@@ -2,7 +2,7 @@ use std::{
     collections::HashMap,
     io::{self, Read, Write},
     net::{SocketAddr, TcpStream as StdTcpStream},
-    sync::mpsc::{self, Receiver, Sender},
+    sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, TryRecvError},
     thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
@@ -94,6 +94,9 @@ pub enum NetworkEvent {
     VoicePacket(RemoteVoicePacket),
     Status(String),
     Error(String),
+    ReconnectScheduled {
+        retry_in: Duration,
+    },
     Disconnected,
 }
 
@@ -166,42 +169,71 @@ fn run_worker(
         udp_addr = %config.udp_addr,
         room_id = config.room_id.0
     );
-    if let Err(error) = run_worker_inner(config, &events, commands) {
-        kvlog::warn!("network worker failed", error = %error);
-        let _ = events.send(NetworkEvent::Error(error));
+    let mut reconnect = ReconnectSchedule::new();
+    loop {
+        match run_worker_inner(&config, &events, &commands) {
+            SessionEnd::Shutdown => break,
+            SessionEnd::ConnectFailed(reason) => {
+                kvlog::warn!(
+                    "network connection attempt failed",
+                    reason = reason.as_str()
+                );
+                if schedule_reconnect(&events, &commands, &mut reconnect, &reason).is_shutdown() {
+                    break;
+                }
+            }
+            SessionEnd::Disconnected(reason) => {
+                reconnect.reset();
+                kvlog::warn!("network session disconnected", reason = reason.as_str());
+                if schedule_reconnect(&events, &commands, &mut reconnect, &reason).is_shutdown() {
+                    break;
+                }
+            }
+        }
     }
-    kvlog::info!("network worker disconnected");
-    let _ = events.send(NetworkEvent::Disconnected);
+    kvlog::info!("network worker stopped");
 }
 
 fn run_worker_inner(
-    config: ClientConfig,
+    config: &ClientConfig,
     events: &Sender<NetworkEvent>,
-    commands: Receiver<NetworkCommand>,
-) -> Result<(), String> {
-    let (std_tcp, control, secrets) = connect_and_handshake(&config)?;
-    let std_udp = bind_udp_socket(
+    commands: &Receiver<NetworkCommand>,
+) -> SessionEnd {
+    let (std_tcp, control, secrets) = match connect_and_handshake(config) {
+        Ok(value) => value,
+        Err(error) => return SessionEnd::ConnectFailed(error),
+    };
+    let std_udp = match bind_udp_socket(
         if config.udp_addr.is_ipv4() {
             "0.0.0.0:0".parse().unwrap()
         } else {
             "[::]:0".parse().unwrap()
         },
         UdpSocketOptions::default(),
-    )
-    .map_err(|error| format!("failed to bind UDP socket: {error}"))?;
-    let udp_local_addr = std_udp
-        .local_addr()
-        .map_err(|error| format!("failed to read UDP socket address: {error}"))?;
+    ) {
+        Ok(socket) => socket,
+        Err(error) => {
+            return SessionEnd::ConnectFailed(format!("failed to bind UDP socket: {error}"));
+        }
+    };
+    let udp_local_addr = match std_udp.local_addr() {
+        Ok(addr) => addr,
+        Err(error) => {
+            return SessionEnd::ConnectFailed(format!(
+                "failed to read UDP socket address: {error}"
+            ));
+        }
+    };
     kvlog::info!("udp socket bound", addr = %udp_local_addr);
-    std_tcp
-        .set_nonblocking(true)
-        .map_err(|error| format!("failed to make TCP nonblocking: {error}"))?;
-    std_udp
-        .set_nonblocking(true)
-        .map_err(|error| format!("failed to make UDP nonblocking: {error}"))?;
+    if let Err(error) = std_tcp.set_nonblocking(true) {
+        return SessionEnd::ConnectFailed(format!("failed to make TCP nonblocking: {error}"));
+    }
+    if let Err(error) = std_udp.set_nonblocking(true) {
+        return SessionEnd::ConnectFailed(format!("failed to make UDP nonblocking: {error}"));
+    }
 
     let mut worker = WorkerState {
-        config,
+        config: config.clone(),
         events: events.clone(),
         tcp: TcpStream::from_std(std_tcp),
         udp: UdpSocket::from_std(std_udp),
@@ -229,24 +261,33 @@ fn run_worker_inner(
         interface_snapshot: InterfaceSnapshot::capture().ok(),
         next_interface_poll: Instant::now() + INTERFACE_POLL_INTERVAL,
         shutdown: false,
+        disconnect_reason: None,
     };
 
-    let mut poll = Poll::new().map_err(|error| format!("failed to create poll: {error}"))?;
-    poll.registry()
-        .register(
-            &mut worker.tcp,
-            TCP,
-            Interest::READABLE | Interest::WRITABLE,
-        )
-        .map_err(|error| format!("failed to register TCP socket: {error}"))?;
-    poll.registry()
+    let mut poll = match Poll::new() {
+        Ok(poll) => poll,
+        Err(error) => return SessionEnd::ConnectFailed(format!("failed to create poll: {error}")),
+    };
+    if let Err(error) = poll.registry().register(
+        &mut worker.tcp,
+        TCP,
+        Interest::READABLE | Interest::WRITABLE,
+    ) {
+        return SessionEnd::ConnectFailed(format!("failed to register TCP socket: {error}"));
+    }
+    if let Err(error) = poll
+        .registry()
         .register(&mut worker.udp, UDP, Interest::READABLE)
-        .map_err(|error| format!("failed to register UDP socket: {error}"))?;
+    {
+        return SessionEnd::ConnectFailed(format!("failed to register UDP socket: {error}"));
+    }
 
-    worker.queue_control(ClientControl::Authenticate {
+    if let Err(error) = worker.queue_control(ClientControl::Authenticate {
         user: worker.config.user.clone(),
         token: worker.config.token.clone(),
-    })?;
+    }) {
+        return SessionEnd::Disconnected(error);
+    }
     kvlog::info!(
         "authenticate control queued",
         user = worker.config.user.as_str()
@@ -255,16 +296,21 @@ fn run_worker_inner(
 
     let mut poll_events = Events::with_capacity(128);
     while !worker.shutdown {
-        poll.poll(&mut poll_events, Some(POLL_TIMEOUT))
-            .map_err(|error| format!("network poll failed: {error}"))?;
+        if let Err(error) = poll.poll(&mut poll_events, Some(POLL_TIMEOUT)) {
+            return SessionEnd::Disconnected(format!("network poll failed: {error}"));
+        }
         for event in poll_events.iter() {
             match event.token() {
                 TCP => {
                     if event.is_readable() {
-                        worker.read_tcp()?;
+                        if let Err(error) = worker.read_tcp() {
+                            return SessionEnd::Disconnected(error);
+                        }
                     }
                     if event.is_writable() {
-                        worker.write_tcp()?;
+                        if let Err(error) = worker.write_tcp() {
+                            return SessionEnd::Disconnected(error);
+                        }
                     }
                 }
                 UDP => worker.read_udp(),
@@ -272,18 +318,117 @@ fn run_worker_inner(
             }
         }
 
-        while let Ok(command) = commands.try_recv() {
-            worker.handle_command(command)?;
+        loop {
+            match commands.try_recv() {
+                Ok(command) => {
+                    if let Err(error) = worker.handle_command(command) {
+                        return SessionEnd::Disconnected(error);
+                    }
+                }
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    worker.shutdown = true;
+                    break;
+                }
+            }
         }
         let now = Instant::now();
         worker.poll_interfaces(now);
         if worker.udp_rebind_requested {
-            worker.rebind_udp_socket(&mut poll)?;
+            if let Err(error) = worker.rebind_udp_socket(&mut poll) {
+                return SessionEnd::Disconnected(error);
+            }
         }
         worker.poll_p2p(now);
     }
-    kvlog::info!("network worker shutdown requested");
-    Ok(())
+    if let Some(reason) = worker.disconnect_reason.take() {
+        SessionEnd::Disconnected(reason)
+    } else {
+        kvlog::info!("network worker shutdown requested");
+        SessionEnd::Shutdown
+    }
+}
+
+enum SessionEnd {
+    Shutdown,
+    ConnectFailed(String),
+    Disconnected(String),
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct ReconnectSchedule {
+    attempts: u32,
+}
+
+impl ReconnectSchedule {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    fn reset(&mut self) {
+        self.attempts = 0;
+    }
+
+    fn next_delay(&mut self) -> Duration {
+        self.attempts = self.attempts.saturating_add(1);
+        match self.attempts {
+            1..=5 => Duration::from_secs(1),
+            6..=10 => Duration::from_secs(2),
+            _ => Duration::from_secs(5),
+        }
+    }
+}
+
+enum RetryWait {
+    Retry,
+    Shutdown,
+}
+
+impl RetryWait {
+    fn is_shutdown(&self) -> bool {
+        matches!(self, Self::Shutdown)
+    }
+}
+
+fn schedule_reconnect(
+    events: &Sender<NetworkEvent>,
+    commands: &Receiver<NetworkCommand>,
+    reconnect: &mut ReconnectSchedule,
+    reason: &str,
+) -> RetryWait {
+    let delay = reconnect.next_delay();
+    kvlog::info!(
+        "network reconnect scheduled",
+        delay_ms = delay.as_millis() as u64,
+        reason
+    );
+    let _ = events.send(NetworkEvent::ReconnectScheduled { retry_in: delay });
+    wait_for_reconnect(commands, delay)
+}
+
+fn wait_for_reconnect(commands: &Receiver<NetworkCommand>, delay: Duration) -> RetryWait {
+    let deadline = Instant::now() + delay;
+    loop {
+        let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+            return RetryWait::Retry;
+        };
+        match commands.recv_timeout(remaining) {
+            Ok(NetworkCommand::Shutdown) => {
+                kvlog::info!("shutdown command handling while disconnected");
+                return RetryWait::Shutdown;
+            }
+            Ok(command) => {
+                if !matches!(command, NetworkCommand::LocalVoicePacket(_)) {
+                    kvlog::info!(
+                        "network command dropped while disconnected",
+                        kind = network_command_kind(&command)
+                    );
+                }
+            }
+            Err(RecvTimeoutError::Timeout) => return RetryWait::Retry,
+            Err(RecvTimeoutError::Disconnected) => return RetryWait::Shutdown,
+        }
+    }
 }
 
 fn connect_and_handshake(
@@ -372,6 +517,7 @@ struct WorkerState {
     interface_snapshot: Option<InterfaceSnapshot>,
     next_interface_poll: Instant,
     shutdown: bool,
+    disconnect_reason: Option<String>,
 }
 
 struct PeerConnection {
@@ -412,6 +558,7 @@ impl WorkerState {
                 Ok(0) => {
                     kvlog::info!("tcp server closed connection");
                     self.shutdown = true;
+                    self.disconnect_reason = Some("server closed connection".to_string());
                     return Ok(());
                 }
                 Ok(n) => {
@@ -1449,4 +1596,31 @@ fn p2p_username(connection_id: u64) -> String {
 
 fn connection_id_from_p2p_username(username: &str) -> Option<u64> {
     username.strip_prefix("tomchat-p2p:")?.parse().ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reconnect_schedule_matches_retry_policy() {
+        let mut schedule = ReconnectSchedule::new();
+        let delays = (0..12)
+            .map(|_| schedule.next_delay().as_secs())
+            .collect::<Vec<_>>();
+
+        assert_eq!(delays, vec![1, 1, 1, 1, 1, 2, 2, 2, 2, 2, 5, 5]);
+    }
+
+    #[test]
+    fn reconnect_schedule_resets_after_connected_session() {
+        let mut schedule = ReconnectSchedule::new();
+        for _ in 0..8 {
+            schedule.next_delay();
+        }
+
+        schedule.reset();
+
+        assert_eq!(schedule.next_delay(), Duration::from_secs(1));
+    }
 }

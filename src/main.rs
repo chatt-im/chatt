@@ -507,6 +507,15 @@ impl App {
                 kvlog::warn!("app network error", error = error.as_str());
                 self.set_error(format!("error: {error}"));
             }
+            NetworkEvent::ReconnectScheduled { retry_in } => {
+                self.voice_tx_enabled.store(false, Ordering::Relaxed);
+                self.call_enabled = false;
+                self.playback.take();
+                self.set_error(format!(
+                    "server down; disconnected retrying in {}s",
+                    retry_in.as_secs()
+                ));
+            }
             NetworkEvent::Disconnected => {
                 self.voice_tx_enabled.store(false, Ordering::Relaxed);
                 self.call_enabled = false;
@@ -1471,6 +1480,7 @@ fn network_event_kind(event: &NetworkEvent) -> &'static str {
         NetworkEvent::VoicePacket(_) => "voice_packet",
         NetworkEvent::Status(_) => "status",
         NetworkEvent::Error(_) => "error",
+        NetworkEvent::ReconnectScheduled { .. } => "reconnect_scheduled",
         NetworkEvent::Disconnected => "disconnected",
     }
 }
@@ -1582,6 +1592,19 @@ mod tests {
         let mut app = test_app();
         let mut buffer = Buffer::new(80, 24);
         render(&mut app, &mut buffer);
+    }
+
+    #[test]
+    fn reconnect_scheduled_sets_down_error_status() {
+        let mut app = test_app();
+
+        app.handle_network_event(NetworkEvent::ReconnectScheduled {
+            retry_in: Duration::from_secs(5),
+        });
+
+        assert_eq!(app.status, "server down; disconnected retrying in 5s");
+        assert_eq!(app.status_kind, StatusKind::Error);
+        assert!(!app.call_enabled);
     }
 
     #[test]
