@@ -14,6 +14,10 @@ udp-probe-addr = "127.0.0.1:41002"
 # public key in network.server-public-key for non-development deployments.
 server-identity-seed = "546f6d636861742064657620736572766572206b657920763100000000000001"
 
+# Set to false for authenticated plaintext transport. Tokens, chat, files, and
+# server-relayed media are then sent without confidentiality.
+encryption = true
+
 # Keep this at zero when the server should relay messages without retaining
 # message bodies for future joins.
 chat-history-limit = 0

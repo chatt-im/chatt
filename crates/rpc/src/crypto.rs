@@ -81,6 +81,12 @@ pub struct SessionSecrets {
     pub media_recv: KeyMaterial,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum HandshakeMode {
+    Encrypted(SessionSecrets),
+    Plaintext,
+}
+
 pub struct ClientHandshake {
     private: agreement::EphemeralPrivateKey,
     pub hello: ClientHello,
@@ -89,6 +95,10 @@ pub struct ClientHandshake {
 pub struct ServerHandshake {
     pub hello: ServerHello,
     pub secrets: SessionSecrets,
+}
+
+pub struct PlaintextServerHandshake {
+    pub hello: ServerHello,
 }
 
 pub fn dev_server_public_key() -> [u8; ED25519_PUBLIC_KEY_LEN] {
@@ -201,6 +211,7 @@ pub fn respond_to_client_hello(
     let unsigned = server_transcript(
         client_hello,
         PROTOCOL_VERSION,
+        true,
         &nonce,
         public.as_ref(),
         server_key_pair.public_key().as_ref(),
@@ -208,6 +219,7 @@ pub fn respond_to_client_hello(
     let signature = server_key_pair.sign(&unsigned);
     let hello = ServerHello {
         version: PROTOCOL_VERSION,
+        encrypted: true,
         server_nonce: nonce.to_vec(),
         server_ephemeral: public.as_ref().to_vec(),
         signature: signature.as_ref().to_vec(),
@@ -215,6 +227,48 @@ pub fn respond_to_client_hello(
     let transcript = full_transcript(client_hello, &hello, server_key_pair.public_key().as_ref())?;
     let secrets = derive_session_secrets(Role::Server, &shared, &transcript);
     Ok(ServerHandshake { hello, secrets })
+}
+
+pub fn respond_to_client_hello_plaintext(
+    rng: &dyn rand::SecureRandom,
+    server_key_pair: &signature::Ed25519KeyPair,
+    client_hello: &ClientHello,
+) -> Result<PlaintextServerHandshake, CryptoError> {
+    validate_client_hello(client_hello)?;
+    let mut nonce = [0u8; NONCE_LEN];
+    rng.fill(&mut nonce).map_err(|_| CryptoError::Random)?;
+    let unsigned = server_transcript(
+        client_hello,
+        PROTOCOL_VERSION,
+        false,
+        &nonce,
+        &[],
+        server_key_pair.public_key().as_ref(),
+    );
+    let signature = server_key_pair.sign(&unsigned);
+    Ok(PlaintextServerHandshake {
+        hello: ServerHello {
+            version: PROTOCOL_VERSION,
+            encrypted: false,
+            server_nonce: nonce.to_vec(),
+            server_ephemeral: Vec::new(),
+            signature: signature.as_ref().to_vec(),
+        },
+    })
+}
+
+pub fn complete_client_transport_handshake(
+    handshake: ClientHandshake,
+    server_hello: &ServerHello,
+    pinned_server_public_key: &[u8; ED25519_PUBLIC_KEY_LEN],
+) -> Result<HandshakeMode, CryptoError> {
+    if server_hello.encrypted {
+        complete_client_handshake(handshake, server_hello, pinned_server_public_key)
+            .map(HandshakeMode::Encrypted)
+    } else {
+        verify_plaintext_server_hello(&handshake.hello, server_hello, pinned_server_public_key)?;
+        Ok(HandshakeMode::Plaintext)
+    }
 }
 
 pub fn complete_client_handshake(
@@ -229,6 +283,7 @@ pub fn complete_client_handshake(
             &server_transcript(
                 &handshake.hello,
                 server_hello.version,
+                true,
                 &server_hello.server_nonce,
                 &server_hello.server_ephemeral,
                 pinned_server_public_key,
@@ -247,6 +302,28 @@ pub fn complete_client_handshake(
     Ok(derive_session_secrets(Role::Client, &shared, &transcript))
 }
 
+fn verify_plaintext_server_hello(
+    client_hello: &ClientHello,
+    server_hello: &ServerHello,
+    pinned_server_public_key: &[u8; ED25519_PUBLIC_KEY_LEN],
+) -> Result<(), CryptoError> {
+    validate_client_hello(client_hello)?;
+    validate_plaintext_server_hello(server_hello)?;
+    signature::UnparsedPublicKey::new(&signature::ED25519, pinned_server_public_key)
+        .verify(
+            &server_transcript(
+                client_hello,
+                server_hello.version,
+                false,
+                &server_hello.server_nonce,
+                &server_hello.server_ephemeral,
+                pinned_server_public_key,
+            ),
+            &server_hello.signature,
+        )
+        .map_err(|_| CryptoError::InvalidSignature)
+}
+
 fn validate_client_hello(hello: &ClientHello) -> Result<(), CryptoError> {
     if hello.version != PROTOCOL_VERSION {
         return Err(CryptoError::UnsupportedVersion(hello.version));
@@ -263,8 +340,23 @@ fn validate_server_hello(hello: &ServerHello) -> Result<(), CryptoError> {
     if hello.version != PROTOCOL_VERSION {
         return Err(CryptoError::UnsupportedVersion(hello.version));
     }
-    if hello.server_nonce.len() != NONCE_LEN
+    if !hello.encrypted
+        || hello.server_nonce.len() != NONCE_LEN
         || hello.server_ephemeral.len() != X25519_PUBLIC_KEY_LEN
+        || hello.signature.is_empty()
+    {
+        return Err(CryptoError::InvalidHandshake);
+    }
+    Ok(())
+}
+
+fn validate_plaintext_server_hello(hello: &ServerHello) -> Result<(), CryptoError> {
+    if hello.version != PROTOCOL_VERSION {
+        return Err(CryptoError::UnsupportedVersion(hello.version));
+    }
+    if hello.encrypted
+        || hello.server_nonce.len() != NONCE_LEN
+        || !hello.server_ephemeral.is_empty()
         || hello.signature.is_empty()
     {
         return Err(CryptoError::InvalidHandshake);
@@ -275,14 +367,16 @@ fn validate_server_hello(hello: &ServerHello) -> Result<(), CryptoError> {
 fn server_transcript(
     client_hello: &ClientHello,
     server_version: u16,
+    encrypted: bool,
     server_nonce: &[u8],
     server_ephemeral: &[u8],
     server_public_key: &[u8],
 ) -> Vec<u8> {
     let mut out = Vec::with_capacity(160);
-    out.extend_from_slice(b"tomchat server hello v1");
+    out.extend_from_slice(b"tomchat server hello v2");
     out.extend_from_slice(&client_hello.version.to_le_bytes());
     out.extend_from_slice(&server_version.to_le_bytes());
+    out.push(u8::from(encrypted));
     out.extend_from_slice(&client_hello.client_nonce);
     out.extend_from_slice(&client_hello.client_ephemeral);
     out.extend_from_slice(server_nonce);
@@ -301,6 +395,7 @@ fn full_transcript(
     let mut out = server_transcript(
         client_hello,
         server_hello.version,
+        server_hello.encrypted,
         &server_hello.server_nonce,
         &server_hello.server_ephemeral,
         server_public_key,
@@ -427,6 +522,54 @@ impl TransportCipher {
             .checked_add(1)
             .ok_or(CryptoError::CounterExhausted)?;
         Ok(plaintext)
+    }
+}
+
+#[derive(Debug)]
+pub enum ControlTransport {
+    Encrypted(TransportCipher),
+    Plaintext,
+}
+
+impl ControlTransport {
+    pub fn encrypted(send: KeyMaterial, recv: KeyMaterial) -> Self {
+        Self::Encrypted(TransportCipher::new(send, recv))
+    }
+
+    pub fn plaintext() -> Self {
+        Self::Plaintext
+    }
+
+    pub fn is_encrypted(&self) -> bool {
+        matches!(self, Self::Encrypted(_))
+    }
+
+    pub fn send_key_id(&self) -> Option<u32> {
+        match self {
+            Self::Encrypted(cipher) => Some(cipher.send_key_id()),
+            Self::Plaintext => None,
+        }
+    }
+
+    pub fn recv_key_id(&self) -> Option<u32> {
+        match self {
+            Self::Encrypted(cipher) => Some(cipher.recv_key_id()),
+            Self::Plaintext => None,
+        }
+    }
+
+    pub fn seal_next(&mut self, channel: u8, plaintext: &[u8]) -> Result<Vec<u8>, CryptoError> {
+        match self {
+            Self::Encrypted(cipher) => cipher.seal_next(channel, plaintext),
+            Self::Plaintext => Ok(plaintext.to_vec()),
+        }
+    }
+
+    pub fn open_next(&mut self, channel: u8, frame: &[u8]) -> Result<Vec<u8>, CryptoError> {
+        match self {
+            Self::Encrypted(cipher) => cipher.open_next(channel, frame),
+            Self::Plaintext => Ok(frame.to_vec()),
+        }
     }
 }
 
@@ -586,6 +729,22 @@ mod tests {
     }
 
     #[test]
+    fn server_can_select_signed_plaintext_transport() {
+        let rng = rand::SystemRandom::new();
+        let client = generate_client_hello(&rng).unwrap();
+        let client_hello = client.hello.clone();
+        let server =
+            respond_to_client_hello_plaintext(&rng, &dev_server_key_pair(), &client_hello).unwrap();
+
+        assert!(!server.hello.encrypted);
+        assert_eq!(
+            complete_client_transport_handshake(client, &server.hello, &dev_server_public_key())
+                .unwrap(),
+            HandshakeMode::Plaintext
+        );
+    }
+
+    #[test]
     fn transport_cipher_round_trips_and_rejects_tamper() {
         let key_a = KeyMaterial {
             id: 11,
@@ -604,6 +763,17 @@ mod tests {
         let last = tampered.len() - 1;
         tampered[last] ^= 0x55;
         assert!(b.open_next(CHANNEL_CONTROL, &tampered).is_err());
+    }
+
+    #[test]
+    fn plaintext_control_transport_passes_payloads_without_framing() {
+        let mut transport = ControlTransport::plaintext();
+        let frame = transport.seal_next(CHANNEL_CONTROL, b"hello").unwrap();
+        assert_eq!(frame, b"hello");
+        assert_eq!(
+            transport.open_next(CHANNEL_CONTROL, &frame).unwrap(),
+            b"hello"
+        );
     }
 
     #[test]

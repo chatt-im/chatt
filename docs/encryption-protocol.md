@@ -6,11 +6,15 @@ useful as the code moves.
 
 ## Security Status
 
-- All application control, chat, file relay, and media traffic is encrypted
-  after the TCP handshake completes.
+- By default, application control, chat, file relay, and server-relayed media
+  traffic is encrypted after the TCP handshake completes. The server can select
+  authenticated plaintext transport with `security.encryption = false`.
 - The handshake itself carries only public key agreement material, nonces, and a
   server signature. No user token, pairing code, chat body, file content, or
-  media payload is sent before encryption is active.
+  media payload is sent before the server-selected transport mode is active.
+- In plaintext mode, the server's no-encryption decision is signed, but user
+  tokens, pairing codes, chat, files, and server-relayed media do not have
+  transport confidentiality.
 - The server is trusted in this version. It decrypts messages and media in order
   to route them, so this is not end-to-end encryption.
 - The default server config sets `security.chat-history-limit = 0`, so the
@@ -36,6 +40,8 @@ Important fields:
   addresses.
 - `security.server-identity-seed`: 32-byte Ed25519 seed encoded as hex. Replace
   the development value before non-local use.
+- `security.encryption`: whether TCP control and server-relayed UDP media use
+  negotiated transport encryption. Defaults to `true`.
 - `security.chat-history-limit`: number of messages to keep in memory for new
   joins. Use `0` for no retained message bodies.
 - `security.max-file-size-bytes`: server-side file relay limit, capped by the
@@ -62,8 +68,8 @@ storing the token in plaintext on the server.
    - `network.pairing-code` to the one-time code.
    - `network.server-public-key` to the server public key printed at startup.
 3. The client performs the normal server-authenticated handshake.
-4. Inside the encrypted control channel, the client sends `ClientControl::Pair`
-   containing the user name, pairing code, and new token.
+4. Inside the server-selected control channel, the client sends
+   `ClientControl::Pair` containing the user name, pairing code, and new token.
 5. The server verifies the pairing code hash, hashes the new token, rewrites the
    server config with `token-hash` set and `pairing-code-hash` cleared, and then
    authenticates the current session.
@@ -79,29 +85,35 @@ TCP control handshake:
 
 1. `ClientHello` contains protocol version, a 32-byte random nonce, and an
    ephemeral X25519 public key.
-2. `ServerHello` contains protocol version, a 32-byte random nonce, an ephemeral
-   X25519 public key, and an Ed25519 signature over the handshake transcript.
+2. `ServerHello` contains protocol version, a transport encryption decision, a
+   32-byte random nonce, optional ephemeral X25519 public key material, and an
+   Ed25519 signature over the handshake transcript.
 3. The client verifies the server signature against the pinned Ed25519 public
-   key.
-4. Both sides compute the X25519 shared secret and derive four traffic keys with
-   HKDF-SHA256: client control, server control, client media, and server media.
-   The transcript hash is the HKDF salt.
-5. TCP control frames are length-prefixed and then encrypted with
-   ChaCha20-Poly1305. The AEAD associated data includes the channel id, key id,
-   and counter. TCP control requires strict monotonically increasing counters.
+   key before accepting the transport mode.
+4. In encrypted mode, both sides compute the X25519 shared secret and derive
+   four traffic keys with HKDF-SHA256: client control, server control, client
+   media, and server media. The transcript hash is the HKDF salt.
+5. In encrypted mode, TCP control frames are length-prefixed and then encrypted
+   with ChaCha20-Poly1305. The AEAD associated data includes the channel id, key
+   id, and counter. TCP control requires strict monotonically increasing
+   counters. In plaintext mode, length-prefixed TCP frames carry encoded control
+   payloads directly.
 
 UDP media:
 
 1. UDP packets carry version, media kind, key id, and counter in a clear header.
-2. The media payload is encrypted with ChaCha20-Poly1305 using the negotiated
-   media key. The key id and counter are authenticated as associated data.
-3. UDP receive paths use a sliding anti-replay window before accepting a packet.
+2. In encrypted mode, the media payload is encrypted with ChaCha20-Poly1305
+   using the negotiated media key. The key id and counter are authenticated as
+   associated data.
+3. In plaintext mode, key id `0` identifies an unencrypted payload encoded in
+   the same media payload format.
+4. UDP receive paths use a sliding anti-replay window before accepting a packet.
 
 P2P media:
 
-1. Peers publish candidates through the encrypted control channel.
+1. Peers publish candidates through the server-selected control channel.
 2. The trusted server creates random directional P2P media keys and sends them
-   to both peers through encrypted control messages.
+   to both peers through control messages.
 3. Direct peer media packets use the same media AEAD and anti-replay machinery.
 
 ## Implementation Map
@@ -112,14 +124,17 @@ Shared protocol:
   `ClientControl::Authenticate`, `ClientControl::Pair`, `ServerControl`, and
   validation in `validate_client_control`.
 - `crates/rpc/src/crypto.rs`: handshake generation and verification in
-  `generate_client_hello`, `respond_to_client_hello`, and
-  `complete_client_handshake`; key derivation in `derive_session_secrets`;
+  `generate_client_hello`, `respond_to_client_hello`,
+  `respond_to_client_hello_plaintext`, and
+  `complete_client_transport_handshake`; key derivation in
+  `derive_session_secrets`; control transport selection in `ControlTransport`;
   AEAD framing in `TransportCipher`, `seal_with_key`, and `open_with_key`;
   replay tracking in `AntiReplay`; configured-key helpers in
   `server_key_pair_from_seed_hex`, `ed25519_public_key_from_hex`, and
   `encode_hex`.
-- `crates/rpc/src/media.rs`: UDP encryption and anti-replay entry points in
-  `seal_media`, `open_media`, and `parse_header`.
+- `crates/rpc/src/media.rs`: UDP encryption/plaintext and anti-replay entry
+  points in `seal_media`, `open_media`, `seal_plaintext_media`,
+  `open_plaintext_media`, and `parse_header`.
 
 Server:
 
@@ -131,7 +146,7 @@ Server:
   TCP handshake in `Server::process_frame`; auth dispatch in
   `Server::handle_control`; token auth in `Server::authenticate_client`;
   first-time pairing in `Server::pair_client`; session creation in
-  `Server::establish_session`; encrypted control send in
+  `Server::establish_session`; control send in
   `Server::send_control_to_token`; UDP receive/send in
   `Server::handle_udp_packet` and `Server::send_udp_payload`; message retention
   behavior in `Server::send_chat` and `Server::start_file_upload`.
@@ -143,8 +158,8 @@ Client:
   `write_runtime_config`.
 - `src/client_net.rs`: server connection and handshake in
   `connect_and_handshake`; public key pin selection in
-  `pinned_server_public_key`; first encrypted auth or pairing message in
-  `run_worker_inner`; encrypted control send in `WorkerState::queue_control`;
+  `pinned_server_public_key`; first auth or pairing message in
+  `run_worker_inner`; control send in `WorkerState::queue_control`;
   server message handling in `WorkerState::handle_control`; UDP media send and
   receive in `WorkerState::send_media`, `WorkerState::handle_udp_packet`, and
   `WorkerState::handle_p2p_media`.

@@ -37,6 +37,8 @@ impl Default for NetworkConfig {
 #[toml(FromToml, ToToml, rename_all = "kebab-case")]
 pub struct SecurityConfig {
     pub server_identity_seed: String,
+    #[toml(default = true)]
+    pub encryption: bool,
     #[toml(default)]
     pub chat_history_limit: u64,
     #[toml(default = DEFAULT_FILE_SIZE_LIMIT_BYTES)]
@@ -48,6 +50,7 @@ impl Default for SecurityConfig {
         Self {
             server_identity_seed:
                 "546f6d636861742064657620736572766572206b657920763100000000000001".to_string(),
+            encryption: true,
             chat_history_limit: 0,
             max_file_size_bytes: DEFAULT_FILE_SIZE_LIMIT_BYTES,
         }
@@ -214,6 +217,15 @@ impl Config {
         {
             self.security.chat_history_limit = limit;
         }
+        if let Some(encryption) = value_arg(&args, "--encryption")
+            .or_else(|| std::env::var("TOMCHAT_SERVER_ENCRYPTION").ok())
+            .and_then(|value| parse_bool(&value))
+        {
+            self.security.encryption = encryption;
+        }
+        if args.iter().any(|arg| arg == "--no-encryption") {
+            self.security.encryption = false;
+        }
     }
 
     fn validate(&self, source: &str) -> Result<(), String> {
@@ -312,6 +324,7 @@ impl Config {
             "server-identity-seed = \"{}\"\n",
             toml_quote_value(&self.security.server_identity_seed)
         ));
+        out.push_str(&format!("encryption = {}\n", self.security.encryption));
         out.push_str(&format!(
             "chat-history-limit = {}\n",
             self.security.chat_history_limit
@@ -452,6 +465,14 @@ fn toml_quote_value(value: &str) -> String {
     out
 }
 
+fn parse_bool(value: &str) -> Option<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Some(true),
+        "0" | "false" | "no" | "off" => Some(false),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -462,6 +483,7 @@ mod tests {
         config.config_path = None;
         config.validate("<test>").unwrap();
         assert_eq!(config.network.tcp_addr.to_string(), "127.0.0.1:41000");
+        assert!(config.security.encryption);
         assert_eq!(config.security.chat_history_limit, 0);
         assert_eq!(config.rooms[0].room_id(), RoomId(1));
     }

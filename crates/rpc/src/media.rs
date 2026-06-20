@@ -5,6 +5,7 @@ pub const UDP_VERSION: u8 = 1;
 pub const UDP_HEADER_LEN: usize = 14;
 pub const SAFE_UDP_PAYLOAD_BYTES: usize = 1_200;
 pub const MAX_VOICE_PAYLOAD_BYTES: usize = 1_024;
+pub const PLAINTEXT_KEY_ID: u32 = 0;
 
 pub const KIND_BIND: u8 = 1;
 pub const KIND_VOICE: u8 = 2;
@@ -114,6 +115,22 @@ pub fn seal_media(
     Ok(out)
 }
 
+pub fn seal_plaintext_media(counter: u64, payload: &MediaPayload) -> Result<Vec<u8>, MediaError> {
+    let kind = payload.kind();
+    let plaintext = encode_payload(payload)?;
+    if plaintext.len() > SAFE_UDP_PAYLOAD_BYTES {
+        return Err(MediaError::PayloadTooLarge);
+    }
+
+    let mut out = Vec::with_capacity(UDP_HEADER_LEN + plaintext.len());
+    out.push(UDP_VERSION);
+    out.push(kind);
+    out.extend_from_slice(&PLAINTEXT_KEY_ID.to_le_bytes());
+    out.extend_from_slice(&counter.to_le_bytes());
+    out.extend_from_slice(&plaintext);
+    Ok(out)
+}
+
 pub fn open_media(
     key: &KeyMaterial,
     replay: &mut AntiReplay,
@@ -133,6 +150,14 @@ pub fn open_media(
         return Err(MediaError::Replay);
     }
     Ok((header, decode_payload(header.kind, &plaintext)?))
+}
+
+pub fn open_plaintext_media(bytes: &[u8]) -> Result<(UdpHeader, MediaPayload), MediaError> {
+    let (header, body) = parse_header(bytes)?;
+    if header.key_id != PLAINTEXT_KEY_ID {
+        return Err(CryptoError::WrongKeyId.into());
+    }
+    Ok((header, decode_payload(header.kind, body)?))
 }
 
 pub fn parse_header(bytes: &[u8]) -> Result<(UdpHeader, &[u8]), MediaError> {
@@ -358,5 +383,19 @@ mod tests {
             open_media(&key, &mut replay, &packet).unwrap_err(),
             MediaError::Replay
         );
+    }
+
+    #[test]
+    fn plaintext_media_round_trips_and_rejects_replay() {
+        let payload = MediaPayload::Ping { nonce: 123 };
+        let packet = seal_plaintext_media(0, &payload).unwrap();
+        let (header, decoded) = open_plaintext_media(&packet).unwrap();
+        assert_eq!(header.key_id, PLAINTEXT_KEY_ID);
+        assert_eq!(decoded, payload);
+
+        let mut replay = AntiReplay::new();
+        assert!(replay.update(header.counter));
+        assert_eq!(open_plaintext_media(&packet).unwrap().1, payload);
+        assert!(!replay.update(header.counter));
     }
 }

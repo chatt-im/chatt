@@ -20,8 +20,8 @@ use rpc::{
         decode_client_hello, encode_server_control, encode_server_hello,
     },
     crypto::{
-        AntiReplay, CHANNEL_CONTROL, KEY_LEN, KeyMaterial, SessionSecrets, TransportCipher,
-        encode_hex, respond_to_client_hello,
+        AntiReplay, CHANNEL_CONTROL, ControlTransport, KEY_LEN, KeyMaterial, SessionSecrets,
+        encode_hex, respond_to_client_hello, respond_to_client_hello_plaintext,
     },
     frame,
     ids::{FileTransferId, MessageId, RoomId, SessionId, StreamId, UserId},
@@ -48,7 +48,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         tcp_addr = %config.network.tcp_addr,
         udp_addr = %config.network.udp_addr,
         udp_probe_addr = %config.network.udp_probe_addr,
-        server_public_key = server_public_key.as_str()
+        server_public_key = server_public_key.as_str(),
+        encryption = config.security.encryption
     );
     let tcp_addr = config.network.tcp_addr;
     let udp_addr = config.network.udp_addr;
@@ -56,11 +57,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut server = Server::bind(config)?;
     println!("tomchat server listening on tcp {tcp_addr}, udp {udp_addr}, probe {udp_probe_addr}");
     println!("tomchat server public key: {server_public_key}");
+    println!(
+        "tomchat transport encryption: {}",
+        if server.config.security.encryption {
+            "enabled"
+        } else {
+            "disabled"
+        }
+    );
     kvlog::info!(
         "server listening",
         tcp_addr = %tcp_addr,
         udp_addr = %udp_addr,
-        udp_probe_addr = %udp_probe_addr
+        udp_probe_addr = %udp_probe_addr,
+        encryption = server.config.security.encryption
     );
     server.run()
 }
@@ -74,6 +84,7 @@ struct Server {
     clients: HashMap<Token, ClientConn>,
     sessions: HashMap<SessionId, Session>,
     media_key_to_session: HashMap<u32, SessionId>,
+    plaintext_addr_to_session: HashMap<SocketAddr, SessionId>,
     peer_links: HashMap<(SessionId, SessionId), PeerLink>,
     rooms: HashMap<RoomId, RoomState>,
     next_token: usize,
@@ -152,6 +163,7 @@ impl Server {
             clients: HashMap::new(),
             sessions: HashMap::new(),
             media_key_to_session: HashMap::new(),
+            plaintext_addr_to_session: HashMap::new(),
             peer_links: HashMap::new(),
             rooms,
             next_token: FIRST_CLIENT,
@@ -312,25 +324,40 @@ impl Server {
                     client_nonce_size = hello.client_nonce.len(),
                     client_ephemeral_size = hello.client_ephemeral.len()
                 );
-                let response = respond_to_client_hello(&self.rng, &self.server_key_pair, &hello)
-                    .map_err(|error| error.to_string())?;
-                let encoded = encode_server_hello(&response.hello);
+                let encryption = self.config.security.encryption;
+                let (server_hello, control, secrets) = if encryption {
+                    let response =
+                        respond_to_client_hello(&self.rng, &self.server_key_pair, &hello)
+                            .map_err(|error| error.to_string())?;
+                    (
+                        response.hello,
+                        ControlTransport::encrypted(
+                            response.secrets.control_send.clone(),
+                            response.secrets.control_recv.clone(),
+                        ),
+                        Some(response.secrets),
+                    )
+                } else {
+                    let response =
+                        respond_to_client_hello_plaintext(&self.rng, &self.server_key_pair, &hello)
+                            .map_err(|error| error.to_string())?;
+                    (response.hello, ControlTransport::plaintext(), None)
+                };
+                let encoded = encode_server_hello(&server_hello);
                 let client = self
                     .clients
                     .get_mut(&token)
                     .ok_or_else(|| "unknown client token".to_string())?;
                 frame::encode_frame(&encoded, &mut client.write_buf)
                     .map_err(|error| error.to_string())?;
-                client.control = Some(TransportCipher::new(
-                    response.secrets.control_send.clone(),
-                    response.secrets.control_recv.clone(),
-                ));
-                client.secrets = Some(response.secrets);
+                client.control = Some(control);
+                client.secrets = secrets;
                 client.state = ConnState::AwaitAuth;
                 kvlog::info!(
                     "client handshake completed",
                     token = token.0,
-                    queued_bytes = client.write_buf.len()
+                    queued_bytes = client.write_buf.len(),
+                    encryption
                 );
                 self.write_client(token);
                 Ok(())
@@ -578,10 +605,11 @@ impl Server {
         let secrets = self
             .clients
             .get(&token)
-            .and_then(|client| client.secrets.clone())
-            .ok_or_else(|| "missing negotiated keys".to_string())?;
-        self.media_key_to_session
-            .insert(secrets.media_recv.id, session_id);
+            .and_then(|client| client.secrets.clone());
+        if let Some(secrets) = &secrets {
+            self.media_key_to_session
+                .insert(secrets.media_recv.id, session_id);
+        }
         self.sessions.insert(
             session_id,
             Session {
@@ -1458,23 +1486,29 @@ impl Server {
         packet: &[u8],
     ) -> Result<(), String> {
         let (header, _) = media::parse_header(packet).map_err(|error| error.to_string())?;
-        let session_id = *self
-            .media_key_to_session
-            .get(&header.key_id)
-            .ok_or_else(|| "unknown UDP key id".to_string())?;
-        let payload = {
-            let session = self
-                .sessions
-                .get_mut(&session_id)
-                .ok_or_else(|| "unknown UDP session".to_string())?;
-            let (_, payload) = media::open_media(
-                &session.secrets.media_recv,
-                &mut session.media_recv_replay,
-                packet,
-            )
-            .map_err(|error| error.to_string())?;
-            session.udp_addr = Some(src);
-            payload
+        let (session_id, payload) = if header.key_id == media::PLAINTEXT_KEY_ID {
+            self.open_plaintext_udp_packet(src, packet)?
+        } else {
+            let session_id = *self
+                .media_key_to_session
+                .get(&header.key_id)
+                .ok_or_else(|| "unknown UDP key id".to_string())?;
+            let payload = {
+                let session = self
+                    .sessions
+                    .get_mut(&session_id)
+                    .ok_or_else(|| "unknown UDP session".to_string())?;
+                let secrets = session
+                    .secrets
+                    .as_ref()
+                    .ok_or_else(|| "encrypted UDP for plaintext session".to_string())?;
+                let (_, payload) =
+                    media::open_media(&secrets.media_recv, &mut session.media_recv_replay, packet)
+                        .map_err(|error| error.to_string())?;
+                session.udp_addr = Some(src);
+                payload
+            };
+            (session_id, payload)
         };
 
         match payload {
@@ -1534,6 +1568,49 @@ impl Server {
         }
     }
 
+    fn open_plaintext_udp_packet(
+        &mut self,
+        src: SocketAddr,
+        packet: &[u8],
+    ) -> Result<(SessionId, MediaPayload), String> {
+        let (header, payload) =
+            media::open_plaintext_media(packet).map_err(|error| error.to_string())?;
+        let session_id = match &payload {
+            MediaPayload::Bind { session_id } | MediaPayload::NatProbe { session_id, .. } => {
+                *session_id
+            }
+            MediaPayload::Voice { .. }
+            | MediaPayload::PeerVoice { .. }
+            | MediaPayload::Ping { .. }
+            | MediaPayload::Pong { .. } => *self
+                .plaintext_addr_to_session
+                .get(&src)
+                .ok_or_else(|| "unknown plaintext UDP source".to_string())?,
+        };
+
+        let old_addr = {
+            let session = self
+                .sessions
+                .get_mut(&session_id)
+                .ok_or_else(|| "unknown UDP session".to_string())?;
+            if session.secrets.is_some() {
+                return Err("plaintext UDP for encrypted session".to_string());
+            }
+            if !session.media_recv_replay.update(header.counter) {
+                return Err(media::MediaError::Replay.to_string());
+            }
+            session.udp_addr.replace(src)
+        };
+        if let Some(old_addr) = old_addr
+            && old_addr != src
+            && self.plaintext_addr_to_session.get(&old_addr) == Some(&session_id)
+        {
+            self.plaintext_addr_to_session.remove(&old_addr);
+        }
+        self.plaintext_addr_to_session.insert(src, session_id);
+        Ok((session_id, payload))
+    }
+
     fn relay_voice(
         &mut self,
         sender_session_id: SessionId,
@@ -1591,7 +1668,11 @@ impl Server {
         };
         let counter = session.media_send_counter;
         session.media_send_counter = session.media_send_counter.wrapping_add(1);
-        match media::seal_media(&session.secrets.media_send, counter, payload) {
+        let packet = match &session.secrets {
+            Some(secrets) => media::seal_media(&secrets.media_send, counter, payload),
+            None => media::seal_plaintext_media(counter, payload),
+        };
+        match packet {
             Ok(packet) => {
                 if let Err(error) = self.udp.send_to(&packet, addr) {
                     kvlog::warn!(
@@ -1730,8 +1811,14 @@ impl Server {
                 self.leave_room(session_id, room_id);
             }
             if let Some(session) = self.sessions.remove(&session_id) {
-                self.media_key_to_session
-                    .remove(&session.secrets.media_recv.id);
+                if let Some(secrets) = &session.secrets {
+                    self.media_key_to_session.remove(&secrets.media_recv.id);
+                }
+                if let Some(addr) = session.udp_addr
+                    && self.plaintext_addr_to_session.get(&addr) == Some(&session_id)
+                {
+                    self.plaintext_addr_to_session.remove(&addr);
+                }
             }
             self.remove_peer_links(session_id);
         }
@@ -1788,7 +1875,7 @@ struct ClientConn {
     read_buf: Vec<u8>,
     write_buf: Vec<u8>,
     state: ConnState,
-    control: Option<TransportCipher>,
+    control: Option<ControlTransport>,
     secrets: Option<SessionSecrets>,
     session_id: Option<SessionId>,
     user_id: Option<UserId>,
@@ -1801,7 +1888,7 @@ struct Session {
     tcp_token: Token,
     room_id: Option<RoomId>,
     udp_addr: Option<SocketAddr>,
-    secrets: SessionSecrets,
+    secrets: Option<SessionSecrets>,
     media_send_counter: u64,
     media_recv_replay: AntiReplay,
     active_stream: Option<StreamId>,

@@ -22,9 +22,9 @@ use rpc::{
         decode_server_control, decode_server_hello, encode_client_control, encode_client_hello,
     },
     crypto::{
-        AntiReplay, CHANNEL_CONTROL, KEY_LEN, KeyMaterial, SessionSecrets, TransportCipher,
-        complete_client_handshake, dev_server_public_key, ed25519_public_key_from_hex,
-        generate_client_hello,
+        AntiReplay, CHANNEL_CONTROL, ControlTransport, HandshakeMode, KEY_LEN, KeyMaterial,
+        SessionSecrets, complete_client_transport_handshake, dev_server_public_key,
+        ed25519_public_key_from_hex, generate_client_hello,
     },
     frame,
     ids::{FileTransferId, RoomId, SessionId, StreamId, UserId},
@@ -465,7 +465,7 @@ fn wait_for_reconnect(commands: &Receiver<NetworkCommand>, delay: Duration) -> R
 
 fn connect_and_handshake(
     config: &ClientConfig,
-) -> Result<(StdTcpStream, TransportCipher, SessionSecrets), String> {
+) -> Result<(StdTcpStream, ControlTransport, Option<SessionSecrets>), String> {
     kvlog::info!(
         "tcp connecting",
         tcp_addr = %config.tcp_addr,
@@ -493,16 +493,30 @@ fn connect_and_handshake(
         .map_err(|error| format!("failed to read server hello: {error}"))?;
     let server_hello = decode_server_hello(&response)?;
     let pinned_server_public_key = pinned_server_public_key(config)?;
-    let secrets = complete_client_handshake(client, &server_hello, &pinned_server_public_key)
-        .map_err(|error| error.to_string())?;
-    let control = TransportCipher::new(secrets.control_send.clone(), secrets.control_recv.clone());
-    kvlog::info!(
-        "tcp handshake completed",
-        control_send_key_id = secrets.control_send.id,
-        control_recv_key_id = secrets.control_recv.id,
-        media_send_key_id = secrets.media_send.id,
-        media_recv_key_id = secrets.media_recv.id
-    );
+    let mode =
+        complete_client_transport_handshake(client, &server_hello, &pinned_server_public_key)
+            .map_err(|error| error.to_string())?;
+    let (control, secrets) = match mode {
+        HandshakeMode::Encrypted(secrets) => {
+            let control = ControlTransport::encrypted(
+                secrets.control_send.clone(),
+                secrets.control_recv.clone(),
+            );
+            kvlog::info!(
+                "tcp handshake completed",
+                encryption = true,
+                control_send_key_id = secrets.control_send.id,
+                control_recv_key_id = secrets.control_recv.id,
+                media_send_key_id = secrets.media_send.id,
+                media_recv_key_id = secrets.media_recv.id
+            );
+            (control, Some(secrets))
+        }
+        HandshakeMode::Plaintext => {
+            kvlog::info!("tcp handshake completed", encryption = false);
+            (ControlTransport::plaintext(), None)
+        }
+    };
     Ok((stream, control, secrets))
 }
 
@@ -537,8 +551,8 @@ struct WorkerState {
     udp_local_addr: SocketAddr,
     read_buf: Vec<u8>,
     write_buf: Vec<u8>,
-    control: TransportCipher,
-    secrets: SessionSecrets,
+    control: ControlTransport,
+    secrets: Option<SessionSecrets>,
     session_id: Option<SessionId>,
     user_id: Option<UserId>,
     room_id: Option<RoomId>,
@@ -712,11 +726,7 @@ impl WorkerState {
                 );
                 continue;
             }
-            match media::open_media(
-                &self.secrets.media_recv,
-                &mut self.media_recv_replay,
-                packet,
-            ) {
+            match self.open_server_media(packet) {
                 Ok((
                     _,
                     MediaPayload::Voice {
@@ -754,6 +764,24 @@ impl WorkerState {
                         .events
                         .send(NetworkEvent::Error(format!("UDP packet rejected: {error}")));
                 }
+            }
+        }
+    }
+
+    fn open_server_media(
+        &mut self,
+        packet: &[u8],
+    ) -> Result<(media::UdpHeader, MediaPayload), media::MediaError> {
+        match &self.secrets {
+            Some(secrets) => {
+                media::open_media(&secrets.media_recv, &mut self.media_recv_replay, packet)
+            }
+            None => {
+                let (header, payload) = media::open_plaintext_media(packet)?;
+                if !self.media_recv_replay.update(header.counter) {
+                    return Err(media::MediaError::Replay);
+                }
+                Ok((header, payload))
             }
         }
     }
@@ -1322,7 +1350,7 @@ impl WorkerState {
         };
         let counter = self.media_send_counter;
         self.media_send_counter = self.media_send_counter.wrapping_add(1);
-        match media::seal_media(&self.secrets.media_send, counter, &payload) {
+        match self.seal_server_media(counter, &payload) {
             Ok(packet) => self.send_udp_raw("nat_probe", None, addr, &packet),
             Err(error) => {
                 kvlog::warn!("nat probe seal failed", probe_id, error = %error);
@@ -1419,7 +1447,7 @@ impl WorkerState {
         let kind = media_payload_kind(payload);
         let counter = self.media_send_counter;
         self.media_send_counter = self.media_send_counter.wrapping_add(1);
-        match media::seal_media(&self.secrets.media_send, counter, payload) {
+        match self.seal_server_media(counter, payload) {
             Ok(packet) => {
                 if let Err(error) = self.udp.send_to(&packet, self.config.udp_addr) {
                     kvlog::warn!(
@@ -1441,6 +1469,17 @@ impl WorkerState {
                     .events
                     .send(NetworkEvent::Error(format!("UDP seal failed: {error}")));
             }
+        }
+    }
+
+    fn seal_server_media(
+        &self,
+        counter: u64,
+        payload: &MediaPayload,
+    ) -> Result<Vec<u8>, media::MediaError> {
+        match &self.secrets {
+            Some(secrets) => media::seal_media(&secrets.media_send, counter, payload),
+            None => media::seal_plaintext_media(counter, payload),
         }
     }
 

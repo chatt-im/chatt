@@ -23,6 +23,7 @@ pub struct ClientHello {
 #[jsony(Binary, version)]
 pub struct ServerHello {
     pub version: u16,
+    pub encrypted: bool,
     pub server_nonce: Vec<u8>,
     pub server_ephemeral: Vec<u8>,
     pub signature: Vec<u8>,

@@ -1,8 +1,8 @@
 # Tomchat
 
 Tomchat is a Rust terminal chat client and local development server with
-encrypted TCP control traffic, encrypted UDP voice/media traffic, file relay,
-and P2P media candidate exchange.
+server-selected TCP/UDP transport encryption, file relay, and P2P media
+candidate exchange.
 
 The server is trusted in the current design. It decrypts traffic to route chat,
 files, voice, and P2P setup messages, but the default server configuration does
@@ -118,6 +118,7 @@ udp-probe-addr = "127.0.0.1:41002"
 
 [security]
 server-identity-seed = "546f6d636861742064657620736572766572206b657920763100000000000001"
+encryption = true
 chat-history-limit = 0
 max-file-size-bytes = 52428800
 
@@ -136,6 +137,12 @@ Replace the development `server-identity-seed`, user token hashes, and pairing
 code hashes before using a server outside local testing. Room id `1` is required
 as the default lobby by the current client flow.
 
+`encryption = true` makes the server require encrypted TCP control and
+server-relayed UDP media transport. Set it to `false` only for trusted local
+networks or debugging; the server still signs that plaintext decision, but user
+tokens, pairing codes, chat, files, and server-relayed media are sent without
+confidentiality.
+
 `chat-history-limit = 0` means the server relays chat without retaining message
 bodies for future room joins. Raising the value keeps that many messages in
 server memory.
@@ -146,13 +153,16 @@ Useful server overrides:
 - `--tcp`, `TOMCHAT_SERVER_TCP`
 - `--udp`, `TOMCHAT_SERVER_UDP`
 - `--udp-probe`, `TOMCHAT_SERVER_UDP_PROBE`
+- `--encryption true|false`, `--no-encryption`, `TOMCHAT_SERVER_ENCRYPTION`
 - `--chat-history-limit`, `TOMCHAT_SERVER_CHAT_HISTORY_LIMIT`
 
 ## Pairing Procedure
 
 Pairing bootstraps or rotates a user's long-lived client token without storing
 that token in plaintext on the server. The one-time pairing code is verified
-inside the encrypted control channel after the server-authenticated handshake.
+inside the server-selected control channel after the server-authenticated
+handshake. Keep `encryption = true` when pairing outside a trusted local
+environment.
 
 1. Generate a client token and a one-time pairing code:
 
@@ -219,8 +229,10 @@ audit map.
 
 Current status:
 
-- TCP control, chat, file relay, and UDP media are encrypted after the handshake.
-- UDP media uses an anti-replay window; TCP control uses strict counters.
+- The server decides whether TCP control and server-relayed UDP media are
+  encrypted after the handshake. Encryption is enabled by default.
+- UDP media uses an anti-replay window. Encrypted TCP control uses strict
+  counters.
 - User tokens and pairing codes are stored on the server as `sha256:` hashes.
 - The server is trusted and not end-to-end encrypted.
 - The current handshake uses X25519 and Ed25519. It is not yet
