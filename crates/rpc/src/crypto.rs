@@ -30,6 +30,7 @@ pub enum CryptoError {
     InvalidHandshake,
     InvalidSignature,
     InvalidKey,
+    InvalidEncoding,
     UnsupportedVersion(u16),
     WrongKeyId,
     CounterMismatch,
@@ -45,6 +46,7 @@ impl std::fmt::Display for CryptoError {
             CryptoError::InvalidHandshake => f.write_str("invalid handshake"),
             CryptoError::InvalidSignature => f.write_str("server signature verification failed"),
             CryptoError::InvalidKey => f.write_str("invalid key material"),
+            CryptoError::InvalidEncoding => f.write_str("invalid encoded key material"),
             CryptoError::UnsupportedVersion(version) => {
                 write!(f, "unsupported protocol version {version}")
             }
@@ -97,9 +99,64 @@ pub fn dev_server_public_key() -> [u8; ED25519_PUBLIC_KEY_LEN] {
         .unwrap()
 }
 
+pub fn dev_server_seed_hex() -> String {
+    encode_hex(&DEV_SERVER_SEED)
+}
+
 pub fn dev_server_key_pair() -> signature::Ed25519KeyPair {
     signature::Ed25519KeyPair::from_seed_unchecked(&DEV_SERVER_SEED)
         .expect("hard-coded dev Ed25519 seed is valid")
+}
+
+pub fn server_key_pair_from_seed_hex(
+    seed_hex: &str,
+) -> Result<signature::Ed25519KeyPair, CryptoError> {
+    let seed = decode_fixed_hex::<KEY_LEN>(seed_hex)?;
+    signature::Ed25519KeyPair::from_seed_unchecked(&seed).map_err(|_| CryptoError::InvalidKey)
+}
+
+pub fn ed25519_public_key_from_hex(
+    public_key_hex: &str,
+) -> Result<[u8; ED25519_PUBLIC_KEY_LEN], CryptoError> {
+    decode_fixed_hex::<ED25519_PUBLIC_KEY_LEN>(public_key_hex)
+}
+
+pub fn encode_hex(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    out
+}
+
+pub fn decode_hex(value: &str) -> Result<Vec<u8>, CryptoError> {
+    let value = value.trim();
+    if value.len() % 2 != 0 {
+        return Err(CryptoError::InvalidEncoding);
+    }
+    let mut out = Vec::with_capacity(value.len() / 2);
+    for chunk in value.as_bytes().chunks_exact(2) {
+        let high = decode_hex_nibble(chunk[0])?;
+        let low = decode_hex_nibble(chunk[1])?;
+        out.push((high << 4) | low);
+    }
+    Ok(out)
+}
+
+fn decode_fixed_hex<const N: usize>(value: &str) -> Result<[u8; N], CryptoError> {
+    let decoded = decode_hex(value)?;
+    decoded.try_into().map_err(|_| CryptoError::InvalidEncoding)
+}
+
+fn decode_hex_nibble(byte: u8) -> Result<u8, CryptoError> {
+    match byte {
+        b'0'..=b'9' => Ok(byte - b'0'),
+        b'a'..=b'f' => Ok(byte - b'a' + 10),
+        b'A'..=b'F' => Ok(byte - b'A' + 10),
+        _ => Err(CryptoError::InvalidEncoding),
+    }
 }
 
 pub fn generate_client_hello(rng: &dyn rand::SecureRandom) -> Result<ClientHandshake, CryptoError> {
@@ -565,5 +622,16 @@ mod tests {
         for i in (65_536 - 10 * REPLAY_WINDOW_SIZE)..65_535 {
             assert!(!replay.check(i));
         }
+    }
+
+    #[test]
+    fn hex_key_helpers_round_trip() {
+        let encoded = dev_server_seed_hex();
+        let pair = server_key_pair_from_seed_hex(&encoded).unwrap();
+        assert_eq!(pair.public_key().as_ref(), dev_server_public_key());
+        assert_eq!(
+            ed25519_public_key_from_hex(&encode_hex(&dev_server_public_key())).unwrap(),
+            dev_server_public_key()
+        );
     }
 }

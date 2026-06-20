@@ -23,7 +23,8 @@ use rpc::{
     },
     crypto::{
         AntiReplay, CHANNEL_CONTROL, KEY_LEN, KeyMaterial, SessionSecrets, TransportCipher,
-        complete_client_handshake, dev_server_public_key, generate_client_hello,
+        complete_client_handshake, dev_server_public_key, ed25519_public_key_from_hex,
+        generate_client_hello,
     },
     frame,
     ids::{FileTransferId, RoomId, SessionId, StreamId, UserId},
@@ -54,6 +55,8 @@ pub struct ClientConfig {
     pub udp_probe_addr: SocketAddr,
     pub user: String,
     pub token: String,
+    pub pairing_code: Option<String>,
+    pub server_public_key: Option<String>,
     pub room_id: RoomId,
     pub file_receive_dir: Option<PathBuf>,
     pub max_upload_bytes: u64,
@@ -293,21 +296,31 @@ fn run_worker_inner(
         return SessionEnd::ConnectFailed(format!("failed to register UDP socket: {error}"));
     }
 
-    if let Err(error) = worker.queue_control(ClientControl::Authenticate {
-        user: worker.config.user.clone(),
-        token: worker.config.token.clone(),
-        receive_files: worker.config.file_receive_dir.is_some(),
-        file_receive_limit_bytes: worker
-            .config
-            .max_receive_bytes
-            .min(DEFAULT_FILE_SIZE_LIMIT_BYTES),
-    }) {
+    let auth_control = match worker.config.pairing_code.clone() {
+        Some(pairing_code) => ClientControl::Pair {
+            user: worker.config.user.clone(),
+            pairing_code,
+            token: worker.config.token.clone(),
+            receive_files: worker.config.file_receive_dir.is_some(),
+            file_receive_limit_bytes: worker
+                .config
+                .max_receive_bytes
+                .min(DEFAULT_FILE_SIZE_LIMIT_BYTES),
+        },
+        None => ClientControl::Authenticate {
+            user: worker.config.user.clone(),
+            token: worker.config.token.clone(),
+            receive_files: worker.config.file_receive_dir.is_some(),
+            file_receive_limit_bytes: worker
+                .config
+                .max_receive_bytes
+                .min(DEFAULT_FILE_SIZE_LIMIT_BYTES),
+        },
+    };
+    if let Err(error) = worker.queue_control(auth_control) {
         return SessionEnd::Disconnected(error);
     }
-    kvlog::info!(
-        "authenticate control queued",
-        user = worker.config.user.as_str()
-    );
+    kvlog::info!("auth control queued", user = worker.config.user.as_str());
     let _ = worker.events.send(NetworkEvent::Connected);
 
     let mut poll_events = Events::with_capacity(128);
@@ -479,7 +492,8 @@ fn connect_and_handshake(
     let response = read_blocking_frame(&mut stream)
         .map_err(|error| format!("failed to read server hello: {error}"))?;
     let server_hello = decode_server_hello(&response)?;
-    let secrets = complete_client_handshake(client, &server_hello, &dev_server_public_key())
+    let pinned_server_public_key = pinned_server_public_key(config)?;
+    let secrets = complete_client_handshake(client, &server_hello, &pinned_server_public_key)
         .map_err(|error| error.to_string())?;
     let control = TransportCipher::new(secrets.control_send.clone(), secrets.control_recv.clone());
     kvlog::info!(
@@ -490,6 +504,14 @@ fn connect_and_handshake(
         media_recv_key_id = secrets.media_recv.id
     );
     Ok((stream, control, secrets))
+}
+
+fn pinned_server_public_key(config: &ClientConfig) -> Result<[u8; 32], String> {
+    match config.server_public_key.as_deref() {
+        Some(public_key) => ed25519_public_key_from_hex(public_key)
+            .map_err(|error| format!("invalid configured network.server-public-key: {error}")),
+        None => Ok(dev_server_public_key()),
+    }
 }
 
 fn read_blocking_frame(stream: &mut StdTcpStream) -> io::Result<Vec<u8>> {
@@ -1803,6 +1825,7 @@ fn network_command_kind(command: &NetworkCommand) -> &'static str {
 fn client_control_kind(control: &ClientControl) -> &'static str {
     match control {
         ClientControl::Authenticate { .. } => "authenticate",
+        ClientControl::Pair { .. } => "pair",
         ClientControl::JoinRoom { .. } => "join_room",
         ClientControl::SendChat { .. } => "send_chat",
         ClientControl::StartVoice { .. } => "start_voice",

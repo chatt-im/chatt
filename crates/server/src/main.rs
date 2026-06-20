@@ -5,83 +5,68 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+mod config;
+
 use mio::{
     Events, Interest, Poll, Token,
     net::{TcpListener, TcpStream, UdpSocket},
 };
 use ring::rand::SecureRandom;
+use ring::signature::KeyPair;
 use rpc::{
     control::{
-        self, ChatMessage, ClientControl, DEFAULT_FILE_SIZE_LIMIT_BYTES, FileMetadata,
-        MAX_FILE_CHUNK_BYTES, P2pCandidate, P2pKey, P2pNatKind, P2pPeerInfo, P2pRole, RoomInfo,
-        ServerControl, decode_client_control, decode_client_hello, encode_server_control,
-        encode_server_hello,
+        self, ChatMessage, ClientControl, FileMetadata, MAX_FILE_CHUNK_BYTES, P2pCandidate, P2pKey,
+        P2pNatKind, P2pPeerInfo, P2pRole, RoomInfo, ServerControl, decode_client_control,
+        decode_client_hello, encode_server_control, encode_server_hello,
     },
     crypto::{
         AntiReplay, CHANNEL_CONTROL, KEY_LEN, KeyMaterial, SessionSecrets, TransportCipher,
-        dev_server_key_pair, respond_to_client_hello,
+        encode_hex, respond_to_client_hello,
     },
     frame,
     ids::{FileTransferId, MessageId, RoomId, SessionId, StreamId, UserId},
     media::{self, MediaPayload},
 };
 
-const TCP_ADDR: &str = "127.0.0.1:41000";
-const UDP_ADDR: &str = "127.0.0.1:41001";
-const UDP_PROBE_ADDR: &str = "127.0.0.1:41002";
+use config::{Config as ServerConfig, UserConfig, hash_secret, value_arg, verify_secret_hash};
+
 const LISTENER: Token = Token(0);
 const UDP: Token = Token(1);
 const UDP_PROBE: Token = Token(2);
 const FIRST_CLIENT: usize = 3;
 const DEFAULT_ROOM: RoomId = RoomId(1);
-const MAX_CHAT_HISTORY: usize = 200;
 const POLL_TIMEOUT: Duration = Duration::from_millis(100);
-const SERVER_FILE_SIZE_LIMIT_BYTES: u64 = DEFAULT_FILE_SIZE_LIMIT_BYTES;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let _logger = kvlog::spawn_collector_from_env(Some("tomchat-server"), false);
+    let args = std::env::args().collect::<Vec<_>>();
+    let config_path = value_arg(&args, "--config");
+    let config = ServerConfig::load(config_path.as_deref()).map_err(invalid_config)?;
+    let server_public_key = config.server_public_key_hex().map_err(invalid_config)?;
     kvlog::info!(
         "server starting",
-        tcp_addr = TCP_ADDR,
-        udp_addr = UDP_ADDR,
-        udp_probe_addr = UDP_PROBE_ADDR
+        tcp_addr = %config.network.tcp_addr,
+        udp_addr = %config.network.udp_addr,
+        udp_probe_addr = %config.network.udp_probe_addr,
+        server_public_key = server_public_key.as_str()
     );
-    let mut server = Server::bind(TCP_ADDR.parse()?, UDP_ADDR.parse()?)?;
-    println!("tomchat server listening on tcp {TCP_ADDR}, udp {UDP_ADDR}, probe {UDP_PROBE_ADDR}");
+    let tcp_addr = config.network.tcp_addr;
+    let udp_addr = config.network.udp_addr;
+    let udp_probe_addr = config.network.udp_probe_addr;
+    let mut server = Server::bind(config)?;
+    println!("tomchat server listening on tcp {tcp_addr}, udp {udp_addr}, probe {udp_probe_addr}");
+    println!("tomchat server public key: {server_public_key}");
     kvlog::info!(
         "server listening",
-        tcp_addr = TCP_ADDR,
-        udp_addr = UDP_ADDR,
-        udp_probe_addr = UDP_PROBE_ADDR
+        tcp_addr = %tcp_addr,
+        udp_addr = %udp_addr,
+        udp_probe_addr = %udp_probe_addr
     );
     server.run()
 }
 
-struct UserConfig {
-    id: UserId,
-    name: &'static str,
-    token: &'static str,
-}
-
-const USERS: &[UserConfig] = &[
-    UserConfig {
-        id: UserId(1),
-        name: "alice",
-        token: "alice-dev-token",
-    },
-    UserConfig {
-        id: UserId(2),
-        name: "bob",
-        token: "bob-dev-token",
-    },
-    UserConfig {
-        id: UserId(3),
-        name: "carol",
-        token: "carol-dev-token",
-    },
-];
-
 struct Server {
+    config: ServerConfig,
     poll: Poll,
     listener: TcpListener,
     udp: UdpSocket,
@@ -99,16 +84,21 @@ struct Server {
     next_file_transfer: u64,
     active_uploads: HashMap<(SessionId, FileTransferId), ServerUpload>,
     reserved_file_names: HashSet<String>,
+    chat_history_limit: usize,
+    file_size_limit_bytes: u64,
     rng: ring::rand::SystemRandom,
     server_key_pair: ring::signature::Ed25519KeyPair,
 }
 
 impl Server {
-    fn bind(tcp_addr: SocketAddr, udp_addr: SocketAddr) -> io::Result<Self> {
+    fn bind(config: ServerConfig) -> io::Result<Self> {
+        let tcp_addr = config.network.tcp_addr;
+        let udp_addr = config.network.udp_addr;
+        let udp_probe_addr = config.network.udp_probe_addr;
         let poll = Poll::new()?;
         let mut listener = TcpListener::bind(tcp_addr)?;
         let mut udp = UdpSocket::bind(udp_addr)?;
-        let mut udp_probe = UdpSocket::bind(probe_addr_for(udp_addr))?;
+        let mut udp_probe = UdpSocket::bind(udp_probe_addr)?;
         poll.registry()
             .register(&mut listener, LISTENER, Interest::READABLE)?;
         poll.registry()
@@ -117,18 +107,44 @@ impl Server {
             .register(&mut udp_probe, UDP_PROBE, Interest::READABLE)?;
 
         let mut rooms = HashMap::new();
-        rooms.insert(
-            DEFAULT_ROOM,
-            RoomState {
-                id: DEFAULT_ROOM,
-                name: "lobby".to_string(),
-                members: HashSet::new(),
-                history: VecDeque::new(),
-                active_streams: HashMap::new(),
-            },
+        for room in &config.rooms {
+            rooms.insert(
+                room.room_id(),
+                RoomState {
+                    id: room.room_id(),
+                    name: room.name.clone(),
+                    members: HashSet::new(),
+                    history: VecDeque::new(),
+                    active_streams: HashMap::new(),
+                },
+            );
+        }
+        if rooms.is_empty() {
+            rooms.insert(
+                DEFAULT_ROOM,
+                RoomState {
+                    id: DEFAULT_ROOM,
+                    name: "lobby".to_string(),
+                    members: HashSet::new(),
+                    history: VecDeque::new(),
+                    active_streams: HashMap::new(),
+                },
+            );
+        }
+
+        let server_key_pair = config
+            .server_key_pair()
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+        kvlog::info!(
+            "server identity loaded",
+            public_key = encode_hex(server_key_pair.public_key().as_ref()).as_str()
         );
+        let chat_history_limit =
+            usize::try_from(config.security.chat_history_limit).unwrap_or(usize::MAX);
+        let file_size_limit_bytes = config.security.max_file_size_bytes;
 
         Ok(Self {
+            config,
             poll,
             listener,
             udp,
@@ -146,8 +162,10 @@ impl Server {
             next_file_transfer: 1,
             active_uploads: HashMap::new(),
             reserved_file_names: HashSet::new(),
+            chat_history_limit,
+            file_size_limit_bytes,
             rng: ring::rand::SystemRandom::new(),
-            server_key_pair: dev_server_key_pair(),
+            server_key_pair,
         })
     }
 
@@ -375,8 +393,25 @@ impl Server {
                 receive_files,
                 file_receive_limit_bytes,
             ),
+            (
+                ConnState::AwaitAuth,
+                ClientControl::Pair {
+                    user,
+                    pairing_code,
+                    token: new_token,
+                    receive_files,
+                    file_receive_limit_bytes,
+                },
+            ) => self.pair_client(
+                token,
+                &user,
+                &pairing_code,
+                &new_token,
+                receive_files,
+                file_receive_limit_bytes,
+            ),
             (ConnState::AwaitAuth, _) => Err("authenticate before sending control messages".into()),
-            (ConnState::Ready, ClientControl::Authenticate { .. }) => {
+            (ConnState::Ready, ClientControl::Authenticate { .. } | ClientControl::Pair { .. }) => {
                 Err("session is already authenticated".into())
             }
             (ConnState::Ready, ClientControl::JoinRoom { room_id }) => {
@@ -473,15 +508,72 @@ impl Server {
         file_receive_limit_bytes: u64,
     ) -> Result<(), String> {
         kvlog::info!("authenticate attempt", token = token.0, user = user_name);
-        let Some(user) = USERS
+        let Some(user) = self
+            .config
+            .users
             .iter()
-            .find(|candidate| candidate.name == user_name && candidate.token == auth_token)
+            .find(|candidate| {
+                candidate.name == user_name
+                    && !candidate.token_hash.trim().is_empty()
+                    && verify_secret_hash(&candidate.token_hash, auth_token)
+            })
+            .cloned()
         else {
             kvlog::warn!("authenticate rejected", token = token.0, user = user_name);
             return Err("invalid user or token".to_string());
         };
+        self.establish_session(token, &user, receive_files, file_receive_limit_bytes)
+    }
+
+    fn pair_client(
+        &mut self,
+        token: Token,
+        user_name: &str,
+        pairing_code: &str,
+        new_token: &str,
+        receive_files: bool,
+        file_receive_limit_bytes: u64,
+    ) -> Result<(), String> {
+        kvlog::info!("pairing attempt", token = token.0, user = user_name);
+        let Some(candidate) = self
+            .config
+            .users
+            .iter()
+            .find(|candidate| candidate.name == user_name)
+            .cloned()
+        else {
+            kvlog::warn!("pairing rejected", token = token.0, user = user_name);
+            return Err("invalid user or pairing code".to_string());
+        };
+        if !candidate.has_pairing_code()
+            || !verify_secret_hash(&candidate.pairing_code_hash, pairing_code)
+        {
+            kvlog::warn!("pairing rejected", token = token.0, user = user_name);
+            return Err("invalid user or pairing code".to_string());
+        }
+
+        let token_hash = hash_secret(new_token);
+        let user = self.config.mark_user_paired(&candidate.name, token_hash)?;
+        kvlog::info!(
+            "pairing accepted",
+            token = token.0,
+            user_id = user.id,
+            user = user.name.as_str()
+        );
+        self.establish_session(token, &user, receive_files, file_receive_limit_bytes)
+    }
+
+    fn establish_session(
+        &mut self,
+        token: Token,
+        user: &UserConfig,
+        receive_files: bool,
+        file_receive_limit_bytes: u64,
+    ) -> Result<(), String> {
         let session_id = SessionId(self.next_session);
         self.next_session += 1;
+        let user_id = user.user_id();
+        let user_name = user.name.clone();
 
         let secrets = self
             .clients
@@ -493,8 +585,8 @@ impl Server {
         self.sessions.insert(
             session_id,
             Session {
-                user_id: user.id,
-                user_name: user.name.to_string(),
+                user_id,
+                user_name: user_name.clone(),
                 tcp_token: token,
                 room_id: None,
                 udp_addr: None,
@@ -511,15 +603,15 @@ impl Server {
         if let Some(client) = self.clients.get_mut(&token) {
             client.state = ConnState::Ready;
             client.session_id = Some(session_id);
-            client.user_id = Some(user.id);
+            client.user_id = Some(user_id);
         }
 
         kvlog::info!(
             "authenticate accepted",
             token = token.0,
             session_id = session_id.0,
-            user_id = user.id.0,
-            user = user.name,
+            user_id = user_id.0,
+            user = user_name.as_str(),
             receive_files,
             file_receive_limit_bytes
         );
@@ -528,7 +620,7 @@ impl Server {
             token,
             &ServerControl::Authenticated {
                 session_id,
-                user_id: user.id,
+                user_id,
                 rooms,
                 current_room: Some(DEFAULT_ROOM),
             },
@@ -759,9 +851,11 @@ impl Server {
         };
         self.next_message += 1;
         let mut history_len = 0;
-        if let Some(room) = self.rooms.get_mut(&room_id) {
+        if self.chat_history_limit > 0
+            && let Some(room) = self.rooms.get_mut(&room_id)
+        {
             room.history.push_back(message.clone());
-            while room.history.len() > MAX_CHAT_HISTORY {
+            while room.history.len() > self.chat_history_limit {
                 room.history.pop_front();
             }
             history_len = room.history.len();
@@ -792,10 +886,9 @@ impl Server {
             session_id = session_id.0,
             room_id = room_id.0,
             client_transfer_id = client_transfer_id.0,
-            file_size = size,
-            file_name = name.as_str()
+            file_size = size
         );
-        if size > SERVER_FILE_SIZE_LIMIT_BYTES {
+        if size > self.file_size_limit_bytes {
             return Err("file exceeds server maximum length".into());
         }
         let key = (session_id, client_transfer_id);
@@ -861,9 +954,11 @@ impl Server {
             body: format!("sent file `{}` ({})", file_name, format_bytes(size)),
         };
         self.next_message += 1;
-        if let Some(room) = self.rooms.get_mut(&room_id) {
+        if self.chat_history_limit > 0
+            && let Some(room) = self.rooms.get_mut(&room_id)
+        {
             room.history.push_back(message.clone());
-            while room.history.len() > MAX_CHAT_HISTORY {
+            while room.history.len() > self.chat_history_limit {
                 room.history.pop_front();
             }
         }
@@ -892,8 +987,6 @@ impl Server {
             ServerUpload {
                 server_transfer_id,
                 room_id,
-                file_name,
-                original_name: metadata.original_name,
                 size,
                 received: 0,
                 recipients,
@@ -977,8 +1070,6 @@ impl Server {
             room_id = upload.room_id.0,
             client_transfer_id = client_transfer_id.0,
             server_transfer_id = upload.server_transfer_id.0,
-            file_name = upload.file_name.as_str(),
-            original_name = upload.original_name.as_str(),
             file_size = upload.size
         );
         for recipient in &upload.recipients {
@@ -1722,8 +1813,6 @@ struct Session {
 struct ServerUpload {
     server_transfer_id: FileTransferId,
     room_id: RoomId,
-    file_name: String,
-    original_name: String,
     size: u64,
     received: u64,
     recipients: HashSet<SessionId>,
@@ -1759,16 +1848,12 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
-fn ordered_pair(a: SessionId, b: SessionId) -> (SessionId, SessionId) {
-    if a <= b { (a, b) } else { (b, a) }
+fn invalid_config(error: String) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidInput, error)
 }
 
-fn probe_addr_for(udp_addr: SocketAddr) -> SocketAddr {
-    UDP_PROBE_ADDR.parse().unwrap_or_else(|_| {
-        let mut probe = udp_addr;
-        probe.set_port(udp_addr.port().saturating_add(1));
-        probe
-    })
+fn ordered_pair(a: SessionId, b: SessionId) -> (SessionId, SessionId) {
+    if a <= b { (a, b) } else { (b, a) }
 }
 
 fn random_key(rng: &dyn SecureRandom) -> Result<KeyMaterial, String> {
@@ -1854,6 +1939,7 @@ fn conn_state_name(state: ConnState) -> &'static str {
 fn client_control_kind(control: &ClientControl) -> &'static str {
     match control {
         ClientControl::Authenticate { .. } => "authenticate",
+        ClientControl::Pair { .. } => "pair",
         ClientControl::JoinRoom { .. } => "join_room",
         ClientControl::SendChat { .. } => "send_chat",
         ClientControl::StartVoice { .. } => "start_voice",

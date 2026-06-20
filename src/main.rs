@@ -1175,6 +1175,8 @@ fn cli_option_takes_value(arg: &str) -> bool {
             | "--logfile"
             | "--user"
             | "--token"
+            | "--pairing-code"
+            | "--server-public-key"
             | "--tcp"
             | "--udp"
             | "--udp-probe"
@@ -1649,6 +1651,10 @@ mod tests {
             "tomchat".to_string(),
             "--config".to_string(),
             "dev.toml".to_string(),
+            "--pairing-code".to_string(),
+            "one-time-pairing-code".to_string(),
+            "--server-public-key".to_string(),
+            "de1235b52a8b96f16f91124a8b462d463f2af83756946effa70e842142a6d7cf".to_string(),
             "upload".to_string(),
             "some_file/foo.md".to_string(),
         ];

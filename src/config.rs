@@ -19,6 +19,10 @@ pub struct NetworkConfig {
     pub udp_probe_addr: SocketAddr,
     pub user: String,
     pub token: String,
+    #[toml(default)]
+    pub pairing_code: String,
+    #[toml(default)]
+    pub server_public_key: String,
     pub room_id: u32,
 }
 
@@ -30,6 +34,8 @@ impl Default for NetworkConfig {
             udp_probe_addr: default_udp_probe_addr(),
             user: "alice".to_string(),
             token: "alice-dev-token".to_string(),
+            pairing_code: String::new(),
+            server_public_key: String::new(),
             room_id: 1,
         }
     }
@@ -43,6 +49,8 @@ impl NetworkConfig {
             udp_probe_addr: self.udp_probe_addr,
             user: self.user.clone(),
             token: self.token.clone(),
+            pairing_code: non_empty_string(&self.pairing_code),
+            server_public_key: non_empty_string(&self.server_public_key),
             room_id: RoomId(self.room_id),
             file_receive_dir: files.receive_dir_path(),
             max_upload_bytes: files.max_upload_bytes,
@@ -239,6 +247,16 @@ impl Config {
         {
             self.network.token = token;
         }
+        if let Some(pairing_code) = value_arg(&args, "--pairing-code")
+            .or_else(|| std::env::var("TOMCHAT_PAIRING_CODE").ok())
+        {
+            self.network.pairing_code = pairing_code;
+        }
+        if let Some(server_public_key) = value_arg(&args, "--server-public-key")
+            .or_else(|| std::env::var("TOMCHAT_SERVER_PUBLIC_KEY").ok())
+        {
+            self.network.server_public_key = server_public_key;
+        }
         if let Some(addr) = value_arg(&args, "--tcp").or_else(|| std::env::var("TOMCHAT_TCP").ok())
         {
             if let Ok(addr) = addr.parse() {
@@ -357,11 +375,23 @@ fn user_config_path() -> Option<PathBuf> {
     std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config/tomchat.toml"))
 }
 
+fn non_empty_string(value: &str) -> Option<String> {
+    let value = value.trim();
+    (!value.is_empty()).then(|| value.to_string())
+}
+
 fn write_runtime_config<'de>(root: &mut Table<'de>, config: &Config, arena: &'de Arena) {
     {
         let network = ensure_table(root, "network", arena);
         insert_str(network, "user", &config.network.user, arena);
         insert_str(network, "token", &config.network.token, arena);
+        insert_str(network, "pairing-code", &config.network.pairing_code, arena);
+        insert_str(
+            network,
+            "server-public-key",
+            &config.network.server_public_key,
+            arena,
+        );
         insert_str(
             network,
             "tcp-addr",

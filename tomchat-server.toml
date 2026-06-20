@@ -1,0 +1,42 @@
+# Default tomchat server configuration. Server configuration is loaded from
+# ./tomchat-server.toml unless --config or TOMCHAT_SERVER_CONFIG is provided.
+#
+# This file is development-oriented. Replace the identity seed, pairing codes,
+# and tokens before using a server outside local testing.
+
+[network]
+tcp-addr = "127.0.0.1:41000"
+udp-addr = "127.0.0.1:41001"
+udp-probe-addr = "127.0.0.1:41002"
+
+[security]
+# 32-byte Ed25519 seed encoded as hex. The client must pin the corresponding
+# public key in network.server-public-key for non-development deployments.
+server-identity-seed = "546f6d636861742064657620736572766572206b657920763100000000000001"
+
+# Keep this at zero when the server should relay messages without retaining
+# message bodies for future joins.
+chat-history-limit = 0
+max-file-size-bytes = 52428800
+
+[[rooms]]
+id = 1
+name = "lobby"
+
+[[users]]
+id = 1
+name = "alice"
+token-hash = "sha256:8989ee243a8829e3364b6eb9cae74f1edfa53e327e5718fe337d23d6ab8b4625"
+pairing-code-hash = "sha256:09ec6995ba094921085c09c966bfa2b255d3482c5984a170543e025308dd74a5"
+
+[[users]]
+id = 2
+name = "bob"
+token-hash = "sha256:fd57e39ef28a47298ae51762fd3c907253ac7d4b7507fdf28fcf6d5e4bbaeb8a"
+pairing-code-hash = "sha256:d1be059b397960b34b0b3ed11be98e227804eaee1c3718cbd44387c293d4a4c9"
+
+[[users]]
+id = 3
+name = "carol"
+token-hash = "sha256:f93be296b384d5f0f8760bdb53cf3ea52a5e41e6f7a532645458784ece411f62"
+pairing-code-hash = "sha256:5b1f136a9fd5ab33374a068146745f004ff3db38f6732e81216dfae046bd5b25"
