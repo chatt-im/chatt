@@ -21,6 +21,8 @@ pub struct NetworkConfig {
     pub udp_addr: SocketAddr,
     #[toml(default = default_udp_probe_addr(), FromToml with = toml_spanner::helper::parse_string, ToToml with = toml_spanner::helper::display)]
     pub udp_probe_addr: SocketAddr,
+    #[toml(default = true)]
+    pub p2p_enabled: bool,
 }
 
 impl Default for NetworkConfig {
@@ -29,6 +31,7 @@ impl Default for NetworkConfig {
             tcp_addr: "127.0.0.1:41000".parse().expect("valid default TCP addr"),
             udp_addr: "127.0.0.1:41001".parse().expect("valid default UDP addr"),
             udp_probe_addr: default_udp_probe_addr(),
+            p2p_enabled: true,
         }
     }
 }
@@ -226,6 +229,17 @@ impl Config {
         if args.iter().any(|arg| arg == "--no-encryption") {
             self.security.encryption = false;
         }
+        if let Some(p2p_enabled) = value_arg(&args, "--p2p")
+            .or_else(|| value_arg(&args, "--p2p-enabled"))
+            .or_else(|| std::env::var("TOMCHAT_SERVER_P2P_ENABLED").ok())
+            .or_else(|| std::env::var("TOMCHAT_SERVER_P2P").ok())
+            .and_then(|value| parse_bool(&value))
+        {
+            self.network.p2p_enabled = p2p_enabled;
+        }
+        if args.iter().any(|arg| arg == "--no-p2p") {
+            self.network.p2p_enabled = false;
+        }
     }
 
     fn validate(&self, source: &str) -> Result<(), String> {
@@ -316,9 +330,10 @@ impl Config {
         out.push_str(&format!("tcp-addr = \"{}\"\n", self.network.tcp_addr));
         out.push_str(&format!("udp-addr = \"{}\"\n", self.network.udp_addr));
         out.push_str(&format!(
-            "udp-probe-addr = \"{}\"\n\n",
+            "udp-probe-addr = \"{}\"\n",
             self.network.udp_probe_addr
         ));
+        out.push_str(&format!("p2p-enabled = {}\n\n", self.network.p2p_enabled));
         out.push_str("[security]\n");
         out.push_str(&format!(
             "server-identity-seed = \"{}\"\n",
@@ -483,9 +498,20 @@ mod tests {
         config.config_path = None;
         config.validate("<test>").unwrap();
         assert_eq!(config.network.tcp_addr.to_string(), "127.0.0.1:41000");
+        assert!(config.network.p2p_enabled);
         assert!(config.security.encryption);
         assert_eq!(config.security.chat_history_limit, 0);
         assert_eq!(config.rooms[0].room_id(), RoomId(1));
+    }
+
+    #[test]
+    fn config_parses_p2p_disabled() {
+        let arena = toml_spanner::Arena::new();
+        let content = DEFAULT_SERVER_CONFIG.replace("p2p-enabled = true", "p2p-enabled = false");
+        let mut doc = toml_spanner::parse(&content, &arena).unwrap();
+        let config: Config = doc.to().unwrap();
+
+        assert!(!config.network.p2p_enabled);
     }
 
     #[test]
@@ -514,6 +540,7 @@ mod tests {
 
         assert_eq!(user.token_hash, token_hash);
         assert!(user.pairing_code_hash.is_empty());
+        assert!(content.contains("p2p-enabled = true"));
         assert!(content.contains(&format!("token-hash = \"{token_hash}\"")));
         assert!(content.contains("pairing-code-hash = \"\""));
     }

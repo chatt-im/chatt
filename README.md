@@ -115,6 +115,7 @@ Important server fields:
 tcp-addr = "127.0.0.1:41000"
 udp-addr = "127.0.0.1:41001"
 udp-probe-addr = "127.0.0.1:41002"
+p2p-enabled = true
 
 [security]
 server-identity-seed = "546f6d636861742064657620736572766572206b657920763100000000000001"
@@ -147,12 +148,16 @@ confidentiality.
 bodies for future room joins. Raising the value keeps that many messages in
 server memory.
 
+`p2p-enabled = false` disables P2P candidate exchange and NAT probing while
+leaving server-relayed UDP media enabled.
+
 Useful server overrides:
 
 - `--config`, `TOMCHAT_SERVER_CONFIG`
 - `--tcp`, `TOMCHAT_SERVER_TCP`
 - `--udp`, `TOMCHAT_SERVER_UDP`
 - `--udp-probe`, `TOMCHAT_SERVER_UDP_PROBE`
+- `--p2p true|false`, `--p2p-enabled true|false`, `--no-p2p`, `TOMCHAT_SERVER_P2P_ENABLED`, `TOMCHAT_SERVER_P2P`
 - `--encryption true|false`, `--no-encryption`, `TOMCHAT_SERVER_ENCRYPTION`
 - `--chat-history-limit`, `TOMCHAT_SERVER_CHAT_HISTORY_LIMIT`
 

@@ -49,17 +49,33 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         udp_addr = %config.network.udp_addr,
         udp_probe_addr = %config.network.udp_probe_addr,
         server_public_key = server_public_key.as_str(),
-        encryption = config.security.encryption
+        encryption = config.security.encryption,
+        p2p_enabled = config.network.p2p_enabled
     );
     let tcp_addr = config.network.tcp_addr;
     let udp_addr = config.network.udp_addr;
     let udp_probe_addr = config.network.udp_probe_addr;
+    let p2p_enabled = config.network.p2p_enabled;
     let mut server = Server::bind(config)?;
-    println!("tomchat server listening on tcp {tcp_addr}, udp {udp_addr}, probe {udp_probe_addr}");
+    if p2p_enabled {
+        println!(
+            "tomchat server listening on tcp {tcp_addr}, udp {udp_addr}, probe {udp_probe_addr}"
+        );
+    } else {
+        println!("tomchat server listening on tcp {tcp_addr}, udp {udp_addr} (P2P disabled)");
+    }
     println!("tomchat server public key: {server_public_key}");
     println!(
         "tomchat transport encryption: {}",
         if server.config.security.encryption {
+            "enabled"
+        } else {
+            "disabled"
+        }
+    );
+    println!(
+        "tomchat P2P support: {}",
+        if server.config.network.p2p_enabled {
             "enabled"
         } else {
             "disabled"
@@ -70,7 +86,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         tcp_addr = %tcp_addr,
         udp_addr = %udp_addr,
         udp_probe_addr = %udp_probe_addr,
-        encryption = server.config.security.encryption
+        encryption = server.config.security.encryption,
+        p2p_enabled = server.config.network.p2p_enabled
     );
     server.run()
 }
@@ -80,7 +97,7 @@ struct Server {
     poll: Poll,
     listener: TcpListener,
     udp: UdpSocket,
-    udp_probe: UdpSocket,
+    udp_probe: Option<UdpSocket>,
     clients: HashMap<Token, ClientConn>,
     sessions: HashMap<SessionId, Session>,
     media_key_to_session: HashMap<u32, SessionId>,
@@ -106,16 +123,23 @@ impl Server {
         let tcp_addr = config.network.tcp_addr;
         let udp_addr = config.network.udp_addr;
         let udp_probe_addr = config.network.udp_probe_addr;
+        let p2p_enabled = config.network.p2p_enabled;
         let poll = Poll::new()?;
         let mut listener = TcpListener::bind(tcp_addr)?;
         let mut udp = UdpSocket::bind(udp_addr)?;
-        let mut udp_probe = UdpSocket::bind(udp_probe_addr)?;
+        let mut udp_probe = if p2p_enabled {
+            Some(UdpSocket::bind(udp_probe_addr)?)
+        } else {
+            None
+        };
         poll.registry()
             .register(&mut listener, LISTENER, Interest::READABLE)?;
         poll.registry()
             .register(&mut udp, UDP, Interest::READABLE)?;
-        poll.registry()
-            .register(&mut udp_probe, UDP_PROBE, Interest::READABLE)?;
+        if let Some(udp_probe) = udp_probe.as_mut() {
+            poll.registry()
+                .register(udp_probe, UDP_PROBE, Interest::READABLE)?;
+        }
 
         let mut rooms = HashMap::new();
         for room in &config.rooms {
@@ -802,6 +826,9 @@ impl Server {
     }
 
     fn broadcast_p2p_gone(&mut self, session_id: SessionId, room_id: RoomId) {
+        if !self.config.network.p2p_enabled {
+            return;
+        }
         let Some(user_id) = self
             .sessions
             .get(&session_id)
@@ -1324,6 +1351,20 @@ impl Server {
         tie_breaker: u64,
         candidates: Vec<P2pCandidate>,
     ) -> Result<(), String> {
+        if !self.config.network.p2p_enabled {
+            kvlog::info!(
+                "p2p candidates ignored; p2p disabled",
+                session_id = session_id.0,
+                room_id = room_id.0,
+                generation,
+                candidate_count = candidates.len()
+            );
+            if let Some(session) = self.sessions.get_mut(&session_id) {
+                session.p2p = None;
+            }
+            self.remove_peer_links(session_id);
+            return Ok(());
+        }
         let in_room = self
             .sessions
             .get(&session_id)
@@ -1454,12 +1495,15 @@ impl Server {
     fn receive_udp(&mut self, probe_id: u8) {
         let mut buf = [0u8; 2048];
         loop {
-            let socket = if probe_id == 0 {
-                &mut self.udp
+            let received = if probe_id == 0 {
+                self.udp.recv_from(&mut buf)
             } else {
-                &mut self.udp_probe
+                let Some(udp_probe) = self.udp_probe.as_mut() else {
+                    return;
+                };
+                udp_probe.recv_from(&mut buf)
             };
-            let (len, src) = match socket.recv_from(&mut buf) {
+            let (len, src) = match received {
                 Ok(value) => value,
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
                 Err(error) => {
@@ -1525,12 +1569,14 @@ impl Server {
                 let token = self.sessions.get(&session_id).map(|s| s.tcp_token);
                 if let Some(token) = token {
                     let _ = self.send_control_to_token(token, &ServerControl::UdpBound);
-                    let _ = self.send_control_to_token(
-                        token,
-                        &ServerControl::UdpReflexive {
-                            addr: src.to_string(),
-                        },
-                    );
+                    if self.config.network.p2p_enabled {
+                        let _ = self.send_control_to_token(
+                            token,
+                            &ServerControl::UdpReflexive {
+                                addr: src.to_string(),
+                            },
+                        );
+                    }
                 }
                 Ok(())
             }
@@ -1540,6 +1586,9 @@ impl Server {
             } => {
                 if bound != session_id {
                     return Err("NAT probe session mismatch".into());
+                }
+                if !self.config.network.p2p_enabled {
+                    return Ok(());
                 }
                 let token = self.sessions.get(&session_id).map(|s| s.tcp_token);
                 if let Some(token) = token {

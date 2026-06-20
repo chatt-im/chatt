@@ -8,6 +8,9 @@
 tcp-addr = "127.0.0.1:41000"
 udp-addr = "127.0.0.1:41001"
 udp-probe-addr = "127.0.0.1:41002"
+# Set to false to disable P2P candidate exchange and NAT probing. Voice still
+# works through server-relayed UDP media.
+p2p-enabled = true
 
 [security]
 # 32-byte Ed25519 seed encoded as hex. The client must pin the corresponding
