@@ -33,8 +33,11 @@ const MAX_CHAT_HISTORY: usize = 200;
 const POLL_TIMEOUT: Duration = Duration::from_millis(100);
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let _logger = kvlog::spawn_collector_from_env(Some("tomchat-server"), false);
+    kvlog::info!("server starting", tcp_addr = TCP_ADDR, udp_addr = UDP_ADDR);
     let mut server = Server::bind(TCP_ADDR.parse()?, UDP_ADDR.parse()?)?;
     println!("tomchat server listening on tcp {TCP_ADDR}, udp {UDP_ADDR}");
+    kvlog::info!("server listening", tcp_addr = TCP_ADDR, udp_addr = UDP_ADDR);
     server.run()
 }
 
@@ -141,13 +144,19 @@ impl Server {
 
     fn accept_clients(&mut self) -> io::Result<()> {
         loop {
-            let (mut socket, _addr) = match self.listener.accept() {
+            let (mut socket, addr) = match self.listener.accept() {
                 Ok(value) => value,
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(()),
                 Err(error) => return Err(error),
             };
             let token = Token(self.next_token);
             self.next_token += 1;
+            kvlog::info!(
+                "tcp client accepted",
+                token = token.0,
+                addr = %addr,
+                client_count = self.clients.len() + 1
+            );
             self.poll.registry().register(
                 &mut socket,
                 token,
@@ -177,13 +186,22 @@ impl Server {
             loop {
                 match client.socket.read(&mut buf) {
                     Ok(0) => {
+                        kvlog::info!("tcp client closed", token = token.0);
                         disconnected = true;
                         break;
                     }
-                    Ok(n) => client.read_buf.extend_from_slice(&buf[..n]),
+                    Ok(n) => {
+                        client.read_buf.extend_from_slice(&buf[..n]);
+                        kvlog::info!(
+                            "tcp client bytes received",
+                            token = token.0,
+                            size = n,
+                            buffered = client.read_buf.len()
+                        );
+                    }
                     Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
                     Err(error) => {
-                        eprintln!("client {} read failed: {error}", token.0);
+                        kvlog::warn!("tcp client read failed", token = token.0, error = %error);
                         disconnected = true;
                         break;
                     }
@@ -202,7 +220,11 @@ impl Server {
                     Ok(Some(frame)) => frame,
                     Ok(None) => break,
                     Err(error) => {
-                        eprintln!("client {} sent invalid frame: {error}", token.0);
+                        kvlog::warn!(
+                            "tcp client sent invalid frame",
+                            token = token.0,
+                            error = %error
+                        );
                         self.disconnect(token);
                         break;
                     }
@@ -211,7 +233,7 @@ impl Server {
             };
 
             if let Err(error) = self.process_frame(token, frame) {
-                eprintln!("client {} protocol error: {error}", token.0);
+                kvlog::warn!("tcp client protocol error", token = token.0, error = %error);
                 self.disconnect(token);
                 break;
             }
@@ -225,9 +247,21 @@ impl Server {
             .map(|client| client.state)
             .ok_or_else(|| "unknown client token".to_string())?;
 
+        kvlog::info!(
+            "tcp frame processing",
+            token = token.0,
+            state = conn_state_name(state),
+            size = frame_bytes.len()
+        );
         match state {
             ConnState::AwaitClientHello => {
                 let hello = decode_client_hello(&frame_bytes)?;
+                kvlog::info!(
+                    "client hello decoded",
+                    token = token.0,
+                    client_nonce_size = hello.client_nonce.len(),
+                    client_ephemeral_size = hello.client_ephemeral.len()
+                );
                 let response = respond_to_client_hello(&self.rng, &self.server_key_pair, &hello)
                     .map_err(|error| error.to_string())?;
                 let encoded = encode_server_hello(&response.hello);
@@ -243,6 +277,12 @@ impl Server {
                 ));
                 client.secrets = Some(response.secrets);
                 client.state = ConnState::AwaitAuth;
+                kvlog::info!(
+                    "client handshake completed",
+                    token = token.0,
+                    queued_bytes = client.write_buf.len()
+                );
+                self.write_client(token);
                 Ok(())
             }
             ConnState::AwaitAuth | ConnState::Ready => {
@@ -258,7 +298,17 @@ impl Server {
                         .open_next(CHANNEL_CONTROL, &frame_bytes)
                         .map_err(|error| error.to_string())?
                 };
+                kvlog::info!(
+                    "client control decrypted",
+                    token = token.0,
+                    payload_size = plaintext.len()
+                );
                 let control = decode_client_control(&plaintext)?;
+                kvlog::info!(
+                    "client control decoded",
+                    token = token.0,
+                    kind = client_control_kind(&control)
+                );
                 self.handle_control(token, control)
             }
         }
@@ -271,6 +321,12 @@ impl Server {
             .map(|client| client.state)
             .ok_or_else(|| "unknown client token".to_string())?;
 
+        kvlog::info!(
+            "client control handling",
+            token = token.0,
+            state = conn_state_name(state),
+            kind = client_control_kind(&control)
+        );
         match (state, control) {
             (
                 ConnState::AwaitAuth,
@@ -314,10 +370,14 @@ impl Server {
         user_name: &str,
         auth_token: &str,
     ) -> Result<(), String> {
-        let user = USERS
+        kvlog::info!("authenticate attempt", token = token.0, user = user_name);
+        let Some(user) = USERS
             .iter()
             .find(|candidate| candidate.name == user_name && candidate.token == auth_token)
-            .ok_or_else(|| "invalid user or token".to_string())?;
+        else {
+            kvlog::warn!("authenticate rejected", token = token.0, user = user_name);
+            return Err("invalid user or token".to_string());
+        };
         let session_id = SessionId(self.next_session);
         self.next_session += 1;
 
@@ -349,6 +409,13 @@ impl Server {
             client.user_id = Some(user.id);
         }
 
+        kvlog::info!(
+            "authenticate accepted",
+            token = token.0,
+            session_id = session_id.0,
+            user_id = user.id.0,
+            user = user.name
+        );
         let rooms = self.room_infos();
         self.send_control_to_token(
             token,
@@ -375,7 +442,18 @@ impl Server {
     }
 
     fn join_room(&mut self, session_id: SessionId, room_id: RoomId) {
+        kvlog::info!(
+            "join room requested",
+            session_id = session_id.0,
+            room_id = room_id.0
+        );
         if !self.rooms.contains_key(&room_id) {
+            kvlog::warn!(
+                "join room rejected",
+                session_id = session_id.0,
+                room_id = room_id.0,
+                error = "room not found"
+            );
             if let Some(session) = self.sessions.get(&session_id) {
                 let _ = self.send_control_to_token(
                     session.tcp_token,
@@ -390,6 +468,12 @@ impl Server {
 
         if let Some(previous) = self.sessions.get(&session_id).and_then(|s| s.room_id) {
             if previous != room_id {
+                kvlog::info!(
+                    "leaving previous room before join",
+                    session_id = session_id.0,
+                    previous_room_id = previous.0,
+                    room_id = room_id.0
+                );
                 self.leave_room(session_id, previous);
             }
         }
@@ -399,6 +483,12 @@ impl Server {
         }
         if let Some(room) = self.rooms.get_mut(&room_id) {
             room.members.insert(session_id);
+            kvlog::info!(
+                "room membership updated",
+                session_id = session_id.0,
+                room_id = room_id.0,
+                member_count = room.members.len()
+            );
         }
 
         let participant = self.participant_for_session(session_id);
@@ -432,9 +522,19 @@ impl Server {
                 participants,
             },
         );
+        kvlog::info!(
+            "room joined sent",
+            session_id = session_id.0,
+            room_id = room_id.0
+        );
     }
 
     fn leave_room(&mut self, session_id: SessionId, room_id: RoomId) {
+        kvlog::info!(
+            "leave room requested",
+            session_id = session_id.0,
+            room_id = room_id.0
+        );
         self.stop_voice(session_id, None);
         if let Some(room) = self.rooms.get_mut(&room_id) {
             room.members.remove(&session_id);
@@ -458,15 +558,35 @@ impl Server {
         room_id: RoomId,
         body: String,
     ) -> Result<(), String> {
+        let body_size = body.len();
+        kvlog::info!(
+            "chat send requested",
+            session_id = session_id.0,
+            room_id = room_id.0,
+            body_size
+        );
         let (sender, sender_name, member) = match self.sessions.get(&session_id) {
             Some(session) => (
                 session.user_id,
                 session.user_name.clone(),
                 session.room_id == Some(room_id),
             ),
-            None => return Err("unknown session".into()),
+            None => {
+                kvlog::warn!(
+                    "chat send rejected",
+                    session_id = session_id.0,
+                    error = "unknown session"
+                );
+                return Err("unknown session".into());
+            }
         };
         if !member {
+            kvlog::warn!(
+                "chat send rejected",
+                session_id = session_id.0,
+                room_id = room_id.0,
+                error = "not a room member"
+            );
             return Err("join the room before sending chat".into());
         }
         let message = ChatMessage {
@@ -478,12 +598,23 @@ impl Server {
             body,
         };
         self.next_message += 1;
+        let mut history_len = 0;
         if let Some(room) = self.rooms.get_mut(&room_id) {
             room.history.push_back(message.clone());
             while room.history.len() > MAX_CHAT_HISTORY {
                 room.history.pop_front();
             }
+            history_len = room.history.len();
         }
+        kvlog::info!(
+            "chat message accepted",
+            session_id = session_id.0,
+            room_id = room_id.0,
+            message_id = message.message_id.0,
+            user_id = sender.0,
+            body_size,
+            history_len
+        );
         self.broadcast_control(room_id, &ServerControl::Chat { message });
         Ok(())
     }
@@ -494,6 +625,12 @@ impl Server {
             None => return Err("unknown session".into()),
         };
         if !in_room {
+            kvlog::warn!(
+                "voice start rejected",
+                session_id = session_id.0,
+                room_id = room_id.0,
+                error = "not a room member"
+            );
             return Err("join the room before starting voice".into());
         }
         if self
@@ -512,6 +649,13 @@ impl Server {
         if let Some(room) = self.rooms.get_mut(&room_id) {
             room.active_streams.insert(stream_id, session_id);
         }
+        kvlog::info!(
+            "voice started",
+            session_id = session_id.0,
+            room_id = room_id.0,
+            user_id = user_id.0,
+            stream_id = stream_id.0
+        );
         self.broadcast_control(
             room_id,
             &ServerControl::VoiceStarted {
@@ -543,6 +687,13 @@ impl Server {
         if let Some(room) = self.rooms.get_mut(&room_id) {
             room.active_streams.remove(&stream_id);
         }
+        kvlog::info!(
+            "voice stopped",
+            session_id = session_id.0,
+            room_id = room_id.0,
+            user_id = user_id.0,
+            stream_id = stream_id.0
+        );
         self.broadcast_control(
             room_id,
             &ServerControl::VoiceStopped {
@@ -560,13 +711,18 @@ impl Server {
                 Ok(value) => value,
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
                 Err(error) => {
-                    eprintln!("udp receive failed: {error}");
+                    kvlog::warn!("udp receive failed", error = %error);
                     break;
                 }
             };
             let packet = &buf[..len];
             if let Err(error) = self.handle_udp_packet(src, packet) {
-                eprintln!("udp packet from {src} rejected: {error}");
+                kvlog::warn!(
+                    "udp packet rejected",
+                    addr = %src,
+                    packet_size = len,
+                    error = %error
+                );
             }
         }
     }
@@ -595,8 +751,14 @@ impl Server {
         match payload {
             MediaPayload::Bind { session_id: bound } => {
                 if bound != session_id {
+                    kvlog::warn!(
+                        "udp bind rejected",
+                        session_id = session_id.0,
+                        bound_session_id = bound.0
+                    );
                     return Err("UDP bind session mismatch".into());
                 }
+                kvlog::info!("udp session bound", session_id = session_id.0, addr = %src);
                 let token = self.sessions.get(&session_id).map(|s| s.tcp_token);
                 if let Some(token) = token {
                     let _ = self.send_control_to_token(token, &ServerControl::UdpBound);
@@ -644,6 +806,15 @@ impl Server {
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
+        kvlog::info!(
+            "voice packet relaying",
+            session_id = sender_session_id.0,
+            room_id = room_id.0,
+            stream_id = stream_id.0,
+            sequence,
+            recipient_count = recipients.len(),
+            payload_size = opus.len()
+        );
         let payload = MediaPayload::Voice {
             stream_id,
             sequence,
@@ -668,10 +839,18 @@ impl Server {
         match media::seal_media(&session.secrets.media_send, counter, payload) {
             Ok(packet) => {
                 if let Err(error) = self.udp.send_to(&packet, addr) {
-                    eprintln!("udp send to {addr} failed: {error}");
+                    kvlog::warn!(
+                        "udp send failed",
+                        session_id = session_id.0,
+                        addr = %addr,
+                        packet_size = packet.len(),
+                        error = %error
+                    );
                 }
             }
-            Err(error) => eprintln!("udp seal failed for session {}: {error}", session_id.0),
+            Err(error) => {
+                kvlog::warn!("udp seal failed", session_id = session_id.0, error = %error);
+            }
         }
     }
 
@@ -680,7 +859,9 @@ impl Server {
         token: Token,
         control: &ServerControl,
     ) -> Result<(), String> {
+        let kind = server_control_kind(control);
         let payload = encode_server_control(control);
+        let payload_size = payload.len();
         let client = self
             .clients
             .get_mut(&token)
@@ -691,10 +872,23 @@ impl Server {
             .ok_or_else(|| "missing control cipher".to_string())?
             .seal_next(CHANNEL_CONTROL, &payload)
             .map_err(|error| error.to_string())?;
-        frame::encode_frame(&encrypted, &mut client.write_buf).map_err(|error| error.to_string())
+        let encrypted_size = encrypted.len();
+        frame::encode_frame(&encrypted, &mut client.write_buf)
+            .map_err(|error| error.to_string())?;
+        kvlog::info!(
+            "server control queued",
+            token = token.0,
+            kind,
+            payload_size,
+            encrypted_size,
+            queued_bytes = client.write_buf.len()
+        );
+        self.write_client(token);
+        Ok(())
     }
 
     fn broadcast_control(&mut self, room_id: RoomId, control: &ServerControl) {
+        let kind = server_control_kind(control);
         let tokens = self
             .rooms
             .get(&room_id)
@@ -705,8 +899,22 @@ impl Server {
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
+        kvlog::info!(
+            "server control broadcasting",
+            room_id = room_id.0,
+            kind,
+            recipient_count = tokens.len()
+        );
         for token in tokens {
-            let _ = self.send_control_to_token(token, control);
+            if let Err(error) = self.send_control_to_token(token, control) {
+                kvlog::warn!(
+                    "server control broadcast failed",
+                    token = token.0,
+                    room_id = room_id.0,
+                    kind,
+                    error = %error
+                );
+            }
         }
     }
 
@@ -718,10 +926,16 @@ impl Server {
                     Ok(0) => break,
                     Ok(n) => {
                         client.write_buf.drain(..n);
+                        kvlog::info!(
+                            "tcp client bytes written",
+                            token = token.0,
+                            size = n,
+                            remaining = client.write_buf.len()
+                        );
                     }
                     Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
                     Err(error) => {
-                        eprintln!("client {} write failed: {error}", token.0);
+                        kvlog::warn!("tcp client write failed", token = token.0, error = %error);
                         disconnected = true;
                         break;
                     }
@@ -748,6 +962,12 @@ impl Server {
         let Some(client) = self.clients.remove(&token) else {
             return;
         };
+        kvlog::info!(
+            "tcp client disconnecting",
+            token = token.0,
+            session_id = client.session_id.map(|id| id.0),
+            user_id = client.user_id.map(|id| id.0)
+        );
         if let Some(session_id) = client.session_id {
             let room_id = self.sessions.get(&session_id).and_then(|s| s.room_id);
             if let Some(room_id) = room_id {
@@ -834,4 +1054,37 @@ fn now_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_millis() as u64)
         .unwrap_or(0)
+}
+
+fn conn_state_name(state: ConnState) -> &'static str {
+    match state {
+        ConnState::AwaitClientHello => "await_client_hello",
+        ConnState::AwaitAuth => "await_auth",
+        ConnState::Ready => "ready",
+    }
+}
+
+fn client_control_kind(control: &ClientControl) -> &'static str {
+    match control {
+        ClientControl::Authenticate { .. } => "authenticate",
+        ClientControl::JoinRoom { .. } => "join_room",
+        ClientControl::SendChat { .. } => "send_chat",
+        ClientControl::StartVoice { .. } => "start_voice",
+        ClientControl::StopVoice { .. } => "stop_voice",
+        ClientControl::Ping { .. } => "ping",
+    }
+}
+
+fn server_control_kind(control: &ServerControl) -> &'static str {
+    match control {
+        ServerControl::Authenticated { .. } => "authenticated",
+        ServerControl::RoomJoined { .. } => "room_joined",
+        ServerControl::Chat { .. } => "chat",
+        ServerControl::Presence { .. } => "presence",
+        ServerControl::VoiceStarted { .. } => "voice_started",
+        ServerControl::VoiceStopped { .. } => "voice_stopped",
+        ServerControl::UdpBound => "udp_bound",
+        ServerControl::Pong { .. } => "pong",
+        ServerControl::Error { .. } => "error",
+    }
 }

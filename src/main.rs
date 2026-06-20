@@ -10,11 +10,17 @@ mod packet_log;
 use std::{
     collections::VecDeque,
     net::SocketAddr,
-    sync::mpsc::{self, Receiver},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+        mpsc::{self, Receiver},
+    },
     time::Duration,
 };
 
-use audio::{BufferRequest, DeviceInfo, LiveCapture, LiveCaptureConfig, LivePlayback};
+use audio::{
+    BufferRequest, DeviceInfo, LiveCapture, LiveCaptureConfig, LivePlayback, StatsSnapshot,
+};
 use client_net::{ClientConfig, NetworkClient, NetworkCommand, NetworkEvent};
 use extui::{
     AnsiColor, BoxStyle, Buffer, Ellipsis, Rect, Style, Terminal, TerminalFlags,
@@ -29,6 +35,7 @@ use rpc::{
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
 const MAX_MESSAGES: usize = 500;
 const BITRATES: [i32; 4] = [16_000, 24_000, 32_000, 48_000];
+const KNOWN_USERS: &[&str] = &["alice", "bob", "carol"];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum View {
@@ -65,6 +72,7 @@ impl SettingsFocus {
 }
 
 struct App {
+    config: ClientConfig,
     user: String,
     room_name: String,
     status: String,
@@ -81,9 +89,14 @@ struct App {
     bitrate_index: usize,
     buffer_index: usize,
     denoise: bool,
+    mic_muted: Arc<AtomicBool>,
+    voice_tx_enabled: Arc<AtomicBool>,
+    mic_error: Option<String>,
     capture: Option<LiveCapture>,
     playback: Option<LivePlayback>,
     call_enabled: bool,
+    voice_packets_received: u64,
+    voice_bytes_received: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -103,6 +116,7 @@ impl App {
         let (event_tx, event_rx) = mpsc::channel();
         let network = NetworkClient::spawn(config.clone(), event_tx);
         Self {
+            config: config.clone(),
             user: config.user,
             room_name: "lobby".to_string(),
             status: "connecting".to_string(),
@@ -119,9 +133,14 @@ impl App {
             bitrate_index: 1,
             buffer_index: 0,
             denoise: true,
+            mic_muted: Arc::new(AtomicBool::new(false)),
+            voice_tx_enabled: Arc::new(AtomicBool::new(false)),
+            mic_error: None,
             capture: None,
             playback: None,
             call_enabled: false,
+            voice_packets_received: 0,
+            voice_bytes_received: 0,
         }
     }
 
@@ -132,8 +151,12 @@ impl App {
     }
 
     fn handle_network_event(&mut self, event: NetworkEvent) {
+        kvlog::info!("app network event", kind = network_event_kind(&event));
         match event {
-            NetworkEvent::Connected => self.status = "connected; authenticating".to_string(),
+            NetworkEvent::Connected => {
+                kvlog::info!("app connected", user = self.user.as_str());
+                self.status = "connected; authenticating".to_string();
+            }
             NetworkEvent::Authenticated {
                 session_id,
                 user_id,
@@ -144,16 +167,37 @@ impl App {
                 if let Some(room) = rooms.first() {
                     self.room_name = room.name.clone();
                 }
+                kvlog::info!(
+                    "app authenticated",
+                    session_id = session_id.0,
+                    user_id = user_id.0,
+                    user = self.user.as_str(),
+                    room_count = rooms.len()
+                );
                 self.status = format!("authenticated as {}", self.user);
             }
             NetworkEvent::RoomJoined { room_id, history } => {
+                kvlog::info!(
+                    "app room joined",
+                    room_id = room_id.0,
+                    history_len = history.len()
+                );
                 self.messages.clear();
                 for message in history {
                     self.push_chat(message);
                 }
                 self.status = format!("joined room {}", room_id.0);
             }
-            NetworkEvent::Chat(message) => self.push_chat(message),
+            NetworkEvent::Chat(message) => {
+                kvlog::info!(
+                    "app chat event",
+                    room_id = message.room_id.0,
+                    message_id = message.message_id.0,
+                    user_id = message.sender.0,
+                    body_size = message.body.len()
+                );
+                self.push_chat(message);
+            }
             NetworkEvent::VoiceStarted { user_id, .. } => {
                 if Some(user_id) == self.user_id {
                     self.status = "call connected".to_string();
@@ -166,7 +210,8 @@ impl App {
                 if Some(user_id) == self.user_id {
                     self.status = "call stopped".to_string();
                     self.call_enabled = false;
-                    self.stop_audio();
+                    self.voice_tx_enabled.store(false, Ordering::Relaxed);
+                    self.playback.take();
                 } else {
                     if let Some(playback) = &self.playback {
                         playback.stop_stream(stream_id.0);
@@ -175,18 +220,39 @@ impl App {
                 }
             }
             NetworkEvent::VoicePacket(packet) => {
+                self.voice_packets_received = self.voice_packets_received.saturating_add(1);
+                self.voice_bytes_received = self
+                    .voice_bytes_received
+                    .saturating_add(packet.payload.len() as u64);
                 if let Some(playback) = &self.playback {
                     playback.push(packet);
                 }
             }
             NetworkEvent::Status(status) => self.status = status,
-            NetworkEvent::Error(error) => self.status = format!("error: {error}"),
-            NetworkEvent::Disconnected => self.status = "disconnected".to_string(),
+            NetworkEvent::Error(error) => {
+                kvlog::warn!("app network error", error = error.as_str());
+                self.status = format!("error: {error}");
+            }
+            NetworkEvent::Disconnected => {
+                kvlog::info!("app disconnected", user = self.user.as_str());
+                self.voice_tx_enabled.store(false, Ordering::Relaxed);
+                self.call_enabled = false;
+                self.playback.take();
+                self.status = "disconnected".to_string();
+            }
         }
     }
 
     fn push_chat(&mut self, message: ChatMessage) {
         let local = Some(message.sender) == self.user_id;
+        kvlog::info!(
+            "app chat appended",
+            message_id = message.message_id.0,
+            room_id = message.room_id.0,
+            user_id = message.sender.0,
+            local,
+            body_size = message.body.len()
+        );
         self.messages.push_back(ChatLine {
             sender: message.sender_name,
             body: message.body,
@@ -265,13 +331,15 @@ impl App {
     }
 
     fn refresh_input_devices(&mut self) {
-        if self.capture.is_some() || self.playback.is_some() {
+        if self.voice_tx_enabled.load(Ordering::Relaxed) || self.playback.is_some() {
             self.status = "stop call before refreshing devices".to_string();
             return;
         }
+        self.stop_mic_capture();
 
         match audio::input_devices(self.buffer_request()) {
             Ok(devices) => {
+                let device_count = devices.len();
                 self.devices = devices;
                 if self.devices.is_empty() {
                     self.selected_input_device = None;
@@ -283,12 +351,14 @@ impl App {
                     {
                         self.selected_input_device = None;
                     }
-                    self.status = format!("found {} input device(s)", self.devices.len());
+                    self.status = format!("found {device_count} input device(s)");
+                    self.start_mic_monitor();
                 }
             }
             Err(error) => {
                 self.devices.clear();
                 self.selected_input_device = None;
+                self.mic_error = Some(error.clone());
                 self.status = error;
             }
         }
@@ -305,16 +375,16 @@ impl App {
             SettingsFocus::Device => self.adjust_input_device(delta),
             SettingsFocus::Bitrate => {
                 self.bitrate_index = cycle_index(self.bitrate_index, BITRATES.len(), delta);
-                self.note_settings_changed();
+                self.note_capture_settings_changed();
             }
             SettingsFocus::Denoise => {
                 self.denoise = !self.denoise;
-                self.note_settings_changed();
+                self.note_capture_settings_changed();
             }
             SettingsFocus::Buffer => {
                 self.buffer_index =
                     cycle_index(self.buffer_index, BufferRequest::OPTIONS.len(), delta);
-                if self.capture.is_none() && self.playback.is_none() {
+                if !self.voice_tx_enabled.load(Ordering::Relaxed) && self.playback.is_none() {
                     self.refresh_input_devices();
                 } else {
                     self.note_settings_changed();
@@ -332,14 +402,14 @@ impl App {
             .unwrap_or(0);
         let next = cycle_index(current, len, delta);
         self.selected_input_device = (next > 0).then_some(next - 1);
-        self.note_settings_changed();
+        self.note_capture_settings_changed();
     }
 
     fn activate_settings_focus(&mut self) {
         match self.settings_focus {
             SettingsFocus::Denoise => {
                 self.denoise = !self.denoise;
-                self.note_settings_changed();
+                self.note_capture_settings_changed();
             }
             SettingsFocus::Refresh => self.refresh_input_devices(),
             SettingsFocus::Close => self.close_settings(),
@@ -350,11 +420,19 @@ impl App {
     }
 
     fn note_settings_changed(&mut self) {
-        self.status = if self.capture.is_some() || self.playback.is_some() {
+        self.status = if self.voice_tx_enabled.load(Ordering::Relaxed) || self.playback.is_some() {
             "settings apply to the next call".to_string()
         } else {
             "settings updated".to_string()
         };
+    }
+
+    fn note_capture_settings_changed(&mut self) {
+        if self.voice_tx_enabled.load(Ordering::Relaxed) || self.playback.is_some() {
+            self.note_settings_changed();
+            return;
+        }
+        self.restart_mic_monitor();
     }
 
     fn bitrate_bps(&self) -> i32 {
@@ -376,39 +454,151 @@ impl App {
             "/quit" => {}
             "/call" => self.start_call(),
             "/hangup" => self.stop_call(),
+            "/mute" => self.set_mute(true),
+            "/unmute" => self.set_mute(false),
+            "/muted" => self.show_mute_status(),
             "/clear" => self.messages.clear(),
             "/config" | "/settings" => self.open_settings(),
+            "/users" => self.show_users(),
+            "/whoami" => self.show_current_user(),
+            command if command.starts_with("/user ") => self.change_user_command(command),
             command if command.starts_with('/') => {
                 self.status = format!("unknown command: {command}");
             }
             body => {
+                kvlog::info!(
+                    "app chat submit",
+                    user = self.user.as_str(),
+                    body_size = body.len()
+                );
                 self.network
                     .send(NetworkCommand::SendChat(body.to_string()));
             }
         }
     }
 
-    fn start_call(&mut self) {
-        if self.capture.is_some() || self.playback.is_some() {
-            self.status = "call already active".to_string();
+    fn set_mute(&mut self, muted: bool) {
+        self.mic_muted.store(muted, Ordering::Relaxed);
+        kvlog::info!("app mute changed", muted);
+        self.status = if muted {
+            "microphone muted".to_string()
+        } else {
+            "microphone unmuted".to_string()
+        };
+    }
+
+    fn show_mute_status(&mut self) {
+        self.status = if self.mic_muted.load(Ordering::Relaxed) {
+            "microphone muted".to_string()
+        } else {
+            "microphone unmuted".to_string()
+        };
+    }
+
+    fn show_users(&mut self) {
+        self.status = format!("users: {}", KNOWN_USERS.join(", "));
+    }
+
+    fn show_current_user(&mut self) {
+        self.status = match self.user_id {
+            Some(user_id) => format!("signed in as {} (user {})", self.user, user_id.0),
+            None => format!("connecting as {}", self.user),
+        };
+    }
+
+    fn change_user_command(&mut self, command: &str) {
+        let mut parts = command.split_whitespace();
+        let _ = parts.next();
+        let Some(user) = parts.next() else {
+            self.status = "usage: /user alice|bob|carol [token]".to_string();
             return;
+        };
+        if !is_known_user(user) {
+            self.status = "known users: alice, bob, carol".to_string();
+            return;
+        }
+        let token = parts
+            .next()
+            .map(ToString::to_string)
+            .unwrap_or_else(|| default_token(user).to_string());
+        if parts.next().is_some() {
+            self.status = "usage: /user alice|bob|carol [token]".to_string();
+            return;
+        }
+        self.reconnect_as(user.to_string(), token);
+    }
+
+    fn reconnect_as(&mut self, user: String, token: String) {
+        kvlog::info!(
+            "app reconnect requested",
+            previous_user = self.user.as_str(),
+            user = user.as_str()
+        );
+        self.stop_audio();
+        self.call_enabled = false;
+        self.network.shutdown();
+
+        self.config.user = user;
+        self.config.token = token;
+        self.user = self.config.user.clone();
+        self.room_name = "lobby".to_string();
+        self.status = format!("connecting as {}", self.user);
+        self.input.clear();
+        self.messages.clear();
+        self.session_id = None;
+        self.user_id = None;
+        self.voice_packets_received = 0;
+        self.voice_bytes_received = 0;
+
+        let (event_tx, event_rx) = mpsc::channel();
+        self.network = NetworkClient::spawn(self.config.clone(), event_tx);
+        self.event_rx = event_rx;
+        self.start_mic_monitor();
+    }
+
+    fn start_mic_monitor(&mut self) {
+        if self.voice_tx_enabled.load(Ordering::Relaxed) || self.playback.is_some() {
+            return;
+        }
+        match self.ensure_mic_capture() {
+            Ok(()) => self.status = "mic monitor active".to_string(),
+            Err(error) => self.status = format!("mic monitor failed: {error}"),
+        }
+    }
+
+    fn restart_mic_monitor(&mut self) {
+        if self.voice_tx_enabled.load(Ordering::Relaxed) || self.playback.is_some() {
+            self.note_settings_changed();
+            return;
+        }
+        self.stop_mic_capture();
+        self.start_mic_monitor();
+    }
+
+    fn ensure_mic_capture(&mut self) -> Result<(), String> {
+        if self.capture.is_some() {
+            return Ok(());
         }
         if let Some(index) = self.selected_input_device {
             let Some(device) = self.devices.get(index) else {
-                self.status = "selected input device is unavailable".to_string();
-                return;
+                let error = "selected input device is unavailable".to_string();
+                self.mic_error = Some(error.clone());
+                return Err(error);
             };
             if !device.supported {
-                self.status = device
+                let error = device
                     .issue
                     .clone()
                     .unwrap_or_else(|| "selected input device is unsupported".to_string());
-                return;
+                self.mic_error = Some(error.clone());
+                return Err(error);
             }
         }
 
         let tx = self.network.sender();
-        let capture = audio::start_live_capture(
+        let mic_muted = Arc::clone(&self.mic_muted);
+        let voice_tx_enabled = Arc::clone(&self.voice_tx_enabled);
+        match audio::start_live_capture(
             LiveCaptureConfig {
                 input_device_index: self.selected_input_device,
                 bitrate_bps: self.bitrate_bps(),
@@ -416,41 +606,74 @@ impl App {
                 buffer_request: self.buffer_request(),
             },
             move |payload| {
+                if mic_muted.load(Ordering::Relaxed) || !voice_tx_enabled.load(Ordering::Relaxed) {
+                    return;
+                }
                 let _ = tx.send(NetworkCommand::LocalVoicePacket(payload));
             },
-        );
+        ) {
+            Ok(capture) => {
+                self.capture = Some(capture);
+                self.mic_error = None;
+                Ok(())
+            }
+            Err(error) => {
+                self.mic_error = Some(error.clone());
+                kvlog::warn!("live capture start failed", error = error.as_str());
+                Err(error)
+            }
+        }
+    }
+
+    fn start_call(&mut self) {
+        if self.voice_tx_enabled.load(Ordering::Relaxed) || self.playback.is_some() {
+            self.status = "call already active".to_string();
+            return;
+        }
+        if let Err(error) = self.ensure_mic_capture() {
+            self.status = format!("failed to start capture: {error}");
+            return;
+        }
+
         let playback = audio::start_live_playback(self.buffer_request());
 
-        match (capture, playback) {
-            (Ok(capture), Ok(playback)) => {
-                self.capture = Some(capture);
+        match playback {
+            Ok(playback) => {
                 self.playback = Some(playback);
+                self.voice_tx_enabled.store(true, Ordering::Relaxed);
                 self.network.send(NetworkCommand::StartVoice);
+                self.voice_packets_received = 0;
+                self.voice_bytes_received = 0;
                 self.status = "starting call".to_string();
             }
-            (Err(error), playback) => {
-                if let Ok(playback) = playback {
-                    playback.stop();
-                }
-                self.status = format!("failed to start capture: {error}");
-            }
-            (Ok(capture), Err(error)) => {
-                capture.stop();
-                self.status = format!("failed to start playback: {error}");
+            Err(error) => {
+                kvlog::warn!("live playback start failed", error = error.as_str());
+                self.playback = None;
+                self.voice_tx_enabled.store(true, Ordering::Relaxed);
+                self.network.send(NetworkCommand::StartVoice);
+                self.voice_packets_received = 0;
+                self.voice_bytes_received = 0;
+                self.status = format!("starting call; playback unavailable: {error}");
             }
         }
     }
 
     fn stop_call(&mut self) {
         self.network.send(NetworkCommand::StopVoice);
-        self.stop_audio();
+        self.voice_tx_enabled.store(false, Ordering::Relaxed);
+        self.playback.take();
         self.call_enabled = false;
-        self.status = "stopping call".to_string();
+        self.status = "stopping call; mic monitor active".to_string();
     }
 
     fn stop_audio(&mut self) {
-        self.capture.take();
+        self.voice_tx_enabled.store(false, Ordering::Relaxed);
+        self.stop_mic_capture();
         self.playback.take();
+    }
+
+    fn stop_mic_capture(&mut self) {
+        self.capture.take();
     }
 }
 
@@ -461,6 +684,21 @@ impl Drop for App {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let mut args = std::env::args();
+    let mut logfile = None;
+    while let Some(arg) = args.next() {
+        if arg == "--logfile" {
+            logfile = args.next();
+        }
+    }
+
+    let logfile = logfile.or_else(|| std::env::var("TOMCHAT_LOGFILE").ok());
+    let _logger = if let Some(logfile) = logfile {
+        kvlog::collector::init_file_logger(&logfile)
+    } else {
+        kvlog::collector::init_closure_logger(|buf| buf.clear())
+    };
+
     event::polling::initialize_global_waker(GlobalWakerConfig {
         resize: true,
         termination: true,
@@ -476,6 +714,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut events = Events::default();
     let stdin = std::io::stdin();
     let mut app = App::new(client_config()?);
+    app.start_mic_monitor();
 
     loop {
         app.drain_network_events();
@@ -541,6 +780,10 @@ fn default_token(user: &str) -> &'static str {
     }
 }
 
+fn is_known_user(user: &str) -> bool {
+    KNOWN_USERS.contains(&user)
+}
+
 fn cycle_index(current: usize, len: usize, delta: isize) -> usize {
     if len == 0 {
         return 0;
@@ -558,7 +801,7 @@ fn render(app: &App, buf: &mut Buffer) {
     draw_header(screen.take_top(3), app, buf);
 
     let footer_height = 3i32;
-    let status_height = 3i32;
+    let status_height = 4i32;
     let transcript_height = screen
         .h
         .saturating_sub((footer_height + status_height) as u16) as i32;
@@ -606,23 +849,93 @@ fn draw_messages(area: &mut Rect, app: &App, buf: &mut Buffer) {
 }
 
 fn draw_status(area: &mut Rect, app: &App, buf: &mut Buffer) {
-    let call = if app.call_enabled || app.capture.is_some() {
-        "call on"
-    } else {
-        "call off"
-    };
+    let call = call_state_label(app);
     let queued = app
         .playback
         .as_ref()
         .map(|playback| playback.queued_samples())
         .unwrap_or(0);
+    let capture = app
+        .capture
+        .as_ref()
+        .map(|capture| capture.stats().snapshot());
     draw_row(area.take_top(1), buf, "Status", &app.status);
     draw_row(
         area.take_top(1),
         buf,
-        "Media",
-        &format!("{call}, queued {queued} samples"),
+        "Mic",
+        &mic_status_line(app, capture.as_ref()),
     );
+    draw_row(
+        area.take_top(1),
+        buf,
+        "Voice",
+        &format!(
+            "{call}, playback {}, rx {} pkts/{} B, queued {queued}",
+            if app.playback.is_some() { "on" } else { "off" },
+            app.voice_packets_received,
+            app.voice_bytes_received
+        ),
+    );
+}
+
+fn mic_status_line(app: &App, capture: Option<&StatsSnapshot>) -> String {
+    let Some(capture) = capture else {
+        let state = if app.mic_muted.load(Ordering::Relaxed) {
+            "muted"
+        } else {
+            "off"
+        };
+        return match &app.mic_error {
+            Some(error) => format!("{state}, inactive {}, error: {error}", vu_meter(0.0)),
+            None => format!("{state}, inactive {}", vu_meter(0.0)),
+        };
+    };
+    let mute = if app.mic_muted.load(Ordering::Relaxed) {
+        "muted"
+    } else {
+        "open"
+    };
+    format!(
+        "{mute}, active {} {}, cb {}, vad {}%, tx {} pkts, drop {}",
+        vu_meter(capture.rms),
+        dbfs_label(capture.rms),
+        capture.callbacks,
+        (capture.vad_probability.clamp(0.0, 1.0) * 100.0).round() as u32,
+        capture.encoded_packets,
+        capture.dropped_chunks
+    )
+}
+
+fn vu_meter(rms: f32) -> String {
+    const WIDTH: usize = 18;
+    let db = dbfs(rms);
+    let normalized = ((db + 60.0) / 60.0).clamp(0.0, 1.0);
+    let filled = (normalized * WIDTH as f32).round() as usize;
+    let mut meter = String::with_capacity(WIDTH + 2);
+    meter.push('[');
+    for index in 0..WIDTH {
+        meter.push(if index < filled { '#' } else { '-' });
+    }
+    meter.push(']');
+    meter
+}
+
+fn dbfs_label(rms: f32) -> String {
+    let db = dbfs(rms);
+    if db <= -59.9 {
+        "-inf dBFS".to_string()
+    } else {
+        format!("{db:.0} dBFS")
+    }
+}
+
+fn dbfs(rms: f32) -> f32 {
+    if rms <= f32::EPSILON {
+        -60.0
+    } else {
+        (20.0 * rms.clamp(f32::EPSILON, 1.0).log10()).max(-60.0)
+    }
 }
 
 fn draw_input(area: &mut Rect, app: &App, buf: &mut Buffer) {
@@ -632,7 +945,7 @@ fn draw_input(area: &mut Rect, app: &App, buf: &mut Buffer) {
         .with(Ellipsis(true))
         .text(
             buf,
-            "enter send | /call | /hangup | /clear | /config or f2 settings | ctrl-c quit",
+            "enter send | /call | /hangup | /mute | /unmute | /user bob | f2 settings | ctrl-c quit",
         );
 }
 
@@ -716,18 +1029,19 @@ fn draw_settings_rows(app: &App, area: &mut Rect, buf: &mut Buffer) {
 }
 
 fn draw_settings_status(area: &mut Rect, app: &App, buf: &mut Buffer) {
-    let call = if app.call_enabled || app.capture.is_some() {
-        "call on"
-    } else {
-        "call off"
-    };
+    let call = call_state_label(app);
     draw_row(area.take_top(1), buf, "Status", &app.status);
     draw_row(
         area.take_top(1),
         buf,
         "Voice",
         &format!(
-            "{call}, {} kbps, denoise {}, {}",
+            "{call}, mic {}, {} kbps, denoise {}, {}",
+            if app.mic_muted.load(Ordering::Relaxed) {
+                "muted"
+            } else {
+                "open"
+            },
             app.bitrate_bps() / 1000,
             if app.denoise { "on" } else { "off" },
             app.buffer_request().label()
@@ -742,6 +1056,16 @@ fn draw_settings_status(area: &mut Rect, app: &App, buf: &mut Buffer) {
                 .and_then(|index| app.devices.get(index)),
         ),
     );
+}
+
+fn call_state_label(app: &App) -> &'static str {
+    if app.call_enabled {
+        "call on"
+    } else if app.voice_tx_enabled.load(Ordering::Relaxed) {
+        "call starting"
+    } else {
+        "call off"
+    }
 }
 
 fn draw_settings_footer(area: Rect, buf: &mut Buffer) {
@@ -867,6 +1191,7 @@ mod tests {
         }
 
         let app = App {
+            config: test_config("alice"),
             user: "alice".to_string(),
             room_name: "lobby".to_string(),
             status: "test".to_string(),
@@ -887,9 +1212,14 @@ mod tests {
             bitrate_index: 1,
             buffer_index: 0,
             denoise: true,
+            mic_muted: Arc::new(AtomicBool::new(false)),
+            voice_tx_enabled: Arc::new(AtomicBool::new(false)),
+            mic_error: None,
             capture: None,
             playback: None,
             call_enabled: false,
+            voice_packets_received: 0,
+            voice_bytes_received: 0,
         };
         let mut buffer = Buffer::new(72, 20);
         render(&app, &mut buffer);
@@ -900,6 +1230,7 @@ mod tests {
         let (_event_tx, event_rx) = mpsc::channel();
         let (command_tx, _command_rx) = mpsc::channel();
         let app = App {
+            config: test_config("alice"),
             user: "alice".to_string(),
             room_name: "lobby".to_string(),
             status: "test".to_string(),
@@ -916,9 +1247,14 @@ mod tests {
             bitrate_index: 1,
             buffer_index: 0,
             denoise: true,
+            mic_muted: Arc::new(AtomicBool::new(false)),
+            voice_tx_enabled: Arc::new(AtomicBool::new(false)),
+            mic_error: None,
             capture: None,
             playback: None,
             call_enabled: false,
+            voice_packets_received: 0,
+            voice_bytes_received: 0,
         };
         let mut buffer = Buffer::new(72, 20);
         render(&app, &mut buffer);
@@ -929,5 +1265,30 @@ mod tests {
         assert_eq!(cycle_index(0, 3, -1), 2);
         assert_eq!(cycle_index(2, 3, 1), 0);
         assert_eq!(cycle_index(1, 3, 1), 2);
+    }
+
+    fn test_config(user: &str) -> ClientConfig {
+        ClientConfig {
+            tcp_addr: "127.0.0.1:41000".parse().unwrap(),
+            udp_addr: "127.0.0.1:41001".parse().unwrap(),
+            user: user.to_string(),
+            token: default_token(user).to_string(),
+            room_id: RoomId(1),
+        }
+    }
+}
+
+fn network_event_kind(event: &NetworkEvent) -> &'static str {
+    match event {
+        NetworkEvent::Connected => "connected",
+        NetworkEvent::Authenticated { .. } => "authenticated",
+        NetworkEvent::RoomJoined { .. } => "room_joined",
+        NetworkEvent::Chat(_) => "chat",
+        NetworkEvent::VoiceStarted { .. } => "voice_started",
+        NetworkEvent::VoiceStopped { .. } => "voice_stopped",
+        NetworkEvent::VoicePacket(_) => "voice_packet",
+        NetworkEvent::Status(_) => "status",
+        NetworkEvent::Error(_) => "error",
+        NetworkEvent::Disconnected => "disconnected",
     }
 }

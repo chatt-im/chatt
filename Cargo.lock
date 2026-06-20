@@ -441,6 +441,23 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8116d59990025388dfe1382f58b3ad82729312538a9a4b81a1dcdee8a17bee49"
 
 [[package]]
+name = "kvlog"
+version = "0.1.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d19a7ec601eeca59ee3d5f377bfae8acb67a9f3b247c7d090c72dd37f87d6e20"
+dependencies = [
+ "itoa",
+ "kvlog-macros",
+ "uuid",
+]
+
+[[package]]
+name = "kvlog-macros"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "175e52cba734851ef3ed52c39c5df2937b5ffe912d3ab0c757bb53aa8e58b522"
+
+[[package]]
 name = "libc"
 version = "0.2.186"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1005,6 +1022,7 @@ name = "server"
 version = "0.1.0"
 dependencies = [
  "jsony",
+ "kvlog",
  "mio",
  "ring",
  "rpc",
@@ -1118,6 +1136,7 @@ dependencies = [
  "cpal",
  "extui",
  "jsony",
+ "kvlog",
  "libc",
  "mio",
  "nnnoiseless",
@@ -1189,6 +1208,12 @@ name = "untrusted"
 version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8ecb6da28b8a351d773b68d5825ac39017e680750f980f3a1a85cd8dd28a47c1"
+
+[[package]]
+name = "uuid"
+version = "1.23.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "144d6b123cef80b301b8f72a9e2ca4370ddec21950d0a103dd22c437006d2db7"
 
 [[package]]
 name = "walkdir"

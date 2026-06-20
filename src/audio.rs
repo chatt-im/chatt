@@ -617,6 +617,15 @@ where
         Ok::<_, String>((device, selection))
     })?;
 
+    let device_name = device.to_string();
+    kvlog::info!(
+        "live capture selected",
+        device = device_name.as_str(),
+        channels = selection.stream_config.channels,
+        sample_rate = selection.stream_config.sample_rate,
+        bitrate_bps = config.bitrate_bps,
+        denoise = config.denoise
+    );
     let encoder = OpusVoiceEncoder::new(config.bitrate_bps)?;
     let stats = AudioStats::new();
     let (sender, receiver) = sync_channel(CALLBACK_QUEUE_CAPACITY);
@@ -638,6 +647,7 @@ where
     with_audio_backend_stderr_suppressed(|| stream.play())
         .map_err(|error| format!("failed to start live input stream: {error}"))?;
 
+    kvlog::info!("live capture started", device = device_name.as_str());
     Ok(LiveCapture {
         stream: Some(stream),
         worker: Some(worker),
@@ -690,6 +700,13 @@ pub fn start_live_playback(buffer_request: BufferRequest) -> Result<LivePlayback
         Ok::<_, String>((device, selection))
     })?;
 
+    let device_name = device.to_string();
+    kvlog::info!(
+        "live playback selected",
+        device = device_name.as_str(),
+        channels = selection.stream_config.channels,
+        sample_rate = selection.stream_config.sample_rate
+    );
     let mixer = Arc::new(Mutex::new(LivePlaybackMixer::new()));
     let stream = with_audio_backend_stderr_suppressed(|| {
         build_live_output_stream(
@@ -703,6 +720,7 @@ pub fn start_live_playback(buffer_request: BufferRequest) -> Result<LivePlayback
     with_audio_backend_stderr_suppressed(|| stream.play())
         .map_err(|error| format!("failed to start live output stream: {error}"))?;
 
+    kvlog::info!("live playback started", device = device_name.as_str());
     let (sender, receiver) = sync_channel(LIVE_PLAYBACK_COMMAND_CAPACITY);
     let worker_mixer = Arc::clone(&mixer);
     let worker = thread::spawn(move || run_live_decoder_worker(receiver, worker_mixer));
