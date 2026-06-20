@@ -89,6 +89,7 @@ pub struct RecordingConfig {
 
 #[derive(Clone, Debug)]
 pub struct LiveCaptureConfig {
+    pub input_device_index: Option<usize>,
     pub bitrate_bps: i32,
     pub denoise: bool,
     pub buffer_request: BufferRequest,
@@ -602,9 +603,16 @@ where
 {
     let (device, selection) = with_audio_backend_stderr_suppressed(|| {
         let host = cpal::default_host();
-        let device = host
-            .default_input_device()
-            .ok_or_else(|| "no default input device found".to_string())?;
+        let device = match config.input_device_index {
+            Some(index) => host
+                .input_devices()
+                .map_err(|error| format!("failed to list input devices: {error}"))?
+                .nth(index)
+                .ok_or_else(|| "selected input device is no longer available".to_string())?,
+            None => host
+                .default_input_device()
+                .ok_or_else(|| "no default input device found".to_string())?,
+        };
         let selection = select_input_config(&device, config.buffer_request)?;
         Ok::<_, String>((device, selection))
     })?;
