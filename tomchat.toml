@@ -1,0 +1,72 @@
+# Default tomchat configuration. User configuration is loaded from
+# ~/.config/tomchat.toml unless --config or TOMCHAT_CONFIG is provided.
+
+[network]
+user = "alice"
+token = "alice-dev-token"
+tcp-addr = "127.0.0.1:41000"
+udp-addr = "127.0.0.1:41001"
+room-id = 1
+
+[audio]
+bitrate-bps = 24000
+denoise = true
+buffer = "default"
+
+[ui]
+room-height = 4
+max-composer-height = 6
+placeholder = "Message #lobby"
+max-messages = 50000
+overscan = 24
+
+[bindings.compose]
+"C-c" = "Quit"
+"F2" = "OpenSettings"
+"ESC" = "EnterLog"
+"ENTER" = "SubmitMessage"
+"C-m" = "SubmitMessage"
+"C-g" = "Cancel"
+"C-v" = "ToggleMute"
+"C-s" = "StartCall"
+"C-h" = "StopCall"
+
+[bindings.log]
+"C-c" = "Quit"
+"i" = "EnterCompose"
+"a" = "EnterCompose"
+"F2" = "OpenSettings"
+"q" = "EnterCompose"
+"j" = "ScrollDown"
+"k" = "ScrollUp"
+"J" = "RoomScrollDown"
+"K" = "RoomScrollUp"
+"DOWN" = "ScrollDown"
+"UP" = "ScrollUp"
+"C-d" = "HalfPageDown"
+"C-u" = "HalfPageUp"
+"G" = "Bottom"
+"g g" = "Top"
+"m" = "ToggleMute"
+"s" = "StartCall"
+"h" = "StopCall"
+"c" = "ClearChat"
+
+[bindings.settings]
+"C-c" = "Quit"
+"ESC" = "CloseSettings"
+"q" = "CloseSettings"
+"F2" = "CloseSettings"
+"j" = "FocusNext"
+"k" = "FocusPrev"
+"DOWN" = "FocusNext"
+"UP" = "FocusPrev"
+"TAB" = "FocusNext"
+"BACKTAB" = "FocusPrev"
+"h" = "AdjustLeft"
+"l" = "AdjustRight"
+"LEFT" = "AdjustLeft"
+"RIGHT" = "AdjustRight"
+"ENTER" = "Activate"
+"r" = "RefreshDevices"
+"w" = "SaveSettings"

@@ -8,12 +8,18 @@ cpal = "0.18.1"
 libc = "0.2"
 nnnoiseless = {version =  "0.5.2", default-features = false}
 extui.path = "/code/extui"
+extui-editor.path = "/code/extui/crates/extui-editor"
+extui-bindings.path = "/code/extui/crates/extui-bindings"
+bwrap.path = "/code/bwrap"
+tinyhl = { path = "/code/extui/crates/tinyhl" }
+unicode-width = "0.2"
 opus-codec = { version = "0.1.1", features = ["dred"] }
 ring = "0.17.14"
 jsony = "0.1.10"
 rpc.path = "crates/rpc"
 mio = { version = "1.2.1", features = ["os-poll", "net"] }
 kvlog = "0.1.5"
+toml-spanner = { version = "1.0.3", features = ["to-toml", "from-toml", "derive"] }
 
 [workspace]
 members = ["crates/benchmark", "crates/rpc", "crates/server"]

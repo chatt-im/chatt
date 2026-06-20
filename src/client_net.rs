@@ -12,8 +12,8 @@ use mio::{
 };
 use rpc::{
     control::{
-        ChatMessage, ClientControl, RoomInfo, ServerControl, decode_server_control,
-        decode_server_hello, encode_client_control, encode_client_hello,
+        ChatMessage, ClientControl, ParticipantInfo, RoomInfo, ServerControl,
+        decode_server_control, decode_server_hello, encode_client_control, encode_client_hello,
     },
     crypto::{
         AntiReplay, CHANNEL_CONTROL, SessionSecrets, TransportCipher, complete_client_handshake,
@@ -59,8 +59,14 @@ pub enum NetworkEvent {
     RoomJoined {
         room_id: RoomId,
         history: Vec<ChatMessage>,
+        participants: Vec<ParticipantInfo>,
     },
     Chat(ChatMessage),
+    Presence {
+        room_id: RoomId,
+        participant: ParticipantInfo,
+        online: bool,
+    },
     VoiceStarted {
         user_id: UserId,
         stream_id: StreamId,
@@ -555,17 +561,22 @@ impl WorkerState {
                 }
             }
             ServerControl::RoomJoined {
-                room_id, history, ..
+                room_id,
+                history,
+                participants,
             } => {
                 self.room_id = Some(room_id);
                 kvlog::info!(
                     "client room joined",
                     room_id = room_id.0,
-                    history_len = history.len()
+                    history_len = history.len(),
+                    participant_count = participants.len()
                 );
-                let _ = self
-                    .events
-                    .send(NetworkEvent::RoomJoined { room_id, history });
+                let _ = self.events.send(NetworkEvent::RoomJoined {
+                    room_id,
+                    history,
+                    participants,
+                });
             }
             ServerControl::Chat { message } => {
                 kvlog::info!(
@@ -578,9 +589,9 @@ impl WorkerState {
                 let _ = self.events.send(NetworkEvent::Chat(message));
             }
             ServerControl::Presence {
+                room_id,
                 participant,
                 online,
-                ..
             } => {
                 kvlog::info!(
                     "client presence received",
@@ -592,6 +603,11 @@ impl WorkerState {
                 let _ = self
                     .events
                     .send(NetworkEvent::Status(format!("{} {verb}", participant.name)));
+                let _ = self.events.send(NetworkEvent::Presence {
+                    room_id,
+                    participant,
+                    online,
+                });
             }
             ServerControl::VoiceStarted {
                 user_id, stream_id, ..
