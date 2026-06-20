@@ -9,3 +9,6 @@ libc = "0.2"
 nnnoiseless = {version =  "0.5.2", default-features = false}
 extui.path = "/code/extui"
 opus-codec = { version = "0.1.1", features = ["dred"] }
+
+[workspace]
+members = ["crates/benchmark"]
