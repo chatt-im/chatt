@@ -113,12 +113,15 @@ impl App {
                     self.status = format!("user {} joined the call", user_id.0);
                 }
             }
-            NetworkEvent::VoiceStopped { user_id, .. } => {
+            NetworkEvent::VoiceStopped { user_id, stream_id } => {
                 if Some(user_id) == self.user_id {
                     self.status = "call stopped".to_string();
                     self.call_enabled = false;
                     self.stop_audio();
                 } else {
+                    if let Some(playback) = &self.playback {
+                        playback.stop_stream(stream_id.0);
+                    }
                     self.status = format!("user {} left the call", user_id.0);
                 }
             }

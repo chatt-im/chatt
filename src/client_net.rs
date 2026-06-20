@@ -353,8 +353,8 @@ impl WorkerState {
                     MediaPayload::Voice {
                         stream_id,
                         sequence,
+                        flags,
                         opus,
-                        ..
                     },
                 )) => {
                     let _ = self
@@ -362,6 +362,7 @@ impl WorkerState {
                         .send(NetworkEvent::VoicePacket(RemoteVoicePacket {
                             stream_id: stream_id.0,
                             sequence,
+                            flags,
                             payload: opus,
                         }));
                 }

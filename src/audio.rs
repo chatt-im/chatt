@@ -6,9 +6,10 @@ use std::{
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering},
-        mpsc::{Receiver, SyncSender, sync_channel},
+        mpsc::{Receiver, RecvTimeoutError, SyncSender, sync_channel},
     },
     thread::{self, JoinHandle},
+    time::{Duration, Instant},
 };
 
 use cpal::{
@@ -18,15 +19,21 @@ use cpal::{
 use nnnoiseless::DenoiseState;
 use opus_codec::{Channels, Complexity, Decoder, SampleRate};
 
-use crate::network::{EncoderNetworkProfile, EncoderNetworkTuning};
+use crate::network::{
+    AudioPacketRef, EncoderNetworkProfile, EncoderNetworkTuning, InsertOutcome, JitterBuffer,
+    JitterBufferConfig, PlayoutItem,
+};
 use crate::packet_log::{FLAG_DENOISE, PacketLogHeader, PacketLogReader, PacketLogWriter};
 
 pub const SAMPLE_RATE: u32 = 48_000;
 pub const CHANNELS: u8 = 1;
 pub const FRAME_SAMPLES: usize = DenoiseState::FRAME_SIZE;
 const CALLBACK_QUEUE_CAPACITY: usize = 8;
-const LIVE_PLAYBACK_QUEUE_CAPACITY: usize = 256;
-const LIVE_PLAYBACK_MAX_QUEUED_SAMPLES: usize = SAMPLE_RATE as usize * 2;
+const LIVE_PLAYBACK_COMMAND_CAPACITY: usize = 256;
+const LIVE_PLAYBACK_MAX_QUEUED_SAMPLES_PER_STREAM: usize = SAMPLE_RATE as usize;
+const LIVE_PLAYBACK_INITIAL_BUFFER: Duration = Duration::from_millis(40);
+const LIVE_PLAYBACK_DRAIN_INTERVAL: Duration = Duration::from_millis(10);
+const LIVE_PLAYBACK_MAX_REORDER_DELAY: Duration = Duration::from_millis(60);
 const MAX_OPUS_DECODE_SAMPLES: usize = 5_760;
 const MAX_OPUS_PACKET_BYTES: usize = 1_500;
 
@@ -91,6 +98,7 @@ pub struct LiveCaptureConfig {
 pub struct RemoteVoicePacket {
     pub stream_id: u32,
     pub sequence: u32,
+    pub flags: u8,
     pub payload: Vec<u8>,
 }
 
@@ -114,8 +122,13 @@ pub struct Playback {
 pub struct LivePlayback {
     stream: Option<Stream>,
     worker: Option<JoinHandle<()>>,
-    sender: Option<SyncSender<RemoteVoicePacket>>,
-    queued_samples: Arc<Mutex<VecDeque<i16>>>,
+    sender: Option<SyncSender<LivePlaybackCommand>>,
+    mixer: Arc<Mutex<LivePlaybackMixer>>,
+}
+
+enum LivePlaybackCommand {
+    Packet(RemoteVoicePacket),
+    StopStream(u32),
 }
 
 struct OpusVoiceEncoder {
@@ -299,14 +312,20 @@ impl Drop for LiveCapture {
 impl LivePlayback {
     pub fn push(&self, packet: RemoteVoicePacket) {
         if let Some(sender) = &self.sender {
-            let _ = sender.try_send(packet);
+            let _ = sender.try_send(LivePlaybackCommand::Packet(packet));
+        }
+    }
+
+    pub fn stop_stream(&self, stream_id: u32) {
+        if let Some(sender) = &self.sender {
+            let _ = sender.send(LivePlaybackCommand::StopStream(stream_id));
         }
     }
 
     pub fn queued_samples(&self) -> usize {
-        self.queued_samples
+        self.mixer
             .lock()
-            .map(|queue| queue.len())
+            .map(|mixer| mixer.queued_samples())
             .unwrap_or_default()
     }
 
@@ -663,30 +682,28 @@ pub fn start_live_playback(buffer_request: BufferRequest) -> Result<LivePlayback
         Ok::<_, String>((device, selection))
     })?;
 
-    let queued_samples = Arc::new(Mutex::new(VecDeque::with_capacity(
-        LIVE_PLAYBACK_MAX_QUEUED_SAMPLES.min(8192),
-    )));
+    let mixer = Arc::new(Mutex::new(LivePlaybackMixer::new()));
     let stream = with_audio_backend_stderr_suppressed(|| {
         build_live_output_stream(
             &device,
             selection.supported_config.sample_format(),
             selection.stream_config,
             usize::from(selection.supported_config.channels()),
-            Arc::clone(&queued_samples),
+            Arc::clone(&mixer),
         )
     })?;
     with_audio_backend_stderr_suppressed(|| stream.play())
         .map_err(|error| format!("failed to start live output stream: {error}"))?;
 
-    let (sender, receiver) = sync_channel(LIVE_PLAYBACK_QUEUE_CAPACITY);
-    let worker_queue = Arc::clone(&queued_samples);
-    let worker = thread::spawn(move || run_live_decoder_worker(receiver, worker_queue));
+    let (sender, receiver) = sync_channel(LIVE_PLAYBACK_COMMAND_CAPACITY);
+    let worker_mixer = Arc::clone(&mixer);
+    let worker = thread::spawn(move || run_live_decoder_worker(receiver, worker_mixer));
 
     Ok(LivePlayback {
         stream: Some(stream),
         worker: Some(worker),
         sender: Some(sender),
-        queued_samples,
+        mixer,
     })
 }
 
@@ -988,44 +1005,44 @@ fn build_live_output_stream(
     sample_format: SampleFormat,
     stream_config: StreamConfig,
     channels: usize,
-    samples: Arc<Mutex<VecDeque<i16>>>,
+    mixer: Arc<Mutex<LivePlaybackMixer>>,
 ) -> Result<Stream, String> {
     match sample_format {
         SampleFormat::I8 => {
-            build_typed_live_output_stream::<i8>(device, stream_config, channels, samples)
+            build_typed_live_output_stream::<i8>(device, stream_config, channels, mixer)
         }
         SampleFormat::I16 => {
-            build_typed_live_output_stream::<i16>(device, stream_config, channels, samples)
+            build_typed_live_output_stream::<i16>(device, stream_config, channels, mixer)
         }
         SampleFormat::I24 => {
-            build_typed_live_output_stream::<cpal::I24>(device, stream_config, channels, samples)
+            build_typed_live_output_stream::<cpal::I24>(device, stream_config, channels, mixer)
         }
         SampleFormat::I32 => {
-            build_typed_live_output_stream::<i32>(device, stream_config, channels, samples)
+            build_typed_live_output_stream::<i32>(device, stream_config, channels, mixer)
         }
         SampleFormat::I64 => {
-            build_typed_live_output_stream::<i64>(device, stream_config, channels, samples)
+            build_typed_live_output_stream::<i64>(device, stream_config, channels, mixer)
         }
         SampleFormat::U8 => {
-            build_typed_live_output_stream::<u8>(device, stream_config, channels, samples)
+            build_typed_live_output_stream::<u8>(device, stream_config, channels, mixer)
         }
         SampleFormat::U16 => {
-            build_typed_live_output_stream::<u16>(device, stream_config, channels, samples)
+            build_typed_live_output_stream::<u16>(device, stream_config, channels, mixer)
         }
         SampleFormat::U24 => {
-            build_typed_live_output_stream::<cpal::U24>(device, stream_config, channels, samples)
+            build_typed_live_output_stream::<cpal::U24>(device, stream_config, channels, mixer)
         }
         SampleFormat::U32 => {
-            build_typed_live_output_stream::<u32>(device, stream_config, channels, samples)
+            build_typed_live_output_stream::<u32>(device, stream_config, channels, mixer)
         }
         SampleFormat::U64 => {
-            build_typed_live_output_stream::<u64>(device, stream_config, channels, samples)
+            build_typed_live_output_stream::<u64>(device, stream_config, channels, mixer)
         }
         SampleFormat::F32 => {
-            build_typed_live_output_stream::<f32>(device, stream_config, channels, samples)
+            build_typed_live_output_stream::<f32>(device, stream_config, channels, mixer)
         }
         SampleFormat::F64 => {
-            build_typed_live_output_stream::<f64>(device, stream_config, channels, samples)
+            build_typed_live_output_stream::<f64>(device, stream_config, channels, mixer)
         }
         _ => Err(format!("unsupported output sample format: {sample_format}")),
     }
@@ -1035,7 +1052,7 @@ fn build_typed_live_output_stream<T>(
     device: &cpal::Device,
     stream_config: StreamConfig,
     channels: usize,
-    samples: Arc<Mutex<VecDeque<i16>>>,
+    mixer: Arc<Mutex<LivePlaybackMixer>>,
 ) -> Result<Stream, String>
 where
     T: Sample + cpal::SizedSample + FromSample<f32> + Send + 'static,
@@ -1044,7 +1061,7 @@ where
         .build_output_stream(
             stream_config,
             move |output: &mut [T], _| {
-                live_playback_callback(output, channels, &samples);
+                live_playback_callback(output, channels, &mixer);
             },
             move |error| {
                 eprintln!("live playback stream error: {error}");
@@ -1116,11 +1133,14 @@ fn playback_callback<T>(
     stats.inner.played_samples.store(*cursor, Ordering::Relaxed);
 }
 
-fn live_playback_callback<T>(output: &mut [T], channels: usize, samples: &Arc<Mutex<VecDeque<i16>>>)
-where
+fn live_playback_callback<T>(
+    output: &mut [T],
+    channels: usize,
+    mixer: &Arc<Mutex<LivePlaybackMixer>>,
+) where
     T: Sample + FromSample<f32>,
 {
-    let Ok(mut queue) = samples.lock() else {
+    let Ok(mut mixer) = mixer.lock() else {
         for sample in output {
             *sample = T::from_sample(0.0);
         }
@@ -1128,7 +1148,7 @@ where
     };
 
     for frame in output.chunks_mut(channels.max(1)) {
-        let sample = queue.pop_front().unwrap_or(0);
+        let sample = mixer.pop_mixed_sample();
         let output_sample = T::from_sample((sample as f32 / 32768.0).clamp(-1.0, 1.0));
         for channel in frame {
             *channel = output_sample;
@@ -1331,41 +1351,241 @@ where
 }
 
 fn run_live_decoder_worker(
-    receiver: Receiver<RemoteVoicePacket>,
-    queued_samples: Arc<Mutex<VecDeque<i16>>>,
+    receiver: Receiver<LivePlaybackCommand>,
+    mixer: Arc<Mutex<LivePlaybackMixer>>,
 ) {
-    let mut decoders: HashMap<u32, Decoder> = HashMap::new();
+    let mut streams: HashMap<u32, LiveDecodeStream> = HashMap::new();
     let mut frame = vec![0i16; MAX_OPUS_DECODE_SAMPLES];
 
-    for packet in receiver {
-        let decoder = match decoders.entry(packet.stream_id) {
-            std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
-            std::collections::hash_map::Entry::Vacant(entry) => {
-                match Decoder::new(SampleRate::Hz48000, Channels::Mono) {
-                    Ok(decoder) => entry.insert(decoder),
-                    Err(error) => {
-                        eprintln!("failed to create live opus decoder: {error}");
-                        continue;
-                    }
+    loop {
+        match receiver.recv_timeout(LIVE_PLAYBACK_DRAIN_INTERVAL) {
+            Ok(command) => {
+                handle_live_playback_command(command, &mut streams, &mixer);
+                while let Ok(command) = receiver.try_recv() {
+                    handle_live_playback_command(command, &mut streams, &mixer);
                 }
             }
-        };
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => break,
+        }
 
-        let decoded = match decoder.decode(&packet.payload, &mut frame, false) {
-            Ok(decoded) => decoded,
-            Err(error) => {
-                eprintln!("failed to decode live opus packet: {error}");
-                continue;
-            }
-        };
+        drain_live_decode_streams(&mut streams, &mixer, &mut frame, Instant::now());
+    }
+}
 
-        if let Ok(mut queue) = queued_samples.lock() {
-            queue.extend(frame[..decoded].iter().copied());
-            while queue.len() > LIVE_PLAYBACK_MAX_QUEUED_SAMPLES {
-                queue.pop_front();
+fn handle_live_playback_command(
+    command: LivePlaybackCommand,
+    streams: &mut HashMap<u32, LiveDecodeStream>,
+    mixer: &Arc<Mutex<LivePlaybackMixer>>,
+) {
+    match command {
+        LivePlaybackCommand::Packet(packet) => {
+            let stream = match streams.entry(packet.stream_id) {
+                std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+                std::collections::hash_map::Entry::Vacant(entry) => match LiveDecodeStream::new() {
+                    Ok(stream) => entry.insert(stream),
+                    Err(error) => {
+                        eprintln!("failed to create live opus decoder: {error}");
+                        return;
+                    }
+                },
+            };
+            let packet_ref = AudioPacketRef {
+                sequence: packet.sequence,
+                flags: packet.flags,
+                payload: &packet.payload,
+            };
+            let _ = stream.insert(packet_ref, Instant::now());
+        }
+        LivePlaybackCommand::StopStream(stream_id) => {
+            streams.remove(&stream_id);
+            if let Ok(mut mixer) = mixer.lock() {
+                mixer.remove_stream(stream_id);
             }
         }
     }
+}
+
+fn drain_live_decode_streams(
+    streams: &mut HashMap<u32, LiveDecodeStream>,
+    mixer: &Arc<Mutex<LivePlaybackMixer>>,
+    frame: &mut [i16],
+    now: Instant,
+) {
+    for (stream_id, stream) in streams {
+        stream.drain_ready(now, frame, |samples| {
+            if let Ok(mut mixer) = mixer.lock() {
+                mixer.queue_stream_samples(*stream_id, samples);
+            }
+        });
+    }
+}
+
+struct LiveDecodeStream {
+    jitter: LiveJitterStream,
+    decoder: Decoder,
+}
+
+impl LiveDecodeStream {
+    fn new() -> Result<Self, String> {
+        Ok(Self {
+            jitter: LiveJitterStream::new(),
+            decoder: Decoder::new(SampleRate::Hz48000, Channels::Mono)
+                .map_err(|error| error.to_string())?,
+        })
+    }
+
+    fn insert(&mut self, packet: AudioPacketRef<'_>, now: Instant) -> InsertOutcome {
+        self.jitter.insert(packet, now)
+    }
+
+    fn drain_ready(&mut self, now: Instant, frame: &mut [i16], mut on_samples: impl FnMut(&[i16])) {
+        for item in self.jitter.drain_ready(now) {
+            match item {
+                PlayoutItem::Audio { payload, .. } => {
+                    self.decode_playout(&payload, frame, &mut on_samples);
+                }
+                PlayoutItem::Missing { .. } => {
+                    let plc_samples = FRAME_SAMPLES.min(frame.len());
+                    self.decode_playout(&[], &mut frame[..plc_samples], &mut on_samples);
+                }
+                PlayoutItem::FastForward { .. } => {}
+            }
+        }
+    }
+
+    fn decode_playout(
+        &mut self,
+        payload: &[u8],
+        frame: &mut [i16],
+        on_samples: &mut impl FnMut(&[i16]),
+    ) {
+        match self.decoder.decode(payload, frame, false) {
+            Ok(decoded) => on_samples(&frame[..decoded]),
+            Err(error) => eprintln!("failed to decode live opus packet: {error}"),
+        }
+    }
+}
+
+struct LiveJitterStream {
+    jitter: JitterBuffer,
+    initial_buffer: Duration,
+    first_packet_at: Option<Instant>,
+    playout_started: bool,
+}
+
+impl LiveJitterStream {
+    fn new() -> Self {
+        Self {
+            jitter: JitterBuffer::new(JitterBufferConfig {
+                max_reorder_delay: LIVE_PLAYBACK_MAX_REORDER_DELAY,
+                ..Default::default()
+            }),
+            initial_buffer: LIVE_PLAYBACK_INITIAL_BUFFER,
+            first_packet_at: None,
+            playout_started: false,
+        }
+    }
+
+    fn insert(&mut self, packet: AudioPacketRef<'_>, now: Instant) -> InsertOutcome {
+        let outcome = self.jitter.insert(packet);
+        if matches!(outcome, InsertOutcome::Accepted) && self.first_packet_at.is_none() {
+            self.first_packet_at = Some(now);
+        }
+        outcome
+    }
+
+    fn drain_ready(&mut self, now: Instant) -> Vec<PlayoutItem> {
+        if !self.playout_started {
+            let Some(first_packet_at) = self.first_packet_at else {
+                return Vec::new();
+            };
+            if now.saturating_duration_since(first_packet_at) < self.initial_buffer {
+                return Vec::new();
+            }
+            self.playout_started = true;
+        }
+
+        self.jitter.drain_ready(now)
+    }
+}
+
+#[derive(Default)]
+struct LivePlaybackMixer {
+    streams: HashMap<u32, VecDeque<i16>>,
+}
+
+impl LivePlaybackMixer {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    fn queue_stream_samples(&mut self, stream_id: u32, samples: &[i16]) {
+        if samples.is_empty() {
+            return;
+        }
+
+        let queue = self
+            .streams
+            .entry(stream_id)
+            .or_insert_with(|| VecDeque::with_capacity(FRAME_SAMPLES * 4));
+        queue.extend(samples.iter().copied());
+
+        let overflow = queue
+            .len()
+            .saturating_sub(LIVE_PLAYBACK_MAX_QUEUED_SAMPLES_PER_STREAM);
+        if overflow > 0 {
+            queue.drain(..overflow);
+        }
+    }
+
+    fn remove_stream(&mut self, stream_id: u32) {
+        self.streams.remove(&stream_id);
+    }
+
+    fn queued_samples(&self) -> usize {
+        self.streams.values().map(VecDeque::len).sum()
+    }
+
+    fn pop_mixed_sample(&mut self) -> i16 {
+        let mut active = 0usize;
+        let mut only_sample = 0i16;
+        let mut sum = 0.0f32;
+
+        for queue in self.streams.values_mut() {
+            let Some(sample) = queue.pop_front() else {
+                continue;
+            };
+            active += 1;
+            only_sample = sample;
+            sum += sample as f32 / 32768.0;
+        }
+
+        match active {
+            0 => 0,
+            1 => only_sample,
+            _ => normalized_to_pcm_i16(soft_limit(sum / (active as f32).sqrt())),
+        }
+    }
+}
+
+fn soft_limit(sample: f32) -> f32 {
+    const THRESHOLD: f32 = 0.95;
+    let magnitude = sample.abs();
+    if magnitude <= THRESHOLD {
+        return sample;
+    }
+
+    let headroom = 1.0 - THRESHOLD;
+    let excess = magnitude - THRESHOLD;
+    let limited = THRESHOLD + headroom * (excess / (excess + headroom));
+    sample.signum() * limited.min(1.0)
+}
+
+fn normalized_to_pcm_i16(sample: f32) -> i16 {
+    (sample.clamp(-1.0, 1.0) * i16::MAX as f32)
+        .round()
+        .clamp(i16::MIN as f32, i16::MAX as f32) as i16
 }
 
 struct DecodedPacketLog {
@@ -1540,5 +1760,168 @@ mod tests {
             frames,
             vec![vec![1.0, 2.0, 3.0, 4.0], vec![5.0, 6.0, 7.0, 8.0]]
         );
+    }
+
+    #[test]
+    fn live_jitter_delays_initial_playout_to_reorder_startup_packets() {
+        let start = Instant::now();
+        let mut jitter = LiveJitterStream::new();
+
+        assert_eq!(
+            jitter.insert(test_audio_packet(2, &[2]), start),
+            InsertOutcome::Accepted
+        );
+        assert!(
+            jitter
+                .drain_ready(start + Duration::from_millis(20))
+                .is_empty()
+        );
+        assert_eq!(
+            jitter.insert(
+                test_audio_packet(1, &[1]),
+                start + Duration::from_millis(20)
+            ),
+            InsertOutcome::Accepted
+        );
+
+        assert_eq!(
+            jitter.drain_ready(start + LIVE_PLAYBACK_INITIAL_BUFFER),
+            vec![
+                PlayoutItem::Audio {
+                    sequence: 1,
+                    payload: vec![1],
+                },
+                PlayoutItem::Audio {
+                    sequence: 2,
+                    payload: vec![2],
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn live_jitter_conceals_later_gaps_after_reorder_deadline() {
+        let start = Instant::now();
+        let mut jitter = LiveJitterStream::new();
+        let first_playout = start + LIVE_PLAYBACK_INITIAL_BUFFER;
+        let gap_seen = first_playout + Duration::from_millis(1);
+
+        assert_eq!(
+            jitter.insert(test_audio_packet(0, &[0]), start),
+            InsertOutcome::Accepted
+        );
+        assert_eq!(
+            jitter.drain_ready(first_playout),
+            vec![PlayoutItem::Audio {
+                sequence: 0,
+                payload: vec![0],
+            }]
+        );
+        assert_eq!(
+            jitter.insert(test_audio_packet(2, &[2]), gap_seen),
+            InsertOutcome::Accepted
+        );
+        assert!(jitter.drain_ready(gap_seen).is_empty());
+
+        assert_eq!(
+            jitter.drain_ready(gap_seen + LIVE_PLAYBACK_MAX_REORDER_DELAY),
+            vec![
+                PlayoutItem::Missing { sequence: 1 },
+                PlayoutItem::Audio {
+                    sequence: 2,
+                    payload: vec![2],
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn live_decode_stream_uses_opus_plc_for_missing_jitter_items() {
+        let start = Instant::now();
+        let first_playout = start + LIVE_PLAYBACK_INITIAL_BUFFER;
+        let gap_seen = first_playout + Duration::from_millis(1);
+        let mut encoder = OpusVoiceEncoder::new(32_000).unwrap();
+        let packet_0 = encode_test_frame(&mut encoder, 0);
+        let packet_2 = encode_test_frame(&mut encoder, 600);
+        let mut stream = LiveDecodeStream::new().unwrap();
+        let mut frame = vec![0i16; MAX_OPUS_DECODE_SAMPLES];
+        let mut decoded = Vec::new();
+
+        assert_eq!(
+            stream.insert(test_audio_packet(0, &packet_0), start),
+            InsertOutcome::Accepted
+        );
+        stream.drain_ready(first_playout, &mut frame, |samples| {
+            decoded.extend_from_slice(samples);
+        });
+        assert_eq!(decoded.len(), FRAME_SAMPLES);
+
+        decoded.clear();
+        assert_eq!(
+            stream.insert(test_audio_packet(2, &packet_2), gap_seen),
+            InsertOutcome::Accepted
+        );
+        stream.drain_ready(gap_seen, &mut frame, |samples| {
+            decoded.extend_from_slice(samples);
+        });
+        assert!(decoded.is_empty());
+
+        stream.drain_ready(
+            gap_seen + LIVE_PLAYBACK_MAX_REORDER_DELAY,
+            &mut frame,
+            |samples| {
+                decoded.extend_from_slice(samples);
+            },
+        );
+        assert_eq!(decoded.len(), FRAME_SAMPLES * 2);
+    }
+
+    #[test]
+    fn mixer_preserves_single_stream_and_mixes_concurrent_streams_with_headroom() {
+        let mut mixer = LivePlaybackMixer::new();
+        mixer.queue_stream_samples(1, &[12_000, -12_000]);
+
+        assert_eq!(mixer.pop_mixed_sample(), 12_000);
+        assert_eq!(mixer.pop_mixed_sample(), -12_000);
+
+        mixer.queue_stream_samples(1, &[12_000]);
+        mixer.queue_stream_samples(2, &[12_000]);
+        let mixed = mixer.pop_mixed_sample();
+
+        assert!(mixed > 12_000);
+        assert!(mixed < 24_000);
+
+        mixer.queue_stream_samples(1, &[10_000]);
+        mixer.queue_stream_samples(2, &[-10_000]);
+        assert!(mixer.pop_mixed_sample().abs() <= 1);
+    }
+
+    #[test]
+    fn mixer_removes_stopped_streams() {
+        let mut mixer = LivePlaybackMixer::new();
+        mixer.queue_stream_samples(1, &[1, 2, 3]);
+        mixer.queue_stream_samples(2, &[4, 5]);
+
+        assert_eq!(mixer.queued_samples(), 5);
+        mixer.remove_stream(1);
+
+        assert_eq!(mixer.queued_samples(), 2);
+        assert_eq!(mixer.pop_mixed_sample(), 4);
+    }
+
+    fn test_audio_packet(sequence: u32, payload: &[u8]) -> AudioPacketRef<'_> {
+        AudioPacketRef {
+            sequence,
+            flags: 0,
+            payload,
+        }
+    }
+
+    fn encode_test_frame(encoder: &mut OpusVoiceEncoder, amplitude: i16) -> Vec<u8> {
+        let input = vec![amplitude; FRAME_SAMPLES];
+        let mut output = vec![0u8; MAX_OPUS_PACKET_BYTES];
+        let len = encoder.encode(&input, &mut output).unwrap();
+        output.truncate(len);
+        output
     }
 }
