@@ -1203,8 +1203,16 @@ dependencies = [
  "ring",
  "rpc",
  "tinyhl",
+ "tomchat-p2p",
  "toml-spanner",
  "unicode-width",
+]
+
+[[package]]
+name = "tomchat-p2p"
+version = "0.1.0"
+dependencies = [
+ "libc",
 ]
 
 [[package]]
