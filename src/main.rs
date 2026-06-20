@@ -5,6 +5,7 @@ mod chat_buffer;
 #[allow(dead_code)]
 mod client_net;
 mod config;
+mod local_control;
 #[cfg_attr(not(test), allow(dead_code))]
 mod network;
 #[allow(dead_code)]
@@ -12,6 +13,7 @@ mod packet_log;
 mod theme;
 
 use std::{
+    path::{Path, PathBuf},
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -374,6 +376,12 @@ struct App {
 enum Action {
     Continue,
     Quit,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum CliCommand {
+    RunUi,
+    Upload { path: PathBuf },
 }
 
 impl App {
@@ -1031,6 +1039,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         kvlog::collector::init_closure_logger(|buf| buf.clear())
     };
 
+    match parse_cli_command(&args)? {
+        CliCommand::RunUi => {}
+        CliCommand::Upload { path } => {
+            let path = absolute_upload_path(&path)?;
+            let response = local_control::send_upload(&path)?;
+            println!("{response}");
+            return Ok(());
+        }
+    }
+
+    let config_path = config::value_arg(&args, "--config");
+    let mut app = App::new(Config::load(config_path.as_deref())?);
+    let control_socket = local_control::ControlSocket::spawn(app.network.sender())?;
+    kvlog::info!(
+        "tomchat local control socket ready",
+        path = %control_socket.path().display()
+    );
+
     event::polling::initialize_global_waker(GlobalWakerConfig {
         resize: true,
         termination: true,
@@ -1046,8 +1072,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     buffer.set_rgb_supported(true);
     let mut events = Events::default();
     let stdin = std::io::stdin();
-    let config_path = config::value_arg(&args, "--config");
-    let mut app = App::new(Config::load(config_path.as_deref())?);
+    let _control_socket = control_socket;
     app.start_mic_monitor();
 
     loop {
@@ -1074,6 +1099,62 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
     }
+}
+
+fn parse_cli_command(args: &[String]) -> Result<CliCommand, String> {
+    let mut index = 1;
+    while index < args.len() {
+        let arg = &args[index];
+        if arg == "upload" {
+            let path = args
+                .get(index + 1)
+                .ok_or_else(|| "usage: tomchat upload file_path".to_string())?;
+            if path.is_empty() {
+                return Err("usage: tomchat upload file_path".to_string());
+            }
+            if args.len() != index + 2 {
+                return Err("usage: tomchat upload file_path".to_string());
+            }
+            return Ok(CliCommand::Upload {
+                path: PathBuf::from(path),
+            });
+        }
+
+        if cli_option_takes_value(arg) {
+            index += 2;
+        } else {
+            index += 1;
+        }
+    }
+    Ok(CliCommand::RunUi)
+}
+
+fn cli_option_takes_value(arg: &str) -> bool {
+    matches!(
+        arg,
+        "--config"
+            | "--logfile"
+            | "--user"
+            | "--token"
+            | "--tcp"
+            | "--udp"
+            | "--udp-probe"
+            | "--receive-dir"
+            | "--max-upload-bytes"
+            | "--max-receive-bytes"
+    )
+}
+
+fn absolute_upload_path(path: &Path) -> Result<PathBuf, String> {
+    if path.as_os_str().is_empty() {
+        return Err("usage: tomchat upload file_path".to_string());
+    }
+    if path.is_absolute() {
+        return Ok(path.to_path_buf());
+    }
+    std::env::current_dir()
+        .map(|cwd| cwd.join(path))
+        .map_err(|error| format!("failed to read current directory: {error}"))
 }
 
 fn render(app: &mut App, buf: &mut Buffer) {
@@ -1551,6 +1632,47 @@ mod tests {
         assert_eq!(config.audio.bitrate_bps, 24_000);
         assert_eq!(config.files.max_upload_bytes, 50 * 1024 * 1024);
         assert_eq!(config.files.max_receive_bytes, 50 * 1024 * 1024);
+    }
+
+    #[test]
+    fn parses_upload_subcommand_after_value_options() {
+        let args = vec![
+            "tomchat".to_string(),
+            "--config".to_string(),
+            "dev.toml".to_string(),
+            "upload".to_string(),
+            "some_file/foo.md".to_string(),
+        ];
+
+        assert_eq!(
+            parse_cli_command(&args).unwrap(),
+            CliCommand::Upload {
+                path: PathBuf::from("some_file/foo.md")
+            }
+        );
+    }
+
+    #[test]
+    fn upload_subcommand_rejects_extra_args() {
+        let args = vec![
+            "tomchat".to_string(),
+            "upload".to_string(),
+            "foo.md".to_string(),
+            "bar.md".to_string(),
+        ];
+
+        assert!(parse_cli_command(&args).is_err());
+    }
+
+    #[test]
+    fn upload_path_is_made_absolute_without_renaming_leaf() {
+        let path = absolute_upload_path(Path::new("some_file/foo.md")).unwrap();
+
+        assert!(path.is_absolute());
+        assert_eq!(
+            path.file_name().and_then(|name| name.to_str()),
+            Some("foo.md")
+        );
     }
 
     #[test]
