@@ -82,7 +82,15 @@ impl Candidate {
         addr: SocketAddr,
         base: Option<SocketAddr>,
     ) -> Self {
-        Self::with_metadata(id, 0, 0, kind, addr, base, matches!(kind, CandidateKind::Host))
+        Self::with_metadata(
+            id,
+            0,
+            0,
+            kind,
+            addr,
+            base,
+            matches!(kind, CandidateKind::Host),
+        )
     }
 
     pub fn with_metadata(

@@ -27,9 +27,9 @@ use rpc::{
     media::{self, MediaPayload},
 };
 use tomchat_p2p::{
-    Action as P2pAction, AgentConfig as P2pAgentConfig, Candidate, CandidateKind, IceRole, NatKind,
-    NatClassifier, ReflexiveObservation, TraversalAgent,
-    interfaces::host_candidates_with_metadata,
+    Action as P2pAction, AgentConfig as P2pAgentConfig, Candidate, CandidateKind, IceRole,
+    NatClassifier, NatKind, ReflexiveObservation, RestartPortPolicy, TraversalAgent,
+    interfaces::{InterfaceSnapshot, host_candidates_with_metadata},
     socket::{UdpSocketOptions, bind_udp_socket, is_ignorable_udp_error},
     stun::{StunMessage, is_stun_message},
 };
@@ -39,6 +39,7 @@ use crate::audio::RemoteVoicePacket;
 const TCP: Token = Token(0);
 const UDP: Token = Token(1);
 const POLL_TIMEOUT: Duration = Duration::from_millis(20);
+const INTERFACE_POLL_INTERVAL: Duration = Duration::from_secs(2);
 
 #[derive(Clone, Debug)]
 pub struct ClientConfig {
@@ -219,6 +220,10 @@ fn run_worker_inner(
         p2p_reflexive_addr: None,
         p2p_candidates: Vec::new(),
         p2p_peers: HashMap::new(),
+        restart_port_policy: RestartPortPolicy::default(),
+        udp_rebind_requested: false,
+        interface_snapshot: InterfaceSnapshot::capture().ok(),
+        next_interface_poll: Instant::now() + INTERFACE_POLL_INTERVAL,
         shutdown: false,
     };
 
@@ -266,7 +271,12 @@ fn run_worker_inner(
         while let Ok(command) = commands.try_recv() {
             worker.handle_command(command)?;
         }
-        worker.poll_p2p(Instant::now());
+        let now = Instant::now();
+        worker.poll_interfaces(now);
+        if worker.udp_rebind_requested {
+            worker.rebind_udp_socket(&mut poll)?;
+        }
+        worker.poll_p2p(now);
     }
     kvlog::info!("network worker shutdown requested");
     Ok(())
@@ -353,6 +363,10 @@ struct WorkerState {
     p2p_reflexive_addr: Option<SocketAddr>,
     p2p_candidates: Vec<P2pCandidate>,
     p2p_peers: HashMap<SessionId, PeerConnection>,
+    restart_port_policy: RestartPortPolicy,
+    udp_rebind_requested: bool,
+    interface_snapshot: Option<InterfaceSnapshot>,
+    next_interface_poll: Instant,
     shutdown: bool,
 }
 
@@ -710,36 +724,34 @@ impl WorkerState {
                     kvlog::warn!("invalid udp reflexive address", addr = addr.as_str(), error = %error);
                 }
             },
-            ServerControl::P2pNatProbe { probe_id, addr } => {
-                match addr.parse::<SocketAddr>() {
-                    Ok(addr) => {
-                        kvlog::info!(
-                            "client nat probe observation received",
-                            probe_id,
-                            addr = %addr
-                        );
-                        let server_addr = self
-                            .probe_addr_for_id(probe_id)
-                            .unwrap_or(self.config.udp_addr);
-                        self.p2p_nat_classifier.observe(ReflexiveObservation {
-                            server_addr,
-                            mapped_addr: addr,
-                        });
-                        let classified = self.p2p_nat_classifier.classify();
-                        self.p2p_nat = control_nat_kind(classified);
-                        self.p2p_reflexive_addr = self.p2p_nat_classifier.primary_reflexive_addr();
-                        self.publish_p2p_candidates();
-                    }
-                    Err(error) => {
-                        kvlog::warn!(
-                            "invalid nat probe address",
-                            probe_id,
-                            addr = addr.as_str(),
-                            error = %error
-                        );
-                    }
+            ServerControl::P2pNatProbe { probe_id, addr } => match addr.parse::<SocketAddr>() {
+                Ok(addr) => {
+                    kvlog::info!(
+                        "client nat probe observation received",
+                        probe_id,
+                        addr = %addr
+                    );
+                    let server_addr = self
+                        .probe_addr_for_id(probe_id)
+                        .unwrap_or(self.config.udp_addr);
+                    self.p2p_nat_classifier.observe(ReflexiveObservation {
+                        server_addr,
+                        mapped_addr: addr,
+                    });
+                    let classified = self.p2p_nat_classifier.classify();
+                    self.p2p_nat = control_nat_kind(classified);
+                    self.p2p_reflexive_addr = self.p2p_nat_classifier.primary_reflexive_addr();
+                    self.publish_p2p_candidates();
                 }
-            }
+                Err(error) => {
+                    kvlog::warn!(
+                        "invalid nat probe address",
+                        probe_id,
+                        addr = addr.as_str(),
+                        error = %error
+                    );
+                }
+            },
             ServerControl::P2pPeer { peer } => {
                 if let Err(error) = self.install_p2p_peer(peer) {
                     kvlog::warn!("p2p peer rejected", error = %error);
@@ -797,6 +809,83 @@ impl WorkerState {
         }
     }
 
+    fn poll_interfaces(&mut self, now: Instant) {
+        if now < self.next_interface_poll {
+            return;
+        }
+        self.next_interface_poll = now + INTERFACE_POLL_INTERVAL;
+        let Ok(snapshot) = InterfaceSnapshot::capture() else {
+            return;
+        };
+        let changed = self
+            .interface_snapshot
+            .as_ref()
+            .is_some_and(|previous| snapshot.changed_from(previous));
+        self.interface_snapshot = Some(snapshot);
+        if changed {
+            kvlog::info!("network interfaces changed; requesting p2p restart");
+            self.request_p2p_restart();
+        }
+    }
+
+    fn request_p2p_restart(&mut self) {
+        self.p2p_generation = self.p2p_generation.wrapping_add(1).max(1);
+        self.p2p_reflexive_addr = None;
+        self.p2p_candidates.clear();
+        self.p2p_nat_classifier = NatClassifier::new();
+        self.p2p_nat = configured_nat_kind();
+        self.udp_rebind_requested = true;
+    }
+
+    fn rebind_udp_socket(&mut self, poll: &mut Poll) -> Result<(), String> {
+        self.udp_rebind_requested = false;
+        if let Err(error) = poll.registry().deregister(&mut self.udp) {
+            kvlog::warn!("failed to deregister udp socket before rebind", error = %error);
+        }
+        self.restart_port_policy.record(self.udp_local_addr.port());
+
+        let bind_addr =
+            RestartPortPolicy::bind_addr_for_restart(if self.config.udp_addr.is_ipv4() {
+                "0.0.0.0:0".parse().unwrap()
+            } else {
+                "[::]:0".parse().unwrap()
+            });
+        let mut last_error = None;
+        for _ in 0..8 {
+            match bind_udp_socket(bind_addr, UdpSocketOptions::default()) {
+                Ok(socket) => {
+                    let local_addr = socket
+                        .local_addr()
+                        .map_err(|error| format!("failed to read rebound UDP address: {error}"))?;
+                    if !self.restart_port_policy.accepts(local_addr.port()) {
+                        self.restart_port_policy.record(local_addr.port());
+                        continue;
+                    }
+                    self.udp_local_addr = local_addr;
+                    self.udp = UdpSocket::from_std(socket);
+                    poll.registry()
+                        .register(&mut self.udp, UDP, Interest::READABLE)
+                        .map_err(|error| {
+                            format!("failed to register rebound UDP socket: {error}")
+                        })?;
+                    kvlog::info!("udp socket rebound", addr = %self.udp_local_addr);
+                    self.bind_udp();
+                    return Ok(());
+                }
+                Err(error) => {
+                    last_error = Some(error);
+                }
+            }
+        }
+
+        Err(format!(
+            "failed to rebind UDP socket to fresh port{}",
+            last_error
+                .map(|error| format!(": {error}"))
+                .unwrap_or_default()
+        ))
+    }
+
     fn send_media(&mut self, payload: &MediaPayload) {
         let kind = media_payload_kind(payload);
         let counter = self.media_send_counter;
@@ -851,12 +940,17 @@ impl WorkerState {
 
     fn gather_p2p_candidates(&self) -> Vec<P2pCandidate> {
         let mut next_id = 1;
-        let mut candidates =
-            host_candidates_with_metadata(1, self.p2p_generation, self.udp_local_addr.port(), true, &mut next_id)
-            .unwrap_or_else(|error| {
-                kvlog::warn!("host candidate discovery failed", error = %error);
-                Vec::new()
-            });
+        let mut candidates = host_candidates_with_metadata(
+            1,
+            self.p2p_generation,
+            self.udp_local_addr.port(),
+            true,
+            &mut next_id,
+        )
+        .unwrap_or_else(|error| {
+            kvlog::warn!("host candidate discovery failed", error = %error);
+            Vec::new()
+        });
         if candidates.is_empty() {
             let fallback_ip = if self.config.udp_addr.is_ipv4() {
                 "127.0.0.1".parse().unwrap()
@@ -1121,11 +1215,14 @@ impl WorkerState {
                     );
                 }
                 P2pAction::IceRestart { .. } => {
-                    self.p2p_generation = self.p2p_generation.wrapping_add(1).max(1);
-                    self.publish_p2p_candidates();
+                    self.request_p2p_restart();
                 }
                 P2pAction::Disconnected => {
                     kvlog::warn!("p2p direct path timed out", session_id = session_id.0);
+                    self.p2p_peers.remove(&session_id);
+                    let _ = self.events.send(NetworkEvent::Status(
+                        "p2p direct path timed out; using relay".to_string(),
+                    ));
                 }
             }
         }

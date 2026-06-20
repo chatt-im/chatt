@@ -8,7 +8,8 @@ The traversal core lives in `crates/p2p`. It is a deterministic ICE-like state
 machine driven by the client event loop:
 
 - Gather host candidates from active non-virtual interfaces.
-- Discover server-reflexive candidates with the same UDP socket used for media.
+- Discover server-reflexive candidates with encrypted NAT probes sent from the
+  same UDP socket used for media.
 - Exchange host, server-reflexive, and relay candidates over encrypted TCP
   signaling.
 - Pace STUN Binding checks at 25 ms minimum spacing.
@@ -62,7 +63,21 @@ paths into the existing jitter buffer; duplicate sequence numbers are dropped,
 so the relay remains a seamless fallback while the direct packet usually wins on
 latency.
 
+NAT classification uses two server UDP endpoints. Stable observed mappings are
+classified as cone; destination-dependent mappings are classified as symmetric.
 Set `TOMCHAT_P2P_NAT=symmetric` or `TOMCHAT_P2P_NAT=cone` to override local NAT
-classification when testing known topologies. The default is `unknown`, which
-still runs direct checks but cannot pre-declare a symmetric-symmetric deadlock
-without the override or future multi-STUN classification.
+classification when testing known topologies.
+
+The client polls local interfaces every 2 seconds. Interface/IP changes trigger
+a P2P restart, clear stale reflexive state, rebind the UDP socket to a fresh
+ephemeral port, and re-publish candidates without stopping the relay path.
+
+## Validation
+
+`cargo test --workspace` runs deterministic simulator coverage for the 23 NAT,
+topology, firewall, socket, lifecycle, and timing edge cases. The Linux network
+namespace smoke test is opt-in:
+
+```sh
+sudo TOMCHAT_NETNS_TESTS=1 cargo test -p tomchat-p2p --test netns
+```
