@@ -379,7 +379,7 @@ enum Action {
 impl App {
     fn new(config: Config) -> Self {
         let (event_tx, event_rx) = mpsc::channel();
-        let client_config = config.network.client_config();
+        let client_config = config.network.client_config(&config.files);
         let network = NetworkClient::spawn(client_config, event_tx);
         let mut composer =
             Editor::with_bindings(editor_bindings::vim(editor_bindings::VimOptions::default()));
@@ -775,6 +775,7 @@ impl App {
             "/config" | "/settings" => self.open_settings(),
             "/users" => self.show_users(),
             "/whoami" => self.show_current_user(),
+            command if command.starts_with("/upload ") => self.upload_file_command(command),
             command if command.starts_with("/user ") => self.change_user_command(command),
             command if command.starts_with('/') => {
                 self.set_error(format!("unknown command: {command}"))
@@ -783,6 +784,17 @@ impl App {
                 .network
                 .send(NetworkCommand::SendChat(body.to_string())),
         }
+    }
+
+    fn upload_file_command(&mut self, command: &str) {
+        let path = command.trim_start_matches("/upload ").trim();
+        if path.is_empty() {
+            self.set_error("usage: /upload file_path/filename.ext");
+            return;
+        }
+        self.network
+            .send(NetworkCommand::UploadFile(std::path::PathBuf::from(path)));
+        self.set_status(format!("queued upload {}", path));
     }
 
     fn set_mute(&mut self, muted: bool) {
@@ -863,7 +875,10 @@ impl App {
         self.set_status(format!("connecting as {}", self.user));
 
         let (event_tx, event_rx) = mpsc::channel();
-        self.network = NetworkClient::spawn(self.config.network.client_config(), event_tx);
+        self.network = NetworkClient::spawn(
+            self.config.network.client_config(&self.config.files),
+            event_tx,
+        );
         self.event_rx = event_rx;
         self.start_mic_monitor();
     }
@@ -1534,6 +1549,8 @@ mod tests {
         let config = Config::default();
         assert_eq!(config.network.user, "alice");
         assert_eq!(config.audio.bitrate_bps, 24_000);
+        assert_eq!(config.files.max_upload_bytes, 50 * 1024 * 1024);
+        assert_eq!(config.files.max_receive_bytes, 50 * 1024 * 1024);
     }
 
     #[test]

@@ -21,6 +21,11 @@ placeholder = "Message #lobby"
 max-messages = 50000
 overscan = 24
 
+[files]
+max-upload-bytes = 52428800
+max-receive-bytes = 52428800
+receive-dir = "/tmp/tchat2"
+
 [bindings.compose]
 "C-c" = "Quit"
 "F2" = "OpenSettings"

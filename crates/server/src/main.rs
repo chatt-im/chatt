@@ -12,8 +12,9 @@ use mio::{
 use ring::rand::SecureRandom;
 use rpc::{
     control::{
-        self, ChatMessage, ClientControl, P2pCandidate, P2pKey, P2pNatKind, P2pPeerInfo, P2pRole,
-        RoomInfo, ServerControl, decode_client_control, decode_client_hello, encode_server_control,
+        self, ChatMessage, ClientControl, DEFAULT_FILE_SIZE_LIMIT_BYTES, FileMetadata,
+        MAX_FILE_CHUNK_BYTES, P2pCandidate, P2pKey, P2pNatKind, P2pPeerInfo, P2pRole, RoomInfo,
+        ServerControl, decode_client_control, decode_client_hello, encode_server_control,
         encode_server_hello,
     },
     crypto::{
@@ -21,7 +22,7 @@ use rpc::{
         dev_server_key_pair, respond_to_client_hello,
     },
     frame,
-    ids::{MessageId, RoomId, SessionId, StreamId, UserId},
+    ids::{FileTransferId, MessageId, RoomId, SessionId, StreamId, UserId},
     media::{self, MediaPayload},
 };
 
@@ -35,6 +36,7 @@ const FIRST_CLIENT: usize = 3;
 const DEFAULT_ROOM: RoomId = RoomId(1);
 const MAX_CHAT_HISTORY: usize = 200;
 const POLL_TIMEOUT: Duration = Duration::from_millis(100);
+const SERVER_FILE_SIZE_LIMIT_BYTES: u64 = DEFAULT_FILE_SIZE_LIMIT_BYTES;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let _logger = kvlog::spawn_collector_from_env(Some("tomchat-server"), false);
@@ -94,6 +96,9 @@ struct Server {
     next_message: u64,
     next_stream: u32,
     next_connection_id: u64,
+    next_file_transfer: u64,
+    active_uploads: HashMap<(SessionId, FileTransferId), ServerUpload>,
+    reserved_file_names: HashSet<String>,
     rng: ring::rand::SystemRandom,
     server_key_pair: ring::signature::Ed25519KeyPair,
 }
@@ -138,6 +143,9 @@ impl Server {
             next_message: 1,
             next_stream: 1,
             next_connection_id: 1,
+            next_file_transfer: 1,
+            active_uploads: HashMap::new(),
+            reserved_file_names: HashSet::new(),
             rng: ring::rand::SystemRandom::new(),
             server_key_pair: dev_server_key_pair(),
         })
@@ -357,8 +365,16 @@ impl Server {
                 ClientControl::Authenticate {
                     user,
                     token: auth_token,
+                    receive_files,
+                    file_receive_limit_bytes,
                 },
-            ) => self.authenticate_client(token, &user, &auth_token),
+            ) => self.authenticate_client(
+                token,
+                &user,
+                &auth_token,
+                receive_files,
+                file_receive_limit_bytes,
+            ),
             (ConnState::AwaitAuth, _) => Err("authenticate before sending control messages".into()),
             (ConnState::Ready, ClientControl::Authenticate { .. }) => {
                 Err("session is already authenticated".into())
@@ -401,6 +417,44 @@ impl Server {
                     candidates,
                 )
             }
+            (
+                ConnState::Ready,
+                ClientControl::UploadFileStart {
+                    room_id,
+                    transfer_id,
+                    name,
+                    size,
+                },
+            ) => {
+                let session_id = self.session_for_token(token)?;
+                self.start_file_upload(session_id, room_id, transfer_id, name, size)
+            }
+            (
+                ConnState::Ready,
+                ClientControl::UploadFileChunk {
+                    transfer_id,
+                    offset,
+                    data,
+                },
+            ) => {
+                let session_id = self.session_for_token(token)?;
+                self.receive_file_chunk(session_id, transfer_id, offset, data)
+            }
+            (ConnState::Ready, ClientControl::UploadFileComplete { transfer_id }) => {
+                let session_id = self.session_for_token(token)?;
+                self.complete_file_upload(session_id, transfer_id)
+            }
+            (
+                ConnState::Ready,
+                ClientControl::UploadFileCancel {
+                    transfer_id,
+                    reason,
+                },
+            ) => {
+                let session_id = self.session_for_token(token)?;
+                self.cancel_file_upload(session_id, transfer_id, reason);
+                Ok(())
+            }
             (ConnState::Ready, ClientControl::Ping { nonce }) => {
                 self.send_control_to_token(token, &ServerControl::Pong { nonce })
             }
@@ -413,6 +467,8 @@ impl Server {
         token: Token,
         user_name: &str,
         auth_token: &str,
+        receive_files: bool,
+        file_receive_limit_bytes: u64,
     ) -> Result<(), String> {
         kvlog::info!("authenticate attempt", token = token.0, user = user_name);
         let Some(user) = USERS
@@ -445,6 +501,8 @@ impl Server {
                 media_recv_replay: AntiReplay::new(),
                 active_stream: None,
                 p2p: None,
+                receive_files,
+                file_receive_limit_bytes,
             },
         );
 
@@ -459,7 +517,9 @@ impl Server {
             token = token.0,
             session_id = session_id.0,
             user_id = user.id.0,
-            user = user.name
+            user = user.name,
+            receive_files,
+            file_receive_limit_bytes
         );
         let rooms = self.room_infos();
         self.send_control_to_token(
@@ -698,6 +758,276 @@ impl Server {
         );
         self.broadcast_control(room_id, &ServerControl::Chat { message });
         Ok(())
+    }
+
+    fn start_file_upload(
+        &mut self,
+        session_id: SessionId,
+        room_id: RoomId,
+        client_transfer_id: FileTransferId,
+        name: String,
+        size: u64,
+    ) -> Result<(), String> {
+        kvlog::info!(
+            "file upload start requested",
+            session_id = session_id.0,
+            room_id = room_id.0,
+            client_transfer_id = client_transfer_id.0,
+            file_size = size,
+            file_name = name.as_str()
+        );
+        if size > SERVER_FILE_SIZE_LIMIT_BYTES {
+            return Err("file exceeds server maximum length".into());
+        }
+        let key = (session_id, client_transfer_id);
+        if self.active_uploads.contains_key(&key) {
+            return Err("file transfer id is already active".into());
+        }
+        let (sender, sender_name, member) = match self.sessions.get(&session_id) {
+            Some(session) => (
+                session.user_id,
+                session.user_name.clone(),
+                session.room_id == Some(room_id),
+            ),
+            None => return Err("unknown session".into()),
+        };
+        if !member {
+            return Err("join the room before uploading files".into());
+        }
+
+        let Some(member_ids) = self
+            .rooms
+            .get(&room_id)
+            .map(|room| room.members.iter().copied().collect::<Vec<_>>())
+        else {
+            return Err("room not found".into());
+        };
+
+        let original_name = sanitize_file_name(&name);
+        let file_name = self.allocate_file_name(&original_name);
+        let server_transfer_id = FileTransferId(self.next_file_transfer);
+        self.next_file_transfer = self.next_file_transfer.wrapping_add(1).max(1);
+        let timestamp_ms = now_ms();
+        let transfer_members = member_ids
+            .iter()
+            .copied()
+            .filter(|member_id| *member_id != session_id)
+            .collect::<Vec<_>>();
+        let recipients = transfer_members
+            .iter()
+            .copied()
+            .filter(|member_id| {
+                self.sessions.get(member_id).is_some_and(|session| {
+                    session.receive_files && size <= session.file_receive_limit_bytes
+                })
+            })
+            .collect::<HashSet<_>>();
+        let metadata = FileMetadata {
+            transfer_id: server_transfer_id,
+            room_id,
+            sender,
+            sender_name: sender_name.clone(),
+            file_name: file_name.clone(),
+            original_name,
+            size,
+            timestamp_ms,
+        };
+
+        let message = ChatMessage {
+            message_id: MessageId(self.next_message),
+            room_id,
+            sender,
+            sender_name,
+            timestamp_ms,
+            body: format!("sent file `{}` ({})", file_name, format_bytes(size)),
+        };
+        self.next_message += 1;
+        if let Some(room) = self.rooms.get_mut(&room_id) {
+            room.history.push_back(message.clone());
+            while room.history.len() > MAX_CHAT_HISTORY {
+                room.history.pop_front();
+            }
+        }
+        self.broadcast_control(room_id, &ServerControl::Chat { message });
+
+        for member_id in &transfer_members {
+            let Some(token) = self
+                .sessions
+                .get(member_id)
+                .map(|session| session.tcp_token)
+            else {
+                continue;
+            };
+            let contents = recipients.contains(member_id);
+            let _ = self.send_control_to_token(
+                token,
+                &ServerControl::FileOffered {
+                    file: metadata.clone(),
+                    contents,
+                },
+            );
+        }
+
+        self.active_uploads.insert(
+            key,
+            ServerUpload {
+                server_transfer_id,
+                room_id,
+                file_name,
+                original_name: metadata.original_name,
+                size,
+                received: 0,
+                recipients,
+            },
+        );
+        Ok(())
+    }
+
+    fn receive_file_chunk(
+        &mut self,
+        session_id: SessionId,
+        client_transfer_id: FileTransferId,
+        offset: u64,
+        data: Vec<u8>,
+    ) -> Result<(), String> {
+        if data.len() > MAX_FILE_CHUNK_BYTES {
+            return Err("file chunk exceeds maximum length".into());
+        }
+        let key = (session_id, client_transfer_id);
+        let (server_transfer_id, recipients) = {
+            let upload = self
+                .active_uploads
+                .get_mut(&key)
+                .ok_or_else(|| "unknown file transfer".to_string())?;
+            if upload.received != offset {
+                return Err("file chunk offset mismatch".into());
+            }
+            let end = offset.saturating_add(data.len() as u64);
+            if end > upload.size {
+                return Err("file chunk exceeds declared file size".into());
+            }
+            upload.received = end;
+            (upload.server_transfer_id, upload.recipients.clone())
+        };
+        kvlog::info!(
+            "file chunk relaying",
+            session_id = session_id.0,
+            client_transfer_id = client_transfer_id.0,
+            server_transfer_id = server_transfer_id.0,
+            offset,
+            chunk_size = data.len(),
+            recipient_count = recipients.len()
+        );
+        for recipient in recipients {
+            let Some(token) = self
+                .sessions
+                .get(&recipient)
+                .map(|session| session.tcp_token)
+            else {
+                continue;
+            };
+            let _ = self.send_control_to_token(
+                token,
+                &ServerControl::FileChunk {
+                    transfer_id: server_transfer_id,
+                    offset,
+                    data: data.clone(),
+                },
+            );
+        }
+        Ok(())
+    }
+
+    fn complete_file_upload(
+        &mut self,
+        session_id: SessionId,
+        client_transfer_id: FileTransferId,
+    ) -> Result<(), String> {
+        let key = (session_id, client_transfer_id);
+        let upload = self
+            .active_uploads
+            .remove(&key)
+            .ok_or_else(|| "unknown file transfer".to_string())?;
+        if upload.received != upload.size {
+            self.send_file_canceled(&upload, "upload ended before all bytes arrived");
+            return Err("file upload ended before all bytes arrived".into());
+        }
+        kvlog::info!(
+            "file upload completed",
+            session_id = session_id.0,
+            room_id = upload.room_id.0,
+            client_transfer_id = client_transfer_id.0,
+            server_transfer_id = upload.server_transfer_id.0,
+            file_name = upload.file_name.as_str(),
+            original_name = upload.original_name.as_str(),
+            file_size = upload.size
+        );
+        for recipient in &upload.recipients {
+            let Some(token) = self
+                .sessions
+                .get(recipient)
+                .map(|session| session.tcp_token)
+            else {
+                continue;
+            };
+            let _ = self.send_control_to_token(
+                token,
+                &ServerControl::FileComplete {
+                    transfer_id: upload.server_transfer_id,
+                },
+            );
+        }
+        Ok(())
+    }
+
+    fn cancel_file_upload(
+        &mut self,
+        session_id: SessionId,
+        client_transfer_id: FileTransferId,
+        reason: String,
+    ) {
+        let key = (session_id, client_transfer_id);
+        if let Some(upload) = self.active_uploads.remove(&key) {
+            kvlog::warn!(
+                "file upload canceled",
+                session_id = session_id.0,
+                room_id = upload.room_id.0,
+                client_transfer_id = client_transfer_id.0,
+                server_transfer_id = upload.server_transfer_id.0,
+                reason = reason.as_str()
+            );
+            self.send_file_canceled(&upload, &reason);
+        }
+    }
+
+    fn cancel_uploads_for_session(&mut self, session_id: SessionId, reason: &str) {
+        let keys = self
+            .active_uploads
+            .keys()
+            .filter_map(|(owner, transfer_id)| (*owner == session_id).then_some(*transfer_id))
+            .collect::<Vec<_>>();
+        for transfer_id in keys {
+            self.cancel_file_upload(session_id, transfer_id, reason.to_string());
+        }
+    }
+
+    fn send_file_canceled(&mut self, upload: &ServerUpload, reason: &str) {
+        for recipient in &upload.recipients {
+            let Some(token) = self
+                .sessions
+                .get(recipient)
+                .map(|session| session.tcp_token)
+            else {
+                continue;
+            };
+            let _ = self.send_control_to_token(
+                token,
+                &ServerControl::FileCanceled {
+                    transfer_id: upload.server_transfer_id,
+                    reason: reason.to_string(),
+                },
+            );
+        }
     }
 
     fn start_voice(&mut self, session_id: SessionId, room_id: RoomId) -> Result<(), String> {
@@ -1222,6 +1552,7 @@ impl Server {
             user_id = client.user_id.map(|id| id.0)
         );
         if let Some(session_id) = client.session_id {
+            self.cancel_uploads_for_session(session_id, "sender disconnected");
             let room_id = self.sessions.get(&session_id).and_then(|s| s.room_id);
             if let Some(room_id) = room_id {
                 self.leave_room(session_id, room_id);
@@ -1267,6 +1598,10 @@ impl Server {
         self.peer_links
             .retain(|(a, b), _| *a != session_id && *b != session_id);
     }
+
+    fn allocate_file_name(&mut self, requested: &str) -> String {
+        reserve_unique_file_name(&mut self.reserved_file_names, requested)
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1299,6 +1634,18 @@ struct Session {
     media_recv_replay: AntiReplay,
     active_stream: Option<StreamId>,
     p2p: Option<P2pSessionState>,
+    receive_files: bool,
+    file_receive_limit_bytes: u64,
+}
+
+struct ServerUpload {
+    server_transfer_id: FileTransferId,
+    room_id: RoomId,
+    file_name: String,
+    original_name: String,
+    size: u64,
+    received: u64,
+    recipients: HashSet<SessionId>,
 }
 
 #[derive(Clone)]
@@ -1363,6 +1710,58 @@ fn p2p_key(key: &KeyMaterial) -> P2pKey {
     }
 }
 
+fn sanitize_file_name(name: &str) -> String {
+    let trimmed = name.rsplit(['/', '\\']).next().unwrap_or("file").trim();
+    let mut out = String::with_capacity(trimmed.len().max(4));
+    for ch in trimmed.chars() {
+        if ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-' | '_' | ' ') {
+            out.push(ch);
+        } else {
+            out.push('_');
+        }
+    }
+    let out = out.trim_matches([' ', '.']);
+    if out.is_empty() {
+        "file".to_string()
+    } else {
+        out.to_string()
+    }
+}
+
+fn split_extension(name: &str) -> (&str, &str) {
+    match name.rfind('.') {
+        Some(index) if index > 0 && index + 1 < name.len() => (&name[..index], &name[index..]),
+        _ => (name, ""),
+    }
+}
+
+fn reserve_unique_file_name(reserved: &mut HashSet<String>, requested: &str) -> String {
+    let requested = sanitize_file_name(requested);
+    if reserved.insert(requested.clone()) {
+        return requested;
+    }
+    let (stem, extension) = split_extension(&requested);
+    for index in 1u64.. {
+        let candidate = format!("{stem}-{index}{extension}");
+        if reserved.insert(candidate.clone()) {
+            return candidate;
+        }
+    }
+    unreachable!("u64 filename suffix space exhausted")
+}
+
+fn format_bytes(bytes: u64) -> String {
+    const KIB: u64 = 1024;
+    const MIB: u64 = 1024 * KIB;
+    if bytes >= MIB {
+        format!("{:.1} MiB", bytes as f64 / MIB as f64)
+    } else if bytes >= KIB {
+        format!("{:.1} KiB", bytes as f64 / KIB as f64)
+    } else {
+        format!("{bytes} B")
+    }
+}
+
 fn conn_state_name(state: ConnState) -> &'static str {
     match state {
         ConnState::AwaitClientHello => "await_client_hello",
@@ -1379,6 +1778,10 @@ fn client_control_kind(control: &ClientControl) -> &'static str {
         ClientControl::StartVoice { .. } => "start_voice",
         ClientControl::StopVoice { .. } => "stop_voice",
         ClientControl::PublishP2p { .. } => "publish_p2p",
+        ClientControl::UploadFileStart { .. } => "upload_file_start",
+        ClientControl::UploadFileChunk { .. } => "upload_file_chunk",
+        ClientControl::UploadFileComplete { .. } => "upload_file_complete",
+        ClientControl::UploadFileCancel { .. } => "upload_file_cancel",
         ClientControl::Ping { .. } => "ping",
     }
 }
@@ -1396,7 +1799,48 @@ fn server_control_kind(control: &ServerControl) -> &'static str {
         ServerControl::P2pNatProbe { .. } => "p2p_nat_probe",
         ServerControl::P2pPeer { .. } => "p2p_peer",
         ServerControl::P2pPeerGone { .. } => "p2p_peer_gone",
+        ServerControl::FileOffered { .. } => "file_offered",
+        ServerControl::FileChunk { .. } => "file_chunk",
+        ServerControl::FileComplete { .. } => "file_complete",
+        ServerControl::FileCanceled { .. } => "file_canceled",
         ServerControl::Pong { .. } => "pong",
         ServerControl::Error { .. } => "error",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn split_extension_preserves_regular_extension() {
+        assert_eq!(split_extension("report.pdf"), ("report", ".pdf"));
+        assert_eq!(split_extension("archive.tar.zst"), ("archive.tar", ".zst"));
+        assert_eq!(split_extension(".env"), (".env", ""));
+    }
+
+    #[test]
+    fn sanitize_file_name_removes_paths_and_controls() {
+        assert_eq!(sanitize_file_name("../unsafe/report.pdf"), "report.pdf");
+        assert_eq!(sanitize_file_name("bad/name?.txt"), "name_.txt");
+        assert_eq!(sanitize_file_name("..."), "file");
+    }
+
+    #[test]
+    fn reserve_unique_file_name_preserves_extension() {
+        let mut reserved = HashSet::new();
+
+        assert_eq!(
+            reserve_unique_file_name(&mut reserved, "report.pdf"),
+            "report.pdf"
+        );
+        assert_eq!(
+            reserve_unique_file_name(&mut reserved, "report.pdf"),
+            "report-1.pdf"
+        );
+        assert_eq!(
+            reserve_unique_file_name(&mut reserved, "report.pdf"),
+            "report-2.pdf"
+        );
     }
 }

@@ -4,7 +4,7 @@ use toml_spanner::Toml;
 use toml_spanner::{Arena, Item, Key, Table};
 
 use crate::{audio::BufferRequest, bindings::BindingRuntime, client_net::ClientConfig};
-use rpc::ids::RoomId;
+use rpc::{control::DEFAULT_FILE_SIZE_LIMIT_BYTES, ids::RoomId};
 
 pub const DEFAULT_CONFIG: &str = include_str!("../tomchat.toml");
 
@@ -36,7 +36,7 @@ impl Default for NetworkConfig {
 }
 
 impl NetworkConfig {
-    pub fn client_config(&self) -> ClientConfig {
+    pub fn client_config(&self, files: &FileConfig) -> ClientConfig {
         ClientConfig {
             tcp_addr: self.tcp_addr,
             udp_addr: self.udp_addr,
@@ -44,6 +44,9 @@ impl NetworkConfig {
             user: self.user.clone(),
             token: self.token.clone(),
             room_id: RoomId(self.room_id),
+            file_receive_dir: files.receive_dir_path(),
+            max_upload_bytes: files.max_upload_bytes,
+            max_receive_bytes: files.max_receive_bytes,
         }
     }
 }
@@ -142,6 +145,34 @@ impl Default for UiConfig {
     }
 }
 
+#[derive(Clone, Debug, Toml)]
+#[toml(FromToml, ToToml, rename_all = "kebab-case")]
+pub struct FileConfig {
+    #[toml(default = DEFAULT_FILE_SIZE_LIMIT_BYTES)]
+    pub max_upload_bytes: u64,
+    #[toml(default = DEFAULT_FILE_SIZE_LIMIT_BYTES)]
+    pub max_receive_bytes: u64,
+    #[toml(default)]
+    pub receive_dir: String,
+}
+
+impl Default for FileConfig {
+    fn default() -> Self {
+        Self {
+            max_upload_bytes: DEFAULT_FILE_SIZE_LIMIT_BYTES,
+            max_receive_bytes: DEFAULT_FILE_SIZE_LIMIT_BYTES,
+            receive_dir: String::new(),
+        }
+    }
+}
+
+impl FileConfig {
+    pub fn receive_dir_path(&self) -> Option<PathBuf> {
+        let trimmed = self.receive_dir.trim();
+        (!trimmed.is_empty()).then(|| PathBuf::from(trimmed))
+    }
+}
+
 #[derive(Toml)]
 #[toml(FromToml, recoverable, warn_unknown_fields, rename_all = "kebab-case")]
 pub struct Config {
@@ -151,6 +182,8 @@ pub struct Config {
     pub audio: AudioConfig,
     #[toml(default)]
     pub ui: UiConfig,
+    #[toml(default)]
+    pub files: FileConfig,
     #[toml(default)]
     pub bindings: BindingRuntime,
     #[toml(skip)]
@@ -223,6 +256,23 @@ impl Config {
             if let Ok(addr) = addr.parse() {
                 self.network.udp_probe_addr = addr;
             }
+        }
+        if let Some(receive_dir) =
+            value_arg(&args, "--receive-dir").or_else(|| std::env::var("TOMCHAT_RECEIVE_DIR").ok())
+        {
+            self.files.receive_dir = receive_dir;
+        }
+        if let Some(limit) = value_arg(&args, "--max-upload-bytes")
+            .or_else(|| std::env::var("TOMCHAT_MAX_UPLOAD_BYTES").ok())
+            .and_then(|value| value.parse().ok())
+        {
+            self.files.max_upload_bytes = limit;
+        }
+        if let Some(limit) = value_arg(&args, "--max-receive-bytes")
+            .or_else(|| std::env::var("TOMCHAT_MAX_RECEIVE_BYTES").ok())
+            .and_then(|value| value.parse().ok())
+        {
+            self.files.max_receive_bytes = limit;
         }
     }
 
@@ -362,6 +412,21 @@ fn write_runtime_config<'de>(root: &mut Table<'de>, config: &Config, arena: &'de
             Item::from(config.ui.overscan as i64),
             arena,
         );
+    }
+
+    {
+        let files = ensure_table(root, "files", arena);
+        files.insert(
+            Key::new("max-upload-bytes"),
+            Item::from(config.files.max_upload_bytes as i64),
+            arena,
+        );
+        files.insert(
+            Key::new("max-receive-bytes"),
+            Item::from(config.files.max_receive_bytes as i64),
+            arena,
+        );
+        insert_str(files, "receive-dir", &config.files.receive_dir, arena);
     }
 }
 

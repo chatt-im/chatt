@@ -1,9 +1,12 @@
 use jsony::Jsony;
 
-use crate::ids::{MessageId, RoomId, SessionId, StreamId, UserId};
+use crate::ids::{FileTransferId, MessageId, RoomId, SessionId, StreamId, UserId};
 
 pub const MAX_CONTROL_PAYLOAD_BYTES: usize = 64 * 1024;
 pub const MAX_CHAT_BODY_BYTES: usize = 8 * 1024;
+pub const DEFAULT_FILE_SIZE_LIMIT_BYTES: u64 = 50 * 1024 * 1024;
+pub const MAX_FILE_CHUNK_BYTES: usize = 32 * 1024;
+pub const MAX_FILE_NAME_BYTES: usize = 255;
 
 #[derive(Clone, Debug, PartialEq, Eq, Jsony)]
 #[jsony(Binary, version)]
@@ -28,6 +31,8 @@ pub enum ClientControl {
     Authenticate {
         user: String,
         token: String,
+        receive_files: bool,
+        file_receive_limit_bytes: u64,
     },
     JoinRoom {
         room_id: RoomId,
@@ -48,6 +53,24 @@ pub enum ClientControl {
         nat: P2pNatKind,
         tie_breaker: u64,
         candidates: Vec<P2pCandidate>,
+    },
+    UploadFileStart {
+        room_id: RoomId,
+        transfer_id: FileTransferId,
+        name: String,
+        size: u64,
+    },
+    UploadFileChunk {
+        transfer_id: FileTransferId,
+        offset: u64,
+        data: Vec<u8>,
+    },
+    UploadFileComplete {
+        transfer_id: FileTransferId,
+    },
+    UploadFileCancel {
+        transfer_id: FileTransferId,
+        reason: String,
     },
     Ping {
         nonce: u64,
@@ -101,6 +124,22 @@ pub enum ServerControl {
         session_id: SessionId,
         user_id: UserId,
     },
+    FileOffered {
+        file: FileMetadata,
+        contents: bool,
+    },
+    FileChunk {
+        transfer_id: FileTransferId,
+        offset: u64,
+        data: Vec<u8>,
+    },
+    FileComplete {
+        transfer_id: FileTransferId,
+    },
+    FileCanceled {
+        transfer_id: FileTransferId,
+        reason: String,
+    },
     Pong {
         nonce: u64,
     },
@@ -135,6 +174,19 @@ pub struct ChatMessage {
     pub sender_name: String,
     pub timestamp_ms: u64,
     pub body: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Jsony)]
+#[jsony(Binary, version)]
+pub struct FileMetadata {
+    pub transfer_id: FileTransferId,
+    pub room_id: RoomId,
+    pub sender: UserId,
+    pub sender_name: String,
+    pub file_name: String,
+    pub original_name: String,
+    pub size: u64,
+    pub timestamp_ms: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Jsony)]
@@ -245,6 +297,14 @@ where
 
 fn validate_client_control(value: &ClientControl) -> Result<(), String> {
     match value {
+        ClientControl::Authenticate {
+            file_receive_limit_bytes,
+            ..
+        } => {
+            if *file_receive_limit_bytes > DEFAULT_FILE_SIZE_LIMIT_BYTES {
+                return Err("file receive limit exceeds maximum".to_string());
+            }
+        }
         ClientControl::SendChat { body, .. } => {
             if body.trim().is_empty() {
                 return Err("chat message is empty".to_string());
@@ -263,7 +323,39 @@ fn validate_client_control(value: &ClientControl) -> Result<(), String> {
                 }
             }
         }
+        ClientControl::UploadFileStart { name, size, .. } => {
+            validate_file_name(name)?;
+            if *size > DEFAULT_FILE_SIZE_LIMIT_BYTES {
+                return Err("file exceeds maximum length".to_string());
+            }
+        }
+        ClientControl::UploadFileChunk { data, .. } => {
+            if data.is_empty() {
+                return Err("file chunk is empty".to_string());
+            }
+            if data.len() > MAX_FILE_CHUNK_BYTES {
+                return Err("file chunk exceeds maximum length".to_string());
+            }
+        }
+        ClientControl::UploadFileCancel { reason, .. } => {
+            if reason.len() > 512 {
+                return Err("file cancel reason exceeds maximum length".to_string());
+            }
+        }
         _ => {}
+    }
+    Ok(())
+}
+
+fn validate_file_name(name: &str) -> Result<(), String> {
+    if name.trim().is_empty() {
+        return Err("file name is empty".to_string());
+    }
+    if name.len() > MAX_FILE_NAME_BYTES {
+        return Err("file name exceeds maximum length".to_string());
+    }
+    if name.contains('/') || name.contains('\\') {
+        return Err("file name must not contain path separators".to_string());
     }
     Ok(())
 }
@@ -311,5 +403,26 @@ mod tests {
             body: "  ".to_string(),
         };
         assert!(encode_client_control(&message).is_err());
+    }
+
+    #[test]
+    fn file_upload_control_round_trips() {
+        let control = ClientControl::UploadFileChunk {
+            transfer_id: FileTransferId(9),
+            offset: 32,
+            data: vec![1, 2, 3],
+        };
+        let encoded = encode_client_control(&control).unwrap();
+        assert_eq!(decode_client_control(&encoded).unwrap(), control);
+    }
+
+    #[test]
+    fn rejects_oversized_file_chunk() {
+        let control = ClientControl::UploadFileChunk {
+            transfer_id: FileTransferId(9),
+            offset: 0,
+            data: vec![0; MAX_FILE_CHUNK_BYTES + 1],
+        };
+        assert!(encode_client_control(&control).is_err());
     }
 }

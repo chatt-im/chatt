@@ -1,7 +1,9 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
+    fs::{self, File, OpenOptions},
     io::{self, Read, Write},
     net::{SocketAddr, TcpStream as StdTcpStream},
+    path::{Path, PathBuf},
     sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, TryRecvError},
     thread::{self, JoinHandle},
     time::{Duration, Instant},
@@ -14,16 +16,17 @@ use mio::{
 use ring::rand::SecureRandom;
 use rpc::{
     control::{
-        ChatMessage, ClientControl, P2pCandidate, P2pCandidateKind, P2pKey, P2pNatKind,
-        P2pPeerInfo, P2pRole, ParticipantInfo, RoomInfo, ServerControl, decode_server_control,
-        decode_server_hello, encode_client_control, encode_client_hello,
+        ChatMessage, ClientControl, DEFAULT_FILE_SIZE_LIMIT_BYTES, FileMetadata,
+        MAX_FILE_CHUNK_BYTES, MAX_FILE_NAME_BYTES, P2pCandidate, P2pCandidateKind, P2pKey,
+        P2pNatKind, P2pPeerInfo, P2pRole, ParticipantInfo, RoomInfo, ServerControl,
+        decode_server_control, decode_server_hello, encode_client_control, encode_client_hello,
     },
     crypto::{
         AntiReplay, CHANNEL_CONTROL, KEY_LEN, KeyMaterial, SessionSecrets, TransportCipher,
         complete_client_handshake, dev_server_public_key, generate_client_hello,
     },
     frame,
-    ids::{RoomId, SessionId, StreamId, UserId},
+    ids::{FileTransferId, RoomId, SessionId, StreamId, UserId},
     media::{self, MediaPayload},
 };
 use tomchat_p2p::{
@@ -40,6 +43,9 @@ const TCP: Token = Token(0);
 const UDP: Token = Token(1);
 const POLL_TIMEOUT: Duration = Duration::from_millis(20);
 const INTERFACE_POLL_INTERVAL: Duration = Duration::from_secs(2);
+const MAX_QUEUED_FILE_BYTES: usize = 128 * 1024;
+const MAX_FILE_CHUNKS_PER_TICK: usize = 4;
+const FILE_PROGRESS_STEP_BYTES: u64 = 1024 * 1024;
 
 #[derive(Clone, Debug)]
 pub struct ClientConfig {
@@ -49,11 +55,15 @@ pub struct ClientConfig {
     pub user: String,
     pub token: String,
     pub room_id: RoomId,
+    pub file_receive_dir: Option<PathBuf>,
+    pub max_upload_bytes: u64,
+    pub max_receive_bytes: u64,
 }
 
 #[derive(Debug)]
 pub enum NetworkCommand {
     SendChat(String),
+    UploadFile(PathBuf),
     StartVoice,
     StopVoice,
     LocalVoicePacket(Vec<u8>),
@@ -260,6 +270,9 @@ fn run_worker_inner(
         udp_rebind_requested: false,
         interface_snapshot: InterfaceSnapshot::capture().ok(),
         next_interface_poll: Instant::now() + INTERFACE_POLL_INTERVAL,
+        next_file_transfer: 1,
+        outgoing_uploads: VecDeque::new(),
+        incoming_files: HashMap::new(),
         shutdown: false,
         disconnect_reason: None,
     };
@@ -285,6 +298,11 @@ fn run_worker_inner(
     if let Err(error) = worker.queue_control(ClientControl::Authenticate {
         user: worker.config.user.clone(),
         token: worker.config.token.clone(),
+        receive_files: worker.config.file_receive_dir.is_some(),
+        file_receive_limit_bytes: worker
+            .config
+            .max_receive_bytes
+            .min(DEFAULT_FILE_SIZE_LIMIT_BYTES),
     }) {
         return SessionEnd::Disconnected(error);
     }
@@ -331,6 +349,9 @@ fn run_worker_inner(
                     break;
                 }
             }
+        }
+        if let Err(error) = worker.poll_uploads() {
+            return SessionEnd::Disconnected(error);
         }
         let now = Instant::now();
         worker.poll_interfaces(now);
@@ -516,8 +537,30 @@ struct WorkerState {
     udp_rebind_requested: bool,
     interface_snapshot: Option<InterfaceSnapshot>,
     next_interface_poll: Instant,
+    next_file_transfer: u64,
+    outgoing_uploads: VecDeque<OutgoingUpload>,
+    incoming_files: HashMap<FileTransferId, IncomingFile>,
     shutdown: bool,
     disconnect_reason: Option<String>,
+}
+
+struct OutgoingUpload {
+    transfer_id: FileTransferId,
+    room_id: RoomId,
+    name: String,
+    size: u64,
+    file: File,
+    offset: u64,
+    started: bool,
+    next_status_at: u64,
+}
+
+struct IncomingFile {
+    metadata: FileMetadata,
+    path: PathBuf,
+    file: File,
+    received: u64,
+    next_status_at: u64,
 }
 
 struct PeerConnection {
@@ -712,6 +755,9 @@ impl WorkerState {
                 );
                 self.queue_control(ClientControl::SendChat { room_id, body })?;
             }
+            NetworkCommand::UploadFile(path) => {
+                self.queue_file_upload(path);
+            }
             NetworkCommand::StartVoice => {
                 let room_id = self.room_id.unwrap_or(self.config.room_id);
                 kvlog::info!("start voice command handling", room_id = room_id.0);
@@ -743,6 +789,306 @@ impl WorkerState {
             }
         }
         Ok(())
+    }
+
+    fn queue_file_upload(&mut self, path: PathBuf) {
+        match self.prepare_file_upload(path) {
+            Ok(upload) => {
+                let name = upload.name.clone();
+                let size = upload.size;
+                self.outgoing_uploads.push_back(upload);
+                let _ = self.events.send(NetworkEvent::Status(format!(
+                    "queued upload {name} ({})",
+                    format_bytes(size)
+                )));
+            }
+            Err(error) => {
+                let _ = self.events.send(NetworkEvent::Error(error));
+            }
+        }
+    }
+
+    fn prepare_file_upload(&mut self, path: PathBuf) -> Result<OutgoingUpload, String> {
+        let metadata = fs::metadata(&path)
+            .map_err(|error| format!("failed to read {}: {error}", path.display()))?;
+        if !metadata.is_file() {
+            return Err(format!("upload path is not a file: {}", path.display()));
+        }
+        let limit = self
+            .config
+            .max_upload_bytes
+            .min(DEFAULT_FILE_SIZE_LIMIT_BYTES);
+        let size = metadata.len();
+        if size > limit {
+            return Err(format!(
+                "file is {}; limit is {}",
+                format_bytes(size),
+                format_bytes(limit)
+            ));
+        }
+        let name = sanitize_file_name(
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .ok_or_else(|| "upload path must end in a UTF-8 file name".to_string())?,
+        );
+        if name.len() > MAX_FILE_NAME_BYTES {
+            return Err("file name exceeds maximum length".to_string());
+        }
+        let file = File::open(&path)
+            .map_err(|error| format!("failed to open {}: {error}", path.display()))?;
+        let transfer_id = FileTransferId(self.next_file_transfer);
+        self.next_file_transfer = self.next_file_transfer.wrapping_add(1).max(1);
+        Ok(OutgoingUpload {
+            transfer_id,
+            room_id: self.room_id.unwrap_or(self.config.room_id),
+            name,
+            size,
+            file,
+            offset: 0,
+            started: false,
+            next_status_at: FILE_PROGRESS_STEP_BYTES.min(size),
+        })
+    }
+
+    fn poll_uploads(&mut self) -> Result<(), String> {
+        for _ in 0..MAX_FILE_CHUNKS_PER_TICK {
+            if self.write_buf.len() > MAX_QUEUED_FILE_BYTES {
+                break;
+            }
+            if !self.poll_one_upload()? {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    fn poll_one_upload(&mut self) -> Result<bool, String> {
+        let Some(mut upload) = self.outgoing_uploads.pop_front() else {
+            return Ok(false);
+        };
+
+        if !upload.started {
+            self.queue_control(ClientControl::UploadFileStart {
+                room_id: upload.room_id,
+                transfer_id: upload.transfer_id,
+                name: upload.name.clone(),
+                size: upload.size,
+            })?;
+            upload.started = true;
+            let _ = self.events.send(NetworkEvent::Status(format!(
+                "uploading {} ({})",
+                upload.name,
+                format_bytes(upload.size)
+            )));
+            self.outgoing_uploads.push_front(upload);
+            return Ok(true);
+        }
+
+        if upload.offset < upload.size {
+            let remaining = (upload.size - upload.offset).min(MAX_FILE_CHUNK_BYTES as u64);
+            let mut data = vec![0; remaining as usize];
+            let read = upload
+                .file
+                .read(&mut data)
+                .map_err(|error| format!("failed to read {}: {error}", upload.name))?;
+            if read == 0 {
+                self.queue_control(ClientControl::UploadFileCancel {
+                    transfer_id: upload.transfer_id,
+                    reason: "local file ended early".to_string(),
+                })?;
+                return Err(format!("file ended early while uploading {}", upload.name));
+            }
+            data.truncate(read);
+            let offset = upload.offset;
+            self.queue_control(ClientControl::UploadFileChunk {
+                transfer_id: upload.transfer_id,
+                offset,
+                data,
+            })?;
+            upload.offset += read as u64;
+            if upload.offset >= upload.next_status_at || upload.offset == upload.size {
+                let _ = self.events.send(NetworkEvent::Status(format!(
+                    "uploaded {} of {} for {}",
+                    format_bytes(upload.offset),
+                    format_bytes(upload.size),
+                    upload.name
+                )));
+                upload.next_status_at = upload
+                    .next_status_at
+                    .saturating_add(FILE_PROGRESS_STEP_BYTES);
+            }
+            self.outgoing_uploads.push_front(upload);
+            return Ok(true);
+        }
+
+        self.queue_control(ClientControl::UploadFileComplete {
+            transfer_id: upload.transfer_id,
+        })?;
+        let _ = self.events.send(NetworkEvent::Status(format!(
+            "upload complete: {} ({})",
+            upload.name,
+            format_bytes(upload.size)
+        )));
+        Ok(true)
+    }
+
+    fn handle_file_offered(&mut self, file: FileMetadata, contents: bool) {
+        kvlog::info!(
+            "file offered",
+            transfer_id = file.transfer_id.0,
+            file_name = file.file_name.as_str(),
+            file_size = file.size,
+            contents
+        );
+        if !contents {
+            let reason = if self.config.file_receive_dir.is_some() {
+                "receive limit"
+            } else {
+                "receive-dir disabled"
+            };
+            let _ = self.events.send(NetworkEvent::Status(format!(
+                "{} sent {} ({}, metadata only: {reason})",
+                file.sender_name,
+                file.file_name,
+                format_bytes(file.size)
+            )));
+            return;
+        }
+        if file.size
+            > self
+                .config
+                .max_receive_bytes
+                .min(DEFAULT_FILE_SIZE_LIMIT_BYTES)
+        {
+            let _ = self.events.send(NetworkEvent::Error(format!(
+                "not receiving {}; size {} exceeds local limit {}",
+                file.file_name,
+                format_bytes(file.size),
+                format_bytes(
+                    self.config
+                        .max_receive_bytes
+                        .min(DEFAULT_FILE_SIZE_LIMIT_BYTES)
+                )
+            )));
+            return;
+        }
+        let Some(receive_dir) = self.config.file_receive_dir.clone() else {
+            let _ = self.events.send(NetworkEvent::Status(format!(
+                "{} sent {} ({}, metadata only)",
+                file.sender_name,
+                file.file_name,
+                format_bytes(file.size)
+            )));
+            return;
+        };
+        match create_receive_file(&receive_dir, &file.file_name) {
+            Ok((path, handle)) => {
+                let _ = self.events.send(NetworkEvent::Status(format!(
+                    "receiving {} from {}",
+                    file.file_name, file.sender_name
+                )));
+                self.incoming_files.insert(
+                    file.transfer_id,
+                    IncomingFile {
+                        metadata: file,
+                        path,
+                        file: handle,
+                        received: 0,
+                        next_status_at: FILE_PROGRESS_STEP_BYTES,
+                    },
+                );
+            }
+            Err(error) => {
+                let _ = self.events.send(NetworkEvent::Error(error));
+            }
+        }
+    }
+
+    fn handle_file_chunk(&mut self, transfer_id: FileTransferId, offset: u64, data: Vec<u8>) {
+        let Some(incoming) = self.incoming_files.get_mut(&transfer_id) else {
+            return;
+        };
+        if incoming.received != offset {
+            let path = incoming.path.clone();
+            let name = incoming.metadata.file_name.clone();
+            self.incoming_files.remove(&transfer_id);
+            let _ = fs::remove_file(path);
+            let _ = self.events.send(NetworkEvent::Error(format!(
+                "file transfer offset mismatch for {name}"
+            )));
+            return;
+        }
+        if offset.saturating_add(data.len() as u64) > incoming.metadata.size {
+            let path = incoming.path.clone();
+            let name = incoming.metadata.file_name.clone();
+            self.incoming_files.remove(&transfer_id);
+            let _ = fs::remove_file(path);
+            let _ = self.events.send(NetworkEvent::Error(format!(
+                "file transfer exceeded declared size for {name}"
+            )));
+            return;
+        }
+        if let Err(error) = incoming.file.write_all(&data) {
+            let path = incoming.path.clone();
+            let name = incoming.metadata.file_name.clone();
+            self.incoming_files.remove(&transfer_id);
+            let _ = fs::remove_file(path);
+            let _ = self.events.send(NetworkEvent::Error(format!(
+                "failed to write {name}: {error}"
+            )));
+            return;
+        }
+        incoming.received += data.len() as u64;
+        if incoming.received >= incoming.next_status_at
+            || incoming.received == incoming.metadata.size
+        {
+            let _ = self.events.send(NetworkEvent::Status(format!(
+                "received {} of {} for {}",
+                format_bytes(incoming.received),
+                format_bytes(incoming.metadata.size),
+                incoming.metadata.file_name
+            )));
+            incoming.next_status_at = incoming
+                .next_status_at
+                .saturating_add(FILE_PROGRESS_STEP_BYTES);
+        }
+    }
+
+    fn handle_file_complete(&mut self, transfer_id: FileTransferId) {
+        let Some(mut incoming) = self.incoming_files.remove(&transfer_id) else {
+            return;
+        };
+        if incoming.received != incoming.metadata.size {
+            let _ = fs::remove_file(&incoming.path);
+            let _ = self.events.send(NetworkEvent::Error(format!(
+                "file transfer ended early for {}",
+                incoming.metadata.file_name
+            )));
+            return;
+        }
+        if let Err(error) = incoming.file.flush() {
+            let _ = fs::remove_file(&incoming.path);
+            let _ = self.events.send(NetworkEvent::Error(format!(
+                "failed to flush {}: {error}",
+                incoming.metadata.file_name
+            )));
+            return;
+        }
+        let _ = self.events.send(NetworkEvent::Status(format!(
+            "saved {} to {}",
+            incoming.metadata.file_name,
+            incoming.path.display()
+        )));
+    }
+
+    fn handle_file_canceled(&mut self, transfer_id: FileTransferId, reason: &str) {
+        if let Some(incoming) = self.incoming_files.remove(&transfer_id) {
+            let _ = fs::remove_file(&incoming.path);
+            let _ = self.events.send(NetworkEvent::Status(format!(
+                "file transfer canceled for {}: {reason}",
+                incoming.metadata.file_name
+            )));
+        }
     }
 
     fn handle_server_control(&mut self, control: ServerControl) {
@@ -923,6 +1269,25 @@ impl WorkerState {
                     session_id = session_id.0,
                     user_id = user_id.0
                 );
+            }
+            ServerControl::FileOffered { file, contents } => {
+                self.handle_file_offered(file, contents);
+            }
+            ServerControl::FileChunk {
+                transfer_id,
+                offset,
+                data,
+            } => {
+                self.handle_file_chunk(transfer_id, offset, data);
+            }
+            ServerControl::FileComplete { transfer_id } => {
+                self.handle_file_complete(transfer_id);
+            }
+            ServerControl::FileCanceled {
+                transfer_id,
+                reason,
+            } => {
+                self.handle_file_canceled(transfer_id, &reason);
             }
             ServerControl::Pong { .. } => {}
             ServerControl::Error { message, .. } => {
@@ -1442,6 +1807,7 @@ impl WorkerState {
 fn network_command_kind(command: &NetworkCommand) -> &'static str {
     match command {
         NetworkCommand::SendChat(_) => "send_chat",
+        NetworkCommand::UploadFile(_) => "upload_file",
         NetworkCommand::StartVoice => "start_voice",
         NetworkCommand::StopVoice => "stop_voice",
         NetworkCommand::LocalVoicePacket(_) => "local_voice_packet",
@@ -1457,6 +1823,10 @@ fn client_control_kind(control: &ClientControl) -> &'static str {
         ClientControl::StartVoice { .. } => "start_voice",
         ClientControl::StopVoice { .. } => "stop_voice",
         ClientControl::PublishP2p { .. } => "publish_p2p",
+        ClientControl::UploadFileStart { .. } => "upload_file_start",
+        ClientControl::UploadFileChunk { .. } => "upload_file_chunk",
+        ClientControl::UploadFileComplete { .. } => "upload_file_complete",
+        ClientControl::UploadFileCancel { .. } => "upload_file_cancel",
         ClientControl::Ping { .. } => "ping",
     }
 }
@@ -1474,8 +1844,73 @@ fn server_control_kind(control: &ServerControl) -> &'static str {
         ServerControl::P2pNatProbe { .. } => "p2p_nat_probe",
         ServerControl::P2pPeer { .. } => "p2p_peer",
         ServerControl::P2pPeerGone { .. } => "p2p_peer_gone",
+        ServerControl::FileOffered { .. } => "file_offered",
+        ServerControl::FileChunk { .. } => "file_chunk",
+        ServerControl::FileComplete { .. } => "file_complete",
+        ServerControl::FileCanceled { .. } => "file_canceled",
         ServerControl::Pong { .. } => "pong",
         ServerControl::Error { .. } => "error",
+    }
+}
+
+fn create_receive_file(dir: &Path, requested_name: &str) -> Result<(PathBuf, File), String> {
+    fs::create_dir_all(dir)
+        .map_err(|error| format!("failed to create {}: {error}", dir.display()))?;
+    let name = sanitize_file_name(requested_name);
+    let (stem, extension) = split_extension(&name);
+    for index in 0u64..10_000 {
+        let candidate = if index == 0 {
+            name.clone()
+        } else {
+            format!("{stem}-{index}{extension}")
+        };
+        let path = dir.join(candidate);
+        match OpenOptions::new().write(true).create_new(true).open(&path) {
+            Ok(file) => return Ok((path, file)),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(format!("failed to create {}: {error}", path.display())),
+        }
+    }
+    Err(format!(
+        "could not allocate a unique receive path for {}",
+        name
+    ))
+}
+
+fn sanitize_file_name(name: &str) -> String {
+    let trimmed = name.rsplit(['/', '\\']).next().unwrap_or("file").trim();
+    let mut out = String::with_capacity(trimmed.len().max(4));
+    for ch in trimmed.chars() {
+        if ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-' | '_' | ' ') {
+            out.push(ch);
+        } else {
+            out.push('_');
+        }
+    }
+    let out = out.trim_matches([' ', '.']);
+    if out.is_empty() {
+        "file".to_string()
+    } else {
+        out.to_string()
+    }
+}
+
+fn split_extension(name: &str) -> (&str, &str) {
+    match name.rfind('.') {
+        Some(index) if index > 0 && index + 1 < name.len() => (&name[..index], &name[index..]),
+        _ => (name, ""),
+    }
+}
+
+fn format_bytes(bytes: u64) -> String {
+    const KIB: u64 = 1024;
+    const MIB: u64 = 1024 * KIB;
+    if bytes >= MIB {
+        format!("{:.1} MiB", bytes as f64 / MIB as f64)
+    } else if bytes >= KIB {
+        format!("{:.1} KiB", bytes as f64 / KIB as f64)
+    } else {
+        format!("{bytes} B")
     }
 }
 
@@ -1601,6 +2036,7 @@ fn connection_id_from_p2p_username(username: &str) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn reconnect_schedule_matches_retry_policy() {
@@ -1622,5 +2058,33 @@ mod tests {
         schedule.reset();
 
         assert_eq!(schedule.next_delay(), Duration::from_secs(1));
+    }
+
+    #[test]
+    fn receive_file_path_preserves_extension_when_colliding() {
+        let dir = std::env::temp_dir().join(format!(
+            "tomchat-client-net-test-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("report.pdf"), b"existing").unwrap();
+
+        let (path, _file) = create_receive_file(&dir, "report.pdf").unwrap();
+
+        assert_eq!(
+            path.file_name().and_then(|name| name.to_str()),
+            Some("report-1.pdf")
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn sanitize_file_name_removes_path_components() {
+        assert_eq!(sanitize_file_name("../unsafe/report.pdf"), "report.pdf");
+        assert_eq!(sanitize_file_name("bad/name?.txt"), "name_.txt");
     }
 }
