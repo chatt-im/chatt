@@ -393,8 +393,10 @@ impl Server {
                 self.start_voice(session_id, room_id)
             }
             (ConnState::Ready, ClientControl::StopVoice { stream_id }) => {
-                let session_id = self.session_for_token(token)?;
-                self.stop_voice(session_id, Some(stream_id));
+                kvlog::info!(
+                    "client stop voice ignored; voice follows room membership",
+                    stream_id = stream_id.0
+                );
                 Ok(())
             }
             (
@@ -596,6 +598,19 @@ impl Server {
             );
         }
 
+        let voice_started = match self.ensure_voice_stream(session_id, room_id) {
+            Ok(voice) => Some(voice),
+            Err(error) => {
+                kvlog::warn!(
+                    "automatic voice stream failed",
+                    session_id = session_id.0,
+                    room_id = room_id.0,
+                    error = error.as_str()
+                );
+                None
+            }
+        };
+
         let participant = self.participant_for_session(session_id);
         if let Some(participant) = participant.clone() {
             self.broadcast_control(
@@ -627,6 +642,10 @@ impl Server {
                 participants,
             },
         );
+        self.send_existing_voice_streams_to_token(room_id, session_id, token);
+        if let Some((user_id, stream_id)) = voice_started {
+            self.broadcast_voice_started(room_id, user_id, stream_id);
+        }
         kvlog::info!(
             "room joined sent",
             session_id = session_id.0,
@@ -1031,6 +1050,23 @@ impl Server {
     }
 
     fn start_voice(&mut self, session_id: SessionId, room_id: RoomId) -> Result<(), String> {
+        let already_active = self
+            .sessions
+            .get(&session_id)
+            .and_then(|session| session.active_stream)
+            .is_some();
+        let (user_id, stream_id) = self.ensure_voice_stream(session_id, room_id)?;
+        if !already_active {
+            self.broadcast_voice_started(room_id, user_id, stream_id);
+        }
+        Ok(())
+    }
+
+    fn ensure_voice_stream(
+        &mut self,
+        session_id: SessionId,
+        room_id: RoomId,
+    ) -> Result<(UserId, StreamId), String> {
         let (user_id, in_room) = match self.sessions.get(&session_id) {
             Some(session) => (session.user_id, session.room_id == Some(room_id)),
             None => return Err("unknown session".into()),
@@ -1050,7 +1086,12 @@ impl Server {
             .and_then(|session| session.active_stream)
             .is_some()
         {
-            return Ok(());
+            let stream_id = self
+                .sessions
+                .get(&session_id)
+                .and_then(|session| session.active_stream)
+                .expect("checked above");
+            return Ok((user_id, stream_id));
         }
         let stream_id = StreamId(self.next_stream);
         self.next_stream = self.next_stream.wrapping_add(1).max(1);
@@ -1067,6 +1108,10 @@ impl Server {
             user_id = user_id.0,
             stream_id = stream_id.0
         );
+        Ok((user_id, stream_id))
+    }
+
+    fn broadcast_voice_started(&mut self, room_id: RoomId, user_id: UserId, stream_id: StreamId) {
         self.broadcast_control(
             room_id,
             &ServerControl::VoiceStarted {
@@ -1075,7 +1120,43 @@ impl Server {
                 stream_id,
             },
         );
-        Ok(())
+    }
+
+    fn send_existing_voice_streams_to_token(
+        &mut self,
+        room_id: RoomId,
+        joining_session_id: SessionId,
+        token: Token,
+    ) {
+        let streams = self
+            .rooms
+            .get(&room_id)
+            .map(|room| {
+                room.active_streams
+                    .iter()
+                    .filter_map(|(stream_id, session_id)| {
+                        (*session_id != joining_session_id).then_some((*stream_id, *session_id))
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        for (stream_id, session_id) in streams {
+            let Some(user_id) = self
+                .sessions
+                .get(&session_id)
+                .map(|session| session.user_id)
+            else {
+                continue;
+            };
+            let _ = self.send_control_to_token(
+                token,
+                &ServerControl::VoiceStarted {
+                    room_id,
+                    user_id,
+                    stream_id,
+                },
+            );
+        }
     }
 
     fn stop_voice(&mut self, session_id: SessionId, requested: Option<StreamId>) {
@@ -1590,7 +1671,7 @@ impl Server {
             .map(|session| control::ParticipantInfo {
                 user_id: session.user_id,
                 name: session.user_name.clone(),
-                in_call: session.active_stream.is_some(),
+                in_call: session.room_id.is_some(),
             })
     }
 

@@ -64,8 +64,6 @@ pub struct ClientConfig {
 pub enum NetworkCommand {
     SendChat(String),
     UploadFile(PathBuf),
-    StartVoice,
-    StopVoice,
     LocalVoicePacket(Vec<u8>),
     Shutdown,
 }
@@ -757,17 +755,6 @@ impl WorkerState {
             }
             NetworkCommand::UploadFile(path) => {
                 self.queue_file_upload(path);
-            }
-            NetworkCommand::StartVoice => {
-                let room_id = self.room_id.unwrap_or(self.config.room_id);
-                kvlog::info!("start voice command handling", room_id = room_id.0);
-                self.queue_control(ClientControl::StartVoice { room_id })?;
-            }
-            NetworkCommand::StopVoice => {
-                if let Some(stream_id) = self.active_stream {
-                    kvlog::info!("stop voice command handling", stream_id = stream_id.0);
-                    self.queue_control(ClientControl::StopVoice { stream_id })?;
-                }
             }
             NetworkCommand::LocalVoicePacket(payload) => {
                 if let Some(stream_id) = self.active_stream {
@@ -1808,8 +1795,6 @@ fn network_command_kind(command: &NetworkCommand) -> &'static str {
     match command {
         NetworkCommand::SendChat(_) => "send_chat",
         NetworkCommand::UploadFile(_) => "upload_file",
-        NetworkCommand::StartVoice => "start_voice",
-        NetworkCommand::StopVoice => "stop_voice",
         NetworkCommand::LocalVoicePacket(_) => "local_voice_packet",
         NetworkCommand::Shutdown => "shutdown",
     }

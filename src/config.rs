@@ -94,7 +94,7 @@ impl BufferChoice {
 #[toml(FromToml, ToToml, rename_all = "kebab-case")]
 pub struct AudioConfig {
     #[toml(default)]
-    pub input_device_index: Option<u32>,
+    pub input_device_id: Option<String>,
     #[toml(default = 24_000)]
     pub bitrate_bps: i32,
     #[toml(default = true)]
@@ -106,7 +106,7 @@ pub struct AudioConfig {
 impl Default for AudioConfig {
     fn default() -> Self {
         Self {
-            input_device_index: None,
+            input_device_id: None,
             bitrate_bps: 24_000,
             denoise: true,
             buffer: BufferChoice::Default,
@@ -217,6 +217,7 @@ impl Config {
         let arena = Arena::new();
         let mut doc = toml_spanner::parse(&content, &arena)
             .map_err(|err| format!("failed to parse {source}: {err}"))?;
+        reject_deprecated_config_keys(&doc, &source)?;
         let mut config: Config = doc.to().map_err(|err| {
             let errors: Vec<String> = err.errors.iter().map(ToString::to_string).collect();
             format!("failed to deserialize {source}: {}", errors.join(", "))
@@ -307,6 +308,23 @@ impl Config {
     }
 }
 
+fn reject_deprecated_config_keys(
+    doc: &toml_spanner::Document<'_>,
+    source: &str,
+) -> Result<(), String> {
+    if doc
+        .table()
+        .get("audio")
+        .and_then(Item::as_table)
+        .is_some_and(|audio| audio.contains_key("input-device-index"))
+    {
+        return Err(format!(
+            "failed to deserialize {source}: audio.input-device-index is not supported; use audio.input-device-id"
+        ));
+    }
+    Ok(())
+}
+
 pub fn default_token(user: &str) -> &'static str {
     match user {
         "bob" => "bob-dev-token",
@@ -365,14 +383,11 @@ fn write_runtime_config<'de>(root: &mut Table<'de>, config: &Config, arena: &'de
 
     {
         let audio = ensure_table(root, "audio", arena);
-        match config.audio.input_device_index {
-            Some(index) => audio.insert(
-                Key::new("input-device-index"),
-                Item::from(index as i64),
-                arena,
-            ),
+        audio.remove_entry("input-device-index");
+        match config.audio.input_device_id.as_deref() {
+            Some(id) => insert_str(audio, "input-device-id", id, arena),
             None => {
-                audio.remove_entry("input-device-index");
+                audio.remove_entry("input-device-id");
             }
         }
         audio.insert(
@@ -454,5 +469,35 @@ fn buffer_choice_name(choice: BufferChoice) -> &'static str {
         BufferChoice::Fixed240 => "fixed-240",
         BufferChoice::Fixed480 => "fixed-480",
         BufferChoice::Fixed960 => "fixed-960",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rejects_legacy_input_device_index() {
+        let path = std::env::temp_dir().join(format!(
+            "tomchat-config-legacy-input-device-index-{}.toml",
+            std::process::id()
+        ));
+        std::fs::write(
+            &path,
+            r#"
+[audio]
+input-device-index = 20
+"#,
+        )
+        .unwrap();
+
+        let error = match Config::load(Some(path.to_str().unwrap())) {
+            Ok(_) => panic!("legacy input-device-index should be rejected"),
+            Err(error) => error,
+        };
+        let _ = std::fs::remove_file(path);
+
+        assert!(error.contains("audio.input-device-index"));
+        assert!(error.contains("audio.input-device-id"));
     }
 }

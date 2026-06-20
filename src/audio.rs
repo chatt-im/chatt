@@ -89,7 +89,7 @@ pub struct RecordingConfig {
 
 #[derive(Clone, Debug)]
 pub struct LiveCaptureConfig {
-    pub input_device_index: Option<usize>,
+    pub input_device_id: Option<String>,
     pub bitrate_bps: i32,
     pub denoise: bool,
     pub buffer_request: BufferRequest,
@@ -517,6 +517,16 @@ pub fn input_devices(buffer_request: BufferRequest) -> Result<Vec<DeviceInfo>, S
     with_audio_backend_stderr_suppressed(|| input_devices_inner(buffer_request))
 }
 
+pub fn stable_input_device_id(name: &str) -> String {
+    let mut key = name.to_ascii_lowercase();
+    for suffix in [", usb audio", ", loopback pcm"] {
+        if let Some(stripped) = key.strip_suffix(suffix) {
+            key = stripped.to_string();
+        }
+    }
+    key.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 fn input_devices_inner(buffer_request: BufferRequest) -> Result<Vec<DeviceInfo>, String> {
     let host = cpal::default_host();
     let devices = host
@@ -603,18 +613,15 @@ where
 {
     let (device, selection) = with_audio_backend_stderr_suppressed(|| {
         let host = cpal::default_host();
-        let device = match config.input_device_index {
-            Some(index) => host
-                .input_devices()
-                .map_err(|error| format!("failed to list input devices: {error}"))?
-                .nth(index)
-                .ok_or_else(|| "selected input device is no longer available".to_string())?,
-            None => host
+        if let Some(id) = config.input_device_id.as_deref() {
+            select_input_device_by_id(&host, id, config.buffer_request)
+        } else {
+            let device = host
                 .default_input_device()
-                .ok_or_else(|| "no default input device found".to_string())?,
-        };
-        let selection = select_input_config(&device, config.buffer_request)?;
-        Ok::<_, String>((device, selection))
+                .ok_or_else(|| "no default input device found".to_string())?;
+            let selection = select_input_config(&device, config.buffer_request)?;
+            Ok::<_, String>((device, selection))
+        }
     })?;
 
     let device_name = device.to_string();
@@ -653,6 +660,39 @@ where
         worker: Some(worker),
         stats,
     })
+}
+
+fn select_input_device_by_id(
+    host: &cpal::Host,
+    id: &str,
+    buffer_request: BufferRequest,
+) -> Result<(cpal::Device, ConfigSelection), String> {
+    let devices = host
+        .input_devices()
+        .map_err(|error| format!("failed to list input devices: {error}"))?;
+    let mut matched = false;
+    let mut first_error = None;
+    for device in devices {
+        let name = device.to_string();
+        if stable_input_device_id(&name) != id {
+            continue;
+        }
+        matched = true;
+        match select_input_config(&device, buffer_request) {
+            Ok(selection) => return Ok((device, selection)),
+            Err(error) if first_error.is_none() => first_error = Some(error),
+            Err(_) => {}
+        }
+    }
+
+    if matched {
+        Err(format!(
+            "selected input device `{id}` is present but unsupported: {}",
+            first_error.unwrap_or_else(|| "no supported 48 kHz input config".to_string())
+        ))
+    } else {
+        Err(format!("selected input device `{id}` is unavailable"))
+    }
 }
 
 pub fn start_playback(path: &Path, buffer_request: BufferRequest) -> Result<Playback, String> {
