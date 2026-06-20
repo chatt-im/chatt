@@ -39,3 +39,30 @@ IPv4/IPv6 mismatches and all hard NAT/firewall failures.
 Liveness uses STUN keepalives every 10 seconds. Five seconds without inbound
 traffic requests an ICE restart. Fifteen seconds without inbound traffic tears
 the direct path down and leaves media on the relay.
+
+## Runtime integration
+
+The server is the signaling coordinator, not the media bottleneck for direct
+paths. After UDP bind, each client publishes:
+
+- host candidates from active non-virtual interfaces;
+- the server-reflexive address observed by the server from that same UDP socket;
+- the existing server UDP endpoint as the relay candidate.
+
+For every pair of room members that publish candidates, the server distributes a
+pair-specific connection ID and two symmetric media keys. Each side gets one key
+for sending and the opposite key for receiving. Direct voice packets use the
+`PeerVoice` media payload, which carries the connection ID inside the encrypted
+payload so the client can migrate to a new source IP/port after Wi-Fi/LTE
+roaming without binding cryptographic state to the old socket address.
+
+The client always keeps sending through the server relay. Once a direct path is
+selected, it also sends peer-encrypted packets directly. Receivers feed both
+paths into the existing jitter buffer; duplicate sequence numbers are dropped,
+so the relay remains a seamless fallback while the direct packet usually wins on
+latency.
+
+Set `TOMCHAT_P2P_NAT=symmetric` or `TOMCHAT_P2P_NAT=cone` to override local NAT
+classification when testing known topologies. The default is `unknown`, which
+still runs direct checks but cannot pre-declare a symmetric-symmetric deadlock
+without the override or future multi-STUN classification.

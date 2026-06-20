@@ -306,7 +306,9 @@ impl TraversalAgent {
         bytes: &[u8],
     ) -> Result<Vec<Action>, StunError> {
         let message = StunMessage::decode(bytes)?;
-        if !self.accepts_username(message.username.as_deref()) {
+        if message.class == MessageClass::Request
+            && !self.accepts_username(message.username.as_deref())
+        {
             return Ok(Vec::new());
         }
         self.last_rx_at = Some(now);
@@ -992,6 +994,56 @@ mod tests {
                 }
             }] if *remote_addr == "198.51.100.2:55003".parse().unwrap()
         ));
+    }
+
+    #[test]
+    fn username_filters_requests_but_not_transaction_responses() {
+        let now = at(0);
+        let config = AgentConfig {
+            username: Some("tomchat-p2p:77".to_string()),
+            ..AgentConfig::default()
+        };
+        let mut agent = TraversalAgent::new(
+            now,
+            config,
+            IceRole::Controlling,
+            10,
+            NatKind::Cone,
+            NatKind::Cone,
+            vec![candidate(1, CandidateKind::Host, "10.0.0.2:5000")],
+            vec![candidate(2, CandidateKind::Host, "10.0.0.3:5001")],
+        );
+
+        let wrong_request = StunMessage::binding_request(
+            TransactionId::from_counter(100),
+            Some("tomchat-p2p:78".to_string()),
+            1,
+            RoleAttribute::Controlled(9),
+            true,
+        )
+        .encode();
+        assert!(
+            agent
+                .handle_inbound(now, "10.0.0.3:5001".parse().unwrap(), &wrong_request)
+                .unwrap()
+                .is_empty()
+        );
+
+        let action = agent.poll(now).pop().unwrap();
+        let transaction_id = match action {
+            Action::SendStun { transaction_id, .. } => transaction_id,
+            _ => panic!("expected STUN check"),
+        };
+        let response =
+            StunMessage::binding_success(transaction_id, "10.0.0.2:5000".parse().unwrap()).encode();
+        let actions = agent
+            .handle_inbound(
+                now + Duration::from_millis(50),
+                "10.0.0.3:5001".parse().unwrap(),
+                &response,
+            )
+            .unwrap();
+        assert!(matches!(actions.as_slice(), [Action::DirectReady { .. }]));
     }
 
     #[test]
