@@ -7,8 +7,6 @@ token = "alice-dev-token"
 pairing-code = ""
 server-public-key = ""
 tcp-addr = "127.0.0.1:41000"
-udp-addr = "127.0.0.1:41001"
-udp-probe-addr = "127.0.0.1:41002"
 room-id = 1
 
 [audio]

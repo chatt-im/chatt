@@ -43,24 +43,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config_path = value_arg(&args, "--config");
     let config = ServerConfig::load(config_path.as_deref()).map_err(invalid_config)?;
     let server_public_key = config.server_public_key_hex().map_err(invalid_config)?;
+    let udp_probe_addr = config.network.udp_probe_addr;
+    let udp_probe_label = udp_probe_addr
+        .map(|addr| addr.to_string())
+        .unwrap_or_else(|| "disabled".to_string());
     kvlog::info!(
         "server starting",
         tcp_addr = %config.network.tcp_addr,
         udp_addr = %config.network.udp_addr,
-        udp_probe_addr = %config.network.udp_probe_addr,
+        udp_probe_addr = udp_probe_label.as_str(),
         server_public_key = server_public_key.as_str(),
         encryption = config.security.encryption,
         p2p_enabled = config.network.p2p_enabled
     );
     let tcp_addr = config.network.tcp_addr;
     let udp_addr = config.network.udp_addr;
-    let udp_probe_addr = config.network.udp_probe_addr;
     let p2p_enabled = config.network.p2p_enabled;
     let mut server = Server::bind(config)?;
-    if p2p_enabled {
+    if p2p_enabled && udp_probe_addr.is_some() {
         println!(
-            "tomchat server listening on tcp {tcp_addr}, udp {udp_addr}, probe {udp_probe_addr}"
+            "tomchat server listening on tcp {tcp_addr}, udp {udp_addr}, probe {udp_probe_label}"
         );
+    } else if p2p_enabled {
+        println!("tomchat server listening on tcp {tcp_addr}, udp {udp_addr}");
     } else {
         println!("tomchat server listening on tcp {tcp_addr}, udp {udp_addr} (P2P disabled)");
     }
@@ -85,7 +90,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "server listening",
         tcp_addr = %tcp_addr,
         udp_addr = %udp_addr,
-        udp_probe_addr = %udp_probe_addr,
+        udp_probe_addr = udp_probe_label.as_str(),
         encryption = server.config.security.encryption,
         p2p_enabled = server.config.network.p2p_enabled
     );
@@ -128,7 +133,7 @@ impl Server {
         let mut listener = TcpListener::bind(tcp_addr)?;
         let mut udp = UdpSocket::bind(udp_addr)?;
         let mut udp_probe = if p2p_enabled {
-            Some(UdpSocket::bind(udp_probe_addr)?)
+            udp_probe_addr.map(UdpSocket::bind).transpose()?
         } else {
             None
         };

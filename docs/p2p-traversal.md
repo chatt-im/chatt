@@ -63,9 +63,12 @@ paths into the existing jitter buffer; duplicate sequence numbers are dropped,
 so the relay remains a seamless fallback while the direct packet usually wins on
 latency.
 
-NAT classification uses two server UDP endpoints. Stable observed mappings are
+NAT classification can use a second server UDP endpoint when
+`udp-probe-addr` is explicitly configured. Stable observed mappings are
 classified as cone; destination-dependent mappings are classified as symmetric.
-Set `TOMCHAT_P2P_NAT=symmetric` or `TOMCHAT_P2P_NAT=cone` to override local NAT
+Without a probe address, clients still publish server-reflexive candidates from
+the shared media endpoint and leave NAT kind as unknown unless overridden. Set
+`TOMCHAT_P2P_NAT=symmetric` or `TOMCHAT_P2P_NAT=cone` to override local NAT
 classification when testing known topologies.
 
 The client polls local interfaces every 2 seconds. Interface/IP changes trigger

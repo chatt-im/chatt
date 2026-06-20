@@ -36,8 +36,11 @@ or from `--config` / `TOMCHAT_SERVER_CONFIG`.
 
 Important fields:
 
-- `network.tcp-addr`, `network.udp-addr`, `network.udp-probe-addr`: listener
-  addresses.
+- `network.tcp-addr`: TCP control listener. UDP media shares this address by
+  default.
+- `network.udp-addr`: optional UDP media listener override.
+- `network.udp-probe-addr`: optional second UDP endpoint for P2P NAT
+  classification.
 - `security.server-identity-seed`: 32-byte Ed25519 seed encoded as hex. Replace
   the development value before non-local use.
 - `security.encryption`: whether TCP control and server-relayed UDP media use

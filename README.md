@@ -81,14 +81,15 @@ token = "alice-dev-token"
 pairing-code = ""
 server-public-key = ""
 tcp-addr = "127.0.0.1:41000"
-udp-addr = "127.0.0.1:41001"
-udp-probe-addr = "127.0.0.1:41002"
 room-id = 1
 ```
 
 `server-public-key` should be set to the public key printed by the server for
 non-development use. If it is empty, the client falls back to the compiled
 development server key.
+
+UDP media shares `tcp-addr` by default. Set `udp-addr` only when the server uses
+a separate UDP media address.
 
 Useful client overrides:
 
@@ -98,10 +99,12 @@ Useful client overrides:
 - `--server-public-key`, `TOMCHAT_SERVER_PUBLIC_KEY`
 - `--tcp`, `TOMCHAT_TCP`
 - `--udp`, `TOMCHAT_UDP`
-- `--udp-probe`, `TOMCHAT_UDP_PROBE`
 - `--receive-dir`, `TOMCHAT_RECEIVE_DIR`
 - `--max-upload-bytes`, `TOMCHAT_MAX_UPLOAD_BYTES`
 - `--max-receive-bytes`, `TOMCHAT_MAX_RECEIVE_BYTES`
+
+Advanced P2P NAT classification can use `--udp-probe` / `TOMCHAT_UDP_PROBE`
+when the server has an explicit `udp-probe-addr`.
 
 ## Server Configuration
 
@@ -113,8 +116,6 @@ Important server fields:
 ```toml
 [network]
 tcp-addr = "127.0.0.1:41000"
-udp-addr = "127.0.0.1:41001"
-udp-probe-addr = "127.0.0.1:41002"
 p2p-enabled = true
 
 [security]
@@ -151,15 +152,22 @@ server memory.
 `p2p-enabled = false` disables P2P candidate exchange and NAT probing while
 leaving server-relayed UDP media enabled.
 
+UDP media shares `tcp-addr` by default because TCP and UDP can listen on the
+same numeric port. Set `udp-addr` only if deployment needs separate control and
+media addresses. `udp-probe-addr` is optional and only enables a second UDP
+endpoint for P2P NAT classification; ordinary voice relay does not need it.
+
 Useful server overrides:
 
 - `--config`, `TOMCHAT_SERVER_CONFIG`
 - `--tcp`, `TOMCHAT_SERVER_TCP`
 - `--udp`, `TOMCHAT_SERVER_UDP`
-- `--udp-probe`, `TOMCHAT_SERVER_UDP_PROBE`
 - `--p2p true|false`, `--p2p-enabled true|false`, `--no-p2p`, `TOMCHAT_SERVER_P2P_ENABLED`, `TOMCHAT_SERVER_P2P`
 - `--encryption true|false`, `--no-encryption`, `TOMCHAT_SERVER_ENCRYPTION`
 - `--chat-history-limit`, `TOMCHAT_SERVER_CHAT_HISTORY_LIMIT`
+
+Advanced P2P NAT classification can use `--udp-probe` /
+`TOMCHAT_SERVER_UDP_PROBE`.
 
 ## Pairing Procedure
 
@@ -208,8 +216,6 @@ token = "<generated-client-token>"
 pairing-code = "<one-time-pairing-code>"
 server-public-key = "<server-public-key-printed-at-startup>"
 tcp-addr = "127.0.0.1:41000"
-udp-addr = "127.0.0.1:41001"
-udp-probe-addr = "127.0.0.1:41002"
 room-id = 1
 ```
 

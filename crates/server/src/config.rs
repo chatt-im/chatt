@@ -6,21 +6,21 @@ use rpc::{
     crypto::{encode_hex, server_key_pair_from_seed_hex},
     ids::{RoomId, UserId},
 };
-use toml_spanner::Toml;
+use toml_spanner::{Item, Toml};
 
 pub const DEFAULT_SERVER_CONFIG: &str = include_str!("../../../tomchat-server.toml");
 const SECRET_HASH_PREFIX: &str = "sha256:";
 const SHA256_HEX_LEN: usize = 64;
 
 #[derive(Clone, Debug, Toml)]
-#[toml(FromToml, ToToml, rename_all = "kebab-case")]
+#[toml(FromToml, rename_all = "kebab-case")]
 pub struct NetworkConfig {
-    #[toml(FromToml with = toml_spanner::helper::parse_string, ToToml with = toml_spanner::helper::display)]
+    #[toml(FromToml with = toml_spanner::helper::parse_string)]
     pub tcp_addr: SocketAddr,
-    #[toml(FromToml with = toml_spanner::helper::parse_string, ToToml with = toml_spanner::helper::display)]
+    #[toml(default = default_shared_addr(), FromToml with = toml_spanner::helper::parse_string)]
     pub udp_addr: SocketAddr,
-    #[toml(default = default_udp_probe_addr(), FromToml with = toml_spanner::helper::parse_string, ToToml with = toml_spanner::helper::display)]
-    pub udp_probe_addr: SocketAddr,
+    #[toml(FromToml with = toml_spanner::helper::parse_string)]
+    pub udp_probe_addr: Option<SocketAddr>,
     #[toml(default = true)]
     pub p2p_enabled: bool,
 }
@@ -29,8 +29,8 @@ impl Default for NetworkConfig {
     fn default() -> Self {
         Self {
             tcp_addr: "127.0.0.1:41000".parse().expect("valid default TCP addr"),
-            udp_addr: "127.0.0.1:41001".parse().expect("valid default UDP addr"),
-            udp_probe_addr: default_udp_probe_addr(),
+            udp_addr: default_shared_addr(),
+            udp_probe_addr: None,
             p2p_enabled: true,
         }
     }
@@ -95,13 +95,7 @@ impl UserConfig {
 }
 
 #[derive(Clone, Debug, Toml)]
-#[toml(
-    FromToml,
-    ToToml,
-    recoverable,
-    warn_unknown_fields,
-    rename_all = "kebab-case"
-)]
+#[toml(FromToml, recoverable, warn_unknown_fields, rename_all = "kebab-case")]
 pub struct Config {
     #[toml(default)]
     pub network: NetworkConfig,
@@ -120,8 +114,11 @@ impl Default for Config {
         let arena = toml_spanner::Arena::new();
         let mut doc = toml_spanner::parse(DEFAULT_SERVER_CONFIG, &arena)
             .expect("embedded tomchat server config must parse");
-        doc.to()
-            .expect("embedded tomchat server config must deserialize")
+        let mut config: Self = doc
+            .to()
+            .expect("embedded tomchat server config must deserialize");
+        config.apply_inferred_addresses(false, false);
+        config
     }
 }
 
@@ -146,12 +143,14 @@ impl Config {
         let arena = toml_spanner::Arena::new();
         let mut doc = toml_spanner::parse(&content, &arena)
             .map_err(|err| format!("failed to parse {source}: {err}"))?;
+        let udp_addr_configured = network_contains_key(&doc, "udp-addr");
         let mut config: Config = doc.to().map_err(|err| {
             let errors: Vec<String> = err.errors.iter().map(ToString::to_string).collect();
             format!("failed to deserialize {source}: {}", errors.join(", "))
         })?;
         config.config_path = config_path;
-        config.apply_env_and_cli_overrides();
+        let udp_addr_overridden = config.apply_env_and_cli_overrides();
+        config.apply_inferred_addresses(udp_addr_configured, udp_addr_overridden);
         config.validate(&source)?;
         Ok(config)
     }
@@ -188,7 +187,7 @@ impl Config {
         Ok(self.users[index].clone())
     }
 
-    fn apply_env_and_cli_overrides(&mut self) {
+    fn apply_env_and_cli_overrides(&mut self) -> bool {
         let args = std::env::args().collect::<Vec<_>>();
         if let Some(addr) = value_arg(&args, "--tcp")
             .or_else(|| std::env::var("TOMCHAT_SERVER_TCP").ok())
@@ -198,10 +197,11 @@ impl Config {
                 self.network.tcp_addr = addr;
             }
         }
-        if let Some(addr) = value_arg(&args, "--udp")
+        let udp_addr_override = value_arg(&args, "--udp")
             .or_else(|| std::env::var("TOMCHAT_SERVER_UDP").ok())
-            .or_else(|| std::env::var("TOMCHAT_UDP").ok())
-        {
+            .or_else(|| std::env::var("TOMCHAT_UDP").ok());
+        let udp_addr_overridden = udp_addr_override.is_some();
+        if let Some(addr) = udp_addr_override {
             if let Ok(addr) = addr.parse() {
                 self.network.udp_addr = addr;
             }
@@ -211,7 +211,7 @@ impl Config {
             .or_else(|| std::env::var("TOMCHAT_UDP_PROBE").ok())
         {
             if let Ok(addr) = addr.parse() {
-                self.network.udp_probe_addr = addr;
+                self.network.udp_probe_addr = Some(addr);
             }
         }
         if let Some(limit) = value_arg(&args, "--chat-history-limit")
@@ -239,6 +239,13 @@ impl Config {
         }
         if args.iter().any(|arg| arg == "--no-p2p") {
             self.network.p2p_enabled = false;
+        }
+        udp_addr_overridden
+    }
+
+    fn apply_inferred_addresses(&mut self, udp_addr_configured: bool, udp_addr_overridden: bool) {
+        if !udp_addr_configured && !udp_addr_overridden {
+            self.network.udp_addr = self.network.tcp_addr;
         }
     }
 
@@ -328,11 +335,12 @@ impl Config {
         out.push_str("# tomchat server configuration\n\n");
         out.push_str("[network]\n");
         out.push_str(&format!("tcp-addr = \"{}\"\n", self.network.tcp_addr));
-        out.push_str(&format!("udp-addr = \"{}\"\n", self.network.udp_addr));
-        out.push_str(&format!(
-            "udp-probe-addr = \"{}\"\n",
-            self.network.udp_probe_addr
-        ));
+        if self.network.udp_addr != self.network.tcp_addr {
+            out.push_str(&format!("udp-addr = \"{}\"\n", self.network.udp_addr));
+        }
+        if let Some(udp_probe_addr) = self.network.udp_probe_addr {
+            out.push_str(&format!("udp-probe-addr = \"{}\"\n", udp_probe_addr));
+        }
         out.push_str(&format!("p2p-enabled = {}\n\n", self.network.p2p_enabled));
         out.push_str("[security]\n");
         out.push_str(&format!(
@@ -426,10 +434,17 @@ fn default_config_path() -> Option<PathBuf> {
     local.exists().then_some(local)
 }
 
-fn default_udp_probe_addr() -> SocketAddr {
-    "127.0.0.1:41002"
+fn default_shared_addr() -> SocketAddr {
+    "127.0.0.1:41000"
         .parse()
-        .expect("valid default UDP probe addr")
+        .expect("valid default network addr")
+}
+
+fn network_contains_key(doc: &toml_spanner::Document<'_>, key: &str) -> bool {
+    doc.table()
+        .get("network")
+        .and_then(Item::as_table)
+        .is_some_and(|network| network.contains_key(key))
 }
 
 fn default_rooms() -> Vec<RoomConfig> {
@@ -498,6 +513,8 @@ mod tests {
         config.config_path = None;
         config.validate("<test>").unwrap();
         assert_eq!(config.network.tcp_addr.to_string(), "127.0.0.1:41000");
+        assert_eq!(config.network.udp_addr, config.network.tcp_addr);
+        assert_eq!(config.network.udp_probe_addr, None);
         assert!(config.network.p2p_enabled);
         assert!(config.security.encryption);
         assert_eq!(config.security.chat_history_limit, 0);
@@ -512,6 +529,37 @@ mod tests {
         let config: Config = doc.to().unwrap();
 
         assert!(!config.network.p2p_enabled);
+    }
+
+    #[test]
+    fn udp_addr_inherits_tcp_addr_when_omitted() {
+        let arena = toml_spanner::Arena::new();
+        let mut doc = toml_spanner::parse(DEFAULT_SERVER_CONFIG, &arena).unwrap();
+        let udp_addr_configured = network_contains_key(&doc, "udp-addr");
+        let mut config: Config = doc.to().unwrap();
+        config.apply_inferred_addresses(udp_addr_configured, false);
+
+        assert_eq!(config.network.udp_addr, config.network.tcp_addr);
+        assert_eq!(config.network.udp_probe_addr, None);
+    }
+
+    #[test]
+    fn parses_explicit_udp_and_probe_addrs() {
+        let arena = toml_spanner::Arena::new();
+        let content = DEFAULT_SERVER_CONFIG.replace(
+            "tcp-addr = \"127.0.0.1:41000\"",
+            "tcp-addr = \"127.0.0.1:42000\"\nudp-addr = \"127.0.0.1:42001\"\nudp-probe-addr = \"127.0.0.1:42002\"",
+        );
+        let mut doc = toml_spanner::parse(&content, &arena).unwrap();
+        let udp_addr_configured = network_contains_key(&doc, "udp-addr");
+        let mut config: Config = doc.to().unwrap();
+        config.apply_inferred_addresses(udp_addr_configured, false);
+
+        assert_eq!(config.network.udp_addr.to_string(), "127.0.0.1:42001");
+        assert_eq!(
+            config.network.udp_probe_addr.map(|addr| addr.to_string()),
+            Some("127.0.0.1:42002".to_string())
+        );
     }
 
     #[test]
@@ -541,6 +589,7 @@ mod tests {
         assert_eq!(user.token_hash, token_hash);
         assert!(user.pairing_code_hash.is_empty());
         assert!(content.contains("p2p-enabled = true"));
+        assert!(!content.contains("udp-probe-addr"));
         assert!(content.contains(&format!("token-hash = \"{token_hash}\"")));
         assert!(content.contains("pairing-code-hash = \"\""));
     }

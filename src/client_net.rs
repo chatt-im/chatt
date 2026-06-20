@@ -52,7 +52,7 @@ const FILE_PROGRESS_STEP_BYTES: u64 = 1024 * 1024;
 pub struct ClientConfig {
     pub tcp_addr: SocketAddr,
     pub udp_addr: SocketAddr,
-    pub udp_probe_addr: SocketAddr,
+    pub udp_probe_addr: Option<SocketAddr>,
     pub user: String,
     pub token: String,
     pub pairing_code: Option<String>,
@@ -1339,7 +1339,9 @@ impl WorkerState {
             kvlog::info!("udp bind sending", session_id = session_id.0);
             self.send_media(&MediaPayload::Bind { session_id });
             self.send_nat_probe(session_id, 0, self.config.udp_addr);
-            self.send_nat_probe(session_id, 1, self.config.udp_probe_addr);
+            if let Some(udp_probe_addr) = self.config.udp_probe_addr {
+                self.send_nat_probe(session_id, 1, udp_probe_addr);
+            }
         }
     }
 
@@ -1361,7 +1363,7 @@ impl WorkerState {
     fn probe_addr_for_id(&self, probe_id: u8) -> Option<SocketAddr> {
         match probe_id {
             0 => Some(self.config.udp_addr),
-            1 => Some(self.config.udp_probe_addr),
+            1 => self.config.udp_probe_addr,
             _ => None,
         }
     }
