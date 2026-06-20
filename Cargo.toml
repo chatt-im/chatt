@@ -9,6 +9,10 @@ libc = "0.2"
 nnnoiseless = {version =  "0.5.2", default-features = false}
 extui.path = "/code/extui"
 opus-codec = { version = "0.1.1", features = ["dred"] }
+ring = "0.17.14"
+jsony = "0.1.10"
+rpc.path = "crates/rpc"
+mio = { version = "1.2.1", features = ["os-poll", "net"] }
 
 [workspace]
-members = ["crates/benchmark"]
+members = ["crates/benchmark", "crates/rpc", "crates/server"]

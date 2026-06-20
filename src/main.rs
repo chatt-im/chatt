@@ -1,56 +1,54 @@
+#[allow(dead_code)]
 mod audio;
+#[allow(dead_code)]
+mod client_net;
 #[cfg_attr(not(test), allow(dead_code))]
 mod network;
+#[allow(dead_code)]
 mod packet_log;
 
 use std::{
-    path::PathBuf,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    collections::VecDeque,
+    net::SocketAddr,
+    sync::mpsc::{self, Receiver},
+    time::Duration,
 };
 
-use audio::{
-    AudioStats, BufferRequest, DeviceInfo, Playback, PlaybackStats, Recording, RecordingConfig,
-    StatsSnapshot,
-};
+use audio::{BufferRequest, LiveCapture, LiveCaptureConfig, LivePlayback};
+use client_net::{ClientConfig, NetworkClient, NetworkCommand, NetworkEvent};
 use extui::{
     AnsiColor, BoxStyle, Buffer, Ellipsis, Rect, Style, Terminal, TerminalFlags,
     event::{self, Event, Events, KeyCode, KeyEvent, KeyModifiers, polling::GlobalWakerConfig},
     vt::Modifier,
 };
+use rpc::{
+    control::ChatMessage,
+    ids::{RoomId, SessionId, UserId},
+};
 
-const BITRATES: [i32; 4] = [16_000, 24_000, 32_000, 48_000];
-const POLL_INTERVAL: Duration = Duration::from_millis(100);
+const POLL_INTERVAL: Duration = Duration::from_millis(50);
+const MAX_MESSAGES: usize = 500;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Focus {
-    Device,
-    Bitrate,
-    Denoise,
-    Buffer,
-    Output,
-    Record,
-    Play,
-    Refresh,
+struct App {
+    user: String,
+    room_name: String,
+    status: String,
+    input: String,
+    messages: VecDeque<ChatLine>,
+    event_rx: Receiver<NetworkEvent>,
+    network: NetworkClient,
+    session_id: Option<SessionId>,
+    user_id: Option<UserId>,
+    capture: Option<LiveCapture>,
+    playback: Option<LivePlayback>,
+    call_enabled: bool,
 }
 
-impl Focus {
-    const ORDER: [Focus; 8] = [
-        Focus::Device,
-        Focus::Bitrate,
-        Focus::Denoise,
-        Focus::Buffer,
-        Focus::Output,
-        Focus::Record,
-        Focus::Play,
-        Focus::Refresh,
-    ];
-
-    fn index(self) -> usize {
-        Self::ORDER
-            .iter()
-            .position(|focus| *focus == self)
-            .unwrap_or(0)
-    }
+#[derive(Clone, Debug)]
+struct ChatLine {
+    sender: String,
+    body: String,
+    local: bool,
 }
 
 enum Action {
@@ -58,99 +56,92 @@ enum Action {
     Quit,
 }
 
-struct App {
-    devices: Vec<DeviceInfo>,
-    selected_device: usize,
-    focus: Focus,
-    bitrate_index: usize,
-    buffer_index: usize,
-    denoise: bool,
-    output_path: String,
-    editing_output: bool,
-    status: String,
-    recording: Option<Recording>,
-    playback: Option<Playback>,
-}
-
 impl App {
-    fn new() -> Self {
-        let mut app = Self {
-            devices: Vec::new(),
-            selected_device: 0,
-            focus: Focus::Device,
-            bitrate_index: 1,
-            buffer_index: 2,
-            denoise: true,
-            output_path: default_output_path(),
-            editing_output: false,
-            status: String::from("ready"),
-            recording: None,
+    fn new(config: ClientConfig) -> Self {
+        let (event_tx, event_rx) = mpsc::channel();
+        let network = NetworkClient::spawn(config.clone(), event_tx);
+        Self {
+            user: config.user,
+            room_name: "lobby".to_string(),
+            status: "connecting".to_string(),
+            input: String::new(),
+            messages: VecDeque::new(),
+            event_rx,
+            network,
+            session_id: None,
+            user_id: None,
+            capture: None,
             playback: None,
-        };
-        app.refresh_devices();
-        app
+            call_enabled: false,
+        }
     }
 
-    fn refresh_devices(&mut self) {
-        if self.recording.is_some() || self.playback.is_some() {
-            self.status = String::from("stop audio before refreshing devices");
-            return;
+    fn drain_network_events(&mut self) {
+        while let Ok(event) = self.event_rx.try_recv() {
+            self.handle_network_event(event);
         }
+    }
 
-        match audio::input_devices(self.buffer_request()) {
-            Ok(devices) => {
-                self.devices = devices;
-                if self.devices.is_empty() {
-                    self.selected_device = 0;
-                    self.status = String::from("no input devices found");
+    fn handle_network_event(&mut self, event: NetworkEvent) {
+        match event {
+            NetworkEvent::Connected => self.status = "connected; authenticating".to_string(),
+            NetworkEvent::Authenticated {
+                session_id,
+                user_id,
+                rooms,
+            } => {
+                self.session_id = Some(session_id);
+                self.user_id = Some(user_id);
+                if let Some(room) = rooms.first() {
+                    self.room_name = room.name.clone();
+                }
+                self.status = format!("authenticated as {}", self.user);
+            }
+            NetworkEvent::RoomJoined { room_id, history } => {
+                self.messages.clear();
+                for message in history {
+                    self.push_chat(message);
+                }
+                self.status = format!("joined room {}", room_id.0);
+            }
+            NetworkEvent::Chat(message) => self.push_chat(message),
+            NetworkEvent::VoiceStarted { user_id, .. } => {
+                if Some(user_id) == self.user_id {
+                    self.status = "call connected".to_string();
+                    self.call_enabled = true;
                 } else {
-                    self.selected_device = self.selected_device.min(self.devices.len() - 1);
-                    self.status = format!("found {} input device(s)", self.devices.len());
+                    self.status = format!("user {} joined the call", user_id.0);
                 }
             }
-            Err(error) => {
-                self.devices.clear();
-                self.selected_device = 0;
-                self.status = error;
+            NetworkEvent::VoiceStopped { user_id, .. } => {
+                if Some(user_id) == self.user_id {
+                    self.status = "call stopped".to_string();
+                    self.call_enabled = false;
+                    self.stop_audio();
+                } else {
+                    self.status = format!("user {} left the call", user_id.0);
+                }
             }
+            NetworkEvent::VoicePacket(packet) => {
+                if let Some(playback) = &self.playback {
+                    playback.push(packet);
+                }
+            }
+            NetworkEvent::Status(status) => self.status = status,
+            NetworkEvent::Error(error) => self.status = format!("error: {error}"),
+            NetworkEvent::Disconnected => self.status = "disconnected".to_string(),
         }
     }
 
-    fn stop_finished_audio(&mut self) {
-        let recording_stopped = self
-            .recording
-            .as_ref()
-            .map(|recording| recording.stats().snapshot().worker_stopped)
-            .unwrap_or(false);
-
-        if recording_stopped {
-            let snapshot = self.stop_recording();
-            if let Some(error) = snapshot.last_error {
-                self.status = format!("recording stopped: {error}");
-            } else {
-                self.status = format!(
-                    "recording stopped: {} packets, {} bytes",
-                    snapshot.encoded_packets, snapshot.encoded_bytes
-                );
-            }
-        }
-
-        let playback_finished = self
-            .playback
-            .as_ref()
-            .map(|playback| playback.stats().snapshot().finished)
-            .unwrap_or(false);
-
-        if playback_finished {
-            let snapshot = self.stop_playback();
-            if let Some(error) = snapshot.last_error {
-                self.status = format!("playback stopped: {error}");
-            } else {
-                self.status = format!(
-                    "playback complete: {}/{} samples",
-                    snapshot.played_samples, snapshot.total_samples
-                );
-            }
+    fn push_chat(&mut self, message: ChatMessage) {
+        let local = Some(message.sender) == self.user_id;
+        self.messages.push_back(ChatLine {
+            sender: message.sender_name,
+            body: message.body,
+            local,
+        });
+        while self.messages.len() > MAX_MESSAGES {
+            self.messages.pop_front();
         }
     }
 
@@ -159,40 +150,17 @@ impl App {
             return Action::Quit;
         }
 
-        if self.editing_output {
-            return self.process_output_edit_key(key);
-        }
-
         match key.code {
-            KeyCode::Char('q') => return Action::Quit,
-            KeyCode::Char(' ') => self.toggle_recording(),
-            KeyCode::Char('p') => self.toggle_playback(),
-            KeyCode::Char('r') => self.refresh_devices(),
-            KeyCode::Up => self.move_focus(-1),
-            KeyCode::Down | KeyCode::Tab => self.move_focus(1),
-            KeyCode::Left => self.adjust_focus(-1),
-            KeyCode::Right => self.adjust_focus(1),
-            KeyCode::Enter => self.activate_focus(),
-            _ => {}
-        }
-
-        Action::Continue
-    }
-
-    fn process_output_edit_key(&mut self, key: KeyEvent) -> Action {
-        match key.code {
-            KeyCode::Enter | KeyCode::Esc => {
-                self.editing_output = false;
-                self.status = String::from("output path updated");
-            }
+            KeyCode::Enter => self.submit_input(),
             KeyCode::Backspace => {
-                self.output_path.pop();
+                self.input.pop();
             }
+            KeyCode::Esc => self.input.clear(),
             KeyCode::Char(ch)
                 if !key.modifiers.contains(KeyModifiers::CONTROL)
                     && !key.modifiers.contains(KeyModifiers::ALT) =>
             {
-                self.output_path.push(ch);
+                self.input.push(ch);
             }
             _ => {}
         }
@@ -200,194 +168,84 @@ impl App {
         Action::Continue
     }
 
-    fn move_focus(&mut self, delta: isize) {
-        let len = Focus::ORDER.len() as isize;
-        let next = (self.focus.index() as isize + delta).rem_euclid(len) as usize;
-        self.focus = Focus::ORDER[next];
-    }
+    fn submit_input(&mut self) {
+        let input = self.input.trim().to_string();
+        self.input.clear();
+        if input.is_empty() {
+            return;
+        }
 
-    fn adjust_focus(&mut self, delta: isize) {
-        match self.focus {
-            Focus::Device => self.adjust_device(delta),
-            Focus::Bitrate => {
-                self.bitrate_index = cycle_index(self.bitrate_index, BITRATES.len(), delta);
+        match input.as_str() {
+            "/quit" => {}
+            "/call" => self.start_call(),
+            "/hangup" => self.stop_call(),
+            "/clear" => self.messages.clear(),
+            command if command.starts_with('/') => {
+                self.status = format!("unknown command: {command}");
             }
-            Focus::Denoise => self.denoise = !self.denoise,
-            Focus::Buffer => {
-                self.buffer_index =
-                    cycle_index(self.buffer_index, BufferRequest::OPTIONS.len(), delta);
-                self.refresh_devices();
-            }
-            Focus::Output | Focus::Record | Focus::Play | Focus::Refresh => {}
-        }
-    }
-
-    fn adjust_device(&mut self, delta: isize) {
-        if self.devices.is_empty() {
-            return;
-        }
-        self.selected_device = cycle_index(self.selected_device, self.devices.len(), delta);
-    }
-
-    fn activate_focus(&mut self) {
-        match self.focus {
-            Focus::Denoise => self.denoise = !self.denoise,
-            Focus::Output => {
-                if self.recording.is_none() && self.playback.is_none() {
-                    self.editing_output = true;
-                    self.status = String::from("editing output path");
-                } else {
-                    self.status = String::from("stop audio before editing output path");
-                }
-            }
-            Focus::Record => self.toggle_recording(),
-            Focus::Play => self.toggle_playback(),
-            Focus::Refresh => self.refresh_devices(),
-            Focus::Device | Focus::Bitrate | Focus::Buffer => self.adjust_focus(1),
-        }
-    }
-
-    fn toggle_recording(&mut self) {
-        if self.playback.is_some() {
-            self.status = String::from("stop playback before recording");
-            return;
-        }
-
-        if self.recording.is_some() {
-            let snapshot = self.stop_recording();
-            self.status = format!(
-                "recorded {} packets ({} bytes)",
-                snapshot.encoded_packets, snapshot.encoded_bytes
-            );
-        } else {
-            self.start_recording();
-        }
-    }
-
-    fn toggle_playback(&mut self) {
-        if self.recording.is_some() {
-            self.status = String::from("stop recording before playback");
-            return;
-        }
-
-        if self.playback.is_some() {
-            let snapshot = self.stop_playback();
-            self.status = format!(
-                "playback stopped: {}/{} samples",
-                snapshot.played_samples, snapshot.total_samples
-            );
-        } else {
-            self.start_playback();
-        }
-    }
-
-    fn start_recording(&mut self) {
-        if self.devices.is_empty() {
-            self.status = String::from("no input device selected");
-            return;
-        }
-
-        let Some(device) = self.devices.get(self.selected_device) else {
-            self.status = String::from("selected input device is unavailable");
-            return;
-        };
-        if !device.supported {
-            self.status = device
-                .issue
-                .clone()
-                .unwrap_or_else(|| String::from("selected device is unsupported"));
-            return;
-        }
-        if self.output_path.trim().is_empty() {
-            self.status = String::from("output path is empty");
-            return;
-        }
-
-        let config = RecordingConfig {
-            device_index: self.selected_device,
-            bitrate_bps: BITRATES[self.bitrate_index],
-            denoise: self.denoise,
-            output_path: PathBuf::from(self.output_path.trim()),
-            buffer_request: self.buffer_request(),
-        };
-
-        match audio::start_recording(config) {
-            Ok(recording) => {
-                self.recording = Some(recording);
-                self.status = String::from("recording");
-            }
-            Err(error) => {
-                self.status = error;
+            body => {
+                self.network
+                    .send(NetworkCommand::SendChat(body.to_string()));
             }
         }
     }
 
-    fn stop_recording(&mut self) -> StatsSnapshot {
-        if let Some(recording) = self.recording.take() {
-            recording.stop()
-        } else {
-            StatsSnapshot::default()
-        }
-    }
-
-    fn start_playback(&mut self) {
-        if self.output_path.trim().is_empty() {
-            self.status = String::from("output path is empty");
+    fn start_call(&mut self) {
+        if self.capture.is_some() || self.playback.is_some() {
+            self.status = "call already active".to_string();
             return;
         }
 
-        match audio::start_playback(
-            PathBuf::from(self.output_path.trim()).as_path(),
-            self.buffer_request(),
-        ) {
-            Ok(playback) => {
+        let tx = self.network.sender();
+        let capture = audio::start_live_capture(
+            LiveCaptureConfig {
+                bitrate_bps: 24_000,
+                denoise: true,
+                buffer_request: BufferRequest::Default,
+            },
+            move |payload| {
+                let _ = tx.send(NetworkCommand::LocalVoicePacket(payload));
+            },
+        );
+        let playback = audio::start_live_playback(BufferRequest::Default);
+
+        match (capture, playback) {
+            (Ok(capture), Ok(playback)) => {
+                self.capture = Some(capture);
                 self.playback = Some(playback);
-                self.status = String::from("playing output");
+                self.network.send(NetworkCommand::StartVoice);
+                self.status = "starting call".to_string();
             }
-            Err(error) => {
-                self.status = error;
+            (Err(error), playback) => {
+                if let Ok(playback) = playback {
+                    playback.stop();
+                }
+                self.status = format!("failed to start capture: {error}");
+            }
+            (Ok(capture), Err(error)) => {
+                capture.stop();
+                self.status = format!("failed to start playback: {error}");
             }
         }
     }
 
-    fn stop_playback(&mut self) -> audio::PlaybackSnapshot {
-        if let Some(playback) = self.playback.take() {
-            playback.stop()
-        } else {
-            audio::PlaybackSnapshot::default()
-        }
+    fn stop_call(&mut self) {
+        self.network.send(NetworkCommand::StopVoice);
+        self.stop_audio();
+        self.call_enabled = false;
+        self.status = "stopping call".to_string();
     }
 
-    fn bitrate_bps(&self) -> i32 {
-        BITRATES[self.bitrate_index]
-    }
-
-    fn buffer_request(&self) -> BufferRequest {
-        BufferRequest::OPTIONS[self.buffer_index]
-    }
-
-    fn active_stats(&self) -> Option<AudioStats> {
-        self.recording.as_ref().map(Recording::stats)
-    }
-
-    fn playback_stats(&self) -> Option<PlaybackStats> {
-        self.playback.as_ref().map(Playback::stats)
+    fn stop_audio(&mut self) {
+        self.capture.take();
+        self.playback.take();
     }
 }
 
-fn cycle_index(current: usize, len: usize, delta: isize) -> usize {
-    if len == 0 {
-        return 0;
+impl Drop for App {
+    fn drop(&mut self) {
+        self.stop_audio();
     }
-    (current as isize + delta).rem_euclid(len as isize) as usize
-}
-
-fn default_output_path() -> String {
-    let seconds = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_secs())
-        .unwrap_or(0);
-    format!("recordings/capture-{seconds}.tcopus")
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -405,10 +263,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut buffer = Buffer::new(w, h);
     let mut events = Events::default();
     let stdin = std::io::stdin();
-    let mut app = App::new();
+    let mut app = App::new(client_config()?);
 
     loop {
-        app.stop_finished_audio();
+        app.drain_network_events();
         render(&app, &mut buffer);
         buffer.render(&mut terminal);
 
@@ -420,8 +278,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             match event {
                 Event::Key(key) => {
                     if matches!(app.process_key(key), Action::Quit) {
-                        app.stop_recording();
-                        app.stop_playback();
                         return Ok(());
                     }
                 }
@@ -435,356 +291,174 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 }
 
-fn render(app: &App, buf: &mut Buffer) {
-    let mut screen = buf.rect().inset(1, 0);
-    draw_header(screen.take_top(3), buf);
-
-    let mut body = BoxStyle::LIGHT.render(screen.take_top(12), buf).inset(1, 0);
-    draw_config_rows(app, &mut body, buf);
-
-    let mut status_box = BoxStyle::LIGHT.render(screen.take_top(9), buf).inset(1, 0);
-    draw_status(app, &mut status_box, buf);
-
-    draw_footer(screen, app, buf);
+fn client_config() -> Result<ClientConfig, Box<dyn std::error::Error>> {
+    let args = std::env::args().collect::<Vec<_>>();
+    let user = value_arg(&args, "--user")
+        .or_else(|| std::env::var("TOMCHAT_USER").ok())
+        .unwrap_or_else(|| "alice".to_string());
+    let token = value_arg(&args, "--token")
+        .or_else(|| std::env::var("TOMCHAT_TOKEN").ok())
+        .unwrap_or_else(|| default_token(&user).to_string());
+    let tcp_addr = value_arg(&args, "--tcp")
+        .or_else(|| std::env::var("TOMCHAT_TCP").ok())
+        .unwrap_or_else(|| "127.0.0.1:41000".to_string())
+        .parse::<SocketAddr>()?;
+    let udp_addr = value_arg(&args, "--udp")
+        .or_else(|| std::env::var("TOMCHAT_UDP").ok())
+        .unwrap_or_else(|| "127.0.0.1:41001".to_string())
+        .parse::<SocketAddr>()?;
+    Ok(ClientConfig {
+        tcp_addr,
+        udp_addr,
+        user,
+        token,
+        room_id: RoomId(1),
+    })
 }
 
-fn draw_header(mut area: Rect, buf: &mut Buffer) {
+fn value_arg(args: &[String], key: &str) -> Option<String> {
+    args.windows(2)
+        .find_map(|window| (window[0] == key).then(|| window[1].clone()))
+}
+
+fn default_token(user: &str) -> &'static str {
+    match user {
+        "bob" => "bob-dev-token",
+        "carol" => "carol-dev-token",
+        _ => "alice-dev-token",
+    }
+}
+
+fn render(app: &App, buf: &mut Buffer) {
+    let mut screen = buf.rect().inset(1, 0);
+    draw_header(screen.take_top(3), app, buf);
+
+    let footer_height = 3i32;
+    let status_height = 3i32;
+    let transcript_height = screen
+        .h
+        .saturating_sub((footer_height + status_height) as u16) as i32;
+    let mut transcript = screen.take_top(transcript_height);
+    draw_messages(&mut transcript, app, buf);
+
+    let mut status = BoxStyle::LIGHT
+        .render(screen.take_top(status_height), buf)
+        .inset(1, 0);
+    draw_status(&mut status, app, buf);
+
+    let mut input = BoxStyle::LIGHT
+        .render(screen.take_top(footer_height), buf)
+        .inset(1, 0);
+    draw_input(&mut input, app, buf);
+}
+
+fn draw_header(mut area: Rect, app: &App, buf: &mut Buffer) {
     area.take_top(1)
         .with(AnsiColor::White.with_fg(AnsiColor::Black) | Modifier::BOLD)
         .fill(buf)
-        .text(buf, " tomchat audio configuration ");
-    area.take_top(1).with(AnsiColor::Grey[20].as_fg()).text(
-        buf,
-        "48 kHz mono capture -> optional nnnoiseless -> Opus packet log",
-    );
+        .text(buf, " tomchat ");
+    area.take_top(1)
+        .with(AnsiColor::Grey[20].as_fg())
+        .text(buf, &format!("{} @ {}", app.user, app.room_name));
 }
 
-fn draw_config_rows(app: &App, area: &mut Rect, buf: &mut Buffer) {
-    let device_value = selected_device_label(app);
-    draw_row(
-        area.take_top(1),
-        buf,
-        "Input device",
-        &device_value,
-        app.focus == Focus::Device,
-    );
-    draw_row(
-        area.take_top(1),
-        buf,
-        "Bitrate",
-        &format!("{} kbps", app.bitrate_bps() / 1000),
-        app.focus == Focus::Bitrate,
-    );
-    draw_row(
-        area.take_top(1),
-        buf,
-        "Denoise",
-        if app.denoise { "on" } else { "off" },
-        app.focus == Focus::Denoise,
-    );
-    draw_row(
-        area.take_top(1),
-        buf,
-        "CPAL buffer",
-        app.buffer_request().label(),
-        app.focus == Focus::Buffer,
-    );
-    let output_label;
-    let output_value = if app.editing_output {
-        output_label = format!("{}_", app.output_path);
-        output_label.as_str()
-    } else {
-        app.output_path.as_str()
-    };
-    draw_row(
-        area.take_top(1),
-        buf,
-        "Output path",
-        output_value,
-        app.focus == Focus::Output,
-    );
-
-    area.take_top(1).display().text(buf, "");
-
-    let record_label = if app.recording.is_some() {
-        "Stop recording"
-    } else {
-        "Start recording"
-    };
-    draw_button_row(
-        area.take_top(1),
-        buf,
-        record_label,
-        app.focus == Focus::Record,
-        app.recording.is_some(),
-    );
-    let play_label = if app.playback.is_some() {
-        "Stop playback"
-    } else {
-        "Play output"
-    };
-    draw_button_row(
-        area.take_top(1),
-        buf,
-        play_label,
-        app.focus == Focus::Play,
-        app.playback.is_some(),
-    );
-    draw_button_row(
-        area.take_top(1),
-        buf,
-        "Refresh devices",
-        app.focus == Focus::Refresh,
-        false,
-    );
+fn draw_messages(area: &mut Rect, app: &App, buf: &mut Buffer) {
+    let height = area.h as usize;
+    let skip = app.messages.len().saturating_sub(height);
+    for line in app.messages.iter().skip(skip) {
+        let style = if line.local {
+            AnsiColor::Green1.with_fg(AnsiColor::Black)
+        } else {
+            Style::DEFAULT
+        };
+        let mut row = area.take_top(1);
+        row.with(style).fill(buf);
+        row.take_left(14)
+            .with(style.patch(AnsiColor::Grey[20].as_fg()))
+            .with(Ellipsis(true))
+            .text(buf, &line.sender);
+        row.with(style).with(Ellipsis(true)).text(buf, &line.body);
+    }
 }
 
-fn draw_status(app: &App, area: &mut Rect, buf: &mut Buffer) {
-    let snapshot = app
-        .active_stats()
-        .map(|stats| stats.snapshot())
-        .unwrap_or_default();
-    let selected = app.devices.get(app.selected_device);
-    let playback = app.playback_stats().map(|stats| stats.snapshot());
-
-    draw_row(area.take_top(1), buf, "Status", &app.status, false);
-    draw_row(
-        area.take_top(1),
-        buf,
-        "Stream",
-        &stream_label(selected),
-        false,
-    );
-    draw_row(
-        area.take_top(1),
-        buf,
-        "RMS",
-        &meter_label(snapshot.rms),
-        false,
-    );
-    draw_row(
-        area.take_top(1),
-        buf,
-        "VAD",
-        &format!("{:>3}%", (snapshot.vad_probability * 100.0).round() as u32),
-        false,
-    );
-    draw_row(
-        area.take_top(1),
-        buf,
-        "Packets",
-        &format!(
-            "{} packets, {} bytes",
-            snapshot.encoded_packets, snapshot.encoded_bytes
-        ),
-        false,
-    );
-    draw_row(
-        area.take_top(1),
-        buf,
-        "Capture",
-        &format!(
-            "{} callbacks, {} samples",
-            snapshot.callbacks, snapshot.captured_samples
-        ),
-        false,
-    );
-    draw_row(
-        area.take_top(1),
-        buf,
-        "Playback",
-        &playback_label(playback.as_ref()),
-        false,
-    );
-    let playback_errors = playback
+fn draw_status(area: &mut Rect, app: &App, buf: &mut Buffer) {
+    let call = if app.call_enabled || app.capture.is_some() {
+        "call on"
+    } else {
+        "call off"
+    };
+    let queued = app
+        .playback
         .as_ref()
-        .map(|snapshot| snapshot.stream_errors)
+        .map(|playback| playback.queued_samples())
         .unwrap_or(0);
+    draw_row(area.take_top(1), buf, "Status", &app.status);
     draw_row(
         area.take_top(1),
         buf,
-        "Drops/errors",
-        &format!(
-            "{}/{} rec, {} play",
-            snapshot.dropped_chunks, snapshot.stream_errors, playback_errors
-        ),
-        false,
+        "Media",
+        &format!("{call}, queued {queued} samples"),
     );
-    if let Some(error) = snapshot.last_error {
-        draw_row(area.take_top(1), buf, "Last error", &error, false);
-    }
 }
 
-fn draw_footer(area: Rect, app: &App, buf: &mut Buffer) {
-    let controls = if app.editing_output {
-        "enter/esc finish edit | backspace delete | ctrl-c quit"
-    } else {
-        "up/down focus | left/right adjust | enter activate | space record | p play | r refresh | q quit"
-    };
-    area.with(AnsiColor::Grey[16].as_fg())
-        .with(Ellipsis(true))
-        .text(buf, controls);
+fn draw_input(area: &mut Rect, app: &App, buf: &mut Buffer) {
+    draw_row(area.take_top(1), buf, "Message", &format!("{}_", app.input));
+    area.take_top(1)
+        .with(AnsiColor::Grey[16].as_fg())
+        .text(buf, "enter send | /call | /hangup | /clear | ctrl-c quit");
 }
 
-fn draw_row(area: Rect, buf: &mut Buffer, label: &str, value: &str, focused: bool) {
-    let row_style = if focused {
-        AnsiColor::Grey[8].with_fg(AnsiColor::White)
-    } else {
-        Style::DEFAULT
-    };
-    area.with(row_style).fill(buf);
-
+fn draw_row(area: Rect, buf: &mut Buffer, label: &str, value: &str) {
     let mut row = area;
-    row.take_left(16)
-        .with(row_style.patch(AnsiColor::Grey[20].as_fg()))
+    row.take_left(12)
+        .with(AnsiColor::Grey[20].as_fg())
         .with(Ellipsis(true))
         .text(buf, label);
-    row.with(row_style).with(Ellipsis(true)).text(buf, value);
-}
-
-fn draw_button_row(area: Rect, buf: &mut Buffer, label: &str, focused: bool, active: bool) {
-    let marker = if active { "[x]" } else { "[ ]" };
-    let style = if focused {
-        AnsiColor::Grey[8].with_fg(AnsiColor::White)
-    } else {
-        Style::DEFAULT
-    };
-    area.with(style).fill(buf);
-    area.with(style)
-        .text(buf, marker)
-        .skip(1)
-        .with(Ellipsis(true))
-        .text(buf, label);
-}
-
-fn selected_device_label(app: &App) -> String {
-    match app.devices.get(app.selected_device) {
-        None => String::from("none"),
-        Some(device) if device.supported => {
-            let preview = device
-                .preview
-                .as_ref()
-                .expect("supported device has preview");
-            format!(
-                "{} ({} ch, {}, {})",
-                device.name, preview.channels, preview.sample_format, preview.buffer_note
-            )
-        }
-        Some(device) => format!(
-            "{} ({})",
-            device.name,
-            device.issue.as_deref().unwrap_or("unsupported")
-        ),
-    }
-}
-
-fn stream_label(device: Option<&DeviceInfo>) -> String {
-    let Some(device) = device else {
-        return String::from("no selected device");
-    };
-    let Some(preview) = &device.preview else {
-        return device
-            .issue
-            .clone()
-            .unwrap_or_else(|| String::from("unsupported"));
-    };
-
-    format!(
-        "{} Hz, {} ch, {}, {}",
-        audio::SAMPLE_RATE,
-        preview.channels,
-        preview.sample_format,
-        buffer_size_label(preview.buffer_size)
-    )
-}
-
-fn playback_label(snapshot: Option<&audio::PlaybackSnapshot>) -> String {
-    let Some(snapshot) = snapshot else {
-        return String::from("idle");
-    };
-    if snapshot.total_samples == 0 {
-        return String::from("loaded 0 samples");
-    }
-
-    let percent = (snapshot.played_samples as f32 / snapshot.total_samples as f32 * 100.0)
-        .clamp(0.0, 100.0)
-        .round() as u32;
-    format!(
-        "{} / {} samples ({}%, {} cb)",
-        snapshot.played_samples, snapshot.total_samples, percent, snapshot.callbacks
-    )
-}
-
-fn buffer_size_label(buffer_size: cpal::BufferSize) -> String {
-    match buffer_size {
-        cpal::BufferSize::Default => String::from("default buffer"),
-        cpal::BufferSize::Fixed(frames) => format!("{frames} frame buffer"),
-    }
-}
-
-fn meter_label(rms: f32) -> String {
-    const WIDTH: usize = 20;
-    let filled = ((rms * 2.0).clamp(0.0, 1.0) * WIDTH as f32).round() as usize;
-    let mut meter = String::with_capacity(WIDTH + 8);
-    meter.push('[');
-    for index in 0..WIDTH {
-        meter.push(if index < filled { '#' } else { '-' });
-    }
-    meter.push(']');
-    format!(
-        "{meter} {:>3}%",
-        (rms.clamp(0.0, 1.0) * 100.0).round() as u32
-    )
+    row.with(Ellipsis(true)).text(buf, value);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::mpsc::Sender;
 
     #[test]
-    fn cycles_indices_in_both_directions() {
-        assert_eq!(cycle_index(0, 3, -1), 2);
-        assert_eq!(cycle_index(2, 3, 1), 0);
-        assert_eq!(cycle_index(1, 3, 1), 2);
+    fn default_tokens_match_users() {
+        assert_eq!(default_token("alice"), "alice-dev-token");
+        assert_eq!(default_token("bob"), "bob-dev-token");
+        assert_eq!(default_token("carol"), "carol-dev-token");
     }
 
     #[test]
-    fn renders_minimum_smoke_frame() {
+    fn renders_smoke_frame() {
+        let (_event_tx, event_rx) = mpsc::channel();
+        let (command_tx, _command_rx) = mpsc::channel();
+        struct DummyClient(Sender<NetworkCommand>);
+        impl DummyClient {
+            fn into_network(self) -> NetworkClient {
+                NetworkClient::from_parts_for_test(self.0)
+            }
+        }
+
         let app = App {
-            devices: Vec::new(),
-            selected_device: 0,
-            focus: Focus::Device,
-            bitrate_index: 1,
-            buffer_index: 2,
-            denoise: true,
-            output_path: String::from("out.tcopus"),
-            editing_output: false,
-            status: String::from("test"),
-            recording: None,
+            user: "alice".to_string(),
+            room_name: "lobby".to_string(),
+            status: "test".to_string(),
+            input: "hello".to_string(),
+            messages: VecDeque::from([ChatLine {
+                sender: "alice".to_string(),
+                body: "hello".to_string(),
+                local: true,
+            }]),
+            event_rx,
+            network: DummyClient(command_tx).into_network(),
+            session_id: Some(SessionId(1)),
+            user_id: Some(UserId(1)),
+            capture: None,
             playback: None,
+            call_enabled: false,
         };
-        let mut buffer = Buffer::new(72, 24);
-
-        render(&app, &mut buffer);
-    }
-
-    #[test]
-    fn renders_cramped_smoke_frame() {
-        let app = App {
-            devices: Vec::new(),
-            selected_device: 0,
-            focus: Focus::Output,
-            bitrate_index: 1,
-            buffer_index: 2,
-            denoise: true,
-            output_path: String::from("out.tcopus"),
-            editing_output: true,
-            status: String::from("test"),
-            recording: None,
-            playback: None,
-        };
-        let mut buffer = Buffer::new(32, 10);
-
+        let mut buffer = Buffer::new(72, 20);
         render(&app, &mut buffer);
     }
 }

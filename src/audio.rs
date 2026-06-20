@@ -1,4 +1,5 @@
 use std::{
+    collections::{HashMap, VecDeque},
     io,
     path::{Path, PathBuf},
     ptr::NonNull,
@@ -24,6 +25,9 @@ pub const SAMPLE_RATE: u32 = 48_000;
 pub const CHANNELS: u8 = 1;
 pub const FRAME_SAMPLES: usize = DenoiseState::FRAME_SIZE;
 const CALLBACK_QUEUE_CAPACITY: usize = 8;
+const LIVE_PLAYBACK_QUEUE_CAPACITY: usize = 256;
+const LIVE_PLAYBACK_MAX_QUEUED_SAMPLES: usize = SAMPLE_RATE as usize * 2;
+const MAX_OPUS_DECODE_SAMPLES: usize = 5_760;
 const MAX_OPUS_PACKET_BYTES: usize = 1_500;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -76,7 +80,27 @@ pub struct RecordingConfig {
     pub buffer_request: BufferRequest,
 }
 
+#[derive(Clone, Debug)]
+pub struct LiveCaptureConfig {
+    pub bitrate_bps: i32,
+    pub denoise: bool,
+    pub buffer_request: BufferRequest,
+}
+
+#[derive(Clone, Debug)]
+pub struct RemoteVoicePacket {
+    pub stream_id: u32,
+    pub sequence: u32,
+    pub payload: Vec<u8>,
+}
+
 pub struct Recording {
+    stream: Option<Stream>,
+    worker: Option<JoinHandle<()>>,
+    stats: AudioStats,
+}
+
+pub struct LiveCapture {
     stream: Option<Stream>,
     worker: Option<JoinHandle<()>>,
     stats: AudioStats,
@@ -85,6 +109,13 @@ pub struct Recording {
 pub struct Playback {
     stream: Option<Stream>,
     stats: PlaybackStats,
+}
+
+pub struct LivePlayback {
+    stream: Option<Stream>,
+    worker: Option<JoinHandle<()>>,
+    sender: Option<SyncSender<RemoteVoicePacket>>,
+    queued_samples: Arc<Mutex<VecDeque<i16>>>,
 }
 
 struct OpusVoiceEncoder {
@@ -233,6 +264,68 @@ impl Playback {
     fn stop_inner(&mut self) -> PlaybackSnapshot {
         self.stream.take();
         self.stats.snapshot()
+    }
+}
+
+impl LiveCapture {
+    pub fn stats(&self) -> AudioStats {
+        self.stats.clone()
+    }
+
+    pub fn stop(mut self) -> StatsSnapshot {
+        self.stop_inner()
+    }
+
+    fn stop_inner(&mut self) -> StatsSnapshot {
+        self.stream.take();
+        if let Some(worker) = self.worker.take() {
+            if worker.join().is_err() {
+                self.stats
+                    .set_error("live audio worker panicked".to_string());
+            }
+        }
+        self.stats.snapshot()
+    }
+}
+
+impl Drop for LiveCapture {
+    fn drop(&mut self) {
+        if self.stream.is_some() || self.worker.is_some() {
+            let _ = self.stop_inner();
+        }
+    }
+}
+
+impl LivePlayback {
+    pub fn push(&self, packet: RemoteVoicePacket) {
+        if let Some(sender) = &self.sender {
+            let _ = sender.try_send(packet);
+        }
+    }
+
+    pub fn queued_samples(&self) -> usize {
+        self.queued_samples
+            .lock()
+            .map(|queue| queue.len())
+            .unwrap_or_default()
+    }
+
+    pub fn stop(mut self) {
+        self.stop_inner();
+    }
+
+    fn stop_inner(&mut self) {
+        self.stream.take();
+        self.sender.take();
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
+}
+
+impl Drop for LivePlayback {
+    fn drop(&mut self) {
+        self.stop_inner();
     }
 }
 
@@ -484,6 +577,47 @@ pub fn start_recording(config: RecordingConfig) -> Result<Recording, String> {
     })
 }
 
+pub fn start_live_capture<F>(config: LiveCaptureConfig, on_packet: F) -> Result<LiveCapture, String>
+where
+    F: FnMut(Vec<u8>) + Send + 'static,
+{
+    let (device, selection) = with_audio_backend_stderr_suppressed(|| {
+        let host = cpal::default_host();
+        let device = host
+            .default_input_device()
+            .ok_or_else(|| "no default input device found".to_string())?;
+        let selection = select_input_config(&device, config.buffer_request)?;
+        Ok::<_, String>((device, selection))
+    })?;
+
+    let encoder = OpusVoiceEncoder::new(config.bitrate_bps)?;
+    let stats = AudioStats::new();
+    let (sender, receiver) = sync_channel(CALLBACK_QUEUE_CAPACITY);
+    let worker_stats = stats.clone();
+    let worker = thread::spawn(move || {
+        run_live_encoder_worker(receiver, encoder, config.denoise, worker_stats, on_packet);
+    });
+
+    let stream = with_audio_backend_stderr_suppressed(|| {
+        build_input_stream(
+            &device,
+            selection.supported_config.sample_format(),
+            selection.stream_config,
+            usize::from(selection.supported_config.channels()),
+            sender,
+            stats.clone(),
+        )
+    })?;
+    with_audio_backend_stderr_suppressed(|| stream.play())
+        .map_err(|error| format!("failed to start live input stream: {error}"))?;
+
+    Ok(LiveCapture {
+        stream: Some(stream),
+        worker: Some(worker),
+        stats,
+    })
+}
+
 pub fn start_playback(path: &Path, buffer_request: BufferRequest) -> Result<Playback, String> {
     let decoded = decode_packet_log(path)?;
     if decoded.samples.is_empty() {
@@ -516,6 +650,43 @@ pub fn start_playback(path: &Path, buffer_request: BufferRequest) -> Result<Play
     Ok(Playback {
         stream: Some(stream),
         stats,
+    })
+}
+
+pub fn start_live_playback(buffer_request: BufferRequest) -> Result<LivePlayback, String> {
+    let (device, selection) = with_audio_backend_stderr_suppressed(|| {
+        let host = cpal::default_host();
+        let device = host
+            .default_output_device()
+            .ok_or_else(|| "no default output device found".to_string())?;
+        let selection = select_output_config(&device, buffer_request)?;
+        Ok::<_, String>((device, selection))
+    })?;
+
+    let queued_samples = Arc::new(Mutex::new(VecDeque::with_capacity(
+        LIVE_PLAYBACK_MAX_QUEUED_SAMPLES.min(8192),
+    )));
+    let stream = with_audio_backend_stderr_suppressed(|| {
+        build_live_output_stream(
+            &device,
+            selection.supported_config.sample_format(),
+            selection.stream_config,
+            usize::from(selection.supported_config.channels()),
+            Arc::clone(&queued_samples),
+        )
+    })?;
+    with_audio_backend_stderr_suppressed(|| stream.play())
+        .map_err(|error| format!("failed to start live output stream: {error}"))?;
+
+    let (sender, receiver) = sync_channel(LIVE_PLAYBACK_QUEUE_CAPACITY);
+    let worker_queue = Arc::clone(&queued_samples);
+    let worker = thread::spawn(move || run_live_decoder_worker(receiver, worker_queue));
+
+    Ok(LivePlayback {
+        stream: Some(stream),
+        worker: Some(worker),
+        sender: Some(sender),
+        queued_samples,
     })
 }
 
@@ -812,6 +983,77 @@ fn build_output_stream(
     }
 }
 
+fn build_live_output_stream(
+    device: &cpal::Device,
+    sample_format: SampleFormat,
+    stream_config: StreamConfig,
+    channels: usize,
+    samples: Arc<Mutex<VecDeque<i16>>>,
+) -> Result<Stream, String> {
+    match sample_format {
+        SampleFormat::I8 => {
+            build_typed_live_output_stream::<i8>(device, stream_config, channels, samples)
+        }
+        SampleFormat::I16 => {
+            build_typed_live_output_stream::<i16>(device, stream_config, channels, samples)
+        }
+        SampleFormat::I24 => {
+            build_typed_live_output_stream::<cpal::I24>(device, stream_config, channels, samples)
+        }
+        SampleFormat::I32 => {
+            build_typed_live_output_stream::<i32>(device, stream_config, channels, samples)
+        }
+        SampleFormat::I64 => {
+            build_typed_live_output_stream::<i64>(device, stream_config, channels, samples)
+        }
+        SampleFormat::U8 => {
+            build_typed_live_output_stream::<u8>(device, stream_config, channels, samples)
+        }
+        SampleFormat::U16 => {
+            build_typed_live_output_stream::<u16>(device, stream_config, channels, samples)
+        }
+        SampleFormat::U24 => {
+            build_typed_live_output_stream::<cpal::U24>(device, stream_config, channels, samples)
+        }
+        SampleFormat::U32 => {
+            build_typed_live_output_stream::<u32>(device, stream_config, channels, samples)
+        }
+        SampleFormat::U64 => {
+            build_typed_live_output_stream::<u64>(device, stream_config, channels, samples)
+        }
+        SampleFormat::F32 => {
+            build_typed_live_output_stream::<f32>(device, stream_config, channels, samples)
+        }
+        SampleFormat::F64 => {
+            build_typed_live_output_stream::<f64>(device, stream_config, channels, samples)
+        }
+        _ => Err(format!("unsupported output sample format: {sample_format}")),
+    }
+}
+
+fn build_typed_live_output_stream<T>(
+    device: &cpal::Device,
+    stream_config: StreamConfig,
+    channels: usize,
+    samples: Arc<Mutex<VecDeque<i16>>>,
+) -> Result<Stream, String>
+where
+    T: Sample + cpal::SizedSample + FromSample<f32> + Send + 'static,
+{
+    device
+        .build_output_stream(
+            stream_config,
+            move |output: &mut [T], _| {
+                live_playback_callback(output, channels, &samples);
+            },
+            move |error| {
+                eprintln!("live playback stream error: {error}");
+            },
+            None,
+        )
+        .map_err(|error| format!("failed to build live output stream: {error}"))
+}
+
 fn build_typed_output_stream<T>(
     device: &cpal::Device,
     stream_config: StreamConfig,
@@ -872,6 +1114,26 @@ fn playback_callback<T>(
         stats.inner.finished.store(true, Ordering::Relaxed);
     }
     stats.inner.played_samples.store(*cursor, Ordering::Relaxed);
+}
+
+fn live_playback_callback<T>(output: &mut [T], channels: usize, samples: &Arc<Mutex<VecDeque<i16>>>)
+where
+    T: Sample + FromSample<f32>,
+{
+    let Ok(mut queue) = samples.lock() else {
+        for sample in output {
+            *sample = T::from_sample(0.0);
+        }
+        return;
+    };
+
+    for frame in output.chunks_mut(channels.max(1)) {
+        let sample = queue.pop_front().unwrap_or(0);
+        let output_sample = T::from_sample((sample as f32 / 32768.0).clamp(-1.0, 1.0));
+        for channel in frame {
+            *channel = output_sample;
+        }
+    }
 }
 
 fn capture_callback<T>(
@@ -957,6 +1219,28 @@ fn run_encoder_worker(
     stats.inner.worker_stopped.store(true, Ordering::Release);
 }
 
+fn run_live_encoder_worker<F>(
+    receiver: Receiver<Vec<f32>>,
+    mut encoder: OpusVoiceEncoder,
+    denoise_enabled: bool,
+    stats: AudioStats,
+    mut on_packet: F,
+) where
+    F: FnMut(Vec<u8>) + Send + 'static,
+{
+    let result = run_live_encoder_worker_inner(
+        receiver,
+        &mut encoder,
+        denoise_enabled,
+        &stats,
+        &mut on_packet,
+    );
+    if let Err(error) = result {
+        stats.set_error(error);
+    }
+    stats.inner.worker_stopped.store(true, Ordering::Release);
+}
+
 fn run_encoder_worker_inner(
     receiver: Receiver<Vec<f32>>,
     writer: &mut PacketLogWriter<std::io::BufWriter<std::fs::File>>,
@@ -999,6 +1283,89 @@ fn run_encoder_worker_inner(
     }
 
     Ok(())
+}
+
+fn run_live_encoder_worker_inner<F>(
+    receiver: Receiver<Vec<f32>>,
+    encoder: &mut OpusVoiceEncoder,
+    denoise_enabled: bool,
+    stats: &AudioStats,
+    on_packet: &mut F,
+) -> Result<(), String>
+where
+    F: FnMut(Vec<u8>),
+{
+    let mut denoise = DenoiseState::new();
+    let mut accumulator = FrameAccumulator::new(FRAME_SAMPLES);
+    let mut denoised_frame = vec![0.0; FRAME_SAMPLES];
+    let mut opus_frame = vec![0i16; FRAME_SAMPLES];
+    let mut encoded = vec![0u8; MAX_OPUS_PACKET_BYTES];
+
+    for chunk in receiver {
+        accumulator.push_chunk(&chunk, |frame| {
+            let vad_probability = if denoise_enabled {
+                let vad = denoise.process_frame(&mut denoised_frame, frame);
+                frame.copy_from_slice(&denoised_frame);
+                vad
+            } else {
+                0.0
+            };
+            stats
+                .inner
+                .vad_bits
+                .store(vad_probability.to_bits(), Ordering::Relaxed);
+
+            convert_i16_scale_to_pcm_i16(frame, &mut opus_frame);
+            let packet_len = encoder.encode(&opus_frame, &mut encoded)?;
+            on_packet(encoded[..packet_len].to_vec());
+            stats.inner.encoded_packets.fetch_add(1, Ordering::Relaxed);
+            stats
+                .inner
+                .encoded_bytes
+                .fetch_add(packet_len as u64, Ordering::Relaxed);
+            Ok(())
+        })?;
+    }
+
+    Ok(())
+}
+
+fn run_live_decoder_worker(
+    receiver: Receiver<RemoteVoicePacket>,
+    queued_samples: Arc<Mutex<VecDeque<i16>>>,
+) {
+    let mut decoders: HashMap<u32, Decoder> = HashMap::new();
+    let mut frame = vec![0i16; MAX_OPUS_DECODE_SAMPLES];
+
+    for packet in receiver {
+        let decoder = match decoders.entry(packet.stream_id) {
+            std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                match Decoder::new(SampleRate::Hz48000, Channels::Mono) {
+                    Ok(decoder) => entry.insert(decoder),
+                    Err(error) => {
+                        eprintln!("failed to create live opus decoder: {error}");
+                        continue;
+                    }
+                }
+            }
+        };
+
+        let decoded = match decoder.decode(&packet.payload, &mut frame, false) {
+            Ok(decoded) => decoded,
+            Err(error) => {
+                eprintln!("failed to decode live opus packet: {error}");
+                continue;
+            }
+        };
+
+        if let Ok(mut queue) = queued_samples.lock() {
+            queue.extend(frame[..decoded].iter().copied());
+            while queue.len() > LIVE_PLAYBACK_MAX_QUEUED_SAMPLES {
+                queue.pop_front();
+            }
+        }
+    }
 }
 
 struct DecodedPacketLog {
