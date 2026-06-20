@@ -10,6 +10,7 @@ pub const KIND_BIND: u8 = 1;
 pub const KIND_VOICE: u8 = 2;
 pub const KIND_PING: u8 = 3;
 pub const KIND_PONG: u8 = 4;
+pub const KIND_PEER_VOICE: u8 = 5;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct UdpHeader {
@@ -25,6 +26,13 @@ pub enum MediaPayload {
         session_id: SessionId,
     },
     Voice {
+        stream_id: StreamId,
+        sequence: u32,
+        flags: u8,
+        opus: Vec<u8>,
+    },
+    PeerVoice {
+        connection_id: u64,
         stream_id: StreamId,
         sequence: u32,
         flags: u8,
@@ -132,7 +140,7 @@ pub fn parse_header(bytes: &[u8]) -> Result<(UdpHeader, &[u8]), MediaError> {
     }
     let kind = bytes[1];
     match kind {
-        KIND_BIND | KIND_VOICE | KIND_PING | KIND_PONG => {}
+        KIND_BIND | KIND_VOICE | KIND_PING | KIND_PONG | KIND_PEER_VOICE => {}
         _ => return Err(MediaError::UnknownKind(kind)),
     }
     Ok((
@@ -151,6 +159,7 @@ impl MediaPayload {
         match self {
             MediaPayload::Bind { .. } => KIND_BIND,
             MediaPayload::Voice { .. } => KIND_VOICE,
+            MediaPayload::PeerVoice { .. } => KIND_PEER_VOICE,
             MediaPayload::Ping { .. } => KIND_PING,
             MediaPayload::Pong { .. } => KIND_PONG,
         }
@@ -173,6 +182,24 @@ pub fn encode_payload(payload: &MediaPayload) -> Result<Vec<u8>, MediaError> {
             if opus.is_empty() || opus.len() > MAX_VOICE_PAYLOAD_BYTES {
                 return Err(MediaError::PayloadTooLarge);
             }
+            out.extend_from_slice(&stream_id.0.to_le_bytes());
+            out.extend_from_slice(&sequence.to_le_bytes());
+            out.push(*flags);
+            let len = u16::try_from(opus.len()).map_err(|_| MediaError::PayloadTooLarge)?;
+            out.extend_from_slice(&len.to_le_bytes());
+            out.extend_from_slice(opus);
+        }
+        MediaPayload::PeerVoice {
+            connection_id,
+            stream_id,
+            sequence,
+            flags,
+            opus,
+        } => {
+            if opus.is_empty() || opus.len() > MAX_VOICE_PAYLOAD_BYTES {
+                return Err(MediaError::PayloadTooLarge);
+            }
+            out.extend_from_slice(&connection_id.to_le_bytes());
             out.extend_from_slice(&stream_id.0.to_le_bytes());
             out.extend_from_slice(&sequence.to_le_bytes());
             out.push(*flags);
@@ -221,6 +248,26 @@ pub fn decode_payload(kind: u8, bytes: &[u8]) -> Result<MediaPayload, MediaError
                 opus: bytes[11..].to_vec(),
             })
         }
+        KIND_PEER_VOICE => {
+            if bytes.len() < 19 {
+                return Err(MediaError::InvalidPayload);
+            }
+            let connection_id = u64::from_le_bytes(bytes[0..8].try_into().unwrap());
+            let stream_id = StreamId(u32::from_le_bytes(bytes[8..12].try_into().unwrap()));
+            let sequence = u32::from_le_bytes(bytes[12..16].try_into().unwrap());
+            let flags = bytes[16];
+            let len = u16::from_le_bytes(bytes[17..19].try_into().unwrap()) as usize;
+            if len == 0 || len > MAX_VOICE_PAYLOAD_BYTES || bytes.len() != 19 + len {
+                return Err(MediaError::InvalidPayload);
+            }
+            Ok(MediaPayload::PeerVoice {
+                connection_id,
+                stream_id,
+                sequence,
+                flags,
+                opus: bytes[19..].to_vec(),
+            })
+        }
         KIND_PING | KIND_PONG => {
             if bytes.len() != 8 {
                 return Err(MediaError::InvalidPayload);
@@ -250,6 +297,19 @@ mod tests {
         };
         let encoded = encode_payload(&payload).unwrap();
         assert_eq!(decode_payload(KIND_VOICE, &encoded).unwrap(), payload);
+    }
+
+    #[test]
+    fn peer_voice_payload_round_trips() {
+        let payload = MediaPayload::PeerVoice {
+            connection_id: 99,
+            stream_id: StreamId(9),
+            sequence: 42,
+            flags: 3,
+            opus: vec![1, 2, 3],
+        };
+        let encoded = encode_payload(&payload).unwrap();
+        assert_eq!(decode_payload(KIND_PEER_VOICE, &encoded).unwrap(), payload);
     }
 
     #[test]

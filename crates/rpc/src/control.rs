@@ -25,12 +25,33 @@ pub struct ServerHello {
 #[derive(Clone, Debug, PartialEq, Eq, Jsony)]
 #[jsony(Binary, version)]
 pub enum ClientControl {
-    Authenticate { user: String, token: String },
-    JoinRoom { room_id: RoomId },
-    SendChat { room_id: RoomId, body: String },
-    StartVoice { room_id: RoomId },
-    StopVoice { stream_id: StreamId },
-    Ping { nonce: u64 },
+    Authenticate {
+        user: String,
+        token: String,
+    },
+    JoinRoom {
+        room_id: RoomId,
+    },
+    SendChat {
+        room_id: RoomId,
+        body: String,
+    },
+    StartVoice {
+        room_id: RoomId,
+    },
+    StopVoice {
+        stream_id: StreamId,
+    },
+    PublishP2p {
+        room_id: RoomId,
+        generation: u64,
+        nat: P2pNatKind,
+        tie_breaker: u64,
+        candidates: Vec<P2pCandidate>,
+    },
+    Ping {
+        nonce: u64,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Jsony)]
@@ -66,6 +87,16 @@ pub enum ServerControl {
         stream_id: StreamId,
     },
     UdpBound,
+    UdpReflexive {
+        addr: String,
+    },
+    P2pPeer {
+        peer: P2pPeerInfo,
+    },
+    P2pPeerGone {
+        session_id: SessionId,
+        user_id: UserId,
+    },
     Pong {
         nonce: u64,
     },
@@ -100,6 +131,63 @@ pub struct ChatMessage {
     pub sender_name: String,
     pub timestamp_ms: u64,
     pub body: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Jsony)]
+#[jsony(Binary, version)]
+pub enum P2pNatKind {
+    Unknown,
+    Cone,
+    Symmetric,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Jsony)]
+#[jsony(Binary, version)]
+pub enum P2pRole {
+    Controlling,
+    Controlled,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Jsony)]
+#[jsony(Binary, version)]
+pub enum P2pCandidateKind {
+    Host,
+    ServerReflexive,
+    PeerReflexive,
+    Relay,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Jsony)]
+#[jsony(Binary, version)]
+pub struct P2pCandidate {
+    pub id: u32,
+    pub kind: P2pCandidateKind,
+    pub addr: String,
+    pub priority: u32,
+    pub foundation: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Jsony)]
+#[jsony(Binary, version)]
+pub struct P2pKey {
+    pub id: u32,
+    pub bytes: Vec<u8>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Jsony)]
+#[jsony(Binary, version)]
+pub struct P2pPeerInfo {
+    pub room_id: RoomId,
+    pub session_id: SessionId,
+    pub user_id: UserId,
+    pub generation: u64,
+    pub role: P2pRole,
+    pub nat: P2pNatKind,
+    pub tie_breaker: u64,
+    pub candidates: Vec<P2pCandidate>,
+    pub send_key: P2pKey,
+    pub recv_key: P2pKey,
+    pub connection_id: u64,
 }
 
 pub fn encode_client_hello(value: &ClientHello) -> Vec<u8> {
@@ -148,13 +236,26 @@ where
 }
 
 fn validate_client_control(value: &ClientControl) -> Result<(), String> {
-    if let ClientControl::SendChat { body, .. } = value {
-        if body.trim().is_empty() {
-            return Err("chat message is empty".to_string());
+    match value {
+        ClientControl::SendChat { body, .. } => {
+            if body.trim().is_empty() {
+                return Err("chat message is empty".to_string());
+            }
+            if body.len() > MAX_CHAT_BODY_BYTES {
+                return Err("chat message exceeds maximum length".to_string());
+            }
         }
-        if body.len() > MAX_CHAT_BODY_BYTES {
-            return Err("chat message exceeds maximum length".to_string());
+        ClientControl::PublishP2p { candidates, .. } => {
+            if candidates.len() > 64 {
+                return Err("too many P2P candidates".to_string());
+            }
+            for candidate in candidates {
+                if candidate.addr.parse::<std::net::SocketAddr>().is_err() {
+                    return Err("P2P candidate address is invalid".to_string());
+                }
+            }
         }
+        _ => {}
     }
     Ok(())
 }
@@ -171,6 +272,25 @@ mod tests {
         };
         let encoded = encode_client_control(&message).unwrap();
         assert_eq!(decode_client_control(&encoded).unwrap(), message);
+    }
+
+    #[test]
+    fn p2p_control_round_trips() {
+        let control = ClientControl::PublishP2p {
+            room_id: RoomId(1),
+            generation: 2,
+            nat: P2pNatKind::Cone,
+            tie_breaker: 99,
+            candidates: vec![P2pCandidate {
+                id: 1,
+                kind: P2pCandidateKind::Host,
+                addr: "192.168.1.2:5000".to_string(),
+                priority: 1,
+                foundation: "host-udp4".to_string(),
+            }],
+        };
+        let encoded = encode_client_control(&control).unwrap();
+        assert_eq!(decode_client_control(&encoded).unwrap(), control);
     }
 
     #[test]

@@ -37,6 +37,7 @@ impl IceRole {
 
 #[derive(Clone, Debug)]
 pub struct AgentConfig {
+    pub username: Option<String>,
     pub min_check_interval: Duration,
     pub handshake_min_duration: Duration,
     pub check_deadline: Duration,
@@ -53,6 +54,7 @@ pub struct AgentConfig {
 impl Default for AgentConfig {
     fn default() -> Self {
         Self {
+            username: None,
             min_check_interval: DEFAULT_MIN_CHECK_INTERVAL,
             handshake_min_duration: DEFAULT_HANDSHAKE_MIN_DURATION,
             check_deadline: DEFAULT_CHECK_DEADLINE,
@@ -304,6 +306,9 @@ impl TraversalAgent {
         bytes: &[u8],
     ) -> Result<Vec<Action>, StunError> {
         let message = StunMessage::decode(bytes)?;
+        if !self.accepts_username(message.username.as_deref()) {
+            return Ok(Vec::new());
+        }
         self.last_rx_at = Some(now);
         self.restart_announced = false;
         self.disconnected_announced = false;
@@ -389,9 +394,14 @@ impl TraversalAgent {
         {
             let transaction_id = self.next_transaction_id();
             self.next_keepalive_at = Some(now + self.config.keepalive_interval);
-            let bytes =
-                StunMessage::binding_request(transaction_id, None, 0, self.role_attribute(), false)
-                    .encode();
+            let bytes = StunMessage::binding_request(
+                transaction_id,
+                self.config.username.clone(),
+                0,
+                self.role_attribute(),
+                false,
+            )
+            .encode();
             actions.push(Action::SendKeepalive {
                 to: selected.remote_addr,
                 bytes,
@@ -445,7 +455,7 @@ impl TraversalAgent {
         let remote = &self.remote_candidates[remote_index];
         let bytes = StunMessage::binding_request(
             transaction_id,
-            None,
+            self.config.username.clone(),
             local.priority,
             self.role_attribute(),
             self.role.is_controlling(),
@@ -609,6 +619,14 @@ impl TraversalAgent {
         }
     }
 
+    fn accepts_username(&self, username: Option<&str>) -> bool {
+        match (&self.config.username, username) {
+            (Some(expected), Some(actual)) => expected == actual,
+            (Some(_), None) => false,
+            _ => true,
+        }
+    }
+
     fn select_peer_reflexive(&mut self, src: SocketAddr) -> SelectedPair {
         if let Some(selected) = self.selected.filter(|selected| selected.remote_addr == src) {
             return selected;
@@ -666,6 +684,7 @@ mod tests {
 
     fn fast_config() -> AgentConfig {
         AgentConfig {
+            username: None,
             min_check_interval: Duration::from_millis(25),
             handshake_min_duration: Duration::from_millis(1),
             check_deadline: Duration::from_millis(1),

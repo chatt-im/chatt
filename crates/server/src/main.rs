@@ -9,14 +9,16 @@ use mio::{
     Events, Interest, Poll, Token,
     net::{TcpListener, TcpStream, UdpSocket},
 };
+use ring::rand::SecureRandom;
 use rpc::{
     control::{
-        self, ChatMessage, ClientControl, RoomInfo, ServerControl, decode_client_control,
-        decode_client_hello, encode_server_control, encode_server_hello,
+        self, ChatMessage, ClientControl, P2pCandidate, P2pKey, P2pNatKind, P2pPeerInfo, P2pRole,
+        RoomInfo, ServerControl, decode_client_control, decode_client_hello, encode_server_control,
+        encode_server_hello,
     },
     crypto::{
-        AntiReplay, CHANNEL_CONTROL, SessionSecrets, TransportCipher, dev_server_key_pair,
-        respond_to_client_hello,
+        AntiReplay, CHANNEL_CONTROL, KEY_LEN, KeyMaterial, SessionSecrets, TransportCipher,
+        dev_server_key_pair, respond_to_client_hello,
     },
     frame,
     ids::{MessageId, RoomId, SessionId, StreamId, UserId},
@@ -72,11 +74,13 @@ struct Server {
     clients: HashMap<Token, ClientConn>,
     sessions: HashMap<SessionId, Session>,
     media_key_to_session: HashMap<u32, SessionId>,
+    peer_links: HashMap<(SessionId, SessionId), PeerLink>,
     rooms: HashMap<RoomId, RoomState>,
     next_token: usize,
     next_session: u64,
     next_message: u64,
     next_stream: u32,
+    next_connection_id: u64,
     rng: ring::rand::SystemRandom,
     server_key_pair: ring::signature::Ed25519KeyPair,
 }
@@ -110,11 +114,13 @@ impl Server {
             clients: HashMap::new(),
             sessions: HashMap::new(),
             media_key_to_session: HashMap::new(),
+            peer_links: HashMap::new(),
             rooms,
             next_token: FIRST_CLIENT,
             next_session: 1,
             next_message: 1,
             next_stream: 1,
+            next_connection_id: 1,
             rng: ring::rand::SystemRandom::new(),
             server_key_pair: dev_server_key_pair(),
         })
@@ -357,6 +363,26 @@ impl Server {
                 self.stop_voice(session_id, Some(stream_id));
                 Ok(())
             }
+            (
+                ConnState::Ready,
+                ClientControl::PublishP2p {
+                    room_id,
+                    generation,
+                    nat,
+                    tie_breaker,
+                    candidates,
+                },
+            ) => {
+                let session_id = self.session_for_token(token)?;
+                self.publish_p2p(
+                    session_id,
+                    room_id,
+                    generation,
+                    nat,
+                    tie_breaker,
+                    candidates,
+                )
+            }
             (ConnState::Ready, ClientControl::Ping { nonce }) => {
                 self.send_control_to_token(token, &ServerControl::Pong { nonce })
             }
@@ -400,6 +426,7 @@ impl Server {
                 media_send_counter: 0,
                 media_recv_replay: AntiReplay::new(),
                 active_stream: None,
+                p2p: None,
             },
         );
 
@@ -536,9 +563,14 @@ impl Server {
             room_id = room_id.0
         );
         self.stop_voice(session_id, None);
+        self.broadcast_p2p_gone(session_id, room_id);
         if let Some(room) = self.rooms.get_mut(&room_id) {
             room.members.remove(&session_id);
         }
+        if let Some(session) = self.sessions.get_mut(&session_id) {
+            session.p2p = None;
+        }
+        self.remove_peer_links(session_id);
         let participant = self.participant_for_session(session_id);
         if let Some(participant) = participant {
             self.broadcast_control(
@@ -547,6 +579,37 @@ impl Server {
                     room_id,
                     participant,
                     online: false,
+                },
+            );
+        }
+    }
+
+    fn broadcast_p2p_gone(&mut self, session_id: SessionId, room_id: RoomId) {
+        let Some(user_id) = self
+            .sessions
+            .get(&session_id)
+            .map(|session| session.user_id)
+        else {
+            return;
+        };
+        let tokens = self
+            .rooms
+            .get(&room_id)
+            .map(|room| {
+                room.members
+                    .iter()
+                    .copied()
+                    .filter(|member| *member != session_id)
+                    .filter_map(|member| self.sessions.get(&member).map(|s| s.tcp_token))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        for token in tokens {
+            let _ = self.send_control_to_token(
+                token,
+                &ServerControl::P2pPeerGone {
+                    session_id,
+                    user_id,
                 },
             );
         }
@@ -704,6 +767,142 @@ impl Server {
         );
     }
 
+    fn publish_p2p(
+        &mut self,
+        session_id: SessionId,
+        room_id: RoomId,
+        generation: u64,
+        nat: P2pNatKind,
+        tie_breaker: u64,
+        candidates: Vec<P2pCandidate>,
+    ) -> Result<(), String> {
+        let in_room = self
+            .sessions
+            .get(&session_id)
+            .is_some_and(|session| session.room_id == Some(room_id));
+        if !in_room {
+            return Err("join the room before publishing P2P candidates".into());
+        }
+        kvlog::info!(
+            "p2p candidates published",
+            session_id = session_id.0,
+            room_id = room_id.0,
+            generation,
+            candidate_count = candidates.len()
+        );
+        if let Some(session) = self.sessions.get_mut(&session_id) {
+            session.p2p = Some(P2pSessionState {
+                generation,
+                nat,
+                tie_breaker,
+                candidates,
+            });
+        }
+
+        let peers = self
+            .rooms
+            .get(&room_id)
+            .map(|room| {
+                room.members
+                    .iter()
+                    .copied()
+                    .filter(|peer| *peer != session_id)
+                    .filter(|peer| {
+                        self.sessions
+                            .get(peer)
+                            .and_then(|s| s.p2p.as_ref())
+                            .is_some()
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+
+        for peer_session_id in peers {
+            self.send_p2p_pair(session_id, peer_session_id)?;
+        }
+        Ok(())
+    }
+
+    fn send_p2p_pair(&mut self, a: SessionId, b: SessionId) -> Result<(), String> {
+        let pair = ordered_pair(a, b);
+        if !self.peer_links.contains_key(&pair) {
+            let link = self.new_peer_link()?;
+            self.peer_links.insert(pair, link);
+        }
+        let link = self
+            .peer_links
+            .get(&pair)
+            .expect("peer link inserted")
+            .clone();
+        let a_info = self.p2p_peer_info(a, b, &link)?;
+        let b_info = self.p2p_peer_info(b, a, &link)?;
+        let a_token = self
+            .sessions
+            .get(&a)
+            .map(|session| session.tcp_token)
+            .ok_or_else(|| "unknown P2P session".to_string())?;
+        let b_token = self
+            .sessions
+            .get(&b)
+            .map(|session| session.tcp_token)
+            .ok_or_else(|| "unknown P2P peer".to_string())?;
+        self.send_control_to_token(a_token, &ServerControl::P2pPeer { peer: a_info })?;
+        self.send_control_to_token(b_token, &ServerControl::P2pPeer { peer: b_info })?;
+        Ok(())
+    }
+
+    fn p2p_peer_info(
+        &self,
+        recipient: SessionId,
+        peer: SessionId,
+        link: &PeerLink,
+    ) -> Result<P2pPeerInfo, String> {
+        let recipient_session = self
+            .sessions
+            .get(&recipient)
+            .ok_or_else(|| "unknown recipient session".to_string())?;
+        let peer_session = self
+            .sessions
+            .get(&peer)
+            .ok_or_else(|| "unknown peer session".to_string())?;
+        let peer_p2p = peer_session
+            .p2p
+            .as_ref()
+            .ok_or_else(|| "peer has not published P2P candidates".to_string())?;
+        let (send_key, recv_key) = if recipient < peer {
+            (&link.low_to_high, &link.high_to_low)
+        } else {
+            (&link.high_to_low, &link.low_to_high)
+        };
+        Ok(P2pPeerInfo {
+            room_id: recipient_session.room_id.unwrap_or(DEFAULT_ROOM),
+            session_id: peer,
+            user_id: peer_session.user_id,
+            generation: peer_p2p.generation,
+            role: if recipient < peer {
+                P2pRole::Controlling
+            } else {
+                P2pRole::Controlled
+            },
+            nat: peer_p2p.nat,
+            tie_breaker: peer_p2p.tie_breaker,
+            candidates: peer_p2p.candidates.clone(),
+            send_key: p2p_key(send_key),
+            recv_key: p2p_key(recv_key),
+            connection_id: link.connection_id,
+        })
+    }
+
+    fn new_peer_link(&mut self) -> Result<PeerLink, String> {
+        let connection_id = self.next_connection_id;
+        self.next_connection_id = self.next_connection_id.wrapping_add(1).max(1);
+        Ok(PeerLink {
+            connection_id,
+            low_to_high: random_key(&self.rng)?,
+            high_to_low: random_key(&self.rng)?,
+        })
+    }
+
     fn receive_udp(&mut self) {
         let mut buf = [0u8; 2048];
         loop {
@@ -762,6 +961,12 @@ impl Server {
                 let token = self.sessions.get(&session_id).map(|s| s.tcp_token);
                 if let Some(token) = token {
                     let _ = self.send_control_to_token(token, &ServerControl::UdpBound);
+                    let _ = self.send_control_to_token(
+                        token,
+                        &ServerControl::UdpReflexive {
+                            addr: src.to_string(),
+                        },
+                    );
                 }
                 Ok(())
             }
@@ -771,6 +976,7 @@ impl Server {
                 flags,
                 opus,
             } => self.relay_voice(session_id, stream_id, sequence, flags, opus),
+            MediaPayload::PeerVoice { .. } => Ok(()),
             MediaPayload::Ping { nonce } => {
                 self.send_udp_payload(session_id, &MediaPayload::Pong { nonce });
                 Ok(())
@@ -977,6 +1183,7 @@ impl Server {
                 self.media_key_to_session
                     .remove(&session.secrets.media_recv.id);
             }
+            self.remove_peer_links(session_id);
         }
     }
 
@@ -1007,6 +1214,11 @@ impl Server {
                 name: session.user_name.clone(),
                 in_call: session.active_stream.is_some(),
             })
+    }
+
+    fn remove_peer_links(&mut self, session_id: SessionId) {
+        self.peer_links
+            .retain(|(a, b), _| *a != session_id && *b != session_id);
     }
 }
 
@@ -1039,6 +1251,22 @@ struct Session {
     media_send_counter: u64,
     media_recv_replay: AntiReplay,
     active_stream: Option<StreamId>,
+    p2p: Option<P2pSessionState>,
+}
+
+#[derive(Clone)]
+struct P2pSessionState {
+    generation: u64,
+    nat: P2pNatKind,
+    tie_breaker: u64,
+    candidates: Vec<P2pCandidate>,
+}
+
+#[derive(Clone)]
+struct PeerLink {
+    connection_id: u64,
+    low_to_high: KeyMaterial,
+    high_to_low: KeyMaterial,
 }
 
 struct RoomState {
@@ -1056,6 +1284,30 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
+fn ordered_pair(a: SessionId, b: SessionId) -> (SessionId, SessionId) {
+    if a <= b { (a, b) } else { (b, a) }
+}
+
+fn random_key(rng: &dyn SecureRandom) -> Result<KeyMaterial, String> {
+    let mut bytes = [0u8; KEY_LEN];
+    rng.fill(&mut bytes)
+        .map_err(|_| "failed to generate P2P key".to_string())?;
+    let mut id_bytes = [0u8; 4];
+    rng.fill(&mut id_bytes)
+        .map_err(|_| "failed to generate P2P key id".to_string())?;
+    Ok(KeyMaterial {
+        id: u32::from_le_bytes(id_bytes).max(1),
+        bytes,
+    })
+}
+
+fn p2p_key(key: &KeyMaterial) -> P2pKey {
+    P2pKey {
+        id: key.id,
+        bytes: key.bytes.to_vec(),
+    }
+}
+
 fn conn_state_name(state: ConnState) -> &'static str {
     match state {
         ConnState::AwaitClientHello => "await_client_hello",
@@ -1071,6 +1323,7 @@ fn client_control_kind(control: &ClientControl) -> &'static str {
         ClientControl::SendChat { .. } => "send_chat",
         ClientControl::StartVoice { .. } => "start_voice",
         ClientControl::StopVoice { .. } => "stop_voice",
+        ClientControl::PublishP2p { .. } => "publish_p2p",
         ClientControl::Ping { .. } => "ping",
     }
 }
@@ -1084,6 +1337,9 @@ fn server_control_kind(control: &ServerControl) -> &'static str {
         ServerControl::VoiceStarted { .. } => "voice_started",
         ServerControl::VoiceStopped { .. } => "voice_stopped",
         ServerControl::UdpBound => "udp_bound",
+        ServerControl::UdpReflexive { .. } => "udp_reflexive",
+        ServerControl::P2pPeer { .. } => "p2p_peer",
+        ServerControl::P2pPeerGone { .. } => "p2p_peer_gone",
         ServerControl::Pong { .. } => "pong",
         ServerControl::Error { .. } => "error",
     }

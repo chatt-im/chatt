@@ -1,27 +1,37 @@
 use std::{
+    collections::HashMap,
     io::{self, Read, Write},
-    net::{SocketAddr, TcpStream as StdTcpStream, UdpSocket as StdUdpSocket},
+    net::{SocketAddr, TcpStream as StdTcpStream},
     sync::mpsc::{self, Receiver, Sender},
     thread::{self, JoinHandle},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use mio::{
     Events, Interest, Poll, Token,
     net::{TcpStream, UdpSocket},
 };
+use ring::rand::SecureRandom;
 use rpc::{
     control::{
-        ChatMessage, ClientControl, ParticipantInfo, RoomInfo, ServerControl,
-        decode_server_control, decode_server_hello, encode_client_control, encode_client_hello,
+        ChatMessage, ClientControl, P2pCandidate, P2pCandidateKind, P2pKey, P2pNatKind,
+        P2pPeerInfo, P2pRole, ParticipantInfo, RoomInfo, ServerControl, decode_server_control,
+        decode_server_hello, encode_client_control, encode_client_hello,
     },
     crypto::{
-        AntiReplay, CHANNEL_CONTROL, SessionSecrets, TransportCipher, complete_client_handshake,
-        dev_server_public_key, generate_client_hello,
+        AntiReplay, CHANNEL_CONTROL, KEY_LEN, KeyMaterial, SessionSecrets, TransportCipher,
+        complete_client_handshake, dev_server_public_key, generate_client_hello,
     },
     frame,
     ids::{RoomId, SessionId, StreamId, UserId},
     media::{self, MediaPayload},
+};
+use tomchat_p2p::{
+    Action as P2pAction, AgentConfig as P2pAgentConfig, Candidate, CandidateKind, IceRole, NatKind,
+    TraversalAgent,
+    interfaces::host_candidates,
+    socket::{UdpSocketOptions, bind_udp_socket, is_ignorable_udp_error},
+    stun::{StunMessage, is_stun_message},
 };
 
 use crate::audio::RemoteVoicePacket;
@@ -164,11 +174,14 @@ fn run_worker_inner(
     commands: Receiver<NetworkCommand>,
 ) -> Result<(), String> {
     let (std_tcp, control, secrets) = connect_and_handshake(&config)?;
-    let std_udp = StdUdpSocket::bind(if config.udp_addr.is_ipv4() {
-        "0.0.0.0:0"
-    } else {
-        "[::]:0"
-    })
+    let std_udp = bind_udp_socket(
+        if config.udp_addr.is_ipv4() {
+            "0.0.0.0:0".parse().unwrap()
+        } else {
+            "[::]:0".parse().unwrap()
+        },
+        UdpSocketOptions::default(),
+    )
     .map_err(|error| format!("failed to bind UDP socket: {error}"))?;
     let udp_local_addr = std_udp
         .local_addr()
@@ -186,6 +199,7 @@ fn run_worker_inner(
         events: events.clone(),
         tcp: TcpStream::from_std(std_tcp),
         udp: UdpSocket::from_std(std_udp),
+        udp_local_addr,
         read_buf: Vec::new(),
         write_buf: Vec::new(),
         control,
@@ -197,6 +211,12 @@ fn run_worker_inner(
         local_sequence: 0,
         media_send_counter: 0,
         media_recv_replay: AntiReplay::new(),
+        p2p_generation: 1,
+        p2p_tie_breaker: random_u64().unwrap_or(1),
+        p2p_nat: configured_nat_kind(),
+        p2p_reflexive_addr: None,
+        p2p_candidates: Vec::new(),
+        p2p_peers: HashMap::new(),
         shutdown: false,
     };
 
@@ -244,6 +264,7 @@ fn run_worker_inner(
         while let Ok(command) = commands.try_recv() {
             worker.handle_command(command)?;
         }
+        worker.poll_p2p(Instant::now());
     }
     kvlog::info!("network worker shutdown requested");
     Ok(())
@@ -311,6 +332,7 @@ struct WorkerState {
     events: Sender<NetworkEvent>,
     tcp: TcpStream,
     udp: UdpSocket,
+    udp_local_addr: SocketAddr,
     read_buf: Vec<u8>,
     write_buf: Vec<u8>,
     control: TransportCipher,
@@ -322,7 +344,23 @@ struct WorkerState {
     local_sequence: u32,
     media_send_counter: u64,
     media_recv_replay: AntiReplay,
+    p2p_generation: u64,
+    p2p_tie_breaker: u64,
+    p2p_nat: P2pNatKind,
+    p2p_reflexive_addr: Option<SocketAddr>,
+    p2p_candidates: Vec<P2pCandidate>,
+    p2p_peers: HashMap<SessionId, PeerConnection>,
     shutdown: bool,
+}
+
+struct PeerConnection {
+    user_id: UserId,
+    agent: TraversalAgent,
+    send_key: KeyMaterial,
+    recv_key: KeyMaterial,
+    send_counter: u64,
+    recv_replay: AntiReplay,
+    connection_id: u64,
 }
 
 impl WorkerState {
@@ -425,6 +463,15 @@ impl WorkerState {
                     break;
                 }
             };
+            let packet = &buf[..len];
+            let now = Instant::now();
+            if is_stun_message(packet) {
+                self.handle_p2p_stun(now, src, packet);
+                continue;
+            }
+            if self.handle_p2p_media(now, src, packet) {
+                continue;
+            }
             if src != self.config.udp_addr {
                 kvlog::warn!(
                     "udp packet ignored",
@@ -437,7 +484,7 @@ impl WorkerState {
             match media::open_media(
                 &self.secrets.media_recv,
                 &mut self.media_recv_replay,
-                &buf[..len],
+                packet,
             ) {
                 Ok((
                     _,
@@ -468,6 +515,7 @@ impl WorkerState {
                     self.send_media(&MediaPayload::Pong { nonce });
                 }
                 Ok((_, MediaPayload::Bind { .. })) => {}
+                Ok((_, MediaPayload::PeerVoice { .. })) => {}
                 Err(error) => {
                     kvlog::warn!("udp packet rejected", packet_size = len, error = %error);
                     let _ = self
@@ -508,14 +556,16 @@ impl WorkerState {
             }
             NetworkCommand::LocalVoicePacket(payload) => {
                 if let Some(stream_id) = self.active_stream {
-                    let payload = MediaPayload::Voice {
+                    let sequence = self.local_sequence;
+                    let relay_payload = MediaPayload::Voice {
                         stream_id,
-                        sequence: self.local_sequence,
+                        sequence,
                         flags: 0,
-                        opus: payload,
+                        opus: payload.clone(),
                     };
                     self.local_sequence = self.local_sequence.wrapping_add(1);
-                    self.send_media(&payload);
+                    self.send_media(&relay_payload);
+                    self.send_p2p_voice(stream_id, sequence, 0, &payload);
                 }
             }
             NetworkCommand::Shutdown => {
@@ -646,6 +696,33 @@ impl WorkerState {
                     .events
                     .send(NetworkEvent::Status("udp media bound".to_string()));
             }
+            ServerControl::UdpReflexive { addr } => match addr.parse::<SocketAddr>() {
+                Ok(addr) => {
+                    kvlog::info!("client udp reflexive address received", addr = %addr);
+                    self.p2p_reflexive_addr = Some(addr);
+                    self.publish_p2p_candidates();
+                }
+                Err(error) => {
+                    kvlog::warn!("invalid udp reflexive address", addr = addr.as_str(), error = %error);
+                }
+            },
+            ServerControl::P2pPeer { peer } => {
+                if let Err(error) = self.install_p2p_peer(peer) {
+                    kvlog::warn!("p2p peer rejected", error = %error);
+                    let _ = self.events.send(NetworkEvent::Error(error));
+                }
+            }
+            ServerControl::P2pPeerGone {
+                session_id,
+                user_id,
+            } => {
+                self.p2p_peers.remove(&session_id);
+                kvlog::info!(
+                    "p2p peer removed",
+                    session_id = session_id.0,
+                    user_id = user_id.0
+                );
+            }
             ServerControl::Pong { .. } => {}
             ServerControl::Error { message, .. } => {
                 kvlog::warn!("server control error", error = message.as_str());
@@ -689,6 +766,332 @@ impl WorkerState {
             }
         }
     }
+
+    fn publish_p2p_candidates(&mut self) {
+        let Some(room_id) = self.room_id else {
+            return;
+        };
+        if self.session_id.is_none() {
+            return;
+        }
+        let candidates = self.gather_p2p_candidates();
+        self.p2p_candidates = candidates.clone();
+        kvlog::info!(
+            "publishing p2p candidates",
+            generation = self.p2p_generation,
+            candidate_count = candidates.len()
+        );
+        let _ = self.queue_control(ClientControl::PublishP2p {
+            room_id,
+            generation: self.p2p_generation,
+            nat: self.p2p_nat,
+            tie_breaker: self.p2p_tie_breaker,
+            candidates,
+        });
+    }
+
+    fn gather_p2p_candidates(&self) -> Vec<P2pCandidate> {
+        let mut next_id = 1;
+        let mut candidates = host_candidates(self.udp_local_addr.port(), true, &mut next_id)
+            .unwrap_or_else(|error| {
+                kvlog::warn!("host candidate discovery failed", error = %error);
+                Vec::new()
+            });
+        if candidates.is_empty() {
+            let fallback_ip = if self.config.udp_addr.is_ipv4() {
+                "127.0.0.1".parse().unwrap()
+            } else {
+                "::1".parse().unwrap()
+            };
+            candidates.push(Candidate::new(
+                next_id,
+                CandidateKind::Host,
+                SocketAddr::new(fallback_ip, self.udp_local_addr.port()),
+            ));
+            next_id = next_id.wrapping_add(1).max(1);
+        }
+        if let Some(reflexive) = self.p2p_reflexive_addr {
+            candidates.push(Candidate::with_base(
+                next_id,
+                CandidateKind::ServerReflexive,
+                reflexive,
+                Some(self.udp_local_addr),
+            ));
+            next_id = next_id.wrapping_add(1).max(1);
+        }
+        candidates.push(Candidate::new(
+            next_id,
+            CandidateKind::Relay,
+            self.config.udp_addr,
+        ));
+        candidates.iter().map(control_candidate).collect()
+    }
+
+    fn install_p2p_peer(&mut self, peer: P2pPeerInfo) -> Result<(), String> {
+        let send_key = key_from_control(&peer.send_key)?;
+        let recv_key = key_from_control(&peer.recv_key)?;
+        let local_candidates = self
+            .p2p_candidates
+            .iter()
+            .filter_map(candidate_from_control)
+            .collect::<Vec<_>>();
+        let remote_candidates = peer
+            .candidates
+            .iter()
+            .filter_map(candidate_from_control)
+            .collect::<Vec<_>>();
+        if local_candidates.is_empty() || remote_candidates.is_empty() {
+            return Err("missing P2P candidates".to_string());
+        }
+        let config = P2pAgentConfig {
+            username: Some(p2p_username(peer.connection_id)),
+            ..P2pAgentConfig::default()
+        };
+        let agent = TraversalAgent::new(
+            Instant::now(),
+            config,
+            ice_role_from_control(peer.role),
+            self.p2p_tie_breaker,
+            nat_from_control(self.p2p_nat),
+            nat_from_control(peer.nat),
+            local_candidates,
+            remote_candidates,
+        );
+        kvlog::info!(
+            "p2p peer installed",
+            session_id = peer.session_id.0,
+            user_id = peer.user_id.0,
+            generation = peer.generation,
+            connection_id = peer.connection_id,
+            direct_pair_count = agent.direct_pair_count()
+        );
+        self.p2p_peers.insert(
+            peer.session_id,
+            PeerConnection {
+                user_id: peer.user_id,
+                agent,
+                send_key,
+                recv_key,
+                send_counter: 0,
+                recv_replay: AntiReplay::new(),
+                connection_id: peer.connection_id,
+            },
+        );
+        Ok(())
+    }
+
+    fn poll_p2p(&mut self, now: Instant) {
+        let actions = self
+            .p2p_peers
+            .iter_mut()
+            .map(|(session_id, peer)| (*session_id, peer.agent.poll(now)))
+            .filter(|(_, actions)| !actions.is_empty())
+            .collect::<Vec<_>>();
+        for (session_id, actions) in actions {
+            self.apply_p2p_actions(session_id, actions);
+        }
+    }
+
+    fn handle_p2p_stun(&mut self, now: Instant, src: SocketAddr, packet: &[u8]) {
+        let username = StunMessage::decode(packet)
+            .ok()
+            .and_then(|message| message.username);
+        let targets = if let Some(connection_id) = username
+            .as_deref()
+            .and_then(connection_id_from_p2p_username)
+        {
+            self.p2p_peers
+                .iter()
+                .filter_map(|(session_id, peer)| {
+                    (peer.connection_id == connection_id).then_some(*session_id)
+                })
+                .collect::<Vec<_>>()
+        } else {
+            self.p2p_peers.keys().copied().collect::<Vec<_>>()
+        };
+
+        let mut pending = Vec::new();
+        for session_id in targets {
+            let Some(peer) = self.p2p_peers.get_mut(&session_id) else {
+                continue;
+            };
+            match peer.agent.handle_inbound(now, src, packet) {
+                Ok(actions) if !actions.is_empty() => pending.push((session_id, actions)),
+                Ok(_) => {}
+                Err(error) => {
+                    kvlog::warn!(
+                        "p2p stun packet rejected",
+                        session_id = session_id.0,
+                        addr = %src,
+                        error = %error
+                    );
+                }
+            }
+        }
+        for (session_id, actions) in pending {
+            self.apply_p2p_actions(session_id, actions);
+        }
+    }
+
+    fn handle_p2p_media(&mut self, now: Instant, src: SocketAddr, packet: &[u8]) -> bool {
+        let Ok((header, _)) = media::parse_header(packet) else {
+            return false;
+        };
+        let Some(session_id) = self.p2p_peers.iter().find_map(|(session_id, peer)| {
+            (peer.recv_key.id == header.key_id).then_some(*session_id)
+        }) else {
+            return false;
+        };
+
+        let outcome = {
+            let peer = self
+                .p2p_peers
+                .get_mut(&session_id)
+                .expect("p2p peer exists");
+            match media::open_media(&peer.recv_key, &mut peer.recv_replay, packet) {
+                Ok((
+                    _,
+                    MediaPayload::PeerVoice {
+                        connection_id,
+                        stream_id,
+                        sequence,
+                        flags,
+                        opus,
+                    },
+                )) if connection_id == peer.connection_id => {
+                    let action = peer.agent.observe_authenticated_packet(now, src);
+                    Ok((stream_id, sequence, flags, opus, action))
+                }
+                Ok(_) => Err("unexpected P2P media payload".to_string()),
+                Err(error) => Err(error.to_string()),
+            }
+        };
+
+        match outcome {
+            Ok((stream_id, sequence, flags, opus, action)) => {
+                if let Some(action) = action {
+                    self.apply_p2p_actions(session_id, vec![action]);
+                }
+                let _ = self
+                    .events
+                    .send(NetworkEvent::VoicePacket(RemoteVoicePacket {
+                        stream_id: stream_id.0,
+                        sequence,
+                        flags,
+                        payload: opus,
+                    }));
+            }
+            Err(error) => {
+                kvlog::warn!(
+                    "p2p media packet rejected",
+                    session_id = session_id.0,
+                    addr = %src,
+                    error = error.as_str()
+                );
+            }
+        }
+        true
+    }
+
+    fn send_p2p_voice(&mut self, stream_id: StreamId, sequence: u32, flags: u8, opus: &[u8]) {
+        let mut packets = Vec::new();
+        for (session_id, peer) in &mut self.p2p_peers {
+            let Some(selected) = peer.agent.selected() else {
+                continue;
+            };
+            let payload = MediaPayload::PeerVoice {
+                connection_id: peer.connection_id,
+                stream_id,
+                sequence,
+                flags,
+                opus: opus.to_vec(),
+            };
+            let counter = peer.send_counter;
+            peer.send_counter = peer.send_counter.wrapping_add(1);
+            match media::seal_media(&peer.send_key, counter, &payload) {
+                Ok(packet) => packets.push((*session_id, selected.remote_addr, packet)),
+                Err(error) => {
+                    kvlog::warn!(
+                        "p2p media seal failed",
+                        session_id = session_id.0,
+                        error = %error
+                    );
+                }
+            }
+        }
+        for (session_id, addr, packet) in packets {
+            self.send_udp_raw("p2p_voice", Some(session_id), addr, &packet);
+        }
+    }
+
+    fn apply_p2p_actions(&mut self, session_id: SessionId, actions: Vec<P2pAction>) {
+        for action in actions {
+            match action {
+                P2pAction::UseRelay { reason, .. } => {
+                    kvlog::info!(
+                        "p2p using relay",
+                        session_id = session_id.0,
+                        reason = ?reason
+                    );
+                }
+                P2pAction::SendStun { to, bytes, .. }
+                | P2pAction::SendStunResponse { to, bytes, .. }
+                | P2pAction::SendKeepalive { to, bytes, .. } => {
+                    self.send_udp_raw("p2p_stun", Some(session_id), to, &bytes);
+                }
+                P2pAction::DirectReady { selected } | P2pAction::Migrated { selected } => {
+                    let user_id = self.p2p_peers.get(&session_id).map(|peer| peer.user_id);
+                    kvlog::info!(
+                        "p2p direct path selected",
+                        session_id = session_id.0,
+                        user_id = user_id.map(|id| id.0),
+                        addr = %selected.remote_addr,
+                        peer_reflexive = selected.peer_reflexive
+                    );
+                }
+                P2pAction::IceRestart { .. } => {
+                    self.p2p_generation = self.p2p_generation.wrapping_add(1).max(1);
+                    self.publish_p2p_candidates();
+                }
+                P2pAction::Disconnected => {
+                    kvlog::warn!("p2p direct path timed out", session_id = session_id.0);
+                }
+            }
+        }
+    }
+
+    fn send_udp_raw(
+        &mut self,
+        kind: &'static str,
+        session_id: Option<SessionId>,
+        addr: SocketAddr,
+        packet: &[u8],
+    ) {
+        match self.udp.send_to(packet, addr) {
+            Ok(_) => {}
+            Err(error) if is_ignorable_udp_error(&error) => {
+                kvlog::warn!(
+                    "udp send got ignorable socket error",
+                    kind,
+                    session_id = session_id.map(|id| id.0),
+                    addr = %addr,
+                    error = %error
+                );
+            }
+            Err(error) => {
+                kvlog::warn!(
+                    "udp send failed",
+                    kind,
+                    session_id = session_id.map(|id| id.0),
+                    addr = %addr,
+                    error = %error
+                );
+                let _ = self
+                    .events
+                    .send(NetworkEvent::Error(format!("UDP send failed: {error}")));
+            }
+        }
+    }
 }
 
 fn network_command_kind(command: &NetworkCommand) -> &'static str {
@@ -708,6 +1111,7 @@ fn client_control_kind(control: &ClientControl) -> &'static str {
         ClientControl::SendChat { .. } => "send_chat",
         ClientControl::StartVoice { .. } => "start_voice",
         ClientControl::StopVoice { .. } => "stop_voice",
+        ClientControl::PublishP2p { .. } => "publish_p2p",
         ClientControl::Ping { .. } => "ping",
     }
 }
@@ -721,6 +1125,9 @@ fn server_control_kind(control: &ServerControl) -> &'static str {
         ServerControl::VoiceStarted { .. } => "voice_started",
         ServerControl::VoiceStopped { .. } => "voice_stopped",
         ServerControl::UdpBound => "udp_bound",
+        ServerControl::UdpReflexive { .. } => "udp_reflexive",
+        ServerControl::P2pPeer { .. } => "p2p_peer",
+        ServerControl::P2pPeerGone { .. } => "p2p_peer_gone",
         ServerControl::Pong { .. } => "pong",
         ServerControl::Error { .. } => "error",
     }
@@ -730,7 +1137,100 @@ fn media_payload_kind(payload: &MediaPayload) -> &'static str {
     match payload {
         MediaPayload::Bind { .. } => "bind",
         MediaPayload::Voice { .. } => "voice",
+        MediaPayload::PeerVoice { .. } => "peer_voice",
         MediaPayload::Ping { .. } => "ping",
         MediaPayload::Pong { .. } => "pong",
     }
+}
+
+fn random_u64() -> Result<u64, String> {
+    let rng = ring::rand::SystemRandom::new();
+    let mut bytes = [0u8; 8];
+    rng.fill(&mut bytes)
+        .map_err(|_| "failed to generate random tie breaker".to_string())?;
+    Ok(u64::from_le_bytes(bytes).max(1))
+}
+
+fn configured_nat_kind() -> P2pNatKind {
+    match std::env::var("TOMCHAT_P2P_NAT")
+        .unwrap_or_default()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "cone" => P2pNatKind::Cone,
+        "symmetric" => P2pNatKind::Symmetric,
+        _ => P2pNatKind::Unknown,
+    }
+}
+
+fn control_candidate(candidate: &Candidate) -> P2pCandidate {
+    P2pCandidate {
+        id: candidate.id,
+        kind: control_candidate_kind(candidate.kind),
+        addr: candidate.addr.to_string(),
+        priority: candidate.priority,
+        foundation: candidate.foundation.clone(),
+    }
+}
+
+fn candidate_from_control(candidate: &P2pCandidate) -> Option<Candidate> {
+    let addr = candidate.addr.parse().ok()?;
+    let mut out = Candidate::new(
+        candidate.id,
+        candidate_kind_from_control(candidate.kind),
+        addr,
+    );
+    out.priority = candidate.priority;
+    out.foundation = candidate.foundation.clone();
+    Some(out)
+}
+
+fn control_candidate_kind(kind: CandidateKind) -> P2pCandidateKind {
+    match kind {
+        CandidateKind::Host => P2pCandidateKind::Host,
+        CandidateKind::ServerReflexive => P2pCandidateKind::ServerReflexive,
+        CandidateKind::PeerReflexive => P2pCandidateKind::PeerReflexive,
+        CandidateKind::Relay => P2pCandidateKind::Relay,
+    }
+}
+
+fn candidate_kind_from_control(kind: P2pCandidateKind) -> CandidateKind {
+    match kind {
+        P2pCandidateKind::Host => CandidateKind::Host,
+        P2pCandidateKind::ServerReflexive => CandidateKind::ServerReflexive,
+        P2pCandidateKind::PeerReflexive => CandidateKind::PeerReflexive,
+        P2pCandidateKind::Relay => CandidateKind::Relay,
+    }
+}
+
+fn nat_from_control(kind: P2pNatKind) -> NatKind {
+    match kind {
+        P2pNatKind::Unknown => NatKind::Unknown,
+        P2pNatKind::Cone => NatKind::Cone,
+        P2pNatKind::Symmetric => NatKind::Symmetric,
+    }
+}
+
+fn ice_role_from_control(role: P2pRole) -> IceRole {
+    match role {
+        P2pRole::Controlling => IceRole::Controlling,
+        P2pRole::Controlled => IceRole::Controlled,
+    }
+}
+
+fn key_from_control(key: &P2pKey) -> Result<KeyMaterial, String> {
+    let bytes: [u8; KEY_LEN] = key
+        .bytes
+        .as_slice()
+        .try_into()
+        .map_err(|_| "invalid P2P key length".to_string())?;
+    Ok(KeyMaterial { id: key.id, bytes })
+}
+
+fn p2p_username(connection_id: u64) -> String {
+    format!("tomchat-p2p:{connection_id}")
+}
+
+fn connection_id_from_p2p_username(username: &str) -> Option<u64> {
+    username.strip_prefix("tomchat-p2p:")?.parse().ok()
 }
