@@ -7,5 +7,5 @@ edition = "2024"
 cpal = "0.18.1"
 libc = "0.2"
 nnnoiseless = {version =  "0.5.2", default-features = false}
-opus = "0.3.1"
 extui.path = "/code/extui"
+opus-codec = { version = "0.1.1", features = ["dred"] }

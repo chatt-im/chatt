@@ -1,4 +1,6 @@
 mod audio;
+#[cfg_attr(not(test), allow(dead_code))]
+mod network;
 mod packet_log;
 
 use std::{

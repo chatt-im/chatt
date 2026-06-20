@@ -1,6 +1,7 @@
 use std::{
     io,
     path::{Path, PathBuf},
+    ptr::NonNull,
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering},
@@ -14,8 +15,9 @@ use cpal::{
     SupportedStreamConfig, traits::DeviceTrait, traits::HostTrait, traits::StreamTrait,
 };
 use nnnoiseless::DenoiseState;
-use opus::{Application, Bitrate, Channels, Decoder, Encoder, Signal};
+use opus_codec::{Channels, Complexity, Decoder, SampleRate};
 
+use crate::network::{EncoderNetworkProfile, EncoderNetworkTuning};
 use crate::packet_log::{FLAG_DENOISE, PacketLogHeader, PacketLogReader, PacketLogWriter};
 
 pub const SAMPLE_RATE: u32 = 48_000;
@@ -83,6 +85,140 @@ pub struct Recording {
 pub struct Playback {
     stream: Option<Stream>,
     stats: PlaybackStats,
+}
+
+struct OpusVoiceEncoder {
+    encoder: NonNull<opus_codec::OpusEncoder>,
+    bitrate_bps: i32,
+    dred_duration_10ms: i32,
+}
+
+unsafe impl Send for OpusVoiceEncoder {}
+
+impl OpusVoiceEncoder {
+    fn new(bitrate_bps: i32) -> Result<Self, String> {
+        let mut error = 0;
+        let encoder = unsafe {
+            opus_codec::opus_encoder_create(
+                SAMPLE_RATE as i32,
+                CHANNELS as i32,
+                opus_codec::OPUS_APPLICATION_VOIP as i32,
+                &mut error,
+            )
+        };
+        if error != opus_codec::OPUS_OK as i32 {
+            return Err(format_opus_error("failed to create opus encoder", error));
+        }
+
+        let encoder =
+            NonNull::new(encoder).ok_or_else(|| String::from("failed to allocate opus encoder"))?;
+        let mut this = Self {
+            encoder,
+            bitrate_bps,
+            dred_duration_10ms: 0,
+        };
+        this.set_bitrate(bitrate_bps)?;
+        this.set_vbr(true)?;
+        this.set_signal_voice()?;
+        this.set_complexity(Complexity::new(5))?;
+        this.set_dred_duration_10ms(0)?;
+        Ok(this)
+    }
+
+    fn encode(&mut self, input: &[i16], output: &mut [u8]) -> Result<usize, String> {
+        if input.is_empty() || output.is_empty() {
+            return Err(String::from("opus encode received an empty buffer"));
+        }
+
+        let frame_size = i32::try_from(input.len() / usize::from(CHANNELS))
+            .map_err(|_| String::from("opus frame is too large"))?;
+        let output_len = i32::try_from(output.len())
+            .map_err(|_| String::from("opus output buffer is too large"))?;
+        let encoded = unsafe {
+            opus_codec::opus_encode(
+                self.encoder.as_ptr(),
+                input.as_ptr(),
+                frame_size,
+                output.as_mut_ptr(),
+                output_len,
+            )
+        };
+        if encoded < 0 {
+            return Err(format_opus_error("failed to encode opus packet", encoded));
+        }
+
+        usize::try_from(encoded).map_err(|_| String::from("opus encoded length is invalid"))
+    }
+
+    fn set_bitrate(&mut self, bitrate_bps: i32) -> Result<(), String> {
+        self.control(
+            opus_codec::OPUS_SET_BITRATE_REQUEST,
+            bitrate_bps,
+            "failed to set opus bitrate",
+        )?;
+        self.bitrate_bps = bitrate_bps;
+        Ok(())
+    }
+
+    fn set_vbr(&mut self, enabled: bool) -> Result<(), String> {
+        self.control(
+            opus_codec::OPUS_SET_VBR_REQUEST,
+            i32::from(enabled),
+            "failed to enable opus VBR",
+        )
+    }
+
+    fn set_signal_voice(&mut self) -> Result<(), String> {
+        self.control(
+            opus_codec::OPUS_SET_SIGNAL_REQUEST,
+            opus_codec::OPUS_SIGNAL_VOICE as i32,
+            "failed to set opus signal hint",
+        )
+    }
+
+    fn set_complexity(&mut self, complexity: Complexity) -> Result<(), String> {
+        self.control(
+            opus_codec::OPUS_SET_COMPLEXITY_REQUEST,
+            complexity.value() as i32,
+            "failed to set opus complexity",
+        )
+    }
+
+    fn set_dred_duration_10ms(&mut self, duration_10ms: i32) -> Result<(), String> {
+        self.control(
+            opus_codec::OPUS_SET_DRED_DURATION_REQUEST,
+            duration_10ms,
+            "failed to set opus DRED duration",
+        )?;
+        self.dred_duration_10ms = duration_10ms;
+        Ok(())
+    }
+
+    fn control(&mut self, request: u32, value: i32, context: &str) -> Result<(), String> {
+        let result =
+            unsafe { opus_codec::opus_encoder_ctl(self.encoder.as_ptr(), request as i32, value) };
+        if result != opus_codec::OPUS_OK as i32 {
+            return Err(format_opus_error(context, result));
+        }
+        Ok(())
+    }
+}
+
+impl EncoderNetworkTuning for OpusVoiceEncoder {
+    type Error = String;
+
+    fn apply_network_profile(&mut self, profile: EncoderNetworkProfile) -> Result<(), Self::Error> {
+        self.set_bitrate(profile.bitrate_bps)?;
+        self.set_dred_duration_10ms(profile.dred_duration_10ms)
+    }
+}
+
+impl Drop for OpusVoiceEncoder {
+    fn drop(&mut self) {
+        unsafe {
+            opus_codec::opus_encoder_destroy(self.encoder.as_ptr());
+        }
+    }
 }
 
 impl Playback {
@@ -319,20 +455,7 @@ pub fn start_recording(config: RecordingConfig) -> Result<Recording, String> {
         format_file_error("failed to create packet log", &config.output_path, error)
     })?;
 
-    let mut encoder = Encoder::new(SAMPLE_RATE, Channels::Mono, Application::Voip)
-        .map_err(|error| format!("failed to create opus encoder: {error}"))?;
-    encoder
-        .set_bitrate(Bitrate::Bits(config.bitrate_bps))
-        .map_err(|error| format!("failed to set opus bitrate: {error}"))?;
-    encoder
-        .set_vbr(true)
-        .map_err(|error| format!("failed to enable opus VBR: {error}"))?;
-    encoder
-        .set_signal(Signal::Voice)
-        .map_err(|error| format!("failed to set opus signal hint: {error}"))?;
-    encoder
-        .set_complexity(5)
-        .map_err(|error| format!("failed to set opus complexity: {error}"))?;
+    let encoder = OpusVoiceEncoder::new(config.bitrate_bps)?;
 
     let stats = AudioStats::new();
     let (sender, receiver) = sync_channel(CALLBACK_QUEUE_CAPACITY);
@@ -398,6 +521,10 @@ pub fn start_playback(path: &Path, buffer_request: BufferRequest) -> Result<Play
 
 fn format_file_error(context: &str, path: &Path, error: io::Error) -> String {
     format!("{context} {}: {error}", path.display())
+}
+
+fn format_opus_error(context: &str, code: i32) -> String {
+    format!("{context}: {} ({code})", opus_codec::strerror(code))
 }
 
 struct ConfigSelection {
@@ -815,7 +942,7 @@ pub(crate) fn convert_i16_scale_to_pcm_i16(input: &[f32], output: &mut [i16]) {
 fn run_encoder_worker(
     receiver: Receiver<Vec<f32>>,
     mut writer: PacketLogWriter<std::io::BufWriter<std::fs::File>>,
-    mut encoder: Encoder,
+    mut encoder: OpusVoiceEncoder,
     denoise_enabled: bool,
     stats: AudioStats,
 ) {
@@ -833,7 +960,7 @@ fn run_encoder_worker(
 fn run_encoder_worker_inner(
     receiver: Receiver<Vec<f32>>,
     writer: &mut PacketLogWriter<std::io::BufWriter<std::fs::File>>,
-    encoder: &mut Encoder,
+    encoder: &mut OpusVoiceEncoder,
     denoise_enabled: bool,
     stats: &AudioStats,
 ) -> Result<(), String> {
@@ -858,9 +985,7 @@ fn run_encoder_worker_inner(
                 .store(vad_probability.to_bits(), Ordering::Relaxed);
 
             convert_i16_scale_to_pcm_i16(frame, &mut opus_frame);
-            let packet_len = encoder
-                .encode(&opus_frame, &mut encoded)
-                .map_err(|error| format!("failed to encode opus packet: {error}"))?;
+            let packet_len = encoder.encode(&opus_frame, &mut encoded)?;
             writer
                 .write_packet(&encoded[..packet_len])
                 .map_err(|error| format!("failed to write packet log: {error}"))?;
@@ -897,7 +1022,15 @@ fn decode_packet_log(path: &Path) -> Result<DecodedPacketLog, String> {
         ));
     }
 
-    let mut decoder = Decoder::new(header.sample_rate, Channels::Mono)
+    let sample_rate = match header.sample_rate {
+        48_000 => SampleRate::Hz48000,
+        24_000 => SampleRate::Hz24000,
+        16_000 => SampleRate::Hz16000,
+        12_000 => SampleRate::Hz12000,
+        8_000 => SampleRate::Hz8000,
+        other => return Err(format!("unsupported packet-log sample rate: {other} Hz")),
+    };
+    let mut decoder = Decoder::new(sample_rate, Channels::Mono)
         .map_err(|error| format!("failed to create opus decoder: {error}"))?;
     let mut frame = vec![0i16; usize::from(header.frame_samples).max(FRAME_SAMPLES)];
     let mut samples = Vec::new();
@@ -998,6 +1131,24 @@ mod tests {
         );
 
         assert_eq!(output, [i16::MIN, i16::MIN, 16_384, 16_385, i16::MAX]);
+    }
+
+    #[test]
+    fn opus_voice_encoder_applies_network_profile_and_encodes() {
+        let mut encoder = OpusVoiceEncoder::new(32_000).unwrap();
+        encoder
+            .apply_network_profile(EncoderNetworkProfile::DEGRADED)
+            .unwrap();
+
+        assert_eq!(encoder.bitrate_bps, 24_000);
+        assert_eq!(encoder.dred_duration_10ms, 20);
+
+        let input = vec![0i16; FRAME_SAMPLES];
+        let mut output = vec![0u8; MAX_OPUS_PACKET_BYTES];
+        let encoded = encoder.encode(&input, &mut output).unwrap();
+
+        assert!(encoded > 0);
+        assert!(encoded <= output.len());
     }
 
     #[test]
