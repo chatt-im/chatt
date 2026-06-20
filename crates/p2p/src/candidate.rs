@@ -22,6 +22,7 @@ pub enum CandidateKind {
     Host,
     ServerReflexive,
     PeerReflexive,
+    PortMapped,
     Relay,
 }
 
@@ -30,6 +31,7 @@ impl CandidateKind {
         match self {
             Self::Host => 126,
             Self::PeerReflexive => 110,
+            Self::PortMapped => 105,
             Self::ServerReflexive => 100,
             Self::Relay => 0,
         }
@@ -59,11 +61,14 @@ impl NetworkFamily {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Candidate {
     pub id: u32,
+    pub socket_id: u32,
+    pub generation: u64,
     pub kind: CandidateKind,
     pub addr: SocketAddr,
     pub base: Option<SocketAddr>,
     pub priority: u32,
     pub foundation: String,
+    pub verified: bool,
 }
 
 impl Candidate {
@@ -77,6 +82,18 @@ impl Candidate {
         addr: SocketAddr,
         base: Option<SocketAddr>,
     ) -> Self {
+        Self::with_metadata(id, 0, 0, kind, addr, base, matches!(kind, CandidateKind::Host))
+    }
+
+    pub fn with_metadata(
+        id: u32,
+        socket_id: u32,
+        generation: u64,
+        kind: CandidateKind,
+        addr: SocketAddr,
+        base: Option<SocketAddr>,
+        verified: bool,
+    ) -> Self {
         let local_preference = match NetworkFamily::of(addr) {
             NetworkFamily::Ipv4 => 65_535,
             NetworkFamily::Ipv6 => 65_534,
@@ -86,11 +103,14 @@ impl Candidate {
         let foundation = format!("{}-{}", kind_name(kind), NetworkFamily::of(addr).name());
         Self {
             id,
+            socket_id,
+            generation,
             kind,
             addr,
             base,
             priority,
             foundation,
+            verified,
         }
     }
 
@@ -142,7 +162,7 @@ pub fn port_guess_candidates(
 ) -> Vec<Candidate> {
     if !matches!(
         remote.kind,
-        CandidateKind::ServerReflexive | CandidateKind::PeerReflexive
+        CandidateKind::ServerReflexive | CandidateKind::PeerReflexive | CandidateKind::PortMapped
     ) {
         return Vec::new();
     }
@@ -193,6 +213,7 @@ fn kind_name(kind: CandidateKind) -> &'static str {
         CandidateKind::Host => "host",
         CandidateKind::ServerReflexive => "srflx",
         CandidateKind::PeerReflexive => "prflx",
+        CandidateKind::PortMapped => "map",
         CandidateKind::Relay => "relay",
     }
 }

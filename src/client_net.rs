@@ -28,8 +28,8 @@ use rpc::{
 };
 use tomchat_p2p::{
     Action as P2pAction, AgentConfig as P2pAgentConfig, Candidate, CandidateKind, IceRole, NatKind,
-    TraversalAgent,
-    interfaces::host_candidates,
+    NatClassifier, ReflexiveObservation, TraversalAgent,
+    interfaces::host_candidates_with_metadata,
     socket::{UdpSocketOptions, bind_udp_socket, is_ignorable_udp_error},
     stun::{StunMessage, is_stun_message},
 };
@@ -44,6 +44,7 @@ const POLL_TIMEOUT: Duration = Duration::from_millis(20);
 pub struct ClientConfig {
     pub tcp_addr: SocketAddr,
     pub udp_addr: SocketAddr,
+    pub udp_probe_addr: SocketAddr,
     pub user: String,
     pub token: String,
     pub room_id: RoomId,
@@ -214,6 +215,7 @@ fn run_worker_inner(
         p2p_generation: 1,
         p2p_tie_breaker: random_u64().unwrap_or(1),
         p2p_nat: configured_nat_kind(),
+        p2p_nat_classifier: NatClassifier::new(),
         p2p_reflexive_addr: None,
         p2p_candidates: Vec::new(),
         p2p_peers: HashMap::new(),
@@ -347,6 +349,7 @@ struct WorkerState {
     p2p_generation: u64,
     p2p_tie_breaker: u64,
     p2p_nat: P2pNatKind,
+    p2p_nat_classifier: NatClassifier,
     p2p_reflexive_addr: Option<SocketAddr>,
     p2p_candidates: Vec<P2pCandidate>,
     p2p_peers: HashMap<SessionId, PeerConnection>,
@@ -515,6 +518,7 @@ impl WorkerState {
                     self.send_media(&MediaPayload::Pong { nonce });
                 }
                 Ok((_, MediaPayload::Bind { .. })) => {}
+                Ok((_, MediaPayload::NatProbe { .. })) => {}
                 Ok((_, MediaPayload::PeerVoice { .. })) => {}
                 Err(error) => {
                     kvlog::warn!("udp packet rejected", packet_size = len, error = %error);
@@ -706,6 +710,36 @@ impl WorkerState {
                     kvlog::warn!("invalid udp reflexive address", addr = addr.as_str(), error = %error);
                 }
             },
+            ServerControl::P2pNatProbe { probe_id, addr } => {
+                match addr.parse::<SocketAddr>() {
+                    Ok(addr) => {
+                        kvlog::info!(
+                            "client nat probe observation received",
+                            probe_id,
+                            addr = %addr
+                        );
+                        let server_addr = self
+                            .probe_addr_for_id(probe_id)
+                            .unwrap_or(self.config.udp_addr);
+                        self.p2p_nat_classifier.observe(ReflexiveObservation {
+                            server_addr,
+                            mapped_addr: addr,
+                        });
+                        let classified = self.p2p_nat_classifier.classify();
+                        self.p2p_nat = control_nat_kind(classified);
+                        self.p2p_reflexive_addr = self.p2p_nat_classifier.primary_reflexive_addr();
+                        self.publish_p2p_candidates();
+                    }
+                    Err(error) => {
+                        kvlog::warn!(
+                            "invalid nat probe address",
+                            probe_id,
+                            addr = addr.as_str(),
+                            error = %error
+                        );
+                    }
+                }
+            }
             ServerControl::P2pPeer { peer } => {
                 if let Err(error) = self.install_p2p_peer(peer) {
                     kvlog::warn!("p2p peer rejected", error = %error);
@@ -735,6 +769,31 @@ impl WorkerState {
         if let Some(session_id) = self.session_id {
             kvlog::info!("udp bind sending", session_id = session_id.0);
             self.send_media(&MediaPayload::Bind { session_id });
+            self.send_nat_probe(session_id, 0, self.config.udp_addr);
+            self.send_nat_probe(session_id, 1, self.config.udp_probe_addr);
+        }
+    }
+
+    fn send_nat_probe(&mut self, session_id: SessionId, probe_id: u8, addr: SocketAddr) {
+        let payload = MediaPayload::NatProbe {
+            session_id,
+            probe_id,
+        };
+        let counter = self.media_send_counter;
+        self.media_send_counter = self.media_send_counter.wrapping_add(1);
+        match media::seal_media(&self.secrets.media_send, counter, &payload) {
+            Ok(packet) => self.send_udp_raw("nat_probe", None, addr, &packet),
+            Err(error) => {
+                kvlog::warn!("nat probe seal failed", probe_id, error = %error);
+            }
+        }
+    }
+
+    fn probe_addr_for_id(&self, probe_id: u8) -> Option<SocketAddr> {
+        match probe_id {
+            0 => Some(self.config.udp_addr),
+            1 => Some(self.config.udp_probe_addr),
+            _ => None,
         }
     }
 
@@ -792,7 +851,8 @@ impl WorkerState {
 
     fn gather_p2p_candidates(&self) -> Vec<P2pCandidate> {
         let mut next_id = 1;
-        let mut candidates = host_candidates(self.udp_local_addr.port(), true, &mut next_id)
+        let mut candidates =
+            host_candidates_with_metadata(1, self.p2p_generation, self.udp_local_addr.port(), true, &mut next_id)
             .unwrap_or_else(|error| {
                 kvlog::warn!("host candidate discovery failed", error = %error);
                 Vec::new()
@@ -803,26 +863,37 @@ impl WorkerState {
             } else {
                 "::1".parse().unwrap()
             };
-            candidates.push(Candidate::new(
+            candidates.push(Candidate::with_metadata(
                 next_id,
+                1,
+                self.p2p_generation,
                 CandidateKind::Host,
                 SocketAddr::new(fallback_ip, self.udp_local_addr.port()),
+                None,
+                true,
             ));
             next_id = next_id.wrapping_add(1).max(1);
         }
         if let Some(reflexive) = self.p2p_reflexive_addr {
-            candidates.push(Candidate::with_base(
+            candidates.push(Candidate::with_metadata(
                 next_id,
+                1,
+                self.p2p_generation,
                 CandidateKind::ServerReflexive,
                 reflexive,
                 Some(self.udp_local_addr),
+                true,
             ));
             next_id = next_id.wrapping_add(1).max(1);
         }
-        candidates.push(Candidate::new(
+        candidates.push(Candidate::with_metadata(
             next_id,
+            1,
+            self.p2p_generation,
             CandidateKind::Relay,
             self.config.udp_addr,
+            None,
+            true,
         ));
         candidates.iter().map(control_candidate).collect()
     }
@@ -1126,6 +1197,7 @@ fn server_control_kind(control: &ServerControl) -> &'static str {
         ServerControl::VoiceStopped { .. } => "voice_stopped",
         ServerControl::UdpBound => "udp_bound",
         ServerControl::UdpReflexive { .. } => "udp_reflexive",
+        ServerControl::P2pNatProbe { .. } => "p2p_nat_probe",
         ServerControl::P2pPeer { .. } => "p2p_peer",
         ServerControl::P2pPeerGone { .. } => "p2p_peer_gone",
         ServerControl::Pong { .. } => "pong",
@@ -1136,6 +1208,7 @@ fn server_control_kind(control: &ServerControl) -> &'static str {
 fn media_payload_kind(payload: &MediaPayload) -> &'static str {
     match payload {
         MediaPayload::Bind { .. } => "bind",
+        MediaPayload::NatProbe { .. } => "nat_probe",
         MediaPayload::Voice { .. } => "voice",
         MediaPayload::PeerVoice { .. } => "peer_voice",
         MediaPayload::Ping { .. } => "ping",
@@ -1166,10 +1239,13 @@ fn configured_nat_kind() -> P2pNatKind {
 fn control_candidate(candidate: &Candidate) -> P2pCandidate {
     P2pCandidate {
         id: candidate.id,
+        socket_id: candidate.socket_id,
+        generation: candidate.generation,
         kind: control_candidate_kind(candidate.kind),
         addr: candidate.addr.to_string(),
         priority: candidate.priority,
         foundation: candidate.foundation.clone(),
+        verified: candidate.verified,
     }
 }
 
@@ -1180,8 +1256,11 @@ fn candidate_from_control(candidate: &P2pCandidate) -> Option<Candidate> {
         candidate_kind_from_control(candidate.kind),
         addr,
     );
+    out.socket_id = candidate.socket_id;
+    out.generation = candidate.generation;
     out.priority = candidate.priority;
     out.foundation = candidate.foundation.clone();
+    out.verified = candidate.verified;
     Some(out)
 }
 
@@ -1190,6 +1269,7 @@ fn control_candidate_kind(kind: CandidateKind) -> P2pCandidateKind {
         CandidateKind::Host => P2pCandidateKind::Host,
         CandidateKind::ServerReflexive => P2pCandidateKind::ServerReflexive,
         CandidateKind::PeerReflexive => P2pCandidateKind::PeerReflexive,
+        CandidateKind::PortMapped => P2pCandidateKind::PortMapped,
         CandidateKind::Relay => P2pCandidateKind::Relay,
     }
 }
@@ -1199,6 +1279,7 @@ fn candidate_kind_from_control(kind: P2pCandidateKind) -> CandidateKind {
         P2pCandidateKind::Host => CandidateKind::Host,
         P2pCandidateKind::ServerReflexive => CandidateKind::ServerReflexive,
         P2pCandidateKind::PeerReflexive => CandidateKind::PeerReflexive,
+        P2pCandidateKind::PortMapped => CandidateKind::PortMapped,
         P2pCandidateKind::Relay => CandidateKind::Relay,
     }
 }
@@ -1208,6 +1289,14 @@ fn nat_from_control(kind: P2pNatKind) -> NatKind {
         P2pNatKind::Unknown => NatKind::Unknown,
         P2pNatKind::Cone => NatKind::Cone,
         P2pNatKind::Symmetric => NatKind::Symmetric,
+    }
+}
+
+fn control_nat_kind(kind: NatKind) -> P2pNatKind {
+    match kind {
+        NatKind::Unknown => P2pNatKind::Unknown,
+        NatKind::Cone => P2pNatKind::Cone,
+        NatKind::Symmetric => P2pNatKind::Symmetric,
     }
 }
 

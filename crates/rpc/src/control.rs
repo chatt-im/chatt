@@ -90,6 +90,10 @@ pub enum ServerControl {
     UdpReflexive {
         addr: String,
     },
+    P2pNatProbe {
+        probe_id: u8,
+        addr: String,
+    },
     P2pPeer {
         peer: P2pPeerInfo,
     },
@@ -154,6 +158,7 @@ pub enum P2pCandidateKind {
     Host,
     ServerReflexive,
     PeerReflexive,
+    PortMapped,
     Relay,
 }
 
@@ -161,10 +166,13 @@ pub enum P2pCandidateKind {
 #[jsony(Binary, version)]
 pub struct P2pCandidate {
     pub id: u32,
+    pub socket_id: u32,
+    pub generation: u64,
     pub kind: P2pCandidateKind,
     pub addr: String,
     pub priority: u32,
     pub foundation: String,
+    pub verified: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Jsony)]
@@ -283,10 +291,13 @@ mod tests {
             tie_breaker: 99,
             candidates: vec![P2pCandidate {
                 id: 1,
+                socket_id: 1,
+                generation: 2,
                 kind: P2pCandidateKind::Host,
                 addr: "192.168.1.2:5000".to_string(),
                 priority: 1,
                 foundation: "host-udp4".to_string(),
+                verified: true,
             }],
         };
         let encoded = encode_client_control(&control).unwrap();

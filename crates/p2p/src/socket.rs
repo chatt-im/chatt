@@ -1,5 +1,7 @@
 use std::{io, net::SocketAddr, net::UdpSocket};
 
+use crate::interfaces::LocalInterface;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct UdpSocketOptions {
     pub reuse_addr: bool,
@@ -21,6 +23,24 @@ impl Default for UdpSocketOptions {
 
 #[cfg(unix)]
 pub fn bind_udp_socket(addr: SocketAddr, options: UdpSocketOptions) -> io::Result<UdpSocket> {
+    bind_udp_socket_inner(addr, options, None)
+}
+
+#[cfg(unix)]
+pub fn bind_udp_socket_on_interface(
+    addr: SocketAddr,
+    interface: &LocalInterface,
+    options: UdpSocketOptions,
+) -> io::Result<UdpSocket> {
+    bind_udp_socket_inner(addr, options, Some(interface))
+}
+
+#[cfg(unix)]
+fn bind_udp_socket_inner(
+    addr: SocketAddr,
+    options: UdpSocketOptions,
+    interface: Option<&LocalInterface>,
+) -> io::Result<UdpSocket> {
     use std::os::fd::FromRawFd;
 
     let domain = if addr.is_ipv4() {
@@ -50,6 +70,9 @@ pub fn bind_udp_socket(addr: SocketAddr, options: UdpSocketOptions) -> io::Resul
         if options.ignore_icmp_errors {
             ignore_icmp_errors(fd);
         }
+        if let Some(interface) = interface {
+            bind_to_interface(fd, interface)?;
+        }
         bind_fd(fd, addr)?;
         let socket = unsafe { UdpSocket::from_raw_fd(fd) };
         socket.set_nonblocking(options.nonblocking)?;
@@ -70,6 +93,15 @@ pub fn bind_udp_socket(addr: SocketAddr, options: UdpSocketOptions) -> io::Resul
     socket.set_nonblocking(options.nonblocking)?;
     let _ = options;
     Ok(socket)
+}
+
+#[cfg(not(unix))]
+pub fn bind_udp_socket_on_interface(
+    addr: SocketAddr,
+    _interface: &LocalInterface,
+    options: UdpSocketOptions,
+) -> io::Result<UdpSocket> {
+    bind_udp_socket(addr, options)
 }
 
 pub fn is_ignorable_udp_error(error: &io::Error) -> bool {
@@ -164,6 +196,31 @@ fn ignore_icmp_errors(fd: libc::c_int) {
             false,
         );
     }
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn bind_to_interface(fd: libc::c_int, interface: &LocalInterface) -> io::Result<()> {
+    let mut name = interface.name.as_bytes().to_vec();
+    name.push(0);
+    let rc = unsafe {
+        libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_BINDTODEVICE,
+            name.as_ptr() as *const libc::c_void,
+            name.len() as libc::socklen_t,
+        )
+    };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+fn bind_to_interface(_fd: libc::c_int, _interface: &LocalInterface) -> io::Result<()> {
+    Ok(())
 }
 
 #[cfg(test)]

@@ -11,6 +11,7 @@ pub const KIND_VOICE: u8 = 2;
 pub const KIND_PING: u8 = 3;
 pub const KIND_PONG: u8 = 4;
 pub const KIND_PEER_VOICE: u8 = 5;
+pub const KIND_NAT_PROBE: u8 = 6;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct UdpHeader {
@@ -24,6 +25,10 @@ pub struct UdpHeader {
 pub enum MediaPayload {
     Bind {
         session_id: SessionId,
+    },
+    NatProbe {
+        session_id: SessionId,
+        probe_id: u8,
     },
     Voice {
         stream_id: StreamId,
@@ -140,7 +145,7 @@ pub fn parse_header(bytes: &[u8]) -> Result<(UdpHeader, &[u8]), MediaError> {
     }
     let kind = bytes[1];
     match kind {
-        KIND_BIND | KIND_VOICE | KIND_PING | KIND_PONG | KIND_PEER_VOICE => {}
+        KIND_BIND | KIND_VOICE | KIND_PING | KIND_PONG | KIND_PEER_VOICE | KIND_NAT_PROBE => {}
         _ => return Err(MediaError::UnknownKind(kind)),
     }
     Ok((
@@ -158,6 +163,7 @@ impl MediaPayload {
     pub fn kind(&self) -> u8 {
         match self {
             MediaPayload::Bind { .. } => KIND_BIND,
+            MediaPayload::NatProbe { .. } => KIND_NAT_PROBE,
             MediaPayload::Voice { .. } => KIND_VOICE,
             MediaPayload::PeerVoice { .. } => KIND_PEER_VOICE,
             MediaPayload::Ping { .. } => KIND_PING,
@@ -172,6 +178,13 @@ pub fn encode_payload(payload: &MediaPayload) -> Result<Vec<u8>, MediaError> {
     match payload {
         MediaPayload::Bind { session_id } => {
             out.extend_from_slice(&session_id.0.to_le_bytes());
+        }
+        MediaPayload::NatProbe {
+            session_id,
+            probe_id,
+        } => {
+            out.extend_from_slice(&session_id.0.to_le_bytes());
+            out.push(*probe_id);
         }
         MediaPayload::Voice {
             stream_id,
@@ -228,6 +241,15 @@ pub fn decode_payload(kind: u8, bytes: &[u8]) -> Result<MediaPayload, MediaError
             }
             Ok(MediaPayload::Bind {
                 session_id: SessionId(u64::from_le_bytes(bytes.try_into().unwrap())),
+            })
+        }
+        KIND_NAT_PROBE => {
+            if bytes.len() != 9 {
+                return Err(MediaError::InvalidPayload);
+            }
+            Ok(MediaPayload::NatProbe {
+                session_id: SessionId(u64::from_le_bytes(bytes[0..8].try_into().unwrap())),
+                probe_id: bytes[8],
             })
         }
         KIND_VOICE => {
@@ -310,6 +332,16 @@ mod tests {
         };
         let encoded = encode_payload(&payload).unwrap();
         assert_eq!(decode_payload(KIND_PEER_VOICE, &encoded).unwrap(), payload);
+    }
+
+    #[test]
+    fn nat_probe_payload_round_trips() {
+        let payload = MediaPayload::NatProbe {
+            session_id: SessionId(42),
+            probe_id: 2,
+        };
+        let encoded = encode_payload(&payload).unwrap();
+        assert_eq!(decode_payload(KIND_NAT_PROBE, &encoded).unwrap(), payload);
     }
 
     #[test]

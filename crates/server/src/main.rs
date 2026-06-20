@@ -27,19 +27,31 @@ use rpc::{
 
 const TCP_ADDR: &str = "127.0.0.1:41000";
 const UDP_ADDR: &str = "127.0.0.1:41001";
+const UDP_PROBE_ADDR: &str = "127.0.0.1:41002";
 const LISTENER: Token = Token(0);
 const UDP: Token = Token(1);
-const FIRST_CLIENT: usize = 2;
+const UDP_PROBE: Token = Token(2);
+const FIRST_CLIENT: usize = 3;
 const DEFAULT_ROOM: RoomId = RoomId(1);
 const MAX_CHAT_HISTORY: usize = 200;
 const POLL_TIMEOUT: Duration = Duration::from_millis(100);
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let _logger = kvlog::spawn_collector_from_env(Some("tomchat-server"), false);
-    kvlog::info!("server starting", tcp_addr = TCP_ADDR, udp_addr = UDP_ADDR);
+    kvlog::info!(
+        "server starting",
+        tcp_addr = TCP_ADDR,
+        udp_addr = UDP_ADDR,
+        udp_probe_addr = UDP_PROBE_ADDR
+    );
     let mut server = Server::bind(TCP_ADDR.parse()?, UDP_ADDR.parse()?)?;
-    println!("tomchat server listening on tcp {TCP_ADDR}, udp {UDP_ADDR}");
-    kvlog::info!("server listening", tcp_addr = TCP_ADDR, udp_addr = UDP_ADDR);
+    println!("tomchat server listening on tcp {TCP_ADDR}, udp {UDP_ADDR}, probe {UDP_PROBE_ADDR}");
+    kvlog::info!(
+        "server listening",
+        tcp_addr = TCP_ADDR,
+        udp_addr = UDP_ADDR,
+        udp_probe_addr = UDP_PROBE_ADDR
+    );
     server.run()
 }
 
@@ -71,6 +83,7 @@ struct Server {
     poll: Poll,
     listener: TcpListener,
     udp: UdpSocket,
+    udp_probe: UdpSocket,
     clients: HashMap<Token, ClientConn>,
     sessions: HashMap<SessionId, Session>,
     media_key_to_session: HashMap<u32, SessionId>,
@@ -90,10 +103,13 @@ impl Server {
         let poll = Poll::new()?;
         let mut listener = TcpListener::bind(tcp_addr)?;
         let mut udp = UdpSocket::bind(udp_addr)?;
+        let mut udp_probe = UdpSocket::bind(probe_addr_for(udp_addr))?;
         poll.registry()
             .register(&mut listener, LISTENER, Interest::READABLE)?;
         poll.registry()
             .register(&mut udp, UDP, Interest::READABLE)?;
+        poll.registry()
+            .register(&mut udp_probe, UDP_PROBE, Interest::READABLE)?;
 
         let mut rooms = HashMap::new();
         rooms.insert(
@@ -111,6 +127,7 @@ impl Server {
             poll,
             listener,
             udp,
+            udp_probe,
             clients: HashMap::new(),
             sessions: HashMap::new(),
             media_key_to_session: HashMap::new(),
@@ -133,7 +150,8 @@ impl Server {
             for event in events.iter() {
                 match event.token() {
                     LISTENER => self.accept_clients()?,
-                    UDP => self.receive_udp(),
+                    UDP => self.receive_udp(0),
+                    UDP_PROBE => self.receive_udp(1),
                     token => {
                         if event.is_readable() {
                             self.read_client(token);
@@ -903,10 +921,15 @@ impl Server {
         })
     }
 
-    fn receive_udp(&mut self) {
+    fn receive_udp(&mut self, probe_id: u8) {
         let mut buf = [0u8; 2048];
         loop {
-            let (len, src) = match self.udp.recv_from(&mut buf) {
+            let socket = if probe_id == 0 {
+                &mut self.udp
+            } else {
+                &mut self.udp_probe
+            };
+            let (len, src) = match socket.recv_from(&mut buf) {
                 Ok(value) => value,
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
                 Err(error) => {
@@ -915,7 +938,7 @@ impl Server {
                 }
             };
             let packet = &buf[..len];
-            if let Err(error) = self.handle_udp_packet(src, packet) {
+            if let Err(error) = self.handle_udp_packet(probe_id, src, packet) {
                 kvlog::warn!(
                     "udp packet rejected",
                     addr = %src,
@@ -926,7 +949,12 @@ impl Server {
         }
     }
 
-    fn handle_udp_packet(&mut self, src: SocketAddr, packet: &[u8]) -> Result<(), String> {
+    fn handle_udp_packet(
+        &mut self,
+        server_probe_id: u8,
+        src: SocketAddr,
+        packet: &[u8],
+    ) -> Result<(), String> {
         let (header, _) = media::parse_header(packet).map_err(|error| error.to_string())?;
         let session_id = *self
             .media_key_to_session
@@ -964,6 +992,25 @@ impl Server {
                     let _ = self.send_control_to_token(
                         token,
                         &ServerControl::UdpReflexive {
+                            addr: src.to_string(),
+                        },
+                    );
+                }
+                Ok(())
+            }
+            MediaPayload::NatProbe {
+                session_id: bound,
+                probe_id,
+            } => {
+                if bound != session_id {
+                    return Err("NAT probe session mismatch".into());
+                }
+                let token = self.sessions.get(&session_id).map(|s| s.tcp_token);
+                if let Some(token) = token {
+                    let _ = self.send_control_to_token(
+                        token,
+                        &ServerControl::P2pNatProbe {
+                            probe_id: probe_id.max(server_probe_id),
                             addr: src.to_string(),
                         },
                     );
@@ -1288,6 +1335,14 @@ fn ordered_pair(a: SessionId, b: SessionId) -> (SessionId, SessionId) {
     if a <= b { (a, b) } else { (b, a) }
 }
 
+fn probe_addr_for(udp_addr: SocketAddr) -> SocketAddr {
+    UDP_PROBE_ADDR.parse().unwrap_or_else(|_| {
+        let mut probe = udp_addr;
+        probe.set_port(udp_addr.port().saturating_add(1));
+        probe
+    })
+}
+
 fn random_key(rng: &dyn SecureRandom) -> Result<KeyMaterial, String> {
     let mut bytes = [0u8; KEY_LEN];
     rng.fill(&mut bytes)
@@ -1338,6 +1393,7 @@ fn server_control_kind(control: &ServerControl) -> &'static str {
         ServerControl::VoiceStopped { .. } => "voice_stopped",
         ServerControl::UdpBound => "udp_bound",
         ServerControl::UdpReflexive { .. } => "udp_reflexive",
+        ServerControl::P2pNatProbe { .. } => "p2p_nat_probe",
         ServerControl::P2pPeer { .. } => "p2p_peer",
         ServerControl::P2pPeerGone { .. } => "p2p_peer_gone",
         ServerControl::Pong { .. } => "pong",

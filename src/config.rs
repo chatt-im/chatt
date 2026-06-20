@@ -15,6 +15,8 @@ pub struct NetworkConfig {
     pub tcp_addr: SocketAddr,
     #[toml(FromToml with = toml_spanner::helper::parse_string, ToToml with = toml_spanner::helper::display)]
     pub udp_addr: SocketAddr,
+    #[toml(default = default_udp_probe_addr(), FromToml with = toml_spanner::helper::parse_string, ToToml with = toml_spanner::helper::display)]
+    pub udp_probe_addr: SocketAddr,
     pub user: String,
     pub token: String,
     pub room_id: u32,
@@ -25,6 +27,7 @@ impl Default for NetworkConfig {
         Self {
             tcp_addr: "127.0.0.1:41000".parse().expect("valid default TCP addr"),
             udp_addr: "127.0.0.1:41001".parse().expect("valid default UDP addr"),
+            udp_probe_addr: default_udp_probe_addr(),
             user: "alice".to_string(),
             token: "alice-dev-token".to_string(),
             room_id: 1,
@@ -37,6 +40,7 @@ impl NetworkConfig {
         ClientConfig {
             tcp_addr: self.tcp_addr,
             udp_addr: self.udp_addr,
+            udp_probe_addr: self.udp_probe_addr,
             user: self.user.clone(),
             token: self.token.clone(),
             room_id: RoomId(self.room_id),
@@ -213,6 +217,13 @@ impl Config {
                 self.network.udp_addr = addr;
             }
         }
+        if let Some(addr) =
+            value_arg(&args, "--udp-probe").or_else(|| std::env::var("TOMCHAT_UDP_PROBE").ok())
+        {
+            if let Ok(addr) = addr.parse() {
+                self.network.udp_probe_addr = addr;
+            }
+        }
     }
 
     pub fn save_runtime(&self) -> Result<PathBuf, String> {
@@ -266,6 +277,12 @@ fn default_config_path() -> Option<PathBuf> {
     }
     let user = user_config_path()?;
     user.exists().then_some(user)
+}
+
+fn default_udp_probe_addr() -> SocketAddr {
+    "127.0.0.1:41002"
+        .parse()
+        .expect("valid default UDP probe addr")
 }
 
 fn user_config_path() -> Option<PathBuf> {

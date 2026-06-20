@@ -8,6 +8,7 @@ use crate::candidate::{Candidate, CandidateKind};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LocalInterface {
+    pub index: u32,
     pub name: String,
     pub addr: IpAddr,
     pub is_up: bool,
@@ -25,7 +26,47 @@ impl LocalInterface {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InterfaceSnapshot {
+    interfaces: Vec<LocalInterface>,
+}
+
+impl InterfaceSnapshot {
+    pub fn capture() -> io::Result<Self> {
+        Self::from_interfaces(discover_interfaces()?)
+    }
+
+    pub fn from_interfaces(mut interfaces: Vec<LocalInterface>) -> io::Result<Self> {
+        interfaces.sort_by(|a, b| {
+            a.name
+                .cmp(&b.name)
+                .then_with(|| a.addr.cmp(&b.addr))
+                .then_with(|| a.index.cmp(&b.index))
+        });
+        interfaces.dedup();
+        Ok(Self { interfaces })
+    }
+
+    pub fn changed_from(&self, previous: &Self) -> bool {
+        self.interfaces != previous.interfaces
+    }
+
+    pub fn interfaces(&self) -> &[LocalInterface] {
+        &self.interfaces
+    }
+}
+
 pub fn host_candidates(
+    port: u16,
+    include_loopback: bool,
+    next_id: &mut u32,
+) -> io::Result<Vec<Candidate>> {
+    host_candidates_with_metadata(0, 0, port, include_loopback, next_id)
+}
+
+pub fn host_candidates_with_metadata(
+    socket_id: u32,
+    generation: u64,
     port: u16,
     include_loopback: bool,
     next_id: &mut u32,
@@ -37,10 +78,14 @@ pub fn host_candidates(
         }
         let id = *next_id;
         *next_id = next_id.wrapping_add(1).max(1);
-        candidates.push(Candidate::new(
+        candidates.push(Candidate::with_metadata(
             id,
+            socket_id,
+            generation,
             CandidateKind::Host,
             SocketAddr::new(interface.addr, port),
+            None,
+            true,
         ));
     }
     Ok(candidates)
@@ -82,7 +127,9 @@ pub fn discover_interfaces() -> io::Result<Vec<LocalInterface>> {
                 .into_owned();
             if let Some(addr) = sockaddr_ip(ifaddr.ifa_addr) {
                 let flags = ifaddr.ifa_flags;
+                let index = unsafe { libc::if_nametoindex(ifaddr.ifa_name) };
                 out.push(LocalInterface {
+                    index,
                     is_up: flags & libc::IFF_UP as u32 != 0,
                     is_loopback: flags & libc::IFF_LOOPBACK as u32 != 0,
                     is_virtual: is_virtual_interface_name(&name),
@@ -153,6 +200,7 @@ mod tests {
     #[test]
     fn usability_filters_virtual_and_loopback() {
         let physical = LocalInterface {
+            index: 1,
             name: "eth0".to_string(),
             addr: "192.168.1.2".parse().unwrap(),
             is_up: true,
@@ -160,6 +208,7 @@ mod tests {
             is_virtual: false,
         };
         let loopback = LocalInterface {
+            index: 2,
             name: "lo".to_string(),
             addr: "127.0.0.1".parse().unwrap(),
             is_up: true,
@@ -167,6 +216,7 @@ mod tests {
             is_virtual: false,
         };
         let vpn = LocalInterface {
+            index: 3,
             name: "tun0".to_string(),
             addr: "10.8.0.2".parse().unwrap(),
             is_up: true,
@@ -178,5 +228,29 @@ mod tests {
         assert!(!loopback.usable_for_host_candidate(false));
         assert!(loopback.usable_for_host_candidate(true));
         assert!(!vpn.usable_for_host_candidate(true));
+    }
+
+    #[test]
+    fn snapshot_detects_interface_changes() {
+        let before = InterfaceSnapshot::from_interfaces(vec![LocalInterface {
+            index: 1,
+            name: "eth0".to_string(),
+            addr: "192.168.1.2".parse().unwrap(),
+            is_up: true,
+            is_loopback: false,
+            is_virtual: false,
+        }])
+        .unwrap();
+        let after = InterfaceSnapshot::from_interfaces(vec![LocalInterface {
+            index: 1,
+            name: "eth0".to_string(),
+            addr: "192.168.1.3".parse().unwrap(),
+            is_up: true,
+            is_loopback: false,
+            is_virtual: false,
+        }])
+        .unwrap();
+
+        assert!(after.changed_from(&before));
     }
 }

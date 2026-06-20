@@ -7,11 +7,18 @@
 pub mod agent;
 pub mod candidate;
 pub mod interfaces;
+pub mod nat;
+pub mod restart;
 pub mod socket;
 pub mod stun;
+
+#[cfg(test)]
+mod sim;
 
 pub use agent::{
     Action, AgentConfig, FallbackReason, IceRole, RestartReason, SelectedPair, TraversalAgent,
 };
 pub use candidate::{Candidate, CandidateKind, CandidatePairId, NatKind, NetworkFamily};
+pub use nat::{NatClassifier, ReflexiveObservation};
+pub use restart::RestartPortPolicy;
 pub use stun::{MessageClass, MessageKind, StunMessage, TransactionId};
