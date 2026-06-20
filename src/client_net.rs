@@ -87,6 +87,10 @@ pub enum NetworkEvent {
         user_id: UserId,
         stream_id: StreamId,
     },
+    PeerTransport {
+        user_id: UserId,
+        direct: bool,
+    },
     VoicePacket(RemoteVoicePacket),
     Status(String),
     Error(String),
@@ -763,6 +767,10 @@ impl WorkerState {
                 user_id,
             } => {
                 self.p2p_peers.remove(&session_id);
+                let _ = self.events.send(NetworkEvent::PeerTransport {
+                    user_id,
+                    direct: false,
+                });
                 kvlog::info!(
                     "p2p peer removed",
                     session_id = session_id.0,
@@ -1193,6 +1201,13 @@ impl WorkerState {
         for action in actions {
             match action {
                 P2pAction::UseRelay { reason, .. } => {
+                    if let Some(user_id) = self.p2p_peers.get(&session_id).map(|peer| peer.user_id)
+                    {
+                        let _ = self.events.send(NetworkEvent::PeerTransport {
+                            user_id,
+                            direct: false,
+                        });
+                    }
                     kvlog::info!(
                         "p2p using relay",
                         session_id = session_id.0,
@@ -1206,6 +1221,16 @@ impl WorkerState {
                 }
                 P2pAction::DirectReady { selected } | P2pAction::Migrated { selected } => {
                     let user_id = self.p2p_peers.get(&session_id).map(|peer| peer.user_id);
+                    if let Some(user_id) = user_id {
+                        let _ = self.events.send(NetworkEvent::PeerTransport {
+                            user_id,
+                            direct: true,
+                        });
+                        let _ = self.events.send(NetworkEvent::Status(format!(
+                            "p2p direct path to user {}",
+                            user_id.0
+                        )));
+                    }
                     kvlog::info!(
                         "p2p direct path selected",
                         session_id = session_id.0,
@@ -1219,7 +1244,12 @@ impl WorkerState {
                 }
                 P2pAction::Disconnected => {
                     kvlog::warn!("p2p direct path timed out", session_id = session_id.0);
-                    self.p2p_peers.remove(&session_id);
+                    if let Some(peer) = self.p2p_peers.remove(&session_id) {
+                        let _ = self.events.send(NetworkEvent::PeerTransport {
+                            user_id: peer.user_id,
+                            direct: false,
+                        });
+                    }
                     let _ = self.events.send(NetworkEvent::Status(
                         "p2p direct path timed out; using relay".to_string(),
                     ));

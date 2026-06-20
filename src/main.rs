@@ -131,6 +131,7 @@ struct ParticipantState {
     name: String,
     online: bool,
     in_call: bool,
+    p2p_direct: bool,
     last_message_ms: Option<u64>,
     last_voice_at: Option<Instant>,
     active_stream: Option<StreamId>,
@@ -161,12 +162,16 @@ impl Participants {
             existing.name = participant.name;
             existing.online = online;
             existing.in_call = participant.in_call;
+            if !participant.in_call {
+                existing.p2p_direct = false;
+            }
         } else {
             self.entries.push(ParticipantState {
                 user_id: participant.user_id,
                 name: participant.name,
                 online,
                 in_call: participant.in_call,
+                p2p_direct: false,
                 last_message_ms: None,
                 last_voice_at: None,
                 active_stream: None,
@@ -198,10 +203,17 @@ impl Participants {
             .find(|entry| entry.user_id == user_id)
         {
             entry.in_call = false;
+            entry.p2p_direct = false;
             if entry.active_stream == Some(stream_id) {
                 entry.active_stream = None;
             }
         }
+    }
+
+    fn set_peer_transport(&mut self, user_id: UserId, direct: bool) {
+        let entry = self.ensure_user(user_id, &format!("user {}", user_id.0));
+        entry.p2p_direct = direct;
+        self.sort();
     }
 
     fn voice_packet(&mut self, stream_id: u32) {
@@ -238,6 +250,7 @@ impl Participants {
             name: name.to_string(),
             online: true,
             in_call: false,
+            p2p_direct: false,
             last_message_ms: None,
             last_voice_at: None,
             active_stream: None,
@@ -251,6 +264,7 @@ impl Participants {
             b.online
                 .cmp(&a.online)
                 .then_with(|| b.in_call.cmp(&a.in_call))
+                .then_with(|| b.p2p_direct.cmp(&a.p2p_direct))
                 .then_with(|| a.name.cmp(&b.name))
         });
     }
@@ -474,6 +488,9 @@ impl App {
                     }
                     self.set_status(format!("user {} left the call", user_id.0));
                 }
+            }
+            NetworkEvent::PeerTransport { user_id, direct } => {
+                self.participants.set_peer_transport(user_id, direct);
             }
             NetworkEvent::VoicePacket(packet) => {
                 self.voice_packets_received = self.voice_packets_received.saturating_add(1);
@@ -1076,8 +1093,12 @@ fn draw_room(area: Rect, app: &App, buf: &mut Buffer) {
     let start = app.participants.scroll.min(app.participants.entries.len());
     for participant in app.participants.entries.iter().skip(start).take(visible) {
         let row = rows.take_top(1);
-        let state = if participant.in_call {
+        let state = if participant.in_call && Some(participant.user_id) == app.user_id {
             "voice"
+        } else if participant.in_call && participant.p2p_direct {
+            "p2p"
+        } else if participant.in_call {
+            "relay"
         } else if participant.online {
             "online"
         } else {
@@ -1446,6 +1467,7 @@ fn network_event_kind(event: &NetworkEvent) -> &'static str {
         NetworkEvent::Presence { .. } => "presence",
         NetworkEvent::VoiceStarted { .. } => "voice_started",
         NetworkEvent::VoiceStopped { .. } => "voice_stopped",
+        NetworkEvent::PeerTransport { .. } => "peer_transport",
         NetworkEvent::VoicePacket(_) => "voice_packet",
         NetworkEvent::Status(_) => "status",
         NetworkEvent::Error(_) => "error",
@@ -1502,6 +1524,57 @@ mod tests {
         let config = Config::default();
         assert_eq!(config.network.user, "alice");
         assert_eq!(config.audio.bitrate_bps, 24_000);
+    }
+
+    #[test]
+    fn participant_transport_badge_tracks_direct_path() {
+        let mut participants = Participants::default();
+        participants.upsert(
+            ParticipantInfo {
+                user_id: UserId(2),
+                name: "bob".to_string(),
+                in_call: true,
+            },
+            true,
+        );
+
+        participants.set_peer_transport(UserId(2), true);
+        let bob = participants
+            .entries
+            .iter()
+            .find(|entry| entry.user_id == UserId(2))
+            .expect("bob participant");
+        assert!(bob.p2p_direct);
+
+        participants.upsert(
+            ParticipantInfo {
+                user_id: UserId(2),
+                name: "bob".to_string(),
+                in_call: true,
+            },
+            true,
+        );
+        let bob = participants
+            .entries
+            .iter()
+            .find(|entry| entry.user_id == UserId(2))
+            .expect("bob participant");
+        assert!(bob.p2p_direct);
+
+        participants.upsert(
+            ParticipantInfo {
+                user_id: UserId(2),
+                name: "bob".to_string(),
+                in_call: false,
+            },
+            true,
+        );
+        let bob = participants
+            .entries
+            .iter()
+            .find(|entry| entry.user_id == UserId(2))
+            .expect("bob participant");
+        assert!(!bob.p2p_direct);
     }
 
     #[test]
