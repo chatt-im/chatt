@@ -57,6 +57,9 @@ const LIVE_PLAYBACK_SILENCE_RAMP: Duration = Duration::from_millis(10);
 const LIVE_PLAYBACK_SILENCE_MAX_SKIP: Duration = Duration::from_millis(200);
 const LIVE_PLAYBACK_SILENCE_MIN_SKIP: Duration = Duration::from_millis(20);
 const LIVE_PLAYBACK_SILENCE_RANGE_COUNT: usize = 2;
+const LIVE_CAPTURE_LONG_SILENCE_STOP: Duration = Duration::from_secs(2);
+const LIVE_CAPTURE_SILENCE_PREROLL: Duration = Duration::from_millis(30);
+const LIVE_CAPTURE_SILENCE_RAMP: Duration = Duration::from_millis(10);
 const MAX_OPUS_DECODE_SAMPLES: usize = 5_760;
 const MAX_OPUS_PACKET_BYTES: usize = 1_500;
 
@@ -1735,6 +1738,141 @@ fn silence_ranges_contain(silence_ranges: u64, offset_samples: usize) -> bool {
     false
 }
 
+struct CaptureBufferedFrame {
+    samples: Vec<f32>,
+    silence_ranges: u64,
+}
+
+enum CaptureGateDecision {
+    TransmitCurrent,
+    SuppressCurrent,
+    Resume(Vec<CaptureBufferedFrame>),
+}
+
+struct LongSilenceGate {
+    silence_frames: usize,
+    stop_frames: usize,
+    preroll_frames: usize,
+    ramp_samples: usize,
+    suppressed: bool,
+    preroll: VecDeque<CaptureBufferedFrame>,
+}
+
+impl LongSilenceGate {
+    fn new() -> Self {
+        Self::with_limits(
+            frames_for_duration(LIVE_CAPTURE_LONG_SILENCE_STOP),
+            frames_for_duration(LIVE_CAPTURE_SILENCE_PREROLL),
+            samples_for_duration(LIVE_CAPTURE_SILENCE_RAMP),
+        )
+    }
+
+    fn with_limits(stop_frames: usize, preroll_frames: usize, ramp_samples: usize) -> Self {
+        Self {
+            silence_frames: 0,
+            stop_frames: stop_frames.max(1),
+            preroll_frames,
+            ramp_samples,
+            suppressed: false,
+            preroll: VecDeque::with_capacity(preroll_frames),
+        }
+    }
+
+    fn observe(
+        &mut self,
+        samples: &mut [f32],
+        silence: bool,
+        silence_ranges: u64,
+    ) -> CaptureGateDecision {
+        if silence {
+            self.silence_frames = self.silence_frames.saturating_add(1);
+        } else {
+            self.silence_frames = 0;
+        }
+
+        if self.suppressed {
+            if silence {
+                self.push_preroll(samples, silence_ranges);
+                return CaptureGateDecision::SuppressCurrent;
+            }
+
+            let mut frames = self.preroll.drain(..).collect::<Vec<_>>();
+            frames.push(CaptureBufferedFrame {
+                samples: samples.to_vec(),
+                silence_ranges,
+            });
+            apply_fade_in_to_frames(&mut frames, self.ramp_samples);
+            self.suppressed = false;
+            return CaptureGateDecision::Resume(frames);
+        }
+
+        if silence && self.silence_frames == self.stop_frames {
+            apply_fade_out(samples, self.ramp_samples);
+            return CaptureGateDecision::TransmitCurrent;
+        }
+
+        if silence && self.silence_frames > self.stop_frames {
+            self.suppressed = true;
+            self.push_preroll(samples, silence_ranges);
+            return CaptureGateDecision::SuppressCurrent;
+        }
+
+        CaptureGateDecision::TransmitCurrent
+    }
+
+    fn push_preroll(&mut self, samples: &[f32], silence_ranges: u64) {
+        if self.preroll_frames == 0 {
+            return;
+        }
+
+        self.preroll.push_back(CaptureBufferedFrame {
+            samples: samples.to_vec(),
+            silence_ranges,
+        });
+        while self.preroll.len() > self.preroll_frames {
+            self.preroll.pop_front();
+        }
+    }
+}
+
+fn apply_fade_out(samples: &mut [f32], ramp_samples: usize) {
+    let fade = ramp_samples.min(samples.len());
+    if fade == 0 {
+        return;
+    }
+
+    let start = samples.len() - fade;
+    for index in 0..fade {
+        let t = (index + 1) as f32 / fade as f32;
+        let gain = ((1.0 - t) * std::f32::consts::FRAC_PI_2).sin();
+        samples[start + index] *= gain;
+    }
+}
+
+fn apply_fade_in_to_frames(frames: &mut [CaptureBufferedFrame], ramp_samples: usize) {
+    let total = frames
+        .iter()
+        .map(|frame| frame.samples.len())
+        .sum::<usize>();
+    let fade = ramp_samples.min(total);
+    if fade == 0 {
+        return;
+    }
+
+    let mut cursor = 0usize;
+    for frame in frames {
+        for sample in &mut frame.samples {
+            if cursor >= fade {
+                return;
+            }
+            let t = (cursor + 1) as f32 / fade as f32;
+            let gain = (t * std::f32::consts::FRAC_PI_2).sin();
+            *sample *= gain;
+            cursor += 1;
+        }
+    }
+}
+
 fn store_processed_level_stats(stats: &AudioStats, samples: &[f32]) {
     let rms = rms_i16_scale(samples);
     let peak = peak_i16_scale(samples);
@@ -1863,6 +2001,7 @@ where
     let mut denoise = DenoiseState::new();
     let mut earshot = EarshotVad::new();
     let mut silence_tracker = SilenceRangeTracker::new();
+    let mut long_silence = LongSilenceGate::new();
     let mut auto_gain = AutoGain::new(f32::from_bits(
         max_amplification_bits.load(Ordering::Relaxed),
     ));
@@ -1890,24 +2029,66 @@ where
                 .vad_bits
                 .store(vad_probability.to_bits(), Ordering::Relaxed);
             let vad = vad_to_u8(vad_probability);
-            let silence_ranges =
-                silence_tracker.observe_frame(is_capture_skip_safe_silence(vad, frame));
+            let silence = is_capture_skip_safe_silence(vad, frame);
+            let silence_ranges = silence_tracker.observe_frame(silence);
 
-            convert_i16_scale_to_pcm_i16(frame, &mut opus_frame);
-            let packet_len = encoder.encode(&opus_frame, &mut encoded)?;
-            on_packet(LocalVoiceFrame {
-                payload: encoded[..packet_len].to_vec(),
-                silence_ranges,
-            });
-            stats.inner.encoded_packets.fetch_add(1, Ordering::Relaxed);
-            stats
-                .inner
-                .encoded_bytes
-                .fetch_add(packet_len as u64, Ordering::Relaxed);
+            match long_silence.observe(frame, silence, silence_ranges) {
+                CaptureGateDecision::TransmitCurrent => {
+                    encode_live_frame(
+                        frame,
+                        silence_ranges,
+                        encoder,
+                        &mut opus_frame,
+                        &mut encoded,
+                        stats,
+                        on_packet,
+                    )?;
+                }
+                CaptureGateDecision::SuppressCurrent => {}
+                CaptureGateDecision::Resume(frames) => {
+                    for frame in frames {
+                        encode_live_frame(
+                            &frame.samples,
+                            frame.silence_ranges,
+                            encoder,
+                            &mut opus_frame,
+                            &mut encoded,
+                            stats,
+                            on_packet,
+                        )?;
+                    }
+                }
+            }
             Ok(())
         })?;
     }
 
+    Ok(())
+}
+
+fn encode_live_frame<F>(
+    frame: &[f32],
+    silence_ranges: u64,
+    encoder: &mut OpusVoiceEncoder,
+    opus_frame: &mut [i16],
+    encoded: &mut [u8],
+    stats: &AudioStats,
+    on_packet: &mut F,
+) -> Result<(), String>
+where
+    F: FnMut(LocalVoiceFrame),
+{
+    convert_i16_scale_to_pcm_i16(frame, opus_frame);
+    let packet_len = encoder.encode(opus_frame, encoded)?;
+    on_packet(LocalVoiceFrame {
+        payload: encoded[..packet_len].to_vec(),
+        silence_ranges,
+    });
+    stats.inner.encoded_packets.fetch_add(1, Ordering::Relaxed);
+    stats
+        .inner
+        .encoded_bytes
+        .fetch_add(packet_len as u64, Ordering::Relaxed);
     Ok(())
 }
 
@@ -2901,6 +3082,10 @@ fn samples_for_duration(duration: Duration) -> usize {
     (duration.as_secs_f64() * SAMPLE_RATE as f64).round() as usize
 }
 
+fn frames_for_duration(duration: Duration) -> usize {
+    samples_for_duration(duration).saturating_add(FRAME_SAMPLES.saturating_sub(1)) / FRAME_SAMPLES
+}
+
 fn samples_to_ms(samples: usize) -> u64 {
     ((samples as f64 / SAMPLE_RATE as f64) * 1_000.0).round() as u64
 }
@@ -3181,6 +3366,73 @@ mod tests {
         assert!(!silence_ranges_contain(encoded, FRAME_SAMPLES));
         assert!(silence_ranges_contain(encoded, FRAME_SAMPLES * 2));
         assert!(!silence_ranges_contain(encoded, FRAME_SAMPLES * 4));
+    }
+
+    #[test]
+    fn long_silence_gate_suppresses_after_threshold_with_fade_out() {
+        let mut gate = LongSilenceGate::with_limits(3, 2, 4);
+
+        for range in 0..2 {
+            let mut frame = vec![1.0; 8];
+            assert!(matches!(
+                gate.observe(&mut frame, true, range),
+                CaptureGateDecision::TransmitCurrent
+            ));
+            assert!(
+                frame
+                    .iter()
+                    .all(|sample| (*sample - 1.0).abs() < f32::EPSILON)
+            );
+        }
+
+        let mut final_frame = vec![1.0; 8];
+        assert!(matches!(
+            gate.observe(&mut final_frame, true, 2),
+            CaptureGateDecision::TransmitCurrent
+        ));
+        assert!(final_frame[4] < 1.0);
+        assert!(final_frame[7].abs() < f32::EPSILON);
+
+        let mut suppressed_frame = vec![1.0; 8];
+        assert!(matches!(
+            gate.observe(&mut suppressed_frame, true, 3),
+            CaptureGateDecision::SuppressCurrent
+        ));
+    }
+
+    #[test]
+    fn long_silence_gate_resumes_with_recent_preroll_and_fade_in() {
+        let mut gate = LongSilenceGate::with_limits(1, 2, 4);
+        let mut threshold_frame = vec![0.1; 4];
+        assert!(matches!(
+            gate.observe(&mut threshold_frame, true, 10),
+            CaptureGateDecision::TransmitCurrent
+        ));
+
+        let mut old_preroll = vec![0.2; 4];
+        assert!(matches!(
+            gate.observe(&mut old_preroll, true, 20),
+            CaptureGateDecision::SuppressCurrent
+        ));
+        let mut recent_preroll = vec![0.4; 4];
+        assert!(matches!(
+            gate.observe(&mut recent_preroll, true, 30),
+            CaptureGateDecision::SuppressCurrent
+        ));
+
+        let mut speech = vec![1.0; 4];
+        let CaptureGateDecision::Resume(frames) = gate.observe(&mut speech, false, 40) else {
+            panic!("speech should resume transmission");
+        };
+
+        assert_eq!(frames.len(), 3);
+        assert_eq!(frames[0].silence_ranges, 20);
+        assert_eq!(frames[1].silence_ranges, 30);
+        assert_eq!(frames[2].silence_ranges, 40);
+        assert!(frames[0].samples[0] > 0.0);
+        assert!(frames[0].samples[0] < frames[0].samples[3]);
+        assert!((frames[1].samples[0] - 0.4).abs() < f32::EPSILON);
+        assert!((frames[2].samples[0] - 1.0).abs() < f32::EPSILON);
     }
 
     #[test]
