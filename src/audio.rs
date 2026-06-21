@@ -2638,10 +2638,21 @@ enum DecodedFrameSource {
     DecodeError,
 }
 
+/// DRED parsed from the packet that bounds a loss gap, cached so every missing
+/// frame in the same gap reuses one parse instead of re-parsing per frame.
+struct DredGapState {
+    sequence: u32,
+    state: DredState,
+    reach: usize,
+    dred_end: i32,
+}
+
 struct LiveDecodeStream {
     jitter: LiveJitterStream,
     decoder: Decoder,
     dred_decoder: Option<DredDecoder>,
+    dred_gap: Option<DredGapState>,
+    dred_parses: u64,
     tuning: LiveAudioTuning,
     feedback: LivePlaybackFeedbackState,
 }
@@ -2653,6 +2664,8 @@ impl LiveDecodeStream {
             decoder: Decoder::new(SampleRate::Hz48000, Channels::Mono)
                 .map_err(|error| error.to_string())?,
             dred_decoder: DredDecoder::new().ok(),
+            dred_gap: None,
+            dred_parses: 0,
             tuning,
             feedback: LivePlaybackFeedbackState::default(),
         })
@@ -2812,6 +2825,15 @@ impl LiveDecodeStream {
         }
     }
 
+    /// Recovers a single missing frame from the DRED carried by the packet that
+    /// bounds the loss gap.
+    ///
+    /// The bounding packet's DRED is parsed once per gap (cached for the gap's
+    /// remaining missing frames), then a whole frame is decoded at the gap
+    /// distance when the DRED reaches that far back. Returns `false` when DRED
+    /// cannot cover the frame, so the caller emits plain PLC. This mirrors
+    /// `opus_demo` and the awebo reference: DRED fills only whole frames within
+    /// reach and is never spliced with concealment.
     #[allow(clippy::too_many_arguments)]
     fn decode_dred<F>(
         &mut self,
@@ -2840,264 +2862,222 @@ impl LiveDecodeStream {
             return false;
         }
 
-        let mut float_frame = vec![0.0f32; frame.len()];
+        // The first audio item after the gap is the packet whose DRED describes
+        // the missing audio. Packets beyond it sit further ahead, so their DRED
+        // would have to reach back even further; only this one can cover the frame.
+        let mut bounding = None;
         for item in future_items {
-            let PlayoutItem::Audio {
+            if let PlayoutItem::Audio {
                 sequence,
                 flags,
                 payload,
                 silence_ranges,
             } = item
-            else {
-                continue;
-            };
-            if flags & LIVE_PACKET_FLAG_OPUS_RESET != 0 {
-                trace_dred_skip(
-                    trace,
-                    trace_start,
-                    now,
-                    stream_id,
-                    missing_sequence,
-                    Some(*sequence),
-                    "future_packet_resets_opus",
-                );
+            {
+                bounding = Some((*sequence, *flags, payload.as_slice(), *silence_ranges));
                 break;
             }
-            let Some(distance) = sequence_distance_forward(missing_sequence, *sequence) else {
-                trace_dred_skip(
-                    trace,
-                    trace_start,
-                    now,
-                    stream_id,
-                    missing_sequence,
-                    Some(*sequence),
-                    "future_packet_not_forward",
-                );
-                continue;
-            };
-            if distance == 0 {
-                continue;
-            }
-            let Some(offset_samples) = distance.checked_mul(LIVE_OPUS_FRAME_SAMPLES as u32) else {
-                trace_dred_skip(
-                    trace,
-                    trace_start,
-                    now,
-                    stream_id,
-                    missing_sequence,
-                    Some(*sequence),
-                    "offset_overflow",
-                );
-                continue;
-            };
-            let dred_max_samples = samples_for_duration(self.tuning.dred_horizon);
-            if offset_samples as usize > dred_max_samples {
-                trace_dred_parse(
-                    trace,
-                    trace_start,
-                    now,
-                    stream_id,
-                    missing_sequence,
-                    *sequence,
-                    offset_samples,
-                    0,
-                    0,
-                    "offset_beyond_horizon",
-                );
-                continue;
-            }
-
-            let Ok(mut dred_state) = DredState::new() else {
-                trace_dred_skip(
-                    trace,
-                    trace_start,
-                    now,
-                    stream_id,
-                    missing_sequence,
-                    Some(*sequence),
-                    "dred_state_unavailable",
-                );
-                return false;
-            };
-            let mut dred_end = 0;
-            let parsed = self
-                .dred_decoder
-                .as_mut()
-                .expect("DRED decoder exists after availability check")
-                .parse(
-                    &mut dred_state,
-                    payload,
-                    dred_max_samples,
-                    SampleRate::Hz48000,
-                    &mut dred_end,
-                    false,
-                )
-                .unwrap_or(0);
-            let partial_prefix_samples = if parsed == 0 {
-                None
-            } else if offset_samples as usize > parsed {
-                Some(offset_samples as usize - parsed)
-            } else {
-                Some(0)
-            };
+        }
+        let Some((sequence, flags, payload, silence_ranges)) = bounding else {
+            return false;
+        };
+        if flags & LIVE_PACKET_FLAG_OPUS_RESET != 0 {
+            trace_dred_skip(
+                trace,
+                trace_start,
+                now,
+                stream_id,
+                missing_sequence,
+                Some(sequence),
+                "future_packet_resets_opus",
+            );
+            return false;
+        }
+        let Some(distance) = sequence_distance_forward(missing_sequence, sequence) else {
+            return false;
+        };
+        if distance == 0 {
+            return false;
+        }
+        let Some(offset_samples) = distance.checked_mul(LIVE_OPUS_FRAME_SAMPLES as u32) else {
+            trace_dred_skip(
+                trace,
+                trace_start,
+                now,
+                stream_id,
+                missing_sequence,
+                Some(sequence),
+                "offset_overflow",
+            );
+            return false;
+        };
+        let dred_max_samples = samples_for_duration(self.tuning.dred_horizon);
+        if offset_samples as usize > dred_max_samples {
             trace_dred_parse(
                 trace,
                 trace_start,
                 now,
                 stream_id,
                 missing_sequence,
-                *sequence,
+                sequence,
                 offset_samples,
-                parsed as u32,
-                dred_end,
-                match partial_prefix_samples {
-                    None => "no_dred",
-                    Some(0) => "parsed",
-                    Some(prefix) if prefix < LIVE_OPUS_FRAME_SAMPLES => "partial",
-                    Some(_) => "parsed_too_late",
-                },
+                0,
+                0,
+                "offset_beyond_horizon",
             );
-            if parsed == 0 {
-                continue;
+            return false;
+        }
+
+        let Some((reach, dred_end)) = self.ensure_dred_gap(sequence, payload, dred_max_samples)
+        else {
+            trace_dred_skip(
+                trace,
+                trace_start,
+                now,
+                stream_id,
+                missing_sequence,
+                Some(sequence),
+                "dred_state_unavailable",
+            );
+            return false;
+        };
+
+        let status = if reach == 0 {
+            "no_dred"
+        } else if offset_samples as usize > reach {
+            "beyond_dred_reach"
+        } else {
+            "recovered"
+        };
+        trace_dred_parse(
+            trace,
+            trace_start,
+            now,
+            stream_id,
+            missing_sequence,
+            sequence,
+            offset_samples,
+            reach as u32,
+            dred_end,
+            status,
+        );
+        if status != "recovered" {
+            return false;
+        }
+
+        let Ok(offset) = i32::try_from(offset_samples) else {
+            return false;
+        };
+        let silence_hint = silence_ranges_contain(silence_ranges, offset_samples as usize);
+        let mut float_frame = vec![0.0f32; frame.len()];
+        let gap = self
+            .dred_gap
+            .as_ref()
+            .expect("dred gap state present after ensure_dred_gap");
+        let dred_result = self
+            .dred_decoder
+            .as_mut()
+            .expect("DRED decoder exists after availability check")
+            .decode_into_f32(&mut self.decoder, &gap.state, offset, &mut float_frame);
+        match dred_result {
+            Ok(decoded) if decoded > 0 => {
+                trace_decode_output(
+                    trace,
+                    trace_start,
+                    now,
+                    stream_id,
+                    missing_sequence,
+                    DecodedFrameSource::Dred,
+                    decoded,
+                    silence_hint,
+                    None,
+                    &float_frame[..decoded],
+                );
+                on_samples(
+                    trace,
+                    &float_frame[..decoded],
+                    DecodedFrameSource::Dred,
+                    silence_hint,
+                );
+                true
             }
-            let partial_prefix_samples = partial_prefix_samples.unwrap_or(0);
-            if partial_prefix_samples >= LIVE_OPUS_FRAME_SAMPLES {
+            Ok(_) => {
                 trace_dred_skip(
                     trace,
                     trace_start,
                     now,
                     stream_id,
                     missing_sequence,
-                    Some(*sequence),
-                    "requested_offset_after_parsed_offset",
+                    Some(sequence),
+                    "decoded_zero_samples",
                 );
-                continue;
+                false
             }
-            if partial_prefix_samples > 0 {
-                self.decode_playout(
-                    &[],
-                    &mut frame[..partial_prefix_samples],
-                    DecodedFrameSource::Plc,
-                    false,
+            Err(error) => {
+                trace_dred_skip(
+                    trace,
                     trace_start,
                     now,
                     stream_id,
                     missing_sequence,
+                    Some(sequence),
+                    "decode_error",
+                );
+                trace_decode_output(
                     trace,
-                    on_samples,
+                    trace_start,
+                    now,
+                    stream_id,
+                    missing_sequence,
+                    DecodedFrameSource::DecodeError,
+                    0,
+                    false,
+                    Some(error.to_string()),
+                    &[],
                 );
-            }
-
-            let dred_offset_samples = if partial_prefix_samples == 0 {
-                offset_samples as usize
-            } else {
-                parsed
-            };
-            let dred_samples = LIVE_OPUS_FRAME_SAMPLES.saturating_sub(partial_prefix_samples);
-            let silence_hint = silence_ranges_contain(*silence_ranges, dred_offset_samples);
-            let Ok(dred_offset_samples) = i32::try_from(dred_offset_samples) else {
-                continue;
-            };
-            let dred_result = self
-                .dred_decoder
-                .as_mut()
-                .expect("DRED decoder exists after availability check")
-                .decode_into_f32(
-                    &mut self.decoder,
-                    &dred_state,
-                    dred_offset_samples,
-                    &mut float_frame[..dred_samples],
-                );
-            match dred_result {
-                Ok(decoded) if decoded > 0 => {
-                    trace_decode_output(
-                        trace,
-                        trace_start,
-                        now,
-                        stream_id,
-                        missing_sequence,
-                        DecodedFrameSource::Dred,
-                        decoded,
-                        silence_hint,
-                        None,
-                        &float_frame[..decoded],
-                    );
-                    on_samples(
-                        trace,
-                        &float_frame[..decoded],
-                        DecodedFrameSource::Dred,
-                        silence_hint,
-                    );
-                    return true;
-                }
-                Ok(_) => {
-                    trace_dred_skip(
-                        trace,
-                        trace_start,
-                        now,
-                        stream_id,
-                        missing_sequence,
-                        Some(*sequence),
-                        "decoded_zero_samples",
-                    );
-                    if partial_prefix_samples > 0 {
-                        self.decode_playout(
-                            &[],
-                            &mut frame[..dred_samples],
-                            DecodedFrameSource::Plc,
-                            false,
-                            trace_start,
-                            now,
-                            stream_id,
-                            missing_sequence,
-                            trace,
-                            on_samples,
-                        );
-                        return true;
-                    }
-                }
-                Err(error) => {
-                    trace_dred_skip(
-                        trace,
-                        trace_start,
-                        now,
-                        stream_id,
-                        missing_sequence,
-                        Some(*sequence),
-                        "decode_error",
-                    );
-                    trace_decode_output(
-                        trace,
-                        trace_start,
-                        now,
-                        stream_id,
-                        missing_sequence,
-                        DecodedFrameSource::DecodeError,
-                        0,
-                        false,
-                        Some(error.to_string()),
-                        &[],
-                    );
-                    if partial_prefix_samples > 0 {
-                        self.decode_playout(
-                            &[],
-                            &mut frame[..dred_samples],
-                            DecodedFrameSource::Plc,
-                            false,
-                            trace_start,
-                            now,
-                            stream_id,
-                            missing_sequence,
-                            trace,
-                            on_samples,
-                        );
-                        return true;
-                    }
-                }
+                false
             }
         }
+    }
 
-        false
+    /// Parses the gap-bounding packet's DRED, reusing the cached parse when the
+    /// same packet already bounds the current gap.
+    ///
+    /// Returns `(reach_samples, dred_end)` where `reach_samples` is how far back
+    /// the DRED reaches, or `None` when DRED state allocation or the decoder is
+    /// unavailable.
+    fn ensure_dred_gap(
+        &mut self,
+        sequence: u32,
+        payload: &[u8],
+        dred_max_samples: usize,
+    ) -> Option<(usize, i32)> {
+        if let Some(gap) = self.dred_gap.as_ref()
+            && gap.sequence == sequence
+        {
+            return Some((gap.reach, gap.dred_end));
+        }
+        let mut state = DredState::new().ok()?;
+        let decoder = self.dred_decoder.as_mut()?;
+        let mut dred_end = 0;
+        let reach = decoder
+            .parse(
+                &mut state,
+                payload,
+                dred_max_samples,
+                SampleRate::Hz48000,
+                &mut dred_end,
+                false,
+            )
+            .unwrap_or(0);
+        self.dred_parses += 1;
+        self.dred_gap = Some(DredGapState {
+            sequence,
+            state,
+            reach,
+            dred_end,
+        });
+        Some((reach, dred_end))
     }
 
     fn reset_decoder_state(&mut self) {
@@ -6038,7 +6018,7 @@ mod tests {
             .apply_network_profile(EncoderNetworkProfile::DEGRADED)
             .unwrap();
 
-        assert_eq!(encoder.bitrate_bps, 32_000);
+        assert_eq!(encoder.bitrate_bps, 48_000);
         assert_eq!(encoder.dred_duration_10ms, 100);
         assert_eq!(encoder.packet_loss_percent, 3);
         assert!(encoder.inband_fec);
@@ -6346,6 +6326,251 @@ mod tests {
                         .is_ok()
             })
             .count()
+    }
+
+    /// Encodes contiguous 20 ms speech packets under `profile` and returns the
+    /// per-packet `(dred_reach_samples, payload_bytes)`. `dred_reach_samples` is
+    /// the `opus_dred_parse` return, the depth of DRED carried by each packet.
+    fn measure_dred_depth(profile: EncoderNetworkProfile) -> Vec<(usize, usize)> {
+        let mut encoder = OpusVoiceEncoder::new(profile.bitrate_bps).unwrap();
+        encoder.apply_network_profile(profile).unwrap();
+        let frames = sample_speech_frames();
+        let mut dred_decoder = DredDecoder::new().unwrap();
+        let mut packet = vec![0u8; MAX_OPUS_PACKET_BYTES];
+        let mut measurements = Vec::new();
+        for index in 0..600 {
+            let mut input = Vec::with_capacity(LIVE_OPUS_FRAME_SAMPLES);
+            while input.len() < LIVE_OPUS_FRAME_SAMPLES {
+                let frame = &frames[(index + input.len() / FRAME_SAMPLES) % frames.len()];
+                input.extend_from_slice(&normalized_to_i16_scale(frame));
+            }
+            input.truncate(LIVE_OPUS_FRAME_SAMPLES);
+            let encoded = encoder
+                .encode(&float_i16_scale_to_i16(&input), &mut packet)
+                .unwrap();
+            let mut dred_state = DredState::new().unwrap();
+            let mut dred_end = 0;
+            let parsed = dred_decoder
+                .parse(
+                    &mut dred_state,
+                    &packet[..encoded],
+                    LIVE_PLAYBACK_DRED_MAX_SAMPLES,
+                    SampleRate::Hz48000,
+                    &mut dred_end,
+                    false,
+                )
+                .unwrap_or(0);
+            measurements.push((parsed, encoded));
+        }
+        measurements
+    }
+
+    /// Diagnostic, not a pass/fail gate. Run with:
+    /// `cargo test -p tomchat dred_depth_distribution -- --ignored --nocapture`
+    /// to see how far back DRED reaches per packet across bitrates. A healthy
+    /// DRED reach should cover multiple 20 ms frames (>= 960 samples each).
+    #[test]
+    #[ignore = "diagnostic measurement, prints DRED reach distribution"]
+    fn dred_depth_distribution() {
+        let frame = LIVE_OPUS_FRAME_SAMPLES;
+        let configs = [
+            ("critical-default", EncoderNetworkProfile::CRITICAL),
+            (
+                "critical-32k",
+                EncoderNetworkProfile {
+                    bitrate_bps: 32_000,
+                    ..EncoderNetworkProfile::CRITICAL
+                },
+            ),
+            (
+                "critical-48k",
+                EncoderNetworkProfile {
+                    bitrate_bps: 48_000,
+                    ..EncoderNetworkProfile::CRITICAL
+                },
+            ),
+            (
+                "critical-64k",
+                EncoderNetworkProfile {
+                    bitrate_bps: 64_000,
+                    ..EncoderNetworkProfile::CRITICAL
+                },
+            ),
+            (
+                "awebo-64k-loss50",
+                EncoderNetworkProfile {
+                    dred_duration_10ms: 100,
+                    bitrate_bps: 64_000,
+                    packet_loss_percent: 50,
+                },
+            ),
+        ];
+        for (label, profile) in configs {
+            let measurements = measure_dred_depth(profile);
+            let mut reach: Vec<usize> = measurements.iter().map(|(parsed, _)| *parsed).collect();
+            reach.sort_unstable();
+            let median = reach[reach.len() / 2];
+            let max = *reach.last().unwrap();
+            let min = reach[0];
+            let frames_covered = |samples: usize| samples / frame;
+            let at_least = |k: usize| reach.iter().filter(|r| **r >= k * frame).count();
+            let avg_bytes =
+                measurements.iter().map(|(_, b)| *b).sum::<usize>() / measurements.len();
+            eprintln!(
+                "{label}: packets={} reach_samples[min={min} median={median} max={max}] \
+                 median_frames={} >=1f={} >=2f={} >=5f={} >=10f={} >=15f={} avg_bytes={avg_bytes}",
+                measurements.len(),
+                frames_covered(median),
+                at_least(1),
+                at_least(2),
+                at_least(5),
+                at_least(10),
+                at_least(15),
+            );
+        }
+    }
+
+    /// Encodes `count` contiguous 20 ms speech packets under `profile`, returning
+    /// the raw Opus payloads (DRED included). Sequence numbers are the indices.
+    fn encode_live_dred_packets(profile: EncoderNetworkProfile, count: usize) -> Vec<Vec<u8>> {
+        let mut encoder = OpusVoiceEncoder::new(profile.bitrate_bps).unwrap();
+        encoder.apply_network_profile(profile).unwrap();
+        let frames = sample_speech_frames();
+        let mut packet = vec![0u8; MAX_OPUS_PACKET_BYTES];
+        let mut packets = Vec::with_capacity(count);
+        for index in 0..count {
+            let mut input = Vec::with_capacity(LIVE_OPUS_FRAME_SAMPLES);
+            while input.len() < LIVE_OPUS_FRAME_SAMPLES {
+                let frame = &frames[(index + input.len() / FRAME_SAMPLES) % frames.len()];
+                input.extend_from_slice(&normalized_to_i16_scale(frame));
+            }
+            input.truncate(LIVE_OPUS_FRAME_SAMPLES);
+            let encoded = encoder
+                .encode(&float_i16_scale_to_i16(&input), &mut packet)
+                .unwrap();
+            packets.push(packet[..encoded].to_vec());
+        }
+        packets
+    }
+
+    /// Delivers every packet except `dropped`, then drains across the gap and
+    /// returns each decoded `(source, sample_count)` in playout order alongside
+    /// the stream so callers can inspect `dred_parses`.
+    fn drive_gap_recovery(
+        packets: &[Vec<u8>],
+        dropped: &[u32],
+    ) -> (Vec<(DecodedFrameSource, usize)>, LiveDecodeStream) {
+        let tuning = test_tuning();
+        let mut stream = LiveDecodeStream::new(tuning).unwrap();
+        let start = Instant::now();
+        for (index, payload) in packets.iter().enumerate() {
+            let sequence = index as u32;
+            if dropped.contains(&sequence) {
+                continue;
+            }
+            stream.insert(
+                AudioPacketRef {
+                    sequence,
+                    flags: 0,
+                    silence_ranges: 0,
+                    payload,
+                },
+                start,
+            );
+        }
+
+        let mut frame = vec![0i16; LIVE_OPUS_FRAME_SAMPLES];
+        let mut collected = Vec::new();
+        let mut trace = None;
+        // First drain plays the contiguous run up to the gap and registers the
+        // gap as pending. The second, after the reorder delay, emits the missing
+        // frames and the remainder in one pass so the gap-bounding packet is
+        // visible to DRED recovery.
+        let t1 = start + tuning.initial_buffer + Duration::from_millis(1);
+        stream.drain_ready(
+            t1,
+            start,
+            1,
+            &mut frame,
+            &mut trace,
+            |_, samples, source, _| {
+                collected.push((source, samples.len()));
+            },
+        );
+        let t2 = t1 + tuning.max_reorder_delay + Duration::from_millis(1);
+        stream.drain_ready(
+            t2,
+            start,
+            1,
+            &mut frame,
+            &mut trace,
+            |_, samples, source, _| {
+                collected.push((source, samples.len()));
+            },
+        );
+        (collected, stream)
+    }
+
+    #[test]
+    fn dred_recovers_short_gap_as_whole_frames() {
+        let packets = encode_live_dred_packets(EncoderNetworkProfile::CRITICAL, 40);
+        let (collected, _) = drive_gap_recovery(&packets, &[18, 19, 20]);
+
+        let dred = collected
+            .iter()
+            .filter(|(source, _)| matches!(source, DecodedFrameSource::Dred))
+            .count();
+        let plc = collected
+            .iter()
+            .filter(|(source, _)| matches!(source, DecodedFrameSource::Plc))
+            .count();
+        assert_eq!(dred, 3, "all three gap frames should be DRED-recovered");
+        assert_eq!(plc, 0, "deep DRED leaves no PLC fallback");
+        assert!(
+            collected
+                .iter()
+                .all(|(_, len)| *len == LIVE_OPUS_FRAME_SAMPLES),
+            "every recovered frame is a whole frame, never a splice"
+        );
+    }
+
+    #[test]
+    fn dred_parses_gap_bounding_packet_once() {
+        let packets = encode_live_dred_packets(EncoderNetworkProfile::CRITICAL, 40);
+        let (_, stream) = drive_gap_recovery(&packets, &[18, 19, 20]);
+        assert_eq!(
+            stream.dred_parses, 1,
+            "a three-frame gap shares one DRED parse, not one per missing frame"
+        );
+    }
+
+    #[test]
+    fn gap_beyond_dred_reach_falls_back_to_whole_plc_frames() {
+        // 32 kbps starves DRED below one frame of reach, so every gap frame must
+        // fall back to a full PLC frame rather than a partial DRED splice.
+        let starved = EncoderNetworkProfile {
+            bitrate_bps: 32_000,
+            ..EncoderNetworkProfile::CRITICAL
+        };
+        let packets = encode_live_dred_packets(starved, 40);
+        let (collected, stream) = drive_gap_recovery(&packets, &[18, 19, 20]);
+
+        let plc = collected
+            .iter()
+            .filter(|(source, _)| matches!(source, DecodedFrameSource::Plc))
+            .count();
+        let dred = collected
+            .iter()
+            .filter(|(source, _)| matches!(source, DecodedFrameSource::Dred))
+            .count();
+        assert_eq!(plc, 3, "out-of-reach gap frames use PLC");
+        assert_eq!(dred, 0, "no frame is partially recovered");
+        assert_eq!(stream.dred_parses, 1, "the gap is still parsed once");
+        assert!(
+            collected
+                .iter()
+                .all(|(_, len)| *len == LIVE_OPUS_FRAME_SAMPLES)
+        );
     }
 
     #[test]
@@ -7048,7 +7273,7 @@ mod tests {
             "\"event\":\"dred_decode\"",
             "\"event\":\"mixer_queue\"",
             "\"event\":\"output_window\"",
-            "\"status\":\"partial\"",
+            "\"status\":\"recovered\"",
         ] {
             assert!(trace.contains(event), "missing {event} in\n{trace}");
         }
