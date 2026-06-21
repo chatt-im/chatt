@@ -1387,6 +1387,7 @@ impl App {
             "/undeafen" => self.set_deafen(false),
             "/muted" => self.show_mute_status(),
             "/deafened" => self.show_deafen_status(),
+            "/audio" => self.show_audio_status(),
             "/clear" => self.chat.clear(),
             "/config" | "/settings" => self.open_settings(),
             "/users" => self.show_users(),
@@ -1455,6 +1456,26 @@ impl App {
         } else {
             "not deafened"
         });
+    }
+
+    fn show_audio_status(&mut self) {
+        let Some(playback) = &self.playback else {
+            self.set_status("audio inactive");
+            return;
+        };
+        let stats = playback.stats();
+        self.set_status(format!(
+            "audio q{}ms target{}ms speed{:+.1}% dred{} plc{} trims{} underruns{} rx {}/{}",
+            stats.max_queue_ms,
+            stats.adaptive_target_ms,
+            stats.correction_percent,
+            stats.dred_recoveries,
+            stats.plc_fallbacks,
+            stats.hard_trim_count,
+            stats.underrun_count,
+            self.voice_packets_received,
+            format_bytes_compact(self.voice_bytes_received),
+        ));
     }
 
     fn show_users(&mut self) {
@@ -1709,6 +1730,18 @@ fn format_signed_db(value_db: f32) -> String {
 
 fn volume_db_label(value_db: f32) -> String {
     format!("{}dB", format_signed_db(value_db))
+}
+
+fn format_bytes_compact(bytes: u64) -> String {
+    const KB: u64 = 1024;
+    const MB: u64 = 1024 * KB;
+    if bytes >= MB {
+        format!("{:.1}MB", bytes as f64 / MB as f64)
+    } else if bytes >= KB {
+        format!("{:.1}KB", bytes as f64 / KB as f64)
+    } else {
+        format!("{bytes}B")
+    }
 }
 
 impl Drop for App {

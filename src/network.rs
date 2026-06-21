@@ -409,24 +409,29 @@ impl TelemetryWindow {
 pub(crate) struct EncoderNetworkProfile {
     pub dred_duration_10ms: i32,
     pub bitrate_bps: i32,
+    pub packet_loss_percent: i32,
 }
 
 impl EncoderNetworkProfile {
     pub(crate) const EXCELLENT: Self = Self {
         dred_duration_10ms: 0,
         bitrate_bps: 32_000,
+        packet_loss_percent: 0,
     };
     pub(crate) const DEGRADED: Self = Self {
         dred_duration_10ms: 20,
         bitrate_bps: 24_000,
+        packet_loss_percent: 3,
     };
     pub(crate) const SEVERE: Self = Self {
         dred_duration_10ms: 50,
         bitrate_bps: 16_000,
+        packet_loss_percent: 10,
     };
     pub(crate) const CRITICAL: Self = Self {
         dred_duration_10ms: 100,
         bitrate_bps: 12_000,
+        packet_loss_percent: 20,
     };
 }
 

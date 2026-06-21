@@ -17,7 +17,12 @@ use cpal::{
     SupportedStreamConfig, traits::DeviceTrait, traits::HostTrait, traits::StreamTrait,
 };
 use nnnoiseless::DenoiseState;
-use opus_codec::{Channels, Complexity, Decoder, SampleRate};
+use opus_codec::{Channels, Complexity, Decoder, DredDecoder, DredState, SampleRate};
+use rubato::{
+    Async, FixedAsync, Indexing, Resampler, SincInterpolationParameters, SincInterpolationType,
+    WindowFunction,
+    audioadapter::{Adapter, AdapterMut},
+};
 
 use crate::network::{
     AudioPacketRef, EncoderNetworkProfile, EncoderNetworkTuning, InsertOutcome, JitterBuffer,
@@ -30,10 +35,20 @@ pub const CHANNELS: u8 = 1;
 pub const FRAME_SAMPLES: usize = DenoiseState::FRAME_SIZE;
 const CALLBACK_QUEUE_CAPACITY: usize = 8;
 const LIVE_PLAYBACK_COMMAND_CAPACITY: usize = 256;
-const LIVE_PLAYBACK_MAX_QUEUED_SAMPLES_PER_STREAM: usize = SAMPLE_RATE as usize;
+const LIVE_PLAYBACK_TARGET_QUEUE: Duration = Duration::from_millis(60);
+const LIVE_PLAYBACK_MODERATE_LOSS_QUEUE: Duration = Duration::from_millis(320);
+const LIVE_PLAYBACK_DRED_HORIZON: Duration = Duration::from_millis(1_000);
+const LIVE_PLAYBACK_HARD_QUEUE_BOUND: Duration = Duration::from_millis(1_500);
+const LIVE_PLAYBACK_LOSS_WINDOW: Duration = Duration::from_secs(5);
+const LIVE_PLAYBACK_LOSS_HOLD: Duration = Duration::from_secs(5);
+const LIVE_PLAYBACK_SEVERE_LOSS_HOLD: Duration = Duration::from_secs(10);
 const LIVE_PLAYBACK_INITIAL_BUFFER: Duration = Duration::from_millis(40);
 const LIVE_PLAYBACK_DRAIN_INTERVAL: Duration = Duration::from_millis(10);
 const LIVE_PLAYBACK_MAX_REORDER_DELAY: Duration = Duration::from_millis(60);
+const LIVE_PLAYBACK_RESAMPLER_CHUNK: usize = 240;
+const LIVE_PLAYBACK_MAX_SPEED_UP: f64 = 0.15;
+const LIVE_PLAYBACK_MAX_RESAMPLE_RATIO_RELATIVE: f64 = 1.20;
+const LIVE_PLAYBACK_DRED_MAX_SAMPLES: usize = SAMPLE_RATE as usize;
 const MAX_OPUS_DECODE_SAMPLES: usize = 5_760;
 const MAX_OPUS_PACKET_BYTES: usize = 1_500;
 
@@ -152,6 +167,8 @@ struct OpusVoiceEncoder {
     encoder: NonNull<opus_codec::OpusEncoder>,
     bitrate_bps: i32,
     dred_duration_10ms: i32,
+    packet_loss_percent: i32,
+    inband_fec: bool,
 }
 
 unsafe impl Send for OpusVoiceEncoder {}
@@ -177,12 +194,16 @@ impl OpusVoiceEncoder {
             encoder,
             bitrate_bps,
             dred_duration_10ms: 0,
+            packet_loss_percent: 0,
+            inband_fec: false,
         };
         this.set_bitrate(bitrate_bps)?;
         this.set_vbr(true)?;
         this.set_signal_voice()?;
         this.set_complexity(Complexity::new(5))?;
         this.set_dred_duration_10ms(0)?;
+        this.set_inband_fec(false)?;
+        this.set_packet_loss_percent(0)?;
         Ok(this)
     }
 
@@ -255,6 +276,27 @@ impl OpusVoiceEncoder {
         Ok(())
     }
 
+    fn set_inband_fec(&mut self, enabled: bool) -> Result<(), String> {
+        self.control(
+            opus_codec::OPUS_SET_INBAND_FEC_REQUEST,
+            i32::from(enabled),
+            "failed to set opus in-band FEC",
+        )?;
+        self.inband_fec = enabled;
+        Ok(())
+    }
+
+    fn set_packet_loss_percent(&mut self, percent: i32) -> Result<(), String> {
+        let percent = percent.clamp(0, 100);
+        self.control(
+            opus_codec::OPUS_SET_PACKET_LOSS_PERC_REQUEST,
+            percent,
+            "failed to set opus expected packet loss",
+        )?;
+        self.packet_loss_percent = percent;
+        Ok(())
+    }
+
     fn control(&mut self, request: u32, value: i32, context: &str) -> Result<(), String> {
         let result =
             unsafe { opus_codec::opus_encoder_ctl(self.encoder.as_ptr(), request as i32, value) };
@@ -270,7 +312,9 @@ impl EncoderNetworkTuning for OpusVoiceEncoder {
 
     fn apply_network_profile(&mut self, profile: EncoderNetworkProfile) -> Result<(), Self::Error> {
         self.set_bitrate(profile.bitrate_bps)?;
-        self.set_dred_duration_10ms(profile.dred_duration_10ms)
+        self.set_dred_duration_10ms(profile.dred_duration_10ms)?;
+        self.set_inband_fec(profile.dred_duration_10ms > 0)?;
+        self.set_packet_loss_percent(profile.packet_loss_percent)
     }
 }
 
@@ -354,6 +398,13 @@ impl LivePlayback {
         self.mixer
             .lock()
             .map(|mixer| mixer.queued_samples())
+            .unwrap_or_default()
+    }
+
+    pub fn stats(&self) -> LivePlaybackSnapshot {
+        self.mixer
+            .lock()
+            .map(|mixer| mixer.snapshot())
             .unwrap_or_default()
     }
 
@@ -449,6 +500,23 @@ pub struct StatsSnapshot {
 #[derive(Clone)]
 pub struct PlaybackStats {
     inner: Arc<SharedPlaybackStats>,
+}
+
+#[derive(Debug, Default, Clone)]
+pub struct LivePlaybackSnapshot {
+    pub active_streams: usize,
+    pub queued_samples: usize,
+    pub max_queue_ms: u64,
+    pub target_queue_ms: u64,
+    pub adaptive_target_ms: u64,
+    pub correction_percent: f32,
+    pub correction_count: u64,
+    pub hard_trim_count: u64,
+    pub underrun_count: u64,
+    pub dred_recoveries: u64,
+    pub plc_fallbacks: u64,
+    pub decode_errors: u64,
+    pub resampler_errors: u64,
 }
 
 impl PlaybackStats {
@@ -1338,9 +1406,10 @@ fn live_playback_callback<T>(
         return;
     };
 
+    let now = Instant::now();
     for frame in output.chunks_mut(channels.max(1)) {
-        let sample = mixer.pop_mixed_sample();
-        let output_sample = T::from_sample((sample as f32 / 32768.0).clamp(-1.0, 1.0));
+        let sample = mixer.pop_mixed_sample(now);
+        let output_sample = T::from_sample(sample.clamp(-1.0, 1.0));
         for channel in frame {
             *channel = output_sample;
         }
@@ -1729,17 +1798,26 @@ fn drain_live_decode_streams(
     now: Instant,
 ) {
     for (stream_id, stream) in streams {
-        stream.drain_ready(now, frame, |samples| {
+        stream.drain_ready(now, frame, |samples, source| {
             if let Ok(mut mixer) = mixer.lock() {
-                mixer.queue_stream_samples(*stream_id, samples);
+                mixer.queue_stream_samples(*stream_id, samples, source, now);
             }
         });
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DecodedFrameSource {
+    Normal,
+    Dred,
+    Plc,
+    DecodeError,
+}
+
 struct LiveDecodeStream {
     jitter: LiveJitterStream,
     decoder: Decoder,
+    dred_decoder: Option<DredDecoder>,
 }
 
 impl LiveDecodeStream {
@@ -1748,6 +1826,7 @@ impl LiveDecodeStream {
             jitter: LiveJitterStream::new(),
             decoder: Decoder::new(SampleRate::Hz48000, Channels::Mono)
                 .map_err(|error| error.to_string())?,
+            dred_decoder: DredDecoder::new().ok(),
         })
     }
 
@@ -1755,15 +1834,38 @@ impl LiveDecodeStream {
         self.jitter.insert(packet, now)
     }
 
-    fn drain_ready(&mut self, now: Instant, frame: &mut [i16], mut on_samples: impl FnMut(&[i16])) {
-        for item in self.jitter.drain_ready(now) {
+    fn drain_ready(
+        &mut self,
+        now: Instant,
+        frame: &mut [i16],
+        mut on_samples: impl FnMut(&[f32], DecodedFrameSource),
+    ) {
+        let items = self.jitter.drain_ready(now);
+        for (index, item) in items.iter().enumerate() {
             match item {
                 PlayoutItem::Audio { payload, .. } => {
-                    self.decode_playout(&payload, frame, &mut on_samples);
+                    self.decode_playout(
+                        payload,
+                        frame,
+                        DecodedFrameSource::Normal,
+                        &mut on_samples,
+                    );
                 }
-                PlayoutItem::Missing { .. } => {
+                PlayoutItem::Missing { sequence } => {
                     let plc_samples = FRAME_SAMPLES.min(frame.len());
-                    self.decode_playout(&[], &mut frame[..plc_samples], &mut on_samples);
+                    if !self.decode_dred(
+                        *sequence,
+                        &items[index + 1..],
+                        &mut frame[..plc_samples],
+                        &mut on_samples,
+                    ) {
+                        self.decode_playout(
+                            &[],
+                            &mut frame[..plc_samples],
+                            DecodedFrameSource::Plc,
+                            &mut on_samples,
+                        );
+                    }
                 }
                 PlayoutItem::FastForward { .. } => {}
             }
@@ -1774,12 +1876,85 @@ impl LiveDecodeStream {
         &mut self,
         payload: &[u8],
         frame: &mut [i16],
-        on_samples: &mut impl FnMut(&[i16]),
+        source: DecodedFrameSource,
+        on_samples: &mut impl FnMut(&[f32], DecodedFrameSource),
     ) {
-        match self.decoder.decode(payload, frame, false) {
-            Ok(decoded) => on_samples(&frame[..decoded]),
-            Err(error) => eprintln!("failed to decode live opus packet: {error}"),
+        let mut float_frame = vec![0.0f32; frame.len()];
+        match self.decoder.decode_float(payload, &mut float_frame, false) {
+            Ok(decoded) => on_samples(&float_frame[..decoded], source),
+            Err(error) => {
+                eprintln!("failed to decode live opus packet: {error}");
+                on_samples(&[], DecodedFrameSource::DecodeError);
+            }
         }
+    }
+
+    fn decode_dred(
+        &mut self,
+        missing_sequence: u32,
+        future_items: &[PlayoutItem],
+        frame: &mut [i16],
+        on_samples: &mut impl FnMut(&[f32], DecodedFrameSource),
+    ) -> bool {
+        let Some(dred_decoder) = self.dred_decoder.as_mut() else {
+            return false;
+        };
+
+        let mut float_frame = vec![0.0f32; frame.len()];
+        for item in future_items {
+            let PlayoutItem::Audio { sequence, payload } = item else {
+                continue;
+            };
+            let Some(distance) = sequence_distance_forward(missing_sequence, *sequence) else {
+                continue;
+            };
+            if distance == 0 {
+                continue;
+            }
+            let Some(offset_samples) = distance.checked_mul(FRAME_SAMPLES as u32) else {
+                continue;
+            };
+            if offset_samples as usize > LIVE_PLAYBACK_DRED_MAX_SAMPLES {
+                continue;
+            }
+
+            let Ok(mut dred_state) = DredState::new() else {
+                return false;
+            };
+            let mut dred_end = 0;
+            let parsed = dred_decoder
+                .parse(
+                    &mut dred_state,
+                    payload,
+                    LIVE_PLAYBACK_DRED_MAX_SAMPLES,
+                    SampleRate::Hz48000,
+                    &mut dred_end,
+                    false,
+                )
+                .unwrap_or(0);
+            if parsed == 0 {
+                continue;
+            }
+
+            let Ok(offset_samples) = i32::try_from(offset_samples) else {
+                continue;
+            };
+            match dred_decoder.decode_into_f32(
+                &mut self.decoder,
+                &dred_state,
+                offset_samples,
+                &mut float_frame,
+            ) {
+                Ok(decoded) if decoded > 0 => {
+                    on_samples(&float_frame[..decoded], DecodedFrameSource::Dred);
+                    return true;
+                }
+                Ok(_) => {}
+                Err(_) => {}
+            }
+        }
+
+        false
     }
 }
 
@@ -1826,10 +2001,30 @@ impl LiveJitterStream {
     }
 }
 
+const LIVE_PLAYBACK_INTERPOLATION: SincInterpolationParameters = SincInterpolationParameters {
+    sinc_len: 256,
+    f_cutoff: 0.95,
+    oversampling_factor: 128,
+    interpolation: SincInterpolationType::Cubic,
+    window: WindowFunction::BlackmanHarris,
+};
+
 #[derive(Default)]
 struct LivePlaybackMixer {
-    streams: HashMap<u32, VecDeque<i16>>,
+    streams: HashMap<u32, AdaptivePlaybackStream>,
     controls: HashMap<u32, PlaybackStreamControl>,
+    stats: LivePlaybackMixerStats,
+}
+
+#[derive(Default)]
+struct LivePlaybackMixerStats {
+    correction_count: u64,
+    hard_trim_count: u64,
+    underrun_count: u64,
+    dred_recoveries: u64,
+    plc_fallbacks: u64,
+    decode_errors: u64,
+    resampler_errors: u64,
 }
 
 impl LivePlaybackMixer {
@@ -1837,23 +2032,45 @@ impl LivePlaybackMixer {
         Self::default()
     }
 
-    fn queue_stream_samples(&mut self, stream_id: u32, samples: &[i16]) {
+    fn queue_stream_samples(
+        &mut self,
+        stream_id: u32,
+        samples: &[f32],
+        source: DecodedFrameSource,
+        now: Instant,
+    ) {
+        match source {
+            DecodedFrameSource::Normal => {}
+            DecodedFrameSource::Dred => {
+                self.stats.dred_recoveries = self.stats.dred_recoveries.saturating_add(1)
+            }
+            DecodedFrameSource::Plc => {
+                self.stats.plc_fallbacks = self.stats.plc_fallbacks.saturating_add(1);
+            }
+            DecodedFrameSource::DecodeError => {
+                self.stats.decode_errors = self.stats.decode_errors.saturating_add(1);
+                return;
+            }
+        }
+
         if samples.is_empty() {
             return;
         }
 
-        let queue = self
-            .streams
-            .entry(stream_id)
-            .or_insert_with(|| VecDeque::with_capacity(FRAME_SAMPLES * 4));
-        queue.extend(samples.iter().copied());
-
-        let overflow = queue
-            .len()
-            .saturating_sub(LIVE_PLAYBACK_MAX_QUEUED_SAMPLES_PER_STREAM);
-        if overflow > 0 {
-            queue.drain(..overflow);
-        }
+        let stream = match self.streams.entry(stream_id) {
+            std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                match AdaptivePlaybackStream::new() {
+                    Ok(stream) => entry.insert(stream),
+                    Err(error) => {
+                        self.stats.resampler_errors = self.stats.resampler_errors.saturating_add(1);
+                        eprintln!("failed to create live playback resampler: {error}");
+                        return;
+                    }
+                }
+            }
+        };
+        stream.queue_samples(samples, source, now, &mut self.stats);
     }
 
     fn remove_stream(&mut self, stream_id: u32) {
@@ -1870,16 +2087,58 @@ impl LivePlaybackMixer {
     }
 
     fn queued_samples(&self) -> usize {
-        self.streams.values().map(VecDeque::len).sum()
+        self.streams
+            .values()
+            .map(AdaptivePlaybackStream::queued_samples)
+            .sum()
     }
 
-    fn pop_mixed_sample(&mut self) -> i16 {
+    fn snapshot(&self) -> LivePlaybackSnapshot {
+        let now = Instant::now();
+        let queued_samples = self.queued_samples();
+        let max_queue_samples = self
+            .streams
+            .values()
+            .map(AdaptivePlaybackStream::queued_samples)
+            .max()
+            .unwrap_or_default();
+        let adaptive_target = self
+            .streams
+            .values()
+            .map(|stream| stream.adaptive_target_samples(now))
+            .max()
+            .unwrap_or_else(target_queue_samples);
+        let correction_percent = self
+            .streams
+            .values()
+            .map(|stream| stream.current_correction_percent)
+            .max_by(|a, b| a.abs().total_cmp(&b.abs()))
+            .unwrap_or_default();
+
+        LivePlaybackSnapshot {
+            active_streams: self.streams.len(),
+            queued_samples,
+            max_queue_ms: samples_to_ms(max_queue_samples),
+            target_queue_ms: duration_to_ms(LIVE_PLAYBACK_TARGET_QUEUE),
+            adaptive_target_ms: samples_to_ms(adaptive_target),
+            correction_percent,
+            correction_count: self.stats.correction_count,
+            hard_trim_count: self.stats.hard_trim_count,
+            underrun_count: self.stats.underrun_count,
+            dred_recoveries: self.stats.dred_recoveries,
+            plc_fallbacks: self.stats.plc_fallbacks,
+            decode_errors: self.stats.decode_errors,
+            resampler_errors: self.stats.resampler_errors,
+        }
+    }
+
+    fn pop_mixed_sample(&mut self, now: Instant) -> f32 {
         let mut active = 0usize;
-        let mut only_sample = 0i16;
+        let mut only_sample = 0.0f32;
         let mut sum = 0.0f32;
 
-        for (stream_id, queue) in self.streams.iter_mut() {
-            let Some(sample) = queue.pop_front() else {
+        for (stream_id, stream) in self.streams.iter_mut() {
+            let Some(sample) = stream.pop_sample(now, &mut self.stats) else {
                 continue;
             };
             let control = self.controls.get(stream_id).copied().unwrap_or_default();
@@ -1888,15 +2147,346 @@ impl LivePlaybackMixer {
             }
             let gain = db_to_gain(control.volume_db);
             active += 1;
-            only_sample = apply_sample_gain(sample, gain);
-            sum += (sample as f32 / 32768.0) * gain;
+            only_sample = (sample * gain).clamp(-1.0, 1.0);
+            sum += sample * gain;
         }
 
         match active {
-            0 => 0,
+            0 => 0.0,
             1 => only_sample,
-            _ => normalized_to_pcm_i16(soft_limit(sum / (active as f32).sqrt())),
+            _ => soft_limit(sum / (active as f32).sqrt()),
         }
+    }
+}
+
+struct AdaptivePlaybackStream {
+    input: MonoSampleQueue,
+    output: VecDeque<f32>,
+    resampler_output: MonoResamplerOutput,
+    resampler: Async<f32>,
+    output_delay_to_drop: usize,
+    current_ratio: f64,
+    current_correction_percent: f32,
+    recent_loss_events: VecDeque<Instant>,
+    expanded_target_samples: usize,
+    expanded_target_until: Option<Instant>,
+}
+
+impl AdaptivePlaybackStream {
+    fn new() -> Result<Self, String> {
+        let resampler = Async::<f32>::new_sinc(
+            1.0,
+            LIVE_PLAYBACK_MAX_RESAMPLE_RATIO_RELATIVE,
+            &LIVE_PLAYBACK_INTERPOLATION,
+            LIVE_PLAYBACK_RESAMPLER_CHUNK,
+            1,
+            FixedAsync::Output,
+        )
+        .map_err(|error| error.to_string())?;
+        let output_delay_to_drop = resampler.output_delay();
+        let output_frames = resampler
+            .output_frames_max()
+            .max(LIVE_PLAYBACK_RESAMPLER_CHUNK);
+
+        Ok(Self {
+            input: MonoSampleQueue::new(),
+            output: VecDeque::with_capacity(output_frames * 2),
+            resampler_output: MonoResamplerOutput::new(output_frames),
+            resampler,
+            output_delay_to_drop,
+            current_ratio: 1.0,
+            current_correction_percent: 0.0,
+            recent_loss_events: VecDeque::new(),
+            expanded_target_samples: target_queue_samples(),
+            expanded_target_until: None,
+        })
+    }
+
+    fn queue_samples(
+        &mut self,
+        samples: &[f32],
+        source: DecodedFrameSource,
+        now: Instant,
+        stats: &mut LivePlaybackMixerStats,
+    ) {
+        if matches!(source, DecodedFrameSource::Dred | DecodedFrameSource::Plc) {
+            self.note_loss(now);
+        }
+        self.input.push_back(samples);
+        self.enforce_hard_bound(now, stats);
+    }
+
+    fn pop_sample(&mut self, now: Instant, stats: &mut LivePlaybackMixerStats) -> Option<f32> {
+        if self.output.is_empty() {
+            self.refill_output(now, stats);
+        }
+        let sample = self.output.pop_front();
+        if sample.is_none() {
+            stats.underrun_count = stats.underrun_count.saturating_add(1);
+        }
+        sample
+    }
+
+    fn refill_output(&mut self, now: Instant, stats: &mut LivePlaybackMixerStats) {
+        if self.input.frames() == 0 {
+            return;
+        }
+
+        self.update_resample_ratio(now, stats);
+        let input_frames_next = self.resampler.input_frames_next();
+        let partial_len = self.input.frames().min(input_frames_next);
+        let indexing = (partial_len < input_frames_next).then_some(Indexing {
+            input_offset: 0,
+            output_offset: 0,
+            active_channels_mask: None,
+            partial_len: Some(partial_len),
+        });
+
+        match self.resampler.process_into_buffer(
+            &self.input,
+            &mut self.resampler_output,
+            indexing.as_ref(),
+        ) {
+            Ok((consumed, generated)) => {
+                self.input.drain_samples(consumed);
+                self.resampler_output.drain_generated(
+                    generated,
+                    &mut self.output,
+                    &mut self.output_delay_to_drop,
+                );
+                if indexing.is_some() {
+                    self.output_delay_to_drop = self.resampler.output_delay();
+                }
+            }
+            Err(error) => {
+                stats.resampler_errors = stats.resampler_errors.saturating_add(1);
+                eprintln!("live playback resampler error: {error}");
+            }
+        }
+    }
+
+    fn update_resample_ratio(&mut self, now: Instant, stats: &mut LivePlaybackMixerStats) {
+        let correction = self.desired_correction(now);
+        let ratio = ratio_for_correction(correction);
+        if (ratio - self.current_ratio).abs() < 0.002 {
+            self.current_correction_percent = (correction * 100.0) as f32;
+            return;
+        }
+
+        match self.resampler.set_resample_ratio_relative(ratio, true) {
+            Ok(()) => {
+                self.current_ratio = ratio;
+                self.current_correction_percent = (correction * 100.0) as f32;
+                stats.correction_count = stats.correction_count.saturating_add(1);
+            }
+            Err(error) => {
+                stats.resampler_errors = stats.resampler_errors.saturating_add(1);
+                eprintln!("failed to update live playback ratio: {error}");
+            }
+        }
+    }
+
+    fn desired_correction(&self, now: Instant) -> f64 {
+        let queued = self.queued_samples();
+        let target = target_queue_samples();
+        if queued < target {
+            return 0.0;
+        }
+
+        let catchup_target = self.adaptive_target_samples(now).max(target);
+        if queued <= catchup_target {
+            return 0.0;
+        }
+
+        let hard_bound = samples_for_duration(LIVE_PLAYBACK_HARD_QUEUE_BOUND);
+        let range = hard_bound.saturating_sub(catchup_target).max(1) as f64;
+        let over = queued.saturating_sub(catchup_target) as f64;
+        (LIVE_PLAYBACK_MAX_SPEED_UP * (over / range)).min(LIVE_PLAYBACK_MAX_SPEED_UP)
+    }
+
+    fn note_loss(&mut self, now: Instant) {
+        if self.expanded_target_until.is_none_or(|until| now >= until) {
+            self.expanded_target_samples = target_queue_samples();
+        }
+        while self
+            .recent_loss_events
+            .front()
+            .is_some_and(|event| now.saturating_duration_since(*event) > LIVE_PLAYBACK_LOSS_WINDOW)
+        {
+            self.recent_loss_events.pop_front();
+        }
+        self.recent_loss_events.push_back(now);
+
+        let (target, hold) = if self.recent_loss_events.len() >= 8 {
+            (
+                samples_for_duration(LIVE_PLAYBACK_DRED_HORIZON),
+                LIVE_PLAYBACK_SEVERE_LOSS_HOLD,
+            )
+        } else {
+            (
+                samples_for_duration(LIVE_PLAYBACK_MODERATE_LOSS_QUEUE),
+                LIVE_PLAYBACK_LOSS_HOLD,
+            )
+        };
+        self.expanded_target_samples = self.expanded_target_samples.max(target);
+        self.expanded_target_until = Some(now + hold);
+    }
+
+    fn adaptive_target_samples(&self, now: Instant) -> usize {
+        if self.expanded_target_until.is_some_and(|until| now < until) {
+            self.expanded_target_samples.max(target_queue_samples())
+        } else {
+            target_queue_samples()
+        }
+    }
+
+    fn enforce_hard_bound(&mut self, now: Instant, stats: &mut LivePlaybackMixerStats) {
+        let hard_bound = samples_for_duration(LIVE_PLAYBACK_HARD_QUEUE_BOUND);
+        let queued = self.queued_samples();
+        if queued <= hard_bound {
+            return;
+        }
+
+        let trim_to = self
+            .adaptive_target_samples(now)
+            .max(samples_for_duration(LIVE_PLAYBACK_DRED_HORIZON));
+        let drop = queued.saturating_sub(trim_to);
+        self.drop_oldest(drop);
+        stats.hard_trim_count = stats.hard_trim_count.saturating_add(1);
+        kvlog::warn!(
+            "live playback queue hard-trim",
+            queued_ms = samples_to_ms(queued),
+            trim_to_ms = samples_to_ms(trim_to),
+            correction_percent = self.current_correction_percent
+        );
+    }
+
+    fn drop_oldest(&mut self, mut samples: usize) {
+        let output_drop = samples.min(self.output.len());
+        self.output.drain(..output_drop);
+        samples -= output_drop;
+        self.input.drain_samples(samples);
+    }
+
+    fn queued_samples(&self) -> usize {
+        self.input.frames() + self.output.len()
+    }
+}
+
+#[derive(Default)]
+struct MonoSampleQueue {
+    samples: VecDeque<f32>,
+}
+
+impl MonoSampleQueue {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    fn push_back(&mut self, samples: &[f32]) {
+        self.samples.extend(samples.iter().copied());
+    }
+
+    fn drain_samples(&mut self, samples: usize) {
+        let drain = samples.min(self.samples.len());
+        self.samples.drain(..drain);
+    }
+}
+
+unsafe impl Adapter<'_, f32> for MonoSampleQueue {
+    unsafe fn read_sample_unchecked(&self, channel: usize, frame: usize) -> f32 {
+        if channel != 0 {
+            return 0.0;
+        }
+        self.samples.get(frame).copied().unwrap_or_default()
+    }
+
+    fn channels(&self) -> usize {
+        1
+    }
+
+    fn frames(&self) -> usize {
+        self.samples.len()
+    }
+}
+
+struct MonoResamplerOutput {
+    samples: Vec<f32>,
+}
+
+impl MonoResamplerOutput {
+    fn new(frames: usize) -> Self {
+        Self {
+            samples: vec![0.0; frames],
+        }
+    }
+
+    fn drain_generated(
+        &mut self,
+        generated: usize,
+        output: &mut VecDeque<f32>,
+        delay_to_drop: &mut usize,
+    ) {
+        let generated = generated.min(self.samples.len());
+        let drop = (*delay_to_drop).min(generated);
+        *delay_to_drop -= drop;
+        output.extend(self.samples[drop..generated].iter().copied());
+    }
+}
+
+unsafe impl AdapterMut<'_, f32> for MonoResamplerOutput {
+    unsafe fn write_sample_unchecked(&mut self, channel: usize, frame: usize, value: &f32) -> bool {
+        if channel == 0 && frame < self.samples.len() {
+            self.samples[frame] = *value;
+        }
+        false
+    }
+}
+
+unsafe impl Adapter<'_, f32> for MonoResamplerOutput {
+    unsafe fn read_sample_unchecked(&self, channel: usize, frame: usize) -> f32 {
+        if channel != 0 {
+            return 0.0;
+        }
+        self.samples.get(frame).copied().unwrap_or_default()
+    }
+
+    fn channels(&self) -> usize {
+        1
+    }
+
+    fn frames(&self) -> usize {
+        self.samples.len()
+    }
+}
+
+fn target_queue_samples() -> usize {
+    samples_for_duration(LIVE_PLAYBACK_TARGET_QUEUE)
+}
+
+fn samples_for_duration(duration: Duration) -> usize {
+    (duration.as_secs_f64() * SAMPLE_RATE as f64).round() as usize
+}
+
+fn samples_to_ms(samples: usize) -> u64 {
+    ((samples as f64 / SAMPLE_RATE as f64) * 1_000.0).round() as u64
+}
+
+fn duration_to_ms(duration: Duration) -> u64 {
+    duration.as_millis().min(u128::from(u64::MAX)) as u64
+}
+
+fn ratio_for_correction(correction: f64) -> f64 {
+    let correction = correction.clamp(0.0, LIVE_PLAYBACK_MAX_SPEED_UP);
+    1.0 / (1.0 + correction)
+}
+
+fn sequence_distance_forward(from: u32, to: u32) -> Option<u32> {
+    let distance = to.wrapping_sub(from);
+    if distance < (1 << 31) {
+        Some(distance)
+    } else {
+        None
     }
 }
 
@@ -1905,14 +2495,6 @@ fn db_to_gain(db: f32) -> f32 {
         1.0
     } else {
         10.0_f32.powf(db / 20.0)
-    }
-}
-
-fn apply_sample_gain(sample: i16, gain: f32) -> i16 {
-    if gain == 1.0 {
-        sample
-    } else {
-        normalized_to_pcm_i16((sample as f32 / 32768.0) * gain)
     }
 }
 
@@ -1927,12 +2509,6 @@ fn soft_limit(sample: f32) -> f32 {
     let excess = magnitude - THRESHOLD;
     let limited = THRESHOLD + headroom * (excess / (excess + headroom));
     sample.signum() * limited.min(1.0)
-}
-
-fn normalized_to_pcm_i16(sample: f32) -> i16 {
-    (sample.clamp(-1.0, 1.0) * i16::MAX as f32)
-        .round()
-        .clamp(i16::MIN as f32, i16::MAX as f32) as i16
 }
 
 struct DecodedPacketLog {
@@ -2111,6 +2687,8 @@ mod tests {
 
         assert_eq!(encoder.bitrate_bps, 24_000);
         assert_eq!(encoder.dred_duration_10ms, 20);
+        assert_eq!(encoder.packet_loss_percent, 3);
+        assert!(encoder.inband_fec);
 
         let input = vec![0i16; FRAME_SAMPLES];
         let mut output = vec![0u8; MAX_OPUS_PACKET_BYTES];
@@ -2233,7 +2811,7 @@ mod tests {
             stream.insert(test_audio_packet(0, &packet_0), start),
             InsertOutcome::Accepted
         );
-        stream.drain_ready(first_playout, &mut frame, |samples| {
+        stream.drain_ready(first_playout, &mut frame, |samples, _source| {
             decoded.extend_from_slice(samples);
         });
         assert_eq!(decoded.len(), FRAME_SAMPLES);
@@ -2243,7 +2821,7 @@ mod tests {
             stream.insert(test_audio_packet(2, &packet_2), gap_seen),
             InsertOutcome::Accepted
         );
-        stream.drain_ready(gap_seen, &mut frame, |samples| {
+        stream.drain_ready(gap_seen, &mut frame, |samples, _source| {
             decoded.extend_from_slice(samples);
         });
         assert!(decoded.is_empty());
@@ -2251,7 +2829,7 @@ mod tests {
         stream.drain_ready(
             gap_seen + LIVE_PLAYBACK_MAX_REORDER_DELAY,
             &mut frame,
-            |samples| {
+            |samples, _source| {
                 decoded.extend_from_slice(samples);
             },
         );
@@ -2259,46 +2837,158 @@ mod tests {
     }
 
     #[test]
-    fn mixer_preserves_single_stream_and_mixes_concurrent_streams_with_headroom() {
+    fn adaptive_stream_keeps_sixty_ms_target_under_good_conditions() {
+        let now = Instant::now();
+        let mut stream = AdaptivePlaybackStream::new().unwrap();
+        stream
+            .input
+            .push_back(&vec![0.0; samples_for_duration(LIVE_PLAYBACK_TARGET_QUEUE)]);
+
+        assert_eq!(stream.adaptive_target_samples(now), target_queue_samples());
+        assert!(stream.desired_correction(now).abs() < 0.000_001);
+    }
+
+    #[test]
+    fn adaptive_stream_does_not_slow_down_below_target_and_caps_catchup_speed() {
+        let now = Instant::now();
+        let mut stream = AdaptivePlaybackStream::new().unwrap();
+        stream
+            .input
+            .push_back(&vec![0.0; samples_for_duration(Duration::from_millis(20))]);
+
+        assert_eq!(stream.desired_correction(now), 0.0);
+
+        stream.input.push_back(&vec![
+            0.0;
+            samples_for_duration(LIVE_PLAYBACK_HARD_QUEUE_BOUND)
+        ]);
+        let correction = stream.desired_correction(now);
+
+        assert!(correction > 0.14);
+        assert!(correction <= LIVE_PLAYBACK_MAX_SPEED_UP);
+    }
+
+    #[test]
+    fn adaptive_stream_expands_loss_target_without_changing_good_default() {
+        let now = Instant::now();
+        let mut stream = AdaptivePlaybackStream::new().unwrap();
+        let mut stats = LivePlaybackMixerStats::default();
+
+        assert_eq!(samples_to_ms(stream.adaptive_target_samples(now)), 60);
+        stream.queue_samples(
+            &vec![0.0; FRAME_SAMPLES],
+            DecodedFrameSource::Dred,
+            now,
+            &mut stats,
+        );
+        assert_eq!(samples_to_ms(stream.adaptive_target_samples(now)), 320);
+
+        for index in 0..7 {
+            stream.queue_samples(
+                &vec![0.0; FRAME_SAMPLES],
+                DecodedFrameSource::Plc,
+                now + Duration::from_millis(index),
+                &mut stats,
+            );
+        }
+        assert_eq!(samples_to_ms(stream.adaptive_target_samples(now)), 1_000);
+        assert_eq!(
+            samples_to_ms(stream.adaptive_target_samples(
+                now + LIVE_PLAYBACK_SEVERE_LOSS_HOLD + Duration::from_millis(20)
+            )),
+            60
+        );
+    }
+
+    #[test]
+    fn adaptive_stream_hard_trim_preserves_dred_horizon() {
+        let now = Instant::now();
+        let mut stream = AdaptivePlaybackStream::new().unwrap();
+        let mut stats = LivePlaybackMixerStats::default();
+        let oversized = samples_for_duration(Duration::from_millis(1_700));
+
+        stream.queue_samples(
+            &vec![0.0; oversized],
+            DecodedFrameSource::Normal,
+            now,
+            &mut stats,
+        );
+
+        assert_eq!(stats.hard_trim_count, 1);
+        assert_eq!(samples_to_ms(stream.queued_samples()), 1_000);
+    }
+
+    #[test]
+    fn mixer_mixes_concurrent_streams_with_headroom() {
         let mut mixer = LivePlaybackMixer::new();
-        mixer.queue_stream_samples(1, &[12_000, -12_000]);
+        let now = Instant::now();
+        mixer.queue_stream_samples(
+            1,
+            &vec![0.4; FRAME_SAMPLES * 2],
+            DecodedFrameSource::Normal,
+            now,
+        );
+        mixer.queue_stream_samples(
+            2,
+            &vec![0.4; FRAME_SAMPLES * 2],
+            DecodedFrameSource::Normal,
+            now,
+        );
 
-        assert_eq!(mixer.pop_mixed_sample(), 12_000);
-        assert_eq!(mixer.pop_mixed_sample(), -12_000);
+        let mixed = pop_until_nonzero(&mut mixer, now);
 
-        mixer.queue_stream_samples(1, &[12_000]);
-        mixer.queue_stream_samples(2, &[12_000]);
-        let mixed = mixer.pop_mixed_sample();
+        assert!(mixed > 0.4);
+        assert!(mixed < 0.8);
 
-        assert!(mixed > 12_000);
-        assert!(mixed < 24_000);
-
-        mixer.queue_stream_samples(1, &[10_000]);
-        mixer.queue_stream_samples(2, &[-10_000]);
-        assert!(mixer.pop_mixed_sample().abs() <= 1);
-
-        mixer.queue_stream_samples(1, &[i16::MAX]);
-        mixer.queue_stream_samples(2, &[i16::MAX]);
-        mixer.queue_stream_samples(3, &[i16::MAX]);
-        assert!(mixer.pop_mixed_sample() < i16::MAX);
+        mixer.queue_stream_samples(
+            1,
+            &vec![1.0; FRAME_SAMPLES * 2],
+            DecodedFrameSource::Normal,
+            now,
+        );
+        mixer.queue_stream_samples(
+            2,
+            &vec![1.0; FRAME_SAMPLES * 2],
+            DecodedFrameSource::Normal,
+            now,
+        );
+        mixer.queue_stream_samples(
+            3,
+            &vec![1.0; FRAME_SAMPLES * 2],
+            DecodedFrameSource::Normal,
+            now,
+        );
+        assert!(pop_until_nonzero(&mut mixer, now) < 1.0);
     }
 
     #[test]
     fn mixer_removes_stopped_streams() {
         let mut mixer = LivePlaybackMixer::new();
-        mixer.queue_stream_samples(1, &[1, 2, 3]);
-        mixer.queue_stream_samples(2, &[4, 5]);
+        let now = Instant::now();
+        mixer.queue_stream_samples(
+            1,
+            &vec![0.2; FRAME_SAMPLES * 2],
+            DecodedFrameSource::Normal,
+            now,
+        );
+        mixer.queue_stream_samples(
+            2,
+            &vec![0.4; FRAME_SAMPLES * 2],
+            DecodedFrameSource::Normal,
+            now,
+        );
 
-        assert_eq!(mixer.queued_samples(), 5);
+        assert!(mixer.queued_samples() > 0);
         mixer.remove_stream(1);
 
-        assert_eq!(mixer.queued_samples(), 2);
-        assert_eq!(mixer.pop_mixed_sample(), 4);
+        assert!(mixer.queued_samples() > 0);
+        assert!(pop_until_nonzero(&mut mixer, now) > 0.2);
     }
 
     #[test]
     fn mixer_applies_stream_gain() {
         let mut mixer = LivePlaybackMixer::new();
+        let now = Instant::now();
         mixer.set_stream_control(
             1,
             PlaybackStreamControl {
@@ -2306,17 +2996,23 @@ mod tests {
                 volume_db: 6.0,
             },
         );
-        mixer.queue_stream_samples(1, &[10_000]);
+        mixer.queue_stream_samples(
+            1,
+            &vec![0.25; FRAME_SAMPLES * 2],
+            DecodedFrameSource::Normal,
+            now,
+        );
 
-        let boosted = mixer.pop_mixed_sample();
+        let boosted = pop_until_nonzero(&mut mixer, now);
 
-        assert!(boosted > 10_000);
-        assert!(boosted <= 20_000);
+        assert!(boosted > 0.25);
+        assert!(boosted <= 0.55);
     }
 
     #[test]
     fn mixer_muted_streams_consume_samples_without_output() {
         let mut mixer = LivePlaybackMixer::new();
+        let now = Instant::now();
         mixer.set_stream_control(
             1,
             PlaybackStreamControl {
@@ -2324,10 +3020,34 @@ mod tests {
                 volume_db: 0.0,
             },
         );
-        mixer.queue_stream_samples(1, &[10_000]);
+        mixer.queue_stream_samples(
+            1,
+            &vec![0.5; FRAME_SAMPLES * 2],
+            DecodedFrameSource::Normal,
+            now,
+        );
+        let before = mixer.queued_samples();
 
-        assert_eq!(mixer.pop_mixed_sample(), 0);
-        assert_eq!(mixer.queued_samples(), 0);
+        assert_eq!(pop_next_nonzero_window(&mut mixer, now), 0.0);
+        assert!(mixer.queued_samples() < before);
+    }
+
+    fn pop_until_nonzero(mixer: &mut LivePlaybackMixer, now: Instant) -> f32 {
+        for _ in 0..(FRAME_SAMPLES * 2) {
+            let sample = mixer.pop_mixed_sample(now);
+            if sample.abs() > 0.01 {
+                return sample;
+            }
+        }
+        0.0
+    }
+
+    fn pop_next_nonzero_window(mixer: &mut LivePlaybackMixer, now: Instant) -> f32 {
+        let mut max_sample: f32 = 0.0;
+        for _ in 0..(FRAME_SAMPLES * 2) {
+            max_sample = max_sample.max(mixer.pop_mixed_sample(now).abs());
+        }
+        max_sample
     }
 
     fn test_audio_packet(sequence: u32, payload: &[u8]) -> AudioPacketRef<'_> {

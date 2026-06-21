@@ -26,6 +26,12 @@ Run the client:
 cargo run -p tomchat -- --config tomchat.toml
 ```
 
+Capture client diagnostics while running:
+
+```sh
+cargo run -p tomchat -- --config tomchat.toml --logfile /tmp/tomchat.log
+```
+
 Invite a configured user from a running server:
 
 ```sh
@@ -65,6 +71,7 @@ Useful in-app slash commands:
 - `/upload path/to/file.ext`: relay a file to users in the room who accept files.
 - `/mute` and `/unmute`: control microphone send.
 - `/deafen` and `/undeafen`: stop or resume receive/playback and microphone send.
+- `/audio`: show receive queue, adaptive catch-up, DRED/PLC, trim, and underrun diagnostics.
 - `/users`: show known or current room users.
 - `/whoami`: show the current authenticated user.
 - `/settings` or `/config`: open settings.
@@ -101,6 +108,13 @@ development server key.
 
 UDP media shares `tcp-addr` by default. Set `udp-addr` only when the server uses
 a separate UDP media address.
+
+Voice receive keeps a low-latency 60 ms playback target under good conditions.
+When loss or DRED recovery is observed, playback temporarily permits a larger
+queue so Opus DRED can recover missing frames; adaptive resampling then catches
+up instead of letting latency grow for the rest of the call. Use `/audio` or
+`--logfile` to inspect queue growth, DRED recovery, PLC fallback, hard trims,
+and underruns.
 
 The client accepts `--config` / `TOMCHAT_CONFIG` for config path selection.
 
