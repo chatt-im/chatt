@@ -13,6 +13,7 @@ pub enum SettingsFocus {
     OutputDevice,
     Bitrate,
     Denoise,
+    EchoCancellation,
     Amplification,
     Buffer,
     Refresh,
@@ -21,11 +22,12 @@ pub enum SettingsFocus {
 }
 
 impl SettingsFocus {
-    pub const ORDER: [SettingsFocus; 9] = [
+    pub const ORDER: [SettingsFocus; 10] = [
         SettingsFocus::InputDevice,
         SettingsFocus::OutputDevice,
         SettingsFocus::Bitrate,
         SettingsFocus::Denoise,
+        SettingsFocus::EchoCancellation,
         SettingsFocus::Amplification,
         SettingsFocus::Buffer,
         SettingsFocus::Refresh,
@@ -588,6 +590,7 @@ mod tests {
         let config = AudioConfig {
             input_device_id: Some("usb mic".to_string()),
             output_device_id: Some("usb speakers".to_string()),
+            echo_cancellation: true,
             max_amplification: 30.0,
             ..AudioConfig::default()
         };
@@ -597,6 +600,7 @@ mod tests {
 
         assert_eq!(audio.input_device_id.as_deref(), Some("usb mic"));
         assert_eq!(audio.output_device_id.as_deref(), Some("usb speakers"));
+        assert!(audio.echo_cancellation);
         assert_eq!(audio.max_amplification, 30.0);
     }
 

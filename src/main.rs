@@ -28,8 +28,9 @@ use std::{
 };
 
 use audio::{
-    BufferRequest, DeviceInfo, EchoReference, LiveCapture, LiveCaptureConfig, LiveEncoderProfile,
-    LivePlayback, LivePlaybackConfig, LivePlaybackFeedback, PlaybackStreamControl, StatsSnapshot,
+    BufferRequest, DeviceInfo, EchoCancellationControl, LiveCapture, LiveCaptureConfig,
+    LiveEncoderProfile, LivePlayback, LivePlaybackConfig, LivePlaybackFeedback,
+    PlaybackStreamControl, StatsSnapshot,
 };
 use bindings::{BindCommand, PendingChord, Resolved};
 use chat_buffer::VirtualChatBuffer;
@@ -431,7 +432,7 @@ struct App {
     settings_preview_capture: bool,
     allow_settings_preview_capture: bool,
     playback: Option<LivePlayback>,
-    echo_reference: Option<Arc<EchoReference>>,
+    echo_control: Arc<EchoCancellationControl>,
     muted_users: HashSet<UserId>,
     stream_users: HashMap<u32, UserId>,
     volume_dialog: Option<UserVolumeDialog>,
@@ -538,10 +539,7 @@ impl App {
             &audio_output_items,
             settings_draft.output_device_id.as_deref(),
         );
-        let echo_reference = config
-            .audio
-            .echo_cancellation
-            .then(|| Arc::new(EchoReference::new()));
+        let echo_control = Arc::new(EchoCancellationControl::new(config.audio.echo_cancellation));
         Ok(Self {
             server_alias: active_server.alias.clone(),
             user: active_server.effective_display_name(),
@@ -580,7 +578,7 @@ impl App {
             settings_preview_capture: false,
             allow_settings_preview_capture: true,
             playback: None,
-            echo_reference,
+            echo_control,
             muted_users: HashSet::new(),
             stream_users: HashMap::new(),
             volume_dialog: None,
@@ -1012,6 +1010,10 @@ impl App {
                 self.settings.denoise = !self.settings.denoise;
                 self.mark_settings_dirty();
             }
+            SettingsFocus::EchoCancellation => {
+                self.settings.echo_cancellation = !self.settings.echo_cancellation;
+                self.mark_settings_dirty();
+            }
             SettingsFocus::Amplification => {
                 self.settings.amplification_index = cycle_index(
                     self.settings.amplification_index,
@@ -1037,6 +1039,10 @@ impl App {
         match self.settings_focus {
             SettingsFocus::Denoise => {
                 self.settings.denoise = !self.settings.denoise;
+                self.mark_settings_dirty();
+            }
+            SettingsFocus::EchoCancellation => {
+                self.settings.echo_cancellation = !self.settings.echo_cancellation;
                 self.mark_settings_dirty();
             }
             SettingsFocus::Refresh => self.refresh_audio_devices(),
@@ -1357,10 +1363,16 @@ impl App {
         }
     }
 
+    fn apply_echo_cancellation_setting(&self) {
+        self.echo_control
+            .set_enabled(self.config.audio.echo_cancellation);
+    }
+
     fn save_settings(&mut self) {
         let restart_preview =
             self.settings_preview_capture && !self.voice_tx_enabled.load(Ordering::Relaxed);
         self.config.audio = self.settings.to_audio();
+        self.apply_echo_cancellation_setting();
         self.apply_active_capture_amplification(self.config.audio.max_amplification);
         match self.config.save_runtime() {
             Ok(path) => {
@@ -1374,7 +1386,7 @@ impl App {
                     || self.playback.is_some()
                 {
                     self.set_status(format!(
-                        "settings saved to {}; live amplification updated, other audio applies after deafen/rejoin",
+                        "settings saved to {}; live amplification and echo cancellation updated, other audio applies after deafen/rejoin",
                         path.display()
                     ));
                 } else {
@@ -1604,7 +1616,7 @@ impl App {
                 max_amplification: self.config.audio.max_amplification,
                 buffer_request: self.buffer_request(),
                 tuning: self.config.audio.latency.to_tuning(),
-                echo_reference: self.echo_reference.clone(),
+                echo_control: Some(Arc::clone(&self.echo_control)),
             },
             move |payload| {
                 if mic_muted.load(Ordering::Relaxed)
@@ -1690,7 +1702,7 @@ impl App {
                 buffer_request: self.buffer_request(),
                 tuning: self.config.audio.latency.to_tuning(),
                 feedback_sender: Some(feedback_tx),
-                echo_reference: self.echo_reference.clone(),
+                echo_control: Some(Arc::clone(&self.echo_control)),
             }) {
                 Ok(playback) => {
                     self.playback = Some(playback);
@@ -3041,7 +3053,7 @@ mod tests {
             settings_preview_capture: false,
             allow_settings_preview_capture: false,
             playback: None,
-            echo_reference: None,
+            echo_control: Arc::new(EchoCancellationControl::new(false)),
             muted_users: HashSet::new(),
             stream_users: HashMap::new(),
             volume_dialog: None,
@@ -3352,6 +3364,42 @@ mod tests {
         assert_eq!(app.audio_input_items[0].selection, None);
         assert_eq!(app.audio_output_items.len(), 1);
         assert_eq!(app.audio_output_items[0].selection, None);
+    }
+
+    #[test]
+    fn settings_echo_cancellation_row_toggles_draft() {
+        let mut app = test_app();
+        app.mode = theme::UiMode::Settings;
+        app.settings_focus = SettingsFocus::EchoCancellation;
+
+        assert!(!app.settings.echo_cancellation);
+
+        app.process_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()));
+
+        assert!(app.settings.echo_cancellation);
+        assert!(app.settings_dirty);
+
+        app.process_key(KeyEvent::new(KeyCode::Left, KeyModifiers::empty()));
+
+        assert!(!app.settings.echo_cancellation);
+    }
+
+    #[test]
+    fn echo_control_tracks_audio_config_without_replacement() {
+        let mut app = test_app();
+        let echo_control = Arc::clone(&app.echo_control);
+
+        assert!(!echo_control.enabled());
+
+        app.config.audio.echo_cancellation = true;
+        app.apply_echo_cancellation_setting();
+        assert!(echo_control.enabled());
+        assert!(Arc::ptr_eq(&echo_control, &app.echo_control));
+
+        app.config.audio.echo_cancellation = false;
+        app.apply_echo_cancellation_setting();
+        assert!(!echo_control.enabled());
+        assert!(Arc::ptr_eq(&echo_control, &app.echo_control));
     }
 
     #[test]

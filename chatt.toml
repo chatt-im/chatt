@@ -15,6 +15,7 @@ room-id = 1
 [audio]
 bitrate-bps = 48000
 denoise = true
+echo-cancellation = false
 max-amplification = 2.0
 buffer = "default"
 

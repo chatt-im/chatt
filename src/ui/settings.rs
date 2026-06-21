@@ -19,7 +19,7 @@ const SELECTED_DIM: Style = Style::DEFAULT
     .with_fg_rgb(0xd8, 0xdb, 0xd6);
 const PANEL_EDGE: Style = Style::DEFAULT.with_bg_rgb(0x18, 0x1b, 0x20);
 const SETTINGS_LABEL_WIDTH: u16 = 16;
-const SETTINGS_CONTROLS_ROWS: u16 = 9;
+const SETTINGS_CONTROLS_ROWS: u16 = 10;
 const MIN_DEVICE_PICKER_ROWS: u16 = 4;
 
 pub fn draw_settings(
@@ -343,6 +343,18 @@ fn draw_settings_controls(
         "Denoise",
         if settings.denoise { "on" } else { "off" },
         focus == SettingsFocus::Denoise,
+        dirty,
+    );
+    draw_settings_row(
+        rows.take_top(1),
+        buf,
+        "Echo Cancellation",
+        if settings.echo_cancellation {
+            "on"
+        } else {
+            "off"
+        },
+        focus == SettingsFocus::EchoCancellation,
         dirty,
     );
     draw_settings_row(

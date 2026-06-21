@@ -800,6 +800,11 @@ fn write_runtime_config<'de>(root: &mut Table<'de>, config: &Config, arena: &'de
         );
         audio.insert(Key::new("denoise"), Item::from(config.audio.denoise), arena);
         audio.insert(
+            Key::new("echo-cancellation"),
+            Item::from(config.audio.echo_cancellation),
+            arena,
+        );
+        audio.insert(
             Key::new("max-amplification"),
             Item::from(config.audio.max_amplification as f64),
             arena,
@@ -1261,6 +1266,25 @@ input-device-index = 20
 
         assert!(content.contains("input-device-id = \"usb mic\""));
         assert!(content.contains("output-device-id = \"usb speakers\""));
+    }
+
+    #[test]
+    fn runtime_config_writes_audio_echo_cancellation() {
+        let mut config = Config::default();
+        config.audio.echo_cancellation = true;
+        let arena = Arena::new();
+        let doc = toml_spanner::parse(DEFAULT_CONFIG, &arena).unwrap();
+        let mut table = doc.table().clone_in(&arena);
+
+        write_runtime_config(&mut table, &config, &arena);
+        let content = String::from_utf8(
+            toml_spanner::Formatting::preserved_from(&doc)
+                .with_span_projection_identity()
+                .format_table_to_bytes(table, &arena),
+        )
+        .unwrap();
+
+        assert!(content.contains("echo-cancellation = true"));
     }
 
     #[test]

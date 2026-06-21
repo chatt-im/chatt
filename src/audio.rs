@@ -134,7 +134,7 @@ pub struct LiveCaptureConfig {
     pub max_amplification: f32,
     pub buffer_request: BufferRequest,
     pub tuning: LiveAudioTuning,
-    pub echo_reference: Option<Arc<EchoReference>>,
+    pub echo_control: Option<Arc<EchoCancellationControl>>,
 }
 
 #[derive(Clone, Debug)]
@@ -143,7 +143,7 @@ pub struct LivePlaybackConfig {
     pub buffer_request: BufferRequest,
     pub tuning: LiveAudioTuning,
     pub feedback_sender: Option<Sender<LivePlaybackFeedback>>,
-    pub echo_reference: Option<Arc<EchoReference>>,
+    pub echo_control: Option<Arc<EchoCancellationControl>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1008,7 +1008,11 @@ where
         sample_rate = selection.stream_config.sample_rate,
         bitrate_bps = config.bitrate_bps,
         denoise = config.denoise,
-        max_amplification = config.max_amplification
+        max_amplification = config.max_amplification,
+        echo_cancellation = config
+            .echo_control
+            .as_ref()
+            .is_some_and(|control| control.enabled())
     );
     let mut encoder = OpusVoiceEncoder::new(config.bitrate_bps)?;
     encoder.apply_live_encoder_profile(LiveEncoderProfile::DRED_20)?;
@@ -1021,7 +1025,10 @@ where
     let worker_stats = stats.clone();
     let worker_max_amplification = Arc::clone(&max_amplification_bits);
     let worker_encoder_loss_percent = Arc::clone(&encoder_loss_percent);
-    let echo_reference = config.echo_reference.clone();
+    let echo_source = config
+        .echo_control
+        .clone()
+        .map(EchoReferenceSource::Controlled);
     let worker = thread::spawn(move || {
         run_live_encoder_worker(
             receiver,
@@ -1030,7 +1037,7 @@ where
             worker_max_amplification,
             worker_encoder_loss_percent,
             config.tuning,
-            echo_reference,
+            echo_source,
             worker_stats,
             on_packet,
         );
@@ -1156,7 +1163,7 @@ pub fn start_live_playback(config: LivePlaybackConfig) -> Result<LivePlayback, S
             selection.stream_config,
             usize::from(selection.supported_config.channels()),
             Arc::clone(&mixer),
-            config.echo_reference.clone(),
+            config.echo_control.clone(),
         )
     })?;
     with_audio_backend_stderr_suppressed(|| stream.play())
@@ -1510,7 +1517,7 @@ fn build_live_output_stream(
     stream_config: StreamConfig,
     channels: usize,
     mixer: Arc<Mutex<LivePlaybackMixer>>,
-    echo_reference: Option<Arc<EchoReference>>,
+    echo_control: Option<Arc<EchoCancellationControl>>,
 ) -> Result<Stream, String> {
     match sample_format {
         SampleFormat::I8 => build_typed_live_output_stream::<i8>(
@@ -1518,84 +1525,84 @@ fn build_live_output_stream(
             stream_config,
             channels,
             mixer,
-            echo_reference,
+            echo_control,
         ),
         SampleFormat::I16 => build_typed_live_output_stream::<i16>(
             device,
             stream_config,
             channels,
             mixer,
-            echo_reference,
+            echo_control,
         ),
         SampleFormat::I24 => build_typed_live_output_stream::<cpal::I24>(
             device,
             stream_config,
             channels,
             mixer,
-            echo_reference,
+            echo_control,
         ),
         SampleFormat::I32 => build_typed_live_output_stream::<i32>(
             device,
             stream_config,
             channels,
             mixer,
-            echo_reference,
+            echo_control,
         ),
         SampleFormat::I64 => build_typed_live_output_stream::<i64>(
             device,
             stream_config,
             channels,
             mixer,
-            echo_reference,
+            echo_control,
         ),
         SampleFormat::U8 => build_typed_live_output_stream::<u8>(
             device,
             stream_config,
             channels,
             mixer,
-            echo_reference,
+            echo_control,
         ),
         SampleFormat::U16 => build_typed_live_output_stream::<u16>(
             device,
             stream_config,
             channels,
             mixer,
-            echo_reference,
+            echo_control,
         ),
         SampleFormat::U24 => build_typed_live_output_stream::<cpal::U24>(
             device,
             stream_config,
             channels,
             mixer,
-            echo_reference,
+            echo_control,
         ),
         SampleFormat::U32 => build_typed_live_output_stream::<u32>(
             device,
             stream_config,
             channels,
             mixer,
-            echo_reference,
+            echo_control,
         ),
         SampleFormat::U64 => build_typed_live_output_stream::<u64>(
             device,
             stream_config,
             channels,
             mixer,
-            echo_reference,
+            echo_control,
         ),
         SampleFormat::F32 => build_typed_live_output_stream::<f32>(
             device,
             stream_config,
             channels,
             mixer,
-            echo_reference,
+            echo_control,
         ),
         SampleFormat::F64 => build_typed_live_output_stream::<f64>(
             device,
             stream_config,
             channels,
             mixer,
-            echo_reference,
+            echo_control,
         ),
         _ => Err(format!("unsupported output sample format: {sample_format}")),
     }
@@ -1606,7 +1613,7 @@ fn build_typed_live_output_stream<T>(
     stream_config: StreamConfig,
     channels: usize,
     mixer: Arc<Mutex<LivePlaybackMixer>>,
-    echo_reference: Option<Arc<EchoReference>>,
+    echo_control: Option<Arc<EchoCancellationControl>>,
 ) -> Result<Stream, String>
 where
     T: Sample + cpal::SizedSample + FromSample<f32> + Send + 'static,
@@ -1615,7 +1622,7 @@ where
         .build_output_stream(
             stream_config,
             move |output: &mut [T], _| {
-                live_playback_callback(output, channels, &mixer, echo_reference.as_ref());
+                live_playback_callback(output, channels, &mixer, echo_control.as_ref());
             },
             move |error| {
                 eprintln!("live playback stream error: {error}");
@@ -1691,7 +1698,7 @@ fn live_playback_callback<T>(
     output: &mut [T],
     channels: usize,
     mixer: &Arc<Mutex<LivePlaybackMixer>>,
-    echo_reference: Option<&Arc<EchoReference>>,
+    echo_control: Option<&Arc<EchoCancellationControl>>,
 ) where
     T: Sample + FromSample<f32>,
 {
@@ -1703,7 +1710,10 @@ fn live_playback_callback<T>(
     };
 
     let now = Instant::now();
-    let mut echo_writer = echo_reference.map(|reference| reference.writer());
+    let mut echo_writer = match echo_control {
+        Some(control) if control.enabled() => Some(control.reference().writer()),
+        _ => None,
+    };
     for frame in output.chunks_mut(channels.max(1)) {
         let sample = mixer.pop_mixed_sample(now);
         if let Some(writer) = echo_writer.as_mut() {
@@ -2199,7 +2209,7 @@ fn run_live_encoder_worker<F>(
     max_amplification_bits: Arc<AtomicU32>,
     encoder_loss_percent: Arc<AtomicU32>,
     tuning: LiveAudioTuning,
-    echo_reference: Option<Arc<EchoReference>>,
+    echo_source: Option<EchoReferenceSource>,
     stats: AudioStats,
     mut on_packet: F,
 ) where
@@ -2212,7 +2222,7 @@ fn run_live_encoder_worker<F>(
         &max_amplification_bits,
         &encoder_loss_percent,
         tuning,
-        echo_reference,
+        echo_source,
         &stats,
         &mut on_packet,
     );
@@ -2277,7 +2287,7 @@ fn run_live_encoder_worker_inner<F>(
     max_amplification_bits: &AtomicU32,
     encoder_loss_percent: &AtomicU32,
     tuning: LiveAudioTuning,
-    echo_reference: Option<Arc<EchoReference>>,
+    echo_source: Option<EchoReferenceSource>,
     stats: &AudioStats,
     on_packet: &mut F,
 ) -> Result<(), String>
@@ -2290,7 +2300,7 @@ where
         tuning,
         f32::from_bits(max_amplification_bits.load(Ordering::Relaxed)),
         true,
-        echo_reference,
+        echo_source,
     );
     let mut applied_loss_percent = LiveEncoderProfile::DRED_20.packet_loss_percent;
 
@@ -2332,6 +2342,55 @@ pub struct EchoReference {
 // `tail` then publishes `head`), so no slot is ever accessed by both at once.
 unsafe impl Send for EchoReference {}
 unsafe impl Sync for EchoReference {}
+
+#[derive(Debug)]
+pub struct EchoCancellationControl {
+    enabled: AtomicBool,
+    reference: EchoReference,
+}
+
+impl EchoCancellationControl {
+    pub fn new(enabled: bool) -> Self {
+        Self {
+            enabled: AtomicBool::new(enabled),
+            reference: EchoReference::new(),
+        }
+    }
+
+    pub fn enabled(&self) -> bool {
+        self.enabled.load(Ordering::Relaxed)
+    }
+
+    pub fn set_enabled(&self, enabled: bool) {
+        self.enabled.store(enabled, Ordering::Relaxed);
+    }
+
+    fn reference(&self) -> &EchoReference {
+        &self.reference
+    }
+}
+
+#[derive(Clone)]
+enum EchoReferenceSource {
+    Always(Arc<EchoReference>),
+    Controlled(Arc<EchoCancellationControl>),
+}
+
+impl EchoReferenceSource {
+    fn enabled(&self) -> bool {
+        match self {
+            EchoReferenceSource::Always(_) => true,
+            EchoReferenceSource::Controlled(control) => control.enabled(),
+        }
+    }
+
+    fn reference(&self) -> &EchoReference {
+        match self {
+            EchoReferenceSource::Always(reference) => reference,
+            EchoReferenceSource::Controlled(control) => control.reference(),
+        }
+    }
+}
 
 impl EchoReference {
     /// Creates a reference ring holding roughly half a second at 48 kHz.
@@ -2522,7 +2581,7 @@ struct LiveEncoderPipeline {
     next_opus_packet_flags: u8,
     suppressed_frames: u64,
     echo: Option<EchoCanceller>,
-    echo_reference: Option<Arc<EchoReference>>,
+    echo_source: Option<EchoReferenceSource>,
 }
 
 impl LiveEncoderPipeline {
@@ -2532,8 +2591,11 @@ impl LiveEncoderPipeline {
         tuning: LiveAudioTuning,
         max_amplification: f32,
         auto_gain_enabled: bool,
-        echo_reference: Option<Arc<EchoReference>>,
+        echo_source: Option<EchoReferenceSource>,
     ) -> Self {
+        let echo = echo_source
+            .as_ref()
+            .and_then(|source| source.enabled().then(EchoCanceller::new));
         Self {
             encoder,
             denoise_enabled,
@@ -2554,9 +2616,22 @@ impl LiveEncoderPipeline {
             pending_opus_silence: Vec::with_capacity(2),
             next_opus_packet_flags: 0,
             suppressed_frames: 0,
-            echo: echo_reference.as_ref().map(|_| EchoCanceller::new()),
-            echo_reference,
+            echo,
+            echo_source,
         }
+    }
+
+    fn process_echo(&mut self, frame: &mut [f32]) {
+        let Some(source) = self.echo_source.as_ref() else {
+            return;
+        };
+        if !source.enabled() {
+            self.echo = None;
+            return;
+        }
+        self.echo
+            .get_or_insert_with(EchoCanceller::new)
+            .process(frame, source.reference());
     }
 
     fn push_chunk<F>(
@@ -2571,11 +2646,7 @@ impl LiveEncoderPipeline {
     {
         self.auto_gain.set_max_amplification(max_amplification);
         for mut frame in self.accumulator.push_chunk_collect(chunk) {
-            if let (Some(echo), Some(reference)) =
-                (self.echo.as_mut(), self.echo_reference.as_ref())
-            {
-                echo.process(&mut frame, reference);
-            }
+            self.process_echo(&mut frame);
             if self.auto_gain_enabled {
                 self.auto_gain.process_frame(&mut frame);
             }
@@ -2732,7 +2803,7 @@ fn build_live_encoder_pipeline(
         tuning,
         max_amplification,
         auto_gain_enabled,
-        echo_reference,
+        echo_reference.map(EchoReferenceSource::Always),
     ))
 }
 
@@ -8045,6 +8116,47 @@ mod tests {
         )
         .unwrap();
         assert!(with.echo.is_some());
+    }
+
+    #[test]
+    fn live_encoder_pipeline_toggles_aec_from_control() {
+        let control = Arc::new(EchoCancellationControl::new(false));
+        let encoder = OpusVoiceEncoder::new(48_000).unwrap();
+        let mut pipeline = LiveEncoderPipeline::new(
+            encoder,
+            false,
+            test_tuning(),
+            DEFAULT_LIVE_MAX_AMPLIFICATION,
+            true,
+            Some(EchoReferenceSource::Controlled(Arc::clone(&control))),
+        );
+        let stats = AudioStats::new();
+        let chunk = vec![0.0; FRAME_SAMPLES];
+        let mut packets = 0;
+
+        pipeline
+            .push_chunk(&chunk, DEFAULT_LIVE_MAX_AMPLIFICATION, &stats, &mut |_| {
+                packets += 1
+            })
+            .unwrap();
+        assert!(pipeline.echo.is_none());
+
+        control.set_enabled(true);
+        pipeline
+            .push_chunk(&chunk, DEFAULT_LIVE_MAX_AMPLIFICATION, &stats, &mut |_| {
+                packets += 1
+            })
+            .unwrap();
+        assert!(pipeline.echo.is_some());
+
+        control.set_enabled(false);
+        pipeline
+            .push_chunk(&chunk, DEFAULT_LIVE_MAX_AMPLIFICATION, &stats, &mut |_| {
+                packets += 1
+            })
+            .unwrap();
+        assert!(pipeline.echo.is_none());
+        assert!(packets <= 1);
     }
 
     #[test]
