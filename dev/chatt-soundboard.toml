@@ -1,0 +1,85 @@
+active-server = "local"
+
+[[servers]]
+alias = "local"
+user = "carol"
+display-name = "Carol Soundboard"
+token = "carol-dev-token"
+server-public-key = ""
+tcp-addr = "127.0.0.1:41000"
+room-id = 1
+
+[ui]
+placeholder = "Soundboard: press 1 or type /sound 1"
+room-height = 4
+max-composer-height = 6
+max-messages = 50000
+overscan = 24
+
+[files]
+receive-dir = "/tmp/chatt-soundboard"
+max-upload-bytes = 52428800
+max-receive-bytes = 52428800
+
+[audio]
+bitrate-bps = 96000
+denoise = true
+echo-cancellation = false
+max-amplification = 2.0
+buffer = "default"
+
+[audio.latency]
+adaptive-catch-up = true
+playback-silence-skip = true
+capture-silence-gate = true
+target-queue-ms = 60
+moderate-loss-queue-ms = 320
+dred-horizon-ms = 1000
+hard-queue-bound-ms = 1500
+loss-window-ms = 5000
+loss-hold-ms = 5000
+severe-loss-hold-ms = 10000
+initial-buffer-ms = 40
+max-reorder-delay-ms = 60
+max-speed-up = 0.15
+silence-vad-max = 64
+silence-min-gap-ms = 250
+silence-guard-ms = 40
+silence-ramp-ms = 10
+silence-max-skip-ms = 200
+silence-min-skip-ms = 20
+capture-long-silence-stop-ms = 2000
+capture-silence-preroll-ms = 30
+capture-silence-ramp-ms = 10
+
+[soundboard]
+enabled = true
+#loss = "congested_wifi"
+loss = "none"
+seed = 8388357047376790533
+
+[[soundboard.clips]]
+name = "sample"
+path = "assets/sample-001.opus"
+
+[bindings.compose]
+"1" = "PlaySoundboard1"
+"2" = "PlaySoundboard2"
+"3" = "PlaySoundboard3"
+"4" = "PlaySoundboard4"
+"5" = "PlaySoundboard5"
+"6" = "PlaySoundboard6"
+"7" = "PlaySoundboard7"
+"8" = "PlaySoundboard8"
+"9" = "PlaySoundboard9"
+
+[bindings.log]
+"1" = "PlaySoundboard1"
+"2" = "PlaySoundboard2"
+"3" = "PlaySoundboard3"
+"4" = "PlaySoundboard4"
+"5" = "PlaySoundboard5"
+"6" = "PlaySoundboard6"
+"7" = "PlaySoundboard7"
+"8" = "PlaySoundboard8"
+"9" = "PlaySoundboard9"

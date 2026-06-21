@@ -5,7 +5,7 @@ use toml_spanner::Toml;
 use toml_spanner::{Arena, Array, ArrayStyle, Item, Key, Table};
 
 use crate::{
-    audio::{BufferRequest, LiveAudioTuning},
+    audio::{BufferRequest, LiveAudioPacketLossProfile, LiveAudioTuning},
     bindings::BindingRuntime,
     client_net::ClientConfig,
 };
@@ -344,6 +344,51 @@ pub struct UserAudioPreference {
     pub volume_db: f32,
 }
 
+#[derive(Clone, Debug, Toml)]
+#[toml(FromToml, ToToml, rename_all = "kebab-case")]
+pub struct SoundboardClip {
+    pub name: String,
+    pub path: String,
+}
+
+#[derive(Clone, Debug, Toml)]
+#[toml(FromToml, ToToml, rename_all = "kebab-case")]
+pub struct SoundboardConfig {
+    #[toml(default)]
+    pub enabled: bool,
+    #[toml(default = default_soundboard_loss())]
+    pub loss: String,
+    #[toml(default = default_soundboard_seed())]
+    pub seed: u64,
+    #[toml(default)]
+    pub clips: Vec<SoundboardClip>,
+}
+
+impl Default for SoundboardConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            loss: default_soundboard_loss(),
+            seed: default_soundboard_seed(),
+            clips: Vec::new(),
+        }
+    }
+}
+
+impl SoundboardConfig {
+    pub fn packet_loss(&self) -> Option<LiveAudioPacketLossProfile> {
+        LiveAudioPacketLossProfile::from_name(self.loss.trim())
+    }
+}
+
+fn default_soundboard_loss() -> String {
+    "congested_wifi".to_string()
+}
+
+fn default_soundboard_seed() -> u64 {
+    0x746f_6d63_6861_7405
+}
+
 #[derive(Toml)]
 #[toml(FromToml, recoverable, warn_unknown_fields, rename_all = "kebab-case")]
 pub struct Config {
@@ -359,6 +404,8 @@ pub struct Config {
     pub files: FileConfig,
     #[toml(default)]
     pub user_audio: Vec<UserAudioPreference>,
+    #[toml(default)]
+    pub soundboard: SoundboardConfig,
     #[toml(default)]
     pub bindings: BindingRuntime,
     #[toml(skip)]
@@ -442,6 +489,11 @@ impl Config {
         self.user_audio
             .retain(|preference| preference.volume_db != 0.0);
         self.sort_user_audio();
+        self.soundboard.loss = self.soundboard.loss.trim().to_string();
+        for clip in &mut self.soundboard.clips {
+            clip.name = clip.name.trim().to_string();
+            clip.path = clip.path.trim().to_string();
+        }
     }
 
     fn validate(&self, source: &str) -> Result<(), String> {
@@ -514,6 +566,33 @@ impl Config {
                 return Err(format!(
                     "{source}: duplicate user-audio entry for {}:{}",
                     preference.server_alias, preference.user_id
+                ));
+            }
+        }
+        if self.soundboard.enabled {
+            if self.soundboard.packet_loss().is_none() {
+                return Err(format!(
+                    "{source}: soundboard loss must be one of: {}",
+                    LiveAudioPacketLossProfile::NAMES.join(", ")
+                ));
+            }
+            if self.soundboard.clips.is_empty() {
+                return Err(format!(
+                    "{source}: soundboard enabled but no [[soundboard.clips]] entries are configured"
+                ));
+            }
+        }
+        for (index, clip) in self.soundboard.clips.iter().enumerate() {
+            if clip.name.is_empty() {
+                return Err(format!(
+                    "{source}: soundboard clip {}: name must not be empty",
+                    index + 1
+                ));
+            }
+            if clip.path.is_empty() {
+                return Err(format!(
+                    "{source}: soundboard clip {}: path must not be empty",
+                    index + 1
                 ));
             }
         }
@@ -1192,6 +1271,48 @@ room-id = 1
             server.udp_probe_addr.as_deref(),
             Some("probe.example.com:54101")
         );
+    }
+
+    #[test]
+    fn soundboard_config_parses_clip_and_loss_profile() {
+        let arena = Arena::new();
+        let mut doc = toml_spanner::parse(
+            r#"
+active-server = "lab"
+
+[[servers]]
+alias = "lab"
+user = "carol"
+display-name = "Carol"
+token = "carol-dev-token"
+tcp-addr = "127.0.0.1:42000"
+server-public-key = ""
+room-id = 1
+
+[soundboard]
+enabled = true
+loss = "random_60"
+seed = 123
+
+[[soundboard.clips]]
+name = "sample"
+path = "assets/sample-001.opus"
+"#,
+            &arena,
+        )
+        .unwrap();
+        let udp_addr_configured = server_udp_addr_configured(&doc);
+        let mut config: Config = doc.to().unwrap();
+        config.apply_inferred_addresses_from_doc(&udp_addr_configured);
+        config.normalize();
+
+        config.validate("test").unwrap();
+        assert!(config.soundboard.enabled);
+        assert_eq!(
+            config.soundboard.packet_loss(),
+            Some(LiveAudioPacketLossProfile::Random60)
+        );
+        assert_eq!(config.soundboard.clips[0].name, "sample");
     }
 
     #[test]

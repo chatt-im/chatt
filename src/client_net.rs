@@ -72,6 +72,10 @@ pub enum NetworkCommand {
     SendChat(String),
     UploadFile(PathBuf),
     LocalVoicePacket(LocalVoiceFrame),
+    SequencedLocalVoicePacket {
+        sequence: u32,
+        frame: LocalVoiceFrame,
+    },
     PlaybackFeedback(LivePlaybackFeedback),
     Shutdown,
 }
@@ -489,7 +493,11 @@ fn wait_for_reconnect(commands: &Receiver<NetworkCommand>, delay: Duration) -> R
                 return RetryWait::Shutdown;
             }
             Ok(command) => {
-                if !matches!(command, NetworkCommand::LocalVoicePacket(_)) {
+                if !matches!(
+                    command,
+                    NetworkCommand::LocalVoicePacket(_)
+                        | NetworkCommand::SequencedLocalVoicePacket { .. }
+                ) {
                     kvlog::info!(
                         "network command dropped while disconnected",
                         kind = network_command_kind(&command)
@@ -960,7 +968,9 @@ impl WorkerState {
     fn handle_command(&mut self, command: NetworkCommand) -> Result<(), String> {
         if !matches!(
             command,
-            NetworkCommand::LocalVoicePacket(_) | NetworkCommand::PlaybackFeedback(_)
+            NetworkCommand::LocalVoicePacket(_)
+                | NetworkCommand::SequencedLocalVoicePacket { .. }
+                | NetworkCommand::PlaybackFeedback(_)
         ) {
             kvlog::info!(
                 "network command received",
@@ -983,22 +993,14 @@ impl WorkerState {
             NetworkCommand::LocalVoicePacket(frame) => {
                 if let Some(stream_id) = self.active_stream {
                     let sequence = self.local_sequence;
-                    let relay_payload = MediaPayload::Voice {
-                        stream_id,
-                        sequence,
-                        flags: frame.flags,
-                        silence_ranges: frame.silence_ranges,
-                        opus: frame.payload.clone(),
-                    };
                     self.local_sequence = self.local_sequence.wrapping_add(1);
-                    self.send_media(&relay_payload);
-                    self.send_p2p_voice(
-                        stream_id,
-                        sequence,
-                        frame.flags,
-                        frame.silence_ranges,
-                        &frame.payload,
-                    );
+                    self.send_local_voice_packet(stream_id, sequence, frame);
+                }
+            }
+            NetworkCommand::SequencedLocalVoicePacket { sequence, frame } => {
+                if let Some(stream_id) = self.active_stream {
+                    self.local_sequence = self.local_sequence.max(sequence.wrapping_add(1));
+                    self.send_local_voice_packet(stream_id, sequence, frame);
                 }
             }
             NetworkCommand::PlaybackFeedback(feedback) => {
@@ -1018,6 +1020,29 @@ impl WorkerState {
             }
         }
         Ok(())
+    }
+
+    fn send_local_voice_packet(
+        &mut self,
+        stream_id: StreamId,
+        sequence: u32,
+        frame: LocalVoiceFrame,
+    ) {
+        let relay_payload = MediaPayload::Voice {
+            stream_id,
+            sequence,
+            flags: frame.flags,
+            silence_ranges: frame.silence_ranges,
+            opus: frame.payload.clone(),
+        };
+        self.send_media(&relay_payload);
+        self.send_p2p_voice(
+            stream_id,
+            sequence,
+            frame.flags,
+            frame.silence_ranges,
+            &frame.payload,
+        );
     }
 
     fn queue_file_upload(&mut self, path: PathBuf) {
@@ -2163,6 +2188,7 @@ fn network_command_kind(command: &NetworkCommand) -> &'static str {
         NetworkCommand::SendChat(_) => "send_chat",
         NetworkCommand::UploadFile(_) => "upload_file",
         NetworkCommand::LocalVoicePacket(_) => "local_voice_packet",
+        NetworkCommand::SequencedLocalVoicePacket { .. } => "sequenced_local_voice_packet",
         NetworkCommand::PlaybackFeedback(_) => "playback_feedback",
         NetworkCommand::Shutdown => "shutdown",
     }

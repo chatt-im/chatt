@@ -1,0 +1,30 @@
+[service.server]
+cmd = ["cargo", "run", "-p", "server", "--", "--config", "chatt-server.toml"]
+ready.when.output_contains = "chatt server listening"
+ready.timeout = 10.0
+cache.never = true
+info = "Local chatt development server"
+
+[action.client-alice]
+cmd = ["cargo", "run", "-p", "chatt", "--", "--config", "dev/chatt-alice.toml"]
+require = ["server"]
+managed = false
+env.CHATT_RUN_DIR = "/tmp/chatt-dev/alice"
+info = "Run the Alice client in this terminal"
+
+[action.client-bob]
+cmd = ["cargo", "run", "-p", "chatt", "--", "--config", "dev/chatt-bob.toml"]
+require = ["server"]
+managed = false
+env.CHATT_RUN_DIR = "/tmp/chatt-dev/bob"
+info = "Run the Bob client in this terminal"
+
+[action.client-soundboard]
+cmd = ["cargo", "run", "-p", "chatt", "--", "--config", "dev/chatt-soundboard.toml"]
+require = ["server"]
+managed = false
+env.CHATT_RUN_DIR = "/tmp/chatt-dev/soundboard"
+info = "Run the Carol prerecorded-audio soundboard client in this terminal"
+
+[group]
+clients = ["client-alice", "client-bob", "client-soundboard"]
