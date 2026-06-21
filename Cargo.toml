@@ -6,12 +6,12 @@ edition = "2024"
 [dependencies]
 cpal = "0.18.1"
 libc = "0.2"
-nnnoiseless = {version =  "0.5.2", default-features = false}
-extui.path = "/code/extui"
-extui-editor.path = "/code/extui/crates/extui-editor"
-extui-bindings.path = "/code/extui/crates/extui-bindings"
-bwrap.path = "/code/bwrap"
-tinyhl = { path = "/code/extui/crates/tinyhl" }
+nnnoiseless = { version = "0.5.2", default-features = false }
+extui = { git = "https://github.com/exrok/extui", rev = "0db2ec429bc437f4d330b24e7642e539c44b8a6a" }
+extui-editor = { git = "https://github.com/exrok/extui", rev = "0db2ec429bc437f4d330b24e7642e539c44b8a6a" }
+extui-bindings = { git = "https://github.com/exrok/extui", rev = "0db2ec429bc437f4d330b24e7642e539c44b8a6a" }
+bwrap.path = "crates/bwrap"
+tinyhl = { git = "https://github.com/exrok/extui", rev = "0db2ec429bc437f4d330b24e7642e539c44b8a6a" }
 unicode-width = "0.2"
 opus-codec = { path = "/code/opus-codec", features = ["dred"] }
 rubato = { version = "3.0", default-features = false }
@@ -21,12 +21,22 @@ rpc.path = "crates/rpc"
 chatt-p2p.path = "crates/p2p"
 mio = { version = "1.2.1", features = ["os-poll", "net"] }
 kvlog = "0.1.5"
-toml-spanner = { version = "1.0.3", features = ["to-toml", "from-toml", "derive"] }
+toml-spanner = { version = "1.0.3", features = [
+    "to-toml",
+    "from-toml",
+    "derive",
+] }
 earshot = "1.1.0"
 sonora = "0.1.0"
 
 [workspace]
-members = ["crates/benchmark", "crates/p2p", "crates/rpc", "crates/server"]
+members = [
+    "crates/benchmark",
+    "crates/p2p",
+    "crates/rpc",
+    "crates/server",
+    "crates/bwrap",
+]
 
 [profile.dev]
 debug = 0
