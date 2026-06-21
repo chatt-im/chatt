@@ -22,11 +22,6 @@ use cpal::{
 use earshot::Detector as EarshotDetector;
 use nnnoiseless::DenoiseState;
 use opus_codec::{Channels, Complexity, Decoder, DredDecoder, DredState, SampleRate};
-use rubato::{
-    Async, FixedAsync, Indexing, Resampler, SincInterpolationParameters, SincInterpolationType,
-    WindowFunction,
-    audioadapter::{Adapter, AdapterMut},
-};
 use sonora::config::EchoCanceller as Aec3Config;
 use sonora::{AudioProcessing, Config as ApmConfig, StreamConfig as ApmStreamConfig};
 
@@ -57,9 +52,12 @@ const LIVE_PLAYBACK_FEEDBACK_INTERVAL: Duration = Duration::from_millis(500);
 const LIVE_PLAYBACK_FEEDBACK_PACKETS: u32 = 25;
 const LIVE_PLAYBACK_MAX_REORDER_DELAY: Duration = Duration::from_millis(60);
 const LIVE_PLAYBACK_CATCH_UP_START_EXCESS: Duration = Duration::from_millis(80);
-const LIVE_PLAYBACK_RESAMPLER_CHUNK: usize = 240;
 const LIVE_PLAYBACK_MAX_SPEED_UP: f64 = 0.15;
-const LIVE_PLAYBACK_MAX_RESAMPLE_RATIO_RELATIVE: f64 = 1.20;
+// One-pole smoothing coefficient for the catch-up correction (tau = 50 ms):
+// alpha = 1 - exp(-1 / (tau * rate)) ~= 1 / (tau * rate).
+const LIVE_PLAYBACK_CORRECTION_ALPHA: f64 = 1.0 / (0.050 * SAMPLE_RATE as f64);
+// Maximum per-sample change in correction, so a full 0 -> max ramp takes >= 1 s.
+const LIVE_PLAYBACK_CORRECTION_SLEW: f64 = LIVE_PLAYBACK_MAX_SPEED_UP / SAMPLE_RATE as f64;
 const LIVE_PLAYBACK_DRED_MAX_SAMPLES: usize = SAMPLE_RATE as usize;
 const LIVE_PLAYBACK_SILENCE_VAD_MAX: u8 = 64;
 const LIVE_PLAYBACK_SILENCE_MIN_GAP: Duration = Duration::from_millis(250);
@@ -206,6 +204,7 @@ pub struct LiveAudioTuning {
     pub initial_buffer: Duration,
     pub max_reorder_delay: Duration,
     pub max_speed_up: f64,
+    pub catch_up_start_excess: Duration,
     pub silence_vad_max: u8,
     pub silence_min_gap: Duration,
     pub silence_guard: Duration,
@@ -233,6 +232,7 @@ impl Default for LiveAudioTuning {
             initial_buffer: LIVE_PLAYBACK_INITIAL_BUFFER,
             max_reorder_delay: LIVE_PLAYBACK_MAX_REORDER_DELAY,
             max_speed_up: LIVE_PLAYBACK_MAX_SPEED_UP,
+            catch_up_start_excess: LIVE_PLAYBACK_CATCH_UP_START_EXCESS,
             silence_vad_max: LIVE_PLAYBACK_SILENCE_VAD_MAX,
             silence_min_gap: LIVE_PLAYBACK_SILENCE_MIN_GAP,
             silence_guard: LIVE_PLAYBACK_SILENCE_GUARD,
@@ -262,6 +262,12 @@ impl LiveAudioTuning {
         validate_duration_ms("severe-loss-hold-ms", self.severe_loss_hold, 100, 120_000)?;
         validate_duration_ms("initial-buffer-ms", self.initial_buffer, 0, 500)?;
         validate_duration_ms("max-reorder-delay-ms", self.max_reorder_delay, 0, 500)?;
+        validate_duration_ms(
+            "catch-up-start-excess-ms",
+            self.catch_up_start_excess,
+            0,
+            1_000,
+        )?;
         validate_duration_ms("silence-min-gap-ms", self.silence_min_gap, 20, 2_000)?;
         validate_duration_ms("silence-guard-ms", self.silence_guard, 0, 500)?;
         validate_duration_ms("silence-ramp-ms", self.silence_ramp, 0, 100)?;
@@ -800,13 +806,11 @@ pub struct LivePlaybackSnapshot {
     pub dred_recoveries: u64,
     pub plc_fallbacks: u64,
     pub decode_errors: u64,
-    pub resampler_errors: u64,
     pub direct_samples: u64,
     pub resampled_samples: u64,
     pub skipped_silence_ms: u64,
     pub silence_skip_count: u64,
     pub silence_skip_rejected: u64,
-    pub resampler_activations: u64,
 }
 
 impl PlaybackStats {
@@ -4012,14 +4016,6 @@ impl LiveJitterStream {
     }
 }
 
-const LIVE_PLAYBACK_INTERPOLATION: SincInterpolationParameters = SincInterpolationParameters {
-    sinc_len: 256,
-    f_cutoff: 0.95,
-    oversampling_factor: 128,
-    interpolation: SincInterpolationType::Cubic,
-    window: WindowFunction::BlackmanHarris,
-};
-
 #[derive(Default)]
 struct LivePlaybackMixer {
     tuning: LiveAudioTuning,
@@ -4036,13 +4032,11 @@ struct LivePlaybackMixerStats {
     dred_recoveries: u64,
     plc_fallbacks: u64,
     decode_errors: u64,
-    resampler_errors: u64,
     direct_samples: u64,
     resampled_samples: u64,
     skipped_silence_samples: u64,
     silence_skip_count: u64,
     silence_skip_rejected: u64,
-    resampler_activations: u64,
 }
 
 impl LivePlaybackMixer {
@@ -4091,8 +4085,7 @@ impl LivePlaybackMixer {
                 match AdaptivePlaybackStream::new(self.tuning) {
                     Ok(stream) => entry.insert(stream),
                     Err(error) => {
-                        self.stats.resampler_errors = self.stats.resampler_errors.saturating_add(1);
-                        eprintln!("failed to create live playback resampler: {error}");
+                        eprintln!("failed to create live playback stream: {error}");
                         return;
                     }
                 }
@@ -4166,13 +4159,11 @@ impl LivePlaybackMixer {
             dred_recoveries: self.stats.dred_recoveries,
             plc_fallbacks: self.stats.plc_fallbacks,
             decode_errors: self.stats.decode_errors,
-            resampler_errors: self.stats.resampler_errors,
             direct_samples: self.stats.direct_samples,
             resampled_samples: self.stats.resampled_samples,
             skipped_silence_ms: samples_to_ms(self.stats.skipped_silence_samples as usize),
             silence_skip_count: self.stats.silence_skip_count,
             silence_skip_rejected: self.stats.silence_skip_rejected,
-            resampler_activations: self.stats.resampler_activations,
         }
     }
 
@@ -4219,12 +4210,9 @@ impl LivePlaybackMixer {
 struct AdaptivePlaybackStream {
     tuning: LiveAudioTuning,
     input: MonoSampleQueue,
-    output: VecDeque<f32>,
-    resampler_output: Option<MonoResamplerOutput>,
-    resampler: Option<Async<f32>>,
-    output_delay_to_drop: usize,
-    queued_tail_source: Option<DecodedFrameSource>,
-    current_ratio: f64,
+    read_pos: f64,
+    phase_increment: f64,
+    smoothed_correction: f64,
     current_correction_percent: f32,
     recent_loss_events: VecDeque<Instant>,
     expanded_target_samples: usize,
@@ -4240,12 +4228,9 @@ impl AdaptivePlaybackStream {
         Ok(Self {
             tuning,
             input: MonoSampleQueue::new(),
-            output: VecDeque::with_capacity(LIVE_PLAYBACK_RESAMPLER_CHUNK * 2),
-            resampler_output: None,
-            resampler: None,
-            output_delay_to_drop: 0,
-            queued_tail_source: None,
-            current_ratio: 1.0,
+            read_pos: 1.0,
+            phase_increment: 1.0,
+            smoothed_correction: 0.0,
             current_correction_percent: 0.0,
             recent_loss_events: VecDeque::new(),
             expanded_target_samples: target_queue_samples(tuning),
@@ -4272,7 +4257,6 @@ impl AdaptivePlaybackStream {
         self.declick_recovery_boundary(&mut samples, source);
         self.input
             .push_back_with_source(&samples, source, silence_hint);
-        self.queued_tail_source = Some(source);
         self.enforce_hard_bound(now, stats);
     }
 
@@ -4305,52 +4289,44 @@ impl AdaptivePlaybackStream {
     }
 
     fn queued_tail_sample_and_source(&self) -> Option<(f32, DecodedFrameSource)> {
-        if self.queued_samples() == 0 {
-            return None;
-        }
-        self.input
-            .last_sample_and_source()
-            .or_else(|| self.output.back().copied().zip(self.queued_tail_source))
-    }
-
-    fn clear_tail_source_if_empty(&mut self) {
-        if self.queued_samples() == 0 {
-            self.queued_tail_source = None;
-        }
+        self.input.last_sample_and_source()
     }
 
     fn pop_sample(&mut self, now: Instant, stats: &mut LivePlaybackMixerStats) -> Option<f32> {
-        if let Some(sample) = self.output.pop_front() {
-            stats.resampled_samples = stats.resampled_samples.saturating_add(1);
-            self.clear_tail_source_if_empty();
-            return Some(sample);
-        }
-
         self.maybe_skip_silence(now, stats);
+        self.update_correction(now, stats);
 
-        if self.desired_correction(now) <= f64::EPSILON {
-            self.current_correction_percent = 0.0;
-            let sample = self.input.pop_front_sample();
-            if sample.is_some() {
-                stats.direct_samples = stats.direct_samples.saturating_add(1);
-            } else {
-                stats.underrun_count = stats.underrun_count.saturating_add(1);
-            }
-            self.clear_tail_source_if_empty();
-            return sample;
-        }
-
-        if self.output.is_empty() {
-            self.refill_output(now, stats);
-        }
-        let sample = self.output.pop_front();
-        if sample.is_some() {
-            stats.resampled_samples = stats.resampled_samples.saturating_add(1);
-        } else {
+        // Read at `read_pos` with a 4-tap Catmull-Rom kernel. `read_pos` is held
+        // in [1.0, 2.0): index `base` is the current sample, `base - 1` is the
+        // retained left-neighbour history, `base + 1`/`base + 2` are look-ahead.
+        let base = self.read_pos.floor() as usize;
+        if self.input.frames() < base + 3 {
             stats.underrun_count = stats.underrun_count.saturating_add(1);
+            return None;
         }
-        self.clear_tail_source_if_empty();
-        sample
+
+        let p1 = self.input.sample_at(base).unwrap_or(0.0);
+        let p0 = base
+            .checked_sub(1)
+            .and_then(|index| self.input.sample_at(index))
+            .unwrap_or(p1);
+        let p2 = self.input.sample_at(base + 1).unwrap_or(p1);
+        let p3 = self.input.sample_at(base + 2).unwrap_or(p2);
+        let frac = (self.read_pos - base as f64) as f32;
+
+        let sample = if self.phase_increment == 1.0 && frac == 0.0 {
+            stats.direct_samples = stats.direct_samples.saturating_add(1);
+            p1
+        } else {
+            stats.resampled_samples = stats.resampled_samples.saturating_add(1);
+            catmull_rom(p0, p1, p2, p3, frac)
+        };
+
+        self.read_pos += self.phase_increment;
+        let consumed = self.read_pos.floor() as usize - 1;
+        self.input.drain_samples(consumed);
+        self.read_pos -= consumed as f64;
+        Some(sample)
     }
 
     fn pop_output_sample(
@@ -4384,12 +4360,15 @@ impl AdaptivePlaybackStream {
         sample
     }
 
-    fn begin_output_block(&mut self, now: Instant, output_block_samples: usize) {
+    fn begin_output_block(&mut self, _now: Instant, output_block_samples: usize) {
         let output_block_samples = output_block_samples.max(1);
         let queued = self.queued_samples();
         // Avoid filling part of a hardware callback with audio and the rest
-        // with underrun silence when the device asks for a large block.
-        let target = self.adaptive_target_samples(now).max(output_block_samples);
+        // with underrun silence when the device asks for a large block. Use the
+        // low-latency playout target here; the loss-expanded target is only an
+        // allowance, not a reason to hold the output device silent for a long
+        // rebuffer.
+        let target = self.low_latency_target_samples().max(output_block_samples);
         self.output_target_floor_samples = output_block_samples;
         self.output_block_playable = if self.output_priming {
             let ready = queued >= target;
@@ -4406,97 +4385,33 @@ impl AdaptivePlaybackStream {
         self.output_block_remaining = output_block_samples;
     }
 
-    fn refill_output(&mut self, now: Instant, stats: &mut LivePlaybackMixerStats) {
-        if self.input.frames() == 0 {
-            return;
+    /// Advances the smoothed catch-up correction toward the queue-driven target
+    /// and updates `phase_increment`. A one-pole low-pass plus a per-sample slew
+    /// clamp keep the playback rate changing slowly so no audible modulation or
+    /// boundary step occurs.
+    fn update_correction(&mut self, now: Instant, stats: &mut LivePlaybackMixerStats) {
+        let target = self.desired_correction(now);
+        let previous = self.smoothed_correction;
+        let lowpassed = previous + LIVE_PLAYBACK_CORRECTION_ALPHA * (target - previous);
+        let smoothed = lowpassed.clamp(
+            previous - LIVE_PLAYBACK_CORRECTION_SLEW,
+            previous + LIVE_PLAYBACK_CORRECTION_SLEW,
+        );
+
+        if previous <= f64::EPSILON && smoothed > f64::EPSILON {
+            stats.correction_count = stats.correction_count.saturating_add(1);
         }
 
-        if self.ensure_resampler(stats).is_err() {
-            return;
-        }
-        self.update_resample_ratio(now, stats);
-        let input_frames_next = self.resampler.as_ref().unwrap().input_frames_next();
-        let partial_len = self.input.frames().min(input_frames_next);
-        let indexing = (partial_len < input_frames_next).then_some(Indexing {
-            input_offset: 0,
-            output_offset: 0,
-            active_channels_mask: None,
-            partial_len: Some(partial_len),
-        });
-
-        match self.resampler.as_mut().unwrap().process_into_buffer(
-            &self.input,
-            self.resampler_output.as_mut().unwrap(),
-            indexing.as_ref(),
-        ) {
-            Ok((consumed, generated)) => {
-                self.input.drain_samples(consumed);
-                self.resampler_output.as_mut().unwrap().drain_generated(
-                    generated,
-                    &mut self.output,
-                    &mut self.output_delay_to_drop,
-                );
-                if indexing.is_some() {
-                    self.output_delay_to_drop = self.resampler.as_ref().unwrap().output_delay();
-                }
-            }
-            Err(error) => {
-                stats.resampler_errors = stats.resampler_errors.saturating_add(1);
-                eprintln!("live playback resampler error: {error}");
-            }
-        }
-    }
-
-    fn ensure_resampler(&mut self, stats: &mut LivePlaybackMixerStats) -> Result<(), String> {
-        if self.resampler.is_some() {
-            return Ok(());
-        }
-
-        let resampler = Async::<f32>::new_sinc(
-            1.0,
-            LIVE_PLAYBACK_MAX_RESAMPLE_RATIO_RELATIVE,
-            &LIVE_PLAYBACK_INTERPOLATION,
-            LIVE_PLAYBACK_RESAMPLER_CHUNK,
-            1,
-            FixedAsync::Output,
-        )
-        .map_err(|error| error.to_string())?;
-        let output_delay_to_drop = resampler.output_delay();
-        let output_frames = resampler
-            .output_frames_max()
-            .max(LIVE_PLAYBACK_RESAMPLER_CHUNK);
-        self.resampler_output = Some(MonoResamplerOutput::new(output_frames));
-        self.output_delay_to_drop = output_delay_to_drop;
-        self.resampler = Some(resampler);
-        stats.resampler_activations = stats.resampler_activations.saturating_add(1);
-        Ok(())
-    }
-
-    fn update_resample_ratio(&mut self, now: Instant, stats: &mut LivePlaybackMixerStats) {
-        let correction = self.desired_correction(now);
-        let ratio = ratio_for_correction(correction, self.tuning);
-        if (ratio - self.current_ratio).abs() < 0.002 {
-            self.current_correction_percent = (correction * 100.0) as f32;
-            return;
-        }
-
-        let Some(resampler) = self.resampler.as_mut() else {
-            return;
+        self.smoothed_correction = smoothed;
+        self.phase_increment = if smoothed <= f64::EPSILON {
+            1.0
+        } else {
+            1.0 + smoothed
         };
-        match resampler.set_resample_ratio_relative(ratio, true) {
-            Ok(()) => {
-                self.current_ratio = ratio;
-                self.current_correction_percent = (correction * 100.0) as f32;
-                stats.correction_count = stats.correction_count.saturating_add(1);
-            }
-            Err(error) => {
-                stats.resampler_errors = stats.resampler_errors.saturating_add(1);
-                eprintln!("failed to update live playback ratio: {error}");
-            }
-        }
+        self.current_correction_percent = (smoothed * 100.0) as f32;
     }
 
-    fn desired_correction(&self, now: Instant) -> f64 {
+    fn desired_correction(&self, _now: Instant) -> f64 {
         if !self.tuning.adaptive_catch_up {
             return 0.0;
         }
@@ -4506,8 +4421,8 @@ impl AdaptivePlaybackStream {
             return 0.0;
         }
 
-        let catchup_target = self.adaptive_target_samples(now).max(target);
-        let catchup_start = catchup_target.saturating_add(catch_up_start_excess_samples());
+        let catchup_start =
+            target.saturating_add(samples_for_duration(self.tuning.catch_up_start_excess));
         if queued <= catchup_start {
             return 0.0;
         }
@@ -4518,21 +4433,22 @@ impl AdaptivePlaybackStream {
         (self.tuning.max_speed_up * (over / range)).min(self.tuning.max_speed_up)
     }
 
-    fn maybe_skip_silence(&mut self, now: Instant, stats: &mut LivePlaybackMixerStats) {
+    fn maybe_skip_silence(&mut self, _now: Instant, stats: &mut LivePlaybackMixerStats) {
         if !self.tuning.playback_silence_skip {
             return;
         }
         let queued = self.queued_samples();
-        let catchup_target = self
-            .adaptive_target_samples(now)
-            .max(target_queue_samples(self.tuning));
+        let catchup_target = self.low_latency_target_samples();
         if queued <= catchup_target {
             return;
         }
 
         let excess = queued.saturating_sub(catchup_target);
+        // Never drain inside the active interpolation window [0, base + 2]; the
+        // silence guard keeps the found run far past it, but make it explicit.
+        let window_end = self.read_pos.ceil() as usize + 2;
         match self.input.find_silence_skip(self.tuning, excess) {
-            Some((skip_start, skip_len)) => {
+            Some((skip_start, skip_len)) if skip_start > window_end => {
                 self.input
                     .ramp_around_skip(self.tuning, skip_start, skip_len);
                 self.input.drain_range(skip_start, skip_len);
@@ -4547,7 +4463,7 @@ impl AdaptivePlaybackStream {
                     target_ms = samples_to_ms(catchup_target)
                 );
             }
-            None => {
+            _ => {
                 stats.silence_skip_rejected = stats.silence_skip_rejected.saturating_add(1);
             }
         }
@@ -4593,6 +4509,10 @@ impl AdaptivePlaybackStream {
         }
     }
 
+    fn low_latency_target_samples(&self) -> usize {
+        target_queue_samples(self.tuning).max(self.output_target_floor_samples)
+    }
+
     fn enforce_hard_bound(&mut self, now: Instant, stats: &mut LivePlaybackMixerStats) {
         let hard_bound = samples_for_duration(self.tuning.hard_queue_bound);
         let queued = self.queued_samples();
@@ -4614,16 +4534,15 @@ impl AdaptivePlaybackStream {
         );
     }
 
-    fn drop_oldest(&mut self, mut samples: usize) {
-        let output_drop = samples.min(self.output.len());
-        self.output.drain(..output_drop);
-        samples -= output_drop;
+    fn drop_oldest(&mut self, samples: usize) {
         self.input.drain_samples(samples);
-        self.clear_tail_source_if_empty();
+        // The front sample identity changed, so reset the read cursor to its
+        // base. The history tap is briefly absent and falls back to `p0 = p1`.
+        self.read_pos = 1.0;
     }
 
     fn queued_samples(&self) -> usize {
-        self.input.frames() + self.output.len()
+        self.input.frames()
     }
 }
 
@@ -4686,6 +4605,13 @@ impl MonoSampleQueue {
 
     fn drain_samples(&mut self, samples: usize) {
         self.drain_range(0, samples);
+    }
+
+    fn frames(&self) -> usize {
+        self.frames
+            .iter()
+            .map(QueuedAudioFrame::remaining_len)
+            .sum()
     }
 
     fn find_silence_skip(
@@ -4771,6 +4697,12 @@ impl MonoSampleQueue {
         }
     }
 
+    fn sample_at(&self, absolute_index: usize) -> Option<f32> {
+        let (frame_index, local_index, _) = self.find_frame_at(absolute_index)?;
+        let frame = self.frames.get(frame_index)?;
+        frame.samples.get(frame.offset + local_index).copied()
+    }
+
     fn sample_mut(&mut self, absolute_index: usize) -> Option<&mut f32> {
         let (frame_index, local_index, _) = self.find_frame_at(absolute_index)?;
         let frame = self.frames.get_mut(frame_index)?;
@@ -4814,92 +4746,8 @@ impl QueuedAudioFrame {
     }
 }
 
-unsafe impl Adapter<'_, f32> for MonoSampleQueue {
-    unsafe fn read_sample_unchecked(&self, channel: usize, frame: usize) -> f32 {
-        if channel != 0 {
-            return 0.0;
-        }
-        let Some((frame_index, local_index, _)) = self.find_frame_at(frame) else {
-            return 0.0;
-        };
-        let Some(audio_frame) = self.frames.get(frame_index) else {
-            return 0.0;
-        };
-        audio_frame
-            .samples
-            .get(audio_frame.offset + local_index)
-            .copied()
-            .unwrap_or_default()
-    }
-
-    fn channels(&self) -> usize {
-        1
-    }
-
-    fn frames(&self) -> usize {
-        self.frames
-            .iter()
-            .map(QueuedAudioFrame::remaining_len)
-            .sum()
-    }
-}
-
-struct MonoResamplerOutput {
-    samples: Vec<f32>,
-}
-
-impl MonoResamplerOutput {
-    fn new(frames: usize) -> Self {
-        Self {
-            samples: vec![0.0; frames],
-        }
-    }
-
-    fn drain_generated(
-        &mut self,
-        generated: usize,
-        output: &mut VecDeque<f32>,
-        delay_to_drop: &mut usize,
-    ) {
-        let generated = generated.min(self.samples.len());
-        let drop = (*delay_to_drop).min(generated);
-        *delay_to_drop -= drop;
-        output.extend(self.samples[drop..generated].iter().copied());
-    }
-}
-
-unsafe impl AdapterMut<'_, f32> for MonoResamplerOutput {
-    unsafe fn write_sample_unchecked(&mut self, channel: usize, frame: usize, value: &f32) -> bool {
-        if channel == 0 && frame < self.samples.len() {
-            self.samples[frame] = *value;
-        }
-        false
-    }
-}
-
-unsafe impl Adapter<'_, f32> for MonoResamplerOutput {
-    unsafe fn read_sample_unchecked(&self, channel: usize, frame: usize) -> f32 {
-        if channel != 0 {
-            return 0.0;
-        }
-        self.samples.get(frame).copied().unwrap_or_default()
-    }
-
-    fn channels(&self) -> usize {
-        1
-    }
-
-    fn frames(&self) -> usize {
-        self.samples.len()
-    }
-}
-
 fn target_queue_samples(tuning: LiveAudioTuning) -> usize {
     samples_for_duration(tuning.target_queue)
-}
-
-fn catch_up_start_excess_samples() -> usize {
-    samples_for_duration(LIVE_PLAYBACK_CATCH_UP_START_EXCESS)
 }
 
 fn samples_for_duration(duration: Duration) -> usize {
@@ -4931,9 +4779,17 @@ fn validate_duration_ms(
     Ok(())
 }
 
-fn ratio_for_correction(correction: f64, tuning: LiveAudioTuning) -> f64 {
-    let correction = correction.clamp(0.0, tuning.max_speed_up);
-    1.0 / (1.0 + correction)
+/// Interpolates a sample at fractional position `t` in `[0, 1]` between `p1`
+/// (`t = 0`) and `p2` (`t = 1`) using the Catmull-Rom cubic with `p0` and `p3`
+/// as outer neighbours. The curve passes through `p1` and `p2` exactly, so a
+/// read at `t = 0` returns the input sample unchanged.
+fn catmull_rom(p0: f32, p1: f32, p2: f32, p3: f32, t: f32) -> f32 {
+    let t2 = t * t;
+    let t3 = t2 * t;
+    0.5 * (2.0 * p1
+        + (-p0 + p2) * t
+        + (2.0 * p0 - 5.0 * p1 + 4.0 * p2 - p3) * t2
+        + (-p0 + 3.0 * p1 - 3.0 * p2 + p3) * t3)
 }
 
 fn sequence_distance_forward(from: u32, to: u32) -> Option<u32> {
@@ -7694,7 +7550,7 @@ mod tests {
         assert_eq!(stream.pop_sample(now, &mut stats), Some(0.25));
         assert_eq!(stats.direct_samples, 1);
         assert_eq!(stats.resampled_samples, 0);
-        assert_eq!(stats.resampler_activations, 0);
+        assert_eq!(stats.correction_count, 0);
     }
 
     #[test]
@@ -7745,11 +7601,40 @@ mod tests {
 
         stream.queue_samples(&[0.25], DecodedFrameSource::Normal, false, now, &mut stats);
 
-        let samples = (0..block)
-            .map(|_| stream.pop_output_sample(now, &mut stats, block))
-            .collect::<Vec<_>>();
-        assert!(samples.iter().all(|sample| *sample == Some(0.25)));
-        assert_eq!(stream.queued_samples(), 0);
+        // Direct playback is bit-exact. The interpolator keeps up to three
+        // look-ahead samples it cannot bracket, so the block drains to that tail
+        // rather than fully to zero.
+        for index in 0..block - 3 {
+            assert_eq!(
+                stream.pop_output_sample(now, &mut stats, block),
+                Some(0.25),
+                "block sample {index}"
+            );
+        }
+        assert!(stream.queued_samples() <= 3);
+    }
+
+    #[test]
+    fn adaptive_stream_output_priming_uses_low_latency_target_under_loss() {
+        let now = Instant::now();
+        let mut stream = AdaptivePlaybackStream::new(test_tuning()).unwrap();
+        let mut stats = LivePlaybackMixerStats::default();
+        let block = samples_for_duration(Duration::from_millis(20));
+
+        for index in 0..8 {
+            stream.note_loss(now + Duration::from_millis(index));
+        }
+        assert_eq!(samples_to_ms(stream.adaptive_target_samples(now)), 1_000);
+
+        stream.queue_samples(
+            &vec![0.25; target_queue_samples(test_tuning())],
+            DecodedFrameSource::Normal,
+            false,
+            now,
+            &mut stats,
+        );
+
+        assert_eq!(stream.pop_output_sample(now, &mut stats, block), Some(0.25));
     }
 
     #[test]
@@ -7767,11 +7652,11 @@ mod tests {
             &mut stats,
         );
 
-        let samples: Vec<f32> = (0..8)
-            .map(|_| stream.pop_sample(now, &mut stats).unwrap())
-            .collect();
-        assert!((samples[3] - samples[4]).abs() < f32::EPSILON);
-        assert!(samples[5] < 0.4);
+        // The de-click ramp removes the boundary delta over the start of the
+        // Normal frame: its first sample meets the last Dred sample (-0.1) and
+        // then ramps back toward the true 0.4 level.
+        assert!((stream.input.sample_at(4).unwrap() - (-0.1)).abs() < f32::EPSILON);
+        assert!(stream.input.sample_at(5).unwrap() < 0.4);
     }
 
     #[test]
@@ -7795,11 +7680,10 @@ mod tests {
             &mut stats,
         );
 
-        let samples: Vec<f32> = (0..8)
-            .map(|_| stream.pop_sample(now, &mut stats).unwrap())
-            .collect();
-        assert_eq!(samples[3], -0.1);
-        assert_eq!(samples[4], 0.4);
+        // No de-click between two Normal frames: the boundary samples are left
+        // exactly as queued.
+        assert_eq!(stream.input.sample_at(3).unwrap(), -0.1);
+        assert_eq!(stream.input.sample_at(4).unwrap(), 0.4);
     }
 
     #[test]
@@ -7839,7 +7723,136 @@ mod tests {
         assert_eq!(stream.desired_correction(now), 0.0);
         assert_eq!(stream.pop_sample(now, &mut stats), Some(0.25));
         assert_eq!(stats.direct_samples, 1);
-        assert_eq!(stats.resampler_activations, 0);
+        assert_eq!(stats.correction_count, 0);
+    }
+
+    #[test]
+    fn adaptive_stream_catches_up_against_low_latency_target_under_loss() {
+        let now = Instant::now();
+        let mut stream = AdaptivePlaybackStream::new(test_tuning()).unwrap();
+
+        for index in 0..8 {
+            stream.note_loss(now + Duration::from_millis(index));
+        }
+        assert_eq!(samples_to_ms(stream.adaptive_target_samples(now)), 1_000);
+
+        stream.input.push_back(
+            &vec![0.0; samples_for_duration(Duration::from_millis(500))],
+            false,
+        );
+
+        assert!(stream.desired_correction(now) > 0.0);
+    }
+
+    /// Drains a backlog through the stream while keeping its queue above target,
+    /// returning every output sample. The look-ahead tail of three samples is
+    /// left queued so playback never underruns at the end.
+    fn drain_catch_up(stream: &mut AdaptivePlaybackStream, now: Instant) -> Vec<f32> {
+        let mut stats = LivePlaybackMixerStats::default();
+        let mut output = Vec::new();
+        while stream.queued_samples() > 8 {
+            match stream.pop_sample(now, &mut stats) {
+                Some(sample) => output.push(sample),
+                None => break,
+            }
+        }
+        assert_eq!(stats.underrun_count, 0, "catch-up must not underrun");
+        assert!(
+            stats.resampled_samples > 0,
+            "catch-up resampling path must engage"
+        );
+        output
+    }
+
+    #[test]
+    fn adaptive_catch_up_stays_continuous_on_forced_speech() {
+        let now = Instant::now();
+        let mut tuning = test_tuning();
+        // Force the resampler path the moment the queue exceeds target.
+        tuning.catch_up_start_excess = Duration::ZERO;
+        let mut stream = AdaptivePlaybackStream::new(tuning).unwrap();
+        let mut stats = LivePlaybackMixerStats::default();
+
+        let mut speech = Vec::new();
+        for frame in sample_speech_frames() {
+            speech.extend_from_slice(frame);
+            if speech.len() >= samples_for_duration(Duration::from_millis(700)) {
+                break;
+            }
+        }
+        let backlog = samples_for_duration(Duration::from_millis(600));
+        stream.queue_samples(
+            &speech[..backlog],
+            DecodedFrameSource::Normal,
+            false,
+            now,
+            &mut stats,
+        );
+
+        let input_delta = max_adjacent_delta(&speech[..backlog]);
+        let output = drain_catch_up(&mut stream, now);
+        let output_delta = max_adjacent_delta(&output);
+        // A direct/resample splice (the original defect) produced sample steps
+        // far larger than the source. Continuous interpolation stays near it.
+        assert!(
+            output_delta <= input_delta * 2.0,
+            "output_delta={output_delta} input_delta={input_delta}"
+        );
+    }
+
+    #[test]
+    fn adaptive_catch_up_stays_continuous_on_forced_sine() {
+        let now = Instant::now();
+        let mut tuning = test_tuning();
+        tuning.catch_up_start_excess = Duration::ZERO;
+        let mut stream = AdaptivePlaybackStream::new(tuning).unwrap();
+        let mut stats = LivePlaybackMixerStats::default();
+
+        let total = samples_for_duration(Duration::from_millis(600));
+        let sine: Vec<f32> = (0..total)
+            .map(|n| {
+                let phase = 2.0 * std::f64::consts::PI * 440.0 * n as f64 / SAMPLE_RATE as f64;
+                (phase.sin() as f32) * 0.5
+            })
+            .collect();
+        stream.queue_samples(&sine, DecodedFrameSource::Normal, false, now, &mut stats);
+
+        let input_delta = max_adjacent_delta(&sine);
+        let output = drain_catch_up(&mut stream, now);
+        let output_delta = max_adjacent_delta(&output);
+        // A 440 Hz sine has a tiny per-sample step; <=15% catch-up only mildly
+        // increases it, while any discontinuity would dwarf this bound.
+        assert!(
+            output_delta <= input_delta * 1.5,
+            "output_delta={output_delta} input_delta={input_delta}"
+        );
+    }
+
+    #[test]
+    fn adaptive_catch_up_stays_continuous_after_hard_trim() {
+        let now = Instant::now();
+        let mut stream = AdaptivePlaybackStream::new(test_tuning()).unwrap();
+        let mut stats = LivePlaybackMixerStats::default();
+
+        let total = samples_for_duration(Duration::from_millis(2_000));
+        let sine: Vec<f32> = (0..total)
+            .map(|n| {
+                let phase = 2.0 * std::f64::consts::PI * 440.0 * n as f64 / SAMPLE_RATE as f64;
+                (phase.sin() as f32) * 0.5
+            })
+            .collect();
+        // Queue beyond the 1.5 s hard bound to force a trim, which resets the
+        // read cursor. Playback must stay continuous afterwards.
+        stream.queue_samples(&sine, DecodedFrameSource::Normal, false, now, &mut stats);
+        assert!(stats.hard_trim_count > 0, "hard-trim must fire");
+
+        let input_delta = max_adjacent_delta(&sine);
+        let output = drain_catch_up(&mut stream, now);
+        let output_delta = max_adjacent_delta(&output);
+        assert!(
+            output_delta <= input_delta * 1.5,
+            "output_delta={output_delta} input_delta={input_delta}"
+        );
     }
 
     #[test]

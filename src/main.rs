@@ -1597,16 +1597,22 @@ impl App {
         } else {
             stats.direct_samples.saturating_mul(100) / played_samples
         };
+        let loss_target = if stats.adaptive_target_ms > stats.target_queue_ms {
+            format!(" loss_target{}ms", stats.adaptive_target_ms)
+        } else {
+            String::new()
+        };
         self.set_status(format!(
-            "audio q{}ms target{}ms speed{:+.1}% enc{} direct{}% skip{}ms/{} rs{} dred{} plc{} trims{} underruns{} rx {}/{}",
+            "audio q{}ms target{}ms{} speed{:+.1}% enc{} direct{}% skip{}ms/{} catchup{} dred{} plc{} trims{} underruns{} rx {}/{}",
             stats.max_queue_ms,
-            stats.adaptive_target_ms,
+            stats.target_queue_ms,
+            loss_target,
             stats.correction_percent,
             self.encoder_profile.label(),
             direct_percent,
             stats.skipped_silence_ms,
             stats.silence_skip_count,
-            stats.resampler_activations,
+            stats.correction_count,
             stats.dred_recoveries,
             stats.plc_fallbacks,
             stats.hard_trim_count,

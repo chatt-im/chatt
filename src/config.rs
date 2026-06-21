@@ -190,6 +190,8 @@ pub struct AudioLatencyConfig {
     pub max_reorder_delay_ms: u64,
     #[toml(default = 0.15)]
     pub max_speed_up: f64,
+    #[toml(default = 80)]
+    pub catch_up_start_excess_ms: u64,
     #[toml(default = 64)]
     pub silence_vad_max: u8,
     #[toml(default = 250)]
@@ -227,6 +229,7 @@ impl Default for AudioLatencyConfig {
             initial_buffer_ms: duration_ms(tuning.initial_buffer),
             max_reorder_delay_ms: duration_ms(tuning.max_reorder_delay),
             max_speed_up: tuning.max_speed_up,
+            catch_up_start_excess_ms: duration_ms(tuning.catch_up_start_excess),
             silence_vad_max: tuning.silence_vad_max,
             silence_min_gap_ms: duration_ms(tuning.silence_min_gap),
             silence_guard_ms: duration_ms(tuning.silence_guard),
@@ -256,6 +259,7 @@ impl AudioLatencyConfig {
             initial_buffer: Duration::from_millis(self.initial_buffer_ms),
             max_reorder_delay: Duration::from_millis(self.max_reorder_delay_ms),
             max_speed_up: self.max_speed_up,
+            catch_up_start_excess: Duration::from_millis(self.catch_up_start_excess_ms),
             silence_vad_max: self.silence_vad_max,
             silence_min_gap: Duration::from_millis(self.silence_min_gap_ms),
             silence_guard: Duration::from_millis(self.silence_guard_ms),
@@ -959,6 +963,11 @@ fn write_runtime_config<'de>(root: &mut Table<'de>, config: &Config, arena: &'de
         latency.insert(
             Key::new("max-speed-up"),
             Item::from(config.audio.latency.max_speed_up),
+            arena,
+        );
+        latency.insert(
+            Key::new("catch-up-start-excess-ms"),
+            Item::from(config.audio.latency.catch_up_start_excess_ms as i64),
             arena,
         );
         latency.insert(
