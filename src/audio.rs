@@ -16,6 +16,7 @@ use cpal::{
     BufferSize, FromSample, Sample, SampleFormat, Stream, StreamConfig, SupportedBufferSize,
     SupportedStreamConfig, traits::DeviceTrait, traits::HostTrait, traits::StreamTrait,
 };
+use earshot::Detector as EarshotDetector;
 use nnnoiseless::DenoiseState;
 use opus_codec::{Channels, Complexity, Decoder, DredDecoder, DredState, SampleRate};
 use rubato::{
@@ -49,6 +50,13 @@ const LIVE_PLAYBACK_RESAMPLER_CHUNK: usize = 240;
 const LIVE_PLAYBACK_MAX_SPEED_UP: f64 = 0.15;
 const LIVE_PLAYBACK_MAX_RESAMPLE_RATIO_RELATIVE: f64 = 1.20;
 const LIVE_PLAYBACK_DRED_MAX_SAMPLES: usize = SAMPLE_RATE as usize;
+const LIVE_PLAYBACK_SILENCE_VAD_MAX: u8 = 64;
+const LIVE_PLAYBACK_SILENCE_MIN_GAP: Duration = Duration::from_millis(250);
+const LIVE_PLAYBACK_SILENCE_GUARD: Duration = Duration::from_millis(40);
+const LIVE_PLAYBACK_SILENCE_RAMP: Duration = Duration::from_millis(10);
+const LIVE_PLAYBACK_SILENCE_MAX_SKIP: Duration = Duration::from_millis(200);
+const LIVE_PLAYBACK_SILENCE_MIN_SKIP: Duration = Duration::from_millis(20);
+const LIVE_PLAYBACK_SILENCE_RANGE_COUNT: usize = 2;
 const MAX_OPUS_DECODE_SAMPLES: usize = 5_760;
 const MAX_OPUS_PACKET_BYTES: usize = 1_500;
 
@@ -123,7 +131,14 @@ pub struct RemoteVoicePacket {
     pub stream_id: u32,
     pub sequence: u32,
     pub flags: u8,
+    pub silence_ranges: u64,
     pub payload: Vec<u8>,
+}
+
+#[derive(Clone, Debug)]
+pub struct LocalVoiceFrame {
+    pub payload: Vec<u8>,
+    pub silence_ranges: u64,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -517,6 +532,12 @@ pub struct LivePlaybackSnapshot {
     pub plc_fallbacks: u64,
     pub decode_errors: u64,
     pub resampler_errors: u64,
+    pub direct_samples: u64,
+    pub resampled_samples: u64,
+    pub skipped_silence_ms: u64,
+    pub silence_skip_count: u64,
+    pub silence_skip_rejected: u64,
+    pub resampler_activations: u64,
 }
 
 impl PlaybackStats {
@@ -754,7 +775,7 @@ pub fn start_recording(config: RecordingConfig) -> Result<Recording, String> {
 
 pub fn start_live_capture<F>(config: LiveCaptureConfig, on_packet: F) -> Result<LiveCapture, String>
 where
-    F: FnMut(Vec<u8>) + Send + 'static,
+    F: FnMut(LocalVoiceFrame) + Send + 'static,
 {
     let (device, selection) = with_audio_backend_stderr_suppressed(|| {
         let host = cpal::default_host();
@@ -1487,6 +1508,22 @@ fn peak_i16_scale(samples: &[f32]) -> f32 {
         .clamp(0.0, 1.0)
 }
 
+fn rms_normalized(samples: &[f32]) -> f32 {
+    if samples.is_empty() {
+        return 0.0;
+    }
+    let square_sum = samples.iter().map(|sample| sample * sample).sum::<f32>();
+    (square_sum / samples.len() as f32).sqrt()
+}
+
+fn peak_normalized(samples: &[f32]) -> f32 {
+    samples
+        .iter()
+        .map(|sample| sample.abs())
+        .fold(0.0, f32::max)
+        .clamp(0.0, 1.0)
+}
+
 struct AutoGain {
     max_amplification: f32,
     current_gain: f32,
@@ -1562,6 +1599,142 @@ impl AutoGain {
     }
 }
 
+struct EarshotVad {
+    detector: EarshotDetector,
+    pending_16k: VecDeque<i16>,
+    decimator: [f32; 3],
+    decimator_len: usize,
+    last_score: f32,
+}
+
+impl EarshotVad {
+    fn new() -> Self {
+        Self {
+            detector: EarshotDetector::default(),
+            pending_16k: VecDeque::with_capacity(512),
+            decimator: [0.0; 3],
+            decimator_len: 0,
+            last_score: 0.0,
+        }
+    }
+
+    fn process_48k_frame(&mut self, samples: &[f32]) -> f32 {
+        let mut score = self.last_score;
+        for sample in samples {
+            self.decimator[self.decimator_len] = *sample;
+            self.decimator_len += 1;
+            if self.decimator_len == self.decimator.len() {
+                let averaged = self.decimator.iter().sum::<f32>() / self.decimator.len() as f32;
+                self.pending_16k
+                    .push_back(averaged.round().clamp(i16::MIN as f32, i16::MAX as f32) as i16);
+                self.decimator_len = 0;
+            }
+        }
+
+        while self.pending_16k.len() >= 256 {
+            let mut frame = [0i16; 256];
+            for sample in &mut frame {
+                *sample = self.pending_16k.pop_front().unwrap_or_default();
+            }
+            score = self.detector.predict_i16(&frame).clamp(0.0, 1.0);
+            self.last_score = score;
+        }
+
+        score
+    }
+}
+
+fn vad_to_u8(vad_probability: f32) -> u8 {
+    (vad_probability.clamp(0.0, 1.0) * u8::MAX as f32).round() as u8
+}
+
+fn is_capture_skip_safe_silence(vad: u8, samples: &[f32]) -> bool {
+    vad <= LIVE_PLAYBACK_SILENCE_VAD_MAX
+        && peak_i16_scale(samples) < 0.20
+        && rms_i16_scale(samples) < 0.05
+}
+
+struct SilenceRangeTracker {
+    frames: VecDeque<bool>,
+    max_frames: usize,
+}
+
+impl SilenceRangeTracker {
+    fn new() -> Self {
+        let max_frames = (samples_for_duration(LIVE_PLAYBACK_DRED_HORIZON) / FRAME_SAMPLES)
+            .saturating_add(1)
+            .max(1);
+        Self {
+            frames: VecDeque::with_capacity(max_frames),
+            max_frames,
+        }
+    }
+
+    fn observe_frame(&mut self, silence: bool) -> u64 {
+        self.frames.push_front(silence);
+        while self.frames.len() > self.max_frames {
+            self.frames.pop_back();
+        }
+        self.encode()
+    }
+
+    fn encode(&self) -> u64 {
+        let mut encoded = 0u64;
+        let mut range = 0usize;
+        let mut index = 0usize;
+
+        while index < self.frames.len() && range < LIVE_PLAYBACK_SILENCE_RANGE_COUNT {
+            while index < self.frames.len() && !self.frames[index] {
+                index += 1;
+            }
+            if index >= self.frames.len() {
+                break;
+            }
+
+            let start_frame = index;
+            while index < self.frames.len() && self.frames[index] {
+                index += 1;
+            }
+            let frame_len = index - start_frame;
+            let start_samples = start_frame
+                .saturating_mul(FRAME_SAMPLES)
+                .min(u16::MAX as usize);
+            let len_samples = frame_len
+                .saturating_mul(FRAME_SAMPLES)
+                .min(u16::MAX as usize);
+            encoded |= pack_silence_range(range, start_samples as u16, len_samples as u16);
+            range += 1;
+        }
+
+        encoded
+    }
+}
+
+fn pack_silence_range(range: usize, start_samples: u16, len_samples: u16) -> u64 {
+    let shift = range.saturating_mul(32);
+    if shift >= u64::BITS as usize {
+        return 0;
+    }
+    let packed = u32::from(start_samples) | (u32::from(len_samples) << 16);
+    u64::from(packed) << shift
+}
+
+fn silence_ranges_contain(silence_ranges: u64, offset_samples: usize) -> bool {
+    for range in 0..LIVE_PLAYBACK_SILENCE_RANGE_COUNT {
+        let shift = range * 32;
+        let packed = ((silence_ranges >> shift) & u64::from(u32::MAX)) as u32;
+        let start = (packed & 0xffff) as usize;
+        let len = (packed >> 16) as usize;
+        if len == 0 {
+            continue;
+        }
+        if offset_samples >= start && offset_samples < start.saturating_add(len) {
+            return true;
+        }
+    }
+    false
+}
+
 fn store_processed_level_stats(stats: &AudioStats, samples: &[f32]) {
     let rms = rms_i16_scale(samples);
     let peak = peak_i16_scale(samples);
@@ -1612,7 +1785,7 @@ fn run_live_encoder_worker<F>(
     stats: AudioStats,
     mut on_packet: F,
 ) where
-    F: FnMut(Vec<u8>) + Send + 'static,
+    F: FnMut(LocalVoiceFrame) + Send + 'static,
 {
     let result = run_live_encoder_worker_inner(
         receiver,
@@ -1685,9 +1858,11 @@ fn run_live_encoder_worker_inner<F>(
     on_packet: &mut F,
 ) -> Result<(), String>
 where
-    F: FnMut(Vec<u8>),
+    F: FnMut(LocalVoiceFrame),
 {
     let mut denoise = DenoiseState::new();
+    let mut earshot = EarshotVad::new();
+    let mut silence_tracker = SilenceRangeTracker::new();
     let mut auto_gain = AutoGain::new(f32::from_bits(
         max_amplification_bits.load(Ordering::Relaxed),
     ));
@@ -1707,17 +1882,23 @@ where
                 frame.copy_from_slice(&denoised_frame);
                 vad
             } else {
-                0.0
+                earshot.process_48k_frame(frame)
             };
             store_processed_level_stats(stats, frame);
             stats
                 .inner
                 .vad_bits
                 .store(vad_probability.to_bits(), Ordering::Relaxed);
+            let vad = vad_to_u8(vad_probability);
+            let silence_ranges =
+                silence_tracker.observe_frame(is_capture_skip_safe_silence(vad, frame));
 
             convert_i16_scale_to_pcm_i16(frame, &mut opus_frame);
             let packet_len = encoder.encode(&opus_frame, &mut encoded)?;
-            on_packet(encoded[..packet_len].to_vec());
+            on_packet(LocalVoiceFrame {
+                payload: encoded[..packet_len].to_vec(),
+                silence_ranges,
+            });
             stats.inner.encoded_packets.fetch_add(1, Ordering::Relaxed);
             stats
                 .inner
@@ -1773,6 +1954,7 @@ fn handle_live_playback_command(
             let packet_ref = AudioPacketRef {
                 sequence: packet.sequence,
                 flags: packet.flags,
+                silence_ranges: packet.silence_ranges,
                 payload: &packet.payload,
             };
             let _ = stream.insert(packet_ref, Instant::now());
@@ -1798,9 +1980,9 @@ fn drain_live_decode_streams(
     now: Instant,
 ) {
     for (stream_id, stream) in streams {
-        stream.drain_ready(now, frame, |samples, source| {
+        stream.drain_ready(now, frame, |samples, source, silence_hint| {
             if let Ok(mut mixer) = mixer.lock() {
-                mixer.queue_stream_samples(*stream_id, samples, source, now);
+                mixer.queue_stream_samples(*stream_id, samples, source, silence_hint, now);
             }
         });
     }
@@ -1838,16 +2020,21 @@ impl LiveDecodeStream {
         &mut self,
         now: Instant,
         frame: &mut [i16],
-        mut on_samples: impl FnMut(&[f32], DecodedFrameSource),
+        mut on_samples: impl FnMut(&[f32], DecodedFrameSource, bool),
     ) {
         let items = self.jitter.drain_ready(now);
         for (index, item) in items.iter().enumerate() {
             match item {
-                PlayoutItem::Audio { payload, .. } => {
+                PlayoutItem::Audio {
+                    payload,
+                    silence_ranges,
+                    ..
+                } => {
                     self.decode_playout(
                         payload,
                         frame,
                         DecodedFrameSource::Normal,
+                        silence_ranges_contain(*silence_ranges, 0),
                         &mut on_samples,
                     );
                 }
@@ -1863,6 +2050,7 @@ impl LiveDecodeStream {
                             &[],
                             &mut frame[..plc_samples],
                             DecodedFrameSource::Plc,
+                            false,
                             &mut on_samples,
                         );
                     }
@@ -1877,14 +2065,15 @@ impl LiveDecodeStream {
         payload: &[u8],
         frame: &mut [i16],
         source: DecodedFrameSource,
-        on_samples: &mut impl FnMut(&[f32], DecodedFrameSource),
+        silence_hint: bool,
+        on_samples: &mut impl FnMut(&[f32], DecodedFrameSource, bool),
     ) {
         let mut float_frame = vec![0.0f32; frame.len()];
         match self.decoder.decode_float(payload, &mut float_frame, false) {
-            Ok(decoded) => on_samples(&float_frame[..decoded], source),
+            Ok(decoded) => on_samples(&float_frame[..decoded], source, silence_hint),
             Err(error) => {
                 eprintln!("failed to decode live opus packet: {error}");
-                on_samples(&[], DecodedFrameSource::DecodeError);
+                on_samples(&[], DecodedFrameSource::DecodeError, false);
             }
         }
     }
@@ -1894,7 +2083,7 @@ impl LiveDecodeStream {
         missing_sequence: u32,
         future_items: &[PlayoutItem],
         frame: &mut [i16],
-        on_samples: &mut impl FnMut(&[f32], DecodedFrameSource),
+        on_samples: &mut impl FnMut(&[f32], DecodedFrameSource, bool),
     ) -> bool {
         let Some(dred_decoder) = self.dred_decoder.as_mut() else {
             return false;
@@ -1902,7 +2091,12 @@ impl LiveDecodeStream {
 
         let mut float_frame = vec![0.0f32; frame.len()];
         for item in future_items {
-            let PlayoutItem::Audio { sequence, payload } = item else {
+            let PlayoutItem::Audio {
+                sequence,
+                payload,
+                silence_ranges,
+            } = item
+            else {
                 continue;
             };
             let Some(distance) = sequence_distance_forward(missing_sequence, *sequence) else {
@@ -1936,6 +2130,7 @@ impl LiveDecodeStream {
                 continue;
             }
 
+            let silence_hint = silence_ranges_contain(*silence_ranges, offset_samples as usize);
             let Ok(offset_samples) = i32::try_from(offset_samples) else {
                 continue;
             };
@@ -1946,7 +2141,11 @@ impl LiveDecodeStream {
                 &mut float_frame,
             ) {
                 Ok(decoded) if decoded > 0 => {
-                    on_samples(&float_frame[..decoded], DecodedFrameSource::Dred);
+                    on_samples(
+                        &float_frame[..decoded],
+                        DecodedFrameSource::Dred,
+                        silence_hint,
+                    );
                     return true;
                 }
                 Ok(_) => {}
@@ -2025,6 +2224,12 @@ struct LivePlaybackMixerStats {
     plc_fallbacks: u64,
     decode_errors: u64,
     resampler_errors: u64,
+    direct_samples: u64,
+    resampled_samples: u64,
+    skipped_silence_samples: u64,
+    silence_skip_count: u64,
+    silence_skip_rejected: u64,
+    resampler_activations: u64,
 }
 
 impl LivePlaybackMixer {
@@ -2037,6 +2242,7 @@ impl LivePlaybackMixer {
         stream_id: u32,
         samples: &[f32],
         source: DecodedFrameSource,
+        silence_hint: bool,
         now: Instant,
     ) {
         match source {
@@ -2070,7 +2276,7 @@ impl LivePlaybackMixer {
                 }
             }
         };
-        stream.queue_samples(samples, source, now, &mut self.stats);
+        stream.queue_samples(samples, source, silence_hint, now, &mut self.stats);
     }
 
     fn remove_stream(&mut self, stream_id: u32) {
@@ -2129,6 +2335,12 @@ impl LivePlaybackMixer {
             plc_fallbacks: self.stats.plc_fallbacks,
             decode_errors: self.stats.decode_errors,
             resampler_errors: self.stats.resampler_errors,
+            direct_samples: self.stats.direct_samples,
+            resampled_samples: self.stats.resampled_samples,
+            skipped_silence_ms: samples_to_ms(self.stats.skipped_silence_samples as usize),
+            silence_skip_count: self.stats.silence_skip_count,
+            silence_skip_rejected: self.stats.silence_skip_rejected,
+            resampler_activations: self.stats.resampler_activations,
         }
     }
 
@@ -2162,8 +2374,8 @@ impl LivePlaybackMixer {
 struct AdaptivePlaybackStream {
     input: MonoSampleQueue,
     output: VecDeque<f32>,
-    resampler_output: MonoResamplerOutput,
-    resampler: Async<f32>,
+    resampler_output: Option<MonoResamplerOutput>,
+    resampler: Option<Async<f32>>,
     output_delay_to_drop: usize,
     current_ratio: f64,
     current_correction_percent: f32,
@@ -2174,6 +2386,112 @@ struct AdaptivePlaybackStream {
 
 impl AdaptivePlaybackStream {
     fn new() -> Result<Self, String> {
+        Ok(Self {
+            input: MonoSampleQueue::new(),
+            output: VecDeque::with_capacity(LIVE_PLAYBACK_RESAMPLER_CHUNK * 2),
+            resampler_output: None,
+            resampler: None,
+            output_delay_to_drop: 0,
+            current_ratio: 1.0,
+            current_correction_percent: 0.0,
+            recent_loss_events: VecDeque::new(),
+            expanded_target_samples: target_queue_samples(),
+            expanded_target_until: None,
+        })
+    }
+
+    fn queue_samples(
+        &mut self,
+        samples: &[f32],
+        source: DecodedFrameSource,
+        silence_hint: bool,
+        now: Instant,
+        stats: &mut LivePlaybackMixerStats,
+    ) {
+        if matches!(source, DecodedFrameSource::Dred | DecodedFrameSource::Plc) {
+            self.note_loss(now);
+        }
+        self.input.push_back(samples, silence_hint);
+        self.enforce_hard_bound(now, stats);
+    }
+
+    fn pop_sample(&mut self, now: Instant, stats: &mut LivePlaybackMixerStats) -> Option<f32> {
+        if let Some(sample) = self.output.pop_front() {
+            stats.resampled_samples = stats.resampled_samples.saturating_add(1);
+            return Some(sample);
+        }
+
+        self.maybe_skip_silence(now, stats);
+
+        if self.desired_correction(now) <= f64::EPSILON {
+            self.current_correction_percent = 0.0;
+            let sample = self.input.pop_front_sample();
+            if sample.is_some() {
+                stats.direct_samples = stats.direct_samples.saturating_add(1);
+            } else {
+                stats.underrun_count = stats.underrun_count.saturating_add(1);
+            }
+            return sample;
+        }
+
+        if self.output.is_empty() {
+            self.refill_output(now, stats);
+        }
+        let sample = self.output.pop_front();
+        if sample.is_some() {
+            stats.resampled_samples = stats.resampled_samples.saturating_add(1);
+        } else {
+            stats.underrun_count = stats.underrun_count.saturating_add(1);
+        }
+        sample
+    }
+
+    fn refill_output(&mut self, now: Instant, stats: &mut LivePlaybackMixerStats) {
+        if self.input.frames() == 0 {
+            return;
+        }
+
+        if self.ensure_resampler(stats).is_err() {
+            return;
+        }
+        self.update_resample_ratio(now, stats);
+        let input_frames_next = self.resampler.as_ref().unwrap().input_frames_next();
+        let partial_len = self.input.frames().min(input_frames_next);
+        let indexing = (partial_len < input_frames_next).then_some(Indexing {
+            input_offset: 0,
+            output_offset: 0,
+            active_channels_mask: None,
+            partial_len: Some(partial_len),
+        });
+
+        match self.resampler.as_mut().unwrap().process_into_buffer(
+            &self.input,
+            self.resampler_output.as_mut().unwrap(),
+            indexing.as_ref(),
+        ) {
+            Ok((consumed, generated)) => {
+                self.input.drain_samples(consumed);
+                self.resampler_output.as_mut().unwrap().drain_generated(
+                    generated,
+                    &mut self.output,
+                    &mut self.output_delay_to_drop,
+                );
+                if indexing.is_some() {
+                    self.output_delay_to_drop = self.resampler.as_ref().unwrap().output_delay();
+                }
+            }
+            Err(error) => {
+                stats.resampler_errors = stats.resampler_errors.saturating_add(1);
+                eprintln!("live playback resampler error: {error}");
+            }
+        }
+    }
+
+    fn ensure_resampler(&mut self, stats: &mut LivePlaybackMixerStats) -> Result<(), String> {
+        if self.resampler.is_some() {
+            return Ok(());
+        }
+
         let resampler = Async::<f32>::new_sinc(
             1.0,
             LIVE_PLAYBACK_MAX_RESAMPLE_RATIO_RELATIVE,
@@ -2187,82 +2505,11 @@ impl AdaptivePlaybackStream {
         let output_frames = resampler
             .output_frames_max()
             .max(LIVE_PLAYBACK_RESAMPLER_CHUNK);
-
-        Ok(Self {
-            input: MonoSampleQueue::new(),
-            output: VecDeque::with_capacity(output_frames * 2),
-            resampler_output: MonoResamplerOutput::new(output_frames),
-            resampler,
-            output_delay_to_drop,
-            current_ratio: 1.0,
-            current_correction_percent: 0.0,
-            recent_loss_events: VecDeque::new(),
-            expanded_target_samples: target_queue_samples(),
-            expanded_target_until: None,
-        })
-    }
-
-    fn queue_samples(
-        &mut self,
-        samples: &[f32],
-        source: DecodedFrameSource,
-        now: Instant,
-        stats: &mut LivePlaybackMixerStats,
-    ) {
-        if matches!(source, DecodedFrameSource::Dred | DecodedFrameSource::Plc) {
-            self.note_loss(now);
-        }
-        self.input.push_back(samples);
-        self.enforce_hard_bound(now, stats);
-    }
-
-    fn pop_sample(&mut self, now: Instant, stats: &mut LivePlaybackMixerStats) -> Option<f32> {
-        if self.output.is_empty() {
-            self.refill_output(now, stats);
-        }
-        let sample = self.output.pop_front();
-        if sample.is_none() {
-            stats.underrun_count = stats.underrun_count.saturating_add(1);
-        }
-        sample
-    }
-
-    fn refill_output(&mut self, now: Instant, stats: &mut LivePlaybackMixerStats) {
-        if self.input.frames() == 0 {
-            return;
-        }
-
-        self.update_resample_ratio(now, stats);
-        let input_frames_next = self.resampler.input_frames_next();
-        let partial_len = self.input.frames().min(input_frames_next);
-        let indexing = (partial_len < input_frames_next).then_some(Indexing {
-            input_offset: 0,
-            output_offset: 0,
-            active_channels_mask: None,
-            partial_len: Some(partial_len),
-        });
-
-        match self.resampler.process_into_buffer(
-            &self.input,
-            &mut self.resampler_output,
-            indexing.as_ref(),
-        ) {
-            Ok((consumed, generated)) => {
-                self.input.drain_samples(consumed);
-                self.resampler_output.drain_generated(
-                    generated,
-                    &mut self.output,
-                    &mut self.output_delay_to_drop,
-                );
-                if indexing.is_some() {
-                    self.output_delay_to_drop = self.resampler.output_delay();
-                }
-            }
-            Err(error) => {
-                stats.resampler_errors = stats.resampler_errors.saturating_add(1);
-                eprintln!("live playback resampler error: {error}");
-            }
-        }
+        self.resampler_output = Some(MonoResamplerOutput::new(output_frames));
+        self.output_delay_to_drop = output_delay_to_drop;
+        self.resampler = Some(resampler);
+        stats.resampler_activations = stats.resampler_activations.saturating_add(1);
+        Ok(())
     }
 
     fn update_resample_ratio(&mut self, now: Instant, stats: &mut LivePlaybackMixerStats) {
@@ -2273,7 +2520,10 @@ impl AdaptivePlaybackStream {
             return;
         }
 
-        match self.resampler.set_resample_ratio_relative(ratio, true) {
+        let Some(resampler) = self.resampler.as_mut() else {
+            return;
+        };
+        match resampler.set_resample_ratio_relative(ratio, true) {
             Ok(()) => {
                 self.current_ratio = ratio;
                 self.current_correction_percent = (correction * 100.0) as f32;
@@ -2302,6 +2552,37 @@ impl AdaptivePlaybackStream {
         let range = hard_bound.saturating_sub(catchup_target).max(1) as f64;
         let over = queued.saturating_sub(catchup_target) as f64;
         (LIVE_PLAYBACK_MAX_SPEED_UP * (over / range)).min(LIVE_PLAYBACK_MAX_SPEED_UP)
+    }
+
+    fn maybe_skip_silence(&mut self, now: Instant, stats: &mut LivePlaybackMixerStats) {
+        let queued = self.queued_samples();
+        let catchup_target = self
+            .adaptive_target_samples(now)
+            .max(target_queue_samples());
+        if queued <= catchup_target {
+            return;
+        }
+
+        let excess = queued.saturating_sub(catchup_target);
+        match self.input.find_silence_skip(excess) {
+            Some((skip_start, skip_len)) => {
+                self.input.ramp_around_skip(skip_start, skip_len);
+                self.input.drain_range(skip_start, skip_len);
+                stats.silence_skip_count = stats.silence_skip_count.saturating_add(1);
+                stats.skipped_silence_samples = stats
+                    .skipped_silence_samples
+                    .saturating_add(skip_len as u64);
+                kvlog::info!(
+                    "live playback skipped silence",
+                    skipped_ms = samples_to_ms(skip_len),
+                    queued_ms = samples_to_ms(queued),
+                    target_ms = samples_to_ms(catchup_target)
+                );
+            }
+            None => {
+                stats.silence_skip_rejected = stats.silence_skip_rejected.saturating_add(1);
+            }
+        }
     }
 
     fn note_loss(&mut self, now: Instant) {
@@ -2375,7 +2656,15 @@ impl AdaptivePlaybackStream {
 
 #[derive(Default)]
 struct MonoSampleQueue {
-    samples: VecDeque<f32>,
+    frames: VecDeque<QueuedAudioFrame>,
+}
+
+struct QueuedAudioFrame {
+    samples: Vec<f32>,
+    offset: usize,
+    silence_hint: bool,
+    rms: f32,
+    peak: f32,
 }
 
 impl MonoSampleQueue {
@@ -2383,13 +2672,144 @@ impl MonoSampleQueue {
         Self::default()
     }
 
-    fn push_back(&mut self, samples: &[f32]) {
-        self.samples.extend(samples.iter().copied());
+    fn push_back(&mut self, samples: &[f32], silence_hint: bool) {
+        if samples.is_empty() {
+            return;
+        }
+        self.frames.push_back(QueuedAudioFrame {
+            samples: samples.to_vec(),
+            offset: 0,
+            silence_hint,
+            rms: rms_normalized(samples),
+            peak: peak_normalized(samples),
+        });
+    }
+
+    fn pop_front_sample(&mut self) -> Option<f32> {
+        loop {
+            let frame = self.frames.front_mut()?;
+            if frame.offset < frame.samples.len() {
+                let sample = frame.samples[frame.offset];
+                frame.offset += 1;
+                if frame.offset >= frame.samples.len() {
+                    self.frames.pop_front();
+                }
+                return Some(sample);
+            }
+            self.frames.pop_front();
+        }
     }
 
     fn drain_samples(&mut self, samples: usize) {
-        let drain = samples.min(self.samples.len());
-        self.samples.drain(..drain);
+        self.drain_range(0, samples);
+    }
+
+    fn find_silence_skip(&self, excess_samples: usize) -> Option<(usize, usize)> {
+        let min_gap = samples_for_duration(LIVE_PLAYBACK_SILENCE_MIN_GAP);
+        let guard = samples_for_duration(LIVE_PLAYBACK_SILENCE_GUARD);
+        let max_skip = samples_for_duration(LIVE_PLAYBACK_SILENCE_MAX_SKIP);
+        let min_skip = samples_for_duration(LIVE_PLAYBACK_SILENCE_MIN_SKIP);
+        let mut cursor = 0usize;
+        let mut run_start = 0usize;
+        let mut run_len = 0usize;
+
+        for frame in &self.frames {
+            let len = frame.remaining_len();
+            if len == 0 {
+                continue;
+            }
+            if frame.is_skip_silence() {
+                if run_len == 0 {
+                    run_start = cursor;
+                }
+                run_len = run_len.saturating_add(len);
+                if run_len >= min_gap {
+                    let interior = run_len.saturating_sub(guard.saturating_mul(2));
+                    let skip_len = interior.min(excess_samples).min(max_skip);
+                    if skip_len >= min_skip {
+                        return Some((run_start + guard, skip_len));
+                    }
+                }
+            } else {
+                run_len = 0;
+            }
+            cursor = cursor.saturating_add(len);
+        }
+
+        None
+    }
+
+    fn ramp_around_skip(&mut self, skip_start: usize, skip_len: usize) {
+        let total = self.frames();
+        let fade = samples_for_duration(LIVE_PLAYBACK_SILENCE_RAMP)
+            .min(skip_start)
+            .min(total.saturating_sub(skip_start.saturating_add(skip_len)));
+        if fade == 0 {
+            return;
+        }
+
+        for index in 0..fade {
+            let t = (index + 1) as f32 / (fade + 1) as f32;
+            let fade_out = ((1.0 - t) * std::f32::consts::FRAC_PI_2).sin();
+            let fade_in = (t * std::f32::consts::FRAC_PI_2).sin();
+            if let Some(sample) = self.sample_mut(skip_start - fade + index) {
+                *sample *= fade_out;
+            }
+            if let Some(sample) = self.sample_mut(skip_start + skip_len + index) {
+                *sample *= fade_in;
+            }
+        }
+    }
+
+    fn drain_range(&mut self, start: usize, mut len: usize) {
+        while len > 0 {
+            let Some((frame_index, local_index, available)) = self.find_frame_at(start) else {
+                break;
+            };
+            let remove = len.min(available);
+            if let Some(frame) = self.frames.get_mut(frame_index) {
+                let drain_start = frame.offset + local_index;
+                let drain_end = drain_start + remove;
+                frame.samples.drain(drain_start..drain_end);
+            }
+            if self
+                .frames
+                .get(frame_index)
+                .is_some_and(|frame| frame.remaining_len() == 0)
+            {
+                self.frames.remove(frame_index);
+            }
+            len -= remove;
+        }
+    }
+
+    fn sample_mut(&mut self, absolute_index: usize) -> Option<&mut f32> {
+        let (frame_index, local_index, _) = self.find_frame_at(absolute_index)?;
+        let frame = self.frames.get_mut(frame_index)?;
+        frame.samples.get_mut(frame.offset + local_index)
+    }
+
+    fn find_frame_at(&self, absolute_index: usize) -> Option<(usize, usize, usize)> {
+        let mut cursor = 0usize;
+        for (index, frame) in self.frames.iter().enumerate() {
+            let len = frame.remaining_len();
+            if absolute_index < cursor + len {
+                let local = absolute_index - cursor;
+                return Some((index, local, len - local));
+            }
+            cursor += len;
+        }
+        None
+    }
+}
+
+impl QueuedAudioFrame {
+    fn remaining_len(&self) -> usize {
+        self.samples.len().saturating_sub(self.offset)
+    }
+
+    fn is_skip_silence(&self) -> bool {
+        self.silence_hint && self.peak < 0.20 && self.rms < 0.05
     }
 }
 
@@ -2398,7 +2818,17 @@ unsafe impl Adapter<'_, f32> for MonoSampleQueue {
         if channel != 0 {
             return 0.0;
         }
-        self.samples.get(frame).copied().unwrap_or_default()
+        let Some((frame_index, local_index, _)) = self.find_frame_at(frame) else {
+            return 0.0;
+        };
+        let Some(audio_frame) = self.frames.get(frame_index) else {
+            return 0.0;
+        };
+        audio_frame
+            .samples
+            .get(audio_frame.offset + local_index)
+            .copied()
+            .unwrap_or_default()
     }
 
     fn channels(&self) -> usize {
@@ -2406,7 +2836,10 @@ unsafe impl Adapter<'_, f32> for MonoSampleQueue {
     }
 
     fn frames(&self) -> usize {
-        self.samples.len()
+        self.frames
+            .iter()
+            .map(QueuedAudioFrame::remaining_len)
+            .sum()
     }
 }
 
@@ -2723,6 +3156,34 @@ mod tests {
     }
 
     #[test]
+    fn silence_range_tracker_keeps_two_recent_sample_ranges() {
+        let mut tracker = SilenceRangeTracker::new();
+
+        assert_eq!(tracker.observe_frame(false), 0);
+        assert!(silence_ranges_contain(tracker.observe_frame(true), 0));
+        assert!(silence_ranges_contain(
+            tracker.observe_frame(true),
+            FRAME_SAMPLES
+        ));
+        assert_eq!(
+            tracker.observe_frame(false),
+            pack_silence_range(0, FRAME_SAMPLES as u16, (FRAME_SAMPLES * 2) as u16)
+        );
+
+        let encoded = tracker.observe_frame(true);
+
+        assert_eq!(
+            encoded,
+            pack_silence_range(0, 0, FRAME_SAMPLES as u16)
+                | pack_silence_range(1, (FRAME_SAMPLES * 2) as u16, (FRAME_SAMPLES * 2) as u16)
+        );
+        assert!(silence_ranges_contain(encoded, 0));
+        assert!(!silence_ranges_contain(encoded, FRAME_SAMPLES));
+        assert!(silence_ranges_contain(encoded, FRAME_SAMPLES * 2));
+        assert!(!silence_ranges_contain(encoded, FRAME_SAMPLES * 4));
+    }
+
+    #[test]
     fn live_jitter_delays_initial_playout_to_reorder_startup_packets() {
         let start = Instant::now();
         let mut jitter = LiveJitterStream::new();
@@ -2749,10 +3210,12 @@ mod tests {
             vec![
                 PlayoutItem::Audio {
                     sequence: 1,
+                    silence_ranges: 0,
                     payload: vec![1],
                 },
                 PlayoutItem::Audio {
                     sequence: 2,
+                    silence_ranges: 0,
                     payload: vec![2],
                 },
             ]
@@ -2774,6 +3237,7 @@ mod tests {
             jitter.drain_ready(first_playout),
             vec![PlayoutItem::Audio {
                 sequence: 0,
+                silence_ranges: 0,
                 payload: vec![0],
             }]
         );
@@ -2789,6 +3253,7 @@ mod tests {
                 PlayoutItem::Missing { sequence: 1 },
                 PlayoutItem::Audio {
                     sequence: 2,
+                    silence_ranges: 0,
                     payload: vec![2],
                 },
             ]
@@ -2811,7 +3276,7 @@ mod tests {
             stream.insert(test_audio_packet(0, &packet_0), start),
             InsertOutcome::Accepted
         );
-        stream.drain_ready(first_playout, &mut frame, |samples, _source| {
+        stream.drain_ready(first_playout, &mut frame, |samples, _source, _silence| {
             decoded.extend_from_slice(samples);
         });
         assert_eq!(decoded.len(), FRAME_SAMPLES);
@@ -2821,7 +3286,7 @@ mod tests {
             stream.insert(test_audio_packet(2, &packet_2), gap_seen),
             InsertOutcome::Accepted
         );
-        stream.drain_ready(gap_seen, &mut frame, |samples, _source| {
+        stream.drain_ready(gap_seen, &mut frame, |samples, _source, _silence| {
             decoded.extend_from_slice(samples);
         });
         assert!(decoded.is_empty());
@@ -2829,7 +3294,7 @@ mod tests {
         stream.drain_ready(
             gap_seen + LIVE_PLAYBACK_MAX_REORDER_DELAY,
             &mut frame,
-            |samples, _source| {
+            |samples, _source, _silence| {
                 decoded.extend_from_slice(samples);
             },
         );
@@ -2840,28 +3305,50 @@ mod tests {
     fn adaptive_stream_keeps_sixty_ms_target_under_good_conditions() {
         let now = Instant::now();
         let mut stream = AdaptivePlaybackStream::new().unwrap();
-        stream
-            .input
-            .push_back(&vec![0.0; samples_for_duration(LIVE_PLAYBACK_TARGET_QUEUE)]);
+        stream.input.push_back(
+            &vec![0.0; samples_for_duration(LIVE_PLAYBACK_TARGET_QUEUE)],
+            false,
+        );
 
         assert_eq!(stream.adaptive_target_samples(now), target_queue_samples());
         assert!(stream.desired_correction(now).abs() < 0.000_001);
     }
 
     #[test]
+    fn adaptive_stream_bypasses_resampler_at_target_queue() {
+        let now = Instant::now();
+        let mut stream = AdaptivePlaybackStream::new().unwrap();
+        let mut stats = LivePlaybackMixerStats::default();
+
+        stream.queue_samples(
+            &vec![0.25; target_queue_samples()],
+            DecodedFrameSource::Normal,
+            false,
+            now,
+            &mut stats,
+        );
+
+        assert_eq!(stream.pop_sample(now, &mut stats), Some(0.25));
+        assert_eq!(stats.direct_samples, 1);
+        assert_eq!(stats.resampled_samples, 0);
+        assert_eq!(stats.resampler_activations, 0);
+    }
+
+    #[test]
     fn adaptive_stream_does_not_slow_down_below_target_and_caps_catchup_speed() {
         let now = Instant::now();
         let mut stream = AdaptivePlaybackStream::new().unwrap();
-        stream
-            .input
-            .push_back(&vec![0.0; samples_for_duration(Duration::from_millis(20))]);
+        stream.input.push_back(
+            &vec![0.0; samples_for_duration(Duration::from_millis(20))],
+            false,
+        );
 
         assert_eq!(stream.desired_correction(now), 0.0);
 
-        stream.input.push_back(&vec![
-            0.0;
-            samples_for_duration(LIVE_PLAYBACK_HARD_QUEUE_BOUND)
-        ]);
+        stream.input.push_back(
+            &vec![0.0; samples_for_duration(LIVE_PLAYBACK_HARD_QUEUE_BOUND)],
+            false,
+        );
         let correction = stream.desired_correction(now);
 
         assert!(correction > 0.14);
@@ -2878,6 +3365,7 @@ mod tests {
         stream.queue_samples(
             &vec![0.0; FRAME_SAMPLES],
             DecodedFrameSource::Dred,
+            false,
             now,
             &mut stats,
         );
@@ -2887,6 +3375,7 @@ mod tests {
             stream.queue_samples(
                 &vec![0.0; FRAME_SAMPLES],
                 DecodedFrameSource::Plc,
+                false,
                 now + Duration::from_millis(index),
                 &mut stats,
             );
@@ -2910,12 +3399,49 @@ mod tests {
         stream.queue_samples(
             &vec![0.0; oversized],
             DecodedFrameSource::Normal,
+            false,
             now,
             &mut stats,
         );
 
         assert_eq!(stats.hard_trim_count, 1);
         assert_eq!(samples_to_ms(stream.queued_samples()), 1_000);
+    }
+
+    #[test]
+    fn adaptive_stream_skips_only_marked_long_silence_when_behind() {
+        let now = Instant::now();
+        let queued = samples_for_duration(Duration::from_millis(400));
+        let mut unmarked = AdaptivePlaybackStream::new().unwrap();
+        let mut unmarked_stats = LivePlaybackMixerStats::default();
+
+        unmarked.queue_samples(
+            &vec![0.0; queued],
+            DecodedFrameSource::Normal,
+            false,
+            now,
+            &mut unmarked_stats,
+        );
+        let _ = unmarked.pop_sample(now, &mut unmarked_stats);
+        assert_eq!(unmarked_stats.silence_skip_count, 0);
+
+        let mut marked = AdaptivePlaybackStream::new().unwrap();
+        let mut marked_stats = LivePlaybackMixerStats::default();
+        marked.queue_samples(
+            &vec![0.0; queued],
+            DecodedFrameSource::Normal,
+            true,
+            now,
+            &mut marked_stats,
+        );
+
+        let _ = marked.pop_sample(now, &mut marked_stats);
+
+        assert_eq!(marked_stats.silence_skip_count, 1);
+        assert_eq!(
+            samples_to_ms(marked_stats.skipped_silence_samples as usize),
+            duration_to_ms(LIVE_PLAYBACK_SILENCE_MAX_SKIP)
+        );
     }
 
     #[test]
@@ -2926,12 +3452,14 @@ mod tests {
             1,
             &vec![0.4; FRAME_SAMPLES * 2],
             DecodedFrameSource::Normal,
+            false,
             now,
         );
         mixer.queue_stream_samples(
             2,
             &vec![0.4; FRAME_SAMPLES * 2],
             DecodedFrameSource::Normal,
+            false,
             now,
         );
 
@@ -2944,18 +3472,21 @@ mod tests {
             1,
             &vec![1.0; FRAME_SAMPLES * 2],
             DecodedFrameSource::Normal,
+            false,
             now,
         );
         mixer.queue_stream_samples(
             2,
             &vec![1.0; FRAME_SAMPLES * 2],
             DecodedFrameSource::Normal,
+            false,
             now,
         );
         mixer.queue_stream_samples(
             3,
             &vec![1.0; FRAME_SAMPLES * 2],
             DecodedFrameSource::Normal,
+            false,
             now,
         );
         assert!(pop_until_nonzero(&mut mixer, now) < 1.0);
@@ -2969,12 +3500,14 @@ mod tests {
             1,
             &vec![0.2; FRAME_SAMPLES * 2],
             DecodedFrameSource::Normal,
+            false,
             now,
         );
         mixer.queue_stream_samples(
             2,
             &vec![0.4; FRAME_SAMPLES * 2],
             DecodedFrameSource::Normal,
+            false,
             now,
         );
 
@@ -3000,6 +3533,7 @@ mod tests {
             1,
             &vec![0.25; FRAME_SAMPLES * 2],
             DecodedFrameSource::Normal,
+            false,
             now,
         );
 
@@ -3024,6 +3558,7 @@ mod tests {
             1,
             &vec![0.5; FRAME_SAMPLES * 2],
             DecodedFrameSource::Normal,
+            false,
             now,
         );
         let before = mixer.queued_samples();
@@ -3054,6 +3589,7 @@ mod tests {
         AudioPacketRef {
             sequence,
             flags: 0,
+            silence_ranges: 0,
             payload,
         }
     }

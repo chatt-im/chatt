@@ -1790,8 +1790,9 @@ impl Server {
                 stream_id,
                 sequence,
                 flags,
+                silence_ranges,
                 opus,
-            } => self.relay_voice(session_id, stream_id, sequence, flags, opus),
+            } => self.relay_voice(session_id, stream_id, sequence, flags, silence_ranges, opus),
             MediaPayload::PeerVoice { .. } => Ok(()),
             MediaPayload::Ping { nonce } => {
                 self.send_udp_payload(session_id, &MediaPayload::Pong { nonce });
@@ -1850,6 +1851,7 @@ impl Server {
         stream_id: StreamId,
         sequence: u32,
         flags: u8,
+        silence_ranges: u64,
         opus: Vec<u8>,
     ) -> Result<(), String> {
         let room_id = match self.sessions.get(&sender_session_id) {
@@ -1884,6 +1886,7 @@ impl Server {
             stream_id,
             sequence,
             flags,
+            silence_ranges,
             opus,
         };
         for session_id in recipients {

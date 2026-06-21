@@ -279,6 +279,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "earshot"
+version = "1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7984231f8b4c72eb3b88c70040dc1e4ff6803fa9169e93c0ac465942d74fa36a"
+
+[[package]]
 name = "easyfft"
 version = "0.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1244,6 +1250,7 @@ version = "0.1.0"
 dependencies = [
  "bwrap",
  "cpal",
+ "earshot",
  "extui",
  "extui-bindings",
  "extui-editor",

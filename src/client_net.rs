@@ -39,7 +39,7 @@ use tomchat_p2p::{
     stun::{StunMessage, is_stun_message},
 };
 
-use crate::audio::RemoteVoicePacket;
+use crate::audio::{LocalVoiceFrame, RemoteVoicePacket};
 
 const TCP: Token = Token(0);
 const UDP: Token = Token(1);
@@ -69,7 +69,7 @@ pub struct ClientConfig {
 pub enum NetworkCommand {
     SendChat(String),
     UploadFile(PathBuf),
-    LocalVoicePacket(Vec<u8>),
+    LocalVoicePacket(LocalVoiceFrame),
     Shutdown,
 }
 
@@ -776,6 +776,7 @@ impl WorkerState {
                         stream_id,
                         sequence,
                         flags,
+                        silence_ranges,
                         opus,
                     },
                 )) => {
@@ -791,6 +792,7 @@ impl WorkerState {
                             stream_id: stream_id.0,
                             sequence,
                             flags,
+                            silence_ranges,
                             payload: opus,
                         }));
                 }
@@ -849,18 +851,25 @@ impl WorkerState {
             NetworkCommand::UploadFile(path) => {
                 self.queue_file_upload(path);
             }
-            NetworkCommand::LocalVoicePacket(payload) => {
+            NetworkCommand::LocalVoicePacket(frame) => {
                 if let Some(stream_id) = self.active_stream {
                     let sequence = self.local_sequence;
                     let relay_payload = MediaPayload::Voice {
                         stream_id,
                         sequence,
                         flags: 0,
-                        opus: payload.clone(),
+                        silence_ranges: frame.silence_ranges,
+                        opus: frame.payload.clone(),
                     };
                     self.local_sequence = self.local_sequence.wrapping_add(1);
                     self.send_media(&relay_payload);
-                    self.send_p2p_voice(stream_id, sequence, 0, &payload);
+                    self.send_p2p_voice(
+                        stream_id,
+                        sequence,
+                        0,
+                        frame.silence_ranges,
+                        &frame.payload,
+                    );
                 }
             }
             NetworkCommand::Shutdown => {
@@ -1739,11 +1748,12 @@ impl WorkerState {
                         stream_id,
                         sequence,
                         flags,
+                        silence_ranges,
                         opus,
                     },
                 )) if connection_id == peer.connection_id => {
                     let action = peer.agent.observe_authenticated_packet(now, src);
-                    Ok((stream_id, sequence, flags, opus, action))
+                    Ok((stream_id, sequence, flags, silence_ranges, opus, action))
                 }
                 Ok(_) => Err("unexpected P2P media payload".to_string()),
                 Err(error) => Err(error.to_string()),
@@ -1751,7 +1761,7 @@ impl WorkerState {
         };
 
         match outcome {
-            Ok((stream_id, sequence, flags, opus, action)) => {
+            Ok((stream_id, sequence, flags, silence_ranges, opus, action)) => {
                 if let Some(action) = action {
                     self.apply_p2p_actions(session_id, vec![action]);
                 }
@@ -1761,6 +1771,7 @@ impl WorkerState {
                         stream_id: stream_id.0,
                         sequence,
                         flags,
+                        silence_ranges,
                         payload: opus,
                     }));
             }
@@ -1776,7 +1787,14 @@ impl WorkerState {
         true
     }
 
-    fn send_p2p_voice(&mut self, stream_id: StreamId, sequence: u32, flags: u8, opus: &[u8]) {
+    fn send_p2p_voice(
+        &mut self,
+        stream_id: StreamId,
+        sequence: u32,
+        flags: u8,
+        silence_ranges: u64,
+        opus: &[u8],
+    ) {
         let mut packets = Vec::new();
         for (session_id, peer) in &mut self.p2p_peers {
             let Some(selected) = peer.agent.selected() else {
@@ -1787,6 +1805,7 @@ impl WorkerState {
                 stream_id,
                 sequence,
                 flags,
+                silence_ranges,
                 opus: opus.to_vec(),
             };
             let counter = peer.send_counter;

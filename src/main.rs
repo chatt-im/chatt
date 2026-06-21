@@ -1464,11 +1464,21 @@ impl App {
             return;
         };
         let stats = playback.stats();
+        let played_samples = stats.direct_samples.saturating_add(stats.resampled_samples);
+        let direct_percent = if played_samples == 0 {
+            0
+        } else {
+            stats.direct_samples.saturating_mul(100) / played_samples
+        };
         self.set_status(format!(
-            "audio q{}ms target{}ms speed{:+.1}% dred{} plc{} trims{} underruns{} rx {}/{}",
+            "audio q{}ms target{}ms speed{:+.1}% direct{}% skip{}ms/{} rs{} dred{} plc{} trims{} underruns{} rx {}/{}",
             stats.max_queue_ms,
             stats.adaptive_target_ms,
             stats.correction_percent,
+            direct_percent,
+            stats.skipped_silence_ms,
+            stats.silence_skip_count,
+            stats.resampler_activations,
             stats.dred_recoveries,
             stats.plc_fallbacks,
             stats.hard_trim_count,
