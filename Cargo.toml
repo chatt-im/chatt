@@ -13,7 +13,7 @@ extui-bindings.path = "/code/extui/crates/extui-bindings"
 bwrap.path = "/code/bwrap"
 tinyhl = { path = "/code/extui/crates/tinyhl" }
 unicode-width = "0.2"
-opus-codec = { version = "0.1.1", features = ["dred"] }
+opus-codec = { path = "/code/opus-codec", features = ["dred"] }
 rubato = { version = "3.0", default-features = false }
 ring = "0.17.14"
 jsony = "0.1.10"
