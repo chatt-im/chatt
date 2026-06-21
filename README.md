@@ -8,6 +8,58 @@ The server is trusted in the current design. It decrypts traffic to route chat,
 files, voice, and P2P setup messages, but the default server configuration does
 not retain chat history.
 
+## Native Dependencies
+
+Chatt needs Rust 1.87 or newer. Install that with `rustup` or another current
+Rust toolchain source before building. The repository builds the bundled Opus
+codec by default, including DRED support, so Linux builds also need a C
+toolchain, CMake, ALSA development headers, and the tools used by the Opus
+build script.
+
+If you use `rustup`, select a current stable toolchain:
+
+```sh
+rustup update stable
+rustup default stable
+```
+
+Install build dependencies on Debian/Ubuntu:
+
+```sh
+sudo apt update
+sudo apt install -y build-essential pkg-config libasound2-dev cmake wget tar ca-certificates git
+```
+
+Install build dependencies on Arch Linux:
+
+```sh
+sudo pacman -Syu --needed base-devel rustup pkgconf alsa-lib cmake wget tar ca-certificates git
+```
+
+Dependency notes:
+
+- `libasound2-dev` on Debian/Ubuntu, or `alsa-lib` on Arch, provides the
+  `alsa.pc` metadata required by `alsa-sys`, which is pulled in by the `cpal`
+  audio backend used by the client.
+- `cmake` and the C toolchain build the bundled `crates/opus-codec` copy of
+  libopus. The default `chatt` build enables the Opus `dred` feature.
+- `wget`, `tar`, and CA certificates are used if the Opus DRED model archive is
+  not already present in the checkout.
+- `ffmpeg` is not needed for `cargo check`, but is needed for full audio tests
+  and benchmarks. Install it with `sudo apt install -y ffmpeg` on
+  Debian/Ubuntu or `sudo pacman -S --needed ffmpeg` on Arch.
+- The opt-in P2P network namespace test needs the `ip` command from
+  `iproute2`, plus root or `CAP_NET_ADMIN`, when `CHATT_NETNS_TESTS=1` is set.
+  Install it with `sudo apt install -y iproute2` on Debian/Ubuntu or
+  `sudo pacman -S --needed iproute2` on Arch.
+- Regenerating Opus bindings, rather than using the checked-in
+  `crates/opus-codec/src/bindings.rs`, needs libclang. Install
+  `clang libclang-dev` on Debian/Ubuntu or `clang` on Arch for that workflow.
+- The non-default `opus-codec/system-lib` feature links to a system libopus
+  instead of the bundled copy. That path needs `libopus-dev` on Debian/Ubuntu
+  or `opus` on Arch, and the system libopus must include any features you rely
+  on, such as DRED.
+
 ## Quick Start
 
 Run the development server:
