@@ -3,6 +3,10 @@ name = "server"
 version = "0.1.0"
 edition = "2024"
 
+[[bin]]
+name = "tomchat-server"
+path = "src/main.rs"
+
 [dependencies]
 jsony = "0.1.10"
 rpc.path = "../rpc"
@@ -10,3 +14,4 @@ mio = { version = "1.2.1", features = ["os-poll", "net"] }
 ring = "0.17.14"
 kvlog = "0.1.5"
 toml-spanner = { version = "1.0.3", features = ["to-toml", "from-toml", "derive"] }
+libc = "0.2"

@@ -1,4 +1,5 @@
-use std::{fs, net::SocketAddr, path::PathBuf};
+use std::fs;
+use std::path::PathBuf;
 
 use toml_spanner::Toml;
 use toml_spanner::{Arena, Item, Key, Table};
@@ -10,51 +11,71 @@ pub const DEFAULT_CONFIG: &str = include_str!("../tomchat.toml");
 
 #[derive(Clone, Debug, Toml)]
 #[toml(FromToml, rename_all = "kebab-case")]
-pub struct NetworkConfig {
-    #[toml(FromToml with = toml_spanner::helper::parse_string)]
-    pub tcp_addr: SocketAddr,
-    #[toml(default = default_shared_addr(), FromToml with = toml_spanner::helper::parse_string)]
-    pub udp_addr: SocketAddr,
-    #[toml(FromToml with = toml_spanner::helper::parse_string)]
-    pub udp_probe_addr: Option<SocketAddr>,
-    pub user: String,
-    pub token: String,
+pub struct ServerEntry {
+    pub alias: String,
+    pub tcp_addr: String,
     #[toml(default)]
-    pub pairing_code: String,
+    pub udp_addr: String,
+    #[toml(default)]
+    pub udp_probe_addr: Option<String>,
+    pub user: String,
+    #[toml(default)]
+    pub display_name: String,
+    pub token: String,
     #[toml(default)]
     pub server_public_key: String,
     pub room_id: u32,
 }
 
-impl Default for NetworkConfig {
+impl Default for ServerEntry {
     fn default() -> Self {
         Self {
-            tcp_addr: "127.0.0.1:41000".parse().expect("valid default TCP addr"),
-            udp_addr: default_shared_addr(),
+            alias: default_active_server(),
+            tcp_addr: "127.0.0.1:41000".to_string(),
+            udp_addr: String::new(),
             udp_probe_addr: None,
             user: "alice".to_string(),
+            display_name: "Alice".to_string(),
             token: "alice-dev-token".to_string(),
-            pairing_code: String::new(),
             server_public_key: String::new(),
             room_id: 1,
         }
     }
 }
 
-impl NetworkConfig {
-    pub fn client_config(&self, files: &FileConfig) -> ClientConfig {
+impl ServerEntry {
+    pub fn client_config(&self, files: &FileConfig, pairing_code: Option<String>) -> ClientConfig {
         ClientConfig {
-            tcp_addr: self.tcp_addr,
-            udp_addr: self.udp_addr,
-            udp_probe_addr: self.udp_probe_addr,
+            tcp_addr: self.tcp_addr.clone(),
+            udp_addr: self.effective_udp_addr(),
+            udp_probe_addr: self.udp_probe_addr.clone(),
             user: self.user.clone(),
+            display_name: self.effective_display_name(),
             token: self.token.clone(),
-            pairing_code: non_empty_string(&self.pairing_code),
+            pairing_code,
             server_public_key: non_empty_string(&self.server_public_key),
             room_id: RoomId(self.room_id),
             file_receive_dir: files.receive_dir_path(),
             max_upload_bytes: files.max_upload_bytes,
             max_receive_bytes: files.max_receive_bytes,
+        }
+    }
+
+    pub fn effective_display_name(&self) -> String {
+        let display_name = self.display_name.trim();
+        if display_name.is_empty() {
+            self.user.clone()
+        } else {
+            display_name.to_string()
+        }
+    }
+
+    pub fn effective_udp_addr(&self) -> String {
+        let udp_addr = self.udp_addr.trim();
+        if udp_addr.is_empty() {
+            self.tcp_addr.clone()
+        } else {
+            udp_addr.to_string()
         }
     }
 }
@@ -183,8 +204,10 @@ impl FileConfig {
 #[derive(Toml)]
 #[toml(FromToml, recoverable, warn_unknown_fields, rename_all = "kebab-case")]
 pub struct Config {
-    #[toml(default)]
-    pub network: NetworkConfig,
+    #[toml(default = default_active_server())]
+    pub active_server: String,
+    #[toml(default = default_servers())]
+    pub servers: Vec<ServerEntry>,
     #[toml(default)]
     pub audio: AudioConfig,
     #[toml(default)]
@@ -204,6 +227,7 @@ impl Default for Config {
             .expect("embedded tomchat config must parse");
         let mut config: Self = doc.to().expect("embedded tomchat config must deserialize");
         config.apply_inferred_addresses(false, false);
+        config.normalize();
         config
     }
 }
@@ -227,84 +251,105 @@ impl Config {
         let mut doc = toml_spanner::parse(&content, &arena)
             .map_err(|err| format!("failed to parse {source}: {err}"))?;
         reject_deprecated_config_keys(&doc, &source)?;
-        let udp_addr_configured = network_contains_key(&doc, "udp-addr");
+        let udp_addr_configured = server_udp_addr_configured(&doc);
         let mut config: Config = doc.to().map_err(|err| {
             let errors: Vec<String> = err.errors.iter().map(ToString::to_string).collect();
             format!("failed to deserialize {source}: {}", errors.join(", "))
         })?;
         config.config_path = config_path;
-        let udp_addr_overridden = config.apply_env_and_cli_overrides();
-        config.apply_inferred_addresses(udp_addr_configured, udp_addr_overridden);
+        config.apply_inferred_addresses_from_doc(&udp_addr_configured);
+        config.normalize();
+        config.validate(&source)?;
         Ok(config)
-    }
-
-    fn apply_env_and_cli_overrides(&mut self) -> bool {
-        let args = std::env::args().collect::<Vec<_>>();
-        if let Some(user) =
-            value_arg(&args, "--user").or_else(|| std::env::var("TOMCHAT_USER").ok())
-        {
-            self.network.user = user;
-        }
-        if let Some(token) =
-            value_arg(&args, "--token").or_else(|| std::env::var("TOMCHAT_TOKEN").ok())
-        {
-            self.network.token = token;
-        }
-        if let Some(pairing_code) = value_arg(&args, "--pairing-code")
-            .or_else(|| std::env::var("TOMCHAT_PAIRING_CODE").ok())
-        {
-            self.network.pairing_code = pairing_code;
-        }
-        if let Some(server_public_key) = value_arg(&args, "--server-public-key")
-            .or_else(|| std::env::var("TOMCHAT_SERVER_PUBLIC_KEY").ok())
-        {
-            self.network.server_public_key = server_public_key;
-        }
-        if let Some(addr) = value_arg(&args, "--tcp").or_else(|| std::env::var("TOMCHAT_TCP").ok())
-        {
-            if let Ok(addr) = addr.parse() {
-                self.network.tcp_addr = addr;
-            }
-        }
-        let udp_addr_override =
-            value_arg(&args, "--udp").or_else(|| std::env::var("TOMCHAT_UDP").ok());
-        let udp_addr_overridden = udp_addr_override.is_some();
-        if let Some(addr) = udp_addr_override {
-            if let Ok(addr) = addr.parse() {
-                self.network.udp_addr = addr;
-            }
-        }
-        if let Some(addr) =
-            value_arg(&args, "--udp-probe").or_else(|| std::env::var("TOMCHAT_UDP_PROBE").ok())
-        {
-            if let Ok(addr) = addr.parse() {
-                self.network.udp_probe_addr = Some(addr);
-            }
-        }
-        if let Some(receive_dir) =
-            value_arg(&args, "--receive-dir").or_else(|| std::env::var("TOMCHAT_RECEIVE_DIR").ok())
-        {
-            self.files.receive_dir = receive_dir;
-        }
-        if let Some(limit) = value_arg(&args, "--max-upload-bytes")
-            .or_else(|| std::env::var("TOMCHAT_MAX_UPLOAD_BYTES").ok())
-            .and_then(|value| value.parse().ok())
-        {
-            self.files.max_upload_bytes = limit;
-        }
-        if let Some(limit) = value_arg(&args, "--max-receive-bytes")
-            .or_else(|| std::env::var("TOMCHAT_MAX_RECEIVE_BYTES").ok())
-            .and_then(|value| value.parse().ok())
-        {
-            self.files.max_receive_bytes = limit;
-        }
-        udp_addr_overridden
     }
 
     fn apply_inferred_addresses(&mut self, udp_addr_configured: bool, udp_addr_overridden: bool) {
         if !udp_addr_configured && !udp_addr_overridden {
-            self.network.udp_addr = self.network.tcp_addr;
+            for server in &mut self.servers {
+                server.udp_addr = server.tcp_addr.clone();
+            }
         }
+    }
+
+    fn apply_inferred_addresses_from_doc(&mut self, udp_addr_configured: &[bool]) {
+        for (index, server) in self.servers.iter_mut().enumerate() {
+            if !udp_addr_configured.get(index).copied().unwrap_or(false) {
+                server.udp_addr = server.tcp_addr.clone();
+            }
+        }
+    }
+
+    fn normalize(&mut self) {
+        for server in &mut self.servers {
+            server.alias = server.alias.trim().to_string();
+            server.user = server.user.trim().to_string();
+            server.display_name = server.effective_display_name();
+        }
+        if self.active_server.trim().is_empty()
+            && let Some(server) = self.servers.first()
+        {
+            self.active_server = server.alias.clone();
+        }
+    }
+
+    fn validate(&self, source: &str) -> Result<(), String> {
+        if self.servers.is_empty() {
+            return Err(format!(
+                "{source}: at least one [[servers]] entry is required"
+            ));
+        }
+        let mut aliases = std::collections::HashSet::new();
+        for server in &self.servers {
+            validate_server_alias(&server.alias)
+                .map_err(|error| format!("{source}: server {}: {error}", server.alias))?;
+            validate_non_empty(&server.user, "user")
+                .map_err(|error| format!("{source}: server {}: {error}", server.alias))?;
+            validate_non_empty(&server.token, "token")
+                .map_err(|error| format!("{source}: server {}: {error}", server.alias))?;
+            validate_non_empty(&server.display_name, "display-name")
+                .map_err(|error| format!("{source}: server {}: {error}", server.alias))?;
+            validate_endpoint(&server.tcp_addr, "tcp-addr")
+                .map_err(|error| format!("{source}: server {}: {error}", server.alias))?;
+            validate_endpoint(&server.effective_udp_addr(), "udp-addr")
+                .map_err(|error| format!("{source}: server {}: {error}", server.alias))?;
+            if let Some(addr) = &server.udp_probe_addr {
+                validate_endpoint(addr, "udp-probe-addr")
+                    .map_err(|error| format!("{source}: server {}: {error}", server.alias))?;
+            }
+            if server.room_id == 0 {
+                return Err(format!(
+                    "{source}: server {}: room-id must be non-zero",
+                    server.alias
+                ));
+            }
+            if !aliases.insert(server.alias.as_str()) {
+                return Err(format!("{source}: duplicate server alias {}", server.alias));
+            }
+        }
+        self.active_server().map(|_| ())
+    }
+
+    pub fn active_server(&self) -> Result<&ServerEntry, String> {
+        self.servers
+            .iter()
+            .find(|server| server.alias == self.active_server)
+            .ok_or_else(|| format!("active server {} is not configured", self.active_server))
+    }
+
+    pub fn upsert_server(&mut self, server: ServerEntry) {
+        if let Some(existing) = self
+            .servers
+            .iter_mut()
+            .find(|existing| existing.alias == server.alias)
+        {
+            *existing = server;
+        } else {
+            self.servers.push(server);
+        }
+    }
+
+    pub fn set_active_server(&mut self, alias: String) {
+        self.active_server = alias;
     }
 
     pub fn save_runtime(&self) -> Result<PathBuf, String> {
@@ -329,9 +374,14 @@ impl Config {
             .map_err(|err| format!("failed to parse {}: {err}", path.display()))?;
         let mut table = doc.table().clone_in(&arena);
         write_runtime_config(&mut table, self, &arena);
-        let output = toml_spanner::Formatting::preserved_from(&doc)
+        let rest = toml_spanner::Formatting::preserved_from(&doc)
             .with_span_projection_identity()
             .format_table_to_bytes(table, &arena);
+        let mut output = runtime_servers_toml(self).into_bytes();
+        let rest = trim_leading_blank_lines(&rest);
+        if !rest.is_empty() {
+            output.extend_from_slice(rest);
+        }
         fs::write(&path, output)
             .map_err(|err| format!("failed to write {}: {err}", path.display()))?;
         Ok(path)
@@ -342,6 +392,27 @@ fn reject_deprecated_config_keys(
     doc: &toml_spanner::Document<'_>,
     source: &str,
 ) -> Result<(), String> {
+    if doc.table().contains_key("network") {
+        return Err(format!(
+            "failed to deserialize {source}: [network] is not supported; use active-server and [[servers]]"
+        ));
+    }
+    if doc
+        .table()
+        .get("servers")
+        .and_then(Item::as_array)
+        .is_some_and(|servers| {
+            servers.iter().any(|server| {
+                server
+                    .as_table()
+                    .is_some_and(|server| server.contains_key("pairing-code"))
+            })
+        })
+    {
+        return Err(format!(
+            "failed to deserialize {source}: servers.pairing-code is not supported; use `tomchat join JOIN_STRING`"
+        ));
+    }
     if doc
         .table()
         .get("audio")
@@ -353,14 +424,6 @@ fn reject_deprecated_config_keys(
         ));
     }
     Ok(())
-}
-
-pub fn default_token(user: &str) -> &'static str {
-    match user {
-        "bob" => "bob-dev-token",
-        "carol" => "carol-dev-token",
-        _ => "alice-dev-token",
-    }
 }
 
 pub fn value_arg(args: &[String], key: &str) -> Option<String> {
@@ -377,17 +440,29 @@ fn default_config_path() -> Option<PathBuf> {
     user.exists().then_some(user)
 }
 
-fn default_shared_addr() -> SocketAddr {
-    "127.0.0.1:41000"
-        .parse()
-        .expect("valid default network addr")
+fn default_active_server() -> String {
+    "local".to_string()
 }
 
-fn network_contains_key(doc: &toml_spanner::Document<'_>, key: &str) -> bool {
+fn default_servers() -> Vec<ServerEntry> {
+    vec![ServerEntry::default()]
+}
+
+fn server_udp_addr_configured(doc: &toml_spanner::Document<'_>) -> Vec<bool> {
     doc.table()
-        .get("network")
-        .and_then(Item::as_table)
-        .is_some_and(|network| network.contains_key(key))
+        .get("servers")
+        .and_then(Item::as_array)
+        .map(|servers| {
+            servers
+                .iter()
+                .map(|server| {
+                    server
+                        .as_table()
+                        .is_some_and(|table| table.contains_key("udp-addr"))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn user_config_path() -> Option<PathBuf> {
@@ -399,45 +474,64 @@ fn non_empty_string(value: &str) -> Option<String> {
     (!value.is_empty()).then(|| value.to_string())
 }
 
+pub fn validate_server_alias(alias: &str) -> Result<(), String> {
+    let alias = alias.trim();
+    if alias.is_empty() {
+        return Err("alias is empty".to_string());
+    }
+    if alias.len() > 64 {
+        return Err("alias exceeds 64 bytes".to_string());
+    }
+    if !alias
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    {
+        return Err("alias must use ASCII letters, numbers, '-' or '_'".to_string());
+    }
+    Ok(())
+}
+
+pub fn validate_display_name(display_name: &str) -> Result<(), String> {
+    let display_name = display_name.trim();
+    validate_non_empty(display_name, "display-name")?;
+    if display_name.len() > 64 {
+        return Err("display-name exceeds 64 bytes".to_string());
+    }
+    Ok(())
+}
+
+fn validate_endpoint(value: &str, name: &str) -> Result<(), String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Err(format!("{name} is empty"));
+    }
+    if value.parse::<std::net::SocketAddr>().is_ok() {
+        return Ok(());
+    }
+    let Some((host, port)) = value.rsplit_once(':') else {
+        return Err(format!("{name} must include a port"));
+    };
+    if host.trim().is_empty() || port.trim().is_empty() {
+        return Err(format!("{name} must include a host and port"));
+    }
+    port.parse::<u16>()
+        .map(|_| ())
+        .map_err(|_| format!("{name} port is invalid"))
+}
+
+fn validate_non_empty(value: &str, name: &str) -> Result<(), String> {
+    if value.trim().is_empty() {
+        Err(format!("{name} is empty"))
+    } else {
+        Ok(())
+    }
+}
+
 fn write_runtime_config<'de>(root: &mut Table<'de>, config: &Config, arena: &'de Arena) {
     {
-        let network = ensure_table(root, "network", arena);
-        insert_str(network, "user", &config.network.user, arena);
-        insert_str(network, "token", &config.network.token, arena);
-        insert_str(network, "pairing-code", &config.network.pairing_code, arena);
-        insert_str(
-            network,
-            "server-public-key",
-            &config.network.server_public_key,
-            arena,
-        );
-        insert_str(
-            network,
-            "tcp-addr",
-            &config.network.tcp_addr.to_string(),
-            arena,
-        );
-        if config.network.udp_addr == config.network.tcp_addr {
-            network.remove_entry("udp-addr");
-        } else {
-            insert_str(
-                network,
-                "udp-addr",
-                &config.network.udp_addr.to_string(),
-                arena,
-            );
-        }
-        match config.network.udp_probe_addr {
-            Some(addr) => insert_str(network, "udp-probe-addr", &addr.to_string(), arena),
-            None => {
-                network.remove_entry("udp-probe-addr");
-            }
-        }
-        network.insert(
-            Key::new("room-id"),
-            Item::from(config.network.room_id as i64),
-            arena,
-        );
+        root.remove_entry("network");
+        root.remove_entry("active-server");
+        root.remove_entry("servers");
     }
 
     {
@@ -504,6 +598,81 @@ fn write_runtime_config<'de>(root: &mut Table<'de>, config: &Config, arena: &'de
     }
 }
 
+fn runtime_servers_toml(config: &Config) -> String {
+    let mut out = String::new();
+    out.push_str(&format!(
+        "active-server = \"{}\"\n\n",
+        toml_quote_value(&config.active_server)
+    ));
+    for server in &config.servers {
+        out.push_str("[[servers]]\n");
+        out.push_str(&format!(
+            "alias = \"{}\"\n",
+            toml_quote_value(&server.alias)
+        ));
+        out.push_str(&format!("user = \"{}\"\n", toml_quote_value(&server.user)));
+        out.push_str(&format!(
+            "display-name = \"{}\"\n",
+            toml_quote_value(&server.display_name)
+        ));
+        out.push_str(&format!(
+            "token = \"{}\"\n",
+            toml_quote_value(&server.token)
+        ));
+        out.push_str(&format!(
+            "server-public-key = \"{}\"\n",
+            toml_quote_value(&server.server_public_key)
+        ));
+        out.push_str(&format!("tcp-addr = \"{}\"\n", server.tcp_addr));
+        if server.effective_udp_addr() != server.tcp_addr {
+            out.push_str(&format!("udp-addr = \"{}\"\n", server.udp_addr));
+        }
+        if let Some(addr) = &server.udp_probe_addr {
+            out.push_str(&format!("udp-probe-addr = \"{}\"\n", addr));
+        }
+        out.push_str(&format!("room-id = {}\n\n", server.room_id));
+    }
+    out
+}
+
+fn trim_leading_blank_lines(bytes: &[u8]) -> &[u8] {
+    let mut start = 0;
+    while start < bytes.len() {
+        match bytes[start] {
+            b'\n' | b'\r' => start += 1,
+            b' ' | b'\t' => {
+                let line_start = start;
+                while start < bytes.len() && matches!(bytes[start], b' ' | b'\t') {
+                    start += 1;
+                }
+                if start < bytes.len() && matches!(bytes[start], b'\n' | b'\r') {
+                    start += 1;
+                } else {
+                    start = line_start;
+                    break;
+                }
+            }
+            _ => break,
+        }
+    }
+    &bytes[start..]
+}
+
+fn toml_quote_value(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for ch in value.chars() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            _ => out.push(ch),
+        }
+    }
+    out
+}
+
 fn ensure_table<'de, 'b>(
     root: &'b mut Table<'de>,
     name: &'static str,
@@ -536,51 +705,97 @@ mod tests {
     use super::*;
 
     #[test]
-    fn network_udp_addr_inherits_tcp_addr_when_omitted() {
+    fn server_udp_addr_inherits_tcp_addr_when_omitted() {
         let arena = Arena::new();
         let mut doc = toml_spanner::parse(
             r#"
-[network]
+active-server = "lab"
+
+[[servers]]
+alias = "lab"
 user = "alice"
+display-name = "Alice"
 token = "alice-dev-token"
 tcp-addr = "127.0.0.1:42000"
+server-public-key = ""
 room-id = 1
 "#,
             &arena,
         )
         .unwrap();
-        let udp_addr_configured = network_contains_key(&doc, "udp-addr");
+        let udp_addr_configured = server_udp_addr_configured(&doc);
         let mut config: Config = doc.to().unwrap();
-        config.apply_inferred_addresses(udp_addr_configured, false);
+        config.apply_inferred_addresses_from_doc(&udp_addr_configured);
 
-        assert_eq!(config.network.udp_addr, config.network.tcp_addr);
-        assert_eq!(config.network.udp_probe_addr, None);
+        assert_eq!(config.servers[0].udp_addr, config.servers[0].tcp_addr);
+        assert_eq!(config.servers[0].udp_probe_addr, None);
     }
 
     #[test]
-    fn network_parses_explicit_udp_and_probe_addrs() {
+    fn server_parses_explicit_udp_and_probe_addrs() {
         let arena = Arena::new();
         let mut doc = toml_spanner::parse(
             r#"
-[network]
+active-server = "lab"
+
+[[servers]]
+alias = "lab"
 user = "alice"
+display-name = "Alice"
 token = "alice-dev-token"
 tcp-addr = "127.0.0.1:42000"
 udp-addr = "127.0.0.1:42001"
 udp-probe-addr = "127.0.0.1:42002"
+server-public-key = ""
 room-id = 1
 "#,
             &arena,
         )
         .unwrap();
-        let udp_addr_configured = network_contains_key(&doc, "udp-addr");
+        let udp_addr_configured = server_udp_addr_configured(&doc);
         let mut config: Config = doc.to().unwrap();
-        config.apply_inferred_addresses(udp_addr_configured, false);
+        config.apply_inferred_addresses_from_doc(&udp_addr_configured);
 
-        assert_eq!(config.network.udp_addr.to_string(), "127.0.0.1:42001");
+        assert_eq!(config.servers[0].udp_addr, "127.0.0.1:42001");
         assert_eq!(
-            config.network.udp_probe_addr.map(|addr| addr.to_string()),
-            Some("127.0.0.1:42002".to_string())
+            config.servers[0].udp_probe_addr.as_deref(),
+            Some("127.0.0.1:42002")
+        );
+    }
+
+    #[test]
+    fn server_endpoints_accept_domains() {
+        let arena = Arena::new();
+        let mut doc = toml_spanner::parse(
+            r#"
+active-server = "prod"
+
+[[servers]]
+alias = "prod"
+user = "alice"
+display-name = "Alice"
+token = "client-generated-token-with-at-least-32-bytes"
+tcp-addr = "chat.example.com:443"
+udp-addr = "media.example.com:54100"
+udp-probe-addr = "probe.example.com:54101"
+server-public-key = ""
+room-id = 1
+"#,
+            &arena,
+        )
+        .unwrap();
+        let udp_addr_configured = server_udp_addr_configured(&doc);
+        let mut config: Config = doc.to().unwrap();
+        config.apply_inferred_addresses_from_doc(&udp_addr_configured);
+        config.normalize();
+        config.validate("<test>").unwrap();
+
+        let server = config.active_server().unwrap();
+        assert_eq!(server.tcp_addr, "chat.example.com:443");
+        assert_eq!(server.udp_addr, "media.example.com:54100");
+        assert_eq!(
+            server.udp_probe_addr.as_deref(),
+            Some("probe.example.com:54101")
         );
     }
 
@@ -607,5 +822,15 @@ input-device-index = 20
 
         assert!(error.contains("audio.input-device-index"));
         assert!(error.contains("audio.input-device-id"));
+    }
+
+    #[test]
+    fn runtime_servers_toml_does_not_write_pairing_code() {
+        let config = Config::default();
+        let content = runtime_servers_toml(&config);
+
+        assert!(content.contains("[[servers]]"));
+        assert!(content.contains("active-server = \"local\""));
+        assert!(!content.contains("pairing-code"));
     }
 }

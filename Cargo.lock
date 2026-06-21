@@ -1072,6 +1072,7 @@ version = "0.1.0"
 dependencies = [
  "jsony",
  "kvlog",
+ "libc",
  "mio",
  "ring",
  "rpc",

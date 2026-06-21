@@ -10,40 +10,41 @@ mod imp {
     };
 
     use std::os::unix::{
-        ffi::{OsStrExt, OsStringExt},
         fs::{FileTypeExt, MetadataExt, PermissionsExt},
         net::{UnixListener, UnixStream},
     };
 
-    use crate::client_net::NetworkCommand;
-
-    pub const SOCKET_ENV: &str = "TOMCHAT_CONTROL_SOCKET";
-    pub const RUN_DIR_ENV: &str = "TOMCHAT_RUN_DIR";
-
     const SOCKET_NAME: &str = "control.sock";
-    const MAGIC: &[u8] = b"tomchat-control-v1\0";
-    const OP_UPLOAD: u8 = 1;
+    const MAGIC: &[u8] = b"tomchat-server-control-v1\0";
+    const OP_INVITE: u8 = 1;
     const STATUS_OK: u8 = 0;
     const STATUS_ERROR: u8 = 1;
-    const MAX_PATH_BYTES: u32 = 64 * 1024;
+    const MAX_REQUEST_BYTES: u32 = 1024;
     const MAX_RESPONSE_BYTES: u32 = 8 * 1024;
     const ACCEPT_SLEEP: Duration = Duration::from_millis(20);
     const STREAM_TIMEOUT: Duration = Duration::from_secs(2);
 
-    pub struct ControlSocket {
+    pub enum AdminCommand {
+        Invite {
+            user: String,
+            reply: Sender<Result<String, String>>,
+        },
+    }
+
+    pub struct AdminSocket {
         path: PathBuf,
         shutdown: Sender<()>,
         worker: Option<JoinHandle<()>>,
     }
 
-    impl ControlSocket {
-        pub fn spawn(commands: Sender<NetworkCommand>) -> Result<Self, String> {
+    impl AdminSocket {
+        pub fn spawn(commands: Sender<AdminCommand>) -> Result<Self, String> {
             let config = socket_config()?;
             Self::spawn_with_config(config, commands)
         }
 
         #[cfg(test)]
-        fn spawn_at_path(path: PathBuf, commands: Sender<NetworkCommand>) -> Result<Self, String> {
+        fn spawn_at_path(path: PathBuf, commands: Sender<AdminCommand>) -> Result<Self, String> {
             Self::spawn_with_config(
                 SocketConfig {
                     path,
@@ -55,13 +56,13 @@ mod imp {
 
         fn spawn_with_config(
             config: SocketConfig,
-            commands: Sender<NetworkCommand>,
+            commands: Sender<AdminCommand>,
         ) -> Result<Self, String> {
             prepare_socket_parent(&config)?;
             let listener = bind_listener(&config.path)?;
-            listener
-                .set_nonblocking(true)
-                .map_err(|error| format!("failed to make control socket nonblocking: {error}"))?;
+            listener.set_nonblocking(true).map_err(|error| {
+                format!("failed to make server control socket nonblocking: {error}")
+            })?;
 
             let path = config.path;
             let (shutdown_tx, shutdown_rx) = mpsc::channel();
@@ -79,14 +80,14 @@ mod imp {
                         }
                         Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
                         Err(error) => {
-                            kvlog::warn!("local control accept failed", error = %error);
+                            kvlog::warn!("server control accept failed", error = %error);
                             thread::sleep(ACCEPT_SLEEP);
                         }
                     }
                 }
             });
 
-            kvlog::info!("local control socket listening", path = %path.display());
+            kvlog::info!("server control socket listening", path = %path.display());
             Ok(Self {
                 path,
                 shutdown: shutdown_tx,
@@ -99,7 +100,7 @@ mod imp {
         }
     }
 
-    impl Drop for ControlSocket {
+    impl Drop for AdminSocket {
         fn drop(&mut self) {
             let _ = self.shutdown.send(());
             if let Some(worker) = self.worker.take() {
@@ -114,45 +115,38 @@ mod imp {
         }
     }
 
-    pub fn send_upload(path: &Path) -> Result<String, String> {
-        let socket_path = socket_path()?;
-        send_upload_to_path(&socket_path, path)
+    pub fn send_invite(user: &str) -> Result<String, String> {
+        send_invite_to_path(&socket_config()?.path, user)
     }
 
-    fn send_upload_to_path(socket_path: &Path, path: &Path) -> Result<String, String> {
+    fn send_invite_to_path(socket_path: &Path, user: &str) -> Result<String, String> {
         let mut stream = UnixStream::connect(socket_path).map_err(|error| {
             format!(
-                "no active tomchat control socket at {}; start tomchat or set {SOCKET_ENV}: {error}",
+                "no active tomchat server control socket at {}; start tomchat-server first: {error}",
                 socket_path.display()
             )
         })?;
         stream
             .set_read_timeout(Some(STREAM_TIMEOUT))
-            .map_err(|error| format!("failed to set control socket read timeout: {error}"))?;
+            .map_err(|error| format!("failed to set server control read timeout: {error}"))?;
         stream
             .set_write_timeout(Some(STREAM_TIMEOUT))
-            .map_err(|error| format!("failed to set control socket write timeout: {error}"))?;
+            .map_err(|error| format!("failed to set server control write timeout: {error}"))?;
 
-        write_upload_request(&mut stream, path)?;
+        write_request(&mut stream, OP_INVITE, user.as_bytes())?;
         let response = read_response(&mut stream)?;
         match response.status {
             STATUS_OK => Ok(response.message),
             STATUS_ERROR => Err(response.message),
-            status => Err(format!("control socket returned unknown status {status}")),
+            status => Err(format!(
+                "server control socket returned unknown status {status}"
+            )),
         }
-    }
-
-    pub fn socket_path() -> Result<PathBuf, String> {
-        Ok(socket_config()?.path)
     }
 
     struct SocketConfig {
         path: PathBuf,
         private_dir: Option<PathBuf>,
-    }
-
-    enum Request {
-        Upload(PathBuf),
     }
 
     struct Response {
@@ -161,27 +155,13 @@ mod imp {
     }
 
     fn socket_config() -> Result<SocketConfig, String> {
-        if let Some(path) = env::var_os(SOCKET_ENV) {
-            let path = PathBuf::from(path);
-            if path.as_os_str().is_empty() {
-                return Err(format!("{SOCKET_ENV} must not be empty"));
-            }
-            return Ok(SocketConfig {
-                path,
-                private_dir: None,
-            });
-        }
-
-        let run_dir = if let Some(path) = env::var_os(RUN_DIR_ENV) {
-            PathBuf::from(path)
-        } else if let Some(path) = env::var_os("XDG_RUNTIME_DIR") {
-            PathBuf::from(path).join("tomchat")
+        let run_dir = if let Some(path) = env::var_os("XDG_RUNTIME_DIR") {
+            PathBuf::from(path).join("tomchat-server")
         } else {
-            env::temp_dir().join(format!("tomchat-{}", current_uid()))
+            env::temp_dir().join(format!("tomchat-server-{}", current_uid()))
         };
-
         if run_dir.as_os_str().is_empty() {
-            return Err(format!("{RUN_DIR_ENV} must not be empty"));
+            return Err("server control run directory must not be empty".to_string());
         }
         Ok(SocketConfig {
             path: run_dir.join(SOCKET_NAME),
@@ -227,7 +207,7 @@ mod imp {
             Ok(listener) => Ok(listener),
             Err(error) if error.kind() == io::ErrorKind::AddrInUse => match stale_socket(path)? {
                 StaleSocket::Live => Err(format!(
-                    "another tomchat instance is already listening on {}; set {SOCKET_ENV} or {RUN_DIR_ENV} to use a different control socket",
+                    "another tomchat server is already listening on {}",
                     path.display()
                 )),
                 StaleSocket::Stale => {
@@ -235,12 +215,15 @@ mod imp {
                         format!("failed to remove stale socket {}: {error}", path.display())
                     })?;
                     UnixListener::bind(path).map_err(|error| {
-                        format!("failed to bind control socket {}: {error}", path.display())
+                        format!(
+                            "failed to bind server control socket {}: {error}",
+                            path.display()
+                        )
                     })
                 }
             },
             Err(error) => Err(format!(
-                "failed to bind control socket {}: {error}",
+                "failed to bind server control socket {}: {error}",
                 path.display()
             )),
         }
@@ -268,88 +251,106 @@ mod imp {
                 }
             }
             Err(error) => Err(format!(
-                "control socket {} exists but cannot be contacted: {error}",
+                "server control socket {} exists but cannot be contacted: {error}",
                 path.display()
             )),
         }
     }
 
-    fn handle_connection(stream: &mut UnixStream, commands: &Sender<NetworkCommand>) {
+    fn handle_connection(stream: &mut UnixStream, commands: &Sender<AdminCommand>) {
         let _ = stream.set_read_timeout(Some(STREAM_TIMEOUT));
         let _ = stream.set_write_timeout(Some(STREAM_TIMEOUT));
         let response = match read_request(stream) {
-            Ok(Request::Upload(path)) => {
-                let message = format!("queued upload {}", path.display());
-                match commands.send(NetworkCommand::UploadFile(path)) {
-                    Ok(()) => Response {
-                        status: STATUS_OK,
-                        message,
-                    },
-                    Err(_) => Response {
-                        status: STATUS_ERROR,
-                        message: "tomchat network worker is not running".to_string(),
-                    },
+            Ok((OP_INVITE, body)) => match String::from_utf8(body) {
+                Ok(user) => {
+                    let (reply_tx, reply_rx) = mpsc::channel();
+                    match commands.send(AdminCommand::Invite {
+                        user,
+                        reply: reply_tx,
+                    }) {
+                        Ok(()) => match reply_rx.recv_timeout(STREAM_TIMEOUT) {
+                            Ok(Ok(join_string)) => Response {
+                                status: STATUS_OK,
+                                message: join_string,
+                            },
+                            Ok(Err(error)) => Response {
+                                status: STATUS_ERROR,
+                                message: error,
+                            },
+                            Err(error) => Response {
+                                status: STATUS_ERROR,
+                                message: format!("server did not answer invite request: {error}"),
+                            },
+                        },
+                        Err(_) => Response {
+                            status: STATUS_ERROR,
+                            message: "tomchat server is not running".to_string(),
+                        },
+                    }
                 }
-            }
+                Err(error) => Response {
+                    status: STATUS_ERROR,
+                    message: format!("invite user is not UTF-8: {error}"),
+                },
+            },
+            Ok((opcode, _)) => Response {
+                status: STATUS_ERROR,
+                message: format!("unknown server control opcode {opcode}"),
+            },
             Err(error) => Response {
                 status: STATUS_ERROR,
                 message: error,
             },
         };
         if let Err(error) = write_response(stream, response.status, &response.message) {
-            kvlog::warn!("local control response failed", error = %error);
+            kvlog::warn!("server control response failed", error = %error);
         }
     }
 
-    fn read_request(stream: &mut UnixStream) -> Result<Request, String> {
+    fn read_request(stream: &mut UnixStream) -> Result<(u8, Vec<u8>), String> {
         let mut reader = BufReader::new(stream);
         let mut magic = vec![0u8; MAGIC.len()];
         reader
             .read_exact(&mut magic)
-            .map_err(|error| format!("failed to read control request: {error}"))?;
+            .map_err(|error| format!("failed to read server control request: {error}"))?;
         if magic != MAGIC {
-            return Err("invalid control request magic".to_string());
+            return Err("invalid server control request magic".to_string());
         }
 
         let mut header = [0u8; 5];
         reader
             .read_exact(&mut header)
-            .map_err(|error| format!("failed to read control request header: {error}"))?;
+            .map_err(|error| format!("failed to read server control request header: {error}"))?;
         let len = u32::from_be_bytes([header[1], header[2], header[3], header[4]]);
-        if len > MAX_PATH_BYTES {
+        if len > MAX_REQUEST_BYTES {
             return Err(format!(
-                "control request path exceeds {MAX_PATH_BYTES} bytes"
+                "server control request exceeds {MAX_REQUEST_BYTES} bytes"
             ));
         }
 
         let mut body = vec![0u8; len as usize];
         reader
             .read_exact(&mut body)
-            .map_err(|error| format!("failed to read control request body: {error}"))?;
-
-        match header[0] {
-            OP_UPLOAD => Ok(Request::Upload(PathBuf::from(
-                std::ffi::OsString::from_vec(body),
-            ))),
-            opcode => Err(format!("unknown control request opcode {opcode}")),
-        }
+            .map_err(|error| format!("failed to read server control request body: {error}"))?;
+        Ok((header[0], body))
     }
 
-    fn write_upload_request(stream: &mut UnixStream, path: &Path) -> Result<(), String> {
-        let bytes = path.as_os_str().as_bytes();
-        let len = u32::try_from(bytes.len())
-            .map_err(|_| "upload path is too long for control socket".to_string())?;
-        if len > MAX_PATH_BYTES {
-            return Err(format!("upload path exceeds {MAX_PATH_BYTES} bytes"));
+    fn write_request(stream: &mut UnixStream, opcode: u8, body: &[u8]) -> Result<(), String> {
+        let len = u32::try_from(body.len())
+            .map_err(|_| "server control request is too long".to_string())?;
+        if len > MAX_REQUEST_BYTES {
+            return Err(format!(
+                "server control request exceeds {MAX_REQUEST_BYTES} bytes"
+            ));
         }
-        let mut frame = Vec::with_capacity(MAGIC.len() + 1 + 4 + bytes.len());
+        let mut frame = Vec::with_capacity(MAGIC.len() + 1 + 4 + body.len());
         frame.extend_from_slice(MAGIC);
-        frame.push(OP_UPLOAD);
+        frame.push(opcode);
         frame.extend_from_slice(&len.to_be_bytes());
-        frame.extend_from_slice(bytes);
+        frame.extend_from_slice(body);
         stream
             .write_all(&frame)
-            .map_err(|error| format!("failed to write control request: {error}"))
+            .map_err(|error| format!("failed to write server control request: {error}"))
     }
 
     fn read_response(stream: &mut UnixStream) -> Result<Response, String> {
@@ -357,28 +358,28 @@ mod imp {
         let mut magic = vec![0u8; MAGIC.len()];
         reader
             .read_exact(&mut magic)
-            .map_err(|error| format!("failed to read control response: {error}"))?;
+            .map_err(|error| format!("failed to read server control response: {error}"))?;
         if magic != MAGIC {
-            return Err("invalid control response magic".to_string());
+            return Err("invalid server control response magic".to_string());
         }
 
         let mut header = [0u8; 5];
         reader
             .read_exact(&mut header)
-            .map_err(|error| format!("failed to read control response header: {error}"))?;
+            .map_err(|error| format!("failed to read server control response header: {error}"))?;
         let len = u32::from_be_bytes([header[1], header[2], header[3], header[4]]);
         if len > MAX_RESPONSE_BYTES {
             return Err(format!(
-                "control response exceeds {MAX_RESPONSE_BYTES} bytes"
+                "server control response exceeds {MAX_RESPONSE_BYTES} bytes"
             ));
         }
 
         let mut body = vec![0u8; len as usize];
         reader
             .read_exact(&mut body)
-            .map_err(|error| format!("failed to read control response body: {error}"))?;
+            .map_err(|error| format!("failed to read server control response body: {error}"))?;
         let message = String::from_utf8(body)
-            .map_err(|error| format!("control response is not UTF-8: {error}"))?;
+            .map_err(|error| format!("server control response is not UTF-8: {error}"))?;
         Ok(Response {
             status: header[0],
             message,
@@ -387,11 +388,11 @@ mod imp {
 
     fn write_response(stream: &mut UnixStream, status: u8, message: &str) -> Result<(), String> {
         let bytes = message.as_bytes();
-        let len =
-            u32::try_from(bytes.len()).map_err(|_| "control response is too long".to_string())?;
+        let len = u32::try_from(bytes.len())
+            .map_err(|_| "server control response is too long".to_string())?;
         if len > MAX_RESPONSE_BYTES {
             return Err(format!(
-                "control response exceeds {MAX_RESPONSE_BYTES} bytes"
+                "server control response exceeds {MAX_RESPONSE_BYTES} bytes"
             ));
         }
         let mut frame = Vec::with_capacity(MAGIC.len() + 1 + 4 + bytes.len());
@@ -401,7 +402,7 @@ mod imp {
         frame.extend_from_slice(bytes);
         stream
             .write_all(&frame)
-            .map_err(|error| format!("failed to write control response: {error}"))
+            .map_err(|error| format!("failed to write server control response: {error}"))
     }
 
     fn current_uid() -> u32 {
@@ -414,64 +415,28 @@ mod imp {
         use std::time::{SystemTime, UNIX_EPOCH};
 
         #[test]
-        fn upload_request_round_trips_path() {
-            let path = PathBuf::from("/tmp/some_file/foo.md");
-            let (mut writer, mut reader) = UnixStream::pair().unwrap();
-
-            write_upload_request(&mut writer, &path).unwrap();
-            let request = read_request(&mut reader).unwrap();
-
-            match request {
-                Request::Upload(actual) => assert_eq!(actual, path),
-            }
-        }
-
-        #[test]
-        fn response_round_trips_message() {
-            let (mut writer, mut reader) = UnixStream::pair().unwrap();
-
-            write_response(&mut writer, STATUS_OK, "queued upload /tmp/foo.md").unwrap();
-            let response = read_response(&mut reader).unwrap();
-
-            assert_eq!(response.status, STATUS_OK);
-            assert_eq!(response.message, "queued upload /tmp/foo.md");
-        }
-
-        #[test]
-        fn control_socket_upload_sends_network_command() {
-            let dir = temp_test_dir("upload-sends-command");
+        fn invite_request_round_trips_through_socket() {
+            let dir = temp_test_dir("invite-round-trip");
             fs::create_dir_all(&dir).unwrap();
             let socket_path = dir.join("control.sock");
-            let upload_path = dir.join("some_file/foo.md");
             let (tx, rx) = mpsc::channel();
-            let socket = ControlSocket::spawn_at_path(socket_path.clone(), tx).unwrap();
+            let socket = AdminSocket::spawn_at_path(socket_path.clone(), tx).unwrap();
+            let worker =
+                thread::spawn(
+                    move || match rx.recv_timeout(Duration::from_secs(2)).unwrap() {
+                        AdminCommand::Invite { user, reply } => {
+                            assert_eq!(user, "alice");
+                            reply.send(Ok("tcj1_join".to_string())).unwrap();
+                        }
+                    },
+                );
 
-            let response = send_upload_to_path(&socket_path, &upload_path).unwrap();
-            let command = rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            let response = send_invite_to_path(&socket_path, "alice").unwrap();
 
-            assert_eq!(response, format!("queued upload {}", upload_path.display()));
-            match command {
-                NetworkCommand::UploadFile(path) => assert_eq!(path, upload_path),
-                other => panic!("unexpected command: {other:?}"),
-            }
-
+            assert_eq!(response, "tcj1_join");
+            worker.join().unwrap();
             drop(socket);
             assert!(!socket_path.exists());
-            let _ = fs::remove_dir_all(dir);
-        }
-
-        #[test]
-        fn bind_listener_rejects_live_socket() {
-            let dir = temp_test_dir("rejects-live-socket");
-            fs::create_dir_all(&dir).unwrap();
-            let socket_path = dir.join("control.sock");
-            let listener = UnixListener::bind(&socket_path).unwrap();
-
-            let error = bind_listener(&socket_path).unwrap_err();
-
-            assert!(error.contains("already listening"));
-            drop(listener);
-            let _ = fs::remove_file(&socket_path);
             let _ = fs::remove_dir_all(dir);
         }
 
@@ -481,7 +446,7 @@ mod imp {
                 .unwrap()
                 .as_nanos();
             env::temp_dir().join(format!(
-                "tomchat-local-control-{name}-{}-{suffix}",
+                "tomchat-server-control-{name}-{}-{suffix}",
                 std::process::id()
             ))
         }
@@ -490,25 +455,30 @@ mod imp {
 
 #[cfg(not(unix))]
 mod imp {
-    use std::{path::Path, sync::mpsc::Sender};
+    use std::sync::mpsc::Sender;
 
-    use crate::client_net::NetworkCommand;
+    pub enum AdminCommand {
+        Invite {
+            user: String,
+            reply: Sender<Result<String, String>>,
+        },
+    }
 
-    pub struct ControlSocket;
+    pub struct AdminSocket;
 
-    impl ControlSocket {
-        pub fn spawn(_commands: Sender<NetworkCommand>) -> Result<Self, String> {
-            Err("tomchat local control sockets are only supported on Unix".to_string())
+    impl AdminSocket {
+        pub fn spawn(_commands: Sender<AdminCommand>) -> Result<Self, String> {
+            Err("tomchat server control sockets are only supported on Unix".to_string())
         }
 
-        pub fn path(&self) -> &Path {
-            Path::new("")
+        pub fn path(&self) -> &std::path::Path {
+            std::path::Path::new("")
         }
     }
 
-    pub fn send_upload(_path: &Path) -> Result<String, String> {
-        Err("tomchat upload is only supported on Unix".to_string())
+    pub fn send_invite(_user: &str) -> Result<String, String> {
+        Err("tomchat-server invite is only supported on Unix".to_string())
     }
 }
 
-pub use imp::{ControlSocket, send_upload};
+pub use imp::{AdminCommand, AdminSocket, send_invite};

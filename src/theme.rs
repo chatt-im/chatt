@@ -30,6 +30,18 @@ pub const ERROR: Style = Style::DEFAULT.with_fg_rgb(0xff, 0x66, 0x6f);
 pub const GOOD: Style = Style::DEFAULT.with_fg_rgb(0x9e, 0xd0, 0x8f);
 pub const WARN: Style = Style::DEFAULT.with_fg_rgb(0xe6, 0xc3, 0x84);
 pub const ACCENT: Style = Style::DEFAULT.with_fg_rgb(0x8a, 0xa6, 0xbd);
+pub const JOIN_INPUT_ACTIVE: Style = Style::DEFAULT
+    .with_bg_rgb(0x24, 0x28, 0x30)
+    .with_fg_rgb(0xf0, 0xf2, 0xe8);
+pub const JOIN_INPUT_INACTIVE: Style = Style::DEFAULT
+    .with_bg_rgb(0x18, 0x1b, 0x21)
+    .with_fg_rgb(0xd8, 0xdb, 0xd6);
+pub const JOIN_INPUT_BOUNDARY_ACTIVE: Style = Style::DEFAULT
+    .with_bg_rgb(0x45, 0x4b, 0x57)
+    .with_fg_rgb(0xf0, 0xf2, 0xe8);
+pub const JOIN_INPUT_BOUNDARY_INACTIVE: Style = Style::DEFAULT
+    .with_bg_rgb(0x1c, 0x20, 0x26)
+    .with_fg_rgb(0x8a, 0x8f, 0x98);
 
 pub const STATUS_FILL: Style = Style::DEFAULT
     .with_bg_rgb(0x2a, 0x2f, 0x38)
@@ -55,6 +67,19 @@ pub fn editor_theme() -> EditorTheme {
         selection: SelectionTheme {
             charwise,
             linewise: Style::DEFAULT.with_bg_rgb(0x33, 0x38, 0x44),
+            blockwise: charwise,
+        },
+    }
+}
+
+pub fn join_input_editor_theme() -> EditorTheme {
+    let charwise = Style::DEFAULT.with_bg_rgb(0x4b, 0x3f, 0x61);
+    EditorTheme {
+        name: "tomchat-join-input",
+        text: JOIN_INPUT_ACTIVE,
+        selection: SelectionTheme {
+            charwise,
+            linewise: JOIN_INPUT_BOUNDARY_ACTIVE,
             blockwise: charwise,
         },
     }

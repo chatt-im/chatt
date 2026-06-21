@@ -2,7 +2,7 @@ use std::{
     collections::{HashMap, VecDeque},
     fs::{self, File, OpenOptions},
     io::{self, Read, Write},
-    net::{SocketAddr, TcpStream as StdTcpStream},
+    net::{SocketAddr, TcpStream as StdTcpStream, ToSocketAddrs},
     path::{Path, PathBuf},
     sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, TryRecvError},
     thread::{self, JoinHandle},
@@ -50,10 +50,11 @@ const FILE_PROGRESS_STEP_BYTES: u64 = 1024 * 1024;
 
 #[derive(Clone, Debug)]
 pub struct ClientConfig {
-    pub tcp_addr: SocketAddr,
-    pub udp_addr: SocketAddr,
-    pub udp_probe_addr: Option<SocketAddr>,
+    pub tcp_addr: String,
+    pub udp_addr: String,
+    pub udp_probe_addr: Option<String>,
     pub user: String,
+    pub display_name: String,
     pub token: String,
     pub pairing_code: Option<String>,
     pub server_public_key: Option<String>,
@@ -214,8 +215,21 @@ fn run_worker_inner(
         Ok(value) => value,
         Err(error) => return SessionEnd::ConnectFailed(error),
     };
+    let server_udp_addr = match resolve_endpoint(&config.udp_addr) {
+        Ok(addr) => addr,
+        Err(error) => return SessionEnd::ConnectFailed(format!("invalid UDP endpoint: {error}")),
+    };
+    let server_udp_probe_addr = match config.udp_probe_addr.as_deref() {
+        Some(addr) => match resolve_endpoint(addr) {
+            Ok(addr) => Some(addr),
+            Err(error) => {
+                return SessionEnd::ConnectFailed(format!("invalid UDP probe endpoint: {error}"));
+            }
+        },
+        None => None,
+    };
     let std_udp = match bind_udp_socket(
-        if config.udp_addr.is_ipv4() {
+        if server_udp_addr.is_ipv4() {
             "0.0.0.0:0".parse().unwrap()
         } else {
             "[::]:0".parse().unwrap()
@@ -249,6 +263,8 @@ fn run_worker_inner(
         tcp: TcpStream::from_std(std_tcp),
         udp: UdpSocket::from_std(std_udp),
         udp_local_addr,
+        server_udp_addr,
+        server_udp_probe_addr,
         read_buf: Vec::new(),
         write_buf: Vec::new(),
         control,
@@ -299,6 +315,7 @@ fn run_worker_inner(
     let auth_control = match worker.config.pairing_code.clone() {
         Some(pairing_code) => ClientControl::Pair {
             user: worker.config.user.clone(),
+            display_name: worker.config.display_name.clone(),
             pairing_code,
             token: worker.config.token.clone(),
             receive_files: worker.config.file_receive_dir.is_some(),
@@ -471,7 +488,7 @@ fn connect_and_handshake(
         tcp_addr = %config.tcp_addr,
         user = config.user.as_str()
     );
-    let mut stream = StdTcpStream::connect(config.tcp_addr)
+    let mut stream = StdTcpStream::connect(config.tcp_addr.as_str())
         .map_err(|error| format!("failed to connect to server: {error}"))?;
     stream
         .set_nodelay(true)
@@ -520,10 +537,18 @@ fn connect_and_handshake(
     Ok((stream, control, secrets))
 }
 
+fn resolve_endpoint(endpoint: &str) -> Result<SocketAddr, String> {
+    endpoint
+        .to_socket_addrs()
+        .map_err(|error| format!("{endpoint}: {error}"))?
+        .next()
+        .ok_or_else(|| format!("{endpoint}: no socket addresses resolved"))
+}
+
 fn pinned_server_public_key(config: &ClientConfig) -> Result<[u8; 32], String> {
     match config.server_public_key.as_deref() {
         Some(public_key) => ed25519_public_key_from_hex(public_key)
-            .map_err(|error| format!("invalid configured network.server-public-key: {error}")),
+            .map_err(|error| format!("invalid configured server-public-key: {error}")),
         None => Ok(dev_server_public_key()),
     }
 }
@@ -553,6 +578,8 @@ struct WorkerState {
     write_buf: Vec<u8>,
     control: ControlTransport,
     secrets: Option<SessionSecrets>,
+    server_udp_addr: SocketAddr,
+    server_udp_probe_addr: Option<SocketAddr>,
     session_id: Option<SessionId>,
     user_id: Option<UserId>,
     room_id: Option<RoomId>,
@@ -717,11 +744,11 @@ impl WorkerState {
             if self.handle_p2p_media(now, src, packet) {
                 continue;
             }
-            if src != self.config.udp_addr {
+            if src != self.server_udp_addr {
                 kvlog::warn!(
                     "udp packet ignored",
                     addr = %src,
-                    expected_addr = %self.config.udp_addr,
+                    expected_addr = %self.server_udp_addr,
                     packet_size = len
                 );
                 continue;
@@ -1267,7 +1294,7 @@ impl WorkerState {
                     );
                     let server_addr = self
                         .probe_addr_for_id(probe_id)
-                        .unwrap_or(self.config.udp_addr);
+                        .unwrap_or(self.server_udp_addr);
                     self.p2p_nat_classifier.observe(ReflexiveObservation {
                         server_addr,
                         mapped_addr: addr,
@@ -1338,8 +1365,8 @@ impl WorkerState {
         if let Some(session_id) = self.session_id {
             kvlog::info!("udp bind sending", session_id = session_id.0);
             self.send_media(&MediaPayload::Bind { session_id });
-            self.send_nat_probe(session_id, 0, self.config.udp_addr);
-            if let Some(udp_probe_addr) = self.config.udp_probe_addr {
+            self.send_nat_probe(session_id, 0, self.server_udp_addr);
+            if let Some(udp_probe_addr) = self.server_udp_probe_addr {
                 self.send_nat_probe(session_id, 1, udp_probe_addr);
             }
         }
@@ -1362,8 +1389,8 @@ impl WorkerState {
 
     fn probe_addr_for_id(&self, probe_id: u8) -> Option<SocketAddr> {
         match probe_id {
-            0 => Some(self.config.udp_addr),
-            1 => self.config.udp_probe_addr,
+            0 => Some(self.server_udp_addr),
+            1 => self.server_udp_probe_addr,
             _ => None,
         }
     }
@@ -1404,7 +1431,7 @@ impl WorkerState {
         self.restart_port_policy.record(self.udp_local_addr.port());
 
         let bind_addr =
-            RestartPortPolicy::bind_addr_for_restart(if self.config.udp_addr.is_ipv4() {
+            RestartPortPolicy::bind_addr_for_restart(if self.server_udp_addr.is_ipv4() {
                 "0.0.0.0:0".parse().unwrap()
             } else {
                 "[::]:0".parse().unwrap()
@@ -1451,7 +1478,7 @@ impl WorkerState {
         self.media_send_counter = self.media_send_counter.wrapping_add(1);
         match self.seal_server_media(counter, payload) {
             Ok(packet) => {
-                if let Err(error) = self.udp.send_to(&packet, self.config.udp_addr) {
+                if let Err(error) = self.udp.send_to(&packet, self.server_udp_addr) {
                     kvlog::warn!(
                         "udp send failed",
                         kind,
@@ -1522,7 +1549,7 @@ impl WorkerState {
             Vec::new()
         });
         if candidates.is_empty() {
-            let fallback_ip = if self.config.udp_addr.is_ipv4() {
+            let fallback_ip = if self.server_udp_addr.is_ipv4() {
                 "127.0.0.1".parse().unwrap()
             } else {
                 "::1".parse().unwrap()
@@ -1555,7 +1582,7 @@ impl WorkerState {
             1,
             self.p2p_generation,
             CandidateKind::Relay,
-            self.config.udp_addr,
+            self.server_udp_addr,
             None,
             true,
         ));

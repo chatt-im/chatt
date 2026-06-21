@@ -41,6 +41,11 @@ Important fields:
 - `network.udp-addr`: optional UDP media listener override.
 - `network.udp-probe-addr`: optional second UDP endpoint for P2P NAT
   classification.
+- `network.public-tcp-addr`: TCP endpoint embedded in invites. This may be a
+  DNS name or NAT/reverse-proxy address and port.
+- `network.public-udp-addr`: UDP media endpoint embedded in invites.
+- `network.public-udp-probe-addr`: optional public P2P NAT probe endpoint
+  embedded in invites.
 - `security.server-identity-seed`: 32-byte Ed25519 seed encoded as hex. Replace
   the development value before non-local use.
 - `security.encryption`: whether TCP control and server-relayed UDP media use
@@ -51,36 +56,40 @@ Important fields:
   RPC protocol maximum.
 - `[[rooms]]`: configured rooms. The current client flow expects room id `1` as
   the default lobby.
-- `[[users]]`: configured users. Tokens and pairing codes are stored as
-  `sha256:<64 hex chars>` hashes, never as plaintext.
+- `[[users]]`: configured users. Token hashes are stored as
+  `sha256:<64 hex chars>`. Invite secrets are never stored in TOML.
 
 The server prints its public key at startup. Clients should copy that value into
-`network.server-public-key` in `tomchat.toml` for non-development deployments.
-If the client field is empty, it falls back to the compiled development key.
+the active `[[servers]].server-public-key` in `tomchat.toml` for
+non-development deployments. If the client field is empty, it falls back to the
+compiled development key.
 
 ## Pairing Procedure
 
 Pairing is used to bootstrap or rotate a user's long random token without
-storing the token in plaintext on the server.
+storing the token or invite secret in plaintext config.
 
-1. The server admin creates or updates a `[[users]]` entry with `name`, `id`,
-   and `pairing-code-hash = "sha256:<hash>"`.
-2. The user's client config sets:
-   - `network.user` to the configured user name.
-   - `network.token` to a newly generated token of at least 32 bytes.
-   - `network.pairing-code` to the one-time code.
-   - `network.server-public-key` to the server public key printed at startup.
-3. The client performs the normal server-authenticated handshake.
-4. Inside the server-selected control channel, the client sends
-   `ClientControl::Pair` containing the user name, pairing code, and new token.
-5. The server verifies the pairing code hash, hashes the new token, rewrites the
-   server config with `token-hash` set and `pairing-code-hash` cleared, and then
-   authenticates the current session.
-6. The user removes `network.pairing-code` from the client config. Future logins
-   use `ClientControl::Authenticate` with the token.
-
-Pairing fails if the server is not using a writable config path, because the
-one-time code must be consumed durably.
+1. While the server is running, the admin runs `tomchat-server invite USER`.
+   The command connects to the server's Unix admin socket and asks the running
+   process to create an in-memory invite for that internal user identifier. The
+   user does not need to exist in TOML yet. A new invite for the same user
+   replaces the previous one. Invites expire after 24 hours.
+2. The server returns a `tcj1_...` join string containing the server addresses,
+   server public key, target user id, default room, and one-time invite secret.
+   The addresses come from `network.public-*`, not from the local bind
+   addresses, so deployments behind NAT or DNS use their externally reachable
+   connection details.
+3. The user runs `tomchat join JOIN_STRING`. The join TUI asks for a local
+   server alias and display username, then generates a long client token.
+4. The client performs the normal server-authenticated handshake. Inside the
+   server-selected control channel, it sends `ClientControl::Pair` containing
+   the internal user identifier, display name, invite secret, and new token.
+5. The server verifies the in-memory invite hash, removes the invite, hashes the
+   new token, creates or updates the `[[users]]` entry with `token-hash` and
+   `display-name`, and authenticates the current session.
+6. After successful authentication, the client writes a named `[[servers]]`
+   entry with the generated token. The invite secret is never written to client
+   config. Future logins use `ClientControl::Authenticate` with the token.
 
 ## Transport Protocol
 
@@ -125,7 +134,8 @@ Shared protocol:
 
 - `crates/rpc/src/control.rs`: `ClientHello`, `ServerHello`,
   `ClientControl::Authenticate`, `ClientControl::Pair`, `ServerControl`, and
-  validation in `validate_client_control`.
+  validation in `validate_client_control`; `InviteTicket` join-string
+  encoding/decoding.
 - `crates/rpc/src/crypto.rs`: handshake generation and verification in
   `generate_client_hello`, `respond_to_client_hello`,
   `respond_to_client_hello_plaintext`, and
@@ -146,6 +156,7 @@ Server:
   `Config::mark_user_paired`; token helpers in `hash_secret` and
   `verify_secret_hash`.
 - `crates/server/src/main.rs`: server startup in `main` and `Server::bind`;
+  invite creation in `Server::create_invite`;
   TCP handshake in `Server::process_frame`; auth dispatch in
   `Server::handle_control`; token auth in `Server::authenticate_client`;
   first-time pairing in `Server::pair_client`; session creation in
@@ -156,9 +167,10 @@ Server:
 
 Client:
 
-- `src/config.rs`: client TOML fields in `NetworkConfig`, environment/CLI
-  overrides in `Config::apply_env_and_cli_overrides`, and runtime persistence in
-  `write_runtime_config`.
+- `src/config.rs`: client TOML fields in `ServerEntry` and runtime persistence
+  in `write_runtime_config`.
+- `src/main.rs`: join-string setup UI in `run_join_setup` and named-server
+  persistence after successful pairing.
 - `src/client_net.rs`: server connection and handshake in
   `connect_and_handshake`; public key pin selection in
   `pinned_server_public_key`; first auth or pairing message in

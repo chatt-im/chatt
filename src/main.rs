@@ -31,7 +31,7 @@ use audio::{
 use bindings::{BindCommand, PendingChord, Resolved};
 use chat_buffer::VirtualChatBuffer;
 use client_net::{NetworkClient, NetworkCommand, NetworkEvent};
-use config::Config;
+use config::{Config, ServerEntry};
 use extui::{
     Buffer, Ellipsis, HAlign, Rect, Style, Terminal, TerminalFlags,
     event::{
@@ -44,15 +44,16 @@ use extui_bindings::InputKey;
 use extui_editor::{
     Editor, Replacement, StyleRun, TextBuffer, TrackedChange, bindings as editor_bindings,
 };
+use ring::rand::SecureRandom;
 use rpc::{
-    control::{ChatMessage, ParticipantInfo},
+    control::{ChatMessage, InviteTicket, ParticipantInfo},
+    crypto::encode_hex,
     ids::{SessionId, StreamId, UserId},
 };
 use settings::{AudioInputPickerState, BITRATES, SettingsDraft, SettingsFocus};
 use tinyhl::{Highlighter, Source};
 
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
-const KNOWN_USERS: &[&str] = &["alice", "bob", "carol"];
 const NAME_COL_WIDTH: u16 = 16;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -274,6 +275,7 @@ impl EditorHighlighter {
 
 struct App {
     config: Config,
+    server_alias: String,
     user: String,
     room_name: String,
     status: String,
@@ -303,6 +305,7 @@ struct App {
     playback: Option<LivePlayback>,
     voice_packets_received: u64,
     voice_bytes_received: u64,
+    save_config_after_auth: bool,
 }
 
 enum Action {
@@ -313,14 +316,20 @@ enum Action {
 #[derive(Debug, PartialEq, Eq)]
 enum CliCommand {
     RunUi,
+    Join { join_string: String },
     Upload { path: PathBuf },
     DebugAudioInputs,
 }
 
 impl App {
-    fn new(config: Config) -> Self {
+    fn new(
+        config: Config,
+        pairing_code: Option<String>,
+        save_config_after_auth: bool,
+    ) -> Result<Self, String> {
         let (event_tx, event_rx) = mpsc::channel();
-        let client_config = config.network.client_config(&config.files);
+        let active_server = config.active_server()?.clone();
+        let client_config = active_server.client_config(&config.files, pairing_code);
         let network = NetworkClient::spawn(client_config, event_tx);
         let mut composer =
             Editor::with_bindings(editor_bindings::vim(editor_bindings::VimOptions::default()));
@@ -336,8 +345,9 @@ impl App {
             &audio_input_items,
             settings_draft.input_device_id.as_deref(),
         );
-        Self {
-            user: config.network.user.clone(),
+        Ok(Self {
+            server_alias: active_server.alias.clone(),
+            user: active_server.effective_display_name(),
             room_name: "lobby".to_string(),
             status: "connecting".to_string(),
             status_kind: StatusKind::Info,
@@ -366,8 +376,9 @@ impl App {
             playback: None,
             voice_packets_received: 0,
             voice_bytes_received: 0,
+            save_config_after_auth,
             config,
-        }
+        })
     }
 
     fn drain_network_events(&mut self) {
@@ -390,7 +401,22 @@ impl App {
                 if let Some(room) = rooms.first() {
                     self.room_name = room.name.clone();
                 }
-                self.set_status(format!("authenticated as {}", self.user));
+                if self.save_config_after_auth {
+                    match self.config.save_runtime() {
+                        Ok(path) => {
+                            self.config.config_path = Some(path.clone());
+                            self.save_config_after_auth = false;
+                            self.set_status(format!(
+                                "joined {}; config saved to {}",
+                                self.server_alias,
+                                path.display()
+                            ));
+                        }
+                        Err(error) => self.set_error(error),
+                    }
+                } else {
+                    self.set_status(format!("authenticated as {}", self.user));
+                }
             }
             NetworkEvent::RoomJoined {
                 room_id,
@@ -801,7 +827,6 @@ impl App {
             "/users" => self.show_users(),
             "/whoami" => self.show_current_user(),
             command if command.starts_with("/upload ") => self.upload_file_command(command),
-            command if command.starts_with("/user ") => self.change_user_command(command),
             command if command.starts_with('/') => {
                 self.set_error(format!("unknown command: {command}"))
             }
@@ -869,7 +894,7 @@ impl App {
 
     fn show_users(&mut self) {
         if self.participants.entries.is_empty() {
-            self.set_status(format!("known users: {}", KNOWN_USERS.join(", ")));
+            self.set_status("no users in the current room yet");
         } else {
             let users = self
                 .participants
@@ -884,54 +909,12 @@ impl App {
 
     fn show_current_user(&mut self) {
         self.set_status(match self.user_id {
-            Some(user_id) => format!("signed in as {} (user {})", self.user, user_id.0),
-            None => format!("connecting as {}", self.user),
+            Some(user_id) => format!(
+                "signed in as {} on {} (user {})",
+                self.user, self.server_alias, user_id.0
+            ),
+            None => format!("connecting as {} on {}", self.user, self.server_alias),
         });
-    }
-
-    fn change_user_command(&mut self, command: &str) {
-        let mut parts = command.split_whitespace();
-        let _ = parts.next();
-        let Some(user) = parts.next() else {
-            self.set_error("usage: /user alice|bob|carol [token]");
-            return;
-        };
-        if !is_known_user(user) {
-            self.set_error("known users: alice, bob, carol");
-            return;
-        }
-        let token = parts
-            .next()
-            .map(ToString::to_string)
-            .unwrap_or_else(|| config::default_token(user).to_string());
-        if parts.next().is_some() {
-            self.set_error("usage: /user alice|bob|carol [token]");
-            return;
-        }
-        self.reconnect_as(user.to_string(), token);
-    }
-
-    fn reconnect_as(&mut self, user: String, token: String) {
-        self.stop_audio();
-        self.network.shutdown();
-        self.config.network.user = user;
-        self.config.network.token = token;
-        self.user = self.config.network.user.clone();
-        self.room_name = "lobby".to_string();
-        self.chat.clear();
-        self.participants = Participants::default();
-        self.session_id = None;
-        self.user_id = None;
-        self.voice_packets_received = 0;
-        self.voice_bytes_received = 0;
-        self.set_status(format!("connecting as {}", self.user));
-
-        let (event_tx, event_rx) = mpsc::channel();
-        self.network = NetworkClient::spawn(
-            self.config.network.client_config(&self.config.files),
-            event_tx,
-        );
-        self.event_rx = event_rx;
     }
 
     fn ensure_mic_capture(&mut self) -> Result<(), String> {
@@ -1069,6 +1052,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     match parse_cli_command(&args)? {
         CliCommand::RunUi => {}
+        CliCommand::Join { join_string } => {
+            let config_path = config::value_arg(&args, "--config");
+            let ticket = rpc::control::decode_invite_ticket(&join_string)?;
+            let (config, pairing_code) = run_join_setup(ticket, config_path.as_deref())?;
+            return run_app(config, Some(pairing_code), true);
+        }
         CliCommand::Upload { path } => {
             let path = absolute_upload_path(&path)?;
             let response = local_control::send_upload(&path)?;
@@ -1084,7 +1073,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let config_path = config::value_arg(&args, "--config");
-    let mut app = App::new(Config::load(config_path.as_deref())?);
+    run_app(Config::load(config_path.as_deref())?, None, false)
+}
+
+fn run_app(
+    config: Config,
+    pairing_code: Option<String>,
+    save_config_after_auth: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut app = App::new(config, pairing_code, save_config_after_auth)?;
     let control_socket = local_control::ControlSocket::spawn(app.network.sender())?;
     kvlog::info!(
         "tomchat local control socket ready",
@@ -1152,6 +1149,20 @@ fn parse_cli_command(args: &[String]) -> Result<CliCommand, String> {
                 path: PathBuf::from(path),
             });
         }
+        if arg == "join" {
+            let join_string = args
+                .get(index + 1)
+                .ok_or_else(|| "usage: tomchat join JOIN_STRING".to_string())?;
+            if join_string.is_empty() {
+                return Err("usage: tomchat join JOIN_STRING".to_string());
+            }
+            if args.len() != index + 2 {
+                return Err("usage: tomchat join JOIN_STRING".to_string());
+            }
+            return Ok(CliCommand::Join {
+                join_string: join_string.clone(),
+            });
+        }
         if arg == "debug-audio-inputs" {
             if args.len() != index + 1 {
                 return Err("usage: tomchat debug-audio-inputs".to_string());
@@ -1169,21 +1180,7 @@ fn parse_cli_command(args: &[String]) -> Result<CliCommand, String> {
 }
 
 fn cli_option_takes_value(arg: &str) -> bool {
-    matches!(
-        arg,
-        "--config"
-            | "--logfile"
-            | "--user"
-            | "--token"
-            | "--pairing-code"
-            | "--server-public-key"
-            | "--tcp"
-            | "--udp"
-            | "--udp-probe"
-            | "--receive-dir"
-            | "--max-upload-bytes"
-            | "--max-receive-bytes"
-    )
+    matches!(arg, "--config" | "--logfile")
 }
 
 fn absolute_upload_path(path: &Path) -> Result<PathBuf, String> {
@@ -1264,6 +1261,436 @@ fn print_debug_audio_inputs(buffer_request: BufferRequest) -> Result<(), String>
     };
     println!("{report}");
     Ok(())
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum JoinFocus {
+    Alias,
+    DisplayName,
+    Confirm,
+}
+
+struct JoinDraft {
+    ticket: InviteTicket,
+    alias: Editor,
+    display_name: Editor,
+    focus: JoinFocus,
+    status: String,
+    status_kind: StatusKind,
+}
+
+impl JoinDraft {
+    fn new(ticket: InviteTicket) -> Self {
+        let mut alias = join_input_editor(&default_join_alias(&ticket));
+        let mut display_name = join_input_editor(&title_case_ascii(&ticket.user));
+        alias.enter_insert_mode();
+        display_name.enter_insert_mode();
+        Self {
+            ticket,
+            alias,
+            display_name,
+            focus: JoinFocus::Alias,
+            status: "review invite".to_string(),
+            status_kind: StatusKind::Info,
+        }
+    }
+
+    fn move_focus(&mut self, delta: isize) {
+        const ORDER: [JoinFocus; 3] =
+            [JoinFocus::Alias, JoinFocus::DisplayName, JoinFocus::Confirm];
+        let index = ORDER
+            .iter()
+            .position(|focus| *focus == self.focus)
+            .unwrap_or(0);
+        let next = (index as isize + delta).rem_euclid(ORDER.len() as isize) as usize;
+        self.focus = ORDER[next];
+    }
+
+    fn set_error(&mut self, error: impl Into<String>) {
+        self.status = error.into();
+        self.status_kind = StatusKind::Error;
+    }
+
+    fn focused_editor_mut(&mut self) -> Option<&mut Editor> {
+        match self.focus {
+            JoinFocus::Alias => Some(&mut self.alias),
+            JoinFocus::DisplayName => Some(&mut self.display_name),
+            JoinFocus::Confirm => None,
+        }
+    }
+}
+
+fn join_input_editor(value: &str) -> Editor {
+    let mut editor = Editor::new();
+    editor.set_single_line(true);
+    editor.set_wrap(false);
+    editor.set_height_bounds(1, 1);
+    editor.set_theme(theme::join_input_editor_theme());
+    editor.set_lines(value);
+    editor.enter_insert_mode();
+    editor
+}
+
+fn run_join_setup(
+    ticket: InviteTicket,
+    config_path: Option<&str>,
+) -> Result<(Config, String), Box<dyn std::error::Error>> {
+    let mut draft = JoinDraft::new(ticket);
+    event::polling::initialize_global_waker(GlobalWakerConfig {
+        resize: true,
+        termination: true,
+    })?;
+
+    let flags = TerminalFlags::RAW_MODE
+        | TerminalFlags::ALT_SCREEN
+        | TerminalFlags::HIDE_CURSOR
+        | TerminalFlags::EXTENDED_KEYBOARD_INPUTS;
+    let mut terminal = Terminal::open(flags)?;
+    let (w, h) = terminal.size()?;
+    let mut buffer = Buffer::new(w, h);
+    buffer.set_rgb_supported(true);
+    let mut events = Events::default();
+    let stdin = std::io::stdin();
+
+    loop {
+        render_join(&mut draft, &mut buffer);
+        buffer.render(&mut terminal);
+
+        if event::poll(&stdin, Some(POLL_INTERVAL))?.is_readable() {
+            events.read_from(&stdin)?;
+        }
+
+        while let Some(event) = events.next(terminal.is_raw()) {
+            match event {
+                Event::Key(key) => match process_join_key(&mut draft, key, config_path) {
+                    JoinAction::Continue => {}
+                    JoinAction::Cancel => return Err("join canceled".into()),
+                    JoinAction::Done(config, pairing_code) => return Ok((config, pairing_code)),
+                },
+                Event::Resized => {
+                    let (new_w, new_h) = terminal.size()?;
+                    buffer.resize(new_w, new_h);
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+enum JoinAction {
+    Continue,
+    Cancel,
+    Done(Config, String),
+}
+
+fn process_join_key(draft: &mut JoinDraft, key: KeyEvent, config_path: Option<&str>) -> JoinAction {
+    if matches!(key.kind, KeyEventKind::Release) {
+        return JoinAction::Continue;
+    }
+    if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+        return JoinAction::Cancel;
+    }
+    match key.code {
+        KeyCode::Esc => JoinAction::Cancel,
+        KeyCode::Tab | KeyCode::Down => {
+            draft.move_focus(1);
+            if let Some(editor) = draft.focused_editor_mut() {
+                editor.enter_insert_mode();
+            }
+            JoinAction::Continue
+        }
+        KeyCode::BackTab | KeyCode::Up => {
+            draft.move_focus(-1);
+            if let Some(editor) = draft.focused_editor_mut() {
+                editor.enter_insert_mode();
+            }
+            JoinAction::Continue
+        }
+        KeyCode::Enter if draft.focus == JoinFocus::Confirm => confirm_join(draft, config_path),
+        KeyCode::Enter => {
+            draft.move_focus(1);
+            if let Some(editor) = draft.focused_editor_mut() {
+                editor.enter_insert_mode();
+            }
+            JoinAction::Continue
+        }
+        _ if draft
+            .focused_editor_mut()
+            .is_some_and(|editor| editor.send_key(&key)) =>
+        {
+            JoinAction::Continue
+        }
+        _ => JoinAction::Continue,
+    }
+}
+
+fn confirm_join(draft: &mut JoinDraft, config_path: Option<&str>) -> JoinAction {
+    let alias = draft.alias.text().trim().to_string();
+    let display_name = draft.display_name.text().trim().to_string();
+    if let Err(error) = config::validate_server_alias(&alias) {
+        draft.set_error(error);
+        draft.focus = JoinFocus::Alias;
+        return JoinAction::Continue;
+    }
+    if let Err(error) = config::validate_display_name(&display_name) {
+        draft.set_error(error);
+        draft.focus = JoinFocus::DisplayName;
+        return JoinAction::Continue;
+    }
+
+    let token = match random_token() {
+        Ok(token) => token,
+        Err(error) => {
+            draft.set_error(error);
+            return JoinAction::Continue;
+        }
+    };
+    let server = match server_entry_from_invite(&draft.ticket, alias.clone(), display_name, token) {
+        Ok(server) => server,
+        Err(error) => {
+            draft.set_error(error);
+            return JoinAction::Continue;
+        }
+    };
+    let mut config = match Config::load(config_path) {
+        Ok(config) => config,
+        Err(error) => {
+            draft.set_error(error);
+            return JoinAction::Continue;
+        }
+    };
+    let pairing_code = draft.ticket.pairing_code.clone();
+    config.upsert_server(server);
+    config.set_active_server(alias);
+    JoinAction::Done(config, pairing_code)
+}
+
+fn server_entry_from_invite(
+    ticket: &InviteTicket,
+    alias: String,
+    display_name: String,
+    token: String,
+) -> Result<ServerEntry, String> {
+    Ok(ServerEntry {
+        alias,
+        tcp_addr: ticket.tcp_addr.clone(),
+        udp_addr: ticket.udp_addr.clone(),
+        udp_probe_addr: ticket.udp_probe_addr.clone(),
+        user: ticket.user.clone(),
+        display_name,
+        token,
+        server_public_key: ticket.server_public_key.clone(),
+        room_id: ticket.room_id,
+    })
+}
+
+fn random_token() -> Result<String, String> {
+    let mut bytes = [0u8; 32];
+    ring::rand::SystemRandom::new()
+        .fill(&mut bytes)
+        .map_err(|_| "failed to generate pairing token".to_string())?;
+    Ok(encode_hex(&bytes))
+}
+
+fn default_join_alias(ticket: &InviteTicket) -> String {
+    let host = if let Ok(addr) = ticket.tcp_addr.parse::<std::net::SocketAddr>() {
+        if addr.ip().is_loopback() {
+            return "local".to_string();
+        }
+        addr.ip().to_string()
+    } else {
+        ticket
+            .tcp_addr
+            .rsplit_once(':')
+            .map(|(host, _)| host.trim_matches(['[', ']']).to_string())
+            .unwrap_or_else(|| "server".to_string())
+    };
+    if host == "localhost" {
+        return "local".to_string();
+    }
+    let mut alias = String::from("server");
+    for ch in host.chars() {
+        if ch.is_ascii_alphanumeric() {
+            alias.push(ch.to_ascii_lowercase());
+        } else if !alias.ends_with('-') {
+            alias.push('-');
+        }
+    }
+    while alias.ends_with('-') {
+        alias.pop();
+    }
+    alias
+}
+
+fn title_case_ascii(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    let mut word_start = true;
+    for ch in value.chars() {
+        if ch.is_ascii_alphanumeric() {
+            if word_start {
+                out.push(ch.to_ascii_uppercase());
+                word_start = false;
+            } else {
+                out.push(ch);
+            }
+        } else {
+            out.push(' ');
+            word_start = true;
+        }
+    }
+    let out = out.trim().to_string();
+    if out.is_empty() {
+        value.to_string()
+    } else {
+        out
+    }
+}
+
+fn render_join(draft: &mut JoinDraft, buf: &mut Buffer) {
+    buf.rect().with(theme::BACKGROUND).fill(buf);
+    buf.hide_cursor();
+    let mut area = buf.rect();
+    let status = area.take_bottom(1);
+    draw_join_status(status, draft, buf);
+    let mut body = area;
+    body.take_top(1)
+        .with(theme::STATUS_SECTION | Modifier::BOLD)
+        .with(Ellipsis(true))
+        .text(buf, " JOIN SERVER ");
+    body.take_top(1).with(theme::BACKGROUND).fill(buf);
+    draw_join_detail(body.take_top(1), buf, "Server", &draft.ticket.tcp_addr);
+    draw_join_detail(body.take_top(1), buf, "UDP", &draft.ticket.udp_addr);
+    draw_join_detail(
+        body.take_top(1),
+        buf,
+        "Probe",
+        draft.ticket.udp_probe_addr.as_deref().unwrap_or("disabled"),
+    );
+    draw_join_detail(body.take_top(1), buf, "User", &draft.ticket.user);
+    draw_join_detail(
+        body.take_top(1),
+        buf,
+        "Room",
+        &draft.ticket.room_id.to_string(),
+    );
+    draw_join_detail(
+        body.take_top(1),
+        buf,
+        "Key",
+        &short_key(&draft.ticket.server_public_key),
+    );
+    body.take_top(1).with(theme::BACKGROUND).fill(buf);
+    draw_join_field(
+        body.take_top(1),
+        buf,
+        "Alias",
+        &mut draft.alias,
+        draft.focus == JoinFocus::Alias,
+    );
+    draw_join_field(
+        body.take_top(1),
+        buf,
+        "Display",
+        &mut draft.display_name,
+        draft.focus == JoinFocus::DisplayName,
+    );
+    body.take_top(1).with(theme::BACKGROUND).fill(buf);
+    draw_join_button(
+        body.take_top(1),
+        buf,
+        "Join server",
+        draft.focus == JoinFocus::Confirm,
+    );
+}
+
+fn draw_join_detail(area: Rect, buf: &mut Buffer, label: &str, value: &str) {
+    if area.is_empty() {
+        return;
+    }
+    let mut row = area;
+    row.take_left(12)
+        .with(theme::BACKGROUND.patch(theme::MUTED))
+        .with(Ellipsis(true))
+        .text(buf, label);
+    row.with(theme::BACKGROUND.patch(theme::TEXT))
+        .with(Ellipsis(true))
+        .text(buf, value);
+}
+
+fn draw_join_field(area: Rect, buf: &mut Buffer, label: &str, editor: &mut Editor, focused: bool) {
+    if area.is_empty() {
+        return;
+    }
+    let label_style = if focused {
+        theme::BACKGROUND.patch(theme::GOOD)
+    } else {
+        theme::BACKGROUND.patch(theme::MUTED)
+    };
+    let boundary = if focused {
+        theme::JOIN_INPUT_BOUNDARY_ACTIVE
+    } else {
+        theme::JOIN_INPUT_BOUNDARY_INACTIVE
+    };
+    let input = if focused {
+        theme::JOIN_INPUT_ACTIVE
+    } else {
+        theme::JOIN_INPUT_INACTIVE
+    };
+    area.with(theme::BACKGROUND).fill(buf);
+    let mut row = area;
+    row.take_left(12)
+        .with(label_style)
+        .with(Ellipsis(true))
+        .text(buf, label);
+    if row.is_empty() {
+        return;
+    }
+    row.with(boundary).fill(buf);
+    row.take_left(1).with(boundary).text(buf, " ");
+    row.take_right(1).with(boundary).text(buf, " ");
+    row.with(input).fill(buf);
+    if focused {
+        editor.render(row, buf);
+    } else {
+        row.with(input)
+            .with(Ellipsis(true))
+            .text(buf, &editor.text());
+    }
+}
+
+fn draw_join_button(area: Rect, buf: &mut Buffer, label: &str, focused: bool) {
+    if area.is_empty() {
+        return;
+    }
+    let style = if focused {
+        Style::DEFAULT
+            .with_bg_rgb(0x35, 0x3b, 0x46)
+            .with_fg_rgb(0xf0, 0xf2, 0xe8)
+    } else {
+        theme::BACKGROUND.patch(theme::TEXT)
+    };
+    area.with(style)
+        .with(HAlign::Center)
+        .text(buf, &format!(" {label} "));
+}
+
+fn draw_join_status(area: Rect, draft: &JoinDraft, buf: &mut Buffer) {
+    let style = match draft.status_kind {
+        StatusKind::Info => theme::STATUS_FILL.patch(theme::MUTED),
+        StatusKind::Error => theme::STATUS_FILL.patch(theme::ERROR),
+    };
+    area.with(theme::STATUS_FILL).fill(buf);
+    area.with(style)
+        .with(Ellipsis(true))
+        .text(buf, &format!(" {}", draft.status));
+}
+
+fn short_key(value: &str) -> String {
+    if value.len() <= 18 {
+        value.to_string()
+    } else {
+        format!("{}...", &value[..18])
+    }
 }
 
 fn render(app: &mut App, buf: &mut Buffer) {
@@ -1565,10 +1992,6 @@ fn cycle_index(current: usize, len: usize, delta: isize) -> usize {
     (current as isize + delta).rem_euclid(len as isize) as usize
 }
 
-fn is_known_user(user: &str) -> bool {
-    KNOWN_USERS.contains(&user)
-}
-
 fn network_event_kind(event: &NetworkEvent) -> &'static str {
     match event {
         NetworkEvent::Connected => "connected",
@@ -1604,6 +2027,7 @@ mod tests {
         audio_input_picker.reset(&audio_input_items, None);
         App {
             config: Config::default(),
+            server_alias: "local".to_string(),
             user: "alice".to_string(),
             room_name: "lobby".to_string(),
             status: "test".to_string(),
@@ -1633,13 +2057,17 @@ mod tests {
             playback: None,
             voice_packets_received: 0,
             voice_bytes_received: 0,
+            save_config_after_auth: false,
         }
     }
 
     #[test]
     fn default_config_parses() {
         let config = Config::default();
-        assert_eq!(config.network.user, "alice");
+        let server = config.active_server().unwrap();
+        assert_eq!(server.alias, "local");
+        assert_eq!(server.user, "alice");
+        assert_eq!(server.display_name, "Alice");
         assert_eq!(config.audio.bitrate_bps, 24_000);
         assert_eq!(config.files.max_upload_bytes, 50 * 1024 * 1024);
         assert_eq!(config.files.max_receive_bytes, 50 * 1024 * 1024);
@@ -1651,10 +2079,6 @@ mod tests {
             "tomchat".to_string(),
             "--config".to_string(),
             "dev.toml".to_string(),
-            "--pairing-code".to_string(),
-            "one-time-pairing-code".to_string(),
-            "--server-public-key".to_string(),
-            "de1235b52a8b96f16f91124a8b462d463f2af83756946effa70e842142a6d7cf".to_string(),
             "upload".to_string(),
             "some_file/foo.md".to_string(),
         ];
@@ -1663,6 +2087,24 @@ mod tests {
             parse_cli_command(&args).unwrap(),
             CliCommand::Upload {
                 path: PathBuf::from("some_file/foo.md")
+            }
+        );
+    }
+
+    #[test]
+    fn parses_join_subcommand_after_value_options() {
+        let args = vec![
+            "tomchat".to_string(),
+            "--config".to_string(),
+            "dev.toml".to_string(),
+            "join".to_string(),
+            "tcj1_deadbeef".to_string(),
+        ];
+
+        assert_eq!(
+            parse_cli_command(&args).unwrap(),
+            CliCommand::Join {
+                join_string: "tcj1_deadbeef".to_string()
             }
         );
     }

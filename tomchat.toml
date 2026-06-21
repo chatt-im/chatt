@@ -1,10 +1,13 @@
 # Default tomchat configuration. User configuration is loaded from
 # ~/.config/tomchat.toml unless --config or TOMCHAT_CONFIG is provided.
 
-[network]
+active-server = "local"
+
+[[servers]]
+alias = "local"
 user = "alice"
+display-name = "Alice"
 token = "alice-dev-token"
-pairing-code = ""
 server-public-key = ""
 tcp-addr = "127.0.0.1:41000"
 room-id = 1

@@ -2,10 +2,12 @@ use std::{
     collections::{HashMap, HashSet, VecDeque},
     io::{self, Read, Write},
     net::SocketAddr,
+    sync::mpsc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 mod config;
+mod local_admin;
 
 use mio::{
     Events, Interest, Poll, Token,
@@ -15,9 +17,10 @@ use ring::rand::SecureRandom;
 use ring::signature::KeyPair;
 use rpc::{
     control::{
-        self, ChatMessage, ClientControl, FileMetadata, MAX_FILE_CHUNK_BYTES, P2pCandidate, P2pKey,
-        P2pNatKind, P2pPeerInfo, P2pRole, RoomInfo, ServerControl, decode_client_control,
-        decode_client_hello, encode_server_control, encode_server_hello,
+        self, ChatMessage, ClientControl, FileMetadata, InviteTicket, MAX_FILE_CHUNK_BYTES,
+        P2pCandidate, P2pKey, P2pNatKind, P2pPeerInfo, P2pRole, RoomInfo, ServerControl,
+        decode_client_control, decode_client_hello, encode_invite_ticket, encode_server_control,
+        encode_server_hello,
     },
     crypto::{
         AntiReplay, CHANNEL_CONTROL, ControlTransport, KEY_LEN, KeyMaterial, SessionSecrets,
@@ -29,6 +32,7 @@ use rpc::{
 };
 
 use config::{Config as ServerConfig, UserConfig, hash_secret, value_arg, verify_secret_hash};
+use local_admin::{AdminCommand, AdminSocket};
 
 const LISTENER: Token = Token(0);
 const UDP: Token = Token(1);
@@ -36,10 +40,23 @@ const UDP_PROBE: Token = Token(2);
 const FIRST_CLIENT: usize = 3;
 const DEFAULT_ROOM: RoomId = RoomId(1);
 const POLL_TIMEOUT: Duration = Duration::from_millis(100);
+const INVITE_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let _logger = kvlog::spawn_collector_from_env(Some("tomchat-server"), false);
     let args = std::env::args().collect::<Vec<_>>();
+    if args.get(1).is_some_and(|arg| arg == "invite") {
+        let user = args
+            .get(2)
+            .ok_or_else(|| invalid_config("usage: tomchat-server invite USER".to_string()))?;
+        if args.len() != 3 || user.trim().is_empty() {
+            return Err(invalid_config("usage: tomchat-server invite USER".to_string()).into());
+        }
+        let join_string = local_admin::send_invite(user).map_err(invalid_config)?;
+        println!("{join_string}");
+        return Ok(());
+    }
+
     let config_path = value_arg(&args, "--config");
     let config = ServerConfig::load(config_path.as_deref()).map_err(invalid_config)?;
     let server_public_key = config.server_public_key_hex().map_err(invalid_config)?;
@@ -58,8 +75,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     let tcp_addr = config.network.tcp_addr;
     let udp_addr = config.network.udp_addr;
+    let public_tcp_addr = config.network.public_tcp_addr.clone();
+    let public_udp_addr = config.network.public_udp_addr.clone();
+    let public_udp_probe_addr = config
+        .network
+        .public_udp_probe_addr
+        .clone()
+        .unwrap_or_else(|| "disabled".to_string());
     let p2p_enabled = config.network.p2p_enabled;
     let mut server = Server::bind(config)?;
+    let (admin_tx, admin_rx) = mpsc::channel();
+    let admin_socket = AdminSocket::spawn(admin_tx).map_err(invalid_config)?;
     if p2p_enabled && udp_probe_addr.is_some() {
         println!(
             "tomchat server listening on tcp {tcp_addr}, udp {udp_addr}, probe {udp_probe_label}"
@@ -69,6 +95,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         println!("tomchat server listening on tcp {tcp_addr}, udp {udp_addr} (P2P disabled)");
     }
+    println!(
+        "tomchat invite endpoints: tcp {public_tcp_addr}, udp {public_udp_addr}, probe {public_udp_probe_addr}"
+    );
     println!("tomchat server public key: {server_public_key}");
     println!(
         "tomchat transport encryption: {}",
@@ -86,6 +115,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "disabled"
         }
     );
+    println!(
+        "tomchat server control socket: {}",
+        admin_socket.path().display()
+    );
     kvlog::info!(
         "server listening",
         tcp_addr = %tcp_addr,
@@ -94,7 +127,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         encryption = server.config.security.encryption,
         p2p_enabled = server.config.network.p2p_enabled
     );
-    server.run()
+    let _admin_socket = admin_socket;
+    server.run(&admin_rx)
 }
 
 struct Server {
@@ -119,6 +153,7 @@ struct Server {
     reserved_file_names: HashSet<String>,
     chat_history_limit: usize,
     file_size_limit_bytes: u64,
+    invites: HashMap<String, InviteState>,
     rng: ring::rand::SystemRandom,
     server_key_pair: ring::signature::Ed25519KeyPair,
 }
@@ -205,12 +240,16 @@ impl Server {
             reserved_file_names: HashSet::new(),
             chat_history_limit,
             file_size_limit_bytes,
+            invites: HashMap::new(),
             rng: ring::rand::SystemRandom::new(),
             server_key_pair,
         })
     }
 
-    fn run(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+    fn run(
+        &mut self,
+        admin_rx: &mpsc::Receiver<AdminCommand>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         let mut events = Events::with_capacity(256);
         loop {
             self.poll.poll(&mut events, Some(POLL_TIMEOUT))?;
@@ -229,8 +268,59 @@ impl Server {
                     }
                 }
             }
+            self.handle_admin_commands(admin_rx);
             self.flush_disconnects();
         }
+    }
+
+    fn handle_admin_commands(&mut self, admin_rx: &mpsc::Receiver<AdminCommand>) {
+        loop {
+            match admin_rx.try_recv() {
+                Ok(AdminCommand::Invite { user, reply }) => {
+                    let result = self.create_invite(&user);
+                    let _ = reply.send(result);
+                }
+                Err(mpsc::TryRecvError::Empty) | Err(mpsc::TryRecvError::Disconnected) => break,
+            }
+        }
+    }
+
+    fn create_invite(&mut self, user_name: &str) -> Result<String, String> {
+        self.expire_invites();
+        let user_name = user_name.trim();
+        if user_name.is_empty() {
+            return Err("invite user is empty".to_string());
+        }
+        if user_name.len() > 512 {
+            return Err("invite user exceeds maximum length".to_string());
+        }
+
+        let pairing_code = random_secret_hex(&self.rng)?;
+        let ticket = InviteTicket {
+            version: rpc::PROTOCOL_VERSION,
+            user: user_name.to_string(),
+            pairing_code: pairing_code.clone(),
+            tcp_addr: self.config.network.public_tcp_addr.clone(),
+            udp_addr: self.config.network.public_udp_addr.clone(),
+            udp_probe_addr: self.config.network.public_udp_probe_addr.clone(),
+            server_public_key: encode_hex(self.server_key_pair.public_key().as_ref()),
+            room_id: DEFAULT_ROOM.0,
+        };
+        let join_string = encode_invite_ticket(&ticket)?;
+        self.invites.insert(
+            user_name.to_string(),
+            InviteState {
+                pairing_code_hash: hash_secret(&pairing_code),
+                expires_at: std::time::Instant::now() + INVITE_TTL,
+            },
+        );
+        kvlog::info!("invite created", user = user_name);
+        Ok(join_string)
+    }
+
+    fn expire_invites(&mut self) {
+        let now = std::time::Instant::now();
+        self.invites.retain(|_, invite| invite.expires_at > now);
     }
 
     fn accept_clients(&mut self) -> io::Result<()> {
@@ -453,6 +543,7 @@ impl Server {
                 ConnState::AwaitAuth,
                 ClientControl::Pair {
                     user,
+                    display_name,
                     pairing_code,
                     token: new_token,
                     receive_files,
@@ -461,6 +552,7 @@ impl Server {
             ) => self.pair_client(
                 token,
                 &user,
+                &display_name,
                 &pairing_code,
                 &new_token,
                 receive_files,
@@ -585,31 +677,32 @@ impl Server {
         &mut self,
         token: Token,
         user_name: &str,
+        display_name: &str,
         pairing_code: &str,
         new_token: &str,
         receive_files: bool,
         file_receive_limit_bytes: u64,
     ) -> Result<(), String> {
         kvlog::info!("pairing attempt", token = token.0, user = user_name);
-        let Some(candidate) = self
-            .config
-            .users
-            .iter()
-            .find(|candidate| candidate.name == user_name)
-            .cloned()
-        else {
+        self.expire_invites();
+        let Some(invite) = self.invites.get(user_name) else {
             kvlog::warn!("pairing rejected", token = token.0, user = user_name);
             return Err("invalid user or pairing code".to_string());
         };
-        if !candidate.has_pairing_code()
-            || !verify_secret_hash(&candidate.pairing_code_hash, pairing_code)
-        {
+        if !verify_secret_hash(&invite.pairing_code_hash, pairing_code) {
             kvlog::warn!("pairing rejected", token = token.0, user = user_name);
             return Err("invalid user or pairing code".to_string());
         }
+        let display_name = display_name.trim();
+        if display_name.is_empty() || display_name.len() > 64 {
+            return Err("display name must be 1-64 bytes".to_string());
+        }
 
         let token_hash = hash_secret(new_token);
-        let user = self.config.mark_user_paired(&candidate.name, token_hash)?;
+        let user = self
+            .config
+            .mark_user_paired(user_name, display_name.to_string(), token_hash)?;
+        self.invites.remove(user_name);
         kvlog::info!(
             "pairing accepted",
             token = token.0,
@@ -629,7 +722,7 @@ impl Server {
         let session_id = SessionId(self.next_session);
         self.next_session += 1;
         let user_id = user.user_id();
-        let user_name = user.name.clone();
+        let user_name = user.display_name.clone();
 
         let secrets = self
             .clients
@@ -1974,6 +2067,11 @@ struct PeerLink {
     high_to_low: KeyMaterial,
 }
 
+struct InviteState {
+    pairing_code_hash: String,
+    expires_at: std::time::Instant,
+}
+
 struct RoomState {
     id: RoomId,
     name: String,
@@ -1991,6 +2089,13 @@ fn now_ms() -> u64 {
 
 fn invalid_config(error: String) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, error)
+}
+
+fn random_secret_hex(rng: &ring::rand::SystemRandom) -> Result<String, String> {
+    let mut bytes = [0u8; 32];
+    rng.fill(&mut bytes)
+        .map_err(|_| "failed to generate invite secret".to_string())?;
+    Ok(encode_hex(&bytes))
 }
 
 fn ordered_pair(a: SessionId, b: SessionId) -> (SessionId, SessionId) {

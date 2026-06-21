@@ -26,10 +26,16 @@ Run the client:
 cargo run -p tomchat -- --config tomchat.toml
 ```
 
-Run as a different configured development user:
+Invite a configured user from a running server:
 
 ```sh
-cargo run -p tomchat -- --config tomchat.toml --user bob --token bob-dev-token
+cargo run -p server -- invite alice
+```
+
+Join from the generated string:
+
+```sh
+cargo run -p tomchat -- join tcj1_...
 ```
 
 Upload a file into an already running client session:
@@ -75,36 +81,28 @@ sample.
 Important client fields:
 
 ```toml
-[network]
+active-server = "local"
+
+[[servers]]
+alias = "local"
 user = "alice"
+display-name = "Alice"
 token = "alice-dev-token"
-pairing-code = ""
 server-public-key = ""
 tcp-addr = "127.0.0.1:41000"
 room-id = 1
 ```
 
-`server-public-key` should be set to the public key printed by the server for
-non-development use. If it is empty, the client falls back to the compiled
+`active-server` selects one `[[servers]]` entry. `alias` is the local name for
+that server. `user` is the server's internal user identifier, and
+`display-name` is the name shown in chat. `server-public-key` is pinned from the
+server invite; if it is empty, the client falls back to the compiled
 development server key.
 
 UDP media shares `tcp-addr` by default. Set `udp-addr` only when the server uses
 a separate UDP media address.
 
-Useful client overrides:
-
-- `--user`, `TOMCHAT_USER`
-- `--token`, `TOMCHAT_TOKEN`
-- `--pairing-code`, `TOMCHAT_PAIRING_CODE`
-- `--server-public-key`, `TOMCHAT_SERVER_PUBLIC_KEY`
-- `--tcp`, `TOMCHAT_TCP`
-- `--udp`, `TOMCHAT_UDP`
-- `--receive-dir`, `TOMCHAT_RECEIVE_DIR`
-- `--max-upload-bytes`, `TOMCHAT_MAX_UPLOAD_BYTES`
-- `--max-receive-bytes`, `TOMCHAT_MAX_RECEIVE_BYTES`
-
-Advanced P2P NAT classification can use `--udp-probe` / `TOMCHAT_UDP_PROBE`
-when the server has an explicit `udp-probe-addr`.
+The client accepts `--config` / `TOMCHAT_CONFIG` for config path selection.
 
 ## Server Configuration
 
@@ -116,6 +114,8 @@ Important server fields:
 ```toml
 [network]
 tcp-addr = "127.0.0.1:41000"
+# public-tcp-addr = "chat.example.com:443"
+# public-udp-addr = "198.51.100.20:41000"
 p2p-enabled = true
 
 [security]
@@ -131,13 +131,20 @@ name = "lobby"
 [[users]]
 id = 1
 name = "alice"
+display-name = "Alice"
 token-hash = "sha256:..."
-pairing-code-hash = "sha256:..."
 ```
 
-Replace the development `server-identity-seed`, user token hashes, and pairing
-code hashes before using a server outside local testing. Room id `1` is required
-as the default lobby by the current client flow.
+`tcp-addr`, `udp-addr`, and `udp-probe-addr` are bind addresses on the server
+host. `public-tcp-addr`, `public-udp-addr`, and `public-udp-probe-addr` are the
+connection details embedded in invites. Set the public fields when clients need
+a DNS name, public IP, reverse proxy port, or NAT-forwarded port. When omitted,
+the public fields default to the corresponding bind address.
+
+Replace the development `server-identity-seed` and user token hashes before
+using a server outside local testing. `name` is the internal user identifier
+used by invites. `display-name` is updated when a user successfully joins. Room
+id `1` is required as the default lobby by the current client flow.
 
 `encryption = true` makes the server require encrypted TCP control and
 server-relayed UDP media transport. Set it to `false` only for trusted local
@@ -152,86 +159,47 @@ server memory.
 `p2p-enabled = false` disables P2P candidate exchange and NAT probing while
 leaving server-relayed UDP media enabled.
 
-UDP media shares `tcp-addr` by default because TCP and UDP can listen on the
-same numeric port. Set `udp-addr` only if deployment needs separate control and
-media addresses. `udp-probe-addr` is optional and only enables a second UDP
-endpoint for P2P NAT classification; ordinary voice relay does not need it.
+UDP media binds to `tcp-addr` by default because TCP and UDP can listen on the
+same numeric port. Set `udp-addr` only if deployment needs separate local
+control and media sockets. `udp-probe-addr` is optional and only enables a
+second UDP endpoint for P2P NAT classification; ordinary voice relay does not
+need it.
 
-Useful server overrides:
-
-- `--config`, `TOMCHAT_SERVER_CONFIG`
-- `--tcp`, `TOMCHAT_SERVER_TCP`
-- `--udp`, `TOMCHAT_SERVER_UDP`
-- `--p2p true|false`, `--p2p-enabled true|false`, `--no-p2p`, `TOMCHAT_SERVER_P2P_ENABLED`, `TOMCHAT_SERVER_P2P`
-- `--encryption true|false`, `--no-encryption`, `TOMCHAT_SERVER_ENCRYPTION`
-- `--chat-history-limit`, `TOMCHAT_SERVER_CHAT_HISTORY_LIMIT`
-
-Advanced P2P NAT classification can use `--udp-probe` /
-`TOMCHAT_SERVER_UDP_PROBE`.
+The server accepts `--config` / `TOMCHAT_SERVER_CONFIG` for config path
+selection. Network, P2P, encryption, and history settings live in TOML.
 
 ## Pairing Procedure
 
-Pairing bootstraps or rotates a user's long-lived client token without storing
-that token in plaintext on the server. The one-time pairing code is verified
-inside the server-selected control channel after the server-authenticated
-handshake. Keep `encryption = true` when pairing outside a trusted local
-environment.
+Pairing bootstraps or rotates a user's long-lived client token without putting a
+pairing code in either config file.
 
-1. Generate a client token and a one-time pairing code:
-
-```sh
-openssl rand -hex 32
-openssl rand -base64 24
-```
-
-2. Hash the one-time pairing code for the server config:
-
-```sh
-printf '%s' 'PAIRING_CODE_HERE' | sha256sum | awk '{print "sha256:" $1}'
-```
-
-3. Add or update the server user entry:
-
-```toml
-[[users]]
-id = 4
-name = "dana"
-token-hash = ""
-pairing-code-hash = "sha256:<pairing-code-sha256-hex>"
-```
-
-4. Start the server with a writable config path:
+1. Start the server with a writable config path:
 
 ```sh
 cargo run -p server -- --config tomchat-server.toml
 ```
 
-5. Configure the client with the generated token, one-time pairing code, and
-   server public key:
-
-```toml
-[network]
-user = "dana"
-token = "<generated-client-token>"
-pairing-code = "<one-time-pairing-code>"
-server-public-key = "<server-public-key-printed-at-startup>"
-tcp-addr = "127.0.0.1:41000"
-room-id = 1
-```
-
-6. Start the client:
+2. On the server host, create an in-memory 24-hour invite:
 
 ```sh
-cargo run -p tomchat -- --config tomchat.toml
+cargo run -p server -- invite dana
 ```
 
-On successful pairing, the server rewrites its config: `token-hash` is set to a
-hash of the client token and `pairing-code-hash` is cleared. Remove
-`pairing-code` from the client config after the first successful login. Future
-logins use the regular `Authenticate` flow with `user` and `token`.
+The `dana` value is the server's internal user identifier. It does not need to
+exist in TOML yet; successful pairing creates or updates the `[[users]]` entry.
 
-Pairing requires a writable server config path because the one-time code must be
-consumed durably.
+3. On the client, join with the printed string:
+
+```sh
+cargo run -p tomchat -- join tcj1_...
+```
+
+The join TUI asks for a server alias and display username, shows the server
+address and key, then pairs over the normal encrypted control channel. On
+successful pairing, the client writes a named `[[servers]]` entry with the new
+token, and the server writes `token-hash` plus the chosen `display-name`.
+Invites are only held in server memory and are removed when replaced, expired,
+or successfully used.
 
 ## Security Notes
 
@@ -244,7 +212,8 @@ Current status:
   encrypted after the handshake. Encryption is enabled by default.
 - UDP media uses an anti-replay window. Encrypted TCP control uses strict
   counters.
-- User tokens and pairing codes are stored on the server as `sha256:` hashes.
+- User tokens are stored on the server as `sha256:` hashes. Invite codes are
+  ephemeral server memory only and expire after 24 hours.
 - The server is trusted and not end-to-end encrypted.
 - The current handshake uses X25519 and Ed25519. It is not yet
   quantum-resistant; the documented next step is a hybrid X25519 + ML-KEM
