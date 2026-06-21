@@ -828,6 +828,9 @@ impl Server {
                 current_room: Some(DEFAULT_ROOM),
             },
         )?;
+        if self.live_token_for_session(session_id).is_none() {
+            return Ok(());
+        }
         self.join_room(session_id, DEFAULT_ROOM);
         Ok(())
     }
@@ -856,9 +859,9 @@ impl Server {
                 room_id = room_id.0,
                 error = "room not found"
             );
-            if let Some(session) = self.sessions.get(&session_id) {
+            if let Some(token) = self.live_token_for_session(session_id) {
                 let _ = self.send_control_to_token(
-                    session.tcp_token,
+                    token,
                     &ServerControl::Error {
                         code: 404,
                         message: "room not found".to_string(),
@@ -876,13 +879,17 @@ impl Server {
                     previous_room_id = previous.0,
                     room_id = room_id.0
                 );
-                self.leave_room(session_id, previous);
+                self.leave_room(session_id, previous, None);
+                if self.live_token_for_session(session_id).is_none() {
+                    return;
+                }
             }
         }
 
-        if let Some(session) = self.sessions.get_mut(&session_id) {
-            session.room_id = Some(room_id);
-        }
+        let Some(session) = self.sessions.get_mut(&session_id) else {
+            return;
+        };
+        session.room_id = Some(room_id);
         if let Some(room) = self.rooms.get_mut(&room_id) {
             room.members.insert(session_id);
             kvlog::info!(
@@ -920,7 +927,7 @@ impl Server {
 
         let (history, participants, token) = match (
             self.rooms.get(&room_id),
-            self.sessions.get(&session_id).map(|s| s.tcp_token),
+            self.live_token_for_session(session_id),
         ) {
             (Some(room), Some(token)) => (
                 room.history.iter().cloned().collect::<Vec<_>>(),
@@ -937,7 +944,13 @@ impl Server {
                 participants,
             },
         );
+        if self.live_token_for_session(session_id).is_none() {
+            return;
+        }
         self.send_existing_voice_streams_to_token(room_id, session_id, token);
+        if self.live_token_for_session(session_id).is_none() {
+            return;
+        }
         if let Some((user_id, stream_id)) = voice_started {
             self.broadcast_voice_started(room_id, user_id, stream_id);
         }
@@ -948,18 +961,24 @@ impl Server {
         );
     }
 
-    fn leave_room(&mut self, session_id: SessionId, room_id: RoomId) {
+    fn leave_room(
+        &mut self,
+        session_id: SessionId,
+        room_id: RoomId,
+        excluded_broadcast_session: Option<SessionId>,
+    ) {
         kvlog::info!(
             "leave room requested",
             session_id = session_id.0,
             room_id = room_id.0
         );
-        self.stop_voice(session_id, None);
+        self.stop_voice(session_id, None, excluded_broadcast_session);
         self.broadcast_p2p_gone(session_id, room_id);
         if let Some(room) = self.rooms.get_mut(&room_id) {
             room.members.remove(&session_id);
         }
         if let Some(session) = self.sessions.get_mut(&session_id) {
+            session.room_id = None;
             session.p2p = None;
         }
         self.remove_peer_links(session_id);
@@ -995,7 +1014,7 @@ impl Server {
                     .iter()
                     .copied()
                     .filter(|member| *member != session_id)
-                    .filter_map(|member| self.sessions.get(&member).map(|s| s.tcp_token))
+                    .filter_map(|member| self.live_token_for_session(member))
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
@@ -1131,7 +1150,7 @@ impl Server {
             .copied()
             .filter(|member_id| *member_id != session_id)
             .collect::<Vec<_>>();
-        let recipients = transfer_members
+        let mut recipients = transfer_members
             .iter()
             .copied()
             .filter(|member_id| {
@@ -1169,13 +1188,13 @@ impl Server {
             }
         }
         self.broadcast_control(room_id, &ServerControl::Chat { message });
+        if self.live_token_for_session(session_id).is_none() {
+            return Ok(());
+        }
+        recipients.retain(|recipient| self.live_token_for_session(*recipient).is_some());
 
         for member_id in &transfer_members {
-            let Some(token) = self
-                .sessions
-                .get(member_id)
-                .map(|session| session.tcp_token)
-            else {
+            let Some(token) = self.live_token_for_session(*member_id) else {
                 continue;
             };
             let contents = recipients.contains(member_id);
@@ -1186,6 +1205,9 @@ impl Server {
                     contents,
                 },
             );
+            if contents && self.live_token_for_session(*member_id).is_none() {
+                recipients.remove(member_id);
+            }
         }
 
         self.active_uploads.insert(
@@ -1236,12 +1258,10 @@ impl Server {
             chunk_size = data.len(),
             recipient_count = recipients.len()
         );
+        let mut disconnected_recipients = Vec::new();
         for recipient in recipients {
-            let Some(token) = self
-                .sessions
-                .get(&recipient)
-                .map(|session| session.tcp_token)
-            else {
+            let Some(token) = self.live_token_for_session(recipient) else {
+                disconnected_recipients.push(recipient);
                 continue;
             };
             let _ = self.send_control_to_token(
@@ -1252,6 +1272,16 @@ impl Server {
                     data: data.clone(),
                 },
             );
+            if self.live_token_for_session(recipient).is_none() {
+                disconnected_recipients.push(recipient);
+            }
+        }
+        if !disconnected_recipients.is_empty()
+            && let Some(upload) = self.active_uploads.get_mut(&key)
+        {
+            for recipient in disconnected_recipients {
+                upload.recipients.remove(&recipient);
+            }
         }
         Ok(())
     }
@@ -1279,11 +1309,7 @@ impl Server {
             file_size = upload.size
         );
         for recipient in &upload.recipients {
-            let Some(token) = self
-                .sessions
-                .get(recipient)
-                .map(|session| session.tcp_token)
-            else {
+            let Some(token) = self.live_token_for_session(*recipient) else {
                 continue;
             };
             let _ = self.send_control_to_token(
@@ -1329,11 +1355,7 @@ impl Server {
 
     fn send_file_canceled(&mut self, upload: &ServerUpload, reason: &str) {
         for recipient in &upload.recipients {
-            let Some(token) = self
-                .sessions
-                .get(recipient)
-                .map(|session| session.tcp_token)
-            else {
+            let Some(token) = self.live_token_for_session(*recipient) else {
                 continue;
             };
             let _ = self.send_control_to_token(
@@ -1456,7 +1478,12 @@ impl Server {
         }
     }
 
-    fn stop_voice(&mut self, session_id: SessionId, requested: Option<StreamId>) {
+    fn stop_voice(
+        &mut self,
+        session_id: SessionId,
+        requested: Option<StreamId>,
+        excluded_broadcast_session: Option<SessionId>,
+    ) {
         let (room_id, user_id, stream_id) = match self.sessions.get_mut(&session_id) {
             Some(session) => {
                 let Some(stream_id) = session.active_stream else {
@@ -1483,13 +1510,14 @@ impl Server {
             user_id = user_id.0,
             stream_id = stream_id.0
         );
-        self.broadcast_control(
+        self.broadcast_control_except(
             room_id,
             &ServerControl::VoiceStopped {
                 room_id,
                 user_id,
                 stream_id,
             },
+            excluded_broadcast_session,
         );
     }
 
@@ -1547,6 +1575,7 @@ impl Server {
                     .iter()
                     .copied()
                     .filter(|peer| *peer != session_id)
+                    .filter(|peer| self.live_token_for_session(*peer).is_some())
                     .filter(|peer| {
                         self.sessions
                             .get(peer)
@@ -1558,6 +1587,9 @@ impl Server {
             .unwrap_or_default();
 
         for peer_session_id in peers {
+            if self.live_token_for_session(session_id).is_none() {
+                break;
+            }
             self.send_p2p_pair(session_id, peer_session_id)?;
         }
         Ok(())
@@ -1577,16 +1609,15 @@ impl Server {
         let a_info = self.p2p_peer_info(a, b, &link)?;
         let b_info = self.p2p_peer_info(b, a, &link)?;
         let a_token = self
-            .sessions
-            .get(&a)
-            .map(|session| session.tcp_token)
+            .live_token_for_session(a)
             .ok_or_else(|| "unknown P2P session".to_string())?;
         let b_token = self
-            .sessions
-            .get(&b)
-            .map(|session| session.tcp_token)
+            .live_token_for_session(b)
             .ok_or_else(|| "unknown P2P peer".to_string())?;
         self.send_control_to_token(a_token, &ServerControl::P2pPeer { peer: a_info })?;
+        if self.live_token_for_session(a).is_none() || self.live_token_for_session(b).is_none() {
+            return Ok(());
+        }
         self.send_control_to_token(b_token, &ServerControl::P2pPeer { peer: b_info })?;
         Ok(())
     }
@@ -1717,10 +1748,12 @@ impl Server {
                     return Err("UDP bind session mismatch".into());
                 }
                 kvlog::info!("udp session bound", session_id = session_id.0, addr = %src);
-                let token = self.sessions.get(&session_id).map(|s| s.tcp_token);
+                let token = self.live_token_for_session(session_id);
                 if let Some(token) = token {
                     let _ = self.send_control_to_token(token, &ServerControl::UdpBound);
-                    if self.config.network.p2p_enabled {
+                    if self.config.network.p2p_enabled
+                        && self.live_token_for_session(session_id).is_some()
+                    {
                         let _ = self.send_control_to_token(
                             token,
                             &ServerControl::UdpReflexive {
@@ -1741,7 +1774,7 @@ impl Server {
                 if !self.config.network.p2p_enabled {
                     return Ok(());
                 }
-                let token = self.sessions.get(&session_id).map(|s| s.tcp_token);
+                let token = self.live_token_for_session(session_id);
                 if let Some(token) = token {
                     let _ = self.send_control_to_token(
                         token,
@@ -1924,17 +1957,23 @@ impl Server {
     }
 
     fn broadcast_control(&mut self, room_id: RoomId, control: &ServerControl) {
+        self.broadcast_control_except(room_id, control, None);
+    }
+
+    fn broadcast_control_except(
+        &mut self,
+        room_id: RoomId,
+        control: &ServerControl,
+        excluded_session: Option<SessionId>,
+    ) {
         let kind = server_control_kind(control);
-        let tokens = self
-            .rooms
-            .get(&room_id)
-            .map(|room| {
-                room.members
-                    .iter()
-                    .filter_map(|session_id| self.sessions.get(session_id).map(|s| s.tcp_token))
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
+        let tokens = room_recipient_tokens(
+            &self.rooms,
+            &self.sessions,
+            room_id,
+            excluded_session,
+            |token| self.clients.contains_key(&token),
+        );
         kvlog::info!(
             "server control broadcasting",
             room_id = room_id.0,
@@ -2013,7 +2052,7 @@ impl Server {
             self.cancel_uploads_for_session(session_id, "sender disconnected");
             let room_id = self.sessions.get(&session_id).and_then(|s| s.room_id);
             if let Some(room_id) = room_id {
-                self.leave_room(session_id, room_id);
+                self.leave_room(session_id, room_id, Some(session_id));
             }
             if let Some(session) = self.sessions.remove(&session_id) {
                 if let Some(secrets) = &session.secrets {
@@ -2034,6 +2073,11 @@ impl Server {
             .get(&token)
             .and_then(|client| client.session_id)
             .ok_or_else(|| "client is not authenticated".to_string())
+    }
+
+    fn live_token_for_session(&self, session_id: SessionId) -> Option<Token> {
+        let token = self.sessions.get(&session_id)?.tcp_token;
+        self.clients.contains_key(&token).then_some(token)
     }
 
     fn participants(&self, room_id: RoomId) -> Vec<control::ParticipantInfo> {
@@ -2136,6 +2180,27 @@ struct RoomState {
     members: HashSet<SessionId>,
     history: VecDeque<ChatMessage>,
     active_streams: HashMap<StreamId, SessionId>,
+}
+
+fn room_recipient_tokens(
+    rooms: &HashMap<RoomId, RoomState>,
+    sessions: &HashMap<SessionId, Session>,
+    room_id: RoomId,
+    excluded_session: Option<SessionId>,
+    mut is_token_active: impl FnMut(Token) -> bool,
+) -> Vec<Token> {
+    rooms
+        .get(&room_id)
+        .map(|room| {
+            room.members
+                .iter()
+                .copied()
+                .filter(|session_id| Some(*session_id) != excluded_session)
+                .filter_map(|session_id| sessions.get(&session_id).map(|session| session.tcp_token))
+                .filter(|token| is_token_active(*token))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn now_ms() -> u64 {
@@ -2283,6 +2348,33 @@ fn server_control_kind(control: &ServerControl) -> &'static str {
 mod tests {
     use super::*;
 
+    fn test_room(room_id: RoomId, members: &[SessionId]) -> RoomState {
+        RoomState {
+            id: room_id,
+            name: "test".to_string(),
+            members: members.iter().copied().collect(),
+            history: VecDeque::new(),
+            active_streams: HashMap::new(),
+        }
+    }
+
+    fn test_session(user_id: UserId, token: Token, room_id: Option<RoomId>) -> Session {
+        Session {
+            user_id,
+            user_name: format!("user-{}", user_id.0),
+            tcp_token: token,
+            room_id,
+            udp_addr: None,
+            secrets: None,
+            media_send_counter: 0,
+            media_recv_replay: AntiReplay::new(),
+            active_stream: None,
+            p2p: None,
+            receive_files: false,
+            file_receive_limit_bytes: 0,
+        }
+    }
+
     #[test]
     fn split_extension_preserves_regular_extension() {
         assert_eq!(split_extension("report.pdf"), ("report", ".pdf"));
@@ -2313,5 +2405,73 @@ mod tests {
             reserve_unique_file_name(&mut reserved, "report.pdf"),
             "report-2.pdf"
         );
+    }
+
+    #[test]
+    fn room_recipient_tokens_excludes_leaving_session() {
+        let room_id = RoomId(1);
+        let leaving_session = SessionId(1);
+        let remaining_session = SessionId(2);
+        let mut rooms = HashMap::new();
+        rooms.insert(
+            room_id,
+            test_room(room_id, &[leaving_session, remaining_session]),
+        );
+        let mut sessions = HashMap::new();
+        sessions.insert(
+            leaving_session,
+            test_session(UserId(1), Token(3), Some(room_id)),
+        );
+        sessions.insert(
+            remaining_session,
+            test_session(UserId(2), Token(4), Some(room_id)),
+        );
+
+        let tokens =
+            room_recipient_tokens(&rooms, &sessions, room_id, Some(leaving_session), |_| true);
+
+        assert_eq!(tokens, vec![Token(4)]);
+    }
+
+    #[test]
+    fn room_recipient_tokens_includes_all_sessions_without_exclusion() {
+        let room_id = RoomId(1);
+        let mut rooms = HashMap::new();
+        rooms.insert(room_id, test_room(room_id, &[SessionId(1), SessionId(2)]));
+        let mut sessions = HashMap::new();
+        sessions.insert(
+            SessionId(1),
+            test_session(UserId(1), Token(3), Some(room_id)),
+        );
+        sessions.insert(
+            SessionId(2),
+            test_session(UserId(2), Token(4), Some(room_id)),
+        );
+
+        let mut tokens = room_recipient_tokens(&rooms, &sessions, room_id, None, |_| true);
+        tokens.sort_by_key(|token| token.0);
+
+        assert_eq!(tokens, vec![Token(3), Token(4)]);
+    }
+
+    #[test]
+    fn room_recipient_tokens_skips_inactive_tokens() {
+        let room_id = RoomId(1);
+        let mut rooms = HashMap::new();
+        rooms.insert(room_id, test_room(room_id, &[SessionId(1), SessionId(2)]));
+        let mut sessions = HashMap::new();
+        sessions.insert(
+            SessionId(1),
+            test_session(UserId(1), Token(3), Some(room_id)),
+        );
+        sessions.insert(
+            SessionId(2),
+            test_session(UserId(2), Token(4), Some(room_id)),
+        );
+
+        let tokens =
+            room_recipient_tokens(&rooms, &sessions, room_id, None, |token| token != Token(3));
+
+        assert_eq!(tokens, vec![Token(4)]);
     }
 }
