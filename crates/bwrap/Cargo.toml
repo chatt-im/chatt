@@ -29,7 +29,3 @@ unicode-width = "0.2.2"
 [package.metadata.docs.rs]
 all-features = true
 rustdoc-args = ["--cfg", "doc_cfg"]
-
-[workspace]
-members = ["benchmark"]
-

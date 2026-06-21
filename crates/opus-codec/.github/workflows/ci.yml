@@ -1,0 +1,143 @@
+name: CI
+
+permissions:
+  contents: read
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+jobs:
+  fmt:
+    name: Rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: cargo fmt
+        run: cargo fmt --all -- --check
+
+  clippy:
+    name: Clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: cargo clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+  check:
+    name: Cargo Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: cargo check
+        run: cargo check --all-targets
+
+  msrv:
+    name: MSRV Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@1.87.0
+      - name: cargo check
+        run: cargo check --all-targets
+
+  tests:
+    name: Tests
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-2025-vs2026]
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Install ffmpeg (Ubuntu)
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+      - name: Install ffmpeg (macOS)
+        if: matrix.os == 'macos-latest'
+        run: brew install ffmpeg
+      - name: Install ffmpeg (Windows)
+        if: startsWith(matrix.os, 'windows-')
+        shell: pwsh
+        run: choco install ffmpeg --no-progress -y
+      - name: cargo test
+        run: cargo test
+
+  windows-static-crt:
+    name: Windows Static CRT
+    runs-on: windows-2025-vs2026
+    env:
+      CARGO_TARGET_DIR: target/ci-windows-static-crt
+      CRT_VERIFY_TARGET: x86_64-pc-windows-msvc
+      RUSTFLAGS: -C target-feature=+crt-static
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+      - name: Install ffmpeg
+        shell: pwsh
+        run: choco install ffmpeg --no-progress -y
+      - name: Verify static CRT imports
+        run: python scripts/verify_windows_static_crt.py
+      - name: cargo test (static CRT)
+        run: cargo test --target x86_64-pc-windows-msvc
+
+  avx-presume:
+    name: AVX presume feature
+    runs-on: ubuntu-latest
+    needs: [fmt, clippy, check, tests]
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Verify AVX presume gating
+        run: python scripts/verify_avx.py
+
+  system-lib:
+    name: System Library
+    runs-on: ubuntu-latest
+    needs: [fmt, clippy, check, tests]
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config ffmpeg curl build-essential autoconf automake libtool cmake
+      - name: Verify system lib build and tests
+        run: python scripts/verify_system_lib.py
+
+  dred:
+    name: DRED (bundled)
+    runs-on: ubuntu-latest
+    needs: [fmt, clippy, check, tests]
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Install deps (ffmpeg + wget for model download)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg wget
+      - name: Clippy with dred
+        run: cargo clippy --features dred --all-targets -- -D warnings
+      - name: Build with dred
+        run: cargo build --features dred
+      - name: Test with dred
+        run: cargo test --features dred

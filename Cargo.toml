@@ -13,7 +13,7 @@ extui-bindings = { git = "https://github.com/exrok/extui", rev = "0db2ec429bc437
 bwrap.path = "crates/bwrap"
 tinyhl = { git = "https://github.com/exrok/extui", rev = "0db2ec429bc437f4d330b24e7642e539c44b8a6a" }
 unicode-width = "0.2"
-opus-codec = { path = "/code/opus-codec", features = ["dred"] }
+opus-codec = { path = "crates/opus-codec", features = ["dred"] }
 rubato = { version = "3.0", default-features = false }
 ring = "0.17.14"
 jsony = "0.1.10"
@@ -36,6 +36,7 @@ members = [
     "crates/rpc",
     "crates/server",
     "crates/bwrap",
+    "crates/opus-codec",
 ]
 
 [profile.dev]
