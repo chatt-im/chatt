@@ -66,6 +66,18 @@ impl VirtualChatBuffer {
         self.trim_front();
     }
 
+    pub fn push_notice(&mut self, sender: impl Into<String>, body: impl Into<String>) {
+        self.messages.push(ChatEntry {
+            id: 0,
+            sender: sender.into(),
+            body: body.into(),
+            timestamp_ms: 0,
+            local: false,
+            layout: MessageLayout::new(),
+        });
+        self.trim_front();
+    }
+
     pub fn clear(&mut self) {
         self.messages.clear();
         self.scroll_offset = 0;

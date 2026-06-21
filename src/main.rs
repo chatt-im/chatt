@@ -305,6 +305,7 @@ struct App {
     playback: Option<LivePlayback>,
     voice_packets_received: u64,
     voice_bytes_received: u64,
+    last_network_notice: Option<String>,
     save_config_after_auth: bool,
 }
 
@@ -376,6 +377,7 @@ impl App {
             playback: None,
             voice_packets_received: 0,
             voice_bytes_received: 0,
+            last_network_notice: None,
             save_config_after_auth,
             config,
         })
@@ -390,7 +392,10 @@ impl App {
     fn handle_network_event(&mut self, event: NetworkEvent) {
         kvlog::info!("app network event", kind = network_event_kind(&event));
         match event {
-            NetworkEvent::Connected => self.set_status("connected; authenticating"),
+            NetworkEvent::Connected => {
+                self.last_network_notice = None;
+                self.set_status("connected; authenticating");
+            }
             NetworkEvent::Authenticated {
                 session_id,
                 user_id,
@@ -398,6 +403,7 @@ impl App {
             } => {
                 self.session_id = Some(session_id);
                 self.user_id = Some(user_id);
+                self.last_network_notice = None;
                 if let Some(room) = rooms.first() {
                     self.room_name = room.name.clone();
                 }
@@ -482,10 +488,17 @@ impl App {
                 kvlog::warn!("app network error", error = error.as_str());
                 self.set_error(format!("error: {error}"));
             }
-            NetworkEvent::ReconnectScheduled { retry_in } => {
+            NetworkEvent::AuthFailed(error) => {
+                kvlog::warn!("app auth failed", error = error.as_str());
                 self.stop_audio();
+                self.push_network_notice("auth", &error);
+                self.set_error(auth_failure_status(&error));
+            }
+            NetworkEvent::ReconnectScheduled { retry_in, reason } => {
+                self.stop_audio();
+                self.push_network_notice("network", &format!("Connection failed: {reason}"));
                 self.set_error(format!(
-                    "server down; disconnected retrying in {}s",
+                    "connection failed; retrying in {}s",
                     retry_in.as_secs()
                 ));
             }
@@ -503,6 +516,15 @@ impl App {
         if self.chat.scroll_offset() == 0 {
             self.chat.bottom();
         }
+    }
+
+    fn push_network_notice(&mut self, sender: &str, body: &str) {
+        if self.last_network_notice.as_deref() == Some(body) {
+            return;
+        }
+        self.last_network_notice = Some(body.to_string());
+        self.chat.push_notice(sender, body);
+        self.chat.bottom();
     }
 
     fn process_key(&mut self, key: KeyEvent) -> Action {
@@ -2005,8 +2027,19 @@ fn network_event_kind(event: &NetworkEvent) -> &'static str {
         NetworkEvent::VoicePacket(_) => "voice_packet",
         NetworkEvent::Status(_) => "status",
         NetworkEvent::Error(_) => "error",
+        NetworkEvent::AuthFailed(_) => "auth_failed",
         NetworkEvent::ReconnectScheduled { .. } => "reconnect_scheduled",
         NetworkEvent::Disconnected => "disconnected",
+    }
+}
+
+fn auth_failure_status(detail: &str) -> &'static str {
+    if detail.starts_with("pairing failed") {
+        "pairing failed; see chat"
+    } else if detail.starts_with("authentication failed") {
+        "authentication failed; see chat"
+    } else {
+        "server rejected login; see chat"
     }
 }
 
@@ -2057,6 +2090,7 @@ mod tests {
             playback: None,
             voice_packets_received: 0,
             voice_bytes_received: 0,
+            last_network_notice: None,
             save_config_after_auth: false,
         }
     }
@@ -2311,11 +2345,38 @@ mod tests {
 
         app.handle_network_event(NetworkEvent::ReconnectScheduled {
             retry_in: Duration::from_secs(5),
+            reason: "failed to connect to server: connection refused".to_string(),
         });
 
-        assert_eq!(app.status, "server down; disconnected retrying in 5s");
+        assert_eq!(app.status, "connection failed; retrying in 5s");
         assert_eq!(app.status_kind, StatusKind::Error);
+        assert_eq!(app.chat.len(), 1);
+        assert_eq!(app.chat.message(0).sender, "network");
+        assert_eq!(
+            app.chat.message(0).body,
+            "Connection failed: failed to connect to server: connection refused"
+        );
         assert!(!app.voice_tx_enabled.load(Ordering::Relaxed));
+        assert!(app.playback.is_none());
+        assert!(app.capture.is_none());
+    }
+
+    #[test]
+    fn auth_failed_sets_specific_error_status() {
+        let mut app = test_app();
+
+        app.handle_network_event(NetworkEvent::AuthFailed(
+            "pairing failed for 'billy': no active invite exists on this server".to_string(),
+        ));
+
+        assert_eq!(app.status, "pairing failed; see chat");
+        assert_eq!(app.status_kind, StatusKind::Error);
+        assert_eq!(app.chat.len(), 1);
+        assert_eq!(app.chat.message(0).sender, "auth");
+        assert_eq!(
+            app.chat.message(0).body,
+            "pairing failed for 'billy': no active invite exists on this server"
+        );
         assert!(app.playback.is_none());
         assert!(app.capture.is_none());
     }

@@ -17,10 +17,11 @@ use ring::rand::SecureRandom;
 use ring::signature::KeyPair;
 use rpc::{
     control::{
-        self, ChatMessage, ClientControl, FileMetadata, InviteTicket, MAX_FILE_CHUNK_BYTES,
-        P2pCandidate, P2pKey, P2pNatKind, P2pPeerInfo, P2pRole, RoomInfo, ServerControl,
-        decode_client_control, decode_client_hello, encode_invite_ticket, encode_server_control,
-        encode_server_hello,
+        self, ChatMessage, ClientControl, ERROR_AUTH_REJECTED, ERROR_PAIRING_CODE_MISMATCH,
+        ERROR_PAIRING_INVALID_REQUEST, ERROR_PAIRING_NOT_ACTIVE, FileMetadata, InviteTicket,
+        MAX_FILE_CHUNK_BYTES, P2pCandidate, P2pKey, P2pNatKind, P2pPeerInfo, P2pRole, RoomInfo,
+        ServerControl, decode_client_control, decode_client_hello, encode_invite_ticket,
+        encode_server_control, encode_server_hello,
     },
     crypto::{
         AntiReplay, CHANNEL_CONTROL, ControlTransport, KEY_LEN, KeyMaterial, SessionSecrets,
@@ -667,8 +668,19 @@ impl Server {
             })
             .cloned()
         else {
-            kvlog::warn!("authenticate rejected", token = token.0, user = user_name);
-            return Err("invalid user or token".to_string());
+            kvlog::warn!(
+                "authenticate rejected",
+                token = token.0,
+                user = user_name,
+                reason = "invalid_user_or_token"
+            );
+            return self.reject_auth(
+                token,
+                ERROR_AUTH_REJECTED,
+                format!(
+                    "authentication failed for '{user_name}': the user or token is not valid for this server"
+                ),
+            );
         };
         self.establish_session(token, &user, receive_files, file_receive_limit_bytes)
     }
@@ -686,16 +698,48 @@ impl Server {
         kvlog::info!("pairing attempt", token = token.0, user = user_name);
         self.expire_invites();
         let Some(invite) = self.invites.get(user_name) else {
-            kvlog::warn!("pairing rejected", token = token.0, user = user_name);
-            return Err("invalid user or pairing code".to_string());
+            kvlog::warn!(
+                "pairing rejected",
+                token = token.0,
+                user = user_name,
+                reason = "no_active_invite"
+            );
+            return self.reject_auth(
+                token,
+                ERROR_PAIRING_NOT_ACTIVE,
+                format!(
+                    "pairing failed for '{user_name}': no active invite exists on this server; the invite may have expired, been replaced, or already been used. Ask the admin to run `tomchat-server invite {user_name}` again"
+                ),
+            );
         };
         if !verify_secret_hash(&invite.pairing_code_hash, pairing_code) {
-            kvlog::warn!("pairing rejected", token = token.0, user = user_name);
-            return Err("invalid user or pairing code".to_string());
+            kvlog::warn!(
+                "pairing rejected",
+                token = token.0,
+                user = user_name,
+                reason = "pairing_code_mismatch"
+            );
+            return self.reject_auth(
+                token,
+                ERROR_PAIRING_CODE_MISMATCH,
+                format!(
+                    "pairing failed for '{user_name}': the join string secret does not match the active invite; use the newest join string from `tomchat-server invite {user_name}`"
+                ),
+            );
         }
         let display_name = display_name.trim();
         if display_name.is_empty() || display_name.len() > 64 {
-            return Err("display name must be 1-64 bytes".to_string());
+            kvlog::warn!(
+                "pairing rejected",
+                token = token.0,
+                user = user_name,
+                reason = "invalid_display_name"
+            );
+            return self.reject_auth(
+                token,
+                ERROR_PAIRING_INVALID_REQUEST,
+                "pairing failed: display name must be 1-64 bytes".to_string(),
+            );
         }
 
         let token_hash = hash_secret(new_token);
@@ -710,6 +754,15 @@ impl Server {
             user = user.name.as_str()
         );
         self.establish_session(token, &user, receive_files, file_receive_limit_bytes)
+    }
+
+    fn reject_auth(&mut self, token: Token, code: u16, message: String) -> Result<(), String> {
+        self.send_control_to_token(token, &ServerControl::Error { code, message })?;
+        if let Some(client) = self.clients.get_mut(&token) {
+            client.disconnect = true;
+        }
+        self.write_client(token);
+        Ok(())
     }
 
     fn establish_session(
@@ -1924,6 +1977,9 @@ impl Server {
                     }
                 }
             }
+            if client.disconnect && client.write_buf.is_empty() {
+                disconnected = true;
+            }
         }
         if disconnected {
             self.disconnect(token);
@@ -1934,7 +1990,9 @@ impl Server {
         let tokens = self
             .clients
             .iter()
-            .filter_map(|(token, client)| client.disconnect.then_some(*token))
+            .filter_map(|(token, client)| {
+                (client.disconnect && client.write_buf.is_empty()).then_some(*token)
+            })
             .collect::<Vec<_>>();
         for token in tokens {
             self.disconnect(token);

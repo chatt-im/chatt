@@ -16,9 +16,10 @@ use mio::{
 use ring::rand::SecureRandom;
 use rpc::{
     control::{
-        ChatMessage, ClientControl, DEFAULT_FILE_SIZE_LIMIT_BYTES, FileMetadata,
-        MAX_FILE_CHUNK_BYTES, MAX_FILE_NAME_BYTES, P2pCandidate, P2pCandidateKind, P2pKey,
-        P2pNatKind, P2pPeerInfo, P2pRole, ParticipantInfo, RoomInfo, ServerControl,
+        ChatMessage, ClientControl, DEFAULT_FILE_SIZE_LIMIT_BYTES, ERROR_AUTH_REJECTED,
+        ERROR_PAIRING_CODE_MISMATCH, ERROR_PAIRING_INVALID_REQUEST, ERROR_PAIRING_NOT_ACTIVE,
+        FileMetadata, MAX_FILE_CHUNK_BYTES, MAX_FILE_NAME_BYTES, P2pCandidate, P2pCandidateKind,
+        P2pKey, P2pNatKind, P2pPeerInfo, P2pRole, ParticipantInfo, RoomInfo, ServerControl,
         decode_server_control, decode_server_hello, encode_client_control, encode_client_hello,
     },
     crypto::{
@@ -106,8 +107,10 @@ pub enum NetworkEvent {
     VoicePacket(RemoteVoicePacket),
     Status(String),
     Error(String),
+    AuthFailed(String),
     ReconnectScheduled {
         retry_in: Duration,
+        reason: String,
     },
     Disconnected,
 }
@@ -201,6 +204,11 @@ fn run_worker(
                     break;
                 }
             }
+            SessionEnd::AuthFailed(reason) => {
+                kvlog::warn!("network auth failed", reason = reason.as_str());
+                let _ = events.send(NetworkEvent::AuthFailed(reason));
+                break;
+            }
         }
     }
     kvlog::info!("network worker stopped");
@@ -292,6 +300,7 @@ fn run_worker_inner(
         incoming_files: HashMap::new(),
         shutdown: false,
         disconnect_reason: None,
+        auth_failure: None,
     };
 
     let mut poll = match Poll::new() {
@@ -390,7 +399,9 @@ fn run_worker_inner(
         }
         worker.poll_p2p(now);
     }
-    if let Some(reason) = worker.disconnect_reason.take() {
+    if let Some(reason) = worker.auth_failure.take() {
+        SessionEnd::AuthFailed(reason)
+    } else if let Some(reason) = worker.disconnect_reason.take() {
         SessionEnd::Disconnected(reason)
     } else {
         kvlog::info!("network worker shutdown requested");
@@ -402,6 +413,7 @@ enum SessionEnd {
     Shutdown,
     ConnectFailed(String),
     Disconnected(String),
+    AuthFailed(String),
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -451,7 +463,10 @@ fn schedule_reconnect(
         delay_ms = delay.as_millis() as u64,
         reason
     );
-    let _ = events.send(NetworkEvent::ReconnectScheduled { retry_in: delay });
+    let _ = events.send(NetworkEvent::ReconnectScheduled {
+        retry_in: delay,
+        reason: reason.to_string(),
+    });
     wait_for_reconnect(commands, delay)
 }
 
@@ -603,6 +618,7 @@ struct WorkerState {
     incoming_files: HashMap<FileTransferId, IncomingFile>,
     shutdown: bool,
     disconnect_reason: Option<String>,
+    auth_failure: Option<String>,
 }
 
 struct OutgoingUpload {
@@ -663,7 +679,7 @@ impl WorkerState {
                     kvlog::info!("tcp server closed connection");
                     self.shutdown = true;
                     self.disconnect_reason = Some("server closed connection".to_string());
-                    return Ok(());
+                    break;
                 }
                 Ok(n) => {
                     self.read_buf.extend_from_slice(&buf[..n]);
@@ -1354,9 +1370,14 @@ impl WorkerState {
                 self.handle_file_canceled(transfer_id, &reason);
             }
             ServerControl::Pong { .. } => {}
-            ServerControl::Error { message, .. } => {
+            ServerControl::Error { code, message } => {
                 kvlog::warn!("server control error", error = message.as_str());
-                let _ = self.events.send(NetworkEvent::Error(message));
+                if self.session_id.is_none() && is_auth_failure_code(code) {
+                    self.auth_failure = Some(message);
+                    self.shutdown = true;
+                } else {
+                    let _ = self.events.send(NetworkEvent::Error(message));
+                }
             }
         }
     }
@@ -1927,6 +1948,16 @@ fn server_control_kind(control: &ServerControl) -> &'static str {
         ServerControl::Pong { .. } => "pong",
         ServerControl::Error { .. } => "error",
     }
+}
+
+fn is_auth_failure_code(code: u16) -> bool {
+    matches!(
+        code,
+        ERROR_AUTH_REJECTED
+            | ERROR_PAIRING_NOT_ACTIVE
+            | ERROR_PAIRING_CODE_MISMATCH
+            | ERROR_PAIRING_INVALID_REQUEST
+    )
 }
 
 fn create_receive_file(dir: &Path, requested_name: &str) -> Result<(PathBuf, File), String> {
