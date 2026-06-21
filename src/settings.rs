@@ -1,16 +1,18 @@
 use crate::{
     audio::{BufferRequest, DeviceInfo, StreamPreview},
-    config::{AudioConfig, BufferChoice},
+    config::{AudioConfig, BufferChoice, DEFAULT_MAX_AMPLIFICATION},
     ui::select::{FuzzySelect, SelectableItem},
 };
 
 pub const BITRATES: [i32; 4] = [16_000, 24_000, 32_000, 48_000];
+pub const MAX_AMPLIFICATIONS: [f32; 9] = [1.0, 2.0, 4.0, 8.0, 12.0, 16.0, 20.0, 30.0, 40.0];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SettingsFocus {
     Device,
     Bitrate,
     Denoise,
+    Amplification,
     Buffer,
     Refresh,
     Save,
@@ -18,10 +20,11 @@ pub enum SettingsFocus {
 }
 
 impl SettingsFocus {
-    pub const ORDER: [SettingsFocus; 7] = [
+    pub const ORDER: [SettingsFocus; 8] = [
         SettingsFocus::Device,
         SettingsFocus::Bitrate,
         SettingsFocus::Denoise,
+        SettingsFocus::Amplification,
         SettingsFocus::Buffer,
         SettingsFocus::Refresh,
         SettingsFocus::Save,
@@ -40,6 +43,7 @@ impl SettingsFocus {
 pub struct SettingsDraft {
     pub input_device_id: Option<String>,
     pub bitrate_index: usize,
+    pub amplification_index: usize,
     pub buffer_index: usize,
     pub denoise: bool,
 }
@@ -52,6 +56,7 @@ impl SettingsDraft {
                 .iter()
                 .position(|bitrate| *bitrate == config.bitrate_bps)
                 .unwrap_or(1),
+            amplification_index: amplification_index(config.max_amplification),
             buffer_index: BufferRequest::OPTIONS
                 .iter()
                 .position(|buffer| *buffer == config.buffer.to_request())
@@ -65,6 +70,7 @@ impl SettingsDraft {
             input_device_id: self.input_device_id.clone(),
             bitrate_bps: BITRATES[self.bitrate_index],
             denoise: self.denoise,
+            max_amplification: self.max_amplification(),
             buffer: BufferChoice::from_request(self.buffer_request()),
         }
     }
@@ -76,6 +82,29 @@ impl SettingsDraft {
     pub fn buffer_request(&self) -> BufferRequest {
         BufferRequest::OPTIONS[self.buffer_index]
     }
+
+    pub fn max_amplification(&self) -> f32 {
+        MAX_AMPLIFICATIONS[self.amplification_index]
+    }
+}
+
+fn amplification_index(value: f32) -> usize {
+    let value = if value.is_finite() {
+        value
+    } else {
+        DEFAULT_MAX_AMPLIFICATION
+    };
+    MAX_AMPLIFICATIONS
+        .iter()
+        .enumerate()
+        .min_by(|(_, left), (_, right)| {
+            (*left - value)
+                .abs()
+                .partial_cmp(&(*right - value).abs())
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .map(|(index, _)| index)
+        .unwrap_or(6)
 }
 
 #[derive(Clone, Debug)]
@@ -402,6 +431,19 @@ mod tests {
             preview: None,
             issue: (!supported).then(|| "unsupported".to_string()),
         }
+    }
+
+    #[test]
+    fn settings_draft_round_trips_max_amplification() {
+        let config = AudioConfig {
+            max_amplification: 30.0,
+            ..AudioConfig::default()
+        };
+
+        let draft = SettingsDraft::from_audio(&config);
+        let audio = draft.to_audio();
+
+        assert_eq!(audio.max_amplification, 30.0);
     }
 
     #[test]

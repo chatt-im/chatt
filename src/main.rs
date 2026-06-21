@@ -50,8 +50,9 @@ use rpc::{
     crypto::encode_hex,
     ids::{SessionId, StreamId, UserId},
 };
-use settings::{AudioInputPickerState, BITRATES, SettingsDraft, SettingsFocus};
+use settings::{AudioInputPickerState, BITRATES, MAX_AMPLIFICATIONS, SettingsDraft, SettingsFocus};
 use tinyhl::{Highlighter, Source};
+use unicode_width::UnicodeWidthStr;
 
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
 const NAME_COL_WIDTH: u16 = 16;
@@ -302,6 +303,8 @@ struct App {
     voice_tx_enabled: Arc<AtomicBool>,
     mic_error: Option<String>,
     capture: Option<LiveCapture>,
+    settings_preview_capture: bool,
+    allow_settings_preview_capture: bool,
     playback: Option<LivePlayback>,
     voice_packets_received: u64,
     voice_bytes_received: u64,
@@ -374,6 +377,8 @@ impl App {
             voice_tx_enabled: Arc::new(AtomicBool::new(false)),
             mic_error: None,
             capture: None,
+            settings_preview_capture: false,
+            allow_settings_preview_capture: true,
             playback: None,
             voice_packets_received: 0,
             voice_bytes_received: 0,
@@ -647,11 +652,22 @@ impl App {
     fn open_settings(&mut self) {
         self.mode = theme::UiMode::Settings;
         self.settings = SettingsDraft::from_audio(&self.config.audio);
+        self.settings_focus = SettingsFocus::Device;
         self.settings_dirty = false;
+        if self.allow_settings_preview_capture
+            && self.devices.is_empty()
+            && self.capture.is_none()
+            && self.playback.is_none()
+        {
+            self.refresh_input_devices();
+        }
         self.rebuild_audio_input_picker();
+        self.start_settings_preview_capture();
     }
 
     fn close_settings(&mut self) {
+        self.apply_active_capture_amplification(self.config.audio.max_amplification);
+        self.stop_settings_preview_capture();
         self.audio_input_picker.reset(
             &self.audio_input_items,
             self.settings.input_device_id.as_deref(),
@@ -690,6 +706,15 @@ impl App {
                 self.settings.denoise = !self.settings.denoise;
                 self.mark_settings_dirty();
             }
+            SettingsFocus::Amplification => {
+                self.settings.amplification_index = cycle_index(
+                    self.settings.amplification_index,
+                    MAX_AMPLIFICATIONS.len(),
+                    delta,
+                );
+                self.apply_active_capture_amplification(self.settings.max_amplification());
+                self.mark_settings_dirty();
+            }
             SettingsFocus::Buffer => {
                 self.settings.buffer_index = cycle_index(
                     self.settings.buffer_index,
@@ -712,7 +737,7 @@ impl App {
             SettingsFocus::Save => self.save_settings(),
             SettingsFocus::Close => self.close_settings(),
             SettingsFocus::Device => self.activate_audio_input_picker(),
-            SettingsFocus::Bitrate | SettingsFocus::Buffer => {
+            SettingsFocus::Bitrate | SettingsFocus::Amplification | SettingsFocus::Buffer => {
                 self.adjust_settings_focus(1);
             }
         }
@@ -785,14 +810,23 @@ impl App {
     }
 
     fn save_settings(&mut self) {
+        let restart_preview =
+            self.settings_preview_capture && !self.voice_tx_enabled.load(Ordering::Relaxed);
         self.config.audio = self.settings.to_audio();
+        self.apply_active_capture_amplification(self.config.audio.max_amplification);
         match self.config.save_runtime() {
             Ok(path) => {
                 self.config.config_path = Some(path.clone());
                 self.settings_dirty = false;
-                if self.capture.is_some() || self.playback.is_some() {
+                if restart_preview {
+                    self.stop_mic_capture();
+                    self.start_settings_preview_capture();
+                }
+                if (self.capture.is_some() && !self.settings_preview_capture)
+                    || self.playback.is_some()
+                {
                     self.set_status(format!(
-                        "settings saved to {}; audio applies after deafen/rejoin",
+                        "settings saved to {}; live amplification updated, other audio applies after deafen/rejoin",
                         path.display()
                     ));
                 } else {
@@ -806,6 +840,11 @@ impl App {
     }
 
     fn refresh_input_devices(&mut self) {
+        let restart_preview =
+            self.settings_preview_capture && !self.voice_tx_enabled.load(Ordering::Relaxed);
+        if restart_preview {
+            self.stop_mic_capture();
+        }
         if self.capture.is_some() || self.playback.is_some() {
             self.set_error("deafen before refreshing devices");
             return;
@@ -824,6 +863,9 @@ impl App {
                 self.mic_error = Some(error.clone());
                 self.set_error(error);
             }
+        }
+        if restart_preview {
+            self.start_settings_preview_capture();
         }
     }
 
@@ -974,6 +1016,7 @@ impl App {
                 input_device_id: self.config.audio.input_device_id.clone(),
                 bitrate_bps: self.config.audio.bitrate_bps,
                 denoise: self.config.audio.denoise,
+                max_amplification: self.config.audio.max_amplification,
                 buffer_request: self.buffer_request(),
             },
             move |payload| {
@@ -998,6 +1041,38 @@ impl App {
         }
     }
 
+    fn apply_active_capture_amplification(&self, max_amplification: f32) {
+        if let Some(capture) = &self.capture {
+            capture.set_max_amplification(max_amplification);
+        }
+    }
+
+    fn start_settings_preview_capture(&mut self) {
+        if !self.allow_settings_preview_capture
+            || self.capture.is_some()
+            || self.voice_tx_enabled.load(Ordering::Relaxed)
+            || self.deafened.load(Ordering::Relaxed)
+        {
+            return;
+        }
+
+        match self.ensure_mic_capture() {
+            Ok(()) => {
+                self.settings_preview_capture = true;
+            }
+            Err(error) => {
+                self.mic_error = Some(error);
+            }
+        }
+    }
+
+    fn stop_settings_preview_capture(&mut self) {
+        if self.settings_preview_capture && !self.voice_tx_enabled.load(Ordering::Relaxed) {
+            self.stop_mic_capture();
+        }
+        self.settings_preview_capture = false;
+    }
+
     fn start_room_voice(&mut self) {
         if self.deafened.load(Ordering::Relaxed) {
             self.voice_tx_enabled.store(false, Ordering::Relaxed);
@@ -1012,6 +1087,8 @@ impl App {
         if let Err(error) = self.ensure_mic_capture() {
             capture_ok = false;
             self.set_error(format!("failed to start capture: {error}"));
+        } else {
+            self.settings_preview_capture = false;
         }
         if self.playback.is_none() {
             match audio::start_live_playback(self.buffer_request()) {
@@ -1032,12 +1109,19 @@ impl App {
     }
 
     fn stop_audio(&mut self) {
+        let restart_settings_preview = self.mode == theme::UiMode::Settings
+            && self.allow_settings_preview_capture
+            && !self.deafened.load(Ordering::Relaxed);
         self.voice_tx_enabled.store(false, Ordering::Relaxed);
         self.stop_mic_capture();
         self.playback.take();
+        if restart_settings_preview {
+            self.start_settings_preview_capture();
+        }
     }
 
     fn stop_mic_capture(&mut self) {
+        self.settings_preview_capture = false;
         self.capture.take();
     }
 
@@ -1718,6 +1802,10 @@ fn short_key(value: &str) -> String {
 fn render(app: &mut App, buf: &mut Buffer) {
     buf.rect().with(theme::BACKGROUND).fill(buf);
     buf.hide_cursor();
+    let capture = app
+        .capture
+        .as_ref()
+        .map(|capture| capture.stats().snapshot());
 
     let mut screen = buf.rect();
     let composer_height = composer_height(app, screen.w);
@@ -1740,12 +1828,13 @@ fn render(app: &mut App, buf: &mut Buffer) {
             &app.settings,
             app.settings_focus,
             app.settings_dirty,
+            capture.as_ref(),
             &app.audio_input_items,
             &mut app.audio_input_picker,
         ),
         theme::UiMode::Compose | theme::UiMode::Log => draw_chat(screen, app, buf),
     }
-    draw_status(status_area, app, buf);
+    draw_status(status_area, app, buf, capture.as_ref());
     draw_composer(composer_area, app, buf);
 }
 
@@ -1869,35 +1958,51 @@ fn draw_chat(area: Rect, app: &mut App, buf: &mut Buffer) {
     }
 }
 
-fn draw_status(area: Rect, app: &App, buf: &mut Buffer) {
+fn draw_status(area: Rect, app: &App, buf: &mut Buffer, capture: Option<&StatsSnapshot>) {
     area.with(theme::STATUS_FILL).fill(buf);
-    let capture = app
-        .capture
-        .as_ref()
-        .map(|capture| capture.stats().snapshot());
-    let mut row = area
-        .with(theme::mode_style(app.mode))
-        .fmt(buf, format_args!(" {} ", app.mode.label()));
-    row = row
-        .with(theme::STATUS_SECTION)
-        .fmt(buf, format_args!(" {} ", app.room_name));
-    row = row
-        .with(theme::STATUS_FILL)
-        .fmt(buf, format_args!(" {} ", app.user));
-    row = row
-        .with(voice_style(app))
-        .fmt(buf, format_args!(" {} ", voice_state_label(app)));
-    row = row.with(theme::STATUS_FILL).fmt(
+    let mut row = area;
+    draw_status_segment(
+        &mut row,
         buf,
-        format_args!(" {} ", mic_status_compact(app, capture.as_ref())),
+        theme::mode_style(app.mode),
+        &format!(" {} ", app.mode.label()),
     );
-    row = row.with(theme::STATUS_FILL).fmt(
+    draw_status_segment(
+        &mut row,
         buf,
-        format_args!(" {}", vu_meter(capture.as_ref().map_or(0.0, |s| s.rms))),
+        theme::STATUS_SECTION,
+        &format!(" {} ", app.room_name),
     );
-    row = row.with(theme::STATUS_FILL.patch(theme::SUBTLE)).fmt(
+    draw_status_segment(
+        &mut row,
         buf,
-        format_args!(
+        theme::STATUS_FILL,
+        &format!(" {} ", app.user),
+    );
+    draw_status_segment(
+        &mut row,
+        buf,
+        voice_style(app),
+        &format!(" {} ", voice_state_label(app)),
+    );
+    draw_status_segment(
+        &mut row,
+        buf,
+        theme::STATUS_FILL,
+        &format!(" {} ", mic_status_compact(app, capture)),
+    );
+    draw_status_segment(&mut row, buf, theme::STATUS_FILL, " ");
+    let meter_width = row.w.min(12);
+    if meter_width > 0 {
+        let meter = row.take_left(meter_width as i32);
+        ui::vu::draw_status_vu(meter, buf, capture);
+    }
+    draw_status_segment(&mut row, buf, theme::STATUS_FILL, " ");
+    draw_status_segment(
+        &mut row,
+        buf,
+        theme::STATUS_FILL.patch(theme::SUBTLE),
+        &format!(
             " {} msg/{} rows ",
             app.chat.len(),
             app.chat.total_lines_estimate()
@@ -1921,6 +2026,17 @@ fn draw_status(area: Rect, app: &App, buf: &mut Buffer) {
         .with(right_style)
         .with(Ellipsis(true))
         .text(buf, &format!(" {} ", status_text));
+}
+
+fn draw_status_segment(row: &mut Rect, buf: &mut Buffer, style: Style, text: &str) {
+    if row.is_empty() {
+        return;
+    }
+    let width = UnicodeWidthStr::width(text).min(u16::MAX as usize) as u16;
+    row.take_left(width as i32)
+        .with(style)
+        .with(Ellipsis(true))
+        .text(buf, text);
 }
 
 fn draw_composer(area: Rect, app: &mut App, buf: &mut Buffer) {
@@ -1949,6 +2065,8 @@ fn voice_style(app: &App) -> Style {
 fn mic_status_compact(app: &App, capture: Option<&StatsSnapshot>) -> String {
     let mute = if app.deafened.load(Ordering::Relaxed) {
         "deaf"
+    } else if app.settings_preview_capture && !app.voice_tx_enabled.load(Ordering::Relaxed) {
+        "preview"
     } else if app.mic_muted.load(Ordering::Relaxed) {
         "muted"
     } else {
@@ -1973,28 +2091,6 @@ fn voice_state_label(app: &App) -> &'static str {
         "voice"
     } else {
         "offline"
-    }
-}
-
-fn vu_meter(rms: f32) -> String {
-    const WIDTH: usize = 10;
-    let db = dbfs(rms);
-    let normalized = ((db + 60.0) / 60.0).clamp(0.0, 1.0);
-    let filled = (normalized * WIDTH as f32).round() as usize;
-    let mut meter = String::with_capacity(WIDTH + 2);
-    meter.push('[');
-    for index in 0..WIDTH {
-        meter.push(if index < filled { '#' } else { '-' });
-    }
-    meter.push(']');
-    meter
-}
-
-fn dbfs(rms: f32) -> f32 {
-    if rms <= f32::EPSILON {
-        -60.0
-    } else {
-        (20.0 * rms.clamp(f32::EPSILON, 1.0).log10()).max(-60.0)
     }
 }
 
@@ -2087,6 +2183,8 @@ mod tests {
             voice_tx_enabled: Arc::new(AtomicBool::new(false)),
             mic_error: None,
             capture: None,
+            settings_preview_capture: false,
+            allow_settings_preview_capture: false,
             playback: None,
             voice_packets_received: 0,
             voice_bytes_received: 0,
@@ -2103,6 +2201,7 @@ mod tests {
         assert_eq!(server.user, "alice");
         assert_eq!(server.display_name, "Alice");
         assert_eq!(config.audio.bitrate_bps, 24_000);
+        assert_eq!(config.audio.max_amplification, 20.0);
         assert_eq!(config.files.max_upload_bytes, 50 * 1024 * 1024);
         assert_eq!(config.files.max_receive_bytes, 50 * 1024 * 1024);
     }
@@ -2240,12 +2339,15 @@ mod tests {
     }
 
     #[test]
-    fn opening_settings_does_not_populate_devices() {
+    fn opening_settings_focuses_input_without_hardware_refresh_in_tests() {
         let mut app = test_app();
+        app.settings_focus = SettingsFocus::Save;
 
         app.open_settings();
 
         assert_eq!(app.mode, theme::UiMode::Settings);
+        assert_eq!(app.settings_focus, SettingsFocus::Device);
+        assert!(!app.audio_input_picker.open);
         assert!(app.devices.is_empty());
         assert_eq!(app.audio_input_items.len(), 1);
         assert_eq!(app.audio_input_items[0].selection, None);

@@ -8,6 +8,7 @@ use crate::{audio::BufferRequest, bindings::BindingRuntime, client_net::ClientCo
 use rpc::{control::DEFAULT_FILE_SIZE_LIMIT_BYTES, ids::RoomId};
 
 pub const DEFAULT_CONFIG: &str = include_str!("../tomchat.toml");
+pub const DEFAULT_MAX_AMPLIFICATION: f32 = 20.0;
 
 #[derive(Clone, Debug, Toml)]
 #[toml(FromToml, rename_all = "kebab-case")]
@@ -127,6 +128,8 @@ pub struct AudioConfig {
     pub bitrate_bps: i32,
     #[toml(default = true)]
     pub denoise: bool,
+    #[toml(default = DEFAULT_MAX_AMPLIFICATION)]
+    pub max_amplification: f32,
     #[toml(default)]
     pub buffer: BufferChoice,
 }
@@ -137,6 +140,7 @@ impl Default for AudioConfig {
             input_device_id: None,
             bitrate_bps: 24_000,
             denoise: true,
+            max_amplification: DEFAULT_MAX_AMPLIFICATION,
             buffer: BufferChoice::Default,
         }
     }
@@ -549,6 +553,11 @@ fn write_runtime_config<'de>(root: &mut Table<'de>, config: &Config, arena: &'de
             arena,
         );
         audio.insert(Key::new("denoise"), Item::from(config.audio.denoise), arena);
+        audio.insert(
+            Key::new("max-amplification"),
+            Item::from(config.audio.max_amplification as f64),
+            arena,
+        );
         insert_str(
             audio,
             "buffer",
@@ -832,5 +841,23 @@ input-device-index = 20
         assert!(content.contains("[[servers]]"));
         assert!(content.contains("active-server = \"local\""));
         assert!(!content.contains("pairing-code"));
+    }
+
+    #[test]
+    fn runtime_config_writes_audio_amplification() {
+        let config = Config::default();
+        let arena = Arena::new();
+        let doc = toml_spanner::parse(DEFAULT_CONFIG, &arena).unwrap();
+        let mut table = doc.table().clone_in(&arena);
+
+        write_runtime_config(&mut table, &config, &arena);
+        let content = String::from_utf8(
+            toml_spanner::Formatting::preserved_from(&doc)
+                .with_span_projection_identity()
+                .format_table_to_bytes(table, &arena),
+        )
+        .unwrap();
+
+        assert!(content.contains("max-amplification = 20.0"));
     }
 }

@@ -83,6 +83,7 @@ pub struct RecordingConfig {
     pub device_index: usize,
     pub bitrate_bps: i32,
     pub denoise: bool,
+    pub max_amplification: f32,
     pub output_path: PathBuf,
     pub buffer_request: BufferRequest,
 }
@@ -92,6 +93,7 @@ pub struct LiveCaptureConfig {
     pub input_device_id: Option<String>,
     pub bitrate_bps: i32,
     pub denoise: bool,
+    pub max_amplification: f32,
     pub buffer_request: BufferRequest,
 }
 
@@ -113,6 +115,7 @@ pub struct LiveCapture {
     stream: Option<Stream>,
     worker: Option<JoinHandle<()>>,
     stats: AudioStats,
+    max_amplification_bits: Arc<AtomicU32>,
 }
 
 pub struct Playback {
@@ -286,6 +289,11 @@ impl LiveCapture {
         self.stats.clone()
     }
 
+    pub fn set_max_amplification(&self, max_amplification: f32) {
+        self.max_amplification_bits
+            .store(max_amplification.to_bits(), Ordering::Relaxed);
+    }
+
     pub fn stop(mut self) -> StatsSnapshot {
         self.stop_inner()
     }
@@ -413,6 +421,7 @@ pub struct StatsSnapshot {
     pub dropped_chunks: u64,
     pub stream_errors: u64,
     pub rms: f32,
+    pub peak: f32,
     pub vad_probability: f32,
     pub worker_stopped: bool,
     pub last_error: Option<String>,
@@ -485,6 +494,7 @@ struct SharedStats {
     dropped_chunks: AtomicU64,
     stream_errors: AtomicU64,
     rms_bits: AtomicU32,
+    peak_bits: AtomicU32,
     vad_bits: AtomicU32,
     worker_stopped: AtomicBool,
     last_error: Mutex<Option<String>>,
@@ -500,6 +510,7 @@ impl SharedStats {
             dropped_chunks: self.dropped_chunks.load(Ordering::Relaxed),
             stream_errors: self.stream_errors.load(Ordering::Relaxed),
             rms: f32::from_bits(self.rms_bits.load(Ordering::Relaxed)),
+            peak: f32::from_bits(self.peak_bits.load(Ordering::Relaxed)),
             vad_probability: f32::from_bits(self.vad_bits.load(Ordering::Relaxed)),
             worker_stopped: self.worker_stopped.load(Ordering::Relaxed),
             last_error: self.last_error.lock().ok().and_then(|error| error.clone()),
@@ -584,7 +595,14 @@ pub fn start_recording(config: RecordingConfig) -> Result<Recording, String> {
     let (sender, receiver) = sync_channel(CALLBACK_QUEUE_CAPACITY);
     let worker_stats = stats.clone();
     let worker = thread::spawn(move || {
-        run_encoder_worker(receiver, writer, encoder, config.denoise, worker_stats);
+        run_encoder_worker(
+            receiver,
+            writer,
+            encoder,
+            config.denoise,
+            config.max_amplification,
+            worker_stats,
+        );
     });
 
     let stream = with_audio_backend_stderr_suppressed(|| {
@@ -631,14 +649,24 @@ where
         channels = selection.stream_config.channels,
         sample_rate = selection.stream_config.sample_rate,
         bitrate_bps = config.bitrate_bps,
-        denoise = config.denoise
+        denoise = config.denoise,
+        max_amplification = config.max_amplification
     );
     let encoder = OpusVoiceEncoder::new(config.bitrate_bps)?;
     let stats = AudioStats::new();
+    let max_amplification_bits = Arc::new(AtomicU32::new(config.max_amplification.to_bits()));
     let (sender, receiver) = sync_channel(CALLBACK_QUEUE_CAPACITY);
     let worker_stats = stats.clone();
+    let worker_max_amplification = Arc::clone(&max_amplification_bits);
     let worker = thread::spawn(move || {
-        run_live_encoder_worker(receiver, encoder, config.denoise, worker_stats, on_packet);
+        run_live_encoder_worker(
+            receiver,
+            encoder,
+            config.denoise,
+            worker_max_amplification,
+            worker_stats,
+            on_packet,
+        );
     });
 
     let stream = with_audio_backend_stderr_suppressed(|| {
@@ -659,6 +687,7 @@ where
         stream: Some(stream),
         worker: Some(worker),
         stats,
+        max_amplification_bits,
     })
 }
 
@@ -1234,12 +1263,17 @@ fn capture_callback<T>(
     let mono = downmix_to_mono_i16_scale(input, channels);
     let samples = mono.len() as u64;
     let rms = rms_i16_scale(&mono);
+    let peak = peak_i16_scale(&mono);
     stats.inner.callbacks.fetch_add(1, Ordering::Relaxed);
     stats
         .inner
         .captured_samples
         .fetch_add(samples, Ordering::Relaxed);
     stats.inner.rms_bits.store(rms.to_bits(), Ordering::Relaxed);
+    stats
+        .inner
+        .peak_bits
+        .store(peak.to_bits(), Ordering::Relaxed);
 
     if sender.try_send(mono).is_err() {
         stats.inner.dropped_chunks.fetch_add(1, Ordering::Relaxed);
@@ -1280,6 +1314,99 @@ fn rms_i16_scale(samples: &[f32]) -> f32 {
     (square_sum / samples.len() as f32).sqrt()
 }
 
+fn peak_i16_scale(samples: &[f32]) -> f32 {
+    samples
+        .iter()
+        .map(|sample| (sample / i16::MAX as f32).abs())
+        .fold(0.0, f32::max)
+        .clamp(0.0, 1.0)
+}
+
+struct AutoGain {
+    max_amplification: f32,
+    current_gain: f32,
+    initialized: bool,
+}
+
+impl AutoGain {
+    const TARGET_RMS: f32 = 0.20;
+    const PEAK_LIMIT: f32 = 0.95;
+    const MIN_GAIN: f32 = 0.05;
+    const RISE_SMOOTHING: f32 = 0.20;
+    const FALL_SMOOTHING: f32 = 0.85;
+
+    fn new(max_amplification: f32) -> Self {
+        let max_amplification = Self::normalize_max_amplification(max_amplification);
+        Self {
+            max_amplification,
+            current_gain: 1.0,
+            initialized: false,
+        }
+    }
+
+    fn set_max_amplification(&mut self, max_amplification: f32) {
+        self.max_amplification = Self::normalize_max_amplification(max_amplification);
+        self.current_gain = self.current_gain.min(self.max_amplification);
+    }
+
+    fn normalize_max_amplification(max_amplification: f32) -> f32 {
+        let max_amplification = if max_amplification.is_finite() {
+            max_amplification
+        } else {
+            20.0
+        };
+        max_amplification.clamp(1.0, 40.0)
+    }
+
+    fn process_frame(&mut self, frame: &mut [f32]) {
+        if frame.is_empty() {
+            return;
+        }
+
+        let rms = rms_i16_scale(frame);
+        let peak = peak_i16_scale(frame);
+        let mut desired_gain = if rms <= f32::EPSILON {
+            1.0
+        } else {
+            (Self::TARGET_RMS / rms).clamp(Self::MIN_GAIN, self.max_amplification)
+        };
+
+        if peak > f32::EPSILON {
+            desired_gain = desired_gain.min(Self::PEAK_LIMIT / peak);
+        }
+
+        self.current_gain = if !self.initialized {
+            self.initialized = true;
+            desired_gain
+        } else {
+            let smoothing = if desired_gain < self.current_gain {
+                Self::FALL_SMOOTHING
+            } else {
+                Self::RISE_SMOOTHING
+            };
+            self.current_gain + (desired_gain - self.current_gain) * smoothing
+        };
+
+        if peak > f32::EPSILON {
+            self.current_gain = self.current_gain.min(Self::PEAK_LIMIT / peak);
+        }
+
+        for sample in frame {
+            *sample = (*sample * self.current_gain).clamp(i16::MIN as f32, i16::MAX as f32);
+        }
+    }
+}
+
+fn store_processed_level_stats(stats: &AudioStats, samples: &[f32]) {
+    let rms = rms_i16_scale(samples);
+    let peak = peak_i16_scale(samples);
+    stats.inner.rms_bits.store(rms.to_bits(), Ordering::Relaxed);
+    stats
+        .inner
+        .peak_bits
+        .store(peak.to_bits(), Ordering::Relaxed);
+}
+
 pub(crate) fn convert_i16_scale_to_pcm_i16(input: &[f32], output: &mut [i16]) {
     debug_assert_eq!(input.len(), output.len());
     for (input, output) in input.iter().zip(output.iter_mut()) {
@@ -1292,10 +1419,17 @@ fn run_encoder_worker(
     mut writer: PacketLogWriter<std::io::BufWriter<std::fs::File>>,
     mut encoder: OpusVoiceEncoder,
     denoise_enabled: bool,
+    max_amplification: f32,
     stats: AudioStats,
 ) {
-    let result =
-        run_encoder_worker_inner(receiver, &mut writer, &mut encoder, denoise_enabled, &stats);
+    let result = run_encoder_worker_inner(
+        receiver,
+        &mut writer,
+        &mut encoder,
+        denoise_enabled,
+        max_amplification,
+        &stats,
+    );
     if let Err(error) = result {
         stats.set_error(error);
     }
@@ -1309,6 +1443,7 @@ fn run_live_encoder_worker<F>(
     receiver: Receiver<Vec<f32>>,
     mut encoder: OpusVoiceEncoder,
     denoise_enabled: bool,
+    max_amplification_bits: Arc<AtomicU32>,
     stats: AudioStats,
     mut on_packet: F,
 ) where
@@ -1318,6 +1453,7 @@ fn run_live_encoder_worker<F>(
         receiver,
         &mut encoder,
         denoise_enabled,
+        &max_amplification_bits,
         &stats,
         &mut on_packet,
     );
@@ -1332,9 +1468,11 @@ fn run_encoder_worker_inner(
     writer: &mut PacketLogWriter<std::io::BufWriter<std::fs::File>>,
     encoder: &mut OpusVoiceEncoder,
     denoise_enabled: bool,
+    max_amplification: f32,
     stats: &AudioStats,
 ) -> Result<(), String> {
     let mut denoise = DenoiseState::new();
+    let mut auto_gain = AutoGain::new(max_amplification);
     let mut accumulator = FrameAccumulator::new(FRAME_SAMPLES);
     let mut denoised_frame = vec![0.0; FRAME_SAMPLES];
     let mut opus_frame = vec![0i16; FRAME_SAMPLES];
@@ -1342,6 +1480,7 @@ fn run_encoder_worker_inner(
 
     for chunk in receiver {
         accumulator.push_chunk(&chunk, |frame| {
+            auto_gain.process_frame(frame);
             let vad_probability = if denoise_enabled {
                 let vad = denoise.process_frame(&mut denoised_frame, frame);
                 frame.copy_from_slice(&denoised_frame);
@@ -1349,6 +1488,7 @@ fn run_encoder_worker_inner(
             } else {
                 0.0
             };
+            store_processed_level_stats(stats, frame);
             stats
                 .inner
                 .vad_bits
@@ -1375,6 +1515,7 @@ fn run_live_encoder_worker_inner<F>(
     receiver: Receiver<Vec<f32>>,
     encoder: &mut OpusVoiceEncoder,
     denoise_enabled: bool,
+    max_amplification_bits: &AtomicU32,
     stats: &AudioStats,
     on_packet: &mut F,
 ) -> Result<(), String>
@@ -1382,6 +1523,9 @@ where
     F: FnMut(Vec<u8>),
 {
     let mut denoise = DenoiseState::new();
+    let mut auto_gain = AutoGain::new(f32::from_bits(
+        max_amplification_bits.load(Ordering::Relaxed),
+    ));
     let mut accumulator = FrameAccumulator::new(FRAME_SAMPLES);
     let mut denoised_frame = vec![0.0; FRAME_SAMPLES];
     let mut opus_frame = vec![0i16; FRAME_SAMPLES];
@@ -1389,6 +1533,10 @@ where
 
     for chunk in receiver {
         accumulator.push_chunk(&chunk, |frame| {
+            auto_gain.set_max_amplification(f32::from_bits(
+                max_amplification_bits.load(Ordering::Relaxed),
+            ));
+            auto_gain.process_frame(frame);
             let vad_probability = if denoise_enabled {
                 let vad = denoise.process_frame(&mut denoised_frame, frame);
                 frame.copy_from_slice(&denoised_frame);
@@ -1396,6 +1544,7 @@ where
             } else {
                 0.0
             };
+            store_processed_level_stats(stats, frame);
             stats
                 .inner
                 .vad_bits
@@ -1787,6 +1936,41 @@ mod tests {
     }
 
     #[test]
+    fn auto_gain_boosts_quiet_frames_up_to_configured_limit() {
+        let mut gain = AutoGain::new(4.0);
+        let mut frame = vec![1_000.0; FRAME_SAMPLES];
+
+        gain.process_frame(&mut frame);
+
+        assert!((frame[0] - 4_000.0).abs() < 1.0);
+    }
+
+    #[test]
+    fn auto_gain_prevents_peak_clipping() {
+        let mut gain = AutoGain::new(40.0);
+        let mut frame = vec![30_000.0; FRAME_SAMPLES];
+
+        gain.process_frame(&mut frame);
+
+        assert!(peak_i16_scale(&frame) <= AutoGain::PEAK_LIMIT + 0.001);
+    }
+
+    #[test]
+    fn auto_gain_smooths_gain_increases_after_loud_frames() {
+        let mut gain = AutoGain::new(20.0);
+        let mut loud = vec![20_000.0; FRAME_SAMPLES];
+        gain.process_frame(&mut loud);
+        let loud_gain = gain.current_gain;
+
+        let mut quiet = vec![1_000.0; FRAME_SAMPLES];
+        gain.process_frame(&mut quiet);
+
+        assert!(gain.current_gain > loud_gain);
+        assert!(gain.current_gain < 20.0);
+        assert!(quiet[0] < 20_000.0);
+    }
+
+    #[test]
     fn opus_voice_encoder_applies_network_profile_and_encodes() {
         let mut encoder = OpusVoiceEncoder::new(32_000).unwrap();
         encoder
@@ -1960,6 +2144,11 @@ mod tests {
         mixer.queue_stream_samples(1, &[10_000]);
         mixer.queue_stream_samples(2, &[-10_000]);
         assert!(mixer.pop_mixed_sample().abs() <= 1);
+
+        mixer.queue_stream_samples(1, &[i16::MAX]);
+        mixer.queue_stream_samples(2, &[i16::MAX]);
+        mixer.queue_stream_samples(3, &[i16::MAX]);
+        assert!(mixer.pop_mixed_sample() < i16::MAX);
     }
 
     #[test]

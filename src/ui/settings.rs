@@ -1,11 +1,13 @@
 use extui::{Buffer, Ellipsis, HAlign, Rect, Style, vt::Modifier};
 
 use crate::{
+    audio::StatsSnapshot,
     settings::{
         AudioInputItem, AudioInputPickerState, SettingsDraft, SettingsFocus,
         selected_audio_input_label,
     },
     theme,
+    ui::vu,
 };
 
 const SELECTED_FOCUSED: Style = Style::DEFAULT
@@ -15,6 +17,8 @@ const SELECTED_DIM: Style = Style::DEFAULT
     .with_bg_rgb(0x24, 0x28, 0x30)
     .with_fg_rgb(0xd8, 0xdb, 0xd6);
 const PANEL_EDGE: Style = Style::DEFAULT.with_bg_rgb(0x18, 0x1b, 0x20);
+const SETTINGS_CONTROLS_ROWS: u16 = 9;
+const MIN_DEVICE_PICKER_ROWS: u16 = 4;
 
 pub fn draw_settings(
     area: Rect,
@@ -22,6 +26,7 @@ pub fn draw_settings(
     settings: &SettingsDraft,
     focus: SettingsFocus,
     dirty: bool,
+    capture: Option<&StatsSnapshot>,
     input_items: &[AudioInputItem],
     input_picker: &mut AudioInputPickerState,
 ) {
@@ -41,7 +46,7 @@ pub fn draw_settings(
     );
 
     if input_picker.open {
-        let controls_height = rows.h.min(7);
+        let controls_height = settings_controls_height(rows.h, input_items.len());
         let controls = rows.take_bottom(controls_height as i32);
         draw_audio_picker(
             rows,
@@ -50,10 +55,21 @@ pub fn draw_settings(
             input_items,
             input_picker,
         );
-        draw_settings_controls(controls, buf, settings, focus, dirty);
+        draw_settings_controls(controls, buf, settings, focus, dirty, capture);
     } else {
-        draw_settings_controls(rows, buf, settings, focus, dirty);
+        draw_settings_controls(rows, buf, settings, focus, dirty, capture);
     }
+}
+
+fn settings_controls_height(available: u16, input_count: usize) -> u16 {
+    let min_picker_rows = if input_count > 1 {
+        MIN_DEVICE_PICKER_ROWS
+    } else {
+        1
+    };
+    available
+        .saturating_sub(min_picker_rows)
+        .min(SETTINGS_CONTROLS_ROWS)
 }
 
 fn draw_input_header(
@@ -282,12 +298,14 @@ fn draw_settings_controls(
     settings: &SettingsDraft,
     focus: SettingsFocus,
     dirty: bool,
+    capture: Option<&StatsSnapshot>,
 ) {
     if area.is_empty() {
         return;
     }
     buf.clear_rect(area, theme::BACKGROUND);
     let mut rows = area;
+    vu::draw_settings_vu_row(rows.take_top(1), buf, capture, false);
     draw_settings_row(
         rows.take_top(1),
         buf,
@@ -302,6 +320,14 @@ fn draw_settings_controls(
         "Denoise",
         if settings.denoise { "on" } else { "off" },
         focus == SettingsFocus::Denoise,
+        dirty,
+    );
+    draw_settings_row(
+        rows.take_top(1),
+        buf,
+        "Max. Amplification",
+        &format!("{:.2}", settings.max_amplification()),
+        focus == SettingsFocus::Amplification,
         dirty,
     );
     draw_settings_row(
@@ -367,4 +393,20 @@ fn draw_button_row(area: Rect, buf: &mut Buffer, label: &str, focused: bool) {
     area.with(style.patch(if focused { theme::GOOD } else { theme::TEXT }))
         .text(buf, "  ")
         .text(buf, label);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn settings_layout_preserves_device_picker_rows() {
+        assert_eq!(settings_controls_height(7, 3), 3);
+        assert_eq!(settings_controls_height(16, 3), SETTINGS_CONTROLS_ROWS);
+    }
+
+    #[test]
+    fn settings_layout_keeps_full_controls_for_default_only_picker() {
+        assert_eq!(settings_controls_height(7, 1), 6);
+    }
 }
