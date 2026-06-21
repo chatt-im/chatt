@@ -108,6 +108,32 @@ Inspect audio input devices:
 cargo run -p chatt -- debug-audio-inputs
 ```
 
+Play an audio file through the real live playback path while applying the same
+loss and delivery-delay profiles used by the latency simulations:
+
+```sh
+cargo run -p chatt -- --config chatt.toml test-audio-playback assets/sample-001.opus --loss congested_wifi
+```
+
+Use `--loss none` to isolate output-device behavior without synthetic network
+loss, or profiles such as `random_60` and `mobile_handoff` to stress DRED/PLC
+recovery and jitter handling.
+
+For live receiver testing, use the dev soundboard client. It joins the room
+without opening a microphone and sends prerecorded clips over the normal voice
+path when triggered:
+
+```sh
+devsm start server
+devsm client-alice
+devsm client-bob
+devsm client-soundboard
+```
+
+Run each interactive client in its own terminal. In the soundboard client,
+press `1` or type `/sound 1` to send `assets/sample-001.opus` with the
+configured `[soundboard]` loss profile.
+
 ## Common Commands
 
 Build and validate the workspace:

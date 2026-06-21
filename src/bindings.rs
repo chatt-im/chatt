@@ -41,6 +41,15 @@ pub enum BindCommand {
     AdjustLeft,
     AdjustRight,
     ClearChat,
+    PlaySoundboard1,
+    PlaySoundboard2,
+    PlaySoundboard3,
+    PlaySoundboard4,
+    PlaySoundboard5,
+    PlaySoundboard6,
+    PlaySoundboard7,
+    PlaySoundboard8,
+    PlaySoundboard9,
 }
 
 impl std::fmt::Display for BindCommand {
@@ -76,6 +85,15 @@ impl std::fmt::Display for BindCommand {
             AdjustLeft => "AdjustLeft",
             AdjustRight => "AdjustRight",
             ClearChat => "ClearChat",
+            PlaySoundboard1 => "PlaySoundboard1",
+            PlaySoundboard2 => "PlaySoundboard2",
+            PlaySoundboard3 => "PlaySoundboard3",
+            PlaySoundboard4 => "PlaySoundboard4",
+            PlaySoundboard5 => "PlaySoundboard5",
+            PlaySoundboard6 => "PlaySoundboard6",
+            PlaySoundboard7 => "PlaySoundboard7",
+            PlaySoundboard8 => "PlaySoundboard8",
+            PlaySoundboard9 => "PlaySoundboard9",
         })
     }
 }

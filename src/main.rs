@@ -28,16 +28,17 @@ use std::{
 };
 
 use audio::{
-    BufferRequest, DeviceInfo, EchoCancellationControl, LiveCapture, LiveCaptureConfig,
-    LiveEncoderProfile, LivePlayback, LivePlaybackConfig, LivePlaybackFeedback,
-    PlaybackStreamControl, StatsSnapshot,
+    BufferRequest, DeviceInfo, EchoCancellationControl, LiveAudioFilePlaybackTestConfig,
+    LiveAudioFilePlaybackTestReport, LiveAudioFileSourceConfig, LiveAudioFileSourceReport,
+    LiveAudioPacketLossProfile, LiveCapture, LiveCaptureConfig, LiveEncoderProfile, LivePlayback,
+    LivePlaybackConfig, LivePlaybackFeedback, PlaybackStreamControl, StatsSnapshot,
 };
 use bindings::{BindCommand, PendingChord, Resolved};
 use chat_buffer::VirtualChatBuffer;
 use client_net::{NetworkClient, NetworkCommand, NetworkEvent};
 use config::{
-    Config, MAX_USER_VOLUME_DB, MIN_USER_VOLUME_DB, ServerEntry, USER_VOLUME_DB_STEP,
-    snap_user_volume_db,
+    Config, MAX_USER_VOLUME_DB, MIN_USER_VOLUME_DB, ServerEntry, SoundboardClip,
+    USER_VOLUME_DB_STEP, snap_user_volume_db,
 };
 use extui::{
     Buffer, Ellipsis, HAlign, Rect, Style, Terminal, TerminalFlags,
@@ -66,6 +67,7 @@ use unicode_width::UnicodeWidthStr;
 
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
 const NAME_COL_WIDTH: u16 = 16;
+const AUDIO_PLAYBACK_TEST_DEFAULT_SEED: u64 = 0x746f_6d63_6861_7404;
 const ROOM_SELECTED: Style = Style::DEFAULT
     .with_bg_rgb(0x24, 0x28, 0x30)
     .with_fg_rgb(0xf0, 0xf2, 0xe8);
@@ -432,6 +434,10 @@ struct App {
     settings_preview_capture: bool,
     allow_settings_preview_capture: bool,
     playback: Option<LivePlayback>,
+    soundboard_event_tx: mpsc::Sender<SoundboardEvent>,
+    soundboard_event_rx: Receiver<SoundboardEvent>,
+    soundboard_busy: Arc<AtomicBool>,
+    soundboard_next_sequence: u32,
     echo_control: Arc<EchoCancellationControl>,
     muted_users: HashSet<UserId>,
     stream_users: HashMap<u32, UserId>,
@@ -495,6 +501,11 @@ struct AudioDeviceRefresh {
     output: Result<Vec<DeviceInfo>, String>,
 }
 
+struct SoundboardEvent {
+    clip_name: String,
+    result: Result<LiveAudioFileSourceReport, String>,
+}
+
 enum Action {
     Continue,
     Quit,
@@ -503,8 +514,17 @@ enum Action {
 #[derive(Debug, PartialEq, Eq)]
 enum CliCommand {
     RunUi,
-    Join { join_string: String },
-    Upload { path: PathBuf },
+    Join {
+        join_string: String,
+    },
+    Upload {
+        path: PathBuf,
+    },
+    TestAudioPlayback {
+        path: PathBuf,
+        packet_loss: LiveAudioPacketLossProfile,
+        seed: u64,
+    },
     DebugAudioInputs,
 }
 
@@ -516,9 +536,11 @@ impl App {
     ) -> Result<Self, String> {
         let (event_tx, event_rx) = mpsc::channel();
         let (audio_device_refresh_tx, audio_device_refresh_rx) = mpsc::channel();
+        let (soundboard_event_tx, soundboard_event_rx) = mpsc::channel();
         let active_server = config.active_server()?.clone();
         let client_config = active_server.client_config(&config.files, pairing_code);
         let network = NetworkClient::spawn(client_config, event_tx);
+        let soundboard_enabled = config.soundboard.enabled;
         let mut composer =
             Editor::with_bindings(editor_bindings::vim(editor_bindings::VimOptions::default()));
         composer.set_wrap(true);
@@ -576,8 +598,12 @@ impl App {
             mic_error: None,
             capture: None,
             settings_preview_capture: false,
-            allow_settings_preview_capture: true,
+            allow_settings_preview_capture: !soundboard_enabled,
             playback: None,
+            soundboard_event_tx,
+            soundboard_event_rx,
+            soundboard_busy: Arc::new(AtomicBool::new(false)),
+            soundboard_next_sequence: 0,
             echo_control,
             muted_users: HashSet::new(),
             stream_users: HashMap::new(),
@@ -600,6 +626,28 @@ impl App {
     fn drain_audio_device_refreshes(&mut self) {
         while let Ok(refresh) = self.audio_device_refresh_rx.try_recv() {
             self.handle_audio_device_refresh(refresh);
+        }
+    }
+
+    fn drain_soundboard_events(&mut self) {
+        while let Ok(event) = self.soundboard_event_rx.try_recv() {
+            self.handle_soundboard_event(event);
+        }
+    }
+
+    fn handle_soundboard_event(&mut self, event: SoundboardEvent) {
+        match event.result {
+            Ok(report) => {
+                self.soundboard_next_sequence = report.next_sequence;
+                self.set_status(format!(
+                    "soundboard {} done: sent {} dropped {} reordered {}",
+                    event.clip_name,
+                    report.delivered_packets,
+                    report.dropped_packets,
+                    report.reordered_packets
+                ));
+            }
+            Err(error) => self.set_error(format!("soundboard {} failed: {error}", event.clip_name)),
         }
     }
 
@@ -727,7 +775,11 @@ impl App {
                 self.participants.voice_started(user_id, stream_id);
                 self.apply_user_audio_control(user_id);
                 if Some(user_id) == self.user_id {
-                    self.set_status("voice stream ready");
+                    if self.config.soundboard.enabled {
+                        self.set_status("soundboard ready");
+                    } else {
+                        self.set_status("voice stream ready");
+                    }
                 } else {
                     self.set_status(format!("user {} voice ready", user_id.0));
                 }
@@ -945,6 +997,15 @@ impl App {
             AdjustLeft => self.adjust_settings_focus(-1),
             AdjustRight => self.adjust_settings_focus(1),
             ClearChat => self.chat.clear(),
+            PlaySoundboard1 => self.trigger_soundboard_slot(0),
+            PlaySoundboard2 => self.trigger_soundboard_slot(1),
+            PlaySoundboard3 => self.trigger_soundboard_slot(2),
+            PlaySoundboard4 => self.trigger_soundboard_slot(3),
+            PlaySoundboard5 => self.trigger_soundboard_slot(4),
+            PlaySoundboard6 => self.trigger_soundboard_slot(5),
+            PlaySoundboard7 => self.trigger_soundboard_slot(6),
+            PlaySoundboard8 => self.trigger_soundboard_slot(7),
+            PlaySoundboard9 => self.trigger_soundboard_slot(8),
         }
         Action::Continue
     }
@@ -1454,9 +1515,11 @@ impl App {
             "/audio" => self.show_audio_status(),
             "/clear" => self.chat.clear(),
             "/config" | "/settings" => self.open_settings(),
+            "/soundboard" => self.show_soundboard(),
             "/users" => self.show_users(),
             "/whoami" => self.show_current_user(),
             command if command.starts_with("/upload ") => self.upload_file_command(command),
+            command if command.starts_with("/sound") => self.soundboard_command(command),
             command if command.starts_with('/') => {
                 self.set_error(format!("unknown command: {command}"))
             }
@@ -1578,6 +1641,141 @@ impl App {
         });
     }
 
+    fn show_soundboard(&mut self) {
+        if !self.config.soundboard.enabled {
+            self.set_status("soundboard is disabled");
+            return;
+        }
+        if self.config.soundboard.clips.is_empty() {
+            self.set_status("soundboard has no clips");
+            return;
+        }
+        let clips = self
+            .config
+            .soundboard
+            .clips
+            .iter()
+            .enumerate()
+            .map(|(index, clip)| format!("{}:{}", index + 1, clip.name))
+            .collect::<Vec<_>>()
+            .join(" ");
+        self.chat.push_notice(
+            "soundboard",
+            format!(
+                "clips {clips}; loss {}; trigger with /sound N or bound keys",
+                self.config.soundboard.loss
+            ),
+        );
+        self.chat.bottom();
+        self.set_status("soundboard clips listed");
+    }
+
+    fn soundboard_command(&mut self, command: &str) {
+        let value = command.trim_start_matches("/sound").trim();
+        if value.is_empty() {
+            self.show_soundboard();
+            return;
+        }
+        if let Ok(slot) = value.parse::<usize>() {
+            self.trigger_soundboard_slot(slot.saturating_sub(1));
+            return;
+        }
+        if let Some(slot) = self
+            .config
+            .soundboard
+            .clips
+            .iter()
+            .position(|clip| clip.name.eq_ignore_ascii_case(value))
+        {
+            self.trigger_soundboard_slot(slot);
+            return;
+        }
+        self.set_error(format!("unknown soundboard clip: {value}"));
+    }
+
+    fn trigger_soundboard_slot(&mut self, slot: usize) {
+        if !self.config.soundboard.enabled {
+            self.set_status("soundboard is disabled");
+            return;
+        }
+        let Some(clip) = self.config.soundboard.clips.get(slot).cloned() else {
+            self.set_error(format!("soundboard slot {} is not configured", slot + 1));
+            return;
+        };
+        if self.deafened.load(Ordering::Relaxed) {
+            self.set_error("undeafen before using soundboard");
+            return;
+        }
+        if !self.voice_tx_enabled.load(Ordering::Relaxed) || !self.local_voice_stream_ready() {
+            self.set_error("soundboard voice stream is not ready yet");
+            return;
+        }
+        if self.soundboard_busy.swap(true, Ordering::AcqRel) {
+            self.set_status("soundboard is already playing");
+            return;
+        }
+        let Some(packet_loss) = self.config.soundboard.packet_loss() else {
+            self.soundboard_busy.store(false, Ordering::Release);
+            self.set_error(format!(
+                "invalid soundboard loss {}; expected one of: {}",
+                self.config.soundboard.loss,
+                LiveAudioPacketLossProfile::NAMES.join(", ")
+            ));
+            return;
+        };
+
+        let input_path = self.soundboard_clip_path(&clip);
+        let clip_name = clip.name.clone();
+        let network_tx = self.network.sender();
+        let event_tx = self.soundboard_event_tx.clone();
+        let busy = Arc::clone(&self.soundboard_busy);
+        let source_config = LiveAudioFileSourceConfig {
+            input_path,
+            tuning: self.config.audio.latency.to_tuning(),
+            packet_loss,
+            seed: self.config.soundboard.seed.wrapping_add(slot as u64),
+            first_sequence: self.soundboard_next_sequence,
+            max_amplification: self.config.audio.max_amplification,
+            denoise: self.config.audio.denoise,
+            auto_gain: true,
+        };
+        self.set_status(format!(
+            "soundboard playing {} ({})",
+            clip.name,
+            packet_loss.as_name()
+        ));
+        thread::spawn(move || {
+            let result = audio::run_live_audio_file_source(source_config, |sequence, frame| {
+                let _ =
+                    network_tx.send(NetworkCommand::SequencedLocalVoicePacket { sequence, frame });
+            });
+            busy.store(false, Ordering::Release);
+            let _ = event_tx.send(SoundboardEvent { clip_name, result });
+        });
+    }
+
+    fn soundboard_clip_path(&self, clip: &SoundboardClip) -> PathBuf {
+        let path = PathBuf::from(&clip.path);
+        if path.is_absolute() || path.exists() {
+            return path;
+        }
+        self.config
+            .config_path
+            .as_ref()
+            .and_then(|path| path.parent())
+            .map(|parent| parent.join(&clip.path))
+            .unwrap_or(path)
+    }
+
+    fn local_voice_stream_ready(&self) -> bool {
+        let Some(user_id) = self.user_id else {
+            return false;
+        };
+        self.stream_users
+            .values()
+            .any(|stream_user| *stream_user == user_id)
+    }
+
     fn ensure_mic_capture(&mut self) -> Result<(), String> {
         if self.capture.is_some() {
             return Ok(());
@@ -1683,7 +1881,10 @@ impl App {
 
         self.voice_tx_enabled.store(true, Ordering::Relaxed);
         let mut capture_ok = true;
-        if let Err(error) = self.ensure_mic_capture() {
+        if self.config.soundboard.enabled {
+            self.settings_preview_capture = false;
+            self.mic_error = None;
+        } else if let Err(error) = self.ensure_mic_capture() {
             capture_ok = false;
             self.set_error(format!("failed to start capture: {error}"));
         } else {
@@ -1708,7 +1909,11 @@ impl App {
                     self.playback = Some(playback);
                     self.apply_all_user_audio_controls();
                     if capture_ok {
-                        self.set_status("voice active");
+                        if self.config.soundboard.enabled {
+                            self.set_status("soundboard voice active");
+                        } else {
+                            self.set_status("voice active");
+                        }
                     }
                 }
                 Err(error) => {
@@ -1861,6 +2066,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("{response}");
             return Ok(());
         }
+        CliCommand::TestAudioPlayback {
+            path,
+            packet_loss,
+            seed,
+        } => {
+            let config_path = config::value_arg(&args, "--config");
+            let config = Config::load(config_path.as_deref())?;
+            run_audio_playback_test(config, path, packet_loss, seed)?;
+            return Ok(());
+        }
         CliCommand::DebugAudioInputs => {
             let config_path = config::value_arg(&args, "--config");
             let config = Config::load(config_path.as_deref())?;
@@ -1905,6 +2120,7 @@ fn run_app(
     loop {
         app.drain_network_events();
         app.drain_audio_device_refreshes();
+        app.drain_soundboard_events();
         render(&mut app, &mut buffer);
         buffer.render(&mut terminal);
 
@@ -1927,6 +2143,73 @@ fn run_app(
             }
         }
     }
+}
+
+fn run_audio_playback_test(
+    config: Config,
+    path: PathBuf,
+    packet_loss: LiveAudioPacketLossProfile,
+    seed: u64,
+) -> Result<(), Box<dyn std::error::Error>> {
+    println!(
+        "playing {} through live playback with loss={} seed={:#x}",
+        path.display(),
+        packet_loss.as_name(),
+        seed
+    );
+    let report = audio::run_live_audio_file_playback_test(LiveAudioFilePlaybackTestConfig {
+        input_path: path,
+        output_device_id: config.audio.output_device_id,
+        buffer_request: config.audio.buffer.to_request(),
+        tuning: config.audio.latency.to_tuning(),
+        packet_loss,
+        seed,
+        max_amplification: config.audio.max_amplification,
+        denoise: config.audio.denoise,
+        auto_gain: true,
+    })?;
+    print_audio_playback_test_report(&report, packet_loss);
+    Ok(())
+}
+
+fn print_audio_playback_test_report(
+    report: &LiveAudioFilePlaybackTestReport,
+    packet_loss: LiveAudioPacketLossProfile,
+) {
+    println!(
+        "input_ms={},input_samples={},generated_frames={},queued_packets={},delivered_packets={},dropped_packets={},reordered_packets={},loss={}",
+        report.input_ms,
+        report.input_samples,
+        report.generated_frames,
+        report.queued_packets,
+        report.delivered_packets,
+        report.dropped_packets,
+        report.reordered_packets,
+        packet_loss.as_name()
+    );
+    println!(
+        "feedback_expected={},feedback_lost={},feedback_late={},feedback_reordered={},feedback_duplicates={},feedback_max_queue_ms={},feedback_max_jitter_ms={}",
+        report.feedback_expected_packets,
+        report.feedback_lost_packets,
+        report.feedback_late_packets,
+        report.feedback_reordered_packets,
+        report.feedback_duplicate_packets,
+        report.feedback_max_queue_ms,
+        report.feedback_max_interarrival_jitter_ms
+    );
+    println!(
+        "playback_max_queue_ms={},adaptive_target_ms={},correction_count={},hard_trim_count={},underruns={},dred={},plc={},silence_skip_count={},skipped_silence_ms={},suppressed_frames={}",
+        report.final_snapshot.max_queue_ms,
+        report.final_snapshot.adaptive_target_ms,
+        report.final_snapshot.correction_count,
+        report.final_snapshot.hard_trim_count,
+        report.final_snapshot.underrun_count,
+        report.final_snapshot.dred_recoveries,
+        report.final_snapshot.plc_fallbacks,
+        report.final_snapshot.silence_skip_count,
+        report.final_snapshot.skipped_silence_ms,
+        report.suppressed_frames
+    );
 }
 
 fn parse_cli_command(args: &[String]) -> Result<CliCommand, String> {
@@ -1961,6 +2244,9 @@ fn parse_cli_command(args: &[String]) -> Result<CliCommand, String> {
                 join_string: join_string.clone(),
             });
         }
+        if arg == "test-audio-playback" || arg == "audio-playback-test" {
+            return parse_test_audio_playback_command(args, index);
+        }
         if arg == "debug-audio-inputs" {
             if args.len() != index + 1 {
                 return Err("usage: chatt debug-audio-inputs".to_string());
@@ -1975,6 +2261,78 @@ fn parse_cli_command(args: &[String]) -> Result<CliCommand, String> {
         }
     }
     Ok(CliCommand::RunUi)
+}
+
+fn parse_test_audio_playback_command(
+    args: &[String],
+    command_index: usize,
+) -> Result<CliCommand, String> {
+    let mut index = command_index + 1;
+    let mut path = None;
+    let mut packet_loss = LiveAudioPacketLossProfile::CongestedWifi;
+    let mut seed = AUDIO_PLAYBACK_TEST_DEFAULT_SEED;
+
+    while index < args.len() {
+        let arg = &args[index];
+        match arg.as_str() {
+            "--loss" => {
+                let value = args.get(index + 1).ok_or_else(test_audio_playback_usage)?;
+                packet_loss = LiveAudioPacketLossProfile::from_name(value).ok_or_else(|| {
+                    format!(
+                        "unknown loss profile `{value}`\n{}",
+                        test_audio_playback_usage()
+                    )
+                })?;
+                index += 2;
+            }
+            "--seed" => {
+                let value = args.get(index + 1).ok_or_else(test_audio_playback_usage)?;
+                seed = parse_u64_cli_value(value, "seed")?;
+                index += 2;
+            }
+            _ if arg.starts_with("--") => {
+                return Err(format!(
+                    "unknown test-audio-playback option `{arg}`\n{}",
+                    test_audio_playback_usage()
+                ));
+            }
+            _ if path.is_none() => {
+                if arg.is_empty() {
+                    return Err(test_audio_playback_usage());
+                }
+                path = Some(PathBuf::from(arg));
+                index += 1;
+            }
+            _ => return Err(test_audio_playback_usage()),
+        }
+    }
+
+    let path = path.ok_or_else(test_audio_playback_usage)?;
+    Ok(CliCommand::TestAudioPlayback {
+        path,
+        packet_loss,
+        seed,
+    })
+}
+
+fn parse_u64_cli_value(value: &str, name: &str) -> Result<u64, String> {
+    if let Some(hex) = value
+        .strip_prefix("0x")
+        .or_else(|| value.strip_prefix("0X"))
+    {
+        u64::from_str_radix(hex, 16).map_err(|error| format!("invalid {name}: {error}"))
+    } else {
+        value
+            .parse::<u64>()
+            .map_err(|error| format!("invalid {name}: {error}"))
+    }
+}
+
+fn test_audio_playback_usage() -> String {
+    format!(
+        "usage: chatt test-audio-playback file_path [--loss PROFILE] [--seed SEED]\nloss profiles: {}",
+        LiveAudioPacketLossProfile::NAMES.join(", ")
+    )
 }
 
 fn cli_option_takes_value(arg: &str) -> bool {
@@ -2917,6 +3275,13 @@ fn voice_style(app: &App) -> Style {
 }
 
 fn mic_status_compact(app: &App, capture: Option<&StatsSnapshot>) -> String {
+    if app.config.soundboard.enabled {
+        return if app.soundboard_busy.load(Ordering::Relaxed) {
+            "soundboard playing".to_string()
+        } else {
+            format!("soundboard {} clips", app.config.soundboard.clips.len())
+        };
+    }
     let mute = if app.deafened.load(Ordering::Relaxed) {
         "deaf"
     } else if app.settings_preview_capture && !app.voice_tx_enabled.load(Ordering::Relaxed) {
@@ -3002,6 +3367,7 @@ mod tests {
     fn test_app() -> App {
         let (_event_tx, event_rx) = mpsc::channel();
         let (audio_device_refresh_tx, audio_device_refresh_rx) = mpsc::channel();
+        let (soundboard_event_tx, soundboard_event_rx) = mpsc::channel();
         let (command_tx, _command_rx) = mpsc::channel();
         let mut composer = Editor::new();
         composer.set_theme(theme::editor_theme());
@@ -3053,6 +3419,10 @@ mod tests {
             settings_preview_capture: false,
             allow_settings_preview_capture: false,
             playback: None,
+            soundboard_event_tx,
+            soundboard_event_rx,
+            soundboard_busy: Arc::new(AtomicBool::new(false)),
+            soundboard_next_sequence: 0,
             echo_control: Arc::new(EchoCancellationControl::new(false)),
             muted_users: HashSet::new(),
             stream_users: HashMap::new(),
@@ -3140,6 +3510,48 @@ mod tests {
         assert_eq!(
             parse_cli_command(&args).unwrap(),
             CliCommand::DebugAudioInputs
+        );
+    }
+
+    #[test]
+    fn parses_test_audio_playback_subcommand_after_value_options() {
+        let args = vec![
+            "chatt".to_string(),
+            "--config".to_string(),
+            "dev.toml".to_string(),
+            "test-audio-playback".to_string(),
+            "assets/sample-001.opus".to_string(),
+            "--loss".to_string(),
+            "random_60".to_string(),
+            "--seed".to_string(),
+            "0x1234".to_string(),
+        ];
+
+        assert_eq!(
+            parse_cli_command(&args).unwrap(),
+            CliCommand::TestAudioPlayback {
+                path: PathBuf::from("assets/sample-001.opus"),
+                packet_loss: LiveAudioPacketLossProfile::Random60,
+                seed: 0x1234,
+            }
+        );
+    }
+
+    #[test]
+    fn test_audio_playback_uses_congested_wifi_by_default() {
+        let args = vec![
+            "chatt".to_string(),
+            "test-audio-playback".to_string(),
+            "assets/sample-001.opus".to_string(),
+        ];
+
+        assert_eq!(
+            parse_cli_command(&args).unwrap(),
+            CliCommand::TestAudioPlayback {
+                path: PathBuf::from("assets/sample-001.opus"),
+                packet_loss: LiveAudioPacketLossProfile::CongestedWifi,
+                seed: AUDIO_PLAYBACK_TEST_DEFAULT_SEED,
+            }
         );
     }
 
