@@ -2100,12 +2100,13 @@ fn live_playback_callback<T>(
     };
 
     let now = Instant::now();
+    let output_frames = output.len() / channels.max(1);
     let mut echo_writer = match echo_control {
         Some(control) if control.enabled() => Some(control.reference().writer()),
         _ => None,
     };
     for frame in output.chunks_mut(channels.max(1)) {
-        let sample = mixer.pop_mixed_sample(now);
+        let sample = mixer.pop_mixed_output_sample(now, output_frames);
         if let Some(writer) = echo_writer.as_mut() {
             writer.push(sample);
         }
@@ -4175,12 +4176,25 @@ impl LivePlaybackMixer {
     }
 
     fn pop_mixed_sample(&mut self, now: Instant) -> f32 {
+        self.pop_mixed_sample_with(|stream, stats| stream.pop_sample(now, stats))
+    }
+
+    fn pop_mixed_output_sample(&mut self, now: Instant, output_block_samples: usize) -> f32 {
+        self.pop_mixed_sample_with(|stream, stats| {
+            stream.pop_output_sample(now, stats, output_block_samples)
+        })
+    }
+
+    fn pop_mixed_sample_with<F>(&mut self, mut pop: F) -> f32
+    where
+        F: FnMut(&mut AdaptivePlaybackStream, &mut LivePlaybackMixerStats) -> Option<f32>,
+    {
         let mut active = 0usize;
         let mut only_sample = 0.0f32;
         let mut sum = 0.0f32;
 
         for (stream_id, stream) in self.streams.iter_mut() {
-            let Some(sample) = stream.pop_sample(now, &mut self.stats) else {
+            let Some(sample) = pop(stream, &mut self.stats) else {
                 continue;
             };
             let control = self.controls.get(stream_id).copied().unwrap_or_default();
@@ -4214,6 +4228,10 @@ struct AdaptivePlaybackStream {
     recent_loss_events: VecDeque<Instant>,
     expanded_target_samples: usize,
     expanded_target_until: Option<Instant>,
+    output_priming: bool,
+    output_block_remaining: usize,
+    output_block_playable: bool,
+    output_target_floor_samples: usize,
 }
 
 impl AdaptivePlaybackStream {
@@ -4231,6 +4249,10 @@ impl AdaptivePlaybackStream {
             recent_loss_events: VecDeque::new(),
             expanded_target_samples: target_queue_samples(tuning),
             expanded_target_until: None,
+            output_priming: true,
+            output_block_remaining: 0,
+            output_block_playable: false,
+            output_target_floor_samples: 0,
         })
     }
 
@@ -4330,6 +4352,59 @@ impl AdaptivePlaybackStream {
         sample
     }
 
+    fn pop_output_sample(
+        &mut self,
+        now: Instant,
+        stats: &mut LivePlaybackMixerStats,
+        output_block_samples: usize,
+    ) -> Option<f32> {
+        if self.output_block_remaining == 0 {
+            self.begin_output_block(now, output_block_samples);
+        }
+
+        if !self.output_block_playable {
+            self.output_block_remaining = self.output_block_remaining.saturating_sub(1);
+            if self.output_block_remaining == 0 {
+                self.output_target_floor_samples = 0;
+            }
+            stats.underrun_count = stats.underrun_count.saturating_add(1);
+            return None;
+        }
+
+        let sample = self.pop_sample(now, stats);
+        self.output_block_remaining = self.output_block_remaining.saturating_sub(1);
+        if self.output_block_remaining == 0 {
+            self.output_target_floor_samples = 0;
+        }
+        if sample.is_none() {
+            self.output_priming = true;
+            self.output_block_playable = false;
+        }
+        sample
+    }
+
+    fn begin_output_block(&mut self, now: Instant, output_block_samples: usize) {
+        let output_block_samples = output_block_samples.max(1);
+        let queued = self.queued_samples();
+        // Avoid filling part of a hardware callback with audio and the rest
+        // with underrun silence when the device asks for a large block.
+        let target = self.adaptive_target_samples(now).max(output_block_samples);
+        self.output_target_floor_samples = output_block_samples;
+        self.output_block_playable = if self.output_priming {
+            let ready = queued >= target;
+            if ready {
+                self.output_priming = false;
+            }
+            ready
+        } else if queued >= output_block_samples {
+            true
+        } else {
+            self.output_priming = true;
+            false
+        };
+        self.output_block_remaining = output_block_samples;
+    }
+
     fn refill_output(&mut self, now: Instant, stats: &mut LivePlaybackMixerStats) {
         if self.input.frames() == 0 {
             return;
@@ -4425,7 +4500,7 @@ impl AdaptivePlaybackStream {
             return 0.0;
         }
         let queued = self.queued_samples();
-        let target = target_queue_samples(self.tuning);
+        let target = target_queue_samples(self.tuning).max(self.output_target_floor_samples);
         if queued < target {
             return 0.0;
         }
@@ -7614,6 +7689,61 @@ mod tests {
         assert_eq!(stats.direct_samples, 1);
         assert_eq!(stats.resampled_samples, 0);
         assert_eq!(stats.resampler_activations, 0);
+    }
+
+    #[test]
+    fn adaptive_stream_primes_output_until_target_queue_is_available() {
+        let now = Instant::now();
+        let mut stream = AdaptivePlaybackStream::new(test_tuning()).unwrap();
+        let mut stats = LivePlaybackMixerStats::default();
+        let block = samples_for_duration(Duration::from_millis(20));
+        let target = target_queue_samples(test_tuning());
+
+        stream.queue_samples(
+            &vec![0.25; target.saturating_sub(1)],
+            DecodedFrameSource::Normal,
+            false,
+            now,
+            &mut stats,
+        );
+
+        for _ in 0..block {
+            assert_eq!(stream.pop_output_sample(now, &mut stats, block), None);
+        }
+        assert_eq!(stream.queued_samples(), target.saturating_sub(1));
+
+        stream.queue_samples(&[0.25], DecodedFrameSource::Normal, false, now, &mut stats);
+
+        assert_eq!(stream.pop_output_sample(now, &mut stats, block), Some(0.25));
+    }
+
+    #[test]
+    fn adaptive_stream_does_not_drain_partial_hardware_blocks() {
+        let now = Instant::now();
+        let mut stream = AdaptivePlaybackStream::new(test_tuning()).unwrap();
+        let mut stats = LivePlaybackMixerStats::default();
+        let block = target_queue_samples(test_tuning()) + 1;
+
+        stream.queue_samples(
+            &vec![0.25; block - 1],
+            DecodedFrameSource::Normal,
+            false,
+            now,
+            &mut stats,
+        );
+
+        for _ in 0..block {
+            assert_eq!(stream.pop_output_sample(now, &mut stats, block), None);
+        }
+        assert_eq!(stream.queued_samples(), block - 1);
+
+        stream.queue_samples(&[0.25], DecodedFrameSource::Normal, false, now, &mut stats);
+
+        let samples = (0..block)
+            .map(|_| stream.pop_output_sample(now, &mut stats, block))
+            .collect::<Vec<_>>();
+        assert!(samples.iter().all(|sample| *sample == Some(0.25)));
+        assert_eq!(stream.queued_samples(), 0);
     }
 
     #[test]

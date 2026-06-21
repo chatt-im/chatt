@@ -23,9 +23,9 @@ max-receive-bytes = 52428800
 
 [audio]
 bitrate-bps = 96000
-denoise = true
+denoise = false
 echo-cancellation = false
-max-amplification = 2.0
+max-amplification = 1.0
 buffer = "default"
 
 [audio.latency]
