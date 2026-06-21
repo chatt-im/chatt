@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-jsony_bench.path = "/code/jsony/crates/jsony_bench"
+jsony_bench = { rev = "1da3d17fedae5ffea4a83a947c97e3c61a78dca8", git = "https://github.com/exrok/jsony" }
 nnnoiseless = { version = "0.5.2", default-features = false }
 opus-codec = { path = "../opus-codec", features = ["dred"] }
 sonora = "0.1.0"
