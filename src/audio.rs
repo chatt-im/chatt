@@ -64,6 +64,8 @@ const LIVE_PLAYBACK_SILENCE_RAMP: Duration = Duration::from_millis(10);
 const LIVE_PLAYBACK_SILENCE_MAX_SKIP: Duration = Duration::from_millis(200);
 const LIVE_PLAYBACK_SILENCE_MIN_SKIP: Duration = Duration::from_millis(20);
 const LIVE_PLAYBACK_SILENCE_RANGE_COUNT: usize = 2;
+const LIVE_PLAYBACK_RECOVERY_DECLICK: Duration = Duration::from_millis(5);
+const LIVE_PLAYBACK_RECOVERY_DECLICK_MIN_DELTA: f32 = 0.01;
 const LIVE_CAPTURE_LONG_SILENCE_STOP: Duration = Duration::from_secs(2);
 const LIVE_CAPTURE_SILENCE_PREROLL: Duration = Duration::from_millis(30);
 const LIVE_CAPTURE_SILENCE_RAMP: Duration = Duration::from_millis(10);
@@ -3493,6 +3495,7 @@ struct AdaptivePlaybackStream {
     resampler_output: Option<MonoResamplerOutput>,
     resampler: Option<Async<f32>>,
     output_delay_to_drop: usize,
+    queued_tail_source: Option<DecodedFrameSource>,
     current_ratio: f64,
     current_correction_percent: f32,
     recent_loss_events: VecDeque<Instant>,
@@ -3509,6 +3512,7 @@ impl AdaptivePlaybackStream {
             resampler_output: None,
             resampler: None,
             output_delay_to_drop: 0,
+            queued_tail_source: None,
             current_ratio: 1.0,
             current_correction_percent: 0.0,
             recent_loss_events: VecDeque::new(),
@@ -3528,13 +3532,61 @@ impl AdaptivePlaybackStream {
         if matches!(source, DecodedFrameSource::Dred | DecodedFrameSource::Plc) {
             self.note_loss(now);
         }
-        self.input.push_back(samples, silence_hint);
+        let mut samples = samples.to_vec();
+        self.declick_recovery_boundary(&mut samples, source);
+        self.input
+            .push_back_with_source(&samples, source, silence_hint);
+        self.queued_tail_source = Some(source);
         self.enforce_hard_bound(now, stats);
+    }
+
+    fn declick_recovery_boundary(&self, samples: &mut [f32], source: DecodedFrameSource) {
+        if samples.is_empty() {
+            return;
+        }
+        let Some((previous_sample, previous_source)) = self.queued_tail_sample_and_source() else {
+            return;
+        };
+        if matches!(
+            (previous_source, source),
+            (DecodedFrameSource::Normal, DecodedFrameSource::Normal)
+        ) {
+            return;
+        }
+
+        let delta = samples[0] - previous_sample;
+        if delta.abs() < LIVE_PLAYBACK_RECOVERY_DECLICK_MIN_DELTA {
+            return;
+        }
+
+        let ramp_samples = samples_for_duration(LIVE_PLAYBACK_RECOVERY_DECLICK)
+            .max(1)
+            .min(samples.len());
+        for (index, sample) in samples.iter_mut().take(ramp_samples).enumerate() {
+            let correction = 1.0 - (index as f32 / ramp_samples as f32);
+            *sample -= delta * correction;
+        }
+    }
+
+    fn queued_tail_sample_and_source(&self) -> Option<(f32, DecodedFrameSource)> {
+        if self.queued_samples() == 0 {
+            return None;
+        }
+        self.input
+            .last_sample_and_source()
+            .or_else(|| self.output.back().copied().zip(self.queued_tail_source))
+    }
+
+    fn clear_tail_source_if_empty(&mut self) {
+        if self.queued_samples() == 0 {
+            self.queued_tail_source = None;
+        }
     }
 
     fn pop_sample(&mut self, now: Instant, stats: &mut LivePlaybackMixerStats) -> Option<f32> {
         if let Some(sample) = self.output.pop_front() {
             stats.resampled_samples = stats.resampled_samples.saturating_add(1);
+            self.clear_tail_source_if_empty();
             return Some(sample);
         }
 
@@ -3548,6 +3600,7 @@ impl AdaptivePlaybackStream {
             } else {
                 stats.underrun_count = stats.underrun_count.saturating_add(1);
             }
+            self.clear_tail_source_if_empty();
             return sample;
         }
 
@@ -3560,6 +3613,7 @@ impl AdaptivePlaybackStream {
         } else {
             stats.underrun_count = stats.underrun_count.saturating_add(1);
         }
+        self.clear_tail_source_if_empty();
         sample
     }
 
@@ -3775,6 +3829,7 @@ impl AdaptivePlaybackStream {
         self.output.drain(..output_drop);
         samples -= output_drop;
         self.input.drain_samples(samples);
+        self.clear_tail_source_if_empty();
     }
 
     fn queued_samples(&self) -> usize {
@@ -3790,6 +3845,7 @@ struct MonoSampleQueue {
 struct QueuedAudioFrame {
     samples: Vec<f32>,
     offset: usize,
+    source: DecodedFrameSource,
     silence_hint: bool,
     rms: f32,
     peak: f32,
@@ -3801,12 +3857,22 @@ impl MonoSampleQueue {
     }
 
     fn push_back(&mut self, samples: &[f32], silence_hint: bool) {
+        self.push_back_with_source(samples, DecodedFrameSource::Normal, silence_hint);
+    }
+
+    fn push_back_with_source(
+        &mut self,
+        samples: &[f32],
+        source: DecodedFrameSource,
+        silence_hint: bool,
+    ) {
         if samples.is_empty() {
             return;
         }
         self.frames.push_back(QueuedAudioFrame {
             samples: samples.to_vec(),
             offset: 0,
+            source,
             silence_hint,
             rms: rms_normalized(samples),
             peak: peak_normalized(samples),
@@ -3932,6 +3998,19 @@ impl MonoSampleQueue {
             cursor += len;
         }
         None
+    }
+
+    fn last_sample_and_source(&self) -> Option<(f32, DecodedFrameSource)> {
+        self.frames.iter().rev().find_map(|frame| {
+            if frame.remaining_len() == 0 {
+                return None;
+            }
+            frame
+                .samples
+                .last()
+                .copied()
+                .map(|sample| (sample, frame.source))
+        })
     }
 }
 
@@ -6562,6 +6641,56 @@ mod tests {
         assert_eq!(stats.direct_samples, 1);
         assert_eq!(stats.resampled_samples, 0);
         assert_eq!(stats.resampler_activations, 0);
+    }
+
+    #[test]
+    fn adaptive_stream_declicks_recovery_boundaries() {
+        let now = Instant::now();
+        let mut stream = AdaptivePlaybackStream::new(test_tuning()).unwrap();
+        let mut stats = LivePlaybackMixerStats::default();
+
+        stream.queue_samples(&[-0.1; 4], DecodedFrameSource::Dred, false, now, &mut stats);
+        stream.queue_samples(
+            &[0.4; 4],
+            DecodedFrameSource::Normal,
+            false,
+            now,
+            &mut stats,
+        );
+
+        let samples: Vec<f32> = (0..8)
+            .map(|_| stream.pop_sample(now, &mut stats).unwrap())
+            .collect();
+        assert!((samples[3] - samples[4]).abs() < f32::EPSILON);
+        assert!(samples[5] < 0.4);
+    }
+
+    #[test]
+    fn adaptive_stream_leaves_normal_packet_boundaries_unchanged() {
+        let now = Instant::now();
+        let mut stream = AdaptivePlaybackStream::new(test_tuning()).unwrap();
+        let mut stats = LivePlaybackMixerStats::default();
+
+        stream.queue_samples(
+            &[-0.1; 4],
+            DecodedFrameSource::Normal,
+            false,
+            now,
+            &mut stats,
+        );
+        stream.queue_samples(
+            &[0.4; 4],
+            DecodedFrameSource::Normal,
+            false,
+            now,
+            &mut stats,
+        );
+
+        let samples: Vec<f32> = (0..8)
+            .map(|_| stream.pop_sample(now, &mut stats).unwrap())
+            .collect();
+        assert_eq!(samples[3], -0.1);
+        assert_eq!(samples[4], 0.4);
     }
 
     #[test]

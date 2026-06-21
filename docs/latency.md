@@ -176,13 +176,15 @@ audio so the results can be inspected by ear.
 | Export | Lost | Reordered | Late | DRED | PLC | Max queue | Avg queue | RMS | Peak | Max delta |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
 | `direct-client-reconstructed-none.wav` | 0 | 0 | 0 | 0 | 0 | 50 ms | 45.0 ms | 0.05421 | 0.50677 | 0.09070 |
-| `direct-client-reconstructed-congested-wifi.wav` | 197 | 418 | 84 | 181 | 281 | 210 ms | 142.7 ms | 0.04991 | 0.49890 | 0.27692 |
-| `direct-client-reconstructed-random-60.wav` | 1247 | 109 | 24 | 481 | 1270 | 410 ms | 213.4 ms | 0.03614 | 0.49338 | 0.42798 |
+| `direct-client-reconstructed-congested-wifi.wav` | 197 | 418 | 84 | 180 | 281 | 210 ms | 142.7 ms | 0.05036 | 0.49890 | 0.08752 |
+| `direct-client-reconstructed-random-60.wav` | 1247 | 109 | 24 | 477 | 1270 | 410 ms | 213.4 ms | 0.03659 | 0.57930 | 0.10205 |
 
 For the direct full-file export, 20 ms Opus packets and current DRED settings
 usually expose 720 samples of DRED for an adjacent missing packet. The client
 therefore reconstructs that gap as a 240-sample PLC prefix plus a 720-sample
-DRED suffix. The JSONL traces record `requested_offset_samples`,
+DRED suffix. Playback applies a 5 ms de-click correction when a queued boundary
+includes PLC or DRED, so those recovery-to-recovery and recovery-to-normal
+handoffs do not introduce hard sample steps. The JSONL traces record `requested_offset_samples`,
 `parsed_offset_samples`, `status: "partial"`, `plc_decode`, `dred_decode`,
 and every output window so artifact timestamps can be correlated to receiver
 decisions.
