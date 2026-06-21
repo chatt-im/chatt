@@ -9,6 +9,11 @@ use std::{
 use jsony_bench::{Bench, BenchParameters, Router};
 use nnnoiseless::DenoiseState;
 use opus_codec::{Channels, Decoder, DredDecoder, DredState, SampleRate};
+use tomchat::audio::{
+    DEFAULT_LIVE_MAX_AMPLIFICATION, LiveAudioPacketLossProfile, LiveAudioSimulationConfig,
+    LiveAudioSimulationScenario, LiveAudioTuning, run_live_audio_simulation_with_speech,
+    split_pcm_to_simulation_frames,
+};
 
 const SAMPLE_RATE: usize = 48_000;
 const OPUS_FRAME_SAMPLES: usize = 960;
@@ -17,6 +22,7 @@ const MAX_OPUS_PACKET_BYTES: usize = 1_500;
 const OPUS_FRAME_LIMIT: usize = 256;
 const RNNOISE_FRAME_LIMIT: usize = 512;
 const DRED_MAX_SAMPLES: usize = SAMPLE_RATE;
+const LIVE_SIM_DURATION: std::time::Duration = std::time::Duration::from_secs(2);
 const BENCH_PARAMS: BenchParameters = BenchParameters {
     sample_target_duration_ns: 5_000_000,
     max_sample_iterations: 1_000_000,
@@ -24,6 +30,14 @@ const BENCH_PARAMS: BenchParameters = BenchParameters {
     max_samples: 160,
     min_samples: 60,
     target_duration_ns: 500_000_000,
+};
+const LIVE_BENCH_PARAMS: BenchParameters = BenchParameters {
+    sample_target_duration_ns: 5_000_000,
+    max_sample_iterations: 1_000,
+    min_sample_iterations: 1,
+    max_samples: 40,
+    min_samples: 8,
+    target_duration_ns: 150_000_000,
 };
 
 const PROFILES: [CodecProfile; 10] = [
@@ -117,6 +131,10 @@ fn benchmark_router() -> Router {
             bench_pipeline(bench, Arc::clone(&corpus));
         });
     }
+    {
+        let corpus = Arc::clone(&corpus);
+        router.add("live", move |bench| bench_live(bench, Arc::clone(&corpus)));
+    }
 
     router
 }
@@ -132,6 +150,7 @@ struct CodecProfile {
 struct Corpus {
     opus_frames: Arc<Vec<Vec<f32>>>,
     rnnoise_frames: Arc<Vec<Vec<f32>>>,
+    live_simulation_frames: Arc<Vec<Vec<f32>>>,
     encoded_profiles: Vec<EncodedProfile>,
 }
 
@@ -347,6 +366,161 @@ fn bench_pipeline(bench: &mut Bench<'_>, corpus: Arc<Corpus>) {
     );
 }
 
+fn bench_live(bench: &mut Bench<'_>, corpus: Arc<Corpus>) {
+    let mut bench = bench.with_parameters(LIVE_BENCH_PARAMS);
+    let feature_sets = ["all_on", "catchup_off", "skip_off", "gate_off"];
+    let loss_profiles = [
+        LiveAudioPacketLossProfile::ScenarioDefault.as_name(),
+        LiveAudioPacketLossProfile::None.as_name(),
+        LiveAudioPacketLossProfile::MildRandom.as_name(),
+        LiveAudioPacketLossProfile::ModerateRandom.as_name(),
+        LiveAudioPacketLossProfile::SevereRandom.as_name(),
+        LiveAudioPacketLossProfile::Random30.as_name(),
+        LiveAudioPacketLossProfile::Random45.as_name(),
+        LiveAudioPacketLossProfile::Random60.as_name(),
+        LiveAudioPacketLossProfile::BurstyWifi.as_name(),
+        LiveAudioPacketLossProfile::CongestedWifi.as_name(),
+        LiveAudioPacketLossProfile::MobileHandoff.as_name(),
+    ];
+    let scenario_names = [
+        LiveAudioSimulationScenario::ConstantSpeech.as_name(),
+        LiveAudioSimulationScenario::AlternatingSpeech.as_name(),
+        LiveAudioSimulationScenario::LossySpeech.as_name(),
+        LiveAudioSimulationScenario::BacklogSilence.as_name(),
+    ];
+
+    bench
+        .named("capture_gate")
+        .param_str("feature", ["all_on", "gate_off"], |bench, feature| {
+            let frames = Arc::clone(&corpus.live_simulation_frames);
+            let tuning = live_tuning_for_feature_set(&feature);
+            bench.indexed_cyclic(1, move |_| {
+                let report = run_live_audio_simulation_with_speech(
+                    LiveAudioSimulationConfig {
+                        scenario: LiveAudioSimulationScenario::AlternatingSpeech,
+                        tuning,
+                        duration: LIVE_SIM_DURATION,
+                        streams: 1,
+                        seed: 0xabc0_0001,
+                        packet_loss: LiveAudioPacketLossProfile::ScenarioDefault,
+                        max_amplification: DEFAULT_LIVE_MAX_AMPLIFICATION,
+                        denoise: true,
+                        auto_gain: true,
+                    },
+                    &frames,
+                )
+                .unwrap();
+                black_box(report.suppressed_frames);
+                black_box(report.queued_frames);
+            });
+        });
+
+    bench
+        .named("playback_mixer")
+        .param_str("feature", &feature_sets, |bench, feature| {
+            let frames = Arc::clone(&corpus.live_simulation_frames);
+            let tuning = live_tuning_for_feature_set(&feature);
+            bench.indexed_cyclic(1, move |_| {
+                let report = run_live_audio_simulation_with_speech(
+                    LiveAudioSimulationConfig {
+                        scenario: LiveAudioSimulationScenario::BacklogSilence,
+                        tuning,
+                        duration: LIVE_SIM_DURATION,
+                        streams: 1,
+                        seed: 0xabc0_0002,
+                        packet_loss: LiveAudioPacketLossProfile::ScenarioDefault,
+                        max_amplification: DEFAULT_LIVE_MAX_AMPLIFICATION,
+                        denoise: true,
+                        auto_gain: true,
+                    },
+                    &frames,
+                )
+                .unwrap();
+                black_box(report.max_queue_ms);
+                black_box(report.final_snapshot.silence_skip_count);
+            });
+        });
+
+    bench
+        .named("call_sim")
+        .param_str("scenario", &scenario_names, |bench, scenario_name| {
+            let frames = Arc::clone(&corpus.live_simulation_frames);
+            let scenario = LiveAudioSimulationScenario::from_name(&scenario_name)
+                .unwrap_or(LiveAudioSimulationScenario::ConstantSpeech);
+            bench.param_str("feature", &feature_sets, move |bench, feature| {
+                let frames = Arc::clone(&frames);
+                let tuning = live_tuning_for_feature_set(&feature);
+                bench.param_str("loss", &loss_profiles, move |bench, loss_name| {
+                    let frames = Arc::clone(&frames);
+                    let packet_loss = LiveAudioPacketLossProfile::from_name(&loss_name)
+                        .unwrap_or(LiveAudioPacketLossProfile::ScenarioDefault);
+                    bench.indexed_cyclic(1, move |_| {
+                        let report = run_live_audio_simulation_with_speech(
+                            LiveAudioSimulationConfig {
+                                scenario,
+                                tuning,
+                                duration: LIVE_SIM_DURATION,
+                                streams: 1,
+                                seed: 0xabc0_0003,
+                                packet_loss,
+                                max_amplification: DEFAULT_LIVE_MAX_AMPLIFICATION,
+                                denoise: true,
+                                auto_gain: true,
+                            },
+                            &frames,
+                        )
+                        .unwrap();
+                        black_box(report.rms);
+                        black_box(report.queue_area_ms);
+                    });
+                });
+            });
+        });
+
+    bench
+        .named("group_call_sim")
+        .param_str("streams", ["3", "6"], |bench, streams| {
+            let frames = Arc::clone(&corpus.live_simulation_frames);
+            let streams = streams.parse::<usize>().unwrap();
+            bench.param_str("loss", &loss_profiles, move |bench, loss_name| {
+                let frames = Arc::clone(&frames);
+                let packet_loss = LiveAudioPacketLossProfile::from_name(&loss_name)
+                    .unwrap_or(LiveAudioPacketLossProfile::ScenarioDefault);
+                bench.indexed_cyclic(1, move |_| {
+                    let report = run_live_audio_simulation_with_speech(
+                        LiveAudioSimulationConfig {
+                            scenario: LiveAudioSimulationScenario::GroupChat,
+                            tuning: LiveAudioTuning::default(),
+                            duration: LIVE_SIM_DURATION,
+                            streams,
+                            seed: 0xabc0_0004,
+                            packet_loss,
+                            max_amplification: DEFAULT_LIVE_MAX_AMPLIFICATION,
+                            denoise: true,
+                            auto_gain: true,
+                        },
+                        &frames,
+                    )
+                    .unwrap();
+                    black_box(report.peak);
+                    black_box(report.final_snapshot.active_streams);
+                });
+            });
+        });
+}
+
+fn live_tuning_for_feature_set(feature: &str) -> LiveAudioTuning {
+    let mut tuning = LiveAudioTuning::default();
+    match feature {
+        "all_on" => {}
+        "catchup_off" => tuning.adaptive_catch_up = false,
+        "skip_off" => tuning.playback_silence_skip = false,
+        "gate_off" => tuning.capture_silence_gate = false,
+        _ => panic!("unknown live feature set {feature}"),
+    }
+    tuning
+}
+
 fn load_corpus() -> Corpus {
     let sample = sample_path();
     let pcm = decode_sample_with_ffmpeg(&sample);
@@ -362,6 +536,7 @@ fn load_corpus() -> Corpus {
         RNNOISE_FRAME_LIMIT,
         i16::MAX as f32,
     ));
+    let live_simulation_frames = Arc::new(split_pcm_to_simulation_frames(&pcm, SAMPLE_RATE * 20));
     let generated_voice_frames = generated_voiced_frames(OPUS_FRAME_SAMPLES, OPUS_FRAME_LIMIT);
 
     let encoded_profiles = PROFILES
@@ -390,6 +565,7 @@ fn load_corpus() -> Corpus {
     Corpus {
         opus_frames,
         rnnoise_frames,
+        live_simulation_frames,
         encoded_profiles,
     }
 }
@@ -693,7 +869,26 @@ mod tests {
         let corpus = load_corpus();
         assert_eq!(corpus.opus_frames.len(), OPUS_FRAME_LIMIT);
         assert_eq!(corpus.rnnoise_frames.len(), RNNOISE_FRAME_LIMIT);
+        assert!(!corpus.live_simulation_frames.is_empty());
         assert_eq!(corpus.encoded_profiles.len(), PROFILES.len());
+    }
+
+    #[test]
+    fn sample_frames_drive_live_call_simulation() {
+        let corpus = load_corpus();
+        let report = run_live_audio_simulation_with_speech(
+            LiveAudioSimulationConfig {
+                scenario: LiveAudioSimulationScenario::ConstantSpeech,
+                duration: std::time::Duration::from_secs(1),
+                ..Default::default()
+            },
+            &corpus.live_simulation_frames,
+        )
+        .unwrap();
+
+        assert_eq!(report.non_finite_samples, 0);
+        assert!(report.rms > 0.0);
+        assert!(report.max_queue_ms <= 120);
     }
 
     #[test]

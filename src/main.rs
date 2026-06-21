@@ -1550,6 +1550,7 @@ impl App {
                 denoise: self.config.audio.denoise,
                 max_amplification: self.config.audio.max_amplification,
                 buffer_request: self.buffer_request(),
+                tuning: self.config.audio.latency.to_tuning(),
             },
             move |payload| {
                 if mic_muted.load(Ordering::Relaxed)
@@ -1626,6 +1627,7 @@ impl App {
             match audio::start_live_playback(LivePlaybackConfig {
                 output_device_id: self.config.audio.output_device_id.clone(),
                 buffer_request: self.buffer_request(),
+                tuning: self.config.audio.latency.to_tuning(),
             }) {
                 Ok(playback) => {
                     self.playback = Some(playback);
@@ -2980,7 +2982,7 @@ mod tests {
         assert_eq!(config.audio.input_device_id, None);
         assert_eq!(config.audio.output_device_id, None);
         assert_eq!(config.audio.bitrate_bps, 24_000);
-        assert_eq!(config.audio.max_amplification, 20.0);
+        assert_eq!(config.audio.max_amplification, 2.0);
         assert_eq!(config.files.max_upload_bytes, 50 * 1024 * 1024);
         assert_eq!(config.files.max_receive_bytes, 50 * 1024 * 1024);
     }

@@ -26,3 +26,9 @@ earshot = "1.1.0"
 
 [workspace]
 members = ["crates/benchmark", "crates/p2p", "crates/rpc", "crates/server"]
+
+[profile.dev]
+debug = 0
+
+[profile.dev.package."*"]
+opt-level = 2

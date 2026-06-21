@@ -857,7 +857,7 @@ impl WorkerState {
                     let relay_payload = MediaPayload::Voice {
                         stream_id,
                         sequence,
-                        flags: 0,
+                        flags: frame.flags,
                         silence_ranges: frame.silence_ranges,
                         opus: frame.payload.clone(),
                     };
@@ -866,7 +866,7 @@ impl WorkerState {
                     self.send_p2p_voice(
                         stream_id,
                         sequence,
-                        0,
+                        frame.flags,
                         frame.silence_ranges,
                         &frame.payload,
                     );

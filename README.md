@@ -116,6 +116,11 @@ up instead of letting latency grow for the rest of the call. Use `/audio` or
 `--logfile` to inspect queue growth, DRED recovery, PLC fallback, hard trims,
 and underruns.
 
+Latency controls live under `[audio.latency]` in `tomchat.toml`. The defaults
+enable adaptive catch-up, playback silence skipping, and capture silence gating;
+set `adaptive-catch-up`, `playback-silence-skip`, or `capture-silence-gate` to
+`false` to isolate those behaviors during testing or profiling.
+
 The client accepts `--config` / `TOMCHAT_CONFIG` for config path selection.
 
 ## Server Configuration

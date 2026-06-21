@@ -1,7 +1,9 @@
 use std::{
     collections::{HashMap, VecDeque},
-    io,
+    fmt, fs,
+    io::{self, BufWriter, Write},
     path::{Path, PathBuf},
+    process::Command,
     ptr::NonNull,
     sync::{
         Arc, Mutex,
@@ -34,6 +36,9 @@ use crate::packet_log::{FLAG_DENOISE, PacketLogHeader, PacketLogReader, PacketLo
 pub const SAMPLE_RATE: u32 = 48_000;
 pub const CHANNELS: u8 = 1;
 pub const FRAME_SAMPLES: usize = DenoiseState::FRAME_SIZE;
+pub const DEFAULT_LIVE_MAX_AMPLIFICATION: f32 = 2.0;
+const LIVE_OPUS_FRAME_SAMPLES: usize = FRAME_SAMPLES * 2;
+const LIVE_PACKET_FLAG_OPUS_RESET: u8 = 0x01;
 const CALLBACK_QUEUE_CAPACITY: usize = 8;
 const LIVE_PLAYBACK_COMMAND_CAPACITY: usize = 256;
 const LIVE_PLAYBACK_TARGET_QUEUE: Duration = Duration::from_millis(60);
@@ -121,12 +126,128 @@ pub struct LiveCaptureConfig {
     pub denoise: bool,
     pub max_amplification: f32,
     pub buffer_request: BufferRequest,
+    pub tuning: LiveAudioTuning,
 }
 
 #[derive(Clone, Debug)]
 pub struct LivePlaybackConfig {
     pub output_device_id: Option<String>,
     pub buffer_request: BufferRequest,
+    pub tuning: LiveAudioTuning,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct LiveAudioTuning {
+    pub adaptive_catch_up: bool,
+    pub playback_silence_skip: bool,
+    pub capture_silence_gate: bool,
+    pub target_queue: Duration,
+    pub moderate_loss_queue: Duration,
+    pub dred_horizon: Duration,
+    pub hard_queue_bound: Duration,
+    pub loss_window: Duration,
+    pub loss_hold: Duration,
+    pub severe_loss_hold: Duration,
+    pub initial_buffer: Duration,
+    pub max_reorder_delay: Duration,
+    pub max_speed_up: f64,
+    pub silence_vad_max: u8,
+    pub silence_min_gap: Duration,
+    pub silence_guard: Duration,
+    pub silence_ramp: Duration,
+    pub silence_max_skip: Duration,
+    pub silence_min_skip: Duration,
+    pub capture_long_silence_stop: Duration,
+    pub capture_silence_preroll: Duration,
+    pub capture_silence_ramp: Duration,
+}
+
+impl Default for LiveAudioTuning {
+    fn default() -> Self {
+        Self {
+            adaptive_catch_up: true,
+            playback_silence_skip: true,
+            capture_silence_gate: true,
+            target_queue: LIVE_PLAYBACK_TARGET_QUEUE,
+            moderate_loss_queue: LIVE_PLAYBACK_MODERATE_LOSS_QUEUE,
+            dred_horizon: LIVE_PLAYBACK_DRED_HORIZON,
+            hard_queue_bound: LIVE_PLAYBACK_HARD_QUEUE_BOUND,
+            loss_window: LIVE_PLAYBACK_LOSS_WINDOW,
+            loss_hold: LIVE_PLAYBACK_LOSS_HOLD,
+            severe_loss_hold: LIVE_PLAYBACK_SEVERE_LOSS_HOLD,
+            initial_buffer: LIVE_PLAYBACK_INITIAL_BUFFER,
+            max_reorder_delay: LIVE_PLAYBACK_MAX_REORDER_DELAY,
+            max_speed_up: LIVE_PLAYBACK_MAX_SPEED_UP,
+            silence_vad_max: LIVE_PLAYBACK_SILENCE_VAD_MAX,
+            silence_min_gap: LIVE_PLAYBACK_SILENCE_MIN_GAP,
+            silence_guard: LIVE_PLAYBACK_SILENCE_GUARD,
+            silence_ramp: LIVE_PLAYBACK_SILENCE_RAMP,
+            silence_max_skip: LIVE_PLAYBACK_SILENCE_MAX_SKIP,
+            silence_min_skip: LIVE_PLAYBACK_SILENCE_MIN_SKIP,
+            capture_long_silence_stop: LIVE_CAPTURE_LONG_SILENCE_STOP,
+            capture_silence_preroll: LIVE_CAPTURE_SILENCE_PREROLL,
+            capture_silence_ramp: LIVE_CAPTURE_SILENCE_RAMP,
+        }
+    }
+}
+
+impl LiveAudioTuning {
+    pub fn validate(self) -> Result<(), String> {
+        validate_duration_ms("target-queue-ms", self.target_queue, 20, 1_000)?;
+        validate_duration_ms(
+            "moderate-loss-queue-ms",
+            self.moderate_loss_queue,
+            20,
+            2_000,
+        )?;
+        validate_duration_ms("dred-horizon-ms", self.dred_horizon, 20, 1_300)?;
+        validate_duration_ms("hard-queue-bound-ms", self.hard_queue_bound, 40, 5_000)?;
+        validate_duration_ms("loss-window-ms", self.loss_window, 100, 60_000)?;
+        validate_duration_ms("loss-hold-ms", self.loss_hold, 100, 60_000)?;
+        validate_duration_ms("severe-loss-hold-ms", self.severe_loss_hold, 100, 120_000)?;
+        validate_duration_ms("initial-buffer-ms", self.initial_buffer, 0, 500)?;
+        validate_duration_ms("max-reorder-delay-ms", self.max_reorder_delay, 0, 500)?;
+        validate_duration_ms("silence-min-gap-ms", self.silence_min_gap, 20, 2_000)?;
+        validate_duration_ms("silence-guard-ms", self.silence_guard, 0, 500)?;
+        validate_duration_ms("silence-ramp-ms", self.silence_ramp, 0, 100)?;
+        validate_duration_ms("silence-max-skip-ms", self.silence_max_skip, 0, 1_000)?;
+        validate_duration_ms("silence-min-skip-ms", self.silence_min_skip, 0, 500)?;
+        validate_duration_ms(
+            "capture-long-silence-stop-ms",
+            self.capture_long_silence_stop,
+            20,
+            60_000,
+        )?;
+        validate_duration_ms(
+            "capture-silence-preroll-ms",
+            self.capture_silence_preroll,
+            0,
+            1_000,
+        )?;
+        validate_duration_ms("capture-silence-ramp-ms", self.capture_silence_ramp, 0, 100)?;
+        if self.hard_queue_bound < self.target_queue {
+            return Err("hard-queue-bound-ms must be at least target-queue-ms".to_string());
+        }
+        if self.moderate_loss_queue < self.target_queue {
+            return Err("moderate-loss-queue-ms must be at least target-queue-ms".to_string());
+        }
+        if self.dred_horizon < self.moderate_loss_queue {
+            return Err("dred-horizon-ms must be at least moderate-loss-queue-ms".to_string());
+        }
+        if self.hard_queue_bound < self.dred_horizon {
+            return Err("hard-queue-bound-ms must be at least dred-horizon-ms".to_string());
+        }
+        if self.silence_max_skip < self.silence_min_skip {
+            return Err("silence-max-skip-ms must be at least silence-min-skip-ms".to_string());
+        }
+        if self.silence_min_gap < self.silence_guard.saturating_mul(2) {
+            return Err("silence-min-gap-ms must be at least twice silence-guard-ms".to_string());
+        }
+        if !self.max_speed_up.is_finite() || !(0.0..=0.20).contains(&self.max_speed_up) {
+            return Err("max-speed-up must be between 0.0 and 0.2".to_string());
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -140,6 +261,7 @@ pub struct RemoteVoicePacket {
 
 #[derive(Clone, Debug)]
 pub struct LocalVoiceFrame {
+    pub flags: u8,
     pub payload: Vec<u8>,
     pub silence_ranges: u64,
 }
@@ -218,7 +340,8 @@ impl OpusVoiceEncoder {
         this.set_bitrate(bitrate_bps)?;
         this.set_vbr(true)?;
         this.set_signal_voice()?;
-        this.set_complexity(Complexity::new(5))?;
+        this.set_max_bandwidth_wideband()?;
+        this.set_complexity(Complexity::new(9))?;
         this.set_dred_duration_10ms(0)?;
         this.set_inband_fec(false)?;
         this.set_packet_loss_percent(0)?;
@@ -250,6 +373,16 @@ impl OpusVoiceEncoder {
         usize::try_from(encoded).map_err(|_| String::from("opus encoded length is invalid"))
     }
 
+    fn reset_state(&mut self) -> Result<(), String> {
+        let result = unsafe {
+            opus_codec::opus_encoder_ctl(self.encoder.as_ptr(), opus_codec::OPUS_RESET_STATE as i32)
+        };
+        if result != opus_codec::OPUS_OK as i32 {
+            return Err(format_opus_error("failed to reset opus encoder", result));
+        }
+        Ok(())
+    }
+
     fn set_bitrate(&mut self, bitrate_bps: i32) -> Result<(), String> {
         self.control(
             opus_codec::OPUS_SET_BITRATE_REQUEST,
@@ -273,6 +406,14 @@ impl OpusVoiceEncoder {
             opus_codec::OPUS_SET_SIGNAL_REQUEST,
             opus_codec::OPUS_SIGNAL_VOICE as i32,
             "failed to set opus signal hint",
+        )
+    }
+
+    fn set_max_bandwidth_wideband(&mut self) -> Result<(), String> {
+        self.control(
+            opus_codec::OPUS_SET_MAX_BANDWIDTH_REQUEST,
+            opus_codec::OPUS_BANDWIDTH_WIDEBAND as i32,
+            "failed to set opus max bandwidth",
         )
     }
 
@@ -815,6 +956,7 @@ where
             encoder,
             config.denoise,
             worker_max_amplification,
+            config.tuning,
             worker_stats,
             on_packet,
         );
@@ -931,7 +1073,7 @@ pub fn start_live_playback(config: LivePlaybackConfig) -> Result<LivePlayback, S
         channels = selection.stream_config.channels,
         sample_rate = selection.stream_config.sample_rate
     );
-    let mixer = Arc::new(Mutex::new(LivePlaybackMixer::new()));
+    let mixer = Arc::new(Mutex::new(LivePlaybackMixer::with_tuning(config.tuning)));
     let stream = with_audio_backend_stderr_suppressed(|| {
         build_live_output_stream(
             &device,
@@ -947,7 +1089,8 @@ pub fn start_live_playback(config: LivePlaybackConfig) -> Result<LivePlayback, S
     kvlog::info!("live playback started", device = device_name.as_str());
     let (sender, receiver) = sync_channel(LIVE_PLAYBACK_COMMAND_CAPACITY);
     let worker_mixer = Arc::clone(&mixer);
-    let worker = thread::spawn(move || run_live_decoder_worker(receiver, worker_mixer));
+    let worker =
+        thread::spawn(move || run_live_decoder_worker(receiver, worker_mixer, config.tuning));
 
     Ok(LivePlayback {
         stream: Some(stream),
@@ -1558,7 +1701,7 @@ impl AutoGain {
         let max_amplification = if max_amplification.is_finite() {
             max_amplification
         } else {
-            20.0
+            DEFAULT_LIVE_MAX_AMPLIFICATION
         };
         max_amplification.clamp(1.0, 40.0)
     }
@@ -1651,10 +1794,8 @@ fn vad_to_u8(vad_probability: f32) -> u8 {
     (vad_probability.clamp(0.0, 1.0) * u8::MAX as f32).round() as u8
 }
 
-fn is_capture_skip_safe_silence(vad: u8, samples: &[f32]) -> bool {
-    vad <= LIVE_PLAYBACK_SILENCE_VAD_MAX
-        && peak_i16_scale(samples) < 0.20
-        && rms_i16_scale(samples) < 0.05
+fn is_capture_skip_safe_silence(tuning: LiveAudioTuning, vad: u8, samples: &[f32]) -> bool {
+    vad <= tuning.silence_vad_max && peak_i16_scale(samples) < 0.20 && rms_i16_scale(samples) < 0.05
 }
 
 struct SilenceRangeTracker {
@@ -1663,8 +1804,8 @@ struct SilenceRangeTracker {
 }
 
 impl SilenceRangeTracker {
-    fn new() -> Self {
-        let max_frames = (samples_for_duration(LIVE_PLAYBACK_DRED_HORIZON) / FRAME_SAMPLES)
+    fn new(tuning: LiveAudioTuning) -> Self {
+        let max_frames = (samples_for_duration(tuning.dred_horizon) / FRAME_SAMPLES)
             .saturating_add(1)
             .max(1);
         Self {
@@ -1759,11 +1900,11 @@ struct LongSilenceGate {
 }
 
 impl LongSilenceGate {
-    fn new() -> Self {
+    fn new(tuning: LiveAudioTuning) -> Self {
         Self::with_limits(
-            frames_for_duration(LIVE_CAPTURE_LONG_SILENCE_STOP),
-            frames_for_duration(LIVE_CAPTURE_SILENCE_PREROLL),
-            samples_for_duration(LIVE_CAPTURE_SILENCE_RAMP),
+            frames_for_duration(tuning.capture_long_silence_stop),
+            frames_for_duration(tuning.capture_silence_preroll),
+            samples_for_duration(tuning.capture_silence_ramp),
         )
     }
 
@@ -1917,9 +2058,10 @@ fn run_encoder_worker(
 
 fn run_live_encoder_worker<F>(
     receiver: Receiver<Vec<f32>>,
-    mut encoder: OpusVoiceEncoder,
+    encoder: OpusVoiceEncoder,
     denoise_enabled: bool,
     max_amplification_bits: Arc<AtomicU32>,
+    tuning: LiveAudioTuning,
     stats: AudioStats,
     mut on_packet: F,
 ) where
@@ -1927,9 +2069,10 @@ fn run_live_encoder_worker<F>(
 {
     let result = run_live_encoder_worker_inner(
         receiver,
-        &mut encoder,
+        encoder,
         denoise_enabled,
         &max_amplification_bits,
+        tuning,
         &stats,
         &mut on_packet,
     );
@@ -1989,85 +2132,256 @@ fn run_encoder_worker_inner(
 
 fn run_live_encoder_worker_inner<F>(
     receiver: Receiver<Vec<f32>>,
-    encoder: &mut OpusVoiceEncoder,
+    encoder: OpusVoiceEncoder,
     denoise_enabled: bool,
     max_amplification_bits: &AtomicU32,
+    tuning: LiveAudioTuning,
     stats: &AudioStats,
     on_packet: &mut F,
 ) -> Result<(), String>
 where
     F: FnMut(LocalVoiceFrame),
 {
-    let mut denoise = DenoiseState::new();
-    let mut earshot = EarshotVad::new();
-    let mut silence_tracker = SilenceRangeTracker::new();
-    let mut long_silence = LongSilenceGate::new();
-    let mut auto_gain = AutoGain::new(f32::from_bits(
-        max_amplification_bits.load(Ordering::Relaxed),
-    ));
-    let mut accumulator = FrameAccumulator::new(FRAME_SAMPLES);
-    let mut denoised_frame = vec![0.0; FRAME_SAMPLES];
-    let mut opus_frame = vec![0i16; FRAME_SAMPLES];
-    let mut encoded = vec![0u8; MAX_OPUS_PACKET_BYTES];
+    let mut pipeline = LiveEncoderPipeline::new(
+        encoder,
+        denoise_enabled,
+        tuning,
+        f32::from_bits(max_amplification_bits.load(Ordering::Relaxed)),
+        true,
+    );
 
     for chunk in receiver {
-        accumulator.push_chunk(&chunk, |frame| {
-            auto_gain.set_max_amplification(f32::from_bits(
-                max_amplification_bits.load(Ordering::Relaxed),
-            ));
-            auto_gain.process_frame(frame);
-            let vad_probability = if denoise_enabled {
-                let vad = denoise.process_frame(&mut denoised_frame, frame);
-                frame.copy_from_slice(&denoised_frame);
+        pipeline.push_chunk(
+            &chunk,
+            f32::from_bits(max_amplification_bits.load(Ordering::Relaxed)),
+            stats,
+            on_packet,
+        )?;
+    }
+
+    Ok(())
+}
+
+struct LiveEncoderPipeline {
+    encoder: OpusVoiceEncoder,
+    denoise_enabled: bool,
+    auto_gain_enabled: bool,
+    tuning: LiveAudioTuning,
+    denoise: Box<DenoiseState<'static>>,
+    earshot: EarshotVad,
+    silence_tracker: SilenceRangeTracker,
+    long_silence: Option<LongSilenceGate>,
+    auto_gain: AutoGain,
+    accumulator: FrameAccumulator,
+    denoised_frame: Vec<f32>,
+    opus_frame: Vec<i16>,
+    encoded: Vec<u8>,
+    pending_opus_samples: Vec<f32>,
+    pending_opus_silence: Vec<bool>,
+    next_opus_packet_flags: u8,
+    suppressed_frames: u64,
+}
+
+impl LiveEncoderPipeline {
+    fn new(
+        encoder: OpusVoiceEncoder,
+        denoise_enabled: bool,
+        tuning: LiveAudioTuning,
+        max_amplification: f32,
+        auto_gain_enabled: bool,
+    ) -> Self {
+        Self {
+            encoder,
+            denoise_enabled,
+            auto_gain_enabled,
+            tuning,
+            denoise: DenoiseState::new(),
+            earshot: EarshotVad::new(),
+            silence_tracker: SilenceRangeTracker::new(tuning),
+            long_silence: tuning
+                .capture_silence_gate
+                .then(|| LongSilenceGate::new(tuning)),
+            auto_gain: AutoGain::new(max_amplification),
+            accumulator: FrameAccumulator::new(FRAME_SAMPLES),
+            denoised_frame: vec![0.0; FRAME_SAMPLES],
+            opus_frame: vec![0i16; LIVE_OPUS_FRAME_SAMPLES],
+            encoded: vec![0u8; MAX_OPUS_PACKET_BYTES],
+            pending_opus_samples: Vec::with_capacity(LIVE_OPUS_FRAME_SAMPLES),
+            pending_opus_silence: Vec::with_capacity(2),
+            next_opus_packet_flags: 0,
+            suppressed_frames: 0,
+        }
+    }
+
+    fn push_chunk<F>(
+        &mut self,
+        chunk: &[f32],
+        max_amplification: f32,
+        stats: &AudioStats,
+        on_packet: &mut F,
+    ) -> Result<(), String>
+    where
+        F: FnMut(LocalVoiceFrame),
+    {
+        self.auto_gain.set_max_amplification(max_amplification);
+        for mut frame in self.accumulator.push_chunk_collect(chunk) {
+            if self.auto_gain_enabled {
+                self.auto_gain.process_frame(&mut frame);
+            }
+            let vad_probability = if self.denoise_enabled {
+                let vad = self
+                    .denoise
+                    .process_frame(&mut self.denoised_frame, frame.as_slice());
+                frame.copy_from_slice(&self.denoised_frame);
                 vad
             } else {
-                earshot.process_48k_frame(frame)
+                self.earshot.process_48k_frame(frame.as_slice())
             };
-            store_processed_level_stats(stats, frame);
+            store_processed_level_stats(stats, frame.as_slice());
             stats
                 .inner
                 .vad_bits
                 .store(vad_probability.to_bits(), Ordering::Relaxed);
             let vad = vad_to_u8(vad_probability);
-            let silence = is_capture_skip_safe_silence(vad, frame);
-            let silence_ranges = silence_tracker.observe_frame(silence);
+            let silence = is_capture_skip_safe_silence(self.tuning, vad, frame.as_slice());
+            let silence_ranges = self.silence_tracker.observe_frame(silence);
 
-            match long_silence.observe(frame, silence, silence_ranges) {
+            let decision = self
+                .long_silence
+                .as_mut()
+                .map(|gate| gate.observe(&mut frame, silence, silence_ranges))
+                .unwrap_or(CaptureGateDecision::TransmitCurrent);
+            match decision {
                 CaptureGateDecision::TransmitCurrent => {
-                    encode_live_frame(
-                        frame,
+                    self.queue_live_opus_input_frame(
+                        frame.as_slice(),
                         silence_ranges,
-                        encoder,
-                        &mut opus_frame,
-                        &mut encoded,
                         stats,
                         on_packet,
                     )?;
                 }
-                CaptureGateDecision::SuppressCurrent => {}
+                CaptureGateDecision::SuppressCurrent => {
+                    self.suppressed_frames = self.suppressed_frames.saturating_add(1);
+                }
                 CaptureGateDecision::Resume(frames) => {
+                    self.reset_opus_stream()?;
                     for frame in frames {
-                        encode_live_frame(
+                        self.queue_live_opus_input_frame(
                             &frame.samples,
                             frame.silence_ranges,
-                            encoder,
-                            &mut opus_frame,
-                            &mut encoded,
                             stats,
                             on_packet,
                         )?;
                     }
                 }
             }
-            Ok(())
-        })?;
+        }
+        Ok(())
     }
 
-    Ok(())
+    fn queue_live_opus_input_frame<F>(
+        &mut self,
+        frame: &[f32],
+        silence_ranges: u64,
+        stats: &AudioStats,
+        on_packet: &mut F,
+    ) -> Result<(), String>
+    where
+        F: FnMut(LocalVoiceFrame),
+    {
+        self.pending_opus_samples.extend_from_slice(frame);
+        self.pending_opus_silence
+            .push(silence_ranges_contain(silence_ranges, 0));
+
+        while self.pending_opus_samples.len() >= LIVE_OPUS_FRAME_SAMPLES {
+            let packet_silence_ranges = pack_current_opus_silence_ranges(
+                &self.pending_opus_silence[..2.min(self.pending_opus_silence.len())],
+            );
+            let flags = self.next_opus_packet_flags;
+            self.next_opus_packet_flags = 0;
+            encode_live_frame(
+                &self.pending_opus_samples[..LIVE_OPUS_FRAME_SAMPLES],
+                flags,
+                packet_silence_ranges,
+                &mut self.encoder,
+                &mut self.opus_frame,
+                &mut self.encoded,
+                stats,
+                on_packet,
+            )?;
+            self.pending_opus_samples.drain(..LIVE_OPUS_FRAME_SAMPLES);
+            let drain_silence = 2.min(self.pending_opus_silence.len());
+            self.pending_opus_silence.drain(..drain_silence);
+        }
+
+        Ok(())
+    }
+
+    fn reset_opus_stream(&mut self) -> Result<(), String> {
+        self.pending_opus_samples.clear();
+        self.pending_opus_silence.clear();
+        self.encoder.reset_state()?;
+        self.next_opus_packet_flags |= LIVE_PACKET_FLAG_OPUS_RESET;
+        Ok(())
+    }
+
+    fn suppressed_frames(&self) -> u64 {
+        self.suppressed_frames
+    }
+
+    fn current_gain(&self) -> f32 {
+        if self.auto_gain_enabled {
+            self.auto_gain.current_gain
+        } else {
+            1.0
+        }
+    }
+}
+
+fn pack_current_opus_silence_ranges(frame_silence: &[bool]) -> u64 {
+    let mut encoded = 0u64;
+    let mut range = 0usize;
+    let mut cursor = 0usize;
+    while cursor < frame_silence.len() && range < LIVE_PLAYBACK_SILENCE_RANGE_COUNT {
+        if !frame_silence[cursor] {
+            cursor += 1;
+            continue;
+        }
+        let start_frame = cursor;
+        while cursor < frame_silence.len() && frame_silence[cursor] {
+            cursor += 1;
+        }
+        let start_samples = start_frame.saturating_mul(FRAME_SAMPLES);
+        let len_samples = cursor
+            .saturating_sub(start_frame)
+            .saturating_mul(FRAME_SAMPLES);
+        encoded |= pack_silence_range(range, start_samples as u16, len_samples as u16);
+        range += 1;
+    }
+    encoded
+}
+
+fn build_live_encoder_pipeline(
+    tuning: LiveAudioTuning,
+    denoise_enabled: bool,
+    max_amplification: f32,
+    auto_gain_enabled: bool,
+    network_profile: EncoderNetworkProfile,
+) -> Result<LiveEncoderPipeline, String> {
+    let mut encoder = OpusVoiceEncoder::new(network_profile.bitrate_bps)?;
+    encoder.apply_network_profile(network_profile)?;
+    Ok(LiveEncoderPipeline::new(
+        encoder,
+        denoise_enabled,
+        tuning,
+        max_amplification,
+        auto_gain_enabled,
+    ))
 }
 
 fn encode_live_frame<F>(
     frame: &[f32],
+    flags: u8,
     silence_ranges: u64,
     encoder: &mut OpusVoiceEncoder,
     opus_frame: &mut [i16],
@@ -2081,6 +2395,7 @@ where
     convert_i16_scale_to_pcm_i16(frame, opus_frame);
     let packet_len = encoder.encode(opus_frame, encoded)?;
     on_packet(LocalVoiceFrame {
+        flags,
         payload: encoded[..packet_len].to_vec(),
         silence_ranges,
     });
@@ -2095,6 +2410,7 @@ where
 fn run_live_decoder_worker(
     receiver: Receiver<LivePlaybackCommand>,
     mixer: Arc<Mutex<LivePlaybackMixer>>,
+    tuning: LiveAudioTuning,
 ) {
     let mut streams: HashMap<u32, LiveDecodeStream> = HashMap::new();
     let mut frame = vec![0i16; MAX_OPUS_DECODE_SAMPLES];
@@ -2102,9 +2418,9 @@ fn run_live_decoder_worker(
     loop {
         match receiver.recv_timeout(LIVE_PLAYBACK_DRAIN_INTERVAL) {
             Ok(command) => {
-                handle_live_playback_command(command, &mut streams, &mixer);
+                handle_live_playback_command(command, &mut streams, &mixer, tuning);
                 while let Ok(command) = receiver.try_recv() {
-                    handle_live_playback_command(command, &mut streams, &mixer);
+                    handle_live_playback_command(command, &mut streams, &mixer, tuning);
                 }
             }
             Err(RecvTimeoutError::Timeout) => {}
@@ -2119,26 +2435,11 @@ fn handle_live_playback_command(
     command: LivePlaybackCommand,
     streams: &mut HashMap<u32, LiveDecodeStream>,
     mixer: &Arc<Mutex<LivePlaybackMixer>>,
+    tuning: LiveAudioTuning,
 ) {
     match command {
         LivePlaybackCommand::Packet(packet) => {
-            let stream = match streams.entry(packet.stream_id) {
-                std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
-                std::collections::hash_map::Entry::Vacant(entry) => match LiveDecodeStream::new() {
-                    Ok(stream) => entry.insert(stream),
-                    Err(error) => {
-                        eprintln!("failed to create live opus decoder: {error}");
-                        return;
-                    }
-                },
-            };
-            let packet_ref = AudioPacketRef {
-                sequence: packet.sequence,
-                flags: packet.flags,
-                silence_ranges: packet.silence_ranges,
-                payload: &packet.payload,
-            };
-            let _ = stream.insert(packet_ref, Instant::now());
+            let _ = insert_live_playback_packet(packet, streams, tuning, Instant::now());
         }
         LivePlaybackCommand::StopStream(stream_id) => {
             streams.remove(&stream_id);
@@ -2154,18 +2455,72 @@ fn handle_live_playback_command(
     }
 }
 
+fn insert_live_playback_packet(
+    packet: RemoteVoicePacket,
+    streams: &mut HashMap<u32, LiveDecodeStream>,
+    tuning: LiveAudioTuning,
+    now: Instant,
+) -> Option<InsertOutcome> {
+    let stream = match streams.entry(packet.stream_id) {
+        std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+        std::collections::hash_map::Entry::Vacant(entry) => match LiveDecodeStream::new(tuning) {
+            Ok(stream) => entry.insert(stream),
+            Err(error) => {
+                eprintln!("failed to create live opus decoder: {error}");
+                return None;
+            }
+        },
+    };
+    let packet_ref = AudioPacketRef {
+        sequence: packet.sequence,
+        flags: packet.flags,
+        silence_ranges: packet.silence_ranges,
+        payload: &packet.payload,
+    };
+    Some(stream.insert(packet_ref, now))
+}
+
 fn drain_live_decode_streams(
     streams: &mut HashMap<u32, LiveDecodeStream>,
     mixer: &Arc<Mutex<LivePlaybackMixer>>,
     frame: &mut [i16],
     now: Instant,
 ) {
+    let mut trace = None;
+    drain_live_decode_streams_with_trace(streams, mixer, frame, now, now, &mut trace);
+}
+
+fn drain_live_decode_streams_with_trace(
+    streams: &mut HashMap<u32, LiveDecodeStream>,
+    mixer: &Arc<Mutex<LivePlaybackMixer>>,
+    frame: &mut [i16],
+    now: Instant,
+    trace_start: Instant,
+    trace: &mut Option<LiveAudioTraceWriter>,
+) {
     for (stream_id, stream) in streams {
-        stream.drain_ready(now, frame, |samples, source, silence_hint| {
-            if let Ok(mut mixer) = mixer.lock() {
-                mixer.queue_stream_samples(*stream_id, samples, source, silence_hint, now);
-            }
-        });
+        stream.drain_ready(
+            now,
+            trace_start,
+            *stream_id,
+            frame,
+            trace,
+            |trace, samples, source, silence_hint| {
+                if let Ok(mut mixer) = mixer.lock() {
+                    mixer.queue_stream_samples(*stream_id, samples, source, silence_hint, now);
+                    trace_mixer_queue(
+                        trace,
+                        trace_start,
+                        now,
+                        *stream_id,
+                        source,
+                        silence_hint,
+                        samples,
+                        mixer.snapshot_at(now).max_queue_ms,
+                    );
+                }
+            },
+        );
     }
 }
 
@@ -2181,15 +2536,17 @@ struct LiveDecodeStream {
     jitter: LiveJitterStream,
     decoder: Decoder,
     dred_decoder: Option<DredDecoder>,
+    tuning: LiveAudioTuning,
 }
 
 impl LiveDecodeStream {
-    fn new() -> Result<Self, String> {
+    fn new(tuning: LiveAudioTuning) -> Result<Self, String> {
         Ok(Self {
-            jitter: LiveJitterStream::new(),
+            jitter: LiveJitterStream::new(tuning),
             decoder: Decoder::new(SampleRate::Hz48000, Channels::Mono)
                 .map_err(|error| error.to_string())?,
             dred_decoder: DredDecoder::new().ok(),
+            tuning,
         })
     }
 
@@ -2197,34 +2554,64 @@ impl LiveDecodeStream {
         self.jitter.insert(packet, now)
     }
 
-    fn drain_ready(
+    fn drain_ready<F>(
         &mut self,
         now: Instant,
+        trace_start: Instant,
+        stream_id: u32,
         frame: &mut [i16],
-        mut on_samples: impl FnMut(&[f32], DecodedFrameSource, bool),
-    ) {
+        trace: &mut Option<LiveAudioTraceWriter>,
+        mut on_samples: F,
+    ) where
+        F: FnMut(&mut Option<LiveAudioTraceWriter>, &[f32], DecodedFrameSource, bool),
+    {
         let items = self.jitter.drain_ready(now);
         for (index, item) in items.iter().enumerate() {
             match item {
                 PlayoutItem::Audio {
+                    sequence,
+                    flags,
                     payload,
                     silence_ranges,
                     ..
                 } => {
+                    trace_jitter_item(
+                        trace,
+                        trace_start,
+                        now,
+                        stream_id,
+                        *sequence,
+                        "audio",
+                        *flags,
+                    );
+                    if flags & LIVE_PACKET_FLAG_OPUS_RESET != 0 {
+                        self.reset_decoder_state();
+                        trace_decoder_reset(trace, trace_start, now, stream_id, *sequence);
+                    }
                     self.decode_playout(
                         payload,
                         frame,
                         DecodedFrameSource::Normal,
                         silence_ranges_contain(*silence_ranges, 0),
+                        trace_start,
+                        now,
+                        stream_id,
+                        *sequence,
+                        trace,
                         &mut on_samples,
                     );
                 }
                 PlayoutItem::Missing { sequence } => {
-                    let plc_samples = FRAME_SAMPLES.min(frame.len());
+                    trace_jitter_item(trace, trace_start, now, stream_id, *sequence, "missing", 0);
+                    let plc_samples = LIVE_OPUS_FRAME_SAMPLES.min(frame.len());
                     if !self.decode_dred(
                         *sequence,
                         &items[index + 1..],
                         &mut frame[..plc_samples],
+                        trace_start,
+                        now,
+                        stream_id,
+                        trace,
                         &mut on_samples,
                     ) {
                         self.decode_playout(
@@ -2232,109 +2619,378 @@ impl LiveDecodeStream {
                             &mut frame[..plc_samples],
                             DecodedFrameSource::Plc,
                             false,
+                            trace_start,
+                            now,
+                            stream_id,
+                            *sequence,
+                            trace,
                             &mut on_samples,
                         );
                     }
                 }
-                PlayoutItem::FastForward { .. } => {}
+                PlayoutItem::FastForward {
+                    from_sequence,
+                    to_sequence,
+                    skipped_packets,
+                } => {
+                    trace_fast_forward(
+                        trace,
+                        trace_start,
+                        now,
+                        stream_id,
+                        *from_sequence,
+                        *to_sequence,
+                        *skipped_packets,
+                    );
+                }
             }
         }
     }
 
-    fn decode_playout(
+    #[allow(clippy::too_many_arguments)]
+    fn decode_playout<F>(
         &mut self,
         payload: &[u8],
         frame: &mut [i16],
         source: DecodedFrameSource,
         silence_hint: bool,
-        on_samples: &mut impl FnMut(&[f32], DecodedFrameSource, bool),
-    ) {
+        trace_start: Instant,
+        now: Instant,
+        stream_id: u32,
+        sequence: u32,
+        trace: &mut Option<LiveAudioTraceWriter>,
+        on_samples: &mut F,
+    ) where
+        F: FnMut(&mut Option<LiveAudioTraceWriter>, &[f32], DecodedFrameSource, bool),
+    {
         let mut float_frame = vec![0.0f32; frame.len()];
         match self.decoder.decode_float(payload, &mut float_frame, false) {
-            Ok(decoded) => on_samples(&float_frame[..decoded], source, silence_hint),
+            Ok(decoded) => {
+                trace_decode_output(
+                    trace,
+                    trace_start,
+                    now,
+                    stream_id,
+                    sequence,
+                    source,
+                    decoded,
+                    silence_hint,
+                    None,
+                    &float_frame[..decoded],
+                );
+                on_samples(trace, &float_frame[..decoded], source, silence_hint);
+            }
             Err(error) => {
                 eprintln!("failed to decode live opus packet: {error}");
-                on_samples(&[], DecodedFrameSource::DecodeError, false);
+                trace_decode_output(
+                    trace,
+                    trace_start,
+                    now,
+                    stream_id,
+                    sequence,
+                    DecodedFrameSource::DecodeError,
+                    0,
+                    false,
+                    Some(error.to_string()),
+                    &[],
+                );
+                on_samples(trace, &[], DecodedFrameSource::DecodeError, false);
             }
         }
     }
 
-    fn decode_dred(
+    #[allow(clippy::too_many_arguments)]
+    fn decode_dred<F>(
         &mut self,
         missing_sequence: u32,
         future_items: &[PlayoutItem],
         frame: &mut [i16],
-        on_samples: &mut impl FnMut(&[f32], DecodedFrameSource, bool),
-    ) -> bool {
-        let Some(dred_decoder) = self.dred_decoder.as_mut() else {
+        trace_start: Instant,
+        now: Instant,
+        stream_id: u32,
+        trace: &mut Option<LiveAudioTraceWriter>,
+        on_samples: &mut F,
+    ) -> bool
+    where
+        F: FnMut(&mut Option<LiveAudioTraceWriter>, &[f32], DecodedFrameSource, bool),
+    {
+        if self.dred_decoder.is_none() {
+            trace_dred_skip(
+                trace,
+                trace_start,
+                now,
+                stream_id,
+                missing_sequence,
+                None,
+                "dred_decoder_unavailable",
+            );
             return false;
-        };
+        }
 
         let mut float_frame = vec![0.0f32; frame.len()];
         for item in future_items {
             let PlayoutItem::Audio {
                 sequence,
+                flags,
                 payload,
                 silence_ranges,
             } = item
             else {
                 continue;
             };
+            if flags & LIVE_PACKET_FLAG_OPUS_RESET != 0 {
+                trace_dred_skip(
+                    trace,
+                    trace_start,
+                    now,
+                    stream_id,
+                    missing_sequence,
+                    Some(*sequence),
+                    "future_packet_resets_opus",
+                );
+                break;
+            }
             let Some(distance) = sequence_distance_forward(missing_sequence, *sequence) else {
+                trace_dred_skip(
+                    trace,
+                    trace_start,
+                    now,
+                    stream_id,
+                    missing_sequence,
+                    Some(*sequence),
+                    "future_packet_not_forward",
+                );
                 continue;
             };
             if distance == 0 {
                 continue;
             }
-            let Some(offset_samples) = distance.checked_mul(FRAME_SAMPLES as u32) else {
+            let Some(offset_samples) = distance.checked_mul(LIVE_OPUS_FRAME_SAMPLES as u32) else {
+                trace_dred_skip(
+                    trace,
+                    trace_start,
+                    now,
+                    stream_id,
+                    missing_sequence,
+                    Some(*sequence),
+                    "offset_overflow",
+                );
                 continue;
             };
-            if offset_samples as usize > LIVE_PLAYBACK_DRED_MAX_SAMPLES {
+            let dred_max_samples = samples_for_duration(self.tuning.dred_horizon);
+            if offset_samples as usize > dred_max_samples {
+                trace_dred_parse(
+                    trace,
+                    trace_start,
+                    now,
+                    stream_id,
+                    missing_sequence,
+                    *sequence,
+                    offset_samples,
+                    0,
+                    0,
+                    "offset_beyond_horizon",
+                );
                 continue;
             }
 
             let Ok(mut dred_state) = DredState::new() else {
+                trace_dred_skip(
+                    trace,
+                    trace_start,
+                    now,
+                    stream_id,
+                    missing_sequence,
+                    Some(*sequence),
+                    "dred_state_unavailable",
+                );
                 return false;
             };
             let mut dred_end = 0;
-            let parsed = dred_decoder
+            let parsed = self
+                .dred_decoder
+                .as_mut()
+                .expect("DRED decoder exists after availability check")
                 .parse(
                     &mut dred_state,
                     payload,
-                    LIVE_PLAYBACK_DRED_MAX_SAMPLES,
+                    dred_max_samples,
                     SampleRate::Hz48000,
                     &mut dred_end,
                     false,
                 )
                 .unwrap_or(0);
+            let partial_prefix_samples = if parsed == 0 {
+                None
+            } else if offset_samples as usize > parsed {
+                Some(offset_samples as usize - parsed)
+            } else {
+                Some(0)
+            };
+            trace_dred_parse(
+                trace,
+                trace_start,
+                now,
+                stream_id,
+                missing_sequence,
+                *sequence,
+                offset_samples,
+                parsed as u32,
+                dred_end,
+                match partial_prefix_samples {
+                    None => "no_dred",
+                    Some(0) => "parsed",
+                    Some(prefix) if prefix < LIVE_OPUS_FRAME_SAMPLES => "partial",
+                    Some(_) => "parsed_too_late",
+                },
+            );
             if parsed == 0 {
                 continue;
             }
+            let partial_prefix_samples = partial_prefix_samples.unwrap_or(0);
+            if partial_prefix_samples >= LIVE_OPUS_FRAME_SAMPLES {
+                trace_dred_skip(
+                    trace,
+                    trace_start,
+                    now,
+                    stream_id,
+                    missing_sequence,
+                    Some(*sequence),
+                    "requested_offset_after_parsed_offset",
+                );
+                continue;
+            }
+            if partial_prefix_samples > 0 {
+                self.decode_playout(
+                    &[],
+                    &mut frame[..partial_prefix_samples],
+                    DecodedFrameSource::Plc,
+                    false,
+                    trace_start,
+                    now,
+                    stream_id,
+                    missing_sequence,
+                    trace,
+                    on_samples,
+                );
+            }
 
-            let silence_hint = silence_ranges_contain(*silence_ranges, offset_samples as usize);
-            let Ok(offset_samples) = i32::try_from(offset_samples) else {
+            let dred_offset_samples = if partial_prefix_samples == 0 {
+                offset_samples as usize
+            } else {
+                parsed
+            };
+            let dred_samples = LIVE_OPUS_FRAME_SAMPLES.saturating_sub(partial_prefix_samples);
+            let silence_hint = silence_ranges_contain(*silence_ranges, dred_offset_samples);
+            let Ok(dred_offset_samples) = i32::try_from(dred_offset_samples) else {
                 continue;
             };
-            match dred_decoder.decode_into_f32(
-                &mut self.decoder,
-                &dred_state,
-                offset_samples,
-                &mut float_frame,
-            ) {
+            let dred_result = self
+                .dred_decoder
+                .as_mut()
+                .expect("DRED decoder exists after availability check")
+                .decode_into_f32(
+                    &mut self.decoder,
+                    &dred_state,
+                    dred_offset_samples,
+                    &mut float_frame[..dred_samples],
+                );
+            match dred_result {
                 Ok(decoded) if decoded > 0 => {
+                    trace_decode_output(
+                        trace,
+                        trace_start,
+                        now,
+                        stream_id,
+                        missing_sequence,
+                        DecodedFrameSource::Dred,
+                        decoded,
+                        silence_hint,
+                        None,
+                        &float_frame[..decoded],
+                    );
                     on_samples(
+                        trace,
                         &float_frame[..decoded],
                         DecodedFrameSource::Dred,
                         silence_hint,
                     );
                     return true;
                 }
-                Ok(_) => {}
-                Err(_) => {}
+                Ok(_) => {
+                    trace_dred_skip(
+                        trace,
+                        trace_start,
+                        now,
+                        stream_id,
+                        missing_sequence,
+                        Some(*sequence),
+                        "decoded_zero_samples",
+                    );
+                    if partial_prefix_samples > 0 {
+                        self.decode_playout(
+                            &[],
+                            &mut frame[..dred_samples],
+                            DecodedFrameSource::Plc,
+                            false,
+                            trace_start,
+                            now,
+                            stream_id,
+                            missing_sequence,
+                            trace,
+                            on_samples,
+                        );
+                        return true;
+                    }
+                }
+                Err(error) => {
+                    trace_dred_skip(
+                        trace,
+                        trace_start,
+                        now,
+                        stream_id,
+                        missing_sequence,
+                        Some(*sequence),
+                        "decode_error",
+                    );
+                    trace_decode_output(
+                        trace,
+                        trace_start,
+                        now,
+                        stream_id,
+                        missing_sequence,
+                        DecodedFrameSource::DecodeError,
+                        0,
+                        false,
+                        Some(error.to_string()),
+                        &[],
+                    );
+                    if partial_prefix_samples > 0 {
+                        self.decode_playout(
+                            &[],
+                            &mut frame[..dred_samples],
+                            DecodedFrameSource::Plc,
+                            false,
+                            trace_start,
+                            now,
+                            stream_id,
+                            missing_sequence,
+                            trace,
+                            on_samples,
+                        );
+                        return true;
+                    }
+                }
             }
         }
 
         false
+    }
+
+    fn reset_decoder_state(&mut self) {
+        if let Err(error) = self.decoder.reset() {
+            eprintln!("failed to reset live opus decoder: {error}");
+        }
     }
 }
 
@@ -2346,13 +3002,13 @@ struct LiveJitterStream {
 }
 
 impl LiveJitterStream {
-    fn new() -> Self {
+    fn new(tuning: LiveAudioTuning) -> Self {
         Self {
             jitter: JitterBuffer::new(JitterBufferConfig {
-                max_reorder_delay: LIVE_PLAYBACK_MAX_REORDER_DELAY,
+                max_reorder_delay: tuning.max_reorder_delay,
                 ..Default::default()
             }),
-            initial_buffer: LIVE_PLAYBACK_INITIAL_BUFFER,
+            initial_buffer: tuning.initial_buffer,
             first_packet_at: None,
             playout_started: false,
         }
@@ -2391,6 +3047,7 @@ const LIVE_PLAYBACK_INTERPOLATION: SincInterpolationParameters = SincInterpolati
 
 #[derive(Default)]
 struct LivePlaybackMixer {
+    tuning: LiveAudioTuning,
     streams: HashMap<u32, AdaptivePlaybackStream>,
     controls: HashMap<u32, PlaybackStreamControl>,
     stats: LivePlaybackMixerStats,
@@ -2415,7 +3072,16 @@ struct LivePlaybackMixerStats {
 
 impl LivePlaybackMixer {
     fn new() -> Self {
-        Self::default()
+        Self::with_tuning(LiveAudioTuning::default())
+    }
+
+    fn with_tuning(tuning: LiveAudioTuning) -> Self {
+        Self {
+            tuning,
+            streams: HashMap::new(),
+            controls: HashMap::new(),
+            stats: LivePlaybackMixerStats::default(),
+        }
     }
 
     fn queue_stream_samples(
@@ -2447,7 +3113,7 @@ impl LivePlaybackMixer {
         let stream = match self.streams.entry(stream_id) {
             std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
             std::collections::hash_map::Entry::Vacant(entry) => {
-                match AdaptivePlaybackStream::new() {
+                match AdaptivePlaybackStream::new(self.tuning) {
                     Ok(stream) => entry.insert(stream),
                     Err(error) => {
                         self.stats.resampler_errors = self.stats.resampler_errors.saturating_add(1);
@@ -2481,7 +3147,10 @@ impl LivePlaybackMixer {
     }
 
     fn snapshot(&self) -> LivePlaybackSnapshot {
-        let now = Instant::now();
+        self.snapshot_at(Instant::now())
+    }
+
+    fn snapshot_at(&self, now: Instant) -> LivePlaybackSnapshot {
         let queued_samples = self.queued_samples();
         let max_queue_samples = self
             .streams
@@ -2494,7 +3163,7 @@ impl LivePlaybackMixer {
             .values()
             .map(|stream| stream.adaptive_target_samples(now))
             .max()
-            .unwrap_or_else(target_queue_samples);
+            .unwrap_or_else(|| target_queue_samples(self.tuning));
         let correction_percent = self
             .streams
             .values()
@@ -2506,7 +3175,7 @@ impl LivePlaybackMixer {
             active_streams: self.streams.len(),
             queued_samples,
             max_queue_ms: samples_to_ms(max_queue_samples),
-            target_queue_ms: duration_to_ms(LIVE_PLAYBACK_TARGET_QUEUE),
+            target_queue_ms: duration_to_ms(self.tuning.target_queue),
             adaptive_target_ms: samples_to_ms(adaptive_target),
             correction_percent,
             correction_count: self.stats.correction_count,
@@ -2553,6 +3222,7 @@ impl LivePlaybackMixer {
 }
 
 struct AdaptivePlaybackStream {
+    tuning: LiveAudioTuning,
     input: MonoSampleQueue,
     output: VecDeque<f32>,
     resampler_output: Option<MonoResamplerOutput>,
@@ -2566,8 +3236,9 @@ struct AdaptivePlaybackStream {
 }
 
 impl AdaptivePlaybackStream {
-    fn new() -> Result<Self, String> {
+    fn new(tuning: LiveAudioTuning) -> Result<Self, String> {
         Ok(Self {
+            tuning,
             input: MonoSampleQueue::new(),
             output: VecDeque::with_capacity(LIVE_PLAYBACK_RESAMPLER_CHUNK * 2),
             resampler_output: None,
@@ -2576,7 +3247,7 @@ impl AdaptivePlaybackStream {
             current_ratio: 1.0,
             current_correction_percent: 0.0,
             recent_loss_events: VecDeque::new(),
-            expanded_target_samples: target_queue_samples(),
+            expanded_target_samples: target_queue_samples(tuning),
             expanded_target_until: None,
         })
     }
@@ -2695,7 +3366,7 @@ impl AdaptivePlaybackStream {
 
     fn update_resample_ratio(&mut self, now: Instant, stats: &mut LivePlaybackMixerStats) {
         let correction = self.desired_correction(now);
-        let ratio = ratio_for_correction(correction);
+        let ratio = ratio_for_correction(correction, self.tuning);
         if (ratio - self.current_ratio).abs() < 0.002 {
             self.current_correction_percent = (correction * 100.0) as f32;
             return;
@@ -2718,8 +3389,11 @@ impl AdaptivePlaybackStream {
     }
 
     fn desired_correction(&self, now: Instant) -> f64 {
+        if !self.tuning.adaptive_catch_up {
+            return 0.0;
+        }
         let queued = self.queued_samples();
-        let target = target_queue_samples();
+        let target = target_queue_samples(self.tuning);
         if queued < target {
             return 0.0;
         }
@@ -2729,25 +3403,29 @@ impl AdaptivePlaybackStream {
             return 0.0;
         }
 
-        let hard_bound = samples_for_duration(LIVE_PLAYBACK_HARD_QUEUE_BOUND);
+        let hard_bound = samples_for_duration(self.tuning.hard_queue_bound);
         let range = hard_bound.saturating_sub(catchup_target).max(1) as f64;
         let over = queued.saturating_sub(catchup_target) as f64;
-        (LIVE_PLAYBACK_MAX_SPEED_UP * (over / range)).min(LIVE_PLAYBACK_MAX_SPEED_UP)
+        (self.tuning.max_speed_up * (over / range)).min(self.tuning.max_speed_up)
     }
 
     fn maybe_skip_silence(&mut self, now: Instant, stats: &mut LivePlaybackMixerStats) {
+        if !self.tuning.playback_silence_skip {
+            return;
+        }
         let queued = self.queued_samples();
         let catchup_target = self
             .adaptive_target_samples(now)
-            .max(target_queue_samples());
+            .max(target_queue_samples(self.tuning));
         if queued <= catchup_target {
             return;
         }
 
         let excess = queued.saturating_sub(catchup_target);
-        match self.input.find_silence_skip(excess) {
+        match self.input.find_silence_skip(self.tuning, excess) {
             Some((skip_start, skip_len)) => {
-                self.input.ramp_around_skip(skip_start, skip_len);
+                self.input
+                    .ramp_around_skip(self.tuning, skip_start, skip_len);
                 self.input.drain_range(skip_start, skip_len);
                 stats.silence_skip_count = stats.silence_skip_count.saturating_add(1);
                 stats.skipped_silence_samples = stats
@@ -2767,13 +3445,16 @@ impl AdaptivePlaybackStream {
     }
 
     fn note_loss(&mut self, now: Instant) {
+        if !self.tuning.adaptive_catch_up {
+            return;
+        }
         if self.expanded_target_until.is_none_or(|until| now >= until) {
-            self.expanded_target_samples = target_queue_samples();
+            self.expanded_target_samples = target_queue_samples(self.tuning);
         }
         while self
             .recent_loss_events
             .front()
-            .is_some_and(|event| now.saturating_duration_since(*event) > LIVE_PLAYBACK_LOSS_WINDOW)
+            .is_some_and(|event| now.saturating_duration_since(*event) > self.tuning.loss_window)
         {
             self.recent_loss_events.pop_front();
         }
@@ -2781,13 +3462,13 @@ impl AdaptivePlaybackStream {
 
         let (target, hold) = if self.recent_loss_events.len() >= 8 {
             (
-                samples_for_duration(LIVE_PLAYBACK_DRED_HORIZON),
-                LIVE_PLAYBACK_SEVERE_LOSS_HOLD,
+                samples_for_duration(self.tuning.dred_horizon),
+                self.tuning.severe_loss_hold,
             )
         } else {
             (
-                samples_for_duration(LIVE_PLAYBACK_MODERATE_LOSS_QUEUE),
-                LIVE_PLAYBACK_LOSS_HOLD,
+                samples_for_duration(self.tuning.moderate_loss_queue),
+                self.tuning.loss_hold,
             )
         };
         self.expanded_target_samples = self.expanded_target_samples.max(target);
@@ -2796,14 +3477,15 @@ impl AdaptivePlaybackStream {
 
     fn adaptive_target_samples(&self, now: Instant) -> usize {
         if self.expanded_target_until.is_some_and(|until| now < until) {
-            self.expanded_target_samples.max(target_queue_samples())
+            self.expanded_target_samples
+                .max(target_queue_samples(self.tuning))
         } else {
-            target_queue_samples()
+            target_queue_samples(self.tuning)
         }
     }
 
     fn enforce_hard_bound(&mut self, now: Instant, stats: &mut LivePlaybackMixerStats) {
-        let hard_bound = samples_for_duration(LIVE_PLAYBACK_HARD_QUEUE_BOUND);
+        let hard_bound = samples_for_duration(self.tuning.hard_queue_bound);
         let queued = self.queued_samples();
         if queued <= hard_bound {
             return;
@@ -2811,7 +3493,7 @@ impl AdaptivePlaybackStream {
 
         let trim_to = self
             .adaptive_target_samples(now)
-            .max(samples_for_duration(LIVE_PLAYBACK_DRED_HORIZON));
+            .max(samples_for_duration(self.tuning.dred_horizon));
         let drop = queued.saturating_sub(trim_to);
         self.drop_oldest(drop);
         stats.hard_trim_count = stats.hard_trim_count.saturating_add(1);
@@ -2885,11 +3567,15 @@ impl MonoSampleQueue {
         self.drain_range(0, samples);
     }
 
-    fn find_silence_skip(&self, excess_samples: usize) -> Option<(usize, usize)> {
-        let min_gap = samples_for_duration(LIVE_PLAYBACK_SILENCE_MIN_GAP);
-        let guard = samples_for_duration(LIVE_PLAYBACK_SILENCE_GUARD);
-        let max_skip = samples_for_duration(LIVE_PLAYBACK_SILENCE_MAX_SKIP);
-        let min_skip = samples_for_duration(LIVE_PLAYBACK_SILENCE_MIN_SKIP);
+    fn find_silence_skip(
+        &self,
+        tuning: LiveAudioTuning,
+        excess_samples: usize,
+    ) -> Option<(usize, usize)> {
+        let min_gap = samples_for_duration(tuning.silence_min_gap);
+        let guard = samples_for_duration(tuning.silence_guard);
+        let max_skip = samples_for_duration(tuning.silence_max_skip);
+        let min_skip = samples_for_duration(tuning.silence_min_skip);
         let mut cursor = 0usize;
         let mut run_start = 0usize;
         let mut run_len = 0usize;
@@ -2920,9 +3606,9 @@ impl MonoSampleQueue {
         None
     }
 
-    fn ramp_around_skip(&mut self, skip_start: usize, skip_len: usize) {
+    fn ramp_around_skip(&mut self, tuning: LiveAudioTuning, skip_start: usize, skip_len: usize) {
         let total = self.frames();
-        let fade = samples_for_duration(LIVE_PLAYBACK_SILENCE_RAMP)
+        let fade = samples_for_duration(tuning.silence_ramp)
             .min(skip_start)
             .min(total.saturating_sub(skip_start.saturating_add(skip_len)));
         if fade == 0 {
@@ -3074,8 +3760,8 @@ unsafe impl Adapter<'_, f32> for MonoResamplerOutput {
     }
 }
 
-fn target_queue_samples() -> usize {
-    samples_for_duration(LIVE_PLAYBACK_TARGET_QUEUE)
+fn target_queue_samples(tuning: LiveAudioTuning) -> usize {
+    samples_for_duration(tuning.target_queue)
 }
 
 fn samples_for_duration(duration: Duration) -> usize {
@@ -3094,8 +3780,21 @@ fn duration_to_ms(duration: Duration) -> u64 {
     duration.as_millis().min(u128::from(u64::MAX)) as u64
 }
 
-fn ratio_for_correction(correction: f64) -> f64 {
-    let correction = correction.clamp(0.0, LIVE_PLAYBACK_MAX_SPEED_UP);
+fn validate_duration_ms(
+    name: &str,
+    duration: Duration,
+    min_ms: u64,
+    max_ms: u64,
+) -> Result<(), String> {
+    let millis = duration_to_ms(duration);
+    if millis < min_ms || millis > max_ms {
+        return Err(format!("{name} must be between {min_ms} and {max_ms}"));
+    }
+    Ok(())
+}
+
+fn ratio_for_correction(correction: f64, tuning: LiveAudioTuning) -> f64 {
+    let correction = correction.clamp(0.0, tuning.max_speed_up);
     1.0 / (1.0 + correction)
 }
 
@@ -3127,6 +3826,1657 @@ fn soft_limit(sample: f32) -> f32 {
     let excess = magnitude - THRESHOLD;
     let limited = THRESHOLD + headroom * (excess / (excess + headroom));
     sample.signum() * limited.min(1.0)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LiveAudioSimulationScenario {
+    ConstantSpeech,
+    AlternatingSpeech,
+    LossySpeech,
+    BacklogSilence,
+    GroupChat,
+}
+
+impl LiveAudioSimulationScenario {
+    pub const NAMES: [&'static str; 5] = [
+        "constant_speech",
+        "alternating_speech",
+        "lossy_speech",
+        "backlog_silence",
+        "group_chat",
+    ];
+
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "constant_speech" => Some(Self::ConstantSpeech),
+            "alternating_speech" => Some(Self::AlternatingSpeech),
+            "lossy_speech" => Some(Self::LossySpeech),
+            "backlog_silence" => Some(Self::BacklogSilence),
+            "group_chat" => Some(Self::GroupChat),
+            _ => None,
+        }
+    }
+
+    pub fn as_name(self) -> &'static str {
+        match self {
+            Self::ConstantSpeech => "constant_speech",
+            Self::AlternatingSpeech => "alternating_speech",
+            Self::LossySpeech => "lossy_speech",
+            Self::BacklogSilence => "backlog_silence",
+            Self::GroupChat => "group_chat",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LiveAudioPacketLossProfile {
+    ScenarioDefault,
+    None,
+    MildRandom,
+    ModerateRandom,
+    SevereRandom,
+    Random30,
+    Random45,
+    Random60,
+    BurstyWifi,
+    CongestedWifi,
+    MobileHandoff,
+}
+
+impl LiveAudioPacketLossProfile {
+    pub const NAMES: [&'static str; 11] = [
+        "scenario_default",
+        "none",
+        "mild_random",
+        "moderate_random",
+        "severe_random",
+        "random_30",
+        "random_45",
+        "random_60",
+        "bursty_wifi",
+        "congested_wifi",
+        "mobile_handoff",
+    ];
+
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "scenario_default" => Some(Self::ScenarioDefault),
+            "none" => Some(Self::None),
+            "mild_random" => Some(Self::MildRandom),
+            "moderate_random" => Some(Self::ModerateRandom),
+            "severe_random" => Some(Self::SevereRandom),
+            "random_30" => Some(Self::Random30),
+            "random_45" => Some(Self::Random45),
+            "random_60" => Some(Self::Random60),
+            "bursty_wifi" => Some(Self::BurstyWifi),
+            "congested_wifi" => Some(Self::CongestedWifi),
+            "mobile_handoff" => Some(Self::MobileHandoff),
+            _ => None,
+        }
+    }
+
+    pub fn as_name(self) -> &'static str {
+        match self {
+            Self::ScenarioDefault => "scenario_default",
+            Self::None => "none",
+            Self::MildRandom => "mild_random",
+            Self::ModerateRandom => "moderate_random",
+            Self::SevereRandom => "severe_random",
+            Self::Random30 => "random_30",
+            Self::Random45 => "random_45",
+            Self::Random60 => "random_60",
+            Self::BurstyWifi => "bursty_wifi",
+            Self::CongestedWifi => "congested_wifi",
+            Self::MobileHandoff => "mobile_handoff",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct LiveAudioSimulationConfig {
+    pub scenario: LiveAudioSimulationScenario,
+    pub tuning: LiveAudioTuning,
+    pub duration: Duration,
+    pub streams: usize,
+    pub seed: u64,
+    pub packet_loss: LiveAudioPacketLossProfile,
+    pub max_amplification: f32,
+    pub denoise: bool,
+    pub auto_gain: bool,
+}
+
+impl Default for LiveAudioSimulationConfig {
+    fn default() -> Self {
+        Self {
+            scenario: LiveAudioSimulationScenario::ConstantSpeech,
+            tuning: LiveAudioTuning::default(),
+            duration: Duration::from_secs(10),
+            streams: 1,
+            seed: 0x746f_6d63_6861_7402,
+            packet_loss: LiveAudioPacketLossProfile::ScenarioDefault,
+            max_amplification: DEFAULT_LIVE_MAX_AMPLIFICATION,
+            denoise: true,
+            auto_gain: true,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct LiveAudioSimulationReport {
+    pub scenario: &'static str,
+    pub generated_frames: u64,
+    pub queued_frames: u64,
+    pub delivered_frames: u64,
+    pub suppressed_frames: u64,
+    pub lost_frames: u64,
+    pub reordered_frames: u64,
+    pub late_frames: u64,
+    pub missing_frames: u64,
+    pub output_samples: u64,
+    pub output_ms: u64,
+    pub rms: f32,
+    pub peak: f32,
+    pub max_adjacent_delta: f32,
+    pub non_finite_samples: u64,
+    pub clipped_samples: u64,
+    pub max_queue_ms: u64,
+    pub queue_area_ms: f64,
+    pub final_snapshot: LivePlaybackSnapshot,
+}
+
+#[derive(Clone, Debug)]
+pub struct LiveAudioSimulationOutput {
+    pub report: LiveAudioSimulationReport,
+    pub samples: Vec<f32>,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct LiveAudioDirectSampleSimulationConfig {
+    pub tuning: LiveAudioTuning,
+    pub seed: u64,
+    pub packet_loss: LiveAudioPacketLossProfile,
+    pub max_amplification: f32,
+    pub denoise: bool,
+    pub auto_gain: bool,
+}
+
+impl Default for LiveAudioDirectSampleSimulationConfig {
+    fn default() -> Self {
+        Self {
+            tuning: LiveAudioTuning::default(),
+            seed: 0x746f_6d63_6861_7403,
+            packet_loss: LiveAudioPacketLossProfile::None,
+            max_amplification: DEFAULT_LIVE_MAX_AMPLIFICATION,
+            denoise: true,
+            auto_gain: true,
+        }
+    }
+}
+
+pub struct LiveAudioTraceWriter {
+    writer: BufWriter<fs::File>,
+}
+
+impl LiveAudioTraceWriter {
+    pub fn create(path: impl AsRef<Path>) -> Result<Self, String> {
+        let path = path.as_ref();
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).map_err(|error| {
+                format!(
+                    "failed to create live audio trace directory {}: {error}",
+                    parent.display()
+                )
+            })?;
+        }
+        let file = fs::File::create(path).map_err(|error| {
+            format!(
+                "failed to create live audio trace {}: {error}",
+                path.display()
+            )
+        })?;
+        Ok(Self {
+            writer: BufWriter::new(file),
+        })
+    }
+
+    fn write_event(&mut self, event: impl fmt::Display) {
+        let _ = writeln!(self.writer, "{event}");
+    }
+
+    pub fn flush(&mut self) -> Result<(), String> {
+        self.writer
+            .flush()
+            .map_err(|error| format!("failed to flush live audio trace: {error}"))
+    }
+}
+
+fn trace_time_ms(start: Instant, now: Instant) -> u64 {
+    duration_to_ms(now.saturating_duration_since(start))
+}
+
+fn trace_source_name(source: DecodedFrameSource) -> &'static str {
+    match source {
+        DecodedFrameSource::Normal => "normal",
+        DecodedFrameSource::Dred => "dred",
+        DecodedFrameSource::Plc => "plc",
+        DecodedFrameSource::DecodeError => "decode_error",
+    }
+}
+
+fn max_adjacent_delta(samples: &[f32]) -> f32 {
+    let mut max_delta: f32 = 0.0;
+    let mut last: Option<f32> = None;
+    for sample in samples {
+        if let Some(last_sample) = last {
+            max_delta = max_delta.max((*sample - last_sample).abs());
+        }
+        last = Some(*sample);
+    }
+    max_delta
+}
+
+fn trace_direct_run_start(
+    trace: &mut Option<LiveAudioTraceWriter>,
+    config: LiveAudioDirectSampleSimulationConfig,
+    input_samples: usize,
+    frame_count: usize,
+) {
+    let Some(trace) = trace else {
+        return;
+    };
+    trace.write_event(jsony::object! {
+        event: "direct_run_start",
+        sample_rate: SAMPLE_RATE,
+        frame_samples: FRAME_SAMPLES,
+        opus_frame_samples: LIVE_OPUS_FRAME_SAMPLES,
+        input_samples,
+        frame_count,
+        loss: config.packet_loss.as_name(),
+        max_amplification: config.max_amplification,
+        denoise: config.denoise,
+        auto_gain: config.auto_gain,
+        capture_silence_gate: config.tuning.capture_silence_gate,
+        playback_silence_skip: config.tuning.playback_silence_skip,
+        adaptive_catch_up: config.tuning.adaptive_catch_up,
+    });
+}
+
+fn trace_capture_frame(
+    trace: &mut Option<LiveAudioTraceWriter>,
+    start: Instant,
+    now: Instant,
+    stream_id: u32,
+    input_samples: &[f32],
+    gain: f32,
+    config: LiveAudioSimulationConfig,
+) {
+    let Some(trace) = trace else {
+        return;
+    };
+    trace.write_event(jsony::object! {
+        event: "capture_frame",
+        time_ms: trace_time_ms(start, now),
+        stream_id,
+        samples: input_samples.len(),
+        input_rms: rms_i16_scale(input_samples),
+        input_peak: peak_i16_scale(input_samples),
+        input_max_delta: max_adjacent_delta(input_samples),
+        gain,
+        max_amplification: config.max_amplification,
+        denoise: config.denoise,
+        auto_gain: config.auto_gain,
+    });
+}
+
+#[allow(clippy::too_many_arguments)]
+fn trace_network_decision(
+    trace: &mut Option<LiveAudioTraceWriter>,
+    start: Instant,
+    now: Instant,
+    stream_id: u32,
+    sequence: u32,
+    flags: u8,
+    silence_ranges: u64,
+    payload_bytes: usize,
+    silence_hint: bool,
+    dropped: bool,
+    delay: Duration,
+) {
+    let Some(trace) = trace else {
+        return;
+    };
+    trace.write_event(jsony::object! {
+        event: "network_decision",
+        time_ms: trace_time_ms(start, now),
+        stream_id,
+        sequence,
+        flags,
+        silence_ranges,
+        payload_bytes,
+        silence_hint,
+        dropped,
+        delay_ms: duration_to_ms(delay),
+    });
+}
+
+#[allow(clippy::too_many_arguments)]
+fn trace_encoded_packet(
+    trace: &mut Option<LiveAudioTraceWriter>,
+    start: Instant,
+    now: Instant,
+    stream_id: u32,
+    sequence: u32,
+    flags: u8,
+    silence_ranges: u64,
+    payload_bytes: usize,
+    silence_hint: bool,
+) {
+    let Some(trace) = trace else {
+        return;
+    };
+    trace.write_event(jsony::object! {
+        event: "encoded_packet",
+        time_ms: trace_time_ms(start, now),
+        stream_id,
+        sequence,
+        flags,
+        silence_ranges,
+        payload_bytes,
+        silence_hint,
+    });
+}
+
+#[allow(clippy::too_many_arguments)]
+fn trace_packet_delivery(
+    trace: &mut Option<LiveAudioTraceWriter>,
+    start: Instant,
+    now: Instant,
+    stream_id: u32,
+    sequence: u32,
+    flags: u8,
+    reordered: bool,
+    outcome: &Option<InsertOutcome>,
+) {
+    let Some(trace) = trace else {
+        return;
+    };
+    let outcome = match outcome {
+        Some(InsertOutcome::Accepted) => "accepted",
+        Some(InsertOutcome::Duplicate) => "duplicate",
+        Some(InsertOutcome::Late) => "late",
+        Some(InsertOutcome::BufferFull) => "buffer_full",
+        None => "decoder_unavailable",
+    };
+    trace.write_event(jsony::object! {
+        event: "packet_delivery",
+        time_ms: trace_time_ms(start, now),
+        stream_id,
+        sequence,
+        flags,
+        reordered,
+        outcome,
+    });
+}
+
+fn trace_jitter_item(
+    trace: &mut Option<LiveAudioTraceWriter>,
+    start: Instant,
+    now: Instant,
+    stream_id: u32,
+    sequence: u32,
+    item: &'static str,
+    flags: u8,
+) {
+    let Some(trace) = trace else {
+        return;
+    };
+    trace.write_event(jsony::object! {
+        event: "jitter_item",
+        time_ms: trace_time_ms(start, now),
+        stream_id,
+        sequence,
+        item,
+        flags,
+    });
+}
+
+fn trace_fast_forward(
+    trace: &mut Option<LiveAudioTraceWriter>,
+    start: Instant,
+    now: Instant,
+    stream_id: u32,
+    from_sequence: u32,
+    to_sequence: u32,
+    skipped_packets: u32,
+) {
+    let Some(trace) = trace else {
+        return;
+    };
+    trace.write_event(jsony::object! {
+        event: "jitter_item",
+        time_ms: trace_time_ms(start, now),
+        stream_id,
+        item: "fast_forward",
+        from_sequence,
+        to_sequence,
+        skipped_packets,
+    });
+}
+
+fn trace_decoder_reset(
+    trace: &mut Option<LiveAudioTraceWriter>,
+    start: Instant,
+    now: Instant,
+    stream_id: u32,
+    sequence: u32,
+) {
+    let Some(trace) = trace else {
+        return;
+    };
+    trace.write_event(jsony::object! {
+        event: "decoder_reset",
+        time_ms: trace_time_ms(start, now),
+        stream_id,
+        sequence,
+    });
+}
+
+#[allow(clippy::too_many_arguments)]
+fn trace_dred_parse(
+    trace: &mut Option<LiveAudioTraceWriter>,
+    start: Instant,
+    now: Instant,
+    stream_id: u32,
+    missing_sequence: u32,
+    future_sequence: u32,
+    requested_offset_samples: u32,
+    parsed_offset_samples: u32,
+    dred_end: i32,
+    status: &'static str,
+) {
+    let Some(trace) = trace else {
+        return;
+    };
+    trace.write_event(jsony::object! {
+        event: "dred_parse",
+        time_ms: trace_time_ms(start, now),
+        stream_id,
+        missing_sequence,
+        future_sequence,
+        requested_offset_samples,
+        parsed_offset_samples,
+        dred_end,
+        status,
+    });
+}
+
+fn trace_dred_skip(
+    trace: &mut Option<LiveAudioTraceWriter>,
+    start: Instant,
+    now: Instant,
+    stream_id: u32,
+    missing_sequence: u32,
+    future_sequence: Option<u32>,
+    reason: &'static str,
+) {
+    let Some(trace) = trace else {
+        return;
+    };
+    trace.write_event(jsony::object! {
+        event: "dred_skip",
+        time_ms: trace_time_ms(start, now),
+        stream_id,
+        missing_sequence,
+        future_sequence,
+        reason,
+    });
+}
+
+#[allow(clippy::too_many_arguments)]
+fn trace_decode_output(
+    trace: &mut Option<LiveAudioTraceWriter>,
+    start: Instant,
+    now: Instant,
+    stream_id: u32,
+    sequence: u32,
+    source: DecodedFrameSource,
+    decoded_samples: usize,
+    silence_hint: bool,
+    error: Option<String>,
+    samples: &[f32],
+) {
+    let Some(trace) = trace else {
+        return;
+    };
+    trace.write_event(jsony::object! {
+        event: match source {
+            DecodedFrameSource::Dred => "dred_decode",
+            DecodedFrameSource::Normal => "normal_decode",
+            DecodedFrameSource::Plc => "plc_decode",
+            DecodedFrameSource::DecodeError => "decode_error",
+        },
+        time_ms: trace_time_ms(start, now),
+        stream_id,
+        sequence,
+        source: trace_source_name(source),
+        decoded_samples,
+        silence_hint,
+        rms: rms_normalized(samples),
+        peak: peak_normalized(samples),
+        max_delta: max_adjacent_delta(samples),
+        error: error.as_deref(),
+    });
+}
+
+#[allow(clippy::too_many_arguments)]
+fn trace_mixer_queue(
+    trace: &mut Option<LiveAudioTraceWriter>,
+    start: Instant,
+    now: Instant,
+    stream_id: u32,
+    source: DecodedFrameSource,
+    silence_hint: bool,
+    samples: &[f32],
+    max_queue_ms: u64,
+) {
+    let Some(trace) = trace else {
+        return;
+    };
+    trace.write_event(jsony::object! {
+        event: "mixer_queue",
+        time_ms: trace_time_ms(start, now),
+        stream_id,
+        source: trace_source_name(source),
+        silence_hint,
+        samples: samples.len(),
+        rms: rms_normalized(samples),
+        peak: peak_normalized(samples),
+        max_delta: max_adjacent_delta(samples),
+        max_queue_ms,
+    });
+}
+
+fn trace_output_window(
+    trace: &mut Option<LiveAudioTraceWriter>,
+    start: Instant,
+    now: Instant,
+    window: &OnlineAudioMetrics,
+    snapshot: &LivePlaybackSnapshot,
+) {
+    let Some(trace) = trace else {
+        return;
+    };
+    trace.write_event(jsony::object! {
+        event: "output_window",
+        time_ms: trace_time_ms(start, now),
+        samples: window.samples,
+        rms: window.rms(),
+        peak: window.peak,
+        max_delta: window.max_adjacent_delta,
+        non_finite: window.non_finite_samples,
+        clipped: window.clipped_samples,
+        active_streams: snapshot.active_streams,
+        max_queue_ms: snapshot.max_queue_ms,
+        correction_percent: snapshot.correction_percent,
+        dred_recoveries: snapshot.dred_recoveries,
+        plc_fallbacks: snapshot.plc_fallbacks,
+        hard_trim_count: snapshot.hard_trim_count,
+        silence_skip_count: snapshot.silence_skip_count,
+        skipped_silence_ms: snapshot.skipped_silence_ms,
+    });
+}
+
+pub fn run_live_audio_simulation(
+    config: LiveAudioSimulationConfig,
+) -> Result<LiveAudioSimulationReport, String> {
+    let speech_frames = load_live_audio_simulation_speech_frames()?;
+    run_live_audio_simulation_with_speech(config, &speech_frames)
+}
+
+pub fn run_live_audio_simulation_with_speech(
+    config: LiveAudioSimulationConfig,
+    speech_frames: &[Vec<f32>],
+) -> Result<LiveAudioSimulationReport, String> {
+    Ok(run_live_audio_simulation_inner(config, speech_frames, false)?.report)
+}
+
+pub fn run_live_audio_simulation_with_speech_output(
+    config: LiveAudioSimulationConfig,
+    speech_frames: &[Vec<f32>],
+) -> Result<LiveAudioSimulationOutput, String> {
+    run_live_audio_simulation_inner(config, speech_frames, true)
+}
+
+pub fn run_live_audio_direct_sample_simulation_output(
+    config: LiveAudioDirectSampleSimulationConfig,
+    input_pcm: &[f32],
+) -> Result<LiveAudioSimulationOutput, String> {
+    let mut trace = None;
+    run_live_audio_direct_sample_simulation_output_inner(config, input_pcm, &mut trace)
+}
+
+pub fn run_live_audio_direct_sample_simulation_output_with_trace(
+    config: LiveAudioDirectSampleSimulationConfig,
+    input_pcm: &[f32],
+    trace_path: impl AsRef<Path>,
+) -> Result<LiveAudioSimulationOutput, String> {
+    let mut trace = Some(LiveAudioTraceWriter::create(trace_path)?);
+    let output =
+        run_live_audio_direct_sample_simulation_output_inner(config, input_pcm, &mut trace);
+    if let Some(trace) = &mut trace {
+        trace.flush()?;
+    }
+    output
+}
+
+fn run_live_audio_direct_sample_simulation_output_inner(
+    config: LiveAudioDirectSampleSimulationConfig,
+    input_pcm: &[f32],
+    trace: &mut Option<LiveAudioTraceWriter>,
+) -> Result<LiveAudioSimulationOutput, String> {
+    debug_assert!(config.tuning.validate().is_ok());
+    if input_pcm.len() < FRAME_SAMPLES {
+        return Err(format!(
+            "direct sample simulation needs at least {FRAME_SAMPLES} samples"
+        ));
+    }
+
+    let frame_count = input_pcm.len().div_ceil(FRAME_SAMPLES);
+    let frame_duration = Duration::from_secs_f64(FRAME_SAMPLES as f64 / SAMPLE_RATE as f64);
+    let input_duration = frame_duration.saturating_mul(frame_count as u32);
+    let drain_duration =
+        config.tuning.initial_buffer + config.tuning.max_reorder_delay + config.tuning.target_queue;
+    let drain_frames = frames_for_duration(drain_duration).saturating_add(2);
+    let sim_config = LiveAudioSimulationConfig {
+        scenario: LiveAudioSimulationScenario::ConstantSpeech,
+        tuning: config.tuning,
+        duration: input_duration,
+        streams: 1,
+        seed: config.seed,
+        packet_loss: config.packet_loss,
+        max_amplification: config.max_amplification,
+        denoise: config.denoise,
+        auto_gain: config.auto_gain,
+    };
+
+    let mixer = Arc::new(Mutex::new(LivePlaybackMixer::with_tuning(config.tuning)));
+    let mut decode_streams = HashMap::new();
+    let mut decode_frame = vec![0i16; MAX_OPUS_DECODE_SAMPLES];
+    let mut state = SimStreamState::new(sim_config, simulation_encoder_profile(sim_config))?;
+    let mut rng = SimRng::new(config.seed);
+    let mut metrics = OnlineAudioMetrics::default();
+    let start = Instant::now();
+    let mut report = LiveAudioSimulationReport {
+        scenario: "direct_sample",
+        ..Default::default()
+    };
+    let mut output_samples = Vec::with_capacity(
+        frame_count
+            .saturating_add(drain_frames)
+            .saturating_mul(FRAME_SAMPLES),
+    );
+    trace_direct_run_start(trace, config, input_pcm.len(), frame_count);
+
+    for frame_index in 0..frame_count.saturating_add(drain_frames) {
+        let now = start + frame_duration.saturating_mul(frame_index as u32);
+        if frame_index < frame_count {
+            let offset = frame_index.saturating_mul(FRAME_SAMPLES);
+            let frame_storage;
+            let frame = if offset + FRAME_SAMPLES <= input_pcm.len() {
+                &input_pcm[offset..offset + FRAME_SAMPLES]
+            } else {
+                frame_storage = {
+                    let mut padded = vec![0.0f32; FRAME_SAMPLES];
+                    let remaining = input_pcm.len().saturating_sub(offset);
+                    padded[..remaining].copy_from_slice(&input_pcm[offset..]);
+                    padded
+                };
+                frame_storage.as_slice()
+            };
+            report.generated_frames = report.generated_frames.saturating_add(1);
+            state.encode_and_queue_frame(
+                sim_config,
+                1,
+                frame,
+                now,
+                start,
+                &mut rng,
+                &mut report,
+                trace,
+            )?;
+        }
+
+        drain_simulation_network_and_playback(
+            now,
+            start,
+            std::slice::from_mut(&mut state),
+            sim_config.tuning,
+            &mixer,
+            &mut decode_streams,
+            &mut decode_frame,
+            &mut report,
+            trace,
+        );
+
+        let mut mixer = mixer
+            .lock()
+            .map_err(|_| "direct sample simulation mixer lock poisoned")?;
+        let mut window = OnlineAudioMetrics::default();
+        for _ in 0..FRAME_SAMPLES {
+            let sample = mixer.pop_mixed_sample(now);
+            metrics.observe(sample);
+            window.observe(sample);
+            output_samples.push(sample);
+        }
+        let snapshot = mixer.snapshot_at(now);
+        trace_output_window(trace, start, now, &window, &snapshot);
+        report.max_queue_ms = report.max_queue_ms.max(snapshot.max_queue_ms);
+        report.queue_area_ms += snapshot.max_queue_ms as f64 * frame_duration.as_secs_f64();
+    }
+
+    let final_now = start + input_duration + drain_duration;
+    report.final_snapshot = mixer
+        .lock()
+        .map_err(|_| "direct sample simulation mixer lock poisoned")?
+        .snapshot_at(final_now);
+    report.max_queue_ms = report.max_queue_ms.max(report.final_snapshot.max_queue_ms);
+    report.output_samples = metrics.samples;
+    report.output_ms = samples_to_ms(metrics.samples as usize);
+    report.rms = metrics.rms();
+    report.peak = metrics.peak;
+    report.max_adjacent_delta = metrics.max_adjacent_delta;
+    report.non_finite_samples = metrics.non_finite_samples;
+    report.clipped_samples = metrics.clipped_samples;
+    report.suppressed_frames = state.suppressed_frames();
+
+    Ok(LiveAudioSimulationOutput {
+        report,
+        samples: output_samples,
+    })
+}
+
+pub fn render_live_audio_simulation_input(
+    config: LiveAudioSimulationConfig,
+    speech_frames: &[Vec<f32>],
+) -> Result<Vec<f32>, String> {
+    debug_assert!(config.tuning.validate().is_ok());
+    validate_live_audio_simulation_speech_frames(speech_frames)?;
+
+    let streams = simulation_streams(config);
+    let total_frames = frames_for_duration(config.duration).max(1);
+    let mut samples = Vec::with_capacity(total_frames.saturating_mul(FRAME_SAMPLES));
+    for frame_index in 0..total_frames {
+        let mut frame_samples = vec![0.0f32; FRAME_SAMPLES];
+        for stream_index in 0..streams {
+            if let Some(frame) =
+                simulation_frame(config.scenario, stream_index, frame_index, speech_frames)
+            {
+                for (mixed, sample) in frame_samples.iter_mut().zip(frame.samples) {
+                    *mixed += sample;
+                }
+            }
+        }
+        let stream_gain = (streams.max(1) as f32).sqrt().recip();
+        samples.extend(
+            frame_samples
+                .into_iter()
+                .map(|sample| soft_limit(sample * stream_gain)),
+        );
+    }
+
+    Ok(samples)
+}
+
+fn run_live_audio_simulation_inner(
+    config: LiveAudioSimulationConfig,
+    speech_frames: &[Vec<f32>],
+    collect_output: bool,
+) -> Result<LiveAudioSimulationOutput, String> {
+    debug_assert!(config.tuning.validate().is_ok());
+    validate_live_audio_simulation_speech_frames(speech_frames)?;
+
+    let mixer = Arc::new(Mutex::new(LivePlaybackMixer::with_tuning(config.tuning)));
+    let mut decode_streams = HashMap::new();
+    let mut decode_frame = vec![0i16; MAX_OPUS_DECODE_SAMPLES];
+    let network_profile = simulation_encoder_profile(config);
+    let mut states = (0..simulation_streams(config))
+        .map(|_| SimStreamState::new(config, network_profile))
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut rng = SimRng::new(config.seed);
+    let mut metrics = OnlineAudioMetrics::default();
+    let start = Instant::now();
+    let total_frames = frames_for_duration(config.duration).max(1);
+    let prebuffer_frames = simulation_prebuffer_frames(config);
+    let frame_duration = Duration::from_secs_f64(FRAME_SAMPLES as f64 / SAMPLE_RATE as f64);
+    let mut report = LiveAudioSimulationReport {
+        scenario: config.scenario.as_name(),
+        ..Default::default()
+    };
+    let mut output_samples = collect_output
+        .then(|| Vec::with_capacity(total_frames.saturating_mul(FRAME_SAMPLES)))
+        .unwrap_or_default();
+
+    for frame_index in 0..prebuffer_frames {
+        let now = start;
+        process_simulation_input_frame(
+            config,
+            frame_index,
+            now,
+            &mut states,
+            &mixer,
+            &mut decode_streams,
+            &mut decode_frame,
+            &mut rng,
+            &mut report,
+            speech_frames,
+        )?;
+    }
+
+    for frame_index in 0..total_frames {
+        let now = start + frame_duration.saturating_mul(frame_index as u32);
+        process_simulation_input_frame(
+            config,
+            frame_index + prebuffer_frames,
+            now,
+            &mut states,
+            &mixer,
+            &mut decode_streams,
+            &mut decode_frame,
+            &mut rng,
+            &mut report,
+            speech_frames,
+        )?;
+
+        let mut mixer = mixer
+            .lock()
+            .map_err(|_| "live simulation mixer lock poisoned")?;
+        for _ in 0..FRAME_SAMPLES {
+            let sample = mixer.pop_mixed_sample(now);
+            metrics.observe(sample);
+            if collect_output {
+                output_samples.push(sample);
+            }
+        }
+        let snapshot = mixer.snapshot_at(now);
+        report.max_queue_ms = report.max_queue_ms.max(snapshot.max_queue_ms);
+        report.queue_area_ms += snapshot.max_queue_ms as f64 * frame_duration.as_secs_f64();
+    }
+
+    let final_now = start + config.duration;
+    report.final_snapshot = mixer
+        .lock()
+        .map_err(|_| "live simulation mixer lock poisoned")?
+        .snapshot_at(final_now);
+    report.max_queue_ms = report.max_queue_ms.max(report.final_snapshot.max_queue_ms);
+    report.output_samples = metrics.samples;
+    report.output_ms = samples_to_ms(metrics.samples as usize);
+    report.rms = metrics.rms();
+    report.peak = metrics.peak;
+    report.max_adjacent_delta = metrics.max_adjacent_delta;
+    report.non_finite_samples = metrics.non_finite_samples;
+    report.clipped_samples = metrics.clipped_samples;
+    report.suppressed_frames = states
+        .iter()
+        .map(SimStreamState::suppressed_frames)
+        .sum::<u64>();
+    Ok(LiveAudioSimulationOutput {
+        report,
+        samples: output_samples,
+    })
+}
+
+pub fn load_live_audio_simulation_speech_frames() -> Result<Vec<Vec<f32>>, String> {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/sample-001.opus");
+    let pcm = decode_sample_asset_with_ffmpeg(&path)?;
+    Ok(split_pcm_to_simulation_frames(&pcm, FRAME_SAMPLES * 4096))
+}
+
+pub fn load_live_audio_simulation_sample_pcm() -> Result<Vec<f32>, String> {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/sample-001.opus");
+    decode_sample_asset_with_ffmpeg(&path)
+}
+
+pub fn split_pcm_to_simulation_frames(pcm: &[f32], max_samples: usize) -> Vec<Vec<f32>> {
+    let max_frames = (max_samples / FRAME_SAMPLES).max(1);
+    let frames: Vec<&[f32]> = pcm.chunks_exact(FRAME_SAMPLES).collect();
+    let start = frames
+        .iter()
+        .position(|frame| rms_normalized(frame) > 0.005)
+        .unwrap_or(0);
+    frames
+        .into_iter()
+        .skip(start)
+        .take(max_frames)
+        .map(|frame| frame.to_vec())
+        .collect()
+}
+
+fn validate_live_audio_simulation_speech_frames(speech_frames: &[Vec<f32>]) -> Result<(), String> {
+    if speech_frames.is_empty() {
+        return Err("live audio simulation requires at least one speech frame".to_string());
+    }
+    if speech_frames
+        .iter()
+        .any(|frame| frame.len() != FRAME_SAMPLES)
+    {
+        return Err(format!(
+            "live audio simulation speech frames must be {FRAME_SAMPLES} samples"
+        ));
+    }
+    Ok(())
+}
+
+fn normalized_to_i16_scale(samples: &[f32]) -> Vec<f32> {
+    samples
+        .iter()
+        .map(|sample| sample.clamp(-1.0, 1.0) * i16::MAX as f32)
+        .collect()
+}
+
+fn decode_sample_asset_with_ffmpeg(path: &Path) -> Result<Vec<f32>, String> {
+    let output = Command::new("ffmpeg")
+        .arg("-v")
+        .arg("error")
+        .arg("-i")
+        .arg(path)
+        .arg("-ac")
+        .arg("1")
+        .arg("-ar")
+        .arg(SAMPLE_RATE.to_string())
+        .arg("-f")
+        .arg("f32le")
+        .arg("-acodec")
+        .arg("pcm_f32le")
+        .arg("-")
+        .output()
+        .map_err(|error| {
+            format!("failed to execute ffmpeg while loading sample speech: {error}")
+        })?;
+
+    if !output.status.success() {
+        return Err(format!(
+            "ffmpeg failed while decoding {}: {}",
+            path.display(),
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+
+    Ok(output
+        .stdout
+        .chunks_exact(4)
+        .map(|bytes| f32::from_le_bytes(bytes.try_into().unwrap()).clamp(-1.0, 1.0))
+        .collect())
+}
+
+fn simulation_streams(config: LiveAudioSimulationConfig) -> usize {
+    match config.scenario {
+        LiveAudioSimulationScenario::GroupChat => config.streams.max(3),
+        _ => config.streams.max(1),
+    }
+}
+
+fn simulation_prebuffer_frames(config: LiveAudioSimulationConfig) -> usize {
+    match config.scenario {
+        LiveAudioSimulationScenario::BacklogSilence => {
+            frames_for_duration(Duration::from_millis(500))
+        }
+        _ => frames_for_duration(config.tuning.target_queue),
+    }
+}
+
+fn process_simulation_input_frame(
+    config: LiveAudioSimulationConfig,
+    frame_index: usize,
+    now: Instant,
+    states: &mut [SimStreamState],
+    mixer: &Arc<Mutex<LivePlaybackMixer>>,
+    decode_streams: &mut HashMap<u32, LiveDecodeStream>,
+    decode_frame: &mut [i16],
+    rng: &mut SimRng,
+    report: &mut LiveAudioSimulationReport,
+    speech_frames: &[Vec<f32>],
+) -> Result<(), String> {
+    let mut trace = None;
+    for (stream_index, state) in states.iter_mut().enumerate() {
+        let stream_id = (stream_index + 1) as u32;
+        let Some(frame) =
+            simulation_frame(config.scenario, stream_index, frame_index, speech_frames)
+        else {
+            continue;
+        };
+        report.generated_frames = report.generated_frames.saturating_add(1);
+        state.encode_and_queue_frame(
+            config,
+            stream_id,
+            &frame.samples,
+            now,
+            now,
+            rng,
+            report,
+            &mut trace,
+        )?;
+    }
+
+    drain_simulation_network_and_playback(
+        now,
+        now,
+        states,
+        config.tuning,
+        mixer,
+        decode_streams,
+        decode_frame,
+        report,
+        &mut trace,
+    );
+    Ok(())
+}
+
+fn drain_simulation_network_and_playback(
+    now: Instant,
+    trace_start: Instant,
+    states: &mut [SimStreamState],
+    tuning: LiveAudioTuning,
+    mixer: &Arc<Mutex<LivePlaybackMixer>>,
+    decode_streams: &mut HashMap<u32, LiveDecodeStream>,
+    decode_frame: &mut [i16],
+    report: &mut LiveAudioSimulationReport,
+    trace: &mut Option<LiveAudioTraceWriter>,
+) {
+    for (stream_index, state) in states.iter_mut().enumerate() {
+        let stream_id = (stream_index + 1) as u32;
+        state.deliver_ready(
+            now,
+            trace_start,
+            stream_id,
+            tuning,
+            decode_streams,
+            report,
+            trace,
+        );
+    }
+    let before_recovery_frames = mixer
+        .lock()
+        .map(|mixer| {
+            mixer
+                .stats
+                .dred_recoveries
+                .saturating_add(mixer.stats.plc_fallbacks)
+        })
+        .unwrap_or_default();
+    drain_live_decode_streams_with_trace(
+        decode_streams,
+        mixer,
+        decode_frame,
+        now,
+        trace_start,
+        trace,
+    );
+    let after_recovery_frames = mixer
+        .lock()
+        .map(|mixer| {
+            mixer
+                .stats
+                .dred_recoveries
+                .saturating_add(mixer.stats.plc_fallbacks)
+        })
+        .unwrap_or(before_recovery_frames);
+    report.missing_frames = report
+        .missing_frames
+        .saturating_add(after_recovery_frames.saturating_sub(before_recovery_frames));
+}
+
+fn simulation_drops_frame(
+    config: LiveAudioSimulationConfig,
+    stream_id: u32,
+    silence_hint: bool,
+    rng: &mut SimRng,
+    loss_state: &mut SimLossState,
+) -> bool {
+    match config.packet_loss {
+        LiveAudioPacketLossProfile::ScenarioDefault => match config.scenario {
+            LiveAudioSimulationScenario::LossySpeech => {
+                rng.next_f64() < if silence_hint { 0.18 } else { 0.08 }
+            }
+            LiveAudioSimulationScenario::GroupChat => {
+                let stream_bias = 0.02 * f64::from(stream_id.saturating_sub(1));
+                rng.next_f64() < 0.03 + stream_bias
+            }
+            _ => false,
+        },
+        LiveAudioPacketLossProfile::None => false,
+        LiveAudioPacketLossProfile::MildRandom => {
+            rng.next_f64() < if silence_hint { 0.02 } else { 0.01 }
+        }
+        LiveAudioPacketLossProfile::ModerateRandom => {
+            rng.next_f64() < if silence_hint { 0.07 } else { 0.03 }
+        }
+        LiveAudioPacketLossProfile::SevereRandom => {
+            rng.next_f64() < if silence_hint { 0.18 } else { 0.08 }
+        }
+        LiveAudioPacketLossProfile::Random30 => rng.next_f64() < 0.30,
+        LiveAudioPacketLossProfile::Random45 => rng.next_f64() < 0.45,
+        LiveAudioPacketLossProfile::Random60 => rng.next_f64() < 0.60,
+        LiveAudioPacketLossProfile::BurstyWifi => loss_state.sample_gilbert(
+            rng,
+            GilbertLossConfig {
+                good_to_bad: 0.004,
+                bad_to_good: 0.12,
+                loss_good: 0.002,
+                loss_bad: 0.35,
+            },
+        ),
+        LiveAudioPacketLossProfile::CongestedWifi => loss_state.sample_gilbert(
+            rng,
+            GilbertLossConfig {
+                good_to_bad: 0.015,
+                bad_to_good: 0.08,
+                loss_good: 0.01,
+                loss_bad: 0.45,
+            },
+        ),
+        LiveAudioPacketLossProfile::MobileHandoff => loss_state.sample_gilbert(
+            rng,
+            GilbertLossConfig {
+                good_to_bad: 0.002,
+                bad_to_good: 0.05,
+                loss_good: 0.005,
+                loss_bad: 0.70,
+            },
+        ),
+    }
+}
+
+fn simulation_delivery_delay(
+    packet_loss: LiveAudioPacketLossProfile,
+    rng: &mut SimRng,
+) -> Duration {
+    let frame = Duration::from_secs_f64(FRAME_SAMPLES as f64 / SAMPLE_RATE as f64);
+    let delayed_frames = match packet_loss {
+        LiveAudioPacketLossProfile::ScenarioDefault | LiveAudioPacketLossProfile::None => 0,
+        LiveAudioPacketLossProfile::MildRandom => random_delay_frames(rng, 0.03, 0.005, 3, 8),
+        LiveAudioPacketLossProfile::ModerateRandom => random_delay_frames(rng, 0.06, 0.01, 4, 9),
+        LiveAudioPacketLossProfile::SevereRandom => random_delay_frames(rng, 0.08, 0.02, 5, 10),
+        LiveAudioPacketLossProfile::Random30 => random_delay_frames(rng, 0.10, 0.03, 5, 11),
+        LiveAudioPacketLossProfile::Random45 => random_delay_frames(rng, 0.12, 0.04, 6, 12),
+        LiveAudioPacketLossProfile::Random60 => random_delay_frames(rng, 0.14, 0.05, 7, 14),
+        LiveAudioPacketLossProfile::BurstyWifi => random_delay_frames(rng, 0.12, 0.04, 4, 9),
+        LiveAudioPacketLossProfile::CongestedWifi => random_delay_frames(rng, 0.18, 0.06, 6, 12),
+        LiveAudioPacketLossProfile::MobileHandoff => random_delay_frames(rng, 0.08, 0.03, 12, 30),
+    };
+    frame.saturating_mul(delayed_frames)
+}
+
+fn random_delay_frames(
+    rng: &mut SimRng,
+    moderate_probability: f64,
+    severe_probability: f64,
+    moderate_frames: u32,
+    severe_frames: u32,
+) -> u32 {
+    let sample = rng.next_f64();
+    if sample < severe_probability {
+        severe_frames
+    } else if sample < severe_probability + moderate_probability {
+        moderate_frames
+    } else {
+        0
+    }
+}
+
+fn simulation_encoder_profile(config: LiveAudioSimulationConfig) -> EncoderNetworkProfile {
+    match config.packet_loss {
+        LiveAudioPacketLossProfile::None => EncoderNetworkProfile::EXCELLENT,
+        LiveAudioPacketLossProfile::MildRandom => EncoderNetworkProfile::DEGRADED,
+        LiveAudioPacketLossProfile::ModerateRandom => EncoderNetworkProfile::SEVERE,
+        LiveAudioPacketLossProfile::SevereRandom
+        | LiveAudioPacketLossProfile::Random30
+        | LiveAudioPacketLossProfile::Random45
+        | LiveAudioPacketLossProfile::Random60
+        | LiveAudioPacketLossProfile::BurstyWifi
+        | LiveAudioPacketLossProfile::CongestedWifi
+        | LiveAudioPacketLossProfile::MobileHandoff => EncoderNetworkProfile::CRITICAL,
+        LiveAudioPacketLossProfile::ScenarioDefault => match config.scenario {
+            LiveAudioSimulationScenario::LossySpeech | LiveAudioSimulationScenario::GroupChat => {
+                EncoderNetworkProfile::CRITICAL
+            }
+            _ => EncoderNetworkProfile::EXCELLENT,
+        },
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct GilbertLossConfig {
+    good_to_bad: f64,
+    bad_to_good: f64,
+    loss_good: f64,
+    loss_bad: f64,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct SimLossState {
+    bad: bool,
+}
+
+impl SimLossState {
+    fn sample_gilbert(&mut self, rng: &mut SimRng, config: GilbertLossConfig) -> bool {
+        let transition = rng.next_f64();
+        if self.bad {
+            if transition < config.bad_to_good {
+                self.bad = false;
+            }
+        } else if transition < config.good_to_bad {
+            self.bad = true;
+        }
+        let loss = if self.bad {
+            config.loss_bad
+        } else {
+            config.loss_good
+        };
+        rng.next_f64() < loss
+    }
+}
+
+struct SimStreamState {
+    capture: LiveEncoderPipeline,
+    capture_stats: AudioStats,
+    loss: SimLossState,
+    network: SimNetworkPipe,
+    next_sequence: u32,
+}
+
+impl SimStreamState {
+    fn new(
+        config: LiveAudioSimulationConfig,
+        network_profile: EncoderNetworkProfile,
+    ) -> Result<Self, String> {
+        Ok(Self {
+            capture: build_live_encoder_pipeline(
+                config.tuning,
+                config.denoise,
+                config.max_amplification,
+                config.auto_gain,
+                network_profile,
+            )?,
+            capture_stats: AudioStats::new(),
+            loss: SimLossState::default(),
+            network: SimNetworkPipe::default(),
+            next_sequence: 0,
+        })
+    }
+
+    fn encode_and_queue_frame(
+        &mut self,
+        config: LiveAudioSimulationConfig,
+        stream_id: u32,
+        samples: &[f32],
+        now: Instant,
+        trace_start: Instant,
+        rng: &mut SimRng,
+        report: &mut LiveAudioSimulationReport,
+        trace: &mut Option<LiveAudioTraceWriter>,
+    ) -> Result<(), String> {
+        let mut chunk = normalized_to_i16_scale(samples);
+        let mut emitted = Vec::new();
+        self.capture.push_chunk(
+            &chunk,
+            config.max_amplification,
+            &self.capture_stats,
+            &mut |packet| emitted.push(packet),
+        )?;
+        trace_capture_frame(
+            trace,
+            trace_start,
+            now,
+            stream_id,
+            &chunk,
+            self.capture.current_gain(),
+            config,
+        );
+        chunk.clear();
+
+        for packet in emitted {
+            self.queue_packet(
+                config,
+                stream_id,
+                packet,
+                now,
+                trace_start,
+                rng,
+                report,
+                trace,
+            );
+        }
+
+        Ok(())
+    }
+
+    fn queue_packet(
+        &mut self,
+        config: LiveAudioSimulationConfig,
+        stream_id: u32,
+        packet: LocalVoiceFrame,
+        now: Instant,
+        trace_start: Instant,
+        rng: &mut SimRng,
+        report: &mut LiveAudioSimulationReport,
+        trace: &mut Option<LiveAudioTraceWriter>,
+    ) {
+        let sequence = self.next_sequence;
+        self.next_sequence = self.next_sequence.wrapping_add(1);
+        report.queued_frames = report.queued_frames.saturating_add(1);
+
+        let silence_hint = silence_ranges_contain(packet.silence_ranges, 0);
+        trace_encoded_packet(
+            trace,
+            trace_start,
+            now,
+            stream_id,
+            sequence,
+            packet.flags,
+            packet.silence_ranges,
+            packet.payload.len(),
+            silence_hint,
+        );
+        let dropped = simulation_drops_frame(config, stream_id, silence_hint, rng, &mut self.loss);
+        let deliver_at = now + simulation_delivery_delay(config.packet_loss, rng);
+        trace_network_decision(
+            trace,
+            trace_start,
+            now,
+            stream_id,
+            sequence,
+            packet.flags,
+            packet.silence_ranges,
+            packet.payload.len(),
+            silence_hint,
+            dropped,
+            deliver_at.saturating_duration_since(now),
+        );
+        if dropped {
+            report.lost_frames = report.lost_frames.saturating_add(1);
+            return;
+        }
+
+        self.network.push(
+            RemoteVoicePacket {
+                stream_id,
+                sequence,
+                flags: packet.flags,
+                silence_ranges: packet.silence_ranges,
+                payload: packet.payload,
+            },
+            deliver_at,
+        );
+    }
+
+    fn deliver_ready(
+        &mut self,
+        now: Instant,
+        trace_start: Instant,
+        _stream_id: u32,
+        tuning: LiveAudioTuning,
+        decode_streams: &mut HashMap<u32, LiveDecodeStream>,
+        report: &mut LiveAudioSimulationReport,
+        trace: &mut Option<LiveAudioTraceWriter>,
+    ) {
+        for packet in self.network.drain_ready(now) {
+            let reordered = self
+                .network
+                .highest_arrived_sequence
+                .is_some_and(|sequence| packet.packet.sequence < sequence);
+            if reordered {
+                report.reordered_frames = report.reordered_frames.saturating_add(1);
+            }
+            self.network.highest_arrived_sequence = Some(
+                self.network
+                    .highest_arrived_sequence
+                    .map_or(packet.packet.sequence, |sequence| {
+                        sequence.max(packet.packet.sequence)
+                    }),
+            );
+
+            let stream_id = packet.packet.stream_id;
+            let sequence = packet.packet.sequence;
+            let flags = packet.packet.flags;
+            let outcome = insert_live_playback_packet(packet.packet, decode_streams, tuning, now);
+            trace_packet_delivery(
+                trace,
+                trace_start,
+                now,
+                stream_id,
+                sequence,
+                flags,
+                reordered,
+                &outcome,
+            );
+            match outcome {
+                Some(InsertOutcome::Accepted) => {
+                    report.delivered_frames = report.delivered_frames.saturating_add(1);
+                }
+                Some(InsertOutcome::Late) => {
+                    report.late_frames = report.late_frames.saturating_add(1);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn suppressed_frames(&self) -> u64 {
+        self.capture.suppressed_frames()
+    }
+}
+
+#[derive(Default)]
+struct SimNetworkPipe {
+    pending: Vec<SimPendingFrame>,
+    next_serial: u64,
+    highest_arrived_sequence: Option<u32>,
+}
+
+impl SimNetworkPipe {
+    fn push(&mut self, packet: RemoteVoicePacket, deliver_at: Instant) {
+        let serial = self.next_serial;
+        self.next_serial = self.next_serial.wrapping_add(1);
+        self.pending.push(SimPendingFrame {
+            packet,
+            deliver_at,
+            serial,
+        });
+    }
+
+    fn drain_ready(&mut self, now: Instant) -> Vec<SimPendingFrame> {
+        let mut ready = Vec::new();
+        let mut index = 0;
+        while index < self.pending.len() {
+            if self.pending[index].deliver_at <= now {
+                ready.push(self.pending.swap_remove(index));
+            } else {
+                index += 1;
+            }
+        }
+        ready.sort_by(|left, right| {
+            left.deliver_at
+                .cmp(&right.deliver_at)
+                .then_with(|| left.serial.cmp(&right.serial))
+        });
+        ready
+    }
+}
+
+struct SimPendingFrame {
+    packet: RemoteVoicePacket,
+    deliver_at: Instant,
+    serial: u64,
+}
+
+struct SimulationFrame {
+    samples: Vec<f32>,
+    silence: bool,
+}
+
+fn simulation_frame(
+    scenario: LiveAudioSimulationScenario,
+    stream_index: usize,
+    frame_index: usize,
+    speech_frames: &[Vec<f32>],
+) -> Option<SimulationFrame> {
+    let cycle_frame = frame_index % frames_for_duration(Duration::from_secs(4));
+    match scenario {
+        LiveAudioSimulationScenario::ConstantSpeech => Some(sample_speech_simulation_frame(
+            speech_frames,
+            stream_index,
+            frame_index,
+            1.0,
+        )),
+        LiveAudioSimulationScenario::AlternatingSpeech => {
+            if cycle_frame < frames_for_duration(Duration::from_millis(700)) {
+                Some(sample_speech_simulation_frame(
+                    speech_frames,
+                    stream_index,
+                    frame_index,
+                    1.0,
+                ))
+            } else {
+                Some(silence_simulation_frame())
+            }
+        }
+        LiveAudioSimulationScenario::LossySpeech => {
+            if cycle_frame < frames_for_duration(Duration::from_millis(900)) {
+                Some(sample_speech_simulation_frame(
+                    speech_frames,
+                    stream_index,
+                    frame_index,
+                    1.0,
+                ))
+            } else {
+                Some(silence_simulation_frame())
+            }
+        }
+        LiveAudioSimulationScenario::BacklogSilence => {
+            if frame_index < frames_for_duration(Duration::from_millis(700)) {
+                Some(silence_simulation_frame())
+            } else {
+                Some(sample_speech_simulation_frame(
+                    speech_frames,
+                    stream_index,
+                    frame_index,
+                    0.95,
+                ))
+            }
+        }
+        LiveAudioSimulationScenario::GroupChat => {
+            let cycle = frame_index % frames_for_duration(Duration::from_secs(3));
+            let active = match stream_index % 3 {
+                0 => cycle < frames_for_duration(Duration::from_millis(900)),
+                1 => {
+                    let start = frames_for_duration(Duration::from_millis(500));
+                    let end = frames_for_duration(Duration::from_millis(1_500));
+                    cycle >= start && cycle < end
+                }
+                _ => {
+                    let start = frames_for_duration(Duration::from_millis(1_350));
+                    let end = frames_for_duration(Duration::from_millis(2_350));
+                    cycle >= start && cycle < end
+                }
+            };
+            if active {
+                Some(sample_speech_simulation_frame(
+                    speech_frames,
+                    stream_index,
+                    frame_index,
+                    0.75,
+                ))
+            } else {
+                Some(silence_simulation_frame())
+            }
+        }
+    }
+}
+
+fn sample_speech_simulation_frame(
+    speech_frames: &[Vec<f32>],
+    stream_index: usize,
+    frame_index: usize,
+    gain: f32,
+) -> SimulationFrame {
+    let offset = stream_index.saturating_mul(37);
+    let source = &speech_frames[(frame_index + offset) % speech_frames.len()];
+    SimulationFrame {
+        samples: source
+            .iter()
+            .map(|sample| (sample * gain).clamp(-0.95, 0.95))
+            .collect(),
+        silence: false,
+    }
+}
+
+fn silence_simulation_frame() -> SimulationFrame {
+    SimulationFrame {
+        samples: vec![0.0; FRAME_SAMPLES],
+        silence: true,
+    }
+}
+
+#[derive(Default)]
+struct OnlineAudioMetrics {
+    samples: u64,
+    sum_square: f64,
+    peak: f32,
+    max_adjacent_delta: f32,
+    last_sample: Option<f32>,
+    non_finite_samples: u64,
+    clipped_samples: u64,
+}
+
+impl OnlineAudioMetrics {
+    fn observe(&mut self, sample: f32) {
+        self.samples = self.samples.saturating_add(1);
+        if !sample.is_finite() {
+            self.non_finite_samples = self.non_finite_samples.saturating_add(1);
+            return;
+        }
+        if sample.abs() > 1.0 {
+            self.clipped_samples = self.clipped_samples.saturating_add(1);
+        }
+        if let Some(last_sample) = self.last_sample {
+            self.max_adjacent_delta = self.max_adjacent_delta.max((sample - last_sample).abs());
+        }
+        self.last_sample = Some(sample);
+        self.peak = self.peak.max(sample.abs());
+        self.sum_square += f64::from(sample) * f64::from(sample);
+    }
+
+    fn rms(&self) -> f32 {
+        if self.samples == 0 {
+            0.0
+        } else {
+            (self.sum_square / self.samples as f64).sqrt() as f32
+        }
+    }
+}
+
+struct SimRng {
+    state: u64,
+}
+
+impl SimRng {
+    fn new(seed: u64) -> Self {
+        Self { state: seed.max(1) }
+    }
+
+    fn next_u64(&mut self) -> u64 {
+        let mut x = self.state;
+        x ^= x >> 12;
+        x ^= x << 25;
+        x ^= x >> 27;
+        self.state = x;
+        x.wrapping_mul(0x2545_f491_4f6c_dd1d)
+    }
+
+    fn next_f64(&mut self) -> f64 {
+        const DENOMINATOR: f64 = (1u64 << 53) as f64;
+        ((self.next_u64() >> 11) as f64) / DENOMINATOR
+    }
 }
 
 struct DecodedPacketLog {
@@ -3235,6 +5585,18 @@ impl FrameAccumulator {
         }
         Ok(())
     }
+
+    fn push_chunk_collect(&mut self, chunk: &[f32]) -> Vec<Vec<f32>> {
+        let mut frames = Vec::new();
+        for sample in chunk {
+            self.pending.push(*sample);
+            if self.pending.len() == self.frame_size {
+                frames.push(std::mem::take(&mut self.pending));
+                self.pending = Vec::with_capacity(self.frame_size);
+            }
+        }
+        frames
+    }
 }
 
 #[cfg(test)]
@@ -3303,8 +5665,8 @@ mod tests {
             .apply_network_profile(EncoderNetworkProfile::DEGRADED)
             .unwrap();
 
-        assert_eq!(encoder.bitrate_bps, 24_000);
-        assert_eq!(encoder.dred_duration_10ms, 20);
+        assert_eq!(encoder.bitrate_bps, 32_000);
+        assert_eq!(encoder.dred_duration_10ms, 100);
         assert_eq!(encoder.packet_loss_percent, 3);
         assert!(encoder.inband_fec);
 
@@ -3314,6 +5676,221 @@ mod tests {
 
         assert!(encoded > 0);
         assert!(encoded <= output.len());
+    }
+
+    #[test]
+    fn live_encoder_pipeline_emits_parseable_dred_for_sampled_speech() {
+        let mut pipeline = build_live_encoder_pipeline(
+            test_tuning(),
+            true,
+            DEFAULT_LIVE_MAX_AMPLIFICATION,
+            true,
+            EncoderNetworkProfile::CRITICAL,
+        )
+        .unwrap();
+        let stats = AudioStats::new();
+        let mut packets = Vec::new();
+
+        for frame in sample_speech_frames().iter().take(240) {
+            let chunk = normalized_to_i16_scale(frame);
+            pipeline
+                .push_chunk(
+                    &chunk,
+                    DEFAULT_LIVE_MAX_AMPLIFICATION,
+                    &stats,
+                    &mut |packet| packets.push(packet),
+                )
+                .unwrap();
+        }
+
+        let mut decoder = Decoder::new(SampleRate::Hz48000, Channels::Mono).unwrap();
+        let mut dred_decoder = DredDecoder::new().unwrap();
+        let mut output = vec![0.0f32; LIVE_OPUS_FRAME_SAMPLES];
+        let mut recoverable = 0usize;
+        for packet in &packets {
+            let mut dred_state = DredState::new().unwrap();
+            let mut dred_end = 0;
+            let parsed = dred_decoder
+                .parse(
+                    &mut dred_state,
+                    packet.payload.as_slice(),
+                    LIVE_PLAYBACK_DRED_MAX_SAMPLES,
+                    SampleRate::Hz48000,
+                    &mut dred_end,
+                    false,
+                )
+                .unwrap_or(0);
+            let Ok(offset_samples) = i32::try_from(parsed) else {
+                continue;
+            };
+            if offset_samples > 0
+                && dred_decoder
+                    .decode_into_f32(&mut decoder, &dred_state, offset_samples, &mut output)
+                    .is_ok()
+            {
+                recoverable += 1;
+            }
+        }
+
+        let direct_10ms = count_direct_encoder_recoverable_dred(FRAME_SAMPLES);
+        let direct_20ms = count_direct_encoder_recoverable_dred(FRAME_SAMPLES * 2);
+
+        assert!(
+            recoverable > 0,
+            "live encoder emitted no parseable DRED across {} packets; direct_10ms={direct_10ms}, direct_20ms={direct_20ms}",
+            packets.len()
+        );
+    }
+
+    #[test]
+    fn live_encoder_marks_resume_after_silence_gate_as_opus_reset() {
+        let mut tuning = test_tuning();
+        tuning.capture_long_silence_stop = Duration::from_millis(20);
+        tuning.capture_silence_preroll = Duration::from_millis(20);
+        tuning.capture_silence_ramp = Duration::ZERO;
+        tuning.silence_vad_max = u8::MAX;
+
+        let mut pipeline = build_live_encoder_pipeline(
+            tuning,
+            false,
+            DEFAULT_LIVE_MAX_AMPLIFICATION,
+            true,
+            EncoderNetworkProfile::EXCELLENT,
+        )
+        .unwrap();
+        let stats = AudioStats::new();
+        let mut packets = Vec::new();
+        let sampled_speech = sample_high_energy_speech_frame()
+            .iter()
+            .map(|sample| (sample * 6.0).clamp(-1.0, 1.0))
+            .collect::<Vec<_>>();
+        let speech = normalized_to_i16_scale(&sampled_speech);
+        let silence = vec![0.0f32; FRAME_SAMPLES];
+
+        for _ in 0..4 {
+            pipeline
+                .push_chunk(
+                    &speech,
+                    DEFAULT_LIVE_MAX_AMPLIFICATION,
+                    &stats,
+                    &mut |packet| packets.push(packet),
+                )
+                .unwrap();
+        }
+        for _ in 0..5 {
+            pipeline
+                .push_chunk(
+                    &silence,
+                    DEFAULT_LIVE_MAX_AMPLIFICATION,
+                    &stats,
+                    &mut |packet| packets.push(packet),
+                )
+                .unwrap();
+        }
+        for _ in 0..4 {
+            pipeline
+                .push_chunk(
+                    &speech,
+                    DEFAULT_LIVE_MAX_AMPLIFICATION,
+                    &stats,
+                    &mut |packet| packets.push(packet),
+                )
+                .unwrap();
+        }
+
+        let reset_index = packets
+            .iter()
+            .position(|packet| packet.flags & LIVE_PACKET_FLAG_OPUS_RESET != 0)
+            .expect("resume packet should carry opus reset flag");
+        assert!(reset_index > 0, "first packet must not be a reset");
+        assert!(
+            packets[..reset_index]
+                .iter()
+                .all(|packet| packet.flags & LIVE_PACKET_FLAG_OPUS_RESET == 0)
+        );
+        assert!(
+            packets[reset_index + 1..]
+                .iter()
+                .all(|packet| packet.flags & LIVE_PACKET_FLAG_OPUS_RESET == 0)
+        );
+    }
+
+    #[test]
+    fn simulation_speech_split_keeps_contiguous_frames_after_first_active_frame() {
+        let mut pcm = Vec::new();
+        pcm.extend(std::iter::repeat(0.0).take(FRAME_SAMPLES));
+        pcm.extend(std::iter::repeat(0.01).take(FRAME_SAMPLES));
+        pcm.extend(std::iter::repeat(0.0).take(FRAME_SAMPLES));
+        pcm.extend(std::iter::repeat(0.02).take(FRAME_SAMPLES));
+
+        let frames = split_pcm_to_simulation_frames(&pcm, FRAME_SAMPLES * 3);
+
+        assert_eq!(frames.len(), 3);
+        assert_eq!(frames[0][0], 0.01);
+        assert_eq!(frames[1][0], 0.0);
+        assert_eq!(frames[2][0], 0.02);
+    }
+
+    fn count_direct_encoder_recoverable_dred(frame_samples: usize) -> usize {
+        let mut encoder = OpusVoiceEncoder::new(32_000).unwrap();
+        encoder
+            .apply_network_profile(EncoderNetworkProfile::CRITICAL)
+            .unwrap();
+        let frames = sample_speech_frames();
+        let mut packet = vec![0u8; MAX_OPUS_PACKET_BYTES];
+        let mut packets = Vec::new();
+        for index in 0..240 {
+            let mut input = Vec::with_capacity(frame_samples);
+            while input.len() < frame_samples {
+                input.extend_from_slice(&normalized_to_i16_scale(
+                    &frames[(index + input.len() / FRAME_SAMPLES) % frames.len()],
+                ));
+            }
+            input.truncate(frame_samples);
+            let encoded = encoder
+                .encode(&float_i16_scale_to_i16(&input), &mut packet)
+                .unwrap();
+            packets.push(packet[..encoded].to_vec());
+        }
+
+        count_recoverable_dred_packets(&packets, frame_samples)
+    }
+
+    fn float_i16_scale_to_i16(samples: &[f32]) -> Vec<i16> {
+        samples
+            .iter()
+            .map(|sample| sample.round().clamp(i16::MIN as f32, i16::MAX as f32) as i16)
+            .collect()
+    }
+
+    fn count_recoverable_dred_packets(packets: &[Vec<u8>], frame_samples: usize) -> usize {
+        let mut decoder = Decoder::new(SampleRate::Hz48000, Channels::Mono).unwrap();
+        let mut dred_decoder = DredDecoder::new().unwrap();
+        let mut output = vec![0.0f32; frame_samples];
+        packets
+            .iter()
+            .filter(|packet| {
+                let mut dred_state = DredState::new().unwrap();
+                let mut dred_end = 0;
+                let parsed = dred_decoder
+                    .parse(
+                        &mut dred_state,
+                        packet,
+                        LIVE_PLAYBACK_DRED_MAX_SAMPLES,
+                        SampleRate::Hz48000,
+                        &mut dred_end,
+                        false,
+                    )
+                    .unwrap_or(0);
+                let Ok(offset_samples) = i32::try_from(parsed) else {
+                    return false;
+                };
+                offset_samples > 0
+                    && dred_decoder
+                        .decode_into_f32(&mut decoder, &dred_state, offset_samples, &mut output)
+                        .is_ok()
+            })
+            .count()
     }
 
     #[test]
@@ -3342,7 +5919,7 @@ mod tests {
 
     #[test]
     fn silence_range_tracker_keeps_two_recent_sample_ranges() {
-        let mut tracker = SilenceRangeTracker::new();
+        let mut tracker = SilenceRangeTracker::new(test_tuning());
 
         assert_eq!(tracker.observe_frame(false), 0);
         assert!(silence_ranges_contain(tracker.observe_frame(true), 0));
@@ -3438,7 +6015,7 @@ mod tests {
     #[test]
     fn live_jitter_delays_initial_playout_to_reorder_startup_packets() {
         let start = Instant::now();
-        let mut jitter = LiveJitterStream::new();
+        let mut jitter = LiveJitterStream::new(test_tuning());
 
         assert_eq!(
             jitter.insert(test_audio_packet(2, &[2]), start),
@@ -3462,11 +6039,13 @@ mod tests {
             vec![
                 PlayoutItem::Audio {
                     sequence: 1,
+                    flags: 0,
                     silence_ranges: 0,
                     payload: vec![1],
                 },
                 PlayoutItem::Audio {
                     sequence: 2,
+                    flags: 0,
                     silence_ranges: 0,
                     payload: vec![2],
                 },
@@ -3477,7 +6056,7 @@ mod tests {
     #[test]
     fn live_jitter_conceals_later_gaps_after_reorder_deadline() {
         let start = Instant::now();
-        let mut jitter = LiveJitterStream::new();
+        let mut jitter = LiveJitterStream::new(test_tuning());
         let first_playout = start + LIVE_PLAYBACK_INITIAL_BUFFER;
         let gap_seen = first_playout + Duration::from_millis(1);
 
@@ -3489,6 +6068,7 @@ mod tests {
             jitter.drain_ready(first_playout),
             vec![PlayoutItem::Audio {
                 sequence: 0,
+                flags: 0,
                 silence_ranges: 0,
                 payload: vec![0],
             }]
@@ -3505,6 +6085,7 @@ mod tests {
                 PlayoutItem::Missing { sequence: 1 },
                 PlayoutItem::Audio {
                     sequence: 2,
+                    flags: 0,
                     silence_ranges: 0,
                     payload: vec![2],
                 },
@@ -3520,7 +6101,7 @@ mod tests {
         let mut encoder = OpusVoiceEncoder::new(32_000).unwrap();
         let packet_0 = encode_test_frame(&mut encoder, 0);
         let packet_2 = encode_test_frame(&mut encoder, 600);
-        let mut stream = LiveDecodeStream::new().unwrap();
+        let mut stream = LiveDecodeStream::new(test_tuning()).unwrap();
         let mut frame = vec![0i16; MAX_OPUS_DECODE_SAMPLES];
         let mut decoded = Vec::new();
 
@@ -3528,52 +6109,73 @@ mod tests {
             stream.insert(test_audio_packet(0, &packet_0), start),
             InsertOutcome::Accepted
         );
-        stream.drain_ready(first_playout, &mut frame, |samples, _source, _silence| {
-            decoded.extend_from_slice(samples);
-        });
-        assert_eq!(decoded.len(), FRAME_SAMPLES);
+        let mut trace = None;
+        stream.drain_ready(
+            first_playout,
+            start,
+            1,
+            &mut frame,
+            &mut trace,
+            |_, samples, _source, _silence| {
+                decoded.extend_from_slice(samples);
+            },
+        );
+        assert_eq!(decoded.len(), LIVE_OPUS_FRAME_SAMPLES);
 
         decoded.clear();
         assert_eq!(
             stream.insert(test_audio_packet(2, &packet_2), gap_seen),
             InsertOutcome::Accepted
         );
-        stream.drain_ready(gap_seen, &mut frame, |samples, _source, _silence| {
-            decoded.extend_from_slice(samples);
-        });
+        stream.drain_ready(
+            gap_seen,
+            start,
+            1,
+            &mut frame,
+            &mut trace,
+            |_, samples, _source, _silence| {
+                decoded.extend_from_slice(samples);
+            },
+        );
         assert!(decoded.is_empty());
 
         stream.drain_ready(
             gap_seen + LIVE_PLAYBACK_MAX_REORDER_DELAY,
+            start,
+            1,
             &mut frame,
-            |samples, _source, _silence| {
+            &mut trace,
+            |_, samples, _source, _silence| {
                 decoded.extend_from_slice(samples);
             },
         );
-        assert_eq!(decoded.len(), FRAME_SAMPLES * 2);
+        assert_eq!(decoded.len(), LIVE_OPUS_FRAME_SAMPLES * 2);
     }
 
     #[test]
     fn adaptive_stream_keeps_sixty_ms_target_under_good_conditions() {
         let now = Instant::now();
-        let mut stream = AdaptivePlaybackStream::new().unwrap();
+        let mut stream = AdaptivePlaybackStream::new(test_tuning()).unwrap();
         stream.input.push_back(
             &vec![0.0; samples_for_duration(LIVE_PLAYBACK_TARGET_QUEUE)],
             false,
         );
 
-        assert_eq!(stream.adaptive_target_samples(now), target_queue_samples());
+        assert_eq!(
+            stream.adaptive_target_samples(now),
+            target_queue_samples(test_tuning())
+        );
         assert!(stream.desired_correction(now).abs() < 0.000_001);
     }
 
     #[test]
     fn adaptive_stream_bypasses_resampler_at_target_queue() {
         let now = Instant::now();
-        let mut stream = AdaptivePlaybackStream::new().unwrap();
+        let mut stream = AdaptivePlaybackStream::new(test_tuning()).unwrap();
         let mut stats = LivePlaybackMixerStats::default();
 
         stream.queue_samples(
-            &vec![0.25; target_queue_samples()],
+            &vec![0.25; target_queue_samples(test_tuning())],
             DecodedFrameSource::Normal,
             false,
             now,
@@ -3589,7 +6191,7 @@ mod tests {
     #[test]
     fn adaptive_stream_does_not_slow_down_below_target_and_caps_catchup_speed() {
         let now = Instant::now();
-        let mut stream = AdaptivePlaybackStream::new().unwrap();
+        let mut stream = AdaptivePlaybackStream::new(test_tuning()).unwrap();
         stream.input.push_back(
             &vec![0.0; samples_for_duration(Duration::from_millis(20))],
             false,
@@ -3610,7 +6212,7 @@ mod tests {
     #[test]
     fn adaptive_stream_expands_loss_target_without_changing_good_default() {
         let now = Instant::now();
-        let mut stream = AdaptivePlaybackStream::new().unwrap();
+        let mut stream = AdaptivePlaybackStream::new(test_tuning()).unwrap();
         let mut stats = LivePlaybackMixerStats::default();
 
         assert_eq!(samples_to_ms(stream.adaptive_target_samples(now)), 60);
@@ -3644,7 +6246,7 @@ mod tests {
     #[test]
     fn adaptive_stream_hard_trim_preserves_dred_horizon() {
         let now = Instant::now();
-        let mut stream = AdaptivePlaybackStream::new().unwrap();
+        let mut stream = AdaptivePlaybackStream::new(test_tuning()).unwrap();
         let mut stats = LivePlaybackMixerStats::default();
         let oversized = samples_for_duration(Duration::from_millis(1_700));
 
@@ -3664,7 +6266,7 @@ mod tests {
     fn adaptive_stream_skips_only_marked_long_silence_when_behind() {
         let now = Instant::now();
         let queued = samples_for_duration(Duration::from_millis(400));
-        let mut unmarked = AdaptivePlaybackStream::new().unwrap();
+        let mut unmarked = AdaptivePlaybackStream::new(test_tuning()).unwrap();
         let mut unmarked_stats = LivePlaybackMixerStats::default();
 
         unmarked.queue_samples(
@@ -3677,7 +6279,7 @@ mod tests {
         let _ = unmarked.pop_sample(now, &mut unmarked_stats);
         assert_eq!(unmarked_stats.silence_skip_count, 0);
 
-        let mut marked = AdaptivePlaybackStream::new().unwrap();
+        let mut marked = AdaptivePlaybackStream::new(test_tuning()).unwrap();
         let mut marked_stats = LivePlaybackMixerStats::default();
         marked.queue_samples(
             &vec![0.0; queued],
@@ -3694,6 +6296,66 @@ mod tests {
             samples_to_ms(marked_stats.skipped_silence_samples as usize),
             duration_to_ms(LIVE_PLAYBACK_SILENCE_MAX_SKIP)
         );
+    }
+
+    #[test]
+    fn adaptive_stream_respects_catchup_toggle() {
+        let now = Instant::now();
+        let mut tuning = test_tuning();
+        tuning.adaptive_catch_up = false;
+        let mut stream = AdaptivePlaybackStream::new(tuning).unwrap();
+
+        stream.input.push_back(
+            &vec![0.0; samples_for_duration(LIVE_PLAYBACK_HARD_QUEUE_BOUND)],
+            false,
+        );
+
+        assert_eq!(stream.desired_correction(now), 0.0);
+        assert_eq!(
+            stream.adaptive_target_samples(now),
+            target_queue_samples(tuning)
+        );
+    }
+
+    #[test]
+    fn adaptive_stream_respects_silence_skip_toggle() {
+        let now = Instant::now();
+        let mut tuning = test_tuning();
+        tuning.playback_silence_skip = false;
+        let queued = samples_for_duration(Duration::from_millis(400));
+        let mut stream = AdaptivePlaybackStream::new(tuning).unwrap();
+        let mut stats = LivePlaybackMixerStats::default();
+
+        stream.queue_samples(
+            &vec![0.0; queued],
+            DecodedFrameSource::Normal,
+            true,
+            now,
+            &mut stats,
+        );
+        let _ = stream.pop_sample(now, &mut stats);
+
+        assert_eq!(stats.silence_skip_count, 0);
+        assert_eq!(stats.skipped_silence_samples, 0);
+    }
+
+    #[test]
+    fn dropped_packets_can_extend_marked_silence_for_skip() {
+        let mut mixer = LivePlaybackMixer::new();
+        let now = Instant::now();
+
+        mixer.queue_stream_samples(
+            1,
+            &vec![0.0; samples_for_duration(Duration::from_millis(400))],
+            DecodedFrameSource::Plc,
+            true,
+            now,
+        );
+        let _ = mixer.pop_mixed_sample(now);
+        let stats = mixer.snapshot_at(now);
+
+        assert_eq!(stats.plc_fallbacks, 1);
+        assert!(stats.silence_skip_count > 0, "{stats:?}");
     }
 
     #[test]
@@ -3819,6 +6481,285 @@ mod tests {
         assert!(mixer.queued_samples() < before);
     }
 
+    #[test]
+    fn simulation_loads_speech_from_existing_sample_asset() {
+        let frames = sample_speech_frames();
+
+        assert!(frames.len() >= 16);
+        assert!(frames.iter().all(|frame| frame.len() == FRAME_SAMPLES));
+        assert!(
+            frames
+                .iter()
+                .any(|frame| rms_normalized(frame.as_slice()) > 0.01)
+        );
+    }
+
+    #[test]
+    fn direct_sample_simulation_traces_the_client_reconstruction_pipeline() {
+        let input = sample_direct_pcm_frames(800);
+        let trace_path = std::env::temp_dir().join(format!(
+            "tomchat-direct-trace-{}-congested.jsonl",
+            std::process::id()
+        ));
+
+        let output = run_live_audio_direct_sample_simulation_output_with_trace(
+            LiveAudioDirectSampleSimulationConfig {
+                packet_loss: LiveAudioPacketLossProfile::CongestedWifi,
+                seed: 0x1357_2468_0123_4567,
+                ..Default::default()
+            },
+            &input,
+            &trace_path,
+        )
+        .unwrap();
+        let trace = std::fs::read_to_string(&trace_path).unwrap();
+        let _ = std::fs::remove_file(&trace_path);
+
+        assert_eq!(
+            output.report.generated_frames,
+            input.len().div_ceil(FRAME_SAMPLES) as u64
+        );
+        assert!(output.report.queued_frames > 0, "{:?}", output.report);
+        assert!(output.report.reordered_frames > 0, "{:?}", output.report);
+        assert!(
+            output.report.final_snapshot.dred_recoveries > 0,
+            "{:?}",
+            output.report
+        );
+        assert!(
+            output.report.max_queue_ms <= duration_to_ms(test_tuning().hard_queue_bound),
+            "{:?}",
+            output.report
+        );
+        assert_coherent_output(&output.report, 0.0005);
+        for event in [
+            "\"event\":\"direct_run_start\"",
+            "\"event\":\"capture_frame\"",
+            "\"event\":\"encoded_packet\"",
+            "\"event\":\"network_decision\"",
+            "\"event\":\"packet_delivery\"",
+            "\"event\":\"jitter_item\"",
+            "\"event\":\"normal_decode\"",
+            "\"event\":\"dred_decode\"",
+            "\"event\":\"mixer_queue\"",
+            "\"event\":\"output_window\"",
+            "\"status\":\"partial\"",
+        ] {
+            assert!(trace.contains(event), "missing {event} in\n{trace}");
+        }
+        assert!(
+            trace.contains("\"event\":\"dred_parse\"")
+                || trace.contains("\"event\":\"plc_decode\"")
+                || trace.contains("\"event\":\"dred_decode\""),
+            "trace did not include loss recovery events:\n{trace}"
+        );
+    }
+
+    #[test]
+    fn direct_sample_simulation_handles_sixty_percent_loss_and_reordering() {
+        let input = sample_direct_pcm_frames(800);
+        let output = run_live_audio_direct_sample_simulation_output(
+            LiveAudioDirectSampleSimulationConfig {
+                packet_loss: LiveAudioPacketLossProfile::Random60,
+                seed: 0x2468_1357_89ab_cdef,
+                ..Default::default()
+            },
+            &input,
+        )
+        .unwrap();
+        let loss_pct = output.report.lost_frames as f64 / output.report.queued_frames as f64;
+
+        assert!(
+            (0.55..=0.65).contains(&loss_pct),
+            "{loss_pct}: {:?}",
+            output.report
+        );
+        assert!(output.report.reordered_frames > 0, "{:?}", output.report);
+        assert!(output.report.missing_frames > 0, "{:?}", output.report);
+        assert!(
+            output.report.final_snapshot.dred_recoveries > 0,
+            "{:?}",
+            output.report
+        );
+        assert!(
+            output.report.max_queue_ms <= duration_to_ms(test_tuning().hard_queue_bound),
+            "{:?}",
+            output.report
+        );
+        assert_coherent_output(&output.report, 0.0001);
+    }
+
+    #[test]
+    fn simulated_constant_sampled_speech_stays_coherent_and_bounded() {
+        let report = simulate(
+            LiveAudioSimulationScenario::ConstantSpeech,
+            Duration::from_secs(60),
+            test_tuning(),
+            1,
+        );
+
+        assert_eq!(report.suppressed_frames, 0);
+        assert_eq!(report.lost_frames, 0);
+        assert!(report.max_queue_ms <= 120, "{report:?}");
+        assert_coherent_output(&report, 0.005);
+    }
+
+    #[test]
+    fn capture_gate_reduces_sampled_alternating_silence_bandwidth() {
+        let enabled = simulate(
+            LiveAudioSimulationScenario::AlternatingSpeech,
+            Duration::from_secs(45),
+            test_tuning(),
+            1,
+        );
+        let mut disabled_tuning = test_tuning();
+        disabled_tuning.capture_silence_gate = false;
+        let disabled = simulate(
+            LiveAudioSimulationScenario::AlternatingSpeech,
+            Duration::from_secs(45),
+            disabled_tuning,
+            1,
+        );
+
+        assert!(enabled.suppressed_frames > 0, "{enabled:?}");
+        assert!(enabled.queued_frames < disabled.queued_frames);
+        assert!(enabled.max_queue_ms <= duration_to_ms(test_tuning().hard_queue_bound));
+        assert_coherent_output(&enabled, 0.002);
+    }
+
+    #[test]
+    fn silence_skip_and_adaptive_catchup_improve_backlog_latency() {
+        let enabled = simulate(
+            LiveAudioSimulationScenario::BacklogSilence,
+            Duration::from_secs(30),
+            test_tuning(),
+            1,
+        );
+        let mut disabled_tuning = test_tuning();
+        disabled_tuning.playback_silence_skip = false;
+        disabled_tuning.adaptive_catch_up = false;
+        let disabled = simulate(
+            LiveAudioSimulationScenario::BacklogSilence,
+            Duration::from_secs(30),
+            disabled_tuning,
+            1,
+        );
+
+        assert!(enabled.final_snapshot.silence_skip_count > 0, "{enabled:?}");
+        assert!(
+            enabled.queue_area_ms < disabled.queue_area_ms,
+            "{enabled:?} vs {disabled:?}"
+        );
+        assert!(
+            enabled.max_queue_ms < disabled.max_queue_ms,
+            "{enabled:?} vs {disabled:?}"
+        );
+        assert_coherent_output(&enabled, 0.002);
+    }
+
+    #[test]
+    fn lossy_sampled_speech_expands_target_but_remains_hard_bounded() {
+        let report = simulate(
+            LiveAudioSimulationScenario::LossySpeech,
+            Duration::from_secs(60),
+            test_tuning(),
+            1,
+        );
+
+        assert!(report.lost_frames > 0, "{report:?}");
+        assert!(report.final_snapshot.plc_fallbacks > 0, "{report:?}");
+        assert!(
+            report.max_queue_ms <= duration_to_ms(test_tuning().hard_queue_bound),
+            "{report:?}"
+        );
+        assert_coherent_output(&report, 0.002);
+    }
+
+    #[test]
+    fn group_chat_mixes_multiple_sampled_inputs_without_clipping() {
+        let report = simulate(
+            LiveAudioSimulationScenario::GroupChat,
+            Duration::from_secs(45),
+            test_tuning(),
+            3,
+        );
+
+        assert_eq!(report.final_snapshot.active_streams, 3);
+        assert!(report.generated_frames > report.output_samples / FRAME_SAMPLES as u64);
+        assert!(report.max_queue_ms <= duration_to_ms(test_tuning().hard_queue_bound));
+        assert_coherent_output(&report, 0.002);
+    }
+
+    #[test]
+    fn realistic_packet_loss_profiles_remain_bounded() {
+        for packet_loss in [
+            LiveAudioPacketLossProfile::MildRandom,
+            LiveAudioPacketLossProfile::ModerateRandom,
+            LiveAudioPacketLossProfile::SevereRandom,
+            LiveAudioPacketLossProfile::Random30,
+            LiveAudioPacketLossProfile::Random45,
+            LiveAudioPacketLossProfile::Random60,
+            LiveAudioPacketLossProfile::BurstyWifi,
+            LiveAudioPacketLossProfile::CongestedWifi,
+            LiveAudioPacketLossProfile::MobileHandoff,
+        ] {
+            let report = simulate_with_loss(
+                LiveAudioSimulationScenario::LossySpeech,
+                Duration::from_secs(20),
+                test_tuning(),
+                1,
+                packet_loss,
+            );
+
+            assert!(
+                report.max_queue_ms <= duration_to_ms(test_tuning().hard_queue_bound),
+                "{packet_loss:?}: {report:?}"
+            );
+            assert_coherent_output(&report, 0.002);
+        }
+    }
+
+    #[test]
+    fn realistic_packet_profiles_include_reordered_and_late_arrivals() {
+        let report = simulate_with_loss(
+            LiveAudioSimulationScenario::LossySpeech,
+            Duration::from_secs(60),
+            test_tuning(),
+            1,
+            LiveAudioPacketLossProfile::CongestedWifi,
+        );
+
+        assert!(report.reordered_frames > 0, "{report:?}");
+        assert!(report.late_frames > 0, "{report:?}");
+        assert!(report.missing_frames > report.lost_frames, "{report:?}");
+        assert!(
+            report.max_queue_ms <= duration_to_ms(test_tuning().hard_queue_bound),
+            "{report:?}"
+        );
+        assert_coherent_output(&report, 0.002);
+    }
+
+    #[test]
+    fn high_loss_profile_covers_sixty_percent_loss_and_remains_coherent() {
+        let report = simulate_with_loss(
+            LiveAudioSimulationScenario::LossySpeech,
+            Duration::from_secs(60),
+            test_tuning(),
+            1,
+            LiveAudioPacketLossProfile::Random60,
+        );
+        let loss_pct = report.lost_frames as f64 / report.queued_frames as f64;
+
+        assert!((0.55..=0.65).contains(&loss_pct), "{loss_pct}: {report:?}");
+        assert!(report.reordered_frames > 0, "{report:?}");
+        assert!(report.missing_frames > 0, "{report:?}");
+        assert!(
+            report.max_queue_ms <= duration_to_ms(test_tuning().hard_queue_bound),
+            "{report:?}"
+        );
+        assert_coherent_output(&report, 0.002);
+    }
+
     fn pop_until_nonzero(mixer: &mut LivePlaybackMixer, now: Instant) -> f32 {
         for _ in 0..(FRAME_SAMPLES * 2) {
             let sample = mixer.pop_mixed_sample(now);
@@ -3847,10 +6788,93 @@ mod tests {
     }
 
     fn encode_test_frame(encoder: &mut OpusVoiceEncoder, amplitude: i16) -> Vec<u8> {
-        let input = vec![amplitude; FRAME_SAMPLES];
+        let input = vec![amplitude; LIVE_OPUS_FRAME_SAMPLES];
         let mut output = vec![0u8; MAX_OPUS_PACKET_BYTES];
         let len = encoder.encode(&input, &mut output).unwrap();
         output.truncate(len);
         output
+    }
+
+    fn test_tuning() -> LiveAudioTuning {
+        LiveAudioTuning::default()
+    }
+
+    fn sample_speech_frames() -> &'static [Vec<f32>] {
+        static FRAMES: std::sync::OnceLock<Vec<Vec<f32>>> = std::sync::OnceLock::new();
+        FRAMES
+            .get_or_init(|| {
+                load_live_audio_simulation_speech_frames()
+                    .expect("assets/sample-001.opus should decode through ffmpeg")
+            })
+            .as_slice()
+    }
+
+    fn sample_high_energy_speech_frame() -> &'static [f32] {
+        sample_speech_frames()
+            .iter()
+            .find(|frame| peak_normalized(frame.as_slice()) > 0.25)
+            .or_else(|| {
+                sample_speech_frames()
+                    .iter()
+                    .find(|frame| rms_normalized(frame.as_slice()) > 0.05)
+            })
+            .unwrap_or_else(|| &sample_speech_frames()[0])
+            .as_slice()
+    }
+
+    fn simulate(
+        scenario: LiveAudioSimulationScenario,
+        duration: Duration,
+        tuning: LiveAudioTuning,
+        streams: usize,
+    ) -> LiveAudioSimulationReport {
+        simulate_with_loss(
+            scenario,
+            duration,
+            tuning,
+            streams,
+            LiveAudioPacketLossProfile::ScenarioDefault,
+        )
+    }
+
+    fn simulate_with_loss(
+        scenario: LiveAudioSimulationScenario,
+        duration: Duration,
+        tuning: LiveAudioTuning,
+        streams: usize,
+        packet_loss: LiveAudioPacketLossProfile,
+    ) -> LiveAudioSimulationReport {
+        run_live_audio_simulation_with_speech(
+            LiveAudioSimulationConfig {
+                scenario,
+                tuning,
+                duration,
+                streams,
+                seed: 0x1234_5678_90ab_cdef,
+                packet_loss,
+                max_amplification: DEFAULT_LIVE_MAX_AMPLIFICATION,
+                denoise: true,
+                auto_gain: true,
+            },
+            sample_speech_frames(),
+        )
+        .unwrap()
+    }
+
+    fn sample_direct_pcm_frames(frames: usize) -> Vec<f32> {
+        let pcm =
+            load_live_audio_simulation_sample_pcm().expect("assets/sample-001.opus should decode");
+        let samples = frames.saturating_mul(FRAME_SAMPLES).min(pcm.len());
+        assert!(samples >= FRAME_SAMPLES);
+        pcm[..samples].to_vec()
+    }
+
+    fn assert_coherent_output(report: &LiveAudioSimulationReport, min_rms: f32) {
+        assert_eq!(report.non_finite_samples, 0, "{report:?}");
+        assert_eq!(report.clipped_samples, 0, "{report:?}");
+        assert!(report.peak <= 1.0, "{report:?}");
+        assert!(report.rms >= min_rms, "{report:?}");
+        assert!(report.max_adjacent_delta <= 1.20, "{report:?}");
+        assert!(report.output_ms > 0, "{report:?}");
     }
 }

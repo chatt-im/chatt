@@ -1,14 +1,18 @@
-use std::fs;
 use std::path::PathBuf;
+use std::{fs, time::Duration};
 
 use toml_spanner::Toml;
 use toml_spanner::{Arena, Array, ArrayStyle, Item, Key, Table};
 
-use crate::{audio::BufferRequest, bindings::BindingRuntime, client_net::ClientConfig};
+use crate::{
+    audio::{BufferRequest, LiveAudioTuning},
+    bindings::BindingRuntime,
+    client_net::ClientConfig,
+};
 use rpc::{control::DEFAULT_FILE_SIZE_LIMIT_BYTES, ids::RoomId};
 
 pub const DEFAULT_CONFIG: &str = include_str!("../tomchat.toml");
-pub const DEFAULT_MAX_AMPLIFICATION: f32 = 20.0;
+pub const DEFAULT_MAX_AMPLIFICATION: f32 = crate::audio::DEFAULT_LIVE_MAX_AMPLIFICATION;
 pub const MIN_USER_VOLUME_DB: f32 = -24.0;
 pub const MAX_USER_VOLUME_DB: f32 = 12.0;
 pub const USER_VOLUME_DB_STEP: f32 = 0.5;
@@ -136,6 +140,8 @@ pub struct AudioConfig {
     pub max_amplification: f32,
     #[toml(default)]
     pub buffer: BufferChoice,
+    #[toml(default)]
+    pub latency: AudioLatencyConfig,
 }
 
 impl Default for AudioConfig {
@@ -147,8 +153,125 @@ impl Default for AudioConfig {
             denoise: true,
             max_amplification: DEFAULT_MAX_AMPLIFICATION,
             buffer: BufferChoice::Default,
+            latency: AudioLatencyConfig::default(),
         }
     }
+}
+
+#[derive(Clone, Debug, PartialEq, Toml)]
+#[toml(FromToml, ToToml, rename_all = "kebab-case")]
+pub struct AudioLatencyConfig {
+    #[toml(default = true)]
+    pub adaptive_catch_up: bool,
+    #[toml(default = true)]
+    pub playback_silence_skip: bool,
+    #[toml(default = true)]
+    pub capture_silence_gate: bool,
+    #[toml(default = 60)]
+    pub target_queue_ms: u64,
+    #[toml(default = 320)]
+    pub moderate_loss_queue_ms: u64,
+    #[toml(default = 1_000)]
+    pub dred_horizon_ms: u64,
+    #[toml(default = 1_500)]
+    pub hard_queue_bound_ms: u64,
+    #[toml(default = 5_000)]
+    pub loss_window_ms: u64,
+    #[toml(default = 5_000)]
+    pub loss_hold_ms: u64,
+    #[toml(default = 10_000)]
+    pub severe_loss_hold_ms: u64,
+    #[toml(default = 40)]
+    pub initial_buffer_ms: u64,
+    #[toml(default = 60)]
+    pub max_reorder_delay_ms: u64,
+    #[toml(default = 0.15)]
+    pub max_speed_up: f64,
+    #[toml(default = 64)]
+    pub silence_vad_max: u8,
+    #[toml(default = 250)]
+    pub silence_min_gap_ms: u64,
+    #[toml(default = 40)]
+    pub silence_guard_ms: u64,
+    #[toml(default = 10)]
+    pub silence_ramp_ms: u64,
+    #[toml(default = 200)]
+    pub silence_max_skip_ms: u64,
+    #[toml(default = 20)]
+    pub silence_min_skip_ms: u64,
+    #[toml(default = 2_000)]
+    pub capture_long_silence_stop_ms: u64,
+    #[toml(default = 30)]
+    pub capture_silence_preroll_ms: u64,
+    #[toml(default = 10)]
+    pub capture_silence_ramp_ms: u64,
+}
+
+impl Default for AudioLatencyConfig {
+    fn default() -> Self {
+        let tuning = LiveAudioTuning::default();
+        Self {
+            adaptive_catch_up: tuning.adaptive_catch_up,
+            playback_silence_skip: tuning.playback_silence_skip,
+            capture_silence_gate: tuning.capture_silence_gate,
+            target_queue_ms: duration_ms(tuning.target_queue),
+            moderate_loss_queue_ms: duration_ms(tuning.moderate_loss_queue),
+            dred_horizon_ms: duration_ms(tuning.dred_horizon),
+            hard_queue_bound_ms: duration_ms(tuning.hard_queue_bound),
+            loss_window_ms: duration_ms(tuning.loss_window),
+            loss_hold_ms: duration_ms(tuning.loss_hold),
+            severe_loss_hold_ms: duration_ms(tuning.severe_loss_hold),
+            initial_buffer_ms: duration_ms(tuning.initial_buffer),
+            max_reorder_delay_ms: duration_ms(tuning.max_reorder_delay),
+            max_speed_up: tuning.max_speed_up,
+            silence_vad_max: tuning.silence_vad_max,
+            silence_min_gap_ms: duration_ms(tuning.silence_min_gap),
+            silence_guard_ms: duration_ms(tuning.silence_guard),
+            silence_ramp_ms: duration_ms(tuning.silence_ramp),
+            silence_max_skip_ms: duration_ms(tuning.silence_max_skip),
+            silence_min_skip_ms: duration_ms(tuning.silence_min_skip),
+            capture_long_silence_stop_ms: duration_ms(tuning.capture_long_silence_stop),
+            capture_silence_preroll_ms: duration_ms(tuning.capture_silence_preroll),
+            capture_silence_ramp_ms: duration_ms(tuning.capture_silence_ramp),
+        }
+    }
+}
+
+impl AudioLatencyConfig {
+    pub fn to_tuning(&self) -> LiveAudioTuning {
+        LiveAudioTuning {
+            adaptive_catch_up: self.adaptive_catch_up,
+            playback_silence_skip: self.playback_silence_skip,
+            capture_silence_gate: self.capture_silence_gate,
+            target_queue: Duration::from_millis(self.target_queue_ms),
+            moderate_loss_queue: Duration::from_millis(self.moderate_loss_queue_ms),
+            dred_horizon: Duration::from_millis(self.dred_horizon_ms),
+            hard_queue_bound: Duration::from_millis(self.hard_queue_bound_ms),
+            loss_window: Duration::from_millis(self.loss_window_ms),
+            loss_hold: Duration::from_millis(self.loss_hold_ms),
+            severe_loss_hold: Duration::from_millis(self.severe_loss_hold_ms),
+            initial_buffer: Duration::from_millis(self.initial_buffer_ms),
+            max_reorder_delay: Duration::from_millis(self.max_reorder_delay_ms),
+            max_speed_up: self.max_speed_up,
+            silence_vad_max: self.silence_vad_max,
+            silence_min_gap: Duration::from_millis(self.silence_min_gap_ms),
+            silence_guard: Duration::from_millis(self.silence_guard_ms),
+            silence_ramp: Duration::from_millis(self.silence_ramp_ms),
+            silence_max_skip: Duration::from_millis(self.silence_max_skip_ms),
+            silence_min_skip: Duration::from_millis(self.silence_min_skip_ms),
+            capture_long_silence_stop: Duration::from_millis(self.capture_long_silence_stop_ms),
+            capture_silence_preroll: Duration::from_millis(self.capture_silence_preroll_ms),
+            capture_silence_ramp: Duration::from_millis(self.capture_silence_ramp_ms),
+        }
+    }
+
+    fn validate(&self) -> Result<(), String> {
+        self.to_tuning().validate()
+    }
+}
+
+fn duration_ms(duration: Duration) -> u64 {
+    duration.as_millis().min(u128::from(u64::MAX)) as u64
 }
 
 #[derive(Clone, Debug, Toml)]
@@ -319,6 +442,10 @@ impl Config {
     }
 
     fn validate(&self, source: &str) -> Result<(), String> {
+        self.audio
+            .latency
+            .validate()
+            .map_err(|error| format!("{source}: audio latency: {error}"))?;
         if self.servers.is_empty() {
             return Err(format!(
                 "{source}: at least one [[servers]] entry is required"
@@ -675,6 +802,118 @@ fn write_runtime_config<'de>(root: &mut Table<'de>, config: &Config, arena: &'de
             buffer_choice_name(config.audio.buffer),
             arena,
         );
+
+        let latency = ensure_table(audio, "latency", arena);
+        latency.insert(
+            Key::new("adaptive-catch-up"),
+            Item::from(config.audio.latency.adaptive_catch_up),
+            arena,
+        );
+        latency.insert(
+            Key::new("playback-silence-skip"),
+            Item::from(config.audio.latency.playback_silence_skip),
+            arena,
+        );
+        latency.insert(
+            Key::new("capture-silence-gate"),
+            Item::from(config.audio.latency.capture_silence_gate),
+            arena,
+        );
+        latency.insert(
+            Key::new("target-queue-ms"),
+            Item::from(config.audio.latency.target_queue_ms as i64),
+            arena,
+        );
+        latency.insert(
+            Key::new("moderate-loss-queue-ms"),
+            Item::from(config.audio.latency.moderate_loss_queue_ms as i64),
+            arena,
+        );
+        latency.insert(
+            Key::new("dred-horizon-ms"),
+            Item::from(config.audio.latency.dred_horizon_ms as i64),
+            arena,
+        );
+        latency.insert(
+            Key::new("hard-queue-bound-ms"),
+            Item::from(config.audio.latency.hard_queue_bound_ms as i64),
+            arena,
+        );
+        latency.insert(
+            Key::new("loss-window-ms"),
+            Item::from(config.audio.latency.loss_window_ms as i64),
+            arena,
+        );
+        latency.insert(
+            Key::new("loss-hold-ms"),
+            Item::from(config.audio.latency.loss_hold_ms as i64),
+            arena,
+        );
+        latency.insert(
+            Key::new("severe-loss-hold-ms"),
+            Item::from(config.audio.latency.severe_loss_hold_ms as i64),
+            arena,
+        );
+        latency.insert(
+            Key::new("initial-buffer-ms"),
+            Item::from(config.audio.latency.initial_buffer_ms as i64),
+            arena,
+        );
+        latency.insert(
+            Key::new("max-reorder-delay-ms"),
+            Item::from(config.audio.latency.max_reorder_delay_ms as i64),
+            arena,
+        );
+        latency.insert(
+            Key::new("max-speed-up"),
+            Item::from(config.audio.latency.max_speed_up),
+            arena,
+        );
+        latency.insert(
+            Key::new("silence-vad-max"),
+            Item::from(config.audio.latency.silence_vad_max as i64),
+            arena,
+        );
+        latency.insert(
+            Key::new("silence-min-gap-ms"),
+            Item::from(config.audio.latency.silence_min_gap_ms as i64),
+            arena,
+        );
+        latency.insert(
+            Key::new("silence-guard-ms"),
+            Item::from(config.audio.latency.silence_guard_ms as i64),
+            arena,
+        );
+        latency.insert(
+            Key::new("silence-ramp-ms"),
+            Item::from(config.audio.latency.silence_ramp_ms as i64),
+            arena,
+        );
+        latency.insert(
+            Key::new("silence-max-skip-ms"),
+            Item::from(config.audio.latency.silence_max_skip_ms as i64),
+            arena,
+        );
+        latency.insert(
+            Key::new("silence-min-skip-ms"),
+            Item::from(config.audio.latency.silence_min_skip_ms as i64),
+            arena,
+        );
+        latency.insert(
+            Key::new("capture-long-silence-stop-ms"),
+            Item::from(config.audio.latency.capture_long_silence_stop_ms as i64),
+            arena,
+        );
+        latency.insert(
+            Key::new("capture-silence-preroll-ms"),
+            Item::from(config.audio.latency.capture_silence_preroll_ms as i64),
+            arena,
+        );
+        latency.insert(
+            Key::new("capture-silence-ramp-ms"),
+            Item::from(config.audio.latency.capture_silence_ramp_ms as i64),
+            arena,
+        );
     }
 
     {
@@ -992,7 +1231,7 @@ input-device-index = 20
         )
         .unwrap();
 
-        assert!(content.contains("max-amplification = 20.0"));
+        assert!(content.contains("max-amplification = 2.0"));
     }
 
     #[test]
@@ -1014,6 +1253,49 @@ input-device-index = 20
 
         assert!(content.contains("input-device-id = \"usb mic\""));
         assert!(content.contains("output-device-id = \"usb speakers\""));
+    }
+
+    #[test]
+    fn audio_latency_config_defaults_match_live_tuning() {
+        let config = AudioLatencyConfig::default();
+        let tuning = config.to_tuning();
+
+        assert_eq!(tuning, LiveAudioTuning::default());
+        assert!(tuning.validate().is_ok());
+    }
+
+    #[test]
+    fn runtime_config_writes_audio_latency_knobs() {
+        let mut config = Config::default();
+        config.audio.latency.playback_silence_skip = false;
+        config.audio.latency.target_queue_ms = 80;
+        let arena = Arena::new();
+        let doc = toml_spanner::parse(DEFAULT_CONFIG, &arena).unwrap();
+        let mut table = doc.table().clone_in(&arena);
+
+        write_runtime_config(&mut table, &config, &arena);
+        let content = String::from_utf8(
+            toml_spanner::Formatting::preserved_from(&doc)
+                .with_span_projection_identity()
+                .format_table_to_bytes(table, &arena),
+        )
+        .unwrap();
+
+        assert!(content.contains("[audio.latency]"));
+        assert!(content.contains("playback-silence-skip = false"));
+        assert!(content.contains("target-queue-ms = 80"));
+    }
+
+    #[test]
+    fn rejects_invalid_audio_latency_config() {
+        let mut config = Config::default();
+        config.audio.latency.hard_queue_bound_ms = 40;
+        config.audio.latency.dred_horizon_ms = 1_000;
+
+        let error = config.validate("<test>").unwrap_err();
+
+        assert!(error.contains("audio latency"));
+        assert!(error.contains("hard-queue-bound-ms"));
     }
 
     #[test]

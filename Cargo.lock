@@ -101,6 +101,7 @@ dependencies = [
  "jsony_bench",
  "nnnoiseless",
  "opus-codec",
+ "tomchat",
 ]
 
 [[package]]

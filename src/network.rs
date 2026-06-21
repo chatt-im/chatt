@@ -199,6 +199,7 @@ pub(crate) enum InsertOutcome {
 pub(crate) enum PlayoutItem {
     Audio {
         sequence: u32,
+        flags: u8,
         silence_ranges: u64,
         payload: Vec<u8>,
     },
@@ -224,6 +225,7 @@ impl PlayoutItem {
 #[derive(Clone, Debug)]
 struct BufferedAudioPacket {
     sequence: u32,
+    flags: u8,
     silence_ranges: u64,
     payload: Vec<u8>,
 }
@@ -269,6 +271,7 @@ impl JitterBuffer {
 
         self.buffered.push(BufferedAudioPacket {
             sequence: packet.sequence,
+            flags: packet.flags,
             silence_ranges: packet.silence_ranges,
             payload: packet.payload.to_vec(),
         });
@@ -294,6 +297,7 @@ impl JitterBuffer {
                 self.missing_since = None;
                 ready.push(PlayoutItem::Audio {
                     sequence: packet.sequence,
+                    flags: packet.flags,
                     silence_ranges: packet.silence_ranges,
                     payload: packet.payload,
                 });
@@ -427,18 +431,18 @@ impl EncoderNetworkProfile {
         packet_loss_percent: 0,
     };
     pub(crate) const DEGRADED: Self = Self {
-        dred_duration_10ms: 20,
-        bitrate_bps: 24_000,
+        dred_duration_10ms: 100,
+        bitrate_bps: 32_000,
         packet_loss_percent: 3,
     };
     pub(crate) const SEVERE: Self = Self {
-        dred_duration_10ms: 50,
-        bitrate_bps: 16_000,
+        dred_duration_10ms: 100,
+        bitrate_bps: 32_000,
         packet_loss_percent: 10,
     };
     pub(crate) const CRITICAL: Self = Self {
         dred_duration_10ms: 100,
-        bitrate_bps: 12_000,
+        bitrate_bps: 32_000,
         packet_loss_percent: 20,
     };
 }
@@ -714,9 +718,13 @@ mod tests {
     use super::*;
 
     fn packet(sequence: u32, payload: &[u8]) -> AudioPacketRef<'_> {
+        packet_with_flags(sequence, 0, payload)
+    }
+
+    fn packet_with_flags(sequence: u32, flags: u8, payload: &[u8]) -> AudioPacketRef<'_> {
         AudioPacketRef {
             sequence,
-            flags: 0,
+            flags,
             silence_ranges: 0,
             payload,
         }
@@ -814,6 +822,7 @@ mod tests {
             jitter.drain_ready(start),
             vec![PlayoutItem::Audio {
                 sequence: 0,
+                flags: 0,
                 silence_ranges: 0,
                 payload: vec![0],
             }]
@@ -832,15 +841,37 @@ mod tests {
             vec![
                 PlayoutItem::Audio {
                     sequence: 1,
+                    flags: 0,
                     silence_ranges: 0,
                     payload: vec![1],
                 },
                 PlayoutItem::Audio {
                     sequence: 2,
+                    flags: 0,
                     silence_ranges: 0,
                     payload: vec![2],
                 },
             ]
+        );
+    }
+
+    #[test]
+    fn jitter_buffer_preserves_audio_flags() {
+        let start = Instant::now();
+        let mut jitter = JitterBuffer::new(JitterBufferConfig::default());
+
+        assert_eq!(
+            jitter.insert(packet_with_flags(7, 0b1010_0001, &[7])),
+            InsertOutcome::Accepted
+        );
+        assert_eq!(
+            jitter.drain_ready(start),
+            vec![PlayoutItem::Audio {
+                sequence: 7,
+                flags: 0b1010_0001,
+                silence_ranges: 0,
+                payload: vec![7],
+            }]
         );
     }
 
@@ -868,6 +899,7 @@ mod tests {
                 PlayoutItem::Missing { sequence: 2 },
                 PlayoutItem::Audio {
                     sequence: 3,
+                    flags: 0,
                     silence_ranges: 0,
                     payload: vec![3],
                 },
@@ -914,6 +946,7 @@ mod tests {
                 },
                 PlayoutItem::Audio {
                     sequence: 20,
+                    flags: 0,
                     silence_ranges: 0,
                     payload: vec![20],
                 },
@@ -928,6 +961,7 @@ mod tests {
         telemetry.observe_insert(&InsertOutcome::Late);
         telemetry.observe_playout(&PlayoutItem::Audio {
             sequence: 5,
+            flags: 0,
             silence_ranges: 0,
             payload: vec![0],
         });

@@ -1,6 +1,6 @@
 use crate::{
     audio::{BufferRequest, DeviceInfo, StreamPreview},
-    config::{AudioConfig, BufferChoice, DEFAULT_MAX_AMPLIFICATION},
+    config::{AudioConfig, AudioLatencyConfig, BufferChoice, DEFAULT_MAX_AMPLIFICATION},
     ui::select::{FuzzySelect, SelectableItem},
 };
 
@@ -49,6 +49,7 @@ pub struct SettingsDraft {
     pub amplification_index: usize,
     pub buffer_index: usize,
     pub denoise: bool,
+    pub latency: AudioLatencyConfig,
 }
 
 impl SettingsDraft {
@@ -66,6 +67,7 @@ impl SettingsDraft {
                 .position(|buffer| *buffer == config.buffer.to_request())
                 .unwrap_or(0),
             denoise: config.denoise,
+            latency: config.latency.clone(),
         }
     }
 
@@ -77,6 +79,7 @@ impl SettingsDraft {
             denoise: self.denoise,
             max_amplification: self.max_amplification(),
             buffer: BufferChoice::from_request(self.buffer_request()),
+            latency: self.latency.clone(),
         }
     }
 
@@ -109,7 +112,7 @@ fn amplification_index(value: f32) -> usize {
                 .unwrap_or(std::cmp::Ordering::Equal)
         })
         .map(|(index, _)| index)
-        .unwrap_or(6)
+        .unwrap_or(1)
 }
 
 #[derive(Clone, Debug)]
