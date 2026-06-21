@@ -9,6 +9,8 @@ use std::{
 use jsony_bench::{Bench, BenchParameters, Router};
 use nnnoiseless::DenoiseState;
 use opus_codec::{Channels, Decoder, DredDecoder, DredState, SampleRate};
+use sonora::config::EchoCanceller as Aec3Config;
+use sonora::{AudioProcessing, Config as ApmConfig, StreamConfig as ApmStreamConfig};
 use tomchat::audio::{
     DEFAULT_LIVE_MAX_AMPLIFICATION, LiveAudioPacketLossProfile, LiveAudioSimulationConfig,
     LiveAudioSimulationScenario, LiveAudioTuning, run_live_audio_simulation_with_speech,
@@ -364,6 +366,55 @@ fn bench_pipeline(bench: &mut Bench<'_>, corpus: Arc<Corpus>) {
             });
         },
     );
+
+    bench
+        .named("aec_then_encode")
+        .param_str("profile", &profile_names, |bench, profile_name| {
+            let profile = profile_by_name(&profile_name);
+            let rnnoise_frames = Arc::clone(&corpus.rnnoise_frames);
+            let cycle_len = rnnoise_frames.len() / 2;
+            let mut aec = new_aec();
+            let mut encoder = OpusRawEncoder::new(profile).unwrap();
+            let mut render = vec![0.0f32; RNNOISE_FRAME_SAMPLES];
+            let mut render_out = vec![0.0f32; RNNOISE_FRAME_SAMPLES];
+            let mut near = vec![0.0f32; RNNOISE_FRAME_SAMPLES];
+            let mut opus_frame = vec![0.0f32; OPUS_FRAME_SAMPLES];
+            let mut encoded = vec![0u8; MAX_OPUS_PACKET_BYTES];
+
+            bench.indexed_cyclic(cycle_len, move |index| {
+                let base = ((index as usize % cycle_len) * 2) % rnnoise_frames.len();
+                for half in 0..2 {
+                    let frame = &rnnoise_frames[(base + half) % rnnoise_frames.len()];
+                    // Drive the render reference one frame ahead of the mic so
+                    // the canceller has a correlated far-end to align against.
+                    let render_src = &rnnoise_frames[(base + half + 1) % rnnoise_frames.len()];
+                    normalize_i16_scale(render_src, &mut render);
+                    normalize_i16_scale(black_box(frame.as_slice()), &mut near);
+                    let span = half * RNNOISE_FRAME_SAMPLES..(half + 1) * RNNOISE_FRAME_SAMPLES;
+                    aec.process_render_f32(&[&render], &mut [&mut render_out])
+                        .unwrap();
+                    aec.process_capture_f32(&[&near], &mut [&mut opus_frame[span]])
+                        .unwrap();
+                }
+
+                let len = encoder.encode_float(black_box(opus_frame.as_slice()), &mut encoded);
+                black_box(len);
+                black_box(&encoded[..len]);
+            });
+        });
+}
+
+fn new_aec() -> AudioProcessing {
+    let stream = ApmStreamConfig::new(SAMPLE_RATE as u32, 1);
+    let config = ApmConfig {
+        echo_canceller: Some(Aec3Config::default()),
+        ..ApmConfig::default()
+    };
+    AudioProcessing::builder()
+        .config(config)
+        .capture_config(stream)
+        .render_config(stream)
+        .build()
 }
 
 fn bench_live(bench: &mut Bench<'_>, corpus: Arc<Corpus>) {
@@ -406,6 +457,7 @@ fn bench_live(bench: &mut Bench<'_>, corpus: Arc<Corpus>) {
                         max_amplification: DEFAULT_LIVE_MAX_AMPLIFICATION,
                         denoise: true,
                         auto_gain: true,
+                        echo_cancellation: false,
                     },
                     &frames,
                 )
@@ -432,6 +484,7 @@ fn bench_live(bench: &mut Bench<'_>, corpus: Arc<Corpus>) {
                         max_amplification: DEFAULT_LIVE_MAX_AMPLIFICATION,
                         denoise: true,
                         auto_gain: true,
+                        echo_cancellation: false,
                     },
                     &frames,
                 )
@@ -454,24 +507,29 @@ fn bench_live(bench: &mut Bench<'_>, corpus: Arc<Corpus>) {
                     let frames = Arc::clone(&frames);
                     let packet_loss = LiveAudioPacketLossProfile::from_name(&loss_name)
                         .unwrap_or(LiveAudioPacketLossProfile::ScenarioDefault);
-                    bench.indexed_cyclic(1, move |_| {
-                        let report = run_live_audio_simulation_with_speech(
-                            LiveAudioSimulationConfig {
-                                scenario,
-                                tuning,
-                                duration: LIVE_SIM_DURATION,
-                                streams: 1,
-                                seed: 0xabc0_0003,
-                                packet_loss,
-                                max_amplification: DEFAULT_LIVE_MAX_AMPLIFICATION,
-                                denoise: true,
-                                auto_gain: true,
-                            },
-                            &frames,
-                        )
-                        .unwrap();
-                        black_box(report.rms);
-                        black_box(report.queue_area_ms);
+                    bench.param_str("aec", ["off", "on"], move |bench, aec| {
+                        let frames = Arc::clone(&frames);
+                        let echo_cancellation = aec == "on";
+                        bench.indexed_cyclic(1, move |_| {
+                            let report = run_live_audio_simulation_with_speech(
+                                LiveAudioSimulationConfig {
+                                    scenario,
+                                    tuning,
+                                    duration: LIVE_SIM_DURATION,
+                                    streams: 1,
+                                    seed: 0xabc0_0003,
+                                    packet_loss,
+                                    max_amplification: DEFAULT_LIVE_MAX_AMPLIFICATION,
+                                    denoise: true,
+                                    auto_gain: true,
+                                    echo_cancellation,
+                                },
+                                &frames,
+                            )
+                            .unwrap();
+                            black_box(report.rms);
+                            black_box(report.queue_area_ms);
+                        });
                     });
                 });
             });
@@ -498,6 +556,7 @@ fn bench_live(bench: &mut Bench<'_>, corpus: Arc<Corpus>) {
                             max_amplification: DEFAULT_LIVE_MAX_AMPLIFICATION,
                             denoise: true,
                             auto_gain: true,
+                            echo_cancellation: false,
                         },
                         &frames,
                     )

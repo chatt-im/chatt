@@ -28,8 +28,8 @@ use std::{
 };
 
 use audio::{
-    BufferRequest, DeviceInfo, LiveCapture, LiveCaptureConfig, LiveEncoderProfile, LivePlayback,
-    LivePlaybackConfig, LivePlaybackFeedback, PlaybackStreamControl, StatsSnapshot,
+    BufferRequest, DeviceInfo, EchoReference, LiveCapture, LiveCaptureConfig, LiveEncoderProfile,
+    LivePlayback, LivePlaybackConfig, LivePlaybackFeedback, PlaybackStreamControl, StatsSnapshot,
 };
 use bindings::{BindCommand, PendingChord, Resolved};
 use chat_buffer::VirtualChatBuffer;
@@ -431,6 +431,7 @@ struct App {
     settings_preview_capture: bool,
     allow_settings_preview_capture: bool,
     playback: Option<LivePlayback>,
+    echo_reference: Option<Arc<EchoReference>>,
     muted_users: HashSet<UserId>,
     stream_users: HashMap<u32, UserId>,
     volume_dialog: Option<UserVolumeDialog>,
@@ -537,6 +538,10 @@ impl App {
             &audio_output_items,
             settings_draft.output_device_id.as_deref(),
         );
+        let echo_reference = config
+            .audio
+            .echo_cancellation
+            .then(|| Arc::new(EchoReference::new()));
         Ok(Self {
             server_alias: active_server.alias.clone(),
             user: active_server.effective_display_name(),
@@ -575,6 +580,7 @@ impl App {
             settings_preview_capture: false,
             allow_settings_preview_capture: true,
             playback: None,
+            echo_reference,
             muted_users: HashSet::new(),
             stream_users: HashMap::new(),
             volume_dialog: None,
@@ -1598,6 +1604,7 @@ impl App {
                 max_amplification: self.config.audio.max_amplification,
                 buffer_request: self.buffer_request(),
                 tuning: self.config.audio.latency.to_tuning(),
+                echo_reference: self.echo_reference.clone(),
             },
             move |payload| {
                 if mic_muted.load(Ordering::Relaxed)
@@ -1683,6 +1690,7 @@ impl App {
                 buffer_request: self.buffer_request(),
                 tuning: self.config.audio.latency.to_tuning(),
                 feedback_sender: Some(feedback_tx),
+                echo_reference: self.echo_reference.clone(),
             }) {
                 Ok(playback) => {
                     self.playback = Some(playback);
@@ -3033,6 +3041,7 @@ mod tests {
             settings_preview_capture: false,
             allow_settings_preview_capture: false,
             playback: None,
+            echo_reference: None,
             muted_users: HashSet::new(),
             stream_users: HashMap::new(),
             volume_dialog: None,

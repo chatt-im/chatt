@@ -12,15 +12,22 @@ cargo run --release -p benchmark -- dred/parse
 cargo run --release -p benchmark -- dred/recover_available
 cargo run --release -p benchmark -- rnnoise/process
 cargo run --release -p benchmark -- pipeline/rnnoise_then_encode
+cargo run --release -p benchmark -- pipeline/aec_then_encode
 cargo run --release -p benchmark -- live/call_sim
 cargo run --release -p benchmark -- live/group_call_sim
 ```
+
+`pipeline/aec_then_encode` mirrors `pipeline/rnnoise_then_encode` but runs the
+`sonora` AEC3 echo canceller (render plus capture) as the per-frame DSP step
+ahead of the Opus encode, isolating the echo cancellation overhead. `live/call_sim`
+takes an `aec=off|on` parameter that toggles echo cancellation end to end so the
+on/off wall-clock delta measures the full-pipeline cost.
 
 Filter a profile:
 
 ```sh
 cargo run --release -p benchmark -- opus/encode --param profile=dred_32k_1000ms_loss20
-cargo run --release -p benchmark -- live/call_sim --param scenario=lossy_speech --param feature=all_on --param loss=congested_wifi
+cargo run --release -p benchmark -- live/call_sim --param scenario=lossy_speech --param feature=all_on --param loss=congested_wifi --param aec=on
 cargo run --release -p benchmark -- live/playback_mixer --param feature=skip_off
 ```
 

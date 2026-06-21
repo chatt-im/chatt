@@ -1,4 +1,5 @@
 use std::{
+    cell::UnsafeCell,
     collections::{HashMap, VecDeque},
     fmt, fs,
     io::{self, BufWriter, Write},
@@ -26,6 +27,8 @@ use rubato::{
     WindowFunction,
     audioadapter::{Adapter, AdapterMut},
 };
+use sonora::config::EchoCanceller as Aec3Config;
+use sonora::{AudioProcessing, Config as ApmConfig, StreamConfig as ApmStreamConfig};
 
 use crate::network::{
     AudioPacketRef, EncoderNetworkProfile, EncoderNetworkTuning, InsertOutcome, JitterBuffer,
@@ -131,6 +134,7 @@ pub struct LiveCaptureConfig {
     pub max_amplification: f32,
     pub buffer_request: BufferRequest,
     pub tuning: LiveAudioTuning,
+    pub echo_reference: Option<Arc<EchoReference>>,
 }
 
 #[derive(Clone, Debug)]
@@ -139,6 +143,7 @@ pub struct LivePlaybackConfig {
     pub buffer_request: BufferRequest,
     pub tuning: LiveAudioTuning,
     pub feedback_sender: Option<Sender<LivePlaybackFeedback>>,
+    pub echo_reference: Option<Arc<EchoReference>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1016,6 +1021,7 @@ where
     let worker_stats = stats.clone();
     let worker_max_amplification = Arc::clone(&max_amplification_bits);
     let worker_encoder_loss_percent = Arc::clone(&encoder_loss_percent);
+    let echo_reference = config.echo_reference.clone();
     let worker = thread::spawn(move || {
         run_live_encoder_worker(
             receiver,
@@ -1024,6 +1030,7 @@ where
             worker_max_amplification,
             worker_encoder_loss_percent,
             config.tuning,
+            echo_reference,
             worker_stats,
             on_packet,
         );
@@ -1149,6 +1156,7 @@ pub fn start_live_playback(config: LivePlaybackConfig) -> Result<LivePlayback, S
             selection.stream_config,
             usize::from(selection.supported_config.channels()),
             Arc::clone(&mixer),
+            config.echo_reference.clone(),
         )
     })?;
     with_audio_backend_stderr_suppressed(|| stream.play())
@@ -1502,44 +1510,93 @@ fn build_live_output_stream(
     stream_config: StreamConfig,
     channels: usize,
     mixer: Arc<Mutex<LivePlaybackMixer>>,
+    echo_reference: Option<Arc<EchoReference>>,
 ) -> Result<Stream, String> {
     match sample_format {
-        SampleFormat::I8 => {
-            build_typed_live_output_stream::<i8>(device, stream_config, channels, mixer)
-        }
-        SampleFormat::I16 => {
-            build_typed_live_output_stream::<i16>(device, stream_config, channels, mixer)
-        }
-        SampleFormat::I24 => {
-            build_typed_live_output_stream::<cpal::I24>(device, stream_config, channels, mixer)
-        }
-        SampleFormat::I32 => {
-            build_typed_live_output_stream::<i32>(device, stream_config, channels, mixer)
-        }
-        SampleFormat::I64 => {
-            build_typed_live_output_stream::<i64>(device, stream_config, channels, mixer)
-        }
-        SampleFormat::U8 => {
-            build_typed_live_output_stream::<u8>(device, stream_config, channels, mixer)
-        }
-        SampleFormat::U16 => {
-            build_typed_live_output_stream::<u16>(device, stream_config, channels, mixer)
-        }
-        SampleFormat::U24 => {
-            build_typed_live_output_stream::<cpal::U24>(device, stream_config, channels, mixer)
-        }
-        SampleFormat::U32 => {
-            build_typed_live_output_stream::<u32>(device, stream_config, channels, mixer)
-        }
-        SampleFormat::U64 => {
-            build_typed_live_output_stream::<u64>(device, stream_config, channels, mixer)
-        }
-        SampleFormat::F32 => {
-            build_typed_live_output_stream::<f32>(device, stream_config, channels, mixer)
-        }
-        SampleFormat::F64 => {
-            build_typed_live_output_stream::<f64>(device, stream_config, channels, mixer)
-        }
+        SampleFormat::I8 => build_typed_live_output_stream::<i8>(
+            device,
+            stream_config,
+            channels,
+            mixer,
+            echo_reference,
+        ),
+        SampleFormat::I16 => build_typed_live_output_stream::<i16>(
+            device,
+            stream_config,
+            channels,
+            mixer,
+            echo_reference,
+        ),
+        SampleFormat::I24 => build_typed_live_output_stream::<cpal::I24>(
+            device,
+            stream_config,
+            channels,
+            mixer,
+            echo_reference,
+        ),
+        SampleFormat::I32 => build_typed_live_output_stream::<i32>(
+            device,
+            stream_config,
+            channels,
+            mixer,
+            echo_reference,
+        ),
+        SampleFormat::I64 => build_typed_live_output_stream::<i64>(
+            device,
+            stream_config,
+            channels,
+            mixer,
+            echo_reference,
+        ),
+        SampleFormat::U8 => build_typed_live_output_stream::<u8>(
+            device,
+            stream_config,
+            channels,
+            mixer,
+            echo_reference,
+        ),
+        SampleFormat::U16 => build_typed_live_output_stream::<u16>(
+            device,
+            stream_config,
+            channels,
+            mixer,
+            echo_reference,
+        ),
+        SampleFormat::U24 => build_typed_live_output_stream::<cpal::U24>(
+            device,
+            stream_config,
+            channels,
+            mixer,
+            echo_reference,
+        ),
+        SampleFormat::U32 => build_typed_live_output_stream::<u32>(
+            device,
+            stream_config,
+            channels,
+            mixer,
+            echo_reference,
+        ),
+        SampleFormat::U64 => build_typed_live_output_stream::<u64>(
+            device,
+            stream_config,
+            channels,
+            mixer,
+            echo_reference,
+        ),
+        SampleFormat::F32 => build_typed_live_output_stream::<f32>(
+            device,
+            stream_config,
+            channels,
+            mixer,
+            echo_reference,
+        ),
+        SampleFormat::F64 => build_typed_live_output_stream::<f64>(
+            device,
+            stream_config,
+            channels,
+            mixer,
+            echo_reference,
+        ),
         _ => Err(format!("unsupported output sample format: {sample_format}")),
     }
 }
@@ -1549,6 +1606,7 @@ fn build_typed_live_output_stream<T>(
     stream_config: StreamConfig,
     channels: usize,
     mixer: Arc<Mutex<LivePlaybackMixer>>,
+    echo_reference: Option<Arc<EchoReference>>,
 ) -> Result<Stream, String>
 where
     T: Sample + cpal::SizedSample + FromSample<f32> + Send + 'static,
@@ -1557,7 +1615,7 @@ where
         .build_output_stream(
             stream_config,
             move |output: &mut [T], _| {
-                live_playback_callback(output, channels, &mixer);
+                live_playback_callback(output, channels, &mixer, echo_reference.as_ref());
             },
             move |error| {
                 eprintln!("live playback stream error: {error}");
@@ -1633,6 +1691,7 @@ fn live_playback_callback<T>(
     output: &mut [T],
     channels: usize,
     mixer: &Arc<Mutex<LivePlaybackMixer>>,
+    echo_reference: Option<&Arc<EchoReference>>,
 ) where
     T: Sample + FromSample<f32>,
 {
@@ -1644,12 +1703,19 @@ fn live_playback_callback<T>(
     };
 
     let now = Instant::now();
+    let mut echo_writer = echo_reference.map(|reference| reference.writer());
     for frame in output.chunks_mut(channels.max(1)) {
         let sample = mixer.pop_mixed_sample(now);
+        if let Some(writer) = echo_writer.as_mut() {
+            writer.push(sample);
+        }
         let output_sample = T::from_sample(sample.clamp(-1.0, 1.0));
         for channel in frame {
             *channel = output_sample;
         }
+    }
+    if let Some(writer) = echo_writer {
+        writer.commit();
     }
 }
 
@@ -2133,6 +2199,7 @@ fn run_live_encoder_worker<F>(
     max_amplification_bits: Arc<AtomicU32>,
     encoder_loss_percent: Arc<AtomicU32>,
     tuning: LiveAudioTuning,
+    echo_reference: Option<Arc<EchoReference>>,
     stats: AudioStats,
     mut on_packet: F,
 ) where
@@ -2145,6 +2212,7 @@ fn run_live_encoder_worker<F>(
         &max_amplification_bits,
         &encoder_loss_percent,
         tuning,
+        echo_reference,
         &stats,
         &mut on_packet,
     );
@@ -2209,6 +2277,7 @@ fn run_live_encoder_worker_inner<F>(
     max_amplification_bits: &AtomicU32,
     encoder_loss_percent: &AtomicU32,
     tuning: LiveAudioTuning,
+    echo_reference: Option<Arc<EchoReference>>,
     stats: &AudioStats,
     on_packet: &mut F,
 ) -> Result<(), String>
@@ -2221,6 +2290,7 @@ where
         tuning,
         f32::from_bits(max_amplification_bits.load(Ordering::Relaxed)),
         true,
+        echo_reference,
     );
     let mut applied_loss_percent = LiveEncoderProfile::DRED_20.packet_loss_percent;
 
@@ -2243,6 +2313,196 @@ where
     Ok(())
 }
 
+/// Lock-free single-producer single-consumer ring carrying the mixed playback
+/// signal used as the acoustic echo cancellation render reference.
+///
+/// The playback CPAL callback is the sole producer and the capture worker is
+/// the sole consumer. Samples are mono in the `[-1.0, 1.0]` range, matching the
+/// mixer output. On overflow the newest sample is dropped, on underflow the
+/// reader zero-fills, so neither side ever blocks.
+pub struct EchoReference {
+    slots: Box<[UnsafeCell<f32>]>,
+    mask: usize,
+    head: AtomicUsize,
+    tail: AtomicUsize,
+}
+
+// SAFETY: `head`/`tail` partition `slots` between a single producer (it writes
+// `slots[tail]` then publishes `tail`) and a single consumer (it reads up to
+// `tail` then publishes `head`), so no slot is ever accessed by both at once.
+unsafe impl Send for EchoReference {}
+unsafe impl Sync for EchoReference {}
+
+impl EchoReference {
+    /// Creates a reference ring holding roughly half a second at 48 kHz.
+    pub fn new() -> Self {
+        Self::with_capacity(1 << 15)
+    }
+
+    fn with_capacity(capacity: usize) -> Self {
+        debug_assert!(capacity.is_power_of_two());
+        let mut slots = Vec::with_capacity(capacity);
+        for _ in 0..capacity {
+            slots.push(UnsafeCell::new(0.0));
+        }
+        Self {
+            slots: slots.into_boxed_slice(),
+            mask: capacity - 1,
+            head: AtomicUsize::new(0),
+            tail: AtomicUsize::new(0),
+        }
+    }
+
+    /// Opens a producer-side writer over the ring. The writer buffers slot
+    /// writes locally and publishes them all with a single atomic store on
+    /// [`EchoWriter::commit`], so a realtime callback pays one release fence per
+    /// block rather than one per sample.
+    pub fn writer(&self) -> EchoWriter<'_> {
+        let tail = self.tail.load(Ordering::Relaxed);
+        let head = self.head.load(Ordering::Acquire);
+        EchoWriter {
+            reference: self,
+            tail,
+            free: self.slots.len() - tail.wrapping_sub(head),
+            written: 0,
+        }
+    }
+
+    /// Appends a block of render samples, publishing them with a single atomic
+    /// store. Producer side, never blocks. Drops the samples that do not fit.
+    pub fn push_frame(&self, samples: &[f32]) {
+        let mut writer = self.writer();
+        for &sample in samples {
+            writer.push(sample);
+        }
+        writer.commit();
+    }
+
+    /// Fills `out` with the next render frame. Consumer side, never blocks.
+    /// Zero-fills the tail of `out` on underflow and returns how many real
+    /// samples were available.
+    pub fn pull_frame(&self, out: &mut [f32]) -> usize {
+        let head = self.head.load(Ordering::Relaxed);
+        let tail = self.tail.load(Ordering::Acquire);
+        let available = tail.wrapping_sub(head).min(out.len());
+        for offset in 0..available {
+            // SAFETY: indices in `head..tail` are owned by the consumer.
+            out[offset] = unsafe { *self.slots[head.wrapping_add(offset) & self.mask].get() };
+        }
+        for slot in &mut out[available..] {
+            *slot = 0.0;
+        }
+        self.head
+            .store(head.wrapping_add(available), Ordering::Release);
+        available
+    }
+}
+
+/// Producer-side batch writer for [`EchoReference`].
+///
+/// Created by [`EchoReference::writer`]. Each [`EchoWriter::push`] writes one
+/// slot without any atomic operation. [`EchoWriter::commit`] publishes the whole
+/// run with a single release store. Dropping without committing discards the
+/// buffered samples, which is safe because the shared tail is never advanced.
+pub struct EchoWriter<'a> {
+    reference: &'a EchoReference,
+    tail: usize,
+    free: usize,
+    written: usize,
+}
+
+impl EchoWriter<'_> {
+    /// Buffers one render sample. Drops it when the ring is full because the
+    /// consumer has fallen behind.
+    #[inline]
+    pub fn push(&mut self, sample: f32) {
+        if self.written == self.free {
+            return;
+        }
+        let index = self.tail.wrapping_add(self.written) & self.reference.mask;
+        // SAFETY: the producer solely owns slots in `tail..tail + free` until
+        // `commit` advances the shared tail.
+        unsafe {
+            *self.reference.slots[index].get() = sample;
+        }
+        self.written += 1;
+    }
+
+    /// Publishes every buffered sample to the consumer with one atomic store.
+    #[inline]
+    pub fn commit(self) {
+        self.reference
+            .tail
+            .store(self.tail.wrapping_add(self.written), Ordering::Release);
+    }
+}
+
+impl Default for EchoReference {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl fmt::Debug for EchoReference {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("EchoReference")
+            .field("capacity", &self.slots.len())
+            .finish_non_exhaustive()
+    }
+}
+
+/// Acoustic echo canceller wrapping the WebRTC AEC3 port from the `sonora`
+/// crate. Processes one 10 ms mono frame at 48 kHz per call inside the capture
+/// worker, never in a realtime audio callback.
+struct EchoCanceller {
+    apm: AudioProcessing,
+    render: Vec<f32>,
+    render_out: Vec<f32>,
+    near: Vec<f32>,
+    cleaned: Vec<f32>,
+}
+
+impl EchoCanceller {
+    fn new() -> Self {
+        let stream = ApmStreamConfig::new(SAMPLE_RATE, 1);
+        let config = ApmConfig {
+            echo_canceller: Some(Aec3Config::default()),
+            ..ApmConfig::default()
+        };
+        let apm = AudioProcessing::builder()
+            .config(config)
+            .capture_config(stream)
+            .render_config(stream)
+            .build();
+        Self {
+            apm,
+            render: vec![0.0; FRAME_SAMPLES],
+            render_out: vec![0.0; FRAME_SAMPLES],
+            near: vec![0.0; FRAME_SAMPLES],
+            cleaned: vec![0.0; FRAME_SAMPLES],
+        }
+    }
+
+    /// Cancels echo on one `FRAME_SAMPLES`-long i16-scale capture frame in
+    /// place, aligning it against the latest render reference frame.
+    fn process(&mut self, frame: &mut [f32], reference: &EchoReference) {
+        reference.pull_frame(&mut self.render);
+        for (near, sample) in self.near.iter_mut().zip(frame.iter()) {
+            *near = sample / 32768.0;
+        }
+        let _ = self
+            .apm
+            .process_render_f32(&[&self.render], &mut [&mut self.render_out]);
+        let _ = self
+            .apm
+            .process_capture_f32(&[&self.near], &mut [&mut self.cleaned]);
+        for (sample, cleaned) in frame.iter_mut().zip(self.cleaned.iter()) {
+            *sample = cleaned * 32768.0;
+        }
+    }
+}
+
 struct LiveEncoderPipeline {
     encoder: OpusVoiceEncoder,
     denoise_enabled: bool,
@@ -2261,6 +2521,8 @@ struct LiveEncoderPipeline {
     pending_opus_silence: Vec<bool>,
     next_opus_packet_flags: u8,
     suppressed_frames: u64,
+    echo: Option<EchoCanceller>,
+    echo_reference: Option<Arc<EchoReference>>,
 }
 
 impl LiveEncoderPipeline {
@@ -2270,6 +2532,7 @@ impl LiveEncoderPipeline {
         tuning: LiveAudioTuning,
         max_amplification: f32,
         auto_gain_enabled: bool,
+        echo_reference: Option<Arc<EchoReference>>,
     ) -> Self {
         Self {
             encoder,
@@ -2291,6 +2554,8 @@ impl LiveEncoderPipeline {
             pending_opus_silence: Vec::with_capacity(2),
             next_opus_packet_flags: 0,
             suppressed_frames: 0,
+            echo: echo_reference.as_ref().map(|_| EchoCanceller::new()),
+            echo_reference,
         }
     }
 
@@ -2306,6 +2571,11 @@ impl LiveEncoderPipeline {
     {
         self.auto_gain.set_max_amplification(max_amplification);
         for mut frame in self.accumulator.push_chunk_collect(chunk) {
+            if let (Some(echo), Some(reference)) =
+                (self.echo.as_mut(), self.echo_reference.as_ref())
+            {
+                echo.process(&mut frame, reference);
+            }
             if self.auto_gain_enabled {
                 self.auto_gain.process_frame(&mut frame);
             }
@@ -2452,6 +2722,7 @@ fn build_live_encoder_pipeline(
     max_amplification: f32,
     auto_gain_enabled: bool,
     network_profile: EncoderNetworkProfile,
+    echo_reference: Option<Arc<EchoReference>>,
 ) -> Result<LiveEncoderPipeline, String> {
     let mut encoder = OpusVoiceEncoder::new(network_profile.bitrate_bps)?;
     encoder.apply_network_profile(network_profile)?;
@@ -2461,6 +2732,7 @@ fn build_live_encoder_pipeline(
         tuning,
         max_amplification,
         auto_gain_enabled,
+        echo_reference,
     ))
 }
 
@@ -4295,6 +4567,7 @@ pub struct LiveAudioSimulationConfig {
     pub max_amplification: f32,
     pub denoise: bool,
     pub auto_gain: bool,
+    pub echo_cancellation: bool,
 }
 
 impl Default for LiveAudioSimulationConfig {
@@ -4309,6 +4582,7 @@ impl Default for LiveAudioSimulationConfig {
             max_amplification: DEFAULT_LIVE_MAX_AMPLIFICATION,
             denoise: true,
             auto_gain: true,
+            echo_cancellation: false,
         }
     }
 }
@@ -4849,12 +5123,13 @@ fn run_live_audio_direct_sample_simulation_output_inner(
         max_amplification: config.max_amplification,
         denoise: config.denoise,
         auto_gain: config.auto_gain,
+        echo_cancellation: false,
     };
 
     let mixer = Arc::new(Mutex::new(LivePlaybackMixer::with_tuning(config.tuning)));
     let mut decode_streams = HashMap::new();
     let mut decode_frame = vec![0i16; MAX_OPUS_DECODE_SAMPLES];
-    let mut state = SimStreamState::new(sim_config, simulation_encoder_profile(sim_config))?;
+    let mut state = SimStreamState::new(sim_config, simulation_encoder_profile(sim_config), None)?;
     let mut rng = SimRng::new(config.seed);
     let mut metrics = OnlineAudioMetrics::default();
     let start = Instant::now();
@@ -4991,8 +5266,11 @@ fn run_live_audio_simulation_inner(
     let mut decode_streams = HashMap::new();
     let mut decode_frame = vec![0i16; MAX_OPUS_DECODE_SAMPLES];
     let network_profile = simulation_encoder_profile(config);
+    let echo_reference = config
+        .echo_cancellation
+        .then(|| Arc::new(EchoReference::new()));
     let mut states = (0..simulation_streams(config))
-        .map(|_| SimStreamState::new(config, network_profile))
+        .map(|_| SimStreamState::new(config, network_profile, echo_reference.clone()))
         .collect::<Result<Vec<_>, _>>()?;
     let mut rng = SimRng::new(config.seed);
     let mut metrics = OnlineAudioMetrics::default();
@@ -5042,12 +5320,19 @@ fn run_live_audio_simulation_inner(
         let mut mixer = mixer
             .lock()
             .map_err(|_| "live simulation mixer lock poisoned")?;
+        let mut echo_writer = echo_reference.as_ref().map(|reference| reference.writer());
         for _ in 0..FRAME_SAMPLES {
             let sample = mixer.pop_mixed_sample(now);
+            if let Some(writer) = echo_writer.as_mut() {
+                writer.push(sample);
+            }
             metrics.observe(sample);
             if collect_output {
                 output_samples.push(sample);
             }
+        }
+        if let Some(writer) = echo_writer {
+            writer.commit();
         }
         let snapshot = mixer.snapshot_at(now);
         report.max_queue_ms = report.max_queue_ms.max(snapshot.max_queue_ms);
@@ -5441,6 +5726,7 @@ impl SimStreamState {
     fn new(
         config: LiveAudioSimulationConfig,
         network_profile: EncoderNetworkProfile,
+        echo_reference: Option<Arc<EchoReference>>,
     ) -> Result<Self, String> {
         Ok(Self {
             capture: build_live_encoder_pipeline(
@@ -5449,6 +5735,7 @@ impl SimStreamState {
                 config.max_amplification,
                 config.auto_gain,
                 network_profile,
+                echo_reference,
             )?,
             capture_stats: AudioStats::new(),
             loss: SimLossState::default(),
@@ -6121,6 +6408,7 @@ mod tests {
             DEFAULT_LIVE_MAX_AMPLIFICATION,
             true,
             EncoderNetworkProfile::CRITICAL,
+            None,
         )
         .unwrap();
         let stats = AudioStats::new();
@@ -6191,6 +6479,7 @@ mod tests {
             DEFAULT_LIVE_MAX_AMPLIFICATION,
             true,
             EncoderNetworkProfile::EXCELLENT,
+            None,
         )
         .unwrap();
         let stats = AudioStats::new();
@@ -7552,6 +7841,40 @@ mod tests {
             .as_slice()
     }
 
+    /// Synthetic acoustic echo path for AEC tests. Delays the normalized render
+    /// signal by `delay_frames`, scales it by `gain`, and sums optional near-end
+    /// speech, returning an i16-scale mic frame.
+    struct EchoPath {
+        delay: VecDeque<Vec<f32>>,
+        delay_frames: usize,
+        gain: f32,
+    }
+
+    impl EchoPath {
+        fn new(delay_frames: usize, gain: f32) -> Self {
+            Self {
+                delay: VecDeque::new(),
+                delay_frames,
+                gain,
+            }
+        }
+
+        fn capture(&mut self, render: &[f32], near: &[f32]) -> Vec<f32> {
+            self.delay.push_back(render.to_vec());
+            let echo = if self.delay.len() > self.delay_frames {
+                self.delay.pop_front().unwrap()
+            } else {
+                vec![0.0; render.len()]
+            };
+            let mut mic = Vec::with_capacity(render.len());
+            for index in 0..render.len() {
+                let near_sample = near.get(index).copied().unwrap_or(0.0);
+                mic.push((near_sample + echo[index] * self.gain) * i16::MAX as f32);
+            }
+            mic
+        }
+    }
+
     fn simulate(
         scenario: LiveAudioSimulationScenario,
         duration: Duration,
@@ -7585,6 +7908,7 @@ mod tests {
                 max_amplification: DEFAULT_LIVE_MAX_AMPLIFICATION,
                 denoise: true,
                 auto_gain: true,
+                echo_cancellation: false,
             },
             sample_speech_frames(),
         )
@@ -7605,6 +7929,132 @@ mod tests {
         assert!(report.peak <= 1.0, "{report:?}");
         assert!(report.rms >= min_rms, "{report:?}");
         assert!(report.max_adjacent_delta <= 1.20, "{report:?}");
+        assert!(report.output_ms > 0, "{report:?}");
+    }
+
+    #[test]
+    fn echo_reference_writes_and_reads_in_order() {
+        let reference = EchoReference::with_capacity(8);
+        let mut writer = reference.writer();
+        for value in [1.0, 2.0, 3.0, 4.0] {
+            writer.push(value);
+        }
+        writer.commit();
+        let mut out = [0.0f32; 6];
+        assert_eq!(reference.pull_frame(&mut out), 4);
+        assert_eq!(out, [1.0, 2.0, 3.0, 4.0, 0.0, 0.0]);
+
+        // A second block continues after the first and the reader keeps order.
+        reference.push_frame(&[5.0, 6.0, 7.0]);
+        let mut out = [0.0f32; 3];
+        assert_eq!(reference.pull_frame(&mut out), 3);
+        assert_eq!(out, [5.0, 6.0, 7.0]);
+
+        // Overflow drops the samples that do not fit.
+        let small = EchoReference::with_capacity(4);
+        small.push_frame(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+        let mut out = [0.0f32; 4];
+        assert_eq!(small.pull_frame(&mut out), 4);
+        assert_eq!(out, [1.0, 2.0, 3.0, 4.0]);
+    }
+
+    #[test]
+    fn echo_canceller_attenuates_aligned_echo() {
+        let reference = EchoReference::new();
+        let mut aec = EchoCanceller::new();
+        let frames = sample_speech_frames();
+        let gain = 0.5f32;
+        let warmup = 600usize;
+        let measure = 200usize;
+        let mut echo_path = EchoPath::new(4, gain);
+        let mut echo_in = 0.0f32;
+        let mut residual = 0.0f32;
+        for index in 0..warmup + measure {
+            let render = &frames[index % frames.len()];
+            reference.push_frame(render);
+            let mut mic = echo_path.capture(render, &[]);
+            let before = rms_i16_scale(&mic);
+            aec.process(&mut mic, &reference);
+            let after = rms_i16_scale(&mic);
+            if index >= warmup {
+                echo_in += before;
+                residual += after;
+            }
+        }
+        assert!(
+            residual < echo_in * 0.3,
+            "far-end-only echo should be attenuated: echo_in={echo_in:.1}, residual={residual:.1}"
+        );
+    }
+
+    #[test]
+    fn echo_canceller_preserves_double_talk() {
+        let reference = EchoReference::new();
+        let mut aec = EchoCanceller::new();
+        let frames = sample_speech_frames();
+        let gain = 0.5f32;
+        let warmup = 600usize;
+        let measure = 200usize;
+        let mut echo_path = EchoPath::new(4, gain);
+        let mut near_in = 0.0f32;
+        let mut near_out = 0.0f32;
+        for index in 0..warmup + measure {
+            // Decorrelated far-end and near-end speech segments.
+            let render = &frames[index % frames.len()];
+            let near = &frames[(index + frames.len() / 2) % frames.len()];
+            reference.push_frame(render);
+            let mut mic = echo_path.capture(render, near);
+            let near_only = rms_i16_scale(
+                &near
+                    .iter()
+                    .map(|sample| sample * i16::MAX as f32)
+                    .collect::<Vec<_>>(),
+            );
+            aec.process(&mut mic, &reference);
+            if index >= warmup {
+                near_in += near_only;
+                near_out += rms_i16_scale(&mic);
+            }
+        }
+        assert!(
+            near_out > near_in * 0.4,
+            "near-end speech must survive double talk: near_in={near_in:.1}, near_out={near_out:.1}"
+        );
+    }
+
+    #[test]
+    fn live_encoder_pipeline_enables_aec_only_with_reference() {
+        let without = build_live_encoder_pipeline(
+            test_tuning(),
+            true,
+            DEFAULT_LIVE_MAX_AMPLIFICATION,
+            true,
+            EncoderNetworkProfile::EXCELLENT,
+            None,
+        )
+        .unwrap();
+        assert!(without.echo.is_none());
+
+        let with = build_live_encoder_pipeline(
+            test_tuning(),
+            true,
+            DEFAULT_LIVE_MAX_AMPLIFICATION,
+            true,
+            EncoderNetworkProfile::EXCELLENT,
+            Some(Arc::new(EchoReference::new())),
+        )
+        .unwrap();
+        assert!(with.echo.is_some());
+    }
+
+    #[test]
+    fn live_simulation_runs_with_echo_cancellation() {
+        let config = LiveAudioSimulationConfig {
+            duration: Duration::from_millis(600),
+            echo_cancellation: true,
+            ..Default::default()
+        };
+        let report = run_live_audio_simulation_with_speech(config, sample_speech_frames()).unwrap();
         assert!(report.output_ms > 0, "{report:?}");
     }
 }

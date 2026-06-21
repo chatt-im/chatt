@@ -34,6 +34,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         max_amplification: DEFAULT_LIVE_MAX_AMPLIFICATION,
         denoise: true,
         auto_gain: true,
+        echo_cancellation: false,
     };
 
     let clean_input = render_live_audio_simulation_input(base_config, &speech_frames)?;

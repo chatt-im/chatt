@@ -7,4 +7,5 @@ edition = "2024"
 jsony_bench.path = "/code/jsony/crates/jsony_bench"
 nnnoiseless = { version = "0.5.2", default-features = false }
 opus-codec = { version = "0.1.1", features = ["dred"] }
+sonora = "0.1.0"
 tomchat = { path = "../.." }

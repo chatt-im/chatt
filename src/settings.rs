@@ -49,6 +49,7 @@ pub struct SettingsDraft {
     pub amplification_index: usize,
     pub buffer_index: usize,
     pub denoise: bool,
+    pub echo_cancellation: bool,
     pub latency: AudioLatencyConfig,
 }
 
@@ -67,6 +68,7 @@ impl SettingsDraft {
                 .position(|buffer| *buffer == config.buffer.to_request())
                 .unwrap_or(0),
             denoise: config.denoise,
+            echo_cancellation: config.echo_cancellation,
             latency: config.latency.clone(),
         }
     }
@@ -77,6 +79,7 @@ impl SettingsDraft {
             output_device_id: self.output_device_id.clone(),
             bitrate_bps: BITRATES[self.bitrate_index],
             denoise: self.denoise,
+            echo_cancellation: self.echo_cancellation,
             max_amplification: self.max_amplification(),
             buffer: BufferChoice::from_request(self.buffer_request()),
             latency: self.latency.clone(),

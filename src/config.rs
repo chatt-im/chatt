@@ -136,6 +136,8 @@ pub struct AudioConfig {
     pub bitrate_bps: i32,
     #[toml(default = true)]
     pub denoise: bool,
+    #[toml(default = false)]
+    pub echo_cancellation: bool,
     #[toml(default = DEFAULT_MAX_AMPLIFICATION)]
     pub max_amplification: f32,
     #[toml(default)]
@@ -151,6 +153,7 @@ impl Default for AudioConfig {
             output_device_id: None,
             bitrate_bps: 48_000,
             denoise: true,
+            echo_cancellation: false,
             max_amplification: DEFAULT_MAX_AMPLIFICATION,
             buffer: BufferChoice::Default,
             latency: AudioLatencyConfig::default(),

@@ -23,6 +23,7 @@ mio = { version = "1.2.1", features = ["os-poll", "net"] }
 kvlog = "0.1.5"
 toml-spanner = { version = "1.0.3", features = ["to-toml", "from-toml", "derive"] }
 earshot = "1.1.0"
+sonora = "0.1.0"
 
 [workspace]
 members = ["crates/benchmark", "crates/p2p", "crates/rpc", "crates/server"]

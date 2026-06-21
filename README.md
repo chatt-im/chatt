@@ -121,6 +121,12 @@ enable adaptive catch-up, playback silence skipping, and capture silence gating;
 set `adaptive-catch-up`, `playback-silence-skip`, or `capture-silence-gate` to
 `false` to isolate those behaviors during testing or profiling.
 
+Set `echo-cancellation = true` under `[audio]` to remove far-end speaker audio
+from the microphone before encoding. It uses the speaker mix as the echo
+reference and runs the WebRTC AEC3 canceller as the first capture DSP step. It
+defaults to `false` and is most useful when playing through speakers rather than
+a headset.
+
 The client accepts `--config` / `TOMCHAT_CONFIG` for config path selection.
 
 ## Server Configuration
