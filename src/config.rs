@@ -2,13 +2,16 @@ use std::fs;
 use std::path::PathBuf;
 
 use toml_spanner::Toml;
-use toml_spanner::{Arena, Item, Key, Table};
+use toml_spanner::{Arena, Array, ArrayStyle, Item, Key, Table};
 
 use crate::{audio::BufferRequest, bindings::BindingRuntime, client_net::ClientConfig};
 use rpc::{control::DEFAULT_FILE_SIZE_LIMIT_BYTES, ids::RoomId};
 
 pub const DEFAULT_CONFIG: &str = include_str!("../tomchat.toml");
 pub const DEFAULT_MAX_AMPLIFICATION: f32 = 20.0;
+pub const MIN_USER_VOLUME_DB: f32 = -24.0;
+pub const MAX_USER_VOLUME_DB: f32 = 12.0;
+pub const USER_VOLUME_DB_STEP: f32 = 0.5;
 
 #[derive(Clone, Debug, Toml)]
 #[toml(FromToml, rename_all = "kebab-case")]
@@ -207,6 +210,14 @@ impl FileConfig {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Toml)]
+#[toml(FromToml, ToToml, rename_all = "kebab-case")]
+pub struct UserAudioPreference {
+    pub server_alias: String,
+    pub user_id: u32,
+    pub volume_db: f32,
+}
+
 #[derive(Toml)]
 #[toml(FromToml, recoverable, warn_unknown_fields, rename_all = "kebab-case")]
 pub struct Config {
@@ -220,6 +231,8 @@ pub struct Config {
     pub ui: UiConfig,
     #[toml(default)]
     pub files: FileConfig,
+    #[toml(default)]
+    pub user_audio: Vec<UserAudioPreference>,
     #[toml(default)]
     pub bindings: BindingRuntime,
     #[toml(skip)]
@@ -296,6 +309,13 @@ impl Config {
         {
             self.active_server = server.alias.clone();
         }
+        for preference in &mut self.user_audio {
+            preference.server_alias = preference.server_alias.trim().to_string();
+            preference.volume_db = snap_user_volume_db(preference.volume_db);
+        }
+        self.user_audio
+            .retain(|preference| preference.volume_db != 0.0);
+        self.sort_user_audio();
     }
 
     fn validate(&self, source: &str) -> Result<(), String> {
@@ -332,6 +352,36 @@ impl Config {
                 return Err(format!("{source}: duplicate server alias {}", server.alias));
             }
         }
+        let mut user_audio_keys = std::collections::HashSet::new();
+        for preference in &self.user_audio {
+            validate_server_alias(&preference.server_alias).map_err(|error| {
+                format!(
+                    "{source}: user-audio {}:{}: {error}",
+                    preference.server_alias, preference.user_id
+                )
+            })?;
+            if preference.user_id == 0 {
+                return Err(format!(
+                    "{source}: user-audio {}: user-id must be non-zero",
+                    preference.server_alias
+                ));
+            }
+            if !(MIN_USER_VOLUME_DB..=MAX_USER_VOLUME_DB).contains(&preference.volume_db) {
+                return Err(format!(
+                    "{source}: user-audio {}:{} volume-db must be between {:.1} and {:.1}",
+                    preference.server_alias,
+                    preference.user_id,
+                    MIN_USER_VOLUME_DB,
+                    MAX_USER_VOLUME_DB
+                ));
+            }
+            if !user_audio_keys.insert((preference.server_alias.as_str(), preference.user_id)) {
+                return Err(format!(
+                    "{source}: duplicate user-audio entry for {}:{}",
+                    preference.server_alias, preference.user_id
+                ));
+            }
+        }
         self.active_server().map(|_| ())
     }
 
@@ -356,6 +406,46 @@ impl Config {
 
     pub fn set_active_server(&mut self, alias: String) {
         self.active_server = alias;
+    }
+
+    pub fn user_volume_db(&self, server_alias: &str, user_id: u32) -> f32 {
+        self.user_audio
+            .iter()
+            .find(|preference| {
+                preference.server_alias == server_alias && preference.user_id == user_id
+            })
+            .map_or(0.0, |preference| preference.volume_db)
+    }
+
+    pub fn set_user_volume_db(&mut self, server_alias: &str, user_id: u32, volume_db: f32) {
+        let volume_db = snap_user_volume_db(volume_db);
+        if volume_db == 0.0 {
+            self.user_audio.retain(|preference| {
+                !(preference.server_alias == server_alias && preference.user_id == user_id)
+            });
+            return;
+        }
+
+        if let Some(preference) = self.user_audio.iter_mut().find(|preference| {
+            preference.server_alias == server_alias && preference.user_id == user_id
+        }) {
+            preference.volume_db = volume_db;
+        } else {
+            self.user_audio.push(UserAudioPreference {
+                server_alias: server_alias.to_string(),
+                user_id,
+                volume_db,
+            });
+        }
+        self.sort_user_audio();
+    }
+
+    fn sort_user_audio(&mut self) {
+        self.user_audio.sort_by(|a, b| {
+            a.server_alias
+                .cmp(&b.server_alias)
+                .then_with(|| a.user_id.cmp(&b.user_id))
+        });
     }
 
     pub fn save_runtime(&self) -> Result<PathBuf, String> {
@@ -391,6 +481,19 @@ impl Config {
         fs::write(&path, output)
             .map_err(|err| format!("failed to write {}: {err}", path.display()))?;
         Ok(path)
+    }
+}
+
+pub fn snap_user_volume_db(volume_db: f32) -> f32 {
+    if !volume_db.is_finite() {
+        return 0.0;
+    }
+    let snapped = (volume_db / USER_VOLUME_DB_STEP).round() * USER_VOLUME_DB_STEP;
+    let clamped = snapped.clamp(MIN_USER_VOLUME_DB, MAX_USER_VOLUME_DB);
+    if clamped.abs() < f32::EPSILON {
+        0.0
+    } else {
+        clamped
     }
 }
 
@@ -612,6 +715,29 @@ fn write_runtime_config<'de>(root: &mut Table<'de>, config: &Config, arena: &'de
             arena,
         );
         insert_str(files, "receive-dir", &config.files.receive_dir, arena);
+    }
+
+    root.remove_entry("user-audio");
+    if !config.user_audio.is_empty() {
+        let mut array = Array::try_with_capacity(config.user_audio.len(), arena)
+            .expect("user audio preferences length must fit in TOML array");
+        array.set_style(ArrayStyle::Header);
+        for preference in &config.user_audio {
+            let mut table = Table::new();
+            insert_str(&mut table, "server-alias", &preference.server_alias, arena);
+            table.insert(
+                Key::new("user-id"),
+                Item::from(preference.user_id as i64),
+                arena,
+            );
+            table.insert(
+                Key::new("volume-db"),
+                Item::from(preference.volume_db as f64),
+                arena,
+            );
+            array.push(table.into_item(), arena);
+        }
+        root.insert(Key::new("user-audio"), array.into_item(), arena);
     }
 }
 
@@ -888,5 +1014,45 @@ input-device-index = 20
 
         assert!(content.contains("input-device-id = \"usb mic\""));
         assert!(content.contains("output-device-id = \"usb speakers\""));
+    }
+
+    #[test]
+    fn user_volume_preferences_snap_sort_and_remove_zero() {
+        let mut config = Config::default();
+
+        config.set_user_volume_db("local", 3, -5.4);
+        config.set_user_volume_db("local", 2, 7.6);
+
+        assert_eq!(config.user_volume_db("local", 3), -5.5);
+        assert_eq!(config.user_volume_db("local", 2), 7.5);
+        assert_eq!(config.user_audio[0].user_id, 2);
+        assert_eq!(config.user_audio[1].user_id, 3);
+
+        config.set_user_volume_db("local", 2, 0.0);
+
+        assert_eq!(config.user_volume_db("local", 2), 0.0);
+        assert_eq!(config.user_audio.len(), 1);
+    }
+
+    #[test]
+    fn runtime_config_writes_user_audio_as_array_of_tables() {
+        let mut config = Config::default();
+        config.set_user_volume_db("local", 2, -5.5);
+        let arena = Arena::new();
+        let doc = toml_spanner::parse(DEFAULT_CONFIG, &arena).unwrap();
+        let mut table = doc.table().clone_in(&arena);
+
+        write_runtime_config(&mut table, &config, &arena);
+        let content = String::from_utf8(
+            toml_spanner::Formatting::preserved_from(&doc)
+                .with_span_projection_identity()
+                .format_table_to_bytes(table, &arena),
+        )
+        .unwrap();
+
+        assert!(content.contains("[[user-audio]]"));
+        assert!(content.contains("server-alias = \"local\""));
+        assert!(content.contains("user-id = 2"));
+        assert!(content.contains("volume-db = -5.5"));
     }
 }

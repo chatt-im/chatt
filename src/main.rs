@@ -16,6 +16,7 @@ mod theme;
 mod ui;
 
 use std::{
+    collections::{HashMap, HashSet},
     path::{Path, PathBuf},
     sync::{
         Arc,
@@ -28,12 +29,15 @@ use std::{
 
 use audio::{
     BufferRequest, DeviceInfo, LiveCapture, LiveCaptureConfig, LivePlayback, LivePlaybackConfig,
-    StatsSnapshot,
+    PlaybackStreamControl, StatsSnapshot,
 };
 use bindings::{BindCommand, PendingChord, Resolved};
 use chat_buffer::VirtualChatBuffer;
 use client_net::{NetworkClient, NetworkCommand, NetworkEvent};
-use config::{Config, ServerEntry};
+use config::{
+    Config, MAX_USER_VOLUME_DB, MIN_USER_VOLUME_DB, ServerEntry, USER_VOLUME_DB_STEP,
+    snap_user_volume_db,
+};
 use extui::{
     Buffer, Ellipsis, HAlign, Rect, Style, Terminal, TerminalFlags,
     event::{
@@ -61,6 +65,15 @@ use unicode_width::UnicodeWidthStr;
 
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
 const NAME_COL_WIDTH: u16 = 16;
+const ROOM_SELECTED: Style = Style::DEFAULT
+    .with_bg_rgb(0x24, 0x28, 0x30)
+    .with_fg_rgb(0xf0, 0xf2, 0xe8);
+const VOLUME_DIALOG: Style = Style::DEFAULT
+    .with_bg_rgb(0x18, 0x1b, 0x20)
+    .with_fg_rgb(0xd8, 0xdb, 0xd6);
+const VOLUME_DIALOG_HEADER: Style = Style::DEFAULT
+    .with_bg_rgb(0x35, 0x3b, 0x46)
+    .with_fg_rgb(0xf0, 0xf2, 0xe8);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum StatusKind {
@@ -84,15 +97,19 @@ struct ParticipantState {
 struct Participants {
     entries: Vec<ParticipantState>,
     scroll: usize,
+    selected_user: Option<UserId>,
 }
 
 impl Participants {
     fn replace_room(&mut self, participants: Vec<ParticipantInfo>) {
+        let selected_user = self.selected_user;
         self.entries.clear();
         for participant in participants {
             self.upsert(participant, true);
         }
         self.sort();
+        self.selected_user = selected_user.filter(|user_id| self.contains_user(*user_id));
+        self.ensure_selection();
         self.scroll = 0;
     }
 
@@ -121,6 +138,7 @@ impl Participants {
             });
         }
         self.sort();
+        self.ensure_selection();
     }
 
     fn set_presence(&mut self, participant: ParticipantInfo, online: bool) {
@@ -194,6 +212,9 @@ impl Participants {
             last_voice_at: None,
             active_stream: None,
         });
+        if self.selected_user.is_none() {
+            self.selected_user = Some(user_id);
+        }
         let index = self.entries.len() - 1;
         &mut self.entries[index]
     }
@@ -206,6 +227,63 @@ impl Participants {
                 .then_with(|| b.p2p_direct.cmp(&a.p2p_direct))
                 .then_with(|| a.name.cmp(&b.name))
         });
+    }
+
+    fn contains_user(&self, user_id: UserId) -> bool {
+        self.entries.iter().any(|entry| entry.user_id == user_id)
+    }
+
+    fn ensure_selection(&mut self) {
+        if self
+            .selected_user
+            .is_some_and(|user_id| self.contains_user(user_id))
+        {
+            return;
+        }
+        self.selected_user = self.entries.first().map(|entry| entry.user_id);
+    }
+
+    fn selected_index(&self) -> Option<usize> {
+        let selected_user = self.selected_user?;
+        self.entries
+            .iter()
+            .position(|entry| entry.user_id == selected_user)
+    }
+
+    fn selected(&self) -> Option<&ParticipantState> {
+        let selected_user = self.selected_user?;
+        self.entries
+            .iter()
+            .find(|entry| entry.user_id == selected_user)
+    }
+
+    fn move_selection(&mut self, delta: isize) -> Option<UserId> {
+        if self.entries.is_empty() {
+            self.selected_user = None;
+            self.scroll = 0;
+            return None;
+        }
+        let current = self.selected_index().unwrap_or(0);
+        let next = (current as isize + delta).rem_euclid(self.entries.len() as isize) as usize;
+        let user_id = self.entries[next].user_id;
+        self.selected_user = Some(user_id);
+        Some(user_id)
+    }
+
+    fn keep_selected_visible(&mut self, visible_rows: usize) {
+        let Some(index) = self.selected_index() else {
+            self.scroll = self.scroll.min(self.entries.len().saturating_sub(1));
+            return;
+        };
+        let visible_rows = visible_rows.max(1);
+        if index < self.scroll {
+            self.scroll = index;
+        } else if index >= self.scroll.saturating_add(visible_rows) {
+            self.scroll = index.saturating_add(1).saturating_sub(visible_rows);
+        }
+        self.scroll = self
+            .scroll
+            .min(self.entries.len().saturating_sub(visible_rows));
     }
 }
 
@@ -318,10 +396,57 @@ struct App {
     settings_preview_capture: bool,
     allow_settings_preview_capture: bool,
     playback: Option<LivePlayback>,
+    muted_users: HashSet<UserId>,
+    stream_users: HashMap<u32, UserId>,
+    volume_dialog: Option<UserVolumeDialog>,
     voice_packets_received: u64,
     voice_bytes_received: u64,
     last_network_notice: Option<String>,
     save_config_after_auth: bool,
+}
+
+struct UserVolumeDialog {
+    user_id: UserId,
+    user_name: String,
+    original_db: f32,
+    value_db: f32,
+    editor: Editor,
+    error: Option<String>,
+}
+
+impl UserVolumeDialog {
+    fn new(user_id: UserId, user_name: String, value_db: f32) -> Self {
+        let mut editor = volume_input_editor(value_db);
+        editor.enter_insert_mode();
+        Self {
+            user_id,
+            user_name,
+            original_db: value_db,
+            value_db,
+            editor,
+            error: None,
+        }
+    }
+
+    fn adjust(&mut self, delta_steps: isize) {
+        let next = self.value_db + delta_steps as f32 * USER_VOLUME_DB_STEP;
+        self.value_db = snap_user_volume_db(next);
+        self.editor
+            .set_lines(&format_volume_db_value(self.value_db));
+        self.editor.enter_insert_mode();
+        self.error = None;
+    }
+
+    fn parse_editor_value(&self) -> Result<f32, String> {
+        parse_user_volume_db(&self.editor.text())
+    }
+
+    fn apply_editor_value(&mut self) -> Result<f32, String> {
+        let value = self.parse_editor_value()?;
+        self.value_db = value;
+        self.error = None;
+        Ok(value)
+    }
 }
 
 struct AudioDeviceRefresh {
@@ -414,6 +539,9 @@ impl App {
             settings_preview_capture: false,
             allow_settings_preview_capture: true,
             playback: None,
+            muted_users: HashSet::new(),
+            stream_users: HashMap::new(),
+            volume_dialog: None,
             voice_packets_received: 0,
             voice_bytes_received: 0,
             last_network_notice: None,
@@ -534,6 +662,7 @@ impl App {
                 participants,
             } => {
                 self.chat.clear();
+                self.stream_users.clear();
                 self.participants.replace_room(participants);
                 for message in history {
                     self.push_chat(message);
@@ -553,7 +682,9 @@ impl App {
                 self.set_status(format!("{name} {}", if online { "joined" } else { "left" }));
             }
             NetworkEvent::VoiceStarted { user_id, stream_id } => {
+                self.stream_users.insert(stream_id.0, user_id);
                 self.participants.voice_started(user_id, stream_id);
+                self.apply_user_audio_control(user_id);
                 if Some(user_id) == self.user_id {
                     self.set_status("voice stream ready");
                 } else {
@@ -562,6 +693,7 @@ impl App {
             }
             NetworkEvent::VoiceStopped { user_id, stream_id } => {
                 self.participants.voice_stopped(user_id, stream_id);
+                self.stream_users.remove(&stream_id.0);
                 if Some(user_id) == self.user_id {
                     self.stop_audio();
                     self.set_status("voice stopped");
@@ -595,11 +727,13 @@ impl App {
             NetworkEvent::AuthFailed(error) => {
                 kvlog::warn!("app auth failed", error = error.as_str());
                 self.stop_audio();
+                self.stream_users.clear();
                 self.push_network_notice("auth", &error);
                 self.set_error(auth_failure_status(&error));
             }
             NetworkEvent::ReconnectScheduled { retry_in, reason } => {
                 self.stop_audio();
+                self.stream_users.clear();
                 self.push_network_notice("network", &format!("Connection failed: {reason}"));
                 self.set_error(format!(
                     "connection failed; retrying in {}s",
@@ -608,6 +742,7 @@ impl App {
             }
             NetworkEvent::Disconnected => {
                 self.stop_audio();
+                self.stream_users.clear();
                 self.set_error("disconnected");
             }
         }
@@ -634,6 +769,10 @@ impl App {
     fn process_key(&mut self, key: KeyEvent) -> Action {
         if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
             return Action::Quit;
+        }
+
+        if self.handle_volume_dialog_key(key) {
+            return Action::Continue;
         }
 
         if self.handle_settings_search_key(key) {
@@ -736,8 +875,10 @@ impl App {
             Quit => return Action::Quit,
             ScrollUp => self.chat.scroll_up(1),
             ScrollDown => self.chat.scroll_down(1),
-            RoomScrollUp => self.scroll_room(-1),
-            RoomScrollDown => self.scroll_room(1),
+            RoomScrollUp => self.move_room_selection(-1),
+            RoomScrollDown => self.move_room_selection(1),
+            OpenSelectedUserVolume => self.open_selected_user_volume(),
+            ToggleSelectedUserMute => self.toggle_selected_user_mute(),
             HalfPageUp => self.chat.scroll_up(10),
             HalfPageDown => self.chat.scroll_down(10),
             Top => self.chat.top(self.last_chat_width),
@@ -972,15 +1113,195 @@ impl App {
         self.set_status("settings draft changed; save config when ready");
     }
 
-    fn scroll_room(&mut self, delta: isize) {
-        let max = self.participants.entries.len().saturating_sub(1);
-        if delta < 0 {
-            self.participants.scroll = self
-                .participants
-                .scroll
-                .saturating_sub(delta.unsigned_abs());
+    fn move_room_selection(&mut self, delta: isize) {
+        if self.participants.move_selection(delta).is_none() {
+            self.set_status("no users in the current room yet");
+            return;
+        }
+        self.keep_selected_room_user_visible();
+    }
+
+    fn keep_selected_room_user_visible(&mut self) {
+        self.participants
+            .keep_selected_visible(self.config.ui.room_height as usize);
+    }
+
+    fn selected_room_user(&self) -> Option<(UserId, String)> {
+        self.participants
+            .selected()
+            .map(|entry| (entry.user_id, entry.name.clone()))
+    }
+
+    fn selected_remote_room_user(&mut self) -> Option<(UserId, String)> {
+        let Some((user_id, name)) = self.selected_room_user() else {
+            self.set_status("select a user first");
+            return None;
+        };
+        if Some(user_id) == self.user_id {
+            self.set_status("select another user for local playback controls");
+            return None;
+        }
+        Some((user_id, name))
+    }
+
+    fn open_selected_user_volume(&mut self) {
+        let Some((user_id, name)) = self.selected_remote_room_user() else {
+            return;
+        };
+        let value_db = self.config.user_volume_db(&self.server_alias, user_id.0);
+        self.volume_dialog = Some(UserVolumeDialog::new(user_id, name.clone(), value_db));
+        self.set_status(format!("adjusting local volume for {name}"));
+    }
+
+    fn toggle_selected_user_mute(&mut self) {
+        let Some((user_id, name)) = self.selected_remote_room_user() else {
+            return;
+        };
+        let muted = if self.muted_users.contains(&user_id) {
+            self.muted_users.remove(&user_id);
+            false
         } else {
-            self.participants.scroll = (self.participants.scroll + delta as usize).min(max);
+            self.muted_users.insert(user_id);
+            true
+        };
+        self.apply_user_audio_control(user_id);
+        self.set_status(format!(
+            "{} {name} locally",
+            if muted { "muted" } else { "unmuted" }
+        ));
+    }
+
+    fn handle_volume_dialog_key(&mut self, key: KeyEvent) -> bool {
+        let Some(mut dialog) = self.volume_dialog.take() else {
+            return false;
+        };
+        if matches!(key.kind, KeyEventKind::Release) {
+            self.volume_dialog = Some(dialog);
+            return true;
+        }
+
+        match key.code {
+            KeyCode::Esc => {
+                self.config.set_user_volume_db(
+                    &self.server_alias,
+                    dialog.user_id.0,
+                    dialog.original_db,
+                );
+                self.apply_user_audio_control_with_volume(dialog.user_id, dialog.original_db);
+                self.set_status(format!("canceled local volume for {}", dialog.user_name));
+            }
+            KeyCode::Enter => match dialog.parse_editor_value() {
+                Ok(value_db) => {
+                    dialog.value_db = value_db;
+                    self.config
+                        .set_user_volume_db(&self.server_alias, dialog.user_id.0, value_db);
+                    self.apply_user_audio_control_with_volume(dialog.user_id, value_db);
+                    match self.config.save_runtime() {
+                        Ok(path) => {
+                            self.config.config_path = Some(path.clone());
+                            self.set_status(format!(
+                                "saved local volume {}dB for {} to {}",
+                                format_signed_db(value_db),
+                                dialog.user_name,
+                                path.display()
+                            ));
+                        }
+                        Err(error) => {
+                            dialog.error = Some(error.clone());
+                            self.volume_dialog = Some(dialog);
+                            self.set_error(error);
+                        }
+                    }
+                }
+                Err(error) => {
+                    dialog.error = Some(error.clone());
+                    self.volume_dialog = Some(dialog);
+                    self.set_error(error);
+                }
+            },
+            KeyCode::Left | KeyCode::Down => {
+                dialog.adjust(-1);
+                self.apply_user_audio_control_with_volume(dialog.user_id, dialog.value_db);
+                self.volume_dialog = Some(dialog);
+            }
+            KeyCode::Right | KeyCode::Up => {
+                dialog.adjust(1);
+                self.apply_user_audio_control_with_volume(dialog.user_id, dialog.value_db);
+                self.volume_dialog = Some(dialog);
+            }
+            _ if dialog.editor.send_key(&key) => {
+                match dialog.apply_editor_value() {
+                    Ok(value_db) => {
+                        self.apply_user_audio_control_with_volume(dialog.user_id, value_db);
+                    }
+                    Err(error) => {
+                        dialog.error = Some(error);
+                    }
+                }
+                self.volume_dialog = Some(dialog);
+            }
+            _ => {
+                self.volume_dialog = Some(dialog);
+            }
+        }
+        true
+    }
+
+    fn effective_user_volume_db(&self, user_id: UserId) -> f32 {
+        if let Some(dialog) = &self.volume_dialog
+            && dialog.user_id == user_id
+        {
+            return dialog.value_db;
+        }
+        self.config.user_volume_db(&self.server_alias, user_id.0)
+    }
+
+    fn user_playback_control_with_volume(
+        &self,
+        user_id: UserId,
+        volume_db: f32,
+    ) -> PlaybackStreamControl {
+        PlaybackStreamControl {
+            muted: self.muted_users.contains(&user_id),
+            volume_db,
+        }
+    }
+
+    fn user_playback_control(&self, user_id: UserId) -> PlaybackStreamControl {
+        self.user_playback_control_with_volume(user_id, self.effective_user_volume_db(user_id))
+    }
+
+    fn apply_user_audio_control(&self, user_id: UserId) {
+        let control = self.user_playback_control(user_id);
+        self.apply_user_audio_control_inner(user_id, control);
+    }
+
+    fn apply_user_audio_control_with_volume(&self, user_id: UserId, volume_db: f32) {
+        let control = self.user_playback_control_with_volume(user_id, volume_db);
+        self.apply_user_audio_control_inner(user_id, control);
+    }
+
+    fn apply_user_audio_control_inner(&self, user_id: UserId, control: PlaybackStreamControl) {
+        let Some(playback) = &self.playback else {
+            return;
+        };
+        for stream_id in self
+            .stream_users
+            .iter()
+            .filter_map(|(stream_id, stream_user)| (*stream_user == user_id).then_some(*stream_id))
+        {
+            playback.set_stream_control(stream_id, control);
+        }
+    }
+
+    fn apply_all_user_audio_controls(&self) {
+        let users = self
+            .stream_users
+            .values()
+            .copied()
+            .collect::<HashSet<UserId>>();
+        for user_id in users {
+            self.apply_user_audio_control(user_id);
         }
     }
 
@@ -1277,6 +1598,7 @@ impl App {
             }) {
                 Ok(playback) => {
                     self.playback = Some(playback);
+                    self.apply_all_user_audio_controls();
                     if capture_ok {
                         self.set_status("voice active");
                     }
@@ -1343,6 +1665,50 @@ fn handle_audio_picker_search_key(
     }
 
     false
+}
+
+fn volume_input_editor(value_db: f32) -> Editor {
+    let mut editor = Editor::new();
+    editor.set_single_line(true);
+    editor.set_wrap(false);
+    editor.set_height_bounds(1, 1);
+    editor.set_theme(theme::join_input_editor_theme());
+    editor.set_lines(&format_volume_db_value(value_db));
+    editor.enter_insert_mode();
+    editor
+}
+
+fn parse_user_volume_db(value: &str) -> Result<f32, String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Err("volume dB value is empty".to_string());
+    }
+    let parsed = value
+        .parse::<f32>()
+        .map_err(|_| "volume dB value must be a number".to_string())?;
+    if !(MIN_USER_VOLUME_DB..=MAX_USER_VOLUME_DB).contains(&parsed) {
+        return Err(format!(
+            "volume dB value must be between {:.1} and {:.1}",
+            MIN_USER_VOLUME_DB, MAX_USER_VOLUME_DB
+        ));
+    }
+    Ok(snap_user_volume_db(parsed))
+}
+
+fn format_volume_db_value(value_db: f32) -> String {
+    format!("{value_db:.1}")
+}
+
+fn format_signed_db(value_db: f32) -> String {
+    if value_db > 0.0 {
+        format!("+{value_db:.1}")
+    } else {
+        format!("{value_db:.1}")
+    }
+}
+
+fn volume_db_label(value_db: f32) -> String {
+    format!("{}dB", format_signed_db(value_db))
 }
 
 impl Drop for App {
@@ -2044,6 +2410,7 @@ fn render(app: &mut App, buf: &mut Buffer) {
     }
     draw_status(status_area, app, buf, capture.as_ref());
     draw_composer(composer_area, app, buf);
+    draw_volume_dialog(buf.rect(), app, buf);
 }
 
 fn composer_height(app: &mut App, width: u16) -> u16 {
@@ -2061,6 +2428,7 @@ fn draw_room(area: Rect, app: &App, buf: &mut Buffer) {
     let start = app.participants.scroll.min(app.participants.entries.len());
     for participant in app.participants.entries.iter().skip(start).take(visible) {
         let row = rows.take_top(1);
+        let selected = Some(participant.user_id) == app.participants.selected_user;
         let state =
             if Some(participant.user_id) == app.user_id && app.deafened.load(Ordering::Relaxed) {
                 "deaf"
@@ -2078,17 +2446,161 @@ fn draw_room(area: Rect, app: &App, buf: &mut Buffer) {
             .map(age_label)
             .or_else(|| participant.last_message_ms.map(|_| "msg".to_string()))
             .unwrap_or_else(|| "--".to_string());
-        let style = if participant.online {
+        let base = if selected {
+            ROOM_SELECTED
+        } else {
+            theme::PANEL_ALT
+        };
+        let style = if selected {
+            base.patch(theme::GOOD)
+        } else if participant.online {
             theme::TEXT
         } else {
             theme::MUTED
         };
-        row.with(theme::PANEL_ALT).fill(buf);
+        let marker = if selected { ">" } else { " " };
+        let control = room_user_control_label(app, participant);
+        row.with(base).fill(buf);
         row.with(style).with(Ellipsis(true)).text(
             buf,
-            &format!("  {:<16} {:<7} {}", participant.name, state, spoke),
+            &format!(
+                "{marker} {:<16} {:<7} {:<5} {}",
+                participant.name, state, spoke, control
+            ),
         );
     }
+}
+
+fn room_user_control_label(app: &App, participant: &ParticipantState) -> String {
+    if Some(participant.user_id) == app.user_id {
+        return String::new();
+    }
+    let muted = app.muted_users.contains(&participant.user_id);
+    let volume_db = app.effective_user_volume_db(participant.user_id);
+    match (muted, volume_db == 0.0) {
+        (false, true) => String::new(),
+        (false, false) => volume_db_label(volume_db),
+        (true, true) => "muted".to_string(),
+        (true, false) => format!("muted {}", volume_db_label(volume_db)),
+    }
+}
+
+fn draw_volume_dialog(area: Rect, app: &mut App, buf: &mut Buffer) {
+    let Some(dialog) = app.volume_dialog.as_mut() else {
+        return;
+    };
+    if area.w < 24 || area.h < 6 {
+        return;
+    }
+
+    let width = area.w.min(58);
+    let height = area.h.min(7);
+    let panel = Rect {
+        x: area.x + area.w.saturating_sub(width) / 2,
+        y: area.y + area.h.saturating_sub(height) / 2,
+        w: width,
+        h: height,
+    };
+    buf.clear_rect(panel, VOLUME_DIALOG);
+
+    let mut rows = panel;
+    rows.take_top(1)
+        .with(VOLUME_DIALOG_HEADER | Modifier::BOLD)
+        .with(Ellipsis(true))
+        .text(buf, &format!(" Local volume: {} ", dialog.user_name));
+
+    let mut body = rows.inset(2, 0);
+    body.take_top(1)
+        .with(VOLUME_DIALOG.patch(theme::MUTED))
+        .with(Ellipsis(true))
+        .text(
+            buf,
+            &format!(
+                "User {}  saved {}",
+                dialog.user_id.0,
+                volume_db_label(dialog.original_db)
+            ),
+        );
+
+    let mut slider_row = body.take_top(1);
+    let label = volume_db_label(dialog.value_db);
+    let label_width = label.width() as u16 + 1;
+    let slider_width = slider_row.w.saturating_sub(label_width).max(8);
+    slider_row
+        .take_left(slider_width as i32)
+        .with(VOLUME_DIALOG.patch(theme::GOOD))
+        .with(Ellipsis(true))
+        .text(buf, &volume_slider(dialog.value_db, slider_width));
+    slider_row
+        .with(VOLUME_DIALOG.patch(theme::TEXT))
+        .with(Ellipsis(true))
+        .text(buf, &format!(" {label}"));
+
+    let mut input_row = body.take_top(1);
+    input_row
+        .take_left(8)
+        .with(VOLUME_DIALOG.patch(theme::MUTED))
+        .text(buf, "Offset");
+    let field_width = input_row.w.min(14);
+    let mut field = input_row.take_left(field_width as i32);
+    field.with(theme::JOIN_INPUT_BOUNDARY_ACTIVE).fill(buf);
+    if field.w > 2 {
+        field
+            .take_left(1)
+            .with(theme::JOIN_INPUT_BOUNDARY_ACTIVE)
+            .text(buf, " ");
+        field
+            .take_right(1)
+            .with(theme::JOIN_INPUT_BOUNDARY_ACTIVE)
+            .text(buf, " ");
+    }
+    field.with(theme::JOIN_INPUT_ACTIVE).fill(buf);
+    dialog.editor.render(field, buf);
+    input_row
+        .with(VOLUME_DIALOG.patch(theme::MUTED))
+        .with(Ellipsis(true))
+        .text(buf, " dB");
+
+    let footer = body.take_top(1);
+    if let Some(error) = &dialog.error {
+        footer
+            .with(VOLUME_DIALOG.patch(theme::ERROR))
+            .with(Ellipsis(true))
+            .text(buf, error);
+    } else {
+        footer
+            .with(VOLUME_DIALOG.patch(theme::SUBTLE))
+            .with(Ellipsis(true))
+            .text(
+                buf,
+                &format!("Pending {}", volume_db_label(dialog.value_db)),
+            );
+    }
+}
+
+fn volume_slider(value_db: f32, width: u16) -> String {
+    let inner = width.saturating_sub(2).max(1) as usize;
+    let span = MAX_USER_VOLUME_DB - MIN_USER_VOLUME_DB;
+    let value_ratio = ((value_db - MIN_USER_VOLUME_DB) / span).clamp(0.0, 1.0);
+    let zero_ratio = ((0.0 - MIN_USER_VOLUME_DB) / span).clamp(0.0, 1.0);
+    let value_index = (value_ratio * inner.saturating_sub(1) as f32).round() as usize;
+    let zero_index = (zero_ratio * inner.saturating_sub(1) as f32).round() as usize;
+
+    let mut out = String::with_capacity(inner + 2);
+    out.push('[');
+    for index in 0..inner {
+        if index == value_index {
+            out.push('|');
+        } else if index == zero_index {
+            out.push('0');
+        } else if index < value_index {
+            out.push('=');
+        } else {
+            out.push('-');
+        }
+    }
+    out.push(']');
+    out
 }
 
 fn draw_room_title(area: Rect, app: &App, buf: &mut Buffer) {
@@ -2405,6 +2917,9 @@ mod tests {
             settings_preview_capture: false,
             allow_settings_preview_capture: false,
             playback: None,
+            muted_users: HashSet::new(),
+            stream_users: HashMap::new(),
+            volume_dialog: None,
             voice_packets_received: 0,
             voice_bytes_received: 0,
             last_network_notice: None,
@@ -2550,6 +3065,141 @@ mod tests {
             .find(|entry| entry.user_id == UserId(2))
             .expect("bob participant");
         assert!(!bob.p2p_direct);
+    }
+
+    #[test]
+    fn participant_selection_moves_and_survives_sorting() {
+        let mut participants = Participants::default();
+        participants.replace_room(vec![
+            ParticipantInfo {
+                user_id: UserId(1),
+                name: "alice".to_string(),
+                in_call: false,
+            },
+            ParticipantInfo {
+                user_id: UserId(2),
+                name: "bob".to_string(),
+                in_call: false,
+            },
+        ]);
+
+        assert_eq!(participants.selected_user, Some(UserId(1)));
+        assert_eq!(participants.move_selection(1), Some(UserId(2)));
+        participants.keep_selected_visible(1);
+        assert_eq!(participants.scroll, 1);
+
+        participants.upsert(
+            ParticipantInfo {
+                user_id: UserId(2),
+                name: "bob".to_string(),
+                in_call: true,
+            },
+            true,
+        );
+
+        assert_eq!(participants.selected_user, Some(UserId(2)));
+        assert_eq!(participants.selected_index(), Some(0));
+    }
+
+    #[test]
+    fn selected_user_mute_is_session_only() {
+        let mut app = test_app();
+        app.participants.replace_room(vec![
+            ParticipantInfo {
+                user_id: UserId(1),
+                name: "alice".to_string(),
+                in_call: true,
+            },
+            ParticipantInfo {
+                user_id: UserId(2),
+                name: "bob".to_string(),
+                in_call: true,
+            },
+        ]);
+        app.move_room_selection(1);
+
+        app.toggle_selected_user_mute();
+        assert!(app.muted_users.contains(&UserId(2)));
+        assert!(app.config.user_audio.is_empty());
+
+        app.toggle_selected_user_mute();
+        assert!(!app.muted_users.contains(&UserId(2)));
+        assert!(app.config.user_audio.is_empty());
+    }
+
+    #[test]
+    fn volume_dialog_parses_decimal_values() {
+        assert_eq!(parse_user_volume_db("-5.5").unwrap(), -5.5);
+        assert_eq!(parse_user_volume_db("-5.4").unwrap(), -5.5);
+        assert!(parse_user_volume_db("-25").is_err());
+        assert!(parse_user_volume_db("loud").is_err());
+    }
+
+    #[test]
+    fn volume_dialog_saves_persisted_user_offset() {
+        let mut app = test_app();
+        let path = std::env::temp_dir().join(format!(
+            "tomchat-user-volume-dialog-{}.toml",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        app.config.config_path = Some(path.clone());
+        app.participants.replace_room(vec![
+            ParticipantInfo {
+                user_id: UserId(1),
+                name: "alice".to_string(),
+                in_call: true,
+            },
+            ParticipantInfo {
+                user_id: UserId(2),
+                name: "bob".to_string(),
+                in_call: true,
+            },
+        ]);
+        app.move_room_selection(1);
+        app.open_selected_user_volume();
+        app.volume_dialog
+            .as_mut()
+            .expect("dialog")
+            .editor
+            .set_lines("-5.5");
+
+        assert!(app.handle_volume_dialog_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty())));
+
+        assert!(app.volume_dialog.is_none());
+        assert_eq!(app.config.user_volume_db("local", 2), -5.5);
+        let content = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(path);
+        assert!(content.contains("[[user-audio]]"));
+        assert!(content.contains("user-id = 2"));
+        assert!(content.contains("volume-db = -5.5"));
+    }
+
+    #[test]
+    fn volume_dialog_cancel_restores_original_offset() {
+        let mut app = test_app();
+        app.config.set_user_volume_db("local", 2, -2.0);
+        app.participants.replace_room(vec![
+            ParticipantInfo {
+                user_id: UserId(1),
+                name: "alice".to_string(),
+                in_call: true,
+            },
+            ParticipantInfo {
+                user_id: UserId(2),
+                name: "bob".to_string(),
+                in_call: true,
+            },
+        ]);
+        app.move_room_selection(1);
+        app.open_selected_user_volume();
+
+        assert!(app.handle_volume_dialog_key(KeyEvent::new(KeyCode::Right, KeyModifiers::empty())));
+        assert_eq!(app.volume_dialog.as_ref().unwrap().value_db, -1.5);
+        assert!(app.handle_volume_dialog_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::empty())));
+
+        assert!(app.volume_dialog.is_none());
+        assert_eq!(app.config.user_volume_db("local", 2), -2.0);
     }
 
     #[test]

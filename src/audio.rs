@@ -111,6 +111,12 @@ pub struct RemoteVoicePacket {
     pub payload: Vec<u8>,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct PlaybackStreamControl {
+    pub muted: bool,
+    pub volume_db: f32,
+}
+
 pub struct Recording {
     stream: Option<Stream>,
     worker: Option<JoinHandle<()>>,
@@ -139,6 +145,7 @@ pub struct LivePlayback {
 enum LivePlaybackCommand {
     Packet(RemoteVoicePacket),
     StopStream(u32),
+    SetStreamControl(u32, PlaybackStreamControl),
 }
 
 struct OpusVoiceEncoder {
@@ -334,6 +341,12 @@ impl LivePlayback {
     pub fn stop_stream(&self, stream_id: u32) {
         if let Some(sender) = &self.sender {
             let _ = sender.send(LivePlaybackCommand::StopStream(stream_id));
+        }
+    }
+
+    pub fn set_stream_control(&self, stream_id: u32, control: PlaybackStreamControl) {
+        if let Some(sender) = &self.sender {
+            let _ = sender.send(LivePlaybackCommand::SetStreamControl(stream_id, control));
         }
     }
 
@@ -1701,6 +1714,11 @@ fn handle_live_playback_command(
                 mixer.remove_stream(stream_id);
             }
         }
+        LivePlaybackCommand::SetStreamControl(stream_id, control) => {
+            if let Ok(mut mixer) = mixer.lock() {
+                mixer.set_stream_control(stream_id, control);
+            }
+        }
     }
 }
 
@@ -1811,6 +1829,7 @@ impl LiveJitterStream {
 #[derive(Default)]
 struct LivePlaybackMixer {
     streams: HashMap<u32, VecDeque<i16>>,
+    controls: HashMap<u32, PlaybackStreamControl>,
 }
 
 impl LivePlaybackMixer {
@@ -1839,6 +1858,15 @@ impl LivePlaybackMixer {
 
     fn remove_stream(&mut self, stream_id: u32) {
         self.streams.remove(&stream_id);
+        self.controls.remove(&stream_id);
+    }
+
+    fn set_stream_control(&mut self, stream_id: u32, control: PlaybackStreamControl) {
+        if control == PlaybackStreamControl::default() {
+            self.controls.remove(&stream_id);
+        } else {
+            self.controls.insert(stream_id, control);
+        }
     }
 
     fn queued_samples(&self) -> usize {
@@ -1850,13 +1878,18 @@ impl LivePlaybackMixer {
         let mut only_sample = 0i16;
         let mut sum = 0.0f32;
 
-        for queue in self.streams.values_mut() {
+        for (stream_id, queue) in self.streams.iter_mut() {
             let Some(sample) = queue.pop_front() else {
                 continue;
             };
+            let control = self.controls.get(stream_id).copied().unwrap_or_default();
+            if control.muted {
+                continue;
+            }
+            let gain = db_to_gain(control.volume_db);
             active += 1;
-            only_sample = sample;
-            sum += sample as f32 / 32768.0;
+            only_sample = apply_sample_gain(sample, gain);
+            sum += (sample as f32 / 32768.0) * gain;
         }
 
         match active {
@@ -1864,6 +1897,22 @@ impl LivePlaybackMixer {
             1 => only_sample,
             _ => normalized_to_pcm_i16(soft_limit(sum / (active as f32).sqrt())),
         }
+    }
+}
+
+fn db_to_gain(db: f32) -> f32 {
+    if db == 0.0 {
+        1.0
+    } else {
+        10.0_f32.powf(db / 20.0)
+    }
+}
+
+fn apply_sample_gain(sample: i16, gain: f32) -> i16 {
+    if gain == 1.0 {
+        sample
+    } else {
+        normalized_to_pcm_i16((sample as f32 / 32768.0) * gain)
     }
 }
 
@@ -2245,6 +2294,40 @@ mod tests {
 
         assert_eq!(mixer.queued_samples(), 2);
         assert_eq!(mixer.pop_mixed_sample(), 4);
+    }
+
+    #[test]
+    fn mixer_applies_stream_gain() {
+        let mut mixer = LivePlaybackMixer::new();
+        mixer.set_stream_control(
+            1,
+            PlaybackStreamControl {
+                muted: false,
+                volume_db: 6.0,
+            },
+        );
+        mixer.queue_stream_samples(1, &[10_000]);
+
+        let boosted = mixer.pop_mixed_sample();
+
+        assert!(boosted > 10_000);
+        assert!(boosted <= 20_000);
+    }
+
+    #[test]
+    fn mixer_muted_streams_consume_samples_without_output() {
+        let mut mixer = LivePlaybackMixer::new();
+        mixer.set_stream_control(
+            1,
+            PlaybackStreamControl {
+                muted: true,
+                volume_db: 0.0,
+            },
+        );
+        mixer.queue_stream_samples(1, &[10_000]);
+
+        assert_eq!(mixer.pop_mixed_sample(), 0);
+        assert_eq!(mixer.queued_samples(), 0);
     }
 
     fn test_audio_packet(sequence: u32, payload: &[u8]) -> AudioPacketRef<'_> {
