@@ -1,0 +1,56 @@
+[package]
+name = "opus-codec"
+version = "0.2.0"
+edition = "2024"
+authors = ["Denis Avvakumov"]
+description = "Safe Rust bindings for the Opus audio codec"
+rust-version = "1.87"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/Deniskore/opus-codec"
+homepage = "https://github.com/Deniskore"
+keywords = ["audio", "codec", "compression", "opus", "voice"]
+categories = ["api-bindings", "encoding", "compression", "multimedia::audio"]
+readme = "README.md"
+exclude = [
+    "opus/opus_data-*.tar.gz",
+    "opus/dnn/models/**",
+    "opus/dnn/dred_rdovae_constants.h",
+    "opus/dnn/dred_rdovae_dec_data.c",
+    "opus/dnn/dred_rdovae_dec_data.h",
+    "opus/dnn/dred_rdovae_enc_data.c",
+    "opus/dnn/dred_rdovae_enc_data.h",
+    "opus/dnn/dred_rdovae_stats_data.c",
+    "opus/dnn/dred_rdovae_stats_data.h",
+    "opus/dnn/bbwenet_data.c",
+    "opus/dnn/bbwenet_data.h",
+    "opus/dnn/fargan_data.c",
+    "opus/dnn/fargan_data.h",
+    "opus/dnn/lace_data.c",
+    "opus/dnn/lace_data.h",
+    "opus/dnn/lossgen_data.c",
+    "opus/dnn/lossgen_data.h",
+    "opus/dnn/nolace_data.c",
+    "opus/dnn/nolace_data.h",
+    "opus/dnn/pitchdnn_data.c",
+    "opus/dnn/pitchdnn_data.h",
+    "opus/dnn/plc_data.c",
+    "opus/dnn/plc_data.h",
+]
+
+[dependencies]
+
+[build-dependencies]
+cmake = { version = "0.1" }
+bindgen = "0.72.1"
+pkg-config = "0.3.33"
+sha2 = "0.10.9"
+
+[features]
+default = []
+dred = []
+system-lib = []
+presume-avx2 = []
+
+[dev-dependencies]
+rand = "0.10.1"
+tempfile = "3.27.0"

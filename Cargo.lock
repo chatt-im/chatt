@@ -101,7 +101,7 @@ dependencies = [
  "chatt",
  "jsony_bench",
  "nnnoiseless",
- "opus-codec 0.1.2",
+ "opus-codec",
  "sonora",
 ]
 
@@ -220,6 +220,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9330f8b2ff13f34540b44e946ef35111825727b38d33286ef986142615121801"
 
 [[package]]
+name = "chacha20"
+version = "0.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6f8d983286843e49675a4b7a2d174efe136dc93a18d69130dd18198a6c167601"
+dependencies = [
+ "cfg-if",
+ "cpufeatures 0.3.0",
+ "rand_core",
+]
+
+[[package]]
 name = "chatt"
 version = "0.1.0"
 dependencies = [
@@ -235,7 +246,7 @@ dependencies = [
  "libc",
  "mio",
  "nnnoiseless",
- "opus-codec 0.2.0",
+ "opus-codec",
  "ring",
  "rpc",
  "rubato",
@@ -446,6 +457,7 @@ dependencies = [
 [[package]]
 name = "extui"
 version = "0.1.3"
+source = "git+https://github.com/exrok/extui?rev=0db2ec429bc437f4d330b24e7642e539c44b8a6a#0db2ec429bc437f4d330b24e7642e539c44b8a6a"
 dependencies = [
  "bitflags",
  "itoap",
@@ -458,6 +470,7 @@ dependencies = [
 [[package]]
 name = "extui-bindings"
 version = "0.1.0"
+source = "git+https://github.com/exrok/extui?rev=0db2ec429bc437f4d330b24e7642e539c44b8a6a#0db2ec429bc437f4d330b24e7642e539c44b8a6a"
 dependencies = [
  "extui",
  "foldhash",
@@ -467,12 +480,19 @@ dependencies = [
 [[package]]
 name = "extui-editor"
 version = "0.1.0"
+source = "git+https://github.com/exrok/extui?rev=0db2ec429bc437f4d330b24e7642e539c44b8a6a#0db2ec429bc437f4d330b24e7642e539c44b8a6a"
 dependencies = [
  "extui",
  "extui-bindings",
  "unicode-segmentation",
  "unicode-width",
 ]
+
+[[package]]
+name = "fastrand"
+version = "2.4.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9f1f227452a390804cdb637b74a86990f2a7d7ba4b7d5693aac9b4dd6defd8d6"
 
 [[package]]
 name = "find-msvc-tools"
@@ -515,6 +535,18 @@ dependencies = [
  "cfg-if",
  "libc",
  "wasi",
+]
+
+[[package]]
+name = "getrandom"
+version = "0.4.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "300e883d756b2e4ec94e02791f39b04b522276138852cfc41d9fb7e904106099"
+dependencies = [
+ "cfg-if",
+ "libc",
+ "r-efi",
+ "rand_core",
 ]
 
 [[package]]
@@ -698,6 +730,12 @@ dependencies = [
  "cfg-if",
  "windows-link",
 ]
+
+[[package]]
+name = "linux-raw-sys"
+version = "0.12.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "32a66949e030da00e8c7d4434b251670a91556f4144941d37452769c25d58a53"
 
 [[package]]
 name = "lock_api"
@@ -970,23 +1008,14 @@ checksum = "9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50"
 
 [[package]]
 name = "opus-codec"
-version = "0.1.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "37755dfadaa9c70fd26a4c1ea13d9bd035993cd0a19eb5b76449301609228280"
-dependencies = [
- "bindgen",
- "cmake",
- "pkg-config",
-]
-
-[[package]]
-name = "opus-codec"
 version = "0.2.0"
 dependencies = [
  "bindgen",
  "cmake",
  "pkg-config",
+ "rand",
  "sha2",
+ "tempfile",
 ]
 
 [[package]]
@@ -1106,6 +1135,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "r-efi"
+version = "6.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf"
+
+[[package]]
+name = "rand"
+version = "0.10.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d2e8e8bcc7961af1fdac401278c6a831614941f6164ee3bf4ce61b7edb162207"
+dependencies = [
+ "chacha20",
+ "getrandom 0.4.3",
+ "rand_core",
+]
+
+[[package]]
+name = "rand_core"
+version = "0.10.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "63b8176103e19a2643978565ca18b50549f6101881c443590420e4dc998a3c69"
+
+[[package]]
 name = "realfft"
 version = "3.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1160,7 +1212,7 @@ checksum = "a4689e6c2294d81e88dc6261c768b63bc4fcdb852be6d1352498b114f61383b7"
 dependencies = [
  "cc",
  "cfg-if",
- "getrandom",
+ "getrandom 0.2.17",
  "libc",
  "untrusted",
  "windows-sys 0.52.0",
@@ -1215,6 +1267,19 @@ dependencies = [
  "primal-check",
  "strength_reduce",
  "transpose",
+]
+
+[[package]]
+name = "rustix"
+version = "1.1.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b6fe4565b9518b83ef4f91bb47ce29620ca828bd32cb7e408f0062e9930ba190"
+dependencies = [
+ "bitflags",
+ "errno",
+ "libc",
+ "linux-raw-sys",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1432,6 +1497,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "tempfile"
+version = "3.27.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
+dependencies = [
+ "fastrand",
+ "getrandom 0.4.3",
+ "once_cell",
+ "rustix",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "thiserror"
 version = "1.0.69"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1474,6 +1552,7 @@ dependencies = [
 [[package]]
 name = "tinyhl"
 version = "0.1.1"
+source = "git+https://github.com/exrok/extui?rev=0db2ec429bc437f4d330b24e7642e539c44b8a6a#0db2ec429bc437f4d330b24e7642e539c44b8a6a"
 dependencies = [
  "unicode-ident",
 ]
