@@ -2,8 +2,8 @@ use std::process::Command;
 
 #[test]
 fn opt_in_linux_netns_veth_smoke() {
-    if std::env::var("TOMCHAT_NETNS_TESTS").ok().as_deref() != Some("1") {
-        eprintln!("skipping netns smoke test; set TOMCHAT_NETNS_TESTS=1 to enable");
+    if std::env::var("CHATT_NETNS_TESTS").ok().as_deref() != Some("1") {
+        eprintln!("skipping netns smoke test; set CHATT_NETNS_TESTS=1 to enable");
         return;
     }
 
@@ -16,8 +16,8 @@ fn opt_in_linux_netns_veth_smoke() {
     }
 
     let suffix = std::process::id();
-    let ns_a = format!("tomchat-p2p-a-{suffix}");
-    let ns_b = format!("tomchat-p2p-b-{suffix}");
+    let ns_a = format!("chatt-p2p-a-{suffix}");
+    let ns_b = format!("chatt-p2p-b-{suffix}");
     let veth_a = format!("tcpa{suffix}");
     let veth_b = format!("tcpb{suffix}");
     let cleanup = Cleanup {

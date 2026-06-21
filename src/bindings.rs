@@ -146,11 +146,11 @@ pub fn resolve(
 impl Default for BindingRuntime {
     fn default() -> Self {
         let arena = toml_spanner::Arena::new();
-        let mut doc = toml_spanner::parse(DEFAULT_CONFIG, &arena)
-            .expect("embedded tomchat config must parse");
+        let mut doc =
+            toml_spanner::parse(DEFAULT_CONFIG, &arena).expect("embedded chatt config must parse");
         let config = doc
             .to::<crate::config::Config>()
-            .expect("embedded tomchat config must deserialize");
+            .expect("embedded chatt config must deserialize");
         config.bindings
     }
 }

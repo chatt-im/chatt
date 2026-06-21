@@ -1828,7 +1828,7 @@ impl Drop for App {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = std::env::args().collect::<Vec<_>>();
     let logfile =
-        config::value_arg(&args, "--logfile").or_else(|| std::env::var("TOMCHAT_LOGFILE").ok());
+        config::value_arg(&args, "--logfile").or_else(|| std::env::var("CHATT_LOGFILE").ok());
     let _logger = if let Some(logfile) = logfile {
         kvlog::collector::init_file_logger(&logfile)
     } else {
@@ -1869,7 +1869,7 @@ fn run_app(
     let mut app = App::new(config, pairing_code, save_config_after_auth)?;
     let control_socket = local_control::ControlSocket::spawn(app.network.sender())?;
     kvlog::info!(
-        "tomchat local control socket ready",
+        "chatt local control socket ready",
         path = %control_socket.path().display()
     );
 
@@ -1924,12 +1924,12 @@ fn parse_cli_command(args: &[String]) -> Result<CliCommand, String> {
         if arg == "upload" {
             let path = args
                 .get(index + 1)
-                .ok_or_else(|| "usage: tomchat upload file_path".to_string())?;
+                .ok_or_else(|| "usage: chatt upload file_path".to_string())?;
             if path.is_empty() {
-                return Err("usage: tomchat upload file_path".to_string());
+                return Err("usage: chatt upload file_path".to_string());
             }
             if args.len() != index + 2 {
-                return Err("usage: tomchat upload file_path".to_string());
+                return Err("usage: chatt upload file_path".to_string());
             }
             return Ok(CliCommand::Upload {
                 path: PathBuf::from(path),
@@ -1938,12 +1938,12 @@ fn parse_cli_command(args: &[String]) -> Result<CliCommand, String> {
         if arg == "join" {
             let join_string = args
                 .get(index + 1)
-                .ok_or_else(|| "usage: tomchat join JOIN_STRING".to_string())?;
+                .ok_or_else(|| "usage: chatt join JOIN_STRING".to_string())?;
             if join_string.is_empty() {
-                return Err("usage: tomchat join JOIN_STRING".to_string());
+                return Err("usage: chatt join JOIN_STRING".to_string());
             }
             if args.len() != index + 2 {
-                return Err("usage: tomchat join JOIN_STRING".to_string());
+                return Err("usage: chatt join JOIN_STRING".to_string());
             }
             return Ok(CliCommand::Join {
                 join_string: join_string.clone(),
@@ -1951,7 +1951,7 @@ fn parse_cli_command(args: &[String]) -> Result<CliCommand, String> {
         }
         if arg == "debug-audio-inputs" {
             if args.len() != index + 1 {
-                return Err("usage: tomchat debug-audio-inputs".to_string());
+                return Err("usage: chatt debug-audio-inputs".to_string());
             }
             return Ok(CliCommand::DebugAudioInputs);
         }
@@ -1971,7 +1971,7 @@ fn cli_option_takes_value(arg: &str) -> bool {
 
 fn absolute_upload_path(path: &Path) -> Result<PathBuf, String> {
     if path.as_os_str().is_empty() {
-        return Err("usage: tomchat upload file_path".to_string());
+        return Err("usage: chatt upload file_path".to_string());
     }
     if path.is_absolute() {
         return Ok(path.to_path_buf());
@@ -3071,7 +3071,7 @@ mod tests {
     #[test]
     fn parses_upload_subcommand_after_value_options() {
         let args = vec![
-            "tomchat".to_string(),
+            "chatt".to_string(),
             "--config".to_string(),
             "dev.toml".to_string(),
             "upload".to_string(),
@@ -3089,7 +3089,7 @@ mod tests {
     #[test]
     fn parses_join_subcommand_after_value_options() {
         let args = vec![
-            "tomchat".to_string(),
+            "chatt".to_string(),
             "--config".to_string(),
             "dev.toml".to_string(),
             "join".to_string(),
@@ -3107,7 +3107,7 @@ mod tests {
     #[test]
     fn upload_subcommand_rejects_extra_args() {
         let args = vec![
-            "tomchat".to_string(),
+            "chatt".to_string(),
             "upload".to_string(),
             "foo.md".to_string(),
             "bar.md".to_string(),
@@ -3119,7 +3119,7 @@ mod tests {
     #[test]
     fn parses_debug_audio_inputs_subcommand_after_value_options() {
         let args = vec![
-            "tomchat".to_string(),
+            "chatt".to_string(),
             "--config".to_string(),
             "dev.toml".to_string(),
             "debug-audio-inputs".to_string(),
@@ -3265,7 +3265,7 @@ mod tests {
     fn volume_dialog_saves_persisted_user_offset() {
         let mut app = test_app();
         let path = std::env::temp_dir().join(format!(
-            "tomchat-user-volume-dialog-{}.toml",
+            "chatt-user-volume-dialog-{}.toml",
             std::process::id()
         ));
         let _ = std::fs::remove_file(&path);

@@ -8,7 +8,7 @@ use rpc::{
 };
 use toml_spanner::{Item, Toml};
 
-pub const DEFAULT_SERVER_CONFIG: &str = include_str!("../../../tomchat-server.toml");
+pub const DEFAULT_SERVER_CONFIG: &str = include_str!("../../../chatt-server.toml");
 const SECRET_HASH_PREFIX: &str = "sha256:";
 const SHA256_HEX_LEN: usize = 64;
 
@@ -118,10 +118,10 @@ impl Default for Config {
     fn default() -> Self {
         let arena = toml_spanner::Arena::new();
         let mut doc = toml_spanner::parse(DEFAULT_SERVER_CONFIG, &arena)
-            .expect("embedded tomchat server config must parse");
+            .expect("embedded chatt server config must parse");
         let mut config: Self = doc
             .to()
-            .expect("embedded tomchat server config must deserialize");
+            .expect("embedded chatt server config must deserialize");
         config.apply_inferred_addresses(false, false);
         config.normalize();
         config
@@ -132,7 +132,7 @@ impl Config {
     pub fn load(path: Option<&str>) -> Result<Self, String> {
         let config_path = path
             .map(PathBuf::from)
-            .or_else(|| std::env::var_os("TOMCHAT_SERVER_CONFIG").map(PathBuf::from))
+            .or_else(|| std::env::var_os("CHATT_SERVER_CONFIG").map(PathBuf::from))
             .or_else(default_config_path);
 
         let (content, source) = if let Some(path) = &config_path {
@@ -342,7 +342,7 @@ impl Config {
 
     fn to_toml_string(&self) -> String {
         let mut out = String::new();
-        out.push_str("# tomchat server configuration\n\n");
+        out.push_str("# chatt server configuration\n\n");
         out.push_str("[network]\n");
         out.push_str(&format!("tcp-addr = \"{}\"\n", self.network.tcp_addr));
         if self.network.udp_addr != self.network.tcp_addr {
@@ -477,11 +477,11 @@ fn parse_secret_hash(stored_hash: &str) -> Option<[u8; 32]> {
 }
 
 fn default_config_path() -> Option<PathBuf> {
-    let explicit = std::env::var_os("TOMCHAT_SERVER_CONFIG").map(PathBuf::from);
+    let explicit = std::env::var_os("CHATT_SERVER_CONFIG").map(PathBuf::from);
     if explicit.is_some() {
         return explicit;
     }
-    let local = PathBuf::from("tomchat-server.toml");
+    let local = PathBuf::from("chatt-server.toml");
     local.exists().then_some(local)
 }
 
@@ -514,7 +514,7 @@ fn reject_deprecated_config_keys(
         })
     {
         return Err(format!(
-            "failed to deserialize {source}: users.pairing-code-hash is not supported; use `tomchat-server invite USER`"
+            "failed to deserialize {source}: users.pairing-code-hash is not supported; use `chatt-server invite USER`"
         ));
     }
     Ok(())
@@ -660,7 +660,7 @@ mod tests {
     #[test]
     fn mark_user_paired_persists_token_hash_and_display_name() {
         let path = std::env::temp_dir().join(format!(
-            "tomchat-server-pairing-test-{}.toml",
+            "chatt-server-pairing-test-{}.toml",
             std::process::id()
         ));
         let mut config = Config::default();
@@ -685,7 +685,7 @@ mod tests {
     #[test]
     fn mark_user_paired_creates_new_user() {
         let path = std::env::temp_dir().join(format!(
-            "tomchat-server-new-user-pairing-test-{}.toml",
+            "chatt-server-new-user-pairing-test-{}.toml",
             std::process::id()
         ));
         let mut config = Config::default();

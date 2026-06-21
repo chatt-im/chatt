@@ -98,11 +98,11 @@ checksum = "f2032f911046de80f0a198e0901378627c33f59ea0ac00e363d481118bd70a53"
 name = "benchmark"
 version = "0.1.0"
 dependencies = [
+ "chatt",
  "jsony_bench",
  "nnnoiseless",
  "opus-codec 0.1.2",
  "sonora",
- "tomchat",
 ]
 
 [[package]]
@@ -218,6 +218,39 @@ name = "cfg-if"
 version = "1.0.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9330f8b2ff13f34540b44e946ef35111825727b38d33286ef986142615121801"
+
+[[package]]
+name = "chatt"
+version = "0.1.0"
+dependencies = [
+ "bwrap",
+ "chatt-p2p",
+ "cpal",
+ "earshot",
+ "extui",
+ "extui-bindings",
+ "extui-editor",
+ "jsony",
+ "kvlog",
+ "libc",
+ "mio",
+ "nnnoiseless",
+ "opus-codec 0.2.0",
+ "ring",
+ "rpc",
+ "rubato",
+ "sonora",
+ "tinyhl",
+ "toml-spanner",
+ "unicode-width",
+]
+
+[[package]]
+name = "chatt-p2p"
+version = "0.1.0"
+dependencies = [
+ "libc",
+]
 
 [[package]]
 name = "clang-sys"
@@ -1443,39 +1476,6 @@ name = "tinyhl"
 version = "0.1.1"
 dependencies = [
  "unicode-ident",
-]
-
-[[package]]
-name = "tomchat"
-version = "0.1.0"
-dependencies = [
- "bwrap",
- "cpal",
- "earshot",
- "extui",
- "extui-bindings",
- "extui-editor",
- "jsony",
- "kvlog",
- "libc",
- "mio",
- "nnnoiseless",
- "opus-codec 0.2.0",
- "ring",
- "rpc",
- "rubato",
- "sonora",
- "tinyhl",
- "tomchat-p2p",
- "toml-spanner",
- "unicode-width",
-]
-
-[[package]]
-name = "tomchat-p2p"
-version = "0.1.0"
-dependencies = [
- "libc",
 ]
 
 [[package]]

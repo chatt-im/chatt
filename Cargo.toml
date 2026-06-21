@@ -1,5 +1,5 @@
 [package]
-name = "tomchat"
+name = "chatt"
 version = "0.1.0"
 edition = "2024"
 
@@ -18,7 +18,7 @@ rubato = { version = "3.0", default-features = false }
 ring = "0.17.14"
 jsony = "0.1.10"
 rpc.path = "crates/rpc"
-tomchat-p2p.path = "crates/p2p"
+chatt-p2p.path = "crates/p2p"
 mio = { version = "1.2.1", features = ["os-poll", "net"] }
 kvlog = "0.1.5"
 toml-spanner = { version = "1.0.3", features = ["to-toml", "from-toml", "derive"] }

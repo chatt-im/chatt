@@ -1,5 +1,5 @@
-# Default tomchat configuration. User configuration is loaded from
-# ~/.config/tomchat.toml unless --config or TOMCHAT_CONFIG is provided.
+# Default chatt configuration. User configuration is loaded from
+# ~/.config/chatt.toml unless --config or CHATT_CONFIG is provided.
 
 active-server = "local"
 

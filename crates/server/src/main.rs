@@ -44,14 +44,14 @@ const POLL_TIMEOUT: Duration = Duration::from_millis(100);
 const INVITE_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let _logger = kvlog::spawn_collector_from_env(Some("tomchat-server"), false);
+    let _logger = kvlog::spawn_collector_from_env(Some("chatt-server"), false);
     let args = std::env::args().collect::<Vec<_>>();
     if args.get(1).is_some_and(|arg| arg == "invite") {
         let user = args
             .get(2)
-            .ok_or_else(|| invalid_config("usage: tomchat-server invite USER".to_string()))?;
+            .ok_or_else(|| invalid_config("usage: chatt-server invite USER".to_string()))?;
         if args.len() != 3 || user.trim().is_empty() {
-            return Err(invalid_config("usage: tomchat-server invite USER".to_string()).into());
+            return Err(invalid_config("usage: chatt-server invite USER".to_string()).into());
         }
         let join_string = local_admin::send_invite(user).map_err(invalid_config)?;
         println!("{join_string}");
@@ -89,19 +89,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let admin_socket = AdminSocket::spawn(admin_tx).map_err(invalid_config)?;
     if p2p_enabled && udp_probe_addr.is_some() {
         println!(
-            "tomchat server listening on tcp {tcp_addr}, udp {udp_addr}, probe {udp_probe_label}"
+            "chatt server listening on tcp {tcp_addr}, udp {udp_addr}, probe {udp_probe_label}"
         );
     } else if p2p_enabled {
-        println!("tomchat server listening on tcp {tcp_addr}, udp {udp_addr}");
+        println!("chatt server listening on tcp {tcp_addr}, udp {udp_addr}");
     } else {
-        println!("tomchat server listening on tcp {tcp_addr}, udp {udp_addr} (P2P disabled)");
+        println!("chatt server listening on tcp {tcp_addr}, udp {udp_addr} (P2P disabled)");
     }
     println!(
-        "tomchat invite endpoints: tcp {public_tcp_addr}, udp {public_udp_addr}, probe {public_udp_probe_addr}"
+        "chatt invite endpoints: tcp {public_tcp_addr}, udp {public_udp_addr}, probe {public_udp_probe_addr}"
     );
-    println!("tomchat server public key: {server_public_key}");
+    println!("chatt server public key: {server_public_key}");
     println!(
-        "tomchat transport encryption: {}",
+        "chatt transport encryption: {}",
         if server.config.security.encryption {
             "enabled"
         } else {
@@ -109,7 +109,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     );
     println!(
-        "tomchat P2P support: {}",
+        "chatt P2P support: {}",
         if server.config.network.p2p_enabled {
             "enabled"
         } else {
@@ -117,7 +117,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     );
     println!(
-        "tomchat server control socket: {}",
+        "chatt server control socket: {}",
         admin_socket.path().display()
     );
     kvlog::info!(
@@ -708,7 +708,7 @@ impl Server {
                 token,
                 ERROR_PAIRING_NOT_ACTIVE,
                 format!(
-                    "pairing failed for '{user_name}': no active invite exists on this server; the invite may have expired, been replaced, or already been used. Ask the admin to run `tomchat-server invite {user_name}` again"
+                    "pairing failed for '{user_name}': no active invite exists on this server; the invite may have expired, been replaced, or already been used. Ask the admin to run `chatt-server invite {user_name}` again"
                 ),
             );
         };
@@ -723,7 +723,7 @@ impl Server {
                 token,
                 ERROR_PAIRING_CODE_MISMATCH,
                 format!(
-                    "pairing failed for '{user_name}': the join string secret does not match the active invite; use the newest join string from `tomchat-server invite {user_name}`"
+                    "pairing failed for '{user_name}': the join string secret does not match the active invite; use the newest join string from `chatt-server invite {user_name}`"
                 ),
             );
         }

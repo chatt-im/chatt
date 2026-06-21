@@ -11,7 +11,7 @@ use crate::{
 };
 use rpc::{control::DEFAULT_FILE_SIZE_LIMIT_BYTES, ids::RoomId};
 
-pub const DEFAULT_CONFIG: &str = include_str!("../tomchat.toml");
+pub const DEFAULT_CONFIG: &str = include_str!("../chatt.toml");
 pub const DEFAULT_MAX_AMPLIFICATION: f32 = crate::audio::DEFAULT_LIVE_MAX_AMPLIFICATION;
 pub const MIN_USER_VOLUME_DB: f32 = -24.0;
 pub const MAX_USER_VOLUME_DB: f32 = 12.0;
@@ -368,9 +368,9 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         let arena = Arena::new();
-        let mut doc = toml_spanner::parse(DEFAULT_CONFIG, &arena)
-            .expect("embedded tomchat config must parse");
-        let mut config: Self = doc.to().expect("embedded tomchat config must deserialize");
+        let mut doc =
+            toml_spanner::parse(DEFAULT_CONFIG, &arena).expect("embedded chatt config must parse");
+        let mut config: Self = doc.to().expect("embedded chatt config must deserialize");
         config.apply_inferred_addresses(false, false);
         config.normalize();
         config
@@ -381,7 +381,7 @@ impl Config {
     pub fn load(path: Option<&str>) -> Result<Self, String> {
         let config_path = path
             .map(PathBuf::from)
-            .or_else(|| std::env::var_os("TOMCHAT_CONFIG").map(PathBuf::from))
+            .or_else(|| std::env::var_os("CHATT_CONFIG").map(PathBuf::from))
             .or_else(default_config_path);
 
         let (content, source) = if let Some(path) = &config_path {
@@ -654,7 +654,7 @@ fn reject_deprecated_config_keys(
         })
     {
         return Err(format!(
-            "failed to deserialize {source}: servers.pairing-code is not supported; use `tomchat join JOIN_STRING`"
+            "failed to deserialize {source}: servers.pairing-code is not supported; use `chatt join JOIN_STRING`"
         ));
     }
     if doc
@@ -676,7 +676,7 @@ pub fn value_arg(args: &[String], key: &str) -> Option<String> {
 }
 
 fn default_config_path() -> Option<PathBuf> {
-    let explicit = std::env::var_os("TOMCHAT_CONFIG").map(PathBuf::from);
+    let explicit = std::env::var_os("CHATT_CONFIG").map(PathBuf::from);
     if explicit.is_some() {
         return explicit;
     }
@@ -710,7 +710,7 @@ fn server_udp_addr_configured(doc: &toml_spanner::Document<'_>) -> Vec<bool> {
 }
 
 fn user_config_path() -> Option<PathBuf> {
-    std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config/tomchat.toml"))
+    std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config/chatt.toml"))
 }
 
 fn non_empty_string(value: &str) -> Option<String> {
@@ -1192,7 +1192,7 @@ room-id = 1
     #[test]
     fn rejects_legacy_input_device_index() {
         let path = std::env::temp_dir().join(format!(
-            "tomchat-config-legacy-input-device-index-{}.toml",
+            "chatt-config-legacy-input-device-index-{}.toml",
             std::process::id()
         ));
         std::fs::write(

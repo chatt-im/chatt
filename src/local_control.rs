@@ -17,11 +17,11 @@ mod imp {
 
     use crate::client_net::NetworkCommand;
 
-    pub const SOCKET_ENV: &str = "TOMCHAT_CONTROL_SOCKET";
-    pub const RUN_DIR_ENV: &str = "TOMCHAT_RUN_DIR";
+    pub const SOCKET_ENV: &str = "CHATT_CONTROL_SOCKET";
+    pub const RUN_DIR_ENV: &str = "CHATT_RUN_DIR";
 
     const SOCKET_NAME: &str = "control.sock";
-    const MAGIC: &[u8] = b"tomchat-control-v1\0";
+    const MAGIC: &[u8] = b"chatt-control-v1\0";
     const OP_UPLOAD: u8 = 1;
     const STATUS_OK: u8 = 0;
     const STATUS_ERROR: u8 = 1;
@@ -122,7 +122,7 @@ mod imp {
     fn send_upload_to_path(socket_path: &Path, path: &Path) -> Result<String, String> {
         let mut stream = UnixStream::connect(socket_path).map_err(|error| {
             format!(
-                "no active tomchat control socket at {}; start tomchat or set {SOCKET_ENV}: {error}",
+                "no active chatt control socket at {}; start chatt or set {SOCKET_ENV}: {error}",
                 socket_path.display()
             )
         })?;
@@ -175,9 +175,9 @@ mod imp {
         let run_dir = if let Some(path) = env::var_os(RUN_DIR_ENV) {
             PathBuf::from(path)
         } else if let Some(path) = env::var_os("XDG_RUNTIME_DIR") {
-            PathBuf::from(path).join("tomchat")
+            PathBuf::from(path).join("chatt")
         } else {
-            env::temp_dir().join(format!("tomchat-{}", current_uid()))
+            env::temp_dir().join(format!("chatt-{}", current_uid()))
         };
 
         if run_dir.as_os_str().is_empty() {
@@ -227,7 +227,7 @@ mod imp {
             Ok(listener) => Ok(listener),
             Err(error) if error.kind() == io::ErrorKind::AddrInUse => match stale_socket(path)? {
                 StaleSocket::Live => Err(format!(
-                    "another tomchat instance is already listening on {}; set {SOCKET_ENV} or {RUN_DIR_ENV} to use a different control socket",
+                    "another chatt instance is already listening on {}; set {SOCKET_ENV} or {RUN_DIR_ENV} to use a different control socket",
                     path.display()
                 )),
                 StaleSocket::Stale => {
@@ -287,7 +287,7 @@ mod imp {
                     },
                     Err(_) => Response {
                         status: STATUS_ERROR,
-                        message: "tomchat network worker is not running".to_string(),
+                        message: "chatt network worker is not running".to_string(),
                     },
                 }
             }
@@ -481,7 +481,7 @@ mod imp {
                 .unwrap()
                 .as_nanos();
             env::temp_dir().join(format!(
-                "tomchat-local-control-{name}-{}-{suffix}",
+                "chatt-local-control-{name}-{}-{suffix}",
                 std::process::id()
             ))
         }
@@ -498,7 +498,7 @@ mod imp {
 
     impl ControlSocket {
         pub fn spawn(_commands: Sender<NetworkCommand>) -> Result<Self, String> {
-            Err("tomchat local control sockets are only supported on Unix".to_string())
+            Err("chatt local control sockets are only supported on Unix".to_string())
         }
 
         pub fn path(&self) -> &Path {
@@ -507,7 +507,7 @@ mod imp {
     }
 
     pub fn send_upload(_path: &Path) -> Result<String, String> {
-        Err("tomchat upload is only supported on Unix".to_string())
+        Err("chatt upload is only supported on Unix".to_string())
     }
 }
 

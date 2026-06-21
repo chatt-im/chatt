@@ -1,4 +1,4 @@
-# tomchat benchmarks
+# chatt benchmarks
 
 This crate uses `jsony_bench` to quantify the hot audio paths against
 `assets/sample-001.opus`.
@@ -53,8 +53,8 @@ window events.
 Save and compare runs with `jsony_bench`:
 
 ```sh
-cargo run --release -p benchmark -- opus/encode --save /tmp/tomchat-opus-base.json
-cargo run --release -p benchmark -- opus/encode --compare /tmp/tomchat-opus-base.json
+cargo run --release -p benchmark -- opus/encode --save /tmp/chatt-opus-base.json
+cargo run --release -p benchmark -- opus/encode --compare /tmp/chatt-opus-base.json
 ```
 
 Notes:

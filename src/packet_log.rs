@@ -78,7 +78,7 @@ impl<R: Read> PacketLogReader<R> {
         if &header_bytes[..MAGIC.len()] != MAGIC {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "invalid tomchat opus packet-log magic",
+                "invalid chatt opus packet-log magic",
             ));
         }
 

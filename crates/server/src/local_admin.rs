@@ -15,7 +15,7 @@ mod imp {
     };
 
     const SOCKET_NAME: &str = "control.sock";
-    const MAGIC: &[u8] = b"tomchat-server-control-v1\0";
+    const MAGIC: &[u8] = b"chatt-server-control-v1\0";
     const OP_INVITE: u8 = 1;
     const STATUS_OK: u8 = 0;
     const STATUS_ERROR: u8 = 1;
@@ -122,7 +122,7 @@ mod imp {
     fn send_invite_to_path(socket_path: &Path, user: &str) -> Result<String, String> {
         let mut stream = UnixStream::connect(socket_path).map_err(|error| {
             format!(
-                "no active tomchat server control socket at {}; start tomchat-server first: {error}",
+                "no active chatt server control socket at {}; start chatt-server first: {error}",
                 socket_path.display()
             )
         })?;
@@ -156,9 +156,9 @@ mod imp {
 
     fn socket_config() -> Result<SocketConfig, String> {
         let run_dir = if let Some(path) = env::var_os("XDG_RUNTIME_DIR") {
-            PathBuf::from(path).join("tomchat-server")
+            PathBuf::from(path).join("chatt-server")
         } else {
-            env::temp_dir().join(format!("tomchat-server-{}", current_uid()))
+            env::temp_dir().join(format!("chatt-server-{}", current_uid()))
         };
         if run_dir.as_os_str().is_empty() {
             return Err("server control run directory must not be empty".to_string());
@@ -207,7 +207,7 @@ mod imp {
             Ok(listener) => Ok(listener),
             Err(error) if error.kind() == io::ErrorKind::AddrInUse => match stale_socket(path)? {
                 StaleSocket::Live => Err(format!(
-                    "another tomchat server is already listening on {}",
+                    "another chatt server is already listening on {}",
                     path.display()
                 )),
                 StaleSocket::Stale => {
@@ -284,7 +284,7 @@ mod imp {
                         },
                         Err(_) => Response {
                             status: STATUS_ERROR,
-                            message: "tomchat server is not running".to_string(),
+                            message: "chatt server is not running".to_string(),
                         },
                     }
                 }
@@ -446,7 +446,7 @@ mod imp {
                 .unwrap()
                 .as_nanos();
             env::temp_dir().join(format!(
-                "tomchat-server-control-{name}-{}-{suffix}",
+                "chatt-server-control-{name}-{}-{suffix}",
                 std::process::id()
             ))
         }
@@ -468,7 +468,7 @@ mod imp {
 
     impl AdminSocket {
         pub fn spawn(_commands: Sender<AdminCommand>) -> Result<Self, String> {
-            Err("tomchat server control sockets are only supported on Unix".to_string())
+            Err("chatt server control sockets are only supported on Unix".to_string())
         }
 
         pub fn path(&self) -> &std::path::Path {
@@ -477,7 +477,7 @@ mod imp {
     }
 
     pub fn send_invite(_user: &str) -> Result<String, String> {
-        Err("tomchat-server invite is only supported on Unix".to_string())
+        Err("chatt-server invite is only supported on Unix".to_string())
     }
 }
 

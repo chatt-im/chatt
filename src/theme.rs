@@ -62,7 +62,7 @@ pub fn mode_style(mode: UiMode) -> Style {
 pub fn editor_theme() -> EditorTheme {
     let charwise = Style::DEFAULT.with_bg_rgb(0x4b, 0x3f, 0x61);
     EditorTheme {
-        name: "tomchat-dark-pastel",
+        name: "chatt-dark-pastel",
         text: TEXT,
         selection: SelectionTheme {
             charwise,
@@ -75,7 +75,7 @@ pub fn editor_theme() -> EditorTheme {
 pub fn join_input_editor_theme() -> EditorTheme {
     let charwise = Style::DEFAULT.with_bg_rgb(0x4b, 0x3f, 0x61);
     EditorTheme {
-        name: "tomchat-join-input",
+        name: "chatt-join-input",
         text: JOIN_INPUT_ACTIVE,
         selection: SelectionTheme {
             charwise,

@@ -1,6 +1,6 @@
-# Tomchat
+# Chatt
 
-Tomchat is a Rust terminal chat client and local development server with
+Chatt is a Rust terminal chat client and local development server with
 server-selected TCP/UDP transport encryption, file relay, and P2P media
 candidate exchange.
 
@@ -16,20 +16,20 @@ Run the development server:
 cargo run -p server
 ```
 
-The server loads `./tomchat-server.toml` by default and prints its Ed25519 public
+The server loads `./chatt-server.toml` by default and prints its Ed25519 public
 key at startup. Keep that public key for client pinning outside local
 development.
 
 Run the client:
 
 ```sh
-cargo run -p tomchat -- --config tomchat.toml
+cargo run -p chatt -- --config chatt.toml
 ```
 
 Capture client diagnostics while running:
 
 ```sh
-cargo run -p tomchat -- --config tomchat.toml --logfile /tmp/tomchat.log
+cargo run -p chatt -- --config chatt.toml --logfile /tmp/chatt.log
 ```
 
 Invite a configured user from a running server:
@@ -41,19 +41,19 @@ cargo run -p server -- invite alice
 Join from the generated string:
 
 ```sh
-cargo run -p tomchat -- join tcj1_...
+cargo run -p chatt -- join tcj1_...
 ```
 
 Upload a file into an already running client session:
 
 ```sh
-cargo run -p tomchat -- upload ./path/to/file.ext
+cargo run -p chatt -- upload ./path/to/file.ext
 ```
 
 Inspect audio input devices:
 
 ```sh
-cargo run -p tomchat -- debug-audio-inputs
+cargo run -p chatt -- debug-audio-inputs
 ```
 
 ## Common Commands
@@ -77,12 +77,12 @@ Useful in-app slash commands:
 - `/settings` or `/config`: open settings.
 - `/clear`: clear the local chat view.
 
-The default key bindings are in `tomchat.toml` under `[bindings.*]`.
+The default key bindings are in `chatt.toml` under `[bindings.*]`.
 
 ## Client Configuration
 
-Client config is loaded from `~/.config/tomchat.toml` when present, or from
-`--config` / `TOMCHAT_CONFIG`. The repository `tomchat.toml` is a development
+Client config is loaded from `~/.config/chatt.toml` when present, or from
+`--config` / `CHATT_CONFIG`. The repository `chatt.toml` is a development
 sample.
 
 Important client fields:
@@ -116,7 +116,7 @@ up instead of letting latency grow for the rest of the call. Use `/audio` or
 `--logfile` to inspect queue growth, DRED recovery, PLC fallback, hard trims,
 and underruns.
 
-Latency controls live under `[audio.latency]` in `tomchat.toml`. The defaults
+Latency controls live under `[audio.latency]` in `chatt.toml`. The defaults
 enable adaptive catch-up, playback silence skipping, and capture silence gating;
 set `adaptive-catch-up`, `playback-silence-skip`, or `capture-silence-gate` to
 `false` to isolate those behaviors during testing or profiling.
@@ -127,12 +127,12 @@ reference and runs the WebRTC AEC3 canceller as the first capture DSP step. It
 defaults to `false` and is most useful when playing through speakers rather than
 a headset.
 
-The client accepts `--config` / `TOMCHAT_CONFIG` for config path selection.
+The client accepts `--config` / `CHATT_CONFIG` for config path selection.
 
 ## Server Configuration
 
-Server config is loaded from `./tomchat-server.toml` when present, or from
-`--config` / `TOMCHAT_SERVER_CONFIG`.
+Server config is loaded from `./chatt-server.toml` when present, or from
+`--config` / `CHATT_SERVER_CONFIG`.
 
 Important server fields:
 
@@ -190,7 +190,7 @@ control and media sockets. `udp-probe-addr` is optional and only enables a
 second UDP endpoint for P2P NAT classification; ordinary voice relay does not
 need it.
 
-The server accepts `--config` / `TOMCHAT_SERVER_CONFIG` for config path
+The server accepts `--config` / `CHATT_SERVER_CONFIG` for config path
 selection. Network, P2P, encryption, and history settings live in TOML.
 
 ## Pairing Procedure
@@ -201,7 +201,7 @@ pairing code in either config file.
 1. Start the server with a writable config path:
 
 ```sh
-cargo run -p server -- --config tomchat-server.toml
+cargo run -p server -- --config chatt-server.toml
 ```
 
 2. On the server host, create an in-memory 24-hour invite:
@@ -216,7 +216,7 @@ exist in TOML yet; successful pairing creates or updates the `[[users]]` entry.
 3. On the client, join with the printed string:
 
 ```sh
-cargo run -p tomchat -- join tcj1_...
+cargo run -p chatt -- join tcj1_...
 ```
 
 The join TUI asks for a server alias and display username, shows the server

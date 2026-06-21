@@ -141,7 +141,7 @@ impl StunMessage {
                 &encode_xor_mapped(mapped, self.transaction_id),
             );
         }
-        append_attr(&mut attrs, ATTR_SOFTWARE, b"tomchat-p2p");
+        append_attr(&mut attrs, ATTR_SOFTWARE, b"chatt-p2p");
 
         let mut out = Vec::with_capacity(HEADER_LEN + attrs.len());
         out.extend_from_slice(&message_type(self.kind, self.class).to_be_bytes());

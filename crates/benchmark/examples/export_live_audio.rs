@@ -5,7 +5,7 @@ use std::{
     time::Duration,
 };
 
-use tomchat::audio::{
+use chatt::audio::{
     DEFAULT_LIVE_MAX_AMPLIFICATION, LiveAudioDirectSampleSimulationConfig,
     LiveAudioPacketLossProfile, LiveAudioSimulationConfig, LiveAudioSimulationScenario,
     LiveAudioTuning, load_live_audio_simulation_sample_pcm,

@@ -1,6 +1,6 @@
 # P2P traversal design
 
-Tomchat keeps the existing server UDP media path as a relay candidate and adds a
+Chatt keeps the existing server UDP media path as a relay candidate and adds a
 direct UDP path beside it. The relay remains usable immediately, then direct
 candidate checks can replace it when a validated peer path is available.
 
@@ -68,7 +68,7 @@ NAT classification can use a second server UDP endpoint when
 classified as cone; destination-dependent mappings are classified as symmetric.
 Without a probe address, clients still publish server-reflexive candidates from
 the shared media endpoint and leave NAT kind as unknown unless overridden. Set
-`TOMCHAT_P2P_NAT=symmetric` or `TOMCHAT_P2P_NAT=cone` to override local NAT
+`CHATT_P2P_NAT=symmetric` or `CHATT_P2P_NAT=cone` to override local NAT
 classification when testing known topologies.
 
 The client polls local interfaces every 2 seconds. Interface/IP changes trigger
@@ -82,5 +82,5 @@ topology, firewall, socket, lifecycle, and timing edge cases. The Linux network
 namespace smoke test is opt-in:
 
 ```sh
-sudo TOMCHAT_NETNS_TESTS=1 cargo test -p tomchat-p2p --test netns
+sudo CHATT_NETNS_TESTS=1 cargo test -p chatt-p2p --test netns
 ```

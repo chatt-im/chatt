@@ -1,4 +1,4 @@
-# Tomchat Encryption, Pairing, and Server Configuration
+# Chatt Encryption, Pairing, and Server Configuration
 
 This document describes the current security design and the implementation map
 for human audit. Function names are listed without line numbers so the map stays
@@ -31,8 +31,8 @@ useful as the code moves.
 
 ## Server Configuration
 
-The server now loads TOML configuration from `./tomchat-server.toml` by default,
-or from `--config` / `TOMCHAT_SERVER_CONFIG`.
+The server now loads TOML configuration from `./chatt-server.toml` by default,
+or from `--config` / `CHATT_SERVER_CONFIG`.
 
 Important fields:
 
@@ -60,7 +60,7 @@ Important fields:
   `sha256:<64 hex chars>`. Invite secrets are never stored in TOML.
 
 The server prints its public key at startup. Clients should copy that value into
-the active `[[servers]].server-public-key` in `tomchat.toml` for
+the active `[[servers]].server-public-key` in `chatt.toml` for
 non-development deployments. If the client field is empty, it falls back to the
 compiled development key.
 
@@ -69,7 +69,7 @@ compiled development key.
 Pairing is used to bootstrap or rotate a user's long random token without
 storing the token or invite secret in plaintext config.
 
-1. While the server is running, the admin runs `tomchat-server invite USER`.
+1. While the server is running, the admin runs `chatt-server invite USER`.
    The command connects to the server's Unix admin socket and asks the running
    process to create an in-memory invite for that internal user identifier. The
    user does not need to exist in TOML yet. A new invite for the same user
@@ -79,7 +79,7 @@ storing the token or invite secret in plaintext config.
    The addresses come from `network.public-*`, not from the local bind
    addresses, so deployments behind NAT or DNS use their externally reachable
    connection details.
-3. The user runs `tomchat join JOIN_STRING`. The join TUI asks for a local
+3. The user runs `chatt join JOIN_STRING`. The join TUI asks for a local
    server alias and display username, then generates a long client token.
 4. The client performs the normal server-authenticated handshake. Inside the
    server-selected control channel, it sends `ClientControl::Pair` containing

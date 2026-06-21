@@ -9,6 +9,13 @@ use std::{
     time::{Duration, Instant},
 };
 
+use chatt_p2p::{
+    Action as P2pAction, AgentConfig as P2pAgentConfig, Candidate, CandidateKind, IceRole,
+    NatClassifier, NatKind, ReflexiveObservation, RestartPortPolicy, TraversalAgent,
+    interfaces::{InterfaceSnapshot, host_candidates_with_metadata},
+    socket::{UdpSocketOptions, bind_udp_socket, is_ignorable_udp_error},
+    stun::{StunMessage, is_stun_message},
+};
 use mio::{
     Events, Interest, Poll, Token,
     net::{TcpStream, UdpSocket},
@@ -30,13 +37,6 @@ use rpc::{
     frame,
     ids::{FileTransferId, RoomId, SessionId, StreamId, UserId},
     media::{self, MediaPayload},
-};
-use tomchat_p2p::{
-    Action as P2pAction, AgentConfig as P2pAgentConfig, Candidate, CandidateKind, IceRole,
-    NatClassifier, NatKind, ReflexiveObservation, RestartPortPolicy, TraversalAgent,
-    interfaces::{InterfaceSnapshot, host_candidates_with_metadata},
-    socket::{UdpSocketOptions, bind_udp_socket, is_ignorable_udp_error},
-    stun::{StunMessage, is_stun_message},
 };
 
 use crate::audio::{LiveEncoderProfile, LivePlaybackFeedback, LocalVoiceFrame, RemoteVoicePacket};
@@ -2332,7 +2332,7 @@ fn random_u64() -> Result<u64, String> {
 }
 
 fn configured_nat_kind() -> P2pNatKind {
-    match std::env::var("TOMCHAT_P2P_NAT")
+    match std::env::var("CHATT_P2P_NAT")
         .unwrap_or_default()
         .to_ascii_lowercase()
         .as_str()
@@ -2424,11 +2424,11 @@ fn key_from_control(key: &P2pKey) -> Result<KeyMaterial, String> {
 }
 
 fn p2p_username(connection_id: u64) -> String {
-    format!("tomchat-p2p:{connection_id}")
+    format!("chatt-p2p:{connection_id}")
 }
 
 fn connection_id_from_p2p_username(username: &str) -> Option<u64> {
-    username.strip_prefix("tomchat-p2p:")?.parse().ok()
+    username.strip_prefix("chatt-p2p:")?.parse().ok()
 }
 
 #[cfg(test)]
@@ -2499,7 +2499,7 @@ mod tests {
     #[test]
     fn receive_file_path_preserves_extension_when_colliding() {
         let dir = std::env::temp_dir().join(format!(
-            "tomchat-client-net-test-{}-{}",
+            "chatt-client-net-test-{}-{}",
             std::process::id(),
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)

@@ -373,7 +373,7 @@ fn server_transcript(
     server_public_key: &[u8],
 ) -> Vec<u8> {
     let mut out = Vec::with_capacity(160);
-    out.extend_from_slice(b"tomchat server hello v2");
+    out.extend_from_slice(b"chatt server hello v2");
     out.extend_from_slice(&client_hello.version.to_le_bytes());
     out.extend_from_slice(&server_version.to_le_bytes());
     out.push(u8::from(encrypted));
@@ -414,11 +414,11 @@ fn derive_session_secrets(role: Role, shared: &[u8], transcript_hash: &[u8]) -> 
     let salt = hkdf::Salt::new(hkdf::HKDF_SHA256, transcript_hash);
     let prk = salt.extract(shared);
 
-    let client_control = expand_key(&prk, b"tomchat client control key v1");
-    let server_control = expand_key(&prk, b"tomchat server control key v1");
-    let client_media = expand_key(&prk, b"tomchat client media key v1");
-    let server_media = expand_key(&prk, b"tomchat server media key v1");
-    let ids = expand_key(&prk, b"tomchat transport key ids v1");
+    let client_control = expand_key(&prk, b"chatt client control key v1");
+    let server_control = expand_key(&prk, b"chatt server control key v1");
+    let client_media = expand_key(&prk, b"chatt client media key v1");
+    let server_media = expand_key(&prk, b"chatt server media key v1");
+    let ids = expand_key(&prk, b"chatt transport key ids v1");
 
     let client_control_id = u32::from_le_bytes(ids[0..4].try_into().unwrap()).max(1);
     let server_control_id = u32::from_le_bytes(ids[4..8].try_into().unwrap()).max(1);

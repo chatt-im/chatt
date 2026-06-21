@@ -11,7 +11,7 @@ use nnnoiseless::DenoiseState;
 use opus_codec::{Channels, Decoder, DredDecoder, DredState, SampleRate};
 use sonora::config::EchoCanceller as Aec3Config;
 use sonora::{AudioProcessing, Config as ApmConfig, StreamConfig as ApmStreamConfig};
-use tomchat::audio::{
+use chatt::audio::{
     DEFAULT_LIVE_MAX_AMPLIFICATION, LiveAudioPacketLossProfile, LiveAudioSimulationConfig,
     LiveAudioSimulationScenario, LiveAudioTuning, run_live_audio_simulation_with_speech,
     split_pcm_to_simulation_frames,

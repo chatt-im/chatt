@@ -1000,7 +1000,7 @@ mod tests {
     fn username_filters_requests_but_not_transaction_responses() {
         let now = at(0);
         let config = AgentConfig {
-            username: Some("tomchat-p2p:77".to_string()),
+            username: Some("chatt-p2p:77".to_string()),
             ..AgentConfig::default()
         };
         let mut agent = TraversalAgent::new(
@@ -1016,7 +1016,7 @@ mod tests {
 
         let wrong_request = StunMessage::binding_request(
             TransactionId::from_counter(100),
-            Some("tomchat-p2p:78".to_string()),
+            Some("chatt-p2p:78".to_string()),
             1,
             RoleAttribute::Controlled(9),
             true,

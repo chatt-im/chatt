@@ -6655,7 +6655,7 @@ mod tests {
     }
 
     /// Diagnostic, not a pass/fail gate. Run with:
-    /// `cargo test -p tomchat dred_depth_distribution -- --ignored --nocapture`
+    /// `cargo test -p chatt dred_depth_distribution -- --ignored --nocapture`
     /// to see how far back DRED reaches per packet across bitrates. A healthy
     /// DRED reach should cover multiple 20 ms frames (>= 960 samples each).
     #[test]
@@ -7517,7 +7517,7 @@ mod tests {
     fn direct_sample_simulation_traces_the_client_reconstruction_pipeline() {
         let input = sample_direct_pcm_frames(800);
         let trace_path = std::env::temp_dir().join(format!(
-            "tomchat-direct-trace-{}-congested.jsonl",
+            "chatt-direct-trace-{}-congested.jsonl",
             std::process::id()
         ));
 

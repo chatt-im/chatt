@@ -1,4 +1,4 @@
-//! Deterministic UDP NAT traversal primitives for tomchat.
+//! Deterministic UDP NAT traversal primitives for chatt.
 //!
 //! The crate intentionally keeps the ICE-like state machine independent from
 //! sockets and timers. The application owns the UDP socket, feeds inbound STUN
