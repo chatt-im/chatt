@@ -56,6 +56,7 @@ const LIVE_PLAYBACK_DRAIN_INTERVAL: Duration = Duration::from_millis(10);
 const LIVE_PLAYBACK_FEEDBACK_INTERVAL: Duration = Duration::from_millis(500);
 const LIVE_PLAYBACK_FEEDBACK_PACKETS: u32 = 25;
 const LIVE_PLAYBACK_MAX_REORDER_DELAY: Duration = Duration::from_millis(60);
+const LIVE_PLAYBACK_CATCH_UP_START_EXCESS: Duration = Duration::from_millis(80);
 const LIVE_PLAYBACK_RESAMPLER_CHUNK: usize = 240;
 const LIVE_PLAYBACK_MAX_SPEED_UP: f64 = 0.15;
 const LIVE_PLAYBACK_MAX_RESAMPLE_RATIO_RELATIVE: f64 = 1.20;
@@ -4506,13 +4507,14 @@ impl AdaptivePlaybackStream {
         }
 
         let catchup_target = self.adaptive_target_samples(now).max(target);
-        if queued <= catchup_target {
+        let catchup_start = catchup_target.saturating_add(catch_up_start_excess_samples());
+        if queued <= catchup_start {
             return 0.0;
         }
 
         let hard_bound = samples_for_duration(self.tuning.hard_queue_bound);
-        let range = hard_bound.saturating_sub(catchup_target).max(1) as f64;
-        let over = queued.saturating_sub(catchup_target) as f64;
+        let range = hard_bound.saturating_sub(catchup_start).max(1) as f64;
+        let over = queued.saturating_sub(catchup_start) as f64;
         (self.tuning.max_speed_up * (over / range)).min(self.tuning.max_speed_up)
     }
 
@@ -4894,6 +4896,10 @@ unsafe impl Adapter<'_, f32> for MonoResamplerOutput {
 
 fn target_queue_samples(tuning: LiveAudioTuning) -> usize {
     samples_for_duration(tuning.target_queue)
+}
+
+fn catch_up_start_excess_samples() -> usize {
+    samples_for_duration(LIVE_PLAYBACK_CATCH_UP_START_EXCESS)
 }
 
 fn samples_for_duration(duration: Duration) -> usize {
@@ -7815,6 +7821,25 @@ mod tests {
 
         assert!(correction > 0.14);
         assert!(correction <= LIVE_PLAYBACK_MAX_SPEED_UP);
+    }
+
+    #[test]
+    fn adaptive_stream_does_not_resample_normal_packet_cadence_jitter() {
+        let now = Instant::now();
+        let mut stream = AdaptivePlaybackStream::new(test_tuning()).unwrap();
+        let mut stats = LivePlaybackMixerStats::default();
+        stream.queue_samples(
+            &vec![0.25; target_queue_samples(test_tuning()) + LIVE_OPUS_FRAME_SAMPLES],
+            DecodedFrameSource::Normal,
+            false,
+            now,
+            &mut stats,
+        );
+
+        assert_eq!(stream.desired_correction(now), 0.0);
+        assert_eq!(stream.pop_sample(now, &mut stats), Some(0.25));
+        assert_eq!(stats.direct_samples, 1);
+        assert_eq!(stats.resampler_activations, 0);
     }
 
     #[test]
