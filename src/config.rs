@@ -132,7 +132,7 @@ impl BufferChoice {
 pub struct AudioConfig {
     pub input_device_id: Option<String>,
     pub output_device_id: Option<String>,
-    #[toml(default = 24_000)]
+    #[toml(default = 48_000)]
     pub bitrate_bps: i32,
     #[toml(default = true)]
     pub denoise: bool,
@@ -149,7 +149,7 @@ impl Default for AudioConfig {
         Self {
             input_device_id: None,
             output_device_id: None,
-            bitrate_bps: 24_000,
+            bitrate_bps: 48_000,
             denoise: true,
             max_amplification: DEFAULT_MAX_AMPLIFICATION,
             buffer: BufferChoice::Default,
@@ -446,6 +446,11 @@ impl Config {
             .latency
             .validate()
             .map_err(|error| format!("{source}: audio latency: {error}"))?;
+        if !(8_000..=96_000).contains(&self.audio.bitrate_bps) {
+            return Err(format!(
+                "{source}: audio bitrate-bps must be between 8000 and 96000"
+            ));
+        }
         if self.servers.is_empty() {
             return Err(format!(
                 "{source}: at least one [[servers]] entry is required"
@@ -1262,6 +1267,7 @@ input-device-index = 20
 
         assert_eq!(tuning, LiveAudioTuning::default());
         assert!(tuning.validate().is_ok());
+        assert_eq!(Config::default().audio.bitrate_bps, 48_000);
     }
 
     #[test]
@@ -1296,6 +1302,16 @@ input-device-index = 20
 
         assert!(error.contains("audio latency"));
         assert!(error.contains("hard-queue-bound-ms"));
+    }
+
+    #[test]
+    fn rejects_invalid_audio_bitrate() {
+        let mut config = Config::default();
+        config.audio.bitrate_bps = 128_000;
+
+        let error = config.validate("<test>").unwrap_err();
+
+        assert!(error.contains("bitrate-bps"));
     }
 
     #[test]

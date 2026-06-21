@@ -13,6 +13,8 @@ pub const KIND_PING: u8 = 3;
 pub const KIND_PONG: u8 = 4;
 pub const KIND_PEER_VOICE: u8 = 5;
 pub const KIND_NAT_PROBE: u8 = 6;
+pub const KIND_VOICE_FEEDBACK: u8 = 7;
+pub const KIND_PEER_VOICE_FEEDBACK: u8 = 8;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct UdpHeader {
@@ -46,12 +48,34 @@ pub enum MediaPayload {
         silence_ranges: u64,
         opus: Vec<u8>,
     },
+    VoiceFeedback {
+        stream_id: StreamId,
+        feedback: VoiceFeedback,
+    },
+    PeerVoiceFeedback {
+        connection_id: u64,
+        stream_id: StreamId,
+        feedback: VoiceFeedback,
+    },
     Ping {
         nonce: u64,
     },
     Pong {
         nonce: u64,
     },
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct VoiceFeedback {
+    pub highest_contiguous_sequence: u32,
+    pub expected_packets: u16,
+    pub lost_packets: u16,
+    pub late_packets: u16,
+    pub duplicate_packets: u16,
+    pub reordered_packets: u16,
+    pub window_ms: u16,
+    pub max_queue_ms: u16,
+    pub max_interarrival_jitter_ms: u16,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -172,7 +196,14 @@ pub fn parse_header(bytes: &[u8]) -> Result<(UdpHeader, &[u8]), MediaError> {
     }
     let kind = bytes[1];
     match kind {
-        KIND_BIND | KIND_VOICE | KIND_PING | KIND_PONG | KIND_PEER_VOICE | KIND_NAT_PROBE => {}
+        KIND_BIND
+        | KIND_VOICE
+        | KIND_PING
+        | KIND_PONG
+        | KIND_PEER_VOICE
+        | KIND_NAT_PROBE
+        | KIND_VOICE_FEEDBACK
+        | KIND_PEER_VOICE_FEEDBACK => {}
         _ => return Err(MediaError::UnknownKind(kind)),
     }
     Ok((
@@ -193,6 +224,8 @@ impl MediaPayload {
             MediaPayload::NatProbe { .. } => KIND_NAT_PROBE,
             MediaPayload::Voice { .. } => KIND_VOICE,
             MediaPayload::PeerVoice { .. } => KIND_PEER_VOICE,
+            MediaPayload::VoiceFeedback { .. } => KIND_VOICE_FEEDBACK,
+            MediaPayload::PeerVoiceFeedback { .. } => KIND_PEER_VOICE_FEEDBACK,
             MediaPayload::Ping { .. } => KIND_PING,
             MediaPayload::Pong { .. } => KIND_PONG,
         }
@@ -250,6 +283,22 @@ pub fn encode_payload(payload: &MediaPayload) -> Result<Vec<u8>, MediaError> {
             let len = u16::try_from(opus.len()).map_err(|_| MediaError::PayloadTooLarge)?;
             out.extend_from_slice(&len.to_le_bytes());
             out.extend_from_slice(opus);
+        }
+        MediaPayload::VoiceFeedback {
+            stream_id,
+            feedback,
+        } => {
+            out.extend_from_slice(&stream_id.0.to_le_bytes());
+            encode_voice_feedback(*feedback, &mut out);
+        }
+        MediaPayload::PeerVoiceFeedback {
+            connection_id,
+            stream_id,
+            feedback,
+        } => {
+            out.extend_from_slice(&connection_id.to_le_bytes());
+            out.extend_from_slice(&stream_id.0.to_le_bytes());
+            encode_voice_feedback(*feedback, &mut out);
         }
         MediaPayload::Ping { nonce } | MediaPayload::Pong { nonce } => {
             out.extend_from_slice(&nonce.to_le_bytes());
@@ -325,6 +374,25 @@ pub fn decode_payload(kind: u8, bytes: &[u8]) -> Result<MediaPayload, MediaError
                 opus: bytes[27..].to_vec(),
             })
         }
+        KIND_VOICE_FEEDBACK => {
+            if bytes.len() != 24 {
+                return Err(MediaError::InvalidPayload);
+            }
+            Ok(MediaPayload::VoiceFeedback {
+                stream_id: StreamId(u32::from_le_bytes(bytes[0..4].try_into().unwrap())),
+                feedback: decode_voice_feedback(&bytes[4..])?,
+            })
+        }
+        KIND_PEER_VOICE_FEEDBACK => {
+            if bytes.len() != 32 {
+                return Err(MediaError::InvalidPayload);
+            }
+            Ok(MediaPayload::PeerVoiceFeedback {
+                connection_id: u64::from_le_bytes(bytes[0..8].try_into().unwrap()),
+                stream_id: StreamId(u32::from_le_bytes(bytes[8..12].try_into().unwrap())),
+                feedback: decode_voice_feedback(&bytes[12..])?,
+            })
+        }
         KIND_PING | KIND_PONG => {
             if bytes.len() != 8 {
                 return Err(MediaError::InvalidPayload);
@@ -338,6 +406,35 @@ pub fn decode_payload(kind: u8, bytes: &[u8]) -> Result<MediaPayload, MediaError
         }
         _ => Err(MediaError::UnknownKind(kind)),
     }
+}
+
+fn encode_voice_feedback(feedback: VoiceFeedback, out: &mut Vec<u8>) {
+    out.extend_from_slice(&feedback.highest_contiguous_sequence.to_le_bytes());
+    out.extend_from_slice(&feedback.expected_packets.to_le_bytes());
+    out.extend_from_slice(&feedback.lost_packets.to_le_bytes());
+    out.extend_from_slice(&feedback.late_packets.to_le_bytes());
+    out.extend_from_slice(&feedback.duplicate_packets.to_le_bytes());
+    out.extend_from_slice(&feedback.reordered_packets.to_le_bytes());
+    out.extend_from_slice(&feedback.window_ms.to_le_bytes());
+    out.extend_from_slice(&feedback.max_queue_ms.to_le_bytes());
+    out.extend_from_slice(&feedback.max_interarrival_jitter_ms.to_le_bytes());
+}
+
+fn decode_voice_feedback(bytes: &[u8]) -> Result<VoiceFeedback, MediaError> {
+    if bytes.len() != 20 {
+        return Err(MediaError::InvalidPayload);
+    }
+    Ok(VoiceFeedback {
+        highest_contiguous_sequence: u32::from_le_bytes(bytes[0..4].try_into().unwrap()),
+        expected_packets: u16::from_le_bytes(bytes[4..6].try_into().unwrap()),
+        lost_packets: u16::from_le_bytes(bytes[6..8].try_into().unwrap()),
+        late_packets: u16::from_le_bytes(bytes[8..10].try_into().unwrap()),
+        duplicate_packets: u16::from_le_bytes(bytes[10..12].try_into().unwrap()),
+        reordered_packets: u16::from_le_bytes(bytes[12..14].try_into().unwrap()),
+        window_ms: u16::from_le_bytes(bytes[14..16].try_into().unwrap()),
+        max_queue_ms: u16::from_le_bytes(bytes[16..18].try_into().unwrap()),
+        max_interarrival_jitter_ms: u16::from_le_bytes(bytes[18..20].try_into().unwrap()),
+    })
 }
 
 #[cfg(test)]
@@ -369,6 +466,55 @@ mod tests {
         };
         let encoded = encode_payload(&payload).unwrap();
         assert_eq!(decode_payload(KIND_PEER_VOICE, &encoded).unwrap(), payload);
+    }
+
+    #[test]
+    fn voice_feedback_payload_round_trips() {
+        let feedback = VoiceFeedback {
+            highest_contiguous_sequence: 80,
+            expected_packets: 25,
+            lost_packets: 4,
+            late_packets: 2,
+            duplicate_packets: 1,
+            reordered_packets: 3,
+            window_ms: 500,
+            max_queue_ms: 240,
+            max_interarrival_jitter_ms: 87,
+        };
+        let payload = MediaPayload::VoiceFeedback {
+            stream_id: StreamId(9),
+            feedback,
+        };
+        let encoded = encode_payload(&payload).unwrap();
+        assert_eq!(
+            decode_payload(KIND_VOICE_FEEDBACK, &encoded).unwrap(),
+            payload
+        );
+    }
+
+    #[test]
+    fn peer_voice_feedback_payload_round_trips() {
+        let feedback = VoiceFeedback {
+            highest_contiguous_sequence: 81,
+            expected_packets: 26,
+            lost_packets: 5,
+            late_packets: 3,
+            duplicate_packets: 2,
+            reordered_packets: 4,
+            window_ms: 501,
+            max_queue_ms: 241,
+            max_interarrival_jitter_ms: 88,
+        };
+        let payload = MediaPayload::PeerVoiceFeedback {
+            connection_id: 99,
+            stream_id: StreamId(9),
+            feedback,
+        };
+        let encoded = encode_payload(&payload).unwrap();
+        assert_eq!(
+            decode_payload(KIND_PEER_VOICE_FEEDBACK, &encoded).unwrap(),
+            payload
+        );
     }
 
     #[test]

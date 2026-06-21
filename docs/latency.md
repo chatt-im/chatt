@@ -70,6 +70,33 @@ For explicit dropped-silence backlog behavior, the unit test
 verifies that marked recovered silence can still be skipped when it contributes
 to excess latency.
 
+## Production Feedback and DRED Tuning
+
+Live capture now starts with Opus DRED enabled instead of waiting for loss to be
+observed first. The production encoder keeps the configured bitrate fixed,
+enables in-band FEC, sets a 100 x 10 ms DRED duration, and starts with
+`OPUS_SET_PACKET_LOSS_PERC` at 20%. Receiver feedback can raise only the Opus
+expected-loss percentage to 35%, 50%, or 60%; it never raises or lowers the
+configured bitrate as a congestion response.
+
+Feedback is generated at the receiver from jitter-buffer and playback state:
+expected packets, missing packets, late packets, duplicates, reordered packets,
+receiver queue, and inter-arrival jitter. The feedback window is emitted every
+500 ms or 25 expected packets. Server-relayed feedback is forwarded only to the
+active owner of the stream in the same room; direct P2P feedback is sent over
+the matching authenticated peer connection.
+
+Latency reporting intentionally does not assume synchronized clocks between
+clients. The reported queue is receiver-local playout/mixer backlog, and
+inter-arrival jitter is computed from local `Instant` deltas against the 20 ms
+packet cadence:
+
+```text
+abs(actual_arrival_delta - sequence_delta * 20ms)
+```
+
+No sender wall-clock timestamp is used to estimate one-way latency.
+
 ## Packet Loss Profiles
 
 The current simulation also supports named network profiles. `mild_random`,

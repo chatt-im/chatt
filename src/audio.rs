@@ -8,7 +8,7 @@ use std::{
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering},
-        mpsc::{Receiver, RecvTimeoutError, SyncSender, sync_channel},
+        mpsc::{Receiver, RecvTimeoutError, Sender, SyncSender, sync_channel},
     },
     thread::{self, JoinHandle},
     time::{Duration, Instant},
@@ -50,6 +50,8 @@ const LIVE_PLAYBACK_LOSS_HOLD: Duration = Duration::from_secs(5);
 const LIVE_PLAYBACK_SEVERE_LOSS_HOLD: Duration = Duration::from_secs(10);
 const LIVE_PLAYBACK_INITIAL_BUFFER: Duration = Duration::from_millis(40);
 const LIVE_PLAYBACK_DRAIN_INTERVAL: Duration = Duration::from_millis(10);
+const LIVE_PLAYBACK_FEEDBACK_INTERVAL: Duration = Duration::from_millis(500);
+const LIVE_PLAYBACK_FEEDBACK_PACKETS: u32 = 25;
 const LIVE_PLAYBACK_MAX_REORDER_DELAY: Duration = Duration::from_millis(60);
 const LIVE_PLAYBACK_RESAMPLER_CHUNK: usize = 240;
 const LIVE_PLAYBACK_MAX_SPEED_UP: f64 = 0.15;
@@ -134,6 +136,51 @@ pub struct LivePlaybackConfig {
     pub output_device_id: Option<String>,
     pub buffer_request: BufferRequest,
     pub tuning: LiveAudioTuning,
+    pub feedback_sender: Option<Sender<LivePlaybackFeedback>>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LiveEncoderProfile {
+    pub packet_loss_percent: i32,
+}
+
+impl LiveEncoderProfile {
+    pub const DRED_20: Self = Self {
+        packet_loss_percent: 20,
+    };
+    pub const DRED_35: Self = Self {
+        packet_loss_percent: 35,
+    };
+    pub const DRED_50: Self = Self {
+        packet_loss_percent: 50,
+    };
+    pub const DRED_60: Self = Self {
+        packet_loss_percent: 60,
+    };
+
+    pub fn label(self) -> &'static str {
+        match self.packet_loss_percent {
+            20 => "dred20",
+            35 => "dred35",
+            50 => "dred50",
+            60 => "dred60",
+            _ => "dred",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct LivePlaybackFeedback {
+    pub stream_id: u32,
+    pub highest_contiguous_sequence: u32,
+    pub expected_packets: u16,
+    pub lost_packets: u16,
+    pub late_packets: u16,
+    pub duplicate_packets: u16,
+    pub reordered_packets: u16,
+    pub window_ms: u16,
+    pub max_queue_ms: u16,
+    pub max_interarrival_jitter_ms: u16,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -283,6 +330,7 @@ pub struct LiveCapture {
     worker: Option<JoinHandle<()>>,
     stats: AudioStats,
     max_amplification_bits: Arc<AtomicU32>,
+    encoder_loss_percent: Arc<AtomicU32>,
 }
 
 pub struct Playback {
@@ -456,6 +504,12 @@ impl OpusVoiceEncoder {
         Ok(())
     }
 
+    fn apply_live_encoder_profile(&mut self, profile: LiveEncoderProfile) -> Result<(), String> {
+        self.set_dred_duration_10ms(100)?;
+        self.set_inband_fec(true)?;
+        self.set_packet_loss_percent(profile.packet_loss_percent)
+    }
+
     fn control(&mut self, request: u32, value: i32, context: &str) -> Result<(), String> {
         let result =
             unsafe { opus_codec::opus_encoder_ctl(self.encoder.as_ptr(), request as i32, value) };
@@ -508,6 +562,11 @@ impl LiveCapture {
     pub fn set_max_amplification(&self, max_amplification: f32) {
         self.max_amplification_bits
             .store(max_amplification.to_bits(), Ordering::Relaxed);
+    }
+
+    pub fn set_encoder_profile(&self, profile: LiveEncoderProfile) {
+        self.encoder_loss_percent
+            .store(profile.packet_loss_percent.max(0) as u32, Ordering::Relaxed);
     }
 
     pub fn stop(mut self) -> StatsSnapshot {
@@ -944,18 +1003,24 @@ where
         denoise = config.denoise,
         max_amplification = config.max_amplification
     );
-    let encoder = OpusVoiceEncoder::new(config.bitrate_bps)?;
+    let mut encoder = OpusVoiceEncoder::new(config.bitrate_bps)?;
+    encoder.apply_live_encoder_profile(LiveEncoderProfile::DRED_20)?;
     let stats = AudioStats::new();
     let max_amplification_bits = Arc::new(AtomicU32::new(config.max_amplification.to_bits()));
+    let encoder_loss_percent = Arc::new(AtomicU32::new(
+        LiveEncoderProfile::DRED_20.packet_loss_percent as u32,
+    ));
     let (sender, receiver) = sync_channel(CALLBACK_QUEUE_CAPACITY);
     let worker_stats = stats.clone();
     let worker_max_amplification = Arc::clone(&max_amplification_bits);
+    let worker_encoder_loss_percent = Arc::clone(&encoder_loss_percent);
     let worker = thread::spawn(move || {
         run_live_encoder_worker(
             receiver,
             encoder,
             config.denoise,
             worker_max_amplification,
+            worker_encoder_loss_percent,
             config.tuning,
             worker_stats,
             on_packet,
@@ -981,6 +1046,7 @@ where
         worker: Some(worker),
         stats,
         max_amplification_bits,
+        encoder_loss_percent,
     })
 }
 
@@ -1089,8 +1155,10 @@ pub fn start_live_playback(config: LivePlaybackConfig) -> Result<LivePlayback, S
     kvlog::info!("live playback started", device = device_name.as_str());
     let (sender, receiver) = sync_channel(LIVE_PLAYBACK_COMMAND_CAPACITY);
     let worker_mixer = Arc::clone(&mixer);
-    let worker =
-        thread::spawn(move || run_live_decoder_worker(receiver, worker_mixer, config.tuning));
+    let feedback_sender = config.feedback_sender;
+    let worker = thread::spawn(move || {
+        run_live_decoder_worker(receiver, worker_mixer, config.tuning, feedback_sender)
+    });
 
     Ok(LivePlayback {
         stream: Some(stream),
@@ -2061,6 +2129,7 @@ fn run_live_encoder_worker<F>(
     encoder: OpusVoiceEncoder,
     denoise_enabled: bool,
     max_amplification_bits: Arc<AtomicU32>,
+    encoder_loss_percent: Arc<AtomicU32>,
     tuning: LiveAudioTuning,
     stats: AudioStats,
     mut on_packet: F,
@@ -2072,6 +2141,7 @@ fn run_live_encoder_worker<F>(
         encoder,
         denoise_enabled,
         &max_amplification_bits,
+        &encoder_loss_percent,
         tuning,
         &stats,
         &mut on_packet,
@@ -2135,6 +2205,7 @@ fn run_live_encoder_worker_inner<F>(
     encoder: OpusVoiceEncoder,
     denoise_enabled: bool,
     max_amplification_bits: &AtomicU32,
+    encoder_loss_percent: &AtomicU32,
     tuning: LiveAudioTuning,
     stats: &AudioStats,
     on_packet: &mut F,
@@ -2149,8 +2220,16 @@ where
         f32::from_bits(max_amplification_bits.load(Ordering::Relaxed)),
         true,
     );
+    let mut applied_loss_percent = LiveEncoderProfile::DRED_20.packet_loss_percent;
 
     for chunk in receiver {
+        let requested_loss_percent = encoder_loss_percent.load(Ordering::Relaxed).min(100) as i32;
+        if requested_loss_percent != applied_loss_percent {
+            pipeline.apply_encoder_profile(LiveEncoderProfile {
+                packet_loss_percent: requested_loss_percent,
+            })?;
+            applied_loss_percent = requested_loss_percent;
+        }
         pipeline.push_chunk(
             &chunk,
             f32::from_bits(max_amplification_bits.load(Ordering::Relaxed)),
@@ -2277,6 +2356,10 @@ impl LiveEncoderPipeline {
             }
         }
         Ok(())
+    }
+
+    fn apply_encoder_profile(&mut self, profile: LiveEncoderProfile) -> Result<(), String> {
+        self.encoder.apply_live_encoder_profile(profile)
     }
 
     fn queue_live_opus_input_frame<F>(
@@ -2411,6 +2494,7 @@ fn run_live_decoder_worker(
     receiver: Receiver<LivePlaybackCommand>,
     mixer: Arc<Mutex<LivePlaybackMixer>>,
     tuning: LiveAudioTuning,
+    feedback_sender: Option<Sender<LivePlaybackFeedback>>,
 ) {
     let mut streams: HashMap<u32, LiveDecodeStream> = HashMap::new();
     let mut frame = vec![0i16; MAX_OPUS_DECODE_SAMPLES];
@@ -2427,7 +2511,13 @@ fn run_live_decoder_worker(
             Err(RecvTimeoutError::Disconnected) => break,
         }
 
-        drain_live_decode_streams(&mut streams, &mixer, &mut frame, Instant::now());
+        drain_live_decode_streams(
+            &mut streams,
+            &mixer,
+            &mut frame,
+            Instant::now(),
+            feedback_sender.as_ref(),
+        );
     }
 }
 
@@ -2485,9 +2575,18 @@ fn drain_live_decode_streams(
     mixer: &Arc<Mutex<LivePlaybackMixer>>,
     frame: &mut [i16],
     now: Instant,
+    feedback_sender: Option<&Sender<LivePlaybackFeedback>>,
 ) {
     let mut trace = None;
-    drain_live_decode_streams_with_trace(streams, mixer, frame, now, now, &mut trace);
+    drain_live_decode_streams_with_trace(
+        streams,
+        mixer,
+        frame,
+        now,
+        now,
+        &mut trace,
+        feedback_sender,
+    );
 }
 
 fn drain_live_decode_streams_with_trace(
@@ -2497,8 +2596,10 @@ fn drain_live_decode_streams_with_trace(
     now: Instant,
     trace_start: Instant,
     trace: &mut Option<LiveAudioTraceWriter>,
+    feedback_sender: Option<&Sender<LivePlaybackFeedback>>,
 ) {
     for (stream_id, stream) in streams {
+        let mut max_stream_queue_ms = 0;
         stream.drain_ready(
             now,
             trace_start,
@@ -2508,6 +2609,8 @@ fn drain_live_decode_streams_with_trace(
             |trace, samples, source, silence_hint| {
                 if let Ok(mut mixer) = mixer.lock() {
                     mixer.queue_stream_samples(*stream_id, samples, source, silence_hint, now);
+                    max_stream_queue_ms =
+                        max_stream_queue_ms.max(mixer.stream_queue_ms(*stream_id));
                     trace_mixer_queue(
                         trace,
                         trace_start,
@@ -2521,6 +2624,7 @@ fn drain_live_decode_streams_with_trace(
                 }
             },
         );
+        stream.flush_feedback(*stream_id, now, max_stream_queue_ms, feedback_sender);
     }
 }
 
@@ -2537,6 +2641,7 @@ struct LiveDecodeStream {
     decoder: Decoder,
     dred_decoder: Option<DredDecoder>,
     tuning: LiveAudioTuning,
+    feedback: LivePlaybackFeedbackState,
 }
 
 impl LiveDecodeStream {
@@ -2547,11 +2652,14 @@ impl LiveDecodeStream {
                 .map_err(|error| error.to_string())?,
             dred_decoder: DredDecoder::new().ok(),
             tuning,
+            feedback: LivePlaybackFeedbackState::default(),
         })
     }
 
     fn insert(&mut self, packet: AudioPacketRef<'_>, now: Instant) -> InsertOutcome {
-        self.jitter.insert(packet, now)
+        let outcome = self.jitter.insert(packet, now);
+        self.feedback.observe_insert(packet.sequence, &outcome, now);
+        outcome
     }
 
     fn drain_ready<F>(
@@ -2566,6 +2674,9 @@ impl LiveDecodeStream {
         F: FnMut(&mut Option<LiveAudioTraceWriter>, &[f32], DecodedFrameSource, bool),
     {
         let items = self.jitter.drain_ready(now);
+        for item in &items {
+            self.feedback.observe_playout(item, now);
+        }
         for (index, item) in items.iter().enumerate() {
             match item {
                 PlayoutItem::Audio {
@@ -2992,6 +3103,153 @@ impl LiveDecodeStream {
             eprintln!("failed to reset live opus decoder: {error}");
         }
     }
+
+    fn flush_feedback(
+        &mut self,
+        stream_id: u32,
+        now: Instant,
+        max_queue_ms: u64,
+        feedback_sender: Option<&Sender<LivePlaybackFeedback>>,
+    ) {
+        self.feedback.observe_queue_ms(max_queue_ms);
+        let Some(feedback) = self.feedback.take_if_ready(stream_id, now) else {
+            return;
+        };
+        if let Some(sender) = feedback_sender {
+            let _ = sender.send(feedback);
+        }
+    }
+}
+
+#[derive(Default)]
+struct LivePlaybackFeedbackState {
+    window_started_at: Option<Instant>,
+    highest_contiguous_sequence: Option<u32>,
+    expected_packets: u32,
+    lost_packets: u32,
+    late_packets: u32,
+    duplicate_packets: u32,
+    reordered_packets: u32,
+    max_queue_ms: u64,
+    max_interarrival_jitter_ms: u64,
+    highest_arrived_sequence: Option<u32>,
+    last_forward_arrival: Option<(u32, Instant)>,
+}
+
+impl LivePlaybackFeedbackState {
+    fn observe_insert(&mut self, sequence: u32, outcome: &InsertOutcome, now: Instant) {
+        self.ensure_started(now);
+        match outcome {
+            InsertOutcome::Accepted => {
+                if self
+                    .highest_arrived_sequence
+                    .is_some_and(|highest| sequence_is_before(sequence, highest))
+                {
+                    self.reordered_packets = self.reordered_packets.saturating_add(1);
+                }
+                if let Some((last_sequence, last_at)) = self.last_forward_arrival
+                    && let Some(distance) = sequence_distance_forward(last_sequence, sequence)
+                    && distance > 0
+                {
+                    let expected = Duration::from_secs_f64(
+                        f64::from(distance) * LIVE_OPUS_FRAME_SAMPLES as f64 / SAMPLE_RATE as f64,
+                    );
+                    let actual = now.saturating_duration_since(last_at);
+                    self.max_interarrival_jitter_ms = self
+                        .max_interarrival_jitter_ms
+                        .max(duration_abs_delta_ms(actual, expected));
+                    self.last_forward_arrival = Some((sequence, now));
+                } else if self.last_forward_arrival.is_none() {
+                    self.last_forward_arrival = Some((sequence, now));
+                }
+                self.highest_arrived_sequence = Some(
+                    self.highest_arrived_sequence
+                        .map_or(sequence, |highest| sequence_max_forward(highest, sequence)),
+                );
+            }
+            InsertOutcome::Duplicate => {
+                self.duplicate_packets = self.duplicate_packets.saturating_add(1);
+            }
+            InsertOutcome::Late => {
+                self.late_packets = self.late_packets.saturating_add(1);
+            }
+            InsertOutcome::BufferFull => {}
+        }
+    }
+
+    fn observe_playout(&mut self, item: &PlayoutItem, now: Instant) {
+        self.ensure_started(now);
+        match *item {
+            PlayoutItem::Audio { sequence, .. } => {
+                self.expected_packets = self.expected_packets.saturating_add(1);
+                self.highest_contiguous_sequence = Some(sequence);
+            }
+            PlayoutItem::Missing { sequence } => {
+                self.expected_packets = self.expected_packets.saturating_add(1);
+                self.lost_packets = self.lost_packets.saturating_add(1);
+                self.highest_contiguous_sequence = Some(sequence);
+            }
+            PlayoutItem::FastForward {
+                to_sequence,
+                skipped_packets,
+                ..
+            } => {
+                self.expected_packets = self.expected_packets.saturating_add(skipped_packets);
+                self.lost_packets = self.lost_packets.saturating_add(skipped_packets);
+                self.highest_contiguous_sequence = Some(to_sequence.wrapping_sub(1));
+            }
+        }
+    }
+
+    fn observe_queue_ms(&mut self, max_queue_ms: u64) {
+        self.max_queue_ms = self.max_queue_ms.max(max_queue_ms);
+    }
+
+    fn take_if_ready(&mut self, stream_id: u32, now: Instant) -> Option<LivePlaybackFeedback> {
+        let started_at = self.window_started_at?;
+        if self.expected_packets == 0 {
+            return None;
+        }
+        let elapsed = now.saturating_duration_since(started_at);
+        if self.expected_packets < LIVE_PLAYBACK_FEEDBACK_PACKETS
+            && elapsed < LIVE_PLAYBACK_FEEDBACK_INTERVAL
+        {
+            return None;
+        }
+
+        let feedback = LivePlaybackFeedback {
+            stream_id,
+            highest_contiguous_sequence: self.highest_contiguous_sequence.unwrap_or(0),
+            expected_packets: clamp_u16_from_u32(self.expected_packets),
+            lost_packets: clamp_u16_from_u32(self.lost_packets),
+            late_packets: clamp_u16_from_u32(self.late_packets),
+            duplicate_packets: clamp_u16_from_u32(self.duplicate_packets),
+            reordered_packets: clamp_u16_from_u32(self.reordered_packets),
+            window_ms: clamp_u16_from_u64(duration_to_ms(elapsed)),
+            max_queue_ms: clamp_u16_from_u64(self.max_queue_ms),
+            max_interarrival_jitter_ms: clamp_u16_from_u64(self.max_interarrival_jitter_ms),
+        };
+        self.reset_window(now);
+        Some(feedback)
+    }
+
+    fn ensure_started(&mut self, now: Instant) {
+        if self.window_started_at.is_none() {
+            self.window_started_at = Some(now);
+        }
+    }
+
+    fn reset_window(&mut self, now: Instant) {
+        self.window_started_at = Some(now);
+        self.expected_packets = 0;
+        self.lost_packets = 0;
+        self.late_packets = 0;
+        self.duplicate_packets = 0;
+        self.reordered_packets = 0;
+        self.max_queue_ms = 0;
+        self.max_interarrival_jitter_ms = 0;
+        self.highest_contiguous_sequence = None;
+    }
 }
 
 struct LiveJitterStream {
@@ -3144,6 +3402,13 @@ impl LivePlaybackMixer {
             .values()
             .map(AdaptivePlaybackStream::queued_samples)
             .sum()
+    }
+
+    fn stream_queue_ms(&self, stream_id: u32) -> u64 {
+        self.streams
+            .get(&stream_id)
+            .map(|stream| samples_to_ms(stream.queued_samples()))
+            .unwrap_or_default()
     }
 
     fn snapshot(&self) -> LivePlaybackSnapshot {
@@ -3805,6 +4070,34 @@ fn sequence_distance_forward(from: u32, to: u32) -> Option<u32> {
     } else {
         None
     }
+}
+
+fn sequence_is_before(left: u32, right: u32) -> bool {
+    sequence_distance_forward(left, right).is_some_and(|distance| distance > 0)
+}
+
+fn sequence_max_forward(left: u32, right: u32) -> u32 {
+    if sequence_is_before(left, right) {
+        right
+    } else {
+        left
+    }
+}
+
+fn duration_abs_delta_ms(left: Duration, right: Duration) -> u64 {
+    if left >= right {
+        duration_to_ms(left - right)
+    } else {
+        duration_to_ms(right - left)
+    }
+}
+
+fn clamp_u16_from_u32(value: u32) -> u16 {
+    value.min(u32::from(u16::MAX)) as u16
+}
+
+fn clamp_u16_from_u64(value: u64) -> u16 {
+    value.min(u64::from(u16::MAX)) as u16
 }
 
 fn db_to_gain(db: f32) -> f32 {
@@ -4910,6 +5203,7 @@ fn drain_simulation_network_and_playback(
         now,
         trace_start,
         trace,
+        None,
     );
     let after_recovery_frames = mixer
         .lock()
@@ -5676,6 +5970,88 @@ mod tests {
 
         assert!(encoded > 0);
         assert!(encoded <= output.len());
+    }
+
+    #[test]
+    fn live_encoder_profile_preserves_configured_bitrate() {
+        let mut encoder = OpusVoiceEncoder::new(96_000).unwrap();
+
+        encoder
+            .apply_live_encoder_profile(LiveEncoderProfile::DRED_20)
+            .unwrap();
+
+        assert_eq!(encoder.bitrate_bps, 96_000);
+        assert_eq!(encoder.dred_duration_10ms, 100);
+        assert_eq!(encoder.packet_loss_percent, 20);
+        assert!(encoder.inband_fec);
+
+        encoder
+            .apply_live_encoder_profile(LiveEncoderProfile::DRED_60)
+            .unwrap();
+
+        assert_eq!(encoder.bitrate_bps, 96_000);
+        assert_eq!(encoder.packet_loss_percent, 60);
+    }
+
+    #[test]
+    fn playback_feedback_counts_loss_and_local_jitter() {
+        let start = Instant::now();
+        let mut feedback = LivePlaybackFeedbackState::default();
+
+        feedback.observe_insert(0, &InsertOutcome::Accepted, start);
+        feedback.observe_insert(
+            2,
+            &InsertOutcome::Accepted,
+            start + Duration::from_millis(60),
+        );
+        feedback.observe_insert(
+            1,
+            &InsertOutcome::Accepted,
+            start + Duration::from_millis(70),
+        );
+        feedback.observe_insert(
+            1,
+            &InsertOutcome::Duplicate,
+            start + Duration::from_millis(71),
+        );
+        feedback.observe_insert(3, &InsertOutcome::Late, start + Duration::from_millis(72));
+        feedback.observe_playout(
+            &PlayoutItem::Audio {
+                sequence: 0,
+                flags: 0,
+                silence_ranges: 0,
+                payload: vec![0],
+            },
+            start + Duration::from_millis(80),
+        );
+        feedback.observe_playout(
+            &PlayoutItem::Missing { sequence: 1 },
+            start + Duration::from_millis(80),
+        );
+        feedback.observe_playout(
+            &PlayoutItem::Audio {
+                sequence: 2,
+                flags: 0,
+                silence_ranges: 0,
+                payload: vec![2],
+            },
+            start + Duration::from_millis(80),
+        );
+        feedback.observe_queue_ms(123);
+
+        let report = feedback
+            .take_if_ready(9, start + LIVE_PLAYBACK_FEEDBACK_INTERVAL)
+            .unwrap();
+
+        assert_eq!(report.stream_id, 9);
+        assert_eq!(report.highest_contiguous_sequence, 2);
+        assert_eq!(report.expected_packets, 3);
+        assert_eq!(report.lost_packets, 1);
+        assert_eq!(report.late_packets, 1);
+        assert_eq!(report.duplicate_packets, 1);
+        assert_eq!(report.reordered_packets, 1);
+        assert_eq!(report.max_queue_ms, 123);
+        assert_eq!(report.max_interarrival_jitter_ms, 20);
     }
 
     #[test]

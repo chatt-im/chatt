@@ -28,8 +28,8 @@ use std::{
 };
 
 use audio::{
-    BufferRequest, DeviceInfo, LiveCapture, LiveCaptureConfig, LivePlayback, LivePlaybackConfig,
-    PlaybackStreamControl, StatsSnapshot,
+    BufferRequest, DeviceInfo, LiveCapture, LiveCaptureConfig, LiveEncoderProfile, LivePlayback,
+    LivePlaybackConfig, LivePlaybackFeedback, PlaybackStreamControl, StatsSnapshot,
 };
 use bindings::{BindCommand, PendingChord, Resolved};
 use chat_buffer::VirtualChatBuffer;
@@ -91,6 +91,15 @@ struct ParticipantState {
     last_message_ms: Option<u64>,
     last_voice_at: Option<Instant>,
     active_stream: Option<StreamId>,
+    voice_feedback: Option<ParticipantVoiceFeedback>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ParticipantVoiceFeedback {
+    loss_percent: u8,
+    max_queue_ms: u16,
+    max_interarrival_jitter_ms: u16,
+    updated_at: Instant,
 }
 
 #[derive(Default)]
@@ -124,6 +133,7 @@ impl Participants {
             existing.voice_active = participant.in_call;
             if !participant.in_call {
                 existing.p2p_direct = false;
+                existing.voice_feedback = None;
             }
         } else {
             self.entries.push(ParticipantState {
@@ -135,6 +145,7 @@ impl Participants {
                 last_message_ms: None,
                 last_voice_at: None,
                 active_stream: None,
+                voice_feedback: None,
             });
         }
         self.sort();
@@ -165,6 +176,7 @@ impl Participants {
         {
             entry.voice_active = false;
             entry.p2p_direct = false;
+            entry.voice_feedback = None;
             if entry.active_stream == Some(stream_id) {
                 entry.active_stream = None;
             }
@@ -184,6 +196,28 @@ impl Participants {
             .find(|entry| entry.active_stream == Some(StreamId(stream_id)))
         {
             entry.last_voice_at = Some(Instant::now());
+        }
+    }
+
+    fn voice_feedback(&mut self, feedback: LivePlaybackFeedback) {
+        if let Some(entry) = self
+            .entries
+            .iter_mut()
+            .find(|entry| entry.active_stream == Some(StreamId(feedback.stream_id)))
+        {
+            let loss_packets = feedback.lost_packets.saturating_add(feedback.late_packets);
+            let loss_percent = if feedback.expected_packets == 0 {
+                0
+            } else {
+                ((u32::from(loss_packets) * 100) / u32::from(feedback.expected_packets)).min(100)
+                    as u8
+            };
+            entry.voice_feedback = Some(ParticipantVoiceFeedback {
+                loss_percent,
+                max_queue_ms: feedback.max_queue_ms,
+                max_interarrival_jitter_ms: feedback.max_interarrival_jitter_ms,
+                updated_at: Instant::now(),
+            });
         }
     }
 
@@ -211,6 +245,7 @@ impl Participants {
             last_message_ms: None,
             last_voice_at: None,
             active_stream: None,
+            voice_feedback: None,
         });
         if self.selected_user.is_none() {
             self.selected_user = Some(user_id);
@@ -401,6 +436,7 @@ struct App {
     volume_dialog: Option<UserVolumeDialog>,
     voice_packets_received: u64,
     voice_bytes_received: u64,
+    encoder_profile: LiveEncoderProfile,
     last_network_notice: Option<String>,
     save_config_after_auth: bool,
 }
@@ -544,6 +580,7 @@ impl App {
             volume_dialog: None,
             voice_packets_received: 0,
             voice_bytes_received: 0,
+            encoder_profile: LiveEncoderProfile::DRED_20,
             last_network_notice: None,
             save_config_after_auth,
             config,
@@ -717,6 +754,15 @@ impl App {
                     && let Some(playback) = &self.playback
                 {
                     playback.push(packet);
+                }
+            }
+            NetworkEvent::PlaybackFeedback(feedback) => {
+                self.participants.voice_feedback(feedback);
+            }
+            NetworkEvent::EncoderProfileChanged(profile) => {
+                self.encoder_profile = profile;
+                if let Some(capture) = &self.capture {
+                    capture.set_encoder_profile(profile);
                 }
             }
             NetworkEvent::Status(status) => self.set_status(status),
@@ -1471,10 +1517,11 @@ impl App {
             stats.direct_samples.saturating_mul(100) / played_samples
         };
         self.set_status(format!(
-            "audio q{}ms target{}ms speed{:+.1}% direct{}% skip{}ms/{} rs{} dred{} plc{} trims{} underruns{} rx {}/{}",
+            "audio q{}ms target{}ms speed{:+.1}% enc{} direct{}% skip{}ms/{} rs{} dred{} plc{} trims{} underruns{} rx {}/{}",
             stats.max_queue_ms,
             stats.adaptive_target_ms,
             stats.correction_percent,
+            self.encoder_profile.label(),
             direct_percent,
             stats.skipped_silence_ms,
             stats.silence_skip_count,
@@ -1624,10 +1671,18 @@ impl App {
             self.settings_preview_capture = false;
         }
         if self.playback.is_none() {
+            let (feedback_tx, feedback_rx) = mpsc::channel::<LivePlaybackFeedback>();
+            let network_tx = self.network.sender();
+            thread::spawn(move || {
+                for feedback in feedback_rx {
+                    let _ = network_tx.send(NetworkCommand::PlaybackFeedback(feedback));
+                }
+            });
             match audio::start_live_playback(LivePlaybackConfig {
                 output_device_id: self.config.audio.output_device_id.clone(),
                 buffer_request: self.buffer_request(),
                 tuning: self.config.audio.latency.to_tuning(),
+                feedback_sender: Some(feedback_tx),
             }) {
                 Ok(playback) => {
                     self.playback = Some(playback);
@@ -2505,15 +2560,29 @@ fn draw_room(area: Rect, app: &App, buf: &mut Buffer) {
         };
         let marker = if selected { ">" } else { " " };
         let control = room_user_control_label(app, participant);
+        let voice = room_user_voice_feedback_label(participant);
         row.with(base).fill(buf);
         row.with(style).with(Ellipsis(true)).text(
             buf,
             &format!(
-                "{marker} {:<16} {:<7} {:<5} {}",
-                participant.name, state, spoke, control
+                "{marker} {:<16} {:<7} {:<5} {:<16} {}",
+                participant.name, state, spoke, voice, control
             ),
         );
     }
+}
+
+fn room_user_voice_feedback_label(participant: &ParticipantState) -> String {
+    let Some(feedback) = participant.voice_feedback else {
+        return String::new();
+    };
+    if !participant.voice_active || feedback.updated_at.elapsed() > Duration::from_secs(10) {
+        return String::new();
+    }
+    format!(
+        "loss{} q{} j{}",
+        feedback.loss_percent, feedback.max_queue_ms, feedback.max_interarrival_jitter_ms
+    )
 }
 
 fn room_user_control_label(app: &App, participant: &ParticipantState) -> String {
@@ -2886,6 +2955,8 @@ fn network_event_kind(event: &NetworkEvent) -> &'static str {
         NetworkEvent::VoiceStopped { .. } => "voice_stopped",
         NetworkEvent::PeerTransport { .. } => "peer_transport",
         NetworkEvent::VoicePacket(_) => "voice_packet",
+        NetworkEvent::PlaybackFeedback(_) => "playback_feedback",
+        NetworkEvent::EncoderProfileChanged(_) => "encoder_profile_changed",
         NetworkEvent::Status(_) => "status",
         NetworkEvent::Error(_) => "error",
         NetworkEvent::AuthFailed(_) => "auth_failed",
@@ -2967,6 +3038,7 @@ mod tests {
             volume_dialog: None,
             voice_packets_received: 0,
             voice_bytes_received: 0,
+            encoder_profile: LiveEncoderProfile::DRED_20,
             last_network_notice: None,
             save_config_after_auth: false,
         }
@@ -2981,7 +3053,7 @@ mod tests {
         assert_eq!(server.display_name, "Alice");
         assert_eq!(config.audio.input_device_id, None);
         assert_eq!(config.audio.output_device_id, None);
-        assert_eq!(config.audio.bitrate_bps, 24_000);
+        assert_eq!(config.audio.bitrate_bps, 48_000);
         assert_eq!(config.audio.max_amplification, 2.0);
         assert_eq!(config.files.max_upload_bytes, 50 * 1024 * 1024);
         assert_eq!(config.files.max_receive_bytes, 50 * 1024 * 1024);

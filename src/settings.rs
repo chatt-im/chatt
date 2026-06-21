@@ -4,7 +4,7 @@ use crate::{
     ui::select::{FuzzySelect, SelectableItem},
 };
 
-pub const BITRATES: [i32; 4] = [16_000, 24_000, 32_000, 48_000];
+pub const BITRATES: [i32; 6] = [16_000, 24_000, 32_000, 48_000, 64_000, 96_000];
 pub const MAX_AMPLIFICATIONS: [f32; 9] = [1.0, 2.0, 4.0, 8.0, 12.0, 16.0, 20.0, 30.0, 40.0];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -60,7 +60,7 @@ impl SettingsDraft {
             bitrate_index: BITRATES
                 .iter()
                 .position(|bitrate| *bitrate == config.bitrate_bps)
-                .unwrap_or(1),
+                .unwrap_or(3),
             amplification_index: amplification_index(config.max_amplification),
             buffer_index: BufferRequest::OPTIONS
                 .iter()

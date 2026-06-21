@@ -39,7 +39,7 @@ use tomchat_p2p::{
     stun::{StunMessage, is_stun_message},
 };
 
-use crate::audio::{LocalVoiceFrame, RemoteVoicePacket};
+use crate::audio::{LiveEncoderProfile, LivePlaybackFeedback, LocalVoiceFrame, RemoteVoicePacket};
 
 const TCP: Token = Token(0);
 const UDP: Token = Token(1);
@@ -48,6 +48,8 @@ const INTERFACE_POLL_INTERVAL: Duration = Duration::from_secs(2);
 const MAX_QUEUED_FILE_BYTES: usize = 128 * 1024;
 const MAX_FILE_CHUNKS_PER_TICK: usize = 4;
 const FILE_PROGRESS_STEP_BYTES: u64 = 1024 * 1024;
+const ENCODER_FEEDBACK_ALPHA: f32 = 0.35;
+const ENCODER_PROFILE_HOLD: Duration = Duration::from_secs(10);
 
 #[derive(Clone, Debug)]
 pub struct ClientConfig {
@@ -70,6 +72,7 @@ pub enum NetworkCommand {
     SendChat(String),
     UploadFile(PathBuf),
     LocalVoicePacket(LocalVoiceFrame),
+    PlaybackFeedback(LivePlaybackFeedback),
     Shutdown,
 }
 
@@ -105,6 +108,8 @@ pub enum NetworkEvent {
         direct: bool,
     },
     VoicePacket(RemoteVoicePacket),
+    PlaybackFeedback(LivePlaybackFeedback),
+    EncoderProfileChanged(LiveEncoderProfile),
     Status(String),
     Error(String),
     AuthFailed(String),
@@ -291,6 +296,8 @@ fn run_worker_inner(
         p2p_reflexive_addr: None,
         p2p_candidates: Vec::new(),
         p2p_peers: HashMap::new(),
+        p2p_stream_owners: HashMap::new(),
+        encoder_feedback: EncoderFeedbackController::new(),
         restart_port_policy: RestartPortPolicy::default(),
         udp_rebind_requested: false,
         interface_snapshot: InterfaceSnapshot::capture().ok(),
@@ -609,6 +616,8 @@ struct WorkerState {
     p2p_reflexive_addr: Option<SocketAddr>,
     p2p_candidates: Vec<P2pCandidate>,
     p2p_peers: HashMap<SessionId, PeerConnection>,
+    p2p_stream_owners: HashMap<StreamId, SessionId>,
+    encoder_feedback: EncoderFeedbackController,
     restart_port_policy: RestartPortPolicy,
     udp_rebind_requested: bool,
     interface_snapshot: Option<InterfaceSnapshot>,
@@ -648,6 +657,110 @@ struct PeerConnection {
     send_counter: u64,
     recv_replay: AntiReplay,
     connection_id: u64,
+}
+
+enum P2pMediaPacket {
+    Voice {
+        stream_id: StreamId,
+        sequence: u32,
+        flags: u8,
+        silence_ranges: u64,
+        opus: Vec<u8>,
+        action: Option<P2pAction>,
+    },
+    Feedback {
+        stream_id: StreamId,
+        feedback: media::VoiceFeedback,
+        action: Option<P2pAction>,
+    },
+}
+
+struct EncoderFeedbackController {
+    current: LiveEncoderProfile,
+    smoothed_loss: f32,
+    high_loss_windows: u8,
+    hold_until: Instant,
+}
+
+impl EncoderFeedbackController {
+    fn new() -> Self {
+        Self {
+            current: LiveEncoderProfile::DRED_20,
+            smoothed_loss: 0.0,
+            high_loss_windows: 0,
+            hold_until: Instant::now(),
+        }
+    }
+
+    fn observe(
+        &mut self,
+        feedback: LivePlaybackFeedback,
+        now: Instant,
+    ) -> Option<LiveEncoderProfile> {
+        if feedback.expected_packets == 0 {
+            return None;
+        }
+        let effective_loss = f32::from(feedback.lost_packets.saturating_add(feedback.late_packets))
+            / f32::from(feedback.expected_packets);
+        self.smoothed_loss = ENCODER_FEEDBACK_ALPHA * effective_loss
+            + (1.0 - ENCODER_FEEDBACK_ALPHA) * self.smoothed_loss;
+        if effective_loss >= 0.45 {
+            self.high_loss_windows = self.high_loss_windows.saturating_add(1).min(2);
+        } else {
+            self.high_loss_windows = 0;
+        }
+
+        let target = if effective_loss >= 0.55 || self.high_loss_windows >= 2 {
+            LiveEncoderProfile::DRED_60
+        } else if effective_loss >= 0.40 {
+            LiveEncoderProfile::DRED_50
+        } else if effective_loss >= 0.25 {
+            LiveEncoderProfile::DRED_35
+        } else {
+            LiveEncoderProfile::DRED_20
+        };
+
+        if target.packet_loss_percent > self.current.packet_loss_percent {
+            return self.set_current(target, now);
+        }
+        if target.packet_loss_percent == self.current.packet_loss_percent
+            && self.current.packet_loss_percent > LiveEncoderProfile::DRED_20.packet_loss_percent
+        {
+            self.hold_until = now + ENCODER_PROFILE_HOLD;
+            return None;
+        }
+        if now < self.hold_until {
+            return None;
+        }
+
+        let next = match self.current.packet_loss_percent {
+            60 if self.smoothed_loss < 0.45 => Some(LiveEncoderProfile::DRED_50),
+            50 if self.smoothed_loss < 0.30 => Some(LiveEncoderProfile::DRED_35),
+            35 if self.smoothed_loss < 0.15
+                && feedback.max_queue_ms < 200
+                && feedback.max_interarrival_jitter_ms < 50 =>
+            {
+                Some(LiveEncoderProfile::DRED_20)
+            }
+            _ => None,
+        };
+        next.and_then(|profile| self.set_current(profile, now))
+    }
+
+    fn set_current(
+        &mut self,
+        profile: LiveEncoderProfile,
+        now: Instant,
+    ) -> Option<LiveEncoderProfile> {
+        if profile == self.current {
+            return None;
+        }
+        self.current = profile;
+        if profile.packet_loss_percent > LiveEncoderProfile::DRED_20.packet_loss_percent {
+            self.hold_until = now + ENCODER_PROFILE_HOLD;
+        }
+        Some(profile)
+    }
 }
 
 impl WorkerState {
@@ -797,12 +910,25 @@ impl WorkerState {
                         }));
                 }
                 Ok((_, MediaPayload::Pong { .. })) => {}
+                Ok((
+                    _,
+                    MediaPayload::VoiceFeedback {
+                        stream_id,
+                        feedback,
+                    },
+                )) => {
+                    let feedback = live_feedback_from_media(stream_id, feedback);
+                    self.handle_encoder_feedback(feedback, now);
+                }
                 Ok((_, MediaPayload::Ping { nonce })) => {
                     self.send_media(&MediaPayload::Pong { nonce });
                 }
                 Ok((_, MediaPayload::Bind { .. })) => {}
                 Ok((_, MediaPayload::NatProbe { .. })) => {}
-                Ok((_, MediaPayload::PeerVoice { .. })) => {}
+                Ok((
+                    _,
+                    MediaPayload::PeerVoice { .. } | MediaPayload::PeerVoiceFeedback { .. },
+                )) => {}
                 Err(error) => {
                     kvlog::warn!("udp packet rejected", packet_size = len, error = %error);
                     let _ = self
@@ -832,7 +958,10 @@ impl WorkerState {
     }
 
     fn handle_command(&mut self, command: NetworkCommand) -> Result<(), String> {
-        if !matches!(command, NetworkCommand::LocalVoicePacket(_)) {
+        if !matches!(
+            command,
+            NetworkCommand::LocalVoicePacket(_) | NetworkCommand::PlaybackFeedback(_)
+        ) {
             kvlog::info!(
                 "network command received",
                 kind = network_command_kind(&command)
@@ -870,6 +999,17 @@ impl WorkerState {
                         frame.silence_ranges,
                         &frame.payload,
                     );
+                }
+            }
+            NetworkCommand::PlaybackFeedback(feedback) => {
+                let _ = self.events.send(NetworkEvent::PlaybackFeedback(feedback));
+                let stream_id = StreamId(feedback.stream_id);
+                self.send_media(&MediaPayload::VoiceFeedback {
+                    stream_id,
+                    feedback: media_feedback_from_live(feedback),
+                });
+                if let Some(session_id) = self.p2p_stream_owners.get(&stream_id).copied() {
+                    self.send_p2p_voice_feedback(session_id, stream_id, feedback);
                 }
             }
             NetworkCommand::Shutdown => {
@@ -1274,6 +1414,10 @@ impl WorkerState {
                 if Some(user_id) == self.user_id {
                     self.active_stream = Some(stream_id);
                     self.local_sequence = 0;
+                    self.encoder_feedback = EncoderFeedbackController::new();
+                    let _ = self.events.send(NetworkEvent::EncoderProfileChanged(
+                        LiveEncoderProfile::DRED_20,
+                    ));
                 }
                 let _ = self
                     .events
@@ -1290,6 +1434,7 @@ impl WorkerState {
                 if Some(stream_id) == self.active_stream {
                     self.active_stream = None;
                 }
+                self.p2p_stream_owners.remove(&stream_id);
                 let _ = self
                     .events
                     .send(NetworkEvent::VoiceStopped { user_id, stream_id });
@@ -1518,7 +1663,10 @@ impl WorkerState {
                     let _ = self
                         .events
                         .send(NetworkEvent::Error(format!("UDP send failed: {error}")));
-                } else if !matches!(payload, MediaPayload::Voice { .. }) {
+                } else if !matches!(
+                    payload,
+                    MediaPayload::Voice { .. } | MediaPayload::VoiceFeedback { .. }
+                ) {
                     kvlog::info!("udp packet sent", kind, packet_size = packet.len(), counter);
                 }
             }
@@ -1753,7 +1901,29 @@ impl WorkerState {
                     },
                 )) if connection_id == peer.connection_id => {
                     let action = peer.agent.observe_authenticated_packet(now, src);
-                    Ok((stream_id, sequence, flags, silence_ranges, opus, action))
+                    Ok(P2pMediaPacket::Voice {
+                        stream_id,
+                        sequence,
+                        flags,
+                        silence_ranges,
+                        opus,
+                        action,
+                    })
+                }
+                Ok((
+                    _,
+                    MediaPayload::PeerVoiceFeedback {
+                        connection_id,
+                        stream_id,
+                        feedback,
+                    },
+                )) if connection_id == peer.connection_id => {
+                    let action = peer.agent.observe_authenticated_packet(now, src);
+                    Ok(P2pMediaPacket::Feedback {
+                        stream_id,
+                        feedback,
+                        action,
+                    })
                 }
                 Ok(_) => Err("unexpected P2P media payload".to_string()),
                 Err(error) => Err(error.to_string()),
@@ -1761,10 +1931,18 @@ impl WorkerState {
         };
 
         match outcome {
-            Ok((stream_id, sequence, flags, silence_ranges, opus, action)) => {
+            Ok(P2pMediaPacket::Voice {
+                stream_id,
+                sequence,
+                flags,
+                silence_ranges,
+                opus,
+                action,
+            }) => {
                 if let Some(action) = action {
                     self.apply_p2p_actions(session_id, vec![action]);
                 }
+                self.p2p_stream_owners.insert(stream_id, session_id);
                 let _ = self
                     .events
                     .send(NetworkEvent::VoicePacket(RemoteVoicePacket {
@@ -1774,6 +1952,17 @@ impl WorkerState {
                         silence_ranges,
                         payload: opus,
                     }));
+            }
+            Ok(P2pMediaPacket::Feedback {
+                stream_id,
+                feedback,
+                action,
+            }) => {
+                if let Some(action) = action {
+                    self.apply_p2p_actions(session_id, vec![action]);
+                }
+                let feedback = live_feedback_from_media(stream_id, feedback);
+                self.handle_encoder_feedback(feedback, now);
             }
             Err(error) => {
                 kvlog::warn!(
@@ -1823,6 +2012,54 @@ impl WorkerState {
         }
         for (session_id, addr, packet) in packets {
             self.send_udp_raw("p2p_voice", Some(session_id), addr, &packet);
+        }
+    }
+
+    fn send_p2p_voice_feedback(
+        &mut self,
+        session_id: SessionId,
+        stream_id: StreamId,
+        feedback: LivePlaybackFeedback,
+    ) {
+        let Some((addr, packet)) = self.p2p_peers.get_mut(&session_id).and_then(|peer| {
+            let addr = peer.agent.selected()?.remote_addr;
+            let payload = MediaPayload::PeerVoiceFeedback {
+                connection_id: peer.connection_id,
+                stream_id,
+                feedback: media_feedback_from_live(feedback),
+            };
+            let counter = peer.send_counter;
+            peer.send_counter = peer.send_counter.wrapping_add(1);
+            Some((addr, media::seal_media(&peer.send_key, counter, &payload)))
+        }) else {
+            return;
+        };
+        match packet {
+            Ok(packet) => self.send_udp_raw("p2p_voice_feedback", Some(session_id), addr, &packet),
+            Err(error) => {
+                kvlog::warn!(
+                    "p2p feedback seal failed",
+                    session_id = session_id.0,
+                    error = %error
+                );
+            }
+        }
+    }
+
+    fn handle_encoder_feedback(&mut self, feedback: LivePlaybackFeedback, now: Instant) {
+        let _ = self.events.send(NetworkEvent::PlaybackFeedback(feedback));
+        if self.active_stream != Some(StreamId(feedback.stream_id)) {
+            return;
+        }
+        if let Some(profile) = self.encoder_feedback.observe(feedback, now) {
+            kvlog::info!(
+                "live encoder DRED profile changed",
+                profile = profile.label(),
+                packet_loss_percent = profile.packet_loss_percent
+            );
+            let _ = self
+                .events
+                .send(NetworkEvent::EncoderProfileChanged(profile));
         }
     }
 
@@ -1926,7 +2163,40 @@ fn network_command_kind(command: &NetworkCommand) -> &'static str {
         NetworkCommand::SendChat(_) => "send_chat",
         NetworkCommand::UploadFile(_) => "upload_file",
         NetworkCommand::LocalVoicePacket(_) => "local_voice_packet",
+        NetworkCommand::PlaybackFeedback(_) => "playback_feedback",
         NetworkCommand::Shutdown => "shutdown",
+    }
+}
+
+fn media_feedback_from_live(feedback: LivePlaybackFeedback) -> media::VoiceFeedback {
+    media::VoiceFeedback {
+        highest_contiguous_sequence: feedback.highest_contiguous_sequence,
+        expected_packets: feedback.expected_packets,
+        lost_packets: feedback.lost_packets,
+        late_packets: feedback.late_packets,
+        duplicate_packets: feedback.duplicate_packets,
+        reordered_packets: feedback.reordered_packets,
+        window_ms: feedback.window_ms,
+        max_queue_ms: feedback.max_queue_ms,
+        max_interarrival_jitter_ms: feedback.max_interarrival_jitter_ms,
+    }
+}
+
+fn live_feedback_from_media(
+    stream_id: StreamId,
+    feedback: media::VoiceFeedback,
+) -> LivePlaybackFeedback {
+    LivePlaybackFeedback {
+        stream_id: stream_id.0,
+        highest_contiguous_sequence: feedback.highest_contiguous_sequence,
+        expected_packets: feedback.expected_packets,
+        lost_packets: feedback.lost_packets,
+        late_packets: feedback.late_packets,
+        duplicate_packets: feedback.duplicate_packets,
+        reordered_packets: feedback.reordered_packets,
+        window_ms: feedback.window_ms,
+        max_queue_ms: feedback.max_queue_ms,
+        max_interarrival_jitter_ms: feedback.max_interarrival_jitter_ms,
     }
 }
 
@@ -2046,6 +2316,8 @@ fn media_payload_kind(payload: &MediaPayload) -> &'static str {
         MediaPayload::NatProbe { .. } => "nat_probe",
         MediaPayload::Voice { .. } => "voice",
         MediaPayload::PeerVoice { .. } => "peer_voice",
+        MediaPayload::VoiceFeedback { .. } => "voice_feedback",
+        MediaPayload::PeerVoiceFeedback { .. } => "peer_voice_feedback",
         MediaPayload::Ping { .. } => "ping",
         MediaPayload::Pong { .. } => "pong",
     }
@@ -2187,6 +2459,44 @@ mod tests {
     }
 
     #[test]
+    fn encoder_feedback_controller_escalates_without_bitrate_policy() {
+        let start = Instant::now();
+        let mut controller = EncoderFeedbackController::new();
+
+        let profile = controller
+            .observe(feedback_window(100, 60, 0, 80, 120), start)
+            .unwrap();
+
+        assert_eq!(profile, LiveEncoderProfile::DRED_60);
+        assert_eq!(profile.packet_loss_percent, 60);
+    }
+
+    #[test]
+    fn encoder_feedback_controller_holds_and_decays_one_level() {
+        let start = Instant::now();
+        let mut controller = EncoderFeedbackController::new();
+        assert_eq!(
+            controller.observe(feedback_window(100, 60, 0, 80, 120), start),
+            Some(LiveEncoderProfile::DRED_60)
+        );
+
+        assert_eq!(
+            controller.observe(
+                feedback_window(100, 0, 0, 20, 20),
+                start + ENCODER_PROFILE_HOLD - Duration::from_millis(1)
+            ),
+            None
+        );
+        assert_eq!(
+            controller.observe(
+                feedback_window(100, 0, 0, 20, 20),
+                start + ENCODER_PROFILE_HOLD + Duration::from_millis(1)
+            ),
+            Some(LiveEncoderProfile::DRED_50)
+        );
+    }
+
+    #[test]
     fn receive_file_path_preserves_extension_when_colliding() {
         let dir = std::env::temp_dir().join(format!(
             "tomchat-client-net-test-{}-{}",
@@ -2212,5 +2522,26 @@ mod tests {
     fn sanitize_file_name_removes_path_components() {
         assert_eq!(sanitize_file_name("../unsafe/report.pdf"), "report.pdf");
         assert_eq!(sanitize_file_name("bad/name?.txt"), "name_.txt");
+    }
+
+    fn feedback_window(
+        expected_packets: u16,
+        lost_packets: u16,
+        late_packets: u16,
+        max_queue_ms: u16,
+        max_interarrival_jitter_ms: u16,
+    ) -> LivePlaybackFeedback {
+        LivePlaybackFeedback {
+            stream_id: 1,
+            highest_contiguous_sequence: 10,
+            expected_packets,
+            lost_packets,
+            late_packets,
+            duplicate_packets: 0,
+            reordered_packets: 0,
+            window_ms: 500,
+            max_queue_ms,
+            max_interarrival_jitter_ms,
+        }
     }
 }

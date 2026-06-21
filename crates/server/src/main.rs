@@ -1793,7 +1793,12 @@ impl Server {
                 silence_ranges,
                 opus,
             } => self.relay_voice(session_id, stream_id, sequence, flags, silence_ranges, opus),
+            MediaPayload::VoiceFeedback {
+                stream_id,
+                feedback,
+            } => self.relay_voice_feedback(session_id, stream_id, feedback),
             MediaPayload::PeerVoice { .. } => Ok(()),
+            MediaPayload::PeerVoiceFeedback { .. } => Ok(()),
             MediaPayload::Ping { nonce } => {
                 self.send_udp_payload(session_id, &MediaPayload::Pong { nonce });
                 Ok(())
@@ -1815,6 +1820,8 @@ impl Server {
             }
             MediaPayload::Voice { .. }
             | MediaPayload::PeerVoice { .. }
+            | MediaPayload::VoiceFeedback { .. }
+            | MediaPayload::PeerVoiceFeedback { .. }
             | MediaPayload::Ping { .. }
             | MediaPayload::Pong { .. } => *self
                 .plaintext_addr_to_session
@@ -1892,6 +1899,50 @@ impl Server {
         for session_id in recipients {
             self.send_udp_payload(session_id, &payload);
         }
+        Ok(())
+    }
+
+    fn relay_voice_feedback(
+        &mut self,
+        receiver_session_id: SessionId,
+        stream_id: StreamId,
+        feedback: media::VoiceFeedback,
+    ) -> Result<(), String> {
+        let room_id = match self.sessions.get(&receiver_session_id) {
+            Some(session) => session.room_id,
+            None => None,
+        };
+        let Some(room_id) = room_id else {
+            return Ok(());
+        };
+        let Some(owner_session_id) = self
+            .rooms
+            .get(&room_id)
+            .and_then(|room| room.active_streams.get(&stream_id).copied())
+        else {
+            return Ok(());
+        };
+        if owner_session_id == receiver_session_id {
+            return Ok(());
+        }
+        kvlog::info!(
+            "voice feedback relaying",
+            receiver_session_id = receiver_session_id.0,
+            owner_session_id = owner_session_id.0,
+            room_id = room_id.0,
+            stream_id = stream_id.0,
+            expected = feedback.expected_packets,
+            lost = feedback.lost_packets,
+            late = feedback.late_packets,
+            queue_ms = feedback.max_queue_ms
+        );
+        self.send_udp_payload(
+            owner_session_id,
+            &MediaPayload::VoiceFeedback {
+                stream_id,
+                feedback,
+            },
+        );
         Ok(())
     }
 

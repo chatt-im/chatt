@@ -13,7 +13,7 @@ tcp-addr = "127.0.0.1:41000"
 room-id = 1
 
 [audio]
-bitrate-bps = 24000
+bitrate-bps = 48000
 denoise = true
 max-amplification = 2.0
 buffer = "default"
