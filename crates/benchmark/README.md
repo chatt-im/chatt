@@ -59,8 +59,10 @@ cargo run --release -p benchmark -- opus/encode --compare /tmp/chatt-opus-base.j
 
 Notes:
 
-- `ffmpeg` must be available in `PATH`; it decodes the provided Opus sample to
-  mono 48 kHz float PCM at benchmark startup.
+- `ffmpeg` and `ffprobe` must be available in `PATH`; they decode and inspect
+  audio samples during benchmark and codec-test workflows. Install them with
+  `sudo apt install -y ffmpeg` on Debian/Ubuntu or
+  `sudo pacman -S --needed ffmpeg` on Arch.
 - Opus uses 20 ms frames, VOIP mode, VBR, wideband, and complexity 9 so the
   analysis path needed by DRED activity gating is enabled.
 - DRED profiles set DRED duration, packet loss percentage, and in-band FEC.
