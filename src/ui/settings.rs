@@ -3,8 +3,9 @@ use extui::{Buffer, Ellipsis, HAlign, Rect, Style, vt::Modifier};
 use crate::{
     audio::StatsSnapshot,
     settings::{
-        AudioInputItem, AudioInputPickerState, SettingsDraft, SettingsFocus,
-        selected_audio_input_label,
+        AudioDeviceItem, AudioDevicePickerState, AudioInputItem, AudioInputPickerState,
+        AudioOutputItem, AudioOutputPickerState, SettingsDraft, SettingsFocus,
+        selected_audio_input_label, selected_audio_output_label,
     },
     theme,
     ui::vu,
@@ -17,6 +18,7 @@ const SELECTED_DIM: Style = Style::DEFAULT
     .with_bg_rgb(0x24, 0x28, 0x30)
     .with_fg_rgb(0xd8, 0xdb, 0xd6);
 const PANEL_EDGE: Style = Style::DEFAULT.with_bg_rgb(0x18, 0x1b, 0x20);
+const SETTINGS_LABEL_WIDTH: u16 = 16;
 const SETTINGS_CONTROLS_ROWS: u16 = 9;
 const MIN_DEVICE_PICKER_ROWS: u16 = 4;
 
@@ -29,6 +31,8 @@ pub fn draw_settings(
     capture: Option<&StatsSnapshot>,
     input_items: &[AudioInputItem],
     input_picker: &mut AudioInputPickerState,
+    output_items: &[AudioOutputItem],
+    output_picker: &mut AudioOutputPickerState,
 ) {
     area.with(theme::BACKGROUND).fill(buf);
     if area.is_empty() {
@@ -36,13 +40,21 @@ pub fn draw_settings(
     }
 
     let mut rows = area;
-    draw_input_header(
+    draw_device_header(
         rows.take_top(1),
         buf,
-        settings,
-        focus == SettingsFocus::Device,
-        input_items,
+        "Input",
+        focus == SettingsFocus::InputDevice,
         input_picker,
+        selected_audio_input_label(input_items, settings.input_device_id.as_deref()),
+    );
+    draw_device_header(
+        rows.take_top(1),
+        buf,
+        "Output",
+        focus == SettingsFocus::OutputDevice,
+        output_picker,
+        selected_audio_output_label(output_items, settings.output_device_id.as_deref()),
     );
 
     if input_picker.open {
@@ -51,9 +63,20 @@ pub fn draw_settings(
         draw_audio_picker(
             rows,
             buf,
-            focus == SettingsFocus::Device,
+            focus == SettingsFocus::InputDevice,
             input_items,
             input_picker,
+        );
+        draw_settings_controls(controls, buf, settings, focus, dirty, capture);
+    } else if output_picker.open {
+        let controls_height = settings_controls_height(rows.h, output_items.len());
+        let controls = rows.take_bottom(controls_height as i32);
+        draw_audio_picker(
+            rows,
+            buf,
+            focus == SettingsFocus::OutputDevice,
+            output_items,
+            output_picker,
         );
         draw_settings_controls(controls, buf, settings, focus, dirty, capture);
     } else {
@@ -72,13 +95,13 @@ fn settings_controls_height(available: u16, input_count: usize) -> u16 {
         .min(SETTINGS_CONTROLS_ROWS)
 }
 
-fn draw_input_header(
+fn draw_device_header(
     area: Rect,
     buf: &mut Buffer,
-    settings: &SettingsDraft,
+    label: &str,
     focused: bool,
-    input_items: &[AudioInputItem],
-    input_picker: &AudioInputPickerState,
+    picker: &AudioDevicePickerState,
+    selected: String,
 ) {
     let style = if focused {
         SELECTED_DIM
@@ -87,57 +110,57 @@ fn draw_input_header(
     };
     buf.clear_rect(area, style);
 
-    let selected = selected_audio_input_label(input_items, settings.input_device_id.as_deref());
-    let mut row = area
+    let mut row = area;
+    row.take_left(SETTINGS_LABEL_WIDTH as i32)
         .with(style.patch(if focused { theme::GOOD } else { theme::MUTED }))
-        .text(buf, "Input ");
-    if input_picker.open && input_picker.searching {
-        row = row.with(style.patch(theme::SUBTLE)).text(buf, "/");
-        row = row
-            .with(style.patch(theme::TEXT))
-            .with(Ellipsis(true))
-            .text(buf, input_picker.selector.query());
-    }
-    row.with(HAlign::Right)
-        .with(style.patch(if focused { theme::GOOD } else { theme::TEXT }))
         .with(Ellipsis(true))
-        .text(buf, &format!(" {} ", selected));
+        .text(buf, label);
+    if picker.open && picker.searching {
+        row.with(style.patch(theme::SUBTLE)).text(buf, "/");
+        row.with(style.patch(theme::TEXT))
+            .with(Ellipsis(true))
+            .text(buf, picker.selector.query());
+    } else {
+        row.with(style.patch(if focused { theme::GOOD } else { theme::TEXT }))
+            .with(Ellipsis(true))
+            .text(buf, &selected);
+    }
 }
 
 fn draw_audio_picker(
     area: Rect,
     buf: &mut Buffer,
     focused: bool,
-    input_items: &[AudioInputItem],
-    input_picker: &mut AudioInputPickerState,
+    items: &[AudioDeviceItem],
+    picker: &mut AudioDevicePickerState,
 ) {
     if area.is_empty() {
         return;
     }
 
-    let mut picker = area;
-    let metadata = if picker.w >= 72 {
-        Some(picker.take_right(34))
-    } else if picker.h >= 9 {
-        Some(picker.take_bottom(5))
+    let mut list_area = area;
+    let metadata = if list_area.w >= 72 {
+        Some(list_area.take_right(34))
+    } else if list_area.h >= 9 {
+        Some(list_area.take_bottom(5))
     } else {
         None
     };
 
-    buf.clear_rect(picker, theme::BACKGROUND);
-    if input_picker.selector.filtered_len() == 0 {
-        picker
+    buf.clear_rect(list_area, theme::BACKGROUND);
+    if picker.selector.filtered_len() == 0 {
+        list_area
             .with(theme::SUBTLE)
             .with(HAlign::Center)
-            .text(buf, "No matching audio inputs");
+            .text(buf, "No matching audio devices");
     } else {
-        let item_height = if picker.h < 4 { 1 } else { 2 };
-        input_picker.selector.render(
-            picker,
+        let item_height = if list_area.h < 4 { 1 } else { 2 };
+        picker.selector.render(
+            list_area,
             item_height,
             buf,
             |_, item_index, selected, area, buf| {
-                if let Some(item) = input_items.get(item_index) {
+                if let Some(item) = items.get(item_index) {
                     draw_audio_input_item(area, buf, item, selected, focused);
                 }
             },
@@ -145,14 +168,14 @@ fn draw_audio_picker(
     }
 
     if let Some(metadata) = metadata {
-        draw_audio_metadata(metadata, buf, input_items, input_picker);
+        draw_audio_metadata(metadata, buf, items, picker);
     }
 }
 
 fn draw_audio_input_item(
     area: Rect,
     buf: &mut Buffer,
-    item: &AudioInputItem,
+    item: &AudioDeviceItem,
     selected: bool,
     focused: bool,
 ) {
@@ -195,18 +218,18 @@ fn draw_audio_input_item(
 fn draw_audio_metadata(
     area: Rect,
     buf: &mut Buffer,
-    input_items: &[AudioInputItem],
-    input_picker: &AudioInputPickerState,
+    items: &[AudioDeviceItem],
+    picker: &AudioDevicePickerState,
 ) {
     buf.clear_rect(area, PANEL_EDGE);
-    let Some(item) = input_picker
+    let Some(item) = picker
         .selector
         .current_item_index()
-        .and_then(|index| input_items.get(index))
+        .and_then(|index| items.get(index))
     else {
         area.with(PANEL_EDGE.patch(theme::SUBTLE))
             .with(HAlign::Center)
-            .text(buf, "No input");
+            .text(buf, "No device");
         return;
     };
 
@@ -254,11 +277,11 @@ fn draw_audio_metadata(
     } else if let Some(issue) = &item.issue {
         draw_metadata_line(rows.take_top(1), buf, "Issue", issue);
     } else {
-        draw_metadata_line(rows.take_top(1), buf, "Source", "OS default input");
+        draw_metadata_line(rows.take_top(1), buf, "Source", item.default_source);
     }
 }
 
-fn item_variant_summary(item: &AudioInputItem) -> String {
+fn item_variant_summary(item: &AudioDeviceItem) -> String {
     match (item.device_index, item.variants.len()) {
         (Some(index), 0 | 1) => format!("#{index}"),
         (Some(index), len) => format!("#{index}, {len} variants"),
@@ -266,7 +289,7 @@ fn item_variant_summary(item: &AudioInputItem) -> String {
     }
 }
 
-fn item_variant_indexes(item: &AudioInputItem) -> String {
+fn item_variant_indexes(item: &AudioDeviceItem) -> String {
     let mut label = String::new();
     for variant in &item.variants {
         if !label.is_empty() {
@@ -374,7 +397,7 @@ fn draw_settings_row(
     };
     buf.clear_rect(area, style);
     let mut row = area;
-    row.take_left(16)
+    row.take_left(SETTINGS_LABEL_WIDTH as i32)
         .with(style.patch(if focused { theme::GOOD } else { theme::MUTED }))
         .with(Ellipsis(true))
         .text(buf, label);

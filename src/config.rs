@@ -124,6 +124,7 @@ impl BufferChoice {
 #[toml(FromToml, ToToml, rename_all = "kebab-case")]
 pub struct AudioConfig {
     pub input_device_id: Option<String>,
+    pub output_device_id: Option<String>,
     #[toml(default = 24_000)]
     pub bitrate_bps: i32,
     #[toml(default = true)]
@@ -138,6 +139,7 @@ impl Default for AudioConfig {
     fn default() -> Self {
         Self {
             input_device_id: None,
+            output_device_id: None,
             bitrate_bps: 24_000,
             denoise: true,
             max_amplification: DEFAULT_MAX_AMPLIFICATION,
@@ -547,6 +549,12 @@ fn write_runtime_config<'de>(root: &mut Table<'de>, config: &Config, arena: &'de
                 audio.remove_entry("input-device-id");
             }
         }
+        match config.audio.output_device_id.as_deref() {
+            Some(id) => insert_str(audio, "output-device-id", id, arena),
+            None => {
+                audio.remove_entry("output-device-id");
+            }
+        }
         audio.insert(
             Key::new("bitrate-bps"),
             Item::from(config.audio.bitrate_bps),
@@ -859,5 +867,26 @@ input-device-index = 20
         .unwrap();
 
         assert!(content.contains("max-amplification = 20.0"));
+    }
+
+    #[test]
+    fn runtime_config_writes_audio_device_ids() {
+        let mut config = Config::default();
+        config.audio.input_device_id = Some("usb mic".to_string());
+        config.audio.output_device_id = Some("usb speakers".to_string());
+        let arena = Arena::new();
+        let doc = toml_spanner::parse(DEFAULT_CONFIG, &arena).unwrap();
+        let mut table = doc.table().clone_in(&arena);
+
+        write_runtime_config(&mut table, &config, &arena);
+        let content = String::from_utf8(
+            toml_spanner::Formatting::preserved_from(&doc)
+                .with_span_projection_identity()
+                .format_table_to_bytes(table, &arena),
+        )
+        .unwrap();
+
+        assert!(content.contains("input-device-id = \"usb mic\""));
+        assert!(content.contains("output-device-id = \"usb speakers\""));
     }
 }

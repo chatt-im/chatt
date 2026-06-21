@@ -98,6 +98,12 @@ pub struct LiveCaptureConfig {
 }
 
 #[derive(Clone, Debug)]
+pub struct LivePlaybackConfig {
+    pub output_device_id: Option<String>,
+    pub buffer_request: BufferRequest,
+}
+
+#[derive(Clone, Debug)]
 pub struct RemoteVoicePacket {
     pub stream_id: u32,
     pub sequence: u32,
@@ -528,7 +534,19 @@ pub fn input_devices(buffer_request: BufferRequest) -> Result<Vec<DeviceInfo>, S
     with_audio_backend_stderr_suppressed(|| input_devices_inner(buffer_request))
 }
 
+pub fn output_devices(buffer_request: BufferRequest) -> Result<Vec<DeviceInfo>, String> {
+    with_audio_backend_stderr_suppressed(|| output_devices_inner(buffer_request))
+}
+
 pub fn stable_input_device_id(name: &str) -> String {
+    stable_device_id(name)
+}
+
+pub fn stable_output_device_id(name: &str) -> String {
+    stable_device_id(name)
+}
+
+fn stable_device_id(name: &str) -> String {
     let mut key = name.to_ascii_lowercase();
     for suffix in [", usb audio", ", loopback pcm"] {
         if let Some(stripped) = key.strip_suffix(suffix) {
@@ -548,6 +566,34 @@ fn input_devices_inner(buffer_request: BufferRequest) -> Result<Vec<DeviceInfo>,
     for device in devices {
         let name = device.to_string();
         match select_input_config(&device, buffer_request) {
+            Ok(selection) => infos.push(DeviceInfo {
+                name,
+                supported: true,
+                preview: Some(selection.preview),
+                issue: None,
+            }),
+            Err(error) => infos.push(DeviceInfo {
+                name,
+                supported: false,
+                preview: None,
+                issue: Some(error),
+            }),
+        }
+    }
+
+    Ok(infos)
+}
+
+fn output_devices_inner(buffer_request: BufferRequest) -> Result<Vec<DeviceInfo>, String> {
+    let host = cpal::default_host();
+    let devices = host
+        .output_devices()
+        .map_err(|error| format!("failed to list output devices: {error}"))?;
+
+    let mut infos = Vec::new();
+    for device in devices {
+        let name = device.to_string();
+        match select_output_config(&device, buffer_request) {
             Ok(selection) => infos.push(DeviceInfo {
                 name,
                 supported: true,
@@ -759,14 +805,18 @@ pub fn start_playback(path: &Path, buffer_request: BufferRequest) -> Result<Play
     })
 }
 
-pub fn start_live_playback(buffer_request: BufferRequest) -> Result<LivePlayback, String> {
+pub fn start_live_playback(config: LivePlaybackConfig) -> Result<LivePlayback, String> {
     let (device, selection) = with_audio_backend_stderr_suppressed(|| {
         let host = cpal::default_host();
-        let device = host
-            .default_output_device()
-            .ok_or_else(|| "no default output device found".to_string())?;
-        let selection = select_output_config(&device, buffer_request)?;
-        Ok::<_, String>((device, selection))
+        if let Some(id) = config.output_device_id.as_deref() {
+            select_output_device_by_id(&host, id, config.buffer_request)
+        } else {
+            let device = host
+                .default_output_device()
+                .ok_or_else(|| "no default output device found".to_string())?;
+            let selection = select_output_config(&device, config.buffer_request)?;
+            Ok::<_, String>((device, selection))
+        }
     })?;
 
     let device_name = device.to_string();
@@ -800,6 +850,39 @@ pub fn start_live_playback(buffer_request: BufferRequest) -> Result<LivePlayback
         sender: Some(sender),
         mixer,
     })
+}
+
+fn select_output_device_by_id(
+    host: &cpal::Host,
+    id: &str,
+    buffer_request: BufferRequest,
+) -> Result<(cpal::Device, ConfigSelection), String> {
+    let devices = host
+        .output_devices()
+        .map_err(|error| format!("failed to list output devices: {error}"))?;
+    let mut matched = false;
+    let mut first_error = None;
+    for device in devices {
+        let name = device.to_string();
+        if stable_output_device_id(&name) != id {
+            continue;
+        }
+        matched = true;
+        match select_output_config(&device, buffer_request) {
+            Ok(selection) => return Ok((device, selection)),
+            Err(error) if first_error.is_none() => first_error = Some(error),
+            Err(_) => {}
+        }
+    }
+
+    if matched {
+        Err(format!(
+            "selected output device `{id}` is present but unsupported: {}",
+            first_error.unwrap_or_else(|| "no supported 48 kHz output config".to_string())
+        ))
+    } else {
+        Err(format!("selected output device `{id}` is unavailable"))
+    }
 }
 
 fn format_file_error(context: &str, path: &Path, error: io::Error) -> String {

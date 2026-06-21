@@ -22,11 +22,13 @@ use std::{
         atomic::{AtomicBool, Ordering},
         mpsc::{self, Receiver},
     },
+    thread,
     time::{Duration, Instant},
 };
 
 use audio::{
-    BufferRequest, DeviceInfo, LiveCapture, LiveCaptureConfig, LivePlayback, StatsSnapshot,
+    BufferRequest, DeviceInfo, LiveCapture, LiveCaptureConfig, LivePlayback, LivePlaybackConfig,
+    StatsSnapshot,
 };
 use bindings::{BindCommand, PendingChord, Resolved};
 use chat_buffer::VirtualChatBuffer;
@@ -50,7 +52,10 @@ use rpc::{
     crypto::encode_hex,
     ids::{SessionId, StreamId, UserId},
 };
-use settings::{AudioInputPickerState, BITRATES, MAX_AMPLIFICATIONS, SettingsDraft, SettingsFocus};
+use settings::{
+    AudioInputPickerState, AudioOutputPickerState, BITRATES, MAX_AMPLIFICATIONS, SettingsDraft,
+    SettingsFocus,
+};
 use tinyhl::{Highlighter, Source};
 use unicode_width::UnicodeWidthStr;
 
@@ -289,12 +294,19 @@ struct App {
     last_chat_width: u16,
     pending_chord: Option<PendingChord>,
     event_rx: Receiver<NetworkEvent>,
+    audio_device_refresh_tx: mpsc::Sender<AudioDeviceRefresh>,
+    audio_device_refresh_rx: Receiver<AudioDeviceRefresh>,
+    audio_device_refresh_in_flight: bool,
+    next_audio_device_refresh_id: u64,
     network: NetworkClient,
     session_id: Option<SessionId>,
     user_id: Option<UserId>,
-    devices: Vec<DeviceInfo>,
+    input_devices: Vec<DeviceInfo>,
+    output_devices: Vec<DeviceInfo>,
     audio_input_items: Vec<settings::AudioInputItem>,
+    audio_output_items: Vec<settings::AudioOutputItem>,
     audio_input_picker: AudioInputPickerState,
+    audio_output_picker: AudioOutputPickerState,
     settings_focus: SettingsFocus,
     settings: SettingsDraft,
     settings_dirty: bool,
@@ -310,6 +322,14 @@ struct App {
     voice_bytes_received: u64,
     last_network_notice: Option<String>,
     save_config_after_auth: bool,
+}
+
+struct AudioDeviceRefresh {
+    id: u64,
+    buffer_request: BufferRequest,
+    restart_preview: bool,
+    input: Result<Vec<DeviceInfo>, String>,
+    output: Result<Vec<DeviceInfo>, String>,
 }
 
 enum Action {
@@ -332,6 +352,7 @@ impl App {
         save_config_after_auth: bool,
     ) -> Result<Self, String> {
         let (event_tx, event_rx) = mpsc::channel();
+        let (audio_device_refresh_tx, audio_device_refresh_rx) = mpsc::channel();
         let active_server = config.active_server()?.clone();
         let client_config = active_server.client_config(&config.files, pairing_code);
         let network = NetworkClient::spawn(client_config, event_tx);
@@ -344,10 +365,16 @@ impl App {
         let composer_hl = EditorHighlighter::new(&mut composer);
         let settings_draft = SettingsDraft::from_audio(&config.audio);
         let audio_input_items = settings::audio_input_items(&[]);
+        let audio_output_items = settings::audio_output_items(&[]);
         let mut audio_input_picker = AudioInputPickerState::default();
         audio_input_picker.reset(
             &audio_input_items,
             settings_draft.input_device_id.as_deref(),
+        );
+        let mut audio_output_picker = AudioOutputPickerState::default();
+        audio_output_picker.reset(
+            &audio_output_items,
+            settings_draft.output_device_id.as_deref(),
         );
         Ok(Self {
             server_alias: active_server.alias.clone(),
@@ -363,13 +390,20 @@ impl App {
             last_chat_width: 80,
             pending_chord: None,
             event_rx,
+            audio_device_refresh_tx,
+            audio_device_refresh_rx,
+            audio_device_refresh_in_flight: false,
+            next_audio_device_refresh_id: 0,
             network,
             session_id: None,
             user_id: None,
-            devices: Vec::new(),
+            input_devices: Vec::new(),
+            output_devices: Vec::new(),
             audio_input_items,
+            audio_output_items,
             audio_input_picker,
-            settings_focus: SettingsFocus::Device,
+            audio_output_picker,
+            settings_focus: SettingsFocus::InputDevice,
             settings: settings_draft,
             settings_dirty: false,
             mic_muted: Arc::new(AtomicBool::new(false)),
@@ -391,6 +425,71 @@ impl App {
     fn drain_network_events(&mut self) {
         while let Ok(event) = self.event_rx.try_recv() {
             self.handle_network_event(event);
+        }
+    }
+
+    fn drain_audio_device_refreshes(&mut self) {
+        while let Ok(refresh) = self.audio_device_refresh_rx.try_recv() {
+            self.handle_audio_device_refresh(refresh);
+        }
+    }
+
+    fn handle_audio_device_refresh(&mut self, refresh: AudioDeviceRefresh) {
+        if refresh.id + 1 != self.next_audio_device_refresh_id {
+            return;
+        }
+        self.audio_device_refresh_in_flight = false;
+
+        let mut input_count = None;
+        let mut output_count = None;
+        let mut errors = Vec::new();
+
+        match refresh.input {
+            Ok(devices) => {
+                input_count = Some(devices.len());
+                self.input_devices = devices;
+            }
+            Err(error) => {
+                self.input_devices.clear();
+                self.settings.input_device_id = None;
+                self.mic_error = Some(error.clone());
+                errors.push(format!("input devices: {error}"));
+            }
+        }
+
+        match refresh.output {
+            Ok(devices) => {
+                output_count = Some(devices.len());
+                self.output_devices = devices;
+            }
+            Err(error) => {
+                self.output_devices.clear();
+                self.settings.output_device_id = None;
+                errors.push(format!("output devices: {error}"));
+            }
+        }
+
+        self.rebuild_audio_device_pickers();
+
+        if self.mode == theme::UiMode::Settings {
+            if errors.is_empty() {
+                self.set_status(format!(
+                    "found {} input device(s), {} output device(s) ({})",
+                    input_count.unwrap_or(0),
+                    output_count.unwrap_or(0),
+                    refresh.buffer_request.label()
+                ));
+            } else {
+                self.set_error(format!("failed to refresh {}", errors.join("; ")));
+            }
+        }
+
+        if refresh.restart_preview
+            && self.mode == theme::UiMode::Settings
+            && !self.voice_tx_enabled.load(Ordering::Relaxed)
+            && !self.deafened.load(Ordering::Relaxed)
+        {
+            self.start_settings_preview_capture();
         }
     }
 
@@ -572,31 +671,43 @@ impl App {
     }
 
     fn handle_settings_search_key(&mut self, key: KeyEvent) -> bool {
-        if self.mode != theme::UiMode::Settings
-            || self.settings_focus != SettingsFocus::Device
-            || !self.audio_input_picker.open
-        {
+        if self.mode != theme::UiMode::Settings {
             return false;
         }
 
-        if self.audio_input_picker.searching {
-            return self
-                .audio_input_picker
-                .edit_search(key, &self.audio_input_items);
+        match self.settings_focus {
+            SettingsFocus::InputDevice if self.audio_input_picker.open => {
+                handle_audio_picker_search_key(
+                    key,
+                    &mut self.audio_input_picker,
+                    &self.audio_input_items,
+                )
+            }
+            SettingsFocus::OutputDevice if self.audio_output_picker.open => {
+                handle_audio_picker_search_key(
+                    key,
+                    &mut self.audio_output_picker,
+                    &self.audio_output_items,
+                )
+            }
+            _ => false,
         }
+    }
 
-        if matches!(key.kind, KeyEventKind::Release) {
-            return false;
+    fn cancel_open_audio_picker(&mut self) -> bool {
+        if self.audio_input_picker.open {
+            self.cancel_audio_input_picker();
+            true
+        } else if self.audio_output_picker.open {
+            self.cancel_audio_output_picker();
+            true
+        } else {
+            false
         }
-        let mut modifiers = key.modifiers;
-        modifiers.remove(KeyModifiers::SHIFT);
-        if modifiers.is_empty() && key.code == KeyCode::Char('/') {
-            self.audio_input_picker
-                .start_search(&self.audio_input_items);
-            return true;
-        }
+    }
 
-        false
+    fn audio_picker_open(&self) -> bool {
+        self.audio_input_picker.open || self.audio_output_picker.open
     }
 
     fn process_command(&mut self, command: BindCommand) -> Action {
@@ -612,9 +723,7 @@ impl App {
             SubmitMessage => self.submit_input(),
             Cancel => {
                 if self.mode == theme::UiMode::Settings {
-                    if self.audio_input_picker.open {
-                        self.cancel_audio_input_picker();
-                    } else {
+                    if !self.cancel_open_audio_picker() {
                         self.close_settings();
                     }
                 } else if self.mode == theme::UiMode::Compose {
@@ -635,7 +744,7 @@ impl App {
             Bottom => self.chat.bottom(),
             ToggleMute => self.set_mute(!self.mic_muted.load(Ordering::Relaxed)),
             ToggleDeafen => self.set_deafen(!self.deafened.load(Ordering::Relaxed)),
-            RefreshDevices => self.refresh_input_devices(),
+            RefreshDevices => self.refresh_audio_devices(),
             SaveSettings => self.save_settings(),
             Activate => self.activate_settings_focus(),
             FocusNext => self.move_settings_focus(1),
@@ -652,16 +761,16 @@ impl App {
     fn open_settings(&mut self) {
         self.mode = theme::UiMode::Settings;
         self.settings = SettingsDraft::from_audio(&self.config.audio);
-        self.settings_focus = SettingsFocus::Device;
+        self.settings_focus = SettingsFocus::InputDevice;
         self.settings_dirty = false;
         if self.allow_settings_preview_capture
-            && self.devices.is_empty()
+            && (self.input_devices.is_empty() || self.output_devices.is_empty())
             && self.capture.is_none()
             && self.playback.is_none()
         {
-            self.refresh_input_devices();
+            self.refresh_audio_devices();
         }
-        self.rebuild_audio_input_picker();
+        self.rebuild_audio_device_pickers();
         self.start_settings_preview_capture();
     }
 
@@ -672,6 +781,10 @@ impl App {
             &self.audio_input_items,
             self.settings.input_device_id.as_deref(),
         );
+        self.audio_output_picker.reset(
+            &self.audio_output_items,
+            self.settings.output_device_id.as_deref(),
+        );
         self.mode = theme::UiMode::Compose;
     }
 
@@ -679,10 +792,8 @@ impl App {
         if self.mode != theme::UiMode::Settings {
             return;
         }
-        if self.audio_input_picker.open {
-            if self.settings_focus == SettingsFocus::Device {
-                self.audio_input_picker.move_selection(delta);
-            }
+        if self.audio_picker_open() {
+            self.move_active_audio_picker_selection(delta);
             return;
         }
         let len = SettingsFocus::ORDER.len() as isize;
@@ -695,8 +806,10 @@ impl App {
             return;
         }
         match self.settings_focus {
-            SettingsFocus::Device if delta < 0 => self.cancel_audio_input_picker(),
-            SettingsFocus::Device => self.activate_audio_input_picker(),
+            SettingsFocus::InputDevice if delta < 0 => self.cancel_audio_input_picker(),
+            SettingsFocus::InputDevice => self.activate_audio_input_picker(),
+            SettingsFocus::OutputDevice if delta < 0 => self.cancel_audio_output_picker(),
+            SettingsFocus::OutputDevice => self.activate_audio_output_picker(),
             SettingsFocus::Bitrate => {
                 self.settings.bitrate_index =
                     cycle_index(self.settings.bitrate_index, BITRATES.len(), delta);
@@ -733,10 +846,11 @@ impl App {
                 self.settings.denoise = !self.settings.denoise;
                 self.mark_settings_dirty();
             }
-            SettingsFocus::Refresh => self.refresh_input_devices(),
+            SettingsFocus::Refresh => self.refresh_audio_devices(),
             SettingsFocus::Save => self.save_settings(),
             SettingsFocus::Close => self.close_settings(),
-            SettingsFocus::Device => self.activate_audio_input_picker(),
+            SettingsFocus::InputDevice => self.activate_audio_input_picker(),
+            SettingsFocus::OutputDevice => self.activate_audio_output_picker(),
             SettingsFocus::Bitrate | SettingsFocus::Amplification | SettingsFocus::Buffer => {
                 self.adjust_settings_focus(1);
             }
@@ -747,10 +861,22 @@ impl App {
         if self.mode != theme::UiMode::Settings {
             return;
         }
-        if self.settings_focus == SettingsFocus::Device && self.audio_input_picker.open {
-            self.audio_input_picker.move_selection(delta);
+        if self.audio_picker_open() {
+            self.move_active_audio_picker_selection(delta);
         } else {
             self.move_settings_focus(delta);
+        }
+    }
+
+    fn move_active_audio_picker_selection(&mut self, delta: isize) {
+        match self.settings_focus {
+            SettingsFocus::InputDevice if self.audio_input_picker.open => {
+                self.audio_input_picker.move_selection(delta);
+            }
+            SettingsFocus::OutputDevice if self.audio_output_picker.open => {
+                self.audio_output_picker.move_selection(delta);
+            }
+            _ => {}
         }
     }
 
@@ -758,12 +884,26 @@ impl App {
         if self.audio_input_picker.open {
             self.confirm_audio_input_picker();
         } else {
-            if self.devices.is_empty() {
-                self.refresh_input_devices();
+            if self.input_devices.is_empty() {
+                self.refresh_audio_devices();
             }
             self.audio_input_picker.open(
                 &self.audio_input_items,
                 self.settings.input_device_id.as_deref(),
+            );
+        }
+    }
+
+    fn activate_audio_output_picker(&mut self) {
+        if self.audio_output_picker.open {
+            self.confirm_audio_output_picker();
+        } else {
+            if self.output_devices.is_empty() {
+                self.refresh_audio_devices();
+            }
+            self.audio_output_picker.open(
+                &self.audio_output_items,
+                self.settings.output_device_id.as_deref(),
             );
         }
     }
@@ -784,12 +924,47 @@ impl App {
         }
     }
 
-    fn rebuild_audio_input_picker(&mut self) {
-        self.audio_input_items = settings::audio_input_items(&self.devices);
-        self.audio_input_picker.reset(
-            &self.audio_input_items,
-            self.settings.input_device_id.as_deref(),
-        );
+    fn confirm_audio_output_picker(&mut self) {
+        let Some(next) = self.audio_output_picker.confirm(&self.audio_output_items) else {
+            return;
+        };
+        if self.settings.output_device_id != next {
+            self.settings.output_device_id = next;
+            self.mark_settings_dirty();
+        }
+    }
+
+    fn cancel_audio_output_picker(&mut self) {
+        if let Some(selection) = self.audio_output_picker.cancel(&self.audio_output_items) {
+            self.settings.output_device_id = selection;
+        }
+    }
+
+    fn rebuild_audio_device_pickers(&mut self) {
+        self.audio_input_items = settings::audio_input_items(&self.input_devices);
+        if self.audio_input_picker.open {
+            self.audio_input_picker.refresh_items(
+                &self.audio_input_items,
+                self.settings.input_device_id.as_deref(),
+            );
+        } else {
+            self.audio_input_picker.reset(
+                &self.audio_input_items,
+                self.settings.input_device_id.as_deref(),
+            );
+        }
+        self.audio_output_items = settings::audio_output_items(&self.output_devices);
+        if self.audio_output_picker.open {
+            self.audio_output_picker.refresh_items(
+                &self.audio_output_items,
+                self.settings.output_device_id.as_deref(),
+            );
+        } else {
+            self.audio_output_picker.reset(
+                &self.audio_output_items,
+                self.settings.output_device_id.as_deref(),
+            );
+        }
     }
 
     fn mark_settings_dirty(&mut self) {
@@ -839,7 +1014,12 @@ impl App {
         }
     }
 
-    fn refresh_input_devices(&mut self) {
+    fn refresh_audio_devices(&mut self) {
+        if self.audio_device_refresh_in_flight {
+            self.set_status("refreshing audio devices");
+            return;
+        }
+
         let restart_preview =
             self.settings_preview_capture && !self.voice_tx_enabled.load(Ordering::Relaxed);
         if restart_preview {
@@ -849,24 +1029,24 @@ impl App {
             self.set_error("deafen before refreshing devices");
             return;
         }
-        match audio::input_devices(self.settings.buffer_request()) {
-            Ok(devices) => {
-                let count = devices.len();
-                self.devices = devices;
-                self.rebuild_audio_input_picker();
-                self.set_status(format!("found {count} input device(s)"));
-            }
-            Err(error) => {
-                self.devices.clear();
-                self.settings.input_device_id = None;
-                self.rebuild_audio_input_picker();
-                self.mic_error = Some(error.clone());
-                self.set_error(error);
-            }
-        }
-        if restart_preview {
-            self.start_settings_preview_capture();
-        }
+
+        let id = self.next_audio_device_refresh_id;
+        self.next_audio_device_refresh_id = self.next_audio_device_refresh_id.saturating_add(1);
+        self.audio_device_refresh_in_flight = true;
+        let buffer_request = self.settings.buffer_request();
+        let tx = self.audio_device_refresh_tx.clone();
+        thread::spawn(move || {
+            let input = audio::input_devices(buffer_request);
+            let output = audio::output_devices(buffer_request);
+            let _ = tx.send(AudioDeviceRefresh {
+                id,
+                buffer_request,
+                restart_preview,
+                input,
+                output,
+            });
+        });
+        self.set_status("refreshing audio devices");
     }
 
     fn submit_input(&mut self) {
@@ -986,7 +1166,7 @@ impl App {
             return Ok(());
         }
         if let Some(id) = self.config.audio.input_device_id.as_deref() {
-            if !self.devices.is_empty() {
+            if !self.input_devices.is_empty() {
                 let Some(item) = self
                     .audio_input_items
                     .iter()
@@ -1091,7 +1271,10 @@ impl App {
             self.settings_preview_capture = false;
         }
         if self.playback.is_none() {
-            match audio::start_live_playback(self.buffer_request()) {
+            match audio::start_live_playback(LivePlaybackConfig {
+                output_device_id: self.config.audio.output_device_id.clone(),
+                buffer_request: self.buffer_request(),
+            }) {
                 Ok(playback) => {
                     self.playback = Some(playback);
                     if capture_ok {
@@ -1138,6 +1321,28 @@ impl App {
         self.status = status.into();
         self.status_kind = StatusKind::Error;
     }
+}
+
+fn handle_audio_picker_search_key(
+    key: KeyEvent,
+    picker: &mut settings::AudioDevicePickerState,
+    items: &[settings::AudioDeviceItem],
+) -> bool {
+    if picker.searching {
+        return picker.edit_search(key, items);
+    }
+
+    if matches!(key.kind, KeyEventKind::Release) {
+        return false;
+    }
+    let mut modifiers = key.modifiers;
+    modifiers.remove(KeyModifiers::SHIFT);
+    if modifiers.is_empty() && key.code == KeyCode::Char('/') {
+        picker.start_search(items);
+        return true;
+    }
+
+    false
 }
 
 impl Drop for App {
@@ -1213,6 +1418,7 @@ fn run_app(
 
     loop {
         app.drain_network_events();
+        app.drain_audio_device_refreshes();
         render(&mut app, &mut buffer);
         buffer.render(&mut terminal);
 
@@ -1831,6 +2037,8 @@ fn render(app: &mut App, buf: &mut Buffer) {
             capture.as_ref(),
             &app.audio_input_items,
             &mut app.audio_input_picker,
+            &app.audio_output_items,
+            &mut app.audio_output_picker,
         ),
         theme::UiMode::Compose | theme::UiMode::Log => draw_chat(screen, app, buf),
     }
@@ -2145,6 +2353,7 @@ mod tests {
 
     fn test_app() -> App {
         let (_event_tx, event_rx) = mpsc::channel();
+        let (audio_device_refresh_tx, audio_device_refresh_rx) = mpsc::channel();
         let (command_tx, _command_rx) = mpsc::channel();
         let mut composer = Editor::new();
         composer.set_theme(theme::editor_theme());
@@ -2154,6 +2363,9 @@ mod tests {
         let audio_input_items = settings::audio_input_items(&[]);
         let mut audio_input_picker = AudioInputPickerState::default();
         audio_input_picker.reset(&audio_input_items, None);
+        let audio_output_items = settings::audio_output_items(&[]);
+        let mut audio_output_picker = AudioOutputPickerState::default();
+        audio_output_picker.reset(&audio_output_items, None);
         App {
             config: Config::default(),
             server_alias: "local".to_string(),
@@ -2169,13 +2381,20 @@ mod tests {
             last_chat_width: 80,
             pending_chord: None,
             event_rx,
+            audio_device_refresh_tx,
+            audio_device_refresh_rx,
+            audio_device_refresh_in_flight: false,
+            next_audio_device_refresh_id: 0,
             network: NetworkClient::from_parts_for_test(command_tx),
             session_id: Some(SessionId(1)),
             user_id: Some(UserId(1)),
-            devices: Vec::new(),
+            input_devices: Vec::new(),
+            output_devices: Vec::new(),
             audio_input_items,
+            audio_output_items,
             audio_input_picker,
-            settings_focus: SettingsFocus::Device,
+            audio_output_picker,
+            settings_focus: SettingsFocus::InputDevice,
             settings: SettingsDraft::from_audio(&config::AudioConfig::default()),
             settings_dirty: false,
             mic_muted: Arc::new(AtomicBool::new(false)),
@@ -2200,6 +2419,8 @@ mod tests {
         assert_eq!(server.alias, "local");
         assert_eq!(server.user, "alice");
         assert_eq!(server.display_name, "Alice");
+        assert_eq!(config.audio.input_device_id, None);
+        assert_eq!(config.audio.output_device_id, None);
         assert_eq!(config.audio.bitrate_bps, 24_000);
         assert_eq!(config.audio.max_amplification, 20.0);
         assert_eq!(config.files.max_upload_bytes, 50 * 1024 * 1024);
@@ -2346,11 +2567,15 @@ mod tests {
         app.open_settings();
 
         assert_eq!(app.mode, theme::UiMode::Settings);
-        assert_eq!(app.settings_focus, SettingsFocus::Device);
+        assert_eq!(app.settings_focus, SettingsFocus::InputDevice);
         assert!(!app.audio_input_picker.open);
-        assert!(app.devices.is_empty());
+        assert!(!app.audio_output_picker.open);
+        assert!(app.input_devices.is_empty());
+        assert!(app.output_devices.is_empty());
         assert_eq!(app.audio_input_items.len(), 1);
         assert_eq!(app.audio_input_items[0].selection, None);
+        assert_eq!(app.audio_output_items.len(), 1);
+        assert_eq!(app.audio_output_items[0].selection, None);
     }
 
     #[test]
@@ -2391,8 +2616,8 @@ mod tests {
     fn open_audio_input_picker_uses_j_k_and_arrows_for_list_navigation() {
         let mut app = test_app();
         app.mode = theme::UiMode::Settings;
-        app.settings_focus = SettingsFocus::Device;
-        app.devices = vec![
+        app.settings_focus = SettingsFocus::InputDevice;
+        app.input_devices = vec![
             DeviceInfo {
                 name: "Alpha Microphone".to_string(),
                 supported: true,
@@ -2406,7 +2631,7 @@ mod tests {
                 issue: None,
             },
         ];
-        app.rebuild_audio_input_picker();
+        app.rebuild_audio_device_pickers();
 
         assert!(!app.audio_input_picker.open);
         app.activate_audio_input_picker();
@@ -2438,6 +2663,94 @@ mod tests {
         assert_eq!(
             app.audio_input_picker.selector.current_item_index(),
             Some(0)
+        );
+    }
+
+    #[test]
+    fn open_audio_output_picker_uses_j_k_and_arrows_for_list_navigation() {
+        let mut app = test_app();
+        app.mode = theme::UiMode::Settings;
+        app.settings_focus = SettingsFocus::OutputDevice;
+        app.output_devices = vec![
+            DeviceInfo {
+                name: "Alpha Speaker".to_string(),
+                supported: true,
+                preview: None,
+                issue: None,
+            },
+            DeviceInfo {
+                name: "Beta Speaker".to_string(),
+                supported: true,
+                preview: None,
+                issue: None,
+            },
+        ];
+        app.rebuild_audio_device_pickers();
+
+        assert!(!app.audio_output_picker.open);
+        app.activate_audio_output_picker();
+        assert!(app.audio_output_picker.open);
+        assert_eq!(
+            app.audio_output_picker.selector.current_item_index(),
+            Some(0)
+        );
+
+        app.process_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::empty()));
+        assert_eq!(
+            app.audio_output_picker.selector.current_item_index(),
+            Some(1)
+        );
+
+        app.process_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::empty()));
+        assert_eq!(
+            app.audio_output_picker.selector.current_item_index(),
+            Some(0)
+        );
+
+        app.process_key(KeyEvent::new(KeyCode::Down, KeyModifiers::empty()));
+        assert_eq!(
+            app.audio_output_picker.selector.current_item_index(),
+            Some(1)
+        );
+
+        app.process_key(KeyEvent::new(KeyCode::Up, KeyModifiers::empty()));
+        assert_eq!(
+            app.audio_output_picker.selector.current_item_index(),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn async_audio_refresh_populates_open_output_picker_without_closing() {
+        let mut app = test_app();
+        app.mode = theme::UiMode::Settings;
+        app.settings_focus = SettingsFocus::OutputDevice;
+        app.activate_audio_output_picker();
+        assert!(app.audio_output_picker.open);
+        assert_eq!(app.audio_output_items.len(), 1);
+
+        app.audio_device_refresh_in_flight = true;
+        app.next_audio_device_refresh_id = 1;
+        app.handle_audio_device_refresh(AudioDeviceRefresh {
+            id: 0,
+            buffer_request: BufferRequest::Default,
+            restart_preview: false,
+            input: Ok(Vec::new()),
+            output: Ok(vec![DeviceInfo {
+                name: "USB Speakers".to_string(),
+                supported: true,
+                preview: None,
+                issue: None,
+            }]),
+        });
+
+        assert!(!app.audio_device_refresh_in_flight);
+        assert!(app.audio_output_picker.open);
+        assert_eq!(app.audio_output_items.len(), 2);
+        assert!(
+            app.audio_output_items
+                .iter()
+                .any(|item| item.name == "USB Speakers")
         );
     }
 
