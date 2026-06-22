@@ -1,5 +1,3 @@
-active-server = "local"
-
 [[servers]]
 alias = "local"
 user = "alice"

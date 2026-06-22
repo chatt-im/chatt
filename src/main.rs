@@ -21,7 +21,7 @@ use std::{
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
-        mpsc::{self, Receiver},
+        mpsc::{self, Receiver, Sender},
     },
     thread,
     time::{Duration, Instant},
@@ -35,10 +35,10 @@ use audio::{
 };
 use bindings::{BindCommand, PendingChord, Resolved};
 use chat_buffer::VirtualChatBuffer;
-use client_net::{NetworkClient, NetworkCommand, NetworkEvent};
+use client_net::{NetworkClient, NetworkCommand, NetworkEvent, spawn_pair_once};
 use config::{
     Config, MAX_USER_VOLUME_DB, MIN_USER_VOLUME_DB, ServerEntry, SoundboardClip,
-    USER_VOLUME_DB_STEP, snap_user_volume_db,
+    USER_VOLUME_DB_STEP, snap_user_volume_db, validate_server_entry,
 };
 use extui::{
     Buffer, Ellipsis, HAlign, Rect, Style, Terminal, TerminalFlags,
@@ -63,6 +63,7 @@ use settings::{
     SettingsFocus,
 };
 use tinyhl::{Highlighter, Source};
+use ui::select::{FuzzySelect, SelectableItem};
 use unicode_width::UnicodeWidthStr;
 
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
@@ -397,6 +398,7 @@ impl EditorHighlighter {
 
 struct App {
     config: Config,
+    event_tx: Sender<NetworkEvent>,
     server_alias: String,
     user: String,
     room_name: String,
@@ -414,9 +416,15 @@ struct App {
     audio_device_refresh_rx: Receiver<AudioDeviceRefresh>,
     audio_device_refresh_in_flight: bool,
     next_audio_device_refresh_id: u64,
-    network: NetworkClient,
+    network: Option<NetworkClient>,
+    control_socket: Option<local_control::ControlSocket>,
     session_id: Option<SessionId>,
     user_id: Option<UserId>,
+    server_items: Vec<ServerSelectItem>,
+    server_select: FuzzySelect,
+    server_select_searching: bool,
+    server_edit: Option<ServerEditDraft>,
+    pending_pair: Option<PendingPair>,
     input_devices: Vec<DeviceInfo>,
     output_devices: Vec<DeviceInfo>,
     audio_input_items: Vec<settings::AudioInputItem>,
@@ -446,7 +454,74 @@ struct App {
     voice_bytes_received: u64,
     encoder_profile: LiveEncoderProfile,
     last_network_notice: Option<String>,
-    save_config_after_auth: bool,
+}
+
+#[derive(Clone, Debug)]
+struct ServerSelectItem {
+    alias: String,
+    user: String,
+    display_name: String,
+    tcp_addr: String,
+    room_id: u32,
+    search_text: String,
+}
+
+impl SelectableItem for ServerSelectItem {
+    fn search_text(&self) -> &str {
+        &self.search_text
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ServerEditFocus {
+    Alias,
+    DisplayName,
+    TcpAddr,
+    UdpAddr,
+    UdpProbeAddr,
+    RoomId,
+    Save,
+    SaveJoin,
+    Cancel,
+}
+
+impl ServerEditFocus {
+    const ORDER: [ServerEditFocus; 9] = [
+        ServerEditFocus::Alias,
+        ServerEditFocus::DisplayName,
+        ServerEditFocus::TcpAddr,
+        ServerEditFocus::UdpAddr,
+        ServerEditFocus::UdpProbeAddr,
+        ServerEditFocus::RoomId,
+        ServerEditFocus::Save,
+        ServerEditFocus::SaveJoin,
+        ServerEditFocus::Cancel,
+    ];
+
+    fn index(self) -> usize {
+        Self::ORDER
+            .iter()
+            .position(|focus| *focus == self)
+            .unwrap_or(0)
+    }
+}
+
+struct ServerEditDraft {
+    original_alias: String,
+    user: String,
+    token: String,
+    server_public_key: String,
+    alias: Editor,
+    display_name: Editor,
+    tcp_addr: Editor,
+    udp_addr: Editor,
+    udp_probe_addr: Editor,
+    room_id: Editor,
+    focus: ServerEditFocus,
+}
+
+struct PendingPair {
+    server: ServerEntry,
 }
 
 struct UserVolumeDialog {
@@ -530,17 +605,10 @@ enum CliCommand {
 }
 
 impl App {
-    fn new(
-        config: Config,
-        pairing_code: Option<String>,
-        save_config_after_auth: bool,
-    ) -> Result<Self, String> {
+    fn new(config: Config, pending_invite: Option<InviteTicket>) -> Result<Self, String> {
         let (event_tx, event_rx) = mpsc::channel();
         let (audio_device_refresh_tx, audio_device_refresh_rx) = mpsc::channel();
         let (soundboard_event_tx, soundboard_event_rx) = mpsc::channel();
-        let active_server = config.active_server()?.clone();
-        let client_config = active_server.client_config(&config.files, pairing_code);
-        let network = NetworkClient::spawn(client_config, event_tx);
         let soundboard_enabled = config.soundboard.enabled;
         let mut composer =
             Editor::with_bindings(editor_bindings::vim(editor_bindings::VimOptions::default()));
@@ -563,13 +631,14 @@ impl App {
             settings_draft.output_device_id.as_deref(),
         );
         let echo_control = Arc::new(EchoCancellationControl::new(config.audio.echo_cancellation));
-        Ok(Self {
-            server_alias: active_server.alias.clone(),
-            user: active_server.effective_display_name(),
-            room_name: "lobby".to_string(),
-            status: "connecting".to_string(),
+        let mut app = Self {
+            event_tx,
+            server_alias: String::new(),
+            user: String::new(),
+            room_name: "servers".to_string(),
+            status: "select a server".to_string(),
             status_kind: StatusKind::Info,
-            mode: theme::UiMode::Compose,
+            mode: theme::UiMode::ServerSelect,
             composer,
             composer_hl,
             chat: VirtualChatBuffer::new(config.ui.max_messages as usize),
@@ -581,9 +650,15 @@ impl App {
             audio_device_refresh_rx,
             audio_device_refresh_in_flight: false,
             next_audio_device_refresh_id: 0,
-            network,
+            network: None,
+            control_socket: None,
             session_id: None,
             user_id: None,
+            server_items: Vec::new(),
+            server_select: FuzzySelect::default(),
+            server_select_searching: false,
+            server_edit: None,
+            pending_pair: None,
             input_devices: Vec::new(),
             output_devices: Vec::new(),
             audio_input_items,
@@ -613,9 +688,15 @@ impl App {
             voice_bytes_received: 0,
             encoder_profile: LiveEncoderProfile::DRED_20,
             last_network_notice: None,
-            save_config_after_auth,
             config,
-        })
+        };
+        app.rebuild_server_items();
+        if let Some(ticket) = pending_invite {
+            app.start_join_pairing(ticket);
+        } else if app.config.servers.is_empty() {
+            app.set_status("no servers configured; run chatt join JOIN_STRING");
+        }
+        Ok(app)
     }
 
     fn drain_network_events(&mut self) {
@@ -634,6 +715,135 @@ impl App {
         while let Ok(event) = self.soundboard_event_rx.try_recv() {
             self.handle_soundboard_event(event);
         }
+    }
+
+    fn rebuild_server_items(&mut self) {
+        self.server_items = self
+            .config
+            .servers
+            .iter()
+            .map(|server| ServerSelectItem {
+                alias: server.alias.clone(),
+                user: server.user.clone(),
+                display_name: server.display_name.clone(),
+                tcp_addr: server.tcp_addr.clone(),
+                room_id: server.room_id,
+                search_text: format!(
+                    "{} {} {} {} {}",
+                    server.alias, server.user, server.display_name, server.tcp_addr, server.room_id
+                ),
+            })
+            .collect();
+        self.server_select.refresh(&self.server_items);
+    }
+
+    fn selected_server_alias(&self) -> Option<String> {
+        self.server_select
+            .current_item_index()
+            .and_then(|index| self.server_items.get(index))
+            .map(|item| item.alias.clone())
+    }
+
+    fn open_server_select(&mut self) {
+        self.mode = theme::UiMode::ServerSelect;
+        self.server_select_searching = false;
+        self.rebuild_server_items();
+        if self.config.servers.is_empty() {
+            self.set_status("no servers configured; run chatt join JOIN_STRING");
+        } else {
+            self.set_status("select a server");
+        }
+    }
+
+    fn open_server_edit(&mut self, alias: &str) {
+        let Ok(server) = self.config.server(alias).cloned() else {
+            self.set_error(format!("server {alias} is not configured"));
+            self.open_server_select();
+            return;
+        };
+        self.server_edit = Some(ServerEditDraft::from_server(&server));
+        self.mode = theme::UiMode::ServerEdit;
+        self.set_status(format!("editing server {}", server.alias));
+    }
+
+    fn start_network(&mut self, alias: &str) {
+        let server = match self.config.server(alias) {
+            Ok(server) => server.clone(),
+            Err(error) => {
+                self.set_error(error);
+                return;
+            }
+        };
+        self.disconnect_network();
+        let network = NetworkClient::spawn(
+            server.client_config(&self.config.files),
+            self.event_tx.clone(),
+        );
+        self.control_socket = match local_control::ControlSocket::spawn(network.sender()) {
+            Ok(socket) => {
+                kvlog::info!(
+                    "chatt local control socket ready",
+                    path = %socket.path().display()
+                );
+                Some(socket)
+            }
+            Err(error) => {
+                self.push_network_notice("control", &error);
+                None
+            }
+        };
+        self.server_alias = server.alias.clone();
+        self.user = server.effective_display_name();
+        self.room_name = "lobby".to_string();
+        self.mode = theme::UiMode::Compose;
+        self.composer.enter_insert_mode();
+        self.network = Some(network);
+        self.set_status("connecting");
+    }
+
+    fn disconnect_network(&mut self) {
+        self.stop_audio();
+        self.control_socket.take();
+        if let Some(network) = self.network.take() {
+            network.stop();
+        }
+        self.session_id = None;
+        self.user_id = None;
+        self.participants = Participants::default();
+        self.stream_users.clear();
+        self.last_network_notice = None;
+        self.voice_tx_enabled.store(false, Ordering::Relaxed);
+    }
+
+    fn start_join_pairing(&mut self, ticket: InviteTicket) {
+        let alias = unique_server_alias(&self.config, &default_join_alias(&ticket));
+        let display_name = title_case_ascii(&ticket.user);
+        let token = match random_token() {
+            Ok(token) => token,
+            Err(error) => {
+                self.set_error(error);
+                return;
+            }
+        };
+        let server = match server_entry_from_invite(&ticket, alias.clone(), display_name, token) {
+            Ok(server) => server,
+            Err(error) => {
+                self.set_error(error);
+                return;
+            }
+        };
+        if let Err(error) = validate_server_entry(&server) {
+            self.set_error(error);
+            return;
+        }
+        spawn_pair_once(
+            server.client_config(&self.config.files),
+            ticket.pairing_code,
+            self.event_tx.clone(),
+        );
+        self.pending_pair = Some(PendingPair { server });
+        self.mode = theme::UiMode::ServerSelect;
+        self.set_status(format!("pairing {alias}"));
     }
 
     fn handle_soundboard_event(&mut self, event: SoundboardEvent) {
@@ -729,22 +939,7 @@ impl App {
                 if let Some(room) = rooms.first() {
                     self.room_name = room.name.clone();
                 }
-                if self.save_config_after_auth {
-                    match self.config.save_runtime() {
-                        Ok(path) => {
-                            self.config.config_path = Some(path.clone());
-                            self.save_config_after_auth = false;
-                            self.set_status(format!(
-                                "joined {}; config saved to {}",
-                                self.server_alias,
-                                path.display()
-                            ));
-                        }
-                        Err(error) => self.set_error(error),
-                    }
-                } else {
-                    self.set_status(format!("authenticated as {}", self.user));
-                }
+                self.set_status(format!("authenticated as {}", self.user));
             }
             NetworkEvent::RoomJoined {
                 room_id,
@@ -830,9 +1025,39 @@ impl App {
             NetworkEvent::AuthFailed(error) => {
                 kvlog::warn!("app auth failed", error = error.as_str());
                 self.stop_audio();
+                self.control_socket.take();
+                self.network.take();
                 self.stream_users.clear();
                 self.push_network_notice("auth", &error);
                 self.set_error(auth_failure_status(&error));
+            }
+            NetworkEvent::PairingSucceeded => {
+                let Some(pair) = self.pending_pair.take() else {
+                    self.set_status("pairing succeeded");
+                    return;
+                };
+                let alias = pair.server.alias.clone();
+                self.config.upsert_server(pair.server);
+                match self.config.save_runtime() {
+                    Ok(path) => {
+                        self.config.config_path = Some(path.clone());
+                        self.rebuild_server_items();
+                        self.open_server_edit(&alias);
+                        self.set_status(format!(
+                            "paired {alias}; config saved to {}",
+                            path.display()
+                        ));
+                    }
+                    Err(error) => {
+                        self.rebuild_server_items();
+                        self.open_server_edit(&alias);
+                        self.set_error(error);
+                    }
+                }
+            }
+            NetworkEvent::PairingFailed(error) => {
+                self.pending_pair.take();
+                self.set_error(error);
             }
             NetworkEvent::ReconnectScheduled { retry_in, reason } => {
                 self.stop_audio();
@@ -874,6 +1099,13 @@ impl App {
             return Action::Quit;
         }
 
+        if self.mode == theme::UiMode::ServerSelect {
+            return self.process_server_select_key(key);
+        }
+        if self.mode == theme::UiMode::ServerEdit {
+            return self.process_server_edit_key(key);
+        }
+
         if self.handle_volume_dialog_key(key) {
             return Action::Continue;
         }
@@ -886,6 +1118,7 @@ impl App {
             theme::UiMode::Compose => bindings::COMPOSE_LAYER,
             theme::UiMode::Log => bindings::LOG_LAYER,
             theme::UiMode::Settings => bindings::SETTINGS_LAYER,
+            theme::UiMode::ServerSelect | theme::UiMode::ServerEdit => bindings::LOG_LAYER,
         };
         if let Some(input) = InputKey::from_event(&key) {
             match bindings::resolve(
@@ -907,9 +1140,211 @@ impl App {
             theme::UiMode::Compose => {
                 let _ = self.composer.send_key(&key);
             }
-            theme::UiMode::Log | theme::UiMode::Settings => {}
+            theme::UiMode::Log
+            | theme::UiMode::Settings
+            | theme::UiMode::ServerSelect
+            | theme::UiMode::ServerEdit => {}
         }
         Action::Continue
+    }
+
+    fn process_server_select_key(&mut self, key: KeyEvent) -> Action {
+        if matches!(key.kind, KeyEventKind::Release) {
+            return Action::Continue;
+        }
+        if self.server_select_searching {
+            match key.code {
+                KeyCode::Esc | KeyCode::Enter => {
+                    self.server_select_searching = false;
+                    return Action::Continue;
+                }
+                _ if self.server_select.edit_query(key) => {
+                    self.server_select.refresh(&self.server_items);
+                    return Action::Continue;
+                }
+                _ => return Action::Continue,
+            }
+        }
+
+        match key.code {
+            KeyCode::Char('/') => {
+                self.server_select_searching = true;
+                self.server_select.clear_query();
+                self.server_select.refresh(&self.server_items);
+            }
+            KeyCode::Char('j') | KeyCode::Down => {
+                self.server_select.move_selection(1);
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                self.server_select.move_selection(-1);
+            }
+            KeyCode::Enter => self.join_selected_server(),
+            KeyCode::Char('e') => self.edit_selected_server(),
+            KeyCode::Char('d') => self.delete_selected_server(),
+            KeyCode::Char('q') | KeyCode::Esc => {
+                if self.network.is_some() {
+                    self.mode = theme::UiMode::Compose;
+                    self.composer.enter_insert_mode();
+                }
+            }
+            KeyCode::F2 => self.open_settings(),
+            _ => {}
+        }
+        Action::Continue
+    }
+
+    fn process_server_edit_key(&mut self, key: KeyEvent) -> Action {
+        if matches!(key.kind, KeyEventKind::Release) {
+            return Action::Continue;
+        }
+        match key.code {
+            KeyCode::Esc => {
+                self.server_edit = None;
+                self.open_server_select();
+            }
+            KeyCode::Tab | KeyCode::Down => {
+                if let Some(draft) = &mut self.server_edit {
+                    draft.move_focus(1);
+                }
+            }
+            KeyCode::BackTab | KeyCode::Up => {
+                if let Some(draft) = &mut self.server_edit {
+                    draft.move_focus(-1);
+                }
+            }
+            KeyCode::Enter => {
+                let focus = self
+                    .server_edit
+                    .as_ref()
+                    .map(|draft| draft.focus)
+                    .unwrap_or(ServerEditFocus::Cancel);
+                match focus {
+                    ServerEditFocus::Save => self.save_server_edit(false),
+                    ServerEditFocus::SaveJoin => self.save_server_edit(true),
+                    ServerEditFocus::Cancel => {
+                        self.server_edit = None;
+                        self.open_server_select();
+                    }
+                    _ => {
+                        if let Some(draft) = &mut self.server_edit {
+                            draft.move_focus(1);
+                        }
+                    }
+                }
+            }
+            _ => {
+                if let Some(draft) = &mut self.server_edit
+                    && draft
+                        .focused_editor_mut()
+                        .is_some_and(|editor| editor.send_key(&key))
+                {}
+            }
+        }
+        Action::Continue
+    }
+
+    fn join_selected_server(&mut self) {
+        let Some(alias) = self.selected_server_alias() else {
+            self.set_error("no server selected");
+            return;
+        };
+        self.start_network(&alias);
+    }
+
+    fn edit_selected_server(&mut self) {
+        let Some(alias) = self.selected_server_alias() else {
+            self.set_error("no server selected");
+            return;
+        };
+        self.open_server_edit(&alias);
+    }
+
+    fn delete_selected_server(&mut self) {
+        let Some(alias) = self.selected_server_alias() else {
+            self.set_error("no server selected");
+            return;
+        };
+        self.config.servers.retain(|server| server.alias != alias);
+        self.config
+            .user_audio
+            .retain(|preference| preference.server_alias != alias);
+        if self.server_alias == alias {
+            self.disconnect_network();
+            self.server_alias.clear();
+            self.user.clear();
+            self.room_name = "servers".to_string();
+        }
+        match self.config.save_runtime() {
+            Ok(path) => {
+                self.config.config_path = Some(path.clone());
+                self.rebuild_server_items();
+                self.set_status(format!(
+                    "deleted {alias}; config saved to {}",
+                    path.display()
+                ));
+            }
+            Err(error) => self.set_error(error),
+        }
+    }
+
+    fn save_server_edit(&mut self, join_after_save: bool) {
+        let Some(draft) = self.server_edit.as_ref() else {
+            self.set_error("no server edit is open");
+            return;
+        };
+        let original_alias = draft.original_alias.clone();
+        let server = match draft.to_server() {
+            Ok(server) => server,
+            Err(error) => {
+                self.set_error(error);
+                return;
+            }
+        };
+        if server.alias != original_alias
+            && self
+                .config
+                .servers
+                .iter()
+                .any(|existing| existing.alias == server.alias)
+        {
+            self.set_error(format!("server alias {} already exists", server.alias));
+            return;
+        }
+        let alias = server.alias.clone();
+        if let Some(existing) = self
+            .config
+            .servers
+            .iter_mut()
+            .find(|existing| existing.alias == original_alias)
+        {
+            *existing = server;
+        } else {
+            self.config.upsert_server(server);
+        }
+        if alias != original_alias {
+            for preference in &mut self.config.user_audio {
+                if preference.server_alias == original_alias {
+                    preference.server_alias = alias.clone();
+                }
+            }
+            if self.server_alias == original_alias {
+                self.server_alias = alias.clone();
+            }
+        }
+        match self.config.save_runtime() {
+            Ok(path) => {
+                self.config.config_path = Some(path.clone());
+                self.server_edit = None;
+                self.rebuild_server_items();
+                if join_after_save {
+                    self.start_network(&alias);
+                } else {
+                    self.open_server_select();
+                    self.set_status(format!("server saved to {}", path.display()));
+                }
+            }
+            Err(error) => self.set_error(error),
+        }
     }
 
     fn handle_settings_search_key(&mut self, key: KeyEvent) -> bool {
@@ -1516,6 +1951,7 @@ impl App {
             "/audio" => self.show_audio_status(),
             "/clear" => self.chat.clear(),
             "/config" | "/settings" => self.open_settings(),
+            "/servers" => self.open_server_select(),
             "/soundboard" => self.show_soundboard(),
             "/users" => self.show_users(),
             "/whoami" => self.show_current_user(),
@@ -1524,9 +1960,10 @@ impl App {
             command if command.starts_with('/') => {
                 self.set_error(format!("unknown command: {command}"))
             }
-            body => self
-                .network
-                .send(NetworkCommand::SendChat(body.to_string())),
+            body => match &self.network {
+                Some(network) => network.send(NetworkCommand::SendChat(body.to_string())),
+                None => self.set_error("select a server before sending messages"),
+            },
         }
     }
 
@@ -1536,9 +1973,13 @@ impl App {
             self.set_error("usage: /upload file_path/filename.ext");
             return;
         }
-        self.network
-            .send(NetworkCommand::UploadFile(std::path::PathBuf::from(path)));
-        self.set_status(format!("queued upload {}", path));
+        match &self.network {
+            Some(network) => {
+                network.send(NetworkCommand::UploadFile(std::path::PathBuf::from(path)));
+                self.set_status(format!("queued upload {}", path));
+            }
+            None => self.set_error("select a server before uploading files"),
+        }
     }
 
     fn set_mute(&mut self, muted: bool) {
@@ -1733,7 +2174,12 @@ impl App {
 
         let input_path = self.soundboard_clip_path(&clip);
         let clip_name = clip.name.clone();
-        let network_tx = self.network.sender();
+        let Some(network) = &self.network else {
+            self.soundboard_busy.store(false, Ordering::Release);
+            self.set_error("select a server before using soundboard");
+            return;
+        };
+        let network_tx = network.sender();
         let event_tx = self.soundboard_event_tx.clone();
         let busy = Arc::clone(&self.soundboard_busy);
         let source_config = LiveAudioFileSourceConfig {
@@ -1806,7 +2252,7 @@ impl App {
             }
         }
 
-        let tx = self.network.sender();
+        let tx = self.network.as_ref().map(|network| network.sender());
         let mic_muted = Arc::clone(&self.mic_muted);
         let deafened = Arc::clone(&self.deafened);
         let voice_tx_enabled = Arc::clone(&self.voice_tx_enabled);
@@ -1827,7 +2273,9 @@ impl App {
                 {
                     return;
                 }
-                let _ = tx.send(NetworkCommand::LocalVoicePacket(payload));
+                if let Some(tx) = &tx {
+                    let _ = tx.send(NetworkCommand::LocalVoicePacket(payload));
+                }
             },
         ) {
             Ok(capture) => {
@@ -1875,6 +2323,11 @@ impl App {
     }
 
     fn start_room_voice(&mut self) {
+        if self.network.is_none() {
+            self.voice_tx_enabled.store(false, Ordering::Relaxed);
+            self.set_error("select a server before starting voice");
+            return;
+        }
         if self.deafened.load(Ordering::Relaxed) {
             self.voice_tx_enabled.store(false, Ordering::Relaxed);
             self.stop_mic_capture();
@@ -1896,7 +2349,11 @@ impl App {
         }
         if self.playback.is_none() {
             let (feedback_tx, feedback_rx) = mpsc::channel::<LivePlaybackFeedback>();
-            let network_tx = self.network.sender();
+            let Some(network) = &self.network else {
+                self.set_error("select a server before starting playback");
+                return;
+            };
+            let network_tx = network.sender();
             thread::spawn(move || {
                 for feedback in feedback_rx {
                     let _ = network_tx.send(NetworkCommand::PlaybackFeedback(feedback));
@@ -2061,8 +2518,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         CliCommand::Join { join_string } => {
             let config_path = config::value_arg(&args, "--config");
             let ticket = rpc::control::decode_invite_ticket(&join_string)?;
-            let (config, pairing_code) = run_join_setup(ticket, config_path.as_deref())?;
-            return run_app(config, Some(pairing_code), true);
+            let config = Config::load(config_path.as_deref())?;
+            return run_app(config, Some(ticket));
         }
         CliCommand::Upload { path } => {
             let path = absolute_upload_path(&path)?;
@@ -2095,21 +2552,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let config_path = config::value_arg(&args, "--config");
-    run_app(Config::load(config_path.as_deref())?, None, false)
+    run_app(Config::load(config_path.as_deref())?, None)
 }
 
 fn run_app(
     config: Config,
-    pairing_code: Option<String>,
-    save_config_after_auth: bool,
+    pending_invite: Option<InviteTicket>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let mut app = App::new(config, pairing_code, save_config_after_auth)?;
-    let control_socket = local_control::ControlSocket::spawn(app.network.sender())?;
-    kvlog::info!(
-        "chatt local control socket ready",
-        path = %control_socket.path().display()
-    );
-
+    let mut app = App::new(config, pending_invite)?;
     event::polling::initialize_global_waker(GlobalWakerConfig {
         resize: true,
         termination: true,
@@ -2126,7 +2576,6 @@ fn run_app(
     buffer.set_rgb_supported(true);
     let mut events = Events::default();
     let stdin = std::io::stdin();
-    let _control_socket = control_socket;
 
     loop {
         app.drain_network_events();
@@ -2453,67 +2902,6 @@ fn print_debug_audio_report(
     println!("{report}");
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum JoinFocus {
-    Alias,
-    DisplayName,
-    Confirm,
-}
-
-struct JoinDraft {
-    ticket: InviteTicket,
-    alias: Editor,
-    display_name: Editor,
-    focus: JoinFocus,
-    status: String,
-    status_kind: StatusKind,
-}
-
-impl JoinDraft {
-    fn new(ticket: InviteTicket) -> Self {
-        let alias = join_input_editor(&default_join_alias(&ticket));
-        let display_name = join_input_editor(&title_case_ascii(&ticket.user));
-        Self {
-            ticket,
-            alias,
-            display_name,
-            focus: JoinFocus::Alias,
-            status: "review invite".to_string(),
-            status_kind: StatusKind::Info,
-        }
-    }
-
-    fn move_focus(&mut self, delta: isize) {
-        const ORDER: [JoinFocus; 3] =
-            [JoinFocus::Alias, JoinFocus::DisplayName, JoinFocus::Confirm];
-        let index = ORDER
-            .iter()
-            .position(|focus| *focus == self.focus)
-            .unwrap_or(0);
-        let next = (index as isize + delta).rem_euclid(ORDER.len() as isize) as usize;
-        self.focus = ORDER[next];
-    }
-
-    fn set_error(&mut self, error: impl Into<String>) {
-        self.status = error.into();
-        self.status_kind = StatusKind::Error;
-    }
-
-    fn focused_editor_mut(&mut self) -> Option<&mut Editor> {
-        match self.focus {
-            JoinFocus::Alias => Some(&mut self.alias),
-            JoinFocus::DisplayName => Some(&mut self.display_name),
-            JoinFocus::Confirm => None,
-        }
-    }
-
-    fn focus_active_editor(&mut self) {
-        if let Some(editor) = self.focused_editor_mut() {
-            focus_join_input_editor(editor);
-        }
-    }
-}
-
 fn join_input_editor(value: &str) -> Editor {
     let mut editor = Editor::with_bindings(editor_bindings::nano());
     editor.set_single_line(true);
@@ -2530,134 +2918,76 @@ fn focus_join_input_editor(editor: &mut Editor) {
     editor.set_cursor_offset(editor.text_len());
 }
 
-fn run_join_setup(
-    ticket: InviteTicket,
-    config_path: Option<&str>,
-) -> Result<(Config, String), Box<dyn std::error::Error>> {
-    let mut draft = JoinDraft::new(ticket);
-    event::polling::initialize_global_waker(GlobalWakerConfig {
-        resize: true,
-        termination: true,
-    })?;
-
-    let flags = TerminalFlags::RAW_MODE
-        | TerminalFlags::ALT_SCREEN
-        | TerminalFlags::HIDE_CURSOR
-        | TerminalFlags::EXTENDED_KEYBOARD_INPUTS;
-    let mut terminal = Terminal::open(flags)?;
-    let (w, h) = terminal.size()?;
-    let mut buffer = Buffer::new(w, h);
-    buffer.set_rgb_supported(true);
-    let mut events = Events::default();
-    let stdin = std::io::stdin();
-
-    loop {
-        render_join(&mut draft, &mut buffer);
-        buffer.render(&mut terminal);
-
-        if event::poll(&stdin, Some(POLL_INTERVAL))?.is_readable() {
-            events.read_from(&stdin)?;
+impl ServerEditDraft {
+    fn from_server(server: &ServerEntry) -> Self {
+        Self {
+            original_alias: server.alias.clone(),
+            user: server.user.clone(),
+            token: server.token.clone(),
+            server_public_key: server.server_public_key.clone(),
+            alias: join_input_editor(&server.alias),
+            display_name: join_input_editor(&server.display_name),
+            tcp_addr: join_input_editor(&server.tcp_addr),
+            udp_addr: join_input_editor(&server.udp_addr),
+            udp_probe_addr: join_input_editor(server.udp_probe_addr.as_deref().unwrap_or("")),
+            room_id: join_input_editor(&server.room_id.to_string()),
+            focus: ServerEditFocus::Alias,
         }
+    }
 
-        while let Some(event) = events.next(terminal.is_raw()) {
-            match event {
-                Event::Key(key) => match process_join_key(&mut draft, key, config_path) {
-                    JoinAction::Continue => {}
-                    JoinAction::Cancel => return Err("join canceled".into()),
-                    JoinAction::Done(config, pairing_code) => return Ok((config, pairing_code)),
-                },
-                Event::Resized => {
-                    let (new_w, new_h) = terminal.size()?;
-                    buffer.resize(new_w, new_h);
-                }
-                _ => {}
-            }
+    fn move_focus(&mut self, delta: isize) {
+        let index = self.focus.index();
+        let next =
+            (index as isize + delta).rem_euclid(ServerEditFocus::ORDER.len() as isize) as usize;
+        self.focus = ServerEditFocus::ORDER[next];
+        self.focus_active_editor();
+    }
+
+    fn focused_editor_mut(&mut self) -> Option<&mut Editor> {
+        match self.focus {
+            ServerEditFocus::Alias => Some(&mut self.alias),
+            ServerEditFocus::DisplayName => Some(&mut self.display_name),
+            ServerEditFocus::TcpAddr => Some(&mut self.tcp_addr),
+            ServerEditFocus::UdpAddr => Some(&mut self.udp_addr),
+            ServerEditFocus::UdpProbeAddr => Some(&mut self.udp_probe_addr),
+            ServerEditFocus::RoomId => Some(&mut self.room_id),
+            ServerEditFocus::Save | ServerEditFocus::SaveJoin | ServerEditFocus::Cancel => None,
         }
+    }
+
+    fn focus_active_editor(&mut self) {
+        if let Some(editor) = self.focused_editor_mut() {
+            focus_join_input_editor(editor);
+        }
+    }
+
+    fn to_server(&self) -> Result<ServerEntry, String> {
+        let room_id = self
+            .room_id
+            .text()
+            .trim()
+            .parse::<u32>()
+            .map_err(|_| "room-id must be a positive integer".to_string())?;
+        let udp_probe_addr = non_empty_text(&self.udp_probe_addr.text());
+        let server = ServerEntry {
+            alias: self.alias.text().trim().to_string(),
+            tcp_addr: self.tcp_addr.text().trim().to_string(),
+            udp_addr: self.udp_addr.text().trim().to_string(),
+            udp_probe_addr,
+            user: self.user.clone(),
+            display_name: self.display_name.text().trim().to_string(),
+            token: self.token.clone(),
+            server_public_key: self.server_public_key.clone(),
+            room_id,
+        };
+        validate_server_entry(&server)?;
+        Ok(server)
     }
 }
 
-enum JoinAction {
-    Continue,
-    Cancel,
-    Done(Config, String),
-}
-
-fn process_join_key(draft: &mut JoinDraft, key: KeyEvent, config_path: Option<&str>) -> JoinAction {
-    if matches!(key.kind, KeyEventKind::Release) {
-        return JoinAction::Continue;
-    }
-    if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
-        return JoinAction::Cancel;
-    }
-    match key.code {
-        KeyCode::Esc => JoinAction::Cancel,
-        KeyCode::Tab | KeyCode::Down => {
-            draft.move_focus(1);
-            draft.focus_active_editor();
-            JoinAction::Continue
-        }
-        KeyCode::BackTab | KeyCode::Up => {
-            draft.move_focus(-1);
-            draft.focus_active_editor();
-            JoinAction::Continue
-        }
-        KeyCode::Enter if draft.focus == JoinFocus::Confirm => confirm_join(draft, config_path),
-        KeyCode::Enter => {
-            draft.move_focus(1);
-            draft.focus_active_editor();
-            JoinAction::Continue
-        }
-        _ if draft
-            .focused_editor_mut()
-            .is_some_and(|editor| editor.send_key(&key)) =>
-        {
-            JoinAction::Continue
-        }
-        _ => JoinAction::Continue,
-    }
-}
-
-fn confirm_join(draft: &mut JoinDraft, config_path: Option<&str>) -> JoinAction {
-    let alias = draft.alias.text().trim().to_string();
-    let display_name = draft.display_name.text().trim().to_string();
-    if let Err(error) = config::validate_server_alias(&alias) {
-        draft.set_error(error);
-        draft.focus = JoinFocus::Alias;
-        draft.focus_active_editor();
-        return JoinAction::Continue;
-    }
-    if let Err(error) = config::validate_display_name(&display_name) {
-        draft.set_error(error);
-        draft.focus = JoinFocus::DisplayName;
-        draft.focus_active_editor();
-        return JoinAction::Continue;
-    }
-
-    let token = match random_token() {
-        Ok(token) => token,
-        Err(error) => {
-            draft.set_error(error);
-            return JoinAction::Continue;
-        }
-    };
-    let server = match server_entry_from_invite(&draft.ticket, alias.clone(), display_name, token) {
-        Ok(server) => server,
-        Err(error) => {
-            draft.set_error(error);
-            return JoinAction::Continue;
-        }
-    };
-    let mut config = match Config::load(config_path) {
-        Ok(config) => config,
-        Err(error) => {
-            draft.set_error(error);
-            return JoinAction::Continue;
-        }
-    };
-    let pairing_code = draft.ticket.pairing_code.clone();
-    config.upsert_server(server);
-    config.set_active_server(alias);
-    JoinAction::Done(config, pairing_code)
+fn non_empty_text(value: &str) -> Option<String> {
+    let value = value.trim();
+    (!value.is_empty()).then(|| value.to_string())
 }
 
 fn server_entry_from_invite(
@@ -2717,6 +3047,51 @@ fn default_join_alias(ticket: &InviteTicket) -> String {
     alias
 }
 
+fn unique_server_alias(config: &Config, base: &str) -> String {
+    let base = sanitize_server_alias(base);
+    if !config.servers.iter().any(|server| server.alias == base) {
+        return base;
+    }
+    for index in 2..10_000 {
+        let suffix = format!("-{index}");
+        let max_base_len = 64usize.saturating_sub(suffix.len());
+        let mut candidate = base.chars().take(max_base_len).collect::<String>();
+        candidate.push_str(&suffix);
+        if !config
+            .servers
+            .iter()
+            .any(|server| server.alias == candidate)
+        {
+            return candidate;
+        }
+    }
+    format!("server-{}", std::process::id())
+}
+
+fn sanitize_server_alias(value: &str) -> String {
+    let mut out = String::with_capacity(value.len().min(64));
+    for ch in value.trim().chars() {
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch.to_ascii_lowercase());
+        } else if matches!(ch, '-' | '_') {
+            out.push(ch);
+        } else if !out.ends_with('-') {
+            out.push('-');
+        }
+        if out.len() >= 64 {
+            break;
+        }
+    }
+    while out.ends_with('-') || out.ends_with('_') {
+        out.pop();
+    }
+    if out.is_empty() {
+        "server".to_string()
+    } else {
+        out
+    }
+}
+
 fn title_case_ascii(value: &str) -> String {
     let mut out = String::with_capacity(value.len());
     let mut word_start = true;
@@ -2739,63 +3114,6 @@ fn title_case_ascii(value: &str) -> String {
     } else {
         out
     }
-}
-
-fn render_join(draft: &mut JoinDraft, buf: &mut Buffer) {
-    buf.rect().with(theme::BACKGROUND).fill(buf);
-    buf.hide_cursor();
-    let mut area = buf.rect();
-    let status = area.take_bottom(1);
-    draw_join_status(status, draft, buf);
-    let mut body = area;
-    body.take_top(1)
-        .with(theme::STATUS_SECTION | Modifier::BOLD)
-        .with(Ellipsis(true))
-        .text(buf, " JOIN SERVER ");
-    body.take_top(1).with(theme::BACKGROUND).fill(buf);
-    draw_join_detail(body.take_top(1), buf, "Server", &draft.ticket.tcp_addr);
-    draw_join_detail(body.take_top(1), buf, "UDP", &draft.ticket.udp_addr);
-    draw_join_detail(
-        body.take_top(1),
-        buf,
-        "Probe",
-        draft.ticket.udp_probe_addr.as_deref().unwrap_or("disabled"),
-    );
-    draw_join_detail(body.take_top(1), buf, "User", &draft.ticket.user);
-    draw_join_detail(
-        body.take_top(1),
-        buf,
-        "Room",
-        &draft.ticket.room_id.to_string(),
-    );
-    draw_join_detail(
-        body.take_top(1),
-        buf,
-        "Key",
-        &short_key(&draft.ticket.server_public_key),
-    );
-    body.take_top(1).with(theme::BACKGROUND).fill(buf);
-    draw_join_field(
-        body.take_top(1),
-        buf,
-        "Alias",
-        &mut draft.alias,
-        draft.focus == JoinFocus::Alias,
-    );
-    draw_join_field(
-        body.take_top(1),
-        buf,
-        "Display",
-        &mut draft.display_name,
-        draft.focus == JoinFocus::DisplayName,
-    );
-    body.take_top(1).with(theme::BACKGROUND).fill(buf);
-    draw_join_button(
-        body.take_top(1),
-        buf,
-        "Join server",
-        draft.focus == JoinFocus::Confirm,
-    );
 }
 
 fn draw_join_detail(area: Rect, buf: &mut Buffer, label: &str, value: &str) {
@@ -2861,17 +3179,6 @@ fn draw_join_button(area: Rect, buf: &mut Buffer, label: &str, focused: bool) {
         .text(buf, &format!(" {label} "));
 }
 
-fn draw_join_status(area: Rect, draft: &JoinDraft, buf: &mut Buffer) {
-    let style = match draft.status_kind {
-        StatusKind::Info => theme::STATUS_FILL.patch(theme::MUTED),
-        StatusKind::Error => theme::STATUS_FILL.patch(theme::ERROR),
-    };
-    area.with(theme::STATUS_FILL).fill(buf);
-    area.with(style)
-        .with(Ellipsis(true))
-        .text(buf, &format!(" {}", draft.status));
-}
-
 fn short_key(value: &str) -> String {
     if value.len() <= 18 {
         value.to_string()
@@ -2889,6 +3196,20 @@ fn render(app: &mut App, buf: &mut Buffer) {
         .map(|capture| capture.stats().snapshot());
 
     let mut screen = buf.rect();
+    if matches!(
+        app.mode,
+        theme::UiMode::ServerSelect | theme::UiMode::ServerEdit
+    ) {
+        let status_area = screen.take_bottom(1);
+        match app.mode {
+            theme::UiMode::ServerSelect => draw_server_select(screen, app, buf),
+            theme::UiMode::ServerEdit => draw_server_edit(screen, app, buf),
+            _ => {}
+        }
+        draw_status(status_area, app, buf, capture.as_ref());
+        return;
+    }
+
     let composer_height = composer_height(app, screen.w);
     let composer_area = screen.take_bottom(composer_height as i32);
     let status_area = screen.take_bottom(1);
@@ -2916,6 +3237,7 @@ fn render(app: &mut App, buf: &mut Buffer) {
             &mut app.audio_output_picker,
         ),
         theme::UiMode::Compose | theme::UiMode::Log => draw_chat(screen, app, buf),
+        theme::UiMode::ServerSelect | theme::UiMode::ServerEdit => {}
     }
     draw_status(status_area, app, buf, capture.as_ref());
     draw_composer(composer_area, app, buf);
@@ -2979,6 +3301,369 @@ fn draw_room(area: Rect, app: &App, buf: &mut Buffer) {
             ),
         );
     }
+}
+
+fn draw_server_select(area: Rect, app: &mut App, buf: &mut Buffer) {
+    area.with(theme::BACKGROUND).fill(buf);
+    let mut rows = area;
+    rows.take_top(1)
+        .with(theme::STATUS_SECTION | Modifier::BOLD)
+        .with(Ellipsis(true))
+        .text(buf, " SERVERS ");
+
+    let mut body = rows;
+    if body.h == 0 {
+        return;
+    }
+    if app.server_items.is_empty() {
+        draw_server_welcome(body, buf);
+        return;
+    }
+
+    let search = body.take_top(1);
+    let search_label = if app.server_select_searching {
+        format!("/{}", app.server_select.query())
+    } else {
+        "Press / to search   Enter join   e edit   d delete   F2 audio   Ctrl-C quit".to_string()
+    };
+    search
+        .with(theme::BACKGROUND.patch(theme::SUBTLE))
+        .with(Ellipsis(true))
+        .text(buf, &search_label);
+
+    let items = &app.server_items;
+    app.server_select
+        .render(body, 3, buf, |_, item_index, selected, area, buf| {
+            if let Some(item) = items.get(item_index) {
+                draw_server_select_item(area, buf, item, selected);
+            }
+        });
+}
+
+enum ServerWelcomeLine {
+    Text(&'static str),
+    Section(&'static str),
+    Binding {
+        key: &'static str,
+        desc: &'static str,
+    },
+    Binding3 {
+        key1: &'static str,
+        key2: &'static str,
+        key3: &'static str,
+        desc: &'static str,
+    },
+    Empty,
+}
+
+const SERVER_WELCOME_KEY_WIDTH: usize = 15;
+const SERVER_WELCOME_COLUMN_GAP: usize = 4;
+
+fn draw_server_welcome(area: Rect, buf: &mut Buffer) {
+    use ServerWelcomeLine::*;
+
+    let header = [
+        Section("Welcome to Chatt"),
+        Empty,
+        Text("No servers are configured yet."),
+        Empty,
+    ];
+    let quick_start = [
+        Section("Quick start:"),
+        Binding {
+            key: "chatt join",
+            desc: "Pair with a server from a join string",
+        },
+        Binding {
+            key: "F2",
+            desc: "Audio settings",
+        },
+    ];
+    let server_actions = [
+        Section("Server actions:"),
+        Binding {
+            key: "Enter",
+            desc: "Join selected",
+        },
+        Binding {
+            key: "e",
+            desc: "Edit selected",
+        },
+        Binding {
+            key: "d",
+            desc: "Delete selected",
+        },
+        Binding {
+            key: "/",
+            desc: "Search servers",
+        },
+    ];
+    let navigation = [
+        Section("Navigation:"),
+        Binding3 {
+            key1: "j",
+            key2: "k",
+            key3: "Arrows",
+            desc: "Move through the server list",
+        },
+        Empty,
+        Binding {
+            key: "Ctrl-C",
+            desc: "Quit",
+        },
+    ];
+    let notes = [
+        Section("Configuration:"),
+        Text(" Servers are saved in chatt.toml."),
+        Text(" Pairing is one-shot; reconnects authenticate normally."),
+    ];
+
+    let left_width = quick_start
+        .iter()
+        .chain(&server_actions)
+        .map(server_welcome_line_width)
+        .max()
+        .unwrap_or(0);
+    let right_width = navigation
+        .iter()
+        .chain(&notes)
+        .map(server_welcome_line_width)
+        .max()
+        .unwrap_or(0);
+    let two_col_width = left_width + SERVER_WELCOME_COLUMN_GAP + right_width;
+
+    if area.w as usize >= two_col_width + 4 {
+        let mut left = Vec::new();
+        left.extend(quick_start);
+        left.push(Empty);
+        left.extend(server_actions);
+        let mut right = Vec::new();
+        right.extend(navigation);
+        right.push(Empty);
+        right.extend(notes);
+
+        let body_height = left.len().max(right.len());
+        let content_height = header.len() + body_height;
+        let start_y = area.y + area.h.saturating_sub(content_height as u16) / 2;
+        let left_x = area.x + area.w.saturating_sub(two_col_width as u16) / 2;
+        let right_x = left_x + left_width as u16 + SERVER_WELCOME_COLUMN_GAP as u16;
+
+        for (index, line) in header.iter().enumerate() {
+            draw_server_welcome_line(buf, left_x, start_y + index as u16, line);
+        }
+        let body_y = start_y + header.len() as u16;
+        for index in 0..body_height {
+            let y = body_y + index as u16;
+            if let Some(line) = left.get(index) {
+                draw_server_welcome_line(buf, left_x, y, line);
+            }
+            if let Some(line) = right.get(index) {
+                draw_server_welcome_line(buf, right_x, y, line);
+            }
+        }
+    } else {
+        let mut lines = Vec::new();
+        lines.extend(header);
+        lines.extend(quick_start);
+        lines.push(Empty);
+        lines.extend(navigation);
+        lines.push(Empty);
+        lines.extend(server_actions);
+        lines.push(Empty);
+        lines.extend(notes);
+
+        let content_height = lines.len() as u16;
+        let start_y = area.y + area.h.saturating_sub(content_height) / 2;
+        let max_width = lines
+            .iter()
+            .map(server_welcome_line_width)
+            .max()
+            .unwrap_or(0) as u16;
+        let x = area.x + area.w.saturating_sub(max_width) / 2;
+        for (index, line) in lines.iter().enumerate() {
+            draw_server_welcome_line(buf, x, start_y + index as u16, line);
+        }
+    }
+}
+
+fn server_welcome_line_width(line: &ServerWelcomeLine) -> usize {
+    match line {
+        ServerWelcomeLine::Text(text) | ServerWelcomeLine::Section(text) => text.width(),
+        ServerWelcomeLine::Binding { desc, .. } => 2 + SERVER_WELCOME_KEY_WIDTH + desc.width(),
+        ServerWelcomeLine::Binding3 {
+            key1,
+            key2,
+            key3,
+            desc,
+        } => {
+            let keys = key1.width() + 1 + key2.width() + 1 + key3.width();
+            2 + SERVER_WELCOME_KEY_WIDTH.max(keys) + desc.width()
+        }
+        ServerWelcomeLine::Empty => 0,
+    }
+}
+
+fn draw_server_welcome_line(buf: &mut Buffer, x: u16, y: u16, line: &ServerWelcomeLine) {
+    let section_style = theme::BACKGROUND.patch(theme::TEXT | Modifier::BOLD);
+    let text_style = theme::BACKGROUND.patch(theme::MUTED);
+    let key_style = theme::BACKGROUND.patch(theme::ACCENT);
+
+    match line {
+        ServerWelcomeLine::Text(text) => draw_text_at(buf, x, y, text, text_style),
+        ServerWelcomeLine::Section(text) => draw_text_at(buf, x, y, text, section_style),
+        ServerWelcomeLine::Binding { key, desc } => {
+            draw_text_at(buf, x, y, "  ", text_style);
+            draw_text_at(buf, x.saturating_add(2), y, key, key_style);
+            let desc_x = x.saturating_add(2 + SERVER_WELCOME_KEY_WIDTH as u16);
+            draw_text_at(buf, desc_x, y, desc, text_style);
+        }
+        ServerWelcomeLine::Binding3 {
+            key1,
+            key2,
+            key3,
+            desc,
+        } => {
+            draw_text_at(buf, x, y, "  ", text_style);
+            let keys = format!("{key1} {key2} {key3}");
+            draw_text_at(buf, x.saturating_add(2), y, &keys, key_style);
+            let desc_x = x.saturating_add(2 + SERVER_WELCOME_KEY_WIDTH as u16);
+            draw_text_at(buf, desc_x, y, desc, text_style);
+        }
+        ServerWelcomeLine::Empty => {}
+    }
+}
+
+fn draw_text_at(buf: &mut Buffer, x: u16, y: u16, text: &str, style: Style) {
+    let area = Rect {
+        x,
+        y,
+        w: text.width().min(u16::MAX as usize) as u16,
+        h: 1,
+    };
+    area.with(style).with(Ellipsis(true)).text(buf, text);
+}
+
+fn draw_server_select_item(area: Rect, buf: &mut Buffer, item: &ServerSelectItem, selected: bool) {
+    let base = if selected {
+        ROOM_SELECTED
+    } else {
+        theme::BACKGROUND
+    };
+    buf.clear_rect(area, base);
+    let mut rows = area;
+    let mut top = rows.take_top(1);
+    top.take_left(2)
+        .with(base.patch(if selected { theme::GOOD } else { theme::SUBTLE }))
+        .text(buf, if selected { ">" } else { " " });
+    top.with(base.patch(theme::TEXT | Modifier::BOLD))
+        .with(Ellipsis(true))
+        .text(buf, &item.alias);
+    if rows.h > 0 {
+        rows.take_top(1)
+            .with(base.patch(theme::MUTED))
+            .with(Ellipsis(true))
+            .text(
+                buf,
+                &format!(
+                    "  {} as {}  room {}",
+                    item.user, item.display_name, item.room_id
+                ),
+            );
+    }
+    if rows.h > 0 {
+        rows.take_top(1)
+            .with(base.patch(theme::SUBTLE))
+            .with(Ellipsis(true))
+            .text(buf, &format!("  {}", item.tcp_addr));
+    }
+}
+
+fn draw_server_edit(area: Rect, app: &mut App, buf: &mut Buffer) {
+    area.with(theme::BACKGROUND).fill(buf);
+    let Some(draft) = app.server_edit.as_mut() else {
+        area.with(theme::SUBTLE)
+            .with(HAlign::Center)
+            .text(buf, "No server edit is open");
+        return;
+    };
+    let mut rows = area;
+    rows.take_top(1)
+        .with(theme::STATUS_SECTION | Modifier::BOLD)
+        .with(Ellipsis(true))
+        .text(buf, &format!(" EDIT SERVER {} ", draft.original_alias));
+    rows.take_top(1).with(theme::BACKGROUND).fill(buf);
+    draw_join_detail(rows.take_top(1), buf, "User", &draft.user);
+    draw_join_detail(rows.take_top(1), buf, "Token", &short_key(&draft.token));
+    draw_join_detail(
+        rows.take_top(1),
+        buf,
+        "Key",
+        &short_key(&draft.server_public_key),
+    );
+    rows.take_top(1).with(theme::BACKGROUND).fill(buf);
+    draw_join_field(
+        rows.take_top(1),
+        buf,
+        "Alias",
+        &mut draft.alias,
+        draft.focus == ServerEditFocus::Alias,
+    );
+    draw_join_field(
+        rows.take_top(1),
+        buf,
+        "Display",
+        &mut draft.display_name,
+        draft.focus == ServerEditFocus::DisplayName,
+    );
+    draw_join_field(
+        rows.take_top(1),
+        buf,
+        "TCP",
+        &mut draft.tcp_addr,
+        draft.focus == ServerEditFocus::TcpAddr,
+    );
+    draw_join_field(
+        rows.take_top(1),
+        buf,
+        "UDP",
+        &mut draft.udp_addr,
+        draft.focus == ServerEditFocus::UdpAddr,
+    );
+    draw_join_field(
+        rows.take_top(1),
+        buf,
+        "Probe",
+        &mut draft.udp_probe_addr,
+        draft.focus == ServerEditFocus::UdpProbeAddr,
+    );
+    draw_join_field(
+        rows.take_top(1),
+        buf,
+        "Room",
+        &mut draft.room_id,
+        draft.focus == ServerEditFocus::RoomId,
+    );
+    rows.take_top(1).with(theme::BACKGROUND).fill(buf);
+    let mut buttons = rows.take_top(1);
+    let button_width = (buttons.w / 3).max(1);
+    draw_join_button(
+        buttons.take_left(button_width as i32),
+        buf,
+        "Save",
+        draft.focus == ServerEditFocus::Save,
+    );
+    draw_join_button(
+        buttons.take_left(button_width as i32),
+        buf,
+        "Save and join",
+        draft.focus == ServerEditFocus::SaveJoin,
+    );
+    draw_join_button(
+        buttons,
+        buf,
+        "Cancel",
+        draft.focus == ServerEditFocus::Cancel,
+    );
 }
 
 fn room_user_voice_feedback_label(participant: &ParticipantState) -> String {
@@ -3376,6 +4061,8 @@ fn network_event_kind(event: &NetworkEvent) -> &'static str {
         NetworkEvent::Status(_) => "status",
         NetworkEvent::Error(_) => "error",
         NetworkEvent::AuthFailed(_) => "auth_failed",
+        NetworkEvent::PairingSucceeded => "pairing_succeeded",
+        NetworkEvent::PairingFailed(_) => "pairing_failed",
         NetworkEvent::ReconnectScheduled { .. } => "reconnect_scheduled",
         NetworkEvent::Disconnected => "disconnected",
     }
@@ -3395,21 +4082,8 @@ fn auth_failure_status(detail: &str) -> &'static str {
 mod tests {
     use super::*;
 
-    fn test_invite_ticket() -> InviteTicket {
-        InviteTicket {
-            version: 1,
-            user: "alice".to_string(),
-            pairing_code: "pair-alice-please-change".to_string(),
-            tcp_addr: "127.0.0.1:9000".to_string(),
-            udp_addr: "127.0.0.1:9001".to_string(),
-            udp_probe_addr: None,
-            server_public_key: "abcd".to_string(),
-            room_id: 1,
-        }
-    }
-
     fn test_app() -> App {
-        let (_event_tx, event_rx) = mpsc::channel();
+        let (event_tx, event_rx) = mpsc::channel();
         let (audio_device_refresh_tx, audio_device_refresh_rx) = mpsc::channel();
         let (soundboard_event_tx, soundboard_event_rx) = mpsc::channel();
         let (command_tx, _command_rx) = mpsc::channel();
@@ -3426,6 +4100,7 @@ mod tests {
         audio_output_picker.reset(&audio_output_items, None);
         App {
             config: Config::default(),
+            event_tx,
             server_alias: "local".to_string(),
             user: "alice".to_string(),
             room_name: "lobby".to_string(),
@@ -3443,9 +4118,15 @@ mod tests {
             audio_device_refresh_rx,
             audio_device_refresh_in_flight: false,
             next_audio_device_refresh_id: 0,
-            network: NetworkClient::from_parts_for_test(command_tx),
+            network: Some(NetworkClient::from_parts_for_test(command_tx)),
+            control_socket: None,
             session_id: Some(SessionId(1)),
             user_id: Some(UserId(1)),
+            server_items: Vec::new(),
+            server_select: FuzzySelect::default(),
+            server_select_searching: false,
+            server_edit: None,
+            pending_pair: None,
             input_devices: Vec::new(),
             output_devices: Vec::new(),
             audio_input_items,
@@ -3475,17 +4156,13 @@ mod tests {
             voice_bytes_received: 0,
             encoder_profile: LiveEncoderProfile::DRED_20,
             last_network_notice: None,
-            save_config_after_auth: false,
         }
     }
 
     #[test]
     fn default_config_parses() {
         let config = Config::default();
-        let server = config.active_server().unwrap();
-        assert_eq!(server.alias, "local");
-        assert_eq!(server.user, "alice");
-        assert_eq!(server.display_name, "Alice");
+        assert!(config.servers.is_empty());
         assert_eq!(config.audio.input_device_id, None);
         assert_eq!(config.audio.output_device_id, None);
         assert_eq!(config.audio.bitrate_bps, 48_000);
@@ -3504,58 +4181,54 @@ mod tests {
     }
 
     #[test]
-    fn join_alias_left_and_right_keys_edit_at_cursor() {
-        let mut draft = JoinDraft::new(test_invite_ticket());
+    fn server_edit_left_and_right_keys_edit_at_cursor() {
+        let mut draft = ServerEditDraft::from_server(&ServerEntry::default());
         draft.alias.set_lines("ac");
         draft.focus_active_editor();
 
-        let _ = process_join_key(
-            &mut draft,
-            KeyEvent::new(KeyCode::Left, KeyModifiers::empty()),
-            None,
+        assert!(
+            draft
+                .focused_editor_mut()
+                .unwrap()
+                .send_key(&KeyEvent::new(KeyCode::Left, KeyModifiers::empty()))
         );
-        let _ = process_join_key(
-            &mut draft,
-            KeyEvent::new(KeyCode::Char('b'), KeyModifiers::empty()),
-            None,
+        assert!(
+            draft
+                .focused_editor_mut()
+                .unwrap()
+                .send_key(&KeyEvent::new(KeyCode::Char('b'), KeyModifiers::empty()))
         );
-        let _ = process_join_key(
-            &mut draft,
-            KeyEvent::new(KeyCode::Right, KeyModifiers::empty()),
-            None,
+        assert!(
+            draft
+                .focused_editor_mut()
+                .unwrap()
+                .send_key(&KeyEvent::new(KeyCode::Right, KeyModifiers::empty()))
         );
-        let _ = process_join_key(
-            &mut draft,
-            KeyEvent::new(KeyCode::Char('d'), KeyModifiers::empty()),
-            None,
+        assert!(
+            draft
+                .focused_editor_mut()
+                .unwrap()
+                .send_key(&KeyEvent::new(KeyCode::Char('d'), KeyModifiers::empty()))
         );
 
-        assert_eq!(draft.focus, JoinFocus::Alias);
+        assert_eq!(draft.focus, ServerEditFocus::Alias);
         assert_eq!(draft.alias.text(), "abcd");
     }
 
     #[test]
-    fn join_focus_moves_cursor_to_end_of_existing_field() {
-        let mut draft = JoinDraft::new(test_invite_ticket());
+    fn server_edit_focus_moves_cursor_to_end_of_existing_field() {
+        let mut draft = ServerEditDraft::from_server(&ServerEntry::default());
         draft.alias.set_cursor_offset(0);
 
-        let _ = process_join_key(
-            &mut draft,
-            KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
-            None,
-        );
-        assert_eq!(draft.focus, JoinFocus::DisplayName);
+        draft.move_focus(1);
+        assert_eq!(draft.focus, ServerEditFocus::DisplayName);
         assert_eq!(
             draft.display_name.cursor_offset(),
             draft.display_name.text_len()
         );
 
-        let _ = process_join_key(
-            &mut draft,
-            KeyEvent::new(KeyCode::Up, KeyModifiers::empty()),
-            None,
-        );
-        assert_eq!(draft.focus, JoinFocus::Alias);
+        draft.move_focus(-1);
+        assert_eq!(draft.focus, ServerEditFocus::Alias);
         assert_eq!(draft.alias.cursor_offset(), draft.alias.text_len());
     }
 

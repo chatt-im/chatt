@@ -38,7 +38,7 @@ pub struct ServerEntry {
 impl Default for ServerEntry {
     fn default() -> Self {
         Self {
-            alias: default_active_server(),
+            alias: default_server_alias(),
             tcp_addr: "127.0.0.1:41000".to_string(),
             udp_addr: String::new(),
             udp_probe_addr: None,
@@ -52,7 +52,7 @@ impl Default for ServerEntry {
 }
 
 impl ServerEntry {
-    pub fn client_config(&self, files: &FileConfig, pairing_code: Option<String>) -> ClientConfig {
+    pub fn client_config(&self, files: &FileConfig) -> ClientConfig {
         ClientConfig {
             tcp_addr: self.tcp_addr.clone(),
             udp_addr: self.effective_udp_addr(),
@@ -60,7 +60,6 @@ impl ServerEntry {
             user: self.user.clone(),
             display_name: self.effective_display_name(),
             token: self.token.clone(),
-            pairing_code,
             server_public_key: non_empty_string(&self.server_public_key),
             room_id: RoomId(self.room_id),
             file_receive_dir: files.receive_dir_path(),
@@ -396,8 +395,9 @@ fn default_soundboard_seed() -> u64 {
 #[derive(Toml)]
 #[toml(FromToml, recoverable, warn_unknown_fields, rename_all = "kebab-case")]
 pub struct Config {
-    #[toml(default = default_active_server())]
-    pub active_server: String,
+    #[allow(dead_code)]
+    #[toml(default, rename = "active-server")]
+    legacy_active_server: Option<String>,
     #[toml(default = default_servers())]
     pub servers: Vec<ServerEntry>,
     #[toml(default)]
@@ -481,11 +481,6 @@ impl Config {
             server.user = server.user.trim().to_string();
             server.display_name = server.effective_display_name();
         }
-        if self.active_server.trim().is_empty()
-            && let Some(server) = self.servers.first()
-        {
-            self.active_server = server.alias.clone();
-        }
         for preference in &mut self.user_audio {
             preference.server_alias = preference.server_alias.trim().to_string();
             preference.volume_db = snap_user_volume_db(preference.volume_db);
@@ -508,11 +503,6 @@ impl Config {
         if !(8_000..=96_000).contains(&self.audio.bitrate_bps) {
             return Err(format!(
                 "{source}: audio bitrate-bps must be between 8000 and 96000"
-            ));
-        }
-        if self.servers.is_empty() {
-            return Err(format!(
-                "{source}: at least one [[servers]] entry is required"
             ));
         }
         let mut aliases = std::collections::HashSet::new();
@@ -600,14 +590,14 @@ impl Config {
                 ));
             }
         }
-        self.active_server().map(|_| ())
+        Ok(())
     }
 
-    pub fn active_server(&self) -> Result<&ServerEntry, String> {
+    pub fn server(&self, alias: &str) -> Result<&ServerEntry, String> {
         self.servers
             .iter()
-            .find(|server| server.alias == self.active_server)
-            .ok_or_else(|| format!("active server {} is not configured", self.active_server))
+            .find(|server| server.alias == alias)
+            .ok_or_else(|| format!("server {alias} is not configured"))
     }
 
     pub fn upsert_server(&mut self, server: ServerEntry) {
@@ -620,10 +610,6 @@ impl Config {
         } else {
             self.servers.push(server);
         }
-    }
-
-    pub fn set_active_server(&mut self, alias: String) {
-        self.active_server = alias;
     }
 
     pub fn user_volume_db(&self, server_alias: &str, user_id: u32) -> f32 {
@@ -721,7 +707,7 @@ fn reject_deprecated_config_keys(
 ) -> Result<(), String> {
     if doc.table().contains_key("network") {
         return Err(format!(
-            "failed to deserialize {source}: [network] is not supported; use active-server and [[servers]]"
+            "failed to deserialize {source}: [network] is not supported; use [[servers]]"
         ));
     }
     if doc
@@ -767,12 +753,12 @@ fn default_config_path() -> Option<PathBuf> {
     user.exists().then_some(user)
 }
 
-fn default_active_server() -> String {
+fn default_server_alias() -> String {
     "local".to_string()
 }
 
 fn default_servers() -> Vec<ServerEntry> {
-    vec![ServerEntry::default()]
+    Vec::new()
 }
 
 fn server_udp_addr_configured(doc: &toml_spanner::Document<'_>) -> Vec<bool> {
@@ -823,6 +809,22 @@ pub fn validate_display_name(display_name: &str) -> Result<(), String> {
     validate_non_empty(display_name, "display-name")?;
     if display_name.len() > 64 {
         return Err("display-name exceeds 64 bytes".to_string());
+    }
+    Ok(())
+}
+
+pub fn validate_server_entry(server: &ServerEntry) -> Result<(), String> {
+    validate_server_alias(&server.alias)?;
+    validate_non_empty(&server.user, "user")?;
+    validate_non_empty(&server.token, "token")?;
+    validate_display_name(&server.display_name)?;
+    validate_endpoint(&server.tcp_addr, "tcp-addr")?;
+    validate_endpoint(&server.effective_udp_addr(), "udp-addr")?;
+    if let Some(addr) = &server.udp_probe_addr {
+        validate_endpoint(addr, "udp-probe-addr")?;
+    }
+    if server.room_id == 0 {
+        return Err("room-id must be non-zero".to_string());
     }
     Ok(())
 }
@@ -1083,10 +1085,6 @@ fn write_runtime_config<'de>(root: &mut Table<'de>, config: &Config, arena: &'de
 
 fn runtime_servers_toml(config: &Config) -> String {
     let mut out = String::new();
-    out.push_str(&format!(
-        "active-server = \"{}\"\n\n",
-        toml_quote_value(&config.active_server)
-    ));
     for server in &config.servers {
         out.push_str("[[servers]]\n");
         out.push_str(&format!(
@@ -1273,7 +1271,7 @@ room-id = 1
         config.normalize();
         config.validate("<test>").unwrap();
 
-        let server = config.active_server().unwrap();
+        let server = config.server("prod").unwrap();
         assert_eq!(server.tcp_addr, "chat.example.com:443");
         assert_eq!(server.udp_addr, "media.example.com:54100");
         assert_eq!(
@@ -1351,11 +1349,12 @@ input-device-index = 20
 
     #[test]
     fn runtime_servers_toml_does_not_write_pairing_code() {
-        let config = Config::default();
+        let mut config = Config::default();
+        config.servers.push(ServerEntry::default());
         let content = runtime_servers_toml(&config);
 
         assert!(content.contains("[[servers]]"));
-        assert!(content.contains("active-server = \"local\""));
+        assert!(!content.contains("active-server"));
         assert!(!content.contains("pairing-code"));
     }
 
