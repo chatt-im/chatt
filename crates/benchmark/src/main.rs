@@ -482,6 +482,7 @@ fn bench_live(bench: &mut Bench<'_>, corpus: Arc<Corpus>) {
         LiveAudioPacketLossProfile::None.as_name(),
         LiveAudioPacketLossProfile::Lan.as_name(),
         LiveAudioPacketLossProfile::RegionalEthernet.as_name(),
+        LiveAudioPacketLossProfile::CleanJitter.as_name(),
         LiveAudioPacketLossProfile::MildRandom.as_name(),
         LiveAudioPacketLossProfile::ModerateRandom.as_name(),
         LiveAudioPacketLossProfile::SevereRandom.as_name(),

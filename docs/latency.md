@@ -121,9 +121,15 @@ signal rather than charging the pause as lateness. The estimate tracks:
 - A smoothed late jitter `J += (late - J) / 16`.
 - A fast-attack/slow-decay peak `P = max(late, P * 0.99)` (~2 s time constant).
 
-The recommended target is `20 ms + 3 * max(J, P) + 8 ms`, clamped to the
-`[dynamic-target-floor-ms, target-queue-ms]` range. It only descends after four
-consecutive feedback windows with zero loss, late, or reorder events. A single
+The recommended target is `20 ms + gain * max(J, weight * P) + margin`, with
+`gain` defaulting to 1.5, the peak `weight` to 0.5, and `margin` to 8 ms, clamped
+to the `[dynamic-target-floor-ms, target-queue-ms]` range. Discounting the
+slow-decay peak `P` keeps a continuous small jitter tail from pinning the target
+at the ceiling: steady-state jitter sets the target, while a genuine burst still
+drives `P` high enough to re-widen toward the ceiling. The gain, peak weight, and
+margin are configurable under `[audio.latency]` as `dynamic-jitter-gain`,
+`dynamic-peak-weight`, and `dynamic-target-margin-ms`. It only descends after
+four consecutive feedback windows with zero loss, late, or reorder events. A single
 such event in the current window pins the recommendation back at the ceiling
 immediately. Recurring playout underruns (an isolated underrun is treated as a
 talkspurt draining to silence, not starvation) snap the active baseline to the
@@ -142,7 +148,10 @@ latency the buffer cannot remove but no variation for it to absorb. The
 The simulation reports `steady_state_adaptive_target_ms`, the minimum adaptive
 target over the steady-state tail window. On `lan` and `regional_ethernet` it
 settles near 28 ms (one packet period plus the 8 ms margin) versus the fixed
-60 ms with the toggle off.
+60 ms with the toggle off. On `clean_jitter`, a clean internet path with a small
+interarrival jitter tail, it settles near 33 ms. Before the gain re-tune that
+same path pinned the target at the 60 ms ceiling for the entire call, which
+production traces confirmed.
 
 ## Packet Loss Profiles
 
@@ -154,7 +163,11 @@ mostly-good state and short bad bursts. The lossy named profiles also add
 deterministic delivery delay variation, so they exercise both packet loss and
 out-of-order arrival. `lan` and `regional_ethernet` model consistent links: zero
 loss and zero delay variation. `lan` adds no delay, `regional_ethernet` adds a
-steady 30 ms one-way delay. Both exercise the dynamic playout target.
+steady 30 ms one-way delay. `clean_jitter` models a clean internet path: zero
+loss with a small in-order interarrival jitter tail (delays stay at most one
+10 ms frame, below the 20 ms packet cadence, so packets jitter in their arrival
+gap without reordering). It reproduces the captured production trace that pinned
+the old target at the ceiling. These three exercise the dynamic playout target.
 
 These rows use the 60 s lossy alternating speech/silence scenario with all
 features enabled.
