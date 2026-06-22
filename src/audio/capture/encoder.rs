@@ -1,6 +1,16 @@
-use crate::audio::*;
+use std::ptr::NonNull;
 
-pub(in crate::audio) struct OpusVoiceEncoder {
+use opus_codec::Complexity;
+
+use crate::{
+    audio::{
+        errors::format_opus_error,
+        shared::{CHANNELS, LiveEncoderProfile, SAMPLE_RATE},
+    },
+    network::{EncoderNetworkProfile, EncoderNetworkTuning},
+};
+
+pub(crate) struct OpusVoiceEncoder {
     encoder: NonNull<opus_codec::OpusEncoder>,
     bitrate_bps: i32,
     dred_duration_10ms: i32,
@@ -11,7 +21,7 @@ pub(in crate::audio) struct OpusVoiceEncoder {
 unsafe impl Send for OpusVoiceEncoder {}
 
 impl OpusVoiceEncoder {
-    pub(in crate::audio) fn new(bitrate_bps: i32) -> Result<Self, String> {
+    pub(crate) fn new(bitrate_bps: i32) -> Result<Self, String> {
         let mut error = 0;
         let encoder = unsafe {
             opus_codec::opus_encoder_create(
@@ -45,11 +55,7 @@ impl OpusVoiceEncoder {
         Ok(this)
     }
 
-    pub(in crate::audio) fn encode(
-        &mut self,
-        input: &[i16],
-        output: &mut [u8],
-    ) -> Result<usize, String> {
+    pub(crate) fn encode(&mut self, input: &[i16], output: &mut [u8]) -> Result<usize, String> {
         if input.is_empty() || output.is_empty() {
             return Err(String::from("opus encode received an empty buffer"));
         }
@@ -74,7 +80,7 @@ impl OpusVoiceEncoder {
         usize::try_from(encoded).map_err(|_| String::from("opus encoded length is invalid"))
     }
 
-    pub(in crate::audio) fn reset_state(&mut self) -> Result<(), String> {
+    pub(crate) fn reset_state(&mut self) -> Result<(), String> {
         let result = unsafe {
             opus_codec::opus_encoder_ctl(self.encoder.as_ptr(), opus_codec::OPUS_RESET_STATE as i32)
         };
@@ -157,7 +163,7 @@ impl OpusVoiceEncoder {
         Ok(())
     }
 
-    pub(in crate::audio) fn apply_live_encoder_profile(
+    pub(crate) fn apply_live_encoder_profile(
         &mut self,
         profile: LiveEncoderProfile,
     ) -> Result<(), String> {
@@ -198,6 +204,7 @@ impl Drop for OpusVoiceEncoder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::audio::shared::{FRAME_SAMPLES, LIVE_OPUS_FRAME_SAMPLES, MAX_OPUS_PACKET_BYTES};
     #[allow(unused_imports)]
     use crate::audio::test_support::*;
 

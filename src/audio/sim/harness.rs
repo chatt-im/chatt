@@ -1,6 +1,42 @@
-use crate::audio::*;
+use std::{
+    path::Path,
+    process::Command,
+    sync::{Arc, Mutex},
+    time::{Duration, Instant},
+};
 
-pub(in crate::audio) fn trace_direct_run_start(
+use hashbrown::HashMap;
+
+use crate::{
+    audio::{
+        capture::{EchoReference, LiveEncoderPipeline, build_live_encoder_pipeline},
+        playback::{
+            LiveDecodeStream, LivePlaybackMixer, drain_live_decode_streams_with_trace,
+            insert_live_playback_packet,
+        },
+        shared::{
+            AudioStats, FRAME_SAMPLES, LIVE_OPUS_FRAME_SAMPLES, LiveAudioTraceWriter,
+            LiveAudioTuning, LocalVoiceFrame, MAX_OPUS_DECODE_SAMPLES, RemoteVoicePacket,
+            SAMPLE_RATE, duration_to_ms, frames_for_duration, max_adjacent_delta,
+            normalized_to_i16_scale, peak_i16_scale, rms_i16_scale, rms_normalized, samples_to_ms,
+            silence_ranges_contain, soft_limit, trace_time_ms,
+        },
+        sim::{
+            network::{
+                OnlineAudioMetrics, SimLossState, SimNetworkPipe, SimRng,
+                simulation_delivery_delay, simulation_drops_frame, simulation_encoder_profile,
+                trace_output_window,
+            },
+            scenario::{
+                LiveAudioDirectSampleSimulationConfig, LiveAudioSimulationConfig,
+                LiveAudioSimulationOutput, LiveAudioSimulationReport, LiveAudioSimulationScenario,
+            },
+        },
+    },
+    network::{EncoderNetworkProfile, InsertOutcome},
+};
+
+pub(crate) fn trace_direct_run_start(
     trace: &mut Option<LiveAudioTraceWriter>,
     config: LiveAudioDirectSampleSimulationConfig,
     input_samples: usize,
@@ -26,7 +62,7 @@ pub(in crate::audio) fn trace_direct_run_start(
     });
 }
 
-pub(in crate::audio) fn trace_capture_frame(
+pub(crate) fn trace_capture_frame(
     trace: &mut Option<LiveAudioTraceWriter>,
     start: Instant,
     now: Instant,
@@ -54,7 +90,7 @@ pub(in crate::audio) fn trace_capture_frame(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(in crate::audio) fn trace_network_decision(
+pub(crate) fn trace_network_decision(
     trace: &mut Option<LiveAudioTraceWriter>,
     start: Instant,
     now: Instant,
@@ -85,7 +121,7 @@ pub(in crate::audio) fn trace_network_decision(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(in crate::audio) fn trace_encoded_packet(
+pub(crate) fn trace_encoded_packet(
     trace: &mut Option<LiveAudioTraceWriter>,
     start: Instant,
     now: Instant,
@@ -112,7 +148,7 @@ pub(in crate::audio) fn trace_encoded_packet(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(in crate::audio) fn trace_packet_delivery(
+pub(crate) fn trace_packet_delivery(
     trace: &mut Option<LiveAudioTraceWriter>,
     start: Instant,
     now: Instant,
@@ -186,7 +222,7 @@ pub fn run_live_audio_direct_sample_simulation_output_with_trace(
     output
 }
 
-pub(in crate::audio) fn run_live_audio_direct_sample_simulation_output_inner(
+pub(crate) fn run_live_audio_direct_sample_simulation_output_inner(
     config: LiveAudioDirectSampleSimulationConfig,
     input_pcm: &[f32],
     trace: &mut Option<LiveAudioTraceWriter>,
@@ -345,7 +381,7 @@ pub fn render_live_audio_simulation_input(
     Ok(samples)
 }
 
-pub(in crate::audio) fn run_live_audio_simulation_inner(
+pub(crate) fn run_live_audio_simulation_inner(
     config: LiveAudioSimulationConfig,
     speech_frames: &[Vec<f32>],
     collect_output: bool,
@@ -508,7 +544,7 @@ pub fn split_pcm_to_simulation_frames(pcm: &[f32], max_samples: usize) -> Vec<Ve
         .collect()
 }
 
-pub(in crate::audio) fn validate_live_audio_simulation_speech_frames(
+pub(crate) fn validate_live_audio_simulation_speech_frames(
     speech_frames: &[Vec<f32>],
 ) -> Result<(), String> {
     if speech_frames.is_empty() {
@@ -525,7 +561,7 @@ pub(in crate::audio) fn validate_live_audio_simulation_speech_frames(
     Ok(())
 }
 
-pub(in crate::audio) fn decode_audio_file_with_ffmpeg(path: &Path) -> Result<Vec<f32>, String> {
+pub(crate) fn decode_audio_file_with_ffmpeg(path: &Path) -> Result<Vec<f32>, String> {
     let output = Command::new("ffmpeg")
         .arg("-v")
         .arg("error")
@@ -558,14 +594,14 @@ pub(in crate::audio) fn decode_audio_file_with_ffmpeg(path: &Path) -> Result<Vec
         .collect())
 }
 
-pub(in crate::audio) fn simulation_streams(config: LiveAudioSimulationConfig) -> usize {
+pub(crate) fn simulation_streams(config: LiveAudioSimulationConfig) -> usize {
     match config.scenario {
         LiveAudioSimulationScenario::GroupChat => config.streams.max(3),
         _ => config.streams.max(1),
     }
 }
 
-pub(in crate::audio) fn simulation_prebuffer_frames(config: LiveAudioSimulationConfig) -> usize {
+pub(crate) fn simulation_prebuffer_frames(config: LiveAudioSimulationConfig) -> usize {
     match config.scenario {
         LiveAudioSimulationScenario::BacklogSilence => {
             frames_for_duration(Duration::from_millis(500))
@@ -574,7 +610,7 @@ pub(in crate::audio) fn simulation_prebuffer_frames(config: LiveAudioSimulationC
     }
 }
 
-pub(in crate::audio) fn process_simulation_input_frame(
+pub(crate) fn process_simulation_input_frame(
     config: LiveAudioSimulationConfig,
     frame_index: usize,
     now: Instant,
@@ -621,7 +657,7 @@ pub(in crate::audio) fn process_simulation_input_frame(
     Ok(())
 }
 
-pub(in crate::audio) fn drain_simulation_network_and_playback(
+pub(crate) fn drain_simulation_network_and_playback(
     now: Instant,
     trace_start: Instant,
     states: &mut [SimStreamState],
@@ -676,16 +712,16 @@ pub(in crate::audio) fn drain_simulation_network_and_playback(
         .saturating_add(after_recovery_frames.saturating_sub(before_recovery_frames));
 }
 
-pub(in crate::audio) struct SimStreamState {
+pub(crate) struct SimStreamState {
     capture: LiveEncoderPipeline,
     capture_stats: AudioStats,
     loss: SimLossState,
-    pub(in crate::audio) network: SimNetworkPipe,
-    pub(in crate::audio) next_sequence: u32,
+    pub(crate) network: SimNetworkPipe,
+    pub(crate) next_sequence: u32,
 }
 
 impl SimStreamState {
-    pub(in crate::audio) fn new(
+    pub(crate) fn new(
         config: LiveAudioSimulationConfig,
         network_profile: EncoderNetworkProfile,
         echo_reference: Option<Arc<EchoReference>>,
@@ -706,7 +742,7 @@ impl SimStreamState {
         })
     }
 
-    pub(in crate::audio) fn encode_and_queue_frame(
+    pub(crate) fn encode_and_queue_frame(
         &mut self,
         config: LiveAudioSimulationConfig,
         stream_id: u32,
@@ -864,17 +900,17 @@ impl SimStreamState {
         }
     }
 
-    pub(in crate::audio) fn suppressed_frames(&self) -> u64 {
+    pub(crate) fn suppressed_frames(&self) -> u64 {
         self.capture.suppressed_frames()
     }
 }
 
-pub(in crate::audio) struct SimulationFrame {
+pub(crate) struct SimulationFrame {
     samples: Vec<f32>,
     silence: bool,
 }
 
-pub(in crate::audio) fn simulation_frame(
+pub(crate) fn simulation_frame(
     scenario: LiveAudioSimulationScenario,
     stream_index: usize,
     frame_index: usize,
@@ -953,7 +989,7 @@ pub(in crate::audio) fn simulation_frame(
     }
 }
 
-pub(in crate::audio) fn sample_speech_simulation_frame(
+pub(crate) fn sample_speech_simulation_frame(
     speech_frames: &[Vec<f32>],
     stream_index: usize,
     frame_index: usize,
@@ -970,7 +1006,7 @@ pub(in crate::audio) fn sample_speech_simulation_frame(
     }
 }
 
-pub(in crate::audio) fn silence_simulation_frame() -> SimulationFrame {
+pub(crate) fn silence_simulation_frame() -> SimulationFrame {
     SimulationFrame {
         samples: vec![0.0; FRAME_SAMPLES],
         silence: true,
@@ -980,6 +1016,7 @@ pub(in crate::audio) fn silence_simulation_frame() -> SimulationFrame {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::audio::sim::LiveAudioPacketLossProfile;
     #[allow(unused_imports)]
     use crate::audio::test_support::*;
 

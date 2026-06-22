@@ -1,6 +1,17 @@
-use crate::audio::*;
+use std::time::{Duration, Instant};
 
-pub(in crate::audio) fn trace_output_window(
+use crate::{
+    audio::{
+        shared::{
+            FRAME_SAMPLES, LiveAudioTraceWriter, LivePlaybackSnapshot, RemoteVoicePacket,
+            SAMPLE_RATE, trace_time_ms,
+        },
+        sim::{LiveAudioPacketLossProfile, LiveAudioSimulationConfig, LiveAudioSimulationScenario},
+    },
+    network::EncoderNetworkProfile,
+};
+
+pub(crate) fn trace_output_window(
     trace: &mut Option<LiveAudioTraceWriter>,
     start: Instant,
     now: Instant,
@@ -32,7 +43,7 @@ pub(in crate::audio) fn trace_output_window(
     });
 }
 
-pub(in crate::audio) fn simulation_drops_frame(
+pub(crate) fn simulation_drops_frame(
     config: LiveAudioSimulationConfig,
     stream_id: u32,
     silence_hint: bool,
@@ -96,7 +107,7 @@ pub(in crate::audio) fn simulation_drops_frame(
     }
 }
 
-pub(in crate::audio) fn simulation_delivery_delay(
+pub(crate) fn simulation_delivery_delay(
     packet_loss: LiveAudioPacketLossProfile,
     rng: &mut SimRng,
 ) -> Duration {
@@ -153,7 +164,7 @@ pub(in crate::audio) fn simulation_delivery_delay(
     }
 }
 
-pub(in crate::audio) fn random_delay_frames(
+pub(crate) fn random_delay_frames(
     rng: &mut SimRng,
     moderate_probability: f64,
     severe_probability: f64,
@@ -170,7 +181,7 @@ pub(in crate::audio) fn random_delay_frames(
     }
 }
 
-pub(in crate::audio) fn simulation_encoder_profile(
+pub(crate) fn simulation_encoder_profile(
     config: LiveAudioSimulationConfig,
 ) -> EncoderNetworkProfile {
     match config.packet_loss {
@@ -197,7 +208,7 @@ pub(in crate::audio) fn simulation_encoder_profile(
 }
 
 #[derive(Clone, Copy, Debug)]
-pub(in crate::audio) struct GilbertLossConfig {
+pub(crate) struct GilbertLossConfig {
     good_to_bad: f64,
     bad_to_good: f64,
     loss_good: f64,
@@ -205,7 +216,7 @@ pub(in crate::audio) struct GilbertLossConfig {
 }
 
 #[derive(Clone, Copy, Debug, Default)]
-pub(in crate::audio) struct SimLossState {
+pub(crate) struct SimLossState {
     bad: bool,
 }
 
@@ -229,14 +240,14 @@ impl SimLossState {
 }
 
 #[derive(Default)]
-pub(in crate::audio) struct SimNetworkPipe {
-    pub(in crate::audio) pending: Vec<SimPendingFrame>,
+pub(crate) struct SimNetworkPipe {
+    pub(crate) pending: Vec<SimPendingFrame>,
     next_serial: u64,
-    pub(in crate::audio) highest_arrived_sequence: Option<u32>,
+    pub(crate) highest_arrived_sequence: Option<u32>,
 }
 
 impl SimNetworkPipe {
-    pub(in crate::audio) fn push(&mut self, packet: RemoteVoicePacket, deliver_at: Instant) {
+    pub(crate) fn push(&mut self, packet: RemoteVoicePacket, deliver_at: Instant) {
         let serial = self.next_serial;
         self.next_serial = self.next_serial.wrapping_add(1);
         self.pending.push(SimPendingFrame {
@@ -246,7 +257,7 @@ impl SimNetworkPipe {
         });
     }
 
-    pub(in crate::audio) fn drain_ready(&mut self, now: Instant) -> Vec<SimPendingFrame> {
+    pub(crate) fn drain_ready(&mut self, now: Instant) -> Vec<SimPendingFrame> {
         let mut ready = Vec::new();
         let mut index = 0;
         while index < self.pending.len() {
@@ -265,25 +276,25 @@ impl SimNetworkPipe {
     }
 }
 
-pub(in crate::audio) struct SimPendingFrame {
-    pub(in crate::audio) packet: RemoteVoicePacket,
+pub(crate) struct SimPendingFrame {
+    pub(crate) packet: RemoteVoicePacket,
     deliver_at: Instant,
     serial: u64,
 }
 
 #[derive(Default)]
-pub(in crate::audio) struct OnlineAudioMetrics {
-    pub(in crate::audio) samples: u64,
+pub(crate) struct OnlineAudioMetrics {
+    pub(crate) samples: u64,
     sum_square: f64,
-    pub(in crate::audio) peak: f32,
-    pub(in crate::audio) max_adjacent_delta: f32,
+    pub(crate) peak: f32,
+    pub(crate) max_adjacent_delta: f32,
     last_sample: Option<f32>,
-    pub(in crate::audio) non_finite_samples: u64,
-    pub(in crate::audio) clipped_samples: u64,
+    pub(crate) non_finite_samples: u64,
+    pub(crate) clipped_samples: u64,
 }
 
 impl OnlineAudioMetrics {
-    pub(in crate::audio) fn observe(&mut self, sample: f32) {
+    pub(crate) fn observe(&mut self, sample: f32) {
         self.samples = self.samples.saturating_add(1);
         if !sample.is_finite() {
             self.non_finite_samples = self.non_finite_samples.saturating_add(1);
@@ -300,7 +311,7 @@ impl OnlineAudioMetrics {
         self.sum_square += f64::from(sample) * f64::from(sample);
     }
 
-    pub(in crate::audio) fn rms(&self) -> f32 {
+    pub(crate) fn rms(&self) -> f32 {
         if self.samples == 0 {
             0.0
         } else {
@@ -309,12 +320,12 @@ impl OnlineAudioMetrics {
     }
 }
 
-pub(in crate::audio) struct SimRng {
+pub(crate) struct SimRng {
     state: u64,
 }
 
 impl SimRng {
-    pub(in crate::audio) fn new(seed: u64) -> Self {
+    pub(crate) fn new(seed: u64) -> Self {
         Self { state: seed.max(1) }
     }
 

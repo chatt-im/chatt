@@ -1,37 +1,48 @@
-use crate::audio::*;
+use std::time::{Duration, Instant};
+
+use hashbrown::HashMap;
+
+use crate::audio::{
+    playback::AdaptivePlaybackStream,
+    shared::{
+        DecodedFrameSource, LIVE_PLAYBACK_SNAPSHOT_INTERVAL, LiveAudioTuning, LivePlaybackSnapshot,
+        PlaybackStreamControl, db_to_gain, duration_to_ms, samples_to_ms, soft_limit,
+        target_queue_samples,
+    },
+};
 
 #[derive(Default)]
-pub(in crate::audio) struct LivePlaybackMixer {
+pub(crate) struct LivePlaybackMixer {
     tuning: LiveAudioTuning,
     streams: HashMap<u32, AdaptivePlaybackStream>,
     controls: HashMap<u32, PlaybackStreamControl>,
-    pub(in crate::audio) stats: LivePlaybackMixerStats,
+    pub(crate) stats: LivePlaybackMixerStats,
     last_diagnostic_at: Option<Instant>,
 }
 
 #[derive(Default)]
-pub(in crate::audio) struct LivePlaybackMixerStats {
-    pub(in crate::audio) correction_count: u64,
-    pub(in crate::audio) hard_trim_count: u64,
-    pub(in crate::audio) underrun_count: u64,
-    pub(in crate::audio) dred_recoveries: u64,
-    pub(in crate::audio) plc_fallbacks: u64,
+pub(crate) struct LivePlaybackMixerStats {
+    pub(crate) correction_count: u64,
+    pub(crate) hard_trim_count: u64,
+    pub(crate) underrun_count: u64,
+    pub(crate) dred_recoveries: u64,
+    pub(crate) plc_fallbacks: u64,
     decode_errors: u64,
-    pub(in crate::audio) direct_samples: u64,
-    pub(in crate::audio) resampled_samples: u64,
-    pub(in crate::audio) skipped_silence_samples: u64,
-    pub(in crate::audio) silence_skip_count: u64,
-    pub(in crate::audio) silence_skip_rejected: u64,
-    pub(in crate::audio) skipped_speech_gap_samples: u64,
-    pub(in crate::audio) speech_gap_skip_count: u64,
+    pub(crate) direct_samples: u64,
+    pub(crate) resampled_samples: u64,
+    pub(crate) skipped_silence_samples: u64,
+    pub(crate) silence_skip_count: u64,
+    pub(crate) silence_skip_rejected: u64,
+    pub(crate) skipped_speech_gap_samples: u64,
+    pub(crate) speech_gap_skip_count: u64,
 }
 
 impl LivePlaybackMixer {
-    pub(in crate::audio) fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self::with_tuning(LiveAudioTuning::default())
     }
 
-    pub(in crate::audio) fn with_tuning(tuning: LiveAudioTuning) -> Self {
+    pub(crate) fn with_tuning(tuning: LiveAudioTuning) -> Self {
         Self {
             tuning,
             streams: HashMap::new(),
@@ -41,7 +52,7 @@ impl LivePlaybackMixer {
         }
     }
 
-    pub(in crate::audio) fn queue_stream_samples(
+    pub(crate) fn queue_stream_samples(
         &mut self,
         stream_id: u32,
         samples: &[f32],
@@ -86,7 +97,7 @@ impl LivePlaybackMixer {
     /// A no-op if the stream has not been created yet, which is harmless: the
     /// target starts at the safe ceiling and only relaxes after sustained
     /// clean windows, well after the stream's first frames arrive.
-    pub(in crate::audio) fn note_stream_recommended_target(
+    pub(crate) fn note_stream_recommended_target(
         &mut self,
         stream_id: u32,
         recommended_target: Duration,
@@ -97,22 +108,18 @@ impl LivePlaybackMixer {
         }
     }
 
-    pub(in crate::audio) fn remove_stream(&mut self, stream_id: u32) {
+    pub(crate) fn remove_stream(&mut self, stream_id: u32) {
         self.streams.remove(&stream_id);
         self.controls.remove(&stream_id);
     }
 
-    pub(in crate::audio) fn note_stream_discontinuity(&mut self, stream_id: u32, now: Instant) {
+    pub(crate) fn note_stream_discontinuity(&mut self, stream_id: u32, now: Instant) {
         if let Some(stream) = self.streams.get_mut(&stream_id) {
             stream.skip_speech_gap_backlog(now, &mut self.stats);
         }
     }
 
-    pub(in crate::audio) fn set_stream_control(
-        &mut self,
-        stream_id: u32,
-        control: PlaybackStreamControl,
-    ) {
+    pub(crate) fn set_stream_control(&mut self, stream_id: u32, control: PlaybackStreamControl) {
         if control == PlaybackStreamControl::default() {
             self.controls.remove(&stream_id);
         } else {
@@ -120,14 +127,14 @@ impl LivePlaybackMixer {
         }
     }
 
-    pub(in crate::audio) fn queued_samples(&self) -> usize {
+    pub(crate) fn queued_samples(&self) -> usize {
         self.streams
             .values()
             .map(AdaptivePlaybackStream::queued_samples)
             .sum()
     }
 
-    pub(in crate::audio) fn stream_queue_ms(&self, stream_id: u32) -> u64 {
+    pub(crate) fn stream_queue_ms(&self, stream_id: u32) -> u64 {
         self.streams
             .get(&stream_id)
             .map(|stream| samples_to_ms(stream.queued_samples()))
@@ -142,7 +149,7 @@ impl LivePlaybackMixer {
     /// (`target_expanded=true`, high `applied_target_ms`) from a low target the
     /// catch-up is failing to drain (`applied_target_ms` low, `queue_ms` high,
     /// `correction_percent` near zero).
-    pub(in crate::audio) fn log_playback_diagnostics_if_due(&mut self, now: Instant) {
+    pub(crate) fn log_playback_diagnostics_if_due(&mut self, now: Instant) {
         if self.streams.is_empty() {
             return;
         }
@@ -182,11 +189,11 @@ impl LivePlaybackMixer {
         }
     }
 
-    pub(in crate::audio) fn snapshot(&self) -> LivePlaybackSnapshot {
+    pub(crate) fn snapshot(&self) -> LivePlaybackSnapshot {
         self.snapshot_at(Instant::now())
     }
 
-    pub(in crate::audio) fn snapshot_at(&self, now: Instant) -> LivePlaybackSnapshot {
+    pub(crate) fn snapshot_at(&self, now: Instant) -> LivePlaybackSnapshot {
         let queued_samples = self.queued_samples();
         let max_queue_samples = self
             .streams
@@ -230,11 +237,11 @@ impl LivePlaybackMixer {
         }
     }
 
-    pub(in crate::audio) fn pop_mixed_sample(&mut self, now: Instant) -> f32 {
+    pub(crate) fn pop_mixed_sample(&mut self, now: Instant) -> f32 {
         self.pop_mixed_sample_with(|stream, stats| stream.pop_sample(now, stats))
     }
 
-    pub(in crate::audio) fn pop_mixed_output_sample(
+    pub(crate) fn pop_mixed_output_sample(
         &mut self,
         now: Instant,
         output_block_samples: usize,
@@ -277,6 +284,7 @@ impl LivePlaybackMixer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::audio::shared::{FRAME_SAMPLES, samples_for_duration};
     #[allow(unused_imports)]
     use crate::audio::test_support::*;
 

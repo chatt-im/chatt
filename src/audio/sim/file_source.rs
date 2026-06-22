@@ -1,4 +1,23 @@
-use crate::audio::*;
+use std::{
+    path::PathBuf,
+    sync::mpsc::Receiver,
+    thread,
+    time::{Duration, Instant},
+};
+
+use crate::audio::{
+    lifecycle::{LivePlayback, LivePlaybackConfig, sleep_until_instant, start_live_playback},
+    shared::{
+        BufferRequest, FRAME_SAMPLES, LiveAudioTuning, LivePlaybackFeedback, LivePlaybackSnapshot,
+        LocalVoiceFrame, SAMPLE_RATE, samples_to_ms,
+    },
+    sim::{
+        LiveAudioPacketLossProfile, LiveAudioSimulationConfig, LiveAudioSimulationReport,
+        LiveAudioSimulationScenario,
+        harness::{SimStreamState, decode_audio_file_with_ffmpeg},
+        network::{SimRng, simulation_encoder_profile},
+    },
+};
 
 #[derive(Clone, Debug)]
 pub struct LiveAudioFilePlaybackTestConfig {
@@ -77,7 +96,7 @@ where
     run_live_audio_file_source_inner(config, &input_pcm, &mut on_packet)
 }
 
-pub(in crate::audio) fn run_live_audio_file_source_inner<F>(
+pub(crate) fn run_live_audio_file_source_inner<F>(
     config: LiveAudioFileSourceConfig,
     input_pcm: &[f32],
     on_packet: &mut F,
@@ -160,7 +179,7 @@ where
     Ok(report)
 }
 
-pub(in crate::audio) fn deliver_ready_file_source_packets<F>(
+pub(crate) fn deliver_ready_file_source_packets<F>(
     state: &mut SimStreamState,
     now: Instant,
     report: &mut LiveAudioSimulationReport,
@@ -235,7 +254,7 @@ pub fn run_live_audio_file_playback_test(
     Ok(report)
 }
 
-pub(in crate::audio) fn run_live_audio_file_playback_test_inner(
+pub(crate) fn run_live_audio_file_playback_test_inner(
     config: &LiveAudioFilePlaybackTestConfig,
     input_pcm: &[f32],
     playback: &LivePlayback,
@@ -324,7 +343,7 @@ pub(in crate::audio) fn run_live_audio_file_playback_test_inner(
     Ok(())
 }
 
-pub(in crate::audio) fn deliver_ready_packets_to_live_playback(
+pub(crate) fn deliver_ready_packets_to_live_playback(
     state: &mut SimStreamState,
     now: Instant,
     playback: &LivePlayback,
@@ -351,7 +370,7 @@ pub(in crate::audio) fn deliver_ready_packets_to_live_playback(
     }
 }
 
-pub(in crate::audio) fn drain_file_playback_feedback(
+pub(crate) fn drain_file_playback_feedback(
     receiver: &Receiver<LivePlaybackFeedback>,
     report: &mut LiveAudioFilePlaybackTestReport,
 ) {

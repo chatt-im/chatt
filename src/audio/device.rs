@@ -1,4 +1,29 @@
-use crate::audio::*;
+use std::{
+    fs,
+    str::FromStr,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+        mpsc::SyncSender,
+    },
+    time::Instant,
+};
+
+use cpal::{
+    BufferSize, FromSample, Sample, SampleFormat, Stream, StreamConfig, SupportedBufferSize,
+    SupportedStreamConfig,
+    traits::{DeviceTrait, HostTrait},
+};
+use hashbrown::HashSet;
+
+use crate::audio::{
+    backend::with_audio_backend_stderr_suppressed,
+    capture::EchoCancellationControl,
+    playback::LivePlaybackMixer,
+    shared::{
+        AudioStats, BufferRequest, PlaybackStats, SAMPLE_RATE, peak_i16_scale, rms_i16_scale,
+    },
+};
 
 #[derive(Clone, Debug)]
 pub struct DeviceInfo {
@@ -33,7 +58,7 @@ pub fn stable_output_device_id(name: &str) -> String {
     stable_device_id(name)
 }
 
-pub(in crate::audio) fn stable_device_id(name: &str) -> String {
+pub(crate) fn stable_device_id(name: &str) -> String {
     let mut key = name.to_ascii_lowercase();
     for suffix in [", usb audio", ", loopback pcm"] {
         if let Some(stripped) = key.strip_suffix(suffix) {
@@ -43,7 +68,7 @@ pub(in crate::audio) fn stable_device_id(name: &str) -> String {
     key.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-pub(in crate::audio) fn input_devices_inner(
+pub(crate) fn input_devices_inner(
     buffer_request: BufferRequest,
 ) -> Result<Vec<DeviceInfo>, String> {
     let host = cpal::default_host();
@@ -74,7 +99,7 @@ pub(in crate::audio) fn input_devices_inner(
     Ok(infos)
 }
 
-pub(in crate::audio) fn output_devices_inner(
+pub(crate) fn output_devices_inner(
     buffer_request: BufferRequest,
 ) -> Result<Vec<DeviceInfo>, String> {
     let host = cpal::default_host();
@@ -105,7 +130,7 @@ pub(in crate::audio) fn output_devices_inner(
     Ok(infos)
 }
 
-pub(in crate::audio) fn input_device_info(
+pub(crate) fn input_device_info(
     device: &cpal::Device,
     name_override: Option<String>,
     buffer_request: BufferRequest,
@@ -130,7 +155,7 @@ pub(in crate::audio) fn input_device_info(
     }
 }
 
-pub(in crate::audio) fn output_device_info(
+pub(crate) fn output_device_info(
     device: &cpal::Device,
     name_override: Option<String>,
     buffer_request: BufferRequest,
@@ -155,7 +180,7 @@ pub(in crate::audio) fn output_device_info(
     }
 }
 
-pub(in crate::audio) fn device_matches_picker_direction(
+pub(crate) fn device_matches_picker_direction(
     device: &cpal::Device,
     direction: AudioDeviceDirection,
 ) -> bool {
@@ -174,7 +199,7 @@ pub(in crate::audio) fn device_matches_picker_direction(
         })
 }
 
-pub(in crate::audio) fn pipewire_device_id_is_hidden_from_picker(node_name: &str) -> bool {
+pub(crate) fn pipewire_device_id_is_hidden_from_picker(node_name: &str) -> bool {
     let node_name = node_name.to_ascii_lowercase();
     matches!(
         node_name.as_str(),
@@ -183,7 +208,7 @@ pub(in crate::audio) fn pipewire_device_id_is_hidden_from_picker(node_name: &str
         || node_name.starts_with("alsa_playback.")
 }
 
-pub(in crate::audio) fn pipewire_device_id_matches_picker_direction(
+pub(crate) fn pipewire_device_id_matches_picker_direction(
     node_name: &str,
     direction: AudioDeviceDirection,
 ) -> bool {
@@ -202,7 +227,7 @@ pub(in crate::audio) fn pipewire_device_id_matches_picker_direction(
     }
 }
 
-pub(in crate::audio) fn pipewire_description_matches_picker_direction(
+pub(crate) fn pipewire_description_matches_picker_direction(
     description: &cpal::DeviceDescription,
     direction: AudioDeviceDirection,
 ) -> bool {
@@ -231,14 +256,11 @@ pub(in crate::audio) fn pipewire_description_matches_picker_direction(
     }
 }
 
-pub(in crate::audio) fn cpal_device_id(device: &cpal::Device) -> Option<String> {
+pub(crate) fn cpal_device_id(device: &cpal::Device) -> Option<String> {
     device.id().ok().map(|id| id.to_string())
 }
 
-pub(in crate::audio) fn cpal_device_matches_config_id(
-    device: &cpal::Device,
-    configured_id: &str,
-) -> bool {
+pub(crate) fn cpal_device_matches_config_id(device: &cpal::Device, configured_id: &str) -> bool {
     if let Some(device_id) = cpal_device_id(device) {
         if device_id == configured_id {
             return true;
@@ -256,7 +278,7 @@ pub(in crate::audio) fn cpal_device_matches_config_id(
     device.id().is_ok_and(|device_id| device_id == parsed_id)
 }
 
-pub(in crate::audio) fn cpal_device_from_config_id(
+pub(crate) fn cpal_device_from_config_id(
     host: &cpal::Host,
     configured_id: &str,
 ) -> Option<cpal::Device> {
@@ -265,7 +287,7 @@ pub(in crate::audio) fn cpal_device_from_config_id(
         .or_else(|| cpal::host_from_id(id.host()).ok()?.device_by_id(&id))
 }
 
-pub(in crate::audio) fn parse_configured_device_id(configured_id: &str) -> Option<cpal::DeviceId> {
+pub(crate) fn parse_configured_device_id(configured_id: &str) -> Option<cpal::DeviceId> {
     let configured_id = configured_id.trim();
     if configured_id.is_empty() {
         return None;
@@ -287,9 +309,7 @@ pub(in crate::audio) fn parse_configured_device_id(configured_id: &str) -> Optio
     target_os = "freebsd",
     target_os = "netbsd"
 ))]
-pub(in crate::audio) fn forced_alsa_device_id_from_pcm_name(
-    pcm_name: &str,
-) -> Option<cpal::DeviceId> {
+pub(crate) fn forced_alsa_device_id_from_pcm_name(pcm_name: &str) -> Option<cpal::DeviceId> {
     (!pcm_name.is_empty()).then(|| cpal::DeviceId::new(cpal::HostId::Alsa, pcm_name))
 }
 
@@ -299,9 +319,7 @@ pub(in crate::audio) fn forced_alsa_device_id_from_pcm_name(
     target_os = "freebsd",
     target_os = "netbsd"
 )))]
-pub(in crate::audio) fn forced_alsa_device_id_from_pcm_name(
-    _pcm_name: &str,
-) -> Option<cpal::DeviceId> {
+pub(crate) fn forced_alsa_device_id_from_pcm_name(_pcm_name: &str) -> Option<cpal::DeviceId> {
     None
 }
 
@@ -311,7 +329,7 @@ pub(in crate::audio) fn forced_alsa_device_id_from_pcm_name(
     target_os = "freebsd",
     target_os = "netbsd"
 ))]
-pub(in crate::audio) fn alsa_device_id_from_pcm_name(pcm_name: &str) -> Option<cpal::DeviceId> {
+pub(crate) fn alsa_device_id_from_pcm_name(pcm_name: &str) -> Option<cpal::DeviceId> {
     looks_like_alsa_pcm_name(pcm_name).then(|| cpal::DeviceId::new(cpal::HostId::Alsa, pcm_name))
 }
 
@@ -321,11 +339,11 @@ pub(in crate::audio) fn alsa_device_id_from_pcm_name(pcm_name: &str) -> Option<c
     target_os = "freebsd",
     target_os = "netbsd"
 )))]
-pub(in crate::audio) fn alsa_device_id_from_pcm_name(_pcm_name: &str) -> Option<cpal::DeviceId> {
+pub(crate) fn alsa_device_id_from_pcm_name(_pcm_name: &str) -> Option<cpal::DeviceId> {
     None
 }
 
-pub(in crate::audio) fn looks_like_alsa_pcm_name(value: &str) -> bool {
+pub(crate) fn looks_like_alsa_pcm_name(value: &str) -> bool {
     if value.is_empty() || value.chars().any(char::is_whitespace) {
         return false;
     }
@@ -360,7 +378,7 @@ pub(in crate::audio) fn looks_like_alsa_pcm_name(value: &str) -> bool {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(in crate::audio) enum AudioDeviceDirection {
+pub(crate) enum AudioDeviceDirection {
     Input,
     Output,
 }
@@ -371,7 +389,7 @@ pub(in crate::audio) enum AudioDeviceDirection {
     target_os = "freebsd",
     target_os = "netbsd"
 ))]
-pub(in crate::audio) fn append_alsa_physical_devices(
+pub(crate) fn append_alsa_physical_devices(
     host: &cpal::Host,
     direction: AudioDeviceDirection,
     buffer_request: BufferRequest,
@@ -408,7 +426,7 @@ pub(in crate::audio) fn append_alsa_physical_devices(
     target_os = "freebsd",
     target_os = "netbsd"
 )))]
-pub(in crate::audio) fn append_alsa_physical_devices(
+pub(crate) fn append_alsa_physical_devices(
     _host: &cpal::Host,
     _direction: AudioDeviceDirection,
     _buffer_request: BufferRequest,
@@ -418,7 +436,7 @@ pub(in crate::audio) fn append_alsa_physical_devices(
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(in crate::audio) struct AlsaPhysicalPcm {
+pub(crate) struct AlsaPhysicalPcm {
     card: u32,
     device: u32,
     name: String,
@@ -430,15 +448,13 @@ pub(in crate::audio) struct AlsaPhysicalPcm {
     target_os = "freebsd",
     target_os = "netbsd"
 ))]
-pub(in crate::audio) fn alsa_physical_pcm_devices(
-    direction: AudioDeviceDirection,
-) -> Vec<AlsaPhysicalPcm> {
+pub(crate) fn alsa_physical_pcm_devices(direction: AudioDeviceDirection) -> Vec<AlsaPhysicalPcm> {
     fs::read_to_string("/proc/asound/pcm")
         .map(|content| parse_alsa_physical_pcm_devices(&content, direction))
         .unwrap_or_default()
 }
 
-pub(in crate::audio) fn parse_alsa_physical_pcm_devices(
+pub(crate) fn parse_alsa_physical_pcm_devices(
     content: &str,
     direction: AudioDeviceDirection,
 ) -> Vec<AlsaPhysicalPcm> {
@@ -471,12 +487,12 @@ pub(in crate::audio) fn parse_alsa_physical_pcm_devices(
     devices
 }
 
-pub(in crate::audio) fn parse_alsa_pcm_address(address: &str) -> Option<(u32, u32)> {
+pub(crate) fn parse_alsa_pcm_address(address: &str) -> Option<(u32, u32)> {
     let (card, device) = address.split_once('-')?;
     Some((card.parse().ok()?, device.parse().ok()?))
 }
 
-pub(in crate::audio) fn select_input_device_by_id(
+pub(crate) fn select_input_device_by_id(
     host: &cpal::Host,
     id: &str,
     buffer_request: BufferRequest,
@@ -513,7 +529,7 @@ pub(in crate::audio) fn select_input_device_by_id(
     }
 }
 
-pub(in crate::audio) fn select_output_device_by_id(
+pub(crate) fn select_output_device_by_id(
     host: &cpal::Host,
     id: &str,
     buffer_request: BufferRequest,
@@ -552,21 +568,13 @@ pub(in crate::audio) fn select_output_device_by_id(
     }
 }
 
-pub(in crate::audio) fn format_file_error(context: &str, path: &Path, error: io::Error) -> String {
-    format!("{context} {}: {error}", path.display())
+pub(crate) struct ConfigSelection {
+    pub(crate) supported_config: SupportedStreamConfig,
+    pub(crate) stream_config: StreamConfig,
+    pub(crate) preview: StreamPreview,
 }
 
-pub(in crate::audio) fn format_opus_error(context: &str, code: i32) -> String {
-    format!("{context}: {} ({code})", opus_codec::strerror(code))
-}
-
-pub(in crate::audio) struct ConfigSelection {
-    pub(in crate::audio) supported_config: SupportedStreamConfig,
-    pub(in crate::audio) stream_config: StreamConfig,
-    pub(in crate::audio) preview: StreamPreview,
-}
-
-pub(in crate::audio) fn select_input_config(
+pub(crate) fn select_input_config(
     device: &cpal::Device,
     buffer_request: BufferRequest,
 ) -> Result<ConfigSelection, String> {
@@ -611,7 +619,7 @@ pub(in crate::audio) fn select_input_config(
     })
 }
 
-pub(in crate::audio) fn select_output_config(
+pub(crate) fn select_output_config(
     device: &cpal::Device,
     buffer_request: BufferRequest,
 ) -> Result<ConfigSelection, String> {
@@ -656,7 +664,7 @@ pub(in crate::audio) fn select_output_config(
     })
 }
 
-pub(in crate::audio) fn channel_rank(channels: u16) -> u16 {
+pub(crate) fn channel_rank(channels: u16) -> u16 {
     match channels {
         1 => 0,
         2 => 1,
@@ -664,7 +672,7 @@ pub(in crate::audio) fn channel_rank(channels: u16) -> u16 {
     }
 }
 
-pub(in crate::audio) fn output_channel_rank(channels: u16) -> u16 {
+pub(crate) fn output_channel_rank(channels: u16) -> u16 {
     match channels {
         2 => 0,
         1 => 1,
@@ -672,7 +680,7 @@ pub(in crate::audio) fn output_channel_rank(channels: u16) -> u16 {
     }
 }
 
-pub(in crate::audio) fn sample_format_rank(format: SampleFormat) -> u8 {
+pub(crate) fn sample_format_rank(format: SampleFormat) -> u8 {
     match format {
         SampleFormat::F32 => 0,
         SampleFormat::I16 => 1,
@@ -690,7 +698,7 @@ pub(in crate::audio) fn sample_format_rank(format: SampleFormat) -> u8 {
     }
 }
 
-pub(in crate::audio) fn select_buffer_size(
+pub(crate) fn select_buffer_size(
     request: BufferRequest,
     supported: SupportedBufferSize,
 ) -> (BufferSize, String) {
@@ -716,20 +724,20 @@ pub(in crate::audio) fn select_buffer_size(
     }
 }
 
-pub(in crate::audio) fn audio_buffer_size_label(buffer_size: BufferSize) -> String {
+pub(crate) fn audio_buffer_size_label(buffer_size: BufferSize) -> String {
     match buffer_size {
         BufferSize::Default => "default".to_string(),
         BufferSize::Fixed(frames) => format!("{frames} frames"),
     }
 }
 
-pub(in crate::audio) struct AudioCallbackBufferObserver {
+pub(crate) struct AudioCallbackBufferObserver {
     direction: &'static str,
     last_frames: AtomicUsize,
 }
 
 impl AudioCallbackBufferObserver {
-    pub(in crate::audio) fn new(direction: &'static str) -> Self {
+    pub(crate) fn new(direction: &'static str) -> Self {
         Self {
             direction,
             last_frames: AtomicUsize::new(usize::MAX),
@@ -756,7 +764,7 @@ impl AudioCallbackBufferObserver {
     }
 }
 
-pub(in crate::audio) fn build_input_stream(
+pub(crate) fn build_input_stream(
     device: &cpal::Device,
     sample_format: SampleFormat,
     stream_config: StreamConfig,
@@ -866,7 +874,7 @@ pub(in crate::audio) fn build_input_stream(
     }
 }
 
-pub(in crate::audio) fn build_typed_input_stream<T>(
+pub(crate) fn build_typed_input_stream<T>(
     device: &cpal::Device,
     stream_config: StreamConfig,
     channels: usize,
@@ -890,18 +898,14 @@ where
                 capture_callback(input, channels, &sender, &data_stats);
             },
             move |error| {
-                error_stats
-                    .inner
-                    .stream_errors
-                    .fetch_add(1, Ordering::Relaxed);
-                error_stats.set_error(format!("stream error: {error}"));
+                error_stats.record_stream_error(format!("stream error: {error}"));
             },
             None,
         )
         .map_err(|error| format!("failed to build input stream: {error}"))
 }
 
-pub(in crate::audio) fn build_output_stream(
+pub(crate) fn build_output_stream(
     device: &cpal::Device,
     sample_format: SampleFormat,
     stream_config: StreamConfig,
@@ -950,7 +954,7 @@ pub(in crate::audio) fn build_output_stream(
     }
 }
 
-pub(in crate::audio) fn build_live_output_stream(
+pub(crate) fn build_live_output_stream(
     device: &cpal::Device,
     sample_format: SampleFormat,
     stream_config: StreamConfig,
@@ -1060,7 +1064,7 @@ pub(in crate::audio) fn build_live_output_stream(
     }
 }
 
-pub(in crate::audio) fn build_typed_live_output_stream<T>(
+pub(crate) fn build_typed_live_output_stream<T>(
     device: &cpal::Device,
     stream_config: StreamConfig,
     channels: usize,
@@ -1088,7 +1092,7 @@ where
         .map_err(|error| format!("failed to build live output stream: {error}"))
 }
 
-pub(in crate::audio) fn build_typed_output_stream<T>(
+pub(crate) fn build_typed_output_stream<T>(
     device: &cpal::Device,
     stream_config: StreamConfig,
     channels: usize,
@@ -1108,18 +1112,14 @@ where
                 playback_callback(output, channels, &samples, &mut cursor, &data_stats);
             },
             move |error| {
-                error_stats
-                    .inner
-                    .stream_errors
-                    .fetch_add(1, Ordering::Relaxed);
-                error_stats.set_error(format!("playback stream error: {error}"));
+                error_stats.record_stream_error(format!("playback stream error: {error}"));
             },
             None,
         )
         .map_err(|error| format!("failed to build output stream: {error}"))
 }
 
-pub(in crate::audio) fn playback_callback<T>(
+pub(crate) fn playback_callback<T>(
     output: &mut [T],
     channels: usize,
     samples: &[i16],
@@ -1128,14 +1128,14 @@ pub(in crate::audio) fn playback_callback<T>(
 ) where
     T: Sample + FromSample<f32>,
 {
-    stats.inner.callbacks.fetch_add(1, Ordering::Relaxed);
+    stats.record_callback();
 
     for frame in output.chunks_mut(channels.max(1)) {
         let sample = samples.get(*cursor).copied().unwrap_or(0);
         if *cursor < samples.len() {
             *cursor += 1;
         } else {
-            stats.inner.finished.store(true, Ordering::Relaxed);
+            stats.mark_finished();
         }
 
         let output_sample = T::from_sample((sample as f32 / 32768.0).clamp(-1.0, 1.0));
@@ -1145,12 +1145,12 @@ pub(in crate::audio) fn playback_callback<T>(
     }
 
     if *cursor >= samples.len() {
-        stats.inner.finished.store(true, Ordering::Relaxed);
+        stats.mark_finished();
     }
-    stats.inner.played_samples.store(*cursor, Ordering::Relaxed);
+    stats.store_played_samples(*cursor);
 }
 
-pub(in crate::audio) fn live_playback_callback<T>(
+pub(crate) fn live_playback_callback<T>(
     output: &mut [T],
     channels: usize,
     mixer: &Arc<Mutex<LivePlaybackMixer>>,
@@ -1186,7 +1186,7 @@ pub(in crate::audio) fn live_playback_callback<T>(
     }
 }
 
-pub(in crate::audio) fn capture_callback<T>(
+pub(crate) fn capture_callback<T>(
     input: &[T],
     channels: usize,
     sender: &SyncSender<Vec<f32>>,
@@ -1199,19 +1199,10 @@ pub(in crate::audio) fn capture_callback<T>(
     let samples = mono.len() as u64;
     let rms = rms_i16_scale(&mono);
     let peak = peak_i16_scale(&mono);
-    stats.inner.callbacks.fetch_add(1, Ordering::Relaxed);
-    stats
-        .inner
-        .captured_samples
-        .fetch_add(samples, Ordering::Relaxed);
-    stats.inner.rms_bits.store(rms.to_bits(), Ordering::Relaxed);
-    stats
-        .inner
-        .peak_bits
-        .store(peak.to_bits(), Ordering::Relaxed);
+    stats.record_capture_callback(samples, rms, peak);
 
     if sender.try_send(mono).is_err() {
-        stats.inner.dropped_chunks.fetch_add(1, Ordering::Relaxed);
+        stats.record_dropped_chunk();
     }
 }
 
@@ -1233,38 +1224,6 @@ where
         mono.push(sum / channels as f32);
     }
     mono
-}
-
-pub(in crate::audio) fn with_audio_backend_stderr_suppressed<T>(f: impl FnOnce() -> T) -> T {
-    static STDERR_REDIRECT_LOCK: Mutex<()> = Mutex::new(());
-    let _guard = STDERR_REDIRECT_LOCK.lock().ok();
-
-    let Ok(dev_null) = std::fs::File::options().write(true).open("/dev/null") else {
-        return f();
-    };
-
-    unsafe {
-        let saved_stderr = libc::dup(libc::STDERR_FILENO);
-        if saved_stderr < 0 {
-            return f();
-        }
-
-        let _ = libc::fflush(std::ptr::null_mut());
-        if libc::dup2(
-            std::os::fd::AsRawFd::as_raw_fd(&dev_null),
-            libc::STDERR_FILENO,
-        ) < 0
-        {
-            let _ = libc::close(saved_stderr);
-            return f();
-        }
-
-        let result = f();
-        let _ = libc::fflush(std::ptr::null_mut());
-        let _ = libc::dup2(saved_stderr, libc::STDERR_FILENO);
-        let _ = libc::close(saved_stderr);
-        result
-    }
 }
 
 #[cfg(test)]

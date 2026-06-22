@@ -1,7 +1,19 @@
-use crate::audio::*;
+use std::time::{Duration, Instant};
+
+use crate::{
+    audio::shared::{
+        LIVE_OPUS_FRAME_SAMPLES, LIVE_PACKET_FLAG_OPUS_RESET, LIVE_PLAYBACK_DYNAMIC_RELAX_WINDOWS,
+        LIVE_PLAYBACK_FEEDBACK_INTERVAL, LIVE_PLAYBACK_FEEDBACK_PACKETS,
+        LIVE_PLAYBACK_JITTER_PEAK_DECAY, LIVE_PLAYBACK_RTP_JITTER_GAIN,
+        LIVE_PLAYBACK_TRANSIT_BASE_FORGET_US, LiveAudioTuning, LivePlaybackFeedback, SAMPLE_RATE,
+        clamp_u16_from_u32, clamp_u16_from_u64, duration_abs_delta_ms, duration_to_ms,
+        sequence_distance_forward, sequence_is_before, sequence_max_forward,
+    },
+    network::{InsertOutcome, PlayoutItem},
+};
 
 #[derive(Default)]
-pub(in crate::audio) struct LivePlaybackFeedbackState {
+pub(crate) struct LivePlaybackFeedbackState {
     window_started_at: Option<Instant>,
     highest_contiguous_sequence: Option<u32>,
     expected_packets: u32,
@@ -16,27 +28,27 @@ pub(in crate::audio) struct LivePlaybackFeedbackState {
     /// Smoothed late-arrival jitter in microseconds, EWMA over packets. Tracks
     /// only how late packets arrive relative to the running baseline, so early
     /// or batched arrivals do not inflate it.
-    pub(in crate::audio) smoothed_jitter_us: f64,
+    pub(crate) smoothed_jitter_us: f64,
     /// Fast-attack/slow-decay peak of the late-arrival jitter. A genuinely late
     /// packet keeps this elevated for a couple seconds.
-    pub(in crate::audio) peak_jitter_us: f64,
+    pub(crate) peak_jitter_us: f64,
     /// Accumulated relative transit time in microseconds: the running sum of
     /// (actual - expected) interarrival. Rises when packets fall behind the 20
     /// ms cadence, dips when they bunch up. Lateness is measured against the
     /// baseline below, not against this absolute value.
-    pub(in crate::audio) relative_transit_us: f64,
+    pub(crate) relative_transit_us: f64,
     /// Slowly forgetting baseline of `relative_transit_us`, tracking the
     /// best-case delivery floor. It descends slowly toward new lows so a single
     /// early/batched packet does not reset it, and rises slowly to forget stale
     /// lows. Lateness is `relative_transit_us - base_transit_us`.
-    pub(in crate::audio) base_transit_us: f64,
+    pub(crate) base_transit_us: f64,
     /// Consecutive feedback windows with zero loss/late/reorder events. The
     /// dynamic target may only descend once this reaches the relax threshold.
-    pub(in crate::audio) clean_window_streak: u32,
+    pub(crate) clean_window_streak: u32,
 }
 
 impl LivePlaybackFeedbackState {
-    pub(in crate::audio) fn observe_insert(
+    pub(crate) fn observe_insert(
         &mut self,
         sequence: u32,
         flags: u8,
@@ -107,7 +119,7 @@ impl LivePlaybackFeedbackState {
         }
     }
 
-    pub(in crate::audio) fn observe_playout(&mut self, item: &PlayoutItem, now: Instant) {
+    pub(crate) fn observe_playout(&mut self, item: &PlayoutItem, now: Instant) {
         self.ensure_started(now);
         match *item {
             PlayoutItem::Audio { sequence, .. } => {
@@ -131,11 +143,11 @@ impl LivePlaybackFeedbackState {
         }
     }
 
-    pub(in crate::audio) fn observe_queue_ms(&mut self, max_queue_ms: u64) {
+    pub(crate) fn observe_queue_ms(&mut self, max_queue_ms: u64) {
         self.max_queue_ms = self.max_queue_ms.max(max_queue_ms);
     }
 
-    pub(in crate::audio) fn take_if_ready(
+    pub(crate) fn take_if_ready(
         &mut self,
         stream_id: u32,
         now: Instant,
@@ -180,7 +192,7 @@ impl LivePlaybackFeedbackState {
     /// toward the floor only after sustained clean windows, sized from the
     /// jitter estimate. A loss/late/reorder event in the current window pins it
     /// back at the ceiling immediately, ahead of the window-close streak reset.
-    pub(in crate::audio) fn recommended_target(&self, tuning: &LiveAudioTuning) -> Duration {
+    pub(crate) fn recommended_target(&self, tuning: &LiveAudioTuning) -> Duration {
         let relaxed = !self.window_had_events()
             && self.clean_window_streak >= LIVE_PLAYBACK_DYNAMIC_RELAX_WINDOWS;
         if !relaxed {

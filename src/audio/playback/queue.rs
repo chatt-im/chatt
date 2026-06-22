@@ -1,14 +1,19 @@
-use crate::audio::*;
+use std::collections::VecDeque;
+
+use crate::audio::{
+    playback::TuningSampleCounts,
+    shared::{DecodedFrameSource, peak_normalized, rms_normalized},
+};
 
 #[derive(Default)]
-pub(in crate::audio) struct MonoSampleQueue {
+pub(crate) struct MonoSampleQueue {
     frames: VecDeque<QueuedAudioFrame>,
     /// Running sum of `remaining_len()` across all queued frames. Kept in sync
     /// by every mutator so `frames()` is O(1) on the per-sample playback path.
     total: usize,
 }
 
-pub(in crate::audio) struct QueuedAudioFrame {
+pub(crate) struct QueuedAudioFrame {
     samples: Vec<f32>,
     offset: usize,
     source: DecodedFrameSource,
@@ -18,11 +23,11 @@ pub(in crate::audio) struct QueuedAudioFrame {
 }
 
 impl MonoSampleQueue {
-    pub(in crate::audio) fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self::default()
     }
 
-    pub(in crate::audio) fn push_back(&mut self, samples: &[f32], silence_hint: bool) {
+    pub(crate) fn push_back(&mut self, samples: &[f32], silence_hint: bool) {
         self.push_back_with_source(samples, DecodedFrameSource::Normal, silence_hint);
     }
 
@@ -38,7 +43,7 @@ impl MonoSampleQueue {
     /// Enqueues an owned sample buffer without copying it. Callers that already
     /// hold a `Vec<f32>` use this to avoid the extra allocation and copy that
     /// `push_back_with_source` incurs.
-    pub(in crate::audio) fn push_back_owned(
+    pub(crate) fn push_back_owned(
         &mut self,
         samples: Vec<f32>,
         source: DecodedFrameSource,
@@ -80,7 +85,7 @@ impl MonoSampleQueue {
     /// read offset, popping frames as they are fully consumed. This is O(frames
     /// touched) and never shifts sample data, unlike the interior
     /// [`drain_range`] path.
-    pub(in crate::audio) fn drain_samples(&mut self, samples: usize) {
+    pub(crate) fn drain_samples(&mut self, samples: usize) {
         let mut remaining = samples;
         while remaining > 0 {
             let Some(frame) = self.frames.front_mut() else {
@@ -98,7 +103,7 @@ impl MonoSampleQueue {
         }
     }
 
-    pub(in crate::audio) fn frames(&self) -> usize {
+    pub(crate) fn frames(&self) -> usize {
         debug_assert_eq!(
             self.total,
             self.frames
@@ -109,7 +114,7 @@ impl MonoSampleQueue {
         self.total
     }
 
-    pub(in crate::audio) fn find_silence_skip(
+    pub(crate) fn find_silence_skip(
         &self,
         counts: &TuningSampleCounts,
         excess_samples: usize,
@@ -148,7 +153,7 @@ impl MonoSampleQueue {
         None
     }
 
-    pub(in crate::audio) fn ramp_around_skip(
+    pub(crate) fn ramp_around_skip(
         &mut self,
         counts: &TuningSampleCounts,
         skip_start: usize,
@@ -176,7 +181,7 @@ impl MonoSampleQueue {
         }
     }
 
-    pub(in crate::audio) fn drain_range(&mut self, start: usize, mut len: usize) {
+    pub(crate) fn drain_range(&mut self, start: usize, mut len: usize) {
         if start == 0 {
             self.drain_samples(len);
             return;
@@ -203,7 +208,7 @@ impl MonoSampleQueue {
         }
     }
 
-    pub(in crate::audio) fn sample_at(&self, absolute_index: usize) -> Option<f32> {
+    pub(crate) fn sample_at(&self, absolute_index: usize) -> Option<f32> {
         let (frame_index, local_index, _) = self.find_frame_at(absolute_index)?;
         let frame = self.frames.get(frame_index)?;
         frame.samples.get(frame.offset + local_index).copied()
@@ -228,7 +233,7 @@ impl MonoSampleQueue {
         None
     }
 
-    pub(in crate::audio) fn last_sample_and_source(&self) -> Option<(f32, DecodedFrameSource)> {
+    pub(crate) fn last_sample_and_source(&self) -> Option<(f32, DecodedFrameSource)> {
         self.frames.iter().rev().find_map(|frame| {
             if frame.remaining_len() == 0 {
                 return None;

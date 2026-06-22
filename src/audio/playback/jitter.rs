@@ -1,6 +1,11 @@
-use crate::audio::*;
+use std::time::{Duration, Instant};
 
-pub(in crate::audio) struct LiveJitterStream {
+use crate::{
+    audio::shared::LiveAudioTuning,
+    network::{AudioPacketRef, InsertOutcome, JitterBuffer, JitterBufferConfig, PlayoutItem},
+};
+
+pub(crate) struct LiveJitterStream {
     jitter: JitterBuffer,
     initial_buffer: Duration,
     first_packet_at: Option<Instant>,
@@ -8,7 +13,7 @@ pub(in crate::audio) struct LiveJitterStream {
 }
 
 impl LiveJitterStream {
-    pub(in crate::audio) fn new(tuning: LiveAudioTuning) -> Self {
+    pub(crate) fn new(tuning: LiveAudioTuning) -> Self {
         Self {
             jitter: JitterBuffer::new(JitterBufferConfig {
                 max_reorder_delay: tuning.max_reorder_delay,
@@ -20,11 +25,7 @@ impl LiveJitterStream {
         }
     }
 
-    pub(in crate::audio) fn insert(
-        &mut self,
-        packet: AudioPacketRef<'_>,
-        now: Instant,
-    ) -> InsertOutcome {
+    pub(crate) fn insert(&mut self, packet: AudioPacketRef<'_>, now: Instant) -> InsertOutcome {
         let outcome = self.jitter.insert(packet);
         if matches!(outcome, InsertOutcome::Accepted) && self.first_packet_at.is_none() {
             self.first_packet_at = Some(now);
@@ -32,7 +33,7 @@ impl LiveJitterStream {
         outcome
     }
 
-    pub(in crate::audio) fn drain_ready(&mut self, now: Instant) -> Vec<PlayoutItem> {
+    pub(crate) fn drain_ready(&mut self, now: Instant) -> Vec<PlayoutItem> {
         if !self.playout_started {
             let Some(first_packet_at) = self.first_packet_at else {
                 return Vec::new();
@@ -50,6 +51,7 @@ impl LiveJitterStream {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::audio::shared::{LIVE_PLAYBACK_INITIAL_BUFFER, LIVE_PLAYBACK_MAX_REORDER_DELAY};
     #[allow(unused_imports)]
     use crate::audio::test_support::*;
 

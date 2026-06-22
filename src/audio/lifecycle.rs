@@ -1,4 +1,43 @@
-use crate::audio::*;
+use std::{
+    path::{Path, PathBuf},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU32, Ordering},
+        mpsc::{Sender, SyncSender, sync_channel},
+    },
+    thread::{self, JoinHandle},
+    time::{Duration, Instant},
+};
+
+use cpal::{
+    Stream,
+    traits::{HostTrait, StreamTrait},
+};
+use opus_codec::{Channels, Decoder, SampleRate};
+
+use crate::{
+    audio::{
+        backend::with_audio_backend_stderr_suppressed,
+        capture::{
+            EchoCancellationControl, EchoReferenceSource, OpusVoiceEncoder, run_encoder_worker,
+            run_live_encoder_worker,
+        },
+        device::{
+            AudioCallbackBufferObserver, audio_buffer_size_label, build_input_stream,
+            build_live_output_stream, build_output_stream, select_input_config,
+            select_input_device_by_id, select_output_config, select_output_device_by_id,
+        },
+        errors::format_file_error,
+        playback::{LivePlaybackMixer, run_live_decoder_worker},
+        shared::{
+            AudioStats, BufferRequest, CALLBACK_QUEUE_CAPACITY, CHANNELS, FRAME_SAMPLES,
+            LIVE_PLAYBACK_COMMAND_CAPACITY, LiveAudioTuning, LiveEncoderProfile,
+            LivePlaybackFeedback, LivePlaybackSnapshot, LocalVoiceFrame, PlaybackSnapshot,
+            PlaybackStats, PlaybackStreamControl, RemoteVoicePacket, SAMPLE_RATE, StatsSnapshot,
+        },
+    },
+    packet_log::{FLAG_DENOISE, PacketLogHeader, PacketLogReader, PacketLogWriter},
+};
 
 #[derive(Clone, Debug)]
 pub struct RecordingConfig {
@@ -61,7 +100,7 @@ pub struct LivePlaybackSink {
     sender: SyncSender<LivePlaybackCommand>,
 }
 
-pub(in crate::audio) enum LivePlaybackCommand {
+pub(crate) enum LivePlaybackCommand {
     Packet(RemoteVoicePacket),
     StopStream(u32),
     SetStreamControl(u32, PlaybackStreamControl),
@@ -467,7 +506,7 @@ pub fn start_live_playback(config: LivePlaybackConfig) -> Result<LivePlayback, S
     })
 }
 
-pub(in crate::audio) fn sleep_until_instant(deadline: Instant) {
+pub(crate) fn sleep_until_instant(deadline: Instant) {
     loop {
         let now = Instant::now();
         if now >= deadline {
@@ -477,11 +516,11 @@ pub(in crate::audio) fn sleep_until_instant(deadline: Instant) {
     }
 }
 
-pub(in crate::audio) struct DecodedPacketLog {
+pub(crate) struct DecodedPacketLog {
     samples: Vec<i16>,
 }
 
-pub(in crate::audio) fn decode_packet_log(path: &Path) -> Result<DecodedPacketLog, String> {
+pub(crate) fn decode_packet_log(path: &Path) -> Result<DecodedPacketLog, String> {
     let mut reader = PacketLogReader::open(path)
         .map_err(|error| format_file_error("failed to open packet log", path, error))?;
     let header = reader.header();
