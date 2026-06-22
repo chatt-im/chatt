@@ -51,6 +51,13 @@ members = [
 ]
 exclude = ["crates/cpal"]
 
+[patch.crates-io]
+# Includes fix(aec3): prevent panic when shrinking adaptive FIR filter (#15).
+sonora-aec3 = { git = "https://github.com/dignifiedquire/sonora", rev = "dec6a074725e82ef371a024fc45236d60f0acf52" }
+sonora-common-audio = { git = "https://github.com/dignifiedquire/sonora", rev = "dec6a074725e82ef371a024fc45236d60f0acf52" }
+sonora-fft = { git = "https://github.com/dignifiedquire/sonora", rev = "dec6a074725e82ef371a024fc45236d60f0acf52" }
+sonora-simd = { git = "https://github.com/dignifiedquire/sonora", rev = "dec6a074725e82ef371a024fc45236d60f0acf52" }
+
 [profile.dev]
 debug = 0
 opt-level = 1
