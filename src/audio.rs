@@ -942,6 +942,9 @@ fn input_devices_inner(buffer_request: BufferRequest) -> Result<Vec<DeviceInfo>,
     let mut infos = Vec::new();
     let mut seen_ids = HashSet::new();
     for device in devices {
+        if !device_matches_picker_direction(&device, AudioDeviceDirection::Input) {
+            continue;
+        }
         let info = input_device_info(&device, None, buffer_request);
         if let Some(id) = &info.id {
             seen_ids.insert(id.clone());
@@ -968,6 +971,9 @@ fn output_devices_inner(buffer_request: BufferRequest) -> Result<Vec<DeviceInfo>
     let mut infos = Vec::new();
     let mut seen_ids = HashSet::new();
     for device in devices {
+        if !device_matches_picker_direction(&device, AudioDeviceDirection::Output) {
+            continue;
+        }
         let info = output_device_info(&device, None, buffer_request);
         if let Some(id) = &info.id {
             seen_ids.insert(id.clone());
@@ -1032,6 +1038,79 @@ fn output_device_info(
             preview: None,
             issue: Some(error),
         },
+    }
+}
+
+fn device_matches_picker_direction(device: &cpal::Device, direction: AudioDeviceDirection) -> bool {
+    let Some(id) = cpal_device_id(device) else {
+        return true;
+    };
+    let Some(node_name) = id.strip_prefix("pipewire:") else {
+        return true;
+    };
+    if pipewire_device_id_is_hidden_from_picker(node_name) {
+        return false;
+    }
+    pipewire_device_id_matches_picker_direction(node_name, direction)
+        || device.description().is_ok_and(|description| {
+            pipewire_description_matches_picker_direction(&description, direction)
+        })
+}
+
+fn pipewire_device_id_is_hidden_from_picker(node_name: &str) -> bool {
+    let node_name = node_name.to_ascii_lowercase();
+    matches!(
+        node_name.as_str(),
+        "sink_default" | "input_default" | "output_default"
+    ) || node_name.starts_with("alsa_capture.")
+        || node_name.starts_with("alsa_playback.")
+}
+
+fn pipewire_device_id_matches_picker_direction(
+    node_name: &str,
+    direction: AudioDeviceDirection,
+) -> bool {
+    let node_name = node_name.to_ascii_lowercase();
+    if pipewire_device_id_is_hidden_from_picker(&node_name) {
+        return false;
+    }
+
+    match direction {
+        AudioDeviceDirection::Input => {
+            node_name.starts_with("alsa_input.") || node_name.starts_with("bluez_input.")
+        }
+        AudioDeviceDirection::Output => {
+            node_name.starts_with("alsa_output.") || node_name.starts_with("bluez_output.")
+        }
+    }
+}
+
+fn pipewire_description_matches_picker_direction(
+    description: &cpal::DeviceDescription,
+    direction: AudioDeviceDirection,
+) -> bool {
+    match direction {
+        AudioDeviceDirection::Input => {
+            description.supports_input()
+                && matches!(
+                    description.device_type(),
+                    cpal::DeviceType::Microphone
+                        | cpal::DeviceType::Headset
+                        | cpal::DeviceType::Handset
+                )
+        }
+        AudioDeviceDirection::Output => {
+            description.supports_output()
+                && matches!(
+                    description.device_type(),
+                    cpal::DeviceType::Speaker
+                        | cpal::DeviceType::Headphones
+                        | cpal::DeviceType::Headset
+                        | cpal::DeviceType::Earpiece
+                        | cpal::DeviceType::Handset
+                        | cpal::DeviceType::HearingAid
+                )
+        }
     }
 }
 
@@ -6990,6 +7069,62 @@ mod tests {
         assert_eq!(parse_configured_device_id("my_custom_pcm"), None);
         assert!(!looks_like_alsa_pcm_name("usb microphone"));
         assert!(!looks_like_alsa_pcm_name(""));
+    }
+
+    #[test]
+    fn pipewire_picker_filter_keeps_endpoints_in_matching_direction() {
+        assert!(pipewire_device_id_matches_picker_direction(
+            "alsa_input.usb-DCMT_Technology_USB_Condenser_Microphone_214b206000000178-00.mono-fallback",
+            AudioDeviceDirection::Input,
+        ));
+        assert!(!pipewire_device_id_matches_picker_direction(
+            "alsa_input.usb-DCMT_Technology_USB_Condenser_Microphone_214b206000000178-00.mono-fallback",
+            AudioDeviceDirection::Output,
+        ));
+        assert!(pipewire_device_id_matches_picker_direction(
+            "alsa_output.usb-BEHRINGER_UMC204HD_192k-00.pro-output-0",
+            AudioDeviceDirection::Output,
+        ));
+        assert!(!pipewire_device_id_matches_picker_direction(
+            "alsa_output.usb-BEHRINGER_UMC204HD_192k-00.pro-output-0",
+            AudioDeviceDirection::Input,
+        ));
+        assert!(pipewire_device_id_matches_picker_direction(
+            "bluez_output.20_F4_D4_61_20_AD.1",
+            AudioDeviceDirection::Output,
+        ));
+        assert!(!pipewire_device_id_matches_picker_direction(
+            "bluez_output.20_F4_D4_61_20_AD.1",
+            AudioDeviceDirection::Input,
+        ));
+    }
+
+    #[test]
+    fn pipewire_picker_filter_hides_defaults_and_client_streams() {
+        for node_name in [
+            "sink_default",
+            "input_default",
+            "output_default",
+            "alsa_capture.chatt",
+            "alsa_playback.chatt",
+            "Mumble",
+            "chatt",
+        ] {
+            assert!(
+                !pipewire_device_id_matches_picker_direction(
+                    node_name,
+                    AudioDeviceDirection::Input
+                ),
+                "{node_name} should not be listed as an input endpoint"
+            );
+            assert!(
+                !pipewire_device_id_matches_picker_direction(
+                    node_name,
+                    AudioDeviceDirection::Output
+                ),
+                "{node_name} should not be listed as an output endpoint"
+            );
+        }
     }
 
     #[test]
