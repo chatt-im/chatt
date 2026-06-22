@@ -2471,10 +2471,8 @@ struct JoinDraft {
 
 impl JoinDraft {
     fn new(ticket: InviteTicket) -> Self {
-        let mut alias = join_input_editor(&default_join_alias(&ticket));
-        let mut display_name = join_input_editor(&title_case_ascii(&ticket.user));
-        alias.enter_insert_mode();
-        display_name.enter_insert_mode();
+        let alias = join_input_editor(&default_join_alias(&ticket));
+        let display_name = join_input_editor(&title_case_ascii(&ticket.user));
         Self {
             ticket,
             alias,
@@ -2508,17 +2506,28 @@ impl JoinDraft {
             JoinFocus::Confirm => None,
         }
     }
+
+    fn focus_active_editor(&mut self) {
+        if let Some(editor) = self.focused_editor_mut() {
+            focus_join_input_editor(editor);
+        }
+    }
 }
 
 fn join_input_editor(value: &str) -> Editor {
-    let mut editor = Editor::new();
+    let mut editor = Editor::with_bindings(editor_bindings::nano());
     editor.set_single_line(true);
     editor.set_wrap(false);
     editor.set_height_bounds(1, 1);
     editor.set_theme(theme::join_input_editor_theme());
     editor.set_lines(value);
-    editor.enter_insert_mode();
+    focus_join_input_editor(&mut editor);
     editor
+}
+
+fn focus_join_input_editor(editor: &mut Editor) {
+    editor.enter_insert_mode();
+    editor.set_cursor_offset(editor.text_len());
 }
 
 fn run_join_setup(
@@ -2584,24 +2593,18 @@ fn process_join_key(draft: &mut JoinDraft, key: KeyEvent, config_path: Option<&s
         KeyCode::Esc => JoinAction::Cancel,
         KeyCode::Tab | KeyCode::Down => {
             draft.move_focus(1);
-            if let Some(editor) = draft.focused_editor_mut() {
-                editor.enter_insert_mode();
-            }
+            draft.focus_active_editor();
             JoinAction::Continue
         }
         KeyCode::BackTab | KeyCode::Up => {
             draft.move_focus(-1);
-            if let Some(editor) = draft.focused_editor_mut() {
-                editor.enter_insert_mode();
-            }
+            draft.focus_active_editor();
             JoinAction::Continue
         }
         KeyCode::Enter if draft.focus == JoinFocus::Confirm => confirm_join(draft, config_path),
         KeyCode::Enter => {
             draft.move_focus(1);
-            if let Some(editor) = draft.focused_editor_mut() {
-                editor.enter_insert_mode();
-            }
+            draft.focus_active_editor();
             JoinAction::Continue
         }
         _ if draft
@@ -2620,11 +2623,13 @@ fn confirm_join(draft: &mut JoinDraft, config_path: Option<&str>) -> JoinAction 
     if let Err(error) = config::validate_server_alias(&alias) {
         draft.set_error(error);
         draft.focus = JoinFocus::Alias;
+        draft.focus_active_editor();
         return JoinAction::Continue;
     }
     if let Err(error) = config::validate_display_name(&display_name) {
         draft.set_error(error);
         draft.focus = JoinFocus::DisplayName;
+        draft.focus_active_editor();
         return JoinAction::Continue;
     }
 
@@ -2816,11 +2821,6 @@ fn draw_join_field(area: Rect, buf: &mut Buffer, label: &str, editor: &mut Edito
     } else {
         theme::BACKGROUND.patch(theme::MUTED)
     };
-    let boundary = if focused {
-        theme::JOIN_INPUT_BOUNDARY_ACTIVE
-    } else {
-        theme::JOIN_INPUT_BOUNDARY_INACTIVE
-    };
     let input = if focused {
         theme::JOIN_INPUT_ACTIVE
     } else {
@@ -2835,9 +2835,6 @@ fn draw_join_field(area: Rect, buf: &mut Buffer, label: &str, editor: &mut Edito
     if row.is_empty() {
         return;
     }
-    row.with(boundary).fill(buf);
-    row.take_left(1).with(boundary).text(buf, " ");
-    row.take_right(1).with(boundary).text(buf, " ");
     row.with(input).fill(buf);
     if focused {
         editor.render(row, buf);
@@ -3398,6 +3395,19 @@ fn auth_failure_status(detail: &str) -> &'static str {
 mod tests {
     use super::*;
 
+    fn test_invite_ticket() -> InviteTicket {
+        InviteTicket {
+            version: 1,
+            user: "alice".to_string(),
+            pairing_code: "pair-alice-please-change".to_string(),
+            tcp_addr: "127.0.0.1:9000".to_string(),
+            udp_addr: "127.0.0.1:9001".to_string(),
+            udp_probe_addr: None,
+            server_public_key: "abcd".to_string(),
+            room_id: 1,
+        }
+    }
+
     fn test_app() -> App {
         let (_event_tx, event_rx) = mpsc::channel();
         let (audio_device_refresh_tx, audio_device_refresh_rx) = mpsc::channel();
@@ -3482,6 +3492,71 @@ mod tests {
         assert_eq!(config.audio.max_amplification, 2.0);
         assert_eq!(config.files.max_upload_bytes, 50 * 1024 * 1024);
         assert_eq!(config.files.max_receive_bytes, 50 * 1024 * 1024);
+    }
+
+    #[test]
+    fn join_input_editor_starts_at_end_of_existing_text() {
+        let mut editor = join_input_editor("local");
+
+        assert_eq!(editor.cursor_offset(), editor.text_len());
+        assert!(editor.send_key(&KeyEvent::new(KeyCode::Char('x'), KeyModifiers::empty())));
+        assert_eq!(editor.text(), "localx");
+    }
+
+    #[test]
+    fn join_alias_left_and_right_keys_edit_at_cursor() {
+        let mut draft = JoinDraft::new(test_invite_ticket());
+        draft.alias.set_lines("ac");
+        draft.focus_active_editor();
+
+        let _ = process_join_key(
+            &mut draft,
+            KeyEvent::new(KeyCode::Left, KeyModifiers::empty()),
+            None,
+        );
+        let _ = process_join_key(
+            &mut draft,
+            KeyEvent::new(KeyCode::Char('b'), KeyModifiers::empty()),
+            None,
+        );
+        let _ = process_join_key(
+            &mut draft,
+            KeyEvent::new(KeyCode::Right, KeyModifiers::empty()),
+            None,
+        );
+        let _ = process_join_key(
+            &mut draft,
+            KeyEvent::new(KeyCode::Char('d'), KeyModifiers::empty()),
+            None,
+        );
+
+        assert_eq!(draft.focus, JoinFocus::Alias);
+        assert_eq!(draft.alias.text(), "abcd");
+    }
+
+    #[test]
+    fn join_focus_moves_cursor_to_end_of_existing_field() {
+        let mut draft = JoinDraft::new(test_invite_ticket());
+        draft.alias.set_cursor_offset(0);
+
+        let _ = process_join_key(
+            &mut draft,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
+            None,
+        );
+        assert_eq!(draft.focus, JoinFocus::DisplayName);
+        assert_eq!(
+            draft.display_name.cursor_offset(),
+            draft.display_name.text_len()
+        );
+
+        let _ = process_join_key(
+            &mut draft,
+            KeyEvent::new(KeyCode::Up, KeyModifiers::empty()),
+            None,
+        );
+        assert_eq!(draft.focus, JoinFocus::Alias);
+        assert_eq!(draft.alias.cursor_offset(), draft.alias.text_len());
     }
 
     #[test]

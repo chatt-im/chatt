@@ -39,9 +39,6 @@ pub const JOIN_INPUT_INACTIVE: Style = Style::DEFAULT
 pub const JOIN_INPUT_BOUNDARY_ACTIVE: Style = Style::DEFAULT
     .with_bg_rgb(0x45, 0x4b, 0x57)
     .with_fg_rgb(0xf0, 0xf2, 0xe8);
-pub const JOIN_INPUT_BOUNDARY_INACTIVE: Style = Style::DEFAULT
-    .with_bg_rgb(0x1c, 0x20, 0x26)
-    .with_fg_rgb(0x8a, 0x8f, 0x98);
 
 pub const STATUS_FILL: Style = Style::DEFAULT
     .with_bg_rgb(0x2a, 0x2f, 0x38)
