@@ -1,5 +1,6 @@
+use hashbrown::HashMap;
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::VecDeque,
     fs::{self, File, OpenOptions},
     io::{self, Read, Write},
     net::{SocketAddr, TcpStream as StdTcpStream, ToSocketAddrs},

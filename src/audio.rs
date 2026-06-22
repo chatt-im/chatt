@@ -1,6 +1,7 @@
+use hashbrown::{HashMap, HashSet};
 use std::{
     cell::UnsafeCell,
-    collections::{HashMap, HashSet, VecDeque},
+    collections::VecDeque,
     fmt, fs,
     io::{self, BufWriter, Write},
     path::{Path, PathBuf},
@@ -3666,8 +3667,8 @@ fn insert_live_playback_packet(
     now: Instant,
 ) -> Option<InsertOutcome> {
     let stream = match streams.entry(packet.stream_id) {
-        std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
-        std::collections::hash_map::Entry::Vacant(entry) => match LiveDecodeStream::new(tuning) {
+        hashbrown::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+        hashbrown::hash_map::Entry::Vacant(entry) => match LiveDecodeStream::new(tuning) {
             Ok(stream) => entry.insert(stream),
             Err(error) => {
                 eprintln!("failed to create live opus decoder: {error}");
@@ -4453,8 +4454,8 @@ impl LivePlaybackMixer {
         }
 
         let stream = match self.streams.entry(stream_id) {
-            std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
-            std::collections::hash_map::Entry::Vacant(entry) => {
+            hashbrown::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+            hashbrown::hash_map::Entry::Vacant(entry) => {
                 match AdaptivePlaybackStream::new(self.tuning) {
                     Ok(stream) => entry.insert(stream),
                     Err(error) => {

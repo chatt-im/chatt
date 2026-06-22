@@ -1,4 +1,5 @@
-use std::{collections::HashSet, fs, net::SocketAddr, path::PathBuf};
+use hashbrown::HashSet;
+use std::{fs, net::SocketAddr, path::PathBuf};
 
 use ring::{digest, signature::KeyPair};
 use rpc::{

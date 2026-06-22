@@ -9,11 +9,44 @@ room-id = 1
 
 [ui]
 placeholder = "Alice #lobby"
+room-height = 4
+max-composer-height = 6
+max-messages = 50000
+overscan = 24
 
 [files]
 receive-dir = "/tmp/chatt-alice"
+max-upload-bytes = 52428800
+max-receive-bytes = 52428800
 
 [audio.latency]
 adaptive-catch-up = true
 playback-silence-skip = true
 capture-silence-gate = true
+target-queue-ms = 60
+moderate-loss-queue-ms = 320
+dred-horizon-ms = 1000
+hard-queue-bound-ms = 1500
+loss-window-ms = 5000
+loss-hold-ms = 5000
+severe-loss-hold-ms = 10000
+initial-buffer-ms = 40
+max-reorder-delay-ms = 60
+max-speed-up = 0.15
+catch-up-start-excess-ms = 20
+silence-vad-max = 64
+silence-min-gap-ms = 250
+silence-guard-ms = 40
+silence-ramp-ms = 10
+silence-max-skip-ms = 200
+silence-min-skip-ms = 20
+capture-long-silence-stop-ms = 2000
+capture-silence-preroll-ms = 30
+capture-silence-ramp-ms = 10
+
+[audio]
+bitrate-bps = 48000
+denoise = true
+echo-cancellation = true
+max-amplification = 2.0
+buffer = "default"

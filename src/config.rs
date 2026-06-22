@@ -1,3 +1,4 @@
+use hashbrown::HashSet;
 use std::path::PathBuf;
 use std::{fs, time::Duration};
 
@@ -505,7 +506,7 @@ impl Config {
                 "{source}: audio bitrate-bps must be between 8000 and 96000"
             ));
         }
-        let mut aliases = std::collections::HashSet::new();
+        let mut aliases = HashSet::new();
         for server in &self.servers {
             validate_server_alias(&server.alias)
                 .map_err(|error| format!("{source}: server {}: {error}", server.alias))?;
@@ -533,7 +534,7 @@ impl Config {
                 return Err(format!("{source}: duplicate server alias {}", server.alias));
             }
         }
-        let mut user_audio_keys = std::collections::HashSet::new();
+        let mut user_audio_keys = HashSet::new();
         for preference in &self.user_audio {
             validate_server_alias(&preference.server_alias).map_err(|error| {
                 format!(

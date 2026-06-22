@@ -15,8 +15,8 @@ mod settings;
 mod theme;
 mod ui;
 
+use hashbrown::{HashMap, HashSet};
 use std::{
-    collections::{HashMap, HashSet},
     path::{Path, PathBuf},
     sync::{
         Arc,
@@ -65,6 +65,10 @@ use settings::{
 use tinyhl::{Highlighter, Source};
 use ui::select::{FuzzySelect, SelectableItem};
 use unicode_width::UnicodeWidthStr;
+use mimalloc::MiMalloc;
+
+#[global_allocator]
+static GLOBAL: MiMalloc = MiMalloc;
 
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
 const NAME_COL_WIDTH: u16 = 16;

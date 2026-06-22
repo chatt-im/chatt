@@ -20,7 +20,7 @@ max-upload-bytes = 52428800
 max-receive-bytes = 52428800
 
 [audio]
-bitrate-bps = 96000
+bitrate-bps = 48000
 denoise = false
 echo-cancellation = false
 max-amplification = 1.0
@@ -52,8 +52,8 @@ capture-silence-ramp-ms = 10
 
 [soundboard]
 enabled = true
-#loss = "random_60"
-loss = "none"
+loss = "random_60"
+#loss = "none"
 seed = 8388357047376790533
 
 [[soundboard.clips]]

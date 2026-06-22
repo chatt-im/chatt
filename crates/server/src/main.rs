@@ -1,5 +1,6 @@
+use hashbrown::{HashMap, HashSet};
 use std::{
-    collections::{HashMap, HashSet, VecDeque},
+    collections::VecDeque,
     io::{self, Read, Write},
     net::SocketAddr,
     sync::mpsc,
@@ -34,6 +35,10 @@ use rpc::{
 
 use config::{Config as ServerConfig, UserConfig, hash_secret, value_arg, verify_secret_hash};
 use local_admin::{AdminCommand, AdminSocket};
+use mimalloc::MiMalloc;
+
+#[global_allocator]
+static GLOBAL: MiMalloc = MiMalloc;
 
 const LISTENER: Token = Token(0);
 const UDP: Token = Token(1);

@@ -16,3 +16,5 @@ kvlog = "0.1.5"
 toml-spanner = { version = "1.0.3", features = ["to-toml", "from-toml", "derive"] }
 libc = "0.2"
 foldhash = "0.2.0"
+hashbrown = "0.17.1"
+mimalloc = { version = "0.1.52", features = ["override"] }
