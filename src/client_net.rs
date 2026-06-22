@@ -1362,6 +1362,13 @@ impl WorkerState {
         sequence: u32,
         frame: LocalVoiceFrame,
     ) {
+        kvlog::info!(
+            "voice packet sent",
+            stream_id = stream_id.0,
+            sequence,
+            flags = frame.flags,
+            payload_size = frame.payload.len()
+        );
         let relay_payload = MediaPayload::Voice {
             stream_id,
             sequence,

@@ -49,8 +49,15 @@ const POLL_TIMEOUT: Duration = Duration::from_millis(100);
 const INVITE_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let _logger = kvlog::spawn_collector_from_env(Some("chatt-server"), false);
     let args = std::env::args().collect::<Vec<_>>();
+    // `--logfile PATH` (or CHATT_LOGFILE) writes the same kvlog stream the
+    // client `--logfile` produces, so server and client traces can be analyzed
+    // together. Without it, logging stays on the env-configured collector.
+    let logfile = value_arg(&args, "--logfile").or_else(|| std::env::var("CHATT_LOGFILE").ok());
+    let _logger = match logfile {
+        Some(logfile) => kvlog::collector::init_file_logger(&logfile),
+        None => kvlog::spawn_collector_from_env(Some("chatt-server"), false),
+    };
     if args.get(1).is_some_and(|arg| arg == "invite") {
         let user = args
             .get(2)
