@@ -248,6 +248,9 @@ fn draw_audio_metadata(
             .map(|index| format!("CPAL #{index}"))
             .unwrap_or_else(|| "OS default".to_string()),
     );
+    if let Some(selection) = &item.selection {
+        draw_metadata_line(rows.take_top(1), buf, "ID", selection);
+    }
     if item.variants.len() > 1 {
         draw_metadata_line(
             rows.take_top(1),

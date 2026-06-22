@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-cpal = "0.18.1"
+cpal = { path = "crates/cpal" }
 libc = "0.2"
 nnnoiseless = { version = "0.5.2", default-features = false }
 extui = { git = "https://github.com/exrok/extui", rev = "0db2ec429bc437f4d330b24e7642e539c44b8a6a" }
@@ -28,6 +28,10 @@ toml-spanner = { version = "1.0.3", features = [
 earshot = "1.1.0"
 sonora = "0.1.0"
 
+[features]
+default = []
+pipewire = ["cpal/pipewire"]
+
 [workspace]
 members = [
     "crates/benchmark",
@@ -37,6 +41,7 @@ members = [
     "crates/bwrap",
     "crates/opus-codec",
 ]
+exclude = ["crates/cpal"]
 
 [profile.dev]
 debug = 0

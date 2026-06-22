@@ -54,8 +54,8 @@ capture-silence-ramp-ms = 10
 
 [soundboard]
 enabled = true
-#loss = "congested_wifi"
-loss = "none"
+loss = "random_60"
+#loss = "none"
 seed = 8388357047376790533
 
 [[soundboard.clips]]

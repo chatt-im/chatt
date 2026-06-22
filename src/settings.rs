@@ -123,6 +123,7 @@ fn amplification_index(value: f32) -> usize {
 #[derive(Clone, Debug)]
 pub struct AudioDeviceItem {
     pub selection: Option<String>,
+    pub aliases: Vec<String>,
     pub device_index: Option<u32>,
     pub name: String,
     pub search_text: String,
@@ -239,6 +240,16 @@ impl AudioDeviceItem {
                 .unwrap_or_else(|| self.default_source.to_string()),
         }
     }
+
+    pub fn matches_selection(&self, selection: Option<&str>) -> bool {
+        match selection {
+            None => self.selection.is_none(),
+            Some(selection) => {
+                self.selection.as_deref() == Some(selection)
+                    || self.aliases.iter().any(|alias| alias == selection)
+            }
+        }
+    }
 }
 
 impl SelectableItem for AudioDeviceItem {
@@ -263,6 +274,7 @@ fn audio_device_items(devices: &[DeviceInfo], kind: AudioDeviceKind) -> Vec<Audi
     let mut items = Vec::with_capacity(devices.len() + 1);
     items.push(AudioDeviceItem {
         selection: None,
+        aliases: Vec::new(),
         device_index: None,
         name: "System default".to_string(),
         search_text: format!("system default {}", kind.name()),
@@ -277,7 +289,7 @@ fn audio_device_items(devices: &[DeviceInfo], kind: AudioDeviceKind) -> Vec<Audi
     let mut grouped: Vec<(String, AudioDeviceItem)> = Vec::new();
     for (index, device) in devices.iter().enumerate() {
         let item = audio_device_item(index as u32, device, kind);
-        let key = item.selection.clone().unwrap_or_default();
+        let key = audio_device_group_key(device, kind);
         if let Some((_, existing)) = grouped
             .iter_mut()
             .find(|(existing_key, _)| *existing_key == key)
@@ -298,7 +310,7 @@ pub fn audio_device_item_index(
 ) -> Option<usize> {
     items
         .iter()
-        .position(|item| item.selection.as_deref() == selection)
+        .position(|item| item.matches_selection(selection))
 }
 
 pub fn selected_audio_input_label(items: &[AudioInputItem], selection: Option<&str>) -> String {
@@ -312,7 +324,7 @@ pub fn selected_audio_output_label(items: &[AudioOutputItem], selection: Option<
 fn selected_audio_device_label(items: &[AudioDeviceItem], selection: Option<&str>) -> String {
     items
         .iter()
-        .find(|item| item.selection.as_deref() == selection)
+        .find(|item| item.matches_selection(selection))
         .map(|item| {
             if item.selection.is_some() {
                 format!("{} ({})", item.name, item.detail())
@@ -354,6 +366,14 @@ impl AudioDeviceKind {
 fn audio_device_item(index: u32, device: &DeviceInfo, kind: AudioDeviceKind) -> AudioDeviceItem {
     let rank = audio_device_rank(device, kind);
     let mut search_text = device.name.clone();
+    if let Some(id) = &device.id {
+        search_text.push(' ');
+        search_text.push_str(id);
+        if let Some(alsa_pcm) = id.strip_prefix("alsa:") {
+            search_text.push(' ');
+            search_text.push_str(alsa_pcm);
+        }
+    }
     if let Some(preview) = &device.preview {
         search_text.push(' ');
         search_text.push_str(&stream_preview_detail(preview));
@@ -363,11 +383,28 @@ fn audio_device_item(index: u32, device: &DeviceInfo, kind: AudioDeviceKind) -> 
         search_text.push_str(issue);
     }
 
+    let stable_selection = match kind {
+        AudioDeviceKind::Input => crate::audio::stable_input_device_id(&device.name),
+        AudioDeviceKind::Output => crate::audio::stable_output_device_id(&device.name),
+    };
+    let selection = device
+        .id
+        .clone()
+        .unwrap_or_else(|| stable_selection.clone());
+    let mut aliases = Vec::new();
+    if selection != stable_selection {
+        aliases.push(stable_selection);
+    }
+    if let Some(alsa_pcm) = selection.strip_prefix("alsa:")
+        && alsa_pcm != selection
+    {
+        aliases.push(alsa_pcm.to_string());
+        aliases.push(format!("alsa/{alsa_pcm}"));
+    }
+
     AudioDeviceItem {
-        selection: Some(match kind {
-            AudioDeviceKind::Input => crate::audio::stable_input_device_id(&device.name),
-            AudioDeviceKind::Output => crate::audio::stable_output_device_id(&device.name),
-        }),
+        selection: Some(selection),
+        aliases,
         device_index: Some(index),
         name: device.name.clone(),
         search_text,
@@ -389,6 +426,12 @@ fn audio_device_item(index: u32, device: &DeviceInfo, kind: AudioDeviceKind) -> 
 fn merge_audio_device_item(existing: &mut AudioDeviceItem, item: AudioDeviceItem) {
     existing.search_text.push(' ');
     existing.search_text.push_str(&item.search_text);
+    if let Some(selection) = &item.selection {
+        push_audio_device_alias(&mut existing.aliases, selection);
+    }
+    for alias in &item.aliases {
+        push_audio_device_alias(&mut existing.aliases, alias);
+    }
     existing.variants.extend(item.variants);
     existing.variants.sort_by(|a, b| {
         b.rank
@@ -405,6 +448,9 @@ fn merge_audio_device_item(existing: &mut AudioDeviceItem, item: AudioDeviceItem
                 .zip(existing.device_index)
                 .is_some_and(|(item, existing)| item < existing)
     {
+        if let Some(selection) = &existing.selection {
+            push_audio_device_alias(&mut existing.aliases, selection);
+        }
         existing.selection = item.selection;
         existing.device_index = item.device_index;
         existing.name = item.name;
@@ -414,6 +460,49 @@ fn merge_audio_device_item(existing: &mut AudioDeviceItem, item: AudioDeviceItem
         existing.issue = item.issue;
         existing.default_source = item.default_source;
     }
+}
+
+fn push_audio_device_alias(aliases: &mut Vec<String>, alias: &str) {
+    if !aliases.iter().any(|existing| existing == alias) {
+        aliases.push(alias.to_string());
+    }
+}
+
+fn audio_device_group_key(device: &DeviceInfo, kind: AudioDeviceKind) -> String {
+    if let Some(id) = &device.id
+        && is_explicit_alsa_device_id(id)
+    {
+        return id.clone();
+    }
+    match kind {
+        AudioDeviceKind::Input => crate::audio::stable_input_device_id(&device.name),
+        AudioDeviceKind::Output => crate::audio::stable_output_device_id(&device.name),
+    }
+}
+
+fn is_explicit_alsa_device_id(id: &str) -> bool {
+    let Some(pcm) = id.strip_prefix("alsa:") else {
+        return false;
+    };
+    let head = pcm
+        .split([':', ','])
+        .next()
+        .unwrap_or(pcm)
+        .to_ascii_lowercase();
+    matches!(
+        head.as_str(),
+        "hw" | "plughw"
+            | "sysdefault"
+            | "front"
+            | "center_lfe"
+            | "side"
+            | "iec958"
+            | "spdif"
+            | "dmix"
+            | "dsnoop"
+            | "usbstream"
+    ) || head.starts_with("surround")
+        || head.starts_with("hdmi")
 }
 
 fn audio_device_rank(device: &DeviceInfo, kind: AudioDeviceKind) -> i32 {
@@ -577,7 +666,12 @@ mod tests {
     use super::*;
 
     fn device(name: &str, supported: bool) -> DeviceInfo {
+        device_with_id(None, name, supported)
+    }
+
+    fn device_with_id(id: Option<&str>, name: &str, supported: bool) -> DeviceInfo {
         DeviceInfo {
+            id: id.map(str::to_string),
             name: name.to_string(),
             supported,
             preview: None,
@@ -602,6 +696,47 @@ mod tests {
         assert_eq!(audio.output_device_id.as_deref(), Some("usb speakers"));
         assert!(audio.echo_cancellation);
         assert_eq!(audio.max_amplification, 30.0);
+    }
+
+    #[test]
+    fn audio_device_items_use_backend_id_with_legacy_name_alias() {
+        let items = audio_output_items(&[device_with_id(
+            Some("alsa:plughw:CARD=2,DEV=0"),
+            "HD-Audio Generic, ALC897 Analog",
+            true,
+        )]);
+        let device = items
+            .iter()
+            .find(|item| item.name.contains("ALC897"))
+            .unwrap();
+
+        assert_eq!(
+            device.selection.as_deref(),
+            Some("alsa:plughw:CARD=2,DEV=0")
+        );
+        assert!(device.matches_selection(Some("plughw:CARD=2,DEV=0")));
+        assert!(device.matches_selection(Some("alsa/plughw:CARD=2,DEV=0")));
+        assert!(device.matches_selection(Some("hd-audio generic, alc897 analog")));
+        assert_eq!(
+            audio_device_item_index(&items, Some("hd-audio generic, alc897 analog")),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn explicit_alsa_ids_are_not_grouped_by_display_name() {
+        let items = audio_output_items(&[
+            device_with_id(Some("alsa:plughw:CARD=2,DEV=0"), "ALC897 Analog", true),
+            device_with_id(Some("alsa:hw:CARD=2,DEV=0"), "ALC897 Analog", true),
+        ]);
+
+        assert_eq!(
+            items
+                .iter()
+                .filter(|item| item.name == "ALC897 Analog")
+                .count(),
+            2
+        );
     }
 
     #[test]

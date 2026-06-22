@@ -1788,22 +1788,19 @@ impl App {
         }
         if let Some(id) = self.config.audio.input_device_id.as_deref() {
             if !self.input_devices.is_empty() {
-                let Some(item) = self
+                if let Some(item) = self
                     .audio_input_items
                     .iter()
-                    .find(|item| item.selection.as_deref() == Some(id))
-                else {
-                    let error = "selected input device is unavailable".to_string();
-                    self.mic_error = Some(error.clone());
-                    return Err(error);
-                };
-                if !item.supported {
-                    let error = item
-                        .issue
-                        .clone()
-                        .unwrap_or_else(|| "selected input device is unsupported".to_string());
-                    self.mic_error = Some(error.clone());
-                    return Err(error);
+                    .find(|item| item.matches_selection(Some(id)))
+                {
+                    if !item.supported {
+                        let error = item
+                            .issue
+                            .clone()
+                            .unwrap_or_else(|| "selected input device is unsupported".to_string());
+                        self.mic_error = Some(error.clone());
+                        return Err(error);
+                    }
                 }
             }
         }
@@ -3861,12 +3858,14 @@ mod tests {
         app.settings_focus = SettingsFocus::InputDevice;
         app.input_devices = vec![
             DeviceInfo {
+                id: None,
                 name: "Alpha Microphone".to_string(),
                 supported: true,
                 preview: None,
                 issue: None,
             },
             DeviceInfo {
+                id: None,
                 name: "Beta Microphone".to_string(),
                 supported: true,
                 preview: None,
@@ -3915,12 +3914,14 @@ mod tests {
         app.settings_focus = SettingsFocus::OutputDevice;
         app.output_devices = vec![
             DeviceInfo {
+                id: None,
                 name: "Alpha Speaker".to_string(),
                 supported: true,
                 preview: None,
                 issue: None,
             },
             DeviceInfo {
+                id: None,
                 name: "Beta Speaker".to_string(),
                 supported: true,
                 preview: None,
@@ -3979,6 +3980,7 @@ mod tests {
             restart_preview: false,
             input: Ok(Vec::new()),
             output: Ok(vec![DeviceInfo {
+                id: None,
                 name: "USB Speakers".to_string(),
                 supported: true,
                 preview: None,
