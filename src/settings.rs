@@ -124,6 +124,7 @@ fn amplification_index(value: f32) -> usize {
 pub struct AudioDeviceItem {
     pub selection: Option<String>,
     pub aliases: Vec<String>,
+    pub backend_id: Option<String>,
     pub device_index: Option<u32>,
     pub name: String,
     pub search_text: String,
@@ -241,6 +242,15 @@ impl AudioDeviceItem {
         }
     }
 
+    pub fn primary_metadata(&self) -> String {
+        let mut metadata = self.detail();
+        if let Some(id) = &self.backend_id {
+            metadata.push_str("  ");
+            metadata.push_str(id);
+        }
+        metadata
+    }
+
     pub fn matches_selection(&self, selection: Option<&str>) -> bool {
         match selection {
             None => self.selection.is_none(),
@@ -275,6 +285,7 @@ fn audio_device_items(devices: &[DeviceInfo], kind: AudioDeviceKind) -> Vec<Audi
     items.push(AudioDeviceItem {
         selection: None,
         aliases: Vec::new(),
+        backend_id: None,
         device_index: None,
         name: "System default".to_string(),
         search_text: format!("system default {}", kind.name()),
@@ -405,6 +416,7 @@ fn audio_device_item(index: u32, device: &DeviceInfo, kind: AudioDeviceKind) -> 
     AudioDeviceItem {
         selection: Some(selection),
         aliases,
+        backend_id: device.id.clone(),
         device_index: Some(index),
         name: device.name.clone(),
         search_text,
@@ -452,6 +464,7 @@ fn merge_audio_device_item(existing: &mut AudioDeviceItem, item: AudioDeviceItem
             push_audio_device_alias(&mut existing.aliases, selection);
         }
         existing.selection = item.selection;
+        existing.backend_id = item.backend_id;
         existing.device_index = item.device_index;
         existing.name = item.name;
         existing.rank = item.rank;
@@ -714,6 +727,15 @@ mod tests {
             device.selection.as_deref(),
             Some("alsa:plughw:CARD=2,DEV=0")
         );
+        assert_eq!(
+            device.backend_id.as_deref(),
+            Some("alsa:plughw:CARD=2,DEV=0")
+        );
+        assert!(
+            device
+                .primary_metadata()
+                .contains("alsa:plughw:CARD=2,DEV=0")
+        );
         assert!(device.matches_selection(Some("plughw:CARD=2,DEV=0")));
         assert!(device.matches_selection(Some("alsa/plughw:CARD=2,DEV=0")));
         assert!(device.matches_selection(Some("hd-audio generic, alc897 analog")));
@@ -825,6 +847,7 @@ mod tests {
             Some("usb condenser microphone")
         );
         assert_eq!(loopback.selection.as_deref(), Some("loopback"));
+        assert_eq!(loopback.backend_id.as_deref(), None);
     }
 
     #[test]

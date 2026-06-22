@@ -2382,6 +2382,7 @@ fn print_debug_audio_inputs(buffer_request: BufferRequest) -> Result<(), String>
             {
                 index,
                 selection: item.selection.as_deref(),
+                backend_id: item.backend_id.as_deref(),
                 device_index: item.device_index,
                 name: item.name.as_str(),
                 rank: item.rank,
