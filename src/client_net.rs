@@ -40,7 +40,9 @@ use rpc::{
     media::{self, MediaPayload},
 };
 
-use crate::audio::{LiveEncoderProfile, LivePlaybackFeedback, LocalVoiceFrame, RemoteVoicePacket};
+use crate::audio::{
+    LiveEncoderProfile, LivePlaybackFeedback, LivePlaybackSink, LocalVoiceFrame, RemoteVoicePacket,
+};
 
 const TCP: Token = Token(0);
 const UDP: Token = Token(1);
@@ -51,6 +53,14 @@ const MAX_FILE_CHUNKS_PER_TICK: usize = 4;
 const FILE_PROGRESS_STEP_BYTES: u64 = 1024 * 1024;
 const ENCODER_FEEDBACK_ALPHA: f32 = 0.35;
 const ENCODER_PROFILE_HOLD: Duration = Duration::from_secs(10);
+const MAX_COMMANDS_PER_ITERATION: usize = 8;
+const MAX_PENDING_PLAYBACK_PACKETS: usize = 256;
+const MAX_RECENT_VOICE_SEQUENCES: usize = 512;
+const MAX_RECENT_VOICE_STREAMS: usize = 256;
+const RECENT_VOICE_SEQUENCE_WORD_BITS: usize = u64::BITS as usize;
+const RECENT_VOICE_SEQUENCE_WORDS: usize =
+    MAX_RECENT_VOICE_SEQUENCES / RECENT_VOICE_SEQUENCE_WORD_BITS;
+const _: () = assert!(MAX_RECENT_VOICE_SEQUENCES % RECENT_VOICE_SEQUENCE_WORD_BITS == 0);
 
 #[derive(Clone, Debug)]
 pub struct ClientConfig {
@@ -76,6 +86,7 @@ pub enum NetworkCommand {
         sequence: u32,
         frame: LocalVoiceFrame,
     },
+    SetPlaybackSink(Option<LivePlaybackSink>),
     PlaybackFeedback(LivePlaybackFeedback),
     Shutdown,
 }
@@ -110,6 +121,10 @@ pub enum NetworkEvent {
     PeerTransport {
         user_id: UserId,
         direct: bool,
+    },
+    VoicePacketObserved {
+        stream_id: u32,
+        payload_size: usize,
     },
     VoicePacket(RemoteVoicePacket),
     PlaybackFeedback(LivePlaybackFeedback),
@@ -318,6 +333,9 @@ fn run_worker_inner(
         p2p_candidates: Vec::new(),
         p2p_peers: HashMap::new(),
         p2p_stream_owners: HashMap::new(),
+        playback_sink: None,
+        pending_playback_packets: VecDeque::new(),
+        voice_dedup: VoicePacketDeduplicator::new(),
         encoder_feedback: EncoderFeedbackController::new(),
         restart_port_policy: RestartPortPolicy::default(),
         udp_rebind_requested: false,
@@ -365,8 +383,9 @@ fn run_worker_inner(
     let _ = worker.events.send(NetworkEvent::Connected);
 
     let mut poll_events = Events::with_capacity(128);
+    let mut poll_timeout = POLL_TIMEOUT;
     while !worker.shutdown {
-        if let Err(error) = poll.poll(&mut poll_events, Some(POLL_TIMEOUT)) {
+        if let Err(error) = poll.poll(&mut poll_events, Some(poll_timeout)) {
             return SessionEnd::Disconnected(format!("network poll failed: {error}"));
         }
         for event in poll_events.iter() {
@@ -388,19 +407,18 @@ fn run_worker_inner(
             }
         }
 
-        loop {
-            match commands.try_recv() {
-                Ok(command) => {
-                    if let Err(error) = worker.handle_command(command) {
-                        return SessionEnd::Disconnected(error);
-                    }
-                }
-                Err(TryRecvError::Empty) => break,
-                Err(TryRecvError::Disconnected) => {
-                    worker.shutdown = true;
-                    break;
-                }
-            }
+        let command_drain =
+            match drain_commands_with(commands, MAX_COMMANDS_PER_ITERATION, |command| {
+                worker.handle_command(command)
+            }) {
+                Ok(outcome) => outcome,
+                Err(error) => return SessionEnd::Disconnected(error),
+            };
+        if command_drain == CommandDrainOutcome::Disconnected {
+            worker.shutdown = true;
+        }
+        if worker.shutdown {
+            break;
         }
         if let Err(error) = worker.poll_uploads() {
             return SessionEnd::Disconnected(error);
@@ -413,6 +431,12 @@ fn run_worker_inner(
             }
         }
         worker.poll_p2p(now);
+        worker.read_udp();
+        poll_timeout = if command_drain == CommandDrainOutcome::HitLimit {
+            Duration::ZERO
+        } else {
+            POLL_TIMEOUT
+        };
     }
     if let Some(reason) = worker.auth_failure.take() {
         SessionEnd::AuthFailed(reason)
@@ -429,6 +453,36 @@ enum SessionEnd {
     ConnectFailed(String),
     Disconnected(String),
     AuthFailed(String),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CommandDrainOutcome {
+    Empty,
+    HitLimit,
+    Disconnected,
+}
+
+fn drain_commands_with<F>(
+    commands: &Receiver<NetworkCommand>,
+    limit: usize,
+    mut handle: F,
+) -> Result<CommandDrainOutcome, String>
+where
+    F: FnMut(NetworkCommand) -> Result<(), String>,
+{
+    debug_assert!(limit > 0);
+    let mut handled = 0;
+    while handled < limit {
+        match commands.try_recv() {
+            Ok(command) => {
+                handle(command)?;
+                handled += 1;
+            }
+            Err(TryRecvError::Empty) => return Ok(CommandDrainOutcome::Empty),
+            Err(TryRecvError::Disconnected) => return Ok(CommandDrainOutcome::Disconnected),
+        }
+    }
+    Ok(CommandDrainOutcome::HitLimit)
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -501,6 +555,7 @@ fn wait_for_reconnect(commands: &Receiver<NetworkCommand>, delay: Duration) -> R
                     command,
                     NetworkCommand::LocalVoicePacket(_)
                         | NetworkCommand::SequencedLocalVoicePacket { .. }
+                        | NetworkCommand::SetPlaybackSink(_)
                 ) {
                     kvlog::info!(
                         "network command dropped while disconnected",
@@ -674,6 +729,9 @@ struct WorkerState {
     p2p_candidates: Vec<P2pCandidate>,
     p2p_peers: HashMap<SessionId, PeerConnection>,
     p2p_stream_owners: HashMap<StreamId, SessionId>,
+    playback_sink: Option<LivePlaybackSink>,
+    pending_playback_packets: VecDeque<RemoteVoicePacket>,
+    voice_dedup: VoicePacketDeduplicator,
     encoder_feedback: EncoderFeedbackController,
     restart_port_policy: RestartPortPolicy,
     udp_rebind_requested: bool,
@@ -685,6 +743,177 @@ struct WorkerState {
     shutdown: bool,
     disconnect_reason: Option<String>,
     auth_failure: Option<String>,
+}
+
+#[derive(Debug)]
+struct VoicePacketDeduplicator {
+    streams: HashMap<u32, RecentVoiceSequences>,
+    clock: u64,
+}
+
+impl VoicePacketDeduplicator {
+    fn new() -> Self {
+        Self {
+            streams: HashMap::with_capacity(MAX_RECENT_VOICE_STREAMS),
+            clock: 0,
+        }
+    }
+
+    fn observe(&mut self, stream_id: u32, sequence: u32) -> RecentVoiceSequenceResult {
+        if !self.streams.contains_key(&stream_id) && self.streams.len() >= MAX_RECENT_VOICE_STREAMS
+        {
+            self.evict_oldest_stream();
+        }
+
+        self.clock = self.clock.wrapping_add(1);
+        let stream = self.streams.entry(stream_id).or_default();
+        stream.last_touched = self.clock;
+        stream.observe(sequence)
+    }
+
+    fn remove_stream(&mut self, stream_id: u32) {
+        self.streams.remove(&stream_id);
+    }
+
+    fn evict_oldest_stream(&mut self) {
+        let oldest = self
+            .streams
+            .iter()
+            .min_by_key(|(_, stream)| stream.last_touched)
+            .map(|(stream_id, _)| *stream_id);
+        if let Some(stream_id) = oldest {
+            self.streams.remove(&stream_id);
+        }
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.streams.len()
+    }
+}
+
+impl Default for VoicePacketDeduplicator {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RecentVoiceSequenceResult {
+    New,
+    Duplicate,
+    Stale,
+}
+
+#[derive(Debug)]
+struct RecentVoiceSequences {
+    highest: Option<u32>,
+    seen: [u64; RECENT_VOICE_SEQUENCE_WORDS],
+    last_touched: u64,
+}
+
+impl Default for RecentVoiceSequences {
+    fn default() -> Self {
+        Self {
+            highest: None,
+            seen: [0; RECENT_VOICE_SEQUENCE_WORDS],
+            last_touched: 0,
+        }
+    }
+}
+
+impl RecentVoiceSequences {
+    fn observe(&mut self, sequence: u32) -> RecentVoiceSequenceResult {
+        let Some(highest) = self.highest else {
+            self.highest = Some(sequence);
+            self.set_seen(0);
+            return RecentVoiceSequenceResult::New;
+        };
+
+        if let Some(forward) = voice_sequence_distance_forward(highest, sequence) {
+            if forward == 0 {
+                return if self.is_seen(0) {
+                    RecentVoiceSequenceResult::Duplicate
+                } else {
+                    self.set_seen(0);
+                    RecentVoiceSequenceResult::New
+                };
+            }
+
+            self.shift_seen(forward as usize);
+            self.highest = Some(sequence);
+            self.set_seen(0);
+            return RecentVoiceSequenceResult::New;
+        }
+
+        let Some(backward) = voice_sequence_distance_forward(sequence, highest) else {
+            return RecentVoiceSequenceResult::Stale;
+        };
+        let backward = backward as usize;
+        if backward >= MAX_RECENT_VOICE_SEQUENCES {
+            return RecentVoiceSequenceResult::Stale;
+        }
+        if self.is_seen(backward) {
+            RecentVoiceSequenceResult::Duplicate
+        } else {
+            self.set_seen(backward);
+            RecentVoiceSequenceResult::New
+        }
+    }
+
+    fn shift_seen(&mut self, shift: usize) {
+        if shift >= MAX_RECENT_VOICE_SEQUENCES {
+            self.seen.fill(0);
+            return;
+        }
+
+        let word_shift = shift / RECENT_VOICE_SEQUENCE_WORD_BITS;
+        let bit_shift = shift % RECENT_VOICE_SEQUENCE_WORD_BITS;
+
+        if word_shift > 0 {
+            for index in (0..RECENT_VOICE_SEQUENCE_WORDS).rev() {
+                self.seen[index] = if index >= word_shift {
+                    self.seen[index - word_shift]
+                } else {
+                    0
+                };
+            }
+        }
+
+        if bit_shift > 0 {
+            for index in (0..RECENT_VOICE_SEQUENCE_WORDS).rev() {
+                let carry = if index > 0 {
+                    self.seen[index - 1] >> (RECENT_VOICE_SEQUENCE_WORD_BITS - bit_shift)
+                } else {
+                    0
+                };
+                self.seen[index] = (self.seen[index] << bit_shift) | carry;
+            }
+        }
+    }
+
+    fn is_seen(&self, distance: usize) -> bool {
+        debug_assert!(distance < MAX_RECENT_VOICE_SEQUENCES);
+        let word = distance / RECENT_VOICE_SEQUENCE_WORD_BITS;
+        let bit = distance % RECENT_VOICE_SEQUENCE_WORD_BITS;
+        self.seen[word] & (1u64 << bit) != 0
+    }
+
+    fn set_seen(&mut self, distance: usize) {
+        debug_assert!(distance < MAX_RECENT_VOICE_SEQUENCES);
+        let word = distance / RECENT_VOICE_SEQUENCE_WORD_BITS;
+        let bit = distance % RECENT_VOICE_SEQUENCE_WORD_BITS;
+        self.seen[word] |= 1u64 << bit;
+    }
+}
+
+fn voice_sequence_distance_forward(from: u32, to: u32) -> Option<u32> {
+    let distance = to.wrapping_sub(from);
+    if distance < (1 << 31) {
+        Some(distance)
+    } else {
+        None
+    }
 }
 
 struct OutgoingUpload {
@@ -968,16 +1197,14 @@ impl WorkerState {
                         sequence,
                         payload_size = opus.len()
                     );
-                    let _ = self
-                        .events
-                        .send(NetworkEvent::VoicePacket(RemoteVoicePacket {
-                            stream_id: stream_id.0,
-                            sequence,
-                            flags,
-                            silence_ranges,
-                            payload: opus,
-                            received_at: now,
-                        }));
+                    self.dispatch_voice_packet(RemoteVoicePacket {
+                        stream_id: stream_id.0,
+                        sequence,
+                        flags,
+                        silence_ranges,
+                        payload: opus,
+                        received_at: now,
+                    });
                 }
                 Ok((_, MediaPayload::Pong { .. })) => {}
                 Ok((
@@ -1027,11 +1254,53 @@ impl WorkerState {
         }
     }
 
+    fn dispatch_voice_packet(&mut self, packet: RemoteVoicePacket) {
+        let stream_id = packet.stream_id;
+        let sequence = packet.sequence;
+        match self.voice_dedup.observe(stream_id, sequence) {
+            RecentVoiceSequenceResult::New => {}
+            RecentVoiceSequenceResult::Duplicate => {
+                kvlog::info!("duplicate voice packet dropped", stream_id, sequence);
+                return;
+            }
+            RecentVoiceSequenceResult::Stale => {
+                kvlog::info!("stale voice packet dropped", stream_id, sequence);
+                return;
+            }
+        }
+        dispatch_voice_packet_to(
+            &self.events,
+            self.playback_sink.as_ref(),
+            &mut self.pending_playback_packets,
+            packet,
+        );
+    }
+
+    fn set_playback_sink(&mut self, sink: Option<LivePlaybackSink>) {
+        let Some(sink) = sink else {
+            self.playback_sink = None;
+            self.pending_playback_packets.clear();
+            return;
+        };
+
+        while let Some(packet) = self.pending_playback_packets.pop_front() {
+            sink.push(packet);
+        }
+        self.playback_sink = Some(sink);
+    }
+
+    fn clear_pending_playback_stream(&mut self, stream_id: StreamId) {
+        self.pending_playback_packets
+            .retain(|packet| packet.stream_id != stream_id.0);
+        self.voice_dedup.remove_stream(stream_id.0);
+    }
+
     fn handle_command(&mut self, command: NetworkCommand) -> Result<(), String> {
         if !matches!(
             command,
             NetworkCommand::LocalVoicePacket(_)
                 | NetworkCommand::SequencedLocalVoicePacket { .. }
+                | NetworkCommand::SetPlaybackSink(_)
                 | NetworkCommand::PlaybackFeedback(_)
         ) {
             kvlog::info!(
@@ -1064,6 +1333,9 @@ impl WorkerState {
                     self.local_sequence = self.local_sequence.max(sequence.wrapping_add(1));
                     self.send_local_voice_packet(stream_id, sequence, frame);
                 }
+            }
+            NetworkCommand::SetPlaybackSink(sink) => {
+                self.set_playback_sink(sink);
             }
             NetworkCommand::PlaybackFeedback(feedback) => {
                 let _ = self.events.send(NetworkEvent::PlaybackFeedback(feedback));
@@ -1522,6 +1794,7 @@ impl WorkerState {
                     self.active_stream = None;
                 }
                 self.p2p_stream_owners.remove(&stream_id);
+                self.clear_pending_playback_stream(stream_id);
                 let _ = self
                     .events
                     .send(NetworkEvent::VoiceStopped { user_id, stream_id });
@@ -2030,16 +2303,14 @@ impl WorkerState {
                     self.apply_p2p_actions(session_id, vec![action]);
                 }
                 self.p2p_stream_owners.insert(stream_id, session_id);
-                let _ = self
-                    .events
-                    .send(NetworkEvent::VoicePacket(RemoteVoicePacket {
-                        stream_id: stream_id.0,
-                        sequence,
-                        flags,
-                        silence_ranges,
-                        payload: opus,
-                        received_at: now,
-                    }));
+                self.dispatch_voice_packet(RemoteVoicePacket {
+                    stream_id: stream_id.0,
+                    sequence,
+                    flags,
+                    silence_ranges,
+                    payload: opus,
+                    received_at: now,
+                });
             }
             Ok(P2pMediaPacket::Feedback {
                 stream_id,
@@ -2252,6 +2523,7 @@ fn network_command_kind(command: &NetworkCommand) -> &'static str {
         NetworkCommand::UploadFile(_) => "upload_file",
         NetworkCommand::LocalVoicePacket(_) => "local_voice_packet",
         NetworkCommand::SequencedLocalVoicePacket { .. } => "sequenced_local_voice_packet",
+        NetworkCommand::SetPlaybackSink(_) => "set_playback_sink",
         NetworkCommand::PlaybackFeedback(_) => "playback_feedback",
         NetworkCommand::Shutdown => "shutdown",
     }
@@ -2412,6 +2684,31 @@ fn media_payload_kind(payload: &MediaPayload) -> &'static str {
     }
 }
 
+fn dispatch_voice_packet_to(
+    events: &Sender<NetworkEvent>,
+    playback_sink: Option<&LivePlaybackSink>,
+    pending_playback_packets: &mut VecDeque<RemoteVoicePacket>,
+    packet: RemoteVoicePacket,
+) {
+    let stream_id = packet.stream_id;
+    let payload_size = packet.payload.len();
+    let _ = events.send(NetworkEvent::VoicePacketObserved {
+        stream_id,
+        payload_size,
+    });
+    if let Some(sink) = playback_sink {
+        while let Some(packet) = pending_playback_packets.pop_front() {
+            sink.push(packet);
+        }
+        sink.push(packet);
+    } else {
+        if pending_playback_packets.len() == MAX_PENDING_PLAYBACK_PACKETS {
+            pending_playback_packets.pop_front();
+        }
+        pending_playback_packets.push_back(packet);
+    }
+}
+
 fn random_u64() -> Result<u64, String> {
     let rng = ring::rand::SystemRandom::new();
     let mut bytes = [0u8; 8];
@@ -2548,6 +2845,105 @@ mod tests {
     }
 
     #[test]
+    fn command_drain_stops_at_iteration_limit() {
+        let (tx, rx) = mpsc::channel();
+        tx.send(NetworkCommand::Shutdown).unwrap();
+        tx.send(NetworkCommand::Shutdown).unwrap();
+        tx.send(NetworkCommand::Shutdown).unwrap();
+
+        let mut handled = 0;
+        let outcome = drain_commands_with(&rx, 2, |_| {
+            handled += 1;
+            Ok(())
+        })
+        .unwrap();
+
+        assert_eq!(outcome, CommandDrainOutcome::HitLimit);
+        assert_eq!(handled, 2);
+        assert!(matches!(rx.try_recv(), Ok(NetworkCommand::Shutdown)));
+    }
+
+    #[test]
+    fn voice_dispatch_buffers_audio_until_sink_attaches() {
+        let (tx, rx) = mpsc::channel();
+        let mut pending = VecDeque::new();
+        dispatch_voice_packet_to(
+            &tx,
+            None,
+            &mut pending,
+            test_remote_voice_packet(7, 3, vec![1, 2, 3, 4]),
+        );
+
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(NetworkEvent::VoicePacketObserved {
+                stream_id: 7,
+                payload_size: 4,
+            })
+        ));
+        assert!(rx.try_recv().is_err());
+        assert_eq!(pending.len(), 1);
+        let packet = pending.pop_front().unwrap();
+        assert_eq!(packet.stream_id, 7);
+        assert_eq!(packet.sequence, 3);
+        assert_eq!(packet.payload, vec![1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn voice_dispatch_uses_sink_when_attached() {
+        let (tx, rx) = mpsc::channel();
+        let mut pending = VecDeque::new();
+        let sink = LivePlaybackSink::for_test();
+        dispatch_voice_packet_to(
+            &tx,
+            Some(&sink),
+            &mut pending,
+            test_remote_voice_packet(9, 4, vec![5, 6, 7]),
+        );
+
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(NetworkEvent::VoicePacketObserved {
+                stream_id: 9,
+                payload_size: 3,
+            })
+        ));
+        assert!(rx.try_recv().is_err());
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn recent_voice_sequences_tracks_duplicates_out_of_order_and_stale_packets() {
+        let mut recent = RecentVoiceSequences::default();
+
+        assert_eq!(recent.observe(10), RecentVoiceSequenceResult::New);
+        assert_eq!(recent.observe(12), RecentVoiceSequenceResult::New);
+        assert_eq!(recent.observe(11), RecentVoiceSequenceResult::New);
+        assert_eq!(recent.observe(11), RecentVoiceSequenceResult::Duplicate);
+        assert_eq!(recent.observe(12), RecentVoiceSequenceResult::Duplicate);
+
+        for sequence in 13..(13 + MAX_RECENT_VOICE_SEQUENCES as u32) {
+            assert_eq!(recent.observe(sequence), RecentVoiceSequenceResult::New);
+        }
+
+        assert!(
+            matches!(recent.observe(10), RecentVoiceSequenceResult::Stale),
+            "packets outside the fixed dedup window should be dropped as stale"
+        );
+    }
+
+    #[test]
+    fn voice_packet_deduplicator_bounds_stream_table() {
+        let mut dedup = VoicePacketDeduplicator::new();
+
+        for stream_id in 0..(MAX_RECENT_VOICE_STREAMS as u32 + 8) {
+            assert_eq!(dedup.observe(stream_id, 0), RecentVoiceSequenceResult::New);
+        }
+
+        assert_eq!(dedup.len(), MAX_RECENT_VOICE_STREAMS);
+    }
+
+    #[test]
     fn encoder_feedback_controller_escalates_without_bitrate_policy() {
         let start = Instant::now();
         let mut controller = EncoderFeedbackController::new();
@@ -2631,6 +3027,21 @@ mod tests {
             window_ms: 500,
             max_queue_ms,
             max_interarrival_jitter_ms,
+        }
+    }
+
+    fn test_remote_voice_packet(
+        stream_id: u32,
+        sequence: u32,
+        payload: Vec<u8>,
+    ) -> RemoteVoicePacket {
+        RemoteVoicePacket {
+            stream_id,
+            sequence,
+            flags: 0,
+            silence_ranges: 0,
+            payload,
+            received_at: Instant::now(),
         }
     }
 }

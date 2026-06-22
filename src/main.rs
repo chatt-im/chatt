@@ -31,7 +31,8 @@ use audio::{
     BufferRequest, DeviceInfo, EchoCancellationControl, LiveAudioFilePlaybackTestConfig,
     LiveAudioFilePlaybackTestReport, LiveAudioFileSourceConfig, LiveAudioFileSourceReport,
     LiveAudioPacketLossProfile, LiveCapture, LiveCaptureConfig, LiveEncoderProfile, LivePlayback,
-    LivePlaybackConfig, LivePlaybackFeedback, PlaybackStreamControl, StatsSnapshot,
+    LivePlaybackConfig, LivePlaybackFeedback, LivePlaybackSink, PlaybackStreamControl,
+    StatsSnapshot,
 };
 use bindings::{BindCommand, PendingChord, Resolved};
 use chat_buffer::VirtualChatBuffer;
@@ -1000,12 +1001,13 @@ impl App {
             NetworkEvent::PeerTransport { user_id, direct } => {
                 self.participants.set_peer_transport(user_id, direct);
             }
+            NetworkEvent::VoicePacketObserved {
+                stream_id,
+                payload_size,
+            } => {
+                self.observe_voice_packet(stream_id, payload_size);
+            }
             NetworkEvent::VoicePacket(packet) => {
-                self.voice_packets_received = self.voice_packets_received.saturating_add(1);
-                self.voice_bytes_received = self
-                    .voice_bytes_received
-                    .saturating_add(packet.payload.len() as u64);
-                self.participants.voice_packet(packet.stream_id);
                 if !self.deafened.load(Ordering::Relaxed)
                     && let Some(playback) = &self.playback
                 {
@@ -1077,6 +1079,20 @@ impl App {
                 self.stream_users.clear();
                 self.set_error("disconnected");
             }
+        }
+    }
+
+    fn observe_voice_packet(&mut self, stream_id: u32, payload_size: usize) {
+        self.voice_packets_received = self.voice_packets_received.saturating_add(1);
+        self.voice_bytes_received = self
+            .voice_bytes_received
+            .saturating_add(payload_size as u64);
+        self.participants.voice_packet(stream_id);
+    }
+
+    fn set_network_playback_sink(&self, sink: Option<LivePlaybackSink>) {
+        if let Some(network) = &self.network {
+            network.send(NetworkCommand::SetPlaybackSink(sink));
         }
     }
 
@@ -2335,6 +2351,7 @@ impl App {
         if self.deafened.load(Ordering::Relaxed) {
             self.voice_tx_enabled.store(false, Ordering::Relaxed);
             self.stop_mic_capture();
+            self.set_network_playback_sink(None);
             self.playback.take();
             self.set_status("deafened");
             return;
@@ -2371,7 +2388,9 @@ impl App {
                 echo_control: Some(Arc::clone(&self.echo_control)),
             }) {
                 Ok(playback) => {
+                    let sink = playback.sink();
                     self.playback = Some(playback);
+                    self.set_network_playback_sink(sink);
                     self.apply_all_user_audio_controls();
                     if capture_ok {
                         if self.config.soundboard.enabled {
@@ -2382,6 +2401,7 @@ impl App {
                     }
                 }
                 Err(error) => {
+                    self.set_network_playback_sink(None);
                     self.playback = None;
                     self.set_error(format!("voice playback unavailable: {error}"));
                 }
@@ -2397,6 +2417,7 @@ impl App {
             && !self.deafened.load(Ordering::Relaxed);
         self.voice_tx_enabled.store(false, Ordering::Relaxed);
         self.stop_mic_capture();
+        self.set_network_playback_sink(None);
         self.playback.take();
         if restart_settings_preview {
             self.start_settings_preview_capture();
@@ -4059,6 +4080,7 @@ fn network_event_kind(event: &NetworkEvent) -> &'static str {
         NetworkEvent::VoiceStarted { .. } => "voice_started",
         NetworkEvent::VoiceStopped { .. } => "voice_stopped",
         NetworkEvent::PeerTransport { .. } => "peer_transport",
+        NetworkEvent::VoicePacketObserved { .. } => "voice_packet_observed",
         NetworkEvent::VoicePacket(_) => "voice_packet",
         NetworkEvent::PlaybackFeedback(_) => "playback_feedback",
         NetworkEvent::EncoderProfileChanged(_) => "encoder_profile_changed",
@@ -4173,6 +4195,26 @@ mod tests {
         assert_eq!(config.audio.max_amplification, 2.0);
         assert_eq!(config.files.max_upload_bytes, 50 * 1024 * 1024);
         assert_eq!(config.files.max_receive_bytes, 50 * 1024 * 1024);
+    }
+
+    #[test]
+    fn fallback_voice_packet_counts_observed_event_only_once() {
+        let mut app = test_app();
+        app.handle_network_event(NetworkEvent::VoicePacketObserved {
+            stream_id: 2,
+            payload_size: 4,
+        });
+        app.handle_network_event(NetworkEvent::VoicePacket(audio::RemoteVoicePacket {
+            stream_id: 2,
+            sequence: 1,
+            flags: 0,
+            silence_ranges: 0,
+            payload: vec![1, 2, 3, 4],
+            received_at: Instant::now(),
+        }));
+
+        assert_eq!(app.voice_packets_received, 1);
+        assert_eq!(app.voice_bytes_received, 4);
     }
 
     #[test]
