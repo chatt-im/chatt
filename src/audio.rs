@@ -52,7 +52,10 @@ const LIVE_PLAYBACK_DRAIN_INTERVAL: Duration = Duration::from_millis(10);
 const LIVE_PLAYBACK_FEEDBACK_INTERVAL: Duration = Duration::from_millis(500);
 const LIVE_PLAYBACK_FEEDBACK_PACKETS: u32 = 25;
 const LIVE_PLAYBACK_MAX_REORDER_DELAY: Duration = Duration::from_millis(60);
-const LIVE_PLAYBACK_CATCH_UP_START_EXCESS: Duration = Duration::from_millis(80);
+// One 20 ms Opus packet of cadence jitter must not trigger resampling, but a
+// persistent excess beyond that should drain back to target. A larger value
+// reopens a dead zone where a startup overshoot parks above target forever.
+const LIVE_PLAYBACK_CATCH_UP_START_EXCESS: Duration = Duration::from_millis(20);
 const LIVE_PLAYBACK_MAX_SPEED_UP: f64 = 0.15;
 // One-pole smoothing coefficient for the catch-up correction (tau = 50 ms):
 // alpha = 1 - exp(-1 / (tau * rate)) ~= 1 / (tau * rate).
@@ -5375,6 +5378,8 @@ pub struct LiveAudioSimulationReport {
     pub clipped_samples: u64,
     pub max_queue_ms: u64,
     pub queue_area_ms: f64,
+    pub steady_state_max_queue_ms: u64,
+    pub steady_state_avg_queue_ms: f64,
     pub final_snapshot: LivePlaybackSnapshot,
 }
 
@@ -6054,6 +6059,15 @@ fn run_live_audio_simulation_inner(
         .then(|| Vec::with_capacity(total_frames.saturating_mul(FRAME_SAMPLES)))
         .unwrap_or_default();
 
+    // Isolate steady-state queue depth from the startup transient by measuring
+    // the queue only over the final window of the run.
+    const STEADY_STATE_WINDOW: Duration = Duration::from_secs(10);
+    let tail_start_frame =
+        total_frames.saturating_sub(frames_for_duration(STEADY_STATE_WINDOW).max(1));
+    let mut tail_queue_sum_ms = 0.0f64;
+    let mut tail_queue_max_ms = 0u64;
+    let mut tail_frames = 0usize;
+
     for frame_index in 0..prebuffer_frames {
         let now = start;
         process_simulation_input_frame(
@@ -6105,7 +6119,19 @@ fn run_live_audio_simulation_inner(
         let snapshot = mixer.snapshot_at(now);
         report.max_queue_ms = report.max_queue_ms.max(snapshot.max_queue_ms);
         report.queue_area_ms += snapshot.max_queue_ms as f64 * frame_duration.as_secs_f64();
+        if frame_index >= tail_start_frame {
+            tail_queue_sum_ms += snapshot.max_queue_ms as f64;
+            tail_queue_max_ms = tail_queue_max_ms.max(snapshot.max_queue_ms);
+            tail_frames += 1;
+        }
     }
+
+    report.steady_state_max_queue_ms = tail_queue_max_ms;
+    report.steady_state_avg_queue_ms = if tail_frames > 0 {
+        tail_queue_sum_ms / tail_frames as f64
+    } else {
+        0.0
+    };
 
     let final_now = start + config.duration;
     report.final_snapshot = mixer
@@ -8735,6 +8761,31 @@ mod tests {
         assert_eq!(report.suppressed_frames, 0);
         assert_eq!(report.lost_frames, 0);
         assert!(report.max_queue_ms <= 120, "{report:?}");
+        assert_coherent_output(&report, 0.005);
+    }
+
+    #[test]
+    fn constant_speech_converges_to_target_queue_at_zero_loss() {
+        let report = simulate_with_loss(
+            LiveAudioSimulationScenario::ConstantSpeech,
+            Duration::from_secs(60),
+            test_tuning(),
+            1,
+            LiveAudioPacketLossProfile::None,
+        );
+
+        assert_eq!(report.suppressed_frames, 0, "{report:?}");
+        assert_eq!(report.lost_frames, 0, "{report:?}");
+        // Over a loopback-equivalent zero-loss link the queue must converge to
+        // the configured target rather than parking on the startup overshoot.
+        assert!(
+            report.steady_state_max_queue_ms <= 90,
+            "tail queue did not converge to target: {report:?}"
+        );
+        assert!(
+            report.steady_state_avg_queue_ms <= 80.0,
+            "tail average queue did not converge to target: {report:?}"
+        );
         assert_coherent_output(&report, 0.005);
     }
 

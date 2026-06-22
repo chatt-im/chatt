@@ -6,15 +6,15 @@ This crate uses `jsony_bench` to quantify the hot audio paths against
 Run benchmarks in release mode:
 
 ```sh
-cargo run --release -p benchmark -- opus/encode
-cargo run --release -p benchmark -- opus/decode
-cargo run --release -p benchmark -- dred/parse
-cargo run --release -p benchmark -- dred/recover_available
-cargo run --release -p benchmark -- rnnoise/process
-cargo run --release -p benchmark -- pipeline/rnnoise_then_encode
-cargo run --release -p benchmark -- pipeline/aec_then_encode
-cargo run --release -p benchmark -- live/call_sim
-cargo run --release -p benchmark -- live/group_call_sim
+cargo run --release -p benchmark -- bench opus/encode --progress
+cargo run --release -p benchmark -- bench opus/decode --progress
+cargo run --release -p benchmark -- bench dred/parse --progress
+cargo run --release -p benchmark -- bench dred/recover_available --progress
+cargo run --release -p benchmark -- bench rnnoise/process --progress
+cargo run --release -p benchmark -- bench pipeline/rnnoise_then_encode --progress
+cargo run --release -p benchmark -- bench pipeline/aec_then_encode --progress
+cargo run --release -p benchmark -- bench live/call_sim --progress
+cargo run --release -p benchmark -- bench live/group_call_sim --progress
 ```
 
 `pipeline/aec_then_encode` mirrors `pipeline/rnnoise_then_encode` but runs the
@@ -23,20 +23,27 @@ ahead of the Opus encode, isolating the echo cancellation overhead. `live/call_s
 takes an `aec=off|on` parameter that toggles echo cancellation end to end so the
 on/off wall-clock delta measures the full-pipeline cost.
 
-Filter a profile:
+Filter benchmark parameters:
 
 ```sh
-cargo run --release -p benchmark -- opus/encode --param profile=dred_32k_1000ms_loss20
-cargo run --release -p benchmark -- live/call_sim --param scenario=lossy_speech --param feature=all_on --param loss=congested_wifi --param aec=on
-cargo run --release -p benchmark -- live/playback_mixer --param feature=skip_off
+cargo run --release -p benchmark -- bench opus/encode --param profile=dred_32k_1000ms_loss20 --progress
+cargo run --release -p benchmark -- bench live/call_sim --param scenario=lossy_speech --param feature=all_on --param loss=congested_wifi --param aec=on --progress
+cargo run --release -p benchmark -- bench live/playback_mixer --param feature=skip_off --progress
 ```
 
-Profile live audio paths with `samply`:
+Profile a route with calibrated default iterations:
 
 ```sh
-samply record cargo run --release -p benchmark -- live/call_sim --param scenario=lossy_speech --param loss=congested_wifi
-samply record cargo run --release -p benchmark -- live/group_call_sim --param streams=3 --param loss=bursty_wifi
+cargo run --release -p benchmark -- profile opus/encode
+samply record cargo run --release -p benchmark -- profile live/call_sim
+samply record cargo run --release -p benchmark -- profile live/group_call_sim
 ```
+
+The `profile` subcommand is quiet by default so profiler output stays compact;
+pass `--progress` only when debugging benchmark selection. Parameterized routes
+use representative profile defaults when a parameter is not explicitly filtered;
+pass `--param key=value` to profile a different case. `--iterations N` remains
+available to override the route default.
 
 Export listenable live-audio simulation WAVs:
 
@@ -53,8 +60,8 @@ window events.
 Save and compare runs with `jsony_bench`:
 
 ```sh
-cargo run --release -p benchmark -- opus/encode --save /tmp/chatt-opus-base.json
-cargo run --release -p benchmark -- opus/encode --compare /tmp/chatt-opus-base.json
+cargo run --release -p benchmark -- bench opus/encode --save /tmp/chatt-opus-base.json --progress
+cargo run --release -p benchmark -- bench opus/encode --compare /tmp/chatt-opus-base.json --progress
 ```
 
 Notes:
