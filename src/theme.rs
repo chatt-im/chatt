@@ -4,6 +4,8 @@ use tinyhl::{RenderSpan, SemanticKind, kind};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum UiMode {
+    ServerSelect,
+    ServerEdit,
     Compose,
     Log,
     Settings,
@@ -12,6 +14,8 @@ pub enum UiMode {
 impl UiMode {
     pub fn label(self) -> &'static str {
         match self {
+            UiMode::ServerSelect => "SERVERS",
+            UiMode::ServerEdit => "SERVER",
             UiMode::Compose => "COMPOSE",
             UiMode::Log => "LOG",
             UiMode::Settings => "SETTINGS",
@@ -49,6 +53,8 @@ pub const STATUS_SECTION: Style = Style::DEFAULT
 
 pub fn mode_style(mode: UiMode) -> Style {
     let bg = match mode {
+        UiMode::ServerSelect => AnsiColor::Grey[10],
+        UiMode::ServerEdit => AnsiColor::PaleGreen3,
         UiMode::Compose => AnsiColor::SpringGreen,
         UiMode::Log => AnsiColor::LightSkyBlue1,
         UiMode::Settings => AnsiColor::Violet,

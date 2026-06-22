@@ -1,17 +1,6 @@
 # Default chatt configuration. User configuration is loaded from
 # ~/.config/chatt.toml unless --config or CHATT_CONFIG is provided.
 
-active-server = "local"
-
-[[servers]]
-alias = "local"
-user = "alice"
-display-name = "Alice"
-token = "alice-dev-token"
-server-public-key = ""
-tcp-addr = "127.0.0.1:41000"
-room-id = 1
-
 [audio]
 bitrate-bps = 48000
 denoise = true

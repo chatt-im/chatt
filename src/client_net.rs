@@ -59,7 +59,6 @@ pub struct ClientConfig {
     pub user: String,
     pub display_name: String,
     pub token: String,
-    pub pairing_code: Option<String>,
     pub server_public_key: Option<String>,
     pub room_id: RoomId,
     pub file_receive_dir: Option<PathBuf>,
@@ -117,6 +116,8 @@ pub enum NetworkEvent {
     Status(String),
     Error(String),
     AuthFailed(String),
+    PairingSucceeded,
+    PairingFailed(String),
     ReconnectScheduled {
         retry_in: Duration,
         reason: String,
@@ -179,6 +180,21 @@ impl Drop for NetworkClient {
     fn drop(&mut self) {
         self.stop_inner();
     }
+}
+
+pub fn spawn_pair_once(
+    config: ClientConfig,
+    pairing_code: String,
+    events: Sender<NetworkEvent>,
+) -> JoinHandle<()> {
+    thread::spawn(move || {
+        let result = pair_once(&config, pairing_code);
+        let event = match result {
+            Ok(()) => NetworkEvent::PairingSucceeded,
+            Err(error) => NetworkEvent::PairingFailed(error),
+        };
+        let _ = events.send(event);
+    })
 }
 
 fn run_worker(
@@ -332,27 +348,14 @@ fn run_worker_inner(
         return SessionEnd::ConnectFailed(format!("failed to register UDP socket: {error}"));
     }
 
-    let auth_control = match worker.config.pairing_code.clone() {
-        Some(pairing_code) => ClientControl::Pair {
-            user: worker.config.user.clone(),
-            display_name: worker.config.display_name.clone(),
-            pairing_code,
-            token: worker.config.token.clone(),
-            receive_files: worker.config.file_receive_dir.is_some(),
-            file_receive_limit_bytes: worker
-                .config
-                .max_receive_bytes
-                .min(DEFAULT_FILE_SIZE_LIMIT_BYTES),
-        },
-        None => ClientControl::Authenticate {
-            user: worker.config.user.clone(),
-            token: worker.config.token.clone(),
-            receive_files: worker.config.file_receive_dir.is_some(),
-            file_receive_limit_bytes: worker
-                .config
-                .max_receive_bytes
-                .min(DEFAULT_FILE_SIZE_LIMIT_BYTES),
-        },
+    let auth_control = ClientControl::Authenticate {
+        user: worker.config.user.clone(),
+        token: worker.config.token.clone(),
+        receive_files: worker.config.file_receive_dir.is_some(),
+        file_receive_limit_bytes: worker
+            .config
+            .max_receive_bytes
+            .min(DEFAULT_FILE_SIZE_LIMIT_BYTES),
     };
     if let Err(error) = worker.queue_control(auth_control) {
         return SessionEnd::Disconnected(error);
@@ -565,6 +568,51 @@ fn connect_and_handshake(
         }
     };
     Ok((stream, control, secrets))
+}
+
+fn pair_once(config: &ClientConfig, pairing_code: String) -> Result<(), String> {
+    let (mut stream, mut control, _secrets) = connect_and_handshake(config)?;
+    write_blocking_control(
+        &mut stream,
+        &mut control,
+        ClientControl::Pair {
+            user: config.user.clone(),
+            display_name: config.display_name.clone(),
+            pairing_code,
+            token: config.token.clone(),
+            receive_files: config.file_receive_dir.is_some(),
+            file_receive_limit_bytes: config.max_receive_bytes.min(DEFAULT_FILE_SIZE_LIMIT_BYTES),
+        },
+    )?;
+
+    loop {
+        let frame = read_blocking_frame(&mut stream)
+            .map_err(|error| format!("failed to read pairing response: {error}"))?;
+        let plaintext = control
+            .open_next(CHANNEL_CONTROL, &frame)
+            .map_err(|error| error.to_string())?;
+        match decode_server_control(&plaintext)? {
+            ServerControl::Authenticated { .. } => return Ok(()),
+            ServerControl::Error { message, .. } => return Err(message),
+            _ => {}
+        }
+    }
+}
+
+fn write_blocking_control(
+    stream: &mut StdTcpStream,
+    control: &mut ControlTransport,
+    message: ClientControl,
+) -> Result<(), String> {
+    let payload = encode_client_control(&message)?;
+    let encrypted = control
+        .seal_next(CHANNEL_CONTROL, &payload)
+        .map_err(|error| error.to_string())?;
+    let mut framed = Vec::new();
+    frame::encode_frame(&encrypted, &mut framed).map_err(|error| error.to_string())?;
+    stream
+        .write_all(&framed)
+        .map_err(|error| format!("failed to write pairing request: {error}"))
 }
 
 fn resolve_endpoint(endpoint: &str) -> Result<SocketAddr, String> {
