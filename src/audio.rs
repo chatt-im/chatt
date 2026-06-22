@@ -1,11 +1,12 @@
 use std::{
     cell::UnsafeCell,
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     fmt, fs,
     io::{self, BufWriter, Write},
     path::{Path, PathBuf},
     process::Command,
     ptr::NonNull,
+    str::FromStr,
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering},
@@ -101,6 +102,7 @@ impl BufferRequest {
 
 #[derive(Clone, Debug)]
 pub struct DeviceInfo {
+    pub id: Option<String>,
     pub name: String,
     pub supported: bool,
     pub preview: Option<StreamPreview>,
@@ -938,23 +940,21 @@ fn input_devices_inner(buffer_request: BufferRequest) -> Result<Vec<DeviceInfo>,
         .map_err(|error| format!("failed to list input devices: {error}"))?;
 
     let mut infos = Vec::new();
+    let mut seen_ids = HashSet::new();
     for device in devices {
-        let name = device.to_string();
-        match select_input_config(&device, buffer_request) {
-            Ok(selection) => infos.push(DeviceInfo {
-                name,
-                supported: true,
-                preview: Some(selection.preview),
-                issue: None,
-            }),
-            Err(error) => infos.push(DeviceInfo {
-                name,
-                supported: false,
-                preview: None,
-                issue: Some(error),
-            }),
+        let info = input_device_info(&device, None, buffer_request);
+        if let Some(id) = &info.id {
+            seen_ids.insert(id.clone());
         }
+        infos.push(info);
     }
+    append_alsa_physical_devices(
+        &host,
+        AudioDeviceDirection::Input,
+        buffer_request,
+        &mut seen_ids,
+        &mut infos,
+    );
 
     Ok(infos)
 }
@@ -966,25 +966,306 @@ fn output_devices_inner(buffer_request: BufferRequest) -> Result<Vec<DeviceInfo>
         .map_err(|error| format!("failed to list output devices: {error}"))?;
 
     let mut infos = Vec::new();
+    let mut seen_ids = HashSet::new();
     for device in devices {
-        let name = device.to_string();
-        match select_output_config(&device, buffer_request) {
-            Ok(selection) => infos.push(DeviceInfo {
-                name,
-                supported: true,
-                preview: Some(selection.preview),
-                issue: None,
-            }),
-            Err(error) => infos.push(DeviceInfo {
-                name,
-                supported: false,
-                preview: None,
-                issue: Some(error),
-            }),
+        let info = output_device_info(&device, None, buffer_request);
+        if let Some(id) = &info.id {
+            seen_ids.insert(id.clone());
+        }
+        infos.push(info);
+    }
+    append_alsa_physical_devices(
+        &host,
+        AudioDeviceDirection::Output,
+        buffer_request,
+        &mut seen_ids,
+        &mut infos,
+    );
+
+    Ok(infos)
+}
+
+fn input_device_info(
+    device: &cpal::Device,
+    name_override: Option<String>,
+    buffer_request: BufferRequest,
+) -> DeviceInfo {
+    let id = cpal_device_id(device);
+    let name = name_override.unwrap_or_else(|| device.to_string());
+    match select_input_config(device, buffer_request) {
+        Ok(selection) => DeviceInfo {
+            id,
+            name,
+            supported: true,
+            preview: Some(selection.preview),
+            issue: None,
+        },
+        Err(error) => DeviceInfo {
+            id,
+            name,
+            supported: false,
+            preview: None,
+            issue: Some(error),
+        },
+    }
+}
+
+fn output_device_info(
+    device: &cpal::Device,
+    name_override: Option<String>,
+    buffer_request: BufferRequest,
+) -> DeviceInfo {
+    let id = cpal_device_id(device);
+    let name = name_override.unwrap_or_else(|| device.to_string());
+    match select_output_config(device, buffer_request) {
+        Ok(selection) => DeviceInfo {
+            id,
+            name,
+            supported: true,
+            preview: Some(selection.preview),
+            issue: None,
+        },
+        Err(error) => DeviceInfo {
+            id,
+            name,
+            supported: false,
+            preview: None,
+            issue: Some(error),
+        },
+    }
+}
+
+fn cpal_device_id(device: &cpal::Device) -> Option<String> {
+    device.id().ok().map(|id| id.to_string())
+}
+
+fn cpal_device_matches_config_id(device: &cpal::Device, configured_id: &str) -> bool {
+    if let Some(device_id) = cpal_device_id(device) {
+        if device_id == configured_id {
+            return true;
+        }
+        if let Some(alsa_pcm_id) = device_id.strip_prefix("alsa:")
+            && alsa_pcm_id == configured_id
+        {
+            return true;
         }
     }
 
-    Ok(infos)
+    let Some(parsed_id) = parse_configured_device_id(configured_id) else {
+        return false;
+    };
+    device.id().is_ok_and(|device_id| device_id == parsed_id)
+}
+
+fn cpal_device_from_config_id(host: &cpal::Host, configured_id: &str) -> Option<cpal::Device> {
+    let id = parse_configured_device_id(configured_id)?;
+    host.device_by_id(&id)
+        .or_else(|| cpal::host_from_id(id.host()).ok()?.device_by_id(&id))
+}
+
+fn parse_configured_device_id(configured_id: &str) -> Option<cpal::DeviceId> {
+    let configured_id = configured_id.trim();
+    if configured_id.is_empty() {
+        return None;
+    }
+    if let Some(alsa_pcm) = configured_id.strip_prefix("alsa/")
+        && let Some(id) = forced_alsa_device_id_from_pcm_name(alsa_pcm)
+    {
+        return Some(id);
+    }
+    if let Ok(id) = cpal::DeviceId::from_str(configured_id) {
+        return Some(id);
+    }
+    alsa_device_id_from_pcm_name(configured_id)
+}
+
+#[cfg(any(
+    target_os = "linux",
+    target_os = "dragonfly",
+    target_os = "freebsd",
+    target_os = "netbsd"
+))]
+fn forced_alsa_device_id_from_pcm_name(pcm_name: &str) -> Option<cpal::DeviceId> {
+    (!pcm_name.is_empty()).then(|| cpal::DeviceId::new(cpal::HostId::Alsa, pcm_name))
+}
+
+#[cfg(not(any(
+    target_os = "linux",
+    target_os = "dragonfly",
+    target_os = "freebsd",
+    target_os = "netbsd"
+)))]
+fn forced_alsa_device_id_from_pcm_name(_pcm_name: &str) -> Option<cpal::DeviceId> {
+    None
+}
+
+#[cfg(any(
+    target_os = "linux",
+    target_os = "dragonfly",
+    target_os = "freebsd",
+    target_os = "netbsd"
+))]
+fn alsa_device_id_from_pcm_name(pcm_name: &str) -> Option<cpal::DeviceId> {
+    looks_like_alsa_pcm_name(pcm_name).then(|| cpal::DeviceId::new(cpal::HostId::Alsa, pcm_name))
+}
+
+#[cfg(not(any(
+    target_os = "linux",
+    target_os = "dragonfly",
+    target_os = "freebsd",
+    target_os = "netbsd"
+)))]
+fn alsa_device_id_from_pcm_name(_pcm_name: &str) -> Option<cpal::DeviceId> {
+    None
+}
+
+fn looks_like_alsa_pcm_name(value: &str) -> bool {
+    if value.is_empty() || value.chars().any(char::is_whitespace) {
+        return false;
+    }
+    let head = value
+        .split([':', ','])
+        .next()
+        .unwrap_or(value)
+        .to_ascii_lowercase();
+
+    matches!(
+        head.as_str(),
+        "default"
+            | "sysdefault"
+            | "hw"
+            | "plughw"
+            | "plug"
+            | "front"
+            | "center_lfe"
+            | "side"
+            | "iec958"
+            | "spdif"
+            | "dmix"
+            | "dsnoop"
+            | "pulse"
+            | "pipewire"
+            | "jack"
+            | "oss"
+            | "null"
+            | "usbstream"
+    ) || head.starts_with("surround")
+        || head.starts_with("hdmi")
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AudioDeviceDirection {
+    Input,
+    Output,
+}
+
+#[cfg(any(
+    target_os = "linux",
+    target_os = "dragonfly",
+    target_os = "freebsd",
+    target_os = "netbsd"
+))]
+fn append_alsa_physical_devices(
+    host: &cpal::Host,
+    direction: AudioDeviceDirection,
+    buffer_request: BufferRequest,
+    seen_ids: &mut HashSet<String>,
+    infos: &mut Vec<DeviceInfo>,
+) {
+    for pcm in alsa_physical_pcm_devices(direction) {
+        for prefix in ["plughw", "hw"] {
+            let pcm_id = format!("{prefix}:CARD={},DEV={}", pcm.card, pcm.device);
+            let id = format!("alsa:{pcm_id}");
+            if !seen_ids.insert(id.clone()) {
+                continue;
+            }
+            let Some(device) = cpal_device_from_config_id(host, &id) else {
+                continue;
+            };
+            let name = format!("{} ({pcm_id})", pcm.name);
+            let info = match direction {
+                AudioDeviceDirection::Input => {
+                    input_device_info(&device, Some(name), buffer_request)
+                }
+                AudioDeviceDirection::Output => {
+                    output_device_info(&device, Some(name), buffer_request)
+                }
+            };
+            infos.push(info);
+        }
+    }
+}
+
+#[cfg(not(any(
+    target_os = "linux",
+    target_os = "dragonfly",
+    target_os = "freebsd",
+    target_os = "netbsd"
+)))]
+fn append_alsa_physical_devices(
+    _host: &cpal::Host,
+    _direction: AudioDeviceDirection,
+    _buffer_request: BufferRequest,
+    _seen_ids: &mut HashSet<String>,
+    _infos: &mut Vec<DeviceInfo>,
+) {
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct AlsaPhysicalPcm {
+    card: u32,
+    device: u32,
+    name: String,
+}
+
+#[cfg(any(
+    target_os = "linux",
+    target_os = "dragonfly",
+    target_os = "freebsd",
+    target_os = "netbsd"
+))]
+fn alsa_physical_pcm_devices(direction: AudioDeviceDirection) -> Vec<AlsaPhysicalPcm> {
+    fs::read_to_string("/proc/asound/pcm")
+        .map(|content| parse_alsa_physical_pcm_devices(&content, direction))
+        .unwrap_or_default()
+}
+
+fn parse_alsa_physical_pcm_devices(
+    content: &str,
+    direction: AudioDeviceDirection,
+) -> Vec<AlsaPhysicalPcm> {
+    let mut devices = Vec::new();
+    for line in content.lines() {
+        let Some((address, rest)) = line.split_once(':') else {
+            continue;
+        };
+        let Some((card, device)) = parse_alsa_pcm_address(address.trim()) else {
+            continue;
+        };
+        let fields: Vec<&str> = rest.split(':').map(str::trim).collect();
+        let supports_direction = match direction {
+            AudioDeviceDirection::Input => fields.iter().any(|field| field.starts_with("capture")),
+            AudioDeviceDirection::Output => {
+                fields.iter().any(|field| field.starts_with("playback"))
+            }
+        };
+        if !supports_direction {
+            continue;
+        }
+        let name = fields
+            .iter()
+            .find(|field| !field.is_empty())
+            .copied()
+            .unwrap_or("ALSA PCM")
+            .to_string();
+        devices.push(AlsaPhysicalPcm { card, device, name });
+    }
+    devices
+}
+
+fn parse_alsa_pcm_address(address: &str) -> Option<(u32, u32)> {
+    let (card, device) = address.split_once('-')?;
+    Some((card.parse().ok()?, device.parse().ok()?))
 }
 
 pub fn start_recording(config: RecordingConfig) -> Result<Recording, String> {
@@ -1141,7 +1422,7 @@ fn select_input_device_by_id(
     let mut first_error = None;
     for device in devices {
         let name = device.to_string();
-        if stable_input_device_id(&name) != id {
+        if !cpal_device_matches_config_id(&device, id) && stable_input_device_id(&name) != id {
             continue;
         }
         matched = true;
@@ -1157,6 +1438,10 @@ fn select_input_device_by_id(
             "selected input device `{id}` is present but unsupported: {}",
             first_error.unwrap_or_else(|| "no supported 48 kHz input config".to_string())
         ))
+    } else if let Some(device) = cpal_device_from_config_id(host, id) {
+        select_input_config(&device, buffer_request)
+            .map(|selection| (device, selection))
+            .map_err(|error| format!("configured input device `{id}` could not be opened: {error}"))
     } else {
         Err(format!("selected input device `{id}` is unavailable"))
     }
@@ -1592,7 +1877,7 @@ fn select_output_device_by_id(
     let mut first_error = None;
     for device in devices {
         let name = device.to_string();
-        if stable_output_device_id(&name) != id {
+        if !cpal_device_matches_config_id(&device, id) && stable_output_device_id(&name) != id {
             continue;
         }
         matched = true;
@@ -1608,6 +1893,12 @@ fn select_output_device_by_id(
             "selected output device `{id}` is present but unsupported: {}",
             first_error.unwrap_or_else(|| "no supported 48 kHz output config".to_string())
         ))
+    } else if let Some(device) = cpal_device_from_config_id(host, id) {
+        select_output_config(&device, buffer_request)
+            .map(|selection| (device, selection))
+            .map_err(|error| {
+                format!("configured output device `{id}` could not be opened: {error}")
+            })
     } else {
         Err(format!("selected output device `{id}` is unavailable"))
     }
@@ -6638,6 +6929,68 @@ impl FrameAccumulator {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_proc_asound_pcm_for_requested_direction() {
+        let content = "\
+00-03: HDMI 0 : HDMI 0 : playback 1
+01-00: USB Audio : USB Audio : playback 1 : capture 1
+02-00: ALC897 Analog : ALC897 Analog : capture 1
+";
+
+        assert_eq!(
+            parse_alsa_physical_pcm_devices(content, AudioDeviceDirection::Output),
+            vec![
+                AlsaPhysicalPcm {
+                    card: 0,
+                    device: 3,
+                    name: "HDMI 0".to_string(),
+                },
+                AlsaPhysicalPcm {
+                    card: 1,
+                    device: 0,
+                    name: "USB Audio".to_string(),
+                },
+            ]
+        );
+        assert_eq!(
+            parse_alsa_physical_pcm_devices(content, AudioDeviceDirection::Input),
+            vec![
+                AlsaPhysicalPcm {
+                    card: 1,
+                    device: 0,
+                    name: "USB Audio".to_string(),
+                },
+                AlsaPhysicalPcm {
+                    card: 2,
+                    device: 0,
+                    name: "ALC897 Analog".to_string(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn recognizes_bare_alsa_pcm_names() {
+        assert!(looks_like_alsa_pcm_name("surround2"));
+        assert!(looks_like_alsa_pcm_name("hw:0,0"));
+        assert!(looks_like_alsa_pcm_name("plughw:CARD=PCH,DEV=0"));
+        assert_eq!(
+            parse_configured_device_id("alsa/hw:0,0")
+                .map(|id| id.to_string())
+                .as_deref(),
+            Some("alsa:hw:0,0")
+        );
+        assert_eq!(
+            parse_configured_device_id("alsa/my_custom_pcm")
+                .map(|id| id.to_string())
+                .as_deref(),
+            Some("alsa:my_custom_pcm")
+        );
+        assert_eq!(parse_configured_device_id("my_custom_pcm"), None);
+        assert!(!looks_like_alsa_pcm_name("usb microphone"));
+        assert!(!looks_like_alsa_pcm_name(""));
+    }
 
     #[test]
     fn downmixes_interleaved_samples_to_mono_i16_scale() {
