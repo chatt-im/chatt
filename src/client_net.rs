@@ -1193,18 +1193,24 @@ impl WorkerState {
                 )) => {
                     kvlog::info!(
                         "voice packet received",
+                        route = "server",
                         stream_id = stream_id.0,
-                        sequence,
-                        payload_size = opus.len()
-                    );
-                    self.dispatch_voice_packet(RemoteVoicePacket {
-                        stream_id: stream_id.0,
                         sequence,
                         flags,
                         silence_ranges,
-                        payload: opus,
-                        received_at: now,
-                    });
+                        payload_size = opus.len()
+                    );
+                    self.dispatch_voice_packet(
+                        RemoteVoicePacket {
+                            stream_id: stream_id.0,
+                            sequence,
+                            flags,
+                            silence_ranges,
+                            payload: opus,
+                            received_at: now,
+                        },
+                        "server",
+                    );
                 }
                 Ok((_, MediaPayload::Pong { .. })) => {}
                 Ok((
@@ -1254,17 +1260,30 @@ impl WorkerState {
         }
     }
 
-    fn dispatch_voice_packet(&mut self, packet: RemoteVoicePacket) {
+    fn dispatch_voice_packet(&mut self, packet: RemoteVoicePacket, route: &'static str) {
         let stream_id = packet.stream_id;
         let sequence = packet.sequence;
+        let flags = packet.flags;
+        let silence_ranges = packet.silence_ranges;
+        let payload_size = packet.payload.len();
         match self.voice_dedup.observe(stream_id, sequence) {
-            RecentVoiceSequenceResult::New => {}
+            RecentVoiceSequenceResult::New => {
+                kvlog::info!(
+                    "voice packet accepted",
+                    route,
+                    stream_id,
+                    sequence,
+                    flags,
+                    silence_ranges,
+                    payload_size
+                );
+            }
             RecentVoiceSequenceResult::Duplicate => {
-                kvlog::info!("duplicate voice packet dropped", stream_id, sequence);
+                kvlog::info!("duplicate voice packet dropped", route, stream_id, sequence);
                 return;
             }
             RecentVoiceSequenceResult::Stale => {
-                kvlog::info!("stale voice packet dropped", stream_id, sequence);
+                kvlog::info!("stale voice packet dropped", route, stream_id, sequence);
                 return;
             }
         }
@@ -1367,6 +1386,7 @@ impl WorkerState {
             stream_id = stream_id.0,
             sequence,
             flags = frame.flags,
+            silence_ranges = frame.silence_ranges,
             payload_size = frame.payload.len()
         );
         let relay_payload = MediaPayload::Voice {
@@ -2309,15 +2329,27 @@ impl WorkerState {
                 if let Some(action) = action {
                     self.apply_p2p_actions(session_id, vec![action]);
                 }
-                self.p2p_stream_owners.insert(stream_id, session_id);
-                self.dispatch_voice_packet(RemoteVoicePacket {
-                    stream_id: stream_id.0,
+                kvlog::info!(
+                    "voice packet received",
+                    route = "p2p",
+                    stream_id = stream_id.0,
                     sequence,
                     flags,
                     silence_ranges,
-                    payload: opus,
-                    received_at: now,
-                });
+                    payload_size = opus.len()
+                );
+                self.p2p_stream_owners.insert(stream_id, session_id);
+                self.dispatch_voice_packet(
+                    RemoteVoicePacket {
+                        stream_id: stream_id.0,
+                        sequence,
+                        flags,
+                        silence_ranges,
+                        payload: opus,
+                        received_at: now,
+                    },
+                    "p2p",
+                );
             }
             Ok(P2pMediaPacket::Feedback {
                 stream_id,
