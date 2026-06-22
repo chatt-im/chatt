@@ -127,6 +127,23 @@ impl BufferRequest {
             BufferRequest::Fixed(_) => "fixed",
         }
     }
+
+    /// Aligns a host-default capture period to the Opus encode frame.
+    ///
+    /// The host-default input period (commonly 1024 frames) does not divide the
+    /// [`LIVE_OPUS_FRAME_SAMPLES`] (960) encode frame, so the surplus accumulates
+    /// and the encoder emits a back-to-back frame pair every ~16 callbacks. That
+    /// pacing burst reaches the receiver as a one-packet-period jitter spike,
+    /// inflating its playout target. Substituting a frame-aligned period keeps
+    /// the encoder at one frame per callback. An explicit [`BufferRequest::Fixed`]
+    /// passes through unchanged, the configured sizes (240/480/960) already divide
+    /// the frame.
+    pub fn aligned_for_opus_capture(self) -> BufferRequest {
+        match self {
+            BufferRequest::Default => BufferRequest::Fixed(LIVE_OPUS_FRAME_SAMPLES as u32),
+            BufferRequest::Fixed(frames) => BufferRequest::Fixed(frames),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1032,6 +1049,21 @@ mod tests {
     use crate::audio::capture::pack_current_opus_silence_ranges;
     #[allow(unused_imports)]
     use crate::audio::test_support::*;
+
+    #[test]
+    fn aligns_host_default_capture_to_opus_frame() {
+        assert_eq!(
+            BufferRequest::Default.aligned_for_opus_capture(),
+            BufferRequest::Fixed(LIVE_OPUS_FRAME_SAMPLES as u32)
+        );
+        for request in [
+            BufferRequest::Fixed(240),
+            BufferRequest::Fixed(480),
+            BufferRequest::Fixed(960),
+        ] {
+            assert_eq!(request.aligned_for_opus_capture(), request);
+        }
+    }
 
     #[test]
     fn converts_i16_scale_samples_for_opus_pcm_input() {

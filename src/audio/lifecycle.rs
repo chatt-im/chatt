@@ -333,15 +333,16 @@ pub fn start_live_capture<F>(config: LiveCaptureConfig, on_packet: F) -> Result<
 where
     F: FnMut(LocalVoiceFrame) + Send + 'static,
 {
+    let buffer_request = config.buffer_request.aligned_for_opus_capture();
     let (device, selection) = with_audio_backend_stderr_suppressed(|| {
         let host = cpal::default_host();
         if let Some(id) = config.input_device_id.as_deref() {
-            select_input_device_by_id(&host, id, config.buffer_request)
+            select_input_device_by_id(&host, id, buffer_request)
         } else {
             let device = host
                 .default_input_device()
                 .ok_or_else(|| "no default input device found".to_string())?;
-            let selection = select_input_config(&device, config.buffer_request)?;
+            let selection = select_input_config(&device, buffer_request)?;
             Ok::<_, String>((device, selection))
         }
     })?;
