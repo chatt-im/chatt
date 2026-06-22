@@ -1,5 +1,3 @@
-#[allow(dead_code)]
-mod audio;
 mod bindings;
 mod chat_buffer;
 #[allow(dead_code)]
@@ -7,10 +5,6 @@ mod client_net;
 mod config;
 mod fuzzy;
 mod local_control;
-#[cfg_attr(not(test), allow(dead_code))]
-mod network;
-#[allow(dead_code)]
-mod packet_log;
 mod settings;
 mod theme;
 mod ui;
@@ -27,15 +21,15 @@ use std::{
     time::{Duration, Instant},
 };
 
-use audio::{
-    BufferRequest, DeviceInfo, EchoCancellationControl, LiveAudioFilePlaybackTestConfig,
+use bindings::{BindCommand, PendingChord, Resolved};
+use chat_buffer::VirtualChatBuffer;
+use chatt::audio::{
+    self, BufferRequest, DeviceInfo, EchoCancellationControl, LiveAudioFilePlaybackTestConfig,
     LiveAudioFilePlaybackTestReport, LiveAudioFileSourceConfig, LiveAudioFileSourceReport,
     LiveAudioPacketLossProfile, LiveCapture, LiveCaptureConfig, LiveEncoderProfile, LivePlayback,
     LivePlaybackConfig, LivePlaybackFeedback, LivePlaybackSink, PlaybackStreamControl,
     StatsSnapshot,
 };
-use bindings::{BindCommand, PendingChord, Resolved};
-use chat_buffer::VirtualChatBuffer;
 use client_net::{NetworkClient, NetworkCommand, NetworkEvent, spawn_pair_once};
 use config::{
     Config, MAX_USER_VOLUME_DB, MIN_USER_VOLUME_DB, ServerEntry, SoundboardClip,
