@@ -81,6 +81,23 @@ Run the client:
 cargo run -p chatt -- --config chatt.toml
 ```
 
+### Optimized build (x86-64-v3)
+
+`cargo run --release` produces a portable binary: baseline x86-64 codegen with
+Opus's own runtime AVX2 dispatch, so it runs on any x86-64 CPU. For lower CPU
+use on modern hardware, build with the `v3` alias:
+
+```sh
+cargo v3                 # builds target/release-v3/chatt
+./target/release-v3/chatt --config chatt.toml
+```
+
+It compiles the Rust audio code for `x86-64-v3` (AVX2 + FMA) and enables the
+`avx2` feature, which presumes AVX2 in the bundled Opus build and drops its
+per-call CPU dispatch. The result needs an Intel Haswell / AMD Excavator or
+newer CPU (2013+) and measures roughly 20% fewer cycles on the live call audio
+pipeline. The portable `release` build is unaffected.
+
 Capture client diagnostics while running:
 
 ```sh

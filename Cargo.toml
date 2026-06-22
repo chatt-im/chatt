@@ -27,10 +27,16 @@ toml-spanner = { version = "1.0.3", features = [
 ] }
 earshot = "1.1.0"
 sonora = "0.1.0"
+foldhash = "0.2.0"
 
 [features]
 default = []
 pipewire = ["cpal/pipewire"]
+# Presume AVX2/FMA in the bundled Opus build, removing its runtime CPU dispatch.
+# Only sound on x86-64 CPUs that actually have AVX2. Pair it with
+# `-C target-cpu=x86-64-v3`; the `cargo v3` alias in `.cargo/config.toml` does
+# both. The default build leaves this off and stays portable.
+avx2 = ["opus-codec/presume-avx2"]
 
 [workspace]
 members = [
@@ -49,3 +55,11 @@ opt-level = 1
 
 [profile.dev.package."*"]
 opt-level = 2
+
+# Opt-in CPU-targeted release. Same codegen as `release`, but a separate profile
+# so its artifacts land in `target/release-v3/` and never clobber the portable
+# `release` build (the two need different Opus C objects). The `cargo v3` alias
+# in `.cargo/config.toml` selects this profile, the `avx2` feature, and
+# `-C target-cpu=x86-64-v3` together.
+[profile.release-v3]
+inherits = "release"

@@ -9,3 +9,9 @@ nnnoiseless = { version = "0.5.2", default-features = false }
 opus-codec = { path = "../opus-codec", features = ["dred"] }
 sonora = "0.1.0"
 chatt = { path = "../.." }
+
+[features]
+default = []
+# Mirrors chatt's `avx2` feature so the optimized build can be profiled
+# end to end. Enable alongside `-C target-cpu=x86-64-v3`.
+avx2 = ["opus-codec/presume-avx2", "chatt/avx2"]

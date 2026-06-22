@@ -4580,8 +4580,44 @@ impl LivePlaybackMixer {
     }
 }
 
+/// Sample-count constants derived from a [`LiveAudioTuning`]. Each value is the
+/// rounded sample count for a tuning duration. They are computed once at stream
+/// construction so the per-sample playback path never repeats the float
+/// `samples_for_duration` rounding.
+#[derive(Clone, Copy)]
+struct TuningSampleCounts {
+    target_queue: usize,
+    catch_up_start_excess: usize,
+    hard_queue_bound: usize,
+    dred_horizon: usize,
+    moderate_loss_queue: usize,
+    silence_min_gap: usize,
+    silence_guard: usize,
+    silence_max_skip: usize,
+    silence_min_skip: usize,
+    silence_ramp: usize,
+}
+
+impl TuningSampleCounts {
+    fn from_tuning(tuning: &LiveAudioTuning) -> Self {
+        Self {
+            target_queue: samples_for_duration(tuning.target_queue),
+            catch_up_start_excess: samples_for_duration(tuning.catch_up_start_excess),
+            hard_queue_bound: samples_for_duration(tuning.hard_queue_bound),
+            dred_horizon: samples_for_duration(tuning.dred_horizon),
+            moderate_loss_queue: samples_for_duration(tuning.moderate_loss_queue),
+            silence_min_gap: samples_for_duration(tuning.silence_min_gap),
+            silence_guard: samples_for_duration(tuning.silence_guard),
+            silence_max_skip: samples_for_duration(tuning.silence_max_skip),
+            silence_min_skip: samples_for_duration(tuning.silence_min_skip),
+            silence_ramp: samples_for_duration(tuning.silence_ramp),
+        }
+    }
+}
+
 struct AdaptivePlaybackStream {
     tuning: LiveAudioTuning,
+    samples: TuningSampleCounts,
     input: MonoSampleQueue,
     read_pos: f64,
     phase_increment: f64,
@@ -4598,15 +4634,17 @@ struct AdaptivePlaybackStream {
 
 impl AdaptivePlaybackStream {
     fn new(tuning: LiveAudioTuning) -> Result<Self, String> {
+        let samples = TuningSampleCounts::from_tuning(&tuning);
         Ok(Self {
             tuning,
+            samples,
             input: MonoSampleQueue::new(),
             read_pos: 1.0,
             phase_increment: 1.0,
             smoothed_correction: 0.0,
             current_correction_percent: 0.0,
             recent_loss_events: VecDeque::new(),
-            expanded_target_samples: target_queue_samples(tuning),
+            expanded_target_samples: samples.target_queue,
             expanded_target_until: None,
             output_priming: true,
             output_block_remaining: 0,
@@ -4628,8 +4666,7 @@ impl AdaptivePlaybackStream {
         }
         let mut samples = samples.to_vec();
         self.declick_recovery_boundary(&mut samples, source);
-        self.input
-            .push_back_with_source(&samples, source, silence_hint);
+        self.input.push_back_owned(samples, source, silence_hint);
         self.enforce_hard_bound(now, stats);
     }
 
@@ -4672,7 +4709,9 @@ impl AdaptivePlaybackStream {
         // Read at `read_pos` with a 4-tap Catmull-Rom kernel. `read_pos` is held
         // in [1.0, 2.0): index `base` is the current sample, `base - 1` is the
         // retained left-neighbour history, `base + 1`/`base + 2` are look-ahead.
-        let base = self.read_pos.floor() as usize;
+        // `read_pos >= 1.0`, so the truncating `as usize` cast equals `floor`
+        // and avoids a libm `floor` call on the per-sample path.
+        let base = self.read_pos as usize;
         if self.input.frames() < base + 3 {
             stats.underrun_count = stats.underrun_count.saturating_add(1);
             return None;
@@ -4696,7 +4735,7 @@ impl AdaptivePlaybackStream {
         };
 
         self.read_pos += self.phase_increment;
-        let consumed = self.read_pos.floor() as usize - 1;
+        let consumed = self.read_pos as usize - 1;
         self.input.drain_samples(consumed);
         self.read_pos -= consumed as f64;
         Some(sample)
@@ -4789,18 +4828,20 @@ impl AdaptivePlaybackStream {
             return 0.0;
         }
         let queued = self.queued_samples();
-        let target = target_queue_samples(self.tuning).max(self.output_target_floor_samples);
+        let target = self
+            .samples
+            .target_queue
+            .max(self.output_target_floor_samples);
         if queued < target {
             return 0.0;
         }
 
-        let catchup_start =
-            target.saturating_add(samples_for_duration(self.tuning.catch_up_start_excess));
+        let catchup_start = target.saturating_add(self.samples.catch_up_start_excess);
         if queued <= catchup_start {
             return 0.0;
         }
 
-        let hard_bound = samples_for_duration(self.tuning.hard_queue_bound);
+        let hard_bound = self.samples.hard_queue_bound;
         let range = hard_bound.saturating_sub(catchup_start).max(1) as f64;
         let over = queued.saturating_sub(catchup_start) as f64;
         (self.tuning.max_speed_up * (over / range)).min(self.tuning.max_speed_up)
@@ -4820,10 +4861,10 @@ impl AdaptivePlaybackStream {
         // Never drain inside the active interpolation window [0, base + 2]; the
         // silence guard keeps the found run far past it, but make it explicit.
         let window_end = self.read_pos.ceil() as usize + 2;
-        match self.input.find_silence_skip(self.tuning, excess) {
+        match self.input.find_silence_skip(&self.samples, excess) {
             Some((skip_start, skip_len)) if skip_start > window_end => {
                 self.input
-                    .ramp_around_skip(self.tuning, skip_start, skip_len);
+                    .ramp_around_skip(&self.samples, skip_start, skip_len);
                 self.input.drain_range(skip_start, skip_len);
                 stats.silence_skip_count = stats.silence_skip_count.saturating_add(1);
                 stats.skipped_silence_samples = stats
@@ -4847,7 +4888,7 @@ impl AdaptivePlaybackStream {
             return;
         }
         if self.expanded_target_until.is_none_or(|until| now >= until) {
-            self.expanded_target_samples = target_queue_samples(self.tuning);
+            self.expanded_target_samples = self.samples.target_queue;
         }
         while self
             .recent_loss_events
@@ -4859,15 +4900,9 @@ impl AdaptivePlaybackStream {
         self.recent_loss_events.push_back(now);
 
         let (target, hold) = if self.recent_loss_events.len() >= 8 {
-            (
-                samples_for_duration(self.tuning.dred_horizon),
-                self.tuning.severe_loss_hold,
-            )
+            (self.samples.dred_horizon, self.tuning.severe_loss_hold)
         } else {
-            (
-                samples_for_duration(self.tuning.moderate_loss_queue),
-                self.tuning.loss_hold,
-            )
+            (self.samples.moderate_loss_queue, self.tuning.loss_hold)
         };
         self.expanded_target_samples = self.expanded_target_samples.max(target);
         self.expanded_target_until = Some(now + hold);
@@ -4875,19 +4910,20 @@ impl AdaptivePlaybackStream {
 
     fn adaptive_target_samples(&self, now: Instant) -> usize {
         if self.expanded_target_until.is_some_and(|until| now < until) {
-            self.expanded_target_samples
-                .max(target_queue_samples(self.tuning))
+            self.expanded_target_samples.max(self.samples.target_queue)
         } else {
-            target_queue_samples(self.tuning)
+            self.samples.target_queue
         }
     }
 
     fn low_latency_target_samples(&self) -> usize {
-        target_queue_samples(self.tuning).max(self.output_target_floor_samples)
+        self.samples
+            .target_queue
+            .max(self.output_target_floor_samples)
     }
 
     fn enforce_hard_bound(&mut self, now: Instant, stats: &mut LivePlaybackMixerStats) {
-        let hard_bound = samples_for_duration(self.tuning.hard_queue_bound);
+        let hard_bound = self.samples.hard_queue_bound;
         let queued = self.queued_samples();
         if queued <= hard_bound {
             return;
@@ -4895,7 +4931,7 @@ impl AdaptivePlaybackStream {
 
         let trim_to = self
             .adaptive_target_samples(now)
-            .max(samples_for_duration(self.tuning.dred_horizon));
+            .max(self.samples.dred_horizon);
         let drop = queued.saturating_sub(trim_to);
         self.drop_oldest(drop);
         stats.hard_trim_count = stats.hard_trim_count.saturating_add(1);
@@ -4922,6 +4958,9 @@ impl AdaptivePlaybackStream {
 #[derive(Default)]
 struct MonoSampleQueue {
     frames: VecDeque<QueuedAudioFrame>,
+    /// Running sum of `remaining_len()` across all queued frames. Kept in sync
+    /// by every mutator so `frames()` is O(1) on the per-sample playback path.
+    total: usize,
 }
 
 struct QueuedAudioFrame {
@@ -4948,16 +4987,31 @@ impl MonoSampleQueue {
         source: DecodedFrameSource,
         silence_hint: bool,
     ) {
+        self.push_back_owned(samples.to_vec(), source, silence_hint);
+    }
+
+    /// Enqueues an owned sample buffer without copying it. Callers that already
+    /// hold a `Vec<f32>` use this to avoid the extra allocation and copy that
+    /// `push_back_with_source` incurs.
+    fn push_back_owned(
+        &mut self,
+        samples: Vec<f32>,
+        source: DecodedFrameSource,
+        silence_hint: bool,
+    ) {
         if samples.is_empty() {
             return;
         }
+        let rms = rms_normalized(&samples);
+        let peak = peak_normalized(&samples);
+        self.total += samples.len();
         self.frames.push_back(QueuedAudioFrame {
-            samples: samples.to_vec(),
+            samples,
             offset: 0,
             source,
             silence_hint,
-            rms: rms_normalized(samples),
-            peak: peak_normalized(samples),
+            rms,
+            peak,
         });
     }
 
@@ -4967,6 +5021,7 @@ impl MonoSampleQueue {
             if frame.offset < frame.samples.len() {
                 let sample = frame.samples[frame.offset];
                 frame.offset += 1;
+                self.total -= 1;
                 if frame.offset >= frame.samples.len() {
                     self.frames.pop_front();
                 }
@@ -4976,26 +5031,48 @@ impl MonoSampleQueue {
         }
     }
 
+    /// Drops `samples` from the front of the queue by advancing each frame's
+    /// read offset, popping frames as they are fully consumed. This is O(frames
+    /// touched) and never shifts sample data, unlike the interior
+    /// [`drain_range`] path.
     fn drain_samples(&mut self, samples: usize) {
-        self.drain_range(0, samples);
+        let mut remaining = samples;
+        while remaining > 0 {
+            let Some(frame) = self.frames.front_mut() else {
+                break;
+            };
+            let available = frame.remaining_len();
+            if remaining < available {
+                frame.offset += remaining;
+                self.total -= remaining;
+                return;
+            }
+            self.total -= available;
+            remaining -= available;
+            self.frames.pop_front();
+        }
     }
 
     fn frames(&self) -> usize {
-        self.frames
-            .iter()
-            .map(QueuedAudioFrame::remaining_len)
-            .sum()
+        debug_assert_eq!(
+            self.total,
+            self.frames
+                .iter()
+                .map(QueuedAudioFrame::remaining_len)
+                .sum::<usize>()
+        );
+        self.total
     }
 
     fn find_silence_skip(
         &self,
-        tuning: LiveAudioTuning,
+        counts: &TuningSampleCounts,
         excess_samples: usize,
     ) -> Option<(usize, usize)> {
-        let min_gap = samples_for_duration(tuning.silence_min_gap);
-        let guard = samples_for_duration(tuning.silence_guard);
-        let max_skip = samples_for_duration(tuning.silence_max_skip);
-        let min_skip = samples_for_duration(tuning.silence_min_skip);
+        let min_gap = counts.silence_min_gap;
+        let guard = counts.silence_guard;
+        let max_skip = counts.silence_max_skip;
+        let min_skip = counts.silence_min_skip;
         let mut cursor = 0usize;
         let mut run_start = 0usize;
         let mut run_len = 0usize;
@@ -5026,9 +5103,15 @@ impl MonoSampleQueue {
         None
     }
 
-    fn ramp_around_skip(&mut self, tuning: LiveAudioTuning, skip_start: usize, skip_len: usize) {
+    fn ramp_around_skip(
+        &mut self,
+        counts: &TuningSampleCounts,
+        skip_start: usize,
+        skip_len: usize,
+    ) {
         let total = self.frames();
-        let fade = samples_for_duration(tuning.silence_ramp)
+        let fade = counts
+            .silence_ramp
             .min(skip_start)
             .min(total.saturating_sub(skip_start.saturating_add(skip_len)));
         if fade == 0 {
@@ -5049,6 +5132,10 @@ impl MonoSampleQueue {
     }
 
     fn drain_range(&mut self, start: usize, mut len: usize) {
+        if start == 0 {
+            self.drain_samples(len);
+            return;
+        }
         while len > 0 {
             let Some((frame_index, local_index, available)) = self.find_frame_at(start) else {
                 break;
@@ -5058,6 +5145,7 @@ impl MonoSampleQueue {
                 let drain_start = frame.offset + local_index;
                 let drain_end = drain_start + remove;
                 frame.samples.drain(drain_start..drain_end);
+                self.total -= remove;
             }
             if self
                 .frames
