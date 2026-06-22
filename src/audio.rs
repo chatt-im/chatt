@@ -100,7 +100,7 @@ const LIVE_PLAYBACK_MAX_REORDER_DELAY: Duration = Duration::from_millis(60);
 // persistent excess beyond that should drain back to target. A larger value
 // reopens a dead zone where a startup overshoot parks above target forever.
 const LIVE_PLAYBACK_CATCH_UP_START_EXCESS: Duration = Duration::from_millis(20);
-const LIVE_PLAYBACK_MAX_SPEED_UP: f64 = 0.15;
+const LIVE_PLAYBACK_MAX_SPEED_UP: f64 = 0.25;
 // One-pole smoothing coefficient for the catch-up correction (tau = 50 ms):
 // alpha = 1 - exp(-1 / (tau * rate)) ~= 1 / (tau * rate).
 const LIVE_PLAYBACK_CORRECTION_ALPHA: f64 = 1.0 / (0.050 * SAMPLE_RATE as f64);
@@ -386,8 +386,8 @@ impl LiveAudioTuning {
         if self.silence_min_gap < self.silence_guard.saturating_mul(2) {
             return Err("silence-min-gap-ms must be at least twice silence-guard-ms".to_string());
         }
-        if !self.max_speed_up.is_finite() || !(0.0..=0.20).contains(&self.max_speed_up) {
-            return Err("max-speed-up must be between 0.0 and 0.2".to_string());
+        if !self.max_speed_up.is_finite() || !(0.0..=0.25).contains(&self.max_speed_up) {
+            return Err("max-speed-up must be between 0.0 and 0.25".to_string());
         }
         Ok(())
     }
@@ -1539,6 +1539,8 @@ where
         device = device_name.as_str(),
         channels = selection.stream_config.channels,
         sample_rate = selection.stream_config.sample_rate,
+        buffer_size = audio_buffer_size_label(selection.preview.buffer_size).as_str(),
+        buffer_note = selection.preview.buffer_note.as_str(),
         bitrate_bps = config.bitrate_bps,
         denoise = config.denoise,
         max_amplification = config.max_amplification,
@@ -1690,7 +1692,9 @@ pub fn start_live_playback(config: LivePlaybackConfig) -> Result<LivePlayback, S
         "live playback selected",
         device = device_name.as_str(),
         channels = selection.stream_config.channels,
-        sample_rate = selection.stream_config.sample_rate
+        sample_rate = selection.stream_config.sample_rate,
+        buffer_size = audio_buffer_size_label(selection.preview.buffer_size).as_str(),
+        buffer_note = selection.preview.buffer_note.as_str()
     );
     let mixer = Arc::new(Mutex::new(LivePlaybackMixer::with_tuning(config.tuning)));
     let stream = with_audio_backend_stderr_suppressed(|| {
@@ -2254,6 +2258,13 @@ fn select_buffer_size(
                 format!("requested {requested}; support unknown"),
             ),
         },
+    }
+}
+
+fn audio_buffer_size_label(buffer_size: BufferSize) -> String {
+    match buffer_size {
+        BufferSize::Default => "default".to_string(),
+        BufferSize::Fixed(frames) => format!("{frames} frames"),
     }
 }
 
@@ -4913,6 +4924,9 @@ struct AdaptivePlaybackStream {
     /// network starvation (which re-widens the target) from an isolated
     /// end-of-talkspurt drain (which does not).
     recent_underruns: VecDeque<Instant>,
+    /// True while the stream is continuously starved; prevents one output
+    /// callback from being counted once per sample.
+    underrun_active: bool,
     output_priming: bool,
     output_block_remaining: usize,
     output_block_playable: bool,
@@ -4936,6 +4950,7 @@ impl AdaptivePlaybackStream {
             recommended_target_samples: samples.target_queue,
             underrun_hold_until: None,
             recent_underruns: VecDeque::new(),
+            underrun_active: false,
             output_priming: true,
             output_block_remaining: 0,
             output_block_playable: false,
@@ -5011,6 +5026,15 @@ impl AdaptivePlaybackStream {
         }
     }
 
+    fn record_underrun(&mut self, now: Instant, stats: &mut LivePlaybackMixerStats) {
+        if self.underrun_active {
+            return;
+        }
+        self.underrun_active = true;
+        stats.underrun_count = stats.underrun_count.saturating_add(1);
+        self.note_underrun(now);
+    }
+
     fn declick_recovery_boundary(&self, samples: &mut [f32], source: DecodedFrameSource) {
         if samples.is_empty() {
             return;
@@ -5054,10 +5078,10 @@ impl AdaptivePlaybackStream {
         // and avoids a libm `floor` call on the per-sample path.
         let base = self.read_pos as usize;
         if self.input.frames() < base + 3 {
-            stats.underrun_count = stats.underrun_count.saturating_add(1);
-            self.note_underrun(now);
+            self.record_underrun(now, stats);
             return None;
         }
+        self.underrun_active = false;
 
         let p1 = self.input.sample_at(base).unwrap_or(0.0);
         let p0 = base
@@ -5098,7 +5122,7 @@ impl AdaptivePlaybackStream {
             if self.output_block_remaining == 0 {
                 self.output_target_floor_samples = 0;
             }
-            stats.underrun_count = stats.underrun_count.saturating_add(1);
+            self.record_underrun(now, stats);
             return None;
         }
 
@@ -5182,8 +5206,12 @@ impl AdaptivePlaybackStream {
             return 0.0;
         }
 
-        let hard_bound = self.samples.hard_queue_bound;
-        let range = hard_bound.saturating_sub(catchup_start).max(1) as f64;
+        let catchup_full_speed = if self.samples.moderate_loss_queue > catchup_start {
+            self.samples.moderate_loss_queue
+        } else {
+            self.samples.hard_queue_bound
+        };
+        let range = catchup_full_speed.saturating_sub(catchup_start).max(1) as f64;
         let over = queued.saturating_sub(catchup_start) as f64;
         (self.tuning.max_speed_up * (over / range)).min(self.tuning.max_speed_up)
     }
@@ -8741,6 +8769,31 @@ mod tests {
     }
 
     #[test]
+    fn adaptive_stream_uses_soft_recovery_range_for_trace_sized_backlog() {
+        let now = Instant::now();
+        let mut stream = AdaptivePlaybackStream::new(test_tuning()).unwrap();
+        stream.input.push_back(
+            &vec![0.0; samples_for_duration(Duration::from_millis(200))],
+            false,
+        );
+
+        let correction = stream.desired_correction(now);
+        assert!(
+            correction > 0.07,
+            "trace-sized backlog should request meaningful catch-up, got {correction}"
+        );
+        assert!(correction < LIVE_PLAYBACK_MAX_SPEED_UP);
+
+        stream.input.push_back(
+            &vec![0.0; samples_for_duration(Duration::from_millis(120))],
+            false,
+        );
+        let correction = stream.desired_correction(now);
+        assert!(correction > 0.14);
+        assert!(correction <= LIVE_PLAYBACK_MAX_SPEED_UP);
+    }
+
+    #[test]
     fn adaptive_stream_does_not_resample_normal_packet_cadence_jitter() {
         let now = Instant::now();
         let mut stream = AdaptivePlaybackStream::new(test_tuning()).unwrap();
@@ -8757,6 +8810,29 @@ mod tests {
         assert_eq!(stream.pop_sample(now, &mut stats), Some(0.25));
         assert_eq!(stats.direct_samples, 1);
         assert_eq!(stats.correction_count, 0);
+    }
+
+    #[test]
+    fn adaptive_stream_counts_one_underrun_per_starvation_episode() {
+        let now = Instant::now();
+        let tuning = test_tuning();
+        let ceiling = target_queue_samples(tuning);
+        let mut stream = AdaptivePlaybackStream::new(tuning).unwrap();
+        let mut stats = LivePlaybackMixerStats::default();
+        let block = samples_for_duration(Duration::from_millis(20));
+
+        stream.apply_recommended_target(tuning.dynamic_target_floor, now);
+        assert!(stream.effective_target_samples() < ceiling);
+
+        for _ in 0..block {
+            assert_eq!(stream.pop_output_sample(now, &mut stats, block), None);
+        }
+
+        assert_eq!(stats.underrun_count, 1);
+        assert!(
+            stream.effective_target_samples() < ceiling,
+            "one hardware callback's empty samples must not look like recurring starvation"
+        );
     }
 
     #[test]
@@ -8853,7 +8929,7 @@ mod tests {
         let input_delta = max_adjacent_delta(&sine);
         let output = drain_catch_up(&mut stream, now);
         let output_delta = max_adjacent_delta(&output);
-        // A 440 Hz sine has a tiny per-sample step; <=15% catch-up only mildly
+        // A 440 Hz sine has a tiny per-sample step; <=25% catch-up only mildly
         // increases it, while any discontinuity would dwarf this bound.
         assert!(
             output_delta <= input_delta * 1.5,
