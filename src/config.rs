@@ -198,7 +198,7 @@ pub struct AudioLatencyConfig {
     pub initial_buffer_ms: u64,
     #[toml(default = 60)]
     pub max_reorder_delay_ms: u64,
-    #[toml(default = 0.15)]
+    #[toml(default = 0.25)]
     pub max_speed_up: f64,
     #[toml(default = 20)]
     pub catch_up_start_excess_ms: u64,
@@ -1493,6 +1493,17 @@ input-device-index = 20
 
         assert!(error.contains("audio latency"));
         assert!(error.contains("hard-queue-bound-ms"));
+    }
+
+    #[test]
+    fn audio_latency_max_speed_up_accepts_1_25x_cap() {
+        let mut tuning = LiveAudioTuning::default();
+        tuning.max_speed_up = 0.25;
+        assert!(tuning.validate().is_ok());
+
+        tuning.max_speed_up = 0.251;
+        let error = tuning.validate().unwrap_err();
+        assert!(error.contains("max-speed-up"));
     }
 
     #[test]
