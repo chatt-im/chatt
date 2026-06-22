@@ -45,6 +45,7 @@ exclude = ["crates/cpal"]
 
 [profile.dev]
 debug = 0
+opt-level = 1
 
 [profile.dev.package."*"]
 opt-level = 2

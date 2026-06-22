@@ -26,21 +26,39 @@ const RNNOISE_FRAME_LIMIT: usize = 512;
 const DRED_MAX_SAMPLES: usize = SAMPLE_RATE;
 const LIVE_SIM_DURATION: std::time::Duration = std::time::Duration::from_secs(2);
 const BENCH_PARAMS: BenchParameters = BenchParameters {
-    sample_target_duration_ns: 5_000_000,
-    max_sample_iterations: 1_000_000,
-    min_sample_iterations: 4,
-    max_samples: 160,
-    min_samples: 60,
-    target_duration_ns: 500_000_000,
-};
-const LIVE_BENCH_PARAMS: BenchParameters = BenchParameters {
-    sample_target_duration_ns: 5_000_000,
-    max_sample_iterations: 1_000,
+    sample_target_duration_ns: 2_000_000,
+    max_sample_iterations: 250_000,
     min_sample_iterations: 1,
-    max_samples: 40,
-    min_samples: 8,
+    max_samples: 64,
+    min_samples: 20,
     target_duration_ns: 150_000_000,
 };
+const LIVE_BENCH_PARAMS: BenchParameters = BenchParameters {
+    sample_target_duration_ns: 2_000_000,
+    max_sample_iterations: 1_000,
+    min_sample_iterations: 1,
+    max_samples: 20,
+    min_samples: 4,
+    target_duration_ns: 75_000_000,
+};
+const PROFILE_CODEC_PROFILE: &str = "dred_32k_1000ms_loss20";
+const PROFILE_FEATURE_ALL_ON: &str = "all_on";
+const PROFILE_PLAYBACK_MIXER_FEATURE: &str = "skip_off";
+const PROFILE_CALL_SCENARIO: &str = "lossy_speech";
+const PROFILE_CALL_LOSS: &str = "congested_wifi";
+const PROFILE_GROUP_LOSS: &str = "bursty_wifi";
+const PROFILE_AEC: &str = "on";
+const PROFILE_GROUP_STREAMS: &str = "3";
+const OPUS_ENCODE_PROFILE_ITERATIONS: u64 = 30_000;
+const OPUS_DECODE_PROFILE_ITERATIONS: u64 = 300_000;
+const DRED_PARSE_PROFILE_ITERATIONS: u64 = 800_000;
+const DRED_RECOVER_PROFILE_ITERATIONS: u64 = 800_000;
+const RNNOISE_PROFILE_ITERATIONS: u64 = 100_000;
+const PIPELINE_PROFILE_ITERATIONS: u64 = 15_000;
+const LIVE_CAPTURE_GATE_PROFILE_ITERATIONS: u64 = 160;
+const LIVE_PLAYBACK_MIXER_PROFILE_ITERATIONS: u64 = 150;
+const LIVE_CALL_SIM_PROFILE_ITERATIONS: u64 = 100;
+const LIVE_GROUP_CALL_SIM_PROFILE_ITERATIONS: u64 = 40;
 
 const PROFILES: [CodecProfile; 10] = [
     CodecProfile {
@@ -189,38 +207,50 @@ fn bench_opus(bench: &mut Bench<'_>, corpus: Arc<Corpus>) {
 
     bench
         .named("encode")
-        .param_str("profile", &profile_names, |bench, profile_name| {
-            let profile = profile_by_name(&profile_name);
-            let frames = Arc::clone(&corpus.opus_frames);
-            let cycle_len = frames.len();
-            let mut encoder = OpusRawEncoder::new(profile).unwrap();
-            let mut output = vec![0u8; MAX_OPUS_PACKET_BYTES];
+        .with_profile_iterations(OPUS_ENCODE_PROFILE_ITERATIONS)
+        .param_str_profile_defaults(
+            "profile",
+            &profile_names,
+            [PROFILE_CODEC_PROFILE],
+            |bench, profile_name| {
+                let profile = profile_by_name(&profile_name);
+                let frames = Arc::clone(&corpus.opus_frames);
+                let cycle_len = frames.len();
+                let mut encoder = OpusRawEncoder::new(profile).unwrap();
+                let mut output = vec![0u8; MAX_OPUS_PACKET_BYTES];
 
-            bench.indexed_cyclic(cycle_len, move |index| {
-                let frame = &frames[index as usize % cycle_len];
-                let len = encoder.encode_float(black_box(frame.as_slice()), &mut output);
-                black_box(len);
-                black_box(&output[..len]);
-            });
-        });
+                bench.indexed_cyclic(cycle_len, move |index| {
+                    let frame = &frames[index as usize % cycle_len];
+                    let len = encoder.encode_float(black_box(frame.as_slice()), &mut output);
+                    black_box(len);
+                    black_box(&output[..len]);
+                });
+            },
+        );
 
     bench
         .named("decode")
-        .param_str("profile", &profile_names, |bench, profile_name| {
-            let packets = Arc::clone(&encoded_profile(&corpus, &profile_name).packets);
-            let cycle_len = packets.len();
-            let mut decoder = Decoder::new(SampleRate::Hz48000, Channels::Mono).unwrap();
-            let mut output = vec![0.0f32; OPUS_FRAME_SAMPLES];
+        .with_profile_iterations(OPUS_DECODE_PROFILE_ITERATIONS)
+        .param_str_profile_defaults(
+            "profile",
+            &profile_names,
+            [PROFILE_CODEC_PROFILE],
+            |bench, profile_name| {
+                let packets = Arc::clone(&encoded_profile(&corpus, &profile_name).packets);
+                let cycle_len = packets.len();
+                let mut decoder = Decoder::new(SampleRate::Hz48000, Channels::Mono).unwrap();
+                let mut output = vec![0.0f32; OPUS_FRAME_SAMPLES];
 
-            bench.indexed_cyclic(cycle_len, move |index| {
-                let packet = &packets[index as usize % cycle_len];
-                let decoded = decoder
-                    .decode_float(black_box(packet.as_slice()), &mut output, false)
-                    .unwrap();
-                black_box(decoded);
-                black_box(&output[..decoded]);
-            });
-        });
+                bench.indexed_cyclic(cycle_len, move |index| {
+                    let packet = &packets[index as usize % cycle_len];
+                    let decoded = decoder
+                        .decode_float(black_box(packet.as_slice()), &mut output, false)
+                        .unwrap();
+                    black_box(decoded);
+                    black_box(&output[..decoded]);
+                });
+            },
+        );
 }
 
 fn bench_dred(bench: &mut Bench<'_>, corpus: Arc<Corpus>) {
@@ -242,49 +272,16 @@ fn bench_dred(bench: &mut Bench<'_>, corpus: Arc<Corpus>) {
 
     bench
         .named("parse")
-        .param_str("profile", &dred_profile_names, |bench, profile_name| {
-            let packets = Arc::clone(&encoded_profile(&corpus, &profile_name).packets);
-            let cycle_len = packets.len();
-            let mut dred_decoder = DredDecoder::new().unwrap();
-            let mut dred_state = DredState::new().unwrap();
-            let mut dred_end = 0;
-
-            bench.indexed_cyclic(cycle_len, move |index| {
-                let packet = &packets[index as usize % cycle_len];
-                let parsed = dred_decoder
-                    .parse(
-                        &mut dred_state,
-                        black_box(packet.as_slice()),
-                        DRED_MAX_SAMPLES,
-                        SampleRate::Hz48000,
-                        &mut dred_end,
-                        false,
-                    )
-                    .unwrap();
-                black_box(parsed);
-                black_box(dred_end);
-            });
-        });
-
-    bench.named("recover_available").param_str(
-        "profile",
-        &dred_recover_profile_names,
-        |bench, profile_name| {
-            let encoded = encoded_profile(&corpus, &profile_name);
-            let packets = Arc::clone(&encoded.dred_recover_packets);
-            let source_name = encoded
-                .dred_recover_source
-                .map(DredRecoverSource::as_str)
-                .unwrap_or("unknown")
-                .to_owned();
-
-            bench.param_str("source", [source_name], move |bench, _source_name| {
-                let packets = Arc::clone(&packets);
+        .with_profile_iterations(DRED_PARSE_PROFILE_ITERATIONS)
+        .param_str_profile_defaults(
+            "profile",
+            &dred_profile_names,
+            [PROFILE_CODEC_PROFILE],
+            |bench, profile_name| {
+                let packets = Arc::clone(&encoded_profile(&corpus, &profile_name).packets);
                 let cycle_len = packets.len();
-                let mut decoder = Decoder::new(SampleRate::Hz48000, Channels::Mono).unwrap();
                 let mut dred_decoder = DredDecoder::new().unwrap();
                 let mut dred_state = DredState::new().unwrap();
-                let mut output = vec![0.0f32; OPUS_FRAME_SAMPLES];
                 let mut dred_end = 0;
 
                 bench.indexed_cyclic(cycle_len, move |index| {
@@ -292,7 +289,7 @@ fn bench_dred(bench: &mut Bench<'_>, corpus: Arc<Corpus>) {
                     let parsed = dred_decoder
                         .parse(
                             &mut dred_state,
-                            black_box(packet.payload.as_slice()),
+                            black_box(packet.as_slice()),
                             DRED_MAX_SAMPLES,
                             SampleRate::Hz48000,
                             &mut dred_end,
@@ -300,20 +297,63 @@ fn bench_dred(bench: &mut Bench<'_>, corpus: Arc<Corpus>) {
                         )
                         .unwrap();
                     black_box(parsed);
-                    let decoded = dred_decoder
-                        .decode_into_f32(
-                            &mut decoder,
-                            &dred_state,
-                            black_box(packet.offset_samples),
-                            &mut output,
-                        )
-                        .unwrap();
-                    black_box(decoded);
-                    black_box(&output[..decoded]);
+                    black_box(dred_end);
                 });
-            });
-        },
-    );
+            },
+        );
+
+    bench
+        .named("recover_available")
+        .with_profile_iterations(DRED_RECOVER_PROFILE_ITERATIONS)
+        .param_str_profile_defaults(
+            "profile",
+            &dred_recover_profile_names,
+            [PROFILE_CODEC_PROFILE],
+            |bench, profile_name| {
+                let encoded = encoded_profile(&corpus, &profile_name);
+                let packets = Arc::clone(&encoded.dred_recover_packets);
+                let source_name = encoded
+                    .dred_recover_source
+                    .map(DredRecoverSource::as_str)
+                    .unwrap_or("unknown")
+                    .to_owned();
+
+                bench.param_str("source", [source_name], move |bench, _source_name| {
+                    let packets = Arc::clone(&packets);
+                    let cycle_len = packets.len();
+                    let mut decoder = Decoder::new(SampleRate::Hz48000, Channels::Mono).unwrap();
+                    let mut dred_decoder = DredDecoder::new().unwrap();
+                    let mut dred_state = DredState::new().unwrap();
+                    let mut output = vec![0.0f32; OPUS_FRAME_SAMPLES];
+                    let mut dred_end = 0;
+
+                    bench.indexed_cyclic(cycle_len, move |index| {
+                        let packet = &packets[index as usize % cycle_len];
+                        let parsed = dred_decoder
+                            .parse(
+                                &mut dred_state,
+                                black_box(packet.payload.as_slice()),
+                                DRED_MAX_SAMPLES,
+                                SampleRate::Hz48000,
+                                &mut dred_end,
+                                false,
+                            )
+                            .unwrap();
+                        black_box(parsed);
+                        let decoded = dred_decoder
+                            .decode_into_f32(
+                                &mut decoder,
+                                &dred_state,
+                                black_box(packet.offset_samples),
+                                &mut output,
+                            )
+                            .unwrap();
+                        black_box(decoded);
+                        black_box(&output[..decoded]);
+                    });
+                });
+            },
+        );
 }
 
 fn bench_rnnoise(bench: &mut Bench<'_>, corpus: Arc<Corpus>) {
@@ -325,6 +365,7 @@ fn bench_rnnoise(bench: &mut Bench<'_>, corpus: Arc<Corpus>) {
 
     bench
         .named("process")
+        .with_profile_iterations(RNNOISE_PROFILE_ITERATIONS)
         .indexed_cyclic(cycle_len, move |index| {
             let frame = &frames[index as usize % cycle_len];
             let vad = denoise.process_frame(&mut output, black_box(frame.as_slice()));
@@ -337,71 +378,81 @@ fn bench_pipeline(bench: &mut Bench<'_>, corpus: Arc<Corpus>) {
     let mut bench = bench.with_parameters(BENCH_PARAMS);
     let profile_names = profile_names();
 
-    bench.named("rnnoise_then_encode").param_str(
-        "profile",
-        &profile_names,
-        |bench, profile_name| {
-            let profile = profile_by_name(&profile_name);
-            let rnnoise_frames = Arc::clone(&corpus.rnnoise_frames);
-            let cycle_len = rnnoise_frames.len() / 2;
-            let mut denoise = DenoiseState::new();
-            let mut encoder = OpusRawEncoder::new(profile).unwrap();
-            let mut denoised_half = vec![0.0f32; RNNOISE_FRAME_SAMPLES];
-            let mut opus_frame = vec![0.0f32; OPUS_FRAME_SAMPLES];
-            let mut encoded = vec![0u8; MAX_OPUS_PACKET_BYTES];
+    bench
+        .named("rnnoise_then_encode")
+        .with_profile_iterations(PIPELINE_PROFILE_ITERATIONS)
+        .param_str_profile_defaults(
+            "profile",
+            &profile_names,
+            [PROFILE_CODEC_PROFILE],
+            |bench, profile_name| {
+                let profile = profile_by_name(&profile_name);
+                let rnnoise_frames = Arc::clone(&corpus.rnnoise_frames);
+                let cycle_len = rnnoise_frames.len() / 2;
+                let mut denoise = DenoiseState::new();
+                let mut encoder = OpusRawEncoder::new(profile).unwrap();
+                let mut denoised_half = vec![0.0f32; RNNOISE_FRAME_SAMPLES];
+                let mut opus_frame = vec![0.0f32; OPUS_FRAME_SAMPLES];
+                let mut encoded = vec![0u8; MAX_OPUS_PACKET_BYTES];
 
-            bench.indexed_cyclic(cycle_len, move |index| {
-                let base = ((index as usize % cycle_len) * 2) % rnnoise_frames.len();
-                let first = &rnnoise_frames[base];
-                let second = &rnnoise_frames[(base + 1) % rnnoise_frames.len()];
+                bench.indexed_cyclic(cycle_len, move |index| {
+                    let base = ((index as usize % cycle_len) * 2) % rnnoise_frames.len();
+                    let first = &rnnoise_frames[base];
+                    let second = &rnnoise_frames[(base + 1) % rnnoise_frames.len()];
 
-                denoise.process_frame(&mut denoised_half, black_box(first.as_slice()));
-                normalize_i16_scale(&denoised_half, &mut opus_frame[..RNNOISE_FRAME_SAMPLES]);
-                denoise.process_frame(&mut denoised_half, black_box(second.as_slice()));
-                normalize_i16_scale(&denoised_half, &mut opus_frame[RNNOISE_FRAME_SAMPLES..]);
+                    denoise.process_frame(&mut denoised_half, black_box(first.as_slice()));
+                    normalize_i16_scale(&denoised_half, &mut opus_frame[..RNNOISE_FRAME_SAMPLES]);
+                    denoise.process_frame(&mut denoised_half, black_box(second.as_slice()));
+                    normalize_i16_scale(&denoised_half, &mut opus_frame[RNNOISE_FRAME_SAMPLES..]);
 
-                let len = encoder.encode_float(black_box(opus_frame.as_slice()), &mut encoded);
-                black_box(len);
-                black_box(&encoded[..len]);
-            });
-        },
-    );
+                    let len = encoder.encode_float(black_box(opus_frame.as_slice()), &mut encoded);
+                    black_box(len);
+                    black_box(&encoded[..len]);
+                });
+            },
+        );
 
     bench
         .named("aec_then_encode")
-        .param_str("profile", &profile_names, |bench, profile_name| {
-            let profile = profile_by_name(&profile_name);
-            let rnnoise_frames = Arc::clone(&corpus.rnnoise_frames);
-            let cycle_len = rnnoise_frames.len() / 2;
-            let mut aec = new_aec();
-            let mut encoder = OpusRawEncoder::new(profile).unwrap();
-            let mut render = vec![0.0f32; RNNOISE_FRAME_SAMPLES];
-            let mut render_out = vec![0.0f32; RNNOISE_FRAME_SAMPLES];
-            let mut near = vec![0.0f32; RNNOISE_FRAME_SAMPLES];
-            let mut opus_frame = vec![0.0f32; OPUS_FRAME_SAMPLES];
-            let mut encoded = vec![0u8; MAX_OPUS_PACKET_BYTES];
+        .with_profile_iterations(PIPELINE_PROFILE_ITERATIONS)
+        .param_str_profile_defaults(
+            "profile",
+            &profile_names,
+            [PROFILE_CODEC_PROFILE],
+            |bench, profile_name| {
+                let profile = profile_by_name(&profile_name);
+                let rnnoise_frames = Arc::clone(&corpus.rnnoise_frames);
+                let cycle_len = rnnoise_frames.len() / 2;
+                let mut aec = new_aec();
+                let mut encoder = OpusRawEncoder::new(profile).unwrap();
+                let mut render = vec![0.0f32; RNNOISE_FRAME_SAMPLES];
+                let mut render_out = vec![0.0f32; RNNOISE_FRAME_SAMPLES];
+                let mut near = vec![0.0f32; RNNOISE_FRAME_SAMPLES];
+                let mut opus_frame = vec![0.0f32; OPUS_FRAME_SAMPLES];
+                let mut encoded = vec![0u8; MAX_OPUS_PACKET_BYTES];
 
-            bench.indexed_cyclic(cycle_len, move |index| {
-                let base = ((index as usize % cycle_len) * 2) % rnnoise_frames.len();
-                for half in 0..2 {
-                    let frame = &rnnoise_frames[(base + half) % rnnoise_frames.len()];
-                    // Drive the render reference one frame ahead of the mic so
-                    // the canceller has a correlated far-end to align against.
-                    let render_src = &rnnoise_frames[(base + half + 1) % rnnoise_frames.len()];
-                    normalize_i16_scale(render_src, &mut render);
-                    normalize_i16_scale(black_box(frame.as_slice()), &mut near);
-                    let span = half * RNNOISE_FRAME_SAMPLES..(half + 1) * RNNOISE_FRAME_SAMPLES;
-                    aec.process_render_f32(&[&render], &mut [&mut render_out])
-                        .unwrap();
-                    aec.process_capture_f32(&[&near], &mut [&mut opus_frame[span]])
-                        .unwrap();
-                }
+                bench.indexed_cyclic(cycle_len, move |index| {
+                    let base = ((index as usize % cycle_len) * 2) % rnnoise_frames.len();
+                    for half in 0..2 {
+                        let frame = &rnnoise_frames[(base + half) % rnnoise_frames.len()];
+                        // Drive the render reference one frame ahead of the mic so
+                        // the canceller has a correlated far-end to align against.
+                        let render_src = &rnnoise_frames[(base + half + 1) % rnnoise_frames.len()];
+                        normalize_i16_scale(render_src, &mut render);
+                        normalize_i16_scale(black_box(frame.as_slice()), &mut near);
+                        let span = half * RNNOISE_FRAME_SAMPLES..(half + 1) * RNNOISE_FRAME_SAMPLES;
+                        aec.process_render_f32(&[&render], &mut [&mut render_out])
+                            .unwrap();
+                        aec.process_capture_f32(&[&near], &mut [&mut opus_frame[span]])
+                            .unwrap();
+                    }
 
-                let len = encoder.encode_float(black_box(opus_frame.as_slice()), &mut encoded);
-                black_box(len);
-                black_box(&encoded[..len]);
-            });
-        });
+                    let len = encoder.encode_float(black_box(opus_frame.as_slice()), &mut encoded);
+                    black_box(len);
+                    black_box(&encoded[..len]);
+                });
+            },
+        );
 }
 
 fn new_aec() -> AudioProcessing {
@@ -442,117 +493,23 @@ fn bench_live(bench: &mut Bench<'_>, corpus: Arc<Corpus>) {
 
     bench
         .named("capture_gate")
-        .param_str("feature", ["all_on", "gate_off"], |bench, feature| {
-            let frames = Arc::clone(&corpus.live_simulation_frames);
-            let tuning = live_tuning_for_feature_set(&feature);
-            bench.indexed_cyclic(1, move |_| {
-                let report = run_live_audio_simulation_with_speech(
-                    LiveAudioSimulationConfig {
-                        scenario: LiveAudioSimulationScenario::AlternatingSpeech,
-                        tuning,
-                        duration: LIVE_SIM_DURATION,
-                        streams: 1,
-                        seed: 0xabc0_0001,
-                        packet_loss: LiveAudioPacketLossProfile::ScenarioDefault,
-                        max_amplification: DEFAULT_LIVE_MAX_AMPLIFICATION,
-                        denoise: true,
-                        auto_gain: true,
-                        echo_cancellation: false,
-                    },
-                    &frames,
-                )
-                .unwrap();
-                black_box(report.suppressed_frames);
-                black_box(report.queued_frames);
-            });
-        });
-
-    bench
-        .named("playback_mixer")
-        .param_str("feature", &feature_sets, |bench, feature| {
-            let frames = Arc::clone(&corpus.live_simulation_frames);
-            let tuning = live_tuning_for_feature_set(&feature);
-            bench.indexed_cyclic(1, move |_| {
-                let report = run_live_audio_simulation_with_speech(
-                    LiveAudioSimulationConfig {
-                        scenario: LiveAudioSimulationScenario::BacklogSilence,
-                        tuning,
-                        duration: LIVE_SIM_DURATION,
-                        streams: 1,
-                        seed: 0xabc0_0002,
-                        packet_loss: LiveAudioPacketLossProfile::ScenarioDefault,
-                        max_amplification: DEFAULT_LIVE_MAX_AMPLIFICATION,
-                        denoise: true,
-                        auto_gain: true,
-                        echo_cancellation: false,
-                    },
-                    &frames,
-                )
-                .unwrap();
-                black_box(report.max_queue_ms);
-                black_box(report.final_snapshot.silence_skip_count);
-            });
-        });
-
-    bench
-        .named("call_sim")
-        .param_str("scenario", &scenario_names, |bench, scenario_name| {
-            let frames = Arc::clone(&corpus.live_simulation_frames);
-            let scenario = LiveAudioSimulationScenario::from_name(&scenario_name)
-                .unwrap_or(LiveAudioSimulationScenario::ConstantSpeech);
-            bench.param_str("feature", &feature_sets, move |bench, feature| {
-                let frames = Arc::clone(&frames);
+        .with_profile_iterations(LIVE_CAPTURE_GATE_PROFILE_ITERATIONS)
+        .param_str_profile_defaults(
+            "feature",
+            ["all_on", "gate_off"],
+            [PROFILE_FEATURE_ALL_ON],
+            |bench, feature| {
+                let frames = Arc::clone(&corpus.live_simulation_frames);
                 let tuning = live_tuning_for_feature_set(&feature);
-                bench.param_str("loss", &loss_profiles, move |bench, loss_name| {
-                    let frames = Arc::clone(&frames);
-                    let packet_loss = LiveAudioPacketLossProfile::from_name(&loss_name)
-                        .unwrap_or(LiveAudioPacketLossProfile::ScenarioDefault);
-                    bench.param_str("aec", ["off", "on"], move |bench, aec| {
-                        let frames = Arc::clone(&frames);
-                        let echo_cancellation = aec == "on";
-                        bench.indexed_cyclic(1, move |_| {
-                            let report = run_live_audio_simulation_with_speech(
-                                LiveAudioSimulationConfig {
-                                    scenario,
-                                    tuning,
-                                    duration: LIVE_SIM_DURATION,
-                                    streams: 1,
-                                    seed: 0xabc0_0003,
-                                    packet_loss,
-                                    max_amplification: DEFAULT_LIVE_MAX_AMPLIFICATION,
-                                    denoise: true,
-                                    auto_gain: true,
-                                    echo_cancellation,
-                                },
-                                &frames,
-                            )
-                            .unwrap();
-                            black_box(report.rms);
-                            black_box(report.queue_area_ms);
-                        });
-                    });
-                });
-            });
-        });
-
-    bench
-        .named("group_call_sim")
-        .param_str("streams", ["3", "6"], |bench, streams| {
-            let frames = Arc::clone(&corpus.live_simulation_frames);
-            let streams = streams.parse::<usize>().unwrap();
-            bench.param_str("loss", &loss_profiles, move |bench, loss_name| {
-                let frames = Arc::clone(&frames);
-                let packet_loss = LiveAudioPacketLossProfile::from_name(&loss_name)
-                    .unwrap_or(LiveAudioPacketLossProfile::ScenarioDefault);
                 bench.indexed_cyclic(1, move |_| {
                     let report = run_live_audio_simulation_with_speech(
                         LiveAudioSimulationConfig {
-                            scenario: LiveAudioSimulationScenario::GroupChat,
-                            tuning: LiveAudioTuning::default(),
+                            scenario: LiveAudioSimulationScenario::AlternatingSpeech,
+                            tuning,
                             duration: LIVE_SIM_DURATION,
-                            streams,
-                            seed: 0xabc0_0004,
-                            packet_loss,
+                            streams: 1,
+                            seed: 0xabc0_0001,
+                            packet_loss: LiveAudioPacketLossProfile::ScenarioDefault,
                             max_amplification: DEFAULT_LIVE_MAX_AMPLIFICATION,
                             denoise: true,
                             auto_gain: true,
@@ -561,11 +518,150 @@ fn bench_live(bench: &mut Bench<'_>, corpus: Arc<Corpus>) {
                         &frames,
                     )
                     .unwrap();
-                    black_box(report.peak);
-                    black_box(report.final_snapshot.active_streams);
+                    black_box(report.suppressed_frames);
+                    black_box(report.queued_frames);
                 });
-            });
-        });
+            },
+        );
+
+    bench
+        .named("playback_mixer")
+        .with_profile_iterations(LIVE_PLAYBACK_MIXER_PROFILE_ITERATIONS)
+        .param_str_profile_defaults(
+            "feature",
+            &feature_sets,
+            [PROFILE_PLAYBACK_MIXER_FEATURE],
+            |bench, feature| {
+                let frames = Arc::clone(&corpus.live_simulation_frames);
+                let tuning = live_tuning_for_feature_set(&feature);
+                bench.indexed_cyclic(1, move |_| {
+                    let report = run_live_audio_simulation_with_speech(
+                        LiveAudioSimulationConfig {
+                            scenario: LiveAudioSimulationScenario::BacklogSilence,
+                            tuning,
+                            duration: LIVE_SIM_DURATION,
+                            streams: 1,
+                            seed: 0xabc0_0002,
+                            packet_loss: LiveAudioPacketLossProfile::ScenarioDefault,
+                            max_amplification: DEFAULT_LIVE_MAX_AMPLIFICATION,
+                            denoise: true,
+                            auto_gain: true,
+                            echo_cancellation: false,
+                        },
+                        &frames,
+                    )
+                    .unwrap();
+                    black_box(report.max_queue_ms);
+                    black_box(report.final_snapshot.silence_skip_count);
+                });
+            },
+        );
+
+    bench
+        .named("call_sim")
+        .with_profile_iterations(LIVE_CALL_SIM_PROFILE_ITERATIONS)
+        .param_str_profile_defaults(
+            "scenario",
+            &scenario_names,
+            [PROFILE_CALL_SCENARIO],
+            |bench, scenario_name| {
+                let frames = Arc::clone(&corpus.live_simulation_frames);
+                let scenario = LiveAudioSimulationScenario::from_name(&scenario_name)
+                    .unwrap_or(LiveAudioSimulationScenario::ConstantSpeech);
+                bench.param_str_profile_defaults(
+                    "feature",
+                    &feature_sets,
+                    [PROFILE_FEATURE_ALL_ON],
+                    move |bench, feature| {
+                        let frames = Arc::clone(&frames);
+                        let tuning = live_tuning_for_feature_set(&feature);
+                        bench.param_str_profile_defaults(
+                            "loss",
+                            &loss_profiles,
+                            [PROFILE_CALL_LOSS],
+                            move |bench, loss_name| {
+                                let frames = Arc::clone(&frames);
+                                let packet_loss = LiveAudioPacketLossProfile::from_name(&loss_name)
+                                    .unwrap_or(LiveAudioPacketLossProfile::ScenarioDefault);
+                                bench.param_str_profile_defaults(
+                                    "aec",
+                                    ["off", "on"],
+                                    [PROFILE_AEC],
+                                    move |bench, aec| {
+                                        let frames = Arc::clone(&frames);
+                                        let echo_cancellation = aec == "on";
+                                        bench.indexed_cyclic(1, move |_| {
+                                            let report = run_live_audio_simulation_with_speech(
+                                                LiveAudioSimulationConfig {
+                                                    scenario,
+                                                    tuning,
+                                                    duration: LIVE_SIM_DURATION,
+                                                    streams: 1,
+                                                    seed: 0xabc0_0003,
+                                                    packet_loss,
+                                                    max_amplification:
+                                                        DEFAULT_LIVE_MAX_AMPLIFICATION,
+                                                    denoise: true,
+                                                    auto_gain: true,
+                                                    echo_cancellation,
+                                                },
+                                                &frames,
+                                            )
+                                            .unwrap();
+                                            black_box(report.rms);
+                                            black_box(report.queue_area_ms);
+                                        });
+                                    },
+                                );
+                            },
+                        );
+                    },
+                );
+            },
+        );
+
+    bench
+        .named("group_call_sim")
+        .with_profile_iterations(LIVE_GROUP_CALL_SIM_PROFILE_ITERATIONS)
+        .param_str_profile_defaults(
+            "streams",
+            ["3", "6"],
+            [PROFILE_GROUP_STREAMS],
+            |bench, streams| {
+                let frames = Arc::clone(&corpus.live_simulation_frames);
+                let streams = streams.parse::<usize>().unwrap();
+                bench.param_str_profile_defaults(
+                    "loss",
+                    &loss_profiles,
+                    [PROFILE_GROUP_LOSS],
+                    move |bench, loss_name| {
+                        let frames = Arc::clone(&frames);
+                        let packet_loss = LiveAudioPacketLossProfile::from_name(&loss_name)
+                            .unwrap_or(LiveAudioPacketLossProfile::ScenarioDefault);
+                        bench.indexed_cyclic(1, move |_| {
+                            let report = run_live_audio_simulation_with_speech(
+                                LiveAudioSimulationConfig {
+                                    scenario: LiveAudioSimulationScenario::GroupChat,
+                                    tuning: LiveAudioTuning::default(),
+                                    duration: LIVE_SIM_DURATION,
+                                    streams,
+                                    seed: 0xabc0_0004,
+                                    packet_loss,
+                                    max_amplification: DEFAULT_LIVE_MAX_AMPLIFICATION,
+                                    denoise: true,
+                                    auto_gain: true,
+                                    echo_cancellation: false,
+                                },
+                                &frames,
+                            )
+                            .unwrap();
+                            black_box(report.peak);
+                            black_box(report.final_snapshot.active_streams);
+                        });
+                    },
+                );
+            },
+        );
 }
 
 fn live_tuning_for_feature_set(feature: &str) -> LiveAudioTuning {

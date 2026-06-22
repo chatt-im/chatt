@@ -189,7 +189,7 @@ pub struct AudioLatencyConfig {
     pub max_reorder_delay_ms: u64,
     #[toml(default = 0.15)]
     pub max_speed_up: f64,
-    #[toml(default = 80)]
+    #[toml(default = 20)]
     pub catch_up_start_excess_ms: u64,
     #[toml(default = 64)]
     pub silence_vad_max: u8,

@@ -52,8 +52,8 @@ capture-silence-ramp-ms = 10
 
 [soundboard]
 enabled = true
-loss = "random_60"
-#loss = "none"
+#loss = "random_60"
+loss = "none"
 seed = 8388357047376790533
 
 [[soundboard.clips]]

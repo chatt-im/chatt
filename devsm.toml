@@ -26,5 +26,33 @@ managed = false
 env.CHATT_RUN_DIR = "/tmp/chatt-dev/soundboard"
 info = "Run the Carol prerecorded-audio soundboard client in this terminal"
 
+[action.bench]
+pwd = "crates/benchmark"
+sh = '''
+set -e
+echo "> cargo build --release -p benchmark"
+BENCH=$(cargo --config "target.'cfg(unix)'.runner = 'echo'" run -q --release)
+$BENCH bench --progress "$@"
+'''
+cli.forward_arguments = true
+allow_multiple = true
+
+[action.profile]
+pwd = "crates/benchmark"
+sh = '''
+set -e
+echo "> cargo build --release -p benchmark"
+BENCH=$(cargo --config "target.'cfg(unix)'.runner = 'echo'" run -q --release)
+ROUTE=${1:-profile}
+PROFILE_ROUTE=$(printf '%s' "$ROUTE" | sed 's#[^A-Za-z0-9_.-]#-#g')
+PROFILE_OUTPUT="/tmp/profile-${PROFILE_ROUTE}.json"
+samply record -r 5000 --save-only --output "$PROFILE_OUTPUT" $BENCH profile  "$@" || exit 1
+echo "Profile output to $PROFILE_OUTPUT for: benchmark profile $*"
+'''
+env.DEBUGINFOD_URLS = "https://debuginfod.archlinux.org"
+env.SAMPLY_USE_DEBUGINFOD = "1"
+cli.forward_arguments = true
+allow_multiple = true
+
 [group]
 clients = ["client-alice", "client-bob", "client-soundboard"]
