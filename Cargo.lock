@@ -231,6 +231,7 @@ dependencies = [
  "extui",
  "extui-bindings",
  "extui-editor",
+ "foldhash",
  "jsony",
  "kvlog",
  "libc",
@@ -1423,6 +1424,7 @@ dependencies = [
 name = "server"
 version = "0.1.0"
 dependencies = [
+ "foldhash",
  "jsony",
  "kvlog",
  "libc",
