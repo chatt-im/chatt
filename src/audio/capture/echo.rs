@@ -1,4 +1,16 @@
-use crate::audio::*;
+use std::{
+    cell::UnsafeCell,
+    fmt,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    },
+};
+
+use sonora::config::EchoCanceller as Aec3Config;
+use sonora::{AudioProcessing, Config as ApmConfig, StreamConfig as ApmStreamConfig};
+
+use crate::audio::shared::{FRAME_SAMPLES, SAMPLE_RATE};
 
 /// Lock-free single-producer single-consumer ring carrying the mixed playback
 /// signal used as the acoustic echo cancellation render reference.
@@ -42,26 +54,26 @@ impl EchoCancellationControl {
         self.enabled.store(enabled, Ordering::Relaxed);
     }
 
-    pub(in crate::audio) fn reference(&self) -> &EchoReference {
+    pub(crate) fn reference(&self) -> &EchoReference {
         &self.reference
     }
 }
 
 #[derive(Clone)]
-pub(in crate::audio) enum EchoReferenceSource {
+pub(crate) enum EchoReferenceSource {
     Always(Arc<EchoReference>),
     Controlled(Arc<EchoCancellationControl>),
 }
 
 impl EchoReferenceSource {
-    pub(in crate::audio) fn enabled(&self) -> bool {
+    pub(crate) fn enabled(&self) -> bool {
         match self {
             EchoReferenceSource::Always(_) => true,
             EchoReferenceSource::Controlled(control) => control.enabled(),
         }
     }
 
-    pub(in crate::audio) fn reference(&self) -> &EchoReference {
+    pub(crate) fn reference(&self) -> &EchoReference {
         match self {
             EchoReferenceSource::Always(reference) => reference,
             EchoReferenceSource::Controlled(control) => control.reference(),
@@ -191,7 +203,7 @@ impl fmt::Debug for EchoReference {
 /// Acoustic echo canceller wrapping the WebRTC AEC3 port from the `sonora`
 /// crate. Processes one 10 ms mono frame at 48 kHz per call inside the capture
 /// worker, never in a realtime audio callback.
-pub(in crate::audio) struct EchoCanceller {
+pub(crate) struct EchoCanceller {
     apm: AudioProcessing,
     render: Vec<f32>,
     render_out: Vec<f32>,
@@ -200,7 +212,7 @@ pub(in crate::audio) struct EchoCanceller {
 }
 
 impl EchoCanceller {
-    pub(in crate::audio) fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let stream = ApmStreamConfig::new(SAMPLE_RATE, 1);
         let config = ApmConfig {
             echo_canceller: Some(Aec3Config::default()),
@@ -222,7 +234,7 @@ impl EchoCanceller {
 
     /// Cancels echo on one `FRAME_SAMPLES`-long i16-scale capture frame in
     /// place, aligning it against the latest render reference frame.
-    pub(in crate::audio) fn process(&mut self, frame: &mut [f32], reference: &EchoReference) {
+    pub(crate) fn process(&mut self, frame: &mut [f32], reference: &EchoReference) {
         reference.pull_frame(&mut self.render);
         for (near, sample) in self.near.iter_mut().zip(frame.iter()) {
             *near = sample / 32768.0;
@@ -242,6 +254,7 @@ impl EchoCanceller {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::audio::shared::rms_i16_scale;
     #[allow(unused_imports)]
     use crate::audio::test_support::*;
 

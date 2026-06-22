@@ -1,6 +1,33 @@
-use crate::audio::*;
+use std::sync::{
+    Arc,
+    atomic::{AtomicU32, Ordering},
+    mpsc::Receiver,
+};
 
-pub(in crate::audio) fn run_encoder_worker(
+use nnnoiseless::DenoiseState;
+
+use crate::{
+    audio::{
+        capture::{
+            dsp::{
+                AutoGain, CaptureGateDecision, EarshotVad, LongSilenceGate, SilenceRangeTracker,
+                is_capture_skip_safe_silence, store_processed_level_stats,
+            },
+            echo::{EchoCanceller, EchoReference, EchoReferenceSource},
+            encoder::OpusVoiceEncoder,
+        },
+        shared::{
+            AudioStats, FRAME_SAMPLES, LIVE_OPUS_FRAME_SAMPLES, LIVE_PACKET_FLAG_OPUS_RESET,
+            LIVE_PLAYBACK_SILENCE_RANGE_COUNT, LiveAudioTuning, LiveEncoderProfile,
+            LocalVoiceFrame, MAX_OPUS_PACKET_BYTES, convert_i16_scale_to_pcm_i16,
+            pack_silence_range, silence_ranges_contain, vad_to_u8,
+        },
+    },
+    network::{EncoderNetworkProfile, EncoderNetworkTuning},
+    packet_log::PacketLogWriter,
+};
+
+pub(crate) fn run_encoder_worker(
     receiver: Receiver<Vec<f32>>,
     mut writer: PacketLogWriter<std::io::BufWriter<std::fs::File>>,
     mut encoder: OpusVoiceEncoder,
@@ -22,10 +49,10 @@ pub(in crate::audio) fn run_encoder_worker(
     if let Err(error) = writer.flush() {
         stats.set_error(format!("failed to flush packet log: {error}"));
     }
-    stats.inner.worker_stopped.store(true, Ordering::Release);
+    stats.mark_worker_stopped();
 }
 
-pub(in crate::audio) fn run_live_encoder_worker<F>(
+pub(crate) fn run_live_encoder_worker<F>(
     receiver: Receiver<Vec<f32>>,
     encoder: OpusVoiceEncoder,
     denoise_enabled: bool,
@@ -52,10 +79,10 @@ pub(in crate::audio) fn run_live_encoder_worker<F>(
     if let Err(error) = result {
         stats.set_error(error);
     }
-    stats.inner.worker_stopped.store(true, Ordering::Release);
+    stats.mark_worker_stopped();
 }
 
-pub(in crate::audio) fn run_encoder_worker_inner(
+pub(crate) fn run_encoder_worker_inner(
     receiver: Receiver<Vec<f32>>,
     writer: &mut PacketLogWriter<std::io::BufWriter<std::fs::File>>,
     encoder: &mut OpusVoiceEncoder,
@@ -81,21 +108,14 @@ pub(in crate::audio) fn run_encoder_worker_inner(
                 0.0
             };
             store_processed_level_stats(stats, frame);
-            stats
-                .inner
-                .vad_bits
-                .store(vad_probability.to_bits(), Ordering::Relaxed);
+            stats.store_vad_probability(vad_probability);
 
             convert_i16_scale_to_pcm_i16(frame, &mut opus_frame);
             let packet_len = encoder.encode(&opus_frame, &mut encoded)?;
             writer
                 .write_packet(&encoded[..packet_len])
                 .map_err(|error| format!("failed to write packet log: {error}"))?;
-            stats.inner.encoded_packets.fetch_add(1, Ordering::Relaxed);
-            stats
-                .inner
-                .encoded_bytes
-                .fetch_add(packet_len as u64, Ordering::Relaxed);
+            stats.record_encoded_packet(packet_len);
             Ok(())
         })?;
     }
@@ -103,7 +123,7 @@ pub(in crate::audio) fn run_encoder_worker_inner(
     Ok(())
 }
 
-pub(in crate::audio) fn run_live_encoder_worker_inner<F>(
+pub(crate) fn run_live_encoder_worker_inner<F>(
     receiver: Receiver<Vec<f32>>,
     encoder: OpusVoiceEncoder,
     denoise_enabled: bool,
@@ -146,7 +166,7 @@ where
     Ok(())
 }
 
-pub(in crate::audio) struct LiveEncoderPipeline {
+pub(crate) struct LiveEncoderPipeline {
     encoder: OpusVoiceEncoder,
     denoise_enabled: bool,
     auto_gain_enabled: bool,
@@ -218,7 +238,7 @@ impl LiveEncoderPipeline {
             .process(frame, source.reference());
     }
 
-    pub(in crate::audio) fn push_chunk<F>(
+    pub(crate) fn push_chunk<F>(
         &mut self,
         chunk: &[f32],
         max_amplification: f32,
@@ -244,10 +264,7 @@ impl LiveEncoderPipeline {
                 self.earshot.process_48k_frame(frame.as_slice())
             };
             store_processed_level_stats(stats, frame.as_slice());
-            stats
-                .inner
-                .vad_bits
-                .store(vad_probability.to_bits(), Ordering::Relaxed);
+            stats.store_vad_probability(vad_probability);
             let vad = vad_to_u8(vad_probability);
             let silence = is_capture_skip_safe_silence(self.tuning, vad, frame.as_slice());
             let silence_ranges = self.silence_tracker.observe_frame(silence);
@@ -335,11 +352,11 @@ impl LiveEncoderPipeline {
         Ok(())
     }
 
-    pub(in crate::audio) fn suppressed_frames(&self) -> u64 {
+    pub(crate) fn suppressed_frames(&self) -> u64 {
         self.suppressed_frames
     }
 
-    pub(in crate::audio) fn current_gain(&self) -> f32 {
+    pub(crate) fn current_gain(&self) -> f32 {
         if self.auto_gain_enabled {
             self.auto_gain.current_gain
         } else {
@@ -348,7 +365,7 @@ impl LiveEncoderPipeline {
     }
 }
 
-pub(in crate::audio) fn pack_current_opus_silence_ranges(frame_silence: &[bool]) -> u64 {
+pub(crate) fn pack_current_opus_silence_ranges(frame_silence: &[bool]) -> u64 {
     let mut encoded = 0u64;
     let mut range = 0usize;
     let mut cursor = 0usize;
@@ -371,7 +388,7 @@ pub(in crate::audio) fn pack_current_opus_silence_ranges(frame_silence: &[bool])
     encoded
 }
 
-pub(in crate::audio) fn build_live_encoder_pipeline(
+pub(crate) fn build_live_encoder_pipeline(
     tuning: LiveAudioTuning,
     denoise_enabled: bool,
     max_amplification: f32,
@@ -391,7 +408,7 @@ pub(in crate::audio) fn build_live_encoder_pipeline(
     ))
 }
 
-pub(in crate::audio) fn encode_live_frame<F>(
+pub(crate) fn encode_live_frame<F>(
     frame: &[f32],
     flags: u8,
     silence_ranges: u64,
@@ -411,15 +428,11 @@ where
         payload: encoded[..packet_len].to_vec(),
         silence_ranges,
     });
-    stats.inner.encoded_packets.fetch_add(1, Ordering::Relaxed);
-    stats
-        .inner
-        .encoded_bytes
-        .fetch_add(packet_len as u64, Ordering::Relaxed);
+    stats.record_encoded_packet(packet_len);
     Ok(())
 }
 
-pub(in crate::audio) struct FrameAccumulator {
+pub(crate) struct FrameAccumulator {
     frame_size: usize,
     pending: Vec<f32>,
 }
@@ -463,8 +476,14 @@ impl FrameAccumulator {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::audio::EchoCancellationControl;
+    use crate::audio::shared::{
+        DEFAULT_LIVE_MAX_AMPLIFICATION, LIVE_PLAYBACK_DRED_MAX_SAMPLES, normalized_to_i16_scale,
+    };
     #[allow(unused_imports)]
     use crate::audio::test_support::*;
+    use opus_codec::{Channels, Decoder, DredDecoder, DredState, SampleRate};
+    use std::time::Duration;
 
     #[test]
     fn live_encoder_pipeline_emits_parseable_dred_for_sampled_speech() {

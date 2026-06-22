@@ -1,22 +1,36 @@
-use crate::audio::*;
+use std::{
+    collections::VecDeque,
+    time::{Duration, Instant},
+};
+
+use crate::audio::{
+    playback::{LivePlaybackMixerStats, MonoSampleQueue},
+    shared::{
+        DecodedFrameSource, LIVE_PLAYBACK_CORRECTION_ALPHA, LIVE_PLAYBACK_CORRECTION_SLEW,
+        LIVE_PLAYBACK_DYNAMIC_DEADBAND, LIVE_PLAYBACK_DYNAMIC_UNDERRUN_MIN,
+        LIVE_PLAYBACK_DYNAMIC_UNDERRUN_WINDOW, LIVE_PLAYBACK_RECOVERY_DECLICK,
+        LIVE_PLAYBACK_RECOVERY_DECLICK_MIN_DELTA, LiveAudioTuning, catmull_rom,
+        samples_for_duration, samples_to_ms,
+    },
+};
 
 /// Sample-count constants derived from a [`LiveAudioTuning`]. Each value is the
 /// rounded sample count for a tuning duration. They are computed once at stream
 /// construction so the per-sample playback path never repeats the float
 /// `samples_for_duration` rounding.
 #[derive(Clone, Copy)]
-pub(in crate::audio) struct TuningSampleCounts {
+pub(crate) struct TuningSampleCounts {
     target_queue: usize,
     dynamic_target_floor: usize,
     catch_up_start_excess: usize,
     hard_queue_bound: usize,
     dred_horizon: usize,
     moderate_loss_queue: usize,
-    pub(in crate::audio) silence_min_gap: usize,
-    pub(in crate::audio) silence_guard: usize,
-    pub(in crate::audio) silence_max_skip: usize,
-    pub(in crate::audio) silence_min_skip: usize,
-    pub(in crate::audio) silence_ramp: usize,
+    pub(crate) silence_min_gap: usize,
+    pub(crate) silence_guard: usize,
+    pub(crate) silence_max_skip: usize,
+    pub(crate) silence_min_skip: usize,
+    pub(crate) silence_ramp: usize,
 }
 
 impl TuningSampleCounts {
@@ -37,17 +51,17 @@ impl TuningSampleCounts {
     }
 }
 
-pub(in crate::audio) struct AdaptivePlaybackStream {
+pub(crate) struct AdaptivePlaybackStream {
     tuning: LiveAudioTuning,
     samples: TuningSampleCounts,
     input: MonoSampleQueue,
     read_pos: f64,
     phase_increment: f64,
     smoothed_correction: f64,
-    pub(in crate::audio) current_correction_percent: f32,
+    pub(crate) current_correction_percent: f32,
     recent_loss_events: VecDeque<Instant>,
     expanded_target_samples: usize,
-    pub(in crate::audio) expanded_target_until: Option<Instant>,
+    pub(crate) expanded_target_until: Option<Instant>,
     /// Receiver-recommended dynamic baseline target in samples, clamped to
     /// [`dynamic_target_floor`, `target_queue`]. Starts at the safe default and
     /// relaxes downward only on evidence of a consistent connection.
@@ -69,7 +83,7 @@ pub(in crate::audio) struct AdaptivePlaybackStream {
 }
 
 impl AdaptivePlaybackStream {
-    pub(in crate::audio) fn new(tuning: LiveAudioTuning) -> Result<Self, String> {
+    pub(crate) fn new(tuning: LiveAudioTuning) -> Result<Self, String> {
         let samples = TuningSampleCounts::from_tuning(&tuning);
         Ok(Self {
             tuning,
@@ -93,7 +107,7 @@ impl AdaptivePlaybackStream {
         })
     }
 
-    pub(in crate::audio) fn queue_samples(
+    pub(crate) fn queue_samples(
         &mut self,
         samples: &[f32],
         source: DecodedFrameSource,
@@ -114,11 +128,7 @@ impl AdaptivePlaybackStream {
     /// dead-band suppresses chatter. While an underrun hold is active the
     /// baseline only rises, so a starve cannot be undone by a stale low
     /// recommendation before the hold expires.
-    pub(in crate::audio) fn apply_recommended_target(
-        &mut self,
-        recommended: Duration,
-        now: Instant,
-    ) {
+    pub(crate) fn apply_recommended_target(&mut self, recommended: Duration, now: Instant) {
         if !self.tuning.adaptive_target {
             return;
         }
@@ -136,7 +146,7 @@ impl AdaptivePlaybackStream {
 
     /// The active playout target in samples: the dynamic baseline clamped to its
     /// valid range, or the fixed configured target when adaptation is disabled.
-    pub(in crate::audio) fn effective_target_samples(&self) -> usize {
+    pub(crate) fn effective_target_samples(&self) -> usize {
         if !self.tuning.adaptive_target {
             return self.samples.target_queue;
         }
@@ -206,7 +216,7 @@ impl AdaptivePlaybackStream {
         self.input.last_sample_and_source()
     }
 
-    pub(in crate::audio) fn pop_sample(
+    pub(crate) fn pop_sample(
         &mut self,
         now: Instant,
         stats: &mut LivePlaybackMixerStats,
@@ -250,7 +260,7 @@ impl AdaptivePlaybackStream {
         Some(sample)
     }
 
-    pub(in crate::audio) fn pop_output_sample(
+    pub(crate) fn pop_output_sample(
         &mut self,
         now: Instant,
         stats: &mut LivePlaybackMixerStats,
@@ -420,7 +430,7 @@ impl AdaptivePlaybackStream {
         self.expanded_target_until = Some(now + hold);
     }
 
-    pub(in crate::audio) fn adaptive_target_samples(&self, now: Instant) -> usize {
+    pub(crate) fn adaptive_target_samples(&self, now: Instant) -> usize {
         if self.expanded_target_until.is_some_and(|until| now < until) {
             self.expanded_target_samples.max(self.samples.target_queue)
         } else {
@@ -433,7 +443,7 @@ impl AdaptivePlaybackStream {
             .max(self.output_target_floor_samples)
     }
 
-    pub(in crate::audio) fn skip_speech_gap_backlog(
+    pub(crate) fn skip_speech_gap_backlog(
         &mut self,
         now: Instant,
         stats: &mut LivePlaybackMixerStats,
@@ -489,7 +499,7 @@ impl AdaptivePlaybackStream {
         self.read_pos = 1.0;
     }
 
-    pub(in crate::audio) fn queued_samples(&self) -> usize {
+    pub(crate) fn queued_samples(&self) -> usize {
         self.input.frames()
     }
 }
@@ -499,6 +509,15 @@ mod tests {
     use super::*;
     #[allow(unused_imports)]
     use crate::audio::test_support::*;
+    use crate::audio::{
+        playback::LivePlaybackMixer,
+        shared::{
+            FRAME_SAMPLES, LIVE_OPUS_FRAME_SAMPLES, LIVE_PLAYBACK_HARD_QUEUE_BOUND,
+            LIVE_PLAYBACK_MAX_SPEED_UP, LIVE_PLAYBACK_SEVERE_LOSS_HOLD,
+            LIVE_PLAYBACK_SILENCE_MAX_SKIP, LIVE_PLAYBACK_TARGET_QUEUE, SAMPLE_RATE,
+            duration_to_ms, max_adjacent_delta, target_queue_samples,
+        },
+    };
 
     #[test]
     fn adaptive_stream_keeps_sixty_ms_target_under_good_conditions() {

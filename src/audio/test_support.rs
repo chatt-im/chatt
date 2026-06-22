@@ -1,8 +1,33 @@
 #![cfg(test)]
 //! Shared test fixtures for the audio module tree.
-use crate::audio::*;
+use std::{
+    collections::VecDeque,
+    time::{Duration, Instant},
+};
 
-pub(in crate::audio) fn count_direct_encoder_recoverable_dred(frame_samples: usize) -> usize {
+use opus_codec::{Channels, Decoder, DredDecoder, DredState, SampleRate};
+
+use crate::{
+    audio::{
+        capture::OpusVoiceEncoder,
+        playback::{
+            AdaptivePlaybackStream, LiveDecodeStream, LivePlaybackMixer, LivePlaybackMixerStats,
+        },
+        shared::{
+            DEFAULT_LIVE_MAX_AMPLIFICATION, DecodedFrameSource, FRAME_SAMPLES,
+            LIVE_OPUS_FRAME_SAMPLES, LIVE_PLAYBACK_DRED_MAX_SAMPLES, LiveAudioTuning,
+            MAX_OPUS_PACKET_BYTES, normalized_to_i16_scale, peak_normalized, rms_normalized,
+        },
+        sim::{
+            LiveAudioPacketLossProfile, LiveAudioSimulationConfig, LiveAudioSimulationReport,
+            LiveAudioSimulationScenario, load_live_audio_simulation_sample_pcm,
+            load_live_audio_simulation_speech_frames, run_live_audio_simulation_with_speech,
+        },
+    },
+    network::{AudioPacketRef, EncoderNetworkProfile, EncoderNetworkTuning},
+};
+
+pub(crate) fn count_direct_encoder_recoverable_dred(frame_samples: usize) -> usize {
     let mut encoder = OpusVoiceEncoder::new(32_000).unwrap();
     encoder
         .apply_network_profile(EncoderNetworkProfile::CRITICAL)
@@ -27,17 +52,14 @@ pub(in crate::audio) fn count_direct_encoder_recoverable_dred(frame_samples: usi
     count_recoverable_dred_packets(&packets, frame_samples)
 }
 
-pub(in crate::audio) fn float_i16_scale_to_i16(samples: &[f32]) -> Vec<i16> {
+pub(crate) fn float_i16_scale_to_i16(samples: &[f32]) -> Vec<i16> {
     samples
         .iter()
         .map(|sample| sample.round().clamp(i16::MIN as f32, i16::MAX as f32) as i16)
         .collect()
 }
 
-pub(in crate::audio) fn count_recoverable_dred_packets(
-    packets: &[Vec<u8>],
-    frame_samples: usize,
-) -> usize {
+pub(crate) fn count_recoverable_dred_packets(packets: &[Vec<u8>], frame_samples: usize) -> usize {
     let mut decoder = Decoder::new(SampleRate::Hz48000, Channels::Mono).unwrap();
     let mut dred_decoder = DredDecoder::new().unwrap();
     let mut output = vec![0.0f32; frame_samples];
@@ -70,7 +92,7 @@ pub(in crate::audio) fn count_recoverable_dred_packets(
 /// Encodes contiguous 20 ms speech packets under `profile` and returns the
 /// per-packet `(dred_reach_samples, payload_bytes)`. `dred_reach_samples` is
 /// the `opus_dred_parse` return, the depth of DRED carried by each packet.
-pub(in crate::audio) fn measure_dred_depth(profile: EncoderNetworkProfile) -> Vec<(usize, usize)> {
+pub(crate) fn measure_dred_depth(profile: EncoderNetworkProfile) -> Vec<(usize, usize)> {
     let mut encoder = OpusVoiceEncoder::new(profile.bitrate_bps).unwrap();
     encoder.apply_network_profile(profile).unwrap();
     let frames = sample_speech_frames();
@@ -106,7 +128,7 @@ pub(in crate::audio) fn measure_dred_depth(profile: EncoderNetworkProfile) -> Ve
 
 /// Encodes `count` contiguous 20 ms speech packets under `profile`, returning
 /// the raw Opus payloads (DRED included). Sequence numbers are the indices.
-pub(in crate::audio) fn encode_live_dred_packets(
+pub(crate) fn encode_live_dred_packets(
     profile: EncoderNetworkProfile,
     count: usize,
 ) -> Vec<Vec<u8>> {
@@ -133,7 +155,7 @@ pub(in crate::audio) fn encode_live_dred_packets(
 /// Delivers every packet except `dropped`, then drains across the gap and
 /// returns each decoded `(source, sample_count)` in playout order alongside
 /// the stream so callers can inspect `dred_parses`.
-pub(in crate::audio) fn drive_gap_recovery(
+pub(crate) fn drive_gap_recovery(
     packets: &[Vec<u8>],
     dropped: &[u32],
 ) -> (Vec<(DecodedFrameSource, usize)>, LiveDecodeStream) {
@@ -193,10 +215,7 @@ pub(in crate::audio) fn drive_gap_recovery(
 /// Drains a backlog through the stream while keeping its queue above target,
 /// returning every output sample. The look-ahead tail of three samples is
 /// left queued so playback never underruns at the end.
-pub(in crate::audio) fn drain_catch_up(
-    stream: &mut AdaptivePlaybackStream,
-    now: Instant,
-) -> Vec<f32> {
+pub(crate) fn drain_catch_up(stream: &mut AdaptivePlaybackStream, now: Instant) -> Vec<f32> {
     let mut stats = LivePlaybackMixerStats::default();
     let mut output = Vec::new();
     while stream.queued_samples() > 8 {
@@ -213,7 +232,7 @@ pub(in crate::audio) fn drain_catch_up(
     output
 }
 
-pub(in crate::audio) fn pop_until_nonzero(mixer: &mut LivePlaybackMixer, now: Instant) -> f32 {
+pub(crate) fn pop_until_nonzero(mixer: &mut LivePlaybackMixer, now: Instant) -> f32 {
     for _ in 0..(FRAME_SAMPLES * 2) {
         let sample = mixer.pop_mixed_sample(now);
         if sample.abs() > 0.01 {
@@ -223,10 +242,7 @@ pub(in crate::audio) fn pop_until_nonzero(mixer: &mut LivePlaybackMixer, now: In
     0.0
 }
 
-pub(in crate::audio) fn pop_next_nonzero_window(
-    mixer: &mut LivePlaybackMixer,
-    now: Instant,
-) -> f32 {
+pub(crate) fn pop_next_nonzero_window(mixer: &mut LivePlaybackMixer, now: Instant) -> f32 {
     let mut max_sample: f32 = 0.0;
     for _ in 0..(FRAME_SAMPLES * 2) {
         max_sample = max_sample.max(mixer.pop_mixed_sample(now).abs());
@@ -234,7 +250,7 @@ pub(in crate::audio) fn pop_next_nonzero_window(
     max_sample
 }
 
-pub(in crate::audio) fn test_audio_packet(sequence: u32, payload: &[u8]) -> AudioPacketRef<'_> {
+pub(crate) fn test_audio_packet(sequence: u32, payload: &[u8]) -> AudioPacketRef<'_> {
     AudioPacketRef {
         sequence,
         flags: 0,
@@ -243,10 +259,7 @@ pub(in crate::audio) fn test_audio_packet(sequence: u32, payload: &[u8]) -> Audi
     }
 }
 
-pub(in crate::audio) fn encode_test_frame(
-    encoder: &mut OpusVoiceEncoder,
-    amplitude: i16,
-) -> Vec<u8> {
+pub(crate) fn encode_test_frame(encoder: &mut OpusVoiceEncoder, amplitude: i16) -> Vec<u8> {
     let input = vec![amplitude; LIVE_OPUS_FRAME_SAMPLES];
     let mut output = vec![0u8; MAX_OPUS_PACKET_BYTES];
     let len = encoder.encode(&input, &mut output).unwrap();
@@ -254,11 +267,11 @@ pub(in crate::audio) fn encode_test_frame(
     output
 }
 
-pub(in crate::audio) fn test_tuning() -> LiveAudioTuning {
+pub(crate) fn test_tuning() -> LiveAudioTuning {
     LiveAudioTuning::default()
 }
 
-pub(in crate::audio) fn sample_speech_frames() -> &'static [Vec<f32>] {
+pub(crate) fn sample_speech_frames() -> &'static [Vec<f32>] {
     static FRAMES: std::sync::OnceLock<Vec<Vec<f32>>> = std::sync::OnceLock::new();
     FRAMES
         .get_or_init(|| {
@@ -268,7 +281,7 @@ pub(in crate::audio) fn sample_speech_frames() -> &'static [Vec<f32>] {
         .as_slice()
 }
 
-pub(in crate::audio) fn sample_high_energy_speech_frame() -> &'static [f32] {
+pub(crate) fn sample_high_energy_speech_frame() -> &'static [f32] {
     sample_speech_frames()
         .iter()
         .find(|frame| peak_normalized(frame.as_slice()) > 0.25)
@@ -284,14 +297,14 @@ pub(in crate::audio) fn sample_high_energy_speech_frame() -> &'static [f32] {
 /// Synthetic acoustic echo path for AEC tests. Delays the normalized render
 /// signal by `delay_frames`, scales it by `gain`, and sums optional near-end
 /// speech, returning an i16-scale mic frame.
-pub(in crate::audio) struct EchoPath {
+pub(crate) struct EchoPath {
     delay: VecDeque<Vec<f32>>,
     delay_frames: usize,
     gain: f32,
 }
 
 impl EchoPath {
-    pub(in crate::audio) fn new(delay_frames: usize, gain: f32) -> Self {
+    pub(crate) fn new(delay_frames: usize, gain: f32) -> Self {
         Self {
             delay: VecDeque::new(),
             delay_frames,
@@ -299,7 +312,7 @@ impl EchoPath {
         }
     }
 
-    pub(in crate::audio) fn capture(&mut self, render: &[f32], near: &[f32]) -> Vec<f32> {
+    pub(crate) fn capture(&mut self, render: &[f32], near: &[f32]) -> Vec<f32> {
         self.delay.push_back(render.to_vec());
         let echo = if self.delay.len() > self.delay_frames {
             self.delay.pop_front().unwrap()
@@ -315,7 +328,7 @@ impl EchoPath {
     }
 }
 
-pub(in crate::audio) fn simulate(
+pub(crate) fn simulate(
     scenario: LiveAudioSimulationScenario,
     duration: Duration,
     tuning: LiveAudioTuning,
@@ -330,7 +343,7 @@ pub(in crate::audio) fn simulate(
     )
 }
 
-pub(in crate::audio) fn simulate_with_loss(
+pub(crate) fn simulate_with_loss(
     scenario: LiveAudioSimulationScenario,
     duration: Duration,
     tuning: LiveAudioTuning,
@@ -355,7 +368,7 @@ pub(in crate::audio) fn simulate_with_loss(
     .unwrap()
 }
 
-pub(in crate::audio) fn sample_direct_pcm_frames(frames: usize) -> Vec<f32> {
+pub(crate) fn sample_direct_pcm_frames(frames: usize) -> Vec<f32> {
     let pcm =
         load_live_audio_simulation_sample_pcm().expect("assets/sample-001.opus should decode");
     let samples = frames.saturating_mul(FRAME_SAMPLES).min(pcm.len());
@@ -363,7 +376,7 @@ pub(in crate::audio) fn sample_direct_pcm_frames(frames: usize) -> Vec<f32> {
     pcm[..samples].to_vec()
 }
 
-pub(in crate::audio) fn assert_coherent_output(report: &LiveAudioSimulationReport, min_rms: f32) {
+pub(crate) fn assert_coherent_output(report: &LiveAudioSimulationReport, min_rms: f32) {
     assert_eq!(report.non_finite_samples, 0, "{report:?}");
     assert_eq!(report.clipped_samples, 0, "{report:?}");
     assert!(report.peak <= 1.0, "{report:?}");

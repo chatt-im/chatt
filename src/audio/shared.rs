@@ -1,99 +1,108 @@
-use crate::audio::*;
+use std::{
+    fmt, fs,
+    io::{BufWriter, Write},
+    path::Path,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering},
+    },
+    time::{Duration, Instant},
+};
+
+use nnnoiseless::DenoiseState;
 
 pub const SAMPLE_RATE: u32 = 48_000;
 pub const CHANNELS: u8 = 1;
 pub const FRAME_SAMPLES: usize = DenoiseState::FRAME_SIZE;
 pub const DEFAULT_LIVE_MAX_AMPLIFICATION: f32 = 2.0;
-pub(in crate::audio) const LIVE_OPUS_FRAME_SAMPLES: usize = FRAME_SAMPLES * 2;
-pub(in crate::audio) const LIVE_PACKET_FLAG_OPUS_RESET: u8 = 0x01;
-pub(in crate::audio) const CALLBACK_QUEUE_CAPACITY: usize = 8;
-pub(in crate::audio) const LIVE_PLAYBACK_COMMAND_CAPACITY: usize = 256;
-pub(in crate::audio) const LIVE_PLAYBACK_TARGET_QUEUE: Duration = Duration::from_millis(60);
+pub(crate) const LIVE_OPUS_FRAME_SAMPLES: usize = FRAME_SAMPLES * 2;
+pub(crate) const LIVE_PACKET_FLAG_OPUS_RESET: u8 = 0x01;
+pub(crate) const CALLBACK_QUEUE_CAPACITY: usize = 8;
+pub(crate) const LIVE_PLAYBACK_COMMAND_CAPACITY: usize = 256;
+pub(crate) const LIVE_PLAYBACK_TARGET_QUEUE: Duration = Duration::from_millis(60);
 // Receiver-side dynamic target. On a consistent connection (low inter-arrival
 // jitter, no loss/late/reorder) the playout target relaxes from the 60 ms
 // default toward this floor, cutting latency on LAN and same-city links. The
 // target only ever lowers; raising above the default stays the job of the
 // loss-expansion path. Buffer depth tracks delay variation, not absolute RTT.
-pub(in crate::audio) const LIVE_PLAYBACK_DYNAMIC_TARGET_FLOOR: Duration = Duration::from_millis(20);
-pub(in crate::audio) const LIVE_PLAYBACK_DYNAMIC_TARGET_MARGIN: Duration = Duration::from_millis(8);
+pub(crate) const LIVE_PLAYBACK_DYNAMIC_TARGET_FLOOR: Duration = Duration::from_millis(20);
+pub(crate) const LIVE_PLAYBACK_DYNAMIC_TARGET_MARGIN: Duration = Duration::from_millis(8);
 // Jitter-to-target gain: the dynamic target adds this multiple of the jitter
 // estimate above one packet period. Sized so a clean internet path with a small
 // jitter tail descends below the ceiling instead of pinning at it.
-pub(in crate::audio) const LIVE_PLAYBACK_DYNAMIC_JITTER_GAIN: f64 = 1.5;
+pub(crate) const LIVE_PLAYBACK_DYNAMIC_JITTER_GAIN: f64 = 1.5;
 // Weight on the slow-decay jitter peak when sizing the target. The peak holds a
 // single late packet for ~2 s, so on a path with a continuous small tail it
 // would otherwise dominate `max(smoothed, peak)` and keep the target pinned.
 // Discounting it lets steady-state jitter, not the held worst case, set the
 // target, while a genuine burst still drives the peak high enough to re-widen.
-pub(in crate::audio) const LIVE_PLAYBACK_DYNAMIC_PEAK_WEIGHT: f64 = 0.5;
+pub(crate) const LIVE_PLAYBACK_DYNAMIC_PEAK_WEIGHT: f64 = 0.5;
 // Late-jitter EWMA gain (J += (late - J) / 16).
-pub(in crate::audio) const LIVE_PLAYBACK_RTP_JITTER_GAIN: f64 = 1.0 / 16.0;
+pub(crate) const LIVE_PLAYBACK_RTP_JITTER_GAIN: f64 = 1.0 / 16.0;
 // Per-packet rise of the relative-transit baseline, in microseconds. The
 // baseline tracks the best-case (minimum) transit, dropping instantly to new
 // lows and rising at this rate to forget stale lows so a constant latency
 // shift is adopted within a few seconds. Lateness is measured above it, so
 // only delay variation, not absolute latency, raises the target.
-pub(in crate::audio) const LIVE_PLAYBACK_TRANSIT_BASE_FORGET_US: f64 = 500.0;
+pub(crate) const LIVE_PLAYBACK_TRANSIT_BASE_FORGET_US: f64 = 500.0;
 // Per-packet bleed for the fast-attack/slow-decay jitter peak tracker. At a
 // 50 packets/s cadence this is a ~2 s time constant, so one late packet keeps
 // the target elevated for a couple seconds, then it relaxes.
-pub(in crate::audio) const LIVE_PLAYBACK_JITTER_PEAK_DECAY: f64 = 0.99;
+pub(crate) const LIVE_PLAYBACK_JITTER_PEAK_DECAY: f64 = 0.99;
 // Consecutive clean feedback windows required before the target may descend.
-pub(in crate::audio) const LIVE_PLAYBACK_DYNAMIC_RELAX_WINDOWS: u32 = 4;
+pub(crate) const LIVE_PLAYBACK_DYNAMIC_RELAX_WINDOWS: u32 = 4;
 // A lone playout underrun is usually a talkspurt draining to empty, not network
 // starvation. The target only re-widens when underruns recur: at least this
 // many within the window below. Each starvation episode produces one underrun
 // notification, so an isolated end-of-speech drain never pins the target.
-pub(in crate::audio) const LIVE_PLAYBACK_DYNAMIC_UNDERRUN_WINDOW: Duration =
-    Duration::from_millis(500);
-pub(in crate::audio) const LIVE_PLAYBACK_DYNAMIC_UNDERRUN_MIN: usize = 2;
+pub(crate) const LIVE_PLAYBACK_DYNAMIC_UNDERRUN_WINDOW: Duration = Duration::from_millis(500);
+pub(crate) const LIVE_PLAYBACK_DYNAMIC_UNDERRUN_MIN: usize = 2;
 // Ignore recommended-target changes smaller than this to avoid chatter.
-pub(in crate::audio) const LIVE_PLAYBACK_DYNAMIC_DEADBAND: Duration = Duration::from_millis(3);
-pub(in crate::audio) const LIVE_PLAYBACK_MODERATE_LOSS_QUEUE: Duration = Duration::from_millis(320);
-pub(in crate::audio) const LIVE_PLAYBACK_DRED_HORIZON: Duration = Duration::from_millis(1_000);
-pub(in crate::audio) const LIVE_PLAYBACK_HARD_QUEUE_BOUND: Duration = Duration::from_millis(1_500);
-pub(in crate::audio) const LIVE_PLAYBACK_LOSS_WINDOW: Duration = Duration::from_secs(5);
-pub(in crate::audio) const LIVE_PLAYBACK_LOSS_HOLD: Duration = Duration::from_secs(5);
-pub(in crate::audio) const LIVE_PLAYBACK_SEVERE_LOSS_HOLD: Duration = Duration::from_secs(10);
-pub(in crate::audio) const LIVE_PLAYBACK_INITIAL_BUFFER: Duration = Duration::from_millis(40);
-pub(in crate::audio) const LIVE_PLAYBACK_DRAIN_INTERVAL: Duration = Duration::from_millis(10);
-pub(in crate::audio) const LIVE_PLAYBACK_FEEDBACK_INTERVAL: Duration = Duration::from_millis(500);
-pub(in crate::audio) const LIVE_PLAYBACK_FEEDBACK_PACKETS: u32 = 25;
+pub(crate) const LIVE_PLAYBACK_DYNAMIC_DEADBAND: Duration = Duration::from_millis(3);
+pub(crate) const LIVE_PLAYBACK_MODERATE_LOSS_QUEUE: Duration = Duration::from_millis(320);
+pub(crate) const LIVE_PLAYBACK_DRED_HORIZON: Duration = Duration::from_millis(1_000);
+pub(crate) const LIVE_PLAYBACK_HARD_QUEUE_BOUND: Duration = Duration::from_millis(1_500);
+pub(crate) const LIVE_PLAYBACK_LOSS_WINDOW: Duration = Duration::from_secs(5);
+pub(crate) const LIVE_PLAYBACK_LOSS_HOLD: Duration = Duration::from_secs(5);
+pub(crate) const LIVE_PLAYBACK_SEVERE_LOSS_HOLD: Duration = Duration::from_secs(10);
+pub(crate) const LIVE_PLAYBACK_INITIAL_BUFFER: Duration = Duration::from_millis(40);
+pub(crate) const LIVE_PLAYBACK_DRAIN_INTERVAL: Duration = Duration::from_millis(10);
+pub(crate) const LIVE_PLAYBACK_FEEDBACK_INTERVAL: Duration = Duration::from_millis(500);
+pub(crate) const LIVE_PLAYBACK_FEEDBACK_PACKETS: u32 = 25;
 // Cadence of the "live playback snapshot" diagnostic. Decoupled from the 500 ms
 // feedback window so queue/target/correction dynamics are sampled finely enough
 // to see the queue oscillate between arrivals (one packet is 20 ms).
-pub(in crate::audio) const LIVE_PLAYBACK_SNAPSHOT_INTERVAL: Duration = Duration::from_millis(100);
-pub(in crate::audio) const LIVE_PLAYBACK_MAX_REORDER_DELAY: Duration = Duration::from_millis(60);
+pub(crate) const LIVE_PLAYBACK_SNAPSHOT_INTERVAL: Duration = Duration::from_millis(100);
+pub(crate) const LIVE_PLAYBACK_MAX_REORDER_DELAY: Duration = Duration::from_millis(60);
 // One 20 ms Opus packet of cadence jitter must not trigger resampling, but a
 // persistent excess beyond that should drain back to target. A larger value
 // reopens a dead zone where a startup overshoot parks above target forever.
-pub(in crate::audio) const LIVE_PLAYBACK_CATCH_UP_START_EXCESS: Duration =
-    Duration::from_millis(20);
-pub(in crate::audio) const LIVE_PLAYBACK_MAX_SPEED_UP: f64 = 0.25;
+pub(crate) const LIVE_PLAYBACK_CATCH_UP_START_EXCESS: Duration = Duration::from_millis(20);
+pub(crate) const LIVE_PLAYBACK_MAX_SPEED_UP: f64 = 0.25;
 // One-pole smoothing coefficient for the catch-up correction (tau = 50 ms):
 // alpha = 1 - exp(-1 / (tau * rate)) ~= 1 / (tau * rate).
-pub(in crate::audio) const LIVE_PLAYBACK_CORRECTION_ALPHA: f64 = 1.0 / (0.050 * SAMPLE_RATE as f64);
+pub(crate) const LIVE_PLAYBACK_CORRECTION_ALPHA: f64 = 1.0 / (0.050 * SAMPLE_RATE as f64);
 // Maximum per-sample change in correction. Full 0 -> max takes at least 2.5 s,
 // which keeps trace-sized burst recovery from jumping abruptly without pitch
 // correction while still allowing the 1.25x ceiling for sustained backlog.
-pub(in crate::audio) const LIVE_PLAYBACK_CORRECTION_RAMP_SECONDS: f64 = 2.5;
-pub(in crate::audio) const LIVE_PLAYBACK_CORRECTION_SLEW: f64 =
+pub(crate) const LIVE_PLAYBACK_CORRECTION_RAMP_SECONDS: f64 = 2.5;
+pub(crate) const LIVE_PLAYBACK_CORRECTION_SLEW: f64 =
     LIVE_PLAYBACK_MAX_SPEED_UP / (LIVE_PLAYBACK_CORRECTION_RAMP_SECONDS * SAMPLE_RATE as f64);
-pub(in crate::audio) const LIVE_PLAYBACK_DRED_MAX_SAMPLES: usize = SAMPLE_RATE as usize;
-pub(in crate::audio) const LIVE_PLAYBACK_SILENCE_VAD_MAX: u8 = 64;
-pub(in crate::audio) const LIVE_PLAYBACK_SILENCE_MIN_GAP: Duration = Duration::from_millis(250);
-pub(in crate::audio) const LIVE_PLAYBACK_SILENCE_GUARD: Duration = Duration::from_millis(40);
-pub(in crate::audio) const LIVE_PLAYBACK_SILENCE_RAMP: Duration = Duration::from_millis(10);
-pub(in crate::audio) const LIVE_PLAYBACK_SILENCE_MAX_SKIP: Duration = Duration::from_millis(200);
-pub(in crate::audio) const LIVE_PLAYBACK_SILENCE_MIN_SKIP: Duration = Duration::from_millis(20);
-pub(in crate::audio) const LIVE_PLAYBACK_SILENCE_RANGE_COUNT: usize = 2;
-pub(in crate::audio) const LIVE_PLAYBACK_RECOVERY_DECLICK: Duration = Duration::from_millis(5);
-pub(in crate::audio) const LIVE_PLAYBACK_RECOVERY_DECLICK_MIN_DELTA: f32 = 0.01;
-pub(in crate::audio) const LIVE_CAPTURE_LONG_SILENCE_STOP: Duration = Duration::from_secs(2);
-pub(in crate::audio) const LIVE_CAPTURE_SILENCE_PREROLL: Duration = Duration::from_millis(30);
-pub(in crate::audio) const LIVE_CAPTURE_SILENCE_RAMP: Duration = Duration::from_millis(10);
-pub(in crate::audio) const MAX_OPUS_DECODE_SAMPLES: usize = 5_760;
-pub(in crate::audio) const MAX_OPUS_PACKET_BYTES: usize = 1_500;
+pub(crate) const LIVE_PLAYBACK_DRED_MAX_SAMPLES: usize = SAMPLE_RATE as usize;
+pub(crate) const LIVE_PLAYBACK_SILENCE_VAD_MAX: u8 = 64;
+pub(crate) const LIVE_PLAYBACK_SILENCE_MIN_GAP: Duration = Duration::from_millis(250);
+pub(crate) const LIVE_PLAYBACK_SILENCE_GUARD: Duration = Duration::from_millis(40);
+pub(crate) const LIVE_PLAYBACK_SILENCE_RAMP: Duration = Duration::from_millis(10);
+pub(crate) const LIVE_PLAYBACK_SILENCE_MAX_SKIP: Duration = Duration::from_millis(200);
+pub(crate) const LIVE_PLAYBACK_SILENCE_MIN_SKIP: Duration = Duration::from_millis(20);
+pub(crate) const LIVE_PLAYBACK_SILENCE_RANGE_COUNT: usize = 2;
+pub(crate) const LIVE_PLAYBACK_RECOVERY_DECLICK: Duration = Duration::from_millis(5);
+pub(crate) const LIVE_PLAYBACK_RECOVERY_DECLICK_MIN_DELTA: f32 = 0.01;
+pub(crate) const LIVE_CAPTURE_LONG_SILENCE_STOP: Duration = Duration::from_secs(2);
+pub(crate) const LIVE_CAPTURE_SILENCE_PREROLL: Duration = Duration::from_millis(30);
+pub(crate) const LIVE_CAPTURE_SILENCE_RAMP: Duration = Duration::from_millis(10);
+pub(crate) const MAX_OPUS_DECODE_SAMPLES: usize = 5_760;
+pub(crate) const MAX_OPUS_PACKET_BYTES: usize = 1_500;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BufferRequest {
@@ -347,11 +356,11 @@ pub struct PlaybackStreamControl {
 
 #[derive(Clone)]
 pub struct AudioStats {
-    pub(in crate::audio) inner: Arc<SharedStats>,
+    inner: Arc<SharedStats>,
 }
 
 impl AudioStats {
-    pub(in crate::audio) fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             inner: Arc::new(SharedStats::default()),
         }
@@ -361,8 +370,49 @@ impl AudioStats {
         self.inner.snapshot()
     }
 
-    pub(in crate::audio) fn set_error(&self, error: String) {
+    pub(crate) fn set_error(&self, error: String) {
         self.inner.set_error(error);
+    }
+
+    pub(crate) fn mark_worker_stopped(&self) {
+        self.inner.worker_stopped.store(true, Ordering::Release);
+    }
+
+    pub(crate) fn record_capture_callback(&self, samples: u64, rms: f32, peak: f32) {
+        self.inner.callbacks.fetch_add(1, Ordering::Relaxed);
+        self.inner
+            .captured_samples
+            .fetch_add(samples, Ordering::Relaxed);
+        self.store_levels(rms, peak);
+    }
+
+    pub(crate) fn record_dropped_chunk(&self) {
+        self.inner.dropped_chunks.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_encoded_packet(&self, packet_len: usize) {
+        self.inner.encoded_packets.fetch_add(1, Ordering::Relaxed);
+        self.inner
+            .encoded_bytes
+            .fetch_add(packet_len as u64, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_stream_error(&self, error: String) {
+        self.inner.stream_errors.fetch_add(1, Ordering::Relaxed);
+        self.set_error(error);
+    }
+
+    pub(crate) fn store_levels(&self, rms: f32, peak: f32) {
+        self.inner.rms_bits.store(rms.to_bits(), Ordering::Relaxed);
+        self.inner
+            .peak_bits
+            .store(peak.to_bits(), Ordering::Relaxed);
+    }
+
+    pub(crate) fn store_vad_probability(&self, vad_probability: f32) {
+        self.inner
+            .vad_bits
+            .store(vad_probability.to_bits(), Ordering::Relaxed);
     }
 }
 
@@ -383,7 +433,7 @@ pub struct StatsSnapshot {
 
 #[derive(Clone)]
 pub struct PlaybackStats {
-    pub(in crate::audio) inner: Arc<SharedPlaybackStats>,
+    inner: Arc<SharedPlaybackStats>,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -410,7 +460,7 @@ pub struct LivePlaybackSnapshot {
 }
 
 impl PlaybackStats {
-    pub(in crate::audio) fn new(total_samples: usize) -> Self {
+    pub(crate) fn new(total_samples: usize) -> Self {
         Self {
             inner: Arc::new(SharedPlaybackStats {
                 total_samples,
@@ -435,10 +485,29 @@ impl PlaybackStats {
         }
     }
 
-    pub(in crate::audio) fn set_error(&self, error: String) {
+    pub(crate) fn set_error(&self, error: String) {
         if let Ok(mut last_error) = self.inner.last_error.lock() {
             *last_error = Some(error);
         }
+    }
+
+    pub(crate) fn record_callback(&self) {
+        self.inner.callbacks.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_stream_error(&self, error: String) {
+        self.inner.stream_errors.fetch_add(1, Ordering::Relaxed);
+        self.set_error(error);
+    }
+
+    pub(crate) fn mark_finished(&self) {
+        self.inner.finished.store(true, Ordering::Relaxed);
+    }
+
+    pub(crate) fn store_played_samples(&self, played_samples: usize) {
+        self.inner
+            .played_samples
+            .store(played_samples, Ordering::Relaxed);
     }
 }
 
@@ -453,27 +522,27 @@ pub struct PlaybackSnapshot {
 }
 
 #[derive(Default)]
-pub(in crate::audio) struct SharedPlaybackStats {
-    pub(in crate::audio) callbacks: AtomicU64,
-    pub(in crate::audio) played_samples: AtomicUsize,
-    pub(in crate::audio) stream_errors: AtomicU64,
-    pub(in crate::audio) finished: AtomicBool,
+struct SharedPlaybackStats {
+    callbacks: AtomicU64,
+    played_samples: AtomicUsize,
+    stream_errors: AtomicU64,
+    finished: AtomicBool,
     total_samples: usize,
     last_error: Mutex<Option<String>>,
 }
 
 #[derive(Default)]
-pub(in crate::audio) struct SharedStats {
-    pub(in crate::audio) callbacks: AtomicU64,
-    pub(in crate::audio) captured_samples: AtomicU64,
-    pub(in crate::audio) encoded_packets: AtomicU64,
-    pub(in crate::audio) encoded_bytes: AtomicU64,
-    pub(in crate::audio) dropped_chunks: AtomicU64,
-    pub(in crate::audio) stream_errors: AtomicU64,
-    pub(in crate::audio) rms_bits: AtomicU32,
-    pub(in crate::audio) peak_bits: AtomicU32,
-    pub(in crate::audio) vad_bits: AtomicU32,
-    pub(in crate::audio) worker_stopped: AtomicBool,
+struct SharedStats {
+    callbacks: AtomicU64,
+    captured_samples: AtomicU64,
+    encoded_packets: AtomicU64,
+    encoded_bytes: AtomicU64,
+    dropped_chunks: AtomicU64,
+    stream_errors: AtomicU64,
+    rms_bits: AtomicU32,
+    peak_bits: AtomicU32,
+    vad_bits: AtomicU32,
+    worker_stopped: AtomicBool,
     last_error: Mutex<Option<String>>,
 }
 
@@ -501,7 +570,7 @@ impl SharedStats {
     }
 }
 
-pub(in crate::audio) fn rms_i16_scale(samples: &[f32]) -> f32 {
+pub(crate) fn rms_i16_scale(samples: &[f32]) -> f32 {
     if samples.is_empty() {
         return 0.0;
     }
@@ -515,7 +584,7 @@ pub(in crate::audio) fn rms_i16_scale(samples: &[f32]) -> f32 {
     (square_sum / samples.len() as f32).sqrt()
 }
 
-pub(in crate::audio) fn peak_i16_scale(samples: &[f32]) -> f32 {
+pub(crate) fn peak_i16_scale(samples: &[f32]) -> f32 {
     samples
         .iter()
         .map(|sample| (sample / i16::MAX as f32).abs())
@@ -523,7 +592,7 @@ pub(in crate::audio) fn peak_i16_scale(samples: &[f32]) -> f32 {
         .clamp(0.0, 1.0)
 }
 
-pub(in crate::audio) fn rms_normalized(samples: &[f32]) -> f32 {
+pub(crate) fn rms_normalized(samples: &[f32]) -> f32 {
     if samples.is_empty() {
         return 0.0;
     }
@@ -531,7 +600,7 @@ pub(in crate::audio) fn rms_normalized(samples: &[f32]) -> f32 {
     (square_sum / samples.len() as f32).sqrt()
 }
 
-pub(in crate::audio) fn peak_normalized(samples: &[f32]) -> f32 {
+pub(crate) fn peak_normalized(samples: &[f32]) -> f32 {
     samples
         .iter()
         .map(|sample| sample.abs())
@@ -539,15 +608,11 @@ pub(in crate::audio) fn peak_normalized(samples: &[f32]) -> f32 {
         .clamp(0.0, 1.0)
 }
 
-pub(in crate::audio) fn vad_to_u8(vad_probability: f32) -> u8 {
+pub(crate) fn vad_to_u8(vad_probability: f32) -> u8 {
     (vad_probability.clamp(0.0, 1.0) * u8::MAX as f32).round() as u8
 }
 
-pub(in crate::audio) fn pack_silence_range(
-    range: usize,
-    start_samples: u16,
-    len_samples: u16,
-) -> u64 {
+pub(crate) fn pack_silence_range(range: usize, start_samples: u16, len_samples: u16) -> u64 {
     let shift = range.saturating_mul(32);
     if shift >= u64::BITS as usize {
         return 0;
@@ -556,7 +621,7 @@ pub(in crate::audio) fn pack_silence_range(
     u64::from(packed) << shift
 }
 
-pub(in crate::audio) fn silence_ranges_contain(silence_ranges: u64, offset_samples: usize) -> bool {
+pub(crate) fn silence_ranges_contain(silence_ranges: u64, offset_samples: usize) -> bool {
     for range in 0..LIVE_PLAYBACK_SILENCE_RANGE_COUNT {
         let shift = range * 32;
         let packed = ((silence_ranges >> shift) & u64::from(u32::MAX)) as u32;
@@ -572,7 +637,7 @@ pub(in crate::audio) fn silence_ranges_contain(silence_ranges: u64, offset_sampl
     false
 }
 
-pub(in crate::audio) fn emit_decoded_samples_by_silence_ranges<F>(
+pub(crate) fn emit_decoded_samples_by_silence_ranges<F>(
     trace: &mut Option<LiveAudioTraceWriter>,
     samples: &[f32],
     source: DecodedFrameSource,
@@ -603,34 +668,34 @@ pub(crate) fn convert_i16_scale_to_pcm_i16(input: &[f32], output: &mut [i16]) {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(in crate::audio) enum DecodedFrameSource {
+pub(crate) enum DecodedFrameSource {
     Normal,
     Dred,
     Plc,
     DecodeError,
 }
 
-pub(in crate::audio) fn target_queue_samples(tuning: LiveAudioTuning) -> usize {
+pub(crate) fn target_queue_samples(tuning: LiveAudioTuning) -> usize {
     samples_for_duration(tuning.target_queue)
 }
 
-pub(in crate::audio) fn samples_for_duration(duration: Duration) -> usize {
+pub(crate) fn samples_for_duration(duration: Duration) -> usize {
     (duration.as_secs_f64() * SAMPLE_RATE as f64).round() as usize
 }
 
-pub(in crate::audio) fn frames_for_duration(duration: Duration) -> usize {
+pub(crate) fn frames_for_duration(duration: Duration) -> usize {
     samples_for_duration(duration).saturating_add(FRAME_SAMPLES.saturating_sub(1)) / FRAME_SAMPLES
 }
 
-pub(in crate::audio) fn samples_to_ms(samples: usize) -> u64 {
+pub(crate) fn samples_to_ms(samples: usize) -> u64 {
     ((samples as f64 / SAMPLE_RATE as f64) * 1_000.0).round() as u64
 }
 
-pub(in crate::audio) fn duration_to_ms(duration: Duration) -> u64 {
+pub(crate) fn duration_to_ms(duration: Duration) -> u64 {
     duration.as_millis().min(u128::from(u64::MAX)) as u64
 }
 
-pub(in crate::audio) fn validate_duration_ms(
+pub(crate) fn validate_duration_ms(
     name: &str,
     duration: Duration,
     min_ms: u64,
@@ -647,7 +712,7 @@ pub(in crate::audio) fn validate_duration_ms(
 /// (`t = 0`) and `p2` (`t = 1`) using the Catmull-Rom cubic with `p0` and `p3`
 /// as outer neighbours. The curve passes through `p1` and `p2` exactly, so a
 /// read at `t = 0` returns the input sample unchanged.
-pub(in crate::audio) fn catmull_rom(p0: f32, p1: f32, p2: f32, p3: f32, t: f32) -> f32 {
+pub(crate) fn catmull_rom(p0: f32, p1: f32, p2: f32, p3: f32, t: f32) -> f32 {
     let t2 = t * t;
     let t3 = t2 * t;
     0.5 * (2.0 * p1
@@ -656,7 +721,7 @@ pub(in crate::audio) fn catmull_rom(p0: f32, p1: f32, p2: f32, p3: f32, t: f32) 
         + (-p0 + 3.0 * p1 - 3.0 * p2 + p3) * t3)
 }
 
-pub(in crate::audio) fn sequence_distance_forward(from: u32, to: u32) -> Option<u32> {
+pub(crate) fn sequence_distance_forward(from: u32, to: u32) -> Option<u32> {
     let distance = to.wrapping_sub(from);
     if distance < (1 << 31) {
         Some(distance)
@@ -665,11 +730,11 @@ pub(in crate::audio) fn sequence_distance_forward(from: u32, to: u32) -> Option<
     }
 }
 
-pub(in crate::audio) fn sequence_is_before(left: u32, right: u32) -> bool {
+pub(crate) fn sequence_is_before(left: u32, right: u32) -> bool {
     sequence_distance_forward(left, right).is_some_and(|distance| distance > 0)
 }
 
-pub(in crate::audio) fn sequence_max_forward(left: u32, right: u32) -> u32 {
+pub(crate) fn sequence_max_forward(left: u32, right: u32) -> u32 {
     if sequence_is_before(left, right) {
         right
     } else {
@@ -677,7 +742,7 @@ pub(in crate::audio) fn sequence_max_forward(left: u32, right: u32) -> u32 {
     }
 }
 
-pub(in crate::audio) fn duration_abs_delta_ms(left: Duration, right: Duration) -> u64 {
+pub(crate) fn duration_abs_delta_ms(left: Duration, right: Duration) -> u64 {
     if left >= right {
         duration_to_ms(left - right)
     } else {
@@ -685,15 +750,15 @@ pub(in crate::audio) fn duration_abs_delta_ms(left: Duration, right: Duration) -
     }
 }
 
-pub(in crate::audio) fn clamp_u16_from_u32(value: u32) -> u16 {
+pub(crate) fn clamp_u16_from_u32(value: u32) -> u16 {
     value.min(u32::from(u16::MAX)) as u16
 }
 
-pub(in crate::audio) fn clamp_u16_from_u64(value: u64) -> u16 {
+pub(crate) fn clamp_u16_from_u64(value: u64) -> u16 {
     value.min(u64::from(u16::MAX)) as u16
 }
 
-pub(in crate::audio) fn db_to_gain(db: f32) -> f32 {
+pub(crate) fn db_to_gain(db: f32) -> f32 {
     if db == 0.0 {
         1.0
     } else {
@@ -701,7 +766,7 @@ pub(in crate::audio) fn db_to_gain(db: f32) -> f32 {
     }
 }
 
-pub(in crate::audio) fn soft_limit(sample: f32) -> f32 {
+pub(crate) fn soft_limit(sample: f32) -> f32 {
     const THRESHOLD: f32 = 0.95;
     let magnitude = sample.abs();
     if magnitude <= THRESHOLD {
@@ -740,7 +805,7 @@ impl LiveAudioTraceWriter {
         })
     }
 
-    pub(in crate::audio) fn write_event(&mut self, event: impl fmt::Display) {
+    pub(crate) fn write_event(&mut self, event: impl fmt::Display) {
         let _ = writeln!(self.writer, "{event}");
     }
 
@@ -751,11 +816,11 @@ impl LiveAudioTraceWriter {
     }
 }
 
-pub(in crate::audio) fn trace_time_ms(start: Instant, now: Instant) -> u64 {
+pub(crate) fn trace_time_ms(start: Instant, now: Instant) -> u64 {
     duration_to_ms(now.saturating_duration_since(start))
 }
 
-pub(in crate::audio) fn trace_source_name(source: DecodedFrameSource) -> &'static str {
+pub(crate) fn trace_source_name(source: DecodedFrameSource) -> &'static str {
     match source {
         DecodedFrameSource::Normal => "normal",
         DecodedFrameSource::Dred => "dred",
@@ -764,7 +829,7 @@ pub(in crate::audio) fn trace_source_name(source: DecodedFrameSource) -> &'stati
     }
 }
 
-pub(in crate::audio) fn max_adjacent_delta(samples: &[f32]) -> f32 {
+pub(crate) fn max_adjacent_delta(samples: &[f32]) -> f32 {
     let mut max_delta: f32 = 0.0;
     let mut last: Option<f32> = None;
     for sample in samples {
@@ -776,7 +841,7 @@ pub(in crate::audio) fn max_adjacent_delta(samples: &[f32]) -> f32 {
     max_delta
 }
 
-pub(in crate::audio) fn trace_jitter_item(
+pub(crate) fn trace_jitter_item(
     trace: &mut Option<LiveAudioTraceWriter>,
     start: Instant,
     now: Instant,
@@ -798,7 +863,7 @@ pub(in crate::audio) fn trace_jitter_item(
     });
 }
 
-pub(in crate::audio) fn trace_fast_forward(
+pub(crate) fn trace_fast_forward(
     trace: &mut Option<LiveAudioTraceWriter>,
     start: Instant,
     now: Instant,
@@ -821,7 +886,7 @@ pub(in crate::audio) fn trace_fast_forward(
     });
 }
 
-pub(in crate::audio) fn trace_decoder_reset(
+pub(crate) fn trace_decoder_reset(
     trace: &mut Option<LiveAudioTraceWriter>,
     start: Instant,
     now: Instant,
@@ -840,7 +905,7 @@ pub(in crate::audio) fn trace_decoder_reset(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(in crate::audio) fn trace_dred_parse(
+pub(crate) fn trace_dred_parse(
     trace: &mut Option<LiveAudioTraceWriter>,
     start: Instant,
     now: Instant,
@@ -868,7 +933,7 @@ pub(in crate::audio) fn trace_dred_parse(
     });
 }
 
-pub(in crate::audio) fn trace_dred_skip(
+pub(crate) fn trace_dred_skip(
     trace: &mut Option<LiveAudioTraceWriter>,
     start: Instant,
     now: Instant,
@@ -891,7 +956,7 @@ pub(in crate::audio) fn trace_dred_skip(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(in crate::audio) fn trace_decode_output(
+pub(crate) fn trace_decode_output(
     trace: &mut Option<LiveAudioTraceWriter>,
     start: Instant,
     now: Instant,
@@ -927,7 +992,7 @@ pub(in crate::audio) fn trace_decode_output(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(in crate::audio) fn trace_mixer_queue(
+pub(crate) fn trace_mixer_queue(
     trace: &mut Option<LiveAudioTraceWriter>,
     start: Instant,
     now: Instant,
@@ -954,7 +1019,7 @@ pub(in crate::audio) fn trace_mixer_queue(
     });
 }
 
-pub(in crate::audio) fn normalized_to_i16_scale(samples: &[f32]) -> Vec<f32> {
+pub(crate) fn normalized_to_i16_scale(samples: &[f32]) -> Vec<f32> {
     samples
         .iter()
         .map(|sample| sample.clamp(-1.0, 1.0) * i16::MAX as f32)
@@ -964,6 +1029,7 @@ pub(in crate::audio) fn normalized_to_i16_scale(samples: &[f32]) -> Vec<f32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::audio::capture::pack_current_opus_silence_ranges;
     #[allow(unused_imports)]
     use crate::audio::test_support::*;
 

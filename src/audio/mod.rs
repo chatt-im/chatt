@@ -1,52 +1,39 @@
-use hashbrown::{HashMap, HashSet};
-use std::{
-    cell::UnsafeCell,
-    collections::VecDeque,
-    fmt, fs,
-    io::{self, BufWriter, Write},
-    path::{Path, PathBuf},
-    process::Command,
-    ptr::NonNull,
-    str::FromStr,
-    sync::{
-        Arc, Mutex,
-        atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering},
-        mpsc::{Receiver, RecvTimeoutError, Sender, SyncSender, sync_channel},
-    },
-    thread::{self, JoinHandle},
-    time::{Duration, Instant},
-};
-
-use cpal::{
-    BufferSize, FromSample, Sample, SampleFormat, Stream, StreamConfig, SupportedBufferSize,
-    SupportedStreamConfig, traits::DeviceTrait, traits::HostTrait, traits::StreamTrait,
-};
-use earshot::Detector as EarshotDetector;
-use nnnoiseless::DenoiseState;
-use opus_codec::{Channels, Complexity, Decoder, DredDecoder, DredState, SampleRate};
-use sonora::config::EchoCanceller as Aec3Config;
-use sonora::{AudioProcessing, Config as ApmConfig, StreamConfig as ApmStreamConfig};
-
-use crate::network::{
-    AudioPacketRef, EncoderNetworkProfile, EncoderNetworkTuning, InsertOutcome, JitterBuffer,
-    JitterBufferConfig, PlayoutItem,
-};
-use crate::packet_log::{FLAG_DENOISE, PacketLogHeader, PacketLogReader, PacketLogWriter};
-
+mod backend;
 mod capture;
 mod device;
+mod errors;
 mod lifecycle;
 mod playback;
 mod shared;
 mod sim;
 
-pub use capture::*;
-pub use device::*;
-pub use lifecycle::*;
-pub use shared::*;
-pub use sim::*;
-
-pub(in crate::audio) use playback::*;
+pub use capture::EchoCancellationControl;
+pub use device::{
+    DeviceInfo, StreamPreview, input_devices, output_devices, stable_input_device_id,
+    stable_output_device_id,
+};
+pub use lifecycle::{
+    LiveCapture, LiveCaptureConfig, LivePlayback, LivePlaybackConfig, LivePlaybackSink, Playback,
+    Recording, RecordingConfig, start_live_capture, start_live_playback, start_playback,
+    start_recording,
+};
+pub use shared::{
+    AudioStats, BufferRequest, CHANNELS, DEFAULT_LIVE_MAX_AMPLIFICATION, FRAME_SAMPLES,
+    LiveAudioTuning, LiveEncoderProfile, LivePlaybackFeedback, LivePlaybackSnapshot,
+    LocalVoiceFrame, PlaybackSnapshot, PlaybackStats, PlaybackStreamControl, RemoteVoicePacket,
+    SAMPLE_RATE, StatsSnapshot,
+};
+pub use sim::{
+    LiveAudioDirectSampleSimulationConfig, LiveAudioFilePlaybackTestConfig,
+    LiveAudioFilePlaybackTestReport, LiveAudioFileSourceConfig, LiveAudioFileSourceReport,
+    LiveAudioPacketLossProfile, LiveAudioSimulationConfig, LiveAudioSimulationOutput,
+    LiveAudioSimulationReport, LiveAudioSimulationScenario, load_live_audio_simulation_sample_pcm,
+    load_live_audio_simulation_speech_frames, render_live_audio_simulation_input,
+    run_live_audio_direct_sample_simulation_output,
+    run_live_audio_direct_sample_simulation_output_with_trace, run_live_audio_file_playback_test,
+    run_live_audio_file_source, run_live_audio_simulation, run_live_audio_simulation_with_speech,
+    run_live_audio_simulation_with_speech_output, split_pcm_to_simulation_frames,
+};
 
 #[cfg(test)]
 mod test_support;

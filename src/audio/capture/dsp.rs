@@ -1,8 +1,16 @@
-use crate::audio::*;
+use std::collections::VecDeque;
 
-pub(in crate::audio) struct AutoGain {
+use earshot::Detector as EarshotDetector;
+
+use crate::audio::shared::{
+    AudioStats, DEFAULT_LIVE_MAX_AMPLIFICATION, FRAME_SAMPLES, LIVE_PLAYBACK_SILENCE_RANGE_COUNT,
+    LiveAudioTuning, frames_for_duration, pack_silence_range, peak_i16_scale, rms_i16_scale,
+    samples_for_duration,
+};
+
+pub(crate) struct AutoGain {
     max_amplification: f32,
-    pub(in crate::audio) current_gain: f32,
+    pub(crate) current_gain: f32,
     initialized: bool,
 }
 
@@ -13,7 +21,7 @@ impl AutoGain {
     const RISE_SMOOTHING: f32 = 0.20;
     const FALL_SMOOTHING: f32 = 0.85;
 
-    pub(in crate::audio) fn new(max_amplification: f32) -> Self {
+    pub(crate) fn new(max_amplification: f32) -> Self {
         let max_amplification = Self::normalize_max_amplification(max_amplification);
         Self {
             max_amplification,
@@ -22,7 +30,7 @@ impl AutoGain {
         }
     }
 
-    pub(in crate::audio) fn set_max_amplification(&mut self, max_amplification: f32) {
+    pub(crate) fn set_max_amplification(&mut self, max_amplification: f32) {
         self.max_amplification = Self::normalize_max_amplification(max_amplification);
         self.current_gain = self.current_gain.min(self.max_amplification);
     }
@@ -36,7 +44,7 @@ impl AutoGain {
         max_amplification.clamp(1.0, 40.0)
     }
 
-    pub(in crate::audio) fn process_frame(&mut self, frame: &mut [f32]) {
+    pub(crate) fn process_frame(&mut self, frame: &mut [f32]) {
         if frame.is_empty() {
             return;
         }
@@ -75,7 +83,7 @@ impl AutoGain {
     }
 }
 
-pub(in crate::audio) struct EarshotVad {
+pub(crate) struct EarshotVad {
     detector: EarshotDetector,
     pending_16k: VecDeque<i16>,
     decimator: [f32; 3],
@@ -84,7 +92,7 @@ pub(in crate::audio) struct EarshotVad {
 }
 
 impl EarshotVad {
-    pub(in crate::audio) fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             detector: EarshotDetector::default(),
             pending_16k: VecDeque::with_capacity(512),
@@ -94,7 +102,7 @@ impl EarshotVad {
         }
     }
 
-    pub(in crate::audio) fn process_48k_frame(&mut self, samples: &[f32]) -> f32 {
+    pub(crate) fn process_48k_frame(&mut self, samples: &[f32]) -> f32 {
         let mut score = self.last_score;
         for sample in samples {
             self.decimator[self.decimator_len] = *sample;
@@ -120,7 +128,7 @@ impl EarshotVad {
     }
 }
 
-pub(in crate::audio) fn is_capture_skip_safe_silence(
+pub(crate) fn is_capture_skip_safe_silence(
     tuning: LiveAudioTuning,
     vad: u8,
     samples: &[f32],
@@ -128,13 +136,13 @@ pub(in crate::audio) fn is_capture_skip_safe_silence(
     vad <= tuning.silence_vad_max && peak_i16_scale(samples) < 0.20 && rms_i16_scale(samples) < 0.05
 }
 
-pub(in crate::audio) struct SilenceRangeTracker {
+pub(crate) struct SilenceRangeTracker {
     frames: VecDeque<bool>,
     max_frames: usize,
 }
 
 impl SilenceRangeTracker {
-    pub(in crate::audio) fn new(tuning: LiveAudioTuning) -> Self {
+    pub(crate) fn new(tuning: LiveAudioTuning) -> Self {
         let max_frames = (samples_for_duration(tuning.dred_horizon) / FRAME_SAMPLES)
             .saturating_add(1)
             .max(1);
@@ -144,7 +152,7 @@ impl SilenceRangeTracker {
         }
     }
 
-    pub(in crate::audio) fn observe_frame(&mut self, silence: bool) -> u64 {
+    pub(crate) fn observe_frame(&mut self, silence: bool) -> u64 {
         self.frames.push_front(silence);
         while self.frames.len() > self.max_frames {
             self.frames.pop_back();
@@ -184,18 +192,18 @@ impl SilenceRangeTracker {
     }
 }
 
-pub(in crate::audio) struct CaptureBufferedFrame {
-    pub(in crate::audio) samples: Vec<f32>,
-    pub(in crate::audio) silence_ranges: u64,
+pub(crate) struct CaptureBufferedFrame {
+    pub(crate) samples: Vec<f32>,
+    pub(crate) silence_ranges: u64,
 }
 
-pub(in crate::audio) enum CaptureGateDecision {
+pub(crate) enum CaptureGateDecision {
     TransmitCurrent,
     SuppressCurrent,
     Resume(Vec<CaptureBufferedFrame>),
 }
 
-pub(in crate::audio) struct LongSilenceGate {
+pub(crate) struct LongSilenceGate {
     silence_frames: usize,
     stop_frames: usize,
     preroll_frames: usize,
@@ -205,7 +213,7 @@ pub(in crate::audio) struct LongSilenceGate {
 }
 
 impl LongSilenceGate {
-    pub(in crate::audio) fn new(tuning: LiveAudioTuning) -> Self {
+    pub(crate) fn new(tuning: LiveAudioTuning) -> Self {
         Self::with_limits(
             frames_for_duration(tuning.capture_long_silence_stop),
             frames_for_duration(tuning.capture_silence_preroll),
@@ -224,7 +232,7 @@ impl LongSilenceGate {
         }
     }
 
-    pub(in crate::audio) fn observe(
+    pub(crate) fn observe(
         &mut self,
         samples: &mut [f32],
         silence: bool,
@@ -281,7 +289,7 @@ impl LongSilenceGate {
     }
 }
 
-pub(in crate::audio) fn apply_fade_out(samples: &mut [f32], ramp_samples: usize) {
+pub(crate) fn apply_fade_out(samples: &mut [f32], ramp_samples: usize) {
     let fade = ramp_samples.min(samples.len());
     if fade == 0 {
         return;
@@ -295,10 +303,7 @@ pub(in crate::audio) fn apply_fade_out(samples: &mut [f32], ramp_samples: usize)
     }
 }
 
-pub(in crate::audio) fn apply_fade_in_to_frames(
-    frames: &mut [CaptureBufferedFrame],
-    ramp_samples: usize,
-) {
+pub(crate) fn apply_fade_in_to_frames(frames: &mut [CaptureBufferedFrame], ramp_samples: usize) {
     let total = frames
         .iter()
         .map(|frame| frame.samples.len())
@@ -322,19 +327,16 @@ pub(in crate::audio) fn apply_fade_in_to_frames(
     }
 }
 
-pub(in crate::audio) fn store_processed_level_stats(stats: &AudioStats, samples: &[f32]) {
+pub(crate) fn store_processed_level_stats(stats: &AudioStats, samples: &[f32]) {
     let rms = rms_i16_scale(samples);
     let peak = peak_i16_scale(samples);
-    stats.inner.rms_bits.store(rms.to_bits(), Ordering::Relaxed);
-    stats
-        .inner
-        .peak_bits
-        .store(peak.to_bits(), Ordering::Relaxed);
+    stats.store_levels(rms, peak);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::audio::shared::silence_ranges_contain;
     #[allow(unused_imports)]
     use crate::audio::test_support::*;
 

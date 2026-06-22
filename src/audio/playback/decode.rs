@@ -1,6 +1,32 @@
-use crate::audio::*;
+use std::{
+    sync::{
+        Arc, Mutex,
+        mpsc::{Receiver, RecvTimeoutError, Sender},
+    },
+    time::Instant,
+};
 
-pub(in crate::audio) fn run_live_decoder_worker(
+use hashbrown::HashMap;
+use opus_codec::{Channels, Decoder, DredDecoder, DredState, SampleRate};
+
+use crate::{
+    audio::{
+        lifecycle::LivePlaybackCommand,
+        playback::{LiveJitterStream, LivePlaybackFeedbackState, LivePlaybackMixer},
+        shared::{
+            DecodedFrameSource, LIVE_OPUS_FRAME_SAMPLES, LIVE_PACKET_FLAG_OPUS_RESET,
+            LIVE_PLAYBACK_DRAIN_INTERVAL, LiveAudioTraceWriter, LiveAudioTuning,
+            LivePlaybackFeedback, MAX_OPUS_DECODE_SAMPLES, RemoteVoicePacket, duration_to_ms,
+            emit_decoded_samples_by_silence_ranges, samples_for_duration,
+            sequence_distance_forward, silence_ranges_contain, trace_decode_output,
+            trace_decoder_reset, trace_dred_parse, trace_dred_skip, trace_fast_forward,
+            trace_jitter_item, trace_mixer_queue,
+        },
+    },
+    network::{AudioPacketRef, InsertOutcome, PlayoutItem},
+};
+
+pub(crate) fn run_live_decoder_worker(
     receiver: Receiver<LivePlaybackCommand>,
     mixer: Arc<Mutex<LivePlaybackMixer>>,
     tuning: LiveAudioTuning,
@@ -35,7 +61,7 @@ pub(in crate::audio) fn run_live_decoder_worker(
     }
 }
 
-pub(in crate::audio) fn handle_live_playback_command(
+pub(crate) fn handle_live_playback_command(
     command: LivePlaybackCommand,
     streams: &mut HashMap<u32, LiveDecodeStream>,
     mixer: &Arc<Mutex<LivePlaybackMixer>>,
@@ -62,7 +88,7 @@ pub(in crate::audio) fn handle_live_playback_command(
     true
 }
 
-pub(in crate::audio) fn insert_live_playback_packet(
+pub(crate) fn insert_live_playback_packet(
     packet: RemoteVoicePacket,
     streams: &mut HashMap<u32, LiveDecodeStream>,
     tuning: LiveAudioTuning,
@@ -87,7 +113,7 @@ pub(in crate::audio) fn insert_live_playback_packet(
     Some(stream.insert(packet_ref, now))
 }
 
-pub(in crate::audio) fn drain_live_decode_streams(
+pub(crate) fn drain_live_decode_streams(
     streams: &mut HashMap<u32, LiveDecodeStream>,
     mixer: &Arc<Mutex<LivePlaybackMixer>>,
     frame: &mut [i16],
@@ -106,7 +132,7 @@ pub(in crate::audio) fn drain_live_decode_streams(
     );
 }
 
-pub(in crate::audio) fn drain_live_decode_streams_with_trace(
+pub(crate) fn drain_live_decode_streams_with_trace(
     streams: &mut HashMap<u32, LiveDecodeStream>,
     mixer: &Arc<Mutex<LivePlaybackMixer>>,
     frame: &mut [i16],
@@ -157,14 +183,14 @@ pub(in crate::audio) fn drain_live_decode_streams_with_trace(
 
 /// DRED parsed from the packet that bounds a loss gap, cached so every missing
 /// frame in the same gap reuses one parse instead of re-parsing per frame.
-pub(in crate::audio) struct DredGapState {
+pub(crate) struct DredGapState {
     sequence: u32,
     state: DredState,
     reach: usize,
     dred_end: i32,
 }
 
-pub(in crate::audio) struct LiveDecodeStream {
+pub(crate) struct LiveDecodeStream {
     jitter: LiveJitterStream,
     decoder: Decoder,
     dred_decoder: Option<DredDecoder>,
@@ -175,7 +201,7 @@ pub(in crate::audio) struct LiveDecodeStream {
 }
 
 impl LiveDecodeStream {
-    pub(in crate::audio) fn new(tuning: LiveAudioTuning) -> Result<Self, String> {
+    pub(crate) fn new(tuning: LiveAudioTuning) -> Result<Self, String> {
         Ok(Self {
             jitter: LiveJitterStream::new(tuning),
             decoder: Decoder::new(SampleRate::Hz48000, Channels::Mono)
@@ -188,18 +214,14 @@ impl LiveDecodeStream {
         })
     }
 
-    pub(in crate::audio) fn insert(
-        &mut self,
-        packet: AudioPacketRef<'_>,
-        now: Instant,
-    ) -> InsertOutcome {
+    pub(crate) fn insert(&mut self, packet: AudioPacketRef<'_>, now: Instant) -> InsertOutcome {
         let outcome = self.jitter.insert(packet, now);
         self.feedback
             .observe_insert(packet.sequence, packet.flags, &outcome, now);
         outcome
     }
 
-    pub(in crate::audio) fn drain_ready<F>(
+    pub(crate) fn drain_ready<F>(
         &mut self,
         now: Instant,
         trace_start: Instant,
@@ -662,8 +684,17 @@ impl LiveDecodeStream {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
+
     #[allow(unused_imports)]
     use crate::audio::test_support::*;
+    use crate::{
+        audio::{
+            capture::OpusVoiceEncoder,
+            shared::{LIVE_PLAYBACK_INITIAL_BUFFER, LIVE_PLAYBACK_MAX_REORDER_DELAY, SAMPLE_RATE},
+        },
+        network::EncoderNetworkProfile,
+    };
 
     #[test]
     fn dred_recovers_short_gap_as_whole_frames() {
