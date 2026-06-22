@@ -97,15 +97,64 @@ abs(actual_arrival_delta - sequence_delta * 20ms)
 
 No sender wall-clock timestamp is used to estimate one-way latency.
 
+## Dynamic Playout Target
+
+The 60 ms playout target is the conservative default for an unknown connection.
+When the connection is consistent the receiver lowers it toward a 20 ms floor,
+cutting latency on LAN and same-city links. The estimator lives in
+`LivePlaybackFeedbackState` next to where arrivals are already observed.
+
+Jitter is measured against each packet's UDP arrival time, captured at the
+socket read (`RemoteVoicePacket::received_at`), not the time the decoder worker
+inserts it. The worker drains its channel in bursts, so insert times are
+batched and would otherwise register a full packet period of phantom jitter on
+every batched packet. The estimator accumulates relative transit
+(`sum(actual - expected)` interarrival) and measures lateness above a slowly
+forgetting baseline that tracks the best-case transit. Early or bursty arrivals
+fall below the baseline and contribute no lateness, so only genuine delay
+variation, the thing that actually forces a larger buffer, raises the estimate.
+When the sender's silence gate resumes a stream it suppressed (the sequence
+advanced by one while wall-clock advanced by the whole pause), the resume packet
+carries `LIVE_PACKET_FLAG_OPUS_RESET`; the estimator re-anchors on that explicit
+signal rather than charging the pause as lateness. The estimate tracks:
+
+- A smoothed late jitter `J += (late - J) / 16`.
+- A fast-attack/slow-decay peak `P = max(late, P * 0.99)` (~2 s time constant).
+
+The recommended target is `20 ms + 3 * max(J, P) + 8 ms`, clamped to the
+`[dynamic-target-floor-ms, target-queue-ms]` range. It only descends after four
+consecutive feedback windows with zero loss, late, or reorder events. A single
+such event in the current window pins the recommendation back at the ceiling
+immediately. Recurring playout underruns (an isolated underrun is treated as a
+talkspurt draining to silence, not starvation) snap the active baseline to the
+ceiling and hold it for `loss-hold-ms`, so lowering the target can never start
+an underrun cascade. The existing correction slew drains the queue toward the
+lowered target gradually, so no audible pitch modulation occurs.
+
+Buffer depth tracks delay variation, not absolute latency. The
+`regional_ethernet` profile demonstrates this: a steady 30 ms one-way delay with
+no jitter still relaxes the target to the floor, because a constant offset adds
+latency the buffer cannot remove but no variation for it to absorb. The
+`adaptive-target` toggle disables the behavior, pinning the target at
+`target-queue-ms`. The `live/call_sim --param loss=lan` and
+`--param feature=adaptive_target_off` benchmark routes compare the two.
+
+The simulation reports `steady_state_adaptive_target_ms`, the minimum adaptive
+target over the steady-state tail window. On `lan` and `regional_ethernet` it
+settles near 28 ms (one packet period plus the 8 ms margin) versus the fixed
+60 ms with the toggle off.
+
 ## Packet Loss Profiles
 
 The current simulation also supports named network profiles. `mild_random`,
 `moderate_random`, `severe_random`, `random_30`, `random_45`, and `random_60`
 are independent per-packet drops, while `bursty_wifi`, `congested_wifi`, and
 `mobile_handoff` are Gilbert-Elliott profiles that alternate between a
-mostly-good state and short bad bursts. All non-`none` named profiles also add
+mostly-good state and short bad bursts. The lossy named profiles also add
 deterministic delivery delay variation, so they exercise both packet loss and
-out-of-order arrival.
+out-of-order arrival. `lan` and `regional_ethernet` model consistent links: zero
+loss and zero delay variation. `lan` adds no delay, `regional_ethernet` adds a
+steady 30 ms one-way delay. Both exercise the dynamic playout target.
 
 These rows use the 60 s lossy alternating speech/silence scenario with all
 features enabled.

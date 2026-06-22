@@ -909,10 +909,21 @@ impl WorkerState {
 
     fn read_udp(&mut self) {
         let mut buf = [0u8; 2048];
+        let mut datagrams_this_wake: u32 = 0;
         loop {
             let (len, src) = match self.udp.recv_from(&mut buf) {
                 Ok(value) => value,
-                Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    // More than one datagram per poll wake means inbound packets
+                    // queued in the socket while this single-threaded worker was
+                    // busy (sending voice, polling p2p) between wakes. That read
+                    // coalescing is what the receiver measures as interarrival
+                    // jitter, so surface it.
+                    if datagrams_this_wake > 1 {
+                        kvlog::info!("udp read coalesced", datagrams = datagrams_this_wake);
+                    }
+                    break;
+                }
                 Err(error) => {
                     kvlog::warn!("udp receive failed", error = %error);
                     let _ = self
@@ -921,6 +932,7 @@ impl WorkerState {
                     break;
                 }
             };
+            datagrams_this_wake += 1;
             let packet = &buf[..len];
             let now = Instant::now();
             if is_stun_message(packet) {
@@ -964,6 +976,7 @@ impl WorkerState {
                             flags,
                             silence_ranges,
                             payload: opus,
+                            received_at: now,
                         }));
                 }
                 Ok((_, MediaPayload::Pong { .. })) => {}
@@ -2025,6 +2038,7 @@ impl WorkerState {
                         flags,
                         silence_ranges,
                         payload: opus,
+                        received_at: now,
                     }));
             }
             Ok(P2pMediaPacket::Feedback {

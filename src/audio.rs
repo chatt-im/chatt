@@ -42,6 +42,36 @@ const LIVE_PACKET_FLAG_OPUS_RESET: u8 = 0x01;
 const CALLBACK_QUEUE_CAPACITY: usize = 8;
 const LIVE_PLAYBACK_COMMAND_CAPACITY: usize = 256;
 const LIVE_PLAYBACK_TARGET_QUEUE: Duration = Duration::from_millis(60);
+// Receiver-side dynamic target. On a consistent connection (low inter-arrival
+// jitter, no loss/late/reorder) the playout target relaxes from the 60 ms
+// default toward this floor, cutting latency on LAN and same-city links. The
+// target only ever lowers; raising above the default stays the job of the
+// loss-expansion path. Buffer depth tracks delay variation, not absolute RTT.
+const LIVE_PLAYBACK_DYNAMIC_TARGET_FLOOR: Duration = Duration::from_millis(20);
+const LIVE_PLAYBACK_DYNAMIC_TARGET_MARGIN: Duration = Duration::from_millis(8);
+const LIVE_PLAYBACK_DYNAMIC_JITTER_GAIN: f64 = 3.0;
+// Late-jitter EWMA gain (J += (late - J) / 16).
+const LIVE_PLAYBACK_RTP_JITTER_GAIN: f64 = 1.0 / 16.0;
+// Per-packet rise of the relative-transit baseline, in microseconds. The
+// baseline tracks the best-case (minimum) transit, dropping instantly to new
+// lows and rising at this rate to forget stale lows so a constant latency
+// shift is adopted within a few seconds. Lateness is measured above it, so
+// only delay variation, not absolute latency, raises the target.
+const LIVE_PLAYBACK_TRANSIT_BASE_FORGET_US: f64 = 500.0;
+// Per-packet bleed for the fast-attack/slow-decay jitter peak tracker. At a
+// 50 packets/s cadence this is a ~2 s time constant, so one late packet keeps
+// the target elevated for a couple seconds, then it relaxes.
+const LIVE_PLAYBACK_JITTER_PEAK_DECAY: f64 = 0.99;
+// Consecutive clean feedback windows required before the target may descend.
+const LIVE_PLAYBACK_DYNAMIC_RELAX_WINDOWS: u32 = 4;
+// A lone playout underrun is usually a talkspurt draining to empty, not network
+// starvation. The target only re-widens when underruns recur: at least this
+// many within the window below. Each starvation episode produces one underrun
+// notification, so an isolated end-of-speech drain never pins the target.
+const LIVE_PLAYBACK_DYNAMIC_UNDERRUN_WINDOW: Duration = Duration::from_millis(500);
+const LIVE_PLAYBACK_DYNAMIC_UNDERRUN_MIN: usize = 2;
+// Ignore recommended-target changes smaller than this to avoid chatter.
+const LIVE_PLAYBACK_DYNAMIC_DEADBAND: Duration = Duration::from_millis(3);
 const LIVE_PLAYBACK_MODERATE_LOSS_QUEUE: Duration = Duration::from_millis(320);
 const LIVE_PLAYBACK_DRED_HORIZON: Duration = Duration::from_millis(1_000);
 const LIVE_PLAYBACK_HARD_QUEUE_BOUND: Duration = Duration::from_millis(1_500);
@@ -200,7 +230,9 @@ pub struct LiveAudioTuning {
     pub adaptive_catch_up: bool,
     pub playback_silence_skip: bool,
     pub capture_silence_gate: bool,
+    pub adaptive_target: bool,
     pub target_queue: Duration,
+    pub dynamic_target_floor: Duration,
     pub moderate_loss_queue: Duration,
     pub dred_horizon: Duration,
     pub hard_queue_bound: Duration,
@@ -228,7 +260,9 @@ impl Default for LiveAudioTuning {
             adaptive_catch_up: true,
             playback_silence_skip: true,
             capture_silence_gate: true,
+            adaptive_target: true,
             target_queue: LIVE_PLAYBACK_TARGET_QUEUE,
+            dynamic_target_floor: LIVE_PLAYBACK_DYNAMIC_TARGET_FLOOR,
             moderate_loss_queue: LIVE_PLAYBACK_MODERATE_LOSS_QUEUE,
             dred_horizon: LIVE_PLAYBACK_DRED_HORIZON,
             hard_queue_bound: LIVE_PLAYBACK_HARD_QUEUE_BOUND,
@@ -255,6 +289,12 @@ impl Default for LiveAudioTuning {
 impl LiveAudioTuning {
     pub fn validate(self) -> Result<(), String> {
         validate_duration_ms("target-queue-ms", self.target_queue, 20, 1_000)?;
+        validate_duration_ms(
+            "dynamic-target-floor-ms",
+            self.dynamic_target_floor,
+            10,
+            1_000,
+        )?;
         validate_duration_ms(
             "moderate-loss-queue-ms",
             self.moderate_loss_queue,
@@ -295,6 +335,9 @@ impl LiveAudioTuning {
         if self.hard_queue_bound < self.target_queue {
             return Err("hard-queue-bound-ms must be at least target-queue-ms".to_string());
         }
+        if self.dynamic_target_floor > self.target_queue {
+            return Err("dynamic-target-floor-ms must not exceed target-queue-ms".to_string());
+        }
         if self.moderate_loss_queue < self.target_queue {
             return Err("moderate-loss-queue-ms must be at least target-queue-ms".to_string());
         }
@@ -324,6 +367,10 @@ pub struct RemoteVoicePacket {
     pub flags: u8,
     pub silence_ranges: u64,
     pub payload: Vec<u8>,
+    /// Wall-clock arrival time captured at the UDP socket read, before any
+    /// downstream channel batching. The jitter estimator measures interarrival
+    /// against this so batched inserts do not inflate the estimate.
+    pub received_at: Instant,
 }
 
 #[derive(Clone, Debug)]
@@ -3644,7 +3691,8 @@ fn handle_live_playback_command(
 ) {
     match command {
         LivePlaybackCommand::Packet(packet) => {
-            let _ = insert_live_playback_packet(packet, streams, tuning, Instant::now());
+            let received_at = packet.received_at;
+            let _ = insert_live_playback_packet(packet, streams, tuning, received_at);
         }
         LivePlaybackCommand::StopStream(stream_id) => {
             streams.remove(&stream_id);
@@ -3715,6 +3763,7 @@ fn drain_live_decode_streams_with_trace(
 ) {
     for (stream_id, stream) in streams {
         let mut max_stream_queue_ms = 0;
+        let recommended_target = stream.feedback.recommended_target(&stream.tuning);
         stream.drain_ready(
             now,
             trace_start,
@@ -3724,6 +3773,7 @@ fn drain_live_decode_streams_with_trace(
             |trace, samples, source, silence_hint| {
                 if let Ok(mut mixer) = mixer.lock() {
                     mixer.queue_stream_samples(*stream_id, samples, source, silence_hint, now);
+                    mixer.note_stream_recommended_target(*stream_id, recommended_target, now);
                     max_stream_queue_ms =
                         max_stream_queue_ms.max(mixer.stream_queue_ms(*stream_id));
                     trace_mixer_queue(
@@ -3786,7 +3836,8 @@ impl LiveDecodeStream {
 
     fn insert(&mut self, packet: AudioPacketRef<'_>, now: Instant) -> InsertOutcome {
         let outcome = self.jitter.insert(packet, now);
-        self.feedback.observe_insert(packet.sequence, &outcome, now);
+        self.feedback
+            .observe_insert(packet.sequence, packet.flags, &outcome, now);
         outcome
     }
 
@@ -4210,6 +4261,16 @@ impl LiveDecodeStream {
         let Some(feedback) = self.feedback.take_if_ready(stream_id, now) else {
             return;
         };
+        kvlog::info!(
+            "live playback target estimate",
+            stream_id,
+            smoothed_jitter_ms = (self.feedback.smoothed_jitter_us / 1_000.0) as f32,
+            peak_jitter_ms = (self.feedback.peak_jitter_us / 1_000.0) as f32,
+            transit_ms = (self.feedback.relative_transit_us / 1_000.0) as f32,
+            base_ms = (self.feedback.base_transit_us / 1_000.0) as f32,
+            clean_window_streak = u64::from(self.feedback.clean_window_streak),
+            recommended_target_ms = duration_to_ms(self.feedback.recommended_target(&self.tuning))
+        );
         if let Some(sender) = feedback_sender {
             let _ = sender.send(feedback);
         }
@@ -4229,10 +4290,30 @@ struct LivePlaybackFeedbackState {
     max_interarrival_jitter_ms: u64,
     highest_arrived_sequence: Option<u32>,
     last_forward_arrival: Option<(u32, Instant)>,
+    /// Smoothed late-arrival jitter in microseconds, EWMA over packets. Tracks
+    /// only how late packets arrive relative to the running baseline, so early
+    /// or batched arrivals do not inflate it.
+    smoothed_jitter_us: f64,
+    /// Fast-attack/slow-decay peak of the late-arrival jitter. A genuinely late
+    /// packet keeps this elevated for a couple seconds.
+    peak_jitter_us: f64,
+    /// Accumulated relative transit time in microseconds: the running sum of
+    /// (actual - expected) interarrival. Rises when packets fall behind the 20
+    /// ms cadence, dips when they bunch up. Lateness is measured against the
+    /// baseline below, not against this absolute value.
+    relative_transit_us: f64,
+    /// Slowly forgetting baseline of `relative_transit_us`, tracking the
+    /// best-case delivery floor. It descends slowly toward new lows so a single
+    /// early/batched packet does not reset it, and rises slowly to forget stale
+    /// lows. Lateness is `relative_transit_us - base_transit_us`.
+    base_transit_us: f64,
+    /// Consecutive feedback windows with zero loss/late/reorder events. The
+    /// dynamic target may only descend once this reaches the relax threshold.
+    clean_window_streak: u32,
 }
 
 impl LivePlaybackFeedbackState {
-    fn observe_insert(&mut self, sequence: u32, outcome: &InsertOutcome, now: Instant) {
+    fn observe_insert(&mut self, sequence: u32, flags: u8, outcome: &InsertOutcome, now: Instant) {
         self.ensure_started(now);
         match outcome {
             InsertOutcome::Accepted => {
@@ -4242,7 +4323,17 @@ impl LivePlaybackFeedbackState {
                 {
                     self.reordered_packets = self.reordered_packets.saturating_add(1);
                 }
-                if let Some((last_sequence, last_at)) = self.last_forward_arrival
+                if flags & LIVE_PACKET_FLAG_OPUS_RESET != 0 {
+                    // The sender restarted the stream after suppressing silence,
+                    // so the sequence advanced by one while wall-clock advanced by
+                    // the whole pause. The accumulated transit is meaningless
+                    // across that boundary: re-anchor here rather than charge the
+                    // pause as lateness. This is the sender's explicit signal, not
+                    // an inferred time threshold.
+                    self.relative_transit_us = 0.0;
+                    self.base_transit_us = 0.0;
+                    self.last_forward_arrival = Some((sequence, now));
+                } else if let Some((last_sequence, last_at)) = self.last_forward_arrival
                     && let Some(distance) = sequence_distance_forward(last_sequence, sequence)
                     && distance > 0
                 {
@@ -4253,6 +4344,21 @@ impl LivePlaybackFeedbackState {
                     self.max_interarrival_jitter_ms = self
                         .max_interarrival_jitter_ms
                         .max(duration_abs_delta_ms(actual, expected));
+                    // Accumulate relative transit, then measure lateness above a
+                    // slowly forgetting baseline. This ignores early/batched
+                    // arrivals (which only bunch packets in the buffer) and
+                    // tracks only how late packets fall behind the cadence,
+                    // which is what actually forces a larger buffer.
+                    self.relative_transit_us +=
+                        actual.as_micros() as f64 - expected.as_micros() as f64;
+                    self.base_transit_us = self
+                        .relative_transit_us
+                        .min(self.base_transit_us + LIVE_PLAYBACK_TRANSIT_BASE_FORGET_US);
+                    let late_us = (self.relative_transit_us - self.base_transit_us).max(0.0);
+                    self.smoothed_jitter_us +=
+                        LIVE_PLAYBACK_RTP_JITTER_GAIN * (late_us - self.smoothed_jitter_us);
+                    self.peak_jitter_us =
+                        late_us.max(self.peak_jitter_us * LIVE_PLAYBACK_JITTER_PEAK_DECAY);
                     self.last_forward_arrival = Some((sequence, now));
                 } else if self.last_forward_arrival.is_none() {
                     self.last_forward_arrival = Some((sequence, now));
@@ -4324,8 +4430,36 @@ impl LivePlaybackFeedbackState {
             max_queue_ms: clamp_u16_from_u64(self.max_queue_ms),
             max_interarrival_jitter_ms: clamp_u16_from_u64(self.max_interarrival_jitter_ms),
         };
+        if self.window_had_events() {
+            self.clean_window_streak = 0;
+        } else {
+            self.clean_window_streak = self.clean_window_streak.saturating_add(1);
+        }
         self.reset_window(now);
         Some(feedback)
+    }
+
+    fn window_had_events(&self) -> bool {
+        self.lost_packets != 0 || self.late_packets != 0 || self.reordered_packets != 0
+    }
+
+    /// Receiver-recommended playout target. Relaxes from the configured ceiling
+    /// toward the floor only after sustained clean windows, sized from the
+    /// jitter estimate. A loss/late/reorder event in the current window pins it
+    /// back at the ceiling immediately, ahead of the window-close streak reset.
+    fn recommended_target(&self, tuning: &LiveAudioTuning) -> Duration {
+        let relaxed = !self.window_had_events()
+            && self.clean_window_streak >= LIVE_PLAYBACK_DYNAMIC_RELAX_WINDOWS;
+        if !relaxed {
+            return tuning.target_queue;
+        }
+        let jitter_us = self.smoothed_jitter_us.max(self.peak_jitter_us).max(0.0);
+        let packet_period =
+            Duration::from_secs_f64(LIVE_OPUS_FRAME_SAMPLES as f64 / SAMPLE_RATE as f64);
+        let raw = packet_period
+            + Duration::from_secs_f64(LIVE_PLAYBACK_DYNAMIC_JITTER_GAIN * jitter_us / 1.0e6)
+            + LIVE_PLAYBACK_DYNAMIC_TARGET_MARGIN;
+        raw.clamp(tuning.dynamic_target_floor, tuning.target_queue)
     }
 
     fn ensure_started(&mut self, now: Instant) {
@@ -4468,6 +4602,21 @@ impl LivePlaybackMixer {
         stream.queue_samples(samples, source, silence_hint, now, &mut self.stats);
     }
 
+    /// Applies the receiver-recommended dynamic target to an existing stream.
+    /// A no-op if the stream has not been created yet, which is harmless: the
+    /// target starts at the safe ceiling and only relaxes after sustained
+    /// clean windows, well after the stream's first frames arrive.
+    fn note_stream_recommended_target(
+        &mut self,
+        stream_id: u32,
+        recommended_target: Duration,
+        now: Instant,
+    ) {
+        if let Some(stream) = self.streams.get_mut(&stream_id) {
+            stream.apply_recommended_target(recommended_target, now);
+        }
+    }
+
     fn remove_stream(&mut self, stream_id: u32) {
         self.streams.remove(&stream_id);
         self.controls.remove(&stream_id);
@@ -4588,6 +4737,7 @@ impl LivePlaybackMixer {
 #[derive(Clone, Copy)]
 struct TuningSampleCounts {
     target_queue: usize,
+    dynamic_target_floor: usize,
     catch_up_start_excess: usize,
     hard_queue_bound: usize,
     dred_horizon: usize,
@@ -4603,6 +4753,7 @@ impl TuningSampleCounts {
     fn from_tuning(tuning: &LiveAudioTuning) -> Self {
         Self {
             target_queue: samples_for_duration(tuning.target_queue),
+            dynamic_target_floor: samples_for_duration(tuning.dynamic_target_floor),
             catch_up_start_excess: samples_for_duration(tuning.catch_up_start_excess),
             hard_queue_bound: samples_for_duration(tuning.hard_queue_bound),
             dred_horizon: samples_for_duration(tuning.dred_horizon),
@@ -4627,6 +4778,17 @@ struct AdaptivePlaybackStream {
     recent_loss_events: VecDeque<Instant>,
     expanded_target_samples: usize,
     expanded_target_until: Option<Instant>,
+    /// Receiver-recommended dynamic baseline target in samples, clamped to
+    /// [`dynamic_target_floor`, `target_queue`]. Starts at the safe default and
+    /// relaxes downward only on evidence of a consistent connection.
+    recommended_target_samples: usize,
+    /// While set, an underrun has armed a hold pinning the dynamic baseline at
+    /// the configured ceiling regardless of the recommendation.
+    underrun_hold_until: Option<Instant>,
+    /// Timestamps of recent playout underruns, used to distinguish recurring
+    /// network starvation (which re-widens the target) from an isolated
+    /// end-of-talkspurt drain (which does not).
+    recent_underruns: VecDeque<Instant>,
     output_priming: bool,
     output_block_remaining: usize,
     output_block_playable: bool,
@@ -4647,6 +4809,9 @@ impl AdaptivePlaybackStream {
             recent_loss_events: VecDeque::new(),
             expanded_target_samples: samples.target_queue,
             expanded_target_until: None,
+            recommended_target_samples: samples.target_queue,
+            underrun_hold_until: None,
+            recent_underruns: VecDeque::new(),
             output_priming: true,
             output_block_remaining: 0,
             output_block_playable: false,
@@ -4669,6 +4834,57 @@ impl AdaptivePlaybackStream {
         self.declick_recovery_boundary(&mut samples, source);
         self.input.push_back_owned(samples, source, silence_hint);
         self.enforce_hard_bound(now, stats);
+    }
+
+    /// Moves the dynamic baseline toward the receiver recommendation. A 3 ms
+    /// dead-band suppresses chatter. While an underrun hold is active the
+    /// baseline only rises, so a starve cannot be undone by a stale low
+    /// recommendation before the hold expires.
+    fn apply_recommended_target(&mut self, recommended: Duration, now: Instant) {
+        if !self.tuning.adaptive_target {
+            return;
+        }
+        let rec = samples_for_duration(recommended)
+            .clamp(self.samples.dynamic_target_floor, self.samples.target_queue);
+        if self.underrun_hold_until.is_some_and(|until| now < until) {
+            self.recommended_target_samples = self.recommended_target_samples.max(rec);
+            return;
+        }
+        let deadband = samples_for_duration(LIVE_PLAYBACK_DYNAMIC_DEADBAND);
+        if rec.abs_diff(self.recommended_target_samples) >= deadband {
+            self.recommended_target_samples = rec;
+        }
+    }
+
+    /// The active playout target in samples: the dynamic baseline clamped to its
+    /// valid range, or the fixed configured target when adaptation is disabled.
+    fn effective_target_samples(&self) -> usize {
+        if !self.tuning.adaptive_target {
+            return self.samples.target_queue;
+        }
+        self.recommended_target_samples
+            .clamp(self.samples.dynamic_target_floor, self.samples.target_queue)
+    }
+
+    /// Records a playout underrun. Recurring underruns snap the dynamic
+    /// baseline back to the configured ceiling and hold it there, breaking an
+    /// underrun cascade caused by an over-aggressive low target. An isolated
+    /// underrun, which is almost always a talkspurt draining to silence rather
+    /// than network starvation, is tracked but does not widen the target.
+    fn note_underrun(&mut self, now: Instant) {
+        if !self.tuning.adaptive_target {
+            return;
+        }
+        while self.recent_underruns.front().is_some_and(|at| {
+            now.saturating_duration_since(*at) > LIVE_PLAYBACK_DYNAMIC_UNDERRUN_WINDOW
+        }) {
+            self.recent_underruns.pop_front();
+        }
+        self.recent_underruns.push_back(now);
+        if self.recent_underruns.len() >= LIVE_PLAYBACK_DYNAMIC_UNDERRUN_MIN {
+            self.recommended_target_samples = self.samples.target_queue;
+            self.underrun_hold_until = Some(now + self.tuning.loss_hold);
+        }
     }
 
     fn declick_recovery_boundary(&self, samples: &mut [f32], source: DecodedFrameSource) {
@@ -4715,6 +4931,7 @@ impl AdaptivePlaybackStream {
         let base = self.read_pos as usize;
         if self.input.frames() < base + 3 {
             stats.underrun_count = stats.underrun_count.saturating_add(1);
+            self.note_underrun(now);
             return None;
         }
 
@@ -4830,8 +5047,7 @@ impl AdaptivePlaybackStream {
         }
         let queued = self.queued_samples();
         let target = self
-            .samples
-            .target_queue
+            .effective_target_samples()
             .max(self.output_target_floor_samples);
         if queued < target {
             return 0.0;
@@ -4913,13 +5129,12 @@ impl AdaptivePlaybackStream {
         if self.expanded_target_until.is_some_and(|until| now < until) {
             self.expanded_target_samples.max(self.samples.target_queue)
         } else {
-            self.samples.target_queue
+            self.effective_target_samples()
         }
     }
 
     fn low_latency_target_samples(&self) -> usize {
-        self.samples
-            .target_queue
+        self.effective_target_samples()
             .max(self.output_target_floor_samples)
     }
 
@@ -5356,6 +5571,8 @@ impl LiveAudioSimulationScenario {
 pub enum LiveAudioPacketLossProfile {
     ScenarioDefault,
     None,
+    Lan,
+    RegionalEthernet,
     MildRandom,
     ModerateRandom,
     SevereRandom,
@@ -5368,9 +5585,11 @@ pub enum LiveAudioPacketLossProfile {
 }
 
 impl LiveAudioPacketLossProfile {
-    pub const NAMES: [&'static str; 11] = [
+    pub const NAMES: [&'static str; 13] = [
         "scenario_default",
         "none",
+        "lan",
+        "regional_ethernet",
         "mild_random",
         "moderate_random",
         "severe_random",
@@ -5386,6 +5605,8 @@ impl LiveAudioPacketLossProfile {
         match name {
             "scenario_default" => Some(Self::ScenarioDefault),
             "none" => Some(Self::None),
+            "lan" => Some(Self::Lan),
+            "regional_ethernet" => Some(Self::RegionalEthernet),
             "mild_random" => Some(Self::MildRandom),
             "moderate_random" => Some(Self::ModerateRandom),
             "severe_random" => Some(Self::SevereRandom),
@@ -5403,6 +5624,8 @@ impl LiveAudioPacketLossProfile {
         match self {
             Self::ScenarioDefault => "scenario_default",
             Self::None => "none",
+            Self::Lan => "lan",
+            Self::RegionalEthernet => "regional_ethernet",
             Self::MildRandom => "mild_random",
             Self::ModerateRandom => "moderate_random",
             Self::SevereRandom => "severe_random",
@@ -5469,6 +5692,9 @@ pub struct LiveAudioSimulationReport {
     pub queue_area_ms: f64,
     pub steady_state_max_queue_ms: u64,
     pub steady_state_avg_queue_ms: f64,
+    /// Minimum adaptive playout target observed over the steady-state tail
+    /// window, in milliseconds. Captures how far the dynamic target relaxed.
+    pub steady_state_adaptive_target_ms: u64,
     pub final_snapshot: LivePlaybackSnapshot,
 }
 
@@ -6155,6 +6381,7 @@ fn run_live_audio_simulation_inner(
         total_frames.saturating_sub(frames_for_duration(STEADY_STATE_WINDOW).max(1));
     let mut tail_queue_sum_ms = 0.0f64;
     let mut tail_queue_max_ms = 0u64;
+    let mut tail_adaptive_target_min_ms = u64::MAX;
     let mut tail_frames = 0usize;
 
     for frame_index in 0..prebuffer_frames {
@@ -6211,6 +6438,8 @@ fn run_live_audio_simulation_inner(
         if frame_index >= tail_start_frame {
             tail_queue_sum_ms += snapshot.max_queue_ms as f64;
             tail_queue_max_ms = tail_queue_max_ms.max(snapshot.max_queue_ms);
+            tail_adaptive_target_min_ms =
+                tail_adaptive_target_min_ms.min(snapshot.adaptive_target_ms);
             tail_frames += 1;
         }
     }
@@ -6220,6 +6449,11 @@ fn run_live_audio_simulation_inner(
         tail_queue_sum_ms / tail_frames as f64
     } else {
         0.0
+    };
+    report.steady_state_adaptive_target_ms = if tail_frames > 0 {
+        tail_adaptive_target_min_ms
+    } else {
+        0
     };
 
     let final_now = start + config.duration;
@@ -6462,7 +6696,9 @@ fn simulation_drops_frame(
             }
             _ => false,
         },
-        LiveAudioPacketLossProfile::None => false,
+        LiveAudioPacketLossProfile::None
+        | LiveAudioPacketLossProfile::Lan
+        | LiveAudioPacketLossProfile::RegionalEthernet => false,
         LiveAudioPacketLossProfile::MildRandom => {
             rng.next_f64() < if silence_hint { 0.02 } else { 0.01 }
         }
@@ -6510,19 +6746,47 @@ fn simulation_delivery_delay(
     rng: &mut SimRng,
 ) -> Duration {
     let frame = Duration::from_secs_f64(FRAME_SAMPLES as f64 / SAMPLE_RATE as f64);
-    let delayed_frames = match packet_loss {
-        LiveAudioPacketLossProfile::ScenarioDefault | LiveAudioPacketLossProfile::None => 0,
-        LiveAudioPacketLossProfile::MildRandom => random_delay_frames(rng, 0.03, 0.005, 3, 8),
-        LiveAudioPacketLossProfile::ModerateRandom => random_delay_frames(rng, 0.06, 0.01, 4, 9),
-        LiveAudioPacketLossProfile::SevereRandom => random_delay_frames(rng, 0.08, 0.02, 5, 10),
-        LiveAudioPacketLossProfile::Random30 => random_delay_frames(rng, 0.10, 0.03, 5, 11),
-        LiveAudioPacketLossProfile::Random45 => random_delay_frames(rng, 0.12, 0.04, 6, 12),
-        LiveAudioPacketLossProfile::Random60 => random_delay_frames(rng, 0.14, 0.05, 7, 14),
-        LiveAudioPacketLossProfile::BurstyWifi => random_delay_frames(rng, 0.12, 0.04, 4, 9),
-        LiveAudioPacketLossProfile::CongestedWifi => random_delay_frames(rng, 0.18, 0.06, 6, 12),
-        LiveAudioPacketLossProfile::MobileHandoff => random_delay_frames(rng, 0.08, 0.03, 12, 30),
-    };
-    frame.saturating_mul(delayed_frames)
+    match packet_loss {
+        LiveAudioPacketLossProfile::ScenarioDefault | LiveAudioPacketLossProfile::None => {
+            Duration::ZERO
+        }
+        // A LAN's real jitter is far below the simulator's 10 ms delivery grid,
+        // so it is modeled as a perfectly consistent link. The dynamic target
+        // relaxes to the floor.
+        LiveAudioPacketLossProfile::Lan => Duration::ZERO,
+        // Same-city Ethernet: a steady 30 ms one-way delay with negligible
+        // jitter. The constant offset adds absolute latency but no delay
+        // variation, so the dynamic target still relaxes. Buffer depth tracks
+        // jitter, not RTT.
+        LiveAudioPacketLossProfile::RegionalEthernet => Duration::from_millis(30),
+        LiveAudioPacketLossProfile::MildRandom => {
+            frame.saturating_mul(random_delay_frames(rng, 0.03, 0.005, 3, 8))
+        }
+        LiveAudioPacketLossProfile::ModerateRandom => {
+            frame.saturating_mul(random_delay_frames(rng, 0.06, 0.01, 4, 9))
+        }
+        LiveAudioPacketLossProfile::SevereRandom => {
+            frame.saturating_mul(random_delay_frames(rng, 0.08, 0.02, 5, 10))
+        }
+        LiveAudioPacketLossProfile::Random30 => {
+            frame.saturating_mul(random_delay_frames(rng, 0.10, 0.03, 5, 11))
+        }
+        LiveAudioPacketLossProfile::Random45 => {
+            frame.saturating_mul(random_delay_frames(rng, 0.12, 0.04, 6, 12))
+        }
+        LiveAudioPacketLossProfile::Random60 => {
+            frame.saturating_mul(random_delay_frames(rng, 0.14, 0.05, 7, 14))
+        }
+        LiveAudioPacketLossProfile::BurstyWifi => {
+            frame.saturating_mul(random_delay_frames(rng, 0.12, 0.04, 4, 9))
+        }
+        LiveAudioPacketLossProfile::CongestedWifi => {
+            frame.saturating_mul(random_delay_frames(rng, 0.18, 0.06, 6, 12))
+        }
+        LiveAudioPacketLossProfile::MobileHandoff => {
+            frame.saturating_mul(random_delay_frames(rng, 0.08, 0.03, 12, 30))
+        }
+    }
 }
 
 fn random_delay_frames(
@@ -6544,7 +6808,9 @@ fn random_delay_frames(
 
 fn simulation_encoder_profile(config: LiveAudioSimulationConfig) -> EncoderNetworkProfile {
     match config.packet_loss {
-        LiveAudioPacketLossProfile::None => EncoderNetworkProfile::EXCELLENT,
+        LiveAudioPacketLossProfile::None
+        | LiveAudioPacketLossProfile::Lan
+        | LiveAudioPacketLossProfile::RegionalEthernet => EncoderNetworkProfile::EXCELLENT,
         LiveAudioPacketLossProfile::MildRandom => EncoderNetworkProfile::DEGRADED,
         LiveAudioPacketLossProfile::ModerateRandom => EncoderNetworkProfile::SEVERE,
         LiveAudioPacketLossProfile::SevereRandom
@@ -6725,6 +6991,7 @@ impl SimStreamState {
                 flags: packet.flags,
                 silence_ranges: packet.silence_ranges,
                 payload: packet.payload,
+                received_at: deliver_at,
             },
             deliver_at,
         );
@@ -7343,23 +7610,31 @@ mod tests {
         let start = Instant::now();
         let mut feedback = LivePlaybackFeedbackState::default();
 
-        feedback.observe_insert(0, &InsertOutcome::Accepted, start);
+        feedback.observe_insert(0, 0, &InsertOutcome::Accepted, start);
         feedback.observe_insert(
             2,
+            0,
             &InsertOutcome::Accepted,
             start + Duration::from_millis(60),
         );
         feedback.observe_insert(
             1,
+            0,
             &InsertOutcome::Accepted,
             start + Duration::from_millis(70),
         );
         feedback.observe_insert(
             1,
+            0,
             &InsertOutcome::Duplicate,
             start + Duration::from_millis(71),
         );
-        feedback.observe_insert(3, &InsertOutcome::Late, start + Duration::from_millis(72));
+        feedback.observe_insert(
+            3,
+            0,
+            &InsertOutcome::Late,
+            start + Duration::from_millis(72),
+        );
         feedback.observe_playout(
             &PlayoutItem::Audio {
                 sequence: 0,
@@ -8855,10 +9130,14 @@ mod tests {
 
     #[test]
     fn constant_speech_converges_to_target_queue_at_zero_loss() {
+        let mut tuning = test_tuning();
+        // Pin the target so this test exercises fixed-target convergence rather
+        // than the dynamic relaxation covered by the LAN/regional tests below.
+        tuning.adaptive_target = false;
         let report = simulate_with_loss(
             LiveAudioSimulationScenario::ConstantSpeech,
             Duration::from_secs(60),
-            test_tuning(),
+            tuning,
             1,
             LiveAudioPacketLossProfile::None,
         );
@@ -8875,7 +9154,262 @@ mod tests {
             report.steady_state_avg_queue_ms <= 80.0,
             "tail average queue did not converge to target: {report:?}"
         );
+        assert_eq!(
+            report.steady_state_adaptive_target_ms,
+            duration_to_ms(tuning.target_queue),
+            "fixed target must not relax when adaptation is off: {report:?}"
+        );
         assert_coherent_output(&report, 0.005);
+    }
+
+    #[test]
+    fn clean_lan_connection_lowers_target_below_default() {
+        let report = simulate_with_loss(
+            LiveAudioSimulationScenario::ConstantSpeech,
+            Duration::from_secs(60),
+            test_tuning(),
+            1,
+            LiveAudioPacketLossProfile::Lan,
+        );
+
+        assert_eq!(report.lost_frames, 0, "{report:?}");
+        // A consistent LAN must relax the playout target well below the 60 ms
+        // default, without ever starving.
+        assert!(
+            report.steady_state_adaptive_target_ms < 30,
+            "target did not relax on LAN: {report:?}"
+        );
+        assert_eq!(
+            report.final_snapshot.underrun_count, 0,
+            "relaxation must not cause underruns: {report:?}"
+        );
+        assert_coherent_output(&report, 0.005);
+
+        // The same link with adaptation off holds the conservative default,
+        // proving the toggle gates the behavior and that relaxation genuinely
+        // cuts queued latency.
+        let mut fixed = test_tuning();
+        fixed.adaptive_target = false;
+        let fixed_report = simulate_with_loss(
+            LiveAudioSimulationScenario::ConstantSpeech,
+            Duration::from_secs(60),
+            fixed,
+            1,
+            LiveAudioPacketLossProfile::Lan,
+        );
+        assert_eq!(
+            fixed_report.steady_state_adaptive_target_ms,
+            duration_to_ms(fixed.target_queue),
+            "target must stay fixed when adaptation is off: {fixed_report:?}"
+        );
+        assert!(
+            report.steady_state_avg_queue_ms < fixed_report.steady_state_avg_queue_ms,
+            "adaptation must reduce queued latency: adaptive={report:?} fixed={fixed_report:?}"
+        );
+    }
+
+    #[test]
+    fn regional_ethernet_steady_delay_still_lowers_target() {
+        let report = simulate_with_loss(
+            LiveAudioSimulationScenario::ConstantSpeech,
+            Duration::from_secs(60),
+            test_tuning(),
+            1,
+            LiveAudioPacketLossProfile::RegionalEthernet,
+        );
+
+        // A steady multi-millisecond propagation delay adds latency but no
+        // jitter, so the target must still relax: buffer depth tracks delay
+        // variation, not absolute one-way latency.
+        assert_eq!(report.lost_frames, 0, "{report:?}");
+        assert!(
+            report.steady_state_adaptive_target_ms < 30,
+            "steady-delay link did not relax the target: {report:?}"
+        );
+        assert_eq!(report.final_snapshot.underrun_count, 0, "{report:?}");
+        assert_coherent_output(&report, 0.005);
+    }
+
+    #[test]
+    fn insert_uses_packet_arrival_time_not_processing_time() {
+        // The decoder worker drains the channel in bursts, so packets are
+        // inserted back-to-back at one wall-clock instant. The jitter estimate
+        // must use each packet's captured arrival time, which is a clean 20 ms
+        // cadence, so a healthy stream is not mistaken for a jittery one.
+        let tuning = test_tuning();
+        let mut streams: HashMap<u32, LiveDecodeStream> = HashMap::new();
+        let base = Instant::now();
+        let frame = Duration::from_secs_f64(LIVE_OPUS_FRAME_SAMPLES as f64 / SAMPLE_RATE as f64);
+        let process_at = base + Duration::from_secs(10);
+
+        for sequence in 0..120u32 {
+            let received_at = base + frame.mul_f64(f64::from(sequence));
+            let packet = RemoteVoicePacket {
+                stream_id: 1,
+                sequence,
+                flags: 0,
+                silence_ranges: 0,
+                payload: vec![0u8; 8],
+                received_at,
+            };
+            // Note: all processed at the same `received_at`-driven path; the
+            // wall clock `process_at` is irrelevant because insert keys off the
+            // packet's arrival time.
+            insert_live_playback_packet(packet, &mut streams, tuning, received_at);
+        }
+        let _ = process_at;
+
+        let feedback = &streams.get(&1).unwrap().feedback;
+        assert!(
+            feedback.smoothed_jitter_us < 2_000.0,
+            "clean 20ms arrivals must not register as jitter: {} us",
+            feedback.smoothed_jitter_us
+        );
+        assert!(
+            feedback.peak_jitter_us < 4_000.0,
+            "clean 20ms arrivals must not spike the jitter peak: {} us",
+            feedback.peak_jitter_us
+        );
+    }
+
+    #[test]
+    fn silence_gate_resume_does_not_inflate_jitter() {
+        // The sender's silence gate suppresses frames without advancing the
+        // sequence, so a multi-second pause arrives as one packet seconds late.
+        // The resume packet carries LIVE_PACKET_FLAG_OPUS_RESET, the sender's
+        // explicit discontinuity signal; the estimator re-anchors on it rather
+        // than charging the pause as jitter (which would pin the target at the
+        // ceiling for the rest of the call after the first pause).
+        let mut feedback = LivePlaybackFeedbackState::default();
+        let frame = Duration::from_secs_f64(LIVE_OPUS_FRAME_SAMPLES as f64 / SAMPLE_RATE as f64);
+        let mut now = Instant::now();
+        let mut seq = 0u32;
+        for _ in 0..30 {
+            feedback.observe_insert(seq, 0, &InsertOutcome::Accepted, now);
+            seq = seq.wrapping_add(1);
+            now += frame;
+        }
+        // Eight second pause, then a flagged resume with the next sequence.
+        now += Duration::from_secs(8);
+        feedback.observe_insert(
+            seq,
+            LIVE_PACKET_FLAG_OPUS_RESET,
+            &InsertOutcome::Accepted,
+            now,
+        );
+
+        assert!(
+            feedback.peak_jitter_us < 5_000.0,
+            "silence gate resume inflated the jitter peak: {} us",
+            feedback.peak_jitter_us
+        );
+        assert!(
+            feedback.smoothed_jitter_us < 5_000.0,
+            "silence gate resume inflated smoothed jitter: {} us",
+            feedback.smoothed_jitter_us
+        );
+    }
+
+    #[test]
+    fn playback_feedback_relaxes_when_consistent_and_pins_on_events() {
+        let tuning = test_tuning();
+        let mut feedback = LivePlaybackFeedbackState::default();
+        let frame = Duration::from_secs_f64(LIVE_OPUS_FRAME_SAMPLES as f64 / SAMPLE_RATE as f64);
+
+        // Before any clean windows the recommendation holds the safe ceiling.
+        assert_eq!(feedback.recommended_target(&tuning), tuning.target_queue);
+
+        let mut seq = 0u32;
+        let mut now = Instant::now();
+        for _ in 0..LIVE_PLAYBACK_DYNAMIC_RELAX_WINDOWS {
+            for _ in 0..30 {
+                feedback.observe_insert(seq, 0, &InsertOutcome::Accepted, now);
+                feedback.observe_playout(
+                    &PlayoutItem::Audio {
+                        sequence: seq,
+                        flags: 0,
+                        silence_ranges: 0,
+                        payload: vec![0],
+                    },
+                    now,
+                );
+                seq = seq.wrapping_add(1);
+                now += frame;
+            }
+            feedback.take_if_ready(0, now).unwrap();
+        }
+
+        // Perfectly periodic arrivals carry no jitter, so the target relaxes
+        // toward the floor, well under the 60 ms ceiling.
+        let relaxed = feedback.recommended_target(&tuning);
+        assert!(relaxed < tuning.target_queue, "{relaxed:?}");
+        assert!(relaxed <= Duration::from_millis(30), "{relaxed:?}");
+        assert!(relaxed >= tuning.dynamic_target_floor, "{relaxed:?}");
+
+        // A single late arrival in the current window pins the recommendation
+        // back at the ceiling immediately, ahead of the window-close reset.
+        feedback.observe_insert(seq, 0, &InsertOutcome::Late, now);
+        assert_eq!(feedback.recommended_target(&tuning), tuning.target_queue);
+    }
+
+    #[test]
+    fn isolated_underrun_keeps_relaxed_target() {
+        let now = Instant::now();
+        let tuning = test_tuning();
+        let ceiling = target_queue_samples(tuning);
+        let mut stream = AdaptivePlaybackStream::new(tuning).unwrap();
+
+        stream.apply_recommended_target(tuning.dynamic_target_floor, now);
+        assert!(stream.effective_target_samples() < ceiling);
+
+        // A lone underrun, the signature of a talkspurt draining to silence,
+        // must not widen the target.
+        stream.note_underrun(now);
+        assert!(stream.effective_target_samples() < ceiling);
+    }
+
+    #[test]
+    fn recurring_underruns_snap_dynamic_target_back_to_ceiling() {
+        let now = Instant::now();
+        let tuning = test_tuning();
+        let ceiling = target_queue_samples(tuning);
+        let mut stream = AdaptivePlaybackStream::new(tuning).unwrap();
+
+        // A low receiver recommendation relaxes the baseline below the ceiling.
+        stream.apply_recommended_target(tuning.dynamic_target_floor, now);
+        assert!(stream.effective_target_samples() < ceiling);
+
+        // Underruns clustered within the window are genuine starvation: they
+        // snap the target back and hold it, even against a stale low
+        // recommendation, breaking the cascade.
+        for offset in 0..LIVE_PLAYBACK_DYNAMIC_UNDERRUN_MIN as u64 {
+            stream.note_underrun(now + Duration::from_millis(offset));
+        }
+        assert_eq!(stream.effective_target_samples(), ceiling);
+        stream
+            .apply_recommended_target(tuning.dynamic_target_floor, now + Duration::from_millis(2));
+        assert_eq!(stream.effective_target_samples(), ceiling);
+
+        // Once the hold expires the recommendation may relax the target again.
+        let after = now + tuning.loss_hold + Duration::from_millis(1);
+        stream.apply_recommended_target(tuning.dynamic_target_floor, after);
+        assert!(stream.effective_target_samples() < ceiling);
+    }
+
+    #[test]
+    fn adaptive_stream_respects_dynamic_target_toggle() {
+        let now = Instant::now();
+        let mut tuning = test_tuning();
+        tuning.adaptive_target = false;
+        let ceiling = target_queue_samples(tuning);
+        let mut stream = AdaptivePlaybackStream::new(tuning).unwrap();
+
+        // With adaptation off, neither a low recommendation nor an underrun may
+        // move the target off the fixed configured value.
+        stream.apply_recommended_target(tuning.dynamic_target_floor, now);
+        assert_eq!(stream.effective_target_samples(), ceiling);
+        stream.note_underrun(now);
+        assert_eq!(stream.effective_target_samples(), ceiling);
     }
 
     #[test]
