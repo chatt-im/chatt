@@ -170,8 +170,12 @@ pub struct AudioLatencyConfig {
     pub playback_silence_skip: bool,
     #[toml(default = true)]
     pub capture_silence_gate: bool,
+    #[toml(default = true)]
+    pub adaptive_target: bool,
     #[toml(default = 60)]
     pub target_queue_ms: u64,
+    #[toml(default = 20)]
+    pub dynamic_target_floor_ms: u64,
     #[toml(default = 320)]
     pub moderate_loss_queue_ms: u64,
     #[toml(default = 1_000)]
@@ -219,7 +223,9 @@ impl Default for AudioLatencyConfig {
             adaptive_catch_up: tuning.adaptive_catch_up,
             playback_silence_skip: tuning.playback_silence_skip,
             capture_silence_gate: tuning.capture_silence_gate,
+            adaptive_target: tuning.adaptive_target,
             target_queue_ms: duration_ms(tuning.target_queue),
+            dynamic_target_floor_ms: duration_ms(tuning.dynamic_target_floor),
             moderate_loss_queue_ms: duration_ms(tuning.moderate_loss_queue),
             dred_horizon_ms: duration_ms(tuning.dred_horizon),
             hard_queue_bound_ms: duration_ms(tuning.hard_queue_bound),
@@ -249,7 +255,9 @@ impl AudioLatencyConfig {
             adaptive_catch_up: self.adaptive_catch_up,
             playback_silence_skip: self.playback_silence_skip,
             capture_silence_gate: self.capture_silence_gate,
+            adaptive_target: self.adaptive_target,
             target_queue: Duration::from_millis(self.target_queue_ms),
+            dynamic_target_floor: Duration::from_millis(self.dynamic_target_floor_ms),
             moderate_loss_queue: Duration::from_millis(self.moderate_loss_queue_ms),
             dred_horizon: Duration::from_millis(self.dred_horizon_ms),
             hard_queue_bound: Duration::from_millis(self.hard_queue_bound_ms),
@@ -919,8 +927,18 @@ fn write_runtime_config<'de>(root: &mut Table<'de>, config: &Config, arena: &'de
             arena,
         );
         latency.insert(
+            Key::new("adaptive-target"),
+            Item::from(config.audio.latency.adaptive_target),
+            arena,
+        );
+        latency.insert(
             Key::new("target-queue-ms"),
             Item::from(config.audio.latency.target_queue_ms as i64),
+            arena,
+        );
+        latency.insert(
+            Key::new("dynamic-target-floor-ms"),
+            Item::from(config.audio.latency.dynamic_target_floor_ms as i64),
             arena,
         );
         latency.insert(
@@ -1432,6 +1450,8 @@ input-device-index = 20
         let mut config = Config::default();
         config.audio.latency.playback_silence_skip = false;
         config.audio.latency.target_queue_ms = 80;
+        config.audio.latency.adaptive_target = false;
+        config.audio.latency.dynamic_target_floor_ms = 25;
         let arena = Arena::new();
         let doc = toml_spanner::parse(DEFAULT_CONFIG, &arena).unwrap();
         let mut table = doc.table().clone_in(&arena);
@@ -1447,6 +1467,8 @@ input-device-index = 20
         assert!(content.contains("[audio.latency]"));
         assert!(content.contains("playback-silence-skip = false"));
         assert!(content.contains("target-queue-ms = 80"));
+        assert!(content.contains("adaptive-target = false"));
+        assert!(content.contains("dynamic-target-floor-ms = 25"));
     }
 
     #[test]

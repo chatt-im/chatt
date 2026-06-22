@@ -52,6 +52,7 @@ use extui_bindings::InputKey;
 use extui_editor::{
     Editor, Replacement, StyleRun, TextBuffer, TrackedChange, bindings as editor_bindings,
 };
+use mimalloc::MiMalloc;
 use ring::rand::SecureRandom;
 use rpc::{
     control::{ChatMessage, InviteTicket, ParticipantInfo},
@@ -65,7 +66,6 @@ use settings::{
 use tinyhl::{Highlighter, Source};
 use ui::select::{FuzzySelect, SelectableItem};
 use unicode_width::UnicodeWidthStr;
-use mimalloc::MiMalloc;
 
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
@@ -2043,10 +2043,10 @@ impl App {
         } else {
             stats.direct_samples.saturating_mul(100) / played_samples
         };
-        let loss_target = if stats.adaptive_target_ms > stats.target_queue_ms {
-            format!(" loss_target{}ms", stats.adaptive_target_ms)
-        } else {
-            String::new()
+        let loss_target = match stats.adaptive_target_ms.cmp(&stats.target_queue_ms) {
+            std::cmp::Ordering::Greater => format!(" loss_target{}ms", stats.adaptive_target_ms),
+            std::cmp::Ordering::Less => format!(" adaptive{}ms", stats.adaptive_target_ms),
+            std::cmp::Ordering::Equal => String::new(),
         };
         self.set_status(format!(
             "audio q{}ms target{}ms{} speed{:+.1}% enc{} direct{}% skip{}ms/{} catchup{} dred{} plc{} trims{} underruns{} rx {}/{}",

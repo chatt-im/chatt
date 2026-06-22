@@ -207,17 +207,21 @@ development server key.
 UDP media shares `tcp-addr` by default. Set `udp-addr` only when the server uses
 a separate UDP media address.
 
-Voice receive keeps a low-latency 60 ms playback target under good conditions.
+Voice receive keeps a 60 ms playback target when the connection is unknown.
 When loss or DRED recovery is observed, playback temporarily permits a larger
 queue so Opus DRED can recover missing frames; adaptive resampling then catches
-up instead of letting latency grow for the rest of the call. Use `/audio` or
-`--logfile` to inspect queue growth, DRED recovery, PLC fallback, hard trims,
-and underruns.
+up instead of letting latency grow for the rest of the call. On a consistent
+connection (low jitter, no loss) it lowers the target toward `dynamic-target-floor-ms`
+to cut latency, and raises it back immediately on any jitter spike, loss, or
+underrun. Use `/audio` or `--logfile` to inspect queue growth, DRED recovery,
+PLC fallback, hard trims, and underruns.
 
 Latency controls live under `[audio.latency]` in `chatt.toml`. The defaults
-enable adaptive catch-up, playback silence skipping, and capture silence gating;
-set `adaptive-catch-up`, `playback-silence-skip`, or `capture-silence-gate` to
-`false` to isolate those behaviors during testing or profiling.
+enable adaptive catch-up, playback silence skipping, capture silence gating, and
+the dynamic target; set `adaptive-catch-up`, `playback-silence-skip`,
+`capture-silence-gate`, or `adaptive-target` to `false` to isolate those
+behaviors during testing or profiling. `dynamic-target-floor-ms` (default 20)
+bounds how low the dynamic target may go.
 
 Set `echo-cancellation = true` under `[audio]` to remove far-end speaker audio
 from the microphone before encoding. It uses the speaker mix as the echo
