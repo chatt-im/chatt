@@ -178,7 +178,6 @@ pub(crate) fn drive_gap_recovery(
         );
     }
 
-    let mut frame = vec![0i16; LIVE_OPUS_FRAME_SAMPLES];
     let mut collected = Vec::new();
     let mut trace = None;
     // First drain plays the contiguous run up to the gap and registers the
@@ -190,7 +189,6 @@ pub(crate) fn drive_gap_recovery(
         t1,
         start,
         1,
-        &mut frame,
         &mut trace,
         |_, samples, source, _| {
             collected.push((source, samples.len()));
@@ -202,7 +200,6 @@ pub(crate) fn drive_gap_recovery(
         t2,
         start,
         1,
-        &mut frame,
         &mut trace,
         |_, samples, source, _| {
             collected.push((source, samples.len()));

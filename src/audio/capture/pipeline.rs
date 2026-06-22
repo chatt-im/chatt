@@ -188,6 +188,26 @@ pub(crate) struct LiveEncoderPipeline {
     echo_source: Option<EchoReferenceSource>,
 }
 
+#[derive(Clone, Copy)]
+struct ProcessedCaptureFrame<'a> {
+    samples: &'a [f32],
+    silence_ranges: u64,
+}
+
+impl<'a> ProcessedCaptureFrame<'a> {
+    fn new(samples: &'a [f32], silence_ranges: u64) -> Self {
+        debug_assert_eq!(samples.len(), FRAME_SAMPLES);
+        Self {
+            samples,
+            silence_ranges,
+        }
+    }
+
+    fn first_subframe_is_silent(self) -> bool {
+        silence_ranges_contain(self.silence_ranges, 0)
+    }
+}
+
 impl LiveEncoderPipeline {
     fn new(
         encoder: OpusVoiceEncoder,
@@ -249,76 +269,80 @@ impl LiveEncoderPipeline {
         F: FnMut(LocalVoiceFrame),
     {
         self.auto_gain.set_max_amplification(max_amplification);
-        for mut frame in self.accumulator.push_chunk_collect(chunk) {
-            self.process_echo(&mut frame);
-            if self.auto_gain_enabled {
-                self.auto_gain.process_frame(&mut frame);
-            }
-            let vad_probability = if self.denoise_enabled {
-                let vad = self
-                    .denoise
-                    .process_frame(&mut self.denoised_frame, frame.as_slice());
-                frame.copy_from_slice(&self.denoised_frame);
-                vad
-            } else {
-                self.earshot.process_48k_frame(frame.as_slice())
-            };
-            store_processed_level_stats(stats, frame.as_slice());
-            stats.store_vad_probability(vad_probability);
-            let vad = vad_to_u8(vad_probability);
-            let silence = is_capture_skip_safe_silence(self.tuning, vad, frame.as_slice());
-            let silence_ranges = self.silence_tracker.observe_frame(silence);
-
-            let decision = self
-                .long_silence
-                .as_mut()
-                .map(|gate| gate.observe(&mut frame, silence, silence_ranges))
-                .unwrap_or(CaptureGateDecision::TransmitCurrent);
-            match decision {
-                CaptureGateDecision::TransmitCurrent => {
-                    self.queue_live_opus_input_frame(
-                        frame.as_slice(),
-                        silence_ranges,
-                        stats,
-                        on_packet,
-                    )?;
-                }
-                CaptureGateDecision::SuppressCurrent => {
-                    self.suppressed_frames = self.suppressed_frames.saturating_add(1);
-                }
-                CaptureGateDecision::Resume(frames) => {
-                    self.reset_opus_stream()?;
-                    for frame in frames {
-                        self.queue_live_opus_input_frame(
-                            &frame.samples,
-                            frame.silence_ranges,
-                            stats,
-                            on_packet,
-                        )?;
-                    }
-                }
-            }
-        }
-        Ok(())
+        let mut accumulator = self.take_accumulator();
+        let result = accumulator.push_chunk(chunk, |frame| {
+            self.process_accumulated_frame(frame, stats, on_packet)
+        });
+        self.accumulator = accumulator;
+        result
     }
 
     fn apply_encoder_profile(&mut self, profile: LiveEncoderProfile) -> Result<(), String> {
         self.encoder.apply_live_encoder_profile(profile)
     }
 
-    fn queue_live_opus_input_frame<F>(
+    fn process_accumulated_frame<F>(
         &mut self,
-        frame: &[f32],
-        silence_ranges: u64,
+        frame: &mut [f32],
         stats: &AudioStats,
         on_packet: &mut F,
     ) -> Result<(), String>
     where
         F: FnMut(LocalVoiceFrame),
     {
-        self.pending_opus_samples.extend_from_slice(frame);
+        self.process_echo(frame);
+        if self.auto_gain_enabled {
+            self.auto_gain.process_frame(frame);
+        }
+        let vad_probability = if self.denoise_enabled {
+            let vad = self.denoise.process_frame(&mut self.denoised_frame, frame);
+            frame.copy_from_slice(&self.denoised_frame);
+            vad
+        } else {
+            self.earshot.process_48k_frame(frame)
+        };
+        store_processed_level_stats(stats, frame);
+        stats.store_vad_probability(vad_probability);
+        let vad = vad_to_u8(vad_probability);
+        let silence = is_capture_skip_safe_silence(self.tuning, vad, frame);
+        let silence_ranges = self.silence_tracker.observe_frame(silence);
+
+        let decision = self
+            .long_silence
+            .as_mut()
+            .map(|gate| gate.observe(frame, silence, silence_ranges))
+            .unwrap_or(CaptureGateDecision::TransmitCurrent);
+        match decision {
+            CaptureGateDecision::TransmitCurrent => {
+                let frame = ProcessedCaptureFrame::new(frame, silence_ranges);
+                self.queue_processed_capture_frame(frame, stats, on_packet)?;
+            }
+            CaptureGateDecision::SuppressCurrent => {
+                self.suppressed_frames = self.suppressed_frames.saturating_add(1);
+            }
+            CaptureGateDecision::Resume(frames) => {
+                self.reset_opus_stream()?;
+                for frame in frames {
+                    let frame = ProcessedCaptureFrame::new(&frame.samples, frame.silence_ranges);
+                    self.queue_processed_capture_frame(frame, stats, on_packet)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn queue_processed_capture_frame<F>(
+        &mut self,
+        frame: ProcessedCaptureFrame<'_>,
+        stats: &AudioStats,
+        on_packet: &mut F,
+    ) -> Result<(), String>
+    where
+        F: FnMut(LocalVoiceFrame),
+    {
+        self.pending_opus_samples.extend_from_slice(frame.samples);
         self.pending_opus_silence
-            .push(silence_ranges_contain(silence_ranges, 0));
+            .push(frame.first_subframe_is_silent());
 
         while self.pending_opus_samples.len() >= LIVE_OPUS_FRAME_SAMPLES {
             let packet_silence_ranges = pack_current_opus_silence_ranges(
@@ -342,6 +366,11 @@ impl LiveEncoderPipeline {
         }
 
         Ok(())
+    }
+
+    fn take_accumulator(&mut self) -> FrameAccumulator {
+        let frame_size = self.accumulator.frame_size;
+        std::mem::replace(&mut self.accumulator, FrameAccumulator::empty(frame_size))
     }
 
     fn reset_opus_stream(&mut self) -> Result<(), String> {
@@ -445,6 +474,13 @@ impl FrameAccumulator {
         }
     }
 
+    fn empty(frame_size: usize) -> Self {
+        Self {
+            frame_size,
+            pending: Vec::new(),
+        }
+    }
+
     fn push_chunk(
         &mut self,
         chunk: &[f32],
@@ -458,18 +494,6 @@ impl FrameAccumulator {
             }
         }
         Ok(())
-    }
-
-    fn push_chunk_collect(&mut self, chunk: &[f32]) -> Vec<Vec<f32>> {
-        let mut frames = Vec::new();
-        for sample in chunk {
-            self.pending.push(*sample);
-            if self.pending.len() == self.frame_size {
-                frames.push(std::mem::take(&mut self.pending));
-                self.pending = Vec::with_capacity(self.frame_size);
-            }
-        }
-        frames
     }
 }
 

@@ -5,21 +5,15 @@ use std::{
     time::{Duration, Instant},
 };
 
-use hashbrown::HashMap;
-
 use crate::{
     audio::{
         capture::{EchoReference, LiveEncoderPipeline, build_live_encoder_pipeline},
-        playback::{
-            LiveDecodeStream, LivePlaybackMixer, drain_live_decode_streams_with_trace,
-            insert_live_playback_packet,
-        },
+        playback::{LiveDecodeStreams, LivePlaybackMixer},
         shared::{
             AudioStats, FRAME_SAMPLES, LIVE_OPUS_FRAME_SAMPLES, LiveAudioTraceWriter,
-            LiveAudioTuning, LocalVoiceFrame, MAX_OPUS_DECODE_SAMPLES, RemoteVoicePacket,
-            SAMPLE_RATE, duration_to_ms, frames_for_duration, max_adjacent_delta,
-            normalized_to_i16_scale, peak_i16_scale, rms_i16_scale, rms_normalized, samples_to_ms,
-            silence_ranges_contain, soft_limit, trace_time_ms,
+            LocalVoiceFrame, RemoteVoicePacket, SAMPLE_RATE, duration_to_ms, frames_for_duration,
+            max_adjacent_delta, normalized_to_i16_scale, peak_i16_scale, rms_i16_scale,
+            rms_normalized, samples_to_ms, silence_ranges_contain, soft_limit, trace_time_ms,
         },
         sim::{
             network::{
@@ -254,8 +248,7 @@ pub(crate) fn run_live_audio_direct_sample_simulation_output_inner(
     };
 
     let mixer = Arc::new(Mutex::new(LivePlaybackMixer::with_tuning(config.tuning)));
-    let mut decode_streams = HashMap::new();
-    let mut decode_frame = vec![0i16; MAX_OPUS_DECODE_SAMPLES];
+    let mut decode_streams = LiveDecodeStreams::new(config.tuning);
     let mut state = SimStreamState::new(sim_config, simulation_encoder_profile(sim_config), None)?;
     let mut rng = SimRng::new(config.seed);
     let mut metrics = OnlineAudioMetrics::default();
@@ -304,10 +297,8 @@ pub(crate) fn run_live_audio_direct_sample_simulation_output_inner(
             now,
             start,
             std::slice::from_mut(&mut state),
-            sim_config.tuning,
             &mixer,
             &mut decode_streams,
-            &mut decode_frame,
             &mut report,
             trace,
         );
@@ -390,8 +381,7 @@ pub(crate) fn run_live_audio_simulation_inner(
     validate_live_audio_simulation_speech_frames(speech_frames)?;
 
     let mixer = Arc::new(Mutex::new(LivePlaybackMixer::with_tuning(config.tuning)));
-    let mut decode_streams = HashMap::new();
-    let mut decode_frame = vec![0i16; MAX_OPUS_DECODE_SAMPLES];
+    let mut decode_streams = LiveDecodeStreams::new(config.tuning);
     let network_profile = simulation_encoder_profile(config);
     let echo_reference = config
         .echo_cancellation
@@ -432,7 +422,6 @@ pub(crate) fn run_live_audio_simulation_inner(
             &mut states,
             &mixer,
             &mut decode_streams,
-            &mut decode_frame,
             &mut rng,
             &mut report,
             speech_frames,
@@ -448,7 +437,6 @@ pub(crate) fn run_live_audio_simulation_inner(
             &mut states,
             &mixer,
             &mut decode_streams,
-            &mut decode_frame,
             &mut rng,
             &mut report,
             speech_frames,
@@ -616,8 +604,7 @@ pub(crate) fn process_simulation_input_frame(
     now: Instant,
     states: &mut [SimStreamState],
     mixer: &Arc<Mutex<LivePlaybackMixer>>,
-    decode_streams: &mut HashMap<u32, LiveDecodeStream>,
-    decode_frame: &mut [i16],
+    decode_streams: &mut LiveDecodeStreams,
     rng: &mut SimRng,
     report: &mut LiveAudioSimulationReport,
     speech_frames: &[Vec<f32>],
@@ -647,10 +634,8 @@ pub(crate) fn process_simulation_input_frame(
         now,
         now,
         states,
-        config.tuning,
         mixer,
         decode_streams,
-        decode_frame,
         report,
         &mut trace,
     );
@@ -661,24 +646,14 @@ pub(crate) fn drain_simulation_network_and_playback(
     now: Instant,
     trace_start: Instant,
     states: &mut [SimStreamState],
-    tuning: LiveAudioTuning,
     mixer: &Arc<Mutex<LivePlaybackMixer>>,
-    decode_streams: &mut HashMap<u32, LiveDecodeStream>,
-    decode_frame: &mut [i16],
+    decode_streams: &mut LiveDecodeStreams,
     report: &mut LiveAudioSimulationReport,
     trace: &mut Option<LiveAudioTraceWriter>,
 ) {
     for (stream_index, state) in states.iter_mut().enumerate() {
         let stream_id = (stream_index + 1) as u32;
-        state.deliver_ready(
-            now,
-            trace_start,
-            stream_id,
-            tuning,
-            decode_streams,
-            report,
-            trace,
-        );
+        state.deliver_ready(now, trace_start, stream_id, decode_streams, report, trace);
     }
     let before_recovery_frames = mixer
         .lock()
@@ -689,15 +664,7 @@ pub(crate) fn drain_simulation_network_and_playback(
                 .saturating_add(mixer.stats.plc_fallbacks)
         })
         .unwrap_or_default();
-    drain_live_decode_streams_with_trace(
-        decode_streams,
-        mixer,
-        decode_frame,
-        now,
-        trace_start,
-        trace,
-        None,
-    );
+    decode_streams.drain_into_mixer_with_trace(mixer, now, trace_start, trace, None);
     let after_recovery_frames = mixer
         .lock()
         .map(|mixer| {
@@ -853,8 +820,7 @@ impl SimStreamState {
         now: Instant,
         trace_start: Instant,
         _stream_id: u32,
-        tuning: LiveAudioTuning,
-        decode_streams: &mut HashMap<u32, LiveDecodeStream>,
+        decode_streams: &mut LiveDecodeStreams,
         report: &mut LiveAudioSimulationReport,
         trace: &mut Option<LiveAudioTraceWriter>,
     ) {
@@ -877,7 +843,7 @@ impl SimStreamState {
             let stream_id = packet.packet.stream_id;
             let sequence = packet.packet.sequence;
             let flags = packet.packet.flags;
-            let outcome = insert_live_playback_packet(packet.packet, decode_streams, tuning, now);
+            let outcome = decode_streams.insert_packet(packet.packet, now);
             trace_packet_delivery(
                 trace,
                 trace_start,

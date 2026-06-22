@@ -1,5 +1,6 @@
 use std::{
     fs,
+    num::NonZeroUsize,
     str::FromStr,
     sync::{
         Arc, Mutex,
@@ -731,6 +732,25 @@ pub(crate) fn audio_buffer_size_label(buffer_size: BufferSize) -> String {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+struct CallbackChannelCount(NonZeroUsize);
+
+impl CallbackChannelCount {
+    fn new(channels: usize, direction: &'static str) -> Result<Self, String> {
+        NonZeroUsize::new(channels)
+            .map(Self)
+            .ok_or_else(|| format!("{direction} stream reported zero channels"))
+    }
+
+    fn get(self) -> usize {
+        self.0.get()
+    }
+
+    fn frames_for_interleaved(self, interleaved_samples: usize) -> usize {
+        interleaved_samples / self.get()
+    }
+}
+
 pub(crate) struct AudioCallbackBufferObserver {
     direction: &'static str,
     last_frames: AtomicUsize,
@@ -744,9 +764,8 @@ impl AudioCallbackBufferObserver {
         }
     }
 
-    fn observe(&self, interleaved_samples: usize, channels: usize) {
-        let channels = channels.max(1);
-        let frames = interleaved_samples / channels;
+    fn observe(&self, interleaved_samples: usize, channels: CallbackChannelCount) {
+        let frames = channels.frames_for_interleaved(interleaved_samples);
         let previous = self.last_frames.swap(frames, Ordering::Relaxed);
         if previous == frames {
             return;
@@ -757,7 +776,7 @@ impl AudioCallbackBufferObserver {
             direction = self.direction,
             observed_buffer_frames = frames,
             observed_buffer_ms = frames as f64 * 1000.0 / SAMPLE_RATE as f64,
-            channels = channels,
+            channels = channels.get(),
             interleaved_samples = interleaved_samples,
             changed = previous != usize::MAX
         );
@@ -773,6 +792,7 @@ pub(crate) fn build_input_stream(
     stats: AudioStats,
     callback_buffer_observer: Option<Arc<AudioCallbackBufferObserver>>,
 ) -> Result<Stream, String> {
+    let channels = CallbackChannelCount::new(channels, "input")?;
     match sample_format {
         SampleFormat::I8 => build_typed_input_stream::<i8>(
             device,
@@ -874,10 +894,10 @@ pub(crate) fn build_input_stream(
     }
 }
 
-pub(crate) fn build_typed_input_stream<T>(
+fn build_typed_input_stream<T>(
     device: &cpal::Device,
     stream_config: StreamConfig,
-    channels: usize,
+    channels: CallbackChannelCount,
     sender: SyncSender<Vec<f32>>,
     stats: AudioStats,
     callback_buffer_observer: Option<Arc<AudioCallbackBufferObserver>>,
@@ -913,6 +933,7 @@ pub(crate) fn build_output_stream(
     samples: Arc<Vec<i16>>,
     stats: PlaybackStats,
 ) -> Result<Stream, String> {
+    let channels = CallbackChannelCount::new(channels, "output")?;
     match sample_format {
         SampleFormat::I8 => {
             build_typed_output_stream::<i8>(device, stream_config, channels, samples, stats)
@@ -963,6 +984,7 @@ pub(crate) fn build_live_output_stream(
     echo_control: Option<Arc<EchoCancellationControl>>,
     callback_buffer_observer: Option<Arc<AudioCallbackBufferObserver>>,
 ) -> Result<Stream, String> {
+    let channels = CallbackChannelCount::new(channels, "live output")?;
     match sample_format {
         SampleFormat::I8 => build_typed_live_output_stream::<i8>(
             device,
@@ -1064,10 +1086,10 @@ pub(crate) fn build_live_output_stream(
     }
 }
 
-pub(crate) fn build_typed_live_output_stream<T>(
+fn build_typed_live_output_stream<T>(
     device: &cpal::Device,
     stream_config: StreamConfig,
-    channels: usize,
+    channels: CallbackChannelCount,
     mixer: Arc<Mutex<LivePlaybackMixer>>,
     echo_control: Option<Arc<EchoCancellationControl>>,
     callback_buffer_observer: Option<Arc<AudioCallbackBufferObserver>>,
@@ -1092,10 +1114,10 @@ where
         .map_err(|error| format!("failed to build live output stream: {error}"))
 }
 
-pub(crate) fn build_typed_output_stream<T>(
+fn build_typed_output_stream<T>(
     device: &cpal::Device,
     stream_config: StreamConfig,
-    channels: usize,
+    channels: CallbackChannelCount,
     samples: Arc<Vec<i16>>,
     stats: PlaybackStats,
 ) -> Result<Stream, String>
@@ -1119,9 +1141,9 @@ where
         .map_err(|error| format!("failed to build output stream: {error}"))
 }
 
-pub(crate) fn playback_callback<T>(
+fn playback_callback<T>(
     output: &mut [T],
-    channels: usize,
+    channels: CallbackChannelCount,
     samples: &[i16],
     cursor: &mut usize,
     stats: &PlaybackStats,
@@ -1130,7 +1152,7 @@ pub(crate) fn playback_callback<T>(
 {
     stats.record_callback();
 
-    for frame in output.chunks_mut(channels.max(1)) {
+    for frame in output.chunks_mut(channels.get()) {
         let sample = samples.get(*cursor).copied().unwrap_or(0);
         if *cursor < samples.len() {
             *cursor += 1;
@@ -1150,9 +1172,9 @@ pub(crate) fn playback_callback<T>(
     stats.store_played_samples(*cursor);
 }
 
-pub(crate) fn live_playback_callback<T>(
+fn live_playback_callback<T>(
     output: &mut [T],
-    channels: usize,
+    channels: CallbackChannelCount,
     mixer: &Arc<Mutex<LivePlaybackMixer>>,
     echo_control: Option<&Arc<EchoCancellationControl>>,
 ) where
@@ -1166,12 +1188,12 @@ pub(crate) fn live_playback_callback<T>(
     };
 
     let now = Instant::now();
-    let output_frames = output.len() / channels.max(1);
+    let output_frames = channels.frames_for_interleaved(output.len());
     let mut echo_writer = match echo_control {
         Some(control) if control.enabled() => Some(control.reference().writer()),
         _ => None,
     };
-    for frame in output.chunks_mut(channels.max(1)) {
+    for frame in output.chunks_mut(channels.get()) {
         let sample = mixer.pop_mixed_output_sample(now, output_frames);
         if let Some(writer) = echo_writer.as_mut() {
             writer.push(sample);
@@ -1186,16 +1208,16 @@ pub(crate) fn live_playback_callback<T>(
     }
 }
 
-pub(crate) fn capture_callback<T>(
+fn capture_callback<T>(
     input: &[T],
-    channels: usize,
+    channels: CallbackChannelCount,
     sender: &SyncSender<Vec<f32>>,
     stats: &AudioStats,
 ) where
     T: Sample,
     f32: FromSample<T>,
 {
-    let mono = downmix_to_mono_i16_scale(input, channels);
+    let mono = downmix_to_mono_i16_scale(input, channels.get());
     let samples = mono.len() as u64;
     let rms = rms_i16_scale(&mono);
     let peak = peak_i16_scale(&mono);
@@ -1206,7 +1228,7 @@ pub(crate) fn capture_callback<T>(
     }
 }
 
-pub(crate) fn downmix_to_mono_i16_scale<T>(input: &[T], channels: usize) -> Vec<f32>
+fn downmix_to_mono_i16_scale<T>(input: &[T], channels: usize) -> Vec<f32>
 where
     T: Sample,
     f32: FromSample<T>,
