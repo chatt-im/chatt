@@ -718,6 +718,7 @@ dependencies = [
 [[package]]
 name = "jsony_bench"
 version = "0.1.0"
+source = "git+https://github.com/exrok/jsony?rev=a92dd3211e8aafda852c910037e07eeaa991df93#a92dd3211e8aafda852c910037e07eeaa991df93"
 dependencies = [
  "jsony",
  "jsony_macros",
