@@ -41,6 +41,9 @@ Dependency notes:
 - `libasound2-dev` on Debian/Ubuntu, or `alsa-lib` on Arch, provides the
   `alsa.pc` metadata required by `alsa-sys`, which is pulled in by the `cpal`
   audio backend used by the client.
+- PipeWire support is available as a non-default Cargo feature. Enable it with
+  `cargo run -p chatt --features pipewire -- --config chatt.toml`; this path
+  needs PipeWire development files discoverable by `pkg-config`.
 - `cmake` and the C toolchain build the bundled `crates/opus-codec` copy of
   libopus. The default `chatt` build enables the Opus `dred` feature.
 - `wget`, `tar`, and CA certificates are used if the Opus DRED model archive is

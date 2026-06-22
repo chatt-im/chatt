@@ -526,6 +526,7 @@ enum CliCommand {
         seed: u64,
     },
     DebugAudioInputs,
+    DebugAudioOutputs,
 }
 
 impl App {
@@ -2085,6 +2086,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             print_debug_audio_inputs(config.audio.buffer.to_request())?;
             return Ok(());
         }
+        CliCommand::DebugAudioOutputs => {
+            let config_path = config::value_arg(&args, "--config");
+            let config = Config::load(config_path.as_deref())?;
+            print_debug_audio_outputs(config.audio.buffer.to_request())?;
+            return Ok(());
+        }
     }
 
     let config_path = config::value_arg(&args, "--config");
@@ -2111,6 +2118,7 @@ fn run_app(
     let flags = TerminalFlags::RAW_MODE
         | TerminalFlags::ALT_SCREEN
         | TerminalFlags::HIDE_CURSOR
+        | TerminalFlags::MOUSE_CAPTURE
         | TerminalFlags::EXTENDED_KEYBOARD_INPUTS;
     let mut terminal = Terminal::open(flags)?;
     let (w, h) = terminal.size()?;
@@ -2256,6 +2264,12 @@ fn parse_cli_command(args: &[String]) -> Result<CliCommand, String> {
             }
             return Ok(CliCommand::DebugAudioInputs);
         }
+        if arg == "debug-audio-outputs" {
+            if args.len() != index + 1 {
+                return Err("usage: chatt debug-audio-outputs".to_string());
+            }
+            return Ok(CliCommand::DebugAudioOutputs);
+        }
 
         if cli_option_takes_value(arg) {
             index += 2;
@@ -2357,12 +2371,29 @@ fn absolute_upload_path(path: &Path) -> Result<PathBuf, String> {
 fn print_debug_audio_inputs(buffer_request: BufferRequest) -> Result<(), String> {
     let devices = audio::input_devices(buffer_request)?;
     let ranked_items = settings::audio_input_items(&devices);
+    print_debug_audio_report(buffer_request, &devices, &ranked_items);
+    Ok(())
+}
+
+fn print_debug_audio_outputs(buffer_request: BufferRequest) -> Result<(), String> {
+    let devices = audio::output_devices(buffer_request)?;
+    let ranked_items = settings::audio_output_items(&devices);
+    print_debug_audio_report(buffer_request, &devices, &ranked_items);
+    Ok(())
+}
+
+fn print_debug_audio_report(
+    buffer_request: BufferRequest,
+    devices: &[DeviceInfo],
+    ranked_items: &[settings::AudioDeviceItem],
+) {
     let report = jsony::object! {
         buffer_request: buffer_request.label(),
         devices: [
             for (index, device) in devices.iter().enumerate();
             {
                 index,
+                id: device.id.as_deref(),
                 name: device.name.as_str(),
                 supported: device.supported,
                 preview: match device.preview.as_ref() {
@@ -2420,7 +2451,6 @@ fn print_debug_audio_inputs(buffer_request: BufferRequest) -> Result<(), String>
         ],
     };
     println!("{report}");
-    Ok(())
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -3514,6 +3544,21 @@ mod tests {
         assert_eq!(
             parse_cli_command(&args).unwrap(),
             CliCommand::DebugAudioInputs
+        );
+    }
+
+    #[test]
+    fn parses_debug_audio_outputs_subcommand_after_value_options() {
+        let args = vec![
+            "chatt".to_string(),
+            "--config".to_string(),
+            "dev.toml".to_string(),
+            "debug-audio-outputs".to_string(),
+        ];
+
+        assert_eq!(
+            parse_cli_command(&args).unwrap(),
+            CliCommand::DebugAudioOutputs
         );
     }
 
