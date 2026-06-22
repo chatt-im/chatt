@@ -104,8 +104,12 @@ const LIVE_PLAYBACK_MAX_SPEED_UP: f64 = 0.25;
 // One-pole smoothing coefficient for the catch-up correction (tau = 50 ms):
 // alpha = 1 - exp(-1 / (tau * rate)) ~= 1 / (tau * rate).
 const LIVE_PLAYBACK_CORRECTION_ALPHA: f64 = 1.0 / (0.050 * SAMPLE_RATE as f64);
-// Maximum per-sample change in correction, so a full 0 -> max ramp takes >= 1 s.
-const LIVE_PLAYBACK_CORRECTION_SLEW: f64 = LIVE_PLAYBACK_MAX_SPEED_UP / SAMPLE_RATE as f64;
+// Maximum per-sample change in correction. Full 0 -> max takes at least 2.5 s,
+// which keeps trace-sized burst recovery from jumping abruptly without pitch
+// correction while still allowing the 1.25x ceiling for sustained backlog.
+const LIVE_PLAYBACK_CORRECTION_RAMP_SECONDS: f64 = 2.5;
+const LIVE_PLAYBACK_CORRECTION_SLEW: f64 =
+    LIVE_PLAYBACK_MAX_SPEED_UP / (LIVE_PLAYBACK_CORRECTION_RAMP_SECONDS * SAMPLE_RATE as f64);
 const LIVE_PLAYBACK_DRED_MAX_SAMPLES: usize = SAMPLE_RATE as usize;
 const LIVE_PLAYBACK_SILENCE_VAD_MAX: u8 = 64;
 const LIVE_PLAYBACK_SILENCE_MIN_GAP: Duration = Duration::from_millis(250);
@@ -923,6 +927,8 @@ pub struct LivePlaybackSnapshot {
     pub skipped_silence_ms: u64,
     pub silence_skip_count: u64,
     pub silence_skip_rejected: u64,
+    pub speech_gap_skip_count: u64,
+    pub skipped_speech_gap_ms: u64,
 }
 
 impl PlaybackStats {
@@ -1504,6 +1510,7 @@ pub fn start_recording(config: RecordingConfig) -> Result<Recording, String> {
             usize::from(selection.supported_config.channels()),
             sender,
             stats.clone(),
+            None,
         )
     })?;
     with_audio_backend_stderr_suppressed(|| stream.play())
@@ -1579,6 +1586,7 @@ where
     });
 
     let stream = with_audio_backend_stderr_suppressed(|| {
+        let callback_buffer_observer = Arc::new(AudioCallbackBufferObserver::new("live_capture"));
         build_input_stream(
             &device,
             selection.supported_config.sample_format(),
@@ -1586,6 +1594,7 @@ where
             usize::from(selection.supported_config.channels()),
             sender,
             stats.clone(),
+            Some(callback_buffer_observer),
         )
     })?;
     with_audio_backend_stderr_suppressed(|| stream.play())
@@ -1698,6 +1707,7 @@ pub fn start_live_playback(config: LivePlaybackConfig) -> Result<LivePlayback, S
     );
     let mixer = Arc::new(Mutex::new(LivePlaybackMixer::with_tuning(config.tuning)));
     let stream = with_audio_backend_stderr_suppressed(|| {
+        let callback_buffer_observer = Arc::new(AudioCallbackBufferObserver::new("live_playback"));
         build_live_output_stream(
             &device,
             selection.supported_config.sample_format(),
@@ -1705,6 +1715,7 @@ pub fn start_live_playback(config: LivePlaybackConfig) -> Result<LivePlayback, S
             usize::from(selection.supported_config.channels()),
             Arc::clone(&mixer),
             config.echo_control.clone(),
+            Some(callback_buffer_observer),
         )
     })?;
     with_audio_backend_stderr_suppressed(|| stream.play())
@@ -2268,6 +2279,39 @@ fn audio_buffer_size_label(buffer_size: BufferSize) -> String {
     }
 }
 
+struct AudioCallbackBufferObserver {
+    direction: &'static str,
+    last_frames: AtomicUsize,
+}
+
+impl AudioCallbackBufferObserver {
+    fn new(direction: &'static str) -> Self {
+        Self {
+            direction,
+            last_frames: AtomicUsize::new(usize::MAX),
+        }
+    }
+
+    fn observe(&self, interleaved_samples: usize, channels: usize) {
+        let channels = channels.max(1);
+        let frames = interleaved_samples / channels;
+        let previous = self.last_frames.swap(frames, Ordering::Relaxed);
+        if previous == frames {
+            return;
+        }
+
+        kvlog::info!(
+            "live audio callback buffer observed",
+            direction = self.direction,
+            observed_buffer_frames = frames,
+            observed_buffer_ms = frames as f64 * 1000.0 / SAMPLE_RATE as f64,
+            channels = channels,
+            interleaved_samples = interleaved_samples,
+            changed = previous != usize::MAX
+        );
+    }
+}
+
 fn build_input_stream(
     device: &cpal::Device,
     sample_format: SampleFormat,
@@ -2275,44 +2319,105 @@ fn build_input_stream(
     channels: usize,
     sender: SyncSender<Vec<f32>>,
     stats: AudioStats,
+    callback_buffer_observer: Option<Arc<AudioCallbackBufferObserver>>,
 ) -> Result<Stream, String> {
     match sample_format {
-        SampleFormat::I8 => {
-            build_typed_input_stream::<i8>(device, stream_config, channels, sender, stats)
-        }
-        SampleFormat::I16 => {
-            build_typed_input_stream::<i16>(device, stream_config, channels, sender, stats)
-        }
-        SampleFormat::I24 => {
-            build_typed_input_stream::<cpal::I24>(device, stream_config, channels, sender, stats)
-        }
-        SampleFormat::I32 => {
-            build_typed_input_stream::<i32>(device, stream_config, channels, sender, stats)
-        }
-        SampleFormat::I64 => {
-            build_typed_input_stream::<i64>(device, stream_config, channels, sender, stats)
-        }
-        SampleFormat::U8 => {
-            build_typed_input_stream::<u8>(device, stream_config, channels, sender, stats)
-        }
-        SampleFormat::U16 => {
-            build_typed_input_stream::<u16>(device, stream_config, channels, sender, stats)
-        }
-        SampleFormat::U24 => {
-            build_typed_input_stream::<cpal::U24>(device, stream_config, channels, sender, stats)
-        }
-        SampleFormat::U32 => {
-            build_typed_input_stream::<u32>(device, stream_config, channels, sender, stats)
-        }
-        SampleFormat::U64 => {
-            build_typed_input_stream::<u64>(device, stream_config, channels, sender, stats)
-        }
-        SampleFormat::F32 => {
-            build_typed_input_stream::<f32>(device, stream_config, channels, sender, stats)
-        }
-        SampleFormat::F64 => {
-            build_typed_input_stream::<f64>(device, stream_config, channels, sender, stats)
-        }
+        SampleFormat::I8 => build_typed_input_stream::<i8>(
+            device,
+            stream_config,
+            channels,
+            sender,
+            stats,
+            callback_buffer_observer,
+        ),
+        SampleFormat::I16 => build_typed_input_stream::<i16>(
+            device,
+            stream_config,
+            channels,
+            sender,
+            stats,
+            callback_buffer_observer,
+        ),
+        SampleFormat::I24 => build_typed_input_stream::<cpal::I24>(
+            device,
+            stream_config,
+            channels,
+            sender,
+            stats,
+            callback_buffer_observer,
+        ),
+        SampleFormat::I32 => build_typed_input_stream::<i32>(
+            device,
+            stream_config,
+            channels,
+            sender,
+            stats,
+            callback_buffer_observer,
+        ),
+        SampleFormat::I64 => build_typed_input_stream::<i64>(
+            device,
+            stream_config,
+            channels,
+            sender,
+            stats,
+            callback_buffer_observer,
+        ),
+        SampleFormat::U8 => build_typed_input_stream::<u8>(
+            device,
+            stream_config,
+            channels,
+            sender,
+            stats,
+            callback_buffer_observer,
+        ),
+        SampleFormat::U16 => build_typed_input_stream::<u16>(
+            device,
+            stream_config,
+            channels,
+            sender,
+            stats,
+            callback_buffer_observer,
+        ),
+        SampleFormat::U24 => build_typed_input_stream::<cpal::U24>(
+            device,
+            stream_config,
+            channels,
+            sender,
+            stats,
+            callback_buffer_observer,
+        ),
+        SampleFormat::U32 => build_typed_input_stream::<u32>(
+            device,
+            stream_config,
+            channels,
+            sender,
+            stats,
+            callback_buffer_observer,
+        ),
+        SampleFormat::U64 => build_typed_input_stream::<u64>(
+            device,
+            stream_config,
+            channels,
+            sender,
+            stats,
+            callback_buffer_observer,
+        ),
+        SampleFormat::F32 => build_typed_input_stream::<f32>(
+            device,
+            stream_config,
+            channels,
+            sender,
+            stats,
+            callback_buffer_observer,
+        ),
+        SampleFormat::F64 => build_typed_input_stream::<f64>(
+            device,
+            stream_config,
+            channels,
+            sender,
+            stats,
+            callback_buffer_observer,
+        ),
         _ => Err(format!("unsupported sample format: {sample_format}")),
     }
 }
@@ -2323,6 +2428,7 @@ fn build_typed_input_stream<T>(
     channels: usize,
     sender: SyncSender<Vec<f32>>,
     stats: AudioStats,
+    callback_buffer_observer: Option<Arc<AudioCallbackBufferObserver>>,
 ) -> Result<Stream, String>
 where
     T: Sample + cpal::SizedSample + Send + 'static,
@@ -2334,6 +2440,9 @@ where
         .build_input_stream(
             stream_config,
             move |input: &[T], _| {
+                if let Some(observer) = callback_buffer_observer.as_ref() {
+                    observer.observe(input.len(), channels);
+                }
                 capture_callback(input, channels, &sender, &data_stats);
             },
             move |error| {
@@ -2404,6 +2513,7 @@ fn build_live_output_stream(
     channels: usize,
     mixer: Arc<Mutex<LivePlaybackMixer>>,
     echo_control: Option<Arc<EchoCancellationControl>>,
+    callback_buffer_observer: Option<Arc<AudioCallbackBufferObserver>>,
 ) -> Result<Stream, String> {
     match sample_format {
         SampleFormat::I8 => build_typed_live_output_stream::<i8>(
@@ -2412,6 +2522,7 @@ fn build_live_output_stream(
             channels,
             mixer,
             echo_control,
+            callback_buffer_observer,
         ),
         SampleFormat::I16 => build_typed_live_output_stream::<i16>(
             device,
@@ -2419,6 +2530,7 @@ fn build_live_output_stream(
             channels,
             mixer,
             echo_control,
+            callback_buffer_observer,
         ),
         SampleFormat::I24 => build_typed_live_output_stream::<cpal::I24>(
             device,
@@ -2426,6 +2538,7 @@ fn build_live_output_stream(
             channels,
             mixer,
             echo_control,
+            callback_buffer_observer,
         ),
         SampleFormat::I32 => build_typed_live_output_stream::<i32>(
             device,
@@ -2433,6 +2546,7 @@ fn build_live_output_stream(
             channels,
             mixer,
             echo_control,
+            callback_buffer_observer,
         ),
         SampleFormat::I64 => build_typed_live_output_stream::<i64>(
             device,
@@ -2440,6 +2554,7 @@ fn build_live_output_stream(
             channels,
             mixer,
             echo_control,
+            callback_buffer_observer,
         ),
         SampleFormat::U8 => build_typed_live_output_stream::<u8>(
             device,
@@ -2447,6 +2562,7 @@ fn build_live_output_stream(
             channels,
             mixer,
             echo_control,
+            callback_buffer_observer,
         ),
         SampleFormat::U16 => build_typed_live_output_stream::<u16>(
             device,
@@ -2454,6 +2570,7 @@ fn build_live_output_stream(
             channels,
             mixer,
             echo_control,
+            callback_buffer_observer,
         ),
         SampleFormat::U24 => build_typed_live_output_stream::<cpal::U24>(
             device,
@@ -2461,6 +2578,7 @@ fn build_live_output_stream(
             channels,
             mixer,
             echo_control,
+            callback_buffer_observer,
         ),
         SampleFormat::U32 => build_typed_live_output_stream::<u32>(
             device,
@@ -2468,6 +2586,7 @@ fn build_live_output_stream(
             channels,
             mixer,
             echo_control,
+            callback_buffer_observer,
         ),
         SampleFormat::U64 => build_typed_live_output_stream::<u64>(
             device,
@@ -2475,6 +2594,7 @@ fn build_live_output_stream(
             channels,
             mixer,
             echo_control,
+            callback_buffer_observer,
         ),
         SampleFormat::F32 => build_typed_live_output_stream::<f32>(
             device,
@@ -2482,6 +2602,7 @@ fn build_live_output_stream(
             channels,
             mixer,
             echo_control,
+            callback_buffer_observer,
         ),
         SampleFormat::F64 => build_typed_live_output_stream::<f64>(
             device,
@@ -2489,6 +2610,7 @@ fn build_live_output_stream(
             channels,
             mixer,
             echo_control,
+            callback_buffer_observer,
         ),
         _ => Err(format!("unsupported output sample format: {sample_format}")),
     }
@@ -2500,6 +2622,7 @@ fn build_typed_live_output_stream<T>(
     channels: usize,
     mixer: Arc<Mutex<LivePlaybackMixer>>,
     echo_control: Option<Arc<EchoCancellationControl>>,
+    callback_buffer_observer: Option<Arc<AudioCallbackBufferObserver>>,
 ) -> Result<Stream, String>
 where
     T: Sample + cpal::SizedSample + FromSample<f32> + Send + 'static,
@@ -2508,6 +2631,9 @@ where
         .build_output_stream(
             stream_config,
             move |output: &mut [T], _| {
+                if let Some(observer) = callback_buffer_observer.as_ref() {
+                    observer.observe(output.len(), channels);
+                }
                 live_playback_callback(output, channels, &mixer, echo_control.as_ref());
             },
             move |error| {
@@ -2910,6 +3036,29 @@ fn silence_ranges_contain(silence_ranges: u64, offset_samples: usize) -> bool {
         }
     }
     false
+}
+
+fn emit_decoded_samples_by_silence_ranges<F>(
+    trace: &mut Option<LiveAudioTraceWriter>,
+    samples: &[f32],
+    source: DecodedFrameSource,
+    silence_ranges: u64,
+    on_samples: &mut F,
+) where
+    F: FnMut(&mut Option<LiveAudioTraceWriter>, &[f32], DecodedFrameSource, bool),
+{
+    if samples.is_empty() {
+        on_samples(trace, samples, source, false);
+        return;
+    }
+
+    let mut offset = 0usize;
+    while offset < samples.len() {
+        let next = offset.saturating_add(FRAME_SAMPLES).min(samples.len());
+        let silence_hint = silence_ranges_contain(silence_ranges, offset);
+        on_samples(trace, &samples[offset..next], source, silence_hint);
+        offset = next;
+    }
 }
 
 struct CaptureBufferedFrame {
@@ -3864,6 +4013,11 @@ fn drain_live_decode_streams_with_trace(
                     );
                 }
             },
+            || {
+                if let Ok(mut mixer) = mixer.lock() {
+                    mixer.note_stream_discontinuity(*stream_id, now);
+                }
+            },
         );
         stream.flush_feedback(*stream_id, now, max_stream_queue_ms, feedback_sender);
     }
@@ -3928,6 +4082,7 @@ impl LiveDecodeStream {
         frame: &mut [i16],
         trace: &mut Option<LiveAudioTraceWriter>,
         mut on_samples: F,
+        mut on_discontinuity: impl FnMut(),
     ) where
         F: FnMut(&mut Option<LiveAudioTraceWriter>, &[f32], DecodedFrameSource, bool),
     {
@@ -3955,13 +4110,14 @@ impl LiveDecodeStream {
                     );
                     if flags & LIVE_PACKET_FLAG_OPUS_RESET != 0 {
                         self.reset_decoder_state();
+                        on_discontinuity();
                         trace_decoder_reset(trace, trace_start, now, stream_id, *sequence);
                     }
                     self.decode_playout(
                         payload,
                         frame,
                         DecodedFrameSource::Normal,
-                        silence_ranges_contain(*silence_ranges, 0),
+                        *silence_ranges,
                         trace_start,
                         now,
                         stream_id,
@@ -3987,7 +4143,7 @@ impl LiveDecodeStream {
                             &[],
                             &mut frame[..plc_samples],
                             DecodedFrameSource::Plc,
-                            false,
+                            0,
                             trace_start,
                             now,
                             stream_id,
@@ -4022,7 +4178,7 @@ impl LiveDecodeStream {
         payload: &[u8],
         frame: &mut [i16],
         source: DecodedFrameSource,
-        silence_hint: bool,
+        silence_ranges: u64,
         trace_start: Instant,
         now: Instant,
         stream_id: u32,
@@ -4035,6 +4191,7 @@ impl LiveDecodeStream {
         let mut float_frame = vec![0.0f32; frame.len()];
         match self.decoder.decode_float(payload, &mut float_frame, false) {
             Ok(decoded) => {
+                let silence_hint = silence_ranges_contain(silence_ranges, 0);
                 trace_decode_output(
                     trace,
                     trace_start,
@@ -4047,7 +4204,17 @@ impl LiveDecodeStream {
                     None,
                     &float_frame[..decoded],
                 );
-                on_samples(trace, &float_frame[..decoded], source, silence_hint);
+                if matches!(source, DecodedFrameSource::Normal) {
+                    emit_decoded_samples_by_silence_ranges(
+                        trace,
+                        &float_frame[..decoded],
+                        source,
+                        silence_ranges,
+                        on_samples,
+                    );
+                } else {
+                    on_samples(trace, &float_frame[..decoded], source, silence_hint);
+                }
             }
             Err(error) => {
                 eprintln!("failed to decode live opus packet: {error}");
@@ -4639,6 +4806,8 @@ struct LivePlaybackMixerStats {
     skipped_silence_samples: u64,
     silence_skip_count: u64,
     silence_skip_rejected: u64,
+    skipped_speech_gap_samples: u64,
+    speech_gap_skip_count: u64,
 }
 
 impl LivePlaybackMixer {
@@ -4717,6 +4886,12 @@ impl LivePlaybackMixer {
         self.controls.remove(&stream_id);
     }
 
+    fn note_stream_discontinuity(&mut self, stream_id: u32, now: Instant) {
+        if let Some(stream) = self.streams.get_mut(&stream_id) {
+            stream.skip_speech_gap_backlog(now, &mut self.stats);
+        }
+    }
+
     fn set_stream_control(&mut self, stream_id: u32, control: PlaybackStreamControl) {
         if control == PlaybackStreamControl::default() {
             self.controls.remove(&stream_id);
@@ -4774,7 +4949,15 @@ impl LivePlaybackMixer {
                 dred = self.stats.dred_recoveries,
                 plc = self.stats.plc_fallbacks,
                 hard_trims = self.stats.hard_trim_count,
-                resampled_samples = self.stats.resampled_samples
+                direct_samples = self.stats.direct_samples,
+                resampled_samples = self.stats.resampled_samples,
+                correction_count = self.stats.correction_count,
+                silence_skip_count = self.stats.silence_skip_count,
+                skipped_silence_ms = samples_to_ms(self.stats.skipped_silence_samples as usize),
+                silence_skip_rejected = self.stats.silence_skip_rejected,
+                speech_gap_skip_count = self.stats.speech_gap_skip_count,
+                skipped_speech_gap_ms =
+                    samples_to_ms(self.stats.skipped_speech_gap_samples as usize)
             );
         }
     }
@@ -4822,6 +5005,8 @@ impl LivePlaybackMixer {
             skipped_silence_ms: samples_to_ms(self.stats.skipped_silence_samples as usize),
             silence_skip_count: self.stats.silence_skip_count,
             silence_skip_rejected: self.stats.silence_skip_rejected,
+            speech_gap_skip_count: self.stats.speech_gap_skip_count,
+            skipped_speech_gap_ms: samples_to_ms(self.stats.skipped_speech_gap_samples as usize),
         }
     }
 
@@ -5288,6 +5473,30 @@ impl AdaptivePlaybackStream {
     fn low_latency_target_samples(&self) -> usize {
         self.effective_target_samples()
             .max(self.output_target_floor_samples)
+    }
+
+    fn skip_speech_gap_backlog(&mut self, now: Instant, stats: &mut LivePlaybackMixerStats) {
+        let queued = self.queued_samples();
+        let target = self.low_latency_target_samples();
+        if queued <= target {
+            return;
+        }
+
+        let skip = queued.saturating_sub(target);
+        self.drop_oldest(skip);
+        self.smoothed_correction = 0.0;
+        self.current_correction_percent = 0.0;
+        self.phase_increment = 1.0;
+        stats.speech_gap_skip_count = stats.speech_gap_skip_count.saturating_add(1);
+        stats.skipped_speech_gap_samples =
+            stats.skipped_speech_gap_samples.saturating_add(skip as u64);
+        kvlog::info!(
+            "live playback skipped speech gap",
+            skipped_ms = samples_to_ms(skip),
+            queued_ms = samples_to_ms(queued),
+            target_ms = samples_to_ms(target),
+            applied_target_ms = samples_to_ms(self.adaptive_target_samples(now))
+        );
     }
 
     fn enforce_hard_bound(&mut self, now: Instant, stats: &mut LivePlaybackMixerStats) {
@@ -6293,6 +6502,8 @@ fn trace_output_window(
         hard_trim_count: snapshot.hard_trim_count,
         silence_skip_count: snapshot.silence_skip_count,
         skipped_silence_ms: snapshot.skipped_silence_ms,
+        speech_gap_skip_count: snapshot.speech_gap_skip_count,
+        skipped_speech_gap_ms: snapshot.skipped_speech_gap_ms,
     });
 }
 
@@ -8242,6 +8453,7 @@ mod tests {
             |_, samples, source, _| {
                 collected.push((source, samples.len()));
             },
+            || {},
         );
         let t2 = t1 + tuning.max_reorder_delay + Duration::from_millis(1);
         stream.drain_ready(
@@ -8253,6 +8465,7 @@ mod tests {
             |_, samples, source, _| {
                 collected.push((source, samples.len()));
             },
+            || {},
         );
         (collected, stream)
     }
@@ -8275,7 +8488,8 @@ mod tests {
         assert!(
             collected
                 .iter()
-                .all(|(_, len)| *len == LIVE_OPUS_FRAME_SAMPLES),
+                .all(|(source, len)| matches!(source, DecodedFrameSource::Normal)
+                    || *len == LIVE_OPUS_FRAME_SAMPLES),
             "every recovered frame is a whole frame, never a splice"
         );
     }
@@ -8315,7 +8529,8 @@ mod tests {
         assert!(
             collected
                 .iter()
-                .all(|(_, len)| *len == LIVE_OPUS_FRAME_SAMPLES)
+                .all(|(source, len)| matches!(source, DecodedFrameSource::Normal)
+                    || *len == LIVE_OPUS_FRAME_SAMPLES)
         );
     }
 
@@ -8369,6 +8584,32 @@ mod tests {
         assert!(!silence_ranges_contain(encoded, FRAME_SAMPLES));
         assert!(silence_ranges_contain(encoded, FRAME_SAMPLES * 2));
         assert!(!silence_ranges_contain(encoded, FRAME_SAMPLES * 4));
+    }
+
+    #[test]
+    fn decoded_samples_keep_per_frame_silence_hints() {
+        let samples = vec![0.0; LIVE_OPUS_FRAME_SAMPLES];
+        let silence_ranges = pack_current_opus_silence_ranges(&[false, true]);
+        let mut chunks = Vec::new();
+        let mut trace = None;
+
+        emit_decoded_samples_by_silence_ranges(
+            &mut trace,
+            &samples,
+            DecodedFrameSource::Normal,
+            silence_ranges,
+            &mut |_, samples, source, silence_hint| {
+                chunks.push((samples.len(), source, silence_hint));
+            },
+        );
+
+        assert_eq!(
+            chunks,
+            vec![
+                (FRAME_SAMPLES, DecodedFrameSource::Normal, false),
+                (FRAME_SAMPLES, DecodedFrameSource::Normal, true),
+            ]
+        );
     }
 
     #[test]
@@ -8545,6 +8786,7 @@ mod tests {
             |_, samples, _source, _silence| {
                 decoded.extend_from_slice(samples);
             },
+            || {},
         );
         assert_eq!(decoded.len(), LIVE_OPUS_FRAME_SAMPLES);
 
@@ -8562,6 +8804,7 @@ mod tests {
             |_, samples, _source, _silence| {
                 decoded.extend_from_slice(samples);
             },
+            || {},
         );
         assert!(decoded.is_empty());
 
@@ -8574,6 +8817,7 @@ mod tests {
             |_, samples, _source, _silence| {
                 decoded.extend_from_slice(samples);
             },
+            || {},
         );
         assert_eq!(decoded.len(), LIVE_OPUS_FRAME_SAMPLES * 2);
     }
@@ -8791,6 +9035,28 @@ mod tests {
         let correction = stream.desired_correction(now);
         assert!(correction > 0.14);
         assert!(correction <= LIVE_PLAYBACK_MAX_SPEED_UP);
+    }
+
+    #[test]
+    fn adaptive_stream_ramps_catchup_correction_slowly() {
+        let now = Instant::now();
+        let mut stream = AdaptivePlaybackStream::new(test_tuning()).unwrap();
+        let mut stats = LivePlaybackMixerStats::default();
+        stream.input.push_back(
+            &vec![0.0; samples_for_duration(LIVE_PLAYBACK_HARD_QUEUE_BOUND)],
+            false,
+        );
+
+        for _ in 0..samples_for_duration(Duration::from_millis(100)) {
+            stream.update_correction(now, &mut stats);
+        }
+
+        assert!(
+            stream.current_correction_percent <= 1.1,
+            "100ms ramp should stay near 1 percentage point, got {}",
+            stream.current_correction_percent
+        );
+        assert_eq!(stats.correction_count, 1);
     }
 
     #[test]
@@ -9051,6 +9317,67 @@ mod tests {
             samples_to_ms(marked_stats.skipped_silence_samples as usize),
             duration_to_ms(LIVE_PLAYBACK_SILENCE_MAX_SKIP)
         );
+    }
+
+    #[test]
+    fn adaptive_stream_skips_marked_250ms_gap_when_behind() {
+        let now = Instant::now();
+        let mut stream = AdaptivePlaybackStream::new(test_tuning()).unwrap();
+        let mut stats = LivePlaybackMixerStats::default();
+
+        stream.queue_samples(
+            &vec![0.25; samples_for_duration(Duration::from_millis(100))],
+            DecodedFrameSource::Normal,
+            false,
+            now,
+            &mut stats,
+        );
+        stream.queue_samples(
+            &vec![0.0; samples_for_duration(Duration::from_millis(250))],
+            DecodedFrameSource::Normal,
+            true,
+            now,
+            &mut stats,
+        );
+        stream.queue_samples(
+            &vec![0.25; samples_for_duration(Duration::from_millis(100))],
+            DecodedFrameSource::Normal,
+            false,
+            now,
+            &mut stats,
+        );
+
+        let _ = stream.pop_sample(now, &mut stats);
+
+        assert_eq!(stats.silence_skip_count, 1);
+        assert!(
+            samples_to_ms(stats.skipped_silence_samples as usize) >= 150,
+            "skipped {}ms",
+            samples_to_ms(stats.skipped_silence_samples as usize)
+        );
+    }
+
+    #[test]
+    fn mixer_skips_backlog_at_speech_gap_discontinuity() {
+        let now = Instant::now();
+        let mut mixer = LivePlaybackMixer::new();
+
+        mixer.queue_stream_samples(
+            1,
+            &vec![0.0; samples_for_duration(Duration::from_millis(220))],
+            DecodedFrameSource::Normal,
+            false,
+            now,
+        );
+        mixer.note_stream_discontinuity(1, now);
+
+        let snapshot = mixer.snapshot_at(now);
+        assert_eq!(
+            snapshot.max_queue_ms,
+            duration_to_ms(test_tuning().target_queue)
+        );
+        assert_eq!(snapshot.speech_gap_skip_count, 1);
+        assert!(snapshot.skipped_speech_gap_ms >= 150, "{snapshot:?}");
     }
 
     #[test]
