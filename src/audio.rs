@@ -91,6 +91,10 @@ const LIVE_PLAYBACK_INITIAL_BUFFER: Duration = Duration::from_millis(40);
 const LIVE_PLAYBACK_DRAIN_INTERVAL: Duration = Duration::from_millis(10);
 const LIVE_PLAYBACK_FEEDBACK_INTERVAL: Duration = Duration::from_millis(500);
 const LIVE_PLAYBACK_FEEDBACK_PACKETS: u32 = 25;
+// Cadence of the "live playback snapshot" diagnostic. Decoupled from the 500 ms
+// feedback window so queue/target/correction dynamics are sampled finely enough
+// to see the queue oscillate between arrivals (one packet is 20 ms).
+const LIVE_PLAYBACK_SNAPSHOT_INTERVAL: Duration = Duration::from_millis(100);
 const LIVE_PLAYBACK_MAX_REORDER_DELAY: Duration = Duration::from_millis(60);
 // One 20 ms Opus packet of cadence jitter must not trigger resampling, but a
 // persistent excess beyond that should drain back to target. A larger value
@@ -3852,6 +3856,9 @@ fn drain_live_decode_streams_with_trace(
         );
         stream.flush_feedback(*stream_id, now, max_stream_queue_ms, feedback_sender);
     }
+    if let Ok(mut mixer) = mixer.lock() {
+        mixer.log_playback_diagnostics_if_due(now);
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -4311,6 +4318,9 @@ impl LiveDecodeStream {
         }
     }
 
+    /// Closes the feedback window if ready, logs the per-window receiver
+    /// estimate (jitter, recommended target, and loss/late/reorder counts), and
+    /// sends the feedback to the network worker.
     fn flush_feedback(
         &mut self,
         stream_id: u32,
@@ -4330,7 +4340,15 @@ impl LiveDecodeStream {
             transit_ms = (self.feedback.relative_transit_us / 1_000.0) as f32,
             base_ms = (self.feedback.base_transit_us / 1_000.0) as f32,
             clean_window_streak = u64::from(self.feedback.clean_window_streak),
-            recommended_target_ms = duration_to_ms(self.feedback.recommended_target(&self.tuning))
+            recommended_target_ms = duration_to_ms(self.feedback.recommended_target(&self.tuning)),
+            window_ms = u64::from(feedback.window_ms),
+            window_max_queue_ms = u64::from(feedback.max_queue_ms),
+            window_max_jitter_ms = u64::from(feedback.max_interarrival_jitter_ms),
+            expected = u64::from(feedback.expected_packets),
+            lost = u64::from(feedback.lost_packets),
+            late = u64::from(feedback.late_packets),
+            reordered = u64::from(feedback.reordered_packets),
+            duplicates = u64::from(feedback.duplicate_packets)
         );
         if let Some(sender) = feedback_sender {
             let _ = sender.send(feedback);
@@ -4594,6 +4612,7 @@ struct LivePlaybackMixer {
     streams: HashMap<u32, AdaptivePlaybackStream>,
     controls: HashMap<u32, PlaybackStreamControl>,
     stats: LivePlaybackMixerStats,
+    last_diagnostic_at: Option<Instant>,
 }
 
 #[derive(Default)]
@@ -4622,6 +4641,7 @@ impl LivePlaybackMixer {
             streams: HashMap::new(),
             controls: HashMap::new(),
             stats: LivePlaybackMixerStats::default(),
+            last_diagnostic_at: None,
         }
     }
 
@@ -4706,6 +4726,46 @@ impl LivePlaybackMixer {
             .get(&stream_id)
             .map(|stream| samples_to_ms(stream.queued_samples()))
             .unwrap_or_default()
+    }
+
+    /// Logs the actual playback state for every active stream, throttled to
+    /// `LIVE_PLAYBACK_SNAPSHOT_INTERVAL`. Each line reports the current queue
+    /// depth, the target actually being applied (after dead-band, underrun hold,
+    /// and loss expansion), the catch-up correction, and cumulative recovery
+    /// stats. This distinguishes a queue parked above target by loss expansion
+    /// (`target_expanded=true`, high `applied_target_ms`) from a low target the
+    /// catch-up is failing to drain (`applied_target_ms` low, `queue_ms` high,
+    /// `correction_percent` near zero).
+    fn log_playback_diagnostics_if_due(&mut self, now: Instant) {
+        if self.streams.is_empty() {
+            return;
+        }
+        if self
+            .last_diagnostic_at
+            .is_some_and(|at| now.saturating_duration_since(at) < LIVE_PLAYBACK_SNAPSHOT_INTERVAL)
+        {
+            return;
+        }
+        self.last_diagnostic_at = Some(now);
+        for (stream_id, stream) in &self.streams {
+            let expanded = stream
+                .expanded_target_until
+                .is_some_and(|until| now < until);
+            kvlog::info!(
+                "live playback snapshot",
+                stream_id = *stream_id,
+                queue_ms = samples_to_ms(stream.queued_samples()),
+                applied_target_ms = samples_to_ms(stream.adaptive_target_samples(now)),
+                recommended_target_ms = samples_to_ms(stream.effective_target_samples()),
+                target_expanded = expanded,
+                correction_percent = stream.current_correction_percent,
+                underruns = self.stats.underrun_count,
+                dred = self.stats.dred_recoveries,
+                plc = self.stats.plc_fallbacks,
+                hard_trims = self.stats.hard_trim_count,
+                resampled_samples = self.stats.resampled_samples
+            );
+        }
     }
 
     fn snapshot(&self) -> LivePlaybackSnapshot {
