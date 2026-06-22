@@ -49,7 +49,16 @@ const LIVE_PLAYBACK_TARGET_QUEUE: Duration = Duration::from_millis(60);
 // loss-expansion path. Buffer depth tracks delay variation, not absolute RTT.
 const LIVE_PLAYBACK_DYNAMIC_TARGET_FLOOR: Duration = Duration::from_millis(20);
 const LIVE_PLAYBACK_DYNAMIC_TARGET_MARGIN: Duration = Duration::from_millis(8);
-const LIVE_PLAYBACK_DYNAMIC_JITTER_GAIN: f64 = 3.0;
+// Jitter-to-target gain: the dynamic target adds this multiple of the jitter
+// estimate above one packet period. Sized so a clean internet path with a small
+// jitter tail descends below the ceiling instead of pinning at it.
+const LIVE_PLAYBACK_DYNAMIC_JITTER_GAIN: f64 = 1.5;
+// Weight on the slow-decay jitter peak when sizing the target. The peak holds a
+// single late packet for ~2 s, so on a path with a continuous small tail it
+// would otherwise dominate `max(smoothed, peak)` and keep the target pinned.
+// Discounting it lets steady-state jitter, not the held worst case, set the
+// target, while a genuine burst still drives the peak high enough to re-widen.
+const LIVE_PLAYBACK_DYNAMIC_PEAK_WEIGHT: f64 = 0.5;
 // Late-jitter EWMA gain (J += (late - J) / 16).
 const LIVE_PLAYBACK_RTP_JITTER_GAIN: f64 = 1.0 / 16.0;
 // Per-packet rise of the relative-transit baseline, in microseconds. The
@@ -233,6 +242,9 @@ pub struct LiveAudioTuning {
     pub adaptive_target: bool,
     pub target_queue: Duration,
     pub dynamic_target_floor: Duration,
+    pub dynamic_target_margin: Duration,
+    pub dynamic_jitter_gain: f64,
+    pub dynamic_peak_weight: f64,
     pub moderate_loss_queue: Duration,
     pub dred_horizon: Duration,
     pub hard_queue_bound: Duration,
@@ -263,6 +275,9 @@ impl Default for LiveAudioTuning {
             adaptive_target: true,
             target_queue: LIVE_PLAYBACK_TARGET_QUEUE,
             dynamic_target_floor: LIVE_PLAYBACK_DYNAMIC_TARGET_FLOOR,
+            dynamic_target_margin: LIVE_PLAYBACK_DYNAMIC_TARGET_MARGIN,
+            dynamic_jitter_gain: LIVE_PLAYBACK_DYNAMIC_JITTER_GAIN,
+            dynamic_peak_weight: LIVE_PLAYBACK_DYNAMIC_PEAK_WEIGHT,
             moderate_loss_queue: LIVE_PLAYBACK_MODERATE_LOSS_QUEUE,
             dred_horizon: LIVE_PLAYBACK_DRED_HORIZON,
             hard_queue_bound: LIVE_PLAYBACK_HARD_QUEUE_BOUND,
@@ -295,6 +310,20 @@ impl LiveAudioTuning {
             10,
             1_000,
         )?;
+        validate_duration_ms(
+            "dynamic-target-margin-ms",
+            self.dynamic_target_margin,
+            0,
+            200,
+        )?;
+        if !self.dynamic_jitter_gain.is_finite() || !(0.0..=8.0).contains(&self.dynamic_jitter_gain)
+        {
+            return Err("dynamic-jitter-gain must be between 0.0 and 8.0".to_string());
+        }
+        if !self.dynamic_peak_weight.is_finite() || !(0.0..=1.0).contains(&self.dynamic_peak_weight)
+        {
+            return Err("dynamic-peak-weight must be between 0.0 and 1.0".to_string());
+        }
         validate_duration_ms(
             "moderate-loss-queue-ms",
             self.moderate_loss_queue,
@@ -4485,12 +4514,15 @@ impl LivePlaybackFeedbackState {
         if !relaxed {
             return tuning.target_queue;
         }
-        let jitter_us = self.smoothed_jitter_us.max(self.peak_jitter_us).max(0.0);
+        let jitter_us = self
+            .smoothed_jitter_us
+            .max(tuning.dynamic_peak_weight * self.peak_jitter_us)
+            .max(0.0);
         let packet_period =
             Duration::from_secs_f64(LIVE_OPUS_FRAME_SAMPLES as f64 / SAMPLE_RATE as f64);
         let raw = packet_period
-            + Duration::from_secs_f64(LIVE_PLAYBACK_DYNAMIC_JITTER_GAIN * jitter_us / 1.0e6)
-            + LIVE_PLAYBACK_DYNAMIC_TARGET_MARGIN;
+            + Duration::from_secs_f64(tuning.dynamic_jitter_gain * jitter_us / 1.0e6)
+            + tuning.dynamic_target_margin;
         raw.clamp(tuning.dynamic_target_floor, tuning.target_queue)
     }
 
@@ -5605,6 +5637,7 @@ pub enum LiveAudioPacketLossProfile {
     None,
     Lan,
     RegionalEthernet,
+    CleanJitter,
     MildRandom,
     ModerateRandom,
     SevereRandom,
@@ -5617,11 +5650,12 @@ pub enum LiveAudioPacketLossProfile {
 }
 
 impl LiveAudioPacketLossProfile {
-    pub const NAMES: [&'static str; 13] = [
+    pub const NAMES: [&'static str; 14] = [
         "scenario_default",
         "none",
         "lan",
         "regional_ethernet",
+        "clean_jitter",
         "mild_random",
         "moderate_random",
         "severe_random",
@@ -5639,6 +5673,7 @@ impl LiveAudioPacketLossProfile {
             "none" => Some(Self::None),
             "lan" => Some(Self::Lan),
             "regional_ethernet" => Some(Self::RegionalEthernet),
+            "clean_jitter" => Some(Self::CleanJitter),
             "mild_random" => Some(Self::MildRandom),
             "moderate_random" => Some(Self::ModerateRandom),
             "severe_random" => Some(Self::SevereRandom),
@@ -5658,6 +5693,7 @@ impl LiveAudioPacketLossProfile {
             Self::None => "none",
             Self::Lan => "lan",
             Self::RegionalEthernet => "regional_ethernet",
+            Self::CleanJitter => "clean_jitter",
             Self::MildRandom => "mild_random",
             Self::ModerateRandom => "moderate_random",
             Self::SevereRandom => "severe_random",
@@ -6730,7 +6766,8 @@ fn simulation_drops_frame(
         },
         LiveAudioPacketLossProfile::None
         | LiveAudioPacketLossProfile::Lan
-        | LiveAudioPacketLossProfile::RegionalEthernet => false,
+        | LiveAudioPacketLossProfile::RegionalEthernet
+        | LiveAudioPacketLossProfile::CleanJitter => false,
         LiveAudioPacketLossProfile::MildRandom => {
             rng.next_f64() < if silence_hint { 0.02 } else { 0.01 }
         }
@@ -6791,6 +6828,15 @@ fn simulation_delivery_delay(
         // variation, so the dynamic target still relaxes. Buffer depth tracks
         // jitter, not RTT.
         LiveAudioPacketLossProfile::RegionalEthernet => Duration::from_millis(30),
+        // A clean internet path: zero loss, but a small interarrival jitter tail.
+        // Delays stay at most one 10 ms frame, strictly below the 20 ms packet
+        // cadence, so packets jitter in their arrival gap without ever
+        // reordering. This reproduces the captured production trace (p90 ~16 ms,
+        // p99 ~20 ms, no loss/late/reorder) that pinned the old target at the
+        // ceiling, and exercises the dynamic target's descent.
+        LiveAudioPacketLossProfile::CleanJitter => {
+            frame.saturating_mul(random_delay_frames(rng, 0.30, 0.0, 1, 1))
+        }
         LiveAudioPacketLossProfile::MildRandom => {
             frame.saturating_mul(random_delay_frames(rng, 0.03, 0.005, 3, 8))
         }
@@ -6842,7 +6888,8 @@ fn simulation_encoder_profile(config: LiveAudioSimulationConfig) -> EncoderNetwo
     match config.packet_loss {
         LiveAudioPacketLossProfile::None
         | LiveAudioPacketLossProfile::Lan
-        | LiveAudioPacketLossProfile::RegionalEthernet => EncoderNetworkProfile::EXCELLENT,
+        | LiveAudioPacketLossProfile::RegionalEthernet
+        | LiveAudioPacketLossProfile::CleanJitter => EncoderNetworkProfile::EXCELLENT,
         LiveAudioPacketLossProfile::MildRandom => EncoderNetworkProfile::DEGRADED,
         LiveAudioPacketLossProfile::ModerateRandom => EncoderNetworkProfile::SEVERE,
         LiveAudioPacketLossProfile::SevereRandom
@@ -9275,6 +9322,37 @@ mod tests {
             "steady-delay link did not relax the target: {report:?}"
         );
         assert_eq!(report.final_snapshot.underrun_count, 0, "{report:?}");
+        assert_coherent_output(&report, 0.005);
+    }
+
+    #[test]
+    fn clean_jitter_connection_descends_target_below_ceiling() {
+        // A clean internet path with a small interarrival jitter tail (no
+        // loss/late/reorder) must still descend the playout target well below
+        // the 60 ms ceiling. This reproduces the captured production trace where
+        // the old `3 * max(J, P)` formula pinned the target at the ceiling for
+        // the entire call.
+        let report = simulate_with_loss(
+            LiveAudioSimulationScenario::ConstantSpeech,
+            Duration::from_secs(60),
+            test_tuning(),
+            1,
+            LiveAudioPacketLossProfile::CleanJitter,
+        );
+
+        assert_eq!(report.lost_frames, 0, "{report:?}");
+        assert!(
+            report.steady_state_adaptive_target_ms <= 45,
+            "clean-jitter link did not descend the target: {report:?}"
+        );
+        assert!(
+            report.steady_state_adaptive_target_ms < duration_to_ms(test_tuning().target_queue),
+            "target stayed pinned at the ceiling: {report:?}"
+        );
+        assert_eq!(
+            report.final_snapshot.underrun_count, 0,
+            "descend must not cause underruns: {report:?}"
+        );
         assert_coherent_output(&report, 0.005);
     }
 

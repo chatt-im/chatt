@@ -176,6 +176,12 @@ pub struct AudioLatencyConfig {
     pub target_queue_ms: u64,
     #[toml(default = 20)]
     pub dynamic_target_floor_ms: u64,
+    #[toml(default = 8)]
+    pub dynamic_target_margin_ms: u64,
+    #[toml(default = 1.5)]
+    pub dynamic_jitter_gain: f64,
+    #[toml(default = 0.5)]
+    pub dynamic_peak_weight: f64,
     #[toml(default = 320)]
     pub moderate_loss_queue_ms: u64,
     #[toml(default = 1_000)]
@@ -226,6 +232,9 @@ impl Default for AudioLatencyConfig {
             adaptive_target: tuning.adaptive_target,
             target_queue_ms: duration_ms(tuning.target_queue),
             dynamic_target_floor_ms: duration_ms(tuning.dynamic_target_floor),
+            dynamic_target_margin_ms: duration_ms(tuning.dynamic_target_margin),
+            dynamic_jitter_gain: tuning.dynamic_jitter_gain,
+            dynamic_peak_weight: tuning.dynamic_peak_weight,
             moderate_loss_queue_ms: duration_ms(tuning.moderate_loss_queue),
             dred_horizon_ms: duration_ms(tuning.dred_horizon),
             hard_queue_bound_ms: duration_ms(tuning.hard_queue_bound),
@@ -258,6 +267,9 @@ impl AudioLatencyConfig {
             adaptive_target: self.adaptive_target,
             target_queue: Duration::from_millis(self.target_queue_ms),
             dynamic_target_floor: Duration::from_millis(self.dynamic_target_floor_ms),
+            dynamic_target_margin: Duration::from_millis(self.dynamic_target_margin_ms),
+            dynamic_jitter_gain: self.dynamic_jitter_gain,
+            dynamic_peak_weight: self.dynamic_peak_weight,
             moderate_loss_queue: Duration::from_millis(self.moderate_loss_queue_ms),
             dred_horizon: Duration::from_millis(self.dred_horizon_ms),
             hard_queue_bound: Duration::from_millis(self.hard_queue_bound_ms),
