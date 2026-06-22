@@ -413,6 +413,11 @@ pub struct LivePlayback {
 }
 
 #[derive(Clone, Debug)]
+pub struct LivePlaybackSink {
+    sender: SyncSender<LivePlaybackCommand>,
+}
+
+#[derive(Clone, Debug)]
 pub struct LiveAudioFilePlaybackTestConfig {
     pub input_path: PathBuf,
     pub output_device_id: Option<String>,
@@ -474,6 +479,7 @@ enum LivePlaybackCommand {
     Packet(RemoteVoicePacket),
     StopStream(u32),
     SetStreamControl(u32, PlaybackStreamControl),
+    Shutdown,
 }
 
 struct OpusVoiceEncoder {
@@ -719,6 +725,12 @@ impl Drop for LiveCapture {
 }
 
 impl LivePlayback {
+    pub fn sink(&self) -> Option<LivePlaybackSink> {
+        self.sender.as_ref().map(|sender| LivePlaybackSink {
+            sender: sender.clone(),
+        })
+    }
+
     pub fn push(&self, packet: RemoteVoicePacket) {
         if let Some(sender) = &self.sender {
             let _ = sender.try_send(LivePlaybackCommand::Packet(packet));
@@ -757,10 +769,24 @@ impl LivePlayback {
 
     fn stop_inner(&mut self) {
         self.stream.take();
-        self.sender.take();
+        if let Some(sender) = self.sender.take() {
+            let _ = sender.send(LivePlaybackCommand::Shutdown);
+        }
         if let Some(worker) = self.worker.take() {
             let _ = worker.join();
         }
+    }
+}
+
+impl LivePlaybackSink {
+    pub fn push(&self, packet: RemoteVoicePacket) {
+        let _ = self.sender.try_send(LivePlaybackCommand::Packet(packet));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test() -> Self {
+        let (sender, _receiver) = sync_channel(1);
+        Self { sender }
     }
 }
 
@@ -3664,9 +3690,13 @@ fn run_live_decoder_worker(
     loop {
         match receiver.recv_timeout(LIVE_PLAYBACK_DRAIN_INTERVAL) {
             Ok(command) => {
-                handle_live_playback_command(command, &mut streams, &mixer, tuning);
+                if !handle_live_playback_command(command, &mut streams, &mixer, tuning) {
+                    break;
+                }
                 while let Ok(command) = receiver.try_recv() {
-                    handle_live_playback_command(command, &mut streams, &mixer, tuning);
+                    if !handle_live_playback_command(command, &mut streams, &mixer, tuning) {
+                        return;
+                    }
                 }
             }
             Err(RecvTimeoutError::Timeout) => {}
@@ -3688,7 +3718,7 @@ fn handle_live_playback_command(
     streams: &mut HashMap<u32, LiveDecodeStream>,
     mixer: &Arc<Mutex<LivePlaybackMixer>>,
     tuning: LiveAudioTuning,
-) {
+) -> bool {
     match command {
         LivePlaybackCommand::Packet(packet) => {
             let received_at = packet.received_at;
@@ -3705,7 +3735,9 @@ fn handle_live_playback_command(
                 mixer.set_stream_control(stream_id, control);
             }
         }
+        LivePlaybackCommand::Shutdown => return false,
     }
+    true
 }
 
 fn insert_live_playback_packet(
@@ -7390,6 +7422,22 @@ impl FrameAccumulator {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn live_decoder_worker_stops_with_sink_clone_alive() {
+        let (sender, receiver) = sync_channel(LIVE_PLAYBACK_COMMAND_CAPACITY);
+        let _sink = LivePlaybackSink {
+            sender: sender.clone(),
+        };
+        let mixer = Arc::new(Mutex::new(LivePlaybackMixer::with_tuning(test_tuning())));
+        let worker = thread::spawn(move || {
+            run_live_decoder_worker(receiver, mixer, test_tuning(), None);
+        });
+
+        sender.send(LivePlaybackCommand::Shutdown).unwrap();
+
+        worker.join().unwrap();
+    }
 
     #[test]
     fn parses_proc_asound_pcm_for_requested_direction() {
