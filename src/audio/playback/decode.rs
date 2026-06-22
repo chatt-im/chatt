@@ -32,17 +32,16 @@ pub(crate) fn run_live_decoder_worker(
     tuning: LiveAudioTuning,
     feedback_sender: Option<Sender<LivePlaybackFeedback>>,
 ) {
-    let mut streams: HashMap<u32, LiveDecodeStream> = HashMap::new();
-    let mut frame = vec![0i16; MAX_OPUS_DECODE_SAMPLES];
+    let mut streams = LiveDecodeStreams::new(tuning);
 
     loop {
         match receiver.recv_timeout(LIVE_PLAYBACK_DRAIN_INTERVAL) {
             Ok(command) => {
-                if !handle_live_playback_command(command, &mut streams, &mixer, tuning) {
+                if !handle_live_playback_command(command, &mut streams, &mixer) {
                     break;
                 }
                 while let Ok(command) = receiver.try_recv() {
-                    if !handle_live_playback_command(command, &mut streams, &mixer, tuning) {
+                    if !handle_live_playback_command(command, &mut streams, &mixer) {
                         return;
                     }
                 }
@@ -51,29 +50,22 @@ pub(crate) fn run_live_decoder_worker(
             Err(RecvTimeoutError::Disconnected) => break,
         }
 
-        drain_live_decode_streams(
-            &mut streams,
-            &mixer,
-            &mut frame,
-            Instant::now(),
-            feedback_sender.as_ref(),
-        );
+        streams.drain_into_mixer(&mixer, Instant::now(), feedback_sender.as_ref());
     }
 }
 
 pub(crate) fn handle_live_playback_command(
     command: LivePlaybackCommand,
-    streams: &mut HashMap<u32, LiveDecodeStream>,
+    streams: &mut LiveDecodeStreams,
     mixer: &Arc<Mutex<LivePlaybackMixer>>,
-    tuning: LiveAudioTuning,
 ) -> bool {
     match command {
         LivePlaybackCommand::Packet(packet) => {
             let received_at = packet.received_at;
-            let _ = insert_live_playback_packet(packet, streams, tuning, received_at);
+            let _ = streams.insert_packet(packet, received_at);
         }
         LivePlaybackCommand::StopStream(stream_id) => {
-            streams.remove(&stream_id);
+            streams.remove_stream(stream_id);
             if let Ok(mut mixer) = mixer.lock() {
                 mixer.remove_stream(stream_id);
             }
@@ -88,96 +80,107 @@ pub(crate) fn handle_live_playback_command(
     true
 }
 
-pub(crate) fn insert_live_playback_packet(
-    packet: RemoteVoicePacket,
-    streams: &mut HashMap<u32, LiveDecodeStream>,
+pub(crate) struct LiveDecodeStreams {
     tuning: LiveAudioTuning,
-    now: Instant,
-) -> Option<InsertOutcome> {
-    let stream = match streams.entry(packet.stream_id) {
-        hashbrown::hash_map::Entry::Occupied(entry) => entry.into_mut(),
-        hashbrown::hash_map::Entry::Vacant(entry) => match LiveDecodeStream::new(tuning) {
-            Ok(stream) => entry.insert(stream),
-            Err(error) => {
-                eprintln!("failed to create live opus decoder: {error}");
-                return None;
-            }
-        },
-    };
-    let packet_ref = AudioPacketRef {
-        sequence: packet.sequence,
-        flags: packet.flags,
-        silence_ranges: packet.silence_ranges,
-        payload: &packet.payload,
-    };
-    Some(stream.insert(packet_ref, now))
+    streams: HashMap<u32, LiveDecodeStream>,
 }
 
-pub(crate) fn drain_live_decode_streams(
-    streams: &mut HashMap<u32, LiveDecodeStream>,
-    mixer: &Arc<Mutex<LivePlaybackMixer>>,
-    frame: &mut [i16],
-    now: Instant,
-    feedback_sender: Option<&Sender<LivePlaybackFeedback>>,
-) {
-    let mut trace = None;
-    drain_live_decode_streams_with_trace(
-        streams,
-        mixer,
-        frame,
-        now,
-        now,
-        &mut trace,
-        feedback_sender,
-    );
-}
-
-pub(crate) fn drain_live_decode_streams_with_trace(
-    streams: &mut HashMap<u32, LiveDecodeStream>,
-    mixer: &Arc<Mutex<LivePlaybackMixer>>,
-    frame: &mut [i16],
-    now: Instant,
-    trace_start: Instant,
-    trace: &mut Option<LiveAudioTraceWriter>,
-    feedback_sender: Option<&Sender<LivePlaybackFeedback>>,
-) {
-    for (stream_id, stream) in streams {
-        let mut max_stream_queue_ms = 0;
-        let recommended_target = stream.feedback.recommended_target(&stream.tuning);
-        stream.drain_ready(
-            now,
-            trace_start,
-            *stream_id,
-            frame,
-            trace,
-            |trace, samples, source, silence_hint| {
-                if let Ok(mut mixer) = mixer.lock() {
-                    mixer.queue_stream_samples(*stream_id, samples, source, silence_hint, now);
-                    mixer.note_stream_recommended_target(*stream_id, recommended_target, now);
-                    max_stream_queue_ms =
-                        max_stream_queue_ms.max(mixer.stream_queue_ms(*stream_id));
-                    trace_mixer_queue(
-                        trace,
-                        trace_start,
-                        now,
-                        *stream_id,
-                        source,
-                        silence_hint,
-                        samples,
-                        mixer.snapshot_at(now).max_queue_ms,
-                    );
-                }
-            },
-            || {
-                if let Ok(mut mixer) = mixer.lock() {
-                    mixer.note_stream_discontinuity(*stream_id, now);
-                }
-            },
-        );
-        stream.flush_feedback(*stream_id, now, max_stream_queue_ms, feedback_sender);
+impl LiveDecodeStreams {
+    pub(crate) fn new(tuning: LiveAudioTuning) -> Self {
+        Self {
+            tuning,
+            streams: HashMap::new(),
+        }
     }
-    if let Ok(mut mixer) = mixer.lock() {
-        mixer.log_playback_diagnostics_if_due(now);
+
+    pub(crate) fn insert_packet(
+        &mut self,
+        packet: RemoteVoicePacket,
+        now: Instant,
+    ) -> Option<InsertOutcome> {
+        let stream = match self.streams.entry(packet.stream_id) {
+            hashbrown::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+            hashbrown::hash_map::Entry::Vacant(entry) => match LiveDecodeStream::new(self.tuning) {
+                Ok(stream) => entry.insert(stream),
+                Err(error) => {
+                    eprintln!("failed to create live opus decoder: {error}");
+                    return None;
+                }
+            },
+        };
+        let packet_ref = AudioPacketRef {
+            sequence: packet.sequence,
+            flags: packet.flags,
+            silence_ranges: packet.silence_ranges,
+            payload: &packet.payload,
+        };
+        Some(stream.insert(packet_ref, now))
+    }
+
+    pub(crate) fn remove_stream(&mut self, stream_id: u32) {
+        self.streams.remove(&stream_id);
+    }
+
+    pub(crate) fn drain_into_mixer(
+        &mut self,
+        mixer: &Arc<Mutex<LivePlaybackMixer>>,
+        now: Instant,
+        feedback_sender: Option<&Sender<LivePlaybackFeedback>>,
+    ) {
+        let mut trace = None;
+        self.drain_into_mixer_with_trace(mixer, now, now, &mut trace, feedback_sender);
+    }
+
+    pub(crate) fn drain_into_mixer_with_trace(
+        &mut self,
+        mixer: &Arc<Mutex<LivePlaybackMixer>>,
+        now: Instant,
+        trace_start: Instant,
+        trace: &mut Option<LiveAudioTraceWriter>,
+        feedback_sender: Option<&Sender<LivePlaybackFeedback>>,
+    ) {
+        for (stream_id, stream) in &mut self.streams {
+            let mut max_stream_queue_ms = 0;
+            let recommended_target = stream.feedback.recommended_target(&stream.tuning);
+            stream.drain_ready(
+                now,
+                trace_start,
+                *stream_id,
+                trace,
+                |trace, samples, source, silence_hint| {
+                    if let Ok(mut mixer) = mixer.lock() {
+                        mixer.queue_stream_samples(*stream_id, samples, source, silence_hint, now);
+                        mixer.note_stream_recommended_target(*stream_id, recommended_target, now);
+                        max_stream_queue_ms =
+                            max_stream_queue_ms.max(mixer.stream_queue_ms(*stream_id));
+                        trace_mixer_queue(
+                            trace,
+                            trace_start,
+                            now,
+                            *stream_id,
+                            source,
+                            silence_hint,
+                            samples,
+                            mixer.snapshot_at(now).max_queue_ms,
+                        );
+                    }
+                },
+                || {
+                    if let Ok(mut mixer) = mixer.lock() {
+                        mixer.note_stream_discontinuity(*stream_id, now);
+                    }
+                },
+            );
+            stream.flush_feedback(*stream_id, now, max_stream_queue_ms, feedback_sender);
+        }
+        if let Ok(mut mixer) = mixer.lock() {
+            mixer.log_playback_diagnostics_if_due(now);
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn get(&self, stream_id: u32) -> Option<&LiveDecodeStream> {
+        self.streams.get(&stream_id)
     }
 }
 
@@ -198,6 +201,7 @@ pub(crate) struct LiveDecodeStream {
     dred_parses: u64,
     tuning: LiveAudioTuning,
     feedback: LivePlaybackFeedbackState,
+    output_frame: Vec<f32>,
 }
 
 impl LiveDecodeStream {
@@ -211,6 +215,7 @@ impl LiveDecodeStream {
             dred_parses: 0,
             tuning,
             feedback: LivePlaybackFeedbackState::default(),
+            output_frame: vec![0.0; MAX_OPUS_DECODE_SAMPLES],
         })
     }
 
@@ -226,7 +231,6 @@ impl LiveDecodeStream {
         now: Instant,
         trace_start: Instant,
         stream_id: u32,
-        frame: &mut [i16],
         trace: &mut Option<LiveAudioTraceWriter>,
         mut on_samples: F,
         mut on_discontinuity: impl FnMut(),
@@ -262,7 +266,6 @@ impl LiveDecodeStream {
                     }
                     self.decode_playout(
                         payload,
-                        frame,
                         DecodedFrameSource::Normal,
                         *silence_ranges,
                         trace_start,
@@ -275,11 +278,9 @@ impl LiveDecodeStream {
                 }
                 PlayoutItem::Missing { sequence } => {
                     trace_jitter_item(trace, trace_start, now, stream_id, *sequence, "missing", 0);
-                    let plc_samples = LIVE_OPUS_FRAME_SAMPLES.min(frame.len());
                     if !self.decode_dred(
                         *sequence,
                         &items[index + 1..],
-                        &mut frame[..plc_samples],
                         trace_start,
                         now,
                         stream_id,
@@ -288,7 +289,6 @@ impl LiveDecodeStream {
                     ) {
                         self.decode_playout(
                             &[],
-                            &mut frame[..plc_samples],
                             DecodedFrameSource::Plc,
                             0,
                             trace_start,
@@ -323,7 +323,6 @@ impl LiveDecodeStream {
     fn decode_playout<F>(
         &mut self,
         payload: &[u8],
-        frame: &mut [i16],
         source: DecodedFrameSource,
         silence_ranges: u64,
         trace_start: Instant,
@@ -335,10 +334,22 @@ impl LiveDecodeStream {
     ) where
         F: FnMut(&mut Option<LiveAudioTraceWriter>, &[f32], DecodedFrameSource, bool),
     {
-        let mut float_frame = vec![0.0f32; frame.len()];
-        match self.decoder.decode_float(payload, &mut float_frame, false) {
+        let output_len = match source {
+            DecodedFrameSource::Plc => LIVE_OPUS_FRAME_SAMPLES,
+            DecodedFrameSource::Normal
+            | DecodedFrameSource::Dred
+            | DecodedFrameSource::DecodeError => self.output_frame.len(),
+        }
+        .min(self.output_frame.len());
+        let decoded = {
+            let decoder = &mut self.decoder;
+            let output = &mut self.output_frame[..output_len];
+            decoder.decode_float(payload, output, false)
+        };
+        match decoded {
             Ok(decoded) => {
                 let silence_hint = silence_ranges_contain(silence_ranges, 0);
+                let samples = &self.output_frame[..decoded];
                 trace_decode_output(
                     trace,
                     trace_start,
@@ -349,18 +360,18 @@ impl LiveDecodeStream {
                     decoded,
                     silence_hint,
                     None,
-                    &float_frame[..decoded],
+                    samples,
                 );
                 if matches!(source, DecodedFrameSource::Normal) {
                     emit_decoded_samples_by_silence_ranges(
                         trace,
-                        &float_frame[..decoded],
+                        samples,
                         source,
                         silence_ranges,
                         on_samples,
                     );
                 } else {
-                    on_samples(trace, &float_frame[..decoded], source, silence_hint);
+                    on_samples(trace, samples, source, silence_hint);
                 }
             }
             Err(error) => {
@@ -396,7 +407,6 @@ impl LiveDecodeStream {
         &mut self,
         missing_sequence: u32,
         future_items: &[PlayoutItem],
-        frame: &mut [i16],
         trace_start: Instant,
         now: Instant,
         stream_id: u32,
@@ -526,18 +536,23 @@ impl LiveDecodeStream {
             return false;
         };
         let silence_hint = silence_ranges_contain(silence_ranges, offset_samples as usize);
-        let mut float_frame = vec![0.0f32; frame.len()];
+        let output_len = LIVE_OPUS_FRAME_SAMPLES.min(self.output_frame.len());
         let gap = self
             .dred_gap
             .as_ref()
             .expect("dred gap state present after ensure_dred_gap");
-        let dred_result = self
-            .dred_decoder
-            .as_mut()
-            .expect("DRED decoder exists after availability check")
-            .decode_into_f32(&mut self.decoder, &gap.state, offset, &mut float_frame);
+        let dred_result = {
+            let dred_decoder = self
+                .dred_decoder
+                .as_mut()
+                .expect("DRED decoder exists after availability check");
+            let decoder = &mut self.decoder;
+            let output = &mut self.output_frame[..output_len];
+            dred_decoder.decode_into_f32(decoder, &gap.state, offset, output)
+        };
         match dred_result {
             Ok(decoded) if decoded > 0 => {
+                let samples = &self.output_frame[..decoded];
                 trace_decode_output(
                     trace,
                     trace_start,
@@ -548,14 +563,9 @@ impl LiveDecodeStream {
                     decoded,
                     silence_hint,
                     None,
-                    &float_frame[..decoded],
+                    samples,
                 );
-                on_samples(
-                    trace,
-                    &float_frame[..decoded],
-                    DecodedFrameSource::Dred,
-                    silence_hint,
-                );
+                on_samples(trace, samples, DecodedFrameSource::Dred, silence_hint);
                 true
             }
             Ok(_) => {
@@ -769,7 +779,6 @@ mod tests {
         let packet_0 = encode_test_frame(&mut encoder, 0);
         let packet_2 = encode_test_frame(&mut encoder, 600);
         let mut stream = LiveDecodeStream::new(test_tuning()).unwrap();
-        let mut frame = vec![0i16; MAX_OPUS_DECODE_SAMPLES];
         let mut decoded = Vec::new();
 
         assert_eq!(
@@ -781,7 +790,6 @@ mod tests {
             first_playout,
             start,
             1,
-            &mut frame,
             &mut trace,
             |_, samples, _source, _silence| {
                 decoded.extend_from_slice(samples);
@@ -799,7 +807,6 @@ mod tests {
             gap_seen,
             start,
             1,
-            &mut frame,
             &mut trace,
             |_, samples, _source, _silence| {
                 decoded.extend_from_slice(samples);
@@ -812,7 +819,6 @@ mod tests {
             gap_seen + LIVE_PLAYBACK_MAX_REORDER_DELAY,
             start,
             1,
-            &mut frame,
             &mut trace,
             |_, samples, _source, _silence| {
                 decoded.extend_from_slice(samples);
@@ -829,7 +835,7 @@ mod tests {
         // must use each packet's captured arrival time, which is a clean 20 ms
         // cadence, so a healthy stream is not mistaken for a jittery one.
         let tuning = test_tuning();
-        let mut streams: HashMap<u32, LiveDecodeStream> = HashMap::new();
+        let mut streams = LiveDecodeStreams::new(tuning);
         let base = Instant::now();
         let frame = Duration::from_secs_f64(LIVE_OPUS_FRAME_SAMPLES as f64 / SAMPLE_RATE as f64);
         let process_at = base + Duration::from_secs(10);
@@ -847,11 +853,11 @@ mod tests {
             // Note: all processed at the same `received_at`-driven path; the
             // wall clock `process_at` is irrelevant because insert keys off the
             // packet's arrival time.
-            insert_live_playback_packet(packet, &mut streams, tuning, received_at);
+            streams.insert_packet(packet, received_at);
         }
         let _ = process_at;
 
-        let feedback = &streams.get(&1).unwrap().feedback;
+        let feedback = &streams.get(1).unwrap().feedback;
         assert!(
             feedback.smoothed_jitter_us < 2_000.0,
             "clean 20ms arrivals must not register as jitter: {} us",
