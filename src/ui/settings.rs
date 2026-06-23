@@ -364,11 +364,17 @@ fn draw_settings_controls(
         focus == SettingsFocus::EchoCancellation,
         dirty,
     );
+    let amplification = settings.max_amplification();
+    let amplification_label = if amplification <= 0.0 {
+        "off".to_string()
+    } else {
+        format!("{amplification:.0} dB")
+    };
     draw_settings_row(
         rows.take_top(1),
         buf,
         "Max. Amplification",
-        &format!("{:.2}", settings.max_amplification()),
+        &amplification_label,
         focus == SettingsFocus::Amplification,
         dirty,
     );

@@ -47,7 +47,7 @@ impl OpusVoiceEncoder {
         this.set_bitrate(bitrate_bps)?;
         this.set_vbr(true)?;
         this.set_signal_voice()?;
-        this.set_max_bandwidth_wideband()?;
+        this.set_max_bandwidth_fullband()?;
         this.set_complexity(Complexity::new(9))?;
         this.set_dred_duration_10ms(0)?;
         this.set_inband_fec(false)?;
@@ -116,10 +116,14 @@ impl OpusVoiceEncoder {
         )
     }
 
-    fn set_max_bandwidth_wideband(&mut self) -> Result<(), String> {
+    /// Lifts the encoder's audio-bandwidth ceiling to fullband (20 kHz) so
+    /// content above 8 kHz (sibilance, brightness) survives encoding rather than
+    /// being discarded by the old wideband cap. Application mode stays VOIP, so
+    /// DRED/FEC/VAD behavior is unchanged.
+    fn set_max_bandwidth_fullband(&mut self) -> Result<(), String> {
         self.control(
             opus_codec::OPUS_SET_MAX_BANDWIDTH_REQUEST,
-            opus_codec::OPUS_BANDWIDTH_WIDEBAND as i32,
+            opus_codec::OPUS_BANDWIDTH_FULLBAND as i32,
             "failed to set opus max bandwidth",
         )
     }

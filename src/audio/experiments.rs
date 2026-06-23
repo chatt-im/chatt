@@ -370,16 +370,17 @@ fn exp5_encoder_wideband_cap_discards_high_frequencies() {
         100.0 * out3 / in3.max(1e-9),
         100.0 * out11 / in11.max(1e-9),
     );
-    println!("(wideband cap = 8 kHz audio bandwidth; 11 kHz is expected to be discarded)");
+    println!("(fullband encode since Phase 1: content above 8 kHz now survives)");
 }
 
-/// EXP 6: the silence-skip only fires on a contiguous flagged-silent run that is
-/// already fully buffered and at least `silence_min_gap` (250 ms) long. Common
-/// inter-word and inter-phrase gaps below that threshold are never shortened, so
-/// a 150 ms gap stays 150 ms. Sweep gap length and show the cliff at 250 ms.
+/// EXP 6: originally the silence-skip only fired on a contiguous flagged-silent
+/// run already fully buffered and at least 250 ms long, so common inter-word gaps
+/// below that never shortened (the cliff this swept for). Since Phase 1 the
+/// overlap-add compressor acts on low-energy runs from `silence_min_gap` (60 ms)
+/// up, in continuous increments, so sub-250 ms gaps now shorten.
 #[test]
 fn exp6_silence_skip_threshold_excludes_short_gaps() {
-    println!("\n=== EXP6: silence-skip length threshold (min_gap=250ms) ===");
+    println!("\n=== EXP6: low-energy gap shortening (overlap-add compressor) ===");
     let now = Instant::now();
     let speech = samples_for_duration(Duration::from_millis(100));
 

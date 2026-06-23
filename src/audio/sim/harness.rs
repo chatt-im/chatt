@@ -661,12 +661,17 @@ pub(crate) fn simulation_streams(config: LiveAudioSimulationConfig) -> usize {
 }
 
 pub(crate) fn simulation_prebuffer_frames(config: LiveAudioSimulationConfig) -> usize {
-    match config.scenario {
-        LiveAudioSimulationScenario::BacklogSilence => {
-            frames_for_duration(Duration::from_millis(500))
-        }
-        _ => frames_for_duration(config.tuning.target_queue),
-    }
+    // Cover one whole output callback plus the device margin so the first
+    // oversized callback is immediately playable rather than priming (which a
+    // real device experiences as one startup underrun).
+    let device_floor =
+        Duration::from_secs_f64(config.output_block_samples as f64 / SAMPLE_RATE as f64)
+            + config.tuning.device_period_margin;
+    let base = match config.scenario {
+        LiveAudioSimulationScenario::BacklogSilence => Duration::from_millis(500),
+        _ => config.tuning.target_queue,
+    };
+    frames_for_duration(base.max(device_floor))
 }
 
 pub(crate) fn process_simulation_input_frame(

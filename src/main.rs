@@ -4241,7 +4241,7 @@ mod tests {
         assert_eq!(config.audio.input_device_id, None);
         assert_eq!(config.audio.output_device_id, None);
         assert_eq!(config.audio.bitrate_bps, 48_000);
-        assert_eq!(config.audio.max_amplification, 2.0);
+        assert_eq!(config.audio.max_amplification, 12.0);
         assert_eq!(config.files.max_upload_bytes, 50 * 1024 * 1024);
         assert_eq!(config.files.max_receive_bytes, 50 * 1024 * 1024);
     }

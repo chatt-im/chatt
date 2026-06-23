@@ -10,8 +10,8 @@ use crate::{
     audio::{
         capture::{
             dsp::{
-                AutoGain, CaptureGateDecision, EarshotVad, LongSilenceGate, SilenceRangeTracker,
-                is_capture_skip_safe_silence, store_processed_level_stats,
+                CaptureGain, CaptureGateDecision, CaptureHighPass, EarshotVad, LongSilenceGate,
+                SilenceRangeTracker, is_capture_skip_safe_silence, store_processed_level_stats,
             },
             echo::{EchoCanceller, EchoReference, EchoReferenceSource},
             encoder::OpusVoiceEncoder,
@@ -91,7 +91,8 @@ pub(crate) fn run_encoder_worker_inner(
     stats: &AudioStats,
 ) -> Result<(), String> {
     let mut denoise = DenoiseState::new();
-    let mut auto_gain = AutoGain::new(max_amplification);
+    let mut high_pass = CaptureHighPass::new();
+    let mut gain = CaptureGain::new(max_amplification);
     let mut accumulator = FrameAccumulator::new(FRAME_SAMPLES);
     let mut denoised_frame = vec![0.0; FRAME_SAMPLES];
     let mut opus_frame = vec![0i16; FRAME_SAMPLES];
@@ -99,7 +100,10 @@ pub(crate) fn run_encoder_worker_inner(
 
     for chunk in receiver {
         accumulator.push_chunk(&chunk, |frame| {
-            auto_gain.process_frame(frame);
+            high_pass.process(frame);
+            if let Some(gain) = gain.as_mut() {
+                gain.process(frame);
+            }
             let vad_probability = if denoise_enabled {
                 let vad = denoise.process_frame(&mut denoised_frame, frame);
                 frame.copy_from_slice(&denoised_frame);
@@ -175,7 +179,12 @@ pub(crate) struct LiveEncoderPipeline {
     earshot: EarshotVad,
     silence_tracker: SilenceRangeTracker,
     long_silence: Option<LongSilenceGate>,
-    auto_gain: AutoGain,
+    high_pass: CaptureHighPass,
+    /// AGC2 gain stage, present only while the user's `max-amplification` dB
+    /// ceiling is positive and auto gain is enabled. Rebuilt when the ceiling
+    /// changes so it tracks the live setting.
+    gain: Option<CaptureGain>,
+    gain_max_db: f32,
     accumulator: FrameAccumulator,
     denoised_frame: Vec<f32>,
     opus_frame: Vec<i16>,
@@ -231,7 +240,11 @@ impl LiveEncoderPipeline {
             long_silence: tuning
                 .capture_silence_gate
                 .then(|| LongSilenceGate::new(tuning)),
-            auto_gain: AutoGain::new(max_amplification),
+            high_pass: CaptureHighPass::new(),
+            gain: auto_gain_enabled
+                .then(|| CaptureGain::new(max_amplification))
+                .flatten(),
+            gain_max_db: max_amplification,
             accumulator: FrameAccumulator::new(FRAME_SAMPLES),
             denoised_frame: vec![0.0; FRAME_SAMPLES],
             opus_frame: vec![0i16; LIVE_OPUS_FRAME_SAMPLES],
@@ -268,7 +281,10 @@ impl LiveEncoderPipeline {
     where
         F: FnMut(LocalVoiceFrame),
     {
-        self.auto_gain.set_max_amplification(max_amplification);
+        if self.auto_gain_enabled && max_amplification != self.gain_max_db {
+            self.gain = CaptureGain::new(max_amplification);
+            self.gain_max_db = max_amplification;
+        }
         let mut accumulator = self.take_accumulator();
         let result = accumulator.push_chunk(chunk, |frame| {
             self.process_accumulated_frame(frame, stats, on_packet)
@@ -290,9 +306,12 @@ impl LiveEncoderPipeline {
     where
         F: FnMut(LocalVoiceFrame),
     {
+        // High-pass first to strip DC and rumble, then cancel echo, then apply
+        // gain so AGC2 never amplifies un-cancelled echo.
+        self.high_pass.process(frame);
         self.process_echo(frame);
-        if self.auto_gain_enabled {
-            self.auto_gain.process_frame(frame);
+        if let Some(gain) = self.gain.as_mut() {
+            gain.process(frame);
         }
         let vad_probability = if self.denoise_enabled {
             let vad = self.denoise.process_frame(&mut self.denoised_frame, frame);
@@ -385,12 +404,12 @@ impl LiveEncoderPipeline {
         self.suppressed_frames
     }
 
+    /// The applied capture gain, for diagnostics only. AGC2 owns the gain
+    /// internally and sonora exposes no per-frame value, so this returns `NaN`
+    /// to mark the reading as unavailable rather than reporting a fabricated
+    /// unity gain.
     pub(crate) fn current_gain(&self) -> f32 {
-        if self.auto_gain_enabled {
-            self.auto_gain.current_gain
-        } else {
-            1.0
-        }
+        f32::NAN
     }
 }
 

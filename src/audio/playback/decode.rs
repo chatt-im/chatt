@@ -16,7 +16,7 @@ use crate::{
         shared::{
             DecodedFrameSource, LIVE_OPUS_FRAME_SAMPLES, LIVE_PACKET_FLAG_OPUS_RESET,
             LIVE_PLAYBACK_DRAIN_INTERVAL, LiveAudioTraceWriter, LiveAudioTuning,
-            LivePlaybackFeedback, MAX_OPUS_DECODE_SAMPLES, RemoteVoicePacket, duration_to_ms,
+            LivePlaybackFeedback, MAX_OPUS_DECODE_SAMPLES, RemoteVoicePacket,
             emit_decoded_samples_by_silence_ranges, samples_for_duration,
             sequence_distance_forward, silence_ranges_contain, trace_decode_output,
             trace_decoder_reset, trace_dred_parse, trace_dred_skip, trace_fast_forward,
@@ -675,7 +675,9 @@ impl LiveDecodeStream {
             transit_ms = (self.feedback.relative_transit_us / 1_000.0) as f32,
             base_ms = (self.feedback.base_transit_us / 1_000.0) as f32,
             clean_window_streak = u64::from(self.feedback.clean_window_streak),
-            recommended_target_ms = duration_to_ms(self.feedback.recommended_target(&self.tuning)),
+            recommended_target_ms = crate::audio::shared::duration_to_ms(
+                self.feedback.recommended_target(&self.tuning)
+            ),
             window_ms = u64::from(feedback.window_ms),
             window_max_queue_ms = u64::from(feedback.max_queue_ms),
             window_max_jitter_ms = u64::from(feedback.max_interarrival_jitter_ms),

@@ -14,7 +14,10 @@ use nnnoiseless::DenoiseState;
 pub const SAMPLE_RATE: u32 = 48_000;
 pub const CHANNELS: u8 = 1;
 pub const FRAME_SAMPLES: usize = DenoiseState::FRAME_SIZE;
-pub const DEFAULT_LIVE_MAX_AMPLIFICATION: f32 = 2.0;
+/// Default auto-gain ceiling, in dB. The `max-amplification` setting is a
+/// maximum AGC2 gain: `0` disables auto gain entirely, and this default leaves a
+/// moderate, sane amount of headroom for the adaptive gain to lift a quiet mic.
+pub const DEFAULT_LIVE_MAX_AMPLIFICATION: f32 = 12.0;
 pub(crate) const LIVE_OPUS_FRAME_SAMPLES: usize = FRAME_SAMPLES * 2;
 pub(crate) const LIVE_PACKET_FLAG_OPUS_RESET: u8 = 0x01;
 pub(crate) const CALLBACK_QUEUE_CAPACITY: usize = 8;
@@ -65,6 +68,19 @@ pub(crate) const LIVE_PLAYBACK_HARD_QUEUE_BOUND: Duration = Duration::from_milli
 pub(crate) const LIVE_PLAYBACK_LOSS_WINDOW: Duration = Duration::from_secs(5);
 pub(crate) const LIVE_PLAYBACK_LOSS_HOLD: Duration = Duration::from_secs(5);
 pub(crate) const LIVE_PLAYBACK_SEVERE_LOSS_HOLD: Duration = Duration::from_secs(10);
+// Concealment events within `loss_window` required before a pure-PLC stream
+// (no DRED recovery) widens the target to the severe horizon. A single
+// concealment is almost always one late or reordered packet, not sustained
+// loss, so it must not pin a large queue. A DRED frame, which carries the
+// sender's redundancy for a packet it knew was at risk, expands on its own.
+pub(crate) const LIVE_PLAYBACK_SEVERE_LOSS_EVENTS: usize = 8;
+// Priming cushion added on top of one output device callback when sizing the
+// playout target. A device whose host period exceeds the one-packet floor needs
+// its whole callback buffered, plus this slack, or it re-primes whenever
+// ordinary packet-granularity jitter dips the queue under one block. Sized at
+// one Opus packet so the steady queue clears the block boundary by a full
+// arrival quantum.
+pub(crate) const LIVE_PLAYBACK_DEVICE_PERIOD_MARGIN: Duration = Duration::from_millis(20);
 pub(crate) const LIVE_PLAYBACK_INITIAL_BUFFER: Duration = Duration::from_millis(40);
 pub(crate) const LIVE_PLAYBACK_DRAIN_INTERVAL: Duration = Duration::from_millis(10);
 pub(crate) const LIVE_PLAYBACK_FEEDBACK_INTERVAL: Duration = Duration::from_millis(500);
@@ -90,8 +106,13 @@ pub(crate) const LIVE_PLAYBACK_CORRECTION_SLEW: f64 =
     LIVE_PLAYBACK_MAX_SPEED_UP / (LIVE_PLAYBACK_CORRECTION_RAMP_SECONDS * SAMPLE_RATE as f64);
 pub(crate) const LIVE_PLAYBACK_DRED_MAX_SAMPLES: usize = SAMPLE_RATE as usize;
 pub(crate) const LIVE_PLAYBACK_SILENCE_VAD_MAX: u8 = 64;
-pub(crate) const LIVE_PLAYBACK_SILENCE_MIN_GAP: Duration = Duration::from_millis(250);
-pub(crate) const LIVE_PLAYBACK_SILENCE_GUARD: Duration = Duration::from_millis(40);
+// Shortest low-energy run the overlap-add compressor will act on. Lowered from
+// the old 250 ms excise threshold so common 60-200 ms inter-word gaps shorten
+// in small continuous increments instead of never.
+pub(crate) const LIVE_PLAYBACK_SILENCE_MIN_GAP: Duration = Duration::from_millis(60);
+// Raised-cosine crossfade length for the overlap-add compressor. The kept tail
+// is blended with the audio following the removed segment over this window so
+// the waveform stays continuous across the join.
 pub(crate) const LIVE_PLAYBACK_SILENCE_RAMP: Duration = Duration::from_millis(10);
 pub(crate) const LIVE_PLAYBACK_SILENCE_MAX_SKIP: Duration = Duration::from_millis(200);
 pub(crate) const LIVE_PLAYBACK_SILENCE_MIN_SKIP: Duration = Duration::from_millis(20);
@@ -194,9 +215,9 @@ pub struct LiveAudioTuning {
     pub max_reorder_delay: Duration,
     pub max_speed_up: f64,
     pub catch_up_start_excess: Duration,
+    pub device_period_margin: Duration,
     pub silence_vad_max: u8,
     pub silence_min_gap: Duration,
-    pub silence_guard: Duration,
     pub silence_ramp: Duration,
     pub silence_max_skip: Duration,
     pub silence_min_skip: Duration,
@@ -227,9 +248,9 @@ impl Default for LiveAudioTuning {
             max_reorder_delay: LIVE_PLAYBACK_MAX_REORDER_DELAY,
             max_speed_up: LIVE_PLAYBACK_MAX_SPEED_UP,
             catch_up_start_excess: LIVE_PLAYBACK_CATCH_UP_START_EXCESS,
+            device_period_margin: LIVE_PLAYBACK_DEVICE_PERIOD_MARGIN,
             silence_vad_max: LIVE_PLAYBACK_SILENCE_VAD_MAX,
             silence_min_gap: LIVE_PLAYBACK_SILENCE_MIN_GAP,
-            silence_guard: LIVE_PLAYBACK_SILENCE_GUARD,
             silence_ramp: LIVE_PLAYBACK_SILENCE_RAMP,
             silence_max_skip: LIVE_PLAYBACK_SILENCE_MAX_SKIP,
             silence_min_skip: LIVE_PLAYBACK_SILENCE_MIN_SKIP,
@@ -282,8 +303,8 @@ impl LiveAudioTuning {
             0,
             1_000,
         )?;
+        validate_duration_ms("device-period-margin-ms", self.device_period_margin, 0, 200)?;
         validate_duration_ms("silence-min-gap-ms", self.silence_min_gap, 20, 2_000)?;
-        validate_duration_ms("silence-guard-ms", self.silence_guard, 0, 500)?;
         validate_duration_ms("silence-ramp-ms", self.silence_ramp, 0, 100)?;
         validate_duration_ms("silence-max-skip-ms", self.silence_max_skip, 0, 1_000)?;
         validate_duration_ms("silence-min-skip-ms", self.silence_min_skip, 0, 500)?;
@@ -318,8 +339,11 @@ impl LiveAudioTuning {
         if self.silence_max_skip < self.silence_min_skip {
             return Err("silence-max-skip-ms must be at least silence-min-skip-ms".to_string());
         }
-        if self.silence_min_gap < self.silence_guard.saturating_mul(2) {
-            return Err("silence-min-gap-ms must be at least twice silence-guard-ms".to_string());
+        if self.silence_min_gap < self.silence_min_skip + self.silence_ramp.saturating_mul(2) {
+            return Err(
+                "silence-min-gap-ms must be at least silence-min-skip-ms plus twice silence-ramp-ms"
+                    .to_string(),
+            );
         }
         if !self.max_speed_up.is_finite() || !(0.0..=0.25).contains(&self.max_speed_up) {
             return Err("max-speed-up must be between 0.0 and 0.25".to_string());
@@ -386,8 +410,11 @@ impl AudioStats {
         self.store_levels(rms, peak);
     }
 
-    pub(crate) fn record_dropped_chunk(&self) {
-        self.inner.dropped_chunks.fetch_add(1, Ordering::Relaxed);
+    /// Records a capture chunk dropped under worker backpressure and returns the
+    /// new running total, so the caller can surface a host that cannot keep up
+    /// rather than letting it silently emit gappy, irregularly paced packets.
+    pub(crate) fn record_dropped_chunk(&self) -> u64 {
+        self.inner.dropped_chunks.fetch_add(1, Ordering::Relaxed) + 1
     }
 
     pub(crate) fn record_encoded_packet(&self, packet_len: usize) {

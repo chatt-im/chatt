@@ -202,12 +202,12 @@ pub struct AudioLatencyConfig {
     pub max_speed_up: f64,
     #[toml(default = 20)]
     pub catch_up_start_excess_ms: u64,
+    #[toml(default = 20)]
+    pub device_period_margin_ms: u64,
     #[toml(default = 64)]
     pub silence_vad_max: u8,
-    #[toml(default = 250)]
+    #[toml(default = 60)]
     pub silence_min_gap_ms: u64,
-    #[toml(default = 40)]
-    pub silence_guard_ms: u64,
     #[toml(default = 10)]
     pub silence_ramp_ms: u64,
     #[toml(default = 200)]
@@ -245,9 +245,9 @@ impl Default for AudioLatencyConfig {
             max_reorder_delay_ms: duration_ms(tuning.max_reorder_delay),
             max_speed_up: tuning.max_speed_up,
             catch_up_start_excess_ms: duration_ms(tuning.catch_up_start_excess),
+            device_period_margin_ms: duration_ms(tuning.device_period_margin),
             silence_vad_max: tuning.silence_vad_max,
             silence_min_gap_ms: duration_ms(tuning.silence_min_gap),
-            silence_guard_ms: duration_ms(tuning.silence_guard),
             silence_ramp_ms: duration_ms(tuning.silence_ramp),
             silence_max_skip_ms: duration_ms(tuning.silence_max_skip),
             silence_min_skip_ms: duration_ms(tuning.silence_min_skip),
@@ -280,9 +280,9 @@ impl AudioLatencyConfig {
             max_reorder_delay: Duration::from_millis(self.max_reorder_delay_ms),
             max_speed_up: self.max_speed_up,
             catch_up_start_excess: Duration::from_millis(self.catch_up_start_excess_ms),
+            device_period_margin: Duration::from_millis(self.device_period_margin_ms),
             silence_vad_max: self.silence_vad_max,
             silence_min_gap: Duration::from_millis(self.silence_min_gap_ms),
-            silence_guard: Duration::from_millis(self.silence_guard_ms),
             silence_ramp: Duration::from_millis(self.silence_ramp_ms),
             silence_max_skip: Duration::from_millis(self.silence_max_skip_ms),
             silence_min_skip: Duration::from_millis(self.silence_min_skip_ms),
@@ -1004,6 +1004,11 @@ fn write_runtime_config<'de>(root: &mut Table<'de>, config: &Config, arena: &'de
             arena,
         );
         latency.insert(
+            Key::new("device-period-margin-ms"),
+            Item::from(config.audio.latency.device_period_margin_ms as i64),
+            arena,
+        );
+        latency.insert(
             Key::new("silence-vad-max"),
             Item::from(config.audio.latency.silence_vad_max as i64),
             arena,
@@ -1011,11 +1016,6 @@ fn write_runtime_config<'de>(root: &mut Table<'de>, config: &Config, arena: &'de
         latency.insert(
             Key::new("silence-min-gap-ms"),
             Item::from(config.audio.latency.silence_min_gap_ms as i64),
-            arena,
-        );
-        latency.insert(
-            Key::new("silence-guard-ms"),
-            Item::from(config.audio.latency.silence_guard_ms as i64),
             arena,
         );
         latency.insert(
@@ -1404,7 +1404,7 @@ input-device-index = 20
         )
         .unwrap();
 
-        assert!(content.contains("max-amplification = 2.0"));
+        assert!(content.contains("max-amplification = 12.0"));
     }
 
     #[test]

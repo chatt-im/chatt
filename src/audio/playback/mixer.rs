@@ -193,7 +193,10 @@ impl LivePlaybackMixer {
     /// catch-up is failing to drain (`applied_target_ms` low, `queue_ms` high,
     /// `correction_percent` near zero).
     pub(crate) fn log_playback_diagnostics_if_due(&mut self, now: Instant) {
-        if self.streams.is_empty() {
+        // Disabled for now: too noisy at the 100 ms snapshot cadence. The
+        // formatting below is kept ready to re-enable by flipping this flag.
+        const PLAYBACK_DIAGNOSTICS_ENABLED: bool = false;
+        if !PLAYBACK_DIAGNOSTICS_ENABLED || self.streams.is_empty() {
             return;
         }
         if self

@@ -1,84 +1,110 @@
 use std::collections::VecDeque;
 
 use earshot::Detector as EarshotDetector;
+use sonora::config::{AdaptiveDigital, GainController2};
+use sonora::{AudioProcessing, Config as ApmConfig, StreamConfig as ApmStreamConfig};
 
 use crate::audio::shared::{
-    AudioStats, DEFAULT_LIVE_MAX_AMPLIFICATION, FRAME_SAMPLES, LIVE_PLAYBACK_SILENCE_RANGE_COUNT,
-    LiveAudioTuning, frames_for_duration, pack_silence_range, peak_i16_scale, rms_i16_scale,
-    samples_for_duration,
+    AudioStats, FRAME_SAMPLES, LIVE_PLAYBACK_SILENCE_RANGE_COUNT, LiveAudioTuning,
+    frames_for_duration, pack_silence_range, peak_i16_scale, rms_i16_scale, samples_for_duration,
 };
 
-pub(crate) struct AutoGain {
-    max_amplification: f32,
-    pub(crate) current_gain: f32,
-    initialized: bool,
+const I16_SCALE: f32 = i16::MAX as f32;
+
+/// Capture high-pass / DC-block, the sonora WebRTC biquad cascade. Runs first on
+/// every frame so a microphone DC bias or low-frequency rumble cannot defeat
+/// silence detection or waste encoder bits. Scale-independent, so it operates on
+/// the i16-scale frame directly. Unlike gain, it is always on: it is filtering,
+/// not amplification.
+pub(crate) struct CaptureHighPass {
+    filter: sonora::high_pass_filter::HighPassFilter,
+    scratch: Vec<f32>,
 }
 
-impl AutoGain {
-    const TARGET_RMS: f32 = 0.20;
-    const PEAK_LIMIT: f32 = 0.95;
-    const MIN_GAIN: f32 = 0.05;
-    const RISE_SMOOTHING: f32 = 0.20;
-    const FALL_SMOOTHING: f32 = 0.85;
-
-    pub(crate) fn new(max_amplification: f32) -> Self {
-        let max_amplification = Self::normalize_max_amplification(max_amplification);
+impl CaptureHighPass {
+    pub(crate) fn new() -> Self {
         Self {
-            max_amplification,
-            current_gain: 1.0,
-            initialized: false,
+            filter: sonora::high_pass_filter::HighPassFilter::new(
+                crate::audio::shared::SAMPLE_RATE as i32,
+                1,
+            ),
+            scratch: Vec::with_capacity(FRAME_SAMPLES),
         }
     }
 
-    pub(crate) fn set_max_amplification(&mut self, max_amplification: f32) {
-        self.max_amplification = Self::normalize_max_amplification(max_amplification);
-        self.current_gain = self.current_gain.min(self.max_amplification);
+    pub(crate) fn process(&mut self, frame: &mut [f32]) {
+        self.scratch.clear();
+        self.scratch.extend_from_slice(frame);
+        self.filter
+            .process_channels(std::slice::from_mut(&mut self.scratch));
+        frame.copy_from_slice(&self.scratch);
     }
+}
 
-    fn normalize_max_amplification(max_amplification: f32) -> f32 {
-        let max_amplification = if max_amplification.is_finite() {
-            max_amplification
-        } else {
-            DEFAULT_LIVE_MAX_AMPLIFICATION
+/// Sane upper bound on the auto-gain ceiling, in dB. The user's
+/// `max-amplification` setting is clamped to this so the default AGC2 curve,
+/// which is not calibrated to any specific rig, cannot run away.
+pub(crate) const MAX_CAPTURE_GAIN_DB: f32 = 30.0;
+
+/// Optional capture gain stage: sonora AGC2 (adaptive digital gain plus a
+/// limiter), replacing the hand-rolled `AutoGain` whose fixed fast-attack /
+/// slow-release smoothing pumped and clipped transients. It is gated by the
+/// user's `max-amplification` setting, now expressed as a maximum gain in dB:
+/// `0` bypasses the pass entirely for a well-levelled rig, and any positive
+/// value caps AGC2's gain at that many dB.
+pub(crate) struct CaptureGain {
+    apm: AudioProcessing,
+    near: Vec<f32>,
+    cleaned: Vec<f32>,
+}
+
+impl CaptureGain {
+    /// Builds the gain stage for a positive `max_gain_db` ceiling, or `None`
+    /// when it is zero (or non-finite), which bypasses auto gain entirely.
+    pub(crate) fn new(max_gain_db: f32) -> Option<Self> {
+        if !(max_gain_db.is_finite() && max_gain_db > 0.0) {
+            return None;
+        }
+        let max_gain_db = max_gain_db.min(MAX_CAPTURE_GAIN_DB);
+        let default_adaptive = AdaptiveDigital::default();
+        let stream = ApmStreamConfig::new(crate::audio::shared::SAMPLE_RATE, 1);
+        let config = ApmConfig {
+            gain_controller2: Some(GainController2 {
+                adaptive_digital: Some(AdaptiveDigital {
+                    max_gain_db,
+                    initial_gain_db: default_adaptive.initial_gain_db.min(max_gain_db),
+                    ..default_adaptive
+                }),
+                ..GainController2::default()
+            }),
+            ..ApmConfig::default()
         };
-        max_amplification.clamp(1.0, 40.0)
+        let apm = AudioProcessing::builder()
+            .config(config)
+            .capture_config(stream)
+            .render_config(stream)
+            .build();
+        Some(Self {
+            apm,
+            near: vec![0.0; FRAME_SAMPLES],
+            cleaned: vec![0.0; FRAME_SAMPLES],
+        })
     }
 
-    pub(crate) fn process_frame(&mut self, frame: &mut [f32]) {
-        if frame.is_empty() {
+    /// Gain-controls one `FRAME_SAMPLES` i16-scale frame in place. The module
+    /// works in normalized `[-1.0, 1.0]`, so the frame is scaled in and back out.
+    pub(crate) fn process(&mut self, frame: &mut [f32]) {
+        if frame.len() != FRAME_SAMPLES {
             return;
         }
-
-        let rms = rms_i16_scale(frame);
-        let peak = peak_i16_scale(frame);
-        let mut desired_gain = if rms <= f32::EPSILON {
-            1.0
-        } else {
-            (Self::TARGET_RMS / rms).clamp(Self::MIN_GAIN, self.max_amplification)
-        };
-
-        if peak > f32::EPSILON {
-            desired_gain = desired_gain.min(Self::PEAK_LIMIT / peak);
+        for (near, sample) in self.near.iter_mut().zip(frame.iter()) {
+            *near = sample / I16_SCALE;
         }
-
-        self.current_gain = if !self.initialized {
-            self.initialized = true;
-            desired_gain
-        } else {
-            let smoothing = if desired_gain < self.current_gain {
-                Self::FALL_SMOOTHING
-            } else {
-                Self::RISE_SMOOTHING
-            };
-            self.current_gain + (desired_gain - self.current_gain) * smoothing
-        };
-
-        if peak > f32::EPSILON {
-            self.current_gain = self.current_gain.min(Self::PEAK_LIMIT / peak);
-        }
-
-        for sample in frame {
-            *sample = (*sample * self.current_gain).clamp(i16::MIN as f32, i16::MAX as f32);
+        let _ = self
+            .apm
+            .process_capture_f32(&[&self.near], &mut [&mut self.cleaned]);
+        for (sample, cleaned) in frame.iter_mut().zip(self.cleaned.iter()) {
+            *sample = cleaned * I16_SCALE;
         }
     }
 }
@@ -133,7 +159,24 @@ pub(crate) fn is_capture_skip_safe_silence(
     vad: u8,
     samples: &[f32],
 ) -> bool {
-    vad <= tuning.silence_vad_max && peak_i16_scale(samples) < 0.20 && rms_i16_scale(samples) < 0.05
+    if samples.is_empty() {
+        return true;
+    }
+    // Measure energy AC-coupled (frame mean removed) so a DC bias or constant
+    // offset on the microphone cannot mask genuine silence. The capture-front
+    // high-pass filter removes the bias from the transmitted signal too; this
+    // keeps the classifier itself robust regardless of upstream filtering.
+    let mean = samples.iter().sum::<f32>() / samples.len() as f32;
+    let inv_scale = 1.0 / i16::MAX as f32;
+    let mut peak = 0.0f32;
+    let mut square_sum = 0.0f32;
+    for &sample in samples {
+        let ac = (sample - mean) * inv_scale;
+        peak = peak.max(ac.abs());
+        square_sum += ac * ac;
+    }
+    let rms = (square_sum / samples.len() as f32).sqrt();
+    vad <= tuning.silence_vad_max && peak < 0.20 && rms < 0.05
 }
 
 pub(crate) struct SilenceRangeTracker {
@@ -341,38 +384,42 @@ mod tests {
     use crate::audio::test_support::*;
 
     #[test]
-    fn auto_gain_boosts_quiet_frames_up_to_configured_limit() {
-        let mut gain = AutoGain::new(4.0);
-        let mut frame = vec![1_000.0; FRAME_SAMPLES];
+    fn capture_high_pass_removes_dc_bias() {
+        // A constant DC offset is filtered out to near zero once the biquad
+        // cascade settles past its transient.
+        let mut hpf = CaptureHighPass::new();
+        let mut frame = vec![0.3 * I16_SCALE; FRAME_SAMPLES];
+        for _ in 0..8 {
+            frame
+                .iter_mut()
+                .for_each(|sample| *sample = 0.3 * I16_SCALE);
+            hpf.process(&mut frame);
+        }
 
-        gain.process_frame(&mut frame);
-
-        assert!((frame[0] - 4_000.0).abs() < 1.0);
+        let mean = frame.iter().sum::<f32>() / frame.len() as f32;
+        assert!(mean.abs() < 0.02 * I16_SCALE, "DC not removed: mean={mean}");
     }
 
     #[test]
-    fn auto_gain_prevents_peak_clipping() {
-        let mut gain = AutoGain::new(40.0);
-        let mut frame = vec![30_000.0; FRAME_SAMPLES];
+    fn capture_gain_is_bypassed_at_zero_max_amplification() {
+        // Zero max-amplification bypasses the auto-gain pass entirely so a
+        // well-levelled rig passes through untouched; any positive value enables
+        // AGC2 and keeps the signal within full scale via its limiter.
+        assert!(CaptureGain::new(0.0).is_none());
+        assert!(CaptureGain::new(-1.0).is_none());
 
-        gain.process_frame(&mut frame);
-
-        assert!(peak_i16_scale(&frame) <= AutoGain::PEAK_LIMIT + 0.001);
-    }
-
-    #[test]
-    fn auto_gain_smooths_gain_increases_after_loud_frames() {
-        let mut gain = AutoGain::new(20.0);
-        let mut loud = vec![20_000.0; FRAME_SAMPLES];
-        gain.process_frame(&mut loud);
-        let loud_gain = gain.current_gain;
-
-        let mut quiet = vec![1_000.0; FRAME_SAMPLES];
-        gain.process_frame(&mut quiet);
-
-        assert!(gain.current_gain > loud_gain);
-        assert!(gain.current_gain < 20.0);
-        assert!(quiet[0] < 20_000.0);
+        let mut gain = CaptureGain::new(8.0).expect("positive max-amplification enables gain");
+        let mut frame = vec![0.4 * I16_SCALE; FRAME_SAMPLES];
+        for _ in 0..8 {
+            frame
+                .iter_mut()
+                .for_each(|sample| *sample = 0.4 * I16_SCALE);
+            gain.process(&mut frame);
+        }
+        assert!(
+            frame.iter().all(|sample| sample.abs() <= I16_SCALE + 1.0),
+            "limiter let a sample exceed full scale"
+        );
     }
 
     #[test]
