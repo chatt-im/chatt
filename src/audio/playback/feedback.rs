@@ -195,6 +195,20 @@ impl LivePlaybackFeedbackState {
         }
     }
 
+    pub(crate) fn observe_sender_silence(&mut self, sequence: u32, now: Instant) {
+        self.ensure_started(now);
+        self.reset_delay_estimator(sequence, now);
+        self.silence_hint_sequence = Some(sequence);
+        self.highest_contiguous_sequence = Some(
+            self.highest_contiguous_sequence
+                .map_or(sequence, |highest| sequence_max_forward(highest, sequence)),
+        );
+        self.highest_arrived_sequence = Some(
+            self.highest_arrived_sequence
+                .map_or(sequence, |highest| sequence_max_forward(highest, sequence)),
+        );
+    }
+
     /// Feeds the delay histogram with how far a reordered or late packet trails
     /// its in-order playout slot, measured against the most recent forward
     /// arrival. This is the buffer depth that would have been needed to play the
@@ -300,6 +314,34 @@ impl LivePlaybackFeedbackState {
         };
         self.reset_window(now);
         Some(feedback)
+    }
+
+    pub(crate) fn take_sender_silence(
+        &mut self,
+        stream_id: u32,
+        now: Instant,
+        queue_ms: u64,
+    ) -> LivePlaybackFeedback {
+        self.ensure_started(now);
+        let started_at = self.window_started_at.unwrap_or(now);
+        let elapsed = now.saturating_duration_since(started_at);
+        let feedback = LivePlaybackFeedback {
+            stream_id,
+            highest_contiguous_sequence: self
+                .highest_contiguous_sequence
+                .or(self.highest_arrived_sequence)
+                .unwrap_or(0),
+            expected_packets: 0,
+            lost_packets: 0,
+            late_packets: 0,
+            duplicate_packets: 0,
+            reordered_packets: 0,
+            window_ms: clamp_u16_from_u64(duration_to_ms(elapsed)),
+            max_queue_ms: clamp_u16_from_u64(queue_ms),
+            max_interarrival_jitter_ms: 0,
+        };
+        self.reset_window(now);
+        feedback
     }
 
     pub(crate) fn recommended_target(&self, tuning: &LiveAudioTuning) -> Duration {
@@ -457,7 +499,7 @@ mod tests {
             &PlayoutItem::Audio {
                 sequence: 0,
                 flags: 0,
-                payload: vec![0],
+                payload: crate::audio::shared::VoicePayload::Opus(vec![0]),
             },
             start + Duration::from_millis(80),
         );
@@ -469,7 +511,7 @@ mod tests {
             &PlayoutItem::Audio {
                 sequence: 2,
                 flags: 0,
-                payload: vec![2],
+                payload: crate::audio::shared::VoicePayload::Opus(vec![2]),
             },
             start + Duration::from_millis(80),
         );
@@ -488,6 +530,38 @@ mod tests {
         assert_eq!(report.reordered_packets, 1);
         assert_eq!(report.max_queue_ms, 123);
         assert_eq!(report.max_interarrival_jitter_ms, 20);
+    }
+
+    #[test]
+    fn sender_silence_feedback_reports_current_queue_and_resets_window() {
+        let start = Instant::now();
+        let mut feedback = LivePlaybackFeedbackState::default();
+
+        feedback.observe_insert(0, 0, &InsertOutcome::Accepted, start);
+        feedback.observe_playout(
+            &PlayoutItem::Audio {
+                sequence: 0,
+                flags: 0,
+                payload: crate::audio::shared::VoicePayload::Opus(vec![0]),
+            },
+            start,
+        );
+        feedback.observe_queue_ms(200);
+        feedback.observe_sender_silence(1, start + Duration::from_millis(100));
+
+        let report = feedback.take_sender_silence(9, start + Duration::from_millis(100), 20);
+
+        assert_eq!(report.stream_id, 9);
+        assert_eq!(report.highest_contiguous_sequence, 1);
+        assert_eq!(report.expected_packets, 0);
+        assert_eq!(report.lost_packets, 0);
+        assert_eq!(report.max_queue_ms, 20);
+        assert_eq!(report.max_interarrival_jitter_ms, 0);
+        assert!(
+            feedback
+                .take_if_ready(9, start + LIVE_PLAYBACK_FEEDBACK_INTERVAL)
+                .is_none()
+        );
     }
 
     #[test]
@@ -556,6 +630,28 @@ mod tests {
             .unwrap();
         assert_eq!(delay.current, Duration::from_millis(50));
         assert_eq!(delay.peak, Duration::from_millis(30));
+    }
+
+    #[test]
+    fn sender_silence_marker_anchors_unflagged_resume_packet() {
+        let start = Instant::now();
+        let tuning = test_tuning();
+        let mut feedback = LivePlaybackFeedbackState::default();
+
+        feedback.observe_insert(145, 0, &InsertOutcome::Accepted, start);
+        feedback.observe_sender_silence(146, start + Duration::from_millis(20));
+        feedback.observe_insert(
+            147,
+            0,
+            &InsertOutcome::Accepted,
+            start + Duration::from_millis(1_641),
+        );
+
+        assert_eq!(
+            feedback.recommended_target(&tuning),
+            tuning.dynamic_target_floor
+        );
+        assert_eq!(feedback.max_interarrival_jitter_ms, 0);
     }
 
     #[test]

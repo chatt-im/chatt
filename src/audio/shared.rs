@@ -61,7 +61,7 @@ pub(crate) const LIVE_PLAYBACK_FEEDBACK_PACKETS: u32 = 25;
 // Cadence of the "live playback snapshot" diagnostic. Decoupled from the 500 ms
 // feedback window so queue/target/correction dynamics are sampled finely enough
 // to see the queue oscillate between arrivals (one packet is 20 ms).
-pub(crate) const LIVE_PLAYBACK_SNAPSHOT_INTERVAL: Duration = Duration::from_secs(36000);
+pub(crate) const LIVE_PLAYBACK_SNAPSHOT_INTERVAL: Duration = Duration::from_millis(100);
 pub(crate) const LIVE_PLAYBACK_MAX_REORDER_DELAY: Duration = Duration::from_millis(60);
 pub(crate) const LIVE_PLAYBACK_DRED_MAX_SAMPLES: usize = SAMPLE_RATE as usize;
 pub(crate) const LIVE_PLAYBACK_SILENCE_VAD_MAX: u8 = 64;
@@ -88,7 +88,7 @@ pub(crate) const DELAY_BUCKETS: usize = 100;
 pub(crate) const DELAY_BUCKET_MS: u64 = 20;
 pub(crate) const DELAY_FORGET_FACTOR: f32 = 0.983;
 pub(crate) const DELAY_QUANTILE: f32 = 0.95;
-pub(crate) const LIVE_CAPTURE_LONG_SILENCE_STOP: Duration = Duration::from_secs(2);
+pub(crate) const LIVE_CAPTURE_LONG_SILENCE_STOP: Duration = Duration::from_millis(200);
 pub(crate) const LIVE_CAPTURE_SILENCE_PREROLL: Duration = Duration::from_millis(30);
 pub(crate) const LIVE_CAPTURE_SILENCE_RAMP: Duration = Duration::from_millis(10);
 pub(crate) const MAX_OPUS_DECODE_SAMPLES: usize = 5_760;
@@ -250,7 +250,7 @@ pub struct RemoteVoicePacket {
     pub stream_id: u32,
     pub sequence: u32,
     pub flags: u8,
-    pub payload: Vec<u8>,
+    pub payload: VoicePayload,
     /// Wall-clock arrival time captured at the UDP socket read, before any
     /// downstream channel batching. The jitter estimator measures interarrival
     /// against this so batched inserts do not inflate the estimate.
@@ -260,7 +260,55 @@ pub struct RemoteVoicePacket {
 #[derive(Clone, Debug)]
 pub struct LocalVoiceFrame {
     pub flags: u8,
-    pub payload: Vec<u8>,
+    pub payload: VoicePayload,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum VoicePayload {
+    Opus(Vec<u8>),
+    Silence,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VoicePayloadRef<'a> {
+    Opus(&'a [u8]),
+    Silence,
+}
+
+impl VoicePayload {
+    pub fn as_ref(&self) -> VoicePayloadRef<'_> {
+        match self {
+            VoicePayload::Opus(payload) => VoicePayloadRef::Opus(payload),
+            VoicePayload::Silence => VoicePayloadRef::Silence,
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        match self {
+            VoicePayload::Opus(payload) => payload.len(),
+            VoicePayload::Silence => 0,
+        }
+    }
+
+    pub fn is_silence(&self) -> bool {
+        matches!(self, VoicePayload::Silence)
+    }
+}
+
+impl VoicePayloadRef<'_> {
+    pub fn to_owned(self) -> VoicePayload {
+        match self {
+            VoicePayloadRef::Opus(payload) => VoicePayload::Opus(payload.to_vec()),
+            VoicePayloadRef::Silence => VoicePayload::Silence,
+        }
+    }
+
+    pub fn len(self) -> usize {
+        match self {
+            VoicePayloadRef::Opus(payload) => payload.len(),
+            VoicePayloadRef::Silence => 0,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -359,6 +407,9 @@ pub struct LivePlaybackSnapshot {
     pub active_streams: usize,
     pub queued_samples: usize,
     pub max_queue_ms: u64,
+    pub max_playout_delay_ms: u64,
+    pub backend_block_ms: u64,
+    pub playout_quantum_ms: u64,
     pub target_queue_ms: u64,
     pub adaptive_target_ms: u64,
     pub hard_trim_count: u64,

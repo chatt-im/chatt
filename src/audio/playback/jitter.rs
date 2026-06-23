@@ -33,6 +33,18 @@ impl LiveJitterStream {
         outcome
     }
 
+    pub(crate) fn observe_sender_silence(&mut self, sequence: u32) {
+        if self.playout_started {
+            self.jitter.consume_silence_sequence(sequence);
+        }
+    }
+
+    pub(crate) fn skip_silence_gap_to(&mut self, sequence: u32) {
+        if self.playout_started {
+            self.jitter.skip_to_sequence(sequence);
+        }
+    }
+
     pub(crate) fn drain_ready(&mut self, now: Instant) -> Vec<PlayoutItem> {
         if !self.playout_started {
             let Some(first_packet_at) = self.first_packet_at else {
@@ -83,12 +95,12 @@ mod tests {
                 PlayoutItem::Audio {
                     sequence: 1,
                     flags: 0,
-                    payload: vec![1],
+                    payload: crate::audio::shared::VoicePayload::Opus(vec![1]),
                 },
                 PlayoutItem::Audio {
                     sequence: 2,
                     flags: 0,
-                    payload: vec![2],
+                    payload: crate::audio::shared::VoicePayload::Opus(vec![2]),
                 },
             ]
         );
@@ -110,7 +122,7 @@ mod tests {
             vec![PlayoutItem::Audio {
                 sequence: 0,
                 flags: 0,
-                payload: vec![0],
+                payload: crate::audio::shared::VoicePayload::Opus(vec![0]),
             }]
         );
         assert_eq!(
@@ -126,9 +138,72 @@ mod tests {
                 PlayoutItem::Audio {
                     sequence: 2,
                     flags: 0,
-                    payload: vec![2],
+                    payload: crate::audio::shared::VoicePayload::Opus(vec![2]),
                 },
             ]
+        );
+    }
+
+    #[test]
+    fn live_jitter_consumes_silence_sequence_without_plc() {
+        let start = Instant::now();
+        let mut jitter = LiveJitterStream::new(test_tuning());
+        let first_playout = start + LIVE_PLAYBACK_INITIAL_BUFFER;
+
+        assert_eq!(
+            jitter.insert(test_audio_packet(0, &[0]), start),
+            InsertOutcome::Accepted
+        );
+        assert_eq!(
+            jitter.drain_ready(first_playout),
+            vec![PlayoutItem::Audio {
+                sequence: 0,
+                flags: 0,
+                payload: crate::audio::shared::VoicePayload::Opus(vec![0]),
+            }]
+        );
+
+        jitter.observe_sender_silence(1);
+        assert_eq!(
+            jitter.insert(test_audio_packet(2, &[2]), first_playout),
+            InsertOutcome::Accepted
+        );
+
+        assert_eq!(
+            jitter.drain_ready(first_playout),
+            vec![PlayoutItem::Audio {
+                sequence: 2,
+                flags: 0,
+                payload: crate::audio::shared::VoicePayload::Opus(vec![2]),
+            }]
+        );
+    }
+
+    #[test]
+    fn live_jitter_skips_lost_silence_sequences_on_reset_resume() {
+        let start = Instant::now();
+        let mut jitter = LiveJitterStream::new(test_tuning());
+        let first_playout = start + LIVE_PLAYBACK_INITIAL_BUFFER;
+
+        assert_eq!(
+            jitter.insert(test_audio_packet(0, &[0]), start),
+            InsertOutcome::Accepted
+        );
+        let _ = jitter.drain_ready(first_playout);
+
+        jitter.skip_silence_gap_to(4);
+        assert_eq!(
+            jitter.insert(test_audio_packet(4, &[4]), first_playout),
+            InsertOutcome::Accepted
+        );
+
+        assert_eq!(
+            jitter.drain_ready(first_playout),
+            vec![PlayoutItem::Audio {
+                sequence: 4,
+                flags: 0,
+                payload: crate::audio::shared::VoicePayload::Opus(vec![4]),
+            }]
         );
     }
 }

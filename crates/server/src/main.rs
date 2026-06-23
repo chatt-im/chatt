@@ -1802,8 +1802,8 @@ impl Server {
                 stream_id,
                 sequence,
                 flags,
-                opus,
-            } => self.relay_voice(session_id, stream_id, sequence, flags, opus),
+                payload,
+            } => self.relay_voice(session_id, stream_id, sequence, flags, payload),
             MediaPayload::VoiceFeedback {
                 stream_id,
                 feedback,
@@ -1869,7 +1869,7 @@ impl Server {
         stream_id: StreamId,
         sequence: u32,
         flags: u8,
-        opus: Vec<u8>,
+        voice_payload: media::VoicePayload,
     ) -> Result<(), String> {
         let room_id = match self.sessions.get(&sender_session_id) {
             Some(session)
@@ -1897,13 +1897,13 @@ impl Server {
             stream_id = stream_id.0,
             sequence,
             recipient_count = recipients.len(),
-            payload_size = opus.len()
+            payload_size = voice_payload.len()
         );
         let payload = MediaPayload::Voice {
             stream_id,
             sequence,
             flags,
-            opus,
+            payload: voice_payload,
         };
         for session_id in recipients {
             self.send_udp_payload(session_id, &payload);

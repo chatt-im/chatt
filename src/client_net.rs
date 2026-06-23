@@ -40,11 +40,12 @@ use rpc::{
     },
     frame,
     ids::{FileTransferId, RoomId, SessionId, StreamId, UserId},
-    media::{self, MediaPayload},
+    media::{self, MediaPayload, VoicePayload as MediaVoicePayload},
 };
 
 use crate::audio::{
     LiveEncoderProfile, LivePlaybackFeedback, LivePlaybackSink, LocalVoiceFrame, RemoteVoicePacket,
+    VoicePayload as AudioVoicePayload,
 };
 
 const TCP: Token = Token(0);
@@ -998,7 +999,7 @@ enum P2pMediaPacket {
         stream_id: StreamId,
         sequence: u32,
         flags: u8,
-        opus: Vec<u8>,
+        payload: MediaVoicePayload,
         action: Option<P2pAction>,
     },
     Feedback {
@@ -1234,23 +1235,26 @@ impl WorkerState {
                         stream_id,
                         sequence,
                         flags,
-                        opus,
+                        payload,
                     },
                 )) => {
+                    let payload_size = payload.len();
+                    let payload_kind = media_voice_payload_kind(&payload);
                     kvlog::info!(
                         "voice packet received",
                         route = "server",
                         stream_id = stream_id.0,
                         sequence,
                         flags,
-                        payload_size = opus.len()
+                        payload_size,
+                        payload_kind
                     );
                     self.dispatch_voice_packet(
                         RemoteVoicePacket {
                             stream_id: stream_id.0,
                             sequence,
                             flags,
-                            payload: opus,
+                            payload: audio_payload_from_media(payload),
                             received_at: now,
                         },
                         "server",
@@ -1309,6 +1313,7 @@ impl WorkerState {
         let sequence = packet.sequence;
         let flags = packet.flags;
         let payload_size = packet.payload.len();
+        let payload_kind = voice_payload_kind(&packet.payload);
         match self.voice_dedup.observe(stream_id, sequence) {
             RecentVoiceSequenceResult::New => {
                 kvlog::info!(
@@ -1317,15 +1322,32 @@ impl WorkerState {
                     stream_id,
                     sequence,
                     flags,
-                    payload_size
+                    payload_size,
+                    payload_kind
                 );
             }
             RecentVoiceSequenceResult::Duplicate => {
-                kvlog::info!("duplicate voice packet dropped", route, stream_id, sequence);
+                kvlog::info!(
+                    "duplicate voice packet dropped",
+                    route,
+                    stream_id,
+                    sequence,
+                    flags,
+                    payload_size,
+                    payload_kind
+                );
                 return;
             }
             RecentVoiceSequenceResult::Stale => {
-                kvlog::info!("stale voice packet dropped", route, stream_id, sequence);
+                kvlog::info!(
+                    "stale voice packet dropped",
+                    route,
+                    stream_id,
+                    sequence,
+                    flags,
+                    payload_size,
+                    payload_kind
+                );
                 return;
             }
         }
@@ -1384,14 +1406,13 @@ impl WorkerState {
             }
             NetworkCommand::LocalVoicePacket(frame) => {
                 if let Some(stream_id) = self.active_stream {
-                    let sequence = self.local_sequence;
-                    self.local_sequence = self.local_sequence.wrapping_add(1);
+                    let sequence = allocate_local_voice_sequence(&mut self.local_sequence);
                     self.send_local_voice_packet(stream_id, sequence, frame);
                 }
             }
             NetworkCommand::SequencedLocalVoicePacket { sequence, frame } => {
                 if let Some(stream_id) = self.active_stream {
-                    self.local_sequence = self.local_sequence.max(sequence.wrapping_add(1));
+                    advance_local_voice_sequence_past(&mut self.local_sequence, sequence);
                     self.send_local_voice_packet(stream_id, sequence, frame);
                 }
             }
@@ -1401,6 +1422,19 @@ impl WorkerState {
             NetworkCommand::PlaybackFeedback(feedback) => {
                 let _ = self.events.send(NetworkEvent::PlaybackFeedback(feedback));
                 let stream_id = StreamId(feedback.stream_id);
+                kvlog::info!(
+                    "playback feedback sent",
+                    stream_id = feedback.stream_id,
+                    highest_contiguous_sequence = feedback.highest_contiguous_sequence,
+                    expected_packets = feedback.expected_packets,
+                    lost_packets = feedback.lost_packets,
+                    late_packets = feedback.late_packets,
+                    duplicate_packets = feedback.duplicate_packets,
+                    reordered_packets = feedback.reordered_packets,
+                    window_ms = feedback.window_ms,
+                    max_queue_ms = feedback.max_queue_ms,
+                    max_interarrival_jitter_ms = feedback.max_interarrival_jitter_ms
+                );
                 self.send_media(&MediaPayload::VoiceFeedback {
                     stream_id,
                     feedback: media_feedback_from_live(feedback),
@@ -1428,13 +1462,14 @@ impl WorkerState {
             stream_id = stream_id.0,
             sequence,
             flags = frame.flags,
-            payload_size = frame.payload.len()
+            payload_size = frame.payload.len(),
+            payload_kind = voice_payload_kind(&frame.payload)
         );
         let relay_payload = MediaPayload::Voice {
             stream_id,
             sequence,
             flags: frame.flags,
-            opus: frame.payload.clone(),
+            payload: media_payload_from_audio(&frame.payload),
         };
         self.send_media(&relay_payload);
         self.send_p2p_voice(stream_id, sequence, frame.flags, &frame.payload);
@@ -2317,7 +2352,7 @@ impl WorkerState {
                         stream_id,
                         sequence,
                         flags,
-                        opus,
+                        payload,
                     },
                 )) if connection_id == peer.connection_id => {
                     let action = peer.agent.observe_authenticated_packet(now, src);
@@ -2325,7 +2360,7 @@ impl WorkerState {
                         stream_id,
                         sequence,
                         flags,
-                        opus,
+                        payload,
                         action,
                     })
                 }
@@ -2354,19 +2389,22 @@ impl WorkerState {
                 stream_id,
                 sequence,
                 flags,
-                opus,
+                payload,
                 action,
             }) => {
                 if let Some(action) = action {
                     self.apply_p2p_actions(session_id, vec![action]);
                 }
+                let payload_size = payload.len();
+                let payload_kind = media_voice_payload_kind(&payload);
                 kvlog::info!(
                     "voice packet received",
                     route = "p2p",
                     stream_id = stream_id.0,
                     sequence,
                     flags,
-                    payload_size = opus.len()
+                    payload_size,
+                    payload_kind
                 );
                 self.p2p_stream_owners.insert(stream_id, session_id);
                 self.dispatch_voice_packet(
@@ -2374,7 +2412,7 @@ impl WorkerState {
                         stream_id: stream_id.0,
                         sequence,
                         flags,
-                        payload: opus,
+                        payload: audio_payload_from_media(payload),
                         received_at: now,
                     },
                     "p2p",
@@ -2403,7 +2441,13 @@ impl WorkerState {
         true
     }
 
-    fn send_p2p_voice(&mut self, stream_id: StreamId, sequence: u32, flags: u8, opus: &[u8]) {
+    fn send_p2p_voice(
+        &mut self,
+        stream_id: StreamId,
+        sequence: u32,
+        flags: u8,
+        audio_payload: &AudioVoicePayload,
+    ) {
         let mut packets = Vec::new();
         for (session_id, peer) in &mut self.p2p_peers {
             let Some(selected) = peer.agent.selected() else {
@@ -2414,7 +2458,7 @@ impl WorkerState {
                 stream_id,
                 sequence,
                 flags,
-                opus: opus.to_vec(),
+                payload: media_payload_from_audio(audio_payload),
             };
             let counter = peer.send_counter;
             peer.send_counter = peer.send_counter.wrapping_add(1);
@@ -2467,6 +2511,19 @@ impl WorkerState {
 
     fn handle_encoder_feedback(&mut self, feedback: LivePlaybackFeedback, now: Instant) {
         let _ = self.events.send(NetworkEvent::PlaybackFeedback(feedback));
+        kvlog::info!(
+            "playback feedback received",
+            stream_id = feedback.stream_id,
+            highest_contiguous_sequence = feedback.highest_contiguous_sequence,
+            expected_packets = feedback.expected_packets,
+            lost_packets = feedback.lost_packets,
+            late_packets = feedback.late_packets,
+            duplicate_packets = feedback.duplicate_packets,
+            reordered_packets = feedback.reordered_packets,
+            window_ms = feedback.window_ms,
+            max_queue_ms = feedback.max_queue_ms,
+            max_interarrival_jitter_ms = feedback.max_interarrival_jitter_ms
+        );
         if self.active_stream != Some(StreamId(feedback.stream_id)) {
             return;
         }
@@ -2744,6 +2801,44 @@ fn media_payload_kind(payload: &MediaPayload) -> &'static str {
     }
 }
 
+fn media_payload_from_audio(payload: &AudioVoicePayload) -> MediaVoicePayload {
+    match payload {
+        AudioVoicePayload::Opus(opus) => MediaVoicePayload::Opus(opus.clone()),
+        AudioVoicePayload::Silence => MediaVoicePayload::Silence,
+    }
+}
+
+fn media_voice_payload_kind(payload: &MediaVoicePayload) -> &'static str {
+    match payload {
+        MediaVoicePayload::Opus(_) => "opus",
+        MediaVoicePayload::Silence => "silence",
+    }
+}
+
+fn allocate_local_voice_sequence(local_sequence: &mut u32) -> u32 {
+    let sequence = *local_sequence;
+    *local_sequence = (*local_sequence).wrapping_add(1);
+    sequence
+}
+
+fn advance_local_voice_sequence_past(local_sequence: &mut u32, sequence: u32) {
+    *local_sequence = (*local_sequence).max(sequence.wrapping_add(1));
+}
+
+fn voice_payload_kind(payload: &AudioVoicePayload) -> &'static str {
+    match payload {
+        AudioVoicePayload::Opus(_) => "opus",
+        AudioVoicePayload::Silence => "silence",
+    }
+}
+
+fn audio_payload_from_media(payload: MediaVoicePayload) -> AudioVoicePayload {
+    match payload {
+        MediaVoicePayload::Opus(opus) => AudioVoicePayload::Opus(opus),
+        MediaVoicePayload::Silence => AudioVoicePayload::Silence,
+    }
+}
+
 fn dispatch_voice_packet_to(
     events: &Sender<NetworkEvent>,
     playback_sink: Option<&LivePlaybackSink>,
@@ -2946,7 +3041,7 @@ mod tests {
         let packet = pending.pop_front().unwrap();
         assert_eq!(packet.stream_id, 7);
         assert_eq!(packet.sequence, 3);
-        assert_eq!(packet.payload, vec![1, 2, 3, 4]);
+        assert_eq!(packet.payload, AudioVoicePayload::Opus(vec![1, 2, 3, 4]));
     }
 
     #[test]
@@ -3001,6 +3096,21 @@ mod tests {
         }
 
         assert_eq!(dedup.len(), MAX_RECENT_VOICE_STREAMS);
+    }
+
+    #[test]
+    fn local_voice_sequence_advances_for_silence_markers() {
+        let mut local_sequence = 10;
+
+        let silence_sequence = allocate_local_voice_sequence(&mut local_sequence);
+        let opus_sequence = allocate_local_voice_sequence(&mut local_sequence);
+
+        assert_eq!(silence_sequence, 10);
+        assert_eq!(opus_sequence, 11);
+        assert_eq!(local_sequence, 12);
+
+        advance_local_voice_sequence_past(&mut local_sequence, 20);
+        assert_eq!(local_sequence, 21);
     }
 
     #[test]
@@ -3099,7 +3209,7 @@ mod tests {
             stream_id,
             sequence,
             flags: 0,
-            payload,
+            payload: AudioVoicePayload::Opus(payload),
             received_at: Instant::now(),
         }
     }

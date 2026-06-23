@@ -16,6 +16,7 @@ pub(crate) struct OpusVoiceEncoder {
     dred_duration_10ms: i32,
     packet_loss_percent: i32,
     inband_fec: bool,
+    dtx: bool,
 }
 
 unsafe impl Send for OpusVoiceEncoder {}
@@ -43,6 +44,7 @@ impl OpusVoiceEncoder {
             dred_duration_10ms: 0,
             packet_loss_percent: 0,
             inband_fec: false,
+            dtx: false,
         };
         this.set_bitrate(bitrate_bps)?;
         this.set_vbr(true)?;
@@ -51,6 +53,7 @@ impl OpusVoiceEncoder {
         this.set_complexity(Complexity::new(9))?;
         this.set_dred_duration_10ms(0)?;
         this.set_inband_fec(false)?;
+        this.set_dtx(true)?;
         this.set_packet_loss_percent(0)?;
         Ok(this)
     }
@@ -154,6 +157,31 @@ impl OpusVoiceEncoder {
         )?;
         self.inband_fec = enabled;
         Ok(())
+    }
+
+    fn set_dtx(&mut self, enabled: bool) -> Result<(), String> {
+        self.control(
+            opus_codec::OPUS_SET_DTX_REQUEST,
+            i32::from(enabled),
+            "failed to set opus DTX",
+        )?;
+        self.dtx = enabled;
+        Ok(())
+    }
+
+    pub(crate) fn in_dtx(&mut self) -> Result<bool, String> {
+        let mut value = 0i32;
+        let result = unsafe {
+            opus_codec::opus_encoder_ctl(
+                self.encoder.as_ptr(),
+                opus_codec::OPUS_GET_IN_DTX_REQUEST as i32,
+                &mut value,
+            )
+        };
+        if result != opus_codec::OPUS_OK as i32 {
+            return Err(format_opus_error("failed to query opus DTX state", result));
+        }
+        Ok(value != 0)
     }
 
     fn set_packet_loss_percent(&mut self, percent: i32) -> Result<(), String> {

@@ -21,7 +21,7 @@ pub use shared::{
     AudioStats, BufferRequest, CHANNELS, DEFAULT_LIVE_MAX_AMPLIFICATION, FRAME_SAMPLES,
     LiveAudioTuning, LiveEncoderProfile, LivePlaybackFeedback, LivePlaybackSnapshot,
     LocalVoiceFrame, PlaybackSnapshot, PlaybackStats, PlaybackStreamControl, RemoteVoicePacket,
-    SAMPLE_RATE, StatsSnapshot,
+    SAMPLE_RATE, StatsSnapshot, VoicePayload, VoicePayloadRef,
 };
 pub use sim::{
     LiveAudioDirectSampleSimulationConfig, LiveAudioFilePlaybackTestConfig,

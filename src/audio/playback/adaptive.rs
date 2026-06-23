@@ -66,6 +66,8 @@ pub(crate) struct AdaptivePlaybackStream {
     underrun_hold_until: Option<Instant>,
     recent_underruns: VecDeque<Instant>,
     underrun_active: bool,
+    sender_silent: bool,
+    passive_output_active: bool,
     output_priming: bool,
     output_block_remaining: usize,
     output_block_playable: bool,
@@ -88,6 +90,8 @@ impl AdaptivePlaybackStream {
             underrun_hold_until: None,
             recent_underruns: VecDeque::new(),
             underrun_active: false,
+            sender_silent: false,
+            passive_output_active: false,
             output_priming: true,
             output_block_remaining: 0,
             output_block_playable: false,
@@ -118,8 +122,11 @@ impl AdaptivePlaybackStream {
         }
         let mut samples = samples.to_vec();
         self.declick_recovery_boundary(&mut samples, source);
+        let passive_frame = samples_are_passive(&samples);
         self.input
             .push_back_owned_with_delay(samples, source, playout_delay, now);
+        self.sender_silent = false;
+        self.passive_output_active = passive_frame;
         // A real decoded frame arrived, so the stream is live: clear the idle
         // expansion budget so concealment is free to bridge the next underrun.
         self.idle_expansion_samples = 0;
@@ -159,6 +166,9 @@ impl AdaptivePlaybackStream {
         now: Instant,
         stats: &mut LivePlaybackMixerStats,
     ) -> Option<f32> {
+        if self.sender_silent {
+            return Some(self.pop_sender_silence_sample(stats));
+        }
         if self.decision_countdown == 0 {
             self.run_time_scale_decision(now, stats);
             self.decision_countdown = self.samples.decision_interval;
@@ -166,13 +176,22 @@ impl AdaptivePlaybackStream {
         self.decision_countdown = self.decision_countdown.saturating_sub(1);
         self.operation_hold_remaining = self.operation_hold_remaining.saturating_sub(1);
 
+        let passive_front = self.front_is_passive_audio();
         match self.input.pop_front_sample() {
             Some(sample) => {
                 self.underrun_active = false;
+                self.passive_output_active = passive_front;
                 stats.direct_samples = stats.direct_samples.saturating_add(1);
                 Some(sample)
             }
             None => {
+                if self.passive_output_active {
+                    self.underrun_active = false;
+                    if self.output_block_remaining > 0 {
+                        return Some(0.0);
+                    }
+                    return None;
+                }
                 self.record_underrun(now, stats);
                 None
             }
@@ -185,11 +204,23 @@ impl AdaptivePlaybackStream {
         stats: &mut LivePlaybackMixerStats,
         output_block_samples: usize,
     ) -> Option<f32> {
+        if self.sender_silent {
+            self.advance_sender_silence_output_block(output_block_samples);
+            return Some(self.pop_sender_silence_sample(stats));
+        }
         if self.output_block_remaining == 0 {
             self.begin_output_block(output_block_samples);
         }
 
         if !self.output_block_playable {
+            if self.passive_output_active {
+                self.output_block_remaining = self.output_block_remaining.saturating_sub(1);
+                if self.output_block_remaining == 0 {
+                    self.output_target_floor_samples = 0;
+                }
+                self.underrun_active = false;
+                return None;
+            }
             self.output_block_remaining = self.output_block_remaining.saturating_sub(1);
             if self.output_block_remaining == 0 {
                 self.output_target_floor_samples = 0;
@@ -222,6 +253,8 @@ impl AdaptivePlaybackStream {
         .min(self.samples.hard_queue_bound);
         self.output_target_floor_samples = block_floor;
         let prime_target = effective_target.max(block_floor);
+        let passive_tail_playable =
+            queued > 0 && (self.passive_output_active || self.prefix_is_passive(queued));
         self.output_block_playable = if self.output_priming {
             let ready = queued >= prime_target;
             if ready {
@@ -229,11 +262,40 @@ impl AdaptivePlaybackStream {
             }
             ready
         } else {
-            let playable = queued >= output_block_samples;
+            let playable = queued >= output_block_samples || passive_tail_playable;
             self.output_priming = !playable;
+            if passive_tail_playable {
+                self.passive_output_active = true;
+            }
             playable
         };
         self.output_block_remaining = output_block_samples;
+    }
+
+    fn advance_sender_silence_output_block(&mut self, output_block_samples: usize) {
+        if self.output_block_remaining == 0 {
+            self.output_block_remaining = output_block_samples.max(1);
+        }
+        self.output_block_remaining = self.output_block_remaining.saturating_sub(1);
+        self.output_target_floor_samples = 0;
+        self.output_priming = false;
+        self.output_block_playable = true;
+    }
+
+    fn pop_sender_silence_sample(&mut self, stats: &mut LivePlaybackMixerStats) -> f32 {
+        self.underrun_active = false;
+        let Some(sample) = self.input.pop_front_sample() else {
+            return 0.0;
+        };
+        stats.direct_samples = stats.direct_samples.saturating_add(1);
+        sample
+    }
+
+    fn front_is_passive_audio(&self) -> bool {
+        let Some((rms, _peak)) = self.input.front_level() else {
+            return false;
+        };
+        rms * rms <= TIME_SCALE_VAD_RATIO * TIME_SCALE_NOISE_FLOOR_MS
     }
 
     fn run_time_scale_decision(&mut self, now: Instant, stats: &mut LivePlaybackMixerStats) {
@@ -333,10 +395,19 @@ impl AdaptivePlaybackStream {
         if analysis.best_correlation <= threshold_for_mode(fast) && analysis.active_speech {
             return false;
         }
+        let peak_index = if fast {
+            let periods = TIME_SCALE_REF_OFFSET / analysis.peak_index.max(1);
+            (periods.max(1) * analysis.peak_index).min(TIME_SCALE_REF_OFFSET)
+        } else {
+            analysis.peak_index
+        };
+        if self.queued_samples().saturating_sub(peak_index) < self.accelerate_reserve_samples() {
+            return false;
+        }
         let delta = accelerate_one_period(
             &mut self.input,
             lead,
-            analysis.peak_index,
+            peak_index,
             self.samples.wsola_overlap,
         );
         if delta == 0 {
@@ -365,10 +436,17 @@ impl AdaptivePlaybackStream {
         if analysis.best_correlation <= threshold_for_mode(false) && analysis.active_speech {
             return false;
         }
+        let peak_index = if analysis.active_speech {
+            analysis.peak_index
+        } else {
+            analysis
+                .peak_index
+                .min(self.queued_samples().saturating_sub(TIME_SCALE_REF_OFFSET))
+        };
         let delta = expand_one_period(
             &mut self.input,
             lead,
-            analysis.peak_index,
+            peak_index,
             self.samples.wsola_overlap,
         );
         if delta == 0 {
@@ -551,6 +629,88 @@ impl AdaptivePlaybackStream {
             .max(self.output_target_floor_samples)
     }
 
+    fn accelerate_reserve_samples(&self) -> usize {
+        let current_output_block_reserve =
+            if self.output_target_floor_samples <= self.effective_target_samples() {
+                self.output_block_remaining
+            } else {
+                0
+            };
+        self.low_latency_target_samples()
+            .saturating_add(self.samples.time_scale_margin)
+            .saturating_add(current_output_block_reserve)
+    }
+
+    pub(crate) fn mark_sender_silent(&mut self, _now: Instant, stats: &mut LivePlaybackMixerStats) {
+        let tail_trim_target = self
+            .effective_target_samples()
+            .max(self.samples.target_queue);
+        self.sender_silent = true;
+        self.passive_output_active = true;
+        self.recommended_target_samples = self.samples.dynamic_target_floor;
+        self.underrun_active = false;
+        self.output_priming = false;
+        self.output_block_playable = true;
+        self.output_target_floor_samples = 0;
+
+        // A sender-silence marker is equivalent to NetEQ entering a silence/CNG
+        // region: stale device-block floors can be dropped immediately, but
+        // without comfort noise we still need to preserve the current playout
+        // target, or the normal target if the current target already relaxed.
+        // Trimming all the way to the adaptive floor repeatedly cuts
+        // low-energy syllable endings and speech gaps.
+        let target = tail_trim_target;
+        let queued = self.queued_samples();
+        if queued <= target {
+            return;
+        }
+        let skip = queued.saturating_sub(target);
+        if !self.prefix_is_passive(skip) {
+            kvlog::info!(
+                "live playback preserved active speech at sender silence",
+                queued_ms = samples_to_ms(queued),
+                target_ms = samples_to_ms(target),
+                preserved_ms = samples_to_ms(skip)
+            );
+            return;
+        }
+        self.input.drain_samples(skip);
+        stats.speech_gap_skip_count = stats.speech_gap_skip_count.saturating_add(1);
+        stats.skipped_speech_gap_samples =
+            stats.skipped_speech_gap_samples.saturating_add(skip as u64);
+        kvlog::info!(
+            "live playback trimmed sender-silence tail",
+            skipped_ms = samples_to_ms(skip),
+            queued_ms = samples_to_ms(queued),
+            target_ms = samples_to_ms(target),
+            adaptive_floor_ms = samples_to_ms(self.samples.dynamic_target_floor)
+        );
+    }
+
+    fn prefix_is_passive(&self, samples: usize) -> bool {
+        let samples = samples.min(self.queued_samples());
+        if samples == 0 {
+            return true;
+        }
+        let active_threshold = TIME_SCALE_VAD_RATIO * TIME_SCALE_NOISE_FLOOR_MS;
+        let chunk = TIME_SCALE_REF_OFFSET.max(1);
+        let mut start = 0;
+        while start < samples {
+            let end = (start + chunk).min(samples);
+            let mut energy = 0.0f32;
+            for index in start..end {
+                let sample = self.input.sample_at(index).unwrap_or(0.0);
+                energy += sample * sample;
+            }
+            let mean_square = energy / (end - start).max(1) as f32;
+            if mean_square > active_threshold {
+                return false;
+            }
+            start = end;
+        }
+        true
+    }
+
     fn enforce_safety_bound(&mut self, _now: Instant, stats: &mut LivePlaybackMixerStats) {
         let queued = self.queued_samples();
         if queued <= self.samples.hard_queue_bound {
@@ -569,6 +729,21 @@ impl AdaptivePlaybackStream {
     pub(crate) fn queued_samples(&self) -> usize {
         self.input.frames()
     }
+
+    pub(crate) fn playout_delay_samples(&self, now: Instant) -> Option<usize> {
+        self.input
+            .front_playout_delay(now)
+            .map(|delay| samples_for_duration(delay.current))
+    }
+}
+
+fn samples_are_passive(samples: &[f32]) -> bool {
+    if samples.is_empty() {
+        return true;
+    }
+    let mean_square =
+        samples.iter().map(|sample| sample * sample).sum::<f32>() / samples.len() as f32;
+    mean_square <= TIME_SCALE_VAD_RATIO * TIME_SCALE_NOISE_FLOOR_MS
 }
 
 #[cfg(test)]
@@ -770,6 +945,210 @@ mod tests {
     }
 
     #[test]
+    fn sender_silence_trims_passive_backlog_to_normal_target() {
+        let now = Instant::now();
+        let tuning = test_tuning();
+        let mut stream = AdaptivePlaybackStream::new(tuning).unwrap();
+        let mut stats = LivePlaybackMixerStats::default();
+        let block = target_queue_samples(tuning) * 3;
+        let active_floor = block + samples_for_duration(tuning.device_period_margin);
+
+        stream.queue_samples(
+            &vec![0.001; samples_for_duration(Duration::from_millis(240))],
+            DecodedFrameSource::Normal,
+            now,
+            &mut stats,
+        );
+        assert_eq!(
+            stream.pop_output_sample(now, &mut stats, block),
+            Some(0.001)
+        );
+        assert_eq!(stream.output_target_floor_samples, active_floor);
+
+        stream.mark_sender_silent(now, &mut stats);
+
+        assert_eq!(
+            stream.queued_samples(),
+            samples_for_duration(tuning.target_queue)
+        );
+        assert!(
+            samples_to_ms(stream.queued_samples()) < samples_to_ms(active_floor),
+            "silence kept the active output floor"
+        );
+    }
+
+    #[test]
+    fn sender_silence_preserves_short_passive_tail_above_adaptive_floor() {
+        let now = Instant::now();
+        let tuning = test_tuning();
+        let mut stream = AdaptivePlaybackStream::new(tuning).unwrap();
+        let mut stats = LivePlaybackMixerStats::default();
+        let queued = samples_for_duration(tuning.target_queue - Duration::from_millis(10));
+
+        stream.apply_recommended_target(tuning.dynamic_target_floor, now);
+        stream.queue_samples(
+            &vec![0.001; queued],
+            DecodedFrameSource::Normal,
+            now,
+            &mut stats,
+        );
+        stream.mark_sender_silent(now, &mut stats);
+
+        assert_eq!(stream.queued_samples(), queued);
+        assert_eq!(stats.speech_gap_skip_count, 0);
+        assert_eq!(stats.skipped_speech_gap_samples, 0);
+    }
+
+    #[test]
+    fn sender_silence_preserves_loss_raised_target_tail() {
+        let now = Instant::now();
+        let tuning = test_tuning();
+        let mut stream = AdaptivePlaybackStream::new(tuning).unwrap();
+        let mut stats = LivePlaybackMixerStats::default();
+        let raised_target = Duration::from_millis(140);
+        let queued = samples_for_duration(Duration::from_millis(130));
+
+        stream.apply_recommended_target(raised_target, now);
+        stream.queue_samples(
+            &vec![0.001; queued],
+            DecodedFrameSource::Normal,
+            now,
+            &mut stats,
+        );
+        stream.mark_sender_silent(now, &mut stats);
+
+        assert_eq!(stream.queued_samples(), queued);
+        assert_eq!(
+            stream.effective_target_samples(),
+            samples_for_duration(tuning.dynamic_target_floor)
+        );
+        assert_eq!(stats.speech_gap_skip_count, 0);
+    }
+
+    #[test]
+    fn sender_silence_preserves_active_speech_backlog() {
+        let now = Instant::now();
+        let tuning = test_tuning();
+        let mut stream = AdaptivePlaybackStream::new(tuning).unwrap();
+        let mut stats = LivePlaybackMixerStats::default();
+        let queued = samples_for_duration(Duration::from_millis(240));
+
+        stream.queue_samples(
+            &vec![0.25; queued],
+            DecodedFrameSource::Normal,
+            now,
+            &mut stats,
+        );
+        stream.mark_sender_silent(now, &mut stats);
+
+        assert_eq!(stream.queued_samples(), queued);
+        assert_eq!(stats.speech_gap_skip_count, 0);
+        assert_eq!(stats.skipped_speech_gap_samples, 0);
+    }
+
+    #[test]
+    fn sender_silence_zeros_age_stale_output_block_floor() {
+        let now = Instant::now();
+        let mut stream = AdaptivePlaybackStream::new(test_tuning()).unwrap();
+        let mut stats = LivePlaybackMixerStats::default();
+        stream.sender_silent = true;
+        stream.output_block_remaining = 3;
+        stream.output_target_floor_samples = samples_for_duration(Duration::from_millis(200));
+
+        for _ in 0..3 {
+            assert_eq!(
+                stream.pop_output_sample(now, &mut stats, FRAME_SAMPLES),
+                Some(0.0)
+            );
+        }
+
+        assert_eq!(stream.output_block_remaining, 0);
+        assert_eq!(stream.output_target_floor_samples, 0);
+        assert_eq!(stats.underrun_count, 0);
+    }
+
+    #[test]
+    fn sender_silence_drains_residue_even_when_output_block_is_large() {
+        let now = Instant::now();
+        let tuning = test_tuning();
+        let mut stream = AdaptivePlaybackStream::new(tuning).unwrap();
+        let mut stats = LivePlaybackMixerStats::default();
+        let block = target_queue_samples(tuning) * 3;
+        let residue = samples_for_duration(tuning.target_queue);
+
+        stream.queue_samples(
+            &vec![0.001; samples_for_duration(Duration::from_millis(240))],
+            DecodedFrameSource::Normal,
+            now,
+            &mut stats,
+        );
+        stream.mark_sender_silent(now, &mut stats);
+        assert_eq!(stream.queued_samples(), residue);
+
+        let mut played_residue = 0usize;
+        for _ in 0..block {
+            let sample = stream.pop_output_sample(now, &mut stats, block).unwrap();
+            if sample.abs() > f32::EPSILON {
+                played_residue += 1;
+            }
+        }
+
+        assert_eq!(played_residue, residue);
+        assert_eq!(stream.queued_samples(), 0);
+        assert_eq!(stats.underrun_count, 0);
+    }
+
+    #[test]
+    fn accelerate_preserves_target_plus_granularity_reserve() {
+        let now = Instant::now();
+        let tuning = test_tuning();
+        let mut stream = AdaptivePlaybackStream::new(tuning).unwrap();
+        let mut stats = LivePlaybackMixerStats::default();
+        stream.apply_recommended_target(tuning.dynamic_target_floor, now);
+        let queued = samples_for_duration(tuning.dynamic_target_floor + TIME_SCALE_MARGIN)
+            + TIME_SCALE_MIN_LAG_48K
+            - 1;
+
+        stream.queue_samples(
+            &vec![0.001; queued],
+            DecodedFrameSource::Normal,
+            now,
+            &mut stats,
+        );
+
+        assert!(!stream.try_accelerate(now, &mut stats, true));
+        assert_eq!(stream.queued_samples(), queued);
+        assert_eq!(stats.accelerate_count, 0);
+    }
+
+    #[test]
+    fn accelerate_preserves_current_output_block_reserve() {
+        let now = Instant::now();
+        let tuning = test_tuning();
+        let mut stream = AdaptivePlaybackStream::new(tuning).unwrap();
+        let mut stats = LivePlaybackMixerStats::default();
+        let block = FRAME_SAMPLES;
+        stream.apply_recommended_target(tuning.dynamic_target_floor, now);
+        stream.output_block_remaining = block;
+        stream.output_target_floor_samples = block;
+        let queued = samples_for_duration(tuning.dynamic_target_floor + TIME_SCALE_MARGIN)
+            + block
+            + TIME_SCALE_MIN_LAG_48K
+            - 1;
+
+        stream.queue_samples(
+            &vec![0.001; queued],
+            DecodedFrameSource::Normal,
+            now,
+            &mut stats,
+        );
+
+        assert!(!stream.try_accelerate(now, &mut stats, true));
+        assert_eq!(stream.queued_samples(), queued);
+        assert_eq!(stats.accelerate_count, 0);
+    }
+
+    #[test]
     fn adaptive_stream_declicks_recovery_boundaries() {
         let now = Instant::now();
         let mut stream = AdaptivePlaybackStream::new(test_tuning()).unwrap();
@@ -813,6 +1192,104 @@ mod tests {
 
         assert_eq!(stats.underrun_count, 1);
         assert!(stream.effective_target_samples() < ceiling);
+    }
+
+    #[test]
+    fn passive_tail_drains_to_zero_without_underrun() {
+        let now = Instant::now();
+        let mut tuning = test_tuning();
+        tuning.adaptive_catch_up = false;
+        let mut stream = AdaptivePlaybackStream::new(tuning).unwrap();
+        let mut stats = LivePlaybackMixerStats::default();
+        let queued = samples_for_duration(Duration::from_millis(10));
+
+        stream.queue_samples(
+            &vec![0.001; queued],
+            DecodedFrameSource::Normal,
+            now,
+            &mut stats,
+        );
+        for _ in 0..queued {
+            assert_eq!(stream.pop_sample(now, &mut stats), Some(0.001));
+        }
+
+        assert_eq!(stream.pop_sample(now, &mut stats), None);
+        assert_eq!(stats.underrun_count, 0);
+    }
+
+    #[test]
+    fn active_tail_still_reports_underrun_when_it_runs_out() {
+        let now = Instant::now();
+        let mut tuning = test_tuning();
+        tuning.adaptive_catch_up = false;
+        let mut stream = AdaptivePlaybackStream::new(tuning).unwrap();
+        let mut stats = LivePlaybackMixerStats::default();
+        let queued = samples_for_duration(Duration::from_millis(10));
+
+        stream.queue_samples(
+            &vec![0.25; queued],
+            DecodedFrameSource::Normal,
+            now,
+            &mut stats,
+        );
+        for _ in 0..queued {
+            assert_eq!(stream.pop_sample(now, &mut stats), Some(0.25));
+        }
+
+        assert_eq!(stream.pop_sample(now, &mut stats), None);
+        assert_eq!(stats.underrun_count, 1);
+    }
+
+    #[test]
+    fn passive_underfilled_output_block_zero_fills_without_underrun() {
+        let now = Instant::now();
+        let mut tuning = test_tuning();
+        tuning.adaptive_catch_up = false;
+        let mut stream = AdaptivePlaybackStream::new(tuning).unwrap();
+        let mut stats = LivePlaybackMixerStats::default();
+        let block = FRAME_SAMPLES;
+        let queued = samples_for_duration(Duration::from_millis(7));
+        stream.output_priming = false;
+
+        stream.queue_samples(
+            &vec![0.001; queued],
+            DecodedFrameSource::Normal,
+            now,
+            &mut stats,
+        );
+
+        let mut zero_filled = 0usize;
+        for _ in 0..block {
+            let sample = stream.pop_output_sample(now, &mut stats, block);
+            if sample == Some(0.0) {
+                zero_filled += 1;
+            }
+        }
+
+        assert_eq!(zero_filled, block - queued);
+        assert_eq!(stats.underrun_count, 0);
+    }
+
+    #[test]
+    fn active_underfilled_output_block_reports_underrun() {
+        let now = Instant::now();
+        let mut tuning = test_tuning();
+        tuning.adaptive_catch_up = false;
+        let mut stream = AdaptivePlaybackStream::new(tuning).unwrap();
+        let mut stats = LivePlaybackMixerStats::default();
+        let block = FRAME_SAMPLES;
+        let queued = samples_for_duration(Duration::from_millis(7));
+        stream.output_priming = false;
+
+        stream.queue_samples(
+            &vec![0.25; queued],
+            DecodedFrameSource::Normal,
+            now,
+            &mut stats,
+        );
+
+        assert_eq!(stream.pop_output_sample(now, &mut stats, block), None);
+        assert_eq!(stats.underrun_count, 1);
     }
 
     #[test]

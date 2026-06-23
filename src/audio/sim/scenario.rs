@@ -182,9 +182,13 @@ pub struct LiveAudioSimulationReport {
     pub non_finite_samples: u64,
     pub clipped_samples: u64,
     pub max_queue_ms: u64,
+    pub max_playout_delay_ms: u64,
     pub queue_area_ms: f64,
+    pub playout_delay_area_ms: f64,
     pub steady_state_max_queue_ms: u64,
     pub steady_state_avg_queue_ms: f64,
+    pub steady_state_max_playout_delay_ms: u64,
+    pub steady_state_avg_playout_delay_ms: f64,
     /// Minimum adaptive playout target observed over the steady-state tail
     /// window, in milliseconds. Captures how far the dynamic target relaxed.
     pub steady_state_adaptive_target_ms: u64,

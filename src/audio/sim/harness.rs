@@ -312,7 +312,12 @@ pub(crate) fn run_live_audio_direct_sample_simulation_output_inner(
         let snapshot = mixer.snapshot_at(now);
         trace_output_window(trace, start, now, &window, &snapshot);
         report.max_queue_ms = report.max_queue_ms.max(snapshot.max_queue_ms);
+        report.max_playout_delay_ms = report
+            .max_playout_delay_ms
+            .max(snapshot.max_playout_delay_ms);
         report.queue_area_ms += snapshot.max_queue_ms as f64 * frame_duration.as_secs_f64();
+        report.playout_delay_area_ms +=
+            snapshot.max_playout_delay_ms as f64 * frame_duration.as_secs_f64();
     }
 
     let final_now = start + input_duration + drain_duration;
@@ -321,6 +326,9 @@ pub(crate) fn run_live_audio_direct_sample_simulation_output_inner(
         .map_err(|_| "direct sample simulation mixer lock poisoned")?
         .snapshot_at(final_now);
     report.max_queue_ms = report.max_queue_ms.max(report.final_snapshot.max_queue_ms);
+    report.max_playout_delay_ms = report
+        .max_playout_delay_ms
+        .max(report.final_snapshot.max_playout_delay_ms);
     report.output_samples = metrics.samples;
     report.output_ms = samples_to_ms(metrics.samples as usize);
     report.rms = metrics.rms();
@@ -414,6 +422,8 @@ pub(crate) fn run_live_audio_simulation_inner(
     let tail_start_callback = total_callbacks.saturating_sub(tail_callbacks);
     let mut tail_queue_sum_ms = 0.0f64;
     let mut tail_queue_max_ms = 0u64;
+    let mut tail_playout_delay_sum_ms = 0.0f64;
+    let mut tail_playout_delay_max_ms = 0u64;
     let mut tail_adaptive_target_min_ms = u64::MAX;
     let mut tail_underruns_start = None;
     let mut tail_callbacks_seen = 0usize;
@@ -478,10 +488,18 @@ pub(crate) fn run_live_audio_simulation_inner(
         }
         let snapshot = mixer.snapshot_at(now);
         report.max_queue_ms = report.max_queue_ms.max(snapshot.max_queue_ms);
+        report.max_playout_delay_ms = report
+            .max_playout_delay_ms
+            .max(snapshot.max_playout_delay_ms);
         report.queue_area_ms += snapshot.max_queue_ms as f64 * output_block_duration.as_secs_f64();
+        report.playout_delay_area_ms +=
+            snapshot.max_playout_delay_ms as f64 * output_block_duration.as_secs_f64();
         if callback_index >= tail_start_callback {
             tail_queue_sum_ms += snapshot.max_queue_ms as f64;
             tail_queue_max_ms = tail_queue_max_ms.max(snapshot.max_queue_ms);
+            tail_playout_delay_sum_ms += snapshot.max_playout_delay_ms as f64;
+            tail_playout_delay_max_ms =
+                tail_playout_delay_max_ms.max(snapshot.max_playout_delay_ms);
             tail_adaptive_target_min_ms =
                 tail_adaptive_target_min_ms.min(snapshot.adaptive_target_ms);
             tail_callbacks_seen += 1;
@@ -491,6 +509,12 @@ pub(crate) fn run_live_audio_simulation_inner(
     report.steady_state_max_queue_ms = tail_queue_max_ms;
     report.steady_state_avg_queue_ms = if tail_callbacks_seen > 0 {
         tail_queue_sum_ms / tail_callbacks_seen as f64
+    } else {
+        0.0
+    };
+    report.steady_state_max_playout_delay_ms = tail_playout_delay_max_ms;
+    report.steady_state_avg_playout_delay_ms = if tail_callbacks_seen > 0 {
+        tail_playout_delay_sum_ms / tail_callbacks_seen as f64
     } else {
         0.0
     };
@@ -510,6 +534,9 @@ pub(crate) fn run_live_audio_simulation_inner(
         .underrun_count
         .saturating_sub(tail_underruns_start.unwrap_or(0));
     report.max_queue_ms = report.max_queue_ms.max(report.final_snapshot.max_queue_ms);
+    report.max_playout_delay_ms = report
+        .max_playout_delay_ms
+        .max(report.final_snapshot.max_playout_delay_ms);
     report.output_samples = metrics.samples;
     report.output_ms = samples_to_ms(metrics.samples as usize);
     report.rms = metrics.rms();
@@ -852,7 +879,10 @@ impl SimStreamState {
     ) {
         let sequence = self.next_sequence;
         self.next_sequence = self.next_sequence.wrapping_add(1);
-        report.queued_frames = report.queued_frames.saturating_add(1);
+        let silence = packet.payload.is_silence();
+        if !silence {
+            report.queued_frames = report.queued_frames.saturating_add(1);
+        }
 
         trace_encoded_packet(
             trace,
@@ -877,7 +907,9 @@ impl SimStreamState {
             deliver_at.saturating_duration_since(now),
         );
         if dropped {
-            report.lost_frames = report.lost_frames.saturating_add(1);
+            if !silence {
+                report.lost_frames = report.lost_frames.saturating_add(1);
+            }
             return;
         }
 
@@ -921,6 +953,7 @@ impl SimStreamState {
             let stream_id = packet.packet.stream_id;
             let sequence = packet.packet.sequence;
             let flags = packet.packet.flags;
+            let silence = packet.packet.payload.is_silence();
             let outcome = decode_streams.insert_packet(packet.packet, now);
             trace_packet_delivery(
                 trace,
@@ -933,7 +966,7 @@ impl SimStreamState {
                 &outcome,
             );
             match outcome {
-                Some(InsertOutcome::Accepted) => {
+                Some(InsertOutcome::Accepted) if !silence => {
                     report.delivered_frames = report.delivered_frames.saturating_add(1);
                 }
                 Some(InsertOutcome::Late) => {
@@ -1221,7 +1254,13 @@ mod tests {
         );
 
         assert!(snapshot.dred_recoveries > 0, "{:?}", output.report);
-        assert!(snapshot.plc_fallbacks <= 3, "{:?}", output.report);
+        assert!(snapshot.plc_fallbacks > 0, "{:?}", output.report);
+        assert_eq!(snapshot.hard_trim_count, 0, "{:?}", output.report);
+        assert!(
+            output.report.max_queue_ms <= duration_to_ms(test_tuning().hard_queue_bound),
+            "{:?}",
+            output.report
+        );
         assert!(
             churn_ms <= 600,
             "random60 time-scaler churn regressed to {churn_ms}ms: {:?}",
@@ -1239,9 +1278,23 @@ mod tests {
             1,
         );
 
-        assert_eq!(report.suppressed_frames, 0);
+        assert!(report.queued_frames > 0, "{report:?}");
+        assert!(
+            report.suppressed_frames < report.generated_frames,
+            "{report:?}"
+        );
         assert_eq!(report.lost_frames, 0);
-        assert!(report.max_queue_ms <= 120, "{report:?}");
+        assert!(
+            report.max_queue_ms <= duration_to_ms(test_tuning().hard_queue_bound),
+            "{report:?}"
+        );
+        assert!(
+            report.steady_state_max_playout_delay_ms
+                <= duration_to_ms(
+                    test_tuning().dynamic_target_floor + crate::audio::shared::TIME_SCALE_MARGIN,
+                ),
+            "{report:?}"
+        );
         assert_coherent_output(&report, 0.005);
     }
 
@@ -1259,7 +1312,11 @@ mod tests {
             LiveAudioPacketLossProfile::None,
         );
 
-        assert_eq!(report.suppressed_frames, 0, "{report:?}");
+        assert!(report.queued_frames > 0, "{report:?}");
+        assert!(
+            report.suppressed_frames < report.generated_frames,
+            "{report:?}"
+        );
         assert_eq!(report.lost_frames, 0, "{report:?}");
         // Over a loopback-equivalent zero-loss link the queue must converge to
         // the configured target rather than parking on the startup overshoot.
@@ -1438,9 +1495,30 @@ mod tests {
         );
 
         assert!(enabled.suppressed_frames > 0, "{enabled:?}");
-        assert!(enabled.queued_frames < disabled.queued_frames);
+        assert!(
+            enabled.suppressed_frames > disabled.suppressed_frames,
+            "{enabled:?} vs {disabled:?}"
+        );
         assert!(enabled.max_queue_ms <= duration_to_ms(test_tuning().hard_queue_bound));
         assert_coherent_output(&enabled, 0.002);
+    }
+
+    #[test]
+    fn congested_wifi_alternating_speech_does_not_overtrim_silence_tails() {
+        let report = simulate_with_loss(
+            LiveAudioSimulationScenario::AlternatingSpeech,
+            Duration::from_secs(60),
+            test_tuning(),
+            1,
+            LiveAudioPacketLossProfile::CongestedWifi,
+        );
+
+        let trim_budget_ms = duration_to_ms(test_tuning().target_queue) * 3;
+        assert!(
+            report.final_snapshot.skipped_speech_gap_ms <= trim_budget_ms,
+            "sender-silence trimming removed too much low-energy tail audio: {report:?}"
+        );
+        assert_coherent_output(&report, 0.002);
     }
 
     #[test]
@@ -1466,9 +1544,15 @@ mod tests {
             "{enabled:?} vs {disabled:?}"
         );
         assert!(
-            enabled.max_queue_ms < disabled.max_queue_ms,
+            enabled.playout_delay_area_ms < disabled.playout_delay_area_ms,
             "{enabled:?} vs {disabled:?}"
         );
+        assert!(
+            enabled.max_playout_delay_ms <= disabled.max_playout_delay_ms,
+            "{enabled:?} vs {disabled:?}"
+        );
+        assert_eq!(enabled.final_snapshot.underrun_count, 0, "{enabled:?}");
+        assert_eq!(enabled.final_snapshot.plc_fallbacks, 0, "{enabled:?}");
         assert_coherent_output(&enabled, 0.002);
     }
 

@@ -19,7 +19,7 @@ use crate::{
         shared::{
             AudioStats, FRAME_SAMPLES, LIVE_OPUS_FRAME_SAMPLES, LIVE_PACKET_FLAG_OPUS_RESET,
             LIVE_PACKET_FLAG_SILENCE_HINT, LIVE_PACKET_FLAG_SILENCE_RESUME, LiveAudioTuning,
-            LiveEncoderProfile, LocalVoiceFrame, MAX_OPUS_PACKET_BYTES,
+            LiveEncoderProfile, LocalVoiceFrame, MAX_OPUS_PACKET_BYTES, VoicePayload,
             convert_i16_scale_to_pcm_i16, vad_to_u8,
         },
     },
@@ -28,6 +28,7 @@ use crate::{
 };
 
 const SILENCE_RESUME_HINT_PACKETS: u8 = 10;
+const SILENCE_KEEPALIVE_CAPTURE_FRAMES: usize = 100;
 
 pub(crate) fn run_encoder_worker(
     receiver: Receiver<Vec<f32>>,
@@ -193,6 +194,8 @@ pub(crate) struct LiveEncoderPipeline {
     pending_opus_samples: Vec<f32>,
     next_opus_packet_flags: u8,
     silence_resume_hint_packets: u8,
+    sender_silence_active: bool,
+    silence_keepalive_frames: usize,
     suppressed_frames: u64,
     echo: Option<EchoCanceller>,
     echo_source: Option<EchoReferenceSource>,
@@ -244,6 +247,8 @@ impl LiveEncoderPipeline {
             pending_opus_samples: Vec::with_capacity(LIVE_OPUS_FRAME_SAMPLES),
             next_opus_packet_flags: LIVE_PACKET_FLAG_OPUS_RESET,
             silence_resume_hint_packets: 0,
+            sender_silence_active: false,
+            silence_keepalive_frames: 0,
             suppressed_frames: 0,
             echo,
             echo_source,
@@ -334,6 +339,7 @@ impl LiveEncoderPipeline {
             }
             CaptureGateDecision::SuppressCurrent => {
                 self.suppressed_frames = self.suppressed_frames.saturating_add(1);
+                self.maybe_emit_silence_marker(on_packet);
             }
             CaptureGateDecision::Resume(frames) => {
                 self.reset_opus_stream()?;
@@ -362,21 +368,55 @@ impl LiveEncoderPipeline {
             self.next_opus_packet_flags = 0;
             if self.silence_resume_hint_packets > 0 {
                 flags |= LIVE_PACKET_FLAG_SILENCE_RESUME;
-                self.silence_resume_hint_packets -= 1;
             }
-            encode_live_frame(
+            match encode_live_frame(
                 &self.pending_opus_samples[..LIVE_OPUS_FRAME_SAMPLES],
-                flags,
                 &mut self.encoder,
                 &mut self.opus_frame,
                 &mut self.encoded,
-                stats,
-                on_packet,
-            )?;
+            )? {
+                VoiceEncodeResult::Opus(payload) => {
+                    if self.silence_resume_hint_packets > 0 {
+                        self.silence_resume_hint_packets -= 1;
+                    }
+                    let packet_len = payload.len();
+                    self.sender_silence_active = false;
+                    self.silence_keepalive_frames = 0;
+                    on_packet(LocalVoiceFrame { flags, payload });
+                    stats.record_encoded_packet(packet_len);
+                }
+                VoiceEncodeResult::Dtx => {
+                    // DTX produces no Opus frame. Restore the flags so the
+                    // first real Opus frame after this silence still resets the
+                    // decoder and advertises resume.
+                    self.next_opus_packet_flags = flags;
+                    self.maybe_emit_silence_marker(on_packet);
+                }
+            }
             self.pending_opus_samples.drain(..LIVE_OPUS_FRAME_SAMPLES);
         }
 
         Ok(())
+    }
+
+    fn maybe_emit_silence_marker<F>(&mut self, on_packet: &mut F)
+    where
+        F: FnMut(LocalVoiceFrame),
+    {
+        if self.sender_silence_active && self.silence_keepalive_frames > 0 {
+            self.silence_keepalive_frames -= 1;
+            return;
+        }
+        let entering_sender_silence = !self.sender_silence_active;
+        self.sender_silence_active = true;
+        self.silence_keepalive_frames = SILENCE_KEEPALIVE_CAPTURE_FRAMES;
+        if entering_sender_silence {
+            self.silence_resume_hint_packets = SILENCE_RESUME_HINT_PACKETS;
+        }
+        on_packet(LocalVoiceFrame {
+            flags: LIVE_PACKET_FLAG_SILENCE_HINT,
+            payload: VoicePayload::Silence,
+        });
     }
 
     fn take_accumulator(&mut self) -> FrameAccumulator {
@@ -389,6 +429,8 @@ impl LiveEncoderPipeline {
         self.encoder.reset_state()?;
         self.next_opus_packet_flags = LIVE_PACKET_FLAG_OPUS_RESET;
         self.silence_resume_hint_packets = SILENCE_RESUME_HINT_PACKETS;
+        self.sender_silence_active = true;
+        self.silence_keepalive_frames = 0;
         Ok(())
     }
 
@@ -425,26 +467,25 @@ pub(crate) fn build_live_encoder_pipeline(
     ))
 }
 
-pub(crate) fn encode_live_frame<F>(
+pub(crate) fn encode_live_frame(
     frame: &[f32],
-    flags: u8,
     encoder: &mut OpusVoiceEncoder,
     opus_frame: &mut [i16],
     encoded: &mut [u8],
-    stats: &AudioStats,
-    on_packet: &mut F,
-) -> Result<(), String>
-where
-    F: FnMut(LocalVoiceFrame),
-{
+) -> Result<VoiceEncodeResult, String> {
     convert_i16_scale_to_pcm_i16(frame, opus_frame);
     let packet_len = encoder.encode(opus_frame, encoded)?;
-    on_packet(LocalVoiceFrame {
-        flags,
-        payload: encoded[..packet_len].to_vec(),
-    });
-    stats.record_encoded_packet(packet_len);
-    Ok(())
+    if encoder.in_dtx()? {
+        return Ok(VoiceEncodeResult::Dtx);
+    }
+    Ok(VoiceEncodeResult::Opus(VoicePayload::Opus(
+        encoded[..packet_len].to_vec(),
+    )))
+}
+
+pub(crate) enum VoiceEncodeResult {
+    Opus(VoicePayload),
+    Dtx,
 }
 
 pub(crate) struct FrameAccumulator {
@@ -526,12 +567,15 @@ mod tests {
         let mut output = vec![0.0f32; LIVE_OPUS_FRAME_SAMPLES];
         let mut recoverable = 0usize;
         for packet in &packets {
+            let VoicePayload::Opus(payload) = &packet.payload else {
+                continue;
+            };
             let mut dred_state = DredState::new().unwrap();
             let mut dred_end = 0;
             let parsed = dred_decoder
                 .parse(
                     &mut dred_state,
-                    packet.payload.as_slice(),
+                    payload.as_slice(),
                     LIVE_PLAYBACK_DRED_MAX_SAMPLES,
                     SampleRate::Hz48000,
                     &mut dred_end,
@@ -666,6 +710,54 @@ mod tests {
                 .any(|packet| packet.flags & LIVE_PACKET_FLAG_SILENCE_RESUME != 0),
             "resume marker should survive loss of the first resume packet"
         );
+    }
+
+    #[test]
+    fn dtx_silence_marker_marks_next_opus_packet_as_resume() {
+        let mut pipeline = build_live_encoder_pipeline(
+            test_tuning(),
+            false,
+            DEFAULT_LIVE_MAX_AMPLIFICATION,
+            true,
+            EncoderNetworkProfile::EXCELLENT,
+            None,
+        )
+        .unwrap();
+        let stats = AudioStats::new();
+        let mut silence_packets = Vec::new();
+        pipeline.next_opus_packet_flags = 0;
+        pipeline.silence_resume_hint_packets = 0;
+        pipeline.sender_silence_active = false;
+
+        pipeline.maybe_emit_silence_marker(&mut |packet| silence_packets.push(packet));
+
+        assert_eq!(silence_packets.len(), 1);
+        assert_ne!(silence_packets[0].flags & LIVE_PACKET_FLAG_SILENCE_HINT, 0);
+        assert_eq!(
+            pipeline.silence_resume_hint_packets,
+            SILENCE_RESUME_HINT_PACKETS
+        );
+
+        let sampled_speech = sample_high_energy_speech_frame()
+            .iter()
+            .map(|sample| (sample * 6.0).clamp(-1.0, 1.0))
+            .collect::<Vec<_>>();
+        let mut speech_packets = Vec::new();
+        for _ in 0..2 {
+            let frame = ProcessedCaptureFrame::new(&sampled_speech);
+            pipeline
+                .queue_processed_capture_frame(frame, &stats, &mut |packet| {
+                    speech_packets.push(packet)
+                })
+                .unwrap();
+        }
+
+        let first_opus = speech_packets
+            .iter()
+            .find(|packet| matches!(packet.payload, VoicePayload::Opus(_)))
+            .expect("speech should produce an Opus packet");
+        assert_ne!(first_opus.flags & LIVE_PACKET_FLAG_SILENCE_RESUME, 0);
+        assert_eq!(first_opus.flags & LIVE_PACKET_FLAG_OPUS_RESET, 0);
     }
 
     #[test]

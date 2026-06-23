@@ -17,7 +17,7 @@ use crate::{
         playback::{AdaptivePlaybackStream, LiveDecodeStreams, LivePlaybackMixer},
         shared::{
             DecodedFrameSource, LIVE_OPUS_FRAME_SAMPLES, MAX_OPUS_PACKET_BYTES, RemoteVoicePacket,
-            SAMPLE_RATE, samples_for_duration, samples_to_ms,
+            SAMPLE_RATE, TIME_SCALE_MARGIN, VoicePayload, samples_for_duration, samples_to_ms,
         },
         test_support::{encode_live_dred_packets, test_tuning},
     },
@@ -94,7 +94,7 @@ fn exp1_drift_and_block_size_through_real_pipeline() {
                     stream_id: 1,
                     sequence: seq,
                     flags: 0,
-                    payload,
+                    payload: VoicePayload::Opus(payload),
                     received_at: now,
                 };
                 decode.insert_packet(packet, now);
@@ -437,6 +437,9 @@ struct PipelineStanding {
     queue_end_ms: u64,
     queue_tail_min_ms: u64,
     queue_tail_max_ms: u64,
+    playout_delay_end_ms: u64,
+    playout_delay_tail_min_ms: u64,
+    playout_delay_tail_max_ms: u64,
     underruns: u64,
     hard_trims: u64,
 }
@@ -463,6 +466,8 @@ fn run_clean_pipeline(
     let mut seq = 0u32;
     let mut tail_min = u64::MAX;
     let mut tail_max = 0u64;
+    let mut tail_delay_min = u64::MAX;
+    let mut tail_delay_max = 0u64;
     let mut tail_underruns_start = None;
     let mut last_target = 0u64;
 
@@ -475,7 +480,7 @@ fn run_clean_pipeline(
                 stream_id: 1,
                 sequence: seq,
                 flags: 0,
-                payload: packets[seq as usize % packets.len()].clone(),
+                payload: VoicePayload::Opus(packets[seq as usize % packets.len()].clone()),
                 received_at: now,
             };
             decode.insert_packet(packet, now);
@@ -493,6 +498,8 @@ fn run_clean_pipeline(
                 let snap = mixer.snapshot_at(now);
                 tail_min = tail_min.min(snap.max_queue_ms);
                 tail_max = tail_max.max(snap.max_queue_ms);
+                tail_delay_min = tail_delay_min.min(snap.max_playout_delay_ms);
+                tail_delay_max = tail_delay_max.max(snap.max_playout_delay_ms);
                 last_target = snap.adaptive_target_ms;
             }
         }
@@ -505,6 +512,13 @@ fn run_clean_pipeline(
         queue_end_ms: snap.max_queue_ms,
         queue_tail_min_ms: if tail_min == u64::MAX { 0 } else { tail_min },
         queue_tail_max_ms: tail_max,
+        playout_delay_end_ms: snap.max_playout_delay_ms,
+        playout_delay_tail_min_ms: if tail_delay_min == u64::MAX {
+            0
+        } else {
+            tail_delay_min
+        },
+        playout_delay_tail_max_ms: tail_delay_max,
         underruns: snap
             .underrun_count
             .saturating_sub(tail_underruns_start.unwrap_or(0)),
@@ -523,23 +537,31 @@ fn exp7_clean_connection_latency_standing() {
         let block = samples_for_duration(Duration::from_millis(block_ms));
         let s = run_clean_pipeline(&packets, 0.0, block, 30.0);
         println!(
-            "block={block_ms:>2}ms | settled target={:>2}ms  steady queue[min={} end={} max={}]ms  underruns={}  -> {}",
+            "block={block_ms:>2}ms | settled target={:>2}ms  steady queue[min={} end={} max={}]ms  playout_delay[min={} end={} max={}]ms  underruns={}  -> {}",
             s.target_ms,
             s.queue_tail_min_ms,
             s.queue_end_ms,
             s.queue_tail_max_ms,
+            s.playout_delay_tail_min_ms,
+            s.playout_delay_end_ms,
+            s.playout_delay_tail_max_ms,
             s.underruns,
-            if s.queue_tail_max_ms <= 22 {
-                "reaches one-packet goal"
+            if s.playout_delay_tail_max_ms
+                <= s.target_ms + samples_to_ms(samples_for_duration(TIME_SCALE_MARGIN))
+            {
+                "within NetEQ adjustment window"
             } else {
-                "ABOVE one-packet goal"
+                "above NetEQ adjustment window"
             },
         );
         if block_ms == 20 {
+            let high_limit_ms =
+                s.target_ms + samples_to_ms(samples_for_duration(TIME_SCALE_MARGIN));
             assert!(
-                s.queue_tail_max_ms <= 22,
-                "20ms block should stay at one packet, got max {}ms",
-                s.queue_tail_max_ms
+                s.playout_delay_tail_max_ms <= high_limit_ms,
+                "20ms block should stay within the NetEQ delay adjustment window, got max {}ms over limit {}ms",
+                s.playout_delay_tail_max_ms,
+                high_limit_ms
             );
         }
     }

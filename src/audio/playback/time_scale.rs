@@ -22,6 +22,7 @@ const DOWNSAMPLE_48KHZ_Q12: [f32; 7] = [
 pub(crate) struct TimeScaler {
     downsampled: Vec<f32>,
     auto_correlation: Vec<f32>,
+    background_noise: BackgroundNoiseEstimate,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -36,6 +37,7 @@ impl TimeScaler {
         Self {
             downsampled: vec![0.0; TIME_SCALE_DOWNSAMPLED_LEN],
             auto_correlation: vec![0.0; TIME_SCALE_CORRELATION_LEN],
+            background_noise: BackgroundNoiseEstimate::new(),
         }
     }
 
@@ -44,7 +46,9 @@ impl TimeScaler {
         self.downsample_to_4khz(window);
         self.auto_correlate();
         let peak_index = self.refined_peak_index_48k();
-        let (best_correlation, active_speech) = normalized_correlation_and_vad(window, peak_index);
+        let (best_correlation, active_speech, mean_square) =
+            normalized_correlation_and_vad(window, peak_index, self.background_noise.energy());
+        self.background_noise.update(mean_square);
         PitchAnalysis {
             peak_index,
             best_correlation,
@@ -153,7 +157,11 @@ pub(crate) fn threshold_for_mode(fast: bool) -> f32 {
     }
 }
 
-fn normalized_correlation_and_vad(window: &[f32], peak_index: usize) -> (f32, bool) {
+fn normalized_correlation_and_vad(
+    window: &[f32],
+    peak_index: usize,
+    background_noise_energy: f32,
+) -> (f32, bool, f32) {
     // Direct f32 port of neteq/time_stretch.cc:92-145. vec1 starts at 15 ms
     // minus one pitch period; vec2 starts at 15 ms.
     let vec1_start = TIME_SCALE_REF_OFFSET.saturating_sub(peak_index);
@@ -170,10 +178,61 @@ fn normalized_correlation_and_vad(window: &[f32], peak_index: usize) -> (f32, bo
     }
     let best_correlation = (cross.max(0.0) / (e1 * e2).sqrt().max(1.0e-12)).clamp(0.0, 1.0);
 
-    // Fixed-threshold form of neteq/time_stretch.cc:180-221 SpeechDetection.
+    // Floating-point form of neteq/time_stretch.cc:180-221 SpeechDetection.
+    // The fixed fallback background-noise energy is 75000 in int16 units,
+    // equivalent to TIME_SCALE_NOISE_FLOOR_MS after normalizing by 32768^2.
     let mean_square = (e1 + e2) / (2 * peak_index).max(1) as f32;
-    let active_speech = mean_square > TIME_SCALE_VAD_RATIO * TIME_SCALE_NOISE_FLOOR_MS;
-    (best_correlation, active_speech)
+    let active_speech = mean_square > TIME_SCALE_VAD_RATIO * background_noise_energy;
+    (best_correlation, active_speech, mean_square)
+}
+
+#[derive(Debug)]
+struct BackgroundNoiseEstimate {
+    energy: f32,
+    initialized: bool,
+    update_threshold: f32,
+    low_energy_update_threshold: f32,
+    max_energy: f32,
+}
+
+impl BackgroundNoiseEstimate {
+    fn new() -> Self {
+        Self {
+            energy: TIME_SCALE_NOISE_FLOOR_MS,
+            initialized: false,
+            update_threshold: 500_000.0 / (i16::MAX as f32 * i16::MAX as f32),
+            low_energy_update_threshold: 0.0,
+            max_energy: 0.0,
+        }
+    }
+
+    fn energy(&self) -> f32 {
+        if self.initialized {
+            self.energy
+        } else {
+            TIME_SCALE_NOISE_FLOOR_MS
+        }
+    }
+
+    fn update(&mut self, sample_energy: f32) {
+        if sample_energy < self.update_threshold {
+            self.energy = sample_energy.max(1.0 / (i16::MAX as f32 * i16::MAX as f32));
+            self.update_threshold = self.energy;
+            self.low_energy_update_threshold = 0.0;
+            self.initialized = true;
+            return;
+        }
+
+        // Floating-point form of BackgroundNoise::IncrementEnergyThreshold.
+        // The WebRTC comment states that the fixed-point body is essentially
+        // threshold += increment * threshold, with the 60 dB max-energy floor.
+        const THRESHOLD_INCREMENT: f32 = 229.0 / 65_536.0;
+        self.low_energy_update_threshold += THRESHOLD_INCREMENT * self.update_threshold;
+        self.update_threshold += THRESHOLD_INCREMENT * self.update_threshold;
+        self.max_energy -= self.max_energy / 1024.0;
+        self.max_energy = self.max_energy.max(sample_energy);
+        self.update_threshold = self.update_threshold.max(self.max_energy / 1_048_576.0);
+    }
 }
 
 #[cfg(test)]
