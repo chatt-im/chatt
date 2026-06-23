@@ -437,6 +437,7 @@ struct App {
     deafened: Arc<AtomicBool>,
     voice_tx_enabled: Arc<AtomicBool>,
     mic_error: Option<String>,
+    playback_error: Option<String>,
     capture: Option<LiveCapture>,
     settings_preview_capture: bool,
     allow_settings_preview_capture: bool,
@@ -671,6 +672,7 @@ impl App {
             deafened: Arc::new(AtomicBool::new(false)),
             voice_tx_enabled: Arc::new(AtomicBool::new(false)),
             mic_error: None,
+            playback_error: None,
             capture: None,
             settings_preview_capture: false,
             allow_settings_preview_capture: !soundboard_enabled,
@@ -2403,11 +2405,23 @@ impl App {
                 echo_control: Some(Arc::clone(&self.echo_control)),
             }) {
                 Ok(playback) => {
+                    let fell_back = playback.buffer_fallback();
                     let sink = playback.sink();
                     self.playback = Some(playback);
+                    self.playback_error = None;
                     self.set_network_playback_sink(sink);
                     self.apply_all_user_audio_controls();
-                    if capture_ok {
+                    if fell_back
+                        || self
+                            .capture
+                            .as_ref()
+                            .is_some_and(LiveCapture::buffer_fallback)
+                    {
+                        self.set_error(format!(
+                            "audio buffer '{}' unsupported; using device default (higher latency)",
+                            self.buffer_request().label()
+                        ));
+                    } else if capture_ok {
                         if self.config.soundboard.enabled {
                             self.set_status("soundboard voice active");
                         } else {
@@ -2418,6 +2432,7 @@ impl App {
                 Err(error) => {
                     self.set_network_playback_sink(None);
                     self.playback = None;
+                    self.playback_error = Some(error.clone());
                     self.set_error(format!("voice playback unavailable: {error}"));
                 }
             }
@@ -2434,6 +2449,7 @@ impl App {
         self.stop_mic_capture();
         self.set_network_playback_sink(None);
         self.playback.take();
+        self.playback_error = None;
         if restart_settings_preview {
             self.start_settings_preview_capture();
         }
@@ -4019,7 +4035,9 @@ fn draw_composer(area: Rect, app: &mut App, buf: &mut Buffer) {
 }
 
 fn voice_style(app: &App) -> Style {
-    if app.deafened.load(Ordering::Relaxed) {
+    if audio_failed(app) {
+        theme::ERROR
+    } else if app.deafened.load(Ordering::Relaxed) {
         theme::WARN
     } else if app.voice_tx_enabled.load(Ordering::Relaxed) {
         theme::GOOD
@@ -4030,7 +4048,20 @@ fn voice_style(app: &App) -> Style {
     }
 }
 
+/// True when capture or playback failed to start while the client is in a call.
+/// Drives the persistent status-bar indicator so a dead audio path is visible
+/// rather than only flashing a transient status line.
+fn audio_failed(app: &App) -> bool {
+    app.user_id.is_some() && (app.mic_error.is_some() || app.playback_error.is_some())
+}
+
 fn mic_status_compact(app: &App, capture: Option<&StatsSnapshot>) -> String {
+    if app.mic_error.is_some() {
+        return "mic unavailable".to_string();
+    }
+    if app.playback_error.is_some() {
+        return "speaker unavailable".to_string();
+    }
     if app.config.soundboard.enabled {
         return if app.soundboard_busy.load(Ordering::Relaxed) {
             "soundboard playing".to_string()
@@ -4058,7 +4089,9 @@ fn mic_status_compact(app: &App, capture: Option<&StatsSnapshot>) -> String {
 }
 
 fn voice_state_label(app: &App) -> &'static str {
-    if app.deafened.load(Ordering::Relaxed) {
+    if audio_failed(app) {
+        "audio error"
+    } else if app.deafened.load(Ordering::Relaxed) {
         "deafened"
     } else if app.voice_tx_enabled.load(Ordering::Relaxed) {
         "voice"
@@ -4181,6 +4214,7 @@ mod tests {
             deafened: Arc::new(AtomicBool::new(false)),
             voice_tx_enabled: Arc::new(AtomicBool::new(false)),
             mic_error: None,
+            playback_error: None,
             capture: None,
             settings_preview_capture: false,
             allow_settings_preview_capture: false,
