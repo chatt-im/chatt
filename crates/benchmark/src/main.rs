@@ -43,7 +43,7 @@ const LIVE_BENCH_PARAMS: BenchParameters = BenchParameters {
 };
 const PROFILE_CODEC_PROFILE: &str = "dred_32k_1000ms_loss20";
 const PROFILE_FEATURE_ALL_ON: &str = "all_on";
-const PROFILE_PLAYBACK_MIXER_FEATURE: &str = "skip_off";
+const PROFILE_PLAYBACK_MIXER_FEATURE: &str = "catchup_off";
 const PROFILE_CALL_SCENARIO: &str = "lossy_speech";
 const PROFILE_CALL_LOSS: &str = "congested_wifi";
 const PROFILE_GROUP_LOSS: &str = "bursty_wifi";
@@ -470,13 +470,7 @@ fn new_aec() -> AudioProcessing {
 
 fn bench_live(bench: &mut Bench<'_>, corpus: Arc<Corpus>) {
     let mut bench = bench.with_parameters(LIVE_BENCH_PARAMS);
-    let feature_sets = [
-        "all_on",
-        "catchup_off",
-        "skip_off",
-        "gate_off",
-        "adaptive_target_off",
-    ];
+    let feature_sets = ["all_on", "catchup_off", "gate_off", "adaptive_target_off"];
     let loss_profiles = [
         LiveAudioPacketLossProfile::ScenarioDefault.as_name(),
         LiveAudioPacketLossProfile::None.as_name(),
@@ -569,7 +563,8 @@ fn bench_live(bench: &mut Bench<'_>, corpus: Arc<Corpus>) {
                     )
                     .unwrap();
                     black_box(report.max_queue_ms);
-                    black_box(report.final_snapshot.silence_skip_count);
+                    black_box(report.final_snapshot.accelerate_count);
+                    black_box(report.final_snapshot.expand_count);
                 });
             },
         );
@@ -694,7 +689,6 @@ fn live_tuning_for_feature_set(feature: &str) -> LiveAudioTuning {
     match feature {
         "all_on" => {}
         "catchup_off" => tuning.adaptive_catch_up = false,
-        "skip_off" => tuning.playback_silence_skip = false,
         "gate_off" => tuning.capture_silence_gate = false,
         "adaptive_target_off" => tuning.adaptive_target = false,
         _ => panic!("unknown live feature set {feature}"),

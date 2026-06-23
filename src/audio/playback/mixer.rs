@@ -23,19 +23,18 @@ pub(crate) struct LivePlaybackMixer {
     last_backend_error_log_at: Option<Instant>,
 }
 
-#[derive(Default)]
+#[derive(Debug, Default)]
 pub(crate) struct LivePlaybackMixerStats {
-    pub(crate) correction_count: u64,
     pub(crate) hard_trim_count: u64,
     pub(crate) underrun_count: u64,
     pub(crate) dred_recoveries: u64,
     pub(crate) plc_fallbacks: u64,
     decode_errors: u64,
     pub(crate) direct_samples: u64,
-    pub(crate) resampled_samples: u64,
-    pub(crate) skipped_silence_samples: u64,
-    pub(crate) silence_skip_count: u64,
-    pub(crate) silence_skip_rejected: u64,
+    pub(crate) accelerate_count: u64,
+    pub(crate) expand_count: u64,
+    pub(crate) accelerate_samples: u64,
+    pub(crate) expand_samples: u64,
     pub(crate) skipped_speech_gap_samples: u64,
     pub(crate) speech_gap_skip_count: u64,
     pub(crate) backend_xruns: u64,
@@ -184,17 +183,11 @@ impl LivePlaybackMixer {
     }
 
     /// Logs the actual playback state for every active stream, throttled to
-    /// `LIVE_PLAYBACK_SNAPSHOT_INTERVAL`. Each line reports the current queue
-    /// depth, the target actually being applied (after dead-band, underrun hold,
-    /// and loss expansion), the catch-up correction, and cumulative recovery
-    /// stats. This distinguishes a queue parked above target by loss expansion
-    /// (`target_expanded=true`, high `applied_target_ms`) from a low target the
-    /// catch-up is failing to drain (`applied_target_ms` low, `queue_ms` high,
-    /// `correction_percent` near zero).
+    /// `LIVE_PLAYBACK_SNAPSHOT_INTERVAL`.
     pub(crate) fn log_playback_diagnostics_if_due(&mut self, now: Instant) {
         // Disabled for now: too noisy at the 100 ms snapshot cadence. The
         // formatting below is kept ready to re-enable by flipping this flag.
-        const PLAYBACK_DIAGNOSTICS_ENABLED: bool = false;
+        const PLAYBACK_DIAGNOSTICS_ENABLED: bool = true;
         if !PLAYBACK_DIAGNOSTICS_ENABLED || self.streams.is_empty() {
             return;
         }
@@ -206,27 +199,21 @@ impl LivePlaybackMixer {
         }
         self.last_diagnostic_at = Some(now);
         for (stream_id, stream) in &self.streams {
-            let expanded = stream
-                .expanded_target_until
-                .is_some_and(|until| now < until);
             kvlog::info!(
                 "live playback snapshot",
                 stream_id = *stream_id,
                 queue_ms = samples_to_ms(stream.queued_samples()),
                 applied_target_ms = samples_to_ms(stream.adaptive_target_samples(now)),
                 recommended_target_ms = samples_to_ms(stream.effective_target_samples()),
-                target_expanded = expanded,
-                correction_percent = stream.current_correction_percent,
                 underruns = self.stats.underrun_count,
                 dred = self.stats.dred_recoveries,
                 plc = self.stats.plc_fallbacks,
                 hard_trims = self.stats.hard_trim_count,
                 direct_samples = self.stats.direct_samples,
-                resampled_samples = self.stats.resampled_samples,
-                correction_count = self.stats.correction_count,
-                silence_skip_count = self.stats.silence_skip_count,
-                skipped_silence_ms = samples_to_ms(self.stats.skipped_silence_samples as usize),
-                silence_skip_rejected = self.stats.silence_skip_rejected,
+                accelerate_count = self.stats.accelerate_count,
+                expand_count = self.stats.expand_count,
+                accelerate_ms = samples_to_ms(self.stats.accelerate_samples as usize),
+                expand_ms = samples_to_ms(self.stats.expand_samples as usize),
                 speech_gap_skip_count = self.stats.speech_gap_skip_count,
                 skipped_speech_gap_ms =
                     samples_to_ms(self.stats.skipped_speech_gap_samples as usize),
@@ -254,12 +241,6 @@ impl LivePlaybackMixer {
             .map(|stream| stream.adaptive_target_samples(now))
             .max()
             .unwrap_or_else(|| target_queue_samples(self.tuning));
-        let correction_percent = self
-            .streams
-            .values()
-            .map(|stream| stream.current_correction_percent)
-            .max_by(|a, b| a.abs().total_cmp(&b.abs()))
-            .unwrap_or_default();
 
         LivePlaybackSnapshot {
             active_streams: self.streams.len(),
@@ -267,18 +248,16 @@ impl LivePlaybackMixer {
             max_queue_ms: samples_to_ms(max_queue_samples),
             target_queue_ms: duration_to_ms(self.tuning.target_queue),
             adaptive_target_ms: samples_to_ms(adaptive_target),
-            correction_percent,
-            correction_count: self.stats.correction_count,
             hard_trim_count: self.stats.hard_trim_count,
             underrun_count: self.stats.underrun_count,
             dred_recoveries: self.stats.dred_recoveries,
             plc_fallbacks: self.stats.plc_fallbacks,
             decode_errors: self.stats.decode_errors,
             direct_samples: self.stats.direct_samples,
-            resampled_samples: self.stats.resampled_samples,
-            skipped_silence_ms: samples_to_ms(self.stats.skipped_silence_samples as usize),
-            silence_skip_count: self.stats.silence_skip_count,
-            silence_skip_rejected: self.stats.silence_skip_rejected,
+            accelerate_count: self.stats.accelerate_count,
+            expand_count: self.stats.expand_count,
+            accelerate_samples: self.stats.accelerate_samples,
+            expand_samples: self.stats.expand_samples,
             speech_gap_skip_count: self.stats.speech_gap_skip_count,
             skipped_speech_gap_ms: samples_to_ms(self.stats.skipped_speech_gap_samples as usize),
             backend_xruns: self.stats.backend_xruns,

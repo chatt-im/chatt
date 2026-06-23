@@ -23,37 +23,14 @@ pub(crate) const LIVE_PACKET_FLAG_OPUS_RESET: u8 = 0x01;
 pub(crate) const CALLBACK_QUEUE_CAPACITY: usize = 8;
 pub(crate) const LIVE_PLAYBACK_COMMAND_CAPACITY: usize = 256;
 pub(crate) const LIVE_PLAYBACK_TARGET_QUEUE: Duration = Duration::from_millis(60);
-// Receiver-side dynamic target. On a consistent connection (low inter-arrival
-// jitter, no loss/late/reorder) the playout target relaxes from the 60 ms
-// default toward this floor, cutting latency on LAN and same-city links. The
-// target only ever lowers; raising above the default stays the job of the
-// loss-expansion path. Buffer depth tracks delay variation, not absolute RTT.
 pub(crate) const LIVE_PLAYBACK_DYNAMIC_TARGET_FLOOR: Duration = Duration::from_millis(20);
-pub(crate) const LIVE_PLAYBACK_DYNAMIC_TARGET_MARGIN: Duration = Duration::from_millis(8);
-// Jitter-to-target gain: the dynamic target adds this multiple of the jitter
-// estimate above one packet period. Sized so a clean internet path with a small
-// jitter tail descends below the ceiling instead of pinning at it.
-pub(crate) const LIVE_PLAYBACK_DYNAMIC_JITTER_GAIN: f64 = 1.5;
-// Weight on the slow-decay jitter peak when sizing the target. The peak holds a
-// single late packet for ~2 s, so on a path with a continuous small tail it
-// would otherwise dominate `max(smoothed, peak)` and keep the target pinned.
-// Discounting it lets steady-state jitter, not the held worst case, set the
-// target, while a genuine burst still drives the peak high enough to re-widen.
-pub(crate) const LIVE_PLAYBACK_DYNAMIC_PEAK_WEIGHT: f64 = 0.5;
-// Late-jitter EWMA gain (J += (late - J) / 16).
-pub(crate) const LIVE_PLAYBACK_RTP_JITTER_GAIN: f64 = 1.0 / 16.0;
+pub(crate) const LIVE_PLAYBACK_MAX_TARGET: Duration = Duration::from_millis(1_000);
 // Per-packet rise of the relative-transit baseline, in microseconds. The
 // baseline tracks the best-case (minimum) transit, dropping instantly to new
 // lows and rising at this rate to forget stale lows so a constant latency
 // shift is adopted within a few seconds. Lateness is measured above it, so
 // only delay variation, not absolute latency, raises the target.
 pub(crate) const LIVE_PLAYBACK_TRANSIT_BASE_FORGET_US: f64 = 500.0;
-// Per-packet bleed for the fast-attack/slow-decay jitter peak tracker. At a
-// 50 packets/s cadence this is a ~2 s time constant, so one late packet keeps
-// the target elevated for a couple seconds, then it relaxes.
-pub(crate) const LIVE_PLAYBACK_JITTER_PEAK_DECAY: f64 = 0.99;
-// Consecutive clean feedback windows required before the target may descend.
-pub(crate) const LIVE_PLAYBACK_DYNAMIC_RELAX_WINDOWS: u32 = 4;
 // A lone playout underrun is usually a talkspurt draining to empty, not network
 // starvation. The target only re-widens when underruns recur: at least this
 // many within the window below. Each starvation episode produces one underrun
@@ -62,18 +39,7 @@ pub(crate) const LIVE_PLAYBACK_DYNAMIC_UNDERRUN_WINDOW: Duration = Duration::fro
 pub(crate) const LIVE_PLAYBACK_DYNAMIC_UNDERRUN_MIN: usize = 2;
 // Ignore recommended-target changes smaller than this to avoid chatter.
 pub(crate) const LIVE_PLAYBACK_DYNAMIC_DEADBAND: Duration = Duration::from_millis(3);
-pub(crate) const LIVE_PLAYBACK_MODERATE_LOSS_QUEUE: Duration = Duration::from_millis(320);
-pub(crate) const LIVE_PLAYBACK_DRED_HORIZON: Duration = Duration::from_millis(1_000);
 pub(crate) const LIVE_PLAYBACK_HARD_QUEUE_BOUND: Duration = Duration::from_millis(1_500);
-pub(crate) const LIVE_PLAYBACK_LOSS_WINDOW: Duration = Duration::from_secs(5);
-pub(crate) const LIVE_PLAYBACK_LOSS_HOLD: Duration = Duration::from_secs(5);
-pub(crate) const LIVE_PLAYBACK_SEVERE_LOSS_HOLD: Duration = Duration::from_secs(10);
-// Concealment events within `loss_window` required before a pure-PLC stream
-// (no DRED recovery) widens the target to the severe horizon. A single
-// concealment is almost always one late or reordered packet, not sustained
-// loss, so it must not pin a large queue. A DRED frame, which carries the
-// sender's redundancy for a packet it knew was at risk, expands on its own.
-pub(crate) const LIVE_PLAYBACK_SEVERE_LOSS_EVENTS: usize = 8;
 // Priming cushion added on top of one output device callback when sizing the
 // playout target. A device whose host period exceeds the one-packet floor needs
 // its whole callback buffered, plus this slack, or it re-primes whenever
@@ -90,34 +56,31 @@ pub(crate) const LIVE_PLAYBACK_FEEDBACK_PACKETS: u32 = 25;
 // to see the queue oscillate between arrivals (one packet is 20 ms).
 pub(crate) const LIVE_PLAYBACK_SNAPSHOT_INTERVAL: Duration = Duration::from_millis(100);
 pub(crate) const LIVE_PLAYBACK_MAX_REORDER_DELAY: Duration = Duration::from_millis(60);
-// One 20 ms Opus packet of cadence jitter must not trigger resampling, but a
-// persistent excess beyond that should drain back to target. A larger value
-// reopens a dead zone where a startup overshoot parks above target forever.
-pub(crate) const LIVE_PLAYBACK_CATCH_UP_START_EXCESS: Duration = Duration::from_millis(20);
-pub(crate) const LIVE_PLAYBACK_MAX_SPEED_UP: f64 = 0.25;
-// One-pole smoothing coefficient for the catch-up correction (tau = 50 ms):
-// alpha = 1 - exp(-1 / (tau * rate)) ~= 1 / (tau * rate).
-pub(crate) const LIVE_PLAYBACK_CORRECTION_ALPHA: f64 = 1.0 / (0.050 * SAMPLE_RATE as f64);
-// Maximum per-sample change in correction. Full 0 -> max takes at least 2.5 s,
-// which keeps trace-sized burst recovery from jumping abruptly without pitch
-// correction while still allowing the 1.25x ceiling for sustained backlog.
-pub(crate) const LIVE_PLAYBACK_CORRECTION_RAMP_SECONDS: f64 = 2.5;
-pub(crate) const LIVE_PLAYBACK_CORRECTION_SLEW: f64 =
-    LIVE_PLAYBACK_MAX_SPEED_UP / (LIVE_PLAYBACK_CORRECTION_RAMP_SECONDS * SAMPLE_RATE as f64);
 pub(crate) const LIVE_PLAYBACK_DRED_MAX_SAMPLES: usize = SAMPLE_RATE as usize;
 pub(crate) const LIVE_PLAYBACK_SILENCE_VAD_MAX: u8 = 64;
-// Shortest low-energy run the overlap-add compressor will act on. Lowered from
-// the old 250 ms excise threshold so common 60-200 ms inter-word gaps shorten
-// in small continuous increments instead of never.
-pub(crate) const LIVE_PLAYBACK_SILENCE_MIN_GAP: Duration = Duration::from_millis(60);
-// Raised-cosine crossfade length for the overlap-add compressor. The kept tail
-// is blended with the audio following the removed segment over this window so
-// the waveform stays continuous across the join.
-pub(crate) const LIVE_PLAYBACK_SILENCE_RAMP: Duration = Duration::from_millis(10);
-pub(crate) const LIVE_PLAYBACK_SILENCE_MAX_SKIP: Duration = Duration::from_millis(200);
-pub(crate) const LIVE_PLAYBACK_SILENCE_MIN_SKIP: Duration = Duration::from_millis(20);
 pub(crate) const LIVE_PLAYBACK_RECOVERY_DECLICK: Duration = Duration::from_millis(5);
 pub(crate) const LIVE_PLAYBACK_RECOVERY_DECLICK_MIN_DELTA: f32 = 0.01;
+pub(crate) const TIME_SCALE_DECIMATION: usize = 12;
+pub(crate) const TIME_SCALE_DOWNSAMPLED_LEN: usize = 110;
+pub(crate) const TIME_SCALE_CORRELATION_LEN: usize = 50;
+pub(crate) const TIME_SCALE_MIN_LAG_4K: usize = 10;
+pub(crate) const TIME_SCALE_MAX_LAG_4K: usize = 60;
+pub(crate) const TIME_SCALE_WINDOW: usize = 1_440;
+pub(crate) const TIME_SCALE_REF_OFFSET: usize = 720;
+pub(crate) const TIME_SCALE_MIN_LAG_48K: usize = 120;
+pub(crate) const TIME_SCALE_MAX_LAG_48K: usize = 720;
+pub(crate) const TIME_SCALE_CORRELATION_THRESHOLD: f32 = 0.90;
+pub(crate) const TIME_SCALE_FAST_CORRELATION_THRESHOLD: f32 = 0.50;
+pub(crate) const TIME_SCALE_OVERLAP: Duration = Duration::from_millis(10);
+pub(crate) const TIME_SCALE_VAD_RATIO: f32 = 8.0;
+pub(crate) const TIME_SCALE_NOISE_FLOOR_MS: f32 = 7.0e-5;
+pub(crate) const TIME_SCALE_DECISION_INTERVAL: Duration = Duration::from_millis(10);
+pub(crate) const TIME_SCALE_OPERATION_HOLD: Duration = Duration::from_millis(50);
+pub(crate) const TIME_SCALE_MARGIN: Duration = Duration::from_millis(20);
+pub(crate) const DELAY_BUCKETS: usize = 100;
+pub(crate) const DELAY_BUCKET_MS: u64 = 20;
+pub(crate) const DELAY_FORGET_FACTOR: f32 = 0.983;
+pub(crate) const DELAY_QUANTILE: f32 = 0.95;
 pub(crate) const LIVE_CAPTURE_LONG_SILENCE_STOP: Duration = Duration::from_secs(2);
 pub(crate) const LIVE_CAPTURE_SILENCE_PREROLL: Duration = Duration::from_millis(30);
 pub(crate) const LIVE_CAPTURE_SILENCE_RAMP: Duration = Duration::from_millis(10);
@@ -196,30 +159,16 @@ pub struct LivePlaybackFeedback {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct LiveAudioTuning {
     pub adaptive_catch_up: bool,
-    pub playback_silence_skip: bool,
     pub capture_silence_gate: bool,
     pub adaptive_target: bool,
     pub target_queue: Duration,
     pub dynamic_target_floor: Duration,
-    pub dynamic_target_margin: Duration,
-    pub dynamic_jitter_gain: f64,
-    pub dynamic_peak_weight: f64,
-    pub moderate_loss_queue: Duration,
-    pub dred_horizon: Duration,
+    pub max_target: Duration,
     pub hard_queue_bound: Duration,
-    pub loss_window: Duration,
-    pub loss_hold: Duration,
-    pub severe_loss_hold: Duration,
     pub initial_buffer: Duration,
     pub max_reorder_delay: Duration,
-    pub max_speed_up: f64,
-    pub catch_up_start_excess: Duration,
     pub device_period_margin: Duration,
     pub silence_vad_max: u8,
-    pub silence_min_gap: Duration,
-    pub silence_ramp: Duration,
-    pub silence_max_skip: Duration,
-    pub silence_min_skip: Duration,
     pub capture_long_silence_stop: Duration,
     pub capture_silence_preroll: Duration,
     pub capture_silence_ramp: Duration,
@@ -229,30 +178,16 @@ impl Default for LiveAudioTuning {
     fn default() -> Self {
         Self {
             adaptive_catch_up: true,
-            playback_silence_skip: true,
             capture_silence_gate: true,
             adaptive_target: true,
             target_queue: LIVE_PLAYBACK_TARGET_QUEUE,
             dynamic_target_floor: LIVE_PLAYBACK_DYNAMIC_TARGET_FLOOR,
-            dynamic_target_margin: LIVE_PLAYBACK_DYNAMIC_TARGET_MARGIN,
-            dynamic_jitter_gain: LIVE_PLAYBACK_DYNAMIC_JITTER_GAIN,
-            dynamic_peak_weight: LIVE_PLAYBACK_DYNAMIC_PEAK_WEIGHT,
-            moderate_loss_queue: LIVE_PLAYBACK_MODERATE_LOSS_QUEUE,
-            dred_horizon: LIVE_PLAYBACK_DRED_HORIZON,
+            max_target: LIVE_PLAYBACK_MAX_TARGET,
             hard_queue_bound: LIVE_PLAYBACK_HARD_QUEUE_BOUND,
-            loss_window: LIVE_PLAYBACK_LOSS_WINDOW,
-            loss_hold: LIVE_PLAYBACK_LOSS_HOLD,
-            severe_loss_hold: LIVE_PLAYBACK_SEVERE_LOSS_HOLD,
             initial_buffer: LIVE_PLAYBACK_INITIAL_BUFFER,
             max_reorder_delay: LIVE_PLAYBACK_MAX_REORDER_DELAY,
-            max_speed_up: LIVE_PLAYBACK_MAX_SPEED_UP,
-            catch_up_start_excess: LIVE_PLAYBACK_CATCH_UP_START_EXCESS,
             device_period_margin: LIVE_PLAYBACK_DEVICE_PERIOD_MARGIN,
             silence_vad_max: LIVE_PLAYBACK_SILENCE_VAD_MAX,
-            silence_min_gap: LIVE_PLAYBACK_SILENCE_MIN_GAP,
-            silence_ramp: LIVE_PLAYBACK_SILENCE_RAMP,
-            silence_max_skip: LIVE_PLAYBACK_SILENCE_MAX_SKIP,
-            silence_min_skip: LIVE_PLAYBACK_SILENCE_MIN_SKIP,
             capture_long_silence_stop: LIVE_CAPTURE_LONG_SILENCE_STOP,
             capture_silence_preroll: LIVE_CAPTURE_SILENCE_PREROLL,
             capture_silence_ramp: LIVE_CAPTURE_SILENCE_RAMP,
@@ -266,47 +201,14 @@ impl LiveAudioTuning {
         validate_duration_ms(
             "dynamic-target-floor-ms",
             self.dynamic_target_floor,
-            10,
+            20,
             1_000,
         )?;
-        validate_duration_ms(
-            "dynamic-target-margin-ms",
-            self.dynamic_target_margin,
-            0,
-            200,
-        )?;
-        if !self.dynamic_jitter_gain.is_finite() || !(0.0..=8.0).contains(&self.dynamic_jitter_gain)
-        {
-            return Err("dynamic-jitter-gain must be between 0.0 and 8.0".to_string());
-        }
-        if !self.dynamic_peak_weight.is_finite() || !(0.0..=1.0).contains(&self.dynamic_peak_weight)
-        {
-            return Err("dynamic-peak-weight must be between 0.0 and 1.0".to_string());
-        }
-        validate_duration_ms(
-            "moderate-loss-queue-ms",
-            self.moderate_loss_queue,
-            20,
-            2_000,
-        )?;
-        validate_duration_ms("dred-horizon-ms", self.dred_horizon, 20, 1_300)?;
+        validate_duration_ms("max-target-ms", self.max_target, 20, 2_000)?;
         validate_duration_ms("hard-queue-bound-ms", self.hard_queue_bound, 40, 5_000)?;
-        validate_duration_ms("loss-window-ms", self.loss_window, 100, 60_000)?;
-        validate_duration_ms("loss-hold-ms", self.loss_hold, 100, 60_000)?;
-        validate_duration_ms("severe-loss-hold-ms", self.severe_loss_hold, 100, 120_000)?;
         validate_duration_ms("initial-buffer-ms", self.initial_buffer, 0, 500)?;
         validate_duration_ms("max-reorder-delay-ms", self.max_reorder_delay, 0, 500)?;
-        validate_duration_ms(
-            "catch-up-start-excess-ms",
-            self.catch_up_start_excess,
-            0,
-            1_000,
-        )?;
         validate_duration_ms("device-period-margin-ms", self.device_period_margin, 0, 200)?;
-        validate_duration_ms("silence-min-gap-ms", self.silence_min_gap, 20, 2_000)?;
-        validate_duration_ms("silence-ramp-ms", self.silence_ramp, 0, 100)?;
-        validate_duration_ms("silence-max-skip-ms", self.silence_max_skip, 0, 1_000)?;
-        validate_duration_ms("silence-min-skip-ms", self.silence_min_skip, 0, 500)?;
         validate_duration_ms(
             "capture-long-silence-stop-ms",
             self.capture_long_silence_stop,
@@ -326,26 +228,11 @@ impl LiveAudioTuning {
         if self.dynamic_target_floor > self.target_queue {
             return Err("dynamic-target-floor-ms must not exceed target-queue-ms".to_string());
         }
-        if self.moderate_loss_queue < self.target_queue {
-            return Err("moderate-loss-queue-ms must be at least target-queue-ms".to_string());
+        if self.max_target < self.target_queue {
+            return Err("max-target-ms must be at least target-queue-ms".to_string());
         }
-        if self.dred_horizon < self.moderate_loss_queue {
-            return Err("dred-horizon-ms must be at least moderate-loss-queue-ms".to_string());
-        }
-        if self.hard_queue_bound < self.dred_horizon {
-            return Err("hard-queue-bound-ms must be at least dred-horizon-ms".to_string());
-        }
-        if self.silence_max_skip < self.silence_min_skip {
-            return Err("silence-max-skip-ms must be at least silence-min-skip-ms".to_string());
-        }
-        if self.silence_min_gap < self.silence_min_skip + self.silence_ramp.saturating_mul(2) {
-            return Err(
-                "silence-min-gap-ms must be at least silence-min-skip-ms plus twice silence-ramp-ms"
-                    .to_string(),
-            );
-        }
-        if !self.max_speed_up.is_finite() || !(0.0..=0.25).contains(&self.max_speed_up) {
-            return Err("max-speed-up must be between 0.0 and 0.25".to_string());
+        if self.hard_queue_bound < self.max_target {
+            return Err("hard-queue-bound-ms must be at least max-target-ms".to_string());
         }
         Ok(())
     }
@@ -467,18 +354,16 @@ pub struct LivePlaybackSnapshot {
     pub max_queue_ms: u64,
     pub target_queue_ms: u64,
     pub adaptive_target_ms: u64,
-    pub correction_percent: f32,
-    pub correction_count: u64,
     pub hard_trim_count: u64,
     pub underrun_count: u64,
     pub dred_recoveries: u64,
     pub plc_fallbacks: u64,
     pub decode_errors: u64,
     pub direct_samples: u64,
-    pub resampled_samples: u64,
-    pub skipped_silence_ms: u64,
-    pub silence_skip_count: u64,
-    pub silence_skip_rejected: u64,
+    pub accelerate_count: u64,
+    pub expand_count: u64,
+    pub accelerate_samples: u64,
+    pub expand_samples: u64,
     pub speech_gap_skip_count: u64,
     pub skipped_speech_gap_ms: u64,
     pub backend_xruns: u64,
@@ -685,19 +570,6 @@ pub(crate) fn validate_duration_ms(
         return Err(format!("{name} must be between {min_ms} and {max_ms}"));
     }
     Ok(())
-}
-
-/// Interpolates a sample at fractional position `t` in `[0, 1]` between `p1`
-/// (`t = 0`) and `p2` (`t = 1`) using the Catmull-Rom cubic with `p0` and `p3`
-/// as outer neighbours. The curve passes through `p1` and `p2` exactly, so a
-/// read at `t = 0` returns the input sample unchanged.
-pub(crate) fn catmull_rom(p0: f32, p1: f32, p2: f32, p3: f32, t: f32) -> f32 {
-    let t2 = t * t;
-    let t3 = t2 * t;
-    0.5 * (2.0 * p1
-        + (-p0 + p2) * t
-        + (2.0 * p0 - 5.0 * p1 + 4.0 * p2 - p3) * t2
-        + (-p0 + 3.0 * p1 - 3.0 * p2 + p3) * t3)
 }
 
 pub(crate) fn sequence_distance_forward(from: u32, to: u32) -> Option<u32> {

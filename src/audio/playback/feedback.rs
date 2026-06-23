@@ -2,15 +2,63 @@ use std::time::{Duration, Instant};
 
 use crate::{
     audio::shared::{
-        LIVE_OPUS_FRAME_SAMPLES, LIVE_PACKET_FLAG_OPUS_RESET, LIVE_PLAYBACK_DYNAMIC_RELAX_WINDOWS,
-        LIVE_PLAYBACK_FEEDBACK_INTERVAL, LIVE_PLAYBACK_FEEDBACK_PACKETS,
-        LIVE_PLAYBACK_JITTER_PEAK_DECAY, LIVE_PLAYBACK_RTP_JITTER_GAIN,
-        LIVE_PLAYBACK_TRANSIT_BASE_FORGET_US, LiveAudioTuning, LivePlaybackFeedback, SAMPLE_RATE,
-        clamp_u16_from_u32, clamp_u16_from_u64, duration_abs_delta_ms, duration_to_ms,
-        sequence_distance_forward, sequence_is_before, sequence_max_forward,
+        DELAY_BUCKET_MS, DELAY_BUCKETS, DELAY_FORGET_FACTOR, DELAY_QUANTILE,
+        LIVE_OPUS_FRAME_SAMPLES, LIVE_PACKET_FLAG_OPUS_RESET, LIVE_PLAYBACK_FEEDBACK_INTERVAL,
+        LIVE_PLAYBACK_FEEDBACK_PACKETS, LIVE_PLAYBACK_TRANSIT_BASE_FORGET_US, LiveAudioTuning,
+        LivePlaybackFeedback, SAMPLE_RATE, clamp_u16_from_u32, clamp_u16_from_u64,
+        duration_abs_delta_ms, duration_to_ms, sequence_distance_forward, sequence_is_before,
+        sequence_max_forward,
     },
     network::{InsertOutcome, PlayoutItem},
 };
+
+#[derive(Clone, Debug)]
+pub(crate) struct DelayHistogram {
+    buckets: [f32; DELAY_BUCKETS],
+    forget_factor: f32,
+}
+
+impl Default for DelayHistogram {
+    fn default() -> Self {
+        let mut buckets = [0.0; DELAY_BUCKETS];
+        buckets[0] = 1.0;
+        Self {
+            buckets,
+            forget_factor: 0.0,
+        }
+    }
+}
+
+impl DelayHistogram {
+    fn add(&mut self, relative_delay_ms: f64) {
+        let bucket = ((relative_delay_ms.max(0.0) / DELAY_BUCKET_MS as f64).floor() as usize)
+            .min(DELAY_BUCKETS - 1);
+        for value in &mut self.buckets {
+            *value *= self.forget_factor;
+        }
+        self.buckets[bucket] += 1.0 - self.forget_factor;
+        let sum = self.buckets.iter().sum::<f32>();
+        if sum > f32::EPSILON {
+            for value in &mut self.buckets {
+                *value /= sum;
+            }
+        }
+        self.forget_factor += (DELAY_FORGET_FACTOR - self.forget_factor) * 0.25;
+        self.forget_factor = self.forget_factor.clamp(0.0, DELAY_FORGET_FACTOR);
+    }
+
+    fn quantile(&self, probability: f32) -> usize {
+        let inverse_probability = 1.0 - probability.clamp(0.0, 1.0);
+        let mut reverse_cumulative = self.buckets.iter().sum::<f32>().max(1.0);
+        for (index, bucket) in self.buckets.iter().enumerate() {
+            reverse_cumulative -= *bucket;
+            if reverse_cumulative <= inverse_probability || index + 1 == DELAY_BUCKETS {
+                return index;
+            }
+        }
+        DELAY_BUCKETS - 1
+    }
+}
 
 #[derive(Default)]
 pub(crate) struct LivePlaybackFeedbackState {
@@ -25,26 +73,9 @@ pub(crate) struct LivePlaybackFeedbackState {
     max_interarrival_jitter_ms: u64,
     highest_arrived_sequence: Option<u32>,
     last_forward_arrival: Option<(u32, Instant)>,
-    /// Smoothed late-arrival jitter in microseconds, EWMA over packets. Tracks
-    /// only how late packets arrive relative to the running baseline, so early
-    /// or batched arrivals do not inflate it.
-    pub(crate) smoothed_jitter_us: f64,
-    /// Fast-attack/slow-decay peak of the late-arrival jitter. A genuinely late
-    /// packet keeps this elevated for a couple seconds.
-    pub(crate) peak_jitter_us: f64,
-    /// Accumulated relative transit time in microseconds: the running sum of
-    /// (actual - expected) interarrival. Rises when packets fall behind the 20
-    /// ms cadence, dips when they bunch up. Lateness is measured against the
-    /// baseline below, not against this absolute value.
+    histogram: DelayHistogram,
     pub(crate) relative_transit_us: f64,
-    /// Slowly forgetting baseline of `relative_transit_us`, tracking the
-    /// best-case delivery floor. It descends slowly toward new lows so a single
-    /// early/batched packet does not reset it, and rises slowly to forget stale
-    /// lows. Lateness is `relative_transit_us - base_transit_us`.
     pub(crate) base_transit_us: f64,
-    /// Consecutive feedback windows with zero loss/late/reorder events. The
-    /// dynamic target may only descend once this reaches the relax threshold.
-    pub(crate) clean_window_streak: u32,
 }
 
 impl LivePlaybackFeedbackState {
@@ -65,12 +96,6 @@ impl LivePlaybackFeedbackState {
                     self.reordered_packets = self.reordered_packets.saturating_add(1);
                 }
                 if flags & LIVE_PACKET_FLAG_OPUS_RESET != 0 {
-                    // The sender restarted the stream after suppressing silence,
-                    // so the sequence advanced by one while wall-clock advanced by
-                    // the whole pause. The accumulated transit is meaningless
-                    // across that boundary: re-anchor here rather than charge the
-                    // pause as lateness. This is the sender's explicit signal, not
-                    // an inferred time threshold.
                     self.relative_transit_us = 0.0;
                     self.base_transit_us = 0.0;
                     self.last_forward_arrival = Some((sequence, now));
@@ -85,24 +110,18 @@ impl LivePlaybackFeedbackState {
                     self.max_interarrival_jitter_ms = self
                         .max_interarrival_jitter_ms
                         .max(duration_abs_delta_ms(actual, expected));
-                    // Accumulate relative transit, then measure lateness above a
-                    // slowly forgetting baseline. This ignores early/batched
-                    // arrivals (which only bunch packets in the buffer) and
-                    // tracks only how late packets fall behind the cadence,
-                    // which is what actually forces a larger buffer.
                     self.relative_transit_us +=
                         actual.as_micros() as f64 - expected.as_micros() as f64;
                     self.base_transit_us = self
                         .relative_transit_us
                         .min(self.base_transit_us + LIVE_PLAYBACK_TRANSIT_BASE_FORGET_US);
-                    let late_us = (self.relative_transit_us - self.base_transit_us).max(0.0);
-                    self.smoothed_jitter_us +=
-                        LIVE_PLAYBACK_RTP_JITTER_GAIN * (late_us - self.smoothed_jitter_us);
-                    self.peak_jitter_us =
-                        late_us.max(self.peak_jitter_us * LIVE_PLAYBACK_JITTER_PEAK_DECAY);
+                    let late_ms =
+                        ((self.relative_transit_us - self.base_transit_us) / 1_000.0).max(0.0);
+                    self.histogram.add(late_ms);
                     self.last_forward_arrival = Some((sequence, now));
                 } else if self.last_forward_arrival.is_none() {
                     self.last_forward_arrival = Some((sequence, now));
+                    self.histogram.add(0.0);
                 }
                 self.highest_arrived_sequence = Some(
                     self.highest_arrived_sequence
@@ -175,39 +194,14 @@ impl LivePlaybackFeedbackState {
             max_queue_ms: clamp_u16_from_u64(self.max_queue_ms),
             max_interarrival_jitter_ms: clamp_u16_from_u64(self.max_interarrival_jitter_ms),
         };
-        if self.window_had_events() {
-            self.clean_window_streak = 0;
-        } else {
-            self.clean_window_streak = self.clean_window_streak.saturating_add(1);
-        }
         self.reset_window(now);
         Some(feedback)
     }
 
-    fn window_had_events(&self) -> bool {
-        self.lost_packets != 0 || self.late_packets != 0 || self.reordered_packets != 0
-    }
-
-    /// Receiver-recommended playout target. Relaxes from the configured ceiling
-    /// toward the floor only after sustained clean windows, sized from the
-    /// jitter estimate. A loss/late/reorder event in the current window pins it
-    /// back at the ceiling immediately, ahead of the window-close streak reset.
     pub(crate) fn recommended_target(&self, tuning: &LiveAudioTuning) -> Duration {
-        let relaxed = !self.window_had_events()
-            && self.clean_window_streak >= LIVE_PLAYBACK_DYNAMIC_RELAX_WINDOWS;
-        if !relaxed {
-            return tuning.target_queue;
-        }
-        let jitter_us = self
-            .smoothed_jitter_us
-            .max(tuning.dynamic_peak_weight * self.peak_jitter_us)
-            .max(0.0);
-        let packet_period =
-            Duration::from_secs_f64(LIVE_OPUS_FRAME_SAMPLES as f64 / SAMPLE_RATE as f64);
-        let raw = packet_period
-            + Duration::from_secs_f64(tuning.dynamic_jitter_gain * jitter_us / 1.0e6)
-            + tuning.dynamic_target_margin;
-        raw.clamp(tuning.dynamic_target_floor, tuning.target_queue)
+        let bucket = self.histogram.quantile(DELAY_QUANTILE);
+        let optimal = Duration::from_millis((1 + bucket) as u64 * DELAY_BUCKET_MS);
+        optimal.clamp(tuning.dynamic_target_floor, tuning.max_target)
     }
 
     fn ensure_started(&mut self, now: Instant) {
@@ -232,7 +226,6 @@ impl LivePlaybackFeedbackState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[allow(unused_imports)]
     use crate::audio::test_support::*;
 
     #[test]
@@ -303,43 +296,44 @@ mod tests {
     }
 
     #[test]
-    fn playback_feedback_relaxes_when_consistent_and_pins_on_events() {
+    fn histogram_quantile_tracks_delay_distribution() {
+        let mut histogram = DelayHistogram::default();
+        for _ in 0..95 {
+            histogram.add(0.0);
+        }
+        for _ in 0..5 {
+            histogram.add(120.0);
+        }
+        let bucket = histogram.quantile(0.95);
+        assert!(bucket <= 6, "bucket={bucket}");
+
+        for _ in 0..80 {
+            histogram.add(500.0);
+        }
+        assert!(histogram.quantile(0.95) >= 20);
+    }
+
+    #[test]
+    fn playback_feedback_histogram_reacts_to_late_arrivals() {
         let tuning = test_tuning();
         let mut feedback = LivePlaybackFeedbackState::default();
         let frame = Duration::from_secs_f64(LIVE_OPUS_FRAME_SAMPLES as f64 / SAMPLE_RATE as f64);
-
-        // Before any clean windows the recommendation holds the safe ceiling.
-        assert_eq!(feedback.recommended_target(&tuning), tuning.target_queue);
-
-        let mut seq = 0u32;
         let mut now = Instant::now();
-        for _ in 0..LIVE_PLAYBACK_DYNAMIC_RELAX_WINDOWS {
-            for _ in 0..30 {
-                feedback.observe_insert(seq, 0, &InsertOutcome::Accepted, now);
-                feedback.observe_playout(
-                    &PlayoutItem::Audio {
-                        sequence: seq,
-                        flags: 0,
-                        payload: vec![0],
-                    },
-                    now,
-                );
-                seq = seq.wrapping_add(1);
-                now += frame;
-            }
-            feedback.take_if_ready(0, now).unwrap();
+        feedback.observe_insert(0, 0, &InsertOutcome::Accepted, now);
+        assert_eq!(
+            feedback.recommended_target(&tuning),
+            tuning.dynamic_target_floor
+        );
+
+        for seq in 1..80 {
+            now += frame + Duration::from_millis(15);
+            feedback.observe_insert(seq, 0, &InsertOutcome::Accepted, now);
         }
 
-        // Perfectly periodic arrivals carry no jitter, so the target relaxes
-        // toward the floor, well under the 60 ms ceiling.
-        let relaxed = feedback.recommended_target(&tuning);
-        assert!(relaxed < tuning.target_queue, "{relaxed:?}");
-        assert!(relaxed <= Duration::from_millis(30), "{relaxed:?}");
-        assert!(relaxed >= tuning.dynamic_target_floor, "{relaxed:?}");
-
-        // A single late arrival in the current window pins the recommendation
-        // back at the ceiling immediately, ahead of the window-close reset.
-        feedback.observe_insert(seq, 0, &InsertOutcome::Late, now);
-        assert_eq!(feedback.recommended_target(&tuning), tuning.target_queue);
+        assert!(
+            feedback.recommended_target(&tuning) > tuning.target_queue,
+            "{:?}",
+            feedback.recommended_target(&tuning)
+        );
     }
 }

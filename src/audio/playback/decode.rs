@@ -15,8 +15,8 @@ use crate::{
         playback::{LiveJitterStream, LivePlaybackFeedbackState, LivePlaybackMixer},
         shared::{
             DecodedFrameSource, LIVE_OPUS_FRAME_SAMPLES, LIVE_PACKET_FLAG_OPUS_RESET,
-            LIVE_PLAYBACK_DRAIN_INTERVAL, LiveAudioTraceWriter, LiveAudioTuning,
-            LivePlaybackFeedback, MAX_OPUS_DECODE_SAMPLES, RemoteVoicePacket, samples_for_duration,
+            LIVE_PLAYBACK_DRAIN_INTERVAL, LIVE_PLAYBACK_DRED_MAX_SAMPLES, LiveAudioTraceWriter,
+            LiveAudioTuning, LivePlaybackFeedback, MAX_OPUS_DECODE_SAMPLES, RemoteVoicePacket,
             sequence_distance_forward, trace_decode_output, trace_decoder_reset, trace_dred_parse,
             trace_dred_skip, trace_fast_forward, trace_jitter_item, trace_mixer_queue,
         },
@@ -456,7 +456,7 @@ impl LiveDecodeStream {
             );
             return false;
         };
-        let dred_max_samples = samples_for_duration(self.tuning.dred_horizon);
+        let dred_max_samples = LIVE_PLAYBACK_DRED_MAX_SAMPLES;
         if offset_samples as usize > dred_max_samples {
             trace_dred_parse(
                 trace,
@@ -628,9 +628,8 @@ impl LiveDecodeStream {
         }
     }
 
-    /// Closes the feedback window if ready, logs the per-window receiver
-    /// estimate (jitter, recommended target, and loss/late/reorder counts), and
-    /// sends the feedback to the network worker.
+    /// Closes the feedback window if ready and sends the receiver-side counters
+    /// to the network worker.
     fn flush_feedback(
         &mut self,
         stream_id: u32,
@@ -642,26 +641,6 @@ impl LiveDecodeStream {
         let Some(feedback) = self.feedback.take_if_ready(stream_id, now) else {
             return;
         };
-        kvlog::info!(
-            "live playback target estimate",
-            stream_id,
-            smoothed_jitter_ms = (self.feedback.smoothed_jitter_us / 1_000.0) as f32,
-            peak_jitter_ms = (self.feedback.peak_jitter_us / 1_000.0) as f32,
-            transit_ms = (self.feedback.relative_transit_us / 1_000.0) as f32,
-            base_ms = (self.feedback.base_transit_us / 1_000.0) as f32,
-            clean_window_streak = u64::from(self.feedback.clean_window_streak),
-            recommended_target_ms = crate::audio::shared::duration_to_ms(
-                self.feedback.recommended_target(&self.tuning)
-            ),
-            window_ms = u64::from(feedback.window_ms),
-            window_max_queue_ms = u64::from(feedback.max_queue_ms),
-            window_max_jitter_ms = u64::from(feedback.max_interarrival_jitter_ms),
-            expected = u64::from(feedback.expected_packets),
-            lost = u64::from(feedback.lost_packets),
-            late = u64::from(feedback.late_packets),
-            reordered = u64::from(feedback.reordered_packets),
-            duplicates = u64::from(feedback.duplicate_packets)
-        );
         if let Some(sender) = feedback_sender {
             let _ = sender.send(feedback);
         }
@@ -834,15 +813,10 @@ mod tests {
         let _ = process_at;
 
         let feedback = &streams.get(1).unwrap().feedback;
-        assert!(
-            feedback.smoothed_jitter_us < 2_000.0,
-            "clean 20ms arrivals must not register as jitter: {} us",
-            feedback.smoothed_jitter_us
-        );
-        assert!(
-            feedback.peak_jitter_us < 4_000.0,
-            "clean 20ms arrivals must not spike the jitter peak: {} us",
-            feedback.peak_jitter_us
+        assert_eq!(
+            feedback.recommended_target(&tuning),
+            tuning.dynamic_target_floor,
+            "clean 20ms arrivals must hold the histogram at the low target"
         );
     }
 
@@ -872,15 +846,11 @@ mod tests {
             now,
         );
 
-        assert!(
-            feedback.peak_jitter_us < 5_000.0,
-            "silence gate resume inflated the jitter peak: {} us",
-            feedback.peak_jitter_us
-        );
-        assert!(
-            feedback.smoothed_jitter_us < 5_000.0,
-            "silence gate resume inflated smoothed jitter: {} us",
-            feedback.smoothed_jitter_us
+        let tuning = test_tuning();
+        assert_eq!(
+            feedback.recommended_target(&tuning),
+            tuning.dynamic_target_floor,
+            "silence gate resume inflated the delay histogram"
         );
     }
 }
