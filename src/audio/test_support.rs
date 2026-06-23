@@ -189,7 +189,7 @@ pub(crate) fn drive_gap_recovery(
         start,
         1,
         &mut trace,
-        |_, samples, source| {
+        |_, samples, source, _| {
             collected.push((source, samples.len()));
         },
         || {},
@@ -200,7 +200,7 @@ pub(crate) fn drive_gap_recovery(
         start,
         1,
         &mut trace,
-        |_, samples, source| {
+        |_, samples, source, _| {
             collected.push((source, samples.len()));
         },
         || {},

@@ -6,7 +6,7 @@ use crate::audio::{
     playback::AdaptivePlaybackStream,
     shared::{
         DecodedFrameSource, LIVE_PLAYBACK_SNAPSHOT_INTERVAL, LiveAudioTuning, LivePlaybackSnapshot,
-        PlaybackStreamControl, db_to_gain, duration_to_ms, samples_to_ms, soft_limit,
+        PlaybackStreamControl, PlayoutDelay, db_to_gain, duration_to_ms, samples_to_ms, soft_limit,
         target_queue_samples,
     },
 };
@@ -65,6 +65,17 @@ impl LivePlaybackMixer {
         source: DecodedFrameSource,
         now: Instant,
     ) {
+        self.queue_stream_samples_with_delay(stream_id, samples, source, None, now);
+    }
+
+    pub(crate) fn queue_stream_samples_with_delay(
+        &mut self,
+        stream_id: u32,
+        samples: &[f32],
+        source: DecodedFrameSource,
+        playout_delay: Option<PlayoutDelay>,
+        now: Instant,
+    ) {
         match source {
             DecodedFrameSource::Normal => {}
             DecodedFrameSource::Dred => {
@@ -95,7 +106,7 @@ impl LivePlaybackMixer {
                 }
             }
         };
-        stream.queue_samples(samples, source, now, &mut self.stats);
+        stream.queue_samples_with_delay(samples, source, playout_delay, now, &mut self.stats);
     }
 
     /// Applies the receiver-recommended dynamic target to an existing stream.

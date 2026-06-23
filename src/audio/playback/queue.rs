@@ -1,6 +1,8 @@
-use std::collections::VecDeque;
+use std::{collections::VecDeque, time::Instant};
 
-use crate::audio::shared::{DecodedFrameSource, peak_normalized, rms_normalized, soft_limit};
+use crate::audio::shared::{
+    DecodedFrameSource, PlayoutDelay, peak_normalized, rms_normalized, soft_limit,
+};
 
 #[derive(Default)]
 pub(crate) struct MonoSampleQueue {
@@ -14,8 +16,15 @@ pub(crate) struct QueuedAudioFrame {
     samples: Vec<f32>,
     offset: usize,
     source: DecodedFrameSource,
+    timing: Option<QueuedPlayoutTiming>,
     rms: f32,
     peak: f32,
+}
+
+#[derive(Clone, Copy)]
+struct QueuedPlayoutTiming {
+    delay: PlayoutDelay,
+    enqueued_at: Instant,
 }
 
 impl MonoSampleQueue {
@@ -35,6 +44,16 @@ impl MonoSampleQueue {
     /// hold a `Vec<f32>` use this to avoid the extra allocation and copy that
     /// `push_back_with_source` incurs.
     pub(crate) fn push_back_owned(&mut self, samples: Vec<f32>, source: DecodedFrameSource) {
+        self.push_back_owned_with_delay(samples, source, None, Instant::now());
+    }
+
+    pub(crate) fn push_back_owned_with_delay(
+        &mut self,
+        samples: Vec<f32>,
+        source: DecodedFrameSource,
+        playout_delay: Option<PlayoutDelay>,
+        now: Instant,
+    ) {
         if samples.is_empty() {
             return;
         }
@@ -45,6 +64,10 @@ impl MonoSampleQueue {
             samples,
             offset: 0,
             source,
+            timing: playout_delay.map(|delay| QueuedPlayoutTiming {
+                delay,
+                enqueued_at: now,
+            }),
             rms,
             peak,
         });
@@ -169,7 +192,8 @@ impl MonoSampleQueue {
             let split_at = frame.offset + local_index;
             let tail = frame.samples.split_off(split_at);
             let source = frame.source;
-            let tail_frame = QueuedAudioFrame::new(tail, source);
+            let timing = frame.timing;
+            let tail_frame = QueuedAudioFrame::new_with_timing(tail, source, timing);
             self.frames.insert(frame_index + 1, tail_frame);
         }
 
@@ -178,10 +202,11 @@ impl MonoSampleQueue {
         } else {
             frame_index + 1
         };
+        let timing = self.timing_at(absolute_index);
         self.total += samples.len();
         self.frames.insert(
             insert_index,
-            QueuedAudioFrame::new(samples.to_vec(), DecodedFrameSource::Normal),
+            QueuedAudioFrame::new_with_timing(samples.to_vec(), DecodedFrameSource::Normal, timing),
         );
     }
 
@@ -249,16 +274,41 @@ impl MonoSampleQueue {
                 .map(|sample| (sample, frame.source))
         })
     }
+
+    pub(crate) fn front_playout_delay(&self, now: Instant) -> Option<PlayoutDelay> {
+        let timing = self.frames.front()?.timing?;
+        Some(PlayoutDelay {
+            current: timing
+                .delay
+                .current
+                .saturating_add(now.saturating_duration_since(timing.enqueued_at)),
+            peak: timing.delay.peak,
+        })
+    }
+
+    fn timing_at(&self, absolute_index: usize) -> Option<QueuedPlayoutTiming> {
+        let (frame_index, _, _) = self.find_frame_at(absolute_index)?;
+        self.frames.get(frame_index)?.timing
+    }
 }
 
 impl QueuedAudioFrame {
     fn new(samples: Vec<f32>, source: DecodedFrameSource) -> Self {
+        Self::new_with_timing(samples, source, None)
+    }
+
+    fn new_with_timing(
+        samples: Vec<f32>,
+        source: DecodedFrameSource,
+        timing: Option<QueuedPlayoutTiming>,
+    ) -> Self {
         let rms = rms_normalized(&samples);
         let peak = peak_normalized(&samples);
         Self {
             samples,
             offset: 0,
             source,
+            timing,
             rms,
             peak,
         }

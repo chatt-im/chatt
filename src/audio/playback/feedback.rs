@@ -1,16 +1,22 @@
-use std::time::{Duration, Instant};
+use std::{
+    collections::VecDeque,
+    time::{Duration, Instant},
+};
 
 use crate::{
     audio::shared::{
         DELAY_BUCKET_MS, DELAY_BUCKETS, DELAY_FORGET_FACTOR, DELAY_QUANTILE,
         LIVE_OPUS_FRAME_SAMPLES, LIVE_PACKET_FLAG_OPUS_RESET, LIVE_PLAYBACK_FEEDBACK_INTERVAL,
         LIVE_PLAYBACK_FEEDBACK_PACKETS, LIVE_PLAYBACK_TRANSIT_BASE_FORGET_US, LiveAudioTuning,
-        LivePlaybackFeedback, SAMPLE_RATE, clamp_u16_from_u32, clamp_u16_from_u64,
+        LivePlaybackFeedback, PlayoutDelay, SAMPLE_RATE, clamp_u16_from_u32, clamp_u16_from_u64,
         duration_abs_delta_ms, duration_to_ms, sequence_distance_forward, sequence_is_before,
         sequence_max_forward,
     },
     network::{InsertOutcome, PlayoutItem},
 };
+
+const ARRIVAL_HISTORY_PACKETS: u32 = 100;
+const FRAME_DURATION_US: i128 = (LIVE_OPUS_FRAME_SAMPLES as i128 * 1_000_000) / SAMPLE_RATE as i128;
 
 #[derive(Clone, Debug)]
 pub(crate) struct DelayHistogram {
@@ -60,6 +66,12 @@ impl DelayHistogram {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+struct ForwardArrival {
+    sequence: u32,
+    arrived_at: Instant,
+}
+
 #[derive(Default)]
 pub(crate) struct LivePlaybackFeedbackState {
     window_started_at: Option<Instant>,
@@ -73,7 +85,9 @@ pub(crate) struct LivePlaybackFeedbackState {
     max_interarrival_jitter_ms: u64,
     highest_arrived_sequence: Option<u32>,
     last_forward_arrival: Option<(u32, Instant)>,
-    histogram: DelayHistogram,
+    forward_arrivals: VecDeque<ForwardArrival>,
+    underrun_histogram: DelayHistogram,
+    reorder_histogram: DelayHistogram,
     pub(crate) relative_transit_us: f64,
     pub(crate) base_transit_us: f64,
 }
@@ -94,11 +108,16 @@ impl LivePlaybackFeedbackState {
                     .is_some_and(|highest| sequence_is_before(sequence, highest))
                 {
                     self.reordered_packets = self.reordered_packets.saturating_add(1);
+                    if flags & LIVE_PACKET_FLAG_OPUS_RESET == 0 {
+                        self.note_late_arrival_delay(sequence, now);
+                    }
                 }
                 if flags & LIVE_PACKET_FLAG_OPUS_RESET != 0 {
                     self.relative_transit_us = 0.0;
                     self.base_transit_us = 0.0;
                     self.last_forward_arrival = Some((sequence, now));
+                    self.forward_arrivals.clear();
+                    self.note_forward_arrival(sequence, now);
                 } else if let Some((last_sequence, last_at)) = self.last_forward_arrival
                     && let Some(distance) = sequence_distance_forward(last_sequence, sequence)
                     && distance > 0
@@ -117,11 +136,13 @@ impl LivePlaybackFeedbackState {
                         .min(self.base_transit_us + LIVE_PLAYBACK_TRANSIT_BASE_FORGET_US);
                     let late_ms =
                         ((self.relative_transit_us - self.base_transit_us) / 1_000.0).max(0.0);
-                    self.histogram.add(late_ms);
+                    self.underrun_histogram.add(late_ms);
                     self.last_forward_arrival = Some((sequence, now));
+                    self.note_forward_arrival(sequence, now);
                 } else if self.last_forward_arrival.is_none() {
                     self.last_forward_arrival = Some((sequence, now));
-                    self.histogram.add(0.0);
+                    self.underrun_histogram.add(0.0);
+                    self.note_forward_arrival(sequence, now);
                 }
                 self.highest_arrived_sequence = Some(
                     self.highest_arrived_sequence
@@ -133,9 +154,38 @@ impl LivePlaybackFeedbackState {
             }
             InsertOutcome::Late => {
                 self.late_packets = self.late_packets.saturating_add(1);
+                // A late packet was dropped by the jitter buffer because playout
+                // had already passed its slot, so a shallow target masks exactly
+                // the lateness that a deeper one would have absorbed. Feed it too
+                // or the target can never grow out of the regime that produced it.
+                if flags & LIVE_PACKET_FLAG_OPUS_RESET == 0 {
+                    self.note_late_arrival_delay(sequence, now);
+                }
             }
             InsertOutcome::BufferFull => {}
         }
+    }
+
+    /// Feeds the delay histogram with how far a reordered or late packet trails
+    /// its in-order playout slot, measured against the most recent forward
+    /// arrival. This is the buffer depth that would have been needed to play the
+    /// packet rather than conceal it, so the playout target tracks the actual
+    /// reordering and lateness under loss, not just forward-arrival jitter.
+    fn note_late_arrival_delay(&mut self, sequence: u32, now: Instant) {
+        let Some((last_sequence, last_at)) = self.last_forward_arrival else {
+            return;
+        };
+        let Some(behind) = sequence_distance_forward(sequence, last_sequence) else {
+            return;
+        };
+        let slot_offset = Duration::from_secs_f64(
+            f64::from(behind) * LIVE_OPUS_FRAME_SAMPLES as f64 / SAMPLE_RATE as f64,
+        );
+        let reorder_delay = now.saturating_duration_since(last_at) + slot_offset;
+        // Drives only the playout target, not the reported interarrival-jitter
+        // metric, which stays a pure forward-arrival measure for the sender.
+        self.reorder_histogram
+            .add(reorder_delay.as_micros() as f64 / 1_000.0);
     }
 
     pub(crate) fn observe_playout(&mut self, item: &PlayoutItem, now: Instant) {
@@ -199,9 +249,80 @@ impl LivePlaybackFeedbackState {
     }
 
     pub(crate) fn recommended_target(&self, tuning: &LiveAudioTuning) -> Duration {
-        let bucket = self.histogram.quantile(DELAY_QUANTILE);
+        let underrun_bucket = self.underrun_histogram.quantile(DELAY_QUANTILE);
+        let reorder_bucket = self.reorder_histogram.quantile(DELAY_QUANTILE);
+        let bucket = underrun_bucket.max(reorder_bucket);
         let optimal = Duration::from_millis((1 + bucket) as u64 * DELAY_BUCKET_MS);
         optimal.clamp(tuning.dynamic_target_floor, tuning.max_target)
+    }
+
+    pub(crate) fn playout_delay(&self, sequence: u32, now: Instant) -> Option<PlayoutDelay> {
+        Some(PlayoutDelay {
+            current: self.arrival_delay_for_sequence(sequence, now)?,
+            peak: self.peak_arrival_delay(),
+        })
+    }
+
+    fn note_forward_arrival(&mut self, sequence: u32, arrived_at: Instant) {
+        self.forward_arrivals.push_back(ForwardArrival {
+            sequence,
+            arrived_at,
+        });
+        while self.forward_arrivals.front().is_some_and(|front| {
+            sequence_distance_forward(front.sequence, sequence)
+                .is_some_and(|distance| distance > ARRIVAL_HISTORY_PACKETS)
+        }) {
+            self.forward_arrivals.pop_front();
+        }
+    }
+
+    fn arrival_delay_for_sequence(&self, sequence: u32, now: Instant) -> Option<Duration> {
+        let min_arrival = self.min_relative_arrival()?;
+        if let Some(distance) = sequence_distance_forward(min_arrival.sequence, sequence) {
+            let expected = frame_duration(distance);
+            Some(
+                now.saturating_duration_since(min_arrival.arrived_at)
+                    .saturating_sub(expected),
+            )
+        } else if let Some(behind) = sequence_distance_forward(sequence, min_arrival.sequence) {
+            Some(
+                now.saturating_duration_since(min_arrival.arrived_at)
+                    .saturating_add(frame_duration(behind)),
+            )
+        } else {
+            None
+        }
+    }
+
+    fn peak_arrival_delay(&self) -> Duration {
+        let Some(reference) = self.forward_arrivals.front() else {
+            return Duration::ZERO;
+        };
+        let min_score = self
+            .forward_arrivals
+            .iter()
+            .filter_map(|arrival| relative_arrival_score_us(*reference, *arrival))
+            .min()
+            .unwrap_or(0);
+        let peak_us = self
+            .forward_arrivals
+            .iter()
+            .filter_map(|arrival| relative_arrival_score_us(*reference, *arrival))
+            .map(|score| score.saturating_sub(min_score).max(0))
+            .max()
+            .unwrap_or(0);
+        duration_from_us(peak_us)
+    }
+
+    fn min_relative_arrival(&self) -> Option<ForwardArrival> {
+        let reference = *self.forward_arrivals.front()?;
+        self.forward_arrivals
+            .iter()
+            .filter_map(|arrival| {
+                relative_arrival_score_us(reference, *arrival).map(|score| (score, *arrival))
+            })
+            .min_by_key(|(score, _)| *score)
+            .map(|(_, arrival)| arrival)
     }
 
     fn ensure_started(&mut self, now: Instant) {
@@ -221,6 +342,26 @@ impl LivePlaybackFeedbackState {
         self.max_interarrival_jitter_ms = 0;
         self.highest_contiguous_sequence = None;
     }
+}
+
+fn frame_duration(frames: u32) -> Duration {
+    Duration::from_micros(
+        u64::from(frames).saturating_mul(LIVE_OPUS_FRAME_SAMPLES as u64) * 1_000_000
+            / u64::from(SAMPLE_RATE),
+    )
+}
+
+fn duration_from_us(us: i128) -> Duration {
+    Duration::from_micros(us.try_into().unwrap_or(u64::MAX))
+}
+
+fn relative_arrival_score_us(reference: ForwardArrival, arrival: ForwardArrival) -> Option<i128> {
+    let distance = sequence_distance_forward(reference.sequence, arrival.sequence)?;
+    let actual = arrival
+        .arrived_at
+        .saturating_duration_since(reference.arrived_at)
+        .as_micros() as i128;
+    Some(actual - i128::from(distance) * FRAME_DURATION_US)
 }
 
 #[cfg(test)]
@@ -335,5 +476,31 @@ mod tests {
             "{:?}",
             feedback.recommended_target(&tuning)
         );
+    }
+
+    #[test]
+    fn playout_delay_uses_forward_arrival_history_not_queue_depth() {
+        let start = Instant::now();
+        let mut feedback = LivePlaybackFeedbackState::default();
+
+        feedback.observe_insert(0, 0, &InsertOutcome::Accepted, start);
+        feedback.observe_insert(
+            1,
+            0,
+            &InsertOutcome::Accepted,
+            start + Duration::from_millis(20),
+        );
+        feedback.observe_insert(
+            2,
+            0,
+            &InsertOutcome::Accepted,
+            start + Duration::from_millis(70),
+        );
+
+        let delay = feedback
+            .playout_delay(2, start + Duration::from_millis(90))
+            .unwrap();
+        assert_eq!(delay.current, Duration::from_millis(50));
+        assert_eq!(delay.peak, Duration::from_millis(30));
     }
 }
