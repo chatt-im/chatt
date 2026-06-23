@@ -15,7 +15,7 @@ mod imp {
         net::{UnixListener, UnixStream},
     };
 
-    use crate::client_net::NetworkCommand;
+    use crate::client_net::{CommandSender, NetworkCommand};
 
     pub const SOCKET_ENV: &str = "CHATT_CONTROL_SOCKET";
     pub const RUN_DIR_ENV: &str = "CHATT_RUN_DIR";
@@ -37,13 +37,13 @@ mod imp {
     }
 
     impl ControlSocket {
-        pub fn spawn(commands: Sender<NetworkCommand>) -> Result<Self, String> {
+        pub fn spawn(commands: CommandSender) -> Result<Self, String> {
             let config = socket_config()?;
             Self::spawn_with_config(config, commands)
         }
 
         #[cfg(test)]
-        fn spawn_at_path(path: PathBuf, commands: Sender<NetworkCommand>) -> Result<Self, String> {
+        fn spawn_at_path(path: PathBuf, commands: CommandSender) -> Result<Self, String> {
             Self::spawn_with_config(
                 SocketConfig {
                     path,
@@ -55,7 +55,7 @@ mod imp {
 
         fn spawn_with_config(
             config: SocketConfig,
-            commands: Sender<NetworkCommand>,
+            commands: CommandSender,
         ) -> Result<Self, String> {
             prepare_socket_parent(&config)?;
             let listener = bind_listener(&config.path)?;
@@ -274,7 +274,7 @@ mod imp {
         }
     }
 
-    fn handle_connection(stream: &mut UnixStream, commands: &Sender<NetworkCommand>) {
+    fn handle_connection(stream: &mut UnixStream, commands: &CommandSender) {
         let _ = stream.set_read_timeout(Some(STREAM_TIMEOUT));
         let _ = stream.set_write_timeout(Some(STREAM_TIMEOUT));
         let response = match read_request(stream) {
@@ -444,7 +444,9 @@ mod imp {
             let socket_path = dir.join("control.sock");
             let upload_path = dir.join("some_file/foo.md");
             let (tx, rx) = mpsc::channel();
-            let socket = ControlSocket::spawn_at_path(socket_path.clone(), tx).unwrap();
+            let socket =
+                ControlSocket::spawn_at_path(socket_path.clone(), CommandSender::for_test(tx))
+                    .unwrap();
 
             let response = send_upload_to_path(&socket_path, &upload_path).unwrap();
             let command = rx.recv_timeout(Duration::from_secs(2)).unwrap();
@@ -492,12 +494,12 @@ mod imp {
 mod imp {
     use std::{path::Path, sync::mpsc::Sender};
 
-    use crate::client_net::NetworkCommand;
+    use crate::client_net::{CommandSender, NetworkCommand};
 
     pub struct ControlSocket;
 
     impl ControlSocket {
-        pub fn spawn(_commands: Sender<NetworkCommand>) -> Result<Self, String> {
+        pub fn spawn(_commands: CommandSender) -> Result<Self, String> {
             Err("chatt local control sockets are only supported on Unix".to_string())
         }
 
