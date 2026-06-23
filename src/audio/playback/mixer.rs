@@ -5,9 +5,9 @@ use hashbrown::HashMap;
 use crate::audio::{
     playback::AdaptivePlaybackStream,
     shared::{
-        DecodedFrameSource, LIVE_PLAYBACK_SNAPSHOT_INTERVAL, LiveAudioTuning, LivePlaybackSnapshot,
-        PlaybackStreamControl, PlayoutDelay, db_to_gain, duration_to_ms, samples_to_ms, soft_limit,
-        target_queue_samples,
+        DecodedFrameSource, FRAME_SAMPLES, LIVE_PLAYBACK_SNAPSHOT_INTERVAL, LiveAudioTuning,
+        LivePlaybackSnapshot, PlaybackStreamControl, PlayoutDelay, db_to_gain, duration_to_ms,
+        samples_to_ms, soft_limit, target_queue_samples,
     },
 };
 
@@ -21,6 +21,8 @@ pub(crate) struct LivePlaybackMixer {
     pub(crate) stats: LivePlaybackMixerStats,
     last_diagnostic_at: Option<Instant>,
     last_backend_error_log_at: Option<Instant>,
+    last_backend_block_samples: usize,
+    last_playout_quantum_samples: usize,
 }
 
 #[derive(Debug, Default)]
@@ -55,6 +57,8 @@ impl LivePlaybackMixer {
             stats: LivePlaybackMixerStats::default(),
             last_diagnostic_at: None,
             last_backend_error_log_at: None,
+            last_backend_block_samples: 0,
+            last_playout_quantum_samples: 0,
         }
     }
 
@@ -133,6 +137,22 @@ impl LivePlaybackMixer {
         if let Some(stream) = self.streams.get_mut(&stream_id) {
             stream.skip_speech_gap_backlog(now, &mut self.stats);
         }
+    }
+
+    pub(crate) fn note_stream_sender_silence(&mut self, stream_id: u32, now: Instant) {
+        let stream = match self.streams.entry(stream_id) {
+            hashbrown::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+            hashbrown::hash_map::Entry::Vacant(entry) => {
+                match AdaptivePlaybackStream::new(self.tuning) {
+                    Ok(stream) => entry.insert(stream),
+                    Err(error) => {
+                        eprintln!("failed to create live playback stream: {error}");
+                        return;
+                    }
+                }
+            }
+        };
+        stream.mark_sender_silent(now, &mut self.stats);
     }
 
     pub(crate) fn set_stream_control(&mut self, stream_id: u32, control: PlaybackStreamControl) {
@@ -216,6 +236,8 @@ impl LivePlaybackMixer {
                 queue_ms = samples_to_ms(stream.queued_samples()),
                 applied_target_ms = samples_to_ms(stream.adaptive_target_samples(now)),
                 recommended_target_ms = samples_to_ms(stream.effective_target_samples()),
+                backend_block_ms = samples_to_ms(self.last_backend_block_samples),
+                playout_quantum_ms = samples_to_ms(self.last_playout_quantum_samples),
                 underruns = self.stats.underrun_count,
                 dred = self.stats.dred_recoveries,
                 plc = self.stats.plc_fallbacks,
@@ -246,6 +268,12 @@ impl LivePlaybackMixer {
             .map(AdaptivePlaybackStream::queued_samples)
             .max()
             .unwrap_or_default();
+        let max_playout_delay_samples = self
+            .streams
+            .values()
+            .filter_map(|stream| stream.playout_delay_samples(now))
+            .max()
+            .unwrap_or_default();
         let adaptive_target = self
             .streams
             .values()
@@ -257,6 +285,9 @@ impl LivePlaybackMixer {
             active_streams: self.streams.len(),
             queued_samples,
             max_queue_ms: samples_to_ms(max_queue_samples),
+            max_playout_delay_ms: samples_to_ms(max_playout_delay_samples),
+            backend_block_ms: samples_to_ms(self.last_backend_block_samples),
+            playout_quantum_ms: samples_to_ms(self.last_playout_quantum_samples),
             target_queue_ms: duration_to_ms(self.tuning.target_queue),
             adaptive_target_ms: samples_to_ms(adaptive_target),
             hard_trim_count: self.stats.hard_trim_count,
@@ -286,8 +317,11 @@ impl LivePlaybackMixer {
         now: Instant,
         output_block_samples: usize,
     ) -> f32 {
+        let playout_quantum_samples = output_block_samples.max(1).min(FRAME_SAMPLES);
+        self.last_backend_block_samples = output_block_samples;
+        self.last_playout_quantum_samples = playout_quantum_samples;
         self.pop_mixed_sample_with(|stream, stats| {
-            stream.pop_output_sample(now, stats, output_block_samples)
+            stream.pop_output_sample(now, stats, playout_quantum_samples)
         })
     }
 
@@ -439,6 +473,30 @@ mod tests {
 
         assert!(boosted > 0.25);
         assert!(boosted <= 0.55);
+    }
+
+    #[test]
+    fn mixer_caps_large_backend_blocks_to_playout_quantum() {
+        let mut mixer = LivePlaybackMixer::new();
+        let now = Instant::now();
+        mixer.queue_stream_samples(
+            1,
+            &vec![0.25; samples_for_duration(test_tuning().target_queue)],
+            DecodedFrameSource::Normal,
+            now,
+        );
+
+        let sample =
+            mixer.pop_mixed_output_sample(now, samples_for_duration(Duration::from_millis(500)));
+        let snapshot = mixer.snapshot_at(now);
+
+        assert_eq!(sample, 0.25);
+        assert_eq!(snapshot.backend_block_ms, 500);
+        assert_eq!(snapshot.playout_quantum_ms, samples_to_ms(FRAME_SAMPLES));
+        assert!(
+            snapshot.queued_samples < samples_for_duration(test_tuning().target_queue),
+            "{snapshot:?}"
+        );
     }
 
     #[test]

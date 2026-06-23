@@ -2,7 +2,7 @@
 
 [network]
 tcp-addr = "127.0.0.1:41000"
-p2p-enabled = false
+p2p-enabled = true
 
 [security]
 server-identity-seed = "546f6d636861742064657620736572766572206b657920763100000000000001"
@@ -37,4 +37,3 @@ id = 4
 name = "billy"
 display-name = "Billy"
 token-hash = "sha256:5c2bc883be6ee4037447e72a76dcd748d01b236a31669cb1bde9e5d460eb9519"
-

@@ -2067,10 +2067,10 @@ impl App {
         } else {
             stats.direct_samples.saturating_mul(100) / played_samples
         };
-        let loss_target = match stats.adaptive_target_ms.cmp(&stats.target_queue_ms) {
-            std::cmp::Ordering::Greater => format!(" loss_target{}ms", stats.adaptive_target_ms),
-            std::cmp::Ordering::Less => format!(" adaptive{}ms", stats.adaptive_target_ms),
-            std::cmp::Ordering::Equal => String::new(),
+        let base_target = if stats.adaptive_target_ms == stats.target_queue_ms {
+            String::new()
+        } else {
+            format!(" base{}ms", stats.target_queue_ms)
         };
         let backend_errors = if stats.backend_stream_errors == 0 {
             String::new()
@@ -2083,8 +2083,8 @@ impl App {
         self.set_status(format!(
             "audio q{}ms target{}ms{} enc{} direct{}% accel{}ms/{} expand{}ms/{} dred{} plc{} trims{} underruns{}{} rx {}/{}",
             stats.max_queue_ms,
-            stats.target_queue_ms,
-            loss_target,
+            stats.adaptive_target_ms,
+            base_target,
             self.encoder_profile.label(),
             direct_percent,
             live_samples_to_ms(stats.accelerate_samples as usize),
@@ -4262,7 +4262,7 @@ mod tests {
             stream_id: 2,
             sequence: 1,
             flags: 0,
-            payload: vec![1, 2, 3, 4],
+            payload: audio::VoicePayload::Opus(vec![1, 2, 3, 4]),
             received_at: Instant::now(),
         }));
 

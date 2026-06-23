@@ -171,7 +171,7 @@ pub(crate) fn drive_gap_recovery(
             AudioPacketRef {
                 sequence,
                 flags: 0,
-                payload,
+                payload: crate::audio::shared::VoicePayloadRef::Opus(payload),
             },
             start,
         );
@@ -193,6 +193,7 @@ pub(crate) fn drive_gap_recovery(
             collected.push((source, samples.len()));
         },
         || {},
+        || {},
     );
     let t2 = t1 + tuning.max_reorder_delay + Duration::from_millis(1);
     stream.drain_ready(
@@ -203,6 +204,7 @@ pub(crate) fn drive_gap_recovery(
         |_, samples, source, _| {
             collected.push((source, samples.len()));
         },
+        || {},
         || {},
     );
     (collected, stream)
@@ -250,7 +252,7 @@ pub(crate) fn test_audio_packet(sequence: u32, payload: &[u8]) -> AudioPacketRef
     AudioPacketRef {
         sequence,
         flags: 0,
-        payload,
+        payload: crate::audio::shared::VoicePayloadRef::Opus(payload),
     }
 }
 

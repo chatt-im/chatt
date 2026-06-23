@@ -224,6 +224,7 @@ pub(crate) fn deliver_ready_file_source_packets<F>(
                     sequence.max(packet.packet.sequence)
                 }),
         );
+        let silence = packet.packet.payload.is_silence();
         on_packet(
             packet.packet.sequence,
             LocalVoiceFrame {
@@ -231,7 +232,9 @@ pub(crate) fn deliver_ready_file_source_packets<F>(
                 payload: packet.packet.payload,
             },
         );
-        report.delivered_frames = report.delivered_frames.saturating_add(1);
+        if !silence {
+            report.delivered_frames = report.delivered_frames.saturating_add(1);
+        }
     }
 }
 

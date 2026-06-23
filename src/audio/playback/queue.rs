@@ -1,7 +1,10 @@
-use std::{collections::VecDeque, time::Instant};
+use std::{
+    collections::VecDeque,
+    time::{Duration, Instant},
+};
 
 use crate::audio::shared::{
-    DecodedFrameSource, PlayoutDelay, peak_normalized, rms_normalized, soft_limit,
+    DecodedFrameSource, PlayoutDelay, SAMPLE_RATE, peak_normalized, rms_normalized, soft_limit,
 };
 
 #[derive(Default)]
@@ -275,13 +278,22 @@ impl MonoSampleQueue {
         })
     }
 
+    pub(crate) fn front_level(&self) -> Option<(f32, f32)> {
+        let frame = self.frames.front()?;
+        Some((frame.rms, frame.peak))
+    }
+
     pub(crate) fn front_playout_delay(&self, now: Instant) -> Option<PlayoutDelay> {
-        let timing = self.frames.front()?.timing?;
+        let frame = self.frames.front()?;
+        let timing = frame.timing?;
+        let elapsed = now.saturating_duration_since(timing.enqueued_at);
+        let played = Duration::from_secs_f64(frame.offset as f64 / SAMPLE_RATE as f64);
         Some(PlayoutDelay {
             current: timing
                 .delay
                 .current
-                .saturating_add(now.saturating_duration_since(timing.enqueued_at)),
+                .saturating_add(elapsed)
+                .saturating_sub(played),
             peak: timing.delay.peak,
         })
     }

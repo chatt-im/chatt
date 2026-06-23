@@ -1,7 +1,7 @@
 use crate::crypto::{self, AntiReplay, CryptoError, KeyMaterial};
 use crate::ids::{SessionId, StreamId};
 
-pub const UDP_VERSION: u8 = 2;
+pub const UDP_VERSION: u8 = 3;
 pub const UDP_HEADER_LEN: usize = 14;
 pub const SAFE_UDP_PAYLOAD_BYTES: usize = 1_200;
 pub const MAX_VOICE_PAYLOAD_BYTES: usize = 1_024;
@@ -15,6 +15,8 @@ pub const KIND_PEER_VOICE: u8 = 5;
 pub const KIND_NAT_PROBE: u8 = 6;
 pub const KIND_VOICE_FEEDBACK: u8 = 7;
 pub const KIND_PEER_VOICE_FEEDBACK: u8 = 8;
+const VOICE_PAYLOAD_OPUS: u8 = 0;
+const VOICE_PAYLOAD_SILENCE: u8 = 1;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct UdpHeader {
@@ -37,14 +39,14 @@ pub enum MediaPayload {
         stream_id: StreamId,
         sequence: u32,
         flags: u8,
-        opus: Vec<u8>,
+        payload: VoicePayload,
     },
     PeerVoice {
         connection_id: u64,
         stream_id: StreamId,
         sequence: u32,
         flags: u8,
-        opus: Vec<u8>,
+        payload: VoicePayload,
     },
     VoiceFeedback {
         stream_id: StreamId,
@@ -61,6 +63,21 @@ pub enum MediaPayload {
     Pong {
         nonce: u64,
     },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum VoicePayload {
+    Opus(Vec<u8>),
+    Silence,
+}
+
+impl VoicePayload {
+    pub fn len(&self) -> usize {
+        match self {
+            VoicePayload::Opus(opus) => opus.len(),
+            VoicePayload::Silence => 0,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -248,35 +265,25 @@ pub fn encode_payload(payload: &MediaPayload) -> Result<Vec<u8>, MediaError> {
             stream_id,
             sequence,
             flags,
-            opus,
+            payload,
         } => {
-            if opus.is_empty() || opus.len() > MAX_VOICE_PAYLOAD_BYTES {
-                return Err(MediaError::PayloadTooLarge);
-            }
             out.extend_from_slice(&stream_id.0.to_le_bytes());
             out.extend_from_slice(&sequence.to_le_bytes());
             out.push(*flags);
-            let len = u16::try_from(opus.len()).map_err(|_| MediaError::PayloadTooLarge)?;
-            out.extend_from_slice(&len.to_le_bytes());
-            out.extend_from_slice(opus);
+            encode_voice_payload(payload, &mut out)?;
         }
         MediaPayload::PeerVoice {
             connection_id,
             stream_id,
             sequence,
             flags,
-            opus,
+            payload,
         } => {
-            if opus.is_empty() || opus.len() > MAX_VOICE_PAYLOAD_BYTES {
-                return Err(MediaError::PayloadTooLarge);
-            }
             out.extend_from_slice(&connection_id.to_le_bytes());
             out.extend_from_slice(&stream_id.0.to_le_bytes());
             out.extend_from_slice(&sequence.to_le_bytes());
             out.push(*flags);
-            let len = u16::try_from(opus.len()).map_err(|_| MediaError::PayloadTooLarge)?;
-            out.extend_from_slice(&len.to_le_bytes());
-            out.extend_from_slice(opus);
+            encode_voice_payload(payload, &mut out)?;
         }
         MediaPayload::VoiceFeedback {
             stream_id,
@@ -327,41 +334,35 @@ pub fn decode_payload(kind: u8, bytes: &[u8]) -> Result<MediaPayload, MediaError
             })
         }
         KIND_VOICE => {
-            if bytes.len() < 11 {
+            if bytes.len() < 12 {
                 return Err(MediaError::InvalidPayload);
             }
             let stream_id = StreamId(u32::from_le_bytes(bytes[0..4].try_into().unwrap()));
             let sequence = u32::from_le_bytes(bytes[4..8].try_into().unwrap());
             let flags = bytes[8];
-            let len = u16::from_le_bytes(bytes[9..11].try_into().unwrap()) as usize;
-            if len == 0 || len > MAX_VOICE_PAYLOAD_BYTES || bytes.len() != 11 + len {
-                return Err(MediaError::InvalidPayload);
-            }
+            let payload = decode_voice_payload(&bytes[9..])?;
             Ok(MediaPayload::Voice {
                 stream_id,
                 sequence,
                 flags,
-                opus: bytes[11..].to_vec(),
+                payload,
             })
         }
         KIND_PEER_VOICE => {
-            if bytes.len() < 19 {
+            if bytes.len() < 20 {
                 return Err(MediaError::InvalidPayload);
             }
             let connection_id = u64::from_le_bytes(bytes[0..8].try_into().unwrap());
             let stream_id = StreamId(u32::from_le_bytes(bytes[8..12].try_into().unwrap()));
             let sequence = u32::from_le_bytes(bytes[12..16].try_into().unwrap());
             let flags = bytes[16];
-            let len = u16::from_le_bytes(bytes[17..19].try_into().unwrap()) as usize;
-            if len == 0 || len > MAX_VOICE_PAYLOAD_BYTES || bytes.len() != 19 + len {
-                return Err(MediaError::InvalidPayload);
-            }
+            let payload = decode_voice_payload(&bytes[17..])?;
             Ok(MediaPayload::PeerVoice {
                 connection_id,
                 stream_id,
                 sequence,
                 flags,
-                opus: bytes[19..].to_vec(),
+                payload,
             })
         }
         KIND_VOICE_FEEDBACK => {
@@ -410,6 +411,47 @@ fn encode_voice_feedback(feedback: VoiceFeedback, out: &mut Vec<u8>) {
     out.extend_from_slice(&feedback.max_interarrival_jitter_ms.to_le_bytes());
 }
 
+fn encode_voice_payload(payload: &VoicePayload, out: &mut Vec<u8>) -> Result<(), MediaError> {
+    match payload {
+        VoicePayload::Opus(opus) => {
+            if opus.is_empty() || opus.len() > MAX_VOICE_PAYLOAD_BYTES {
+                return Err(MediaError::PayloadTooLarge);
+            }
+            out.push(VOICE_PAYLOAD_OPUS);
+            let len = u16::try_from(opus.len()).map_err(|_| MediaError::PayloadTooLarge)?;
+            out.extend_from_slice(&len.to_le_bytes());
+            out.extend_from_slice(opus);
+        }
+        VoicePayload::Silence => {
+            out.push(VOICE_PAYLOAD_SILENCE);
+            out.extend_from_slice(&0u16.to_le_bytes());
+        }
+    }
+    Ok(())
+}
+
+fn decode_voice_payload(bytes: &[u8]) -> Result<VoicePayload, MediaError> {
+    if bytes.len() < 3 {
+        return Err(MediaError::InvalidPayload);
+    }
+    let len = u16::from_le_bytes(bytes[1..3].try_into().unwrap()) as usize;
+    match bytes[0] {
+        VOICE_PAYLOAD_OPUS => {
+            if len == 0 || len > MAX_VOICE_PAYLOAD_BYTES || bytes.len() != 3 + len {
+                return Err(MediaError::InvalidPayload);
+            }
+            Ok(VoicePayload::Opus(bytes[3..].to_vec()))
+        }
+        VOICE_PAYLOAD_SILENCE => {
+            if len != 0 || bytes.len() != 3 {
+                return Err(MediaError::InvalidPayload);
+            }
+            Ok(VoicePayload::Silence)
+        }
+        _ => Err(MediaError::InvalidPayload),
+    }
+}
+
 fn decode_voice_feedback(bytes: &[u8]) -> Result<VoiceFeedback, MediaError> {
     if bytes.len() != 20 {
         return Err(MediaError::InvalidPayload);
@@ -437,7 +479,7 @@ mod tests {
             stream_id: StreamId(9),
             sequence: 42,
             flags: 3,
-            opus: vec![1, 2, 3],
+            payload: VoicePayload::Opus(vec![1, 2, 3]),
         };
         let encoded = encode_payload(&payload).unwrap();
         assert_eq!(decode_payload(KIND_VOICE, &encoded).unwrap(), payload);
@@ -450,10 +492,22 @@ mod tests {
             stream_id: StreamId(9),
             sequence: 42,
             flags: 3,
-            opus: vec![1, 2, 3],
+            payload: VoicePayload::Opus(vec![1, 2, 3]),
         };
         let encoded = encode_payload(&payload).unwrap();
         assert_eq!(decode_payload(KIND_PEER_VOICE, &encoded).unwrap(), payload);
+    }
+
+    #[test]
+    fn silence_voice_payload_round_trips() {
+        let payload = MediaPayload::Voice {
+            stream_id: StreamId(9),
+            sequence: 42,
+            flags: 3,
+            payload: VoicePayload::Silence,
+        };
+        let encoded = encode_payload(&payload).unwrap();
+        assert_eq!(decode_payload(KIND_VOICE, &encoded).unwrap(), payload);
     }
 
     #[test]

@@ -5,8 +5,10 @@ use std::{
     time::{Duration, Instant},
 };
 
-pub(crate) const PROTOCOL_VERSION: u8 = 2;
-pub(crate) const AUDIO_HEADER_LEN: usize = 6;
+use crate::audio::{VoicePayload, VoicePayloadRef};
+
+pub(crate) const PROTOCOL_VERSION: u8 = 3;
+pub(crate) const AUDIO_HEADER_LEN: usize = 7;
 pub(crate) const FEEDBACK_PACKET_LEN: usize = 16;
 pub(crate) const SAFE_UDP_PAYLOAD_BYTES: usize = 1_200;
 pub(crate) const MAX_AUDIO_PAYLOAD_BYTES: usize = SAFE_UDP_PAYLOAD_BYTES - AUDIO_HEADER_LEN;
@@ -15,6 +17,8 @@ const VERSION_SHIFT: u8 = 4;
 const KIND_MASK: u8 = 0x0f;
 const KIND_AUDIO: u8 = 0;
 const KIND_FEEDBACK: u8 = 1;
+const AUDIO_PAYLOAD_OPUS: u8 = 0;
+const AUDIO_PAYLOAD_SILENCE: u8 = 1;
 const DEFAULT_MAX_BUFFERED_PACKETS: usize = 128;
 const DEFAULT_MAX_REORDER_DELAY: Duration = Duration::from_millis(60);
 const DEFAULT_MAX_LOSS_FILL_PACKETS: u32 = 50;
@@ -24,6 +28,7 @@ pub(crate) enum ProtocolError {
     DatagramTooShort,
     UnsupportedVersion(u8),
     UnknownPacketKind(u8),
+    InvalidPayload,
     EmptyAudioPayload,
     AudioPayloadTooLarge,
 }
@@ -36,6 +41,7 @@ impl fmt::Display for ProtocolError {
                 write!(f, "unsupported protocol version {version}")
             }
             ProtocolError::UnknownPacketKind(kind) => write!(f, "unknown packet kind {kind}"),
+            ProtocolError::InvalidPayload => f.write_str("invalid audio datagram payload"),
             ProtocolError::EmptyAudioPayload => f.write_str("audio datagram has no Opus payload"),
             ProtocolError::AudioPayloadTooLarge => {
                 f.write_str("audio payload exceeds safe UDP datagram budget")
@@ -50,7 +56,7 @@ impl std::error::Error for ProtocolError {}
 pub(crate) struct AudioPacketRef<'a> {
     pub sequence: u32,
     pub flags: u8,
-    pub payload: &'a [u8],
+    pub payload: VoicePayloadRef<'a>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -82,14 +88,16 @@ pub(crate) enum DatagramRef<'a> {
 pub(crate) fn encode_audio_datagram(
     sequence: u32,
     flags: u8,
-    payload: &[u8],
+    payload: VoicePayloadRef<'_>,
     out: &mut Vec<u8>,
 ) -> Result<(), ProtocolError> {
-    if payload.is_empty() {
-        return Err(ProtocolError::EmptyAudioPayload);
-    }
-    if payload.len() > MAX_AUDIO_PAYLOAD_BYTES {
-        return Err(ProtocolError::AudioPayloadTooLarge);
+    if let VoicePayloadRef::Opus(opus) = payload {
+        if opus.is_empty() {
+            return Err(ProtocolError::EmptyAudioPayload);
+        }
+        if opus.len() > MAX_AUDIO_PAYLOAD_BYTES {
+            return Err(ProtocolError::AudioPayloadTooLarge);
+        }
     }
 
     out.clear();
@@ -97,7 +105,15 @@ pub(crate) fn encode_audio_datagram(
     out.push(packet_tag(KIND_AUDIO));
     out.push(flags);
     out.extend_from_slice(&sequence.to_le_bytes());
-    out.extend_from_slice(payload);
+    match payload {
+        VoicePayloadRef::Opus(opus) => {
+            out.push(AUDIO_PAYLOAD_OPUS);
+            out.extend_from_slice(opus);
+        }
+        VoicePayloadRef::Silence => {
+            out.push(AUDIO_PAYLOAD_SILENCE);
+        }
+    }
     Ok(())
 }
 
@@ -135,10 +151,22 @@ fn parse_audio_datagram(bytes: &[u8]) -> Result<AudioPacketRef<'_>, ProtocolErro
     if bytes.len() < AUDIO_HEADER_LEN {
         return Err(ProtocolError::DatagramTooShort);
     }
-    let payload = &bytes[AUDIO_HEADER_LEN..];
-    if payload.is_empty() {
-        return Err(ProtocolError::EmptyAudioPayload);
-    }
+    let payload = match bytes[6] {
+        AUDIO_PAYLOAD_OPUS => {
+            let payload = &bytes[AUDIO_HEADER_LEN..];
+            if payload.is_empty() {
+                return Err(ProtocolError::EmptyAudioPayload);
+            }
+            VoicePayloadRef::Opus(payload)
+        }
+        AUDIO_PAYLOAD_SILENCE => {
+            if bytes.len() != AUDIO_HEADER_LEN {
+                return Err(ProtocolError::InvalidPayload);
+            }
+            VoicePayloadRef::Silence
+        }
+        _ => return Err(ProtocolError::InvalidPayload),
+    };
 
     Ok(AudioPacketRef {
         sequence: u32::from_le_bytes(bytes[2..6].try_into().unwrap()),
@@ -196,7 +224,7 @@ pub(crate) enum PlayoutItem {
     Audio {
         sequence: u32,
         flags: u8,
-        payload: Vec<u8>,
+        payload: VoicePayload,
     },
     Missing {
         sequence: u32,
@@ -221,7 +249,7 @@ impl PlayoutItem {
 struct BufferedAudioPacket {
     sequence: u32,
     flags: u8,
-    payload: Vec<u8>,
+    payload: VoicePayload,
 }
 
 #[derive(Clone, Debug)]
@@ -266,7 +294,7 @@ impl JitterBuffer {
         self.buffered.push(BufferedAudioPacket {
             sequence: packet.sequence,
             flags: packet.flags,
-            payload: packet.payload.to_vec(),
+            payload: packet.payload.to_owned(),
         });
         InsertOutcome::Accepted
     }
@@ -330,6 +358,36 @@ impl JitterBuffer {
         }
 
         ready
+    }
+
+    pub(crate) fn consume_silence_sequence(&mut self, sequence: u32) {
+        let Some(next_sequence) = self.next_sequence else {
+            return;
+        };
+        if sequence_distance(next_sequence, sequence).is_none() {
+            return;
+        }
+        self.buffered
+            .retain(|packet| sequence_distance(packet.sequence, sequence).is_none());
+        self.next_sequence = Some(sequence.wrapping_add(1));
+        self.missing_since = None;
+    }
+
+    pub(crate) fn skip_to_sequence(&mut self, sequence: u32) {
+        let Some(next_sequence) = self.next_sequence else {
+            return;
+        };
+        let Some(distance) = sequence_distance(next_sequence, sequence) else {
+            return;
+        };
+        if distance == 0 {
+            return;
+        }
+        let previous = sequence.wrapping_sub(1);
+        self.buffered
+            .retain(|packet| sequence_distance(packet.sequence, previous).is_none());
+        self.next_sequence = Some(sequence);
+        self.missing_since = None;
     }
 
     fn initialize_next_sequence(&mut self) {
@@ -721,7 +779,7 @@ mod tests {
         AudioPacketRef {
             sequence,
             flags,
-            payload,
+            payload: VoicePayloadRef::Opus(payload),
         }
     }
 
@@ -739,7 +797,13 @@ mod tests {
     #[test]
     fn audio_datagram_round_trips() {
         let mut bytes = Vec::new();
-        encode_audio_datagram(0x1122_3344, 0b1010_0001, &[1, 2, 3], &mut bytes).unwrap();
+        encode_audio_datagram(
+            0x1122_3344,
+            0b1010_0001,
+            VoicePayloadRef::Opus(&[1, 2, 3]),
+            &mut bytes,
+        )
+        .unwrap();
 
         assert_eq!(bytes.len(), AUDIO_HEADER_LEN + 3);
         assert_eq!(bytes[0], packet_tag(KIND_AUDIO));
@@ -751,8 +815,24 @@ mod tests {
             DatagramRef::Audio(AudioPacketRef {
                 sequence: 0x1122_3344,
                 flags: 0b1010_0001,
-                payload: &[1, 2, 3],
+                payload: VoicePayloadRef::Opus(&[1, 2, 3]),
             })
+        );
+    }
+
+    #[test]
+    fn silence_audio_datagram_round_trips() {
+        let mut bytes = Vec::new();
+        encode_audio_datagram(7, 0b10, VoicePayloadRef::Silence, &mut bytes).unwrap();
+
+        assert_eq!(bytes.len(), AUDIO_HEADER_LEN);
+        assert_eq!(
+            parse_datagram(&bytes),
+            Ok(DatagramRef::Audio(AudioPacketRef {
+                sequence: 7,
+                flags: 0b10,
+                payload: VoicePayloadRef::Silence,
+            }))
         );
     }
 
@@ -760,11 +840,16 @@ mod tests {
     fn rejects_invalid_datagrams() {
         let mut bytes = Vec::new();
         assert_eq!(
-            encode_audio_datagram(0, 0, &[], &mut bytes),
+            encode_audio_datagram(0, 0, VoicePayloadRef::Opus(&[]), &mut bytes),
             Err(ProtocolError::EmptyAudioPayload)
         );
         assert_eq!(
-            encode_audio_datagram(0, 0, &vec![0; MAX_AUDIO_PAYLOAD_BYTES + 1], &mut bytes),
+            encode_audio_datagram(
+                0,
+                0,
+                VoicePayloadRef::Opus(&vec![0; MAX_AUDIO_PAYLOAD_BYTES + 1]),
+                &mut bytes
+            ),
             Err(ProtocolError::AudioPayloadTooLarge)
         );
         assert_eq!(parse_datagram(&[0]), Err(ProtocolError::DatagramTooShort));
@@ -810,7 +895,7 @@ mod tests {
             vec![PlayoutItem::Audio {
                 sequence: 0,
                 flags: 0,
-                payload: vec![0],
+                payload: VoicePayload::Opus(vec![0]),
             }]
         );
 
@@ -828,12 +913,12 @@ mod tests {
                 PlayoutItem::Audio {
                     sequence: 1,
                     flags: 0,
-                    payload: vec![1],
+                    payload: VoicePayload::Opus(vec![1]),
                 },
                 PlayoutItem::Audio {
                     sequence: 2,
                     flags: 0,
-                    payload: vec![2],
+                    payload: VoicePayload::Opus(vec![2]),
                 },
             ]
         );
@@ -853,7 +938,7 @@ mod tests {
             vec![PlayoutItem::Audio {
                 sequence: 7,
                 flags: 0b1010_0001,
-                payload: vec![7],
+                payload: VoicePayload::Opus(vec![7]),
             }]
         );
     }
@@ -883,9 +968,51 @@ mod tests {
                 PlayoutItem::Audio {
                     sequence: 3,
                     flags: 0,
-                    payload: vec![3],
+                    payload: VoicePayload::Opus(vec![3]),
                 },
             ]
+        );
+    }
+
+    #[test]
+    fn jitter_buffer_consumes_silence_sequence_without_loss() {
+        let start = Instant::now();
+        let mut jitter = JitterBuffer::new(JitterBufferConfig::default());
+
+        assert_eq!(jitter.insert(packet(0, &[0])), InsertOutcome::Accepted);
+        assert_eq!(jitter.drain_ready(start).len(), 1);
+
+        jitter.consume_silence_sequence(1);
+        assert_eq!(jitter.insert(packet(2, &[2])), InsertOutcome::Accepted);
+
+        assert_eq!(
+            jitter.drain_ready(start),
+            vec![PlayoutItem::Audio {
+                sequence: 2,
+                flags: 0,
+                payload: VoicePayload::Opus(vec![2]),
+            }]
+        );
+    }
+
+    #[test]
+    fn jitter_buffer_skips_lost_silence_sequences_before_resume() {
+        let start = Instant::now();
+        let mut jitter = JitterBuffer::new(JitterBufferConfig::default());
+
+        assert_eq!(jitter.insert(packet(0, &[0])), InsertOutcome::Accepted);
+        assert_eq!(jitter.drain_ready(start).len(), 1);
+
+        jitter.skip_to_sequence(4);
+        assert_eq!(jitter.insert(packet(4, &[4])), InsertOutcome::Accepted);
+
+        assert_eq!(
+            jitter.drain_ready(start),
+            vec![PlayoutItem::Audio {
+                sequence: 4,
+                flags: 0,
+                payload: VoicePayload::Opus(vec![4]),
+            }]
         );
     }
 
@@ -929,7 +1056,7 @@ mod tests {
                 PlayoutItem::Audio {
                     sequence: 20,
                     flags: 0,
-                    payload: vec![20],
+                    payload: VoicePayload::Opus(vec![20]),
                 },
             ]
         );
@@ -943,7 +1070,7 @@ mod tests {
         telemetry.observe_playout(&PlayoutItem::Audio {
             sequence: 5,
             flags: 0,
-            payload: vec![0],
+            payload: VoicePayload::Opus(vec![0]),
         });
         telemetry.observe_playout(&PlayoutItem::Missing { sequence: 6 });
         telemetry.observe_playout(&PlayoutItem::FastForward {
@@ -1052,7 +1179,13 @@ mod tests {
         let mut datagram = Vec::new();
 
         for sequence in 0..80 {
-            encode_audio_datagram(sequence, 0, &[sequence as u8], &mut datagram).unwrap();
+            encode_audio_datagram(
+                sequence,
+                0,
+                VoicePayloadRef::Opus(&[sequence as u8]),
+                &mut datagram,
+            )
+            .unwrap();
             simulator.send_datagram(
                 &datagram,
                 start + Duration::from_millis(u64::from(sequence) * 20),
@@ -1102,7 +1235,13 @@ mod tests {
 
         for sequence in 0..100 {
             let now = start + Duration::from_millis(u64::from(sequence) * 20);
-            encode_audio_datagram(sequence, 0, &[sequence as u8], &mut datagram).unwrap();
+            encode_audio_datagram(
+                sequence,
+                0,
+                VoicePayloadRef::Opus(&[sequence as u8]),
+                &mut datagram,
+            )
+            .unwrap();
             simulator.send_datagram(&datagram, now);
 
             for delivered in simulator.receive_datagrams(now) {

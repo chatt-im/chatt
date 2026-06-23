@@ -1,4 +1,5 @@
 use std::{
+    cell::Cell,
     sync::{
         Arc, Mutex,
         mpsc::{Receiver, RecvTimeoutError, Sender},
@@ -15,9 +16,10 @@ use crate::{
         playback::{LiveJitterStream, LivePlaybackFeedbackState, LivePlaybackMixer},
         shared::{
             DecodedFrameSource, LIVE_OPUS_FRAME_SAMPLES, LIVE_PACKET_FLAG_OPUS_RESET,
-            LIVE_PLAYBACK_DRAIN_INTERVAL, LIVE_PLAYBACK_DRED_MAX_SAMPLES, LiveAudioTraceWriter,
-            LiveAudioTuning, LivePlaybackFeedback, MAX_OPUS_DECODE_SAMPLES, PlayoutDelay,
-            RemoteVoicePacket, sequence_distance_forward, trace_decode_output, trace_decoder_reset,
+            LIVE_PACKET_FLAG_SILENCE_RESUME, LIVE_PLAYBACK_DRAIN_INTERVAL,
+            LIVE_PLAYBACK_DRED_MAX_SAMPLES, LiveAudioTraceWriter, LiveAudioTuning,
+            LivePlaybackFeedback, MAX_OPUS_DECODE_SAMPLES, PlayoutDelay, RemoteVoicePacket,
+            VoicePayload, sequence_distance_forward, trace_decode_output, trace_decoder_reset,
             trace_dred_parse, trace_dred_skip, trace_fast_forward, trace_jitter_item,
             trace_mixer_queue,
         },
@@ -107,10 +109,14 @@ impl LiveDecodeStreams {
                 }
             },
         };
+        if packet.payload.is_silence() {
+            stream.observe_sender_silence(packet.sequence, now);
+            return Some(InsertOutcome::Accepted);
+        }
         let packet_ref = AudioPacketRef {
             sequence: packet.sequence,
             flags: packet.flags,
-            payload: &packet.payload,
+            payload: packet.payload.as_ref(),
         };
         Some(stream.insert(packet_ref, now))
     }
@@ -139,6 +145,7 @@ impl LiveDecodeStreams {
     ) {
         for (stream_id, stream) in &mut self.streams {
             let mut max_stream_queue_ms = 0;
+            let sender_silence_queue_ms = Cell::new(None);
             let recommended_target = stream.feedback.recommended_target(&stream.tuning);
             stream.drain_ready(
                 now,
@@ -146,6 +153,7 @@ impl LiveDecodeStreams {
                 *stream_id,
                 trace,
                 |trace, samples, source, playout_delay| {
+                    sender_silence_queue_ms.set(None);
                     if let Ok(mut mixer) = mixer.lock() {
                         mixer.queue_stream_samples_with_delay(
                             *stream_id,
@@ -173,8 +181,18 @@ impl LiveDecodeStreams {
                         mixer.note_stream_discontinuity(*stream_id, now);
                     }
                 },
+                || {
+                    if let Ok(mut mixer) = mixer.lock() {
+                        mixer.note_stream_sender_silence(*stream_id, now);
+                        sender_silence_queue_ms.set(Some(mixer.stream_queue_ms(*stream_id)));
+                    }
+                },
             );
-            stream.flush_feedback(*stream_id, now, max_stream_queue_ms, feedback_sender);
+            if let Some(queue_ms) = sender_silence_queue_ms.get() {
+                stream.flush_sender_silence_feedback(*stream_id, now, queue_ms, feedback_sender);
+            } else {
+                stream.flush_feedback(*stream_id, now, max_stream_queue_ms, feedback_sender);
+            }
         }
         if let Ok(mut mixer) = mixer.lock() {
             mixer.log_playback_diagnostics_if_due(now);
@@ -205,6 +223,7 @@ pub(crate) struct LiveDecodeStream {
     tuning: LiveAudioTuning,
     feedback: LivePlaybackFeedbackState,
     output_frame: Vec<f32>,
+    sender_silence_pending: bool,
 }
 
 impl LiveDecodeStream {
@@ -219,14 +238,27 @@ impl LiveDecodeStream {
             tuning,
             feedback: LivePlaybackFeedbackState::default(),
             output_frame: vec![0.0; MAX_OPUS_DECODE_SAMPLES],
+            sender_silence_pending: false,
         })
     }
 
     pub(crate) fn insert(&mut self, packet: AudioPacketRef<'_>, now: Instant) -> InsertOutcome {
+        if packet.flags & LIVE_PACKET_FLAG_OPUS_RESET != 0
+            && packet.flags & LIVE_PACKET_FLAG_SILENCE_RESUME != 0
+        {
+            self.jitter.skip_silence_gap_to(packet.sequence);
+        }
         let outcome = self.jitter.insert(packet, now);
         self.feedback
             .observe_insert(packet.sequence, packet.flags, &outcome, now);
         outcome
+    }
+
+    pub(crate) fn observe_sender_silence(&mut self, sequence: u32, now: Instant) {
+        self.jitter.observe_sender_silence(sequence);
+        self.feedback.observe_sender_silence(sequence, now);
+        self.sender_silence_pending = true;
+        self.dred_gap = None;
     }
 
     pub(crate) fn drain_ready<F>(
@@ -237,6 +269,7 @@ impl LiveDecodeStream {
         trace: &mut Option<LiveAudioTraceWriter>,
         mut on_samples: F,
         mut on_discontinuity: impl FnMut(),
+        mut on_sender_silence: impl FnMut(),
     ) where
         F: FnMut(
             &mut Option<LiveAudioTraceWriter>,
@@ -245,6 +278,11 @@ impl LiveDecodeStream {
             Option<PlayoutDelay>,
         ),
     {
+        if self.sender_silence_pending {
+            self.sender_silence_pending = false;
+            on_sender_silence();
+        }
+
         let items = self.jitter.drain_ready(now);
         for item in &items {
             self.feedback.observe_playout(item, now);
@@ -257,6 +295,9 @@ impl LiveDecodeStream {
                     payload,
                     ..
                 } => {
+                    let VoicePayload::Opus(payload) = payload else {
+                        continue;
+                    };
                     trace_jitter_item(
                         trace,
                         trace_start,
@@ -269,7 +310,9 @@ impl LiveDecodeStream {
                     let playout_delay = self.feedback.playout_delay(*sequence, now);
                     if flags & LIVE_PACKET_FLAG_OPUS_RESET != 0 {
                         self.reset_decoder_state();
-                        on_discontinuity();
+                        if flags & LIVE_PACKET_FLAG_SILENCE_RESUME == 0 {
+                            on_discontinuity();
+                        }
                         trace_decoder_reset(trace, trace_start, now, stream_id, *sequence);
                     }
                     self.decode_playout(
@@ -447,6 +490,7 @@ impl LiveDecodeStream {
                 flags,
                 payload,
             } = item
+                && let VoicePayload::Opus(payload) = payload
             {
                 bounding = Some((*sequence, *flags, payload.as_slice()));
                 break;
@@ -674,19 +718,38 @@ impl LiveDecodeStream {
             let _ = sender.send(feedback);
         }
     }
+
+    fn flush_sender_silence_feedback(
+        &mut self,
+        stream_id: u32,
+        now: Instant,
+        queue_ms: u64,
+        feedback_sender: Option<&Sender<LivePlaybackFeedback>>,
+    ) {
+        let feedback = self.feedback.take_sender_silence(stream_id, now, queue_ms);
+        if let Some(sender) = feedback_sender {
+            let _ = sender.send(feedback);
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Duration;
+    use std::{
+        sync::{Arc, Mutex},
+        time::Duration,
+    };
 
     #[allow(unused_imports)]
     use crate::audio::test_support::*;
     use crate::{
         audio::{
             capture::OpusVoiceEncoder,
-            shared::{LIVE_PLAYBACK_INITIAL_BUFFER, LIVE_PLAYBACK_MAX_REORDER_DELAY, SAMPLE_RATE},
+            shared::{
+                LIVE_PACKET_FLAG_SILENCE_HINT, LIVE_PLAYBACK_INITIAL_BUFFER,
+                LIVE_PLAYBACK_MAX_REORDER_DELAY, SAMPLE_RATE, duration_to_ms, samples_for_duration,
+            },
         },
         network::EncoderNetworkProfile,
     };
@@ -780,6 +843,7 @@ mod tests {
                 decoded.extend_from_slice(samples);
             },
             || {},
+            || {},
         );
         assert_eq!(decoded.len(), LIVE_OPUS_FRAME_SAMPLES);
 
@@ -797,6 +861,7 @@ mod tests {
                 decoded.extend_from_slice(samples);
             },
             || {},
+            || {},
         );
         assert!(decoded.is_empty());
 
@@ -809,8 +874,52 @@ mod tests {
                 decoded.extend_from_slice(samples);
             },
             || {},
+            || {},
         );
         assert_eq!(decoded.len(), LIVE_OPUS_FRAME_SAMPLES * 2);
+    }
+
+    #[test]
+    fn silence_marker_flushes_feedback_with_trimmed_queue() {
+        let now = Instant::now();
+        let tuning = test_tuning();
+        let mut streams = LiveDecodeStreams::new(tuning);
+        let mixer = Arc::new(Mutex::new(LivePlaybackMixer::with_tuning(tuning)));
+        let (feedback_sender, feedback_receiver) = std::sync::mpsc::channel();
+
+        {
+            let mut mixer = mixer.lock().unwrap();
+            mixer.queue_stream_samples(
+                7,
+                &vec![0.001; samples_for_duration(Duration::from_millis(240))],
+                DecodedFrameSource::Normal,
+                now,
+            );
+        }
+        streams.insert_packet(
+            RemoteVoicePacket {
+                stream_id: 7,
+                sequence: 12,
+                flags: LIVE_PACKET_FLAG_SILENCE_HINT,
+                payload: VoicePayload::Silence,
+                received_at: now,
+            },
+            now,
+        );
+
+        streams.drain_into_mixer(&mixer, now, Some(&feedback_sender));
+
+        let feedback = feedback_receiver.try_recv().unwrap();
+        assert_eq!(feedback.stream_id, 7);
+        assert_eq!(feedback.expected_packets, 0);
+        assert_eq!(
+            u64::from(feedback.max_queue_ms),
+            duration_to_ms(tuning.target_queue)
+        );
+        assert_eq!(
+            mixer.lock().unwrap().stream_queue_ms(7),
+            duration_to_ms(tuning.target_queue)
+        );
     }
 
     #[test]
@@ -831,7 +940,7 @@ mod tests {
                 stream_id: 1,
                 sequence,
                 flags: 0,
-                payload: vec![0u8; 8],
+                payload: VoicePayload::Opus(vec![0u8; 8]),
                 received_at,
             };
             // Note: all processed at the same `received_at`-driven path; the
@@ -851,8 +960,6 @@ mod tests {
 
     #[test]
     fn silence_gate_resume_does_not_inflate_jitter() {
-        // The sender's silence gate suppresses frames without advancing the
-        // sequence, so a multi-second pause arrives as one packet seconds late.
         // The resume packet carries LIVE_PACKET_FLAG_OPUS_RESET, the sender's
         // explicit discontinuity signal; the estimator re-anchors on it rather
         // than charging the pause as jitter (which would pin the target at the
