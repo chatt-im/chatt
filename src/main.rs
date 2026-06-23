@@ -883,8 +883,6 @@ impl App {
                 self.input_devices = devices;
             }
             Err(error) => {
-                self.input_devices.clear();
-                self.settings.input_device_id = None;
                 self.mic_error = Some(error.clone());
                 errors.push(format!("input devices: {error}"));
             }
@@ -896,13 +894,19 @@ impl App {
                 self.output_devices = devices;
             }
             Err(error) => {
-                self.output_devices.clear();
-                self.settings.output_device_id = None;
                 errors.push(format!("output devices: {error}"));
             }
         }
 
         self.rebuild_audio_device_pickers();
+        kvlog::info!(
+            "audio device refresh completed",
+            id = refresh.id,
+            input_count = input_count.unwrap_or(self.input_devices.len()),
+            output_count = output_count.unwrap_or(self.output_devices.len()),
+            input_ok = input_count.is_some(),
+            output_ok = output_count.is_some(),
+        );
 
         if self.mode == theme::UiMode::Settings {
             if errors.is_empty() {
@@ -1473,8 +1477,6 @@ impl App {
         self.settings_dirty = false;
         if self.allow_settings_preview_capture
             && (self.input_devices.is_empty() || self.output_devices.is_empty())
-            && self.capture.is_none()
-            && self.playback.is_none()
         {
             self.refresh_audio_devices();
         }
@@ -1927,16 +1929,20 @@ impl App {
         if restart_preview {
             self.stop_mic_capture();
         }
-        if self.capture.is_some() || self.playback.is_some() {
-            self.set_error("deafen before refreshing devices");
-            return;
-        }
 
         let id = self.next_audio_device_refresh_id;
         self.next_audio_device_refresh_id = self.next_audio_device_refresh_id.saturating_add(1);
         self.audio_device_refresh_in_flight = true;
         let buffer_request = self.settings.buffer_request();
         let tx = self.audio_device_refresh_tx.clone();
+        kvlog::info!(
+            "audio device refresh started",
+            id,
+            buffer_request = buffer_request.label(),
+            capture_active = self.capture.is_some(),
+            playback_active = self.playback.is_some(),
+            settings_preview_capture = self.settings_preview_capture,
+        );
         thread::spawn(move || {
             let input = audio::input_devices(buffer_request);
             let output = audio::output_devices(buffer_request);
@@ -4844,6 +4850,71 @@ mod tests {
             app.audio_output_items
                 .iter()
                 .any(|item| item.name == "USB Speakers")
+        );
+    }
+
+    #[test]
+    fn async_audio_refresh_error_keeps_cached_picker_devices() {
+        let mut app = test_app();
+        app.mode = theme::UiMode::Settings;
+        app.settings_focus = SettingsFocus::OutputDevice;
+        app.settings.input_device_id = Some("usb-mic".to_string());
+        app.settings.output_device_id = Some("usb-speakers".to_string());
+        app.input_devices = vec![DeviceInfo {
+            id: Some("usb-mic".to_string()),
+            name: "USB Microphone".to_string(),
+            supported: true,
+            preview: None,
+            issue: None,
+        }];
+        app.output_devices = vec![DeviceInfo {
+            id: Some("usb-speakers".to_string()),
+            name: "USB Speakers".to_string(),
+            supported: true,
+            preview: None,
+            issue: None,
+        }];
+        app.rebuild_audio_device_pickers();
+        app.activate_audio_output_picker();
+        assert!(app.audio_output_picker.open);
+        assert_eq!(
+            app.audio_output_picker.selector.current_item_index(),
+            Some(1)
+        );
+
+        app.audio_device_refresh_in_flight = true;
+        app.next_audio_device_refresh_id = 1;
+        app.handle_audio_device_refresh(AudioDeviceRefresh {
+            id: 0,
+            buffer_request: BufferRequest::Default,
+            restart_preview: false,
+            input: Err("input backend unavailable".to_string()),
+            output: Err("output backend unavailable".to_string()),
+        });
+
+        assert!(!app.audio_device_refresh_in_flight);
+        assert_eq!(app.status_kind, StatusKind::Error);
+        assert_eq!(app.settings.input_device_id.as_deref(), Some("usb-mic"));
+        assert_eq!(
+            app.settings.output_device_id.as_deref(),
+            Some("usb-speakers")
+        );
+        assert_eq!(app.input_devices.len(), 1);
+        assert_eq!(app.output_devices.len(), 1);
+        assert!(
+            app.audio_input_items
+                .iter()
+                .any(|item| item.name == "USB Microphone")
+        );
+        assert!(
+            app.audio_output_items
+                .iter()
+                .any(|item| item.name == "USB Speakers")
+        );
+        assert!(app.audio_output_picker.open);
+        assert_eq!(
+            app.audio_output_picker.selector.current_item_index(),
+            Some(1)
         );
     }
 
