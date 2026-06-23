@@ -457,6 +457,9 @@ pub struct LivePlaybackSnapshot {
     pub silence_skip_rejected: u64,
     pub speech_gap_skip_count: u64,
     pub skipped_speech_gap_ms: u64,
+    pub backend_xruns: u64,
+    pub backend_stream_errors: u64,
+    pub last_backend_error: Option<String>,
 }
 
 impl PlaybackStats {
