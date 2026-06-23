@@ -1612,32 +1612,29 @@ fn set_hw_params_from_format(
     // buffer_size = 2x and period_size = x. This provides consistent low-latency
     // behavior across different ALSA implementations and hardware.
     if let BufferSize::Fixed(period_size) = config.buffer_size {
-        let period_size = period_size as alsa::pcm::Frames;
+        let mut period_size = period_size as alsa::pcm::Frames;
 
-        // Validate the requested size against the device's supported ranges using the same PCM
-        // handle we'll use for streaming. This avoids a second PCM open (which can disturb
-        // hardware clock state on some drivers) while still catching wildly out-of-range
-        // requests before set_period_size_near silently rounds them.
+        // Clamp the request into the device's supported period range rather than failing.
+        // ALSA hardware advertises a discrete period range (often power-of-two bound), so an
+        // exact request such as 960 frames can fall outside it on real cards. Hard-failing
+        // there leaves the caller with no audio at all; clamping plus the `_near` setters
+        // below negotiate the closest supported period, matching how long-standing ALSA
+        // clients (for example Mumble's snd_pcm_hw_params_set_period_size_near) configure low
+        // latency. The same PCM handle is reused to avoid a second open that can disturb
+        // hardware clock state on some drivers.
         if let Some((min_period, max_period)) = hw_params_period_size_min_max(&hw_params) {
-            if !(min_period..=max_period).contains(&period_size) {
-                return Err(Error::with_message(
-                    ErrorKind::UnsupportedConfig,
-                    format!("Buffer size {period_size} is not in the supported range {min_period}..={max_period}"),
-                ));
+            period_size = period_size.clamp(min_period, max_period);
+        }
+
+        // Keep the double-buffered ring within the device maximum by shrinking the period so
+        // that buffer = DEFAULT_PERIODS * period still fits.
+        if let Ok(max_buffer) = hw_params.get_buffer_size_max() {
+            if max_buffer > 0 && DEFAULT_PERIODS * period_size > max_buffer {
+                period_size = (max_buffer / DEFAULT_PERIODS).max(1);
             }
         }
 
         let buffer_size = DEFAULT_PERIODS * period_size;
-        if let Ok(max_buffer) = hw_params.get_buffer_size_max() {
-            if max_buffer > 0 && buffer_size > max_buffer {
-                let effective_max = max_buffer / DEFAULT_PERIODS;
-                return Err(Error::with_message(
-                    ErrorKind::UnsupportedConfig,
-                    format!("Buffer size {period_size} exceeds the maximum supported value of {effective_max}"),
-                ));
-            }
-        }
-
         hw_params.set_buffer_size_near(buffer_size)?;
         hw_params.set_period_size_near(period_size, alsa::ValueOr::Nearest)?;
     }

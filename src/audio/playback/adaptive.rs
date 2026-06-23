@@ -294,20 +294,25 @@ impl AdaptivePlaybackStream {
     fn begin_output_block(&mut self, _now: Instant, output_block_samples: usize) {
         let output_block_samples = output_block_samples.max(1);
         let queued = self.queued_samples();
-        // Avoid filling part of a hardware callback with audio and the rest
-        // with underrun silence when the device asks for a large block. Use the
-        // low-latency playout target here; the loss-expanded target is only an
-        // allowance, not a reason to hold the output device silent for a long
-        // rebuffer.
-        let target = self.low_latency_target_samples().max(output_block_samples);
-        self.output_target_floor_samples = output_block_samples;
+        // Gate playback on a floor no larger than the playout target. For a small
+        // hardware block this is the whole block, so a callback is filled with
+        // audio rather than part audio and part underrun silence. For an oversized
+        // block (a host-default ALSA/PipeWire period of hundreds of ms) the device
+        // buffer already imposes its own latency; requiring a whole block to be
+        // queued would add that latency again and emit a full block of silence on
+        // any dip, so the floor stays at the target and the block's tail underruns
+        // transiently instead. The loss-expanded target is only an allowance, not a
+        // reason to hold the device silent for a long rebuffer.
+        let block_floor = output_block_samples.min(self.samples.target_queue);
+        let target = self.low_latency_target_samples().max(block_floor);
+        self.output_target_floor_samples = block_floor;
         self.output_block_playable = if self.output_priming {
             let ready = queued >= target;
             if ready {
                 self.output_priming = false;
             }
             ready
-        } else if queued >= output_block_samples {
+        } else if queued >= block_floor {
             true
         } else {
             self.output_priming = true;
@@ -582,37 +587,40 @@ mod tests {
     }
 
     #[test]
-    fn adaptive_stream_does_not_drain_partial_hardware_blocks() {
+    fn adaptive_stream_plays_oversized_block_without_full_prefill() {
+        // A host-default ALSA/PipeWire period can be many times the playout target.
+        // Playback must start once the target is queued rather than waiting for a
+        // whole oversized block, which would re-impose the device-buffer latency and
+        // emit a full block of silence on every dip below it.
         let now = Instant::now();
         let mut stream = AdaptivePlaybackStream::new(test_tuning()).unwrap();
         let mut stats = LivePlaybackMixerStats::default();
-        let block = target_queue_samples(test_tuning()) + 1;
+        let target = target_queue_samples(test_tuning());
+        let block = target * 4;
 
+        // One target's worth of audio, far short of a full hardware block.
         stream.queue_samples(
-            &vec![0.25; block - 1],
+            &vec![0.25; target],
             DecodedFrameSource::Normal,
             false,
             now,
             &mut stats,
         );
 
+        // The block is playable at the target: the queued audio drains bit-exact and
+        // only the unbacked tail of the block underruns instead of the whole block.
+        let mut played = 0usize;
         for _ in 0..block {
-            assert_eq!(stream.pop_output_sample(now, &mut stats, block), None);
+            match stream.pop_output_sample(now, &mut stats, block) {
+                Some(sample) => {
+                    assert_eq!(sample, 0.25);
+                    played += 1;
+                }
+                None => break,
+            }
         }
-        assert_eq!(stream.queued_samples(), block - 1);
-
-        stream.queue_samples(&[0.25], DecodedFrameSource::Normal, false, now, &mut stats);
-
-        // Direct playback is bit-exact. The interpolator keeps up to three
-        // look-ahead samples it cannot bracket, so the block drains to that tail
-        // rather than fully to zero.
-        for index in 0..block - 3 {
-            assert_eq!(
-                stream.pop_output_sample(now, &mut stats, block),
-                Some(0.25),
-                "block sample {index}"
-            );
-        }
+        // The interpolator keeps up to three look-ahead samples it cannot bracket.
+        assert!(played >= target - 3, "played {played} of {target}");
         assert!(stream.queued_samples() <= 3);
     }
 

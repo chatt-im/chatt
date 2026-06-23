@@ -3,7 +3,7 @@ use std::{
     sync::{
         Arc, Mutex,
         atomic::{AtomicU32, Ordering},
-        mpsc::{Sender, SyncSender, sync_channel},
+        mpsc::{Receiver, Sender, SyncSender, sync_channel},
     },
     thread::{self, JoinHandle},
     time::{Duration, Instant},
@@ -23,8 +23,8 @@ use crate::{
             run_live_encoder_worker,
         },
         device::{
-            AudioCallbackBufferObserver, audio_buffer_size_label, build_input_stream,
-            build_live_output_stream, build_output_stream, select_input_config,
+            AudioCallbackBufferObserver, ConfigSelection, audio_buffer_size_label,
+            build_input_stream, build_live_output_stream, build_output_stream, select_input_config,
             select_input_device_by_id, select_output_config, select_output_device_by_id,
         },
         errors::format_file_error,
@@ -81,6 +81,10 @@ pub struct LiveCapture {
     stats: AudioStats,
     max_amplification_bits: Arc<AtomicU32>,
     encoder_loss_percent: Arc<AtomicU32>,
+    /// True when the configured fixed buffer was unsupported and the host-default
+    /// buffer was used instead. Surfaced so the UI can warn that the requested
+    /// low-latency buffer did not take effect.
+    buffer_fallback: bool,
 }
 
 pub struct Playback {
@@ -93,6 +97,9 @@ pub struct LivePlayback {
     worker: Option<JoinHandle<()>>,
     sender: Option<SyncSender<LivePlaybackCommand>>,
     mixer: Arc<Mutex<LivePlaybackMixer>>,
+    /// True when the configured fixed buffer was unsupported and the host-default
+    /// buffer was used instead. See [`LiveCapture::buffer_fallback`].
+    buffer_fallback: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -125,6 +132,12 @@ impl Playback {
 impl LiveCapture {
     pub fn stats(&self) -> AudioStats {
         self.stats.clone()
+    }
+
+    /// True when the configured fixed buffer was unsupported and capture fell back
+    /// to the host-default buffer.
+    pub fn buffer_fallback(&self) -> bool {
+        self.buffer_fallback
     }
 
     pub fn set_max_amplification(&self, max_amplification: f32) {
@@ -166,6 +179,12 @@ impl LivePlayback {
         self.sender.as_ref().map(|sender| LivePlaybackSink {
             sender: sender.clone(),
         })
+    }
+
+    /// True when the configured fixed buffer was unsupported and playback fell back
+    /// to the host-default buffer.
+    pub fn buffer_fallback(&self) -> bool {
+        self.buffer_fallback
     }
 
     pub fn push(&self, packet: RemoteVoicePacket) {
@@ -347,6 +366,52 @@ where
     })?;
 
     let device_name = device.to_string();
+    let mut encoder = OpusVoiceEncoder::new(config.bitrate_bps)?;
+    encoder.apply_live_encoder_profile(LiveEncoderProfile::DRED_20)?;
+    let stats = AudioStats::new();
+    let max_amplification_bits = Arc::new(AtomicU32::new(config.max_amplification.to_bits()));
+    let encoder_loss_percent = Arc::new(AtomicU32::new(
+        LiveEncoderProfile::DRED_20.packet_loss_percent as u32,
+    ));
+
+    // Build the input stream, falling back to the host-default buffer if the configured
+    // fixed buffer is unsupported on this device. The channel and worker are created only
+    // after a stream builds so a fallback attempt uses a fresh channel. Audio must never
+    // die because a buffer preference was rejected.
+    let observer = Arc::new(AudioCallbackBufferObserver::new("live_capture"));
+    let build = |selection: &ConfigSelection| -> Result<(Stream, Receiver<Vec<f32>>), String> {
+        let (sender, receiver) = sync_channel(CALLBACK_QUEUE_CAPACITY);
+        let stream = with_audio_backend_stderr_suppressed(|| {
+            build_input_stream(
+                &device,
+                selection.supported_config.sample_format(),
+                selection.stream_config.clone(),
+                usize::from(selection.supported_config.channels()),
+                sender,
+                stats.clone(),
+                Some(Arc::clone(&observer)),
+            )
+        })?;
+        Ok((stream, receiver))
+    };
+    let (stream, receiver, selection, buffer_fallback) = match build(&selection) {
+        Ok((stream, receiver)) => (stream, receiver, selection, false),
+        Err(error) if !matches!(config.buffer_request, BufferRequest::Default) => {
+            kvlog::warn!(
+                "live capture buffer fallback",
+                device = device_name.as_str(),
+                requested = audio_buffer_size_label(selection.preview.buffer_size).as_str(),
+                error = error.as_str()
+            );
+            let fallback = with_audio_backend_stderr_suppressed(|| {
+                select_input_config(&device, BufferRequest::Default)
+            })?;
+            let (stream, receiver) = build(&fallback)?;
+            (stream, receiver, fallback, true)
+        }
+        Err(error) => return Err(error),
+    };
+
     kvlog::info!(
         "live capture selected",
         device = device_name.as_str(),
@@ -354,6 +419,7 @@ where
         sample_rate = selection.stream_config.sample_rate,
         buffer_size = audio_buffer_size_label(selection.preview.buffer_size).as_str(),
         buffer_note = selection.preview.buffer_note.as_str(),
+        buffer_fallback = buffer_fallback,
         bitrate_bps = config.bitrate_bps,
         denoise = config.denoise,
         max_amplification = config.max_amplification,
@@ -362,14 +428,7 @@ where
             .as_ref()
             .is_some_and(|control| control.enabled())
     );
-    let mut encoder = OpusVoiceEncoder::new(config.bitrate_bps)?;
-    encoder.apply_live_encoder_profile(LiveEncoderProfile::DRED_20)?;
-    let stats = AudioStats::new();
-    let max_amplification_bits = Arc::new(AtomicU32::new(config.max_amplification.to_bits()));
-    let encoder_loss_percent = Arc::new(AtomicU32::new(
-        LiveEncoderProfile::DRED_20.packet_loss_percent as u32,
-    ));
-    let (sender, receiver) = sync_channel(CALLBACK_QUEUE_CAPACITY);
+
     let worker_stats = stats.clone();
     let worker_max_amplification = Arc::clone(&max_amplification_bits);
     let worker_encoder_loss_percent = Arc::clone(&encoder_loss_percent);
@@ -391,18 +450,6 @@ where
         );
     });
 
-    let stream = with_audio_backend_stderr_suppressed(|| {
-        let callback_buffer_observer = Arc::new(AudioCallbackBufferObserver::new("live_capture"));
-        build_input_stream(
-            &device,
-            selection.supported_config.sample_format(),
-            selection.stream_config,
-            usize::from(selection.supported_config.channels()),
-            sender,
-            stats.clone(),
-            Some(callback_buffer_observer),
-        )
-    })?;
     with_audio_backend_stderr_suppressed(|| stream.play())
         .map_err(|error| format!("failed to start live input stream: {error}"))?;
 
@@ -413,6 +460,7 @@ where
         stats,
         max_amplification_bits,
         encoder_loss_percent,
+        buffer_fallback,
     })
 }
 
@@ -466,27 +514,53 @@ pub fn start_live_playback(config: LivePlaybackConfig) -> Result<LivePlayback, S
     })?;
 
     let device_name = device.to_string();
+    let mixer = Arc::new(Mutex::new(LivePlaybackMixer::with_tuning(config.tuning)));
+
+    // Build the output stream, falling back to the host-default buffer if the configured
+    // fixed buffer is unsupported on this device, so playback never fails to start over a
+    // buffer preference.
+    let echo_control = config.echo_control.clone();
+    let observer = Arc::new(AudioCallbackBufferObserver::new("live_playback"));
+    let build = |selection: &ConfigSelection| -> Result<Stream, String> {
+        with_audio_backend_stderr_suppressed(|| {
+            build_live_output_stream(
+                &device,
+                selection.supported_config.sample_format(),
+                selection.stream_config.clone(),
+                usize::from(selection.supported_config.channels()),
+                Arc::clone(&mixer),
+                echo_control.clone(),
+                Some(Arc::clone(&observer)),
+            )
+        })
+    };
+    let (stream, selection, buffer_fallback) = match build(&selection) {
+        Ok(stream) => (stream, selection, false),
+        Err(error) if !matches!(config.buffer_request, BufferRequest::Default) => {
+            kvlog::warn!(
+                "live playback buffer fallback",
+                device = device_name.as_str(),
+                requested = audio_buffer_size_label(selection.preview.buffer_size).as_str(),
+                error = error.as_str()
+            );
+            let fallback = with_audio_backend_stderr_suppressed(|| {
+                select_output_config(&device, BufferRequest::Default)
+            })?;
+            let stream = build(&fallback)?;
+            (stream, fallback, true)
+        }
+        Err(error) => return Err(error),
+    };
+
     kvlog::info!(
         "live playback selected",
         device = device_name.as_str(),
         channels = selection.stream_config.channels,
         sample_rate = selection.stream_config.sample_rate,
         buffer_size = audio_buffer_size_label(selection.preview.buffer_size).as_str(),
-        buffer_note = selection.preview.buffer_note.as_str()
+        buffer_note = selection.preview.buffer_note.as_str(),
+        buffer_fallback = buffer_fallback
     );
-    let mixer = Arc::new(Mutex::new(LivePlaybackMixer::with_tuning(config.tuning)));
-    let stream = with_audio_backend_stderr_suppressed(|| {
-        let callback_buffer_observer = Arc::new(AudioCallbackBufferObserver::new("live_playback"));
-        build_live_output_stream(
-            &device,
-            selection.supported_config.sample_format(),
-            selection.stream_config,
-            usize::from(selection.supported_config.channels()),
-            Arc::clone(&mixer),
-            config.echo_control.clone(),
-            Some(callback_buffer_observer),
-        )
-    })?;
     with_audio_backend_stderr_suppressed(|| stream.play())
         .map_err(|error| format!("failed to start live output stream: {error}"))?;
 
@@ -503,6 +577,7 @@ pub fn start_live_playback(config: LivePlaybackConfig) -> Result<LivePlayback, S
         worker: Some(worker),
         sender: Some(sender),
         mixer,
+        buffer_fallback,
     })
 }
 
