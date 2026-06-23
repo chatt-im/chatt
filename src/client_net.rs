@@ -5,7 +5,10 @@ use std::{
     io::{self, Read, Write},
     net::{SocketAddr, TcpStream as StdTcpStream, ToSocketAddrs},
     path::{Path, PathBuf},
-    sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, TryRecvError},
+    sync::{
+        Arc,
+        mpsc::{self, Receiver, RecvTimeoutError, SendError, Sender, TryRecvError},
+    },
     thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
@@ -18,7 +21,7 @@ use chatt_p2p::{
     stun::{StunMessage, is_stun_message},
 };
 use mio::{
-    Events, Interest, Poll, Token,
+    Events, Interest, Poll, Token, Waker,
     net::{TcpStream, UdpSocket},
 };
 use ring::rand::SecureRandom;
@@ -46,6 +49,7 @@ use crate::audio::{
 
 const TCP: Token = Token(0);
 const UDP: Token = Token(1);
+const WAKE: Token = Token(2);
 const POLL_TIMEOUT: Duration = Duration::from_millis(20);
 const INTERFACE_POLL_INTERVAL: Duration = Duration::from_secs(2);
 const MAX_QUEUED_FILE_BYTES: usize = 128 * 1024;
@@ -141,13 +145,45 @@ pub enum NetworkEvent {
     Disconnected,
 }
 
-pub struct NetworkClient {
+/// Sends a [`NetworkCommand`] to the worker and wakes its event loop.
+///
+/// The worker blocks in [`Poll::poll`] for up to [`POLL_TIMEOUT`] watching only
+/// its sockets, so a queued command would otherwise wait for the next socket
+/// event or the timeout. Waking after the channel send makes the worker drain
+/// outbound voice immediately, which keeps send pacing off the poll cadence.
+#[derive(Clone)]
+pub struct CommandSender {
     tx: Sender<NetworkCommand>,
+    waker: Arc<Waker>,
+}
+
+impl CommandSender {
+    /// Sends a command and wakes the worker's poll loop.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SendError`] if the worker has stopped and the channel is closed.
+    pub fn send(&self, command: NetworkCommand) -> Result<(), SendError<NetworkCommand>> {
+        self.tx.send(command)?;
+        let _ = self.waker.wake();
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(tx: Sender<NetworkCommand>) -> Self {
+        let poll = Poll::new().expect("create test poll");
+        let waker = Arc::new(Waker::new(poll.registry(), WAKE).expect("create test waker"));
+        Self { tx, waker }
+    }
+}
+
+pub struct NetworkClient {
+    tx: CommandSender,
     worker: Option<JoinHandle<()>>,
 }
 
 impl NetworkClient {
-    pub fn spawn(config: ClientConfig, events: Sender<NetworkEvent>) -> Self {
+    pub fn spawn(config: ClientConfig, events: Sender<NetworkEvent>) -> Result<Self, String> {
         kvlog::info!(
             "network client spawning",
             user = config.user.as_str(),
@@ -155,15 +191,22 @@ impl NetworkClient {
             udp_addr = %config.udp_addr,
             room_id = config.room_id.0
         );
+        let poll = Poll::new().map_err(|error| format!("failed to create poll: {error}"))?;
+        let waker = Waker::new(poll.registry(), WAKE)
+            .map_err(|error| format!("failed to create waker: {error}"))?;
         let (tx, rx) = mpsc::channel();
-        let worker = thread::spawn(move || run_worker(config, events, rx));
-        Self {
+        let tx = CommandSender {
+            tx,
+            waker: Arc::new(waker),
+        };
+        let worker = thread::spawn(move || run_worker(config, events, rx, poll));
+        Ok(Self {
             tx,
             worker: Some(worker),
-        }
+        })
     }
 
-    pub fn sender(&self) -> Sender<NetworkCommand> {
+    pub fn sender(&self) -> CommandSender {
         self.tx.clone()
     }
 
@@ -181,7 +224,10 @@ impl NetworkClient {
 
     #[cfg(test)]
     pub(crate) fn from_parts_for_test(tx: Sender<NetworkCommand>) -> Self {
-        Self { tx, worker: None }
+        Self {
+            tx: CommandSender::for_test(tx),
+            worker: None,
+        }
     }
 
     fn stop_inner(&mut self) {
@@ -217,6 +263,7 @@ fn run_worker(
     config: ClientConfig,
     events: Sender<NetworkEvent>,
     commands: Receiver<NetworkCommand>,
+    mut poll: Poll,
 ) {
     kvlog::info!(
         "network worker starting",
@@ -227,7 +274,7 @@ fn run_worker(
     );
     let mut reconnect = ReconnectSchedule::new();
     loop {
-        match run_worker_inner(&config, &events, &commands) {
+        match run_worker_inner(&config, &events, &commands, &mut poll) {
             SessionEnd::Shutdown => break,
             SessionEnd::ConnectFailed(reason) => {
                 kvlog::warn!(
@@ -259,6 +306,7 @@ fn run_worker_inner(
     config: &ClientConfig,
     events: &Sender<NetworkEvent>,
     commands: &Receiver<NetworkCommand>,
+    poll: &mut Poll,
 ) -> SessionEnd {
     let (std_tcp, control, secrets) = match connect_and_handshake(config) {
         Ok(value) => value,
@@ -349,10 +397,9 @@ fn run_worker_inner(
         auth_failure: None,
     };
 
-    let mut poll = match Poll::new() {
-        Ok(poll) => poll,
-        Err(error) => return SessionEnd::ConnectFailed(format!("failed to create poll: {error}")),
-    };
+    // The poll outlives each session so its waker survives reconnects. A prior
+    // session's sockets were dropped on return, closing their fds and clearing
+    // them from the poll, so re-registering the same tokens here is sound.
     if let Err(error) = poll.registry().register(
         &mut worker.tcp,
         TCP,
@@ -403,6 +450,7 @@ fn run_worker_inner(
                     }
                 }
                 UDP => worker.read_udp(),
+                WAKE => {}
                 _ => {}
             }
         }
@@ -426,7 +474,7 @@ fn run_worker_inner(
         let now = Instant::now();
         worker.poll_interfaces(now);
         if worker.udp_rebind_requested {
-            if let Err(error) = worker.rebind_udp_socket(&mut poll) {
+            if let Err(error) = worker.rebind_udp_socket(poll) {
                 return SessionEnd::Disconnected(error);
             }
         }

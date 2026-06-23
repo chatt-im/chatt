@@ -774,10 +774,16 @@ impl App {
             }
         };
         self.disconnect_network();
-        let network = NetworkClient::spawn(
+        let network = match NetworkClient::spawn(
             server.client_config(&self.config.files),
             self.event_tx.clone(),
-        );
+        ) {
+            Ok(network) => network,
+            Err(error) => {
+                self.set_error(format!("failed to start network: {error}"));
+                return;
+            }
+        };
         self.control_socket = match local_control::ControlSocket::spawn(network.sender()) {
             Ok(socket) => {
                 kvlog::info!(
