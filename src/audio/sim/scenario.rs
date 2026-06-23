@@ -123,6 +123,12 @@ pub struct LiveAudioSimulationConfig {
     pub scenario: LiveAudioSimulationScenario,
     pub tuning: LiveAudioTuning,
     pub duration: Duration,
+    /// Sender production rate relative to the playback clock. `1.0` is a shared
+    /// clock, values above one model a sender that produces audio faster than
+    /// the consumer plays it, and values below one model a slower sender.
+    pub producer_clock_ratio: f64,
+    /// Number of samples requested by each synthetic output callback.
+    pub output_block_samples: usize,
     pub streams: usize,
     pub seed: u64,
     pub packet_loss: LiveAudioPacketLossProfile,
@@ -130,6 +136,10 @@ pub struct LiveAudioSimulationConfig {
     pub denoise: bool,
     pub auto_gain: bool,
     pub echo_cancellation: bool,
+    /// Full-scale normalized DC offset added before the capture pipeline.
+    pub capture_dc_offset: f32,
+    /// Approximate full-scale normalized RMS noise added before capture.
+    pub capture_noise_rms: f32,
 }
 
 impl Default for LiveAudioSimulationConfig {
@@ -138,6 +148,8 @@ impl Default for LiveAudioSimulationConfig {
             scenario: LiveAudioSimulationScenario::ConstantSpeech,
             tuning: LiveAudioTuning::default(),
             duration: Duration::from_secs(10),
+            producer_clock_ratio: 1.0,
+            output_block_samples: crate::audio::shared::FRAME_SAMPLES,
             streams: 1,
             seed: 0x746f_6d63_6861_7402,
             packet_loss: LiveAudioPacketLossProfile::ScenarioDefault,
@@ -145,6 +157,8 @@ impl Default for LiveAudioSimulationConfig {
             denoise: true,
             auto_gain: true,
             echo_cancellation: false,
+            capture_dc_offset: 0.0,
+            capture_noise_rms: 0.0,
         }
     }
 }

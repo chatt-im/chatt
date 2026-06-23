@@ -113,6 +113,8 @@ where
         scenario: LiveAudioSimulationScenario::LossySpeech,
         tuning: config.tuning,
         duration: input_duration,
+        producer_clock_ratio: 1.0,
+        output_block_samples: FRAME_SAMPLES,
         streams: 1,
         seed: config.seed,
         packet_loss: config.packet_loss,
@@ -120,6 +122,8 @@ where
         denoise: config.denoise,
         auto_gain: config.auto_gain,
         echo_cancellation: false,
+        capture_dc_offset: 0.0,
+        capture_noise_rms: 0.0,
     };
     let network_profile = simulation_encoder_profile(sim_config);
     let mut state = SimStreamState::new(sim_config, network_profile, None)?;
@@ -153,6 +157,7 @@ where
         state.encode_and_queue_frame(
             sim_config,
             1,
+            frame_index,
             &frame,
             now,
             start,
@@ -270,6 +275,8 @@ pub(crate) fn run_live_audio_file_playback_test_inner(
         scenario: LiveAudioSimulationScenario::LossySpeech,
         tuning: config.tuning,
         duration: input_duration,
+        producer_clock_ratio: 1.0,
+        output_block_samples: FRAME_SAMPLES,
         streams: 1,
         seed: config.seed,
         packet_loss: config.packet_loss,
@@ -277,6 +284,8 @@ pub(crate) fn run_live_audio_file_playback_test_inner(
         denoise: config.denoise,
         auto_gain: config.auto_gain,
         echo_cancellation: false,
+        capture_dc_offset: 0.0,
+        capture_noise_rms: 0.0,
     };
     let network_profile = simulation_encoder_profile(sim_config);
     let mut state = SimStreamState::new(sim_config, network_profile, None)?;
@@ -303,6 +312,7 @@ pub(crate) fn run_live_audio_file_playback_test_inner(
         state.encode_and_queue_frame(
             sim_config,
             1,
+            frame_index,
             &frame,
             now,
             start,

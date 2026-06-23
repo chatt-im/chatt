@@ -376,6 +376,16 @@ mod tests {
     }
 
     #[test]
+    fn dc_offset_silence_remains_skip_safe() {
+        let frame = vec![0.06 * f32::from(i16::MAX); FRAME_SAMPLES];
+
+        assert!(
+            is_capture_skip_safe_silence(test_tuning(), 0, &frame),
+            "DC offset alone must not disable silence trimming"
+        );
+    }
+
+    #[test]
     fn silence_range_tracker_keeps_two_recent_sample_ranges() {
         let mut tracker = SilenceRangeTracker::new(test_tuning());
 

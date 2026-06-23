@@ -519,10 +519,21 @@ mod tests {
         shared::{
             FRAME_SAMPLES, LIVE_OPUS_FRAME_SAMPLES, LIVE_PLAYBACK_HARD_QUEUE_BOUND,
             LIVE_PLAYBACK_MAX_SPEED_UP, LIVE_PLAYBACK_SEVERE_LOSS_HOLD,
-            LIVE_PLAYBACK_SILENCE_MAX_SKIP, LIVE_PLAYBACK_TARGET_QUEUE, SAMPLE_RATE,
-            duration_to_ms, max_adjacent_delta, target_queue_samples,
+            LIVE_PLAYBACK_SILENCE_MAX_SKIP, LIVE_PLAYBACK_SILENCE_MIN_SKIP,
+            LIVE_PLAYBACK_TARGET_QUEUE, SAMPLE_RATE, duration_to_ms, max_adjacent_delta,
+            target_queue_samples,
         },
     };
+
+    fn zero_cross_freq(samples: &[f32], rate: f64) -> f64 {
+        let mut crossings = 0usize;
+        for pair in samples.windows(2) {
+            if (pair[0] <= 0.0 && pair[1] > 0.0) || (pair[0] >= 0.0 && pair[1] < 0.0) {
+                crossings += 1;
+            }
+        }
+        (crossings as f64 / 2.0) / (samples.len() as f64 / rate)
+    }
 
     #[test]
     fn adaptive_stream_keeps_sixty_ms_target_under_good_conditions() {
@@ -950,6 +961,27 @@ mod tests {
     }
 
     #[test]
+    fn isolated_plc_does_not_expand_playout_target() {
+        let now = Instant::now();
+        let mut stream = AdaptivePlaybackStream::new(test_tuning()).unwrap();
+        let mut stats = LivePlaybackMixerStats::default();
+
+        stream.queue_samples(
+            &vec![0.0; FRAME_SAMPLES],
+            DecodedFrameSource::Plc,
+            false,
+            now,
+            &mut stats,
+        );
+
+        assert!(
+            stream.adaptive_target_samples(now) <= target_queue_samples(test_tuning()),
+            "one PLC frame must not expand target to {}ms",
+            samples_to_ms(stream.adaptive_target_samples(now))
+        );
+    }
+
+    #[test]
     fn adaptive_stream_hard_trim_preserves_dred_horizon() {
         let now = Instant::now();
         let mut stream = AdaptivePlaybackStream::new(test_tuning()).unwrap();
@@ -1005,6 +1037,39 @@ mod tests {
     }
 
     #[test]
+    fn unflagged_silent_audio_is_trimmed() {
+        let now = Instant::now();
+        let queued = samples_for_duration(Duration::from_millis(600));
+        let mut stream = AdaptivePlaybackStream::new(test_tuning()).unwrap();
+        let mut stats = LivePlaybackMixerStats::default();
+
+        stream.queue_samples(
+            &vec![0.0; queued],
+            DecodedFrameSource::Normal,
+            false,
+            now,
+            &mut stats,
+        );
+        let before = stream.queued_samples();
+        for _ in 0..FRAME_SAMPLES {
+            let _ = stream.pop_sample(now, &mut stats);
+        }
+
+        assert!(
+            stats.silence_skip_count > 0,
+            "silence_skip_count={} skipped_silence_ms={}",
+            stats.silence_skip_count,
+            samples_to_ms(stats.skipped_silence_samples as usize)
+        );
+        assert!(
+            stream.queued_samples() + FRAME_SAMPLES < before,
+            "unflagged zeros were not shortened: before={}ms after={}ms",
+            samples_to_ms(before),
+            samples_to_ms(stream.queued_samples())
+        );
+    }
+
+    #[test]
     fn adaptive_stream_skips_marked_250ms_gap_when_behind() {
         let now = Instant::now();
         let mut stream = AdaptivePlaybackStream::new(test_tuning()).unwrap();
@@ -1038,6 +1103,52 @@ mod tests {
         assert!(
             samples_to_ms(stats.skipped_silence_samples as usize) >= 150,
             "skipped {}ms",
+            samples_to_ms(stats.skipped_silence_samples as usize)
+        );
+    }
+
+    #[test]
+    fn sub_250ms_silent_gap_shortens() {
+        let now = Instant::now();
+        let mut stream = AdaptivePlaybackStream::new(test_tuning()).unwrap();
+        let mut stats = LivePlaybackMixerStats::default();
+
+        stream.queue_samples(
+            &vec![0.25; samples_for_duration(Duration::from_millis(100))],
+            DecodedFrameSource::Normal,
+            false,
+            now,
+            &mut stats,
+        );
+        stream.queue_samples(
+            &vec![0.0; samples_for_duration(Duration::from_millis(150))],
+            DecodedFrameSource::Normal,
+            true,
+            now,
+            &mut stats,
+        );
+        stream.queue_samples(
+            &vec![0.25; samples_for_duration(Duration::from_millis(200))],
+            DecodedFrameSource::Normal,
+            false,
+            now,
+            &mut stats,
+        );
+
+        for _ in 0..samples_for_duration(Duration::from_millis(50)) {
+            let _ = stream.pop_sample(now, &mut stats);
+        }
+
+        assert!(
+            stats.silence_skip_count > 0,
+            "silence_skip_count={} skipped_silence_ms={}",
+            stats.silence_skip_count,
+            samples_to_ms(stats.skipped_silence_samples as usize)
+        );
+        assert!(
+            stats.skipped_silence_samples
+                >= samples_for_duration(LIVE_PLAYBACK_SILENCE_MIN_SKIP) as u64,
+            "skipped only {}ms",
             samples_to_ms(stats.skipped_silence_samples as usize)
         );
     }
@@ -1144,6 +1255,43 @@ mod tests {
         let after = now + tuning.loss_hold + Duration::from_millis(1);
         stream.apply_recommended_target(tuning.dynamic_target_floor, after);
         assert!(stream.effective_target_samples() < ceiling);
+    }
+
+    #[test]
+    fn catchup_preserves_steady_tone_pitch() {
+        let now = Instant::now();
+        let rate = f64::from(SAMPLE_RATE);
+        let total = samples_for_duration(Duration::from_millis(2_000));
+        let tone: Vec<f32> = (0..total)
+            .map(|n| (2.0 * std::f64::consts::PI * 1_000.0 * n as f64 / rate).sin() as f32 * 0.5)
+            .collect();
+        let mut tuning = test_tuning();
+        tuning.catch_up_start_excess = Duration::ZERO;
+        let mut stream = AdaptivePlaybackStream::new(tuning).unwrap();
+        let mut stats = LivePlaybackMixerStats::default();
+        stream.queue_samples(&tone, DecodedFrameSource::Normal, false, now, &mut stats);
+
+        let mut output = Vec::new();
+        while stream.queued_samples() > samples_for_duration(Duration::from_millis(100)) {
+            let Some(sample) = stream.pop_sample(now, &mut stats) else {
+                break;
+            };
+            output.push(sample);
+        }
+
+        let window = samples_for_duration(Duration::from_millis(100));
+        let tail = output
+            .len()
+            .checked_sub(window)
+            .map(|start| &output[start..])
+            .unwrap_or(output.as_slice());
+        let freq = zero_cross_freq(tail, rate);
+        assert!(
+            (freq - 1_000.0).abs() <= 10.0,
+            "catch-up shifted 1kHz tone to {freq:.1}Hz; resampled={} direct={}",
+            stats.resampled_samples,
+            stats.direct_samples
+        );
     }
 
     #[test]

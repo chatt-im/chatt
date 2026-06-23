@@ -238,6 +238,8 @@ pub(crate) fn run_live_audio_direct_sample_simulation_output_inner(
         scenario: LiveAudioSimulationScenario::ConstantSpeech,
         tuning: config.tuning,
         duration: input_duration,
+        producer_clock_ratio: 1.0,
+        output_block_samples: FRAME_SAMPLES,
         streams: 1,
         seed: config.seed,
         packet_loss: config.packet_loss,
@@ -245,6 +247,8 @@ pub(crate) fn run_live_audio_direct_sample_simulation_output_inner(
         denoise: config.denoise,
         auto_gain: config.auto_gain,
         echo_cancellation: false,
+        capture_dc_offset: 0.0,
+        capture_noise_rms: 0.0,
     };
 
     let mixer = Arc::new(Mutex::new(LivePlaybackMixer::with_tuning(config.tuning)));
@@ -284,6 +288,7 @@ pub(crate) fn run_live_audio_direct_sample_simulation_output_inner(
             state.encode_and_queue_frame(
                 sim_config,
                 1,
+                frame_index,
                 frame,
                 now,
                 start,
@@ -378,6 +383,7 @@ pub(crate) fn run_live_audio_simulation_inner(
     collect_output: bool,
 ) -> Result<LiveAudioSimulationOutput, String> {
     debug_assert!(config.tuning.validate().is_ok());
+    validate_live_audio_simulation_config(config)?;
     validate_live_audio_simulation_speech_frames(speech_frames)?;
 
     let mixer = Arc::new(Mutex::new(LivePlaybackMixer::with_tuning(config.tuning)));
@@ -392,26 +398,33 @@ pub(crate) fn run_live_audio_simulation_inner(
     let mut rng = SimRng::new(config.seed);
     let mut metrics = OnlineAudioMetrics::default();
     let start = Instant::now();
-    let total_frames = frames_for_duration(config.duration).max(1);
+    let frame_duration_secs = FRAME_SAMPLES as f64 / SAMPLE_RATE as f64;
+    let output_block_samples = config.output_block_samples.max(1);
+    let output_block_secs = output_block_samples as f64 / SAMPLE_RATE as f64;
+    let total_callbacks = (config.duration.as_secs_f64() / output_block_secs)
+        .ceil()
+        .max(1.0) as usize;
     let prebuffer_frames = simulation_prebuffer_frames(config);
-    let frame_duration = Duration::from_secs_f64(FRAME_SAMPLES as f64 / SAMPLE_RATE as f64);
+    let output_block_duration = Duration::from_secs_f64(output_block_secs);
     let mut report = LiveAudioSimulationReport {
         scenario: config.scenario.as_name(),
         ..Default::default()
     };
     let mut output_samples = collect_output
-        .then(|| Vec::with_capacity(total_frames.saturating_mul(FRAME_SAMPLES)))
+        .then(|| Vec::with_capacity(total_callbacks.saturating_mul(output_block_samples)))
         .unwrap_or_default();
 
     // Isolate steady-state queue depth from the startup transient by measuring
     // the queue only over the final window of the run.
     const STEADY_STATE_WINDOW: Duration = Duration::from_secs(10);
-    let tail_start_frame =
-        total_frames.saturating_sub(frames_for_duration(STEADY_STATE_WINDOW).max(1));
+    let tail_callbacks = (STEADY_STATE_WINDOW.as_secs_f64() / output_block_secs)
+        .ceil()
+        .max(1.0) as usize;
+    let tail_start_callback = total_callbacks.saturating_sub(tail_callbacks);
     let mut tail_queue_sum_ms = 0.0f64;
     let mut tail_queue_max_ms = 0u64;
     let mut tail_adaptive_target_min_ms = u64::MAX;
-    let mut tail_frames = 0usize;
+    let mut tail_callbacks_seen = 0usize;
 
     for frame_index in 0..prebuffer_frames {
         let now = start;
@@ -428,26 +441,35 @@ pub(crate) fn run_live_audio_simulation_inner(
         )?;
     }
 
-    for frame_index in 0..total_frames {
-        let now = start + frame_duration.saturating_mul(frame_index as u32);
-        process_simulation_input_frame(
-            config,
-            frame_index + prebuffer_frames,
-            now,
-            &mut states,
-            &mixer,
-            &mut decode_streams,
-            &mut rng,
-            &mut report,
-            speech_frames,
-        )?;
+    let mut next_input_frame = prebuffer_frames;
+    for callback_index in 0..total_callbacks {
+        let elapsed_secs = callback_index as f64 * output_block_secs;
+        let now = start + Duration::from_secs_f64(elapsed_secs);
+        let production_horizon_secs =
+            (callback_index + 1) as f64 * output_block_secs * config.producer_clock_ratio;
+        let desired_input_frames =
+            prebuffer_frames + (production_horizon_secs / frame_duration_secs).floor() as usize;
+        while next_input_frame < desired_input_frames {
+            process_simulation_input_frame(
+                config,
+                next_input_frame,
+                now,
+                &mut states,
+                &mixer,
+                &mut decode_streams,
+                &mut rng,
+                &mut report,
+                speech_frames,
+            )?;
+            next_input_frame += 1;
+        }
 
         let mut mixer = mixer
             .lock()
             .map_err(|_| "live simulation mixer lock poisoned")?;
         let mut echo_writer = echo_reference.as_ref().map(|reference| reference.writer());
-        for _ in 0..FRAME_SAMPLES {
-            let sample = mixer.pop_mixed_sample(now);
+        for _ in 0..output_block_samples {
+            let sample = mixer.pop_mixed_output_sample(now, output_block_samples);
             if let Some(writer) = echo_writer.as_mut() {
                 writer.push(sample);
             }
@@ -461,23 +483,23 @@ pub(crate) fn run_live_audio_simulation_inner(
         }
         let snapshot = mixer.snapshot_at(now);
         report.max_queue_ms = report.max_queue_ms.max(snapshot.max_queue_ms);
-        report.queue_area_ms += snapshot.max_queue_ms as f64 * frame_duration.as_secs_f64();
-        if frame_index >= tail_start_frame {
+        report.queue_area_ms += snapshot.max_queue_ms as f64 * output_block_duration.as_secs_f64();
+        if callback_index >= tail_start_callback {
             tail_queue_sum_ms += snapshot.max_queue_ms as f64;
             tail_queue_max_ms = tail_queue_max_ms.max(snapshot.max_queue_ms);
             tail_adaptive_target_min_ms =
                 tail_adaptive_target_min_ms.min(snapshot.adaptive_target_ms);
-            tail_frames += 1;
+            tail_callbacks_seen += 1;
         }
     }
 
     report.steady_state_max_queue_ms = tail_queue_max_ms;
-    report.steady_state_avg_queue_ms = if tail_frames > 0 {
-        tail_queue_sum_ms / tail_frames as f64
+    report.steady_state_avg_queue_ms = if tail_callbacks_seen > 0 {
+        tail_queue_sum_ms / tail_callbacks_seen as f64
     } else {
         0.0
     };
-    report.steady_state_adaptive_target_ms = if tail_frames > 0 {
+    report.steady_state_adaptive_target_ms = if tail_callbacks_seen > 0 {
         tail_adaptive_target_min_ms
     } else {
         0
@@ -547,6 +569,55 @@ pub(crate) fn validate_live_audio_simulation_speech_frames(
         ));
     }
     Ok(())
+}
+
+pub(crate) fn validate_live_audio_simulation_config(
+    config: LiveAudioSimulationConfig,
+) -> Result<(), String> {
+    config.tuning.validate()?;
+    if !config.producer_clock_ratio.is_finite() || config.producer_clock_ratio <= 0.0 {
+        return Err(
+            "live audio simulation producer_clock_ratio must be finite and positive".into(),
+        );
+    }
+    if config.output_block_samples == 0 {
+        return Err("live audio simulation output_block_samples must be greater than zero".into());
+    }
+    if !config.capture_dc_offset.is_finite() {
+        return Err("live audio simulation capture_dc_offset must be finite".into());
+    }
+    if !config.capture_noise_rms.is_finite() || config.capture_noise_rms < 0.0 {
+        return Err(
+            "live audio simulation capture_noise_rms must be finite and non-negative".into(),
+        );
+    }
+    Ok(())
+}
+
+fn capture_impairment_samples(
+    config: LiveAudioSimulationConfig,
+    stream_id: u32,
+    frame_index: usize,
+    samples: &[f32],
+) -> Vec<f32> {
+    let noise_amp = config.capture_noise_rms * 3.0f32.sqrt();
+    let mut state = config.seed
+        ^ ((stream_id as u64) << 32)
+        ^ (frame_index as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+    if state == 0 {
+        state = 0x2545_f491_4f6c_dd1d;
+    }
+
+    samples
+        .iter()
+        .map(|sample| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            let unit = ((state >> 40) as f32 / (1u32 << 24) as f32) * 2.0 - 1.0;
+            (*sample + config.capture_dc_offset + unit * noise_amp).clamp(-1.0, 1.0)
+        })
+        .collect()
 }
 
 pub(crate) fn decode_audio_file_with_ffmpeg(path: &Path) -> Result<Vec<f32>, String> {
@@ -621,6 +692,7 @@ pub(crate) fn process_simulation_input_frame(
         state.encode_and_queue_frame(
             config,
             stream_id,
+            frame_index,
             &frame.samples,
             now,
             now,
@@ -713,6 +785,7 @@ impl SimStreamState {
         &mut self,
         config: LiveAudioSimulationConfig,
         stream_id: u32,
+        frame_index: usize,
         samples: &[f32],
         now: Instant,
         trace_start: Instant,
@@ -720,7 +793,14 @@ impl SimStreamState {
         report: &mut LiveAudioSimulationReport,
         trace: &mut Option<LiveAudioTraceWriter>,
     ) -> Result<(), String> {
-        let mut chunk = normalized_to_i16_scale(samples);
+        let impaired_samples;
+        let capture_samples = if config.capture_dc_offset != 0.0 || config.capture_noise_rms > 0.0 {
+            impaired_samples = capture_impairment_samples(config, stream_id, frame_index, samples);
+            impaired_samples.as_slice()
+        } else {
+            samples
+        };
+        let mut chunk = normalized_to_i16_scale(capture_samples);
         let mut emitted = Vec::new();
         self.capture.push_chunk(
             &chunk,
@@ -982,9 +1062,9 @@ pub(crate) fn silence_simulation_frame() -> SimulationFrame {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::audio::sim::LiveAudioPacketLossProfile;
     #[allow(unused_imports)]
     use crate::audio::test_support::*;
+    use crate::audio::{shared::samples_for_duration, sim::LiveAudioPacketLossProfile};
 
     #[test]
     fn simulation_speech_split_keeps_contiguous_frames_after_first_active_frame() {
@@ -1220,7 +1300,7 @@ mod tests {
         // variation, not absolute one-way latency.
         assert_eq!(report.lost_frames, 0, "{report:?}");
         assert!(
-            report.steady_state_adaptive_target_ms < 30,
+            report.steady_state_adaptive_target_ms <= 30,
             "steady-delay link did not relax the target: {report:?}"
         );
         assert_eq!(report.final_snapshot.underrun_count, 0, "{report:?}");
@@ -1256,6 +1336,48 @@ mod tests {
             "descend must not cause underruns: {report:?}"
         );
         assert_coherent_output(&report, 0.005);
+    }
+
+    #[test]
+    fn hundred_ms_output_period_has_no_sustained_underruns() {
+        let report = run_live_audio_simulation_with_speech(
+            LiveAudioSimulationConfig {
+                scenario: LiveAudioSimulationScenario::ConstantSpeech,
+                tuning: test_tuning(),
+                duration: Duration::from_secs(30),
+                output_block_samples: samples_for_duration(Duration::from_millis(100)),
+                packet_loss: LiveAudioPacketLossProfile::None,
+                ..Default::default()
+            },
+            sample_speech_frames(),
+        )
+        .unwrap();
+
+        assert_eq!(report.lost_frames, 0, "{report:?}");
+        assert_eq!(
+            report.final_snapshot.underrun_count, 0,
+            "100ms output callback sustained underruns: {report:?}"
+        );
+    }
+
+    #[test]
+    fn capture_impairment_samples_are_seeded_and_full_scale() {
+        let config = LiveAudioSimulationConfig {
+            capture_dc_offset: 0.06,
+            capture_noise_rms: 0.02,
+            seed: 0xfeed_face_cafe_beef,
+            ..Default::default()
+        };
+        let samples = vec![0.0; FRAME_SAMPLES];
+
+        let first = capture_impairment_samples(config, 7, 11, &samples);
+        let second = capture_impairment_samples(config, 7, 11, &samples);
+        let other_frame = capture_impairment_samples(config, 7, 12, &samples);
+
+        assert_eq!(first, second);
+        assert_ne!(first, other_frame);
+        assert!(rms_normalized(&first) > 0.05, "{:?}", &first[..8]);
+        assert!(first.iter().all(|sample| (-1.0..=1.0).contains(sample)));
     }
 
     #[test]

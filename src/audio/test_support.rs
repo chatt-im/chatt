@@ -352,6 +352,8 @@ pub(crate) fn simulate_with_loss(
             scenario,
             tuning,
             duration,
+            producer_clock_ratio: 1.0,
+            output_block_samples: FRAME_SAMPLES,
             streams,
             seed: 0x1234_5678_90ab_cdef,
             packet_loss,
@@ -359,6 +361,8 @@ pub(crate) fn simulate_with_loss(
             denoise: true,
             auto_gain: true,
             echo_cancellation: false,
+            capture_dc_offset: 0.0,
+            capture_noise_rms: 0.0,
         },
         sample_speech_frames(),
     )

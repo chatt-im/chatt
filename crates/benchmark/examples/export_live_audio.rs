@@ -28,6 +28,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         scenario: LiveAudioSimulationScenario::LossySpeech,
         tuning: LiveAudioTuning::default(),
         duration: Duration::from_secs(12),
+        producer_clock_ratio: 1.0,
+        output_block_samples: chatt::audio::FRAME_SAMPLES,
         streams: 1,
         seed: 0x1234_5678_90ab_cdef,
         packet_loss: LiveAudioPacketLossProfile::None,
@@ -35,6 +37,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         denoise: true,
         auto_gain: true,
         echo_cancellation: false,
+        capture_dc_offset: 0.0,
+        capture_noise_rms: 0.0,
     };
 
     let clean_input = render_live_audio_simulation_input(base_config, &speech_frames)?;
