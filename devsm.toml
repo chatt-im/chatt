@@ -1,21 +1,24 @@
 [service.server]
 sh = '''
-rm /tmp/chatt-server.json
 rm /tmp/chatt-server.kvlog
 cargo run -p server -- --config chatt-server.toml --logfile /tmp/chatt-server.kvlog
-kvlog /tmp/chatt-server.kvlog --json > /tmp/chatt-server.json
 '''
 ready.when.output_contains = "chatt server listening"
 ready.timeout = 10.0
 cache.never = true
 info = "Local chatt development server"
 
+[action.json-snapshot-client-logs]
+sh = '''
+kvlog /tmp/chatt-server.kvlog --json > /tmp/chatt-server.json
+kvlog /tmp/chatt-alice.kvlog --json > /tmp/chatt-alice.json
+kvlog /tmp/chatt-soundboard.kvlog --json > /tmp/chatt-soundboard.json
+'''
+
 [action.client-alice]
 sh = '''
-rm /tmp/chatt-alice.json
 rm /tmp/chatt-alice.kvlog
 cargo run -p chatt -- --config dev/chatt-alice.toml --logfile /tmp/chatt-alice.kvlog
-kvlog /tmp/chatt-alice.kvlog --json > /tmp/chatt-alice.json
 '''
 require = ["server"]
 managed = false
@@ -24,10 +27,8 @@ info = "Run the Alice client in this terminal"
 
 [action.client-bob]
 sh = '''
-rm /tmp/chatt-bob.json
 rm /tmp/chatt-bob.kvlog
 cargo run -p chatt -- --config dev/chatt-bob.toml --logfile /tmp/chatt-bob.kvlog
-kvlog /tmp/chatt-bob.kvlog --json > /tmp/chatt-bob.json
 '''
 require = ["server"]
 managed = false

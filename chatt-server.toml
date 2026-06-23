@@ -2,7 +2,7 @@
 
 [network]
 tcp-addr = "127.0.0.1:41000"
-p2p-enabled = true
+p2p-enabled = false
 
 [security]
 server-identity-seed = "546f6d636861742064657620736572766572206b657920763100000000000001"
