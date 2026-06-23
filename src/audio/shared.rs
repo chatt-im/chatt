@@ -40,6 +40,15 @@ pub(crate) const LIVE_PLAYBACK_DYNAMIC_UNDERRUN_MIN: usize = 2;
 // Ignore recommended-target changes smaller than this to avoid chatter.
 pub(crate) const LIVE_PLAYBACK_DYNAMIC_DEADBAND: Duration = Duration::from_millis(3);
 pub(crate) const LIVE_PLAYBACK_HARD_QUEUE_BOUND: Duration = Duration::from_millis(1_500);
+// Overlap-add expansion conceals jitter and sender-slow drift on a *live*
+// stream: it duplicates buffered audio to bridge an underrun until the next
+// real frame arrives. A stream that has ended (sender stopped, or a
+// silence-gated pause) delivers no further frames, so unbounded expansion would
+// loop the residual buffer forever and play a static drone. This caps how much
+// audio expansion may synthesize before a real decoded frame resets it, so a
+// stalled stream drains to silence instead. Any genuine live stream (even under
+// heavy loss) keeps queuing real Normal/DRED/PLC frames well within this bound.
+pub(crate) const LIVE_PLAYBACK_MAX_IDLE_EXPANSION: Duration = Duration::from_millis(100);
 // Priming cushion added on top of one output device callback when sizing the
 // playout target. A device whose host period exceeds the one-packet floor needs
 // its whole callback buffered, plus this slack, or it re-primes whenever
@@ -54,7 +63,7 @@ pub(crate) const LIVE_PLAYBACK_FEEDBACK_PACKETS: u32 = 25;
 // Cadence of the "live playback snapshot" diagnostic. Decoupled from the 500 ms
 // feedback window so queue/target/correction dynamics are sampled finely enough
 // to see the queue oscillate between arrivals (one packet is 20 ms).
-pub(crate) const LIVE_PLAYBACK_SNAPSHOT_INTERVAL: Duration = Duration::from_millis(100);
+pub(crate) const LIVE_PLAYBACK_SNAPSHOT_INTERVAL: Duration = Duration::from_secs(36000);
 pub(crate) const LIVE_PLAYBACK_MAX_REORDER_DELAY: Duration = Duration::from_millis(60);
 pub(crate) const LIVE_PLAYBACK_DRED_MAX_SAMPLES: usize = SAMPLE_RATE as usize;
 pub(crate) const LIVE_PLAYBACK_SILENCE_VAD_MAX: u8 = 64;

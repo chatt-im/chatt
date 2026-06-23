@@ -1534,6 +1534,104 @@ mod tests {
     }
 
     #[test]
+    fn stream_end_under_heavy_loss_drains_to_silence() {
+        // End-to-end regression for the soundboard's `random_60` glitch. Drive
+        // the real encode -> 60% loss -> DRED/PLC decode -> mixer pipeline, then
+        // stop the sender and keep pulling output callbacks. After the stream
+        // ends the playout queue must drain and go silent. The pre-fix engine
+        // refilled the queue with overlap-add expansion forever, so the residual
+        // buffer looped as a static tone that outlasted the speech.
+        let tuning = test_tuning();
+        let config = LiveAudioSimulationConfig {
+            scenario: LiveAudioSimulationScenario::ConstantSpeech,
+            tuning,
+            duration: Duration::from_secs(2),
+            producer_clock_ratio: 1.0,
+            output_block_samples: FRAME_SAMPLES,
+            streams: 1,
+            seed: 0x51c3_0d09_2bad_f00d,
+            packet_loss: LiveAudioPacketLossProfile::Random60,
+            max_amplification: crate::audio::shared::DEFAULT_LIVE_MAX_AMPLIFICATION,
+            denoise: true,
+            auto_gain: true,
+            echo_cancellation: false,
+            capture_dc_offset: 0.0,
+            capture_noise_rms: 0.0,
+        };
+        let speech = sample_speech_frames();
+        let mixer = Arc::new(Mutex::new(LivePlaybackMixer::with_tuning(tuning)));
+        let mut decode_streams = LiveDecodeStreams::new(tuning);
+        let mut state =
+            SimStreamState::new(config, simulation_encoder_profile(config), None).unwrap();
+        let mut rng = SimRng::new(config.seed);
+        let mut report = LiveAudioSimulationReport {
+            scenario: "stall",
+            ..Default::default()
+        };
+        let mut trace = None;
+        let start = Instant::now();
+        let frame_duration = Duration::from_secs_f64(FRAME_SAMPLES as f64 / SAMPLE_RATE as f64);
+
+        let speech_frames = frames_for_duration(Duration::from_secs(2));
+        let tail_frames = frames_for_duration(Duration::from_secs(2));
+        // Measure the last second of the tail, long after the sender stopped and
+        // any late packets were delivered.
+        let measure_from = speech_frames + frames_for_duration(Duration::from_secs(1));
+        let mut tail = OnlineAudioMetrics::default();
+
+        for frame_index in 0..(speech_frames + tail_frames) {
+            let now = start + frame_duration.saturating_mul(frame_index as u32);
+            if frame_index < speech_frames {
+                let frame = &speech[frame_index % speech.len()];
+                state
+                    .encode_and_queue_frame(
+                        config,
+                        1,
+                        frame_index,
+                        frame,
+                        now,
+                        start,
+                        &mut rng,
+                        &mut report,
+                        &mut trace,
+                    )
+                    .unwrap();
+            }
+            drain_simulation_network_and_playback(
+                now,
+                start,
+                std::slice::from_mut(&mut state),
+                &mixer,
+                &mut decode_streams,
+                &mut report,
+                &mut trace,
+            );
+            let mut mixer = mixer.lock().unwrap();
+            for _ in 0..FRAME_SAMPLES {
+                let sample = mixer.pop_mixed_output_sample(now, FRAME_SAMPLES);
+                if frame_index >= measure_from {
+                    tail.observe(sample);
+                }
+            }
+        }
+
+        let final_now = start + frame_duration.saturating_mul((speech_frames + tail_frames) as u32);
+        let snapshot = mixer.lock().unwrap().snapshot_at(final_now);
+        // Confirm the run genuinely exercised loss recovery (otherwise the
+        // silence assertion would be vacuous).
+        assert!(report.lost_frames > 0, "{report:?}");
+        assert!(snapshot.dred_recoveries > 0, "{snapshot:?}");
+        assert!(
+            tail.rms() < 0.001,
+            "stream kept droning {:.4} rms a full second after it ended: {snapshot:?}",
+            tail.rms()
+        );
+        // The queue must have drained; the drone bug parked it near the playout
+        // target (55-80 ms) forever.
+        assert!(snapshot.queued_samples < FRAME_SAMPLES, "{snapshot:?}");
+    }
+
+    #[test]
     fn live_simulation_runs_with_echo_cancellation() {
         let config = LiveAudioSimulationConfig {
             duration: Duration::from_millis(600),

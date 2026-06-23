@@ -10,12 +10,12 @@ use crate::audio::{
     },
     shared::{
         DecodedFrameSource, LIVE_PLAYBACK_DYNAMIC_DEADBAND, LIVE_PLAYBACK_DYNAMIC_UNDERRUN_MIN,
-        LIVE_PLAYBACK_DYNAMIC_UNDERRUN_WINDOW, LIVE_PLAYBACK_RECOVERY_DECLICK,
-        LIVE_PLAYBACK_RECOVERY_DECLICK_MIN_DELTA, LiveAudioTuning, TIME_SCALE_DECISION_INTERVAL,
-        TIME_SCALE_MARGIN, TIME_SCALE_MAX_LAG_48K, TIME_SCALE_MIN_LAG_48K,
-        TIME_SCALE_NOISE_FLOOR_MS, TIME_SCALE_OPERATION_HOLD, TIME_SCALE_OVERLAP,
-        TIME_SCALE_REF_OFFSET, TIME_SCALE_VAD_RATIO, TIME_SCALE_WINDOW, samples_for_duration,
-        samples_to_ms,
+        LIVE_PLAYBACK_DYNAMIC_UNDERRUN_WINDOW, LIVE_PLAYBACK_MAX_IDLE_EXPANSION,
+        LIVE_PLAYBACK_RECOVERY_DECLICK, LIVE_PLAYBACK_RECOVERY_DECLICK_MIN_DELTA, LiveAudioTuning,
+        TIME_SCALE_DECISION_INTERVAL, TIME_SCALE_MARGIN, TIME_SCALE_MAX_LAG_48K,
+        TIME_SCALE_MIN_LAG_48K, TIME_SCALE_NOISE_FLOOR_MS, TIME_SCALE_OPERATION_HOLD,
+        TIME_SCALE_OVERLAP, TIME_SCALE_REF_OFFSET, TIME_SCALE_VAD_RATIO, TIME_SCALE_WINDOW,
+        samples_for_duration, samples_to_ms,
     },
 };
 
@@ -30,6 +30,7 @@ pub(crate) struct TuningSampleCounts {
     wsola_overlap: usize,
     decision_interval: usize,
     operation_hold: usize,
+    max_idle_expansion: usize,
 }
 
 impl TuningSampleCounts {
@@ -44,6 +45,7 @@ impl TuningSampleCounts {
             wsola_overlap: samples_for_duration(TIME_SCALE_OVERLAP),
             decision_interval: samples_for_duration(TIME_SCALE_DECISION_INTERVAL).max(1),
             operation_hold: samples_for_duration(TIME_SCALE_OPERATION_HOLD),
+            max_idle_expansion: samples_for_duration(LIVE_PLAYBACK_MAX_IDLE_EXPANSION),
         }
     }
 }
@@ -56,6 +58,10 @@ pub(crate) struct AdaptivePlaybackStream {
     time_scale_window: Vec<f32>,
     decision_countdown: usize,
     operation_hold_remaining: usize,
+    /// Samples synthesized by overlap-add expansion since the last real decoded
+    /// frame was queued. Bounds concealment so an ended stream drains to silence
+    /// instead of looping its residual buffer forever. Reset by `queue_samples`.
+    idle_expansion_samples: usize,
     recommended_target_samples: usize,
     underrun_hold_until: Option<Instant>,
     recent_underruns: VecDeque<Instant>,
@@ -77,6 +83,7 @@ impl AdaptivePlaybackStream {
             time_scale_window: Vec::with_capacity(TIME_SCALE_WINDOW),
             decision_countdown: 0,
             operation_hold_remaining: 0,
+            idle_expansion_samples: 0,
             recommended_target_samples: samples.target_queue,
             underrun_hold_until: None,
             recent_underruns: VecDeque::new(),
@@ -95,9 +102,15 @@ impl AdaptivePlaybackStream {
         now: Instant,
         stats: &mut LivePlaybackMixerStats,
     ) {
+        if samples.is_empty() {
+            return;
+        }
         let mut samples = samples.to_vec();
         self.declick_recovery_boundary(&mut samples, source);
         self.input.push_back_owned(samples, source);
+        // A real decoded frame arrived, so the stream is live: clear the idle
+        // expansion budget so concealment is free to bridge the next underrun.
+        self.idle_expansion_samples = 0;
         self.enforce_safety_bound(now, stats);
     }
 
@@ -286,6 +299,9 @@ impl AdaptivePlaybackStream {
     }
 
     fn try_expand(&mut self, _now: Instant, stats: &mut LivePlaybackMixerStats) -> bool {
+        if self.idle_expansion_exhausted() {
+            return false;
+        }
         let lead = 0;
         if self.queued_samples() < lead + TIME_SCALE_REF_OFFSET {
             return false;
@@ -307,6 +323,7 @@ impl AdaptivePlaybackStream {
         }
         stats.expand_count = stats.expand_count.saturating_add(1);
         stats.expand_samples = stats.expand_samples.saturating_add(delta as u64);
+        self.idle_expansion_samples = self.idle_expansion_samples.saturating_add(delta);
         self.operation_hold_remaining = self.samples.operation_hold;
         true
     }
@@ -316,6 +333,9 @@ impl AdaptivePlaybackStream {
         // inside a full-target callback, dropping below target mid-block is
         // expected and should not synthesize extra audio.
         if self.output_target_floor_samples >= self.effective_target_samples() {
+            return false;
+        }
+        if self.idle_expansion_exhausted() {
             return false;
         }
         let queued = self.queued_samples();
@@ -334,8 +354,16 @@ impl AdaptivePlaybackStream {
         }
         stats.expand_count = stats.expand_count.saturating_add(1);
         stats.expand_samples = stats.expand_samples.saturating_add(delta as u64);
+        self.idle_expansion_samples = self.idle_expansion_samples.saturating_add(delta);
         self.operation_hold_remaining = self.samples.operation_hold;
         true
+    }
+
+    /// Whether overlap-add expansion has synthesized its full idle budget since
+    /// the last real decoded frame. Once exhausted, the stream is treated as
+    /// ended and is allowed to drain to silence rather than looping its buffer.
+    fn idle_expansion_exhausted(&self) -> bool {
+        self.idle_expansion_samples >= self.samples.max_idle_expansion
     }
 
     fn tail_pitch_period(&self, queued: usize) -> Option<usize> {
@@ -512,6 +540,85 @@ mod tests {
                     * 0.5
             })
             .collect()
+    }
+
+    #[test]
+    fn stalled_stream_drains_to_silence_instead_of_looping_forever() {
+        // Regression: when a stream ends (sender stops, or a silence-gated
+        // pause), no further frames are queued. Overlap-add expansion used to
+        // refill the queue every decision tick, holding it near the playout
+        // target indefinitely and looping the residual buffer as a static drone
+        // that never stopped after speech ended. Expansion must instead exhaust
+        // its idle budget and let the queue drain to silence.
+        let now = Instant::now();
+        let mut stream = AdaptivePlaybackStream::new(test_tuning()).unwrap();
+        let mut stats = LivePlaybackMixerStats::default();
+        let block = FRAME_SAMPLES;
+
+        // ~120 ms of residual low-energy audio (a clip tail / noise floor),
+        // below the active-speech threshold so expansion is freely allowed.
+        let residual: Vec<f32> = (0..samples_for_duration(Duration::from_millis(120)))
+            .map(|index| 0.01 * (index as f32 * 0.05).sin())
+            .collect();
+        stream.queue_samples(&residual, DecodedFrameSource::Normal, now, &mut stats);
+
+        // Pull three seconds of output callbacks with no further input.
+        let horizon = samples_for_duration(Duration::from_secs(3));
+        let mut produced_output = 0usize;
+        for _ in 0..horizon {
+            if stream.pop_output_sample(now, &mut stats, block).is_some() {
+                produced_output += 1;
+            }
+        }
+
+        assert!(
+            stream.queued_samples() <= samples_for_duration(Duration::from_millis(40)),
+            "stalled stream still holds {} ms; expansion ran away",
+            samples_to_ms(stream.queued_samples())
+        );
+        assert!(
+            samples_to_ms(produced_output) <= 400,
+            "120 ms of input produced {} ms of output (expand_count={}); the stream looped itself",
+            samples_to_ms(produced_output),
+            stats.expand_count
+        );
+    }
+
+    #[test]
+    fn stalled_stream_resumes_when_audio_returns() {
+        // The idle expansion bound must only suppress concealment of an ended
+        // stream: a fresh decoded frame (speech resuming after a pause) has to
+        // reset the budget and play out normally, not stay dead.
+        let now = Instant::now();
+        let mut stream = AdaptivePlaybackStream::new(test_tuning()).unwrap();
+        let mut stats = LivePlaybackMixerStats::default();
+        let block = FRAME_SAMPLES;
+
+        let residual: Vec<f32> = (0..samples_for_duration(Duration::from_millis(120)))
+            .map(|index| 0.01 * (index as f32 * 0.05).sin())
+            .collect();
+        stream.queue_samples(&residual, DecodedFrameSource::Normal, now, &mut stats);
+        for _ in 0..samples_for_duration(Duration::from_secs(1)) {
+            let _ = stream.pop_output_sample(now, &mut stats, block);
+        }
+        assert!(stream.queued_samples() <= samples_for_duration(Duration::from_millis(40)));
+
+        let resume = vec![0.5f32; samples_for_duration(Duration::from_millis(200))];
+        stream.queue_samples(&resume, DecodedFrameSource::Normal, now, &mut stats);
+        let mut played = 0usize;
+        for _ in 0..samples_for_duration(Duration::from_millis(300)) {
+            if stream
+                .pop_output_sample(now, &mut stats, block)
+                .is_some_and(|sample| sample.abs() > 0.1)
+            {
+                played += 1;
+            }
+        }
+        assert!(
+            played >= samples_for_duration(Duration::from_millis(150)),
+            "stream stayed dead after the pause; only {} ms played back",
+            samples_to_ms(played)
+        );
     }
 
     #[test]
