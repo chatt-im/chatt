@@ -2064,8 +2064,16 @@ impl App {
             std::cmp::Ordering::Less => format!(" adaptive{}ms", stats.adaptive_target_ms),
             std::cmp::Ordering::Equal => String::new(),
         };
+        let backend_errors = if stats.backend_stream_errors == 0 {
+            String::new()
+        } else {
+            format!(
+                " backend_xruns{}/{}",
+                stats.backend_xruns, stats.backend_stream_errors
+            )
+        };
         self.set_status(format!(
-            "audio q{}ms target{}ms{} speed{:+.1}% enc{} direct{}% skip{}ms/{} catchup{} dred{} plc{} trims{} underruns{} rx {}/{}",
+            "audio q{}ms target{}ms{} speed{:+.1}% enc{} direct{}% skip{}ms/{} catchup{} dred{} plc{} trims{} underruns{}{} rx {}/{}",
             stats.max_queue_ms,
             stats.target_queue_ms,
             loss_target,
@@ -2079,6 +2087,7 @@ impl App {
             stats.plc_fallbacks,
             stats.hard_trim_count,
             stats.underrun_count,
+            backend_errors,
             self.voice_packets_received,
             format_bytes_compact(self.voice_bytes_received),
         ));

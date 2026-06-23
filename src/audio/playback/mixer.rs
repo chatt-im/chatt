@@ -11,6 +11,8 @@ use crate::audio::{
     },
 };
 
+const LIVE_PLAYBACK_BACKEND_ERROR_LOG_INTERVAL: Duration = Duration::from_secs(1);
+
 #[derive(Default)]
 pub(crate) struct LivePlaybackMixer {
     tuning: LiveAudioTuning,
@@ -18,6 +20,7 @@ pub(crate) struct LivePlaybackMixer {
     controls: HashMap<u32, PlaybackStreamControl>,
     pub(crate) stats: LivePlaybackMixerStats,
     last_diagnostic_at: Option<Instant>,
+    last_backend_error_log_at: Option<Instant>,
 }
 
 #[derive(Default)]
@@ -35,6 +38,9 @@ pub(crate) struct LivePlaybackMixerStats {
     pub(crate) silence_skip_rejected: u64,
     pub(crate) skipped_speech_gap_samples: u64,
     pub(crate) speech_gap_skip_count: u64,
+    pub(crate) backend_xruns: u64,
+    pub(crate) backend_stream_errors: u64,
+    pub(crate) last_backend_error: Option<String>,
 }
 
 impl LivePlaybackMixer {
@@ -49,6 +55,7 @@ impl LivePlaybackMixer {
             controls: HashMap::new(),
             stats: LivePlaybackMixerStats::default(),
             last_diagnostic_at: None,
+            last_backend_error_log_at: None,
         }
     }
 
@@ -127,6 +134,42 @@ impl LivePlaybackMixer {
         }
     }
 
+    pub(crate) fn record_backend_stream_error(
+        &mut self,
+        error: String,
+        is_xrun: bool,
+        now: Instant,
+    ) {
+        self.stats.backend_stream_errors = self.stats.backend_stream_errors.saturating_add(1);
+        if is_xrun {
+            self.stats.backend_xruns = self.stats.backend_xruns.saturating_add(1);
+        }
+        self.stats.last_backend_error = Some(error.clone());
+
+        if self.last_backend_error_log_at.is_some_and(|at| {
+            now.saturating_duration_since(at) < LIVE_PLAYBACK_BACKEND_ERROR_LOG_INTERVAL
+        }) {
+            return;
+        }
+        self.last_backend_error_log_at = Some(now);
+
+        if is_xrun {
+            kvlog::warn!(
+                "live playback backend xrun",
+                error = error.as_str(),
+                backend_xruns = self.stats.backend_xruns,
+                backend_stream_errors = self.stats.backend_stream_errors
+            );
+        } else {
+            kvlog::warn!(
+                "live playback backend stream error",
+                error = error.as_str(),
+                backend_xruns = self.stats.backend_xruns,
+                backend_stream_errors = self.stats.backend_stream_errors
+            );
+        }
+    }
+
     pub(crate) fn queued_samples(&self) -> usize {
         self.streams
             .values()
@@ -184,7 +227,9 @@ impl LivePlaybackMixer {
                 silence_skip_rejected = self.stats.silence_skip_rejected,
                 speech_gap_skip_count = self.stats.speech_gap_skip_count,
                 skipped_speech_gap_ms =
-                    samples_to_ms(self.stats.skipped_speech_gap_samples as usize)
+                    samples_to_ms(self.stats.skipped_speech_gap_samples as usize),
+                backend_xruns = self.stats.backend_xruns,
+                backend_stream_errors = self.stats.backend_stream_errors
             );
         }
     }
@@ -234,6 +279,9 @@ impl LivePlaybackMixer {
             silence_skip_rejected: self.stats.silence_skip_rejected,
             speech_gap_skip_count: self.stats.speech_gap_skip_count,
             skipped_speech_gap_ms: samples_to_ms(self.stats.skipped_speech_gap_samples as usize),
+            backend_xruns: self.stats.backend_xruns,
+            backend_stream_errors: self.stats.backend_stream_errors,
+            last_backend_error: self.stats.last_backend_error.clone(),
         }
     }
 
@@ -432,5 +480,26 @@ mod tests {
 
         assert_eq!(pop_next_nonzero_window(&mut mixer, now), 0.0);
         assert!(mixer.queued_samples() < before);
+    }
+
+    #[test]
+    fn mixer_records_backend_stream_errors() {
+        let now = Instant::now();
+        let mut mixer = LivePlaybackMixer::new();
+
+        mixer.record_backend_stream_error(
+            "A buffer underrun or overrun occurred.".to_string(),
+            true,
+            now,
+        );
+        mixer.record_backend_stream_error("device disconnected".to_string(), false, now);
+
+        let snapshot = mixer.snapshot_at(now);
+        assert_eq!(snapshot.backend_xruns, 1);
+        assert_eq!(snapshot.backend_stream_errors, 2);
+        assert_eq!(
+            snapshot.last_backend_error.as_deref(),
+            Some("device disconnected")
+        );
     }
 }

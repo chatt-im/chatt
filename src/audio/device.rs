@@ -11,8 +11,8 @@ use std::{
 };
 
 use cpal::{
-    BufferSize, FromSample, Sample, SampleFormat, Stream, StreamConfig, SupportedBufferSize,
-    SupportedStreamConfig,
+    BufferSize, ErrorKind, FromSample, Sample, SampleFormat, Stream, StreamConfig,
+    SupportedBufferSize, SupportedStreamConfig,
     traits::{DeviceTrait, HostTrait},
 };
 use hashbrown::HashSet;
@@ -1097,6 +1097,7 @@ fn build_typed_live_output_stream<T>(
 where
     T: Sample + cpal::SizedSample + FromSample<f32> + Send + 'static,
 {
+    let error_mixer = Arc::clone(&mixer);
     device
         .build_output_stream(
             stream_config,
@@ -1107,11 +1108,23 @@ where
                 live_playback_callback(output, channels, &mixer, echo_control.as_ref());
             },
             move |error| {
-                eprintln!("live playback stream error: {error}");
+                record_live_playback_stream_error(&error_mixer, error);
             },
             None,
         )
         .map_err(|error| format!("failed to build live output stream: {error}"))
+}
+
+fn record_live_playback_stream_error(mixer: &Arc<Mutex<LivePlaybackMixer>>, error: cpal::Error) {
+    let is_xrun = error.kind() == ErrorKind::Xrun;
+    let error = error.to_string();
+    if let Ok(mut mixer) = mixer.lock() {
+        mixer.record_backend_stream_error(error, is_xrun, Instant::now());
+    } else if is_xrun {
+        kvlog::warn!("live playback backend xrun", error = error.as_str());
+    } else {
+        kvlog::warn!("live playback backend stream error", error = error.as_str());
+    }
 }
 
 fn build_typed_output_stream<T>(
@@ -1180,7 +1193,7 @@ fn live_playback_callback<T>(
 ) where
     T: Sample + FromSample<f32>,
 {
-    let Ok(mut mixer) = mixer.lock() else {
+    let Ok(mut mixer) = mixer.try_lock() else {
         for sample in output {
             *sample = T::from_sample(0.0);
         }
