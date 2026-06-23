@@ -13,5 +13,3 @@ pub(crate) use pipeline::{
 
 #[cfg(test)]
 pub(crate) use dsp::is_capture_skip_safe_silence;
-#[cfg(test)]
-pub(crate) use pipeline::pack_current_opus_silence_ranges;

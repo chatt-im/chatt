@@ -94,7 +94,6 @@ fn exp1_drift_and_block_size_through_real_pipeline() {
                     stream_id: 1,
                     sequence: seq,
                     flags: 0,
-                    silence_ranges: 0,
                     payload,
                     received_at: now,
                 };
@@ -132,39 +131,35 @@ fn exp1_drift_and_block_size_through_real_pipeline() {
     }
 }
 
-/// EXP 2: silence trimming is gated on the SENDER's silence flag, not on the
-/// actual acoustic content. Two queues with bit-identical silent audio behave
-/// differently solely because one is flagged silent and the other is not.
+/// EXP 2: silence trimming is based on decoded acoustic energy, not sender
+/// metadata.
 #[test]
-fn exp2_silence_skip_depends_on_sender_flag_not_acoustics() {
-    println!("\n=== EXP2: silence-skip gating ===");
+fn exp2_silence_skip_uses_decoded_energy() {
+    println!("\n=== EXP2: silence-skip energy gating ===");
     let now = Instant::now();
     let queued = samples_for_duration(Duration::from_millis(600));
 
-    for (label, silence_hint) in [("flagged_silent", true), ("unflagged_silent", false)] {
-        let mut stream = AdaptivePlaybackStream::new(test_tuning()).unwrap();
-        let mut stats = crate::audio::playback::LivePlaybackMixerStats::default();
-        stream.queue_samples(
-            &vec![0.0; queued],
-            DecodedFrameSource::Normal,
-            silence_hint,
-            now,
-            &mut stats,
-        );
-        let before = stream.queued_samples();
-        // Pump the per-sample path so maybe_skip_silence runs.
-        for _ in 0..480 {
-            let _ = stream.pop_sample(now, &mut stats);
-        }
-        let after = stream.queued_samples();
-        println!(
-            "{label:>16}: queue {}ms -> {}ms  silence_skip_count={} skipped={}ms (audio is bit-identical zeros)",
-            samples_to_ms(before),
-            samples_to_ms(after),
-            stats.silence_skip_count,
-            samples_to_ms(stats.skipped_silence_samples as usize),
-        );
+    let mut stream = AdaptivePlaybackStream::new(test_tuning()).unwrap();
+    let mut stats = crate::audio::playback::LivePlaybackMixerStats::default();
+    stream.queue_samples(
+        &vec![0.0; queued],
+        DecodedFrameSource::Normal,
+        now,
+        &mut stats,
+    );
+    let before = stream.queued_samples();
+    // Pump the per-sample path so maybe_skip_silence runs.
+    for _ in 0..480 {
+        let _ = stream.pop_sample(now, &mut stats);
     }
+    let after = stream.queued_samples();
+    println!(
+        "silent zeros: queue {}ms -> {}ms  silence_skip_count={} skipped={}ms",
+        samples_to_ms(before),
+        samples_to_ms(after),
+        stats.silence_skip_count,
+        samples_to_ms(stats.skipped_silence_samples as usize),
+    );
 
     println!("\n--- capture-side silence classifier (is_capture_skip_safe_silence, vad=0) ---");
     let tuning = test_tuning();
@@ -222,7 +217,6 @@ fn exp3_loss_expansion_stickiness() {
     stream.queue_samples(
         &vec![0.0; LIVE_OPUS_FRAME_SAMPLES],
         DecodedFrameSource::Plc,
-        false,
         now,
         &mut stats,
     );
@@ -238,7 +232,6 @@ fn exp3_loss_expansion_stickiness() {
         stream.queue_samples(
             &vec![0.0; LIVE_OPUS_FRAME_SAMPLES],
             DecodedFrameSource::Plc,
-            false,
             now + Duration::from_millis(index),
             &mut stats,
         );
@@ -256,7 +249,6 @@ fn exp3_loss_expansion_stickiness() {
     stream.queue_samples(
         &vec![0.0; backlog],
         DecodedFrameSource::Normal,
-        false,
         now,
         &mut stats,
     );
@@ -289,7 +281,7 @@ fn exp4_catch_up_resampling_pitch_shift() {
         tuning.adaptive_catch_up = catch_up;
         let mut stream = AdaptivePlaybackStream::new(tuning).unwrap();
         let mut stats = crate::audio::playback::LivePlaybackMixerStats::default();
-        stream.queue_samples(&tone, DecodedFrameSource::Normal, false, now, &mut stats);
+        stream.queue_samples(&tone, DecodedFrameSource::Normal, now, &mut stats);
 
         let mut out = Vec::new();
         while stream.queued_samples() > 8 {
@@ -387,25 +379,22 @@ fn exp6_silence_skip_threshold_excludes_short_gaps() {
     for gap_ms in [120u64, 150, 200, 240, 250, 300] {
         let mut stream = AdaptivePlaybackStream::new(test_tuning()).unwrap();
         let mut stats = crate::audio::playback::LivePlaybackMixerStats::default();
-        // speech, then a flagged-silent gap, then speech.
+        // speech, then a low-energy gap, then speech.
         stream.queue_samples(
             &vec![0.3; speech],
             DecodedFrameSource::Normal,
-            false,
             now,
             &mut stats,
         );
         stream.queue_samples(
             &vec![0.0; samples_for_duration(Duration::from_millis(gap_ms))],
             DecodedFrameSource::Normal,
-            true,
             now,
             &mut stats,
         );
         stream.queue_samples(
             &vec![0.3; speech],
             DecodedFrameSource::Normal,
-            false,
             now,
             &mut stats,
         );
@@ -469,7 +458,6 @@ fn run_clean_pipeline(
                 stream_id: 1,
                 sequence: seq,
                 flags: 0,
-                silence_ranges: 0,
                 payload: packets[seq as usize % packets.len()].clone(),
                 received_at: now,
             };

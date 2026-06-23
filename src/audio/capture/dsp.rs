@@ -5,8 +5,8 @@ use sonora::config::{AdaptiveDigital, GainController2};
 use sonora::{AudioProcessing, Config as ApmConfig, StreamConfig as ApmStreamConfig};
 
 use crate::audio::shared::{
-    AudioStats, FRAME_SAMPLES, LIVE_PLAYBACK_SILENCE_RANGE_COUNT, LiveAudioTuning,
-    frames_for_duration, pack_silence_range, peak_i16_scale, rms_i16_scale, samples_for_duration,
+    AudioStats, FRAME_SAMPLES, LiveAudioTuning, frames_for_duration, peak_i16_scale, rms_i16_scale,
+    samples_for_duration,
 };
 
 const I16_SCALE: f32 = i16::MAX as f32;
@@ -179,65 +179,8 @@ pub(crate) fn is_capture_skip_safe_silence(
     vad <= tuning.silence_vad_max && peak < 0.20 && rms < 0.05
 }
 
-pub(crate) struct SilenceRangeTracker {
-    frames: VecDeque<bool>,
-    max_frames: usize,
-}
-
-impl SilenceRangeTracker {
-    pub(crate) fn new(tuning: LiveAudioTuning) -> Self {
-        let max_frames = (samples_for_duration(tuning.dred_horizon) / FRAME_SAMPLES)
-            .saturating_add(1)
-            .max(1);
-        Self {
-            frames: VecDeque::with_capacity(max_frames),
-            max_frames,
-        }
-    }
-
-    pub(crate) fn observe_frame(&mut self, silence: bool) -> u64 {
-        self.frames.push_front(silence);
-        while self.frames.len() > self.max_frames {
-            self.frames.pop_back();
-        }
-        self.encode()
-    }
-
-    fn encode(&self) -> u64 {
-        let mut encoded = 0u64;
-        let mut range = 0usize;
-        let mut index = 0usize;
-
-        while index < self.frames.len() && range < LIVE_PLAYBACK_SILENCE_RANGE_COUNT {
-            while index < self.frames.len() && !self.frames[index] {
-                index += 1;
-            }
-            if index >= self.frames.len() {
-                break;
-            }
-
-            let start_frame = index;
-            while index < self.frames.len() && self.frames[index] {
-                index += 1;
-            }
-            let frame_len = index - start_frame;
-            let start_samples = start_frame
-                .saturating_mul(FRAME_SAMPLES)
-                .min(u16::MAX as usize);
-            let len_samples = frame_len
-                .saturating_mul(FRAME_SAMPLES)
-                .min(u16::MAX as usize);
-            encoded |= pack_silence_range(range, start_samples as u16, len_samples as u16);
-            range += 1;
-        }
-
-        encoded
-    }
-}
-
 pub(crate) struct CaptureBufferedFrame {
     pub(crate) samples: Vec<f32>,
-    pub(crate) silence_ranges: u64,
 }
 
 pub(crate) enum CaptureGateDecision {
@@ -275,12 +218,7 @@ impl LongSilenceGate {
         }
     }
 
-    pub(crate) fn observe(
-        &mut self,
-        samples: &mut [f32],
-        silence: bool,
-        silence_ranges: u64,
-    ) -> CaptureGateDecision {
+    pub(crate) fn observe(&mut self, samples: &mut [f32], silence: bool) -> CaptureGateDecision {
         if silence {
             self.silence_frames = self.silence_frames.saturating_add(1);
         } else {
@@ -289,14 +227,13 @@ impl LongSilenceGate {
 
         if self.suppressed {
             if silence {
-                self.push_preroll(samples, silence_ranges);
+                self.push_preroll(samples);
                 return CaptureGateDecision::SuppressCurrent;
             }
 
             let mut frames = self.preroll.drain(..).collect::<Vec<_>>();
             frames.push(CaptureBufferedFrame {
                 samples: samples.to_vec(),
-                silence_ranges,
             });
             apply_fade_in_to_frames(&mut frames, self.ramp_samples);
             self.suppressed = false;
@@ -310,21 +247,20 @@ impl LongSilenceGate {
 
         if silence && self.silence_frames > self.stop_frames {
             self.suppressed = true;
-            self.push_preroll(samples, silence_ranges);
+            self.push_preroll(samples);
             return CaptureGateDecision::SuppressCurrent;
         }
 
         CaptureGateDecision::TransmitCurrent
     }
 
-    fn push_preroll(&mut self, samples: &[f32], silence_ranges: u64) {
+    fn push_preroll(&mut self, samples: &[f32]) {
         if self.preroll_frames == 0 {
             return;
         }
 
         self.preroll.push_back(CaptureBufferedFrame {
             samples: samples.to_vec(),
-            silence_ranges,
         });
         while self.preroll.len() > self.preroll_frames {
             self.preroll.pop_front();
@@ -379,7 +315,6 @@ pub(crate) fn store_processed_level_stats(stats: &AudioStats, samples: &[f32]) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::audio::shared::silence_ranges_contain;
     #[allow(unused_imports)]
     use crate::audio::test_support::*;
 
@@ -433,41 +368,13 @@ mod tests {
     }
 
     #[test]
-    fn silence_range_tracker_keeps_two_recent_sample_ranges() {
-        let mut tracker = SilenceRangeTracker::new(test_tuning());
-
-        assert_eq!(tracker.observe_frame(false), 0);
-        assert!(silence_ranges_contain(tracker.observe_frame(true), 0));
-        assert!(silence_ranges_contain(
-            tracker.observe_frame(true),
-            FRAME_SAMPLES
-        ));
-        assert_eq!(
-            tracker.observe_frame(false),
-            pack_silence_range(0, FRAME_SAMPLES as u16, (FRAME_SAMPLES * 2) as u16)
-        );
-
-        let encoded = tracker.observe_frame(true);
-
-        assert_eq!(
-            encoded,
-            pack_silence_range(0, 0, FRAME_SAMPLES as u16)
-                | pack_silence_range(1, (FRAME_SAMPLES * 2) as u16, (FRAME_SAMPLES * 2) as u16)
-        );
-        assert!(silence_ranges_contain(encoded, 0));
-        assert!(!silence_ranges_contain(encoded, FRAME_SAMPLES));
-        assert!(silence_ranges_contain(encoded, FRAME_SAMPLES * 2));
-        assert!(!silence_ranges_contain(encoded, FRAME_SAMPLES * 4));
-    }
-
-    #[test]
     fn long_silence_gate_suppresses_after_threshold_with_fade_out() {
         let mut gate = LongSilenceGate::with_limits(3, 2, 4);
 
-        for range in 0..2 {
+        for _ in 0..2 {
             let mut frame = vec![1.0; 8];
             assert!(matches!(
-                gate.observe(&mut frame, true, range),
+                gate.observe(&mut frame, true),
                 CaptureGateDecision::TransmitCurrent
             ));
             assert!(
@@ -479,7 +386,7 @@ mod tests {
 
         let mut final_frame = vec![1.0; 8];
         assert!(matches!(
-            gate.observe(&mut final_frame, true, 2),
+            gate.observe(&mut final_frame, true),
             CaptureGateDecision::TransmitCurrent
         ));
         assert!(final_frame[4] < 1.0);
@@ -487,7 +394,7 @@ mod tests {
 
         let mut suppressed_frame = vec![1.0; 8];
         assert!(matches!(
-            gate.observe(&mut suppressed_frame, true, 3),
+            gate.observe(&mut suppressed_frame, true),
             CaptureGateDecision::SuppressCurrent
         ));
     }
@@ -497,30 +404,27 @@ mod tests {
         let mut gate = LongSilenceGate::with_limits(1, 2, 4);
         let mut threshold_frame = vec![0.1; 4];
         assert!(matches!(
-            gate.observe(&mut threshold_frame, true, 10),
+            gate.observe(&mut threshold_frame, true),
             CaptureGateDecision::TransmitCurrent
         ));
 
         let mut old_preroll = vec![0.2; 4];
         assert!(matches!(
-            gate.observe(&mut old_preroll, true, 20),
+            gate.observe(&mut old_preroll, true),
             CaptureGateDecision::SuppressCurrent
         ));
         let mut recent_preroll = vec![0.4; 4];
         assert!(matches!(
-            gate.observe(&mut recent_preroll, true, 30),
+            gate.observe(&mut recent_preroll, true),
             CaptureGateDecision::SuppressCurrent
         ));
 
         let mut speech = vec![1.0; 4];
-        let CaptureGateDecision::Resume(frames) = gate.observe(&mut speech, false, 40) else {
+        let CaptureGateDecision::Resume(frames) = gate.observe(&mut speech, false) else {
             panic!("speech should resume transmission");
         };
 
         assert_eq!(frames.len(), 3);
-        assert_eq!(frames[0].silence_ranges, 20);
-        assert_eq!(frames[1].silence_ranges, 30);
-        assert_eq!(frames[2].silence_ranges, 40);
         assert!(frames[0].samples[0] > 0.0);
         assert!(frames[0].samples[0] < frames[0].samples[3]);
         assert!((frames[1].samples[0] - 0.4).abs() < f32::EPSILON);

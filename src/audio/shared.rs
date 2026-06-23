@@ -116,7 +116,6 @@ pub(crate) const LIVE_PLAYBACK_SILENCE_MIN_GAP: Duration = Duration::from_millis
 pub(crate) const LIVE_PLAYBACK_SILENCE_RAMP: Duration = Duration::from_millis(10);
 pub(crate) const LIVE_PLAYBACK_SILENCE_MAX_SKIP: Duration = Duration::from_millis(200);
 pub(crate) const LIVE_PLAYBACK_SILENCE_MIN_SKIP: Duration = Duration::from_millis(20);
-pub(crate) const LIVE_PLAYBACK_SILENCE_RANGE_COUNT: usize = 2;
 pub(crate) const LIVE_PLAYBACK_RECOVERY_DECLICK: Duration = Duration::from_millis(5);
 pub(crate) const LIVE_PLAYBACK_RECOVERY_DECLICK_MIN_DELTA: f32 = 0.01;
 pub(crate) const LIVE_CAPTURE_LONG_SILENCE_STOP: Duration = Duration::from_secs(2);
@@ -357,7 +356,6 @@ pub struct RemoteVoicePacket {
     pub stream_id: u32,
     pub sequence: u32,
     pub flags: u8,
-    pub silence_ranges: u64,
     pub payload: Vec<u8>,
     /// Wall-clock arrival time captured at the UDP socket read, before any
     /// downstream channel batching. The jitter estimator measures interarrival
@@ -369,7 +367,6 @@ pub struct RemoteVoicePacket {
 pub struct LocalVoiceFrame {
     pub flags: u8,
     pub payload: Vec<u8>,
-    pub silence_ranges: u64,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -640,54 +637,6 @@ pub(crate) fn peak_normalized(samples: &[f32]) -> f32 {
 
 pub(crate) fn vad_to_u8(vad_probability: f32) -> u8 {
     (vad_probability.clamp(0.0, 1.0) * u8::MAX as f32).round() as u8
-}
-
-pub(crate) fn pack_silence_range(range: usize, start_samples: u16, len_samples: u16) -> u64 {
-    let shift = range.saturating_mul(32);
-    if shift >= u64::BITS as usize {
-        return 0;
-    }
-    let packed = u32::from(start_samples) | (u32::from(len_samples) << 16);
-    u64::from(packed) << shift
-}
-
-pub(crate) fn silence_ranges_contain(silence_ranges: u64, offset_samples: usize) -> bool {
-    for range in 0..LIVE_PLAYBACK_SILENCE_RANGE_COUNT {
-        let shift = range * 32;
-        let packed = ((silence_ranges >> shift) & u64::from(u32::MAX)) as u32;
-        let start = (packed & 0xffff) as usize;
-        let len = (packed >> 16) as usize;
-        if len == 0 {
-            continue;
-        }
-        if offset_samples >= start && offset_samples < start.saturating_add(len) {
-            return true;
-        }
-    }
-    false
-}
-
-pub(crate) fn emit_decoded_samples_by_silence_ranges<F>(
-    trace: &mut Option<LiveAudioTraceWriter>,
-    samples: &[f32],
-    source: DecodedFrameSource,
-    silence_ranges: u64,
-    on_samples: &mut F,
-) where
-    F: FnMut(&mut Option<LiveAudioTraceWriter>, &[f32], DecodedFrameSource, bool),
-{
-    if samples.is_empty() {
-        on_samples(trace, samples, source, false);
-        return;
-    }
-
-    let mut offset = 0usize;
-    while offset < samples.len() {
-        let next = offset.saturating_add(FRAME_SAMPLES).min(samples.len());
-        let silence_hint = silence_ranges_contain(silence_ranges, offset);
-        on_samples(trace, &samples[offset..next], source, silence_hint);
-        offset = next;
-    }
 }
 
 pub(crate) fn convert_i16_scale_to_pcm_i16(input: &[f32], output: &mut [i16]) {
@@ -994,7 +943,6 @@ pub(crate) fn trace_decode_output(
     sequence: u32,
     source: DecodedFrameSource,
     decoded_samples: usize,
-    silence_hint: bool,
     error: Option<String>,
     samples: &[f32],
 ) {
@@ -1013,7 +961,6 @@ pub(crate) fn trace_decode_output(
         sequence,
         source: trace_source_name(source),
         decoded_samples,
-        silence_hint,
         rms: rms_normalized(samples),
         peak: peak_normalized(samples),
         max_delta: max_adjacent_delta(samples),
@@ -1028,7 +975,6 @@ pub(crate) fn trace_mixer_queue(
     now: Instant,
     stream_id: u32,
     source: DecodedFrameSource,
-    silence_hint: bool,
     samples: &[f32],
     max_queue_ms: u64,
 ) {
@@ -1040,7 +986,6 @@ pub(crate) fn trace_mixer_queue(
         time_ms: trace_time_ms(start, now),
         stream_id,
         source: trace_source_name(source),
-        silence_hint,
         samples: samples.len(),
         rms: rms_normalized(samples),
         peak: peak_normalized(samples),
@@ -1059,7 +1004,6 @@ pub(crate) fn normalized_to_i16_scale(samples: &[f32]) -> Vec<f32> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::audio::capture::pack_current_opus_silence_ranges;
     #[allow(unused_imports)]
     use crate::audio::test_support::*;
 
@@ -1072,31 +1016,5 @@ mod tests {
         );
 
         assert_eq!(output, [i16::MIN, i16::MIN, 16_384, 16_385, i16::MAX]);
-    }
-
-    #[test]
-    fn decoded_samples_keep_per_frame_silence_hints() {
-        let samples = vec![0.0; LIVE_OPUS_FRAME_SAMPLES];
-        let silence_ranges = pack_current_opus_silence_ranges(&[false, true]);
-        let mut chunks = Vec::new();
-        let mut trace = None;
-
-        emit_decoded_samples_by_silence_ranges(
-            &mut trace,
-            &samples,
-            DecodedFrameSource::Normal,
-            silence_ranges,
-            &mut |_, samples, source, silence_hint| {
-                chunks.push((samples.len(), source, silence_hint));
-            },
-        );
-
-        assert_eq!(
-            chunks,
-            vec![
-                (FRAME_SAMPLES, DecodedFrameSource::Normal, false),
-                (FRAME_SAMPLES, DecodedFrameSource::Normal, true),
-            ]
-        );
     }
 }

@@ -46,15 +46,12 @@ pub(crate) fn trace_output_window(
 pub(crate) fn simulation_drops_frame(
     config: LiveAudioSimulationConfig,
     stream_id: u32,
-    silence_hint: bool,
     rng: &mut SimRng,
     loss_state: &mut SimLossState,
 ) -> bool {
     match config.packet_loss {
         LiveAudioPacketLossProfile::ScenarioDefault => match config.scenario {
-            LiveAudioSimulationScenario::LossySpeech => {
-                rng.next_f64() < if silence_hint { 0.18 } else { 0.08 }
-            }
+            LiveAudioSimulationScenario::LossySpeech => rng.next_f64() < 0.08,
             LiveAudioSimulationScenario::GroupChat => {
                 let stream_bias = 0.02 * f64::from(stream_id.saturating_sub(1));
                 rng.next_f64() < 0.03 + stream_bias
@@ -65,15 +62,9 @@ pub(crate) fn simulation_drops_frame(
         | LiveAudioPacketLossProfile::Lan
         | LiveAudioPacketLossProfile::RegionalEthernet
         | LiveAudioPacketLossProfile::CleanJitter => false,
-        LiveAudioPacketLossProfile::MildRandom => {
-            rng.next_f64() < if silence_hint { 0.02 } else { 0.01 }
-        }
-        LiveAudioPacketLossProfile::ModerateRandom => {
-            rng.next_f64() < if silence_hint { 0.07 } else { 0.03 }
-        }
-        LiveAudioPacketLossProfile::SevereRandom => {
-            rng.next_f64() < if silence_hint { 0.18 } else { 0.08 }
-        }
+        LiveAudioPacketLossProfile::MildRandom => rng.next_f64() < 0.01,
+        LiveAudioPacketLossProfile::ModerateRandom => rng.next_f64() < 0.03,
+        LiveAudioPacketLossProfile::SevereRandom => rng.next_f64() < 0.08,
         LiveAudioPacketLossProfile::Random30 => rng.next_f64() < 0.30,
         LiveAudioPacketLossProfile::Random45 => rng.next_f64() < 0.45,
         LiveAudioPacketLossProfile::Random60 => rng.next_f64() < 0.60,

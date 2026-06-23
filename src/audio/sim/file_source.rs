@@ -213,7 +213,6 @@ pub(crate) fn deliver_ready_file_source_packets<F>(
             LocalVoiceFrame {
                 flags: packet.packet.flags,
                 payload: packet.packet.payload,
-                silence_ranges: packet.packet.silence_ranges,
             },
         );
         report.delivered_frames = report.delivered_frames.saturating_add(1);

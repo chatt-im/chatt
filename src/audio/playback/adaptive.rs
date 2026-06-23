@@ -117,7 +117,6 @@ impl AdaptivePlaybackStream {
         &mut self,
         samples: &[f32],
         source: DecodedFrameSource,
-        silence_hint: bool,
         now: Instant,
         stats: &mut LivePlaybackMixerStats,
     ) {
@@ -132,7 +131,7 @@ impl AdaptivePlaybackStream {
         }
         let mut samples = samples.to_vec();
         self.declick_recovery_boundary(&mut samples, source);
-        self.input.push_back_owned(samples, source, silence_hint);
+        self.input.push_back_owned(samples, source);
         self.enforce_hard_bound(now, stats);
     }
 
@@ -602,10 +601,9 @@ mod tests {
     fn adaptive_stream_keeps_sixty_ms_target_under_good_conditions() {
         let now = Instant::now();
         let mut stream = AdaptivePlaybackStream::new(test_tuning()).unwrap();
-        stream.input.push_back(
-            &vec![0.0; samples_for_duration(LIVE_PLAYBACK_TARGET_QUEUE)],
-            false,
-        );
+        stream
+            .input
+            .push_back(&vec![0.0; samples_for_duration(LIVE_PLAYBACK_TARGET_QUEUE)]);
 
         assert_eq!(
             stream.adaptive_target_samples(now),
@@ -623,7 +621,6 @@ mod tests {
         stream.queue_samples(
             &vec![0.25; target_queue_samples(test_tuning())],
             DecodedFrameSource::Normal,
-            false,
             now,
             &mut stats,
         );
@@ -645,7 +642,6 @@ mod tests {
         stream.queue_samples(
             &vec![0.25; target.saturating_sub(1)],
             DecodedFrameSource::Normal,
-            false,
             now,
             &mut stats,
         );
@@ -655,7 +651,7 @@ mod tests {
         }
         assert_eq!(stream.queued_samples(), target.saturating_sub(1));
 
-        stream.queue_samples(&[0.25], DecodedFrameSource::Normal, false, now, &mut stats);
+        stream.queue_samples(&[0.25], DecodedFrameSource::Normal, now, &mut stats);
 
         assert_eq!(stream.pop_output_sample(now, &mut stats, block), Some(0.25));
     }
@@ -678,7 +674,6 @@ mod tests {
         stream.queue_samples(
             &vec![0.25; floor],
             DecodedFrameSource::Normal,
-            false,
             now,
             &mut stats,
         );
@@ -714,7 +709,6 @@ mod tests {
         stream.queue_samples(
             &vec![0.25; target_queue_samples(test_tuning())],
             DecodedFrameSource::Normal,
-            false,
             now,
             &mut stats,
         );
@@ -728,14 +722,8 @@ mod tests {
         let mut stream = AdaptivePlaybackStream::new(test_tuning()).unwrap();
         let mut stats = LivePlaybackMixerStats::default();
 
-        stream.queue_samples(&[-0.1; 4], DecodedFrameSource::Dred, false, now, &mut stats);
-        stream.queue_samples(
-            &[0.4; 4],
-            DecodedFrameSource::Normal,
-            false,
-            now,
-            &mut stats,
-        );
+        stream.queue_samples(&[-0.1; 4], DecodedFrameSource::Dred, now, &mut stats);
+        stream.queue_samples(&[0.4; 4], DecodedFrameSource::Normal, now, &mut stats);
 
         // The de-click ramp removes the boundary delta over the start of the
         // Normal frame: its first sample meets the last Dred sample (-0.1) and
@@ -750,20 +738,8 @@ mod tests {
         let mut stream = AdaptivePlaybackStream::new(test_tuning()).unwrap();
         let mut stats = LivePlaybackMixerStats::default();
 
-        stream.queue_samples(
-            &[-0.1; 4],
-            DecodedFrameSource::Normal,
-            false,
-            now,
-            &mut stats,
-        );
-        stream.queue_samples(
-            &[0.4; 4],
-            DecodedFrameSource::Normal,
-            false,
-            now,
-            &mut stats,
-        );
+        stream.queue_samples(&[-0.1; 4], DecodedFrameSource::Normal, now, &mut stats);
+        stream.queue_samples(&[0.4; 4], DecodedFrameSource::Normal, now, &mut stats);
 
         // No de-click between two Normal frames: the boundary samples are left
         // exactly as queued.
@@ -775,17 +751,16 @@ mod tests {
     fn adaptive_stream_does_not_slow_down_below_target_and_caps_catchup_speed() {
         let now = Instant::now();
         let mut stream = AdaptivePlaybackStream::new(test_tuning()).unwrap();
-        stream.input.push_back(
-            &vec![0.0; samples_for_duration(Duration::from_millis(20))],
-            false,
-        );
+        stream
+            .input
+            .push_back(&vec![0.0; samples_for_duration(Duration::from_millis(20))]);
 
         assert_eq!(stream.desired_correction(now), 0.0);
 
-        stream.input.push_back(
-            &vec![0.0; samples_for_duration(LIVE_PLAYBACK_HARD_QUEUE_BOUND)],
-            false,
-        );
+        stream.input.push_back(&vec![
+            0.0;
+            samples_for_duration(LIVE_PLAYBACK_HARD_QUEUE_BOUND)
+        ]);
         let correction = stream.desired_correction(now);
 
         assert!(correction > 0.14);
@@ -796,10 +771,9 @@ mod tests {
     fn adaptive_stream_uses_soft_recovery_range_for_trace_sized_backlog() {
         let now = Instant::now();
         let mut stream = AdaptivePlaybackStream::new(test_tuning()).unwrap();
-        stream.input.push_back(
-            &vec![0.0; samples_for_duration(Duration::from_millis(200))],
-            false,
-        );
+        stream
+            .input
+            .push_back(&vec![0.0; samples_for_duration(Duration::from_millis(200))]);
 
         let correction = stream.desired_correction(now);
         assert!(
@@ -808,10 +782,9 @@ mod tests {
         );
         assert!(correction < LIVE_PLAYBACK_MAX_SPEED_UP);
 
-        stream.input.push_back(
-            &vec![0.0; samples_for_duration(Duration::from_millis(120))],
-            false,
-        );
+        stream
+            .input
+            .push_back(&vec![0.0; samples_for_duration(Duration::from_millis(120))]);
         let correction = stream.desired_correction(now);
         assert!(correction > 0.14);
         assert!(correction <= LIVE_PLAYBACK_MAX_SPEED_UP);
@@ -822,10 +795,10 @@ mod tests {
         let now = Instant::now();
         let mut stream = AdaptivePlaybackStream::new(test_tuning()).unwrap();
         let mut stats = LivePlaybackMixerStats::default();
-        stream.input.push_back(
-            &vec![0.0; samples_for_duration(LIVE_PLAYBACK_HARD_QUEUE_BOUND)],
-            false,
-        );
+        stream.input.push_back(&vec![
+            0.0;
+            samples_for_duration(LIVE_PLAYBACK_HARD_QUEUE_BOUND)
+        ]);
 
         for _ in 0..samples_for_duration(Duration::from_millis(100)) {
             stream.update_correction(now, &mut stats);
@@ -847,7 +820,6 @@ mod tests {
         stream.queue_samples(
             &vec![0.25; target_queue_samples(test_tuning()) + LIVE_OPUS_FRAME_SAMPLES],
             DecodedFrameSource::Normal,
-            false,
             now,
             &mut stats,
         );
@@ -891,10 +863,9 @@ mod tests {
         }
         assert_eq!(samples_to_ms(stream.adaptive_target_samples(now)), 1_000);
 
-        stream.input.push_back(
-            &vec![0.0; samples_for_duration(Duration::from_millis(500))],
-            false,
-        );
+        stream
+            .input
+            .push_back(&vec![0.0; samples_for_duration(Duration::from_millis(500))]);
 
         assert!(stream.desired_correction(now) > 0.0);
     }
@@ -919,7 +890,6 @@ mod tests {
         stream.queue_samples(
             &speech[..backlog],
             DecodedFrameSource::Normal,
-            false,
             now,
             &mut stats,
         );
@@ -950,7 +920,7 @@ mod tests {
                 (phase.sin() as f32) * 0.5
             })
             .collect();
-        stream.queue_samples(&sine, DecodedFrameSource::Normal, false, now, &mut stats);
+        stream.queue_samples(&sine, DecodedFrameSource::Normal, now, &mut stats);
 
         let input_delta = max_adjacent_delta(&sine);
         let output = drain_catch_up(&mut stream, now);
@@ -985,7 +955,7 @@ mod tests {
             .collect();
         // Queue beyond the 1.5 s hard bound to force a trim, which resets the
         // read cursor. Playback must stay continuous afterwards.
-        stream.queue_samples(&sine, DecodedFrameSource::Normal, false, now, &mut stats);
+        stream.queue_samples(&sine, DecodedFrameSource::Normal, now, &mut stats);
         assert!(stats.hard_trim_count > 0, "hard-trim must fire");
 
         let input_delta = max_adjacent_delta(&sine);
@@ -1007,7 +977,6 @@ mod tests {
         stream.queue_samples(
             &vec![0.0; FRAME_SAMPLES],
             DecodedFrameSource::Dred,
-            false,
             now,
             &mut stats,
         );
@@ -1017,7 +986,6 @@ mod tests {
             stream.queue_samples(
                 &vec![0.0; FRAME_SAMPLES],
                 DecodedFrameSource::Plc,
-                false,
                 now + Duration::from_millis(index),
                 &mut stats,
             );
@@ -1040,7 +1008,6 @@ mod tests {
         stream.queue_samples(
             &vec![0.0; FRAME_SAMPLES],
             DecodedFrameSource::Plc,
-            false,
             now,
             &mut stats,
         );
@@ -1062,7 +1029,6 @@ mod tests {
         stream.queue_samples(
             &vec![0.0; oversized],
             DecodedFrameSource::Normal,
-            false,
             now,
             &mut stats,
         );
@@ -1078,34 +1044,24 @@ mod tests {
     }
 
     #[test]
-    fn adaptive_stream_compresses_low_energy_run_regardless_of_sender_flag() {
-        // The compressor measures decoded energy, so an identical low-energy run
-        // is shortened by the same amount whether or not the sender flagged it.
+    fn adaptive_stream_compresses_low_energy_run_from_decoded_energy() {
         let now = Instant::now();
         let queued = samples_for_duration(Duration::from_millis(400));
-        let compress_one = |silence_hint: bool| {
-            let mut stream = AdaptivePlaybackStream::new(test_tuning()).unwrap();
-            let mut stats = LivePlaybackMixerStats::default();
-            stream.queue_samples(
-                &vec![0.0; queued],
-                DecodedFrameSource::Normal,
-                silence_hint,
-                now,
-                &mut stats,
-            );
-            let _ = stream.pop_sample(now, &mut stats);
-            stats
-        };
+        let mut stream = AdaptivePlaybackStream::new(test_tuning()).unwrap();
+        let mut stats = LivePlaybackMixerStats::default();
+        stream.queue_samples(
+            &vec![0.0; queued],
+            DecodedFrameSource::Normal,
+            now,
+            &mut stats,
+        );
+        let _ = stream.pop_sample(now, &mut stats);
 
-        for silence_hint in [false, true] {
-            let stats = compress_one(silence_hint);
-            assert_eq!(stats.silence_skip_count, 1, "silence_hint={silence_hint}");
-            assert_eq!(
-                samples_to_ms(stats.skipped_silence_samples as usize),
-                duration_to_ms(LIVE_PLAYBACK_SILENCE_MAX_SKIP),
-                "silence_hint={silence_hint}"
-            );
-        }
+        assert_eq!(stats.silence_skip_count, 1);
+        assert_eq!(
+            samples_to_ms(stats.skipped_silence_samples as usize),
+            duration_to_ms(LIVE_PLAYBACK_SILENCE_MAX_SKIP),
+        );
     }
 
     #[test]
@@ -1118,7 +1074,6 @@ mod tests {
         stream.queue_samples(
             &vec![0.0; queued],
             DecodedFrameSource::Normal,
-            false,
             now,
             &mut stats,
         );
@@ -1150,21 +1105,18 @@ mod tests {
         stream.queue_samples(
             &vec![0.25; samples_for_duration(Duration::from_millis(100))],
             DecodedFrameSource::Normal,
-            false,
             now,
             &mut stats,
         );
         stream.queue_samples(
             &vec![0.0; samples_for_duration(Duration::from_millis(250))],
             DecodedFrameSource::Normal,
-            true,
             now,
             &mut stats,
         );
         stream.queue_samples(
             &vec![0.25; samples_for_duration(Duration::from_millis(100))],
             DecodedFrameSource::Normal,
-            false,
             now,
             &mut stats,
         );
@@ -1188,21 +1140,18 @@ mod tests {
         stream.queue_samples(
             &vec![0.25; samples_for_duration(Duration::from_millis(100))],
             DecodedFrameSource::Normal,
-            false,
             now,
             &mut stats,
         );
         stream.queue_samples(
             &vec![0.0; samples_for_duration(Duration::from_millis(150))],
             DecodedFrameSource::Normal,
-            true,
             now,
             &mut stats,
         );
         stream.queue_samples(
             &vec![0.25; samples_for_duration(Duration::from_millis(200))],
             DecodedFrameSource::Normal,
-            false,
             now,
             &mut stats,
         );
@@ -1232,10 +1181,10 @@ mod tests {
         tuning.adaptive_catch_up = false;
         let mut stream = AdaptivePlaybackStream::new(tuning).unwrap();
 
-        stream.input.push_back(
-            &vec![0.0; samples_for_duration(LIVE_PLAYBACK_HARD_QUEUE_BOUND)],
-            false,
-        );
+        stream.input.push_back(&vec![
+            0.0;
+            samples_for_duration(LIVE_PLAYBACK_HARD_QUEUE_BOUND)
+        ]);
 
         assert_eq!(stream.desired_correction(now), 0.0);
         assert_eq!(
@@ -1256,7 +1205,6 @@ mod tests {
         stream.queue_samples(
             &vec![0.0; queued],
             DecodedFrameSource::Normal,
-            true,
             now,
             &mut stats,
         );
@@ -1275,7 +1223,6 @@ mod tests {
             1,
             &vec![0.0; samples_for_duration(Duration::from_millis(400))],
             DecodedFrameSource::Plc,
-            true,
             now,
         );
         let _ = mixer.pop_mixed_sample(now);
@@ -1343,7 +1290,7 @@ mod tests {
         tuning.catch_up_start_excess = Duration::ZERO;
         let mut stream = AdaptivePlaybackStream::new(tuning).unwrap();
         let mut stats = LivePlaybackMixerStats::default();
-        stream.queue_samples(&tone, DecodedFrameSource::Normal, false, now, &mut stats);
+        stream.queue_samples(&tone, DecodedFrameSource::Normal, now, &mut stats);
 
         let mut output = Vec::new();
         while stream.queued_samples() > samples_for_duration(Duration::from_millis(100)) {

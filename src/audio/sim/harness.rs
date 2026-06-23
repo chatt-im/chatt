@@ -13,7 +13,7 @@ use crate::{
             AudioStats, FRAME_SAMPLES, LIVE_OPUS_FRAME_SAMPLES, LiveAudioTraceWriter,
             LocalVoiceFrame, RemoteVoicePacket, SAMPLE_RATE, duration_to_ms, frames_for_duration,
             max_adjacent_delta, normalized_to_i16_scale, peak_i16_scale, rms_i16_scale,
-            rms_normalized, samples_to_ms, silence_ranges_contain, soft_limit, trace_time_ms,
+            rms_normalized, samples_to_ms, soft_limit, trace_time_ms,
         },
         sim::{
             network::{
@@ -91,9 +91,7 @@ pub(crate) fn trace_network_decision(
     stream_id: u32,
     sequence: u32,
     flags: u8,
-    silence_ranges: u64,
     payload_bytes: usize,
-    silence_hint: bool,
     dropped: bool,
     delay: Duration,
 ) {
@@ -106,9 +104,7 @@ pub(crate) fn trace_network_decision(
         stream_id,
         sequence,
         flags,
-        silence_ranges,
         payload_bytes,
-        silence_hint,
         dropped,
         delay_ms: duration_to_ms(delay),
     });
@@ -122,9 +118,7 @@ pub(crate) fn trace_encoded_packet(
     stream_id: u32,
     sequence: u32,
     flags: u8,
-    silence_ranges: u64,
     payload_bytes: usize,
-    silence_hint: bool,
 ) {
     let Some(trace) = trace else {
         return;
@@ -135,9 +129,7 @@ pub(crate) fn trace_encoded_packet(
         stream_id,
         sequence,
         flags,
-        silence_ranges,
         payload_bytes,
-        silence_hint,
     });
 }
 
@@ -855,7 +847,6 @@ impl SimStreamState {
         self.next_sequence = self.next_sequence.wrapping_add(1);
         report.queued_frames = report.queued_frames.saturating_add(1);
 
-        let silence_hint = silence_ranges_contain(packet.silence_ranges, 0);
         trace_encoded_packet(
             trace,
             trace_start,
@@ -863,11 +854,9 @@ impl SimStreamState {
             stream_id,
             sequence,
             packet.flags,
-            packet.silence_ranges,
             packet.payload.len(),
-            silence_hint,
         );
-        let dropped = simulation_drops_frame(config, stream_id, silence_hint, rng, &mut self.loss);
+        let dropped = simulation_drops_frame(config, stream_id, rng, &mut self.loss);
         let deliver_at = now + simulation_delivery_delay(config.packet_loss, rng);
         trace_network_decision(
             trace,
@@ -876,9 +865,7 @@ impl SimStreamState {
             stream_id,
             sequence,
             packet.flags,
-            packet.silence_ranges,
             packet.payload.len(),
-            silence_hint,
             dropped,
             deliver_at.saturating_duration_since(now),
         );
@@ -892,7 +879,6 @@ impl SimStreamState {
                 stream_id,
                 sequence,
                 flags: packet.flags,
-                silence_ranges: packet.silence_ranges,
                 payload: packet.payload,
                 received_at: deliver_at,
             },

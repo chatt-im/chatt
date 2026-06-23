@@ -16,11 +16,9 @@ use crate::{
         shared::{
             DecodedFrameSource, LIVE_OPUS_FRAME_SAMPLES, LIVE_PACKET_FLAG_OPUS_RESET,
             LIVE_PLAYBACK_DRAIN_INTERVAL, LiveAudioTraceWriter, LiveAudioTuning,
-            LivePlaybackFeedback, MAX_OPUS_DECODE_SAMPLES, RemoteVoicePacket,
-            emit_decoded_samples_by_silence_ranges, samples_for_duration,
-            sequence_distance_forward, silence_ranges_contain, trace_decode_output,
-            trace_decoder_reset, trace_dred_parse, trace_dred_skip, trace_fast_forward,
-            trace_jitter_item, trace_mixer_queue,
+            LivePlaybackFeedback, MAX_OPUS_DECODE_SAMPLES, RemoteVoicePacket, samples_for_duration,
+            sequence_distance_forward, trace_decode_output, trace_decoder_reset, trace_dred_parse,
+            trace_dred_skip, trace_fast_forward, trace_jitter_item, trace_mixer_queue,
         },
     },
     network::{AudioPacketRef, InsertOutcome, PlayoutItem},
@@ -111,7 +109,6 @@ impl LiveDecodeStreams {
         let packet_ref = AudioPacketRef {
             sequence: packet.sequence,
             flags: packet.flags,
-            silence_ranges: packet.silence_ranges,
             payload: &packet.payload,
         };
         Some(stream.insert(packet_ref, now))
@@ -147,9 +144,9 @@ impl LiveDecodeStreams {
                 trace_start,
                 *stream_id,
                 trace,
-                |trace, samples, source, silence_hint| {
+                |trace, samples, source| {
                     if let Ok(mut mixer) = mixer.lock() {
-                        mixer.queue_stream_samples(*stream_id, samples, source, silence_hint, now);
+                        mixer.queue_stream_samples(*stream_id, samples, source, now);
                         mixer.note_stream_recommended_target(*stream_id, recommended_target, now);
                         max_stream_queue_ms =
                             max_stream_queue_ms.max(mixer.stream_queue_ms(*stream_id));
@@ -159,7 +156,6 @@ impl LiveDecodeStreams {
                             now,
                             *stream_id,
                             source,
-                            silence_hint,
                             samples,
                             mixer.snapshot_at(now).max_queue_ms,
                         );
@@ -235,7 +231,7 @@ impl LiveDecodeStream {
         mut on_samples: F,
         mut on_discontinuity: impl FnMut(),
     ) where
-        F: FnMut(&mut Option<LiveAudioTraceWriter>, &[f32], DecodedFrameSource, bool),
+        F: FnMut(&mut Option<LiveAudioTraceWriter>, &[f32], DecodedFrameSource),
     {
         let items = self.jitter.drain_ready(now);
         for item in &items {
@@ -247,7 +243,6 @@ impl LiveDecodeStream {
                     sequence,
                     flags,
                     payload,
-                    silence_ranges,
                     ..
                 } => {
                     trace_jitter_item(
@@ -267,7 +262,6 @@ impl LiveDecodeStream {
                     self.decode_playout(
                         payload,
                         DecodedFrameSource::Normal,
-                        *silence_ranges,
                         trace_start,
                         now,
                         stream_id,
@@ -290,7 +284,6 @@ impl LiveDecodeStream {
                         self.decode_playout(
                             &[],
                             DecodedFrameSource::Plc,
-                            0,
                             trace_start,
                             now,
                             stream_id,
@@ -324,7 +317,6 @@ impl LiveDecodeStream {
         &mut self,
         payload: &[u8],
         source: DecodedFrameSource,
-        silence_ranges: u64,
         trace_start: Instant,
         now: Instant,
         stream_id: u32,
@@ -332,7 +324,7 @@ impl LiveDecodeStream {
         trace: &mut Option<LiveAudioTraceWriter>,
         on_samples: &mut F,
     ) where
-        F: FnMut(&mut Option<LiveAudioTraceWriter>, &[f32], DecodedFrameSource, bool),
+        F: FnMut(&mut Option<LiveAudioTraceWriter>, &[f32], DecodedFrameSource),
     {
         let output_len = match source {
             DecodedFrameSource::Plc => LIVE_OPUS_FRAME_SAMPLES,
@@ -348,7 +340,6 @@ impl LiveDecodeStream {
         };
         match decoded {
             Ok(decoded) => {
-                let silence_hint = silence_ranges_contain(silence_ranges, 0);
                 let samples = &self.output_frame[..decoded];
                 trace_decode_output(
                     trace,
@@ -358,21 +349,10 @@ impl LiveDecodeStream {
                     sequence,
                     source,
                     decoded,
-                    silence_hint,
                     None,
                     samples,
                 );
-                if matches!(source, DecodedFrameSource::Normal) {
-                    emit_decoded_samples_by_silence_ranges(
-                        trace,
-                        samples,
-                        source,
-                        silence_ranges,
-                        on_samples,
-                    );
-                } else {
-                    on_samples(trace, samples, source, silence_hint);
-                }
+                on_samples(trace, samples, source);
             }
             Err(error) => {
                 eprintln!("failed to decode live opus packet: {error}");
@@ -384,11 +364,10 @@ impl LiveDecodeStream {
                     sequence,
                     DecodedFrameSource::DecodeError,
                     0,
-                    false,
                     Some(error.to_string()),
                     &[],
                 );
-                on_samples(trace, &[], DecodedFrameSource::DecodeError, false);
+                on_samples(trace, &[], DecodedFrameSource::DecodeError);
             }
         }
     }
@@ -414,7 +393,7 @@ impl LiveDecodeStream {
         on_samples: &mut F,
     ) -> bool
     where
-        F: FnMut(&mut Option<LiveAudioTraceWriter>, &[f32], DecodedFrameSource, bool),
+        F: FnMut(&mut Option<LiveAudioTraceWriter>, &[f32], DecodedFrameSource),
     {
         if self.dred_decoder.is_none() {
             trace_dred_skip(
@@ -438,14 +417,13 @@ impl LiveDecodeStream {
                 sequence,
                 flags,
                 payload,
-                silence_ranges,
             } = item
             {
-                bounding = Some((*sequence, *flags, payload.as_slice(), *silence_ranges));
+                bounding = Some((*sequence, *flags, payload.as_slice()));
                 break;
             }
         }
-        let Some((sequence, flags, payload, silence_ranges)) = bounding else {
+        let Some((sequence, flags, payload)) = bounding else {
             return false;
         };
         if flags & LIVE_PACKET_FLAG_OPUS_RESET != 0 {
@@ -535,7 +513,6 @@ impl LiveDecodeStream {
         let Ok(offset) = i32::try_from(offset_samples) else {
             return false;
         };
-        let silence_hint = silence_ranges_contain(silence_ranges, offset_samples as usize);
         let output_len = LIVE_OPUS_FRAME_SAMPLES.min(self.output_frame.len());
         let gap = self
             .dred_gap
@@ -561,11 +538,10 @@ impl LiveDecodeStream {
                     missing_sequence,
                     DecodedFrameSource::Dred,
                     decoded,
-                    silence_hint,
                     None,
                     samples,
                 );
-                on_samples(trace, samples, DecodedFrameSource::Dred, silence_hint);
+                on_samples(trace, samples, DecodedFrameSource::Dred);
                 true
             }
             Ok(_) => {
@@ -598,7 +574,6 @@ impl LiveDecodeStream {
                     missing_sequence,
                     DecodedFrameSource::DecodeError,
                     0,
-                    false,
                     Some(error.to_string()),
                     &[],
                 );
@@ -793,7 +768,7 @@ mod tests {
             start,
             1,
             &mut trace,
-            |_, samples, _source, _silence| {
+            |_, samples, _source| {
                 decoded.extend_from_slice(samples);
             },
             || {},
@@ -810,7 +785,7 @@ mod tests {
             start,
             1,
             &mut trace,
-            |_, samples, _source, _silence| {
+            |_, samples, _source| {
                 decoded.extend_from_slice(samples);
             },
             || {},
@@ -822,7 +797,7 @@ mod tests {
             start,
             1,
             &mut trace,
-            |_, samples, _source, _silence| {
+            |_, samples, _source| {
                 decoded.extend_from_slice(samples);
             },
             || {},
@@ -848,7 +823,6 @@ mod tests {
                 stream_id: 1,
                 sequence,
                 flags: 0,
-                silence_ranges: 0,
                 payload: vec![0u8; 8],
                 received_at,
             };
