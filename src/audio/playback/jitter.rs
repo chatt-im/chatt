@@ -83,13 +83,11 @@ mod tests {
                 PlayoutItem::Audio {
                     sequence: 1,
                     flags: 0,
-                    silence_ranges: 0,
                     payload: vec![1],
                 },
                 PlayoutItem::Audio {
                     sequence: 2,
                     flags: 0,
-                    silence_ranges: 0,
                     payload: vec![2],
                 },
             ]
@@ -112,7 +110,6 @@ mod tests {
             vec![PlayoutItem::Audio {
                 sequence: 0,
                 flags: 0,
-                silence_ranges: 0,
                 payload: vec![0],
             }]
         );
@@ -129,7 +126,6 @@ mod tests {
                 PlayoutItem::Audio {
                     sequence: 2,
                     flags: 0,
-                    silence_ranges: 0,
                     payload: vec![2],
                 },
             ]

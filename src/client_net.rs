@@ -998,7 +998,6 @@ enum P2pMediaPacket {
         stream_id: StreamId,
         sequence: u32,
         flags: u8,
-        silence_ranges: u64,
         opus: Vec<u8>,
         action: Option<P2pAction>,
     },
@@ -1235,7 +1234,6 @@ impl WorkerState {
                         stream_id,
                         sequence,
                         flags,
-                        silence_ranges,
                         opus,
                     },
                 )) => {
@@ -1245,7 +1243,6 @@ impl WorkerState {
                         stream_id = stream_id.0,
                         sequence,
                         flags,
-                        silence_ranges,
                         payload_size = opus.len()
                     );
                     self.dispatch_voice_packet(
@@ -1253,7 +1250,6 @@ impl WorkerState {
                             stream_id: stream_id.0,
                             sequence,
                             flags,
-                            silence_ranges,
                             payload: opus,
                             received_at: now,
                         },
@@ -1312,7 +1308,6 @@ impl WorkerState {
         let stream_id = packet.stream_id;
         let sequence = packet.sequence;
         let flags = packet.flags;
-        let silence_ranges = packet.silence_ranges;
         let payload_size = packet.payload.len();
         match self.voice_dedup.observe(stream_id, sequence) {
             RecentVoiceSequenceResult::New => {
@@ -1322,7 +1317,6 @@ impl WorkerState {
                     stream_id,
                     sequence,
                     flags,
-                    silence_ranges,
                     payload_size
                 );
             }
@@ -1434,24 +1428,16 @@ impl WorkerState {
             stream_id = stream_id.0,
             sequence,
             flags = frame.flags,
-            silence_ranges = frame.silence_ranges,
             payload_size = frame.payload.len()
         );
         let relay_payload = MediaPayload::Voice {
             stream_id,
             sequence,
             flags: frame.flags,
-            silence_ranges: frame.silence_ranges,
             opus: frame.payload.clone(),
         };
         self.send_media(&relay_payload);
-        self.send_p2p_voice(
-            stream_id,
-            sequence,
-            frame.flags,
-            frame.silence_ranges,
-            &frame.payload,
-        );
+        self.send_p2p_voice(stream_id, sequence, frame.flags, &frame.payload);
     }
 
     fn queue_file_upload(&mut self, path: PathBuf) {
@@ -2331,7 +2317,6 @@ impl WorkerState {
                         stream_id,
                         sequence,
                         flags,
-                        silence_ranges,
                         opus,
                     },
                 )) if connection_id == peer.connection_id => {
@@ -2340,7 +2325,6 @@ impl WorkerState {
                         stream_id,
                         sequence,
                         flags,
-                        silence_ranges,
                         opus,
                         action,
                     })
@@ -2370,7 +2354,6 @@ impl WorkerState {
                 stream_id,
                 sequence,
                 flags,
-                silence_ranges,
                 opus,
                 action,
             }) => {
@@ -2383,7 +2366,6 @@ impl WorkerState {
                     stream_id = stream_id.0,
                     sequence,
                     flags,
-                    silence_ranges,
                     payload_size = opus.len()
                 );
                 self.p2p_stream_owners.insert(stream_id, session_id);
@@ -2392,7 +2374,6 @@ impl WorkerState {
                         stream_id: stream_id.0,
                         sequence,
                         flags,
-                        silence_ranges,
                         payload: opus,
                         received_at: now,
                     },
@@ -2422,14 +2403,7 @@ impl WorkerState {
         true
     }
 
-    fn send_p2p_voice(
-        &mut self,
-        stream_id: StreamId,
-        sequence: u32,
-        flags: u8,
-        silence_ranges: u64,
-        opus: &[u8],
-    ) {
+    fn send_p2p_voice(&mut self, stream_id: StreamId, sequence: u32, flags: u8, opus: &[u8]) {
         let mut packets = Vec::new();
         for (session_id, peer) in &mut self.p2p_peers {
             let Some(selected) = peer.agent.selected() else {
@@ -2440,7 +2414,6 @@ impl WorkerState {
                 stream_id,
                 sequence,
                 flags,
-                silence_ranges,
                 opus: opus.to_vec(),
             };
             let counter = peer.send_counter;
@@ -3126,7 +3099,6 @@ mod tests {
             stream_id,
             sequence,
             flags: 0,
-            silence_ranges: 0,
             payload,
             received_at: Instant::now(),
         }

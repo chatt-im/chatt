@@ -4257,7 +4257,6 @@ mod tests {
             stream_id: 2,
             sequence: 1,
             flags: 0,
-            silence_ranges: 0,
             payload: vec![1, 2, 3, 4],
             received_at: Instant::now(),
         }));

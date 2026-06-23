@@ -64,7 +64,6 @@ impl LivePlaybackMixer {
         stream_id: u32,
         samples: &[f32],
         source: DecodedFrameSource,
-        silence_hint: bool,
         now: Instant,
     ) {
         match source {
@@ -97,7 +96,7 @@ impl LivePlaybackMixer {
                 }
             }
         };
-        stream.queue_samples(samples, source, silence_hint, now, &mut self.stats);
+        stream.queue_samples(samples, source, now, &mut self.stats);
     }
 
     /// Applies the receiver-recommended dynamic target to an existing stream.
@@ -348,7 +347,6 @@ mod tests {
             1,
             &vec![0.0; samples_for_duration(Duration::from_millis(220))],
             DecodedFrameSource::Normal,
-            false,
             now,
         );
         mixer.note_stream_discontinuity(1, now);
@@ -370,14 +368,12 @@ mod tests {
             1,
             &vec![0.4; FRAME_SAMPLES * 2],
             DecodedFrameSource::Normal,
-            false,
             now,
         );
         mixer.queue_stream_samples(
             2,
             &vec![0.4; FRAME_SAMPLES * 2],
             DecodedFrameSource::Normal,
-            false,
             now,
         );
 
@@ -390,21 +386,18 @@ mod tests {
             1,
             &vec![1.0; FRAME_SAMPLES * 2],
             DecodedFrameSource::Normal,
-            false,
             now,
         );
         mixer.queue_stream_samples(
             2,
             &vec![1.0; FRAME_SAMPLES * 2],
             DecodedFrameSource::Normal,
-            false,
             now,
         );
         mixer.queue_stream_samples(
             3,
             &vec![1.0; FRAME_SAMPLES * 2],
             DecodedFrameSource::Normal,
-            false,
             now,
         );
         assert!(pop_until_nonzero(&mut mixer, now) < 1.0);
@@ -418,14 +411,12 @@ mod tests {
             1,
             &vec![0.2; FRAME_SAMPLES * 2],
             DecodedFrameSource::Normal,
-            false,
             now,
         );
         mixer.queue_stream_samples(
             2,
             &vec![0.4; FRAME_SAMPLES * 2],
             DecodedFrameSource::Normal,
-            false,
             now,
         );
 
@@ -451,7 +442,6 @@ mod tests {
             1,
             &vec![0.25; FRAME_SAMPLES * 2],
             DecodedFrameSource::Normal,
-            false,
             now,
         );
 
@@ -476,7 +466,6 @@ mod tests {
             1,
             &vec![0.5; FRAME_SAMPLES * 2],
             DecodedFrameSource::Normal,
-            false,
             now,
         );
         let before = mixer.queued_samples();

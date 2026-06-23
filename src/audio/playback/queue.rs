@@ -26,32 +26,18 @@ impl MonoSampleQueue {
         Self::default()
     }
 
-    pub(crate) fn push_back(&mut self, samples: &[f32], silence_hint: bool) {
-        self.push_back_with_source(samples, DecodedFrameSource::Normal, silence_hint);
+    pub(crate) fn push_back(&mut self, samples: &[f32]) {
+        self.push_back_with_source(samples, DecodedFrameSource::Normal);
     }
 
-    fn push_back_with_source(
-        &mut self,
-        samples: &[f32],
-        source: DecodedFrameSource,
-        silence_hint: bool,
-    ) {
-        self.push_back_owned(samples.to_vec(), source, silence_hint);
+    fn push_back_with_source(&mut self, samples: &[f32], source: DecodedFrameSource) {
+        self.push_back_owned(samples.to_vec(), source);
     }
 
     /// Enqueues an owned sample buffer without copying it. Callers that already
     /// hold a `Vec<f32>` use this to avoid the extra allocation and copy that
     /// `push_back_with_source` incurs.
-    pub(crate) fn push_back_owned(
-        &mut self,
-        samples: Vec<f32>,
-        source: DecodedFrameSource,
-        // The sender's silence flag is now advisory only: the compressor decides
-        // from measured decoded energy below, so a missing or wrong flag no
-        // longer disables trimming. Retained on the signature pending the
-        // protocol-level removal of `silence_ranges`.
-        _silence_hint: bool,
-    ) {
+    pub(crate) fn push_back_owned(&mut self, samples: Vec<f32>, source: DecodedFrameSource) {
         if samples.is_empty() {
             return;
         }

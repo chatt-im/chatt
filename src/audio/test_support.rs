@@ -171,7 +171,6 @@ pub(crate) fn drive_gap_recovery(
             AudioPacketRef {
                 sequence,
                 flags: 0,
-                silence_ranges: 0,
                 payload,
             },
             start,
@@ -190,7 +189,7 @@ pub(crate) fn drive_gap_recovery(
         start,
         1,
         &mut trace,
-        |_, samples, source, _| {
+        |_, samples, source| {
             collected.push((source, samples.len()));
         },
         || {},
@@ -201,7 +200,7 @@ pub(crate) fn drive_gap_recovery(
         start,
         1,
         &mut trace,
-        |_, samples, source, _| {
+        |_, samples, source| {
             collected.push((source, samples.len()));
         },
         || {},
@@ -251,7 +250,6 @@ pub(crate) fn test_audio_packet(sequence: u32, payload: &[u8]) -> AudioPacketRef
     AudioPacketRef {
         sequence,
         flags: 0,
-        silence_ranges: 0,
         payload,
     }
 }

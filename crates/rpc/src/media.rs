@@ -1,7 +1,7 @@
 use crate::crypto::{self, AntiReplay, CryptoError, KeyMaterial};
 use crate::ids::{SessionId, StreamId};
 
-pub const UDP_VERSION: u8 = 1;
+pub const UDP_VERSION: u8 = 2;
 pub const UDP_HEADER_LEN: usize = 14;
 pub const SAFE_UDP_PAYLOAD_BYTES: usize = 1_200;
 pub const MAX_VOICE_PAYLOAD_BYTES: usize = 1_024;
@@ -37,7 +37,6 @@ pub enum MediaPayload {
         stream_id: StreamId,
         sequence: u32,
         flags: u8,
-        silence_ranges: u64,
         opus: Vec<u8>,
     },
     PeerVoice {
@@ -45,7 +44,6 @@ pub enum MediaPayload {
         stream_id: StreamId,
         sequence: u32,
         flags: u8,
-        silence_ranges: u64,
         opus: Vec<u8>,
     },
     VoiceFeedback {
@@ -250,7 +248,6 @@ pub fn encode_payload(payload: &MediaPayload) -> Result<Vec<u8>, MediaError> {
             stream_id,
             sequence,
             flags,
-            silence_ranges,
             opus,
         } => {
             if opus.is_empty() || opus.len() > MAX_VOICE_PAYLOAD_BYTES {
@@ -259,7 +256,6 @@ pub fn encode_payload(payload: &MediaPayload) -> Result<Vec<u8>, MediaError> {
             out.extend_from_slice(&stream_id.0.to_le_bytes());
             out.extend_from_slice(&sequence.to_le_bytes());
             out.push(*flags);
-            out.extend_from_slice(&silence_ranges.to_le_bytes());
             let len = u16::try_from(opus.len()).map_err(|_| MediaError::PayloadTooLarge)?;
             out.extend_from_slice(&len.to_le_bytes());
             out.extend_from_slice(opus);
@@ -269,7 +265,6 @@ pub fn encode_payload(payload: &MediaPayload) -> Result<Vec<u8>, MediaError> {
             stream_id,
             sequence,
             flags,
-            silence_ranges,
             opus,
         } => {
             if opus.is_empty() || opus.len() > MAX_VOICE_PAYLOAD_BYTES {
@@ -279,7 +274,6 @@ pub fn encode_payload(payload: &MediaPayload) -> Result<Vec<u8>, MediaError> {
             out.extend_from_slice(&stream_id.0.to_le_bytes());
             out.extend_from_slice(&sequence.to_le_bytes());
             out.push(*flags);
-            out.extend_from_slice(&silence_ranges.to_le_bytes());
             let len = u16::try_from(opus.len()).map_err(|_| MediaError::PayloadTooLarge)?;
             out.extend_from_slice(&len.to_le_bytes());
             out.extend_from_slice(opus);
@@ -333,36 +327,33 @@ pub fn decode_payload(kind: u8, bytes: &[u8]) -> Result<MediaPayload, MediaError
             })
         }
         KIND_VOICE => {
-            if bytes.len() < 19 {
+            if bytes.len() < 11 {
                 return Err(MediaError::InvalidPayload);
             }
             let stream_id = StreamId(u32::from_le_bytes(bytes[0..4].try_into().unwrap()));
             let sequence = u32::from_le_bytes(bytes[4..8].try_into().unwrap());
             let flags = bytes[8];
-            let silence_ranges = u64::from_le_bytes(bytes[9..17].try_into().unwrap());
-            let len = u16::from_le_bytes(bytes[17..19].try_into().unwrap()) as usize;
-            if len == 0 || len > MAX_VOICE_PAYLOAD_BYTES || bytes.len() != 19 + len {
+            let len = u16::from_le_bytes(bytes[9..11].try_into().unwrap()) as usize;
+            if len == 0 || len > MAX_VOICE_PAYLOAD_BYTES || bytes.len() != 11 + len {
                 return Err(MediaError::InvalidPayload);
             }
             Ok(MediaPayload::Voice {
                 stream_id,
                 sequence,
                 flags,
-                silence_ranges,
-                opus: bytes[19..].to_vec(),
+                opus: bytes[11..].to_vec(),
             })
         }
         KIND_PEER_VOICE => {
-            if bytes.len() < 27 {
+            if bytes.len() < 19 {
                 return Err(MediaError::InvalidPayload);
             }
             let connection_id = u64::from_le_bytes(bytes[0..8].try_into().unwrap());
             let stream_id = StreamId(u32::from_le_bytes(bytes[8..12].try_into().unwrap()));
             let sequence = u32::from_le_bytes(bytes[12..16].try_into().unwrap());
             let flags = bytes[16];
-            let silence_ranges = u64::from_le_bytes(bytes[17..25].try_into().unwrap());
-            let len = u16::from_le_bytes(bytes[25..27].try_into().unwrap()) as usize;
-            if len == 0 || len > MAX_VOICE_PAYLOAD_BYTES || bytes.len() != 27 + len {
+            let len = u16::from_le_bytes(bytes[17..19].try_into().unwrap()) as usize;
+            if len == 0 || len > MAX_VOICE_PAYLOAD_BYTES || bytes.len() != 19 + len {
                 return Err(MediaError::InvalidPayload);
             }
             Ok(MediaPayload::PeerVoice {
@@ -370,8 +361,7 @@ pub fn decode_payload(kind: u8, bytes: &[u8]) -> Result<MediaPayload, MediaError
                 stream_id,
                 sequence,
                 flags,
-                silence_ranges,
-                opus: bytes[27..].to_vec(),
+                opus: bytes[19..].to_vec(),
             })
         }
         KIND_VOICE_FEEDBACK => {
@@ -447,7 +437,6 @@ mod tests {
             stream_id: StreamId(9),
             sequence: 42,
             flags: 3,
-            silence_ranges: 0x0000_03c0_0000_0000,
             opus: vec![1, 2, 3],
         };
         let encoded = encode_payload(&payload).unwrap();
@@ -461,7 +450,6 @@ mod tests {
             stream_id: StreamId(9),
             sequence: 42,
             flags: 3,
-            silence_ranges: 0x0000_03c0_0000_0000,
             opus: vec![1, 2, 3],
         };
         let encoded = encode_payload(&payload).unwrap();

@@ -269,7 +269,6 @@ mod tests {
             &PlayoutItem::Audio {
                 sequence: 0,
                 flags: 0,
-                silence_ranges: 0,
                 payload: vec![0],
             },
             start + Duration::from_millis(80),
@@ -282,7 +281,6 @@ mod tests {
             &PlayoutItem::Audio {
                 sequence: 2,
                 flags: 0,
-                silence_ranges: 0,
                 payload: vec![2],
             },
             start + Duration::from_millis(80),
@@ -322,7 +320,6 @@ mod tests {
                     &PlayoutItem::Audio {
                         sequence: seq,
                         flags: 0,
-                        silence_ranges: 0,
                         payload: vec![0],
                     },
                     now,
