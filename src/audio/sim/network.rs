@@ -4,7 +4,7 @@ use crate::{
     audio::{
         shared::{
             FRAME_SAMPLES, LiveAudioTraceWriter, LivePlaybackSnapshot, RemoteVoicePacket,
-            SAMPLE_RATE, trace_time_ms,
+            SAMPLE_RATE, samples_to_ms, trace_time_ms,
         },
         sim::{LiveAudioPacketLossProfile, LiveAudioSimulationConfig, LiveAudioSimulationScenario},
     },
@@ -32,12 +32,13 @@ pub(crate) fn trace_output_window(
         clipped: window.clipped_samples,
         active_streams: snapshot.active_streams,
         max_queue_ms: snapshot.max_queue_ms,
-        correction_percent: snapshot.correction_percent,
         dred_recoveries: snapshot.dred_recoveries,
         plc_fallbacks: snapshot.plc_fallbacks,
         hard_trim_count: snapshot.hard_trim_count,
-        silence_skip_count: snapshot.silence_skip_count,
-        skipped_silence_ms: snapshot.skipped_silence_ms,
+        accelerate_count: snapshot.accelerate_count,
+        expand_count: snapshot.expand_count,
+        accelerate_ms: samples_to_ms(snapshot.accelerate_samples as usize),
+        expand_ms: samples_to_ms(snapshot.expand_samples as usize),
         speech_gap_skip_count: snapshot.speech_gap_skip_count,
         skipped_speech_gap_ms: snapshot.skipped_speech_gap_ms,
     });

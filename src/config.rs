@@ -167,8 +167,6 @@ pub struct AudioLatencyConfig {
     #[toml(default = true)]
     pub adaptive_catch_up: bool,
     #[toml(default = true)]
-    pub playback_silence_skip: bool,
-    #[toml(default = true)]
     pub capture_silence_gate: bool,
     #[toml(default = true)]
     pub adaptive_target: bool,
@@ -176,44 +174,18 @@ pub struct AudioLatencyConfig {
     pub target_queue_ms: u64,
     #[toml(default = 20)]
     pub dynamic_target_floor_ms: u64,
-    #[toml(default = 8)]
-    pub dynamic_target_margin_ms: u64,
-    #[toml(default = 1.5)]
-    pub dynamic_jitter_gain: f64,
-    #[toml(default = 0.5)]
-    pub dynamic_peak_weight: f64,
-    #[toml(default = 320)]
-    pub moderate_loss_queue_ms: u64,
     #[toml(default = 1_000)]
-    pub dred_horizon_ms: u64,
+    pub max_target_ms: u64,
     #[toml(default = 1_500)]
     pub hard_queue_bound_ms: u64,
-    #[toml(default = 5_000)]
-    pub loss_window_ms: u64,
-    #[toml(default = 5_000)]
-    pub loss_hold_ms: u64,
-    #[toml(default = 10_000)]
-    pub severe_loss_hold_ms: u64,
     #[toml(default = 40)]
     pub initial_buffer_ms: u64,
     #[toml(default = 60)]
     pub max_reorder_delay_ms: u64,
-    #[toml(default = 0.25)]
-    pub max_speed_up: f64,
-    #[toml(default = 20)]
-    pub catch_up_start_excess_ms: u64,
     #[toml(default = 20)]
     pub device_period_margin_ms: u64,
     #[toml(default = 64)]
     pub silence_vad_max: u8,
-    #[toml(default = 60)]
-    pub silence_min_gap_ms: u64,
-    #[toml(default = 10)]
-    pub silence_ramp_ms: u64,
-    #[toml(default = 200)]
-    pub silence_max_skip_ms: u64,
-    #[toml(default = 20)]
-    pub silence_min_skip_ms: u64,
     #[toml(default = 2_000)]
     pub capture_long_silence_stop_ms: u64,
     #[toml(default = 30)]
@@ -227,30 +199,16 @@ impl Default for AudioLatencyConfig {
         let tuning = LiveAudioTuning::default();
         Self {
             adaptive_catch_up: tuning.adaptive_catch_up,
-            playback_silence_skip: tuning.playback_silence_skip,
             capture_silence_gate: tuning.capture_silence_gate,
             adaptive_target: tuning.adaptive_target,
             target_queue_ms: duration_ms(tuning.target_queue),
             dynamic_target_floor_ms: duration_ms(tuning.dynamic_target_floor),
-            dynamic_target_margin_ms: duration_ms(tuning.dynamic_target_margin),
-            dynamic_jitter_gain: tuning.dynamic_jitter_gain,
-            dynamic_peak_weight: tuning.dynamic_peak_weight,
-            moderate_loss_queue_ms: duration_ms(tuning.moderate_loss_queue),
-            dred_horizon_ms: duration_ms(tuning.dred_horizon),
+            max_target_ms: duration_ms(tuning.max_target),
             hard_queue_bound_ms: duration_ms(tuning.hard_queue_bound),
-            loss_window_ms: duration_ms(tuning.loss_window),
-            loss_hold_ms: duration_ms(tuning.loss_hold),
-            severe_loss_hold_ms: duration_ms(tuning.severe_loss_hold),
             initial_buffer_ms: duration_ms(tuning.initial_buffer),
             max_reorder_delay_ms: duration_ms(tuning.max_reorder_delay),
-            max_speed_up: tuning.max_speed_up,
-            catch_up_start_excess_ms: duration_ms(tuning.catch_up_start_excess),
             device_period_margin_ms: duration_ms(tuning.device_period_margin),
             silence_vad_max: tuning.silence_vad_max,
-            silence_min_gap_ms: duration_ms(tuning.silence_min_gap),
-            silence_ramp_ms: duration_ms(tuning.silence_ramp),
-            silence_max_skip_ms: duration_ms(tuning.silence_max_skip),
-            silence_min_skip_ms: duration_ms(tuning.silence_min_skip),
             capture_long_silence_stop_ms: duration_ms(tuning.capture_long_silence_stop),
             capture_silence_preroll_ms: duration_ms(tuning.capture_silence_preroll),
             capture_silence_ramp_ms: duration_ms(tuning.capture_silence_ramp),
@@ -262,30 +220,16 @@ impl AudioLatencyConfig {
     pub fn to_tuning(&self) -> LiveAudioTuning {
         LiveAudioTuning {
             adaptive_catch_up: self.adaptive_catch_up,
-            playback_silence_skip: self.playback_silence_skip,
             capture_silence_gate: self.capture_silence_gate,
             adaptive_target: self.adaptive_target,
             target_queue: Duration::from_millis(self.target_queue_ms),
             dynamic_target_floor: Duration::from_millis(self.dynamic_target_floor_ms),
-            dynamic_target_margin: Duration::from_millis(self.dynamic_target_margin_ms),
-            dynamic_jitter_gain: self.dynamic_jitter_gain,
-            dynamic_peak_weight: self.dynamic_peak_weight,
-            moderate_loss_queue: Duration::from_millis(self.moderate_loss_queue_ms),
-            dred_horizon: Duration::from_millis(self.dred_horizon_ms),
+            max_target: Duration::from_millis(self.max_target_ms),
             hard_queue_bound: Duration::from_millis(self.hard_queue_bound_ms),
-            loss_window: Duration::from_millis(self.loss_window_ms),
-            loss_hold: Duration::from_millis(self.loss_hold_ms),
-            severe_loss_hold: Duration::from_millis(self.severe_loss_hold_ms),
             initial_buffer: Duration::from_millis(self.initial_buffer_ms),
             max_reorder_delay: Duration::from_millis(self.max_reorder_delay_ms),
-            max_speed_up: self.max_speed_up,
-            catch_up_start_excess: Duration::from_millis(self.catch_up_start_excess_ms),
             device_period_margin: Duration::from_millis(self.device_period_margin_ms),
             silence_vad_max: self.silence_vad_max,
-            silence_min_gap: Duration::from_millis(self.silence_min_gap_ms),
-            silence_ramp: Duration::from_millis(self.silence_ramp_ms),
-            silence_max_skip: Duration::from_millis(self.silence_max_skip_ms),
-            silence_min_skip: Duration::from_millis(self.silence_min_skip_ms),
             capture_long_silence_stop: Duration::from_millis(self.capture_long_silence_stop_ms),
             capture_silence_preroll: Duration::from_millis(self.capture_silence_preroll_ms),
             capture_silence_ramp: Duration::from_millis(self.capture_silence_ramp_ms),
@@ -757,6 +701,39 @@ fn reject_deprecated_config_keys(
             "failed to deserialize {source}: audio.input-device-index is not supported; use audio.input-device-id"
         ));
     }
+    const REMOVED_AUDIO_LATENCY_KEYS: &[&str] = &[
+        "playback-silence-skip",
+        "dynamic-target-margin-ms",
+        "dynamic-jitter-gain",
+        "dynamic-peak-weight",
+        "moderate-loss-queue-ms",
+        "dred-horizon-ms",
+        "loss-window-ms",
+        "loss-hold-ms",
+        "severe-loss-hold-ms",
+        "max-speed-up",
+        "catch-up-start-excess-ms",
+        "silence-min-gap-ms",
+        "silence-ramp-ms",
+        "silence-max-skip-ms",
+        "silence-min-skip-ms",
+    ];
+    if let Some(key) = doc
+        .table()
+        .get("audio")
+        .and_then(Item::as_table)
+        .and_then(|audio| audio.get("latency"))
+        .and_then(Item::as_table)
+        .and_then(|latency| {
+            REMOVED_AUDIO_LATENCY_KEYS
+                .iter()
+                .find(|key| latency.contains_key(**key))
+        })
+    {
+        return Err(format!(
+            "failed to deserialize {source}: audio.latency.{key} was removed by the WSOLA playback refactor"
+        ));
+    }
     Ok(())
 }
 
@@ -929,11 +906,6 @@ fn write_runtime_config<'de>(root: &mut Table<'de>, config: &Config, arena: &'de
             arena,
         );
         latency.insert(
-            Key::new("playback-silence-skip"),
-            Item::from(config.audio.latency.playback_silence_skip),
-            arena,
-        );
-        latency.insert(
             Key::new("capture-silence-gate"),
             Item::from(config.audio.latency.capture_silence_gate),
             arena,
@@ -954,33 +926,13 @@ fn write_runtime_config<'de>(root: &mut Table<'de>, config: &Config, arena: &'de
             arena,
         );
         latency.insert(
-            Key::new("moderate-loss-queue-ms"),
-            Item::from(config.audio.latency.moderate_loss_queue_ms as i64),
-            arena,
-        );
-        latency.insert(
-            Key::new("dred-horizon-ms"),
-            Item::from(config.audio.latency.dred_horizon_ms as i64),
+            Key::new("max-target-ms"),
+            Item::from(config.audio.latency.max_target_ms as i64),
             arena,
         );
         latency.insert(
             Key::new("hard-queue-bound-ms"),
             Item::from(config.audio.latency.hard_queue_bound_ms as i64),
-            arena,
-        );
-        latency.insert(
-            Key::new("loss-window-ms"),
-            Item::from(config.audio.latency.loss_window_ms as i64),
-            arena,
-        );
-        latency.insert(
-            Key::new("loss-hold-ms"),
-            Item::from(config.audio.latency.loss_hold_ms as i64),
-            arena,
-        );
-        latency.insert(
-            Key::new("severe-loss-hold-ms"),
-            Item::from(config.audio.latency.severe_loss_hold_ms as i64),
             arena,
         );
         latency.insert(
@@ -994,16 +946,6 @@ fn write_runtime_config<'de>(root: &mut Table<'de>, config: &Config, arena: &'de
             arena,
         );
         latency.insert(
-            Key::new("max-speed-up"),
-            Item::from(config.audio.latency.max_speed_up),
-            arena,
-        );
-        latency.insert(
-            Key::new("catch-up-start-excess-ms"),
-            Item::from(config.audio.latency.catch_up_start_excess_ms as i64),
-            arena,
-        );
-        latency.insert(
             Key::new("device-period-margin-ms"),
             Item::from(config.audio.latency.device_period_margin_ms as i64),
             arena,
@@ -1011,26 +953,6 @@ fn write_runtime_config<'de>(root: &mut Table<'de>, config: &Config, arena: &'de
         latency.insert(
             Key::new("silence-vad-max"),
             Item::from(config.audio.latency.silence_vad_max as i64),
-            arena,
-        );
-        latency.insert(
-            Key::new("silence-min-gap-ms"),
-            Item::from(config.audio.latency.silence_min_gap_ms as i64),
-            arena,
-        );
-        latency.insert(
-            Key::new("silence-ramp-ms"),
-            Item::from(config.audio.latency.silence_ramp_ms as i64),
-            arena,
-        );
-        latency.insert(
-            Key::new("silence-max-skip-ms"),
-            Item::from(config.audio.latency.silence_max_skip_ms as i64),
-            arena,
-        );
-        latency.insert(
-            Key::new("silence-min-skip-ms"),
-            Item::from(config.audio.latency.silence_min_skip_ms as i64),
             arena,
         );
         latency.insert(
@@ -1460,10 +1382,10 @@ input-device-index = 20
     #[test]
     fn runtime_config_writes_audio_latency_knobs() {
         let mut config = Config::default();
-        config.audio.latency.playback_silence_skip = false;
         config.audio.latency.target_queue_ms = 80;
         config.audio.latency.adaptive_target = false;
         config.audio.latency.dynamic_target_floor_ms = 25;
+        config.audio.latency.max_target_ms = 1_200;
         let arena = Arena::new();
         let doc = toml_spanner::parse(DEFAULT_CONFIG, &arena).unwrap();
         let mut table = doc.table().clone_in(&arena);
@@ -1477,17 +1399,17 @@ input-device-index = 20
         .unwrap();
 
         assert!(content.contains("[audio.latency]"));
-        assert!(content.contains("playback-silence-skip = false"));
         assert!(content.contains("target-queue-ms = 80"));
         assert!(content.contains("adaptive-target = false"));
         assert!(content.contains("dynamic-target-floor-ms = 25"));
+        assert!(content.contains("max-target-ms = 1200"));
     }
 
     #[test]
     fn rejects_invalid_audio_latency_config() {
         let mut config = Config::default();
         config.audio.latency.hard_queue_bound_ms = 40;
-        config.audio.latency.dred_horizon_ms = 1_000;
+        config.audio.latency.max_target_ms = 1_000;
 
         let error = config.validate("<test>").unwrap_err();
 
@@ -1496,14 +1418,15 @@ input-device-index = 20
     }
 
     #[test]
-    fn audio_latency_max_speed_up_accepts_1_25x_cap() {
+    fn audio_latency_max_target_must_cover_target_queue() {
         let mut tuning = LiveAudioTuning::default();
-        tuning.max_speed_up = 0.25;
+        tuning.max_target = tuning.target_queue;
         assert!(tuning.validate().is_ok());
 
-        tuning.max_speed_up = 0.251;
+        tuning.max_target = Duration::from_millis(20);
+        tuning.target_queue = Duration::from_millis(60);
         let error = tuning.validate().unwrap_err();
-        assert!(error.contains("max-speed-up"));
+        assert!(error.contains("max-target-ms"));
     }
 
     #[test]

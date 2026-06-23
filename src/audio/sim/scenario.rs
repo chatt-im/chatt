@@ -188,6 +188,9 @@ pub struct LiveAudioSimulationReport {
     /// Minimum adaptive playout target observed over the steady-state tail
     /// window, in milliseconds. Captures how far the dynamic target relaxed.
     pub steady_state_adaptive_target_ms: u64,
+    /// Underrun episodes observed over the steady-state tail window, excluding
+    /// startup priming.
+    pub steady_state_underruns: u64,
     pub final_snapshot: LivePlaybackSnapshot,
 }
 

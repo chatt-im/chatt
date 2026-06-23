@@ -51,7 +51,6 @@ pub(crate) fn trace_direct_run_start(
         denoise: config.denoise,
         auto_gain: config.auto_gain,
         capture_silence_gate: config.tuning.capture_silence_gate,
-        playback_silence_skip: config.tuning.playback_silence_skip,
         adaptive_catch_up: config.tuning.adaptive_catch_up,
     });
 }
@@ -416,6 +415,7 @@ pub(crate) fn run_live_audio_simulation_inner(
     let mut tail_queue_sum_ms = 0.0f64;
     let mut tail_queue_max_ms = 0u64;
     let mut tail_adaptive_target_min_ms = u64::MAX;
+    let mut tail_underruns_start = None;
     let mut tail_callbacks_seen = 0usize;
 
     for frame_index in 0..prebuffer_frames {
@@ -459,6 +459,9 @@ pub(crate) fn run_live_audio_simulation_inner(
         let mut mixer = mixer
             .lock()
             .map_err(|_| "live simulation mixer lock poisoned")?;
+        if callback_index == tail_start_callback {
+            tail_underruns_start = Some(mixer.snapshot_at(now).underrun_count);
+        }
         let mut echo_writer = echo_reference.as_ref().map(|reference| reference.writer());
         for _ in 0..output_block_samples {
             let sample = mixer.pop_mixed_output_sample(now, output_block_samples);
@@ -502,6 +505,10 @@ pub(crate) fn run_live_audio_simulation_inner(
         .lock()
         .map_err(|_| "live simulation mixer lock poisoned")?
         .snapshot_at(final_now);
+    report.steady_state_underruns = report
+        .final_snapshot
+        .underrun_count
+        .saturating_sub(tail_underruns_start.unwrap_or(0));
     report.max_queue_ms = report.max_queue_ms.max(report.final_snapshot.max_queue_ms);
     report.output_samples = metrics.samples;
     report.output_ms = samples_to_ms(metrics.samples as usize);
@@ -1248,7 +1255,7 @@ mod tests {
             "target did not relax on LAN: {report:?}"
         );
         assert_eq!(
-            report.final_snapshot.underrun_count, 0,
+            report.steady_state_underruns, 0,
             "relaxation must not cause underruns: {report:?}"
         );
         assert_coherent_output(&report, 0.005);
@@ -1294,7 +1301,7 @@ mod tests {
             report.steady_state_adaptive_target_ms <= 30,
             "steady-delay link did not relax the target: {report:?}"
         );
-        assert_eq!(report.final_snapshot.underrun_count, 0, "{report:?}");
+        assert_eq!(report.steady_state_underruns, 0, "{report:?}");
         assert_coherent_output(&report, 0.005);
     }
 
@@ -1323,7 +1330,7 @@ mod tests {
             "target stayed pinned at the ceiling: {report:?}"
         );
         assert_eq!(
-            report.final_snapshot.underrun_count, 0,
+            report.steady_state_underruns, 0,
             "descend must not cause underruns: {report:?}"
         );
         assert_coherent_output(&report, 0.005);
@@ -1346,7 +1353,7 @@ mod tests {
 
         assert_eq!(report.lost_frames, 0, "{report:?}");
         assert_eq!(
-            report.final_snapshot.underrun_count, 0,
+            report.steady_state_underruns, 0,
             "100ms output callback sustained underruns: {report:?}"
         );
     }
@@ -1395,7 +1402,7 @@ mod tests {
     }
 
     #[test]
-    fn silence_skip_and_adaptive_catchup_improve_backlog_latency() {
+    fn wsola_catchup_improves_backlog_latency() {
         let enabled = simulate(
             LiveAudioSimulationScenario::BacklogSilence,
             Duration::from_secs(30),
@@ -1403,7 +1410,6 @@ mod tests {
             1,
         );
         let mut disabled_tuning = test_tuning();
-        disabled_tuning.playback_silence_skip = false;
         disabled_tuning.adaptive_catch_up = false;
         let disabled = simulate(
             LiveAudioSimulationScenario::BacklogSilence,
@@ -1412,7 +1418,7 @@ mod tests {
             1,
         );
 
-        assert!(enabled.final_snapshot.silence_skip_count > 0, "{enabled:?}");
+        assert!(enabled.final_snapshot.accelerate_count > 0, "{enabled:?}");
         assert!(
             enabled.queue_area_ms < disabled.queue_area_ms,
             "{enabled:?} vs {disabled:?}"

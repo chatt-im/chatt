@@ -10,26 +10,16 @@ buffer = "default"
 
 [audio.latency]
 adaptive-catch-up = true
-playback-silence-skip = true
 capture-silence-gate = true
 adaptive-target = true
 target-queue-ms = 60
 dynamic-target-floor-ms = 20
-moderate-loss-queue-ms = 320
-dred-horizon-ms = 1000
+max-target-ms = 1000
 hard-queue-bound-ms = 1500
-loss-window-ms = 5000
-loss-hold-ms = 5000
-severe-loss-hold-ms = 10000
 initial-buffer-ms = 40
 max-reorder-delay-ms = 60
 device-period-margin-ms = 20
-max-speed-up = 0.15
 silence-vad-max = 64
-silence-min-gap-ms = 60
-silence-ramp-ms = 10
-silence-max-skip-ms = 200
-silence-min-skip-ms = 20
 capture-long-silence-stop-ms = 2000
 capture-silence-preroll-ms = 30
 capture-silence-ramp-ms = 10

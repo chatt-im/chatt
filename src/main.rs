@@ -2061,7 +2061,7 @@ impl App {
             return;
         };
         let stats = playback.stats();
-        let played_samples = stats.direct_samples.saturating_add(stats.resampled_samples);
+        let played_samples = stats.direct_samples;
         let direct_percent = if played_samples == 0 {
             0
         } else {
@@ -2081,16 +2081,16 @@ impl App {
             )
         };
         self.set_status(format!(
-            "audio q{}ms target{}ms{} speed{:+.1}% enc{} direct{}% skip{}ms/{} catchup{} dred{} plc{} trims{} underruns{}{} rx {}/{}",
+            "audio q{}ms target{}ms{} enc{} direct{}% accel{}ms/{} expand{}ms/{} dred{} plc{} trims{} underruns{}{} rx {}/{}",
             stats.max_queue_ms,
             stats.target_queue_ms,
             loss_target,
-            stats.correction_percent,
             self.encoder_profile.label(),
             direct_percent,
-            stats.skipped_silence_ms,
-            stats.silence_skip_count,
-            stats.correction_count,
+            live_samples_to_ms(stats.accelerate_samples as usize),
+            stats.accelerate_count,
+            live_samples_to_ms(stats.expand_samples as usize),
+            stats.expand_count,
             stats.dred_recoveries,
             stats.plc_fallbacks,
             stats.hard_trim_count,
@@ -2553,6 +2553,10 @@ fn format_bytes_compact(bytes: u64) -> String {
     }
 }
 
+fn live_samples_to_ms(samples: usize) -> u64 {
+    ((samples as f64 / f64::from(audio::SAMPLE_RATE)) * 1_000.0).round() as u64
+}
+
 impl Drop for App {
     fn drop(&mut self) {
         self.stop_audio();
@@ -2714,16 +2718,17 @@ fn print_audio_playback_test_report(
         report.feedback_max_interarrival_jitter_ms
     );
     println!(
-        "playback_max_queue_ms={},adaptive_target_ms={},correction_count={},hard_trim_count={},underruns={},dred={},plc={},silence_skip_count={},skipped_silence_ms={},suppressed_frames={}",
+        "playback_max_queue_ms={},adaptive_target_ms={},accelerate_count={},expand_count={},accelerate_ms={},expand_ms={},hard_trim_count={},underruns={},dred={},plc={},suppressed_frames={}",
         report.final_snapshot.max_queue_ms,
         report.final_snapshot.adaptive_target_ms,
-        report.final_snapshot.correction_count,
+        report.final_snapshot.accelerate_count,
+        report.final_snapshot.expand_count,
+        live_samples_to_ms(report.final_snapshot.accelerate_samples as usize),
+        live_samples_to_ms(report.final_snapshot.expand_samples as usize),
         report.final_snapshot.hard_trim_count,
         report.final_snapshot.underrun_count,
         report.final_snapshot.dred_recoveries,
         report.final_snapshot.plc_fallbacks,
-        report.final_snapshot.silence_skip_count,
-        report.final_snapshot.skipped_silence_ms,
         report.suppressed_frames
     );
 }

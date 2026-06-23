@@ -1,9 +1,6 @@
 use std::collections::VecDeque;
 
-use crate::audio::{
-    playback::TuningSampleCounts,
-    shared::{DecodedFrameSource, peak_normalized, rms_normalized},
-};
+use crate::audio::shared::{DecodedFrameSource, peak_normalized, rms_normalized, soft_limit};
 
 #[derive(Default)]
 pub(crate) struct MonoSampleQueue {
@@ -53,7 +50,7 @@ impl MonoSampleQueue {
         });
     }
 
-    fn pop_front_sample(&mut self) -> Option<f32> {
+    pub(crate) fn pop_front_sample(&mut self) -> Option<f32> {
         loop {
             let frame = self.frames.front_mut()?;
             if frame.offset < frame.samples.len() {
@@ -102,45 +99,6 @@ impl MonoSampleQueue {
         self.total
     }
 
-    /// Finds a low-energy region the overlap-add compressor can shorten, ahead
-    /// of the play head. Returns the absolute start index and the segment length
-    /// to remove, sized to the `excess` to shed but bounded by `silence_max_skip`
-    /// and the room left in the run after reserving one crossfade overlap.
-    /// `window_end` is the last index the resampler may still read, so the
-    /// removed region stays strictly ahead of it.
-    pub(crate) fn find_low_energy_compress(
-        &self,
-        counts: &TuningSampleCounts,
-        excess_samples: usize,
-        window_end: usize,
-    ) -> Option<(usize, usize)> {
-        let mut cursor = 0usize;
-        let mut run_start = 0usize;
-        let mut run_len = 0usize;
-
-        for frame in &self.frames {
-            let len = frame.remaining_len();
-            if len == 0 {
-                continue;
-            }
-            if frame.is_skip_silence() {
-                if run_len == 0 {
-                    run_start = cursor;
-                }
-                run_len += len;
-            } else {
-                if let Some(found) =
-                    compress_segment(counts, run_start, run_len, window_end, excess_samples)
-                {
-                    return Some(found);
-                }
-                run_len = 0;
-            }
-            cursor += len;
-        }
-        compress_segment(counts, run_start, run_len, window_end, excess_samples)
-    }
-
     /// Removes `segment` samples starting at `start` and crossfades the join so
     /// the waveform stays continuous. The kept tail `[start, start + overlap)` is
     /// blended with the audio that follows the removed segment
@@ -148,6 +106,10 @@ impl MonoSampleQueue {
     /// then the segment is dropped. This is the compression half of the
     /// overlap-add time-scaler, scoped here to low-energy regions.
     pub(crate) fn overlap_add_compress(&mut self, overlap: usize, start: usize, segment: usize) {
+        if overlap == 0 || segment == 0 {
+            self.drain_range(start, segment);
+            return;
+        }
         for index in 0..overlap {
             let old = self.sample_at(start + index).unwrap_or(0.0);
             let new = self.sample_at(start + segment + index).unwrap_or(old);
@@ -155,10 +117,72 @@ impl MonoSampleQueue {
             let fade_in = (t * std::f32::consts::FRAC_PI_2).sin();
             let fade_out = ((1.0 - t) * std::f32::consts::FRAC_PI_2).sin();
             if let Some(sample) = self.sample_mut(start + index) {
-                *sample = fade_out * old + fade_in * new;
+                *sample = soft_limit(fade_out * old + fade_in * new);
             }
         }
         self.drain_range(start + overlap, segment);
+    }
+
+    pub(crate) fn copy_window(&self, start: usize, len: usize, scratch: &mut Vec<f32>) {
+        scratch.clear();
+        scratch.reserve(len);
+        scratch.extend((0..len).map(|index| self.sample_at(start + index).unwrap_or(0.0)));
+    }
+
+    pub(crate) fn overlap_add_expand(&mut self, overlap: usize, start: usize, segment: usize) {
+        if segment == 0 || start < segment {
+            return;
+        }
+        let mut inserted = Vec::with_capacity(segment);
+        for index in 0..segment {
+            inserted.push(self.sample_at(start - segment + index).unwrap_or(0.0));
+        }
+        let overlap = overlap.min(segment);
+        for index in 0..overlap {
+            let old = inserted[index];
+            let new = self.sample_at(start + index).unwrap_or(old);
+            let t = (index + 1) as f32 / (overlap + 1) as f32;
+            let fade_in = (t * std::f32::consts::FRAC_PI_2).sin();
+            let fade_out = ((1.0 - t) * std::f32::consts::FRAC_PI_2).sin();
+            inserted[index] = soft_limit(fade_out * old + fade_in * new);
+        }
+        self.insert_at_owned(start, inserted.as_slice());
+    }
+
+    pub(crate) fn insert_at_owned(&mut self, absolute_index: usize, samples: &[f32]) {
+        if samples.is_empty() {
+            return;
+        }
+        if absolute_index >= self.total {
+            self.push_back(samples);
+            return;
+        }
+
+        let Some((frame_index, local_index, _)) = self.find_frame_at(absolute_index) else {
+            self.push_back(samples);
+            return;
+        };
+
+        if local_index > 0
+            && let Some(frame) = self.frames.get_mut(frame_index)
+        {
+            let split_at = frame.offset + local_index;
+            let tail = frame.samples.split_off(split_at);
+            let source = frame.source;
+            let tail_frame = QueuedAudioFrame::new(tail, source);
+            self.frames.insert(frame_index + 1, tail_frame);
+        }
+
+        let insert_index = if local_index == 0 {
+            frame_index
+        } else {
+            frame_index + 1
+        };
+        self.total += samples.len();
+        self.frames.insert(
+            insert_index,
+            QueuedAudioFrame::new(samples.to_vec(), DecodedFrameSource::Normal),
+        );
     }
 
     pub(crate) fn drain_range(&mut self, start: usize, mut len: usize) {
@@ -228,44 +252,19 @@ impl MonoSampleQueue {
 }
 
 impl QueuedAudioFrame {
+    fn new(samples: Vec<f32>, source: DecodedFrameSource) -> Self {
+        let rms = rms_normalized(&samples);
+        let peak = peak_normalized(&samples);
+        Self {
+            samples,
+            offset: 0,
+            source,
+            rms,
+            peak,
+        }
+    }
+
     fn remaining_len(&self) -> usize {
         self.samples.len().saturating_sub(self.offset)
     }
-
-    /// Whether this frame is low-energy enough to compress through, measured
-    /// from the decoded signal rather than the sender's silence flag, so
-    /// trimming works regardless of a missing or wrong hint.
-    fn is_skip_silence(&self) -> bool {
-        self.peak < 0.20 && self.rms < 0.05
-    }
-}
-
-/// Sizes the compressor's removal within one low-energy run. Requires the run
-/// to be at least `silence_min_gap`, keeps the removed region strictly ahead of
-/// the resampler window, reserves one crossfade overlap, and bounds the segment
-/// by the excess to shed and `silence_max_skip`.
-fn compress_segment(
-    counts: &TuningSampleCounts,
-    run_start: usize,
-    run_len: usize,
-    window_end: usize,
-    excess_samples: usize,
-) -> Option<(usize, usize)> {
-    if run_len < counts.silence_min_gap {
-        return None;
-    }
-    let overlap = counts.silence_ramp;
-    let run_end = run_start + run_len;
-    let start = run_start.max(window_end + 1);
-    let available = run_end.saturating_sub(start);
-    if available <= overlap {
-        return None;
-    }
-    let segment = (available - overlap)
-        .min(counts.silence_max_skip)
-        .min(excess_samples);
-    if segment < counts.silence_min_skip {
-        return None;
-    }
-    Some((start, segment))
 }

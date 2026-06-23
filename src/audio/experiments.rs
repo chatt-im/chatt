@@ -119,23 +119,35 @@ fn exp1_drift_and_block_size_through_real_pipeline() {
         let snap = mixer.lock().unwrap().snapshot_at(now);
         println!(
             "{label} | q@5s={q5:>4}ms q@15s={q15:>4}ms q@end={:>4}ms target={:>3}ms \
-             underruns={:>4} hardtrims={} silenceskips={} resampled={} direct={}",
+             underruns={:>4} hardtrims={} accelerate={} expand={} direct={}",
             snap.max_queue_ms,
             snap.adaptive_target_ms,
             snap.underrun_count,
             snap.hard_trim_count,
-            snap.silence_skip_count,
-            snap.resampled_samples,
+            snap.accelerate_count,
+            snap.expand_count,
             snap.direct_samples,
         );
+        assert_eq!(snap.underrun_count, 0, "{label} should not underrun");
+        if drift < 0.0 {
+            assert!(
+                snap.expand_count > 0,
+                "{label} should stretch sender-slow drift"
+            );
+        }
+        if drift > 0.0 {
+            assert!(
+                snap.accelerate_count > 0,
+                "{label} should accelerate sender-fast drift"
+            );
+        }
     }
 }
 
-/// EXP 2: silence trimming is based on decoded acoustic energy, not sender
-/// metadata.
+/// EXP 2: passive WSOLA uses decoded acoustic energy, not sender metadata.
 #[test]
-fn exp2_silence_skip_uses_decoded_energy() {
-    println!("\n=== EXP2: silence-skip energy gating ===");
+fn exp2_passive_wsola_uses_decoded_energy() {
+    println!("\n=== EXP2: passive WSOLA energy gating ===");
     let now = Instant::now();
     let queued = samples_for_duration(Duration::from_millis(600));
 
@@ -148,17 +160,17 @@ fn exp2_silence_skip_uses_decoded_energy() {
         &mut stats,
     );
     let before = stream.queued_samples();
-    // Pump the per-sample path so maybe_skip_silence runs.
+    // Pump the per-sample path so the WSOLA decision cadence runs.
     for _ in 0..480 {
         let _ = stream.pop_sample(now, &mut stats);
     }
     let after = stream.queued_samples();
     println!(
-        "silent zeros: queue {}ms -> {}ms  silence_skip_count={} skipped={}ms",
+        "silent zeros: queue {}ms -> {}ms  accelerate_count={} removed={}ms",
         samples_to_ms(before),
         samples_to_ms(after),
-        stats.silence_skip_count,
-        samples_to_ms(stats.skipped_silence_samples as usize),
+        stats.accelerate_count,
+        samples_to_ms(stats.accelerate_samples as usize),
     );
 
     println!("\n--- capture-side silence classifier (is_capture_skip_safe_silence, vad=0) ---");
@@ -198,13 +210,12 @@ fn pseudo_noise(target_amp_i16_scale: f32) -> Vec<f32> {
     out
 }
 
-/// EXP 3: a single concealed (PLC) frame expands the playout target to 320 ms
-/// and holds it for the loss-hold window. Eight concealed frames expand it to
-/// 1000 ms. While expanded, the hard-trim floor is the DRED horizon, so the
-/// queue cannot dissipate below ~1 s.
+/// EXP 3: PLC frames no longer pin a binary loss-expansion target. Isolated
+/// concealment leaves the plain target alone, and the rare safety trim drains a
+/// runaway queue back to that target rather than a DRED floor.
 #[test]
 fn exp3_loss_expansion_stickiness() {
-    println!("\n=== EXP3: loss-expansion target stickiness ===");
+    println!("\n=== EXP3: retired loss-expansion stickiness ===");
     let now = Instant::now();
     let mut stream = AdaptivePlaybackStream::new(test_tuning()).unwrap();
     let mut stats = crate::audio::playback::LivePlaybackMixerStats::default();
@@ -243,8 +254,8 @@ fn exp3_loss_expansion_stickiness() {
         probe(&stream, now + Duration::from_millis(10_100)),
     );
 
-    // Queue a 1700ms normal backlog while expanded; the hard bound only trims to
-    // the DRED horizon, so a large queue persists.
+    // Queue a 1700ms normal backlog; the safety bound trims to the plain target,
+    // not to the retired DRED horizon floor.
     let backlog = samples_for_duration(Duration::from_millis(1_700));
     stream.queue_samples(
         &vec![0.0; backlog],
@@ -253,26 +264,23 @@ fn exp3_loss_expansion_stickiness() {
         &mut stats,
     );
     println!(
-        "queued 1700ms backlog while expanded -> queue after hard-trim = {}ms (cannot drop below DRED horizon)",
+        "queued 1700ms backlog -> queue after hard-trim = {}ms (trims to target, no DRED floor)",
         samples_to_ms(stream.queued_samples()),
     );
 }
 
-/// EXP 4: the adaptive catch-up corrects timing by fractionally resampling the
-/// whole signal, which pitch-shifts it. Feed a steady 1 kHz tone with a backlog
-/// and measure the output frequency per window: a steady input becomes a
-/// rising, wobbling pitch.
+/// EXP 4: WSOLA catch-up corrects timing without pitch-shifting a steady tone.
 #[test]
-fn exp4_catch_up_resampling_pitch_shift() {
-    println!("\n=== EXP4: catch-up resampler pitch shift on a 1 kHz tone ===");
+fn exp4_wsola_catch_up_preserves_pitch() {
+    println!("\n=== EXP4: WSOLA catch-up on a 1 kHz tone ===");
     let now = Instant::now();
     let rate = f64::from(SAMPLE_RATE);
-    let total = samples_for_duration(Duration::from_millis(2_000));
+    let total = samples_for_duration(Duration::from_millis(1_000));
     let tone: Vec<f32> = (0..total)
         .map(|n| (2.0 * std::f64::consts::PI * 1_000.0 * n as f64 / rate).sin() as f32 * 0.5)
         .collect();
     println!(
-        "input: 2000ms of 1000.0 Hz, zero-cross freq = {:.1} Hz",
+        "input: 1000ms of 1000.0 Hz, zero-cross freq = {:.1} Hz",
         zero_cross_freq(&tone, rate)
     );
 
@@ -298,14 +306,25 @@ fn exp4_catch_up_resampling_pitch_shift() {
             start += window;
         }
         println!(
-            "catch_up={catch_up:>5}: out_len={} ({}ms, compression={:.3}) resampled={} direct={} per-100ms Hz={:?}",
+            "catch_up={catch_up:>5}: out_len={} ({}ms, compression={:.3}) accelerate={} expand={} direct={} per-100ms Hz={:?}",
             out.len(),
             samples_to_ms(out.len()),
             out.len() as f64 / total as f64,
-            stats.resampled_samples,
+            stats.accelerate_count,
+            stats.expand_count,
             stats.direct_samples,
             freqs,
         );
+        if catch_up {
+            assert!(stats.accelerate_count > 0, "WSOLA accelerate must engage");
+            assert!(!freqs.is_empty(), "frequency windows must be measured");
+            for hz in &freqs {
+                assert!(
+                    (*hz - 1_000).abs() <= 10,
+                    "WSOLA shifted tone pitch: {freqs:?}"
+                );
+            }
+        }
     }
 }
 
@@ -365,14 +384,11 @@ fn exp5_encoder_wideband_cap_discards_high_frequencies() {
     println!("(fullband encode since Phase 1: content above 8 kHz now survives)");
 }
 
-/// EXP 6: originally the silence-skip only fired on a contiguous flagged-silent
-/// run already fully buffered and at least 250 ms long, so common inter-word gaps
-/// below that never shortened (the cliff this swept for). Since Phase 1 the
-/// overlap-add compressor acts on low-energy runs from `silence_min_gap` (60 ms)
-/// up, in continuous increments, so sub-250 ms gaps now shorten.
+/// EXP 6: WSOLA shortens low-energy backlog continuously rather than waiting
+/// for large flagged-silent ranges.
 #[test]
-fn exp6_silence_skip_threshold_excludes_short_gaps() {
-    println!("\n=== EXP6: low-energy gap shortening (overlap-add compressor) ===");
+fn exp6_low_energy_backlog_shortens() {
+    println!("\n=== EXP6: low-energy backlog shortening (WSOLA accelerate) ===");
     let now = Instant::now();
     let speech = samples_for_duration(Duration::from_millis(100));
 
@@ -399,15 +415,15 @@ fn exp6_silence_skip_threshold_excludes_short_gaps() {
             &mut stats,
         );
 
-        // Pump through enough of the queue for maybe_skip_silence to act.
+        // Pump through enough of the queue for WSOLA accelerate to act.
         for _ in 0..samples_for_duration(Duration::from_millis(50)) {
             let _ = stream.pop_sample(now, &mut stats);
         }
         println!(
-            "gap={gap_ms:>3}ms -> skipped={:>3}ms (skip_count={})  {}",
-            samples_to_ms(stats.skipped_silence_samples as usize),
-            stats.silence_skip_count,
-            if stats.silence_skip_count == 0 {
+            "gap={gap_ms:>3}ms -> removed={:>3}ms (accelerate_count={})  {}",
+            samples_to_ms(stats.accelerate_samples as usize),
+            stats.accelerate_count,
+            if stats.accelerate_count == 0 {
                 "NOT shortened"
             } else {
                 "shortened"
@@ -447,6 +463,7 @@ fn run_clean_pipeline(
     let mut seq = 0u32;
     let mut tail_min = u64::MAX;
     let mut tail_max = 0u64;
+    let mut tail_underruns_start = None;
     let mut last_target = 0u64;
 
     for callback in 0..callbacks {
@@ -466,6 +483,9 @@ fn run_clean_pipeline(
         }
         decode.drain_into_mixer(&mixer, now, None);
         if let Ok(mut mixer) = mixer.lock() {
+            if callback == tail_start {
+                tail_underruns_start = Some(mixer.snapshot_at(now).underrun_count);
+            }
             for _ in 0..block {
                 let _ = mixer.pop_mixed_output_sample(now, block);
             }
@@ -485,7 +505,9 @@ fn run_clean_pipeline(
         queue_end_ms: snap.max_queue_ms,
         queue_tail_min_ms: if tail_min == u64::MAX { 0 } else { tail_min },
         queue_tail_max_ms: tail_max,
-        underruns: snap.underrun_count,
+        underruns: snap
+            .underrun_count
+            .saturating_sub(tail_underruns_start.unwrap_or(0)),
         hard_trims: snap.hard_trim_count,
     }
 }
@@ -513,6 +535,13 @@ fn exp7_clean_connection_latency_standing() {
                 "ABOVE one-packet goal"
             },
         );
+        if block_ms == 20 {
+            assert!(
+                s.queue_tail_max_ms <= 22,
+                "20ms block should stay at one packet, got max {}ms",
+                s.queue_tail_max_ms
+            );
+        }
     }
 }
 
@@ -538,6 +567,10 @@ fn exp8_device_period_robustness() {
             } else {
                 "UNDERRUNS"
             },
+        );
+        assert_eq!(
+            s.underruns, 0,
+            "period {block_ms}ms should have no sustained underruns"
         );
     }
 }

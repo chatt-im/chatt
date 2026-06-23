@@ -222,8 +222,8 @@ pub(crate) fn drain_catch_up(stream: &mut AdaptivePlaybackStream, now: Instant) 
     }
     assert_eq!(stats.underrun_count, 0, "catch-up must not underrun");
     assert!(
-        stats.resampled_samples > 0,
-        "catch-up resampling path must engage"
+        stats.accelerate_count > 0 || stats.expand_count > 0,
+        "WSOLA path must engage"
     );
     output
 }
