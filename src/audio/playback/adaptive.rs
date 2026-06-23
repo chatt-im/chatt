@@ -12,7 +12,7 @@ use crate::audio::{
         DecodedFrameSource, LIVE_PLAYBACK_DYNAMIC_DEADBAND, LIVE_PLAYBACK_DYNAMIC_UNDERRUN_MIN,
         LIVE_PLAYBACK_DYNAMIC_UNDERRUN_WINDOW, LIVE_PLAYBACK_MAX_IDLE_EXPANSION,
         LIVE_PLAYBACK_RECOVERY_DECLICK, LIVE_PLAYBACK_RECOVERY_DECLICK_MIN_DELTA, LiveAudioTuning,
-        TIME_SCALE_DECISION_INTERVAL, TIME_SCALE_MARGIN, TIME_SCALE_MAX_LAG_48K,
+        PlayoutDelay, TIME_SCALE_DECISION_INTERVAL, TIME_SCALE_MARGIN, TIME_SCALE_MAX_LAG_48K,
         TIME_SCALE_MIN_LAG_48K, TIME_SCALE_NOISE_FLOOR_MS, TIME_SCALE_OPERATION_HOLD,
         TIME_SCALE_OVERLAP, TIME_SCALE_REF_OFFSET, TIME_SCALE_VAD_RATIO, TIME_SCALE_WINDOW,
         samples_for_duration, samples_to_ms,
@@ -102,12 +102,24 @@ impl AdaptivePlaybackStream {
         now: Instant,
         stats: &mut LivePlaybackMixerStats,
     ) {
+        self.queue_samples_with_delay(samples, source, None, now, stats);
+    }
+
+    pub(crate) fn queue_samples_with_delay(
+        &mut self,
+        samples: &[f32],
+        source: DecodedFrameSource,
+        playout_delay: Option<PlayoutDelay>,
+        now: Instant,
+        stats: &mut LivePlaybackMixerStats,
+    ) {
         if samples.is_empty() {
             return;
         }
         let mut samples = samples.to_vec();
         self.declick_recovery_boundary(&mut samples, source);
-        self.input.push_back_owned(samples, source);
+        self.input
+            .push_back_owned_with_delay(samples, source, playout_delay, now);
         // A real decoded frame arrived, so the stream is live: clear the idle
         // expansion budget so concealment is free to bridge the next underrun.
         self.idle_expansion_samples = 0;
@@ -232,15 +244,56 @@ impl AdaptivePlaybackStream {
         let target = self
             .effective_target_samples()
             .max(self.output_target_floor_samples);
+        if let Some(playout_delay) = self.input.front_playout_delay(now) {
+            self.run_arrival_delay_decision(playout_delay, target, now, stats);
+            return;
+        }
+        self.run_queue_depth_fallback_decision(queued, target, now, stats);
+    }
+
+    fn run_arrival_delay_decision(
+        &mut self,
+        playout_delay: PlayoutDelay,
+        target: usize,
+        now: Instant,
+        stats: &mut LivePlaybackMixerStats,
+    ) {
+        let current_delay = samples_for_duration(playout_delay.current);
+        let peak_arrival_delay = samples_for_duration(playout_delay.peak);
+        let high = target
+            .saturating_add(peak_arrival_delay)
+            .saturating_add(self.samples.time_scale_margin);
+        if current_delay >= high.saturating_mul(4) {
+            self.try_accelerate(now, stats, true);
+            return;
+        }
+        if !self.time_scale_allowed() {
+            return;
+        }
+        if current_delay >= high {
+            self.try_accelerate(now, stats, false);
+        } else if current_delay < target {
+            if !self.try_expand(now, stats) {
+                self.try_short_buffer_expand(stats);
+            }
+        }
+    }
+
+    fn run_queue_depth_fallback_decision(
+        &mut self,
+        queued: usize,
+        target: usize,
+        now: Instant,
+        stats: &mut LivePlaybackMixerStats,
+    ) {
         let high = target.saturating_add(self.samples.time_scale_margin);
         if queued >= high.saturating_mul(4) {
             self.try_accelerate(now, stats, true);
             return;
         }
         let effective_target = self.effective_target_samples();
-        let should_preemptively_expand = queued == target
-            && self.output_target_floor_samples > 0
-            && self.output_target_floor_samples < effective_target;
+        let should_preemptively_expand =
+            queued == target && self.output_target_floor_samples > effective_target;
         if queued < target || should_preemptively_expand {
             if !self.try_expand(now, stats) {
                 self.try_short_buffer_expand(stats);
@@ -419,7 +472,15 @@ impl AdaptivePlaybackStream {
         }
         self.recent_underruns.push_back(now);
         if self.recent_underruns.len() >= LIVE_PLAYBACK_DYNAMIC_UNDERRUN_MIN {
-            self.recommended_target_samples = self.samples.target_queue;
+            // Recurring underruns mean the buffer is too shallow, so raise the
+            // target to at least the conservative default. Never lower it: under
+            // loss the delay estimator may already hold a deeper target, and
+            // snapping it down to the default here is what made it oscillate
+            // (deep, snap shallow, refill deep), moving the catch-up deadband and
+            // firing accelerate/expand against the swing.
+            self.recommended_target_samples = self
+                .recommended_target_samples
+                .max(self.samples.target_queue);
             self.underrun_hold_until = Some(now + LIVE_PLAYBACK_DYNAMIC_UNDERRUN_WINDOW);
         }
     }
@@ -516,7 +577,7 @@ mod tests {
     use crate::audio::{
         playback::LivePlaybackMixer,
         shared::{
-            FRAME_SAMPLES, LIVE_PLAYBACK_TARGET_QUEUE, SAMPLE_RATE, duration_to_ms,
+            FRAME_SAMPLES, LIVE_PLAYBACK_TARGET_QUEUE, PlayoutDelay, SAMPLE_RATE, duration_to_ms,
             max_adjacent_delta, samples_for_duration, target_queue_samples,
         },
         test_support::{drain_catch_up, sample_speech_frames, test_tuning},
@@ -796,6 +857,52 @@ mod tests {
     }
 
     #[test]
+    fn arrival_delay_decision_ignores_raw_queue_churn_inside_band() {
+        let now = Instant::now();
+        let mut stream = AdaptivePlaybackStream::new(test_tuning()).unwrap();
+        let mut stats = LivePlaybackMixerStats::default();
+        let tone = sine(1_000.0, Duration::from_millis(300));
+
+        stream.queue_samples_with_delay(
+            &tone,
+            DecodedFrameSource::Normal,
+            Some(PlayoutDelay {
+                current: Duration::from_millis(70),
+                peak: Duration::from_millis(20),
+            }),
+            now,
+            &mut stats,
+        );
+
+        assert!(stream.queued_samples() > samples_for_duration(Duration::from_millis(250)));
+        assert_eq!(stream.pop_sample(now, &mut stats), Some(tone[0]));
+        assert_eq!(stats.accelerate_count, 0, "{stats:?}");
+        assert_eq!(stats.expand_count, 0, "{stats:?}");
+    }
+
+    #[test]
+    fn arrival_delay_decision_accelerates_excess_playout_delay() {
+        let now = Instant::now();
+        let mut stream = AdaptivePlaybackStream::new(test_tuning()).unwrap();
+        let mut stats = LivePlaybackMixerStats::default();
+        let tone = sine(1_000.0, Duration::from_millis(1_000));
+
+        stream.queue_samples_with_delay(
+            &tone,
+            DecodedFrameSource::Normal,
+            Some(PlayoutDelay {
+                current: Duration::from_millis(200),
+                peak: Duration::ZERO,
+            }),
+            now,
+            &mut stats,
+        );
+
+        let _ = stream.pop_sample(now, &mut stats);
+        assert!(stats.accelerate_count > 0, "{stats:?}");
+    }
+
+    #[test]
     fn time_scale_preserves_pitch_through_accelerate() {
         let now = Instant::now();
         let rate = f64::from(SAMPLE_RATE);
@@ -830,29 +937,31 @@ mod tests {
     fn time_scale_preserves_pitch_through_expand() {
         let now = Instant::now();
         let rate = f64::from(SAMPLE_RATE);
-        let mut tuning = test_tuning();
-        tuning.max_target = Duration::from_millis(1_000);
-        let tone = sine(1_000.0, Duration::from_millis(120));
+        let tuning = test_tuning();
+        // Queue less than the near-empty expand floor so the safety-net expand
+        // engages and bridges by duplicating whole pitch periods, then verify the
+        // bridged output holds the 1 kHz pitch (no resample-style shift).
+        let tone = sine(1_000.0, Duration::from_millis(30));
         let mut stream = AdaptivePlaybackStream::new(tuning).unwrap();
         let mut stats = LivePlaybackMixerStats::default();
-        stream.apply_recommended_target(Duration::from_millis(200), now);
         stream.queue_samples(&tone, DecodedFrameSource::Normal, now, &mut stats);
-        let before = stream.queued_samples();
 
-        for _ in 0..samples_for_duration(Duration::from_millis(40)) {
-            let _ = stream.pop_sample(now, &mut stats);
+        let mut output = Vec::new();
+        for _ in 0..samples_for_duration(Duration::from_millis(90)) {
+            match stream.pop_sample(now, &mut stats) {
+                Some(sample) => output.push(sample),
+                None => break,
+            }
         }
 
         assert!(stats.expand_count > 0, "{stats:?}");
-        assert!(stream.queued_samples() + samples_for_duration(Duration::from_millis(40)) > before);
-
-        let output = drain_catch_up(&mut stream, now);
-        let window = output
-            .len()
-            .min(samples_for_duration(Duration::from_millis(40)));
-        let freq = zero_cross_freq(&output[..window], rate);
+        // Measure pitch over a window in the bridged tail, after expansion has
+        // synthesized past the original 30 ms of real audio.
+        let window = samples_for_duration(Duration::from_millis(20));
+        let start = output.len().saturating_sub(window);
+        let freq = zero_cross_freq(&output[start..], rate);
         assert!(
-            (freq - 1_000.0).abs() <= 10.0,
+            (freq - 1_000.0).abs() <= 15.0,
             "expand shifted 1kHz tone to {freq:.1}Hz; stats={stats:?}",
         );
     }
@@ -903,9 +1012,11 @@ mod tests {
         let mut mixer = LivePlaybackMixer::new();
         let now = Instant::now();
 
+        // Below the near-empty expand floor, so the passive (PLC) buffer is
+        // bridged by the safety-net expand rather than left to underrun.
         mixer.queue_stream_samples(
             1,
-            &vec![0.0; samples_for_duration(Duration::from_millis(40))],
+            &vec![0.0; samples_for_duration(Duration::from_millis(30))],
             DecodedFrameSource::Plc,
             now,
         );

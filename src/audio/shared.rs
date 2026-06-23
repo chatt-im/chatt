@@ -548,6 +548,12 @@ pub(crate) enum DecodedFrameSource {
     DecodeError,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct PlayoutDelay {
+    pub(crate) current: Duration,
+    pub(crate) peak: Duration,
+}
+
 pub(crate) fn target_queue_samples(tuning: LiveAudioTuning) -> usize {
     samples_for_duration(tuning.target_queue)
 }

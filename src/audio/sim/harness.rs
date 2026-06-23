@@ -1189,6 +1189,48 @@ mod tests {
     }
 
     #[test]
+    fn random60_direct_sample_timescale_churn_stays_bounded() {
+        let input = sample_direct_pcm_frames(1500);
+        let output = run_live_audio_direct_sample_simulation_output(
+            LiveAudioDirectSampleSimulationConfig {
+                packet_loss: LiveAudioPacketLossProfile::Random60,
+                seed: 0x2468_1357_89ab_cdef,
+                ..Default::default()
+            },
+            &input,
+        )
+        .unwrap();
+        let snapshot = &output.report.final_snapshot;
+        let accelerate_ms = samples_to_ms(snapshot.accelerate_samples as usize);
+        let expand_ms = samples_to_ms(snapshot.expand_samples as usize);
+        let churn_ms = accelerate_ms + expand_ms;
+
+        eprintln!(
+            "random60 direct sample: dred={} plc={} underruns={} accel={}({}ms) expand={}({}ms) churn={}ms output={}ms max_queue={}ms max_delta={:.3}",
+            snapshot.dred_recoveries,
+            snapshot.plc_fallbacks,
+            snapshot.underrun_count,
+            snapshot.accelerate_count,
+            accelerate_ms,
+            snapshot.expand_count,
+            expand_ms,
+            churn_ms,
+            output.report.output_ms,
+            output.report.max_queue_ms,
+            output.report.max_adjacent_delta,
+        );
+
+        assert!(snapshot.dred_recoveries > 0, "{:?}", output.report);
+        assert!(snapshot.plc_fallbacks <= 3, "{:?}", output.report);
+        assert!(
+            churn_ms <= 600,
+            "random60 time-scaler churn regressed to {churn_ms}ms: {:?}",
+            output.report
+        );
+        assert_coherent_output(&output.report, 0.0001);
+    }
+
+    #[test]
     fn simulated_constant_sampled_speech_stays_coherent_and_bounded() {
         let report = simulate(
             LiveAudioSimulationScenario::ConstantSpeech,
