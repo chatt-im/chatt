@@ -20,17 +20,15 @@ pub const FRAME_SAMPLES: usize = DenoiseState::FRAME_SIZE;
 pub const DEFAULT_LIVE_MAX_AMPLIFICATION: f32 = 12.0;
 pub(crate) const LIVE_OPUS_FRAME_SAMPLES: usize = FRAME_SAMPLES * 2;
 pub(crate) const LIVE_PACKET_FLAG_OPUS_RESET: u8 = 0x01;
+/// Sender is transmitting silence at the edge of a silence-suppressed pause.
+pub(crate) const LIVE_PACKET_FLAG_SILENCE_HINT: u8 = 0x02;
+/// Sender has resumed after a silence-suppressed pause.
+pub(crate) const LIVE_PACKET_FLAG_SILENCE_RESUME: u8 = 0x04;
 pub(crate) const CALLBACK_QUEUE_CAPACITY: usize = 8;
 pub(crate) const LIVE_PLAYBACK_COMMAND_CAPACITY: usize = 256;
 pub(crate) const LIVE_PLAYBACK_TARGET_QUEUE: Duration = Duration::from_millis(60);
 pub(crate) const LIVE_PLAYBACK_DYNAMIC_TARGET_FLOOR: Duration = Duration::from_millis(20);
 pub(crate) const LIVE_PLAYBACK_MAX_TARGET: Duration = Duration::from_millis(1_000);
-// Per-packet rise of the relative-transit baseline, in microseconds. The
-// baseline tracks the best-case (minimum) transit, dropping instantly to new
-// lows and rising at this rate to forget stale lows so a constant latency
-// shift is adopted within a few seconds. Lateness is measured above it, so
-// only delay variation, not absolute latency, raises the target.
-pub(crate) const LIVE_PLAYBACK_TRANSIT_BASE_FORGET_US: f64 = 500.0;
 // A lone playout underrun is usually a talkspurt draining to empty, not network
 // starvation. The target only re-widens when underruns recur: at least this
 // many within the window below. Each starvation episode produces one underrun

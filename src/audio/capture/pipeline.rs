@@ -18,13 +18,16 @@ use crate::{
         },
         shared::{
             AudioStats, FRAME_SAMPLES, LIVE_OPUS_FRAME_SAMPLES, LIVE_PACKET_FLAG_OPUS_RESET,
-            LiveAudioTuning, LiveEncoderProfile, LocalVoiceFrame, MAX_OPUS_PACKET_BYTES,
+            LIVE_PACKET_FLAG_SILENCE_HINT, LIVE_PACKET_FLAG_SILENCE_RESUME, LiveAudioTuning,
+            LiveEncoderProfile, LocalVoiceFrame, MAX_OPUS_PACKET_BYTES,
             convert_i16_scale_to_pcm_i16, vad_to_u8,
         },
     },
     network::{EncoderNetworkProfile, EncoderNetworkTuning},
     packet_log::PacketLogWriter,
 };
+
+const SILENCE_RESUME_HINT_PACKETS: u8 = 10;
 
 pub(crate) fn run_encoder_worker(
     receiver: Receiver<Vec<f32>>,
@@ -189,6 +192,7 @@ pub(crate) struct LiveEncoderPipeline {
     encoded: Vec<u8>,
     pending_opus_samples: Vec<f32>,
     next_opus_packet_flags: u8,
+    silence_resume_hint_packets: u8,
     suppressed_frames: u64,
     echo: Option<EchoCanceller>,
     echo_source: Option<EchoReferenceSource>,
@@ -238,7 +242,8 @@ impl LiveEncoderPipeline {
             opus_frame: vec![0i16; LIVE_OPUS_FRAME_SAMPLES],
             encoded: vec![0u8; MAX_OPUS_PACKET_BYTES],
             pending_opus_samples: Vec::with_capacity(LIVE_OPUS_FRAME_SAMPLES),
-            next_opus_packet_flags: 0,
+            next_opus_packet_flags: LIVE_PACKET_FLAG_OPUS_RESET,
+            silence_resume_hint_packets: 0,
             suppressed_frames: 0,
             echo,
             echo_source,
@@ -316,9 +321,14 @@ impl LiveEncoderPipeline {
             .long_silence
             .as_mut()
             .map(|gate| gate.observe(frame, silence))
-            .unwrap_or(CaptureGateDecision::TransmitCurrent);
+            .unwrap_or(CaptureGateDecision::TransmitCurrent {
+                silence_hint: false,
+            });
         match decision {
-            CaptureGateDecision::TransmitCurrent => {
+            CaptureGateDecision::TransmitCurrent { silence_hint } => {
+                if silence_hint {
+                    self.next_opus_packet_flags |= LIVE_PACKET_FLAG_SILENCE_HINT;
+                }
                 let frame = ProcessedCaptureFrame::new(frame);
                 self.queue_processed_capture_frame(frame, stats, on_packet)?;
             }
@@ -348,8 +358,12 @@ impl LiveEncoderPipeline {
         self.pending_opus_samples.extend_from_slice(frame.samples);
 
         while self.pending_opus_samples.len() >= LIVE_OPUS_FRAME_SAMPLES {
-            let flags = self.next_opus_packet_flags;
+            let mut flags = self.next_opus_packet_flags;
             self.next_opus_packet_flags = 0;
+            if self.silence_resume_hint_packets > 0 {
+                flags |= LIVE_PACKET_FLAG_SILENCE_RESUME;
+                self.silence_resume_hint_packets -= 1;
+            }
             encode_live_frame(
                 &self.pending_opus_samples[..LIVE_OPUS_FRAME_SAMPLES],
                 flags,
@@ -373,7 +387,8 @@ impl LiveEncoderPipeline {
     fn reset_opus_stream(&mut self) -> Result<(), String> {
         self.pending_opus_samples.clear();
         self.encoder.reset_state()?;
-        self.next_opus_packet_flags |= LIVE_PACKET_FLAG_OPUS_RESET;
+        self.next_opus_packet_flags = LIVE_PACKET_FLAG_OPUS_RESET;
+        self.silence_resume_hint_packets = SILENCE_RESUME_HINT_PACKETS;
         Ok(())
     }
 
@@ -604,18 +619,52 @@ mod tests {
 
         let reset_index = packets
             .iter()
-            .position(|packet| packet.flags & LIVE_PACKET_FLAG_OPUS_RESET != 0)
+            .enumerate()
+            .find_map(|(index, packet)| {
+                (index > 0 && packet.flags & LIVE_PACKET_FLAG_OPUS_RESET != 0).then_some(index)
+            })
             .expect("resume packet should carry opus reset flag");
-        assert!(reset_index > 0, "first packet must not be a reset");
+        assert!(
+            reset_index > 0,
+            "resume reset should not be the first packet"
+        );
+        assert_ne!(
+            packets[0].flags & LIVE_PACKET_FLAG_OPUS_RESET,
+            0,
+            "fresh encoder should reset Opus on its first packet"
+        );
+        assert!(
+            packets[1..reset_index]
+                .iter()
+                .all(|packet| packet.flags & LIVE_PACKET_FLAG_OPUS_RESET == 0)
+        );
         assert!(
             packets[..reset_index]
+                .iter()
+                .any(|packet| packet.flags & LIVE_PACKET_FLAG_SILENCE_HINT != 0),
+            "transmitted silence before suppression should advertise the pending sender pause"
+        );
+        assert_ne!(
+            packets[reset_index].flags & LIVE_PACKET_FLAG_SILENCE_RESUME,
+            0,
+            "resume packet should advertise the sender pause it follows"
+        );
+        assert!(
+            packets[reset_index..]
+                .iter()
+                .all(|packet| packet.flags & LIVE_PACKET_FLAG_SILENCE_HINT == 0),
+            "resume speech must not keep advertising a pending silence pause"
+        );
+        assert!(
+            packets[reset_index + 1..]
                 .iter()
                 .all(|packet| packet.flags & LIVE_PACKET_FLAG_OPUS_RESET == 0)
         );
         assert!(
             packets[reset_index + 1..]
                 .iter()
-                .all(|packet| packet.flags & LIVE_PACKET_FLAG_OPUS_RESET == 0)
+                .any(|packet| packet.flags & LIVE_PACKET_FLAG_SILENCE_RESUME != 0),
+            "resume marker should survive loss of the first resume packet"
         );
     }
 

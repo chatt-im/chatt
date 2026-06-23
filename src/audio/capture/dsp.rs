@@ -184,7 +184,7 @@ pub(crate) struct CaptureBufferedFrame {
 }
 
 pub(crate) enum CaptureGateDecision {
-    TransmitCurrent,
+    TransmitCurrent { silence_hint: bool },
     SuppressCurrent,
     Resume(Vec<CaptureBufferedFrame>),
 }
@@ -242,7 +242,7 @@ impl LongSilenceGate {
 
         if silence && self.silence_frames == self.stop_frames {
             apply_fade_out(samples, self.ramp_samples);
-            return CaptureGateDecision::TransmitCurrent;
+            return CaptureGateDecision::TransmitCurrent { silence_hint: true };
         }
 
         if silence && self.silence_frames > self.stop_frames {
@@ -251,7 +251,9 @@ impl LongSilenceGate {
             return CaptureGateDecision::SuppressCurrent;
         }
 
-        CaptureGateDecision::TransmitCurrent
+        CaptureGateDecision::TransmitCurrent {
+            silence_hint: false,
+        }
     }
 
     fn push_preroll(&mut self, samples: &[f32]) {
@@ -375,7 +377,9 @@ mod tests {
             let mut frame = vec![1.0; 8];
             assert!(matches!(
                 gate.observe(&mut frame, true),
-                CaptureGateDecision::TransmitCurrent
+                CaptureGateDecision::TransmitCurrent {
+                    silence_hint: false
+                }
             ));
             assert!(
                 frame
@@ -387,7 +391,7 @@ mod tests {
         let mut final_frame = vec![1.0; 8];
         assert!(matches!(
             gate.observe(&mut final_frame, true),
-            CaptureGateDecision::TransmitCurrent
+            CaptureGateDecision::TransmitCurrent { silence_hint: true }
         ));
         assert!(final_frame[4] < 1.0);
         assert!(final_frame[7].abs() < f32::EPSILON);
@@ -405,7 +409,7 @@ mod tests {
         let mut threshold_frame = vec![0.1; 4];
         assert!(matches!(
             gate.observe(&mut threshold_frame, true),
-            CaptureGateDecision::TransmitCurrent
+            CaptureGateDecision::TransmitCurrent { silence_hint: true }
         ));
 
         let mut old_preroll = vec![0.2; 4];
