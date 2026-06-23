@@ -9,8 +9,8 @@ use crate::audio::{
         DecodedFrameSource, LIVE_PLAYBACK_CORRECTION_ALPHA, LIVE_PLAYBACK_CORRECTION_SLEW,
         LIVE_PLAYBACK_DYNAMIC_DEADBAND, LIVE_PLAYBACK_DYNAMIC_UNDERRUN_MIN,
         LIVE_PLAYBACK_DYNAMIC_UNDERRUN_WINDOW, LIVE_PLAYBACK_RECOVERY_DECLICK,
-        LIVE_PLAYBACK_RECOVERY_DECLICK_MIN_DELTA, LiveAudioTuning, catmull_rom,
-        samples_for_duration, samples_to_ms,
+        LIVE_PLAYBACK_RECOVERY_DECLICK_MIN_DELTA, LIVE_PLAYBACK_SEVERE_LOSS_EVENTS,
+        LiveAudioTuning, catmull_rom, samples_for_duration, samples_to_ms,
     },
 };
 
@@ -23,11 +23,11 @@ pub(crate) struct TuningSampleCounts {
     target_queue: usize,
     dynamic_target_floor: usize,
     catch_up_start_excess: usize,
+    device_period_margin: usize,
     hard_queue_bound: usize,
     dred_horizon: usize,
     moderate_loss_queue: usize,
     pub(crate) silence_min_gap: usize,
-    pub(crate) silence_guard: usize,
     pub(crate) silence_max_skip: usize,
     pub(crate) silence_min_skip: usize,
     pub(crate) silence_ramp: usize,
@@ -39,11 +39,11 @@ impl TuningSampleCounts {
             target_queue: samples_for_duration(tuning.target_queue),
             dynamic_target_floor: samples_for_duration(tuning.dynamic_target_floor),
             catch_up_start_excess: samples_for_duration(tuning.catch_up_start_excess),
+            device_period_margin: samples_for_duration(tuning.device_period_margin),
             hard_queue_bound: samples_for_duration(tuning.hard_queue_bound),
             dred_horizon: samples_for_duration(tuning.dred_horizon),
             moderate_loss_queue: samples_for_duration(tuning.moderate_loss_queue),
             silence_min_gap: samples_for_duration(tuning.silence_min_gap),
-            silence_guard: samples_for_duration(tuning.silence_guard),
             silence_max_skip: samples_for_duration(tuning.silence_max_skip),
             silence_min_skip: samples_for_duration(tuning.silence_min_skip),
             silence_ramp: samples_for_duration(tuning.silence_ramp),
@@ -61,6 +61,11 @@ pub(crate) struct AdaptivePlaybackStream {
     pub(crate) current_correction_percent: f32,
     recent_loss_events: VecDeque<Instant>,
     expanded_target_samples: usize,
+    /// When the current loss expansion was (re)armed. The applied target decays
+    /// linearly from `expanded_target_samples` at this instant down to the
+    /// effective target at `expanded_target_until`, so a transient concealment
+    /// relaxes smoothly instead of holding a fixed plateau for 5-10 s.
+    expanded_started_at: Option<Instant>,
     pub(crate) expanded_target_until: Option<Instant>,
     /// Receiver-recommended dynamic baseline target in samples, clamped to
     /// [`dynamic_target_floor`, `target_queue`]. Starts at the safe default and
@@ -95,6 +100,7 @@ impl AdaptivePlaybackStream {
             current_correction_percent: 0.0,
             recent_loss_events: VecDeque::new(),
             expanded_target_samples: samples.target_queue,
+            expanded_started_at: None,
             expanded_target_until: None,
             recommended_target_samples: samples.target_queue,
             underrun_hold_until: None,
@@ -115,8 +121,14 @@ impl AdaptivePlaybackStream {
         now: Instant,
         stats: &mut LivePlaybackMixerStats,
     ) {
-        if matches!(source, DecodedFrameSource::Dred | DecodedFrameSource::Plc) {
-            self.note_loss(now);
+        match source {
+            // A DRED frame is a confirmed loss the sender shipped redundancy
+            // for, so it expands the target on its own. A PLC frame is bare
+            // concealment that fires on any single late or reordered packet, so
+            // it only contributes toward the sustained-loss threshold.
+            DecodedFrameSource::Dred => self.note_loss(now, true),
+            DecodedFrameSource::Plc => self.note_loss(now, false),
+            DecodedFrameSource::Normal | DecodedFrameSource::DecodeError => {}
         }
         let mut samples = samples.to_vec();
         self.declick_recovery_boundary(&mut samples, source);
@@ -221,7 +233,7 @@ impl AdaptivePlaybackStream {
         now: Instant,
         stats: &mut LivePlaybackMixerStats,
     ) -> Option<f32> {
-        self.maybe_skip_silence(now, stats);
+        self.maybe_compress(now, stats);
         self.update_correction(now, stats);
 
         // Read at `read_pos` with a 4-tap Catmull-Rom kernel. `read_pos` is held
@@ -294,29 +306,36 @@ impl AdaptivePlaybackStream {
     fn begin_output_block(&mut self, _now: Instant, output_block_samples: usize) {
         let output_block_samples = output_block_samples.max(1);
         let queued = self.queued_samples();
-        // Gate playback on a floor no larger than the playout target. For a small
-        // hardware block this is the whole block, so a callback is filled with
-        // audio rather than part audio and part underrun silence. For an oversized
-        // block (a host-default ALSA/PipeWire period of hundreds of ms) the device
-        // buffer already imposes its own latency; requiring a whole block to be
-        // queued would add that latency again and emit a full block of silence on
-        // any dip, so the floor stays at the target and the block's tail underruns
-        // transiently instead. The loss-expanded target is only an allowance, not a
-        // reason to hold the device silent for a long rebuffer.
-        let block_floor = output_block_samples.min(self.samples.target_queue);
-        let target = self.low_latency_target_samples().max(block_floor);
+        // Size the floor to cover one whole device callback plus a margin. A
+        // small hardware block yields the one-packet/effective target; a large
+        // host period (a host-default ALSA/PipeWire period of hundreds of ms)
+        // yields a period-bound floor so the callback is filled with audio
+        // rather than draining past the queue and underrunning its tail every
+        // time. Latency on a large-period device is period-bound by the device,
+        // so matching it is correct. Clamp to the hard bound so an absurd
+        // reported period cannot demand an unbounded prebuffer.
+        let block_floor = (output_block_samples + self.samples.device_period_margin)
+            .min(self.samples.hard_queue_bound);
         self.output_target_floor_samples = block_floor;
+        // Prime against the effective (not loss-expanded) target raised to the
+        // device floor. The loss expansion is an allowance, not a reason to hold
+        // the device silent for a long rebuffer. The margin is a one-time priming
+        // cushion so playback starts with slack above the device period.
+        let prime_target = self.effective_target_samples().max(block_floor);
         self.output_block_playable = if self.output_priming {
-            let ready = queued >= target;
+            let ready = queued >= prime_target;
             if ready {
                 self.output_priming = false;
             }
             ready
-        } else if queued >= block_floor {
-            true
         } else {
-            self.output_priming = true;
-            false
+            // Once playing, keep playing as long as the queue can back one whole
+            // callback. Re-priming only when a full block is no longer available
+            // lets the cushion absorb ordinary packet-granularity jitter instead
+            // of emitting a block of silence on every dip below the prime target.
+            let playable = queued >= output_block_samples;
+            self.output_priming = !playable;
+            playable
         };
         self.output_block_remaining = output_block_samples;
     }
@@ -374,48 +393,56 @@ impl AdaptivePlaybackStream {
         (self.tuning.max_speed_up * (over / range)).min(self.tuning.max_speed_up)
     }
 
-    fn maybe_skip_silence(&mut self, _now: Instant, stats: &mut LivePlaybackMixerStats) {
+    /// Sheds buffered latency by overlap-add compressing a low-energy region
+    /// ahead of the play head. Unlike the old excise-and-fade skip it acts on
+    /// runs as short as `silence_min_gap` and in continuous increments, with a
+    /// crossfade across the join so the waveform stays continuous and the
+    /// removal needs no sender silence flag.
+    fn maybe_compress(&mut self, _now: Instant, stats: &mut LivePlaybackMixerStats) {
         if !self.tuning.playback_silence_skip {
             return;
         }
         let queued = self.queued_samples();
-        let catchup_target = self.low_latency_target_samples();
-        if queued <= catchup_target {
+        let target = self.low_latency_target_samples();
+        if queued <= target {
             return;
         }
 
-        let excess = queued.saturating_sub(catchup_target);
-        // Never drain inside the active interpolation window [0, base + 2]; the
-        // silence guard keeps the found run far past it, but make it explicit.
+        let excess = queued.saturating_sub(target);
+        // Never touch the active interpolation window [0, base + 2]; the
+        // compressor keeps its removed region strictly past `window_end`.
         let window_end = self.read_pos.ceil() as usize + 2;
-        match self.input.find_silence_skip(&self.samples, excess) {
-            Some((skip_start, skip_len)) if skip_start > window_end => {
+        match self
+            .input
+            .find_low_energy_compress(&self.samples, excess, window_end)
+        {
+            Some((start, segment)) => {
                 self.input
-                    .ramp_around_skip(&self.samples, skip_start, skip_len);
-                self.input.drain_range(skip_start, skip_len);
+                    .overlap_add_compress(self.samples.silence_ramp, start, segment);
                 stats.silence_skip_count = stats.silence_skip_count.saturating_add(1);
-                stats.skipped_silence_samples = stats
-                    .skipped_silence_samples
-                    .saturating_add(skip_len as u64);
+                stats.skipped_silence_samples =
+                    stats.skipped_silence_samples.saturating_add(segment as u64);
                 kvlog::info!(
-                    "live playback skipped silence",
-                    skipped_ms = samples_to_ms(skip_len),
+                    "live playback compressed silence",
+                    skipped_ms = samples_to_ms(segment),
                     queued_ms = samples_to_ms(queued),
-                    target_ms = samples_to_ms(catchup_target)
+                    target_ms = samples_to_ms(target)
                 );
             }
-            _ => {
+            None => {
                 stats.silence_skip_rejected = stats.silence_skip_rejected.saturating_add(1);
             }
         }
     }
 
-    fn note_loss(&mut self, now: Instant) {
+    /// Records a concealment event and widens the playout target only on
+    /// sustained loss. `recovered` is true for a DRED frame (a confirmed loss
+    /// the sender anticipated), which expands to the moderate queue on its own.
+    /// A bare PLC frame (`recovered == false`) only counts toward the severe
+    /// threshold, so an isolated late packet never pins a large queue.
+    fn note_loss(&mut self, now: Instant, recovered: bool) {
         if !self.tuning.adaptive_catch_up {
             return;
-        }
-        if self.expanded_target_until.is_none_or(|until| now >= until) {
-            self.expanded_target_samples = self.samples.target_queue;
         }
         while self
             .recent_loss_events
@@ -426,21 +453,54 @@ impl AdaptivePlaybackStream {
         }
         self.recent_loss_events.push_back(now);
 
-        let (target, hold) = if self.recent_loss_events.len() >= 8 {
-            (self.samples.dred_horizon, self.tuning.severe_loss_hold)
+        let expansion = if self.recent_loss_events.len() >= LIVE_PLAYBACK_SEVERE_LOSS_EVENTS {
+            Some((self.samples.dred_horizon, self.tuning.severe_loss_hold))
+        } else if recovered {
+            Some((self.samples.moderate_loss_queue, self.tuning.loss_hold))
         } else {
-            (self.samples.moderate_loss_queue, self.tuning.loss_hold)
+            None
         };
-        self.expanded_target_samples = self.expanded_target_samples.max(target);
+        let Some((target, hold)) = expansion else {
+            return;
+        };
+
+        let active = self.expanded_target_until.is_some_and(|until| now < until);
+        let base_peak = if active {
+            self.expanded_target_samples
+        } else {
+            self.samples.target_queue
+        };
+        self.expanded_target_samples = base_peak.max(target);
+        self.expanded_started_at = Some(now);
         self.expanded_target_until = Some(now + hold);
     }
 
+    /// The applied playout target, including any loss expansion. While an
+    /// expansion is active the value decays linearly from its armed peak toward
+    /// the effective target across the hold window, so a transient concealment
+    /// relaxes smoothly rather than holding a fixed plateau.
     pub(crate) fn adaptive_target_samples(&self, now: Instant) -> usize {
-        if self.expanded_target_until.is_some_and(|until| now < until) {
-            self.expanded_target_samples.max(self.samples.target_queue)
-        } else {
-            self.effective_target_samples()
+        let effective = self.effective_target_samples();
+        let (Some(started), Some(until)) = (self.expanded_started_at, self.expanded_target_until)
+        else {
+            return effective;
+        };
+        if now >= until {
+            return effective;
         }
+        let peak = self.expanded_target_samples.max(self.samples.target_queue);
+        if peak <= effective {
+            return effective;
+        }
+        let span = until.saturating_duration_since(started).as_secs_f64();
+        let elapsed = now.saturating_duration_since(started).as_secs_f64();
+        let fraction = if span > 0.0 {
+            (elapsed / span).clamp(0.0, 1.0)
+        } else {
+            1.0
+        };
+        let decayed = peak as f64 - fraction * (peak - effective) as f64;
+        decayed.round() as usize
     }
 
     fn low_latency_target_samples(&self) -> usize {
@@ -483,9 +543,12 @@ impl AdaptivePlaybackStream {
             return;
         }
 
-        let trim_to = self
-            .adaptive_target_samples(now)
-            .max(self.samples.dred_horizon);
+        // Trim to the applied target, which is the expanded value during genuine
+        // loss (so DRED's recovery horizon is preserved exactly when loss is
+        // sustained) but the plain playout target otherwise. Without a fixed
+        // `dred_horizon` floor a quiet, non-lossy stream can drain all the way
+        // back instead of being pinned near one second.
+        let trim_to = self.adaptive_target_samples(now);
         let drop = queued.saturating_sub(trim_to);
         self.drop_oldest(drop);
         stats.hard_trim_count = stats.hard_trim_count.saturating_add(1);
@@ -598,28 +661,28 @@ mod tests {
     }
 
     #[test]
-    fn adaptive_stream_plays_oversized_block_without_full_prefill() {
-        // A host-default ALSA/PipeWire period can be many times the playout target.
-        // Playback must start once the target is queued rather than waiting for a
-        // whole oversized block, which would re-impose the device-buffer latency and
-        // emit a full block of silence on every dip below it.
+    fn adaptive_stream_primes_oversized_block_to_device_period() {
+        // A host-default ALSA/PipeWire period can be many times the playout
+        // target. The playout target is sized up to one whole device callback
+        // plus a margin so the block is filled with audio rather than draining
+        // past the queue and underrunning its tail every callback.
         let now = Instant::now();
-        let mut stream = AdaptivePlaybackStream::new(test_tuning()).unwrap();
+        let tuning = test_tuning();
+        let mut stream = AdaptivePlaybackStream::new(tuning).unwrap();
         let mut stats = LivePlaybackMixerStats::default();
-        let target = target_queue_samples(test_tuning());
-        let block = target * 4;
+        let block = target_queue_samples(tuning) * 4;
+        let floor = block + samples_for_duration(tuning.device_period_margin);
 
-        // One target's worth of audio, far short of a full hardware block.
+        // Prebuffer one device period plus the margin, the floor the stream
+        // requires before it starts an oversized block.
         stream.queue_samples(
-            &vec![0.25; target],
+            &vec![0.25; floor],
             DecodedFrameSource::Normal,
             false,
             now,
             &mut stats,
         );
 
-        // The block is playable at the target: the queued audio drains bit-exact and
-        // only the unbacked tail of the block underruns instead of the whole block.
         let mut played = 0usize;
         for _ in 0..block {
             match stream.pop_output_sample(now, &mut stats, block) {
@@ -630,9 +693,10 @@ mod tests {
                 None => break,
             }
         }
-        // The interpolator keeps up to three look-ahead samples it cannot bracket.
-        assert!(played >= target - 3, "played {played} of {target}");
-        assert!(stream.queued_samples() <= 3);
+        // The whole device callback is backed by audio: it plays in full with no
+        // tail underrun.
+        assert_eq!(played, block, "played {played} of {block}");
+        assert_eq!(stats.underrun_count, 0);
     }
 
     #[test]
@@ -643,7 +707,7 @@ mod tests {
         let block = samples_for_duration(Duration::from_millis(20));
 
         for index in 0..8 {
-            stream.note_loss(now + Duration::from_millis(index));
+            stream.note_loss(now + Duration::from_millis(index), false);
         }
         assert_eq!(samples_to_ms(stream.adaptive_target_samples(now)), 1_000);
 
@@ -823,7 +887,7 @@ mod tests {
         let mut stream = AdaptivePlaybackStream::new(test_tuning()).unwrap();
 
         for index in 0..8 {
-            stream.note_loss(now + Duration::from_millis(index));
+            stream.note_loss(now + Duration::from_millis(index), false);
         }
         assert_eq!(samples_to_ms(stream.adaptive_target_samples(now)), 1_000);
 
@@ -905,6 +969,13 @@ mod tests {
         let mut stream = AdaptivePlaybackStream::new(test_tuning()).unwrap();
         let mut stats = LivePlaybackMixerStats::default();
 
+        // Sustained loss expands the applied target to the DRED horizon, so the
+        // hard-trim leaves ~1 s of backlog for the catch-up resampler to drain.
+        for index in 0..8 {
+            stream.note_loss(now + Duration::from_millis(index), false);
+        }
+        assert_eq!(samples_to_ms(stream.adaptive_target_samples(now)), 1_000);
+
         let total = samples_for_duration(Duration::from_millis(2_000));
         let sine: Vec<f32> = (0..total)
             .map(|n| {
@@ -982,7 +1053,7 @@ mod tests {
     }
 
     #[test]
-    fn adaptive_stream_hard_trim_preserves_dred_horizon() {
+    fn adaptive_stream_hard_trim_drains_to_target_without_loss() {
         let now = Instant::now();
         let mut stream = AdaptivePlaybackStream::new(test_tuning()).unwrap();
         let mut stats = LivePlaybackMixerStats::default();
@@ -996,44 +1067,45 @@ mod tests {
             &mut stats,
         );
 
+        // With no active loss expansion the hard-trim drains to the plain
+        // playout target rather than being pinned at the 1 s DRED horizon, so a
+        // quiet stream that overran the hard bound can recover fully.
         assert_eq!(stats.hard_trim_count, 1);
-        assert_eq!(samples_to_ms(stream.queued_samples()), 1_000);
+        assert_eq!(
+            samples_to_ms(stream.queued_samples()),
+            duration_to_ms(test_tuning().target_queue)
+        );
     }
 
     #[test]
-    fn adaptive_stream_skips_only_marked_long_silence_when_behind() {
+    fn adaptive_stream_compresses_low_energy_run_regardless_of_sender_flag() {
+        // The compressor measures decoded energy, so an identical low-energy run
+        // is shortened by the same amount whether or not the sender flagged it.
         let now = Instant::now();
         let queued = samples_for_duration(Duration::from_millis(400));
-        let mut unmarked = AdaptivePlaybackStream::new(test_tuning()).unwrap();
-        let mut unmarked_stats = LivePlaybackMixerStats::default();
+        let compress_one = |silence_hint: bool| {
+            let mut stream = AdaptivePlaybackStream::new(test_tuning()).unwrap();
+            let mut stats = LivePlaybackMixerStats::default();
+            stream.queue_samples(
+                &vec![0.0; queued],
+                DecodedFrameSource::Normal,
+                silence_hint,
+                now,
+                &mut stats,
+            );
+            let _ = stream.pop_sample(now, &mut stats);
+            stats
+        };
 
-        unmarked.queue_samples(
-            &vec![0.0; queued],
-            DecodedFrameSource::Normal,
-            false,
-            now,
-            &mut unmarked_stats,
-        );
-        let _ = unmarked.pop_sample(now, &mut unmarked_stats);
-        assert_eq!(unmarked_stats.silence_skip_count, 0);
-
-        let mut marked = AdaptivePlaybackStream::new(test_tuning()).unwrap();
-        let mut marked_stats = LivePlaybackMixerStats::default();
-        marked.queue_samples(
-            &vec![0.0; queued],
-            DecodedFrameSource::Normal,
-            true,
-            now,
-            &mut marked_stats,
-        );
-
-        let _ = marked.pop_sample(now, &mut marked_stats);
-
-        assert_eq!(marked_stats.silence_skip_count, 1);
-        assert_eq!(
-            samples_to_ms(marked_stats.skipped_silence_samples as usize),
-            duration_to_ms(LIVE_PLAYBACK_SILENCE_MAX_SKIP)
-        );
+        for silence_hint in [false, true] {
+            let stats = compress_one(silence_hint);
+            assert_eq!(stats.silence_skip_count, 1, "silence_hint={silence_hint}");
+            assert_eq!(
+                samples_to_ms(stats.skipped_silence_samples as usize),
+                duration_to_ms(LIVE_PLAYBACK_SILENCE_MAX_SKIP),
+                "silence_hint={silence_hint}"
+            );
+        }
     }
 
     #[test]
@@ -1258,6 +1330,8 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "Phase 2: the overlap-add engine replaces the catch-up resampler \
+                (plan item 11), retiring the fractional-resample pitch shift this asserts against"]
     fn catchup_preserves_steady_tone_pitch() {
         let now = Instant::now();
         let rate = f64::from(SAMPLE_RATE);

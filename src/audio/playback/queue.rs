@@ -17,7 +17,6 @@ pub(crate) struct QueuedAudioFrame {
     samples: Vec<f32>,
     offset: usize,
     source: DecodedFrameSource,
-    silence_hint: bool,
     rms: f32,
     peak: f32,
 }
@@ -47,7 +46,11 @@ impl MonoSampleQueue {
         &mut self,
         samples: Vec<f32>,
         source: DecodedFrameSource,
-        silence_hint: bool,
+        // The sender's silence flag is now advisory only: the compressor decides
+        // from measured decoded energy below, so a missing or wrong flag no
+        // longer disables trimming. Retained on the signature pending the
+        // protocol-level removal of `silence_ranges`.
+        _silence_hint: bool,
     ) {
         if samples.is_empty() {
             return;
@@ -59,7 +62,6 @@ impl MonoSampleQueue {
             samples,
             offset: 0,
             source,
-            silence_hint,
             rms,
             peak,
         });
@@ -114,15 +116,18 @@ impl MonoSampleQueue {
         self.total
     }
 
-    pub(crate) fn find_silence_skip(
+    /// Finds a low-energy region the overlap-add compressor can shorten, ahead
+    /// of the play head. Returns the absolute start index and the segment length
+    /// to remove, sized to the `excess` to shed but bounded by `silence_max_skip`
+    /// and the room left in the run after reserving one crossfade overlap.
+    /// `window_end` is the last index the resampler may still read, so the
+    /// removed region stays strictly ahead of it.
+    pub(crate) fn find_low_energy_compress(
         &self,
         counts: &TuningSampleCounts,
         excess_samples: usize,
+        window_end: usize,
     ) -> Option<(usize, usize)> {
-        let min_gap = counts.silence_min_gap;
-        let guard = counts.silence_guard;
-        let max_skip = counts.silence_max_skip;
-        let min_skip = counts.silence_min_skip;
         let mut cursor = 0usize;
         let mut run_start = 0usize;
         let mut run_len = 0usize;
@@ -136,49 +141,38 @@ impl MonoSampleQueue {
                 if run_len == 0 {
                     run_start = cursor;
                 }
-                run_len = run_len.saturating_add(len);
-                if run_len >= min_gap {
-                    let interior = run_len.saturating_sub(guard.saturating_mul(2));
-                    let skip_len = interior.min(excess_samples).min(max_skip);
-                    if skip_len >= min_skip {
-                        return Some((run_start + guard, skip_len));
-                    }
-                }
+                run_len += len;
             } else {
+                if let Some(found) =
+                    compress_segment(counts, run_start, run_len, window_end, excess_samples)
+                {
+                    return Some(found);
+                }
                 run_len = 0;
             }
-            cursor = cursor.saturating_add(len);
+            cursor += len;
         }
-
-        None
+        compress_segment(counts, run_start, run_len, window_end, excess_samples)
     }
 
-    pub(crate) fn ramp_around_skip(
-        &mut self,
-        counts: &TuningSampleCounts,
-        skip_start: usize,
-        skip_len: usize,
-    ) {
-        let total = self.frames();
-        let fade = counts
-            .silence_ramp
-            .min(skip_start)
-            .min(total.saturating_sub(skip_start.saturating_add(skip_len)));
-        if fade == 0 {
-            return;
-        }
-
-        for index in 0..fade {
-            let t = (index + 1) as f32 / (fade + 1) as f32;
-            let fade_out = ((1.0 - t) * std::f32::consts::FRAC_PI_2).sin();
+    /// Removes `segment` samples starting at `start` and crossfades the join so
+    /// the waveform stays continuous. The kept tail `[start, start + overlap)` is
+    /// blended with the audio that follows the removed segment
+    /// `[start + segment, start + segment + overlap)` over a raised-cosine ramp,
+    /// then the segment is dropped. This is the compression half of the
+    /// overlap-add time-scaler, scoped here to low-energy regions.
+    pub(crate) fn overlap_add_compress(&mut self, overlap: usize, start: usize, segment: usize) {
+        for index in 0..overlap {
+            let old = self.sample_at(start + index).unwrap_or(0.0);
+            let new = self.sample_at(start + segment + index).unwrap_or(old);
+            let t = (index + 1) as f32 / (overlap + 1) as f32;
             let fade_in = (t * std::f32::consts::FRAC_PI_2).sin();
-            if let Some(sample) = self.sample_mut(skip_start - fade + index) {
-                *sample *= fade_out;
-            }
-            if let Some(sample) = self.sample_mut(skip_start + skip_len + index) {
-                *sample *= fade_in;
+            let fade_out = ((1.0 - t) * std::f32::consts::FRAC_PI_2).sin();
+            if let Some(sample) = self.sample_mut(start + index) {
+                *sample = fade_out * old + fade_in * new;
             }
         }
+        self.drain_range(start + overlap, segment);
     }
 
     pub(crate) fn drain_range(&mut self, start: usize, mut len: usize) {
@@ -252,7 +246,40 @@ impl QueuedAudioFrame {
         self.samples.len().saturating_sub(self.offset)
     }
 
+    /// Whether this frame is low-energy enough to compress through, measured
+    /// from the decoded signal rather than the sender's silence flag, so
+    /// trimming works regardless of a missing or wrong hint.
     fn is_skip_silence(&self) -> bool {
-        self.silence_hint && self.peak < 0.20 && self.rms < 0.05
+        self.peak < 0.20 && self.rms < 0.05
     }
+}
+
+/// Sizes the compressor's removal within one low-energy run. Requires the run
+/// to be at least `silence_min_gap`, keeps the removed region strictly ahead of
+/// the resampler window, reserves one crossfade overlap, and bounds the segment
+/// by the excess to shed and `silence_max_skip`.
+fn compress_segment(
+    counts: &TuningSampleCounts,
+    run_start: usize,
+    run_len: usize,
+    window_end: usize,
+    excess_samples: usize,
+) -> Option<(usize, usize)> {
+    if run_len < counts.silence_min_gap {
+        return None;
+    }
+    let overlap = counts.silence_ramp;
+    let run_end = run_start + run_len;
+    let start = run_start.max(window_end + 1);
+    let available = run_end.saturating_sub(start);
+    if available <= overlap {
+        return None;
+    }
+    let segment = (available - overlap)
+        .min(counts.silence_max_skip)
+        .min(excess_samples);
+    if segment < counts.silence_min_skip {
+        return None;
+    }
+    Some((start, segment))
 }

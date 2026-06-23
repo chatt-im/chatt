@@ -5,7 +5,7 @@
 bitrate-bps = 48000
 denoise = true
 echo-cancellation = false
-max-amplification = 2.0
+max-amplification = 12.0
 buffer = "default"
 
 [audio.latency]
@@ -23,10 +23,10 @@ loss-hold-ms = 5000
 severe-loss-hold-ms = 10000
 initial-buffer-ms = 40
 max-reorder-delay-ms = 60
+device-period-margin-ms = 20
 max-speed-up = 0.15
 silence-vad-max = 64
-silence-min-gap-ms = 250
-silence-guard-ms = 40
+silence-min-gap-ms = 60
 silence-ramp-ms = 10
 silence-max-skip-ms = 200
 silence-min-skip-ms = 20

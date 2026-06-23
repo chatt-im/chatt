@@ -5,7 +5,9 @@ use crate::{
 };
 
 pub const BITRATES: [i32; 6] = [16_000, 24_000, 32_000, 48_000, 64_000, 96_000];
-pub const MAX_AMPLIFICATIONS: [f32; 9] = [1.0, 2.0, 4.0, 8.0, 12.0, 16.0, 20.0, 30.0, 40.0];
+/// Auto-gain ceiling options, in dB. `0` disables auto gain entirely for a
+/// well-levelled rig; higher values let AGC2 lift a quieter mic further.
+pub const MAX_AMPLIFICATIONS: [f32; 6] = [0.0, 6.0, 12.0, 18.0, 24.0, 30.0];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SettingsFocus {

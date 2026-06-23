@@ -1237,7 +1237,18 @@ fn capture_callback<T>(
     stats.record_capture_callback(samples, rms, peak);
 
     if sender.try_send(mono).is_err() {
-        stats.record_dropped_chunk();
+        // The encoder worker is behind, so this chunk is lost. Surface the
+        // backpressure (throttled to powers of two so a sustained overload does
+        // not flood the log) instead of dropping it silently: a slow host that
+        // drops chunks emits gappy packets the receiver would otherwise see as
+        // network loss.
+        let dropped = stats.record_dropped_chunk();
+        if dropped.is_power_of_two() {
+            kvlog::warn!(
+                "capture worker backpressure dropped chunk",
+                dropped_chunks = dropped
+            );
+        }
     }
 }
 
