@@ -6,17 +6,19 @@ use std::{
 use crate::{
     audio::shared::{
         DELAY_BUCKET_MS, DELAY_BUCKETS, DELAY_FORGET_FACTOR, DELAY_QUANTILE,
-        LIVE_OPUS_FRAME_SAMPLES, LIVE_PACKET_FLAG_OPUS_RESET, LIVE_PLAYBACK_FEEDBACK_INTERVAL,
-        LIVE_PLAYBACK_FEEDBACK_PACKETS, LIVE_PLAYBACK_TRANSIT_BASE_FORGET_US, LiveAudioTuning,
-        LivePlaybackFeedback, PlayoutDelay, SAMPLE_RATE, clamp_u16_from_u32, clamp_u16_from_u64,
-        duration_abs_delta_ms, duration_to_ms, sequence_distance_forward, sequence_is_before,
-        sequence_max_forward,
+        LIVE_OPUS_FRAME_SAMPLES, LIVE_PACKET_FLAG_OPUS_RESET, LIVE_PACKET_FLAG_SILENCE_HINT,
+        LIVE_PACKET_FLAG_SILENCE_RESUME, LIVE_PLAYBACK_FEEDBACK_INTERVAL,
+        LIVE_PLAYBACK_FEEDBACK_PACKETS, LiveAudioTuning, LivePlaybackFeedback, PlayoutDelay,
+        SAMPLE_RATE, clamp_u16_from_u32, clamp_u16_from_u64, duration_abs_delta_ms, duration_to_ms,
+        sequence_distance_forward, sequence_is_before, sequence_max_forward,
     },
     network::{InsertOutcome, PlayoutItem},
 };
 
 const ARRIVAL_HISTORY_PACKETS: u32 = 100;
 const FRAME_DURATION_US: i128 = (LIVE_OPUS_FRAME_SAMPLES as i128 * 1_000_000) / SAMPLE_RATE as i128;
+const SILENCE_GAP_HINT_MIN: Duration = Duration::from_millis(200);
+const SILENCE_GAP_MAX_SEQUENCE_DISTANCE: u32 = 10;
 
 #[derive(Clone, Debug)]
 pub(crate) struct DelayHistogram {
@@ -85,11 +87,10 @@ pub(crate) struct LivePlaybackFeedbackState {
     max_interarrival_jitter_ms: u64,
     highest_arrived_sequence: Option<u32>,
     last_forward_arrival: Option<(u32, Instant)>,
+    silence_hint_sequence: Option<u32>,
     forward_arrivals: VecDeque<ForwardArrival>,
     underrun_histogram: DelayHistogram,
     reorder_histogram: DelayHistogram,
-    pub(crate) relative_transit_us: f64,
-    pub(crate) base_transit_us: f64,
 }
 
 impl LivePlaybackFeedbackState {
@@ -113,11 +114,13 @@ impl LivePlaybackFeedbackState {
                     }
                 }
                 if flags & LIVE_PACKET_FLAG_OPUS_RESET != 0 {
-                    self.relative_transit_us = 0.0;
-                    self.base_transit_us = 0.0;
-                    self.last_forward_arrival = Some((sequence, now));
-                    self.forward_arrivals.clear();
-                    self.note_forward_arrival(sequence, now);
+                    kvlog::info!(
+                        "live playback delay estimator reset",
+                        sequence,
+                        flags,
+                        reason = "opus_reset"
+                    );
+                    self.reset_delay_estimator(sequence, now);
                 } else if let Some((last_sequence, last_at)) = self.last_forward_arrival
                     && let Some(distance) = sequence_distance_forward(last_sequence, sequence)
                     && distance > 0
@@ -126,24 +129,50 @@ impl LivePlaybackFeedbackState {
                         f64::from(distance) * LIVE_OPUS_FRAME_SAMPLES as f64 / SAMPLE_RATE as f64,
                     );
                     let actual = now.saturating_duration_since(last_at);
+                    let excess = actual.saturating_sub(expected);
+                    let hinted_silence_gap = self
+                        .silence_hint_sequence
+                        .and_then(|hint_sequence| {
+                            sequence_distance_forward(hint_sequence, sequence)
+                        })
+                        .is_some_and(|hint_distance| {
+                            hint_distance > 0
+                                && hint_distance <= SILENCE_GAP_MAX_SEQUENCE_DISTANCE
+                                && excess >= SILENCE_GAP_HINT_MIN
+                        });
+                    let resumed_silence_gap = flags & LIVE_PACKET_FLAG_SILENCE_RESUME != 0
+                        && excess >= SILENCE_GAP_HINT_MIN;
+                    if hinted_silence_gap || resumed_silence_gap {
+                        self.reset_delay_estimator(sequence, now);
+                        self.highest_arrived_sequence =
+                            Some(self.highest_arrived_sequence.map_or(sequence, |highest| {
+                                sequence_max_forward(highest, sequence)
+                            }));
+                        kvlog::info!(
+                            "live playback sender silence gap",
+                            sequence,
+                            distance,
+                            hinted = hinted_silence_gap,
+                            resumed = resumed_silence_gap,
+                            actual_ms = duration_to_ms(actual),
+                            expected_ms = duration_to_ms(expected)
+                        );
+                        return;
+                    }
                     self.max_interarrival_jitter_ms = self
                         .max_interarrival_jitter_ms
                         .max(duration_abs_delta_ms(actual, expected));
-                    self.relative_transit_us +=
-                        actual.as_micros() as f64 - expected.as_micros() as f64;
-                    self.base_transit_us = self
-                        .relative_transit_us
-                        .min(self.base_transit_us + LIVE_PLAYBACK_TRANSIT_BASE_FORGET_US);
-                    let late_ms =
-                        ((self.relative_transit_us - self.base_transit_us) / 1_000.0).max(0.0);
-                    self.underrun_histogram.add(late_ms);
                     self.last_forward_arrival = Some((sequence, now));
                     self.note_forward_arrival(sequence, now);
+                    if let Some(delay) = self.arrival_delay_for_sequence(sequence, now) {
+                        self.underrun_histogram
+                            .add(delay.as_micros() as f64 / 1_000.0);
+                    }
                 } else if self.last_forward_arrival.is_none() {
                     self.last_forward_arrival = Some((sequence, now));
-                    self.underrun_histogram.add(0.0);
                     self.note_forward_arrival(sequence, now);
                 }
+                self.update_silence_hint(sequence, flags);
                 self.highest_arrived_sequence = Some(
                     self.highest_arrived_sequence
                         .map_or(sequence, |highest| sequence_max_forward(highest, sequence)),
@@ -186,6 +215,31 @@ impl LivePlaybackFeedbackState {
         // metric, which stays a pure forward-arrival measure for the sender.
         self.reorder_histogram
             .add(reorder_delay.as_micros() as f64 / 1_000.0);
+    }
+
+    fn reset_delay_estimator(&mut self, sequence: u32, now: Instant) {
+        self.last_forward_arrival = Some((sequence, now));
+        self.silence_hint_sequence = None;
+        self.forward_arrivals.clear();
+        self.underrun_histogram = DelayHistogram::default();
+        self.reorder_histogram = DelayHistogram::default();
+        self.note_forward_arrival(sequence, now);
+    }
+
+    fn update_silence_hint(&mut self, sequence: u32, flags: u8) {
+        if flags & LIVE_PACKET_FLAG_SILENCE_RESUME != 0 {
+            self.silence_hint_sequence = None;
+            return;
+        }
+        if flags & LIVE_PACKET_FLAG_SILENCE_HINT != 0 {
+            self.silence_hint_sequence = Some(sequence);
+            return;
+        }
+        if self.silence_hint_sequence.is_some_and(|hint_sequence| {
+            sequence_distance_forward(hint_sequence, sequence).is_some_and(|distance| distance > 0)
+        }) {
+            self.silence_hint_sequence = None;
+        }
     }
 
     pub(crate) fn observe_playout(&mut self, item: &PlayoutItem, now: Instant) {
@@ -502,5 +556,157 @@ mod tests {
             .unwrap();
         assert_eq!(delay.current, Duration::from_millis(50));
         assert_eq!(delay.peak, Duration::from_millis(30));
+    }
+
+    #[test]
+    fn hinted_sender_silence_gap_does_not_raise_target() {
+        let start = Instant::now();
+        let tuning = test_tuning();
+        let mut feedback = LivePlaybackFeedbackState::default();
+
+        feedback.observe_insert(
+            0,
+            LIVE_PACKET_FLAG_SILENCE_HINT,
+            &InsertOutcome::Accepted,
+            start,
+        );
+        feedback.observe_insert(
+            1,
+            0,
+            &InsertOutcome::Accepted,
+            start + Duration::from_secs(2),
+        );
+
+        assert_eq!(
+            feedback.recommended_target(&tuning),
+            tuning.dynamic_target_floor
+        );
+        assert_eq!(feedback.max_interarrival_jitter_ms, 0);
+    }
+
+    #[test]
+    fn resume_marker_after_sender_silence_gap_does_not_raise_target() {
+        let start = Instant::now();
+        let tuning = test_tuning();
+        let mut feedback = LivePlaybackFeedbackState::default();
+
+        feedback.observe_insert(0, 0, &InsertOutcome::Accepted, start);
+        feedback.observe_insert(
+            2,
+            LIVE_PACKET_FLAG_SILENCE_RESUME,
+            &InsertOutcome::Accepted,
+            start + Duration::from_secs(2),
+        );
+
+        assert_eq!(
+            feedback.recommended_target(&tuning),
+            tuning.dynamic_target_floor
+        );
+        assert_eq!(feedback.max_interarrival_jitter_ms, 0);
+    }
+
+    #[test]
+    fn unhinted_large_elapsed_gap_counts_as_network_delay() {
+        let start = Instant::now();
+        let tuning = test_tuning();
+        let mut feedback = LivePlaybackFeedbackState::default();
+
+        feedback.observe_insert(0, 0, &InsertOutcome::Accepted, start);
+        feedback.observe_insert(
+            1,
+            0,
+            &InsertOutcome::Accepted,
+            start + Duration::from_secs(2),
+        );
+
+        assert!(
+            feedback.recommended_target(&tuning) > tuning.target_queue,
+            "{:?}",
+            feedback.recommended_target(&tuning)
+        );
+        assert!(feedback.max_interarrival_jitter_ms > 0);
+    }
+
+    #[test]
+    fn unhinted_delay_spike_recovers_after_clean_arrivals_age_out() {
+        let start = Instant::now();
+        let tuning = test_tuning();
+        let frame = frame_duration(1);
+        let mut feedback = LivePlaybackFeedbackState::default();
+
+        feedback.observe_insert(0, 0, &InsertOutcome::Accepted, start);
+        feedback.observe_insert(
+            1,
+            0,
+            &InsertOutcome::Accepted,
+            start + Duration::from_secs(2),
+        );
+        assert!(
+            feedback.recommended_target(&tuning) > tuning.target_queue,
+            "{:?}",
+            feedback.recommended_target(&tuning)
+        );
+
+        let mut now = start + Duration::from_secs(2);
+        for sequence in 2..500 {
+            now += frame;
+            feedback.observe_insert(sequence, 0, &InsertOutcome::Accepted, now);
+        }
+
+        assert!(
+            feedback.recommended_target(&tuning) <= tuning.target_queue,
+            "{:?}",
+            feedback.recommended_target(&tuning)
+        );
+    }
+
+    #[test]
+    fn large_sequence_gap_still_counts_as_network_delay() {
+        let start = Instant::now();
+        let tuning = test_tuning();
+        let mut feedback = LivePlaybackFeedbackState::default();
+
+        feedback.observe_insert(0, 0, &InsertOutcome::Accepted, start);
+        feedback.observe_insert(
+            80,
+            0,
+            &InsertOutcome::Accepted,
+            start + Duration::from_secs(4),
+        );
+
+        assert!(
+            feedback.recommended_target(&tuning) > tuning.target_queue,
+            "{:?}",
+            feedback.recommended_target(&tuning)
+        );
+        assert!(feedback.max_interarrival_jitter_ms > 0);
+    }
+
+    #[test]
+    fn opus_reset_clears_stale_high_delay_target() {
+        let start = Instant::now();
+        let tuning = test_tuning();
+        let mut feedback = LivePlaybackFeedbackState::default();
+
+        feedback.observe_insert(0, 0, &InsertOutcome::Accepted, start);
+        feedback.observe_insert(
+            80,
+            0,
+            &InsertOutcome::Accepted,
+            start + Duration::from_secs(4),
+        );
+        assert!(feedback.recommended_target(&tuning) > tuning.target_queue);
+
+        feedback.observe_insert(
+            81,
+            LIVE_PACKET_FLAG_OPUS_RESET,
+            &InsertOutcome::Accepted,
+            start + Duration::from_millis(4_020),
+        );
+
+        assert_eq!(
+            feedback.recommended_target(&tuning),
+            tuning.dynamic_target_floor
+        );
     }
 }

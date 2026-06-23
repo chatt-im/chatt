@@ -143,6 +143,13 @@ where
     let start = Instant::now();
     let frame_duration = Duration::from_secs_f64(FRAME_SAMPLES as f64 / SAMPLE_RATE as f64);
 
+    kvlog::info!(
+        "live file source starting",
+        first_sequence = config.first_sequence,
+        input_ms = samples_to_ms(input_pcm.len()),
+        loss = config.packet_loss.as_name()
+    );
+
     for frame_index in 0..padded_frames {
         sleep_until_instant(start + frame_duration.saturating_mul(frame_index as u32));
         let now = Instant::now();
@@ -181,6 +188,15 @@ where
     report.reordered_packets = sim_report.reordered_frames;
     report.suppressed_frames = state.suppressed_frames();
     report.next_sequence = state.next_sequence;
+    kvlog::info!(
+        "live file source finished",
+        first_sequence = config.first_sequence,
+        next_sequence = report.next_sequence,
+        delivered_packets = report.delivered_packets,
+        dropped_packets = report.dropped_packets,
+        reordered_packets = report.reordered_packets,
+        suppressed_frames = report.suppressed_frames
+    );
     Ok(report)
 }
 
@@ -405,5 +421,67 @@ pub(crate) fn drain_file_playback_feedback(
         report.feedback_max_interarrival_jitter_ms = report
             .feedback_max_interarrival_jitter_ms
             .max(u64::from(feedback.max_interarrival_jitter_ms));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::audio::shared::{DEFAULT_LIVE_MAX_AMPLIFICATION, LIVE_PACKET_FLAG_OPUS_RESET};
+
+    fn file_source_test_config(first_sequence: u32) -> LiveAudioFileSourceConfig {
+        LiveAudioFileSourceConfig {
+            input_path: PathBuf::from("unused.wav"),
+            tuning: LiveAudioTuning::default(),
+            packet_loss: LiveAudioPacketLossProfile::None,
+            seed: 0x5150_5150,
+            first_sequence,
+            max_amplification: DEFAULT_LIVE_MAX_AMPLIFICATION,
+            denoise: false,
+            auto_gain: false,
+        }
+    }
+
+    #[test]
+    fn file_source_replay_marks_new_encoder_start_as_opus_reset() {
+        let input = vec![0.25; FRAME_SAMPLES * 8];
+        let mut first_packets = Vec::new();
+        let first = run_live_audio_file_source_inner(
+            file_source_test_config(100),
+            &input,
+            &mut |sequence, frame| first_packets.push((sequence, frame.flags)),
+        )
+        .unwrap();
+
+        let mut replay_packets = Vec::new();
+        let replay = run_live_audio_file_source_inner(
+            file_source_test_config(first.next_sequence),
+            &input,
+            &mut |sequence, frame| replay_packets.push((sequence, frame.flags)),
+        )
+        .unwrap();
+
+        assert!(
+            !first_packets.is_empty(),
+            "first playback should emit voice packets"
+        );
+        assert!(
+            !replay_packets.is_empty(),
+            "replay should emit voice packets"
+        );
+        assert_eq!(first_packets[0].0, 100);
+        assert_eq!(replay_packets[0].0, first.next_sequence);
+        assert_eq!(
+            replay.next_sequence,
+            first.next_sequence + replay_packets.len() as u32
+        );
+        assert_ne!(first_packets[0].1 & LIVE_PACKET_FLAG_OPUS_RESET, 0);
+        assert_ne!(replay_packets[0].1 & LIVE_PACKET_FLAG_OPUS_RESET, 0);
+        assert!(
+            replay_packets[1..]
+                .iter()
+                .all(|(_, flags)| flags & LIVE_PACKET_FLAG_OPUS_RESET == 0),
+            "only the first packet of a fresh file-source encoder should reset Opus"
+        );
     }
 }
