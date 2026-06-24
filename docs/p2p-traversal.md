@@ -352,6 +352,7 @@ a `peer_reflexive` flag.
 | `Migrated { selected }` | the selected path moved to a new address |
 | `IceRestart { reason }` | the path is stale, restart ICE |
 | `Disconnected` | the path is dead, tear it down |
+| `ConsentExpired` | consent to send expired; the selection is cleared, so direct media and keepalives to the address stop (ICE recovery checks may continue) |
 
 `FallbackReason` is `SymmetricSymmetric`, `NoCommonAddressFamily`,
 `RelayCandidateAvailable`, or `DirectChecksFailed`.
@@ -436,6 +437,35 @@ authenticated packet:
 Any inbound STUN or authenticated packet refreshes the last-receive time and
 clears both latches, so a recovered path cancels a pending restart.
 
+The keepalive cadence is randomized by a factor in `[0.8, 1.2]` (RFC 7675 §5.1)
+to de-synchronize many peers' checks. The factor is derived deterministically
+from the agent's transaction salt and a keepalive counter, so the agent stays
+reproducible with no RNG in `poll`.
+
+### 9.7.1 Consent to send (RFC 7675)
+
+Liveness counts any verified inbound. Consent is stricter: it counts only
+integrity-checked traffic from the *selected* address. The agent tracks
+`last_consent_response`, refreshed by an integrity-checked `Binding Success` or
+an authenticated media packet whose source equals `selected.remote_addr`, and by
+a fresh selection. When `now - last_consent_response` reaches `consent_timeout`
+the agent emits `ConsentExpired` and clears the selection. Because media and
+keepalives only flow on a selected path, this stops them to the address at once.
+ICE connectivity checks resume as ordinary recovery, paced and bounded by
+`max_check_attempts`, so a transient outage does not permanently ban the address.
+Consent re-establishes when a later selection installs there, whether from a
+successful check or authenticated media.
+
+`ConsentExpired` is the hard send-stop RFC 7675 requires: once it fires, no
+further media or keepalives go to the stale address. It is distinct from
+`Disconnected`, which is a recovery teardown. The agent default `consent_timeout` is 30 s
+(WebRTC's `kDeadConnectionReceiveTimeout`); the client tightens it to 10 s, below
+the 15 s `disconnect_after_idle`, so on the 1 s keepalive cadence consent expiry
+stops sending before the disconnect teardown. `consent_timeout` must exceed
+`keepalive_interval * 1.2` (the jitter bound) or `AgentConfig::validate` reports
+`ConsentTimeoutTooSmall`, since otherwise consent could expire on a path that is
+still answering keepalives.
+
 ### 9.8 Role conflict resolution
 
 The seeded role can collide (glare). On an inbound request the agent compares its
@@ -462,6 +492,7 @@ Either change recomputes pair priorities.
 | `keepalive_interval` | 10 s | keepalive spacing on a selected path |
 | `restart_after_idle` | 5 s | idle before `IceRestart` |
 | `disconnect_after_idle` | 15 s | idle before `Disconnected` |
+| `consent_timeout` | 30 s | consent lifetime before `ConsentExpired`; client tightens to 10 s |
 | `port_guess_limit` | 8 | max guesses per reflexive source |
 | `port_guess_max_delta` | 8 | max port delta when guessing |
 | `max_check_attempts` | 5 | sends before a pair can fail |
@@ -470,6 +501,9 @@ The client overrides `keepalive_interval` to 1 s per peer
 (`P2P_KEEPALIVE_INTERVAL`). The tighter keepalive keeps the selected path's
 liveness fresh through ordinary speech silence, which is what makes the relay
 switch in section 11 detect failure in about a second and a half rather than five.
+It also overrides `consent_timeout` to 10 s (`P2P_CONSENT_TIMEOUT`), below the
+15 s `disconnect_after_idle`, so consent expiry is the hard send-stop on the 1 s
+keepalive cadence.
 
 ## 11. Dynamic relay/direct switch
 
@@ -517,6 +551,17 @@ detected in about `DIRECT_FAILOVER_IDLE`. The agent's own `IceRestart` at 5 s an
 `Disconnected` at 15 s remain as deeper recovery, the former triggering an ICE
 restart and socket rebind.
 
+Relay-resume and the send-stop are separate guarantees. Resuming the relay
+restores audio but does not, by itself, stop direct transmission to a stale
+address. `ConsentExpired` (at the client's 10 s `consent_timeout`) is the
+independent hard send-stop: it clears the selection, so `PeerVoice`,
+`PeerVoiceFeedback`, and STUN keepalives to that address cease on the next poll.
+The relay resumes before direct media stops, so there is no audio gap, and the
+send-stop forbids continued media and keepalive transmission to a dead or
+reassigned address, which is what prevents the agent from becoming a UDP
+amplification source. Paced ICE recovery checks still probe the address so a
+transient outage can re-establish the path.
+
 ### 11.5 Symmetry
 
 Each client controls only its own uplink. A client suppresses its relay only after
@@ -532,6 +577,7 @@ coordination message is needed.
 | `DIRECT_FAILOVER_IDLE` | 1500 ms | inbound-direct idle that marks a path degraded |
 | `RELAY_KEEPALIVE_INTERVAL` | 5 s | server keepalive cadence while suppressed |
 | `P2P_KEEPALIVE_INTERVAL` | 1 s | STUN keepalive spacing on a selected path |
+| `P2P_CONSENT_TIMEOUT` | 10 s | consent lifetime before the direct send-stop |
 
 ## 12. Restart and socket rebind lifecycle
 
