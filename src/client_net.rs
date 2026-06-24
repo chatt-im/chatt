@@ -103,6 +103,7 @@ pub struct ClientConfig {
     pub max_upload_bytes: u64,
     pub max_receive_bytes: u64,
     pub candidate_privacy: crate::config::CandidatePrivacy,
+    pub prefer_ipv6: bool,
 }
 
 #[derive(Debug)]
@@ -405,6 +406,7 @@ fn run_worker_inner(
         p2p_candidates: Vec::new(),
         p2p_local_candidates: Vec::new(),
         candidate_privacy: config.candidate_privacy,
+        prefer_ipv6: config.prefer_ipv6,
         mdns: MdnsSystem::bind(),
         mdns_pending: HashMap::new(),
         p2p_peers: HashMap::new(),
@@ -837,6 +839,7 @@ struct WorkerState {
     p2p_candidates: Vec<P2pCandidate>,
     p2p_local_candidates: Vec<Candidate>,
     candidate_privacy: CandidatePrivacy,
+    prefer_ipv6: bool,
     mdns: MdnsSystem,
     mdns_pending: HashMap<String, MdnsPending>,
     p2p_peers: HashMap<SessionId, PeerConnection>,
@@ -2316,6 +2319,7 @@ impl WorkerState {
             self.udp_local_addr.port(),
             true,
             &mut next_id,
+            self.prefer_ipv6,
         )
         .unwrap_or_else(|error| {
             kvlog::warn!("host candidate discovery failed", error = %error);
@@ -2335,6 +2339,7 @@ impl WorkerState {
                 SocketAddr::new(fallback_ip, self.udp_local_addr.port()),
                 None,
                 true,
+                self.prefer_ipv6,
             ));
             next_id = next_id.wrapping_add(1).max(1);
         }
@@ -2347,6 +2352,7 @@ impl WorkerState {
                 reflexive,
                 Some(self.udp_local_addr),
                 true,
+                self.prefer_ipv6,
             ));
             next_id = next_id.wrapping_add(1).max(1);
         }
@@ -2358,6 +2364,7 @@ impl WorkerState {
             self.server_udp_addr,
             None,
             true,
+            self.prefer_ipv6,
         ));
 
         let rng = ring::rand::SystemRandom::new();
@@ -3318,7 +3325,7 @@ mod tests {
     }
 
     fn cand(id: u32, kind: CandidateKind, addr: &str) -> Candidate {
-        Candidate::with_metadata(id, 1, 0, kind, addr.parse().unwrap(), None, true)
+        Candidate::with_metadata(id, 1, 0, kind, addr.parse().unwrap(), None, true, true)
     }
 
     fn ctrl(addr: &str, kind: P2pCandidateKind) -> P2pCandidate {

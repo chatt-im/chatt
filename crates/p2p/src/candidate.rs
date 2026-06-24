@@ -90,9 +90,16 @@ impl Candidate {
             addr,
             base,
             matches!(kind, CandidateKind::Host),
+            true,
         )
     }
 
+    /// Builds a candidate with full metadata.
+    ///
+    /// `prefer_ipv6` selects the address-family tie-break folded into `priority`:
+    /// when set (the default), IPv6 outranks IPv4 at equal type per RFC 8421.
+    /// Remote candidates rebuilt from the wire overwrite `priority` afterward, so
+    /// this only sets the local default.
     pub fn with_metadata(
         id: u32,
         socket_id: u32,
@@ -101,10 +108,11 @@ impl Candidate {
         addr: SocketAddr,
         base: Option<SocketAddr>,
         verified: bool,
+        prefer_ipv6: bool,
     ) -> Self {
-        let local_preference = match NetworkFamily::of(addr) {
-            NetworkFamily::Ipv4 => 65_535,
-            NetworkFamily::Ipv6 => 65_534,
+        let local_preference = match (NetworkFamily::of(addr), prefer_ipv6) {
+            (NetworkFamily::Ipv6, true) | (NetworkFamily::Ipv4, false) => 65_535,
+            (NetworkFamily::Ipv4, true) | (NetworkFamily::Ipv6, false) => 65_534,
         };
         let component = 1;
         let priority = (kind.type_preference() << 24) | (local_preference << 8) | (256 - component);
@@ -253,6 +261,53 @@ mod tests {
         assert!(local_v4.can_pair_with(&remote_v4));
         assert!(!local_v4.can_pair_with(&remote_v6));
         assert!(!local_v4.can_pair_with(&relay));
+    }
+
+    #[test]
+    fn ipv6_outranks_ipv4_at_equal_type_when_preferred() {
+        let v4 = Candidate::with_metadata(
+            1,
+            0,
+            0,
+            CandidateKind::Host,
+            "192.168.1.2:5000".parse().unwrap(),
+            None,
+            true,
+            true,
+        );
+        let v6 = Candidate::with_metadata(
+            2,
+            0,
+            0,
+            CandidateKind::Host,
+            "[2001:db8::2]:5000".parse().unwrap(),
+            None,
+            true,
+            true,
+        );
+        assert!(v6.priority > v4.priority);
+
+        let v4_first = Candidate::with_metadata(
+            3,
+            0,
+            0,
+            CandidateKind::Host,
+            "192.168.1.2:5000".parse().unwrap(),
+            None,
+            true,
+            false,
+        );
+        let v6_second = Candidate::with_metadata(
+            4,
+            0,
+            0,
+            CandidateKind::Host,
+            "[2001:db8::2]:5000".parse().unwrap(),
+            None,
+            true,
+            false,
+        );
+        assert!(v4_first.priority > v6_second.priority);
     }
 
     #[test]

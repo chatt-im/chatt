@@ -6,7 +6,8 @@ use std::{
 
 use crate::{
     candidate::{
-        Candidate, CandidateKind, CandidatePairId, NatKind, pair_priority, port_guess_candidates,
+        Candidate, CandidateKind, CandidatePairId, NatKind, NetworkFamily, pair_priority,
+        port_guess_candidates,
     },
     stun::{MessageClass, RoleAttribute, StunError, StunMessage, TransactionId},
 };
@@ -265,6 +266,7 @@ pub struct TraversalAgent {
     transactions: HashMap<TransactionId, Transaction>,
     start: Instant,
     next_check_at: Instant,
+    last_check_family: Option<NetworkFamily>,
     transaction_counter: u64,
     next_candidate_id: u32,
     relay_announced: bool,
@@ -315,6 +317,7 @@ impl TraversalAgent {
             transactions: HashMap::new(),
             start: now,
             next_check_at: now,
+            last_check_family: None,
             transaction_counter: 1,
             next_candidate_id,
             relay_announced: false,
@@ -564,13 +567,48 @@ impl TraversalAgent {
     }
 
     fn next_check_action(&mut self, now: Instant) -> Option<Action> {
+        // Retransmissions stay in strict priority order, time-driven and outside
+        // the family race, per the RFC 8421 simplification documented below.
         if let Some(pair_index) = self.next_due_retransmission(now) {
             return Some(self.send_check(now, pair_index, true));
         }
+        let pair_index = self.next_waiting_pair()?;
+        self.last_check_family = Some(self.pair_family(pair_index));
+        Some(self.send_check(now, pair_index, false))
+    }
+
+    /// Selects the next `Waiting` pair to check, intermingling address families
+    /// (RFC 8421). When both an IPv4 and an IPv6 pair are eligible, prefers the
+    /// family not used by the previous check so each family gets a check within
+    /// one `min_check_interval`. Otherwise picks the highest-priority eligible
+    /// pair. A deliberate simplification of RFC 8421: last-family-used
+    /// alternation rather than foundation grouping, which suffices for the small
+    /// candidate counts here. The choice is a pure function of agent state, so
+    /// the simulator stays reproducible.
+    fn next_waiting_pair(&self) -> Option<usize> {
+        let mut has_v4 = false;
+        let mut has_v6 = false;
+        for (index, pair) in self.pairs.iter().enumerate() {
+            if !self.pair_is_eligible(pair) {
+                continue;
+            }
+            match self.pair_family(index) {
+                NetworkFamily::Ipv4 => has_v4 = true,
+                NetworkFamily::Ipv6 => has_v6 = true,
+            }
+        }
+        let preferred_family = match self.last_check_family {
+            Some(last) if has_v4 && has_v6 => Some(other_family(last)),
+            _ => None,
+        };
+
         let mut best_pair = None;
         let mut best_priority = 0;
         for (index, pair) in self.pairs.iter().enumerate() {
-            if pair.state != PairState::Waiting || !self.pair_is_allowed(pair) {
+            if !self.pair_is_eligible(pair) {
+                continue;
+            }
+            if preferred_family.is_some_and(|family| self.pair_family(index) != family) {
                 continue;
             }
             if best_pair.is_none() || pair.priority > best_priority {
@@ -578,8 +616,15 @@ impl TraversalAgent {
                 best_priority = pair.priority;
             }
         }
-        let pair_index = best_pair?;
-        Some(self.send_check(now, pair_index, false))
+        best_pair
+    }
+
+    fn pair_is_eligible(&self, pair: &CandidatePair) -> bool {
+        pair.state == PairState::Waiting && self.pair_is_allowed(pair)
+    }
+
+    fn pair_family(&self, index: usize) -> NetworkFamily {
+        self.local_candidates[self.pairs[index].local_index].family()
     }
 
     fn next_due_retransmission(&self, now: Instant) -> Option<usize> {
@@ -845,6 +890,13 @@ impl TraversalAgent {
             TransactionId::from_salt(&self.config.auth.transaction_salt, self.transaction_counter);
         self.transaction_counter = self.transaction_counter.wrapping_add(1).max(1);
         id
+    }
+}
+
+fn other_family(family: NetworkFamily) -> NetworkFamily {
+    match family {
+        NetworkFamily::Ipv4 => NetworkFamily::Ipv6,
+        NetworkFamily::Ipv6 => NetworkFamily::Ipv4,
     }
 }
 

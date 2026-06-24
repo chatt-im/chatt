@@ -61,7 +61,7 @@ pub fn host_candidates(
     include_loopback: bool,
     next_id: &mut u32,
 ) -> io::Result<Vec<Candidate>> {
-    host_candidates_with_metadata(0, 0, port, include_loopback, next_id)
+    host_candidates_with_metadata(0, 0, port, include_loopback, next_id, true)
 }
 
 pub fn host_candidates_with_metadata(
@@ -70,6 +70,7 @@ pub fn host_candidates_with_metadata(
     port: u16,
     include_loopback: bool,
     next_id: &mut u32,
+    prefer_ipv6: bool,
 ) -> io::Result<Vec<Candidate>> {
     let mut candidates = Vec::new();
     for interface in discover_interfaces()? {
@@ -86,6 +87,7 @@ pub fn host_candidates_with_metadata(
             SocketAddr::new(interface.addr, port),
             None,
             true,
+            prefer_ipv6,
         ));
     }
     Ok(candidates)

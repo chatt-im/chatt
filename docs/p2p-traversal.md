@@ -131,7 +131,9 @@ priority = (type_preference << 24) | (local_preference << 8) | (256 - component)
 ```
 
 with `component = 1` (so the low byte is 255), and `local_preference = 65535` for
-IPv4, `65534` for IPv6. IPv4 is preferred over IPv6 at equal type.
+IPv6, `65534` for IPv4 by default. IPv6 is preferred over IPv4 at equal type
+(RFC 8421). The `[p2p] prefer-ipv6` config key (default `true`) flips this to
+IPv4-first for diagnostics by swapping the two `local_preference` values.
 
 Foundation is `"{kind_name}-{family}"` with kind names `host`, `srflx`, `prflx`,
 `map`, `relay` and family `udp4` or `udp6`.
@@ -384,8 +386,15 @@ Exhausting retransmissions past the deadline moves it to `Failed`.
 6. If `now` is before the next allowed check time, return. Checks are paced at
    `min_check_interval`.
 7. Otherwise pick the next check. A due retransmission with attempts left and the
-   highest priority wins, else the highest-priority `Waiting` pair that is allowed.
-   Send it and schedule the next check `min_check_interval` later.
+   highest priority wins (strict priority order, outside the family race), else a
+   `Waiting` pair selected with address-family alternation: when both an IPv4 and
+   an IPv6 pair are allowed, prefer the family not used by the previous check,
+   otherwise the highest-priority allowed pair. This intermingles the two
+   families' first checks within one `min_check_interval` (RFC 8421 Happy
+   Eyeballs). It is a deliberate simplification of RFC 8421: last-family-used
+   alternation rather than foundation grouping, which suffices for the small
+   candidate counts here and keeps selection a pure function of agent state. Send
+   the check and schedule the next one `min_check_interval` later.
 
 ### 9.5 Selecting a path
 
