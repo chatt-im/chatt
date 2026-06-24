@@ -17,7 +17,7 @@ per-pair keys the server mints, so this is not end-to-end encryption.
   timer. The application feeds it inbound STUN and authenticated-packet
   observations plus a monotonic clock, and sends the `Action` packets it returns.
   Modules: `agent` (the state machine), `candidate` (candidate model, priority,
-  pairing, port guessing), `nat` (reflexive-based NAT classification), `stun`
+  pairing), `nat` (reflexive-based NAT classification), `stun`
   (STUN subset), `restart` (rebind port quarantine), `interfaces`, `socket`.
 - `crates/rpc`: the shared protocol. `control` carries the encrypted-TCP signaling
   messages, `media` defines the UDP media framing, `crypto` defines the AEAD and
@@ -374,18 +374,16 @@ Exhausting retransmissions past the deadline moves it to `Failed`.
 2. If a pair is selected, run the selected-path branch (section 9.7) and return.
 3. If fallback has not been announced yet:
    - both sides symmetric: announce `UseRelay(SymmetricSymmetric)` and return.
-     Two destination-dependent mappings cannot be punched with static guesses.
+     Two destination-dependent mappings cannot be punched, so the agent relays.
    - no pairs at all: announce `UseRelay(NoCommonAddressFamily)` and return.
    - otherwise, if a relay candidate exists, announce
      `UseRelay(RelayCandidateAvailable)` and continue. The relay is usable
      immediately while checks proceed.
-4. If all pairs have failed and guesses were not added yet, add port guesses
-   (section 9.6) and rebuild pairs.
-5. If all pairs have failed and `handshake_min_duration` has elapsed, announce
+4. If all pairs have failed and `handshake_min_duration` has elapsed, announce
    `UseRelay(DirectChecksFailed)` and return.
-6. If `now` is before the next allowed check time, return. Checks are paced at
+5. If `now` is before the next allowed check time, return. Checks are paced at
    `min_check_interval`.
-7. Otherwise pick the next check. A due retransmission with attempts left and the
+6. Otherwise pick the next check. A due retransmission with attempts left and the
    highest priority wins (strict priority order, outside the family race), else a
    `Waiting` pair selected with address-family alternation: when both an IPv4 and
    an IPv6 pair are allowed, prefer the family not used by the previous check,
@@ -420,14 +418,13 @@ disconnect latches, then resolves role conflicts (section 9.8).
   emit `Migrated`. This handles Wi-Fi/LTE roaming without a renegotiation, because
   the connection id, not the address, binds the cryptographic state.
 
-### 9.6 Limited port guessing
+### 9.6 Symmetric NAT and the relay fallback
 
-Once every ordinary pair has failed, the agent adds peer-reflexive guess
-candidates derived from each IPv4 server-reflexive remote candidate, one time.
-Guesses walk outward by port delta
-`+1, -1, +2, -2, ...` up to `port_guess_max_delta`, capped at `port_guess_limit`,
-skipping invalid ports. Guesses are paced by the same `min_check_interval` limiter
-so the pattern does not look like a port scan.
+The agent does not predict a symmetric peer's mapped port. Bursting UDP packets at
+closely clustered ports on one host matches an IDS port-scan signature and can get
+the client's public IP blackholed, severing even the working relay path. When
+direct checks fail the agent relays instead, which the always-present relay
+candidate and the symmetric-to-symmetric fallback already cover.
 
 The check-allowance rule also encodes the asymmetry: when the local NAT is cone,
 the remote NAT is symmetric, and no peer-reflexive request has been seen yet, the
@@ -502,8 +499,6 @@ Either change recomputes pair priorities.
 | `restart_after_idle` | 5 s | idle before `IceRestart` |
 | `disconnect_after_idle` | 15 s | idle before `Disconnected` |
 | `consent_timeout` | 30 s | consent lifetime before `ConsentExpired`; client tightens to 10 s |
-| `port_guess_limit` | 8 | max guesses per reflexive source |
-| `port_guess_max_delta` | 8 | max port delta when guessing |
 | `max_check_attempts` | 5 | sends before a pair can fail |
 
 The client overrides `keepalive_interval` to 1 s per peer
@@ -605,8 +600,6 @@ rebind.
   destination-dependent mappings.
 - Symmetric to cone: the symmetric side sends checks first. The cone side treats
   the inbound request source as a peer-reflexive candidate and answers there.
-- Endpoint-independent mapping quirks: limited, paced sequential port guesses
-  after ordinary checks fail.
 - IPv4/IPv6 mismatch and hard NAT or firewall failures: relay. Host-host checks
   still cover LAN peers and NATs without hairpin support.
 - Roaming: authenticated-packet migration moves the selected address under the
