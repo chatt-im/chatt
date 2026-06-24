@@ -7,6 +7,7 @@ use crate::{
     tui::editor::FormEditor,
     ui::select::{FuzzySelect, SelectableItem},
 };
+use extui::event::{KeyCode, KeyEvent};
 
 pub const BITRATES: [i32; 6] = [16_000, 24_000, 32_000, 48_000, 64_000, 96_000];
 /// Auto-gain ceiling options, in dB. `0` disables auto gain entirely for a
@@ -31,12 +32,12 @@ pub enum SettingsFocus {
 impl SettingsFocus {
     pub const ORDER: [SettingsFocus; 11] = [
         SettingsFocus::InputDevice,
-        SettingsFocus::OutputDevice,
         SettingsFocus::Bitrate,
         SettingsFocus::Denoise,
         SettingsFocus::EchoCancellation,
         SettingsFocus::Amplification,
         SettingsFocus::InputBuffer,
+        SettingsFocus::OutputDevice,
         SettingsFocus::OutputBuffer,
         SettingsFocus::Refresh,
         SettingsFocus::Save,
@@ -52,18 +53,25 @@ impl SettingsFocus {
 }
 
 pub struct SettingsDraft {
-    pub input_device_id: Option<String>,
-    pub output_device_id: Option<String>,
-    pub bitrate_index: usize,
-    pub amplification_index: usize,
+    input_device_id: Option<String>,
+    output_device_id: Option<String>,
+    bitrate_index: usize,
+    amplification_index: usize,
     /// Single-line field values holding a sample count or `"default"` (see
     /// [`parse_buffer_size`]). The active field is edited through `editor`.
-    pub input_buffer: String,
-    pub output_buffer: String,
-    pub editor: FormEditor<SettingsFocus>,
-    pub denoise: bool,
-    pub echo_cancellation: bool,
-    pub latency: AudioLatencyConfig,
+    input_buffer: String,
+    output_buffer: String,
+    editor: FormEditor<SettingsFocus>,
+    denoise: bool,
+    echo_cancellation: bool,
+    latency: AudioLatencyConfig,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum SettingsMutation {
+    None,
+    Changed,
+    AmplificationChanged(f32),
 }
 
 impl SettingsDraft {
@@ -103,6 +111,124 @@ impl SettingsDraft {
         BITRATES[self.bitrate_index]
     }
 
+    pub fn input_selection(&self) -> Option<&str> {
+        self.input_device_id.as_deref()
+    }
+
+    pub fn output_selection(&self) -> Option<&str> {
+        self.output_device_id.as_deref()
+    }
+
+    pub fn set_input_selection(&mut self, selection: Option<String>) -> bool {
+        if self.input_device_id == selection {
+            return false;
+        }
+        self.input_device_id = selection;
+        true
+    }
+
+    pub fn restore_input_selection(&mut self, selection: Option<String>) {
+        self.input_device_id = selection;
+    }
+
+    pub fn set_output_selection(&mut self, selection: Option<String>) -> bool {
+        if self.output_device_id == selection {
+            return false;
+        }
+        self.output_device_id = selection;
+        true
+    }
+
+    pub fn restore_output_selection(&mut self, selection: Option<String>) {
+        self.output_device_id = selection;
+    }
+
+    pub fn option_label(&self, focus: SettingsFocus) -> String {
+        match focus {
+            SettingsFocus::Bitrate => format!("{} kbps", self.bitrate_bps() / 1000),
+            SettingsFocus::Denoise => on_off(self.denoise),
+            SettingsFocus::EchoCancellation => on_off(self.echo_cancellation),
+            SettingsFocus::Amplification => {
+                let value = self.max_amplification();
+                if value <= 0.0 {
+                    "off".to_string()
+                } else {
+                    format!("{value:.0} dB")
+                }
+            }
+            SettingsFocus::InputBuffer | SettingsFocus::OutputBuffer => self.buffer_text(focus),
+            SettingsFocus::InputDevice
+            | SettingsFocus::OutputDevice
+            | SettingsFocus::Refresh
+            | SettingsFocus::Save
+            | SettingsFocus::Close => String::new(),
+        }
+    }
+
+    pub fn option_detail(&self, focus: SettingsFocus) -> &'static str {
+        match focus {
+            SettingsFocus::InputDevice => "Capture device used when voice starts.",
+            SettingsFocus::OutputDevice => "Playback device used for remote voice.",
+            SettingsFocus::Bitrate => "Opus target bitrate for outgoing voice packets.",
+            SettingsFocus::Denoise => {
+                "Noise suppression before encoding. Useful for fans and room noise."
+            }
+            SettingsFocus::EchoCancellation => {
+                "Cancels speaker echo from the microphone path when supported."
+            }
+            SettingsFocus::Amplification => {
+                "Auto-gain ceiling for quiet microphones; 0 dB disables amplification."
+            }
+            SettingsFocus::InputBuffer => {
+                "Requested capture buffer in samples, or default for the host backend."
+            }
+            SettingsFocus::OutputBuffer => {
+                "Requested playback buffer in samples, or default for the host backend."
+            }
+            SettingsFocus::Refresh => "Re-scan audio devices using the current buffer requests.",
+            SettingsFocus::Save => "Persist the draft to chatt.toml.",
+            SettingsFocus::Close => "Return to chat without saving further changes.",
+        }
+    }
+
+    pub fn adjust(&mut self, focus: SettingsFocus, delta: isize) -> SettingsMutation {
+        match focus {
+            SettingsFocus::Bitrate => {
+                self.bitrate_index = cycle_index(self.bitrate_index, BITRATES.len(), delta);
+                SettingsMutation::Changed
+            }
+            SettingsFocus::Denoise => self.toggle_denoise(),
+            SettingsFocus::EchoCancellation => self.toggle_echo_cancellation(),
+            SettingsFocus::Amplification => {
+                self.amplification_index =
+                    cycle_index(self.amplification_index, MAX_AMPLIFICATIONS.len(), delta);
+                SettingsMutation::AmplificationChanged(self.max_amplification())
+            }
+            SettingsFocus::InputDevice
+            | SettingsFocus::OutputDevice
+            | SettingsFocus::InputBuffer
+            | SettingsFocus::OutputBuffer
+            | SettingsFocus::Refresh
+            | SettingsFocus::Save
+            | SettingsFocus::Close => SettingsMutation::None,
+        }
+    }
+
+    pub fn activate(&mut self, focus: SettingsFocus) -> SettingsMutation {
+        match focus {
+            SettingsFocus::Denoise => self.toggle_denoise(),
+            SettingsFocus::EchoCancellation => self.toggle_echo_cancellation(),
+            SettingsFocus::Bitrate | SettingsFocus::Amplification => self.adjust(focus, 1),
+            SettingsFocus::InputDevice
+            | SettingsFocus::OutputDevice
+            | SettingsFocus::InputBuffer
+            | SettingsFocus::OutputBuffer
+            | SettingsFocus::Refresh
+            | SettingsFocus::Save
+            | SettingsFocus::Close => SettingsMutation::None,
+        }
+    }
+
     pub fn input_buffer_request(&self) -> BufferRequest {
         parse_buffer_size(&self.buffer_text(SettingsFocus::InputBuffer))
             .to_request(DEFAULT_INPUT_BUFFER_SAMPLES)
@@ -113,13 +239,37 @@ impl SettingsDraft {
             .to_request(DEFAULT_OUTPUT_BUFFER_SAMPLES)
     }
 
-    /// Focuses the shared editor for `focus`, if it is one of the buffer rows.
-    pub fn buffer_editor_mut(&mut self, focus: SettingsFocus) -> Option<&mut extui_editor::Editor> {
+    pub fn handle_buffer_key(
+        &mut self,
+        focus: SettingsFocus,
+        key: KeyEvent,
+    ) -> Option<SettingsMutation> {
         self.focus_buffer_editor(focus)?;
-        Some(self.editor.editor_mut())
+        let editing = match key.code {
+            KeyCode::Char(ch) => !ch.is_control(),
+            KeyCode::Backspace
+            | KeyCode::Delete
+            | KeyCode::Left
+            | KeyCode::Right
+            | KeyCode::Home
+            | KeyCode::End => true,
+            _ => false,
+        };
+        if !editing {
+            return None;
+        }
+        let mutates = !matches!(
+            key.code,
+            KeyCode::Left | KeyCode::Right | KeyCode::Home | KeyCode::End
+        );
+        if self.editor.editor_mut().send_key(&key) && mutates {
+            Some(SettingsMutation::Changed)
+        } else {
+            Some(SettingsMutation::None)
+        }
     }
 
-    pub fn focus_buffer_editor(&mut self, focus: SettingsFocus) -> Option<()> {
+    fn focus_buffer_editor(&mut self, focus: SettingsFocus) -> Option<()> {
         match focus {
             SettingsFocus::InputBuffer | SettingsFocus::OutputBuffer => {
                 let value = self.buffer_value(focus).to_string();
@@ -168,6 +318,55 @@ impl SettingsDraft {
     pub fn max_amplification(&self) -> f32 {
         MAX_AMPLIFICATIONS[self.amplification_index]
     }
+
+    pub fn render_buffer_editor(
+        &mut self,
+        focus: SettingsFocus,
+        area: extui::Rect,
+        buf: &mut extui::Buffer,
+    ) {
+        self.focus_buffer_editor(focus);
+        self.editor.render(area, buf);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn active_buffer_editor_address(&mut self, focus: SettingsFocus) -> Option<usize> {
+        self.focus_buffer_editor(focus)?;
+        Some(self.editor.editor_mut() as *mut _ as usize)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_buffer_editor_text(&mut self, focus: SettingsFocus, text: &str) {
+        if self.focus_buffer_editor(focus).is_some() {
+            self.editor.editor_mut().set_lines(text);
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn focus_buffer_for_test(&mut self, focus: SettingsFocus) {
+        self.focus_buffer_editor(focus);
+    }
+
+    fn toggle_denoise(&mut self) -> SettingsMutation {
+        self.denoise = !self.denoise;
+        SettingsMutation::Changed
+    }
+
+    fn toggle_echo_cancellation(&mut self) -> SettingsMutation {
+        self.echo_cancellation = !self.echo_cancellation;
+        SettingsMutation::Changed
+    }
+}
+
+fn cycle_index(index: usize, len: usize, delta: isize) -> usize {
+    if len == 0 {
+        return 0;
+    }
+    (index as isize + delta).rem_euclid(len as isize) as usize
+}
+
+fn on_off(value: bool) -> String {
+    (if value { "on" } else { "off" }).to_string()
 }
 
 /// Renders a [`BufferSize`] as the editable settings text: `"default"` or the

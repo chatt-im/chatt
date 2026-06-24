@@ -9,8 +9,7 @@ use unicode_width::UnicodeWidthStr;
 use chatt::audio::StatsSnapshot;
 
 use crate::{
-    app::{App, ParticipantState, ServerEditFocus, ServerSelectItem, StatusKind, volume_db_label},
-    config::{MAX_USER_VOLUME_DB, MIN_USER_VOLUME_DB},
+    app::{App, ParticipantState, ServerSelectItem, StatusKind, volume_db_label},
     theme, ui,
 };
 
@@ -18,91 +17,6 @@ const NAME_COL_WIDTH: u16 = 16;
 const ROOM_SELECTED: Style = Style::DEFAULT
     .with_bg_rgb(0x24, 0x28, 0x30)
     .with_fg_rgb(0xf0, 0xf2, 0xe8);
-const VOLUME_DIALOG: Style = Style::DEFAULT
-    .with_bg_rgb(0x18, 0x1b, 0x20)
-    .with_fg_rgb(0xd8, 0xdb, 0xd6);
-const VOLUME_DIALOG_HEADER: Style = Style::DEFAULT
-    .with_bg_rgb(0x35, 0x3b, 0x46)
-    .with_fg_rgb(0xf0, 0xf2, 0xe8);
-
-fn draw_join_detail(area: Rect, buf: &mut Buffer, label: &str, value: &str) {
-    if area.is_empty() {
-        return;
-    }
-    let mut row = area;
-    row.take_left(12)
-        .with(theme::BACKGROUND.patch(theme::MUTED))
-        .with(Ellipsis(true))
-        .text(buf, label);
-    row.with(theme::BACKGROUND.patch(theme::TEXT))
-        .with(Ellipsis(true))
-        .text(buf, value);
-}
-
-fn draw_join_field(
-    area: Rect,
-    buf: &mut Buffer,
-    label: &str,
-    draft: &mut crate::app::ServerEditDraft,
-    field: ServerEditFocus,
-) {
-    if area.is_empty() {
-        return;
-    }
-    let focused = draft.focus == field;
-    let label_style = if focused {
-        theme::BACKGROUND.patch(theme::GOOD)
-    } else {
-        theme::BACKGROUND.patch(theme::MUTED)
-    };
-    let input = if focused {
-        theme::JOIN_INPUT_ACTIVE
-    } else {
-        theme::JOIN_INPUT_INACTIVE
-    };
-    area.with(theme::BACKGROUND).fill(buf);
-    let mut row = area;
-    row.take_left(12)
-        .with(label_style)
-        .with(Ellipsis(true))
-        .text(buf, label);
-    if row.is_empty() {
-        return;
-    }
-    row.with(input).fill(buf);
-    if focused {
-        draft.focus_active_editor();
-        draft.editor.render(row, buf);
-    } else {
-        row.with(input)
-            .with(Ellipsis(true))
-            .text(buf, &draft.active_text(field));
-    }
-}
-
-fn draw_join_button(area: Rect, buf: &mut Buffer, label: &str, focused: bool) {
-    if area.is_empty() {
-        return;
-    }
-    let style = if focused {
-        Style::DEFAULT
-            .with_bg_rgb(0x35, 0x3b, 0x46)
-            .with_fg_rgb(0xf0, 0xf2, 0xe8)
-    } else {
-        theme::BACKGROUND.patch(theme::TEXT)
-    };
-    area.with(style)
-        .with(HAlign::Center)
-        .text(buf, &format!(" {label} "));
-}
-
-fn short_key(value: &str) -> String {
-    if value.len() <= 18 {
-        value.to_string()
-    } else {
-        format!("{}...", &value[..18])
-    }
-}
 
 pub(crate) fn render(app: &mut App, buf: &mut Buffer) {
     buf.rect().with(theme::BACKGROUND).fill(buf);
@@ -503,84 +417,7 @@ fn draw_server_edit(area: Rect, app: &mut App, buf: &mut Buffer) {
             .text(buf, "No server edit is open");
         return;
     };
-    let mut rows = area;
-    rows.take_top(1)
-        .with(theme::STATUS_SECTION | Modifier::BOLD)
-        .with(Ellipsis(true))
-        .text(buf, &format!(" EDIT SERVER {} ", draft.original_alias));
-    rows.take_top(1).with(theme::BACKGROUND).fill(buf);
-    draw_join_detail(rows.take_top(1), buf, "User", &draft.user);
-    draw_join_detail(rows.take_top(1), buf, "Token", &short_key(&draft.token));
-    draw_join_detail(
-        rows.take_top(1),
-        buf,
-        "Key",
-        &short_key(&draft.server_public_key),
-    );
-    rows.take_top(1).with(theme::BACKGROUND).fill(buf);
-    draw_join_field(
-        rows.take_top(1),
-        buf,
-        "Alias",
-        draft,
-        ServerEditFocus::Alias,
-    );
-    draw_join_field(
-        rows.take_top(1),
-        buf,
-        "Display",
-        draft,
-        ServerEditFocus::DisplayName,
-    );
-    draw_join_field(
-        rows.take_top(1),
-        buf,
-        "TCP",
-        draft,
-        ServerEditFocus::TcpAddr,
-    );
-    draw_join_field(
-        rows.take_top(1),
-        buf,
-        "UDP",
-        draft,
-        ServerEditFocus::UdpAddr,
-    );
-    draw_join_field(
-        rows.take_top(1),
-        buf,
-        "Probe",
-        draft,
-        ServerEditFocus::UdpProbeAddr,
-    );
-    draw_join_field(
-        rows.take_top(1),
-        buf,
-        "Room",
-        draft,
-        ServerEditFocus::RoomId,
-    );
-    rows.take_top(1).with(theme::BACKGROUND).fill(buf);
-    let mut buttons = rows.take_top(1);
-    let button_width = (buttons.w / 3).max(1);
-    draw_join_button(
-        buttons.take_left(button_width as i32),
-        buf,
-        "Save",
-        draft.focus == ServerEditFocus::Save,
-    );
-    draw_join_button(
-        buttons.take_left(button_width as i32),
-        buf,
-        "Save and join",
-        draft.focus == ServerEditFocus::SaveJoin,
-    );
-    draw_join_button(
-        buttons,
-        buf,
-        "Cancel",
-        draft.focus == ServerEditFocus::Cancel,
-    );
+    draft.render(area, buf);
 }
 
 fn room_user_voice_feedback_label(participant: &ParticipantState) -> String {
@@ -614,118 +451,7 @@ fn draw_volume_dialog(area: Rect, app: &mut App, buf: &mut Buffer) {
     let Some(dialog) = app.volume_dialog.as_mut() else {
         return;
     };
-    if area.w < 24 || area.h < 6 {
-        return;
-    }
-
-    let width = area.w.min(58);
-    let height = area.h.min(7);
-    let panel = Rect {
-        x: area.x + area.w.saturating_sub(width) / 2,
-        y: area.y + area.h.saturating_sub(height) / 2,
-        w: width,
-        h: height,
-    };
-    buf.clear_rect(panel, VOLUME_DIALOG);
-
-    let mut rows = panel;
-    rows.take_top(1)
-        .with(VOLUME_DIALOG_HEADER | Modifier::BOLD)
-        .with(Ellipsis(true))
-        .text(buf, &format!(" Local volume: {} ", dialog.user_name));
-
-    let mut body = rows.inset(2, 0);
-    body.take_top(1)
-        .with(VOLUME_DIALOG.patch(theme::MUTED))
-        .with(Ellipsis(true))
-        .text(
-            buf,
-            &format!(
-                "User {}  saved {}",
-                dialog.user_id.0,
-                volume_db_label(dialog.original_db)
-            ),
-        );
-
-    let mut slider_row = body.take_top(1);
-    let label = volume_db_label(dialog.value_db);
-    let label_width = label.width() as u16 + 1;
-    let slider_width = slider_row.w.saturating_sub(label_width).max(8);
-    slider_row
-        .take_left(slider_width as i32)
-        .with(VOLUME_DIALOG.patch(theme::GOOD))
-        .with(Ellipsis(true))
-        .text(buf, &volume_slider(dialog.value_db, slider_width));
-    slider_row
-        .with(VOLUME_DIALOG.patch(theme::TEXT))
-        .with(Ellipsis(true))
-        .text(buf, &format!(" {label}"));
-
-    let mut input_row = body.take_top(1);
-    input_row
-        .take_left(8)
-        .with(VOLUME_DIALOG.patch(theme::MUTED))
-        .text(buf, "Offset");
-    let field_width = input_row.w.min(14);
-    let mut field = input_row.take_left(field_width as i32);
-    field.with(theme::JOIN_INPUT_BOUNDARY_ACTIVE).fill(buf);
-    if field.w > 2 {
-        field
-            .take_left(1)
-            .with(theme::JOIN_INPUT_BOUNDARY_ACTIVE)
-            .text(buf, " ");
-        field
-            .take_right(1)
-            .with(theme::JOIN_INPUT_BOUNDARY_ACTIVE)
-            .text(buf, " ");
-    }
-    field.with(theme::JOIN_INPUT_ACTIVE).fill(buf);
-    dialog.editor.render(field, buf);
-    input_row
-        .with(VOLUME_DIALOG.patch(theme::MUTED))
-        .with(Ellipsis(true))
-        .text(buf, " dB");
-
-    let footer = body.take_top(1);
-    if let Some(error) = &dialog.error {
-        footer
-            .with(VOLUME_DIALOG.patch(theme::ERROR))
-            .with(Ellipsis(true))
-            .text(buf, error);
-    } else {
-        footer
-            .with(VOLUME_DIALOG.patch(theme::SUBTLE))
-            .with(Ellipsis(true))
-            .text(
-                buf,
-                &format!("Pending {}", volume_db_label(dialog.value_db)),
-            );
-    }
-}
-
-fn volume_slider(value_db: f32, width: u16) -> String {
-    let inner = width.saturating_sub(2).max(1) as usize;
-    let span = MAX_USER_VOLUME_DB - MIN_USER_VOLUME_DB;
-    let value_ratio = ((value_db - MIN_USER_VOLUME_DB) / span).clamp(0.0, 1.0);
-    let zero_ratio = ((0.0 - MIN_USER_VOLUME_DB) / span).clamp(0.0, 1.0);
-    let value_index = (value_ratio * inner.saturating_sub(1) as f32).round() as usize;
-    let zero_index = (zero_ratio * inner.saturating_sub(1) as f32).round() as usize;
-
-    let mut out = String::with_capacity(inner + 2);
-    out.push('[');
-    for index in 0..inner {
-        if index == value_index {
-            out.push('|');
-        } else if index == zero_index {
-            out.push('0');
-        } else if index < value_index {
-            out.push('=');
-        } else {
-            out.push('-');
-        }
-    }
-    out.push(']');
-    out
+    dialog.render(area, buf);
 }
 
 fn draw_room_title(area: Rect, app: &App, buf: &mut Buffer) {

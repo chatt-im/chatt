@@ -1,3 +1,4 @@
+pub(crate) mod audio_diagnostics;
 pub(crate) mod dialogs;
 pub(crate) mod participants;
 pub(crate) mod server;
@@ -24,14 +25,11 @@ use crate::{
     bindings::{BindCommand, PendingChord},
     chat_buffer::VirtualChatBuffer,
     client_net::{NetworkClient, NetworkCommand, NetworkEvent, spawn_pair_once},
-    config::{
-        self, Config, MAX_USER_VOLUME_DB, MIN_USER_VOLUME_DB, SoundboardClip, snap_user_volume_db,
-        validate_server_entry,
-    },
+    config::{self, Config, SoundboardClip, validate_server_entry},
     local_control,
     settings::{
-        self, AudioInputPickerState, AudioOutputPickerState, BITRATES, MAX_AMPLIFICATIONS,
-        SettingsDraft, SettingsFocus,
+        self, AudioInputPickerState, AudioOutputPickerState, SettingsDraft, SettingsFocus,
+        SettingsMutation,
     },
     theme,
     tui::{
@@ -50,11 +48,14 @@ use chatt::audio::{
     PlaybackStreamControl,
 };
 
-pub(crate) use dialogs::UserVolumeDialog;
+use audio_diagnostics::AudioDiagnostics;
+
+pub(crate) use dialogs::{UserVolumeDialog, UserVolumeEvent};
 pub(crate) use participants::{ParticipantState, Participants};
 pub(crate) use server::{
-    PendingPair, ServerEditDraft, ServerEditFocus, ServerSelectItem, default_join_alias,
-    random_token, server_entry_from_invite, title_case_ascii, unique_server_alias,
+    PendingPair, ServerEditDraft, ServerEditEvent, ServerEditFocus, ServerSelectItem,
+    default_join_alias, random_token, server_entry_from_invite, title_case_ascii,
+    unique_server_alias,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -159,15 +160,9 @@ impl App {
         let audio_input_items = settings::audio_input_items(&[]);
         let audio_output_items = settings::audio_output_items(&[]);
         let mut audio_input_picker = AudioInputPickerState::default();
-        audio_input_picker.reset(
-            &audio_input_items,
-            settings_draft.input_device_id.as_deref(),
-        );
+        audio_input_picker.reset(&audio_input_items, settings_draft.input_selection());
         let mut audio_output_picker = AudioOutputPickerState::default();
-        audio_output_picker.reset(
-            &audio_output_items,
-            settings_draft.output_device_id.as_deref(),
-        );
+        audio_output_picker.reset(&audio_output_items, settings_draft.output_selection());
         let echo_control = Arc::new(EchoCancellationControl::new(config.audio.echo_cancellation));
         let mut app = Self {
             event_tx,
@@ -711,53 +706,19 @@ impl App {
     }
 
     pub(crate) fn process_server_edit_key(&mut self, key: KeyEvent) -> Action {
-        if matches!(key.kind, KeyEventKind::Release) {
+        let Some(draft) = self.server_edit.as_mut() else {
             return Action::Continue;
-        }
-        match key.code {
-            KeyCode::Esc => {
+        };
+        match draft.handle_key(key) {
+            ServerEditEvent::Consumed => {
+                self.sync_focus();
+            }
+            ServerEditEvent::Cancel => {
                 self.server_edit = None;
                 self.open_server_select();
             }
-            KeyCode::Tab | KeyCode::Down => {
-                if let Some(draft) = &mut self.server_edit {
-                    draft.move_focus(1);
-                    self.sync_focus();
-                }
-            }
-            KeyCode::BackTab | KeyCode::Up => {
-                if let Some(draft) = &mut self.server_edit {
-                    draft.move_focus(-1);
-                    self.sync_focus();
-                }
-            }
-            KeyCode::Enter => {
-                let focus = self
-                    .server_edit
-                    .as_ref()
-                    .map(|draft| draft.focus)
-                    .unwrap_or(ServerEditFocus::Cancel);
-                match focus {
-                    ServerEditFocus::Save => self.save_server_edit(false),
-                    ServerEditFocus::SaveJoin => self.save_server_edit(true),
-                    ServerEditFocus::Cancel => {
-                        self.server_edit = None;
-                        self.open_server_select();
-                    }
-                    _ => {
-                        if let Some(draft) = &mut self.server_edit {
-                            draft.move_focus(1);
-                            self.sync_focus();
-                        }
-                    }
-                }
-            }
-            _ => {
-                if let Some(draft) = &mut self.server_edit
-                    && draft
-                        .focused_editor_mut()
-                        .is_some_and(|editor| editor.send_key(&key))
-                {}
+            ServerEditEvent::Save { join_after_save } => {
+                self.save_server_edit(join_after_save);
             }
         }
         Action::Continue
@@ -812,14 +773,15 @@ impl App {
             self.set_error("no server edit is open");
             return;
         };
-        let original_alias = draft.original_alias.clone();
-        let server = match draft.to_server() {
-            Ok(server) => server,
+        let update = match draft.to_update() {
+            Ok(update) => update,
             Err(error) => {
                 self.set_error(error);
                 return;
             }
         };
+        let original_alias = update.original_alias;
+        let server = update.server;
         if server.alias != original_alias
             && self
                 .config
@@ -898,30 +860,10 @@ impl App {
         if self.mode != theme::UiMode::Settings || matches!(key.kind, KeyEventKind::Release) {
             return false;
         }
-        let focus = self.settings_focus;
-        let Some(editor) = self.settings.buffer_editor_mut(focus) else {
+        let Some(mutation) = self.settings.handle_buffer_key(self.settings_focus, key) else {
             return false;
         };
-        let editing = match key.code {
-            KeyCode::Char(ch) => !ch.is_control(),
-            KeyCode::Backspace
-            | KeyCode::Delete
-            | KeyCode::Left
-            | KeyCode::Right
-            | KeyCode::Home
-            | KeyCode::End => true,
-            _ => false,
-        };
-        if !editing {
-            return false;
-        }
-        let mutates = !matches!(
-            key.code,
-            KeyCode::Left | KeyCode::Right | KeyCode::Home | KeyCode::End
-        );
-        if editor.send_key(&key) && mutates {
-            self.mark_settings_dirty();
-        }
+        self.apply_settings_mutation(mutation);
         true
     }
 
@@ -1018,14 +960,10 @@ impl App {
         self.settings.commit_buffer_editor();
         self.apply_active_capture_amplification(self.config.audio.max_amplification);
         self.stop_settings_preview_capture();
-        self.audio_input_picker.reset(
-            &self.audio_input_items,
-            self.settings.input_device_id.as_deref(),
-        );
-        self.audio_output_picker.reset(
-            &self.audio_output_items,
-            self.settings.output_device_id.as_deref(),
-        );
+        self.audio_input_picker
+            .reset(&self.audio_input_items, self.settings.input_selection());
+        self.audio_output_picker
+            .reset(&self.audio_output_items, self.settings.output_selection());
         self.set_mode(theme::UiMode::Compose);
     }
 
@@ -1053,27 +991,12 @@ impl App {
             SettingsFocus::InputDevice => self.activate_audio_input_picker(),
             SettingsFocus::OutputDevice if delta < 0 => self.cancel_audio_output_picker(),
             SettingsFocus::OutputDevice => self.activate_audio_output_picker(),
-            SettingsFocus::Bitrate => {
-                self.settings.bitrate_index =
-                    cycle_index(self.settings.bitrate_index, BITRATES.len(), delta);
-                self.mark_settings_dirty();
-            }
-            SettingsFocus::Denoise => {
-                self.settings.denoise = !self.settings.denoise;
-                self.mark_settings_dirty();
-            }
-            SettingsFocus::EchoCancellation => {
-                self.settings.echo_cancellation = !self.settings.echo_cancellation;
-                self.mark_settings_dirty();
-            }
-            SettingsFocus::Amplification => {
-                self.settings.amplification_index = cycle_index(
-                    self.settings.amplification_index,
-                    MAX_AMPLIFICATIONS.len(),
-                    delta,
-                );
-                self.apply_active_capture_amplification(self.settings.max_amplification());
-                self.mark_settings_dirty();
+            SettingsFocus::Bitrate
+            | SettingsFocus::Denoise
+            | SettingsFocus::EchoCancellation
+            | SettingsFocus::Amplification => {
+                let mutation = self.settings.adjust(self.settings_focus, delta);
+                self.apply_settings_mutation(mutation);
             }
             SettingsFocus::InputBuffer
             | SettingsFocus::OutputBuffer
@@ -1085,23 +1008,30 @@ impl App {
 
     fn activate_settings_focus(&mut self) {
         match self.settings_focus {
-            SettingsFocus::Denoise => {
-                self.settings.denoise = !self.settings.denoise;
-                self.mark_settings_dirty();
-            }
-            SettingsFocus::EchoCancellation => {
-                self.settings.echo_cancellation = !self.settings.echo_cancellation;
-                self.mark_settings_dirty();
-            }
             SettingsFocus::Refresh => self.refresh_audio_devices(),
             SettingsFocus::Save => self.save_settings(),
             SettingsFocus::Close => self.close_settings(),
             SettingsFocus::InputDevice => self.activate_audio_input_picker(),
             SettingsFocus::OutputDevice => self.activate_audio_output_picker(),
-            SettingsFocus::Bitrate | SettingsFocus::Amplification => {
-                self.adjust_settings_focus(1);
+            SettingsFocus::Denoise
+            | SettingsFocus::EchoCancellation
+            | SettingsFocus::Bitrate
+            | SettingsFocus::Amplification => {
+                let mutation = self.settings.activate(self.settings_focus);
+                self.apply_settings_mutation(mutation);
             }
             SettingsFocus::InputBuffer | SettingsFocus::OutputBuffer => {}
+        }
+    }
+
+    fn apply_settings_mutation(&mut self, mutation: SettingsMutation) {
+        match mutation {
+            SettingsMutation::None => {}
+            SettingsMutation::Changed => self.mark_settings_dirty(),
+            SettingsMutation::AmplificationChanged(value) => {
+                self.apply_active_capture_amplification(value);
+                self.mark_settings_dirty();
+            }
         }
     }
 
@@ -1135,10 +1065,8 @@ impl App {
             if self.input_devices.is_empty() {
                 self.refresh_audio_devices();
             }
-            self.audio_input_picker.open(
-                &self.audio_input_items,
-                self.settings.input_device_id.as_deref(),
-            );
+            self.audio_input_picker
+                .open(&self.audio_input_items, self.settings.input_selection());
             self.sync_focus();
         }
     }
@@ -1150,10 +1078,8 @@ impl App {
             if self.output_devices.is_empty() {
                 self.refresh_audio_devices();
             }
-            self.audio_output_picker.open(
-                &self.audio_output_items,
-                self.settings.output_device_id.as_deref(),
-            );
+            self.audio_output_picker
+                .open(&self.audio_output_items, self.settings.output_selection());
             self.sync_focus();
         }
     }
@@ -1162,8 +1088,7 @@ impl App {
         let Some(next) = self.audio_input_picker.confirm(&self.audio_input_items) else {
             return;
         };
-        if self.settings.input_device_id != next {
-            self.settings.input_device_id = next;
+        if self.settings.set_input_selection(next) {
             self.mark_settings_dirty();
         }
         self.sync_focus();
@@ -1171,7 +1096,7 @@ impl App {
 
     fn cancel_audio_input_picker(&mut self) {
         if let Some(selection) = self.audio_input_picker.cancel(&self.audio_input_items) {
-            self.settings.input_device_id = selection;
+            self.settings.restore_input_selection(selection);
         }
         self.sync_focus();
     }
@@ -1180,8 +1105,7 @@ impl App {
         let Some(next) = self.audio_output_picker.confirm(&self.audio_output_items) else {
             return;
         };
-        if self.settings.output_device_id != next {
-            self.settings.output_device_id = next;
+        if self.settings.set_output_selection(next) {
             self.mark_settings_dirty();
         }
         self.sync_focus();
@@ -1189,7 +1113,7 @@ impl App {
 
     fn cancel_audio_output_picker(&mut self) {
         if let Some(selection) = self.audio_output_picker.cancel(&self.audio_output_items) {
-            self.settings.output_device_id = selection;
+            self.settings.restore_output_selection(selection);
         }
         self.sync_focus();
     }
@@ -1197,27 +1121,19 @@ impl App {
     fn rebuild_audio_device_pickers(&mut self) {
         self.audio_input_items = settings::audio_input_items(&self.input_devices);
         if self.audio_input_picker.open {
-            self.audio_input_picker.refresh_items(
-                &self.audio_input_items,
-                self.settings.input_device_id.as_deref(),
-            );
+            self.audio_input_picker
+                .refresh_items(&self.audio_input_items, self.settings.input_selection());
         } else {
-            self.audio_input_picker.reset(
-                &self.audio_input_items,
-                self.settings.input_device_id.as_deref(),
-            );
+            self.audio_input_picker
+                .reset(&self.audio_input_items, self.settings.input_selection());
         }
         self.audio_output_items = settings::audio_output_items(&self.output_devices);
         if self.audio_output_picker.open {
-            self.audio_output_picker.refresh_items(
-                &self.audio_output_items,
-                self.settings.output_device_id.as_deref(),
-            );
+            self.audio_output_picker
+                .refresh_items(&self.audio_output_items, self.settings.output_selection());
         } else {
-            self.audio_output_picker.reset(
-                &self.audio_output_items,
-                self.settings.output_device_id.as_deref(),
-            );
+            self.audio_output_picker
+                .reset(&self.audio_output_items, self.settings.output_selection());
         }
     }
 
@@ -1291,87 +1207,68 @@ impl App {
         let Some(mut dialog) = self.volume_dialog.take() else {
             return false;
         };
-        if matches!(key.kind, KeyEventKind::Release) {
-            self.volume_dialog = Some(dialog);
-            return true;
-        }
-
-        match key.code {
-            KeyCode::Esc => {
-                self.config.set_user_volume_db(
-                    &self.server_alias,
-                    dialog.user_id.0,
-                    dialog.original_db,
-                );
-                self.apply_user_audio_control_with_volume(dialog.user_id, dialog.original_db);
+        match dialog.handle_key(key) {
+            UserVolumeEvent::Consumed => {
+                self.volume_dialog = Some(dialog);
+            }
+            UserVolumeEvent::Preview { user_id, value_db } => {
+                self.apply_user_audio_control_with_volume(user_id, value_db);
+                self.volume_dialog = Some(dialog);
+            }
+            UserVolumeEvent::Invalid(error) => {
+                self.set_error(error);
+                self.volume_dialog = Some(dialog);
+            }
+            UserVolumeEvent::Cancel {
+                user_id,
+                user_name,
+                original_db,
+            } => {
+                self.config
+                    .set_user_volume_db(&self.server_alias, user_id.0, original_db);
+                self.apply_user_audio_control_with_volume(user_id, original_db);
                 self.focus.pop_modal(FocusId::Participants);
                 self.modes.pop_or(ModeKind::from(self.mode));
-                self.set_status(format!("canceled local volume for {}", dialog.user_name));
+                self.set_status(format!("canceled local volume for {user_name}"));
             }
-            KeyCode::Enter => match dialog.parse_editor_value() {
-                Ok(value_db) => {
-                    dialog.value_db = value_db;
-                    self.config
-                        .set_user_volume_db(&self.server_alias, dialog.user_id.0, value_db);
-                    self.apply_user_audio_control_with_volume(dialog.user_id, value_db);
-                    match self.config.save_runtime() {
-                        Ok(path) => {
-                            self.config.config_path = Some(path.clone());
-                            self.focus.pop_modal(FocusId::Participants);
-                            self.modes.pop_or(ModeKind::from(self.mode));
-                            self.set_status(format!(
-                                "saved local volume {}dB for {} to {}",
-                                format_signed_db(value_db),
-                                dialog.user_name,
-                                path.display()
-                            ));
-                        }
-                        Err(error) => {
-                            dialog.error = Some(error.clone());
-                            self.volume_dialog = Some(dialog);
-                            self.set_error(error);
-                        }
-                    }
-                }
-                Err(error) => {
-                    dialog.error = Some(error.clone());
-                    self.volume_dialog = Some(dialog);
-                    self.set_error(error);
-                }
-            },
-            KeyCode::Left | KeyCode::Down => {
-                dialog.adjust(-1);
-                self.apply_user_audio_control_with_volume(dialog.user_id, dialog.value_db);
-                self.volume_dialog = Some(dialog);
-            }
-            KeyCode::Right | KeyCode::Up => {
-                dialog.adjust(1);
-                self.apply_user_audio_control_with_volume(dialog.user_id, dialog.value_db);
-                self.volume_dialog = Some(dialog);
-            }
-            _ if dialog.editor.send_key(&key) => {
-                match dialog.apply_editor_value() {
-                    Ok(value_db) => {
-                        self.apply_user_audio_control_with_volume(dialog.user_id, value_db);
+            UserVolumeEvent::Save {
+                user_id,
+                user_name,
+                value_db,
+            } => {
+                self.config
+                    .set_user_volume_db(&self.server_alias, user_id.0, value_db);
+                self.apply_user_audio_control_with_volume(user_id, value_db);
+                match self.config.save_runtime() {
+                    Ok(path) => {
+                        self.config.config_path = Some(path.clone());
+                        self.focus.pop_modal(FocusId::Participants);
+                        self.modes.pop_or(ModeKind::from(self.mode));
+                        self.set_status(format!(
+                            "saved local volume {}dB for {} to {}",
+                            format_signed_db(value_db),
+                            user_name,
+                            path.display()
+                        ));
                     }
                     Err(error) => {
-                        dialog.error = Some(error);
+                        dialog.mark_save_error(error.clone());
+                        self.volume_dialog = Some(dialog);
+                        self.set_error(error);
                     }
                 }
-                self.volume_dialog = Some(dialog);
-            }
-            _ => {
-                self.volume_dialog = Some(dialog);
             }
         }
         true
     }
 
     pub(crate) fn effective_user_volume_db(&self, user_id: UserId) -> f32 {
-        if let Some(dialog) = &self.volume_dialog
-            && dialog.user_id == user_id
+        if let Some(value_db) = self
+            .volume_dialog
+            .as_ref()
+            .and_then(|dialog| dialog.preview_for(user_id))
         {
-            return dialog.value_db;
+            return value_db;
         }
         self.config.user_volume_db(&self.server_alias, user_id.0)
     }
@@ -1605,45 +1502,15 @@ impl App {
             self.set_status("audio inactive");
             return;
         };
-        let stats = playback.stats();
-        let played_samples = stats.direct_samples;
-        let direct_percent = if played_samples == 0 {
-            0
-        } else {
-            stats.direct_samples.saturating_mul(100) / played_samples
-        };
-        let base_target = if stats.adaptive_target_ms == stats.target_queue_ms {
-            String::new()
-        } else {
-            format!(" base{}ms", stats.target_queue_ms)
-        };
-        let backend_errors = if stats.backend_stream_errors == 0 {
-            String::new()
-        } else {
-            format!(
-                " backend_xruns{}/{}",
-                stats.backend_xruns, stats.backend_stream_errors
-            )
-        };
-        self.set_status(format!(
-            "audio q{}ms target{}ms{} enc{} direct{}% accel{}ms/{} expand{}ms/{} dred{} plc{} trims{} underruns{}{} rx {}/{}",
-            stats.max_queue_ms,
-            stats.adaptive_target_ms,
-            base_target,
-            self.encoder_profile.label(),
-            direct_percent,
-            live_samples_to_ms(stats.accelerate_samples as usize),
-            stats.accelerate_count,
-            live_samples_to_ms(stats.expand_samples as usize),
-            stats.expand_count,
-            stats.dred_recoveries,
-            stats.plc_fallbacks,
-            stats.hard_trim_count,
-            stats.underrun_count,
-            backend_errors,
+        let diagnostics = AudioDiagnostics::new(
+            playback.stats(),
+            self.encoder_profile,
             self.voice_packets_received,
-            format_bytes_compact(self.voice_bytes_received),
-        ));
+            self.voice_bytes_received,
+        );
+        self.chat.push_notice("audio", diagnostics.notice_body());
+        self.chat.bottom();
+        self.set_status(diagnostics.status_summary());
     }
 
     fn show_users(&mut self) {
@@ -2041,7 +1908,7 @@ impl App {
             theme::UiMode::ServerEdit => self
                 .server_edit
                 .as_ref()
-                .map(|draft| FocusId::ServerField(server_field(draft.focus)))
+                .map(|draft| FocusId::ServerField(server_field(draft.focus())))
                 .unwrap_or(FocusId::ServerList),
             theme::UiMode::Compose => FocusId::Composer,
             theme::UiMode::Log => FocusId::Chat,
@@ -2111,38 +1978,6 @@ fn handle_audio_picker_search_key(
     false
 }
 
-fn volume_input_editor(value_db: f32) -> Editor {
-    let mut editor = Editor::new();
-    editor.set_single_line(true);
-    editor.set_wrap(false);
-    editor.set_height_bounds(1, 1);
-    editor.set_theme(theme::join_input_editor_theme());
-    editor.set_lines(&format_volume_db_value(value_db));
-    editor.enter_insert_mode();
-    editor
-}
-
-fn parse_user_volume_db(value: &str) -> Result<f32, String> {
-    let value = value.trim();
-    if value.is_empty() {
-        return Err("volume dB value is empty".to_string());
-    }
-    let parsed = value
-        .parse::<f32>()
-        .map_err(|_| "volume dB value must be a number".to_string())?;
-    if !(MIN_USER_VOLUME_DB..=MAX_USER_VOLUME_DB).contains(&parsed) {
-        return Err(format!(
-            "volume dB value must be between {:.1} and {:.1}",
-            MIN_USER_VOLUME_DB, MAX_USER_VOLUME_DB
-        ));
-    }
-    Ok(snap_user_volume_db(parsed))
-}
-
-fn format_volume_db_value(value_db: f32) -> String {
-    format!("{value_db:.1}")
-}
-
 fn format_signed_db(value_db: f32) -> String {
     if value_db > 0.0 {
         format!("+{value_db:.1}")
@@ -2153,29 +1988,6 @@ fn format_signed_db(value_db: f32) -> String {
 
 pub(crate) fn volume_db_label(value_db: f32) -> String {
     format!("{}dB", format_signed_db(value_db))
-}
-
-fn format_bytes_compact(bytes: u64) -> String {
-    const KB: u64 = 1024;
-    const MB: u64 = 1024 * KB;
-    if bytes >= MB {
-        format!("{:.1}MB", bytes as f64 / MB as f64)
-    } else if bytes >= KB {
-        format!("{:.1}KB", bytes as f64 / KB as f64)
-    } else {
-        format!("{bytes}B")
-    }
-}
-
-fn live_samples_to_ms(samples: usize) -> u64 {
-    ((samples as f64 / f64::from(audio::SAMPLE_RATE)) * 1_000.0).round() as u64
-}
-
-fn cycle_index(current: usize, len: usize, delta: isize) -> usize {
-    if len == 0 {
-        return 0;
-    }
-    (current as isize + delta).rem_euclid(len as isize) as usize
 }
 
 fn network_event_kind(event: &NetworkEvent) -> &'static str {
@@ -2225,17 +2037,16 @@ mod tests {
     #[test]
     fn server_edit_reuses_one_editor_across_text_fields() {
         let mut draft = ServerEditDraft::from_server(&crate::config::ServerEntry::default());
-        let first_editor = draft.focused_editor_mut().unwrap() as *mut _ as usize;
-        draft.focused_editor_mut().unwrap().set_lines("local-dev");
+        let first_editor = draft.active_editor_address().unwrap();
+        draft.set_active_editor_text("local-dev");
 
-        draft.move_focus(1);
+        draft.move_focus_for_test(1);
 
-        assert_eq!(draft.alias, "local-dev");
-        let second_editor = draft.focused_editor_mut().unwrap() as *mut _ as usize;
+        let second_editor = draft.active_editor_address().unwrap();
         assert_eq!(first_editor, second_editor);
-        draft.focused_editor_mut().unwrap().set_lines("Alice Dev");
+        draft.set_active_editor_text("Alice Dev");
 
-        let server = draft.to_server().unwrap();
+        let server = draft.to_update().unwrap().server;
         assert_eq!(server.alias, "local-dev");
         assert_eq!(server.display_name, "Alice Dev");
     }
@@ -2243,19 +2054,17 @@ mod tests {
     #[test]
     fn settings_buffers_reuse_one_editor_and_commit_on_focus_change() {
         let mut draft = SettingsDraft::from_audio(&crate::config::AudioConfig::default());
-        let input_editor =
-            draft.buffer_editor_mut(SettingsFocus::InputBuffer).unwrap() as *mut _ as usize;
-        draft
-            .buffer_editor_mut(SettingsFocus::InputBuffer)
-            .unwrap()
-            .set_lines("1024");
+        let input_editor = draft
+            .active_buffer_editor_address(SettingsFocus::InputBuffer)
+            .unwrap();
+        draft.set_buffer_editor_text(SettingsFocus::InputBuffer, "1024");
 
-        draft.focus_buffer_editor(SettingsFocus::OutputBuffer);
+        draft.focus_buffer_for_test(SettingsFocus::OutputBuffer);
 
-        assert_eq!(draft.input_buffer, "1024");
+        assert_eq!(draft.buffer_text(SettingsFocus::InputBuffer), "1024");
         let output_editor = draft
-            .buffer_editor_mut(SettingsFocus::OutputBuffer)
-            .unwrap() as *mut _ as usize;
+            .active_buffer_editor_address(SettingsFocus::OutputBuffer)
+            .unwrap();
         assert_eq!(input_editor, output_editor);
     }
 

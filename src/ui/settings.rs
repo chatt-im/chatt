@@ -6,6 +6,7 @@ use crate::{
         selected_audio_input_label, selected_audio_output_label,
     },
     theme,
+    tui::widgets,
     ui::vu,
 };
 use extui::{Buffer, Ellipsis, HAlign, Rect, Style, vt::Modifier};
@@ -16,10 +17,26 @@ const SELECTED_FOCUSED: Style = Style::DEFAULT
 const SELECTED_DIM: Style = Style::DEFAULT
     .with_bg_rgb(0x24, 0x28, 0x30)
     .with_fg_rgb(0xd8, 0xdb, 0xd6);
-const PANEL_EDGE: Style = Style::DEFAULT.with_bg_rgb(0x18, 0x1b, 0x20);
-const SETTINGS_LABEL_WIDTH: u16 = 16;
-const SETTINGS_CONTROLS_ROWS: u16 = 11;
-const MIN_DEVICE_PICKER_ROWS: u16 = 4;
+const DETAIL_PANEL: Style = Style::DEFAULT.with_bg_rgb(0x18, 0x1b, 0x20);
+const LABEL_WIDTH: u16 = 18;
+const DETAIL_WIDTH: u16 = 34;
+const MIN_DETAIL_SCREEN_WIDTH: u16 = 92;
+const MIN_PICKER_ROWS: u16 = 3;
+const ACTION_ROWS: [SettingsFocus; 3] = [
+    SettingsFocus::Refresh,
+    SettingsFocus::Save,
+    SettingsFocus::Close,
+];
+const INPUT_ROWS: [SettingsFocus; 5] = [
+    SettingsFocus::Bitrate,
+    SettingsFocus::Denoise,
+    SettingsFocus::EchoCancellation,
+    SettingsFocus::Amplification,
+    SettingsFocus::InputBuffer,
+];
+const OUTPUT_ROWS: [SettingsFocus; 1] = [SettingsFocus::OutputBuffer];
+const INPUT_FIXED_ROWS: u16 = 2 + INPUT_ROWS.len() as u16;
+const OUTPUT_FIXED_ROWS: u16 = 2 + OUTPUT_ROWS.len() as u16;
 
 pub fn draw_settings(
     area: Rect,
@@ -39,90 +56,287 @@ pub fn draw_settings(
     }
 
     let mut rows = area;
-    draw_device_header(
-        rows.take_top(1),
-        buf,
-        "Input",
-        focus == SettingsFocus::InputDevice,
-        input_picker,
-        selected_audio_input_label(input_items, settings.input_device_id.as_deref()),
-    );
-    draw_device_header(
-        rows.take_top(1),
-        buf,
-        "Output",
-        focus == SettingsFocus::OutputDevice,
-        output_picker,
-        selected_audio_output_label(output_items, settings.output_device_id.as_deref()),
-    );
+    vu::draw_settings_vu_row(rows.take_top(1), buf, capture, false);
 
-    if input_picker.open {
-        let controls_height = settings_controls_height(rows.h, input_items.len());
-        let controls = rows.take_bottom(controls_height as i32);
-        draw_audio_picker(
-            rows,
+    let actions = rows.take_bottom(action_rows(rows.h) as i32);
+    let mut body = rows;
+    let detail = if body.w >= MIN_DETAIL_SCREEN_WIDTH {
+        let mut detail = body.take_right(DETAIL_WIDTH as i32);
+        body.take_right(1).with(theme::BACKGROUND).fill(buf);
+        detail = detail.inset(1, 0);
+        Some(detail)
+    } else {
+        None
+    };
+
+    draw_audio_sections(
+        body,
+        buf,
+        settings,
+        focus,
+        dirty,
+        input_items,
+        input_picker,
+        output_items,
+        output_picker,
+    );
+    draw_actions(actions, buf, focus, dirty);
+
+    if let Some(detail) = detail {
+        draw_focus_detail(
+            detail,
             buf,
-            focus == SettingsFocus::InputDevice,
+            settings,
+            focus,
             input_items,
             input_picker,
-        );
-        draw_settings_controls(controls, buf, settings, focus, dirty, capture);
-    } else if output_picker.open {
-        let controls_height = settings_controls_height(rows.h, output_items.len());
-        let controls = rows.take_bottom(controls_height as i32);
-        draw_audio_picker(
-            rows,
-            buf,
-            focus == SettingsFocus::OutputDevice,
             output_items,
             output_picker,
         );
-        draw_settings_controls(controls, buf, settings, focus, dirty, capture);
-    } else {
-        draw_settings_controls(rows, buf, settings, focus, dirty, capture);
     }
 }
 
-fn settings_controls_height(available: u16, input_count: usize) -> u16 {
-    let min_picker_rows = if input_count > 1 {
-        MIN_DEVICE_PICKER_ROWS
-    } else {
-        1
-    };
-    available
-        .saturating_sub(min_picker_rows)
-        .min(SETTINGS_CONTROLS_ROWS)
+fn action_rows(available: u16) -> u16 {
+    available.min(ACTION_ROWS.len() as u16)
 }
 
-fn draw_device_header(
+fn draw_audio_sections(
+    area: Rect,
+    buf: &mut Buffer,
+    settings: &mut SettingsDraft,
+    focus: SettingsFocus,
+    dirty: bool,
+    input_items: &[AudioInputItem],
+    input_picker: &mut AudioInputPickerState,
+    output_items: &[AudioOutputItem],
+    output_picker: &mut AudioOutputPickerState,
+) {
+    if area.is_empty() {
+        return;
+    }
+
+    let mut rows = area;
+    let input_height = input_section_height(rows.h, input_picker.open, output_picker.open);
+    let input_area = rows.take_top(input_height as i32);
+    draw_input_section(
+        input_area,
+        buf,
+        settings,
+        focus,
+        dirty,
+        input_items,
+        input_picker,
+    );
+    if rows.h > 0 {
+        rows.take_top(1).with(theme::BACKGROUND).fill(buf);
+    }
+    draw_output_section(
+        rows,
+        buf,
+        settings,
+        focus,
+        dirty,
+        output_items,
+        output_picker,
+    );
+}
+
+fn input_section_height(available: u16, input_picker_open: bool, output_picker_open: bool) -> u16 {
+    if available <= INPUT_FIXED_ROWS {
+        return available;
+    }
+    if output_picker_open {
+        return available.min(INPUT_FIXED_ROWS);
+    }
+    if input_picker_open {
+        return available
+            .saturating_sub(OUTPUT_FIXED_ROWS + 1)
+            .max(INPUT_FIXED_ROWS + MIN_PICKER_ROWS)
+            .min(available);
+    }
+    available.min(INPUT_FIXED_ROWS)
+}
+
+fn draw_input_section(
+    area: Rect,
+    buf: &mut Buffer,
+    settings: &mut SettingsDraft,
+    focus: SettingsFocus,
+    dirty: bool,
+    input_items: &[AudioInputItem],
+    picker: &mut AudioInputPickerState,
+) {
+    let mut rows = area;
+    draw_section_header(rows.take_top(1), buf, " INPUT ");
+    draw_device_row(
+        rows.take_top(1),
+        buf,
+        "Device",
+        focus == SettingsFocus::InputDevice,
+        dirty,
+        picker,
+        selected_audio_input_label(input_items, settings.input_selection()),
+    );
+    if picker.open {
+        let picker_rows = rows
+            .h
+            .saturating_sub(INPUT_ROWS.len() as u16)
+            .max(MIN_PICKER_ROWS)
+            .min(rows.h);
+        draw_audio_picker(
+            rows.take_top(picker_rows as i32),
+            buf,
+            focus == SettingsFocus::InputDevice,
+            input_items,
+            picker,
+        );
+    }
+    for row in INPUT_ROWS {
+        draw_control_row(rows.take_top(1), buf, settings, row, focus, dirty);
+    }
+}
+
+fn draw_output_section(
+    area: Rect,
+    buf: &mut Buffer,
+    settings: &mut SettingsDraft,
+    focus: SettingsFocus,
+    dirty: bool,
+    output_items: &[AudioOutputItem],
+    picker: &mut AudioOutputPickerState,
+) {
+    let mut rows = area;
+    draw_section_header(rows.take_top(1), buf, " OUTPUT ");
+    draw_device_row(
+        rows.take_top(1),
+        buf,
+        "Device",
+        focus == SettingsFocus::OutputDevice,
+        dirty,
+        picker,
+        selected_audio_output_label(output_items, settings.output_selection()),
+    );
+    if picker.open {
+        let picker_rows = rows
+            .h
+            .saturating_sub(OUTPUT_ROWS.len() as u16)
+            .max(MIN_PICKER_ROWS)
+            .min(rows.h);
+        draw_audio_picker(
+            rows.take_top(picker_rows as i32),
+            buf,
+            focus == SettingsFocus::OutputDevice,
+            output_items,
+            picker,
+        );
+    }
+    for row in OUTPUT_ROWS {
+        draw_control_row(rows.take_top(1), buf, settings, row, focus, dirty);
+    }
+}
+
+fn draw_section_header(area: Rect, buf: &mut Buffer, label: &str) {
+    widgets::draw_section_header(area, buf, label);
+}
+
+fn draw_device_row(
     area: Rect,
     buf: &mut Buffer,
     label: &str,
     focused: bool,
+    dirty: bool,
     picker: &AudioDevicePickerState,
     selected: String,
 ) {
-    let style = if focused {
-        SELECTED_DIM
+    let value = if picker.open && picker.searching {
+        format!("/{}", picker.selector.query())
     } else {
-        theme::BACKGROUND
+        selected
     };
-    buf.clear_rect(area, style);
+    widgets::draw_labeled_value(area, buf, LABEL_WIDTH, label, &value, focused, dirty);
+}
 
-    let mut row = area;
-    row.take_left(SETTINGS_LABEL_WIDTH as i32)
-        .with(style.patch(if focused { theme::GOOD } else { theme::MUTED }))
-        .with(Ellipsis(true))
-        .text(buf, label);
-    if picker.open && picker.searching {
-        row.with(style.patch(theme::SUBTLE)).text(buf, "/");
-        row.with(style.patch(theme::TEXT))
-            .with(Ellipsis(true))
-            .text(buf, picker.selector.query());
-    } else {
-        row.with(style.patch(if focused { theme::GOOD } else { theme::TEXT }))
-            .with(Ellipsis(true))
-            .text(buf, &selected);
+fn draw_control_row(
+    area: Rect,
+    buf: &mut Buffer,
+    settings: &mut SettingsDraft,
+    row: SettingsFocus,
+    focus: SettingsFocus,
+    dirty: bool,
+) {
+    if matches!(
+        row,
+        SettingsFocus::InputBuffer | SettingsFocus::OutputBuffer
+    ) && focus == row
+    {
+        let input =
+            widgets::draw_labeled_editor_frame(area, buf, LABEL_WIDTH, setting_label(row), true);
+        settings.render_buffer_editor(row, input, buf);
+        return;
+    }
+    widgets::draw_labeled_value(
+        area,
+        buf,
+        LABEL_WIDTH,
+        setting_label(row),
+        &settings.option_label(row),
+        focus == row,
+        dirty,
+    );
+}
+
+fn draw_actions(area: Rect, buf: &mut Buffer, focus: SettingsFocus, dirty: bool) {
+    if area.is_empty() {
+        return;
+    }
+    let mut rows = area;
+    draw_action_row(
+        rows.take_top(1),
+        buf,
+        "Refresh devices",
+        focus == SettingsFocus::Refresh,
+        false,
+    );
+    draw_action_row(
+        rows.take_top(1),
+        buf,
+        if dirty {
+            "Save config *"
+        } else {
+            "Save config"
+        },
+        focus == SettingsFocus::Save,
+        dirty,
+    );
+    draw_action_row(
+        rows.take_top(1),
+        buf,
+        "Back to chat",
+        focus == SettingsFocus::Close,
+        false,
+    );
+}
+
+fn draw_action_row(area: Rect, buf: &mut Buffer, label: &str, focused: bool, dirty: bool) {
+    let mut label = label.to_string();
+    if dirty && !label.ends_with('*') {
+        label.push_str(" *");
+    }
+    widgets::draw_action(area, buf, &label, focused);
+}
+
+fn setting_label(focus: SettingsFocus) -> &'static str {
+    match focus {
+        SettingsFocus::InputDevice | SettingsFocus::OutputDevice => "Device",
+        SettingsFocus::Bitrate => "Bitrate",
+        SettingsFocus::Denoise => "Denoise",
+        SettingsFocus::EchoCancellation => "Echo Cancel",
+        SettingsFocus::Amplification => "Max Gain",
+        SettingsFocus::InputBuffer => "Input Buffer",
+        SettingsFocus::OutputBuffer => "Output Buffer",
+        SettingsFocus::Refresh => "Refresh",
+        SettingsFocus::Save => "Save",
+        SettingsFocus::Close => "Close",
     }
 }
 
@@ -136,42 +350,27 @@ fn draw_audio_picker(
     if area.is_empty() {
         return;
     }
-
-    let mut list_area = area;
-    let metadata = if list_area.w >= 72 {
-        Some(list_area.take_right(34))
-    } else if list_area.h >= 9 {
-        Some(list_area.take_bottom(5))
-    } else {
-        None
-    };
-
-    buf.clear_rect(list_area, theme::BACKGROUND);
+    buf.clear_rect(area, theme::BACKGROUND);
     if picker.selector.filtered_len() == 0 {
-        list_area
-            .with(theme::SUBTLE)
+        area.with(theme::SUBTLE)
             .with(HAlign::Center)
             .text(buf, "No matching audio devices");
-    } else {
-        let item_height = if list_area.h < 4 { 1 } else { 2 };
-        picker.selector.render(
-            list_area,
-            item_height,
-            buf,
-            |_, item_index, selected, area, buf| {
-                if let Some(item) = items.get(item_index) {
-                    draw_audio_input_item(area, buf, item, selected, focused);
-                }
-            },
-        );
+        return;
     }
-
-    if let Some(metadata) = metadata {
-        draw_audio_metadata(metadata, buf, items, picker);
-    }
+    let item_height = if area.h < 4 { 1 } else { 2 };
+    picker.selector.render(
+        area,
+        item_height,
+        buf,
+        |_, item_index, selected, area, buf| {
+            if let Some(item) = items.get(item_index) {
+                draw_audio_item(area, buf, item, selected, focused);
+            }
+        },
+    );
 }
 
-fn draw_audio_input_item(
+fn draw_audio_item(
     area: Rect,
     buf: &mut Buffer,
     item: &AudioDeviceItem,
@@ -189,10 +388,9 @@ fn draw_audio_input_item(
 
     let mut rows = area;
     let mut top = rows.take_top(1);
-    let marker = if selected { ">" } else { " " };
     top.take_left(2)
         .with(base.patch(if selected { theme::GOOD } else { theme::SUBTLE }))
-        .text(buf, marker);
+        .text(buf, if selected { ">" } else { " " });
     top.with(base.patch(if item.supported {
         theme::TEXT
     } else {
@@ -218,19 +416,63 @@ fn draw_audio_input_item(
     }
 }
 
-fn draw_audio_metadata(
+fn draw_focus_detail(
     area: Rect,
     buf: &mut Buffer,
-    items: &[AudioDeviceItem],
-    picker: &AudioDevicePickerState,
+    settings: &SettingsDraft,
+    focus: SettingsFocus,
+    input_items: &[AudioInputItem],
+    input_picker: &AudioInputPickerState,
+    output_items: &[AudioOutputItem],
+    output_picker: &AudioOutputPickerState,
 ) {
-    buf.clear_rect(area, PANEL_EDGE);
-    let Some(item) = picker
-        .selector
-        .current_item_index()
-        .and_then(|index| items.get(index))
-    else {
-        area.with(PANEL_EDGE.patch(theme::SUBTLE))
+    buf.clear_rect(area, DETAIL_PANEL);
+    let mut rows = area;
+    rows.take_top(1)
+        .with(DETAIL_PANEL.patch(theme::ACCENT | Modifier::BOLD))
+        .with(Ellipsis(true))
+        .text(buf, &format!(" {} ", detail_title(focus)));
+
+    match focus {
+        SettingsFocus::InputDevice => draw_device_detail(
+            rows,
+            buf,
+            focused_device(input_items, input_picker, settings.input_selection()),
+        ),
+        SettingsFocus::OutputDevice => draw_device_detail(
+            rows,
+            buf,
+            focused_device(output_items, output_picker, settings.output_selection()),
+        ),
+        _ => draw_option_detail(rows, buf, settings, focus),
+    }
+}
+
+fn detail_title(focus: SettingsFocus) -> &'static str {
+    match focus {
+        SettingsFocus::InputDevice => "Input Device",
+        SettingsFocus::OutputDevice => "Output Device",
+        _ => setting_label(focus),
+    }
+}
+
+fn focused_device<'a>(
+    items: &'a [AudioDeviceItem],
+    picker: &AudioDevicePickerState,
+    selection: Option<&str>,
+) -> Option<&'a AudioDeviceItem> {
+    if picker.open {
+        return picker
+            .selector
+            .current_item_index()
+            .and_then(|index| items.get(index));
+    }
+    items.iter().find(|item| item.matches_selection(selection))
+}
+
+fn draw_device_detail(area: Rect, buf: &mut Buffer, item: Option<&AudioDeviceItem>) {
+    let Some(item) = item else {
+        area.with(DETAIL_PANEL.patch(theme::SUBTLE))
             .with(HAlign::Center)
             .text(buf, "No device");
         return;
@@ -238,13 +480,14 @@ fn draw_audio_metadata(
 
     let mut rows = area;
     rows.take_top(1)
-        .with(PANEL_EDGE.patch(theme::ACCENT | Modifier::BOLD))
+        .with(DETAIL_PANEL.patch(theme::TEXT | Modifier::BOLD))
         .with(Ellipsis(true))
-        .text(buf, &format!(" {}", item.name));
-
-    draw_metadata_line(
+        .text(buf, &item.name);
+    widgets::draw_metadata_line(
         rows.take_top(1),
         buf,
+        DETAIL_PANEL,
+        10,
         "Index",
         &item
             .device_index
@@ -252,39 +495,108 @@ fn draw_audio_metadata(
             .unwrap_or_else(|| "OS default".to_string()),
     );
     if let Some(id) = item.backend_id.as_ref().or(item.selection.as_ref()) {
-        draw_metadata_line(rows.take_top(1), buf, "ID", id);
+        widgets::draw_metadata_line(rows.take_top(1), buf, DETAIL_PANEL, 10, "ID", id);
     }
     if item.variants.len() > 1 {
-        draw_metadata_line(
+        widgets::draw_metadata_line(
             rows.take_top(1),
             buf,
+            DETAIL_PANEL,
+            10,
             "Variants",
             &item_variant_indexes(item),
         );
     }
-
     if let Some(preview) = &item.preview {
-        draw_metadata_line(
+        widgets::draw_metadata_line(
             rows.take_top(1),
             buf,
+            DETAIL_PANEL,
+            10,
             "Channels",
             &preview.channels.to_string(),
         );
-        draw_metadata_line(
+        widgets::draw_metadata_line(
             rows.take_top(1),
             buf,
+            DETAIL_PANEL,
+            10,
             "Format",
             &preview.sample_format.to_string(),
         );
-        draw_metadata_line(rows.take_top(1), buf, "Rate", "48 kHz");
+        widgets::draw_metadata_line(rows.take_top(1), buf, DETAIL_PANEL, 10, "Rate", "48 kHz");
         if let cpal::BufferSize::Fixed(frames) = preview.buffer_size {
-            draw_metadata_line(rows.take_top(1), buf, "Buffer", &format!("{frames} frames"));
+            widgets::draw_metadata_line(
+                rows.take_top(1),
+                buf,
+                DETAIL_PANEL,
+                10,
+                "Buffer",
+                &format!("{frames} frames"),
+            );
         }
     } else if let Some(issue) = &item.issue {
-        draw_metadata_line(rows.take_top(1), buf, "Issue", issue);
+        widgets::draw_metadata_line(rows.take_top(1), buf, DETAIL_PANEL, 10, "Issue", issue);
     } else {
-        draw_metadata_line(rows.take_top(1), buf, "Source", item.default_source);
+        widgets::draw_metadata_line(
+            rows.take_top(1),
+            buf,
+            DETAIL_PANEL,
+            10,
+            "Source",
+            item.default_source,
+        );
     }
+}
+
+fn draw_option_detail(
+    area: Rect,
+    buf: &mut Buffer,
+    settings: &SettingsDraft,
+    focus: SettingsFocus,
+) {
+    let mut rows = area;
+    widgets::draw_metadata_line(
+        rows.take_top(1),
+        buf,
+        DETAIL_PANEL,
+        10,
+        "Current",
+        &settings.option_label(focus),
+    );
+    rows.take_top(1).with(DETAIL_PANEL).fill(buf);
+    for line in wrap_detail(settings.option_detail(focus), rows.w as usize) {
+        rows.take_top(1)
+            .with(DETAIL_PANEL.patch(theme::MUTED))
+            .with(Ellipsis(true))
+            .text(buf, &line);
+    }
+}
+
+fn wrap_detail(text: &str, width: usize) -> Vec<String> {
+    if width == 0 {
+        return Vec::new();
+    }
+    let mut lines = Vec::new();
+    let mut current = String::new();
+    for word in text.split_whitespace() {
+        let next_len = if current.is_empty() {
+            word.len()
+        } else {
+            current.len() + 1 + word.len()
+        };
+        if next_len > width && !current.is_empty() {
+            lines.push(std::mem::take(&mut current));
+        }
+        if !current.is_empty() {
+            current.push(' ');
+        }
+        current.push_str(word);
+    }
+    if !current.is_empty() {
+        lines.push(current);
+    }
+    lines
 }
 
 fn item_variant_summary(item: &AudioDeviceItem) -> String {
@@ -307,198 +619,41 @@ fn item_variant_indexes(item: &AudioDeviceItem) -> String {
     label
 }
 
-fn draw_metadata_line(area: Rect, buf: &mut Buffer, label: &str, value: &str) {
-    if area.is_empty() {
-        return;
-    }
-    let mut row = area;
-    row.take_left(10)
-        .with(PANEL_EDGE.patch(theme::SUBTLE))
-        .with(Ellipsis(true))
-        .text(buf, label);
-    row.with(PANEL_EDGE.patch(theme::TEXT))
-        .with(Ellipsis(true))
-        .text(buf, value);
-}
-
-fn draw_settings_controls(
-    area: Rect,
-    buf: &mut Buffer,
-    settings: &mut SettingsDraft,
-    focus: SettingsFocus,
-    dirty: bool,
-    capture: Option<&StatsSnapshot>,
-) {
-    if area.is_empty() {
-        return;
-    }
-    buf.clear_rect(area, theme::BACKGROUND);
-    let mut rows = area;
-    vu::draw_settings_vu_row(rows.take_top(1), buf, capture, false);
-    draw_settings_row(
-        rows.take_top(1),
-        buf,
-        "Bitrate",
-        &format!("{} kbps", settings.bitrate_bps() / 1000),
-        focus == SettingsFocus::Bitrate,
-        dirty,
-    );
-    draw_settings_row(
-        rows.take_top(1),
-        buf,
-        "Denoise",
-        if settings.denoise { "on" } else { "off" },
-        focus == SettingsFocus::Denoise,
-        dirty,
-    );
-    draw_settings_row(
-        rows.take_top(1),
-        buf,
-        "Echo Cancellation",
-        if settings.echo_cancellation {
-            "on"
-        } else {
-            "off"
-        },
-        focus == SettingsFocus::EchoCancellation,
-        dirty,
-    );
-    let amplification = settings.max_amplification();
-    let amplification_label = if amplification <= 0.0 {
-        "off".to_string()
-    } else {
-        format!("{amplification:.0} dB")
-    };
-    draw_settings_row(
-        rows.take_top(1),
-        buf,
-        "Max. Amplification",
-        &amplification_label,
-        focus == SettingsFocus::Amplification,
-        dirty,
-    );
-    draw_settings_input_row(
-        rows.take_top(1),
-        buf,
-        "Input Buffer",
-        settings,
-        SettingsFocus::InputBuffer,
-        focus == SettingsFocus::InputBuffer,
-        dirty,
-    );
-    draw_settings_input_row(
-        rows.take_top(1),
-        buf,
-        "Output Buffer",
-        settings,
-        SettingsFocus::OutputBuffer,
-        focus == SettingsFocus::OutputBuffer,
-        dirty,
-    );
-    rows.take_top(1).with(theme::BACKGROUND).fill(buf);
-    draw_button_row(
-        rows.take_top(1),
-        buf,
-        "Refresh devices",
-        focus == SettingsFocus::Refresh,
-    );
-    draw_button_row(
-        rows.take_top(1),
-        buf,
-        "Save config",
-        focus == SettingsFocus::Save,
-    );
-    draw_button_row(
-        rows.take_top(1),
-        buf,
-        "Back to chat",
-        focus == SettingsFocus::Close,
-    );
-}
-
-/// Renders an editable settings row: the focused row hosts the live [`Editor`]
-/// (with cursor), unfocused rows show the editor's current text.
-fn draw_settings_input_row(
-    area: Rect,
-    buf: &mut Buffer,
-    label: &str,
-    settings: &mut SettingsDraft,
-    field: SettingsFocus,
-    focused: bool,
-    dirty: bool,
-) {
-    let style = if focused {
-        SELECTED_DIM
-    } else {
-        theme::BACKGROUND
-    };
-    buf.clear_rect(area, style);
-    let mut row = area;
-    row.take_left(SETTINGS_LABEL_WIDTH as i32)
-        .with(style.patch(if focused { theme::GOOD } else { theme::MUTED }))
-        .with(Ellipsis(true))
-        .text(buf, label);
-    if row.is_empty() {
-        return;
-    }
-    if focused {
-        settings.focus_buffer_editor(field);
-        settings.editor.render(row, buf);
-    } else {
-        row.with(style.patch(if dirty { theme::WARN } else { theme::TEXT }))
-            .with(Ellipsis(true))
-            .text(buf, &settings.buffer_text(field));
-    }
-}
-
-fn draw_settings_row(
-    area: Rect,
-    buf: &mut Buffer,
-    label: &str,
-    value: &str,
-    focused: bool,
-    dirty: bool,
-) {
-    let style = if focused {
-        SELECTED_DIM
-    } else {
-        theme::BACKGROUND
-    };
-    buf.clear_rect(area, style);
-    let mut row = area;
-    row.take_left(SETTINGS_LABEL_WIDTH as i32)
-        .with(style.patch(if focused { theme::GOOD } else { theme::MUTED }))
-        .with(Ellipsis(true))
-        .text(buf, label);
-    row.with(style.patch(if dirty { theme::WARN } else { theme::TEXT }))
-        .with(Ellipsis(true))
-        .text(buf, value);
-}
-
-fn draw_button_row(area: Rect, buf: &mut Buffer, label: &str, focused: bool) {
-    let style = if focused {
-        SELECTED_DIM
-    } else {
-        theme::BACKGROUND
-    };
-    buf.clear_rect(area, style);
-    area.with(style.patch(if focused { theme::GOOD } else { theme::TEXT }))
-        .text(buf, "  ")
-        .text(buf, label);
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn settings_layout_preserves_device_picker_rows() {
-        assert_eq!(settings_controls_height(7, 3), 3);
-        assert_eq!(settings_controls_height(16, 3), SETTINGS_CONTROLS_ROWS);
+    fn input_section_expands_for_open_input_picker() {
+        assert_eq!(input_section_height(14, true, false), 10);
+        assert_eq!(input_section_height(8, true, false), 8);
     }
 
     #[test]
-    fn settings_layout_keeps_full_controls_for_default_only_picker() {
-        assert_eq!(settings_controls_height(7, 1), 6);
+    fn output_picker_keeps_input_section_compact() {
+        assert_eq!(input_section_height(14, false, true), 7);
+    }
+
+    #[test]
+    fn focus_order_matches_rendered_settings_layout() {
+        let mut expected = vec![SettingsFocus::InputDevice];
+        expected.extend(INPUT_ROWS);
+        expected.push(SettingsFocus::OutputDevice);
+        expected.extend(OUTPUT_ROWS);
+        expected.extend(ACTION_ROWS);
+
+        assert_eq!(SettingsFocus::ORDER.as_slice(), expected.as_slice());
+    }
+
+    #[test]
+    fn detail_wraps_on_word_boundaries() {
+        assert_eq!(
+            wrap_detail("one two three four", 8),
+            vec![
+                "one two".to_string(),
+                "three".to_string(),
+                "four".to_string()
+            ]
+        );
     }
 }
