@@ -6,11 +6,13 @@ use std::{
 use crate::{
     audio::shared::{
         DELAY_BUCKET_MS, DELAY_BUCKETS, DELAY_FORGET_FACTOR, DELAY_QUANTILE,
-        LIVE_OPUS_FRAME_SAMPLES, LIVE_PACKET_FLAG_OPUS_RESET, LIVE_PACKET_FLAG_SILENCE_HINT,
-        LIVE_PACKET_FLAG_SILENCE_RESUME, LIVE_PLAYBACK_FEEDBACK_INTERVAL,
-        LIVE_PLAYBACK_FEEDBACK_PACKETS, LiveAudioTuning, LivePlaybackFeedback, PlayoutDelay,
-        SAMPLE_RATE, clamp_u16_from_u32, clamp_u16_from_u64, duration_abs_delta_ms, duration_to_ms,
-        sequence_distance_forward, sequence_is_before, sequence_max_forward,
+        DELAY_RESAMPLE_INTERVAL, LIVE_OPUS_FRAME_SAMPLES, LIVE_PACKET_FLAG_OPUS_RESET,
+        LIVE_PACKET_FLAG_SILENCE_HINT, LIVE_PACKET_FLAG_SILENCE_RESUME,
+        LIVE_PLAYBACK_FEEDBACK_INTERVAL, LIVE_PLAYBACK_FEEDBACK_PACKETS, LiveAudioTuning,
+        LivePlaybackFeedback, MS_PER_LOSS_PERCENT, PlayoutDelay, REORDER_FORGET_FACTOR,
+        SAMPLE_RATE, START_FORGET_WEIGHT, clamp_u16_from_u32, clamp_u16_from_u64,
+        duration_abs_delta_ms, duration_to_ms, sequence_distance_forward, sequence_is_before,
+        sequence_max_forward,
     },
     network::{InsertOutcome, PlayoutItem},
 };
@@ -24,20 +26,28 @@ const SILENCE_GAP_MAX_SEQUENCE_DISTANCE: u32 = 10;
 pub(crate) struct DelayHistogram {
     buckets: [f32; DELAY_BUCKETS],
     forget_factor: f32,
+    base_forget_factor: f32,
+    add_count: u32,
 }
 
 impl Default for DelayHistogram {
     fn default() -> Self {
+        Self::with_forget_factor(DELAY_FORGET_FACTOR)
+    }
+}
+
+impl DelayHistogram {
+    fn with_forget_factor(base_forget_factor: f32) -> Self {
         let mut buckets = [0.0; DELAY_BUCKETS];
         buckets[0] = 1.0;
         Self {
             buckets,
             forget_factor: 0.0,
+            base_forget_factor,
+            add_count: 0,
         }
     }
-}
 
-impl DelayHistogram {
     fn add(&mut self, relative_delay_ms: f64) {
         let bucket = ((relative_delay_ms.max(0.0) / DELAY_BUCKET_MS as f64).floor() as usize)
             .min(DELAY_BUCKETS - 1);
@@ -51,8 +61,11 @@ impl DelayHistogram {
                 *value /= sum;
             }
         }
-        self.forget_factor += (DELAY_FORGET_FACTOR - self.forget_factor) * 0.25;
-        self.forget_factor = self.forget_factor.clamp(0.0, DELAY_FORGET_FACTOR);
+        self.add_count = self.add_count.saturating_add(1);
+        if self.forget_factor != self.base_forget_factor {
+            let forget = 1.0 - START_FORGET_WEIGHT / (self.add_count as f32 + 1.0);
+            self.forget_factor = forget.clamp(0.0, self.base_forget_factor);
+        }
     }
 
     fn quantile(&self, probability: f32) -> usize {
@@ -66,6 +79,10 @@ impl DelayHistogram {
         }
         DELAY_BUCKETS - 1
     }
+
+    fn buckets(&self) -> &[f32; DELAY_BUCKETS] {
+        &self.buckets
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -74,7 +91,6 @@ struct ForwardArrival {
     arrived_at: Instant,
 }
 
-#[derive(Default)]
 pub(crate) struct LivePlaybackFeedbackState {
     window_started_at: Option<Instant>,
     highest_contiguous_sequence: Option<u32>,
@@ -91,6 +107,32 @@ pub(crate) struct LivePlaybackFeedbackState {
     forward_arrivals: VecDeque<ForwardArrival>,
     underrun_histogram: DelayHistogram,
     reorder_histogram: DelayHistogram,
+    resample_interval_started_at: Option<Instant>,
+    max_delay_in_interval_ms: f64,
+}
+
+impl Default for LivePlaybackFeedbackState {
+    fn default() -> Self {
+        Self {
+            window_started_at: None,
+            highest_contiguous_sequence: None,
+            expected_packets: 0,
+            lost_packets: 0,
+            late_packets: 0,
+            duplicate_packets: 0,
+            reordered_packets: 0,
+            max_queue_ms: 0,
+            max_interarrival_jitter_ms: 0,
+            highest_arrived_sequence: None,
+            last_forward_arrival: None,
+            silence_hint_sequence: None,
+            forward_arrivals: VecDeque::new(),
+            underrun_histogram: DelayHistogram::default(),
+            reorder_histogram: DelayHistogram::with_forget_factor(REORDER_FORGET_FACTOR),
+            resample_interval_started_at: None,
+            max_delay_in_interval_ms: 0.0,
+        }
+    }
 }
 
 impl LivePlaybackFeedbackState {
@@ -165,12 +207,13 @@ impl LivePlaybackFeedbackState {
                     self.last_forward_arrival = Some((sequence, now));
                     self.note_forward_arrival(sequence, now);
                     if let Some(delay) = self.arrival_delay_for_sequence(sequence, now) {
-                        self.underrun_histogram
-                            .add(delay.as_micros() as f64 / 1_000.0);
+                        self.feed_underrun_delay(delay.as_micros() as f64 / 1_000.0, now);
                     }
+                    self.reorder_histogram.add(0.0);
                 } else if self.last_forward_arrival.is_none() {
                     self.last_forward_arrival = Some((sequence, now));
                     self.note_forward_arrival(sequence, now);
+                    self.reorder_histogram.add(0.0);
                 }
                 self.update_silence_hint(sequence, flags);
                 self.highest_arrived_sequence = Some(
@@ -231,12 +274,29 @@ impl LivePlaybackFeedbackState {
             .add(reorder_delay.as_micros() as f64 / 1_000.0);
     }
 
+    fn feed_underrun_delay(&mut self, delay_ms: f64, now: Instant) {
+        match self.resample_interval_started_at {
+            Some(started) if now.saturating_duration_since(started) > DELAY_RESAMPLE_INTERVAL => {
+                self.underrun_histogram.add(self.max_delay_in_interval_ms);
+                self.resample_interval_started_at = Some(now);
+                self.max_delay_in_interval_ms = 0.0;
+            }
+            Some(_) => {}
+            None => {
+                self.resample_interval_started_at = Some(now);
+            }
+        }
+        self.max_delay_in_interval_ms = self.max_delay_in_interval_ms.max(delay_ms);
+    }
+
     fn reset_delay_estimator(&mut self, sequence: u32, now: Instant) {
         self.last_forward_arrival = Some((sequence, now));
         self.silence_hint_sequence = None;
         self.forward_arrivals.clear();
         self.underrun_histogram = DelayHistogram::default();
-        self.reorder_histogram = DelayHistogram::default();
+        self.reorder_histogram = DelayHistogram::with_forget_factor(REORDER_FORGET_FACTOR);
+        self.resample_interval_started_at = None;
+        self.max_delay_in_interval_ms = 0.0;
         self.note_forward_arrival(sequence, now);
     }
 
@@ -346,10 +406,39 @@ impl LivePlaybackFeedbackState {
 
     pub(crate) fn recommended_target(&self, tuning: &LiveAudioTuning) -> Duration {
         let underrun_bucket = self.underrun_histogram.quantile(DELAY_QUANTILE);
-        let reorder_bucket = self.reorder_histogram.quantile(DELAY_QUANTILE);
-        let bucket = underrun_bucket.max(reorder_bucket);
-        let optimal = Duration::from_millis((1 + bucket) as u64 * DELAY_BUCKET_MS);
-        optimal.clamp(tuning.dynamic_target_floor, tuning.max_target)
+        let underrun_ms = (1 + underrun_bucket) as f64 * DELAY_BUCKET_MS as f64;
+        let reorder_bucket = self.reorder_cost_bucket(underrun_ms);
+        let reorder_ms = (1 + reorder_bucket) as f64 * DELAY_BUCKET_MS as f64;
+        let optimal = Duration::from_millis(underrun_ms.max(reorder_ms) as u64);
+        let floor = tuning.dynamic_target_floor.max(tuning.base_minimum_target);
+        let capacity_cap =
+            Duration::from_millis(duration_to_ms(tuning.hard_queue_bound).saturating_mul(3) / 4);
+        let ceiling = tuning.max_target.min(capacity_cap);
+        if floor > ceiling {
+            return ceiling;
+        }
+        optimal.clamp(floor, ceiling)
+    }
+
+    fn reorder_cost_bucket(&self, base_delay_ms: f64) -> usize {
+        let mut loss_probability = 1.0_f64;
+        let mut min_cost = f64::INFINITY;
+        let mut min_bucket = 0;
+
+        for (index, mass) in self.reorder_histogram.buckets().iter().enumerate() {
+            loss_probability = (loss_probability - f64::from(*mass)).max(0.0);
+            let delay_ms = (index as f64 * DELAY_BUCKET_MS as f64 - base_delay_ms).max(0.0);
+            let cost = delay_ms + 100.0 * MS_PER_LOSS_PERCENT as f64 * loss_probability;
+            if cost < min_cost {
+                min_cost = cost;
+                min_bucket = index;
+            }
+            if loss_probability <= f64::EPSILON {
+                break;
+            }
+        }
+
+        min_bucket
     }
 
     pub(crate) fn playout_delay(&self, sequence: u32, now: Instant) -> Option<PlayoutDelay> {
@@ -583,6 +672,129 @@ mod tests {
     }
 
     #[test]
+    fn histogram_first_sample_takes_full_weight() {
+        let mut histogram = DelayHistogram::default();
+
+        histogram.add(200.0);
+
+        assert_eq!(histogram.quantile(0.95), 10);
+    }
+
+    #[test]
+    fn interval_max_dominates_over_clean_burst() {
+        let tuning = test_tuning();
+        let start = Instant::now();
+        let mut feedback = LivePlaybackFeedbackState::default();
+
+        feedback.feed_underrun_delay(120.0, start);
+        for offset_ms in [20, 40, 60, 80, 100, 120, 140, 160] {
+            feedback.feed_underrun_delay(0.0, start + Duration::from_millis(offset_ms));
+        }
+        feedback.feed_underrun_delay(
+            0.0,
+            start + DELAY_RESAMPLE_INTERVAL + Duration::from_millis(1),
+        );
+
+        assert!(
+            feedback.recommended_target(&tuning) >= Duration::from_millis(120),
+            "{:?}",
+            feedback.recommended_target(&tuning)
+        );
+    }
+
+    #[test]
+    fn target_tracks_jitter_envelope_not_packet_rate() {
+        fn feed_pattern(packet_ms: u64) -> Duration {
+            let tuning = test_tuning();
+            let start = Instant::now();
+            let mut feedback = LivePlaybackFeedbackState::default();
+
+            for interval in 0..12 {
+                let base = start + Duration::from_millis(interval * 600);
+                feedback.feed_underrun_delay(80.0, base);
+                let mut offset_ms = packet_ms;
+                while offset_ms < 500 {
+                    feedback.feed_underrun_delay(0.0, base + Duration::from_millis(offset_ms));
+                    offset_ms += packet_ms;
+                }
+            }
+            feedback.feed_underrun_delay(0.0, start + Duration::from_millis(12 * 600));
+            feedback.recommended_target(&tuning)
+        }
+
+        let dense = feed_pattern(20);
+        let sparse = feed_pattern(40);
+
+        assert!(
+            duration_abs_delta_ms(dense, sparse) <= DELAY_BUCKET_MS,
+            "dense={dense:?} sparse={sparse:?}"
+        );
+    }
+
+    #[test]
+    fn mild_reorder_does_not_pin_deep_target() {
+        let tuning = test_tuning();
+        let mut feedback = LivePlaybackFeedbackState::default();
+
+        feedback.underrun_histogram.add(0.0);
+        for _ in 0..200 {
+            feedback.reorder_histogram.add(0.0);
+        }
+        for _ in 0..3 {
+            feedback.reorder_histogram.add(180.0);
+        }
+
+        assert!(
+            feedback.recommended_target(&tuning) <= tuning.target_queue,
+            "{:?}",
+            feedback.recommended_target(&tuning)
+        );
+    }
+
+    #[test]
+    fn persistent_reorder_raises_target() {
+        let tuning = test_tuning();
+        let mut feedback = LivePlaybackFeedbackState::default();
+
+        for _ in 0..40 {
+            feedback.reorder_histogram.add(180.0);
+        }
+
+        assert!(
+            feedback.recommended_target(&tuning) > tuning.target_queue,
+            "{:?}",
+            feedback.recommended_target(&tuning)
+        );
+    }
+
+    #[test]
+    fn base_minimum_target_raises_floor() {
+        let mut tuning = test_tuning();
+        tuning.base_minimum_target = Duration::from_millis(100);
+        let feedback = LivePlaybackFeedbackState::default();
+
+        assert_eq!(
+            feedback.recommended_target(&tuning),
+            tuning.base_minimum_target
+        );
+    }
+
+    #[test]
+    fn capacity_cap_bounds_target_below_buffer() {
+        let mut tuning = test_tuning();
+        tuning.max_target = Duration::from_millis(200);
+        tuning.hard_queue_bound = Duration::from_millis(200);
+        let mut feedback = LivePlaybackFeedbackState::default();
+
+        feedback.underrun_histogram.add(1_000.0);
+
+        assert_eq!(
+            feedback.recommended_target(&tuning),
+            Duration::from_millis(150)
+        );
+    }
+
+    #[test]
     fn playback_feedback_histogram_reacts_to_late_arrivals() {
         let tuning = test_tuning();
         let mut feedback = LivePlaybackFeedbackState::default();
@@ -714,6 +926,12 @@ mod tests {
             &InsertOutcome::Accepted,
             start + Duration::from_secs(2),
         );
+        feedback.observe_insert(
+            2,
+            0,
+            &InsertOutcome::Accepted,
+            start + Duration::from_secs(2) + DELAY_RESAMPLE_INTERVAL + Duration::from_millis(1),
+        );
 
         assert!(
             feedback.recommended_target(&tuning) > tuning.target_queue,
@@ -737,14 +955,20 @@ mod tests {
             &InsertOutcome::Accepted,
             start + Duration::from_secs(2),
         );
+        feedback.observe_insert(
+            2,
+            0,
+            &InsertOutcome::Accepted,
+            start + Duration::from_secs(2) + DELAY_RESAMPLE_INTERVAL + Duration::from_millis(1),
+        );
         assert!(
             feedback.recommended_target(&tuning) > tuning.target_queue,
             "{:?}",
             feedback.recommended_target(&tuning)
         );
 
-        let mut now = start + Duration::from_secs(2);
-        for sequence in 2..500 {
+        let mut now = start + Duration::from_secs(2) + DELAY_RESAMPLE_INTERVAL;
+        for sequence in 3..2_000 {
             now += frame;
             feedback.observe_insert(sequence, 0, &InsertOutcome::Accepted, now);
         }
@@ -769,6 +993,12 @@ mod tests {
             &InsertOutcome::Accepted,
             start + Duration::from_secs(4),
         );
+        feedback.observe_insert(
+            81,
+            0,
+            &InsertOutcome::Accepted,
+            start + Duration::from_secs(4) + DELAY_RESAMPLE_INTERVAL + Duration::from_millis(1),
+        );
 
         assert!(
             feedback.recommended_target(&tuning) > tuning.target_queue,
@@ -791,13 +1021,19 @@ mod tests {
             &InsertOutcome::Accepted,
             start + Duration::from_secs(4),
         );
+        feedback.observe_insert(
+            81,
+            0,
+            &InsertOutcome::Accepted,
+            start + Duration::from_secs(4) + DELAY_RESAMPLE_INTERVAL + Duration::from_millis(1),
+        );
         assert!(feedback.recommended_target(&tuning) > tuning.target_queue);
 
         feedback.observe_insert(
-            81,
+            82,
             LIVE_PACKET_FLAG_OPUS_RESET,
             &InsertOutcome::Accepted,
-            start + Duration::from_millis(4_020),
+            start + Duration::from_millis(4_540),
         );
 
         assert_eq!(

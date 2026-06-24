@@ -125,7 +125,11 @@ pub(crate) const TIME_SCALE_MARGIN: Duration = Duration::from_millis(20);
 pub(crate) const DELAY_BUCKETS: usize = 100;
 pub(crate) const DELAY_BUCKET_MS: u64 = 20;
 pub(crate) const DELAY_FORGET_FACTOR: f32 = 0.983;
+pub(crate) const REORDER_FORGET_FACTOR: f32 = 0.9993;
+pub(crate) const START_FORGET_WEIGHT: f32 = 2.0;
+pub(crate) const MS_PER_LOSS_PERCENT: f32 = 20.0;
 pub(crate) const DELAY_QUANTILE: f32 = 0.95;
+pub(crate) const DELAY_RESAMPLE_INTERVAL: Duration = Duration::from_millis(500);
 pub(crate) const LIVE_CAPTURE_LONG_SILENCE_STOP: Duration = Duration::from_millis(200);
 pub(crate) const LIVE_CAPTURE_SILENCE_PREROLL: Duration = Duration::from_millis(30);
 pub(crate) const LIVE_CAPTURE_SILENCE_RAMP: Duration = Duration::from_millis(10);
@@ -198,6 +202,7 @@ pub struct LiveAudioTuning {
     pub adaptive_target: bool,
     pub target_queue: Duration,
     pub dynamic_target_floor: Duration,
+    pub base_minimum_target: Duration,
     pub max_target: Duration,
     pub hard_queue_bound: Duration,
     pub initial_buffer: Duration,
@@ -217,6 +222,7 @@ impl Default for LiveAudioTuning {
             adaptive_target: true,
             target_queue: LIVE_PLAYBACK_TARGET_QUEUE,
             dynamic_target_floor: LIVE_PLAYBACK_DYNAMIC_TARGET_FLOOR,
+            base_minimum_target: Duration::ZERO,
             max_target: LIVE_PLAYBACK_MAX_TARGET,
             hard_queue_bound: LIVE_PLAYBACK_HARD_QUEUE_BOUND,
             initial_buffer: LIVE_PLAYBACK_INITIAL_BUFFER,
@@ -239,6 +245,7 @@ impl LiveAudioTuning {
             20,
             1_000,
         )?;
+        validate_duration_ms("base-minimum-target-ms", self.base_minimum_target, 0, 2_000)?;
         validate_duration_ms("max-target-ms", self.max_target, 20, 2_000)?;
         validate_duration_ms("hard-queue-bound-ms", self.hard_queue_bound, 40, 5_000)?;
         validate_duration_ms("initial-buffer-ms", self.initial_buffer, 0, 500)?;
@@ -263,11 +270,22 @@ impl LiveAudioTuning {
         if self.dynamic_target_floor > self.target_queue {
             return Err("dynamic-target-floor-ms must not exceed target-queue-ms".to_string());
         }
+        if self.base_minimum_target > self.max_target {
+            return Err("base-minimum-target-ms must not exceed max-target-ms".to_string());
+        }
         if self.max_target < self.target_queue {
             return Err("max-target-ms must be at least target-queue-ms".to_string());
         }
         if self.hard_queue_bound < self.max_target {
             return Err("hard-queue-bound-ms must be at least max-target-ms".to_string());
+        }
+        let capacity_target_cap =
+            Duration::from_millis(duration_to_ms(self.hard_queue_bound).saturating_mul(3) / 4);
+        if self.dynamic_target_floor.max(self.base_minimum_target) > capacity_target_cap {
+            return Err(
+                "dynamic-target-floor-ms/base-minimum-target-ms must not exceed 75% of hard-queue-bound-ms"
+                    .to_string(),
+            );
         }
         Ok(())
     }
