@@ -429,8 +429,30 @@ pub(crate) fn drain_file_playback_feedback(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Arc, Mutex};
+
     use super::*;
-    use crate::audio::shared::{DEFAULT_LIVE_MAX_AMPLIFICATION, LIVE_PACKET_FLAG_OPUS_RESET};
+    use crate::{
+        audio::{
+            playback::{LiveDecodeStreams, LivePlaybackMixer},
+            shared::{
+                DEFAULT_LIVE_MAX_AMPLIFICATION, LIVE_OPUS_FRAME_SAMPLES,
+                LIVE_PACKET_FLAG_OPUS_RESET, frames_for_duration,
+            },
+        },
+        network::InsertOutcome,
+    };
+
+    const SOUNDBOARD_RANDOM60_SEED: u64 = 8_388_357_047_376_790_533;
+
+    #[derive(Debug)]
+    struct HeadlessSoundboardPlaybackReport {
+        source: LiveAudioFileSourceReport,
+        final_snapshot: LivePlaybackSnapshot,
+        max_queue_ms: u64,
+        voice_packets_received: u64,
+        voice_bytes_received: u64,
+    }
 
     fn file_source_test_config(first_sequence: u32) -> LiveAudioFileSourceConfig {
         LiveAudioFileSourceConfig {
@@ -443,6 +465,226 @@ mod tests {
             denoise: false,
             auto_gain: false,
         }
+    }
+
+    fn soundboard_random60_test_config() -> LiveAudioFileSourceConfig {
+        LiveAudioFileSourceConfig {
+            input_path: PathBuf::from("assets/sample-001.opus"),
+            tuning: LiveAudioTuning::default(),
+            packet_loss: LiveAudioPacketLossProfile::Random60,
+            seed: SOUNDBOARD_RANDOM60_SEED,
+            first_sequence: 0,
+            max_amplification: 1.0,
+            denoise: true,
+            auto_gain: true,
+        }
+    }
+
+    fn run_headless_soundboard_playback(
+        config: LiveAudioFileSourceConfig,
+        input_pcm: &[f32],
+    ) -> Result<HeadlessSoundboardPlaybackReport, String> {
+        config.tuning.validate()?;
+        if input_pcm.is_empty() {
+            return Err("headless soundboard playback requires input samples".to_string());
+        }
+
+        let source_frames = input_pcm.len().div_ceil(FRAME_SAMPLES);
+        let padded_frames = source_frames + (source_frames % 2);
+        let input_duration = Duration::from_secs_f64(
+            source_frames.saturating_mul(FRAME_SAMPLES) as f64 / SAMPLE_RATE as f64,
+        );
+        let sim_config = LiveAudioSimulationConfig {
+            scenario: LiveAudioSimulationScenario::LossySpeech,
+            tuning: config.tuning,
+            duration: input_duration,
+            producer_clock_ratio: 1.0,
+            output_block_samples: LIVE_OPUS_FRAME_SAMPLES,
+            streams: 1,
+            seed: config.seed,
+            packet_loss: config.packet_loss,
+            max_amplification: config.max_amplification,
+            denoise: config.denoise,
+            auto_gain: config.auto_gain,
+            echo_cancellation: false,
+            capture_dc_offset: 0.0,
+            capture_noise_rms: 0.0,
+        };
+        let mut state =
+            SimStreamState::new(sim_config, simulation_encoder_profile(sim_config), None)?;
+        state.next_sequence = config.first_sequence;
+        let mut rng = SimRng::new(config.seed);
+        let mut sim_report = LiveAudioSimulationReport {
+            scenario: "headless_soundboard",
+            ..Default::default()
+        };
+        let mut source_report = LiveAudioFileSourceReport {
+            input_samples: input_pcm.len(),
+            input_ms: samples_to_ms(input_pcm.len()),
+            next_sequence: config.first_sequence,
+            ..Default::default()
+        };
+        let mixer = Arc::new(Mutex::new(LivePlaybackMixer::with_tuning(config.tuning)));
+        let mut decode_streams = LiveDecodeStreams::new(config.tuning);
+        let mut trace = None;
+        let start = Instant::now();
+        let frame_duration = Duration::from_secs_f64(FRAME_SAMPLES as f64 / SAMPLE_RATE as f64);
+        let drain_frames = frames_for_duration(
+            config
+                .tuning
+                .initial_buffer
+                .saturating_add(config.tuning.max_reorder_delay)
+                .saturating_add(config.tuning.target_queue)
+                .saturating_add(Duration::from_millis(500)),
+        )
+        .saturating_add(2);
+        let mut max_queue_ms = 0;
+        let mut voice_packets_received = 0u64;
+        let mut voice_bytes_received = 0u64;
+
+        for frame_index in 0..padded_frames.saturating_add(drain_frames) {
+            let now = start + frame_duration.saturating_mul(frame_index as u32);
+            if frame_index < padded_frames {
+                let mut frame = vec![0.0f32; FRAME_SAMPLES];
+                let offset = frame_index.saturating_mul(FRAME_SAMPLES);
+                if offset < input_pcm.len() {
+                    let end = offset.saturating_add(FRAME_SAMPLES).min(input_pcm.len());
+                    frame[..end - offset].copy_from_slice(&input_pcm[offset..end]);
+                    sim_report.generated_frames = sim_report.generated_frames.saturating_add(1);
+                }
+
+                state.encode_and_queue_frame(
+                    sim_config,
+                    1,
+                    frame_index,
+                    &frame,
+                    now,
+                    start,
+                    &mut rng,
+                    &mut sim_report,
+                    &mut trace,
+                )?;
+            }
+
+            for packet in state.network.drain_ready(now) {
+                let reordered = state
+                    .network
+                    .highest_arrived_sequence
+                    .is_some_and(|sequence| packet.packet.sequence < sequence);
+                if reordered {
+                    sim_report.reordered_frames = sim_report.reordered_frames.saturating_add(1);
+                }
+                state.network.highest_arrived_sequence = Some(
+                    state
+                        .network
+                        .highest_arrived_sequence
+                        .map_or(packet.packet.sequence, |sequence| {
+                            sequence.max(packet.packet.sequence)
+                        }),
+                );
+
+                let silence = packet.packet.payload.is_silence();
+                voice_packets_received = voice_packets_received.saturating_add(1);
+                voice_bytes_received =
+                    voice_bytes_received.saturating_add(packet.packet.payload.len() as u64);
+                match decode_streams.insert_packet(packet.packet, now) {
+                    Some(InsertOutcome::Accepted) if !silence => {
+                        sim_report.delivered_frames = sim_report.delivered_frames.saturating_add(1);
+                    }
+                    Some(InsertOutcome::Late) => {
+                        sim_report.late_frames = sim_report.late_frames.saturating_add(1);
+                    }
+                    _ => {}
+                }
+            }
+
+            let before_recovery_frames = mixer
+                .lock()
+                .map(|mixer| {
+                    mixer
+                        .stats
+                        .dred_recoveries
+                        .saturating_add(mixer.stats.plc_fallbacks)
+                })
+                .unwrap_or_default();
+            decode_streams.drain_into_mixer_with_trace(&mixer, now, start, &mut trace, None);
+            let after_recovery_frames = mixer
+                .lock()
+                .map(|mixer| {
+                    mixer
+                        .stats
+                        .dred_recoveries
+                        .saturating_add(mixer.stats.plc_fallbacks)
+                })
+                .unwrap_or(before_recovery_frames);
+            sim_report.missing_frames = sim_report
+                .missing_frames
+                .saturating_add(after_recovery_frames.saturating_sub(before_recovery_frames));
+
+            if frame_index % (LIVE_OPUS_FRAME_SAMPLES / FRAME_SAMPLES) == 0 {
+                let mut mixer = mixer
+                    .lock()
+                    .map_err(|_| "headless soundboard mixer lock poisoned")?;
+                for _ in 0..LIVE_OPUS_FRAME_SAMPLES {
+                    let _ = mixer.pop_mixed_output_sample(now, LIVE_OPUS_FRAME_SAMPLES);
+                }
+                max_queue_ms = max_queue_ms.max(mixer.snapshot_at(now).max_queue_ms);
+            }
+        }
+
+        source_report.generated_frames = sim_report.generated_frames;
+        source_report.queued_packets = sim_report.queued_frames;
+        source_report.delivered_packets = sim_report.delivered_frames;
+        source_report.dropped_packets = sim_report.lost_frames;
+        source_report.reordered_packets = sim_report.reordered_frames;
+        source_report.suppressed_frames = state.suppressed_frames();
+        source_report.next_sequence = state.next_sequence;
+        let final_snapshot = mixer
+            .lock()
+            .map_err(|_| "headless soundboard mixer lock poisoned")?
+            .snapshot_at(start + input_duration);
+        max_queue_ms = max_queue_ms.max(final_snapshot.max_queue_ms);
+
+        Ok(HeadlessSoundboardPlaybackReport {
+            source: source_report,
+            final_snapshot,
+            max_queue_ms,
+            voice_packets_received,
+            voice_bytes_received,
+        })
+    }
+
+    fn soundboard_audio_summary(report: &HeadlessSoundboardPlaybackReport) -> String {
+        let snapshot = &report.final_snapshot;
+        format!(
+            "playbackqueue: max {}ms, target {}ms (base {}ms)\n\
+             timing: accelerate {}ms / {}, expand {}ms / {}\n\
+             recovery: dred {}, plc {}, trims {}, underruns {}\n\
+             active streams: {}, queued {} samples\n\
+             networkvoice rx: {} packets / {}B\n\
+             source: generated {}, queued {}, delivered {}, dropped {}, reordered {}, suppressed {}",
+            report.max_queue_ms,
+            snapshot.adaptive_target_ms,
+            snapshot.target_queue_ms,
+            samples_to_ms(snapshot.accelerate_samples as usize),
+            snapshot.accelerate_count,
+            samples_to_ms(snapshot.expand_samples as usize),
+            snapshot.expand_count,
+            snapshot.dred_recoveries,
+            snapshot.plc_fallbacks,
+            snapshot.hard_trim_count,
+            snapshot.underrun_count,
+            snapshot.active_streams,
+            snapshot.queued_samples,
+            report.voice_packets_received,
+            report.voice_bytes_received,
+            report.source.generated_frames,
+            report.source.queued_packets,
+            report.source.delivered_packets,
+            report.source.dropped_packets,
+            report.source.reordered_packets,
+            report.source.suppressed_frames,
+        )
     }
 
     #[test]
@@ -485,6 +727,30 @@ mod tests {
                 .iter()
                 .all(|(_, flags)| flags & LIVE_PACKET_FLAG_OPUS_RESET == 0),
             "only the first packet of a fresh file-source encoder should reset Opus"
+        );
+    }
+
+    #[test]
+    fn soundboard_random60_uses_dred_for_most_missing_frames() {
+        let input_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("assets/sample-001.opus");
+        let input = decode_audio_file_with_ffmpeg(&input_path)
+            .expect("assets/sample-001.opus should decode through ffmpeg");
+        let report =
+            run_headless_soundboard_playback(soundboard_random60_test_config(), &input).unwrap();
+        let summary = soundboard_audio_summary(&report);
+        eprintln!("{summary}");
+
+        assert!(
+            (700..=900).contains(&report.voice_packets_received),
+            "soundboard random_60 packet count should match the production-shaped run:\n{summary}"
+        );
+        assert!(
+            report.final_snapshot.dred_recoveries >= 1_000,
+            "DRED should recover almost every missing random_60 frame:\n{summary}"
+        );
+        assert!(
+            report.final_snapshot.plc_fallbacks <= 10,
+            "PLC should be rare when DRED is active:\n{summary}"
         );
     }
 }

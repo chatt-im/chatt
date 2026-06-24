@@ -1397,7 +1397,7 @@ mod tests {
         // variation, not absolute one-way latency.
         assert_eq!(report.lost_frames, 0, "{report:?}");
         assert!(
-            report.steady_state_adaptive_target_ms <= 30,
+            report.steady_state_adaptive_target_ms < duration_to_ms(test_tuning().target_queue),
             "steady-delay link did not relax the target: {report:?}"
         );
         assert_eq!(report.steady_state_underruns, 0, "{report:?}");

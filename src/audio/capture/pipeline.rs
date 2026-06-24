@@ -385,30 +385,20 @@ impl LiveEncoderPipeline {
             if self.silence_resume_hint_packets > 0 {
                 flags |= LIVE_PACKET_FLAG_SILENCE_RESUME;
             }
-            match encode_live_frame(
+            let payload = encode_live_frame(
                 &self.pending_opus_samples[..LIVE_OPUS_FRAME_SAMPLES],
                 &mut self.encoder,
                 &mut self.opus_frame,
                 &mut self.encoded,
-            )? {
-                VoiceEncodeResult::Opus(payload) => {
-                    if self.silence_resume_hint_packets > 0 {
-                        self.silence_resume_hint_packets -= 1;
-                    }
-                    let packet_len = payload.len();
-                    self.sender_silence_active = false;
-                    self.silence_keepalive_frames = 0;
-                    on_packet(LocalVoiceFrame { flags, payload });
-                    stats.record_encoded_packet(packet_len);
-                }
-                VoiceEncodeResult::Dtx => {
-                    // DTX produces no Opus frame. Restore the flags so the
-                    // first real Opus frame after this silence still resets the
-                    // decoder and advertises resume.
-                    self.next_opus_packet_flags = flags;
-                    self.maybe_emit_silence_marker(on_packet);
-                }
+            )?;
+            if self.silence_resume_hint_packets > 0 {
+                self.silence_resume_hint_packets -= 1;
             }
+            let packet_len = payload.len();
+            self.sender_silence_active = false;
+            self.silence_keepalive_frames = 0;
+            on_packet(LocalVoiceFrame { flags, payload });
+            stats.record_encoded_packet(packet_len);
             self.pending_opus_samples.drain(..LIVE_OPUS_FRAME_SAMPLES);
         }
 
@@ -496,20 +486,10 @@ pub(crate) fn encode_live_frame(
     encoder: &mut OpusVoiceEncoder,
     opus_frame: &mut [i16],
     encoded: &mut [u8],
-) -> Result<VoiceEncodeResult, String> {
+) -> Result<VoicePayload, String> {
     convert_i16_scale_to_pcm_i16(frame, opus_frame);
     let packet_len = encoder.encode(opus_frame, encoded)?;
-    if encoder.in_dtx()? {
-        return Ok(VoiceEncodeResult::Dtx);
-    }
-    Ok(VoiceEncodeResult::Opus(VoicePayload::Opus(
-        encoded[..packet_len].to_vec(),
-    )))
-}
-
-pub(crate) enum VoiceEncodeResult {
-    Opus(VoicePayload),
-    Dtx,
+    Ok(VoicePayload::Opus(encoded[..packet_len].to_vec()))
 }
 
 pub(crate) struct FrameAccumulator {
@@ -737,7 +717,7 @@ mod tests {
     }
 
     #[test]
-    fn dtx_silence_marker_marks_next_opus_packet_as_resume() {
+    fn silence_marker_marks_next_opus_packet_as_resume() {
         let mut pipeline = build_live_encoder_pipeline(
             test_tuning(),
             false,
