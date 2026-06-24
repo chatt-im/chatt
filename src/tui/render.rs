@@ -54,21 +54,29 @@ pub(crate) fn render(app: &mut App, buf: &mut Buffer) {
         draw_room_title(title_area, app, buf);
     }
 
-    match app.mode {
-        theme::UiMode::Settings => ui::settings::draw_settings(
+    if app.mode == theme::UiMode::Settings {
+        draw_composer(composer_area, app, buf);
+        buf.hide_cursor();
+        ui::settings::draw_settings(
             screen,
             buf,
             &mut app.settings,
-            app.settings_focus,
+            &mut app.settings_form,
             app.settings_dirty,
             capture.as_ref(),
             &app.audio_input_items,
             &mut app.audio_input_picker,
             &app.audio_output_items,
             &mut app.audio_output_picker,
-        ),
+        );
+        draw_status(status_area, app, buf, capture.as_ref());
+        draw_volume_dialog(buf.rect(), app, buf);
+        return;
+    }
+
+    match app.mode {
         theme::UiMode::Compose | theme::UiMode::Log => draw_chat(screen, app, buf),
-        theme::UiMode::ServerSelect | theme::UiMode::ServerEdit => {}
+        theme::UiMode::Settings | theme::UiMode::ServerSelect | theme::UiMode::ServerEdit => {}
     }
     draw_status(status_area, app, buf, capture.as_ref());
     draw_composer(composer_area, app, buf);

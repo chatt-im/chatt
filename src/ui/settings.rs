@@ -6,7 +6,10 @@ use crate::{
         selected_audio_input_label, selected_audio_output_label,
     },
     theme,
-    tui::widgets,
+    tui::{
+        form::{FormFieldKind, FormState},
+        widgets,
+    },
     ui::vu,
 };
 use extui::{Buffer, Ellipsis, HAlign, Rect, Style, vt::Modifier};
@@ -27,22 +30,21 @@ const ACTION_ROWS: [SettingsFocus; 3] = [
     SettingsFocus::Save,
     SettingsFocus::Close,
 ];
-const INPUT_ROWS: [SettingsFocus; 5] = [
+const CAPTURE_ROWS: [SettingsFocus; 5] = [
     SettingsFocus::Bitrate,
     SettingsFocus::Denoise,
     SettingsFocus::EchoCancellation,
     SettingsFocus::Amplification,
-    SettingsFocus::InputBuffer,
+    SettingsFocus::CaptureBuffer,
 ];
-const OUTPUT_ROWS: [SettingsFocus; 1] = [SettingsFocus::OutputBuffer];
-const INPUT_FIXED_ROWS: u16 = 2 + INPUT_ROWS.len() as u16;
-const OUTPUT_FIXED_ROWS: u16 = 2 + OUTPUT_ROWS.len() as u16;
+const PLAYBACK_ROWS: [SettingsFocus; 1] = [SettingsFocus::PlaybackBuffer];
+const INTERFACE_ROWS: [SettingsFocus; 1] = [SettingsFocus::FormBindings];
 
 pub fn draw_settings(
     area: Rect,
     buf: &mut Buffer,
     settings: &mut SettingsDraft,
-    focus: SettingsFocus,
+    form: &mut FormState<SettingsFocus>,
     dirty: bool,
     capture: Option<&StatsSnapshot>,
     input_items: &[AudioInputItem],
@@ -58,7 +60,6 @@ pub fn draw_settings(
     let mut rows = area;
     vu::draw_settings_vu_row(rows.take_top(1), buf, capture, false);
 
-    let actions = rows.take_bottom(action_rows(rows.h) as i32);
     let mut body = rows;
     let detail = if body.w >= MIN_DETAIL_SCREEN_WIDTH {
         let mut detail = body.take_right(DETAIL_WIDTH as i32);
@@ -69,25 +70,24 @@ pub fn draw_settings(
         None
     };
 
-    draw_audio_sections(
+    draw_form(
         body,
         buf,
         settings,
-        focus,
+        form,
         dirty,
         input_items,
         input_picker,
         output_items,
         output_picker,
     );
-    draw_actions(actions, buf, focus, dirty);
 
     if let Some(detail) = detail {
         draw_focus_detail(
             detail,
             buf,
             settings,
-            focus,
+            form.focus(),
             input_items,
             input_picker,
             output_items,
@@ -96,15 +96,11 @@ pub fn draw_settings(
     }
 }
 
-fn action_rows(available: u16) -> u16 {
-    available.min(ACTION_ROWS.len() as u16)
-}
-
-fn draw_audio_sections(
+fn draw_form(
     area: Rect,
     buf: &mut Buffer,
     settings: &mut SettingsDraft,
-    focus: SettingsFocus,
+    form: &mut FormState<SettingsFocus>,
     dirty: bool,
     input_items: &[AudioInputItem],
     input_picker: &mut AudioInputPickerState,
@@ -115,225 +111,239 @@ fn draw_audio_sections(
         return;
     }
 
-    let mut rows = area;
-    let input_height = input_section_height(rows.h, input_picker.open, output_picker.open);
-    let input_area = rows.take_top(input_height as i32);
-    draw_input_section(
-        input_area,
-        buf,
-        settings,
-        focus,
-        dirty,
-        input_items,
-        input_picker,
-    );
-    if rows.h > 0 {
-        rows.take_top(1).with(theme::BACKGROUND).fill(buf);
-    }
-    draw_output_section(
-        rows,
-        buf,
-        settings,
-        focus,
-        dirty,
-        output_items,
-        output_picker,
-    );
-}
-
-fn input_section_height(available: u16, input_picker_open: bool, output_picker_open: bool) -> u16 {
-    if available <= INPUT_FIXED_ROWS {
-        return available;
-    }
-    if output_picker_open {
-        return available.min(INPUT_FIXED_ROWS);
-    }
-    if input_picker_open {
-        return available
-            .saturating_sub(OUTPUT_FIXED_ROWS + 1)
-            .max(INPUT_FIXED_ROWS + MIN_PICKER_ROWS)
-            .min(available);
-    }
-    available.min(INPUT_FIXED_ROWS)
-}
-
-fn draw_input_section(
-    area: Rect,
-    buf: &mut Buffer,
-    settings: &mut SettingsDraft,
-    focus: SettingsFocus,
-    dirty: bool,
-    input_items: &[AudioInputItem],
-    picker: &mut AudioInputPickerState,
-) {
-    let mut rows = area;
-    draw_section_header(rows.take_top(1), buf, " INPUT ");
+    form.begin_frame(area);
+    draw_section(form, buf, "Capture Settings");
     draw_device_row(
-        rows.take_top(1),
+        form,
         buf,
+        SettingsFocus::CaptureDevice,
         "Device",
-        focus == SettingsFocus::InputDevice,
         dirty,
-        picker,
+        input_picker,
         selected_audio_input_label(input_items, settings.input_selection()),
     );
-    if picker.open {
-        let picker_rows = rows
-            .h
-            .saturating_sub(INPUT_ROWS.len() as u16)
-            .max(MIN_PICKER_ROWS)
-            .min(rows.h);
+    if input_picker.open {
         draw_audio_picker(
-            rows.take_top(picker_rows as i32),
+            form,
             buf,
-            focus == SettingsFocus::InputDevice,
+            SettingsFocus::CaptureDevice,
             input_items,
-            picker,
+            input_picker,
         );
     }
-    for row in INPUT_ROWS {
-        draw_control_row(rows.take_top(1), buf, settings, row, focus, dirty);
+    for row in CAPTURE_ROWS {
+        draw_control_row(form, buf, settings, row, dirty);
     }
-}
 
-fn draw_output_section(
-    area: Rect,
-    buf: &mut Buffer,
-    settings: &mut SettingsDraft,
-    focus: SettingsFocus,
-    dirty: bool,
-    output_items: &[AudioOutputItem],
-    picker: &mut AudioOutputPickerState,
-) {
-    let mut rows = area;
-    draw_section_header(rows.take_top(1), buf, " OUTPUT ");
+    form.spacer(1);
+    draw_section(form, buf, "Playback Settings");
     draw_device_row(
-        rows.take_top(1),
+        form,
         buf,
+        SettingsFocus::PlaybackDevice,
         "Device",
-        focus == SettingsFocus::OutputDevice,
         dirty,
-        picker,
+        output_picker,
         selected_audio_output_label(output_items, settings.output_selection()),
     );
-    if picker.open {
-        let picker_rows = rows
-            .h
-            .saturating_sub(OUTPUT_ROWS.len() as u16)
-            .max(MIN_PICKER_ROWS)
-            .min(rows.h);
+    if output_picker.open {
         draw_audio_picker(
-            rows.take_top(picker_rows as i32),
+            form,
             buf,
-            focus == SettingsFocus::OutputDevice,
+            SettingsFocus::PlaybackDevice,
             output_items,
-            picker,
+            output_picker,
         );
     }
-    for row in OUTPUT_ROWS {
-        draw_control_row(rows.take_top(1), buf, settings, row, focus, dirty);
+    for row in PLAYBACK_ROWS {
+        draw_control_row(form, buf, settings, row, dirty);
     }
+
+    form.spacer(1);
+    draw_section(form, buf, "Interface Settings");
+    for row in INTERFACE_ROWS {
+        draw_control_row(form, buf, settings, row, dirty);
+    }
+
+    form.spacer(1);
+    draw_section(form, buf, "Actions");
+    draw_action_buttons(form, buf, dirty);
+    form.finish_frame();
 }
 
-fn draw_section_header(area: Rect, buf: &mut Buffer, label: &str) {
-    widgets::draw_section_header(area, buf, label);
+fn draw_section(form: &mut FormState<SettingsFocus>, buf: &mut Buffer, title: &str) {
+    let row = form.next_row(1);
+    if let Some(area) = row.rect {
+        widgets::draw_section_header(area, buf, &format!(" {title} "));
+    }
 }
 
 fn draw_device_row(
-    area: Rect,
+    form: &mut FormState<SettingsFocus>,
     buf: &mut Buffer,
+    field: SettingsFocus,
     label: &str,
-    focused: bool,
     dirty: bool,
     picker: &AudioDevicePickerState,
     selected: String,
 ) {
+    let row = form.next_row(1);
+    let Some(area) = form.register_field(row, field, FormFieldKind::Select) else {
+        return;
+    };
     let value = if picker.open && picker.searching {
         format!("/{}", picker.selector.query())
     } else {
         selected
     };
-    widgets::draw_labeled_value(area, buf, LABEL_WIDTH, label, &value, focused, dirty);
-}
-
-fn draw_control_row(
-    area: Rect,
-    buf: &mut Buffer,
-    settings: &mut SettingsDraft,
-    row: SettingsFocus,
-    focus: SettingsFocus,
-    dirty: bool,
-) {
-    if matches!(
-        row,
-        SettingsFocus::InputBuffer | SettingsFocus::OutputBuffer
-    ) && focus == row
-    {
-        let input =
-            widgets::draw_labeled_editor_frame(area, buf, LABEL_WIDTH, setting_label(row), true);
-        settings.render_buffer_editor(row, input, buf);
-        return;
-    }
     widgets::draw_labeled_value(
         area,
         buf,
         LABEL_WIDTH,
-        setting_label(row),
-        &settings.option_label(row),
-        focus == row,
+        label,
+        &value,
+        form.focus() == field,
         dirty,
     );
 }
 
-fn draw_actions(area: Rect, buf: &mut Buffer, focus: SettingsFocus, dirty: bool) {
-    if area.is_empty() {
+fn draw_control_row(
+    form: &mut FormState<SettingsFocus>,
+    buf: &mut Buffer,
+    settings: &mut SettingsDraft,
+    field: SettingsFocus,
+    dirty: bool,
+) {
+    let row = form.next_row(1);
+    let kind = setting_kind(field);
+    let Some(area) = form.register_field(row, field, kind) else {
+        return;
+    };
+    let focused = form.focus() == field;
+    if focused && is_text_field(field) {
+        let value = settings.buffer_text(field);
+        if let Some((commit_field, text)) = form.focus_text(field, &value, false) {
+            let _ = settings.set_buffer_text(commit_field, text);
+        }
+        let input =
+            widgets::draw_labeled_editor_frame(area, buf, LABEL_WIDTH, setting_label(field), true);
+        form.register_text_area(field, input);
+        form.render_editor(input, buf);
         return;
     }
-    let mut rows = area;
-    draw_action_row(
-        rows.take_top(1),
+
+    widgets::draw_labeled_value(
+        area,
         buf,
-        "Refresh devices",
-        focus == SettingsFocus::Refresh,
-        false,
-    );
-    draw_action_row(
-        rows.take_top(1),
-        buf,
-        if dirty {
-            "Save config *"
-        } else {
-            "Save config"
-        },
-        focus == SettingsFocus::Save,
+        LABEL_WIDTH,
+        setting_label(field),
+        &settings.option_label(field),
+        focused,
         dirty,
     );
-    draw_action_row(
-        rows.take_top(1),
-        buf,
-        "Back to chat",
-        focus == SettingsFocus::Close,
-        false,
-    );
-}
-
-fn draw_action_row(area: Rect, buf: &mut Buffer, label: &str, focused: bool, dirty: bool) {
-    let mut label = label.to_string();
-    if dirty && !label.ends_with('*') {
-        label.push_str(" *");
+    if kind == FormFieldKind::Choice {
+        let value_x = area.x.saturating_add(LABEL_WIDTH.min(area.w));
+        let value_w = area.w.saturating_sub(LABEL_WIDTH);
+        let left_w = value_w / 2;
+        if left_w > 0 {
+            form.register_adjust(
+                field,
+                Rect {
+                    x: value_x,
+                    y: area.y,
+                    w: left_w,
+                    h: area.h,
+                },
+                -1,
+            );
+        }
+        let right_w = value_w.saturating_sub(left_w);
+        if right_w > 0 {
+            form.register_adjust(
+                field,
+                Rect {
+                    x: value_x.saturating_add(left_w),
+                    y: area.y,
+                    w: right_w,
+                    h: area.h,
+                },
+                1,
+            );
+        }
     }
-    widgets::draw_action(area, buf, &label, focused);
 }
 
-fn setting_label(focus: SettingsFocus) -> &'static str {
+fn draw_action_buttons(form: &mut FormState<SettingsFocus>, buf: &mut Buffer, dirty: bool) {
+    let row = form.next_row(1);
+    let Some(area) = row.rect else {
+        for field in ACTION_ROWS {
+            form.register_field(row, field, FormFieldKind::Action);
+        }
+        return;
+    };
+    let width = (area.w / ACTION_ROWS.len() as u16).max(1);
+    let mut buttons = area;
+    for (index, field) in ACTION_ROWS.iter().copied().enumerate() {
+        let button = if index + 1 == ACTION_ROWS.len() {
+            buttons
+        } else {
+            buttons.take_left(width as i32)
+        };
+        form.register_rect(row, button, field, FormFieldKind::Action);
+        draw_action_button(
+            button,
+            buf,
+            action_label(field, dirty),
+            form.focus() == field,
+        );
+    }
+}
+
+fn draw_action_button(area: Rect, buf: &mut Buffer, label: &str, focused: bool) {
+    widgets::draw_action(area, buf, label, focused);
+}
+
+fn action_label(field: SettingsFocus, dirty: bool) -> &'static str {
+    match field {
+        SettingsFocus::Refresh => "Refresh devices",
+        SettingsFocus::Save if dirty => "Save config *",
+        SettingsFocus::Save => "Save config",
+        SettingsFocus::Close => "Back to chat",
+        _ => "",
+    }
+}
+
+pub(crate) fn setting_kind(field: SettingsFocus) -> FormFieldKind {
+    match field {
+        SettingsFocus::CaptureBuffer | SettingsFocus::PlaybackBuffer => FormFieldKind::Text,
+        SettingsFocus::Denoise | SettingsFocus::EchoCancellation => FormFieldKind::Toggle,
+        SettingsFocus::Bitrate | SettingsFocus::Amplification | SettingsFocus::FormBindings => {
+            FormFieldKind::Choice
+        }
+        SettingsFocus::CaptureDevice | SettingsFocus::PlaybackDevice => FormFieldKind::Select,
+        SettingsFocus::Refresh | SettingsFocus::Save | SettingsFocus::Close => {
+            FormFieldKind::Action
+        }
+    }
+}
+
+fn is_text_field(field: SettingsFocus) -> bool {
+    matches!(
+        field,
+        SettingsFocus::CaptureBuffer | SettingsFocus::PlaybackBuffer
+    )
+}
+
+pub(crate) fn setting_label(focus: SettingsFocus) -> &'static str {
     match focus {
-        SettingsFocus::InputDevice | SettingsFocus::OutputDevice => "Device",
+        SettingsFocus::CaptureDevice | SettingsFocus::PlaybackDevice => "Device",
         SettingsFocus::Bitrate => "Bitrate",
         SettingsFocus::Denoise => "Denoise",
         SettingsFocus::EchoCancellation => "Echo Cancel",
         SettingsFocus::Amplification => "Max Gain",
-        SettingsFocus::InputBuffer => "Input Buffer",
-        SettingsFocus::OutputBuffer => "Output Buffer",
+        SettingsFocus::CaptureBuffer => "Capture Buffer",
+        SettingsFocus::PlaybackBuffer => "Playback Buffer",
+        SettingsFocus::FormBindings => "Form Bindings",
         SettingsFocus::Refresh => "Refresh",
         SettingsFocus::Save => "Save",
         SettingsFocus::Close => "Close",
@@ -341,15 +351,20 @@ fn setting_label(focus: SettingsFocus) -> &'static str {
 }
 
 fn draw_audio_picker(
-    area: Rect,
+    form: &mut FormState<SettingsFocus>,
     buf: &mut Buffer,
-    focused: bool,
+    field: SettingsFocus,
     items: &[AudioDeviceItem],
     picker: &mut AudioDevicePickerState,
 ) {
-    if area.is_empty() {
+    let rows = picker_rows(form, items);
+    if rows == 0 {
         return;
     }
+    let area_row = form.next_row(rows);
+    let Some(area) = area_row.rect else {
+        return;
+    };
     buf.clear_rect(area, theme::BACKGROUND);
     if picker.selector.filtered_len() == 0 {
         area.with(theme::SUBTLE)
@@ -363,11 +378,21 @@ fn draw_audio_picker(
         item_height,
         buf,
         |_, item_index, selected, area, buf| {
+            form.register_picker_item(field, area, item_index);
             if let Some(item) = items.get(item_index) {
-                draw_audio_item(area, buf, item, selected, focused);
+                draw_audio_item(area, buf, item, selected, form.focus() == field);
             }
         },
     );
+}
+
+fn picker_rows(form: &FormState<SettingsFocus>, items: &[AudioDeviceItem]) -> u16 {
+    let wanted = items.len().clamp(MIN_PICKER_ROWS as usize, 8) as u16;
+    wanted.min(form_rows_available_hint(form).max(MIN_PICKER_ROWS))
+}
+
+fn form_rows_available_hint(_: &FormState<SettingsFocus>) -> u16 {
+    8
 }
 
 fn draw_audio_item(
@@ -434,12 +459,12 @@ fn draw_focus_detail(
         .text(buf, &format!(" {} ", detail_title(focus)));
 
     match focus {
-        SettingsFocus::InputDevice => draw_device_detail(
+        SettingsFocus::CaptureDevice => draw_device_detail(
             rows,
             buf,
             focused_device(input_items, input_picker, settings.input_selection()),
         ),
-        SettingsFocus::OutputDevice => draw_device_detail(
+        SettingsFocus::PlaybackDevice => draw_device_detail(
             rows,
             buf,
             focused_device(output_items, output_picker, settings.output_selection()),
@@ -450,8 +475,8 @@ fn draw_focus_detail(
 
 fn detail_title(focus: SettingsFocus) -> &'static str {
     match focus {
-        SettingsFocus::InputDevice => "Input Device",
-        SettingsFocus::OutputDevice => "Output Device",
+        SettingsFocus::CaptureDevice => "Capture Device",
+        SettingsFocus::PlaybackDevice => "Playback Device",
         _ => setting_label(focus),
     }
 }
@@ -624,25 +649,27 @@ mod tests {
     use super::*;
 
     #[test]
-    fn input_section_expands_for_open_input_picker() {
-        assert_eq!(input_section_height(14, true, false), 10);
-        assert_eq!(input_section_height(8, true, false), 8);
-    }
-
-    #[test]
-    fn output_picker_keeps_input_section_compact() {
-        assert_eq!(input_section_height(14, false, true), 7);
-    }
-
-    #[test]
     fn focus_order_matches_rendered_settings_layout() {
-        let mut expected = vec![SettingsFocus::InputDevice];
-        expected.extend(INPUT_ROWS);
-        expected.push(SettingsFocus::OutputDevice);
-        expected.extend(OUTPUT_ROWS);
+        let mut expected = vec![SettingsFocus::CaptureDevice];
+        expected.extend(CAPTURE_ROWS);
+        expected.push(SettingsFocus::PlaybackDevice);
+        expected.extend(PLAYBACK_ROWS);
+        expected.extend(INTERFACE_ROWS);
         expected.extend(ACTION_ROWS);
 
         assert_eq!(SettingsFocus::ORDER.as_slice(), expected.as_slice());
+    }
+
+    #[test]
+    fn settings_sections_are_title_case() {
+        for title in [
+            "Capture Settings",
+            "Playback Settings",
+            "Interface Settings",
+            "Actions",
+        ] {
+            assert_ne!(title, title.to_ascii_uppercase());
+        }
     }
 
     #[test]

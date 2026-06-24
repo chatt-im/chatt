@@ -14,7 +14,7 @@ use std::{
     thread,
 };
 
-use extui::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use extui::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind};
 use extui_editor::{Editor, bindings as editor_bindings};
 use rpc::{
     control::{ChatMessage, InviteTicket},
@@ -36,6 +36,7 @@ use crate::{
         Action,
         editor::EditorHighlighter,
         focus::{FocusId, FocusManager, ServerField, SettingsField},
+        form::{FormAction, FormMouseIntent, FormState},
         modes::{ModeKind, ModeStack},
     },
     ui::select::FuzzySelect,
@@ -101,7 +102,7 @@ pub(crate) struct App {
     pub(crate) audio_output_items: Vec<settings::AudioOutputItem>,
     pub(crate) audio_input_picker: AudioInputPickerState,
     pub(crate) audio_output_picker: AudioOutputPickerState,
-    pub(crate) settings_focus: SettingsFocus,
+    pub(crate) settings_form: FormState<SettingsFocus>,
     pub(crate) settings: SettingsDraft,
     pub(crate) settings_dirty: bool,
     pub(crate) mic_muted: Arc<AtomicBool>,
@@ -156,7 +157,13 @@ impl App {
         composer.set_theme(theme::editor_theme());
         composer.enter_insert_mode();
         let composer_hl = EditorHighlighter::new(&mut composer);
-        let settings_draft = SettingsDraft::from_audio(&config.audio);
+        let mut settings_draft = SettingsDraft::from_audio(&config.audio);
+        settings_draft.set_form_bindings_from_config(config.ui.form_bindings);
+        let settings_form = FormState::with_order(
+            SettingsFocus::CaptureDevice,
+            config.ui.form_bindings,
+            SettingsFocus::ORDER,
+        );
         let audio_input_items = settings::audio_input_items(&[]);
         let audio_output_items = settings::audio_output_items(&[]);
         let mut audio_input_picker = AudioInputPickerState::default();
@@ -200,7 +207,7 @@ impl App {
             audio_output_items,
             audio_input_picker,
             audio_output_picker,
-            settings_focus: SettingsFocus::InputDevice,
+            settings_form,
             settings: settings_draft,
             settings_dirty: false,
             mic_muted: Arc::new(AtomicBool::new(false)),
@@ -297,7 +304,10 @@ impl App {
             self.open_server_select();
             return;
         };
-        self.server_edit = Some(ServerEditDraft::from_server(&server));
+        self.server_edit = Some(ServerEditDraft::from_server(
+            &server,
+            self.config.ui.form_bindings,
+        ));
         self.set_mode(theme::UiMode::ServerEdit);
         self.set_status(format!("editing server {}", server.alias));
     }
@@ -660,6 +670,14 @@ impl App {
         crate::tui::modes::process_key(self, key)
     }
 
+    pub(crate) fn process_mouse(&mut self, mouse: MouseEvent) -> Action {
+        match self.mode {
+            theme::UiMode::Settings => self.process_settings_mouse(mouse),
+            theme::UiMode::ServerEdit => self.process_server_edit_mouse(mouse),
+            _ => Action::Continue,
+        }
+    }
+
     pub(crate) fn process_server_select_key(&mut self, key: KeyEvent) -> Action {
         if matches!(key.kind, KeyEventKind::Release) {
             return Action::Continue;
@@ -829,44 +847,6 @@ impl App {
         }
     }
 
-    pub(crate) fn handle_settings_search_key(&mut self, key: KeyEvent) -> bool {
-        if self.mode != theme::UiMode::Settings {
-            return false;
-        }
-
-        match self.settings_focus {
-            SettingsFocus::InputDevice if self.audio_input_picker.open => {
-                handle_audio_picker_search_key(
-                    key,
-                    &mut self.audio_input_picker,
-                    &self.audio_input_items,
-                )
-            }
-            SettingsFocus::OutputDevice if self.audio_output_picker.open => {
-                handle_audio_picker_search_key(
-                    key,
-                    &mut self.audio_output_picker,
-                    &self.audio_output_items,
-                )
-            }
-            _ => false,
-        }
-    }
-
-    /// Routes printable input and in-line editing keys to the focused buffer
-    /// editor, leaving navigation keys (arrows up/down, Tab, Enter, Esc) for the
-    /// settings bindings layer. Mirrors the audio picker's search editing.
-    pub(crate) fn handle_settings_buffer_key(&mut self, key: KeyEvent) -> bool {
-        if self.mode != theme::UiMode::Settings || matches!(key.kind, KeyEventKind::Release) {
-            return false;
-        }
-        let Some(mutation) = self.settings.handle_buffer_key(self.settings_focus, key) else {
-            return false;
-        };
-        self.apply_settings_mutation(mutation);
-        true
-    }
-
     fn cancel_open_audio_picker(&mut self) -> bool {
         if self.audio_input_picker.open {
             self.cancel_audio_input_picker();
@@ -881,6 +861,185 @@ impl App {
 
     fn audio_picker_open(&self) -> bool {
         self.audio_input_picker.open || self.audio_output_picker.open
+    }
+
+    pub(crate) fn process_settings_key(&mut self, key: KeyEvent) -> Action {
+        if self.mode != theme::UiMode::Settings || matches!(key.kind, KeyEventKind::Release) {
+            return Action::Continue;
+        }
+        if self.handle_open_settings_picker_key(key) {
+            self.sync_focus();
+            return Action::Continue;
+        }
+
+        let focus = self.settings_form.focus();
+        let kind = crate::ui::settings::setting_kind(focus);
+        let text_focused = kind == crate::tui::form::FormFieldKind::Text;
+        if !text_focused {
+            match key.code {
+                KeyCode::Char('q') | KeyCode::F2 => {
+                    self.close_settings();
+                    return Action::Continue;
+                }
+                KeyCode::Char('r') => {
+                    self.refresh_audio_devices();
+                    return Action::Continue;
+                }
+                KeyCode::Char('w') => {
+                    self.save_settings();
+                    return Action::Continue;
+                }
+                _ => {}
+            }
+        }
+
+        let event = self.settings_form.handle_key(key, kind);
+        self.apply_settings_commit(event.commit);
+        match event.action {
+            FormAction::None => {}
+            FormAction::Cancel => {
+                if !self.cancel_open_audio_picker() {
+                    self.close_settings();
+                }
+            }
+            FormAction::Activate => self.activate_settings_focus(),
+            FormAction::Adjust(delta) => self.adjust_settings_focus(delta),
+            FormAction::FocusMoved => self.sync_focus(),
+            FormAction::TextChanged => self.mark_settings_dirty(),
+            FormAction::Scrolled => {}
+        }
+        Action::Continue
+    }
+
+    fn process_settings_mouse(&mut self, mouse: MouseEvent) -> Action {
+        if self.handle_open_settings_picker_mouse(mouse) {
+            self.sync_focus();
+            return Action::Continue;
+        }
+
+        let event = self.settings_form.handle_mouse(mouse);
+        self.apply_settings_commit(event.commit);
+        match event.intent {
+            FormMouseIntent::None => {}
+            FormMouseIntent::Activate(field) => {
+                let _ = self.settings_form.set_focus(field);
+                self.activate_settings_focus();
+            }
+            FormMouseIntent::Adjust(field, delta) => {
+                let commit = self.settings_form.set_focus(field);
+                self.apply_settings_commit(commit);
+                self.adjust_settings_focus(delta);
+            }
+            FormMouseIntent::Text(field, area, column) => {
+                let value = self.settings.buffer_text(field);
+                let commit = self
+                    .settings_form
+                    .focus_text_at(field, &value, area, column, true);
+                self.apply_settings_commit(commit);
+            }
+            FormMouseIntent::PickerItem(field, item_index) => match field {
+                SettingsFocus::CaptureDevice => {
+                    if self
+                        .audio_input_picker
+                        .selector
+                        .select_item_index(item_index)
+                    {
+                        self.confirm_audio_input_picker();
+                    }
+                }
+                SettingsFocus::PlaybackDevice => {
+                    if self
+                        .audio_output_picker
+                        .selector
+                        .select_item_index(item_index)
+                    {
+                        self.confirm_audio_output_picker();
+                    }
+                }
+                _ => {}
+            },
+        }
+        if event.action == FormAction::Scrolled {
+            self.sync_focus();
+        }
+        Action::Continue
+    }
+
+    fn handle_open_settings_picker_mouse(&mut self, mouse: MouseEvent) -> bool {
+        let delta = match mouse.kind {
+            MouseEventKind::ScrollDown => 1,
+            MouseEventKind::ScrollUp => -1,
+            _ => return false,
+        };
+        match self.settings_form.focus() {
+            SettingsFocus::CaptureDevice if self.audio_input_picker.open => {
+                self.audio_input_picker.move_selection(delta);
+                true
+            }
+            SettingsFocus::PlaybackDevice if self.audio_output_picker.open => {
+                self.audio_output_picker.move_selection(delta);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn process_server_edit_mouse(&mut self, mouse: MouseEvent) -> Action {
+        let Some(draft) = self.server_edit.as_mut() else {
+            return Action::Continue;
+        };
+        match draft.handle_mouse(mouse) {
+            ServerEditEvent::Consumed => self.sync_focus(),
+            ServerEditEvent::Cancel => {
+                self.server_edit = None;
+                self.open_server_select();
+            }
+            ServerEditEvent::Save { join_after_save } => self.save_server_edit(join_after_save),
+        }
+        Action::Continue
+    }
+
+    fn handle_open_settings_picker_key(&mut self, key: KeyEvent) -> bool {
+        let focus = self.settings_form.focus();
+        match focus {
+            SettingsFocus::CaptureDevice if self.audio_input_picker.open => {
+                if !self.audio_input_picker.searching {
+                    match key.code {
+                        KeyCode::Esc => {
+                            self.cancel_audio_input_picker();
+                            return true;
+                        }
+                        KeyCode::Enter => {
+                            self.confirm_audio_input_picker();
+                            return true;
+                        }
+                        _ => {}
+                    }
+                }
+                handle_audio_picker_key(key, &mut self.audio_input_picker, &self.audio_input_items)
+            }
+            SettingsFocus::PlaybackDevice if self.audio_output_picker.open => {
+                if !self.audio_output_picker.searching {
+                    match key.code {
+                        KeyCode::Esc => {
+                            self.cancel_audio_output_picker();
+                            return true;
+                        }
+                        KeyCode::Enter => {
+                            self.confirm_audio_output_picker();
+                            return true;
+                        }
+                        _ => {}
+                    }
+                }
+                handle_audio_picker_key(
+                    key,
+                    &mut self.audio_output_picker,
+                    &self.audio_output_items,
+                )
+            }
+            _ => false,
+        }
     }
 
     pub(crate) fn process_command(&mut self, command: BindCommand) -> Action {
@@ -945,7 +1104,13 @@ impl App {
     fn open_settings(&mut self) {
         self.set_mode(theme::UiMode::Settings);
         self.settings = SettingsDraft::from_audio(&self.config.audio);
-        self.settings_focus = SettingsFocus::InputDevice;
+        self.settings
+            .set_form_bindings_from_config(self.config.ui.form_bindings);
+        self.settings_form = FormState::with_order(
+            SettingsFocus::CaptureDevice,
+            self.config.ui.form_bindings,
+            SettingsFocus::ORDER,
+        );
         self.settings_dirty = false;
         if self.allow_settings_preview_capture
             && (self.input_devices.is_empty() || self.output_devices.is_empty())
@@ -957,7 +1122,7 @@ impl App {
     }
 
     fn close_settings(&mut self) {
-        self.settings.commit_buffer_editor();
+        self.commit_settings_form_text();
         self.apply_active_capture_amplification(self.config.audio.max_amplification);
         self.stop_settings_preview_capture();
         self.audio_input_picker
@@ -975,10 +1140,8 @@ impl App {
             self.move_active_audio_picker_selection(delta);
             return;
         }
-        self.settings.commit_buffer_editor();
-        let len = SettingsFocus::ORDER.len() as isize;
-        let next = (self.settings_focus.index() as isize + delta).rem_euclid(len) as usize;
-        self.settings_focus = SettingsFocus::ORDER[next];
+        let commit = self.settings_form.move_focus(delta);
+        self.apply_settings_commit(commit);
         self.sync_focus();
     }
 
@@ -986,20 +1149,21 @@ impl App {
         if self.mode != theme::UiMode::Settings {
             return;
         }
-        match self.settings_focus {
-            SettingsFocus::InputDevice if delta < 0 => self.cancel_audio_input_picker(),
-            SettingsFocus::InputDevice => self.activate_audio_input_picker(),
-            SettingsFocus::OutputDevice if delta < 0 => self.cancel_audio_output_picker(),
-            SettingsFocus::OutputDevice => self.activate_audio_output_picker(),
+        match self.settings_form.focus() {
+            SettingsFocus::CaptureDevice if delta < 0 => self.cancel_audio_input_picker(),
+            SettingsFocus::CaptureDevice => self.activate_audio_input_picker(),
+            SettingsFocus::PlaybackDevice if delta < 0 => self.cancel_audio_output_picker(),
+            SettingsFocus::PlaybackDevice => self.activate_audio_output_picker(),
             SettingsFocus::Bitrate
             | SettingsFocus::Denoise
             | SettingsFocus::EchoCancellation
-            | SettingsFocus::Amplification => {
-                let mutation = self.settings.adjust(self.settings_focus, delta);
+            | SettingsFocus::Amplification
+            | SettingsFocus::FormBindings => {
+                let mutation = self.settings.adjust(self.settings_form.focus(), delta);
                 self.apply_settings_mutation(mutation);
             }
-            SettingsFocus::InputBuffer
-            | SettingsFocus::OutputBuffer
+            SettingsFocus::CaptureBuffer
+            | SettingsFocus::PlaybackBuffer
             | SettingsFocus::Refresh
             | SettingsFocus::Save
             | SettingsFocus::Close => {}
@@ -1007,32 +1171,58 @@ impl App {
     }
 
     fn activate_settings_focus(&mut self) {
-        match self.settings_focus {
+        match self.settings_form.focus() {
             SettingsFocus::Refresh => self.refresh_audio_devices(),
             SettingsFocus::Save => self.save_settings(),
             SettingsFocus::Close => self.close_settings(),
-            SettingsFocus::InputDevice => self.activate_audio_input_picker(),
-            SettingsFocus::OutputDevice => self.activate_audio_output_picker(),
+            SettingsFocus::CaptureDevice => self.activate_audio_input_picker(),
+            SettingsFocus::PlaybackDevice => self.activate_audio_output_picker(),
             SettingsFocus::Denoise
             | SettingsFocus::EchoCancellation
             | SettingsFocus::Bitrate
-            | SettingsFocus::Amplification => {
-                let mutation = self.settings.activate(self.settings_focus);
+            | SettingsFocus::Amplification
+            | SettingsFocus::FormBindings => {
+                let mutation = self.settings.activate(self.settings_form.focus());
                 self.apply_settings_mutation(mutation);
             }
-            SettingsFocus::InputBuffer | SettingsFocus::OutputBuffer => {}
+            SettingsFocus::CaptureBuffer | SettingsFocus::PlaybackBuffer => {
+                self.move_settings_focus(1);
+            }
         }
     }
 
     fn apply_settings_mutation(&mut self, mutation: SettingsMutation) {
         match mutation {
             SettingsMutation::None => {}
-            SettingsMutation::Changed => self.mark_settings_dirty(),
+            SettingsMutation::Changed => {
+                self.apply_settings_form_bindings();
+                self.mark_settings_dirty();
+            }
             SettingsMutation::AmplificationChanged(value) => {
                 self.apply_active_capture_amplification(value);
                 self.mark_settings_dirty();
             }
         }
+    }
+
+    fn apply_settings_commit(&mut self, commit: Option<(SettingsFocus, String)>) {
+        let Some((field, text)) = commit else {
+            return;
+        };
+        let mutation = self.settings.set_buffer_text(field, text);
+        self.apply_settings_mutation(mutation);
+    }
+
+    fn commit_settings_form_text(&mut self) {
+        let commit = self.settings_form.clear_text();
+        self.apply_settings_commit(commit);
+    }
+
+    fn apply_settings_form_bindings(&mut self) {
+        let commit = self
+            .settings_form
+            .set_bindings(self.settings.form_bindings());
+        self.apply_settings_commit(commit);
     }
 
     fn move_settings_selection(&mut self, delta: isize) {
@@ -1047,11 +1237,11 @@ impl App {
     }
 
     fn move_active_audio_picker_selection(&mut self, delta: isize) {
-        match self.settings_focus {
-            SettingsFocus::InputDevice if self.audio_input_picker.open => {
+        match self.settings_form.focus() {
+            SettingsFocus::CaptureDevice if self.audio_input_picker.open => {
                 self.audio_input_picker.move_selection(delta);
             }
-            SettingsFocus::OutputDevice if self.audio_output_picker.open => {
+            SettingsFocus::PlaybackDevice if self.audio_output_picker.open => {
                 self.audio_output_picker.move_selection(delta);
             }
             _ => {}
@@ -1328,10 +1518,11 @@ impl App {
     }
 
     fn save_settings(&mut self) {
-        self.settings.commit_buffer_editor();
+        self.commit_settings_form_text();
         let restart_preview =
             self.settings_preview_capture && !self.voice_tx_enabled.load(Ordering::Relaxed);
         self.config.audio = self.settings.to_audio();
+        self.config.ui.form_bindings = self.settings.form_bindings();
         self.apply_echo_cancellation_setting();
         self.apply_active_capture_amplification(self.config.audio.max_amplification);
         match self.config.save_runtime() {
@@ -1918,7 +2109,7 @@ impl App {
                 } else if self.audio_output_picker.open {
                     FocusId::OutputPicker
                 } else {
-                    FocusId::Settings(settings_field(self.settings_focus))
+                    FocusId::Settings(settings_field(self.settings_form.focus()))
                 }
             }
         };
@@ -1942,27 +2133,34 @@ fn server_field(focus: ServerEditFocus) -> ServerField {
 
 fn settings_field(focus: SettingsFocus) -> SettingsField {
     match focus {
-        SettingsFocus::InputDevice => SettingsField::InputDevice,
-        SettingsFocus::OutputDevice => SettingsField::OutputDevice,
+        SettingsFocus::CaptureDevice => SettingsField::InputDevice,
+        SettingsFocus::PlaybackDevice => SettingsField::OutputDevice,
         SettingsFocus::Bitrate => SettingsField::Bitrate,
         SettingsFocus::Denoise => SettingsField::Denoise,
         SettingsFocus::EchoCancellation => SettingsField::EchoCancellation,
         SettingsFocus::Amplification => SettingsField::Amplification,
-        SettingsFocus::InputBuffer => SettingsField::InputBuffer,
-        SettingsFocus::OutputBuffer => SettingsField::OutputBuffer,
+        SettingsFocus::CaptureBuffer => SettingsField::InputBuffer,
+        SettingsFocus::PlaybackBuffer => SettingsField::OutputBuffer,
+        SettingsFocus::FormBindings => SettingsField::FormBindings,
         SettingsFocus::Refresh => SettingsField::Refresh,
         SettingsFocus::Save => SettingsField::Save,
         SettingsFocus::Close => SettingsField::Close,
     }
 }
 
-fn handle_audio_picker_search_key(
+fn handle_audio_picker_key(
     key: KeyEvent,
     picker: &mut settings::AudioDevicePickerState,
     items: &[settings::AudioDeviceItem],
 ) -> bool {
     if picker.searching {
-        return picker.edit_search(key, items);
+        match key.code {
+            KeyCode::Esc | KeyCode::Enter => {
+                picker.searching = false;
+                return true;
+            }
+            _ => return picker.edit_search(key, items),
+        }
     }
 
     if matches!(key.kind, KeyEventKind::Release) {
@@ -1975,7 +2173,35 @@ fn handle_audio_picker_search_key(
         return true;
     }
 
-    false
+    match key.code {
+        KeyCode::Esc => {
+            return true;
+        }
+        KeyCode::Enter => {
+            return true;
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            picker.move_selection(1);
+            true
+        }
+        KeyCode::Up | KeyCode::Char('k') => {
+            picker.move_selection(-1);
+            true
+        }
+        _ if key.modifiers.contains(KeyModifiers::CONTROL)
+            && matches!(key.code, KeyCode::Char('j')) =>
+        {
+            picker.move_selection(1);
+            true
+        }
+        _ if key.modifiers.contains(KeyModifiers::CONTROL)
+            && matches!(key.code, KeyCode::Char('k')) =>
+        {
+            picker.move_selection(-1);
+            true
+        }
+        _ => false,
+    }
 }
 
 fn format_signed_db(value_db: f32) -> String {
@@ -2036,7 +2262,10 @@ mod tests {
 
     #[test]
     fn server_edit_reuses_one_editor_across_text_fields() {
-        let mut draft = ServerEditDraft::from_server(&crate::config::ServerEntry::default());
+        let mut draft = ServerEditDraft::from_server(
+            &crate::config::ServerEntry::default(),
+            crate::config::FormBindings::Standard,
+        );
         let first_editor = draft.active_editor_address().unwrap();
         draft.set_active_editor_text("local-dev");
 
@@ -2054,18 +2283,75 @@ mod tests {
     #[test]
     fn settings_buffers_reuse_one_editor_and_commit_on_focus_change() {
         let mut draft = SettingsDraft::from_audio(&crate::config::AudioConfig::default());
-        let input_editor = draft
-            .active_buffer_editor_address(SettingsFocus::InputBuffer)
-            .unwrap();
-        draft.set_buffer_editor_text(SettingsFocus::InputBuffer, "1024");
+        let mut form = FormState::with_order(
+            SettingsFocus::CaptureBuffer,
+            crate::config::FormBindings::Standard,
+            SettingsFocus::ORDER,
+        );
+        form.focus_text(
+            SettingsFocus::CaptureBuffer,
+            &draft.buffer_text(SettingsFocus::CaptureBuffer),
+            false,
+        );
+        let input_editor = form.editor_mut() as *mut _ as usize;
+        form.editor_mut().set_lines("1024");
 
-        draft.focus_buffer_for_test(SettingsFocus::OutputBuffer);
+        let commit = form.set_focus(SettingsFocus::PlaybackBuffer);
+        if let Some((field, text)) = commit {
+            draft.set_buffer_text(field, text);
+        }
+        assert_eq!(draft.buffer_text(SettingsFocus::CaptureBuffer), "1024");
 
-        assert_eq!(draft.buffer_text(SettingsFocus::InputBuffer), "1024");
-        let output_editor = draft
-            .active_buffer_editor_address(SettingsFocus::OutputBuffer)
-            .unwrap();
+        form.focus_text(
+            SettingsFocus::PlaybackBuffer,
+            &draft.buffer_text(SettingsFocus::PlaybackBuffer),
+            false,
+        );
+        let output_editor = form.editor_mut() as *mut _ as usize;
         assert_eq!(input_editor, output_editor);
+    }
+
+    #[test]
+    fn mouse_wheel_moves_open_settings_device_picker() {
+        let mut app = test_app();
+        app.set_mode(theme::UiMode::Settings);
+        app.audio_input_items = ["System default", "USB Mic", "Line In"]
+            .into_iter()
+            .enumerate()
+            .map(|(index, name)| settings::AudioDeviceItem {
+                selection: Some(format!("device-{index}")),
+                aliases: Vec::new(),
+                backend_id: None,
+                device_index: Some(index as u32),
+                name: name.to_string(),
+                search_text: name.to_string(),
+                rank: 0,
+                supported: true,
+                preview: None,
+                issue: None,
+                variants: Vec::new(),
+                default_source: "test",
+            })
+            .collect();
+        app.audio_input_picker
+            .open(&app.audio_input_items, app.settings.input_selection());
+
+        assert_eq!(
+            app.audio_input_picker.selector.current_item_index(),
+            Some(0)
+        );
+
+        app.process_mouse(MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column: 4,
+            row: 4,
+            modifiers: KeyModifiers::empty(),
+        });
+
+        assert_eq!(
+            app.audio_input_picker.selector.current_item_index(),
+            Some(1)
+        );
     }
 
     #[test]
