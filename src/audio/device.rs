@@ -345,7 +345,7 @@ pub(crate) fn alsa_device_id_from_pcm_name(_pcm_name: &str) -> Option<cpal::Devi
     None
 }
 
-pub(crate) fn looks_like_alsa_pcm_name(value: &str) -> bool {
+pub fn looks_like_alsa_pcm_name(value: &str) -> bool {
     if value.is_empty() || value.chars().any(char::is_whitespace) {
         return false;
     }

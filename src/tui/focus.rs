@@ -27,7 +27,9 @@ pub(crate) enum ServerField {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum SettingsField {
     InputDevice,
+    RawInputDevice,
     OutputDevice,
+    RawOutputDevice,
     Bitrate,
     Denoise,
     EchoCancellation,
@@ -109,7 +111,9 @@ impl SettingsField {
     fn label(self) -> &'static str {
         match self {
             SettingsField::InputDevice => "capture",
+            SettingsField::RawInputDevice => "raw capture device",
             SettingsField::OutputDevice => "playback",
+            SettingsField::RawOutputDevice => "raw playback device",
             SettingsField::Bitrate => "bitrate",
             SettingsField::Denoise => "denoise",
             SettingsField::EchoCancellation => "echo",

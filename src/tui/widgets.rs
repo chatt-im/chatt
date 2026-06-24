@@ -10,6 +10,7 @@ pub(crate) struct RowPalette {
     pub(crate) focused_label: Style,
     pub(crate) value: Style,
     pub(crate) dirty_value: Style,
+    pub(crate) error: Style,
 }
 
 impl RowPalette {
@@ -21,6 +22,7 @@ impl RowPalette {
             focused_label: theme.good,
             value: theme.text,
             dirty_value: theme.warn,
+            error: theme.error,
         }
     }
 }
@@ -53,9 +55,11 @@ pub(crate) fn draw_labeled_value(
         value,
         focused,
         dirty,
+        false,
     );
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn draw_labeled_value_with(
     area: Rect,
     buf: &mut Buffer,
@@ -65,6 +69,7 @@ pub(crate) fn draw_labeled_value_with(
     value: &str,
     focused: bool,
     dirty: bool,
+    error: bool,
 ) {
     let base = if focused {
         palette.focused
@@ -73,21 +78,27 @@ pub(crate) fn draw_labeled_value_with(
     };
     buf.clear_rect(area, base);
     let mut row = area;
+    let label_style = if error {
+        palette.error
+    } else if focused {
+        palette.focused_label
+    } else {
+        palette.label
+    };
     row.take_left(label_width as i32)
-        .with(base.patch(if focused {
-            palette.focused_label
-        } else {
-            palette.label
-        }))
+        .with(base.patch(label_style))
         .with(Ellipsis(true))
         .text(buf, label);
-    row.with(base.patch(if dirty {
+    let value_style = if error {
+        palette.error
+    } else if dirty {
         palette.dirty_value
     } else {
         palette.value
-    }))
-    .with(Ellipsis(true))
-    .text(buf, value);
+    };
+    row.with(base.patch(value_style))
+        .with(Ellipsis(true))
+        .text(buf, value);
 }
 
 pub(crate) fn draw_labeled_editor_frame(
@@ -97,6 +108,7 @@ pub(crate) fn draw_labeled_editor_frame(
     label_width: u16,
     label: &str,
     focused: bool,
+    error: bool,
 ) -> Rect {
     let palette = RowPalette::from_theme(theme);
     let base = if focused {
@@ -106,20 +118,25 @@ pub(crate) fn draw_labeled_editor_frame(
     };
     buf.clear_rect(area, base);
     let mut row = area;
+    let label_style = if error {
+        palette.error
+    } else if focused {
+        palette.focused_label
+    } else {
+        palette.label
+    };
     row.take_left(label_width as i32)
-        .with(base.patch(if focused {
-            palette.focused_label
-        } else {
-            palette.label
-        }))
+        .with(base.patch(label_style))
         .with(Ellipsis(true))
         .text(buf, label);
-    row.with(if focused {
+    let frame_style = if error {
+        theme.error
+    } else if focused {
         theme.join_input_active
     } else {
         theme.join_input_inactive
-    })
-    .fill(buf);
+    };
+    row.with(frame_style).fill(buf);
     row
 }
 

@@ -261,8 +261,15 @@ impl ServerEditDraft {
             let value = self.field_value(field).to_string();
             let commit = self.form.focus_text(field, &value, false);
             self.apply_commit(commit);
-            let input =
-                widgets::draw_labeled_editor_frame(area, buf, theme, LABEL_WIDTH, label, true);
+            let input = widgets::draw_labeled_editor_frame(
+                area,
+                buf,
+                theme,
+                LABEL_WIDTH,
+                label,
+                true,
+                false,
+            );
             self.form.register_text_area(field, input);
             self.form.render_editor(input, buf, theme);
         } else {

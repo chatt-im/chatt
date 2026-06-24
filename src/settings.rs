@@ -4,6 +4,7 @@ use crate::{
         AudioConfig, AudioLatencyConfig, BufferSize, DEFAULT_INPUT_BUFFER_SAMPLES,
         DEFAULT_MAX_AMPLIFICATION, DEFAULT_OUTPUT_BUFFER_SAMPLES, FormBindings, ThemeChoice,
     },
+    tui::form::FormFieldKind,
     ui::select::{FuzzySelect, SelectableItem},
 };
 
@@ -12,10 +13,17 @@ pub const BITRATES: [i32; 6] = [16_000, 24_000, 32_000, 48_000, 64_000, 96_000];
 /// well-levelled rig; higher values let AGC2 lift a quieter mic further.
 pub const MAX_AMPLIFICATIONS: [f32; 6] = [0.0, 6.0, 12.0, 18.0, 24.0, 30.0];
 
+/// Smallest accepted explicit buffer in samples (~0.7 ms at 48 kHz).
+pub const MIN_BUFFER_SAMPLES: u32 = 32;
+/// Largest accepted explicit buffer in samples (~170 ms at 48 kHz).
+pub const MAX_BUFFER_SAMPLES: u32 = 8192;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SettingsFocus {
     CaptureDevice,
+    RawCaptureDevice,
     PlaybackDevice,
+    RawPlaybackDevice,
     Bitrate,
     Denoise,
     EchoCancellation,
@@ -30,14 +38,16 @@ pub enum SettingsFocus {
 }
 
 impl SettingsFocus {
-    pub const ORDER: [SettingsFocus; 13] = [
+    pub const ORDER: [SettingsFocus; 15] = [
         SettingsFocus::CaptureDevice,
+        SettingsFocus::RawCaptureDevice,
         SettingsFocus::Bitrate,
         SettingsFocus::Denoise,
         SettingsFocus::EchoCancellation,
         SettingsFocus::Amplification,
         SettingsFocus::CaptureBuffer,
         SettingsFocus::PlaybackDevice,
+        SettingsFocus::RawPlaybackDevice,
         SettingsFocus::PlaybackBuffer,
         SettingsFocus::FormBindings,
         SettingsFocus::Theme,
@@ -56,6 +66,10 @@ pub struct SettingsDraft {
     /// [`parse_buffer_size`]). The shared form editor commits into these.
     input_buffer: String,
     output_buffer: String,
+    /// When set, the device row is a free-form text field for a raw ALSA pcm
+    /// string instead of the enumerated-device picker.
+    input_raw: bool,
+    output_raw: bool,
     form_bindings: FormBindings,
     theme: ThemeChoice,
     denoise: DenoiseConfig,
@@ -82,6 +96,14 @@ impl SettingsDraft {
             amplification_index: amplification_index(config.max_amplification),
             input_buffer: buffer_size_text(config.input_buffer),
             output_buffer: buffer_size_text(config.output_buffer),
+            input_raw: config
+                .input_device_id
+                .as_deref()
+                .is_some_and(is_raw_device_selection),
+            output_raw: config
+                .output_device_id
+                .as_deref()
+                .is_some_and(is_raw_device_selection),
             form_bindings: FormBindings::Standard,
             theme: ThemeChoice::default(),
             denoise: config.denoise,
@@ -156,6 +178,93 @@ impl SettingsDraft {
         self.output_device_id = selection;
     }
 
+    pub fn input_raw(&self) -> bool {
+        self.input_raw
+    }
+
+    pub fn output_raw(&self) -> bool {
+        self.output_raw
+    }
+
+    /// Returns the form field kind for `focus`, accounting for raw device mode:
+    /// a device row is a free-form [`FormFieldKind::Text`] field while its raw
+    /// flag is on, otherwise the enumerated-device [`FormFieldKind::Select`].
+    pub fn field_kind(&self, focus: SettingsFocus) -> FormFieldKind {
+        match focus {
+            SettingsFocus::CaptureDevice if self.input_raw => FormFieldKind::Text,
+            SettingsFocus::PlaybackDevice if self.output_raw => FormFieldKind::Text,
+            SettingsFocus::CaptureDevice | SettingsFocus::PlaybackDevice => FormFieldKind::Select,
+            SettingsFocus::CaptureBuffer | SettingsFocus::PlaybackBuffer => FormFieldKind::Text,
+            SettingsFocus::RawCaptureDevice
+            | SettingsFocus::RawPlaybackDevice
+            | SettingsFocus::EchoCancellation => FormFieldKind::Toggle,
+            SettingsFocus::Denoise
+            | SettingsFocus::Bitrate
+            | SettingsFocus::Amplification
+            | SettingsFocus::FormBindings
+            | SettingsFocus::Theme => FormFieldKind::Choice,
+            SettingsFocus::Refresh | SettingsFocus::Save | SettingsFocus::Close => {
+                FormFieldKind::Action
+            }
+        }
+    }
+
+    /// Returns the validation error for a text field, or `None` when valid.
+    /// Buffer fields accept `default`/empty or an in-range sample count. Raw
+    /// device fields (only while raw mode is on) accept an empty value (system
+    /// default) or a string [`looks_like_alsa_pcm_name`].
+    ///
+    /// [`looks_like_alsa_pcm_name`]: crate::audio::looks_like_alsa_pcm_name
+    pub fn field_error(&self, focus: SettingsFocus) -> Option<String> {
+        match focus {
+            SettingsFocus::CaptureBuffer | SettingsFocus::PlaybackBuffer => {
+                buffer_field_error(&self.buffer_text(focus))
+            }
+            SettingsFocus::CaptureDevice if self.input_raw => {
+                raw_device_error(self.input_device_id.as_deref().unwrap_or(""))
+            }
+            SettingsFocus::PlaybackDevice if self.output_raw => {
+                raw_device_error(self.output_device_id.as_deref().unwrap_or(""))
+            }
+            _ => None,
+        }
+    }
+
+    /// Returns a blocking reason when either raw device string is invalid. Used
+    /// to gate live apply and Save so a malformed ALSA string is never opened.
+    pub fn device_string_invalid(&self) -> Option<String> {
+        self.field_error(SettingsFocus::CaptureDevice)
+            .or_else(|| self.field_error(SettingsFocus::PlaybackDevice))
+    }
+
+    /// Commits editor text for a focusable text field. Buffer fields update the
+    /// buffer strings; raw device fields update the device selection (trimmed,
+    /// empty means system default).
+    pub fn commit_field_text(&mut self, focus: SettingsFocus, text: String) -> SettingsMutation {
+        match focus {
+            SettingsFocus::CaptureBuffer | SettingsFocus::PlaybackBuffer => {
+                self.set_buffer_text(focus, text)
+            }
+            SettingsFocus::CaptureDevice => {
+                let changed = self.set_input_selection(raw_device_selection(&text));
+                if changed {
+                    SettingsMutation::Changed
+                } else {
+                    SettingsMutation::None
+                }
+            }
+            SettingsFocus::PlaybackDevice => {
+                let changed = self.set_output_selection(raw_device_selection(&text));
+                if changed {
+                    SettingsMutation::Changed
+                } else {
+                    SettingsMutation::None
+                }
+            }
+            _ => SettingsMutation::None,
+        }
+    }
+
     pub fn option_label(&self, focus: SettingsFocus) -> String {
         match focus {
             SettingsFocus::Bitrate => format!("{} kbps", self.bitrate_bps() / 1000),
@@ -172,6 +281,8 @@ impl SettingsDraft {
             SettingsFocus::CaptureBuffer | SettingsFocus::PlaybackBuffer => self.buffer_text(focus),
             SettingsFocus::FormBindings => form_bindings_label(self.form_bindings).to_string(),
             SettingsFocus::Theme => self.theme.label().to_string(),
+            SettingsFocus::RawCaptureDevice => on_off(self.input_raw),
+            SettingsFocus::RawPlaybackDevice => on_off(self.output_raw),
             SettingsFocus::CaptureDevice
             | SettingsFocus::PlaybackDevice
             | SettingsFocus::Refresh
@@ -184,6 +295,9 @@ impl SettingsDraft {
         match focus {
             SettingsFocus::CaptureDevice => "Capture device used when voice starts.",
             SettingsFocus::PlaybackDevice => "Playback device used for remote voice.",
+            SettingsFocus::RawCaptureDevice | SettingsFocus::RawPlaybackDevice => {
+                "Type a raw ALSA device string (e.g. hw:0,0) instead of picking an enumerated device."
+            }
             SettingsFocus::Bitrate => "Opus target bitrate for outgoing voice packets.",
             SettingsFocus::Denoise => {
                 "Noise suppression before encoding. Useful for fans and room noise."
@@ -241,6 +355,14 @@ impl SettingsDraft {
                 self.theme = ThemeChoice::ALL[next];
                 SettingsMutation::Changed
             }
+            SettingsFocus::RawCaptureDevice => {
+                self.input_raw = !self.input_raw;
+                SettingsMutation::Changed
+            }
+            SettingsFocus::RawPlaybackDevice => {
+                self.output_raw = !self.output_raw;
+                SettingsMutation::Changed
+            }
             SettingsFocus::CaptureDevice
             | SettingsFocus::PlaybackDevice
             | SettingsFocus::CaptureBuffer
@@ -254,7 +376,9 @@ impl SettingsDraft {
     pub fn activate(&mut self, focus: SettingsFocus) -> SettingsMutation {
         match focus {
             SettingsFocus::Denoise => self.cycle_denoise(1),
-            SettingsFocus::EchoCancellation => self.toggle_echo_cancellation(),
+            SettingsFocus::EchoCancellation
+            | SettingsFocus::RawCaptureDevice
+            | SettingsFocus::RawPlaybackDevice => self.adjust(focus, 1),
             SettingsFocus::Bitrate
             | SettingsFocus::Amplification
             | SettingsFocus::FormBindings
@@ -365,6 +489,58 @@ fn parse_buffer_size(text: &str) -> BufferSize {
         Ok(samples) if samples > 0 => BufferSize::Samples(samples),
         _ => BufferSize::Default,
     }
+}
+
+/// Validates buffer field text, returning an error message when it is neither
+/// `default`/empty nor an integer within `[MIN_BUFFER_SAMPLES, MAX_BUFFER_SAMPLES]`.
+fn buffer_field_error(text: &str) -> Option<String> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("default") {
+        return None;
+    }
+    let invalid = || {
+        Some(format!(
+            "buffer must be \"default\" or {MIN_BUFFER_SAMPLES}-{MAX_BUFFER_SAMPLES} samples"
+        ))
+    };
+    match trimmed.parse::<u32>() {
+        Ok(samples) if (MIN_BUFFER_SAMPLES..=MAX_BUFFER_SAMPLES).contains(&samples) => None,
+        _ => invalid(),
+    }
+}
+
+/// Validates a raw ALSA device string. Empty means system default. Otherwise it
+/// must look like an ALSA pcm name.
+fn raw_device_error(text: &str) -> Option<String> {
+    let trimmed = text.trim();
+    let pcm = trimmed
+        .strip_prefix("alsa:")
+        .or_else(|| trimmed.strip_prefix("alsa/"))
+        .unwrap_or(trimmed);
+    if pcm.is_empty() || crate::audio::looks_like_alsa_pcm_name(pcm) {
+        return None;
+    }
+    Some("not a valid ALSA device string (e.g. hw:0,0)".to_string())
+}
+
+/// Maps raw device editor text to a selection: trimmed, with an empty string
+/// becoming `None` (system default).
+fn raw_device_selection(text: &str) -> Option<String> {
+    let trimmed = text.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
+}
+
+/// Detects whether a stored device selection was a hand-entered raw ALSA pcm
+/// string rather than an enumerated picker id (which carries an `alsa:` backend
+/// prefix). Used to seed raw mode when settings open on a hand-edited config.
+fn is_raw_device_selection(selection: &str) -> bool {
+    if let Some(forced) = selection.strip_prefix("alsa/") {
+        return crate::audio::looks_like_alsa_pcm_name(forced);
+    }
+    if selection.starts_with("alsa:") {
+        return false;
+    }
+    crate::audio::looks_like_alsa_pcm_name(selection)
 }
 
 fn amplification_index(value: f32) -> usize {
@@ -995,6 +1171,74 @@ mod tests {
         // Backward wraps the other way.
         draft.adjust(SettingsFocus::Theme, -1);
         assert_eq!(draft.theme(), ThemeChoice::Base16Light);
+    }
+
+    #[test]
+    fn buffer_field_error_accepts_default_and_in_range() {
+        assert!(buffer_field_error("default").is_none());
+        assert!(buffer_field_error("").is_none());
+        assert!(buffer_field_error("  960 ").is_none());
+        assert!(buffer_field_error(&MIN_BUFFER_SAMPLES.to_string()).is_none());
+        assert!(buffer_field_error(&MAX_BUFFER_SAMPLES.to_string()).is_none());
+    }
+
+    #[test]
+    fn buffer_field_error_rejects_out_of_range_and_garbage() {
+        assert!(buffer_field_error("0").is_some());
+        assert!(buffer_field_error(&(MAX_BUFFER_SAMPLES + 1).to_string()).is_some());
+        assert!(buffer_field_error("abc").is_some());
+        assert!(buffer_field_error("12.5").is_some());
+    }
+
+    #[test]
+    fn raw_device_error_only_flags_invalid_when_raw_mode_on() {
+        let mut draft = SettingsDraft::from_audio(&AudioConfig::default());
+        // Off: device fields never report an error.
+        let _ = draft.set_input_selection(Some("not a device".to_string()));
+        assert!(draft.field_error(SettingsFocus::CaptureDevice).is_none());
+
+        // On: a garbage string is flagged, a valid ALSA pcm is accepted.
+        draft.activate(SettingsFocus::RawCaptureDevice);
+        assert!(draft.input_raw());
+        assert!(draft.field_error(SettingsFocus::CaptureDevice).is_some());
+        assert!(draft.device_string_invalid().is_some());
+
+        let _ = draft.commit_field_text(SettingsFocus::CaptureDevice, "hw:0,0".to_string());
+        assert!(draft.field_error(SettingsFocus::CaptureDevice).is_none());
+        assert_eq!(draft.input_selection(), Some("hw:0,0"));
+        assert!(draft.device_string_invalid().is_none());
+
+        // Empty means system default and is valid.
+        let _ = draft.commit_field_text(SettingsFocus::CaptureDevice, String::new());
+        assert_eq!(draft.input_selection(), None);
+        assert!(draft.field_error(SettingsFocus::CaptureDevice).is_none());
+    }
+
+    #[test]
+    fn field_kind_flips_device_row_with_raw_mode() {
+        let mut draft = SettingsDraft::from_audio(&AudioConfig::default());
+        assert_eq!(
+            draft.field_kind(SettingsFocus::CaptureDevice),
+            FormFieldKind::Select
+        );
+        draft.activate(SettingsFocus::RawCaptureDevice);
+        assert_eq!(
+            draft.field_kind(SettingsFocus::CaptureDevice),
+            FormFieldKind::Text
+        );
+    }
+
+    #[test]
+    fn from_audio_seeds_raw_mode_from_hand_entered_pcm() {
+        let config = AudioConfig {
+            input_device_id: Some("plughw:CARD=PCH,DEV=0".to_string()),
+            output_device_id: Some("alsa:hw:CARD=2,DEV=0".to_string()),
+            ..AudioConfig::default()
+        };
+        let draft = SettingsDraft::from_audio(&config);
+        // Bare pcm string is raw, a picker backend id (alsa:...) is not.
+        assert!(draft.input_raw());
+        assert!(!draft.output_raw());
     }
 
     #[test]
