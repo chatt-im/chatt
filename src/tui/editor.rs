@@ -1,7 +1,5 @@
 use extui::{Buffer, Rect};
-use extui_editor::{
-    Editor, Replacement, StyleRun, TextBuffer, TrackedChange, bindings as editor_bindings,
-};
+use extui_editor::{Editor, Replacement, StyleRun, TextBuffer, TrackedChange};
 use tinyhl::{Highlighter, Source};
 
 use crate::theme;
@@ -74,73 +72,4 @@ impl EditorHighlighter {
         }
         editor.render_with_styles(area, buf, &self.runs);
     }
-}
-
-pub(crate) fn focus_join_input_editor(editor: &mut Editor) {
-    editor.enter_insert_mode();
-    editor.set_cursor_offset(editor.text_len());
-}
-
-pub(crate) struct FormEditor<F> {
-    editor: Editor,
-    active: Option<F>,
-}
-
-impl<F> Default for FormEditor<F> {
-    fn default() -> Self {
-        Self {
-            editor: new_form_editor(""),
-            active: None,
-        }
-    }
-}
-
-impl<F: Copy + Eq> FormEditor<F> {
-    pub(crate) fn new() -> Self {
-        Self::default()
-    }
-
-    pub(crate) fn active(&self) -> Option<F> {
-        self.active
-    }
-
-    pub(crate) fn focus(&mut self, field: F, value: &str) -> Option<(F, String)> {
-        if self.active == Some(field) {
-            return None;
-        }
-        let previous = self.active.map(|field| (field, self.editor.text()));
-        self.editor.set_lines(value);
-        focus_join_input_editor(&mut self.editor);
-        self.active = Some(field);
-        previous
-    }
-
-    pub(crate) fn clear_focus(&mut self) -> Option<(F, String)> {
-        let previous = self.active.map(|field| (field, self.editor.text()));
-        self.active = None;
-        previous
-    }
-
-    pub(crate) fn editor_mut(&mut self) -> &mut Editor {
-        &mut self.editor
-    }
-
-    pub(crate) fn text(&self) -> String {
-        self.editor.text()
-    }
-
-    pub(crate) fn render(&mut self, area: Rect, buf: &mut Buffer) {
-        self.editor.render(area, buf);
-    }
-}
-
-fn new_form_editor(value: &str) -> Editor {
-    let mut editor = Editor::with_bindings(editor_bindings::nano());
-    editor.set_single_line(true);
-    editor.set_wrap(false);
-    editor.set_height_bounds(1, 1);
-    editor.set_theme(theme::join_input_editor_theme());
-    editor.set_lines(value);
-    focus_join_input_editor(&mut editor);
-    editor
 }

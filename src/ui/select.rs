@@ -64,6 +64,19 @@ impl FuzzySelect {
         }
     }
 
+    pub fn select_item_index(&mut self, item_index: usize) -> bool {
+        let Some(cursor) = self
+            .entries
+            .iter()
+            .position(|entry| entry.item_index == item_index)
+        else {
+            return false;
+        };
+        self.cursor = cursor;
+        self.selected_item = Some(item_index);
+        true
+    }
+
     pub fn refresh<T: SelectableItem>(&mut self, items: &[T]) {
         self.entries.clear();
 

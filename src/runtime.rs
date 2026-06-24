@@ -54,6 +54,11 @@ pub(crate) fn run_app(
                         return Ok(());
                     }
                 }
+                Event::Mouse(mouse) => {
+                    if matches!(app.process_mouse(mouse), Action::Quit) {
+                        return Ok(());
+                    }
+                }
                 Event::Resized => {
                     let (new_w, new_h) = terminal.size()?;
                     buffer.resize(new_w, new_h);

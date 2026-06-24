@@ -26,12 +26,12 @@ pub(crate) enum ModeKind {
 impl ModeKind {
     pub(crate) fn label(self) -> &'static str {
         match self {
-            ModeKind::ServerSelect => "SERVERS",
-            ModeKind::ServerEdit => "SERVER",
-            ModeKind::Workspace => "WORKSPACE",
-            ModeKind::Insert => "INSERT",
-            ModeKind::Settings => "SETTINGS",
-            ModeKind::Dialog => "DIALOG",
+            ModeKind::ServerSelect => "Servers",
+            ModeKind::ServerEdit => "Server",
+            ModeKind::Workspace => "Workspace",
+            ModeKind::Insert => "Insert",
+            ModeKind::Settings => "Settings",
+            ModeKind::Dialog => "Dialog",
         }
     }
 
@@ -104,16 +104,11 @@ pub(crate) fn process_key(app: &mut App, key: KeyEvent) -> Action {
     if app.mode == theme::UiMode::ServerEdit {
         return app.process_server_edit_key(key);
     }
+    if app.mode == theme::UiMode::Settings {
+        return app.process_settings_key(key);
+    }
 
     if app.handle_volume_dialog_key(key) {
-        return Action::Continue;
-    }
-
-    if app.handle_settings_search_key(key) {
-        return Action::Continue;
-    }
-
-    if app.handle_settings_buffer_key(key) {
         return Action::Continue;
     }
 

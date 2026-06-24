@@ -34,6 +34,7 @@ pub(crate) enum SettingsField {
     Amplification,
     InputBuffer,
     OutputBuffer,
+    FormBindings,
     Refresh,
     Save,
     Close,
@@ -106,14 +107,15 @@ impl ServerField {
 impl SettingsField {
     fn label(self) -> &'static str {
         match self {
-            SettingsField::InputDevice => "input",
-            SettingsField::OutputDevice => "output",
+            SettingsField::InputDevice => "capture",
+            SettingsField::OutputDevice => "playback",
             SettingsField::Bitrate => "bitrate",
             SettingsField::Denoise => "denoise",
             SettingsField::EchoCancellation => "echo",
             SettingsField::Amplification => "gain",
-            SettingsField::InputBuffer => "input buffer",
-            SettingsField::OutputBuffer => "output buffer",
+            SettingsField::InputBuffer => "capture buffer",
+            SettingsField::OutputBuffer => "playback buffer",
+            SettingsField::FormBindings => "form bindings",
             SettingsField::Refresh => "refresh",
             SettingsField::Save => "save settings",
             SettingsField::Close => "close settings",

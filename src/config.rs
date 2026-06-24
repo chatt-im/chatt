@@ -253,6 +253,8 @@ pub struct UiConfig {
     pub max_messages: u32,
     #[toml(default = 24)]
     pub overscan: u32,
+    #[toml(default)]
+    pub form_bindings: FormBindings,
 }
 
 fn default_placeholder() -> String {
@@ -267,8 +269,17 @@ impl Default for UiConfig {
             placeholder: default_placeholder(),
             max_messages: 50_000,
             overscan: 24,
+            form_bindings: FormBindings::Standard,
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Toml)]
+#[toml(FromToml, ToToml, rename_all = "kebab-case")]
+pub enum FormBindings {
+    #[default]
+    Standard,
+    Vim,
 }
 
 #[derive(Clone, Debug, Toml)]

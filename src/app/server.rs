@@ -1,14 +1,14 @@
-use extui::{
-    Buffer, Ellipsis, HAlign, Rect, Style, event::KeyCode, event::KeyEvent, event::KeyEventKind,
-};
+use extui::{Buffer, Ellipsis, Rect, event::KeyEvent, event::MouseEvent};
 use ring::rand::SecureRandom;
 use rpc::{control::InviteTicket, crypto::encode_hex};
 
 use crate::{
-    config::{Config, ServerEntry, validate_server_entry},
+    config::{Config, FormBindings, ServerEntry, validate_server_entry},
     theme,
-    tui::editor::FormEditor,
-    tui::widgets,
+    tui::{
+        form::{FormAction, FormFieldKind, FormMouseIntent, FormState},
+        widgets,
+    },
     ui::select::SelectableItem,
 };
 
@@ -55,13 +55,6 @@ impl ServerEditFocus {
         ServerEditFocus::SaveJoin,
         ServerEditFocus::Cancel,
     ];
-
-    pub(crate) fn index(self) -> usize {
-        Self::ORDER
-            .iter()
-            .position(|focus| *focus == self)
-            .unwrap_or(0)
-    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -82,8 +75,7 @@ pub(crate) struct ServerEditDraft {
     udp_addr: String,
     udp_probe_addr: String,
     room_id: String,
-    focus: ServerEditFocus,
-    editor: FormEditor<ServerEditFocus>,
+    form: FormState<ServerEditFocus>,
 }
 
 pub(crate) struct ServerEditUpdate {
@@ -96,7 +88,7 @@ pub(crate) struct PendingPair {
 }
 
 impl ServerEditDraft {
-    pub(crate) fn from_server(server: &ServerEntry) -> Self {
+    pub(crate) fn from_server(server: &ServerEntry, bindings: FormBindings) -> Self {
         let mut draft = Self {
             original_alias: server.alias.clone(),
             user: server.user.clone(),
@@ -108,146 +100,99 @@ impl ServerEditDraft {
             udp_addr: server.udp_addr.clone(),
             udp_probe_addr: server.udp_probe_addr.clone().unwrap_or_default(),
             room_id: server.room_id.to_string(),
-            focus: ServerEditFocus::Alias,
-            editor: FormEditor::new(),
+            form: FormState::with_order(ServerEditFocus::Alias, bindings, ServerEditFocus::ORDER),
         };
-        draft.focus_active_editor();
+        let alias = draft.alias.clone();
+        draft.form.focus_text(ServerEditFocus::Alias, &alias, false);
         draft
     }
 
     pub(crate) fn focus(&self) -> ServerEditFocus {
-        self.focus
+        self.form.focus()
     }
 
     pub(crate) fn handle_key(&mut self, key: KeyEvent) -> ServerEditEvent {
-        if matches!(key.kind, KeyEventKind::Release) {
-            return ServerEditEvent::Consumed;
+        let kind = self.focus_kind();
+        let event = self.form.handle_key(key, kind);
+        self.apply_commit(event.commit);
+        match event.action {
+            FormAction::None | FormAction::TextChanged | FormAction::Scrolled => {
+                ServerEditEvent::Consumed
+            }
+            FormAction::Cancel => ServerEditEvent::Cancel,
+            FormAction::FocusMoved => ServerEditEvent::Consumed,
+            FormAction::Adjust(delta) => {
+                if self.focus_is_action() {
+                    self.move_focus(delta);
+                }
+                ServerEditEvent::Consumed
+            }
+            FormAction::Activate => self.activate_focus(),
         }
-        match key.code {
-            KeyCode::Esc => ServerEditEvent::Cancel,
-            KeyCode::Tab | KeyCode::Down => {
-                self.move_focus(1);
-                ServerEditEvent::Consumed
+    }
+
+    pub(crate) fn handle_mouse(&mut self, mouse: MouseEvent) -> ServerEditEvent {
+        let event = self.form.handle_mouse(mouse);
+        self.apply_commit(event.commit);
+        match event.intent {
+            FormMouseIntent::None => ServerEditEvent::Consumed,
+            FormMouseIntent::Activate(field) => {
+                let commit = self.form.set_focus(field);
+                self.apply_commit(commit);
+                self.activate_focus()
             }
-            KeyCode::BackTab | KeyCode::Up => {
-                self.move_focus(-1);
-                ServerEditEvent::Consumed
-            }
-            KeyCode::Enter => match self.focus {
-                ServerEditFocus::Save => ServerEditEvent::Save {
-                    join_after_save: false,
-                },
-                ServerEditFocus::SaveJoin => ServerEditEvent::Save {
-                    join_after_save: true,
-                },
-                ServerEditFocus::Cancel => ServerEditEvent::Cancel,
-                _ => {
-                    self.move_focus(1);
-                    ServerEditEvent::Consumed
-                }
-            },
-            _ => {
-                if let Some(editor) = self.focused_editor_mut() {
-                    editor.send_key(&key);
+            FormMouseIntent::Adjust(field, delta) => {
+                let commit = self.form.set_focus(field);
+                self.apply_commit(commit);
+                if self.focus_is_action() {
+                    self.move_focus(delta);
                 }
                 ServerEditEvent::Consumed
             }
+            FormMouseIntent::Text(field, area, column) => {
+                let value = self.field_value(field).to_string();
+                let commit = self.form.focus_text_at(field, &value, area, column, true);
+                self.apply_commit(commit);
+                ServerEditEvent::Consumed
+            }
+            FormMouseIntent::PickerItem(_, _) => ServerEditEvent::Consumed,
         }
     }
 
     pub(crate) fn render(&mut self, area: Rect, buf: &mut Buffer) {
         area.with(theme::BACKGROUND).fill(buf);
-        let mut rows = area;
-        rows.take_top(1)
-            .with(theme::STATUS_SECTION | extui::vt::Modifier::BOLD)
-            .with(Ellipsis(true))
-            .text(buf, &format!(" EDIT SERVER {} ", self.original_alias));
-        rows.take_top(1).with(theme::BACKGROUND).fill(buf);
-        draw_detail(rows.take_top(1), buf, "User", &self.user);
-        draw_detail(rows.take_top(1), buf, "Token", &short_key(&self.token));
-        draw_detail(
-            rows.take_top(1),
-            buf,
-            "Key",
-            &short_key(&self.server_public_key),
-        );
-        rows.take_top(1).with(theme::BACKGROUND).fill(buf);
-        self.draw_field(rows.take_top(1), buf, "Alias", ServerEditFocus::Alias);
-        self.draw_field(
-            rows.take_top(1),
-            buf,
-            "Display",
-            ServerEditFocus::DisplayName,
-        );
-        self.draw_field(rows.take_top(1), buf, "TCP", ServerEditFocus::TcpAddr);
-        self.draw_field(rows.take_top(1), buf, "UDP", ServerEditFocus::UdpAddr);
-        self.draw_field(
-            rows.take_top(1),
-            buf,
-            "Probe",
-            ServerEditFocus::UdpProbeAddr,
-        );
-        self.draw_field(rows.take_top(1), buf, "Room", ServerEditFocus::RoomId);
-        rows.take_top(1).with(theme::BACKGROUND).fill(buf);
-        let mut buttons = rows.take_top(1);
-        let width = (buttons.w / 3).max(1);
-        draw_button(
-            buttons.take_left(width as i32),
-            buf,
-            "Save",
-            self.focus == ServerEditFocus::Save,
-        );
-        draw_button(
-            buttons.take_left(width as i32),
-            buf,
-            "Save and join",
-            self.focus == ServerEditFocus::SaveJoin,
-        );
-        draw_button(
-            buttons,
-            buf,
-            "Cancel",
-            self.focus == ServerEditFocus::Cancel,
-        );
+        self.form.begin_frame(area);
+        let title = self.form.next_row(1);
+        if let Some(area) = title.rect {
+            area.with(theme::STATUS_SECTION | extui::vt::Modifier::BOLD)
+                .with(Ellipsis(true))
+                .text(buf, &format!(" Edit Server {} ", self.original_alias));
+        }
+        self.form.spacer(1);
+        self.draw_detail_row(buf, "User", self.user.clone());
+        self.draw_detail_row(buf, "Token", short_key(&self.token));
+        self.draw_detail_row(buf, "Key", short_key(&self.server_public_key));
+        self.form.spacer(1);
+        self.draw_field(buf, "Alias", ServerEditFocus::Alias);
+        self.draw_field(buf, "Display", ServerEditFocus::DisplayName);
+        self.draw_field(buf, "TCP", ServerEditFocus::TcpAddr);
+        self.draw_field(buf, "UDP", ServerEditFocus::UdpAddr);
+        self.draw_field(buf, "Probe", ServerEditFocus::UdpProbeAddr);
+        self.draw_field(buf, "Room", ServerEditFocus::RoomId);
+        self.form.spacer(1);
+        self.draw_buttons(buf);
+        self.form.finish_frame();
     }
 
     fn move_focus(&mut self, delta: isize) {
-        self.commit_active_editor();
-        let index = self.focus.index();
-        let next =
-            (index as isize + delta).rem_euclid(ServerEditFocus::ORDER.len() as isize) as usize;
-        self.focus = ServerEditFocus::ORDER[next];
-        self.focus_active_editor();
-    }
-
-    fn focused_editor_mut(&mut self) -> Option<&mut extui_editor::Editor> {
-        self.focus_active_editor();
-        match self.focus {
-            ServerEditFocus::Alias
-            | ServerEditFocus::DisplayName
-            | ServerEditFocus::TcpAddr
-            | ServerEditFocus::UdpAddr
-            | ServerEditFocus::UdpProbeAddr
-            | ServerEditFocus::RoomId => Some(self.editor.editor_mut()),
-            ServerEditFocus::Save | ServerEditFocus::SaveJoin | ServerEditFocus::Cancel => None,
-        }
-    }
-
-    fn focus_active_editor(&mut self) {
-        if self.focused_text_field() {
-            let value = self.field_value(self.focus).to_string();
-            if let Some((field, text)) = self.editor.focus(self.focus, &value) {
-                self.set_field_value(field, text);
-            }
-        } else if let Some((field, text)) = self.editor.clear_focus() {
-            self.set_field_value(field, text);
-        }
+        let commit = self.form.move_focus(delta);
+        self.apply_commit(commit);
     }
 
     pub(crate) fn to_update(&self) -> Result<ServerEditUpdate, String> {
         let mut draft = self.clone_values();
-        if let Some(field) = self.editor.active() {
-            draft.set_field_value(field, self.editor.text());
+        if let Some(field) = self.form.active_text() {
+            draft.set_field_value(field, self.form.text());
         }
         let room_id = draft
             .room_id
@@ -273,8 +218,8 @@ impl ServerEditDraft {
         })
     }
 
-    fn commit_active_editor(&mut self) {
-        if let Some((field, text)) = self.editor.clear_focus() {
+    fn apply_commit(&mut self, commit: Option<(ServerEditFocus, String)>) {
+        if let Some((field, text)) = commit {
             self.set_field_value(field, text);
         }
     }
@@ -292,22 +237,33 @@ impl ServerEditDraft {
     }
 
     fn active_text(&self, field: ServerEditFocus) -> String {
-        if self.editor.active() == Some(field) {
-            self.editor.text()
+        if self.form.active_text() == Some(field) {
+            self.form.text()
         } else {
             self.field_value(field).to_string()
         }
     }
 
-    fn draw_field(&mut self, area: Rect, buf: &mut Buffer, label: &str, field: ServerEditFocus) {
-        if area.is_empty() {
-            return;
+    fn draw_detail_row(&mut self, buf: &mut Buffer, label: &str, value: String) {
+        let row = self.form.next_row(1);
+        if let Some(area) = row.rect {
+            draw_detail(area, buf, label, &value);
         }
-        let focused = self.focus == field;
+    }
+
+    fn draw_field(&mut self, buf: &mut Buffer, label: &str, field: ServerEditFocus) {
+        let row = self.form.next_row(1);
+        let Some(area) = self.form.register_field(row, field, FormFieldKind::Text) else {
+            return;
+        };
+        let focused = self.form.focus() == field;
         if focused {
+            let value = self.field_value(field).to_string();
+            let commit = self.form.focus_text(field, &value, false);
+            self.apply_commit(commit);
             let input = widgets::draw_labeled_editor_frame(area, buf, LABEL_WIDTH, label, true);
-            self.focus_active_editor();
-            self.editor.render(input, buf);
+            self.form.register_text_area(field, input);
+            self.form.render_editor(input, buf);
         } else {
             widgets::draw_labeled_value(
                 area,
@@ -321,16 +277,53 @@ impl ServerEditDraft {
         }
     }
 
+    fn draw_buttons(&mut self, buf: &mut Buffer) {
+        let row = self.form.next_row(1);
+        let Some(area) = row.rect else {
+            for field in [
+                ServerEditFocus::Save,
+                ServerEditFocus::SaveJoin,
+                ServerEditFocus::Cancel,
+            ] {
+                self.form.register_field(row, field, FormFieldKind::Action);
+            }
+            return;
+        };
+        let mut buttons = area;
+        let width = (buttons.w / 3).max(1);
+        let specs = [
+            (ServerEditFocus::Save, "Save"),
+            (ServerEditFocus::SaveJoin, "Save and join"),
+            (ServerEditFocus::Cancel, "Cancel"),
+        ];
+        for (index, (field, label)) in specs.into_iter().enumerate() {
+            let button = if index == 2 {
+                buttons
+            } else {
+                buttons.take_left(width as i32)
+            };
+            self.form
+                .register_rect(row, button, field, FormFieldKind::Action);
+            widgets::draw_action(button, buf, label, self.form.focus() == field);
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn active_editor_address(&mut self) -> Option<usize> {
-        self.focused_editor_mut()
-            .map(|editor| editor as *mut _ as usize)
+        let focus = self.form.focus();
+        if !self.focused_text_field() {
+            return None;
+        }
+        let value = self.field_value(focus).to_string();
+        let commit = self.form.focus_text(focus, &value, false);
+        self.apply_commit(commit);
+        Some(self.form.editor_mut() as *mut _ as usize)
     }
 
     #[cfg(test)]
     pub(crate) fn set_active_editor_text(&mut self, text: &str) {
-        if let Some(editor) = self.focused_editor_mut() {
-            editor.set_lines(text);
+        if self.focused_text_field() {
+            self.form.editor_mut().set_lines(text);
         }
     }
 
@@ -341,7 +334,7 @@ impl ServerEditDraft {
 
     fn focused_text_field(&self) -> bool {
         matches!(
-            self.focus,
+            self.form.focus(),
             ServerEditFocus::Alias
                 | ServerEditFocus::DisplayName
                 | ServerEditFocus::TcpAddr
@@ -375,8 +368,42 @@ impl ServerEditDraft {
             udp_addr: self.udp_addr.clone(),
             udp_probe_addr: self.udp_probe_addr.clone(),
             room_id: self.room_id.clone(),
-            focus: self.focus,
-            editor: FormEditor::new(),
+            form: FormState::with_order(
+                self.form.focus(),
+                FormBindings::Standard,
+                ServerEditFocus::ORDER,
+            ),
+        }
+    }
+
+    fn focus_kind(&self) -> FormFieldKind {
+        if self.focused_text_field() {
+            FormFieldKind::Text
+        } else {
+            FormFieldKind::Action
+        }
+    }
+
+    fn focus_is_action(&self) -> bool {
+        matches!(
+            self.form.focus(),
+            ServerEditFocus::Save | ServerEditFocus::SaveJoin | ServerEditFocus::Cancel
+        )
+    }
+
+    fn activate_focus(&mut self) -> ServerEditEvent {
+        match self.form.focus() {
+            ServerEditFocus::Save => ServerEditEvent::Save {
+                join_after_save: false,
+            },
+            ServerEditFocus::SaveJoin => ServerEditEvent::Save {
+                join_after_save: true,
+            },
+            ServerEditFocus::Cancel => ServerEditEvent::Cancel,
+            _ => {
+                self.move_focus(1);
+                ServerEditEvent::Consumed
+            }
         }
     }
 }
@@ -386,23 +413,6 @@ fn draw_detail(area: Rect, buf: &mut Buffer, label: &str, value: &str) {
         return;
     }
     widgets::draw_labeled_value(area, buf, LABEL_WIDTH, label, value, false, false);
-}
-
-fn draw_button(area: Rect, buf: &mut Buffer, label: &str, focused: bool) {
-    if area.is_empty() {
-        return;
-    }
-    let style = if focused {
-        Style::DEFAULT
-            .with_bg_rgb(0x35, 0x3b, 0x46)
-            .with_fg_rgb(0xf0, 0xf2, 0xe8)
-    } else {
-        theme::BACKGROUND.patch(theme::TEXT)
-    };
-    area.with(style)
-        .with(HAlign::Center)
-        .with(Ellipsis(true))
-        .text(buf, &format!(" {label} "));
 }
 
 fn short_key(value: &str) -> String {

@@ -31,6 +31,7 @@ max-composer-height = 6
 placeholder = "Message #lobby"
 max-messages = 50000
 overscan = 24
+form-bindings = "standard"
 
 [files]
 max-upload-bytes = 52428800
