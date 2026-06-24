@@ -1,4 +1,5 @@
 use extui::{Buffer, Ellipsis, HAlign, Rect, Style, vt::Modifier};
+use extui_editor::Editor;
 
 use crate::{
     audio::StatsSnapshot,
@@ -19,13 +20,13 @@ const SELECTED_DIM: Style = Style::DEFAULT
     .with_fg_rgb(0xd8, 0xdb, 0xd6);
 const PANEL_EDGE: Style = Style::DEFAULT.with_bg_rgb(0x18, 0x1b, 0x20);
 const SETTINGS_LABEL_WIDTH: u16 = 16;
-const SETTINGS_CONTROLS_ROWS: u16 = 10;
+const SETTINGS_CONTROLS_ROWS: u16 = 11;
 const MIN_DEVICE_PICKER_ROWS: u16 = 4;
 
 pub fn draw_settings(
     area: Rect,
     buf: &mut Buffer,
-    settings: &SettingsDraft,
+    settings: &mut SettingsDraft,
     focus: SettingsFocus,
     dirty: bool,
     capture: Option<&StatsSnapshot>,
@@ -325,7 +326,7 @@ fn draw_metadata_line(area: Rect, buf: &mut Buffer, label: &str, value: &str) {
 fn draw_settings_controls(
     area: Rect,
     buf: &mut Buffer,
-    settings: &SettingsDraft,
+    settings: &mut SettingsDraft,
     focus: SettingsFocus,
     dirty: bool,
     capture: Option<&StatsSnapshot>,
@@ -378,12 +379,20 @@ fn draw_settings_controls(
         focus == SettingsFocus::Amplification,
         dirty,
     );
-    draw_settings_row(
+    draw_settings_input_row(
         rows.take_top(1),
         buf,
-        "Buffer",
-        settings.buffer_request().label(),
-        focus == SettingsFocus::Buffer,
+        "Input Buffer",
+        &mut settings.input_buffer,
+        focus == SettingsFocus::InputBuffer,
+        dirty,
+    );
+    draw_settings_input_row(
+        rows.take_top(1),
+        buf,
+        "Output Buffer",
+        &mut settings.output_buffer,
+        focus == SettingsFocus::OutputBuffer,
         dirty,
     );
     rows.take_top(1).with(theme::BACKGROUND).fill(buf);
@@ -405,6 +414,39 @@ fn draw_settings_controls(
         "Back to chat",
         focus == SettingsFocus::Close,
     );
+}
+
+/// Renders an editable settings row: the focused row hosts the live [`Editor`]
+/// (with cursor), unfocused rows show the editor's current text.
+fn draw_settings_input_row(
+    area: Rect,
+    buf: &mut Buffer,
+    label: &str,
+    editor: &mut Editor,
+    focused: bool,
+    dirty: bool,
+) {
+    let style = if focused {
+        SELECTED_DIM
+    } else {
+        theme::BACKGROUND
+    };
+    buf.clear_rect(area, style);
+    let mut row = area;
+    row.take_left(SETTINGS_LABEL_WIDTH as i32)
+        .with(style.patch(if focused { theme::GOOD } else { theme::MUTED }))
+        .with(Ellipsis(true))
+        .text(buf, label);
+    if row.is_empty() {
+        return;
+    }
+    if focused {
+        editor.render(row, buf);
+    } else {
+        row.with(style.patch(if dirty { theme::WARN } else { theme::TEXT }))
+            .with(Ellipsis(true))
+            .text(buf, &editor.text());
+    }
 }
 
 fn draw_settings_row(

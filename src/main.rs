@@ -570,7 +570,8 @@ impl UserVolumeDialog {
 
 struct AudioDeviceRefresh {
     id: u64,
-    buffer_request: BufferRequest,
+    input_buffer_request: BufferRequest,
+    output_buffer_request: BufferRequest,
     restart_preview: bool,
     input: Result<Vec<DeviceInfo>, String>,
     output: Result<Vec<DeviceInfo>, String>,
@@ -913,10 +914,11 @@ impl App {
         if self.mode == theme::UiMode::Settings {
             if errors.is_empty() {
                 self.set_status(format!(
-                    "found {} input device(s), {} output device(s) ({})",
+                    "found {} input device(s), {} output device(s) (in {}, out {})",
                     input_count.unwrap_or(0),
                     output_count.unwrap_or(0),
-                    refresh.buffer_request.label()
+                    refresh.input_buffer_request.label(),
+                    refresh.output_buffer_request.label(),
                 ));
             } else {
                 self.set_error(format!("failed to refresh {}", errors.join("; ")));
@@ -1137,6 +1139,10 @@ impl App {
         }
 
         if self.handle_settings_search_key(key) {
+            return Action::Continue;
+        }
+
+        if self.handle_settings_buffer_key(key) {
             return Action::Continue;
         }
 
@@ -1397,6 +1403,40 @@ impl App {
         }
     }
 
+    /// Routes printable input and in-line editing keys to the focused buffer
+    /// editor, leaving navigation keys (arrows up/down, Tab, Enter, Esc) for the
+    /// settings bindings layer. Mirrors the audio picker's search editing.
+    fn handle_settings_buffer_key(&mut self, key: KeyEvent) -> bool {
+        if self.mode != theme::UiMode::Settings || matches!(key.kind, KeyEventKind::Release) {
+            return false;
+        }
+        let focus = self.settings_focus;
+        let Some(editor) = self.settings.buffer_editor_mut(focus) else {
+            return false;
+        };
+        let editing = match key.code {
+            KeyCode::Char(ch) => !ch.is_control(),
+            KeyCode::Backspace
+            | KeyCode::Delete
+            | KeyCode::Left
+            | KeyCode::Right
+            | KeyCode::Home
+            | KeyCode::End => true,
+            _ => false,
+        };
+        if !editing {
+            return false;
+        }
+        let mutates = !matches!(
+            key.code,
+            KeyCode::Left | KeyCode::Right | KeyCode::Home | KeyCode::End
+        );
+        if editor.send_key(&key) && mutates {
+            self.mark_settings_dirty();
+        }
+        true
+    }
+
     fn cancel_open_audio_picker(&mut self) -> bool {
         if self.audio_input_picker.open {
             self.cancel_audio_input_picker();
@@ -1544,15 +1584,11 @@ impl App {
                 self.apply_active_capture_amplification(self.settings.max_amplification());
                 self.mark_settings_dirty();
             }
-            SettingsFocus::Buffer => {
-                self.settings.buffer_index = cycle_index(
-                    self.settings.buffer_index,
-                    BufferRequest::OPTIONS.len(),
-                    delta,
-                );
-                self.mark_settings_dirty();
-            }
-            SettingsFocus::Refresh | SettingsFocus::Save | SettingsFocus::Close => {}
+            SettingsFocus::InputBuffer
+            | SettingsFocus::OutputBuffer
+            | SettingsFocus::Refresh
+            | SettingsFocus::Save
+            | SettingsFocus::Close => {}
         }
     }
 
@@ -1571,9 +1607,10 @@ impl App {
             SettingsFocus::Close => self.close_settings(),
             SettingsFocus::InputDevice => self.activate_audio_input_picker(),
             SettingsFocus::OutputDevice => self.activate_audio_output_picker(),
-            SettingsFocus::Bitrate | SettingsFocus::Amplification | SettingsFocus::Buffer => {
+            SettingsFocus::Bitrate | SettingsFocus::Amplification => {
                 self.adjust_settings_focus(1);
             }
+            SettingsFocus::InputBuffer | SettingsFocus::OutputBuffer => {}
         }
     }
 
@@ -1935,22 +1972,25 @@ impl App {
         let id = self.next_audio_device_refresh_id;
         self.next_audio_device_refresh_id = self.next_audio_device_refresh_id.saturating_add(1);
         self.audio_device_refresh_in_flight = true;
-        let buffer_request = self.settings.buffer_request();
+        let input_buffer_request = self.settings.input_buffer_request();
+        let output_buffer_request = self.settings.output_buffer_request();
         let tx = self.audio_device_refresh_tx.clone();
         kvlog::info!(
             "audio device refresh started",
             id,
-            buffer_request = buffer_request.label(),
+            input_buffer_request = input_buffer_request.label(),
+            output_buffer_request = output_buffer_request.label(),
             capture_active = self.capture.is_some(),
             playback_active = self.playback.is_some(),
             settings_preview_capture = self.settings_preview_capture,
         );
         thread::spawn(move || {
-            let input = audio::input_devices(buffer_request);
-            let output = audio::output_devices(buffer_request);
+            let input = audio::input_devices(input_buffer_request);
+            let output = audio::output_devices(output_buffer_request);
             let _ = tx.send(AudioDeviceRefresh {
                 id,
-                buffer_request,
+                input_buffer_request,
+                output_buffer_request,
                 restart_preview,
                 input,
                 output,
@@ -2299,7 +2339,7 @@ impl App {
                 bitrate_bps: self.config.audio.bitrate_bps,
                 denoise: self.config.audio.denoise,
                 max_amplification: self.config.audio.max_amplification,
-                buffer_request: self.buffer_request(),
+                buffer_request: self.input_buffer_request(),
                 tuning: self.config.audio.latency.to_tuning(),
                 echo_control: Some(Arc::clone(&self.echo_control)),
             },
@@ -2399,7 +2439,7 @@ impl App {
             });
             match audio::start_live_playback(LivePlaybackConfig {
                 output_device_id: self.config.audio.output_device_id.clone(),
-                buffer_request: self.buffer_request(),
+                buffer_request: self.output_buffer_request(),
                 tuning: self.config.audio.latency.to_tuning(),
                 feedback_sender: Some(feedback_tx),
                 echo_control: Some(Arc::clone(&self.echo_control)),
@@ -2417,10 +2457,10 @@ impl App {
                             .as_ref()
                             .is_some_and(LiveCapture::buffer_fallback)
                     {
-                        self.set_error(format!(
-                            "audio buffer '{}' unsupported; using device default (higher latency)",
-                            self.buffer_request().label()
-                        ));
+                        self.set_error(
+                            "requested audio buffer unsupported; using device default (higher latency)"
+                                .to_string(),
+                        );
                     } else if capture_ok {
                         if self.config.soundboard.enabled {
                             self.set_status("soundboard voice active");
@@ -2460,8 +2500,18 @@ impl App {
         self.capture.take();
     }
 
-    fn buffer_request(&self) -> BufferRequest {
-        self.config.audio.buffer.to_request()
+    fn input_buffer_request(&self) -> BufferRequest {
+        self.config
+            .audio
+            .input_buffer
+            .to_request(config::DEFAULT_INPUT_BUFFER_SAMPLES)
+    }
+
+    fn output_buffer_request(&self) -> BufferRequest {
+        self.config
+            .audio
+            .output_buffer
+            .to_request(config::DEFAULT_OUTPUT_BUFFER_SAMPLES)
     }
 
     fn set_status(&mut self, status: impl Into<String>) {
@@ -2600,13 +2650,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         CliCommand::DebugAudioInputs => {
             let config_path = config::value_arg(&args, "--config");
             let config = Config::load(config_path.as_deref())?;
-            print_debug_audio_inputs(config.audio.buffer.to_request())?;
+            print_debug_audio_inputs(
+                config
+                    .audio
+                    .input_buffer
+                    .to_request(config::DEFAULT_INPUT_BUFFER_SAMPLES),
+            )?;
             return Ok(());
         }
         CliCommand::DebugAudioOutputs => {
             let config_path = config::value_arg(&args, "--config");
             let config = Config::load(config_path.as_deref())?;
-            print_debug_audio_outputs(config.audio.buffer.to_request())?;
+            print_debug_audio_outputs(
+                config
+                    .audio
+                    .output_buffer
+                    .to_request(config::DEFAULT_OUTPUT_BUFFER_SAMPLES),
+            )?;
             return Ok(());
         }
     }
@@ -2680,7 +2740,10 @@ fn run_audio_playback_test(
     let report = audio::run_live_audio_file_playback_test(LiveAudioFilePlaybackTestConfig {
         input_path: path,
         output_device_id: config.audio.output_device_id,
-        buffer_request: config.audio.buffer.to_request(),
+        buffer_request: config
+            .audio
+            .output_buffer
+            .to_request(config::DEFAULT_OUTPUT_BUFFER_SAMPLES),
         tuning: config.audio.latency.to_tuning(),
         packet_loss,
         seed,
@@ -2963,7 +3026,7 @@ fn print_debug_audio_report(
     println!("{report}");
 }
 
-fn join_input_editor(value: &str) -> Editor {
+pub(crate) fn join_input_editor(value: &str) -> Editor {
     let mut editor = Editor::with_bindings(editor_bindings::nano());
     editor.set_single_line(true);
     editor.set_wrap(false);
@@ -3288,7 +3351,7 @@ fn render(app: &mut App, buf: &mut Buffer) {
         theme::UiMode::Settings => ui::settings::draw_settings(
             screen,
             buf,
-            &app.settings,
+            &mut app.settings,
             app.settings_focus,
             app.settings_dirty,
             capture.as_ref(),
@@ -4869,7 +4932,8 @@ mod tests {
         app.next_audio_device_refresh_id = 1;
         app.handle_audio_device_refresh(AudioDeviceRefresh {
             id: 0,
-            buffer_request: BufferRequest::Default,
+            input_buffer_request: BufferRequest::Default,
+            output_buffer_request: BufferRequest::Default,
             restart_preview: false,
             input: Ok(Vec::new()),
             output: Ok(vec![DeviceInfo {
@@ -4924,7 +4988,8 @@ mod tests {
         app.next_audio_device_refresh_id = 1;
         app.handle_audio_device_refresh(AudioDeviceRefresh {
             id: 0,
-            buffer_request: BufferRequest::Default,
+            input_buffer_request: BufferRequest::Default,
+            output_buffer_request: BufferRequest::Default,
             restart_preview: false,
             input: Err("input backend unavailable".to_string()),
             output: Err("output backend unavailable".to_string()),

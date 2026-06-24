@@ -2,7 +2,7 @@ use std::time::Instant;
 
 use extui_bindings::{ActionId, InputKey, LayerId, Payload, Router, RouterBuilder, parse_sequence};
 use toml_spanner::Toml;
-use toml_spanner::{Context, Error, Failed, FromToml, Item};
+use toml_spanner::{Arena, Context, Error, Failed, FromToml, Item, OwnedItem, ToToml, ToTomlError};
 
 use crate::config::DEFAULT_CONFIG;
 
@@ -115,6 +115,10 @@ impl Actions {
 pub struct BindingRuntime {
     pub router: Router,
     pub actions: Actions,
+    /// The `[bindings]` table this runtime was parsed from, retained so it can
+    /// be re-emitted verbatim on save (the [`Router`] cannot be serialized
+    /// back to its source key sequences).
+    raw: OwnedItem,
 }
 
 pub struct PendingChord {
@@ -242,6 +246,13 @@ impl<'de> FromToml<'de> for BindingRuntime {
         Ok(Self {
             router: builder.build(),
             actions,
+            raw: OwnedItem::from(value),
         })
+    }
+}
+
+impl ToToml for BindingRuntime {
+    fn to_toml<'a>(&'a self, arena: &'a Arena) -> Result<Item<'a>, ToTomlError> {
+        self.raw.to_toml(arena)
     }
 }
