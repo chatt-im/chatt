@@ -12,6 +12,7 @@ use std::{
         mpsc::{self, Receiver, Sender},
     },
     thread,
+    time::{Duration, Instant},
 };
 
 use extui::Rect;
@@ -133,6 +134,35 @@ pub(crate) struct App {
     pub(crate) voice_bytes_received: u64,
     pub(crate) encoder_profile: LiveEncoderProfile,
     pub(crate) last_network_notice: Option<String>,
+    pub(crate) pending_audio_apply: Option<PendingAudioApply>,
+}
+
+/// A debounced request to restart audio streams so a slow settings-page change
+/// (device, bitrate, denoise, buffer size, latency tuning) takes effect. Rapid
+/// edits coalesce into one restart once `deadline` passes.
+pub(crate) struct PendingAudioApply {
+    capture: bool,
+    playback: bool,
+    deadline: Instant,
+}
+
+/// Debounce window before a scheduled audio restart fires. Coalesces rapid
+/// settings edits (cycling a choice, typing a buffer size) into one restart.
+const AUDIO_APPLY_DEBOUNCE: Duration = Duration::from_millis(400);
+
+/// Returns which audio streams must restart for an audio-config change to take
+/// effect, as `(capture, playback)`. Cheap in-place fields (amplification, echo
+/// cancellation) do not appear here because they never require a restart.
+fn audio_restart_flags(old: &config::AudioConfig, new: &config::AudioConfig) -> (bool, bool) {
+    let capture = old.input_device_id != new.input_device_id
+        || old.bitrate_bps != new.bitrate_bps
+        || old.denoise != new.denoise
+        || old.input_buffer != new.input_buffer
+        || old.latency != new.latency;
+    let playback = old.output_device_id != new.output_device_id
+        || old.output_buffer != new.output_buffer
+        || old.latency != new.latency;
+    (capture, playback)
 }
 pub(crate) struct AudioDeviceRefresh {
     pub(crate) id: u64,
@@ -242,6 +272,7 @@ impl App {
             voice_bytes_received: 0,
             encoder_profile: LiveEncoderProfile::DRED_20,
             last_network_notice: None,
+            pending_audio_apply: None,
             config,
         };
         app.rebuild_server_items();
@@ -1301,16 +1332,97 @@ impl App {
 
     fn apply_settings_mutation(&mut self, mutation: SettingsMutation) {
         match mutation {
-            SettingsMutation::None => {}
-            SettingsMutation::Changed => {
-                self.apply_settings_form_bindings();
-                self.mark_settings_dirty();
+            SettingsMutation::None => return,
+            SettingsMutation::Changed => self.apply_settings_form_bindings(),
+            SettingsMutation::AmplificationChanged(_) => {}
+        }
+        self.sync_settings_change();
+    }
+
+    /// Syncs the settings draft into the live config and applies it to running
+    /// audio. Cheap fields (amplification, echo cancellation) update in place.
+    /// Slow fields (device, bitrate, denoise, buffer, latency) schedule a
+    /// debounced stream restart. The on-disk file is only written by `Save`.
+    fn sync_settings_change(&mut self) {
+        let old = self.config.audio.clone();
+        self.config.audio = self.settings.to_audio();
+        self.config.ui.form_bindings = self.settings.form_bindings();
+        self.apply_echo_cancellation_setting();
+        self.apply_active_capture_amplification(self.config.audio.max_amplification);
+        let (capture, playback) = audio_restart_flags(&old, &self.config.audio);
+        if capture || playback {
+            self.schedule_audio_apply(capture, playback);
+        }
+        self.mark_settings_dirty();
+    }
+
+    fn schedule_audio_apply(&mut self, capture: bool, playback: bool) {
+        let deadline = Instant::now() + AUDIO_APPLY_DEBOUNCE;
+        match &mut self.pending_audio_apply {
+            Some(pending) => {
+                pending.capture |= capture;
+                pending.playback |= playback;
+                pending.deadline = deadline;
             }
-            SettingsMutation::AmplificationChanged(value) => {
-                self.apply_active_capture_amplification(value);
-                self.mark_settings_dirty();
+            None => {
+                self.pending_audio_apply = Some(PendingAudioApply {
+                    capture,
+                    playback,
+                    deadline,
+                })
             }
         }
+    }
+
+    /// Fires a debounced audio restart once its window elapses. Called once per
+    /// run-loop iteration from [`crate::runtime`].
+    pub(crate) fn tick(&mut self) {
+        let Some(pending) = &self.pending_audio_apply else {
+            return;
+        };
+        if Instant::now() < pending.deadline {
+            return;
+        }
+        let PendingAudioApply {
+            capture, playback, ..
+        } = self
+            .pending_audio_apply
+            .take()
+            .expect("pending checked above");
+        let mut applied = Vec::new();
+        if capture && self.capture.is_some() {
+            self.restart_capture_stream();
+            applied.push("capture");
+        }
+        if playback && self.playback.is_some() {
+            self.restart_playback_stream();
+            applied.push("playback");
+        }
+        if !applied.is_empty() {
+            self.set_status(format!("audio settings applied ({})", applied.join(", ")));
+        }
+    }
+
+    fn restart_capture_stream(&mut self) {
+        let was_preview = self.settings_preview_capture;
+        let in_call = self.voice_tx_enabled.load(Ordering::Relaxed);
+        self.stop_mic_capture();
+        if in_call {
+            if let Err(error) = self.ensure_mic_capture() {
+                self.set_error(format!("failed to restart capture: {error}"));
+            }
+        } else if was_preview {
+            self.start_settings_preview_capture();
+        }
+    }
+
+    fn restart_playback_stream(&mut self) {
+        if self.network.is_none() {
+            return;
+        }
+        self.set_network_playback_sink(None);
+        self.playback.take();
+        self.start_playback_stream(true);
     }
 
     fn apply_settings_commit(&mut self, commit: Option<(SettingsFocus, String)>) {
@@ -1626,33 +1738,17 @@ impl App {
     }
 
     fn save_settings(&mut self) {
+        // Edits already applied live; this captures any uncommitted buffer field
+        // then persists the live config to disk.
         self.commit_settings_form_text();
-        let restart_preview =
-            self.settings_preview_capture && !self.voice_tx_enabled.load(Ordering::Relaxed);
-        self.config.audio = self.settings.to_audio();
-        self.config.ui.form_bindings = self.settings.form_bindings();
-        self.apply_echo_cancellation_setting();
-        self.apply_active_capture_amplification(self.config.audio.max_amplification);
+        self.sync_settings_change();
         match self.config.save_runtime() {
             Ok(path) => {
                 self.config.config_path = Some(path.clone());
                 self.settings_dirty = false;
-                if restart_preview {
-                    self.stop_mic_capture();
-                    self.start_settings_preview_capture();
-                }
-                if (self.capture.is_some() && !self.settings_preview_capture)
-                    || self.playback.is_some()
-                {
-                    self.set_status(format!(
-                        "settings saved to {}; live amplification and echo cancellation updated, other audio applies after deafen/rejoin",
-                        path.display()
-                    ));
-                } else {
-                    self.chat
-                        .set_max_messages(self.config.ui.max_messages as usize);
-                    self.set_status(format!("settings saved to {}", path.display()));
-                }
+                self.chat
+                    .set_max_messages(self.config.ui.max_messages as usize);
+                self.set_status(format!("settings saved to {}", path.display()));
             }
             Err(error) => self.set_error(error),
         }
@@ -2097,59 +2193,67 @@ impl App {
             self.settings_preview_capture = false;
         }
         if self.playback.is_none() {
-            let (feedback_tx, feedback_rx) = mpsc::channel::<LivePlaybackFeedback>();
-            let Some(network) = &self.network else {
-                self.set_error("select a server before starting playback");
-                return;
-            };
-            let network_tx = network.sender();
-            thread::spawn(move || {
-                for feedback in feedback_rx {
-                    let _ = network_tx.send(NetworkCommand::PlaybackFeedback(feedback));
-                }
-            });
-            match audio::start_live_playback(LivePlaybackConfig {
-                output_device_id: self.config.audio.output_device_id.clone(),
-                buffer_request: self.output_buffer_request(),
-                tuning: self.config.audio.latency.to_tuning(),
-                feedback_sender: Some(feedback_tx),
-                echo_control: Some(Arc::clone(&self.echo_control)),
-            }) {
-                Ok(playback) => {
-                    let fell_back = playback.buffer_fallback();
-                    let sink = playback.sink();
-                    self.playback = Some(playback);
-                    self.playback_error = None;
-                    self.set_network_playback_sink(sink);
-                    self.apply_all_user_audio_controls();
-                    if fell_back
-                        || self
-                            .capture
-                            .as_ref()
-                            .is_some_and(LiveCapture::buffer_fallback)
-                    {
-                        self.set_error(
-                            "requested audio buffer unsupported; using device default (higher latency)"
-                                .to_string(),
-                        );
-                    } else if capture_ok {
-                        if self.config.soundboard.enabled {
-                            self.set_status("soundboard voice active");
-                        } else {
-                            self.set_status("voice active");
-                        }
-                    }
-                }
-                Err(error) => {
-                    self.set_network_playback_sink(None);
-                    self.playback = None;
-                    self.playback_error = Some(error.clone());
-                    self.set_error(format!("voice playback unavailable: {error}"));
-                }
-            }
+            self.start_playback_stream(capture_ok);
         }
         self.voice_packets_received = 0;
         self.voice_bytes_received = 0;
+    }
+
+    /// Builds the live playback stream from the current `config.audio`, wires its
+    /// feedback relay to the network, sets the playback sink, and re-applies
+    /// per-user audio controls. `capture_ok` gates the "voice active" status so a
+    /// failed capture start does not look successful.
+    fn start_playback_stream(&mut self, capture_ok: bool) {
+        let (feedback_tx, feedback_rx) = mpsc::channel::<LivePlaybackFeedback>();
+        let Some(network) = &self.network else {
+            self.set_error("select a server before starting playback");
+            return;
+        };
+        let network_tx = network.sender();
+        thread::spawn(move || {
+            for feedback in feedback_rx {
+                let _ = network_tx.send(NetworkCommand::PlaybackFeedback(feedback));
+            }
+        });
+        match audio::start_live_playback(LivePlaybackConfig {
+            output_device_id: self.config.audio.output_device_id.clone(),
+            buffer_request: self.output_buffer_request(),
+            tuning: self.config.audio.latency.to_tuning(),
+            feedback_sender: Some(feedback_tx),
+            echo_control: Some(Arc::clone(&self.echo_control)),
+        }) {
+            Ok(playback) => {
+                let fell_back = playback.buffer_fallback();
+                let sink = playback.sink();
+                self.playback = Some(playback);
+                self.playback_error = None;
+                self.set_network_playback_sink(sink);
+                self.apply_all_user_audio_controls();
+                if fell_back
+                    || self
+                        .capture
+                        .as_ref()
+                        .is_some_and(LiveCapture::buffer_fallback)
+                {
+                    self.set_error(
+                        "requested audio buffer unsupported; using device default (higher latency)"
+                            .to_string(),
+                    );
+                } else if capture_ok {
+                    if self.config.soundboard.enabled {
+                        self.set_status("soundboard voice active");
+                    } else {
+                        self.set_status("voice active");
+                    }
+                }
+            }
+            Err(error) => {
+                self.set_network_playback_sink(None);
+                self.playback = None;
+                self.playback_error = Some(error.clone());
+                self.set_error(format!("voice playback unavailable: {error}"));
+            }
+        }
     }
 
     fn stop_audio(&mut self) {
@@ -2366,6 +2470,49 @@ mod tests {
 
     fn test_app() -> App {
         App::new(Config::default(), None).expect("test app")
+    }
+
+    #[test]
+    fn audio_restart_flags_isolate_capture_and_playback_fields() {
+        let base = config::AudioConfig::default();
+
+        let mut bitrate = base.clone();
+        bitrate.bitrate_bps += 8_000;
+        assert_eq!(audio_restart_flags(&base, &bitrate), (true, false));
+
+        let mut denoise = base.clone();
+        denoise.denoise = audio::DenoiseConfig::None;
+        let denoise_changed = denoise.denoise != base.denoise;
+        assert_eq!(audio_restart_flags(&base, &denoise).0, denoise_changed);
+
+        let mut input_buffer = base.clone();
+        input_buffer.input_buffer = config::BufferSize::Samples(480);
+        assert_eq!(audio_restart_flags(&base, &input_buffer), (true, false));
+
+        let mut output_buffer = base.clone();
+        output_buffer.output_buffer = config::BufferSize::Samples(480);
+        assert_eq!(audio_restart_flags(&base, &output_buffer), (false, true));
+
+        let mut output_device = base.clone();
+        output_device.output_device_id = Some("other".to_string());
+        assert_eq!(audio_restart_flags(&base, &output_device), (false, true));
+
+        let mut latency = base.clone();
+        latency.latency.target_queue_ms += 10;
+        assert_eq!(audio_restart_flags(&base, &latency), (true, true));
+    }
+
+    #[test]
+    fn audio_restart_flags_ignore_cheap_live_fields() {
+        let base = config::AudioConfig::default();
+
+        let mut amplification = base.clone();
+        amplification.max_amplification += 6.0;
+        assert_eq!(audio_restart_flags(&base, &amplification), (false, false));
+
+        let mut echo = base.clone();
+        echo.echo_cancellation = !echo.echo_cancellation;
+        assert_eq!(audio_restart_flags(&base, &echo), (false, false));
     }
 
     #[test]
