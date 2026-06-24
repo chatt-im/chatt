@@ -1,6 +1,12 @@
+use extui_editor::Editor;
+
 use crate::{
     audio::{BufferRequest, DeviceInfo, StreamPreview},
-    config::{AudioConfig, AudioLatencyConfig, BufferChoice, DEFAULT_MAX_AMPLIFICATION},
+    config::{
+        AudioConfig, AudioLatencyConfig, BufferSize, DEFAULT_INPUT_BUFFER_SAMPLES,
+        DEFAULT_MAX_AMPLIFICATION, DEFAULT_OUTPUT_BUFFER_SAMPLES,
+    },
+    join_input_editor,
     ui::select::{FuzzySelect, SelectableItem},
 };
 
@@ -17,21 +23,23 @@ pub enum SettingsFocus {
     Denoise,
     EchoCancellation,
     Amplification,
-    Buffer,
+    InputBuffer,
+    OutputBuffer,
     Refresh,
     Save,
     Close,
 }
 
 impl SettingsFocus {
-    pub const ORDER: [SettingsFocus; 10] = [
+    pub const ORDER: [SettingsFocus; 11] = [
         SettingsFocus::InputDevice,
         SettingsFocus::OutputDevice,
         SettingsFocus::Bitrate,
         SettingsFocus::Denoise,
         SettingsFocus::EchoCancellation,
         SettingsFocus::Amplification,
-        SettingsFocus::Buffer,
+        SettingsFocus::InputBuffer,
+        SettingsFocus::OutputBuffer,
         SettingsFocus::Refresh,
         SettingsFocus::Save,
         SettingsFocus::Close,
@@ -45,13 +53,15 @@ impl SettingsFocus {
     }
 }
 
-#[derive(Clone, Debug)]
 pub struct SettingsDraft {
     pub input_device_id: Option<String>,
     pub output_device_id: Option<String>,
     pub bitrate_index: usize,
     pub amplification_index: usize,
-    pub buffer_index: usize,
+    /// Single-line editors holding a sample count or `"default"` (see
+    /// [`parse_buffer_size`]).
+    pub input_buffer: Editor,
+    pub output_buffer: Editor,
     pub denoise: bool,
     pub echo_cancellation: bool,
     pub latency: AudioLatencyConfig,
@@ -67,10 +77,8 @@ impl SettingsDraft {
                 .position(|bitrate| *bitrate == config.bitrate_bps)
                 .unwrap_or(3),
             amplification_index: amplification_index(config.max_amplification),
-            buffer_index: BufferRequest::OPTIONS
-                .iter()
-                .position(|buffer| *buffer == config.buffer.to_request())
-                .unwrap_or(0),
+            input_buffer: join_input_editor(&buffer_size_text(config.input_buffer)),
+            output_buffer: join_input_editor(&buffer_size_text(config.output_buffer)),
             denoise: config.denoise,
             echo_cancellation: config.echo_cancellation,
             latency: config.latency.clone(),
@@ -85,7 +93,8 @@ impl SettingsDraft {
             denoise: self.denoise,
             echo_cancellation: self.echo_cancellation,
             max_amplification: self.max_amplification(),
-            buffer: BufferChoice::from_request(self.buffer_request()),
+            input_buffer: parse_buffer_size(&self.input_buffer.text()),
+            output_buffer: parse_buffer_size(&self.output_buffer.text()),
             latency: self.latency.clone(),
         }
     }
@@ -94,12 +103,48 @@ impl SettingsDraft {
         BITRATES[self.bitrate_index]
     }
 
-    pub fn buffer_request(&self) -> BufferRequest {
-        BufferRequest::OPTIONS[self.buffer_index]
+    pub fn input_buffer_request(&self) -> BufferRequest {
+        parse_buffer_size(&self.input_buffer.text()).to_request(DEFAULT_INPUT_BUFFER_SAMPLES)
+    }
+
+    pub fn output_buffer_request(&self) -> BufferRequest {
+        parse_buffer_size(&self.output_buffer.text()).to_request(DEFAULT_OUTPUT_BUFFER_SAMPLES)
+    }
+
+    /// The editor for `focus`, if it is one of the buffer rows.
+    pub fn buffer_editor_mut(&mut self, focus: SettingsFocus) -> Option<&mut Editor> {
+        match focus {
+            SettingsFocus::InputBuffer => Some(&mut self.input_buffer),
+            SettingsFocus::OutputBuffer => Some(&mut self.output_buffer),
+            _ => None,
+        }
     }
 
     pub fn max_amplification(&self) -> f32 {
         MAX_AMPLIFICATIONS[self.amplification_index]
+    }
+}
+
+/// Renders a [`BufferSize`] as the editable settings text: `"default"` or the
+/// raw sample count.
+fn buffer_size_text(size: BufferSize) -> String {
+    match size {
+        BufferSize::Default => "default".to_string(),
+        BufferSize::Samples(samples) => samples.to_string(),
+    }
+}
+
+/// Parses the editable settings text into a [`BufferSize`]. Empty input or
+/// `"default"` (any case) means [`BufferSize::Default`]; a positive integer is
+/// an explicit sample count. Anything else falls back to the default.
+fn parse_buffer_size(text: &str) -> BufferSize {
+    let trimmed = text.trim();
+    if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("default") {
+        return BufferSize::Default;
+    }
+    match trimmed.parse::<u32>() {
+        Ok(samples) if samples > 0 => BufferSize::Samples(samples),
+        _ => BufferSize::Default,
     }
 }
 

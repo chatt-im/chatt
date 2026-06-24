@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use std::{fs, time::Duration};
 
 use toml_spanner::Toml;
-use toml_spanner::{Arena, Array, ArrayStyle, Item, Key, Table};
+use toml_spanner::{Arena, Item};
 
 use crate::{
     audio::{BufferRequest, LiveAudioPacketLossProfile, LiveAudioTuning},
@@ -19,11 +19,11 @@ pub const MAX_USER_VOLUME_DB: f32 = 12.0;
 pub const USER_VOLUME_DB_STEP: f32 = 0.5;
 
 #[derive(Clone, Debug, Toml)]
-#[toml(FromToml, rename_all = "kebab-case")]
+#[toml(FromToml, ToToml, rename_all = "kebab-case")]
 pub struct ServerEntry {
     pub alias: String,
     pub tcp_addr: String,
-    #[toml(default)]
+    #[toml(default, ToToml skip_if = String::is_empty)]
     pub udp_addr: String,
     #[toml(default)]
     pub udp_probe_addr: Option<String>,
@@ -88,41 +88,33 @@ impl ServerEntry {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Toml)]
+/// The cpal device period to request for one audio stream, in samples.
+///
+/// `Default` resolves to a usage-appropriate fixed size (see
+/// [`DEFAULT_INPUT_BUFFER_SAMPLES`]/[`DEFAULT_OUTPUT_BUFFER_SAMPLES`]) rather
+/// than the host default; `Samples(n)` requests exactly `n` frames.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Toml)]
 #[toml(FromToml, ToToml, rename_all = "kebab-case")]
-pub enum BufferChoice {
+pub enum BufferSize {
+    #[default]
     Default,
-    #[toml(rename = "fixed-240")]
-    Fixed240,
-    #[toml(rename = "fixed-480")]
-    Fixed480,
-    #[toml(rename = "fixed-960")]
-    Fixed960,
+    Samples(u32),
 }
 
-impl Default for BufferChoice {
-    fn default() -> Self {
-        BufferChoice::Default
-    }
-}
+/// Sample count `input-buffer.samples = "default"` resolves to: one 20 ms Opus
+/// frame at 48 kHz, which keeps capture wakeups aligned to the encoder frame.
+pub const DEFAULT_INPUT_BUFFER_SAMPLES: u32 = 960;
+/// Sample count `output-buffer.samples = "default"` resolves to: one 20 ms Opus
+/// frame at 48 kHz, matching the input default.
+pub const DEFAULT_OUTPUT_BUFFER_SAMPLES: u32 = 960;
 
-impl BufferChoice {
-    pub fn to_request(self) -> BufferRequest {
+impl BufferSize {
+    /// Resolves the configured size into a [`BufferRequest`], substituting
+    /// `default_samples` for [`BufferSize::Default`].
+    pub fn to_request(self, default_samples: u32) -> BufferRequest {
         match self {
-            BufferChoice::Default => BufferRequest::Default,
-            BufferChoice::Fixed240 => BufferRequest::Fixed(240),
-            BufferChoice::Fixed480 => BufferRequest::Fixed(480),
-            BufferChoice::Fixed960 => BufferRequest::Fixed(960),
-        }
-    }
-
-    pub fn from_request(request: BufferRequest) -> Self {
-        match request {
-            BufferRequest::Default => BufferChoice::Default,
-            BufferRequest::Fixed(240) => BufferChoice::Fixed240,
-            BufferRequest::Fixed(480) => BufferChoice::Fixed480,
-            BufferRequest::Fixed(960) => BufferChoice::Fixed960,
-            BufferRequest::Fixed(_) => BufferChoice::Default,
+            BufferSize::Default => BufferRequest::Fixed(default_samples),
+            BufferSize::Samples(samples) => BufferRequest::Fixed(samples),
         }
     }
 }
@@ -140,9 +132,11 @@ pub struct AudioConfig {
     pub echo_cancellation: bool,
     #[toml(default = DEFAULT_MAX_AMPLIFICATION)]
     pub max_amplification: f32,
-    #[toml(default)]
-    pub buffer: BufferChoice,
-    #[toml(default)]
+    #[toml(default, style = Dotted)]
+    pub input_buffer: BufferSize,
+    #[toml(default, style = Dotted)]
+    pub output_buffer: BufferSize,
+    #[toml(default, style = Header)]
     pub latency: AudioLatencyConfig,
 }
 
@@ -155,7 +149,8 @@ impl Default for AudioConfig {
             denoise: true,
             echo_cancellation: false,
             max_amplification: DEFAULT_MAX_AMPLIFICATION,
-            buffer: BufferChoice::Default,
+            input_buffer: BufferSize::Default,
+            output_buffer: BufferSize::Default,
             latency: AudioLatencyConfig::default(),
         }
     }
@@ -312,14 +307,14 @@ pub struct UserAudioPreference {
     pub volume_db: f32,
 }
 
-#[derive(Clone, Debug, Toml)]
+#[derive(Clone, Debug, PartialEq, Eq, Toml)]
 #[toml(FromToml, ToToml, rename_all = "kebab-case")]
 pub struct SoundboardClip {
     pub name: String,
     pub path: String,
 }
 
-#[derive(Clone, Debug, Toml)]
+#[derive(Clone, Debug, PartialEq, Eq, Toml)]
 #[toml(FromToml, ToToml, rename_all = "kebab-case")]
 pub struct SoundboardConfig {
     #[toml(default)]
@@ -328,7 +323,7 @@ pub struct SoundboardConfig {
     pub loss: String,
     #[toml(default = default_soundboard_seed())]
     pub seed: u64,
-    #[toml(default)]
+    #[toml(default, style = Header)]
     pub clips: Vec<SoundboardClip>,
 }
 
@@ -347,6 +342,12 @@ impl SoundboardConfig {
     pub fn packet_loss(&self) -> Option<LiveAudioPacketLossProfile> {
         LiveAudioPacketLossProfile::from_name(self.loss.trim())
     }
+
+    /// Whether this matches a freshly defaulted soundboard, in which case saves
+    /// omit the `[soundboard]` section entirely.
+    pub fn is_default(&self) -> bool {
+        *self == SoundboardConfig::default()
+    }
 }
 
 fn default_soundboard_loss() -> String {
@@ -358,24 +359,34 @@ fn default_soundboard_seed() -> u64 {
 }
 
 #[derive(Toml)]
-#[toml(FromToml, recoverable, warn_unknown_fields, rename_all = "kebab-case")]
+#[toml(
+    FromToml,
+    ToToml,
+    recoverable,
+    warn_unknown_fields,
+    rename_all = "kebab-case"
+)]
 pub struct Config {
     #[allow(dead_code)]
-    #[toml(default, rename = "active-server")]
+    #[toml(default, rename = "active-server", ToToml skip)]
     legacy_active_server: Option<String>,
-    #[toml(default = default_servers())]
+    #[toml(default = default_servers(), style = Header)]
     pub servers: Vec<ServerEntry>,
-    #[toml(default)]
+    #[toml(default, style = Header)]
     pub audio: AudioConfig,
-    #[toml(default)]
+    #[toml(default, style = Header)]
     pub ui: UiConfig,
-    #[toml(default)]
+    #[toml(default, style = Header)]
     pub files: FileConfig,
-    #[toml(default)]
+    #[toml(default, style = Header, ToToml skip_if = Vec::is_empty)]
     pub user_audio: Vec<UserAudioPreference>,
-    #[toml(default)]
+    // Serialized so a save never drops a configured soundboard; an unconfigured
+    // (default) soundboard is omitted so saves don't inject an empty section.
+    #[toml(default, style = Header, ToToml skip_if = SoundboardConfig::is_default)]
     pub soundboard: SoundboardConfig,
-    #[toml(default)]
+    // `BindingRuntime` re-emits the `[bindings]` table it was parsed from, so a
+    // save preserves custom keybindings verbatim. See its `ToToml` impl.
+    #[toml(default, style = Implicit)]
     pub bindings: BindingRuntime,
     #[toml(skip)]
     pub config_path: Option<PathBuf>,
@@ -634,22 +645,28 @@ impl Config {
             Err(err) => return Err(format!("failed to read {}: {err}", path.display())),
         };
 
-        let arena = Arena::new();
-        let doc = toml_spanner::parse(&content, &arena)
-            .map_err(|err| format!("failed to parse {}: {err}", path.display()))?;
-        let mut table = doc.table().clone_in(&arena);
-        write_runtime_config(&mut table, self, &arena);
-        let rest = toml_spanner::Formatting::preserved_from(&doc)
-            .with_span_projection_identity()
-            .format_table_to_bytes(table, &arena);
-        let mut output = runtime_servers_toml(self).into_bytes();
-        let rest = trim_leading_blank_lines(&rest);
-        if !rest.is_empty() {
-            output.extend_from_slice(rest);
-        }
+        let output = self
+            .runtime_toml(&content)
+            .map_err(|err| format!("failed to serialize {}: {err}", path.display()))?;
         fs::write(&path, output)
             .map_err(|err| format!("failed to write {}: {err}", path.display()))?;
         Ok(path)
+    }
+
+    /// Serializes the runtime config, reusing the comments, key order, and
+    /// value styling of `existing` for the keys they share.
+    ///
+    /// Content comes entirely from `self`: every section the file should keep
+    /// (including `[soundboard]` and `[bindings]`) is serialized by `Config`'s
+    /// [`ToToml`] impl, so format preservation only restyles, never re-adds,
+    /// keys.
+    fn runtime_toml(&self, existing: &str) -> Result<String, String> {
+        let arena = Arena::new();
+        let doc = toml_spanner::parse(existing, &arena)
+            .map_err(|err| format!("failed to parse existing config: {err}"))?;
+        toml_spanner::Formatting::preserved_from(&doc)
+            .format(self)
+            .map_err(|err| err.to_string())
     }
 }
 
@@ -854,286 +871,6 @@ fn validate_non_empty(value: &str, name: &str) -> Result<(), String> {
     }
 }
 
-fn write_runtime_config<'de>(root: &mut Table<'de>, config: &Config, arena: &'de Arena) {
-    {
-        root.remove_entry("network");
-        root.remove_entry("active-server");
-        root.remove_entry("servers");
-    }
-
-    {
-        let audio = ensure_table(root, "audio", arena);
-        audio.remove_entry("input-device-index");
-        match config.audio.input_device_id.as_deref() {
-            Some(id) => insert_str(audio, "input-device-id", id, arena),
-            None => {
-                audio.remove_entry("input-device-id");
-            }
-        }
-        match config.audio.output_device_id.as_deref() {
-            Some(id) => insert_str(audio, "output-device-id", id, arena),
-            None => {
-                audio.remove_entry("output-device-id");
-            }
-        }
-        audio.insert(
-            Key::new("bitrate-bps"),
-            Item::from(config.audio.bitrate_bps),
-            arena,
-        );
-        audio.insert(Key::new("denoise"), Item::from(config.audio.denoise), arena);
-        audio.insert(
-            Key::new("echo-cancellation"),
-            Item::from(config.audio.echo_cancellation),
-            arena,
-        );
-        audio.insert(
-            Key::new("max-amplification"),
-            Item::from(config.audio.max_amplification as f64),
-            arena,
-        );
-        insert_str(
-            audio,
-            "buffer",
-            buffer_choice_name(config.audio.buffer),
-            arena,
-        );
-
-        let latency = ensure_table(audio, "latency", arena);
-        latency.insert(
-            Key::new("adaptive-catch-up"),
-            Item::from(config.audio.latency.adaptive_catch_up),
-            arena,
-        );
-        latency.insert(
-            Key::new("capture-silence-gate"),
-            Item::from(config.audio.latency.capture_silence_gate),
-            arena,
-        );
-        latency.insert(
-            Key::new("adaptive-target"),
-            Item::from(config.audio.latency.adaptive_target),
-            arena,
-        );
-        latency.insert(
-            Key::new("target-queue-ms"),
-            Item::from(config.audio.latency.target_queue_ms as i64),
-            arena,
-        );
-        latency.insert(
-            Key::new("dynamic-target-floor-ms"),
-            Item::from(config.audio.latency.dynamic_target_floor_ms as i64),
-            arena,
-        );
-        latency.insert(
-            Key::new("max-target-ms"),
-            Item::from(config.audio.latency.max_target_ms as i64),
-            arena,
-        );
-        latency.insert(
-            Key::new("hard-queue-bound-ms"),
-            Item::from(config.audio.latency.hard_queue_bound_ms as i64),
-            arena,
-        );
-        latency.insert(
-            Key::new("initial-buffer-ms"),
-            Item::from(config.audio.latency.initial_buffer_ms as i64),
-            arena,
-        );
-        latency.insert(
-            Key::new("max-reorder-delay-ms"),
-            Item::from(config.audio.latency.max_reorder_delay_ms as i64),
-            arena,
-        );
-        latency.insert(
-            Key::new("device-period-margin-ms"),
-            Item::from(config.audio.latency.device_period_margin_ms as i64),
-            arena,
-        );
-        latency.insert(
-            Key::new("silence-vad-max"),
-            Item::from(config.audio.latency.silence_vad_max as i64),
-            arena,
-        );
-        latency.insert(
-            Key::new("capture-long-silence-stop-ms"),
-            Item::from(config.audio.latency.capture_long_silence_stop_ms as i64),
-            arena,
-        );
-        latency.insert(
-            Key::new("capture-silence-preroll-ms"),
-            Item::from(config.audio.latency.capture_silence_preroll_ms as i64),
-            arena,
-        );
-        latency.insert(
-            Key::new("capture-silence-ramp-ms"),
-            Item::from(config.audio.latency.capture_silence_ramp_ms as i64),
-            arena,
-        );
-    }
-
-    {
-        let ui = ensure_table(root, "ui", arena);
-        ui.insert(
-            Key::new("room-height"),
-            Item::from(config.ui.room_height as i64),
-            arena,
-        );
-        ui.insert(
-            Key::new("max-composer-height"),
-            Item::from(config.ui.max_composer_height as i64),
-            arena,
-        );
-        insert_str(ui, "placeholder", &config.ui.placeholder, arena);
-        ui.insert(
-            Key::new("max-messages"),
-            Item::from(config.ui.max_messages as i64),
-            arena,
-        );
-        ui.insert(
-            Key::new("overscan"),
-            Item::from(config.ui.overscan as i64),
-            arena,
-        );
-    }
-
-    {
-        let files = ensure_table(root, "files", arena);
-        files.insert(
-            Key::new("max-upload-bytes"),
-            Item::from(config.files.max_upload_bytes as i64),
-            arena,
-        );
-        files.insert(
-            Key::new("max-receive-bytes"),
-            Item::from(config.files.max_receive_bytes as i64),
-            arena,
-        );
-        insert_str(files, "receive-dir", &config.files.receive_dir, arena);
-    }
-
-    root.remove_entry("user-audio");
-    if !config.user_audio.is_empty() {
-        let mut array = Array::try_with_capacity(config.user_audio.len(), arena)
-            .expect("user audio preferences length must fit in TOML array");
-        array.set_style(ArrayStyle::Header);
-        for preference in &config.user_audio {
-            let mut table = Table::new();
-            insert_str(&mut table, "server-alias", &preference.server_alias, arena);
-            table.insert(
-                Key::new("user-id"),
-                Item::from(preference.user_id as i64),
-                arena,
-            );
-            table.insert(
-                Key::new("volume-db"),
-                Item::from(preference.volume_db as f64),
-                arena,
-            );
-            array.push(table.into_item(), arena);
-        }
-        root.insert(Key::new("user-audio"), array.into_item(), arena);
-    }
-}
-
-fn runtime_servers_toml(config: &Config) -> String {
-    let mut out = String::new();
-    for server in &config.servers {
-        out.push_str("[[servers]]\n");
-        out.push_str(&format!(
-            "alias = \"{}\"\n",
-            toml_quote_value(&server.alias)
-        ));
-        out.push_str(&format!("user = \"{}\"\n", toml_quote_value(&server.user)));
-        out.push_str(&format!(
-            "display-name = \"{}\"\n",
-            toml_quote_value(&server.display_name)
-        ));
-        out.push_str(&format!(
-            "token = \"{}\"\n",
-            toml_quote_value(&server.token)
-        ));
-        out.push_str(&format!(
-            "server-public-key = \"{}\"\n",
-            toml_quote_value(&server.server_public_key)
-        ));
-        out.push_str(&format!("tcp-addr = \"{}\"\n", server.tcp_addr));
-        if server.effective_udp_addr() != server.tcp_addr {
-            out.push_str(&format!("udp-addr = \"{}\"\n", server.udp_addr));
-        }
-        if let Some(addr) = &server.udp_probe_addr {
-            out.push_str(&format!("udp-probe-addr = \"{}\"\n", addr));
-        }
-        out.push_str(&format!("room-id = {}\n\n", server.room_id));
-    }
-    out
-}
-
-fn trim_leading_blank_lines(bytes: &[u8]) -> &[u8] {
-    let mut start = 0;
-    while start < bytes.len() {
-        match bytes[start] {
-            b'\n' | b'\r' => start += 1,
-            b' ' | b'\t' => {
-                let line_start = start;
-                while start < bytes.len() && matches!(bytes[start], b' ' | b'\t') {
-                    start += 1;
-                }
-                if start < bytes.len() && matches!(bytes[start], b'\n' | b'\r') {
-                    start += 1;
-                } else {
-                    start = line_start;
-                    break;
-                }
-            }
-            _ => break,
-        }
-    }
-    &bytes[start..]
-}
-
-fn toml_quote_value(value: &str) -> String {
-    let mut out = String::with_capacity(value.len());
-    for ch in value.chars() {
-        match ch {
-            '\\' => out.push_str("\\\\"),
-            '"' => out.push_str("\\\""),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            _ => out.push(ch),
-        }
-    }
-    out
-}
-
-fn ensure_table<'de, 'b>(
-    root: &'b mut Table<'de>,
-    name: &'static str,
-    arena: &'de Arena,
-) -> &'b mut Table<'de> {
-    let needs_insert = root.get(name).and_then(|item| item.as_table()).is_none();
-    if needs_insert {
-        root.insert(Key::new(name), Table::new().into_item(), arena);
-    }
-    root.get_mut(name)
-        .and_then(|item| item.as_table_mut())
-        .expect("section was just inserted as a table")
-}
-
-fn insert_str<'de>(table: &mut Table<'de>, key: &'static str, value: &str, arena: &'de Arena) {
-    table.insert(Key::new(key), Item::string(arena.alloc_str(value)), arena);
-}
-
-fn buffer_choice_name(choice: BufferChoice) -> &'static str {
-    match choice {
-        BufferChoice::Default => "default",
-        BufferChoice::Fixed240 => "fixed-240",
-        BufferChoice::Fixed480 => "fixed-480",
-        BufferChoice::Fixed960 => "fixed-960",
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1300,11 +1037,15 @@ input-device-index = 20
         assert!(error.contains("audio.input-device-id"));
     }
 
+    fn render_runtime(config: &Config) -> String {
+        config.runtime_toml(DEFAULT_CONFIG).unwrap()
+    }
+
     #[test]
-    fn runtime_servers_toml_does_not_write_pairing_code() {
+    fn runtime_config_writes_servers_without_legacy_keys() {
         let mut config = Config::default();
         config.servers.push(ServerEntry::default());
-        let content = runtime_servers_toml(&config);
+        let content = render_runtime(&config);
 
         assert!(content.contains("[[servers]]"));
         assert!(!content.contains("active-server"));
@@ -1313,18 +1054,7 @@ input-device-index = 20
 
     #[test]
     fn runtime_config_writes_audio_amplification() {
-        let config = Config::default();
-        let arena = Arena::new();
-        let doc = toml_spanner::parse(DEFAULT_CONFIG, &arena).unwrap();
-        let mut table = doc.table().clone_in(&arena);
-
-        write_runtime_config(&mut table, &config, &arena);
-        let content = String::from_utf8(
-            toml_spanner::Formatting::preserved_from(&doc)
-                .with_span_projection_identity()
-                .format_table_to_bytes(table, &arena),
-        )
-        .unwrap();
+        let content = render_runtime(&Config::default());
 
         assert!(content.contains("max-amplification = 12.0"));
     }
@@ -1334,39 +1064,56 @@ input-device-index = 20
         let mut config = Config::default();
         config.audio.input_device_id = Some("usb mic".to_string());
         config.audio.output_device_id = Some("usb speakers".to_string());
-        let arena = Arena::new();
-        let doc = toml_spanner::parse(DEFAULT_CONFIG, &arena).unwrap();
-        let mut table = doc.table().clone_in(&arena);
-
-        write_runtime_config(&mut table, &config, &arena);
-        let content = String::from_utf8(
-            toml_spanner::Formatting::preserved_from(&doc)
-                .with_span_projection_identity()
-                .format_table_to_bytes(table, &arena),
-        )
-        .unwrap();
+        let content = render_runtime(&config);
 
         assert!(content.contains("input-device-id = \"usb mic\""));
         assert!(content.contains("output-device-id = \"usb speakers\""));
     }
 
     #[test]
+    fn runtime_config_omits_unset_audio_device_ids() {
+        let content = render_runtime(&Config::default());
+
+        assert!(!content.contains("input-device-id"));
+        assert!(!content.contains("output-device-id"));
+    }
+
+    #[test]
     fn runtime_config_writes_audio_echo_cancellation() {
         let mut config = Config::default();
         config.audio.echo_cancellation = true;
-        let arena = Arena::new();
-        let doc = toml_spanner::parse(DEFAULT_CONFIG, &arena).unwrap();
-        let mut table = doc.table().clone_in(&arena);
-
-        write_runtime_config(&mut table, &config, &arena);
-        let content = String::from_utf8(
-            toml_spanner::Formatting::preserved_from(&doc)
-                .with_span_projection_identity()
-                .format_table_to_bytes(table, &arena),
-        )
-        .unwrap();
+        let content = render_runtime(&config);
 
         assert!(content.contains("echo-cancellation = true"));
+    }
+
+    #[test]
+    fn runtime_config_writes_split_buffer_sizes() {
+        let mut config = Config::default();
+        config.audio.input_buffer = BufferSize::Samples(1024);
+        config.audio.output_buffer = BufferSize::Default;
+        let content = render_runtime(&config);
+
+        assert!(content.contains("input-buffer.samples = 1024"));
+        assert!(content.contains("output-buffer = \"default\""));
+    }
+
+    #[test]
+    fn runtime_config_preserves_bindings_and_comments() {
+        let existing = concat!(
+            "[audio]\n",
+            "input-buffer = \"default\" # keep me\n",
+            "\n",
+            "[bindings.compose]\n",
+            "\"C-x\" = \"Quit\"\n",
+        );
+        let arena = Arena::new();
+        let config: Config = toml_spanner::parse(existing, &arena).unwrap().to().unwrap();
+        let content = config.runtime_toml(existing).unwrap();
+
+        assert!(content.contains("# keep me"));
+        assert!(content.contains("[bindings.compose]"));
+        assert!(content.contains("\"C-x\" = \"Quit\""));
     }
 
     #[test]
@@ -1386,17 +1133,7 @@ input-device-index = 20
         config.audio.latency.adaptive_target = false;
         config.audio.latency.dynamic_target_floor_ms = 25;
         config.audio.latency.max_target_ms = 1_200;
-        let arena = Arena::new();
-        let doc = toml_spanner::parse(DEFAULT_CONFIG, &arena).unwrap();
-        let mut table = doc.table().clone_in(&arena);
-
-        write_runtime_config(&mut table, &config, &arena);
-        let content = String::from_utf8(
-            toml_spanner::Formatting::preserved_from(&doc)
-                .with_span_projection_identity()
-                .format_table_to_bytes(table, &arena),
-        )
-        .unwrap();
+        let content = render_runtime(&config);
 
         assert!(content.contains("[audio.latency]"));
         assert!(content.contains("target-queue-ms = 80"));
@@ -1461,17 +1198,7 @@ input-device-index = 20
     fn runtime_config_writes_user_audio_as_array_of_tables() {
         let mut config = Config::default();
         config.set_user_volume_db("local", 2, -5.5);
-        let arena = Arena::new();
-        let doc = toml_spanner::parse(DEFAULT_CONFIG, &arena).unwrap();
-        let mut table = doc.table().clone_in(&arena);
-
-        write_runtime_config(&mut table, &config, &arena);
-        let content = String::from_utf8(
-            toml_spanner::Formatting::preserved_from(&doc)
-                .with_span_projection_identity()
-                .format_table_to_bytes(table, &arena),
-        )
-        .unwrap();
+        let content = render_runtime(&config);
 
         assert!(content.contains("[[user-audio]]"));
         assert!(content.contains("server-alias = \"local\""));

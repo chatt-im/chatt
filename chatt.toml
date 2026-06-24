@@ -6,7 +6,8 @@ bitrate-bps = 48000
 denoise = true
 echo-cancellation = false
 max-amplification = 12.0
-buffer = "default"
+input-buffer = "default"
+output-buffer = "default"
 
 [audio.latency]
 adaptive-catch-up = true

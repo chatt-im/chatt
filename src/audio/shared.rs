@@ -101,20 +101,10 @@ pub enum BufferRequest {
 }
 
 impl BufferRequest {
-    pub const OPTIONS: [BufferRequest; 4] = [
-        BufferRequest::Default,
-        BufferRequest::Fixed(240),
-        BufferRequest::Fixed(480),
-        BufferRequest::Fixed(960),
-    ];
-
-    pub fn label(self) -> &'static str {
+    pub fn label(self) -> String {
         match self {
-            BufferRequest::Default => "default",
-            BufferRequest::Fixed(240) => "240 frames",
-            BufferRequest::Fixed(480) => "480 frames",
-            BufferRequest::Fixed(960) => "960 frames",
-            BufferRequest::Fixed(_) => "fixed",
+            BufferRequest::Default => "default".to_string(),
+            BufferRequest::Fixed(frames) => format!("{frames} frames"),
         }
     }
 }
