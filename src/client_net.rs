@@ -1,4 +1,4 @@
-use hashbrown::HashMap;
+use hashbrown::{HashMap, HashSet};
 use std::{
     collections::VecDeque,
     fs::{self, File, OpenOptions},
@@ -53,6 +53,19 @@ const UDP: Token = Token(1);
 const WAKE: Token = Token(2);
 const POLL_TIMEOUT: Duration = Duration::from_millis(20);
 const INTERFACE_POLL_INTERVAL: Duration = Duration::from_secs(2);
+/// How long a direct path must stay healthy before the client stops relaying
+/// voice through the server.
+const DIRECT_CONFIRM_WINDOW: Duration = Duration::from_secs(3);
+/// Maximum gap in inbound direct traffic before a direct path is treated as
+/// degraded and the server relay resumes. Kept above [`P2P_KEEPALIVE_INTERVAL`]
+/// so ordinary speech silence does not trip it.
+const DIRECT_FAILOVER_IDLE: Duration = Duration::from_millis(1500);
+/// Cadence of the server keepalive sent while the relay is suppressed, to keep
+/// the on-path NAT binding warm so relay resumes instantly.
+const RELAY_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(5);
+/// STUN keepalive spacing for direct paths. Tightened from the agent default so
+/// path liveness is reconfirmed every second.
+const P2P_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(1);
 const MAX_QUEUED_FILE_BYTES: usize = 128 * 1024;
 const MAX_FILE_CHUNKS_PER_TICK: usize = 4;
 const FILE_PROGRESS_STEP_BYTES: u64 = 1024 * 1024;
@@ -382,6 +395,8 @@ fn run_worker_inner(
         p2p_candidates: Vec::new(),
         p2p_peers: HashMap::new(),
         p2p_stream_owners: HashMap::new(),
+        online_others: HashSet::new(),
+        next_relay_keepalive: Instant::now() + RELAY_KEEPALIVE_INTERVAL,
         playback_sink: None,
         pending_playback_packets: VecDeque::new(),
         voice_dedup: VoicePacketDeduplicator::new(),
@@ -480,6 +495,7 @@ fn run_worker_inner(
             }
         }
         worker.poll_p2p(now);
+        worker.poll_relay_keepalive(now);
         worker.read_udp();
         poll_timeout = if command_drain == CommandDrainOutcome::HitLimit {
             Duration::ZERO
@@ -778,6 +794,8 @@ struct WorkerState {
     p2p_candidates: Vec<P2pCandidate>,
     p2p_peers: HashMap<SessionId, PeerConnection>,
     p2p_stream_owners: HashMap<StreamId, SessionId>,
+    online_others: HashSet<UserId>,
+    next_relay_keepalive: Instant,
     playback_sink: Option<LivePlaybackSink>,
     pending_playback_packets: VecDeque<RemoteVoicePacket>,
     voice_dedup: VoicePacketDeduplicator,
@@ -956,6 +974,42 @@ impl RecentVoiceSequences {
     }
 }
 
+/// Whether a direct path counts as healthy right now: a candidate pair is
+/// selected and an inbound packet arrived within `failover_idle`.
+fn direct_path_healthy(
+    selected: bool,
+    last_inbound: Option<Instant>,
+    now: Instant,
+    failover_idle: Duration,
+) -> bool {
+    selected && last_inbound.is_some_and(|at| now.saturating_duration_since(at) <= failover_idle)
+}
+
+/// Whether the server relay can be dropped: there is at least one other online
+/// participant and every one of them has a peer whose direct path has been
+/// stable for at least `confirm_window`.
+fn relay_suppressed(
+    now: Instant,
+    confirm_window: Duration,
+    online_others: &HashSet<UserId>,
+    peers: impl Iterator<Item = (UserId, Option<Instant>)>,
+) -> bool {
+    if online_others.is_empty() {
+        return false;
+    }
+    let mut covered = HashSet::new();
+    for (user_id, stable_since) in peers {
+        if let Some(since) = stable_since {
+            if now.saturating_duration_since(since) >= confirm_window {
+                covered.insert(user_id);
+            }
+        }
+    }
+    online_others
+        .iter()
+        .all(|user_id| covered.contains(user_id))
+}
+
 fn voice_sequence_distance_forward(from: u32, to: u32) -> Option<u32> {
     let distance = to.wrapping_sub(from);
     if distance < (1 << 31) {
@@ -992,6 +1046,12 @@ struct PeerConnection {
     send_counter: u64,
     recv_replay: AntiReplay,
     connection_id: u64,
+    /// When the current healthy direct path was first observed, the clock for
+    /// the [`DIRECT_CONFIRM_WINDOW`] confirmation. `None` while no healthy direct
+    /// path exists.
+    direct_stable_since: Option<Instant>,
+    /// Last inbound direct packet (media or STUN) from this peer.
+    last_direct_inbound: Option<Instant>,
 }
 
 enum P2pMediaPacket {
@@ -1435,11 +1495,20 @@ impl WorkerState {
                     max_queue_ms = feedback.max_queue_ms,
                     max_interarrival_jitter_ms = feedback.max_interarrival_jitter_ms
                 );
-                self.send_media(&MediaPayload::VoiceFeedback {
-                    stream_id,
-                    feedback: media_feedback_from_live(feedback),
-                });
-                if let Some(session_id) = self.p2p_stream_owners.get(&stream_id).copied() {
+                let owner = self.p2p_stream_owners.get(&stream_id).copied();
+                let owner_direct_stable = owner
+                    .and_then(|session_id| self.p2p_peers.get(&session_id))
+                    .and_then(|peer| peer.direct_stable_since)
+                    .is_some_and(|since| {
+                        Instant::now().saturating_duration_since(since) >= DIRECT_CONFIRM_WINDOW
+                    });
+                if !owner_direct_stable {
+                    self.send_media(&MediaPayload::VoiceFeedback {
+                        stream_id,
+                        feedback: media_feedback_from_live(feedback),
+                    });
+                }
+                if let Some(session_id) = owner {
                     self.send_p2p_voice_feedback(session_id, stream_id, feedback);
                 }
             }
@@ -1465,13 +1534,15 @@ impl WorkerState {
             payload_size = frame.payload.len(),
             payload_kind = voice_payload_kind(&frame.payload)
         );
-        let relay_payload = MediaPayload::Voice {
-            stream_id,
-            sequence,
-            flags: frame.flags,
-            payload: media_payload_from_audio(&frame.payload),
-        };
-        self.send_media(&relay_payload);
+        if !self.relay_suppressed(Instant::now()) {
+            let relay_payload = MediaPayload::Voice {
+                stream_id,
+                sequence,
+                flags: frame.flags,
+                payload: media_payload_from_audio(&frame.payload),
+            };
+            self.send_media(&relay_payload);
+        }
         self.send_p2p_voice(stream_id, sequence, frame.flags, &frame.payload);
     }
 
@@ -1821,6 +1892,11 @@ impl WorkerState {
                     history_len = history.len(),
                     participant_count = participants.len()
                 );
+                self.online_others = participants
+                    .iter()
+                    .map(|participant| participant.user_id)
+                    .filter(|user_id| Some(*user_id) != self.user_id)
+                    .collect();
                 let _ = self.events.send(NetworkEvent::RoomJoined {
                     room_id,
                     history,
@@ -1849,6 +1925,13 @@ impl WorkerState {
                     online
                 );
                 let verb = if online { "joined" } else { "left" };
+                if Some(participant.user_id) != self.user_id {
+                    if online {
+                        self.online_others.insert(participant.user_id);
+                    } else {
+                        self.online_others.remove(&participant.user_id);
+                    }
+                }
                 let _ = self
                     .events
                     .send(NetworkEvent::Status(format!("{} {verb}", participant.name)));
@@ -2241,6 +2324,7 @@ impl WorkerState {
         }
         let config = P2pAgentConfig {
             username: Some(p2p_username(peer.connection_id)),
+            keepalive_interval: P2P_KEEPALIVE_INTERVAL,
             ..P2pAgentConfig::default()
         };
         let agent = TraversalAgent::new(
@@ -2271,6 +2355,8 @@ impl WorkerState {
                 send_counter: 0,
                 recv_replay: AntiReplay::new(),
                 connection_id: peer.connection_id,
+                direct_stable_since: None,
+                last_direct_inbound: None,
             },
         );
         Ok(())
@@ -2285,6 +2371,59 @@ impl WorkerState {
             .collect::<Vec<_>>();
         for (session_id, actions) in actions {
             self.apply_p2p_actions(session_id, actions);
+        }
+        self.reconcile_direct_stability(now);
+    }
+
+    /// Derives each peer's direct-path stability from current liveness. Arms
+    /// [`PeerConnection::direct_stable_since`] once a path is healthy, clears it
+    /// when the path stalls past [`DIRECT_FAILOVER_IDLE`] or loses selection,
+    /// and re-arms after recovery. The relay suppression decision reads from it.
+    fn reconcile_direct_stability(&mut self, now: Instant) {
+        for peer in self.p2p_peers.values_mut() {
+            let healthy = direct_path_healthy(
+                peer.agent.selected().is_some(),
+                peer.last_direct_inbound,
+                now,
+                DIRECT_FAILOVER_IDLE,
+            );
+            if healthy {
+                if peer.direct_stable_since.is_none() {
+                    peer.direct_stable_since = Some(now);
+                }
+            } else {
+                peer.direct_stable_since = None;
+            }
+        }
+    }
+
+    /// Returns true when every other online participant is reachable over a
+    /// direct path that has been stable for [`DIRECT_CONFIRM_WINDOW`], so the
+    /// server relay is pure redundancy and can be dropped.
+    fn relay_suppressed(&self, now: Instant) -> bool {
+        relay_suppressed(
+            now,
+            DIRECT_CONFIRM_WINDOW,
+            &self.online_others,
+            self.p2p_peers
+                .values()
+                .map(|peer| (peer.user_id, peer.direct_stable_since)),
+        )
+    }
+
+    /// Sends a lightweight server keepalive while the relay is suppressed so the
+    /// on-path NAT binding stays warm and relay can resume without a stall.
+    fn poll_relay_keepalive(&mut self, now: Instant) {
+        if !self.relay_suppressed(now) {
+            self.next_relay_keepalive = now + RELAY_KEEPALIVE_INTERVAL;
+            return;
+        }
+        if now < self.next_relay_keepalive {
+            return;
+        }
+        self.next_relay_keepalive = now + RELAY_KEEPALIVE_INTERVAL;
+        if let Some(session_id) = self.session_id {
+            self.send_media(&MediaPayload::Bind { session_id });
         }
     }
 
@@ -2312,8 +2451,12 @@ impl WorkerState {
                 continue;
             };
             match peer.agent.handle_inbound(now, src, packet) {
-                Ok(actions) if !actions.is_empty() => pending.push((session_id, actions)),
-                Ok(_) => {}
+                Ok(actions) => {
+                    peer.last_direct_inbound = Some(now);
+                    if !actions.is_empty() {
+                        pending.push((session_id, actions));
+                    }
+                }
                 Err(error) => {
                     kvlog::warn!(
                         "p2p stun packet rejected",
@@ -2356,6 +2499,7 @@ impl WorkerState {
                     },
                 )) if connection_id == peer.connection_id => {
                     let action = peer.agent.observe_authenticated_packet(now, src);
+                    peer.last_direct_inbound = Some(now);
                     Ok(P2pMediaPacket::Voice {
                         stream_id,
                         sequence,
@@ -2373,6 +2517,7 @@ impl WorkerState {
                     },
                 )) if connection_id == peer.connection_id => {
                     let action = peer.agent.observe_authenticated_packet(now, src);
+                    peer.last_direct_inbound = Some(now);
                     Ok(P2pMediaPacket::Feedback {
                         stream_id,
                         feedback,
@@ -2976,6 +3121,82 @@ fn connection_id_from_p2p_username(username: &str) -> Option<u64> {
 mod tests {
     use super::*;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn user(id: u32) -> UserId {
+        UserId(id)
+    }
+
+    #[test]
+    fn relay_suppressed_only_when_all_others_direct_stable() {
+        let now = Instant::now();
+        let window = Duration::from_secs(3);
+        let stable = now - Duration::from_secs(4);
+        let recent = now - Duration::from_secs(1);
+        let others: HashSet<UserId> = [user(2), user(3)].into_iter().collect();
+
+        // Both peers stable past the window: relay can be dropped.
+        assert!(relay_suppressed(
+            now,
+            window,
+            &others,
+            [(user(2), Some(stable)), (user(3), Some(stable))].into_iter(),
+        ));
+
+        // One peer only just became stable, still inside the window.
+        assert!(!relay_suppressed(
+            now,
+            window,
+            &others,
+            [(user(2), Some(stable)), (user(3), Some(recent))].into_iter(),
+        ));
+
+        // One peer has no direct path at all.
+        assert!(!relay_suppressed(
+            now,
+            window,
+            &others,
+            [(user(2), Some(stable)), (user(3), None)].into_iter(),
+        ));
+
+        // A newcomer with no peer entry must keep the relay alive.
+        assert!(!relay_suppressed(
+            now,
+            window,
+            &others,
+            [(user(2), Some(stable))].into_iter(),
+        ));
+    }
+
+    #[test]
+    fn relay_not_suppressed_without_other_participants() {
+        let now = Instant::now();
+        let stable = now - Duration::from_secs(4);
+        assert!(!relay_suppressed(
+            now,
+            Duration::from_secs(3),
+            &HashSet::new(),
+            [(user(2), Some(stable))].into_iter(),
+        ));
+    }
+
+    #[test]
+    fn direct_path_health_arms_clears_and_rearms() {
+        let idle = Duration::from_millis(1500);
+        let t0 = Instant::now();
+
+        // Healthy: selected with a fresh inbound.
+        assert!(direct_path_healthy(true, Some(t0), t0, idle));
+
+        // No selected pair is never healthy.
+        assert!(!direct_path_healthy(false, Some(t0), t0, idle));
+
+        // Inbound went stale past the failover window.
+        let later = t0 + Duration::from_millis(1600);
+        assert!(!direct_path_healthy(true, Some(t0), later, idle));
+
+        // Recovery: a new inbound at `later` is healthy again.
+        assert!(direct_path_healthy(true, Some(later), later, idle));
+    }
 
     #[test]
     fn reconnect_schedule_matches_retry_policy() {
