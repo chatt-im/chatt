@@ -609,9 +609,16 @@ fn case_25_authenticated_binding_success_selects_legitimate_path() {
 }
 
 fn selected_agent(now: std::time::Instant) -> TraversalAgent {
+    // A long consent timeout keeps the idle-latch cases (restart, disconnect,
+    // keepalive) free of consent interference. Consent expiry is exercised
+    // separately with the client's tighter keepalive cadence.
+    let config = AgentConfig {
+        consent_timeout: Duration::from_secs(60),
+        ..test_config()
+    };
     let mut agent = TraversalAgent::new(
         now,
-        test_config(),
+        config,
         IceRole::Controlling,
         1,
         NatKind::Cone,
@@ -633,4 +640,198 @@ fn snapshot(addr: std::net::IpAddr) -> InterfaceSnapshot {
         is_virtual: false,
     }])
     .unwrap()
+}
+
+/// Authenticated agent with the client's tight 1 s keepalive cadence, parameterized
+/// by STUN `key` and `salt` so consent and jitter behavior can be driven.
+fn keepalive_agent(now: std::time::Instant, key: [u8; 32], salt: [u8; 32]) -> TraversalAgent {
+    // The client's active values: a 1 s keepalive and a 10 s consent timeout
+    // below `disconnect_after_idle`.
+    let config = AgentConfig {
+        keepalive_interval: Duration::from_secs(1),
+        consent_timeout: Duration::from_secs(10),
+        ..AgentConfig::with_auth(StunAuth::new(key, salt))
+    };
+    TraversalAgent::new(
+        now,
+        config,
+        IceRole::Controlling,
+        1,
+        NatKind::Cone,
+        NatKind::Cone,
+        vec![candidate(1, CandidateKind::Host, "10.0.0.2:5000")],
+        vec![candidate(
+            2,
+            CandidateKind::ServerReflexive,
+            "198.51.100.2:55000",
+        )],
+    )
+}
+
+/// Drives `keepalive_agent` to 12 s, answering every keepalive from the selected
+/// address, and returns the millisecond offsets at which each keepalive fired.
+fn keepalive_fire_times(key: [u8; 32], salt: [u8; 32]) -> Vec<u64> {
+    let now = at(0);
+    let mut agent = keepalive_agent(now, key, salt);
+    let peer: SocketAddr = "198.51.100.2:55003".parse().unwrap();
+    agent.observe_authenticated_packet(now, peer);
+    let mut fires = Vec::new();
+    let mut t = 0u64;
+    while t < 12_000 {
+        t += 10;
+        let at_t = now + Duration::from_millis(t);
+        for action in agent.poll(at_t) {
+            if let Action::SendKeepalive {
+                to, transaction_id, ..
+            } = action
+            {
+                fires.push(t);
+                let response = StunMessage::binding_success(transaction_id, to).encode(Some(&key));
+                let _ = agent.handle_inbound(at_t, to, &response);
+            }
+        }
+    }
+    fires
+}
+
+#[test]
+fn case_26_silent_peer_expires_consent_and_clears_selection() {
+    let now = at(0);
+    let mut agent = keepalive_agent(now, [0x42u8; 32], [9u8; 32]);
+    agent.observe_authenticated_packet(now, "198.51.100.2:55003".parse().unwrap());
+    // No inbound after selection: consent expires at the 10 s default, before the
+    // 15 s disconnect teardown.
+    assert_eq!(
+        agent.poll(now + Duration::from_secs(10)).as_slice(),
+        [Action::ConsentExpired]
+    );
+    assert!(agent.selected().is_none());
+    // Emitted once: the selection is gone, so later polls cannot re-fire it.
+    assert!(
+        !agent
+            .poll(now + Duration::from_secs(11))
+            .iter()
+            .any(|action| matches!(action, Action::ConsentExpired))
+    );
+}
+
+#[test]
+fn case_27_answered_keepalives_keep_consent_fresh() {
+    let now = at(0);
+    let key = [0x42u8; 32];
+    let mut agent = keepalive_agent(now, key, [9u8; 32]);
+    let peer: SocketAddr = "198.51.100.2:55003".parse().unwrap();
+    agent.observe_authenticated_packet(now, peer);
+
+    let mut t = 0u64;
+    while t < 30_000 {
+        t += 200;
+        let at_t = now + Duration::from_millis(t);
+        for action in agent.poll(at_t) {
+            assert!(
+                !matches!(action, Action::ConsentExpired),
+                "consent expired despite answered keepalives at {t} ms"
+            );
+            if let Action::SendKeepalive {
+                to, transaction_id, ..
+            } = action
+            {
+                let response = StunMessage::binding_success(transaction_id, to).encode(Some(&key));
+                let _ = agent.handle_inbound(at_t, to, &response);
+            }
+        }
+    }
+    assert!(agent.selected().is_some());
+}
+
+#[test]
+fn case_28_keepalive_jitter_is_deterministic_and_bounded() {
+    let key = [0x42u8; 32];
+    let first = keepalive_fire_times(key, [7u8; 32]);
+    let second = keepalive_fire_times(key, [7u8; 32]);
+    // Same salt yields an identical schedule: no RNG in poll.
+    assert_eq!(first, second);
+    assert!(
+        first.len() >= 5,
+        "expected several keepalives, got {first:?}"
+    );
+    // Gaps stay within [0.8, 1.2] of the 1 s interval, allowing 10 ms poll
+    // granularity at each edge.
+    for window in first.windows(2) {
+        let gap = window[1] - window[0];
+        assert!(
+            (790..=1210).contains(&gap),
+            "keepalive gap {gap} ms outside jitter range"
+        );
+    }
+    // A different salt de-synchronizes the schedule.
+    let other = keepalive_fire_times(key, [8u8; 32]);
+    assert_ne!(first, other);
+}
+
+#[test]
+fn case_29_consent_expiry_stops_the_keepalive_flood_but_allows_bounded_recovery() {
+    let now = at(0);
+    let mut agent = keepalive_agent(now, [0x42u8; 32], [9u8; 32]);
+    // Select a peer-reflexive victim address with no configured candidate pair,
+    // modeling a NAT rebinding the peer's port onto a third party.
+    let victim: SocketAddr = "203.0.113.50:9000".parse().unwrap();
+    agent.observe_authenticated_packet(now, victim);
+    assert_eq!(agent.selected().map(|pair| pair.remote_addr), Some(victim));
+
+    assert!(
+        agent
+            .poll(now + Duration::from_secs(10))
+            .iter()
+            .any(|action| matches!(action, Action::ConsentExpired))
+    );
+    assert!(agent.selected().is_none());
+
+    // After expiry the keepalive flood to the stale address stops outright, since
+    // keepalives only fire on a selected path. ICE connectivity checks may still
+    // reach it as paced, bounded consent re-acquisition (a transient outage must
+    // not permanently ban the address), so those are counted separately and
+    // capped by `max_check_attempts`.
+    let mut keepalives_to_victim = 0;
+    let mut checks_to_victim = 0;
+    let mut t = 10_000u64;
+    while t < 25_000 {
+        t += 25;
+        for action in agent.poll(now + Duration::from_millis(t)) {
+            match action {
+                Action::SendKeepalive { to, .. } if to == victim => keepalives_to_victim += 1,
+                Action::SendStun { to, .. } if to == victim => checks_to_victim += 1,
+                _ => {}
+            }
+        }
+    }
+    assert_eq!(keepalives_to_victim, 0, "keepalive flood must stop");
+    assert!(
+        checks_to_victim <= usize::from(test_config().max_check_attempts),
+        "recovery checks must stay bounded, got {checks_to_victim}"
+    );
+}
+
+#[test]
+fn case_30_transient_outage_recovers_after_consent_expiry() {
+    let now = at(0);
+    let mut agent = keepalive_agent(now, [0x42u8; 32], [9u8; 32]);
+    let peer: SocketAddr = "198.51.100.2:55003".parse().unwrap();
+    agent.observe_authenticated_packet(now, peer);
+
+    assert!(
+        agent
+            .poll(now + Duration::from_secs(10))
+            .iter()
+            .any(|action| matches!(action, Action::ConsentExpired))
+    );
+    assert!(agent.selected().is_none());
+
+    // The peer returns at the same address: authenticated traffic re-selects it,
+    // so consent expiry did not permanently ban the path.
+    assert!(matches!(
+        agent.observe_authenticated_packet(now + Duration::from_millis(10_500), peer),
+        Some(Action::DirectReady { selected }) if selected.remote_addr == peer
+    ));
+    assert_eq!(agent.selected().map(|pair| pair.remote_addr), Some(peer));
 }

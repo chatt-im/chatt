@@ -19,6 +19,14 @@ const DEFAULT_MAX_RTO: Duration = Duration::from_millis(800);
 const DEFAULT_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
 const DEFAULT_RESTART_AFTER_IDLE: Duration = Duration::from_secs(5);
 const DEFAULT_DISCONNECT_AFTER_IDLE: Duration = Duration::from_secs(15);
+// WebRTC's dead-connection timeout (`kDeadConnectionReceiveTimeout`, 30 s). The
+// client overrides this to a tighter value below `disconnect_after_idle` so
+// consent is the active hard send-stop on its 1 s keepalive cadence.
+const DEFAULT_CONSENT_TIMEOUT: Duration = Duration::from_secs(30);
+/// Upper bound of [`consent_jitter`], matching RFC 7675 §5.1's 1.2 factor. A
+/// healthy path's keepalives are answered at most `keepalive_interval * this`
+/// apart, so `consent_timeout` must exceed that product.
+const MAX_KEEPALIVE_JITTER: f64 = 1.2;
 const DEFAULT_PORT_GUESS_LIMIT: usize = 8;
 const DEFAULT_PORT_GUESS_MAX_DELTA: u16 = 8;
 const DEFAULT_MAX_CHECK_ATTEMPTS: u8 = 5;
@@ -76,6 +84,13 @@ pub struct AgentConfig {
     pub keepalive_interval: Duration,
     pub restart_after_idle: Duration,
     pub disconnect_after_idle: Duration,
+    /// RFC 7675 consent-to-send lifetime for a selected path. Sending stops once
+    /// no integrity-checked traffic has arrived from the selected address within
+    /// this window. Must exceed `keepalive_interval * MAX_KEEPALIVE_JITTER` so a
+    /// healthy path's answered keepalives keep consent fresh. The client sets it
+    /// below `disconnect_after_idle` so the hard send-stop fires before the
+    /// recovery teardown.
+    pub consent_timeout: Duration,
     pub port_guess_limit: usize,
     pub port_guess_max_delta: u16,
     pub max_check_attempts: u8,
@@ -95,12 +110,60 @@ impl AgentConfig {
             keepalive_interval: DEFAULT_KEEPALIVE_INTERVAL,
             restart_after_idle: DEFAULT_RESTART_AFTER_IDLE,
             disconnect_after_idle: DEFAULT_DISCONNECT_AFTER_IDLE,
+            consent_timeout: DEFAULT_CONSENT_TIMEOUT,
             port_guess_limit: DEFAULT_PORT_GUESS_LIMIT,
             port_guess_max_delta: DEFAULT_PORT_GUESS_MAX_DELTA,
             max_check_attempts: DEFAULT_MAX_CHECK_ATTEMPTS,
         }
     }
+
+    /// Checks the timer relationships the agent relies on.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AgentConfigError::ConsentTimeoutTooSmall`] when `consent_timeout`
+    /// does not exceed the worst-case answered-keepalive spacing
+    /// (`keepalive_interval * MAX_KEEPALIVE_JITTER`), which would let consent
+    /// expire on a healthy path.
+    pub fn validate(&self) -> Result<(), AgentConfigError> {
+        let max_keepalive = self.keepalive_interval.mul_f64(MAX_KEEPALIVE_JITTER);
+        if self.consent_timeout <= max_keepalive {
+            return Err(AgentConfigError::ConsentTimeoutTooSmall {
+                keepalive_interval: self.keepalive_interval,
+                consent_timeout: self.consent_timeout,
+            });
+        }
+        Ok(())
+    }
 }
+
+/// A timer relationship in [`AgentConfig`] that would break the state machine.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AgentConfigError {
+    /// `consent_timeout` is not larger than the jittered keepalive interval, so
+    /// consent could expire on a path that is answering keepalives.
+    ConsentTimeoutTooSmall {
+        keepalive_interval: Duration,
+        consent_timeout: Duration,
+    },
+}
+
+impl std::fmt::Display for AgentConfigError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ConsentTimeoutTooSmall {
+                keepalive_interval,
+                consent_timeout,
+            } => write!(
+                f,
+                "consent_timeout {consent_timeout:?} must exceed keepalive_interval \
+                 {keepalive_interval:?} times the {MAX_KEEPALIVE_JITTER} jitter bound"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for AgentConfigError {}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FallbackReason {
@@ -156,6 +219,11 @@ pub enum Action {
         reason: RestartReason,
     },
     Disconnected,
+    /// RFC 7675 consent to send expired for the selected path. The selection is
+    /// cleared, so the application must stop all direct transmission to the
+    /// address. Distinct from `Disconnected`, which tears the path down for
+    /// recovery.
+    ConsentExpired,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -205,9 +273,12 @@ pub struct TraversalAgent {
     peer_reflexive_seen: bool,
     selected: Option<SelectedPair>,
     last_rx_at: Option<Instant>,
+    last_consent_response: Option<Instant>,
     next_keepalive_at: Option<Instant>,
+    keepalive_counter: u64,
     restart_announced: bool,
     disconnected_announced: bool,
+    consent_expired_announced: bool,
 }
 
 impl TraversalAgent {
@@ -221,6 +292,9 @@ impl TraversalAgent {
         local_candidates: Vec<Candidate>,
         remote_candidates: Vec<Candidate>,
     ) -> Self {
+        if let Err(error) = config.validate() {
+            panic!("invalid AgentConfig: {error}");
+        }
         let next_candidate_id = local_candidates
             .iter()
             .chain(remote_candidates.iter())
@@ -249,9 +323,12 @@ impl TraversalAgent {
             peer_reflexive_seen: false,
             selected: None,
             last_rx_at: None,
+            last_consent_response: None,
             next_keepalive_at: None,
+            keepalive_counter: 0,
             restart_announced: false,
             disconnected_announced: false,
+            consent_expired_announced: false,
         };
         agent.rebuild_pairs();
         agent
@@ -354,6 +431,17 @@ impl TraversalAgent {
         self.last_rx_at = Some(now);
         self.restart_announced = false;
         self.disconnected_announced = false;
+        // An integrity-checked Binding Success from the selected address renews
+        // consent to send. Keepalive responses are not registered in
+        // `self.transactions`, so this must run before the transaction-match
+        // branch that drops them as a no-op.
+        if message.class == MessageClass::SuccessResponse
+            && self
+                .selected
+                .is_some_and(|selected| selected.remote_addr == src)
+        {
+            self.refresh_consent(now);
+        }
         self.resolve_role_conflict(&message);
 
         match message.class {
@@ -399,7 +487,10 @@ impl TraversalAgent {
         self.disconnected_announced = false;
 
         match self.selected {
-            Some(selected) if selected.remote_addr == src => None,
+            Some(selected) if selected.remote_addr == src => {
+                self.refresh_consent(now);
+                None
+            }
             Some(mut selected) => {
                 selected.remote_addr = src;
                 selected.peer_reflexive = true;
@@ -415,6 +506,19 @@ impl TraversalAgent {
 
     fn poll_selected(&mut self, now: Instant, selected: SelectedPair) -> Vec<Action> {
         let mut actions = Vec::new();
+        // RFC 7675 consent. Checked first, so it preempts the idle latches and is
+        // the trigger that stops sending to a stale address. Clearing the
+        // selection routes later polls through the non-selected branch, which
+        // emits no keepalive to that address.
+        if self
+            .last_consent_response
+            .is_some_and(|at| now.duration_since(at) >= self.config.consent_timeout)
+        {
+            self.consent_expired_announced = true;
+            self.selected = None;
+            self.next_keepalive_at = None;
+            return vec![Action::ConsentExpired];
+        }
         if let Some(last_rx_at) = self.last_rx_at {
             let idle = now.duration_since(last_rx_at);
             if idle >= self.config.disconnect_after_idle {
@@ -436,7 +540,12 @@ impl TraversalAgent {
             .is_some_and(|next_keepalive_at| now >= next_keepalive_at)
         {
             let transaction_id = self.next_transaction_id();
-            self.next_keepalive_at = Some(now + self.config.keepalive_interval);
+            // RFC 7675 §5.1 randomizes the check cadence by [0.8, 1.2] to
+            // de-synchronize many peers' keepalives. Derived from the salt and
+            // counter so the agent stays deterministic with no RNG in `poll`.
+            let factor = consent_jitter(&self.config.auth.transaction_salt, self.keepalive_counter);
+            self.keepalive_counter = self.keepalive_counter.wrapping_add(1);
+            self.next_keepalive_at = Some(now + self.config.keepalive_interval.mul_f64(factor));
             let bytes = StunMessage::binding_request(
                 transaction_id,
                 self.config.username.clone(),
@@ -707,6 +816,16 @@ impl TraversalAgent {
         self.next_keepalive_at = Some(now + self.config.keepalive_interval);
         self.restart_announced = false;
         self.disconnected_announced = false;
+        // A selection always follows an integrity-checked exchange, so the
+        // consent clock starts fresh here.
+        self.refresh_consent(now);
+    }
+
+    /// Renews RFC 7675 consent to send after integrity-checked traffic from the
+    /// selected address.
+    fn refresh_consent(&mut self, now: Instant) {
+        self.last_consent_response = Some(now);
+        self.consent_expired_announced = false;
     }
 
     fn next_transaction_id(&mut self) -> TransactionId {
@@ -715,6 +834,16 @@ impl TraversalAgent {
         self.transaction_counter = self.transaction_counter.wrapping_add(1).max(1);
         id
     }
+}
+
+/// Deterministic keepalive jitter factor in `[0.8, 1.2]` (RFC 7675 §5.1).
+///
+/// Derived from the per-agent `salt` and a counter `n` via HMAC-SHA256, so it is
+/// reproducible across runs with the same salt and needs no RNG in `poll`.
+fn consent_jitter(salt: &[u8; 32], n: u64) -> f64 {
+    let mac = rpc::crypto::stun_integrity(salt, &n.to_be_bytes());
+    let h = u64::from_le_bytes(mac[0..8].try_into().expect("8 bytes"));
+    0.8 + (h % 401) as f64 / 1000.0
 }
 
 #[cfg(test)]
@@ -1122,9 +1251,15 @@ mod tests {
     #[test]
     fn idle_selected_connection_restarts_then_disconnects() {
         let now = at(0);
+        // A long consent timeout isolates the restart/disconnect latches from the
+        // earlier consent expiry, which is covered by the sim cases.
+        let config = AgentConfig {
+            consent_timeout: Duration::from_secs(60),
+            ..test_config()
+        };
         let mut agent = TraversalAgent::new(
             now,
-            test_config(),
+            config,
             IceRole::Controlling,
             10,
             NatKind::Cone,
@@ -1144,6 +1279,53 @@ mod tests {
             agent.poll(now + Duration::from_secs(15)).as_slice(),
             [Action::Disconnected]
         ));
+    }
+
+    #[test]
+    fn default_config_has_no_timeout_collision() {
+        assert!(test_config().validate().is_ok());
+    }
+
+    #[test]
+    fn consent_timeout_at_or_below_jittered_keepalive_is_rejected() {
+        // The original collision: equal keepalive and consent timers.
+        let collision = AgentConfig {
+            keepalive_interval: Duration::from_secs(10),
+            consent_timeout: Duration::from_secs(10),
+            ..test_config()
+        };
+        assert!(matches!(
+            collision.validate(),
+            Err(AgentConfigError::ConsentTimeoutTooSmall { .. })
+        ));
+        // Above the keepalive but within the jitter band still races.
+        let within_jitter = AgentConfig {
+            keepalive_interval: Duration::from_secs(10),
+            consent_timeout: Duration::from_secs(11),
+            ..test_config()
+        };
+        assert!(within_jitter.validate().is_err());
+    }
+
+    #[test]
+    #[should_panic(expected = "invalid AgentConfig")]
+    fn new_rejects_colliding_timeouts() {
+        let now = at(0);
+        let config = AgentConfig {
+            keepalive_interval: Duration::from_secs(10),
+            consent_timeout: Duration::from_secs(10),
+            ..test_config()
+        };
+        let _ = TraversalAgent::new(
+            now,
+            config,
+            IceRole::Controlling,
+            10,
+            NatKind::Cone,
+            NatKind::Cone,
+            vec![candidate(1, CandidateKind::Host, "10.0.0.2:5000")],
+            vec![candidate(2, CandidateKind::Host, "10.0.0.3:5001")],
+        );
     }
 
     #[test]

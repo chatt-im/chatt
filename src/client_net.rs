@@ -66,6 +66,11 @@ const RELAY_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(5);
 /// STUN keepalive spacing for direct paths. Tightened from the agent default so
 /// path liveness is reconfirmed every second.
 const P2P_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(1);
+/// RFC 7675 consent lifetime for a direct path. Tightened from the agent default
+/// to below [`struct@TraversalAgent`]'s 15 s disconnect timeout so consent expiry
+/// is the hard send-stop, while staying well above [`P2P_KEEPALIVE_INTERVAL`] so
+/// answered keepalives keep it fresh.
+const P2P_CONSENT_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_QUEUED_FILE_BYTES: usize = 128 * 1024;
 const MAX_FILE_CHUNKS_PER_TICK: usize = 4;
 const FILE_PROGRESS_STEP_BYTES: u64 = 1024 * 1024;
@@ -2331,6 +2336,7 @@ impl WorkerState {
         let config = P2pAgentConfig {
             username: Some(p2p_username(peer.connection_id)),
             keepalive_interval: P2P_KEEPALIVE_INTERVAL,
+            consent_timeout: P2P_CONSENT_TIMEOUT,
             ..P2pAgentConfig::with_auth(auth)
         };
         let agent = TraversalAgent::new(
@@ -2750,6 +2756,24 @@ impl WorkerState {
                     }
                     let _ = self.events.send(NetworkEvent::Status(
                         "p2p direct path timed out; using relay".to_string(),
+                    ));
+                }
+                P2pAction::ConsentExpired => {
+                    // RFC 7675 hard send-stop. The agent has already cleared its
+                    // selection, so `send_p2p_voice`/`send_p2p_voice_feedback`
+                    // (gated on `agent.selected()`) emit nothing further to the
+                    // stale address. Clearing `direct_stable_since` resumes the
+                    // relay. The peer is kept, distinct from `Disconnected`.
+                    kvlog::warn!("p2p consent to send expired", session_id = session_id.0);
+                    if let Some(peer) = self.p2p_peers.get_mut(&session_id) {
+                        peer.direct_stable_since = None;
+                        let _ = self.events.send(NetworkEvent::PeerTransport {
+                            user_id: peer.user_id,
+                            direct: false,
+                        });
+                    }
+                    let _ = self.events.send(NetworkEvent::Status(
+                        "p2p consent expired; using relay".to_string(),
                     ));
                 }
             }
