@@ -9,6 +9,13 @@ use crate::theme;
 
 const REFLOW_TARGET: usize = 95;
 
+/// Wrapped body lines beyond this collapse a lone message behind an expander.
+const COLLAPSE_LIMIT: usize = 12;
+/// Body lines shown while a long message is collapsed.
+const COLLAPSE_SHOW: usize = 10;
+/// Maximum gap between adjacent same-sender messages that still groups them.
+const GROUP_GAP_MS: u64 = 90_000;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Segment {
     pub col: u16,
@@ -17,10 +24,25 @@ pub struct Segment {
     pub style: Style,
 }
 
+/// The role a rendered chat row plays within its block.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LineKind {
+    /// Sender name plus age. Toggles collapse when it belongs to a long message.
+    Heading,
+    /// A wrapped body line. The only selectable kind.
+    Body,
+    /// The `...` truncation row of a collapsed message. Toggles collapse.
+    Ellipsis,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct VisibleLine {
+    /// For `Body`/`Ellipsis` the owning message; for `Heading` the block's first
+    /// (oldest) message.
     pub message: usize,
+    /// Body line index within `message`; zero for `Heading`/`Ellipsis`.
     pub line: usize,
+    pub kind: LineKind,
 }
 
 pub struct ChatEntry {
@@ -28,10 +50,25 @@ pub struct ChatEntry {
     pub id: u64,
     pub sender: String,
     pub body: String,
-    #[allow(dead_code)]
     pub timestamp_ms: u64,
     pub local: bool,
+    /// Whether a collapsible (over [`COLLAPSE_LIMIT`] lines) message is expanded.
+    expanded: bool,
     layout: MessageLayout,
+}
+
+/// A run of one or more consecutive messages rendered under a single heading.
+struct Block {
+    /// Oldest message index (heading anchor and age source).
+    first: usize,
+    /// Newest message index, inclusive.
+    last: usize,
+    /// Body lines actually rendered: the full wrapped count, or [`COLLAPSE_SHOW`]
+    /// when collapsed.
+    body_lines: usize,
+    /// True only for a lone message over [`COLLAPSE_LIMIT`] lines that is not
+    /// expanded.
+    collapsed: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -80,6 +117,7 @@ impl VirtualChatBuffer {
             body: message.body,
             timestamp_ms: message.timestamp_ms,
             local,
+            expanded: false,
             layout: MessageLayout::new(),
         });
         self.trim_front();
@@ -92,6 +130,7 @@ impl VirtualChatBuffer {
             body: body.into(),
             timestamp_ms: 0,
             local: false,
+            expanded: false,
             layout: MessageLayout::new(),
         });
         self.trim_front();
@@ -216,6 +255,37 @@ impl VirtualChatBuffer {
         Some(out)
     }
 
+    /// Toggles the expand/collapse state of `message` when it is collapsible
+    /// (over [`COLLAPSE_LIMIT`] wrapped lines at `width`). Returns whether the
+    /// state changed.
+    pub fn toggle_expand(&mut self, message: usize, width: u16) -> bool {
+        if message >= self.messages.len() || self.ensure_lines(message, width) <= COLLAPSE_LIMIT {
+            return false;
+        }
+        self.messages[message].expanded = !self.messages[message].expanded;
+        true
+    }
+
+    /// Whether `message`'s wrapped body exceeds [`COLLAPSE_LIMIT`] at `width`.
+    pub fn is_collapsible(&mut self, message: usize, width: u16) -> bool {
+        message < self.messages.len() && self.ensure_lines(message, width) > COLLAPSE_LIMIT
+    }
+
+    /// Whether `message` is collapsible (over [`COLLAPSE_LIMIT`] lines) and
+    /// currently collapsed. Assumes its layout was already laid out this frame
+    /// (true for any message in a visible block).
+    pub fn is_collapsed(&self, message: usize) -> bool {
+        let entry = &self.messages[message];
+        entry.layout.lines() > COLLAPSE_LIMIT && !entry.expanded
+    }
+
+    /// Whether `message` is collapsible and currently expanded. Counterpart to
+    /// [`Self::is_collapsed`]; both are false for short messages.
+    pub fn is_expanded(&self, message: usize) -> bool {
+        let entry = &self.messages[message];
+        entry.layout.lines() > COLLAPSE_LIMIT && entry.expanded
+    }
+
     pub fn visible_lines(&mut self, width: u16, height: u16, overscan: usize) -> Vec<VisibleLine> {
         let width = width.max(1);
         let target = height as usize;
@@ -223,25 +293,30 @@ impl VirtualChatBuffer {
         let mut skip = self.scroll_offset;
         let mut reversed = Vec::with_capacity(target);
 
-        for idx in (0..self.messages.len()).rev() {
-            let msg = &mut self.messages[idx];
-            msg.layout.ensure(width, &msg.body);
-            let lines = msg.layout.lines().max(1);
-            if skip >= lines {
-                skip -= lines;
-                continue;
-            }
-
-            let end = lines - skip;
-            let take = end.min(need);
-            let start = end - take;
-            for line in (start..end).rev() {
-                reversed.push(VisibleLine { message: idx, line });
-            }
-            need = need.saturating_sub(take);
-            skip = 0;
-            if need == 0 {
-                break;
+        let mut cursor = self.messages.len();
+        'runs: while cursor > 0 && need > 0 {
+            let last = cursor - 1;
+            let run_start = self.run_start(last, width);
+            let blocks = self.pack_run(run_start, last, width);
+            cursor = run_start;
+            for block in blocks.iter().rev() {
+                let rows = self.block_row_lines(block);
+                let n = rows.len();
+                if skip >= n {
+                    skip -= n;
+                    continue;
+                }
+                let end = n - skip;
+                let take = end.min(need);
+                let start = end - take;
+                for i in (start..end).rev() {
+                    reversed.push(rows[i]);
+                }
+                need = need.saturating_sub(take);
+                skip = 0;
+                if need == 0 {
+                    break 'runs;
+                }
             }
         }
 
@@ -257,6 +332,146 @@ impl VirtualChatBuffer {
         }
     }
 
+    /// Lays out `idx` at `width` and returns its wrapped line count (at least 1).
+    fn ensure_lines(&mut self, idx: usize, width: u16) -> usize {
+        let width = width.max(1);
+        let msg = &mut self.messages[idx];
+        msg.layout.ensure(width, &msg.body);
+        msg.layout.lines().max(1)
+    }
+
+    /// Whether a block boundary is forced between adjacent messages `prev` and
+    /// `cur` (`cur == prev + 1`): a sender or locality change, a notice
+    /// (`timestamp_ms == 0`), a gap over [`GROUP_GAP_MS`], or either side being a
+    /// lone collapsible message over [`COLLAPSE_LIMIT`] lines.
+    fn boundary_before(&mut self, prev: usize, cur: usize, width: u16) -> bool {
+        if self.messages[prev].timestamp_ms == 0 || self.messages[cur].timestamp_ms == 0 {
+            return true;
+        }
+        if self.messages[prev].local != self.messages[cur].local
+            || self.messages[prev].sender != self.messages[cur].sender
+        {
+            return true;
+        }
+        let gap = self.messages[cur]
+            .timestamp_ms
+            .saturating_sub(self.messages[prev].timestamp_ms);
+        if gap > GROUP_GAP_MS {
+            return true;
+        }
+        self.ensure_lines(prev, width) > COLLAPSE_LIMIT
+            || self.ensure_lines(cur, width) > COLLAPSE_LIMIT
+    }
+
+    /// Oldest message in the same groupable run as `last`, walking back until a
+    /// forced boundary. Headings anchor to a run's blocks from this end, so they
+    /// stay fixed as newer messages arrive.
+    fn run_start(&mut self, last: usize, width: u16) -> usize {
+        if self.ensure_lines(last, width) > COLLAPSE_LIMIT {
+            return last;
+        }
+        let mut start = last;
+        while start > 0 && !self.boundary_before(start - 1, start, width) {
+            start -= 1;
+        }
+        start
+    }
+
+    /// Newest message in the same groupable run as `start`, walking forward until
+    /// a forced boundary.
+    fn run_end(&mut self, start: usize, width: u16) -> usize {
+        if self.ensure_lines(start, width) > COLLAPSE_LIMIT {
+            return start;
+        }
+        let mut end = start;
+        while end + 1 < self.messages.len() && !self.boundary_before(end, end + 1, width) {
+            end += 1;
+        }
+        end
+    }
+
+    /// Packs the run `[run_start, run_end]` into blocks oldest-first, greedily
+    /// filling each to [`COLLAPSE_LIMIT`] lines. A lone message over the limit
+    /// becomes a single collapsible block.
+    fn pack_run(&mut self, run_start: usize, run_end: usize, width: u16) -> Vec<Block> {
+        let first_lines = self.ensure_lines(run_start, width);
+        if run_start == run_end && first_lines > COLLAPSE_LIMIT {
+            let expanded = self.messages[run_start].expanded;
+            return vec![Block {
+                first: run_start,
+                last: run_start,
+                body_lines: if expanded { first_lines } else { COLLAPSE_SHOW },
+                collapsed: !expanded,
+            }];
+        }
+        let mut blocks = Vec::new();
+        let mut start = run_start;
+        let mut total = 0usize;
+        for message in run_start..=run_end {
+            let lines = self.ensure_lines(message, width);
+            if total > 0 && total + lines > COLLAPSE_LIMIT {
+                blocks.push(Block {
+                    first: start,
+                    last: message - 1,
+                    body_lines: total,
+                    collapsed: false,
+                });
+                start = message;
+                total = 0;
+            }
+            total += lines;
+        }
+        blocks.push(Block {
+            first: start,
+            last: run_end,
+            body_lines: total,
+            collapsed: false,
+        });
+        blocks
+    }
+
+    /// Rendered rows of `block`, top to bottom: heading, body lines, then an
+    /// ellipsis row when collapsed. Layouts must already be ensured.
+    fn block_row_lines(&self, block: &Block) -> Vec<VisibleLine> {
+        let mut rows = Vec::with_capacity(Self::block_rows(block));
+        rows.push(VisibleLine {
+            message: block.first,
+            line: 0,
+            kind: LineKind::Heading,
+        });
+        if block.collapsed {
+            for line in 0..block.body_lines {
+                rows.push(VisibleLine {
+                    message: block.last,
+                    line,
+                    kind: LineKind::Body,
+                });
+            }
+            rows.push(VisibleLine {
+                message: block.last,
+                line: 0,
+                kind: LineKind::Ellipsis,
+            });
+        } else {
+            for message in block.first..=block.last {
+                let lines = self.messages[message].layout.lines().max(1);
+                for line in 0..lines {
+                    rows.push(VisibleLine {
+                        message,
+                        line,
+                        kind: LineKind::Body,
+                    });
+                }
+            }
+        }
+        rows
+    }
+
+    /// Total rendered rows for a block: heading + body + optional ellipsis.
+    fn block_rows(block: &Block) -> usize {
+        1 + block.body_lines + usize::from(block.collapsed)
+    }
+
     pub fn total_lines_estimate(&self) -> usize {
         self.messages
             .iter()
@@ -268,9 +483,13 @@ impl VirtualChatBuffer {
     fn total_lines_exact(&mut self, width: u16) -> usize {
         let width = width.max(1);
         let mut total = 0usize;
-        for message in &mut self.messages {
-            message.layout.ensure(width, &message.body);
-            total = total.saturating_add(message.layout.lines().max(1));
+        let mut cursor = 0usize;
+        while cursor < self.messages.len() {
+            let run_end = self.run_end(cursor, width);
+            for block in self.pack_run(cursor, run_end, width) {
+                total = total.saturating_add(Self::block_rows(&block));
+            }
+            cursor = run_end + 1;
         }
         total.max(1)
     }
@@ -736,6 +955,24 @@ fn estimate_lines(text: &str, avail: usize) -> usize {
     lines.max(1)
 }
 
+/// Formats elapsed wall-clock milliseconds as a compact age label: minutes under
+/// an hour (`40m`), tenths of an hour up to `9.9h`, whole hours through `48h`,
+/// then whole days (`4d`).
+pub fn format_age(elapsed_ms: u64) -> String {
+    let minutes = elapsed_ms / 60_000;
+    if minutes < 60 {
+        return format!("{minutes}m");
+    }
+    if elapsed_ms < 36_000_000 {
+        let tenths = (elapsed_ms / 360_000).min(99);
+        return format!("{}.{}h", tenths / 10, tenths % 10);
+    }
+    if elapsed_ms <= 172_800_000 {
+        return format!("{}h", elapsed_ms / 3_600_000);
+    }
+    format!("{}d", elapsed_ms / 86_400_000)
+}
+
 fn is_fence_closer(line: &[u8], fence: u8, count: usize) -> bool {
     let indent = line
         .iter()
@@ -759,6 +996,197 @@ mod tests {
             buf.push_notice("user", format!("message {i}"));
         }
         buf
+    }
+
+    impl VirtualChatBuffer {
+        fn push_test(&mut self, sender: &str, body: &str, timestamp_ms: u64, local: bool) {
+            let id = self.messages.len() as u64;
+            self.messages.push(ChatEntry {
+                id,
+                sender: sender.to_string(),
+                body: body.to_string(),
+                timestamp_ms,
+                local,
+                expanded: false,
+                layout: MessageLayout::new(),
+            });
+            self.trim_front();
+        }
+    }
+
+    fn heading_ids(buf: &mut VirtualChatBuffer, width: u16) -> Vec<u64> {
+        buf.visible_lines(width, 10_000, 0)
+            .into_iter()
+            .filter(|row| row.kind == LineKind::Heading)
+            .map(|row| buf.message(row.message).id)
+            .collect()
+    }
+
+    /// A fenced code block laying out to exactly `n` rendered lines (`n >= 2`):
+    /// an opening fence, `n - 2` content lines, and a closing fence.
+    fn fenced(n: usize) -> String {
+        let mut body = String::from("```");
+        for i in 0..n.saturating_sub(2) {
+            body.push('\n');
+            body.push_str(&i.to_string());
+        }
+        body.push_str("\n```");
+        body
+    }
+
+    fn kinds(rows: &[VisibleLine]) -> Vec<LineKind> {
+        rows.iter().map(|row| row.kind).collect()
+    }
+
+    fn headings(rows: &[VisibleLine]) -> usize {
+        rows.iter()
+            .filter(|row| row.kind == LineKind::Heading)
+            .count()
+    }
+
+    #[test]
+    fn format_age_covers_each_unit_boundary() {
+        let cases = [
+            (0u64, "0m"),
+            (59 * 60_000, "59m"),
+            (3_600_000, "1.0h"),
+            (5_400_000, "1.5h"),
+            (35_640_000, "9.9h"),
+            (36_000_000, "10h"),
+            (115_200_000, "32h"),
+            (172_800_000, "48h"),
+            (176_400_000, "2d"),
+            (345_600_000, "4d"),
+        ];
+        for (elapsed, expected) in cases {
+            assert_eq!(format_age(elapsed), expected, "elapsed {elapsed}ms");
+        }
+    }
+
+    #[test]
+    fn same_sender_within_window_shares_one_heading() {
+        let mut buf = VirtualChatBuffer::new(1000);
+        buf.push_test("alice", "hello", 1_000_000, false);
+        buf.push_test("alice", "world", 1_000_000 + GROUP_GAP_MS, false);
+        let rows = buf.visible_lines(40, 50, 0);
+        assert_eq!(headings(&rows), 1);
+        assert_eq!(rows.len(), 3); // heading + two body lines
+    }
+
+    #[test]
+    fn gap_over_window_breaks_the_block() {
+        let mut buf = VirtualChatBuffer::new(1000);
+        buf.push_test("alice", "hello", 1_000_000, false);
+        buf.push_test("alice", "world", 1_000_000 + GROUP_GAP_MS + 1, false);
+        let rows = buf.visible_lines(40, 50, 0);
+        assert_eq!(headings(&rows), 2);
+    }
+
+    #[test]
+    fn sender_change_breaks_the_block() {
+        let mut buf = VirtualChatBuffer::new(1000);
+        buf.push_test("alice", "hello", 1_000_000, false);
+        buf.push_test("bob", "world", 1_000_000 + 1_000, false);
+        assert_eq!(headings(&buf.visible_lines(40, 50, 0)), 2);
+    }
+
+    #[test]
+    fn block_cap_groups_twelve_lines_and_splits_thirteen() {
+        let group = |count: usize| {
+            let mut buf = VirtualChatBuffer::new(1000);
+            for i in 0..count {
+                buf.push_test("alice", "x", 1_000_000 + i as u64 * 1_000, false);
+            }
+            headings(&buf.visible_lines(40, 100, 0))
+        };
+        assert_eq!(group(12), 1); // twelve single-line messages stay together
+        assert_eq!(group(13), 2); // the thirteenth line forces a new heading
+    }
+
+    #[test]
+    fn notices_never_group() {
+        let mut buf = buffer_with_notices(3);
+        assert_eq!(headings(&buf.visible_lines(40, 50, 0)), 3);
+    }
+
+    #[test]
+    fn long_message_collapses_to_preview_plus_ellipsis() {
+        let mut buf = VirtualChatBuffer::new(1000);
+        buf.push_test("alice", &fenced(13), 1_000_000, false);
+        let rows = buf.visible_lines(40, 50, 0);
+        assert_eq!(rows.len(), 1 + COLLAPSE_SHOW + 1);
+        assert_eq!(rows.first().map(|r| r.kind), Some(LineKind::Heading));
+        assert_eq!(rows.last().map(|r| r.kind), Some(LineKind::Ellipsis));
+        assert_eq!(
+            kinds(&rows[1..=COLLAPSE_SHOW]),
+            vec![LineKind::Body; COLLAPSE_SHOW]
+        );
+        assert!(buf.is_collapsed(0));
+        assert!(buf.is_collapsible(0, 40));
+    }
+
+    #[test]
+    fn exactly_twelve_lines_renders_in_full() {
+        let mut buf = VirtualChatBuffer::new(1000);
+        buf.push_test("alice", &fenced(12), 1_000_000, false);
+        let rows = buf.visible_lines(40, 50, 0);
+        assert_eq!(rows.len(), 1 + 12); // heading + twelve body lines
+        assert!(rows.iter().all(|r| r.kind != LineKind::Ellipsis));
+        assert!(!buf.is_collapsible(0, 40));
+    }
+
+    #[test]
+    fn expanding_a_long_message_shows_every_line() {
+        let mut buf = VirtualChatBuffer::new(1000);
+        buf.push_test("alice", &fenced(13), 1_000_000, false);
+        let _ = buf.visible_lines(40, 50, 0);
+        assert!(buf.is_collapsed(0) && !buf.is_expanded(0));
+        assert!(buf.toggle_expand(0, 40));
+        let rows = buf.visible_lines(40, 50, 0);
+        assert_eq!(rows.len(), 1 + 13);
+        assert!(rows.iter().all(|r| r.kind != LineKind::Ellipsis));
+        assert!(buf.is_expanded(0) && !buf.is_collapsed(0));
+    }
+
+    #[test]
+    fn block_first_line_is_a_heading() {
+        let mut buf = VirtualChatBuffer::new(1000);
+        buf.push_test("alice", "hi", 1_000_000, false);
+        let rows = buf.visible_lines(40, 50, 0);
+        assert_eq!(rows.first().map(|r| r.kind), Some(LineKind::Heading));
+    }
+
+    #[test]
+    fn headings_stay_fixed_as_messages_arrive() {
+        // Five-line messages pack two-to-a-block (10 lines) with a third forcing a
+        // new heading. Forward packing keeps earlier headings anchored to the same
+        // message as the run grows; backward packing would shuffle them.
+        let mut buf = VirtualChatBuffer::new(1000);
+        let mut ts = 1_000_000;
+        for _ in 0..3 {
+            buf.push_test("alice", &fenced(5), ts, false);
+            ts += 1_000;
+        }
+        let before = heading_ids(&mut buf, 40);
+        buf.push_test("alice", &fenced(5), ts, false);
+        let after = heading_ids(&mut buf, 40);
+        for id in &before {
+            assert!(
+                after.contains(id),
+                "heading on message {id} moved after a new message"
+            );
+        }
+    }
+
+    #[test]
+    fn total_lines_exact_matches_emitted_row_count() {
+        let mut buf = VirtualChatBuffer::new(1000);
+        buf.push_test("alice", "hello", 1_000_000, false);
+        buf.push_test("alice", "world", 1_000_000 + 1_000, false);
+        buf.push_test("bob", &fenced(13), 1_000_000 + 200_000, false);
+        buf.push_notice("system", "joined");
+        let total = buf.total_lines_exact(40);
+        assert_eq!(total, buf.visible_lines(40, 10_000, 0).len());
     }
 
     #[test]

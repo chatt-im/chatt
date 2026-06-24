@@ -141,8 +141,8 @@ fn spawn_clipboard_command(command: &ClipboardCommand, text: &str) -> Option<Chi
 /// a helper that already exited is reaped here and the slot left empty.
 fn retain_if_running(mut child: Child) -> Option<Child> {
     match child.try_wait() {
-        Ok(Some(_)) => None,       // Exited already; reaped by try_wait.
-        Ok(None) => Some(child),   // Still owning the selection; keep it.
-        Err(_) => Some(child),     // Status unknown; keep so Drop can reap it.
+        Ok(Some(_)) => None,     // Exited already; reaped by try_wait.
+        Ok(None) => Some(child), // Still owning the selection; keep it.
+        Err(_) => Some(child),   // Status unknown; keep so Drop can reap it.
     }
 }

@@ -1,4 +1,4 @@
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use extui::{
     Buffer, Terminal, TerminalFlags,
@@ -42,7 +42,11 @@ pub(crate) fn run_app(
         app.drain_network_events();
         app.drain_audio_device_refreshes();
         app.drain_soundboard_events();
-        render(&mut app, &mut buffer);
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_millis() as u64)
+            .unwrap_or(0);
+        render(&mut app, &mut buffer, now_ms);
         buffer.render(&mut terminal);
 
         if event::poll(&stdin, Some(POLL_INTERVAL))?.is_readable() {
