@@ -18,6 +18,7 @@ pub const TEXT: Style = Style::DEFAULT.with_fg_rgb(0xd8, 0xdb, 0xd6);
 pub const MUTED: Style = Style::DEFAULT.with_fg_rgb(0x8a, 0x8f, 0x98);
 pub const SUBTLE: Style = Style::DEFAULT.with_fg_rgb(0x66, 0x6d, 0x78);
 pub const LOCAL_LINE: Style = Style::DEFAULT;
+pub const SELECTED_LINE: Style = Style::DEFAULT.with_bg_rgb(0x33, 0x38, 0x44);
 pub const ERROR: Style = Style::DEFAULT.with_fg_rgb(0xff, 0x66, 0x6f);
 pub const GOOD: Style = Style::DEFAULT.with_fg_rgb(0x9e, 0xd0, 0x8f);
 pub const WARN: Style = Style::DEFAULT.with_fg_rgb(0xe6, 0xc3, 0x84);

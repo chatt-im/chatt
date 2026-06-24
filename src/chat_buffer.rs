@@ -34,10 +34,28 @@ pub struct ChatEntry {
     layout: MessageLayout,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Selection {
+    anchor: (usize, usize),
+    head: (usize, usize),
+    active: bool,
+}
+
+impl Selection {
+    fn bounds(&self) -> ((usize, usize), (usize, usize)) {
+        if self.anchor <= self.head {
+            (self.anchor, self.head)
+        } else {
+            (self.head, self.anchor)
+        }
+    }
+}
+
 pub struct VirtualChatBuffer {
     messages: Vec<ChatEntry>,
     max_messages: usize,
     scroll_offset: usize,
+    selection: Option<Selection>,
 }
 
 impl VirtualChatBuffer {
@@ -46,6 +64,7 @@ impl VirtualChatBuffer {
             messages: Vec::new(),
             max_messages: max_messages.max(1),
             scroll_offset: 0,
+            selection: None,
         }
     }
 
@@ -81,6 +100,7 @@ impl VirtualChatBuffer {
     pub fn clear(&mut self) {
         self.messages.clear();
         self.scroll_offset = 0;
+        self.selection = None;
     }
 
     pub fn len(&self) -> usize {
@@ -103,8 +123,9 @@ impl VirtualChatBuffer {
         self.scroll_offset
     }
 
-    pub fn scroll_up(&mut self, rows: usize) {
-        self.scroll_offset = self.scroll_offset.saturating_add(rows.max(1));
+    pub fn scroll_up(&mut self, rows: usize, width: u16, height: u16) {
+        let max = self.max_scroll(width, height);
+        self.scroll_offset = self.scroll_offset.saturating_add(rows.max(1)).min(max);
     }
 
     pub fn scroll_down(&mut self, rows: usize) {
@@ -115,8 +136,84 @@ impl VirtualChatBuffer {
         self.scroll_offset = 0;
     }
 
-    pub fn top(&mut self, width: u16) {
-        self.scroll_offset = self.total_lines_exact(width).saturating_sub(1);
+    pub fn top(&mut self, width: u16, height: u16) {
+        self.scroll_offset = self.max_scroll(width, height);
+    }
+
+    /// Largest valid `scroll_offset`: the offset that places the oldest line at
+    /// the top of the view. Zero when all content fits within `height`.
+    fn max_scroll(&mut self, width: u16, height: u16) -> usize {
+        self.total_lines_exact(width)
+            .saturating_sub(height as usize)
+    }
+
+    /// Starts a selection anchored at `pos`, a `(message, line)` coordinate.
+    pub fn begin_selection(&mut self, pos: (usize, usize)) {
+        self.selection = Some(Selection {
+            anchor: pos,
+            head: pos,
+            active: true,
+        });
+    }
+
+    /// Moves the head of an in-progress selection to `pos`.
+    pub fn extend_selection(&mut self, pos: (usize, usize)) {
+        if let Some(selection) = &mut self.selection
+            && selection.active
+        {
+            selection.head = pos;
+        }
+    }
+
+    /// Marks the in-progress selection as finished; it remains visible.
+    pub fn end_selection(&mut self) {
+        if let Some(selection) = &mut self.selection {
+            selection.active = false;
+        }
+    }
+
+    pub fn clear_selection(&mut self) {
+        self.selection = None;
+    }
+
+    pub fn is_selecting(&self) -> bool {
+        self.selection.is_some_and(|selection| selection.active)
+    }
+
+    /// Returns whether the given `(message, line)` falls within the selection.
+    pub fn is_selected(&self, message: usize, line: usize) -> bool {
+        let Some(selection) = self.selection else {
+            return false;
+        };
+        let (lo, hi) = selection.bounds();
+        let pos = (message, line);
+        lo <= pos && pos <= hi
+    }
+
+    /// Concatenates the body text of every selected line, content only (no
+    /// sender column), joining lines with `\n`. Returns `None` when nothing is
+    /// selected.
+    pub fn selected_text(&self) -> Option<String> {
+        let (lo, hi) = self.selection?.bounds();
+        let mut out = String::new();
+        let mut first = true;
+        for message in lo.0..=hi.0.min(self.messages.len().saturating_sub(1)) {
+            let lines = self.messages[message].layout.lines().max(1);
+            let start = if message == lo.0 { lo.1 } else { 0 };
+            let end = if message == hi.0 { hi.1 } else { lines - 1 };
+            for line in start..=end.min(lines - 1) {
+                if !first {
+                    out.push('\n');
+                }
+                first = false;
+                for segment in self.line(message, line) {
+                    out.push_str(
+                        &self.messages[message].body[segment.start as usize..segment.end as usize],
+                    );
+                }
+            }
+        }
+        Some(out)
     }
 
     pub fn visible_lines(&mut self, width: u16, height: u16, overscan: usize) -> Vec<VisibleLine> {
@@ -183,6 +280,8 @@ impl VirtualChatBuffer {
         if excess > 0 {
             self.messages.drain(0..excess);
             self.scroll_offset = self.scroll_offset.saturating_sub(excess);
+            // Message indices shifted; any selection now points at the wrong rows.
+            self.selection = None;
         }
     }
 }
@@ -648,4 +747,70 @@ fn is_fence_closer(line: &[u8], fence: u8, count: usize) -> bool {
     let rest = &line[indent..];
     let n = rest.iter().take_while(|&&b| b == fence).count();
     n >= count && rest[n..].iter().all(|b| matches!(b, b' ' | b'\t'))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn buffer_with_notices(count: usize) -> VirtualChatBuffer {
+        let mut buf = VirtualChatBuffer::new(1000);
+        for i in 0..count {
+            buf.push_notice("user", format!("message {i}"));
+        }
+        buf
+    }
+
+    #[test]
+    fn scroll_up_clamps_at_the_top() {
+        let mut buf = buffer_with_notices(20);
+        let (width, height) = (40, 5);
+        let total = buf.total_lines_exact(width);
+        buf.scroll_up(1000, width, height);
+        assert_eq!(buf.scroll_offset(), total - height as usize);
+        // Already clamped; scrolling further changes nothing.
+        buf.scroll_up(10, width, height);
+        assert_eq!(buf.scroll_offset(), total - height as usize);
+    }
+
+    #[test]
+    fn top_then_scroll_down_reveals_one_line() {
+        let mut buf = buffer_with_notices(20);
+        let (width, height) = (40, 5);
+        buf.top(width, height);
+        let top = buf.scroll_offset();
+        assert!(top > 0);
+        buf.scroll_down(1);
+        assert_eq!(buf.scroll_offset(), top - 1);
+    }
+
+    #[test]
+    fn max_scroll_is_zero_when_content_fits() {
+        let mut buf = buffer_with_notices(3);
+        assert_eq!(buf.max_scroll(40, 50), 0);
+        buf.top(40, 50);
+        assert_eq!(buf.scroll_offset(), 0);
+    }
+
+    #[test]
+    fn bottom_resets_to_zero_offset() {
+        let mut buf = buffer_with_notices(20);
+        buf.scroll_up(5, 40, 5);
+        assert!(buf.scroll_offset() > 0);
+        buf.bottom();
+        assert_eq!(buf.scroll_offset(), 0);
+    }
+
+    #[test]
+    fn selected_text_is_body_content_joined_by_newlines() {
+        let mut buf = buffer_with_notices(3);
+        // Lay out every message so line segments exist.
+        let _ = buf.total_lines_exact(40);
+        buf.begin_selection((0, 0));
+        buf.extend_selection((2, 0));
+        assert_eq!(
+            buf.selected_text().as_deref(),
+            Some("message 0\nmessage 1\nmessage 2")
+        );
+    }
 }

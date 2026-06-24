@@ -483,8 +483,15 @@ fn draw_chat(area: Rect, app: &mut App, buf: &mut Buffer) {
     }
     let name_width = NAME_COL_WIDTH.min(area.w.saturating_sub(1));
     let body_width = area.w.saturating_sub(name_width).max(1);
+    if body_width != app.last_chat_width {
+        // Reflow invalidates the (message, line) coordinates a selection holds.
+        app.chat.clear_selection();
+    }
     app.last_chat_width = body_width;
+    app.last_chat_height = area.h;
+    app.last_chat_rect = area;
     if app.chat.is_empty() {
+        app.last_chat_lines.clear();
         area.with(theme::SUBTLE)
             .with(HAlign::Center)
             .text(buf, "No messages");
@@ -493,15 +500,17 @@ fn draw_chat(area: Rect, app: &mut App, buf: &mut Buffer) {
     let lines = app
         .chat
         .visible_lines(body_width, area.h, app.config.ui.overscan as usize);
+    app.last_chat_lines = lines.clone();
+    // Content is top-anchored: lines are drawn from the top of `area` and the
+    // already-background-filled rows below them stay empty.
     let mut row_area = area;
-    let empty_rows = (area.h as usize).saturating_sub(lines.len());
-    for _ in 0..empty_rows {
-        row_area.take_top(1).with(theme::BACKGROUND).fill(buf);
-    }
     for line in lines {
         let msg = app.chat.message(line.message);
+        let selected = app.chat.is_selected(line.message, line.line);
         let mut row = row_area.take_top(1);
-        let base = if msg.local {
+        let base = if selected {
+            theme::SELECTED_LINE
+        } else if msg.local {
             theme::LOCAL_LINE
         } else {
             theme::BACKGROUND

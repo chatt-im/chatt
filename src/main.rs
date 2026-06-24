@@ -4,6 +4,7 @@ mod chat_buffer;
 mod cli;
 #[allow(dead_code)]
 mod client_net;
+mod clipboard;
 mod config;
 mod fuzzy;
 mod local_control;
