@@ -261,6 +261,8 @@ pub struct UiConfig {
     pub overscan: u32,
     #[toml(default)]
     pub form_bindings: FormBindings,
+    #[toml(default)]
+    pub theme: ThemeChoice,
 }
 
 fn default_placeholder() -> String {
@@ -276,6 +278,7 @@ impl Default for UiConfig {
             max_messages: 50_000,
             overscan: 24,
             form_bindings: FormBindings::Standard,
+            theme: ThemeChoice::default(),
         }
     }
 }
@@ -412,6 +415,37 @@ fn default_soundboard_loss() -> String {
 
 fn default_soundboard_seed() -> u64 {
     0x746f_6d63_6861_7405
+}
+
+/// Selects which builtin color theme the UI renders with. A future custom mode
+/// can add a variant (or a sibling `[theme]` table) without breaking configs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Toml)]
+#[toml(FromToml, ToToml, rename_all = "kebab-case")]
+pub enum ThemeChoice {
+    /// The original dark pastel palette, in 24-bit RGB.
+    #[default]
+    TomorrowNight,
+    /// A 16-color base16 palette for dark terminals.
+    Base16Dark,
+    /// A 16-color base16 palette for light terminals.
+    Base16Light,
+}
+
+impl ThemeChoice {
+    /// The builtin themes in cycle order.
+    pub const ALL: [ThemeChoice; 3] = [
+        ThemeChoice::TomorrowNight,
+        ThemeChoice::Base16Dark,
+        ThemeChoice::Base16Light,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            ThemeChoice::TomorrowNight => "Tomorrow Night",
+            ThemeChoice::Base16Dark => "Base16 Dark",
+            ThemeChoice::Base16Light => "Base16 Light",
+        }
+    }
 }
 
 #[derive(Toml)]
@@ -1108,6 +1142,41 @@ input-device-index = 20
         assert!(content.contains("[[servers]]"));
         assert!(!content.contains("active-server"));
         assert!(!content.contains("pairing-code"));
+    }
+
+    #[test]
+    fn theme_choice_parses_each_builtin() {
+        let arena = Arena::new();
+        for (text, expected) in [
+            (
+                "[ui]\ntheme = \"tomorrow-night\"\n",
+                ThemeChoice::TomorrowNight,
+            ),
+            ("[ui]\ntheme = \"base16-dark\"\n", ThemeChoice::Base16Dark),
+            ("[ui]\ntheme = \"base16-light\"\n", ThemeChoice::Base16Light),
+        ] {
+            let config: Config = toml_spanner::parse(text, &arena).unwrap().to().unwrap();
+            assert_eq!(config.ui.theme, expected);
+        }
+    }
+
+    #[test]
+    fn theme_choice_defaults_to_tomorrow_night() {
+        let arena = Arena::new();
+        let config: Config = toml_spanner::parse("", &arena).unwrap().to().unwrap();
+        assert_eq!(config.ui.theme, ThemeChoice::TomorrowNight);
+    }
+
+    #[test]
+    fn runtime_config_round_trips_theme() {
+        let mut config = Config::default();
+        config.ui.theme = ThemeChoice::Base16Dark;
+        let content = render_runtime(&config);
+        assert!(content.contains("theme = \"base16-dark\""));
+
+        let arena = Arena::new();
+        let parsed: Config = toml_spanner::parse(&content, &arena).unwrap().to().unwrap();
+        assert_eq!(parsed.ui.theme, ThemeChoice::Base16Dark);
     }
 
     #[test]

@@ -2,7 +2,7 @@ use extui::{Buffer, Rect};
 use extui_editor::{Editor, Replacement, StyleRun, TextBuffer, TrackedChange};
 use tinyhl::{Highlighter, Source};
 
-use crate::theme;
+use crate::theme::Theme;
 
 struct BufferSource<'a>(&'a TextBuffer);
 
@@ -48,20 +48,26 @@ impl EditorHighlighter {
         }
     }
 
-    pub(crate) fn render(&mut self, editor: &mut Editor, area: Rect, buf: &mut Buffer) {
+    pub(crate) fn render(
+        &mut self,
+        editor: &mut Editor,
+        area: Rect,
+        buf: &mut Buffer,
+        theme: &Theme,
+    ) {
         self.sync(editor);
         self.runs.clear();
         if let Some(table) = self.hl.table() {
             let visible = editor.visible_byte_span(area);
             let span = tinyhl::Span::new(visible.offset, visible.len);
             for tok in table.query(span) {
-                let mut style = theme::TEXT;
+                let mut style = theme.text;
                 if let Some(render_span) = self
                     .hl
                     .render(tinyhl::Span::new(tok.span.offset, tok.span.len))
                     .next()
                 {
-                    style = style.patch(theme::syntax_style(&render_span));
+                    style = style.patch(theme.syntax.style(&render_span));
                 }
                 self.runs.push(StyleRun {
                     offset: tok.span.offset,

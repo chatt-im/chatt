@@ -5,7 +5,7 @@ use rpc::control::ChatMessage;
 use tinyhl::{Highlighter, Language, Source, Span};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use crate::theme;
+use crate::theme::SyntaxTheme;
 
 const REFLOW_TARGET: usize = 95;
 
@@ -93,21 +93,36 @@ pub struct VirtualChatBuffer {
     max_messages: usize,
     scroll_offset: usize,
     selection: Option<Selection>,
+    syntax: SyntaxTheme,
 }
 
 impl VirtualChatBuffer {
-    pub fn new(max_messages: usize) -> Self {
+    pub fn new(max_messages: usize, syntax: SyntaxTheme) -> Self {
         Self {
             messages: Vec::new(),
             max_messages: max_messages.max(1),
             scroll_offset: 0,
             selection: None,
+            syntax,
         }
     }
 
     pub fn set_max_messages(&mut self, max_messages: usize) {
         self.max_messages = max_messages.max(1);
         self.trim_front();
+    }
+
+    /// Restyles syntax highlighting when the active theme changes. Cached
+    /// message layouts are invalidated so already-rendered history recolors on
+    /// the next layout pass.
+    pub fn set_syntax(&mut self, syntax: SyntaxTheme) {
+        if self.syntax == syntax {
+            return;
+        }
+        self.syntax = syntax;
+        for entry in &mut self.messages {
+            entry.layout.invalidate();
+        }
     }
 
     pub fn push_chat(&mut self, message: ChatMessage, local: bool) {
@@ -335,8 +350,9 @@ impl VirtualChatBuffer {
     /// Lays out `idx` at `width` and returns its wrapped line count (at least 1).
     fn ensure_lines(&mut self, idx: usize, width: u16) -> usize {
         let width = width.max(1);
+        let syntax = self.syntax;
         let msg = &mut self.messages[idx];
-        msg.layout.ensure(width, &msg.body);
+        msg.layout.ensure(width, &msg.body, syntax);
         msg.layout.lines().max(1)
     }
 
@@ -513,6 +529,7 @@ struct MessageLayout {
     segments: Vec<Segment>,
     complete: bool,
     estimated_lines: usize,
+    syntax: SyntaxTheme,
 }
 
 enum BlockKind {
@@ -533,10 +550,19 @@ impl MessageLayout {
             segments: Vec::new(),
             complete: false,
             estimated_lines: 1,
+            syntax: SyntaxTheme::default(),
         }
     }
 
-    fn ensure(&mut self, width: u16, text: &str) {
+    /// Forces the next [`ensure`](Self::ensure) to rebuild the layout, picking
+    /// up a new syntax theme. `0` is never a real wrap width (callers pass
+    /// `width.max(1)`), so it reliably triggers a rebuild.
+    fn invalidate(&mut self) {
+        self.wrap_width = 0;
+    }
+
+    fn ensure(&mut self, width: u16, text: &str, syntax: SyntaxTheme) {
+        self.syntax = syntax;
         if self.wrap_width != width {
             self.hl.rebuild(&text as &dyn Source);
             self.reset_layout(width, text);
@@ -841,6 +867,7 @@ impl MessageLayout {
     }
 
     fn emit_styled(&mut self, text: &str, start: usize, end: usize, mut col: u16) -> u16 {
+        let syntax = self.syntax;
         let Self { hl, segments, .. } = self;
         let mut push = |s: usize, e: usize, style: Style, col: u16| -> u16 {
             segments.push(Segment {
@@ -864,7 +891,7 @@ impl MessageLayout {
             let style = if span.local_kind == tinyhl::kind::WHITESPACE {
                 Style::DEFAULT
             } else {
-                theme::syntax_style(&span)
+                syntax.style(&span)
             };
             col = push(s, e, style, col);
             cursor = e;
@@ -991,7 +1018,7 @@ mod tests {
     use super::*;
 
     fn buffer_with_notices(count: usize) -> VirtualChatBuffer {
-        let mut buf = VirtualChatBuffer::new(1000);
+        let mut buf = VirtualChatBuffer::new(1000, SyntaxTheme::default());
         for i in 0..count {
             buf.push_notice("user", format!("message {i}"));
         }
@@ -1065,7 +1092,7 @@ mod tests {
 
     #[test]
     fn same_sender_within_window_shares_one_heading() {
-        let mut buf = VirtualChatBuffer::new(1000);
+        let mut buf = VirtualChatBuffer::new(1000, SyntaxTheme::default());
         buf.push_test("alice", "hello", 1_000_000, false);
         buf.push_test("alice", "world", 1_000_000 + GROUP_GAP_MS, false);
         let rows = buf.visible_lines(40, 50, 0);
@@ -1075,7 +1102,7 @@ mod tests {
 
     #[test]
     fn gap_over_window_breaks_the_block() {
-        let mut buf = VirtualChatBuffer::new(1000);
+        let mut buf = VirtualChatBuffer::new(1000, SyntaxTheme::default());
         buf.push_test("alice", "hello", 1_000_000, false);
         buf.push_test("alice", "world", 1_000_000 + GROUP_GAP_MS + 1, false);
         let rows = buf.visible_lines(40, 50, 0);
@@ -1084,7 +1111,7 @@ mod tests {
 
     #[test]
     fn sender_change_breaks_the_block() {
-        let mut buf = VirtualChatBuffer::new(1000);
+        let mut buf = VirtualChatBuffer::new(1000, SyntaxTheme::default());
         buf.push_test("alice", "hello", 1_000_000, false);
         buf.push_test("bob", "world", 1_000_000 + 1_000, false);
         assert_eq!(headings(&buf.visible_lines(40, 50, 0)), 2);
@@ -1093,7 +1120,7 @@ mod tests {
     #[test]
     fn block_cap_groups_twelve_lines_and_splits_thirteen() {
         let group = |count: usize| {
-            let mut buf = VirtualChatBuffer::new(1000);
+            let mut buf = VirtualChatBuffer::new(1000, SyntaxTheme::default());
             for i in 0..count {
                 buf.push_test("alice", "x", 1_000_000 + i as u64 * 1_000, false);
             }
@@ -1111,7 +1138,7 @@ mod tests {
 
     #[test]
     fn long_message_collapses_to_preview_plus_ellipsis() {
-        let mut buf = VirtualChatBuffer::new(1000);
+        let mut buf = VirtualChatBuffer::new(1000, SyntaxTheme::default());
         buf.push_test("alice", &fenced(13), 1_000_000, false);
         let rows = buf.visible_lines(40, 50, 0);
         assert_eq!(rows.len(), 1 + COLLAPSE_SHOW + 1);
@@ -1127,7 +1154,7 @@ mod tests {
 
     #[test]
     fn exactly_twelve_lines_renders_in_full() {
-        let mut buf = VirtualChatBuffer::new(1000);
+        let mut buf = VirtualChatBuffer::new(1000, SyntaxTheme::default());
         buf.push_test("alice", &fenced(12), 1_000_000, false);
         let rows = buf.visible_lines(40, 50, 0);
         assert_eq!(rows.len(), 1 + 12); // heading + twelve body lines
@@ -1137,7 +1164,7 @@ mod tests {
 
     #[test]
     fn expanding_a_long_message_shows_every_line() {
-        let mut buf = VirtualChatBuffer::new(1000);
+        let mut buf = VirtualChatBuffer::new(1000, SyntaxTheme::default());
         buf.push_test("alice", &fenced(13), 1_000_000, false);
         let _ = buf.visible_lines(40, 50, 0);
         assert!(buf.is_collapsed(0) && !buf.is_expanded(0));
@@ -1150,7 +1177,7 @@ mod tests {
 
     #[test]
     fn block_first_line_is_a_heading() {
-        let mut buf = VirtualChatBuffer::new(1000);
+        let mut buf = VirtualChatBuffer::new(1000, SyntaxTheme::default());
         buf.push_test("alice", "hi", 1_000_000, false);
         let rows = buf.visible_lines(40, 50, 0);
         assert_eq!(rows.first().map(|r| r.kind), Some(LineKind::Heading));
@@ -1161,7 +1188,7 @@ mod tests {
         // Five-line messages pack two-to-a-block (10 lines) with a third forcing a
         // new heading. Forward packing keeps earlier headings anchored to the same
         // message as the run grows; backward packing would shuffle them.
-        let mut buf = VirtualChatBuffer::new(1000);
+        let mut buf = VirtualChatBuffer::new(1000, SyntaxTheme::default());
         let mut ts = 1_000_000;
         for _ in 0..3 {
             buf.push_test("alice", &fenced(5), ts, false);
@@ -1180,7 +1207,7 @@ mod tests {
 
     #[test]
     fn total_lines_exact_matches_emitted_row_count() {
-        let mut buf = VirtualChatBuffer::new(1000);
+        let mut buf = VirtualChatBuffer::new(1000, SyntaxTheme::default());
         buf.push_test("alice", "hello", 1_000_000, false);
         buf.push_test("alice", "world", 1_000_000 + 1_000, false);
         buf.push_test("bob", &fenced(13), 1_000_000 + 200_000, false);

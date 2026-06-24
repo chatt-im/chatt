@@ -5,7 +5,7 @@ use extui::{
 use extui_editor::{Editor, Mode, bindings as editor_bindings};
 use unicode_width::UnicodeWidthChar;
 
-use crate::{config::FormBindings, theme};
+use crate::{config::FormBindings, theme::Theme};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum FormFieldKind {
@@ -369,7 +369,8 @@ impl<F: Copy + Eq> FormState<F> {
         self.editor.text()
     }
 
-    pub(crate) fn render_editor(&mut self, area: Rect, buf: &mut Buffer) {
+    pub(crate) fn render_editor(&mut self, area: Rect, buf: &mut Buffer, theme: &Theme) {
+        self.editor.set_theme(theme.join_input_editor_theme());
         self.editor.resize(area.w.max(1));
         self.editor.render(area, buf);
     }
@@ -652,7 +653,6 @@ fn new_form_editor(bindings: FormBindings) -> Editor {
     editor.set_single_line(true);
     editor.set_wrap(false);
     editor.set_height_bounds(1, 1);
-    editor.set_theme(theme::join_input_editor_theme());
     editor
 }
 

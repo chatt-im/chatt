@@ -1,6 +1,6 @@
 use extui::{Buffer, Ellipsis, HAlign, Rect, Style, vt::Modifier};
 
-use crate::theme;
+use crate::theme::Theme;
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct RowPalette {
@@ -12,26 +12,24 @@ pub(crate) struct RowPalette {
     pub(crate) dirty_value: Style,
 }
 
-impl Default for RowPalette {
-    fn default() -> Self {
+impl RowPalette {
+    pub(crate) fn from_theme(theme: &Theme) -> Self {
         Self {
-            base: theme::BACKGROUND,
-            focused: Style::DEFAULT
-                .with_bg_rgb(0x24, 0x28, 0x30)
-                .with_fg_rgb(0xd8, 0xdb, 0xd6),
-            label: theme::MUTED,
-            focused_label: theme::GOOD,
-            value: theme::TEXT,
-            dirty_value: theme::WARN,
+            base: theme.background,
+            focused: theme.row_focused,
+            label: theme.muted,
+            focused_label: theme.good,
+            value: theme.text,
+            dirty_value: theme.warn,
         }
     }
 }
 
-pub(crate) fn draw_section_header(area: Rect, buf: &mut Buffer, label: &str) {
+pub(crate) fn draw_section_header(area: Rect, buf: &mut Buffer, theme: &Theme, label: &str) {
     if area.is_empty() {
         return;
     }
-    area.with(theme::STATUS_SECTION | Modifier::BOLD)
+    area.with(theme.status_section | Modifier::BOLD)
         .with(Ellipsis(true))
         .text(buf, label);
 }
@@ -39,6 +37,7 @@ pub(crate) fn draw_section_header(area: Rect, buf: &mut Buffer, label: &str) {
 pub(crate) fn draw_labeled_value(
     area: Rect,
     buf: &mut Buffer,
+    theme: &Theme,
     label_width: u16,
     label: &str,
     value: &str,
@@ -48,7 +47,7 @@ pub(crate) fn draw_labeled_value(
     draw_labeled_value_with(
         area,
         buf,
-        RowPalette::default(),
+        RowPalette::from_theme(theme),
         label_width,
         label,
         value,
@@ -94,11 +93,12 @@ pub(crate) fn draw_labeled_value_with(
 pub(crate) fn draw_labeled_editor_frame(
     area: Rect,
     buf: &mut Buffer,
+    theme: &Theme,
     label_width: u16,
     label: &str,
     focused: bool,
 ) -> Rect {
-    let palette = RowPalette::default();
+    let palette = RowPalette::from_theme(theme);
     let base = if focused {
         palette.focused
     } else {
@@ -115,22 +115,22 @@ pub(crate) fn draw_labeled_editor_frame(
         .with(Ellipsis(true))
         .text(buf, label);
     row.with(if focused {
-        theme::JOIN_INPUT_ACTIVE
+        theme.join_input_active
     } else {
-        theme::JOIN_INPUT_INACTIVE
+        theme.join_input_inactive
     })
     .fill(buf);
     row
 }
 
-pub(crate) fn draw_action(area: Rect, buf: &mut Buffer, label: &str, focused: bool) {
+pub(crate) fn draw_action(area: Rect, buf: &mut Buffer, theme: &Theme, label: &str, focused: bool) {
     if area.is_empty() {
         return;
     }
     let style = if focused {
-        RowPalette::default().focused.patch(theme::GOOD)
+        RowPalette::from_theme(theme).focused.patch(theme.good)
     } else {
-        theme::BACKGROUND.patch(theme::TEXT)
+        theme.background.patch(theme.text)
     };
     area.with(style)
         .with(HAlign::Center)
@@ -141,6 +141,7 @@ pub(crate) fn draw_action(area: Rect, buf: &mut Buffer, label: &str, focused: bo
 pub(crate) fn draw_metadata_line(
     area: Rect,
     buf: &mut Buffer,
+    theme: &Theme,
     base: Style,
     label_width: u16,
     label: &str,
@@ -151,10 +152,10 @@ pub(crate) fn draw_metadata_line(
     }
     let mut row = area;
     row.take_left(label_width as i32)
-        .with(base.patch(theme::SUBTLE))
+        .with(base.patch(theme.subtle))
         .with(Ellipsis(true))
         .text(buf, label);
-    row.with(base.patch(theme::TEXT))
+    row.with(base.patch(theme.text))
         .with(Ellipsis(true))
         .text(buf, value);
 }

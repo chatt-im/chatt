@@ -1,4 +1,4 @@
-use extui::{Buffer, Ellipsis, Rect, Style, vt::Modifier};
+use extui::{Buffer, Ellipsis, Rect, vt::Modifier};
 use extui_editor::Editor;
 use rpc::ids::UserId;
 use unicode_width::UnicodeWidthStr;
@@ -6,15 +6,8 @@ use unicode_width::UnicodeWidthStr;
 use super::volume_db_label;
 use crate::{
     config::{MAX_USER_VOLUME_DB, MIN_USER_VOLUME_DB, USER_VOLUME_DB_STEP, snap_user_volume_db},
-    theme,
+    theme::Theme,
 };
-
-const PANEL: Style = Style::DEFAULT
-    .with_bg_rgb(0x18, 0x1b, 0x20)
-    .with_fg_rgb(0xd8, 0xdb, 0xd6);
-const HEADER: Style = Style::DEFAULT
-    .with_bg_rgb(0x35, 0x3b, 0x46)
-    .with_fg_rgb(0xf0, 0xf2, 0xe8);
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum UserVolumeEvent {
@@ -46,8 +39,8 @@ pub(crate) struct UserVolumeDialog {
 }
 
 impl UserVolumeDialog {
-    pub(crate) fn new(user_id: UserId, user_name: String, value_db: f32) -> Self {
-        let mut editor = volume_input_editor(value_db);
+    pub(crate) fn new(user_id: UserId, user_name: String, value_db: f32, theme: &Theme) -> Self {
+        let mut editor = volume_input_editor(value_db, theme);
         editor.enter_insert_mode();
         Self {
             user_id,
@@ -104,7 +97,7 @@ impl UserVolumeDialog {
         self.error = Some(error);
     }
 
-    pub(crate) fn render(&mut self, area: Rect, buf: &mut Buffer) {
+    pub(crate) fn render(&mut self, area: Rect, buf: &mut Buffer, theme: &Theme) {
         if area.w < 24 || area.h < 6 {
             return;
         }
@@ -117,17 +110,17 @@ impl UserVolumeDialog {
             w: width,
             h: height,
         };
-        buf.clear_rect(panel, PANEL);
+        buf.clear_rect(panel, theme.dialog_panel);
 
         let mut rows = panel;
         rows.take_top(1)
-            .with(HEADER | Modifier::BOLD)
+            .with(theme.dialog_header | Modifier::BOLD)
             .with(Ellipsis(true))
             .text(buf, &format!(" Local volume: {} ", self.user_name));
 
         let mut body = rows.inset(2, 0);
         body.take_top(1)
-            .with(PANEL.patch(theme::MUTED))
+            .with(theme.dialog_panel.patch(theme.muted))
             .with(Ellipsis(true))
             .text(
                 buf,
@@ -138,9 +131,9 @@ impl UserVolumeDialog {
                 ),
             );
 
-        self.render_slider(body.take_top(1), buf);
-        self.render_editor_row(body.take_top(1), buf);
-        self.render_footer(body.take_top(1), buf);
+        self.render_slider(body.take_top(1), buf, theme);
+        self.render_editor_row(body.take_top(1), buf, theme);
+        self.render_footer(body.take_top(1), buf, theme);
     }
 
     fn adjust(&mut self, delta_steps: isize) -> UserVolumeEvent {
@@ -167,64 +160,64 @@ impl UserVolumeDialog {
         Ok(value)
     }
 
-    fn render_slider(&self, area: Rect, buf: &mut Buffer) {
+    fn render_slider(&self, area: Rect, buf: &mut Buffer, theme: &Theme) {
         let mut row = area;
         let label = volume_db_label(self.value_db);
         let label_width = label.width() as u16 + 1;
         let slider_width = row.w.saturating_sub(label_width).max(8);
         row.take_left(slider_width as i32)
-            .with(PANEL.patch(theme::GOOD))
+            .with(theme.dialog_panel.patch(theme.good))
             .with(Ellipsis(true))
             .text(buf, &volume_slider(self.value_db, slider_width));
-        row.with(PANEL.patch(theme::TEXT))
+        row.with(theme.dialog_panel.patch(theme.text))
             .with(Ellipsis(true))
             .text(buf, &format!(" {label}"));
     }
 
-    fn render_editor_row(&mut self, area: Rect, buf: &mut Buffer) {
+    fn render_editor_row(&mut self, area: Rect, buf: &mut Buffer, theme: &Theme) {
         let mut row = area;
         row.take_left(8)
-            .with(PANEL.patch(theme::MUTED))
+            .with(theme.dialog_panel.patch(theme.muted))
             .text(buf, "Offset");
         let field_width = row.w.min(14);
         let mut field = row.take_left(field_width as i32);
-        field.with(theme::JOIN_INPUT_BOUNDARY_ACTIVE).fill(buf);
+        field.with(theme.join_input_boundary_active).fill(buf);
         if field.w > 2 {
             field
                 .take_left(1)
-                .with(theme::JOIN_INPUT_BOUNDARY_ACTIVE)
+                .with(theme.join_input_boundary_active)
                 .text(buf, " ");
             field
                 .take_right(1)
-                .with(theme::JOIN_INPUT_BOUNDARY_ACTIVE)
+                .with(theme.join_input_boundary_active)
                 .text(buf, " ");
         }
-        field.with(theme::JOIN_INPUT_ACTIVE).fill(buf);
+        field.with(theme.join_input_active).fill(buf);
         self.editor.render(field, buf);
-        row.with(PANEL.patch(theme::MUTED))
+        row.with(theme.dialog_panel.patch(theme.muted))
             .with(Ellipsis(true))
             .text(buf, " dB");
     }
 
-    fn render_footer(&self, area: Rect, buf: &mut Buffer) {
+    fn render_footer(&self, area: Rect, buf: &mut Buffer, theme: &Theme) {
         if let Some(error) = &self.error {
-            area.with(PANEL.patch(theme::ERROR))
+            area.with(theme.dialog_panel.patch(theme.error))
                 .with(Ellipsis(true))
                 .text(buf, error);
         } else {
-            area.with(PANEL.patch(theme::SUBTLE))
+            area.with(theme.dialog_panel.patch(theme.subtle))
                 .with(Ellipsis(true))
                 .text(buf, &format!("Pending {}", volume_db_label(self.value_db)));
         }
     }
 }
 
-fn volume_input_editor(value_db: f32) -> Editor {
+fn volume_input_editor(value_db: f32, theme: &Theme) -> Editor {
     let mut editor = Editor::new();
     editor.set_single_line(true);
     editor.set_wrap(false);
     editor.set_height_bounds(1, 1);
-    editor.set_theme(theme::join_input_editor_theme());
+    editor.set_theme(theme.join_input_editor_theme());
     editor.set_lines(&format_volume_db_value(value_db));
     editor.enter_insert_mode();
     editor

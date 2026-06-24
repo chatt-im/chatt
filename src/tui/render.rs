@@ -11,15 +11,12 @@ use chatt::audio::StatsSnapshot;
 use crate::{
     app::{App, ParticipantState, ServerSelectItem, StatusKind, volume_db_label},
     chat_buffer::{self, LineKind},
-    theme, ui,
+    theme::{self, Theme},
+    ui,
 };
 
-const ROOM_SELECTED: Style = Style::DEFAULT
-    .with_bg_rgb(0x24, 0x28, 0x30)
-    .with_fg_rgb(0xf0, 0xf2, 0xe8);
-
 pub(crate) fn render(app: &mut App, buf: &mut Buffer, now_ms: u64) {
-    buf.rect().with(theme::BACKGROUND).fill(buf);
+    buf.rect().with(app.theme.background).fill(buf);
     buf.hide_cursor();
     let capture = app
         .capture
@@ -60,6 +57,7 @@ pub(crate) fn render(app: &mut App, buf: &mut Buffer, now_ms: u64) {
         ui::settings::draw_settings(
             screen,
             buf,
+            &app.theme,
             &mut app.settings,
             &mut app.settings_form,
             app.settings_dirty,
@@ -92,7 +90,7 @@ fn composer_height(app: &mut App, width: u16) -> u16 {
 }
 
 fn draw_room(area: Rect, app: &App, buf: &mut Buffer) {
-    area.with(theme::PANEL_ALT).fill(buf);
+    area.with(app.theme.panel_alt).fill(buf);
     let mut rows = area;
     let visible = rows.h as usize;
     let start = app.participants.scroll.min(app.participants.entries.len());
@@ -117,16 +115,16 @@ fn draw_room(area: Rect, app: &App, buf: &mut Buffer) {
             .or_else(|| participant.last_message_ms.map(|_| "msg".to_string()))
             .unwrap_or_else(|| "--".to_string());
         let base = if selected {
-            ROOM_SELECTED
+            app.theme.room_selected
         } else {
-            theme::PANEL_ALT
+            app.theme.panel_alt
         };
         let style = if selected {
-            base.patch(theme::GOOD)
+            base.patch(app.theme.good)
         } else if participant.online {
-            theme::TEXT
+            app.theme.text
         } else {
-            theme::MUTED
+            app.theme.muted
         };
         let marker = if selected { ">" } else { " " };
         let control = room_user_control_label(app, participant);
@@ -143,10 +141,10 @@ fn draw_room(area: Rect, app: &App, buf: &mut Buffer) {
 }
 
 fn draw_server_select(area: Rect, app: &mut App, buf: &mut Buffer) {
-    area.with(theme::BACKGROUND).fill(buf);
+    area.with(app.theme.background).fill(buf);
     let mut rows = area;
     rows.take_top(1)
-        .with(theme::STATUS_SECTION | Modifier::BOLD)
+        .with(app.theme.status_section | Modifier::BOLD)
         .with(Ellipsis(true))
         .text(buf, " SERVERS ");
 
@@ -155,7 +153,7 @@ fn draw_server_select(area: Rect, app: &mut App, buf: &mut Buffer) {
         return;
     }
     if app.server_items.is_empty() {
-        draw_server_welcome(body, buf);
+        draw_server_welcome(body, buf, &app.theme);
         return;
     }
 
@@ -166,15 +164,16 @@ fn draw_server_select(area: Rect, app: &mut App, buf: &mut Buffer) {
         "Press / to search   Enter join   e edit   d delete   F2 audio   Ctrl-C quit".to_string()
     };
     search
-        .with(theme::BACKGROUND.patch(theme::SUBTLE))
+        .with(app.theme.background.patch(app.theme.subtle))
         .with(Ellipsis(true))
         .text(buf, &search_label);
 
+    let theme = &app.theme;
     let items = &app.server_items;
     app.server_select
         .render(body, 3, buf, |_, item_index, selected, area, buf| {
             if let Some(item) = items.get(item_index) {
-                draw_server_select_item(area, buf, item, selected);
+                draw_server_select_item(area, buf, item, selected, theme);
             }
         });
 }
@@ -198,7 +197,7 @@ enum ServerWelcomeLine {
 const SERVER_WELCOME_KEY_WIDTH: usize = 15;
 const SERVER_WELCOME_COLUMN_GAP: usize = 4;
 
-fn draw_server_welcome(area: Rect, buf: &mut Buffer) {
+fn draw_server_welcome(area: Rect, buf: &mut Buffer, theme: &Theme) {
     use ServerWelcomeLine::*;
 
     let header = [
@@ -288,16 +287,16 @@ fn draw_server_welcome(area: Rect, buf: &mut Buffer) {
         let right_x = left_x + left_width as u16 + SERVER_WELCOME_COLUMN_GAP as u16;
 
         for (index, line) in header.iter().enumerate() {
-            draw_server_welcome_line(buf, left_x, start_y + index as u16, line);
+            draw_server_welcome_line(buf, left_x, start_y + index as u16, line, theme);
         }
         let body_y = start_y + header.len() as u16;
         for index in 0..body_height {
             let y = body_y + index as u16;
             if let Some(line) = left.get(index) {
-                draw_server_welcome_line(buf, left_x, y, line);
+                draw_server_welcome_line(buf, left_x, y, line, theme);
             }
             if let Some(line) = right.get(index) {
-                draw_server_welcome_line(buf, right_x, y, line);
+                draw_server_welcome_line(buf, right_x, y, line, theme);
             }
         }
     } else {
@@ -320,7 +319,7 @@ fn draw_server_welcome(area: Rect, buf: &mut Buffer) {
             .unwrap_or(0) as u16;
         let x = area.x + area.w.saturating_sub(max_width) / 2;
         for (index, line) in lines.iter().enumerate() {
-            draw_server_welcome_line(buf, x, start_y + index as u16, line);
+            draw_server_welcome_line(buf, x, start_y + index as u16, line, theme);
         }
     }
 }
@@ -342,10 +341,16 @@ fn server_welcome_line_width(line: &ServerWelcomeLine) -> usize {
     }
 }
 
-fn draw_server_welcome_line(buf: &mut Buffer, x: u16, y: u16, line: &ServerWelcomeLine) {
-    let section_style = theme::BACKGROUND.patch(theme::TEXT | Modifier::BOLD);
-    let text_style = theme::BACKGROUND.patch(theme::MUTED);
-    let key_style = theme::BACKGROUND.patch(theme::ACCENT);
+fn draw_server_welcome_line(
+    buf: &mut Buffer,
+    x: u16,
+    y: u16,
+    line: &ServerWelcomeLine,
+    theme: &Theme,
+) {
+    let section_style = theme.background.patch(theme.text | Modifier::BOLD);
+    let text_style = theme.background.patch(theme.muted);
+    let key_style = theme.background.patch(theme.accent);
 
     match line {
         ServerWelcomeLine::Text(text) => draw_text_at(buf, x, y, text, text_style),
@@ -382,24 +387,30 @@ fn draw_text_at(buf: &mut Buffer, x: u16, y: u16, text: &str, style: Style) {
     area.with(style).with(Ellipsis(true)).text(buf, text);
 }
 
-fn draw_server_select_item(area: Rect, buf: &mut Buffer, item: &ServerSelectItem, selected: bool) {
+fn draw_server_select_item(
+    area: Rect,
+    buf: &mut Buffer,
+    item: &ServerSelectItem,
+    selected: bool,
+    theme: &Theme,
+) {
     let base = if selected {
-        ROOM_SELECTED
+        theme.room_selected
     } else {
-        theme::BACKGROUND
+        theme.background
     };
     buf.clear_rect(area, base);
     let mut rows = area;
     let mut top = rows.take_top(1);
     top.take_left(2)
-        .with(base.patch(if selected { theme::GOOD } else { theme::SUBTLE }))
+        .with(base.patch(if selected { theme.good } else { theme.subtle }))
         .text(buf, if selected { ">" } else { " " });
-    top.with(base.patch(theme::TEXT | Modifier::BOLD))
+    top.with(base.patch(theme.text | Modifier::BOLD))
         .with(Ellipsis(true))
         .text(buf, &item.alias);
     if rows.h > 0 {
         rows.take_top(1)
-            .with(base.patch(theme::MUTED))
+            .with(base.patch(theme.muted))
             .with(Ellipsis(true))
             .text(
                 buf,
@@ -411,21 +422,22 @@ fn draw_server_select_item(area: Rect, buf: &mut Buffer, item: &ServerSelectItem
     }
     if rows.h > 0 {
         rows.take_top(1)
-            .with(base.patch(theme::SUBTLE))
+            .with(base.patch(theme.subtle))
             .with(Ellipsis(true))
             .text(buf, &format!("  {}", item.tcp_addr));
     }
 }
 
 fn draw_server_edit(area: Rect, app: &mut App, buf: &mut Buffer) {
-    area.with(theme::BACKGROUND).fill(buf);
+    area.with(app.theme.background).fill(buf);
+    let theme = &app.theme;
     let Some(draft) = app.server_edit.as_mut() else {
-        area.with(theme::SUBTLE)
+        area.with(theme.subtle)
             .with(HAlign::Center)
             .text(buf, "No server edit is open");
         return;
     };
-    draft.render(area, buf);
+    draft.render(area, buf, theme);
 }
 
 fn room_user_voice_feedback_label(participant: &ParticipantState) -> String {
@@ -456,15 +468,17 @@ fn room_user_control_label(app: &App, participant: &ParticipantState) -> String 
 }
 
 fn draw_volume_dialog(area: Rect, app: &mut App, buf: &mut Buffer) {
+    let theme = &app.theme;
     let Some(dialog) = app.volume_dialog.as_mut() else {
         return;
     };
-    dialog.render(area, buf);
+    dialog.render(area, buf, theme);
 }
 
 fn draw_room_title(area: Rect, app: &App, buf: &mut Buffer) {
-    area.with(theme::STATUS_SECTION | Modifier::BOLD).fill(buf);
-    area.with(theme::STATUS_SECTION | Modifier::BOLD).text(
+    area.with(app.theme.status_section | Modifier::BOLD)
+        .fill(buf);
+    area.with(app.theme.status_section | Modifier::BOLD).text(
         buf,
         &format!(
             " ROOM {}  online {}/{}  voice {} ",
@@ -477,7 +491,7 @@ fn draw_room_title(area: Rect, app: &App, buf: &mut Buffer) {
 }
 
 fn draw_chat(area: Rect, app: &mut App, buf: &mut Buffer, now_ms: u64) {
-    area.with(theme::BACKGROUND).fill(buf);
+    area.with(app.theme.background).fill(buf);
     if area.is_empty() {
         return;
     }
@@ -493,7 +507,7 @@ fn draw_chat(area: Rect, app: &mut App, buf: &mut Buffer, now_ms: u64) {
     app.last_chat_rect = area;
     if app.chat.is_empty() {
         app.last_chat_lines.clear();
-        area.with(theme::SUBTLE)
+        area.with(app.theme.subtle)
             .with(HAlign::Center)
             .text(buf, "No messages");
         return;
@@ -514,16 +528,16 @@ fn draw_chat(area: Rect, app: &mut App, buf: &mut Buffer, now_ms: u64) {
                 let msg = app.chat.message(line.message);
                 let selected = app.chat.is_selected(line.message, line.line);
                 let base = if selected {
-                    theme::SELECTED_LINE
+                    app.theme.selected_line
                 } else if msg.local {
-                    theme::LOCAL_LINE
+                    app.theme.local_line
                 } else {
-                    theme::BACKGROUND
+                    app.theme.background
                 };
                 let accent = if msg.local {
-                    theme::GOOD
+                    app.theme.good
                 } else {
-                    theme::ACCENT
+                    app.theme.accent
                 };
                 marker.with(base).fill(buf);
                 marker.with(base.patch(accent)).text(buf, "▌");
@@ -532,7 +546,7 @@ fn draw_chat(area: Rect, app: &mut App, buf: &mut Buffer, now_ms: u64) {
                     let start = seg.start as usize;
                     let end = seg.end as usize;
                     let text = &msg.body[start..end];
-                    let style = base.patch(theme::TEXT).patch(seg.style);
+                    let style = base.patch(app.theme.text).patch(seg.style);
                     let max_width = row.w.saturating_sub(seg.col) as usize;
                     if max_width > 0 {
                         buf.set_stringn(row.x + seg.col, row.y, text, max_width, style);
@@ -540,9 +554,9 @@ fn draw_chat(area: Rect, app: &mut App, buf: &mut Buffer, now_ms: u64) {
                 }
             }
             LineKind::Ellipsis => {
-                marker.with(theme::BACKGROUND).fill(buf);
-                row.with(theme::BACKGROUND).fill(buf);
-                row.with(theme::SUBTLE)
+                marker.with(app.theme.background).fill(buf);
+                row.with(app.theme.background).fill(buf);
+                row.with(app.theme.subtle)
                     .with(HAlign::Center)
                     .text(buf, "...");
             }
@@ -562,14 +576,14 @@ fn draw_chat_heading(
 ) {
     let msg = app.chat.message(message);
     let base = if msg.local {
-        theme::LOCAL_LINE
+        app.theme.local_line
     } else {
-        theme::BACKGROUND
+        app.theme.background
     };
     let accent = if msg.local {
-        theme::GOOD
+        app.theme.good
     } else {
-        theme::ACCENT
+        app.theme.accent
     };
     marker.with(base).fill(buf);
     marker.with(base.patch(accent)).text(buf, "▟");
@@ -589,7 +603,7 @@ fn draw_chat_heading(
     let age = chat_age(msg.timestamp_ms, now_ms);
     if !age.is_empty() {
         content
-            .with(base.patch(theme::SUBTLE))
+            .with(base.patch(app.theme.subtle))
             .with(HAlign::Right)
             .text(buf, &age);
     }
@@ -604,26 +618,22 @@ fn chat_age(timestamp_ms: u64, now_ms: u64) -> String {
 }
 
 fn draw_status(area: Rect, app: &App, buf: &mut Buffer, capture: Option<&StatsSnapshot>) {
-    area.with(theme::STATUS_FILL).fill(buf);
+    let theme = &app.theme;
+    area.with(theme.status_fill).fill(buf);
     let mut row = area;
     draw_status_segment(
         &mut row,
         buf,
-        theme::mode_style(app.mode),
+        theme.mode_style(app.mode),
         &format!(" {} ", app.modes.top().label()),
     );
     draw_status_segment(
         &mut row,
         buf,
-        theme::STATUS_SECTION,
+        theme.status_section,
         &format!(" {} ", app.room_name),
     );
-    draw_status_segment(
-        &mut row,
-        buf,
-        theme::STATUS_FILL,
-        &format!(" {} ", app.user),
-    );
+    draw_status_segment(&mut row, buf, theme.status_fill, &format!(" {} ", app.user));
     draw_status_segment(
         &mut row,
         buf,
@@ -633,20 +643,20 @@ fn draw_status(area: Rect, app: &App, buf: &mut Buffer, capture: Option<&StatsSn
     draw_status_segment(
         &mut row,
         buf,
-        theme::STATUS_FILL,
+        theme.status_fill,
         &format!(" {} ", mic_status_compact(app, capture)),
     );
-    draw_status_segment(&mut row, buf, theme::STATUS_FILL, " ");
+    draw_status_segment(&mut row, buf, theme.status_fill, " ");
     let meter_width = row.w.min(12);
     if meter_width > 0 {
         let meter = row.take_left(meter_width as i32);
-        ui::vu::draw_status_vu(meter, buf, capture);
+        ui::vu::draw_status_vu(meter, buf, capture, theme);
     }
-    draw_status_segment(&mut row, buf, theme::STATUS_FILL, " ");
+    draw_status_segment(&mut row, buf, theme.status_fill, " ");
     draw_status_segment(
         &mut row,
         buf,
-        theme::STATUS_FILL.patch(theme::SUBTLE),
+        theme.status_fill.patch(theme.subtle),
         &format!(
             " {} msg/{} rows ",
             app.chat.len(),
@@ -655,8 +665,8 @@ fn draw_status(area: Rect, app: &App, buf: &mut Buffer, capture: Option<&StatsSn
     );
 
     let right_style = match app.status_kind {
-        StatusKind::Info => theme::STATUS_FILL.patch(theme::MUTED),
-        StatusKind::Error => theme::STATUS_FILL.patch(theme::ERROR),
+        StatusKind::Info => theme.status_fill.patch(theme.muted),
+        StatusKind::Error => theme.status_fill.patch(theme.error),
     };
     let status_text = if let Some(chord) = &app.pending_chord {
         format!(
@@ -685,11 +695,12 @@ fn draw_status_segment(row: &mut Rect, buf: &mut Buffer, style: Style, text: &st
 }
 
 fn draw_composer(area: Rect, app: &mut App, buf: &mut Buffer) {
-    area.with(theme::PANEL).fill(buf);
+    area.with(app.theme.panel).fill(buf);
     app.composer.resize(area.w.max(1));
-    app.composer_hl.render(&mut app.composer, area, buf);
+    app.composer_hl
+        .render(&mut app.composer, area, buf, &app.theme);
     if app.composer.text_len() == 0 {
-        area.with(theme::MUTED)
+        area.with(app.theme.muted)
             .with(Ellipsis(true))
             .text(buf, &format!(" {}", app.config.ui.placeholder));
     }
@@ -697,15 +708,15 @@ fn draw_composer(area: Rect, app: &mut App, buf: &mut Buffer) {
 
 fn voice_style(app: &App) -> Style {
     if audio_failed(app) {
-        theme::ERROR
+        app.theme.error
     } else if app.deafened.load(Ordering::Relaxed) {
-        theme::WARN
+        app.theme.warn
     } else if app.voice_tx_enabled.load(Ordering::Relaxed) {
-        theme::GOOD
+        app.theme.good
     } else if app.user_id.is_some() {
-        theme::WARN
+        app.theme.warn
     } else {
-        theme::STATUS_FILL
+        app.theme.status_fill
     }
 }
 
