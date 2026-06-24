@@ -2,7 +2,7 @@ use crate::{
     audio::{BufferRequest, DenoiseConfig, DeviceInfo, StreamPreview},
     config::{
         AudioConfig, AudioLatencyConfig, BufferSize, DEFAULT_INPUT_BUFFER_SAMPLES,
-        DEFAULT_MAX_AMPLIFICATION, DEFAULT_OUTPUT_BUFFER_SAMPLES, FormBindings,
+        DEFAULT_MAX_AMPLIFICATION, DEFAULT_OUTPUT_BUFFER_SAMPLES, FormBindings, ThemeChoice,
     },
     ui::select::{FuzzySelect, SelectableItem},
 };
@@ -23,13 +23,14 @@ pub enum SettingsFocus {
     CaptureBuffer,
     PlaybackBuffer,
     FormBindings,
+    Theme,
     Refresh,
     Save,
     Close,
 }
 
 impl SettingsFocus {
-    pub const ORDER: [SettingsFocus; 12] = [
+    pub const ORDER: [SettingsFocus; 13] = [
         SettingsFocus::CaptureDevice,
         SettingsFocus::Bitrate,
         SettingsFocus::Denoise,
@@ -39,6 +40,7 @@ impl SettingsFocus {
         SettingsFocus::PlaybackDevice,
         SettingsFocus::PlaybackBuffer,
         SettingsFocus::FormBindings,
+        SettingsFocus::Theme,
         SettingsFocus::Refresh,
         SettingsFocus::Save,
         SettingsFocus::Close,
@@ -55,6 +57,7 @@ pub struct SettingsDraft {
     input_buffer: String,
     output_buffer: String,
     form_bindings: FormBindings,
+    theme: ThemeChoice,
     denoise: DenoiseConfig,
     echo_cancellation: bool,
     latency: AudioLatencyConfig,
@@ -80,6 +83,7 @@ impl SettingsDraft {
             input_buffer: buffer_size_text(config.input_buffer),
             output_buffer: buffer_size_text(config.output_buffer),
             form_bindings: FormBindings::Standard,
+            theme: ThemeChoice::default(),
             denoise: config.denoise,
             echo_cancellation: config.echo_cancellation,
             latency: config.latency.clone(),
@@ -88,6 +92,14 @@ impl SettingsDraft {
 
     pub fn set_form_bindings_from_config(&mut self, form_bindings: FormBindings) {
         self.form_bindings = form_bindings;
+    }
+
+    pub fn set_theme_from_config(&mut self, theme: ThemeChoice) {
+        self.theme = theme;
+    }
+
+    pub fn theme(&self) -> ThemeChoice {
+        self.theme
     }
 
     pub fn to_audio(&self) -> AudioConfig {
@@ -159,6 +171,7 @@ impl SettingsDraft {
             }
             SettingsFocus::CaptureBuffer | SettingsFocus::PlaybackBuffer => self.buffer_text(focus),
             SettingsFocus::FormBindings => form_bindings_label(self.form_bindings).to_string(),
+            SettingsFocus::Theme => self.theme.label().to_string(),
             SettingsFocus::CaptureDevice
             | SettingsFocus::PlaybackDevice
             | SettingsFocus::Refresh
@@ -190,6 +203,9 @@ impl SettingsDraft {
             SettingsFocus::FormBindings => {
                 "Keyboard model used by forms such as settings and server editing."
             }
+            SettingsFocus::Theme => {
+                "Color theme for the interface. Applies immediately; Save persists it."
+            }
             SettingsFocus::Refresh => "Re-scan audio devices using the current buffer requests.",
             SettingsFocus::Save => "Persist the draft to chatt.toml.",
             SettingsFocus::Close => "Return to chat without saving further changes.",
@@ -216,6 +232,15 @@ impl SettingsDraft {
                 };
                 SettingsMutation::Changed
             }
+            SettingsFocus::Theme => {
+                let current = ThemeChoice::ALL
+                    .iter()
+                    .position(|choice| *choice == self.theme)
+                    .unwrap_or(0);
+                let next = cycle_index(current, ThemeChoice::ALL.len(), delta);
+                self.theme = ThemeChoice::ALL[next];
+                SettingsMutation::Changed
+            }
             SettingsFocus::CaptureDevice
             | SettingsFocus::PlaybackDevice
             | SettingsFocus::CaptureBuffer
@@ -230,9 +255,10 @@ impl SettingsDraft {
         match focus {
             SettingsFocus::Denoise => self.cycle_denoise(1),
             SettingsFocus::EchoCancellation => self.toggle_echo_cancellation(),
-            SettingsFocus::Bitrate | SettingsFocus::Amplification | SettingsFocus::FormBindings => {
-                self.adjust(focus, 1)
-            }
+            SettingsFocus::Bitrate
+            | SettingsFocus::Amplification
+            | SettingsFocus::FormBindings
+            | SettingsFocus::Theme => self.adjust(focus, 1),
             SettingsFocus::CaptureDevice
             | SettingsFocus::PlaybackDevice
             | SettingsFocus::CaptureBuffer
@@ -949,6 +975,26 @@ mod tests {
         // Backward steps wrap the other way.
         draft.adjust(SettingsFocus::Denoise, -1);
         assert_eq!(draft.to_audio().denoise, DenoiseConfig::RnnNoise);
+    }
+
+    #[test]
+    fn settings_draft_cycles_theme() {
+        let mut draft = SettingsDraft::from_audio(&AudioConfig::default());
+        draft.set_theme_from_config(ThemeChoice::TomorrowNight);
+
+        assert_eq!(
+            draft.adjust(SettingsFocus::Theme, 1),
+            SettingsMutation::Changed
+        );
+        assert_eq!(draft.theme(), ThemeChoice::Base16Dark);
+        draft.adjust(SettingsFocus::Theme, 1);
+        assert_eq!(draft.theme(), ThemeChoice::Base16Light);
+        // Forward wraps back to the first theme.
+        draft.adjust(SettingsFocus::Theme, 1);
+        assert_eq!(draft.theme(), ThemeChoice::TomorrowNight);
+        // Backward wraps the other way.
+        draft.adjust(SettingsFocus::Theme, -1);
+        assert_eq!(draft.theme(), ThemeChoice::Base16Light);
     }
 
     #[test]

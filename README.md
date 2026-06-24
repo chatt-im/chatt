@@ -207,6 +207,15 @@ development server key.
 UDP media shares `tcp-addr` by default. Set `udp-addr` only when the server uses
 a separate UDP media address.
 
+The `theme` key under `[ui]` selects the color theme. Valid values are
+`"tomorrow-night"` (the default true-color dark palette), `"base16-dark"`, and
+`"base16-light"`. The base16 themes draw foreground roles from the 16 terminal
+ANSI colors and keep the terminal's own background, so they follow the
+terminal's color scheme. Use `base16-light` on a light terminal and
+`base16-dark` on a dark one. The Theme row in the settings page (`F2`) cycles
+through the themes and applies the change immediately; Save writes it to
+`chatt.toml`.
+
 Voice receive keeps a 60 ms playback target when the connection is unknown.
 When loss or DRED recovery is observed, playback temporarily permits a larger
 queue so Opus DRED can recover missing frames; adaptive resampling then catches

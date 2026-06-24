@@ -30,13 +30,13 @@ use crate::{
     bindings::{self, BindCommand, PendingChord, Resolved},
     chat_buffer::{LineKind, VirtualChatBuffer, VisibleLine},
     client_net::{NetworkClient, NetworkCommand, NetworkEvent, spawn_pair_once},
-    config::{self, Config, SoundboardClip, validate_server_entry},
+    config::{self, Config, SoundboardClip, ThemeChoice, validate_server_entry},
     local_control,
     settings::{
         self, AudioInputPickerState, AudioOutputPickerState, SettingsDraft, SettingsFocus,
         SettingsMutation,
     },
-    theme,
+    theme::{self, Theme},
     tui::{
         Action,
         editor::EditorHighlighter,
@@ -72,6 +72,7 @@ pub(crate) enum StatusKind {
 
 pub(crate) struct App {
     pub(crate) config: Config,
+    pub(crate) theme: Theme,
     pub(crate) event_tx: Sender<NetworkEvent>,
     pub(crate) server_alias: String,
     pub(crate) user: String,
@@ -188,15 +189,17 @@ impl App {
         let (audio_device_refresh_tx, audio_device_refresh_rx) = mpsc::channel();
         let (soundboard_event_tx, soundboard_event_rx) = mpsc::channel();
         let soundboard_enabled = config.soundboard.enabled;
+        let theme = Theme::from_choice(config.ui.theme);
         let mut composer =
             Editor::with_bindings(editor_bindings::vim(editor_bindings::VimOptions::default()));
         composer.set_wrap(true);
         composer.set_height_bounds(1, config.ui.max_composer_height.max(1));
-        composer.set_theme(theme::editor_theme());
+        composer.set_theme(theme.editor_theme());
         composer.enter_insert_mode();
         let composer_hl = EditorHighlighter::new(&mut composer);
         let mut settings_draft = SettingsDraft::from_audio(&config.audio);
         settings_draft.set_form_bindings_from_config(config.ui.form_bindings);
+        settings_draft.set_theme_from_config(config.ui.theme);
         let settings_form = FormState::with_order(
             SettingsFocus::CaptureDevice,
             config.ui.form_bindings,
@@ -210,6 +213,7 @@ impl App {
         audio_output_picker.reset(&audio_output_items, settings_draft.output_selection());
         let echo_control = Arc::new(EchoCancellationControl::new(config.audio.echo_cancellation));
         let mut app = Self {
+            theme,
             event_tx,
             server_alias: String::new(),
             user: String::new(),
@@ -221,7 +225,7 @@ impl App {
             modes: ModeStack::new(ModeKind::ServerSelect),
             composer,
             composer_hl,
-            chat: VirtualChatBuffer::new(config.ui.max_messages as usize),
+            chat: VirtualChatBuffer::new(config.ui.max_messages as usize, theme.syntax),
             participants: Participants::default(),
             last_chat_width: 80,
             last_chat_height: 0,
@@ -1255,6 +1259,7 @@ impl App {
         self.settings = SettingsDraft::from_audio(&self.config.audio);
         self.settings
             .set_form_bindings_from_config(self.config.ui.form_bindings);
+        self.settings.set_theme_from_config(self.config.ui.theme);
         self.settings_form = FormState::with_order(
             SettingsFocus::CaptureDevice,
             self.config.ui.form_bindings,
@@ -1307,7 +1312,8 @@ impl App {
             | SettingsFocus::Denoise
             | SettingsFocus::EchoCancellation
             | SettingsFocus::Amplification
-            | SettingsFocus::FormBindings => {
+            | SettingsFocus::FormBindings
+            | SettingsFocus::Theme => {
                 let mutation = self.settings.adjust(self.settings_form.focus(), delta);
                 self.apply_settings_mutation(mutation);
             }
@@ -1330,7 +1336,8 @@ impl App {
             | SettingsFocus::EchoCancellation
             | SettingsFocus::Bitrate
             | SettingsFocus::Amplification
-            | SettingsFocus::FormBindings => {
+            | SettingsFocus::FormBindings
+            | SettingsFocus::Theme => {
                 let mutation = self.settings.activate(self.settings_form.focus());
                 self.apply_settings_mutation(mutation);
             }
@@ -1357,6 +1364,7 @@ impl App {
         let old = self.config.audio.clone();
         self.config.audio = self.settings.to_audio();
         self.config.ui.form_bindings = self.settings.form_bindings();
+        self.apply_theme(self.settings.theme());
         self.apply_echo_cancellation_setting();
         self.apply_active_capture_amplification(self.config.audio.max_amplification);
         let (capture, playback) = audio_restart_flags(&old, &self.config.audio);
@@ -1364,6 +1372,20 @@ impl App {
             self.schedule_audio_apply(capture, playback);
         }
         self.mark_settings_dirty();
+    }
+
+    /// Re-resolves the active theme and applies it to the live UI: the chat
+    /// buffer restyles its syntax highlighting and the composer editor adopts
+    /// the new selection colors. Every other surface reads `self.theme` per
+    /// frame, so a field swap is enough for them.
+    fn apply_theme(&mut self, choice: ThemeChoice) {
+        if self.config.ui.theme == choice {
+            return;
+        }
+        self.config.ui.theme = choice;
+        self.theme = Theme::from_choice(choice);
+        self.chat.set_syntax(self.theme.syntax);
+        self.composer.set_theme(self.theme.editor_theme());
     }
 
     fn schedule_audio_apply(&mut self, capture: bool, playback: bool) {
@@ -1599,7 +1621,12 @@ impl App {
             return;
         };
         let value_db = self.config.user_volume_db(&self.server_alias, user_id.0);
-        self.volume_dialog = Some(UserVolumeDialog::new(user_id, name.clone(), value_db));
+        self.volume_dialog = Some(UserVolumeDialog::new(
+            user_id,
+            name.clone(),
+            value_db,
+            &self.theme,
+        ));
         self.focus.push_modal(FocusId::Dialog);
         self.modes.push(ModeKind::Dialog);
         self.set_status(format!("adjusting local volume for {name}"));
@@ -2364,6 +2391,7 @@ fn settings_field(focus: SettingsFocus) -> SettingsField {
         SettingsFocus::CaptureBuffer => SettingsField::InputBuffer,
         SettingsFocus::PlaybackBuffer => SettingsField::OutputBuffer,
         SettingsFocus::FormBindings => SettingsField::FormBindings,
+        SettingsFocus::Theme => SettingsField::Theme,
         SettingsFocus::Refresh => SettingsField::Refresh,
         SettingsFocus::Save => SettingsField::Save,
         SettingsFocus::Close => SettingsField::Close,

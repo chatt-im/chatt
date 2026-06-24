@@ -33,6 +33,8 @@ placeholder = "Message #lobby"
 max-messages = 50000
 overscan = 24
 form-bindings = "standard"
+# Color theme: "tomorrow-night", "base16-dark", or "base16-light".
+theme = "tomorrow-night"
 
 [files]
 max-upload-bytes = 52428800

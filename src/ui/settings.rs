@@ -5,22 +5,15 @@ use crate::{
         AudioOutputItem, AudioOutputPickerState, SettingsDraft, SettingsFocus,
         selected_audio_input_label, selected_audio_output_label,
     },
-    theme,
+    theme::Theme,
     tui::{
         form::{FormFieldKind, FormState},
         widgets,
     },
     ui::vu,
 };
-use extui::{Buffer, Ellipsis, HAlign, Rect, Style, vt::Modifier};
+use extui::{Buffer, Ellipsis, HAlign, Rect, vt::Modifier};
 
-const SELECTED_FOCUSED: Style = Style::DEFAULT
-    .with_bg_rgb(0x35, 0x3b, 0x46)
-    .with_fg_rgb(0xf0, 0xf2, 0xe8);
-const SELECTED_DIM: Style = Style::DEFAULT
-    .with_bg_rgb(0x24, 0x28, 0x30)
-    .with_fg_rgb(0xd8, 0xdb, 0xd6);
-const DETAIL_PANEL: Style = Style::DEFAULT.with_bg_rgb(0x18, 0x1b, 0x20);
 const LABEL_WIDTH: u16 = 18;
 const DETAIL_WIDTH: u16 = 34;
 const MIN_DETAIL_SCREEN_WIDTH: u16 = 92;
@@ -38,11 +31,12 @@ const CAPTURE_ROWS: [SettingsFocus; 5] = [
     SettingsFocus::CaptureBuffer,
 ];
 const PLAYBACK_ROWS: [SettingsFocus; 1] = [SettingsFocus::PlaybackBuffer];
-const INTERFACE_ROWS: [SettingsFocus; 1] = [SettingsFocus::FormBindings];
+const INTERFACE_ROWS: [SettingsFocus; 2] = [SettingsFocus::FormBindings, SettingsFocus::Theme];
 
 pub fn draw_settings(
     area: Rect,
     buf: &mut Buffer,
+    theme: &Theme,
     settings: &mut SettingsDraft,
     form: &mut FormState<SettingsFocus>,
     dirty: bool,
@@ -52,18 +46,18 @@ pub fn draw_settings(
     output_items: &[AudioOutputItem],
     output_picker: &mut AudioOutputPickerState,
 ) {
-    area.with(theme::BACKGROUND).fill(buf);
+    area.with(theme.background).fill(buf);
     if area.is_empty() {
         return;
     }
 
     let mut rows = area;
-    vu::draw_settings_vu_row(rows.take_top(1), buf, capture, false);
+    vu::draw_settings_vu_row(rows.take_top(1), buf, capture, false, theme);
 
     let mut body = rows;
     let detail = if body.w >= MIN_DETAIL_SCREEN_WIDTH {
         let mut detail = body.take_right(DETAIL_WIDTH as i32);
-        body.take_right(1).with(theme::BACKGROUND).fill(buf);
+        body.take_right(1).with(theme.background).fill(buf);
         detail = detail.inset(1, 0);
         Some(detail)
     } else {
@@ -73,6 +67,7 @@ pub fn draw_settings(
     draw_form(
         body,
         buf,
+        theme,
         settings,
         form,
         dirty,
@@ -86,6 +81,7 @@ pub fn draw_settings(
         draw_focus_detail(
             detail,
             buf,
+            theme,
             settings,
             form.focus(),
             input_items,
@@ -99,6 +95,7 @@ pub fn draw_settings(
 fn draw_form(
     area: Rect,
     buf: &mut Buffer,
+    theme: &Theme,
     settings: &mut SettingsDraft,
     form: &mut FormState<SettingsFocus>,
     dirty: bool,
@@ -112,10 +109,11 @@ fn draw_form(
     }
 
     form.begin_frame(area);
-    draw_section(form, buf, "Capture Settings");
+    draw_section(form, buf, theme, "Capture Settings");
     draw_device_row(
         form,
         buf,
+        theme,
         SettingsFocus::CaptureDevice,
         "Device",
         dirty,
@@ -126,20 +124,22 @@ fn draw_form(
         draw_audio_picker(
             form,
             buf,
+            theme,
             SettingsFocus::CaptureDevice,
             input_items,
             input_picker,
         );
     }
     for row in CAPTURE_ROWS {
-        draw_control_row(form, buf, settings, row, dirty);
+        draw_control_row(form, buf, theme, settings, row, dirty);
     }
 
     form.spacer(1);
-    draw_section(form, buf, "Playback Settings");
+    draw_section(form, buf, theme, "Playback Settings");
     draw_device_row(
         form,
         buf,
+        theme,
         SettingsFocus::PlaybackDevice,
         "Device",
         dirty,
@@ -150,37 +150,39 @@ fn draw_form(
         draw_audio_picker(
             form,
             buf,
+            theme,
             SettingsFocus::PlaybackDevice,
             output_items,
             output_picker,
         );
     }
     for row in PLAYBACK_ROWS {
-        draw_control_row(form, buf, settings, row, dirty);
+        draw_control_row(form, buf, theme, settings, row, dirty);
     }
 
     form.spacer(1);
-    draw_section(form, buf, "Interface Settings");
+    draw_section(form, buf, theme, "Interface Settings");
     for row in INTERFACE_ROWS {
-        draw_control_row(form, buf, settings, row, dirty);
+        draw_control_row(form, buf, theme, settings, row, dirty);
     }
 
     form.spacer(1);
-    draw_section(form, buf, "Actions");
-    draw_action_buttons(form, buf, dirty);
+    draw_section(form, buf, theme, "Actions");
+    draw_action_buttons(form, buf, theme, dirty);
     form.finish_frame();
 }
 
-fn draw_section(form: &mut FormState<SettingsFocus>, buf: &mut Buffer, title: &str) {
+fn draw_section(form: &mut FormState<SettingsFocus>, buf: &mut Buffer, theme: &Theme, title: &str) {
     let row = form.next_row(1);
     if let Some(area) = row.rect {
-        widgets::draw_section_header(area, buf, &format!(" {title} "));
+        widgets::draw_section_header(area, buf, theme, &format!(" {title} "));
     }
 }
 
 fn draw_device_row(
     form: &mut FormState<SettingsFocus>,
     buf: &mut Buffer,
+    theme: &Theme,
     field: SettingsFocus,
     label: &str,
     dirty: bool,
@@ -199,6 +201,7 @@ fn draw_device_row(
     widgets::draw_labeled_value(
         area,
         buf,
+        theme,
         LABEL_WIDTH,
         label,
         &value,
@@ -210,6 +213,7 @@ fn draw_device_row(
 fn draw_control_row(
     form: &mut FormState<SettingsFocus>,
     buf: &mut Buffer,
+    theme: &Theme,
     settings: &mut SettingsDraft,
     field: SettingsFocus,
     dirty: bool,
@@ -225,16 +229,23 @@ fn draw_control_row(
         if let Some((commit_field, text)) = form.focus_text(field, &value, false) {
             let _ = settings.set_buffer_text(commit_field, text);
         }
-        let input =
-            widgets::draw_labeled_editor_frame(area, buf, LABEL_WIDTH, setting_label(field), true);
+        let input = widgets::draw_labeled_editor_frame(
+            area,
+            buf,
+            theme,
+            LABEL_WIDTH,
+            setting_label(field),
+            true,
+        );
         form.register_text_area(field, input);
-        form.render_editor(input, buf);
+        form.render_editor(input, buf, theme);
         return;
     }
 
     widgets::draw_labeled_value(
         area,
         buf,
+        theme,
         LABEL_WIDTH,
         setting_label(field),
         &settings.option_label(field),
@@ -273,7 +284,12 @@ fn draw_control_row(
     }
 }
 
-fn draw_action_buttons(form: &mut FormState<SettingsFocus>, buf: &mut Buffer, dirty: bool) {
+fn draw_action_buttons(
+    form: &mut FormState<SettingsFocus>,
+    buf: &mut Buffer,
+    theme: &Theme,
+    dirty: bool,
+) {
     let row = form.next_row(1);
     let Some(area) = row.rect else {
         for field in ACTION_ROWS {
@@ -293,14 +309,15 @@ fn draw_action_buttons(form: &mut FormState<SettingsFocus>, buf: &mut Buffer, di
         draw_action_button(
             button,
             buf,
+            theme,
             action_label(field, dirty),
             form.focus() == field,
         );
     }
 }
 
-fn draw_action_button(area: Rect, buf: &mut Buffer, label: &str, focused: bool) {
-    widgets::draw_action(area, buf, label, focused);
+fn draw_action_button(area: Rect, buf: &mut Buffer, theme: &Theme, label: &str, focused: bool) {
+    widgets::draw_action(area, buf, theme, label, focused);
 }
 
 fn action_label(field: SettingsFocus, dirty: bool) -> &'static str {
@@ -320,7 +337,8 @@ pub(crate) fn setting_kind(field: SettingsFocus) -> FormFieldKind {
         SettingsFocus::Denoise
         | SettingsFocus::Bitrate
         | SettingsFocus::Amplification
-        | SettingsFocus::FormBindings => FormFieldKind::Choice,
+        | SettingsFocus::FormBindings
+        | SettingsFocus::Theme => FormFieldKind::Choice,
         SettingsFocus::CaptureDevice | SettingsFocus::PlaybackDevice => FormFieldKind::Select,
         SettingsFocus::Refresh | SettingsFocus::Save | SettingsFocus::Close => {
             FormFieldKind::Action
@@ -345,6 +363,7 @@ pub(crate) fn setting_label(focus: SettingsFocus) -> &'static str {
         SettingsFocus::CaptureBuffer => "Capture Buffer",
         SettingsFocus::PlaybackBuffer => "Playback Buffer",
         SettingsFocus::FormBindings => "Form Bindings",
+        SettingsFocus::Theme => "Theme",
         SettingsFocus::Refresh => "Refresh",
         SettingsFocus::Save => "Save",
         SettingsFocus::Close => "Close",
@@ -354,6 +373,7 @@ pub(crate) fn setting_label(focus: SettingsFocus) -> &'static str {
 fn draw_audio_picker(
     form: &mut FormState<SettingsFocus>,
     buf: &mut Buffer,
+    theme: &Theme,
     field: SettingsFocus,
     items: &[AudioDeviceItem],
     picker: &mut AudioDevicePickerState,
@@ -366,9 +386,9 @@ fn draw_audio_picker(
     let Some(area) = area_row.rect else {
         return;
     };
-    buf.clear_rect(area, theme::BACKGROUND);
+    buf.clear_rect(area, theme.background);
     if picker.selector.filtered_len() == 0 {
-        area.with(theme::SUBTLE)
+        area.with(theme.subtle)
             .with(HAlign::Center)
             .text(buf, "No matching audio devices");
         return;
@@ -381,7 +401,7 @@ fn draw_audio_picker(
         |_, item_index, selected, area, buf| {
             form.register_picker_item(field, area, item_index);
             if let Some(item) = items.get(item_index) {
-                draw_audio_item(area, buf, item, selected, form.focus() == field);
+                draw_audio_item(area, buf, theme, item, selected, form.focus() == field);
             }
         },
     );
@@ -399,28 +419,29 @@ fn form_rows_available_hint(_: &FormState<SettingsFocus>) -> u16 {
 fn draw_audio_item(
     area: Rect,
     buf: &mut Buffer,
+    theme: &Theme,
     item: &AudioDeviceItem,
     selected: bool,
     focused: bool,
 ) {
     let base = if selected && focused {
-        SELECTED_FOCUSED
+        theme.selected_focused
     } else if selected {
-        SELECTED_DIM
+        theme.row_focused
     } else {
-        theme::BACKGROUND
+        theme.background
     };
     buf.clear_rect(area, base);
 
     let mut rows = area;
     let mut top = rows.take_top(1);
     top.take_left(2)
-        .with(base.patch(if selected { theme::GOOD } else { theme::SUBTLE }))
+        .with(base.patch(if selected { theme.good } else { theme.subtle }))
         .text(buf, if selected { ">" } else { " " });
     top.with(base.patch(if item.supported {
-        theme::TEXT
+        theme.text
     } else {
-        theme::ERROR
+        theme.error
     }))
     .with(Ellipsis(true))
     .text(buf, &item.name);
@@ -429,7 +450,7 @@ fn draw_audio_item(
         let mut detail = rows.take_top(1);
         detail.take_left(2).with(base).text(buf, " ");
         detail
-            .with(base.patch(theme::MUTED))
+            .with(base.patch(theme.muted))
             .with(Ellipsis(true))
             .text(
                 buf,
@@ -445,6 +466,7 @@ fn draw_audio_item(
 fn draw_focus_detail(
     area: Rect,
     buf: &mut Buffer,
+    theme: &Theme,
     settings: &SettingsDraft,
     focus: SettingsFocus,
     input_items: &[AudioInputItem],
@@ -452,10 +474,10 @@ fn draw_focus_detail(
     output_items: &[AudioOutputItem],
     output_picker: &AudioOutputPickerState,
 ) {
-    buf.clear_rect(area, DETAIL_PANEL);
+    buf.clear_rect(area, theme.detail_panel);
     let mut rows = area;
     rows.take_top(1)
-        .with(DETAIL_PANEL.patch(theme::ACCENT | Modifier::BOLD))
+        .with(theme.detail_panel.patch(theme.accent | Modifier::BOLD))
         .with(Ellipsis(true))
         .text(buf, &format!(" {} ", detail_title(focus)));
 
@@ -463,14 +485,16 @@ fn draw_focus_detail(
         SettingsFocus::CaptureDevice => draw_device_detail(
             rows,
             buf,
+            theme,
             focused_device(input_items, input_picker, settings.input_selection()),
         ),
         SettingsFocus::PlaybackDevice => draw_device_detail(
             rows,
             buf,
+            theme,
             focused_device(output_items, output_picker, settings.output_selection()),
         ),
-        _ => draw_option_detail(rows, buf, settings, focus),
+        _ => draw_option_detail(rows, buf, theme, settings, focus),
     }
 }
 
@@ -496,9 +520,10 @@ fn focused_device<'a>(
     items.iter().find(|item| item.matches_selection(selection))
 }
 
-fn draw_device_detail(area: Rect, buf: &mut Buffer, item: Option<&AudioDeviceItem>) {
+fn draw_device_detail(area: Rect, buf: &mut Buffer, theme: &Theme, item: Option<&AudioDeviceItem>) {
+    let panel = theme.detail_panel;
     let Some(item) = item else {
-        area.with(DETAIL_PANEL.patch(theme::SUBTLE))
+        area.with(panel.patch(theme.subtle))
             .with(HAlign::Center)
             .text(buf, "No device");
         return;
@@ -506,13 +531,14 @@ fn draw_device_detail(area: Rect, buf: &mut Buffer, item: Option<&AudioDeviceIte
 
     let mut rows = area;
     rows.take_top(1)
-        .with(DETAIL_PANEL.patch(theme::TEXT | Modifier::BOLD))
+        .with(panel.patch(theme.text | Modifier::BOLD))
         .with(Ellipsis(true))
         .text(buf, &item.name);
     widgets::draw_metadata_line(
         rows.take_top(1),
         buf,
-        DETAIL_PANEL,
+        theme,
+        panel,
         10,
         "Index",
         &item
@@ -521,13 +547,14 @@ fn draw_device_detail(area: Rect, buf: &mut Buffer, item: Option<&AudioDeviceIte
             .unwrap_or_else(|| "OS default".to_string()),
     );
     if let Some(id) = item.backend_id.as_ref().or(item.selection.as_ref()) {
-        widgets::draw_metadata_line(rows.take_top(1), buf, DETAIL_PANEL, 10, "ID", id);
+        widgets::draw_metadata_line(rows.take_top(1), buf, theme, panel, 10, "ID", id);
     }
     if item.variants.len() > 1 {
         widgets::draw_metadata_line(
             rows.take_top(1),
             buf,
-            DETAIL_PANEL,
+            theme,
+            panel,
             10,
             "Variants",
             &item_variant_indexes(item),
@@ -537,7 +564,8 @@ fn draw_device_detail(area: Rect, buf: &mut Buffer, item: Option<&AudioDeviceIte
         widgets::draw_metadata_line(
             rows.take_top(1),
             buf,
-            DETAIL_PANEL,
+            theme,
+            panel,
             10,
             "Channels",
             &preview.channels.to_string(),
@@ -545,29 +573,32 @@ fn draw_device_detail(area: Rect, buf: &mut Buffer, item: Option<&AudioDeviceIte
         widgets::draw_metadata_line(
             rows.take_top(1),
             buf,
-            DETAIL_PANEL,
+            theme,
+            panel,
             10,
             "Format",
             &preview.sample_format.to_string(),
         );
-        widgets::draw_metadata_line(rows.take_top(1), buf, DETAIL_PANEL, 10, "Rate", "48 kHz");
+        widgets::draw_metadata_line(rows.take_top(1), buf, theme, panel, 10, "Rate", "48 kHz");
         if let cpal::BufferSize::Fixed(frames) = preview.buffer_size {
             widgets::draw_metadata_line(
                 rows.take_top(1),
                 buf,
-                DETAIL_PANEL,
+                theme,
+                panel,
                 10,
                 "Buffer",
                 &format!("{frames} frames"),
             );
         }
     } else if let Some(issue) = &item.issue {
-        widgets::draw_metadata_line(rows.take_top(1), buf, DETAIL_PANEL, 10, "Issue", issue);
+        widgets::draw_metadata_line(rows.take_top(1), buf, theme, panel, 10, "Issue", issue);
     } else {
         widgets::draw_metadata_line(
             rows.take_top(1),
             buf,
-            DETAIL_PANEL,
+            theme,
+            panel,
             10,
             "Source",
             item.default_source,
@@ -578,22 +609,25 @@ fn draw_device_detail(area: Rect, buf: &mut Buffer, item: Option<&AudioDeviceIte
 fn draw_option_detail(
     area: Rect,
     buf: &mut Buffer,
+    theme: &Theme,
     settings: &SettingsDraft,
     focus: SettingsFocus,
 ) {
+    let panel = theme.detail_panel;
     let mut rows = area;
     widgets::draw_metadata_line(
         rows.take_top(1),
         buf,
-        DETAIL_PANEL,
+        theme,
+        panel,
         10,
         "Current",
         &settings.option_label(focus),
     );
-    rows.take_top(1).with(DETAIL_PANEL).fill(buf);
+    rows.take_top(1).with(panel).fill(buf);
     for line in wrap_detail(settings.option_detail(focus), rows.w as usize) {
         rows.take_top(1)
-            .with(DETAIL_PANEL.patch(theme::MUTED))
+            .with(panel.patch(theme.muted))
             .with(Ellipsis(true))
             .text(buf, &line);
     }

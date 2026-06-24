@@ -4,7 +4,7 @@ use rpc::{control::InviteTicket, crypto::encode_hex};
 
 use crate::{
     config::{Config, FormBindings, ServerEntry, validate_server_entry},
-    theme,
+    theme::Theme,
     tui::{
         form::{FormAction, FormFieldKind, FormMouseIntent, FormState},
         widgets,
@@ -159,28 +159,28 @@ impl ServerEditDraft {
         }
     }
 
-    pub(crate) fn render(&mut self, area: Rect, buf: &mut Buffer) {
-        area.with(theme::BACKGROUND).fill(buf);
+    pub(crate) fn render(&mut self, area: Rect, buf: &mut Buffer, theme: &Theme) {
+        area.with(theme.background).fill(buf);
         self.form.begin_frame(area);
         let title = self.form.next_row(1);
         if let Some(area) = title.rect {
-            area.with(theme::STATUS_SECTION | extui::vt::Modifier::BOLD)
+            area.with(theme.status_section | extui::vt::Modifier::BOLD)
                 .with(Ellipsis(true))
                 .text(buf, &format!(" Edit Server {} ", self.original_alias));
         }
         self.form.spacer(1);
-        self.draw_detail_row(buf, "User", self.user.clone());
-        self.draw_detail_row(buf, "Token", short_key(&self.token));
-        self.draw_detail_row(buf, "Key", short_key(&self.server_public_key));
+        self.draw_detail_row(buf, theme, "User", self.user.clone());
+        self.draw_detail_row(buf, theme, "Token", short_key(&self.token));
+        self.draw_detail_row(buf, theme, "Key", short_key(&self.server_public_key));
         self.form.spacer(1);
-        self.draw_field(buf, "Alias", ServerEditFocus::Alias);
-        self.draw_field(buf, "Display", ServerEditFocus::DisplayName);
-        self.draw_field(buf, "TCP", ServerEditFocus::TcpAddr);
-        self.draw_field(buf, "UDP", ServerEditFocus::UdpAddr);
-        self.draw_field(buf, "Probe", ServerEditFocus::UdpProbeAddr);
-        self.draw_field(buf, "Room", ServerEditFocus::RoomId);
+        self.draw_field(buf, theme, "Alias", ServerEditFocus::Alias);
+        self.draw_field(buf, theme, "Display", ServerEditFocus::DisplayName);
+        self.draw_field(buf, theme, "TCP", ServerEditFocus::TcpAddr);
+        self.draw_field(buf, theme, "UDP", ServerEditFocus::UdpAddr);
+        self.draw_field(buf, theme, "Probe", ServerEditFocus::UdpProbeAddr);
+        self.draw_field(buf, theme, "Room", ServerEditFocus::RoomId);
         self.form.spacer(1);
-        self.draw_buttons(buf);
+        self.draw_buttons(buf, theme);
         self.form.finish_frame();
     }
 
@@ -244,14 +244,14 @@ impl ServerEditDraft {
         }
     }
 
-    fn draw_detail_row(&mut self, buf: &mut Buffer, label: &str, value: String) {
+    fn draw_detail_row(&mut self, buf: &mut Buffer, theme: &Theme, label: &str, value: String) {
         let row = self.form.next_row(1);
         if let Some(area) = row.rect {
-            draw_detail(area, buf, label, &value);
+            draw_detail(area, buf, theme, label, &value);
         }
     }
 
-    fn draw_field(&mut self, buf: &mut Buffer, label: &str, field: ServerEditFocus) {
+    fn draw_field(&mut self, buf: &mut Buffer, theme: &Theme, label: &str, field: ServerEditFocus) {
         let row = self.form.next_row(1);
         let Some(area) = self.form.register_field(row, field, FormFieldKind::Text) else {
             return;
@@ -261,13 +261,15 @@ impl ServerEditDraft {
             let value = self.field_value(field).to_string();
             let commit = self.form.focus_text(field, &value, false);
             self.apply_commit(commit);
-            let input = widgets::draw_labeled_editor_frame(area, buf, LABEL_WIDTH, label, true);
+            let input =
+                widgets::draw_labeled_editor_frame(area, buf, theme, LABEL_WIDTH, label, true);
             self.form.register_text_area(field, input);
-            self.form.render_editor(input, buf);
+            self.form.render_editor(input, buf, theme);
         } else {
             widgets::draw_labeled_value(
                 area,
                 buf,
+                theme,
                 LABEL_WIDTH,
                 label,
                 &self.active_text(field),
@@ -277,7 +279,7 @@ impl ServerEditDraft {
         }
     }
 
-    fn draw_buttons(&mut self, buf: &mut Buffer) {
+    fn draw_buttons(&mut self, buf: &mut Buffer, theme: &Theme) {
         let row = self.form.next_row(1);
         let Some(area) = row.rect else {
             for field in [
@@ -304,7 +306,7 @@ impl ServerEditDraft {
             };
             self.form
                 .register_rect(row, button, field, FormFieldKind::Action);
-            widgets::draw_action(button, buf, label, self.form.focus() == field);
+            widgets::draw_action(button, buf, theme, label, self.form.focus() == field);
         }
     }
 
@@ -408,11 +410,11 @@ impl ServerEditDraft {
     }
 }
 
-fn draw_detail(area: Rect, buf: &mut Buffer, label: &str, value: &str) {
+fn draw_detail(area: Rect, buf: &mut Buffer, theme: &Theme, label: &str, value: &str) {
     if area.is_empty() {
         return;
     }
-    widgets::draw_labeled_value(area, buf, LABEL_WIDTH, label, value, false, false);
+    widgets::draw_labeled_value(area, buf, theme, LABEL_WIDTH, label, value, false, false);
 }
 
 fn short_key(value: &str) -> String {

@@ -1,22 +1,12 @@
 use extui::{Buffer, HAlign, Rect, Style, vt::Modifier};
 
-use crate::{audio::StatsSnapshot, theme};
+use crate::{audio::StatsSnapshot, theme::Theme};
 
 const FLOOR_DB: f32 = -60.0;
 const LOW_DB: f32 = -36.0;
 const GOOD_MIN_DB: f32 = -24.0;
 const GOOD_MAX_DB: f32 = -9.0;
 const PEAK_DB: f32 = -3.0;
-
-const TRACK: Style = Style::DEFAULT.with_bg_rgb(0x1d, 0x22, 0x29);
-const LOW_FILL: Style = Style::DEFAULT.with_bg_rgb(0x3f, 0x5f, 0x75);
-const LOW_FG: Style = Style::DEFAULT.with_fg_rgb(0x5d, 0x86, 0xa1);
-const GOOD_FILL: Style = Style::DEFAULT.with_bg_rgb(0x45, 0x78, 0x4e);
-const GOOD_FG: Style = Style::DEFAULT.with_fg_rgb(0x8f, 0xd0, 0x88);
-const WARN_FILL: Style = Style::DEFAULT.with_bg_rgb(0x8a, 0x6a, 0x35);
-const WARN_FG: Style = Style::DEFAULT.with_fg_rgb(0xe6, 0xc3, 0x84);
-const PEAK_FILL: Style = Style::DEFAULT.with_bg_rgb(0x8a, 0x35, 0x3d);
-const PEAK_FG: Style = Style::DEFAULT.with_fg_rgb(0xff, 0x66, 0x6f);
 
 pub fn dbfs(level: f32) -> f32 {
     if level <= f32::EPSILON {
@@ -26,11 +16,16 @@ pub fn dbfs(level: f32) -> f32 {
     }
 }
 
-pub fn draw_status_vu(area: Rect, buf: &mut Buffer, capture: Option<&StatsSnapshot>) {
+pub fn draw_status_vu(
+    area: Rect,
+    buf: &mut Buffer,
+    capture: Option<&StatsSnapshot>,
+    theme: &Theme,
+) {
     let (rms, peak) = capture
         .map(|stats| (stats.rms, stats.peak))
         .unwrap_or_default();
-    draw_vu_meter(area, buf, rms, peak, theme::STATUS_FILL);
+    draw_vu_meter(area, buf, rms, peak, theme.status_fill, theme);
 }
 
 pub fn draw_settings_vu_row(
@@ -38,23 +33,22 @@ pub fn draw_settings_vu_row(
     buf: &mut Buffer,
     capture: Option<&StatsSnapshot>,
     focused: bool,
+    theme: &Theme,
 ) {
     if area.is_empty() {
         return;
     }
 
     let base = if focused {
-        Style::DEFAULT
-            .with_bg_rgb(0x24, 0x28, 0x30)
-            .with_fg_rgb(0xd8, 0xdb, 0xd6)
+        theme.row_focused
     } else {
-        theme::BACKGROUND
+        theme.background
     };
     buf.clear_rect(area, base);
 
     let mut row = area;
     row.take_left(16)
-        .with(base.patch(if focused { theme::GOOD } else { theme::MUTED }))
+        .with(base.patch(if focused { theme.good } else { theme.muted }))
         .text(buf, "Mic Level");
 
     let value_width = if row.w >= 28 { 11 } else { 0 };
@@ -67,21 +61,24 @@ pub fn draw_settings_vu_row(
     let (rms, peak) = capture
         .map(|stats| (stats.rms, stats.peak))
         .unwrap_or_default();
-    draw_vu_meter(row, buf, rms, peak, base);
+    draw_vu_meter(row, buf, rms, peak, base, theme);
 
     if let Some(value_area) = value_area {
         let (label, style) = match capture {
             Some(_) => {
                 let db = dbfs(rms);
-                (format!("{db:>5.1} dB"), level_style(base, db, dbfs(peak)))
+                (
+                    format!("{db:>5.1} dB"),
+                    level_style(base, db, dbfs(peak), theme),
+                )
             }
-            None => ("inactive".to_string(), base.patch(theme::MUTED)),
+            None => ("inactive".to_string(), base.patch(theme.muted)),
         };
         value_area.with(style).with(HAlign::Right).text(buf, &label);
     }
 }
 
-fn draw_vu_meter(area: Rect, buf: &mut Buffer, rms: f32, peak: f32, base: Style) {
+fn draw_vu_meter(area: Rect, buf: &mut Buffer, rms: f32, peak: f32, base: Style, theme: &Theme) {
     if area.is_empty() {
         return;
     }
@@ -95,7 +92,7 @@ fn draw_vu_meter(area: Rect, buf: &mut Buffer, rms: f32, peak: f32, base: Style)
     for index in 0..width {
         let zone_db = cell_zone_db(index, width);
         let covered = filled.saturating_sub(index * 4).min(4);
-        let (text, style) = meter_cell(covered, base, zone_db);
+        let (text, style) = meter_cell(covered, base, zone_db, theme);
         buf.set_stringn(area.x + index as u16, area.y, text, 1, style);
     }
 
@@ -106,23 +103,32 @@ fn draw_vu_meter(area: Rect, buf: &mut Buffer, rms: f32, peak: f32, base: Style)
             let zone_db = cell_zone_db(index, width);
             let covered = filled.saturating_sub(index * 4).min(4);
             let bg = if covered == 4 {
-                fill_bg(zone_db)
+                fill_bg(zone_db, theme)
             } else {
-                TRACK
+                theme.vu_track
             };
-            let style = base.patch(bg).patch(PEAK_FG).with_modifier(Modifier::BOLD);
+            let style = base
+                .patch(bg)
+                .patch(theme.vu_peak_fg)
+                .with_modifier(Modifier::BOLD);
             buf.set_stringn(area.x + index as u16, area.y, "▏", 1, style);
         }
     }
 }
 
-fn meter_cell(covered_quarters: usize, base: Style, zone_db: f32) -> (&'static str, Style) {
+fn meter_cell(
+    covered_quarters: usize,
+    base: Style,
+    zone_db: f32,
+    theme: &Theme,
+) -> (&'static str, Style) {
+    let track = theme.vu_track;
     match covered_quarters {
-        0 => (" ", base.patch(TRACK)),
-        1 => ("▎", base.patch(TRACK).patch(fill_fg(zone_db))),
-        2 => ("▌", base.patch(TRACK).patch(fill_fg(zone_db))),
-        3 => ("▊", base.patch(TRACK).patch(fill_fg(zone_db))),
-        _ => (" ", base.patch(fill_bg(zone_db))),
+        0 => (" ", base.patch(track)),
+        1 => ("▎", base.patch(track).patch(fill_fg(zone_db, theme))),
+        2 => ("▌", base.patch(track).patch(fill_fg(zone_db, theme))),
+        3 => ("▊", base.patch(track).patch(fill_fg(zone_db, theme))),
+        _ => (" ", base.patch(fill_bg(zone_db, theme))),
     }
 }
 
@@ -136,39 +142,39 @@ fn cell_zone_db(index: usize, width: usize) -> f32 {
     FLOOR_DB + (-FLOOR_DB * right_edge)
 }
 
-fn fill_bg(db: f32) -> Style {
+fn fill_bg(db: f32, theme: &Theme) -> Style {
     if db >= PEAK_DB {
-        PEAK_FILL
+        theme.vu_peak_fill
     } else if db >= GOOD_MAX_DB {
-        WARN_FILL
+        theme.vu_warn_fill
     } else if db >= GOOD_MIN_DB {
-        GOOD_FILL
+        theme.vu_good_fill
     } else {
-        LOW_FILL
+        theme.vu_low_fill
     }
 }
 
-fn fill_fg(db: f32) -> Style {
+fn fill_fg(db: f32, theme: &Theme) -> Style {
     if db >= PEAK_DB {
-        PEAK_FG
+        theme.vu_peak_fg
     } else if db >= GOOD_MAX_DB {
-        WARN_FG
+        theme.vu_warn_fg
     } else if db >= GOOD_MIN_DB {
-        GOOD_FG
+        theme.vu_good_fg
     } else {
-        LOW_FG
+        theme.vu_low_fg
     }
 }
 
-fn level_style(base: Style, rms_db: f32, peak_db: f32) -> Style {
+fn level_style(base: Style, rms_db: f32, peak_db: f32, theme: &Theme) -> Style {
     if peak_db >= PEAK_DB {
-        base.patch(theme::ERROR).with_modifier(Modifier::BOLD)
+        base.patch(theme.error).with_modifier(Modifier::BOLD)
     } else if rms_db < LOW_DB {
-        base.patch(LOW_FG)
+        base.patch(theme.vu_low_fg)
     } else if (GOOD_MIN_DB..=GOOD_MAX_DB).contains(&rms_db) {
-        base.patch(theme::GOOD)
+        base.patch(theme.good)
     } else {
-        base.patch(theme::WARN)
+        base.patch(theme.warn)
     }
 }
 
@@ -191,9 +197,10 @@ mod tests {
 
     #[test]
     fn meter_cells_use_quarter_block_precision() {
-        assert_eq!(meter_cell(1, Style::DEFAULT, -30.0).0, "▎");
-        assert_eq!(meter_cell(2, Style::DEFAULT, -30.0).0, "▌");
-        assert_eq!(meter_cell(3, Style::DEFAULT, -30.0).0, "▊");
-        assert_eq!(meter_cell(4, Style::DEFAULT, -30.0).0, " ");
+        let theme = Theme::tomorrow_night();
+        assert_eq!(meter_cell(1, Style::DEFAULT, -30.0, &theme).0, "▎");
+        assert_eq!(meter_cell(2, Style::DEFAULT, -30.0, &theme).0, "▌");
+        assert_eq!(meter_cell(3, Style::DEFAULT, -30.0, &theme).0, "▊");
+        assert_eq!(meter_cell(4, Style::DEFAULT, -30.0, &theme).0, " ");
     }
 }
