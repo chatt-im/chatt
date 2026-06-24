@@ -3,7 +3,8 @@
 
 [audio]
 bitrate-bps = 48000
-denoise = true
+# Noise suppression engine: "none", "spectral" (WebRTC), or "rnn-noise" (RNNoise).
+denoise = "rnn-noise"
 echo-cancellation = false
 max-amplification = 12.0
 input-buffer = "default"

@@ -10,17 +10,18 @@ use crate::{
     audio::{
         capture::{
             dsp::{
-                CaptureGain, CaptureGateDecision, CaptureHighPass, EarshotVad, LongSilenceGate,
-                is_capture_skip_safe_silence, store_processed_level_stats,
+                CaptureGain, CaptureGateDecision, CaptureHighPass, CaptureProcessor, EarshotVad,
+                LongSilenceGate, is_capture_skip_safe_silence, store_processed_level_stats,
             },
-            echo::{EchoCanceller, EchoReference, EchoReferenceSource},
+            echo::{EchoReference, EchoReferenceSource},
             encoder::OpusVoiceEncoder,
         },
+        resample::CaptureResampler,
         shared::{
-            AudioStats, FRAME_SAMPLES, LIVE_OPUS_FRAME_SAMPLES, LIVE_PACKET_FLAG_OPUS_RESET,
-            LIVE_PACKET_FLAG_SILENCE_HINT, LIVE_PACKET_FLAG_SILENCE_RESUME, LiveAudioTuning,
-            LiveEncoderProfile, LocalVoiceFrame, MAX_OPUS_PACKET_BYTES, VoicePayload,
-            convert_i16_scale_to_pcm_i16, vad_to_u8,
+            AudioStats, DenoiseConfig, FRAME_SAMPLES, LIVE_OPUS_FRAME_SAMPLES,
+            LIVE_PACKET_FLAG_OPUS_RESET, LIVE_PACKET_FLAG_SILENCE_HINT,
+            LIVE_PACKET_FLAG_SILENCE_RESUME, LiveAudioTuning, LiveEncoderProfile, LocalVoiceFrame,
+            MAX_OPUS_PACKET_BYTES, VoicePayload, convert_i16_scale_to_pcm_i16, vad_to_u8,
         },
     },
     network::{EncoderNetworkProfile, EncoderNetworkTuning},
@@ -34,7 +35,7 @@ pub(crate) fn run_encoder_worker(
     receiver: Receiver<Vec<f32>>,
     mut writer: PacketLogWriter<std::io::BufWriter<std::fs::File>>,
     mut encoder: OpusVoiceEncoder,
-    denoise_enabled: bool,
+    denoise: DenoiseConfig,
     max_amplification: f32,
     stats: AudioStats,
 ) {
@@ -42,7 +43,7 @@ pub(crate) fn run_encoder_worker(
         receiver,
         &mut writer,
         &mut encoder,
-        denoise_enabled,
+        denoise,
         max_amplification,
         &stats,
     );
@@ -55,14 +56,16 @@ pub(crate) fn run_encoder_worker(
     stats.mark_worker_stopped();
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn run_live_encoder_worker<F>(
     receiver: Receiver<Vec<f32>>,
     encoder: OpusVoiceEncoder,
-    denoise_enabled: bool,
+    denoise: DenoiseConfig,
     max_amplification_bits: Arc<AtomicU32>,
     encoder_loss_percent: Arc<AtomicU32>,
     tuning: LiveAudioTuning,
     echo_source: Option<EchoReferenceSource>,
+    device_rate: u32,
     stats: AudioStats,
     mut on_packet: F,
 ) where
@@ -71,11 +74,12 @@ pub(crate) fn run_live_encoder_worker<F>(
     let result = run_live_encoder_worker_inner(
         receiver,
         encoder,
-        denoise_enabled,
+        denoise,
         &max_amplification_bits,
         &encoder_loss_percent,
         tuning,
         echo_source,
+        device_rate,
         &stats,
         &mut on_packet,
     );
@@ -89,10 +93,13 @@ pub(crate) fn run_encoder_worker_inner(
     receiver: Receiver<Vec<f32>>,
     writer: &mut PacketLogWriter<std::io::BufWriter<std::fs::File>>,
     encoder: &mut OpusVoiceEncoder,
-    denoise_enabled: bool,
+    denoise: DenoiseConfig,
     max_amplification: f32,
     stats: &AudioStats,
 ) -> Result<(), String> {
+    // The offline recorder has no APM, so it denoises with RNNoise whenever any
+    // engine is selected and otherwise passes the frame through.
+    let denoise_enabled = denoise.is_enabled();
     let mut denoise = DenoiseState::new();
     let mut high_pass = CaptureHighPass::new();
     let mut gain = CaptureGain::new(max_amplification);
@@ -130,14 +137,16 @@ pub(crate) fn run_encoder_worker_inner(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn run_live_encoder_worker_inner<F>(
     receiver: Receiver<Vec<f32>>,
     encoder: OpusVoiceEncoder,
-    denoise_enabled: bool,
+    denoise: DenoiseConfig,
     max_amplification_bits: &AtomicU32,
     encoder_loss_percent: &AtomicU32,
     tuning: LiveAudioTuning,
     echo_source: Option<EchoReferenceSource>,
+    device_rate: u32,
     stats: &AudioStats,
     on_packet: &mut F,
 ) -> Result<(), String>
@@ -146,11 +155,12 @@ where
 {
     let mut pipeline = LiveEncoderPipeline::new(
         encoder,
-        denoise_enabled,
+        denoise,
         tuning,
         f32::from_bits(max_amplification_bits.load(Ordering::Relaxed)),
         true,
         echo_source,
+        device_rate,
     );
     let mut applied_loss_percent = LiveEncoderProfile::DRED_20.packet_loss_percent;
 
@@ -175,20 +185,19 @@ where
 
 pub(crate) struct LiveEncoderPipeline {
     encoder: OpusVoiceEncoder,
-    denoise_enabled: bool,
     auto_gain_enabled: bool,
     tuning: LiveAudioTuning,
-    denoise: Box<DenoiseState<'static>>,
+    /// Consolidated high-pass / AEC3 / noise-suppression / AGC2 front-end. The
+    /// VAD is taken from `earshot` after this runs.
+    processor: CaptureProcessor,
     earshot: EarshotVad,
     long_silence: Option<LongSilenceGate>,
-    high_pass: CaptureHighPass,
-    /// AGC2 gain stage, present only while the user's `max-amplification` dB
-    /// ceiling is positive and auto gain is enabled. Rebuilt when the ceiling
-    /// changes so it tracks the live setting.
-    gain: Option<CaptureGain>,
     gain_max_db: f32,
+    /// Device-rate to 48 kHz resampler, present only for non-48 kHz capture
+    /// devices. `None` keeps the native 48 kHz path allocation-free.
+    resampler: Option<CaptureResampler>,
+    resampled: Vec<f32>,
     accumulator: FrameAccumulator,
-    denoised_frame: Vec<f32>,
     opus_frame: Vec<i16>,
     encoded: Vec<u8>,
     pending_opus_samples: Vec<f32>,
@@ -197,7 +206,6 @@ pub(crate) struct LiveEncoderPipeline {
     sender_silence_active: bool,
     silence_keepalive_frames: usize,
     suppressed_frames: u64,
-    echo: Option<EchoCanceller>,
     echo_source: Option<EchoReferenceSource>,
 }
 
@@ -216,32 +224,32 @@ impl<'a> ProcessedCaptureFrame<'a> {
 impl LiveEncoderPipeline {
     fn new(
         encoder: OpusVoiceEncoder,
-        denoise_enabled: bool,
+        denoise: DenoiseConfig,
         tuning: LiveAudioTuning,
         max_amplification: f32,
         auto_gain_enabled: bool,
         echo_source: Option<EchoReferenceSource>,
+        device_rate: u32,
     ) -> Self {
-        let echo = echo_source
-            .as_ref()
-            .and_then(|source| source.enabled().then(EchoCanceller::new));
+        let echo_enabled = echo_source.as_ref().is_some_and(|source| source.enabled());
+        let gain_max_db = if auto_gain_enabled {
+            max_amplification
+        } else {
+            0.0
+        };
         Self {
             encoder,
-            denoise_enabled,
             auto_gain_enabled,
             tuning,
-            denoise: DenoiseState::new(),
+            processor: CaptureProcessor::new(denoise, gain_max_db, echo_enabled),
             earshot: EarshotVad::new(),
             long_silence: tuning
                 .capture_silence_gate
                 .then(|| LongSilenceGate::new(tuning)),
-            high_pass: CaptureHighPass::new(),
-            gain: auto_gain_enabled
-                .then(|| CaptureGain::new(max_amplification))
-                .flatten(),
-            gain_max_db: max_amplification,
+            gain_max_db,
+            resampler: CaptureResampler::new(device_rate),
+            resampled: Vec::new(),
             accumulator: FrameAccumulator::new(FRAME_SAMPLES),
-            denoised_frame: vec![0.0; FRAME_SAMPLES],
             opus_frame: vec![0i16; LIVE_OPUS_FRAME_SAMPLES],
             encoded: vec![0u8; MAX_OPUS_PACKET_BYTES],
             pending_opus_samples: Vec::with_capacity(LIVE_OPUS_FRAME_SAMPLES),
@@ -250,22 +258,12 @@ impl LiveEncoderPipeline {
             sender_silence_active: false,
             silence_keepalive_frames: 0,
             suppressed_frames: 0,
-            echo,
             echo_source,
         }
     }
 
-    fn process_echo(&mut self, frame: &mut [f32]) {
-        let Some(source) = self.echo_source.as_ref() else {
-            return;
-        };
-        if !source.enabled() {
-            self.echo = None;
-            return;
-        }
-        self.echo
-            .get_or_insert_with(EchoCanceller::new)
-            .process(frame, source.reference());
+    pub(crate) fn aec_enabled(&self) -> bool {
+        self.processor.echo_enabled()
     }
 
     pub(crate) fn push_chunk<F>(
@@ -279,14 +277,31 @@ impl LiveEncoderPipeline {
         F: FnMut(LocalVoiceFrame),
     {
         if self.auto_gain_enabled && max_amplification != self.gain_max_db {
-            self.gain = CaptureGain::new(max_amplification);
+            self.processor.set_max_gain_db(max_amplification);
             self.gain_max_db = max_amplification;
         }
+        // Resample a non-48 kHz device to 48 kHz before any DSP, so the whole
+        // pipeline downstream keeps assuming 48 kHz / 480-sample frames. The
+        // resampled buffer is owned locally during the accumulator pass so it
+        // does not alias `self`, then returned to the pipeline for reuse.
+        let mut resampled = Vec::new();
+        let chunk = match self.resampler.as_mut() {
+            Some(resampler) => {
+                resampled = std::mem::take(&mut self.resampled);
+                resampled.clear();
+                resampler.push(chunk, &mut resampled);
+                resampled.as_slice()
+            }
+            None => chunk,
+        };
         let mut accumulator = self.take_accumulator();
         let result = accumulator.push_chunk(chunk, |frame| {
             self.process_accumulated_frame(frame, stats, on_packet)
         });
         self.accumulator = accumulator;
+        if self.resampler.is_some() {
+            self.resampled = resampled;
+        }
         result
     }
 
@@ -303,20 +318,21 @@ impl LiveEncoderPipeline {
     where
         F: FnMut(LocalVoiceFrame),
     {
-        // High-pass first to strip DC and rumble, then cancel echo, then apply
-        // gain so AGC2 never amplifies un-cancelled echo.
-        self.high_pass.process(frame);
-        self.process_echo(frame);
-        if let Some(gain) = self.gain.as_mut() {
-            gain.process(frame);
-        }
-        let vad_probability = if self.denoise_enabled {
-            let vad = self.denoise.process_frame(&mut self.denoised_frame, frame);
-            frame.copy_from_slice(&self.denoised_frame);
-            vad
-        } else {
-            self.earshot.process_48k_frame(frame)
-        };
+        // One consolidated APM pass runs high-pass, AEC3, noise suppression, and
+        // AGC2 in WebRTC order. The echo reference, present only while AEC is
+        // enabled, supplies the 48 kHz render frame to cancel against.
+        let reference = self
+            .echo_source
+            .as_ref()
+            .filter(|source| source.enabled())
+            .map(|source| source.reference());
+        self.processor.set_echo_enabled(reference.is_some());
+        // RNNoise yields its own VAD; with any other engine fall back to the
+        // always-on Earshot detector on the cleaned frame.
+        let vad_probability = self
+            .processor
+            .process(frame, reference)
+            .unwrap_or_else(|| self.earshot.process_48k_frame(frame));
         store_processed_level_stats(stats, frame);
         stats.store_vad_probability(vad_probability);
         let vad = vad_to_u8(vad_probability);
@@ -455,15 +471,23 @@ pub(crate) fn build_live_encoder_pipeline(
     network_profile: EncoderNetworkProfile,
     echo_reference: Option<Arc<EchoReference>>,
 ) -> Result<LiveEncoderPipeline, String> {
+    // The simulation and benchmark callers express denoise as on/off; on maps to
+    // the default RNNoise engine.
+    let denoise = if denoise_enabled {
+        DenoiseConfig::RnnNoise
+    } else {
+        DenoiseConfig::None
+    };
     let mut encoder = OpusVoiceEncoder::new(network_profile.bitrate_bps)?;
     encoder.apply_network_profile(network_profile)?;
     Ok(LiveEncoderPipeline::new(
         encoder,
-        denoise_enabled,
+        denoise,
         tuning,
         max_amplification,
         auto_gain_enabled,
         echo_reference.map(EchoReferenceSource::Always),
+        crate::audio::shared::SAMPLE_RATE,
     ))
 }
 
@@ -761,6 +785,44 @@ mod tests {
     }
 
     #[test]
+    fn live_encoder_pipeline_resamples_non_48k_capture() {
+        // A 44.1 kHz device is resampled to 48 kHz before the pipeline, so a
+        // steady tone still encodes to Opus frames despite the rate mismatch.
+        let encoder = OpusVoiceEncoder::new(48_000).unwrap();
+        let mut pipeline = LiveEncoderPipeline::new(
+            encoder,
+            DenoiseConfig::None,
+            test_tuning(),
+            DEFAULT_LIVE_MAX_AMPLIFICATION,
+            true,
+            None,
+            44_100,
+        );
+        let stats = AudioStats::new();
+        let mut packets = Vec::new();
+        // 300 ms of a 44.1 kHz tone in i16 scale, fed as ragged chunks.
+        let input: Vec<f32> = (0..13_230)
+            .map(|n| (n as f32 * 0.05).sin() * 6_000.0)
+            .collect();
+        for chunk in input.chunks(101) {
+            pipeline
+                .push_chunk(
+                    chunk,
+                    DEFAULT_LIVE_MAX_AMPLIFICATION,
+                    &stats,
+                    &mut |packet| packets.push(packet),
+                )
+                .unwrap();
+        }
+        assert!(
+            packets
+                .iter()
+                .any(|packet| matches!(packet.payload, VoicePayload::Opus(_))),
+            "resampled 44.1 kHz capture produced no Opus packets"
+        );
+    }
+
+    #[test]
     fn accumulates_frames_across_arbitrary_chunk_boundaries() {
         let mut accumulator = FrameAccumulator::new(4);
         let mut frames = Vec::new();
@@ -795,7 +857,7 @@ mod tests {
             None,
         )
         .unwrap();
-        assert!(without.echo.is_none());
+        assert!(!without.aec_enabled());
 
         let with = build_live_encoder_pipeline(
             test_tuning(),
@@ -806,7 +868,7 @@ mod tests {
             Some(Arc::new(EchoReference::new())),
         )
         .unwrap();
-        assert!(with.echo.is_some());
+        assert!(with.aec_enabled());
     }
 
     #[test]
@@ -815,11 +877,12 @@ mod tests {
         let encoder = OpusVoiceEncoder::new(48_000).unwrap();
         let mut pipeline = LiveEncoderPipeline::new(
             encoder,
-            false,
+            DenoiseConfig::None,
             test_tuning(),
             DEFAULT_LIVE_MAX_AMPLIFICATION,
             true,
             Some(EchoReferenceSource::Controlled(Arc::clone(&control))),
+            crate::audio::shared::SAMPLE_RATE,
         );
         let stats = AudioStats::new();
         let chunk = vec![0.0; FRAME_SAMPLES];
@@ -830,7 +893,7 @@ mod tests {
                 packets += 1
             })
             .unwrap();
-        assert!(pipeline.echo.is_none());
+        assert!(!pipeline.aec_enabled());
 
         control.set_enabled(true);
         pipeline
@@ -838,7 +901,7 @@ mod tests {
                 packets += 1
             })
             .unwrap();
-        assert!(pipeline.echo.is_some());
+        assert!(pipeline.aec_enabled());
 
         control.set_enabled(false);
         pipeline
@@ -846,7 +909,7 @@ mod tests {
                 packets += 1
             })
             .unwrap();
-        assert!(pipeline.echo.is_none());
+        assert!(!pipeline.aec_enabled());
         assert!(packets <= 1);
     }
 }

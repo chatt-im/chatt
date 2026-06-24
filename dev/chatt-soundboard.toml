@@ -21,14 +21,14 @@ max-receive-bytes = 52428800
 
 [audio]
 bitrate-bps = 48000
-denoise = false
 echo-cancellation = false
 max-amplification = 1.0
 
 [soundboard]
 enabled = true
-#loss = "random_60"
-loss = "congested_wifi"
+#loss = "none"
+loss = "random_60"
+#loss = "congested_wifi"
 seed = 8388357047376790533
 
 [[soundboard.clips]]

@@ -22,6 +22,5 @@ max-receive-bytes = 52428800
 
 [audio]
 bitrate-bps = 48000
-denoise = true
 echo-cancellation = true
 max-amplification = 2.0

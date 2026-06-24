@@ -4,6 +4,7 @@ mod device;
 mod errors;
 mod lifecycle;
 mod playback;
+mod resample;
 mod shared;
 mod sim;
 
@@ -18,8 +19,8 @@ pub use lifecycle::{
     start_recording,
 };
 pub use shared::{
-    AudioStats, BufferRequest, CHANNELS, DEFAULT_LIVE_MAX_AMPLIFICATION, FRAME_SAMPLES,
-    LiveAudioTuning, LiveEncoderProfile, LivePlaybackFeedback, LivePlaybackSnapshot,
+    AudioStats, BufferRequest, CHANNELS, DEFAULT_LIVE_MAX_AMPLIFICATION, DenoiseConfig,
+    FRAME_SAMPLES, LiveAudioTuning, LiveEncoderProfile, LivePlaybackFeedback, LivePlaybackSnapshot,
     LocalVoiceFrame, PlaybackSnapshot, PlaybackStats, PlaybackStreamControl, RemoteVoicePacket,
     SAMPLE_RATE, StatsSnapshot, VoicePayload, VoicePayloadRef,
 };

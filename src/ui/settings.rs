@@ -316,10 +316,11 @@ fn action_label(field: SettingsFocus, dirty: bool) -> &'static str {
 pub(crate) fn setting_kind(field: SettingsFocus) -> FormFieldKind {
     match field {
         SettingsFocus::CaptureBuffer | SettingsFocus::PlaybackBuffer => FormFieldKind::Text,
-        SettingsFocus::Denoise | SettingsFocus::EchoCancellation => FormFieldKind::Toggle,
-        SettingsFocus::Bitrate | SettingsFocus::Amplification | SettingsFocus::FormBindings => {
-            FormFieldKind::Choice
-        }
+        SettingsFocus::EchoCancellation => FormFieldKind::Toggle,
+        SettingsFocus::Denoise
+        | SettingsFocus::Bitrate
+        | SettingsFocus::Amplification
+        | SettingsFocus::FormBindings => FormFieldKind::Choice,
         SettingsFocus::CaptureDevice | SettingsFocus::PlaybackDevice => FormFieldKind::Select,
         SettingsFocus::Refresh | SettingsFocus::Save | SettingsFocus::Close => {
             FormFieldKind::Action

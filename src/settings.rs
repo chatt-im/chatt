@@ -1,5 +1,5 @@
 use crate::{
-    audio::{BufferRequest, DeviceInfo, StreamPreview},
+    audio::{BufferRequest, DenoiseConfig, DeviceInfo, StreamPreview},
     config::{
         AudioConfig, AudioLatencyConfig, BufferSize, DEFAULT_INPUT_BUFFER_SAMPLES,
         DEFAULT_MAX_AMPLIFICATION, DEFAULT_OUTPUT_BUFFER_SAMPLES, FormBindings,
@@ -55,7 +55,7 @@ pub struct SettingsDraft {
     input_buffer: String,
     output_buffer: String,
     form_bindings: FormBindings,
-    denoise: bool,
+    denoise: DenoiseConfig,
     echo_cancellation: bool,
     latency: AudioLatencyConfig,
 }
@@ -147,7 +147,7 @@ impl SettingsDraft {
     pub fn option_label(&self, focus: SettingsFocus) -> String {
         match focus {
             SettingsFocus::Bitrate => format!("{} kbps", self.bitrate_bps() / 1000),
-            SettingsFocus::Denoise => on_off(self.denoise),
+            SettingsFocus::Denoise => self.denoise.label().to_string(),
             SettingsFocus::EchoCancellation => on_off(self.echo_cancellation),
             SettingsFocus::Amplification => {
                 let value = self.max_amplification();
@@ -202,7 +202,7 @@ impl SettingsDraft {
                 self.bitrate_index = cycle_index(self.bitrate_index, BITRATES.len(), delta);
                 SettingsMutation::Changed
             }
-            SettingsFocus::Denoise => self.toggle_denoise(),
+            SettingsFocus::Denoise => self.cycle_denoise(delta),
             SettingsFocus::EchoCancellation => self.toggle_echo_cancellation(),
             SettingsFocus::Amplification => {
                 self.amplification_index =
@@ -228,7 +228,7 @@ impl SettingsDraft {
 
     pub fn activate(&mut self, focus: SettingsFocus) -> SettingsMutation {
         match focus {
-            SettingsFocus::Denoise => self.toggle_denoise(),
+            SettingsFocus::Denoise => self.cycle_denoise(1),
             SettingsFocus::EchoCancellation => self.toggle_echo_cancellation(),
             SettingsFocus::Bitrate | SettingsFocus::Amplification | SettingsFocus::FormBindings => {
                 self.adjust(focus, 1)
@@ -284,8 +284,13 @@ impl SettingsDraft {
         MAX_AMPLIFICATIONS[self.amplification_index]
     }
 
-    fn toggle_denoise(&mut self) -> SettingsMutation {
-        self.denoise = !self.denoise;
+    fn cycle_denoise(&mut self, delta: isize) -> SettingsMutation {
+        let current = DenoiseConfig::ALL
+            .iter()
+            .position(|engine| *engine == self.denoise)
+            .unwrap_or(0);
+        let next = cycle_index(current, DenoiseConfig::ALL.len(), delta);
+        self.denoise = DenoiseConfig::ALL[next];
         SettingsMutation::Changed
     }
 
@@ -925,6 +930,25 @@ mod tests {
             preview: None,
             issue: (!supported).then(|| "unsupported".to_string()),
         }
+    }
+
+    #[test]
+    fn settings_draft_cycles_and_round_trips_denoise_engine() {
+        let config = AudioConfig {
+            denoise: DenoiseConfig::Spectral,
+            ..AudioConfig::default()
+        };
+        let mut draft = SettingsDraft::from_audio(&config);
+        assert_eq!(draft.to_audio().denoise, DenoiseConfig::Spectral);
+
+        // Forward cycles None -> Spectral -> RnnNoise and wraps.
+        draft.adjust(SettingsFocus::Denoise, 1);
+        assert_eq!(draft.to_audio().denoise, DenoiseConfig::RnnNoise);
+        draft.adjust(SettingsFocus::Denoise, 1);
+        assert_eq!(draft.to_audio().denoise, DenoiseConfig::None);
+        // Backward steps wrap the other way.
+        draft.adjust(SettingsFocus::Denoise, -1);
+        assert_eq!(draft.to_audio().denoise, DenoiseConfig::RnnNoise);
     }
 
     #[test]

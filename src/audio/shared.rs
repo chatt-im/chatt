@@ -10,6 +10,44 @@ use std::{
 };
 
 use nnnoiseless::DenoiseState;
+use toml_spanner::Toml;
+
+/// Capture noise-suppression engine.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Toml)]
+#[toml(FromToml, ToToml, rename_all = "kebab-case")]
+pub enum DenoiseConfig {
+    /// No noise suppression.
+    None,
+    /// WebRTC spectral noise suppression, run inside the capture APM pass.
+    Spectral,
+    /// nnnoiseless (RNNoise), the higher-quality neural denoiser, run after the
+    /// APM pass. The default.
+    #[default]
+    RnnNoise,
+}
+
+impl DenoiseConfig {
+    /// Engines in cycle order for the settings control.
+    pub const ALL: [DenoiseConfig; 3] = [
+        DenoiseConfig::None,
+        DenoiseConfig::Spectral,
+        DenoiseConfig::RnnNoise,
+    ];
+
+    /// Whether any noise suppression runs.
+    pub fn is_enabled(self) -> bool {
+        !matches!(self, DenoiseConfig::None)
+    }
+
+    /// Short label for the settings UI.
+    pub fn label(self) -> &'static str {
+        match self {
+            DenoiseConfig::None => "off",
+            DenoiseConfig::Spectral => "spectral",
+            DenoiseConfig::RnnNoise => "rnnoise",
+        }
+    }
+}
 
 pub const SAMPLE_RATE: u32 = 48_000;
 pub const CHANNELS: u8 = 1;

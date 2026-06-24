@@ -21,6 +21,7 @@ use crate::audio::{
     backend::with_audio_backend_stderr_suppressed,
     capture::EchoCancellationControl,
     playback::LivePlaybackMixer,
+    resample::PlaybackResampler,
     shared::{
         AudioStats, BufferRequest, PlaybackStats, SAMPLE_RATE, peak_i16_scale, rms_i16_scale,
     },
@@ -519,7 +520,7 @@ pub(crate) fn select_input_device_by_id(
     if matched {
         Err(format!(
             "selected input device `{id}` is present but unsupported: {}",
-            first_error.unwrap_or_else(|| "no supported 48 kHz input config".to_string())
+            first_error.unwrap_or_else(|| "no supported PCM input config".to_string())
         ))
     } else if let Some(device) = cpal_device_from_config_id(host, id) {
         select_input_config(&device, buffer_request)
@@ -556,7 +557,7 @@ pub(crate) fn select_output_device_by_id(
     if matched {
         Err(format!(
             "selected output device `{id}` is present but unsupported: {}",
-            first_error.unwrap_or_else(|| "no supported 48 kHz output config".to_string())
+            first_error.unwrap_or_else(|| "no supported PCM output config".to_string())
         ))
     } else if let Some(device) = cpal_device_from_config_id(host, id) {
         select_output_config(&device, buffer_request)
@@ -572,7 +573,44 @@ pub(crate) fn select_output_device_by_id(
 pub(crate) struct ConfigSelection {
     pub(crate) supported_config: SupportedStreamConfig,
     pub(crate) stream_config: StreamConfig,
+    /// Sample rate the device stream actually runs at. Equals [`SAMPLE_RATE`]
+    /// for native devices, otherwise a fallback rate the capture/playback paths
+    /// resample to and from 48 kHz.
+    pub(crate) device_rate: u32,
     pub(crate) preview: StreamPreview,
+}
+
+/// Device sample rates the capture and playback paths can resample to and from
+/// 48 kHz, in descending preference. Each is divisible by 100 so a 10 ms
+/// resampler block is a whole number of samples on both sides of the
+/// conversion, and each exceeds the sinc kernel's minimum block.
+pub(crate) const RESAMPLE_FALLBACK_RATES: [u32; 7] =
+    [96_000, 88_200, 44_100, 32_000, 24_000, 16_000, 8_000];
+
+/// The rate one supported config range will run at: native 48 kHz when the
+/// range covers it, otherwise the most preferred fallback rate it covers.
+/// Returns `None` when the range covers no usable rate.
+pub(crate) fn range_stream_rate(range: &cpal::SupportedStreamConfigRange) -> Option<u32> {
+    if range.contains_rate(SAMPLE_RATE) {
+        return Some(SAMPLE_RATE);
+    }
+    RESAMPLE_FALLBACK_RATES
+        .iter()
+        .copied()
+        .find(|rate| range.contains_rate(*rate))
+}
+
+/// Sort rank for a chosen device rate. Native 48 kHz ranks first so a device
+/// that also offers 48 kHz never resamples, then fallbacks in preference order.
+fn rate_rank(rate: u32) -> usize {
+    if rate == SAMPLE_RATE {
+        return 0;
+    }
+    RESAMPLE_FALLBACK_RATES
+        .iter()
+        .position(|candidate| *candidate == rate)
+        .map(|index| index + 1)
+        .unwrap_or(usize::MAX)
 }
 
 pub(crate) fn select_input_config(
@@ -585,15 +623,19 @@ pub(crate) fn select_input_config(
         .map_err(|error| format!("failed to query input configs: {error}"))?;
 
     for range in ranges {
-        if !range.contains_rate(SAMPLE_RATE) || range.sample_format().is_dsd() {
+        if range.sample_format().is_dsd() {
             continue;
         }
-        let supported_config = range.with_sample_rate(SAMPLE_RATE);
+        let Some(rate) = range_stream_rate(&range) else {
+            continue;
+        };
+        let supported_config = range.with_sample_rate(rate);
         candidates.push((supported_config, *range.buffer_size()));
     }
 
     candidates.sort_by_key(|(config, _)| {
         (
+            rate_rank(config.sample_rate()),
             channel_rank(config.channels()),
             sample_format_rank(config.sample_format()),
         )
@@ -602,8 +644,9 @@ pub(crate) fn select_input_config(
     let (supported_config, supported_buffer_size) = candidates
         .into_iter()
         .next()
-        .ok_or_else(|| "no 48 kHz PCM input config available".to_string())?;
+        .ok_or_else(|| "no usable PCM input config available".to_string())?;
 
+    let device_rate = supported_config.sample_rate();
     let (buffer_size, buffer_note) = select_buffer_size(buffer_request, supported_buffer_size);
     let mut stream_config = supported_config.config();
     stream_config.buffer_size = buffer_size;
@@ -615,6 +658,7 @@ pub(crate) fn select_input_config(
             buffer_size,
             buffer_note,
         },
+        device_rate,
         supported_config,
         stream_config,
     })
@@ -630,15 +674,19 @@ pub(crate) fn select_output_config(
         .map_err(|error| format!("failed to query output configs: {error}"))?;
 
     for range in ranges {
-        if !range.contains_rate(SAMPLE_RATE) || range.sample_format().is_dsd() {
+        if range.sample_format().is_dsd() {
             continue;
         }
-        let supported_config = range.with_sample_rate(SAMPLE_RATE);
+        let Some(rate) = range_stream_rate(&range) else {
+            continue;
+        };
+        let supported_config = range.with_sample_rate(rate);
         candidates.push((supported_config, *range.buffer_size()));
     }
 
     candidates.sort_by_key(|(config, _)| {
         (
+            rate_rank(config.sample_rate()),
             output_channel_rank(config.channels()),
             sample_format_rank(config.sample_format()),
         )
@@ -647,8 +695,9 @@ pub(crate) fn select_output_config(
     let (supported_config, supported_buffer_size) = candidates
         .into_iter()
         .next()
-        .ok_or_else(|| "no 48 kHz PCM output config available".to_string())?;
+        .ok_or_else(|| "no usable PCM output config available".to_string())?;
 
+    let device_rate = supported_config.sample_rate();
     let (buffer_size, buffer_note) = select_buffer_size(buffer_request, supported_buffer_size);
     let mut stream_config = supported_config.config();
     stream_config.buffer_size = buffer_size;
@@ -660,6 +709,7 @@ pub(crate) fn select_output_config(
             buffer_size,
             buffer_note,
         },
+        device_rate,
         supported_config,
         stream_config,
     })
@@ -983,6 +1033,7 @@ pub(crate) fn build_live_output_stream(
     mixer: Arc<Mutex<LivePlaybackMixer>>,
     echo_control: Option<Arc<EchoCancellationControl>>,
     callback_buffer_observer: Option<Arc<AudioCallbackBufferObserver>>,
+    device_rate: u32,
 ) -> Result<Stream, String> {
     let channels = CallbackChannelCount::new(channels, "live output")?;
     match sample_format {
@@ -993,6 +1044,7 @@ pub(crate) fn build_live_output_stream(
             mixer,
             echo_control,
             callback_buffer_observer,
+            device_rate,
         ),
         SampleFormat::I16 => build_typed_live_output_stream::<i16>(
             device,
@@ -1001,6 +1053,7 @@ pub(crate) fn build_live_output_stream(
             mixer,
             echo_control,
             callback_buffer_observer,
+            device_rate,
         ),
         SampleFormat::I24 => build_typed_live_output_stream::<cpal::I24>(
             device,
@@ -1009,6 +1062,7 @@ pub(crate) fn build_live_output_stream(
             mixer,
             echo_control,
             callback_buffer_observer,
+            device_rate,
         ),
         SampleFormat::I32 => build_typed_live_output_stream::<i32>(
             device,
@@ -1017,6 +1071,7 @@ pub(crate) fn build_live_output_stream(
             mixer,
             echo_control,
             callback_buffer_observer,
+            device_rate,
         ),
         SampleFormat::I64 => build_typed_live_output_stream::<i64>(
             device,
@@ -1025,6 +1080,7 @@ pub(crate) fn build_live_output_stream(
             mixer,
             echo_control,
             callback_buffer_observer,
+            device_rate,
         ),
         SampleFormat::U8 => build_typed_live_output_stream::<u8>(
             device,
@@ -1033,6 +1089,7 @@ pub(crate) fn build_live_output_stream(
             mixer,
             echo_control,
             callback_buffer_observer,
+            device_rate,
         ),
         SampleFormat::U16 => build_typed_live_output_stream::<u16>(
             device,
@@ -1041,6 +1098,7 @@ pub(crate) fn build_live_output_stream(
             mixer,
             echo_control,
             callback_buffer_observer,
+            device_rate,
         ),
         SampleFormat::U24 => build_typed_live_output_stream::<cpal::U24>(
             device,
@@ -1049,6 +1107,7 @@ pub(crate) fn build_live_output_stream(
             mixer,
             echo_control,
             callback_buffer_observer,
+            device_rate,
         ),
         SampleFormat::U32 => build_typed_live_output_stream::<u32>(
             device,
@@ -1057,6 +1116,7 @@ pub(crate) fn build_live_output_stream(
             mixer,
             echo_control,
             callback_buffer_observer,
+            device_rate,
         ),
         SampleFormat::U64 => build_typed_live_output_stream::<u64>(
             device,
@@ -1065,6 +1125,7 @@ pub(crate) fn build_live_output_stream(
             mixer,
             echo_control,
             callback_buffer_observer,
+            device_rate,
         ),
         SampleFormat::F32 => build_typed_live_output_stream::<f32>(
             device,
@@ -1073,6 +1134,7 @@ pub(crate) fn build_live_output_stream(
             mixer,
             echo_control,
             callback_buffer_observer,
+            device_rate,
         ),
         SampleFormat::F64 => build_typed_live_output_stream::<f64>(
             device,
@@ -1081,6 +1143,7 @@ pub(crate) fn build_live_output_stream(
             mixer,
             echo_control,
             callback_buffer_observer,
+            device_rate,
         ),
         _ => Err(format!("unsupported output sample format: {sample_format}")),
     }
@@ -1093,11 +1156,13 @@ fn build_typed_live_output_stream<T>(
     mixer: Arc<Mutex<LivePlaybackMixer>>,
     echo_control: Option<Arc<EchoCancellationControl>>,
     callback_buffer_observer: Option<Arc<AudioCallbackBufferObserver>>,
+    device_rate: u32,
 ) -> Result<Stream, String>
 where
     T: Sample + cpal::SizedSample + FromSample<f32> + Send + 'static,
 {
     let error_mixer = Arc::clone(&mixer);
+    let mut resampler = PlaybackResampler::new(device_rate);
     device
         .build_output_stream(
             stream_config,
@@ -1105,7 +1170,13 @@ where
                 if let Some(observer) = callback_buffer_observer.as_ref() {
                     observer.observe(output.len(), channels);
                 }
-                live_playback_callback(output, channels, &mixer, echo_control.as_ref());
+                live_playback_callback(
+                    output,
+                    channels,
+                    &mixer,
+                    echo_control.as_ref(),
+                    resampler.as_mut(),
+                );
             },
             move |error| {
                 record_live_playback_stream_error(&error_mixer, error);
@@ -1190,6 +1261,7 @@ fn live_playback_callback<T>(
     channels: CallbackChannelCount,
     mixer: &Arc<Mutex<LivePlaybackMixer>>,
     echo_control: Option<&Arc<EchoCancellationControl>>,
+    mut resampler: Option<&mut PlaybackResampler>,
 ) where
     T: Sample + FromSample<f32>,
 {
@@ -1206,14 +1278,39 @@ fn live_playback_callback<T>(
         Some(control) if control.enabled() => Some(control.reference().writer()),
         _ => None,
     };
-    for frame in output.chunks_mut(channels.get()) {
-        let sample = mixer.pop_mixed_output_sample(now, output_frames);
-        if let Some(writer) = echo_writer.as_mut() {
-            writer.push(sample);
+    match resampler.as_mut() {
+        // Non-48 kHz device: pull 48 kHz blocks from the mixer, resample each to
+        // the device rate. The echo reference still receives the pre-resample
+        // 48 kHz samples, so AEC keeps working against a 48 kHz render signal.
+        Some(resampler) => {
+            let source_block = resampler.source_block_samples(output_frames);
+            for frame in output.chunks_mut(channels.get()) {
+                let sample = resampler.next_sample(|block| {
+                    for source in block.iter_mut() {
+                        let mixed = mixer.pop_mixed_output_sample(now, source_block);
+                        if let Some(writer) = echo_writer.as_mut() {
+                            writer.push(mixed);
+                        }
+                        *source = mixed;
+                    }
+                });
+                let output_sample = T::from_sample(sample.clamp(-1.0, 1.0));
+                for channel in frame {
+                    *channel = output_sample;
+                }
+            }
         }
-        let output_sample = T::from_sample(sample.clamp(-1.0, 1.0));
-        for channel in frame {
-            *channel = output_sample;
+        None => {
+            for frame in output.chunks_mut(channels.get()) {
+                let sample = mixer.pop_mixed_output_sample(now, output_frames);
+                if let Some(writer) = echo_writer.as_mut() {
+                    writer.push(sample);
+                }
+                let output_sample = T::from_sample(sample.clamp(-1.0, 1.0));
+                for channel in frame {
+                    *channel = output_sample;
+                }
+            }
         }
     }
     if let Some(writer) = echo_writer {
@@ -1277,6 +1374,35 @@ mod tests {
     use super::*;
     #[allow(unused_imports)]
     use crate::audio::test_support::*;
+    use cpal::{SupportedBufferSize, SupportedStreamConfigRange};
+
+    fn range(min_rate: u32, max_rate: u32) -> SupportedStreamConfigRange {
+        SupportedStreamConfigRange::new(
+            1,
+            min_rate,
+            max_rate,
+            SupportedBufferSize::Unknown,
+            SampleFormat::F32,
+        )
+    }
+
+    #[test]
+    fn range_stream_rate_prefers_native_48k() {
+        // A range that covers 48 kHz always resolves to 48 kHz, never a fallback,
+        // so a capable device never resamples.
+        assert_eq!(range_stream_rate(&range(44_100, 96_000)), Some(SAMPLE_RATE));
+        assert_eq!(rate_rank(SAMPLE_RATE), 0);
+    }
+
+    #[test]
+    fn range_stream_rate_falls_back_to_best_supported_rate() {
+        // 44.1 kHz-only hardware resolves to its supported fallback rate, ranked
+        // after native 48 kHz so it loses to any 48 kHz-capable range.
+        assert_eq!(range_stream_rate(&range(44_100, 44_100)), Some(44_100));
+        assert!(rate_rank(44_100) > rate_rank(SAMPLE_RATE));
+        // A range covering no usable rate is rejected.
+        assert_eq!(range_stream_rate(&range(22_050, 22_050)), None);
+    }
 
     #[test]
     fn parses_proc_asound_pcm_for_requested_direction() {
