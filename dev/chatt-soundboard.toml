@@ -24,7 +24,6 @@ bitrate-bps = 48000
 denoise = false
 echo-cancellation = false
 max-amplification = 1.0
-buffer = "default"
 
 [soundboard]
 enabled = true
