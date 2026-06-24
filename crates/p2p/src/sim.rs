@@ -3,7 +3,6 @@ use std::{net::SocketAddr, time::Duration};
 use crate::{
     Action, AgentConfig, Candidate, CandidateKind, FallbackReason, IceRole, NatClassifier, NatKind,
     ReflexiveObservation, RestartPortPolicy, StunAuth, StunMessage, TransactionId, TraversalAgent,
-    candidate::port_guess_candidates,
     interfaces::{InterfaceSnapshot, LocalInterface, is_virtual_interface_name},
     socket::is_ignorable_udp_error,
     stun::{RoleAttribute, is_stun_message},
@@ -48,8 +47,6 @@ fn fast_config() -> AgentConfig {
         handshake_min_duration: Duration::from_millis(1),
         check_deadline: Duration::from_millis(1),
         max_check_attempts: 1,
-        port_guess_limit: 4,
-        port_guess_max_delta: 4,
         ..test_config()
     }
 }
@@ -134,18 +131,6 @@ fn case_02_symmetric_to_cone_uses_inbound_peer_reflexive_port() {
         [Action::SendStunResponse { .. }, Action::DirectReady { selected }]
             if selected.remote_addr == "198.51.100.2:6001".parse().unwrap()
     ));
-}
-
-#[test]
-fn case_03_eim_deviation_runs_limited_sequential_port_guessing() {
-    let mut next_id = 10;
-    let remote = candidate(2, CandidateKind::ServerReflexive, "198.51.100.2:55000");
-    let guesses = port_guess_candidates(&mut next_id, &remote, 4, 4);
-    let ports = guesses
-        .iter()
-        .map(|candidate| candidate.addr.port())
-        .collect::<Vec<_>>();
-    assert_eq!(ports, vec![55001, 54999, 55002, 54998]);
 }
 
 #[test]

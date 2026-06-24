@@ -1,4 +1,4 @@
-use std::net::{IpAddr, SocketAddr};
+use std::net::SocketAddr;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum NatKind {
@@ -170,60 +170,6 @@ pub fn pair_priority(local: &Candidate, remote: &Candidate, controlling: bool) -
     ((1_u64 << 32) - 1) * u64::from(g.min(d)) + 2 * u64::from(g.max(d)) + u64::from(g > d)
 }
 
-pub fn port_guess_candidates(
-    next_id: &mut u32,
-    remote: &Candidate,
-    limit: usize,
-    max_delta: u16,
-) -> Vec<Candidate> {
-    if !matches!(
-        remote.kind,
-        CandidateKind::ServerReflexive | CandidateKind::PeerReflexive | CandidateKind::PortMapped
-    ) {
-        return Vec::new();
-    }
-    let IpAddr::V4(ip) = remote.addr.ip() else {
-        return Vec::new();
-    };
-
-    let mut out = Vec::with_capacity(limit);
-    for delta in delta_sequence(max_delta) {
-        let Some(port) = offset_port(remote.addr.port(), delta) else {
-            continue;
-        };
-        if port == remote.addr.port() {
-            continue;
-        }
-        let id = *next_id;
-        *next_id = next_id.wrapping_add(1).max(1);
-        let addr = SocketAddr::new(IpAddr::V4(ip), port);
-        out.push(Candidate::with_base(
-            id,
-            CandidateKind::PeerReflexive,
-            addr,
-            Some(remote.addr),
-        ));
-        if out.len() == limit {
-            break;
-        }
-    }
-    out
-}
-
-fn delta_sequence(max_delta: u16) -> Vec<i32> {
-    let mut values = Vec::with_capacity(max_delta as usize * 2);
-    for value in 1..=i32::from(max_delta) {
-        values.push(value);
-        values.push(-value);
-    }
-    values
-}
-
-fn offset_port(port: u16, delta: i32) -> Option<u16> {
-    let next = i32::from(port) + delta;
-    (1..=65_535).contains(&next).then_some(next as u16)
-}
-
 fn kind_name(kind: CandidateKind) -> &'static str {
     match kind {
         CandidateKind::Host => "host",
@@ -308,38 +254,5 @@ mod tests {
             false,
         );
         assert!(v4_first.priority > v6_second.priority);
-    }
-
-    #[test]
-    fn port_guesses_are_limited_and_sequential() {
-        let mut next_id = 20;
-        let remote = Candidate::new(
-            9,
-            CandidateKind::ServerReflexive,
-            "198.51.100.10:55000".parse().unwrap(),
-        );
-        let guesses = port_guess_candidates(&mut next_id, &remote, 4, 4);
-        let ports = guesses
-            .iter()
-            .map(|candidate| candidate.addr.port())
-            .collect::<Vec<_>>();
-        assert_eq!(ports, vec![55001, 54999, 55002, 54998]);
-        assert_eq!(next_id, 24);
-    }
-
-    #[test]
-    fn port_guesses_do_not_wrap_to_invalid_ports() {
-        let mut next_id = 1;
-        let remote = Candidate::new(
-            9,
-            CandidateKind::ServerReflexive,
-            "198.51.100.10:1".parse().unwrap(),
-        );
-        let guesses = port_guess_candidates(&mut next_id, &remote, 4, 4);
-        let ports = guesses
-            .iter()
-            .map(|candidate| candidate.addr.port())
-            .collect::<Vec<_>>();
-        assert_eq!(ports, vec![2, 3, 4, 5]);
     }
 }

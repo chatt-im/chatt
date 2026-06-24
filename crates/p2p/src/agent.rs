@@ -5,10 +5,7 @@ use std::{
 };
 
 use crate::{
-    candidate::{
-        Candidate, CandidateKind, CandidatePairId, NatKind, NetworkFamily, pair_priority,
-        port_guess_candidates,
-    },
+    candidate::{Candidate, CandidateKind, CandidatePairId, NatKind, NetworkFamily, pair_priority},
     stun::{MessageClass, RoleAttribute, StunError, StunMessage, TransactionId},
 };
 
@@ -28,8 +25,6 @@ const DEFAULT_CONSENT_TIMEOUT: Duration = Duration::from_secs(30);
 /// healthy path's keepalives are answered at most `keepalive_interval * this`
 /// apart, so `consent_timeout` must exceed that product.
 const MAX_KEEPALIVE_JITTER: f64 = 1.2;
-const DEFAULT_PORT_GUESS_LIMIT: usize = 8;
-const DEFAULT_PORT_GUESS_MAX_DELTA: u16 = 8;
 const DEFAULT_MAX_CHECK_ATTEMPTS: u8 = 5;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -92,8 +87,6 @@ pub struct AgentConfig {
     /// below `disconnect_after_idle` so the hard send-stop fires before the
     /// recovery teardown.
     pub consent_timeout: Duration,
-    pub port_guess_limit: usize,
-    pub port_guess_max_delta: u16,
     pub max_check_attempts: u8,
 }
 
@@ -112,8 +105,6 @@ impl AgentConfig {
             restart_after_idle: DEFAULT_RESTART_AFTER_IDLE,
             disconnect_after_idle: DEFAULT_DISCONNECT_AFTER_IDLE,
             consent_timeout: DEFAULT_CONSENT_TIMEOUT,
-            port_guess_limit: DEFAULT_PORT_GUESS_LIMIT,
-            port_guess_max_delta: DEFAULT_PORT_GUESS_MAX_DELTA,
             max_check_attempts: DEFAULT_MAX_CHECK_ATTEMPTS,
         }
     }
@@ -271,7 +262,6 @@ pub struct TraversalAgent {
     next_candidate_id: u32,
     relay_announced: bool,
     direct_failed_announced: bool,
-    guesses_added: bool,
     peer_reflexive_seen: bool,
     selected: Option<SelectedPair>,
     last_rx_at: Option<Instant>,
@@ -322,7 +312,6 @@ impl TraversalAgent {
             next_candidate_id,
             relay_announced: false,
             direct_failed_announced: false,
-            guesses_added: false,
             peer_reflexive_seen: false,
             selected: None,
             last_rx_at: None,
@@ -382,10 +371,6 @@ impl TraversalAgent {
                     reason: FallbackReason::RelayCandidateAvailable,
                 });
             }
-        }
-
-        if self.all_pairs_failed() && !self.guesses_added {
-            self.add_port_guesses();
         }
 
         if self.all_pairs_failed()
@@ -713,26 +698,6 @@ impl TraversalAgent {
         }
     }
 
-    fn add_port_guesses(&mut self) {
-        let guess_sources = self
-            .remote_candidates
-            .iter()
-            .filter(|candidate| matches!(candidate.kind, CandidateKind::ServerReflexive))
-            .cloned()
-            .collect::<Vec<_>>();
-        for remote in guess_sources {
-            let guesses = port_guess_candidates(
-                &mut self.next_candidate_id,
-                &remote,
-                self.config.port_guess_limit,
-                self.config.port_guess_max_delta,
-            );
-            self.remote_candidates.extend(guesses);
-        }
-        self.guesses_added = true;
-        self.rebuild_pairs();
-    }
-
     /// Adds a remote candidate discovered after construction and rebuilds the
     /// pair set. Used by the client integration to feed candidates resolved
     /// asynchronously (mDNS `.local` host candidates) into the IP-only core.
@@ -921,17 +886,6 @@ mod tests {
 
     fn test_config() -> AgentConfig {
         AgentConfig::with_auth(StunAuth::new([0u8; 32], [0u8; 32]))
-    }
-
-    fn fast_config() -> AgentConfig {
-        AgentConfig {
-            handshake_min_duration: Duration::from_millis(1),
-            check_deadline: Duration::from_millis(1),
-            port_guess_limit: 4,
-            port_guess_max_delta: 4,
-            max_check_attempts: 1,
-            ..test_config()
-        }
     }
 
     fn candidate(id: u32, kind: CandidateKind, addr: &str) -> Candidate {
@@ -1174,39 +1128,6 @@ mod tests {
                 ..
             })
         ));
-    }
-
-    #[test]
-    fn failed_checks_add_limited_port_guesses_before_relay_failure() {
-        let now = at(0);
-        let mut agent = TraversalAgent::new(
-            now,
-            fast_config(),
-            IceRole::Controlling,
-            10,
-            NatKind::Cone,
-            NatKind::Cone,
-            vec![candidate(
-                1,
-                CandidateKind::ServerReflexive,
-                "198.51.100.1:5000",
-            )],
-            vec![candidate(
-                2,
-                CandidateKind::ServerReflexive,
-                "198.51.100.2:55000",
-            )],
-        );
-
-        assert_eq!(
-            send_stun(&agent.poll(now)),
-            vec!["198.51.100.2:55000".parse().unwrap()]
-        );
-        let actions = agent.poll(now + Duration::from_millis(25));
-        assert_eq!(
-            send_stun(&actions),
-            vec!["198.51.100.2:55001".parse().unwrap()]
-        );
     }
 
     #[test]
