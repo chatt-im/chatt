@@ -37,7 +37,7 @@ max-upload-bytes = 52428800
 max-receive-bytes = 52428800
 receive-dir = "/tmp/tchat2"
 
-[bindings.compose]
+[bindings.insert]
 "C-c" = "Quit"
 "F2" = "OpenSettings"
 "ESC" = "EnterLog"
@@ -47,7 +47,7 @@ receive-dir = "/tmp/tchat2"
 "C-v" = "ToggleMute"
 "C-h" = "ToggleDeafen"
 
-[bindings.log]
+[bindings.workspace]
 "C-c" = "Quit"
 "i" = "EnterCompose"
 "a" = "EnterCompose"
@@ -68,6 +68,26 @@ receive-dir = "/tmp/tchat2"
 "m" = "ToggleMute"
 "h" = "ToggleDeafen"
 "c" = "ClearChat"
+
+[bindings.picker]
+"C-c" = "Quit"
+"ESC" = "Cancel"
+"q" = "Cancel"
+"j" = "SelectNext"
+"k" = "SelectPrev"
+"DOWN" = "SelectNext"
+"UP" = "SelectPrev"
+"ENTER" = "Activate"
+"F2" = "OpenSettings"
+
+[bindings.form]
+"C-c" = "Quit"
+"ESC" = "Cancel"
+"TAB" = "FocusNext"
+"BACKTAB" = "FocusPrev"
+"DOWN" = "FocusNext"
+"UP" = "FocusPrev"
+"ENTER" = "Activate"
 
 [bindings.settings]
 "C-c" = "Quit"
@@ -90,3 +110,12 @@ receive-dir = "/tmp/tchat2"
 "ENTER" = "Activate"
 "r" = "RefreshDevices"
 "w" = "SaveSettings"
+
+[bindings.dialog]
+"C-c" = "Quit"
+"ESC" = "Cancel"
+"ENTER" = "Activate"
+"LEFT" = "AdjustLeft"
+"RIGHT" = "AdjustRight"
+"DOWN" = "AdjustLeft"
+"UP" = "AdjustRight"

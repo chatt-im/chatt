@@ -1,6 +1,3 @@
-use extui::{Buffer, Ellipsis, HAlign, Rect, Style, vt::Modifier};
-use extui_editor::Editor;
-
 use crate::{
     audio::StatsSnapshot,
     settings::{
@@ -11,6 +8,7 @@ use crate::{
     theme,
     ui::vu,
 };
+use extui::{Buffer, Ellipsis, HAlign, Rect, Style, vt::Modifier};
 
 const SELECTED_FOCUSED: Style = Style::DEFAULT
     .with_bg_rgb(0x35, 0x3b, 0x46)
@@ -383,7 +381,8 @@ fn draw_settings_controls(
         rows.take_top(1),
         buf,
         "Input Buffer",
-        &mut settings.input_buffer,
+        settings,
+        SettingsFocus::InputBuffer,
         focus == SettingsFocus::InputBuffer,
         dirty,
     );
@@ -391,7 +390,8 @@ fn draw_settings_controls(
         rows.take_top(1),
         buf,
         "Output Buffer",
-        &mut settings.output_buffer,
+        settings,
+        SettingsFocus::OutputBuffer,
         focus == SettingsFocus::OutputBuffer,
         dirty,
     );
@@ -422,7 +422,8 @@ fn draw_settings_input_row(
     area: Rect,
     buf: &mut Buffer,
     label: &str,
-    editor: &mut Editor,
+    settings: &mut SettingsDraft,
+    field: SettingsFocus,
     focused: bool,
     dirty: bool,
 ) {
@@ -441,11 +442,12 @@ fn draw_settings_input_row(
         return;
     }
     if focused {
-        editor.render(row, buf);
+        settings.focus_buffer_editor(field);
+        settings.editor.render(row, buf);
     } else {
         row.with(style.patch(if dirty { theme::WARN } else { theme::TEXT }))
             .with(Ellipsis(true))
-            .text(buf, &editor.text());
+            .text(buf, &settings.buffer_text(field));
     }
 }
 

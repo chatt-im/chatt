@@ -6,9 +6,12 @@ use toml_spanner::{Arena, Context, Error, Failed, FromToml, Item, OwnedItem, ToT
 
 use crate::config::DEFAULT_CONFIG;
 
-pub const COMPOSE_LAYER: LayerId = LayerId::new(1);
-pub const LOG_LAYER: LayerId = LayerId::new(2);
-pub const SETTINGS_LAYER: LayerId = LayerId::new(3);
+pub const WORKSPACE_LAYER: LayerId = LayerId::new(1);
+pub const INSERT_LAYER: LayerId = LayerId::new(2);
+pub const PICKER_LAYER: LayerId = LayerId::new(3);
+pub const FORM_LAYER: LayerId = LayerId::new(4);
+pub const SETTINGS_LAYER: LayerId = LayerId::new(5);
+pub const DIALOG_LAYER: LayerId = LayerId::new(6);
 
 #[derive(Clone, Debug, Toml)]
 pub enum BindCommand {
@@ -231,9 +234,12 @@ impl<'de> FromToml<'de> for BindingRuntime {
         }
 
         for (name, layer) in [
-            ("compose", COMPOSE_LAYER),
-            ("log", LOG_LAYER),
+            ("workspace", WORKSPACE_LAYER),
+            ("insert", INSERT_LAYER),
+            ("picker", PICKER_LAYER),
+            ("form", FORM_LAYER),
             ("settings", SETTINGS_LAYER),
+            ("dialog", DIALOG_LAYER),
         ] {
             if let Some(bindings) = default_table.get(name) {
                 extend_layer(ctx, bindings, &mut actions, &mut builder, layer)?;

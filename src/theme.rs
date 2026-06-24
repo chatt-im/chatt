@@ -11,18 +11,6 @@ pub enum UiMode {
     Settings,
 }
 
-impl UiMode {
-    pub fn label(self) -> &'static str {
-        match self {
-            UiMode::ServerSelect => "SERVERS",
-            UiMode::ServerEdit => "SERVER",
-            UiMode::Compose => "COMPOSE",
-            UiMode::Log => "LOG",
-            UiMode::Settings => "SETTINGS",
-        }
-    }
-}
-
 pub const BACKGROUND: Style = Style::DEFAULT;
 pub const PANEL: Style = Style::DEFAULT;
 pub const PANEL_ALT: Style = Style::DEFAULT;

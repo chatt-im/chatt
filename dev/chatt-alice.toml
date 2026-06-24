@@ -25,4 +25,3 @@ bitrate-bps = 48000
 denoise = true
 echo-cancellation = true
 max-amplification = 2.0
-buffer = "default"

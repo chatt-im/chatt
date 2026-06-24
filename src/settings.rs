@@ -1,12 +1,10 @@
-use extui_editor::Editor;
-
 use crate::{
     audio::{BufferRequest, DeviceInfo, StreamPreview},
     config::{
         AudioConfig, AudioLatencyConfig, BufferSize, DEFAULT_INPUT_BUFFER_SAMPLES,
         DEFAULT_MAX_AMPLIFICATION, DEFAULT_OUTPUT_BUFFER_SAMPLES,
     },
-    join_input_editor,
+    tui::editor::FormEditor,
     ui::select::{FuzzySelect, SelectableItem},
 };
 
@@ -58,10 +56,11 @@ pub struct SettingsDraft {
     pub output_device_id: Option<String>,
     pub bitrate_index: usize,
     pub amplification_index: usize,
-    /// Single-line editors holding a sample count or `"default"` (see
-    /// [`parse_buffer_size`]).
-    pub input_buffer: Editor,
-    pub output_buffer: Editor,
+    /// Single-line field values holding a sample count or `"default"` (see
+    /// [`parse_buffer_size`]). The active field is edited through `editor`.
+    pub input_buffer: String,
+    pub output_buffer: String,
+    pub editor: FormEditor<SettingsFocus>,
     pub denoise: bool,
     pub echo_cancellation: bool,
     pub latency: AudioLatencyConfig,
@@ -77,8 +76,9 @@ impl SettingsDraft {
                 .position(|bitrate| *bitrate == config.bitrate_bps)
                 .unwrap_or(3),
             amplification_index: amplification_index(config.max_amplification),
-            input_buffer: join_input_editor(&buffer_size_text(config.input_buffer)),
-            output_buffer: join_input_editor(&buffer_size_text(config.output_buffer)),
+            input_buffer: buffer_size_text(config.input_buffer),
+            output_buffer: buffer_size_text(config.output_buffer),
+            editor: FormEditor::new(),
             denoise: config.denoise,
             echo_cancellation: config.echo_cancellation,
             latency: config.latency.clone(),
@@ -93,8 +93,8 @@ impl SettingsDraft {
             denoise: self.denoise,
             echo_cancellation: self.echo_cancellation,
             max_amplification: self.max_amplification(),
-            input_buffer: parse_buffer_size(&self.input_buffer.text()),
-            output_buffer: parse_buffer_size(&self.output_buffer.text()),
+            input_buffer: parse_buffer_size(&self.buffer_text(SettingsFocus::InputBuffer)),
+            output_buffer: parse_buffer_size(&self.buffer_text(SettingsFocus::OutputBuffer)),
             latency: self.latency.clone(),
         }
     }
@@ -104,19 +104,64 @@ impl SettingsDraft {
     }
 
     pub fn input_buffer_request(&self) -> BufferRequest {
-        parse_buffer_size(&self.input_buffer.text()).to_request(DEFAULT_INPUT_BUFFER_SAMPLES)
+        parse_buffer_size(&self.buffer_text(SettingsFocus::InputBuffer))
+            .to_request(DEFAULT_INPUT_BUFFER_SAMPLES)
     }
 
     pub fn output_buffer_request(&self) -> BufferRequest {
-        parse_buffer_size(&self.output_buffer.text()).to_request(DEFAULT_OUTPUT_BUFFER_SAMPLES)
+        parse_buffer_size(&self.buffer_text(SettingsFocus::OutputBuffer))
+            .to_request(DEFAULT_OUTPUT_BUFFER_SAMPLES)
     }
 
-    /// The editor for `focus`, if it is one of the buffer rows.
-    pub fn buffer_editor_mut(&mut self, focus: SettingsFocus) -> Option<&mut Editor> {
+    /// Focuses the shared editor for `focus`, if it is one of the buffer rows.
+    pub fn buffer_editor_mut(&mut self, focus: SettingsFocus) -> Option<&mut extui_editor::Editor> {
+        self.focus_buffer_editor(focus)?;
+        Some(self.editor.editor_mut())
+    }
+
+    pub fn focus_buffer_editor(&mut self, focus: SettingsFocus) -> Option<()> {
         match focus {
-            SettingsFocus::InputBuffer => Some(&mut self.input_buffer),
-            SettingsFocus::OutputBuffer => Some(&mut self.output_buffer),
-            _ => None,
+            SettingsFocus::InputBuffer | SettingsFocus::OutputBuffer => {
+                let value = self.buffer_value(focus).to_string();
+                if let Some((field, text)) = self.editor.focus(focus, &value) {
+                    self.set_buffer_value(field, text);
+                }
+                Some(())
+            }
+            _ => {
+                self.commit_buffer_editor();
+                None
+            }
+        }
+    }
+
+    pub fn commit_buffer_editor(&mut self) {
+        if let Some((field, text)) = self.editor.clear_focus() {
+            self.set_buffer_value(field, text);
+        }
+    }
+
+    pub fn buffer_text(&self, focus: SettingsFocus) -> String {
+        if self.editor.active() == Some(focus) {
+            self.editor.text()
+        } else {
+            self.buffer_value(focus).to_string()
+        }
+    }
+
+    fn buffer_value(&self, focus: SettingsFocus) -> &str {
+        match focus {
+            SettingsFocus::InputBuffer => &self.input_buffer,
+            SettingsFocus::OutputBuffer => &self.output_buffer,
+            _ => "",
+        }
+    }
+
+    fn set_buffer_value(&mut self, focus: SettingsFocus, text: String) {
+        match focus {
+            SettingsFocus::InputBuffer => self.input_buffer = text,
+            SettingsFocus::OutputBuffer => self.output_buffer = text,
+            _ => {}
         }
     }
 
