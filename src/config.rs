@@ -171,6 +171,8 @@ pub struct AudioLatencyConfig {
     pub target_queue_ms: u64,
     #[toml(default = 20)]
     pub dynamic_target_floor_ms: u64,
+    #[toml(default = 0)]
+    pub base_minimum_target_ms: u64,
     #[toml(default = 1_000)]
     pub max_target_ms: u64,
     #[toml(default = 1_500)]
@@ -200,6 +202,7 @@ impl Default for AudioLatencyConfig {
             adaptive_target: tuning.adaptive_target,
             target_queue_ms: duration_ms(tuning.target_queue),
             dynamic_target_floor_ms: duration_ms(tuning.dynamic_target_floor),
+            base_minimum_target_ms: duration_ms(tuning.base_minimum_target),
             max_target_ms: duration_ms(tuning.max_target),
             hard_queue_bound_ms: duration_ms(tuning.hard_queue_bound),
             initial_buffer_ms: duration_ms(tuning.initial_buffer),
@@ -221,6 +224,7 @@ impl AudioLatencyConfig {
             adaptive_target: self.adaptive_target,
             target_queue: Duration::from_millis(self.target_queue_ms),
             dynamic_target_floor: Duration::from_millis(self.dynamic_target_floor_ms),
+            base_minimum_target: Duration::from_millis(self.base_minimum_target_ms),
             max_target: Duration::from_millis(self.max_target_ms),
             hard_queue_bound: Duration::from_millis(self.hard_queue_bound_ms),
             initial_buffer: Duration::from_millis(self.initial_buffer_ms),
@@ -1186,6 +1190,7 @@ input-device-index = 20
         config.audio.latency.target_queue_ms = 80;
         config.audio.latency.adaptive_target = false;
         config.audio.latency.dynamic_target_floor_ms = 25;
+        config.audio.latency.base_minimum_target_ms = 90;
         config.audio.latency.max_target_ms = 1_200;
         let content = render_runtime(&config);
 
@@ -1193,6 +1198,7 @@ input-device-index = 20
         assert!(content.contains("target-queue-ms = 80"));
         assert!(content.contains("adaptive-target = false"));
         assert!(content.contains("dynamic-target-floor-ms = 25"));
+        assert!(content.contains("base-minimum-target-ms = 90"));
         assert!(content.contains("max-target-ms = 1200"));
     }
 
@@ -1218,6 +1224,17 @@ input-device-index = 20
         tuning.target_queue = Duration::from_millis(60);
         let error = tuning.validate().unwrap_err();
         assert!(error.contains("max-target-ms"));
+    }
+
+    #[test]
+    fn audio_latency_base_minimum_must_fit_constraints() {
+        let mut tuning = LiveAudioTuning::default();
+        tuning.base_minimum_target = Duration::from_millis(80);
+        assert!(tuning.validate().is_ok());
+
+        tuning.base_minimum_target = Duration::from_millis(1_200);
+        let error = tuning.validate().unwrap_err();
+        assert!(error.contains("base-minimum-target-ms"));
     }
 
     #[test]

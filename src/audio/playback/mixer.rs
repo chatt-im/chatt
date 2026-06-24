@@ -218,7 +218,7 @@ impl LivePlaybackMixer {
     pub(crate) fn log_playback_diagnostics_if_due(&mut self, now: Instant) {
         // Disabled for now: too noisy at the 100 ms snapshot cadence. The
         // formatting below is kept ready to re-enable by flipping this flag.
-        const PLAYBACK_DIAGNOSTICS_ENABLED: bool = true;
+        const PLAYBACK_DIAGNOSTICS_ENABLED: bool = false;
         if !PLAYBACK_DIAGNOSTICS_ENABLED || self.streams.is_empty() {
             return;
         }

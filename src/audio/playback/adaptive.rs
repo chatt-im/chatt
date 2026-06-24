@@ -23,6 +23,7 @@ use crate::audio::{
 pub(crate) struct TuningSampleCounts {
     target_queue: usize,
     dynamic_target_floor: usize,
+    base_minimum_target: usize,
     max_target: usize,
     device_period_margin: usize,
     hard_queue_bound: usize,
@@ -38,6 +39,7 @@ impl TuningSampleCounts {
         Self {
             target_queue: samples_for_duration(tuning.target_queue),
             dynamic_target_floor: samples_for_duration(tuning.dynamic_target_floor),
+            base_minimum_target: samples_for_duration(tuning.base_minimum_target),
             max_target: samples_for_duration(tuning.max_target),
             device_period_margin: samples_for_duration(tuning.device_period_margin),
             hard_queue_bound: samples_for_duration(tuning.hard_queue_bound),
@@ -47,6 +49,49 @@ impl TuningSampleCounts {
             operation_hold: samples_for_duration(TIME_SCALE_OPERATION_HOLD),
             max_idle_expansion: samples_for_duration(LIVE_PLAYBACK_MAX_IDLE_EXPANSION),
         }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct BufferLevelFilter {
+    filtered_level: f32,
+    level_factor: f32,
+}
+
+impl Default for BufferLevelFilter {
+    fn default() -> Self {
+        Self {
+            filtered_level: 0.0,
+            level_factor: 253.0 / 256.0,
+        }
+    }
+}
+
+impl BufferLevelFilter {
+    fn set_target(&mut self, target_ms: u64) {
+        self.level_factor = if target_ms <= 20 {
+            251.0 / 256.0
+        } else if target_ms <= 60 {
+            252.0 / 256.0
+        } else if target_ms <= 140 {
+            253.0 / 256.0
+        } else {
+            254.0 / 256.0
+        };
+    }
+
+    fn update(&mut self, buffer_samples: usize, time_stretched: i64) {
+        let filtered = self.level_factor * self.filtered_level
+            + (1.0 - self.level_factor) * buffer_samples as f32;
+        self.filtered_level = (filtered - time_stretched as f32).max(0.0);
+    }
+
+    fn level_samples(&self) -> usize {
+        self.filtered_level.round() as usize
+    }
+
+    fn set_level(&mut self, buffer_samples: usize) {
+        self.filtered_level = buffer_samples as f32;
     }
 }
 
@@ -72,6 +117,8 @@ pub(crate) struct AdaptivePlaybackStream {
     output_block_remaining: usize,
     output_block_playable: bool,
     output_target_floor_samples: usize,
+    buffer_level: BufferLevelFilter,
+    pending_time_stretch: i64,
 }
 
 impl AdaptivePlaybackStream {
@@ -86,7 +133,7 @@ impl AdaptivePlaybackStream {
             decision_countdown: 0,
             operation_hold_remaining: 0,
             idle_expansion_samples: 0,
-            recommended_target_samples: samples.target_queue,
+            recommended_target_samples: samples.target_queue.max(samples.base_minimum_target),
             underrun_hold_until: None,
             recent_underruns: VecDeque::new(),
             underrun_active: false,
@@ -96,6 +143,8 @@ impl AdaptivePlaybackStream {
             output_block_remaining: 0,
             output_block_playable: false,
             output_target_floor_samples: 0,
+            buffer_level: BufferLevelFilter::default(),
+            pending_time_stretch: 0,
         })
     }
 
@@ -131,14 +180,17 @@ impl AdaptivePlaybackStream {
         // expansion budget so concealment is free to bridge the next underrun.
         self.idle_expansion_samples = 0;
         self.enforce_safety_bound(now, stats);
+        if self.output_priming {
+            self.sync_buffer_level_to_queue();
+        }
     }
 
     pub(crate) fn apply_recommended_target(&mut self, recommended: Duration, now: Instant) {
         if !self.tuning.adaptive_target {
             return;
         }
-        let rec = samples_for_duration(recommended)
-            .clamp(self.samples.dynamic_target_floor, self.samples.max_target);
+        let floor = self.minimum_target_samples();
+        let rec = samples_for_duration(recommended).clamp(floor, self.samples.max_target);
         if self.underrun_hold_until.is_some_and(|until| now < until) {
             self.recommended_target_samples = self.recommended_target_samples.max(rec);
             return;
@@ -150,11 +202,12 @@ impl AdaptivePlaybackStream {
     }
 
     pub(crate) fn effective_target_samples(&self) -> usize {
+        let floor = self.minimum_target_samples();
         if !self.tuning.adaptive_target {
-            return self.samples.target_queue;
+            return self.samples.target_queue.max(floor);
         }
         self.recommended_target_samples
-            .clamp(self.samples.dynamic_target_floor, self.samples.max_target)
+            .clamp(floor, self.samples.max_target)
     }
 
     pub(crate) fn adaptive_target_samples(&self, _now: Instant) -> usize {
@@ -253,10 +306,12 @@ impl AdaptivePlaybackStream {
         .min(self.samples.hard_queue_bound);
         self.output_target_floor_samples = block_floor;
         let prime_target = effective_target.max(block_floor);
+        self.buffer_level.set_target(samples_to_ms(prime_target));
+        let filtered_queued = self.buffer_level.level_samples();
         let passive_tail_playable =
             queued > 0 && (self.passive_output_active || self.prefix_is_passive(queued));
         self.output_block_playable = if self.output_priming {
-            let ready = queued >= prime_target;
+            let ready = queued >= block_floor && filtered_queued >= prime_target;
             if ready {
                 self.output_priming = false;
             }
@@ -299,18 +354,45 @@ impl AdaptivePlaybackStream {
     }
 
     fn run_time_scale_decision(&mut self, now: Instant, stats: &mut LivePlaybackMixerStats) {
-        if !self.tuning.adaptive_catch_up {
-            return;
-        }
-        let queued = self.queued_samples();
         let target = self
             .effective_target_samples()
             .max(self.output_target_floor_samples);
-        if let Some(playout_delay) = self.input.front_playout_delay(now) {
-            self.run_arrival_delay_decision(playout_delay, target, now, stats);
+        self.refresh_buffer_level_filter(target);
+        if !self.tuning.adaptive_catch_up {
             return;
         }
-        self.run_queue_depth_fallback_decision(queued, target, now, stats);
+        let active_recovery_front = self
+            .input
+            .front_source()
+            .is_some_and(|source| source != DecodedFrameSource::Normal)
+            && !self.front_is_passive_audio();
+        if let Some(playout_delay) = self.input.front_playout_delay(now) {
+            self.run_arrival_delay_decision(playout_delay, target, now, stats, active_recovery_front);
+            return;
+        }
+        self.run_queue_depth_fallback_decision(
+            self.buffer_level.level_samples(),
+            target,
+            now,
+            stats,
+            active_recovery_front,
+        );
+    }
+
+    fn refresh_buffer_level_filter(&mut self, target: usize) {
+        self.buffer_level.set_target(samples_to_ms(target));
+        self.buffer_level
+            .update(self.queued_samples(), self.pending_time_stretch);
+        self.pending_time_stretch = 0;
+    }
+
+    fn sync_buffer_level_to_queue(&mut self) {
+        self.sync_buffer_level_to_samples(self.queued_samples());
+    }
+
+    fn sync_buffer_level_to_samples(&mut self, samples: usize) {
+        self.buffer_level.set_level(samples);
+        self.pending_time_stretch = 0;
     }
 
     fn run_arrival_delay_decision(
@@ -319,22 +401,23 @@ impl AdaptivePlaybackStream {
         target: usize,
         now: Instant,
         stats: &mut LivePlaybackMixerStats,
+        active_recovery_front: bool,
     ) {
         let current_delay = samples_for_duration(playout_delay.current);
         let peak_arrival_delay = samples_for_duration(playout_delay.peak);
         let high = target
             .saturating_add(peak_arrival_delay)
             .saturating_add(self.samples.time_scale_margin);
-        if current_delay >= high.saturating_mul(4) {
+        if !active_recovery_front && current_delay >= high.saturating_mul(4) {
             self.try_accelerate(now, stats, true);
             return;
         }
         if !self.time_scale_allowed() {
             return;
         }
-        if current_delay >= high {
+        if !active_recovery_front && current_delay >= high {
             self.try_accelerate(now, stats, false);
-        } else if current_delay < target {
+        } else if current_delay.saturating_add(self.low_delay_expand_deadband()) < target {
             if !self.try_expand(now, stats) {
                 self.try_short_buffer_expand(stats);
             }
@@ -347,31 +430,38 @@ impl AdaptivePlaybackStream {
         target: usize,
         now: Instant,
         stats: &mut LivePlaybackMixerStats,
+        active_recovery_front: bool,
     ) {
         let high = target.saturating_add(self.samples.time_scale_margin);
-        if queued >= high.saturating_mul(4) {
+        if !active_recovery_front && queued >= high.saturating_mul(4) {
             self.try_accelerate(now, stats, true);
-            return;
-        }
-        let effective_target = self.effective_target_samples();
-        let should_preemptively_expand =
-            queued == target && self.output_target_floor_samples > effective_target;
-        if queued < target || should_preemptively_expand {
-            if !self.try_expand(now, stats) {
-                self.try_short_buffer_expand(stats);
-            }
             return;
         }
         if !self.time_scale_allowed() {
             return;
         }
-        if queued >= high {
+        let effective_target = self.effective_target_samples();
+        let should_preemptively_expand =
+            queued == target && self.output_target_floor_samples > effective_target;
+        if queued.saturating_add(self.low_delay_expand_deadband()) < target
+            || should_preemptively_expand
+        {
+            if !self.try_expand(now, stats) {
+                self.try_short_buffer_expand(stats);
+            }
+            return;
+        }
+        if !active_recovery_front && queued >= high {
             self.try_accelerate(now, stats, false);
         }
     }
 
     fn time_scale_allowed(&self) -> bool {
         self.operation_hold_remaining == 0
+    }
+
+    fn low_delay_expand_deadband(&self) -> usize {
+        self.samples.time_scale_margin / 2
     }
 
     fn try_accelerate(
@@ -415,6 +505,7 @@ impl AdaptivePlaybackStream {
         }
         stats.accelerate_count = stats.accelerate_count.saturating_add(1);
         stats.accelerate_samples = stats.accelerate_samples.saturating_add(delta as u64);
+        self.pending_time_stretch = self.pending_time_stretch.saturating_add(delta as i64);
         if !fast {
             self.operation_hold_remaining = self.samples.operation_hold;
         }
@@ -454,6 +545,7 @@ impl AdaptivePlaybackStream {
         }
         stats.expand_count = stats.expand_count.saturating_add(1);
         stats.expand_samples = stats.expand_samples.saturating_add(delta as u64);
+        self.pending_time_stretch = self.pending_time_stretch.saturating_sub(delta as i64);
         self.idle_expansion_samples = self.idle_expansion_samples.saturating_add(delta);
         self.operation_hold_remaining = self.samples.operation_hold;
         true
@@ -485,6 +577,7 @@ impl AdaptivePlaybackStream {
         }
         stats.expand_count = stats.expand_count.saturating_add(1);
         stats.expand_samples = stats.expand_samples.saturating_add(delta as u64);
+        self.pending_time_stretch = self.pending_time_stretch.saturating_sub(delta as i64);
         self.idle_expansion_samples = self.idle_expansion_samples.saturating_add(delta);
         self.operation_hold_remaining = self.samples.operation_hold;
         true
@@ -558,9 +651,15 @@ impl AdaptivePlaybackStream {
             // firing accelerate/expand against the swing.
             self.recommended_target_samples = self
                 .recommended_target_samples
-                .max(self.samples.target_queue);
+                .max(self.samples.target_queue.max(self.minimum_target_samples()));
             self.underrun_hold_until = Some(now + LIVE_PLAYBACK_DYNAMIC_UNDERRUN_WINDOW);
         }
+    }
+
+    fn minimum_target_samples(&self) -> usize {
+        self.samples
+            .dynamic_target_floor
+            .max(self.samples.base_minimum_target)
     }
 
     fn record_underrun(&mut self, now: Instant, stats: &mut LivePlaybackMixerStats) {
@@ -613,6 +712,7 @@ impl AdaptivePlaybackStream {
 
         let skip = queued.saturating_sub(target);
         self.input.drain_samples(skip);
+        self.sync_buffer_level_to_queue();
         stats.speech_gap_skip_count = stats.speech_gap_skip_count.saturating_add(1);
         stats.skipped_speech_gap_samples =
             stats.skipped_speech_gap_samples.saturating_add(skip as u64);
@@ -647,7 +747,7 @@ impl AdaptivePlaybackStream {
             .max(self.samples.target_queue);
         self.sender_silent = true;
         self.passive_output_active = true;
-        self.recommended_target_samples = self.samples.dynamic_target_floor;
+        self.recommended_target_samples = tail_trim_target;
         self.underrun_active = false;
         self.output_priming = false;
         self.output_block_playable = true;
@@ -662,10 +762,12 @@ impl AdaptivePlaybackStream {
         let target = tail_trim_target;
         let queued = self.queued_samples();
         if queued <= target {
+            self.sync_buffer_level_to_samples(queued);
             return;
         }
         let skip = queued.saturating_sub(target);
         if !self.prefix_is_passive(skip) {
+            self.sync_buffer_level_to_samples(queued);
             kvlog::info!(
                 "live playback preserved active speech at sender silence",
                 queued_ms = samples_to_ms(queued),
@@ -675,6 +777,7 @@ impl AdaptivePlaybackStream {
             return;
         }
         self.input.drain_samples(skip);
+        self.sync_buffer_level_to_queue();
         stats.speech_gap_skip_count = stats.speech_gap_skip_count.saturating_add(1);
         stats.skipped_speech_gap_samples =
             stats.skipped_speech_gap_samples.saturating_add(skip as u64);
@@ -718,6 +821,7 @@ impl AdaptivePlaybackStream {
         }
         let trim_to = self.effective_target_samples();
         self.input.drain_samples(queued.saturating_sub(trim_to));
+        self.sync_buffer_level_to_queue();
         stats.hard_trim_count = stats.hard_trim_count.saturating_add(1);
         kvlog::warn!(
             "live playback queue safety-trim",
@@ -776,6 +880,52 @@ mod tests {
                     * 0.5
             })
             .collect()
+    }
+
+    #[test]
+    fn buffer_level_filter_subtracts_accelerate_delta() {
+        let mut filter = BufferLevelFilter::default();
+        let steady = samples_for_duration(Duration::from_millis(100));
+        let accelerated = samples_for_duration(Duration::from_millis(10));
+
+        filter.set_target(60);
+        filter.set_level(steady);
+        filter.update(steady, accelerated as i64);
+
+        assert_eq!(filter.level_samples(), steady - accelerated);
+    }
+
+    #[test]
+    fn fallback_decision_does_not_rechurn_after_correction() {
+        let now = Instant::now();
+        let tuning = test_tuning();
+        let mut stream = AdaptivePlaybackStream::new(tuning).unwrap();
+        let mut stats = LivePlaybackMixerStats::default();
+        let high = target_queue_samples(tuning) + samples_for_duration(TIME_SCALE_MARGIN);
+        let period = (SAMPLE_RATE / 200) as usize;
+        let queued = high + period;
+        let tone: Vec<f32> = (0..queued)
+            .map(|n| {
+                (2.0 * std::f64::consts::PI * 200.0 * n as f64 / SAMPLE_RATE as f64).sin() as f32
+                    * 0.5
+            })
+            .collect();
+
+        stream.queue_samples(&tone, DecodedFrameSource::Normal, now, &mut stats);
+        stream.buffer_level.set_level(stream.queued_samples());
+        stream.run_time_scale_decision(now, &mut stats);
+        assert_eq!(stats.accelerate_count, 1, "{stats:?}");
+
+        stream.operation_hold_remaining = 0;
+        stream.run_time_scale_decision(now + TIME_SCALE_DECISION_INTERVAL, &mut stats);
+
+        assert_eq!(
+            stats.accelerate_count,
+            1,
+            "queued={} filtered={} stats={stats:?}",
+            stream.queued_samples(),
+            stream.buffer_level.level_samples()
+        );
     }
 
     #[test]
@@ -1020,7 +1170,7 @@ mod tests {
         assert_eq!(stream.queued_samples(), queued);
         assert_eq!(
             stream.effective_target_samples(),
-            samples_for_duration(tuning.dynamic_target_floor)
+            samples_for_duration(raised_target)
         );
         assert_eq!(stats.speech_gap_skip_count, 0);
     }
@@ -1377,6 +1527,53 @@ mod tests {
 
         let _ = stream.pop_sample(now, &mut stats);
         assert!(stats.accelerate_count > 0, "{stats:?}");
+    }
+
+    #[test]
+    fn recovery_frames_do_not_accelerate_catch_up() {
+        let now = Instant::now();
+        let mut stream = AdaptivePlaybackStream::new(test_tuning()).unwrap();
+        let mut stats = LivePlaybackMixerStats::default();
+        let tone = sine(1_000.0, Duration::from_millis(300));
+
+        stream.queue_samples_with_delay(
+            &tone,
+            DecodedFrameSource::Dred,
+            Some(PlayoutDelay {
+                current: Duration::from_millis(200),
+                peak: Duration::ZERO,
+            }),
+            now,
+            &mut stats,
+        );
+
+        assert_eq!(stream.pop_sample(now, &mut stats), Some(tone[0]));
+        assert_eq!(stats.accelerate_count, 0, "{stats:?}");
+        assert_eq!(stats.expand_count, 0, "{stats:?}");
+    }
+
+    #[test]
+    fn recovery_frames_can_expand_when_below_target() {
+        let now = Instant::now();
+        let mut stream = AdaptivePlaybackStream::new(test_tuning()).unwrap();
+        let mut stats = LivePlaybackMixerStats::default();
+        let tone = sine(1_000.0, Duration::from_millis(300));
+
+        stream.apply_recommended_target(Duration::from_millis(140), now);
+        stream.queue_samples_with_delay(
+            &tone,
+            DecodedFrameSource::Dred,
+            Some(PlayoutDelay {
+                current: Duration::from_millis(20),
+                peak: Duration::ZERO,
+            }),
+            now,
+            &mut stats,
+        );
+
+        let _ = stream.pop_sample(now, &mut stats);
+        assert_eq!(stats.accelerate_count, 0, "{stats:?}");
+        assert!(stats.expand_count > 0, "{stats:?}");
     }
 
     #[test]

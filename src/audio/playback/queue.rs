@@ -28,6 +28,16 @@ pub(crate) struct QueuedAudioFrame {
 struct QueuedPlayoutTiming {
     delay: PlayoutDelay,
     enqueued_at: Instant,
+    media_offset_samples: usize,
+}
+
+impl QueuedPlayoutTiming {
+    fn at_media_offset(self, additional_samples: usize) -> Self {
+        Self {
+            media_offset_samples: self.media_offset_samples.saturating_add(additional_samples),
+            ..self
+        }
+    }
 }
 
 impl MonoSampleQueue {
@@ -70,6 +80,7 @@ impl MonoSampleQueue {
             timing: playout_delay.map(|delay| QueuedPlayoutTiming {
                 delay,
                 enqueued_at: now,
+                media_offset_samples: 0,
             }),
             rms,
             peak,
@@ -189,15 +200,8 @@ impl MonoSampleQueue {
             return;
         };
 
-        if local_index > 0
-            && let Some(frame) = self.frames.get_mut(frame_index)
-        {
-            let split_at = frame.offset + local_index;
-            let tail = frame.samples.split_off(split_at);
-            let source = frame.source;
-            let timing = frame.timing;
-            let tail_frame = QueuedAudioFrame::new_with_timing(tail, source, timing);
-            self.frames.insert(frame_index + 1, tail_frame);
+        if local_index > 0 && !self.split_frame_at(frame_index, local_index) {
+            return;
         }
 
         let insert_index = if local_index == 0 {
@@ -222,11 +226,15 @@ impl MonoSampleQueue {
             let Some((frame_index, local_index, available)) = self.find_frame_at(start) else {
                 break;
             };
+            if local_index > 0 {
+                if !self.split_frame_at(frame_index, local_index) {
+                    break;
+                }
+                continue;
+            }
             let remove = len.min(available);
             if let Some(frame) = self.frames.get_mut(frame_index) {
-                let drain_start = frame.offset + local_index;
-                let drain_end = drain_start + remove;
-                frame.samples.drain(drain_start..drain_end);
+                frame.offset += remove;
                 self.total -= remove;
             }
             if self
@@ -238,6 +246,25 @@ impl MonoSampleQueue {
             }
             len -= remove;
         }
+    }
+
+    fn split_frame_at(&mut self, frame_index: usize, local_index: usize) -> bool {
+        if local_index == 0 {
+            return true;
+        }
+        let Some(frame) = self.frames.get_mut(frame_index) else {
+            return false;
+        };
+        let split_at = frame.offset.saturating_add(local_index);
+        if split_at >= frame.samples.len() {
+            return false;
+        }
+        let tail = frame.samples.split_off(split_at);
+        let source = frame.source;
+        let timing = frame.timing.map(|timing| timing.at_media_offset(split_at));
+        let tail_frame = QueuedAudioFrame::new_with_timing(tail, source, timing);
+        self.frames.insert(frame_index + 1, tail_frame);
+        true
     }
 
     pub(crate) fn sample_at(&self, absolute_index: usize) -> Option<f32> {
@@ -283,11 +310,15 @@ impl MonoSampleQueue {
         Some((frame.rms, frame.peak))
     }
 
+    pub(crate) fn front_source(&self) -> Option<DecodedFrameSource> {
+        self.frames.front().map(|frame| frame.source)
+    }
+
     pub(crate) fn front_playout_delay(&self, now: Instant) -> Option<PlayoutDelay> {
         let frame = self.frames.front()?;
         let timing = frame.timing?;
         let elapsed = now.saturating_duration_since(timing.enqueued_at);
-        let played = Duration::from_secs_f64(frame.offset as f64 / SAMPLE_RATE as f64);
+        let played = duration_for_samples(timing.media_offset_samples.saturating_add(frame.offset));
         Some(PlayoutDelay {
             current: timing
                 .delay
@@ -299,9 +330,16 @@ impl MonoSampleQueue {
     }
 
     fn timing_at(&self, absolute_index: usize) -> Option<QueuedPlayoutTiming> {
-        let (frame_index, _, _) = self.find_frame_at(absolute_index)?;
-        self.frames.get(frame_index)?.timing
+        let (frame_index, local_index, _) = self.find_frame_at(absolute_index)?;
+        let frame = self.frames.get(frame_index)?;
+        frame
+            .timing
+            .map(|timing| timing.at_media_offset(frame.offset.saturating_add(local_index)))
     }
+}
+
+fn duration_for_samples(samples: usize) -> Duration {
+    Duration::from_micros((samples as u64).saturating_mul(1_000_000) / u64::from(SAMPLE_RATE))
 }
 
 impl QueuedAudioFrame {
@@ -328,5 +366,69 @@ impl QueuedAudioFrame {
 
     fn remaining_len(&self) -> usize {
         self.samples.len().saturating_sub(self.offset)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn samples_for_ms(ms: u64) -> usize {
+        (u64::from(SAMPLE_RATE) * ms / 1_000) as usize
+    }
+
+    fn samples(len: usize) -> Vec<f32> {
+        (0..len).map(|index| index as f32).collect()
+    }
+
+    #[test]
+    fn insert_preserves_playout_delay_offset_at_split() {
+        let start = Instant::now();
+        let mut queue = MonoSampleQueue::new();
+        queue.push_back_owned_with_delay(
+            samples(samples_for_ms(40)),
+            DecodedFrameSource::Normal,
+            Some(PlayoutDelay {
+                current: Duration::from_millis(100),
+                peak: Duration::ZERO,
+            }),
+            start,
+        );
+
+        queue.insert_at_owned(samples_for_ms(15), &[0.0; 8]);
+        queue.drain_samples(samples_for_ms(15));
+
+        assert_eq!(
+            queue.front_playout_delay(start).unwrap().current,
+            Duration::from_millis(85)
+        );
+        queue.drain_samples(8);
+        assert_eq!(
+            queue.front_playout_delay(start).unwrap().current,
+            Duration::from_millis(85)
+        );
+    }
+
+    #[test]
+    fn interior_drain_preserves_playout_delay_offset_after_removed_audio() {
+        let start = Instant::now();
+        let mut queue = MonoSampleQueue::new();
+        queue.push_back_owned_with_delay(
+            samples(samples_for_ms(60)),
+            DecodedFrameSource::Normal,
+            Some(PlayoutDelay {
+                current: Duration::from_millis(120),
+                peak: Duration::ZERO,
+            }),
+            start,
+        );
+
+        queue.drain_range(samples_for_ms(15), samples_for_ms(10));
+        queue.drain_samples(samples_for_ms(15));
+
+        assert_eq!(
+            queue.front_playout_delay(start).unwrap().current,
+            Duration::from_millis(95)
+        );
     }
 }
