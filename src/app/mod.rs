@@ -1015,7 +1015,7 @@ impl App {
         }
 
         let focus = self.settings_form.focus();
-        let kind = crate::ui::settings::setting_kind(focus);
+        let kind = self.settings.field_kind(focus);
         let text_focused = kind == crate::tui::form::FormFieldKind::Text;
 
         let event = self.settings_form.handle_key(key, kind);
@@ -1304,11 +1304,15 @@ impl App {
             return;
         }
         match self.settings_form.focus() {
+            SettingsFocus::CaptureDevice if self.settings.input_raw() => {}
             SettingsFocus::CaptureDevice if delta < 0 => self.cancel_audio_input_picker(),
             SettingsFocus::CaptureDevice => self.activate_audio_input_picker(),
+            SettingsFocus::PlaybackDevice if self.settings.output_raw() => {}
             SettingsFocus::PlaybackDevice if delta < 0 => self.cancel_audio_output_picker(),
             SettingsFocus::PlaybackDevice => self.activate_audio_output_picker(),
-            SettingsFocus::Bitrate
+            SettingsFocus::RawCaptureDevice
+            | SettingsFocus::RawPlaybackDevice
+            | SettingsFocus::Bitrate
             | SettingsFocus::Denoise
             | SettingsFocus::EchoCancellation
             | SettingsFocus::Amplification
@@ -1330,10 +1334,18 @@ impl App {
             SettingsFocus::Refresh => self.refresh_audio_devices(),
             SettingsFocus::Save => self.save_settings(),
             SettingsFocus::Close => self.close_settings(),
+            SettingsFocus::CaptureDevice if self.settings.input_raw() => {
+                self.move_settings_focus(1)
+            }
             SettingsFocus::CaptureDevice => self.activate_audio_input_picker(),
+            SettingsFocus::PlaybackDevice if self.settings.output_raw() => {
+                self.move_settings_focus(1)
+            }
             SettingsFocus::PlaybackDevice => self.activate_audio_output_picker(),
             SettingsFocus::Denoise
             | SettingsFocus::EchoCancellation
+            | SettingsFocus::RawCaptureDevice
+            | SettingsFocus::RawPlaybackDevice
             | SettingsFocus::Bitrate
             | SettingsFocus::Amplification
             | SettingsFocus::FormBindings
@@ -1361,10 +1373,18 @@ impl App {
     /// Slow fields (device, bitrate, denoise, buffer, latency) schedule a
     /// debounced stream restart. The on-disk file is only written by `Save`.
     fn sync_settings_change(&mut self) {
-        let old = self.config.audio.clone();
-        self.config.audio = self.settings.to_audio();
         self.config.ui.form_bindings = self.settings.form_bindings();
         self.apply_theme(self.settings.theme());
+        // Never open a malformed ALSA string. Hold the audio config at its last
+        // valid state until the device string is fixed, then the diff below
+        // re-applies every pending change.
+        if let Some(reason) = self.settings.device_string_invalid() {
+            self.mark_settings_dirty();
+            self.set_status(format!("audio not applied: {reason}"));
+            return;
+        }
+        let old = self.config.audio.clone();
+        self.config.audio = self.settings.to_audio();
         self.apply_echo_cancellation_setting();
         self.apply_active_capture_amplification(self.config.audio.max_amplification);
         let (capture, playback) = audio_restart_flags(&old, &self.config.audio);
@@ -1461,7 +1481,7 @@ impl App {
         let Some((field, text)) = commit else {
             return;
         };
-        let mutation = self.settings.set_buffer_text(field, text);
+        let mutation = self.settings.commit_field_text(field, text);
         self.apply_settings_mutation(mutation);
     }
 
@@ -1779,6 +1799,10 @@ impl App {
         // then persists the live config to disk.
         self.commit_settings_form_text();
         self.sync_settings_change();
+        if let Some(reason) = self.settings.device_string_invalid() {
+            self.set_error(format!("not saved: {reason}"));
+            return;
+        }
         match self.config.save_runtime() {
             Ok(path) => {
                 self.config.config_path = Some(path.clone());
@@ -2383,7 +2407,9 @@ fn server_field(focus: ServerEditFocus) -> ServerField {
 fn settings_field(focus: SettingsFocus) -> SettingsField {
     match focus {
         SettingsFocus::CaptureDevice => SettingsField::InputDevice,
+        SettingsFocus::RawCaptureDevice => SettingsField::RawInputDevice,
         SettingsFocus::PlaybackDevice => SettingsField::OutputDevice,
+        SettingsFocus::RawPlaybackDevice => SettingsField::RawOutputDevice,
         SettingsFocus::Bitrate => SettingsField::Bitrate,
         SettingsFocus::Denoise => SettingsField::Denoise,
         SettingsFocus::EchoCancellation => SettingsField::EchoCancellation,
