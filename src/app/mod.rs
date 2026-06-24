@@ -14,8 +14,11 @@ use std::{
     thread,
 };
 
-use extui::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind};
-use extui_editor::{Editor, bindings as editor_bindings};
+use extui::Rect;
+use extui::event::{
+    KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
+use extui_editor::{Editor, Span as EditorSpan, bindings as editor_bindings};
 use rpc::{
     control::{ChatMessage, InviteTicket},
     ids::{SessionId, UserId},
@@ -23,7 +26,7 @@ use rpc::{
 
 use crate::{
     bindings::{BindCommand, PendingChord},
-    chat_buffer::VirtualChatBuffer,
+    chat_buffer::{VirtualChatBuffer, VisibleLine},
     client_net::{NetworkClient, NetworkCommand, NetworkEvent, spawn_pair_once},
     config::{self, Config, SoundboardClip, validate_server_entry},
     local_control,
@@ -36,7 +39,7 @@ use crate::{
         Action,
         editor::EditorHighlighter,
         focus::{FocusId, FocusManager, ServerField, SettingsField},
-        form::{FormAction, FormMouseIntent, FormState},
+        form::{FormAction, FormMouseIntent, FormState, rect_contains},
         modes::{ModeKind, ModeStack},
     },
     ui::select::FuzzySelect,
@@ -81,6 +84,10 @@ pub(crate) struct App {
     pub(crate) chat: VirtualChatBuffer,
     pub(crate) participants: Participants,
     pub(crate) last_chat_width: u16,
+    pub(crate) last_chat_height: u16,
+    pub(crate) last_chat_rect: Rect,
+    pub(crate) last_chat_lines: Vec<VisibleLine>,
+    pub(crate) pending_clipboard: Option<String>,
     pub(crate) pending_chord: Option<PendingChord>,
     pub(crate) event_rx: Receiver<NetworkEvent>,
     pub(crate) audio_device_refresh_tx: mpsc::Sender<AudioDeviceRefresh>,
@@ -186,6 +193,10 @@ impl App {
             chat: VirtualChatBuffer::new(config.ui.max_messages as usize),
             participants: Participants::default(),
             last_chat_width: 80,
+            last_chat_height: 0,
+            last_chat_rect: Rect::EMPTY,
+            last_chat_lines: Vec::new(),
+            pending_clipboard: None,
             pending_chord: None,
             event_rx,
             audio_device_refresh_tx,
@@ -674,8 +685,81 @@ impl App {
         match self.mode {
             theme::UiMode::Settings => self.process_settings_mouse(mouse),
             theme::UiMode::ServerEdit => self.process_server_edit_mouse(mouse),
+            theme::UiMode::Compose | theme::UiMode::Log => self.process_chat_mouse(mouse),
             _ => Action::Continue,
         }
+    }
+
+    fn process_chat_mouse(&mut self, mouse: MouseEvent) -> Action {
+        let rect = self.last_chat_rect;
+        match mouse.kind {
+            MouseEventKind::ScrollUp if rect_contains(rect, mouse.column, mouse.row) => {
+                self.scroll_chat_up(5);
+            }
+            MouseEventKind::ScrollDown if rect_contains(rect, mouse.column, mouse.row) => {
+                self.chat.scroll_down(5);
+            }
+            MouseEventKind::Down(MouseButton::Left) => match self.chat_line_at(mouse.row) {
+                Some(pos) if rect_contains(rect, mouse.column, mouse.row) => {
+                    self.chat.begin_selection(pos);
+                }
+                _ => self.chat.clear_selection(),
+            },
+            MouseEventKind::Drag(MouseButton::Left) if self.chat.is_selecting() => {
+                self.drag_chat_selection(mouse.row);
+            }
+            MouseEventKind::Up(MouseButton::Left) => self.chat.end_selection(),
+            _ => {}
+        }
+        Action::Continue
+    }
+
+    /// Extends the active selection toward `row`, auto-scrolling when the cursor
+    /// is dragged above the top or below the bottom of the chat area.
+    fn drag_chat_selection(&mut self, row: u16) {
+        let rect = self.last_chat_rect;
+        if row < rect.y {
+            self.scroll_chat_up(1);
+        } else if row >= rect.y.saturating_add(rect.h) {
+            self.chat.scroll_down(1);
+        }
+        if let Some(pos) =
+            self.chat_line_at(row.clamp(rect.y, rect.y.saturating_add(rect.h).saturating_sub(1)))
+        {
+            self.chat.extend_selection(pos);
+        }
+    }
+
+    /// Maps a screen `row` to the `(message, line)` it renders, using the
+    /// top-anchored layout captured during the last render.
+    fn chat_line_at(&self, row: u16) -> Option<(usize, usize)> {
+        let index = row.checked_sub(self.last_chat_rect.y)? as usize;
+        let line = self.last_chat_lines.get(index)?;
+        Some((line.message, line.line))
+    }
+
+    fn scroll_chat_up(&mut self, rows: usize) {
+        self.chat
+            .scroll_up(rows, self.last_chat_width, self.last_chat_height);
+    }
+
+    fn copy_chat_selection(&mut self) {
+        if let Some(text) = self.chat.selected_text() {
+            self.pending_clipboard = Some(text);
+        }
+    }
+
+    pub(crate) fn take_pending_clipboard(&mut self) -> Option<String> {
+        self.pending_clipboard.take()
+    }
+
+    /// Inserts terminal-pasted text at the composer cursor while composing.
+    pub(crate) fn handle_paste(&mut self, text: String) {
+        if self.mode != theme::UiMode::Compose {
+            return;
+        }
+        let span = EditorSpan::empty_at(self.composer.cursor_offset());
+        self.composer.replace_range(span, &text);
     }
 
     pub(crate) fn process_server_select_key(&mut self, key: KeyEvent) -> Action {
@@ -1066,16 +1150,17 @@ impl App {
                 }
             }
             Quit => return Action::Quit,
-            ScrollUp => self.chat.scroll_up(1),
+            ScrollUp => self.scroll_chat_up(1),
             ScrollDown => self.chat.scroll_down(1),
             RoomScrollUp => self.move_room_selection(-1),
             RoomScrollDown => self.move_room_selection(1),
             OpenSelectedUserVolume => self.open_selected_user_volume(),
             ToggleSelectedUserMute => self.toggle_selected_user_mute(),
-            HalfPageUp => self.chat.scroll_up(10),
+            HalfPageUp => self.scroll_chat_up(10),
             HalfPageDown => self.chat.scroll_down(10),
-            Top => self.chat.top(self.last_chat_width),
+            Top => self.chat.top(self.last_chat_width, self.last_chat_height),
             Bottom => self.chat.bottom(),
+            CopySelection => self.copy_chat_selection(),
             ToggleMute => self.set_mute(!self.mic_muted.load(Ordering::Relaxed)),
             ToggleDeafen => self.set_deafen(!self.deafened.load(Ordering::Relaxed)),
             RefreshDevices => self.refresh_audio_devices(),

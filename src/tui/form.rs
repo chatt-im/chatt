@@ -621,7 +621,7 @@ fn visible_row(viewport: Rect, scroll: u16, virtual_y: u16, height: u16) -> Opti
     })
 }
 
-fn rect_contains(rect: Rect, column: u16, row: u16) -> bool {
+pub(crate) fn rect_contains(rect: Rect, column: u16, row: u16) -> bool {
     column >= rect.x
         && row >= rect.y
         && column < rect.x.saturating_add(rect.w)

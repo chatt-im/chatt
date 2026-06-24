@@ -69,6 +69,7 @@ receive-dir = "/tmp/tchat2"
 "m" = "ToggleMute"
 "h" = "ToggleDeafen"
 "c" = "ClearChat"
+"y" = "CopySelection"
 
 [bindings.picker]
 "C-c" = "Quit"

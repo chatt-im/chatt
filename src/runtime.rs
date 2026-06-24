@@ -28,12 +28,14 @@ pub(crate) fn run_app(
         | TerminalFlags::ALT_SCREEN
         | TerminalFlags::HIDE_CURSOR
         | TerminalFlags::MOUSE_CAPTURE
-        | TerminalFlags::EXTENDED_KEYBOARD_INPUTS;
+        | TerminalFlags::EXTENDED_KEYBOARD_INPUTS
+        | TerminalFlags::BRACKETED_PASTE;
     let mut terminal = Terminal::open(flags)?;
     let (w, h) = terminal.size()?;
     let mut buffer = Buffer::new(w, h);
     buffer.set_rgb_supported(true);
     let mut events = Events::default();
+    let mut clipboard = crate::clipboard::Clipboard::new();
     let stdin = std::io::stdin();
 
     loop {
@@ -59,12 +61,17 @@ pub(crate) fn run_app(
                         return Ok(());
                     }
                 }
+                Event::Paste(text) => app.handle_paste(text),
                 Event::Resized => {
                     let (new_w, new_h) = terminal.size()?;
                     buffer.resize(new_w, new_h);
                 }
                 _ => {}
             }
+        }
+
+        if let Some(text) = app.take_pending_clipboard() {
+            clipboard.copy(&mut terminal, &text);
         }
     }
 }
