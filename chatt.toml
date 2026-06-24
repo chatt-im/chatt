@@ -44,6 +44,9 @@ receive-dir = "/tmp/tchat2"
 #   disabled publish host candidates as literal IP addresses
 #   no-host  suppress host candidates entirely, relying on reflexive and relay
 candidate-privacy = "mdns"
+# Prefer native IPv6 over IPv4 at equal candidate type (RFC 8421). Set false to
+# revert to IPv4-first for diagnostics.
+prefer-ipv6 = true
 
 [bindings.insert]
 "C-c" = "Quit"

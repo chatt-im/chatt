@@ -67,6 +67,7 @@ impl ServerEntry {
             max_upload_bytes: files.max_upload_bytes,
             max_receive_bytes: files.max_receive_bytes,
             candidate_privacy: p2p.candidate_privacy,
+            prefer_ipv6: p2p.prefer_ipv6,
         }
     }
 
@@ -324,11 +325,24 @@ pub enum CandidatePrivacy {
     NoHost,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq, Toml)]
+#[derive(Clone, Debug, PartialEq, Eq, Toml)]
 #[toml(FromToml, ToToml, rename_all = "kebab-case")]
 pub struct P2pConfig {
     #[toml(default)]
     pub candidate_privacy: CandidatePrivacy,
+    /// Prefer native IPv6 over IPv4 at equal candidate type (RFC 8421). Set
+    /// `false` to revert to IPv4-first for diagnostics.
+    #[toml(default = true)]
+    pub prefer_ipv6: bool,
+}
+
+impl Default for P2pConfig {
+    fn default() -> Self {
+        Self {
+            candidate_privacy: CandidatePrivacy::default(),
+            prefer_ipv6: true,
+        }
+    }
 }
 
 impl P2pConfig {

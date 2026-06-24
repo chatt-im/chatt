@@ -22,6 +22,7 @@ fn candidate(id: u32, kind: CandidateKind, addr: &str) -> Candidate {
         addr.parse().unwrap(),
         None,
         kind == CandidateKind::Host,
+        true,
     )
 }
 
@@ -33,6 +34,7 @@ fn relay() -> Candidate {
         CandidateKind::Relay,
         "203.0.113.10:41001".parse().unwrap(),
         None,
+        true,
         true,
     )
 }
@@ -339,6 +341,7 @@ fn case_14_same_socket_metadata_survives_host_reflexive_and_relay_candidates() {
             "10.0.0.2:5000".parse().unwrap(),
             None,
             true,
+            true,
         ),
         Candidate::with_metadata(
             2,
@@ -348,6 +351,7 @@ fn case_14_same_socket_metadata_survives_host_reflexive_and_relay_candidates() {
             "198.51.100.2:55000".parse().unwrap(),
             None,
             true,
+            true,
         ),
         Candidate::with_metadata(
             3,
@@ -356,6 +360,7 @@ fn case_14_same_socket_metadata_survives_host_reflexive_and_relay_candidates() {
             CandidateKind::Relay,
             "203.0.113.10:41001".parse().unwrap(),
             None,
+            true,
             true,
         ),
     ];
@@ -536,6 +541,79 @@ fn case_23_port_reuse_timeout_requires_fresh_ephemeral_rebind() {
         RestartPortPolicy::bind_addr_for_restart("127.0.0.1:5000".parse().unwrap()).port(),
         0
     );
+}
+
+fn dual_stack_agent(now: std::time::Instant) -> TraversalAgent {
+    TraversalAgent::new(
+        now,
+        test_config(),
+        IceRole::Controlling,
+        1,
+        NatKind::Cone,
+        NatKind::Cone,
+        vec![
+            candidate(1, CandidateKind::Host, "192.168.1.2:5000"),
+            candidate(2, CandidateKind::Host, "[2001:db8::2]:5000"),
+        ],
+        vec![
+            candidate(3, CandidateKind::Host, "192.168.1.3:5000"),
+            candidate(4, CandidateKind::Host, "[2001:db8::3]:5000"),
+        ],
+    )
+}
+
+#[test]
+fn case_31_dual_stack_prefers_ipv6_when_both_families_work() {
+    let now = at(0);
+    let mut agent = dual_stack_agent(now);
+
+    // The highest-priority check targets the IPv6 pair, preferred at equal type.
+    let action = agent
+        .poll(now)
+        .into_iter()
+        .find(|action| matches!(action, Action::SendStun { .. }))
+        .expect("a connectivity check");
+    let (to, tx) = match action {
+        Action::SendStun {
+            to, transaction_id, ..
+        } => (to, transaction_id),
+        _ => unreachable!(),
+    };
+    assert!(to.is_ipv6(), "first check should target IPv6, got {to}");
+
+    let response = StunMessage::binding_success(tx, "[2001:db8::3]:5000".parse().unwrap())
+        .encode(Some(&[0u8; 32]));
+    let actions = agent
+        .handle_inbound(now + Duration::from_millis(1), to, &response)
+        .unwrap();
+    assert!(matches!(
+        actions.as_slice(),
+        [Action::DirectReady { selected }] if selected.remote_addr.is_ipv6()
+    ));
+}
+
+#[test]
+fn case_32_dual_stack_races_ipv6_when_ipv4_is_a_black_hole() {
+    let now = at(0);
+    let mut agent = dual_stack_agent(now);
+
+    // Neither family answers (the IPv4 path is a black hole, IPv6 is being
+    // raced). Both families must receive a check within one pacing interval, so
+    // the IPv6 path is not stuck behind the IPv4 pairs reaching `Failed` (which
+    // needs `max_check_attempts` past `check_deadline`).
+    let mut saw_v4 = false;
+    let mut saw_v6 = false;
+    for ms in [0u64, 25] {
+        if let Some((to, _)) = first_stun(agent.poll(now + Duration::from_millis(ms))) {
+            if to.is_ipv6() {
+                saw_v6 = true;
+            } else {
+                saw_v4 = true;
+            }
+        }
+    }
+    assert!(saw_v6, "expected an IPv6 check within the pacing budget");
+    assert!(saw_v4, "expected an IPv4 check within the pacing budget");
 }
 
 fn authenticated_agent(now: std::time::Instant, key: [u8; 32]) -> TraversalAgent {
