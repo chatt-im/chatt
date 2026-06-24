@@ -1937,7 +1937,7 @@ impl App {
             seed: self.config.soundboard.seed.wrapping_add(slot as u64),
             first_sequence: self.soundboard_next_sequence,
             max_amplification: self.config.audio.max_amplification,
-            denoise: self.config.audio.denoise,
+            denoise: self.config.audio.denoise.is_enabled(),
             auto_gain: true,
         };
         self.set_status(format!(

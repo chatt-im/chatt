@@ -243,6 +243,7 @@ dependencies = [
  "ring",
  "rpc",
  "sonora",
+ "sonora-common-audio",
  "tinyhl",
  "toml-spanner",
  "unicode-width",

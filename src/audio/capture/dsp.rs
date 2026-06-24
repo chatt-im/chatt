@@ -1,12 +1,17 @@
 use std::collections::VecDeque;
 
 use earshot::Detector as EarshotDetector;
-use sonora::config::{AdaptiveDigital, GainController2};
+use nnnoiseless::DenoiseState;
+use sonora::config::{
+    AdaptiveDigital, EchoCanceller as Aec3Config, GainController2, HighPassFilter, NoiseSuppression,
+};
 use sonora::{AudioProcessing, Config as ApmConfig, StreamConfig as ApmStreamConfig};
 
+use crate::audio::capture::echo::EchoReference;
+use crate::audio::shared::DenoiseConfig;
 use crate::audio::shared::{
-    AudioStats, FRAME_SAMPLES, LiveAudioTuning, frames_for_duration, peak_i16_scale, rms_i16_scale,
-    samples_for_duration,
+    AudioStats, FRAME_SAMPLES, LiveAudioTuning, SAMPLE_RATE, frames_for_duration, peak_i16_scale,
+    rms_i16_scale, samples_for_duration,
 };
 
 const I16_SCALE: f32 = i16::MAX as f32;
@@ -106,6 +111,148 @@ impl CaptureGain {
         for (sample, cleaned) in frame.iter_mut().zip(self.cleaned.iter()) {
             *sample = cleaned * I16_SCALE;
         }
+    }
+}
+
+/// Builds the live capture APM config bundling the always-on high-pass filter
+/// with the optionally-enabled AEC3, spectral noise suppression, and AGC2
+/// passes. A pass left out of the config is not run, so a well-levelled rig with
+/// echo off and a non-spectral denoise engine pays only for the high-pass
+/// filter and any enabled gain. RNNoise denoising runs outside the APM (see
+/// [`CaptureProcessor::process`]).
+fn capture_apm_config(denoise: DenoiseConfig, echo: bool, max_gain_db: f32) -> ApmConfig {
+    let gain_controller2 = (max_gain_db.is_finite() && max_gain_db > 0.0).then(|| {
+        let max_gain_db = max_gain_db.min(MAX_CAPTURE_GAIN_DB);
+        let default_adaptive = AdaptiveDigital::default();
+        GainController2 {
+            adaptive_digital: Some(AdaptiveDigital {
+                max_gain_db,
+                initial_gain_db: default_adaptive.initial_gain_db.min(max_gain_db),
+                ..default_adaptive
+            }),
+            ..GainController2::default()
+        }
+    });
+    ApmConfig {
+        high_pass_filter: Some(HighPassFilter::default()),
+        echo_canceller: echo.then(Aec3Config::default),
+        noise_suppression: matches!(denoise, DenoiseConfig::Spectral)
+            .then(NoiseSuppression::default),
+        gain_controller2,
+        ..ApmConfig::default()
+    }
+}
+
+/// Consolidated live capture front-end: one sonora WebRTC `AudioProcessing`
+/// instance running the high-pass filter, AEC3, optional spectral noise
+/// suppression, and AGC2 in the canonical WebRTC order in a single pass. With
+/// the [`DenoiseConfig::RnnNoise`] engine, the higher-quality RNNoise denoiser
+/// runs after that pass instead of the APM's spectral suppressor, matching the
+/// historical "denoise last" ordering and supplying the VAD. Processes one 10 ms
+/// mono frame at 48 kHz per call inside the capture worker, never a realtime
+/// callback. AEC and gain toggle at runtime through `apply_config`.
+pub(crate) struct CaptureProcessor {
+    apm: AudioProcessing,
+    denoise: DenoiseConfig,
+    echo_enabled: bool,
+    gain_max_db: f32,
+    rnnoise: Option<Box<DenoiseState<'static>>>,
+    denoised: Vec<f32>,
+    render: Vec<f32>,
+    render_out: Vec<f32>,
+    near: Vec<f32>,
+    cleaned: Vec<f32>,
+}
+
+impl CaptureProcessor {
+    pub(crate) fn new(denoise: DenoiseConfig, max_gain_db: f32, echo_enabled: bool) -> Self {
+        let stream = ApmStreamConfig::new(SAMPLE_RATE, 1);
+        let apm = AudioProcessing::builder()
+            .config(capture_apm_config(denoise, echo_enabled, max_gain_db))
+            .capture_config(stream)
+            .render_config(stream)
+            .build();
+        Self {
+            apm,
+            denoise,
+            echo_enabled,
+            gain_max_db: max_gain_db,
+            rnnoise: matches!(denoise, DenoiseConfig::RnnNoise).then(DenoiseState::new),
+            denoised: vec![0.0; FRAME_SAMPLES],
+            render: vec![0.0; FRAME_SAMPLES],
+            render_out: vec![0.0; FRAME_SAMPLES],
+            near: vec![0.0; FRAME_SAMPLES],
+            cleaned: vec![0.0; FRAME_SAMPLES],
+        }
+    }
+
+    fn rebuild(&mut self) {
+        self.apm.apply_config(capture_apm_config(
+            self.denoise,
+            self.echo_enabled,
+            self.gain_max_db,
+        ));
+    }
+
+    /// Retunes or bypasses the AGC2 gain ceiling when the user's
+    /// `max-amplification` setting changes. A value of `0` drops the gain pass.
+    pub(crate) fn set_max_gain_db(&mut self, max_gain_db: f32) {
+        if max_gain_db != self.gain_max_db {
+            self.gain_max_db = max_gain_db;
+            self.rebuild();
+        }
+    }
+
+    /// Enables or disables the echo canceller when the live AEC toggle changes.
+    pub(crate) fn set_echo_enabled(&mut self, enabled: bool) {
+        if enabled != self.echo_enabled {
+            self.echo_enabled = enabled;
+            self.rebuild();
+        }
+    }
+
+    pub(crate) fn echo_enabled(&self) -> bool {
+        self.echo_enabled
+    }
+
+    /// Processes one `FRAME_SAMPLES` i16-scale capture frame in place. When echo
+    /// cancellation is enabled, `reference` supplies the latest 48 kHz render
+    /// frame to align against. The module works in normalized `[-1.0, 1.0]`, so
+    /// the frame is scaled in and back out. Returns the RNNoise voice-activity
+    /// probability when the RNNoise engine is active, otherwise `None`.
+    pub(crate) fn process(
+        &mut self,
+        frame: &mut [f32],
+        reference: Option<&EchoReference>,
+    ) -> Option<f32> {
+        if frame.len() != FRAME_SAMPLES {
+            return None;
+        }
+        if self.echo_enabled {
+            if let Some(reference) = reference {
+                reference.pull_frame(&mut self.render);
+                let _ = self
+                    .apm
+                    .process_render_f32(&[&self.render], &mut [&mut self.render_out]);
+            }
+        }
+        for (near, sample) in self.near.iter_mut().zip(frame.iter()) {
+            *near = sample / I16_SCALE;
+        }
+        let _ = self
+            .apm
+            .process_capture_f32(&[&self.near], &mut [&mut self.cleaned]);
+        for (sample, cleaned) in frame.iter_mut().zip(self.cleaned.iter()) {
+            *sample = cleaned * I16_SCALE;
+        }
+        // RNNoise runs last on the cleaned i16-scale frame, the same scale it
+        // expects, and yields the VAD probability for the silence gate.
+        if let Some(rnnoise) = self.rnnoise.as_mut() {
+            let vad = rnnoise.process_frame(&mut self.denoised, frame);
+            frame.copy_from_slice(&self.denoised);
+            return Some(vad);
+        }
+        None
     }
 }
 
@@ -317,8 +464,95 @@ pub(crate) fn store_processed_level_stats(stats: &AudioStats, samples: &[f32]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::audio::shared::rms_i16_scale;
     #[allow(unused_imports)]
     use crate::audio::test_support::*;
+
+    #[test]
+    fn consolidated_processor_removes_dc_and_caps_full_scale() {
+        // The always-on high-pass strips a DC bias, and with a positive gain
+        // ceiling the AGC2 limiter keeps the signal inside full scale, all in one
+        // consolidated pass.
+        let mut processor = CaptureProcessor::new(DenoiseConfig::RnnNoise, 8.0, false);
+        let mut frame = vec![0.3 * I16_SCALE; FRAME_SAMPLES];
+        for _ in 0..8 {
+            frame
+                .iter_mut()
+                .for_each(|sample| *sample = 0.3 * I16_SCALE);
+            processor.process(&mut frame, None);
+        }
+        let mean = frame.iter().sum::<f32>() / frame.len() as f32;
+        assert!(mean.abs() < 0.05 * I16_SCALE, "DC not removed: mean={mean}");
+        assert!(
+            frame.iter().all(|sample| sample.abs() <= I16_SCALE + 1.0),
+            "limiter let a sample exceed full scale"
+        );
+    }
+
+    #[test]
+    fn consolidated_processor_attenuates_aligned_echo() {
+        // With echo cancellation enabled the consolidated APM attenuates a
+        // far-end-only echo aligned against the render reference.
+        let reference = EchoReference::new();
+        let mut processor = CaptureProcessor::new(DenoiseConfig::None, 0.0, true);
+        let frames = sample_speech_frames();
+        let gain = 0.5f32;
+        let warmup = 600usize;
+        let measure = 200usize;
+        let mut echo_path = EchoPath::new(4, gain);
+        let mut echo_in = 0.0f32;
+        let mut residual = 0.0f32;
+        for index in 0..warmup + measure {
+            let render = &frames[index % frames.len()];
+            reference.push_frame(render);
+            let mut mic = echo_path.capture(render, &[]);
+            let before = rms_i16_scale(&mic);
+            processor.process(&mut mic, Some(&reference));
+            let after = rms_i16_scale(&mic);
+            if index >= warmup {
+                echo_in += before;
+                residual += after;
+            }
+        }
+        assert!(
+            residual < echo_in * 0.3,
+            "far-end-only echo should be attenuated: echo_in={echo_in:.1}, residual={residual:.1}"
+        );
+    }
+
+    #[test]
+    fn consolidated_processor_preserves_double_talk() {
+        let reference = EchoReference::new();
+        let mut processor = CaptureProcessor::new(DenoiseConfig::None, 0.0, true);
+        let frames = sample_speech_frames();
+        let gain = 0.5f32;
+        let warmup = 600usize;
+        let measure = 200usize;
+        let mut echo_path = EchoPath::new(4, gain);
+        let mut near_in = 0.0f32;
+        let mut near_out = 0.0f32;
+        for index in 0..warmup + measure {
+            let render = &frames[index % frames.len()];
+            let near = &frames[(index + frames.len() / 2) % frames.len()];
+            reference.push_frame(render);
+            let mut mic = echo_path.capture(render, near);
+            let near_only = rms_i16_scale(
+                &near
+                    .iter()
+                    .map(|sample| sample * i16::MAX as f32)
+                    .collect::<Vec<_>>(),
+            );
+            processor.process(&mut mic, Some(&reference));
+            if index >= warmup {
+                near_in += near_only;
+                near_out += rms_i16_scale(&mic);
+            }
+        }
+        assert!(
+            near_out > near_in * 0.4,
+            "near-end speech must survive double talk: near_in={near_in:.1}, near_out={near_out:.1}"
+        );
+    }
 
     #[test]
     fn capture_high_pass_removes_dc_bias() {

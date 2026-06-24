@@ -30,8 +30,8 @@ use crate::{
         errors::format_file_error,
         playback::{LivePlaybackMixer, run_live_decoder_worker},
         shared::{
-            AudioStats, BufferRequest, CALLBACK_QUEUE_CAPACITY, CHANNELS, FRAME_SAMPLES,
-            LIVE_PLAYBACK_COMMAND_CAPACITY, LiveAudioTuning, LiveEncoderProfile,
+            AudioStats, BufferRequest, CALLBACK_QUEUE_CAPACITY, CHANNELS, DenoiseConfig,
+            FRAME_SAMPLES, LIVE_PLAYBACK_COMMAND_CAPACITY, LiveAudioTuning, LiveEncoderProfile,
             LivePlaybackFeedback, LivePlaybackSnapshot, LocalVoiceFrame, PlaybackSnapshot,
             PlaybackStats, PlaybackStreamControl, RemoteVoicePacket, SAMPLE_RATE, StatsSnapshot,
         },
@@ -43,7 +43,7 @@ use crate::{
 pub struct RecordingConfig {
     pub device_index: usize,
     pub bitrate_bps: i32,
-    pub denoise: bool,
+    pub denoise: DenoiseConfig,
     pub max_amplification: f32,
     pub output_path: PathBuf,
     pub buffer_request: BufferRequest,
@@ -53,7 +53,7 @@ pub struct RecordingConfig {
 pub struct LiveCaptureConfig {
     pub input_device_id: Option<String>,
     pub bitrate_bps: i32,
-    pub denoise: bool,
+    pub denoise: DenoiseConfig,
     pub max_amplification: f32,
     pub buffer_request: BufferRequest,
     pub tuning: LiveAudioTuning,
@@ -297,6 +297,12 @@ pub fn start_recording(config: RecordingConfig) -> Result<Recording, String> {
             .nth(config.device_index)
             .ok_or_else(|| "selected input device is no longer available".to_string())?;
         let selection = select_input_config(&device, config.buffer_request)?;
+        if selection.device_rate != SAMPLE_RATE {
+            return Err(format!(
+                "recording requires a 48 kHz input device, this device runs at {} Hz",
+                selection.device_rate
+            ));
+        }
         Ok::<_, String>((device, selection))
     })?;
 
@@ -304,7 +310,11 @@ pub fn start_recording(config: RecordingConfig) -> Result<Recording, String> {
         sample_rate: SAMPLE_RATE,
         frame_samples: FRAME_SAMPLES as u16,
         channels: CHANNELS,
-        flags: if config.denoise { FLAG_DENOISE } else { 0 },
+        flags: if config.denoise.is_enabled() {
+            FLAG_DENOISE
+        } else {
+            0
+        },
         bitrate_bps: config.bitrate_bps as u32,
     };
     let writer = PacketLogWriter::create(&config.output_path, header).map_err(|error| {
@@ -421,7 +431,7 @@ where
         buffer_note = selection.preview.buffer_note.as_str(),
         buffer_fallback = buffer_fallback,
         bitrate_bps = config.bitrate_bps,
-        denoise = config.denoise,
+        denoise = config.denoise.label(),
         max_amplification = config.max_amplification,
         echo_cancellation = config
             .echo_control
@@ -445,6 +455,7 @@ where
             worker_encoder_loss_percent,
             config.tuning,
             echo_source,
+            selection.device_rate,
             worker_stats,
             on_packet,
         );
@@ -531,6 +542,7 @@ pub fn start_live_playback(config: LivePlaybackConfig) -> Result<LivePlayback, S
                 Arc::clone(&mixer),
                 echo_control.clone(),
                 Some(Arc::clone(&observer)),
+                selection.device_rate,
             )
         })
     };

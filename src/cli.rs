@@ -112,7 +112,7 @@ fn run_audio_playback_test(
         packet_loss,
         seed,
         max_amplification: config.audio.max_amplification,
-        denoise: config.audio.denoise,
+        denoise: config.audio.denoise.is_enabled(),
         auto_gain: true,
     })?;
     print_audio_playback_test_report(&report, packet_loss);
