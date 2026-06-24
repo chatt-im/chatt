@@ -2,7 +2,7 @@ use std::{net::SocketAddr, time::Duration};
 
 use crate::{
     Action, AgentConfig, Candidate, CandidateKind, FallbackReason, IceRole, NatClassifier, NatKind,
-    ReflexiveObservation, RestartPortPolicy, StunMessage, TransactionId, TraversalAgent,
+    ReflexiveObservation, RestartPortPolicy, StunAuth, StunMessage, TransactionId, TraversalAgent,
     candidate::port_guess_candidates,
     interfaces::{InterfaceSnapshot, LocalInterface, is_virtual_interface_name},
     socket::is_ignorable_udp_error,
@@ -37,6 +37,10 @@ fn relay() -> Candidate {
     )
 }
 
+fn test_config() -> AgentConfig {
+    AgentConfig::with_auth(StunAuth::new([0u8; 32], [0u8; 32]))
+}
+
 fn fast_config() -> AgentConfig {
     AgentConfig {
         handshake_min_duration: Duration::from_millis(1),
@@ -44,7 +48,7 @@ fn fast_config() -> AgentConfig {
         max_check_attempts: 1,
         port_guess_limit: 4,
         port_guess_max_delta: 4,
-        ..AgentConfig::default()
+        ..test_config()
     }
 }
 
@@ -60,7 +64,7 @@ fn case_01_symmetric_symmetric_deadlock_immediate_relay() {
     let now = at(0);
     let mut agent = TraversalAgent::new(
         now,
-        AgentConfig::default(),
+        test_config(),
         IceRole::Controlling,
         1,
         NatKind::Symmetric,
@@ -90,7 +94,7 @@ fn case_02_symmetric_to_cone_uses_inbound_peer_reflexive_port() {
     let now = at(0);
     let mut cone = TraversalAgent::new(
         now,
-        AgentConfig::default(),
+        test_config(),
         IceRole::Controlled,
         2,
         NatKind::Cone,
@@ -119,7 +123,7 @@ fn case_02_symmetric_to_cone_uses_inbound_peer_reflexive_port() {
         RoleAttribute::Controlling(9),
         true,
     )
-    .encode();
+    .encode(Some(&[0u8; 32]));
     let actions = cone
         .handle_inbound(now, "198.51.100.2:6001".parse().unwrap(), &request)
         .unwrap();
@@ -147,7 +151,7 @@ fn case_04_multilayer_nat_races_host_reflexive_and_relay_candidates() {
     let now = at(0);
     let mut agent = TraversalAgent::new(
         now,
-        AgentConfig::default(),
+        test_config(),
         IceRole::Controlling,
         1,
         NatKind::Unknown,
@@ -195,7 +199,7 @@ fn case_06_no_hairpin_prefers_lan_host_path() {
     let now = at(0);
     let mut agent = TraversalAgent::new(
         now,
-        AgentConfig::default(),
+        test_config(),
         IceRole::Controlling,
         1,
         NatKind::Cone,
@@ -220,7 +224,7 @@ fn case_07_ipv4_ipv6_mismatch_falls_back_to_relay() {
     let now = at(0);
     let mut agent = TraversalAgent::new(
         now,
-        AgentConfig::default(),
+        test_config(),
         IceRole::Controlling,
         1,
         NatKind::Cone,
@@ -259,7 +263,7 @@ fn case_10_connectivity_checks_are_paced_at_middlebox_safe_interval() {
     let now = at(0);
     let mut agent = TraversalAgent::new(
         now,
-        AgentConfig::default(),
+        test_config(),
         IceRole::Controlling,
         1,
         NatKind::Cone,
@@ -280,7 +284,7 @@ fn case_11_dpi_safe_connectivity_checks_are_stun_binding_requests() {
     let now = at(0);
     let mut agent = TraversalAgent::new(
         now,
-        AgentConfig::default(),
+        test_config(),
         IceRole::Controlling,
         1,
         NatKind::Cone,
@@ -363,7 +367,7 @@ fn case_15_valid_handshake_updates_active_source_address() {
     let now = at(0);
     let mut agent = TraversalAgent::new(
         now,
-        AgentConfig::default(),
+        test_config(),
         IceRole::Controlling,
         1,
         NatKind::Cone,
@@ -380,7 +384,8 @@ fn case_15_valid_handshake_updates_active_source_address() {
         Action::SendStun { transaction_id, .. } => transaction_id,
         _ => panic!("expected send stun"),
     };
-    let response = StunMessage::binding_success(tx, "10.0.0.2:5000".parse().unwrap()).encode();
+    let response =
+        StunMessage::binding_success(tx, "10.0.0.2:5000".parse().unwrap()).encode(Some(&[0u8; 32]));
     let actions = agent
         .handle_inbound(now, "198.51.100.2:55003".parse().unwrap(), &response)
         .unwrap();
@@ -431,7 +436,7 @@ fn case_19_glare_uses_tie_breaker_roles() {
     let now = at(0);
     let mut agent = TraversalAgent::new(
         now,
-        AgentConfig::default(),
+        test_config(),
         IceRole::Controlling,
         10,
         NatKind::Cone,
@@ -446,7 +451,7 @@ fn case_19_glare_uses_tie_breaker_roles() {
         RoleAttribute::Controlling(11),
         true,
     )
-    .encode();
+    .encode(Some(&[0u8; 32]));
     let _ = agent.handle_inbound(now, "10.0.0.3:5000".parse().unwrap(), &request);
     assert_eq!(agent.role(), IceRole::Controlled);
 }
@@ -491,7 +496,7 @@ fn case_22_packet_loss_uses_exponential_backoff_retransmits() {
     let now = at(0);
     let mut agent = TraversalAgent::new(
         now,
-        AgentConfig::default(),
+        test_config(),
         IceRole::Controlling,
         1,
         NatKind::Cone,
@@ -533,10 +538,80 @@ fn case_23_port_reuse_timeout_requires_fresh_ephemeral_rebind() {
     );
 }
 
+fn authenticated_agent(now: std::time::Instant, key: [u8; 32]) -> TraversalAgent {
+    let config = AgentConfig::with_auth(StunAuth::new(key, [9u8; 32]));
+    TraversalAgent::new(
+        now,
+        config,
+        IceRole::Controlling,
+        1,
+        NatKind::Cone,
+        NatKind::Cone,
+        vec![candidate(1, CandidateKind::Host, "10.0.0.2:5000")],
+        vec![candidate(
+            2,
+            CandidateKind::ServerReflexive,
+            "198.51.100.2:55000",
+        )],
+    )
+}
+
+#[test]
+fn case_24_forged_binding_success_without_valid_integrity_does_not_select() {
+    let now = at(0);
+    let key = [0x42u8; 32];
+    let mut agent = authenticated_agent(now, key);
+    let tx = match agent.poll(now).pop().unwrap() {
+        Action::SendStun { transaction_id, .. } => transaction_id,
+        other => panic!("expected send stun, got {other:?}"),
+    };
+    let forged_addr: SocketAddr = "203.0.113.9:62000".parse().unwrap();
+
+    // An off-path attacker who guessed the in-flight transaction id forges a
+    // success choosing its own mapped address, but cannot sign with the shared key.
+    let unsigned = StunMessage::binding_success(tx, forged_addr).encode(None);
+    assert!(
+        agent
+            .handle_inbound(now + Duration::from_millis(1), forged_addr, &unsigned)
+            .unwrap()
+            .is_empty()
+    );
+    let wrong_key = StunMessage::binding_success(tx, forged_addr).encode(Some(&[0u8; 32]));
+    assert!(
+        agent
+            .handle_inbound(now + Duration::from_millis(2), forged_addr, &wrong_key)
+            .unwrap()
+            .is_empty()
+    );
+    assert!(agent.selected().is_none());
+}
+
+#[test]
+fn case_25_authenticated_binding_success_selects_legitimate_path() {
+    let now = at(0);
+    let key = [0x42u8; 32];
+    let mut agent = authenticated_agent(now, key);
+    let tx = match agent.poll(now).pop().unwrap() {
+        Action::SendStun { transaction_id, .. } => transaction_id,
+        other => panic!("expected send stun, got {other:?}"),
+    };
+    let mapped: SocketAddr = "10.0.0.2:5000".parse().unwrap();
+    let response = StunMessage::binding_success(tx, mapped).encode(Some(&key));
+    let src: SocketAddr = "198.51.100.2:55003".parse().unwrap();
+    let actions = agent
+        .handle_inbound(now + Duration::from_millis(50), src, &response)
+        .unwrap();
+    assert!(matches!(
+        actions.as_slice(),
+        [Action::DirectReady { selected }] if selected.remote_addr == src
+    ));
+    assert_eq!(agent.selected().map(|pair| pair.remote_addr), Some(src));
+}
+
 fn selected_agent(now: std::time::Instant) -> TraversalAgent {
     let mut agent = TraversalAgent::new(
         now,
-        AgentConfig::default(),
+        test_config(),
         IceRole::Controlling,
         1,
         NatKind::Cone,

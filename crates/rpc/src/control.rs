@@ -266,6 +266,7 @@ pub struct P2pPeerInfo {
     pub candidates: Vec<P2pCandidate>,
     pub send_key: P2pKey,
     pub recv_key: P2pKey,
+    pub stun_key: P2pKey,
     pub connection_id: u64,
 }
 
@@ -619,6 +620,37 @@ mod tests {
         };
         let encoded = encode_client_control(&control).unwrap();
         assert_eq!(decode_client_control(&encoded).unwrap(), control);
+    }
+
+    #[test]
+    fn p2p_peer_info_round_trips() {
+        let control = ServerControl::P2pPeer {
+            peer: P2pPeerInfo {
+                room_id: RoomId(1),
+                session_id: SessionId(2),
+                user_id: UserId(3),
+                generation: 4,
+                role: P2pRole::Controlling,
+                nat: P2pNatKind::Cone,
+                tie_breaker: 99,
+                candidates: vec![],
+                send_key: P2pKey {
+                    id: 1,
+                    bytes: vec![1, 2, 3],
+                },
+                recv_key: P2pKey {
+                    id: 2,
+                    bytes: vec![4, 5, 6],
+                },
+                stun_key: P2pKey {
+                    id: 3,
+                    bytes: vec![7, 8, 9],
+                },
+                connection_id: 77,
+            },
+        };
+        let encoded = encode_server_control(&control);
+        assert_eq!(decode_server_control(&encoded).unwrap(), control);
     }
 
     #[test]

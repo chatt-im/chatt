@@ -16,7 +16,8 @@ pub mod stun;
 mod sim;
 
 pub use agent::{
-    Action, AgentConfig, FallbackReason, IceRole, RestartReason, SelectedPair, TraversalAgent,
+    Action, AgentConfig, FallbackReason, IceRole, RestartReason, SelectedPair, StunAuth,
+    TraversalAgent,
 };
 pub use candidate::{Candidate, CandidateKind, CandidatePairId, NatKind, NetworkFamily};
 pub use nat::{NatClassifier, ReflexiveObservation};
