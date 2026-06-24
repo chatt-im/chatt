@@ -26,7 +26,7 @@ use rpc::{
 
 use crate::{
     bindings::{BindCommand, PendingChord},
-    chat_buffer::{VirtualChatBuffer, VisibleLine},
+    chat_buffer::{LineKind, VirtualChatBuffer, VisibleLine},
     client_net::{NetworkClient, NetworkCommand, NetworkEvent, spawn_pair_once},
     config::{self, Config, SoundboardClip, validate_server_entry},
     local_control,
@@ -700,9 +700,13 @@ impl App {
                 self.chat.scroll_down(5);
             }
             MouseEventKind::Down(MouseButton::Left) => match self.chat_line_at(mouse.row) {
-                Some(pos) if rect_contains(rect, mouse.column, mouse.row) => {
-                    self.chat.begin_selection(pos);
-                }
+                Some(line) if rect_contains(rect, mouse.column, mouse.row) => match line.kind {
+                    LineKind::Heading | LineKind::Ellipsis => {
+                        self.chat.toggle_expand(line.message, self.last_chat_width);
+                        self.chat.clear_selection();
+                    }
+                    LineKind::Body => self.chat.begin_selection((line.message, line.line)),
+                },
                 _ => self.chat.clear_selection(),
             },
             MouseEventKind::Drag(MouseButton::Left) if self.chat.is_selecting() => {
@@ -723,19 +727,37 @@ impl App {
         } else if row >= rect.y.saturating_add(rect.h) {
             self.chat.scroll_down(1);
         }
-        if let Some(pos) =
-            self.chat_line_at(row.clamp(rect.y, rect.y.saturating_add(rect.h).saturating_sub(1)))
+        let clamped = row.clamp(rect.y, rect.y.saturating_add(rect.h).saturating_sub(1));
+        if let Some(line) = self.chat_line_at(clamped)
+            && line.kind == LineKind::Body
         {
-            self.chat.extend_selection(pos);
+            self.chat.extend_selection((line.message, line.line));
         }
     }
 
-    /// Maps a screen `row` to the `(message, line)` it renders, using the
+    /// Maps a screen `row` to the [`VisibleLine`] it renders, using the
     /// top-anchored layout captured during the last render.
-    fn chat_line_at(&self, row: u16) -> Option<(usize, usize)> {
+    fn chat_line_at(&self, row: u16) -> Option<VisibleLine> {
         let index = row.checked_sub(self.last_chat_rect.y)? as usize;
-        let line = self.last_chat_lines.get(index)?;
-        Some((line.message, line.line))
+        self.last_chat_lines.get(index).copied()
+    }
+
+    /// Toggles collapse on the most recent visible collapsible message, scanning
+    /// the captured render rows from the bottom for its heading or ellipsis row.
+    fn toggle_recent_collapsible(&mut self) {
+        let width = self.last_chat_width;
+        let mut target = None;
+        for line in self.last_chat_lines.iter().rev() {
+            if matches!(line.kind, LineKind::Heading | LineKind::Ellipsis)
+                && self.chat.is_collapsible(line.message, width)
+            {
+                target = Some(line.message);
+                break;
+            }
+        }
+        if let Some(message) = target {
+            self.chat.toggle_expand(message, width);
+        }
     }
 
     fn scroll_chat_up(&mut self, rows: usize) {
@@ -1161,6 +1183,7 @@ impl App {
             Top => self.chat.top(self.last_chat_width, self.last_chat_height),
             Bottom => self.chat.bottom(),
             CopySelection => self.copy_chat_selection(),
+            ToggleExpand => self.toggle_recent_collapsible(),
             ToggleMute => self.set_mute(!self.mic_muted.load(Ordering::Relaxed)),
             ToggleDeafen => self.set_deafen(!self.deafened.load(Ordering::Relaxed)),
             RefreshDevices => self.refresh_audio_devices(),
@@ -2496,7 +2519,7 @@ mod tests {
     fn renders_smoke_frame() {
         let mut app = test_app();
         let mut buffer = Buffer::new(80, 24);
-        crate::tui::render(&mut app, &mut buffer);
+        crate::tui::render(&mut app, &mut buffer, 0);
     }
 }
 

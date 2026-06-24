@@ -10,15 +10,15 @@ use chatt::audio::StatsSnapshot;
 
 use crate::{
     app::{App, ParticipantState, ServerSelectItem, StatusKind, volume_db_label},
+    chat_buffer::{self, LineKind},
     theme, ui,
 };
 
-const NAME_COL_WIDTH: u16 = 16;
 const ROOM_SELECTED: Style = Style::DEFAULT
     .with_bg_rgb(0x24, 0x28, 0x30)
     .with_fg_rgb(0xf0, 0xf2, 0xe8);
 
-pub(crate) fn render(app: &mut App, buf: &mut Buffer) {
+pub(crate) fn render(app: &mut App, buf: &mut Buffer, now_ms: u64) {
     buf.rect().with(theme::BACKGROUND).fill(buf);
     buf.hide_cursor();
     let capture = app
@@ -75,7 +75,7 @@ pub(crate) fn render(app: &mut App, buf: &mut Buffer) {
     }
 
     match app.mode {
-        theme::UiMode::Compose | theme::UiMode::Log => draw_chat(screen, app, buf),
+        theme::UiMode::Compose | theme::UiMode::Log => draw_chat(screen, app, buf, now_ms),
         theme::UiMode::Settings | theme::UiMode::ServerSelect | theme::UiMode::ServerEdit => {}
     }
     draw_status(status_area, app, buf, capture.as_ref());
@@ -476,18 +476,19 @@ fn draw_room_title(area: Rect, app: &App, buf: &mut Buffer) {
     );
 }
 
-fn draw_chat(area: Rect, app: &mut App, buf: &mut Buffer) {
+fn draw_chat(area: Rect, app: &mut App, buf: &mut Buffer, now_ms: u64) {
     area.with(theme::BACKGROUND).fill(buf);
     if area.is_empty() {
         return;
     }
-    let name_width = NAME_COL_WIDTH.min(area.w.saturating_sub(1));
-    let body_width = area.w.saturating_sub(name_width).max(1);
-    if body_width != app.last_chat_width {
+    // The leftmost column is a marker gutter (`▟`/`▌`), so content wraps to one
+    // column less than the full chat width.
+    let content_width = area.w.saturating_sub(1).max(1);
+    if content_width != app.last_chat_width {
         // Reflow invalidates the (message, line) coordinates a selection holds.
         app.chat.clear_selection();
     }
-    app.last_chat_width = body_width;
+    app.last_chat_width = content_width;
     app.last_chat_height = area.h;
     app.last_chat_rect = area;
     if app.chat.is_empty() {
@@ -499,51 +500,107 @@ fn draw_chat(area: Rect, app: &mut App, buf: &mut Buffer) {
     }
     let lines = app
         .chat
-        .visible_lines(body_width, area.h, app.config.ui.overscan as usize);
+        .visible_lines(content_width, area.h, app.config.ui.overscan as usize);
     app.last_chat_lines = lines.clone();
     // Content is top-anchored: lines are drawn from the top of `area` and the
     // already-background-filled rows below them stay empty.
     let mut row_area = area;
     for line in lines {
-        let msg = app.chat.message(line.message);
-        let selected = app.chat.is_selected(line.message, line.line);
         let mut row = row_area.take_top(1);
-        let base = if selected {
-            theme::SELECTED_LINE
-        } else if msg.local {
-            theme::LOCAL_LINE
-        } else {
-            theme::BACKGROUND
-        };
-        row.with(base).fill(buf);
-        let name_area = row.take_left(name_width as i32);
-        if line.line == 0 {
-            name_area
-                .with(base.patch(if msg.local {
+        let marker = row.take_left(1);
+        match line.kind {
+            LineKind::Heading => draw_chat_heading(marker, row, app, line.message, now_ms, buf),
+            LineKind::Body => {
+                let msg = app.chat.message(line.message);
+                let selected = app.chat.is_selected(line.message, line.line);
+                let base = if selected {
+                    theme::SELECTED_LINE
+                } else if msg.local {
+                    theme::LOCAL_LINE
+                } else {
+                    theme::BACKGROUND
+                };
+                let accent = if msg.local {
                     theme::GOOD
                 } else {
                     theme::ACCENT
-                }))
-                .with(HAlign::Right)
-                .with(Ellipsis(true))
-                .text(buf, &format!("{} ", msg.sender));
-        } else {
-            name_area
-                .with(base.patch(theme::SUBTLE))
-                .with(HAlign::Right)
-                .text(buf, "│ ");
-        }
-        for seg in app.chat.line(line.message, line.line) {
-            let start = seg.start as usize;
-            let end = seg.end as usize;
-            let text = &msg.body[start..end];
-            let style = base.patch(theme::TEXT).patch(seg.style);
-            let max_width = row.w.saturating_sub(seg.col) as usize;
-            if max_width > 0 {
-                buf.set_stringn(row.x + seg.col, row.y, text, max_width, style);
+                };
+                marker.with(base).fill(buf);
+                marker.with(base.patch(accent)).text(buf, "▌");
+                row.with(base).fill(buf);
+                for seg in app.chat.line(line.message, line.line) {
+                    let start = seg.start as usize;
+                    let end = seg.end as usize;
+                    let text = &msg.body[start..end];
+                    let style = base.patch(theme::TEXT).patch(seg.style);
+                    let max_width = row.w.saturating_sub(seg.col) as usize;
+                    if max_width > 0 {
+                        buf.set_stringn(row.x + seg.col, row.y, text, max_width, style);
+                    }
+                }
+            }
+            LineKind::Ellipsis => {
+                marker.with(theme::BACKGROUND).fill(buf);
+                row.with(theme::BACKGROUND).fill(buf);
+                row.with(theme::SUBTLE)
+                    .with(HAlign::Center)
+                    .text(buf, "...");
             }
         }
     }
+}
+
+/// Draws a block heading: the `▟` marker, then the sender name on the left and
+/// the relative age on the right, both padded one column inside `row`.
+fn draw_chat_heading(
+    marker: Rect,
+    row: Rect,
+    app: &App,
+    message: usize,
+    now_ms: u64,
+    buf: &mut Buffer,
+) {
+    let msg = app.chat.message(message);
+    let base = if msg.local {
+        theme::LOCAL_LINE
+    } else {
+        theme::BACKGROUND
+    };
+    let accent = if msg.local {
+        theme::GOOD
+    } else {
+        theme::ACCENT
+    };
+    marker.with(base).fill(buf);
+    marker.with(base.patch(accent)).text(buf, "▟");
+    row.with(base).fill(buf);
+    let content = row.inset(1, 0);
+    let name = if app.chat.is_collapsed(message) {
+        format!("{} (Collapsed)", msg.sender)
+    } else if app.chat.is_expanded(message) {
+        format!("{} (Expanded)", msg.sender)
+    } else {
+        msg.sender.clone()
+    };
+    content
+        .with(base.patch(accent))
+        .with(Ellipsis(true))
+        .text(buf, &name);
+    let age = chat_age(msg.timestamp_ms, now_ms);
+    if !age.is_empty() {
+        content
+            .with(base.patch(theme::SUBTLE))
+            .with(HAlign::Right)
+            .text(buf, &age);
+    }
+}
+
+/// Formats a message age for the heading. Empty for notices (`timestamp_ms == 0`).
+fn chat_age(timestamp_ms: u64, now_ms: u64) -> String {
+    if timestamp_ms == 0 {
+        return String::new();
+    }
+    chat_buffer::format_age(now_ms.saturating_sub(timestamp_ms))
 }
 
 fn draw_status(area: Rect, app: &App, buf: &mut Buffer, capture: Option<&StatsSnapshot>) {
