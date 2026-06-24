@@ -38,6 +38,13 @@ max-upload-bytes = 52428800
 max-receive-bytes = 52428800
 receive-dir = "/tmp/tchat2"
 
+[p2p]
+# How local host candidates are exposed to peers.
+#   mdns     publish host candidates as random `.local` names resolved via mDNS (default)
+#   disabled publish host candidates as literal IP addresses
+#   no-host  suppress host candidates entirely, relying on reflexive and relay
+candidate-privacy = "mdns"
+
 [bindings.insert]
 "C-c" = "Quit"
 "F2" = "OpenSettings"

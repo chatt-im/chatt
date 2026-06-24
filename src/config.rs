@@ -53,7 +53,7 @@ impl Default for ServerEntry {
 }
 
 impl ServerEntry {
-    pub fn client_config(&self, files: &FileConfig) -> ClientConfig {
+    pub fn client_config(&self, files: &FileConfig, p2p: &P2pConfig) -> ClientConfig {
         ClientConfig {
             tcp_addr: self.tcp_addr.clone(),
             udp_addr: self.effective_udp_addr(),
@@ -66,6 +66,7 @@ impl ServerEntry {
             file_receive_dir: files.receive_dir_path(),
             max_upload_bytes: files.max_upload_bytes,
             max_receive_bytes: files.max_receive_bytes,
+            candidate_privacy: p2p.candidate_privacy,
         }
     }
 
@@ -310,6 +311,32 @@ impl FileConfig {
     }
 }
 
+/// How local host candidates are exposed to peers, mirroring RFC 8828.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Toml)]
+#[toml(FromToml, ToToml, rename_all = "kebab-case")]
+pub enum CandidatePrivacy {
+    /// Publish host candidates as random `.local` names resolved via mDNS.
+    #[default]
+    Mdns,
+    /// Publish host candidates as literal IP addresses.
+    Disabled,
+    /// Suppress host candidates entirely, relying on reflexive and relay.
+    NoHost,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Toml)]
+#[toml(FromToml, ToToml, rename_all = "kebab-case")]
+pub struct P2pConfig {
+    #[toml(default)]
+    pub candidate_privacy: CandidatePrivacy,
+}
+
+impl P2pConfig {
+    pub fn is_default(&self) -> bool {
+        *self == P2pConfig::default()
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Toml)]
 #[toml(FromToml, ToToml, rename_all = "kebab-case")]
 pub struct UserAudioPreference {
@@ -389,6 +416,8 @@ pub struct Config {
     pub ui: UiConfig,
     #[toml(default, style = Header)]
     pub files: FileConfig,
+    #[toml(default, style = Header, ToToml skip_if = P2pConfig::is_default)]
+    pub p2p: P2pConfig,
     #[toml(default, style = Header, ToToml skip_if = Vec::is_empty)]
     pub user_audio: Vec<UserAudioPreference>,
     // Serialized so a save never drops a configured soundboard; an unconfigured

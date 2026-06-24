@@ -688,6 +688,18 @@ impl TraversalAgent {
         self.rebuild_pairs();
     }
 
+    /// Adds a remote candidate discovered after construction and rebuilds the
+    /// pair set. Used by the client integration to feed candidates resolved
+    /// asynchronously (mDNS `.local` host candidates) into the IP-only core.
+    pub fn add_remote_candidate(&mut self, now: Instant, candidate: Candidate) {
+        let _ = now;
+        self.next_candidate_id = self
+            .next_candidate_id
+            .max(candidate.id.wrapping_add(1).max(1));
+        self.remote_candidates.push(candidate);
+        self.rebuild_pairs();
+    }
+
     fn rebuild_pairs(&mut self) {
         let mut existing = self
             .pairs
@@ -915,6 +927,31 @@ mod tests {
                 relay: Some("203.0.113.10:41001".parse().unwrap()),
                 reason: FallbackReason::SymmetricSymmetric,
             }]
+        );
+    }
+
+    #[test]
+    fn add_remote_candidate_rebuilds_pairs() {
+        let now = at(0);
+        let mut agent = TraversalAgent::new(
+            now,
+            test_config(),
+            IceRole::Controlling,
+            10,
+            NatKind::Cone,
+            NatKind::Cone,
+            vec![candidate(1, CandidateKind::Host, "192.168.1.1:5000")],
+            vec![candidate(2, CandidateKind::Host, "192.168.1.2:6000")],
+        );
+        assert_eq!(agent.direct_pair_count(), 1);
+
+        agent.add_remote_candidate(now, candidate(3, CandidateKind::Host, "192.168.1.3:7000"));
+        assert_eq!(agent.direct_pair_count(), 2);
+        assert!(
+            agent
+                .pairs
+                .iter()
+                .all(|pair| matches!(pair.state, PairState::Waiting))
         );
     }
 

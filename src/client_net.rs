@@ -3,7 +3,7 @@ use std::{
     collections::VecDeque,
     fs::{self, File, OpenOptions},
     io::{self, Read, Write},
-    net::{SocketAddr, TcpStream as StdTcpStream, ToSocketAddrs},
+    net::{IpAddr, SocketAddr, TcpStream as StdTcpStream, ToSocketAddrs},
     path::{Path, PathBuf},
     sync::{
         Arc,
@@ -47,10 +47,14 @@ use crate::audio::{
     LiveEncoderProfile, LivePlaybackFeedback, LivePlaybackSink, LocalVoiceFrame, RemoteVoicePacket,
     VoicePayload as AudioVoicePayload,
 };
+use crate::config::CandidatePrivacy;
+use crate::mdns::{MdnsSystem, generate_mdns_name};
 
 const TCP: Token = Token(0);
 const UDP: Token = Token(1);
 const WAKE: Token = Token(2);
+const MDNS_V4: Token = Token(3);
+const MDNS_V6: Token = Token(4);
 const POLL_TIMEOUT: Duration = Duration::from_millis(20);
 const INTERFACE_POLL_INTERVAL: Duration = Duration::from_secs(2);
 /// How long a direct path must stay healthy before the client stops relaying
@@ -98,6 +102,7 @@ pub struct ClientConfig {
     pub file_receive_dir: Option<PathBuf>,
     pub max_upload_bytes: u64,
     pub max_receive_bytes: u64,
+    pub candidate_privacy: crate::config::CandidatePrivacy,
 }
 
 #[derive(Debug)]
@@ -398,6 +403,10 @@ fn run_worker_inner(
         p2p_nat_classifier: NatClassifier::new(),
         p2p_reflexive_addr: None,
         p2p_candidates: Vec::new(),
+        p2p_local_candidates: Vec::new(),
+        candidate_privacy: config.candidate_privacy,
+        mdns: MdnsSystem::bind(),
+        mdns_pending: HashMap::new(),
         p2p_peers: HashMap::new(),
         p2p_stream_owners: HashMap::new(),
         online_others: HashSet::new(),
@@ -433,6 +442,11 @@ fn run_worker_inner(
         .register(&mut worker.udp, UDP, Interest::READABLE)
     {
         return SessionEnd::ConnectFailed(format!("failed to register UDP socket: {error}"));
+    }
+    // mDNS is best effort: a failure to register leaves it inert and host
+    // candidates fall back to reflexive/relay rather than aborting the session.
+    if let Err(error) = worker.mdns.register(poll.registry(), MDNS_V4, MDNS_V6) {
+        kvlog::warn!("failed to register mdns sockets", error = %error);
     }
 
     let auth_control = ClientControl::Authenticate {
@@ -471,6 +485,8 @@ fn run_worker_inner(
                     }
                 }
                 UDP => worker.read_udp(),
+                MDNS_V4 => worker.handle_mdns_readable(MDNS_V4, Instant::now()),
+                MDNS_V6 => worker.handle_mdns_readable(MDNS_V6, Instant::now()),
                 WAKE => {}
                 _ => {}
             }
@@ -501,12 +517,16 @@ fn run_worker_inner(
         }
         worker.poll_p2p(now);
         worker.poll_relay_keepalive(now);
+        worker.poll_mdns(now);
         worker.read_udp();
         poll_timeout = if command_drain == CommandDrainOutcome::HitLimit {
             Duration::ZERO
         } else {
             POLL_TIMEOUT
         };
+        if let Some(deadline) = worker.mdns.next_timeout(now) {
+            poll_timeout = poll_timeout.min(deadline);
+        }
     }
     if let Some(reason) = worker.auth_failure.take() {
         SessionEnd::AuthFailed(reason)
@@ -772,6 +792,24 @@ fn read_blocking_frame(stream: &mut StdTcpStream) -> io::Result<Vec<u8>> {
     Ok(payload)
 }
 
+/// A remote `.local` host candidate awaiting mDNS resolution, keyed by its
+/// lowercased host name. On resolution the address is rebuilt from the resolved
+/// IP and this stored port and fed to the peer's agent.
+struct MdnsPending {
+    session_id: SessionId,
+    control: P2pCandidate,
+    port: u16,
+}
+
+/// The result of gathering local candidates: literal-address candidates for the
+/// IP-only agent, the candidates published to the server (host names rewritten
+/// per privacy mode), and the responder name table.
+struct GatheredP2p {
+    local: Vec<Candidate>,
+    published: Vec<P2pCandidate>,
+    mdns_names: HashMap<String, IpAddr>,
+}
+
 struct WorkerState {
     config: ClientConfig,
     events: Sender<NetworkEvent>,
@@ -797,6 +835,10 @@ struct WorkerState {
     p2p_nat_classifier: NatClassifier,
     p2p_reflexive_addr: Option<SocketAddr>,
     p2p_candidates: Vec<P2pCandidate>,
+    p2p_local_candidates: Vec<Candidate>,
+    candidate_privacy: CandidatePrivacy,
+    mdns: MdnsSystem,
+    mdns_pending: HashMap<String, MdnsPending>,
     p2p_peers: HashMap<SessionId, PeerConnection>,
     p2p_stream_owners: HashMap<StreamId, SessionId>,
     online_others: HashSet<UserId>,
@@ -2137,6 +2179,8 @@ impl WorkerState {
         self.p2p_generation = self.p2p_generation.wrapping_add(1).max(1);
         self.p2p_reflexive_addr = None;
         self.p2p_candidates.clear();
+        self.p2p_local_candidates.clear();
+        self.mdns_pending.clear();
         self.p2p_nat_classifier = NatClassifier::new();
         self.p2p_nat = configured_nat_kind();
         self.udp_rebind_requested = true;
@@ -2241,23 +2285,30 @@ impl WorkerState {
         if self.session_id.is_none() {
             return;
         }
-        let candidates = self.gather_p2p_candidates();
-        self.p2p_candidates = candidates.clone();
+        let gathered = self.gather_p2p_candidates();
+        self.p2p_local_candidates = gathered.local;
+        self.p2p_candidates = gathered.published.clone();
+        self.mdns.publish_names(gathered.mdns_names);
         kvlog::info!(
             "publishing p2p candidates",
             generation = self.p2p_generation,
-            candidate_count = candidates.len()
+            candidate_count = gathered.published.len()
         );
         let _ = self.queue_control(ClientControl::PublishP2p {
             room_id,
             generation: self.p2p_generation,
             nat: self.p2p_nat,
             tie_breaker: self.p2p_tie_breaker,
-            candidates,
+            candidates: gathered.published,
         });
     }
 
-    fn gather_p2p_candidates(&self) -> Vec<P2pCandidate> {
+    /// Builds the local candidate set from interface enumeration and applies the
+    /// configured candidate privacy mode. The returned `local` candidates always
+    /// carry literal addresses for the IP-only agent, while `published` carries
+    /// the rewritten `.local` names (mDNS mode) and `mdns_names` maps each name
+    /// back to the interface address for the responder.
+    fn gather_p2p_candidates(&self) -> GatheredP2p {
         let mut next_id = 1;
         let mut candidates = host_candidates_with_metadata(
             1,
@@ -2308,7 +2359,9 @@ impl WorkerState {
             None,
             true,
         ));
-        candidates.iter().map(control_candidate).collect()
+
+        let rng = ring::rand::SystemRandom::new();
+        apply_candidate_privacy(candidates, self.candidate_privacy, &rng)
     }
 
     fn install_p2p_peer(&mut self, peer: P2pPeerInfo) -> Result<(), String> {
@@ -2320,18 +2373,24 @@ impl WorkerState {
             .fill(&mut transaction_salt)
             .map_err(|_| "failed to generate STUN transaction salt".to_string())?;
         let auth = StunAuth::new(stun_key, transaction_salt);
-        let local_candidates = self
-            .p2p_candidates
-            .iter()
-            .filter_map(candidate_from_control)
-            .collect::<Vec<_>>();
-        let remote_candidates = peer
-            .candidates
-            .iter()
-            .filter_map(candidate_from_control)
-            .collect::<Vec<_>>();
-        if local_candidates.is_empty() || remote_candidates.is_empty() {
-            return Err("missing P2P candidates".to_string());
+        let local_candidates = self.p2p_local_candidates.clone();
+        // Literal-IP remote candidates go straight into the agent. Each `.local`
+        // host candidate is queued for mDNS resolution and added later via
+        // `add_remote_candidate` once its address is known.
+        let mut remote_candidates = Vec::new();
+        let mut pending = Vec::new();
+        for control in &peer.candidates {
+            if let Some(candidate) = candidate_from_control(control) {
+                remote_candidates.push(candidate);
+            } else if let Some((name, port)) = split_mdns_addr(&control.addr) {
+                pending.push((name, control.clone(), port));
+            }
+        }
+        if local_candidates.is_empty() {
+            return Err("missing local P2P candidates".to_string());
+        }
+        if remote_candidates.is_empty() && pending.is_empty() {
+            return Err("missing remote P2P candidates".to_string());
         }
         let config = P2pAgentConfig {
             username: Some(p2p_username(peer.connection_id)),
@@ -2357,8 +2416,9 @@ impl WorkerState {
             connection_id = peer.connection_id,
             direct_pair_count = agent.direct_pair_count()
         );
+        let session_id = peer.session_id;
         self.p2p_peers.insert(
-            peer.session_id,
+            session_id,
             PeerConnection {
                 user_id: peer.user_id,
                 agent,
@@ -2371,7 +2431,44 @@ impl WorkerState {
                 last_direct_inbound: None,
             },
         );
+        let now = Instant::now();
+        for (name, control, port) in pending {
+            self.mdns.start_resolve(&name, now);
+            self.mdns_pending.insert(
+                name,
+                MdnsPending {
+                    session_id,
+                    control,
+                    port,
+                },
+            );
+        }
         Ok(())
+    }
+
+    /// Drains resolved mDNS answers on the given socket, feeding each one into
+    /// the matching peer's agent. Also answers inbound queries for local names.
+    fn handle_mdns_readable(&mut self, token: Token, now: Instant) {
+        let resolved = self.mdns.handle_readable(token, now);
+        for (name, ip) in resolved {
+            let Some(pending) = self.mdns_pending.remove(&name) else {
+                continue;
+            };
+            let addr = SocketAddr::new(ip, pending.port);
+            let candidate = candidate_from_control_with_addr(&pending.control, addr);
+            let Some(peer) = self.p2p_peers.get_mut(&pending.session_id) else {
+                continue;
+            };
+            kvlog::info!("p2p mdns candidate resolved", name = name.as_str(), addr = %addr);
+            peer.agent.add_remote_candidate(now, candidate);
+        }
+    }
+
+    /// Drops mDNS queries that exceeded the resolution timeout.
+    fn poll_mdns(&mut self, now: Instant) {
+        for name in self.mdns.handle_timeout(now) {
+            self.mdns_pending.remove(&name);
+        }
     }
 
     fn poll_p2p(&mut self, now: Instant) {
@@ -3064,6 +3161,47 @@ fn configured_nat_kind() -> P2pNatKind {
     }
 }
 
+/// Applies the candidate privacy mode to a set of local candidates, producing
+/// the literal-address set for the agent and the published set for the server.
+/// Only host candidates are affected: `Mdns` replaces each host address with a
+/// random `.local` name, `NoHost` drops host candidates, and `Disabled` keeps
+/// literal addresses.
+fn apply_candidate_privacy(
+    candidates: Vec<Candidate>,
+    mode: CandidatePrivacy,
+    rng: &dyn SecureRandom,
+) -> GatheredP2p {
+    let mut local = Vec::with_capacity(candidates.len());
+    let mut published = Vec::with_capacity(candidates.len());
+    let mut mdns_names = HashMap::new();
+    for candidate in candidates {
+        if candidate.kind == CandidateKind::Host {
+            match mode {
+                CandidatePrivacy::NoHost => continue,
+                CandidatePrivacy::Disabled => {}
+                CandidatePrivacy::Mdns => {
+                    if let Some(name) = generate_mdns_name(rng) {
+                        let mut control = control_candidate(&candidate);
+                        control.addr = format!("{}:{}", name, candidate.addr.port());
+                        mdns_names.insert(name, candidate.addr.ip());
+                        published.push(control);
+                        local.push(candidate);
+                        continue;
+                    }
+                    kvlog::warn!("mdns name generation failed; publishing literal host");
+                }
+            }
+        }
+        published.push(control_candidate(&candidate));
+        local.push(candidate);
+    }
+    GatheredP2p {
+        local,
+        published,
+        mdns_names,
+    }
+}
+
 fn control_candidate(candidate: &Candidate) -> P2pCandidate {
     P2pCandidate {
         id: candidate.id,
@@ -3079,6 +3217,12 @@ fn control_candidate(candidate: &Candidate) -> P2pCandidate {
 
 fn candidate_from_control(candidate: &P2pCandidate) -> Option<Candidate> {
     let addr = candidate.addr.parse().ok()?;
+    Some(candidate_from_control_with_addr(candidate, addr))
+}
+
+/// Builds a [`Candidate`] from control metadata with an externally resolved
+/// address, used when an mDNS `.local` candidate's address becomes known.
+fn candidate_from_control_with_addr(candidate: &P2pCandidate, addr: SocketAddr) -> Candidate {
     let mut out = Candidate::new(
         candidate.id,
         candidate_kind_from_control(candidate.kind),
@@ -3089,7 +3233,19 @@ fn candidate_from_control(candidate: &P2pCandidate) -> Option<Candidate> {
     out.priority = candidate.priority;
     out.foundation = candidate.foundation.clone();
     out.verified = candidate.verified;
-    Some(out)
+    out
+}
+
+/// Splits a `{token}.local:{port}` candidate address into its lowercased host
+/// name and port, returning `None` for any address that is not a valid single
+/// label `.local` mDNS name.
+fn split_mdns_addr(addr: &str) -> Option<(String, u16)> {
+    let (host, port) = addr.rsplit_once(':')?;
+    let port = port.parse::<u16>().ok()?;
+    if !rpc::control::is_valid_mdns_candidate_name(host) {
+        return None;
+    }
+    Some((host.to_ascii_lowercase(), port))
 }
 
 fn control_candidate_kind(kind: CandidateKind) -> P2pCandidateKind {
@@ -3159,6 +3315,110 @@ mod tests {
 
     fn user(id: u32) -> UserId {
         UserId(id)
+    }
+
+    fn cand(id: u32, kind: CandidateKind, addr: &str) -> Candidate {
+        Candidate::with_metadata(id, 1, 0, kind, addr.parse().unwrap(), None, true)
+    }
+
+    fn ctrl(addr: &str, kind: P2pCandidateKind) -> P2pCandidate {
+        P2pCandidate {
+            id: 1,
+            socket_id: 1,
+            generation: 0,
+            kind,
+            addr: addr.to_string(),
+            priority: 1,
+            foundation: "host-udp4".to_string(),
+            verified: true,
+        }
+    }
+
+    fn is_private_ip(ip: IpAddr) -> bool {
+        match ip {
+            IpAddr::V4(v4) => v4.is_private(),
+            IpAddr::V6(v6) => (v6.octets()[0] & 0xfe) == 0xfc,
+        }
+    }
+
+    #[test]
+    fn mdns_mode_publishes_no_private_literal() {
+        let rng = ring::rand::SystemRandom::new();
+        let candidates = vec![
+            cand(1, CandidateKind::Host, "192.168.1.50:5000"),
+            cand(2, CandidateKind::ServerReflexive, "198.51.100.7:6000"),
+            cand(3, CandidateKind::Relay, "203.0.113.9:7000"),
+        ];
+        let gathered = apply_candidate_privacy(candidates, CandidatePrivacy::Mdns, &rng);
+
+        assert_eq!(gathered.mdns_names.len(), 1);
+        assert!(
+            gathered
+                .mdns_names
+                .values()
+                .any(|ip| *ip == "192.168.1.50".parse::<IpAddr>().unwrap())
+        );
+        for candidate in &gathered.published {
+            if let Ok(addr) = candidate.addr.parse::<SocketAddr>() {
+                assert!(!is_private_ip(addr.ip()), "leaked private literal {addr}");
+            }
+        }
+        assert!(
+            gathered
+                .local
+                .iter()
+                .any(|candidate| candidate.addr.to_string() == "192.168.1.50:5000")
+        );
+    }
+
+    #[test]
+    fn no_host_mode_drops_host_candidates() {
+        let rng = ring::rand::SystemRandom::new();
+        let candidates = vec![
+            cand(1, CandidateKind::Host, "192.168.1.50:5000"),
+            cand(2, CandidateKind::Relay, "203.0.113.9:7000"),
+        ];
+        let gathered = apply_candidate_privacy(candidates, CandidatePrivacy::NoHost, &rng);
+        assert!(
+            gathered
+                .published
+                .iter()
+                .all(|candidate| candidate.kind != P2pCandidateKind::Host)
+        );
+        assert!(
+            gathered
+                .local
+                .iter()
+                .all(|candidate| candidate.kind != CandidateKind::Host)
+        );
+        assert!(gathered.mdns_names.is_empty());
+    }
+
+    #[test]
+    fn disabled_mode_publishes_literal_host() {
+        let rng = ring::rand::SystemRandom::new();
+        let candidates = vec![cand(1, CandidateKind::Host, "192.168.1.50:5000")];
+        let gathered = apply_candidate_privacy(candidates, CandidatePrivacy::Disabled, &rng);
+        assert_eq!(gathered.published[0].addr, "192.168.1.50:5000");
+        assert!(gathered.mdns_names.is_empty());
+    }
+
+    #[test]
+    fn mdns_remote_candidate_is_split_for_resolution() {
+        // A `.local` candidate does not parse to a literal address and is routed
+        // to mDNS resolution, while literal candidates are taken directly.
+        assert!(
+            candidate_from_control(&ctrl("abc123.local:5000", P2pCandidateKind::Host)).is_none()
+        );
+        assert_eq!(
+            split_mdns_addr("abc123.local:5000"),
+            Some(("abc123.local".to_string(), 5000))
+        );
+        assert_eq!(split_mdns_addr("203.0.113.1:5000"), None);
+        assert!(
+            candidate_from_control(&ctrl("203.0.113.1:5000", P2pCandidateKind::ServerReflexive))
+                .is_some()
+        );
     }
 
     #[test]

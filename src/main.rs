@@ -17,6 +17,7 @@ mod ui;
 use mimalloc::MiMalloc;
 
 pub(crate) use chatt::audio;
+pub(crate) use chatt::mdns;
 
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
