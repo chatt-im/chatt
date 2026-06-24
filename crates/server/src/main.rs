@@ -1672,6 +1672,7 @@ impl Server {
             candidates: peer_p2p.candidates.clone(),
             send_key: p2p_key(send_key),
             recv_key: p2p_key(recv_key),
+            stun_key: p2p_key(&link.stun_key),
             connection_id: link.connection_id,
         })
     }
@@ -1683,6 +1684,7 @@ impl Server {
             connection_id,
             low_to_high: random_key(&self.rng)?,
             high_to_low: random_key(&self.rng)?,
+            stun_key: random_key(&self.rng)?,
         })
     }
 
@@ -2230,6 +2232,7 @@ struct PeerLink {
     connection_id: u64,
     low_to_high: KeyMaterial,
     high_to_low: KeyMaterial,
+    stun_key: KeyMaterial,
 }
 
 struct InviteState {

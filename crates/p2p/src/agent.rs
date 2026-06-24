@@ -35,8 +35,38 @@ impl IceRole {
     }
 }
 
+/// STUN authentication material for one agent.
+///
+/// A value can only be built from explicit key bytes, so an agent cannot be
+/// constructed with missing or implicitly-zero credentials. The fields are
+/// private and the [`Debug`] impl redacts them to keep key material out of logs.
+#[derive(Clone)]
+pub struct StunAuth {
+    key: [u8; 32],
+    transaction_salt: [u8; 32],
+}
+
+impl StunAuth {
+    /// Builds authentication from the shared per-pair `key` and a per-agent
+    /// `transaction_salt`.
+    pub fn new(key: [u8; 32], transaction_salt: [u8; 32]) -> Self {
+        Self {
+            key,
+            transaction_salt,
+        }
+    }
+}
+
+impl std::fmt::Debug for StunAuth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("StunAuth(..)")
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct AgentConfig {
+    /// Required STUN authentication. No default exists, so every agent is keyed.
+    pub auth: StunAuth,
     pub username: Option<String>,
     pub min_check_interval: Duration,
     pub handshake_min_duration: Duration,
@@ -51,9 +81,11 @@ pub struct AgentConfig {
     pub max_check_attempts: u8,
 }
 
-impl Default for AgentConfig {
-    fn default() -> Self {
+impl AgentConfig {
+    /// Tuning defaults paired with the required STUN authentication.
+    pub fn with_auth(auth: StunAuth) -> Self {
         Self {
+            auth,
             username: None,
             min_check_interval: DEFAULT_MIN_CHECK_INTERVAL,
             handshake_min_duration: DEFAULT_HANDSHAKE_MIN_DURATION,
@@ -305,7 +337,15 @@ impl TraversalAgent {
         src: SocketAddr,
         bytes: &[u8],
     ) -> Result<Vec<Action>, StunError> {
-        let message = StunMessage::decode(bytes)?;
+        // Verify integrity before the packet can influence any agent state. A
+        // forged or unsigned message is dropped as a no-op, like a non-matching
+        // packet. Structural decode errors still propagate to the caller.
+        let message = match StunMessage::decode_and_verify(bytes, &self.config.auth.key) {
+            Ok(message) => message,
+            Err(StunError::IntegrityFailure) => return Ok(Vec::new()),
+            Err(error) => return Err(error),
+        };
+        // Redundant secondary filter: the username is not a secret, integrity is.
         if message.class == MessageClass::Request
             && !self.accepts_username(message.username.as_deref())
         {
@@ -320,7 +360,8 @@ impl TraversalAgent {
             MessageClass::Request => {
                 self.peer_reflexive_seen = true;
                 let selected = self.select_peer_reflexive(src);
-                let response = StunMessage::binding_success(message.transaction_id, src).encode();
+                let response = StunMessage::binding_success(message.transaction_id, src)
+                    .encode(Some(&self.config.auth.key));
                 let mut actions = vec![Action::SendStunResponse {
                     to: src,
                     bytes: response,
@@ -403,7 +444,7 @@ impl TraversalAgent {
                 self.role_attribute(),
                 false,
             )
-            .encode();
+            .encode(Some(&self.config.auth.key));
             actions.push(Action::SendKeepalive {
                 to: selected.remote_addr,
                 bytes,
@@ -462,7 +503,7 @@ impl TraversalAgent {
             self.role_attribute(),
             self.role.is_controlling(),
         )
-        .encode();
+        .encode(Some(&self.config.auth.key));
 
         let pair = &mut self.pairs[pair_index];
         pair.state = PairState::InProgress;
@@ -669,7 +710,8 @@ impl TraversalAgent {
     }
 
     fn next_transaction_id(&mut self) -> TransactionId {
-        let id = TransactionId::from_counter(self.transaction_counter);
+        let id =
+            TransactionId::from_salt(&self.config.auth.transaction_salt, self.transaction_counter);
         self.transaction_counter = self.transaction_counter.wrapping_add(1).max(1);
         id
     }
@@ -684,20 +726,18 @@ mod tests {
         Instant::now() + Duration::from_millis(ms)
     }
 
+    fn test_config() -> AgentConfig {
+        AgentConfig::with_auth(StunAuth::new([0u8; 32], [0u8; 32]))
+    }
+
     fn fast_config() -> AgentConfig {
         AgentConfig {
-            username: None,
-            min_check_interval: Duration::from_millis(25),
             handshake_min_duration: Duration::from_millis(1),
             check_deadline: Duration::from_millis(1),
-            initial_rto: Duration::from_millis(100),
-            max_rto: Duration::from_millis(800),
-            keepalive_interval: Duration::from_secs(10),
-            restart_after_idle: Duration::from_secs(5),
-            disconnect_after_idle: Duration::from_secs(15),
             port_guess_limit: 4,
             port_guess_max_delta: 4,
             max_check_attempts: 1,
+            ..test_config()
         }
     }
 
@@ -724,7 +764,7 @@ mod tests {
         let now = at(0);
         let mut agent = TraversalAgent::new(
             now,
-            AgentConfig::default(),
+            test_config(),
             IceRole::Controlling,
             10,
             NatKind::Symmetric,
@@ -754,7 +794,7 @@ mod tests {
         let now = at(0);
         let mut cone = TraversalAgent::new(
             now,
-            AgentConfig::default(),
+            test_config(),
             IceRole::Controlled,
             5,
             NatKind::Cone,
@@ -779,7 +819,7 @@ mod tests {
             RoleAttribute::Controlling(9),
             true,
         )
-        .encode();
+        .encode(Some(&[0u8; 32]));
         let actions = cone
             .handle_inbound(
                 now + Duration::from_millis(10),
@@ -806,7 +846,7 @@ mod tests {
         let now = at(0);
         let mut agent = TraversalAgent::new(
             now,
-            AgentConfig::default(),
+            test_config(),
             IceRole::Controlling,
             10,
             NatKind::Cone,
@@ -833,7 +873,7 @@ mod tests {
         let now = at(0);
         let mut agent = TraversalAgent::new(
             now,
-            AgentConfig::default(),
+            test_config(),
             IceRole::Controlling,
             10,
             NatKind::Cone,
@@ -859,7 +899,7 @@ mod tests {
         let now = at(0);
         let mut agent = TraversalAgent::new(
             now,
-            AgentConfig::default(),
+            test_config(),
             IceRole::Controlling,
             10,
             NatKind::Cone,
@@ -884,7 +924,7 @@ mod tests {
         let now = at(0);
         let mut agent = TraversalAgent::new(
             now,
-            AgentConfig::default(),
+            test_config(),
             IceRole::Controlling,
             10,
             NatKind::Cone,
@@ -956,7 +996,7 @@ mod tests {
         let now = at(0);
         let mut agent = TraversalAgent::new(
             now,
-            AgentConfig::default(),
+            test_config(),
             IceRole::Controlling,
             10,
             NatKind::Cone,
@@ -975,7 +1015,7 @@ mod tests {
         };
         let response =
             StunMessage::binding_success(transaction_id, "198.51.100.1:40000".parse().unwrap())
-                .encode();
+                .encode(Some(&[0u8; 32]));
         let actions = agent
             .handle_inbound(
                 now + Duration::from_millis(50),
@@ -1001,7 +1041,7 @@ mod tests {
         let now = at(0);
         let config = AgentConfig {
             username: Some("chatt-p2p:77".to_string()),
-            ..AgentConfig::default()
+            ..test_config()
         };
         let mut agent = TraversalAgent::new(
             now,
@@ -1021,7 +1061,7 @@ mod tests {
             RoleAttribute::Controlled(9),
             true,
         )
-        .encode();
+        .encode(Some(&[0u8; 32]));
         assert!(
             agent
                 .handle_inbound(now, "10.0.0.3:5001".parse().unwrap(), &wrong_request)
@@ -1035,7 +1075,8 @@ mod tests {
             _ => panic!("expected STUN check"),
         };
         let response =
-            StunMessage::binding_success(transaction_id, "10.0.0.2:5000".parse().unwrap()).encode();
+            StunMessage::binding_success(transaction_id, "10.0.0.2:5000".parse().unwrap())
+                .encode(Some(&[0u8; 32]));
         let actions = agent
             .handle_inbound(
                 now + Duration::from_millis(50),
@@ -1051,7 +1092,7 @@ mod tests {
         let now = at(0);
         let mut agent = TraversalAgent::new(
             now,
-            AgentConfig::default(),
+            test_config(),
             IceRole::Controlling,
             10,
             NatKind::Cone,
@@ -1083,7 +1124,7 @@ mod tests {
         let now = at(0);
         let mut agent = TraversalAgent::new(
             now,
-            AgentConfig::default(),
+            test_config(),
             IceRole::Controlling,
             10,
             NatKind::Cone,
@@ -1110,7 +1151,7 @@ mod tests {
         let now = at(0);
         let mut agent = TraversalAgent::new(
             now,
-            AgentConfig::default(),
+            test_config(),
             IceRole::Controlling,
             10,
             NatKind::Cone,
@@ -1125,7 +1166,7 @@ mod tests {
             RoleAttribute::Controlling(11),
             true,
         )
-        .encode();
+        .encode(Some(&[0u8; 32]));
 
         let _ = agent
             .handle_inbound(now, "10.0.0.3:5001".parse().unwrap(), &request)

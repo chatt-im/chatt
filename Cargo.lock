@@ -253,6 +253,7 @@ name = "chatt-p2p"
 version = "0.1.0"
 dependencies = [
  "libc",
+ "rpc",
 ]
 
 [[package]]

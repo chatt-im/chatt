@@ -1,6 +1,6 @@
 use ring::{
     aead::{self, Aad, CHACHA20_POLY1305, LessSafeKey, Nonce, UnboundKey},
-    agreement, digest, hkdf, rand,
+    agreement, digest, hkdf, hmac, rand,
     signature::{self, KeyPair},
 };
 
@@ -626,6 +626,28 @@ pub fn open_with_key(
     Ok((counter, plaintext.to_vec()))
 }
 
+/// Computes the STUN `MESSAGE-INTEGRITY-SHA256` value for a message prefix.
+///
+/// `key` is the shared per-pair STUN key and `message_prefix` is the STUN
+/// message up to but excluding the integrity attribute, with the header length
+/// already adjusted per RFC 8489 §14.6. The full 32-byte HMAC-SHA256 output is
+/// returned.
+pub fn stun_integrity(key: &[u8], message_prefix: &[u8]) -> [u8; 32] {
+    let signing_key = hmac::Key::new(hmac::HMAC_SHA256, key);
+    let tag = hmac::sign(&signing_key, message_prefix);
+    let mut out = [0u8; 32];
+    out.copy_from_slice(tag.as_ref());
+    out
+}
+
+/// Verifies a STUN `MESSAGE-INTEGRITY-SHA256` value in constant time.
+///
+/// Returns `true` when `tag` is the HMAC-SHA256 of `message_prefix` under `key`.
+pub fn stun_verify(key: &[u8], message_prefix: &[u8], tag: &[u8]) -> bool {
+    let verify_key = hmac::Key::new(hmac::HMAC_SHA256, key);
+    hmac::verify(&verify_key, message_prefix, tag).is_ok()
+}
+
 fn transport_aad(channel: u8, header: &[u8]) -> Vec<u8> {
     let mut aad = Vec::with_capacity(1 + header.len());
     aad.push(channel);
@@ -792,6 +814,14 @@ mod tests {
         for i in (65_536 - 10 * REPLAY_WINDOW_SIZE)..65_535 {
             assert!(!replay.check(i));
         }
+    }
+
+    #[test]
+    fn stun_integrity_matches_known_vector() {
+        // RFC 4231 test case 1: key = 20 bytes of 0x0b, data = "Hi There".
+        let key = [0x0bu8; 20];
+        let expected = "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7";
+        assert_eq!(encode_hex(&stun_integrity(&key, b"Hi There")), expected);
     }
 
     #[test]

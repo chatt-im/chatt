@@ -15,7 +15,7 @@ use std::{
 
 use chatt_p2p::{
     Action as P2pAction, AgentConfig as P2pAgentConfig, Candidate, CandidateKind, IceRole,
-    NatClassifier, NatKind, ReflexiveObservation, RestartPortPolicy, TraversalAgent,
+    NatClassifier, NatKind, ReflexiveObservation, RestartPortPolicy, StunAuth, TraversalAgent,
     interfaces::{InterfaceSnapshot, host_candidates_with_metadata},
     socket::{UdpSocketOptions, bind_udp_socket, is_ignorable_udp_error},
     stun::{StunMessage, is_stun_message},
@@ -2309,6 +2309,12 @@ impl WorkerState {
     fn install_p2p_peer(&mut self, peer: P2pPeerInfo) -> Result<(), String> {
         let send_key = key_from_control(&peer.send_key)?;
         let recv_key = key_from_control(&peer.recv_key)?;
+        let stun_key = key_from_control(&peer.stun_key)?.bytes;
+        let mut transaction_salt = [0u8; 32];
+        ring::rand::SystemRandom::new()
+            .fill(&mut transaction_salt)
+            .map_err(|_| "failed to generate STUN transaction salt".to_string())?;
+        let auth = StunAuth::new(stun_key, transaction_salt);
         let local_candidates = self
             .p2p_candidates
             .iter()
@@ -2325,7 +2331,7 @@ impl WorkerState {
         let config = P2pAgentConfig {
             username: Some(p2p_username(peer.connection_id)),
             keepalive_interval: P2P_KEEPALIVE_INTERVAL,
-            ..P2pAgentConfig::default()
+            ..P2pAgentConfig::with_auth(auth)
         };
         let agent = TraversalAgent::new(
             Instant::now(),
@@ -2428,6 +2434,11 @@ impl WorkerState {
     }
 
     fn handle_p2p_stun(&mut self, now: Instant, src: SocketAddr, packet: &[u8]) {
+        // Two-step contract: route by the unverified USERNAME, then reject by
+        // verified integrity. The username is not a secret, so it only picks the
+        // candidate agent. That agent's `handle_inbound` recomputes the per-pair
+        // HMAC and drops forgeries, bounding the cost of a spoofed username to one
+        // HMAC check per datagram.
         let username = StunMessage::decode(packet)
             .ok()
             .and_then(|message| message.username);
