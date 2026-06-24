@@ -352,6 +352,34 @@ where
     jsony::from_binary(bytes).map_err(|error| error.to_string())
 }
 
+/// Whether a published P2P candidate address is acceptable: either a literal
+/// `ip:port` socket address or an `{token}.local:port` mDNS host name.
+fn is_valid_candidate_addr(addr: &str) -> bool {
+    if addr.parse::<std::net::SocketAddr>().is_ok() {
+        return true;
+    }
+    let Some((host, port)) = addr.rsplit_once(':') else {
+        return false;
+    };
+    port.parse::<u16>().is_ok() && is_valid_mdns_candidate_name(host)
+}
+
+/// Whether a host name is a single-label `.local` mDNS candidate name, matching
+/// the WebRTC mDNS-ICE filter (one dot, `.local` suffix, alphanumeric label).
+pub fn is_valid_mdns_candidate_name(name: &str) -> bool {
+    let trimmed = name.trim_end_matches('.');
+    if trimmed.len() > 80 || trimmed.matches('.').count() != 1 {
+        return false;
+    }
+    let Some(label) = trimmed.strip_suffix(".local") else {
+        return false;
+    };
+    !label.is_empty()
+        && label
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+}
+
 fn validate_client_control(value: &ClientControl) -> Result<(), String> {
     match value {
         ClientControl::Authenticate {
@@ -401,7 +429,7 @@ fn validate_client_control(value: &ClientControl) -> Result<(), String> {
                 return Err("too many P2P candidates".to_string());
             }
             for candidate in candidates {
-                if candidate.addr.parse::<std::net::SocketAddr>().is_err() {
+                if !is_valid_candidate_addr(&candidate.addr) {
                     return Err("P2P candidate address is invalid".to_string());
                 }
             }
@@ -589,6 +617,20 @@ fn validate_file_name(name: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn accepts_socket_addr_and_mdns_candidate_addrs() {
+        assert!(is_valid_candidate_addr("192.168.1.2:5000"));
+        assert!(is_valid_candidate_addr("[fe80::1]:5000"));
+        assert!(is_valid_candidate_addr("abc123.local:5000"));
+        // Rejects multi-label names, missing port, and non-.local hosts.
+        assert!(!is_valid_candidate_addr("sub.token.local:5000"));
+        assert!(!is_valid_candidate_addr("token.local"));
+        assert!(!is_valid_candidate_addr("router.lan:5000"));
+        assert!(!is_valid_candidate_addr("token.local:notaport"));
+        assert!(!is_valid_mdns_candidate_name(".local"));
+        assert!(!is_valid_mdns_candidate_name("under_score.local"));
+    }
 
     #[test]
     fn client_control_round_trips() {

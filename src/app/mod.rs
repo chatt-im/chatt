@@ -333,7 +333,7 @@ impl App {
         };
         self.disconnect_network();
         let network = match NetworkClient::spawn(
-            server.client_config(&self.config.files),
+            server.client_config(&self.config.files, &self.config.p2p),
             self.event_tx.clone(),
         ) {
             Ok(network) => network,
@@ -400,7 +400,7 @@ impl App {
             return;
         }
         spawn_pair_once(
-            server.client_config(&self.config.files),
+            server.client_config(&self.config.files, &self.config.p2p),
             ticket.pairing_code,
             self.event_tx.clone(),
         );
