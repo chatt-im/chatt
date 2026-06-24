@@ -367,7 +367,13 @@ impl AdaptivePlaybackStream {
             .is_some_and(|source| source != DecodedFrameSource::Normal)
             && !self.front_is_passive_audio();
         if let Some(playout_delay) = self.input.front_playout_delay(now) {
-            self.run_arrival_delay_decision(playout_delay, target, now, stats, active_recovery_front);
+            self.run_arrival_delay_decision(
+                playout_delay,
+                target,
+                now,
+                stats,
+                active_recovery_front,
+            );
             return;
         }
         self.run_queue_depth_fallback_decision(
