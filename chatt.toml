@@ -124,6 +124,7 @@ prefer-ipv6 = true
 "ENTER" = "Activate"
 "r" = "RefreshDevices"
 "w" = "SaveSettings"
+"C-s" = "SaveSettings"
 
 [bindings.dialog]
 "C-c" = "Quit"

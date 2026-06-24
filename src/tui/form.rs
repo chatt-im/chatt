@@ -287,6 +287,34 @@ impl<F: Copy + Eq> FormState<F> {
         self.set_focus(self.order[next])
     }
 
+    /// Returns the focusable field reached by moving `delta` positions
+    /// horizontally within the focused field's row, or `None` when the row
+    /// holds a single field. Fields registered on one [`FormRow`] share a
+    /// `virtual_y`, and `order` preserves their left-to-right registration.
+    fn horizontal_target(&self, delta: isize) -> Option<F> {
+        let row_y = self
+            .fields
+            .iter()
+            .find(|entry| entry.field == self.focus)?
+            .virtual_y;
+        let mut row = Vec::new();
+        for field in &self.order {
+            let on_row = self
+                .fields
+                .iter()
+                .any(|entry| entry.field == *field && entry.virtual_y == row_y);
+            if on_row {
+                row.push(*field);
+            }
+        }
+        if row.len() <= 1 {
+            return None;
+        }
+        let position = row.iter().position(|field| *field == self.focus)?;
+        let next = (position as isize + delta).rem_euclid(row.len() as isize) as usize;
+        Some(row[next])
+    }
+
     pub(crate) fn focus_text(
         &mut self,
         field: F,
@@ -453,9 +481,21 @@ impl<F: Copy + Eq> FormState<F> {
                 };
             }
             KeyCode::Left if focused_kind != FormFieldKind::Text => {
+                if let Some(target) = self.horizontal_target(-1) {
+                    return FormEvent {
+                        commit: self.set_focus(target),
+                        action: FormAction::FocusMoved,
+                    };
+                }
                 return FormEvent::action(FormAction::Adjust(-1));
             }
             KeyCode::Right if focused_kind != FormFieldKind::Text => {
+                if let Some(target) = self.horizontal_target(1) {
+                    return FormEvent {
+                        commit: self.set_focus(target),
+                        action: FormAction::FocusMoved,
+                    };
+                }
                 return FormEvent::action(FormAction::Adjust(1));
             }
             _ => {}
@@ -539,8 +579,20 @@ impl<F: Copy + Eq> FormState<F> {
                 commit: self.move_focus(-1),
                 action: FormAction::FocusMoved,
             },
-            KeyCode::Left | KeyCode::Char('h') => FormEvent::action(FormAction::Adjust(-1)),
-            KeyCode::Right | KeyCode::Char('l') => FormEvent::action(FormAction::Adjust(1)),
+            KeyCode::Left | KeyCode::Char('h') => match self.horizontal_target(-1) {
+                Some(target) => FormEvent {
+                    commit: self.set_focus(target),
+                    action: FormAction::FocusMoved,
+                },
+                None => FormEvent::action(FormAction::Adjust(-1)),
+            },
+            KeyCode::Right | KeyCode::Char('l') => match self.horizontal_target(1) {
+                Some(target) => FormEvent {
+                    commit: self.set_focus(target),
+                    action: FormAction::FocusMoved,
+                },
+                None => FormEvent::action(FormAction::Adjust(1)),
+            },
             KeyCode::Enter | KeyCode::Char('i') => FormEvent::action(FormAction::Activate),
             _ => FormEvent::action(FormAction::None),
         }
@@ -675,6 +727,107 @@ mod tests {
         let event = form.handle_key(key(KeyCode::Down), FormFieldKind::Choice);
         assert_eq!(event.action, FormAction::FocusMoved);
         assert_eq!(form.focus(), Field::Two);
+    }
+
+    #[test]
+    fn horizontal_moves_between_fields_sharing_a_row() {
+        let mut form = FormState::new(Field::One, FormBindings::Standard);
+        form.begin_frame(Rect {
+            x: 0,
+            y: 0,
+            w: 20,
+            h: 1,
+        });
+        let row = form.next_row(1);
+        form.register_rect(
+            row,
+            Rect {
+                x: 0,
+                y: 0,
+                w: 10,
+                h: 1,
+            },
+            Field::One,
+            FormFieldKind::Action,
+        );
+        form.register_rect(
+            row,
+            Rect {
+                x: 10,
+                y: 0,
+                w: 10,
+                h: 1,
+            },
+            Field::Two,
+            FormFieldKind::Action,
+        );
+        form.finish_frame();
+
+        let event = form.handle_key(key(KeyCode::Right), FormFieldKind::Action);
+        assert_eq!(event.action, FormAction::FocusMoved);
+        assert_eq!(form.focus(), Field::Two);
+
+        let event = form.handle_key(key(KeyCode::Char('h')), FormFieldKind::Action);
+        // Standard mode ignores 'h' as a movement key, leaving focus put.
+        assert_eq!(event.action, FormAction::None);
+        assert_eq!(form.focus(), Field::Two);
+    }
+
+    #[test]
+    fn vim_horizontal_moves_between_buttons() {
+        let mut form = FormState::new(Field::One, FormBindings::Vim);
+        form.begin_frame(Rect {
+            x: 0,
+            y: 0,
+            w: 20,
+            h: 1,
+        });
+        let row = form.next_row(1);
+        form.register_rect(
+            row,
+            Rect {
+                x: 0,
+                y: 0,
+                w: 10,
+                h: 1,
+            },
+            Field::One,
+            FormFieldKind::Action,
+        );
+        form.register_rect(
+            row,
+            Rect {
+                x: 10,
+                y: 0,
+                w: 10,
+                h: 1,
+            },
+            Field::Two,
+            FormFieldKind::Action,
+        );
+        form.finish_frame();
+
+        let event = form.handle_key(key(KeyCode::Char('l')), FormFieldKind::Action);
+        assert_eq!(event.action, FormAction::FocusMoved);
+        assert_eq!(form.focus(), Field::Two);
+    }
+
+    #[test]
+    fn horizontal_adjusts_single_field_row() {
+        let mut form = FormState::new(Field::One, FormBindings::Standard);
+        form.begin_frame(Rect {
+            x: 0,
+            y: 0,
+            w: 20,
+            h: 1,
+        });
+        let row = form.next_row(1);
+        form.register_field(row, Field::One, FormFieldKind::Choice);
+        form.finish_frame();
+
+        let event = form.handle_key(key(KeyCode::Right), FormFieldKind::Choice);
+        assert_eq!(event.action, FormAction::Adjust(1));
+        assert_eq!(form.focus(), Field::One);
     }
 
     #[test]

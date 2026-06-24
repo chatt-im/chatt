@@ -19,6 +19,7 @@ use extui::Rect;
 use extui::event::{
     KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
+use extui_bindings::InputKey;
 use extui_editor::{Editor, Span as EditorSpan, bindings as editor_bindings};
 use rpc::{
     control::{ChatMessage, InviteTicket},
@@ -26,7 +27,7 @@ use rpc::{
 };
 
 use crate::{
-    bindings::{BindCommand, PendingChord},
+    bindings::{self, BindCommand, PendingChord, Resolved},
     chat_buffer::{LineKind, VirtualChatBuffer, VisibleLine},
     client_net::{NetworkClient, NetworkCommand, NetworkEvent, spawn_pair_once},
     config::{self, Config, SoundboardClip, validate_server_entry},
@@ -1012,28 +1013,15 @@ impl App {
         let focus = self.settings_form.focus();
         let kind = crate::ui::settings::setting_kind(focus);
         let text_focused = kind == crate::tui::form::FormFieldKind::Text;
-        if !text_focused {
-            match key.code {
-                KeyCode::Char('q') | KeyCode::F2 => {
-                    self.close_settings();
-                    return Action::Continue;
-                }
-                KeyCode::Char('r') => {
-                    self.refresh_audio_devices();
-                    return Action::Continue;
-                }
-                KeyCode::Char('w') => {
-                    self.save_settings();
-                    return Action::Continue;
-                }
-                _ => {}
-            }
-        }
 
         let event = self.settings_form.handle_key(key, kind);
         self.apply_settings_commit(event.commit);
         match event.action {
-            FormAction::None => {}
+            FormAction::None => {
+                if !text_focused {
+                    return self.resolve_settings_binding(key);
+                }
+            }
             FormAction::Cancel => {
                 if !self.cancel_open_audio_picker() {
                     self.close_settings();
@@ -1046,6 +1034,28 @@ impl App {
             FormAction::Scrolled => {}
         }
         Action::Continue
+    }
+
+    /// Dispatches a key the settings form left unhandled through the
+    /// `SETTINGS_LAYER` bindings, so command bindings such as `Ctrl-s`
+    /// (`SaveSettings`), `q`, `r`, and `w` work while the form keeps ownership
+    /// of movement and text editing.
+    fn resolve_settings_binding(&mut self, key: KeyEvent) -> Action {
+        let Some(input) = InputKey::from_event(&key) else {
+            return Action::Continue;
+        };
+        match bindings::resolve(
+            &self.config.bindings.router,
+            bindings::SETTINGS_LAYER,
+            &mut self.pending_chord,
+            input,
+        ) {
+            Resolved::Action(id) => {
+                let command = self.config.bindings.actions.get(id).clone();
+                self.process_command(command)
+            }
+            Resolved::Consumed | Resolved::Unmatched => Action::Continue,
+        }
     }
 
     fn process_settings_mouse(&mut self, mouse: MouseEvent) -> Action {
