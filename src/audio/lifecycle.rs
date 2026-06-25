@@ -323,16 +323,19 @@ pub fn start_recording(config: RecordingConfig) -> Result<Recording, String> {
     let stats = AudioStats::new();
     let (sender, receiver) = sync_channel(CALLBACK_QUEUE_CAPACITY);
     let worker_stats = stats.clone();
-    let worker = thread::spawn(move || {
-        run_encoder_worker(
-            receiver,
-            writer,
-            encoder,
-            config.denoise,
-            config.max_amplification,
-            worker_stats,
-        );
-    });
+    let worker = thread::Builder::new()
+        .name("chatt-audio-record-enc".to_string())
+        .spawn(move || {
+            run_encoder_worker(
+                receiver,
+                writer,
+                encoder,
+                config.denoise,
+                config.max_amplification,
+                worker_stats,
+            );
+        })
+        .map_err(|error| format!("failed to spawn chatt-audio-record-enc: {error}"))?;
 
     let stream = with_audio_backend_stderr_suppressed(|| {
         build_input_stream(
@@ -443,20 +446,23 @@ where
         .echo_control
         .clone()
         .map(EchoReferenceSource::Controlled);
-    let worker = thread::spawn(move || {
-        run_live_encoder_worker(
-            receiver,
-            encoder,
-            config.denoise,
-            worker_max_amplification,
-            worker_encoder_loss_percent,
-            config.tuning,
-            echo_source,
-            selection.device_rate,
-            worker_stats,
-            on_packet,
-        );
-    });
+    let worker = thread::Builder::new()
+        .name("chatt-audio-live-enc".to_string())
+        .spawn(move || {
+            run_live_encoder_worker(
+                receiver,
+                encoder,
+                config.denoise,
+                worker_max_amplification,
+                worker_encoder_loss_percent,
+                config.tuning,
+                echo_source,
+                selection.device_rate,
+                worker_stats,
+                on_packet,
+            );
+        })
+        .map_err(|error| format!("failed to spawn chatt-audio-live-enc: {error}"))?;
 
     with_audio_backend_stderr_suppressed(|| stream.play())
         .map_err(|error| format!("failed to start live input stream: {error}"))?;
@@ -590,15 +596,18 @@ pub fn start_live_playback(config: LivePlaybackConfig) -> Result<LivePlayback, S
     let worker_mixer_events = Arc::clone(&mixer_events);
     let worker_queue_reports = Arc::clone(&queue_reports);
     let feedback_sender = config.feedback_sender;
-    let worker = thread::spawn(move || {
-        run_live_decoder_worker(
-            receiver,
-            worker_mixer_events,
-            worker_queue_reports,
-            config.tuning,
-            feedback_sender,
-        )
-    });
+    let worker = thread::Builder::new()
+        .name("chatt-audio-live-dec".to_string())
+        .spawn(move || {
+            run_live_decoder_worker(
+                receiver,
+                worker_mixer_events,
+                worker_queue_reports,
+                config.tuning,
+                feedback_sender,
+            )
+        })
+        .map_err(|error| format!("failed to spawn chatt-audio-live-dec: {error}"))?;
 
     Ok(LivePlayback {
         stream: Some(stream),
