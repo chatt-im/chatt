@@ -1,7 +1,9 @@
 use crate::{
     audio::{BufferRequest, DenoiseConfig, DeviceInfo, StreamPreview},
     config::{
-        AudioConfig, AudioLatencyConfig, BufferSize, DEFAULT_INPUT_BUFFER_SAMPLES,
+        AudioConfig, AudioLatencyConfig, BufferSize, DEFAULT_DENOISE_RELEASE,
+        DEFAULT_DENOISE_SUPPRESSION, DEFAULT_DENOISE_TYPING_VAD_ENTER,
+        DEFAULT_DENOISE_TYPING_VAD_RELEASE, DEFAULT_INPUT_BUFFER_SAMPLES,
         DEFAULT_MAX_AMPLIFICATION, DEFAULT_OUTPUT_BUFFER_SAMPLES, FormBindings, ThemeChoice,
     },
     tui::form::FormFieldKind,
@@ -12,6 +14,18 @@ pub const BITRATES: [i32; 6] = [16_000, 24_000, 32_000, 48_000, 64_000, 96_000];
 /// Auto-gain ceiling options, in dB. `0` disables auto gain entirely for a
 /// well-levelled rig; higher values let AGC2 lift a quieter mic further.
 pub const MAX_AMPLIFICATIONS: [f32; 6] = [0.0, 6.0, 12.0, 18.0, 24.0, 30.0];
+/// RNNoise over-suppression exponent options. `1.0` is stock RNNoise, higher
+/// values push down residual non-voice noise (keyboard, fans).
+pub const DENOISE_SUPPRESSIONS: [f32; 5] = [1.0, 1.5, 2.0, 2.5, 3.0];
+pub const DENOISE_SUPPRESSION_LABELS: [&str; 5] = ["off", "1.5x", "2x", "2.5x", "3x"];
+/// RNNoise release-smoothing options, expressed as the per-frame gain-rise cap.
+/// `1.0` releases instantly (stock), lower values stop noise bursts swelling
+/// back up after a silence.
+pub const DENOISE_RELEASES: [f32; 5] = [1.0, 0.6, 0.4, 0.3, 0.15];
+pub const DENOISE_RELEASE_LABELS: [&str; 5] = ["off", "light", "medium", "strong", "max"];
+/// Earshot VAD thresholds for the post-RNNoise typing gate.
+pub const DENOISE_TYPING_VAD_THRESHOLDS: [f32; 7] = [0.60, 0.70, 0.75, 0.80, 0.82, 0.85, 0.90];
+pub const DENOISE_TYPING_VAD_LABELS: [&str; 7] = ["60%", "70%", "75%", "80%", "82%", "85%", "90%"];
 
 /// Smallest accepted explicit buffer in samples (~0.7 ms at 48 kHz).
 pub const MIN_BUFFER_SAMPLES: u32 = 32;
@@ -28,6 +42,11 @@ pub enum SettingsFocus {
     Denoise,
     EchoCancellation,
     Amplification,
+    Suppression,
+    Release,
+    TypingSuppression,
+    TypingVadEnter,
+    TypingVadRelease,
     CaptureBuffer,
     PlaybackBuffer,
     FormBindings,
@@ -38,13 +57,18 @@ pub enum SettingsFocus {
 }
 
 impl SettingsFocus {
-    pub const ORDER: [SettingsFocus; 15] = [
+    pub const ORDER: [SettingsFocus; 20] = [
         SettingsFocus::CaptureDevice,
         SettingsFocus::RawCaptureDevice,
         SettingsFocus::Bitrate,
         SettingsFocus::Denoise,
         SettingsFocus::EchoCancellation,
         SettingsFocus::Amplification,
+        SettingsFocus::Suppression,
+        SettingsFocus::Release,
+        SettingsFocus::TypingSuppression,
+        SettingsFocus::TypingVadEnter,
+        SettingsFocus::TypingVadRelease,
         SettingsFocus::CaptureBuffer,
         SettingsFocus::PlaybackDevice,
         SettingsFocus::RawPlaybackDevice,
@@ -62,6 +86,11 @@ pub struct SettingsDraft {
     output_device_id: Option<String>,
     bitrate_index: usize,
     amplification_index: usize,
+    suppression_index: usize,
+    release_index: usize,
+    typing_suppression: bool,
+    typing_vad_enter_index: usize,
+    typing_vad_release_index: usize,
     /// Single-line field values holding a sample count or `"default"` (see
     /// [`parse_buffer_size`]). The shared form editor commits into these.
     input_buffer: String,
@@ -94,6 +123,27 @@ impl SettingsDraft {
                 .position(|bitrate| *bitrate == config.bitrate_bps)
                 .unwrap_or(3),
             amplification_index: amplification_index(config.max_amplification),
+            suppression_index: nearest_index(
+                &DENOISE_SUPPRESSIONS,
+                config.denoise_suppression,
+                DEFAULT_DENOISE_SUPPRESSION,
+            ),
+            release_index: nearest_index(
+                &DENOISE_RELEASES,
+                config.denoise_release,
+                DEFAULT_DENOISE_RELEASE,
+            ),
+            typing_suppression: config.denoise_typing_suppression,
+            typing_vad_enter_index: nearest_index(
+                &DENOISE_TYPING_VAD_THRESHOLDS,
+                config.denoise_typing_vad_enter,
+                DEFAULT_DENOISE_TYPING_VAD_ENTER,
+            ),
+            typing_vad_release_index: nearest_index(
+                &DENOISE_TYPING_VAD_THRESHOLDS,
+                config.denoise_typing_vad_release,
+                DEFAULT_DENOISE_TYPING_VAD_RELEASE,
+            ),
             input_buffer: buffer_size_text(config.input_buffer),
             output_buffer: buffer_size_text(config.output_buffer),
             input_raw: config
@@ -132,6 +182,11 @@ impl SettingsDraft {
             denoise: self.denoise,
             echo_cancellation: self.echo_cancellation,
             max_amplification: self.max_amplification(),
+            denoise_suppression: self.suppression_strength(),
+            denoise_release: self.release_value(),
+            denoise_typing_suppression: self.typing_suppression,
+            denoise_typing_vad_enter: self.typing_vad_enter(),
+            denoise_typing_vad_release: self.typing_vad_release(),
             input_buffer: parse_buffer_size(&self.buffer_text(SettingsFocus::CaptureBuffer)),
             output_buffer: parse_buffer_size(&self.buffer_text(SettingsFocus::PlaybackBuffer)),
             latency: self.latency.clone(),
@@ -197,10 +252,15 @@ impl SettingsDraft {
             SettingsFocus::CaptureBuffer | SettingsFocus::PlaybackBuffer => FormFieldKind::Text,
             SettingsFocus::RawCaptureDevice
             | SettingsFocus::RawPlaybackDevice
-            | SettingsFocus::EchoCancellation => FormFieldKind::Toggle,
+            | SettingsFocus::EchoCancellation
+            | SettingsFocus::TypingSuppression => FormFieldKind::Toggle,
             SettingsFocus::Denoise
             | SettingsFocus::Bitrate
             | SettingsFocus::Amplification
+            | SettingsFocus::Suppression
+            | SettingsFocus::Release
+            | SettingsFocus::TypingVadEnter
+            | SettingsFocus::TypingVadRelease
             | SettingsFocus::FormBindings
             | SettingsFocus::Theme => FormFieldKind::Choice,
             SettingsFocus::Refresh | SettingsFocus::Save | SettingsFocus::Close => {
@@ -278,6 +338,17 @@ impl SettingsDraft {
                     format!("{value:.0} dB")
                 }
             }
+            SettingsFocus::Suppression => {
+                DENOISE_SUPPRESSION_LABELS[self.suppression_index].to_string()
+            }
+            SettingsFocus::Release => DENOISE_RELEASE_LABELS[self.release_index].to_string(),
+            SettingsFocus::TypingSuppression => on_off(self.typing_suppression),
+            SettingsFocus::TypingVadEnter => {
+                DENOISE_TYPING_VAD_LABELS[self.typing_vad_enter_index].to_string()
+            }
+            SettingsFocus::TypingVadRelease => {
+                DENOISE_TYPING_VAD_LABELS[self.typing_vad_release_index].to_string()
+            }
             SettingsFocus::CaptureBuffer | SettingsFocus::PlaybackBuffer => self.buffer_text(focus),
             SettingsFocus::FormBindings => form_bindings_label(self.form_bindings).to_string(),
             SettingsFocus::Theme => self.theme.label().to_string(),
@@ -307,6 +378,21 @@ impl SettingsDraft {
             }
             SettingsFocus::Amplification => {
                 "Auto-gain ceiling for quiet microphones; 0 dB disables amplification."
+            }
+            SettingsFocus::Suppression => {
+                "RNNoise over-suppression of residual noise (typing, fans). off keeps stock denoising."
+            }
+            SettingsFocus::Release => {
+                "Smooths how fast RNNoise releases suppression, stopping noise swelling up after a pause."
+            }
+            SettingsFocus::TypingSuppression => {
+                "Ducks loud low-VAD desk and keyboard thumps after RNNoise."
+            }
+            SettingsFocus::TypingVadEnter => {
+                "Typing gate engages when Earshot VAD is below this threshold and acoustic guards match."
+            }
+            SettingsFocus::TypingVadRelease => {
+                "Typing gate releases only after Earshot VAD reaches this threshold."
             }
             SettingsFocus::CaptureBuffer => {
                 "Requested capture buffer in samples, or default for the host backend."
@@ -338,6 +424,38 @@ impl SettingsDraft {
                 self.amplification_index =
                     cycle_index(self.amplification_index, MAX_AMPLIFICATIONS.len(), delta);
                 SettingsMutation::AmplificationChanged(self.max_amplification())
+            }
+            SettingsFocus::Suppression => {
+                self.suppression_index =
+                    cycle_index(self.suppression_index, DENOISE_SUPPRESSIONS.len(), delta);
+                SettingsMutation::Changed
+            }
+            SettingsFocus::Release => {
+                self.release_index = cycle_index(self.release_index, DENOISE_RELEASES.len(), delta);
+                SettingsMutation::Changed
+            }
+            SettingsFocus::TypingSuppression => self.toggle_typing_suppression(),
+            SettingsFocus::TypingVadEnter => {
+                self.typing_vad_enter_index = cycle_index(
+                    self.typing_vad_enter_index,
+                    DENOISE_TYPING_VAD_THRESHOLDS.len(),
+                    delta,
+                );
+                if self.typing_vad_release() < self.typing_vad_enter() {
+                    self.typing_vad_release_index = self.typing_vad_enter_index;
+                }
+                SettingsMutation::Changed
+            }
+            SettingsFocus::TypingVadRelease => {
+                self.typing_vad_release_index = cycle_index(
+                    self.typing_vad_release_index,
+                    DENOISE_TYPING_VAD_THRESHOLDS.len(),
+                    delta,
+                );
+                if self.typing_vad_release() < self.typing_vad_enter() {
+                    self.typing_vad_enter_index = self.typing_vad_release_index;
+                }
+                SettingsMutation::Changed
             }
             SettingsFocus::FormBindings => {
                 self.form_bindings = match self.form_bindings {
@@ -378,9 +496,14 @@ impl SettingsDraft {
             SettingsFocus::Denoise => self.cycle_denoise(1),
             SettingsFocus::EchoCancellation
             | SettingsFocus::RawCaptureDevice
-            | SettingsFocus::RawPlaybackDevice => self.adjust(focus, 1),
+            | SettingsFocus::RawPlaybackDevice
+            | SettingsFocus::TypingSuppression => self.adjust(focus, 1),
             SettingsFocus::Bitrate
             | SettingsFocus::Amplification
+            | SettingsFocus::Suppression
+            | SettingsFocus::Release
+            | SettingsFocus::TypingVadEnter
+            | SettingsFocus::TypingVadRelease
             | SettingsFocus::FormBindings
             | SettingsFocus::Theme => self.adjust(focus, 1),
             SettingsFocus::CaptureDevice
@@ -434,6 +557,22 @@ impl SettingsDraft {
         MAX_AMPLIFICATIONS[self.amplification_index]
     }
 
+    pub fn suppression_strength(&self) -> f32 {
+        DENOISE_SUPPRESSIONS[self.suppression_index]
+    }
+
+    pub fn release_value(&self) -> f32 {
+        DENOISE_RELEASES[self.release_index]
+    }
+
+    pub fn typing_vad_enter(&self) -> f32 {
+        DENOISE_TYPING_VAD_THRESHOLDS[self.typing_vad_enter_index]
+    }
+
+    pub fn typing_vad_release(&self) -> f32 {
+        DENOISE_TYPING_VAD_THRESHOLDS[self.typing_vad_release_index]
+    }
+
     fn cycle_denoise(&mut self, delta: isize) -> SettingsMutation {
         let current = DenoiseConfig::ALL
             .iter()
@@ -446,6 +585,11 @@ impl SettingsDraft {
 
     fn toggle_echo_cancellation(&mut self) -> SettingsMutation {
         self.echo_cancellation = !self.echo_cancellation;
+        SettingsMutation::Changed
+    }
+
+    fn toggle_typing_suppression(&mut self) -> SettingsMutation {
+        self.typing_suppression = !self.typing_suppression;
         SettingsMutation::Changed
     }
 }
@@ -541,6 +685,23 @@ fn is_raw_device_selection(selection: &str) -> bool {
         return false;
     }
     crate::audio::looks_like_alsa_pcm_name(selection)
+}
+
+/// Returns the index of the option nearest to `value`, falling back to the
+/// option nearest `default` when `value` is non-finite.
+fn nearest_index(options: &[f32], value: f32, default: f32) -> usize {
+    let value = if value.is_finite() { value } else { default };
+    options
+        .iter()
+        .enumerate()
+        .min_by(|(_, left), (_, right)| {
+            (*left - value)
+                .abs()
+                .partial_cmp(&(*right - value).abs())
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .map(|(index, _)| index)
+        .unwrap_or(0)
 }
 
 fn amplification_index(value: f32) -> usize {
@@ -1258,6 +1419,57 @@ mod tests {
         assert_eq!(audio.output_device_id.as_deref(), Some("usb speakers"));
         assert!(audio.echo_cancellation);
         assert_eq!(audio.max_amplification, 30.0);
+    }
+
+    #[test]
+    fn settings_draft_round_trips_denoise_suppression() {
+        let config = AudioConfig {
+            denoise_suppression: 2.0,
+            denoise_release: 0.3,
+            ..AudioConfig::default()
+        };
+
+        let draft = SettingsDraft::from_audio(&config);
+        assert_eq!(draft.option_label(SettingsFocus::Suppression), "2x");
+        assert_eq!(draft.option_label(SettingsFocus::Release), "strong");
+
+        let audio = draft.to_audio();
+        assert_eq!(audio.denoise_suppression, 2.0);
+        assert_eq!(audio.denoise_release, 0.3);
+    }
+
+    #[test]
+    fn settings_draft_round_trips_typing_suppression() {
+        let config = AudioConfig {
+            denoise_typing_suppression: true,
+            denoise_typing_vad_enter: 0.75,
+            denoise_typing_vad_release: 0.85,
+            ..AudioConfig::default()
+        };
+
+        let mut draft = SettingsDraft::from_audio(&config);
+        assert_eq!(draft.option_label(SettingsFocus::TypingSuppression), "on");
+        assert_eq!(draft.option_label(SettingsFocus::TypingVadEnter), "75%");
+        assert_eq!(draft.option_label(SettingsFocus::TypingVadRelease), "85%");
+        assert!(draft.to_audio().denoise_typing_suppression);
+        assert_eq!(draft.to_audio().denoise_typing_vad_enter, 0.75);
+        assert_eq!(draft.to_audio().denoise_typing_vad_release, 0.85);
+
+        draft.activate(SettingsFocus::TypingSuppression);
+        assert_eq!(draft.option_label(SettingsFocus::TypingSuppression), "off");
+        assert!(!draft.to_audio().denoise_typing_suppression);
+    }
+
+    #[test]
+    fn default_denoise_tuning_is_stock() {
+        let draft = SettingsDraft::from_audio(&AudioConfig::default());
+        assert_eq!(draft.suppression_strength(), 1.0);
+        assert_eq!(draft.release_value(), 1.0);
+        assert_eq!(draft.option_label(SettingsFocus::Suppression), "off");
+        assert_eq!(draft.option_label(SettingsFocus::Release), "off");
+        assert_eq!(draft.option_label(SettingsFocus::TypingSuppression), "off");
+        assert_eq!(draft.option_label(SettingsFocus::TypingVadEnter), "80%");
+        assert_eq!(draft.option_label(SettingsFocus::TypingVadRelease), "82%");
     }
 
     #[test]

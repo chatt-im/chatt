@@ -159,6 +159,11 @@ fn audio_restart_flags(old: &config::AudioConfig, new: &config::AudioConfig) -> 
     let capture = old.input_device_id != new.input_device_id
         || old.bitrate_bps != new.bitrate_bps
         || old.denoise != new.denoise
+        || old.denoise_suppression != new.denoise_suppression
+        || old.denoise_release != new.denoise_release
+        || old.denoise_typing_suppression != new.denoise_typing_suppression
+        || old.denoise_typing_vad_enter != new.denoise_typing_vad_enter
+        || old.denoise_typing_vad_release != new.denoise_typing_vad_release
         || old.input_buffer != new.input_buffer
         || old.latency != new.latency;
     let playback = old.output_device_id != new.output_device_id
@@ -1316,6 +1321,11 @@ impl App {
             | SettingsFocus::Denoise
             | SettingsFocus::EchoCancellation
             | SettingsFocus::Amplification
+            | SettingsFocus::Suppression
+            | SettingsFocus::Release
+            | SettingsFocus::TypingSuppression
+            | SettingsFocus::TypingVadEnter
+            | SettingsFocus::TypingVadRelease
             | SettingsFocus::FormBindings
             | SettingsFocus::Theme => {
                 let mutation = self.settings.adjust(self.settings_form.focus(), delta);
@@ -1348,6 +1358,11 @@ impl App {
             | SettingsFocus::RawPlaybackDevice
             | SettingsFocus::Bitrate
             | SettingsFocus::Amplification
+            | SettingsFocus::Suppression
+            | SettingsFocus::Release
+            | SettingsFocus::TypingSuppression
+            | SettingsFocus::TypingVadEnter
+            | SettingsFocus::TypingVadRelease
             | SettingsFocus::FormBindings
             | SettingsFocus::Theme => {
                 let mutation = self.settings.activate(self.settings_form.focus());
@@ -2167,6 +2182,8 @@ impl App {
                 bitrate_bps: self.config.audio.bitrate_bps,
                 denoise: self.config.audio.denoise,
                 max_amplification: self.config.audio.max_amplification,
+                suppression: self.config.audio.suppression(),
+                typing_suppression: self.config.audio.typing_suppression(),
                 buffer_request: self.input_buffer_request(),
                 tuning: self.config.audio.latency.to_tuning(),
                 echo_control: Some(Arc::clone(&self.echo_control)),
@@ -2414,6 +2431,11 @@ fn settings_field(focus: SettingsFocus) -> SettingsField {
         SettingsFocus::Denoise => SettingsField::Denoise,
         SettingsFocus::EchoCancellation => SettingsField::EchoCancellation,
         SettingsFocus::Amplification => SettingsField::Amplification,
+        SettingsFocus::Suppression => SettingsField::Suppression,
+        SettingsFocus::Release => SettingsField::Release,
+        SettingsFocus::TypingSuppression => SettingsField::TypingSuppression,
+        SettingsFocus::TypingVadEnter => SettingsField::TypingVadEnter,
+        SettingsFocus::TypingVadRelease => SettingsField::TypingVadRelease,
         SettingsFocus::CaptureBuffer => SettingsField::InputBuffer,
         SettingsFocus::PlaybackBuffer => SettingsField::OutputBuffer,
         SettingsFocus::FormBindings => SettingsField::FormBindings,
@@ -2548,6 +2570,17 @@ mod tests {
         denoise.denoise = audio::DenoiseConfig::None;
         let denoise_changed = denoise.denoise != base.denoise;
         assert_eq!(audio_restart_flags(&base, &denoise).0, denoise_changed);
+
+        let mut typing_suppression = base.clone();
+        typing_suppression.denoise_typing_suppression = !base.denoise_typing_suppression;
+        assert_eq!(
+            audio_restart_flags(&base, &typing_suppression),
+            (true, false)
+        );
+
+        let mut typing_threshold = base.clone();
+        typing_threshold.denoise_typing_vad_enter = 0.75;
+        assert_eq!(audio_restart_flags(&base, &typing_threshold), (true, false));
 
         let mut input_buffer = base.clone();
         input_buffer.input_buffer = config::BufferSize::Samples(480);

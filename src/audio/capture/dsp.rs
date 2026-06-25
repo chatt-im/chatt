@@ -8,13 +8,17 @@ use sonora::config::{
 use sonora::{AudioProcessing, Config as ApmConfig, StreamConfig as ApmStreamConfig};
 
 use crate::audio::capture::echo::EchoReference;
-use crate::audio::shared::DenoiseConfig;
 use crate::audio::shared::{
-    AudioStats, FRAME_SAMPLES, LiveAudioTuning, SAMPLE_RATE, frames_for_duration, peak_i16_scale,
-    rms_i16_scale, samples_for_duration,
+    AudioStats, DenoiseConfig, DenoiseSuppression, DenoiseTypingSuppression, FRAME_SAMPLES,
+    LiveAudioTuning, SAMPLE_RATE, frames_for_duration, peak_i16_scale, rms_i16_scale,
+    samples_for_duration,
 };
 
 const I16_SCALE: f32 = i16::MAX as f32;
+const TYPING_GATE_RMS_MIN: f32 = 400.0;
+const TYPING_GATE_DIFF_RATIO_MAX: f32 = 0.06;
+const TYPING_GATE_GAIN: f32 = 0.05;
+const TYPING_GATE_RAMP_SAMPLES: usize = 96;
 
 /// Capture high-pass / DC-block, the sonora WebRTC biquad cascade. Runs first on
 /// every frame so a microphone DC bias or low-frequency rumble cannot defeat
@@ -165,19 +169,29 @@ pub(crate) struct CaptureProcessor {
 }
 
 impl CaptureProcessor {
-    pub(crate) fn new(denoise: DenoiseConfig, max_gain_db: f32, echo_enabled: bool) -> Self {
+    pub(crate) fn new(
+        denoise: DenoiseConfig,
+        max_gain_db: f32,
+        echo_enabled: bool,
+        suppression: DenoiseSuppression,
+    ) -> Self {
         let stream = ApmStreamConfig::new(SAMPLE_RATE, 1);
         let apm = AudioProcessing::builder()
             .config(capture_apm_config(denoise, echo_enabled, max_gain_db))
             .capture_config(stream)
             .render_config(stream)
             .build();
+        let rnnoise = matches!(denoise, DenoiseConfig::RnnNoise).then(|| {
+            let mut state = DenoiseState::new();
+            state.set_suppression_params(suppression.into());
+            state
+        });
         Self {
             apm,
             denoise,
             echo_enabled,
             gain_max_db: max_gain_db,
-            rnnoise: matches!(denoise, DenoiseConfig::RnnNoise).then(DenoiseState::new),
+            rnnoise,
             denoised: vec![0.0; FRAME_SAMPLES],
             render: vec![0.0; FRAME_SAMPLES],
             render_out: vec![0.0; FRAME_SAMPLES],
@@ -298,6 +312,99 @@ impl EarshotVad {
         }
 
         score
+    }
+}
+
+pub(crate) struct TypingNoiseGate {
+    config: DenoiseTypingSuppression,
+    release_confirm_frames: usize,
+    release_ready_frames: usize,
+    suppressing: bool,
+    current_gain: f32,
+}
+
+impl TypingNoiseGate {
+    pub(crate) fn new(config: DenoiseTypingSuppression, denoise: DenoiseConfig) -> Self {
+        let mut config = config.normalized();
+        config.enabled &= matches!(denoise, DenoiseConfig::RnnNoise);
+        Self {
+            config,
+            release_confirm_frames: frames_for_duration(config.release_confirm).max(1),
+            release_ready_frames: 0,
+            suppressing: false,
+            current_gain: 1.0,
+        }
+    }
+
+    pub(crate) fn process(&mut self, vad_probability: f32, frame: &mut [f32]) {
+        if !self.config.enabled || frame.is_empty() {
+            return;
+        }
+        let rms = rms_i16_scale(frame) * I16_SCALE;
+        let diff_ratio = derivative_rms_i16_scale(frame) / rms.max(1.0);
+        let should_enter = vad_probability < self.config.vad_enter
+            && rms >= TYPING_GATE_RMS_MIN
+            && diff_ratio <= TYPING_GATE_DIFF_RATIO_MAX;
+        if should_enter {
+            self.suppressing = true;
+            self.release_ready_frames = 0;
+        } else if self.suppressing {
+            if vad_probability >= self.config.vad_release {
+                self.release_ready_frames = self.release_ready_frames.saturating_add(1);
+                if self.release_ready_frames >= self.release_confirm_frames {
+                    self.suppressing = false;
+                    self.release_ready_frames = 0;
+                }
+            } else {
+                self.release_ready_frames = 0;
+            }
+        }
+
+        let target_gain = if self.suppressing {
+            TYPING_GATE_GAIN
+        } else {
+            1.0
+        };
+        apply_ramped_frame_gain(frame, self.current_gain, target_gain);
+        self.current_gain = target_gain;
+    }
+}
+
+fn derivative_rms_i16_scale(samples: &[f32]) -> f32 {
+    if samples.len() < 2 {
+        return 0.0;
+    }
+    let square_sum = samples
+        .windows(2)
+        .map(|pair| {
+            let diff = pair[1] - pair[0];
+            diff * diff
+        })
+        .sum::<f32>();
+    (square_sum / (samples.len() - 1) as f32).sqrt()
+}
+
+fn apply_ramped_frame_gain(samples: &mut [f32], start_gain: f32, target_gain: f32) {
+    if samples.is_empty() {
+        return;
+    }
+    if (start_gain - target_gain).abs() < f32::EPSILON {
+        if target_gain != 1.0 {
+            for sample in samples {
+                *sample *= target_gain;
+            }
+        }
+        return;
+    }
+
+    let ramp = TYPING_GATE_RAMP_SAMPLES.min(samples.len());
+    for (index, sample) in samples.iter_mut().take(ramp).enumerate() {
+        let t = (index + 1) as f32 / ramp as f32;
+        let gain = start_gain + (target_gain - start_gain) * t;
+        *sample *= gain;
+    }
+    for sample in samples.iter_mut().skip(ramp) {
+        *sample *= target_gain;
     }
 }
 
@@ -469,11 +576,49 @@ mod tests {
     use crate::audio::test_support::*;
 
     #[test]
+    fn suppression_params_reach_rnnoise_and_attenuate_noise() {
+        // A higher suppression strength routed through the processor must push a
+        // broadband noise frame further down than stock RNNoise does. Drives both
+        // processors with the same pseudo-random noise.
+        fn run(suppression: DenoiseSuppression) -> f32 {
+            let mut processor =
+                CaptureProcessor::new(DenoiseConfig::RnnNoise, 0.0, false, suppression);
+            let mut state: u32 = 0x9e37_79b9;
+            let mut last = 0.0;
+            for _ in 0..40 {
+                let mut frame: Vec<f32> = (0..FRAME_SAMPLES)
+                    .map(|_| {
+                        state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                        (state >> 8) as f32 / (1 << 24) as f32 * 0.2 * I16_SCALE - 0.1 * I16_SCALE
+                    })
+                    .collect();
+                processor.process(&mut frame, None);
+                last = rms_i16_scale(&frame);
+            }
+            last
+        }
+        let stock = run(DenoiseSuppression::IDENTITY);
+        let strong = run(DenoiseSuppression {
+            strength: 3.0,
+            release: 1.0,
+        });
+        assert!(
+            strong < stock,
+            "strength=3 should attenuate noise below stock: stock={stock:.2} strong={strong:.2}"
+        );
+    }
+
+    #[test]
     fn consolidated_processor_removes_dc_and_caps_full_scale() {
         // The always-on high-pass strips a DC bias, and with a positive gain
         // ceiling the AGC2 limiter keeps the signal inside full scale, all in one
         // consolidated pass.
-        let mut processor = CaptureProcessor::new(DenoiseConfig::RnnNoise, 8.0, false);
+        let mut processor = CaptureProcessor::new(
+            DenoiseConfig::RnnNoise,
+            8.0,
+            false,
+            DenoiseSuppression::IDENTITY,
+        );
         let mut frame = vec![0.3 * I16_SCALE; FRAME_SAMPLES];
         for _ in 0..8 {
             frame
@@ -494,7 +639,8 @@ mod tests {
         // With echo cancellation enabled the consolidated APM attenuates a
         // far-end-only echo aligned against the render reference.
         let reference = EchoReference::new();
-        let mut processor = CaptureProcessor::new(DenoiseConfig::None, 0.0, true);
+        let mut processor =
+            CaptureProcessor::new(DenoiseConfig::None, 0.0, true, DenoiseSuppression::IDENTITY);
         let frames = sample_speech_frames();
         let gain = 0.5f32;
         let warmup = 600usize;
@@ -523,7 +669,8 @@ mod tests {
     #[test]
     fn consolidated_processor_preserves_double_talk() {
         let reference = EchoReference::new();
-        let mut processor = CaptureProcessor::new(DenoiseConfig::None, 0.0, true);
+        let mut processor =
+            CaptureProcessor::new(DenoiseConfig::None, 0.0, true, DenoiseSuppression::IDENTITY);
         let frames = sample_speech_frames();
         let gain = 0.5f32;
         let warmup = 600usize;
@@ -590,6 +737,84 @@ mod tests {
         assert!(
             frame.iter().all(|sample| sample.abs() <= I16_SCALE + 1.0),
             "limiter let a sample exceed full scale"
+        );
+    }
+
+    #[test]
+    fn typing_noise_gate_ducks_low_vad_table_thumps() {
+        let mut gate = TypingNoiseGate::new(test_typing_gate_config(), DenoiseConfig::RnnNoise);
+        let mut frame = sine_frame(220.0, 1_800.0);
+        let before = rms_i16_scale(&frame) * I16_SCALE;
+
+        gate.process(0.2, &mut frame);
+        let after_first = rms_i16_scale(&frame) * I16_SCALE;
+
+        let mut next = sine_frame(220.0, 1_800.0);
+        gate.process(0.2, &mut next);
+        let after_second = rms_i16_scale(&next) * I16_SCALE;
+
+        assert!(
+            after_first < before * 0.35,
+            "first ducked frame should ramp down quickly: before={before:.1} after={after_first:.1}"
+        );
+        assert!(
+            after_second < before * 0.08,
+            "continued ducking should reach the floor: before={before:.1} after={after_second:.1}"
+        );
+    }
+
+    #[test]
+    fn typing_noise_gate_preserves_speech_like_frames() {
+        let mut gate = TypingNoiseGate::new(test_typing_gate_config(), DenoiseConfig::RnnNoise);
+        let mut voiced = sine_frame(1_600.0, 1_800.0);
+        let before = rms_i16_scale(&voiced) * I16_SCALE;
+
+        gate.process(0.2, &mut voiced);
+        let after = rms_i16_scale(&voiced) * I16_SCALE;
+
+        assert!(
+            after > before * 0.99,
+            "high-derivative speech-like frame should not be ducked: before={before:.1} after={after:.1}"
+        );
+    }
+
+    #[test]
+    fn typing_noise_gate_disabled_is_transparent() {
+        let mut gate =
+            TypingNoiseGate::new(DenoiseTypingSuppression::DISABLED, DenoiseConfig::RnnNoise);
+        let mut frame = sine_frame(220.0, 1_800.0);
+        let before = frame.clone();
+
+        gate.process(0.0, &mut frame);
+
+        assert_eq!(frame, before);
+    }
+
+    #[test]
+    fn typing_noise_gate_requires_release_vad_before_opening() {
+        let mut gate = TypingNoiseGate::new(test_typing_gate_config(), DenoiseConfig::RnnNoise);
+        let mut thump = sine_frame(220.0, 1_800.0);
+        gate.process(0.2, &mut thump);
+
+        let mut not_enough_vad = sine_frame(1_600.0, 1_800.0);
+        let before = rms_i16_scale(&not_enough_vad) * I16_SCALE;
+        gate.process(0.81, &mut not_enough_vad);
+        let held = rms_i16_scale(&not_enough_vad) * I16_SCALE;
+        assert!(
+            held < before * 0.10,
+            "gate should stay closed below release VAD: before={before:.1} held={held:.1}"
+        );
+
+        for _ in 0..3 {
+            let mut release = sine_frame(1_600.0, 1_800.0);
+            gate.process(0.86, &mut release);
+        }
+        let mut released = sine_frame(1_600.0, 1_800.0);
+        gate.process(0.86, &mut released);
+        let after = rms_i16_scale(&released) * I16_SCALE;
+        assert!(
+            after > before * 0.95,
+            "gate should open after sustained release VAD: before={before:.1} after={after:.1}"
         );
     }
 
@@ -667,5 +892,23 @@ mod tests {
         assert!(frames[0].samples[0] < frames[0].samples[3]);
         assert!((frames[1].samples[0] - 0.4).abs() < f32::EPSILON);
         assert!((frames[2].samples[0] - 1.0).abs() < f32::EPSILON);
+    }
+
+    fn sine_frame(freq_hz: f32, amplitude: f32) -> Vec<f32> {
+        (0..FRAME_SAMPLES)
+            .map(|sample| {
+                let phase = sample as f32 * freq_hz * std::f32::consts::TAU / SAMPLE_RATE as f32;
+                phase.sin() * amplitude
+            })
+            .collect()
+    }
+
+    fn test_typing_gate_config() -> DenoiseTypingSuppression {
+        DenoiseTypingSuppression {
+            enabled: true,
+            vad_enter: 0.80,
+            vad_release: 0.82,
+            release_confirm: std::time::Duration::from_millis(30),
+        }
     }
 }

@@ -6,7 +6,7 @@ edition = "2024"
 [dependencies]
 cpal = { path = "crates/cpal", default-features = false }
 libc = "0.2"
-nnnoiseless = { version = "0.5.2", default-features = false }
+nnnoiseless = { path = "crates/nnnoiseless" }
 extui = { git = "https://github.com/exrok/extui", rev = "0db2ec429bc437f4d330b24e7642e539c44b8a6a", features = ["bracketed-paste"] }
 extui-editor = { git = "https://github.com/exrok/extui", rev = "0db2ec429bc437f4d330b24e7642e539c44b8a6a" }
 extui-bindings = { git = "https://github.com/exrok/extui", rev = "0db2ec429bc437f4d330b24e7642e539c44b8a6a" }
@@ -51,6 +51,7 @@ members = [
     "crates/server",
     "crates/bwrap",
     "crates/opus-codec",
+    "crates/nnnoiseless",
 ]
 exclude = ["crates/cpal"]
 

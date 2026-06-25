@@ -34,7 +34,8 @@ use crate::{
         },
         shared::{
             AudioStats, BufferRequest, CALLBACK_QUEUE_CAPACITY, CHANNELS, DenoiseConfig,
-            FRAME_SAMPLES, LIVE_PLAYBACK_COMMAND_CAPACITY, LiveAudioTuning, LiveEncoderProfile,
+            DenoiseSuppression, DenoiseTypingSuppression, FRAME_SAMPLES,
+            LIVE_PLAYBACK_COMMAND_CAPACITY, LiveAudioTuning, LiveEncoderProfile,
             LivePlaybackFeedback, LivePlaybackSnapshot, LocalVoiceFrame, PlaybackSnapshot,
             PlaybackStats, PlaybackStreamControl, RemoteVoicePacket, SAMPLE_RATE, StatsSnapshot,
         },
@@ -58,6 +59,8 @@ pub struct LiveCaptureConfig {
     pub bitrate_bps: i32,
     pub denoise: DenoiseConfig,
     pub max_amplification: f32,
+    pub suppression: DenoiseSuppression,
+    pub typing_suppression: DenoiseTypingSuppression,
     pub buffer_request: BufferRequest,
     pub tuning: LiveAudioTuning,
     pub echo_control: Option<Arc<EchoCancellationControl>>,
@@ -433,6 +436,9 @@ where
         bitrate_bps = config.bitrate_bps,
         denoise = config.denoise.label(),
         max_amplification = config.max_amplification,
+        typing_suppression = config.typing_suppression.enabled,
+        typing_vad_enter = config.typing_suppression.vad_enter,
+        typing_vad_release = config.typing_suppression.vad_release,
         echo_cancellation = config
             .echo_control
             .as_ref()
@@ -456,6 +462,8 @@ where
                 worker_max_amplification,
                 worker_encoder_loss_percent,
                 config.tuning,
+                config.suppression,
+                config.typing_suppression,
                 echo_source,
                 selection.device_rate,
                 worker_stats,

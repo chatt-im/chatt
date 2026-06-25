@@ -6,7 +6,10 @@ use toml_spanner::Toml;
 use toml_spanner::{Arena, Item};
 
 use crate::{
-    audio::{BufferRequest, DenoiseConfig, LiveAudioPacketLossProfile, LiveAudioTuning},
+    audio::{
+        BufferRequest, DenoiseConfig, DenoiseSuppression, DenoiseTypingSuppression,
+        LiveAudioPacketLossProfile, LiveAudioTuning,
+    },
     bindings::BindingRuntime,
     client_net::ClientConfig,
 };
@@ -14,6 +17,14 @@ use rpc::{control::DEFAULT_FILE_SIZE_LIMIT_BYTES, ids::RoomId};
 
 pub const DEFAULT_CONFIG: &str = include_str!("../chatt.toml");
 pub const DEFAULT_MAX_AMPLIFICATION: f32 = crate::audio::DEFAULT_LIVE_MAX_AMPLIFICATION;
+pub const DEFAULT_DENOISE_SUPPRESSION: f32 = crate::audio::DEFAULT_DENOISE_SUPPRESSION;
+pub const DEFAULT_DENOISE_RELEASE: f32 = crate::audio::DEFAULT_DENOISE_RELEASE;
+pub const DEFAULT_DENOISE_TYPING_SUPPRESSION: bool =
+    crate::audio::DEFAULT_DENOISE_TYPING_SUPPRESSION;
+pub const DEFAULT_DENOISE_TYPING_VAD_ENTER: f32 = crate::audio::DEFAULT_DENOISE_TYPING_VAD_ENTER;
+pub const DEFAULT_DENOISE_TYPING_VAD_RELEASE: f32 =
+    crate::audio::DEFAULT_DENOISE_TYPING_VAD_RELEASE;
+pub const DEFAULT_DENOISE_TYPING_RELEASE_MS: u64 = crate::audio::DEFAULT_DENOISE_TYPING_RELEASE_MS;
 pub const MIN_USER_VOLUME_DB: f32 = -24.0;
 pub const MAX_USER_VOLUME_DB: f32 = 12.0;
 pub const USER_VOLUME_DB_STEP: f32 = 0.5;
@@ -135,12 +146,42 @@ pub struct AudioConfig {
     pub echo_cancellation: bool,
     #[toml(default = DEFAULT_MAX_AMPLIFICATION)]
     pub max_amplification: f32,
+    #[toml(default = DEFAULT_DENOISE_SUPPRESSION)]
+    pub denoise_suppression: f32,
+    #[toml(default = DEFAULT_DENOISE_RELEASE)]
+    pub denoise_release: f32,
+    #[toml(default = DEFAULT_DENOISE_TYPING_SUPPRESSION)]
+    pub denoise_typing_suppression: bool,
+    #[toml(default = DEFAULT_DENOISE_TYPING_VAD_ENTER)]
+    pub denoise_typing_vad_enter: f32,
+    #[toml(default = DEFAULT_DENOISE_TYPING_VAD_RELEASE)]
+    pub denoise_typing_vad_release: f32,
     #[toml(default, style = Dotted)]
     pub input_buffer: BufferSize,
     #[toml(default, style = Dotted)]
     pub output_buffer: BufferSize,
     #[toml(default, style = Header)]
     pub latency: AudioLatencyConfig,
+}
+
+impl AudioConfig {
+    /// Bundles the two flat RNNoise tuning fields into a [`DenoiseSuppression`].
+    pub fn suppression(&self) -> DenoiseSuppression {
+        DenoiseSuppression {
+            strength: self.denoise_suppression,
+            release: self.denoise_release,
+        }
+    }
+
+    pub fn typing_suppression(&self) -> DenoiseTypingSuppression {
+        DenoiseTypingSuppression {
+            enabled: self.denoise_typing_suppression,
+            vad_enter: self.denoise_typing_vad_enter,
+            vad_release: self.denoise_typing_vad_release,
+            release_confirm: Duration::from_millis(DEFAULT_DENOISE_TYPING_RELEASE_MS),
+        }
+        .normalized()
+    }
 }
 
 impl Default for AudioConfig {
@@ -152,6 +193,11 @@ impl Default for AudioConfig {
             denoise: DenoiseConfig::RnnNoise,
             echo_cancellation: false,
             max_amplification: DEFAULT_MAX_AMPLIFICATION,
+            denoise_suppression: DEFAULT_DENOISE_SUPPRESSION,
+            denoise_release: DEFAULT_DENOISE_RELEASE,
+            denoise_typing_suppression: DEFAULT_DENOISE_TYPING_SUPPRESSION,
+            denoise_typing_vad_enter: DEFAULT_DENOISE_TYPING_VAD_ENTER,
+            denoise_typing_vad_release: DEFAULT_DENOISE_TYPING_VAD_RELEASE,
             input_buffer: BufferSize::Default,
             output_buffer: BufferSize::Default,
             latency: AudioLatencyConfig::default(),
@@ -1252,6 +1298,22 @@ input-device-index = 20
         assert_eq!(tuning, LiveAudioTuning::default());
         assert!(tuning.validate().is_ok());
         assert_eq!(Config::default().audio.bitrate_bps, 48_000);
+    }
+
+    #[test]
+    fn typing_suppression_clamps_release_threshold_above_enter() {
+        let audio = AudioConfig {
+            denoise_typing_suppression: true,
+            denoise_typing_vad_enter: 0.85,
+            denoise_typing_vad_release: 0.70,
+            ..AudioConfig::default()
+        };
+
+        let gate = audio.typing_suppression();
+
+        assert!(gate.enabled);
+        assert_eq!(gate.vad_enter, 0.85);
+        assert_eq!(gate.vad_release, 0.85);
     }
 
     #[test]

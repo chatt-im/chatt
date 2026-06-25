@@ -7,6 +7,20 @@ bitrate-bps = 48000
 denoise = "rnn-noise"
 echo-cancellation = false
 max-amplification = 12.0
+# RNNoise tuning (rnn-noise engine only). 1.0 is stock; both default to off.
+# denoise-suppression: over-suppression exponent (1.0..3.0), pushes down residual
+#   noise like typing while preserving voice.
+# denoise-release: per-frame gain-rise cap (1.0..0.15), stops noise swelling up
+#   after a pause. Lower is stronger.
+denoise-suppression = 1.0
+denoise-release = 1.0
+# Desk-mounted mic guard. When enabled with RNNoise, ducks loud low-VAD,
+# low-derivative table/keyboard thumps after denoising.
+denoise-typing-suppression = true
+# Earshot VAD thresholds for the typing gate. Lower "enter" is less sensitive;
+# higher "release" keeps suppression held until speech confidence is clearer.
+denoise-typing-vad-enter = 0.80
+denoise-typing-vad-release = 0.82
 input-buffer = "default"
 output-buffer = "default"
 
