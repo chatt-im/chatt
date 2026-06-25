@@ -504,12 +504,7 @@ impl AdaptivePlaybackStream {
         if self.queued_samples().saturating_sub(peak_index) < self.accelerate_reserve_samples() {
             return false;
         }
-        let delta = accelerate_one_period(
-            &mut self.input,
-            lead,
-            peak_index,
-            self.samples.wsola_overlap,
-        );
+        let delta = accelerate_one_period(&mut self.input, lead, peak_index);
         if delta == 0 {
             return false;
         }
@@ -544,12 +539,7 @@ impl AdaptivePlaybackStream {
                 .peak_index
                 .min(self.queued_samples().saturating_sub(TIME_SCALE_REF_OFFSET))
         };
-        let delta = expand_one_period(
-            &mut self.input,
-            lead,
-            peak_index,
-            self.samples.wsola_overlap,
-        );
+        let delta = expand_one_period(&mut self.input, lead, peak_index);
         if delta == 0 {
             return false;
         }
@@ -579,8 +569,7 @@ impl AdaptivePlaybackStream {
             return false;
         };
         let before = self.input.frames();
-        self.input
-            .overlap_add_expand(self.samples.wsola_overlap.min(segment), queued, segment);
+        self.input.overlap_add_expand(queued, segment);
         let delta = self.input.frames().saturating_sub(before);
         if delta == 0 {
             return false;
@@ -1693,11 +1682,10 @@ mod tests {
         let original_len = q.frames();
         let start = samples_for_duration(Duration::from_millis(40));
         let segment = samples_for_duration(Duration::from_millis(5));
-        let overlap = samples_for_duration(Duration::from_millis(5));
 
-        q.overlap_add_compress(overlap, start, segment);
+        q.overlap_add_compress(start, segment);
         assert_eq!(q.frames(), original_len - segment);
-        q.overlap_add_expand(overlap, start, segment);
+        q.overlap_add_expand(start, segment);
         assert_eq!(q.frames(), original_len);
 
         let mut restored = Vec::new();
