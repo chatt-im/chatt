@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-cpal = { path = "crates/cpal" }
+cpal = { path = "crates/cpal", default-features = false }
 libc = "0.2"
 nnnoiseless = { version = "0.5.2", default-features = false }
 extui = { git = "https://github.com/exrok/extui", rev = "0db2ec429bc437f4d330b24e7642e539c44b8a6a", features = ["bracketed-paste"] }
@@ -33,8 +33,10 @@ hashbrown = "0.17.1"
 mimalloc = { version = "0.1.52", features = ["override"] }
 
 [features]
-default = []
+default = ["audio-realtime"]
 pipewire = ["cpal/pipewire"]
+audio-realtime = ["cpal/realtime"]
+audio-realtime-dbus = ["audio-realtime", "cpal/realtime-dbus"]
 # Presume AVX2/FMA in the bundled Opus build, removing its runtime CPU dispatch.
 # Only sound on x86-64 CPUs that actually have AVX2. Pair it with
 # `-C target-cpu=x86-64-v3`; the `cargo v3` alias in `.cargo/config.toml` does

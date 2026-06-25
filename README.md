@@ -41,6 +41,12 @@ Dependency notes:
 - `libasound2-dev` on Debian/Ubuntu, or `alsa-lib` on Arch, provides the
   `alsa.pc` metadata required by `alsa-sys`, which is pulled in by the `cpal`
   audio backend used by the client.
+- Realtime audio callback scheduling is enabled by the default
+  `audio-realtime` Cargo feature. On Linux/BSD, CPAL can only acquire RT
+  priority when the user has `rtprio` limits or equivalent privileges; without
+  that, chatt logs the refusal and keeps running at normal scheduling priority.
+  Desktop systems with rtkit can use `--features audio-realtime-dbus` if D-Bus
+  development files are installed.
 - PipeWire support is available as a non-default Cargo feature. Enable it with
   `cargo run -p chatt --features pipewire -- --config chatt.toml`; this path
   needs PipeWire development files discoverable by `pkg-config`.

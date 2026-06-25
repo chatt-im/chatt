@@ -971,6 +971,15 @@ where
                 capture_callback(input, channels, &sender, &data_stats);
             },
             move |error| {
+                if error.kind() == ErrorKind::RealtimeDenied {
+                    let error_message = error.to_string();
+                    kvlog::warn!(
+                        "audio realtime priority denied",
+                        direction = "capture",
+                        error = error_message.as_str(),
+                        hint = "grant rtprio or build with audio-realtime-dbus on rtkit systems"
+                    );
+                }
                 error_stats.record_stream_error(format!("stream error: {error}"));
             },
             None,
@@ -1250,7 +1259,16 @@ fn record_live_playback_stream_error(
     error: cpal::Error,
 ) {
     let is_xrun = error.kind() == ErrorKind::Xrun;
+    let is_realtime_denied = error.kind() == ErrorKind::RealtimeDenied;
     let error = error.to_string();
+    if is_realtime_denied {
+        kvlog::warn!(
+            "audio realtime priority denied",
+            direction = "live playback",
+            error = error.as_str(),
+            hint = "grant rtprio or build with audio-realtime-dbus on rtkit systems"
+        );
+    }
     shared_snapshot.record_backend_stream_error(error, is_xrun, Instant::now());
 }
 
@@ -1354,6 +1372,15 @@ where
                 playback_callback(output, channels, &samples, &mut cursor, &data_stats);
             },
             move |error| {
+                if error.kind() == ErrorKind::RealtimeDenied {
+                    let error_message = error.to_string();
+                    kvlog::warn!(
+                        "audio realtime priority denied",
+                        direction = "playback",
+                        error = error_message.as_str(),
+                        hint = "grant rtprio or build with audio-realtime-dbus on rtkit systems"
+                    );
+                }
                 error_stats.record_stream_error(format!("playback stream error: {error}"));
             },
             None,
