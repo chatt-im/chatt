@@ -5,7 +5,9 @@ edition = "2024"
 
 [dependencies]
 jsony_bench = { git = "https://github.com/exrok/jsony", rev = "a92dd3211e8aafda852c910037e07eeaa991df93" }
-nnnoiseless = { version = "0.5.2", default-features = false }
+# Use chatt's vendored RNNoise fork (not crates.io) so the isolated `rnnoise`
+# route measures the exact engine chatt ships, including the optional V2 model.
+nnnoiseless = { path = "../nnnoiseless" }
 opus-codec = { path = "../opus-codec", features = ["dred"] }
 sonora = "0.1.0"
 chatt = { path = "../.." }
@@ -14,4 +16,7 @@ chatt = { path = "../.." }
 default = []
 # Mirrors chatt's `avx2` feature so the optimized build can be profiled
 # end to end. Enable alongside `-C target-cpu=x86-64-v3`.
-avx2 = ["opus-codec/presume-avx2", "chatt/avx2"]
+avx2 = ["opus-codec/presume-avx2", "chatt/avx2", "nnnoiseless/presume-avx2"]
+# Mirrors chatt's `rnnoise-v2`: swaps the Rust RNNoise for the official V2 C
+# model. Requires NNNOISELESS_RNNOISE_V2_WEIGHTS at build time.
+rnnoise-v2 = ["chatt/rnnoise-v2", "nnnoiseless/rnnoise-v2"]

@@ -602,11 +602,21 @@ impl AdaptivePlaybackStream {
         self.idle_expansion_samples >= self.samples.max_idle_expansion
     }
 
-    fn tail_pitch_period(&self, queued: usize) -> Option<usize> {
+    fn tail_pitch_period(&mut self, queued: usize) -> Option<usize> {
         let max_lag = TIME_SCALE_MAX_LAG_48K.min(queued / 2);
         if max_lag < TIME_SCALE_MIN_LAG_48K {
             return None;
         }
+
+        // The correlation only ever reads the last `2 * max_lag` samples, so copy
+        // that tail into a contiguous scratch buffer once and index it directly.
+        // This replaces the per-sample `sample_at` ring lookups (each an O(frames)
+        // scan) with flat, autovectorizable slice reads.
+        let window = (2 * max_lag).min(queued);
+        let window_start = queued - window;
+        self.input
+            .copy_window(window_start, window, &mut self.time_scale_window);
+        let tail = self.time_scale_window.as_slice();
 
         let mut best_lag = TIME_SCALE_MIN_LAG_48K;
         let mut best_corr = -1.0f32;
@@ -616,14 +626,16 @@ impl AdaptivePlaybackStream {
             if len < TIME_SCALE_MIN_LAG_48K {
                 continue;
             }
-            let second_start = queued - len;
+            let second_start = window - len;
             let first_start = second_start - lag;
-            let mut cross = 0.0;
-            let mut e1 = 0.0;
-            let mut e2 = 0.0;
+            let first = &tail[first_start..first_start + len];
+            let second = &tail[second_start..second_start + len];
+            let mut cross = 0.0f32;
+            let mut e1 = 0.0f32;
+            let mut e2 = 0.0f32;
             for index in 0..len {
-                let left = self.input.sample_at(first_start + index).unwrap_or(0.0);
-                let right = self.input.sample_at(second_start + index).unwrap_or(0.0);
+                let left = first[index];
+                let right = second[index];
                 cross += left * right;
                 e1 += left * left;
                 e2 += right * right;

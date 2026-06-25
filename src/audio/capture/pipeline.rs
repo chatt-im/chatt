@@ -531,11 +531,18 @@ impl FrameAccumulator {
 
     fn push_chunk(
         &mut self,
-        chunk: &[f32],
+        mut chunk: &[f32],
         mut on_frame: impl FnMut(&mut [f32]) -> Result<(), String>,
     ) -> Result<(), String> {
-        for sample in chunk {
-            self.pending.push(*sample);
+        // Copy in frame-sized runs rather than sample by sample: each
+        // `extend_from_slice` is a single bulk memcpy the compiler can vectorize,
+        // and a full frame that lands on an empty buffer skips straight to the
+        // callback without per-sample bookkeeping.
+        while !chunk.is_empty() {
+            let needed = self.frame_size - self.pending.len();
+            let take = needed.min(chunk.len());
+            self.pending.extend_from_slice(&chunk[..take]);
+            chunk = &chunk[take..];
             if self.pending.len() == self.frame_size {
                 on_frame(&mut self.pending)?;
                 self.pending.clear();
