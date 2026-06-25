@@ -317,11 +317,12 @@ impl LivePlaybackMixer {
         now: Instant,
         output_block_samples: usize,
     ) -> f32 {
-        let playout_quantum_samples = output_block_samples.max(1).min(FRAME_SAMPLES);
-        self.last_backend_block_samples = output_block_samples;
+        let backend_block_samples = output_block_samples.max(1);
+        let playout_quantum_samples = backend_block_samples.min(FRAME_SAMPLES);
+        self.last_backend_block_samples = backend_block_samples;
         self.last_playout_quantum_samples = playout_quantum_samples;
         self.pop_mixed_sample_with(|stream, stats| {
-            stream.pop_output_sample(now, stats, playout_quantum_samples)
+            stream.pop_output_sample(now, stats, playout_quantum_samples, backend_block_samples)
         })
     }
 
@@ -476,27 +477,36 @@ mod tests {
     }
 
     #[test]
-    fn mixer_caps_large_backend_blocks_to_playout_quantum() {
+    fn mixer_primes_large_backend_blocks_to_device_floor() {
         let mut mixer = LivePlaybackMixer::new();
         let now = Instant::now();
+        let tuning = test_tuning();
+        let target = samples_for_duration(tuning.target_queue);
+        let backend_block = samples_for_duration(Duration::from_millis(500));
+        let floor = backend_block + samples_for_duration(tuning.device_period_margin);
+        mixer.queue_stream_samples(1, &vec![0.25; target], DecodedFrameSource::Normal, now);
+
+        let sample = mixer.pop_mixed_output_sample(now, backend_block);
+        let snapshot = mixer.snapshot_at(now);
+
+        assert_eq!(sample, 0.0);
+        assert_eq!(snapshot.backend_block_ms, 500);
+        assert_eq!(snapshot.playout_quantum_ms, samples_to_ms(FRAME_SAMPLES));
+        assert_eq!(snapshot.queued_samples, target);
+
+        for _ in 1..FRAME_SAMPLES {
+            assert_eq!(mixer.pop_mixed_output_sample(now, backend_block), 0.0);
+        }
+
         mixer.queue_stream_samples(
             1,
-            &vec![0.25; samples_for_duration(test_tuning().target_queue)],
+            &vec![0.25; floor - target],
             DecodedFrameSource::Normal,
             now,
         );
 
-        let sample =
-            mixer.pop_mixed_output_sample(now, samples_for_duration(Duration::from_millis(500)));
-        let snapshot = mixer.snapshot_at(now);
-
-        assert_eq!(sample, 0.25);
-        assert_eq!(snapshot.backend_block_ms, 500);
-        assert_eq!(snapshot.playout_quantum_ms, samples_to_ms(FRAME_SAMPLES));
-        assert!(
-            snapshot.queued_samples < samples_for_duration(test_tuning().target_queue),
-            "{snapshot:?}"
-        );
+        assert_eq!(mixer.pop_mixed_output_sample(now, backend_block), 0.25);
+        assert_eq!(mixer.snapshot_at(now).underrun_count, 1);
     }
 
     #[test]

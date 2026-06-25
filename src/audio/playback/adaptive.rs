@@ -255,14 +255,17 @@ impl AdaptivePlaybackStream {
         &mut self,
         now: Instant,
         stats: &mut LivePlaybackMixerStats,
-        output_block_samples: usize,
+        playout_quantum_samples: usize,
+        device_block_samples: usize,
     ) -> Option<f32> {
+        let playout_quantum_samples = playout_quantum_samples.max(1);
+        let device_block_samples = device_block_samples.max(1);
         if self.sender_silent {
-            self.advance_sender_silence_output_block(output_block_samples);
+            self.advance_sender_silence_output_block(playout_quantum_samples);
             return Some(self.pop_sender_silence_sample(stats));
         }
         if self.output_block_remaining == 0 {
-            self.begin_output_block(output_block_samples);
+            self.begin_output_block(playout_quantum_samples, device_block_samples);
         }
 
         if !self.output_block_playable {
@@ -294,14 +297,15 @@ impl AdaptivePlaybackStream {
         sample
     }
 
-    fn begin_output_block(&mut self, output_block_samples: usize) {
-        let output_block_samples = output_block_samples.max(1);
+    fn begin_output_block(&mut self, playout_quantum_samples: usize, device_block_samples: usize) {
+        let playout_quantum_samples = playout_quantum_samples.max(1);
+        let device_block_samples = device_block_samples.max(1);
         let queued = self.queued_samples();
         let effective_target = self.effective_target_samples();
-        let block_floor = if output_block_samples > effective_target {
-            output_block_samples + self.samples.device_period_margin
+        let block_floor = if device_block_samples > effective_target {
+            device_block_samples + self.samples.device_period_margin
         } else {
-            output_block_samples
+            device_block_samples
         }
         .min(self.samples.hard_queue_bound);
         self.output_target_floor_samples = block_floor;
@@ -317,14 +321,14 @@ impl AdaptivePlaybackStream {
             }
             ready
         } else {
-            let playable = queued >= output_block_samples || passive_tail_playable;
+            let playable = queued >= playout_quantum_samples || passive_tail_playable;
             self.output_priming = !playable;
             if passive_tail_playable {
                 self.passive_output_active = true;
             }
             playable
         };
-        self.output_block_remaining = output_block_samples;
+        self.output_block_remaining = playout_quantum_samples;
     }
 
     fn advance_sender_silence_output_block(&mut self, output_block_samples: usize) {
@@ -958,7 +962,10 @@ mod tests {
         let horizon = samples_for_duration(Duration::from_secs(3));
         let mut produced_output = 0usize;
         for _ in 0..horizon {
-            if stream.pop_output_sample(now, &mut stats, block).is_some() {
+            if stream
+                .pop_output_sample(now, &mut stats, block, block)
+                .is_some()
+            {
                 produced_output += 1;
             }
         }
@@ -991,7 +998,7 @@ mod tests {
             .collect();
         stream.queue_samples(&residual, DecodedFrameSource::Normal, now, &mut stats);
         for _ in 0..samples_for_duration(Duration::from_secs(1)) {
-            let _ = stream.pop_output_sample(now, &mut stats, block);
+            let _ = stream.pop_output_sample(now, &mut stats, block, block);
         }
         assert!(stream.queued_samples() <= samples_for_duration(Duration::from_millis(40)));
 
@@ -1000,7 +1007,7 @@ mod tests {
         let mut played = 0usize;
         for _ in 0..samples_for_duration(Duration::from_millis(300)) {
             if stream
-                .pop_output_sample(now, &mut stats, block)
+                .pop_output_sample(now, &mut stats, block, block)
                 .is_some_and(|sample| sample.abs() > 0.1)
             {
                 played += 1;
@@ -1062,13 +1069,19 @@ mod tests {
         );
 
         for _ in 0..block {
-            assert_eq!(stream.pop_output_sample(now, &mut stats, block), None);
+            assert_eq!(
+                stream.pop_output_sample(now, &mut stats, block, block),
+                None
+            );
         }
         assert_eq!(stream.queued_samples(), target.saturating_sub(1));
 
         stream.queue_samples(&[0.25], DecodedFrameSource::Normal, now, &mut stats);
 
-        assert_eq!(stream.pop_output_sample(now, &mut stats, block), Some(0.25));
+        assert_eq!(
+            stream.pop_output_sample(now, &mut stats, block, block),
+            Some(0.25)
+        );
     }
 
     #[test]
@@ -1089,7 +1102,7 @@ mod tests {
 
         let mut played = 0usize;
         for _ in 0..block {
-            match stream.pop_output_sample(now, &mut stats, block) {
+            match stream.pop_output_sample(now, &mut stats, FRAME_SAMPLES, block) {
                 Some(_sample) => {
                     played += 1;
                 }
@@ -1116,7 +1129,7 @@ mod tests {
             &mut stats,
         );
         assert_eq!(
-            stream.pop_output_sample(now, &mut stats, block),
+            stream.pop_output_sample(now, &mut stats, block, block),
             Some(0.001)
         );
         assert_eq!(stream.output_target_floor_samples, active_floor);
@@ -1213,7 +1226,7 @@ mod tests {
 
         for _ in 0..3 {
             assert_eq!(
-                stream.pop_output_sample(now, &mut stats, FRAME_SAMPLES),
+                stream.pop_output_sample(now, &mut stats, FRAME_SAMPLES, FRAME_SAMPLES),
                 Some(0.0)
             );
         }
@@ -1243,7 +1256,9 @@ mod tests {
 
         let mut played_residue = 0usize;
         for _ in 0..block {
-            let sample = stream.pop_output_sample(now, &mut stats, block).unwrap();
+            let sample = stream
+                .pop_output_sample(now, &mut stats, block, block)
+                .unwrap();
             if sample.abs() > f32::EPSILON {
                 played_residue += 1;
             }
@@ -1343,7 +1358,10 @@ mod tests {
         assert!(stream.effective_target_samples() < ceiling);
 
         for _ in 0..block {
-            assert_eq!(stream.pop_output_sample(now, &mut stats, block), None);
+            assert_eq!(
+                stream.pop_output_sample(now, &mut stats, block, block),
+                None
+            );
         }
 
         assert_eq!(stats.underrun_count, 1);
@@ -1416,7 +1434,7 @@ mod tests {
 
         let mut zero_filled = 0usize;
         for _ in 0..block {
-            let sample = stream.pop_output_sample(now, &mut stats, block);
+            let sample = stream.pop_output_sample(now, &mut stats, block, block);
             if sample == Some(0.0) {
                 zero_filled += 1;
             }
@@ -1444,7 +1462,10 @@ mod tests {
             &mut stats,
         );
 
-        assert_eq!(stream.pop_output_sample(now, &mut stats, block), None);
+        assert_eq!(
+            stream.pop_output_sample(now, &mut stats, block, block),
+            None
+        );
         assert_eq!(stats.underrun_count, 1);
     }
 

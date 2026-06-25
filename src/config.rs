@@ -106,9 +106,10 @@ pub enum BufferSize {
 /// Sample count `input-buffer.samples = "default"` resolves to: one 20 ms Opus
 /// frame at 48 kHz, which keeps capture wakeups aligned to the encoder frame.
 pub const DEFAULT_INPUT_BUFFER_SAMPLES: u32 = 960;
-/// Sample count `output-buffer.samples = "default"` resolves to: one 20 ms Opus
-/// frame at 48 kHz, matching the input default.
-pub const DEFAULT_OUTPUT_BUFFER_SAMPLES: u32 = 960;
+/// Sample count `output-buffer.samples = "default"` resolves to: one 10 ms
+/// playback quantum at 48 kHz, lowering latency on hosts that honor fixed
+/// output periods.
+pub const DEFAULT_OUTPUT_BUFFER_SAMPLES: u32 = 480;
 
 impl BufferSize {
     /// Resolves the configured size into a [`BufferRequest`], substituting
