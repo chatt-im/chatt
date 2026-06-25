@@ -22,6 +22,8 @@ pub(crate) fn render(app: &mut App, buf: &mut Buffer, now_ms: u64) {
         .capture
         .as_ref()
         .map(|capture| capture.stats().snapshot());
+    app.top_bar_mute_rect = Rect::EMPTY;
+    app.top_bar_deafen_rect = Rect::EMPTY;
 
     let mut screen = buf.rect();
     if matches!(
@@ -38,18 +40,13 @@ pub(crate) fn render(app: &mut App, buf: &mut Buffer, now_ms: u64) {
         return;
     }
 
+    let top_bar_area = screen.take_top(1);
+    draw_top_bar(top_bar_area, app, buf, capture.as_ref());
+
     let composer_height = composer_height(app, screen.w);
-    let composer_area = screen.take_bottom(composer_height as i32);
+    let minibuffer_area = screen.take_bottom(1);
     let status_area = screen.take_bottom(1);
-    let room_height = app.config.ui.room_height.min(screen.h.saturating_sub(1));
-    if room_height > 0 {
-        let room_area = screen.take_top(room_height as i32);
-        draw_room(room_area, app, buf);
-    }
-    if screen.h > 0 {
-        let title_area = screen.take_top(1);
-        draw_room_title(title_area, app, buf);
-    }
+    let composer_area = screen.take_bottom(composer_height as i32);
 
     if app.mode == theme::UiMode::Settings {
         draw_composer(composer_area, app, buf);
@@ -68,16 +65,18 @@ pub(crate) fn render(app: &mut App, buf: &mut Buffer, now_ms: u64) {
             &mut app.audio_output_picker,
         );
         draw_status(status_area, app, buf, capture.as_ref());
+        draw_minibuffer(minibuffer_area, app, buf);
         draw_volume_dialog(buf.rect(), app, buf);
         return;
     }
 
-    match app.mode {
-        theme::UiMode::Compose | theme::UiMode::Log => draw_chat(screen, app, buf, now_ms),
-        theme::UiMode::Settings | theme::UiMode::ServerSelect | theme::UiMode::ServerEdit => {}
-    }
+    let chat_log_bar_area = screen.take_bottom(1);
+    draw_workspace(screen, app, buf, now_ms);
+    draw_chat_log_bar(chat_log_bar_area, app, buf);
+
     draw_status(status_area, app, buf, capture.as_ref());
     draw_composer(composer_area, app, buf);
+    draw_minibuffer(minibuffer_area, app, buf);
     draw_volume_dialog(buf.rect(), app, buf);
 }
 
@@ -137,6 +136,26 @@ fn draw_room(area: Rect, app: &App, buf: &mut Buffer) {
                 participant.name, state, spoke, voice, control
             ),
         );
+    }
+}
+
+fn draw_workspace(area: Rect, app: &mut App, buf: &mut Buffer, now_ms: u64) {
+    let mut rows = area;
+    let room_height = app.config.ui.room_height.min(rows.h.saturating_sub(1));
+    if room_height > 0 {
+        let room_area = rows.take_top(room_height as i32);
+        draw_room(room_area, app, buf);
+    }
+
+    if rows.h > 0 {
+        let lobby_bar = rows.take_top(1);
+        draw_lobby_bar(lobby_bar, app, buf);
+    }
+
+    if rows.h > 0 {
+        draw_chat(rows, app, buf, now_ms);
+    } else {
+        clear_chat_layout(app);
     }
 }
 
@@ -475,17 +494,122 @@ fn draw_volume_dialog(area: Rect, app: &mut App, buf: &mut Buffer) {
     dialog.render(area, buf, theme);
 }
 
-fn draw_room_title(area: Rect, app: &App, buf: &mut Buffer) {
+fn draw_top_bar(area: Rect, app: &mut App, buf: &mut Buffer, capture: Option<&StatsSnapshot>) {
+    if area.is_empty() {
+        return;
+    }
+    let theme = app.theme;
+    area.with(theme.status_fill).fill(buf);
+
+    let server = if app.server_alias.trim().is_empty() {
+        "Server"
+    } else {
+        app.server_alias.as_str()
+    };
+    let mut left = area;
+    draw_status_segment(
+        &mut left,
+        buf,
+        theme.status_section | Modifier::BOLD,
+        &format!(" {server} - {} ", connection_state_label(app)),
+    );
+    if !app.user.trim().is_empty() {
+        draw_status_segment(
+            &mut left,
+            buf,
+            theme.status_fill.patch(theme.muted),
+            &format!(" {} ", app.user),
+        );
+    }
+
+    let mut right = area;
+    let deafened = app.deafened.load(Ordering::Relaxed);
+    let muted = deafened || app.mic_muted.load(Ordering::Relaxed);
+    app.top_bar_deafen_rect = draw_status_segment_right(
+        &mut right,
+        buf,
+        if deafened {
+            theme.status_section.patch(theme.warn) | Modifier::BOLD
+        } else {
+            theme.status_fill.patch(theme.good)
+        },
+        if deafened { " DEAF " } else { " HEAR " },
+    );
+    app.top_bar_mute_rect = draw_status_segment_right(
+        &mut right,
+        buf,
+        if muted {
+            theme.status_section.patch(theme.warn) | Modifier::BOLD
+        } else {
+            theme.status_fill.patch(theme.good)
+        },
+        if muted { " MUTED " } else { " MIC " },
+    );
+    draw_status_segment_right(&mut right, buf, theme.status_fill, " ");
+
+    let meter_width = right.w.min(14);
+    if meter_width > 0 {
+        let meter = right.take_right(meter_width as i32);
+        ui::vu::draw_status_vu(meter, buf, capture, &theme);
+    }
+    draw_status_segment_right(&mut right, buf, theme.status_fill, " ");
+    draw_status_segment_right(
+        &mut right,
+        buf,
+        theme.status_fill.patch(voice_style(app)),
+        &format!(
+            " {} {} ",
+            voice_state_label(app),
+            mic_status_compact(app, capture)
+        ),
+    );
+}
+
+fn draw_lobby_bar(area: Rect, app: &App, buf: &mut Buffer) {
+    if area.is_empty() {
+        return;
+    }
     area.with(app.theme.status_section | Modifier::BOLD)
         .fill(buf);
+    let voice_count = app
+        .participants
+        .entries
+        .iter()
+        .filter(|participant| participant.online && participant.voice_active)
+        .count();
     area.with(app.theme.status_section | Modifier::BOLD).text(
         buf,
         &format!(
-            " ROOM {}  online {}/{}  voice {} ",
+            " Lobby  room {}  online {}/{}  voice {} ",
             app.room_name,
             app.participants.online_count(),
             app.participants.entries.len(),
-            app.participants.online_count()
+            voice_count
+        ),
+    );
+}
+
+fn draw_chat_log_bar(area: Rect, app: &App, buf: &mut Buffer) {
+    if area.is_empty() {
+        return;
+    }
+    area.with(app.theme.status_section | Modifier::BOLD)
+        .fill(buf);
+    let mut row = area;
+    draw_status_segment(
+        &mut row,
+        buf,
+        app.theme.status_section | Modifier::BOLD,
+        " Chat Log ",
+    );
+    draw_status_segment(
+        &mut row,
+        buf,
+        app.theme.status_section.patch(app.theme.subtle),
+        &format!(
+            " {} msg/{} rows ",
+            app.chat.len(),
+            app.chat.total_lines_estimate()
         ),
     );
 }
@@ -493,6 +617,7 @@ fn draw_room_title(area: Rect, app: &App, buf: &mut Buffer) {
 fn draw_chat(area: Rect, app: &mut App, buf: &mut Buffer, now_ms: u64) {
     area.with(app.theme.background).fill(buf);
     if area.is_empty() {
+        clear_chat_layout(app);
         return;
     }
     // The leftmost column is a marker gutter (`▟`/`▌`), so content wraps to one
@@ -564,6 +689,12 @@ fn draw_chat(area: Rect, app: &mut App, buf: &mut Buffer, now_ms: u64) {
     }
 }
 
+fn clear_chat_layout(app: &mut App) {
+    app.last_chat_height = 0;
+    app.last_chat_rect = Rect::EMPTY;
+    app.last_chat_lines.clear();
+}
+
 /// Draws a block heading: the `▟` marker, then the sender name on the left and
 /// the relative age on the right, both padded one column inside `row`.
 fn draw_chat_heading(
@@ -617,7 +748,10 @@ fn chat_age(timestamp_ms: u64, now_ms: u64) -> String {
     chat_buffer::format_age(now_ms.saturating_sub(timestamp_ms))
 }
 
-fn draw_status(area: Rect, app: &App, buf: &mut Buffer, capture: Option<&StatsSnapshot>) {
+fn draw_status(area: Rect, app: &App, buf: &mut Buffer, _capture: Option<&StatsSnapshot>) {
+    if area.is_empty() {
+        return;
+    }
     let theme = &app.theme;
     area.with(theme.status_fill).fill(buf);
     let mut row = area;
@@ -630,38 +764,8 @@ fn draw_status(area: Rect, app: &App, buf: &mut Buffer, capture: Option<&StatsSn
     draw_status_segment(
         &mut row,
         buf,
-        theme.status_section,
-        &format!(" {} ", app.room_name),
-    );
-    draw_status_segment(&mut row, buf, theme.status_fill, &format!(" {} ", app.user));
-    draw_status_segment(
-        &mut row,
-        buf,
-        voice_style(app),
-        &format!(" {} ", voice_state_label(app)),
-    );
-    draw_status_segment(
-        &mut row,
-        buf,
-        theme.status_fill,
-        &format!(" {} ", mic_status_compact(app, capture)),
-    );
-    draw_status_segment(&mut row, buf, theme.status_fill, " ");
-    let meter_width = row.w.min(12);
-    if meter_width > 0 {
-        let meter = row.take_left(meter_width as i32);
-        ui::vu::draw_status_vu(meter, buf, capture, theme);
-    }
-    draw_status_segment(&mut row, buf, theme.status_fill, " ");
-    draw_status_segment(
-        &mut row,
-        buf,
         theme.status_fill.patch(theme.subtle),
-        &format!(
-            " {} msg/{} rows ",
-            app.chat.len(),
-            app.chat.total_lines_estimate()
-        ),
+        &format!(" {} ", app.focus.active().label()),
     );
 
     let right_style = match app.status_kind {
@@ -675,7 +779,7 @@ fn draw_status(area: Rect, app: &App, buf: &mut Buffer, capture: Option<&StatsSn
             chord.activated_at.elapsed().as_millis()
         )
     } else {
-        format!("{} | {}", app.focus.active().label(), app.status)
+        app.status.clone()
     };
     row.with(HAlign::Right)
         .with(right_style)
@@ -694,7 +798,20 @@ fn draw_status_segment(row: &mut Rect, buf: &mut Buffer, style: Style, text: &st
         .text(buf, text);
 }
 
+fn draw_status_segment_right(row: &mut Rect, buf: &mut Buffer, style: Style, text: &str) -> Rect {
+    if row.is_empty() {
+        return Rect::EMPTY;
+    }
+    let width = UnicodeWidthStr::width(text).min(u16::MAX as usize) as u16;
+    let area = row.take_right(width as i32);
+    area.with(style).with(Ellipsis(true)).text(buf, text);
+    area
+}
+
 fn draw_composer(area: Rect, app: &mut App, buf: &mut Buffer) {
+    if area.is_empty() {
+        return;
+    }
     area.with(app.theme.panel).fill(buf);
     app.composer.resize(area.w.max(1));
     app.composer_hl
@@ -703,6 +820,23 @@ fn draw_composer(area: Rect, app: &mut App, buf: &mut Buffer) {
         area.with(app.theme.muted)
             .with(Ellipsis(true))
             .text(buf, &format!(" {}", app.config.ui.placeholder));
+    }
+}
+
+fn draw_minibuffer(area: Rect, app: &App, buf: &mut Buffer) {
+    if area.is_empty() {
+        return;
+    }
+    area.with(app.theme.background).fill(buf);
+}
+
+fn connection_state_label(app: &App) -> &'static str {
+    if app.network.is_none() {
+        "Disconnected"
+    } else if app.user_id.is_some() {
+        "Connected"
+    } else {
+        "Connecting"
     }
 }
 
