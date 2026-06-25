@@ -1,4 +1,9 @@
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::{
+    io::{self, Write},
+    panic,
+    sync::Once,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 
 use extui::{
     Buffer, Terminal, TerminalFlags,
@@ -13,11 +18,13 @@ use crate::{
 };
 
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
+static PANIC_HOOK: Once = Once::new();
 
 pub(crate) fn run_app(
     config: Config,
     pending_invite: Option<InviteTicket>,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    install_panic_hook();
     let mut app = App::new(config, pending_invite)?;
     event::polling::initialize_global_waker(GlobalWakerConfig {
         resize: true,
@@ -79,4 +86,39 @@ pub(crate) fn run_app(
             clipboard.copy(&mut terminal, &text);
         }
     }
+}
+
+fn install_panic_hook() {
+    PANIC_HOOK.call_once(|| {
+        panic::set_hook(Box::new(|info| {
+            restore_terminal_escape_state();
+            let payload = info
+                .payload()
+                .downcast_ref::<&str>()
+                .copied()
+                .or_else(|| info.payload().downcast_ref::<String>().map(String::as_str))
+                .unwrap_or("panic payload was not a string");
+            let location = info
+                .location()
+                .map(|location| {
+                    format!(
+                        "{}:{}:{}",
+                        location.file(),
+                        location.line(),
+                        location.column()
+                    )
+                })
+                .unwrap_or_else(|| "unknown location".to_string());
+            eprintln!("chatt crashed: {payload}");
+            eprintln!("panic location: {location}");
+        }));
+    });
+}
+
+fn restore_terminal_escape_state() {
+    let mut stderr = io::stderr().lock();
+    let _ = stderr.write_all(
+        b"\x1b[?1049l\x1b[?25h\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?2004l\r\n",
+    );
+    let _ = stderr.flush();
 }

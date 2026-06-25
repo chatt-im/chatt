@@ -4,6 +4,7 @@ use std::{
     fs::{self, File, OpenOptions},
     io::{self, Read, Write},
     net::{IpAddr, SocketAddr, TcpStream as StdTcpStream, ToSocketAddrs},
+    panic::{self, AssertUnwindSafe},
     path::{Path, PathBuf},
     sync::{
         Arc,
@@ -167,6 +168,9 @@ pub enum NetworkEvent {
         retry_in: Duration,
         reason: String,
     },
+    WorkerStopped {
+        reason: String,
+    },
     Disconnected,
 }
 
@@ -224,7 +228,18 @@ impl NetworkClient {
             tx,
             waker: Arc::new(waker),
         };
-        let worker = thread::spawn(move || run_worker(config, events, rx, poll));
+        let panic_events = events.clone();
+        let worker = thread::spawn(move || {
+            let result = panic::catch_unwind(AssertUnwindSafe(|| {
+                run_worker(config, events, rx, poll);
+            }));
+            if result.is_err() {
+                kvlog::error!("network worker panicked");
+                let _ = panic_events.send(NetworkEvent::WorkerStopped {
+                    reason: "network worker panicked".to_string(),
+                });
+            }
+        });
         Ok(Self {
             tx,
             worker: Some(worker),
@@ -235,8 +250,16 @@ impl NetworkClient {
         self.tx.clone()
     }
 
+    pub fn try_send(&self, command: NetworkCommand) -> Result<(), SendError<NetworkCommand>> {
+        self.tx.send(command)
+    }
+
     pub fn send(&self, command: NetworkCommand) {
-        let _ = self.tx.send(command);
+        let _ = self.try_send(command);
+    }
+
+    pub fn is_worker_finished(&self) -> bool {
+        self.worker.as_ref().is_some_and(JoinHandle::is_finished)
     }
 
     pub fn stop(mut self) {
