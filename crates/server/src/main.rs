@@ -5,7 +5,7 @@ use std::{
     net::SocketAddr,
     sync::mpsc,
     thread,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 mod config;
@@ -49,6 +49,7 @@ const DEFAULT_ROOM: RoomId = RoomId(1);
 const POLL_TIMEOUT: Duration = Duration::from_millis(100);
 const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(20);
 const MAX_CLIENTS: usize = 1024;
+const MEDIA_SWEEP_INTERVAL: Duration = Duration::from_secs(30);
 const INVITE_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -172,6 +173,7 @@ struct Server {
     invites: HashMap<String, InviteState>,
     rng: ring::rand::SystemRandom,
     server_key_pair: ring::signature::Ed25519KeyPair,
+    next_media_sweep_at: Option<Instant>,
 }
 
 impl Server {
@@ -259,6 +261,7 @@ impl Server {
             invites: HashMap::new(),
             rng: ring::rand::SystemRandom::new(),
             server_key_pair,
+            next_media_sweep_at: None,
         })
     }
 
@@ -292,7 +295,7 @@ impl Server {
             }
             self.handle_admin_commands(admin_rx);
             self.flush_disconnects();
-            self.sweep_stale_media_keys();
+            self.sweep_stale_media_keys(Instant::now());
         }
     }
 
@@ -348,24 +351,34 @@ impl Server {
 
     fn accept_clients(&mut self) -> io::Result<()> {
         loop {
-            if self.clients.len() >= MAX_CLIENTS {
-                kvlog::warn!(
-                    "tcp client cap reached",
-                    client_count = self.clients.len(),
-                    max_clients = MAX_CLIENTS
-                );
-                return Ok(());
-            }
             let (mut socket, addr) = match self.listener.accept() {
                 Ok(value) => value,
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(()),
                 Err(error) if is_transient_accept_error(&error) => {
+                    // fd pressure (EMFILE/ENFILE) cannot drain by accepting, so
+                    // back off briefly before returning. This stalls the whole
+                    // single-threaded loop, but a tight retry would just spin on
+                    // the same error and starve existing clients harder.
                     kvlog::warn!("transient tcp accept failure", error = %error);
                     thread::sleep(ACCEPT_ERROR_BACKOFF);
                     return Ok(());
                 }
                 Err(error) => return Err(error),
             };
+            // Accept then close over-cap connections so the backlog keeps
+            // draining. Returning early would leave the listener readable with
+            // an edge-triggered poll, so it would not wake again until the next
+            // new connection.
+            if self.clients.len() >= MAX_CLIENTS {
+                kvlog::warn!(
+                    "tcp client cap reached, rejecting connection",
+                    client_count = self.clients.len(),
+                    max_clients = MAX_CLIENTS,
+                    addr = %addr
+                );
+                drop(socket);
+                continue;
+            }
             let token = Token(self.next_token);
             self.next_token += 1;
             kvlog::info!(
@@ -2163,7 +2176,17 @@ impl Server {
         }
     }
 
-    fn sweep_stale_media_keys(&mut self) {
+    /// Backstop that drops media-key mappings whose session has gone away.
+    /// `disconnect` already removes a session's key on the normal path, so this
+    /// only catches leaks and runs at most once per [`MEDIA_SWEEP_INTERVAL`].
+    fn sweep_stale_media_keys(&mut self, now: Instant) {
+        if self
+            .next_media_sweep_at
+            .is_some_and(|deadline| now < deadline)
+        {
+            return;
+        }
+        self.next_media_sweep_at = Some(now + MEDIA_SWEEP_INTERVAL);
         let sessions = &self.sessions;
         let before = self.media_key_to_session.len();
         self.media_key_to_session

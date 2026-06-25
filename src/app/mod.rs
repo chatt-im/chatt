@@ -234,14 +234,20 @@ impl RecoveryState {
         self.reason = None;
         self.exhausted = false;
     }
+
+    fn is_pending(&self) -> bool {
+        self.next_retry_at.is_some()
+    }
 }
 
+/// Backoff before the n-th recovery attempt. `schedule` only ever passes
+/// attempts `1..=RECOVERY_MAX_ATTEMPTS`, so the first attempt is immediate and
+/// the rest ramp up before exhaustion.
 fn recovery_delay(attempt: usize) -> Duration {
     match attempt {
         0 | 1 => Duration::ZERO,
         2 => Duration::from_secs(1),
-        3 => Duration::from_secs(2),
-        _ => Duration::from_secs(5),
+        _ => Duration::from_secs(2),
     }
 }
 
@@ -1667,7 +1673,15 @@ impl App {
             .network
             .as_ref()
             .is_some_and(NetworkClient::is_worker_finished)
+            && !self.supervisor.network.is_pending()
         {
+            // First detection of a silently-dead worker. Tear down audio bound
+            // to its closed command channel and match the WorkerStopped event
+            // path, so a muted capture stream cannot keep a stale sender alive
+            // until the restart fires. The `is_pending` guard keeps this from
+            // re-running every tick while recovery is already scheduled.
+            self.stop_audio();
+            self.stream_users.clear();
             self.schedule_network_recovery(now, "network worker stopped");
         }
         if let Some(reason) = self.supervisor.network.take_due(now) {
