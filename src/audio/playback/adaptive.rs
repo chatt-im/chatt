@@ -19,6 +19,9 @@ use crate::audio::{
     },
 };
 
+const LIVE_PLAYBACK_PREALLOCATED_FRAMES: usize = 256;
+const LIVE_PLAYBACK_PREALLOCATED_UNDERRUNS: usize = 128;
+
 #[derive(Clone, Copy)]
 pub(crate) struct TuningSampleCounts {
     target_queue: usize,
@@ -127,7 +130,7 @@ impl AdaptivePlaybackStream {
         Ok(Self {
             tuning,
             samples,
-            input: MonoSampleQueue::new(),
+            input: MonoSampleQueue::with_capacity(LIVE_PLAYBACK_PREALLOCATED_FRAMES),
             scaler: TimeScaler::new(),
             time_scale_window: Vec::with_capacity(TIME_SCALE_WINDOW),
             decision_countdown: 0,
@@ -135,7 +138,7 @@ impl AdaptivePlaybackStream {
             idle_expansion_samples: 0,
             recommended_target_samples: samples.target_queue.max(samples.base_minimum_target),
             underrun_hold_until: None,
-            recent_underruns: VecDeque::new(),
+            recent_underruns: VecDeque::with_capacity(LIVE_PLAYBACK_PREALLOCATED_UNDERRUNS),
             underrun_active: false,
             sender_silent: false,
             passive_output_active: false,
@@ -166,10 +169,20 @@ impl AdaptivePlaybackStream {
         now: Instant,
         stats: &mut LivePlaybackMixerStats,
     ) {
+        self.queue_samples_owned_with_delay(samples.to_vec(), source, playout_delay, now, stats);
+    }
+
+    pub(crate) fn queue_samples_owned_with_delay(
+        &mut self,
+        mut samples: Vec<f32>,
+        source: DecodedFrameSource,
+        playout_delay: Option<PlayoutDelay>,
+        now: Instant,
+        stats: &mut LivePlaybackMixerStats,
+    ) {
         if samples.is_empty() {
             return;
         }
-        let mut samples = samples.to_vec();
         self.declick_recovery_boundary(&mut samples, source);
         let passive_frame = samples_are_passive(&samples);
         self.input

@@ -45,6 +45,13 @@ impl MonoSampleQueue {
         Self::default()
     }
 
+    pub(crate) fn with_capacity(capacity: usize) -> Self {
+        Self {
+            frames: VecDeque::with_capacity(capacity),
+            total: 0,
+        }
+    }
+
     pub(crate) fn push_back(&mut self, samples: &[f32]) {
         self.push_back_with_source(samples, DecodedFrameSource::Normal);
     }
