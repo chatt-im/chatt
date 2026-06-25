@@ -46,7 +46,7 @@ max-composer-height = 6
 placeholder = "Message #lobby"
 max-messages = 50000
 overscan = 24
-form-bindings = "standard"
+form-bindings = "vim"
 # Color theme: "tomorrow-night", "base16-dark", or "base16-light".
 theme = "tomorrow-night"
 
@@ -68,12 +68,21 @@ prefer-ipv6 = true
 [bindings.insert]
 "C-c" = "Quit"
 "F2" = "OpenSettings"
-"ESC" = "EnterLog"
 "ENTER" = "SubmitMessage"
 "C-m" = "SubmitMessage"
 "C-g" = "Cancel"
 "C-v" = "ToggleMute"
 "C-h" = "ToggleDeafen"
+"D-j" = "FocusNext"
+"D-k" = "FocusPrev"
+
+[bindings.compose-normal]
+"F2" = "OpenSettings"
+"J" = "FocusNext"
+"K" = "FocusPrev"
+"D-j" = "FocusNext"
+"D-k" = "FocusPrev"
+"m" = "ToggleMute"
 
 [bindings.workspace]
 "C-c" = "Quit"
@@ -83,8 +92,10 @@ prefer-ipv6 = true
 "q" = "EnterCompose"
 "j" = "ScrollDown"
 "k" = "ScrollUp"
-"J" = "RoomScrollDown"
-"K" = "RoomScrollUp"
+"J" = "FocusNext"
+"K" = "FocusPrev"
+"D-j" = "FocusNext"
+"D-k" = "FocusPrev"
 "ENTER" = "OpenSelectedUserVolume"
 "M" = "ToggleSelectedUserMute"
 "DOWN" = "ScrollDown"
@@ -98,6 +109,7 @@ prefer-ipv6 = true
 "c" = "ClearChat"
 "y" = "CopySelection"
 "e" = "ToggleExpand"
+"TAB" = "ToggleExpand"
 
 [bindings.picker]
 "C-c" = "Quit"

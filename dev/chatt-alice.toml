@@ -5,6 +5,7 @@ display-name = "Alice"
 token = "alice-dev-token"
 server-public-key = ""
 tcp-addr = "127.0.0.1:41000"
+udp-addr = "127.0.0.1:41000"
 room-id = 1
 
 [ui]
@@ -13,14 +14,129 @@ room-height = 4
 max-composer-height = 6
 max-messages = 50000
 overscan = 24
+form-bindings = "vim"
+theme = "tomorrow-night"
 
 [files]
 receive-dir = "/tmp/chatt-alice"
 max-upload-bytes = 52428800
 max-receive-bytes = 52428800
 
+[bindings]
+
+[bindings.insert]
+C-c = "Quit"
+F2 = "OpenSettings"
+ENTER = "SubmitMessage"
+C-m = "SubmitMessage"
+C-g = "Cancel"
+C-v = "ToggleMute"
+C-h = "ToggleDeafen"
+
+[bindings.workspace]
+C-c = "Quit"
+i = "EnterCompose"
+a = "EnterCompose"
+F2 = "OpenSettings"
+q = "EnterCompose"
+j = "ScrollDown"
+k = "ScrollUp"
+J = "FocusNext"
+K = "FocusPrev"
+ENTER = "OpenSelectedUserVolume"
+M = "ToggleSelectedUserMute"
+DOWN = "ScrollDown"
+UP = "ScrollUp"
+C-d = "HalfPageDown"
+C-u = "HalfPageUp"
+G = "Bottom"
+"g g" = "Top"
+m = "ToggleMute"
+h = "ToggleDeafen"
+c = "ClearChat"
+y = "CopySelection"
+e = "ToggleExpand"
+TAB = "ToggleExpand"
+
+[bindings.picker]
+C-c = "Quit"
+ESC = "Cancel"
+q = "Cancel"
+j = "SelectNext"
+k = "SelectPrev"
+DOWN = "SelectNext"
+UP = "SelectPrev"
+ENTER = "Activate"
+F2 = "OpenSettings"
+
+[bindings.form]
+C-c = "Quit"
+ESC = "Cancel"
+TAB = "FocusNext"
+BACKTAB = "FocusPrev"
+DOWN = "FocusNext"
+UP = "FocusPrev"
+ENTER = "Activate"
+
+[bindings.settings]
+C-c = "Quit"
+ESC = "Cancel"
+q = "CloseSettings"
+F2 = "CloseSettings"
+j = "FocusNext"
+k = "FocusPrev"
+DOWN = "SelectNext"
+UP = "SelectPrev"
+C-j = "SelectNext"
+C-k = "SelectPrev"
+TAB = "FocusNext"
+BACKTAB = "FocusPrev"
+h = "AdjustLeft"
+l = "AdjustRight"
+C-l = "AdjustRight"
+LEFT = "AdjustLeft"
+RIGHT = "AdjustRight"
+ENTER = "Activate"
+r = "RefreshDevices"
+w = "SaveSettings"
+C-s = "SaveSettings"
+
+[bindings.dialog]
+C-c = "Quit"
+ESC = "Cancel"
+ENTER = "Activate"
+LEFT = "AdjustLeft"
+RIGHT = "AdjustRight"
+DOWN = "AdjustLeft"
+UP = "AdjustRight"
+
 
 [audio]
 bitrate-bps = 48000
+denoise = "rnn-noise"
 echo-cancellation = true
-max-amplification = 2.0
+max-amplification = 0.0
+denoise-suppression = 1.0
+denoise-release = 1.0
+denoise-typing-suppression = false
+denoise-typing-vad-enter = 0.800000011920929
+denoise-typing-vad-release = 0.8199999928474426
+input-buffer = "default"
+output-buffer = "default"
+
+[audio.latency]
+adaptive-catch-up = true
+capture-silence-gate = true
+adaptive-target = true
+target-queue-ms = 60
+dynamic-target-floor-ms = 20
+base-minimum-target-ms = 0
+max-target-ms = 1000
+hard-queue-bound-ms = 1500
+initial-buffer-ms = 40
+max-reorder-delay-ms = 60
+device-period-margin-ms = 20
+silence-vad-max = 64
+capture-long-silence-stop-ms = 2000
+capture-silence-preroll-ms = 30
+capture-silence-ramp-ms = 10

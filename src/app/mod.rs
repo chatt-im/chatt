@@ -21,7 +21,7 @@ use extui::event::{
     KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
 use extui_bindings::InputKey;
-use extui_editor::{Editor, Span as EditorSpan, bindings as editor_bindings};
+use extui_editor::{Editor, Mode as EditorMode, Span as EditorSpan, bindings as editor_bindings};
 use rpc::{
     control::{ChatMessage, InviteTicket},
     ids::{SessionId, UserId},
@@ -71,6 +71,34 @@ pub(crate) enum StatusKind {
     Error,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ChatPanelFocus {
+    Lobby,
+    ChatLog,
+    Compose,
+}
+
+impl ChatPanelFocus {
+    const ORDER: [Self; 3] = [Self::Lobby, Self::ChatLog, Self::Compose];
+
+    fn moved(self, delta: isize) -> Self {
+        let current = Self::ORDER
+            .iter()
+            .position(|panel| *panel == self)
+            .unwrap_or(0);
+        let next = (current as isize + delta).rem_euclid(Self::ORDER.len() as isize) as usize;
+        Self::ORDER[next]
+    }
+
+    fn focus_id(self) -> FocusId {
+        match self {
+            Self::Lobby => FocusId::Participants,
+            Self::ChatLog => FocusId::Chat,
+            Self::Compose => FocusId::Composer,
+        }
+    }
+}
+
 pub(crate) struct App {
     pub(crate) config: Config,
     pub(crate) theme: Theme,
@@ -81,6 +109,7 @@ pub(crate) struct App {
     pub(crate) status: String,
     pub(crate) status_kind: StatusKind,
     pub(crate) mode: theme::UiMode,
+    pub(crate) chat_focus: ChatPanelFocus,
     pub(crate) focus: FocusManager,
     pub(crate) modes: ModeStack,
     pub(crate) composer: Editor,
@@ -91,6 +120,11 @@ pub(crate) struct App {
     pub(crate) last_chat_height: u16,
     pub(crate) last_chat_rect: Rect,
     pub(crate) last_chat_lines: Vec<VisibleLine>,
+    pub(crate) last_room_rect: Rect,
+    pub(crate) last_lobby_bar_rect: Rect,
+    pub(crate) last_chat_log_bar_rect: Rect,
+    pub(crate) last_composer_rect: Rect,
+    pub(crate) last_compose_bar_rect: Rect,
     pub(crate) top_bar_mute_rect: Rect,
     pub(crate) top_bar_deafen_rect: Rect,
     pub(crate) pending_clipboard: Option<String>,
@@ -327,6 +361,7 @@ impl App {
             status: "select a server".to_string(),
             status_kind: StatusKind::Info,
             mode: theme::UiMode::ServerSelect,
+            chat_focus: ChatPanelFocus::Compose,
             focus: FocusManager::new(FocusId::ServerList),
             modes: ModeStack::new(ModeKind::ServerSelect),
             composer,
@@ -337,6 +372,11 @@ impl App {
             last_chat_height: 0,
             last_chat_rect: Rect::EMPTY,
             last_chat_lines: Vec::new(),
+            last_room_rect: Rect::EMPTY,
+            last_lobby_bar_rect: Rect::EMPTY,
+            last_chat_log_bar_rect: Rect::EMPTY,
+            last_composer_rect: Rect::EMPTY,
+            last_compose_bar_rect: Rect::EMPTY,
             top_bar_mute_rect: Rect::EMPTY,
             top_bar_deafen_rect: Rect::EMPTY,
             pending_clipboard: None,
@@ -516,8 +556,7 @@ impl App {
         self.server_alias = server.alias.clone();
         self.user = server.effective_display_name();
         self.room_name = "lobby".to_string();
-        self.set_mode(theme::UiMode::Compose);
-        self.composer.enter_insert_mode();
+        self.enter_compose_insert_mode();
         self.network = Some(network);
         self.supervisor.network.reset();
         self.set_status("connecting");
@@ -930,7 +969,7 @@ impl App {
             return false;
         }
         if rect_contains(self.top_bar_mute_rect, mouse.column, mouse.row) {
-            self.set_mute(!self.mic_muted.load(Ordering::Relaxed));
+            self.toggle_mute();
             return true;
         }
         if rect_contains(self.top_bar_deafen_rect, mouse.column, mouse.row) {
@@ -942,24 +981,64 @@ impl App {
 
     fn process_chat_mouse(&mut self, mouse: MouseEvent) -> Action {
         let rect = self.last_chat_rect;
+        let in_chat = rect_contains(rect, mouse.column, mouse.row);
+        let in_chat_bar = rect_contains(self.last_chat_log_bar_rect, mouse.column, mouse.row);
+        let in_room = rect_contains(self.last_room_rect, mouse.column, mouse.row);
+        let in_lobby_bar = rect_contains(self.last_lobby_bar_rect, mouse.column, mouse.row);
+        let in_composer = rect_contains(self.last_composer_rect, mouse.column, mouse.row)
+            || rect_contains(self.last_compose_bar_rect, mouse.column, mouse.row);
+
         match mouse.kind {
-            MouseEventKind::ScrollUp if rect_contains(rect, mouse.column, mouse.row) => {
+            MouseEventKind::Down(MouseButton::Left) if in_composer => {
+                self.enter_compose_insert_mode();
+            }
+            MouseEventKind::Down(MouseButton::Left) if in_lobby_bar => {
+                self.set_chat_panel_focus(ChatPanelFocus::Lobby);
+            }
+            MouseEventKind::ScrollUp if in_room => {
+                self.move_room_selection_with_focus(-1);
+            }
+            MouseEventKind::ScrollDown if in_room => {
+                self.move_room_selection_with_focus(1);
+            }
+            MouseEventKind::Down(MouseButton::Left) if in_room => {
+                self.set_chat_panel_focus(ChatPanelFocus::Lobby);
+                let row = mouse.row.saturating_sub(self.last_room_rect.y) as usize;
+                if self.participants.select_visible_row(row).is_some() {
+                    self.keep_selected_room_user_visible();
+                    self.refresh_mode_and_focus();
+                }
+            }
+            MouseEventKind::Down(MouseButton::Left) if in_chat_bar => {
+                self.set_chat_panel_focus(ChatPanelFocus::ChatLog);
+            }
+            MouseEventKind::ScrollUp if in_chat => {
+                self.set_chat_panel_focus(ChatPanelFocus::ChatLog);
                 self.scroll_chat_up(5);
             }
-            MouseEventKind::ScrollDown if rect_contains(rect, mouse.column, mouse.row) => {
+            MouseEventKind::ScrollDown if in_chat => {
+                self.set_chat_panel_focus(ChatPanelFocus::ChatLog);
                 self.chat.scroll_down(5);
             }
-            MouseEventKind::Down(MouseButton::Left) => match self.chat_line_at(mouse.row) {
-                Some(line) if rect_contains(rect, mouse.column, mouse.row) => match line.kind {
-                    LineKind::Heading | LineKind::Ellipsis => {
-                        self.chat.toggle_expand(line.message, self.last_chat_width);
-                        self.chat.clear_selection();
-                    }
-                    LineKind::Body => self.chat.begin_selection((line.message, line.line)),
-                },
-                _ => self.chat.clear_selection(),
-            },
+            MouseEventKind::Down(MouseButton::Left) if in_chat => {
+                self.set_chat_panel_focus(ChatPanelFocus::ChatLog);
+                match self.chat_line_at(mouse.row) {
+                    Some(line) => match line.kind {
+                        LineKind::Heading | LineKind::Ellipsis => {
+                            self.chat
+                                .select_header_containing(line.message, self.last_chat_width);
+                            self.chat.toggle_expand(line.message, self.last_chat_width);
+                            self.chat.clear_selection();
+                        }
+                        LineKind::Body => {
+                            self.chat.begin_selection((line.message, line.line));
+                        }
+                    },
+                    _ => self.chat.clear_selection(),
+                }
+            }
             MouseEventKind::Drag(MouseButton::Left) if self.chat.is_selecting() => {
+                self.set_chat_panel_focus(ChatPanelFocus::ChatLog);
                 self.drag_chat_selection(mouse.row);
             }
             MouseEventKind::Up(MouseButton::Left) => self.chat.end_selection(),
@@ -992,22 +1071,17 @@ impl App {
         self.last_chat_lines.get(index).copied()
     }
 
-    /// Toggles collapse on the most recent visible collapsible message, scanning
-    /// the captured render rows from the bottom for its heading or ellipsis row.
-    fn toggle_recent_collapsible(&mut self) {
+    fn toggle_selected_log_collapse(&mut self) {
         let width = self.last_chat_width;
-        let mut target = None;
-        for line in self.last_chat_lines.iter().rev() {
-            if matches!(line.kind, LineKind::Heading | LineKind::Ellipsis)
-                && self.chat.is_collapsible(line.message, width)
-            {
-                target = Some(line.message);
-                break;
-            }
+        if self.chat.ensure_selected_header(width).is_none() {
+            self.set_status("no messages");
+            return;
         }
-        if let Some(message) = target {
-            self.chat.toggle_expand(message, width);
+        self.chat.clear_selection();
+        if !self.chat.toggle_selected_expand(width) {
+            self.set_status("selected log is not collapsible");
         }
+        self.keep_selected_chat_header_visible();
     }
 
     fn scroll_chat_up(&mut self, rows: usize) {
@@ -1017,6 +1091,8 @@ impl App {
 
     fn copy_chat_selection(&mut self) {
         if let Some(text) = self.chat.selected_text() {
+            self.pending_clipboard = Some(text);
+        } else if let Some(text) = self.chat.selected_header_text(self.last_chat_width) {
             self.pending_clipboard = Some(text);
         }
     }
@@ -1069,8 +1145,7 @@ impl App {
             KeyCode::Char('d') => self.delete_selected_server(),
             KeyCode::Char('q') | KeyCode::Esc => {
                 if self.network.is_some() {
-                    self.set_mode(theme::UiMode::Compose);
-                    self.composer.enter_insert_mode();
+                    self.enter_compose_insert_mode();
                 }
             }
             KeyCode::F2 => self.open_settings(),
@@ -1410,11 +1485,8 @@ impl App {
     pub(crate) fn process_command(&mut self, command: BindCommand) -> Action {
         use BindCommand::*;
         match command {
-            EnterCompose => {
-                self.set_mode(theme::UiMode::Compose);
-                self.composer.enter_insert_mode();
-            }
-            EnterLog => self.set_mode(theme::UiMode::Log),
+            EnterCompose => self.enter_compose_insert_mode(),
+            EnterLog => self.set_chat_panel_focus(ChatPanelFocus::ChatLog),
             OpenSettings => self.open_settings(),
             CloseSettings => self.close_settings(),
             SubmitMessage => self.submit_input(),
@@ -1425,36 +1497,98 @@ impl App {
                     }
                 } else if self.mode == theme::UiMode::Compose {
                     self.composer.clear();
-                    self.composer.enter_insert_mode();
+                    self.enter_compose_insert_mode();
                 } else {
-                    self.set_mode(theme::UiMode::Compose);
+                    self.enter_compose_insert_mode();
                 }
             }
             Quit => return Action::Quit,
-            ScrollUp => self.scroll_chat_up(1),
-            ScrollDown => self.chat.scroll_down(1),
-            RoomScrollUp => self.move_room_selection(-1),
-            RoomScrollDown => self.move_room_selection(1),
-            OpenSelectedUserVolume => self.open_selected_user_volume(),
-            ToggleSelectedUserMute => self.toggle_selected_user_mute(),
-            HalfPageUp => self.scroll_chat_up(10),
-            HalfPageDown => self.chat.scroll_down(10),
-            Top => self.chat.top(self.last_chat_width, self.last_chat_height),
-            Bottom => self.chat.bottom(),
-            CopySelection => self.copy_chat_selection(),
-            ToggleExpand => self.toggle_recent_collapsible(),
-            ToggleMute => self.set_mute(!self.mic_muted.load(Ordering::Relaxed)),
+            ScrollUp => self.scroll_focused_panel(-1, 1),
+            ScrollDown => self.scroll_focused_panel(1, 1),
+            RoomScrollUp => self.move_room_selection_with_focus(-1),
+            RoomScrollDown => self.move_room_selection_with_focus(1),
+            OpenSelectedUserVolume => {
+                if self.chat_focus == ChatPanelFocus::Lobby {
+                    self.open_selected_user_volume();
+                } else {
+                    self.set_status("focus lobby to adjust users");
+                }
+            }
+            ToggleSelectedUserMute => {
+                if self.chat_focus == ChatPanelFocus::Lobby {
+                    self.toggle_selected_user_mute();
+                } else {
+                    self.set_status("focus lobby to mute users");
+                }
+            }
+            HalfPageUp => self.scroll_chat_log_if_focused(-(self.chat_half_page_rows() as isize)),
+            HalfPageDown => self.scroll_chat_log_if_focused(self.chat_half_page_rows() as isize),
+            Top => {
+                if self.chat_focus == ChatPanelFocus::ChatLog {
+                    self.chat.top(self.last_chat_width, self.last_chat_height);
+                    self.chat.select_first_header();
+                    self.chat.clear_selection();
+                    self.keep_selected_chat_header_visible();
+                }
+            }
+            Bottom => {
+                if self.chat_focus == ChatPanelFocus::ChatLog {
+                    self.chat.bottom();
+                    self.chat.select_last_header(self.last_chat_width);
+                    self.chat.clear_selection();
+                    self.keep_selected_chat_header_visible();
+                }
+            }
+            CopySelection => {
+                if self.chat_focus == ChatPanelFocus::ChatLog {
+                    self.copy_chat_selection();
+                }
+            }
+            ToggleExpand => {
+                if self.chat_focus == ChatPanelFocus::ChatLog {
+                    self.toggle_selected_log_collapse();
+                }
+            }
+            ToggleMute => self.toggle_mute(),
             ToggleDeafen => self.set_deafen(!self.deafened.load(Ordering::Relaxed)),
             RefreshDevices => self.refresh_audio_devices(),
             SaveSettings => self.save_settings(),
             Activate => self.activate_settings_focus(),
-            FocusNext => self.move_settings_focus(1),
-            FocusPrev => self.move_settings_focus(-1),
-            SelectNext => self.move_settings_selection(1),
-            SelectPrev => self.move_settings_selection(-1),
+            FocusNext => {
+                if self.mode == theme::UiMode::Settings {
+                    self.move_settings_focus(1);
+                } else {
+                    self.move_chat_panel_focus(1);
+                }
+            }
+            FocusPrev => {
+                if self.mode == theme::UiMode::Settings {
+                    self.move_settings_focus(-1);
+                } else {
+                    self.move_chat_panel_focus(-1);
+                }
+            }
+            SelectNext => {
+                if self.mode == theme::UiMode::Settings {
+                    self.move_settings_selection(1);
+                } else if self.chat_focus == ChatPanelFocus::Lobby {
+                    self.move_room_selection_with_focus(1);
+                }
+            }
+            SelectPrev => {
+                if self.mode == theme::UiMode::Settings {
+                    self.move_settings_selection(-1);
+                } else if self.chat_focus == ChatPanelFocus::Lobby {
+                    self.move_room_selection_with_focus(-1);
+                }
+            }
             AdjustLeft => self.adjust_settings_focus(-1),
             AdjustRight => self.adjust_settings_focus(1),
-            ClearChat => self.chat.clear(),
+            ClearChat => {
+                if self.chat_focus == ChatPanelFocus::ChatLog {
+                    self.chat.clear();
+                }
+            }
             PlaySoundboard1 => self.trigger_soundboard_slot(0),
             PlaySoundboard2 => self.trigger_soundboard_slot(1),
             PlaySoundboard3 => self.trigger_soundboard_slot(2),
@@ -1468,7 +1602,7 @@ impl App {
         Action::Continue
     }
 
-    fn open_settings(&mut self) {
+    pub(crate) fn open_settings(&mut self) {
         self.set_mode(theme::UiMode::Settings);
         self.settings = SettingsDraft::from_audio(&self.config.audio);
         self.settings
@@ -1497,7 +1631,7 @@ impl App {
             .reset(&self.audio_input_items, self.settings.input_selection());
         self.audio_output_picker
             .reset(&self.audio_output_items, self.settings.output_selection());
-        self.set_mode(theme::UiMode::Compose);
+        self.enter_compose_insert_mode();
     }
 
     fn move_settings_focus(&mut self, delta: isize) {
@@ -2138,13 +2272,61 @@ impl App {
         self.set_status("settings draft changed; save config when ready");
     }
 
+    fn scroll_focused_panel(&mut self, direction: isize, _rows: usize) {
+        match self.chat_focus {
+            ChatPanelFocus::ChatLog => self.move_chat_log_selection(direction),
+            ChatPanelFocus::Lobby => self.move_room_selection_with_focus(direction),
+            ChatPanelFocus::Compose => {}
+        }
+    }
+
+    fn scroll_chat_log_if_focused(&mut self, rows: isize) {
+        if self.chat_focus != ChatPanelFocus::ChatLog {
+            return;
+        }
+        if rows < 0 {
+            self.scroll_chat_up(rows.unsigned_abs());
+        } else {
+            self.chat.scroll_down(rows as usize);
+        }
+    }
+
+    fn chat_half_page_rows(&self) -> usize {
+        (self.last_chat_height as usize / 2).max(1)
+    }
+
+    fn move_chat_log_selection(&mut self, delta: isize) {
+        self.set_chat_panel_focus(ChatPanelFocus::ChatLog);
+        self.chat.clear_selection();
+        if self
+            .chat
+            .move_selected_header(delta, self.last_chat_width)
+            .is_none()
+        {
+            self.set_status("no messages");
+            return;
+        }
+        self.keep_selected_chat_header_visible();
+    }
+
+    fn keep_selected_chat_header_visible(&mut self) {
+        self.chat
+            .keep_selected_header_visible(self.last_chat_width, self.last_chat_height);
+    }
+
+    fn move_room_selection_with_focus(&mut self, delta: isize) {
+        self.set_chat_panel_focus(ChatPanelFocus::Lobby);
+        self.move_room_selection(delta);
+    }
+
     fn move_room_selection(&mut self, delta: isize) {
         if self.participants.move_selection(delta).is_none() {
             self.set_status("no users in the current room yet");
             return;
         }
         self.keep_selected_room_user_visible();
-        self.focus.set(FocusId::Participants);
+        self.chat_focus = ChatPanelFocus::Lobby;
+        self.refresh_mode_and_focus();
     }
 
     fn keep_selected_room_user_visible(&mut self) {
@@ -2399,7 +2581,7 @@ impl App {
         }
         let input = input.to_string();
         self.composer.clear();
-        self.composer.enter_insert_mode();
+        self.enter_compose_insert_mode();
         match input.as_str() {
             "/quit" => self.set_status("use Ctrl-C to quit"),
             "/mute" => self.set_mute(true),
@@ -2458,6 +2640,15 @@ impl App {
         } else {
             "microphone unmuted"
         });
+    }
+
+    fn toggle_mute(&mut self) {
+        if self.deafened.load(Ordering::Relaxed) {
+            self.mic_muted.store(false, Ordering::Relaxed);
+            self.set_deafen(false);
+        } else {
+            self.set_mute(!self.mic_muted.load(Ordering::Relaxed));
+        }
     }
 
     fn set_deafen(&mut self, deafened: bool) {
@@ -3000,10 +3191,58 @@ impl App {
         self.status_kind = StatusKind::Error;
     }
 
-    fn set_mode(&mut self, mode: theme::UiMode) {
-        self.mode = mode;
-        self.modes.set(ModeKind::from(mode));
+    pub(crate) fn enter_compose_insert_mode(&mut self) {
+        self.composer.enter_insert_mode();
+        self.set_chat_panel_focus(ChatPanelFocus::Compose);
+    }
+
+    pub(crate) fn move_chat_panel_focus(&mut self, delta: isize) {
+        self.set_chat_panel_focus(self.chat_focus.moved(delta));
+    }
+
+    pub(crate) fn set_chat_panel_focus(&mut self, focus: ChatPanelFocus) {
+        self.chat_focus = focus;
+        self.mode = match focus {
+            ChatPanelFocus::Compose => theme::UiMode::Compose,
+            ChatPanelFocus::Lobby | ChatPanelFocus::ChatLog => theme::UiMode::Log,
+        };
+        if focus == ChatPanelFocus::Lobby {
+            self.keep_selected_room_user_visible();
+        } else if focus == ChatPanelFocus::ChatLog {
+            self.chat.ensure_selected_header(self.last_chat_width);
+        }
+        self.refresh_mode_and_focus();
+    }
+
+    pub(crate) fn refresh_mode_and_focus(&mut self) {
+        self.modes.set(self.active_mode_kind());
         self.sync_focus();
+    }
+
+    fn active_mode_kind(&self) -> ModeKind {
+        match self.mode {
+            theme::UiMode::Compose if self.composer.mode() == EditorMode::Insert => {
+                ModeKind::Insert
+            }
+            theme::UiMode::Compose | theme::UiMode::Log => ModeKind::Workspace,
+            mode => ModeKind::from(mode),
+        }
+    }
+
+    fn set_mode(&mut self, mode: theme::UiMode) {
+        match mode {
+            theme::UiMode::Compose => {
+                self.chat_focus = ChatPanelFocus::Compose;
+            }
+            theme::UiMode::Log => {
+                if self.chat_focus == ChatPanelFocus::Compose {
+                    self.chat_focus = ChatPanelFocus::ChatLog;
+                }
+            }
+            theme::UiMode::ServerSelect | theme::UiMode::ServerEdit | theme::UiMode::Settings => {}
+        }
+        self.mode = mode;
+        self.refresh_mode_and_focus();
     }
 
     fn sync_focus(&mut self) {
@@ -3014,8 +3253,7 @@ impl App {
                 .as_ref()
                 .map(|draft| FocusId::ServerField(server_field(draft.focus())))
                 .unwrap_or(FocusId::ServerList),
-            theme::UiMode::Compose => FocusId::Composer,
-            theme::UiMode::Log => FocusId::Chat,
+            theme::UiMode::Compose | theme::UiMode::Log => self.chat_focus.focus_id(),
             theme::UiMode::Settings => {
                 if self.audio_input_picker.open {
                     FocusId::InputPicker
@@ -3444,6 +3682,350 @@ mod tests {
         assert!(app.volume_dialog.is_none());
         assert_eq!(app.focus.active(), FocusId::Participants);
         assert_eq!(app.modes.top(), ModeKind::Workspace);
+    }
+
+    #[test]
+    fn escape_leaves_compose_focused_in_vim_normal_mode() {
+        let mut app = test_app();
+        app.set_mode(theme::UiMode::Compose);
+
+        assert!(matches!(
+            app.process_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::empty())),
+            Action::Continue
+        ));
+        assert!(matches!(
+            app.process_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::empty())),
+            Action::Continue
+        ));
+
+        assert_eq!(app.chat_focus, ChatPanelFocus::Compose);
+        assert_eq!(app.focus.active(), FocusId::Composer);
+        assert_eq!(app.composer.mode(), EditorMode::Normal);
+        assert_eq!(app.modes.top(), ModeKind::Workspace);
+
+        assert!(matches!(
+            app.process_key(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::empty())),
+            Action::Continue
+        ));
+        assert_eq!(app.chat_focus, ChatPanelFocus::Compose);
+        assert_eq!(app.composer.mode(), EditorMode::Insert);
+        assert_eq!(app.modes.top(), ModeKind::Insert);
+    }
+
+    #[test]
+    fn compose_normal_m_uses_binding_to_toggle_mute() {
+        let mut app = test_app();
+        app.set_mode(theme::UiMode::Compose);
+        app.process_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::empty()));
+        assert_eq!(app.composer.mode(), EditorMode::Normal);
+
+        app.process_key(KeyEvent::new(KeyCode::Char('m'), KeyModifiers::empty()));
+
+        assert!(app.mic_muted.load(Ordering::Relaxed));
+        assert_eq!(app.chat_focus, ChatPanelFocus::Compose);
+        assert_eq!(app.composer.mode(), EditorMode::Normal);
+    }
+
+    #[test]
+    fn compose_vim_text_object_commands_receive_i_key() {
+        let mut app = test_app();
+        app.set_mode(theme::UiMode::Compose);
+        app.composer.set_lines("alpha beta");
+        app.composer.set_cursor_offset(2);
+
+        app.process_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::empty()));
+        assert_eq!(app.composer.mode(), EditorMode::Normal);
+
+        for key in ['c', 'i', 'w'] {
+            app.process_key(KeyEvent::new(KeyCode::Char(key), KeyModifiers::empty()));
+        }
+
+        assert_eq!(app.chat_focus, ChatPanelFocus::Compose);
+        assert_eq!(app.composer.mode(), EditorMode::Insert);
+        assert_eq!(app.composer.text(), " beta");
+    }
+
+    #[test]
+    fn shifted_jk_wraps_chat_panel_focus() {
+        let mut app = test_app();
+        app.set_mode(theme::UiMode::Compose);
+        app.process_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::empty()));
+
+        app.process_key(KeyEvent::new(KeyCode::Char('K'), KeyModifiers::empty()));
+        assert_eq!(app.chat_focus, ChatPanelFocus::ChatLog);
+        assert_eq!(app.focus.active(), FocusId::Chat);
+
+        app.process_key(KeyEvent::new(KeyCode::Char('K'), KeyModifiers::empty()));
+        assert_eq!(app.chat_focus, ChatPanelFocus::Lobby);
+        assert_eq!(app.focus.active(), FocusId::Participants);
+
+        app.process_key(KeyEvent::new(KeyCode::Char('K'), KeyModifiers::empty()));
+        assert_eq!(app.chat_focus, ChatPanelFocus::Compose);
+        assert_eq!(app.focus.active(), FocusId::Composer);
+        assert_eq!(app.composer.mode(), EditorMode::Normal);
+
+        app.process_key(KeyEvent::new(KeyCode::Char('J'), KeyModifiers::empty()));
+        assert_eq!(app.chat_focus, ChatPanelFocus::Lobby);
+    }
+
+    #[test]
+    fn super_jk_move_chat_panel_focus_from_compose_insert_mode() {
+        let mut app = test_app();
+        app.set_mode(theme::UiMode::Compose);
+        assert_eq!(app.composer.mode(), EditorMode::Insert);
+
+        app.process_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::SUPER));
+        assert_eq!(app.chat_focus, ChatPanelFocus::ChatLog);
+        assert_eq!(app.focus.active(), FocusId::Chat);
+
+        app.set_chat_panel_focus(ChatPanelFocus::Compose);
+        assert_eq!(app.composer.mode(), EditorMode::Insert);
+
+        app.process_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::SUPER));
+        assert_eq!(app.chat_focus, ChatPanelFocus::Lobby);
+        assert_eq!(app.focus.active(), FocusId::Participants);
+    }
+
+    #[test]
+    fn selected_user_volume_requires_lobby_focus() {
+        let mut app = test_app();
+        app.server_alias = "local".to_string();
+        app.user_id = Some(UserId(1));
+        app.set_mode(theme::UiMode::Log);
+        app.participants.replace_room(vec![
+            ParticipantInfo {
+                user_id: UserId(1),
+                name: "alice".to_string(),
+                in_call: true,
+            },
+            ParticipantInfo {
+                user_id: UserId(2),
+                name: "bob".to_string(),
+                in_call: true,
+            },
+        ]);
+        app.move_room_selection(1);
+        app.set_chat_panel_focus(ChatPanelFocus::ChatLog);
+
+        app.process_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()));
+        assert!(app.volume_dialog.is_none());
+        assert_eq!(app.status, "focus lobby to adjust users");
+
+        app.set_chat_panel_focus(ChatPanelFocus::Lobby);
+        app.process_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()));
+        assert!(app.volume_dialog.is_some());
+        assert_eq!(app.focus.active(), FocusId::Dialog);
+    }
+
+    #[test]
+    fn toggle_mute_while_deafened_undeafens_and_unmutes() {
+        let mut app = test_app();
+        app.set_deafen(true);
+        assert!(app.deafened.load(Ordering::Relaxed));
+        assert!(app.mic_muted.load(Ordering::Relaxed));
+
+        app.process_command(BindCommand::ToggleMute);
+
+        assert!(!app.deafened.load(Ordering::Relaxed));
+        assert!(!app.mic_muted.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn chat_log_jk_moves_selected_message() {
+        let mut app = test_app();
+        app.set_mode(theme::UiMode::Compose);
+        for index in 0..3 {
+            app.push_chat(ChatMessage {
+                message_id: rpc::ids::MessageId(index + 1),
+                room_id: rpc::ids::RoomId(1),
+                sender: UserId(index as u32 + 1),
+                sender_name: format!("user{index}"),
+                timestamp_ms: index * 120_000,
+                body: format!("message {index}"),
+            });
+        }
+
+        app.set_chat_panel_focus(ChatPanelFocus::ChatLog);
+        assert_eq!(app.chat.selected_message(), Some(2));
+
+        app.process_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::empty()));
+        assert_eq!(app.chat.selected_message(), Some(1));
+
+        app.process_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::empty()));
+        assert_eq!(app.chat.selected_message(), Some(2));
+    }
+
+    #[test]
+    fn chat_log_gg_and_g_select_edge_headers() {
+        let mut app = test_app();
+        app.set_mode(theme::UiMode::Compose);
+        for index in 0..20 {
+            app.push_chat(ChatMessage {
+                message_id: rpc::ids::MessageId(index + 1),
+                room_id: rpc::ids::RoomId(1),
+                sender: UserId(index as u32 + 1),
+                sender_name: format!("user{index}"),
+                timestamp_ms: index * 120_000,
+                body: format!("message {index}"),
+            });
+        }
+
+        let mut buffer = Buffer::new(80, 12);
+        crate::tui::render(&mut app, &mut buffer, 0);
+        app.set_chat_panel_focus(ChatPanelFocus::ChatLog);
+
+        app.process_key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::empty()));
+        app.process_key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::empty()));
+        assert_eq!(app.chat.selected_message(), Some(0));
+        assert!(app.chat.scroll_offset() > 0);
+
+        app.process_key(KeyEvent::new(KeyCode::Char('G'), KeyModifiers::empty()));
+        assert_eq!(app.chat.selected_message(), Some(19));
+        assert_eq!(app.chat.scroll_offset(), 0);
+    }
+
+    #[test]
+    fn chat_log_selection_change_scrolls_selected_header_into_view() {
+        let mut app = test_app();
+        app.set_mode(theme::UiMode::Compose);
+        for index in 0..30 {
+            app.push_chat(ChatMessage {
+                message_id: rpc::ids::MessageId(index + 1),
+                room_id: rpc::ids::RoomId(1),
+                sender: UserId(2),
+                sender_name: "bob".to_string(),
+                timestamp_ms: 1_000 + index * 1_000,
+                body: format!("message {index}"),
+            });
+        }
+
+        let mut buffer = Buffer::new(80, 14);
+        crate::tui::render(&mut app, &mut buffer, 0);
+        app.set_chat_panel_focus(ChatPanelFocus::ChatLog);
+        app.process_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::empty()));
+        crate::tui::render(&mut app, &mut buffer, 0);
+
+        let selected = app.chat.selected_message().expect("selected header");
+        assert_eq!(selected, 12);
+        assert!(
+            app.last_chat_lines
+                .iter()
+                .any(|line| line.kind == LineKind::Heading && line.block_contains(selected)),
+            "selected header must be visible after movement"
+        );
+    }
+
+    #[test]
+    fn tab_toggles_selected_chat_log_collapse() {
+        let mut app = test_app();
+        app.set_mode(theme::UiMode::Compose);
+        app.push_chat(ChatMessage {
+            message_id: rpc::ids::MessageId(1),
+            room_id: rpc::ids::RoomId(1),
+            sender: UserId(2),
+            sender_name: "bob".to_string(),
+            timestamp_ms: 1,
+            body: "```\n0\n1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n```".to_string(),
+        });
+
+        let mut buffer = Buffer::new(80, 24);
+        crate::tui::render(&mut app, &mut buffer, 0);
+        app.set_chat_panel_focus(ChatPanelFocus::ChatLog);
+        assert!(app.chat.is_collapsed(0));
+
+        app.process_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::empty()));
+        assert!(app.chat.is_expanded(0));
+    }
+
+    #[test]
+    fn y_copies_selected_log_when_no_lines_are_selected() {
+        let mut app = test_app();
+        app.set_mode(theme::UiMode::Compose);
+        for (index, body) in ["first", "second"].into_iter().enumerate() {
+            app.push_chat(ChatMessage {
+                message_id: rpc::ids::MessageId(index as u64 + 1),
+                room_id: rpc::ids::RoomId(1),
+                sender: UserId(2),
+                sender_name: "bob".to_string(),
+                timestamp_ms: 1_000 + index as u64 * 1_000,
+                body: body.to_string(),
+            });
+        }
+
+        let mut buffer = Buffer::new(80, 24);
+        crate::tui::render(&mut app, &mut buffer, 0);
+        app.set_chat_panel_focus(ChatPanelFocus::ChatLog);
+        app.chat.select_first_header();
+        app.process_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::empty()));
+
+        assert_eq!(app.pending_clipboard.as_deref(), Some("first\nsecond"));
+    }
+
+    #[test]
+    fn mouse_down_on_chat_text_focuses_chat_log_and_selects_message() {
+        let mut app = test_app();
+        app.set_mode(theme::UiMode::Compose);
+        app.push_chat(ChatMessage {
+            message_id: rpc::ids::MessageId(1),
+            room_id: rpc::ids::RoomId(1),
+            sender: UserId(2),
+            sender_name: "bob".to_string(),
+            timestamp_ms: 1,
+            body: "hello".to_string(),
+        });
+
+        let mut buffer = Buffer::new(80, 24);
+        crate::tui::render(&mut app, &mut buffer, 0);
+        let (row_index, line) = app
+            .last_chat_lines
+            .iter()
+            .copied()
+            .enumerate()
+            .find(|(_, line)| line.kind == LineKind::Body)
+            .expect("body line rendered");
+
+        app.process_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: app.last_chat_rect.x + 2,
+            row: app.last_chat_rect.y + row_index as u16,
+            modifiers: KeyModifiers::empty(),
+        });
+
+        assert_eq!(app.chat_focus, ChatPanelFocus::ChatLog);
+        assert_eq!(app.focus.active(), FocusId::Chat);
+        assert_eq!(app.chat.selected_message(), Some(line.message));
+        assert!(app.chat.is_selecting());
+    }
+
+    #[test]
+    fn mouse_down_on_lobby_row_focuses_lobby_and_selects_user() {
+        let mut app = test_app();
+        app.set_mode(theme::UiMode::Compose);
+        app.participants.replace_room(vec![
+            ParticipantInfo {
+                user_id: UserId(1),
+                name: "alice".to_string(),
+                in_call: true,
+            },
+            ParticipantInfo {
+                user_id: UserId(2),
+                name: "bob".to_string(),
+                in_call: true,
+            },
+        ]);
+
+        let mut buffer = Buffer::new(80, 24);
+        crate::tui::render(&mut app, &mut buffer, 0);
+        app.process_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: app.last_room_rect.x + 1,
+            row: app.last_room_rect.y,
+            modifiers: KeyModifiers::empty(),
+        });
+
+        assert_eq!(app.chat_focus, ChatPanelFocus::Lobby);
+        assert_eq!(app.focus.active(), FocusId::Participants);
+        assert_eq!(app.participants.selected_user, Some(UserId(1)));
     }
 
     #[test]

@@ -1,8 +1,9 @@
 use extui::event::{KeyCode, KeyEvent, KeyModifiers};
-use extui_bindings::{InputKey, LayerId};
+use extui_bindings::InputKey;
+use extui_editor::Mode as EditorMode;
 
 use crate::{
-    app::App,
+    app::{App, ChatPanelFocus},
     bindings::{self, Resolved},
     theme,
 };
@@ -32,17 +33,6 @@ impl ModeKind {
             ModeKind::Insert => "Insert",
             ModeKind::Settings => "Settings",
             ModeKind::Dialog => "Dialog",
-        }
-    }
-
-    pub(crate) fn binding_layer(self) -> LayerId {
-        match self {
-            ModeKind::Insert => bindings::INSERT_LAYER,
-            ModeKind::Settings => bindings::SETTINGS_LAYER,
-            ModeKind::ServerSelect => bindings::PICKER_LAYER,
-            ModeKind::ServerEdit => bindings::FORM_LAYER,
-            ModeKind::Dialog => bindings::DIALOG_LAYER,
-            ModeKind::Workspace => bindings::WORKSPACE_LAYER,
         }
     }
 }
@@ -112,7 +102,49 @@ pub(crate) fn process_key(app: &mut App, key: KeyEvent) -> Action {
         return Action::Continue;
     }
 
-    let base = ModeKind::from(app.mode).binding_layer();
+    if matches!(app.mode, theme::UiMode::Compose | theme::UiMode::Log) {
+        return process_chat_key(app, key);
+    }
+
+    Action::Continue
+}
+
+fn process_chat_key(app: &mut App, key: KeyEvent) -> Action {
+    match app.chat_focus {
+        ChatPanelFocus::Compose => process_compose_key(app, key),
+        ChatPanelFocus::ChatLog | ChatPanelFocus::Lobby => {
+            resolve_app_binding(app, bindings::WORKSPACE_LAYER, key).unwrap_or(Action::Continue)
+        }
+    }
+}
+
+fn process_compose_key(app: &mut App, key: KeyEvent) -> Action {
+    if app.composer.mode() == EditorMode::Insert {
+        if key.code != KeyCode::Esc
+            && let Some(action) = resolve_app_binding(app, bindings::INSERT_LAYER, key)
+        {
+            return action;
+        }
+
+        let _ = app.composer.send_key(&key);
+        app.refresh_mode_and_focus();
+        return Action::Continue;
+    }
+
+    if let Some(action) = resolve_app_binding(app, bindings::COMPOSE_NORMAL_LAYER, key) {
+        return action;
+    }
+
+    let _ = app.composer.send_key(&key);
+    app.refresh_mode_and_focus();
+    Action::Continue
+}
+
+fn resolve_app_binding(
+    app: &mut App,
+    base: extui_bindings::LayerId,
+    key: KeyEvent,
+) -> Option<Action> {
     if let Some(input) = InputKey::from_event(&key) {
         match bindings::resolve(
             &app.config.bindings.router,
@@ -122,21 +154,11 @@ pub(crate) fn process_key(app: &mut App, key: KeyEvent) -> Action {
         ) {
             Resolved::Action(id) => {
                 let command = app.config.bindings.actions.get(id).clone();
-                return app.process_command(command);
+                return Some(app.process_command(command));
             }
-            Resolved::Consumed => return Action::Continue,
+            Resolved::Consumed => return Some(Action::Continue),
             Resolved::Unmatched => {}
         }
     }
-
-    match app.mode {
-        theme::UiMode::Compose => {
-            let _ = app.composer.send_key(&key);
-        }
-        theme::UiMode::Log
-        | theme::UiMode::Settings
-        | theme::UiMode::ServerSelect
-        | theme::UiMode::ServerEdit => {}
-    }
-    Action::Continue
+    None
 }

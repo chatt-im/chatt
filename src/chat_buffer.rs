@@ -40,9 +40,19 @@ pub struct VisibleLine {
     /// For `Body`/`Ellipsis` the owning message; for `Heading` the block's first
     /// (oldest) message.
     pub message: usize,
+    /// Oldest message rendered under this line's heading.
+    pub block_first: usize,
+    /// Newest message rendered under this line's heading, inclusive.
+    pub block_last: usize,
     /// Body line index within `message`; zero for `Heading`/`Ellipsis`.
     pub line: usize,
     pub kind: LineKind,
+}
+
+impl VisibleLine {
+    pub fn block_contains(self, message: usize) -> bool {
+        self.block_first <= message && message <= self.block_last
+    }
 }
 
 pub struct ChatEntry {
@@ -93,6 +103,7 @@ pub struct VirtualChatBuffer {
     max_messages: usize,
     scroll_offset: usize,
     selection: Option<Selection>,
+    selected_message: Option<usize>,
     syntax: SyntaxTheme,
 }
 
@@ -103,6 +114,7 @@ impl VirtualChatBuffer {
             max_messages: max_messages.max(1),
             scroll_offset: 0,
             selection: None,
+            selected_message: None,
             syntax,
         }
     }
@@ -155,6 +167,7 @@ impl VirtualChatBuffer {
         self.messages.clear();
         self.scroll_offset = 0;
         self.selection = None;
+        self.selected_message = None;
     }
 
     pub fn len(&self) -> usize {
@@ -230,6 +243,87 @@ impl VirtualChatBuffer {
         self.selection = None;
     }
 
+    #[cfg(test)]
+    pub fn selected_message(&self) -> Option<usize> {
+        self.selected_message
+    }
+
+    pub fn ensure_selected_message(&mut self) -> Option<usize> {
+        if self.messages.is_empty() {
+            self.selected_message = None;
+            return None;
+        }
+        let selected = self
+            .selected_message
+            .filter(|message| *message < self.messages.len())
+            .unwrap_or_else(|| self.messages.len() - 1);
+        self.selected_message = Some(selected);
+        self.selected_message
+    }
+
+    pub fn ensure_selected_header(&mut self, width: u16) -> Option<usize> {
+        let selected = self.ensure_selected_message()?;
+        let (first, _) = self.header_block_containing(selected, width)?;
+        self.selected_message = Some(first);
+        self.selected_message
+    }
+
+    pub fn select_message(&mut self, message: usize) -> Option<usize> {
+        if message >= self.messages.len() {
+            return None;
+        }
+        self.selected_message = Some(message);
+        Some(message)
+    }
+
+    pub fn select_first_header(&mut self) -> Option<usize> {
+        self.select_message(0)
+    }
+
+    pub fn select_last_header(&mut self, width: u16) -> Option<usize> {
+        let (first, _) = self.header_blocks(width).last().copied()?;
+        self.selected_message = Some(first);
+        self.selected_message
+    }
+
+    pub fn select_header_containing(&mut self, message: usize, width: u16) -> Option<usize> {
+        if message >= self.messages.len() {
+            return None;
+        }
+        let (first, _) = self.header_block_containing(message, width)?;
+        self.selected_message = Some(first);
+        self.selected_message
+    }
+
+    pub fn move_selected_header(&mut self, delta: isize, width: u16) -> Option<usize> {
+        if self.messages.is_empty() {
+            self.selected_message = None;
+            return None;
+        }
+        let blocks = self.header_blocks(width);
+        let selected = self.ensure_selected_message()?;
+        let current = blocks
+            .iter()
+            .position(|(first, last)| *first <= selected && selected <= *last)
+            .unwrap_or_else(|| {
+                blocks
+                    .iter()
+                    .position(|(first, _)| selected < *first)
+                    .unwrap_or(blocks.len())
+                    .saturating_sub(1)
+            });
+        let next = (current as isize + delta).clamp(0, blocks.len() as isize - 1) as usize;
+        self.selected_message = Some(blocks[next].0);
+        self.selected_message
+    }
+
+    pub fn is_header_selected(&self, line: VisibleLine) -> bool {
+        line.kind == LineKind::Heading
+            && self
+                .selected_message
+                .is_some_and(|message| line.block_contains(message))
+    }
+
     pub fn is_selecting(&self) -> bool {
         self.selection.is_some_and(|selection| selection.active)
     }
@@ -244,30 +338,53 @@ impl VirtualChatBuffer {
         lo <= pos && pos <= hi
     }
 
-    /// Concatenates the body text of every selected line, content only (no
-    /// sender column), joining lines with `\n`. Returns `None` when nothing is
-    /// selected.
+    /// Copies original body text covered by the selected rendered rows, content
+    /// only (no sender column). Wrapped rows from the same message are sliced
+    /// as one source range so clipboard text keeps the message's whitespace
+    /// instead of the display wrapper's trimmed fragments.
     pub fn selected_text(&self) -> Option<String> {
         let (lo, hi) = self.selection?.bounds();
         let mut out = String::new();
         let mut first = true;
         for message in lo.0..=hi.0.min(self.messages.len().saturating_sub(1)) {
-            let lines = self.messages[message].layout.lines().max(1);
+            let entry = &self.messages[message];
+            let lines = entry.layout.lines().max(1);
             let start = if message == lo.0 { lo.1 } else { 0 };
+            if start >= lines {
+                continue;
+            }
             let end = if message == hi.0 { hi.1 } else { lines - 1 };
-            for line in start..=end.min(lines - 1) {
-                if !first {
-                    out.push('\n');
-                }
-                first = false;
-                for segment in self.line(message, line) {
-                    out.push_str(
-                        &self.messages[message].body[segment.start as usize..segment.end as usize],
-                    );
-                }
+            let end = end.min(lines - 1);
+            if !first {
+                out.push('\n');
+            }
+            first = false;
+            if start == 0 && end == lines - 1 {
+                out.push_str(&entry.body);
+            } else {
+                let range = entry.layout.source_range(start, end, entry.body.len());
+                out.push_str(&entry.body[range]);
             }
         }
         Some(out)
+    }
+
+    pub fn selected_header_text(&mut self, width: u16) -> Option<String> {
+        let selected = self.selected_message?;
+        let (first, last) = self.header_block_containing(selected, width)?;
+        let mut out = String::new();
+        for message in first..=last {
+            if message > first {
+                out.push('\n');
+            }
+            out.push_str(&self.messages[message].body);
+        }
+        Some(out)
+    }
+
+    pub fn keep_selected_header_visible(&mut self, width: u16, height: u16) -> Option<()> {
+        let selected = self.ensure_selected_message()?;
+        self.keep_header_visible(selected, width, height)
     }
 
     /// Toggles the expand/collapse state of `message` when it is collapsible
@@ -281,7 +398,21 @@ impl VirtualChatBuffer {
         true
     }
 
+    pub fn toggle_selected_expand(&mut self, width: u16) -> bool {
+        let Some(selected) = self.selected_message else {
+            return false;
+        };
+        let Some((first, last)) = self.header_block_containing(selected, width) else {
+            return false;
+        };
+        if first != last {
+            return false;
+        }
+        self.toggle_expand(first, width)
+    }
+
     /// Whether `message`'s wrapped body exceeds [`COLLAPSE_LIMIT`] at `width`.
+    #[cfg(test)]
     pub fn is_collapsible(&mut self, message: usize, width: u16) -> bool {
         message < self.messages.len() && self.ensure_lines(message, width) > COLLAPSE_LIMIT
     }
@@ -452,6 +583,8 @@ impl VirtualChatBuffer {
         let mut rows = Vec::with_capacity(Self::block_rows(block));
         rows.push(VisibleLine {
             message: block.first,
+            block_first: block.first,
+            block_last: block.last,
             line: 0,
             kind: LineKind::Heading,
         });
@@ -459,12 +592,16 @@ impl VirtualChatBuffer {
             for line in 0..block.body_lines {
                 rows.push(VisibleLine {
                     message: block.last,
+                    block_first: block.first,
+                    block_last: block.last,
                     line,
                     kind: LineKind::Body,
                 });
             }
             rows.push(VisibleLine {
                 message: block.last,
+                block_first: block.first,
+                block_last: block.last,
                 line: 0,
                 kind: LineKind::Ellipsis,
             });
@@ -474,6 +611,8 @@ impl VirtualChatBuffer {
                 for line in 0..lines {
                     rows.push(VisibleLine {
                         message,
+                        block_first: block.first,
+                        block_last: block.last,
                         line,
                         kind: LineKind::Body,
                     });
@@ -510,13 +649,72 @@ impl VirtualChatBuffer {
         total.max(1)
     }
 
+    fn header_blocks(&mut self, width: u16) -> Vec<(usize, usize)> {
+        let width = width.max(1);
+        let mut blocks = Vec::new();
+        let mut cursor = 0usize;
+        while cursor < self.messages.len() {
+            let run_end = self.run_end(cursor, width);
+            for block in self.pack_run(cursor, run_end, width) {
+                blocks.push((block.first, block.last));
+            }
+            cursor = run_end + 1;
+        }
+        blocks
+    }
+
+    fn header_block_containing(&mut self, message: usize, width: u16) -> Option<(usize, usize)> {
+        self.header_blocks(width)
+            .into_iter()
+            .find(|(first, last)| *first <= message && message <= *last)
+    }
+
+    fn keep_header_visible(&mut self, message: usize, width: u16, height: u16) -> Option<()> {
+        let height = height as usize;
+        if height == 0 {
+            return None;
+        }
+        let (header_row, total_rows) = self.header_row_and_total(message, width)?;
+        let max_scroll = total_rows.saturating_sub(height);
+        self.scroll_offset = self.scroll_offset.min(max_scroll);
+        let top = total_rows.saturating_sub(self.scroll_offset.saturating_add(height));
+        let bottom = top.saturating_add(height).min(total_rows);
+        if header_row < top || header_row >= bottom {
+            self.scroll_offset = total_rows
+                .saturating_sub(header_row.saturating_add(height))
+                .min(max_scroll);
+        }
+        Some(())
+    }
+
+    fn header_row_and_total(&mut self, message: usize, width: u16) -> Option<(usize, usize)> {
+        let width = width.max(1);
+        let mut header_row = None;
+        let mut row = 0usize;
+        let mut cursor = 0usize;
+        while cursor < self.messages.len() {
+            let run_end = self.run_end(cursor, width);
+            for block in self.pack_run(cursor, run_end, width) {
+                if block.first <= message && message <= block.last {
+                    header_row = Some(row);
+                }
+                row = row.saturating_add(Self::block_rows(&block));
+            }
+            cursor = run_end + 1;
+        }
+        header_row.map(|header| (header, row.max(1)))
+    }
+
     fn trim_front(&mut self) {
         let excess = self.messages.len().saturating_sub(self.max_messages);
         if excess > 0 {
             self.messages.drain(0..excess);
             self.scroll_offset = self.scroll_offset.saturating_sub(excess);
-            // Message indices shifted; any selection now points at the wrong rows.
+            // Message indices shifted; line selections now point at wrong rows.
             self.selection = None;
+            self.selected_message = self
+                .selected_message
+                .and_then(|message| message.checked_sub(excess));
         }
     }
 }
@@ -526,6 +724,7 @@ struct MessageLayout {
     hl: Highlighter,
     cursor: usize,
     line_starts: Vec<u32>,
+    line_sources: Vec<(u32, u32)>,
     segments: Vec<Segment>,
     complete: bool,
     estimated_lines: usize,
@@ -547,6 +746,7 @@ impl MessageLayout {
             hl: Highlighter::new(Language::Markdown),
             cursor: 0,
             line_starts: Vec::new(),
+            line_sources: Vec::new(),
             segments: Vec::new(),
             complete: false,
             estimated_lines: 1,
@@ -589,6 +789,35 @@ impl MessageLayout {
         &self.segments[start..end]
     }
 
+    fn source_range(&self, start_line: usize, end_line: usize, text_len: usize) -> Range<usize> {
+        if self.line_sources.is_empty() || text_len == 0 {
+            return 0..0;
+        }
+        let last_line = self.line_sources.len() - 1;
+        let start_line = start_line.min(last_line);
+        let end_line = end_line.min(last_line).max(start_line);
+        let start = (start_line..=end_line)
+            .find_map(|line| Self::source_start(self.line_sources[line]))
+            .or_else(|| {
+                (0..start_line)
+                    .rev()
+                    .find_map(|line| Self::source_end(self.line_sources[line]))
+            })
+            .unwrap_or(0)
+            .min(text_len);
+        let end = (start_line..=end_line)
+            .rev()
+            .find_map(|line| Self::source_end(self.line_sources[line]))
+            .or_else(|| {
+                ((end_line + 1)..self.line_sources.len())
+                    .find_map(|line| Self::source_start(self.line_sources[line]))
+            })
+            .unwrap_or(start)
+            .min(text_len)
+            .max(start);
+        start..end
+    }
+
     fn total_lines_estimate(&self, text: &str) -> usize {
         if self.complete {
             self.lines()
@@ -602,6 +831,7 @@ impl MessageLayout {
         self.wrap_width = width;
         self.cursor = 0;
         self.line_starts.clear();
+        self.line_sources.clear();
         self.segments.clear();
         self.complete = false;
         self.estimated_lines = estimate_lines(text, width.max(1) as usize);
@@ -610,6 +840,7 @@ impl MessageLayout {
     fn layout_next_block(&mut self, text: &str) {
         let bytes = text.as_bytes();
         let mut pos = self.cursor;
+        let blank_start = pos;
         let mut saw_blank = false;
         loop {
             if pos >= bytes.len() {
@@ -626,6 +857,7 @@ impl MessageLayout {
         }
         if saw_blank && !self.line_starts.is_empty() {
             self.push_line();
+            self.note_source_range(blank_start, pos);
         }
         let avail = (self.wrap_width as usize).max(1);
         let target = avail.min(REFLOW_TARGET);
@@ -642,23 +874,12 @@ impl MessageLayout {
 
     fn layout_paragraph(&mut self, text: &str, pos: usize, target: usize) -> usize {
         let bytes = text.as_bytes();
-        let mut unit_start = pos;
         let mut line_pos = pos;
         loop {
             let (content_end, next) = line_bounds(bytes, line_pos);
+            self.wrap_unit(text, line_pos..content_end, (target, target), (0, 0), false);
             let ends_block =
                 next >= bytes.len() || is_blank_line(bytes, next) || starts_new_block(bytes, next);
-            let hard_break = !ends_block && bytes[line_pos..content_end].ends_with(b"  ");
-            if ends_block || hard_break {
-                self.wrap_unit(
-                    text,
-                    unit_start..content_end,
-                    (target, target),
-                    (0, 0),
-                    false,
-                );
-                unit_start = next;
-            }
             if ends_block {
                 return next;
             }
@@ -818,10 +1039,15 @@ impl MessageLayout {
 
     fn push_line(&mut self) {
         self.line_starts.push(self.segments.len() as u32);
+        self.line_sources.push((u32::MAX, 0));
     }
 
     fn emit_verbatim(&mut self, text: &str, start: usize, end: usize, avail: usize) {
         self.push_line();
+        if start == end {
+            self.note_source_range(start, end);
+            return;
+        }
         let avail = avail.max(1);
         let mut chunk_start = start;
         let mut width = 0usize;
@@ -841,6 +1067,7 @@ impl MessageLayout {
     }
 
     fn emit_text(&mut self, text: &str, mut start: usize, end: usize, mut col: u16) {
+        self.note_source_range(start, end);
         let bytes = text.as_bytes();
         while start < end {
             let mut brk = start;
@@ -900,6 +1127,29 @@ impl MessageLayout {
             col = push(cursor, end, Style::DEFAULT, col);
         }
         col
+    }
+
+    fn note_source_range(&mut self, start: usize, end: usize) {
+        let Some((line_start, line_end)) = self.line_sources.last_mut() else {
+            return;
+        };
+        let start = start.min(u32::MAX as usize) as u32;
+        let end = end.min(u32::MAX as usize) as u32;
+        if *line_start == u32::MAX {
+            *line_start = start;
+            *line_end = end;
+        } else {
+            *line_start = (*line_start).min(start);
+            *line_end = (*line_end).max(end);
+        }
+    }
+
+    fn source_start(range: (u32, u32)) -> Option<usize> {
+        (range.0 != u32::MAX).then_some(range.0 as usize)
+    }
+
+    fn source_end(range: (u32, u32)) -> Option<usize> {
+        (range.0 != u32::MAX).then_some(range.1 as usize)
     }
 }
 
@@ -1071,6 +1321,17 @@ mod tests {
             .count()
     }
 
+    fn selected_heading_blocks(
+        buf: &VirtualChatBuffer,
+        rows: &[VisibleLine],
+    ) -> Vec<(usize, usize)> {
+        rows.iter()
+            .copied()
+            .filter(|row| buf.is_header_selected(*row))
+            .map(|row| (row.block_first, row.block_last))
+            .collect()
+    }
+
     #[test]
     fn format_age_covers_each_unit_boundary() {
         let cases = [
@@ -1206,6 +1467,41 @@ mod tests {
     }
 
     #[test]
+    fn selected_header_follows_anchor_when_reflow_changes_blocks() {
+        let mut buf = VirtualChatBuffer::new(1000, SyntaxTheme::default());
+        for i in 0..5 {
+            buf.push_test(
+                "alice",
+                "aa bb cc dd ee ff",
+                1_000_000 + i as u64 * 1_000,
+                false,
+            );
+        }
+
+        let narrow = buf.visible_lines(7, 100, 0);
+        assert!(narrow.iter().any(|row| {
+            row.kind == LineKind::Heading && row.block_first == 4 && row.block_last == 4
+        }));
+        buf.select_message(4);
+
+        let wide = buf.visible_lines(40, 100, 0);
+        assert_eq!(selected_heading_blocks(&buf, &wide), vec![(0, 4)]);
+    }
+
+    #[test]
+    fn selected_header_text_copies_the_current_block_bodies() {
+        let mut buf = VirtualChatBuffer::new(1000, SyntaxTheme::default());
+        buf.push_test("alice", "first", 1_000_000, false);
+        buf.push_test("alice", "second", 1_001_000, false);
+        buf.select_message(0);
+
+        assert_eq!(
+            buf.selected_header_text(40).as_deref(),
+            Some("first\nsecond")
+        );
+    }
+
+    #[test]
     fn total_lines_exact_matches_emitted_row_count() {
         let mut buf = VirtualChatBuffer::new(1000, SyntaxTheme::default());
         buf.push_test("alice", "hello", 1_000_000, false);
@@ -1267,5 +1563,43 @@ mod tests {
             buf.selected_text().as_deref(),
             Some("message 0\nmessage 1\nmessage 2")
         );
+    }
+
+    #[test]
+    fn paragraph_newlines_render_as_separate_body_rows() {
+        let mut buf = VirtualChatBuffer::new(1000, SyntaxTheme::default());
+        buf.push_test("alice", "Alpha.\nBeta.", 1_000_000, false);
+        let _ = buf.total_lines_exact(80);
+
+        assert_eq!(buf.messages[0].layout.lines(), 2);
+        assert_eq!(
+            kinds(&buf.visible_lines(80, 10, 0)),
+            vec![LineKind::Heading, LineKind::Body, LineKind::Body]
+        );
+    }
+
+    #[test]
+    fn selected_text_preserves_whitespace_between_wrapped_rows() {
+        let mut buf = VirtualChatBuffer::new(1000, SyntaxTheme::default());
+        buf.push_test("alice", "alpha beta", 1_000_000, false);
+        let _ = buf.total_lines_exact(5);
+        assert_eq!(buf.messages[0].layout.lines(), 2);
+
+        buf.begin_selection((0, 0));
+        buf.extend_selection((0, 1));
+
+        assert_eq!(buf.selected_text().as_deref(), Some("alpha beta"));
+    }
+
+    #[test]
+    fn selected_text_preserves_original_newlines_when_message_is_selected() {
+        let mut buf = VirtualChatBuffer::new(1000, SyntaxTheme::default());
+        buf.push_test("alice", "alpha\nbeta", 1_000_000, false);
+        let _ = buf.total_lines_exact(40);
+
+        buf.begin_selection((0, 0));
+        buf.extend_selection((0, buf.messages[0].layout.lines() - 1));
+
+        assert_eq!(buf.selected_text().as_deref(), Some("alpha\nbeta"));
     }
 }
