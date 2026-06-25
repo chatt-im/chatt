@@ -37,11 +37,13 @@ default = ["audio-realtime"]
 pipewire = ["cpal/pipewire"]
 audio-realtime = ["cpal/realtime"]
 audio-realtime-dbus = ["audio-realtime", "cpal/realtime-dbus"]
-# Presume AVX2/FMA in the bundled Opus build, removing its runtime CPU dispatch.
+rnnoise-v2 = ["nnnoiseless/rnnoise-v2"]
+# Presume AVX2/FMA in bundled C audio code, removing runtime CPU dispatch where
+# supported.
 # Only sound on x86-64 CPUs that actually have AVX2. Pair it with
 # `-C target-cpu=x86-64-v3`; the `cargo v3` alias in `.cargo/config.toml` does
 # both. The default build leaves this off and stays portable.
-avx2 = ["opus-codec/presume-avx2"]
+avx2 = ["opus-codec/presume-avx2", "nnnoiseless/presume-avx2"]
 
 [workspace]
 members = [

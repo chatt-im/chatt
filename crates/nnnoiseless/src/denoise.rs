@@ -35,11 +35,23 @@ use crate::{RnnModel, FRAME_SIZE, FREQ_SIZE, NB_BANDS};
 /// ```
 #[derive(Clone)]
 pub struct DenoiseState<'model> {
+    backend: DenoiseBackend<'model>,
+    params: SuppressionParams,
+}
+
+#[derive(Clone)]
+enum DenoiseBackend<'model> {
+    #[cfg(feature = "rnnoise-v2")]
+    V2(crate::v2::V2DenoiseState),
+    Legacy(LegacyDenoiseState<'model>),
+}
+
+#[derive(Clone)]
+struct LegacyDenoiseState<'model> {
     /// Most recent gains that we applied.
     lastg: [f32; crate::NB_BANDS],
     rnn: crate::rnn::RnnState<'model>,
     feat: crate::features::DenoiseFeatures,
-    params: SuppressionParams,
 }
 
 /// Tunable post-processing applied to the model's per-band suppression gains.
@@ -77,7 +89,17 @@ impl DenoiseState<'static> {
     pub const FRAME_SIZE: usize = FRAME_SIZE;
 
     pub(crate) fn default() -> Self {
-        DenoiseState::from_model_owned(Cow::Owned(RnnModel::default()))
+        #[cfg(feature = "rnnoise-v2")]
+        {
+            DenoiseState {
+                backend: DenoiseBackend::V2(crate::v2::V2DenoiseState::new()),
+                params: SuppressionParams::default(),
+            }
+        }
+        #[cfg(not(feature = "rnnoise-v2"))]
+        {
+            DenoiseState::from_model_owned(Cow::Owned(RnnModel::default()))
+        }
     }
 
     /// Creates a new `DenoiseState`.
@@ -106,9 +128,11 @@ impl<'model> DenoiseState<'model> {
 
     pub(crate) fn from_model_owned(model: Cow<'model, RnnModel>) -> DenoiseState<'model> {
         DenoiseState {
-            lastg: [0.0; NB_BANDS],
-            rnn: crate::rnn::RnnState::new(model),
-            feat: crate::features::DenoiseFeatures::new(),
+            backend: DenoiseBackend::Legacy(LegacyDenoiseState {
+                lastg: [0.0; NB_BANDS],
+                rnn: crate::rnn::RnnState::new(model),
+                feat: crate::features::DenoiseFeatures::new(),
+            }),
             params: SuppressionParams::default(),
         }
     }
@@ -118,6 +142,10 @@ impl<'model> DenoiseState<'model> {
     /// Takes effect on the next [`process_frame`](Self::process_frame) call.
     pub fn set_suppression_params(&mut self, params: SuppressionParams) {
         self.params = params;
+        #[cfg(feature = "rnnoise-v2")]
+        if let DenoiseBackend::V2(v2) = &mut self.backend {
+            v2.set_suppression_params(params);
+        }
     }
 
     /// Returns the current gain post-processing parameters.
@@ -137,6 +165,21 @@ impl<'model> DenoiseState<'model> {
     /// preceding inputs. Because of this, you might prefer to discard the very first output; it
     /// will contain some fade-in artifacts.
     pub fn process_frame(&mut self, output: &mut [f32], input: &[f32]) -> f32 {
+        match &mut self.backend {
+            #[cfg(feature = "rnnoise-v2")]
+            DenoiseBackend::V2(v2) => v2.process_frame(output, input),
+            DenoiseBackend::Legacy(legacy) => legacy.process_frame(output, input, self.params),
+        }
+    }
+}
+
+impl<'model> LegacyDenoiseState<'model> {
+    fn process_frame(
+        &mut self,
+        output: &mut [f32],
+        input: &[f32],
+        params: SuppressionParams,
+    ) -> f32 {
         let mut g = [0.0; NB_BANDS];
         let mut gf = [1.0; FREQ_SIZE];
         let mut vad_prob = [0.0];
@@ -149,9 +192,9 @@ impl<'model> DenoiseState<'model> {
             // Over-suppression: reshape partial gains downward before the pitch
             // comb and release floor see them, so the whole chain stays
             // consistent. A near-unity (voice) gain is barely moved.
-            if self.params.gain_exponent != 1.0 {
+            if params.gain_exponent != 1.0 {
                 for gain in g.iter_mut() {
-                    *gain = gain.powf(self.params.gain_exponent);
+                    *gain = gain.powf(params.gain_exponent);
                 }
             }
             self.feat.pitch_filter(&g);
@@ -159,8 +202,8 @@ impl<'model> DenoiseState<'model> {
                 g[i] = g[i].max(0.6 * self.lastg[i]);
                 // Attack clamp: cap the per-frame rise so suppression cannot
                 // release back to full level within a few frames after silence.
-                if self.params.attack < 1.0 && g[i] > self.lastg[i] {
-                    g[i] = self.lastg[i] + (g[i] - self.lastg[i]) * self.params.attack;
+                if params.attack < 1.0 && g[i] > self.lastg[i] {
+                    g[i] = self.lastg[i] + (g[i] - self.lastg[i]) * params.attack;
                 }
                 self.lastg[i] = g[i];
             }

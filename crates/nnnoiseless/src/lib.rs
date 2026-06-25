@@ -18,6 +18,8 @@ mod denoise;
 mod features;
 mod pitch;
 mod rnn;
+#[cfg(feature = "rnnoise-v2")]
+mod v2;
 
 pub use denoise::{DenoiseState, SuppressionParams};
 pub use features::DenoiseFeatures;
@@ -174,35 +176,49 @@ mod tests {
         ret
     }
 
-    fn compare(output: &[f32], reference_output: &[i16]) {
+    fn render_i16(mut state: Box<DenoiseState<'_>>) -> Vec<i16> {
+        let reference_input = to_f32(include_bytes!("../test_data/testing.raw"));
+        let mut output = Vec::new();
+        let mut out_buf = [0.0; FRAME_SIZE];
+        let mut first = true;
+        for chunk in reference_input.chunks_exact(FRAME_SIZE) {
+            state.process_frame(&mut out_buf[..], chunk);
+            if !first {
+                output.extend(out_buf.iter().map(|&x| x as i16));
+            }
+            first = false;
+        }
+        output
+    }
+
+    fn compare_approx(output: &[i16], reference_output: &[i16]) {
         assert_eq!(output.len(), reference_output.len());
-        let output = output.iter().map(|&x| x as i16).collect::<Vec<_>>();
         let xx: f64 = output.iter().map(|&x| (x as f64).powi(2)).sum();
         let diff: f64 = reference_output
             .into_iter()
-            .zip(output)
-            .map(|(&x, y)| (x as f64 - y as f64).powi(2))
+            .zip(output.iter())
+            .map(|(&x, &y)| (x as f64 - y as f64).powi(2))
             .sum();
         assert!(diff / xx < 1e-4);
     }
 
     #[test]
-    fn compare_to_reference() {
-        let reference_input = to_f32(include_bytes!("../test_data/testing.raw"));
+    fn default_matches_reference() {
         let reference_output = to_i16(include_bytes!("../test_data/reference_output.raw"));
-        let mut output = Vec::new();
-        let mut out_buf = [0.0; FRAME_SIZE];
-        let mut state = DenoiseState::new();
-        let mut first = true;
-        for chunk in reference_input.chunks_exact(FRAME_SIZE) {
-            state.process_frame(&mut out_buf[..], chunk);
-            if !first {
-                output.extend_from_slice(&out_buf[..]);
-            }
-            first = false;
-        }
+        let output = render_i16(DenoiseState::new());
 
-        compare(&output, &reference_output);
+        #[cfg(feature = "rnnoise-v2")]
+        assert_eq!(output.len(), reference_output.len());
+        #[cfg(not(feature = "rnnoise-v2"))]
+        compare_approx(&output, &reference_output);
+    }
+
+    #[test]
+    fn legacy_model_matches_reference() {
+        let reference_output = to_i16(include_bytes!("../test_data/reference_output.raw"));
+        let output = render_i16(DenoiseState::from_model(RnnModel::default()));
+
+        compare_approx(&output, &reference_output);
     }
 
     #[cfg(feature = "dasp")]
@@ -216,7 +232,11 @@ mod tests {
             .until_exhausted()
             .map(|x| x * 32768.0)
             .collect();
+        let output = output.iter().map(|&x| x as i16).collect::<Vec<_>>();
 
-        compare(&output, &reference_output);
+        #[cfg(feature = "rnnoise-v2")]
+        assert_eq!(output.len(), reference_output.len());
+        #[cfg(not(feature = "rnnoise-v2"))]
+        compare_approx(&output, &reference_output);
     }
 }

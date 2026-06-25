@@ -336,10 +336,11 @@ impl TypingNoiseGate {
         }
     }
 
-    pub(crate) fn process(&mut self, vad_probability: f32, frame: &mut [f32]) {
+    pub(crate) fn process(&mut self, rnnoise_vad: f32, earshot_vad: f32, frame: &mut [f32]) {
         if !self.config.enabled || frame.is_empty() {
             return;
         }
+        let vad_probability = rnnoise_vad.max(earshot_vad);
         let rms = rms_i16_scale(frame) * I16_SCALE;
         let diff_ratio = derivative_rms_i16_scale(frame) / rms.max(1.0);
         let should_enter = vad_probability < self.config.vad_enter
@@ -746,11 +747,11 @@ mod tests {
         let mut frame = sine_frame(220.0, 1_800.0);
         let before = rms_i16_scale(&frame) * I16_SCALE;
 
-        gate.process(0.2, &mut frame);
+        gate.process(0.2, 0.2, &mut frame);
         let after_first = rms_i16_scale(&frame) * I16_SCALE;
 
         let mut next = sine_frame(220.0, 1_800.0);
-        gate.process(0.2, &mut next);
+        gate.process(0.2, 0.2, &mut next);
         let after_second = rms_i16_scale(&next) * I16_SCALE;
 
         assert!(
@@ -769,12 +770,27 @@ mod tests {
         let mut voiced = sine_frame(1_600.0, 1_800.0);
         let before = rms_i16_scale(&voiced) * I16_SCALE;
 
-        gate.process(0.2, &mut voiced);
+        gate.process(0.2, 0.2, &mut voiced);
         let after = rms_i16_scale(&voiced) * I16_SCALE;
 
         assert!(
             after > before * 0.99,
             "high-derivative speech-like frame should not be ducked: before={before:.1} after={after:.1}"
+        );
+    }
+
+    #[test]
+    fn typing_noise_gate_preserves_frames_when_rnnoise_vad_is_speech() {
+        let mut gate = TypingNoiseGate::new(test_typing_gate_config(), DenoiseConfig::RnnNoise);
+        let mut frame = sine_frame(220.0, 1_800.0);
+        let before = rms_i16_scale(&frame) * I16_SCALE;
+
+        gate.process(0.9, 0.2, &mut frame);
+        let after = rms_i16_scale(&frame) * I16_SCALE;
+
+        assert!(
+            after > before * 0.99,
+            "high RNNoise VAD should prevent typing gate entry: before={before:.1} after={after:.1}"
         );
     }
 
@@ -785,7 +801,7 @@ mod tests {
         let mut frame = sine_frame(220.0, 1_800.0);
         let before = frame.clone();
 
-        gate.process(0.0, &mut frame);
+        gate.process(0.0, 0.0, &mut frame);
 
         assert_eq!(frame, before);
     }
@@ -794,11 +810,11 @@ mod tests {
     fn typing_noise_gate_requires_release_vad_before_opening() {
         let mut gate = TypingNoiseGate::new(test_typing_gate_config(), DenoiseConfig::RnnNoise);
         let mut thump = sine_frame(220.0, 1_800.0);
-        gate.process(0.2, &mut thump);
+        gate.process(0.2, 0.2, &mut thump);
 
         let mut not_enough_vad = sine_frame(1_600.0, 1_800.0);
         let before = rms_i16_scale(&not_enough_vad) * I16_SCALE;
-        gate.process(0.81, &mut not_enough_vad);
+        gate.process(0.81, 0.81, &mut not_enough_vad);
         let held = rms_i16_scale(&not_enough_vad) * I16_SCALE;
         assert!(
             held < before * 0.10,
@@ -807,10 +823,10 @@ mod tests {
 
         for _ in 0..3 {
             let mut release = sine_frame(1_600.0, 1_800.0);
-            gate.process(0.86, &mut release);
+            gate.process(0.86, 0.86, &mut release);
         }
         let mut released = sine_frame(1_600.0, 1_800.0);
-        gate.process(0.86, &mut released);
+        gate.process(0.86, 0.86, &mut released);
         let after = rms_i16_scale(&released) * I16_SCALE;
         assert!(
             after > before * 0.95,

@@ -5,9 +5,9 @@
 #
 # `cargo v3` instead targets x86-64-v3 (AVX2 + FMA, Intel Haswell / AMD
 # Excavator and newer, 2013+). It pairs `-C target-cpu=x86-64-v3` for the Rust
-# DSP code with the `avx2` feature, which presumes AVX2 in the bundled Opus C
-# build and drops its per-call CPU dispatch. Artifacts land in
-# `target/release-v3/` and never clobber the portable `release` build.
+# DSP code with the `avx2` feature, which presumes AVX2 in bundled C audio
+# backends that support it and drops their per-call CPU dispatch. Artifacts land
+# in `target/release-v3/` and never clobber the portable `release` build.
 #
 # The rustflags are scoped to x86-64 targets so host build scripts are
 # unaffected when cross-compiling. Note env `RUSTFLAGS`, if set, overrides these.
@@ -16,5 +16,12 @@ v3 = [
     "build",
     "--profile", "release-v3",
     "--features", "avx2",
+    "--config", "target.'cfg(target_arch = \"x86_64\")'.rustflags=['-C', 'target-cpu=x86-64-v3']",
+]
+
+v3-rnnoise = [
+    "build",
+    "--profile", "release-v3",
+    "--features", "avx2 rnnoise-v2",
     "--config", "target.'cfg(target_arch = \"x86_64\")'.rustflags=['-C', 'target-cpu=x86-64-v3']",
 ]

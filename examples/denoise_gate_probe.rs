@@ -456,8 +456,9 @@ fn run_production_gate_variant(
     let mut typing_ducked = 0usize;
 
     for (frame_index, chunk) in samples.chunks_exact(N).enumerate() {
-        st.process_frame(&mut out, chunk);
-        let vad = earshot.process(&out);
+        let rnnoise_vad = st.process_frame(&mut out, chunk);
+        let earshot_vad = earshot.process(&out);
+        let vad = rnnoise_vad.max(earshot_vad);
         let out_rms_before = rms(&out);
         let diff_ratio = diff_rms(&out) / out_rms_before.max(1.0);
         let should_enter =
@@ -552,6 +553,9 @@ fn main() {
     summarize("ear out", &frames, |frame| frame.earshot_out);
     summarize("min vad", &frames, |frame| {
         frame.rnnoise_vad.min(frame.earshot_out)
+    });
+    summarize("max vad", &frames, |frame| {
+        frame.rnnoise_vad.max(frame.earshot_out)
     });
     summarize("crest", &frames, |frame| frame.crest);
     summarize("zcr", &frames, |frame| frame.zcr);
