@@ -12,9 +12,14 @@ publish = false
 [features]
 default = []
 dasp = ["dep:dasp", "dep:dasp_interpolate", "dep:dasp_ring_buffer"]
+rnnoise-v2 = []
+presume-avx2 = []
 
 [lib]
 bench = false
+
+[build-dependencies]
+cc = "1.0"
 
 [dependencies]
 easyfft = "0.4.1"

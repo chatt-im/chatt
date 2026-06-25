@@ -1071,6 +1071,7 @@ dependencies = [
 name = "nnnoiseless"
 version = "0.5.1"
 dependencies = [
+ "cc",
  "dasp",
  "dasp_interpolate",
  "dasp_ring_buffer",

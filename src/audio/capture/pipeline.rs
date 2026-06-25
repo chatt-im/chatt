@@ -344,9 +344,10 @@ impl LiveEncoderPipeline {
         // Earshot drives gating and silence decisions even when RNNoise is
         // active. RNNoise VAD over-scores keyboard/table thumps in this capture
         // path, while Earshot is less prone to that false-open behaviour.
-        let _rnnoise_vad = self.processor.process(frame, reference);
+        let rnnoise_vad = self.processor.process(frame, reference).unwrap_or_default();
         let vad_probability = self.earshot.process_48k_frame(frame);
-        self.typing_gate.process(vad_probability, frame);
+        self.typing_gate
+            .process(rnnoise_vad, vad_probability, frame);
         store_processed_level_stats(stats, frame);
         stats.store_vad_probability(vad_probability);
         let vad = vad_to_u8(vad_probability);
