@@ -231,6 +231,13 @@ impl Participants {
         Some(user_id)
     }
 
+    pub(crate) fn select_visible_row(&mut self, row: usize) -> Option<UserId> {
+        let index = self.scroll.saturating_add(row);
+        let user_id = self.entries.get(index)?.user_id;
+        self.selected_user = Some(user_id);
+        Some(user_id)
+    }
+
     pub(crate) fn keep_selected_visible(&mut self, visible_rows: usize) {
         let Some(index) = self.selected_index() else {
             self.scroll = self.scroll.min(self.entries.len().saturating_sub(1));

@@ -62,6 +62,7 @@ impl FocusManager {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn active(&self) -> FocusId {
         self.active
     }
@@ -77,65 +78,6 @@ impl FocusManager {
 
     pub(crate) fn pop_modal(&mut self, fallback: FocusId) {
         self.active = self.restore_stack.pop().unwrap_or(fallback);
-    }
-}
-
-impl FocusId {
-    pub(crate) fn label(self) -> &'static str {
-        match self {
-            FocusId::Chat => "chat",
-            FocusId::Composer => "composer",
-            FocusId::Participants => "users",
-            FocusId::ServerList => "servers",
-            FocusId::ServerField(field) => field.label(),
-            FocusId::Settings(field) => field.label(),
-            FocusId::InputPicker => "input picker",
-            FocusId::OutputPicker => "output picker",
-            FocusId::Dialog => "dialog",
-        }
-    }
-}
-
-impl ServerField {
-    fn label(self) -> &'static str {
-        match self {
-            ServerField::Alias => "server alias",
-            ServerField::DisplayName => "display name",
-            ServerField::TcpAddr => "tcp address",
-            ServerField::UdpAddr => "udp address",
-            ServerField::UdpProbeAddr => "probe address",
-            ServerField::RoomId => "room",
-            ServerField::Save => "save server",
-            ServerField::SaveJoin => "save join",
-            ServerField::Cancel => "cancel",
-        }
-    }
-}
-
-impl SettingsField {
-    fn label(self) -> &'static str {
-        match self {
-            SettingsField::InputDevice => "capture",
-            SettingsField::RawInputDevice => "raw capture device",
-            SettingsField::OutputDevice => "playback",
-            SettingsField::RawOutputDevice => "raw playback device",
-            SettingsField::Bitrate => "bitrate",
-            SettingsField::Denoise => "denoise",
-            SettingsField::EchoCancellation => "echo",
-            SettingsField::Amplification => "gain",
-            SettingsField::Suppression => "suppression",
-            SettingsField::Release => "release",
-            SettingsField::TypingSuppression => "typing gate",
-            SettingsField::TypingVadEnter => "typing gate start",
-            SettingsField::TypingVadRelease => "typing gate release",
-            SettingsField::InputBuffer => "capture buffer",
-            SettingsField::OutputBuffer => "playback buffer",
-            SettingsField::FormBindings => "form bindings",
-            SettingsField::Theme => "theme",
-            SettingsField::Refresh => "refresh",
-            SettingsField::Save => "save settings",
-            SettingsField::Close => "close settings",
-        }
     }
 }
 

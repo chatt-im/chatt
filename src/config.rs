@@ -324,7 +324,7 @@ impl Default for UiConfig {
             placeholder: default_placeholder(),
             max_messages: 50_000,
             overscan: 24,
-            form_bindings: FormBindings::Standard,
+            form_bindings: FormBindings::Vim,
             theme: ThemeChoice::default(),
         }
     }
@@ -333,8 +333,8 @@ impl Default for UiConfig {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Toml)]
 #[toml(FromToml, ToToml, rename_all = "kebab-case")]
 pub enum FormBindings {
-    #[default]
     Standard,
+    #[default]
     Vim,
 }
 
