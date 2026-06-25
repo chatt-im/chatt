@@ -23,11 +23,16 @@ const ACTION_ROWS: [SettingsFocus; 3] = [
     SettingsFocus::Save,
     SettingsFocus::Close,
 ];
-const CAPTURE_ROWS: [SettingsFocus; 5] = [
+const CAPTURE_ROWS: [SettingsFocus; 10] = [
     SettingsFocus::Bitrate,
     SettingsFocus::Denoise,
     SettingsFocus::EchoCancellation,
     SettingsFocus::Amplification,
+    SettingsFocus::Suppression,
+    SettingsFocus::Release,
+    SettingsFocus::TypingSuppression,
+    SettingsFocus::TypingVadEnter,
+    SettingsFocus::TypingVadRelease,
     SettingsFocus::CaptureBuffer,
 ];
 const PLAYBACK_ROWS: [SettingsFocus; 1] = [SettingsFocus::PlaybackBuffer];
@@ -443,6 +448,11 @@ pub(crate) fn setting_label(focus: SettingsFocus) -> &'static str {
         SettingsFocus::Denoise => "Denoise",
         SettingsFocus::EchoCancellation => "Echo Cancel",
         SettingsFocus::Amplification => "Max Gain",
+        SettingsFocus::Suppression => "Suppression",
+        SettingsFocus::Release => "Release",
+        SettingsFocus::TypingSuppression => "Typing Gate",
+        SettingsFocus::TypingVadEnter => "Gate Start",
+        SettingsFocus::TypingVadRelease => "Gate Release",
         SettingsFocus::CaptureBuffer => "Capture Buffer",
         SettingsFocus::PlaybackBuffer => "Playback Buffer",
         SettingsFocus::FormBindings => "Form Bindings",

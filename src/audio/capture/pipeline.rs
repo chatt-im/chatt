@@ -11,15 +11,16 @@ use crate::{
         capture::{
             dsp::{
                 CaptureGain, CaptureGateDecision, CaptureHighPass, CaptureProcessor, EarshotVad,
-                LongSilenceGate, is_capture_skip_safe_silence, store_processed_level_stats,
+                LongSilenceGate, TypingNoiseGate, is_capture_skip_safe_silence,
+                store_processed_level_stats,
             },
             echo::{EchoReference, EchoReferenceSource},
             encoder::OpusVoiceEncoder,
         },
         resample::CaptureResampler,
         shared::{
-            AudioStats, DenoiseConfig, FRAME_SAMPLES, LIVE_OPUS_FRAME_SAMPLES,
-            LIVE_PACKET_FLAG_OPUS_RESET, LIVE_PACKET_FLAG_SILENCE_HINT,
+            AudioStats, DenoiseConfig, DenoiseSuppression, DenoiseTypingSuppression, FRAME_SAMPLES,
+            LIVE_OPUS_FRAME_SAMPLES, LIVE_PACKET_FLAG_OPUS_RESET, LIVE_PACKET_FLAG_SILENCE_HINT,
             LIVE_PACKET_FLAG_SILENCE_RESUME, LiveAudioTuning, LiveEncoderProfile, LocalVoiceFrame,
             MAX_OPUS_PACKET_BYTES, VoicePayload, convert_i16_scale_to_pcm_i16, vad_to_u8,
         },
@@ -64,6 +65,8 @@ pub(crate) fn run_live_encoder_worker<F>(
     max_amplification_bits: Arc<AtomicU32>,
     encoder_loss_percent: Arc<AtomicU32>,
     tuning: LiveAudioTuning,
+    suppression: DenoiseSuppression,
+    typing_suppression: DenoiseTypingSuppression,
     echo_source: Option<EchoReferenceSource>,
     device_rate: u32,
     stats: AudioStats,
@@ -78,6 +81,8 @@ pub(crate) fn run_live_encoder_worker<F>(
         &max_amplification_bits,
         &encoder_loss_percent,
         tuning,
+        suppression,
+        typing_suppression,
         echo_source,
         device_rate,
         &stats,
@@ -145,6 +150,8 @@ pub(crate) fn run_live_encoder_worker_inner<F>(
     max_amplification_bits: &AtomicU32,
     encoder_loss_percent: &AtomicU32,
     tuning: LiveAudioTuning,
+    suppression: DenoiseSuppression,
+    typing_suppression: DenoiseTypingSuppression,
     echo_source: Option<EchoReferenceSource>,
     device_rate: u32,
     stats: &AudioStats,
@@ -159,6 +166,8 @@ where
         tuning,
         f32::from_bits(max_amplification_bits.load(Ordering::Relaxed)),
         true,
+        suppression,
+        typing_suppression,
         echo_source,
         device_rate,
     );
@@ -191,6 +200,7 @@ pub(crate) struct LiveEncoderPipeline {
     /// VAD is taken from `earshot` after this runs.
     processor: CaptureProcessor,
     earshot: EarshotVad,
+    typing_gate: TypingNoiseGate,
     long_silence: Option<LongSilenceGate>,
     gain_max_db: f32,
     /// Device-rate to 48 kHz resampler, present only for non-48 kHz capture
@@ -222,12 +232,15 @@ impl<'a> ProcessedCaptureFrame<'a> {
 }
 
 impl LiveEncoderPipeline {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         encoder: OpusVoiceEncoder,
         denoise: DenoiseConfig,
         tuning: LiveAudioTuning,
         max_amplification: f32,
         auto_gain_enabled: bool,
+        suppression: DenoiseSuppression,
+        typing_suppression: DenoiseTypingSuppression,
         echo_source: Option<EchoReferenceSource>,
         device_rate: u32,
     ) -> Self {
@@ -241,8 +254,9 @@ impl LiveEncoderPipeline {
             encoder,
             auto_gain_enabled,
             tuning,
-            processor: CaptureProcessor::new(denoise, gain_max_db, echo_enabled),
+            processor: CaptureProcessor::new(denoise, gain_max_db, echo_enabled, suppression),
             earshot: EarshotVad::new(),
+            typing_gate: TypingNoiseGate::new(typing_suppression, denoise),
             long_silence: tuning
                 .capture_silence_gate
                 .then(|| LongSilenceGate::new(tuning)),
@@ -327,12 +341,12 @@ impl LiveEncoderPipeline {
             .filter(|source| source.enabled())
             .map(|source| source.reference());
         self.processor.set_echo_enabled(reference.is_some());
-        // RNNoise yields its own VAD; with any other engine fall back to the
-        // always-on Earshot detector on the cleaned frame.
-        let vad_probability = self
-            .processor
-            .process(frame, reference)
-            .unwrap_or_else(|| self.earshot.process_48k_frame(frame));
+        // Earshot drives gating and silence decisions even when RNNoise is
+        // active. RNNoise VAD over-scores keyboard/table thumps in this capture
+        // path, while Earshot is less prone to that false-open behaviour.
+        let _rnnoise_vad = self.processor.process(frame, reference);
+        let vad_probability = self.earshot.process_48k_frame(frame);
+        self.typing_gate.process(vad_probability, frame);
         store_processed_level_stats(stats, frame);
         stats.store_vad_probability(vad_probability);
         let vad = vad_to_u8(vad_probability);
@@ -476,6 +490,8 @@ pub(crate) fn build_live_encoder_pipeline(
         tuning,
         max_amplification,
         auto_gain_enabled,
+        DenoiseSuppression::IDENTITY,
+        DenoiseTypingSuppression::DISABLED,
         echo_reference.map(EchoReferenceSource::Always),
         crate::audio::shared::SAMPLE_RATE,
     ))
@@ -775,6 +791,8 @@ mod tests {
             test_tuning(),
             DEFAULT_LIVE_MAX_AMPLIFICATION,
             true,
+            DenoiseSuppression::IDENTITY,
+            DenoiseTypingSuppression::DISABLED,
             None,
             44_100,
         );
@@ -861,6 +879,8 @@ mod tests {
             test_tuning(),
             DEFAULT_LIVE_MAX_AMPLIFICATION,
             true,
+            DenoiseSuppression::IDENTITY,
+            DenoiseTypingSuppression::DISABLED,
             Some(EchoReferenceSource::Controlled(Arc::clone(&control))),
             crate::audio::shared::SAMPLE_RATE,
         );

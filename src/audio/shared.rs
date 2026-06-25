@@ -56,6 +56,96 @@ pub const FRAME_SAMPLES: usize = DenoiseState::FRAME_SIZE;
 /// maximum AGC2 gain: `0` disables auto gain entirely, and this default leaves a
 /// moderate, sane amount of headroom for the adaptive gain to lift a quiet mic.
 pub const DEFAULT_LIVE_MAX_AMPLIFICATION: f32 = 12.0;
+/// Default RNNoise over-suppression exponent. `1.0` is stock RNNoise.
+pub const DEFAULT_DENOISE_SUPPRESSION: f32 = 1.0;
+/// Default RNNoise release smoothing. `1.0` lets suppression release instantly,
+/// the stock behaviour.
+pub const DEFAULT_DENOISE_RELEASE: f32 = 1.0;
+/// Default post-RNNoise typing/table-thump ducking. Off by default because it is
+/// tuned for desk-mounted microphone setups rather than every capture path.
+pub const DEFAULT_DENOISE_TYPING_SUPPRESSION: bool = false;
+/// Earshot VAD below this level may engage the typing gate when the acoustic
+/// guards also match.
+pub const DEFAULT_DENOISE_TYPING_VAD_ENTER: f32 = 0.80;
+/// Once the typing gate is suppressing, Earshot VAD must reach at least this
+/// level before release can begin. Keep this above `vad_enter` for hysteresis.
+pub const DEFAULT_DENOISE_TYPING_VAD_RELEASE: f32 = 0.82;
+/// Minimum duration of continuous release-level VAD before the typing gate opens.
+pub const DEFAULT_DENOISE_TYPING_RELEASE_MS: u64 = 30;
+
+/// Tunable RNNoise gain post-processing exposed in `[audio]` settings. The
+/// identity value reproduces stock RNNoise output bit-for-bit and only the
+/// [`DenoiseConfig::RnnNoise`] engine reads it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct DenoiseSuppression {
+    /// Over-suppression exponent applied to each band gain. `1.0` is stock,
+    /// higher values push down partial gains (broadband clatter) while leaving
+    /// voice bands near full level.
+    pub strength: f32,
+    /// Per-frame cap on how fast a band gain may rise, in `(0.0, 1.0]`. `1.0`
+    /// releases instantly, lower values stop noise bursts swelling back up after
+    /// a silence.
+    pub release: f32,
+}
+
+impl DenoiseSuppression {
+    /// Stock RNNoise behaviour, no extra suppression.
+    pub const IDENTITY: Self = Self {
+        strength: 1.0,
+        release: 1.0,
+    };
+}
+
+impl Default for DenoiseSuppression {
+    fn default() -> Self {
+        Self::IDENTITY
+    }
+}
+
+impl From<DenoiseSuppression> for nnnoiseless::SuppressionParams {
+    fn from(value: DenoiseSuppression) -> Self {
+        nnnoiseless::SuppressionParams {
+            gain_exponent: value.strength.max(1.0),
+            attack: value.release.clamp(0.01, 1.0),
+        }
+    }
+}
+
+/// Post-RNNoise desk/keyboard suppression gate. The VAD thresholds are Earshot
+/// probabilities in `[0, 1]`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct DenoiseTypingSuppression {
+    pub enabled: bool,
+    pub vad_enter: f32,
+    pub vad_release: f32,
+    pub release_confirm: Duration,
+}
+
+impl DenoiseTypingSuppression {
+    pub const DISABLED: Self = Self {
+        enabled: false,
+        vad_enter: DEFAULT_DENOISE_TYPING_VAD_ENTER,
+        vad_release: DEFAULT_DENOISE_TYPING_VAD_RELEASE,
+        release_confirm: Duration::from_millis(DEFAULT_DENOISE_TYPING_RELEASE_MS),
+    };
+
+    pub fn normalized(self) -> Self {
+        let vad_enter = self.vad_enter.clamp(0.0, 1.0);
+        let vad_release = self.vad_release.clamp(vad_enter, 1.0);
+        Self {
+            enabled: self.enabled,
+            vad_enter,
+            vad_release,
+            release_confirm: self.release_confirm.min(Duration::from_millis(500)),
+        }
+    }
+}
+
+impl Default for DenoiseTypingSuppression {
+    fn default() -> Self {
+        Self::DISABLED
+    }
+}
 pub(crate) const LIVE_OPUS_FRAME_SAMPLES: usize = FRAME_SAMPLES * 2;
 pub(crate) const LIVE_PACKET_FLAG_OPUS_RESET: u8 = 0x01;
 /// Sender is transmitting silence at the edge of a silence-suppressed pause.
