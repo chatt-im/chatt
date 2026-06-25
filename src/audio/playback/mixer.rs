@@ -1,4 +1,7 @@
-use std::time::{Duration, Instant};
+use std::{
+    sync::Mutex,
+    time::{Duration, Instant},
+};
 
 use hashbrown::HashMap;
 
@@ -12,6 +15,7 @@ use crate::audio::{
 };
 
 const LIVE_PLAYBACK_BACKEND_ERROR_LOG_INTERVAL: Duration = Duration::from_secs(1);
+const LIVE_PLAYBACK_PREALLOCATED_STREAMS: usize = 32;
 
 #[derive(Default)]
 pub(crate) struct LivePlaybackMixer {
@@ -23,6 +27,15 @@ pub(crate) struct LivePlaybackMixer {
     last_backend_error_log_at: Option<Instant>,
     last_backend_block_samples: usize,
     last_playout_quantum_samples: usize,
+}
+
+pub(crate) struct LivePlaybackSharedSnapshot {
+    inner: Mutex<LivePlaybackSharedSnapshotInner>,
+}
+
+struct LivePlaybackSharedSnapshotInner {
+    snapshot: LivePlaybackSnapshot,
+    last_backend_error_log_at: Option<Instant>,
 }
 
 #[derive(Debug, Default)]
@@ -62,6 +75,23 @@ impl LivePlaybackMixer {
         }
     }
 
+    pub(crate) fn with_live_capacity(tuning: LiveAudioTuning) -> Self {
+        Self {
+            tuning,
+            streams: HashMap::with_capacity(LIVE_PLAYBACK_PREALLOCATED_STREAMS),
+            controls: HashMap::with_capacity(LIVE_PLAYBACK_PREALLOCATED_STREAMS),
+            stats: LivePlaybackMixerStats::default(),
+            last_diagnostic_at: None,
+            last_backend_error_log_at: None,
+            last_backend_block_samples: 0,
+            last_playout_quantum_samples: 0,
+        }
+    }
+
+    pub(crate) fn ensure_stream(&mut self, stream_id: u32, stream: AdaptivePlaybackStream) {
+        self.streams.entry(stream_id).or_insert(stream);
+    }
+
     pub(crate) fn queue_stream_samples(
         &mut self,
         stream_id: u32,
@@ -80,6 +110,46 @@ impl LivePlaybackMixer {
         playout_delay: Option<PlayoutDelay>,
         now: Instant,
     ) {
+        self.queue_stream_samples_owned_with_delay(
+            stream_id,
+            samples.to_vec(),
+            source,
+            playout_delay,
+            now,
+        );
+    }
+
+    pub(crate) fn queue_stream_samples_owned_with_delay(
+        &mut self,
+        stream_id: u32,
+        samples: Vec<f32>,
+        source: DecodedFrameSource,
+        playout_delay: Option<PlayoutDelay>,
+        now: Instant,
+    ) {
+        self.queue_stream_samples_owned_inner(stream_id, samples, source, playout_delay, now, true);
+    }
+
+    pub(crate) fn queue_existing_stream_samples_owned_with_delay(
+        &mut self,
+        stream_id: u32,
+        samples: Vec<f32>,
+        source: DecodedFrameSource,
+        playout_delay: Option<PlayoutDelay>,
+        now: Instant,
+    ) -> bool {
+        self.queue_stream_samples_owned_inner(stream_id, samples, source, playout_delay, now, false)
+    }
+
+    fn queue_stream_samples_owned_inner(
+        &mut self,
+        stream_id: u32,
+        samples: Vec<f32>,
+        source: DecodedFrameSource,
+        playout_delay: Option<PlayoutDelay>,
+        now: Instant,
+        create_stream: bool,
+    ) -> bool {
         match source {
             DecodedFrameSource::Normal => {}
             DecodedFrameSource::Dred => {
@@ -90,27 +160,29 @@ impl LivePlaybackMixer {
             }
             DecodedFrameSource::DecodeError => {
                 self.stats.decode_errors = self.stats.decode_errors.saturating_add(1);
-                return;
+                return false;
             }
         }
 
         if samples.is_empty() {
-            return;
+            return true;
         }
 
         let stream = match self.streams.entry(stream_id) {
             hashbrown::hash_map::Entry::Occupied(entry) => entry.into_mut(),
-            hashbrown::hash_map::Entry::Vacant(entry) => {
+            hashbrown::hash_map::Entry::Vacant(entry) if create_stream => {
                 match AdaptivePlaybackStream::new(self.tuning) {
                     Ok(stream) => entry.insert(stream),
                     Err(error) => {
                         eprintln!("failed to create live playback stream: {error}");
-                        return;
+                        return false;
                     }
                 }
             }
+            hashbrown::hash_map::Entry::Vacant(_) => return false,
         };
-        stream.queue_samples_with_delay(samples, source, playout_delay, now, &mut self.stats);
+        stream.queue_samples_owned_with_delay(samples, source, playout_delay, now, &mut self.stats);
+        true
     }
 
     /// Applies the receiver-recommended dynamic target to an existing stream.
@@ -153,6 +225,18 @@ impl LivePlaybackMixer {
             }
         };
         stream.mark_sender_silent(now, &mut self.stats);
+    }
+
+    pub(crate) fn note_existing_stream_sender_silence(
+        &mut self,
+        stream_id: u32,
+        now: Instant,
+    ) -> bool {
+        let Some(stream) = self.streams.get_mut(&stream_id) else {
+            return false;
+        };
+        stream.mark_sender_silent(now, &mut self.stats);
+        true
     }
 
     pub(crate) fn set_stream_control(&mut self, stream_id: u32, control: PlaybackStreamControl) {
@@ -352,6 +436,87 @@ impl LivePlaybackMixer {
             0 => 0.0,
             1 => only_sample,
             _ => soft_limit(sum / (active as f32).sqrt()),
+        }
+    }
+}
+
+impl LivePlaybackSharedSnapshot {
+    pub(crate) fn new(snapshot: LivePlaybackSnapshot) -> Self {
+        Self {
+            inner: Mutex::new(LivePlaybackSharedSnapshotInner {
+                snapshot,
+                last_backend_error_log_at: None,
+            }),
+        }
+    }
+
+    pub(crate) fn snapshot(&self) -> LivePlaybackSnapshot {
+        self.inner
+            .lock()
+            .map(|inner| inner.snapshot.clone())
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn queued_samples(&self) -> usize {
+        self.inner
+            .lock()
+            .map(|inner| inner.snapshot.queued_samples)
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn try_update_from_mixer(&self, mixer: &LivePlaybackMixer, now: Instant) {
+        let Ok(mut inner) = self.inner.try_lock() else {
+            return;
+        };
+
+        let backend_xruns = inner.snapshot.backend_xruns;
+        let backend_stream_errors = inner.snapshot.backend_stream_errors;
+        let last_backend_error = inner.snapshot.last_backend_error.clone();
+        let mut snapshot = mixer.snapshot_at(now);
+        snapshot.backend_xruns = backend_xruns;
+        snapshot.backend_stream_errors = backend_stream_errors;
+        snapshot.last_backend_error = last_backend_error;
+        inner.snapshot = snapshot;
+    }
+
+    pub(crate) fn record_backend_stream_error(&self, error: String, is_xrun: bool, now: Instant) {
+        let Ok(mut inner) = self.inner.lock() else {
+            if is_xrun {
+                kvlog::warn!("live playback backend xrun", error = error.as_str());
+            } else {
+                kvlog::warn!("live playback backend stream error", error = error.as_str());
+            }
+            return;
+        };
+
+        inner.snapshot.backend_stream_errors =
+            inner.snapshot.backend_stream_errors.saturating_add(1);
+        if is_xrun {
+            inner.snapshot.backend_xruns = inner.snapshot.backend_xruns.saturating_add(1);
+        }
+        inner.snapshot.last_backend_error = Some(error.clone());
+
+        if inner.last_backend_error_log_at.is_some_and(|at| {
+            now.saturating_duration_since(at) < LIVE_PLAYBACK_BACKEND_ERROR_LOG_INTERVAL
+        }) {
+            return;
+        }
+        inner.last_backend_error_log_at = Some(now);
+
+        if is_xrun {
+            kvlog::warn!(
+                "live playback backend xrun",
+                error = error.as_str(),
+                backend_xruns = inner.snapshot.backend_xruns,
+                backend_stream_errors = inner.snapshot.backend_stream_errors
+            );
+        } else {
+            kvlog::warn!(
+                "live playback backend stream error",
+                error = error.as_str(),
+                backend_xruns = inner.snapshot.backend_xruns,
+                backend_stream_errors = inner.snapshot.backend_stream_errors
+            );
         }
     }
 }

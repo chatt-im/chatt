@@ -1,7 +1,7 @@
 use std::{
     path::{Path, PathBuf},
     sync::{
-        Arc, Mutex,
+        Arc,
         atomic::{AtomicU32, Ordering},
         mpsc::{Receiver, Sender, SyncSender, sync_channel},
     },
@@ -28,7 +28,10 @@ use crate::{
             select_input_device_by_id, select_output_config, select_output_device_by_id,
         },
         errors::format_file_error,
-        playback::{LivePlaybackMixer, run_live_decoder_worker},
+        playback::{
+            LivePlaybackMixer, LivePlaybackMixerEvent, LivePlaybackQueueReport,
+            LivePlaybackSharedSnapshot, SpscSwapQueue, run_live_decoder_worker,
+        },
         shared::{
             AudioStats, BufferRequest, CALLBACK_QUEUE_CAPACITY, CHANNELS, DenoiseConfig,
             FRAME_SAMPLES, LIVE_PLAYBACK_COMMAND_CAPACITY, LiveAudioTuning, LiveEncoderProfile,
@@ -96,7 +99,7 @@ pub struct LivePlayback {
     stream: Option<Stream>,
     worker: Option<JoinHandle<()>>,
     sender: Option<SyncSender<LivePlaybackCommand>>,
-    mixer: Arc<Mutex<LivePlaybackMixer>>,
+    shared_snapshot: Arc<LivePlaybackSharedSnapshot>,
     /// True when the configured fixed buffer was unsupported and the host-default
     /// buffer was used instead. See [`LiveCapture::buffer_fallback`].
     buffer_fallback: bool,
@@ -206,17 +209,11 @@ impl LivePlayback {
     }
 
     pub fn queued_samples(&self) -> usize {
-        self.mixer
-            .lock()
-            .map(|mixer| mixer.queued_samples())
-            .unwrap_or_default()
+        self.shared_snapshot.queued_samples()
     }
 
     pub fn stats(&self) -> LivePlaybackSnapshot {
-        self.mixer
-            .lock()
-            .map(|mixer| mixer.snapshot())
-            .unwrap_or_default()
+        self.shared_snapshot.snapshot()
     }
 
     pub fn stop(mut self) {
@@ -525,7 +522,15 @@ pub fn start_live_playback(config: LivePlaybackConfig) -> Result<LivePlayback, S
     })?;
 
     let device_name = device.to_string();
-    let mixer = Arc::new(Mutex::new(LivePlaybackMixer::with_tuning(config.tuning)));
+    let mixer_events = Arc::new(SpscSwapQueue::<LivePlaybackMixerEvent>::with_capacity(
+        LIVE_PLAYBACK_COMMAND_CAPACITY,
+    ));
+    let queue_reports = Arc::new(SpscSwapQueue::<LivePlaybackQueueReport>::with_capacity(
+        LIVE_PLAYBACK_COMMAND_CAPACITY,
+    ));
+    let shared_snapshot = Arc::new(LivePlaybackSharedSnapshot::new(
+        LivePlaybackMixer::with_live_capacity(config.tuning).snapshot(),
+    ));
 
     // Build the output stream, falling back to the host-default buffer if the configured
     // fixed buffer is unsupported on this device, so playback never fails to start over a
@@ -533,13 +538,17 @@ pub fn start_live_playback(config: LivePlaybackConfig) -> Result<LivePlayback, S
     let echo_control = config.echo_control.clone();
     let observer = Arc::new(AudioCallbackBufferObserver::new("live_playback"));
     let build = |selection: &ConfigSelection| -> Result<Stream, String> {
+        let mixer = LivePlaybackMixer::with_live_capacity(config.tuning);
         with_audio_backend_stderr_suppressed(|| {
             build_live_output_stream(
                 &device,
                 selection.supported_config.sample_format(),
                 selection.stream_config.clone(),
                 usize::from(selection.supported_config.channels()),
-                Arc::clone(&mixer),
+                mixer,
+                Arc::clone(&mixer_events),
+                Arc::clone(&queue_reports),
+                Arc::clone(&shared_snapshot),
                 echo_control.clone(),
                 Some(Arc::clone(&observer)),
                 selection.device_rate,
@@ -578,17 +587,24 @@ pub fn start_live_playback(config: LivePlaybackConfig) -> Result<LivePlayback, S
 
     kvlog::info!("live playback started", device = device_name.as_str());
     let (sender, receiver) = sync_channel(LIVE_PLAYBACK_COMMAND_CAPACITY);
-    let worker_mixer = Arc::clone(&mixer);
+    let worker_mixer_events = Arc::clone(&mixer_events);
+    let worker_queue_reports = Arc::clone(&queue_reports);
     let feedback_sender = config.feedback_sender;
     let worker = thread::spawn(move || {
-        run_live_decoder_worker(receiver, worker_mixer, config.tuning, feedback_sender)
+        run_live_decoder_worker(
+            receiver,
+            worker_mixer_events,
+            worker_queue_reports,
+            config.tuning,
+            feedback_sender,
+        )
     });
 
     Ok(LivePlayback {
         stream: Some(stream),
         worker: Some(worker),
         sender: Some(sender),
-        mixer,
+        shared_snapshot,
         buffer_fallback,
     })
 }
@@ -662,9 +678,14 @@ mod tests {
         let _sink = LivePlaybackSink {
             sender: sender.clone(),
         };
-        let mixer = Arc::new(Mutex::new(LivePlaybackMixer::with_tuning(test_tuning())));
+        let mixer_events = Arc::new(SpscSwapQueue::<LivePlaybackMixerEvent>::with_capacity(
+            LIVE_PLAYBACK_COMMAND_CAPACITY,
+        ));
+        let queue_reports = Arc::new(SpscSwapQueue::<LivePlaybackQueueReport>::with_capacity(
+            LIVE_PLAYBACK_COMMAND_CAPACITY,
+        ));
         let worker = thread::spawn(move || {
-            run_live_decoder_worker(receiver, mixer, test_tuning(), None);
+            run_live_decoder_worker(receiver, mixer_events, queue_reports, test_tuning(), None);
         });
 
         sender.send(LivePlaybackCommand::Shutdown).unwrap();

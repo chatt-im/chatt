@@ -1,5 +1,6 @@
 use std::{
-    cell::Cell,
+    cell::{Cell, RefCell},
+    mem,
     sync::{
         Arc, Mutex,
         mpsc::{Receiver, RecvTimeoutError, Sender},
@@ -7,13 +8,16 @@ use std::{
     time::Instant,
 };
 
-use hashbrown::HashMap;
+use hashbrown::{HashMap, HashSet};
 use opus_codec::{Channels, Decoder, DredDecoder, DredState, SampleRate};
 
 use crate::{
     audio::{
         lifecycle::LivePlaybackCommand,
-        playback::{LiveJitterStream, LivePlaybackFeedbackState, LivePlaybackMixer},
+        playback::{
+            AdaptivePlaybackStream, LiveJitterStream, LivePlaybackFeedbackState, LivePlaybackMixer,
+            LivePlaybackMixerEvent, LivePlaybackQueueReport, SpscSwapQueue,
+        },
         shared::{
             DecodedFrameSource, LIVE_OPUS_FRAME_SAMPLES, LIVE_PACKET_FLAG_OPUS_RESET,
             LIVE_PACKET_FLAG_SILENCE_RESUME, LIVE_PLAYBACK_DRAIN_INTERVAL,
@@ -29,20 +33,23 @@ use crate::{
 
 pub(crate) fn run_live_decoder_worker(
     receiver: Receiver<LivePlaybackCommand>,
-    mixer: Arc<Mutex<LivePlaybackMixer>>,
+    mixer_events: Arc<SpscSwapQueue<LivePlaybackMixerEvent>>,
+    queue_reports: Arc<SpscSwapQueue<LivePlaybackQueueReport>>,
     tuning: LiveAudioTuning,
     feedback_sender: Option<Sender<LivePlaybackFeedback>>,
 ) {
     let mut streams = LiveDecodeStreams::new(tuning);
 
     loop {
+        let now = Instant::now();
+        streams.drain_queue_reports(&queue_reports, now, feedback_sender.as_ref());
         match receiver.recv_timeout(LIVE_PLAYBACK_DRAIN_INTERVAL) {
             Ok(command) => {
-                if !handle_live_playback_command(command, &mut streams, &mixer) {
+                if !handle_live_playback_command(command, &mut streams, &mixer_events) {
                     break;
                 }
                 while let Ok(command) = receiver.try_recv() {
-                    if !handle_live_playback_command(command, &mut streams, &mixer) {
+                    if !handle_live_playback_command(command, &mut streams, &mixer_events) {
                         return;
                     }
                 }
@@ -51,14 +58,16 @@ pub(crate) fn run_live_decoder_worker(
             Err(RecvTimeoutError::Disconnected) => break,
         }
 
-        streams.drain_into_mixer(&mixer, Instant::now(), feedback_sender.as_ref());
+        let now = Instant::now();
+        streams.drain_into_mixer_events(&mixer_events, now);
+        streams.drain_queue_reports(&queue_reports, now, feedback_sender.as_ref());
     }
 }
 
 pub(crate) fn handle_live_playback_command(
     command: LivePlaybackCommand,
     streams: &mut LiveDecodeStreams,
-    mixer: &Arc<Mutex<LivePlaybackMixer>>,
+    mixer_events: &SpscSwapQueue<LivePlaybackMixerEvent>,
 ) -> bool {
     match command {
         LivePlaybackCommand::Packet(packet) => {
@@ -67,23 +76,49 @@ pub(crate) fn handle_live_playback_command(
         }
         LivePlaybackCommand::StopStream(stream_id) => {
             streams.remove_stream(stream_id);
-            if let Ok(mut mixer) = mixer.lock() {
-                mixer.remove_stream(stream_id);
-            }
+            push_mixer_event(
+                mixer_events,
+                &mut streams.dropped_mixer_events,
+                LivePlaybackMixerEvent::StopStream { stream_id },
+            );
         }
         LivePlaybackCommand::SetStreamControl(stream_id, control) => {
-            if let Ok(mut mixer) = mixer.lock() {
-                mixer.set_stream_control(stream_id, control);
-            }
+            push_mixer_event(
+                mixer_events,
+                &mut streams.dropped_mixer_events,
+                LivePlaybackMixerEvent::SetStreamControl { stream_id, control },
+            );
         }
         LivePlaybackCommand::Shutdown => return false,
     }
     true
 }
 
+fn push_mixer_event(
+    mixer_events: &SpscSwapQueue<LivePlaybackMixerEvent>,
+    dropped_mixer_events: &mut u64,
+    mut event: LivePlaybackMixerEvent,
+) -> bool {
+    if mixer_events.insert(&mut event) {
+        return true;
+    }
+
+    *dropped_mixer_events = dropped_mixer_events.saturating_add(1);
+    if dropped_mixer_events.is_power_of_two() {
+        kvlog::warn!(
+            "live playback mixer event queue full",
+            dropped_events = *dropped_mixer_events,
+            event = event.kind()
+        );
+    }
+    false
+}
+
 pub(crate) struct LiveDecodeStreams {
     tuning: LiveAudioTuning,
     streams: HashMap<u32, LiveDecodeStream>,
+    mixer_streams: HashSet<u32>,
+    dropped_mixer_events: u64,
 }
 
 impl LiveDecodeStreams {
@@ -91,6 +126,8 @@ impl LiveDecodeStreams {
         Self {
             tuning,
             streams: HashMap::new(),
+            mixer_streams: HashSet::new(),
+            dropped_mixer_events: 0,
         }
     }
 
@@ -123,6 +160,7 @@ impl LiveDecodeStreams {
 
     pub(crate) fn remove_stream(&mut self, stream_id: u32) {
         self.streams.remove(&stream_id);
+        self.mixer_streams.remove(&stream_id);
     }
 
     pub(crate) fn drain_into_mixer(
@@ -133,6 +171,113 @@ impl LiveDecodeStreams {
     ) {
         let mut trace = None;
         self.drain_into_mixer_with_trace(mixer, now, now, &mut trace, feedback_sender);
+    }
+
+    pub(crate) fn drain_into_mixer_events(
+        &mut self,
+        mixer_events: &SpscSwapQueue<LivePlaybackMixerEvent>,
+        now: Instant,
+    ) {
+        let dropped_mixer_events = &mut self.dropped_mixer_events;
+        let mixer_streams = &mut self.mixer_streams;
+        for (stream_id, stream) in &mut self.streams {
+            let mut trace = None;
+            let recommended_target = stream.feedback.recommended_target(&stream.tuning);
+            let events = RefCell::new(Vec::new());
+            if mixer_streams.insert(*stream_id) {
+                match AdaptivePlaybackStream::new(stream.tuning) {
+                    Ok(stream) => {
+                        events
+                            .borrow_mut()
+                            .push(LivePlaybackMixerEvent::EnsureStream {
+                                stream_id: *stream_id,
+                                stream: Box::new(stream),
+                            });
+                    }
+                    Err(error) => {
+                        mixer_streams.remove(stream_id);
+                        eprintln!("failed to create live playback stream: {error}");
+                    }
+                }
+            }
+            stream.drain_ready(
+                now,
+                now,
+                *stream_id,
+                &mut trace,
+                |_, samples, source, playout_delay| {
+                    events
+                        .borrow_mut()
+                        .push(LivePlaybackMixerEvent::QueueSamples {
+                            stream_id: *stream_id,
+                            samples: samples.to_vec(),
+                            source,
+                            playout_delay,
+                            recommended_target,
+                        });
+                },
+                || {
+                    events
+                        .borrow_mut()
+                        .push(LivePlaybackMixerEvent::NoteStreamDiscontinuity {
+                            stream_id: *stream_id,
+                        });
+                },
+                || {
+                    events
+                        .borrow_mut()
+                        .push(LivePlaybackMixerEvent::NoteSenderSilence {
+                            stream_id: *stream_id,
+                        });
+                },
+            );
+            for event in events.into_inner() {
+                let ensured_stream_id = match &event {
+                    LivePlaybackMixerEvent::EnsureStream { stream_id, .. } => Some(*stream_id),
+                    _ => None,
+                };
+                if !push_mixer_event(mixer_events, dropped_mixer_events, event)
+                    && let Some(stream_id) = ensured_stream_id
+                {
+                    mixer_streams.remove(&stream_id);
+                }
+            }
+        }
+    }
+
+    pub(crate) fn drain_queue_reports(
+        &mut self,
+        queue_reports: &SpscSwapQueue<LivePlaybackQueueReport>,
+        now: Instant,
+        feedback_sender: Option<&Sender<LivePlaybackFeedback>>,
+    ) {
+        let mut report = LivePlaybackQueueReport::default();
+        while queue_reports.remove(&mut report) {
+            match mem::take(&mut report) {
+                LivePlaybackQueueReport::Empty => {}
+                LivePlaybackQueueReport::Queued {
+                    stream_id,
+                    max_queue_ms,
+                } => {
+                    if let Some(stream) = self.streams.get_mut(&stream_id) {
+                        stream.flush_feedback(stream_id, now, max_queue_ms, feedback_sender);
+                    }
+                }
+                LivePlaybackQueueReport::SenderSilence {
+                    stream_id,
+                    queue_ms,
+                } => {
+                    if let Some(stream) = self.streams.get_mut(&stream_id) {
+                        stream.flush_sender_silence_feedback(
+                            stream_id,
+                            now,
+                            queue_ms,
+                            feedback_sender,
+                        );
+                    }
+                }
+            }
+        }
     }
 
     pub(crate) fn drain_into_mixer_with_trace(

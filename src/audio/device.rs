@@ -1,9 +1,9 @@
 use std::{
-    fs,
+    fs, mem,
     num::NonZeroUsize,
     str::FromStr,
     sync::{
-        Arc, Mutex,
+        Arc,
         atomic::{AtomicUsize, Ordering},
         mpsc::SyncSender,
     },
@@ -20,7 +20,10 @@ use hashbrown::HashSet;
 use crate::audio::{
     backend::with_audio_backend_stderr_suppressed,
     capture::EchoCancellationControl,
-    playback::LivePlaybackMixer,
+    playback::{
+        LivePlaybackMixer, LivePlaybackMixerEvent, LivePlaybackQueueReport,
+        LivePlaybackSharedSnapshot, SpscSwapQueue,
+    },
     resample::PlaybackResampler,
     shared::{
         AudioStats, BufferRequest, PlaybackStats, SAMPLE_RATE, peak_i16_scale, rms_i16_scale,
@@ -1030,7 +1033,10 @@ pub(crate) fn build_live_output_stream(
     sample_format: SampleFormat,
     stream_config: StreamConfig,
     channels: usize,
-    mixer: Arc<Mutex<LivePlaybackMixer>>,
+    mixer: LivePlaybackMixer,
+    mixer_events: Arc<SpscSwapQueue<LivePlaybackMixerEvent>>,
+    queue_reports: Arc<SpscSwapQueue<LivePlaybackQueueReport>>,
+    shared_snapshot: Arc<LivePlaybackSharedSnapshot>,
     echo_control: Option<Arc<EchoCancellationControl>>,
     callback_buffer_observer: Option<Arc<AudioCallbackBufferObserver>>,
     device_rate: u32,
@@ -1042,6 +1048,9 @@ pub(crate) fn build_live_output_stream(
             stream_config,
             channels,
             mixer,
+            mixer_events,
+            queue_reports,
+            shared_snapshot,
             echo_control,
             callback_buffer_observer,
             device_rate,
@@ -1051,6 +1060,9 @@ pub(crate) fn build_live_output_stream(
             stream_config,
             channels,
             mixer,
+            mixer_events,
+            queue_reports,
+            shared_snapshot,
             echo_control,
             callback_buffer_observer,
             device_rate,
@@ -1060,6 +1072,9 @@ pub(crate) fn build_live_output_stream(
             stream_config,
             channels,
             mixer,
+            mixer_events,
+            queue_reports,
+            shared_snapshot,
             echo_control,
             callback_buffer_observer,
             device_rate,
@@ -1069,6 +1084,9 @@ pub(crate) fn build_live_output_stream(
             stream_config,
             channels,
             mixer,
+            mixer_events,
+            queue_reports,
+            shared_snapshot,
             echo_control,
             callback_buffer_observer,
             device_rate,
@@ -1078,6 +1096,9 @@ pub(crate) fn build_live_output_stream(
             stream_config,
             channels,
             mixer,
+            mixer_events,
+            queue_reports,
+            shared_snapshot,
             echo_control,
             callback_buffer_observer,
             device_rate,
@@ -1087,6 +1108,9 @@ pub(crate) fn build_live_output_stream(
             stream_config,
             channels,
             mixer,
+            mixer_events,
+            queue_reports,
+            shared_snapshot,
             echo_control,
             callback_buffer_observer,
             device_rate,
@@ -1096,6 +1120,9 @@ pub(crate) fn build_live_output_stream(
             stream_config,
             channels,
             mixer,
+            mixer_events,
+            queue_reports,
+            shared_snapshot,
             echo_control,
             callback_buffer_observer,
             device_rate,
@@ -1105,6 +1132,9 @@ pub(crate) fn build_live_output_stream(
             stream_config,
             channels,
             mixer,
+            mixer_events,
+            queue_reports,
+            shared_snapshot,
             echo_control,
             callback_buffer_observer,
             device_rate,
@@ -1114,6 +1144,9 @@ pub(crate) fn build_live_output_stream(
             stream_config,
             channels,
             mixer,
+            mixer_events,
+            queue_reports,
+            shared_snapshot,
             echo_control,
             callback_buffer_observer,
             device_rate,
@@ -1123,6 +1156,9 @@ pub(crate) fn build_live_output_stream(
             stream_config,
             channels,
             mixer,
+            mixer_events,
+            queue_reports,
+            shared_snapshot,
             echo_control,
             callback_buffer_observer,
             device_rate,
@@ -1132,6 +1168,9 @@ pub(crate) fn build_live_output_stream(
             stream_config,
             channels,
             mixer,
+            mixer_events,
+            queue_reports,
+            shared_snapshot,
             echo_control,
             callback_buffer_observer,
             device_rate,
@@ -1141,6 +1180,9 @@ pub(crate) fn build_live_output_stream(
             stream_config,
             channels,
             mixer,
+            mixer_events,
+            queue_reports,
+            shared_snapshot,
             echo_control,
             callback_buffer_observer,
             device_rate,
@@ -1153,7 +1195,10 @@ fn build_typed_live_output_stream<T>(
     device: &cpal::Device,
     stream_config: StreamConfig,
     channels: CallbackChannelCount,
-    mixer: Arc<Mutex<LivePlaybackMixer>>,
+    mut mixer: LivePlaybackMixer,
+    mixer_events: Arc<SpscSwapQueue<LivePlaybackMixerEvent>>,
+    queue_reports: Arc<SpscSwapQueue<LivePlaybackQueueReport>>,
+    shared_snapshot: Arc<LivePlaybackSharedSnapshot>,
     echo_control: Option<Arc<EchoCancellationControl>>,
     callback_buffer_observer: Option<Arc<AudioCallbackBufferObserver>>,
     device_rate: u32,
@@ -1161,8 +1206,10 @@ fn build_typed_live_output_stream<T>(
 where
     T: Sample + cpal::SizedSample + FromSample<f32> + Send + 'static,
 {
-    let error_mixer = Arc::clone(&mixer);
+    let error_snapshot = Arc::clone(&shared_snapshot);
     let mut resampler = PlaybackResampler::new(device_rate);
+    let mut pending_event = LivePlaybackMixerEvent::default();
+    let mut dropped_queue_reports = 0u64;
     device
         .build_output_stream(
             stream_config,
@@ -1170,32 +1217,121 @@ where
                 if let Some(observer) = callback_buffer_observer.as_ref() {
                     observer.observe(output.len(), channels);
                 }
+                let now = Instant::now();
+                drain_live_playback_mixer_events(
+                    &mut mixer,
+                    &mixer_events,
+                    &queue_reports,
+                    &mut pending_event,
+                    &mut dropped_queue_reports,
+                    now,
+                );
                 live_playback_callback(
                     output,
                     channels,
-                    &mixer,
+                    &mut mixer,
                     echo_control.as_ref(),
                     resampler.as_mut(),
+                    now,
                 );
+                mixer.log_playback_diagnostics_if_due(now);
+                shared_snapshot.try_update_from_mixer(&mixer, now);
             },
             move |error| {
-                record_live_playback_stream_error(&error_mixer, error);
+                record_live_playback_stream_error(&error_snapshot, error);
             },
             None,
         )
         .map_err(|error| format!("failed to build live output stream: {error}"))
 }
 
-fn record_live_playback_stream_error(mixer: &Arc<Mutex<LivePlaybackMixer>>, error: cpal::Error) {
+fn record_live_playback_stream_error(
+    shared_snapshot: &Arc<LivePlaybackSharedSnapshot>,
+    error: cpal::Error,
+) {
     let is_xrun = error.kind() == ErrorKind::Xrun;
     let error = error.to_string();
-    if let Ok(mut mixer) = mixer.lock() {
-        mixer.record_backend_stream_error(error, is_xrun, Instant::now());
-    } else if is_xrun {
-        kvlog::warn!("live playback backend xrun", error = error.as_str());
-    } else {
-        kvlog::warn!("live playback backend stream error", error = error.as_str());
+    shared_snapshot.record_backend_stream_error(error, is_xrun, Instant::now());
+}
+
+fn drain_live_playback_mixer_events(
+    mixer: &mut LivePlaybackMixer,
+    mixer_events: &SpscSwapQueue<LivePlaybackMixerEvent>,
+    queue_reports: &SpscSwapQueue<LivePlaybackQueueReport>,
+    pending_event: &mut LivePlaybackMixerEvent,
+    dropped_queue_reports: &mut u64,
+    now: Instant,
+) {
+    while mixer_events.remove(pending_event) {
+        match mem::take(pending_event) {
+            LivePlaybackMixerEvent::Empty => {}
+            LivePlaybackMixerEvent::EnsureStream { stream_id, stream } => {
+                mixer.ensure_stream(stream_id, *stream);
+            }
+            LivePlaybackMixerEvent::QueueSamples {
+                stream_id,
+                samples,
+                source,
+                playout_delay,
+                recommended_target,
+            } => {
+                if !mixer.queue_existing_stream_samples_owned_with_delay(
+                    stream_id,
+                    samples,
+                    source,
+                    playout_delay,
+                    now,
+                ) {
+                    continue;
+                }
+                mixer.note_stream_recommended_target(stream_id, recommended_target, now);
+                let max_queue_ms = mixer.snapshot_at(now).max_queue_ms;
+                push_live_playback_queue_report(
+                    queue_reports,
+                    dropped_queue_reports,
+                    LivePlaybackQueueReport::Queued {
+                        stream_id,
+                        max_queue_ms,
+                    },
+                );
+            }
+            LivePlaybackMixerEvent::NoteStreamDiscontinuity { stream_id } => {
+                mixer.note_stream_discontinuity(stream_id, now);
+            }
+            LivePlaybackMixerEvent::NoteSenderSilence { stream_id } => {
+                if !mixer.note_existing_stream_sender_silence(stream_id, now) {
+                    continue;
+                }
+                let queue_ms = mixer.stream_queue_ms(stream_id);
+                push_live_playback_queue_report(
+                    queue_reports,
+                    dropped_queue_reports,
+                    LivePlaybackQueueReport::SenderSilence {
+                        stream_id,
+                        queue_ms,
+                    },
+                );
+            }
+            LivePlaybackMixerEvent::StopStream { stream_id } => {
+                mixer.remove_stream(stream_id);
+            }
+            LivePlaybackMixerEvent::SetStreamControl { stream_id, control } => {
+                mixer.set_stream_control(stream_id, control);
+            }
+        }
     }
+}
+
+fn push_live_playback_queue_report(
+    queue_reports: &SpscSwapQueue<LivePlaybackQueueReport>,
+    dropped_queue_reports: &mut u64,
+    mut report: LivePlaybackQueueReport,
+) {
+    if queue_reports.insert(&mut report) {
+        return;
+    }
+
+    *dropped_queue_reports = dropped_queue_reports.saturating_add(1);
 }
 
 fn build_typed_output_stream<T>(
@@ -1259,20 +1395,13 @@ fn playback_callback<T>(
 fn live_playback_callback<T>(
     output: &mut [T],
     channels: CallbackChannelCount,
-    mixer: &Arc<Mutex<LivePlaybackMixer>>,
+    mixer: &mut LivePlaybackMixer,
     echo_control: Option<&Arc<EchoCancellationControl>>,
     mut resampler: Option<&mut PlaybackResampler>,
+    now: Instant,
 ) where
     T: Sample + FromSample<f32>,
 {
-    let Ok(mut mixer) = mixer.try_lock() else {
-        for sample in output {
-            *sample = T::from_sample(0.0);
-        }
-        return;
-    };
-
-    let now = Instant::now();
     let output_frames = channels.frames_for_interleaved(output.len());
     let mut echo_writer = match echo_control {
         Some(control) if control.enabled() => Some(control.reference().writer()),
@@ -1529,5 +1658,54 @@ mod tests {
         assert_eq!(mono.len(), 2);
         assert!(mono[0].abs() < 0.01);
         assert!((mono[1] - 0.5 * i16::MAX as f32).abs() < 1.0);
+    }
+
+    #[test]
+    fn live_mixer_events_queue_samples_and_report_depth() {
+        let now = Instant::now();
+        let mixer_events = SpscSwapQueue::<LivePlaybackMixerEvent>::with_capacity(4);
+        let queue_reports = SpscSwapQueue::<LivePlaybackQueueReport>::with_capacity(4);
+        let mut event = LivePlaybackMixerEvent::EnsureStream {
+            stream_id: 7,
+            stream: Box::new(
+                crate::audio::playback::AdaptivePlaybackStream::new(test_tuning()).unwrap(),
+            ),
+        };
+        assert!(mixer_events.insert(&mut event));
+        let mut event = LivePlaybackMixerEvent::QueueSamples {
+            stream_id: 7,
+            samples: vec![0.25; crate::audio::shared::FRAME_SAMPLES * 2],
+            source: crate::audio::shared::DecodedFrameSource::Normal,
+            playout_delay: None,
+            recommended_target: test_tuning().target_queue,
+        };
+        assert!(mixer_events.insert(&mut event));
+
+        let mut mixer = LivePlaybackMixer::with_tuning(test_tuning());
+        let mut pending_event = LivePlaybackMixerEvent::default();
+        let mut dropped_reports = 0;
+        drain_live_playback_mixer_events(
+            &mut mixer,
+            &mixer_events,
+            &queue_reports,
+            &mut pending_event,
+            &mut dropped_reports,
+            now,
+        );
+
+        assert_eq!(dropped_reports, 0);
+        assert!(mixer.queued_samples() > 0);
+        let mut report = LivePlaybackQueueReport::default();
+        assert!(queue_reports.remove(&mut report));
+        match report {
+            LivePlaybackQueueReport::Queued {
+                stream_id,
+                max_queue_ms,
+            } => {
+                assert_eq!(stream_id, 7);
+                assert!(max_queue_ms > 0);
+            }
+            other => panic!("unexpected queue report: {other:?}"),
+        }
     }
 }
