@@ -91,6 +91,8 @@ pub(crate) struct App {
     pub(crate) last_chat_height: u16,
     pub(crate) last_chat_rect: Rect,
     pub(crate) last_chat_lines: Vec<VisibleLine>,
+    pub(crate) top_bar_mute_rect: Rect,
+    pub(crate) top_bar_deafen_rect: Rect,
     pub(crate) pending_clipboard: Option<String>,
     pub(crate) pending_chord: Option<PendingChord>,
     pub(crate) event_rx: Receiver<NetworkEvent>,
@@ -335,6 +337,8 @@ impl App {
             last_chat_height: 0,
             last_chat_rect: Rect::EMPTY,
             last_chat_lines: Vec::new(),
+            top_bar_mute_rect: Rect::EMPTY,
+            top_bar_deafen_rect: Rect::EMPTY,
             pending_clipboard: None,
             pending_chord: None,
             event_rx,
@@ -909,12 +913,31 @@ impl App {
     }
 
     pub(crate) fn process_mouse(&mut self, mouse: MouseEvent) -> Action {
+        if self.process_top_bar_mouse(mouse) {
+            return Action::Continue;
+        }
+
         match self.mode {
             theme::UiMode::Settings => self.process_settings_mouse(mouse),
             theme::UiMode::ServerEdit => self.process_server_edit_mouse(mouse),
             theme::UiMode::Compose | theme::UiMode::Log => self.process_chat_mouse(mouse),
             _ => Action::Continue,
         }
+    }
+
+    fn process_top_bar_mouse(&mut self, mouse: MouseEvent) -> bool {
+        if !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+            return false;
+        }
+        if rect_contains(self.top_bar_mute_rect, mouse.column, mouse.row) {
+            self.set_mute(!self.mic_muted.load(Ordering::Relaxed));
+            return true;
+        }
+        if rect_contains(self.top_bar_deafen_rect, mouse.column, mouse.row) {
+            self.set_deafen(!self.deafened.load(Ordering::Relaxed));
+            return true;
+        }
+        false
     }
 
     fn process_chat_mouse(&mut self, mouse: MouseEvent) -> Action {
@@ -3449,6 +3472,52 @@ mod tests {
         let mut app = test_app();
         let mut buffer = Buffer::new(80, 24);
         crate::tui::render(&mut app, &mut buffer, 0);
+    }
+
+    #[test]
+    fn chat_layout_reserves_top_bar_and_bottom_minibuffer() {
+        let mut app = test_app();
+        app.set_mode(theme::UiMode::Compose);
+        app.server_alias = "local".to_string();
+        app.user = "alice".to_string();
+        app.room_name = "lobby".to_string();
+
+        let mut buffer = Buffer::new(80, 24);
+        crate::tui::render(&mut app, &mut buffer, 0);
+
+        let expected_chat_top = 1 + app.config.ui.room_height + 1;
+        let expected_chat_bottom = buffer.height() - 4;
+        assert_eq!(app.last_chat_rect.y, expected_chat_top);
+        assert_eq!(app.last_chat_rect.bottom(), expected_chat_bottom);
+    }
+
+    #[test]
+    fn top_bar_audio_indicators_toggle_on_click() {
+        let mut app = test_app();
+        app.set_mode(theme::UiMode::Compose);
+
+        let mut buffer = Buffer::new(80, 24);
+        crate::tui::render(&mut app, &mut buffer, 0);
+
+        let mute_rect = app.top_bar_mute_rect;
+        assert!(!mute_rect.is_empty());
+        app.process_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: mute_rect.x,
+            row: mute_rect.y,
+            modifiers: KeyModifiers::empty(),
+        });
+        assert!(app.mic_muted.load(Ordering::Relaxed));
+
+        let deafen_rect = app.top_bar_deafen_rect;
+        assert!(!deafen_rect.is_empty());
+        app.process_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: deafen_rect.x,
+            row: deafen_rect.y,
+            modifiers: KeyModifiers::empty(),
+        });
+        assert!(app.deafened.load(Ordering::Relaxed));
     }
 }
 
