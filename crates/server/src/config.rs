@@ -1,5 +1,10 @@
 use hashbrown::HashSet;
-use std::{fs, net::SocketAddr, path::PathBuf};
+use std::{
+    fs::{self, File, OpenOptions},
+    io::Write,
+    net::SocketAddr,
+    path::{Path, PathBuf},
+};
 
 use ring::{digest, signature::KeyPair};
 use rpc::{
@@ -147,20 +152,15 @@ impl Config {
             )
         };
 
-        let arena = toml_spanner::Arena::new();
-        let mut doc = toml_spanner::parse(&content, &arena)
-            .map_err(|err| format!("failed to parse {source}: {err}"))?;
-        reject_deprecated_config_keys(&doc, &source)?;
-        let udp_addr_configured = network_contains_key(&doc, "udp-addr");
-        let mut config: Config = doc.to().map_err(|err| {
-            let errors: Vec<String> = err.errors.iter().map(ToString::to_string).collect();
-            format!("failed to deserialize {source}: {}", errors.join(", "))
-        })?;
-        config.config_path = config_path;
-        config.apply_inferred_addresses(udp_addr_configured, false);
-        config.normalize();
-        config.validate(&source)?;
-        Ok(config)
+        match parse_config_content(&content, &source, config_path.clone()) {
+            Ok(config) => Ok(config),
+            Err(error) => {
+                let Some(path) = config_path.as_deref() else {
+                    return Err(error);
+                };
+                recover_config_from_backup(path, &content, &error)
+            }
+        }
     }
 
     pub fn server_key_pair(&self) -> Result<ring::signature::Ed25519KeyPair, String> {
@@ -337,8 +337,7 @@ impl Config {
             fs::create_dir_all(parent)
                 .map_err(|err| format!("failed to create {}: {err}", parent.display()))?;
         }
-        fs::write(path, self.to_toml_string())
-            .map_err(|err| format!("failed to write {}: {err}", path.display()))
+        atomic_write_config(path, &self.to_toml_string(), true)
     }
 
     fn to_toml_string(&self) -> String {
@@ -408,6 +407,160 @@ impl Config {
             out.push('\n');
         }
         out
+    }
+}
+
+fn parse_config_content(
+    content: &str,
+    source: &str,
+    config_path: Option<PathBuf>,
+) -> Result<Config, String> {
+    let arena = toml_spanner::Arena::new();
+    let mut doc = toml_spanner::parse(content, &arena)
+        .map_err(|err| format!("failed to parse {source}: {err}"))?;
+    reject_deprecated_config_keys(&doc, source)?;
+    if config_path.is_some() && !doc.table().contains_key("users") {
+        return Err(format!(
+            "{source}: persisted server config must contain a users section"
+        ));
+    }
+    let udp_addr_configured = network_contains_key(&doc, "udp-addr");
+    let mut config: Config = doc.to().map_err(|err| {
+        let errors: Vec<String> = err.errors.iter().map(ToString::to_string).collect();
+        format!("failed to deserialize {source}: {}", errors.join(", "))
+    })?;
+    config.config_path = config_path;
+    config.apply_inferred_addresses(udp_addr_configured, false);
+    config.normalize();
+    config.validate(source)?;
+    Ok(config)
+}
+
+fn atomic_write_config(path: &Path, content: &str, backup_existing: bool) -> Result<(), String> {
+    let tmp = temp_config_path(path);
+    let bak = backup_config_path(path);
+    if backup_existing && path.exists() {
+        fs::copy(path, &bak).map_err(|err| {
+            format!(
+                "failed to back up {} to {}: {err}",
+                path.display(),
+                bak.display()
+            )
+        })?;
+    }
+
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&tmp)
+        .map_err(|err| format!("failed to create {}: {err}", tmp.display()))?;
+    file.write_all(content.as_bytes())
+        .map_err(|err| format!("failed to write {}: {err}", tmp.display()))?;
+    file.sync_all()
+        .map_err(|err| format!("failed to sync {}: {err}", tmp.display()))?;
+    drop(file);
+
+    fs::rename(&tmp, path).map_err(|err| {
+        let _ = fs::remove_file(&tmp);
+        format!(
+            "failed to replace {} with {}: {err}",
+            path.display(),
+            tmp.display()
+        )
+    })?;
+    sync_parent_dir(path);
+    Ok(())
+}
+
+fn recover_config_from_backup(
+    path: &Path,
+    corrupt_content: &str,
+    load_error: &str,
+) -> Result<Config, String> {
+    let corrupt_path = preserve_corrupt_config(path, corrupt_content)?;
+    let bak = backup_config_path(path);
+    let backup_content = fs::read_to_string(&bak).map_err(|err| {
+        format!(
+            "{load_error}; preserved corrupt config as {}; no usable backup at {}: {err}",
+            corrupt_path.display(),
+            bak.display()
+        )
+    })?;
+    let config = parse_config_content(
+        &backup_content,
+        &bak.display().to_string(),
+        Some(path.to_path_buf()),
+    )
+    .map_err(|backup_error| {
+        format!(
+            "{load_error}; preserved corrupt config as {}; backup {} is not usable: {backup_error}",
+            corrupt_path.display(),
+            bak.display()
+        )
+    })?;
+    atomic_write_config(path, &backup_content, false)?;
+    kvlog::warn!(
+        "server config restored from backup",
+        path = %path.display(),
+        backup = %bak.display(),
+        corrupt = %corrupt_path.display(),
+        error = load_error
+    );
+    Ok(config)
+}
+
+fn preserve_corrupt_config(path: &Path, content: &str) -> Result<PathBuf, String> {
+    let corrupt_path = next_corrupt_config_path(path);
+    fs::write(&corrupt_path, content).map_err(|err| {
+        format!(
+            "failed to preserve corrupt config {} as {}: {err}",
+            path.display(),
+            corrupt_path.display()
+        )
+    })?;
+    Ok(corrupt_path)
+}
+
+fn temp_config_path(path: &Path) -> PathBuf {
+    extension_path(path, "tmp")
+}
+
+fn backup_config_path(path: &Path) -> PathBuf {
+    extension_path(path, "bak")
+}
+
+fn next_corrupt_config_path(path: &Path) -> PathBuf {
+    let first = extension_path(path, "corrupt");
+    if !first.exists() {
+        return first;
+    }
+    for index in 1.. {
+        let candidate = extension_path(path, &format!("corrupt.{index}"));
+        if !candidate.exists() {
+            return candidate;
+        }
+    }
+    unreachable!("unbounded corrupt config suffix search must return")
+}
+
+fn extension_path(path: &Path, suffix: &str) -> PathBuf {
+    let extension = path
+        .extension()
+        .map(|extension| format!("{}.{}", extension.to_string_lossy(), suffix))
+        .unwrap_or_else(|| suffix.to_string());
+    path.with_extension(extension)
+}
+
+fn sync_parent_dir(path: &Path) {
+    let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    else {
+        return;
+    };
+    if let Ok(dir) = File::open(parent) {
+        let _ = dir.sync_all();
     }
 }
 
@@ -706,5 +859,89 @@ mod tests {
         assert!(content.contains("name = \"billy\""));
         assert!(content.contains("display-name = \"Billy\""));
         assert!(content.contains(&format!("token-hash = \"{token_hash}\"")));
+    }
+
+    #[test]
+    fn save_runtime_keeps_backup_of_previous_config() {
+        let path = std::env::temp_dir().join(format!(
+            "chatt-server-backup-save-test-{}.toml",
+            std::process::id()
+        ));
+        let bak = backup_config_path(&path);
+        let tmp = temp_config_path(&path);
+        let mut config = Config::default();
+        config.config_path = Some(path.clone());
+
+        let first_hash = hash_secret("first-client-generated-token-with-at-least-32-bytes");
+        config
+            .mark_user_paired("alice", "Alice One".to_string(), first_hash.clone())
+            .unwrap();
+        let second_hash = hash_secret("second-client-generated-token-with-at-least-32-bytes");
+        config
+            .mark_user_paired("alice", "Alice Two".to_string(), second_hash.clone())
+            .unwrap();
+
+        let current = std::fs::read_to_string(&path).unwrap();
+        let backup = std::fs::read_to_string(&bak).unwrap();
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&bak);
+        let _ = std::fs::remove_file(&tmp);
+
+        assert!(current.contains("display-name = \"Alice Two\""));
+        assert!(current.contains(&format!("token-hash = \"{second_hash}\"")));
+        assert!(backup.contains("display-name = \"Alice One\""));
+        assert!(backup.contains(&format!("token-hash = \"{first_hash}\"")));
+        assert!(!tmp.exists());
+    }
+
+    #[test]
+    fn corrupt_config_restores_from_backup_without_demo_user_fallback() {
+        let path = std::env::temp_dir().join(format!(
+            "chatt-server-corrupt-restore-test-{}.toml",
+            std::process::id()
+        ));
+        let bak = backup_config_path(&path);
+        let corrupt = extension_path(&path, "corrupt");
+        let mut config = Config::default();
+        config.config_path = Some(path.clone());
+        config.users = vec![UserConfig {
+            id: 9,
+            name: "paired-user".to_string(),
+            display_name: "Paired User".to_string(),
+            token_hash: hash_secret("paired-client-generated-token-with-at-least-32-bytes"),
+        }];
+        let backup_content = config.to_toml_string();
+        std::fs::write(&bak, &backup_content).unwrap();
+        std::fs::write(&path, "this is not valid toml = [").unwrap();
+
+        let restored = Config::load(Some(path.to_str().unwrap())).unwrap();
+        let restored_content = std::fs::read_to_string(&path).unwrap();
+        let corrupt_content = std::fs::read_to_string(&corrupt).unwrap();
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&bak);
+        let _ = std::fs::remove_file(&corrupt);
+
+        assert_eq!(restored.users.len(), 1);
+        assert_eq!(restored.users[0].name, "paired-user");
+        assert!(restored_content.contains("name = \"paired-user\""));
+        assert!(corrupt_content.contains("this is not valid toml"));
+    }
+
+    #[test]
+    fn persisted_config_without_users_is_rejected() {
+        let content = Config::default().to_toml_string();
+        let content = content
+            .split("[[users]]")
+            .next()
+            .expect("default config has users")
+            .to_string();
+        let error = parse_config_content(
+            &content,
+            "<persisted>",
+            Some(PathBuf::from("chatt-server.toml")),
+        )
+        .unwrap_err();
+
+        assert!(error.contains("users section"));
     }
 }

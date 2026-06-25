@@ -4,6 +4,7 @@ use std::{
     io::{self, Read, Write},
     net::SocketAddr,
     sync::mpsc,
+    thread,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -46,6 +47,8 @@ const UDP_PROBE: Token = Token(2);
 const FIRST_CLIENT: usize = 3;
 const DEFAULT_ROOM: RoomId = RoomId(1);
 const POLL_TIMEOUT: Duration = Duration::from_millis(100);
+const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(20);
+const MAX_CLIENTS: usize = 1024;
 const INVITE_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -265,7 +268,13 @@ impl Server {
     ) -> Result<(), Box<dyn std::error::Error>> {
         let mut events = Events::with_capacity(256);
         loop {
-            self.poll.poll(&mut events, Some(POLL_TIMEOUT))?;
+            if let Err(error) = self.poll.poll(&mut events, Some(POLL_TIMEOUT)) {
+                if is_interrupted_io_error(&error) {
+                    kvlog::warn!("server poll interrupted", error = %error);
+                    continue;
+                }
+                return Err(error.into());
+            }
             for event in events.iter() {
                 match event.token() {
                     LISTENER => self.accept_clients()?,
@@ -283,6 +292,7 @@ impl Server {
             }
             self.handle_admin_commands(admin_rx);
             self.flush_disconnects();
+            self.sweep_stale_media_keys();
         }
     }
 
@@ -338,9 +348,22 @@ impl Server {
 
     fn accept_clients(&mut self) -> io::Result<()> {
         loop {
+            if self.clients.len() >= MAX_CLIENTS {
+                kvlog::warn!(
+                    "tcp client cap reached",
+                    client_count = self.clients.len(),
+                    max_clients = MAX_CLIENTS
+                );
+                return Ok(());
+            }
             let (mut socket, addr) = match self.listener.accept() {
                 Ok(value) => value,
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(()),
+                Err(error) if is_transient_accept_error(&error) => {
+                    kvlog::warn!("transient tcp accept failure", error = %error);
+                    thread::sleep(ACCEPT_ERROR_BACKOFF);
+                    return Ok(());
+                }
                 Err(error) => return Err(error),
             };
             let token = Token(self.next_token);
@@ -2104,9 +2127,16 @@ impl Server {
     }
 
     fn disconnect(&mut self, token: Token) {
-        let Some(client) = self.clients.remove(&token) else {
+        let Some(mut client) = self.clients.remove(&token) else {
             return;
         };
+        if let Err(error) = self.poll.registry().deregister(&mut client.socket) {
+            kvlog::warn!(
+                "tcp client deregister failed",
+                token = token.0,
+                error = %error
+            );
+        }
         kvlog::info!(
             "tcp client disconnecting",
             token = token.0,
@@ -2130,6 +2160,17 @@ impl Server {
                 }
             }
             self.remove_peer_links(session_id);
+        }
+    }
+
+    fn sweep_stale_media_keys(&mut self) {
+        let sessions = &self.sessions;
+        let before = self.media_key_to_session.len();
+        self.media_key_to_session
+            .retain(|_, session_id| sessions.contains_key(session_id));
+        let removed = before.saturating_sub(self.media_key_to_session.len());
+        if removed > 0 {
+            kvlog::warn!("stale media key mappings removed", removed);
         }
     }
 
@@ -2270,14 +2311,27 @@ fn room_recipient_tokens(
 }
 
 fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_millis() as u64)
-        .unwrap_or(0)
+    match SystemTime::now().duration_since(UNIX_EPOCH) {
+        Ok(duration) => duration.as_millis() as u64,
+        Err(error) => {
+            kvlog::warn!("system clock is before unix epoch", error = %error);
+            0
+        }
+    }
 }
 
 fn invalid_config(error: String) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, error)
+}
+
+fn is_interrupted_io_error(error: &io::Error) -> bool {
+    error.kind() == io::ErrorKind::Interrupted || error.raw_os_error() == Some(libc::EINTR)
+}
+
+fn is_transient_accept_error(error: &io::Error) -> bool {
+    is_interrupted_io_error(error)
+        || matches!(error.kind(), io::ErrorKind::ConnectionAborted)
+        || matches!(error.raw_os_error(), Some(libc::EMFILE | libc::ENFILE))
 }
 
 fn random_secret_hex(rng: &ring::rand::SystemRandom) -> Result<String, String> {
@@ -2539,5 +2593,21 @@ mod tests {
             room_recipient_tokens(&rooms, &sessions, room_id, None, |token| token != Token(3));
 
         assert_eq!(tokens, vec![Token(4)]);
+    }
+
+    #[test]
+    fn accept_error_classification_is_transient_for_fd_pressure() {
+        assert!(is_transient_accept_error(&io::Error::from_raw_os_error(
+            libc::EMFILE
+        )));
+        assert!(is_transient_accept_error(&io::Error::from_raw_os_error(
+            libc::ENFILE
+        )));
+        assert!(is_transient_accept_error(&io::Error::from(
+            io::ErrorKind::Interrupted
+        )));
+        assert!(!is_transient_accept_error(&io::Error::from(
+            io::ErrorKind::PermissionDenied
+        )));
     }
 }
