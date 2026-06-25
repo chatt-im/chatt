@@ -91,6 +91,11 @@ impl TimeScaler {
             .max_by(|(_, left), (_, right)| left.total_cmp(right))
             .map(|(index, _)| index)
             .unwrap_or(0);
+        // Octave correction: the 4 kHz autocorrelation frequently maxes at a
+        // higher harmonic of the true pitch period. When the half-lag bin holds
+        // nearly as much energy, it is the fundamental, so prefer it. This keeps
+        // each accelerate/expand operation on a single fundamental period rather
+        // than a multiple of it.
         let peak_value = self.auto_correlation[peak];
         let lag = TIME_SCALE_MIN_LAG_4K + peak;
         let half_lag = lag / 2;
@@ -129,23 +134,18 @@ pub(crate) fn accelerate_one_period(
     q: &mut MonoSampleQueue,
     lead: usize,
     peak_index: usize,
-    overlap: usize,
 ) -> usize {
     let before = q.frames();
-    let overlap = overlap.min(peak_index);
-    q.overlap_add_compress(overlap, lead + TIME_SCALE_REF_OFFSET, peak_index);
+    let Some(start) = (lead + TIME_SCALE_REF_OFFSET).checked_sub(peak_index) else {
+        return 0;
+    };
+    q.overlap_add_compress(start, peak_index);
     before.saturating_sub(q.frames())
 }
 
-pub(crate) fn expand_one_period(
-    q: &mut MonoSampleQueue,
-    lead: usize,
-    peak_index: usize,
-    overlap: usize,
-) -> usize {
+pub(crate) fn expand_one_period(q: &mut MonoSampleQueue, lead: usize, peak_index: usize) -> usize {
     let before = q.frames();
-    let overlap = overlap.min(peak_index);
-    q.overlap_add_expand(overlap, lead + TIME_SCALE_REF_OFFSET, peak_index);
+    q.overlap_add_expand(lead + TIME_SCALE_REF_OFFSET, peak_index);
     q.frames().saturating_sub(before)
 }
 
@@ -240,6 +240,19 @@ mod tests {
     use super::*;
     use crate::audio::shared::SAMPLE_RATE;
 
+    fn queue_samples(q: &MonoSampleQueue) -> Vec<f32> {
+        let mut samples = Vec::new();
+        q.copy_window(0, q.frames(), &mut samples);
+        samples
+    }
+
+    fn assert_near(left: f32, right: f32) {
+        assert!(
+            (left - right).abs() <= 1.0e-6,
+            "left={left:.8} right={right:.8}"
+        );
+    }
+
     #[test]
     fn time_scale_correlation_search_finds_known_pitch() {
         let mut scaler = TimeScaler::new();
@@ -260,5 +273,69 @@ mod tests {
         let quiet = vec![0.0; TIME_SCALE_WINDOW];
         let analysis = scaler.analyze(&quiet);
         assert!(!analysis.active_speech, "{analysis:?}");
+    }
+
+    #[test]
+    fn accelerate_one_period_matches_webrtc_crossfade_window() {
+        // Ported from NetEq Accelerate::CheckCriteriaAndStretch and
+        // AudioVector::CrossFade: copy 0..15 ms, crossfade the following pitch
+        // period onto the tail of that output, then skip the copied period.
+        let segment = TIME_SCALE_MIN_LAG_48K;
+        let ref_offset = TIME_SCALE_REF_OFFSET;
+        let mut input = vec![0.0; ref_offset + segment + 32];
+        input[ref_offset..ref_offset + segment].fill(1.0);
+        input[ref_offset + segment..].fill(0.25);
+
+        let mut q = MonoSampleQueue::new();
+        q.push_back(&input);
+
+        assert_eq!(accelerate_one_period(&mut q, 0, segment), segment);
+        let output = queue_samples(&q);
+        assert_eq!(output.len(), input.len() - segment);
+
+        for sample in output.iter().take(ref_offset - segment) {
+            assert_near(*sample, 0.0);
+        }
+        for index in 0..segment {
+            let expected = (index + 1) as f32 / (segment + 1) as f32;
+            assert_near(output[ref_offset - segment + index], expected);
+        }
+        for sample in output.iter().skip(ref_offset) {
+            assert_near(*sample, 0.25);
+        }
+    }
+
+    #[test]
+    fn expand_one_period_matches_webrtc_preemptive_expand_crossfade_window() {
+        // Ported from NetEq PreemptiveExpand::CheckCriteriaAndStretch: copy
+        // through the following pitch period, crossfade the period before the
+        // reference onto the output tail, then append the original future audio.
+        let segment = TIME_SCALE_MIN_LAG_48K;
+        let ref_offset = TIME_SCALE_REF_OFFSET;
+        let mut input = vec![0.0; ref_offset + segment + 32];
+        input[ref_offset..ref_offset + segment].fill(1.0);
+        input[ref_offset + segment..].fill(0.25);
+
+        let mut q = MonoSampleQueue::new();
+        q.push_back(&input);
+
+        assert_eq!(expand_one_period(&mut q, 0, segment), segment);
+        let output = queue_samples(&q);
+        assert_eq!(output.len(), input.len() + segment);
+
+        for sample in output.iter().take(ref_offset) {
+            assert_near(*sample, 0.0);
+        }
+        for index in 0..segment {
+            let fade_to_previous = (index + 1) as f32 / (segment + 1) as f32;
+            let expected = 1.0 - fade_to_previous;
+            assert_near(output[ref_offset + index], expected);
+        }
+        for sample in &output[ref_offset + segment..ref_offset + 2 * segment] {
+            assert_near(*sample, 1.0);
+        }
+        for sample in output.iter().skip(ref_offset + 2 * segment) {
+            assert_near(*sample, 0.25);
+        }
     }
 }

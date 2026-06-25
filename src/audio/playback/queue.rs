@@ -4,7 +4,7 @@ use std::{
 };
 
 use crate::audio::shared::{
-    DecodedFrameSource, PlayoutDelay, SAMPLE_RATE, peak_normalized, rms_normalized, soft_limit,
+    DecodedFrameSource, PlayoutDelay, SAMPLE_RATE, peak_normalized, rms_normalized,
 };
 
 #[derive(Default)]
@@ -136,28 +136,25 @@ impl MonoSampleQueue {
         self.total
     }
 
-    /// Removes `segment` samples starting at `start` and crossfades the join so
-    /// the waveform stays continuous. The kept tail `[start, start + overlap)` is
-    /// blended with the audio that follows the removed segment
-    /// `[start + segment, start + segment + overlap)` over a raised-cosine ramp,
-    /// then the segment is dropped. This is the compression half of the
-    /// overlap-add time-scaler, scoped here to low-energy regions.
-    pub(crate) fn overlap_add_compress(&mut self, overlap: usize, start: usize, segment: usize) {
-        if overlap == 0 || segment == 0 {
-            self.drain_range(start, segment);
+    /// Crossfades one pitch period with the following period, then drops the
+    /// following period. This mirrors WebRTC NetEq Accelerate: the kept period
+    /// `[start, start + segment)` is blended over the full period with
+    /// `[start + segment, start + 2 * segment)`, and the second period is
+    /// removed. Callers pass `start = reference - segment` so the crossfade lands
+    /// on the 15 ms reference tail, matching AudioVector::CrossFade.
+    pub(crate) fn overlap_add_compress(&mut self, start: usize, segment: usize) {
+        if segment == 0 || start.saturating_add(segment.saturating_mul(2)) > self.total {
             return;
         }
-        for index in 0..overlap {
-            let old = self.sample_at(start + index).unwrap_or(0.0);
-            let new = self.sample_at(start + segment + index).unwrap_or(old);
-            let t = (index + 1) as f32 / (overlap + 1) as f32;
-            let fade_in = (t * std::f32::consts::FRAC_PI_2).sin();
-            let fade_out = ((1.0 - t) * std::f32::consts::FRAC_PI_2).sin();
+        for index in 0..segment {
+            let kept = self.sample_at(start + index).unwrap_or(0.0);
+            let following = self.sample_at(start + segment + index).unwrap_or(kept);
+            let t = (index + 1) as f32 / (segment + 1) as f32;
             if let Some(sample) = self.sample_mut(start + index) {
-                *sample = soft_limit(fade_out * old + fade_in * new);
+                *sample = (1.0 - t) * kept + t * following;
             }
         }
-        self.drain_range(start + overlap, segment);
+        self.drain_range(start + segment, segment);
     }
 
     pub(crate) fn copy_window(&self, start: usize, len: usize, scratch: &mut Vec<f32>) {
@@ -166,22 +163,22 @@ impl MonoSampleQueue {
         scratch.extend((0..len).map(|index| self.sample_at(start + index).unwrap_or(0.0)));
     }
 
-    pub(crate) fn overlap_add_expand(&mut self, overlap: usize, start: usize, segment: usize) {
+    /// Inserts one pitch period (`segment` samples) before `start`. The inserted
+    /// period linearly crossfades from the upcoming audio at `start` to the
+    /// preceding period, matching WebRTC NetEq PreemptiveExpand and
+    /// AudioVector::CrossFade. When no upcoming audio exists (extending the tail
+    /// past the end of the queue) the inserted period falls back to a copy of the
+    /// preceding period.
+    pub(crate) fn overlap_add_expand(&mut self, start: usize, segment: usize) {
         if segment == 0 || start < segment {
             return;
         }
         let mut inserted = Vec::with_capacity(segment);
         for index in 0..segment {
-            inserted.push(self.sample_at(start - segment + index).unwrap_or(0.0));
-        }
-        let overlap = overlap.min(segment);
-        for index in 0..overlap {
-            let old = inserted[index];
-            let new = self.sample_at(start + index).unwrap_or(old);
-            let t = (index + 1) as f32 / (overlap + 1) as f32;
-            let fade_in = (t * std::f32::consts::FRAC_PI_2).sin();
-            let fade_out = ((1.0 - t) * std::f32::consts::FRAC_PI_2).sin();
-            inserted[index] = soft_limit(fade_out * old + fade_in * new);
+            let earlier = self.sample_at(start - segment + index).unwrap_or(0.0);
+            let upcoming = self.sample_at(start + index).unwrap_or(earlier);
+            let t = (index + 1) as f32 / (segment + 1) as f32;
+            inserted.push((1.0 - t) * upcoming + t * earlier);
         }
         self.insert_at_owned(start, inserted.as_slice());
     }
