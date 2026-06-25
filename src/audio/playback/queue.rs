@@ -164,10 +164,38 @@ impl MonoSampleQueue {
         self.drain_range(start + segment, segment);
     }
 
+    /// Copies `len` samples starting at absolute index `start` into `scratch`,
+    /// zero-padding any portion past the end of the queue. Walks the frame list
+    /// once and copies contiguous runs, so the cost is `O(len + frames)` rather
+    /// than the `O(len * frames)` of per-sample [`Self::sample_at`] lookups.
     pub(crate) fn copy_window(&self, start: usize, len: usize, scratch: &mut Vec<f32>) {
         scratch.clear();
         scratch.reserve(len);
-        scratch.extend((0..len).map(|index| self.sample_at(start + index).unwrap_or(0.0)));
+        let Some((mut frame_index, mut local_index, _)) = self.find_frame_at(start) else {
+            scratch.resize(len, 0.0);
+            return;
+        };
+        let mut remaining = len;
+        while remaining > 0 {
+            let Some(frame) = self.frames.get(frame_index) else {
+                break;
+            };
+            let available = frame.remaining_len().saturating_sub(local_index);
+            if available == 0 {
+                frame_index += 1;
+                local_index = 0;
+                continue;
+            }
+            let take = remaining.min(available);
+            let base = frame.offset + local_index;
+            scratch.extend_from_slice(&frame.samples[base..base + take]);
+            remaining -= take;
+            frame_index += 1;
+            local_index = 0;
+        }
+        if remaining > 0 {
+            scratch.resize(len, 0.0);
+        }
     }
 
     /// Inserts one pitch period (`segment` samples) before `start`. The inserted

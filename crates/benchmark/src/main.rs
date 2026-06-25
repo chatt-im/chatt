@@ -981,7 +981,12 @@ impl OpusRawEncoder {
             opus_codec::OPUS_SET_MAX_BANDWIDTH_REQUEST,
             opus_codec::OPUS_BANDWIDTH_WIDEBAND as i32,
         )?;
-        this.control(opus_codec::OPUS_SET_COMPLEXITY_REQUEST, 9)?;
+        let complexity = std::env::var("OPUS_COMPLEXITY")
+            .ok()
+            .and_then(|value| value.parse::<i32>().ok())
+            .unwrap_or(9)
+            .clamp(0, 10);
+        this.control(opus_codec::OPUS_SET_COMPLEXITY_REQUEST, complexity)?;
         this.control(
             opus_codec::OPUS_SET_DRED_DURATION_REQUEST,
             profile.dred_duration_10ms,

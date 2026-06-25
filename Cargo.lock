@@ -93,7 +93,7 @@ version = "0.1.0"
 dependencies = [
  "chatt",
  "jsony_bench",
- "nnnoiseless 0.5.2",
+ "nnnoiseless",
  "opus-codec",
  "sonora",
 ]
@@ -252,7 +252,7 @@ dependencies = [
  "libc",
  "mimalloc",
  "mio",
- "nnnoiseless 0.5.1",
+ "nnnoiseless",
  "opus-codec",
  "ring",
  "rpc",
@@ -1075,16 +1075,6 @@ dependencies = [
  "dasp",
  "dasp_interpolate",
  "dasp_ring_buffer",
- "easyfft",
- "once_cell",
-]
-
-[[package]]
-name = "nnnoiseless"
-version = "0.5.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "805d5964d1e7a0006a7fdced7dae75084d66d18b35f1dfe81bd76929b1f8da0c"
-dependencies = [
  "easyfft",
  "once_cell",
 ]
