@@ -1,9 +1,10 @@
 use std::{
+    cmp::Ordering as CmpOrdering,
     sync::atomic::Ordering,
     time::{Duration, Instant},
 };
 
-use extui::{Buffer, Ellipsis, HAlign, Rect, Style, vt::Modifier};
+use extui::{AnsiColor, Buffer, Ellipsis, HAlign, Rect, Style, vt::Modifier};
 use extui_editor::Mode as EditorMode;
 use unicode_width::UnicodeWidthStr;
 
@@ -11,6 +12,7 @@ use chatt::audio::StatsSnapshot;
 
 use crate::{
     app::{App, ChatPanelFocus, ParticipantState, ServerSelectItem, StatusKind, volume_db_label},
+    bindings::{self, Reachable, ReachableKind},
     chat_buffer::{self, LineKind},
     theme::{self, Theme},
     ui,
@@ -50,7 +52,8 @@ pub(crate) fn render(app: &mut App, buf: &mut Buffer, now_ms: u64) {
     draw_top_bar(top_bar_area, app, buf, capture.as_ref());
 
     let composer_height = composer_height(app, screen.w);
-    let minibuffer_area = screen.take_bottom(1);
+    let key_preview_height = key_preview_height(app, screen.w);
+    let key_preview_area = screen.take_bottom(key_preview_height as i32);
     let status_area = screen.take_bottom(1);
     let composer_area = screen.take_bottom(composer_height as i32);
     app.last_composer_rect = composer_area;
@@ -73,7 +76,7 @@ pub(crate) fn render(app: &mut App, buf: &mut Buffer, now_ms: u64) {
             &mut app.audio_output_picker,
         );
         draw_status(status_area, app, buf, capture.as_ref());
-        draw_minibuffer(minibuffer_area, app, buf);
+        draw_key_preview(key_preview_area, app, buf);
         draw_volume_dialog(buf.rect(), app, buf);
         return;
     }
@@ -85,7 +88,7 @@ pub(crate) fn render(app: &mut App, buf: &mut Buffer, now_ms: u64) {
 
     draw_compose_bar(status_area, app, buf);
     draw_composer(composer_area, app, buf);
-    draw_minibuffer(minibuffer_area, app, buf);
+    draw_key_preview(key_preview_area, app, buf);
     draw_volume_dialog(buf.rect(), app, buf);
 }
 
@@ -899,6 +902,218 @@ fn draw_status_text_right(area: Rect, app: &App, buf: &mut Buffer, fill: Style) 
         .text(buf, &format!(" {} ", status_text));
 }
 
+struct KeyPreviewEntry {
+    key_hint: String,
+    label: String,
+    width: usize,
+    order: i8,
+    toggle: bool,
+}
+
+#[derive(Clone, Copy)]
+struct KeyPreviewRow {
+    start: usize,
+    end: usize,
+}
+
+const KEY_PREVIEW_ENTRY_GAP: &str = "  ";
+const KEY_PREVIEW_ENTRY_GAP_WIDTH: usize = 2;
+
+fn key_preview_height(app: &App, width: u16) -> u16 {
+    let entries = key_preview_entries(app);
+    if entries.is_empty() {
+        return 0;
+    }
+    let rows = key_preview_rows(&entries, width);
+    if app.key_preview_expanded && rows.len() > 1 {
+        rows.len().try_into().unwrap_or(u16::MAX)
+    } else {
+        1
+    }
+}
+
+fn draw_key_preview(area: Rect, app: &App, buf: &mut Buffer) {
+    if area.is_empty() {
+        return;
+    }
+
+    let entries = key_preview_entries(app);
+    if entries.is_empty() {
+        area.with(Style::default()).fill(buf);
+        return;
+    }
+
+    let rows = key_preview_rows(&entries, area.w);
+    let bar_style = key_preview_bar_style();
+    let key_style = key_preview_key_style();
+    let label_style = key_preview_label_style();
+    area.with(bar_style).fill(buf);
+
+    for (row_index, row) in rows.iter().enumerate() {
+        let Ok(row_index) = u16::try_from(row_index) else {
+            break;
+        };
+        if row_index >= area.h {
+            break;
+        }
+
+        let line = Rect {
+            x: area.x,
+            y: area.y.saturating_add(row_index),
+            w: area.w,
+            h: 1,
+        };
+        let mut display_row = line.with(bar_style).fill(buf);
+        for (entry_index, entry) in entries[row.start..row.end].iter().enumerate() {
+            if entry_index > 0 {
+                display_row = display_row.with(bar_style).text(buf, KEY_PREVIEW_ENTRY_GAP);
+            }
+            display_row = display_row
+                .with(key_style)
+                .text(buf, entry.key_hint.as_str());
+            if !entry.label.is_empty() {
+                display_row = display_row
+                    .with(label_style)
+                    .text(buf, " ")
+                    .text(buf, entry.label.as_str());
+            }
+        }
+    }
+
+    if rows.len() > 1 {
+        let hint = key_preview_toggle_hint(&entries);
+        let label = if app.key_preview_expanded {
+            format!("less [{hint}]")
+        } else {
+            format!("more [{hint}]")
+        };
+        let width = key_preview_more_width(&entries);
+        let toggle = Rect {
+            x: area.x.saturating_add(area.w.saturating_sub(width)),
+            y: area.y + area.h.saturating_sub(1),
+            w: width.min(area.w),
+            h: 1.min(area.h),
+        };
+        toggle
+            .with(label_style)
+            .with(HAlign::Right)
+            .text(buf, &label);
+    }
+}
+
+fn key_preview_entries(app: &App) -> Vec<KeyPreviewEntry> {
+    let Some(layer) = app.active_binding_layer() else {
+        return Vec::new();
+    };
+    let mut entries: Vec<_> = bindings::reachable(&app.config.bindings, layer, &app.pending_chord)
+        .into_iter()
+        .map(|Reachable { key, kind }| {
+            let key_hint = key.to_string();
+            let (label, order, toggle) = match kind {
+                ReachableKind::Action(command) => {
+                    let toggle = matches!(command, bindings::BindCommand::ToggleKeyPreview);
+                    let spec = command.spec();
+                    (spec.label.to_string(), spec.order, toggle)
+                }
+                ReachableKind::EnterLayer(label) => {
+                    (label.unwrap_or_else(|| "more".to_string()), 10, false)
+                }
+            };
+            let width = key_hint.width() + usize::from(!label.is_empty()) + label.width();
+            KeyPreviewEntry {
+                key_hint,
+                label,
+                width,
+                order,
+                toggle,
+            }
+        })
+        .collect();
+    entries.sort_by(|left, right| key_preview_entry_cmp(left, right));
+    entries
+}
+
+fn key_preview_entry_cmp(left: &KeyPreviewEntry, right: &KeyPreviewEntry) -> CmpOrdering {
+    left.order
+        .cmp(&right.order)
+        .then_with(|| left.key_hint.cmp(&right.key_hint))
+        .then_with(|| left.label.cmp(&right.label))
+}
+
+fn key_preview_rows(entries: &[KeyPreviewEntry], width: u16) -> Vec<KeyPreviewRow> {
+    let mut rows = key_preview_rows_for_width(entries, width);
+    if rows.len() > 1 {
+        rows = key_preview_rows_for_width(
+            entries,
+            width.saturating_sub(key_preview_more_width(entries)),
+        );
+    }
+    rows
+}
+
+fn key_preview_toggle_hint(entries: &[KeyPreviewEntry]) -> &str {
+    entries
+        .iter()
+        .find(|entry| entry.toggle)
+        .map(|entry| entry.key_hint.as_str())
+        .unwrap_or(".")
+}
+
+fn key_preview_more_width(entries: &[KeyPreviewEntry]) -> u16 {
+    (7 + key_preview_toggle_hint(entries).width())
+        .max(9)
+        .try_into()
+        .unwrap_or(u16::MAX)
+}
+
+fn key_preview_rows_for_width(entries: &[KeyPreviewEntry], width: u16) -> Vec<KeyPreviewRow> {
+    if entries.is_empty() {
+        return Vec::new();
+    }
+
+    let width = usize::from(width);
+    let mut rows = Vec::new();
+    let mut row_start = 0;
+    let mut line_width = 0;
+
+    for (index, entry) in entries.iter().enumerate() {
+        let entry_width = entry.width
+            + if line_width > 0 {
+                KEY_PREVIEW_ENTRY_GAP_WIDTH
+            } else {
+                0
+            };
+        if line_width > 0 && line_width + entry_width > width {
+            rows.push(KeyPreviewRow {
+                start: row_start,
+                end: index,
+            });
+            row_start = index;
+            line_width = entry.width;
+        } else {
+            line_width += entry_width;
+        }
+    }
+
+    rows.push(KeyPreviewRow {
+        start: row_start,
+        end: entries.len(),
+    });
+    rows
+}
+
+fn key_preview_bar_style() -> Style {
+    Style::default()
+}
+
+fn key_preview_key_style() -> Style {
+    Style::default().with_fg_ansi(AnsiColor::Grey[23])
+}
+
+fn key_preview_label_style() -> Style {
+    Style::default().with_fg_ansi(AnsiColor::Grey[14])
+}
+
 fn draw_status_segment(row: &mut Rect, buf: &mut Buffer, style: Style, text: &str) {
     if row.is_empty() {
         return;
@@ -936,13 +1151,6 @@ fn draw_composer(area: Rect, app: &mut App, buf: &mut Buffer) {
             .with(Ellipsis(true))
             .text(buf, &format!(" {}", app.config.ui.placeholder));
     }
-}
-
-fn draw_minibuffer(area: Rect, app: &App, buf: &mut Buffer) {
-    if area.is_empty() {
-        return;
-    }
-    area.with(app.theme.background).fill(buf);
 }
 
 fn connection_state_label(app: &App) -> &'static str {
