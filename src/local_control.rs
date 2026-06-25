@@ -97,6 +97,10 @@ mod imp {
         pub fn path(&self) -> &Path {
             &self.path
         }
+
+        pub fn is_finished(&self) -> bool {
+            self.worker.as_ref().is_some_and(JoinHandle::is_finished)
+        }
     }
 
     impl Drop for ControlSocket {
@@ -505,6 +509,10 @@ mod imp {
 
         pub fn path(&self) -> &Path {
             Path::new("")
+        }
+
+        pub fn is_finished(&self) -> bool {
+            false
         }
     }
 

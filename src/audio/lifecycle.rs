@@ -146,6 +146,10 @@ impl LiveCapture {
         self.buffer_fallback
     }
 
+    pub fn worker_finished(&self) -> bool {
+        self.worker.as_ref().is_some_and(JoinHandle::is_finished)
+    }
+
     pub fn set_max_amplification(&self, max_amplification: f32) {
         self.max_amplification_bits
             .store(max_amplification.to_bits(), Ordering::Relaxed);
@@ -217,6 +221,10 @@ impl LivePlayback {
 
     pub fn stats(&self) -> LivePlaybackSnapshot {
         self.shared_snapshot.snapshot()
+    }
+
+    pub fn worker_finished(&self) -> bool {
+        self.worker.as_ref().is_some_and(JoinHandle::is_finished)
     }
 
     pub fn stop(mut self) {

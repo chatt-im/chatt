@@ -5,6 +5,7 @@ pub(crate) mod server;
 
 use hashbrown::{HashMap, HashSet};
 use std::{
+    collections::VecDeque,
     path::PathBuf,
     sync::{
         Arc,
@@ -51,7 +52,7 @@ use chatt::audio::{
     self, BufferRequest, DeviceInfo, EchoCancellationControl, LiveAudioFileSourceConfig,
     LiveAudioFileSourceReport, LiveAudioPacketLossProfile, LiveCapture, LiveCaptureConfig,
     LiveEncoderProfile, LivePlayback, LivePlaybackConfig, LivePlaybackFeedback, LivePlaybackSink,
-    PlaybackStreamControl,
+    LocalVoiceFrame, PlaybackStreamControl,
 };
 
 use audio_diagnostics::AudioDiagnostics;
@@ -137,6 +138,8 @@ pub(crate) struct App {
     pub(crate) encoder_profile: LiveEncoderProfile,
     pub(crate) last_network_notice: Option<String>,
     pub(crate) pending_audio_apply: Option<PendingAudioApply>,
+    pending_network_commands: VecDeque<NetworkCommand>,
+    supervisor: SupervisorState,
 }
 
 /// A debounced request to restart audio streams so a slow settings-page change
@@ -148,9 +151,99 @@ pub(crate) struct PendingAudioApply {
     deadline: Instant,
 }
 
+#[derive(Default)]
+struct SupervisorState {
+    network: RecoveryState,
+    control_socket: RecoveryState,
+    capture: RecoveryState,
+    playback: RecoveryState,
+    capture_watch: CaptureWatch,
+    playback_watch: PlaybackWatch,
+}
+
+#[derive(Default)]
+struct CaptureWatch {
+    callbacks: u64,
+    captured_samples: u64,
+    stream_errors: u64,
+    worker_stopped: bool,
+    last_progress_at: Option<Instant>,
+}
+
+#[derive(Default)]
+struct PlaybackWatch {
+    backend_stream_errors: u64,
+}
+
+#[derive(Default)]
+struct RecoveryState {
+    attempts: Vec<Instant>,
+    next_retry_at: Option<Instant>,
+    reason: Option<String>,
+    exhausted: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RecoverySchedule {
+    Scheduled(Duration),
+    Pending,
+    Exhausted,
+}
+
+const RECOVERY_WINDOW: Duration = Duration::from_secs(30);
+const RECOVERY_MAX_ATTEMPTS: usize = 3;
+const CAPTURE_STALL_TIMEOUT: Duration = Duration::from_millis(750);
+
 /// Debounce window before a scheduled audio restart fires. Coalesces rapid
 /// settings edits (cycling a choice, typing a buffer size) into one restart.
 const AUDIO_APPLY_DEBOUNCE: Duration = Duration::from_millis(400);
+
+impl RecoveryState {
+    fn schedule(&mut self, now: Instant, reason: impl Into<String>) -> RecoverySchedule {
+        if self.exhausted {
+            return RecoverySchedule::Exhausted;
+        }
+        if self.next_retry_at.is_some() {
+            return RecoverySchedule::Pending;
+        }
+        self.attempts
+            .retain(|attempt| now.saturating_duration_since(*attempt) <= RECOVERY_WINDOW);
+        if self.attempts.len() >= RECOVERY_MAX_ATTEMPTS {
+            self.exhausted = true;
+            return RecoverySchedule::Exhausted;
+        }
+        let attempt = self.attempts.len() + 1;
+        let delay = recovery_delay(attempt);
+        self.attempts.push(now);
+        self.next_retry_at = Some(now + delay);
+        self.reason = Some(reason.into());
+        RecoverySchedule::Scheduled(delay)
+    }
+
+    fn take_due(&mut self, now: Instant) -> Option<String> {
+        if self.exhausted || !self.next_retry_at.is_some_and(|deadline| now >= deadline) {
+            return None;
+        }
+        self.next_retry_at = None;
+        self.reason.take()
+    }
+
+    fn reset(&mut self) {
+        self.attempts.clear();
+        self.next_retry_at = None;
+        self.reason = None;
+        self.exhausted = false;
+    }
+}
+
+fn recovery_delay(attempt: usize) -> Duration {
+    match attempt {
+        0 | 1 => Duration::ZERO,
+        2 => Duration::from_secs(1),
+        3 => Duration::from_secs(2),
+        _ => Duration::from_secs(5),
+    }
+}
 
 /// Returns which audio streams must restart for an audio-config change to take
 /// effect, as `(capture, playback)`. Cheap in-place fields (amplification, echo
@@ -283,6 +376,8 @@ impl App {
             encoder_profile: LiveEncoderProfile::DRED_20,
             last_network_notice: None,
             pending_audio_apply: None,
+            pending_network_commands: VecDeque::new(),
+            supervisor: SupervisorState::default(),
             config,
         };
         app.rebuild_server_items();
@@ -295,8 +390,18 @@ impl App {
     }
 
     pub(crate) fn drain_network_events(&mut self) {
-        while let Ok(event) = self.event_rx.try_recv() {
-            self.handle_network_event(event);
+        loop {
+            match self.event_rx.try_recv() {
+                Ok(event) => self.handle_network_event(event),
+                Err(mpsc::TryRecvError::Empty) => break,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    self.schedule_network_recovery(
+                        Instant::now(),
+                        "network event channel disconnected",
+                    );
+                    break;
+                }
+            }
         }
     }
 
@@ -389,10 +494,12 @@ impl App {
                     "chatt local control socket ready",
                     path = %socket.path().display()
                 );
+                self.supervisor.control_socket.reset();
                 Some(socket)
             }
             Err(error) => {
                 self.push_network_notice("control", &error);
+                self.schedule_control_socket_recovery(Instant::now(), error.clone());
                 None
             }
         };
@@ -402,6 +509,7 @@ impl App {
         self.set_mode(theme::UiMode::Compose);
         self.composer.enter_insert_mode();
         self.network = Some(network);
+        self.supervisor.network.reset();
         self.set_status("connecting");
     }
 
@@ -417,6 +525,13 @@ impl App {
         self.stream_users.clear();
         self.last_network_notice = None;
         self.voice_tx_enabled.store(false, Ordering::Relaxed);
+        self.pending_network_commands.clear();
+        self.supervisor.network.reset();
+        self.supervisor.control_socket.reset();
+        self.supervisor.capture.reset();
+        self.supervisor.playback.reset();
+        self.supervisor.capture_watch = CaptureWatch::default();
+        self.supervisor.playback_watch = PlaybackWatch::default();
     }
 
     fn start_join_pairing(&mut self, ticket: InviteTicket) {
@@ -564,6 +679,7 @@ impl App {
                 self.chat.bottom();
                 self.set_status(format!("joined room {}", room_id.0));
                 self.start_room_voice();
+                self.flush_pending_network_commands();
             }
             NetworkEvent::Chat(message) => self.push_chat(message),
             NetworkEvent::Presence {
@@ -678,10 +794,19 @@ impl App {
                     retry_in.as_secs()
                 ));
             }
+            NetworkEvent::WorkerStopped { reason } => {
+                self.stop_audio();
+                self.stream_users.clear();
+                self.push_network_notice(
+                    "network",
+                    &format!("Network worker stopped: {reason}; reconnecting"),
+                );
+                self.schedule_network_recovery(Instant::now(), reason);
+            }
             NetworkEvent::Disconnected => {
                 self.stop_audio();
                 self.stream_users.clear();
-                self.set_error("disconnected");
+                self.schedule_network_recovery(Instant::now(), "network worker disconnected");
             }
         }
     }
@@ -694,9 +819,64 @@ impl App {
         self.participants.voice_packet(stream_id);
     }
 
-    fn set_network_playback_sink(&self, sink: Option<LivePlaybackSink>) {
-        if let Some(network) = &self.network {
-            network.send(NetworkCommand::SetPlaybackSink(sink));
+    fn set_network_playback_sink(&mut self, sink: Option<LivePlaybackSink>) {
+        if self.network.is_some() {
+            self.send_network_command(NetworkCommand::SetPlaybackSink(sink), false);
+        }
+    }
+
+    fn send_network_command(&mut self, command: NetworkCommand, queue_on_failure: bool) -> bool {
+        let Some(network) = &self.network else {
+            return false;
+        };
+        match network.try_send(command) {
+            Ok(()) => true,
+            Err(error) => {
+                let command = error.0;
+                let kind = app_network_command_kind(&command);
+                kvlog::warn!("network command send failed", kind);
+                if queue_on_failure {
+                    self.pending_network_commands.push_back(command);
+                }
+                self.schedule_network_recovery(
+                    Instant::now(),
+                    format!("network command channel closed while sending {kind}"),
+                );
+                self.set_error("network worker stopped; reconnecting");
+                false
+            }
+        }
+    }
+
+    fn flush_pending_network_commands(&mut self) {
+        if self.pending_network_commands.is_empty() || self.network.is_none() {
+            return;
+        }
+        let mut sent = 0usize;
+        let mut remaining = VecDeque::new();
+        while let Some(command) = self.pending_network_commands.pop_front() {
+            let Some(network) = &self.network else {
+                remaining.push_back(command);
+                break;
+            };
+            match network.try_send(command) {
+                Ok(()) => sent += 1,
+                Err(error) => {
+                    remaining.push_back(error.0);
+                    while let Some(command) = self.pending_network_commands.pop_front() {
+                        remaining.push_back(command);
+                    }
+                    self.schedule_network_recovery(
+                        Instant::now(),
+                        "network command channel closed while flushing queued commands",
+                    );
+                    break;
+                }
+            }
+        }
+        self.pending_network_commands = remaining;
+        if sent > 0 {
+            self.set_status(format!("sent {sent} queued network command(s)"));
         }
     }
 
@@ -1444,18 +1624,23 @@ impl App {
     /// Fires a debounced audio restart once its window elapses. Called once per
     /// run-loop iteration from [`crate::runtime`].
     pub(crate) fn tick(&mut self) {
+        self.supervise(Instant::now());
+        self.apply_pending_audio_restart();
+    }
+
+    fn apply_pending_audio_restart(&mut self) {
         let Some(pending) = &self.pending_audio_apply else {
             return;
         };
         if Instant::now() < pending.deadline {
             return;
         }
-        let PendingAudioApply {
+        let Some(PendingAudioApply {
             capture, playback, ..
-        } = self
-            .pending_audio_apply
-            .take()
-            .expect("pending checked above");
+        }) = self.pending_audio_apply.take()
+        else {
+            return;
+        };
         let mut applied = Vec::new();
         if capture && self.capture.is_some() {
             self.restart_capture_stream();
@@ -1470,16 +1655,313 @@ impl App {
         }
     }
 
+    fn supervise(&mut self, now: Instant) {
+        self.supervise_network(now);
+        self.supervise_control_socket(now);
+        self.supervise_capture(now);
+        self.supervise_playback(now);
+    }
+
+    fn supervise_network(&mut self, now: Instant) {
+        if self
+            .network
+            .as_ref()
+            .is_some_and(NetworkClient::is_worker_finished)
+        {
+            self.schedule_network_recovery(now, "network worker stopped");
+        }
+        if let Some(reason) = self.supervisor.network.take_due(now) {
+            self.restart_network_worker(&reason);
+        }
+    }
+
+    fn supervise_control_socket(&mut self, now: Instant) {
+        if self.network.is_none() {
+            self.supervisor.control_socket.reset();
+            return;
+        }
+        if self
+            .control_socket
+            .as_ref()
+            .is_some_and(local_control::ControlSocket::is_finished)
+        {
+            self.schedule_control_socket_recovery(now, "control socket worker stopped");
+        }
+        if let Some(reason) = self.supervisor.control_socket.take_due(now) {
+            self.restart_control_socket(&reason);
+        }
+    }
+
+    fn supervise_capture(&mut self, now: Instant) {
+        let Some(capture) = &self.capture else {
+            self.supervisor.capture_watch = CaptureWatch::default();
+            return;
+        };
+        let snapshot = capture.stats().snapshot();
+        let mut reason = None;
+        if snapshot.stream_errors > self.supervisor.capture_watch.stream_errors {
+            reason = Some(
+                snapshot
+                    .last_error
+                    .clone()
+                    .unwrap_or_else(|| "capture stream error".to_string()),
+            );
+        }
+        if snapshot.worker_stopped && !self.supervisor.capture_watch.worker_stopped {
+            reason = Some("capture worker stopped".to_string());
+        }
+        if capture.worker_finished() {
+            reason = Some("capture worker exited".to_string());
+        }
+
+        let progressed = snapshot.callbacks != self.supervisor.capture_watch.callbacks
+            || snapshot.captured_samples != self.supervisor.capture_watch.captured_samples;
+        if progressed || self.supervisor.capture_watch.last_progress_at.is_none() {
+            self.supervisor.capture_watch.last_progress_at = Some(now);
+        } else if self.capture_should_be_live()
+            && self
+                .supervisor
+                .capture_watch
+                .last_progress_at
+                .is_some_and(|last| now.saturating_duration_since(last) >= CAPTURE_STALL_TIMEOUT)
+        {
+            reason = Some("capture stream stopped delivering audio".to_string());
+        }
+
+        self.supervisor.capture_watch.callbacks = snapshot.callbacks;
+        self.supervisor.capture_watch.captured_samples = snapshot.captured_samples;
+        self.supervisor.capture_watch.stream_errors = snapshot.stream_errors;
+        self.supervisor.capture_watch.worker_stopped = snapshot.worker_stopped;
+
+        if let Some(reason) = reason {
+            self.schedule_capture_recovery(now, reason);
+        }
+        if let Some(reason) = self.supervisor.capture.take_due(now) {
+            self.recover_capture_stream(&reason);
+        }
+    }
+
+    fn supervise_playback(&mut self, now: Instant) {
+        let Some(playback) = &self.playback else {
+            self.supervisor.playback_watch = PlaybackWatch::default();
+            return;
+        };
+        let snapshot = playback.stats();
+        let mut reason = None;
+        if snapshot.backend_stream_errors > self.supervisor.playback_watch.backend_stream_errors {
+            reason = Some(
+                snapshot
+                    .last_backend_error
+                    .clone()
+                    .unwrap_or_else(|| "playback stream error".to_string()),
+            );
+        }
+        if playback.worker_finished() {
+            reason = Some("playback decoder worker exited".to_string());
+        }
+        self.supervisor.playback_watch.backend_stream_errors = snapshot.backend_stream_errors;
+
+        if let Some(reason) = reason {
+            self.schedule_playback_recovery(now, reason);
+        }
+        if let Some(reason) = self.supervisor.playback.take_due(now) {
+            self.recover_playback_stream(&reason);
+        }
+    }
+
+    fn capture_should_be_live(&self) -> bool {
+        self.capture.is_some()
+            && (self.settings_preview_capture || self.voice_tx_enabled.load(Ordering::Relaxed))
+    }
+
+    fn schedule_network_recovery(&mut self, now: Instant, reason: impl Into<String>) {
+        let reason = reason.into();
+        match self.supervisor.network.schedule(now, reason.clone()) {
+            RecoverySchedule::Scheduled(delay) => {
+                if delay.is_zero() {
+                    self.set_status("network worker stopped; reconnecting");
+                } else {
+                    self.set_status(format!(
+                        "network worker stopped; retrying in {}s",
+                        delay.as_secs()
+                    ));
+                }
+            }
+            RecoverySchedule::Pending => {}
+            RecoverySchedule::Exhausted => {
+                self.stop_audio();
+                self.control_socket.take();
+                if let Some(network) = self.network.take() {
+                    network.stop();
+                }
+                self.stream_users.clear();
+                self.set_error(format!("network recovery exhausted: {reason}"));
+            }
+        }
+    }
+
+    fn schedule_control_socket_recovery(&mut self, now: Instant, reason: impl Into<String>) {
+        let reason = reason.into();
+        match self.supervisor.control_socket.schedule(now, reason.clone()) {
+            RecoverySchedule::Scheduled(delay) => {
+                if !delay.is_zero() {
+                    self.set_status(format!(
+                        "file-upload socket down; retrying in {}s",
+                        delay.as_secs()
+                    ));
+                }
+            }
+            RecoverySchedule::Pending => {}
+            RecoverySchedule::Exhausted => {
+                self.control_socket.take();
+                self.set_error(format!("file-upload socket down: {reason}"));
+            }
+        }
+    }
+
+    fn schedule_capture_recovery(&mut self, now: Instant, reason: impl Into<String>) {
+        let reason = reason.into();
+        match self.supervisor.capture.schedule(now, reason.clone()) {
+            RecoverySchedule::Scheduled(delay) => {
+                if !delay.is_zero() {
+                    self.set_status(format!(
+                        "microphone recovery retrying in {}s",
+                        delay.as_secs()
+                    ));
+                }
+            }
+            RecoverySchedule::Pending => {}
+            RecoverySchedule::Exhausted => {
+                self.mic_error = Some(reason.clone());
+                self.set_error(format!("mic unavailable: {reason}"));
+            }
+        }
+    }
+
+    fn schedule_playback_recovery(&mut self, now: Instant, reason: impl Into<String>) {
+        let reason = reason.into();
+        match self.supervisor.playback.schedule(now, reason.clone()) {
+            RecoverySchedule::Scheduled(delay) => {
+                if !delay.is_zero() {
+                    self.set_status(format!(
+                        "playback recovery retrying in {}s",
+                        delay.as_secs()
+                    ));
+                }
+            }
+            RecoverySchedule::Pending => {}
+            RecoverySchedule::Exhausted => {
+                self.playback_error = Some(reason.clone());
+                self.set_error(format!("playback unavailable: {reason}"));
+            }
+        }
+    }
+
+    fn restart_network_worker(&mut self, reason: &str) {
+        let alias = self.server_alias.clone();
+        if alias.is_empty() {
+            self.set_error(format!("network worker stopped: {reason}"));
+            return;
+        }
+        kvlog::warn!("restarting network worker", reason);
+        self.push_network_notice(
+            "network",
+            &format!("Network worker stopped: {reason}; reconnecting"),
+        );
+        let queued = std::mem::take(&mut self.pending_network_commands);
+        let network_recovery = std::mem::take(&mut self.supervisor.network);
+        let control_recovery = std::mem::take(&mut self.supervisor.control_socket);
+        self.start_network(&alias);
+        self.pending_network_commands = queued;
+        if self.network.is_some() {
+            self.supervisor.network.reset();
+        } else {
+            self.supervisor.network = network_recovery;
+            self.supervisor.control_socket = control_recovery;
+            self.schedule_network_recovery(
+                Instant::now(),
+                format!("failed to restart network worker after {reason}"),
+            );
+        }
+    }
+
+    fn restart_control_socket(&mut self, reason: &str) {
+        kvlog::warn!("restarting local control socket", reason);
+        self.control_socket.take();
+        let Some(network) = &self.network else {
+            self.supervisor.control_socket.reset();
+            return;
+        };
+        match local_control::ControlSocket::spawn(network.sender()) {
+            Ok(socket) => {
+                kvlog::info!(
+                    "chatt local control socket recovered",
+                    path = %socket.path().display()
+                );
+                self.control_socket = Some(socket);
+                self.supervisor.control_socket.reset();
+                self.set_status("file-upload socket recovered");
+            }
+            Err(error) => {
+                self.push_network_notice("control", &error);
+                self.set_error(format!("file-upload socket unavailable: {error}"));
+                self.schedule_control_socket_recovery(Instant::now(), error);
+            }
+        }
+    }
+
+    fn recover_capture_stream(&mut self, reason: &str) {
+        kvlog::warn!("recovering capture stream", reason);
+        match self.restart_capture_stream_inner() {
+            Ok(restarted) => {
+                self.supervisor.capture.reset();
+                self.supervisor.capture_watch = CaptureWatch::default();
+                if restarted {
+                    self.set_status("microphone recovered");
+                }
+            }
+            Err(error) => {
+                self.mic_error = Some(error.clone());
+                self.set_error(format!("mic unavailable: {error}"));
+                self.schedule_capture_recovery(Instant::now(), error);
+            }
+        }
+    }
+
+    fn recover_playback_stream(&mut self, reason: &str) {
+        kvlog::warn!("recovering playback stream", reason);
+        self.restart_playback_stream();
+        if self.playback.is_some() {
+            self.supervisor.playback.reset();
+            self.supervisor.playback_watch = PlaybackWatch::default();
+            self.set_status("playback recovered");
+        } else {
+            let error = self
+                .playback_error
+                .clone()
+                .unwrap_or_else(|| reason.to_string());
+            self.schedule_playback_recovery(Instant::now(), error);
+        }
+    }
+
     fn restart_capture_stream(&mut self) {
+        if let Err(error) = self.restart_capture_stream_inner() {
+            self.set_error(format!("failed to restart capture: {error}"));
+        }
+    }
+
+    fn restart_capture_stream_inner(&mut self) -> Result<bool, String> {
         let was_preview = self.settings_preview_capture;
         let in_call = self.voice_tx_enabled.load(Ordering::Relaxed);
         self.stop_mic_capture();
         if in_call {
-            if let Err(error) = self.ensure_mic_capture() {
-                self.set_error(format!("failed to restart capture: {error}"));
-            }
+            self.ensure_mic_capture()?;
+            Ok(true)
         } else if was_preview {
-            self.start_settings_preview_capture();
+            self.start_settings_preview_capture_inner()?;
+            Ok(true)
+        } else {
+            Ok(false)
         }
     }
 
@@ -1901,10 +2383,13 @@ impl App {
             command if command.starts_with('/') => {
                 self.set_error(format!("unknown command: {command}"))
             }
-            body => match &self.network {
-                Some(network) => network.send(NetworkCommand::SendChat(body.to_string())),
-                None => self.set_error("select a server before sending messages"),
-            },
+            body => {
+                if self.network.is_some() {
+                    self.send_network_command(NetworkCommand::SendChat(body.to_string()), true);
+                } else {
+                    self.set_error("select a server before sending messages");
+                }
+            }
         }
     }
 
@@ -1914,12 +2399,14 @@ impl App {
             self.set_error("usage: /upload file_path/filename.ext");
             return;
         }
-        match &self.network {
-            Some(network) => {
-                network.send(NetworkCommand::UploadFile(std::path::PathBuf::from(path)));
-                self.set_status(format!("queued upload {}", path));
-            }
-            None => self.set_error("select a server before uploading files"),
+        if self.network.is_some() {
+            self.send_network_command(
+                NetworkCommand::UploadFile(std::path::PathBuf::from(path)),
+                true,
+            );
+            self.set_status(format!("queued upload {}", path));
+        } else {
+            self.set_error("select a server before uploading files");
         }
     }
 
@@ -2101,6 +2588,8 @@ impl App {
         };
         let network_tx = network.sender();
         let event_tx = self.soundboard_event_tx.clone();
+        let network_event_tx = self.event_tx.clone();
+        let send_failed = Arc::new(AtomicBool::new(false));
         let busy = Arc::clone(&self.soundboard_busy);
         let source_config = LiveAudioFileSourceConfig {
             input_path,
@@ -2118,9 +2607,18 @@ impl App {
             packet_loss.as_name()
         ));
         thread::spawn(move || {
+            let send_failed = Arc::clone(&send_failed);
             let result = audio::run_live_audio_file_source(source_config, |sequence, frame| {
-                let _ =
-                    network_tx.send(NetworkCommand::SequencedLocalVoicePacket { sequence, frame });
+                if network_tx
+                    .send(NetworkCommand::SequencedLocalVoicePacket { sequence, frame })
+                    .is_err()
+                    && !send_failed.swap(true, Ordering::AcqRel)
+                {
+                    let _ = network_event_tx.send(NetworkEvent::WorkerStopped {
+                        reason: "network command channel closed while sending soundboard audio"
+                            .to_string(),
+                    });
+                }
             });
             busy.store(false, Ordering::Release);
             let _ = event_tx.send(SoundboardEvent { clip_name, result });
@@ -2149,6 +2647,46 @@ impl App {
             .any(|stream_user| *stream_user == user_id)
     }
 
+    fn live_capture_config(&self, input_device_id: Option<String>) -> LiveCaptureConfig {
+        LiveCaptureConfig {
+            input_device_id,
+            bitrate_bps: self.config.audio.bitrate_bps,
+            denoise: self.config.audio.denoise,
+            max_amplification: self.config.audio.max_amplification,
+            suppression: self.config.audio.suppression(),
+            typing_suppression: self.config.audio.typing_suppression(),
+            buffer_request: self.input_buffer_request(),
+            tuning: self.config.audio.latency.to_tuning(),
+            echo_control: Some(Arc::clone(&self.echo_control)),
+        }
+    }
+
+    fn capture_packet_handler(&self) -> impl FnMut(LocalVoiceFrame) + Send + 'static {
+        let tx = self.network.as_ref().map(|network| network.sender());
+        let event_tx = self.event_tx.clone();
+        let send_failed = Arc::new(AtomicBool::new(false));
+        let mic_muted = Arc::clone(&self.mic_muted);
+        let deafened = Arc::clone(&self.deafened);
+        let voice_tx_enabled = Arc::clone(&self.voice_tx_enabled);
+        move |payload| {
+            if mic_muted.load(Ordering::Relaxed)
+                || deafened.load(Ordering::Relaxed)
+                || !voice_tx_enabled.load(Ordering::Relaxed)
+            {
+                return;
+            }
+            if let Some(tx) = &tx
+                && tx.send(NetworkCommand::LocalVoicePacket(payload)).is_err()
+                && !send_failed.swap(true, Ordering::AcqRel)
+            {
+                let _ = event_tx.send(NetworkEvent::WorkerStopped {
+                    reason: "network command channel closed while sending microphone audio"
+                        .to_string(),
+                });
+            }
+        }
+    }
+
     fn ensure_mic_capture(&mut self) -> Result<(), String> {
         if self.capture.is_some() {
             return Ok(());
@@ -2172,37 +2710,37 @@ impl App {
             }
         }
 
-        let tx = self.network.as_ref().map(|network| network.sender());
-        let mic_muted = Arc::clone(&self.mic_muted);
-        let deafened = Arc::clone(&self.deafened);
-        let voice_tx_enabled = Arc::clone(&self.voice_tx_enabled);
-        match audio::start_live_capture(
-            LiveCaptureConfig {
-                input_device_id: self.config.audio.input_device_id.clone(),
-                bitrate_bps: self.config.audio.bitrate_bps,
-                denoise: self.config.audio.denoise,
-                max_amplification: self.config.audio.max_amplification,
-                suppression: self.config.audio.suppression(),
-                typing_suppression: self.config.audio.typing_suppression(),
-                buffer_request: self.input_buffer_request(),
-                tuning: self.config.audio.latency.to_tuning(),
-                echo_control: Some(Arc::clone(&self.echo_control)),
-            },
-            move |payload| {
-                if mic_muted.load(Ordering::Relaxed)
-                    || deafened.load(Ordering::Relaxed)
-                    || !voice_tx_enabled.load(Ordering::Relaxed)
-                {
-                    return;
-                }
-                if let Some(tx) = &tx {
-                    let _ = tx.send(NetworkCommand::LocalVoicePacket(payload));
-                }
-            },
+        let configured_input = self.config.audio.input_device_id.clone();
+        let capture = match audio::start_live_capture(
+            self.live_capture_config(configured_input.clone()),
+            self.capture_packet_handler(),
         ) {
+            Ok(capture) => Ok(capture),
+            Err(error) if configured_input.is_some() => {
+                kvlog::warn!(
+                    "configured input failed, trying default",
+                    error = error.as_str()
+                );
+                self.push_network_notice(
+                    "audio",
+                    &format!("Input device failed; trying system default: {error}"),
+                );
+                audio::start_live_capture(
+                    self.live_capture_config(None),
+                    self.capture_packet_handler(),
+                )
+                .map_err(|fallback_error| {
+                    format!("{error}; default input fallback failed: {fallback_error}")
+                })
+            }
+            Err(error) => Err(error),
+        };
+        match capture {
             Ok(capture) => {
                 self.capture = Some(capture);
                 self.mic_error = None;
+                self.supervisor.capture.reset();
+                self.supervisor.capture_watch = CaptureWatch::default();
                 Ok(())
             }
             Err(error) => {
@@ -2219,22 +2757,23 @@ impl App {
     }
 
     fn start_settings_preview_capture(&mut self) {
+        if let Err(error) = self.start_settings_preview_capture_inner() {
+            self.mic_error = Some(error);
+        }
+    }
+
+    fn start_settings_preview_capture_inner(&mut self) -> Result<(), String> {
         if !self.allow_settings_preview_capture
             || self.capture.is_some()
             || self.voice_tx_enabled.load(Ordering::Relaxed)
             || self.deafened.load(Ordering::Relaxed)
         {
-            return;
+            return Ok(());
         }
 
-        match self.ensure_mic_capture() {
-            Ok(()) => {
-                self.settings_preview_capture = true;
-            }
-            Err(error) => {
-                self.mic_error = Some(error);
-            }
-        }
+        self.ensure_mic_capture()?;
+        self.settings_preview_capture = true;
+        Ok(())
     }
 
     fn stop_settings_preview_capture(&mut self) {
@@ -2288,23 +2827,51 @@ impl App {
             return;
         };
         let network_tx = network.sender();
+        let event_tx = self.event_tx.clone();
+        let send_failed = Arc::new(AtomicBool::new(false));
         thread::spawn(move || {
             for feedback in feedback_rx {
-                let _ = network_tx.send(NetworkCommand::PlaybackFeedback(feedback));
+                if network_tx
+                    .send(NetworkCommand::PlaybackFeedback(feedback))
+                    .is_err()
+                    && !send_failed.swap(true, Ordering::AcqRel)
+                {
+                    let _ = event_tx.send(NetworkEvent::WorkerStopped {
+                        reason: "network command channel closed while sending playback feedback"
+                            .to_string(),
+                    });
+                }
             }
         });
-        match audio::start_live_playback(LivePlaybackConfig {
-            output_device_id: self.config.audio.output_device_id.clone(),
-            buffer_request: self.output_buffer_request(),
-            tuning: self.config.audio.latency.to_tuning(),
-            feedback_sender: Some(feedback_tx),
-            echo_control: Some(Arc::clone(&self.echo_control)),
-        }) {
+        let configured_output = self.config.audio.output_device_id.clone();
+        let playback = match audio::start_live_playback(
+            self.live_playback_config(configured_output.clone(), Some(feedback_tx.clone())),
+        ) {
+            Ok(playback) => Ok(playback),
+            Err(error) if configured_output.is_some() => {
+                kvlog::warn!(
+                    "configured output failed, trying default",
+                    error = error.as_str()
+                );
+                self.push_network_notice(
+                    "audio",
+                    &format!("Output device failed; trying system default: {error}"),
+                );
+                audio::start_live_playback(self.live_playback_config(None, Some(feedback_tx)))
+                    .map_err(|fallback_error| {
+                        format!("{error}; default output fallback failed: {fallback_error}")
+                    })
+            }
+            Err(error) => Err(error),
+        };
+        match playback {
             Ok(playback) => {
                 let fell_back = playback.buffer_fallback();
                 let sink = playback.sink();
                 self.playback = Some(playback);
                 self.playback_error = None;
+                self.supervisor.playback.reset();
+                self.supervisor.playback_watch = PlaybackWatch::default();
                 self.set_network_playback_sink(sink);
                 self.apply_all_user_audio_controls();
                 if fell_back
@@ -2334,6 +2901,20 @@ impl App {
         }
     }
 
+    fn live_playback_config(
+        &self,
+        output_device_id: Option<String>,
+        feedback_sender: Option<Sender<LivePlaybackFeedback>>,
+    ) -> LivePlaybackConfig {
+        LivePlaybackConfig {
+            output_device_id,
+            buffer_request: self.output_buffer_request(),
+            tuning: self.config.audio.latency.to_tuning(),
+            feedback_sender,
+            echo_control: Some(Arc::clone(&self.echo_control)),
+        }
+    }
+
     fn stop_audio(&mut self) {
         let restart_settings_preview = self.mode == theme::UiMode::Settings
             && self.allow_settings_preview_capture
@@ -2343,6 +2924,10 @@ impl App {
         self.set_network_playback_sink(None);
         self.playback.take();
         self.playback_error = None;
+        self.supervisor.capture.reset();
+        self.supervisor.playback.reset();
+        self.supervisor.capture_watch = CaptureWatch::default();
+        self.supervisor.playback_watch = PlaybackWatch::default();
         if restart_settings_preview {
             self.start_settings_preview_capture();
         }
@@ -2351,6 +2936,7 @@ impl App {
     fn stop_mic_capture(&mut self) {
         self.settings_preview_capture = false;
         self.capture.take();
+        self.supervisor.capture_watch = CaptureWatch::default();
     }
 
     fn input_buffer_request(&self) -> BufferRequest {
@@ -2534,7 +3120,20 @@ fn network_event_kind(event: &NetworkEvent) -> &'static str {
         NetworkEvent::PairingSucceeded => "pairing_succeeded",
         NetworkEvent::PairingFailed(_) => "pairing_failed",
         NetworkEvent::ReconnectScheduled { .. } => "reconnect_scheduled",
+        NetworkEvent::WorkerStopped { .. } => "worker_stopped",
         NetworkEvent::Disconnected => "disconnected",
+    }
+}
+
+fn app_network_command_kind(command: &NetworkCommand) -> &'static str {
+    match command {
+        NetworkCommand::SendChat(_) => "send_chat",
+        NetworkCommand::UploadFile(_) => "upload_file",
+        NetworkCommand::LocalVoicePacket(_) => "local_voice_packet",
+        NetworkCommand::SequencedLocalVoicePacket { .. } => "sequenced_local_voice_packet",
+        NetworkCommand::SetPlaybackSink(_) => "set_playback_sink",
+        NetworkCommand::PlaybackFeedback(_) => "playback_feedback",
+        NetworkCommand::Shutdown => "shutdown",
     }
 }
 
@@ -2610,6 +3209,78 @@ mod tests {
         let mut echo = base.clone();
         echo.echo_cancellation = !echo.echo_cancellation;
         assert_eq!(audio_restart_flags(&base, &echo), (false, false));
+    }
+
+    #[test]
+    fn recovery_state_backs_off_and_exhausts_within_window() {
+        let now = Instant::now();
+        let mut recovery = RecoveryState::default();
+
+        assert_eq!(
+            recovery.schedule(now, "first"),
+            RecoverySchedule::Scheduled(Duration::ZERO)
+        );
+        assert_eq!(recovery.take_due(now).as_deref(), Some("first"));
+        assert_eq!(
+            recovery.schedule(now + Duration::from_millis(1), "second"),
+            RecoverySchedule::Scheduled(Duration::from_secs(1))
+        );
+        assert_eq!(
+            recovery.schedule(now + Duration::from_millis(2), "ignored"),
+            RecoverySchedule::Pending
+        );
+        assert_eq!(recovery.take_due(now + Duration::from_millis(500)), None);
+        assert_eq!(
+            recovery.take_due(now + Duration::from_secs(2)).as_deref(),
+            Some("second")
+        );
+        assert_eq!(
+            recovery.schedule(now + Duration::from_secs(3), "third"),
+            RecoverySchedule::Scheduled(Duration::from_secs(2))
+        );
+        assert_eq!(
+            recovery.take_due(now + Duration::from_secs(6)).as_deref(),
+            Some("third")
+        );
+        assert_eq!(
+            recovery.schedule(now + Duration::from_secs(7), "fourth"),
+            RecoverySchedule::Exhausted
+        );
+    }
+
+    #[test]
+    fn failed_user_network_command_is_queued_for_recovery() {
+        let mut app = test_app();
+        let (tx, rx) = mpsc::channel();
+        drop(rx);
+        app.network = Some(NetworkClient::from_parts_for_test(tx));
+
+        let sent = app.send_network_command(NetworkCommand::SendChat("hello".to_string()), true);
+
+        assert!(!sent);
+        assert_eq!(app.pending_network_commands.len(), 1);
+        assert!(matches!(
+            app.pending_network_commands.front(),
+            Some(NetworkCommand::SendChat(body)) if body == "hello"
+        ));
+        assert_eq!(app.status_kind, StatusKind::Error);
+    }
+
+    #[test]
+    fn queued_user_network_commands_flush_when_worker_is_available() {
+        let mut app = test_app();
+        let (tx, rx) = mpsc::channel();
+        app.network = Some(NetworkClient::from_parts_for_test(tx));
+        app.pending_network_commands
+            .push_back(NetworkCommand::SendChat("hello".to_string()));
+
+        app.flush_pending_network_commands();
+
+        match rx.try_recv().unwrap() {
+            NetworkCommand::SendChat(body) => assert_eq!(body, "hello"),
+            other => panic!("unexpected command: {other:?}"),
+        }
+        assert!(app.pending_network_commands.is_empty());
     }
 
     #[test]
