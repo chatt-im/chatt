@@ -1,4 +1,4 @@
-use std::time::Instant;
+use std::{collections::HashSet, time::Instant};
 
 use extui_bindings::{ActionId, InputKey, LayerId, Payload, Router, RouterBuilder, parse_sequence};
 use toml_spanner::Toml;
@@ -56,6 +56,7 @@ pub enum BindCommand {
     PlaySoundboard7,
     PlaySoundboard8,
     PlaySoundboard9,
+    ToggleKeyPreview,
 }
 
 impl std::fmt::Display for BindCommand {
@@ -102,8 +103,72 @@ impl std::fmt::Display for BindCommand {
             PlaySoundboard7 => "PlaySoundboard7",
             PlaySoundboard8 => "PlaySoundboard8",
             PlaySoundboard9 => "PlaySoundboard9",
+            ToggleKeyPreview => "ToggleKeyPreview",
         })
     }
+}
+
+pub struct CommandSpec {
+    pub label: &'static str,
+    pub order: i8,
+}
+
+impl BindCommand {
+    pub fn spec(&self) -> CommandSpec {
+        use BindCommand::*;
+        const NAV: i8 = 0;
+        const ACTION: i8 = 10;
+        const DESTRUCTIVE: i8 = 90;
+        const APP: i8 = 100;
+
+        match self {
+            EnterCompose => spec("Compose", NAV),
+            EnterLog => spec("Log", NAV),
+            OpenSettings => spec("Settings", NAV),
+            CloseSettings => spec("Close", NAV),
+            SubmitMessage => spec("Send", ACTION),
+            Cancel => spec("Cancel", NAV),
+            Quit => spec("Quit", APP),
+            ScrollUp => spec("Up", NAV),
+            ScrollDown => spec("Down", NAV),
+            RoomScrollUp => spec("User Up", NAV),
+            RoomScrollDown => spec("User Down", NAV),
+            OpenSelectedUserVolume => spec("Volume", ACTION),
+            ToggleSelectedUserMute => spec("Mute User", ACTION),
+            HalfPageUp => spec("Page Up", NAV),
+            HalfPageDown => spec("Page Down", NAV),
+            Top => spec("Top", NAV),
+            Bottom => spec("Bottom", NAV),
+            CopySelection => spec("Copy", ACTION),
+            ToggleExpand => spec("Expand", ACTION),
+            ToggleMute => spec("Mute", ACTION),
+            ToggleDeafen => spec("Deafen", ACTION),
+            RefreshDevices => spec("Refresh", ACTION),
+            SaveSettings => spec("Save", ACTION),
+            Activate => spec("Select", ACTION),
+            FocusNext => spec("Next", NAV),
+            FocusPrev => spec("Previous", NAV),
+            SelectNext => spec("Down", NAV),
+            SelectPrev => spec("Up", NAV),
+            AdjustLeft => spec("Left", NAV),
+            AdjustRight => spec("Right", NAV),
+            ClearChat => spec("Clear", DESTRUCTIVE),
+            PlaySoundboard1 => spec("Sound 1", ACTION),
+            PlaySoundboard2 => spec("Sound 2", ACTION),
+            PlaySoundboard3 => spec("Sound 3", ACTION),
+            PlaySoundboard4 => spec("Sound 4", ACTION),
+            PlaySoundboard5 => spec("Sound 5", ACTION),
+            PlaySoundboard6 => spec("Sound 6", ACTION),
+            PlaySoundboard7 => spec("Sound 7", ACTION),
+            PlaySoundboard8 => spec("Sound 8", ACTION),
+            PlaySoundboard9 => spec("Sound 9", ACTION),
+            ToggleKeyPreview => spec("More", APP),
+        }
+    }
+}
+
+const fn spec(label: &'static str, order: i8) -> CommandSpec {
+    CommandSpec { label, order }
 }
 
 pub struct Actions(Vec<BindCommand>);
@@ -133,6 +198,16 @@ pub struct PendingChord {
     pub layer: LayerId,
     pub label: Option<String>,
     pub activated_at: Instant,
+}
+
+pub enum ReachableKind {
+    Action(BindCommand),
+    EnterLayer(Option<String>),
+}
+
+pub struct Reachable {
+    pub key: InputKey,
+    pub kind: ReachableKind,
 }
 
 #[derive(Debug)]
@@ -171,6 +246,34 @@ pub fn resolve(
             Resolved::Consumed
         }
     }
+}
+
+pub fn reachable(
+    bindings: &BindingRuntime,
+    base: LayerId,
+    pending: &Option<PendingChord>,
+) -> Vec<Reachable> {
+    let layer = pending.as_ref().map_or(base, |chord| chord.layer);
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+
+    for entry in bindings.router.layer_entries(layer) {
+        let key = entry.key();
+        if !seen.insert(key) {
+            continue;
+        }
+        let kind = match entry.payload() {
+            Payload::Action(id) => ReachableKind::Action(bindings.actions.get(id).clone()),
+            Payload::Layer(_) => ReachableKind::EnterLayer(
+                entry
+                    .label()
+                    .map(|id| bindings.router.label(id).to_string()),
+            ),
+        };
+        out.push(Reachable { key, kind });
+    }
+
+    out
 }
 
 impl Default for BindingRuntime {

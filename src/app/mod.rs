@@ -129,6 +129,7 @@ pub(crate) struct App {
     pub(crate) top_bar_deafen_rect: Rect,
     pub(crate) pending_clipboard: Option<String>,
     pub(crate) pending_chord: Option<PendingChord>,
+    pub(crate) key_preview_expanded: bool,
     pub(crate) event_rx: Receiver<NetworkEvent>,
     pub(crate) audio_device_refresh_tx: mpsc::Sender<AudioDeviceRefresh>,
     pub(crate) audio_device_refresh_rx: Receiver<AudioDeviceRefresh>,
@@ -381,6 +382,7 @@ impl App {
             top_bar_deafen_rect: Rect::EMPTY,
             pending_clipboard: None,
             pending_chord: None,
+            key_preview_expanded: false,
             event_rx,
             audio_device_refresh_tx,
             audio_device_refresh_rx,
@@ -1598,6 +1600,7 @@ impl App {
             PlaySoundboard7 => self.trigger_soundboard_slot(6),
             PlaySoundboard8 => self.trigger_soundboard_slot(7),
             PlaySoundboard9 => self.trigger_soundboard_slot(8),
+            ToggleKeyPreview => self.key_preview_expanded = !self.key_preview_expanded,
         }
         Action::Continue
     }
@@ -3229,6 +3232,25 @@ impl App {
         }
     }
 
+    pub(crate) fn active_binding_layer(&self) -> Option<extui_bindings::LayerId> {
+        if self.volume_dialog.is_some() {
+            return Some(bindings::DIALOG_LAYER);
+        }
+
+        match self.mode {
+            theme::UiMode::ServerSelect | theme::UiMode::ServerEdit => None,
+            theme::UiMode::Settings => Some(bindings::SETTINGS_LAYER),
+            theme::UiMode::Compose if self.chat_focus == ChatPanelFocus::Compose => {
+                if self.composer.mode() == EditorMode::Insert {
+                    Some(bindings::INSERT_LAYER)
+                } else {
+                    Some(bindings::COMPOSE_NORMAL_LAYER)
+                }
+            }
+            theme::UiMode::Compose | theme::UiMode::Log => Some(bindings::WORKSPACE_LAYER),
+        }
+    }
+
     fn set_mode(&mut self, mode: theme::UiMode) {
         match mode {
             theme::UiMode::Compose => {
@@ -4057,7 +4079,7 @@ mod tests {
     }
 
     #[test]
-    fn chat_layout_reserves_top_bar_and_bottom_minibuffer() {
+    fn chat_layout_reserves_top_bar_and_key_preview() {
         let mut app = test_app();
         app.set_mode(theme::UiMode::Compose);
         app.server_alias = "local".to_string();

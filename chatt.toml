@@ -75,6 +75,7 @@ prefer-ipv6 = true
 "C-h" = "ToggleDeafen"
 "D-j" = "FocusNext"
 "D-k" = "FocusPrev"
+"M-." = "ToggleKeyPreview"
 
 [bindings.compose-normal]
 "F2" = "OpenSettings"
@@ -83,6 +84,7 @@ prefer-ipv6 = true
 "D-j" = "FocusNext"
 "D-k" = "FocusPrev"
 "m" = "ToggleMute"
+"." = "ToggleKeyPreview"
 
 [bindings.workspace]
 "C-c" = "Quit"
@@ -110,6 +112,7 @@ prefer-ipv6 = true
 "y" = "CopySelection"
 "e" = "ToggleExpand"
 "TAB" = "ToggleExpand"
+"." = "ToggleKeyPreview"
 
 [bindings.picker]
 "C-c" = "Quit"
@@ -121,6 +124,7 @@ prefer-ipv6 = true
 "UP" = "SelectPrev"
 "ENTER" = "Activate"
 "F2" = "OpenSettings"
+"." = "ToggleKeyPreview"
 
 [bindings.form]
 "C-c" = "Quit"
@@ -153,6 +157,7 @@ prefer-ipv6 = true
 "r" = "RefreshDevices"
 "w" = "SaveSettings"
 "C-s" = "SaveSettings"
+"." = "ToggleKeyPreview"
 
 [bindings.dialog]
 "C-c" = "Quit"
@@ -162,3 +167,4 @@ prefer-ipv6 = true
 "RIGHT" = "AdjustRight"
 "DOWN" = "AdjustLeft"
 "UP" = "AdjustRight"
+"." = "ToggleKeyPreview"
