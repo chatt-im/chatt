@@ -71,6 +71,8 @@ pub(crate) enum StatusKind {
     Error,
 }
 
+const TRANSIENT_STATUS_LIFETIME: Duration = Duration::from_secs(3);
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ChatPanelFocus {
     Lobby,
@@ -108,6 +110,7 @@ pub(crate) struct App {
     pub(crate) room_name: String,
     pub(crate) status: String,
     pub(crate) status_kind: StatusKind,
+    status_expires_at: Option<Instant>,
     pub(crate) mode: theme::UiMode,
     pub(crate) chat_focus: ChatPanelFocus,
     pub(crate) focus: FocusManager,
@@ -366,6 +369,7 @@ impl App {
             room_name: "servers".to_string(),
             status: "select a server".to_string(),
             status_kind: StatusKind::Info,
+            status_expires_at: None,
             mode: theme::UiMode::ServerSelect,
             chat_focus: ChatPanelFocus::Compose,
             focus: FocusManager::new(FocusId::ServerList),
@@ -1102,10 +1106,13 @@ impl App {
     }
 
     fn copy_chat_selection(&mut self) {
-        if let Some(text) = self.chat.selected_text() {
+        let text = self
+            .chat
+            .selected_text()
+            .or_else(|| self.chat.selected_header_text(self.last_chat_width));
+        if let Some(text) = text {
             self.pending_clipboard = Some(text);
-        } else if let Some(text) = self.chat.selected_header_text(self.last_chat_width) {
-            self.pending_clipboard = Some(text);
+            self.set_transient_status("copied to clipboard");
         }
     }
 
@@ -1801,6 +1808,7 @@ impl App {
     /// run-loop iteration from [`crate::runtime`].
     pub(crate) fn tick(&mut self) {
         let now = Instant::now();
+        self.expire_status(now);
         self.supervise(now);
         self.update_lobby_talking(now);
         self.apply_pending_audio_restart();
@@ -3280,11 +3288,28 @@ impl App {
     fn set_status(&mut self, status: impl Into<String>) {
         self.status = status.into();
         self.status_kind = StatusKind::Info;
+        self.status_expires_at = None;
+    }
+
+    fn set_transient_status(&mut self, status: impl Into<String>) {
+        self.set_status(status);
+        self.status_expires_at = Some(Instant::now() + TRANSIENT_STATUS_LIFETIME);
     }
 
     fn set_error(&mut self, status: impl Into<String>) {
         self.status = status.into();
         self.status_kind = StatusKind::Error;
+        self.status_expires_at = None;
+    }
+
+    fn expire_status(&mut self, now: Instant) {
+        if self
+            .status_expires_at
+            .is_some_and(|expires_at| now >= expires_at)
+        {
+            self.status.clear();
+            self.status_expires_at = None;
+        }
     }
 
     pub(crate) fn enter_compose_insert_mode(&mut self) {
@@ -4139,6 +4164,16 @@ mod tests {
         app.process_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::empty()));
 
         assert_eq!(app.pending_clipboard.as_deref(), Some("first\nsecond"));
+        assert_eq!(app.status, "copied to clipboard");
+        assert_eq!(app.status_kind, StatusKind::Info);
+
+        let expires_at = app.status_expires_at.expect("copy status should expire");
+        app.expire_status(expires_at - Duration::from_millis(1));
+        assert_eq!(app.status, "copied to clipboard");
+
+        app.expire_status(expires_at);
+        assert!(app.status.is_empty());
+        assert_eq!(app.status_expires_at, None);
     }
 
     #[test]
