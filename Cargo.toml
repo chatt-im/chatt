@@ -28,8 +28,8 @@ toml-spanner = { version = "1.0.3", features = [
     "derive",
 ] }
 earshot = "1.1.0"
-sonora = "0.1.0"
-sonora-common-audio = "0.1.0"
+sonora.path = "crates/sonora/crates/sonora"
+sonora-common-audio.path = "crates/sonora/crates/sonora-common-audio/"
 foldhash = "0.2.0"
 hashbrown = "0.17.1"
 mimalloc = { version = "0.1.52", features = ["override"], optional = true }
@@ -67,14 +67,7 @@ members = [
     "crates/opus-codec",
     "crates/nnnoiseless",
 ]
-exclude = ["crates/cpal"]
-
-[patch.crates-io]
-# Includes fix(aec3): prevent panic when shrinking adaptive FIR filter (#15).
-sonora-aec3 = { git = "https://github.com/dignifiedquire/sonora", rev = "dec6a074725e82ef371a024fc45236d60f0acf52" }
-sonora-common-audio = { git = "https://github.com/dignifiedquire/sonora", rev = "dec6a074725e82ef371a024fc45236d60f0acf52" }
-sonora-fft = { git = "https://github.com/dignifiedquire/sonora", rev = "dec6a074725e82ef371a024fc45236d60f0acf52" }
-sonora-simd = { git = "https://github.com/dignifiedquire/sonora", rev = "dec6a074725e82ef371a024fc45236d60f0acf52" }
+exclude = ["crates/cpal", "crates/sonora"]
 
 [profile.dev]
 debug = 0

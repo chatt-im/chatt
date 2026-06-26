@@ -1,0 +1,17 @@
+[package]
+name = "sonora-sys"
+version = "0.1.0"
+description = "C++ FFI bindings to WebRTC Audio Processing for comparison testing"
+publish = false
+edition = "2024"
+rust-version = "1.91"
+license = "BSD-3-Clause"
+repository = "https://github.com/dignifiedquire/sonora"
+readme = "README.md"
+
+[dependencies]
+cxx = "1.0"
+
+[build-dependencies]
+cxx-build = "1.0"
+pkg-config = "0.3"
