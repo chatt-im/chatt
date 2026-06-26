@@ -15,6 +15,7 @@ mod imp {
         net::{UnixListener, UnixStream},
     };
 
+    use crate::app::EventSender;
     use crate::client_net::{CommandSender, NetworkCommand};
 
     pub const SOCKET_ENV: &str = "CHATT_CONTROL_SOCKET";
@@ -95,7 +96,7 @@ mod imp {
     }
 
     impl ControlSocket {
-        pub fn spawn(commands: CommandSender, voice: Sender<VoiceCommand>) -> Result<Self, String> {
+        pub fn spawn(commands: CommandSender, voice: EventSender) -> Result<Self, String> {
             let config = socket_config()?;
             Self::spawn_with_config(config, commands, voice)
         }
@@ -104,7 +105,7 @@ mod imp {
         fn spawn_at_path(
             path: PathBuf,
             commands: CommandSender,
-            voice: Sender<VoiceCommand>,
+            voice: EventSender,
         ) -> Result<Self, String> {
             Self::spawn_with_config(
                 SocketConfig {
@@ -119,7 +120,7 @@ mod imp {
         fn spawn_with_config(
             config: SocketConfig,
             commands: CommandSender,
-            voice: Sender<VoiceCommand>,
+            voice: EventSender,
         ) -> Result<Self, String> {
             prepare_socket_parent(&config)?;
             let listener = bind_listener(&config.path)?;
@@ -378,11 +379,7 @@ mod imp {
         }
     }
 
-    fn handle_connection(
-        stream: &mut UnixStream,
-        commands: &CommandSender,
-        voice: &Sender<VoiceCommand>,
-    ) {
+    fn handle_connection(stream: &mut UnixStream, commands: &CommandSender, voice: &EventSender) {
         let _ = stream.set_read_timeout(Some(STREAM_TIMEOUT));
         let _ = stream.set_write_timeout(Some(STREAM_TIMEOUT));
         let response = match read_request(stream) {
@@ -601,7 +598,7 @@ mod imp {
             let socket = ControlSocket::spawn_at_path(
                 socket_path.clone(),
                 CommandSender::for_test(tx),
-                voice_tx,
+                EventSender(voice_tx),
             )
             .unwrap();
 
@@ -629,15 +626,18 @@ mod imp {
             let socket = ControlSocket::spawn_at_path(
                 socket_path.clone(),
                 CommandSender::for_test(tx),
-                voice_tx,
+                EventSender(voice_tx),
             )
             .unwrap();
 
             let response = send_voice_to_path(&socket_path, VoiceCommand::SetDeafen(true)).unwrap();
-            let command = voice_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            let event = voice_rx.recv_timeout(Duration::from_secs(2)).unwrap();
 
             assert_eq!(response, "deafen set true requested");
-            assert_eq!(command, VoiceCommand::SetDeafen(true));
+            assert!(matches!(
+                event,
+                crate::app::AppEvent::Voice(VoiceCommand::SetDeafen(true))
+            ));
 
             drop(socket);
             assert!(!socket_path.exists());
@@ -674,8 +674,9 @@ mod imp {
 
 #[cfg(not(unix))]
 mod imp {
-    use std::{path::Path, sync::mpsc::Sender};
+    use std::path::Path;
 
+    use crate::app::EventSender;
     use crate::client_net::{CommandSender, NetworkCommand};
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -689,10 +690,7 @@ mod imp {
     pub struct ControlSocket;
 
     impl ControlSocket {
-        pub fn spawn(
-            _commands: CommandSender,
-            _voice: Sender<VoiceCommand>,
-        ) -> Result<Self, String> {
+        pub fn spawn(_commands: CommandSender, _voice: EventSender) -> Result<Self, String> {
             Err("chatt local control sockets are only supported on Unix".to_string())
         }
 

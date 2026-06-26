@@ -55,10 +55,7 @@ pub(crate) fn run_app(
     let stdin = std::io::stdin();
 
     loop {
-        app.drain_network_events();
-        app.drain_audio_device_refreshes();
-        app.drain_soundboard_events();
-        app.drain_voice_commands();
+        app.drain_events();
         app.tick();
         let now_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
