@@ -333,12 +333,14 @@ pub fn start_recording(config: RecordingConfig) -> Result<Recording, String> {
 
     let stats = AudioStats::new();
     let (sender, receiver) = sync_channel(CALLBACK_QUEUE_CAPACITY);
+    let (recycle_tx, recycle_rx) = sync_channel(CALLBACK_QUEUE_CAPACITY);
     let worker_stats = stats.clone();
     let worker = thread::Builder::new()
         .name("chatt-audio-record-enc".to_string())
         .spawn(move || {
             run_encoder_worker(
                 receiver,
+                recycle_tx,
                 writer,
                 encoder,
                 config.denoise,
@@ -355,6 +357,7 @@ pub fn start_recording(config: RecordingConfig) -> Result<Recording, String> {
             selection.stream_config,
             usize::from(selection.supported_config.channels()),
             sender,
+            recycle_rx,
             stats.clone(),
             None,
         )
@@ -400,8 +403,9 @@ where
     // after a stream builds so a fallback attempt uses a fresh channel. Audio must never
     // die because a buffer preference was rejected.
     let observer = Arc::new(AudioCallbackBufferObserver::new("live_capture"));
-    let build = |selection: &ConfigSelection| -> Result<(Stream, Receiver<Vec<f32>>), String> {
+    let build = |selection: &ConfigSelection| -> Result<(Stream, Receiver<Vec<f32>>, SyncSender<Vec<f32>>), String> {
         let (sender, receiver) = sync_channel(CALLBACK_QUEUE_CAPACITY);
+        let (recycle_tx, recycle_rx) = sync_channel(CALLBACK_QUEUE_CAPACITY);
         let stream = with_audio_backend_stderr_suppressed(|| {
             build_input_stream(
                 &device,
@@ -409,14 +413,15 @@ where
                 selection.stream_config.clone(),
                 usize::from(selection.supported_config.channels()),
                 sender,
+                recycle_rx,
                 stats.clone(),
                 Some(Arc::clone(&observer)),
             )
         })?;
-        Ok((stream, receiver))
+        Ok((stream, receiver, recycle_tx))
     };
-    let (stream, receiver, selection, buffer_fallback) = match build(&selection) {
-        Ok((stream, receiver)) => (stream, receiver, selection, false),
+    let (stream, receiver, recycle_tx, selection, buffer_fallback) = match build(&selection) {
+        Ok((stream, receiver, recycle_tx)) => (stream, receiver, recycle_tx, selection, false),
         Err(error) if !matches!(config.buffer_request, BufferRequest::Default) => {
             kvlog::warn!(
                 "live capture buffer fallback",
@@ -427,8 +432,8 @@ where
             let fallback = with_audio_backend_stderr_suppressed(|| {
                 select_input_config(&device, BufferRequest::Default)
             })?;
-            let (stream, receiver) = build(&fallback)?;
-            (stream, receiver, fallback, true)
+            let (stream, receiver, recycle_tx) = build(&fallback)?;
+            (stream, receiver, recycle_tx, fallback, true)
         }
         Err(error) => return Err(error),
     };
@@ -465,6 +470,7 @@ where
         .spawn(move || {
             run_live_encoder_worker(
                 receiver,
+                recycle_tx,
                 encoder,
                 config.denoise,
                 worker_max_amplification,
