@@ -2,7 +2,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc,
-        atomic::{AtomicU32, Ordering},
+        atomic::{AtomicU32, AtomicUsize, Ordering},
         mpsc::{Receiver, Sender, SyncSender, sync_channel},
     },
     thread::{self, JoinHandle},
@@ -29,8 +29,8 @@ use crate::{
         },
         errors::format_file_error,
         playback::{
-            LivePlaybackMixer, LivePlaybackMixerEvent, LivePlaybackQueueReport,
-            LivePlaybackSharedSnapshot, SpscSwapQueue, run_live_decoder_worker,
+            LivePlaybackMixer, LivePlaybackMixerEvent, LivePlaybackSharedSnapshot, SpscSwapQueue,
+            run_live_decoder_worker,
         },
         shared::{
             AudioStats, BufferRequest, CALLBACK_QUEUE_CAPACITY, CHANNELS, DenoiseConfig,
@@ -547,9 +547,9 @@ pub fn start_live_playback(config: LivePlaybackConfig) -> Result<LivePlayback, S
     let mixer_events = Arc::new(SpscSwapQueue::<LivePlaybackMixerEvent>::with_capacity(
         LIVE_PLAYBACK_COMMAND_CAPACITY,
     ));
-    let queue_reports = Arc::new(SpscSwapQueue::<LivePlaybackQueueReport>::with_capacity(
-        LIVE_PLAYBACK_COMMAND_CAPACITY,
-    ));
+    // Consumer publishes its callback block here, the producer reads it to keep
+    // the ring deep enough for an oversized callback.
+    let block_hint = Arc::new(AtomicUsize::new(FRAME_SAMPLES));
     let shared_snapshot = Arc::new(LivePlaybackSharedSnapshot::new(
         LivePlaybackMixer::with_live_capacity(config.tuning).snapshot(),
     ));
@@ -560,7 +560,8 @@ pub fn start_live_playback(config: LivePlaybackConfig) -> Result<LivePlayback, S
     let echo_control = config.echo_control.clone();
     let observer = Arc::new(AudioCallbackBufferObserver::new("live_playback"));
     let build = |selection: &ConfigSelection| -> Result<Stream, String> {
-        let mixer = LivePlaybackMixer::with_live_capacity(config.tuning);
+        let mut mixer = LivePlaybackMixer::with_live_capacity(config.tuning);
+        mixer.set_block_hint(Arc::clone(&block_hint));
         with_audio_backend_stderr_suppressed(|| {
             build_live_output_stream(
                 &device,
@@ -569,7 +570,6 @@ pub fn start_live_playback(config: LivePlaybackConfig) -> Result<LivePlayback, S
                 usize::from(selection.supported_config.channels()),
                 mixer,
                 Arc::clone(&mixer_events),
-                Arc::clone(&queue_reports),
                 Arc::clone(&shared_snapshot),
                 echo_control.clone(),
                 Some(Arc::clone(&observer)),
@@ -610,7 +610,8 @@ pub fn start_live_playback(config: LivePlaybackConfig) -> Result<LivePlayback, S
     kvlog::info!("live playback started", device = device_name.as_str());
     let (sender, receiver) = sync_channel(LIVE_PLAYBACK_COMMAND_CAPACITY);
     let worker_mixer_events = Arc::clone(&mixer_events);
-    let worker_queue_reports = Arc::clone(&queue_reports);
+    let worker_shared_snapshot = Arc::clone(&shared_snapshot);
+    let worker_block_hint = Arc::clone(&block_hint);
     let feedback_sender = config.feedback_sender;
     let worker = thread::Builder::new()
         .name("chatt-audio-live-dec".to_string())
@@ -618,9 +619,10 @@ pub fn start_live_playback(config: LivePlaybackConfig) -> Result<LivePlayback, S
             run_live_decoder_worker(
                 receiver,
                 worker_mixer_events,
-                worker_queue_reports,
                 config.tuning,
                 feedback_sender,
+                worker_shared_snapshot,
+                worker_block_hint,
             )
         })
         .map_err(|error| format!("failed to spawn chatt-audio-live-dec: {error}"))?;
@@ -706,11 +708,19 @@ mod tests {
         let mixer_events = Arc::new(SpscSwapQueue::<LivePlaybackMixerEvent>::with_capacity(
             LIVE_PLAYBACK_COMMAND_CAPACITY,
         ));
-        let queue_reports = Arc::new(SpscSwapQueue::<LivePlaybackQueueReport>::with_capacity(
-            LIVE_PLAYBACK_COMMAND_CAPACITY,
+        let shared_snapshot = Arc::new(LivePlaybackSharedSnapshot::new(
+            LivePlaybackMixer::new().snapshot(),
         ));
+        let block_hint = Arc::new(AtomicUsize::new(FRAME_SAMPLES));
         let worker = thread::spawn(move || {
-            run_live_decoder_worker(receiver, mixer_events, queue_reports, test_tuning(), None);
+            run_live_decoder_worker(
+                receiver,
+                mixer_events,
+                test_tuning(),
+                None,
+                shared_snapshot,
+                block_hint,
+            );
         });
 
         sender.send(LivePlaybackCommand::Shutdown).unwrap();

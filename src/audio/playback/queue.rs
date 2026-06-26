@@ -132,6 +132,17 @@ impl MonoSampleQueue {
         }
     }
 
+    /// Contiguous run of ready samples at the front of the queue, i.e. the
+    /// current frame's unread tail. Lets the producer bulk-copy playout audio
+    /// into the ring instead of popping one sample at a time. Empty when the
+    /// queue is empty.
+    pub(crate) fn front_run(&self) -> &[f32] {
+        match self.frames.front() {
+            Some(frame) => &frame.samples[frame.offset..],
+            None => &[],
+        }
+    }
+
     pub(crate) fn frames(&self) -> usize {
         debug_assert_eq!(
             self.total,

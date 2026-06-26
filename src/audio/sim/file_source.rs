@@ -526,6 +526,7 @@ mod tests {
         };
         let mixer = Arc::new(Mutex::new(LivePlaybackMixer::with_tuning(config.tuning)));
         let mut decode_streams = LiveDecodeStreams::new(config.tuning);
+        decode_streams.set_block_samples(LIVE_OPUS_FRAME_SAMPLES);
         let mut trace = None;
         let start = Instant::now();
         let frame_duration = Duration::from_secs_f64(FRAME_SAMPLES as f64 / SAMPLE_RATE as f64);
@@ -598,25 +599,15 @@ mod tests {
                 }
             }
 
-            let before_recovery_frames = mixer
-                .lock()
-                .map(|mixer| {
-                    mixer
-                        .stats
-                        .dred_recoveries
-                        .saturating_add(mixer.stats.plc_fallbacks)
-                })
-                .unwrap_or_default();
+            let before_recovery_frames = decode_streams
+                .stats()
+                .dred_recoveries
+                .saturating_add(decode_streams.stats().plc_fallbacks);
             decode_streams.drain_into_mixer_with_trace(&mixer, now, start, &mut trace, None);
-            let after_recovery_frames = mixer
-                .lock()
-                .map(|mixer| {
-                    mixer
-                        .stats
-                        .dred_recoveries
-                        .saturating_add(mixer.stats.plc_fallbacks)
-                })
-                .unwrap_or(before_recovery_frames);
+            let after_recovery_frames = decode_streams
+                .stats()
+                .dred_recoveries
+                .saturating_add(decode_streams.stats().plc_fallbacks);
             sim_report.missing_frames = sim_report
                 .missing_frames
                 .saturating_add(after_recovery_frames.saturating_sub(before_recovery_frames));

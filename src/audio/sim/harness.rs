@@ -399,6 +399,9 @@ pub(crate) fn run_live_audio_simulation_inner(
     let start = Instant::now();
     let frame_duration_secs = FRAME_SAMPLES as f64 / SAMPLE_RATE as f64;
     let output_block_samples = config.output_block_samples.max(1);
+    // Tell the producer the consumer's callback block so the ring is kept deep
+    // enough to serve a whole callback.
+    decode_streams.set_block_samples(output_block_samples);
     let output_block_secs = output_block_samples as f64 / SAMPLE_RATE as f64;
     let total_callbacks = (config.duration.as_secs_f64() / output_block_secs)
         .ceil()
@@ -758,25 +761,15 @@ pub(crate) fn drain_simulation_network_and_playback(
         let stream_id = (stream_index + 1) as u32;
         state.deliver_ready(now, trace_start, stream_id, decode_streams, report, trace);
     }
-    let before_recovery_frames = mixer
-        .lock()
-        .map(|mixer| {
-            mixer
-                .stats
-                .dred_recoveries
-                .saturating_add(mixer.stats.plc_fallbacks)
-        })
-        .unwrap_or_default();
+    let before_recovery_frames = decode_streams
+        .stats()
+        .dred_recoveries
+        .saturating_add(decode_streams.stats().plc_fallbacks);
     decode_streams.drain_into_mixer_with_trace(mixer, now, trace_start, trace, None);
-    let after_recovery_frames = mixer
-        .lock()
-        .map(|mixer| {
-            mixer
-                .stats
-                .dred_recoveries
-                .saturating_add(mixer.stats.plc_fallbacks)
-        })
-        .unwrap_or(before_recovery_frames);
+    let after_recovery_frames = decode_streams
+        .stats()
+        .dred_recoveries
+        .saturating_add(decode_streams.stats().plc_fallbacks);
     report.missing_frames = report
         .missing_frames
         .saturating_add(after_recovery_frames.saturating_sub(before_recovery_frames));

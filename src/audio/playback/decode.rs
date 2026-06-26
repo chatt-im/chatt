@@ -1,8 +1,8 @@
 use std::{
-    cell::{Cell, RefCell},
-    mem,
+    cell::RefCell,
     sync::{
         Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
         mpsc::{Receiver, RecvTimeoutError, Sender},
     },
     time::Instant,
@@ -15,15 +15,17 @@ use crate::{
     audio::{
         lifecycle::LivePlaybackCommand,
         playback::{
-            AdaptivePlaybackStream, LiveJitterStream, LivePlaybackFeedbackState, LivePlaybackMixer,
-            LivePlaybackMixerEvent, LivePlaybackQueueReport, SpscSwapQueue,
+            LiveJitterStream, LivePlaybackFeedbackState, LivePlaybackMixer, LivePlaybackMixerEvent,
+            LivePlaybackMixerStats, LivePlaybackSharedSnapshot, RingPlaybackProducer,
+            SpscSwapQueue,
         },
         shared::{
-            DecodedFrameSource, LIVE_OPUS_FRAME_SAMPLES, LIVE_PACKET_FLAG_OPUS_RESET,
-            LIVE_PACKET_FLAG_SILENCE_RESUME, LIVE_PLAYBACK_DRAIN_INTERVAL,
-            LIVE_PLAYBACK_DRED_MAX_SAMPLES, LiveAudioTraceWriter, LiveAudioTuning,
-            LivePlaybackFeedback, MAX_OPUS_DECODE_SAMPLES, PlayoutDelay, RemoteVoicePacket,
-            VoicePayload, sequence_distance_forward, trace_decode_output, trace_decoder_reset,
+            DecodedFrameSource, FRAME_SAMPLES, LIVE_OPUS_FRAME_SAMPLES,
+            LIVE_PACKET_FLAG_OPUS_RESET, LIVE_PACKET_FLAG_SILENCE_RESUME,
+            LIVE_PLAYBACK_DRAIN_INTERVAL, LIVE_PLAYBACK_DRED_MAX_SAMPLES, LiveAudioTraceWriter,
+            LiveAudioTuning, LivePlaybackFeedback, LivePlaybackSnapshot, MAX_OPUS_DECODE_SAMPLES,
+            PlayoutDelay, RemoteVoicePacket, VoicePayload, duration_to_ms, samples_for_duration,
+            samples_to_ms, sequence_distance_forward, trace_decode_output, trace_decoder_reset,
             trace_dred_parse, trace_dred_skip, trace_fast_forward, trace_jitter_item,
             trace_mixer_queue,
         },
@@ -31,18 +33,26 @@ use crate::{
     network::{AudioPacketRef, InsertOutcome, PlayoutItem},
 };
 
+/// One decoded-and-time-scaled action drained from a stream's jitter buffer,
+/// collected so the producer can be mutated after `drain_ready` releases its
+/// borrows.
+enum DrainAction {
+    Samples(Vec<f32>, DecodedFrameSource, Option<PlayoutDelay>),
+    Discontinuity,
+    SenderSilence,
+}
+
 pub(crate) fn run_live_decoder_worker(
     receiver: Receiver<LivePlaybackCommand>,
     mixer_events: Arc<SpscSwapQueue<LivePlaybackMixerEvent>>,
-    queue_reports: Arc<SpscSwapQueue<LivePlaybackQueueReport>>,
     tuning: LiveAudioTuning,
     feedback_sender: Option<Sender<LivePlaybackFeedback>>,
+    shared_snapshot: Arc<LivePlaybackSharedSnapshot>,
+    block_hint: Arc<AtomicUsize>,
 ) {
     let mut streams = LiveDecodeStreams::new(tuning);
 
     loop {
-        let now = Instant::now();
-        streams.drain_queue_reports(&queue_reports, now, feedback_sender.as_ref());
         match receiver.recv_timeout(LIVE_PLAYBACK_DRAIN_INTERVAL) {
             Ok(command) => {
                 if !handle_live_playback_command(command, &mut streams, &mixer_events) {
@@ -59,8 +69,9 @@ pub(crate) fn run_live_decoder_worker(
         }
 
         let now = Instant::now();
-        streams.drain_into_mixer_events(&mixer_events, now);
-        streams.drain_queue_reports(&queue_reports, now, feedback_sender.as_ref());
+        streams.set_block_samples(block_hint.load(Ordering::Relaxed));
+        streams.drain_into_mixer_events(&mixer_events, now, feedback_sender.as_ref());
+        shared_snapshot.update_stream_snapshot(streams.snapshot_at(now));
     }
 }
 
@@ -114,10 +125,86 @@ fn push_mixer_event(
     false
 }
 
+/// Decodes a stream's ready jitter items into its producer, pumps the producer
+/// into the ring, and closes the feedback window. Takes the stream and producer
+/// as disjoint borrows so `drain_ready` (which borrows the decoder) and the
+/// producer can be mutated in the same pass.
+#[allow(clippy::too_many_arguments)]
+fn drain_pump_stream(
+    stream: &mut LiveDecodeStream,
+    producer: &mut RingPlaybackProducer,
+    stats: &mut LivePlaybackMixerStats,
+    tuning: &LiveAudioTuning,
+    stream_id: u32,
+    now: Instant,
+    trace_start: Instant,
+    trace: &mut Option<LiveAudioTraceWriter>,
+    block: usize,
+    feedback_sender: Option<&Sender<LivePlaybackFeedback>>,
+) {
+    let recommended = stream.feedback.recommended_target(tuning);
+    producer.apply_recommended_target(recommended, now);
+
+    let actions = RefCell::new(Vec::new());
+    stream.drain_ready(
+        now,
+        trace_start,
+        stream_id,
+        trace,
+        |_, samples, source, playout_delay| {
+            actions.borrow_mut().push(DrainAction::Samples(
+                samples.to_vec(),
+                source,
+                playout_delay,
+            ));
+        },
+        || actions.borrow_mut().push(DrainAction::Discontinuity),
+        || actions.borrow_mut().push(DrainAction::SenderSilence),
+    );
+
+    let mut sender_silence = false;
+    for action in actions.into_inner() {
+        match action {
+            DrainAction::Samples(samples, source, playout_delay) => {
+                trace_mixer_queue(
+                    trace,
+                    trace_start,
+                    now,
+                    stream_id,
+                    source,
+                    &samples,
+                    samples_to_ms(producer.buffered_samples() + samples.len()),
+                );
+                producer.queue_samples_owned(samples, source, playout_delay, now, stats);
+            }
+            DrainAction::Discontinuity => producer.skip_speech_gap_backlog(now, stats),
+            DrainAction::SenderSilence => {
+                producer.mark_sender_silent(now, stats);
+                sender_silence = true;
+            }
+        }
+    }
+
+    producer.pump(block, now, stats);
+
+    let buffered_ms = samples_to_ms(producer.buffered_samples());
+    if sender_silence {
+        stream.flush_sender_silence_feedback(stream_id, now, buffered_ms, feedback_sender);
+    } else {
+        stream.flush_feedback(stream_id, now, buffered_ms, feedback_sender);
+    }
+}
+
 pub(crate) struct LiveDecodeStreams {
     tuning: LiveAudioTuning,
     streams: HashMap<u32, LiveDecodeStream>,
+    producers: HashMap<u32, RingPlaybackProducer>,
+    /// Streams whose `EnsureStream` event the consumer already has.
     mixer_streams: HashSet<u32>,
+    stats: LivePlaybackMixerStats,
+    /// Consumer callback block, used to keep the ring deep enough for an
+    /// oversized callback. Defaults to one frame.
+    block_samples: usize,
     dropped_mixer_events: u64,
 }
 
@@ -126,9 +213,44 @@ impl LiveDecodeStreams {
         Self {
             tuning,
             streams: HashMap::new(),
+            producers: HashMap::new(),
             mixer_streams: HashSet::new(),
+            stats: LivePlaybackMixerStats::default(),
+            block_samples: FRAME_SAMPLES,
             dropped_mixer_events: 0,
         }
+    }
+
+    pub(crate) fn set_block_samples(&mut self, block_samples: usize) {
+        self.block_samples = block_samples.max(FRAME_SAMPLES);
+    }
+
+    pub(crate) fn stats(&self) -> &LivePlaybackMixerStats {
+        &self.stats
+    }
+
+    /// Ensures both the decode stream and its producer exist for `stream_id`.
+    fn ensure_entry(&mut self, stream_id: u32) -> bool {
+        if self.streams.contains_key(&stream_id) {
+            return true;
+        }
+        let stream = match LiveDecodeStream::new(self.tuning) {
+            Ok(stream) => stream,
+            Err(error) => {
+                eprintln!("failed to create live opus decoder: {error}");
+                return false;
+            }
+        };
+        let producer = match RingPlaybackProducer::new(self.tuning) {
+            Ok(producer) => producer,
+            Err(error) => {
+                eprintln!("failed to create live playback producer: {error}");
+                return false;
+            }
+        };
+        self.streams.insert(stream_id, stream);
+        self.producers.insert(stream_id, producer);
+        true
     }
 
     pub(crate) fn insert_packet(
@@ -136,16 +258,10 @@ impl LiveDecodeStreams {
         packet: RemoteVoicePacket,
         now: Instant,
     ) -> Option<InsertOutcome> {
-        let stream = match self.streams.entry(packet.stream_id) {
-            hashbrown::hash_map::Entry::Occupied(entry) => entry.into_mut(),
-            hashbrown::hash_map::Entry::Vacant(entry) => match LiveDecodeStream::new(self.tuning) {
-                Ok(stream) => entry.insert(stream),
-                Err(error) => {
-                    eprintln!("failed to create live opus decoder: {error}");
-                    return None;
-                }
-            },
-        };
+        if !self.ensure_entry(packet.stream_id) {
+            return None;
+        }
+        let stream = self.streams.get_mut(&packet.stream_id)?;
         if packet.payload.is_silence() {
             stream.observe_sender_silence(packet.sequence, now);
             return Some(InsertOutcome::Accepted);
@@ -160,9 +276,56 @@ impl LiveDecodeStreams {
 
     pub(crate) fn remove_stream(&mut self, stream_id: u32) {
         self.streams.remove(&stream_id);
+        self.producers.remove(&stream_id);
         self.mixer_streams.remove(&stream_id);
     }
 
+    /// Producer step on the real worker: decode, pump every stream into its
+    /// ring, and emit `EnsureStream` for any new stream so the consumer learns
+    /// the ring handle.
+    pub(crate) fn drain_into_mixer_events(
+        &mut self,
+        mixer_events: &SpscSwapQueue<LivePlaybackMixerEvent>,
+        now: Instant,
+        feedback_sender: Option<&Sender<LivePlaybackFeedback>>,
+    ) {
+        let tuning = self.tuning;
+        let block = self.block_samples;
+        let producers = &mut self.producers;
+        let mixer_streams = &mut self.mixer_streams;
+        let dropped = &mut self.dropped_mixer_events;
+        let stats = &mut self.stats;
+        for (stream_id, stream) in &mut self.streams {
+            let Some(producer) = producers.get_mut(stream_id) else {
+                continue;
+            };
+            if mixer_streams.insert(*stream_id) {
+                let event = LivePlaybackMixerEvent::EnsureStream {
+                    stream_id: *stream_id,
+                    ring: producer.ring(),
+                };
+                if !push_mixer_event(mixer_events, dropped, event) {
+                    mixer_streams.remove(stream_id);
+                }
+            }
+            drain_pump_stream(
+                stream,
+                producer,
+                stats,
+                &tuning,
+                *stream_id,
+                now,
+                now,
+                &mut None,
+                block,
+                feedback_sender,
+            );
+        }
+    }
+
+    /// Producer step used by the single-threaded simulation harness: registers
+    /// each stream's ring with the shared consumer mixer, pumps, and stashes the
+    /// snapshot so `mixer.snapshot_at` keeps reporting depth.
     pub(crate) fn drain_into_mixer(
         &mut self,
         mixer: &Arc<Mutex<LivePlaybackMixer>>,
@@ -173,113 +336,6 @@ impl LiveDecodeStreams {
         self.drain_into_mixer_with_trace(mixer, now, now, &mut trace, feedback_sender);
     }
 
-    pub(crate) fn drain_into_mixer_events(
-        &mut self,
-        mixer_events: &SpscSwapQueue<LivePlaybackMixerEvent>,
-        now: Instant,
-    ) {
-        let dropped_mixer_events = &mut self.dropped_mixer_events;
-        let mixer_streams = &mut self.mixer_streams;
-        for (stream_id, stream) in &mut self.streams {
-            let mut trace = None;
-            let recommended_target = stream.feedback.recommended_target(&stream.tuning);
-            let events = RefCell::new(Vec::new());
-            if mixer_streams.insert(*stream_id) {
-                match AdaptivePlaybackStream::new(stream.tuning) {
-                    Ok(stream) => {
-                        events
-                            .borrow_mut()
-                            .push(LivePlaybackMixerEvent::EnsureStream {
-                                stream_id: *stream_id,
-                                stream: Box::new(stream),
-                            });
-                    }
-                    Err(error) => {
-                        mixer_streams.remove(stream_id);
-                        eprintln!("failed to create live playback stream: {error}");
-                    }
-                }
-            }
-            stream.drain_ready(
-                now,
-                now,
-                *stream_id,
-                &mut trace,
-                |_, samples, source, playout_delay| {
-                    events
-                        .borrow_mut()
-                        .push(LivePlaybackMixerEvent::QueueSamples {
-                            stream_id: *stream_id,
-                            samples: samples.to_vec(),
-                            source,
-                            playout_delay,
-                            recommended_target,
-                        });
-                },
-                || {
-                    events
-                        .borrow_mut()
-                        .push(LivePlaybackMixerEvent::NoteStreamDiscontinuity {
-                            stream_id: *stream_id,
-                        });
-                },
-                || {
-                    events
-                        .borrow_mut()
-                        .push(LivePlaybackMixerEvent::NoteSenderSilence {
-                            stream_id: *stream_id,
-                        });
-                },
-            );
-            for event in events.into_inner() {
-                let ensured_stream_id = match &event {
-                    LivePlaybackMixerEvent::EnsureStream { stream_id, .. } => Some(*stream_id),
-                    _ => None,
-                };
-                if !push_mixer_event(mixer_events, dropped_mixer_events, event)
-                    && let Some(stream_id) = ensured_stream_id
-                {
-                    mixer_streams.remove(&stream_id);
-                }
-            }
-        }
-    }
-
-    pub(crate) fn drain_queue_reports(
-        &mut self,
-        queue_reports: &SpscSwapQueue<LivePlaybackQueueReport>,
-        now: Instant,
-        feedback_sender: Option<&Sender<LivePlaybackFeedback>>,
-    ) {
-        let mut report = LivePlaybackQueueReport::default();
-        while queue_reports.remove(&mut report) {
-            match mem::take(&mut report) {
-                LivePlaybackQueueReport::Empty => {}
-                LivePlaybackQueueReport::Queued {
-                    stream_id,
-                    max_queue_ms,
-                } => {
-                    if let Some(stream) = self.streams.get_mut(&stream_id) {
-                        stream.flush_feedback(stream_id, now, max_queue_ms, feedback_sender);
-                    }
-                }
-                LivePlaybackQueueReport::SenderSilence {
-                    stream_id,
-                    queue_ms,
-                } => {
-                    if let Some(stream) = self.streams.get_mut(&stream_id) {
-                        stream.flush_sender_silence_feedback(
-                            stream_id,
-                            now,
-                            queue_ms,
-                            feedback_sender,
-                        );
-                    }
-                }
-            }
-        }
-    }
-
     pub(crate) fn drain_into_mixer_with_trace(
         &mut self,
         mixer: &Arc<Mutex<LivePlaybackMixer>>,
@@ -288,59 +344,87 @@ impl LiveDecodeStreams {
         trace: &mut Option<LiveAudioTraceWriter>,
         feedback_sender: Option<&Sender<LivePlaybackFeedback>>,
     ) {
+        let tuning = self.tuning;
+        let block = self.block_samples;
+        let producers = &mut self.producers;
+        let mixer_streams = &mut self.mixer_streams;
+        let stats = &mut self.stats;
         for (stream_id, stream) in &mut self.streams {
-            let mut max_stream_queue_ms = 0;
-            let sender_silence_queue_ms = Cell::new(None);
-            let recommended_target = stream.feedback.recommended_target(&stream.tuning);
-            stream.drain_ready(
+            let Some(producer) = producers.get_mut(stream_id) else {
+                continue;
+            };
+            if mixer_streams.insert(*stream_id)
+                && let Ok(mut mixer) = mixer.lock()
+            {
+                mixer.ensure_stream(*stream_id, producer.ring());
+            }
+            drain_pump_stream(
+                stream,
+                producer,
+                stats,
+                &tuning,
+                *stream_id,
                 now,
                 trace_start,
-                *stream_id,
                 trace,
-                |trace, samples, source, playout_delay| {
-                    sender_silence_queue_ms.set(None);
-                    if let Ok(mut mixer) = mixer.lock() {
-                        mixer.queue_stream_samples_with_delay(
-                            *stream_id,
-                            samples,
-                            source,
-                            playout_delay,
-                            now,
-                        );
-                        mixer.note_stream_recommended_target(*stream_id, recommended_target, now);
-                        max_stream_queue_ms =
-                            max_stream_queue_ms.max(mixer.stream_queue_ms(*stream_id));
-                        trace_mixer_queue(
-                            trace,
-                            trace_start,
-                            now,
-                            *stream_id,
-                            source,
-                            samples,
-                            mixer.snapshot_at(now).max_queue_ms,
-                        );
-                    }
-                },
-                || {
-                    if let Ok(mut mixer) = mixer.lock() {
-                        mixer.note_stream_discontinuity(*stream_id, now);
-                    }
-                },
-                || {
-                    if let Ok(mut mixer) = mixer.lock() {
-                        mixer.note_stream_sender_silence(*stream_id, now);
-                        sender_silence_queue_ms.set(Some(mixer.stream_queue_ms(*stream_id)));
-                    }
-                },
+                block,
+                feedback_sender,
             );
-            if let Some(queue_ms) = sender_silence_queue_ms.get() {
-                stream.flush_sender_silence_feedback(*stream_id, now, queue_ms, feedback_sender);
-            } else {
-                stream.flush_feedback(*stream_id, now, max_stream_queue_ms, feedback_sender);
-            }
         }
+        let snapshot = self.snapshot_at(now);
         if let Ok(mut mixer) = mixer.lock() {
-            mixer.log_playback_diagnostics_if_due(now);
+            mixer.set_snapshot(snapshot);
+        }
+    }
+
+    /// Aggregates a diagnostics snapshot across every active stream. Backend
+    /// error fields are left empty; the consumer fills them in when this
+    /// snapshot is merged.
+    pub(crate) fn snapshot_at(&self, now: Instant) -> LivePlaybackSnapshot {
+        let queued_samples: usize = self.producers.values().map(|p| p.buffered_samples()).sum();
+        let max_queue_samples = self
+            .producers
+            .values()
+            .map(|p| p.buffered_samples())
+            .max()
+            .unwrap_or_default();
+        let max_playout_delay_samples = self
+            .producers
+            .values()
+            .filter_map(|p| p.playout_delay_samples(now))
+            .max()
+            .unwrap_or_default();
+        let adaptive_target = self
+            .producers
+            .values()
+            .map(|p| p.target_samples())
+            .max()
+            .unwrap_or_else(|| samples_for_duration(self.tuning.target_queue));
+
+        LivePlaybackSnapshot {
+            active_streams: self.streams.len(),
+            queued_samples,
+            max_queue_ms: samples_to_ms(max_queue_samples),
+            max_playout_delay_ms: samples_to_ms(max_playout_delay_samples),
+            backend_block_ms: samples_to_ms(self.block_samples),
+            playout_quantum_ms: samples_to_ms(self.block_samples.min(FRAME_SAMPLES)),
+            target_queue_ms: duration_to_ms(self.tuning.target_queue),
+            adaptive_target_ms: samples_to_ms(adaptive_target),
+            hard_trim_count: self.stats.hard_trim_count,
+            underrun_count: self.stats.underrun_count,
+            dred_recoveries: self.stats.dred_recoveries,
+            plc_fallbacks: self.stats.plc_fallbacks,
+            decode_errors: self.stats.decode_errors,
+            direct_samples: self.stats.direct_samples,
+            accelerate_count: self.stats.accelerate_count,
+            expand_count: self.stats.expand_count,
+            accelerate_samples: self.stats.accelerate_samples,
+            expand_samples: self.stats.expand_samples,
+            speech_gap_skip_count: self.stats.speech_gap_skip_count,
+            skipped_speech_gap_ms: samples_to_ms(self.stats.skipped_speech_gap_samples as usize),
+            backend_xruns: 0,
+            backend_stream_errors: 0,
+            last_backend_error: None,
         }
     }
 
@@ -893,7 +977,7 @@ mod tests {
             capture::OpusVoiceEncoder,
             shared::{
                 LIVE_PACKET_FLAG_SILENCE_HINT, LIVE_PLAYBACK_INITIAL_BUFFER,
-                LIVE_PLAYBACK_MAX_REORDER_DELAY, SAMPLE_RATE, duration_to_ms, samples_for_duration,
+                LIVE_PLAYBACK_MAX_REORDER_DELAY, SAMPLE_RATE,
             },
         },
         network::EncoderNetworkProfile,
@@ -1025,22 +1109,16 @@ mod tests {
     }
 
     #[test]
-    fn silence_marker_flushes_feedback_with_trimmed_queue() {
+    fn silence_marker_flushes_sender_silence_feedback() {
         let now = Instant::now();
         let tuning = test_tuning();
         let mut streams = LiveDecodeStreams::new(tuning);
         let mixer = Arc::new(Mutex::new(LivePlaybackMixer::with_tuning(tuning)));
         let (feedback_sender, feedback_receiver) = std::sync::mpsc::channel();
 
-        {
-            let mut mixer = mixer.lock().unwrap();
-            mixer.queue_stream_samples(
-                7,
-                &vec![0.001; samples_for_duration(Duration::from_millis(240))],
-                DecodedFrameSource::Normal,
-                now,
-            );
-        }
+        // A sender-silence marker registers the stream and, on the next drain,
+        // flushes a zero-expectation feedback window. The queue trim that the
+        // marker triggers is verified directly in the adaptive-stream tests.
         streams.insert_packet(
             RemoteVoicePacket {
                 stream_id: 7,
@@ -1057,14 +1135,6 @@ mod tests {
         let feedback = feedback_receiver.try_recv().unwrap();
         assert_eq!(feedback.stream_id, 7);
         assert_eq!(feedback.expected_packets, 0);
-        assert_eq!(
-            u64::from(feedback.max_queue_ms),
-            duration_to_ms(tuning.target_queue)
-        );
-        assert_eq!(
-            mixer.lock().unwrap().stream_queue_ms(7),
-            duration_to_ms(tuning.target_queue)
-        );
     }
 
     #[test]

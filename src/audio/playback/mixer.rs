@@ -1,50 +1,289 @@
 use std::{
-    sync::Mutex,
+    sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 
 use hashbrown::HashMap;
 
 use crate::audio::{
-    playback::AdaptivePlaybackStream,
-    shared::{
-        DecodedFrameSource, FRAME_SAMPLES, LIVE_PLAYBACK_SNAPSHOT_INTERVAL, LiveAudioTuning,
-        LivePlaybackSnapshot, PlaybackStreamControl, PlayoutDelay, db_to_gain, duration_to_ms,
-        samples_to_ms, soft_limit, target_queue_samples,
-    },
+    playback::{RingReader, SampleRing},
+    shared::{FRAME_SAMPLES, LivePlaybackSnapshot, PlaybackStreamControl, db_to_gain, soft_limit},
 };
 
 const LIVE_PLAYBACK_BACKEND_ERROR_LOG_INTERVAL: Duration = Duration::from_secs(1);
 const LIVE_PLAYBACK_PREALLOCATED_STREAMS: usize = 32;
+/// Reusable per-frame active-stream tally capacity. Large enough for the
+/// deepest device callback so the consumer never reallocates on the audio
+/// thread.
+const LIVE_PLAYBACK_MIX_SCRATCH: usize = 8_192;
+/// Conceal tiny producer/callback edge misses without escalating them into
+/// adaptive-target underruns. At 48 kHz the floor is 2 ms; larger host periods
+/// may conceal up to 10% of the callback, which is still bounded to the current
+/// callback and does not add queued latency.
+const SHORT_RING_CONCEALMENT_FLOOR_SAMPLES: usize = 96;
 
-#[derive(Default)]
+/// Consumer side of live playback: the cpal callback's pure ring-mixer.
+///
+/// It owns the read side of each active stream's [`SampleRing`] plus the
+/// per-stream mute and gain. Per callback it does bounded work only: one
+/// acquire-load span snapshot, a plain index mix, one release-store read
+/// advance, and a dry-ring underrun bump. It allocates nothing, frees nothing,
+/// takes no lock, and runs no DSP. All decoding, jitter handling, and
+/// time-scaling happen on the decode worker behind the rings.
 pub(crate) struct LivePlaybackMixer {
-    tuning: LiveAudioTuning,
-    streams: HashMap<u32, AdaptivePlaybackStream>,
-    controls: HashMap<u32, PlaybackStreamControl>,
-    pub(crate) stats: LivePlaybackMixerStats,
-    last_diagnostic_at: Option<Instant>,
+    streams: HashMap<u32, ConsumerStream>,
+    backend_xruns: u64,
+    backend_stream_errors: u64,
+    last_backend_error: Option<String>,
     last_backend_error_log_at: Option<Instant>,
-    last_backend_block_samples: usize,
-    last_playout_quantum_samples: usize,
+    /// Per-frame count of streams that contributed a sample, reused across
+    /// callbacks to avoid allocation.
+    active_scratch: Vec<u32>,
+    /// Block-fill cache backing the per-sample `pop_mixed_*` interface. One
+    /// `fill_block` runs per block; per-sample callers read out of `fill`.
+    fill: Vec<f32>,
+    fill_cursor: usize,
+    /// Diagnostics snapshot the producer stashes here, so the UI and the
+    /// single-threaded simulation can read depth through this consumer.
+    last_snapshot: LivePlaybackSnapshot,
+    /// Optional publisher of the consumer's callback block back to the producer.
+    block_hint: Option<Arc<std::sync::atomic::AtomicUsize>>,
 }
 
-pub(crate) struct LivePlaybackSharedSnapshot {
-    inner: Mutex<LivePlaybackSharedSnapshotInner>,
+struct ConsumerStream {
+    reader: RingReader,
+    control: PlaybackStreamControl,
+    last_sample: f32,
 }
 
-struct LivePlaybackSharedSnapshotInner {
-    snapshot: LivePlaybackSnapshot,
-    last_backend_error_log_at: Option<Instant>,
+impl Default for LivePlaybackMixer {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
+impl LivePlaybackMixer {
+    pub(crate) fn new() -> Self {
+        Self::with_streams(HashMap::new())
+    }
+
+    pub(crate) fn with_tuning(_tuning: crate::audio::shared::LiveAudioTuning) -> Self {
+        Self::new()
+    }
+
+    pub(crate) fn with_live_capacity(_tuning: crate::audio::shared::LiveAudioTuning) -> Self {
+        Self::with_streams(HashMap::with_capacity(LIVE_PLAYBACK_PREALLOCATED_STREAMS))
+    }
+
+    fn with_streams(streams: HashMap<u32, ConsumerStream>) -> Self {
+        Self {
+            streams,
+            backend_xruns: 0,
+            backend_stream_errors: 0,
+            last_backend_error: None,
+            last_backend_error_log_at: None,
+            active_scratch: Vec::with_capacity(LIVE_PLAYBACK_MIX_SCRATCH),
+            fill: Vec::with_capacity(LIVE_PLAYBACK_MIX_SCRATCH),
+            fill_cursor: 0,
+            last_snapshot: LivePlaybackSnapshot::default(),
+            block_hint: None,
+        }
+    }
+
+    /// Installs the shared atomic the consumer uses to report its callback block
+    /// size to the producer.
+    pub(crate) fn set_block_hint(&mut self, block_hint: Arc<std::sync::atomic::AtomicUsize>) {
+        self.block_hint = Some(block_hint);
+    }
+
+    /// Stashes the producer's diagnostics snapshot, preserving the consumer's own
+    /// backend-error counters.
+    pub(crate) fn set_snapshot(&mut self, mut snapshot: LivePlaybackSnapshot) {
+        snapshot.backend_xruns = self.backend_xruns;
+        snapshot.backend_stream_errors = self.backend_stream_errors;
+        snapshot.last_backend_error = self.last_backend_error.clone();
+        self.last_snapshot = snapshot;
+    }
+
+    pub(crate) fn snapshot_at(&self, _now: Instant) -> LivePlaybackSnapshot {
+        self.last_snapshot.clone()
+    }
+
+    pub(crate) fn snapshot(&self) -> LivePlaybackSnapshot {
+        self.last_snapshot.clone()
+    }
+
+    pub(crate) fn queued_samples(&self) -> usize {
+        self.last_snapshot.queued_samples
+    }
+
+    /// Diagnostics logging now lives on the producer; kept as a no-op so the
+    /// device and simulation call sites stay unchanged.
+    pub(crate) fn log_playback_diagnostics_if_due(&self, _now: Instant) {}
+
+    /// Mixes one mono sample, refilling the block cache once per `block`.
+    pub(crate) fn pop_mixed_output_sample(&mut self, _now: Instant, block: usize) -> f32 {
+        let block = block.max(1);
+        if self.fill_cursor >= self.fill.len() {
+            if let Some(hint) = &self.block_hint {
+                hint.store(block, std::sync::atomic::Ordering::Relaxed);
+            }
+            let mut buf = std::mem::take(&mut self.fill);
+            buf.clear();
+            buf.resize(block, 0.0);
+            self.fill_block(&mut buf);
+            self.fill = buf;
+            self.fill_cursor = 0;
+        }
+        let sample = self.fill[self.fill_cursor];
+        self.fill_cursor += 1;
+        sample
+    }
+
+    pub(crate) fn pop_mixed_sample(&mut self, now: Instant) -> f32 {
+        self.pop_mixed_output_sample(now, crate::audio::shared::FRAME_SAMPLES)
+    }
+
+    /// Registers a stream's ring, sent by the producer when the stream starts.
+    ///
+    /// This is the only site that builds a [`RingReader`]. `or_insert_with` keeps
+    /// it to one per `stream_id`, and the producer hands each ring to exactly one
+    /// stream, so each ring gets exactly one reader.
+    pub(crate) fn ensure_stream(&mut self, stream_id: u32, ring: Arc<SampleRing>) {
+        self.streams
+            .entry(stream_id)
+            .or_insert_with(|| ConsumerStream {
+                // SAFETY: the sole `RingReader` for `ring`. This vacant-entry closure
+                // runs once per `stream_id`, and the producer routes each ring to a
+                // single stream, so no other reader is ever built for it.
+                reader: unsafe { RingReader::new(ring) },
+                control: PlaybackStreamControl::default(),
+                last_sample: 0.0,
+            });
+    }
+
+    pub(crate) fn remove_stream(&mut self, stream_id: u32) {
+        self.streams.remove(&stream_id);
+    }
+
+    pub(crate) fn set_stream_control(&mut self, stream_id: u32, control: PlaybackStreamControl) {
+        if let Some(stream) = self.streams.get_mut(&stream_id) {
+            stream.control = control;
+        }
+    }
+
+    pub(crate) fn active_streams(&self) -> usize {
+        self.streams.len()
+    }
+
+    /// Mixes one callback block of mono samples into `out`.
+    ///
+    /// For each stream: one acquire-load span snapshot, a plain index mix into
+    /// the accumulator, a dry-ring underrun bump when the span is short, and one
+    /// release-store read advance. Streams are summed and the per-frame total is
+    /// divided by the square root of the active count, then soft-limited, the
+    /// same headroom policy as the old per-sample mixer.
+    pub(crate) fn fill_block(&mut self, out: &mut [f32]) {
+        let frames = out.len();
+        out.fill(0.0);
+        self.active_scratch.clear();
+        self.active_scratch.resize(frames, 0);
+
+        for stream in self.streams.values_mut() {
+            let span = stream.reader.readable_span();
+            let span_len = span.len();
+            let covered = span_len.min(frames);
+            if !stream.control.muted {
+                let gain = db_to_gain(stream.control.volume_db);
+                for offset in 0..covered {
+                    let sample = span.get(offset).unwrap_or(0.0);
+                    stream.last_sample = sample;
+                    out[offset] += sample * gain;
+                    self.active_scratch[offset] += 1;
+                }
+            }
+            // Drop the span before releasing samples: its `&[f32]` into the ring
+            // must die before `advance` publishes the freed read cursor, or the
+            // producer could overwrite still-borrowed slots.
+            drop(span);
+            let missing = frames.saturating_sub(covered);
+            let concealment_limit = if frames >= FRAME_SAMPLES {
+                SHORT_RING_CONCEALMENT_FLOOR_SAMPLES.max(frames / 10)
+            } else {
+                0
+            };
+            if missing > 0 && covered > 0 && missing <= concealment_limit {
+                if !stream.control.muted {
+                    let gain = db_to_gain(stream.control.volume_db);
+                    for offset in covered..frames {
+                        out[offset] += stream.last_sample * gain;
+                        self.active_scratch[offset] += 1;
+                    }
+                }
+            } else if span_len < frames {
+                stream.reader.note_underrun();
+            }
+            stream.reader.advance(covered);
+        }
+
+        for (sample, &active) in out.iter_mut().zip(self.active_scratch.iter()) {
+            *sample = match active {
+                0 => 0.0,
+                1 => sample.clamp(-1.0, 1.0),
+                _ => soft_limit(*sample / (active as f32).sqrt()),
+            };
+        }
+    }
+
+    pub(crate) fn record_backend_stream_error(
+        &mut self,
+        error: String,
+        is_xrun: bool,
+        now: Instant,
+    ) {
+        self.backend_stream_errors = self.backend_stream_errors.saturating_add(1);
+        if is_xrun {
+            self.backend_xruns = self.backend_xruns.saturating_add(1);
+        }
+        self.last_backend_error = Some(error.clone());
+
+        if self.last_backend_error_log_at.is_some_and(|at| {
+            now.saturating_duration_since(at) < LIVE_PLAYBACK_BACKEND_ERROR_LOG_INTERVAL
+        }) {
+            return;
+        }
+        self.last_backend_error_log_at = Some(now);
+        if is_xrun {
+            kvlog::warn!(
+                "live playback backend xrun",
+                error = error.as_str(),
+                backend_xruns = self.backend_xruns,
+                backend_stream_errors = self.backend_stream_errors
+            );
+        } else {
+            kvlog::warn!(
+                "live playback backend stream error",
+                error = error.as_str(),
+                backend_xruns = self.backend_xruns,
+                backend_stream_errors = self.backend_stream_errors
+            );
+        }
+    }
+}
+
+/// Cross-thread accounting counters for the playback path.
+///
+/// Despite the historical name these now live on the decode worker (the
+/// producer), where the [`crate::audio::playback::RingPlaybackProducer`] and the
+/// time-scaler mutate them. The worker folds them into a
+/// [`LivePlaybackSnapshot`] for diagnostics.
 #[derive(Debug, Default)]
 pub(crate) struct LivePlaybackMixerStats {
     pub(crate) hard_trim_count: u64,
     pub(crate) underrun_count: u64,
     pub(crate) dred_recoveries: u64,
     pub(crate) plc_fallbacks: u64,
-    decode_errors: u64,
+    pub(crate) decode_errors: u64,
     pub(crate) direct_samples: u64,
     pub(crate) accelerate_count: u64,
     pub(crate) expand_count: u64,
@@ -57,387 +296,22 @@ pub(crate) struct LivePlaybackMixerStats {
     pub(crate) last_backend_error: Option<String>,
 }
 
-impl LivePlaybackMixer {
-    pub(crate) fn new() -> Self {
-        Self::with_tuning(LiveAudioTuning::default())
+impl LivePlaybackMixerStats {
+    pub(crate) fn record_decode_error(&mut self) {
+        self.decode_errors = self.decode_errors.saturating_add(1);
     }
+}
 
-    pub(crate) fn with_tuning(tuning: LiveAudioTuning) -> Self {
-        Self {
-            tuning,
-            streams: HashMap::new(),
-            controls: HashMap::new(),
-            stats: LivePlaybackMixerStats::default(),
-            last_diagnostic_at: None,
-            last_backend_error_log_at: None,
-            last_backend_block_samples: 0,
-            last_playout_quantum_samples: 0,
-        }
-    }
+/// Snapshot shared with the UI thread. The decode worker publishes stream depth
+/// and counters through [`Self::update_stream_snapshot`]; the cpal consumer
+/// publishes backend errors through [`Self::record_backend_stream_error`].
+pub(crate) struct LivePlaybackSharedSnapshot {
+    inner: Mutex<LivePlaybackSharedSnapshotInner>,
+}
 
-    pub(crate) fn with_live_capacity(tuning: LiveAudioTuning) -> Self {
-        Self {
-            tuning,
-            streams: HashMap::with_capacity(LIVE_PLAYBACK_PREALLOCATED_STREAMS),
-            controls: HashMap::with_capacity(LIVE_PLAYBACK_PREALLOCATED_STREAMS),
-            stats: LivePlaybackMixerStats::default(),
-            last_diagnostic_at: None,
-            last_backend_error_log_at: None,
-            last_backend_block_samples: 0,
-            last_playout_quantum_samples: 0,
-        }
-    }
-
-    pub(crate) fn ensure_stream(&mut self, stream_id: u32, stream: AdaptivePlaybackStream) {
-        self.streams.entry(stream_id).or_insert(stream);
-    }
-
-    pub(crate) fn queue_stream_samples(
-        &mut self,
-        stream_id: u32,
-        samples: &[f32],
-        source: DecodedFrameSource,
-        now: Instant,
-    ) {
-        self.queue_stream_samples_with_delay(stream_id, samples, source, None, now);
-    }
-
-    pub(crate) fn queue_stream_samples_with_delay(
-        &mut self,
-        stream_id: u32,
-        samples: &[f32],
-        source: DecodedFrameSource,
-        playout_delay: Option<PlayoutDelay>,
-        now: Instant,
-    ) {
-        self.queue_stream_samples_owned_with_delay(
-            stream_id,
-            samples.to_vec(),
-            source,
-            playout_delay,
-            now,
-        );
-    }
-
-    pub(crate) fn queue_stream_samples_owned_with_delay(
-        &mut self,
-        stream_id: u32,
-        samples: Vec<f32>,
-        source: DecodedFrameSource,
-        playout_delay: Option<PlayoutDelay>,
-        now: Instant,
-    ) {
-        self.queue_stream_samples_owned_inner(stream_id, samples, source, playout_delay, now, true);
-    }
-
-    pub(crate) fn queue_existing_stream_samples_owned_with_delay(
-        &mut self,
-        stream_id: u32,
-        samples: Vec<f32>,
-        source: DecodedFrameSource,
-        playout_delay: Option<PlayoutDelay>,
-        now: Instant,
-    ) -> bool {
-        self.queue_stream_samples_owned_inner(stream_id, samples, source, playout_delay, now, false)
-    }
-
-    fn queue_stream_samples_owned_inner(
-        &mut self,
-        stream_id: u32,
-        samples: Vec<f32>,
-        source: DecodedFrameSource,
-        playout_delay: Option<PlayoutDelay>,
-        now: Instant,
-        create_stream: bool,
-    ) -> bool {
-        match source {
-            DecodedFrameSource::Normal => {}
-            DecodedFrameSource::Dred => {
-                self.stats.dred_recoveries = self.stats.dred_recoveries.saturating_add(1)
-            }
-            DecodedFrameSource::Plc => {
-                self.stats.plc_fallbacks = self.stats.plc_fallbacks.saturating_add(1);
-            }
-            DecodedFrameSource::DecodeError => {
-                self.stats.decode_errors = self.stats.decode_errors.saturating_add(1);
-                return false;
-            }
-        }
-
-        if samples.is_empty() {
-            return true;
-        }
-
-        let stream = match self.streams.entry(stream_id) {
-            hashbrown::hash_map::Entry::Occupied(entry) => entry.into_mut(),
-            hashbrown::hash_map::Entry::Vacant(entry) if create_stream => {
-                match AdaptivePlaybackStream::new(self.tuning) {
-                    Ok(stream) => entry.insert(stream),
-                    Err(error) => {
-                        eprintln!("failed to create live playback stream: {error}");
-                        return false;
-                    }
-                }
-            }
-            hashbrown::hash_map::Entry::Vacant(_) => return false,
-        };
-        stream.queue_samples_owned_with_delay(samples, source, playout_delay, now, &mut self.stats);
-        true
-    }
-
-    /// Applies the receiver-recommended dynamic target to an existing stream.
-    /// A no-op if the stream has not been created yet, which is harmless: the
-    /// target starts at the safe ceiling and only relaxes after sustained
-    /// clean windows, well after the stream's first frames arrive.
-    pub(crate) fn note_stream_recommended_target(
-        &mut self,
-        stream_id: u32,
-        recommended_target: Duration,
-        now: Instant,
-    ) {
-        if let Some(stream) = self.streams.get_mut(&stream_id) {
-            stream.apply_recommended_target(recommended_target, now);
-        }
-    }
-
-    pub(crate) fn remove_stream(&mut self, stream_id: u32) {
-        self.streams.remove(&stream_id);
-        self.controls.remove(&stream_id);
-    }
-
-    pub(crate) fn note_stream_discontinuity(&mut self, stream_id: u32, now: Instant) {
-        if let Some(stream) = self.streams.get_mut(&stream_id) {
-            stream.skip_speech_gap_backlog(now, &mut self.stats);
-        }
-    }
-
-    pub(crate) fn note_stream_sender_silence(&mut self, stream_id: u32, now: Instant) {
-        let stream = match self.streams.entry(stream_id) {
-            hashbrown::hash_map::Entry::Occupied(entry) => entry.into_mut(),
-            hashbrown::hash_map::Entry::Vacant(entry) => {
-                match AdaptivePlaybackStream::new(self.tuning) {
-                    Ok(stream) => entry.insert(stream),
-                    Err(error) => {
-                        eprintln!("failed to create live playback stream: {error}");
-                        return;
-                    }
-                }
-            }
-        };
-        stream.mark_sender_silent(now, &mut self.stats);
-    }
-
-    pub(crate) fn note_existing_stream_sender_silence(
-        &mut self,
-        stream_id: u32,
-        now: Instant,
-    ) -> bool {
-        let Some(stream) = self.streams.get_mut(&stream_id) else {
-            return false;
-        };
-        stream.mark_sender_silent(now, &mut self.stats);
-        true
-    }
-
-    pub(crate) fn set_stream_control(&mut self, stream_id: u32, control: PlaybackStreamControl) {
-        if control == PlaybackStreamControl::default() {
-            self.controls.remove(&stream_id);
-        } else {
-            self.controls.insert(stream_id, control);
-        }
-    }
-
-    pub(crate) fn record_backend_stream_error(
-        &mut self,
-        error: String,
-        is_xrun: bool,
-        now: Instant,
-    ) {
-        self.stats.backend_stream_errors = self.stats.backend_stream_errors.saturating_add(1);
-        if is_xrun {
-            self.stats.backend_xruns = self.stats.backend_xruns.saturating_add(1);
-        }
-        self.stats.last_backend_error = Some(error.clone());
-
-        if self.last_backend_error_log_at.is_some_and(|at| {
-            now.saturating_duration_since(at) < LIVE_PLAYBACK_BACKEND_ERROR_LOG_INTERVAL
-        }) {
-            return;
-        }
-        self.last_backend_error_log_at = Some(now);
-
-        if is_xrun {
-            kvlog::warn!(
-                "live playback backend xrun",
-                error = error.as_str(),
-                backend_xruns = self.stats.backend_xruns,
-                backend_stream_errors = self.stats.backend_stream_errors
-            );
-        } else {
-            kvlog::warn!(
-                "live playback backend stream error",
-                error = error.as_str(),
-                backend_xruns = self.stats.backend_xruns,
-                backend_stream_errors = self.stats.backend_stream_errors
-            );
-        }
-    }
-
-    pub(crate) fn queued_samples(&self) -> usize {
-        self.streams
-            .values()
-            .map(AdaptivePlaybackStream::queued_samples)
-            .sum()
-    }
-
-    pub(crate) fn stream_queue_ms(&self, stream_id: u32) -> u64 {
-        self.streams
-            .get(&stream_id)
-            .map(|stream| samples_to_ms(stream.queued_samples()))
-            .unwrap_or_default()
-    }
-
-    /// Logs the actual playback state for every active stream, throttled to
-    /// `LIVE_PLAYBACK_SNAPSHOT_INTERVAL`.
-    pub(crate) fn log_playback_diagnostics_if_due(&mut self, now: Instant) {
-        // Disabled for now: too noisy at the 100 ms snapshot cadence. The
-        // formatting below is kept ready to re-enable by flipping this flag.
-        const PLAYBACK_DIAGNOSTICS_ENABLED: bool = false;
-        if !PLAYBACK_DIAGNOSTICS_ENABLED || self.streams.is_empty() {
-            return;
-        }
-        if self
-            .last_diagnostic_at
-            .is_some_and(|at| now.saturating_duration_since(at) < LIVE_PLAYBACK_SNAPSHOT_INTERVAL)
-        {
-            return;
-        }
-        self.last_diagnostic_at = Some(now);
-        for (stream_id, stream) in &self.streams {
-            kvlog::info!(
-                "live playback snapshot",
-                stream_id = *stream_id,
-                queue_ms = samples_to_ms(stream.queued_samples()),
-                applied_target_ms = samples_to_ms(stream.adaptive_target_samples(now)),
-                recommended_target_ms = samples_to_ms(stream.effective_target_samples()),
-                backend_block_ms = samples_to_ms(self.last_backend_block_samples),
-                playout_quantum_ms = samples_to_ms(self.last_playout_quantum_samples),
-                underruns = self.stats.underrun_count,
-                dred = self.stats.dred_recoveries,
-                plc = self.stats.plc_fallbacks,
-                hard_trims = self.stats.hard_trim_count,
-                direct_samples = self.stats.direct_samples,
-                accelerate_count = self.stats.accelerate_count,
-                expand_count = self.stats.expand_count,
-                accelerate_ms = samples_to_ms(self.stats.accelerate_samples as usize),
-                expand_ms = samples_to_ms(self.stats.expand_samples as usize),
-                speech_gap_skip_count = self.stats.speech_gap_skip_count,
-                skipped_speech_gap_ms =
-                    samples_to_ms(self.stats.skipped_speech_gap_samples as usize),
-                backend_xruns = self.stats.backend_xruns,
-                backend_stream_errors = self.stats.backend_stream_errors
-            );
-        }
-    }
-
-    pub(crate) fn snapshot(&self) -> LivePlaybackSnapshot {
-        self.snapshot_at(Instant::now())
-    }
-
-    pub(crate) fn snapshot_at(&self, now: Instant) -> LivePlaybackSnapshot {
-        let queued_samples = self.queued_samples();
-        let max_queue_samples = self
-            .streams
-            .values()
-            .map(AdaptivePlaybackStream::queued_samples)
-            .max()
-            .unwrap_or_default();
-        let max_playout_delay_samples = self
-            .streams
-            .values()
-            .filter_map(|stream| stream.playout_delay_samples(now))
-            .max()
-            .unwrap_or_default();
-        let adaptive_target = self
-            .streams
-            .values()
-            .map(|stream| stream.adaptive_target_samples(now))
-            .max()
-            .unwrap_or_else(|| target_queue_samples(self.tuning));
-
-        LivePlaybackSnapshot {
-            active_streams: self.streams.len(),
-            queued_samples,
-            max_queue_ms: samples_to_ms(max_queue_samples),
-            max_playout_delay_ms: samples_to_ms(max_playout_delay_samples),
-            backend_block_ms: samples_to_ms(self.last_backend_block_samples),
-            playout_quantum_ms: samples_to_ms(self.last_playout_quantum_samples),
-            target_queue_ms: duration_to_ms(self.tuning.target_queue),
-            adaptive_target_ms: samples_to_ms(adaptive_target),
-            hard_trim_count: self.stats.hard_trim_count,
-            underrun_count: self.stats.underrun_count,
-            dred_recoveries: self.stats.dred_recoveries,
-            plc_fallbacks: self.stats.plc_fallbacks,
-            decode_errors: self.stats.decode_errors,
-            direct_samples: self.stats.direct_samples,
-            accelerate_count: self.stats.accelerate_count,
-            expand_count: self.stats.expand_count,
-            accelerate_samples: self.stats.accelerate_samples,
-            expand_samples: self.stats.expand_samples,
-            speech_gap_skip_count: self.stats.speech_gap_skip_count,
-            skipped_speech_gap_ms: samples_to_ms(self.stats.skipped_speech_gap_samples as usize),
-            backend_xruns: self.stats.backend_xruns,
-            backend_stream_errors: self.stats.backend_stream_errors,
-            last_backend_error: self.stats.last_backend_error.clone(),
-        }
-    }
-
-    pub(crate) fn pop_mixed_sample(&mut self, now: Instant) -> f32 {
-        self.pop_mixed_sample_with(|stream, stats| stream.pop_sample(now, stats))
-    }
-
-    pub(crate) fn pop_mixed_output_sample(
-        &mut self,
-        now: Instant,
-        output_block_samples: usize,
-    ) -> f32 {
-        let backend_block_samples = output_block_samples.max(1);
-        let playout_quantum_samples = backend_block_samples.min(FRAME_SAMPLES);
-        self.last_backend_block_samples = backend_block_samples;
-        self.last_playout_quantum_samples = playout_quantum_samples;
-        self.pop_mixed_sample_with(|stream, stats| {
-            stream.pop_output_sample(now, stats, playout_quantum_samples, backend_block_samples)
-        })
-    }
-
-    fn pop_mixed_sample_with<F>(&mut self, mut pop: F) -> f32
-    where
-        F: FnMut(&mut AdaptivePlaybackStream, &mut LivePlaybackMixerStats) -> Option<f32>,
-    {
-        let mut active = 0usize;
-        let mut only_sample = 0.0f32;
-        let mut sum = 0.0f32;
-
-        for (stream_id, stream) in self.streams.iter_mut() {
-            let Some(sample) = pop(stream, &mut self.stats) else {
-                continue;
-            };
-            let control = self.controls.get(stream_id).copied().unwrap_or_default();
-            if control.muted {
-                continue;
-            }
-            let gain = db_to_gain(control.volume_db);
-            active += 1;
-            only_sample = (sample * gain).clamp(-1.0, 1.0);
-            sum += sample * gain;
-        }
-
-        match active {
-            0 => 0.0,
-            1 => only_sample,
-            _ => soft_limit(sum / (active as f32).sqrt()),
-        }
-    }
+struct LivePlaybackSharedSnapshotInner {
+    snapshot: LivePlaybackSnapshot,
+    last_backend_error_log_at: Option<Instant>,
 }
 
 impl LivePlaybackSharedSnapshot {
@@ -464,18 +338,15 @@ impl LivePlaybackSharedSnapshot {
             .unwrap_or_default()
     }
 
-    pub(crate) fn try_update_from_mixer(&self, mixer: &LivePlaybackMixer, now: Instant) {
-        let Ok(mut inner) = self.inner.try_lock() else {
+    /// Publishes the worker's stream snapshot, preserving the consumer-owned
+    /// backend-error fields.
+    pub(crate) fn update_stream_snapshot(&self, mut snapshot: LivePlaybackSnapshot) {
+        let Ok(mut inner) = self.inner.lock() else {
             return;
         };
-
-        let backend_xruns = inner.snapshot.backend_xruns;
-        let backend_stream_errors = inner.snapshot.backend_stream_errors;
-        let last_backend_error = inner.snapshot.last_backend_error.clone();
-        let mut snapshot = mixer.snapshot_at(now);
-        snapshot.backend_xruns = backend_xruns;
-        snapshot.backend_stream_errors = backend_stream_errors;
-        snapshot.last_backend_error = last_backend_error;
+        snapshot.backend_xruns = inner.snapshot.backend_xruns;
+        snapshot.backend_stream_errors = inner.snapshot.backend_stream_errors;
+        snapshot.last_backend_error = inner.snapshot.last_backend_error.clone();
         inner.snapshot = snapshot;
     }
 
@@ -502,7 +373,6 @@ impl LivePlaybackSharedSnapshot {
             return;
         }
         inner.last_backend_error_log_at = Some(now);
-
         if is_xrun {
             kvlog::warn!(
                 "live playback backend xrun",
@@ -524,160 +394,68 @@ impl LivePlaybackSharedSnapshot {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::audio::shared::{FRAME_SAMPLES, samples_for_duration};
-    #[allow(unused_imports)]
-    use crate::audio::test_support::*;
+    use crate::audio::shared::FRAME_SAMPLES;
 
-    #[test]
-    fn mixer_skips_backlog_at_speech_gap_discontinuity() {
-        let now = Instant::now();
-        let mut mixer = LivePlaybackMixer::new();
-
-        mixer.queue_stream_samples(
-            1,
-            &vec![0.0; samples_for_duration(Duration::from_millis(220))],
-            DecodedFrameSource::Normal,
-            now,
-        );
-        mixer.note_stream_discontinuity(1, now);
-
-        let snapshot = mixer.snapshot_at(now);
-        assert_eq!(
-            snapshot.max_queue_ms,
-            duration_to_ms(test_tuning().target_queue)
-        );
-        assert_eq!(snapshot.speech_gap_skip_count, 1);
-        assert!(snapshot.skipped_speech_gap_ms >= 150, "{snapshot:?}");
+    fn ring_with(samples: &[f32]) -> Arc<SampleRing> {
+        let ring = Arc::new(SampleRing::with_capacity(samples.len().max(1) * 2));
+        ring.write_samples(samples);
+        ring
     }
 
     #[test]
-    fn mixer_mixes_concurrent_streams_with_headroom() {
+    fn mixes_concurrent_streams_with_headroom() {
         let mut mixer = LivePlaybackMixer::new();
-        let now = Instant::now();
-        mixer.queue_stream_samples(
-            1,
-            &vec![0.4; FRAME_SAMPLES * 2],
-            DecodedFrameSource::Normal,
-            now,
-        );
-        mixer.queue_stream_samples(
-            2,
-            &vec![0.4; FRAME_SAMPLES * 2],
-            DecodedFrameSource::Normal,
-            now,
-        );
+        mixer.ensure_stream(1, ring_with(&[0.4; FRAME_SAMPLES]));
+        mixer.ensure_stream(2, ring_with(&[0.4; FRAME_SAMPLES]));
 
-        let mixed = pop_until_nonzero(&mut mixer, now);
+        let mut out = vec![0.0; FRAME_SAMPLES];
+        mixer.fill_block(&mut out);
 
-        assert!(mixed > 0.4);
-        assert!(mixed < 0.8);
-
-        mixer.queue_stream_samples(
-            1,
-            &vec![1.0; FRAME_SAMPLES * 2],
-            DecodedFrameSource::Normal,
-            now,
+        // Two equal streams: sum 0.8 over sqrt(2) ~= 0.566, then soft-limited.
+        assert!(out[0] > 0.4, "mixed {} should exceed one stream", out[0]);
+        assert!(
+            out[0] < 0.8,
+            "mixed {} should stay below the raw sum",
+            out[0]
         );
-        mixer.queue_stream_samples(
-            2,
-            &vec![1.0; FRAME_SAMPLES * 2],
-            DecodedFrameSource::Normal,
-            now,
-        );
-        mixer.queue_stream_samples(
-            3,
-            &vec![1.0; FRAME_SAMPLES * 2],
-            DecodedFrameSource::Normal,
-            now,
-        );
-        assert!(pop_until_nonzero(&mut mixer, now) < 1.0);
     }
 
     #[test]
-    fn mixer_removes_stopped_streams() {
+    fn dry_stream_bumps_underrun_and_outputs_silence_past_the_span() {
         let mut mixer = LivePlaybackMixer::new();
-        let now = Instant::now();
-        mixer.queue_stream_samples(
-            1,
-            &vec![0.2; FRAME_SAMPLES * 2],
-            DecodedFrameSource::Normal,
-            now,
-        );
-        mixer.queue_stream_samples(
-            2,
-            &vec![0.4; FRAME_SAMPLES * 2],
-            DecodedFrameSource::Normal,
-            now,
-        );
+        let ring = ring_with(&[0.5; 10]);
+        mixer.ensure_stream(1, Arc::clone(&ring));
 
-        assert!(mixer.queued_samples() > 0);
-        mixer.remove_stream(1);
+        let mut out = vec![0.0; 20];
+        mixer.fill_block(&mut out);
 
-        assert!(mixer.queued_samples() > 0);
-        assert!(pop_until_nonzero(&mut mixer, now) > 0.2);
+        assert_eq!(out[0], 0.5);
+        assert_eq!(out[10], 0.0, "past the span is silence");
+        assert_eq!(ring.underruns(), 1, "short span bumped one underrun");
+        assert_eq!(ring.depth(), 0, "the consumer drained what was available");
     }
 
     #[test]
-    fn mixer_applies_stream_gain() {
+    fn tiny_partial_ring_miss_is_concealed_without_underrun() {
         let mut mixer = LivePlaybackMixer::new();
-        let now = Instant::now();
-        mixer.set_stream_control(
-            1,
-            PlaybackStreamControl {
-                muted: false,
-                volume_db: 6.0,
-            },
-        );
-        mixer.queue_stream_samples(
-            1,
-            &vec![0.25; FRAME_SAMPLES * 2],
-            DecodedFrameSource::Normal,
-            now,
-        );
+        let missing = SHORT_RING_CONCEALMENT_FLOOR_SAMPLES / 2;
+        let ring = ring_with(&vec![0.5; FRAME_SAMPLES - missing]);
+        mixer.ensure_stream(1, Arc::clone(&ring));
 
-        let boosted = pop_until_nonzero(&mut mixer, now);
+        let mut out = vec![0.0; FRAME_SAMPLES];
+        mixer.fill_block(&mut out);
 
-        assert!(boosted > 0.25);
-        assert!(boosted <= 0.55);
+        assert_eq!(out[0], 0.5);
+        assert_eq!(out[FRAME_SAMPLES - 1], 0.5, "tail held last sample");
+        assert_eq!(ring.underruns(), 0, "tiny miss should not widen target");
+        assert_eq!(ring.depth(), 0, "consumer drained the published span");
     }
 
     #[test]
-    fn mixer_primes_large_backend_blocks_to_device_floor() {
+    fn muted_stream_drains_ring_without_output() {
         let mut mixer = LivePlaybackMixer::new();
-        let now = Instant::now();
-        let tuning = test_tuning();
-        let target = samples_for_duration(tuning.target_queue);
-        let backend_block = samples_for_duration(Duration::from_millis(500));
-        let floor = backend_block + samples_for_duration(tuning.device_period_margin);
-        mixer.queue_stream_samples(1, &vec![0.25; target], DecodedFrameSource::Normal, now);
-
-        let sample = mixer.pop_mixed_output_sample(now, backend_block);
-        let snapshot = mixer.snapshot_at(now);
-
-        assert_eq!(sample, 0.0);
-        assert_eq!(snapshot.backend_block_ms, 500);
-        assert_eq!(snapshot.playout_quantum_ms, samples_to_ms(FRAME_SAMPLES));
-        assert_eq!(snapshot.queued_samples, target);
-
-        for _ in 1..FRAME_SAMPLES {
-            assert_eq!(mixer.pop_mixed_output_sample(now, backend_block), 0.0);
-        }
-
-        mixer.queue_stream_samples(
-            1,
-            &vec![0.25; floor - target],
-            DecodedFrameSource::Normal,
-            now,
-        );
-
-        assert_eq!(mixer.pop_mixed_output_sample(now, backend_block), 0.25);
-        assert_eq!(mixer.snapshot_at(now).underrun_count, 1);
-    }
-
-    #[test]
-    fn mixer_muted_streams_consume_samples_without_output() {
-        let mut mixer = LivePlaybackMixer::new();
-        let now = Instant::now();
+        let ring = ring_with(&[0.5; FRAME_SAMPLES]);
+        mixer.ensure_stream(1, Arc::clone(&ring));
         mixer.set_stream_control(
             1,
             PlaybackStreamControl {
@@ -685,36 +463,39 @@ mod tests {
                 volume_db: 0.0,
             },
         );
-        mixer.queue_stream_samples(
-            1,
-            &vec![0.5; FRAME_SAMPLES * 2],
-            DecodedFrameSource::Normal,
-            now,
-        );
-        let before = mixer.queued_samples();
 
-        assert_eq!(pop_next_nonzero_window(&mut mixer, now), 0.0);
-        assert!(mixer.queued_samples() < before);
+        let mut out = vec![0.0; FRAME_SAMPLES];
+        mixer.fill_block(&mut out);
+
+        assert!(out.iter().all(|&s| s == 0.0), "muted stream produced audio");
+        assert_eq!(ring.depth(), 0, "muted stream still drained its ring");
     }
 
     #[test]
-    fn mixer_records_backend_stream_errors() {
-        let now = Instant::now();
+    fn applies_stream_gain() {
         let mut mixer = LivePlaybackMixer::new();
-
-        mixer.record_backend_stream_error(
-            "A buffer underrun or overrun occurred.".to_string(),
-            true,
-            now,
+        mixer.ensure_stream(1, ring_with(&[0.25; FRAME_SAMPLES]));
+        mixer.set_stream_control(
+            1,
+            PlaybackStreamControl {
+                muted: false,
+                volume_db: 6.0,
+            },
         );
-        mixer.record_backend_stream_error("device disconnected".to_string(), false, now);
 
-        let snapshot = mixer.snapshot_at(now);
-        assert_eq!(snapshot.backend_xruns, 1);
-        assert_eq!(snapshot.backend_stream_errors, 2);
-        assert_eq!(
-            snapshot.last_backend_error.as_deref(),
-            Some("device disconnected")
-        );
+        let mut out = vec![0.0; FRAME_SAMPLES];
+        mixer.fill_block(&mut out);
+        assert!(out[0] > 0.25, "gain not applied: {}", out[0]);
+        assert!(out[0] <= 0.55);
+    }
+
+    #[test]
+    fn removed_stream_stops_mixing() {
+        let mut mixer = LivePlaybackMixer::new();
+        mixer.ensure_stream(1, ring_with(&[0.5; FRAME_SAMPLES]));
+        mixer.remove_stream(1);
+        let mut out = vec![0.0; FRAME_SAMPLES];
+        mixer.fill_block(&mut out);
+        assert!(out.iter().all(|&s| s == 0.0));
     }
 }
