@@ -23,7 +23,7 @@ use extui::event::{
 use extui_bindings::InputKey;
 use extui_editor::{Editor, Mode as EditorMode, Span as EditorSpan, bindings as editor_bindings};
 use rpc::{
-    control::{ChatMessage, InviteTicket},
+    control::{ChatMessage, InviteTicket, ParticipantVoiceStatus},
     ids::{SessionId, UserId},
 };
 
@@ -231,6 +231,10 @@ enum RecoverySchedule {
 const RECOVERY_WINDOW: Duration = Duration::from_secs(30);
 const RECOVERY_MAX_ATTEMPTS: usize = 3;
 const CAPTURE_STALL_TIMEOUT: Duration = Duration::from_millis(750);
+const LOBBY_TALKING_RELEASE: Duration = Duration::from_millis(200);
+/// The talking indicator is intentionally more sensitive than NetEQ's
+/// time-scaling VAD so quiet but audible decoded speech still registers.
+const LOBBY_TALKING_RMS_THRESHOLD: f32 = 0.001; // -60 dBFS
 
 /// Debounce window before a scheduled audio restart fires. Coalesces rapid
 /// settings edits (cycling a choice, typing a buffer size) into one restart.
@@ -731,6 +735,7 @@ impl App {
                 }
                 self.chat.bottom();
                 self.set_status(format!("joined room {}", room_id.0));
+                self.publish_voice_status();
                 self.start_room_voice();
                 self.flush_pending_network_commands();
             }
@@ -789,6 +794,9 @@ impl App {
             }
             NetworkEvent::PlaybackFeedback(feedback) => {
                 self.participants.voice_feedback(feedback);
+            }
+            NetworkEvent::VoiceStatus { user_id, status } => {
+                self.participants.set_voice_status(user_id, status);
             }
             NetworkEvent::EncoderProfileChanged(profile) => {
                 self.encoder_profile = profile;
@@ -1792,8 +1800,56 @@ impl App {
     /// Fires a debounced audio restart once its window elapses. Called once per
     /// run-loop iteration from [`crate::runtime`].
     pub(crate) fn tick(&mut self) {
-        self.supervise(Instant::now());
+        let now = Instant::now();
+        self.supervise(now);
+        self.update_lobby_talking(now);
         self.apply_pending_audio_restart();
+    }
+
+    fn update_lobby_talking(&mut self, now: Instant) {
+        let local_user = self.user_id;
+        let local_status = self.local_voice_status();
+        let local_raw_active = if local_status.muted {
+            false
+        } else if self.config.soundboard.enabled {
+            self.soundboard_busy.load(Ordering::Relaxed)
+        } else {
+            self.capture
+                .as_ref()
+                .is_some_and(|capture| lobby_voice_level_active(capture.stats().snapshot().rms))
+        };
+        let playback = self.playback.as_ref().map(|playback| playback.stats());
+        let updates = self
+            .participants
+            .entries
+            .iter()
+            .map(|participant| {
+                let raw_active = if Some(participant.user_id) == local_user {
+                    local_raw_active
+                } else {
+                    participant
+                        .active_stream
+                        .and_then(|stream_id| {
+                            playback.as_ref().and_then(|snapshot| {
+                                snapshot
+                                    .stream_activity
+                                    .iter()
+                                    .find(|activity| activity.stream_id == stream_id.0)
+                            })
+                        })
+                        .is_some_and(|activity| lobby_voice_level_active(activity.rms))
+                };
+                (participant.user_id, raw_active)
+            })
+            .collect::<Vec<_>>();
+        for (user_id, raw_active) in updates {
+            self.participants.update_talking_display(
+                user_id,
+                raw_active,
+                now,
+                LOBBY_TALKING_RELEASE,
+            );
+        }
     }
 
     fn apply_pending_audio_restart(&mut self) {
@@ -2644,6 +2700,7 @@ impl App {
             return;
         }
         self.mic_muted.store(muted, Ordering::Relaxed);
+        self.publish_voice_status();
         self.set_status(if muted {
             "microphone muted"
         } else {
@@ -2666,12 +2723,31 @@ impl App {
             self.mic_muted.store(true, Ordering::Relaxed);
             self.voice_tx_enabled.store(false, Ordering::Relaxed);
             self.stop_mic_capture();
+            self.set_network_playback_sink(None);
             self.playback.take();
+            self.publish_voice_status();
             self.set_status("deafened");
         } else {
+            self.publish_voice_status();
             self.set_status("undeafened");
             self.start_room_voice();
         }
+    }
+
+    fn local_voice_status(&self) -> ParticipantVoiceStatus {
+        ParticipantVoiceStatus {
+            muted: self.mic_muted.load(Ordering::Relaxed) || self.deafened.load(Ordering::Relaxed),
+            deafened: self.deafened.load(Ordering::Relaxed),
+        }
+        .normalized()
+    }
+
+    fn publish_voice_status(&mut self) {
+        let status = self.local_voice_status();
+        if let Some(user_id) = self.user_id {
+            self.participants.set_voice_status(user_id, status);
+        }
+        self.send_network_command(NetworkCommand::SetVoiceStatus(status), false);
     }
 
     fn show_mute_status(&mut self) {
@@ -3414,6 +3490,10 @@ pub(crate) fn volume_db_label(value_db: f32) -> String {
     format!("{}dB", format_signed_db(value_db))
 }
 
+fn lobby_voice_level_active(rms: f32) -> bool {
+    rms.is_finite() && rms >= LOBBY_TALKING_RMS_THRESHOLD
+}
+
 fn network_event_kind(event: &NetworkEvent) -> &'static str {
     match event {
         NetworkEvent::Connected => "connected",
@@ -3427,6 +3507,7 @@ fn network_event_kind(event: &NetworkEvent) -> &'static str {
         NetworkEvent::VoicePacketObserved { .. } => "voice_packet_observed",
         NetworkEvent::VoicePacket(_) => "voice_packet",
         NetworkEvent::PlaybackFeedback(_) => "playback_feedback",
+        NetworkEvent::VoiceStatus { .. } => "voice_status",
         NetworkEvent::EncoderProfileChanged(_) => "encoder_profile_changed",
         NetworkEvent::Status(_) => "status",
         NetworkEvent::Error(_) => "error",
@@ -3447,6 +3528,7 @@ fn app_network_command_kind(command: &NetworkCommand) -> &'static str {
         NetworkCommand::SequencedLocalVoicePacket { .. } => "sequenced_local_voice_packet",
         NetworkCommand::SetPlaybackSink(_) => "set_playback_sink",
         NetworkCommand::PlaybackFeedback(_) => "playback_feedback",
+        NetworkCommand::SetVoiceStatus(_) => "set_voice_status",
         NetworkCommand::Shutdown => "shutdown",
     }
 }
@@ -3469,6 +3551,14 @@ mod tests {
 
     fn test_app() -> App {
         App::new(Config::default(), None).expect("test app")
+    }
+
+    #[test]
+    fn lobby_talking_threshold_includes_quiet_decoded_speech() {
+        assert!(lobby_voice_level_active(0.005));
+        assert!(lobby_voice_level_active(LOBBY_TALKING_RMS_THRESHOLD));
+        assert!(!lobby_voice_level_active(LOBBY_TALKING_RMS_THRESHOLD * 0.5));
+        assert!(!lobby_voice_level_active(f32::NAN));
     }
 
     #[test]
@@ -3598,6 +3688,53 @@ mod tests {
     }
 
     #[test]
+    fn local_mute_and_deafen_publish_voice_status() {
+        let mut app = test_app();
+        let (tx, rx) = mpsc::channel();
+        app.network = Some(NetworkClient::from_parts_for_test(tx));
+        app.user_id = Some(UserId(1));
+        app.participants.replace_room(vec![ParticipantInfo {
+            user_id: UserId(1),
+            name: "alice".to_string(),
+            in_call: true,
+            voice_status: ParticipantVoiceStatus::default(),
+        }]);
+
+        app.set_mute(true);
+
+        let status = match rx.try_recv().unwrap() {
+            NetworkCommand::SetVoiceStatus(status) => status,
+            other => panic!("unexpected command: {other:?}"),
+        };
+        assert_eq!(
+            status,
+            ParticipantVoiceStatus {
+                muted: true,
+                deafened: false,
+            }
+        );
+        assert!(app.participants.entries[0].voice_status.muted);
+
+        app.set_deafen(true);
+
+        let status = loop {
+            match rx.try_recv().unwrap() {
+                NetworkCommand::SetVoiceStatus(status) => break status,
+                NetworkCommand::SetPlaybackSink(None) => {}
+                other => panic!("unexpected command: {other:?}"),
+            }
+        };
+        assert_eq!(
+            status,
+            ParticipantVoiceStatus {
+                muted: true,
+                deafened: true,
+            }
+        );
+        assert!(app.participants.entries[0].voice_status.deafened);
+    }
+
+    #[test]
     fn server_edit_reuses_one_editor_across_text_fields() {
         let mut draft = ServerEditDraft::from_server(
             &crate::config::ServerEntry::default(),
@@ -3702,11 +3839,13 @@ mod tests {
                 user_id: UserId(1),
                 name: "alice".to_string(),
                 in_call: true,
+                voice_status: ParticipantVoiceStatus::default(),
             },
             ParticipantInfo {
                 user_id: UserId(2),
                 name: "bob".to_string(),
                 in_call: true,
+                voice_status: ParticipantVoiceStatus::default(),
             },
         ]);
         app.move_room_selection(1);
@@ -3836,11 +3975,13 @@ mod tests {
                 user_id: UserId(1),
                 name: "alice".to_string(),
                 in_call: true,
+                voice_status: ParticipantVoiceStatus::default(),
             },
             ParticipantInfo {
                 user_id: UserId(2),
                 name: "bob".to_string(),
                 in_call: true,
+                voice_status: ParticipantVoiceStatus::default(),
             },
         ]);
         app.move_room_selection(1);
@@ -4045,11 +4186,13 @@ mod tests {
                 user_id: UserId(1),
                 name: "alice".to_string(),
                 in_call: true,
+                voice_status: ParticipantVoiceStatus::default(),
             },
             ParticipantInfo {
                 user_id: UserId(2),
                 name: "bob".to_string(),
                 in_call: true,
+                voice_status: ParticipantVoiceStatus::default(),
             },
         ]);
 

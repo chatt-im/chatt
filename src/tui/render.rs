@@ -141,16 +141,20 @@ fn draw_room(area: Rect, app: &App, buf: &mut Buffer) {
             app.theme.muted
         };
         let marker = if selected { ">" } else { " " };
+        let (status_marker, status_style) = room_user_status_indicator(app, participant);
         let control = room_user_control_label(app, participant);
         let voice = room_user_voice_feedback_label(participant);
         row.with(base).fill(buf);
         row.with(style).with(Ellipsis(true)).text(
             buf,
             &format!(
-                "{marker} {:<16} {:<7} {:<5} {:<16} {}",
+                "{marker}   {:<16} {:<7} {:<5} {:<16} {}",
                 participant.name, state, spoke, voice, control
             ),
         );
+        if row.w > 2 {
+            buf.set_stringn(row.x + 2, row.y, status_marker, 1, base.patch(status_style));
+        }
     }
 }
 
@@ -487,6 +491,30 @@ fn room_user_voice_feedback_label(participant: &ParticipantState) -> String {
         "loss{} q{} j{}",
         feedback.loss_percent, feedback.max_queue_ms, feedback.max_interarrival_jitter_ms
     )
+}
+
+fn room_user_status_indicator(app: &App, participant: &ParticipantState) -> (&'static str, Style) {
+    let local_user = Some(participant.user_id) == app.user_id;
+    if !participant.online {
+        return ("▇", app.theme.muted);
+    }
+    if participant.voice_status.deafened || (local_user && app.deafened.load(Ordering::Relaxed)) {
+        return ("▇", app.theme.error);
+    }
+    if participant.voice_status.muted || (local_user && app.mic_muted.load(Ordering::Relaxed)) {
+        return ("▇", app.theme.warn);
+    }
+    if participant.voice_active {
+        return (
+            if participant.talking_display {
+                "▇"
+            } else {
+                "░"
+            },
+            app.theme.good,
+        );
+    }
+    ("▇", app.theme.muted)
 }
 
 fn room_user_control_label(app: &App, participant: &ParticipantState) -> String {

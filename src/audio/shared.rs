@@ -516,6 +516,10 @@ impl AudioStats {
             .vad_bits
             .store(vad_probability.to_bits(), Ordering::Relaxed);
     }
+
+    pub(crate) fn store_voice_active(&self, active: bool) {
+        self.inner.voice_active.store(active, Ordering::Relaxed);
+    }
 }
 
 #[derive(Debug, Default, Clone)]
@@ -529,6 +533,7 @@ pub struct StatsSnapshot {
     pub rms: f32,
     pub peak: f32,
     pub vad_probability: f32,
+    pub voice_active: bool,
     pub worker_stopped: bool,
     pub last_error: Option<String>,
 }
@@ -539,8 +544,17 @@ pub struct PlaybackStats {
 }
 
 #[derive(Debug, Default, Clone)]
+pub struct LivePlaybackStreamActivity {
+    pub stream_id: u32,
+    pub voice_active: bool,
+    /// RMS of the decoded frame nearest playout, normalized to full scale.
+    pub rms: f32,
+}
+
+#[derive(Debug, Default, Clone)]
 pub struct LivePlaybackSnapshot {
     pub active_streams: usize,
+    pub stream_activity: Vec<LivePlaybackStreamActivity>,
     pub queued_samples: usize,
     pub max_queue_ms: u64,
     pub max_playout_delay_ms: u64,
@@ -648,6 +662,7 @@ struct SharedStats {
     rms_bits: AtomicU32,
     peak_bits: AtomicU32,
     vad_bits: AtomicU32,
+    voice_active: AtomicBool,
     worker_stopped: AtomicBool,
     last_error: Mutex<Option<String>>,
 }
@@ -664,6 +679,7 @@ impl SharedStats {
             rms: f32::from_bits(self.rms_bits.load(Ordering::Relaxed)),
             peak: f32::from_bits(self.peak_bits.load(Ordering::Relaxed)),
             vad_probability: f32::from_bits(self.vad_bits.load(Ordering::Relaxed)),
+            voice_active: self.voice_active.load(Ordering::Relaxed),
             worker_stopped: self.worker_stopped.load(Ordering::Relaxed),
             last_error: self.last_error.lock().ok().and_then(|error| error.clone()),
         }
