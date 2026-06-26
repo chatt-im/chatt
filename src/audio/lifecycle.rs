@@ -337,6 +337,10 @@ pub fn start_recording(config: RecordingConfig) -> Result<Recording, String> {
     let worker_stats = stats.clone();
     let worker = thread::Builder::new()
         .name("chatt-audio-record-enc".to_string())
+        // 1M. This thread runs Opus encode plus the denoise path, whose worst-case stack depth
+        // is not bounded by inspection. 1M is an overly safe margin over the default 2M with no
+        // measurable cost.
+        .stack_size(1024 * 1024)
         .spawn(move || {
             run_encoder_worker(
                 receiver,
@@ -467,6 +471,10 @@ where
         .map(EchoReferenceSource::Controlled);
     let worker = thread::Builder::new()
         .name("chatt-audio-live-enc".to_string())
+        // 1M. This thread runs the sonora WebRTC APM (AEC3, spectral NS, AGC2), RNNoise, VAD, and
+        // Opus+DRED encode. AEC3 stack depth is not bounded by inspection, so keep an overly safe
+        // margin over the default 2M with no measurable cost.
+        .stack_size(1024 * 1024)
         .spawn(move || {
             run_live_encoder_worker(
                 receiver,
@@ -621,6 +629,10 @@ pub fn start_live_playback(config: LivePlaybackConfig) -> Result<LivePlayback, S
     let feedback_sender = config.feedback_sender;
     let worker = thread::Builder::new()
         .name("chatt-audio-live-dec".to_string())
+        // 1M. This thread runs Opus + DRED decode, whose libopus-internal stack depth is not
+        // bounded by inspection. 1M is an overly safe margin over the default 2M with no
+        // measurable cost.
+        .stack_size(1024 * 1024)
         .spawn(move || {
             run_live_decoder_worker(
                 receiver,

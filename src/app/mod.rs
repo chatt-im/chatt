@@ -2561,18 +2561,22 @@ impl App {
             playback_active = self.playback.is_some(),
             settings_preview_capture = self.settings_preview_capture,
         );
-        thread::spawn(move || {
-            let input = audio::input_devices(input_buffer_request);
-            let output = audio::output_devices(output_buffer_request);
-            let _ = tx.send(AudioDeviceRefresh {
-                id,
-                input_buffer_request,
-                output_buffer_request,
-                restart_preview,
-                input,
-                output,
-            });
-        });
+        thread::Builder::new()
+            .name("chatt-dev-refresh".to_string())
+            .stack_size(256 * 1024)
+            .spawn(move || {
+                let input = audio::input_devices(input_buffer_request);
+                let output = audio::output_devices(output_buffer_request);
+                let _ = tx.send(AudioDeviceRefresh {
+                    id,
+                    input_buffer_request,
+                    output_buffer_request,
+                    restart_preview,
+                    input,
+                    output,
+                });
+            })
+            .expect("failed to spawn audio device refresh");
         self.set_status("refreshing audio devices");
     }
 
@@ -2837,23 +2841,29 @@ impl App {
             clip.name,
             packet_loss.as_name()
         ));
-        thread::spawn(move || {
-            let send_failed = Arc::clone(&send_failed);
-            let result = audio::run_live_audio_file_source(source_config, |sequence, frame| {
-                if network_tx
-                    .send(NetworkCommand::SequencedLocalVoicePacket { sequence, frame })
-                    .is_err()
-                    && !send_failed.swap(true, Ordering::AcqRel)
-                {
-                    let _ = network_event_tx.send(NetworkEvent::WorkerStopped {
-                        reason: "network command channel closed while sending soundboard audio"
-                            .to_string(),
-                    });
-                }
-            });
-            busy.store(false, Ordering::Release);
-            let _ = event_tx.send(SoundboardEvent { clip_name, result });
-        });
+        thread::Builder::new()
+            .name("chatt-soundboard".to_string())
+            // 1M. This thread runs Opus encode via run_live_audio_file_source, whose stack depth
+            // is not bounded by inspection. 1M is an overly safe margin over the default 2M.
+            .stack_size(1024 * 1024)
+            .spawn(move || {
+                let send_failed = Arc::clone(&send_failed);
+                let result = audio::run_live_audio_file_source(source_config, |sequence, frame| {
+                    if network_tx
+                        .send(NetworkCommand::SequencedLocalVoicePacket { sequence, frame })
+                        .is_err()
+                        && !send_failed.swap(true, Ordering::AcqRel)
+                    {
+                        let _ = network_event_tx.send(NetworkEvent::WorkerStopped {
+                            reason: "network command channel closed while sending soundboard audio"
+                                .to_string(),
+                        });
+                    }
+                });
+                busy.store(false, Ordering::Release);
+                let _ = event_tx.send(SoundboardEvent { clip_name, result });
+            })
+            .expect("failed to spawn soundboard worker");
     }
 
     fn soundboard_clip_path(&self, clip: &SoundboardClip) -> PathBuf {
@@ -3060,20 +3070,25 @@ impl App {
         let network_tx = network.sender();
         let event_tx = self.event_tx.clone();
         let send_failed = Arc::new(AtomicBool::new(false));
-        thread::spawn(move || {
-            for feedback in feedback_rx {
-                if network_tx
-                    .send(NetworkCommand::PlaybackFeedback(feedback))
-                    .is_err()
-                    && !send_failed.swap(true, Ordering::AcqRel)
-                {
-                    let _ = event_tx.send(NetworkEvent::WorkerStopped {
-                        reason: "network command channel closed while sending playback feedback"
-                            .to_string(),
-                    });
+        thread::Builder::new()
+            .name("chatt-fb-router".to_string())
+            .stack_size(256 * 1024)
+            .spawn(move || {
+                for feedback in feedback_rx {
+                    if network_tx
+                        .send(NetworkCommand::PlaybackFeedback(feedback))
+                        .is_err()
+                        && !send_failed.swap(true, Ordering::AcqRel)
+                    {
+                        let _ = event_tx.send(NetworkEvent::WorkerStopped {
+                            reason:
+                                "network command channel closed while sending playback feedback"
+                                    .to_string(),
+                        });
+                    }
                 }
-            }
-        });
+            })
+            .expect("failed to spawn playback feedback router");
         let configured_output = self.config.audio.output_device_id.clone();
         let playback = match audio::start_live_playback(
             self.live_playback_config(configured_output.clone(), Some(feedback_tx.clone())),
