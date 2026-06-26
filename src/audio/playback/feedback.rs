@@ -156,13 +156,19 @@ impl LivePlaybackFeedbackState {
                     }
                 }
                 if flags & LIVE_PACKET_FLAG_OPUS_RESET != 0 {
+                    let silence_resume = flags & LIVE_PACKET_FLAG_SILENCE_RESUME != 0;
                     kvlog::info!(
                         "live playback delay estimator reset",
                         sequence,
                         flags,
-                        reason = "opus_reset"
+                        reason = "opus_reset",
+                        silence_resume
                     );
-                    self.reset_delay_estimator(sequence, now);
+                    if silence_resume {
+                        self.reset_arrival_baseline(sequence, now);
+                    } else {
+                        self.reset_delay_estimator(sequence, now);
+                    }
                 } else if let Some((last_sequence, last_at)) = self.last_forward_arrival
                     && let Some(distance) = sequence_distance_forward(last_sequence, sequence)
                     && distance > 0
@@ -185,7 +191,7 @@ impl LivePlaybackFeedbackState {
                     let resumed_silence_gap = flags & LIVE_PACKET_FLAG_SILENCE_RESUME != 0
                         && excess >= SILENCE_GAP_HINT_MIN;
                     if hinted_silence_gap || resumed_silence_gap {
-                        self.reset_delay_estimator(sequence, now);
+                        self.reset_arrival_baseline(sequence, now);
                         self.highest_arrived_sequence =
                             Some(self.highest_arrived_sequence.map_or(sequence, |highest| {
                                 sequence_max_forward(highest, sequence)
@@ -240,7 +246,7 @@ impl LivePlaybackFeedbackState {
 
     pub(crate) fn observe_sender_silence(&mut self, sequence: u32, now: Instant) {
         self.ensure_started(now);
-        self.reset_delay_estimator(sequence, now);
+        self.reset_arrival_baseline(sequence, now);
         self.silence_hint_sequence = Some(sequence);
         self.highest_contiguous_sequence = Some(
             self.highest_contiguous_sequence
@@ -289,15 +295,28 @@ impl LivePlaybackFeedbackState {
         self.max_delay_in_interval_ms = self.max_delay_in_interval_ms.max(delay_ms);
     }
 
-    fn reset_delay_estimator(&mut self, sequence: u32, now: Instant) {
+    /// Rebases the forward-arrival timeline onto `sequence` so the silence gap
+    /// preceding it is not measured as a delay spike, while keeping the
+    /// accumulated jitter and loss histograms. A sender pause and resume is the
+    /// same stream over the same path, so its congestion estimate stays valid,
+    /// mirroring NetEQ holding its `DelayManager` across a comfort-noise region
+    /// rather than wiping it.
+    fn reset_arrival_baseline(&mut self, sequence: u32, now: Instant) {
         self.last_forward_arrival = Some((sequence, now));
         self.silence_hint_sequence = None;
         self.forward_arrivals.clear();
-        self.underrun_histogram = DelayHistogram::default();
-        self.reorder_histogram = DelayHistogram::with_forget_factor(REORDER_FORGET_FACTOR);
         self.resample_interval_started_at = None;
         self.max_delay_in_interval_ms = 0.0;
         self.note_forward_arrival(sequence, now);
+    }
+
+    /// Rebases the timeline and drops the jitter and loss histograms. Reserved
+    /// for a genuine stream restart (a bare Opus reset with no silence-resume
+    /// hint), where the prior estimate describes a context that no longer exists.
+    fn reset_delay_estimator(&mut self, sequence: u32, now: Instant) {
+        self.underrun_histogram = DelayHistogram::default();
+        self.reorder_histogram = DelayHistogram::with_forget_factor(REORDER_FORGET_FACTOR);
+        self.reset_arrival_baseline(sequence, now);
     }
 
     fn update_silence_hint(&mut self, sequence: u32, flags: u8) {
@@ -1040,5 +1059,41 @@ mod tests {
             feedback.recommended_target(&tuning),
             tuning.dynamic_target_floor
         );
+    }
+
+    #[test]
+    fn silence_resume_preserves_congestion_target() {
+        // A silence-resume Opus reset (sender paused then resumed the same
+        // stream) must keep the jitter and loss estimate, unlike a bare reset.
+        // Otherwise the trim that fires on the resuming silence marker collapses
+        // the playout buffer to the floor on a still-congested link.
+        let start = Instant::now();
+        let tuning = test_tuning();
+        let mut feedback = LivePlaybackFeedbackState::default();
+
+        feedback.observe_insert(0, 0, &InsertOutcome::Accepted, start);
+        feedback.observe_insert(
+            80,
+            0,
+            &InsertOutcome::Accepted,
+            start + Duration::from_secs(4),
+        );
+        feedback.observe_insert(
+            81,
+            0,
+            &InsertOutcome::Accepted,
+            start + Duration::from_secs(4) + DELAY_RESAMPLE_INTERVAL + Duration::from_millis(1),
+        );
+        let raised = feedback.recommended_target(&tuning);
+        assert!(raised > tuning.target_queue);
+
+        feedback.observe_insert(
+            82,
+            LIVE_PACKET_FLAG_OPUS_RESET | LIVE_PACKET_FLAG_SILENCE_RESUME,
+            &InsertOutcome::Accepted,
+            start + Duration::from_millis(4_540),
+        );
+
+        assert_eq!(feedback.recommended_target(&tuning), raised);
     }
 }
