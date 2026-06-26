@@ -25,3 +25,18 @@ v3-rnnoise = [
     "--features", "avx2 rnnoise-v2",
     "--config", "target.'cfg(target_arch = \"x86_64\")'.rustflags=['-C', 'target-cpu=x86-64-v3']",
 ]
+
+# Heap profiling with dhat. Builds the `dhat` profile (release + debug info),
+# drops the mimalloc allocator (`--no-default-features`), and arms the dhat
+# profiler. Extra args pass through, e.g.:
+#   cargo dhat -- --config chatt.toml
+#   cargo dhat -- test-audio-playback assets/sample-001.opus --loss congested_wifi
+# Writes `dhat-heap.json` on exit. View it at:
+#   https://nnethercote.github.io/dh_view/dh_view.html
+# See docs/profiling.md.
+dhat = [
+    "run",
+    "--profile", "dhat",
+    "--no-default-features",
+    "--features", "audio-realtime dhat-heap",
+]

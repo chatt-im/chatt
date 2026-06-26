@@ -7,12 +7,20 @@ use crate::audio::shared::{
     DecodedFrameSource, PlayoutDelay, SAMPLE_RATE, peak_normalized, rms_normalized,
 };
 
+/// Maximum number of recycled sample buffers held between frames. Bounds idle
+/// memory while still absorbing the queue-depth bursts that loss/DRED recovery
+/// allows.
+const FREE_LIST_CAP: usize = 64;
+
 #[derive(Default)]
 pub(crate) struct MonoSampleQueue {
     frames: VecDeque<QueuedAudioFrame>,
     /// Running sum of `remaining_len()` across all queued frames. Kept in sync
     /// by every mutator so `frames()` is O(1) on the per-sample playback path.
     total: usize,
+    /// Sample buffers reclaimed from fully consumed frames, reused by
+    /// [`Self::take_buffer`] so the steady push/pop path does not allocate.
+    free: Vec<Vec<f32>>,
 }
 
 pub(crate) struct QueuedAudioFrame {
@@ -49,7 +57,32 @@ impl MonoSampleQueue {
         Self {
             frames: VecDeque::with_capacity(capacity),
             total: 0,
+            free: Vec::new(),
         }
+    }
+
+    /// Returns a cleared buffer with room for `len` samples, reusing a recycled
+    /// one when the free list is non-empty. Callers fill it and hand it back to
+    /// the queue via [`Self::push_back_owned`].
+    pub(crate) fn take_buffer(&mut self, len: usize) -> Vec<f32> {
+        match self.free.pop() {
+            Some(mut buffer) => {
+                buffer.clear();
+                buffer.reserve(len);
+                buffer
+            }
+            None => Vec::with_capacity(len),
+        }
+    }
+
+    /// Returns a consumed buffer to the free list, dropping it once the list is
+    /// full.
+    fn recycle(&mut self, mut buffer: Vec<f32>) {
+        if self.free.len() >= FREE_LIST_CAP {
+            return;
+        }
+        buffer.clear();
+        self.free.push(buffer);
     }
 
     pub(crate) fn push_back(&mut self, samples: &[f32]) {
@@ -57,7 +90,9 @@ impl MonoSampleQueue {
     }
 
     fn push_back_with_source(&mut self, samples: &[f32], source: DecodedFrameSource) {
-        self.push_back_owned(samples.to_vec(), source);
+        let mut buffer = self.take_buffer(samples.len());
+        buffer.extend_from_slice(samples);
+        self.push_back_owned(buffer, source);
     }
 
     /// Enqueues an owned sample buffer without copying it. Callers that already
@@ -102,11 +137,15 @@ impl MonoSampleQueue {
                 frame.offset += 1;
                 self.total -= 1;
                 if frame.offset >= frame.samples.len() {
-                    self.frames.pop_front();
+                    if let Some(frame) = self.frames.pop_front() {
+                        self.recycle(frame.samples);
+                    }
                 }
                 return Some(sample);
             }
-            self.frames.pop_front();
+            if let Some(frame) = self.frames.pop_front() {
+                self.recycle(frame.samples);
+            }
         }
     }
 
@@ -128,7 +167,9 @@ impl MonoSampleQueue {
             }
             self.total -= available;
             remaining -= available;
-            self.frames.pop_front();
+            if let Some(frame) = self.frames.pop_front() {
+                self.recycle(frame.samples);
+            }
         }
     }
 
@@ -285,7 +326,9 @@ impl MonoSampleQueue {
                 .get(frame_index)
                 .is_some_and(|frame| frame.remaining_len() == 0)
             {
-                self.frames.remove(frame_index);
+                if let Some(frame) = self.frames.remove(frame_index) {
+                    self.recycle(frame.samples);
+                }
             }
             len -= remove;
         }

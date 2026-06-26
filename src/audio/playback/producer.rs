@@ -95,36 +95,6 @@ impl RingPlaybackProducer {
             .queue_samples_with_delay(samples, source, playout_delay, now, stats);
     }
 
-    /// Same as [`Self::queue_samples`] but takes ownership of the decoded buffer,
-    /// avoiding a copy on the worker's hot path.
-    pub(crate) fn queue_samples_owned(
-        &mut self,
-        samples: Vec<f32>,
-        source: DecodedFrameSource,
-        playout_delay: Option<PlayoutDelay>,
-        now: Instant,
-        stats: &mut LivePlaybackMixerStats,
-    ) {
-        match source {
-            DecodedFrameSource::Normal => {}
-            DecodedFrameSource::Dred => {
-                stats.dred_recoveries = stats.dred_recoveries.saturating_add(1);
-            }
-            DecodedFrameSource::Plc => {
-                stats.plc_fallbacks = stats.plc_fallbacks.saturating_add(1);
-            }
-            DecodedFrameSource::DecodeError => {
-                stats.record_decode_error();
-                return;
-            }
-        }
-        if samples.is_empty() {
-            return;
-        }
-        self.stream
-            .queue_samples_owned_with_delay(samples, source, playout_delay, now, stats);
-    }
-
     pub(crate) fn apply_recommended_target(&mut self, recommended: Duration, now: Instant) {
         self.stream.apply_recommended_target(recommended, now);
     }

@@ -11,7 +11,8 @@ use crate::{
     audio::{
         capture::OpusVoiceEncoder,
         playback::{
-            AdaptivePlaybackStream, LiveDecodeStream, LivePlaybackMixer, LivePlaybackMixerStats,
+            AdaptivePlaybackStream, DrainEvent, LiveDecodeStream, LivePlaybackMixer,
+            LivePlaybackMixerStats,
         },
         shared::{
             DEFAULT_LIVE_MAX_AMPLIFICATION, DecodedFrameSource, FRAME_SAMPLES,
@@ -184,29 +185,23 @@ pub(crate) fn drive_gap_recovery(
     // frames and the remainder in one pass so the gap-bounding packet is
     // visible to DRED recovery.
     let t1 = start + tuning.initial_buffer + Duration::from_millis(1);
-    stream.drain_ready(
-        t1,
-        start,
-        1,
-        &mut trace,
-        |_, samples, source, _| {
+    stream.drain_ready(t1, start, 1, &mut trace, |_, event| {
+        if let DrainEvent::Samples {
+            samples, source, ..
+        } = event
+        {
             collected.push((source, samples.len()));
-        },
-        || {},
-        || {},
-    );
+        }
+    });
     let t2 = t1 + tuning.max_reorder_delay + Duration::from_millis(1);
-    stream.drain_ready(
-        t2,
-        start,
-        1,
-        &mut trace,
-        |_, samples, source, _| {
+    stream.drain_ready(t2, start, 1, &mut trace, |_, event| {
+        if let DrainEvent::Samples {
+            samples, source, ..
+        } = event
+        {
             collected.push((source, samples.len()));
-        },
-        || {},
-        || {},
-    );
+        }
+    });
     (collected, stream)
 }
 
