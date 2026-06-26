@@ -338,16 +338,29 @@ impl MonoSampleQueue {
         if local_index == 0 {
             return true;
         }
-        let Some(frame) = self.frames.get_mut(frame_index) else {
-            return false;
+        let (split_at, tail_len, source, timing) = {
+            let Some(frame) = self.frames.get(frame_index) else {
+                return false;
+            };
+            let split_at = frame.offset.saturating_add(local_index);
+            if split_at >= frame.samples.len() {
+                return false;
+            }
+            (
+                split_at,
+                frame.samples.len() - split_at,
+                frame.source,
+                frame.timing.map(|timing| timing.at_media_offset(split_at)),
+            )
         };
-        let split_at = frame.offset.saturating_add(local_index);
-        if split_at >= frame.samples.len() {
-            return false;
+        // Reuse a recycled buffer for the tail instead of `Vec::split_off`, which
+        // would allocate a fresh `Vec` on every mid-frame split. The original
+        // frame keeps its allocation via `truncate`.
+        let mut tail = self.take_buffer(tail_len);
+        if let Some(frame) = self.frames.get_mut(frame_index) {
+            tail.extend_from_slice(&frame.samples[split_at..]);
+            frame.samples.truncate(split_at);
         }
-        let tail = frame.samples.split_off(split_at);
-        let source = frame.source;
-        let timing = frame.timing.map(|timing| timing.at_media_offset(split_at));
         let tail_frame = QueuedAudioFrame::new_with_timing(tail, source, timing);
         self.frames.insert(frame_index + 1, tail_frame);
         true
@@ -516,5 +529,25 @@ mod tests {
             queue.front_playout_delay(start).unwrap().current,
             Duration::from_millis(95)
         );
+    }
+
+    #[test]
+    fn interior_drain_via_split_preserves_sample_layout() {
+        let mut queue = MonoSampleQueue::new();
+        queue.push_back(&samples(20));
+
+        // Removing an interior run forces `split_frame_at`. The surviving
+        // samples must be the original sequence with [5, 10) excised.
+        queue.drain_range(5, 5);
+        assert_eq!(queue.frames(), 15);
+
+        let mut remaining = Vec::new();
+        while let Some(sample) = queue.pop_front_sample() {
+            remaining.push(sample);
+        }
+
+        let mut expected: Vec<f32> = (0..5).map(|index| index as f32).collect();
+        expected.extend((10..20).map(|index| index as f32));
+        assert_eq!(remaining, expected);
     }
 }
