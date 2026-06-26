@@ -196,8 +196,9 @@ pub(crate) struct LiveEncoderPipeline {
     encoder: OpusVoiceEncoder,
     auto_gain_enabled: bool,
     tuning: LiveAudioTuning,
-    /// Consolidated high-pass / AEC3 / noise-suppression / AGC2 front-end. The
-    /// VAD is taken from `earshot` after this runs.
+    /// Consolidated high-pass / AEC3 / noise-suppression / AGC2 front-end. When
+    /// the RNNoise engine is active it also supplies the VAD, so `earshot` only
+    /// runs as the fallback for the non-RNNoise engines.
     processor: CaptureProcessor,
     earshot: EarshotVad,
     typing_gate: TypingNoiseGate,
@@ -341,13 +342,18 @@ impl LiveEncoderPipeline {
             .filter(|source| source.enabled())
             .map(|source| source.reference());
         self.processor.set_echo_enabled(reference.is_some());
-        // Earshot drives gating and silence decisions even when RNNoise is
-        // active. RNNoise VAD over-scores keyboard/table thumps in this capture
-        // path, while Earshot is less prone to that false-open behaviour.
-        let rnnoise_vad = self.processor.process(frame, reference).unwrap_or_default();
-        let vad_probability = self.earshot.process_48k_frame(frame);
+        // The RNNoise engine supplies its own VAD and drives gating directly.
+        // Earshot, which holds a non-zero floor on steady background noise, only
+        // runs as the fallback for the non-RNNoise engines.
+        let rnnoise_vad = self.processor.process(frame, reference);
+        let earshot_vad = match rnnoise_vad {
+            Some(_) => 0.0,
+            None => self.earshot.process_48k_frame(frame),
+        };
+        let rnnoise_vad = rnnoise_vad.unwrap_or_default();
+        let vad_probability = rnnoise_vad.max(earshot_vad);
         self.typing_gate
-            .process(rnnoise_vad, vad_probability, frame);
+            .process(rnnoise_vad, earshot_vad, frame);
         store_processed_level_stats(stats, frame);
         stats.store_vad_probability(vad_probability);
         let vad = vad_to_u8(vad_probability);
