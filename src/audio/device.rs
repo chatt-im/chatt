@@ -5,7 +5,7 @@ use std::{
     sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
-        mpsc::SyncSender,
+        mpsc::{Receiver, SyncSender},
     },
     time::Instant,
 };
@@ -841,6 +841,7 @@ pub(crate) fn build_input_stream(
     stream_config: StreamConfig,
     channels: usize,
     sender: SyncSender<Vec<f32>>,
+    recycle: Receiver<Vec<f32>>,
     stats: AudioStats,
     callback_buffer_observer: Option<Arc<AudioCallbackBufferObserver>>,
 ) -> Result<Stream, String> {
@@ -851,6 +852,7 @@ pub(crate) fn build_input_stream(
             stream_config,
             channels,
             sender,
+            recycle,
             stats,
             callback_buffer_observer,
         ),
@@ -859,6 +861,7 @@ pub(crate) fn build_input_stream(
             stream_config,
             channels,
             sender,
+            recycle,
             stats,
             callback_buffer_observer,
         ),
@@ -867,6 +870,7 @@ pub(crate) fn build_input_stream(
             stream_config,
             channels,
             sender,
+            recycle,
             stats,
             callback_buffer_observer,
         ),
@@ -875,6 +879,7 @@ pub(crate) fn build_input_stream(
             stream_config,
             channels,
             sender,
+            recycle,
             stats,
             callback_buffer_observer,
         ),
@@ -883,6 +888,7 @@ pub(crate) fn build_input_stream(
             stream_config,
             channels,
             sender,
+            recycle,
             stats,
             callback_buffer_observer,
         ),
@@ -891,6 +897,7 @@ pub(crate) fn build_input_stream(
             stream_config,
             channels,
             sender,
+            recycle,
             stats,
             callback_buffer_observer,
         ),
@@ -899,6 +906,7 @@ pub(crate) fn build_input_stream(
             stream_config,
             channels,
             sender,
+            recycle,
             stats,
             callback_buffer_observer,
         ),
@@ -907,6 +915,7 @@ pub(crate) fn build_input_stream(
             stream_config,
             channels,
             sender,
+            recycle,
             stats,
             callback_buffer_observer,
         ),
@@ -915,6 +924,7 @@ pub(crate) fn build_input_stream(
             stream_config,
             channels,
             sender,
+            recycle,
             stats,
             callback_buffer_observer,
         ),
@@ -923,6 +933,7 @@ pub(crate) fn build_input_stream(
             stream_config,
             channels,
             sender,
+            recycle,
             stats,
             callback_buffer_observer,
         ),
@@ -931,6 +942,7 @@ pub(crate) fn build_input_stream(
             stream_config,
             channels,
             sender,
+            recycle,
             stats,
             callback_buffer_observer,
         ),
@@ -939,6 +951,7 @@ pub(crate) fn build_input_stream(
             stream_config,
             channels,
             sender,
+            recycle,
             stats,
             callback_buffer_observer,
         ),
@@ -951,6 +964,7 @@ fn build_typed_input_stream<T>(
     stream_config: StreamConfig,
     channels: CallbackChannelCount,
     sender: SyncSender<Vec<f32>>,
+    recycle: Receiver<Vec<f32>>,
     stats: AudioStats,
     callback_buffer_observer: Option<Arc<AudioCallbackBufferObserver>>,
 ) -> Result<Stream, String>
@@ -967,7 +981,8 @@ where
                 if let Some(observer) = callback_buffer_observer.as_ref() {
                     observer.observe(input.len(), channels);
                 }
-                capture_callback(input, channels, &sender, &data_stats);
+                let mono = recycle.try_recv().unwrap_or_default();
+                capture_callback(input, channels, mono, &sender, &data_stats);
             },
             move |error| {
                 if error.kind() == ErrorKind::RealtimeDenied {
@@ -1396,13 +1411,14 @@ fn live_playback_callback<T>(
 fn capture_callback<T>(
     input: &[T],
     channels: CallbackChannelCount,
+    mut mono: Vec<f32>,
     sender: &SyncSender<Vec<f32>>,
     stats: &AudioStats,
 ) where
     T: Sample,
     f32: FromSample<T>,
 {
-    let mono = downmix_to_mono_i16_scale(input, channels.get());
+    downmix_to_mono_i16_scale_into(input, channels.get(), &mut mono);
     let samples = mono.len() as u64;
     let rms = rms_i16_scale(&mono);
     let peak = peak_i16_scale(&mono);
@@ -1424,24 +1440,24 @@ fn capture_callback<T>(
     }
 }
 
-fn downmix_to_mono_i16_scale<T>(input: &[T], channels: usize) -> Vec<f32>
+fn downmix_to_mono_i16_scale_into<T>(input: &[T], channels: usize, out: &mut Vec<f32>)
 where
     T: Sample,
     f32: FromSample<T>,
 {
+    out.clear();
     if channels == 0 {
-        return Vec::new();
+        return;
     }
 
-    let mut mono = Vec::with_capacity(input.len() / channels);
+    out.reserve(input.len() / channels);
     for frame in input.chunks_exact(channels) {
         let mut sum = 0.0f32;
         for sample in frame {
             sum += sample.to_sample::<f32>() * i16::MAX as f32;
         }
-        mono.push(sum / channels as f32);
+        out.push(sum / channels as f32);
     }
-    mono
 }
 
 #[cfg(test)]
@@ -1599,11 +1615,26 @@ mod tests {
 
     #[test]
     fn downmixes_interleaved_samples_to_mono_i16_scale() {
-        let mono = downmix_to_mono_i16_scale(&[0.5f32, -0.5, 0.25, 0.75], 2);
+        let mut mono = Vec::new();
+        downmix_to_mono_i16_scale_into(&[0.5f32, -0.5, 0.25, 0.75], 2, &mut mono);
 
         assert_eq!(mono.len(), 2);
         assert!(mono[0].abs() < 0.01);
         assert!((mono[1] - 0.5 * i16::MAX as f32).abs() < 1.0);
+
+        // Mono input passes each sample through at i16 scale.
+        let mut mono_in = Vec::new();
+        downmix_to_mono_i16_scale_into(&[0.25f32, -0.5], 1, &mut mono_in);
+        assert_eq!(mono_in.len(), 2);
+        assert!((mono_in[0] - 0.25 * i16::MAX as f32).abs() < 1.0);
+        assert!((mono_in[1] + 0.5 * i16::MAX as f32).abs() < 1.0);
+
+        // Reusing the same buffer for an equal-size fill grows no capacity, so the
+        // recycled callback path allocates nothing after the first fill.
+        let capacity_before = mono.capacity();
+        downmix_to_mono_i16_scale_into(&[0.1f32, 0.2, 0.3, 0.4], 2, &mut mono);
+        assert_eq!(mono.len(), 2);
+        assert_eq!(mono.capacity(), capacity_before);
     }
 
     #[test]

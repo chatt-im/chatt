@@ -1,7 +1,7 @@
 use std::sync::{
     Arc,
     atomic::{AtomicU32, Ordering},
-    mpsc::Receiver,
+    mpsc::{Receiver, SyncSender},
 };
 
 use nnnoiseless::DenoiseState;
@@ -34,6 +34,7 @@ const SILENCE_KEEPALIVE_CAPTURE_FRAMES: usize = 100;
 
 pub(crate) fn run_encoder_worker(
     receiver: Receiver<Vec<f32>>,
+    recycle: SyncSender<Vec<f32>>,
     mut writer: PacketLogWriter<std::io::BufWriter<std::fs::File>>,
     mut encoder: OpusVoiceEncoder,
     denoise: DenoiseConfig,
@@ -42,6 +43,7 @@ pub(crate) fn run_encoder_worker(
 ) {
     let result = run_encoder_worker_inner(
         receiver,
+        recycle,
         &mut writer,
         &mut encoder,
         denoise,
@@ -60,6 +62,7 @@ pub(crate) fn run_encoder_worker(
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn run_live_encoder_worker<F>(
     receiver: Receiver<Vec<f32>>,
+    recycle: SyncSender<Vec<f32>>,
     encoder: OpusVoiceEncoder,
     denoise: DenoiseConfig,
     max_amplification_bits: Arc<AtomicU32>,
@@ -76,6 +79,7 @@ pub(crate) fn run_live_encoder_worker<F>(
 {
     let result = run_live_encoder_worker_inner(
         receiver,
+        recycle,
         encoder,
         denoise,
         &max_amplification_bits,
@@ -96,6 +100,7 @@ pub(crate) fn run_live_encoder_worker<F>(
 
 pub(crate) fn run_encoder_worker_inner(
     receiver: Receiver<Vec<f32>>,
+    recycle: SyncSender<Vec<f32>>,
     writer: &mut PacketLogWriter<std::io::BufWriter<std::fs::File>>,
     encoder: &mut OpusVoiceEncoder,
     denoise: DenoiseConfig,
@@ -114,7 +119,7 @@ pub(crate) fn run_encoder_worker_inner(
     let mut encoded = vec![0u8; MAX_OPUS_PACKET_BYTES];
 
     for chunk in receiver {
-        accumulator.push_chunk(&chunk, |frame| {
+        let result = accumulator.push_chunk(&chunk, |frame| {
             high_pass.process(frame);
             if let Some(gain) = gain.as_mut() {
                 gain.process(frame);
@@ -136,7 +141,9 @@ pub(crate) fn run_encoder_worker_inner(
                 .map_err(|error| format!("failed to write packet log: {error}"))?;
             stats.record_encoded_packet(packet_len);
             Ok(())
-        })?;
+        });
+        let _ = recycle.try_send(chunk);
+        result?;
     }
 
     Ok(())
@@ -145,6 +152,7 @@ pub(crate) fn run_encoder_worker_inner(
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn run_live_encoder_worker_inner<F>(
     receiver: Receiver<Vec<f32>>,
+    recycle: SyncSender<Vec<f32>>,
     encoder: OpusVoiceEncoder,
     denoise: DenoiseConfig,
     max_amplification_bits: &AtomicU32,
@@ -187,6 +195,7 @@ where
             stats,
             on_packet,
         )?;
+        let _ = recycle.try_send(chunk);
     }
 
     Ok(())
@@ -352,8 +361,7 @@ impl LiveEncoderPipeline {
         };
         let rnnoise_vad = rnnoise_vad.unwrap_or_default();
         let vad_probability = rnnoise_vad.max(earshot_vad);
-        self.typing_gate
-            .process(rnnoise_vad, earshot_vad, frame);
+        self.typing_gate.process(rnnoise_vad, earshot_vad, frame);
         store_processed_level_stats(stats, frame);
         stats.store_vad_probability(vad_probability);
         let vad = vad_to_u8(vad_probability);
