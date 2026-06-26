@@ -83,6 +83,7 @@ opt-level = 2
 # `-C target-cpu=x86-64-v3` together.
 [profile.release-v3]
 inherits = "release"
+debug = 1
 
 # Heap-profiling build. Release codegen so the allocation pattern matches a real
 # run, plus full debug info so dhat backtraces resolve to functions and lines.

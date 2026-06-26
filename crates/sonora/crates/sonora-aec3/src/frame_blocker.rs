@@ -35,7 +35,7 @@ impl FrameBlocker {
     /// slice has `SUB_FRAME_LENGTH` (80) samples.
     pub fn insert_sub_frame_and_extract_block(
         &mut self,
-        sub_frame: &[Vec<&[f32]>],
+        sub_frame: &[Vec<Vec<f32>>],
         block: &mut Block,
     ) {
         debug_assert_eq!(self.num_bands, block.num_bands());
@@ -126,13 +126,6 @@ mod tests {
         }
     }
 
-    fn make_sub_frame_view(sub_frame: &[Vec<Vec<f32>>]) -> Vec<Vec<&[f32]>> {
-        sub_frame
-            .iter()
-            .map(|band| band.iter().map(|ch| ch.as_slice()).collect())
-            .collect()
-    }
-
     fn verify_block(block_counter: usize, offset: i32, block: &Block) -> bool {
         for band in 0..block.num_bands() {
             for channel in 0..block.num_channels() {
@@ -189,9 +182,7 @@ mod tests {
         let mut block_counter = 0;
         for sub_frame_index in 0..NUM_SUB_FRAMES {
             fill_sub_frame(sub_frame_index, 0, &mut input_sub_frame);
-            let view = make_sub_frame_view(&input_sub_frame);
-
-            blocker.insert_sub_frame_and_extract_block(&view, &mut block);
+            blocker.insert_sub_frame_and_extract_block(&input_sub_frame, &mut block);
             assert!(
                 verify_block(block_counter, 0, &block),
                 "block {block_counter} mismatch"
@@ -228,9 +219,7 @@ mod tests {
 
         for sub_frame_index in 0..NUM_SUB_FRAMES {
             fill_sub_frame(sub_frame_index, 0, &mut input_sub_frame);
-            let view = make_sub_frame_view(&input_sub_frame);
-
-            blocker.insert_sub_frame_and_extract_block(&view, &mut block);
+            blocker.insert_sub_frame_and_extract_block(&input_sub_frame, &mut block);
             framer.insert_block_and_extract_sub_frame(&block, &mut output_sub_frame);
 
             if (sub_frame_index + 1) % 4 == 0 {
