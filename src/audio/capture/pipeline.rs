@@ -366,6 +366,7 @@ impl LiveEncoderPipeline {
         stats.store_vad_probability(vad_probability);
         let vad = vad_to_u8(vad_probability);
         let silence = is_capture_skip_safe_silence(self.tuning, vad, frame);
+        stats.store_voice_active(!silence);
 
         let decision = self
             .long_silence

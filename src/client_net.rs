@@ -31,8 +31,9 @@ use rpc::{
         ChatMessage, ClientControl, DEFAULT_FILE_SIZE_LIMIT_BYTES, ERROR_AUTH_REJECTED,
         ERROR_PAIRING_CODE_MISMATCH, ERROR_PAIRING_INVALID_REQUEST, ERROR_PAIRING_NOT_ACTIVE,
         FileMetadata, MAX_FILE_CHUNK_BYTES, MAX_FILE_NAME_BYTES, P2pCandidate, P2pCandidateKind,
-        P2pKey, P2pNatKind, P2pPeerInfo, P2pRole, ParticipantInfo, RoomInfo, ServerControl,
-        decode_server_control, decode_server_hello, encode_client_control, encode_client_hello,
+        P2pKey, P2pNatKind, P2pPeerInfo, P2pRole, ParticipantInfo, ParticipantVoiceStatus,
+        RoomInfo, ServerControl, decode_server_control, decode_server_hello, encode_client_control,
+        encode_client_hello,
     },
     crypto::{
         AntiReplay, CHANNEL_CONTROL, ControlTransport, HandshakeMode, KEY_LEN, KeyMaterial,
@@ -118,6 +119,7 @@ pub enum NetworkCommand {
     },
     SetPlaybackSink(Option<LivePlaybackSink>),
     PlaybackFeedback(LivePlaybackFeedback),
+    SetVoiceStatus(ParticipantVoiceStatus),
     Shutdown,
 }
 
@@ -158,6 +160,10 @@ pub enum NetworkEvent {
     },
     VoicePacket(RemoteVoicePacket),
     PlaybackFeedback(LivePlaybackFeedback),
+    VoiceStatus {
+        user_id: UserId,
+        status: ParticipantVoiceStatus,
+    },
     EncoderProfileChanged(LiveEncoderProfile),
     Status(String),
     Error(String),
@@ -1617,6 +1623,9 @@ impl WorkerState {
                     self.send_p2p_voice_feedback(session_id, stream_id, feedback);
                 }
             }
+            NetworkCommand::SetVoiceStatus(status) => {
+                self.queue_control(ClientControl::SetVoiceStatus { status })?;
+            }
             NetworkCommand::Shutdown => {
                 kvlog::info!("shutdown command handling");
                 self.shutdown = true;
@@ -2082,6 +2091,19 @@ impl WorkerState {
                 let _ = self
                     .events
                     .send(NetworkEvent::VoiceStopped { user_id, stream_id });
+            }
+            ServerControl::VoiceStatus {
+                user_id, status, ..
+            } => {
+                kvlog::info!(
+                    "client voice status received",
+                    user_id = user_id.0,
+                    muted = status.muted,
+                    deafened = status.deafened
+                );
+                let _ = self
+                    .events
+                    .send(NetworkEvent::VoiceStatus { user_id, status });
             }
             ServerControl::UdpBound => {
                 kvlog::info!("client udp bound");
@@ -3023,6 +3045,7 @@ fn network_command_kind(command: &NetworkCommand) -> &'static str {
         NetworkCommand::SequencedLocalVoicePacket { .. } => "sequenced_local_voice_packet",
         NetworkCommand::SetPlaybackSink(_) => "set_playback_sink",
         NetworkCommand::PlaybackFeedback(_) => "playback_feedback",
+        NetworkCommand::SetVoiceStatus(_) => "set_voice_status",
         NetworkCommand::Shutdown => "shutdown",
     }
 }
@@ -3067,6 +3090,7 @@ fn client_control_kind(control: &ClientControl) -> &'static str {
         ClientControl::SendChat { .. } => "send_chat",
         ClientControl::StartVoice { .. } => "start_voice",
         ClientControl::StopVoice { .. } => "stop_voice",
+        ClientControl::SetVoiceStatus { .. } => "set_voice_status",
         ClientControl::PublishP2p { .. } => "publish_p2p",
         ClientControl::UploadFileStart { .. } => "upload_file_start",
         ClientControl::UploadFileChunk { .. } => "upload_file_chunk",
@@ -3084,6 +3108,7 @@ fn server_control_kind(control: &ServerControl) -> &'static str {
         ServerControl::Presence { .. } => "presence",
         ServerControl::VoiceStarted { .. } => "voice_started",
         ServerControl::VoiceStopped { .. } => "voice_stopped",
+        ServerControl::VoiceStatus { .. } => "voice_status",
         ServerControl::UdpBound => "udp_bound",
         ServerControl::UdpReflexive { .. } => "udp_reflexive",
         ServerControl::P2pNatProbe { .. } => "p2p_nat_probe",

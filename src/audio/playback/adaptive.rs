@@ -1092,6 +1092,14 @@ impl AdaptivePlaybackStream {
             .front_playout_delay(now)
             .map(|delay| samples_for_duration(delay.current))
     }
+
+    pub(crate) fn voice_active(&self) -> bool {
+        !self.sender_silent && !self.passive_output_active
+    }
+
+    pub(crate) fn voice_rms(&self) -> f32 {
+        self.input.front_level().map_or(0.0, |(rms, _peak)| rms)
+    }
 }
 
 fn samples_are_passive(samples: &[f32]) -> bool {
@@ -1260,6 +1268,22 @@ mod tests {
             "stream stayed dead after the pause; only {} ms played back",
             samples_to_ms(played)
         );
+    }
+
+    #[test]
+    fn quiet_decoded_audio_exposes_level_below_time_scale_vad() {
+        let now = Instant::now();
+        let mut stream = AdaptivePlaybackStream::new(test_tuning()).unwrap();
+        let mut stats = LivePlaybackMixerStats::default();
+        let quiet = vec![0.005; FRAME_SAMPLES];
+
+        stream.queue_samples(&quiet, DecodedFrameSource::Normal, now, &mut stats);
+
+        assert!(
+            !stream.voice_active(),
+            "time-scaling should still classify this level as passive"
+        );
+        assert!((stream.voice_rms() - 0.005).abs() < f32::EPSILON);
     }
 
     #[test]

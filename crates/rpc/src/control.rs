@@ -66,6 +66,9 @@ pub enum ClientControl {
     StopVoice {
         stream_id: StreamId,
     },
+    SetVoiceStatus {
+        status: ParticipantVoiceStatus,
+    },
     PublishP2p {
         room_id: RoomId,
         generation: u64,
@@ -128,6 +131,11 @@ pub enum ServerControl {
         user_id: UserId,
         stream_id: StreamId,
     },
+    VoiceStatus {
+        room_id: RoomId,
+        user_id: UserId,
+        status: ParticipantVoiceStatus,
+    },
     UdpBound,
     UdpReflexive {
         addr: String,
@@ -182,6 +190,23 @@ pub struct ParticipantInfo {
     pub user_id: UserId,
     pub name: String,
     pub in_call: bool,
+    pub voice_status: ParticipantVoiceStatus,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Jsony)]
+#[jsony(Binary, version)]
+pub struct ParticipantVoiceStatus {
+    pub muted: bool,
+    pub deafened: bool,
+}
+
+impl ParticipantVoiceStatus {
+    pub fn normalized(mut self) -> Self {
+        if self.deafened {
+            self.muted = true;
+        }
+        self
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Jsony)]
@@ -693,6 +718,25 @@ mod tests {
         };
         let encoded = encode_server_control(&control);
         assert_eq!(decode_server_control(&encoded).unwrap(), control);
+    }
+
+    #[test]
+    fn voice_status_controls_round_trip() {
+        let status = ParticipantVoiceStatus {
+            muted: true,
+            deafened: false,
+        };
+        let client = ClientControl::SetVoiceStatus { status };
+        let encoded = encode_client_control(&client).unwrap();
+        assert_eq!(decode_client_control(&encoded).unwrap(), client);
+
+        let server = ServerControl::VoiceStatus {
+            room_id: RoomId(1),
+            user_id: UserId(2),
+            status,
+        };
+        let encoded = encode_server_control(&server);
+        assert_eq!(decode_server_control(&encoded).unwrap(), server);
     }
 
     #[test]

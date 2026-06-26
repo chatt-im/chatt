@@ -22,11 +22,11 @@ use crate::{
             DecodedFrameSource, FRAME_SAMPLES, LIVE_OPUS_FRAME_SAMPLES,
             LIVE_PACKET_FLAG_OPUS_RESET, LIVE_PACKET_FLAG_SILENCE_RESUME,
             LIVE_PLAYBACK_DRAIN_INTERVAL, LIVE_PLAYBACK_DRED_MAX_SAMPLES, LiveAudioTraceWriter,
-            LiveAudioTuning, LivePlaybackFeedback, LivePlaybackSnapshot, MAX_OPUS_DECODE_SAMPLES,
-            PlayoutDelay, RemoteVoicePacket, VoicePayload, duration_to_ms, samples_for_duration,
-            samples_to_ms, sequence_distance_forward, trace_decode_output, trace_decoder_reset,
-            trace_dred_parse, trace_dred_skip, trace_fast_forward, trace_jitter_item,
-            trace_mixer_queue,
+            LiveAudioTuning, LivePlaybackFeedback, LivePlaybackSnapshot,
+            LivePlaybackStreamActivity, MAX_OPUS_DECODE_SAMPLES, PlayoutDelay, RemoteVoicePacket,
+            VoicePayload, duration_to_ms, samples_for_duration, samples_to_ms,
+            sequence_distance_forward, trace_decode_output, trace_decoder_reset, trace_dred_parse,
+            trace_dred_skip, trace_fast_forward, trace_jitter_item, trace_mixer_queue,
         },
     },
     network::{AudioPacketRef, InsertOutcome, PlayoutItem},
@@ -397,6 +397,15 @@ impl LiveDecodeStreams {
 
         LivePlaybackSnapshot {
             active_streams: self.streams.len(),
+            stream_activity: self
+                .producers
+                .iter()
+                .map(|(stream_id, producer)| LivePlaybackStreamActivity {
+                    stream_id: *stream_id,
+                    voice_active: producer.voice_active(),
+                    rms: producer.voice_rms(),
+                })
+                .collect(),
             queued_samples,
             max_queue_ms: samples_to_ms(max_queue_samples),
             max_playout_delay_ms: samples_to_ms(max_playout_delay_samples),

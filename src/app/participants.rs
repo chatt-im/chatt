@@ -1,7 +1,7 @@
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use rpc::{
-    control::{ChatMessage, ParticipantInfo},
+    control::{ChatMessage, ParticipantInfo, ParticipantVoiceStatus},
     ids::{StreamId, UserId},
 };
 
@@ -13,6 +13,9 @@ pub(crate) struct ParticipantState {
     pub(crate) name: String,
     pub(crate) online: bool,
     pub(crate) voice_active: bool,
+    pub(crate) voice_status: ParticipantVoiceStatus,
+    pub(crate) talking_display: bool,
+    last_talking_at: Option<Instant>,
     pub(crate) p2p_direct: bool,
     pub(crate) last_message_ms: Option<u64>,
     pub(crate) last_voice_at: Option<Instant>,
@@ -57,16 +60,23 @@ impl Participants {
             existing.name = participant.name;
             existing.online = online;
             existing.voice_active = participant.in_call;
-            if !participant.in_call {
+            existing.voice_status = participant.voice_status.normalized();
+            if !online || !participant.in_call || existing.voice_status.muted {
                 existing.p2p_direct = false;
                 existing.voice_feedback = None;
+                existing.talking_display = false;
+                existing.last_talking_at = None;
             }
         } else {
+            let voice_status = participant.voice_status.normalized();
             self.entries.push(ParticipantState {
                 user_id: participant.user_id,
                 name: participant.name,
                 online,
                 voice_active: participant.in_call,
+                voice_status,
+                talking_display: false,
+                last_talking_at: None,
                 p2p_direct: false,
                 last_message_ms: None,
                 last_voice_at: None,
@@ -103,9 +113,49 @@ impl Participants {
             entry.voice_active = false;
             entry.p2p_direct = false;
             entry.voice_feedback = None;
+            entry.talking_display = false;
+            entry.last_talking_at = None;
             if entry.active_stream == Some(stream_id) {
                 entry.active_stream = None;
             }
+        }
+    }
+
+    pub(crate) fn set_voice_status(&mut self, user_id: UserId, status: ParticipantVoiceStatus) {
+        let entry = self.ensure_user(user_id, &format!("user {}", user_id.0));
+        entry.voice_status = status.normalized();
+        if entry.voice_status.muted {
+            entry.talking_display = false;
+            entry.last_talking_at = None;
+        }
+    }
+
+    pub(crate) fn update_talking_display(
+        &mut self,
+        user_id: UserId,
+        raw_active: bool,
+        now: Instant,
+        release_hold: Duration,
+    ) {
+        let Some(entry) = self
+            .entries
+            .iter_mut()
+            .find(|entry| entry.user_id == user_id)
+        else {
+            return;
+        };
+        if !entry.online || !entry.voice_active || entry.voice_status.muted {
+            entry.talking_display = false;
+            entry.last_talking_at = None;
+            return;
+        }
+        if raw_active {
+            entry.talking_display = true;
+            entry.last_talking_at = Some(now);
+        } else if entry.last_talking_at.map_or(true, |last| {
+            now.saturating_duration_since(last) >= release_hold
+        }) {
+            entry.talking_display = false;
         }
     }
 
@@ -167,6 +217,9 @@ impl Participants {
             name: name.to_string(),
             online: true,
             voice_active: false,
+            voice_status: ParticipantVoiceStatus::default(),
+            talking_display: false,
+            last_talking_at: None,
             p2p_direct: false,
             last_message_ms: None,
             last_voice_at: None,
@@ -252,5 +305,63 @@ impl Participants {
         self.scroll = self
             .scroll
             .min(self.entries.len().saturating_sub(visible_rows));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn participant(user_id: UserId) -> ParticipantInfo {
+        ParticipantInfo {
+            user_id,
+            name: format!("user-{}", user_id.0),
+            in_call: true,
+            voice_status: ParticipantVoiceStatus::default(),
+        }
+    }
+
+    #[test]
+    fn talking_display_uses_release_hold() {
+        let mut participants = Participants::default();
+        participants.replace_room(vec![participant(UserId(1))]);
+        let now = Instant::now();
+
+        participants.update_talking_display(UserId(1), true, now, Duration::from_millis(200));
+        assert!(participants.entries[0].talking_display);
+
+        participants.update_talking_display(
+            UserId(1),
+            false,
+            now + Duration::from_millis(199),
+            Duration::from_millis(200),
+        );
+        assert!(participants.entries[0].talking_display);
+
+        participants.update_talking_display(
+            UserId(1),
+            false,
+            now + Duration::from_millis(200),
+            Duration::from_millis(200),
+        );
+        assert!(!participants.entries[0].talking_display);
+    }
+
+    #[test]
+    fn muted_status_clears_talking_display_immediately() {
+        let mut participants = Participants::default();
+        participants.replace_room(vec![participant(UserId(1))]);
+        let now = Instant::now();
+        participants.update_talking_display(UserId(1), true, now, Duration::from_millis(200));
+
+        participants.set_voice_status(
+            UserId(1),
+            ParticipantVoiceStatus {
+                muted: true,
+                deafened: false,
+            },
+        );
+
+        assert!(!participants.entries[0].talking_display);
     }
 }

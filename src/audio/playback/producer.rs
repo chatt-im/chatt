@@ -60,6 +60,14 @@ impl RingPlaybackProducer {
         self.stream.playout_delay_samples(now)
     }
 
+    pub(crate) fn voice_active(&self) -> bool {
+        self.stream.voice_active()
+    }
+
+    pub(crate) fn voice_rms(&self) -> f32 {
+        self.stream.voice_rms()
+    }
+
     #[cfg(test)]
     pub(crate) fn stream(&self) -> &AdaptivePlaybackStream {
         &self.stream

@@ -631,6 +631,11 @@ impl Server {
                 );
                 Ok(())
             }
+            (ConnState::Ready, ClientControl::SetVoiceStatus { status }) => {
+                let session_id = self.session_for_token(token)?;
+                self.set_voice_status(session_id, status);
+                Ok(())
+            }
             (
                 ConnState::Ready,
                 ClientControl::PublishP2p {
@@ -845,6 +850,7 @@ impl Server {
                 media_send_counter: 0,
                 media_recv_replay: AntiReplay::new(),
                 active_stream: None,
+                voice_status: control::ParticipantVoiceStatus::default(),
                 p2p: None,
                 receive_files,
                 file_receive_limit_bytes,
@@ -1569,6 +1575,37 @@ impl Server {
         );
     }
 
+    fn set_voice_status(&mut self, session_id: SessionId, status: control::ParticipantVoiceStatus) {
+        let status = status.normalized();
+        let Some(session) = self.sessions.get_mut(&session_id) else {
+            return;
+        };
+        if session.voice_status == status {
+            return;
+        }
+        session.voice_status = status;
+        let Some(room_id) = session.room_id else {
+            return;
+        };
+        let user_id = session.user_id;
+        kvlog::info!(
+            "voice status changed",
+            session_id = session_id.0,
+            room_id = room_id.0,
+            user_id = user_id.0,
+            muted = status.muted,
+            deafened = status.deafened
+        );
+        self.broadcast_control(
+            room_id,
+            &ServerControl::VoiceStatus {
+                room_id,
+                user_id,
+                status,
+            },
+        );
+    }
+
     fn publish_p2p(
         &mut self,
         session_id: SessionId,
@@ -2228,6 +2265,7 @@ impl Server {
                 user_id: session.user_id,
                 name: session.user_name.clone(),
                 in_call: session.room_id.is_some(),
+                voice_status: session.voice_status,
             })
     }
 
@@ -2270,6 +2308,7 @@ struct Session {
     media_send_counter: u64,
     media_recv_replay: AntiReplay,
     active_stream: Option<StreamId>,
+    voice_status: control::ParticipantVoiceStatus,
     p2p: Option<P2pSessionState>,
     receive_files: bool,
     file_receive_limit_bytes: u64,
@@ -2456,6 +2495,7 @@ fn client_control_kind(control: &ClientControl) -> &'static str {
         ClientControl::SendChat { .. } => "send_chat",
         ClientControl::StartVoice { .. } => "start_voice",
         ClientControl::StopVoice { .. } => "stop_voice",
+        ClientControl::SetVoiceStatus { .. } => "set_voice_status",
         ClientControl::PublishP2p { .. } => "publish_p2p",
         ClientControl::UploadFileStart { .. } => "upload_file_start",
         ClientControl::UploadFileChunk { .. } => "upload_file_chunk",
@@ -2473,6 +2513,7 @@ fn server_control_kind(control: &ServerControl) -> &'static str {
         ServerControl::Presence { .. } => "presence",
         ServerControl::VoiceStarted { .. } => "voice_started",
         ServerControl::VoiceStopped { .. } => "voice_stopped",
+        ServerControl::VoiceStatus { .. } => "voice_status",
         ServerControl::UdpBound => "udp_bound",
         ServerControl::UdpReflexive { .. } => "udp_reflexive",
         ServerControl::P2pNatProbe { .. } => "p2p_nat_probe",
@@ -2512,10 +2553,51 @@ mod tests {
             media_send_counter: 0,
             media_recv_replay: AntiReplay::new(),
             active_stream: None,
+            voice_status: control::ParticipantVoiceStatus::default(),
             p2p: None,
             receive_files: false,
             file_receive_limit_bytes: 0,
         }
+    }
+
+    fn test_server() -> Server {
+        let mut config = ServerConfig::default();
+        config.network.tcp_addr = "127.0.0.1:0".parse().expect("valid tcp addr");
+        config.network.udp_addr = "127.0.0.1:0".parse().expect("valid udp addr");
+        config.network.udp_probe_addr = None;
+        config.network.p2p_enabled = false;
+        Server::bind(config).expect("test server")
+    }
+
+    #[test]
+    fn voice_status_updates_participant_snapshot() {
+        let mut server = test_server();
+        let room_id = RoomId(1);
+        let session_id = SessionId(1);
+        server
+            .rooms
+            .insert(room_id, test_room(room_id, &[session_id]));
+        server.sessions.insert(
+            session_id,
+            test_session(UserId(9), Token(11), Some(room_id)),
+        );
+
+        server.set_voice_status(
+            session_id,
+            control::ParticipantVoiceStatus {
+                muted: false,
+                deafened: true,
+            },
+        );
+
+        let participant = server.participant_for_session(session_id).unwrap();
+        assert_eq!(
+            participant.voice_status,
+            control::ParticipantVoiceStatus {
+                muted: true,
+                deafened: true,
+            }
+        );
     }
 
     #[test]
