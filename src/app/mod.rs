@@ -135,6 +135,8 @@ pub(crate) struct App {
     pub(crate) key_preview_expanded: bool,
     pub(crate) key_preview_cache: crate::tui::render::KeyPreviewCache,
     pub(crate) event_rx: Receiver<NetworkEvent>,
+    pub(crate) voice_command_tx: Sender<local_control::VoiceCommand>,
+    pub(crate) voice_command_rx: Receiver<local_control::VoiceCommand>,
     pub(crate) audio_device_refresh_tx: mpsc::Sender<AudioDeviceRefresh>,
     pub(crate) audio_device_refresh_rx: Receiver<AudioDeviceRefresh>,
     pub(crate) audio_device_refresh_in_flight: bool,
@@ -335,6 +337,7 @@ impl App {
         pending_invite: Option<InviteTicket>,
     ) -> Result<Self, String> {
         let (event_tx, event_rx) = mpsc::channel();
+        let (voice_command_tx, voice_command_rx) = mpsc::channel();
         let (audio_device_refresh_tx, audio_device_refresh_rx) = mpsc::channel();
         let (soundboard_event_tx, soundboard_event_rx) = mpsc::channel();
         let soundboard_enabled = config.soundboard.enabled;
@@ -394,6 +397,8 @@ impl App {
             key_preview_expanded: false,
             key_preview_cache: crate::tui::render::KeyPreviewCache::default(),
             event_rx,
+            voice_command_tx,
+            voice_command_rx,
             audio_device_refresh_tx,
             audio_device_refresh_rx,
             audio_device_refresh_in_flight: false,
@@ -479,6 +484,25 @@ impl App {
         }
     }
 
+    pub(crate) fn drain_voice_commands(&mut self) {
+        while let Ok(command) = self.voice_command_rx.try_recv() {
+            self.apply_voice_command(command);
+        }
+    }
+
+    /// Applies a CLI-driven voice command through the same App methods the UI
+    /// keybindings and top-bar buttons use.
+    fn apply_voice_command(&mut self, command: local_control::VoiceCommand) {
+        match command {
+            local_control::VoiceCommand::ToggleMute => self.toggle_mute(),
+            local_control::VoiceCommand::SetMute(state) => self.set_mute(state),
+            local_control::VoiceCommand::ToggleDeafen => {
+                self.set_deafen(!self.deafened.load(Ordering::Relaxed))
+            }
+            local_control::VoiceCommand::SetDeafen(state) => self.set_deafen(state),
+        }
+    }
+
     fn rebuild_server_items(&mut self) {
         self.server_items = self
             .config
@@ -550,7 +574,10 @@ impl App {
                 return;
             }
         };
-        self.control_socket = match local_control::ControlSocket::spawn(network.sender()) {
+        self.control_socket = match local_control::ControlSocket::spawn(
+            network.sender(),
+            self.voice_command_tx.clone(),
+        ) {
             Ok(socket) => {
                 kvlog::info!(
                     "chatt local control socket ready",
@@ -2132,7 +2159,7 @@ impl App {
             self.supervisor.control_socket.reset();
             return;
         };
-        match local_control::ControlSocket::spawn(network.sender()) {
+        match local_control::ControlSocket::spawn(network.sender(), self.voice_command_tx.clone()) {
             Ok(socket) => {
                 kvlog::info!(
                     "chatt local control socket recovered",

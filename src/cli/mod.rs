@@ -287,11 +287,21 @@ fn dispatch(matches: &Matches) -> Result<(), Box<dyn std::error::Error>> {
             Ok(())
         }
         Some(("mute", sub)) => {
-            print_voice_toggle("mute", sub);
+            let command = match sub.subcommand() {
+                Some(("set", set)) => local_control::VoiceCommand::SetMute(parse_voice_state(set)),
+                _ => local_control::VoiceCommand::ToggleMute,
+            };
+            let response = local_control::send_voice(command)?;
+            println!("{response}");
             Ok(())
         }
         Some(("deafen", sub)) => {
-            print_voice_toggle("deafen", sub);
+            let command = match sub.subcommand() {
+                Some(("set", set)) => local_control::VoiceCommand::SetDeafen(parse_voice_state(set)),
+                _ => local_control::VoiceCommand::ToggleDeafen,
+            };
+            let response = local_control::send_voice(command)?;
+            println!("{response}");
             Ok(())
         }
         _ => {
@@ -301,18 +311,10 @@ fn dispatch(matches: &Matches) -> Result<(), Box<dyn std::error::Error>> {
     }
 }
 
-/// No-op handler for `mute`/`deafen`. The active-call wiring is not yet
-/// implemented, so this only reports what it would do and returns.
-fn print_voice_toggle(name: &str, matches: &Matches) {
-    match matches.subcommand() {
-        Some(("set", set)) => {
-            let state = set.value_of("state").unwrap_or_default();
-            println!("{name}: would set {name}={state} on the active call (not yet implemented)");
-        }
-        _ => {
-            println!("{name}: would toggle {name} on the active call (not yet implemented)");
-        }
-    }
+/// Reads the `state` value of a `set` subcommand. The parser restricts it to
+/// `"true"` / `"false"`, so any other value falls back to `false`.
+fn parse_voice_state(set: &Matches) -> bool {
+    set.value_of("state") == Some("true")
 }
 
 fn run_audio_playback_test(

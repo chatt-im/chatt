@@ -23,12 +23,70 @@ mod imp {
     const SOCKET_NAME: &str = "control.sock";
     const MAGIC: &[u8] = b"chatt-control-v1\0";
     const OP_UPLOAD: u8 = 1;
+    const OP_VOICE: u8 = 2;
     const STATUS_OK: u8 = 0;
     const STATUS_ERROR: u8 = 1;
     const MAX_PATH_BYTES: u32 = 64 * 1024;
     const MAX_RESPONSE_BYTES: u32 = 8 * 1024;
     const ACCEPT_SLEEP: Duration = Duration::from_millis(20);
     const STREAM_TIMEOUT: Duration = Duration::from_secs(2);
+
+    const VOICE_TARGET_MUTE: u8 = 0;
+    const VOICE_TARGET_DEAFEN: u8 = 1;
+    const VOICE_ACTION_TOGGLE: u8 = 0;
+    const VOICE_ACTION_SET_FALSE: u8 = 1;
+    const VOICE_ACTION_SET_TRUE: u8 = 2;
+
+    /// A voice-control intent forwarded from the CLI to the running client. The
+    /// client applies it through the same App methods the UI keybindings use.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum VoiceCommand {
+        ToggleMute,
+        SetMute(bool),
+        ToggleDeafen,
+        SetDeafen(bool),
+    }
+
+    impl VoiceCommand {
+        fn encode(self) -> [u8; 2] {
+            let (target, action) = match self {
+                VoiceCommand::ToggleMute => (VOICE_TARGET_MUTE, VOICE_ACTION_TOGGLE),
+                VoiceCommand::SetMute(false) => (VOICE_TARGET_MUTE, VOICE_ACTION_SET_FALSE),
+                VoiceCommand::SetMute(true) => (VOICE_TARGET_MUTE, VOICE_ACTION_SET_TRUE),
+                VoiceCommand::ToggleDeafen => (VOICE_TARGET_DEAFEN, VOICE_ACTION_TOGGLE),
+                VoiceCommand::SetDeafen(false) => (VOICE_TARGET_DEAFEN, VOICE_ACTION_SET_FALSE),
+                VoiceCommand::SetDeafen(true) => (VOICE_TARGET_DEAFEN, VOICE_ACTION_SET_TRUE),
+            };
+            [target, action]
+        }
+
+        fn decode(payload: &[u8]) -> Result<Self, String> {
+            let [target, action] = match payload {
+                [target, action] => [*target, *action],
+                _ => return Err("voice control payload must be 2 bytes".to_string()),
+            };
+            match (target, action) {
+                (VOICE_TARGET_MUTE, VOICE_ACTION_TOGGLE) => Ok(VoiceCommand::ToggleMute),
+                (VOICE_TARGET_MUTE, VOICE_ACTION_SET_FALSE) => Ok(VoiceCommand::SetMute(false)),
+                (VOICE_TARGET_MUTE, VOICE_ACTION_SET_TRUE) => Ok(VoiceCommand::SetMute(true)),
+                (VOICE_TARGET_DEAFEN, VOICE_ACTION_TOGGLE) => Ok(VoiceCommand::ToggleDeafen),
+                (VOICE_TARGET_DEAFEN, VOICE_ACTION_SET_FALSE) => Ok(VoiceCommand::SetDeafen(false)),
+                (VOICE_TARGET_DEAFEN, VOICE_ACTION_SET_TRUE) => Ok(VoiceCommand::SetDeafen(true)),
+                _ => Err(format!(
+                    "unknown voice control target {target} action {action}"
+                )),
+            }
+        }
+
+        fn ack_message(self) -> String {
+            match self {
+                VoiceCommand::ToggleMute => "mute toggle requested".to_string(),
+                VoiceCommand::SetMute(state) => format!("mute set {state} requested"),
+                VoiceCommand::ToggleDeafen => "deafen toggle requested".to_string(),
+                VoiceCommand::SetDeafen(state) => format!("deafen set {state} requested"),
+            }
+        }
+    }
 
     pub struct ControlSocket {
         path: PathBuf,
@@ -37,25 +95,34 @@ mod imp {
     }
 
     impl ControlSocket {
-        pub fn spawn(commands: CommandSender) -> Result<Self, String> {
+        pub fn spawn(
+            commands: CommandSender,
+            voice: Sender<VoiceCommand>,
+        ) -> Result<Self, String> {
             let config = socket_config()?;
-            Self::spawn_with_config(config, commands)
+            Self::spawn_with_config(config, commands, voice)
         }
 
         #[cfg(test)]
-        fn spawn_at_path(path: PathBuf, commands: CommandSender) -> Result<Self, String> {
+        fn spawn_at_path(
+            path: PathBuf,
+            commands: CommandSender,
+            voice: Sender<VoiceCommand>,
+        ) -> Result<Self, String> {
             Self::spawn_with_config(
                 SocketConfig {
                     path,
                     private_dir: None,
                 },
                 commands,
+                voice,
             )
         }
 
         fn spawn_with_config(
             config: SocketConfig,
             commands: CommandSender,
+            voice: Sender<VoiceCommand>,
         ) -> Result<Self, String> {
             prepare_socket_parent(&config)?;
             let listener = bind_listener(&config.path)?;
@@ -76,7 +143,9 @@ mod imp {
                         }
 
                         match listener.accept() {
-                            Ok((mut stream, _addr)) => handle_connection(&mut stream, &commands),
+                            Ok((mut stream, _addr)) => {
+                                handle_connection(&mut stream, &commands, &voice)
+                            }
                             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                                 thread::sleep(ACCEPT_SLEEP);
                             }
@@ -150,6 +219,34 @@ mod imp {
         }
     }
 
+    pub fn send_voice(command: VoiceCommand) -> Result<String, String> {
+        let socket_path = socket_path()?;
+        send_voice_to_path(&socket_path, command)
+    }
+
+    fn send_voice_to_path(socket_path: &Path, command: VoiceCommand) -> Result<String, String> {
+        let mut stream = UnixStream::connect(socket_path).map_err(|error| {
+            format!(
+                "no active chatt control socket at {}; start chatt or set {SOCKET_ENV}: {error}",
+                socket_path.display()
+            )
+        })?;
+        stream
+            .set_read_timeout(Some(STREAM_TIMEOUT))
+            .map_err(|error| format!("failed to set control socket read timeout: {error}"))?;
+        stream
+            .set_write_timeout(Some(STREAM_TIMEOUT))
+            .map_err(|error| format!("failed to set control socket write timeout: {error}"))?;
+
+        write_voice_request(&mut stream, command)?;
+        let response = read_response(&mut stream)?;
+        match response.status {
+            STATUS_OK => Ok(response.message),
+            STATUS_ERROR => Err(response.message),
+            status => Err(format!("control socket returned unknown status {status}")),
+        }
+    }
+
     pub fn socket_path() -> Result<PathBuf, String> {
         Ok(socket_config()?.path)
     }
@@ -159,8 +256,10 @@ mod imp {
         private_dir: Option<PathBuf>,
     }
 
+    #[derive(Debug)]
     enum Request {
         Upload(PathBuf),
+        Voice(VoiceCommand),
     }
 
     struct Response {
@@ -282,7 +381,11 @@ mod imp {
         }
     }
 
-    fn handle_connection(stream: &mut UnixStream, commands: &CommandSender) {
+    fn handle_connection(
+        stream: &mut UnixStream,
+        commands: &CommandSender,
+        voice: &Sender<VoiceCommand>,
+    ) {
         let _ = stream.set_read_timeout(Some(STREAM_TIMEOUT));
         let _ = stream.set_write_timeout(Some(STREAM_TIMEOUT));
         let response = match read_request(stream) {
@@ -299,6 +402,16 @@ mod imp {
                     },
                 }
             }
+            Ok(Request::Voice(command)) => match voice.send(command) {
+                Ok(()) => Response {
+                    status: STATUS_OK,
+                    message: command.ack_message(),
+                },
+                Err(_) => Response {
+                    status: STATUS_ERROR,
+                    message: "chatt client is not running".to_string(),
+                },
+            },
             Err(error) => Response {
                 status: STATUS_ERROR,
                 message: error,
@@ -339,6 +452,7 @@ mod imp {
             OP_UPLOAD => Ok(Request::Upload(PathBuf::from(
                 std::ffi::OsString::from_vec(body),
             ))),
+            OP_VOICE => Ok(Request::Voice(VoiceCommand::decode(&body)?)),
             opcode => Err(format!("unknown control request opcode {opcode}")),
         }
     }
@@ -355,6 +469,19 @@ mod imp {
         frame.push(OP_UPLOAD);
         frame.extend_from_slice(&len.to_be_bytes());
         frame.extend_from_slice(bytes);
+        stream
+            .write_all(&frame)
+            .map_err(|error| format!("failed to write control request: {error}"))
+    }
+
+    fn write_voice_request(stream: &mut UnixStream, command: VoiceCommand) -> Result<(), String> {
+        let payload = command.encode();
+        let len = payload.len() as u32;
+        let mut frame = Vec::with_capacity(MAGIC.len() + 1 + 4 + payload.len());
+        frame.extend_from_slice(MAGIC);
+        frame.push(OP_VOICE);
+        frame.extend_from_slice(&len.to_be_bytes());
+        frame.extend_from_slice(&payload);
         stream
             .write_all(&frame)
             .map_err(|error| format!("failed to write control request: {error}"))
@@ -431,6 +558,27 @@ mod imp {
 
             match request {
                 Request::Upload(actual) => assert_eq!(actual, path),
+                other => panic!("unexpected request: {other:?}"),
+            }
+        }
+
+        #[test]
+        fn voice_request_round_trips_each_command() {
+            let commands = [
+                VoiceCommand::ToggleMute,
+                VoiceCommand::SetMute(true),
+                VoiceCommand::SetMute(false),
+                VoiceCommand::ToggleDeafen,
+                VoiceCommand::SetDeafen(true),
+                VoiceCommand::SetDeafen(false),
+            ];
+            for command in commands {
+                let (mut writer, mut reader) = UnixStream::pair().unwrap();
+                write_voice_request(&mut writer, command).unwrap();
+                match read_request(&mut reader).unwrap() {
+                    Request::Voice(actual) => assert_eq!(actual, command),
+                    other => panic!("unexpected request: {other:?}"),
+                }
             }
         }
 
@@ -452,9 +600,13 @@ mod imp {
             let socket_path = dir.join("control.sock");
             let upload_path = dir.join("some_file/foo.md");
             let (tx, rx) = mpsc::channel();
-            let socket =
-                ControlSocket::spawn_at_path(socket_path.clone(), CommandSender::for_test(tx))
-                    .unwrap();
+            let (voice_tx, _voice_rx) = mpsc::channel();
+            let socket = ControlSocket::spawn_at_path(
+                socket_path.clone(),
+                CommandSender::for_test(tx),
+                voice_tx,
+            )
+            .unwrap();
 
             let response = send_upload_to_path(&socket_path, &upload_path).unwrap();
             let command = rx.recv_timeout(Duration::from_secs(2)).unwrap();
@@ -464,6 +616,31 @@ mod imp {
                 NetworkCommand::UploadFile(path) => assert_eq!(path, upload_path),
                 other => panic!("unexpected command: {other:?}"),
             }
+
+            drop(socket);
+            assert!(!socket_path.exists());
+            let _ = fs::remove_dir_all(dir);
+        }
+
+        #[test]
+        fn control_socket_voice_sends_command() {
+            let dir = temp_test_dir("voice-sends-command");
+            fs::create_dir_all(&dir).unwrap();
+            let socket_path = dir.join("control.sock");
+            let (tx, _rx) = mpsc::channel();
+            let (voice_tx, voice_rx) = mpsc::channel();
+            let socket = ControlSocket::spawn_at_path(
+                socket_path.clone(),
+                CommandSender::for_test(tx),
+                voice_tx,
+            )
+            .unwrap();
+
+            let response = send_voice_to_path(&socket_path, VoiceCommand::SetDeafen(true)).unwrap();
+            let command = voice_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+
+            assert_eq!(response, "deafen set true requested");
+            assert_eq!(command, VoiceCommand::SetDeafen(true));
 
             drop(socket);
             assert!(!socket_path.exists());
@@ -504,10 +681,21 @@ mod imp {
 
     use crate::client_net::{CommandSender, NetworkCommand};
 
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum VoiceCommand {
+        ToggleMute,
+        SetMute(bool),
+        ToggleDeafen,
+        SetDeafen(bool),
+    }
+
     pub struct ControlSocket;
 
     impl ControlSocket {
-        pub fn spawn(_commands: CommandSender) -> Result<Self, String> {
+        pub fn spawn(
+            _commands: CommandSender,
+            _voice: Sender<VoiceCommand>,
+        ) -> Result<Self, String> {
             Err("chatt local control sockets are only supported on Unix".to_string())
         }
 
@@ -523,6 +711,10 @@ mod imp {
     pub fn send_upload(_path: &Path) -> Result<String, String> {
         Err("chatt upload is only supported on Unix".to_string())
     }
+
+    pub fn send_voice(_command: VoiceCommand) -> Result<String, String> {
+        Err("chatt voice control is only supported on Unix".to_string())
+    }
 }
 
-pub use imp::{ControlSocket, send_upload};
+pub use imp::{ControlSocket, VoiceCommand, send_upload, send_voice};
