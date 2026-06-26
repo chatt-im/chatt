@@ -297,7 +297,9 @@ fn dispatch(matches: &Matches) -> Result<(), Box<dyn std::error::Error>> {
         }
         Some(("deafen", sub)) => {
             let command = match sub.subcommand() {
-                Some(("set", set)) => local_control::VoiceCommand::SetDeafen(parse_voice_state(set)),
+                Some(("set", set)) => {
+                    local_control::VoiceCommand::SetDeafen(parse_voice_state(set))
+                }
                 _ => local_control::VoiceCommand::ToggleDeafen,
             };
             let response = local_control::send_voice(command)?;

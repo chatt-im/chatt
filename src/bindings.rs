@@ -57,6 +57,9 @@ pub enum BindCommand {
     PlaySoundboard8,
     PlaySoundboard9,
     ToggleKeyPreview,
+    EditServer,
+    DeleteServer,
+    SearchServers,
 }
 
 impl std::fmt::Display for BindCommand {
@@ -104,6 +107,9 @@ impl std::fmt::Display for BindCommand {
             PlaySoundboard8 => "PlaySoundboard8",
             PlaySoundboard9 => "PlaySoundboard9",
             ToggleKeyPreview => "ToggleKeyPreview",
+            EditServer => "EditServer",
+            DeleteServer => "DeleteServer",
+            SearchServers => "SearchServers",
         })
     }
 }
@@ -163,6 +169,9 @@ impl BindCommand {
             PlaySoundboard8 => spec("Sound 8", ACTION),
             PlaySoundboard9 => spec("Sound 9", ACTION),
             ToggleKeyPreview => spec("More", APP),
+            EditServer => spec("Edit", ACTION),
+            DeleteServer => spec("Delete", DESTRUCTIVE),
+            SearchServers => spec("Search", ACTION),
         }
     }
 }

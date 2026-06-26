@@ -123,6 +123,9 @@ prefer-ipv6 = true
 "DOWN" = "SelectNext"
 "UP" = "SelectPrev"
 "ENTER" = "Activate"
+"e" = "EditServer"
+"d" = "DeleteServer"
+"/" = "SearchServers"
 "F2" = "OpenSettings"
 "." = "ToggleKeyPreview"
 

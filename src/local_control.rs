@@ -95,10 +95,7 @@ mod imp {
     }
 
     impl ControlSocket {
-        pub fn spawn(
-            commands: CommandSender,
-            voice: Sender<VoiceCommand>,
-        ) -> Result<Self, String> {
+        pub fn spawn(commands: CommandSender, voice: Sender<VoiceCommand>) -> Result<Self, String> {
             let config = socket_config()?;
             Self::spawn_with_config(config, commands, voice)
         }

@@ -39,6 +39,9 @@ pub(crate) fn render(app: &mut App, buf: &mut Buffer, now_ms: u64) {
         app.mode,
         theme::UiMode::ServerSelect | theme::UiMode::ServerEdit
     ) {
+        refresh_key_preview_cache(app);
+        let key_preview_height = key_preview_height(app, screen.w);
+        let key_preview_area = screen.take_bottom(key_preview_height as i32);
         let status_area = screen.take_bottom(1);
         match app.mode {
             theme::UiMode::ServerSelect => draw_server_select(screen, app, buf),
@@ -46,6 +49,7 @@ pub(crate) fn render(app: &mut App, buf: &mut Buffer, now_ms: u64) {
             _ => {}
         }
         draw_status(status_area, app, buf, capture.as_ref());
+        draw_key_preview(key_preview_area, app, buf);
         return;
     }
 
@@ -197,16 +201,13 @@ fn draw_server_select(area: Rect, app: &mut App, buf: &mut Buffer) {
         return;
     }
 
-    let search = body.take_top(1);
-    let search_label = if app.server_select_searching {
-        format!("/{}", app.server_select.query())
-    } else {
-        "Press / to search   Enter join   e edit   d delete   F2 audio   Ctrl-C quit".to_string()
-    };
-    search
-        .with(app.theme.background.patch(app.theme.subtle))
-        .with(Ellipsis(true))
-        .text(buf, &search_label);
+    if app.server_select_searching {
+        let search = body.take_top(1);
+        search
+            .with(app.theme.background.patch(app.theme.subtle))
+            .with(Ellipsis(true))
+            .text(buf, &format!("/{}", app.server_select.query()));
+    }
 
     let theme = &app.theme;
     let items = &app.server_items;
