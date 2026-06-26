@@ -516,12 +516,20 @@ impl LongSilenceGate {
             return;
         }
 
-        self.preroll.push_back(CaptureBufferedFrame {
-            samples: samples.to_vec(),
-        });
-        while self.preroll.len() > self.preroll_frames {
-            self.preroll.pop_front();
-        }
+        // At capacity, reuse the evicted frame's buffer instead of dropping it
+        // and allocating a fresh `Vec`. Sustained silence then cycles a fixed
+        // set of buffers with no per-frame allocation.
+        let mut frame = if self.preroll.len() >= self.preroll_frames {
+            let mut reused = self.preroll.pop_front().expect("len checked above");
+            reused.samples.clear();
+            reused
+        } else {
+            CaptureBufferedFrame {
+                samples: Vec::with_capacity(samples.len()),
+            }
+        };
+        frame.samples.extend_from_slice(samples);
+        self.preroll.push_back(frame);
     }
 }
 
@@ -908,6 +916,51 @@ mod tests {
         assert!(frames[0].samples[0] < frames[0].samples[3]);
         assert!((frames[1].samples[0] - 0.4).abs() < f32::EPSILON);
         assert!((frames[2].samples[0] - 1.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn long_silence_gate_preroll_keeps_recent_frames_when_buffer_reused() {
+        // ramp 0 keeps fade-in an identity so reused-buffer contents are exact.
+        let mut gate = LongSilenceGate::with_limits(1, 2, 0);
+        assert!(matches!(
+            gate.observe(&mut vec![1.0; 4], true),
+            CaptureGateDecision::TransmitCurrent { silence_hint: true }
+        ));
+
+        // Feed more silence frames than the 2-frame preroll holds, forcing the
+        // capacity path that recycles evicted buffers.
+        for value in [2.0_f32, 3.0, 4.0, 5.0] {
+            assert!(matches!(
+                gate.observe(&mut vec![value; 4], true),
+                CaptureGateDecision::SuppressCurrent
+            ));
+        }
+
+        let CaptureGateDecision::Resume(frames) = gate.observe(&mut vec![9.0; 4], false) else {
+            panic!("speech should resume transmission");
+        };
+
+        // Only the two most recent prerolls survive, in order, plus the current
+        // speech frame, with contents intact through buffer reuse.
+        assert_eq!(frames.len(), 3);
+        assert!(
+            frames[0]
+                .samples
+                .iter()
+                .all(|&s| (s - 4.0).abs() < f32::EPSILON)
+        );
+        assert!(
+            frames[1]
+                .samples
+                .iter()
+                .all(|&s| (s - 5.0).abs() < f32::EPSILON)
+        );
+        assert!(
+            frames[2]
+                .samples
+                .iter()
+                .all(|&s| (s - 9.0).abs() < f32::EPSILON)
+        );
     }
 
     fn sine_frame(freq_hz: f32, amplitude: f32) -> Vec<f32> {

@@ -5,6 +5,7 @@ use std::{
 };
 
 use extui::{AnsiColor, Buffer, Ellipsis, HAlign, Rect, Style, vt::Modifier};
+use extui_bindings::LayerId;
 use extui_editor::Mode as EditorMode;
 use unicode_width::UnicodeWidthStr;
 
@@ -51,6 +52,7 @@ pub(crate) fn render(app: &mut App, buf: &mut Buffer, now_ms: u64) {
     let top_bar_area = screen.take_top(1);
     draw_top_bar(top_bar_area, app, buf, capture.as_ref());
 
+    refresh_key_preview_cache(app);
     let composer_height = composer_height(app, screen.w);
     let key_preview_height = key_preview_height(app, screen.w);
     let key_preview_area = screen.take_bottom(key_preview_height as i32);
@@ -855,6 +857,40 @@ mod tests {
         assert_eq!(local.fg(), theme.mode_log.fg());
         assert_eq!(remote.fg(), theme.mode_log.fg());
     }
+
+    #[test]
+    fn key_preview_entries_are_deterministic_and_reuse_buffer() {
+        let runtime = bindings::BindingRuntime::default();
+        let layer = bindings::WORKSPACE_LAYER;
+
+        fn snapshot(entries: &[KeyPreviewEntry]) -> Vec<(String, String, i8)> {
+            let mut out = Vec::new();
+            for entry in entries {
+                out.push((entry.key_hint.clone(), entry.label.clone(), entry.order));
+            }
+            out
+        }
+
+        let mut buffer = Vec::new();
+        build_key_preview_entries(&runtime, &None, layer, &mut buffer);
+        assert!(!buffer.is_empty(), "workspace layer should expose bindings");
+        let first = snapshot(&buffer);
+
+        // Output is already sorted by the comparator render relies on.
+        let mut sorted = buffer.iter().map(|e| e.order).collect::<Vec<_>>();
+        sorted.sort_unstable();
+        assert_eq!(
+            buffer.iter().map(|e| e.order).collect::<Vec<_>>(),
+            sorted,
+            "entries must be returned in sorted order"
+        );
+
+        // Rebuilding into the same cleared buffer (the cache-miss reuse path)
+        // reproduces the entries exactly.
+        buffer.clear();
+        build_key_preview_entries(&runtime, &None, layer, &mut buffer);
+        assert_eq!(first, snapshot(&buffer));
+    }
 }
 
 /// Formats a message age for the heading. Empty for notices (`timestamp_ms == 0`).
@@ -902,12 +938,22 @@ fn draw_status_text_right(area: Rect, app: &App, buf: &mut Buffer, fill: Style) 
         .text(buf, &format!(" {} ", status_text));
 }
 
-struct KeyPreviewEntry {
+pub(crate) struct KeyPreviewEntry {
     key_hint: String,
     label: String,
     width: usize,
     order: i8,
     toggle: bool,
+}
+
+/// Memoized key-preview entries plus the inputs that produced them. `render`
+/// rebuilds the entries only when the active binding layer or the pending chord
+/// layer changes, so the steady ~20 Hz redraw does not re-run
+/// [`bindings::reachable`] or reallocate the per-entry strings.
+#[derive(Default)]
+pub(crate) struct KeyPreviewCache {
+    key: Option<(Option<LayerId>, Option<LayerId>)>,
+    entries: Vec<KeyPreviewEntry>,
 }
 
 #[derive(Clone, Copy)]
@@ -920,11 +966,11 @@ const KEY_PREVIEW_ENTRY_GAP: &str = "  ";
 const KEY_PREVIEW_ENTRY_GAP_WIDTH: usize = 2;
 
 fn key_preview_height(app: &App, width: u16) -> u16 {
-    let entries = key_preview_entries(app);
+    let entries = &app.key_preview_cache.entries;
     if entries.is_empty() {
         return 0;
     }
-    let rows = key_preview_rows(&entries, width);
+    let rows = key_preview_rows(entries, width);
     if app.key_preview_expanded && rows.len() > 1 {
         rows.len().try_into().unwrap_or(u16::MAX)
     } else {
@@ -937,13 +983,13 @@ fn draw_key_preview(area: Rect, app: &App, buf: &mut Buffer) {
         return;
     }
 
-    let entries = key_preview_entries(app);
+    let entries = &app.key_preview_cache.entries;
     if entries.is_empty() {
         area.with(Style::default()).fill(buf);
         return;
     }
 
-    let rows = key_preview_rows(&entries, area.w);
+    let rows = key_preview_rows(entries, area.w);
     let bar_style = key_preview_bar_style();
     let key_style = key_preview_key_style();
     let label_style = key_preview_label_style();
@@ -981,13 +1027,13 @@ fn draw_key_preview(area: Rect, app: &App, buf: &mut Buffer) {
     }
 
     if rows.len() > 1 {
-        let hint = key_preview_toggle_hint(&entries);
+        let hint = key_preview_toggle_hint(entries);
         let label = if app.key_preview_expanded {
             format!("less [{hint}]")
         } else {
             format!("more [{hint}]")
         };
-        let width = key_preview_more_width(&entries);
+        let width = key_preview_more_width(entries);
         let toggle = Rect {
             x: area.x.saturating_add(area.w.saturating_sub(width)),
             y: area.y + area.h.saturating_sub(1),
@@ -1001,36 +1047,59 @@ fn draw_key_preview(area: Rect, app: &App, buf: &mut Buffer) {
     }
 }
 
-fn key_preview_entries(app: &App) -> Vec<KeyPreviewEntry> {
-    let Some(layer) = app.active_binding_layer() else {
-        return Vec::new();
-    };
-    let mut entries: Vec<_> = bindings::reachable(&app.config.bindings, layer, &app.pending_chord)
-        .into_iter()
-        .map(|Reachable { key, kind }| {
-            let key_hint = key.to_string();
-            let (label, order, toggle) = match kind {
-                ReachableKind::Action(command) => {
-                    let toggle = matches!(command, bindings::BindCommand::ToggleKeyPreview);
-                    let spec = command.spec();
-                    (spec.label.to_string(), spec.order, toggle)
-                }
-                ReachableKind::EnterLayer(label) => {
-                    (label.unwrap_or_else(|| "more".to_string()), 10, false)
-                }
-            };
-            let width = key_hint.width() + usize::from(!label.is_empty()) + label.width();
-            KeyPreviewEntry {
-                key_hint,
-                label,
-                width,
-                order,
-                toggle,
+/// Rebuilds [`App::key_preview_cache`] when the active binding layer or pending
+/// chord layer has changed since the last render, and is a cheap key comparison
+/// otherwise. The stored entries back both [`key_preview_height`] and
+/// [`draw_key_preview`], which read them without recomputing.
+fn refresh_key_preview_cache(app: &mut App) {
+    let base = app.active_binding_layer();
+    let pending = app.pending_chord.as_ref().map(|chord| chord.layer);
+    let key = Some((base, pending));
+    if app.key_preview_cache.key == key {
+        return;
+    }
+    app.key_preview_cache.key = key;
+    let mut entries = std::mem::take(&mut app.key_preview_cache.entries);
+    entries.clear();
+    if let Some(layer) = base {
+        build_key_preview_entries(
+            &app.config.bindings,
+            &app.pending_chord,
+            layer,
+            &mut entries,
+        );
+    }
+    app.key_preview_cache.entries = entries;
+}
+
+fn build_key_preview_entries(
+    bindings: &bindings::BindingRuntime,
+    pending: &Option<bindings::PendingChord>,
+    layer: LayerId,
+    out: &mut Vec<KeyPreviewEntry>,
+) {
+    for Reachable { key, kind } in bindings::reachable(bindings, layer, pending) {
+        let key_hint = key.to_string();
+        let (label, order, toggle) = match kind {
+            ReachableKind::Action(command) => {
+                let toggle = matches!(command, bindings::BindCommand::ToggleKeyPreview);
+                let spec = command.spec();
+                (spec.label.to_string(), spec.order, toggle)
             }
-        })
-        .collect();
-    entries.sort_by(|left, right| key_preview_entry_cmp(left, right));
-    entries
+            ReachableKind::EnterLayer(label) => {
+                (label.unwrap_or_else(|| "more".to_string()), 10, false)
+            }
+        };
+        let width = key_hint.width() + usize::from(!label.is_empty()) + label.width();
+        out.push(KeyPreviewEntry {
+            key_hint,
+            label,
+            width,
+            order,
+            toggle,
+        });
+    }
+    out.sort_by(|left, right| key_preview_entry_cmp(left, right));
 }
 
 fn key_preview_entry_cmp(left: &KeyPreviewEntry, right: &KeyPreviewEntry) -> CmpOrdering {

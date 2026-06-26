@@ -598,6 +598,35 @@ pub fn seal_with_key(
     Ok(out)
 }
 
+/// Encrypts `out[cipher_start..]` in place under `key`, authenticating `aad`,
+/// and appends the 16-byte tag to `out`. Callers that have already written their
+/// own framing (for example the media UDP header, which embeds the same key id
+/// and counter the transport header would carry) seal directly into that buffer
+/// instead of allocating a separate transport frame.
+///
+/// `aad` must match what the receiver reconstructs, and `out[cipher_start..]`
+/// must already hold the plaintext.
+pub fn seal_in_place_append_tag(
+    key: &KeyMaterial,
+    counter: u64,
+    aad: &[u8],
+    cipher_start: usize,
+    out: &mut Vec<u8>,
+) -> Result<(), CryptoError> {
+    if counter >= REJECT_AFTER_MESSAGES {
+        return Err(CryptoError::CounterExhausted);
+    }
+    let nonce = nonce_from_counter(counter);
+    let seal_key = LessSafeKey::new(
+        UnboundKey::new(&CHACHA20_POLY1305, &key.bytes).map_err(|_| CryptoError::InvalidKey)?,
+    );
+    let tag = seal_key
+        .seal_in_place_separate_tag(nonce, Aad::from(aad), &mut out[cipher_start..])
+        .map_err(|_| CryptoError::Cipher)?;
+    out.extend_from_slice(tag.as_ref());
+    Ok(())
+}
+
 pub fn open_with_key(
     key: &KeyMaterial,
     channel: u8,
@@ -648,10 +677,13 @@ pub fn stun_verify(key: &[u8], message_prefix: &[u8], tag: &[u8]) -> bool {
     hmac::verify(&verify_key, message_prefix, tag).is_ok()
 }
 
-fn transport_aad(channel: u8, header: &[u8]) -> Vec<u8> {
-    let mut aad = Vec::with_capacity(1 + header.len());
-    aad.push(channel);
-    aad.extend_from_slice(header);
+/// Builds the additional-authenticated-data block for a transport frame: the
+/// channel byte followed by the 12-byte transport header. Returned by value on
+/// the stack so the per-frame seal/open paths do not allocate.
+fn transport_aad(channel: u8, header: &[u8]) -> [u8; 1 + TRANSPORT_HEADER_LEN] {
+    let mut aad = [0u8; 1 + TRANSPORT_HEADER_LEN];
+    aad[0] = channel;
+    aad[1..].copy_from_slice(header);
     aad
 }
 

@@ -423,6 +423,9 @@ fn run_worker_inner(
         server_udp_probe_addr,
         read_buf: Vec::new(),
         write_buf: Vec::new(),
+        media_packet: Vec::new(),
+        media_scratch: Vec::new(),
+        p2p_routes: Vec::new(),
         control,
         secrets,
         session_id: None,
@@ -846,6 +849,17 @@ struct GatheredP2p {
     mdns_names: HashMap<String, IpAddr>,
 }
 
+/// Per-peer routing captured for one outbound P2P voice frame. Collected while
+/// iterating the peer map so the seal-and-send loop can reuse a single packet
+/// buffer without holding a borrow on `p2p_peers`.
+struct P2pVoiceRoute {
+    session_id: SessionId,
+    addr: SocketAddr,
+    connection_id: u64,
+    counter: u64,
+    key: KeyMaterial,
+}
+
 struct WorkerState {
     config: ClientConfig,
     events: Sender<NetworkEvent>,
@@ -854,6 +868,13 @@ struct WorkerState {
     udp_local_addr: SocketAddr,
     read_buf: Vec<u8>,
     write_buf: Vec<u8>,
+    /// Reusable buffers for the outbound media seal path, cleared on each use so
+    /// the per-frame voice send does not allocate. `media_packet` holds the UDP
+    /// datagram, `media_scratch` the encoded plaintext, and `p2p_routes` the
+    /// per-peer routing collected before sealing.
+    media_packet: Vec<u8>,
+    media_scratch: Vec<u8>,
+    p2p_routes: Vec<P2pVoiceRoute>,
     control: ControlTransport,
     secrets: Option<SessionSecrets>,
     server_udp_addr: SocketAddr,
@@ -2276,8 +2297,26 @@ impl WorkerState {
         let kind = media_payload_kind(payload);
         let counter = self.media_send_counter;
         self.media_send_counter = self.media_send_counter.wrapping_add(1);
-        match self.seal_server_media(counter, payload) {
-            Ok(packet) => {
+        let result = match &self.secrets {
+            Some(secrets) => media::seal_media_into(
+                &secrets.media_send,
+                counter,
+                payload,
+                &mut self.media_packet,
+                &mut self.media_scratch,
+            ),
+            None => media::seal_plaintext_media_into(
+                counter,
+                payload,
+                &mut self.media_packet,
+                &mut self.media_scratch,
+            ),
+        };
+        match result {
+            Ok(()) => {
+                // Detach the packet buffer so `send_udp` style logging can borrow
+                // `self` again, then restore it to retain its capacity.
+                let packet = std::mem::take(&mut self.media_packet);
                 if let Err(error) = self.udp.send_to(&packet, self.server_udp_addr) {
                     kvlog::warn!(
                         "udp send failed",
@@ -2294,6 +2333,7 @@ impl WorkerState {
                 ) {
                     kvlog::info!("udp packet sent", kind, packet_size = packet.len(), counter);
                 }
+                self.media_packet = packet;
             }
             Err(error) => {
                 kvlog::warn!("udp seal failed", kind, error = %error);
@@ -2748,34 +2788,57 @@ impl WorkerState {
         flags: u8,
         audio_payload: &AudioVoicePayload,
     ) {
-        let mut packets = Vec::new();
+        // Phase 1: collect routing for each ready peer. This borrows the peer map
+        // mutably (to advance `send_counter`), so it must finish before the
+        // seal-and-send loop can reuse `self.media_packet` and `send_udp_raw`.
+        let mut routes = std::mem::take(&mut self.p2p_routes);
+        routes.clear();
         for (session_id, peer) in &mut self.p2p_peers {
             let Some(selected) = peer.agent.selected() else {
                 continue;
             };
-            let payload = MediaPayload::PeerVoice {
+            let counter = peer.send_counter;
+            peer.send_counter = peer.send_counter.wrapping_add(1);
+            routes.push(P2pVoiceRoute {
+                session_id: *session_id,
+                addr: selected.remote_addr,
                 connection_id: peer.connection_id,
+                counter,
+                key: peer.send_key.clone(),
+            });
+        }
+
+        // Phase 2: seal into the shared buffer and send, one peer at a time.
+        for route in &routes {
+            let payload = MediaPayload::PeerVoice {
+                connection_id: route.connection_id,
                 stream_id,
                 sequence,
                 flags,
                 payload: media_payload_from_audio(audio_payload),
             };
-            let counter = peer.send_counter;
-            peer.send_counter = peer.send_counter.wrapping_add(1);
-            match media::seal_media(&peer.send_key, counter, &payload) {
-                Ok(packet) => packets.push((*session_id, selected.remote_addr, packet)),
+            match media::seal_media_into(
+                &route.key,
+                route.counter,
+                &payload,
+                &mut self.media_packet,
+                &mut self.media_scratch,
+            ) {
+                Ok(()) => {
+                    let packet = std::mem::take(&mut self.media_packet);
+                    self.send_udp_raw("p2p_voice", Some(route.session_id), route.addr, &packet);
+                    self.media_packet = packet;
+                }
                 Err(error) => {
                     kvlog::warn!(
                         "p2p media seal failed",
-                        session_id = session_id.0,
+                        session_id = route.session_id.0,
                         error = %error
                     );
                 }
             }
         }
-        for (session_id, addr, packet) in packets {
-            self.send_udp_raw("p2p_voice", Some(session_id), addr, &packet);
-        }
+        self.p2p_routes = routes;
     }
 
     fn send_p2p_voice_feedback(

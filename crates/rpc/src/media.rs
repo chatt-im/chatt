@@ -133,43 +133,77 @@ pub fn seal_media(
     counter: u64,
     payload: &MediaPayload,
 ) -> Result<Vec<u8>, MediaError> {
+    let mut packet = Vec::new();
+    let mut scratch = Vec::new();
+    seal_media_into(key, counter, payload, &mut packet, &mut scratch)?;
+    Ok(packet)
+}
+
+/// Seals `payload` into `packet` as a UDP media datagram, reusing `scratch` for
+/// the encoded plaintext. Both buffers are cleared first, so callers reuse them
+/// across frames to avoid per-frame allocation. Produces the same bytes as
+/// [`seal_media`].
+pub fn seal_media_into(
+    key: &KeyMaterial,
+    counter: u64,
+    payload: &MediaPayload,
+    packet: &mut Vec<u8>,
+    scratch: &mut Vec<u8>,
+) -> Result<(), MediaError> {
     let kind = payload.kind();
-    let plaintext = encode_payload(payload)?;
-    if plaintext.len() > SAFE_UDP_PAYLOAD_BYTES {
+    scratch.clear();
+    encode_payload_into(payload, scratch)?;
+    if scratch.len() > SAFE_UDP_PAYLOAD_BYTES {
         return Err(MediaError::PayloadTooLarge);
     }
 
-    let mut header = [0u8; UDP_HEADER_LEN];
-    header[0] = UDP_VERSION;
-    header[1] = kind;
-    header[2..6].copy_from_slice(&key.id.to_le_bytes());
-    header[6..14].copy_from_slice(&counter.to_le_bytes());
+    packet.clear();
+    packet.push(UDP_VERSION);
+    packet.push(kind);
+    packet.extend_from_slice(&key.id.to_le_bytes());
+    packet.extend_from_slice(&counter.to_le_bytes());
+    // `packet[2..UDP_HEADER_LEN]` is the transport header (key id + counter); it
+    // is authenticated as AAD instead of carrying a second copy in the body.
+    let cipher_start = packet.len();
+    debug_assert_eq!(cipher_start, UDP_HEADER_LEN);
+    packet.extend_from_slice(scratch);
 
-    let mut sealed = crypto::seal_with_key(key, crypto::CHANNEL_MEDIA, counter, &plaintext)?;
-    debug_assert_eq!(
-        sealed.len(),
-        crypto::TRANSPORT_HEADER_LEN + plaintext.len() + crypto::TAG_LEN
-    );
-    let mut out = Vec::with_capacity(UDP_HEADER_LEN + sealed.len() - crypto::TRANSPORT_HEADER_LEN);
-    out.extend_from_slice(&header);
-    out.extend_from_slice(&sealed.split_off(crypto::TRANSPORT_HEADER_LEN));
-    Ok(out)
+    let mut aad = [0u8; 1 + crypto::TRANSPORT_HEADER_LEN];
+    aad[0] = crypto::CHANNEL_MEDIA;
+    aad[1..].copy_from_slice(&packet[2..UDP_HEADER_LEN]);
+    crypto::seal_in_place_append_tag(key, counter, &aad, cipher_start, packet)?;
+    Ok(())
 }
 
 pub fn seal_plaintext_media(counter: u64, payload: &MediaPayload) -> Result<Vec<u8>, MediaError> {
+    let mut packet = Vec::new();
+    let mut scratch = Vec::new();
+    seal_plaintext_media_into(counter, payload, &mut packet, &mut scratch)?;
+    Ok(packet)
+}
+
+/// Buffer-reusing counterpart to [`seal_plaintext_media`]. Clears `packet` and
+/// `scratch` before use.
+pub fn seal_plaintext_media_into(
+    counter: u64,
+    payload: &MediaPayload,
+    packet: &mut Vec<u8>,
+    scratch: &mut Vec<u8>,
+) -> Result<(), MediaError> {
     let kind = payload.kind();
-    let plaintext = encode_payload(payload)?;
-    if plaintext.len() > SAFE_UDP_PAYLOAD_BYTES {
+    scratch.clear();
+    encode_payload_into(payload, scratch)?;
+    if scratch.len() > SAFE_UDP_PAYLOAD_BYTES {
         return Err(MediaError::PayloadTooLarge);
     }
 
-    let mut out = Vec::with_capacity(UDP_HEADER_LEN + plaintext.len());
-    out.push(UDP_VERSION);
-    out.push(kind);
-    out.extend_from_slice(&PLAINTEXT_KEY_ID.to_le_bytes());
-    out.extend_from_slice(&counter.to_le_bytes());
-    out.extend_from_slice(&plaintext);
-    Ok(out)
+    packet.clear();
+    packet.push(UDP_VERSION);
+    packet.push(kind);
+    packet.extend_from_slice(&PLAINTEXT_KEY_ID.to_le_bytes());
+    packet.extend_from_slice(&counter.to_le_bytes());
+    packet.extend_from_slice(scratch);
+    Ok(())
 }
 
 pub fn open_media(
@@ -249,6 +283,13 @@ impl MediaPayload {
 
 pub fn encode_payload(payload: &MediaPayload) -> Result<Vec<u8>, MediaError> {
     let mut out = Vec::new();
+    encode_payload_into(payload, &mut out)?;
+    Ok(out)
+}
+
+/// Appends the wire encoding of `payload` to `out` without clearing it first.
+/// [`encode_payload`] is the allocating convenience wrapper.
+pub fn encode_payload_into(payload: &MediaPayload, out: &mut Vec<u8>) -> Result<(), MediaError> {
     out.push(payload.kind());
     match payload {
         MediaPayload::Bind { session_id } => {
@@ -270,7 +311,7 @@ pub fn encode_payload(payload: &MediaPayload) -> Result<Vec<u8>, MediaError> {
             out.extend_from_slice(&stream_id.0.to_le_bytes());
             out.extend_from_slice(&sequence.to_le_bytes());
             out.push(*flags);
-            encode_voice_payload(payload, &mut out)?;
+            encode_voice_payload(payload, out)?;
         }
         MediaPayload::PeerVoice {
             connection_id,
@@ -283,14 +324,14 @@ pub fn encode_payload(payload: &MediaPayload) -> Result<Vec<u8>, MediaError> {
             out.extend_from_slice(&stream_id.0.to_le_bytes());
             out.extend_from_slice(&sequence.to_le_bytes());
             out.push(*flags);
-            encode_voice_payload(payload, &mut out)?;
+            encode_voice_payload(payload, out)?;
         }
         MediaPayload::VoiceFeedback {
             stream_id,
             feedback,
         } => {
             out.extend_from_slice(&stream_id.0.to_le_bytes());
-            encode_voice_feedback(*feedback, &mut out);
+            encode_voice_feedback(*feedback, out);
         }
         MediaPayload::PeerVoiceFeedback {
             connection_id,
@@ -299,13 +340,13 @@ pub fn encode_payload(payload: &MediaPayload) -> Result<Vec<u8>, MediaError> {
         } => {
             out.extend_from_slice(&connection_id.to_le_bytes());
             out.extend_from_slice(&stream_id.0.to_le_bytes());
-            encode_voice_feedback(*feedback, &mut out);
+            encode_voice_feedback(*feedback, out);
         }
         MediaPayload::Ping { nonce } | MediaPayload::Pong { nonce } => {
             out.extend_from_slice(&nonce.to_le_bytes());
         }
     }
-    Ok(out)
+    Ok(())
 }
 
 pub fn decode_payload(kind: u8, bytes: &[u8]) -> Result<MediaPayload, MediaError> {
@@ -597,5 +638,31 @@ mod tests {
         assert!(replay.update(header.counter));
         assert_eq!(open_plaintext_media(&packet).unwrap().1, payload);
         assert!(!replay.update(header.counter));
+    }
+
+    #[test]
+    fn seal_media_into_matches_seal_media_byte_for_byte() {
+        let key = KeyMaterial {
+            id: 77,
+            bytes: [8; crypto::KEY_LEN],
+        };
+        let payload = MediaPayload::Voice {
+            stream_id: StreamId(5),
+            sequence: 9,
+            flags: 0,
+            payload: VoicePayload::Opus(vec![1, 2, 3, 4, 5, 6, 7, 8]),
+        };
+
+        let expected = seal_media(&key, 3, &payload).unwrap();
+
+        // Pre-populate the reusable buffers with stale data to prove they are
+        // cleared, mirroring the steady-state reuse in the client worker.
+        let mut packet = vec![0xAA; 64];
+        let mut scratch = vec![0xBB; 64];
+        seal_media_into(&key, 3, &payload, &mut packet, &mut scratch).unwrap();
+        assert_eq!(packet, expected);
+
+        let mut replay = AntiReplay::new();
+        assert_eq!(open_media(&key, &mut replay, &packet).unwrap().1, payload);
     }
 }
