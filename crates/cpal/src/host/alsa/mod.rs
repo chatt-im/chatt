@@ -1326,6 +1326,7 @@ impl Stream {
 
         let thread = thread::Builder::new()
             .name("cpal_alsa_in".to_owned())
+            .stack_size(256 * 1024)
             .spawn(move || {
                 waiter.wait();
                 input_stream_worker(
@@ -1369,6 +1370,7 @@ impl Stream {
 
         let thread = thread::Builder::new()
             .name("cpal_alsa_out".to_owned())
+            .stack_size(256 * 1024)
             .spawn(move || {
                 waiter.wait();
                 output_stream_worker(

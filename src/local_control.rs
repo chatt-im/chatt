@@ -65,26 +65,30 @@ mod imp {
 
             let path = config.path;
             let (shutdown_tx, shutdown_rx) = mpsc::channel();
-            let worker = thread::spawn(move || {
-                loop {
-                    match shutdown_rx.try_recv() {
-                        Ok(()) | Err(TryRecvError::Disconnected) => break,
-                        Err(TryRecvError::Empty) => {}
-                    }
+            let worker = thread::Builder::new()
+                .name("chatt-local-ctl".to_string())
+                .stack_size(256 * 1024)
+                .spawn(move || {
+                    loop {
+                        match shutdown_rx.try_recv() {
+                            Ok(()) | Err(TryRecvError::Disconnected) => break,
+                            Err(TryRecvError::Empty) => {}
+                        }
 
-                    match listener.accept() {
-                        Ok((mut stream, _addr)) => handle_connection(&mut stream, &commands),
-                        Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                            thread::sleep(ACCEPT_SLEEP);
-                        }
-                        Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-                        Err(error) => {
-                            kvlog::warn!("local control accept failed", error = %error);
-                            thread::sleep(ACCEPT_SLEEP);
+                        match listener.accept() {
+                            Ok((mut stream, _addr)) => handle_connection(&mut stream, &commands),
+                            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                                thread::sleep(ACCEPT_SLEEP);
+                            }
+                            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                            Err(error) => {
+                                kvlog::warn!("local control accept failed", error = %error);
+                                thread::sleep(ACCEPT_SLEEP);
+                            }
                         }
                     }
-                }
-            });
+                })
+                .map_err(|error| format!("failed to spawn local control worker: {error}"))?;
 
             kvlog::info!("local control socket listening", path = %path.display());
             Ok(Self {

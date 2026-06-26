@@ -229,17 +229,24 @@ impl NetworkClient {
             waker: Arc::new(waker),
         };
         let panic_events = events.clone();
-        let worker = thread::spawn(move || {
-            let result = panic::catch_unwind(AssertUnwindSafe(|| {
-                run_worker(config, events, rx, poll);
-            }));
-            if result.is_err() {
-                kvlog::error!("network worker panicked");
-                let _ = panic_events.send(NetworkEvent::WorkerStopped {
-                    reason: "network worker panicked".to_string(),
-                });
-            }
-        });
+        let worker = thread::Builder::new()
+            .name("chatt-net".to_string())
+            // 1M. This thread runs the mio loop, ChaCha20-Poly1305/X25519 crypto, jsony
+            // (de)serialization, and P2P/STUN state machines. Serialization depth is not bounded
+            // by inspection, so keep an overly safe margin over the default 2M.
+            .stack_size(1024 * 1024)
+            .spawn(move || {
+                let result = panic::catch_unwind(AssertUnwindSafe(|| {
+                    run_worker(config, events, rx, poll);
+                }));
+                if result.is_err() {
+                    kvlog::error!("network worker panicked");
+                    let _ = panic_events.send(NetworkEvent::WorkerStopped {
+                        reason: "network worker panicked".to_string(),
+                    });
+                }
+            })
+            .map_err(|error| format!("failed to spawn network worker: {error}"))?;
         Ok(Self {
             tx,
             worker: Some(worker),
@@ -297,14 +304,18 @@ pub fn spawn_pair_once(
     pairing_code: String,
     events: Sender<NetworkEvent>,
 ) -> JoinHandle<()> {
-    thread::spawn(move || {
-        let result = pair_once(&config, pairing_code);
-        let event = match result {
-            Ok(()) => NetworkEvent::PairingSucceeded,
-            Err(error) => NetworkEvent::PairingFailed(error),
-        };
-        let _ = events.send(event);
-    })
+    thread::Builder::new()
+        .name("chatt-pair".to_string())
+        .stack_size(256 * 1024)
+        .spawn(move || {
+            let result = pair_once(&config, pairing_code);
+            let event = match result {
+                Ok(()) => NetworkEvent::PairingSucceeded,
+                Err(error) => NetworkEvent::PairingFailed(error),
+            };
+            let _ = events.send(event);
+        })
+        .expect("failed to spawn pairing worker")
 }
 
 fn run_worker(
