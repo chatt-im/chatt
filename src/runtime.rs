@@ -8,6 +8,7 @@ use std::{
 use extui::{
     Buffer, Terminal, TerminalFlags,
     event::{self, Event, Events, polling::GlobalWakerConfig},
+    vt,
 };
 use rpc::control::InviteTicket;
 
@@ -38,6 +39,14 @@ pub(crate) fn run_app(
         | TerminalFlags::EXTENDED_KEYBOARD_INPUTS
         | TerminalFlags::BRACKETED_PASTE;
     let mut terminal = Terminal::open(flags)?;
+
+    // Batch startup terminal queries into one buffer and dispatch with a single
+    // write. The cursor-style reply arrives as Event::CursorStyleReport and is
+    // stored for restore on exit.
+    let mut startup_queries = Vec::new();
+    startup_queries.extend_from_slice(vt::QUERY_CURSOR_STYLE);
+    terminal.write_all(&startup_queries)?;
+
     let (w, h) = terminal.size()?;
     let mut buffer = Buffer::new(w, h);
     buffer.set_rgb_supported(true);
@@ -77,6 +86,9 @@ pub(crate) fn run_app(
                 Event::Resized => {
                     let (new_w, new_h) = terminal.size()?;
                     buffer.resize(new_w, new_h);
+                }
+                Event::CursorStyleReport(shape) => {
+                    terminal.set_restore_cursor_style(Some(shape));
                 }
                 _ => {}
             }

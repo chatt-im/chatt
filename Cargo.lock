@@ -595,7 +595,7 @@ dependencies = [
 [[package]]
 name = "extui"
 version = "0.1.3"
-source = "git+https://github.com/exrok/extui?rev=0db2ec429bc437f4d330b24e7642e539c44b8a6a#0db2ec429bc437f4d330b24e7642e539c44b8a6a"
+source = "git+https://github.com/exrok/extui?rev=d86585e4667ff868aab88cd1e2f1cb5b8cfaf4b5#d86585e4667ff868aab88cd1e2f1cb5b8cfaf4b5"
 dependencies = [
  "bitflags",
  "itoap",
@@ -608,7 +608,7 @@ dependencies = [
 [[package]]
 name = "extui-bindings"
 version = "0.1.0"
-source = "git+https://github.com/exrok/extui?rev=0db2ec429bc437f4d330b24e7642e539c44b8a6a#0db2ec429bc437f4d330b24e7642e539c44b8a6a"
+source = "git+https://github.com/exrok/extui?rev=d86585e4667ff868aab88cd1e2f1cb5b8cfaf4b5#d86585e4667ff868aab88cd1e2f1cb5b8cfaf4b5"
 dependencies = [
  "extui",
  "foldhash",
@@ -618,7 +618,7 @@ dependencies = [
 [[package]]
 name = "extui-editor"
 version = "0.1.0"
-source = "git+https://github.com/exrok/extui?rev=0db2ec429bc437f4d330b24e7642e539c44b8a6a#0db2ec429bc437f4d330b24e7642e539c44b8a6a"
+source = "git+https://github.com/exrok/extui?rev=d86585e4667ff868aab88cd1e2f1cb5b8cfaf4b5#d86585e4667ff868aab88cd1e2f1cb5b8cfaf4b5"
 dependencies = [
  "extui",
  "extui-bindings",
@@ -1845,7 +1845,7 @@ dependencies = [
 [[package]]
 name = "tinyhl"
 version = "0.1.1"
-source = "git+https://github.com/exrok/extui?rev=0db2ec429bc437f4d330b24e7642e539c44b8a6a#0db2ec429bc437f4d330b24e7642e539c44b8a6a"
+source = "git+https://github.com/exrok/extui?rev=d86585e4667ff868aab88cd1e2f1cb5b8cfaf4b5#d86585e4667ff868aab88cd1e2f1cb5b8cfaf4b5"
 dependencies = [
  "unicode-ident",
 ]
