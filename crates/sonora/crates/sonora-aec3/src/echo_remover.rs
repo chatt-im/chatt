@@ -148,6 +148,18 @@ pub(crate) struct EchoRemover {
     metrics: EchoRemoverMetrics,
     e_old: Vec<[f32; FFT_LENGTH_BY_2]>,
     y_old: Vec<[f32; FFT_LENGTH_BY_2]>,
+    // Per-call working storage, reset (not persisted) each `process_capture`.
+    e: Vec<[f32; FFT_LENGTH_BY_2]>,
+    y2: Vec<[f32; FFT_LENGTH_BY_2_PLUS_1]>,
+    e2: Vec<[f32; FFT_LENGTH_BY_2_PLUS_1]>,
+    r2: Vec<[f32; FFT_LENGTH_BY_2_PLUS_1]>,
+    r2_unbounded: Vec<[f32; FFT_LENGTH_BY_2_PLUS_1]>,
+    s2_linear: Vec<[f32; FFT_LENGTH_BY_2_PLUS_1]>,
+    y_fft: Vec<FftData>,
+    e_fft: Vec<FftData>,
+    comfort_noise: Vec<FftData>,
+    high_band_comfort_noise: Vec<FftData>,
+    subtractor_output: Vec<SubtractorOutput>,
     block_counter: usize,
     gain_change_hangover: i32,
     refined_filter_output_last_selected: bool,
@@ -181,6 +193,19 @@ impl EchoRemover {
             metrics: EchoRemoverMetrics::new(),
             e_old: vec![[0.0; FFT_LENGTH_BY_2]; num_capture_channels],
             y_old: vec![[0.0; FFT_LENGTH_BY_2]; num_capture_channels],
+            e: vec![[0.0; FFT_LENGTH_BY_2]; num_capture_channels],
+            y2: vec![[0.0; FFT_LENGTH_BY_2_PLUS_1]; num_capture_channels],
+            e2: vec![[0.0; FFT_LENGTH_BY_2_PLUS_1]; num_capture_channels],
+            r2: vec![[0.0; FFT_LENGTH_BY_2_PLUS_1]; num_capture_channels],
+            r2_unbounded: vec![[0.0; FFT_LENGTH_BY_2_PLUS_1]; num_capture_channels],
+            s2_linear: vec![[0.0; FFT_LENGTH_BY_2_PLUS_1]; num_capture_channels],
+            y_fft: vec![FftData::default(); num_capture_channels],
+            e_fft: vec![FftData::default(); num_capture_channels],
+            comfort_noise: vec![FftData::default(); num_capture_channels],
+            high_band_comfort_noise: vec![FftData::default(); num_capture_channels],
+            subtractor_output: (0..num_capture_channels)
+                .map(|_| SubtractorOutput::default())
+                .collect(),
             block_counter: 0,
             gain_change_hangover: 0,
             refined_filter_output_last_selected: true,
@@ -221,20 +246,47 @@ impl EchoRemover {
         );
         debug_assert_eq!(capture.num_channels(), num_capture_channels);
 
-        // Per-channel working storage.
-        let mut e = vec![[0.0f32; FFT_LENGTH_BY_2]; num_capture_channels];
-        let mut y2 = vec![[0.0f32; FFT_LENGTH_BY_2_PLUS_1]; num_capture_channels];
-        let mut e2 = vec![[0.0f32; FFT_LENGTH_BY_2_PLUS_1]; num_capture_channels];
-        let mut r2 = vec![[0.0f32; FFT_LENGTH_BY_2_PLUS_1]; num_capture_channels];
-        let mut r2_unbounded = vec![[0.0f32; FFT_LENGTH_BY_2_PLUS_1]; num_capture_channels];
-        let mut s2_linear = vec![[0.0f32; FFT_LENGTH_BY_2_PLUS_1]; num_capture_channels];
-        let mut y_fft = vec![FftData::default(); num_capture_channels];
-        let mut e_fft = vec![FftData::default(); num_capture_channels];
-        let mut comfort_noise = vec![FftData::default(); num_capture_channels];
-        let mut high_band_comfort_noise = vec![FftData::default(); num_capture_channels];
-        let mut subtractor_output: Vec<SubtractorOutput> = (0..num_capture_channels)
-            .map(|_| SubtractorOutput::default())
-            .collect();
+        // Reset per-channel working storage. These fields are recomputed each
+        // call, so reset them to the zero/default state the old per-call `vec!`
+        // produced. (`e_old`/`y_old` are persistent filter state, not reset.)
+        for b in &mut self.e {
+            b.fill(0.0);
+        }
+        for b in &mut self.y2 {
+            b.fill(0.0);
+        }
+        for b in &mut self.e2 {
+            b.fill(0.0);
+        }
+        for b in &mut self.r2 {
+            b.fill(0.0);
+        }
+        for b in &mut self.r2_unbounded {
+            b.fill(0.0);
+        }
+        for b in &mut self.s2_linear {
+            b.fill(0.0);
+        }
+        self.y_fft.fill(FftData::default());
+        self.e_fft.fill(FftData::default());
+        self.comfort_noise.fill(FftData::default());
+        self.high_band_comfort_noise.fill(FftData::default());
+        for o in &mut self.subtractor_output {
+            *o = SubtractorOutput::default();
+        }
+
+        // Bind disjoint-field borrows so the body logic below is unchanged.
+        let e = &mut self.e;
+        let y2 = &mut self.y2;
+        let e2 = &mut self.e2;
+        let r2 = &mut self.r2;
+        let r2_unbounded = &mut self.r2_unbounded;
+        let s2_linear = &mut self.s2_linear;
+        let y_fft = &mut self.y_fft;
+        let e_fft = &mut self.e_fft;
+        let comfort_noise = &mut self.comfort_noise;
+        let high_band_comfort_noise = &mut self.high_band_comfort_noise;
+        let subtractor_output = &mut self.subtractor_output;
 
         self.aec_state
             .update_capture_saturation(capture_signal_saturation);
@@ -281,7 +333,7 @@ impl EchoRemover {
             capture,
             &self.render_signal_analyzer,
             &self.aec_state,
-            &mut subtractor_output,
+            &mut *subtractor_output,
         );
 
         // Decide refined vs coarse once across all channels.
@@ -353,8 +405,8 @@ impl EchoRemover {
                     y2: &y2,
                     dominant_nearend: self.suppression_gain.is_dominant_nearend(),
                 },
-                &mut r2,
-                &mut r2_unbounded,
+                &mut *r2,
+                &mut *r2_unbounded,
             );
 
             // Suppressor nearend estimate: E2 is bound by Y2.
@@ -378,8 +430,8 @@ impl EchoRemover {
             self.cng.compute(
                 self.aec_state.saturated_capture(),
                 nearend_spectrum,
-                &mut comfort_noise,
-                &mut high_band_comfort_noise,
+                &mut *comfort_noise,
+                &mut *high_band_comfort_noise,
             );
 
             // Suppressor echo estimate.
@@ -430,8 +482,8 @@ impl EchoRemover {
             self.cng.compute(
                 self.aec_state.saturated_capture(),
                 nearend_spectrum,
-                &mut comfort_noise,
-                &mut high_band_comfort_noise,
+                &mut *comfort_noise,
+                &mut *high_band_comfort_noise,
             );
             g.fill(0.0);
         }
