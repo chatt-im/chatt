@@ -75,6 +75,7 @@ fn exp1_drift_and_block_size_through_real_pipeline() {
         let tuning = test_tuning();
         let mixer = Arc::new(Mutex::new(LivePlaybackMixer::with_tuning(tuning)));
         let mut decode = LiveDecodeStreams::new(tuning);
+        decode.set_block_samples(block);
         let device_rate = f64::from(SAMPLE_RATE);
         let sender_rate = device_rate * (1.0 + drift);
         let dt = block as f64 / device_rate;
@@ -457,6 +458,7 @@ fn run_clean_pipeline(
     let tuning = test_tuning();
     let mixer = Arc::new(Mutex::new(LivePlaybackMixer::with_tuning(tuning)));
     let mut decode = LiveDecodeStreams::new(tuning);
+    decode.set_block_samples(block);
     let device_rate = f64::from(SAMPLE_RATE);
     let sender_rate = device_rate * (1.0 + drift);
     let dt = block as f64 / device_rate;

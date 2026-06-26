@@ -1,28 +1,18 @@
-use std::time::Duration;
+use std::sync::Arc;
 
-use crate::audio::{
-    playback::AdaptivePlaybackStream,
-    shared::{DecodedFrameSource, PlaybackStreamControl, PlayoutDelay},
-};
+use crate::audio::{playback::SampleRing, shared::PlaybackStreamControl};
 
+/// Control-plane events the decode worker sends to the cpal consumer.
+///
+/// Sample data no longer travels through this channel: the worker writes
+/// time-scaled audio straight into each stream's [`SampleRing`], and the
+/// consumer reads it. Only stream lifecycle and mute/gain cross here.
 pub(crate) enum LivePlaybackMixerEvent {
     Empty,
+    /// Registers a new stream and hands the consumer the read side of its ring.
     EnsureStream {
         stream_id: u32,
-        stream: Box<AdaptivePlaybackStream>,
-    },
-    QueueSamples {
-        stream_id: u32,
-        samples: Vec<f32>,
-        source: DecodedFrameSource,
-        playout_delay: Option<PlayoutDelay>,
-        recommended_target: Duration,
-    },
-    NoteStreamDiscontinuity {
-        stream_id: u32,
-    },
-    NoteSenderSilence {
-        stream_id: u32,
+        ring: Arc<SampleRing>,
     },
     StopStream {
         stream_id: u32,
@@ -44,25 +34,8 @@ impl LivePlaybackMixerEvent {
         match self {
             Self::Empty => "empty",
             Self::EnsureStream { .. } => "ensure_stream",
-            Self::QueueSamples { .. } => "queue_samples",
-            Self::NoteStreamDiscontinuity { .. } => "note_stream_discontinuity",
-            Self::NoteSenderSilence { .. } => "note_sender_silence",
             Self::StopStream { .. } => "stop_stream",
             Self::SetStreamControl { .. } => "set_stream_control",
         }
     }
-}
-
-#[derive(Debug, Default)]
-pub(crate) enum LivePlaybackQueueReport {
-    #[default]
-    Empty,
-    Queued {
-        stream_id: u32,
-        max_queue_ms: u64,
-    },
-    SenderSilence {
-        stream_id: u32,
-        queue_ms: u64,
-    },
 }

@@ -3,3 +3,4 @@
 /assets/sample-001.opus
 /docs/smooth-adaptive-catch-up.md
 .rgignore
+/assets/weights_blob_little.bin

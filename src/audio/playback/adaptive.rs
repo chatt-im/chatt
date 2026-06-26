@@ -122,6 +122,15 @@ pub(crate) struct AdaptivePlaybackStream {
     output_target_floor_samples: usize,
     buffer_level: BufferLevelFilter,
     pending_time_stretch: i64,
+    /// Ring samples already published to the callback during a ring-path
+    /// time-scale decision. They are immutable, but they still count as
+    /// protected output reserve when deciding whether it is safe to accelerate
+    /// queued future samples.
+    ring_decision_published_samples: usize,
+    /// Ring-path priming gate. While set, the batched pump holds the ring empty
+    /// (the consumer hears silence) until the buffer first reaches the target,
+    /// then re-arms on a dry-ring underrun. Unused by the legacy pull path.
+    ring_priming: bool,
 }
 
 impl AdaptivePlaybackStream {
@@ -148,6 +157,8 @@ impl AdaptivePlaybackStream {
             output_target_floor_samples: 0,
             buffer_level: BufferLevelFilter::default(),
             pending_time_stretch: 0,
+            ring_decision_published_samples: 0,
+            ring_priming: true,
         })
     }
 
@@ -221,6 +232,13 @@ impl AdaptivePlaybackStream {
         }
         self.recommended_target_samples
             .clamp(floor, self.samples.max_target)
+    }
+
+    /// Alias kept for the diagnostics snapshot. The ring carries no extra target
+    /// of its own: the time-scaler steers the combined queue-plus-ring depth to
+    /// this single target, so allocation does not change the buffering target.
+    pub(crate) fn total_target_samples(&self) -> usize {
+        self.effective_target_samples()
     }
 
     pub(crate) fn adaptive_target_samples(&self, _now: Instant) -> usize {
@@ -368,6 +386,80 @@ impl AdaptivePlaybackStream {
             return false;
         };
         rms * rms <= TIME_SCALE_VAD_RATIO * TIME_SCALE_NOISE_FLOOR_MS
+    }
+
+    /// Ring-path decision. Identical policy to [`Self::run_time_scale_decision`]
+    /// but fed the combined queue-plus-ring depth, so the time-scaler steers the
+    /// same total buffer to the same target whether a sample currently sits in
+    /// the queue or the ring. The queue-depth fallback is used rather than the
+    /// arrival-delay path, since the producer fills the ring ahead of real time
+    /// and the network-derived playout delay no longer reflects buffered latency.
+    fn run_ring_time_scale_decision(
+        &mut self,
+        total: usize,
+        ring_depth: usize,
+        now: Instant,
+        stats: &mut LivePlaybackMixerStats,
+    ) {
+        let target = self
+            .effective_target_samples()
+            .max(self.output_target_floor_samples);
+        self.buffer_level.set_target(samples_to_ms(target));
+        self.buffer_level.update(total, self.pending_time_stretch);
+        self.pending_time_stretch = 0;
+        if !self.tuning.adaptive_catch_up {
+            return;
+        }
+        let active_recovery_front = self
+            .input
+            .front_source()
+            .is_some_and(|source| source != DecodedFrameSource::Normal)
+            && !self.front_is_passive_audio();
+        self.ring_decision_published_samples = ring_depth;
+        self.run_ring_queue_depth_fallback_decision(
+            self.buffer_level.level_samples(),
+            ring_depth,
+            target,
+            now,
+            stats,
+            active_recovery_front,
+        );
+        self.ring_decision_published_samples = 0;
+    }
+
+    fn run_ring_queue_depth_fallback_decision(
+        &mut self,
+        queued: usize,
+        ring_depth: usize,
+        target: usize,
+        now: Instant,
+        stats: &mut LivePlaybackMixerStats,
+        active_recovery_front: bool,
+    ) {
+        let high = target.saturating_add(self.samples.time_scale_margin);
+        if !active_recovery_front && queued >= high.saturating_mul(4) {
+            self.try_accelerate(now, stats, true);
+            return;
+        }
+        if !self.time_scale_allowed() {
+            return;
+        }
+        let effective_target = self.effective_target_samples();
+        let should_preemptively_expand =
+            queued == target && self.output_target_floor_samples > effective_target;
+        let projected_after_callback =
+            queued.saturating_sub(ring_depth.min(self.samples.decision_interval));
+        if projected_after_callback.saturating_add(self.low_delay_expand_deadband()) <= target
+            || should_preemptively_expand
+        {
+            if !self.try_expand(now, stats) {
+                self.try_short_buffer_expand(stats);
+            }
+            return;
+        }
+        if !active_recovery_front && queued >= high {
+            self.try_accelerate(now, stats, false);
+        }
     }
 
     fn run_time_scale_decision(&mut self, now: Instant, stats: &mut LivePlaybackMixerStats) {
@@ -749,7 +841,10 @@ impl AdaptivePlaybackStream {
     }
 
     fn low_latency_target_samples(&self) -> usize {
-        self.effective_target_samples()
+        // Trim toward the full buffered target, not the reduced queue target:
+        // the ring carries the reserved share, so trimming the queue to the
+        // reduced value would discard more low-energy tail than intended.
+        self.total_target_samples()
             .max(self.output_target_floor_samples)
     }
 
@@ -763,15 +858,31 @@ impl AdaptivePlaybackStream {
         self.low_latency_target_samples()
             .saturating_add(self.samples.time_scale_margin)
             .saturating_add(current_output_block_reserve)
+            .saturating_sub(self.ring_decision_published_samples)
     }
 
     pub(crate) fn mark_sender_silent(&mut self, _now: Instant, stats: &mut LivePlaybackMixerStats) {
-        let tail_trim_target = self
-            .effective_target_samples()
-            .max(self.samples.target_queue);
+        self.mark_sender_silent_inner(0, stats);
+    }
+
+    pub(crate) fn mark_sender_silent_from_ring(
+        &mut self,
+        _now: Instant,
+        stats: &mut LivePlaybackMixerStats,
+    ) {
+        self.mark_sender_silent_inner(self.samples.target_queue, stats);
+    }
+
+    fn mark_sender_silent_inner(
+        &mut self,
+        passive_tail_reserve: usize,
+        stats: &mut LivePlaybackMixerStats,
+    ) {
+        let playout_target = self.total_target_samples().max(self.samples.target_queue);
+        let tail_trim_target = playout_target.saturating_add(passive_tail_reserve);
         self.sender_silent = true;
         self.passive_output_active = true;
-        self.recommended_target_samples = tail_trim_target;
+        self.recommended_target_samples = playout_target;
         self.underrun_active = false;
         self.output_priming = false;
         self.output_block_playable = true;
@@ -779,10 +890,12 @@ impl AdaptivePlaybackStream {
 
         // A sender-silence marker is equivalent to NetEQ entering a silence/CNG
         // region: stale device-block floors can be dropped immediately, but
-        // without comfort noise we still need to preserve the current playout
-        // target, or the normal target if the current target already relaxed.
-        // Trimming all the way to the adaptive floor repeatedly cuts
-        // low-energy syllable endings and speech gaps.
+        // without comfort noise we preserve the current playout target, or the
+        // normal target if the current target already relaxed. The ring path
+        // adds one normal target of passive-tail reserve because callback
+        // staging shifts a little tail audio out of the producer queue; trimming
+        // closer than that repeatedly cuts low-energy syllable endings and
+        // speech gaps.
         let target = tail_trim_target;
         let queued = self.queued_samples();
         if queued <= target {
@@ -854,6 +967,120 @@ impl AdaptivePlaybackStream {
         );
     }
 
+    /// Records a dry-ring underrun observed by the cpal consumer.
+    ///
+    /// In the ring-buffer playback path the consumer, not this state machine,
+    /// detects starvation: it reads a dry [`SampleRing`](super::SampleRing) and
+    /// bumps an atomic. The producer drains that atomic and calls this so the
+    /// same dynamic-target response fires as when `pop_sample` found the queue
+    /// dry on the old pull path. Episode debouncing still lives in
+    /// `record_underrun`.
+    pub(crate) fn note_ring_underrun(&mut self, now: Instant, stats: &mut LivePlaybackMixerStats) {
+        self.record_underrun(now, stats);
+    }
+
+    /// Whether the ring pump is still priming. The producer ignores dry-ring
+    /// reads in this phase, since silence before the buffer first fills is
+    /// expected rather than a starvation event.
+    pub(crate) fn is_ring_priming(&self) -> bool {
+        self.ring_priming
+    }
+
+    /// Moves time-scaled playout audio into `ring` in bulk, steering total
+    /// buffered depth (queue plus ring) toward the adaptive target.
+    ///
+    /// The time-scale decision runs once per `decision_interval` of output, the
+    /// same cadence as the pull path, and at most one pitch-period crossfade
+    /// fires per decision. Between decisions the queue front is copied into the
+    /// ring as bulk runs, two `memcpy`s at most per run when it wraps. No
+    /// per-sample work crosses the thread boundary.
+    pub(crate) fn pump_into_ring(
+        &mut self,
+        ring: &super::SampleRing,
+        block_samples: usize,
+        now: Instant,
+        stats: &mut LivePlaybackMixerStats,
+    ) {
+        // Allocation is behaviour-neutral: the queue and the ring together are
+        // the adaptive buffer, and the time-scaler steers their *combined* depth
+        // to the single target exactly as the pull path steered the queue alone.
+        // The ring publishes the current callback plus one decision interval
+        // when the target allows it. That gives the consumer visibility across
+        // one producer tick without raising the combined buffering target.
+        let block = block_samples.max(1);
+        let total_target = self.effective_target_samples();
+        let ring_target = if block > total_target {
+            (block + self.samples.device_period_margin).min(self.samples.hard_queue_bound)
+        } else {
+            block
+                .saturating_add(self.samples.decision_interval)
+                .min(total_target)
+        }
+        .min(ring.capacity());
+        self.output_target_floor_samples = 0;
+
+        // Priming: keep the ring empty until the combined buffer first reaches
+        // the target, so the consumer outputs silence rather than starting
+        // shallow and immediately starving.
+        if self.ring_priming {
+            if self.queued_samples() + ring.depth() < total_target && !self.sender_silent {
+                return;
+            }
+            self.ring_priming = false;
+            self.output_priming = false;
+        }
+
+        // Top the ring up to the publication window, running the time-scale
+        // decision on the combined depth every `decision_interval` of committed
+        // output, the same cadence and policy as the pull path.
+        loop {
+            let depth = ring.depth();
+            if depth >= ring_target || ring.free() == 0 {
+                break;
+            }
+            if self.decision_countdown == 0 {
+                self.run_ring_time_scale_decision(self.queued_samples() + depth, depth, now, stats);
+                self.decision_countdown = self.samples.decision_interval;
+            }
+            let committable = self.queued_samples();
+            if committable == 0 {
+                break;
+            }
+            let want = committable
+                .min(self.decision_countdown.max(1))
+                .min(ring.free())
+                .min(ring_target - depth);
+            let moved = self.commit_front_to_ring(ring, want);
+            if moved == 0 {
+                break;
+            }
+            // A committed run is the ring equivalent of playing real samples, so
+            // the next dry ring counts as a fresh underrun episode.
+            self.underrun_active = false;
+            self.decision_countdown = self.decision_countdown.saturating_sub(moved);
+            self.operation_hold_remaining = self.operation_hold_remaining.saturating_sub(moved);
+            stats.direct_samples = stats.direct_samples.saturating_add(moved as u64);
+        }
+    }
+
+    /// Copies up to `want` contiguous front samples into the ring as one bulk
+    /// write and drains exactly what was accepted. Returns the count moved.
+    fn commit_front_to_ring(&mut self, ring: &super::SampleRing, want: usize) -> usize {
+        if want == 0 {
+            return 0;
+        }
+        let written = {
+            let run = self.input.front_run();
+            if run.is_empty() {
+                return 0;
+            }
+            let take = want.min(run.len());
+            ring.write_samples(&run[..take])
+        };
+        self.input.drain_samples(written);
+        written
+    }
+
     pub(crate) fn queued_samples(&self) -> usize {
         self.input.frames()
     }
@@ -878,7 +1105,6 @@ fn samples_are_passive(samples: &[f32]) -> bool {
 mod tests {
     use super::*;
     use crate::audio::{
-        playback::LivePlaybackMixer,
         shared::{
             FRAME_SAMPLES, LIVE_PLAYBACK_TARGET_QUEUE, PlayoutDelay, SAMPLE_RATE, duration_to_ms,
             max_adjacent_delta, samples_for_duration, target_queue_samples,
@@ -1722,22 +1948,30 @@ mod tests {
     }
 
     #[test]
-    fn dropped_packets_can_expand_passive_audio() {
-        let mut mixer = LivePlaybackMixer::new();
+    fn dropped_packets_can_time_scale_passive_audio() {
         let now = Instant::now();
+        let tuning = test_tuning();
+        let mut producer = crate::audio::playback::RingPlaybackProducer::new(tuning).unwrap();
+        let mut stats = LivePlaybackMixerStats::default();
+        let target = target_queue_samples(tuning);
 
-        // Below the near-empty expand floor, so the passive (PLC) buffer is
-        // bridged by the safety-net expand rather than left to underrun.
-        mixer.queue_stream_samples(
-            1,
-            &vec![0.0; samples_for_duration(Duration::from_millis(30))],
+        // A run of passive PLC audio well above target: the producer time-scales
+        // it (accelerate to drain, or expand to bridge) rather than leaving it
+        // to drift, the ring-path equivalent of the old mixer behavior.
+        producer.queue_samples(
+            &vec![0.001; target * 2],
             DecodedFrameSource::Plc,
+            None,
             now,
+            &mut stats,
         );
-        for _ in 0..FRAME_SAMPLES {
-            let _ = mixer.pop_mixed_sample(now);
+        // SAFETY: the only `RingReader` built for this producer's ring.
+        let mut reader = unsafe { crate::audio::playback::RingReader::new(producer.ring()) };
+        for _ in 0..8 {
+            producer.pump(FRAME_SAMPLES, now, &mut stats);
+            let depth = producer.buffered_samples().min(FRAME_SAMPLES);
+            reader.advance(depth);
         }
-        let stats = mixer.snapshot_at(now);
 
         assert_eq!(stats.plc_fallbacks, 1);
         assert!(
