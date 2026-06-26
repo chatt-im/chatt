@@ -1174,30 +1174,21 @@ impl App {
             }
         }
 
-        match key.code {
-            KeyCode::Char('/') => {
-                self.server_select_searching = true;
-                self.server_select.clear_query();
-                self.server_select.refresh(&self.server_items);
+        let Some(input) = InputKey::from_event(&key) else {
+            return Action::Continue;
+        };
+        match bindings::resolve(
+            &self.config.bindings.router,
+            bindings::PICKER_LAYER,
+            &mut self.pending_chord,
+            input,
+        ) {
+            Resolved::Action(id) => {
+                let command = self.config.bindings.actions.get(id).clone();
+                self.process_command(command)
             }
-            KeyCode::Char('j') | KeyCode::Down => {
-                self.server_select.move_selection(1);
-            }
-            KeyCode::Char('k') | KeyCode::Up => {
-                self.server_select.move_selection(-1);
-            }
-            KeyCode::Enter => self.join_selected_server(),
-            KeyCode::Char('e') => self.edit_selected_server(),
-            KeyCode::Char('d') => self.delete_selected_server(),
-            KeyCode::Char('q') | KeyCode::Esc => {
-                if self.network.is_some() {
-                    self.enter_compose_insert_mode();
-                }
-            }
-            KeyCode::F2 => self.open_settings(),
-            _ => {}
+            Resolved::Consumed | Resolved::Unmatched => Action::Continue,
         }
-        Action::Continue
     }
 
     pub(crate) fn process_server_edit_key(&mut self, key: KeyEvent) -> Action {
@@ -1537,7 +1528,11 @@ impl App {
             CloseSettings => self.close_settings(),
             SubmitMessage => self.submit_input(),
             Cancel => {
-                if self.mode == theme::UiMode::Settings {
+                if self.mode == theme::UiMode::ServerSelect {
+                    if self.network.is_some() {
+                        self.enter_compose_insert_mode();
+                    }
+                } else if self.mode == theme::UiMode::Settings {
                     if !self.cancel_open_audio_picker() {
                         self.close_settings();
                     }
@@ -1599,7 +1594,13 @@ impl App {
             ToggleDeafen => self.set_deafen(!self.deafened.load(Ordering::Relaxed)),
             RefreshDevices => self.refresh_audio_devices(),
             SaveSettings => self.save_settings(),
-            Activate => self.activate_settings_focus(),
+            Activate => {
+                if self.mode == theme::UiMode::ServerSelect {
+                    self.join_selected_server();
+                } else {
+                    self.activate_settings_focus();
+                }
+            }
             FocusNext => {
                 if self.mode == theme::UiMode::Settings {
                     self.move_settings_focus(1);
@@ -1615,14 +1616,18 @@ impl App {
                 }
             }
             SelectNext => {
-                if self.mode == theme::UiMode::Settings {
+                if self.mode == theme::UiMode::ServerSelect {
+                    self.server_select.move_selection(1);
+                } else if self.mode == theme::UiMode::Settings {
                     self.move_settings_selection(1);
                 } else if self.chat_focus == ChatPanelFocus::Lobby {
                     self.move_room_selection_with_focus(1);
                 }
             }
             SelectPrev => {
-                if self.mode == theme::UiMode::Settings {
+                if self.mode == theme::UiMode::ServerSelect {
+                    self.server_select.move_selection(-1);
+                } else if self.mode == theme::UiMode::Settings {
                     self.move_settings_selection(-1);
                 } else if self.chat_focus == ChatPanelFocus::Lobby {
                     self.move_room_selection_with_focus(-1);
@@ -1645,6 +1650,13 @@ impl App {
             PlaySoundboard8 => self.trigger_soundboard_slot(7),
             PlaySoundboard9 => self.trigger_soundboard_slot(8),
             ToggleKeyPreview => self.key_preview_expanded = !self.key_preview_expanded,
+            EditServer => self.edit_selected_server(),
+            DeleteServer => self.delete_selected_server(),
+            SearchServers => {
+                self.server_select_searching = true;
+                self.server_select.clear_query();
+                self.server_select.refresh(&self.server_items);
+            }
         }
         Action::Continue
     }
@@ -3383,7 +3395,8 @@ impl App {
         }
 
         match self.mode {
-            theme::UiMode::ServerSelect | theme::UiMode::ServerEdit => None,
+            theme::UiMode::ServerSelect => Some(bindings::PICKER_LAYER),
+            theme::UiMode::ServerEdit => Some(bindings::FORM_LAYER),
             theme::UiMode::Settings => Some(bindings::SETTINGS_LAYER),
             theme::UiMode::Compose if self.chat_focus == ChatPanelFocus::Compose => {
                 if self.composer.mode() == EditorMode::Insert {
