@@ -104,7 +104,7 @@ impl ChatPanelFocus {
 pub(crate) struct App {
     pub(crate) config: Config,
     pub(crate) theme: Theme,
-    pub(crate) event_tx: Sender<NetworkEvent>,
+    pub(crate) event_tx: EventSender,
     pub(crate) server_alias: String,
     pub(crate) user: String,
     pub(crate) room_name: String,
@@ -134,11 +134,7 @@ pub(crate) struct App {
     pub(crate) pending_chord: Option<PendingChord>,
     pub(crate) key_preview_expanded: bool,
     pub(crate) key_preview_cache: crate::tui::render::KeyPreviewCache,
-    pub(crate) event_rx: Receiver<NetworkEvent>,
-    pub(crate) voice_command_tx: Sender<local_control::VoiceCommand>,
-    pub(crate) voice_command_rx: Receiver<local_control::VoiceCommand>,
-    pub(crate) audio_device_refresh_tx: mpsc::Sender<AudioDeviceRefresh>,
-    pub(crate) audio_device_refresh_rx: Receiver<AudioDeviceRefresh>,
+    pub(crate) event_rx: Receiver<AppEvent>,
     pub(crate) audio_device_refresh_in_flight: bool,
     pub(crate) next_audio_device_refresh_id: u64,
     pub(crate) network: Option<NetworkClient>,
@@ -168,8 +164,6 @@ pub(crate) struct App {
     pub(crate) settings_preview_capture: bool,
     pub(crate) allow_settings_preview_capture: bool,
     pub(crate) playback: Option<LivePlayback>,
-    pub(crate) soundboard_event_tx: mpsc::Sender<SoundboardEvent>,
-    pub(crate) soundboard_event_rx: Receiver<SoundboardEvent>,
     pub(crate) soundboard_busy: Arc<AtomicBool>,
     pub(crate) soundboard_next_sequence: u32,
     pub(crate) echo_control: Arc<EchoCancellationControl>,
@@ -331,15 +325,61 @@ pub(crate) struct SoundboardEvent {
     pub(crate) result: Result<LiveAudioFileSourceReport, String>,
 }
 
+/// An event delivered from a worker thread to the UI thread over the single
+/// application event channel.
+pub(crate) enum AppEvent {
+    Network(NetworkEvent),
+    AudioDeviceRefresh(AudioDeviceRefresh),
+    Soundboard(SoundboardEvent),
+    Voice(local_control::VoiceCommand),
+}
+
+impl From<NetworkEvent> for AppEvent {
+    fn from(event: NetworkEvent) -> Self {
+        AppEvent::Network(event)
+    }
+}
+
+impl From<AudioDeviceRefresh> for AppEvent {
+    fn from(refresh: AudioDeviceRefresh) -> Self {
+        AppEvent::AudioDeviceRefresh(refresh)
+    }
+}
+
+impl From<SoundboardEvent> for AppEvent {
+    fn from(event: SoundboardEvent) -> Self {
+        AppEvent::Soundboard(event)
+    }
+}
+
+impl From<local_control::VoiceCommand> for AppEvent {
+    fn from(command: local_control::VoiceCommand) -> Self {
+        AppEvent::Voice(command)
+    }
+}
+
+/// Sends events into the single application event channel. Worker threads keep
+/// constructing their own event types and rely on the `Into<AppEvent>` bound to
+/// wrap them.
+#[derive(Clone)]
+pub(crate) struct EventSender(pub(crate) Sender<AppEvent>);
+
+impl EventSender {
+    pub(crate) fn send<E: Into<AppEvent>>(
+        &self,
+        event: E,
+    ) -> Result<(), mpsc::SendError<AppEvent>> {
+        self.0.send(event.into())
+    }
+}
+
 impl App {
     pub(crate) fn new(
         config: Config,
         pending_invite: Option<InviteTicket>,
     ) -> Result<Self, String> {
         let (event_tx, event_rx) = mpsc::channel();
-        let (voice_command_tx, voice_command_rx) = mpsc::channel();
-        let (audio_device_refresh_tx, audio_device_refresh_rx) = mpsc::channel();
-        let (soundboard_event_tx, soundboard_event_rx) = mpsc::channel();
+        let event_tx = EventSender(event_tx);
         let soundboard_enabled = config.soundboard.enabled;
         let theme = Theme::from_choice(config.ui.theme);
         let mut composer =
@@ -397,10 +437,6 @@ impl App {
             key_preview_expanded: false,
             key_preview_cache: crate::tui::render::KeyPreviewCache::default(),
             event_rx,
-            voice_command_tx,
-            voice_command_rx,
-            audio_device_refresh_tx,
-            audio_device_refresh_rx,
             audio_device_refresh_in_flight: false,
             next_audio_device_refresh_id: 0,
             network: None,
@@ -430,8 +466,6 @@ impl App {
             settings_preview_capture: false,
             allow_settings_preview_capture: !soundboard_enabled,
             playback: None,
-            soundboard_event_tx,
-            soundboard_event_rx,
             soundboard_busy: Arc::new(AtomicBool::new(false)),
             soundboard_next_sequence: 0,
             echo_control,
@@ -456,37 +490,25 @@ impl App {
         Ok(app)
     }
 
-    pub(crate) fn drain_network_events(&mut self) {
+    pub(crate) fn drain_events(&mut self) {
         loop {
             match self.event_rx.try_recv() {
-                Ok(event) => self.handle_network_event(event),
+                Ok(event) => self.handle_app_event(event),
                 Err(mpsc::TryRecvError::Empty) => break,
                 Err(mpsc::TryRecvError::Disconnected) => {
-                    self.schedule_network_recovery(
-                        Instant::now(),
-                        "network event channel disconnected",
-                    );
+                    self.schedule_network_recovery(Instant::now(), "event channel disconnected");
                     break;
                 }
             }
         }
     }
 
-    pub(crate) fn drain_audio_device_refreshes(&mut self) {
-        while let Ok(refresh) = self.audio_device_refresh_rx.try_recv() {
-            self.handle_audio_device_refresh(refresh);
-        }
-    }
-
-    pub(crate) fn drain_soundboard_events(&mut self) {
-        while let Ok(event) = self.soundboard_event_rx.try_recv() {
-            self.handle_soundboard_event(event);
-        }
-    }
-
-    pub(crate) fn drain_voice_commands(&mut self) {
-        while let Ok(command) = self.voice_command_rx.try_recv() {
-            self.apply_voice_command(command);
+    fn handle_app_event(&mut self, event: AppEvent) {
+        match event {
+            AppEvent::Network(event) => self.handle_network_event(event),
+            AppEvent::AudioDeviceRefresh(refresh) => self.handle_audio_device_refresh(refresh),
+            AppEvent::Soundboard(event) => self.handle_soundboard_event(event),
+            AppEvent::Voice(command) => self.apply_voice_command(command),
         }
     }
 
@@ -574,24 +596,22 @@ impl App {
                 return;
             }
         };
-        self.control_socket = match local_control::ControlSocket::spawn(
-            network.sender(),
-            self.voice_command_tx.clone(),
-        ) {
-            Ok(socket) => {
-                kvlog::info!(
-                    "chatt local control socket ready",
-                    path = %socket.path().display()
-                );
-                self.supervisor.control_socket.reset();
-                Some(socket)
-            }
-            Err(error) => {
-                self.push_network_notice("control", &error);
-                self.schedule_control_socket_recovery(Instant::now(), error.clone());
-                None
-            }
-        };
+        self.control_socket =
+            match local_control::ControlSocket::spawn(network.sender(), self.event_tx.clone()) {
+                Ok(socket) => {
+                    kvlog::info!(
+                        "chatt local control socket ready",
+                        path = %socket.path().display()
+                    );
+                    self.supervisor.control_socket.reset();
+                    Some(socket)
+                }
+                Err(error) => {
+                    self.push_network_notice("control", &error);
+                    self.schedule_control_socket_recovery(Instant::now(), error.clone());
+                    None
+                }
+            };
         self.server_alias = server.alias.clone();
         self.user = server.effective_display_name();
         self.room_name = "lobby".to_string();
@@ -2171,7 +2191,7 @@ impl App {
             self.supervisor.control_socket.reset();
             return;
         };
-        match local_control::ControlSocket::spawn(network.sender(), self.voice_command_tx.clone()) {
+        match local_control::ControlSocket::spawn(network.sender(), self.event_tx.clone()) {
             Ok(socket) => {
                 kvlog::info!(
                     "chatt local control socket recovered",
@@ -2656,7 +2676,7 @@ impl App {
         self.audio_device_refresh_in_flight = true;
         let input_buffer_request = self.settings.input_buffer_request();
         let output_buffer_request = self.settings.output_buffer_request();
-        let tx = self.audio_device_refresh_tx.clone();
+        let tx = self.event_tx.clone();
         kvlog::info!(
             "audio device refresh started",
             id,
@@ -2947,8 +2967,7 @@ impl App {
             return;
         };
         let network_tx = network.sender();
-        let event_tx = self.soundboard_event_tx.clone();
-        let network_event_tx = self.event_tx.clone();
+        let events = self.event_tx.clone();
         let send_failed = Arc::new(AtomicBool::new(false));
         let busy = Arc::clone(&self.soundboard_busy);
         let source_config = LiveAudioFileSourceConfig {
@@ -2979,14 +2998,14 @@ impl App {
                         .is_err()
                         && !send_failed.swap(true, Ordering::AcqRel)
                     {
-                        let _ = network_event_tx.send(NetworkEvent::WorkerStopped {
+                        let _ = events.send(NetworkEvent::WorkerStopped {
                             reason: "network command channel closed while sending soundboard audio"
                                 .to_string(),
                         });
                     }
                 });
                 busy.store(false, Ordering::Release);
-                let _ = event_tx.send(SoundboardEvent { clip_name, result });
+                let _ = events.send(SoundboardEvent { clip_name, result });
             })
             .expect("failed to spawn soundboard worker");
     }

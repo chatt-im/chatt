@@ -45,6 +45,7 @@ use rpc::{
     media::{self, MediaPayload, VoicePayload as MediaVoicePayload},
 };
 
+use crate::app::EventSender;
 use crate::audio::{
     LiveEncoderProfile, LivePlaybackFeedback, LivePlaybackSink, LocalVoiceFrame, RemoteVoicePacket,
     VoicePayload as AudioVoicePayload,
@@ -218,7 +219,7 @@ pub struct NetworkClient {
 }
 
 impl NetworkClient {
-    pub fn spawn(config: ClientConfig, events: Sender<NetworkEvent>) -> Result<Self, String> {
+    pub fn spawn(config: ClientConfig, events: EventSender) -> Result<Self, String> {
         kvlog::info!(
             "network client spawning",
             user = config.user.as_str(),
@@ -308,7 +309,7 @@ impl Drop for NetworkClient {
 pub fn spawn_pair_once(
     config: ClientConfig,
     pairing_code: String,
-    events: Sender<NetworkEvent>,
+    events: EventSender,
 ) -> JoinHandle<()> {
     thread::Builder::new()
         .name("chatt-pair".to_string())
@@ -326,7 +327,7 @@ pub fn spawn_pair_once(
 
 fn run_worker(
     config: ClientConfig,
-    events: Sender<NetworkEvent>,
+    events: EventSender,
     commands: Receiver<NetworkCommand>,
     mut poll: Poll,
 ) {
@@ -369,7 +370,7 @@ fn run_worker(
 
 fn run_worker_inner(
     config: &ClientConfig,
-    events: &Sender<NetworkEvent>,
+    events: &EventSender,
     commands: &Receiver<NetworkCommand>,
     poll: &mut Poll,
 ) -> SessionEnd {
@@ -656,7 +657,7 @@ impl RetryWait {
 }
 
 fn schedule_reconnect(
-    events: &Sender<NetworkEvent>,
+    events: &EventSender,
     commands: &Receiver<NetworkCommand>,
     reconnect: &mut ReconnectSchedule,
     reason: &str,
@@ -868,7 +869,7 @@ struct P2pVoiceRoute {
 
 struct WorkerState {
     config: ClientConfig,
-    events: Sender<NetworkEvent>,
+    events: EventSender,
     tcp: TcpStream,
     udp: UdpSocket,
     udp_local_addr: SocketAddr,
@@ -3246,7 +3247,7 @@ fn audio_payload_from_media(payload: MediaVoicePayload) -> AudioVoicePayload {
 }
 
 fn dispatch_voice_packet_to(
-    events: &Sender<NetworkEvent>,
+    events: &EventSender,
     playback_sink: Option<&LivePlaybackSink>,
     pending_playback_packets: &mut VecDeque<RemoteVoicePacket>,
     packet: RemoteVoicePacket,
@@ -3666,9 +3667,10 @@ mod tests {
     #[test]
     fn voice_dispatch_buffers_audio_until_sink_attaches() {
         let (tx, rx) = mpsc::channel();
+        let events = EventSender(tx);
         let mut pending = VecDeque::new();
         dispatch_voice_packet_to(
-            &tx,
+            &events,
             None,
             &mut pending,
             test_remote_voice_packet(7, 3, vec![1, 2, 3, 4]),
@@ -3676,10 +3678,12 @@ mod tests {
 
         assert!(matches!(
             rx.try_recv(),
-            Ok(NetworkEvent::VoicePacketObserved {
-                stream_id: 7,
-                payload_size: 4,
-            })
+            Ok(crate::app::AppEvent::Network(
+                NetworkEvent::VoicePacketObserved {
+                    stream_id: 7,
+                    payload_size: 4,
+                }
+            ))
         ));
         assert!(rx.try_recv().is_err());
         assert_eq!(pending.len(), 1);
@@ -3692,10 +3696,11 @@ mod tests {
     #[test]
     fn voice_dispatch_uses_sink_when_attached() {
         let (tx, rx) = mpsc::channel();
+        let events = EventSender(tx);
         let mut pending = VecDeque::new();
         let sink = LivePlaybackSink::for_test();
         dispatch_voice_packet_to(
-            &tx,
+            &events,
             Some(&sink),
             &mut pending,
             test_remote_voice_packet(9, 4, vec![5, 6, 7]),
@@ -3703,10 +3708,12 @@ mod tests {
 
         assert!(matches!(
             rx.try_recv(),
-            Ok(NetworkEvent::VoicePacketObserved {
-                stream_id: 9,
-                payload_size: 3,
-            })
+            Ok(crate::app::AppEvent::Network(
+                NetworkEvent::VoicePacketObserved {
+                    stream_id: 9,
+                    payload_size: 3,
+                }
+            ))
         ));
         assert!(rx.try_recv().is_err());
         assert!(pending.is_empty());
