@@ -180,7 +180,9 @@ impl AdaptivePlaybackStream {
         now: Instant,
         stats: &mut LivePlaybackMixerStats,
     ) {
-        self.queue_samples_owned_with_delay(samples.to_vec(), source, playout_delay, now, stats);
+        let mut buffer = self.input.take_buffer(samples.len());
+        buffer.extend_from_slice(samples);
+        self.queue_samples_owned_with_delay(buffer, source, playout_delay, now, stats);
     }
 
     pub(crate) fn queue_samples_owned_with_delay(

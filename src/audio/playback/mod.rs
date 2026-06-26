@@ -12,6 +12,8 @@ mod time_scale;
 
 pub(crate) use adaptive::AdaptivePlaybackStream;
 #[cfg(test)]
+pub(crate) use decode::DrainEvent;
+#[cfg(test)]
 pub(crate) use decode::LiveDecodeStream;
 pub(crate) use decode::{LiveDecodeStreams, run_live_decoder_worker};
 pub(crate) use events::LivePlaybackMixerEvent;

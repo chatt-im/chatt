@@ -1,5 +1,4 @@
 use std::{
-    cell::RefCell,
     sync::{
         Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
@@ -33,11 +32,15 @@ use crate::{
     network::{AudioPacketRef, InsertOutcome, PlayoutItem},
 };
 
-/// One decoded-and-time-scaled action drained from a stream's jitter buffer,
-/// collected so the producer can be mutated after `drain_ready` releases its
-/// borrows.
-enum DrainAction {
-    Samples(Vec<f32>, DecodedFrameSource, Option<PlayoutDelay>),
+/// One event drained from a stream's jitter buffer, handed to the `drain_ready`
+/// callback as it is produced. `Samples` borrows the decoder's reusable output
+/// buffer, so the callback must consume it before returning.
+pub(crate) enum DrainEvent<'a> {
+    Samples {
+        samples: &'a [f32],
+        source: DecodedFrameSource,
+        playout_delay: Option<PlayoutDelay>,
+    },
     Discontinuity,
     SenderSilence,
 }
@@ -145,45 +148,36 @@ fn drain_pump_stream(
     let recommended = stream.feedback.recommended_target(tuning);
     producer.apply_recommended_target(recommended, now);
 
-    let actions = RefCell::new(Vec::new());
+    let mut sender_silence = false;
     stream.drain_ready(
         now,
         trace_start,
         stream_id,
         trace,
-        |_, samples, source, playout_delay| {
-            actions.borrow_mut().push(DrainAction::Samples(
-                samples.to_vec(),
+        |trace, event| match event {
+            DrainEvent::Samples {
+                samples,
                 source,
                 playout_delay,
-            ));
-        },
-        || actions.borrow_mut().push(DrainAction::Discontinuity),
-        || actions.borrow_mut().push(DrainAction::SenderSilence),
-    );
-
-    let mut sender_silence = false;
-    for action in actions.into_inner() {
-        match action {
-            DrainAction::Samples(samples, source, playout_delay) => {
+            } => {
                 trace_mixer_queue(
                     trace,
                     trace_start,
                     now,
                     stream_id,
                     source,
-                    &samples,
+                    samples,
                     samples_to_ms(producer.buffered_samples() + samples.len()),
                 );
-                producer.queue_samples_owned(samples, source, playout_delay, now, stats);
+                producer.queue_samples(samples, source, playout_delay, now, stats);
             }
-            DrainAction::Discontinuity => producer.skip_speech_gap_backlog(now, stats),
-            DrainAction::SenderSilence => {
+            DrainEvent::Discontinuity => producer.skip_speech_gap_backlog(now, stats),
+            DrainEvent::SenderSilence => {
                 producer.mark_sender_silent(now, stats);
                 sender_silence = true;
             }
-        }
-    }
+        },
+    );
 
     producer.pump(block, now, stats);
 
@@ -496,20 +490,13 @@ impl LiveDecodeStream {
         trace_start: Instant,
         stream_id: u32,
         trace: &mut Option<LiveAudioTraceWriter>,
-        mut on_samples: F,
-        mut on_discontinuity: impl FnMut(),
-        mut on_sender_silence: impl FnMut(),
+        mut on_event: F,
     ) where
-        F: FnMut(
-            &mut Option<LiveAudioTraceWriter>,
-            &[f32],
-            DecodedFrameSource,
-            Option<PlayoutDelay>,
-        ),
+        F: FnMut(&mut Option<LiveAudioTraceWriter>, DrainEvent<'_>),
     {
         if self.sender_silence_pending {
             self.sender_silence_pending = false;
-            on_sender_silence();
+            on_event(trace, DrainEvent::SenderSilence);
         }
 
         let items = self.jitter.drain_ready(now);
@@ -540,7 +527,7 @@ impl LiveDecodeStream {
                     if flags & LIVE_PACKET_FLAG_OPUS_RESET != 0 {
                         self.reset_decoder_state();
                         if flags & LIVE_PACKET_FLAG_SILENCE_RESUME == 0 {
-                            on_discontinuity();
+                            on_event(trace, DrainEvent::Discontinuity);
                         }
                         trace_decoder_reset(trace, trace_start, now, stream_id, *sequence);
                     }
@@ -553,7 +540,7 @@ impl LiveDecodeStream {
                         *sequence,
                         trace,
                         playout_delay,
-                        &mut on_samples,
+                        &mut on_event,
                     );
                 }
                 PlayoutItem::Missing { sequence } => {
@@ -567,7 +554,7 @@ impl LiveDecodeStream {
                         stream_id,
                         trace,
                         playout_delay,
-                        &mut on_samples,
+                        &mut on_event,
                     ) {
                         self.decode_playout(
                             &[],
@@ -578,7 +565,7 @@ impl LiveDecodeStream {
                             *sequence,
                             trace,
                             playout_delay,
-                            &mut on_samples,
+                            &mut on_event,
                         );
                     }
                 }
@@ -612,14 +599,9 @@ impl LiveDecodeStream {
         sequence: u32,
         trace: &mut Option<LiveAudioTraceWriter>,
         playout_delay: Option<PlayoutDelay>,
-        on_samples: &mut F,
+        on_event: &mut F,
     ) where
-        F: FnMut(
-            &mut Option<LiveAudioTraceWriter>,
-            &[f32],
-            DecodedFrameSource,
-            Option<PlayoutDelay>,
-        ),
+        F: FnMut(&mut Option<LiveAudioTraceWriter>, DrainEvent<'_>),
     {
         let output_len = match source {
             DecodedFrameSource::Plc => LIVE_OPUS_FRAME_SAMPLES,
@@ -647,7 +629,14 @@ impl LiveDecodeStream {
                     None,
                     samples,
                 );
-                on_samples(trace, samples, source, playout_delay);
+                on_event(
+                    trace,
+                    DrainEvent::Samples {
+                        samples,
+                        source,
+                        playout_delay,
+                    },
+                );
             }
             Err(error) => {
                 eprintln!("failed to decode live opus packet: {error}");
@@ -662,7 +651,14 @@ impl LiveDecodeStream {
                     Some(error.to_string()),
                     &[],
                 );
-                on_samples(trace, &[], DecodedFrameSource::DecodeError, playout_delay);
+                on_event(
+                    trace,
+                    DrainEvent::Samples {
+                        samples: &[],
+                        source: DecodedFrameSource::DecodeError,
+                        playout_delay,
+                    },
+                );
             }
         }
     }
@@ -686,15 +682,10 @@ impl LiveDecodeStream {
         stream_id: u32,
         trace: &mut Option<LiveAudioTraceWriter>,
         playout_delay: Option<PlayoutDelay>,
-        on_samples: &mut F,
+        on_event: &mut F,
     ) -> bool
     where
-        F: FnMut(
-            &mut Option<LiveAudioTraceWriter>,
-            &[f32],
-            DecodedFrameSource,
-            Option<PlayoutDelay>,
-        ),
+        F: FnMut(&mut Option<LiveAudioTraceWriter>, DrainEvent<'_>),
     {
         if self.dred_decoder.is_none() {
             trace_dred_skip(
@@ -843,7 +834,14 @@ impl LiveDecodeStream {
                     None,
                     samples,
                 );
-                on_samples(trace, samples, DecodedFrameSource::Dred, playout_delay);
+                on_event(
+                    trace,
+                    DrainEvent::Samples {
+                        samples,
+                        source: DecodedFrameSource::Dred,
+                        playout_delay,
+                    },
+                );
                 true
             }
             Ok(_) => {
@@ -1063,17 +1061,11 @@ mod tests {
             InsertOutcome::Accepted
         );
         let mut trace = None;
-        stream.drain_ready(
-            first_playout,
-            start,
-            1,
-            &mut trace,
-            |_, samples, _source, _| {
+        stream.drain_ready(first_playout, start, 1, &mut trace, |_, event| {
+            if let DrainEvent::Samples { samples, .. } = event {
                 decoded.extend_from_slice(samples);
-            },
-            || {},
-            || {},
-        );
+            }
+        });
         assert_eq!(decoded.len(), LIVE_OPUS_FRAME_SAMPLES);
 
         decoded.clear();
@@ -1081,17 +1073,11 @@ mod tests {
             stream.insert(test_audio_packet(2, &packet_2), gap_seen),
             InsertOutcome::Accepted
         );
-        stream.drain_ready(
-            gap_seen,
-            start,
-            1,
-            &mut trace,
-            |_, samples, _source, _| {
+        stream.drain_ready(gap_seen, start, 1, &mut trace, |_, event| {
+            if let DrainEvent::Samples { samples, .. } = event {
                 decoded.extend_from_slice(samples);
-            },
-            || {},
-            || {},
-        );
+            }
+        });
         assert!(decoded.is_empty());
 
         stream.drain_ready(
@@ -1099,11 +1085,11 @@ mod tests {
             start,
             1,
             &mut trace,
-            |_, samples, _source, _| {
-                decoded.extend_from_slice(samples);
+            |_, event| {
+                if let DrainEvent::Samples { samples, .. } = event {
+                    decoded.extend_from_slice(samples);
+                }
             },
-            || {},
-            || {},
         );
         assert_eq!(decoded.len(), LIVE_OPUS_FRAME_SAMPLES * 2);
     }
