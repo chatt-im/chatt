@@ -125,7 +125,7 @@ dependencies = [
  "jsony_bench",
  "nnnoiseless",
  "opus-codec",
- "sonora",
+ "sonora 0.1.0 (registry+https://github.com/rust-lang/crates.io-index)",
 ]
 
 [[package]]
@@ -287,8 +287,8 @@ dependencies = [
  "opus-codec",
  "ring",
  "rpc",
- "sonora",
- "sonora-common-audio",
+ "sonora 0.1.0",
+ "sonora-common-audio 0.1.0",
  "tinyhl",
  "toml-spanner",
  "unicode-width",
@@ -1796,25 +1796,59 @@ checksum = "8ed6a63f02c8539c91a8685a86f4099661ba3da017932f6ebbea6de3f0fa7c90"
 [[package]]
 name = "sonora"
 version = "0.1.0"
+dependencies = [
+ "sonora-aec3 0.1.0",
+ "sonora-agc2 0.1.0",
+ "sonora-common-audio 0.1.0",
+ "sonora-ns 0.1.0",
+ "sonora-simd 0.1.0",
+ "tracing",
+]
+
+[[package]]
+name = "sonora"
+version = "0.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "559f6011d42721f7b4599ef4cf3224ac07539ee5bc25967169701c7aeb6c6bb1"
 dependencies = [
- "sonora-aec3",
- "sonora-agc2",
- "sonora-common-audio",
- "sonora-ns",
- "sonora-simd",
+ "sonora-aec3 0.1.0 (registry+https://github.com/rust-lang/crates.io-index)",
+ "sonora-agc2 0.1.0 (registry+https://github.com/rust-lang/crates.io-index)",
+ "sonora-common-audio 0.1.0 (registry+https://github.com/rust-lang/crates.io-index)",
+ "sonora-ns 0.1.0 (registry+https://github.com/rust-lang/crates.io-index)",
+ "sonora-simd 0.1.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "tracing",
 ]
 
 [[package]]
 name = "sonora-aec3"
 version = "0.1.0"
-source = "git+https://github.com/dignifiedquire/sonora?rev=dec6a074725e82ef371a024fc45236d60f0acf52#dec6a074725e82ef371a024fc45236d60f0acf52"
 dependencies = [
- "sonora-common-audio",
- "sonora-fft",
- "sonora-simd",
+ "sonora-common-audio 0.1.0",
+ "sonora-fft 0.1.0",
+ "sonora-simd 0.1.0",
+]
+
+[[package]]
+name = "sonora-aec3"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "65d8b7e53b058aa4631cf2a8f483bd7a0dec093aa413d21b44b86d5704deedeb"
+dependencies = [
+ "sonora-common-audio 0.1.0 (registry+https://github.com/rust-lang/crates.io-index)",
+ "sonora-fft 0.1.0 (registry+https://github.com/rust-lang/crates.io-index)",
+ "sonora-simd 0.1.0 (registry+https://github.com/rust-lang/crates.io-index)",
+]
+
+[[package]]
+name = "sonora-agc2"
+version = "0.1.0"
+dependencies = [
+ "bytemuck",
+ "derive_more",
+ "sonora-common-audio 0.1.0",
+ "sonora-fft 0.1.0",
+ "sonora-simd 0.1.0",
+ "tracing",
 ]
 
 [[package]]
@@ -1825,25 +1859,46 @@ checksum = "132876fc38c4e191dee939a38243df5eb5830cd29f1d1ac9a67377389d74a10e"
 dependencies = [
  "bytemuck",
  "derive_more",
- "sonora-common-audio",
- "sonora-fft",
- "sonora-simd",
+ "sonora-common-audio 0.1.0 (registry+https://github.com/rust-lang/crates.io-index)",
+ "sonora-fft 0.1.0 (registry+https://github.com/rust-lang/crates.io-index)",
+ "sonora-simd 0.1.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "tracing",
 ]
 
 [[package]]
 name = "sonora-common-audio"
 version = "0.1.0"
-source = "git+https://github.com/dignifiedquire/sonora?rev=dec6a074725e82ef371a024fc45236d60f0acf52#dec6a074725e82ef371a024fc45236d60f0acf52"
 dependencies = [
  "derive_more",
- "sonora-simd",
+ "sonora-simd 0.1.0",
+]
+
+[[package]]
+name = "sonora-common-audio"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "30a16fa975fe4aa12e4d980d5453452bd3e6df2b33abfb89840e1757ebd212e6"
+dependencies = [
+ "derive_more",
+ "sonora-simd 0.1.0 (registry+https://github.com/rust-lang/crates.io-index)",
 ]
 
 [[package]]
 name = "sonora-fft"
 version = "0.1.0"
-source = "git+https://github.com/dignifiedquire/sonora?rev=dec6a074725e82ef371a024fc45236d60f0acf52#dec6a074725e82ef371a024fc45236d60f0acf52"
+
+[[package]]
+name = "sonora-fft"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cca158c4b6ace2cb3f4fa8084842da2b4ffcc25cf8ac4366675aea541aabc6af"
+
+[[package]]
+name = "sonora-ns"
+version = "0.1.0"
+dependencies = [
+ "sonora-fft 0.1.0",
+]
 
 [[package]]
 name = "sonora-ns"
@@ -1851,13 +1906,21 @@ version = "0.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cc549f9bca1d60e7a2483e4949e9649467c5cca371a4341e44aaf24dae338fd4"
 dependencies = [
- "sonora-fft",
+ "sonora-fft 0.1.0 (registry+https://github.com/rust-lang/crates.io-index)",
 ]
 
 [[package]]
 name = "sonora-simd"
 version = "0.1.0"
-source = "git+https://github.com/dignifiedquire/sonora?rev=dec6a074725e82ef371a024fc45236d60f0acf52#dec6a074725e82ef371a024fc45236d60f0acf52"
+dependencies = [
+ "cpufeatures 0.3.0",
+]
+
+[[package]]
+name = "sonora-simd"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a053f93cc01f4e1cc51c61844a196b6d1da7e054cdd406d2cd27677ba4d898e0"
 dependencies = [
  "cpufeatures 0.3.0",
 ]
