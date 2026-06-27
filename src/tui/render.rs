@@ -19,7 +19,7 @@ use crate::{
     bindings::{self, Reachable, ReachableKind},
     chat_buffer::{self, LineKind},
     theme::{self, Theme},
-    tui::modes::SettingsMode,
+    tui::modes::{RoomLayout, SettingsMode},
     ui,
     ui::select::FuzzySelect,
 };
@@ -31,13 +31,8 @@ fn prepare_screen(app: &mut App, buf: &mut Buffer) -> Option<StatsSnapshot> {
         .capture
         .as_ref()
         .map(|capture| capture.stats().snapshot());
-    app.top_bar_mute_rect = Rect::EMPTY;
-    app.top_bar_deafen_rect = Rect::EMPTY;
-    app.last_room_rect = Rect::EMPTY;
-    app.last_lobby_bar_rect = Rect::EMPTY;
-    app.last_chat_log_bar_rect = Rect::EMPTY;
-    app.last_composer_rect = Rect::EMPTY;
-    app.last_compose_bar_rect = Rect::EMPTY;
+    app.chrome.top_bar.mute = Rect::EMPTY;
+    app.chrome.top_bar.deafen = Rect::EMPTY;
     capture
 }
 
@@ -99,23 +94,22 @@ pub(crate) fn draw_settings_screen(
     let key_preview_area = screen.take_bottom(key_preview_height as i32);
     let status_area = screen.take_bottom(1);
     let composer_area = screen.take_bottom(composer_height as i32);
-    app.last_composer_rect = composer_area;
-    app.last_compose_bar_rect = status_area;
 
-    draw_composer(composer_area, app, buf);
+    draw_composer(composer_area, app, ChatPanelFocus::Compose, buf);
     buf.hide_cursor();
+    let session = settings_mode.session_mut();
     ui::settings::draw_settings(
         screen,
         buf,
         &app.theme,
-        &mut app.settings,
-        settings_mode.form_mut(),
-        app.settings_dirty,
+        &mut session.draft,
+        &mut session.form,
+        session.dirty,
         capture.as_ref(),
-        &app.audio_input_items,
-        &mut app.audio_input_picker,
-        &app.audio_output_items,
-        &mut app.audio_output_picker,
+        &session.input_items,
+        &mut session.input_picker,
+        &session.output_items,
+        &mut session.output_picker,
     );
     draw_status(status_area, app, buf, mode, status_label, capture.as_ref());
     draw_key_preview(key_preview_area, app, buf);
@@ -123,6 +117,8 @@ pub(crate) fn draw_settings_screen(
 
 pub(crate) fn draw_room_screen(
     app: &mut App,
+    focus: ChatPanelFocus,
+    layout: &mut RoomLayout,
     mode: theme::UiMode,
     status_label: &'static str,
     layer: LayerId,
@@ -130,6 +126,7 @@ pub(crate) fn draw_room_screen(
     now_ms: u64,
 ) {
     let capture = prepare_screen(app, buf);
+    layout.clear_workspace();
     let mut screen = buf.rect();
     let top_bar_area = screen.take_top(1);
     draw_top_bar(top_bar_area, app, buf, capture.as_ref());
@@ -140,35 +137,48 @@ pub(crate) fn draw_room_screen(
     let key_preview_area = screen.take_bottom(key_preview_height as i32);
     let status_area = screen.take_bottom(1);
     let composer_area = screen.take_bottom(composer_height as i32);
-    app.last_composer_rect = composer_area;
-    app.last_compose_bar_rect = status_area;
+    layout.composer_rect = composer_area;
+    layout.compose_bar_rect = status_area;
     let chat_log_bar_area = screen.take_bottom(1);
-    app.last_chat_log_bar_rect = chat_log_bar_area;
-    draw_workspace(screen, app, buf, now_ms);
-    draw_chat_log_bar(chat_log_bar_area, app, buf);
+    layout.chat_log_bar_rect = chat_log_bar_area;
+    draw_workspace(screen, app, focus, layout, buf, now_ms);
+    draw_chat_log_bar(chat_log_bar_area, app, focus, buf);
 
-    draw_compose_bar(status_area, app, buf, mode, status_label);
-    draw_composer(composer_area, app, buf);
+    draw_compose_bar(status_area, app, focus, buf, mode, status_label);
+    draw_composer(composer_area, app, focus, buf);
     draw_key_preview(key_preview_area, app, buf);
 }
 
 fn composer_height(app: &mut App, width: u16) -> u16 {
-    app.composer.resize(width.max(1));
-    app.composer
+    app.room.composer.resize(width.max(1));
+    app.room
+        .composer
         .desired_height()
         .min(app.config.ui.max_composer_height.max(1))
         .max(1)
 }
 
-fn draw_room(area: Rect, app: &App, buf: &mut Buffer) {
+fn draw_room(area: Rect, app: &App, focus: ChatPanelFocus, buf: &mut Buffer) {
     area.with(app.theme.panel_alt).fill(buf);
     let mut rows = area;
     let visible = rows.h as usize;
-    let start = app.participants.scroll.min(app.participants.entries.len());
-    let lobby_focused = app.chat_focus == ChatPanelFocus::Lobby;
-    for participant in app.participants.entries.iter().skip(start).take(visible) {
+    let start = app
+        .room
+        .participants
+        .scroll
+        .min(app.room.participants.entries.len());
+    let lobby_focused = focus == ChatPanelFocus::Lobby;
+    for participant in app
+        .room
+        .participants
+        .entries
+        .iter()
+        .skip(start)
+        .take(visible)
+    {
         let row = rows.take_top(1);
-        let selected = lobby_focused && Some(participant.user_id) == app.participants.selected_user;
+        let selected =
+            lobby_focused && Some(participant.user_id) == app.room.participants.selected_user;
         let state =
             if Some(participant.user_id) == app.user_id && app.deafened.load(Ordering::Relaxed) {
                 "deaf"
@@ -220,25 +230,32 @@ fn draw_room(area: Rect, app: &App, buf: &mut Buffer) {
     }
 }
 
-fn draw_workspace(area: Rect, app: &mut App, buf: &mut Buffer, now_ms: u64) {
+fn draw_workspace(
+    area: Rect,
+    app: &mut App,
+    focus: ChatPanelFocus,
+    layout: &mut RoomLayout,
+    buf: &mut Buffer,
+    now_ms: u64,
+) {
     let mut rows = area;
     let room_height = app.config.ui.room_height.min(rows.h.saturating_sub(1));
     if room_height > 0 {
         let room_area = rows.take_top(room_height as i32);
-        app.last_room_rect = room_area;
-        draw_room(room_area, app, buf);
+        layout.room_rect = room_area;
+        draw_room(room_area, app, focus, buf);
     }
 
     if rows.h > 0 {
         let lobby_bar = rows.take_top(1);
-        app.last_lobby_bar_rect = lobby_bar;
-        draw_lobby_bar(lobby_bar, app, buf);
+        layout.lobby_bar_rect = lobby_bar;
+        draw_lobby_bar(lobby_bar, app, focus, buf);
     }
 
     if rows.h > 0 {
-        draw_chat(rows, app, buf, now_ms);
+        draw_chat(rows, app, focus, layout, buf, now_ms);
     } else {
-        clear_chat_layout(app);
+        layout.clear_chat();
     }
 }
 
@@ -260,7 +277,7 @@ fn draw_server_select(
     if body.h == 0 {
         return;
     }
-    if app.server_items.is_empty() {
+    if app.server_items().is_empty() {
         draw_server_welcome(body, buf, &app.theme);
         return;
     }
@@ -274,7 +291,7 @@ fn draw_server_select(
     }
 
     let theme = &app.theme;
-    let items = &app.server_items;
+    let items = app.server_items();
     select.render(body, 3, buf, |_, item_index, selected, area, buf| {
         if let Some(item) = items.get(item_index) {
             draw_server_select_item(area, buf, item, selected, theme);
@@ -576,8 +593,10 @@ fn room_user_control_label(app: &App, participant: &ParticipantState) -> String 
     if Some(participant.user_id) == app.user_id {
         return String::new();
     }
-    let muted = app.muted_users.contains(&participant.user_id);
-    let volume_db = app.effective_user_volume_db(participant.user_id);
+    let muted = app.room.muted_user(participant.user_id);
+    let volume_db = app
+        .room
+        .effective_user_volume_db(&app.config, participant.user_id);
     match (muted, volume_db == 0.0) {
         (false, true) => String::new(),
         (false, false) => volume_db_label(volume_db),
@@ -593,10 +612,10 @@ fn draw_top_bar(area: Rect, app: &mut App, buf: &mut Buffer, capture: Option<&St
     let theme = app.theme;
     area.with(theme.status_fill).fill(buf);
 
-    let server = if app.server_alias.trim().is_empty() {
+    let server = if app.room.server_alias.trim().is_empty() {
         "Server"
     } else {
-        app.server_alias.as_str()
+        app.room.server_alias.as_str()
     };
     let mut left = area;
     draw_status_segment(
@@ -605,19 +624,19 @@ fn draw_top_bar(area: Rect, app: &mut App, buf: &mut Buffer, capture: Option<&St
         theme.status_section | Modifier::BOLD,
         &format!(" {server} - {} ", connection_state_label(app)),
     );
-    if !app.user.trim().is_empty() {
+    if !app.room.local_user_name.trim().is_empty() {
         draw_status_segment(
             &mut left,
             buf,
             theme.status_fill.patch(theme.muted),
-            &format!(" {} ", app.user),
+            &format!(" {} ", app.room.local_user_name),
         );
     }
 
     let mut right = area;
     let deafened = app.deafened.load(Ordering::Relaxed);
     let muted = deafened || app.mic_muted.load(Ordering::Relaxed);
-    app.top_bar_deafen_rect = draw_status_segment_right(
+    app.chrome.top_bar.deafen = draw_status_segment_right(
         &mut right,
         buf,
         if deafened {
@@ -627,7 +646,7 @@ fn draw_top_bar(area: Rect, app: &mut App, buf: &mut Buffer, capture: Option<&St
         },
         if deafened { " DEAF " } else { " HEAR " },
     );
-    app.top_bar_mute_rect = draw_status_segment_right(
+    app.chrome.top_bar.mute = draw_status_segment_right(
         &mut right,
         buf,
         if muted {
@@ -657,14 +676,15 @@ fn draw_top_bar(area: Rect, app: &mut App, buf: &mut Buffer, capture: Option<&St
     );
 }
 
-fn draw_lobby_bar(area: Rect, app: &App, buf: &mut Buffer) {
+fn draw_lobby_bar(area: Rect, app: &App, focus: ChatPanelFocus, buf: &mut Buffer) {
     if area.is_empty() {
         return;
     }
-    let focused = app.chat_focus == ChatPanelFocus::Lobby;
+    let focused = focus == ChatPanelFocus::Lobby;
     let (fill, label, detail) = section_bar_styles(app.theme, ChatPanelFocus::Lobby, focused);
     area.with(fill).fill(buf);
     let voice_count = app
+        .room
         .participants
         .entries
         .iter()
@@ -678,19 +698,19 @@ fn draw_lobby_bar(area: Rect, app: &App, buf: &mut Buffer) {
         detail,
         &format!(
             " room {}  online {}/{}  voice {} ",
-            app.room_name,
-            app.participants.online_count(),
-            app.participants.entries.len(),
+            app.room.room_name,
+            app.room.participants.online_count(),
+            app.room.participants.entries.len(),
             voice_count
         ),
     );
 }
 
-fn draw_chat_log_bar(area: Rect, app: &App, buf: &mut Buffer) {
+fn draw_chat_log_bar(area: Rect, app: &App, focus: ChatPanelFocus, buf: &mut Buffer) {
     if area.is_empty() {
         return;
     }
-    let focused = app.chat_focus == ChatPanelFocus::ChatLog;
+    let focused = focus == ChatPanelFocus::ChatLog;
     let (fill, label, detail) = section_bar_styles(app.theme, ChatPanelFocus::ChatLog, focused);
     area.with(fill).fill(buf);
     let mut row = area;
@@ -701,8 +721,8 @@ fn draw_chat_log_bar(area: Rect, app: &App, buf: &mut Buffer) {
         detail,
         &format!(
             " {} msg/{} rows ",
-            app.chat.len(),
-            app.chat.total_lines_estimate()
+            app.room.chat.len(),
+            app.room.chat.total_lines_estimate()
         ),
     );
 }
@@ -710,6 +730,7 @@ fn draw_chat_log_bar(area: Rect, app: &App, buf: &mut Buffer) {
 fn draw_compose_bar(
     area: Rect,
     app: &App,
+    focus: ChatPanelFocus,
     buf: &mut Buffer,
     mode: theme::UiMode,
     status_label: &'static str,
@@ -717,7 +738,7 @@ fn draw_compose_bar(
     if area.is_empty() {
         return;
     }
-    let focused = app.chat_focus == ChatPanelFocus::Compose;
+    let focused = focus == ChatPanelFocus::Compose;
     let (fill, mut label, detail) = section_bar_styles(app.theme, ChatPanelFocus::Compose, focused);
     if focused {
         label = app.theme.mode_style(mode) | Modifier::BOLD;
@@ -735,7 +756,7 @@ fn draw_compose_bar(
 }
 
 fn composer_mode_label(app: &App) -> &'static str {
-    match app.composer.mode() {
+    match app.room.composer.mode() {
         EditorMode::Normal => "normal",
         EditorMode::Insert => "insert",
         EditorMode::Visual => "visual",
@@ -766,34 +787,42 @@ fn panel_mode_style(theme: Theme, panel: ChatPanelFocus) -> Style {
     }
 }
 
-fn draw_chat(area: Rect, app: &mut App, buf: &mut Buffer, now_ms: u64) {
+fn draw_chat(
+    area: Rect,
+    app: &mut App,
+    focus: ChatPanelFocus,
+    layout: &mut RoomLayout,
+    buf: &mut Buffer,
+    now_ms: u64,
+) {
     area.with(app.theme.background).fill(buf);
     if area.is_empty() {
-        clear_chat_layout(app);
+        layout.clear_chat();
         return;
     }
     // The leftmost column is a marker gutter (`▟`/`▌`), so content wraps to one
     // column less than the full chat width.
     let content_width = area.w.saturating_sub(1).max(1);
-    if content_width != app.last_chat_width {
+    if content_width != layout.chat_width {
         // Reflow invalidates the (message, line) coordinates a selection holds.
-        app.chat.clear_selection();
+        app.room.chat.clear_selection();
     }
-    app.last_chat_width = content_width;
-    app.last_chat_height = area.h;
-    app.last_chat_rect = area;
-    if app.chat.is_empty() {
-        app.last_chat_lines.clear();
+    layout.chat_width = content_width;
+    layout.chat_height = area.h;
+    layout.chat_rect = area;
+    if app.room.chat.is_empty() {
+        layout.visible_chat_lines.clear();
         area.with(app.theme.subtle)
             .with(HAlign::Center)
             .text(buf, "No messages");
         return;
     }
     let lines = app
+        .room
         .chat
         .visible_lines(content_width, area.h, app.config.ui.overscan as usize);
-    app.last_chat_lines = lines.clone();
-    let chat_focused = app.chat_focus == ChatPanelFocus::ChatLog;
+    layout.visible_chat_lines = lines.clone();
+    let chat_focused = focus == ChatPanelFocus::ChatLog;
     // Content is top-anchored: lines are drawn from the top of `area` and the
     // already-background-filled rows below them stay empty.
     let mut row_area = area;
@@ -807,12 +836,12 @@ fn draw_chat(area: Rect, app: &mut App, buf: &mut Buffer, now_ms: u64) {
                 app,
                 line.message,
                 now_ms,
-                chat_focused && app.chat.is_header_selected(line),
+                chat_focused && app.room.chat.is_header_selected(line),
                 buf,
             ),
             LineKind::Body => {
-                let msg = app.chat.message(line.message);
-                let selected = chat_focused && app.chat.is_selected(line.message, line.line);
+                let msg = app.room.chat.message(line.message);
+                let selected = chat_focused && app.room.chat.is_selected(line.message, line.line);
                 let base = if selected {
                     app.theme.selected_line
                 } else if msg.local {
@@ -828,7 +857,7 @@ fn draw_chat(area: Rect, app: &mut App, buf: &mut Buffer, now_ms: u64) {
                 marker.with(base).fill(buf);
                 marker.with(base.patch(accent)).text(buf, "▌");
                 row.with(base).fill(buf);
-                for seg in app.chat.line(line.message, line.line) {
+                for seg in app.room.chat.line(line.message, line.line) {
                     let start = seg.start as usize;
                     let end = seg.end as usize;
                     let text = &msg.body[start..end];
@@ -851,12 +880,6 @@ fn draw_chat(area: Rect, app: &mut App, buf: &mut Buffer, now_ms: u64) {
     }
 }
 
-fn clear_chat_layout(app: &mut App) {
-    app.last_chat_height = 0;
-    app.last_chat_rect = Rect::EMPTY;
-    app.last_chat_lines.clear();
-}
-
 /// Draws a block heading: the `▟` marker, then the sender name on the left and
 /// the relative age on the right, both padded one column inside `row`.
 fn draw_chat_heading(
@@ -868,7 +891,7 @@ fn draw_chat_heading(
     selected: bool,
     buf: &mut Buffer,
 ) {
-    let msg = app.chat.message(message);
+    let msg = app.room.chat.message(message);
     let normal_base = if msg.local {
         app.theme.local_line
     } else {
@@ -894,9 +917,9 @@ fn draw_chat_heading(
     marker.with(normal_base.patch(accent)).text(buf, "▟");
     row.with(header_base).fill(buf);
     let content = row.inset(1, 0);
-    let name = if app.chat.is_collapsed(message) {
+    let name = if app.room.chat.is_collapsed(message) {
         format!("{} (Collapsed)", msg.sender)
-    } else if app.chat.is_expanded(message) {
+    } else if app.room.chat.is_expanded(message) {
         format!("{} (Expanded)", msg.sender)
     } else {
         msg.sender.clone()
@@ -1005,18 +1028,18 @@ fn draw_status(
 
 fn draw_status_text_right(area: Rect, app: &App, buf: &mut Buffer, fill: Style) {
     let theme = &app.theme;
-    let right_style = match app.status_kind {
+    let right_style = match app.status.kind() {
         StatusKind::Info => fill.patch(theme.muted),
         StatusKind::Error => fill.patch(theme.error),
     };
-    let status_text = if let Some(chord) = &app.pending_chord {
+    let status_text = if let Some(chord) = &app.chrome.binding.pending_chord {
         format!(
             "{} chord {}ms",
             chord.label.as_deref().unwrap_or("pending"),
             chord.activated_at.elapsed().as_millis()
         )
     } else {
-        app.status.clone()
+        app.status.text().to_string()
     };
     area.with(HAlign::Right)
         .with(right_style)
@@ -1052,12 +1075,12 @@ const KEY_PREVIEW_ENTRY_GAP: &str = "  ";
 const KEY_PREVIEW_ENTRY_GAP_WIDTH: usize = 2;
 
 fn key_preview_height(app: &App, width: u16) -> u16 {
-    let entries = &app.key_preview_cache.entries;
+    let entries = &app.chrome.key_preview.cache.entries;
     if entries.is_empty() {
         return 0;
     }
     let rows = key_preview_rows(entries, width);
-    if app.key_preview_expanded && rows.len() > 1 {
+    if app.chrome.key_preview.expanded && rows.len() > 1 {
         rows.len().try_into().unwrap_or(u16::MAX)
     } else {
         1
@@ -1069,7 +1092,7 @@ fn draw_key_preview(area: Rect, app: &App, buf: &mut Buffer) {
         return;
     }
 
-    let entries = &app.key_preview_cache.entries;
+    let entries = &app.chrome.key_preview.cache.entries;
     if entries.is_empty() {
         area.with(Style::default()).fill(buf);
         return;
@@ -1114,7 +1137,7 @@ fn draw_key_preview(area: Rect, app: &App, buf: &mut Buffer) {
 
     if rows.len() > 1 {
         let hint = key_preview_toggle_hint(entries);
-        let label = if app.key_preview_expanded {
+        let label = if app.chrome.key_preview.expanded {
             format!("less [{hint}]")
         } else {
             format!("more [{hint}]")
@@ -1133,28 +1156,33 @@ fn draw_key_preview(area: Rect, app: &App, buf: &mut Buffer) {
     }
 }
 
-/// Rebuilds [`App::key_preview_cache`] when the active binding layer or pending
+/// Rebuilds the shared key-preview cache when the active binding layer or pending
 /// chord layer has changed since the last render, and is a cheap key comparison
 /// otherwise. The stored entries back both [`key_preview_height`] and
 /// [`draw_key_preview`], which read them without recomputing.
 fn refresh_key_preview_cache(app: &mut App, base: Option<LayerId>) {
-    let pending = app.pending_chord.as_ref().map(|chord| chord.layer);
+    let pending = app
+        .chrome
+        .binding
+        .pending_chord
+        .as_ref()
+        .map(|chord| chord.layer);
     let key = Some((base, pending));
-    if app.key_preview_cache.key == key {
+    if app.chrome.key_preview.cache.key == key {
         return;
     }
-    app.key_preview_cache.key = key;
-    let mut entries = std::mem::take(&mut app.key_preview_cache.entries);
+    app.chrome.key_preview.cache.key = key;
+    let mut entries = std::mem::take(&mut app.chrome.key_preview.cache.entries);
     entries.clear();
     if let Some(layer) = base {
         build_key_preview_entries(
             &app.config.bindings,
-            &app.pending_chord,
+            &app.chrome.binding.pending_chord,
             layer,
             &mut entries,
         );
     }
-    app.key_preview_cache.entries = entries;
+    app.chrome.key_preview.cache.entries = entries;
 }
 
 fn build_key_preview_entries(
@@ -1289,18 +1317,19 @@ fn draw_status_segment_right(row: &mut Rect, buf: &mut Buffer, style: Style, tex
     area
 }
 
-fn draw_composer(area: Rect, app: &mut App, buf: &mut Buffer) {
+fn draw_composer(area: Rect, app: &mut App, focus: ChatPanelFocus, buf: &mut Buffer) {
     if area.is_empty() {
         return;
     }
     area.with(app.theme.panel).fill(buf);
-    app.composer.resize(area.w.max(1));
-    app.composer_hl
-        .render(&mut app.composer, area, buf, &app.theme);
-    if app.chat_focus != ChatPanelFocus::Compose {
+    app.room.composer.resize(area.w.max(1));
+    app.room
+        .composer_hl
+        .render(&mut app.room.composer, area, buf, &app.theme);
+    if focus != ChatPanelFocus::Compose {
         buf.hide_cursor();
     }
-    if app.composer.text_len() == 0 {
+    if app.room.composer.text_len() == 0 {
         area.with(app.theme.muted)
             .with(Ellipsis(true))
             .text(buf, &format!(" {}", app.config.ui.placeholder));
