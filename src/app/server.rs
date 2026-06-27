@@ -17,7 +17,6 @@ const LABEL_WIDTH: u16 = 12;
 #[derive(Clone, Debug)]
 pub(crate) struct ServerSelectItem {
     pub(crate) alias: String,
-    pub(crate) user: String,
     pub(crate) display_name: String,
     pub(crate) tcp_addr: String,
     pub(crate) room_id: u32,
@@ -66,7 +65,6 @@ pub(crate) enum ServerEditEvent {
 
 pub(crate) struct ServerEditDraft {
     original_alias: String,
-    user: String,
     token: String,
     server_public_key: String,
     alias: String,
@@ -91,7 +89,6 @@ impl ServerEditDraft {
     pub(crate) fn from_server(server: &ServerEntry, bindings: FormBindings) -> Self {
         let mut draft = Self {
             original_alias: server.alias.clone(),
-            user: server.user.clone(),
             token: server.token.clone(),
             server_public_key: server.server_public_key.clone(),
             alias: server.alias.clone(),
@@ -169,7 +166,6 @@ impl ServerEditDraft {
                 .text(buf, &format!(" Edit Server {} ", self.original_alias));
         }
         self.form.spacer(1);
-        self.draw_detail_row(buf, theme, "User", self.user.clone());
         self.draw_detail_row(buf, theme, "Token", short_key(&self.token));
         self.draw_detail_row(buf, theme, "Key", short_key(&self.server_public_key));
         self.form.spacer(1);
@@ -205,7 +201,7 @@ impl ServerEditDraft {
             tcp_addr: draft.tcp_addr.trim().to_string(),
             udp_addr: draft.udp_addr.trim().to_string(),
             udp_probe_addr,
-            user: self.user.clone(),
+            legacy_user: String::new(),
             display_name: draft.display_name.trim().to_string(),
             token: self.token.clone(),
             server_public_key: self.server_public_key.clone(),
@@ -368,7 +364,6 @@ impl ServerEditDraft {
     fn clone_values(&self) -> Self {
         Self {
             original_alias: self.original_alias.clone(),
-            user: self.user.clone(),
             token: self.token.clone(),
             server_public_key: self.server_public_key.clone(),
             alias: self.alias.clone(),
@@ -448,7 +443,7 @@ pub(crate) fn server_entry_from_invite(
         tcp_addr: ticket.tcp_addr.clone(),
         udp_addr: ticket.udp_addr.clone(),
         udp_probe_addr: ticket.udp_probe_addr.clone(),
-        user: ticket.user.clone(),
+        legacy_user: String::new(),
         display_name,
         token,
         server_public_key: ticket.server_public_key.clone(),
@@ -560,5 +555,23 @@ pub(crate) fn title_case_ascii(value: &str) -> String {
         value.to_string()
     } else {
         out
+    }
+}
+
+/// The display name to pre-fill when pairing from an invite.
+///
+/// Joining no longer carries an admin-chosen identifier, so the client seeds the
+/// display name from the operating system account name in title case. It falls
+/// back to `User` when that name is unavailable. The display name is editable
+/// afterward in settings.
+pub(crate) fn default_join_display_name() -> String {
+    let raw = std::env::var("USER")
+        .or_else(|_| std::env::var("USERNAME"))
+        .unwrap_or_default();
+    let name = title_case_ascii(raw.trim());
+    if name.trim().is_empty() {
+        "User".to_string()
+    } else {
+        name
     }
 }

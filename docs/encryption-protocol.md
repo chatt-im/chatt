@@ -75,18 +75,21 @@ storing the token or invite secret in plaintext config.
    user does not need to exist in TOML yet. A new invite for the same user
    replaces the previous one. Invites expire after 24 hours.
 2. The server returns a `tcj1_...` join string containing the server addresses,
-   server public key, target user id, default room, and one-time invite secret.
-   The addresses come from `network.public-*`, not from the local bind
-   addresses, so deployments behind NAT or DNS use their externally reachable
-   connection details.
-3. The user runs `chatt join JOIN_STRING`. The join TUI asks for a local
-   server alias and display username, then generates a long client token.
+   server public key, default room, and one-time invite secret. It does not
+   carry the internal user identifier. The addresses come from
+   `network.public-*`, not from the local bind addresses, so deployments behind
+   NAT or DNS use their externally reachable connection details.
+3. The user runs `chatt join JOIN_STRING`. The client derives a local server
+   alias from the address, seeds the display name from the operating system
+   account name, and generates a long client token.
 4. The client performs the normal server-authenticated handshake. Inside the
    server-selected control channel, it sends `ClientControl::Pair` containing
-   the internal user identifier, display name, invite secret, and new token.
-5. The server verifies the in-memory invite hash, removes the invite, hashes the
-   new token, creates or updates the `[[users]]` entry with `token-hash` and
-   `display-name`, and authenticates the current session.
+   the display name, invite secret, and new token. No user identifier is sent.
+5. The server matches the invite by its secret, which selects the user the
+   invite was issued for, removes the invite, rejects the token if its hash
+   already belongs to another user, hashes the new token, creates or updates
+   the `[[users]]` entry with `token-hash` and `display-name`, and authenticates
+   the current session.
 6. After successful authentication, the client writes a named `[[servers]]`
    entry with the generated token. The invite secret is never written to client
    config. Future logins use `ClientControl::Authenticate` with the token.

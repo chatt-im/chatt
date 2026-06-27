@@ -97,7 +97,6 @@ pub struct ClientConfig {
     pub tcp_addr: String,
     pub udp_addr: String,
     pub udp_probe_addr: Option<String>,
-    pub user: String,
     pub display_name: String,
     pub token: String,
     pub server_public_key: Option<String>,
@@ -226,7 +225,7 @@ impl NetworkClient {
     pub fn spawn(config: ClientConfig, events: EventSender) -> Result<Self, String> {
         kvlog::info!(
             "network client spawning",
-            user = config.user.as_str(),
+            display_name = config.display_name.as_str(),
             tcp_addr = %config.tcp_addr,
             udp_addr = %config.udp_addr,
             room_id = config.room_id.0
@@ -337,7 +336,7 @@ fn run_worker(
 ) {
     kvlog::info!(
         "network worker starting",
-        user = config.user.as_str(),
+        display_name = config.display_name.as_str(),
         tcp_addr = %config.tcp_addr,
         udp_addr = %config.udp_addr,
         room_id = config.room_id.0
@@ -500,7 +499,6 @@ fn run_worker_inner(
     }
 
     let auth_control = ClientControl::Authenticate {
-        user: worker.config.user.clone(),
         display_name: worker.config.display_name.clone(),
         token: worker.config.token.clone(),
         receive_files: worker.config.file_receive_dir.is_some(),
@@ -512,7 +510,10 @@ fn run_worker_inner(
     if let Err(error) = worker.queue_control(auth_control) {
         return SessionEnd::Disconnected(error);
     }
-    kvlog::info!("auth control queued", user = worker.config.user.as_str());
+    kvlog::info!(
+        "auth control queued",
+        display_name = worker.config.display_name.as_str()
+    );
     let _ = worker.events.send(NetworkEvent::Connected);
 
     let mut poll_events = Events::with_capacity(128);
@@ -716,7 +717,7 @@ fn connect_and_handshake(
     kvlog::info!(
         "tcp connecting",
         tcp_addr = %config.tcp_addr,
-        user = config.user.as_str()
+        display_name = config.display_name.as_str()
     );
     let mut stream = StdTcpStream::connect(config.tcp_addr.as_str())
         .map_err(|error| format!("failed to connect to server: {error}"))?;
@@ -773,7 +774,6 @@ fn pair_once(config: &ClientConfig, pairing_code: String) -> Result<(), String> 
         &mut stream,
         &mut control,
         ClientControl::Pair {
-            user: config.user.clone(),
             display_name: config.display_name.clone(),
             pairing_code,
             token: config.token.clone(),
@@ -2110,7 +2110,8 @@ impl WorkerState {
                 kvlog::info!(
                     "client presence received",
                     user_id = participant.user_id.0,
-                    user = participant.name.as_str(),
+                    display_name = participant.display_name.as_str(),
+                    identifier = participant.identifier.as_str(),
                     online
                 );
                 let verb = if online { "joined" } else { "left" };
@@ -2121,9 +2122,10 @@ impl WorkerState {
                         self.online_others.remove(&participant.user_id);
                     }
                 }
-                let _ = self
-                    .events
-                    .send(NetworkEvent::Status(format!("{} {verb}", participant.name)));
+                let _ = self.events.send(NetworkEvent::Status(format!(
+                    "{} {verb}",
+                    participant.display_name
+                )));
                 let _ = self.events.send(NetworkEvent::Presence {
                     room_id,
                     participant,

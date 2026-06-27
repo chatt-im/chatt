@@ -40,14 +40,12 @@ pub struct ServerHello {
 #[jsony(Binary, version)]
 pub enum ClientControl {
     Authenticate {
-        user: String,
         display_name: String,
         token: String,
         receive_files: bool,
         file_receive_limit_bytes: u64,
     },
     Pair {
-        user: String,
         display_name: String,
         pairing_code: String,
         token: String,
@@ -189,7 +187,8 @@ pub struct RoomInfo {
 #[jsony(Binary, version)]
 pub struct ParticipantInfo {
     pub user_id: UserId,
-    pub name: String,
+    pub display_name: String,
+    pub identifier: String,
     pub in_call: bool,
     pub voice_status: ParticipantVoiceStatus,
 }
@@ -300,7 +299,6 @@ pub struct P2pPeerInfo {
 #[jsony(Binary, version)]
 pub struct InviteTicket {
     pub version: u16,
-    pub user: String,
     pub pairing_code: String,
     pub tcp_addr: String,
     pub udp_addr: String,
@@ -409,26 +407,22 @@ pub fn is_valid_mdns_candidate_name(name: &str) -> bool {
 fn validate_client_control(value: &ClientControl) -> Result<(), String> {
     match value {
         ClientControl::Authenticate {
-            user,
             token,
             file_receive_limit_bytes,
             ..
         } => {
-            validate_auth_field("user", user)?;
             validate_auth_field("token", token)?;
             if *file_receive_limit_bytes > DEFAULT_FILE_SIZE_LIMIT_BYTES {
                 return Err("file receive limit exceeds maximum".to_string());
             }
         }
         ClientControl::Pair {
-            user,
             display_name,
             pairing_code,
             token,
             file_receive_limit_bytes,
             ..
         } => {
-            validate_auth_field("user", user)?;
             validate_auth_field("display name", display_name)?;
             validate_auth_field("pairing code", pairing_code)?;
             validate_auth_field("token", token)?;
@@ -488,7 +482,6 @@ fn validate_invite_ticket(value: &InviteTicket) -> Result<(), String> {
     if value.version != crate::PROTOCOL_VERSION {
         return Err(format!("unsupported invite version {}", value.version));
     }
-    validate_auth_field("user", &value.user)?;
     validate_auth_field("pairing code", &value.pairing_code)?;
     if value.pairing_code.len() < MIN_PAIRING_SECRET_BYTES {
         return Err("pairing code is too short".to_string());
@@ -669,6 +662,35 @@ mod tests {
     }
 
     #[test]
+    fn authenticate_control_round_trips_without_user() {
+        let message = ClientControl::Authenticate {
+            display_name: "Alice".to_string(),
+            token: "client-generated-token-with-at-least-32-bytes".to_string(),
+            receive_files: true,
+            file_receive_limit_bytes: DEFAULT_FILE_SIZE_LIMIT_BYTES,
+        };
+        let encoded = encode_client_control(&message).unwrap();
+        assert_eq!(decode_client_control(&encoded).unwrap(), message);
+    }
+
+    #[test]
+    fn participant_info_round_trips_identifier() {
+        let message = ServerControl::Presence {
+            room_id: RoomId(1),
+            participant: ParticipantInfo {
+                user_id: UserId(5),
+                display_name: "Alice".to_string(),
+                identifier: "alice-internal".to_string(),
+                in_call: true,
+                voice_status: ParticipantVoiceStatus::default(),
+            },
+            online: true,
+        };
+        let encoded = encode_server_control(&message);
+        assert_eq!(decode_server_control(&encoded).unwrap(), message);
+    }
+
+    #[test]
     fn p2p_control_round_trips() {
         let control = ClientControl::PublishP2p {
             room_id: RoomId(1),
@@ -752,7 +774,6 @@ mod tests {
     #[test]
     fn pair_control_requires_strong_one_time_and_session_secrets() {
         let weak = ClientControl::Pair {
-            user: "alice".to_string(),
             display_name: "Alice".to_string(),
             pairing_code: "short".to_string(),
             token: "also-short".to_string(),
@@ -762,7 +783,6 @@ mod tests {
         assert!(encode_client_control(&weak).is_err());
 
         let strong = ClientControl::Pair {
-            user: "alice".to_string(),
             display_name: "Alice".to_string(),
             pairing_code: "pair-alice-please-change".to_string(),
             token: "client-generated-token-with-at-least-32-bytes".to_string(),
@@ -776,7 +796,6 @@ mod tests {
     fn invite_ticket_round_trips_join_string() {
         let ticket = InviteTicket {
             version: crate::PROTOCOL_VERSION,
-            user: "alice".to_string(),
             pairing_code: "pair-alice-please-change".to_string(),
             tcp_addr: "127.0.0.1:41000".to_string(),
             udp_addr: "127.0.0.1:41000".to_string(),

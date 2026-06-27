@@ -13,6 +13,7 @@ const UNKNOWN_NAME: &str = "…";
 pub(crate) struct ParticipantState {
     pub(crate) user_id: UserId,
     pub(crate) name: Option<String>,
+    pub(crate) identifier: Option<String>,
     pub(crate) online: bool,
     pub(crate) voice_active: bool,
     pub(crate) voice_status: ParticipantVoiceStatus,
@@ -65,7 +66,8 @@ impl Participants {
             .iter_mut()
             .find(|entry| entry.user_id == participant.user_id)
         {
-            existing.name = Some(participant.name);
+            existing.name = Some(participant.display_name);
+            existing.identifier = Some(participant.identifier);
             existing.online = online;
             existing.voice_active = participant.in_call;
             existing.voice_status = participant.voice_status.normalized();
@@ -79,7 +81,8 @@ impl Participants {
             let voice_status = participant.voice_status.normalized();
             self.entries.push(ParticipantState {
                 user_id: participant.user_id,
-                name: Some(participant.name),
+                name: Some(participant.display_name),
+                identifier: Some(participant.identifier),
                 online,
                 voice_active: participant.in_call,
                 voice_status,
@@ -228,6 +231,7 @@ impl Participants {
         self.entries.push(ParticipantState {
             user_id,
             name: None,
+            identifier: None,
             online: true,
             voice_active: false,
             voice_status: ParticipantVoiceStatus::default(),
@@ -328,7 +332,8 @@ mod tests {
     fn participant(user_id: UserId) -> ParticipantInfo {
         ParticipantInfo {
             user_id,
-            name: format!("user-{}", user_id.0),
+            display_name: format!("user-{}", user_id.0),
+            identifier: format!("id-{}", user_id.0),
             in_call: true,
             voice_status: ParticipantVoiceStatus::default(),
         }
@@ -375,7 +380,7 @@ mod tests {
     fn authoritative_name_starting_with_user_is_preserved() {
         let mut participants = Participants::default();
         let mut info = participant(UserId(3));
-        info.name = "user friend".to_string();
+        info.display_name = "user friend".to_string();
         participants.set_presence(info, true);
         participants.voice_started(UserId(3), StreamId(9));
         assert_eq!(participants.entries[0].display_name(), "user friend");
