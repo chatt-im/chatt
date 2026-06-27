@@ -12,89 +12,367 @@ pub(crate) fn is_quit_key(key: &KeyEvent) -> bool {
     key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL)
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Coverage {
+    FullScreen,
+    Overlay,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct ChromeSpec {
+    pub(crate) theme_mode: theme::UiMode,
+    pub(crate) status_label: &'static str,
+    pub(crate) layer: LayerId,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct ModePresentation {
+    pub(crate) coverage: Coverage,
+    pub(crate) chrome: Option<ChromeSpec>,
+}
+
+impl ModePresentation {
+    pub(crate) fn full_screen(chrome: ChromeSpec) -> Self {
+        Self {
+            coverage: Coverage::FullScreen,
+            chrome: Some(chrome),
+        }
+    }
+
+    pub(crate) const OVERLAY: Self = Self {
+        coverage: Coverage::Overlay,
+        chrome: None,
+    };
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ExitReason {
+    Popped,
+    Replaced,
+    Reset,
+}
+
 /// A screen or overlay on the mode stack.
 ///
-/// A mode owns its transient interaction state and bundles input handling with
-/// rendering. The active (top) mode receives input. The whole stack renders
-/// bottom-to-top so an overlay paints over the base mode beneath it.
+/// One dispatch may request at most one transition. The stack applies that
+/// transition only after the borrowed active mode returns.
 pub(crate) trait AppMode {
-    /// Renders this mode.
-    ///
-    /// Base modes draw the full screen and chrome. Overlay modes draw only their
-    /// panel on top of the mode beneath them.
     fn render(&mut self, app: &mut App, buf: &mut Buffer, now_ms: u64);
 
-    /// Handles a key event routed to the active mode.
     fn process_input(&mut self, app: &mut App, key: KeyEvent) -> Action;
 
-    /// Handles a mouse event routed to the active mode.
     fn process_mouse(&mut self, app: &mut App, mouse: MouseEvent) -> Action {
         let _ = (app, mouse);
         Action::Continue
     }
 
-    /// Handles pasted text routed to the active mode.
     fn process_paste(&mut self, app: &mut App, text: String) {
         let _ = (app, text);
     }
 
-    /// Runs once after this mode becomes the active mode on the stack.
-    fn init(&mut self, app: &mut App) {
-        let _ = app;
-    }
+    fn on_enter(&mut self, _app: &mut App) {}
 
-    /// Whether this mode overlays the mode beneath it rather than replacing it.
-    #[cfg_attr(not(test), allow(dead_code))]
-    fn is_overlay(&self) -> bool {
-        false
-    }
+    fn on_exit(&mut self, _app: &mut App, _reason: ExitReason) {}
 
-    /// Styling token for this mode's chrome.
-    fn theme_mode(&self, app: &App) -> theme::UiMode;
-
-    /// Short label displayed in this mode's status chrome.
-    fn status_label(&self, app: &App) -> &'static str;
-
-    /// Binding layer displayed in this mode's key-preview chrome.
-    fn layer_id(&self, app: &App) -> LayerId;
+    fn presentation(&self, app: &App) -> ModePresentation;
 }
 
-/// A deferred edit to the mode stack.
-///
-/// A mode requests a transition while it is borrowed as a stack element. The
-/// event loop applies it afterward via [`apply_mode_transition`], which avoids
-/// mutating the stack while a mode borrowed from it runs.
-#[derive(Default)]
 pub(crate) enum ModeTransition {
-    #[default]
-    None,
     Set(Box<dyn AppMode>),
     Push(Box<dyn AppMode>),
     Replace(Box<dyn AppMode>),
     Pop,
 }
 
-/// Applies a pending [`ModeTransition`] to the stack and initializes the new top.
-pub(crate) fn apply_mode_transition(app: &mut App, stack: &mut Vec<Box<dyn AppMode>>) {
-    match std::mem::take(&mut app.mode_transition) {
-        ModeTransition::None => return,
-        ModeTransition::Set(mode) => {
-            stack.clear();
-            stack.push(mode);
+/// The single deferred transition slot.
+///
+/// Requesting twice during one dispatch is a programming error. Keeping this a
+/// slot rather than a queue makes event ordering explicit at the runtime loop.
+#[derive(Default)]
+pub(crate) struct PendingTransition(Option<ModeTransition>);
+
+impl PendingTransition {
+    pub(crate) fn request(&mut self, transition: ModeTransition) {
+        debug_assert!(
+            self.0.is_none(),
+            "a dispatch requested multiple mode transitions"
+        );
+        if self.0.is_none() {
+            self.0 = Some(transition);
         }
-        ModeTransition::Push(mode) => stack.push(mode),
-        ModeTransition::Replace(mode) => {
-            stack.pop();
-            stack.push(mode);
+    }
+
+    pub(crate) fn take(&mut self) -> Option<ModeTransition> {
+        self.0.take()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_empty(&self) -> bool {
+        self.0.is_none()
+    }
+}
+
+/// Owns navigation invariants and lifecycle for all screens and overlays.
+pub(crate) struct ModeStack {
+    modes: Vec<Box<dyn AppMode>>,
+}
+
+impl ModeStack {
+    pub(crate) fn new(mut root: Box<dyn AppMode>, app: &mut App) -> Self {
+        root.on_enter(app);
+        Self { modes: vec![root] }
+    }
+
+    pub(crate) fn active_mut(&mut self) -> &mut dyn AppMode {
+        self.modes
+            .last_mut()
+            .map(Box::as_mut)
+            .expect("mode stack always has a root")
+    }
+
+    /// Applies at most one requested transition. A root pop is an explicit
+    /// no-op; navigation must use `Set` to replace the root.
+    pub(crate) fn apply_pending(&mut self, app: &mut App) {
+        let Some(transition) = app.take_mode_transition() else {
+            return;
+        };
+
+        // Chords never cross a navigation boundary, including overlays.
+        app.chrome.binding.pending_chord = None;
+
+        match transition {
+            ModeTransition::Set(mut mode) => {
+                for mut removed in self.modes.drain(..).rev() {
+                    removed.on_exit(app, ExitReason::Reset);
+                }
+                mode.on_enter(app);
+                self.modes.push(mode);
+            }
+            ModeTransition::Push(mut mode) => {
+                mode.on_enter(app);
+                self.modes.push(mode);
+            }
+            ModeTransition::Replace(mut mode) => {
+                if let Some(mut removed) = self.modes.pop() {
+                    removed.on_exit(app, ExitReason::Replaced);
+                }
+                mode.on_enter(app);
+                self.modes.push(mode);
+            }
+            ModeTransition::Pop if self.modes.len() > 1 => {
+                let mut removed = self.modes.pop().expect("checked non-root mode");
+                removed.on_exit(app, ExitReason::Popped);
+            }
+            ModeTransition::Pop => {}
         }
-        ModeTransition::Pop => {
-            stack.pop();
-            if stack.is_empty() {
-                stack.push(app.base_mode());
+    }
+
+    /// Renders the highest full-screen mode and overlays above it. Covered
+    /// full-screen modes retain state without mutating active layout caches.
+    pub(crate) fn render(&mut self, app: &mut App, buf: &mut Buffer, now_ms: u64) {
+        let start = self
+            .modes
+            .iter()
+            .rposition(|mode| mode.presentation(app).coverage == Coverage::FullScreen)
+            .unwrap_or(0);
+        for mode in &mut self.modes[start..] {
+            mode.render(app, buf, now_ms);
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn depth(&self) -> usize {
+        self.modes.len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.depth()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn overlay_active(&self, app: &App) -> bool {
+        self.modes
+            .last()
+            .is_some_and(|mode| mode.presentation(app).coverage == Coverage::Overlay)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn top_presentation(&self, app: &App) -> ModePresentation {
+        self.modes
+            .last()
+            .expect("mode stack always has a root")
+            .presentation(app)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{cell::RefCell, rc::Rc};
+
+    use extui::event::{KeyEvent, MouseEvent};
+
+    use super::*;
+    use crate::{bindings, config::Config, tui::modes::ServerListMode};
+
+    struct OverlayMode;
+
+    impl AppMode for OverlayMode {
+        fn render(&mut self, _app: &mut App, _buf: &mut Buffer, _now_ms: u64) {}
+
+        fn process_input(&mut self, _app: &mut App, _key: KeyEvent) -> Action {
+            Action::Continue
+        }
+
+        fn process_mouse(&mut self, _app: &mut App, _mouse: MouseEvent) -> Action {
+            Action::Continue
+        }
+
+        fn presentation(&self, _app: &App) -> ModePresentation {
+            ModePresentation::OVERLAY
+        }
+    }
+
+    struct RecordingMode {
+        label: &'static str,
+        presentation: ModePresentation,
+        rendered: Rc<RefCell<Vec<&'static str>>>,
+    }
+
+    impl RecordingMode {
+        fn full_screen(label: &'static str, rendered: Rc<RefCell<Vec<&'static str>>>) -> Self {
+            Self {
+                label,
+                rendered,
+                presentation: ModePresentation::full_screen(ChromeSpec {
+                    theme_mode: theme::UiMode::Log,
+                    status_label: label,
+                    layer: bindings::WORKSPACE_LAYER,
+                }),
+            }
+        }
+
+        fn overlay(label: &'static str, rendered: Rc<RefCell<Vec<&'static str>>>) -> Self {
+            Self {
+                label,
+                rendered,
+                presentation: ModePresentation::OVERLAY,
             }
         }
     }
-    if let Some(top) = stack.last_mut() {
-        top.init(app);
+
+    impl AppMode for RecordingMode {
+        fn render(&mut self, _app: &mut App, _buf: &mut Buffer, _now_ms: u64) {
+            self.rendered.borrow_mut().push(self.label);
+        }
+
+        fn process_input(&mut self, _app: &mut App, _key: KeyEvent) -> Action {
+            Action::Continue
+        }
+
+        fn presentation(&self, _app: &App) -> ModePresentation {
+            self.presentation
+        }
+    }
+
+    fn app() -> App {
+        App::new(Config::default(), None).expect("test app")
+    }
+
+    #[test]
+    fn popping_root_is_an_explicit_noop() {
+        let mut app = app();
+        let mut stack = ModeStack::new(Box::new(ServerListMode::new()), &mut app);
+
+        app.pop_mode();
+        stack.apply_pending(&mut app);
+
+        assert_eq!(stack.depth(), 1);
+        assert!(app.pending_transition.is_empty());
+    }
+
+    #[test]
+    fn transition_cancels_pending_chord() {
+        let mut app = app();
+        let mut stack = ModeStack::new(Box::new(ServerListMode::new()), &mut app);
+        let input = extui_bindings::InputKey::from_event(&KeyEvent::new(
+            KeyCode::Char('g'),
+            KeyModifiers::empty(),
+        ))
+        .expect("input key");
+        let _ = crate::bindings::resolve(
+            &app.config.bindings.router,
+            crate::bindings::WORKSPACE_LAYER,
+            &mut app.chrome.binding.pending_chord,
+            input,
+        );
+        assert!(app.chrome.binding.pending_chord.is_some());
+
+        app.push_mode(Box::new(OverlayMode));
+        stack.apply_pending(&mut app);
+
+        assert!(app.chrome.binding.pending_chord.is_none());
+        assert_eq!(stack.depth(), 2);
+    }
+
+    #[test]
+    #[should_panic(expected = "multiple mode transitions")]
+    fn requesting_two_transitions_in_one_dispatch_panics() {
+        let mut pending = PendingTransition::default();
+        pending.request(ModeTransition::Pop);
+        pending.request(ModeTransition::Pop);
+    }
+
+    #[test]
+    fn render_skips_full_screen_modes_covered_by_a_later_full_screen_mode() {
+        let mut app = app();
+        let rendered = Rc::new(RefCell::new(Vec::new()));
+        let mut stack = ModeStack::new(
+            Box::new(RecordingMode::full_screen("list", Rc::clone(&rendered))),
+            &mut app,
+        );
+        app.push_mode(Box::new(RecordingMode::full_screen(
+            "room",
+            Rc::clone(&rendered),
+        )));
+        stack.apply_pending(&mut app);
+        app.push_mode(Box::new(RecordingMode::full_screen(
+            "settings",
+            Rc::clone(&rendered),
+        )));
+        stack.apply_pending(&mut app);
+
+        stack.render(&mut app, &mut Buffer::new(80, 24), 0);
+
+        assert_eq!(&*rendered.borrow(), &["settings"]);
+    }
+
+    #[test]
+    fn render_draws_highest_full_screen_then_overlays_bottom_to_top() {
+        let mut app = app();
+        let rendered = Rc::new(RefCell::new(Vec::new()));
+        let mut stack = ModeStack::new(
+            Box::new(RecordingMode::full_screen("list", Rc::clone(&rendered))),
+            &mut app,
+        );
+        app.push_mode(Box::new(RecordingMode::full_screen(
+            "room",
+            Rc::clone(&rendered),
+        )));
+        stack.apply_pending(&mut app);
+        app.push_mode(Box::new(RecordingMode::overlay(
+            "confirm",
+            Rc::clone(&rendered),
+        )));
+        stack.apply_pending(&mut app);
+        app.push_mode(Box::new(RecordingMode::overlay(
+            "volume",
+            Rc::clone(&rendered),
+        )));
+        stack.apply_pending(&mut app);
+
+        stack.render(&mut app, &mut Buffer::new(80, 24), 0);
+
+        assert_eq!(&*rendered.borrow(), &["room", "confirm", "volume"]);
     }
 }

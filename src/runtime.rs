@@ -15,10 +15,7 @@ use rpc::control::InviteTicket;
 use crate::{
     app::App,
     config::Config,
-    tui::{
-        Action,
-        mode::{AppMode, apply_mode_transition},
-    },
+    tui::{Action, mode_stack::ModeStack},
 };
 
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
@@ -57,20 +54,20 @@ pub(crate) fn run_app(
     let mut clipboard = crate::clipboard::Clipboard::new();
     let stdin = std::io::stdin();
 
-    let mut mode_stack: Vec<Box<dyn AppMode>> = vec![app.base_mode()];
-    mode_stack.last_mut().unwrap().init(&mut app);
+    let mut mode_stack = ModeStack::new(app.base_mode(), &mut app);
 
     loop {
-        app.drain_events();
+        while let Some(event) = app.next_event() {
+            app.handle_app_event(event);
+            mode_stack.apply_pending(&mut app);
+        }
         app.tick();
-        apply_mode_transition(&mut app, &mut mode_stack);
+        mode_stack.apply_pending(&mut app);
         let now_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|elapsed| elapsed.as_millis() as u64)
             .unwrap_or(0);
-        for mode in mode_stack.iter_mut() {
-            mode.render(&mut app, &mut buffer, now_ms);
-        }
+        mode_stack.render(&mut app, &mut buffer, now_ms);
         buffer.render(&mut terminal);
 
         if event::poll(&stdin, Some(POLL_INTERVAL))?.is_readable() {
@@ -80,21 +77,18 @@ pub(crate) fn run_app(
         while let Some(event) = events.next(terminal.is_raw()) {
             match event {
                 Event::Key(key) => {
-                    let action = mode_stack.last_mut().unwrap().process_input(&mut app, key);
+                    let action = mode_stack.active_mut().process_input(&mut app, key);
                     if matches!(action, Action::Quit) {
                         return Ok(());
                     }
                 }
                 Event::Mouse(mouse) => {
-                    let action = mode_stack
-                        .last_mut()
-                        .unwrap()
-                        .process_mouse(&mut app, mouse);
+                    let action = mode_stack.active_mut().process_mouse(&mut app, mouse);
                     if matches!(action, Action::Quit) {
                         return Ok(());
                     }
                 }
-                Event::Paste(text) => mode_stack.last_mut().unwrap().process_paste(&mut app, text),
+                Event::Paste(text) => mode_stack.active_mut().process_paste(&mut app, text),
                 Event::Resized => {
                     let (new_w, new_h) = terminal.size()?;
                     buffer.resize(new_w, new_h);
@@ -104,10 +98,10 @@ pub(crate) fn run_app(
                 }
                 _ => {}
             }
-            apply_mode_transition(&mut app, &mut mode_stack);
+            mode_stack.apply_pending(&mut app);
         }
 
-        if let Some(text) = app.take_pending_clipboard() {
+        if let Some(text) = app.room.take_pending_clipboard() {
             clipboard.copy(&mut terminal, &text);
         }
     }

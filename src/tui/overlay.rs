@@ -6,11 +6,10 @@ use extui::{
 
 use crate::{
     app::{App, UserVolumeDialog},
-    bindings,
-    theme::{self, Theme},
+    theme::Theme,
     tui::{
         Action,
-        mode::{AppMode, is_quit_key},
+        mode::{AppMode, ModePresentation, ModeTransition, is_quit_key},
     },
 };
 
@@ -29,10 +28,6 @@ impl DialogMode {
 }
 
 impl AppMode for DialogMode {
-    fn is_overlay(&self) -> bool {
-        true
-    }
-
     fn render(&mut self, app: &mut App, buf: &mut Buffer, _now_ms: u64) {
         self.dialog.render(buf.rect(), buf, &app.theme);
     }
@@ -48,17 +43,14 @@ impl AppMode for DialogMode {
         Action::Continue
     }
 
-    fn theme_mode(&self, _app: &App) -> theme::UiMode {
-        theme::UiMode::Log
+    fn presentation(&self, _app: &App) -> ModePresentation {
+        ModePresentation::OVERLAY
     }
+}
 
-    fn status_label(&self, _app: &App) -> &'static str {
-        "Dialog"
-    }
-
-    fn layer_id(&self, _app: &App) -> extui_bindings::LayerId {
-        bindings::DIALOG_LAYER
-    }
+pub(crate) enum ConfirmDisposition {
+    Close,
+    Transition(ModeTransition),
 }
 
 /// Reusable yes/no confirmation overlay.
@@ -71,7 +63,7 @@ pub(crate) struct ConfirmMode {
     confirm_label: String,
     cancel_label: String,
     selected_confirm: bool,
-    on_confirm: Option<Box<dyn FnOnce(&mut App)>>,
+    on_confirm: Option<Box<dyn FnOnce(&mut App) -> ConfirmDisposition>>,
 }
 
 impl ConfirmMode {
@@ -79,7 +71,7 @@ impl ConfirmMode {
         prompt: impl Into<String>,
         confirm_label: impl Into<String>,
         cancel_label: impl Into<String>,
-        on_confirm: impl FnOnce(&mut App) + 'static,
+        on_confirm: impl FnOnce(&mut App) -> ConfirmDisposition + 'static,
     ) -> Self {
         Self {
             prompt: prompt.into(),
@@ -91,10 +83,17 @@ impl ConfirmMode {
     }
 
     fn confirm(&mut self, app: &mut App) {
-        if let Some(callback) = self.on_confirm.take() {
-            callback(app);
+        let disposition = self
+            .on_confirm
+            .take()
+            .map(|callback| callback(app))
+            .unwrap_or(ConfirmDisposition::Close);
+        match disposition {
+            ConfirmDisposition::Close => app.pop_mode(),
+            ConfirmDisposition::Transition(transition) => {
+                app.request_mode_transition(transition);
+            }
         }
-        app.pop_mode();
     }
 
     fn render_buttons(&self, area: Rect, buf: &mut Buffer, theme: &Theme) {
@@ -114,10 +113,6 @@ impl ConfirmMode {
 }
 
 impl AppMode for ConfirmMode {
-    fn is_overlay(&self) -> bool {
-        true
-    }
-
     fn render(&mut self, app: &mut App, buf: &mut Buffer, _now_ms: u64) {
         let theme = &app.theme;
         let area = buf.rect();
@@ -176,16 +171,8 @@ impl AppMode for ConfirmMode {
         Action::Continue
     }
 
-    fn theme_mode(&self, _app: &App) -> theme::UiMode {
-        theme::UiMode::Log
-    }
-
-    fn status_label(&self, _app: &App) -> &'static str {
-        "Confirm"
-    }
-
-    fn layer_id(&self, _app: &App) -> extui_bindings::LayerId {
-        bindings::DIALOG_LAYER
+    fn presentation(&self, _app: &App) -> ModePresentation {
+        ModePresentation::OVERLAY
     }
 }
 

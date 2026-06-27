@@ -1,9 +1,10 @@
 pub(crate) mod audio_diagnostics;
 pub(crate) mod dialogs;
 pub(crate) mod participants;
+pub(crate) mod room;
 pub(crate) mod server;
 
-use hashbrown::{HashMap, HashSet};
+use hashbrown::HashSet;
 use std::{
     collections::VecDeque,
     path::PathBuf,
@@ -16,33 +17,27 @@ use std::{
     time::{Duration, Instant},
 };
 
-use extui::Rect;
 use extui::event::{
     KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
-use extui_editor::{Editor, Span as EditorSpan, bindings as editor_bindings};
 use rpc::{
-    control::{ChatMessage, InviteTicket, ParticipantVoiceStatus},
+    control::{InviteTicket, ParticipantVoiceStatus},
     ids::{SessionId, UserId},
 };
 
 use crate::{
-    bindings::{BindCommand, PendingChord},
-    chat_buffer::{LineKind, VirtualChatBuffer, VisibleLine},
+    bindings::BindCommand,
     client_net::{NetworkClient, NetworkCommand, NetworkEvent, spawn_pair_once},
     config::{self, Config, SoundboardClip, ThemeChoice, validate_server_entry},
     local_control,
-    settings::{
-        self, AudioInputPickerState, AudioOutputPickerState, SettingsDraft, SettingsFocus,
-        SettingsMutation,
-    },
+    settings::{self, SettingsFocus, SettingsMutation},
     theme::Theme,
     tui::{
         Action,
-        editor::EditorHighlighter,
-        form::{FormState, rect_contains},
-        mode::{AppMode, ModeTransition},
-        modes::{RoomMode, ServerEditMode, ServerListMode, SettingsMode},
+        chrome::ChromeState,
+        form::rect_contains,
+        mode::{AppMode, ModeTransition, PendingTransition},
+        modes::{RoomMode, ServerEditMode, ServerListMode, SettingsMode, SettingsSession},
         overlay::DialogMode,
     },
 };
@@ -51,13 +46,14 @@ use chatt::audio::{
     self, BufferRequest, DeviceInfo, EchoCancellationControl, LiveAudioFileSourceConfig,
     LiveAudioFileSourceReport, LiveAudioPacketLossProfile, LiveCapture, LiveCaptureConfig,
     LiveEncoderProfile, LivePlayback, LivePlaybackConfig, LivePlaybackFeedback, LivePlaybackSink,
-    LocalVoiceFrame, NotificationSound, PlaybackStreamControl,
+    LivePlaybackSnapshot, LocalVoiceFrame, NotificationSound, PlaybackStreamControl,
 };
 
 use audio_diagnostics::AudioDiagnostics;
 
 pub(crate) use dialogs::{UserVolumeDialog, UserVolumeEvent};
 pub(crate) use participants::{ParticipantState, Participants};
+pub(crate) use room::{RoomSession, ToggleExpandResult};
 pub(crate) use server::{
     PendingPair, ServerEditDraft, ServerEditEvent, ServerSelectItem, default_join_alias,
     default_join_display_name, random_token, server_entry_from_invite, unique_server_alias,
@@ -71,6 +67,54 @@ pub(crate) enum StatusKind {
 
 const TRANSIENT_STATUS_LIFETIME: Duration = Duration::from_secs(3);
 
+pub(crate) struct StatusState {
+    text: String,
+    kind: StatusKind,
+    expires_at: Option<Instant>,
+}
+
+impl StatusState {
+    fn new(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            kind: StatusKind::Info,
+            expires_at: None,
+        }
+    }
+
+    pub(crate) fn text(&self) -> &str {
+        &self.text
+    }
+
+    pub(crate) fn kind(&self) -> StatusKind {
+        self.kind
+    }
+
+    fn set(&mut self, status: impl Into<String>) {
+        self.text = status.into();
+        self.kind = StatusKind::Info;
+        self.expires_at = None;
+    }
+
+    fn set_error(&mut self, status: impl Into<String>) {
+        self.text = status.into();
+        self.kind = StatusKind::Error;
+        self.expires_at = None;
+    }
+
+    fn set_transient(&mut self, status: impl Into<String>, expires_at: Instant) {
+        self.set(status);
+        self.expires_at = Some(expires_at);
+    }
+
+    fn expire(&mut self, now: Instant) {
+        if self.expires_at.is_some_and(|expires_at| now >= expires_at) {
+            self.text.clear();
+            self.expires_at = None;
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ChatPanelFocus {
     Lobby,
@@ -81,7 +125,7 @@ pub(crate) enum ChatPanelFocus {
 impl ChatPanelFocus {
     const ORDER: [Self; 3] = [Self::Lobby, Self::ChatLog, Self::Compose];
 
-    fn moved(self, delta: isize) -> Self {
+    pub(crate) fn moved(self, delta: isize) -> Self {
         let current = Self::ORDER
             .iter()
             .position(|panel| *panel == self)
@@ -91,75 +135,97 @@ impl ChatPanelFocus {
     }
 }
 
+#[derive(Default)]
+pub(crate) struct ServerCatalog {
+    items: Vec<ServerSelectItem>,
+    generation: u64,
+}
+
+impl ServerCatalog {
+    fn rebuild(&mut self, config: &Config) {
+        self.items = config
+            .servers
+            .iter()
+            .map(|server| ServerSelectItem {
+                alias: server.alias.clone(),
+                display_name: server.display_name.clone(),
+                tcp_addr: server.tcp_addr.clone(),
+                room_id: server.room_id,
+                search_text: format!(
+                    "{} {} {} {}",
+                    server.alias, server.display_name, server.tcp_addr, server.room_id
+                ),
+            })
+            .collect();
+        self.generation = self.generation.saturating_add(1);
+    }
+
+    pub(crate) fn items(&self) -> &[ServerSelectItem] {
+        &self.items
+    }
+
+    #[cfg(test)]
+    pub(crate) fn generation(&self) -> u64 {
+        self.generation
+    }
+}
+
+#[derive(Default)]
+pub(crate) struct AudioDeviceCatalog {
+    input_devices: Vec<DeviceInfo>,
+    output_devices: Vec<DeviceInfo>,
+    generation: u64,
+    refresh_in_flight: bool,
+    next_refresh_id: u64,
+}
+
+impl AudioDeviceCatalog {
+    pub(crate) fn input_devices(&self) -> &[DeviceInfo] {
+        &self.input_devices
+    }
+
+    pub(crate) fn output_devices(&self) -> &[DeviceInfo] {
+        &self.output_devices
+    }
+
+    pub(crate) fn generation(&self) -> u64 {
+        self.generation
+    }
+}
+
 pub(crate) struct App {
-    pub(crate) config: Config,
-    pub(crate) theme: Theme,
-    pub(crate) event_tx: EventSender,
-    pub(crate) server_alias: String,
-    pub(crate) user: String,
-    pub(crate) room_name: String,
-    pub(crate) status: String,
-    pub(crate) status_kind: StatusKind,
-    status_expires_at: Option<Instant>,
-    pub(crate) mode_transition: ModeTransition,
-    pub(crate) chat_focus: ChatPanelFocus,
-    pub(crate) composer: Editor,
-    pub(crate) composer_hl: EditorHighlighter,
-    pub(crate) chat: VirtualChatBuffer,
-    pub(crate) participants: Participants,
-    pub(crate) last_chat_width: u16,
-    pub(crate) last_chat_height: u16,
-    pub(crate) last_chat_rect: Rect,
-    pub(crate) last_chat_lines: Vec<VisibleLine>,
-    pub(crate) last_room_rect: Rect,
-    pub(crate) last_lobby_bar_rect: Rect,
-    pub(crate) last_chat_log_bar_rect: Rect,
-    pub(crate) last_composer_rect: Rect,
-    pub(crate) last_compose_bar_rect: Rect,
-    pub(crate) top_bar_mute_rect: Rect,
-    pub(crate) top_bar_deafen_rect: Rect,
-    pub(crate) pending_clipboard: Option<String>,
-    pub(crate) pending_chord: Option<PendingChord>,
-    pub(crate) key_preview_expanded: bool,
-    pub(crate) key_preview_cache: crate::tui::render::KeyPreviewCache,
-    pub(crate) event_rx: Receiver<AppEvent>,
-    pub(crate) audio_device_refresh_in_flight: bool,
-    pub(crate) next_audio_device_refresh_id: u64,
-    pub(crate) network: Option<NetworkClient>,
-    pub(crate) control_socket: Option<local_control::ControlSocket>,
-    pub(crate) session_id: Option<SessionId>,
-    pub(crate) user_id: Option<UserId>,
-    pub(crate) server_items: Vec<ServerSelectItem>,
-    pub(crate) pending_pair: Option<PendingPair>,
-    pub(crate) input_devices: Vec<DeviceInfo>,
-    pub(crate) output_devices: Vec<DeviceInfo>,
-    pub(crate) audio_input_items: Vec<settings::AudioInputItem>,
-    pub(crate) audio_output_items: Vec<settings::AudioOutputItem>,
-    pub(crate) audio_input_picker: AudioInputPickerState,
-    pub(crate) audio_output_picker: AudioOutputPickerState,
-    pub(crate) settings: SettingsDraft,
-    pub(crate) settings_dirty: bool,
-    pub(crate) settings_open: bool,
-    pub(crate) mic_muted: Arc<AtomicBool>,
-    pub(crate) deafened: Arc<AtomicBool>,
-    pub(crate) voice_tx_enabled: Arc<AtomicBool>,
-    pub(crate) mic_error: Option<String>,
-    pub(crate) playback_error: Option<String>,
-    pub(crate) capture: Option<LiveCapture>,
-    pub(crate) settings_preview_capture: bool,
-    pub(crate) allow_settings_preview_capture: bool,
-    pub(crate) playback: Option<LivePlayback>,
-    pub(crate) soundboard_busy: Arc<AtomicBool>,
-    pub(crate) soundboard_next_sequence: u32,
-    pub(crate) echo_control: Arc<EchoCancellationControl>,
-    pub(crate) muted_users: HashSet<UserId>,
-    pub(crate) stream_users: HashMap<u32, UserId>,
-    pub(crate) volume_preview: Option<(UserId, f32)>,
-    pub(crate) voice_packets_received: u64,
-    pub(crate) voice_bytes_received: u64,
-    pub(crate) encoder_profile: LiveEncoderProfile,
-    pub(crate) last_network_notice: Option<String>,
-    pub(crate) pending_audio_apply: Option<PendingAudioApply>,
+    pub config: Config,
+    pub theme: Theme,
+    events: AppEvents,
+    pub room: RoomSession,
+    pub status: StatusState,
+    pub pending_transition: PendingTransition,
+    pub chrome: ChromeState,
+    pub audio_devices: AudioDeviceCatalog,
+    pub network: Option<NetworkClient>,
+    pub control_socket: Option<local_control::ControlSocket>,
+    pub session_id: Option<SessionId>,
+    pub user_id: Option<UserId>,
+    pub server_catalog: ServerCatalog,
+    pub pending_pair: Option<PendingPair>,
+    pub mic_muted: Arc<AtomicBool>,
+    pub deafened: Arc<AtomicBool>,
+    pub voice_tx_enabled: Arc<AtomicBool>,
+    pub mic_error: Option<String>,
+    pub playback_error: Option<String>,
+    pub capture: Option<LiveCapture>,
+    pub settings_preview_capture: bool,
+    pub settings_preview_refresh_id: Option<u64>,
+    pub allow_settings_preview_capture: bool,
+    pub playback: Option<LivePlayback>,
+    pub soundboard_busy: Arc<AtomicBool>,
+    pub soundboard_next_sequence: u32,
+    pub echo_control: Arc<EchoCancellationControl>,
+    pub voice_packets_received: u64,
+    pub voice_bytes_received: u64,
+    pub encoder_profile: LiveEncoderProfile,
+    pub last_network_notice: Option<String>,
+    pub pending_audio_apply: Option<PendingAudioApply>,
     pending_network_commands: VecDeque<NetworkCommand>,
     supervisor: SupervisorState,
     /// The browser chat-log feed, present only when `[web] enabled = true`.
@@ -197,6 +263,7 @@ struct CaptureWatch {
 #[derive(Default)]
 struct PlaybackWatch {
     backend_stream_errors: u64,
+    backend_xruns: u64,
 }
 
 #[derive(Default)]
@@ -298,6 +365,28 @@ fn audio_restart_flags(old: &config::AudioConfig, new: &config::AudioConfig) -> 
         || old.latency != new.latency;
     (capture, playback)
 }
+
+fn playback_backend_recovery_reason(
+    snapshot: &LivePlaybackSnapshot,
+    watch: &PlaybackWatch,
+) -> Option<String> {
+    let previous_non_xrun_errors = watch
+        .backend_stream_errors
+        .saturating_sub(watch.backend_xruns);
+    let current_non_xrun_errors = snapshot
+        .backend_stream_errors
+        .saturating_sub(snapshot.backend_xruns);
+    if current_non_xrun_errors <= previous_non_xrun_errors {
+        return None;
+    }
+    Some(
+        snapshot
+            .last_backend_error
+            .clone()
+            .unwrap_or_else(|| "playback stream error".to_string()),
+    )
+}
+
 pub(crate) struct AudioDeviceRefresh {
     pub(crate) id: u64,
     pub(crate) input_buffer_request: BufferRequest,
@@ -360,31 +449,42 @@ impl EventSender {
     }
 }
 
+struct AppEvents {
+    tx: EventSender,
+    rx: Receiver<AppEvent>,
+}
+
+impl AppEvents {
+    fn new() -> Self {
+        let (tx, rx) = mpsc::channel();
+        Self {
+            tx: EventSender(tx),
+            rx,
+        }
+    }
+
+    fn sender(&self) -> EventSender {
+        self.tx.clone()
+    }
+
+    fn next(&mut self) -> Result<Option<AppEvent>, mpsc::TryRecvError> {
+        match self.rx.try_recv() {
+            Ok(event) => Ok(Some(event)),
+            Err(mpsc::TryRecvError::Empty) => Ok(None),
+            Err(error @ mpsc::TryRecvError::Disconnected) => Err(error),
+        }
+    }
+}
+
 impl App {
     pub(crate) fn new(
         config: Config,
         pending_invite: Option<InviteTicket>,
     ) -> Result<Self, String> {
-        let (event_tx, event_rx) = mpsc::channel();
-        let event_tx = EventSender(event_tx);
+        let events = AppEvents::new();
         let soundboard_enabled = config.soundboard.enabled;
         let theme = Theme::from_choice(config.ui.theme);
-        let mut composer =
-            Editor::with_bindings(editor_bindings::vim(editor_bindings::VimOptions::default()));
-        composer.set_wrap(true);
-        composer.set_height_bounds(1, config.ui.max_composer_height.max(1));
-        composer.set_theme(theme.editor_theme());
-        composer.enter_insert_mode();
-        let composer_hl = EditorHighlighter::new(&mut composer);
-        let mut settings_draft = SettingsDraft::from_audio(&config.audio);
-        settings_draft.set_form_bindings_from_config(config.ui.form_bindings);
-        settings_draft.set_theme_from_config(config.ui.theme);
-        let audio_input_items = settings::audio_input_items(&[]);
-        let audio_output_items = settings::audio_output_items(&[]);
-        let mut audio_input_picker = AudioInputPickerState::default();
-        audio_input_picker.reset(&audio_input_items, settings_draft.input_selection());
-        let mut audio_output_picker = AudioOutputPickerState::default();
-        audio_output_picker.reset(&audio_output_items, settings_draft.output_selection());
+        let room = RoomSession::new(&config, &theme);
         let echo_control = Arc::new(EchoCancellationControl::new(config.audio.echo_cancellation));
         let web_feed = if config.web.enabled {
             match crate::web_server::spawn(
@@ -403,52 +503,18 @@ impl App {
         };
         let mut app = Self {
             theme,
-            event_tx,
-            server_alias: String::new(),
-            user: String::new(),
-            room_name: "servers".to_string(),
-            status: "select a server".to_string(),
-            status_kind: StatusKind::Info,
-            status_expires_at: None,
-            mode_transition: ModeTransition::None,
-            chat_focus: ChatPanelFocus::Compose,
-            composer,
-            composer_hl,
-            chat: VirtualChatBuffer::new(config.ui.max_messages as usize, theme.syntax),
-            participants: Participants::default(),
-            last_chat_width: 80,
-            last_chat_height: 0,
-            last_chat_rect: Rect::EMPTY,
-            last_chat_lines: Vec::new(),
-            last_room_rect: Rect::EMPTY,
-            last_lobby_bar_rect: Rect::EMPTY,
-            last_chat_log_bar_rect: Rect::EMPTY,
-            last_composer_rect: Rect::EMPTY,
-            last_compose_bar_rect: Rect::EMPTY,
-            top_bar_mute_rect: Rect::EMPTY,
-            top_bar_deafen_rect: Rect::EMPTY,
-            pending_clipboard: None,
-            pending_chord: None,
-            key_preview_expanded: false,
-            key_preview_cache: crate::tui::render::KeyPreviewCache::default(),
-            event_rx,
-            audio_device_refresh_in_flight: false,
-            next_audio_device_refresh_id: 0,
+            events,
+            room,
+            status: StatusState::new("select a server"),
+            pending_transition: PendingTransition::default(),
+            chrome: ChromeState::default(),
+            audio_devices: AudioDeviceCatalog::default(),
             network: None,
             control_socket: None,
             session_id: None,
             user_id: None,
-            server_items: Vec::new(),
+            server_catalog: ServerCatalog::default(),
             pending_pair: None,
-            input_devices: Vec::new(),
-            output_devices: Vec::new(),
-            audio_input_items,
-            audio_output_items,
-            audio_input_picker,
-            audio_output_picker,
-            settings: settings_draft,
-            settings_dirty: false,
-            settings_open: false,
             mic_muted: Arc::new(AtomicBool::new(false)),
             deafened: Arc::new(AtomicBool::new(false)),
             voice_tx_enabled: Arc::new(AtomicBool::new(false)),
@@ -456,14 +522,12 @@ impl App {
             playback_error: None,
             capture: None,
             settings_preview_capture: false,
+            settings_preview_refresh_id: None,
             allow_settings_preview_capture: !soundboard_enabled,
             playback: None,
             soundboard_busy: Arc::new(AtomicBool::new(false)),
             soundboard_next_sequence: 0,
             echo_control,
-            muted_users: HashSet::new(),
-            stream_users: HashMap::new(),
-            volume_preview: None,
             voice_packets_received: 0,
             voice_bytes_received: 0,
             encoder_profile: LiveEncoderProfile::DRED_20,
@@ -483,20 +547,18 @@ impl App {
         Ok(app)
     }
 
-    pub(crate) fn drain_events(&mut self) {
-        loop {
-            match self.event_rx.try_recv() {
-                Ok(event) => self.handle_app_event(event),
-                Err(mpsc::TryRecvError::Empty) => break,
-                Err(mpsc::TryRecvError::Disconnected) => {
-                    self.schedule_network_recovery(Instant::now(), "event channel disconnected");
-                    break;
-                }
+    pub(crate) fn next_event(&mut self) -> Option<AppEvent> {
+        match self.events.next() {
+            Ok(event) => event,
+            Err(mpsc::TryRecvError::Disconnected) => {
+                self.schedule_network_recovery(Instant::now(), "event channel disconnected");
+                None
             }
+            Err(mpsc::TryRecvError::Empty) => None,
         }
     }
 
-    fn handle_app_event(&mut self, event: AppEvent) {
+    pub(crate) fn handle_app_event(&mut self, event: AppEvent) {
         match event {
             AppEvent::Network(event) => self.handle_network_event(event),
             AppEvent::AudioDeviceRefresh(refresh) => self.handle_audio_device_refresh(refresh),
@@ -519,34 +581,15 @@ impl App {
     }
 
     fn rebuild_server_items(&mut self) {
-        self.server_items = self
-            .config
-            .servers
-            .iter()
-            .map(|server| ServerSelectItem {
-                alias: server.alias.clone(),
-                display_name: server.display_name.clone(),
-                tcp_addr: server.tcp_addr.clone(),
-                room_id: server.room_id,
-                search_text: format!(
-                    "{} {} {} {}",
-                    server.alias, server.display_name, server.tcp_addr, server.room_id
-                ),
-            })
-            .collect();
+        self.server_catalog.rebuild(&self.config);
+    }
+
+    pub(crate) fn server_items(&self) -> &[ServerSelectItem] {
+        self.server_catalog.items()
     }
 
     pub(crate) fn open_server_select(&mut self) {
-        if self.settings_open {
-            self.apply_active_capture_amplification(self.config.audio.max_amplification);
-            self.stop_settings_preview_capture();
-            self.audio_input_picker
-                .reset(&self.audio_input_items, self.settings.input_selection());
-            self.audio_output_picker
-                .reset(&self.audio_output_items, self.settings.output_selection());
-        }
-        self.settings_open = false;
-        self.mode_transition = ModeTransition::Set(Box::new(ServerListMode::new()));
+        self.request_mode_transition(ModeTransition::Set(Box::new(ServerListMode::new())));
         self.rebuild_server_items();
         if self.config.servers.is_empty() {
             self.set_status("no servers configured; run chatt join JOIN_STRING");
@@ -556,20 +599,28 @@ impl App {
     }
 
     pub(crate) fn open_server_edit(&mut self, alias: &str) {
-        let Ok(server) = self.config.server(alias).cloned() else {
-            self.set_error(format!("server {alias} is not configured"));
+        let Some((server_alias, draft)) = self.server_edit_draft(alias) else {
             return;
         };
+        self.push_mode(Box::new(ServerEditMode::new(draft)));
+        self.set_status(format!("editing server {server_alias}"));
+    }
+
+    pub(crate) fn replace_with_server_edit(&mut self, alias: &str) {
+        let Some((server_alias, draft)) = self.server_edit_draft(alias) else {
+            return;
+        };
+        self.replace_mode(Box::new(ServerEditMode::new(draft)));
+        self.set_status(format!("editing server {server_alias}"));
+    }
+
+    fn server_edit_draft(&mut self, alias: &str) -> Option<(String, ServerEditDraft)> {
+        let Ok(server) = self.config.server(alias).cloned() else {
+            self.set_error(format!("server {alias} is not configured"));
+            return None;
+        };
         let draft = ServerEditDraft::from_server(&server, self.config.ui.form_bindings);
-        if self.settings_open {
-            self.apply_active_capture_amplification(self.config.audio.max_amplification);
-            self.stop_settings_preview_capture();
-            self.settings_open = false;
-            self.replace_mode(Box::new(ServerEditMode::new(draft)));
-        } else {
-            self.push_mode(Box::new(ServerEditMode::new(draft)));
-        }
-        self.set_status(format!("editing server {}", server.alias));
+        Some((server.alias, draft))
     }
 
     pub(crate) fn start_network(&mut self, alias: &str) -> bool {
@@ -583,7 +634,7 @@ impl App {
         self.disconnect_network();
         let network = match NetworkClient::spawn(
             server.client_config(&self.config.files, &self.config.p2p),
-            self.event_tx.clone(),
+            self.events.sender(),
         ) {
             Ok(network) => network,
             Err(error) => {
@@ -592,7 +643,7 @@ impl App {
             }
         };
         self.control_socket =
-            match local_control::ControlSocket::spawn(network.sender(), self.event_tx.clone()) {
+            match local_control::ControlSocket::spawn(network.sender(), self.events.sender()) {
                 Ok(socket) => {
                     kvlog::info!(
                         "chatt local control socket ready",
@@ -607,10 +658,8 @@ impl App {
                     None
                 }
             };
-        self.server_alias = server.alias.clone();
-        self.user = server.effective_display_name();
-        self.room_name = "lobby".to_string();
-        self.enter_compose_insert_mode();
+        self.room
+            .connect_to_server(server.alias.clone(), server.effective_display_name());
         self.network = Some(network);
         self.supervisor.network.reset();
         self.set_status("connecting");
@@ -625,8 +674,7 @@ impl App {
         }
         self.session_id = None;
         self.user_id = None;
-        self.participants = Participants::default();
-        self.stream_users.clear();
+        self.room.reset_for_disconnect();
         self.last_network_notice = None;
         self.voice_tx_enabled.store(false, Ordering::Relaxed);
         self.pending_network_commands.clear();
@@ -662,7 +710,7 @@ impl App {
         spawn_pair_once(
             server.client_config(&self.config.files, &self.config.p2p),
             ticket.pairing_code,
-            self.event_tx.clone(),
+            self.events.sender(),
         );
         self.pending_pair = Some(PendingPair { server });
         self.set_status(format!("pairing {alias}"));
@@ -685,10 +733,10 @@ impl App {
     }
 
     fn handle_audio_device_refresh(&mut self, refresh: AudioDeviceRefresh) {
-        if refresh.id + 1 != self.next_audio_device_refresh_id {
+        if refresh.id + 1 != self.audio_devices.next_refresh_id {
             return;
         }
-        self.audio_device_refresh_in_flight = false;
+        self.audio_devices.refresh_in_flight = false;
 
         let mut input_count = None;
         let mut output_count = None;
@@ -697,7 +745,7 @@ impl App {
         match refresh.input {
             Ok(devices) => {
                 input_count = Some(devices.len());
-                self.input_devices = devices;
+                self.audio_devices.input_devices = devices;
             }
             Err(error) => {
                 self.mic_error = Some(error.clone());
@@ -708,39 +756,34 @@ impl App {
         match refresh.output {
             Ok(devices) => {
                 output_count = Some(devices.len());
-                self.output_devices = devices;
+                self.audio_devices.output_devices = devices;
             }
             Err(error) => {
                 errors.push(format!("output devices: {error}"));
             }
         }
 
-        self.rebuild_audio_device_pickers();
+        self.audio_devices.generation = self.audio_devices.generation.saturating_add(1);
         kvlog::info!(
             "audio device refresh completed",
             id = refresh.id,
-            input_count = input_count.unwrap_or(self.input_devices.len()),
-            output_count = output_count.unwrap_or(self.output_devices.len()),
+            input_buffer_request = refresh.input_buffer_request.label(),
+            output_buffer_request = refresh.output_buffer_request.label(),
+            input_count = input_count.unwrap_or(self.audio_devices.input_devices.len()),
+            output_count = output_count.unwrap_or(self.audio_devices.output_devices.len()),
             input_ok = input_count.is_some(),
             output_ok = output_count.is_some(),
         );
 
-        if self.settings_open {
-            if errors.is_empty() {
-                self.set_status(format!(
-                    "found {} input device(s), {} output device(s) (in {}, out {})",
-                    input_count.unwrap_or(0),
-                    output_count.unwrap_or(0),
-                    refresh.input_buffer_request.label(),
-                    refresh.output_buffer_request.label(),
-                ));
-            } else {
-                self.set_error(format!("failed to refresh {}", errors.join("; ")));
-            }
+        if !errors.is_empty() {
+            kvlog::warn!(
+                "audio device refresh had errors",
+                errors = errors.join("; ")
+            );
         }
 
         if refresh.restart_preview
-            && self.settings_open
+            && self.settings_preview_refresh_id.take() == Some(refresh.id)
             && !self.voice_tx_enabled.load(Ordering::Relaxed)
             && !self.deafened.load(Ordering::Relaxed)
         {
@@ -763,33 +806,30 @@ impl App {
                 self.session_id = Some(session_id);
                 self.user_id = Some(user_id);
                 self.last_network_notice = None;
-                if let Some(room) = rooms.first() {
-                    self.room_name = room.name.clone();
-                }
-                self.set_status(format!("authenticated as {}", self.user));
+                self.room
+                    .authenticated(rooms.first().map(|room| room.name.clone()));
+                self.set_status(format!("authenticated as {}", self.room.local_user_name));
             }
             NetworkEvent::RoomJoined {
                 room_id,
                 history,
                 participants,
             } => {
-                self.chat.clear();
-                self.stream_users.clear();
-                self.participants.replace_room(participants);
-                for message in history {
-                    self.push_chat(message);
-                }
-                self.chat.bottom();
+                self.room.joined(participants, history, self.user_id);
                 self.set_status(format!("joined room {}", room_id.0));
                 self.publish_voice_status();
                 self.start_room_voice();
                 self.flush_pending_network_commands();
             }
             NetworkEvent::Chat(message) => {
-                if Some(message.sender) != self.user_id {
+                if let Some(feed) = &self.web_feed {
+                    feed.send((&message).into());
+                }
+                let update = RoomSession::chat_received(&mut self.room, message, self.user_id);
+                if !update.local {
                     self.play_notification(NotificationSound::MessageReceived);
                 }
-                self.push_chat(message);
+                let _ = update.should_scroll_bottom;
             }
             NetworkEvent::FileReceived {
                 metadata,
@@ -813,48 +853,49 @@ impl App {
                 online,
                 ..
             } => {
-                let name = participant.display_name.clone();
-                if Some(participant.user_id) != self.user_id {
+                let notice = self
+                    .room
+                    .presence_changed(participant, online, self.user_id);
+                if !notice.local {
                     self.play_notification(if online {
                         NotificationSound::PeerJoin
                     } else {
                         NotificationSound::PeerLeave
                     });
                 }
-                self.participants.set_presence(participant, online);
-                self.set_status(format!("{name} {}", if online { "joined" } else { "left" }));
+                self.set_status(format!(
+                    "{} {}",
+                    notice.display_name,
+                    if online { "joined" } else { "left" }
+                ));
             }
             NetworkEvent::VoiceStarted { user_id, stream_id } => {
-                self.stream_users.insert(stream_id.0, user_id);
-                self.participants.voice_started(user_id, stream_id);
+                let notice = self.room.voice_started(user_id, stream_id, self.user_id);
                 self.apply_user_audio_control(user_id);
-                if Some(user_id) == self.user_id {
+                if notice.local {
                     if self.config.soundboard.enabled {
                         self.set_status("soundboard ready");
                     } else {
                         self.set_status("voice stream ready");
                     }
                 } else {
-                    let name = self.participants.display_name_for(user_id).to_string();
-                    self.set_status(format!("{name} voice ready"));
+                    self.set_status(format!("{} voice ready", notice.display_name));
                 }
             }
             NetworkEvent::VoiceStopped { user_id, stream_id } => {
-                self.participants.voice_stopped(user_id, stream_id);
-                self.stream_users.remove(&stream_id.0);
-                if Some(user_id) == self.user_id {
+                let notice = self.room.voice_stopped(user_id, stream_id, self.user_id);
+                if notice.local {
                     self.stop_audio();
                     self.set_status("voice stopped");
                 } else {
                     if let Some(playback) = &self.playback {
                         playback.stop_stream(stream_id.0);
                     }
-                    let name = self.participants.display_name_for(user_id).to_string();
-                    self.set_status(format!("{name} left voice"));
+                    self.set_status(format!("{} left voice", notice.display_name));
                 }
             }
             NetworkEvent::PeerTransport { user_id, direct } => {
-                self.participants.set_peer_transport(user_id, direct);
+                self.room.peer_transport_changed(user_id, direct);
             }
             NetworkEvent::VoicePacketObserved {
                 stream_id,
@@ -870,10 +911,10 @@ impl App {
                 }
             }
             NetworkEvent::PlaybackFeedback(feedback) => {
-                self.participants.voice_feedback(feedback);
+                self.room.playback_feedback(feedback);
             }
             NetworkEvent::VoiceStatus { user_id, status } => {
-                self.participants.set_voice_status(user_id, status);
+                self.room.voice_status_changed(user_id, status);
             }
             NetworkEvent::EncoderProfileChanged(profile) => {
                 self.encoder_profile = profile;
@@ -904,7 +945,7 @@ impl App {
                     Ok(path) => {
                         self.config.config_path = Some(path.clone());
                         self.rebuild_server_items();
-                        self.open_server_edit(&alias);
+                        self.replace_with_server_edit(&alias);
                         self.set_status(format!(
                             "paired {alias}; config saved to {}",
                             path.display()
@@ -912,7 +953,7 @@ impl App {
                     }
                     Err(error) => {
                         self.rebuild_server_items();
-                        self.open_server_edit(&alias);
+                        self.replace_with_server_edit(&alias);
                         self.set_error(error);
                     }
                 }
@@ -923,7 +964,7 @@ impl App {
             }
             NetworkEvent::ReconnectScheduled { retry_in, reason } => {
                 self.stop_audio();
-                self.stream_users.clear();
+                self.room.reset_for_disconnect();
                 self.push_network_notice("network", &format!("Connection failed: {reason}"));
                 self.set_error(format!(
                     "connection failed; retrying in {}s",
@@ -932,7 +973,7 @@ impl App {
             }
             NetworkEvent::WorkerStopped { reason } => {
                 self.stop_audio();
-                self.stream_users.clear();
+                self.room.reset_for_disconnect();
                 self.push_network_notice(
                     "network",
                     &format!("Network worker stopped: {reason}; reconnecting"),
@@ -952,7 +993,7 @@ impl App {
         self.voice_bytes_received = self
             .voice_bytes_received
             .saturating_add(payload_size as u64);
-        self.participants.voice_packet(stream_id);
+        self.room.voice_packet_observed(stream_id, payload_size);
     }
 
     fn set_network_playback_sink(&mut self, sink: Option<LivePlaybackSink>) {
@@ -1016,37 +1057,18 @@ impl App {
         }
     }
 
-    fn push_chat(&mut self, message: ChatMessage) {
-        if let Some(feed) = &self.web_feed {
-            feed.send((&message).into());
-        }
-        let local = Some(message.sender) == self.user_id;
-        self.participants.note_message(&message);
-        self.chat.push_chat(message, local);
-        if self.chat.scroll_offset() == 0 {
-            self.chat.bottom();
-        }
-    }
-
     fn push_network_notice(&mut self, sender: &str, body: &str) {
         if self.last_network_notice.as_deref() == Some(body) {
             return;
         }
         self.last_network_notice = Some(body.to_string());
-        self.chat.push_notice(sender, body);
-        self.chat.bottom();
-    }
-
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub(crate) fn process_key(&mut self, key: KeyEvent) -> Action {
-        let mut mode = RoomMode;
-        mode.process_input(self, key)
+        self.room.push_notice(sender, body);
     }
 
     /// Builds the fallback base mode used if the stack is ever popped empty.
     pub(crate) fn base_mode(&self) -> Box<dyn AppMode> {
         if self.network.is_some() {
-            Box::new(RoomMode)
+            Box::new(RoomMode::default())
         } else {
             Box::new(ServerListMode::new())
         }
@@ -1054,191 +1076,39 @@ impl App {
 
     /// Requests pushing `mode` as an overlay on top of the current stack.
     pub(crate) fn push_mode(&mut self, mode: Box<dyn AppMode>) {
-        self.mode_transition = ModeTransition::Push(mode);
+        self.request_mode_transition(ModeTransition::Push(mode));
     }
 
     pub(crate) fn replace_mode(&mut self, mode: Box<dyn AppMode>) {
-        self.mode_transition = ModeTransition::Replace(mode);
+        self.request_mode_transition(ModeTransition::Replace(mode));
     }
 
     /// Requests popping the active mode off the stack.
     pub(crate) fn pop_mode(&mut self) {
-        self.mode_transition = ModeTransition::Pop;
+        self.request_mode_transition(ModeTransition::Pop);
+    }
+
+    pub(crate) fn request_mode_transition(&mut self, transition: ModeTransition) {
+        self.pending_transition.request(transition);
+    }
+
+    pub(crate) fn take_mode_transition(&mut self) -> Option<ModeTransition> {
+        self.pending_transition.take()
     }
 
     pub(crate) fn process_top_bar_mouse(&mut self, mouse: MouseEvent) -> bool {
         if !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
             return false;
         }
-        if rect_contains(self.top_bar_mute_rect, mouse.column, mouse.row) {
+        if rect_contains(self.chrome.top_bar.mute, mouse.column, mouse.row) {
             self.toggle_mute();
             return true;
         }
-        if rect_contains(self.top_bar_deafen_rect, mouse.column, mouse.row) {
+        if rect_contains(self.chrome.top_bar.deafen, mouse.column, mouse.row) {
             self.set_deafen(!self.deafened.load(Ordering::Relaxed));
             return true;
         }
         false
-    }
-
-    pub(crate) fn process_chat_mouse(&mut self, mouse: MouseEvent) -> Action {
-        let rect = self.last_chat_rect;
-        let in_chat = rect_contains(rect, mouse.column, mouse.row);
-        let in_chat_bar = rect_contains(self.last_chat_log_bar_rect, mouse.column, mouse.row);
-        let in_room = rect_contains(self.last_room_rect, mouse.column, mouse.row);
-        let in_lobby_bar = rect_contains(self.last_lobby_bar_rect, mouse.column, mouse.row);
-        let in_composer = rect_contains(self.last_composer_rect, mouse.column, mouse.row)
-            || rect_contains(self.last_compose_bar_rect, mouse.column, mouse.row);
-
-        match mouse.kind {
-            MouseEventKind::Down(MouseButton::Left) if in_composer => {
-                self.enter_compose_insert_mode();
-            }
-            MouseEventKind::Down(MouseButton::Left) if in_lobby_bar => {
-                self.set_chat_panel_focus(ChatPanelFocus::Lobby);
-            }
-            MouseEventKind::ScrollUp if in_room => {
-                self.move_room_selection_with_focus(-1);
-            }
-            MouseEventKind::ScrollDown if in_room => {
-                self.move_room_selection_with_focus(1);
-            }
-            MouseEventKind::Down(MouseButton::Left) if in_room => {
-                self.set_chat_panel_focus(ChatPanelFocus::Lobby);
-                let row = mouse.row.saturating_sub(self.last_room_rect.y) as usize;
-                if self.participants.select_visible_row(row).is_some() {
-                    self.keep_selected_room_user_visible();
-                }
-            }
-            MouseEventKind::Down(MouseButton::Left) if in_chat_bar => {
-                self.set_chat_panel_focus(ChatPanelFocus::ChatLog);
-            }
-            MouseEventKind::ScrollUp if in_chat => {
-                self.set_chat_panel_focus(ChatPanelFocus::ChatLog);
-                self.scroll_chat_up(5);
-            }
-            MouseEventKind::ScrollDown if in_chat => {
-                self.set_chat_panel_focus(ChatPanelFocus::ChatLog);
-                self.chat.scroll_down(5);
-            }
-            MouseEventKind::Down(MouseButton::Left) if in_chat => {
-                self.set_chat_panel_focus(ChatPanelFocus::ChatLog);
-                match self.chat_line_at(mouse.row) {
-                    Some(line) => match line.kind {
-                        LineKind::Heading | LineKind::Ellipsis => {
-                            self.chat
-                                .select_header_containing(line.message, self.last_chat_width);
-                            self.chat.toggle_expand(line.message, self.last_chat_width);
-                            self.chat.clear_selection();
-                        }
-                        LineKind::Body => {
-                            self.chat.begin_selection((line.message, line.line));
-                        }
-                    },
-                    _ => self.chat.clear_selection(),
-                }
-            }
-            MouseEventKind::Drag(MouseButton::Left) if self.chat.is_selecting() => {
-                self.set_chat_panel_focus(ChatPanelFocus::ChatLog);
-                self.drag_chat_selection(mouse.row);
-            }
-            MouseEventKind::Up(MouseButton::Left) => self.chat.end_selection(),
-            _ => {}
-        }
-        Action::Continue
-    }
-
-    /// Extends the active selection toward `row`, auto-scrolling when the cursor
-    /// is dragged above the top or below the bottom of the chat area.
-    fn drag_chat_selection(&mut self, row: u16) {
-        let rect = self.last_chat_rect;
-        if row < rect.y {
-            self.scroll_chat_up(1);
-        } else if row >= rect.y.saturating_add(rect.h) {
-            self.chat.scroll_down(1);
-        }
-        let clamped = row.clamp(rect.y, rect.y.saturating_add(rect.h).saturating_sub(1));
-        if let Some(line) = self.chat_line_at(clamped)
-            && line.kind == LineKind::Body
-        {
-            self.chat.extend_selection((line.message, line.line));
-        }
-    }
-
-    /// Maps a screen `row` to the [`VisibleLine`] it renders, using the
-    /// top-anchored layout captured during the last render.
-    fn chat_line_at(&self, row: u16) -> Option<VisibleLine> {
-        let index = row.checked_sub(self.last_chat_rect.y)? as usize;
-        self.last_chat_lines.get(index).copied()
-    }
-
-    fn toggle_selected_log_collapse(&mut self) {
-        let width = self.last_chat_width;
-        if self.chat.ensure_selected_header(width).is_none() {
-            self.set_status("no messages");
-            return;
-        }
-        self.chat.clear_selection();
-        if !self.chat.toggle_selected_expand(width) {
-            self.set_status("selected log is not collapsible");
-        }
-        self.keep_selected_chat_header_visible();
-    }
-
-    fn scroll_chat_up(&mut self, rows: usize) {
-        self.chat
-            .scroll_up(rows, self.last_chat_width, self.last_chat_height);
-    }
-
-    fn copy_chat_selection(&mut self) {
-        let text = self
-            .chat
-            .selected_text()
-            .or_else(|| self.chat.selected_header_text(self.last_chat_width));
-        if let Some(text) = text {
-            self.pending_clipboard = Some(text);
-            self.set_transient_status("copied to clipboard");
-        }
-    }
-
-    pub(crate) fn select_chat_top(&mut self) {
-        if self.chat_focus == ChatPanelFocus::ChatLog {
-            self.chat.top(self.last_chat_width, self.last_chat_height);
-            self.chat.select_first_header();
-            self.chat.clear_selection();
-            self.keep_selected_chat_header_visible();
-        }
-    }
-
-    pub(crate) fn select_chat_bottom(&mut self) {
-        if self.chat_focus == ChatPanelFocus::ChatLog {
-            self.chat.bottom();
-            self.chat.select_last_header(self.last_chat_width);
-            self.chat.clear_selection();
-            self.keep_selected_chat_header_visible();
-        }
-    }
-
-    pub(crate) fn copy_chat_selection_if_focused(&mut self) {
-        if self.chat_focus == ChatPanelFocus::ChatLog {
-            self.copy_chat_selection();
-        }
-    }
-
-    pub(crate) fn toggle_chat_expand_if_focused(&mut self) {
-        if self.chat_focus == ChatPanelFocus::ChatLog {
-            self.toggle_selected_log_collapse();
-        }
-    }
-
-    pub(crate) fn take_pending_clipboard(&mut self) -> Option<String> {
-        self.pending_clipboard.take()
-    }
-
-    /// Inserts terminal-pasted text at the composer cursor.
-    pub(crate) fn insert_composer_paste(&mut self, text: String) {
-        let span = EditorSpan::empty_at(self.composer.cursor_offset());
-        self.composer.replace_range(span, &text);
     }
 
     pub(crate) fn delete_server(&mut self, alias: &str) {
@@ -1246,11 +1116,9 @@ impl App {
         self.config
             .user_audio
             .retain(|preference| preference.server_alias != alias);
-        if self.server_alias == alias {
+        if self.room.server_alias == alias {
             self.disconnect_network();
-            self.server_alias.clear();
-            self.user.clear();
-            self.room_name = "servers".to_string();
+            self.room.reset_for_server_list();
         }
         match self.config.save_runtime() {
             Ok(path) => {
@@ -1302,8 +1170,8 @@ impl App {
                     preference.server_alias = alias.clone();
                 }
             }
-            if self.server_alias == original_alias {
-                self.server_alias = alias.clone();
+            if self.room.server_alias == original_alias {
+                self.room.server_alias = alias.clone();
             }
         }
         match self.config.save_runtime() {
@@ -1312,7 +1180,7 @@ impl App {
                 self.rebuild_server_items();
                 if join_after_save {
                     if self.start_network(&alias) {
-                        self.replace_mode(Box::new(RoomMode));
+                        self.replace_mode(Box::new(RoomMode::default()));
                     }
                 } else {
                     self.pop_mode();
@@ -1323,25 +1191,25 @@ impl App {
         }
     }
 
-    pub(crate) fn cancel_open_audio_picker(&mut self) -> bool {
-        if self.audio_input_picker.open {
-            self.cancel_audio_input_picker();
+    pub(crate) fn cancel_open_audio_picker(&mut self, session: &mut SettingsSession) -> bool {
+        if session.input_picker.open {
+            self.cancel_audio_input_picker(session);
             true
-        } else if self.audio_output_picker.open {
-            self.cancel_audio_output_picker();
+        } else if session.output_picker.open {
+            self.cancel_audio_output_picker(session);
             true
         } else {
             false
         }
     }
 
-    fn audio_picker_open(&self) -> bool {
-        self.audio_input_picker.open || self.audio_output_picker.open
+    fn audio_picker_open(session: &SettingsSession) -> bool {
+        session.input_picker.open || session.output_picker.open
     }
 
     pub(crate) fn handle_open_settings_picker_mouse(
         &mut self,
-        focus: SettingsFocus,
+        session: &mut SettingsSession,
         mouse: MouseEvent,
     ) -> bool {
         let delta = match mouse.kind {
@@ -1349,13 +1217,13 @@ impl App {
             MouseEventKind::ScrollUp => -1,
             _ => return false,
         };
-        match focus {
-            SettingsFocus::CaptureDevice if self.audio_input_picker.open => {
-                self.audio_input_picker.move_selection(delta);
+        match session.form.focus() {
+            SettingsFocus::CaptureDevice if session.input_picker.open => {
+                session.input_picker.move_selection(delta);
                 true
             }
-            SettingsFocus::PlaybackDevice if self.audio_output_picker.open => {
-                self.audio_output_picker.move_selection(delta);
+            SettingsFocus::PlaybackDevice if session.output_picker.open => {
+                session.output_picker.move_selection(delta);
                 true
             }
             _ => false,
@@ -1364,45 +1232,41 @@ impl App {
 
     pub(crate) fn handle_open_settings_picker_key(
         &mut self,
-        focus: SettingsFocus,
+        session: &mut SettingsSession,
         key: KeyEvent,
     ) -> bool {
-        match focus {
-            SettingsFocus::CaptureDevice if self.audio_input_picker.open => {
-                if !self.audio_input_picker.searching {
+        match session.form.focus() {
+            SettingsFocus::CaptureDevice if session.input_picker.open => {
+                if !session.input_picker.searching {
                     match key.code {
                         KeyCode::Esc => {
-                            self.cancel_audio_input_picker();
+                            self.cancel_audio_input_picker(session);
                             return true;
                         }
                         KeyCode::Enter => {
-                            self.confirm_audio_input_picker();
+                            self.confirm_audio_input_picker(session);
                             return true;
                         }
                         _ => {}
                     }
                 }
-                handle_audio_picker_key(key, &mut self.audio_input_picker, &self.audio_input_items)
+                handle_audio_picker_key(key, &mut session.input_picker, &session.input_items)
             }
-            SettingsFocus::PlaybackDevice if self.audio_output_picker.open => {
-                if !self.audio_output_picker.searching {
+            SettingsFocus::PlaybackDevice if session.output_picker.open => {
+                if !session.output_picker.searching {
                     match key.code {
                         KeyCode::Esc => {
-                            self.cancel_audio_output_picker();
+                            self.cancel_audio_output_picker(session);
                             return true;
                         }
                         KeyCode::Enter => {
-                            self.confirm_audio_output_picker();
+                            self.confirm_audio_output_picker(session);
                             return true;
                         }
                         _ => {}
                     }
                 }
-                handle_audio_picker_key(
-                    key,
-                    &mut self.audio_output_picker,
-                    &self.audio_output_items,
-                )
+                handle_audio_picker_key(key, &mut session.output_picker, &session.output_items)
             }
             _ => false,
         }
@@ -1424,74 +1288,59 @@ impl App {
             PlaySoundboard7 => self.trigger_soundboard_slot(6),
             PlaySoundboard8 => self.trigger_soundboard_slot(7),
             PlaySoundboard9 => self.trigger_soundboard_slot(8),
-            ToggleKeyPreview => self.key_preview_expanded = !self.key_preview_expanded,
+            ToggleKeyPreview => {
+                self.chrome.key_preview.expanded = !self.chrome.key_preview.expanded
+            }
             _ => {}
         }
         Action::Continue
     }
 
     pub(crate) fn open_settings(&mut self) {
-        if self.settings_open {
-            return;
-        }
-        self.settings = SettingsDraft::from_audio(&self.config.audio);
-        self.settings
-            .set_form_bindings_from_config(self.config.ui.form_bindings);
-        self.settings.set_theme_from_config(self.config.ui.theme);
-        let form = FormState::with_order(
-            SettingsFocus::CaptureDevice,
-            self.config.ui.form_bindings,
-            SettingsFocus::ORDER,
-        );
-        self.settings_dirty = false;
-        self.settings_open = true;
         if self.allow_settings_preview_capture
-            && (self.input_devices.is_empty() || self.output_devices.is_empty())
+            && (self.audio_devices.input_devices.is_empty()
+                || self.audio_devices.output_devices.is_empty())
         {
             self.refresh_audio_devices();
         }
-        self.rebuild_audio_device_pickers();
         self.start_settings_preview_capture();
-        self.push_mode(Box::new(SettingsMode::new(form)));
+        self.push_mode(Box::new(SettingsMode::new(self)));
     }
 
-    pub(crate) fn close_settings(&mut self, form: &mut FormState<SettingsFocus>) {
-        self.commit_settings_form_text(form);
-        self.apply_active_capture_amplification(self.config.audio.max_amplification);
-        self.stop_settings_preview_capture();
-        self.audio_input_picker
-            .reset(&self.audio_input_items, self.settings.input_selection());
-        self.audio_output_picker
-            .reset(&self.audio_output_items, self.settings.output_selection());
-        self.settings_open = false;
+    pub(crate) fn close_settings(&mut self, session: &mut SettingsSession) {
+        self.commit_settings_form_text(session);
         self.pop_mode();
     }
 
-    pub(crate) fn move_settings_focus(
-        &mut self,
-        form: &mut FormState<SettingsFocus>,
-        delta: isize,
-    ) {
-        if self.audio_picker_open() {
-            self.move_active_audio_picker_selection(form.focus(), delta);
-            return;
-        }
-        let commit = form.move_focus(delta);
-        self.apply_settings_commit(form, commit);
+    pub(crate) fn finish_settings_session(&mut self, session: &mut SettingsSession) {
+        self.apply_active_capture_amplification(self.config.audio.max_amplification);
+        self.settings_preview_refresh_id = None;
+        self.stop_settings_preview_capture();
+        session
+            .input_picker
+            .reset(&session.input_items, session.draft.input_selection());
+        session
+            .output_picker
+            .reset(&session.output_items, session.draft.output_selection());
     }
 
-    pub(crate) fn adjust_settings_focus(
-        &mut self,
-        form: &mut FormState<SettingsFocus>,
-        delta: isize,
-    ) {
-        match form.focus() {
-            SettingsFocus::CaptureDevice if self.settings.input_raw() => {}
-            SettingsFocus::CaptureDevice if delta < 0 => self.cancel_audio_input_picker(),
-            SettingsFocus::CaptureDevice => self.activate_audio_input_picker(),
-            SettingsFocus::PlaybackDevice if self.settings.output_raw() => {}
-            SettingsFocus::PlaybackDevice if delta < 0 => self.cancel_audio_output_picker(),
-            SettingsFocus::PlaybackDevice => self.activate_audio_output_picker(),
+    pub(crate) fn move_settings_focus(&mut self, session: &mut SettingsSession, delta: isize) {
+        if Self::audio_picker_open(session) {
+            self.move_active_audio_picker_selection(session, delta);
+            return;
+        }
+        let commit = session.form.move_focus(delta);
+        self.apply_settings_commit(session, commit);
+    }
+
+    pub(crate) fn adjust_settings_focus(&mut self, session: &mut SettingsSession, delta: isize) {
+        match session.form.focus() {
+            SettingsFocus::CaptureDevice if session.draft.input_raw() => {}
+            SettingsFocus::CaptureDevice if delta < 0 => self.cancel_audio_input_picker(session),
+            SettingsFocus::CaptureDevice => self.activate_audio_input_picker(session),
+            SettingsFocus::PlaybackDevice if session.draft.output_raw() => {}
+            SettingsFocus::PlaybackDevice if delta < 0 => self.cancel_audio_output_picker(session),
+            SettingsFocus::PlaybackDevice => self.activate_audio_output_picker(session),
             SettingsFocus::RawCaptureDevice
             | SettingsFocus::RawPlaybackDevice
             | SettingsFocus::Bitrate
@@ -1505,8 +1354,8 @@ impl App {
             | SettingsFocus::TypingVadRelease
             | SettingsFocus::FormBindings
             | SettingsFocus::Theme => {
-                let mutation = self.settings.adjust(form.focus(), delta);
-                self.apply_settings_mutation(form, mutation);
+                let mutation = session.draft.adjust(session.form.focus(), delta);
+                self.apply_settings_mutation(session, mutation);
             }
             SettingsFocus::CaptureBuffer
             | SettingsFocus::PlaybackBuffer
@@ -1516,19 +1365,19 @@ impl App {
         }
     }
 
-    pub(crate) fn activate_settings_focus(&mut self, form: &mut FormState<SettingsFocus>) {
-        match form.focus() {
+    pub(crate) fn activate_settings_focus(&mut self, session: &mut SettingsSession) {
+        match session.form.focus() {
             SettingsFocus::Refresh => self.refresh_audio_devices(),
-            SettingsFocus::Save => self.save_settings(form),
-            SettingsFocus::Close => self.close_settings(form),
-            SettingsFocus::CaptureDevice if self.settings.input_raw() => {
-                self.move_settings_focus(form, 1)
+            SettingsFocus::Save => self.save_settings(session),
+            SettingsFocus::Close => self.close_settings(session),
+            SettingsFocus::CaptureDevice if session.draft.input_raw() => {
+                self.move_settings_focus(session, 1)
             }
-            SettingsFocus::CaptureDevice => self.activate_audio_input_picker(),
-            SettingsFocus::PlaybackDevice if self.settings.output_raw() => {
-                self.move_settings_focus(form, 1)
+            SettingsFocus::CaptureDevice => self.activate_audio_input_picker(session),
+            SettingsFocus::PlaybackDevice if session.draft.output_raw() => {
+                self.move_settings_focus(session, 1)
             }
-            SettingsFocus::PlaybackDevice => self.activate_audio_output_picker(),
+            SettingsFocus::PlaybackDevice => self.activate_audio_output_picker(session),
             SettingsFocus::Denoise
             | SettingsFocus::EchoCancellation
             | SettingsFocus::RawCaptureDevice
@@ -1542,52 +1391,52 @@ impl App {
             | SettingsFocus::TypingVadRelease
             | SettingsFocus::FormBindings
             | SettingsFocus::Theme => {
-                let mutation = self.settings.activate(form.focus());
-                self.apply_settings_mutation(form, mutation);
+                let mutation = session.draft.activate(session.form.focus());
+                self.apply_settings_mutation(session, mutation);
             }
             SettingsFocus::CaptureBuffer | SettingsFocus::PlaybackBuffer => {
-                self.move_settings_focus(form, 1);
+                self.move_settings_focus(session, 1);
             }
         }
     }
 
     fn apply_settings_mutation(
         &mut self,
-        form: &mut FormState<SettingsFocus>,
+        session: &mut SettingsSession,
         mutation: SettingsMutation,
     ) {
         match mutation {
             SettingsMutation::None => return,
-            SettingsMutation::Changed => self.apply_settings_form_bindings(form),
+            SettingsMutation::Changed => self.apply_settings_form_bindings(session),
             SettingsMutation::AmplificationChanged(_) => {}
         }
-        self.sync_settings_change();
+        self.sync_settings_change(session);
     }
 
     /// Syncs the settings draft into the live config and applies it to running
     /// audio. Cheap fields (amplification, echo cancellation) update in place.
     /// Slow fields (device, bitrate, denoise, buffer, latency) schedule a
     /// debounced stream restart. The on-disk file is only written by `Save`.
-    fn sync_settings_change(&mut self) {
-        self.config.ui.form_bindings = self.settings.form_bindings();
-        self.apply_theme(self.settings.theme());
+    fn sync_settings_change(&mut self, session: &mut SettingsSession) {
+        self.config.ui.form_bindings = session.draft.form_bindings();
+        self.apply_theme(session.draft.theme());
         // Never open a malformed ALSA string. Hold the audio config at its last
         // valid state until the device string is fixed, then the diff below
         // re-applies every pending change.
-        if let Some(reason) = self.settings.device_string_invalid() {
-            self.mark_settings_dirty();
+        if let Some(reason) = session.draft.device_string_invalid() {
+            self.mark_settings_dirty(session);
             self.set_status(format!("audio not applied: {reason}"));
             return;
         }
         let old = self.config.audio.clone();
-        self.config.audio = self.settings.to_audio();
+        self.config.audio = session.draft.to_audio();
         self.apply_echo_cancellation_setting();
         self.apply_active_capture_amplification(self.config.audio.max_amplification);
         let (capture, playback) = audio_restart_flags(&old, &self.config.audio);
         if capture || playback {
             self.schedule_audio_apply(capture, playback);
         }
-        self.mark_settings_dirty();
+        self.mark_settings_dirty(session);
     }
 
     /// Re-resolves the active theme and applies it to the live UI: the chat
@@ -1600,8 +1449,7 @@ impl App {
         }
         self.config.ui.theme = choice;
         self.theme = Theme::from_choice(choice);
-        self.chat.set_syntax(self.theme.syntax);
-        self.composer.set_theme(self.theme.editor_theme());
+        self.room.apply_theme(&self.theme);
     }
 
     fn schedule_audio_apply(&mut self, capture: bool, playback: bool) {
@@ -1646,6 +1494,7 @@ impl App {
         };
         let playback = self.playback.as_ref().map(|playback| playback.stats());
         let updates = self
+            .room
             .participants
             .entries
             .iter()
@@ -1669,12 +1518,8 @@ impl App {
             })
             .collect::<Vec<_>>();
         for (user_id, raw_active) in updates {
-            self.participants.update_talking_display(
-                user_id,
-                raw_active,
-                now,
-                LOBBY_TALKING_RELEASE,
-            );
+            self.room
+                .update_talking_display(user_id, raw_active, now, LOBBY_TALKING_RELEASE);
         }
     }
 
@@ -1725,7 +1570,7 @@ impl App {
             // until the restart fires. The `is_pending` guard keeps this from
             // re-running every tick while recovery is already scheduled.
             self.stop_audio();
-            self.stream_users.clear();
+            self.room.reset_for_disconnect();
             self.schedule_network_recovery(now, "network worker stopped");
         }
         if let Some(reason) = self.supervisor.network.take_due(now) {
@@ -1805,19 +1650,13 @@ impl App {
             return;
         };
         let snapshot = playback.stats();
-        let mut reason = None;
-        if snapshot.backend_stream_errors > self.supervisor.playback_watch.backend_stream_errors {
-            reason = Some(
-                snapshot
-                    .last_backend_error
-                    .clone()
-                    .unwrap_or_else(|| "playback stream error".to_string()),
-            );
-        }
+        let mut reason =
+            playback_backend_recovery_reason(&snapshot, &self.supervisor.playback_watch);
         if playback.worker_finished() {
             reason = Some("playback decoder worker exited".to_string());
         }
         self.supervisor.playback_watch.backend_stream_errors = snapshot.backend_stream_errors;
+        self.supervisor.playback_watch.backend_xruns = snapshot.backend_xruns;
 
         if let Some(reason) = reason {
             self.schedule_playback_recovery(now, reason);
@@ -1852,7 +1691,7 @@ impl App {
                 if let Some(network) = self.network.take() {
                     network.stop();
                 }
-                self.stream_users.clear();
+                self.room.reset_for_disconnect();
                 self.set_error(format!("network recovery exhausted: {reason}"));
             }
         }
@@ -1916,7 +1755,7 @@ impl App {
     }
 
     fn restart_network_worker(&mut self, reason: &str) {
-        let alias = self.server_alias.clone();
+        let alias = self.room.server_alias.clone();
         if alias.is_empty() {
             self.set_error(format!("network worker stopped: {reason}"));
             return;
@@ -1950,7 +1789,7 @@ impl App {
             self.supervisor.control_socket.reset();
             return;
         };
-        match local_control::ControlSocket::spawn(network.sender(), self.event_tx.clone()) {
+        match local_control::ControlSocket::spawn(network.sender(), self.events.sender()) {
             Ok(socket) => {
                 kvlog::info!(
                     "chatt local control socket recovered",
@@ -2034,257 +1873,158 @@ impl App {
 
     pub(crate) fn apply_settings_commit(
         &mut self,
-        form: &mut FormState<SettingsFocus>,
+        session: &mut SettingsSession,
         commit: Option<(SettingsFocus, String)>,
     ) {
         let Some((field, text)) = commit else {
             return;
         };
-        let mutation = self.settings.commit_field_text(field, text);
-        self.apply_settings_mutation(form, mutation);
+        let mutation = session.draft.commit_field_text(field, text);
+        self.apply_settings_mutation(session, mutation);
     }
 
-    fn commit_settings_form_text(&mut self, form: &mut FormState<SettingsFocus>) {
-        let commit = form.clear_text();
-        self.apply_settings_commit(form, commit);
+    fn commit_settings_form_text(&mut self, session: &mut SettingsSession) {
+        let commit = session.form.clear_text();
+        self.apply_settings_commit(session, commit);
     }
 
-    fn apply_settings_form_bindings(&mut self, form: &mut FormState<SettingsFocus>) {
-        let commit = form.set_bindings(self.settings.form_bindings());
-        self.apply_settings_commit(form, commit);
+    fn apply_settings_form_bindings(&mut self, session: &mut SettingsSession) {
+        let commit = session.form.set_bindings(session.draft.form_bindings());
+        self.apply_settings_commit(session, commit);
     }
 
-    pub(crate) fn move_settings_selection(
-        &mut self,
-        form: &mut FormState<SettingsFocus>,
-        delta: isize,
-    ) {
-        if self.audio_picker_open() {
-            self.move_active_audio_picker_selection(form.focus(), delta);
+    pub(crate) fn move_settings_selection(&mut self, session: &mut SettingsSession, delta: isize) {
+        if Self::audio_picker_open(session) {
+            self.move_active_audio_picker_selection(session, delta);
         } else {
-            self.move_settings_focus(form, delta);
+            self.move_settings_focus(session, delta);
         }
     }
 
-    fn move_active_audio_picker_selection(&mut self, focus: SettingsFocus, delta: isize) {
-        match focus {
-            SettingsFocus::CaptureDevice if self.audio_input_picker.open => {
-                self.audio_input_picker.move_selection(delta);
+    fn move_active_audio_picker_selection(&mut self, session: &mut SettingsSession, delta: isize) {
+        match session.form.focus() {
+            SettingsFocus::CaptureDevice if session.input_picker.open => {
+                session.input_picker.move_selection(delta);
             }
-            SettingsFocus::PlaybackDevice if self.audio_output_picker.open => {
-                self.audio_output_picker.move_selection(delta);
+            SettingsFocus::PlaybackDevice if session.output_picker.open => {
+                session.output_picker.move_selection(delta);
             }
             _ => {}
         }
     }
 
-    fn activate_audio_input_picker(&mut self) {
-        if self.audio_input_picker.open {
-            self.confirm_audio_input_picker();
+    fn activate_audio_input_picker(&mut self, session: &mut SettingsSession) {
+        if session.input_picker.open {
+            self.confirm_audio_input_picker(session);
         } else {
-            if self.input_devices.is_empty() {
+            if self.audio_devices.input_devices.is_empty() {
                 self.refresh_audio_devices();
             }
-            self.audio_input_picker
-                .open(&self.audio_input_items, self.settings.input_selection());
+            session
+                .input_picker
+                .open(&session.input_items, session.draft.input_selection());
         }
     }
 
-    fn activate_audio_output_picker(&mut self) {
-        if self.audio_output_picker.open {
-            self.confirm_audio_output_picker();
+    fn activate_audio_output_picker(&mut self, session: &mut SettingsSession) {
+        if session.output_picker.open {
+            self.confirm_audio_output_picker(session);
         } else {
-            if self.output_devices.is_empty() {
+            if self.audio_devices.output_devices.is_empty() {
                 self.refresh_audio_devices();
             }
-            self.audio_output_picker
-                .open(&self.audio_output_items, self.settings.output_selection());
+            session
+                .output_picker
+                .open(&session.output_items, session.draft.output_selection());
         }
     }
 
-    fn confirm_audio_input_picker(&mut self) {
-        let Some(next) = self.audio_input_picker.confirm(&self.audio_input_items) else {
+    fn confirm_audio_input_picker(&mut self, session: &mut SettingsSession) {
+        let Some(next) = session.input_picker.confirm(&session.input_items) else {
             return;
         };
-        if self.settings.set_input_selection(next) {
-            self.mark_settings_dirty();
+        if session.draft.set_input_selection(next) {
+            self.mark_settings_dirty(session);
         }
     }
 
-    fn cancel_audio_input_picker(&mut self) {
-        if let Some(selection) = self.audio_input_picker.cancel(&self.audio_input_items) {
-            self.settings.restore_input_selection(selection);
+    fn cancel_audio_input_picker(&mut self, session: &mut SettingsSession) {
+        if let Some(selection) = session.input_picker.cancel(&session.input_items) {
+            session.draft.restore_input_selection(selection);
         }
     }
 
-    fn confirm_audio_output_picker(&mut self) {
-        let Some(next) = self.audio_output_picker.confirm(&self.audio_output_items) else {
+    fn confirm_audio_output_picker(&mut self, session: &mut SettingsSession) {
+        let Some(next) = session.output_picker.confirm(&session.output_items) else {
             return;
         };
-        if self.settings.set_output_selection(next) {
-            self.mark_settings_dirty();
+        if session.draft.set_output_selection(next) {
+            self.mark_settings_dirty(session);
         }
     }
 
-    fn cancel_audio_output_picker(&mut self) {
-        if let Some(selection) = self.audio_output_picker.cancel(&self.audio_output_items) {
-            self.settings.restore_output_selection(selection);
+    fn cancel_audio_output_picker(&mut self, session: &mut SettingsSession) {
+        if let Some(selection) = session.output_picker.cancel(&session.output_items) {
+            session.draft.restore_output_selection(selection);
         }
     }
 
     pub(crate) fn activate_settings_picker_item(
         &mut self,
+        session: &mut SettingsSession,
         field: SettingsFocus,
         item_index: usize,
     ) {
         match field {
             SettingsFocus::CaptureDevice => {
-                if self
-                    .audio_input_picker
-                    .selector
-                    .select_item_index(item_index)
-                {
-                    self.confirm_audio_input_picker();
+                if session.input_picker.selector.select_item_index(item_index) {
+                    self.confirm_audio_input_picker(session);
                 }
             }
             SettingsFocus::PlaybackDevice => {
-                if self
-                    .audio_output_picker
-                    .selector
-                    .select_item_index(item_index)
-                {
-                    self.confirm_audio_output_picker();
+                if session.output_picker.selector.select_item_index(item_index) {
+                    self.confirm_audio_output_picker(session);
                 }
             }
             _ => {}
         }
     }
 
-    fn rebuild_audio_device_pickers(&mut self) {
-        self.audio_input_items = settings::audio_input_items(&self.input_devices);
-        if self.audio_input_picker.open {
-            self.audio_input_picker
-                .refresh_items(&self.audio_input_items, self.settings.input_selection());
-        } else {
-            self.audio_input_picker
-                .reset(&self.audio_input_items, self.settings.input_selection());
-        }
-        self.audio_output_items = settings::audio_output_items(&self.output_devices);
-        if self.audio_output_picker.open {
-            self.audio_output_picker
-                .refresh_items(&self.audio_output_items, self.settings.output_selection());
-        } else {
-            self.audio_output_picker
-                .reset(&self.audio_output_items, self.settings.output_selection());
-        }
-    }
-
-    pub(crate) fn mark_settings_dirty(&mut self) {
-        self.settings_dirty = true;
+    pub(crate) fn mark_settings_dirty(&mut self, session: &mut SettingsSession) {
+        session.dirty = true;
         self.set_status("settings draft changed; save config when ready");
     }
 
-    pub(crate) fn scroll_focused_panel(&mut self, direction: isize, _rows: usize) {
-        match self.chat_focus {
-            ChatPanelFocus::ChatLog => self.move_chat_log_selection(direction),
-            ChatPanelFocus::Lobby => self.move_room_selection_with_focus(direction),
-            ChatPanelFocus::Compose => {}
-        }
-    }
-
-    pub(crate) fn scroll_chat_log_if_focused(&mut self, rows: isize) {
-        if self.chat_focus != ChatPanelFocus::ChatLog {
-            return;
-        }
-        if rows < 0 {
-            self.scroll_chat_up(rows.unsigned_abs());
-        } else {
-            self.chat.scroll_down(rows as usize);
-        }
-    }
-
-    pub(crate) fn chat_half_page_rows(&self) -> usize {
-        (self.last_chat_height as usize / 2).max(1)
-    }
-
-    fn move_chat_log_selection(&mut self, delta: isize) {
-        self.set_chat_panel_focus(ChatPanelFocus::ChatLog);
-        self.chat.clear_selection();
-        if self
-            .chat
-            .move_selected_header(delta, self.last_chat_width)
-            .is_none()
-        {
-            self.set_status("no messages");
-            return;
-        }
-        self.keep_selected_chat_header_visible();
-    }
-
-    fn keep_selected_chat_header_visible(&mut self) {
-        self.chat
-            .keep_selected_header_visible(self.last_chat_width, self.last_chat_height);
-    }
-
-    pub(crate) fn move_room_selection_with_focus(&mut self, delta: isize) {
-        self.set_chat_panel_focus(ChatPanelFocus::Lobby);
-        self.move_room_selection(delta);
-    }
-
-    fn move_room_selection(&mut self, delta: isize) {
-        if self.participants.move_selection(delta).is_none() {
-            self.set_status("no users in the current room yet");
-            return;
-        }
-        self.keep_selected_room_user_visible();
-        self.chat_focus = ChatPanelFocus::Lobby;
-    }
-
-    fn keep_selected_room_user_visible(&mut self) {
-        self.participants
-            .keep_selected_visible(self.config.ui.room_height as usize);
-    }
-
-    fn selected_room_user(&self) -> Option<(UserId, String)> {
-        self.participants
-            .selected()
-            .map(|entry| (entry.user_id, entry.display_name().to_string()))
-    }
-
-    fn selected_remote_room_user(&mut self) -> Option<(UserId, String)> {
-        let Some((user_id, name)) = self.selected_room_user() else {
-            self.set_status("select a user first");
-            return None;
-        };
-        if Some(user_id) == self.user_id {
-            self.set_status("select another user for local playback controls");
-            return None;
-        }
-        Some((user_id, name))
-    }
-
     pub(crate) fn open_selected_user_volume(&mut self) {
-        let Some((user_id, name)) = self.selected_remote_room_user() else {
-            return;
+        let selected = match self.room.selected_remote_user(self.user_id) {
+            Ok(user) => user,
+            Err(error) => {
+                self.set_status(error.status_text());
+                return;
+            }
         };
-        let value_db = self.config.user_volume_db(&self.server_alias, user_id.0);
-        self.volume_preview = Some((user_id, value_db));
+        let user_id = selected.user_id;
+        let name = selected.display_name;
+        let value_db = self
+            .config
+            .user_volume_db(&self.room.server_alias, user_id.0);
+        self.room.begin_volume_preview(user_id, value_db);
         let dialog = UserVolumeDialog::new(user_id, name.clone(), value_db, &self.theme);
         self.push_mode(Box::new(DialogMode::new(dialog)));
         self.set_status(format!("adjusting local volume for {name}"));
     }
 
     pub(crate) fn toggle_selected_user_mute(&mut self) {
-        let Some((user_id, name)) = self.selected_remote_room_user() else {
-            return;
+        let selected = match self.room.selected_remote_user(self.user_id) {
+            Ok(user) => user,
+            Err(error) => {
+                self.set_status(error.status_text());
+                return;
+            }
         };
-        let muted = if self.muted_users.contains(&user_id) {
-            self.muted_users.remove(&user_id);
-            false
-        } else {
-            self.muted_users.insert(user_id);
-            true
-        };
+        let user_id = selected.user_id;
+        let name = selected.display_name;
+        let muted = self.room.toggle_user_mute(user_id);
         self.apply_user_audio_control(user_id);
         self.set_status(format!(
             "{} {name} locally",
@@ -2304,7 +2044,7 @@ impl App {
         match event {
             UserVolumeEvent::Consumed => {}
             UserVolumeEvent::Preview { user_id, value_db } => {
-                self.volume_preview = Some((user_id, value_db));
+                self.room.begin_volume_preview(user_id, value_db);
                 self.apply_user_audio_control_with_volume(user_id, value_db);
             }
             UserVolumeEvent::Invalid(error) => self.set_error(error),
@@ -2314,9 +2054,9 @@ impl App {
                 original_db,
             } => {
                 self.config
-                    .set_user_volume_db(&self.server_alias, user_id.0, original_db);
+                    .set_user_volume_db(&self.room.server_alias, user_id.0, original_db);
                 self.apply_user_audio_control_with_volume(user_id, original_db);
-                self.volume_preview = None;
+                self.room.clear_volume_preview();
                 self.set_status(format!("canceled local volume for {user_name}"));
                 return true;
             }
@@ -2326,12 +2066,12 @@ impl App {
                 value_db,
             } => {
                 self.config
-                    .set_user_volume_db(&self.server_alias, user_id.0, value_db);
+                    .set_user_volume_db(&self.room.server_alias, user_id.0, value_db);
                 self.apply_user_audio_control_with_volume(user_id, value_db);
                 match self.config.save_runtime() {
                     Ok(path) => {
                         self.config.config_path = Some(path.clone());
-                        self.volume_preview = None;
+                        self.room.clear_volume_preview();
                         self.set_status(format!(
                             "saved local volume {}dB for {} to {}",
                             format_signed_db(value_db),
@@ -2350,37 +2090,13 @@ impl App {
         false
     }
 
-    pub(crate) fn effective_user_volume_db(&self, user_id: UserId) -> f32 {
-        if let Some((preview_user, value_db)) = self.volume_preview
-            && preview_user == user_id
-        {
-            return value_db;
-        }
-        self.config.user_volume_db(&self.server_alias, user_id.0)
-    }
-
-    fn user_playback_control_with_volume(
-        &self,
-        user_id: UserId,
-        volume_db: f32,
-    ) -> PlaybackStreamControl {
-        PlaybackStreamControl {
-            muted: self.muted_users.contains(&user_id),
-            volume_db,
-        }
-    }
-
-    fn user_playback_control(&self, user_id: UserId) -> PlaybackStreamControl {
-        self.user_playback_control_with_volume(user_id, self.effective_user_volume_db(user_id))
-    }
-
     fn apply_user_audio_control(&self, user_id: UserId) {
-        let control = self.user_playback_control(user_id);
+        let control = self.room.playback_control_for(&self.config, user_id);
         self.apply_user_audio_control_inner(user_id, control);
     }
 
     fn apply_user_audio_control_with_volume(&self, user_id: UserId, volume_db: f32) {
-        let control = self.user_playback_control_with_volume(user_id, volume_db);
+        let control = self.room.playback_control_for_volume(user_id, volume_db);
         self.apply_user_audio_control_inner(user_id, control);
     }
 
@@ -2388,21 +2104,13 @@ impl App {
         let Some(playback) = &self.playback else {
             return;
         };
-        for stream_id in self
-            .stream_users
-            .iter()
-            .filter_map(|(stream_id, stream_user)| (*stream_user == user_id).then_some(*stream_id))
-        {
+        for stream_id in self.room.stream_ids_for_user(user_id) {
             playback.set_stream_control(stream_id, control);
         }
     }
 
     fn apply_all_user_audio_controls(&self) {
-        let users = self
-            .stream_users
-            .values()
-            .copied()
-            .collect::<HashSet<UserId>>();
+        let users = self.room.users_with_streams().collect::<HashSet<UserId>>();
         for user_id in users {
             self.apply_user_audio_control(user_id);
         }
@@ -2413,21 +2121,20 @@ impl App {
             .set_enabled(self.config.audio.echo_cancellation);
     }
 
-    pub(crate) fn save_settings(&mut self, form: &mut FormState<SettingsFocus>) {
+    pub(crate) fn save_settings(&mut self, session: &mut SettingsSession) {
         // Edits already applied live; this captures any uncommitted buffer field
         // then persists the live config to disk.
-        self.commit_settings_form_text(form);
-        self.sync_settings_change();
-        if let Some(reason) = self.settings.device_string_invalid() {
+        self.commit_settings_form_text(session);
+        self.sync_settings_change(session);
+        if let Some(reason) = session.draft.device_string_invalid() {
             self.set_error(format!("not saved: {reason}"));
             return;
         }
         match self.config.save_runtime() {
             Ok(path) => {
                 self.config.config_path = Some(path.clone());
-                self.settings_dirty = false;
-                self.chat
-                    .set_max_messages(self.config.ui.max_messages as usize);
+                session.dirty = false;
+                self.room.set_max_messages(self.config.ui.max_messages);
                 self.set_status(format!("settings saved to {}", path.display()));
             }
             Err(error) => self.set_error(error),
@@ -2435,7 +2142,22 @@ impl App {
     }
 
     pub(crate) fn refresh_audio_devices(&mut self) {
-        if self.audio_device_refresh_in_flight {
+        self.refresh_audio_devices_with(self.input_buffer_request(), self.output_buffer_request());
+    }
+
+    pub(crate) fn refresh_audio_devices_for_settings(&mut self, session: &SettingsSession) {
+        self.refresh_audio_devices_with(
+            session.draft.input_buffer_request(),
+            session.draft.output_buffer_request(),
+        );
+    }
+
+    fn refresh_audio_devices_with(
+        &mut self,
+        input_buffer_request: BufferRequest,
+        output_buffer_request: BufferRequest,
+    ) {
+        if self.audio_devices.refresh_in_flight {
             self.set_status("refreshing audio devices");
             return;
         }
@@ -2446,12 +2168,13 @@ impl App {
             self.stop_mic_capture();
         }
 
-        let id = self.next_audio_device_refresh_id;
-        self.next_audio_device_refresh_id = self.next_audio_device_refresh_id.saturating_add(1);
-        self.audio_device_refresh_in_flight = true;
-        let input_buffer_request = self.settings.input_buffer_request();
-        let output_buffer_request = self.settings.output_buffer_request();
-        let tx = self.event_tx.clone();
+        let id = self.audio_devices.next_refresh_id;
+        self.audio_devices.next_refresh_id = self.audio_devices.next_refresh_id.saturating_add(1);
+        self.audio_devices.refresh_in_flight = true;
+        if restart_preview {
+            self.settings_preview_refresh_id = Some(id);
+        }
+        let tx = self.events.sender();
         kvlog::info!(
             "audio device refresh started",
             id,
@@ -2481,14 +2204,9 @@ impl App {
     }
 
     pub(crate) fn submit_input(&mut self) {
-        let text = self.composer.text();
-        let input = text.trim();
-        if input.is_empty() {
+        let Some(input) = self.room.submit_composer() else {
             return;
-        }
-        let input = input.to_string();
-        self.composer.clear();
-        self.enter_compose_insert_mode();
+        };
         match input.as_str() {
             "/quit" => self.set_status("use Ctrl-C to quit"),
             "/mute" => self.set_mute(true),
@@ -2498,7 +2216,7 @@ impl App {
             "/muted" => self.show_mute_status(),
             "/deafened" => self.show_deafen_status(),
             "/audio" => self.show_audio_status(),
-            "/clear" => self.chat.clear(),
+            "/clear" => self.room.clear_chat(),
             "/config" | "/settings" => self.open_settings(),
             "/servers" if self.network.is_some() => self.pop_mode(),
             "/servers" => self.open_server_select(),
@@ -2588,7 +2306,7 @@ impl App {
     fn publish_voice_status(&mut self) {
         let status = self.local_voice_status();
         if let Some(user_id) = self.user_id {
-            self.participants.set_voice_status(user_id, status);
+            self.room.voice_status_changed(user_id, status);
         }
         self.send_network_command(NetworkCommand::SetVoiceStatus(status), false);
     }
@@ -2622,33 +2340,28 @@ impl App {
             self.voice_packets_received,
             self.voice_bytes_received,
         );
-        self.chat.push_notice("audio", diagnostics.notice_body());
-        self.chat.bottom();
+        self.room.push_notice("audio", diagnostics.notice_body());
         self.set_status(diagnostics.status_summary());
     }
 
     fn show_users(&mut self) {
-        if self.participants.entries.is_empty() {
+        let Some(users) = self.room.participant_names() else {
             self.set_status("no users in the current room yet");
-        } else {
-            let users = self
-                .participants
-                .entries
-                .iter()
-                .map(|entry| entry.display_name())
-                .collect::<Vec<_>>()
-                .join(", ");
-            self.set_status(format!("users: {users}"));
-        }
+            return;
+        };
+        self.set_status(format!("users: {users}"));
     }
 
     fn show_current_user(&mut self) {
         self.set_status(match self.user_id {
             Some(user_id) => format!(
                 "signed in as {} on {} (user {})",
-                self.user, self.server_alias, user_id.0
+                self.room.local_user_name, self.room.server_alias, user_id.0
             ),
-            None => format!("connecting as {} on {}", self.user, self.server_alias),
+            None => format!(
+                "connecting as {} on {}",
+                self.room.local_user_name, self.room.server_alias
+            ),
         });
     }
 
@@ -2670,14 +2383,13 @@ impl App {
             .map(|(index, clip)| format!("{}:{}", index + 1, clip.name))
             .collect::<Vec<_>>()
             .join(" ");
-        self.chat.push_notice(
+        self.room.push_notice(
             "soundboard",
-            format!(
+            &format!(
                 "clips {clips}; loss {}; trigger with /sound N or bound keys",
                 self.config.soundboard.loss
             ),
         );
-        self.chat.bottom();
         self.set_status("soundboard clips listed");
     }
 
@@ -2717,7 +2429,9 @@ impl App {
             self.set_error("undeafen before using soundboard");
             return;
         }
-        if !self.voice_tx_enabled.load(Ordering::Relaxed) || !self.local_voice_stream_ready() {
+        if !self.voice_tx_enabled.load(Ordering::Relaxed)
+            || !self.room.local_voice_stream_ready(self.user_id)
+        {
             self.set_error("soundboard voice stream is not ready yet");
             return;
         }
@@ -2743,7 +2457,7 @@ impl App {
             return;
         };
         let network_tx = network.sender();
-        let events = self.event_tx.clone();
+        let events = self.events.sender();
         let send_failed = Arc::new(AtomicBool::new(false));
         let busy = Arc::clone(&self.soundboard_busy);
         let source_config = LiveAudioFileSourceConfig {
@@ -2799,15 +2513,6 @@ impl App {
             .unwrap_or(path)
     }
 
-    fn local_voice_stream_ready(&self) -> bool {
-        let Some(user_id) = self.user_id else {
-            return false;
-        };
-        self.stream_users
-            .values()
-            .any(|stream_user| *stream_user == user_id)
-    }
-
     fn live_capture_config(&self, input_device_id: Option<String>) -> LiveCaptureConfig {
         LiveCaptureConfig {
             input_device_id,
@@ -2824,7 +2529,7 @@ impl App {
 
     fn capture_packet_handler(&self) -> impl FnMut(LocalVoiceFrame) + Send + 'static {
         let tx = self.network.as_ref().map(|network| network.sender());
-        let event_tx = self.event_tx.clone();
+        let event_tx = self.events.sender();
         let send_failed = Arc::new(AtomicBool::new(false));
         let mic_muted = Arc::clone(&self.mic_muted);
         let deafened = Arc::clone(&self.deafened);
@@ -2853,9 +2558,9 @@ impl App {
             return Ok(());
         }
         if let Some(id) = self.config.audio.input_device_id.as_deref() {
-            if !self.input_devices.is_empty() {
-                if let Some(item) = self
-                    .audio_input_items
+            if !self.audio_devices.input_devices.is_empty() {
+                let input_items = settings::audio_input_items(&self.audio_devices.input_devices);
+                if let Some(item) = input_items
                     .iter()
                     .find(|item| item.matches_selection(Some(id)))
                 {
@@ -2988,7 +2693,7 @@ impl App {
             return;
         };
         let network_tx = network.sender();
-        let event_tx = self.event_tx.clone();
+        let event_tx = self.events.sender();
         let send_failed = Arc::new(AtomicBool::new(false));
         thread::Builder::new()
             .name("chatt-fb-router".to_string())
@@ -3090,9 +2795,8 @@ impl App {
     }
 
     fn stop_audio(&mut self) {
-        let restart_settings_preview = self.settings_open
-            && self.allow_settings_preview_capture
-            && !self.deafened.load(Ordering::Relaxed);
+        let restart_settings_preview =
+            self.settings_preview_capture && !self.deafened.load(Ordering::Relaxed);
         self.voice_tx_enabled.store(false, Ordering::Relaxed);
         self.stop_mic_capture();
         self.set_network_playback_sink(None);
@@ -3128,48 +2832,20 @@ impl App {
     }
 
     pub(crate) fn set_status(&mut self, status: impl Into<String>) {
-        self.status = status.into();
-        self.status_kind = StatusKind::Info;
-        self.status_expires_at = None;
+        self.status.set(status);
     }
 
-    fn set_transient_status(&mut self, status: impl Into<String>) {
-        self.set_status(status);
-        self.status_expires_at = Some(Instant::now() + TRANSIENT_STATUS_LIFETIME);
+    pub(crate) fn set_transient_status(&mut self, status: impl Into<String>) {
+        self.status
+            .set_transient(status, Instant::now() + TRANSIENT_STATUS_LIFETIME);
     }
 
     pub(crate) fn set_error(&mut self, status: impl Into<String>) {
-        self.status = status.into();
-        self.status_kind = StatusKind::Error;
-        self.status_expires_at = None;
+        self.status.set_error(status);
     }
 
     fn expire_status(&mut self, now: Instant) {
-        if self
-            .status_expires_at
-            .is_some_and(|expires_at| now >= expires_at)
-        {
-            self.status.clear();
-            self.status_expires_at = None;
-        }
-    }
-
-    pub(crate) fn enter_compose_insert_mode(&mut self) {
-        self.composer.enter_insert_mode();
-        self.set_chat_panel_focus(ChatPanelFocus::Compose);
-    }
-
-    pub(crate) fn move_chat_panel_focus(&mut self, delta: isize) {
-        self.set_chat_panel_focus(self.chat_focus.moved(delta));
-    }
-
-    pub(crate) fn set_chat_panel_focus(&mut self, focus: ChatPanelFocus) {
-        self.chat_focus = focus;
-        if focus == ChatPanelFocus::Lobby {
-            self.keep_selected_room_user_visible();
-        } else if focus == ChatPanelFocus::ChatLog {
-            self.chat.ensure_selected_header(self.last_chat_width);
-        }
+        self.status.expire(now);
     }
 }
 
@@ -3298,6 +2974,7 @@ fn auth_failure_status(detail: &str) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{settings::SettingsDraft, tui::form::FormState};
     use extui::{Buffer, event::KeyModifiers};
     use extui_editor::Mode as EditorMode;
     use rpc::control::ParticipantInfo;
@@ -3306,55 +2983,58 @@ mod tests {
         App::new(Config::default(), None).expect("test app")
     }
 
-    fn render_room(app: &mut App, buffer: &mut Buffer) {
-        RoomMode.render(app, buffer, 0);
+    fn render_room(app: &mut App, room: &mut RoomMode, buffer: &mut Buffer) {
+        room.render(app, buffer, 0);
+    }
+
+    fn participant(user_id: UserId, display_name: &str) -> ParticipantInfo {
+        ParticipantInfo {
+            user_id,
+            display_name: display_name.to_string(),
+            identifier: display_name.to_string(),
+            in_call: true,
+            voice_status: ParticipantVoiceStatus::default(),
+        }
     }
 
     /// Drives an [`App`] through a real mode stack so tests can exercise mode
     /// transitions (push/pop of overlays) the same way the runtime loop does.
     struct Harness {
         app: App,
-        stack: Vec<Box<dyn AppMode>>,
+        stack: crate::tui::mode_stack::ModeStack,
     }
 
     impl Harness {
         fn new(mut app: App) -> Self {
-            let base: Box<dyn AppMode> = if app.server_alias.is_empty() {
+            let base: Box<dyn AppMode> = if app.room.server_alias.is_empty() {
                 app.base_mode()
             } else {
-                Box::new(RoomMode)
+                Box::new(RoomMode::default())
             };
-            let mut stack: Vec<Box<dyn AppMode>> = vec![base];
-            stack.last_mut().unwrap().init(&mut app);
+            let stack = crate::tui::mode_stack::ModeStack::new(base, &mut app);
             Self { app, stack }
         }
 
         fn apply(&mut self) {
-            crate::tui::mode::apply_mode_transition(&mut self.app, &mut self.stack);
+            self.stack.apply_pending(&mut self.app);
         }
 
         fn key(&mut self, key: KeyEvent) -> Action {
-            let action = self
-                .stack
-                .last_mut()
-                .unwrap()
-                .process_input(&mut self.app, key);
+            let action = self.stack.active_mut().process_input(&mut self.app, key);
             self.apply();
             action
         }
 
         fn overlay_active(&self) -> bool {
-            self.stack
-                .last()
-                .map(|mode| mode.is_overlay())
-                .unwrap_or(false)
+            self.stack.overlay_active(&self.app)
         }
 
         fn top_theme_mode(&self) -> crate::theme::UiMode {
             self.stack
-                .last()
-                .expect("mode stack is non-empty")
-                .theme_mode(&self.app)
+                .top_presentation(&self.app)
+                .chrome
+                .expect("base mode has chrome")
+                .theme_mode
         }
     }
 
@@ -3472,7 +3152,7 @@ mod tests {
             app.pending_network_commands.front(),
             Some(NetworkCommand::SendChat(body)) if body == "hello"
         ));
-        assert_eq!(app.status_kind, StatusKind::Error);
+        assert_eq!(app.status.kind(), StatusKind::Error);
     }
 
     #[test]
@@ -3498,13 +3178,11 @@ mod tests {
         let (tx, rx) = mpsc::channel();
         app.network = Some(NetworkClient::from_parts_for_test(tx));
         app.user_id = Some(UserId(1));
-        app.participants.replace_room(vec![ParticipantInfo {
-            user_id: UserId(1),
-            display_name: "alice".to_string(),
-            identifier: "alice".to_string(),
-            in_call: true,
-            voice_status: ParticipantVoiceStatus::default(),
-        }]);
+        app.room.joined(
+            vec![participant(UserId(1), "alice")],
+            Vec::new(),
+            app.user_id,
+        );
 
         app.set_mute(true);
 
@@ -3519,7 +3197,6 @@ mod tests {
                 deafened: false,
             }
         );
-        assert!(app.participants.entries[0].voice_status.muted);
 
         app.set_deafen(true);
 
@@ -3537,7 +3214,6 @@ mod tests {
                 deafened: true,
             }
         );
-        assert!(app.participants.entries[0].voice_status.deafened);
     }
 
     #[test]
@@ -3599,8 +3275,8 @@ mod tests {
             app.config.ui.form_bindings,
             SettingsFocus::ORDER,
         );
-        let mut mode = SettingsMode::new(form);
-        app.audio_input_items = ["System default", "USB Mic", "Line In"]
+        let mut mode = SettingsMode::with_form_for_test(form, &app);
+        mode.session_mut().input_items = ["System default", "USB Mic", "Line In"]
             .into_iter()
             .enumerate()
             .map(|(index, name)| settings::AudioDeviceItem {
@@ -3618,11 +3294,18 @@ mod tests {
                 default_source: "test",
             })
             .collect();
-        app.audio_input_picker
-            .open(&app.audio_input_items, app.settings.input_selection());
+        let session = mode.session_mut();
+        let input_selection = session.draft.input_selection().map(ToOwned::to_owned);
+        let input_items = session.input_items.clone();
+        session
+            .input_picker
+            .open(&input_items, input_selection.as_deref());
 
         assert_eq!(
-            app.audio_input_picker.selector.current_item_index(),
+            mode.session_mut()
+                .input_picker
+                .selector
+                .current_item_index(),
             Some(0)
         );
 
@@ -3637,7 +3320,10 @@ mod tests {
         );
 
         assert_eq!(
-            app.audio_input_picker.selector.current_item_index(),
+            mode.session_mut()
+                .input_picker
+                .selector
+                .current_item_index(),
             Some(1)
         );
     }
@@ -3655,14 +3341,15 @@ mod tests {
 
         assert_eq!(h.stack.len(), 1);
         assert_eq!(h.top_theme_mode(), crate::theme::UiMode::ServerSelect);
-        assert!(!h.app.settings_open);
+        assert!(!h.app.settings_preview_capture);
+        assert_eq!(h.app.settings_preview_refresh_id, None);
     }
 
     #[test]
     fn settings_detour_preserves_composer_draft() {
         let mut app = test_app();
-        app.server_alias = "local".to_string();
-        app.composer.set_lines("unsent draft");
+        app.room.server_alias = "local".to_string();
+        app.room.composer.set_lines("unsent draft");
         let mut h = Harness::new(app);
 
         h.app.open_settings();
@@ -3671,32 +3358,23 @@ mod tests {
 
         assert_eq!(h.stack.len(), 1);
         assert_eq!(h.top_theme_mode(), crate::theme::UiMode::Compose);
-        assert_eq!(h.app.composer.text(), "unsent draft");
+        assert_eq!(h.app.room.composer.text(), "unsent draft");
     }
 
     #[test]
     fn volume_dialog_pushes_and_restores_focus() {
         let mut app = test_app();
-        app.server_alias = "local".to_string();
+        app.room.server_alias = "local".to_string();
         app.user_id = Some(UserId(1));
-        app.set_chat_panel_focus(ChatPanelFocus::ChatLog);
-        app.participants.replace_room(vec![
-            ParticipantInfo {
-                user_id: UserId(1),
-                display_name: "alice".to_string(),
-                identifier: "alice".to_string(),
-                in_call: true,
-                voice_status: ParticipantVoiceStatus::default(),
-            },
-            ParticipantInfo {
-                user_id: UserId(2),
-                display_name: "bob".to_string(),
-                identifier: "bob".to_string(),
-                in_call: true,
-                voice_status: ParticipantVoiceStatus::default(),
-            },
-        ]);
-        app.move_room_selection(1);
+        app.room.joined(
+            vec![
+                participant(UserId(1), "alice"),
+                participant(UserId(2), "bob"),
+            ],
+            Vec::new(),
+            app.user_id,
+        );
+        app.room.move_participant_selection(1);
 
         let mut h = Harness::new(app);
         h.app.open_selected_user_volume();
@@ -3704,146 +3382,68 @@ mod tests {
 
         assert_eq!(h.stack.len(), 2);
         assert!(h.overlay_active());
-        assert_eq!(h.app.volume_preview.map(|(user, _)| user), Some(UserId(2)));
+        assert_eq!(
+            h.app.room.preview_volume_for_test().map(|(user, _)| user),
+            Some(UserId(2))
+        );
 
         h.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::empty()));
 
         assert_eq!(h.stack.len(), 1);
         assert!(!h.overlay_active());
-        assert_eq!(h.app.volume_preview, None);
-    }
-
-    #[test]
-    fn escape_leaves_compose_focused_in_vim_normal_mode() {
-        let mut app = test_app();
-        app.set_chat_panel_focus(ChatPanelFocus::Compose);
-
-        assert!(matches!(
-            app.process_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::empty())),
-            Action::Continue
-        ));
-        assert!(matches!(
-            app.process_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::empty())),
-            Action::Continue
-        ));
-
-        assert_eq!(app.chat_focus, ChatPanelFocus::Compose);
-        assert_eq!(app.composer.mode(), EditorMode::Normal);
-
-        assert!(matches!(
-            app.process_key(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::empty())),
-            Action::Continue
-        ));
-        assert_eq!(app.chat_focus, ChatPanelFocus::Compose);
-        assert_eq!(app.composer.mode(), EditorMode::Insert);
+        assert_eq!(h.app.room.preview_volume_for_test(), None);
     }
 
     #[test]
     fn compose_normal_m_uses_binding_to_toggle_mute() {
         let mut app = test_app();
-        app.set_chat_panel_focus(ChatPanelFocus::Compose);
-        app.process_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::empty()));
-        assert_eq!(app.composer.mode(), EditorMode::Normal);
+        let mut room = RoomMode::default();
+        room.process_input(&mut app, KeyEvent::new(KeyCode::Esc, KeyModifiers::empty()));
+        assert_eq!(app.room.composer.mode(), EditorMode::Normal);
 
-        app.process_key(KeyEvent::new(KeyCode::Char('m'), KeyModifiers::empty()));
+        room.process_input(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('m'), KeyModifiers::empty()),
+        );
 
         assert!(app.mic_muted.load(Ordering::Relaxed));
-        assert_eq!(app.chat_focus, ChatPanelFocus::Compose);
-        assert_eq!(app.composer.mode(), EditorMode::Normal);
-    }
-
-    #[test]
-    fn compose_vim_text_object_commands_receive_i_key() {
-        let mut app = test_app();
-        app.set_chat_panel_focus(ChatPanelFocus::Compose);
-        app.composer.set_lines("alpha beta");
-        app.composer.set_cursor_offset(2);
-
-        app.process_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::empty()));
-        assert_eq!(app.composer.mode(), EditorMode::Normal);
-
-        for key in ['c', 'i', 'w'] {
-            app.process_key(KeyEvent::new(KeyCode::Char(key), KeyModifiers::empty()));
-        }
-
-        assert_eq!(app.chat_focus, ChatPanelFocus::Compose);
-        assert_eq!(app.composer.mode(), EditorMode::Insert);
-        assert_eq!(app.composer.text(), " beta");
-    }
-
-    #[test]
-    fn shifted_jk_wraps_chat_panel_focus() {
-        let mut app = test_app();
-        app.set_chat_panel_focus(ChatPanelFocus::Compose);
-        app.process_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::empty()));
-
-        app.process_key(KeyEvent::new(KeyCode::Char('K'), KeyModifiers::empty()));
-        assert_eq!(app.chat_focus, ChatPanelFocus::ChatLog);
-        assert_eq!(app.chat_focus, ChatPanelFocus::ChatLog);
-
-        app.process_key(KeyEvent::new(KeyCode::Char('K'), KeyModifiers::empty()));
-        assert_eq!(app.chat_focus, ChatPanelFocus::Lobby);
-        assert_eq!(app.chat_focus, ChatPanelFocus::Lobby);
-
-        app.process_key(KeyEvent::new(KeyCode::Char('K'), KeyModifiers::empty()));
-        assert_eq!(app.chat_focus, ChatPanelFocus::Compose);
-        assert_eq!(app.chat_focus, ChatPanelFocus::Compose);
-        assert_eq!(app.composer.mode(), EditorMode::Normal);
-
-        app.process_key(KeyEvent::new(KeyCode::Char('J'), KeyModifiers::empty()));
-        assert_eq!(app.chat_focus, ChatPanelFocus::Lobby);
-    }
-
-    #[test]
-    fn super_jk_move_chat_panel_focus_from_compose_insert_mode() {
-        let mut app = test_app();
-        app.set_chat_panel_focus(ChatPanelFocus::Compose);
-        assert_eq!(app.composer.mode(), EditorMode::Insert);
-
-        app.process_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::SUPER));
-        assert_eq!(app.chat_focus, ChatPanelFocus::ChatLog);
-        assert_eq!(app.chat_focus, ChatPanelFocus::ChatLog);
-
-        app.set_chat_panel_focus(ChatPanelFocus::Compose);
-        assert_eq!(app.composer.mode(), EditorMode::Insert);
-
-        app.process_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::SUPER));
-        assert_eq!(app.chat_focus, ChatPanelFocus::Lobby);
-        assert_eq!(app.chat_focus, ChatPanelFocus::Lobby);
+        assert_eq!(room.focus(), ChatPanelFocus::Compose);
+        assert_eq!(app.room.composer.mode(), EditorMode::Normal);
     }
 
     #[test]
     fn selected_user_volume_requires_lobby_focus() {
         let mut app = test_app();
-        app.server_alias = "local".to_string();
+        app.room.server_alias = "local".to_string();
         app.user_id = Some(UserId(1));
-        app.set_chat_panel_focus(ChatPanelFocus::ChatLog);
-        app.participants.replace_room(vec![
-            ParticipantInfo {
-                user_id: UserId(1),
-                display_name: "alice".to_string(),
-                identifier: "alice".to_string(),
-                in_call: true,
-                voice_status: ParticipantVoiceStatus::default(),
-            },
-            ParticipantInfo {
-                user_id: UserId(2),
-                display_name: "bob".to_string(),
-                identifier: "bob".to_string(),
-                in_call: true,
-                voice_status: ParticipantVoiceStatus::default(),
-            },
-        ]);
-        app.move_room_selection(1);
-        app.set_chat_panel_focus(ChatPanelFocus::ChatLog);
+        app.room.joined(
+            vec![
+                participant(UserId(1), "alice"),
+                participant(UserId(2), "bob"),
+            ],
+            Vec::new(),
+            app.user_id,
+        );
+        app.room.move_participant_selection(1);
 
         let mut h = Harness::new(app);
-        h.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()));
+        let mut chat_room = RoomMode::with_focus(ChatPanelFocus::ChatLog);
+        let action = chat_room.process_input(
+            &mut h.app,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
+        );
+        assert_eq!(action, Action::Continue);
+        h.apply();
         assert_eq!(h.stack.len(), 1);
-        assert_eq!(h.app.status, "focus lobby to adjust users");
+        assert_eq!(h.app.status.text(), "focus lobby to adjust users");
 
-        h.app.set_chat_panel_focus(ChatPanelFocus::Lobby);
-        h.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()));
+        let mut lobby_room = RoomMode::with_focus(ChatPanelFocus::Lobby);
+        let action = lobby_room.process_input(
+            &mut h.app,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
+        );
+        assert_eq!(action, Action::Continue);
+        h.apply();
         assert_eq!(h.stack.len(), 2);
         assert!(h.overlay_active());
     }
@@ -3889,6 +3489,24 @@ mod tests {
     }
 
     #[test]
+    fn server_catalog_rebuild_tracks_generation() {
+        let mut app = test_app();
+        let initial_generation = app.server_catalog.generation();
+        app.config.servers.push(crate::config::ServerEntry {
+            alias: "s1".to_string(),
+            ..Default::default()
+        });
+
+        app.rebuild_server_items();
+
+        assert_eq!(app.server_items().len(), 1);
+        assert_eq!(
+            app.server_catalog.generation(),
+            initial_generation.saturating_add(1)
+        );
+    }
+
+    #[test]
     fn toggle_mute_while_deafened_undeafens_and_unmutes() {
         let mut app = test_app();
         app.set_deafen(true);
@@ -3902,283 +3520,41 @@ mod tests {
     }
 
     #[test]
-    fn chat_log_jk_moves_selected_message() {
-        let mut app = test_app();
-        app.set_chat_panel_focus(ChatPanelFocus::Compose);
-        for index in 0..3 {
-            app.push_chat(ChatMessage {
-                message_id: rpc::ids::MessageId(index + 1),
-                room_id: rpc::ids::RoomId(1),
-                sender: UserId(index as u32 + 1),
-                sender_name: format!("user{index}"),
-                timestamp_ms: index * 120_000,
-                body: format!("message {index}"),
-            });
-        }
-
-        app.set_chat_panel_focus(ChatPanelFocus::ChatLog);
-        assert_eq!(app.chat.selected_message(), Some(2));
-
-        app.process_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::empty()));
-        assert_eq!(app.chat.selected_message(), Some(1));
-
-        app.process_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::empty()));
-        assert_eq!(app.chat.selected_message(), Some(2));
-    }
-
-    #[test]
-    fn chat_log_gg_and_g_select_edge_headers() {
-        let mut app = test_app();
-        app.set_chat_panel_focus(ChatPanelFocus::Compose);
-        for index in 0..20 {
-            app.push_chat(ChatMessage {
-                message_id: rpc::ids::MessageId(index + 1),
-                room_id: rpc::ids::RoomId(1),
-                sender: UserId(index as u32 + 1),
-                sender_name: format!("user{index}"),
-                timestamp_ms: index * 120_000,
-                body: format!("message {index}"),
-            });
-        }
-
-        let mut buffer = Buffer::new(80, 12);
-        render_room(&mut app, &mut buffer);
-        app.set_chat_panel_focus(ChatPanelFocus::ChatLog);
-
-        app.process_key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::empty()));
-        app.process_key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::empty()));
-        assert_eq!(app.chat.selected_message(), Some(0));
-        assert!(app.chat.scroll_offset() > 0);
-
-        app.process_key(KeyEvent::new(KeyCode::Char('G'), KeyModifiers::empty()));
-        assert_eq!(app.chat.selected_message(), Some(19));
-        assert_eq!(app.chat.scroll_offset(), 0);
-    }
-
-    #[test]
-    fn chat_log_selection_change_scrolls_selected_header_into_view() {
-        let mut app = test_app();
-        app.set_chat_panel_focus(ChatPanelFocus::Compose);
-        for index in 0..30 {
-            app.push_chat(ChatMessage {
-                message_id: rpc::ids::MessageId(index + 1),
-                room_id: rpc::ids::RoomId(1),
-                sender: UserId(2),
-                sender_name: "bob".to_string(),
-                timestamp_ms: 1_000 + index * 1_000,
-                body: format!("message {index}"),
-            });
-        }
-
-        let mut buffer = Buffer::new(80, 14);
-        render_room(&mut app, &mut buffer);
-        app.set_chat_panel_focus(ChatPanelFocus::ChatLog);
-        app.process_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::empty()));
-        render_room(&mut app, &mut buffer);
-
-        let selected = app.chat.selected_message().expect("selected header");
-        assert_eq!(selected, 12);
-        assert!(
-            app.last_chat_lines
-                .iter()
-                .any(|line| line.kind == LineKind::Heading && line.block_contains(selected)),
-            "selected header must be visible after movement"
-        );
-    }
-
-    #[test]
-    fn tab_toggles_selected_chat_log_collapse() {
-        let mut app = test_app();
-        app.set_chat_panel_focus(ChatPanelFocus::Compose);
-        app.push_chat(ChatMessage {
-            message_id: rpc::ids::MessageId(1),
-            room_id: rpc::ids::RoomId(1),
-            sender: UserId(2),
-            sender_name: "bob".to_string(),
-            timestamp_ms: 1,
-            body: "```\n0\n1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n```".to_string(),
-        });
-
-        let mut buffer = Buffer::new(80, 24);
-        render_room(&mut app, &mut buffer);
-        app.set_chat_panel_focus(ChatPanelFocus::ChatLog);
-        assert!(app.chat.is_collapsed(0));
-
-        app.process_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::empty()));
-        assert!(app.chat.is_expanded(0));
-    }
-
-    #[test]
-    fn y_copies_selected_log_when_no_lines_are_selected() {
-        let mut app = test_app();
-        app.set_chat_panel_focus(ChatPanelFocus::Compose);
-        for (index, body) in ["first", "second"].into_iter().enumerate() {
-            app.push_chat(ChatMessage {
-                message_id: rpc::ids::MessageId(index as u64 + 1),
-                room_id: rpc::ids::RoomId(1),
-                sender: UserId(2),
-                sender_name: "bob".to_string(),
-                timestamp_ms: 1_000 + index as u64 * 1_000,
-                body: body.to_string(),
-            });
-        }
-
-        let mut buffer = Buffer::new(80, 24);
-        render_room(&mut app, &mut buffer);
-        app.set_chat_panel_focus(ChatPanelFocus::ChatLog);
-        app.chat.select_first_header();
-        app.process_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::empty()));
-
-        assert_eq!(app.pending_clipboard.as_deref(), Some("first\nsecond"));
-        assert_eq!(app.status, "copied to clipboard");
-        assert_eq!(app.status_kind, StatusKind::Info);
-
-        let expires_at = app.status_expires_at.expect("copy status should expire");
-        app.expire_status(expires_at - Duration::from_millis(1));
-        assert_eq!(app.status, "copied to clipboard");
-
-        app.expire_status(expires_at);
-        assert!(app.status.is_empty());
-        assert_eq!(app.status_expires_at, None);
-    }
-
-    #[test]
-    fn mouse_down_on_chat_text_focuses_chat_log_and_selects_message() {
-        let mut app = test_app();
-        app.set_chat_panel_focus(ChatPanelFocus::Compose);
-        app.push_chat(ChatMessage {
-            message_id: rpc::ids::MessageId(1),
-            room_id: rpc::ids::RoomId(1),
-            sender: UserId(2),
-            sender_name: "bob".to_string(),
-            timestamp_ms: 1,
-            body: "hello".to_string(),
-        });
-
-        let mut buffer = Buffer::new(80, 24);
-        render_room(&mut app, &mut buffer);
-        let (row_index, line) = app
-            .last_chat_lines
-            .iter()
-            .copied()
-            .enumerate()
-            .find(|(_, line)| line.kind == LineKind::Body)
-            .expect("body line rendered");
-        let column = app.last_chat_rect.x + 2;
-        let row = app.last_chat_rect.y + row_index as u16;
-
-        RoomMode.process_mouse(
-            &mut app,
-            MouseEvent {
-                kind: MouseEventKind::Down(MouseButton::Left),
-                column,
-                row,
-                modifiers: KeyModifiers::empty(),
-            },
-        );
-
-        assert_eq!(app.chat_focus, ChatPanelFocus::ChatLog);
-        assert_eq!(app.chat_focus, ChatPanelFocus::ChatLog);
-        assert_eq!(app.chat.selected_message(), Some(line.message));
-        assert!(app.chat.is_selecting());
-    }
-
-    #[test]
-    fn mouse_down_on_lobby_row_focuses_lobby_and_selects_user() {
-        let mut app = test_app();
-        app.set_chat_panel_focus(ChatPanelFocus::Compose);
-        app.participants.replace_room(vec![
-            ParticipantInfo {
-                user_id: UserId(1),
-                display_name: "alice".to_string(),
-                identifier: "alice".to_string(),
-                in_call: true,
-                voice_status: ParticipantVoiceStatus::default(),
-            },
-            ParticipantInfo {
-                user_id: UserId(2),
-                display_name: "bob".to_string(),
-                identifier: "bob".to_string(),
-                in_call: true,
-                voice_status: ParticipantVoiceStatus::default(),
-            },
-        ]);
-
-        let mut buffer = Buffer::new(80, 24);
-        render_room(&mut app, &mut buffer);
-        let column = app.last_room_rect.x + 1;
-        let row = app.last_room_rect.y;
-        RoomMode.process_mouse(
-            &mut app,
-            MouseEvent {
-                kind: MouseEventKind::Down(MouseButton::Left),
-                column,
-                row,
-                modifiers: KeyModifiers::empty(),
-            },
-        );
-
-        assert_eq!(app.chat_focus, ChatPanelFocus::Lobby);
-        assert_eq!(app.chat_focus, ChatPanelFocus::Lobby);
-        assert_eq!(app.participants.selected_user, Some(UserId(1)));
-    }
-
-    #[test]
-    fn shift_enter_inserts_newline_in_composer() {
-        let mut app = test_app();
-        app.set_chat_panel_focus(ChatPanelFocus::Compose);
-
-        assert!(matches!(
-            app.process_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::empty())),
-            Action::Continue
-        ));
-        assert!(matches!(
-            app.process_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT)),
-            Action::Continue
-        ));
-        assert!(matches!(
-            app.process_key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::empty())),
-            Action::Continue
-        ));
-
-        assert_eq!(app.composer.text(), "a\nb");
-    }
-
-    #[test]
     fn renders_smoke_frame() {
         let mut app = test_app();
+        let mut room = RoomMode::default();
         let mut buffer = Buffer::new(80, 24);
-        render_room(&mut app, &mut buffer);
+        render_room(&mut app, &mut room, &mut buffer);
     }
 
     #[test]
     fn chat_layout_reserves_top_bar_and_key_preview() {
         let mut app = test_app();
-        app.set_chat_panel_focus(ChatPanelFocus::Compose);
-        app.server_alias = "local".to_string();
-        app.user = "alice".to_string();
-        app.room_name = "lobby".to_string();
+        let mut room = RoomMode::default();
+        app.room.server_alias = "local".to_string();
+        app.room.local_user_name = "alice".to_string();
+        app.room.room_name = "lobby".to_string();
 
         let mut buffer = Buffer::new(80, 24);
-        render_room(&mut app, &mut buffer);
+        render_room(&mut app, &mut room, &mut buffer);
 
         let expected_chat_top = 1 + app.config.ui.room_height + 1;
         let expected_chat_bottom = buffer.height() - 4;
-        assert_eq!(app.last_chat_rect.y, expected_chat_top);
-        assert_eq!(app.last_chat_rect.bottom(), expected_chat_bottom);
+        assert_eq!(room.layout().chat_rect.y, expected_chat_top);
+        assert_eq!(room.layout().chat_rect.bottom(), expected_chat_bottom);
     }
 
     #[test]
     fn top_bar_audio_indicators_toggle_on_click() {
         let mut app = test_app();
-        app.set_chat_panel_focus(ChatPanelFocus::Compose);
+        let mut room = RoomMode::default();
 
         let mut buffer = Buffer::new(80, 24);
-        render_room(&mut app, &mut buffer);
+        render_room(&mut app, &mut room, &mut buffer);
 
-        let mute_rect = app.top_bar_mute_rect;
+        let mute_rect = app.chrome.top_bar.mute;
         assert!(!mute_rect.is_empty());
-        RoomMode.process_mouse(
+        room.process_mouse(
             &mut app,
             MouseEvent {
                 kind: MouseEventKind::Down(MouseButton::Left),
@@ -4189,9 +3565,9 @@ mod tests {
         );
         assert!(app.mic_muted.load(Ordering::Relaxed));
 
-        let deafen_rect = app.top_bar_deafen_rect;
+        let deafen_rect = app.chrome.top_bar.deafen;
         assert!(!deafen_rect.is_empty());
-        RoomMode.process_mouse(
+        room.process_mouse(
             &mut app,
             MouseEvent {
                 kind: MouseEventKind::Down(MouseButton::Left),
