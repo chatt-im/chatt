@@ -29,7 +29,7 @@ token-hash = "sha256:fd57e39ef28a47298ae51762fd3c907253ac7d4b7507fdf28fcf6d5e4bb
 [[users]]
 id = 3
 name = "carol"
-display-name = "Carol"
+display-name = "Carol Soundboard"
 token-hash = "sha256:f93be296b384d5f0f8760bdb53cf3ea52a5e41e6f7a532645458784ece411f62"
 
 [[users]]
@@ -37,3 +37,4 @@ id = 4
 name = "billy"
 display-name = "Billy"
 token-hash = "sha256:5c2bc883be6ee4037447e72a76dcd748d01b236a31669cb1bde9e5d460eb9519"
+

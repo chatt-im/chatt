@@ -15,7 +15,7 @@ use crate::{
         lifecycle::LivePlaybackCommand,
         playback::{
             LiveJitterStream, LivePlaybackFeedbackState, LivePlaybackMixer, LivePlaybackMixerEvent,
-            LivePlaybackMixerStats, LivePlaybackSharedSnapshot, RingPlaybackProducer,
+            LivePlaybackMixerStats, LivePlaybackSharedSnapshot, RingPlaybackProducer, SampleRing,
             SpscSwapQueue,
         },
         shared::{
@@ -31,6 +31,22 @@ use crate::{
     },
     network::{AudioPacketRef, InsertOutcome, PlayoutItem},
 };
+
+/// Reserved mixer stream id for one-shot notification clips. Server-assigned
+/// voice [`crate::audio::shared::RemoteVoicePacket`] stream ids start at 1 and
+/// climb, so the top of the range never collides.
+const NOTIFICATION_STREAM_ID: u32 = u32::MAX;
+/// Notification ring capacity, one second at 48 kHz. The longest clip is well
+/// under this, with room for a second clip queued behind a still-playing one.
+const NOTIFICATION_RING_SAMPLES: usize = 48_000;
+
+/// Producer side of the notification stream: the write end of a [`SampleRing`]
+/// the cpal mixer reads, registered with the consumer only while a clip plays.
+struct NotificationVoice {
+    ring: Arc<SampleRing>,
+    /// True once the consumer holds this ring via `EnsureStream`.
+    registered: bool,
+}
 
 /// One event drained from a stream's jitter buffer, handed to the `drain_ready`
 /// callback as it is produced. `Samples` borrows the decoder's reusable output
@@ -102,6 +118,9 @@ pub(crate) fn handle_live_playback_command(
                 &mut streams.dropped_mixer_events,
                 LivePlaybackMixerEvent::SetStreamControl { stream_id, control },
             );
+        }
+        LivePlaybackCommand::PlayNotification(samples) => {
+            streams.play_notification(&samples, mixer_events);
         }
         LivePlaybackCommand::Shutdown => return false,
     }
@@ -200,6 +219,8 @@ pub(crate) struct LiveDecodeStreams {
     /// oversized callback. Defaults to one frame.
     block_samples: usize,
     dropped_mixer_events: u64,
+    /// One-shot notification clips, allocated on first use.
+    notification: Option<NotificationVoice>,
 }
 
 impl LiveDecodeStreams {
@@ -212,6 +233,53 @@ impl LiveDecodeStreams {
             stats: LivePlaybackMixerStats::default(),
             block_samples: FRAME_SAMPLES,
             dropped_mixer_events: 0,
+            notification: None,
+        }
+    }
+
+    /// Writes a one-shot clip into the notification ring and registers it with
+    /// the consumer mixer if it is not already playing. Overlapping clips append
+    /// to the same ring and play back to back.
+    fn play_notification(
+        &mut self,
+        samples: &[f32],
+        mixer_events: &SpscSwapQueue<LivePlaybackMixerEvent>,
+    ) {
+        let dropped = &mut self.dropped_mixer_events;
+        let notification = self.notification.get_or_insert_with(|| NotificationVoice {
+            ring: Arc::new(SampleRing::with_capacity(NOTIFICATION_RING_SAMPLES)),
+            registered: false,
+        });
+        notification.ring.write_samples(samples);
+        if !notification.registered {
+            let event = LivePlaybackMixerEvent::EnsureStream {
+                stream_id: NOTIFICATION_STREAM_ID,
+                ring: Arc::clone(&notification.ring),
+            };
+            if push_mixer_event(mixer_events, dropped, event) {
+                notification.registered = true;
+            }
+        }
+    }
+
+    /// Unregisters the notification stream once its clip has fully drained, so an
+    /// idle empty ring stops bumping the consumer's per-callback underrun count.
+    fn retire_drained_notification(
+        &mut self,
+        mixer_events: &SpscSwapQueue<LivePlaybackMixerEvent>,
+    ) {
+        let dropped = &mut self.dropped_mixer_events;
+        let Some(notification) = self.notification.as_mut() else {
+            return;
+        };
+        if !notification.registered || notification.ring.depth() != 0 {
+            return;
+        }
+        let event = LivePlaybackMixerEvent::StopStream {
+            stream_id: NOTIFICATION_STREAM_ID,
+        };
+        if push_mixer_event(mixer_events, dropped, event) {
+            notification.registered = false;
         }
     }
 
@@ -315,6 +383,7 @@ impl LiveDecodeStreams {
                 feedback_sender,
             );
         }
+        self.retire_drained_notification(mixer_events);
     }
 
     /// Producer step used by the single-threaded simulation harness: registers
@@ -1197,6 +1266,68 @@ mod tests {
             feedback.recommended_target(&tuning),
             tuning.dynamic_target_floor,
             "silence gate resume inflated the delay histogram"
+        );
+    }
+
+    fn take_notification_ring(
+        queue: &SpscSwapQueue<LivePlaybackMixerEvent>,
+    ) -> Option<Arc<SampleRing>> {
+        let mut event = LivePlaybackMixerEvent::Empty;
+        while queue.remove(&mut event) {
+            if let LivePlaybackMixerEvent::EnsureStream { stream_id, ring } = &event
+                && *stream_id == NOTIFICATION_STREAM_ID
+            {
+                return Some(Arc::clone(ring));
+            }
+            event = LivePlaybackMixerEvent::Empty;
+        }
+        None
+    }
+
+    fn saw_notification_stop(queue: &SpscSwapQueue<LivePlaybackMixerEvent>) -> bool {
+        let mut event = LivePlaybackMixerEvent::Empty;
+        while queue.remove(&mut event) {
+            if let LivePlaybackMixerEvent::StopStream { stream_id } = &event
+                && *stream_id == NOTIFICATION_STREAM_ID
+            {
+                return true;
+            }
+            event = LivePlaybackMixerEvent::Empty;
+        }
+        false
+    }
+
+    #[test]
+    fn notification_registers_then_retires_after_draining() {
+        use crate::audio::playback::RingReader;
+
+        let queue = SpscSwapQueue::<LivePlaybackMixerEvent>::with_capacity(8);
+        let mut streams = LiveDecodeStreams::new(test_tuning());
+        let clip: Arc<[f32]> = Arc::from(vec![0.25_f32; 480].as_slice());
+
+        assert!(handle_live_playback_command(
+            LivePlaybackCommand::PlayNotification(Arc::clone(&clip)),
+            &mut streams,
+            &queue,
+        ));
+
+        let ring = take_notification_ring(&queue).expect("EnsureStream for the notification");
+        assert_eq!(ring.depth(), clip.len(), "ring holds the whole clip");
+
+        // Drain the clip the way the cpal consumer would.
+        // SAFETY: the only `RingReader` built for this ring in the test.
+        let mut reader = unsafe { RingReader::new(Arc::clone(&ring)) };
+        let span = reader.readable_span();
+        let drained = span.len();
+        drop(span);
+        reader.advance(drained);
+        assert_eq!(ring.depth(), 0, "consumer drained the clip");
+
+        // The next worker tick retires the now-empty notification stream.
+        streams.drain_into_mixer_events(&queue, Instant::now(), None);
+        assert!(
+            saw_notification_stop(&queue),
+            "StopStream emitted once the clip drained"
         );
     }
 }
