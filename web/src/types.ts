@@ -18,6 +18,10 @@ export interface WebMessage {
   body: string;
   timestamp_ms: number;
   attachment: WebAttachment | null;
+  // The file transfer id for a file message, else null. A `message` frame with a
+  // file_id matching one already held replaces it in place (the announcement
+  // placeholder gains its inline attachment) instead of appending a second row.
+  file_id: number | null;
 }
 
 // One JSON object per WebSocket text frame.

@@ -1148,6 +1148,7 @@ impl Server {
             sender_name,
             timestamp_ms: now_ms(),
             body,
+            file_transfer_id: None,
         };
         self.next_message += 1;
         let mut history_len = 0;
@@ -1252,6 +1253,7 @@ impl Server {
             sender_name,
             timestamp_ms,
             body: format!("sent file `{}` ({})", file_name, format_bytes(size)),
+            file_transfer_id: Some(server_transfer_id),
         };
         self.next_message += 1;
         if self.chat_history_limit > 0

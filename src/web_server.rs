@@ -44,6 +44,10 @@ pub struct WebMessage {
     pub body: String,
     pub timestamp_ms: u64,
     pub attachment: Option<WebAttachment>,
+    /// `Some` for a file message, carrying the file transfer id. The feed upserts
+    /// by it so a file's announcement placeholder and its later inline version are
+    /// one entry, enriched in place rather than two separate messages.
+    pub file_id: Option<u64>,
 }
 
 /// An inline media file attached to a [`WebMessage`], served from `/files`.
@@ -65,12 +69,16 @@ pub struct WebAttachment {
 
 impl From<&ChatMessage> for WebMessage {
     fn from(message: &ChatMessage) -> Self {
+        let file_id = message.file_transfer_id.map(|transfer_id| transfer_id.0);
         WebMessage {
-            id: message.message_id.0,
+            // A file announcement keys on the transfer id so it shares an id with
+            // the inline file message that later enriches it.
+            id: file_id.unwrap_or(message.message_id.0),
             sender: message.sender_name.clone(),
             body: message.body.clone(),
             timestamp_ms: message.timestamp_ms,
             attachment: None,
+            file_id,
         }
     }
 }
@@ -97,7 +105,13 @@ impl WebMessage {
         WebMessage {
             id: metadata.transfer_id.0,
             sender: metadata.sender_name.clone(),
-            body: metadata.original_name.clone(),
+            // Mirror the server's announcement body so the size metadata survives
+            // whichever of the two messages wins the upsert merge.
+            body: format!(
+                "sent file `{}` ({})",
+                metadata.original_name,
+                format_size(metadata.size)
+            ),
             timestamp_ms: metadata.timestamp_ms,
             attachment: Some(WebAttachment {
                 kind: kind.to_string(),
@@ -105,7 +119,36 @@ impl WebMessage {
                 width,
                 height,
             }),
+            file_id: Some(metadata.transfer_id.0),
         }
+    }
+}
+
+impl WebMessage {
+    /// Folds a later message for the same file into this one. Order-independent:
+    /// the incoming fields win, but an attachment is never dropped, so the inline
+    /// version's media survives whether it arrives before or after the
+    /// announcement placeholder.
+    fn merge_from(&mut self, incoming: WebMessage) {
+        let attachment = incoming.attachment.or_else(|| self.attachment.take());
+        *self = WebMessage {
+            attachment,
+            ..incoming
+        };
+    }
+}
+
+/// Formats a byte count the way the server's file announcement does, so an
+/// enriched file message reads identically to its placeholder.
+fn format_size(bytes: u64) -> String {
+    const KIB: u64 = 1024;
+    const MIB: u64 = 1024 * KIB;
+    if bytes >= MIB {
+        format!("{:.1} MiB", bytes as f64 / MIB as f64)
+    } else if bytes >= KIB {
+        format!("{:.1} KiB", bytes as f64 / KIB as f64)
+    } else {
+        format!("{bytes} B")
     }
 }
 
@@ -253,15 +296,31 @@ fn run(mut server: Server, rx: Receiver<WebFeed>, max_messages: usize) {
         loop {
             match rx.try_recv() {
                 Ok(WebFeed::Message(message)) => {
-                    let payload = message_payload(&message);
+                    // A file message upserts onto its existing entry (the
+                    // announcement placeholder, or the inline version if it
+                    // arrived first), so a file is one message enriched in place,
+                    // never two. The seq is preserved, so paging is untouched.
+                    let existing = message.file_id.and_then(|file_id| {
+                        history
+                            .iter_mut()
+                            .rev()
+                            .find(|held| held.file_id == Some(file_id))
+                    });
+                    let payload = if let Some(existing) = existing {
+                        existing.merge_from(message);
+                        message_payload(existing)
+                    } else {
+                        let payload = message_payload(&message);
+                        history.push(message);
+                        if history.len() > max_messages {
+                            let excess = history.len() - max_messages;
+                            history.drain(0..excess);
+                            base_seq += excess as u64;
+                        }
+                        payload
+                    };
                     for id in &clients {
                         let _ = server.send_websocket_text(*id, &payload);
-                    }
-                    history.push(message);
-                    if history.len() > max_messages {
-                        let excess = history.len() - max_messages;
-                        history.drain(0..excess);
-                        base_seq += excess as u64;
                     }
                 }
                 Ok(WebFeed::Stop) => return,
@@ -339,6 +398,7 @@ mod tests {
             body: body.to_string(),
             timestamp_ms: 100,
             attachment: None,
+            file_id: None,
         }
     }
 
@@ -420,6 +480,81 @@ mod tests {
         let json = jsony::to_json(&message);
         assert!(json.contains("\"attachment\":{"), "{json}");
         assert!(json.contains("\"name\":\"wide-1.png\""), "{json}");
+
+        // The file id carries the transfer id and the body keeps the size, so the
+        // inline message correlates with and reads like its announcement.
+        assert_eq!(message.file_id, Some(3));
+        assert_eq!(message.body, "sent file `wide.png` (10 B)");
+    }
+
+    fn file_metadata(transfer_id: u64) -> FileMetadata {
+        FileMetadata {
+            transfer_id: FileTransferId(transfer_id),
+            room_id: RoomId(1),
+            sender: UserId(2),
+            sender_name: "Alice".to_string(),
+            file_name: "wide.png".to_string(),
+            original_name: "wide.png".to_string(),
+            size: 2048,
+            timestamp_ms: 5,
+        }
+    }
+
+    #[test]
+    fn file_announcement_carries_file_id() {
+        use rpc::control::ChatMessage;
+        use rpc::ids::MessageId;
+        let announcement = ChatMessage {
+            message_id: MessageId(99),
+            room_id: RoomId(1),
+            sender: UserId(2),
+            sender_name: "Alice".to_string(),
+            timestamp_ms: 5,
+            body: "sent file `wide.png` (2.0 KiB)".to_string(),
+            file_transfer_id: Some(FileTransferId(7)),
+        };
+        let message: WebMessage = (&announcement).into();
+        // The file id keys the upsert, and the message id matches it so the
+        // placeholder shares an id with the inline version that enriches it.
+        assert_eq!(message.file_id, Some(7));
+        assert_eq!(message.id, 7);
+        assert!(message.attachment.is_none());
+    }
+
+    #[test]
+    fn merge_enriches_placeholder_in_place() {
+        let mut placeholder: WebMessage = WebMessage {
+            id: 7,
+            sender: "Alice".to_string(),
+            body: "sent file `wide.png` (2.0 KiB)".to_string(),
+            timestamp_ms: 5,
+            attachment: None,
+            file_id: Some(7),
+        };
+        let inline = WebMessage::from_file(&file_metadata(7), "wide.png", Some((4, 2)));
+        placeholder.merge_from(inline);
+        let attachment = placeholder.attachment.as_ref().expect("attachment kept");
+        assert_eq!(attachment.width, Some(4));
+        assert_eq!(placeholder.file_id, Some(7));
+    }
+
+    #[test]
+    fn merge_keeps_attachment_when_placeholder_arrives_last() {
+        // Reverse order: the inline file arrived first, then the announcement.
+        let mut inline = WebMessage::from_file(&file_metadata(7), "wide.png", Some((4, 2)));
+        let placeholder = WebMessage {
+            id: 7,
+            sender: "Alice".to_string(),
+            body: "sent file `wide.png` (2.0 KiB)".to_string(),
+            timestamp_ms: 5,
+            attachment: None,
+            file_id: Some(7),
+        };
+        inline.merge_from(placeholder);
+        assert!(
+            inline.attachment.is_some(),
+            "a late placeholder must not drop the attachment"
+        );
     }
 
     #[test]
@@ -466,6 +601,7 @@ mod tests {
             body: "hi".to_string(),
             timestamp_ms: 0,
             attachment: None,
+            file_id: None,
         };
         assert!(jsony::to_json(&message).contains("\"attachment\":null"));
     }
@@ -546,6 +682,7 @@ Sec-WebSocket-Version: 13\r\n\
             body: "hello web".to_string(),
             timestamp_ms: 42,
             attachment: None,
+            file_id: None,
         });
 
         let (opcode, payload) = read_ws_frame(&mut stream);
@@ -613,6 +750,7 @@ Sec-WebSocket-Version: 13\r\n\
                 body: format!("m{i}"),
                 timestamp_ms: 1,
                 attachment: None,
+                file_id: None,
             });
             let _ = read_ws_frame(&mut stream);
         }

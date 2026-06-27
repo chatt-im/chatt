@@ -444,6 +444,7 @@ mod tests {
             sender_name: format!("user-{sender}"),
             timestamp_ms: id * 1_000,
             body: body.to_string(),
+            file_transfer_id: None,
         }
     }
 
