@@ -53,6 +53,13 @@ pub struct WebAttachment {
     pub name: String,
     /// One of `image`, `video`, `audio`, or `file`.
     pub kind: String,
+    /// Intrinsic pixel width, set for `image` attachments whose header parsed.
+    ///
+    /// The frontend reserves the box from `width`/`height` so a decoding image
+    /// never grows the layout. `None` for non-images or an unreadable header.
+    pub width: Option<u32>,
+    /// Intrinsic pixel height, paired with [`width`](WebAttachment::width).
+    pub height: Option<u32>,
 }
 
 impl From<&ChatMessage> for WebMessage {
@@ -73,22 +80,47 @@ impl WebMessage {
     /// `served_name` is the file's actual name on disk under the receive
     /// directory, which is what `/files/<name>` resolves. It can differ from
     /// `metadata.file_name` when a name collision was renamed on save.
-    pub fn from_file(metadata: &FileMetadata, served_name: &str) -> Self {
+    ///
+    /// `dimensions`, when set, is the intrinsic pixel size of an image. It is
+    /// recorded only for the `image` kind so the frontend can reserve the box.
+    pub fn from_file(
+        metadata: &FileMetadata,
+        served_name: &str,
+        dimensions: Option<(u32, u32)>,
+    ) -> Self {
+        let kind = classify(served_name);
+        let (width, height) = match (kind, dimensions) {
+            ("image", Some((w, h))) => (Some(w), Some(h)),
+            _ => (None, None),
+        };
         WebMessage {
             id: metadata.transfer_id.0,
             sender: metadata.sender_name.clone(),
             body: metadata.original_name.clone(),
             timestamp_ms: metadata.timestamp_ms,
             attachment: Some(WebAttachment {
-                kind: classify(served_name).to_string(),
+                kind: kind.to_string(),
                 name: served_name.to_string(),
+                width,
+                height,
             }),
         }
     }
 }
 
+/// Reads the intrinsic pixel size of an image from a prefix of its bytes.
+///
+/// Parses only the header fields, so a leading slice of the file is enough. The
+/// caller captures that slice as the transfer streams, so the bytes are never
+/// read from disk a second time. Returns `None` when `header` is not a
+/// recognized image or is too short to hold the dimensions.
+pub fn image_dimensions(header: &[u8]) -> Option<(u32, u32)> {
+    let size = imagesize::blob_size(header).ok()?;
+    Some((size.width as u32, size.height as u32))
+}
+
 /// Classifies a file name into a media kind by its extension.
-fn classify(name: &str) -> &'static str {
+pub(crate) fn classify(name: &str) -> &'static str {
     let extension = name.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
     match extension.as_str() {
         "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" | "svg" | "avif" => "image",
@@ -370,14 +402,52 @@ mod tests {
             timestamp_ms: 5,
         };
         // A save-time collision renamed the file on disk.
-        let message = WebMessage::from_file(&metadata, "wide-1.png");
+        let message = WebMessage::from_file(&metadata, "wide-1.png", Some((640, 480)));
         let attachment = message.attachment.as_ref().expect("attachment present");
         assert_eq!(attachment.name, "wide-1.png");
         assert_eq!(attachment.kind, "image");
+        assert_eq!(attachment.width, Some(640));
+        assert_eq!(attachment.height, Some(480));
 
         let json = jsony::to_json(&message);
         assert!(json.contains("\"attachment\":{"), "{json}");
         assert!(json.contains("\"name\":\"wide-1.png\""), "{json}");
+    }
+
+    #[test]
+    fn image_dimensions_parses_png_header() {
+        let mut png = vec![0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
+        png.extend_from_slice(&[0, 0, 0, 13]);
+        png.extend_from_slice(b"IHDR");
+        png.extend_from_slice(&100u32.to_be_bytes());
+        png.extend_from_slice(&50u32.to_be_bytes());
+        png.extend_from_slice(&[8, 2, 0, 0, 0]);
+        assert_eq!(image_dimensions(&png), Some((100, 50)));
+    }
+
+    #[test]
+    fn image_dimensions_rejects_non_image_bytes() {
+        assert_eq!(image_dimensions(b"not an image"), None);
+        assert_eq!(image_dimensions(&[]), None);
+    }
+
+    #[test]
+    fn non_image_attachment_drops_dimensions() {
+        let metadata = FileMetadata {
+            transfer_id: FileTransferId(4),
+            room_id: RoomId(1),
+            sender: UserId(2),
+            sender_name: "Alice".to_string(),
+            file_name: "clip.mp4".to_string(),
+            original_name: "clip.mp4".to_string(),
+            size: 10,
+            timestamp_ms: 5,
+        };
+        let message = WebMessage::from_file(&metadata, "clip.mp4", Some((1920, 1080)));
+        let attachment = message.attachment.as_ref().expect("attachment present");
+        assert_eq!(attachment.kind, "video");
+        assert_eq!(attachment.width, None);
+        assert_eq!(attachment.height, None);
     }
 
     #[test]

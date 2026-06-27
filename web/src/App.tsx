@@ -27,10 +27,22 @@ function formatTime(ms: number): string {
 function Attachment(props: { message: WebMessage }) {
   const att = () => props.message.attachment!;
   const url = () => fileUrl(att().name);
+  // Fades the image in on decode instead of snapping. The box is already
+  // reserved by width/height, so this only affects the pixels, never layout.
+  const [loaded, setLoaded] = createSignal(false);
   return (
     <div class="message-media">
       <Show when={att().kind === "image"}>
-        <img class="media-image" src={url()} alt={att().name} />
+        <img
+          class="media-image"
+          classList={{ "is-loaded": loaded() }}
+          src={url()}
+          alt={att().name}
+          width={att().width ?? undefined}
+          height={att().height ?? undefined}
+          onLoad={() => setLoaded(true)}
+          onError={() => setLoaded(true)}
+        />
       </Show>
       <Show when={att().kind === "video"}>
         <video class="media-video" src={url()} controls preload="metadata" />
