@@ -140,6 +140,9 @@ pub enum NetworkEvent {
     FileReceived {
         metadata: FileMetadata,
         path: PathBuf,
+        /// Intrinsic pixel size, parsed from the file's header as it streamed.
+        /// `Some` only for images whose header fit the captured prefix.
+        dimensions: Option<(u32, u32)>,
     },
     Presence {
         room_id: RoomId,
@@ -1149,6 +1152,8 @@ struct OutgoingUpload {
     /// uploader's own views (such as the web log) can serve the file. Written
     /// from the same chunks sent to the server, never round-tripped through it.
     local_copy: Option<(PathBuf, File)>,
+    /// Intrinsic image size, parsed from the first chunk as it streams.
+    dimensions: Option<(u32, u32)>,
 }
 
 struct IncomingFile {
@@ -1157,6 +1162,8 @@ struct IncomingFile {
     file: File,
     received: u64,
     next_status_at: u64,
+    /// Intrinsic image size, parsed from the first chunk as it streams.
+    dimensions: Option<(u32, u32)>,
 }
 
 struct PeerConnection {
@@ -1727,6 +1734,7 @@ impl WorkerState {
             started: false,
             next_status_at: FILE_PROGRESS_STEP_BYTES.min(size),
             local_copy: None,
+            dimensions: None,
         })
     }
 
@@ -1790,6 +1798,9 @@ impl WorkerState {
                 return Err(format!("file ended early while uploading {}", upload.name));
             }
             data.truncate(read);
+            if upload.offset == 0 && is_image_name(&upload.name) {
+                upload.dimensions = crate::web_server::image_dimensions(&data);
+            }
             if let Some((path, file)) = upload.local_copy.as_mut()
                 && let Err(error) = file.write_all(&data)
             {
@@ -1867,9 +1878,11 @@ impl WorkerState {
             size: upload.size,
             timestamp_ms,
         };
-        let _ = self
-            .events
-            .send(NetworkEvent::FileReceived { metadata, path });
+        let _ = self.events.send(NetworkEvent::FileReceived {
+            metadata,
+            path,
+            dimensions: upload.dimensions,
+        });
     }
 
     fn handle_file_offered(&mut self, file: FileMetadata, contents: bool) {
@@ -1935,6 +1948,7 @@ impl WorkerState {
                         file: handle,
                         received: 0,
                         next_status_at: FILE_PROGRESS_STEP_BYTES,
+                        dimensions: None,
                     },
                 );
             }
@@ -1977,6 +1991,9 @@ impl WorkerState {
                 "failed to write {name}: {error}"
             )));
             return;
+        }
+        if offset == 0 && is_image_name(&incoming.metadata.file_name) {
+            incoming.dimensions = crate::web_server::image_dimensions(&data);
         }
         incoming.received += data.len() as u64;
         if incoming.received >= incoming.next_status_at
@@ -2022,6 +2039,7 @@ impl WorkerState {
         let _ = self.events.send(NetworkEvent::FileReceived {
             metadata: incoming.metadata.clone(),
             path: incoming.path.clone(),
+            dimensions: incoming.dimensions,
         });
     }
 
@@ -3208,6 +3226,11 @@ fn is_auth_failure_code(code: u16) -> bool {
             | ERROR_PAIRING_CODE_MISMATCH
             | ERROR_PAIRING_INVALID_REQUEST
     )
+}
+
+/// Whether `name`'s extension marks it as an image worth probing for size.
+fn is_image_name(name: &str) -> bool {
+    crate::web_server::classify(name) == "image"
 }
 
 fn create_receive_file(dir: &Path, requested_name: &str) -> Result<(PathBuf, File), String> {

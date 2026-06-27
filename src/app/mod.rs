@@ -791,7 +791,11 @@ impl App {
                 }
                 self.push_chat(message);
             }
-            NetworkEvent::FileReceived { metadata, path } => {
+            NetworkEvent::FileReceived {
+                metadata,
+                path,
+                dimensions,
+            } => {
                 if let Some(feed) = &self.web_feed {
                     let served_name = path
                         .file_name()
@@ -800,6 +804,7 @@ impl App {
                     feed.send(crate::web_server::WebMessage::from_file(
                         &metadata,
                         served_name,
+                        dimensions,
                     ));
                 }
             }
