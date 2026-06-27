@@ -35,6 +35,25 @@ pub fn bind_udp_socket_on_interface(
     bind_udp_socket_inner(addr, options, Some(interface))
 }
 
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn socket_cloexec(domain: libc::c_int) -> libc::c_int {
+    unsafe { libc::socket(domain, libc::SOCK_DGRAM | libc::SOCK_CLOEXEC, 0) }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+fn socket_cloexec(domain: libc::c_int) -> libc::c_int {
+    let fd = unsafe { libc::socket(domain, libc::SOCK_DGRAM, 0) };
+    if fd >= 0 {
+        if unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) } < 0 {
+            unsafe {
+                libc::close(fd);
+            }
+            return -1;
+        }
+    }
+    fd
+}
+
 #[cfg(unix)]
 fn bind_udp_socket_inner(
     addr: SocketAddr,
@@ -48,7 +67,7 @@ fn bind_udp_socket_inner(
     } else {
         libc::AF_INET6
     };
-    let fd = unsafe { libc::socket(domain, libc::SOCK_DGRAM | libc::SOCK_CLOEXEC, 0) };
+    let fd = socket_cloexec(domain);
     if fd < 0 {
         return Err(io::Error::last_os_error());
     }
@@ -140,6 +159,8 @@ fn bind_fd(fd: libc::c_int, addr: SocketAddr) -> io::Result<()> {
     match addr {
         SocketAddr::V4(addr) => {
             let raw = libc::sockaddr_in {
+                #[cfg(any(target_os = "macos", target_os = "ios"))]
+                sin_len: std::mem::size_of::<libc::sockaddr_in>() as u8,
                 sin_family: libc::AF_INET as libc::sa_family_t,
                 sin_port: addr.port().to_be(),
                 sin_addr: libc::in_addr {
@@ -155,6 +176,8 @@ fn bind_fd(fd: libc::c_int, addr: SocketAddr) -> io::Result<()> {
         }
         SocketAddr::V6(addr) => {
             let raw = libc::sockaddr_in6 {
+                #[cfg(any(target_os = "macos", target_os = "ios"))]
+                sin6_len: std::mem::size_of::<libc::sockaddr_in6>() as u8,
                 sin6_family: libc::AF_INET6 as libc::sa_family_t,
                 sin6_port: addr.port().to_be(),
                 sin6_flowinfo: addr.flowinfo(),
@@ -183,14 +206,14 @@ fn bind_sockaddr(fd: libc::c_int, addr: *const libc::sockaddr, len: usize) -> io
 }
 
 #[cfg(unix)]
-fn ignore_icmp_errors(fd: libc::c_int) {
+fn ignore_icmp_errors(_fd: libc::c_int) {
     #[cfg(any(target_os = "linux", target_os = "android"))]
     {
         #[allow(clippy::unnecessary_cast)]
-        let _ = set_bool_opt(fd, libc::IPPROTO_IP, libc::IP_RECVERR as libc::c_int, false);
+        let _ = set_bool_opt(_fd, libc::IPPROTO_IP, libc::IP_RECVERR as libc::c_int, false);
         #[allow(clippy::unnecessary_cast)]
         let _ = set_bool_opt(
-            fd,
+            _fd,
             libc::IPPROTO_IPV6,
             libc::IPV6_RECVERR as libc::c_int,
             false,

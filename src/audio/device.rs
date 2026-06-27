@@ -1,5 +1,5 @@
 use std::{
-    fs, mem,
+    mem,
     num::NonZeroUsize,
     str::FromStr,
     sync::{
@@ -453,7 +453,7 @@ pub(crate) struct AlsaPhysicalPcm {
     target_os = "netbsd"
 ))]
 pub(crate) fn alsa_physical_pcm_devices(direction: AudioDeviceDirection) -> Vec<AlsaPhysicalPcm> {
-    fs::read_to_string("/proc/asound/pcm")
+    std::fs::read_to_string("/proc/asound/pcm")
         .map(|content| parse_alsa_physical_pcm_devices(&content, direction))
         .unwrap_or_default()
 }

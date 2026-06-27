@@ -395,14 +395,21 @@ fn ensure_dred_assets(opus_source: &Path, out_dir: &Path) {
         out_dir.join(DRED_MODEL_ARCHIVE)
     };
     if !archive_path.exists() {
+        let url = format!("https://media.xiph.org/opus/models/{DRED_MODEL_ARCHIVE}");
         let status = Command::new("wget")
             .arg("-O")
             .arg(&archive_path)
-            .arg(format!(
-                "https://media.xiph.org/opus/models/{DRED_MODEL_ARCHIVE}"
-            ))
+            .arg(&url)
             .status()
-            .expect("failed to spawn wget for DRED model download");
+            .or_else(|_| {
+                Command::new("curl")
+                    .arg("-L")
+                    .arg("-o")
+                    .arg(&archive_path)
+                    .arg(&url)
+                    .status()
+            })
+            .expect("failed to spawn wget or curl for DRED model download");
 
         if !status.success() {
             panic!("downloading DRED model assets failed (exit status: {status})");
