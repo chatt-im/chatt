@@ -41,6 +41,7 @@ pub struct ServerHello {
 pub enum ClientControl {
     Authenticate {
         user: String,
+        display_name: String,
         token: String,
         receive_files: bool,
         file_receive_limit_bytes: u64,

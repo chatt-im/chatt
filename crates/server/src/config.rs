@@ -214,6 +214,23 @@ impl Config {
         Ok(self.users.last().expect("user was just inserted").clone())
     }
 
+    pub fn set_user_display_name(
+        &mut self,
+        user_name: &str,
+        display_name: String,
+    ) -> Result<UserConfig, String> {
+        let Some(index) = self.users.iter().position(|user| user.name == user_name) else {
+            return Err(format!("no user named '{user_name}'"));
+        };
+        let old_display_name = self.users[index].display_name.clone();
+        self.users[index].display_name = display_name;
+        if let Err(error) = self.save_runtime() {
+            self.users[index].display_name = old_display_name;
+            return Err(error);
+        }
+        Ok(self.users[index].clone())
+    }
+
     fn apply_inferred_addresses(&mut self, udp_addr_configured: bool, udp_addr_overridden: bool) {
         if !udp_addr_configured && !udp_addr_overridden {
             self.network.udp_addr = self.network.tcp_addr;
@@ -834,6 +851,37 @@ mod tests {
         assert!(content.contains("display-name = \"Alice Example\""));
         assert!(content.contains(&format!("token-hash = \"{token_hash}\"")));
         assert!(!content.contains("pairing-code-hash"));
+    }
+
+    #[test]
+    fn set_user_display_name_updates_and_persists() {
+        let path = std::env::temp_dir().join(format!(
+            "chatt-server-display-name-test-{}.toml",
+            std::process::id()
+        ));
+        let mut config = Config::default();
+        config.config_path = Some(path.clone());
+        let token_hash = config.users[0].token_hash.clone();
+
+        let user = config
+            .set_user_display_name("alice", "Alice Renamed".to_string())
+            .unwrap();
+        let content = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(path);
+
+        assert_eq!(user.display_name, "Alice Renamed");
+        assert_eq!(user.token_hash, token_hash);
+        assert!(content.contains("display-name = \"Alice Renamed\""));
+    }
+
+    #[test]
+    fn set_user_display_name_rejects_unknown_user() {
+        let mut config = Config::default();
+        assert!(
+            config
+                .set_user_display_name("nobody", "Ghost".to_string())
+                .is_err()
+        );
     }
 
     #[test]

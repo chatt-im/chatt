@@ -577,6 +577,7 @@ impl Server {
                 ConnState::AwaitAuth,
                 ClientControl::Authenticate {
                     user,
+                    display_name,
                     token: auth_token,
                     receive_files,
                     file_receive_limit_bytes,
@@ -584,6 +585,7 @@ impl Server {
             ) => self.authenticate_client(
                 token,
                 &user,
+                &display_name,
                 &auth_token,
                 receive_files,
                 file_receive_limit_bytes,
@@ -705,6 +707,7 @@ impl Server {
         &mut self,
         token: Token,
         user_name: &str,
+        display_name: &str,
         auth_token: &str,
         receive_files: bool,
         file_receive_limit_bytes: u64,
@@ -734,6 +737,28 @@ impl Server {
                     "authentication failed for '{user_name}': the user or token is not valid for this server"
                 ),
             );
+        };
+        let display_name = display_name.trim();
+        let user = if display_name.is_empty()
+            || display_name.len() > 64
+            || display_name == user.display_name
+        {
+            user
+        } else {
+            match self
+                .config
+                .set_user_display_name(user_name, display_name.to_string())
+            {
+                Ok(user) => user,
+                Err(error) => {
+                    kvlog::warn!(
+                        "display name update failed",
+                        user = user_name,
+                        error = error.as_str()
+                    );
+                    user
+                }
+            }
         };
         self.establish_session(token, &user, receive_files, file_receive_limit_bytes)
     }

@@ -4,4 +4,4 @@ pub mod frame;
 pub mod ids;
 pub mod media;
 
-pub const PROTOCOL_VERSION: u16 = 2;
+pub const PROTOCOL_VERSION: u16 = 3;

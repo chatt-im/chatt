@@ -153,7 +153,11 @@ fn draw_room(area: Rect, app: &App, buf: &mut Buffer) {
             buf,
             &format!(
                 "{marker}   {:<16} {:<7} {:<5} {:<16} {}",
-                participant.name, state, spoke, voice, control
+                participant.display_name(),
+                state,
+                spoke,
+                voice,
+                control
             ),
         );
         if row.w > 2 {
