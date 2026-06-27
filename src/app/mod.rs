@@ -841,7 +841,8 @@ impl App {
                         self.set_status("voice stream ready");
                     }
                 } else {
-                    self.set_status(format!("user {} voice ready", user_id.0));
+                    let name = self.participants.display_name_for(user_id).to_string();
+                    self.set_status(format!("{name} voice ready"));
                 }
             }
             NetworkEvent::VoiceStopped { user_id, stream_id } => {
@@ -854,7 +855,8 @@ impl App {
                     if let Some(playback) = &self.playback {
                         playback.stop_stream(stream_id.0);
                     }
-                    self.set_status(format!("user {} left voice", user_id.0));
+                    let name = self.participants.display_name_for(user_id).to_string();
+                    self.set_status(format!("{name} left voice"));
                 }
             }
             NetworkEvent::PeerTransport { user_id, direct } => {
@@ -2498,7 +2500,7 @@ impl App {
     fn selected_room_user(&self) -> Option<(UserId, String)> {
         self.participants
             .selected()
-            .map(|entry| (entry.user_id, entry.name.clone()))
+            .map(|entry| (entry.user_id, entry.display_name().to_string()))
     }
 
     fn selected_remote_room_user(&mut self) -> Option<(UserId, String)> {
@@ -2892,7 +2894,7 @@ impl App {
                 .participants
                 .entries
                 .iter()
-                .map(|entry| entry.name.as_str())
+                .map(|entry| entry.display_name())
                 .collect::<Vec<_>>()
                 .join(", ");
             self.set_status(format!("users: {users}"));

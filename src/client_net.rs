@@ -501,6 +501,7 @@ fn run_worker_inner(
 
     let auth_control = ClientControl::Authenticate {
         user: worker.config.user.clone(),
+        display_name: worker.config.display_name.clone(),
         token: worker.config.token.clone(),
         receive_files: worker.config.file_receive_dir.is_some(),
         file_receive_limit_bytes: worker

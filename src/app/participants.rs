@@ -7,10 +7,12 @@ use rpc::{
 
 use chatt::audio::LivePlaybackFeedback;
 
+const UNKNOWN_NAME: &str = "…";
+
 #[derive(Clone, Debug)]
 pub(crate) struct ParticipantState {
     pub(crate) user_id: UserId,
-    pub(crate) name: String,
+    pub(crate) name: Option<String>,
     pub(crate) online: bool,
     pub(crate) voice_active: bool,
     pub(crate) voice_status: ParticipantVoiceStatus,
@@ -21,6 +23,12 @@ pub(crate) struct ParticipantState {
     pub(crate) last_voice_at: Option<Instant>,
     pub(crate) active_stream: Option<StreamId>,
     pub(crate) voice_feedback: Option<ParticipantVoiceFeedback>,
+}
+
+impl ParticipantState {
+    pub(crate) fn display_name(&self) -> &str {
+        self.name.as_deref().unwrap_or(UNKNOWN_NAME)
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -57,7 +65,7 @@ impl Participants {
             .iter_mut()
             .find(|entry| entry.user_id == participant.user_id)
         {
-            existing.name = participant.name;
+            existing.name = Some(participant.name);
             existing.online = online;
             existing.voice_active = participant.in_call;
             existing.voice_status = participant.voice_status.normalized();
@@ -71,7 +79,7 @@ impl Participants {
             let voice_status = participant.voice_status.normalized();
             self.entries.push(ParticipantState {
                 user_id: participant.user_id,
-                name: participant.name,
+                name: Some(participant.name),
                 online,
                 voice_active: participant.in_call,
                 voice_status,
@@ -93,12 +101,13 @@ impl Participants {
     }
 
     pub(crate) fn note_message(&mut self, message: &ChatMessage) {
-        let entry = self.ensure_user(message.sender, &message.sender_name);
+        let entry = self.ensure_user(message.sender);
+        entry.name = Some(message.sender_name.clone());
         entry.last_message_ms = Some(message.timestamp_ms);
     }
 
     pub(crate) fn voice_started(&mut self, user_id: UserId, stream_id: StreamId) {
-        let entry = self.ensure_user(user_id, &format!("user {}", user_id.0));
+        let entry = self.ensure_user(user_id);
         entry.voice_active = true;
         entry.active_stream = Some(stream_id);
         entry.last_voice_at = Some(Instant::now());
@@ -122,7 +131,7 @@ impl Participants {
     }
 
     pub(crate) fn set_voice_status(&mut self, user_id: UserId, status: ParticipantVoiceStatus) {
-        let entry = self.ensure_user(user_id, &format!("user {}", user_id.0));
+        let entry = self.ensure_user(user_id);
         entry.voice_status = status.normalized();
         if entry.voice_status.muted {
             entry.talking_display = false;
@@ -160,7 +169,7 @@ impl Participants {
     }
 
     pub(crate) fn set_peer_transport(&mut self, user_id: UserId, direct: bool) {
-        let entry = self.ensure_user(user_id, &format!("user {}", user_id.0));
+        let entry = self.ensure_user(user_id);
         entry.p2p_direct = direct;
         self.sort();
     }
@@ -197,24 +206,28 @@ impl Participants {
         }
     }
 
+    pub(crate) fn display_name_for(&self, user_id: UserId) -> &str {
+        self.entries
+            .iter()
+            .find(|entry| entry.user_id == user_id)
+            .map_or(UNKNOWN_NAME, |entry| entry.display_name())
+    }
+
     pub(crate) fn online_count(&self) -> usize {
         self.entries.iter().filter(|entry| entry.online).count()
     }
 
-    fn ensure_user(&mut self, user_id: UserId, name: &str) -> &mut ParticipantState {
+    fn ensure_user(&mut self, user_id: UserId) -> &mut ParticipantState {
         if let Some(index) = self
             .entries
             .iter()
             .position(|entry| entry.user_id == user_id)
         {
-            if self.entries[index].name.starts_with("user ") {
-                self.entries[index].name = name.to_string();
-            }
             return &mut self.entries[index];
         }
         self.entries.push(ParticipantState {
             user_id,
-            name: name.to_string(),
+            name: None,
             online: true,
             voice_active: false,
             voice_status: ParticipantVoiceStatus::default(),
@@ -239,7 +252,7 @@ impl Participants {
                 .cmp(&a.online)
                 .then_with(|| b.voice_active.cmp(&a.voice_active))
                 .then_with(|| b.p2p_direct.cmp(&a.p2p_direct))
-                .then_with(|| a.name.cmp(&b.name))
+                .then_with(|| a.display_name().cmp(b.display_name()))
         });
     }
 
@@ -345,6 +358,27 @@ mod tests {
             Duration::from_millis(200),
         );
         assert!(!participants.entries[0].talking_display);
+    }
+
+    #[test]
+    fn voice_before_roster_does_not_fabricate_id_name() {
+        let mut participants = Participants::default();
+        participants.voice_started(UserId(7), StreamId(1));
+        assert_eq!(participants.entries[0].name, None);
+        assert_eq!(participants.entries[0].display_name(), UNKNOWN_NAME);
+
+        participants.set_presence(participant(UserId(7)), true);
+        assert_eq!(participants.entries[0].display_name(), "user-7");
+    }
+
+    #[test]
+    fn authoritative_name_starting_with_user_is_preserved() {
+        let mut participants = Participants::default();
+        let mut info = participant(UserId(3));
+        info.name = "user friend".to_string();
+        participants.set_presence(info, true);
+        participants.voice_started(UserId(3), StreamId(9));
+        assert_eq!(participants.entries[0].display_name(), "user friend");
     }
 
     #[test]
