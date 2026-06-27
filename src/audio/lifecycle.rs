@@ -117,6 +117,8 @@ pub(crate) enum LivePlaybackCommand {
     Packet(RemoteVoicePacket),
     StopStream(u32),
     SetStreamControl(u32, PlaybackStreamControl),
+    /// Mix a one-shot notification clip (48 kHz mono `f32`) into the output.
+    PlayNotification(Arc<[f32]>),
     Shutdown,
 }
 
@@ -200,6 +202,14 @@ impl LivePlayback {
     pub fn push(&self, packet: RemoteVoicePacket) {
         if let Some(sender) = &self.sender {
             let _ = sender.try_send(LivePlaybackCommand::Packet(packet));
+        }
+    }
+
+    /// Mixes a one-shot notification clip into the live output. Drops the clip
+    /// if the command channel is full, which is acceptable for a notification.
+    pub fn play_notification(&self, samples: Arc<[f32]>) {
+        if let Some(sender) = &self.sender {
+            let _ = sender.try_send(LivePlaybackCommand::PlayNotification(samples));
         }
     }
 

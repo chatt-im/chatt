@@ -52,7 +52,7 @@ use chatt::audio::{
     self, BufferRequest, DeviceInfo, EchoCancellationControl, LiveAudioFileSourceConfig,
     LiveAudioFileSourceReport, LiveAudioPacketLossProfile, LiveCapture, LiveCaptureConfig,
     LiveEncoderProfile, LivePlayback, LivePlaybackConfig, LivePlaybackFeedback, LivePlaybackSink,
-    LocalVoiceFrame, PlaybackStreamControl,
+    LocalVoiceFrame, NotificationSound, PlaybackStreamControl,
 };
 
 use audio_diagnostics::AudioDiagnostics;
@@ -807,7 +807,12 @@ impl App {
                 self.start_room_voice();
                 self.flush_pending_network_commands();
             }
-            NetworkEvent::Chat(message) => self.push_chat(message),
+            NetworkEvent::Chat(message) => {
+                if Some(message.sender) != self.user_id {
+                    self.play_notification(NotificationSound::MessageReceived);
+                }
+                self.push_chat(message);
+            }
             NetworkEvent::FileReceived { metadata, path } => {
                 if let Some(feed) = &self.web_feed {
                     let served_name = path
@@ -826,6 +831,13 @@ impl App {
                 ..
             } => {
                 let name = participant.display_name.clone();
+                if Some(participant.user_id) != self.user_id {
+                    self.play_notification(if online {
+                        NotificationSound::PeerJoin
+                    } else {
+                        NotificationSound::PeerLeave
+                    });
+                }
                 self.participants.set_presence(participant, online);
                 self.set_status(format!("{name} {}", if online { "joined" } else { "left" }));
             }
@@ -3336,6 +3348,14 @@ impl App {
             tuning: self.config.audio.latency.to_tuning(),
             feedback_sender,
             echo_control: Some(Arc::clone(&self.echo_control)),
+        }
+    }
+
+    /// Mixes a notification sound into the live output. The playback stream
+    /// exists only inside a call, so the `Some` guard scopes sounds to in-call.
+    fn play_notification(&self, sound: NotificationSound) {
+        if let Some(playback) = &self.playback {
+            playback.play_notification(audio::sound_samples(sound));
         }
     }
 

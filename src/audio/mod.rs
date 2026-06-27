@@ -3,6 +3,7 @@ mod capture;
 mod device;
 mod errors;
 mod lifecycle;
+mod notifications;
 mod playback;
 mod resample;
 mod shared;
@@ -18,6 +19,7 @@ pub use lifecycle::{
     Recording, RecordingConfig, start_live_capture, start_live_playback, start_playback,
     start_recording,
 };
+pub use notifications::{NotificationSound, sound_samples};
 pub use shared::{
     AudioStats, BufferRequest, CHANNELS, DEFAULT_DENOISE_RELEASE, DEFAULT_DENOISE_SUPPRESSION,
     DEFAULT_DENOISE_TYPING_RELEASE_MS, DEFAULT_DENOISE_TYPING_SUPPRESSION,
