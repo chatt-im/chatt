@@ -36,6 +36,12 @@ const CAPTURE_ROWS: [SettingsFocus; 10] = [
     SettingsFocus::CaptureBuffer,
 ];
 const PLAYBACK_ROWS: [SettingsFocus; 1] = [SettingsFocus::PlaybackBuffer];
+const WEB_ROWS: [SettingsFocus; 2] = [SettingsFocus::WebEnabled, SettingsFocus::WebBind];
+const NOTIFICATION_ROWS: [SettingsFocus; 3] = [
+    SettingsFocus::MessageNotificationVolume,
+    SettingsFocus::PeerJoinNotificationVolume,
+    SettingsFocus::PeerLeaveNotificationVolume,
+];
 const INTERFACE_ROWS: [SettingsFocus; 2] = [SettingsFocus::FormBindings, SettingsFocus::Theme];
 
 pub fn draw_settings(
@@ -184,6 +190,18 @@ fn draw_form(
     }
 
     form.spacer(1);
+    draw_section(form, buf, theme, "Web Log Server");
+    for row in WEB_ROWS {
+        draw_control_row(form, buf, theme, settings, row, dirty);
+    }
+
+    form.spacer(1);
+    draw_section(form, buf, theme, "Notifications");
+    for row in NOTIFICATION_ROWS {
+        draw_control_row(form, buf, theme, settings, row, dirty);
+    }
+
+    form.spacer(1);
     draw_section(form, buf, theme, "Interface Settings");
     for row in INTERFACE_ROWS {
         draw_control_row(form, buf, theme, settings, row, dirty);
@@ -276,9 +294,19 @@ fn draw_control_row(
     };
     let focused = form.focus() == field;
     let error = settings.field_error(field).is_some();
+    if kind == FormFieldKind::Disabled {
+        draw_disabled_row(
+            area,
+            buf,
+            theme,
+            setting_label(field),
+            &settings.option_label(field),
+        );
+        return;
+    }
     if kind == FormFieldKind::Text {
         if focused {
-            let value = settings.buffer_text(field);
+            let value = settings.field_text(field);
             if let Some((commit_field, text)) = form.focus_text(field, &value, false) {
                 let _ = settings.commit_field_text(commit_field, text);
             }
@@ -440,6 +468,23 @@ fn draw_value_row(
     );
 }
 
+fn draw_disabled_row(area: Rect, buf: &mut Buffer, theme: &Theme, label: &str, value: &str) {
+    let mut palette = widgets::RowPalette::from_theme(theme);
+    palette.label = theme.subtle;
+    palette.value = theme.subtle;
+    widgets::draw_labeled_value_with(
+        area,
+        buf,
+        palette,
+        LABEL_WIDTH,
+        label,
+        value,
+        false,
+        false,
+        false,
+    );
+}
+
 pub(crate) fn setting_label(focus: SettingsFocus) -> &'static str {
     match focus {
         SettingsFocus::CaptureDevice | SettingsFocus::PlaybackDevice => "Device",
@@ -455,6 +500,11 @@ pub(crate) fn setting_label(focus: SettingsFocus) -> &'static str {
         SettingsFocus::TypingVadRelease => "Gate Release",
         SettingsFocus::CaptureBuffer => "Capture Buffer",
         SettingsFocus::PlaybackBuffer => "Playback Buffer",
+        SettingsFocus::WebEnabled => "Web Log",
+        SettingsFocus::WebBind => "Web Bind",
+        SettingsFocus::MessageNotificationVolume => "Message Volume",
+        SettingsFocus::PeerJoinNotificationVolume => "Join Volume",
+        SettingsFocus::PeerLeaveNotificationVolume => "Leave Volume",
         SettingsFocus::FormBindings => "Form Bindings",
         SettingsFocus::Theme => "Theme",
         SettingsFocus::Refresh => "Refresh",
@@ -715,6 +765,9 @@ fn draw_option_detail(
         _ => settings.option_label(focus),
     };
     widgets::draw_metadata_line(rows.take_top(1), buf, theme, panel, 10, "Current", &current);
+    if let Some(reason) = settings.disabled_reason(focus) {
+        widgets::draw_metadata_line(rows.take_top(1), buf, theme, panel, 10, "Disabled", reason);
+    }
     if let Some(error) = settings.field_error(focus) {
         rows.take_top(1).with(panel).fill(buf);
         for line in wrap_detail(&error, rows.w as usize) {
@@ -793,6 +846,8 @@ mod tests {
         expected.push(SettingsFocus::PlaybackDevice);
         expected.push(SettingsFocus::RawPlaybackDevice);
         expected.extend(PLAYBACK_ROWS);
+        expected.extend(WEB_ROWS);
+        expected.extend(NOTIFICATION_ROWS);
         expected.extend(INTERFACE_ROWS);
         expected.extend(ACTION_ROWS);
 
@@ -804,6 +859,8 @@ mod tests {
         for title in [
             "Capture Settings",
             "Playback Settings",
+            "Web Log Server",
+            "Notifications",
             "Interface Settings",
             "Actions",
         ] {

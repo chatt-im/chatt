@@ -8,7 +8,7 @@ use toml_spanner::{Arena, Item};
 use crate::{
     audio::{
         BufferRequest, DenoiseConfig, DenoiseSuppression, DenoiseTypingSuppression,
-        LiveAudioPacketLossProfile, LiveAudioTuning,
+        LiveAudioPacketLossProfile, LiveAudioTuning, NotificationSound,
     },
     bindings::BindingRuntime,
     client_net::ClientConfig,
@@ -28,6 +28,9 @@ pub const DEFAULT_DENOISE_TYPING_RELEASE_MS: u64 = crate::audio::DEFAULT_DENOISE
 pub const MIN_USER_VOLUME_DB: f32 = -24.0;
 pub const MAX_USER_VOLUME_DB: f32 = 12.0;
 pub const USER_VOLUME_DB_STEP: f32 = 0.5;
+pub const MIN_NOTIFICATION_VOLUME_DB: f32 = -24.0;
+pub const MAX_NOTIFICATION_VOLUME_DB: f32 = 12.0;
+pub const NOTIFICATION_VOLUME_DB_STEP: f32 = 0.5;
 
 #[derive(Clone, Debug, Toml)]
 #[toml(FromToml, ToToml, rename_all = "kebab-case")]
@@ -413,9 +416,6 @@ pub struct WebConfig {
     /// The loopback address the web server binds.
     #[toml(default = default_web_bind())]
     pub bind: String,
-    /// The directory of built frontend assets to serve at `/`.
-    #[toml(default = default_web_assets())]
-    pub assets_dir: String,
 }
 
 impl Default for WebConfig {
@@ -423,7 +423,6 @@ impl Default for WebConfig {
         Self {
             enabled: false,
             bind: default_web_bind(),
-            assets_dir: default_web_assets(),
         }
     }
 }
@@ -431,6 +430,41 @@ impl Default for WebConfig {
 impl WebConfig {
     pub fn is_default(&self) -> bool {
         *self == WebConfig::default()
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Toml)]
+#[toml(FromToml, ToToml, rename_all = "kebab-case")]
+pub struct NotificationConfig {
+    #[toml(default)]
+    pub message_volume_db: f32,
+    #[toml(default)]
+    pub peer_join_volume_db: f32,
+    #[toml(default)]
+    pub peer_leave_volume_db: f32,
+}
+
+impl Default for NotificationConfig {
+    fn default() -> Self {
+        Self {
+            message_volume_db: 0.0,
+            peer_join_volume_db: 0.0,
+            peer_leave_volume_db: 0.0,
+        }
+    }
+}
+
+impl NotificationConfig {
+    pub fn volume_db(&self, sound: NotificationSound) -> f32 {
+        match sound {
+            NotificationSound::MessageReceived => self.message_volume_db,
+            NotificationSound::PeerJoin => self.peer_join_volume_db,
+            NotificationSound::PeerLeave => self.peer_leave_volume_db,
+        }
+    }
+
+    pub fn is_default(&self) -> bool {
+        *self == NotificationConfig::default()
     }
 }
 
@@ -548,6 +582,8 @@ pub struct Config {
     pub p2p: P2pConfig,
     #[toml(default, style = Header, ToToml skip_if = WebConfig::is_default)]
     pub web: WebConfig,
+    #[toml(default, style = Header, ToToml skip_if = NotificationConfig::is_default)]
+    pub notifications: NotificationConfig,
     #[toml(default, style = Header, ToToml skip_if = Vec::is_empty)]
     pub user_audio: Vec<UserAudioPreference>,
     // Serialized so a save never drops a configured soundboard; an unconfigured
@@ -633,6 +669,13 @@ impl Config {
         self.user_audio
             .retain(|preference| preference.volume_db != 0.0);
         self.sort_user_audio();
+        self.web.bind = self.web.bind.trim().to_string();
+        self.notifications.message_volume_db =
+            snap_notification_volume_db(self.notifications.message_volume_db);
+        self.notifications.peer_join_volume_db =
+            snap_notification_volume_db(self.notifications.peer_join_volume_db);
+        self.notifications.peer_leave_volume_db =
+            snap_notification_volume_db(self.notifications.peer_leave_volume_db);
         self.soundboard.loss = self.soundboard.loss.trim().to_string();
         for clip in &mut self.soundboard.clips {
             clip.name = clip.name.trim().to_string();
@@ -649,6 +692,28 @@ impl Config {
             return Err(format!(
                 "{source}: audio bitrate-bps must be between 8000 and 96000"
             ));
+        }
+        self.web
+            .bind
+            .parse::<std::net::SocketAddr>()
+            .map_err(|error| format!("{source}: web bind must be a socket address: {error}"))?;
+        for (name, volume_db) in [
+            ("message-volume-db", self.notifications.message_volume_db),
+            (
+                "peer-join-volume-db",
+                self.notifications.peer_join_volume_db,
+            ),
+            (
+                "peer-leave-volume-db",
+                self.notifications.peer_leave_volume_db,
+            ),
+        ] {
+            if !(MIN_NOTIFICATION_VOLUME_DB..=MAX_NOTIFICATION_VOLUME_DB).contains(&volume_db) {
+                return Err(format!(
+                    "{source}: notifications {name} must be between {:.1} and {:.1}",
+                    MIN_NOTIFICATION_VOLUME_DB, MAX_NOTIFICATION_VOLUME_DB
+                ));
+            }
         }
         let mut aliases = HashSet::new();
         for server in &self.servers {
@@ -850,6 +915,19 @@ pub fn snap_user_volume_db(volume_db: f32) -> f32 {
     }
 }
 
+pub fn snap_notification_volume_db(volume_db: f32) -> f32 {
+    if !volume_db.is_finite() {
+        return 0.0;
+    }
+    let snapped = (volume_db / NOTIFICATION_VOLUME_DB_STEP).round() * NOTIFICATION_VOLUME_DB_STEP;
+    let clamped = snapped.clamp(MIN_NOTIFICATION_VOLUME_DB, MAX_NOTIFICATION_VOLUME_DB);
+    if clamped.abs() < f32::EPSILON {
+        0.0
+    } else {
+        clamped
+    }
+}
+
 fn reject_deprecated_config_keys(
     doc: &toml_spanner::Document<'_>,
     source: &str,
@@ -941,10 +1019,6 @@ fn default_server_alias() -> String {
 
 fn default_web_bind() -> String {
     "127.0.0.1:8080".to_string()
-}
-
-fn default_web_assets() -> String {
-    "web/dist".to_string()
 }
 
 fn default_servers() -> Vec<ServerEntry> {

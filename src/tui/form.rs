@@ -14,6 +14,8 @@ pub(crate) enum FormFieldKind {
     Choice,
     Select,
     Action,
+    Disabled,
+    #[allow(dead_code)]
     Static,
 }
 
@@ -194,7 +196,9 @@ impl<F: Copy + Eq> FormState<F> {
         field: F,
         kind: FormFieldKind,
     ) -> Option<Rect> {
-        if kind != FormFieldKind::Static && !self.frame_order.contains(&field) {
+        if !matches!(kind, FormFieldKind::Static | FormFieldKind::Disabled)
+            && !self.frame_order.contains(&field)
+        {
             self.frame_order.push(field);
         }
         self.fields.push(FieldEntry {
@@ -210,6 +214,7 @@ impl<F: Copy + Eq> FormState<F> {
                 | FormFieldKind::Select
                 | FormFieldKind::Action => HitKind::Activate,
                 FormFieldKind::Static => HitKind::Focus,
+                FormFieldKind::Disabled => return row.rect,
             };
             self.register_hit(field, rect, hit);
         }
@@ -223,7 +228,9 @@ impl<F: Copy + Eq> FormState<F> {
         field: F,
         kind: FormFieldKind,
     ) {
-        if kind != FormFieldKind::Static && !self.frame_order.contains(&field) {
+        if !matches!(kind, FormFieldKind::Static | FormFieldKind::Disabled)
+            && !self.frame_order.contains(&field)
+        {
             self.frame_order.push(field);
         }
         self.fields.push(FieldEntry {
@@ -238,6 +245,7 @@ impl<F: Copy + Eq> FormState<F> {
             | FormFieldKind::Select
             | FormFieldKind::Action => HitKind::Activate,
             FormFieldKind::Static => HitKind::Focus,
+            FormFieldKind::Disabled => return,
         };
         self.register_hit(field, rect, hit);
     }
@@ -259,6 +267,9 @@ impl<F: Copy + Eq> FormState<F> {
         if !self.frame_order.is_empty() {
             self.order.clear();
             self.order.extend(self.frame_order.iter().copied());
+            if !self.order.contains(&self.focus) {
+                self.focus = self.order[0];
+            }
         }
         self.scroll = self.max_scroll().min(self.scroll);
         self.ensure_focus_visible();

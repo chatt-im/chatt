@@ -1352,6 +1352,10 @@ impl App {
             | SettingsFocus::TypingSuppression
             | SettingsFocus::TypingVadEnter
             | SettingsFocus::TypingVadRelease
+            | SettingsFocus::WebEnabled
+            | SettingsFocus::MessageNotificationVolume
+            | SettingsFocus::PeerJoinNotificationVolume
+            | SettingsFocus::PeerLeaveNotificationVolume
             | SettingsFocus::FormBindings
             | SettingsFocus::Theme => {
                 let mutation = session.draft.adjust(session.form.focus(), delta);
@@ -1359,6 +1363,7 @@ impl App {
             }
             SettingsFocus::CaptureBuffer
             | SettingsFocus::PlaybackBuffer
+            | SettingsFocus::WebBind
             | SettingsFocus::Refresh
             | SettingsFocus::Save
             | SettingsFocus::Close => {}
@@ -1389,12 +1394,18 @@ impl App {
             | SettingsFocus::TypingSuppression
             | SettingsFocus::TypingVadEnter
             | SettingsFocus::TypingVadRelease
+            | SettingsFocus::WebEnabled
+            | SettingsFocus::MessageNotificationVolume
+            | SettingsFocus::PeerJoinNotificationVolume
+            | SettingsFocus::PeerLeaveNotificationVolume
             | SettingsFocus::FormBindings
             | SettingsFocus::Theme => {
                 let mutation = session.draft.activate(session.form.focus());
                 self.apply_settings_mutation(session, mutation);
             }
-            SettingsFocus::CaptureBuffer | SettingsFocus::PlaybackBuffer => {
+            SettingsFocus::CaptureBuffer
+            | SettingsFocus::PlaybackBuffer
+            | SettingsFocus::WebBind => {
                 self.move_settings_focus(session, 1);
             }
         }
@@ -1420,16 +1431,20 @@ impl App {
     fn sync_settings_change(&mut self, session: &mut SettingsSession) {
         self.config.ui.form_bindings = session.draft.form_bindings();
         self.apply_theme(session.draft.theme());
-        // Never open a malformed ALSA string. Hold the audio config at its last
-        // valid state until the device string is fixed, then the diff below
+        // Never place malformed free-form settings into the live config. Hold
+        // the last valid state until the text is fixed, then the diff below
         // re-applies every pending change.
-        if let Some(reason) = session.draft.device_string_invalid() {
+        if let Some(reason) = session.draft.settings_text_invalid() {
             self.mark_settings_dirty(session);
-            self.set_status(format!("audio not applied: {reason}"));
+            self.set_status(format!("settings not applied: {reason}"));
             return;
         }
         let old = self.config.audio.clone();
+        let old_web = self.config.web.clone();
         self.config.audio = session.draft.to_audio();
+        self.config.web = session.draft.to_web();
+        self.config.notifications = session.draft.to_notifications();
+        self.apply_web_setting(&old_web);
         self.apply_echo_cancellation_setting();
         self.apply_active_capture_amplification(self.config.audio.max_amplification);
         let (capture, playback) = audio_restart_flags(&old, &self.config.audio);
@@ -1450,6 +1465,41 @@ impl App {
         self.config.ui.theme = choice;
         self.theme = Theme::from_choice(choice);
         self.room.apply_theme(&self.theme);
+    }
+
+    fn apply_web_setting(&mut self, old: &config::WebConfig) {
+        if old.enabled && !self.config.web.enabled {
+            if let Some(feed) = self.web_feed.take() {
+                feed.stop();
+                self.set_status("web log server stopped");
+            }
+            return;
+        }
+
+        if old.enabled && self.config.web.enabled && old.bind != self.config.web.bind {
+            if let Some(feed) = self.web_feed.take() {
+                feed.stop();
+            }
+        }
+
+        if self.config.web.enabled && self.web_feed.is_none() {
+            match crate::web_server::spawn(
+                &self.config.web,
+                self.config.files.receive_dir_path(),
+                self.config.ui.max_messages as usize,
+            ) {
+                Ok(sender) => {
+                    self.web_feed = Some(sender);
+                    self.set_status(format!(
+                        "web log server listening on {}",
+                        self.config.web.bind
+                    ));
+                }
+                Err(error) => {
+                    self.set_error(format!("web log server failed: {error}"));
+                }
+            }
+        }
     }
 
     fn schedule_audio_apply(&mut self, capture: bool, playback: bool) {
@@ -2126,7 +2176,7 @@ impl App {
         // then persists the live config to disk.
         self.commit_settings_form_text(session);
         self.sync_settings_change(session);
-        if let Some(reason) = session.draft.device_string_invalid() {
+        if let Some(reason) = session.draft.settings_text_invalid() {
             self.set_error(format!("not saved: {reason}"));
             return;
         }
@@ -2790,7 +2840,19 @@ impl App {
     /// exists only inside a call, so the `Some` guard scopes sounds to in-call.
     fn play_notification(&self, sound: NotificationSound) {
         if let Some(playback) = &self.playback {
-            playback.play_notification(audio::sound_samples(sound));
+            let volume_db = self.config.notifications.volume_db(sound);
+            let samples = audio::sound_samples(sound);
+            if volume_db == 0.0 {
+                playback.play_notification(samples);
+            } else {
+                let gain = 10.0_f32.powf(volume_db / 20.0);
+                let scaled: Arc<[f32]> = samples
+                    .iter()
+                    .map(|sample| sample * gain)
+                    .collect::<Vec<_>>()
+                    .into();
+                playback.play_notification(scaled);
+            }
         }
     }
 
