@@ -218,6 +218,9 @@ pub struct ChatMessage {
     pub sender_name: String,
     pub timestamp_ms: u64,
     pub body: String,
+    /// `Some` when this chat announces a file transfer, carrying that transfer's
+    /// id. The web view correlates the announcement with the inline file by it.
+    pub file_transfer_id: Option<FileTransferId>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Jsony)]

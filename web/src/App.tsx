@@ -225,7 +225,21 @@ export default function App() {
         oldestSeq = env.oldest_seq;
         hasMore = env.has_more;
       } else {
-        setMessages((prev) => [...prev, env.message]);
+        // Upsert by file_id: a file's announcement placeholder and its later
+        // inline version share an id, so the second arrival enriches the first
+        // in place rather than appearing as a separate message.
+        const msg = env.message;
+        setMessages((prev) => {
+          if (msg.file_id !== null) {
+            const i = prev.findIndex((m) => m.file_id === msg.file_id);
+            if (i >= 0) {
+              const next = prev.slice();
+              next[i] = msg;
+              return next;
+            }
+          }
+          return [...prev, msg];
+        });
         pin();
       }
     };

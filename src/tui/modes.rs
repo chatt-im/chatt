@@ -965,6 +965,7 @@ mod tests {
                 sender_name: format!("user{}", sender.0),
                 timestamp_ms,
                 body: body.into(),
+                file_transfer_id: None,
             },
             None,
         );
