@@ -104,6 +104,7 @@ pub(crate) struct FormState<F> {
     bindings: FormBindings,
     editor: Editor,
     active_text: Option<F>,
+    focused_kind: FormFieldKind,
 }
 
 impl<F: Copy + Eq> FormState<F> {
@@ -126,9 +127,11 @@ impl<F: Copy + Eq> FormState<F> {
             bindings,
             editor: new_form_editor(bindings),
             active_text: None,
+            focused_kind: FormFieldKind::Action,
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn with_order(
         focus: F,
         bindings: FormBindings,
@@ -141,6 +144,20 @@ impl<F: Copy + Eq> FormState<F> {
 
     pub(crate) fn focus(&self) -> F {
         self.focus
+    }
+
+    /// Kind of the focused field as recorded by the most recent registration
+    /// pass. Lets immediate-mode callers feed [`handle_key`](Self::handle_key)
+    /// the focused kind without a separate per-field lookup table.
+    pub(crate) fn focused_kind(&self) -> FormFieldKind {
+        self.focused_kind
+    }
+
+    /// Viewport set by the most recent [`begin_frame`](Self::begin_frame). A
+    /// headless logic pass replays the layout against the last rendered
+    /// viewport so field ids and rects match what the user sees.
+    pub(crate) fn viewport(&self) -> Rect {
+        self.viewport
     }
 
     #[cfg(test)]
@@ -201,6 +218,9 @@ impl<F: Copy + Eq> FormState<F> {
         {
             self.frame_order.push(field);
         }
+        if field == self.focus {
+            self.focused_kind = kind;
+        }
         self.fields.push(FieldEntry {
             field,
             virtual_y: row.virtual_y,
@@ -232,6 +252,9 @@ impl<F: Copy + Eq> FormState<F> {
             && !self.frame_order.contains(&field)
         {
             self.frame_order.push(field);
+        }
+        if field == self.focus {
+            self.focused_kind = kind;
         }
         self.fields.push(FieldEntry {
             field,

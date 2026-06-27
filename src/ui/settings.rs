@@ -1,55 +1,661 @@
+use crate::audio::DenoiseConfig;
+use crate::config::{FormBindings, ThemeChoice};
 use crate::{
     audio::StatsSnapshot,
     settings::{
         AudioDeviceItem, AudioDevicePickerState, AudioInputItem, AudioInputPickerState,
-        AudioOutputItem, AudioOutputPickerState, SettingsDraft, SettingsFocus,
-        selected_audio_input_label, selected_audio_output_label,
+        AudioOutputItem, AudioOutputPickerState, BITRATES, DENOISE_RELEASE_LABELS,
+        DENOISE_RELEASES, DENOISE_SUPPRESSION_LABELS, DENOISE_SUPPRESSIONS,
+        DENOISE_TYPING_VAD_LABELS, DENOISE_TYPING_VAD_THRESHOLDS, MAX_AMPLIFICATIONS,
+        NOTIFICATION_VOLUMES_DB, SettingsDraft, buffer_field_error, form_bindings_label,
+        raw_device_error, raw_device_selection, selected_audio_input_label,
+        selected_audio_output_label, volume_db_label, web_bind_error,
     },
     theme::Theme,
     tui::{
         form::{FormFieldKind, FormState},
         widgets,
     },
-    ui::vu,
+    ui::{
+        form::{ActionButton, Form as CoreForm},
+        vu,
+    },
 };
 use extui::{Buffer, Ellipsis, HAlign, Rect, vt::Modifier};
+
+pub(crate) use crate::ui::form::{FieldId, FieldIntent};
 
 const LABEL_WIDTH: u16 = 18;
 const DETAIL_WIDTH: u16 = 34;
 const MIN_DETAIL_SCREEN_WIDTH: u16 = 92;
 const MIN_PICKER_ROWS: u16 = 3;
-const ACTION_ROWS: [SettingsFocus; 3] = [
-    SettingsFocus::Refresh,
-    SettingsFocus::Save,
-    SettingsFocus::Close,
-];
-const CAPTURE_ROWS: [SettingsFocus; 10] = [
-    SettingsFocus::Bitrate,
-    SettingsFocus::Denoise,
-    SettingsFocus::EchoCancellation,
-    SettingsFocus::Amplification,
-    SettingsFocus::Suppression,
-    SettingsFocus::Release,
-    SettingsFocus::TypingSuppression,
-    SettingsFocus::TypingVadEnter,
-    SettingsFocus::TypingVadRelease,
-    SettingsFocus::CaptureBuffer,
-];
-const PLAYBACK_ROWS: [SettingsFocus; 1] = [SettingsFocus::PlaybackBuffer];
-const WEB_ROWS: [SettingsFocus; 2] = [SettingsFocus::WebEnabled, SettingsFocus::WebBind];
-const NOTIFICATION_ROWS: [SettingsFocus; 3] = [
-    SettingsFocus::MessageNotificationVolume,
-    SettingsFocus::PeerJoinNotificationVolume,
-    SettingsFocus::PeerLeaveNotificationVolume,
-];
-const INTERFACE_ROWS: [SettingsFocus; 2] = [SettingsFocus::FormBindings, SettingsFocus::Theme];
 
+const CAPTURE_SECTION: &str = "Capture Settings";
+const PLAYBACK_SECTION: &str = "Playback Settings";
+
+/// Id of the capture device row, used by the app layer to route the open
+/// device picker's key, mouse, and scroll input.
+pub(crate) fn capture_device_id() -> FieldId {
+    FieldId::new(CAPTURE_SECTION, "Device")
+}
+
+/// Id of the playback device row.
+pub(crate) fn playback_device_id() -> FieldId {
+    FieldId::new(PLAYBACK_SECTION, "Device")
+}
+
+/// Initial focus when a settings session opens.
+pub(crate) fn initial_focus() -> FieldId {
+    capture_device_id()
+}
+
+/// Builds the id for an arbitrary section/label pair. Used by tests that drive
+/// the form without running the full declaration pass.
+#[cfg(test)]
+pub(crate) fn field_id_for(section: &str, label: &str) -> FieldId {
+    FieldId::new(section, label)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DeviceSide {
+    Input,
+    Output,
+}
+
+/// Picker request emitted by a focused device row during the logic pass.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DeviceAction {
+    /// Open the picker, or confirm the highlighted item when already open.
+    Activate(DeviceSide),
+    /// Cancel the open picker, restoring the prior selection.
+    Cancel(DeviceSide),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SettingsButton {
+    Refresh,
+    Save,
+    Close,
+}
+
+/// What the focused field did this logic pass, applied by the app layer.
+#[derive(Default)]
+pub(crate) struct SettingsOutput {
+    /// A draft value changed and the live config should resync.
+    pub(crate) changed: bool,
+    pub(crate) button: Option<SettingsButton>,
+    pub(crate) device: Option<DeviceAction>,
+}
+
+/// Detail captured for the focused field, rendered into the side panel.
+enum FocusDetail {
+    Option {
+        current: String,
+        error: Option<String>,
+        help: &'static str,
+    },
+    Device(DeviceSide),
+}
+
+struct SettingsForm<'a> {
+    form: CoreForm<'a>,
+    dirty: bool,
+    detail: Option<FocusDetail>,
+    output: SettingsOutput,
+}
+
+impl<'a> SettingsForm<'a> {
+    fn new(
+        state: &'a mut FormState<FieldId>,
+        buf: Option<&'a mut Buffer>,
+        theme: &'a Theme,
+        dirty: bool,
+        intent: FieldIntent,
+        commit: Option<(FieldId, String)>,
+        focus_column: Option<u16>,
+    ) -> Self {
+        Self {
+            form: CoreForm::new(state, buf, theme, dirty, intent, commit, focus_column)
+                .with_label_width(LABEL_WIDTH),
+            dirty,
+            detail: None,
+            output: SettingsOutput::default(),
+        }
+    }
+
+    fn section(&mut self, title: &str) {
+        self.form.section(title);
+    }
+
+    fn enabled(&mut self, reason: Option<&'static str>, body: impl FnOnce(&mut Self)) {
+        let previous = self.form.set_enabled(reason.is_none());
+        body(self);
+        self.form.set_enabled(previous);
+    }
+
+    fn checkbox(&mut self, label: &str, value: &mut bool) -> crate::ui::form::Response {
+        let response = self.form.checkbox(label, value);
+        if response.changed() {
+            self.output.changed = true;
+        }
+        if response.is_focus() {
+            self.set_option_detail(if *value { "on" } else { "off" }.to_string(), None);
+        }
+        response
+    }
+
+    fn choice(
+        &mut self,
+        label: &str,
+        index: &mut usize,
+        len: usize,
+        fmt: impl Fn(usize) -> String,
+    ) -> crate::ui::form::Response {
+        let response = self.form.choice(label, index, len, &fmt);
+        if response.changed() {
+            self.output.changed = true;
+        }
+        if response.is_focus() {
+            self.set_option_detail(fmt(*index), None);
+        }
+        response
+    }
+
+    fn choice_value<T: Copy + PartialEq>(
+        &mut self,
+        label: &str,
+        value: &mut T,
+        options: &[T],
+        fmt: impl Fn(T) -> String,
+    ) -> crate::ui::form::Response {
+        let response = self.form.choice_value(label, value, options, &fmt);
+        if response.changed() {
+            self.output.changed = true;
+        }
+        if response.is_focus() {
+            self.set_option_detail(fmt(*value), None);
+        }
+        response
+    }
+
+    fn text(
+        &mut self,
+        label: &str,
+        value: &mut String,
+        validate: impl Fn(&str) -> Option<String>,
+    ) -> crate::ui::form::Response {
+        let response = self.form.text(label, value, &validate);
+        if response.changed() {
+            self.output.changed = true;
+        }
+        if response.is_focus() {
+            self.set_option_detail(value.clone(), validate(value));
+        }
+        response
+    }
+
+    /// Records the help text for the focused field. Call from the `is_focus`
+    /// guard of a widget. The widget already filled the current value and any
+    /// validation error.
+    pub(crate) fn set_help(&mut self, help: &'static str) {
+        if let Some(FocusDetail::Option { help: slot, .. }) = &mut self.detail {
+            *slot = help;
+        }
+    }
+
+    /// A device picker row: an enumerated [`FormFieldKind::Select`], or a raw
+    /// ALSA text field while `raw` is on. Emits a [`DeviceAction`] when focused
+    /// and activated, and the picker overlay when open.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn device(
+        &mut self,
+        side: DeviceSide,
+        raw: bool,
+        selection: &mut Option<String>,
+        items: &[AudioDeviceItem],
+        picker: &mut AudioDevicePickerState,
+        selected_label: String,
+    ) -> crate::ui::form::Response {
+        let id = self.form.id("Device");
+        let row = self.form.next_row(1);
+        if raw {
+            let area = self.form.register_field(row, id, FormFieldKind::Text);
+            let focused = self.form.focus() == id;
+            let mut changed = false;
+            if let Some((commit_id, text)) = self.form.take_commit() {
+                if commit_id == id {
+                    let next = raw_device_selection(&text);
+                    if *selection != next {
+                        *selection = next;
+                        changed = true;
+                    }
+                } else {
+                    self.form.restore_commit((commit_id, text));
+                }
+            }
+            let current = selection.clone().unwrap_or_default();
+            if focused {
+                self.form.seed_editor(id, &current, area);
+            }
+            let error = raw_device_error(&current);
+            if focused {
+                let shown = if current.is_empty() {
+                    "system default".to_string()
+                } else {
+                    current.clone()
+                };
+                self.set_option_detail(shown, error.clone());
+            }
+            self.form
+                .render_text_row(id, "Device", &current, focused, error.is_some(), area);
+            if changed {
+                self.output.changed = true;
+            }
+            return self.form.respond(focused, changed);
+        }
+
+        let area = self.form.register_field(row, id, FormFieldKind::Select);
+        let focused = self.form.focus() == id;
+        if focused {
+            match self.form.intent() {
+                FieldIntent::Activate => self.output.device = Some(DeviceAction::Activate(side)),
+                FieldIntent::Adjust(delta) if delta > 0 => {
+                    self.output.device = Some(DeviceAction::Activate(side))
+                }
+                FieldIntent::Adjust(_) => self.output.device = Some(DeviceAction::Cancel(side)),
+                FieldIntent::None => {}
+            }
+            self.detail = Some(FocusDetail::Device(side));
+        }
+        let value = if picker.open && picker.searching {
+            format!("/{}", picker.selector.query())
+        } else {
+            selected_label
+        };
+        if let Some(area) = area {
+            self.form
+                .draw_labeled_value(area, "Device", &value, focused);
+        }
+        if picker.open {
+            self.draw_picker(id, items, picker);
+        }
+        self.form.respond(focused, false)
+    }
+
+    /// The trailing action-button row (Refresh / Save / Close). Buttons share a
+    /// virtual row so left/right moves between them.
+    fn actions(&mut self) {
+        let specs = [
+            ActionButton {
+                key: "Refresh",
+                label: "Refresh devices",
+                value: SettingsButton::Refresh,
+                help: "Re-scan audio devices using the current buffer requests.",
+            },
+            ActionButton {
+                key: "Save",
+                label: if self.dirty {
+                    "Save config *"
+                } else {
+                    "Save config"
+                },
+                value: SettingsButton::Save,
+                help: "Persist the draft to chatt.toml.",
+            },
+            ActionButton {
+                key: "Close",
+                label: "Back to chat",
+                value: SettingsButton::Close,
+                help: "Return to chat without saving further changes.",
+            },
+        ];
+        let response = self.form.actions(&specs);
+        if let Some(button) = response.activated {
+            self.output.button = Some(button);
+        }
+        if response.focused.is_some() {
+            self.set_option_detail(String::new(), None);
+            if let Some(help) = response.help {
+                self.set_help(help);
+            }
+        }
+    }
+
+    fn set_option_detail(&mut self, current: String, error: Option<String>) {
+        self.detail = Some(FocusDetail::Option {
+            current,
+            error,
+            help: "",
+        });
+    }
+
+    fn draw_picker(
+        &mut self,
+        id: FieldId,
+        items: &[AudioDeviceItem],
+        picker: &mut AudioDevicePickerState,
+    ) {
+        let rows = picker_rows(items);
+        if rows == 0 {
+            return;
+        }
+        let area_row = self.form.next_row(rows);
+        let Some(area) = area_row.rect else {
+            return;
+        };
+        let focused = self.form.focus() == id;
+        self.form.with_draw(|state, buf, theme| {
+            buf.clear_rect(area, theme.background);
+            if picker.selector.filtered_len() == 0 {
+                area.with(theme.subtle)
+                    .with(HAlign::Center)
+                    .text(buf, "No matching audio devices");
+                return;
+            }
+            let item_height = if area.h < 4 { 1 } else { 2 };
+            picker.selector.render(
+                area,
+                item_height,
+                buf,
+                |_, item_index, selected, area, buf| {
+                    state.register_picker_item(id, area, item_index);
+                    if let Some(item) = items.get(item_index) {
+                        draw_audio_item(area, buf, theme, item, selected, focused);
+                    }
+                },
+            );
+        });
+    }
+}
+
+/// Declares the whole settings form. The single place every field lives: one
+/// widget call per row carries its label, the `&mut` it mutates, its input
+/// kind, and (via the `is_focus` guard) its detail help.
+fn settings_ui(
+    form: &mut SettingsForm,
+    draft: &mut SettingsDraft,
+    input_items: &[AudioInputItem],
+    input_picker: &mut AudioInputPickerState,
+    output_items: &[AudioOutputItem],
+    output_picker: &mut AudioOutputPickerState,
+) {
+    form.section(CAPTURE_SECTION);
+    let input_label = selected_audio_input_label(input_items, draft.input_device_id.as_deref());
+    form.device(
+        DeviceSide::Input,
+        draft.input_raw,
+        &mut draft.input_device_id,
+        input_items,
+        input_picker,
+        input_label,
+    );
+    if form.checkbox("Raw Device", &mut draft.input_raw).is_focus() {
+        form.set_help(
+            "Type a raw ALSA device string (e.g. hw:0,0) instead of picking an enumerated device.",
+        );
+    }
+    if form
+        .choice("Bitrate", &mut draft.bitrate_index, BITRATES.len(), |i| {
+            format!("{} kbps", BITRATES[i] / 1000)
+        })
+        .is_focus()
+    {
+        form.set_help("Opus target bitrate for outgoing voice packets.");
+    }
+    if form
+        .choice_value(
+            "Denoise",
+            &mut draft.denoise,
+            &DenoiseConfig::ALL,
+            |denoise| denoise.label().to_string(),
+        )
+        .is_focus()
+    {
+        form.set_help("Noise suppression before encoding. Useful for fans and room noise.");
+    }
+    if form
+        .checkbox("Echo Cancel", &mut draft.echo_cancellation)
+        .is_focus()
+    {
+        form.set_help("Cancels speaker echo from the microphone path when supported.");
+    }
+    if form
+        .choice(
+            "Max Gain",
+            &mut draft.amplification_index,
+            MAX_AMPLIFICATIONS.len(),
+            amplification_label,
+        )
+        .is_focus()
+    {
+        form.set_help("Auto-gain ceiling for quiet microphones; 0 dB disables amplification.");
+    }
+
+    let denoise_disabled = draft.denoise_tuning_disabled();
+    form.enabled(denoise_disabled, |form| {
+        if form
+            .choice(
+                "Suppression",
+                &mut draft.suppression_index,
+                DENOISE_SUPPRESSIONS.len(),
+                |i| DENOISE_SUPPRESSION_LABELS[i].to_string(),
+            )
+            .is_focus()
+        {
+            form.set_help(
+                "RNNoise over-suppression of residual noise (typing, fans). off keeps stock denoising.",
+            );
+        }
+        if form
+            .choice("Release", &mut draft.release_index, DENOISE_RELEASES.len(), |i| {
+                DENOISE_RELEASE_LABELS[i].to_string()
+            })
+            .is_focus()
+        {
+            form.set_help(
+                "Smooths how fast RNNoise releases suppression, stopping noise swelling up after a pause.",
+            );
+        }
+        if form.checkbox("Typing Gate", &mut draft.typing_suppression).is_focus() {
+            form.set_help("Ducks loud low-VAD desk and keyboard thumps after RNNoise.");
+        }
+    });
+
+    let vad_disabled = draft.typing_vad_disabled();
+    form.enabled(vad_disabled, |form| {
+        let enter = form.choice(
+            "Gate Start",
+            &mut draft.typing_vad_enter_index,
+            DENOISE_TYPING_VAD_THRESHOLDS.len(),
+            |i| DENOISE_TYPING_VAD_LABELS[i].to_string(),
+        );
+        if enter.is_focus() {
+            form.set_help(
+                "Typing gate engages when Earshot VAD is below this threshold and acoustic guards match.",
+            );
+        }
+        if enter.changed() && draft.typing_vad_release_index < draft.typing_vad_enter_index {
+            draft.typing_vad_release_index = draft.typing_vad_enter_index;
+        }
+        let release = form.choice(
+            "Gate Release",
+            &mut draft.typing_vad_release_index,
+            DENOISE_TYPING_VAD_THRESHOLDS.len(),
+            |i| DENOISE_TYPING_VAD_LABELS[i].to_string(),
+        );
+        if release.is_focus() {
+            form.set_help("Typing gate releases only after Earshot VAD reaches this threshold.");
+        }
+        if release.changed() && draft.typing_vad_release_index < draft.typing_vad_enter_index {
+            draft.typing_vad_enter_index = draft.typing_vad_release_index;
+        }
+    });
+
+    if form
+        .text(
+            "Capture Buffer",
+            &mut draft.input_buffer,
+            buffer_field_error,
+        )
+        .is_focus()
+    {
+        form.set_help("Requested capture buffer in samples, or default for the host backend.");
+    }
+
+    form.section(PLAYBACK_SECTION);
+    let output_label = selected_audio_output_label(output_items, draft.output_device_id.as_deref());
+    form.device(
+        DeviceSide::Output,
+        draft.output_raw,
+        &mut draft.output_device_id,
+        output_items,
+        output_picker,
+        output_label,
+    );
+    if form
+        .checkbox("Raw Device", &mut draft.output_raw)
+        .is_focus()
+    {
+        form.set_help(
+            "Type a raw ALSA device string (e.g. hw:0,0) instead of picking an enumerated device.",
+        );
+    }
+    if form
+        .text(
+            "Playback Buffer",
+            &mut draft.output_buffer,
+            buffer_field_error,
+        )
+        .is_focus()
+    {
+        form.set_help("Requested playback buffer in samples, or default for the host backend.");
+    }
+
+    form.section("Web Log Server");
+    if form.checkbox("Web Log", &mut draft.web_enabled).is_focus() {
+        form.set_help("Starts the browser chat-log server. Bind is saved even while disabled.");
+    }
+    if form
+        .text("Web Bind", &mut draft.web_bind, web_bind_error)
+        .is_focus()
+    {
+        form.set_help(
+            "Loopback socket address for the browser chat-log server, for example 127.0.0.1:8080.",
+        );
+    }
+
+    form.section("Notifications");
+    if form
+        .choice(
+            "Message Volume",
+            &mut draft.message_notification_volume_index,
+            NOTIFICATION_VOLUMES_DB.len(),
+            notification_volume_label,
+        )
+        .is_focus()
+    {
+        form.set_help("Volume for incoming-message notification sounds.");
+    }
+    if form
+        .choice(
+            "Join Volume",
+            &mut draft.peer_join_notification_volume_index,
+            NOTIFICATION_VOLUMES_DB.len(),
+            notification_volume_label,
+        )
+        .is_focus()
+    {
+        form.set_help("Volume for peer-joined notification sounds.");
+    }
+    if form
+        .choice(
+            "Leave Volume",
+            &mut draft.peer_leave_notification_volume_index,
+            NOTIFICATION_VOLUMES_DB.len(),
+            notification_volume_label,
+        )
+        .is_focus()
+    {
+        form.set_help("Volume for peer-left notification sounds.");
+    }
+
+    form.section("Interface Settings");
+    if form
+        .choice_value(
+            "Form Bindings",
+            &mut draft.form_bindings,
+            &[FormBindings::Standard, FormBindings::Vim],
+            |bindings| form_bindings_label(bindings).to_string(),
+        )
+        .is_focus()
+    {
+        form.set_help("Keyboard model used by forms such as settings and server editing.");
+    }
+    if form
+        .choice_value("Theme", &mut draft.theme, &ThemeChoice::ALL, |theme| {
+            theme.label().to_string()
+        })
+        .is_focus()
+    {
+        form.set_help("Color theme for the interface. Applies immediately; Save persists it.");
+    }
+
+    form.section("Actions");
+    form.actions();
+}
+
+fn amplification_label(index: usize) -> String {
+    let value = MAX_AMPLIFICATIONS[index];
+    if value <= 0.0 {
+        "off".to_string()
+    } else {
+        format!("{value:.0} dB")
+    }
+}
+
+fn notification_volume_label(index: usize) -> String {
+    volume_db_label(NOTIFICATION_VOLUMES_DB[index])
+}
+
+/// Replays the form layout headlessly to apply `intent` (and any pending text
+/// commit) to the focused field, returning what the app layer must act on.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn settings_logic(
+    state: &mut FormState<FieldId>,
+    draft: &mut SettingsDraft,
+    theme: &Theme,
+    dirty: bool,
+    intent: FieldIntent,
+    commit: Option<(FieldId, String)>,
+    focus_column: Option<u16>,
+    input_items: &[AudioInputItem],
+    input_picker: &mut AudioInputPickerState,
+    output_items: &[AudioOutputItem],
+    output_picker: &mut AudioOutputPickerState,
+) -> SettingsOutput {
+    let viewport = state.viewport();
+    state.begin_frame(viewport);
+    let mut form = SettingsForm::new(state, None, theme, dirty, intent, commit, focus_column);
+    settings_ui(
+        &mut form,
+        draft,
+        input_items,
+        input_picker,
+        output_items,
+        output_picker,
+    );
+    let output = std::mem::take(&mut form.output);
+    state.finish_frame();
+    output
+}
+
+#[allow(clippy::too_many_arguments)]
 pub fn draw_settings(
     area: Rect,
     buf: &mut Buffer,
     theme: &Theme,
     settings: &mut SettingsDraft,
-    form: &mut FormState<SettingsFocus>,
+    form: &mut FormState<FieldId>,
     dirty: bool,
     capture: Option<&StatsSnapshot>,
     input_items: &[AudioInputItem],
@@ -75,18 +681,24 @@ pub fn draw_settings(
         None
     };
 
-    draw_form(
-        body,
-        buf,
-        theme,
-        settings,
-        form,
-        dirty,
-        input_items,
-        input_picker,
-        output_items,
-        output_picker,
-    );
+    if body.is_empty() {
+        return;
+    }
+    form.begin_frame(body);
+    let focus_detail = {
+        let mut context =
+            SettingsForm::new(form, Some(buf), theme, dirty, FieldIntent::None, None, None);
+        settings_ui(
+            &mut context,
+            settings,
+            input_items,
+            input_picker,
+            output_items,
+            output_picker,
+        );
+        context.detail.take()
+    };
+    form.finish_frame();
 
     if let Some(detail) = detail {
         draw_focus_detail(
@@ -94,7 +706,7 @@ pub fn draw_settings(
             buf,
             theme,
             settings,
-            form.focus(),
+            focus_detail,
             input_items,
             input_picker,
             output_items,
@@ -103,460 +715,9 @@ pub fn draw_settings(
     }
 }
 
-fn draw_form(
-    area: Rect,
-    buf: &mut Buffer,
-    theme: &Theme,
-    settings: &mut SettingsDraft,
-    form: &mut FormState<SettingsFocus>,
-    dirty: bool,
-    input_items: &[AudioInputItem],
-    input_picker: &mut AudioInputPickerState,
-    output_items: &[AudioOutputItem],
-    output_picker: &mut AudioOutputPickerState,
-) {
-    if area.is_empty() {
-        return;
-    }
-
-    form.begin_frame(area);
-    draw_section(form, buf, theme, "Capture Settings");
-    let input_selected = selected_audio_input_label(input_items, settings.input_selection());
-    draw_device_row(
-        form,
-        buf,
-        theme,
-        settings,
-        SettingsFocus::CaptureDevice,
-        dirty,
-        input_picker,
-        input_selected,
-    );
-    draw_control_row(
-        form,
-        buf,
-        theme,
-        settings,
-        SettingsFocus::RawCaptureDevice,
-        dirty,
-    );
-    if input_picker.open && !settings.input_raw() {
-        draw_audio_picker(
-            form,
-            buf,
-            theme,
-            SettingsFocus::CaptureDevice,
-            input_items,
-            input_picker,
-        );
-    }
-    for row in CAPTURE_ROWS {
-        draw_control_row(form, buf, theme, settings, row, dirty);
-    }
-
-    form.spacer(1);
-    draw_section(form, buf, theme, "Playback Settings");
-    let output_selected = selected_audio_output_label(output_items, settings.output_selection());
-    draw_device_row(
-        form,
-        buf,
-        theme,
-        settings,
-        SettingsFocus::PlaybackDevice,
-        dirty,
-        output_picker,
-        output_selected,
-    );
-    draw_control_row(
-        form,
-        buf,
-        theme,
-        settings,
-        SettingsFocus::RawPlaybackDevice,
-        dirty,
-    );
-    if output_picker.open && !settings.output_raw() {
-        draw_audio_picker(
-            form,
-            buf,
-            theme,
-            SettingsFocus::PlaybackDevice,
-            output_items,
-            output_picker,
-        );
-    }
-    for row in PLAYBACK_ROWS {
-        draw_control_row(form, buf, theme, settings, row, dirty);
-    }
-
-    form.spacer(1);
-    draw_section(form, buf, theme, "Web Log Server");
-    for row in WEB_ROWS {
-        draw_control_row(form, buf, theme, settings, row, dirty);
-    }
-
-    form.spacer(1);
-    draw_section(form, buf, theme, "Notifications");
-    for row in NOTIFICATION_ROWS {
-        draw_control_row(form, buf, theme, settings, row, dirty);
-    }
-
-    form.spacer(1);
-    draw_section(form, buf, theme, "Interface Settings");
-    for row in INTERFACE_ROWS {
-        draw_control_row(form, buf, theme, settings, row, dirty);
-    }
-
-    form.spacer(1);
-    draw_section(form, buf, theme, "Actions");
-    draw_action_buttons(form, buf, theme, dirty);
-    form.finish_frame();
-}
-
-fn draw_section(form: &mut FormState<SettingsFocus>, buf: &mut Buffer, theme: &Theme, title: &str) {
-    let row = form.next_row(1);
-    if let Some(area) = row.rect {
-        widgets::draw_section_header(area, buf, theme, &format!(" {title} "));
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn draw_device_row(
-    form: &mut FormState<SettingsFocus>,
-    buf: &mut Buffer,
-    theme: &Theme,
-    settings: &mut SettingsDraft,
-    field: SettingsFocus,
-    dirty: bool,
-    picker: &AudioDevicePickerState,
-    selected: String,
-) {
-    let row = form.next_row(1);
-    let kind = settings.field_kind(field);
-    let Some(area) = form.register_field(row, field, kind) else {
-        return;
-    };
-    let focused = form.focus() == field;
-    if kind == FormFieldKind::Text {
-        let error = settings.field_error(field).is_some();
-        if focused {
-            let value = device_selection_text(settings, field);
-            if let Some((commit_field, text)) = form.focus_text(field, &value, false) {
-                let _ = settings.commit_field_text(commit_field, text);
-            }
-            let input = widgets::draw_labeled_editor_frame(
-                area,
-                buf,
-                theme,
-                LABEL_WIDTH,
-                "Device",
-                true,
-                error,
-            );
-            form.register_text_area(field, input);
-            form.render_editor(input, buf, theme);
-        } else {
-            let value = device_selection_display(settings, field);
-            draw_value_row(area, buf, theme, "Device", &value, false, dirty, error);
-        }
-        return;
-    }
-
-    let value = if picker.open && picker.searching {
-        format!("/{}", picker.selector.query())
-    } else {
-        selected
-    };
-    widgets::draw_labeled_value(
-        area,
-        buf,
-        theme,
-        LABEL_WIDTH,
-        "Device",
-        &value,
-        focused,
-        dirty,
-    );
-}
-
-fn draw_control_row(
-    form: &mut FormState<SettingsFocus>,
-    buf: &mut Buffer,
-    theme: &Theme,
-    settings: &mut SettingsDraft,
-    field: SettingsFocus,
-    dirty: bool,
-) {
-    let row = form.next_row(1);
-    let kind = settings.field_kind(field);
-    let Some(area) = form.register_field(row, field, kind) else {
-        return;
-    };
-    let focused = form.focus() == field;
-    let error = settings.field_error(field).is_some();
-    if kind == FormFieldKind::Disabled {
-        draw_disabled_row(
-            area,
-            buf,
-            theme,
-            setting_label(field),
-            &settings.option_label(field),
-        );
-        return;
-    }
-    if kind == FormFieldKind::Text {
-        if focused {
-            let value = settings.field_text(field);
-            if let Some((commit_field, text)) = form.focus_text(field, &value, false) {
-                let _ = settings.commit_field_text(commit_field, text);
-            }
-            let input = widgets::draw_labeled_editor_frame(
-                area,
-                buf,
-                theme,
-                LABEL_WIDTH,
-                setting_label(field),
-                true,
-                error,
-            );
-            form.register_text_area(field, input);
-            form.render_editor(input, buf, theme);
-        } else {
-            draw_value_row(
-                area,
-                buf,
-                theme,
-                setting_label(field),
-                &settings.option_label(field),
-                false,
-                dirty,
-                error,
-            );
-        }
-        return;
-    }
-
-    draw_value_row(
-        area,
-        buf,
-        theme,
-        setting_label(field),
-        &settings.option_label(field),
-        focused,
-        dirty,
-        error,
-    );
-    if kind == FormFieldKind::Choice {
-        let value_x = area.x.saturating_add(LABEL_WIDTH.min(area.w));
-        let value_w = area.w.saturating_sub(LABEL_WIDTH);
-        let left_w = value_w / 2;
-        if left_w > 0 {
-            form.register_adjust(
-                field,
-                Rect {
-                    x: value_x,
-                    y: area.y,
-                    w: left_w,
-                    h: area.h,
-                },
-                -1,
-            );
-        }
-        let right_w = value_w.saturating_sub(left_w);
-        if right_w > 0 {
-            form.register_adjust(
-                field,
-                Rect {
-                    x: value_x.saturating_add(left_w),
-                    y: area.y,
-                    w: right_w,
-                    h: area.h,
-                },
-                1,
-            );
-        }
-    }
-}
-
-fn draw_action_buttons(
-    form: &mut FormState<SettingsFocus>,
-    buf: &mut Buffer,
-    theme: &Theme,
-    dirty: bool,
-) {
-    let row = form.next_row(1);
-    let Some(area) = row.rect else {
-        for field in ACTION_ROWS {
-            form.register_field(row, field, FormFieldKind::Action);
-        }
-        return;
-    };
-    let width = (area.w / ACTION_ROWS.len() as u16).max(1);
-    let mut buttons = area;
-    for (index, field) in ACTION_ROWS.iter().copied().enumerate() {
-        let button = if index + 1 == ACTION_ROWS.len() {
-            buttons
-        } else {
-            buttons.take_left(width as i32)
-        };
-        form.register_rect(row, button, field, FormFieldKind::Action);
-        draw_action_button(
-            button,
-            buf,
-            theme,
-            action_label(field, dirty),
-            form.focus() == field,
-        );
-    }
-}
-
-fn draw_action_button(area: Rect, buf: &mut Buffer, theme: &Theme, label: &str, focused: bool) {
-    widgets::draw_action(area, buf, theme, label, focused);
-}
-
-fn action_label(field: SettingsFocus, dirty: bool) -> &'static str {
-    match field {
-        SettingsFocus::Refresh => "Refresh devices",
-        SettingsFocus::Save if dirty => "Save config *",
-        SettingsFocus::Save => "Save config",
-        SettingsFocus::Close => "Back to chat",
-        _ => "",
-    }
-}
-
-/// Current raw device string for the editor seed, empty when unset.
-fn device_selection_text(settings: &SettingsDraft, field: SettingsFocus) -> String {
-    let selection = match field {
-        SettingsFocus::CaptureDevice => settings.input_selection(),
-        SettingsFocus::PlaybackDevice => settings.output_selection(),
-        _ => None,
-    };
-    selection.unwrap_or("").to_string()
-}
-
-/// Display label for an unfocused raw device row, falling back to a placeholder.
-fn device_selection_display(settings: &SettingsDraft, field: SettingsFocus) -> String {
-    let text = device_selection_text(settings, field);
-    if text.is_empty() {
-        "system default".to_string()
-    } else {
-        text
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn draw_value_row(
-    area: Rect,
-    buf: &mut Buffer,
-    theme: &Theme,
-    label: &str,
-    value: &str,
-    focused: bool,
-    dirty: bool,
-    error: bool,
-) {
-    widgets::draw_labeled_value_with(
-        area,
-        buf,
-        widgets::RowPalette::from_theme(theme),
-        LABEL_WIDTH,
-        label,
-        value,
-        focused,
-        dirty,
-        error,
-    );
-}
-
-fn draw_disabled_row(area: Rect, buf: &mut Buffer, theme: &Theme, label: &str, value: &str) {
-    let mut palette = widgets::RowPalette::from_theme(theme);
-    palette.label = theme.subtle;
-    palette.value = theme.subtle;
-    widgets::draw_labeled_value_with(
-        area,
-        buf,
-        palette,
-        LABEL_WIDTH,
-        label,
-        value,
-        false,
-        false,
-        false,
-    );
-}
-
-pub(crate) fn setting_label(focus: SettingsFocus) -> &'static str {
-    match focus {
-        SettingsFocus::CaptureDevice | SettingsFocus::PlaybackDevice => "Device",
-        SettingsFocus::RawCaptureDevice | SettingsFocus::RawPlaybackDevice => "Raw Device",
-        SettingsFocus::Bitrate => "Bitrate",
-        SettingsFocus::Denoise => "Denoise",
-        SettingsFocus::EchoCancellation => "Echo Cancel",
-        SettingsFocus::Amplification => "Max Gain",
-        SettingsFocus::Suppression => "Suppression",
-        SettingsFocus::Release => "Release",
-        SettingsFocus::TypingSuppression => "Typing Gate",
-        SettingsFocus::TypingVadEnter => "Gate Start",
-        SettingsFocus::TypingVadRelease => "Gate Release",
-        SettingsFocus::CaptureBuffer => "Capture Buffer",
-        SettingsFocus::PlaybackBuffer => "Playback Buffer",
-        SettingsFocus::WebEnabled => "Web Log",
-        SettingsFocus::WebBind => "Web Bind",
-        SettingsFocus::MessageNotificationVolume => "Message Volume",
-        SettingsFocus::PeerJoinNotificationVolume => "Join Volume",
-        SettingsFocus::PeerLeaveNotificationVolume => "Leave Volume",
-        SettingsFocus::FormBindings => "Form Bindings",
-        SettingsFocus::Theme => "Theme",
-        SettingsFocus::Refresh => "Refresh",
-        SettingsFocus::Save => "Save",
-        SettingsFocus::Close => "Close",
-    }
-}
-
-fn draw_audio_picker(
-    form: &mut FormState<SettingsFocus>,
-    buf: &mut Buffer,
-    theme: &Theme,
-    field: SettingsFocus,
-    items: &[AudioDeviceItem],
-    picker: &mut AudioDevicePickerState,
-) {
-    let rows = picker_rows(form, items);
-    if rows == 0 {
-        return;
-    }
-    let area_row = form.next_row(rows);
-    let Some(area) = area_row.rect else {
-        return;
-    };
-    buf.clear_rect(area, theme.background);
-    if picker.selector.filtered_len() == 0 {
-        area.with(theme.subtle)
-            .with(HAlign::Center)
-            .text(buf, "No matching audio devices");
-        return;
-    }
-    let item_height = if area.h < 4 { 1 } else { 2 };
-    picker.selector.render(
-        area,
-        item_height,
-        buf,
-        |_, item_index, selected, area, buf| {
-            form.register_picker_item(field, area, item_index);
-            if let Some(item) = items.get(item_index) {
-                draw_audio_item(area, buf, theme, item, selected, form.focus() == field);
-            }
-        },
-    );
-}
-
-fn picker_rows(form: &FormState<SettingsFocus>, items: &[AudioDeviceItem]) -> u16 {
+fn picker_rows(items: &[AudioDeviceItem]) -> u16 {
     let wanted = items.len().clamp(MIN_PICKER_ROWS as usize, 8) as u16;
-    wanted.min(form_rows_available_hint(form).max(MIN_PICKER_ROWS))
-}
-
-fn form_rows_available_hint(_: &FormState<SettingsFocus>) -> u16 {
-    8
+    wanted.min(8u16.max(MIN_PICKER_ROWS))
 }
 
 fn draw_audio_item(
@@ -606,46 +767,61 @@ fn draw_audio_item(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn draw_focus_detail(
     area: Rect,
     buf: &mut Buffer,
     theme: &Theme,
     settings: &SettingsDraft,
-    focus: SettingsFocus,
+    detail: Option<FocusDetail>,
     input_items: &[AudioInputItem],
     input_picker: &AudioInputPickerState,
     output_items: &[AudioOutputItem],
     output_picker: &AudioOutputPickerState,
 ) {
     buf.clear_rect(area, theme.detail_panel);
+    let Some(detail) = detail else {
+        return;
+    };
     let mut rows = area;
-    rows.take_top(1)
-        .with(theme.detail_panel.patch(theme.accent | Modifier::BOLD))
-        .with(Ellipsis(true))
-        .text(buf, &format!(" {} ", detail_title(focus)));
-
-    match focus {
-        SettingsFocus::CaptureDevice if !settings.input_raw() => draw_device_detail(
-            rows,
-            buf,
-            theme,
-            focused_device(input_items, input_picker, settings.input_selection()),
-        ),
-        SettingsFocus::PlaybackDevice if !settings.output_raw() => draw_device_detail(
-            rows,
-            buf,
-            theme,
-            focused_device(output_items, output_picker, settings.output_selection()),
-        ),
-        _ => draw_option_detail(rows, buf, theme, settings, focus),
+    let title = match &detail {
+        FocusDetail::Device(DeviceSide::Input) => "Capture Device",
+        FocusDetail::Device(DeviceSide::Output) => "Playback Device",
+        FocusDetail::Option { .. } => "",
+    };
+    if !title.is_empty() {
+        rows.take_top(1)
+            .with(theme.detail_panel.patch(theme.accent | Modifier::BOLD))
+            .with(Ellipsis(true))
+            .text(buf, &format!(" {title} "));
     }
-}
 
-fn detail_title(focus: SettingsFocus) -> &'static str {
-    match focus {
-        SettingsFocus::CaptureDevice => "Capture Device",
-        SettingsFocus::PlaybackDevice => "Playback Device",
-        _ => setting_label(focus),
+    match detail {
+        FocusDetail::Device(DeviceSide::Input) => draw_device_detail(
+            rows,
+            buf,
+            theme,
+            focused_device(
+                input_items,
+                input_picker,
+                settings.input_device_id.as_deref(),
+            ),
+        ),
+        FocusDetail::Device(DeviceSide::Output) => draw_device_detail(
+            rows,
+            buf,
+            theme,
+            focused_device(
+                output_items,
+                output_picker,
+                settings.output_device_id.as_deref(),
+            ),
+        ),
+        FocusDetail::Option {
+            current,
+            error,
+            help,
+        } => draw_option_detail(rows, buf, theme, &current, error.as_deref(), help),
     }
 }
 
@@ -753,36 +929,32 @@ fn draw_option_detail(
     area: Rect,
     buf: &mut Buffer,
     theme: &Theme,
-    settings: &SettingsDraft,
-    focus: SettingsFocus,
+    current: &str,
+    error: Option<&str>,
+    help: &str,
 ) {
     let panel = theme.detail_panel;
     let mut rows = area;
-    let current = match focus {
-        SettingsFocus::CaptureDevice | SettingsFocus::PlaybackDevice => {
-            device_selection_display(settings, focus)
-        }
-        _ => settings.option_label(focus),
-    };
-    widgets::draw_metadata_line(rows.take_top(1), buf, theme, panel, 10, "Current", &current);
-    if let Some(reason) = settings.disabled_reason(focus) {
-        widgets::draw_metadata_line(rows.take_top(1), buf, theme, panel, 10, "Disabled", reason);
+    if !current.is_empty() {
+        widgets::draw_metadata_line(rows.take_top(1), buf, theme, panel, 10, "Current", current);
     }
-    if let Some(error) = settings.field_error(focus) {
+    if let Some(error) = error {
         rows.take_top(1).with(panel).fill(buf);
-        for line in wrap_detail(&error, rows.w as usize) {
+        for line in wrap_detail(error, rows.w as usize) {
             rows.take_top(1)
                 .with(panel.patch(theme.error))
                 .with(Ellipsis(true))
                 .text(buf, &line);
         }
     }
-    rows.take_top(1).with(panel).fill(buf);
-    for line in wrap_detail(settings.option_detail(focus), rows.w as usize) {
-        rows.take_top(1)
-            .with(panel.patch(theme.muted))
-            .with(Ellipsis(true))
-            .text(buf, &line);
+    if !help.is_empty() {
+        rows.take_top(1).with(panel).fill(buf);
+        for line in wrap_detail(help, rows.w as usize) {
+            rows.take_top(1)
+                .with(panel.patch(theme.muted))
+                .with(Ellipsis(true))
+                .text(buf, &line);
+        }
     }
 }
 
@@ -837,38 +1009,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn focus_order_matches_rendered_settings_layout() {
-        let mut expected = vec![
-            SettingsFocus::CaptureDevice,
-            SettingsFocus::RawCaptureDevice,
-        ];
-        expected.extend(CAPTURE_ROWS);
-        expected.push(SettingsFocus::PlaybackDevice);
-        expected.push(SettingsFocus::RawPlaybackDevice);
-        expected.extend(PLAYBACK_ROWS);
-        expected.extend(WEB_ROWS);
-        expected.extend(NOTIFICATION_ROWS);
-        expected.extend(INTERFACE_ROWS);
-        expected.extend(ACTION_ROWS);
-
-        assert_eq!(SettingsFocus::ORDER.as_slice(), expected.as_slice());
-    }
-
-    #[test]
-    fn settings_sections_are_title_case() {
-        for title in [
-            "Capture Settings",
-            "Playback Settings",
-            "Web Log Server",
-            "Notifications",
-            "Interface Settings",
-            "Actions",
-        ] {
-            assert_ne!(title, title.to_ascii_uppercase());
-        }
-    }
-
-    #[test]
     fn detail_wraps_on_word_boundaries() {
         assert_eq!(
             wrap_detail("one two three four", 8),
@@ -878,5 +1018,10 @@ mod tests {
                 "four".to_string()
             ]
         );
+    }
+
+    #[test]
+    fn device_field_ids_are_distinct() {
+        assert_ne!(capture_device_id(), playback_device_id());
     }
 }
