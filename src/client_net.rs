@@ -11,7 +11,7 @@ use std::{
         mpsc::{self, Receiver, RecvTimeoutError, SendError, Sender, TryRecvError},
     },
     thread::{self, JoinHandle},
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use chatt_p2p::{
@@ -138,6 +138,10 @@ pub enum NetworkEvent {
         participants: Vec<ParticipantInfo>,
     },
     Chat(ChatMessage),
+    FileReceived {
+        metadata: FileMetadata,
+        path: PathBuf,
+    },
     Presence {
         room_id: RoomId,
         participant: ParticipantInfo,
@@ -1140,6 +1144,10 @@ struct OutgoingUpload {
     offset: u64,
     started: bool,
     next_status_at: u64,
+    /// A copy of the upload written into the local receive directory so the
+    /// uploader's own views (such as the web log) can serve the file. Written
+    /// from the same chunks sent to the server, never round-tripped through it.
+    local_copy: Option<(PathBuf, File)>,
 }
 
 struct IncomingFile {
@@ -1717,6 +1725,7 @@ impl WorkerState {
             offset: 0,
             started: false,
             next_status_at: FILE_PROGRESS_STEP_BYTES.min(size),
+            local_copy: None,
         })
     }
 
@@ -1745,6 +1754,17 @@ impl WorkerState {
                 size: upload.size,
             })?;
             upload.started = true;
+            if let Some(receive_dir) = self.config.file_receive_dir.clone() {
+                match create_receive_file(&receive_dir, &upload.name) {
+                    Ok((path, file)) => upload.local_copy = Some((path, file)),
+                    Err(error) => {
+                        let _ = self.events.send(NetworkEvent::Error(format!(
+                            "failed to keep a local copy of {}: {error}",
+                            upload.name
+                        )));
+                    }
+                }
+            }
             let _ = self.events.send(NetworkEvent::Status(format!(
                 "uploading {} ({})",
                 upload.name,
@@ -1769,6 +1789,16 @@ impl WorkerState {
                 return Err(format!("file ended early while uploading {}", upload.name));
             }
             data.truncate(read);
+            if let Some((path, file)) = upload.local_copy.as_mut()
+                && let Err(error) = file.write_all(&data)
+            {
+                let _ = self.events.send(NetworkEvent::Error(format!(
+                    "failed to write local copy {}: {error}",
+                    path.display()
+                )));
+                let _ = fs::remove_file(&*path);
+                upload.local_copy = None;
+            }
             let offset = upload.offset;
             self.queue_control(ClientControl::UploadFileChunk {
                 transfer_id: upload.transfer_id,
@@ -1799,7 +1829,46 @@ impl WorkerState {
             upload.name,
             format_bytes(upload.size)
         )));
+        self.finish_local_copy(&mut upload);
         Ok(true)
+    }
+
+    /// Flushes the uploader's local copy and emits [`NetworkEvent::FileReceived`]
+    /// so local views render the file the same way they render a received one.
+    fn finish_local_copy(&mut self, upload: &mut OutgoingUpload) {
+        let Some((path, mut file)) = upload.local_copy.take() else {
+            return;
+        };
+        if let Err(error) = file.flush() {
+            let _ = fs::remove_file(&path);
+            let _ = self.events.send(NetworkEvent::Error(format!(
+                "failed to flush local copy {}: {error}",
+                path.display()
+            )));
+            return;
+        }
+        let file_name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or(&upload.name)
+            .to_string();
+        let timestamp_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_millis() as u64)
+            .unwrap_or(0);
+        let metadata = FileMetadata {
+            transfer_id: upload.transfer_id,
+            room_id: upload.room_id,
+            sender: self.user_id.unwrap_or(UserId(0)),
+            sender_name: self.config.display_name.clone(),
+            file_name,
+            original_name: upload.name.clone(),
+            size: upload.size,
+            timestamp_ms,
+        };
+        let _ = self
+            .events
+            .send(NetworkEvent::FileReceived { metadata, path });
     }
 
     fn handle_file_offered(&mut self, file: FileMetadata, contents: bool) {
@@ -1949,6 +2018,10 @@ impl WorkerState {
             incoming.metadata.file_name,
             incoming.path.display()
         )));
+        let _ = self.events.send(NetworkEvent::FileReceived {
+            metadata: incoming.metadata.clone(),
+            path: incoming.path.clone(),
+        });
     }
 
     fn handle_file_canceled(&mut self, transfer_id: FileTransferId, reason: &str) {

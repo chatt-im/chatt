@@ -405,6 +405,37 @@ impl P2pConfig {
     }
 }
 
+/// The optional browser chat-log view served over `darkhttp`.
+#[derive(Clone, Debug, PartialEq, Eq, Toml)]
+#[toml(FromToml, ToToml, rename_all = "kebab-case")]
+pub struct WebConfig {
+    /// Whether to start the web server when the client runs.
+    #[toml(default)]
+    pub enabled: bool,
+    /// The loopback address the web server binds.
+    #[toml(default = default_web_bind())]
+    pub bind: String,
+    /// The directory of built frontend assets to serve at `/`.
+    #[toml(default = default_web_assets())]
+    pub assets_dir: String,
+}
+
+impl Default for WebConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            bind: default_web_bind(),
+            assets_dir: default_web_assets(),
+        }
+    }
+}
+
+impl WebConfig {
+    pub fn is_default(&self) -> bool {
+        *self == WebConfig::default()
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Toml)]
 #[toml(FromToml, ToToml, rename_all = "kebab-case")]
 pub struct UserAudioPreference {
@@ -517,6 +548,8 @@ pub struct Config {
     pub files: FileConfig,
     #[toml(default, style = Header, ToToml skip_if = P2pConfig::is_default)]
     pub p2p: P2pConfig,
+    #[toml(default, style = Header, ToToml skip_if = WebConfig::is_default)]
+    pub web: WebConfig,
     #[toml(default, style = Header, ToToml skip_if = Vec::is_empty)]
     pub user_audio: Vec<UserAudioPreference>,
     // Serialized so a save never drops a configured soundboard; an unconfigured
@@ -909,6 +942,14 @@ fn default_config_path() -> Option<PathBuf> {
 
 fn default_server_alias() -> String {
     "local".to_string()
+}
+
+fn default_web_bind() -> String {
+    "127.0.0.1:8080".to_string()
+}
+
+fn default_web_assets() -> String {
+    "web/dist".to_string()
 }
 
 fn default_servers() -> Vec<ServerEntry> {

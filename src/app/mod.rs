@@ -177,6 +177,8 @@ pub(crate) struct App {
     pub(crate) pending_audio_apply: Option<PendingAudioApply>,
     pending_network_commands: VecDeque<NetworkCommand>,
     supervisor: SupervisorState,
+    /// The browser chat-log feed, present only when `[web] enabled = true`.
+    web_feed: Option<crate::web_server::WebFeedSender>,
 }
 
 /// A debounced request to restart audio streams so a slow settings-page change
@@ -404,6 +406,21 @@ impl App {
         let mut audio_output_picker = AudioOutputPickerState::default();
         audio_output_picker.reset(&audio_output_items, settings_draft.output_selection());
         let echo_control = Arc::new(EchoCancellationControl::new(config.audio.echo_cancellation));
+        let web_feed = if config.web.enabled {
+            match crate::web_server::spawn(
+                &config.web,
+                config.files.receive_dir_path(),
+                config.ui.max_messages as usize,
+            ) {
+                Ok(sender) => Some(sender),
+                Err(error) => {
+                    kvlog::error!("web server failed to start", error = %error);
+                    None
+                }
+            }
+        } else {
+            None
+        };
         let mut app = Self {
             theme,
             event_tx,
@@ -479,6 +496,7 @@ impl App {
             pending_audio_apply: None,
             pending_network_commands: VecDeque::new(),
             supervisor: SupervisorState::default(),
+            web_feed,
             config,
         };
         app.rebuild_server_items();
@@ -791,6 +809,18 @@ impl App {
                 self.flush_pending_network_commands();
             }
             NetworkEvent::Chat(message) => self.push_chat(message),
+            NetworkEvent::FileReceived { metadata, path } => {
+                if let Some(feed) = &self.web_feed {
+                    let served_name = path
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .unwrap_or(&metadata.file_name);
+                    feed.send(crate::web_server::WebMessage::from_file(
+                        &metadata,
+                        served_name,
+                    ));
+                }
+            }
             NetworkEvent::Presence {
                 participant,
                 online,
@@ -993,6 +1023,9 @@ impl App {
     }
 
     fn push_chat(&mut self, message: ChatMessage) {
+        if let Some(feed) = &self.web_feed {
+            feed.send((&message).into());
+        }
         let local = Some(message.sender) == self.user_id;
         self.participants.note_message(&message);
         self.chat.push_chat(message, local);
@@ -3584,6 +3617,7 @@ fn network_event_kind(event: &NetworkEvent) -> &'static str {
         NetworkEvent::Authenticated { .. } => "authenticated",
         NetworkEvent::RoomJoined { .. } => "room_joined",
         NetworkEvent::Chat(_) => "chat",
+        NetworkEvent::FileReceived { .. } => "file_received",
         NetworkEvent::Presence { .. } => "presence",
         NetworkEvent::VoiceStarted { .. } => "voice_started",
         NetworkEvent::VoiceStopped { .. } => "voice_stopped",
