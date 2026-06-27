@@ -247,6 +247,8 @@ impl SettingsSession {
         let mut draft = SettingsDraft::from_audio(&app.config.audio);
         draft.set_form_bindings_from_config(app.config.ui.form_bindings);
         draft.set_theme_from_config(app.config.ui.theme);
+        draft.set_web_from_config(&app.config.web);
+        draft.set_notifications_from_config(&app.config.notifications);
         let input_items = settings::audio_input_items(app.audio_devices.input_devices());
         let output_items = settings::audio_output_items(app.audio_devices.output_devices());
         let mut input_picker = AudioInputPickerState::default();
@@ -415,7 +417,7 @@ impl AppMode for SettingsMode {
                 app.adjust_settings_focus(&mut self.session, delta);
             }
             FormMouseIntent::Text(field, area, column) => {
-                let value = self.session.draft.buffer_text(field);
+                let value = self.session.draft.field_text(field);
                 let commit = self
                     .session
                     .form

@@ -4,7 +4,8 @@ use crate::{
         AudioConfig, AudioLatencyConfig, BufferSize, DEFAULT_DENOISE_RELEASE,
         DEFAULT_DENOISE_SUPPRESSION, DEFAULT_DENOISE_TYPING_VAD_ENTER,
         DEFAULT_DENOISE_TYPING_VAD_RELEASE, DEFAULT_INPUT_BUFFER_SAMPLES,
-        DEFAULT_MAX_AMPLIFICATION, DEFAULT_OUTPUT_BUFFER_SAMPLES, FormBindings, ThemeChoice,
+        DEFAULT_MAX_AMPLIFICATION, DEFAULT_OUTPUT_BUFFER_SAMPLES, FormBindings, NotificationConfig,
+        ThemeChoice, WebConfig,
     },
     tui::form::FormFieldKind,
     ui::select::{FuzzySelect, SelectableItem},
@@ -26,6 +27,9 @@ pub const DENOISE_RELEASE_LABELS: [&str; 5] = ["off", "light", "medium", "strong
 /// Earshot VAD thresholds for the post-RNNoise typing gate.
 pub const DENOISE_TYPING_VAD_THRESHOLDS: [f32; 7] = [0.60, 0.70, 0.75, 0.80, 0.82, 0.85, 0.90];
 pub const DENOISE_TYPING_VAD_LABELS: [&str; 7] = ["60%", "70%", "75%", "80%", "82%", "85%", "90%"];
+pub const NOTIFICATION_VOLUMES_DB: [f32; 11] = [
+    -24.0, -18.0, -12.0, -9.0, -6.0, -3.0, 0.0, 3.0, 6.0, 9.0, 12.0,
+];
 
 /// Smallest accepted explicit buffer in samples (~0.7 ms at 48 kHz).
 pub const MIN_BUFFER_SAMPLES: u32 = 32;
@@ -49,6 +53,11 @@ pub enum SettingsFocus {
     TypingVadRelease,
     CaptureBuffer,
     PlaybackBuffer,
+    WebEnabled,
+    WebBind,
+    MessageNotificationVolume,
+    PeerJoinNotificationVolume,
+    PeerLeaveNotificationVolume,
     FormBindings,
     Theme,
     Refresh,
@@ -57,7 +66,7 @@ pub enum SettingsFocus {
 }
 
 impl SettingsFocus {
-    pub const ORDER: [SettingsFocus; 20] = [
+    pub const ORDER: [SettingsFocus; 25] = [
         SettingsFocus::CaptureDevice,
         SettingsFocus::RawCaptureDevice,
         SettingsFocus::Bitrate,
@@ -73,6 +82,11 @@ impl SettingsFocus {
         SettingsFocus::PlaybackDevice,
         SettingsFocus::RawPlaybackDevice,
         SettingsFocus::PlaybackBuffer,
+        SettingsFocus::WebEnabled,
+        SettingsFocus::WebBind,
+        SettingsFocus::MessageNotificationVolume,
+        SettingsFocus::PeerJoinNotificationVolume,
+        SettingsFocus::PeerLeaveNotificationVolume,
         SettingsFocus::FormBindings,
         SettingsFocus::Theme,
         SettingsFocus::Refresh,
@@ -99,6 +113,11 @@ pub struct SettingsDraft {
     /// string instead of the enumerated-device picker.
     input_raw: bool,
     output_raw: bool,
+    web_enabled: bool,
+    web_bind: String,
+    message_notification_volume_index: usize,
+    peer_join_notification_volume_index: usize,
+    peer_leave_notification_volume_index: usize,
     form_bindings: FormBindings,
     theme: ThemeChoice,
     denoise: DenoiseConfig,
@@ -154,12 +173,31 @@ impl SettingsDraft {
                 .output_device_id
                 .as_deref()
                 .is_some_and(is_raw_device_selection),
+            web_enabled: WebConfig::default().enabled,
+            web_bind: WebConfig::default().bind,
+            message_notification_volume_index: notification_volume_index(0.0),
+            peer_join_notification_volume_index: notification_volume_index(0.0),
+            peer_leave_notification_volume_index: notification_volume_index(0.0),
             form_bindings: FormBindings::Standard,
             theme: ThemeChoice::default(),
             denoise: config.denoise,
             echo_cancellation: config.echo_cancellation,
             latency: config.latency.clone(),
         }
+    }
+
+    pub fn set_web_from_config(&mut self, web: &WebConfig) {
+        self.web_enabled = web.enabled;
+        self.web_bind = web.bind.clone();
+    }
+
+    pub fn set_notifications_from_config(&mut self, notifications: &NotificationConfig) {
+        self.message_notification_volume_index =
+            notification_volume_index(notifications.message_volume_db);
+        self.peer_join_notification_volume_index =
+            notification_volume_index(notifications.peer_join_volume_db);
+        self.peer_leave_notification_volume_index =
+            notification_volume_index(notifications.peer_leave_volume_db);
     }
 
     pub fn set_form_bindings_from_config(&mut self, form_bindings: FormBindings) {
@@ -190,6 +228,21 @@ impl SettingsDraft {
             input_buffer: parse_buffer_size(&self.buffer_text(SettingsFocus::CaptureBuffer)),
             output_buffer: parse_buffer_size(&self.buffer_text(SettingsFocus::PlaybackBuffer)),
             latency: self.latency.clone(),
+        }
+    }
+
+    pub fn to_web(&self) -> WebConfig {
+        WebConfig {
+            enabled: self.web_enabled,
+            bind: self.web_bind.trim().to_string(),
+        }
+    }
+
+    pub fn to_notifications(&self) -> NotificationConfig {
+        NotificationConfig {
+            message_volume_db: self.message_notification_volume_db(),
+            peer_join_volume_db: self.peer_join_notification_volume_db(),
+            peer_leave_volume_db: self.peer_leave_notification_volume_db(),
         }
     }
 
@@ -249,11 +302,15 @@ impl SettingsDraft {
             SettingsFocus::CaptureDevice if self.input_raw => FormFieldKind::Text,
             SettingsFocus::PlaybackDevice if self.output_raw => FormFieldKind::Text,
             SettingsFocus::CaptureDevice | SettingsFocus::PlaybackDevice => FormFieldKind::Select,
-            SettingsFocus::CaptureBuffer | SettingsFocus::PlaybackBuffer => FormFieldKind::Text,
+            focus if self.disabled_reason(focus).is_some() => FormFieldKind::Disabled,
+            SettingsFocus::CaptureBuffer
+            | SettingsFocus::PlaybackBuffer
+            | SettingsFocus::WebBind => FormFieldKind::Text,
             SettingsFocus::RawCaptureDevice
             | SettingsFocus::RawPlaybackDevice
             | SettingsFocus::EchoCancellation
-            | SettingsFocus::TypingSuppression => FormFieldKind::Toggle,
+            | SettingsFocus::TypingSuppression
+            | SettingsFocus::WebEnabled => FormFieldKind::Toggle,
             SettingsFocus::Denoise
             | SettingsFocus::Bitrate
             | SettingsFocus::Amplification
@@ -261,6 +318,9 @@ impl SettingsDraft {
             | SettingsFocus::Release
             | SettingsFocus::TypingVadEnter
             | SettingsFocus::TypingVadRelease
+            | SettingsFocus::MessageNotificationVolume
+            | SettingsFocus::PeerJoinNotificationVolume
+            | SettingsFocus::PeerLeaveNotificationVolume
             | SettingsFocus::FormBindings
             | SettingsFocus::Theme => FormFieldKind::Choice,
             SettingsFocus::Refresh | SettingsFocus::Save | SettingsFocus::Close => {
@@ -286,6 +346,7 @@ impl SettingsDraft {
             SettingsFocus::PlaybackDevice if self.output_raw => {
                 raw_device_error(self.output_device_id.as_deref().unwrap_or(""))
             }
+            SettingsFocus::WebBind => web_bind_error(&self.web_bind),
             _ => None,
         }
     }
@@ -295,6 +356,11 @@ impl SettingsDraft {
     pub fn device_string_invalid(&self) -> Option<String> {
         self.field_error(SettingsFocus::CaptureDevice)
             .or_else(|| self.field_error(SettingsFocus::PlaybackDevice))
+    }
+
+    pub fn settings_text_invalid(&self) -> Option<String> {
+        self.device_string_invalid()
+            .or_else(|| self.field_error(SettingsFocus::WebBind))
     }
 
     /// Commits editor text for a focusable text field. Buffer fields update the
@@ -321,6 +387,11 @@ impl SettingsDraft {
                     SettingsMutation::None
                 }
             }
+            SettingsFocus::WebBind if self.web_bind != text => {
+                self.web_bind = text;
+                SettingsMutation::Changed
+            }
+            SettingsFocus::WebBind => SettingsMutation::None,
             _ => SettingsMutation::None,
         }
     }
@@ -350,6 +421,17 @@ impl SettingsDraft {
                 DENOISE_TYPING_VAD_LABELS[self.typing_vad_release_index].to_string()
             }
             SettingsFocus::CaptureBuffer | SettingsFocus::PlaybackBuffer => self.buffer_text(focus),
+            SettingsFocus::WebEnabled => on_off(self.web_enabled),
+            SettingsFocus::WebBind => self.web_bind.clone(),
+            SettingsFocus::MessageNotificationVolume => {
+                volume_db_label(self.message_notification_volume_db())
+            }
+            SettingsFocus::PeerJoinNotificationVolume => {
+                volume_db_label(self.peer_join_notification_volume_db())
+            }
+            SettingsFocus::PeerLeaveNotificationVolume => {
+                volume_db_label(self.peer_leave_notification_volume_db())
+            }
             SettingsFocus::FormBindings => form_bindings_label(self.form_bindings).to_string(),
             SettingsFocus::Theme => self.theme.label().to_string(),
             SettingsFocus::RawCaptureDevice => on_off(self.input_raw),
@@ -399,6 +481,21 @@ impl SettingsDraft {
             }
             SettingsFocus::PlaybackBuffer => {
                 "Requested playback buffer in samples, or default for the host backend."
+            }
+            SettingsFocus::WebEnabled => {
+                "Starts the browser chat-log server. Bind is saved even while disabled."
+            }
+            SettingsFocus::WebBind => {
+                "Loopback socket address for the browser chat-log server, for example 127.0.0.1:8080."
+            }
+            SettingsFocus::MessageNotificationVolume => {
+                "Volume for incoming-message notification sounds."
+            }
+            SettingsFocus::PeerJoinNotificationVolume => {
+                "Volume for peer-joined notification sounds."
+            }
+            SettingsFocus::PeerLeaveNotificationVolume => {
+                "Volume for peer-left notification sounds."
             }
             SettingsFocus::FormBindings => {
                 "Keyboard model used by forms such as settings and server editing."
@@ -473,6 +570,34 @@ impl SettingsDraft {
                 self.theme = ThemeChoice::ALL[next];
                 SettingsMutation::Changed
             }
+            SettingsFocus::WebEnabled => {
+                self.web_enabled = !self.web_enabled;
+                SettingsMutation::Changed
+            }
+            SettingsFocus::MessageNotificationVolume => {
+                self.message_notification_volume_index = cycle_index(
+                    self.message_notification_volume_index,
+                    NOTIFICATION_VOLUMES_DB.len(),
+                    delta,
+                );
+                SettingsMutation::Changed
+            }
+            SettingsFocus::PeerJoinNotificationVolume => {
+                self.peer_join_notification_volume_index = cycle_index(
+                    self.peer_join_notification_volume_index,
+                    NOTIFICATION_VOLUMES_DB.len(),
+                    delta,
+                );
+                SettingsMutation::Changed
+            }
+            SettingsFocus::PeerLeaveNotificationVolume => {
+                self.peer_leave_notification_volume_index = cycle_index(
+                    self.peer_leave_notification_volume_index,
+                    NOTIFICATION_VOLUMES_DB.len(),
+                    delta,
+                );
+                SettingsMutation::Changed
+            }
             SettingsFocus::RawCaptureDevice => {
                 self.input_raw = !self.input_raw;
                 SettingsMutation::Changed
@@ -485,6 +610,7 @@ impl SettingsDraft {
             | SettingsFocus::PlaybackDevice
             | SettingsFocus::CaptureBuffer
             | SettingsFocus::PlaybackBuffer
+            | SettingsFocus::WebBind
             | SettingsFocus::Refresh
             | SettingsFocus::Save
             | SettingsFocus::Close => SettingsMutation::None,
@@ -497,19 +623,24 @@ impl SettingsDraft {
             SettingsFocus::EchoCancellation
             | SettingsFocus::RawCaptureDevice
             | SettingsFocus::RawPlaybackDevice
-            | SettingsFocus::TypingSuppression => self.adjust(focus, 1),
+            | SettingsFocus::TypingSuppression
+            | SettingsFocus::WebEnabled => self.adjust(focus, 1),
             SettingsFocus::Bitrate
             | SettingsFocus::Amplification
             | SettingsFocus::Suppression
             | SettingsFocus::Release
             | SettingsFocus::TypingVadEnter
             | SettingsFocus::TypingVadRelease
+            | SettingsFocus::MessageNotificationVolume
+            | SettingsFocus::PeerJoinNotificationVolume
+            | SettingsFocus::PeerLeaveNotificationVolume
             | SettingsFocus::FormBindings
             | SettingsFocus::Theme => self.adjust(focus, 1),
             SettingsFocus::CaptureDevice
             | SettingsFocus::PlaybackDevice
             | SettingsFocus::CaptureBuffer
             | SettingsFocus::PlaybackBuffer
+            | SettingsFocus::WebBind
             | SettingsFocus::Refresh
             | SettingsFocus::Save
             | SettingsFocus::Close => SettingsMutation::None,
@@ -528,6 +659,14 @@ impl SettingsDraft {
 
     pub fn buffer_text(&self, focus: SettingsFocus) -> String {
         self.buffer_value(focus).to_string()
+    }
+
+    pub fn field_text(&self, focus: SettingsFocus) -> String {
+        match focus {
+            SettingsFocus::CaptureBuffer | SettingsFocus::PlaybackBuffer => self.buffer_text(focus),
+            SettingsFocus::WebBind => self.web_bind.clone(),
+            _ => String::new(),
+        }
     }
 
     fn buffer_value(&self, focus: SettingsFocus) -> &str {
@@ -573,6 +712,41 @@ impl SettingsDraft {
         DENOISE_TYPING_VAD_THRESHOLDS[self.typing_vad_release_index]
     }
 
+    pub fn message_notification_volume_db(&self) -> f32 {
+        NOTIFICATION_VOLUMES_DB[self.message_notification_volume_index]
+    }
+
+    pub fn peer_join_notification_volume_db(&self) -> f32 {
+        NOTIFICATION_VOLUMES_DB[self.peer_join_notification_volume_index]
+    }
+
+    pub fn peer_leave_notification_volume_db(&self) -> f32 {
+        NOTIFICATION_VOLUMES_DB[self.peer_leave_notification_volume_index]
+    }
+
+    pub fn disabled_reason(&self, focus: SettingsFocus) -> Option<&'static str> {
+        match focus {
+            SettingsFocus::Suppression
+            | SettingsFocus::Release
+            | SettingsFocus::TypingSuppression
+                if self.denoise != DenoiseConfig::RnnNoise =>
+            {
+                Some("Requires the rnnoise denoise engine.")
+            }
+            SettingsFocus::TypingVadEnter | SettingsFocus::TypingVadRelease
+                if self.denoise != DenoiseConfig::RnnNoise =>
+            {
+                Some("Requires the rnnoise denoise engine.")
+            }
+            SettingsFocus::TypingVadEnter | SettingsFocus::TypingVadRelease
+                if !self.typing_suppression =>
+            {
+                Some("Requires Typing Gate to be on.")
+            }
+            _ => None,
+        }
+    }
+
     fn cycle_denoise(&mut self, delta: isize) -> SettingsMutation {
         let current = DenoiseConfig::ALL
             .iter()
@@ -603,6 +777,14 @@ fn cycle_index(index: usize, len: usize, delta: isize) -> usize {
 
 fn on_off(value: bool) -> String {
     (if value { "on" } else { "off" }).to_string()
+}
+
+fn volume_db_label(value: f32) -> String {
+    if value == 0.0 {
+        "0 dB".to_string()
+    } else {
+        format!("{value:+.0} dB")
+    }
 }
 
 pub fn form_bindings_label(value: FormBindings) -> &'static str {
@@ -667,6 +849,14 @@ fn raw_device_error(text: &str) -> Option<String> {
     Some("not a valid ALSA device string (e.g. hw:0,0)".to_string())
 }
 
+fn web_bind_error(text: &str) -> Option<String> {
+    let trimmed = text.trim();
+    match trimmed.parse::<std::net::SocketAddr>() {
+        Ok(_) => None,
+        Err(error) => Some(format!("web bind must be a socket address: {error}")),
+    }
+}
+
 /// Maps raw device editor text to a selection: trimmed, with an empty string
 /// becoming `None` (system default).
 fn raw_device_selection(text: &str) -> Option<String> {
@@ -721,6 +911,10 @@ fn amplification_index(value: f32) -> usize {
         })
         .map(|(index, _)| index)
         .unwrap_or(1)
+}
+
+fn notification_volume_index(value: f32) -> usize {
+    nearest_index(&NOTIFICATION_VOLUMES_DB, value, 0.0)
 }
 
 #[derive(Clone, Debug)]

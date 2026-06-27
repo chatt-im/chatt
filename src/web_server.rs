@@ -25,6 +25,7 @@ use crate::config::WebConfig;
 
 /// The path a browser opens a WebSocket on for the live feed.
 const WS_PATH: &str = "/ws";
+const WEB_ASSETS_DIR: &str = "web/dist";
 
 /// How many of the most recent messages a fresh `sync` frame carries. Older
 /// history is paged in on demand.
@@ -133,6 +134,7 @@ pub(crate) fn classify(name: &str) -> &'static str {
 /// What the app sends to the web thread.
 enum WebFeed {
     Message(WebMessage),
+    Stop,
 }
 
 /// A request a browser sends over the WebSocket. The feed is otherwise
@@ -162,6 +164,11 @@ impl WebFeedSender {
         let _ = self.tx.send(WebFeed::Message(message));
         self.wake.wake();
     }
+
+    pub fn stop(&self) {
+        let _ = self.tx.send(WebFeed::Stop);
+        self.wake.wake();
+    }
 }
 
 /// Starts the web server on its own thread and returns a feed handle.
@@ -189,7 +196,7 @@ pub fn spawn(
     if let Some(dir) = receive_dir {
         router = router.mount_file_dir("/files", dir);
     }
-    router = router.mount_static_dir("/", PathBuf::from(&cfg.assets_dir));
+    router = router.mount_static_dir("/", PathBuf::from(WEB_ASSETS_DIR));
 
     // A zero timeout disables idle-connection reaping so a quiet WebSocket is
     // never closed out from under a watching browser.
@@ -257,6 +264,7 @@ fn run(mut server: Server, rx: Receiver<WebFeed>, max_messages: usize) {
                         base_seq += excess as u64;
                     }
                 }
+                Ok(WebFeed::Stop) => return,
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => return,
             }
@@ -500,7 +508,6 @@ mod tests {
         let cfg = WebConfig {
             enabled: true,
             bind: "127.0.0.1:39517".to_string(),
-            assets_dir: String::new(),
         };
         let sender = spawn(&cfg, None, 100).unwrap();
 
@@ -590,7 +597,6 @@ Sec-WebSocket-Version: 13\r\n\
         let cfg = WebConfig {
             enabled: true,
             bind: "127.0.0.1:39518".to_string(),
-            assets_dir: String::new(),
         };
         let sender = spawn(&cfg, None, 100).unwrap();
 
