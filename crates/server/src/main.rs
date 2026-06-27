@@ -19,11 +19,10 @@ use ring::rand::SecureRandom;
 use ring::signature::KeyPair;
 use rpc::{
     control::{
-        self, ChatMessage, ClientControl, ERROR_AUTH_REJECTED, ERROR_PAIRING_CODE_MISMATCH,
-        ERROR_PAIRING_INVALID_REQUEST, ERROR_PAIRING_NOT_ACTIVE, FileMetadata, InviteTicket,
-        MAX_FILE_CHUNK_BYTES, P2pCandidate, P2pKey, P2pNatKind, P2pPeerInfo, P2pRole, RoomInfo,
-        ServerControl, decode_client_control, decode_client_hello, encode_invite_ticket,
-        encode_server_control, encode_server_hello,
+        self, ChatMessage, ClientControl, ERROR_AUTH_REJECTED, ERROR_PAIRING_INVALID_REQUEST,
+        ERROR_PAIRING_NOT_ACTIVE, FileMetadata, InviteTicket, MAX_FILE_CHUNK_BYTES, P2pCandidate,
+        P2pKey, P2pNatKind, P2pPeerInfo, P2pRole, RoomInfo, ServerControl, decode_client_control,
+        decode_client_hello, encode_invite_ticket, encode_server_control, encode_server_hello,
     },
     crypto::{
         AntiReplay, CHANNEL_CONTROL, ControlTransport, KEY_LEN, KeyMaterial, SessionSecrets,
@@ -324,7 +323,6 @@ impl Server {
         let pairing_code = random_secret_hex(&self.rng)?;
         let ticket = InviteTicket {
             version: rpc::PROTOCOL_VERSION,
-            user: user_name.to_string(),
             pairing_code: pairing_code.clone(),
             tcp_addr: self.config.network.public_tcp_addr.clone(),
             udp_addr: self.config.network.public_udp_addr.clone(),
@@ -576,7 +574,6 @@ impl Server {
             (
                 ConnState::AwaitAuth,
                 ClientControl::Authenticate {
-                    user,
                     display_name,
                     token: auth_token,
                     receive_files,
@@ -584,7 +581,6 @@ impl Server {
                 },
             ) => self.authenticate_client(
                 token,
-                &user,
                 &display_name,
                 &auth_token,
                 receive_files,
@@ -593,7 +589,6 @@ impl Server {
             (
                 ConnState::AwaitAuth,
                 ClientControl::Pair {
-                    user,
                     display_name,
                     pairing_code,
                     token: new_token,
@@ -602,7 +597,6 @@ impl Server {
                 },
             ) => self.pair_client(
                 token,
-                &user,
                 &display_name,
                 &pairing_code,
                 &new_token,
@@ -706,20 +700,18 @@ impl Server {
     fn authenticate_client(
         &mut self,
         token: Token,
-        user_name: &str,
         display_name: &str,
         auth_token: &str,
         receive_files: bool,
         file_receive_limit_bytes: u64,
     ) -> Result<(), String> {
-        kvlog::info!("authenticate attempt", token = token.0, user = user_name);
+        kvlog::info!("authenticate attempt", token = token.0);
         let Some(user) = self
             .config
             .users
             .iter()
             .find(|candidate| {
-                candidate.name == user_name
-                    && !candidate.token_hash.trim().is_empty()
+                !candidate.token_hash.trim().is_empty()
                     && verify_secret_hash(&candidate.token_hash, auth_token)
             })
             .cloned()
@@ -727,17 +719,15 @@ impl Server {
             kvlog::warn!(
                 "authenticate rejected",
                 token = token.0,
-                user = user_name,
-                reason = "invalid_user_or_token"
+                reason = "invalid_token"
             );
             return self.reject_auth(
                 token,
                 ERROR_AUTH_REJECTED,
-                format!(
-                    "authentication failed for '{user_name}': the user or token is not valid for this server"
-                ),
+                "authentication failed: the token is not valid for this server".to_string(),
             );
         };
+        let user_name = user.name.clone();
         let display_name = display_name.trim();
         let user = if display_name.is_empty()
             || display_name.len() > 64
@@ -747,13 +737,13 @@ impl Server {
         } else {
             match self
                 .config
-                .set_user_display_name(user_name, display_name.to_string())
+                .set_user_display_name(&user_name, display_name.to_string())
             {
                 Ok(user) => user,
                 Err(error) => {
                     kvlog::warn!(
                         "display name update failed",
-                        user = user_name,
+                        user = user_name.as_str(),
                         error = error.as_str()
                     );
                     user
@@ -766,51 +756,37 @@ impl Server {
     fn pair_client(
         &mut self,
         token: Token,
-        user_name: &str,
         display_name: &str,
         pairing_code: &str,
         new_token: &str,
         receive_files: bool,
         file_receive_limit_bytes: u64,
     ) -> Result<(), String> {
-        kvlog::info!("pairing attempt", token = token.0, user = user_name);
+        kvlog::info!("pairing attempt", token = token.0);
         self.expire_invites();
-        let Some(invite) = self.invites.get(user_name) else {
+        let Some(user_name) = self
+            .invites
+            .iter()
+            .find(|(_, invite)| verify_secret_hash(&invite.pairing_code_hash, pairing_code))
+            .map(|(name, _)| name.clone())
+        else {
             kvlog::warn!(
                 "pairing rejected",
                 token = token.0,
-                user = user_name,
                 reason = "no_active_invite"
             );
             return self.reject_auth(
                 token,
                 ERROR_PAIRING_NOT_ACTIVE,
-                format!(
-                    "pairing failed for '{user_name}': no active invite exists on this server; the invite may have expired, been replaced, or already been used. Ask the admin to run `chatt-server invite {user_name}` again"
-                ),
+                "pairing failed: no active invite matches this join string; the invite may have expired, been replaced, or already been used. Ask the admin to issue a new one".to_string(),
             );
         };
-        if !verify_secret_hash(&invite.pairing_code_hash, pairing_code) {
-            kvlog::warn!(
-                "pairing rejected",
-                token = token.0,
-                user = user_name,
-                reason = "pairing_code_mismatch"
-            );
-            return self.reject_auth(
-                token,
-                ERROR_PAIRING_CODE_MISMATCH,
-                format!(
-                    "pairing failed for '{user_name}': the join string secret does not match the active invite; use the newest join string from `chatt-server invite {user_name}`"
-                ),
-            );
-        }
         let display_name = display_name.trim();
         if display_name.is_empty() || display_name.len() > 64 {
             kvlog::warn!(
                 "pairing rejected",
                 token = token.0,
-                user = user_name,
+                user = user_name.as_str(),
                 reason = "invalid_display_name"
             );
             return self.reject_auth(
@@ -821,10 +797,28 @@ impl Server {
         }
 
         let token_hash = hash_secret(new_token);
-        let user = self
+        if self
             .config
-            .mark_user_paired(user_name, display_name.to_string(), token_hash)?;
-        self.invites.remove(user_name);
+            .users
+            .iter()
+            .any(|user| user.name != user_name && user.token_hash == token_hash)
+        {
+            kvlog::warn!(
+                "pairing rejected",
+                token = token.0,
+                user = user_name.as_str(),
+                reason = "token_collision"
+            );
+            return self.reject_auth(
+                token,
+                ERROR_PAIRING_INVALID_REQUEST,
+                "pairing failed: the generated token is already in use; retry pairing".to_string(),
+            );
+        }
+        let user =
+            self.config
+                .mark_user_paired(&user_name, display_name.to_string(), token_hash)?;
+        self.invites.remove(&user_name);
         kvlog::info!(
             "pairing accepted",
             token = token.0,
@@ -853,7 +847,8 @@ impl Server {
         let session_id = SessionId(self.next_session);
         self.next_session += 1;
         let user_id = user.user_id();
-        let user_name = user.display_name.clone();
+        let display_name = user.display_name.clone();
+        let identifier = user.name.clone();
 
         let secrets = self
             .clients
@@ -867,7 +862,8 @@ impl Server {
             session_id,
             Session {
                 user_id,
-                user_name: user_name.clone(),
+                display_name: display_name.clone(),
+                identifier: identifier.clone(),
                 tcp_token: token,
                 room_id: None,
                 udp_addr: None,
@@ -893,7 +889,7 @@ impl Server {
             token = token.0,
             session_id = session_id.0,
             user_id = user_id.0,
-            user = user_name.as_str(),
+            user = identifier.as_str(),
             receive_files,
             file_receive_limit_bytes
         );
@@ -1124,7 +1120,7 @@ impl Server {
         let (sender, sender_name, member) = match self.sessions.get(&session_id) {
             Some(session) => (
                 session.user_id,
-                session.user_name.clone(),
+                session.display_name.clone(),
                 session.room_id == Some(room_id),
             ),
             None => {
@@ -1202,7 +1198,7 @@ impl Server {
         let (sender, sender_name, member) = match self.sessions.get(&session_id) {
             Some(session) => (
                 session.user_id,
-                session.user_name.clone(),
+                session.display_name.clone(),
                 session.room_id == Some(room_id),
             ),
             None => return Err("unknown session".into()),
@@ -2288,7 +2284,8 @@ impl Server {
             .get(&session_id)
             .map(|session| control::ParticipantInfo {
                 user_id: session.user_id,
-                name: session.user_name.clone(),
+                display_name: session.display_name.clone(),
+                identifier: session.identifier.clone(),
                 in_call: session.room_id.is_some(),
                 voice_status: session.voice_status,
             })
@@ -2325,7 +2322,8 @@ struct ClientConn {
 
 struct Session {
     user_id: UserId,
-    user_name: String,
+    display_name: String,
+    identifier: String,
     tcp_token: Token,
     room_id: Option<RoomId>,
     udp_addr: Option<SocketAddr>,
@@ -2570,7 +2568,8 @@ mod tests {
     fn test_session(user_id: UserId, token: Token, room_id: Option<RoomId>) -> Session {
         Session {
             user_id,
-            user_name: format!("user-{}", user_id.0),
+            display_name: format!("user-{}", user_id.0),
+            identifier: format!("user-{}", user_id.0),
             tcp_token: token,
             room_id,
             udp_addr: None,
@@ -2723,6 +2722,143 @@ mod tests {
             room_recipient_tokens(&rooms, &sessions, room_id, None, |token| token != Token(3));
 
         assert_eq!(tokens, vec![Token(4)]);
+    }
+
+    #[test]
+    fn authenticate_resolves_user_by_token_alone() {
+        let mut server = test_server();
+        let token_secret = "alice-client-generated-token-with-at-least-32-bytes";
+        server.config.users = vec![UserConfig {
+            id: 7,
+            name: "alice-internal".to_string(),
+            display_name: "Alice".to_string(),
+            token_hash: hash_secret(token_secret),
+        }];
+
+        // The trailing Authenticated send fails because no client socket is
+        // registered, but the session is established before that send, so the
+        // durable side effect proves the token-only lookup succeeded. The
+        // display name matches the stored one, so no config save is attempted.
+        let _ = server.authenticate_client(Token(1), "Alice", token_secret, true, 0);
+
+        let session = server
+            .sessions
+            .values()
+            .find(|session| session.tcp_token == Token(1))
+            .expect("session established by token");
+        assert_eq!(session.identifier, "alice-internal");
+        assert_eq!(session.display_name, "Alice");
+        assert_eq!(session.user_id, UserId(7));
+    }
+
+    #[test]
+    fn authenticate_rejects_unknown_token() {
+        let mut server = test_server();
+        server.config.users = vec![UserConfig {
+            id: 7,
+            name: "alice-internal".to_string(),
+            display_name: "Alice".to_string(),
+            token_hash: hash_secret("alice-client-generated-token-with-at-least-32-bytes"),
+        }];
+
+        let _ = server.authenticate_client(Token(1), "Mallory", "wrong-token", true, 0);
+
+        assert!(server.sessions.is_empty());
+    }
+
+    #[test]
+    fn pairing_resolves_user_from_code() {
+        let path = std::env::temp_dir().join(format!(
+            "chatt-server-pair-code-test-{}.toml",
+            std::process::id()
+        ));
+        let mut server = test_server();
+        server.config.config_path = Some(path.clone());
+        server.config.users = vec![UserConfig {
+            id: 3,
+            name: "dana".to_string(),
+            display_name: "old".to_string(),
+            token_hash: String::new(),
+        }];
+        let code = "pairing-code-secret-1234567890";
+        server.invites.insert(
+            "dana".to_string(),
+            InviteState {
+                pairing_code_hash: hash_secret(code),
+                expires_at: std::time::Instant::now() + INVITE_TTL,
+            },
+        );
+        let new_token = "dana-client-generated-token-with-at-least-32-bytes";
+
+        // No `user` is supplied: the server matches the invite by pairing code.
+        let _ = server.pair_client(Token(2), "Dana", code, new_token, true, 0);
+
+        let _ = std::fs::remove_file(&path);
+
+        let user = server
+            .config
+            .users
+            .iter()
+            .find(|user| user.name == "dana")
+            .expect("user exists");
+        assert!(verify_secret_hash(&user.token_hash, new_token));
+        assert_eq!(user.display_name, "Dana");
+        assert!(server.invites.is_empty());
+        assert!(
+            server
+                .sessions
+                .values()
+                .any(|session| session.identifier == "dana")
+        );
+    }
+
+    #[test]
+    fn pairing_rejects_token_collision() {
+        let path = std::env::temp_dir().join(format!(
+            "chatt-server-pair-collision-test-{}.toml",
+            std::process::id()
+        ));
+        let new_token = "shared-client-generated-token-with-at-least-32-bytes";
+        let mut server = test_server();
+        server.config.config_path = Some(path.clone());
+        server.config.users = vec![
+            UserConfig {
+                id: 1,
+                name: "erin".to_string(),
+                display_name: "Erin".to_string(),
+                token_hash: hash_secret(new_token),
+            },
+            UserConfig {
+                id: 2,
+                name: "frank".to_string(),
+                display_name: "old".to_string(),
+                token_hash: String::new(),
+            },
+        ];
+        let code = "pairing-code-secret-0987654321";
+        server.invites.insert(
+            "frank".to_string(),
+            InviteState {
+                pairing_code_hash: hash_secret(code),
+                expires_at: std::time::Instant::now() + INVITE_TTL,
+            },
+        );
+
+        // Frank's generated token collides with Erin's existing one, so the
+        // server must refuse to pair rather than make the token ambiguous.
+        let _ = server.pair_client(Token(5), "Frank", code, new_token, true, 0);
+
+        let _ = std::fs::remove_file(&path);
+
+        let frank = server
+            .config
+            .users
+            .iter()
+            .find(|user| user.name == "frank")
+            .expect("frank exists");
+        assert!(frank.token_hash.is_empty());
+        assert!(!server.invites.is_empty());
+        assert!(server.sessions.is_empty());
     }
 
     #[test]

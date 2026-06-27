@@ -38,8 +38,12 @@ pub struct ServerEntry {
     pub udp_addr: String,
     #[toml(default)]
     pub udp_probe_addr: Option<String>,
-    pub user: String,
-    #[toml(default)]
+    /// Deprecated. Older configs stored an admin-chosen `user` identifier here.
+    /// The server now identifies clients by token, so this value is accepted for
+    /// backward compatibility, ignored, and dropped on the next config save.
+    #[toml(default, rename = "user", ToToml skip)]
+    #[allow(dead_code)]
+    pub legacy_user: String,
     pub display_name: String,
     pub token: String,
     #[toml(default)]
@@ -54,7 +58,7 @@ impl Default for ServerEntry {
             tcp_addr: "127.0.0.1:41000".to_string(),
             udp_addr: String::new(),
             udp_probe_addr: None,
-            user: "alice".to_string(),
+            legacy_user: String::new(),
             display_name: "Alice".to_string(),
             token: "alice-dev-token".to_string(),
             server_public_key: String::new(),
@@ -69,7 +73,6 @@ impl ServerEntry {
             tcp_addr: self.tcp_addr.clone(),
             udp_addr: self.effective_udp_addr(),
             udp_probe_addr: self.udp_probe_addr.clone(),
-            user: self.user.clone(),
             display_name: self.effective_display_name(),
             token: self.token.clone(),
             server_public_key: non_empty_string(&self.server_public_key),
@@ -83,12 +86,7 @@ impl ServerEntry {
     }
 
     pub fn effective_display_name(&self) -> String {
-        let display_name = self.display_name.trim();
-        if display_name.is_empty() {
-            self.user.clone()
-        } else {
-            display_name.to_string()
-        }
+        self.display_name.trim().to_string()
     }
 
     pub fn effective_udp_addr(&self) -> String {
@@ -626,7 +624,6 @@ impl Config {
     fn normalize(&mut self) {
         for server in &mut self.servers {
             server.alias = server.alias.trim().to_string();
-            server.user = server.user.trim().to_string();
             server.display_name = server.effective_display_name();
         }
         for preference in &mut self.user_audio {
@@ -656,8 +653,6 @@ impl Config {
         let mut aliases = HashSet::new();
         for server in &self.servers {
             validate_server_alias(&server.alias)
-                .map_err(|error| format!("{source}: server {}: {error}", server.alias))?;
-            validate_non_empty(&server.user, "user")
                 .map_err(|error| format!("{source}: server {}: {error}", server.alias))?;
             validate_non_empty(&server.token, "token")
                 .map_err(|error| format!("{source}: server {}: {error}", server.alias))?;
@@ -1010,7 +1005,6 @@ pub fn validate_display_name(display_name: &str) -> Result<(), String> {
 
 pub fn validate_server_entry(server: &ServerEntry) -> Result<(), String> {
     validate_server_alias(&server.alias)?;
-    validate_non_empty(&server.user, "user")?;
     validate_non_empty(&server.token, "token")?;
     validate_display_name(&server.display_name)?;
     validate_endpoint(&server.tcp_addr, "tcp-addr")?;
@@ -1064,7 +1058,6 @@ active-server = "lab"
 
 [[servers]]
 alias = "lab"
-user = "alice"
 display-name = "Alice"
 token = "alice-dev-token"
 tcp-addr = "127.0.0.1:42000"
@@ -1083,6 +1076,34 @@ room-id = 1
     }
 
     #[test]
+    fn server_ignores_legacy_user_key() {
+        let arena = Arena::new();
+        let mut doc = toml_spanner::parse(
+            r#"
+active-server = "lab"
+
+[[servers]]
+alias = "lab"
+user = "stale-internal-name"
+display-name = "Alice"
+token = "alice-dev-token"
+tcp-addr = "127.0.0.1:42000"
+server-public-key = ""
+room-id = 1
+"#,
+            &arena,
+        )
+        .unwrap();
+        let udp_addr_configured = server_udp_addr_configured(&doc);
+        let mut config: Config = doc.to().unwrap();
+        config.apply_inferred_addresses_from_doc(&udp_addr_configured);
+        config.normalize();
+
+        config.validate("<test>").unwrap();
+        assert_eq!(config.servers[0].display_name, "Alice");
+    }
+
+    #[test]
     fn server_parses_explicit_udp_and_probe_addrs() {
         let arena = Arena::new();
         let mut doc = toml_spanner::parse(
@@ -1091,7 +1112,6 @@ active-server = "lab"
 
 [[servers]]
 alias = "lab"
-user = "alice"
 display-name = "Alice"
 token = "alice-dev-token"
 tcp-addr = "127.0.0.1:42000"
@@ -1123,7 +1143,6 @@ active-server = "prod"
 
 [[servers]]
 alias = "prod"
-user = "alice"
 display-name = "Alice"
 token = "client-generated-token-with-at-least-32-bytes"
 tcp-addr = "chat.example.com:443"
@@ -1159,7 +1178,6 @@ active-server = "lab"
 
 [[servers]]
 alias = "lab"
-user = "carol"
 display-name = "Carol"
 token = "carol-dev-token"
 tcp-addr = "127.0.0.1:42000"

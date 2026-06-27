@@ -252,7 +252,6 @@ active-server = "local"
 
 [[servers]]
 alias = "local"
-user = "alice"
 display-name = "Alice"
 token = "alice-dev-token"
 server-public-key = ""
@@ -261,10 +260,13 @@ room-id = 1
 ```
 
 `active-server` selects one `[[servers]]` entry. `alias` is the local name for
-that server. `user` is the server's internal user identifier, and
-`display-name` is the name shown in chat. `server-public-key` is pinned from the
-server invite; if it is empty, the client falls back to the compiled
-development server key.
+that server. `token` is the secret that identifies the client to the server, so
+there is no separate user field. `display-name` is the name shown in chat.
+`server-public-key` is pinned from the server invite; if it is empty, the client
+falls back to the compiled development server key.
+
+Older configs may still contain a `user` key. It is now ignored and removed the
+next time the client saves its config.
 
 UDP media shares `tcp-addr` by default. Set `udp-addr` only when the server uses
 a separate UDP media address.
@@ -340,9 +342,11 @@ a DNS name, public IP, reverse proxy port, or NAT-forwarded port. When omitted,
 the public fields default to the corresponding bind address.
 
 Replace the development `server-identity-seed` and user token hashes before
-using a server outside local testing. `name` is the internal user identifier
-used by invites. `display-name` is updated when a user successfully joins. Room
-id `1` is required as the default lobby by the current client flow.
+using a server outside local testing. `name` is the admin-chosen internal
+identifier. It is used by `invite` and distinguishes users server-side, and it
+is never sent by or shown to clients, which authenticate by token alone.
+`display-name` is updated when a user successfully joins. Room id `1` is required
+as the default lobby by the current client flow.
 
 `encryption = true` makes the server require encrypted TCP control and
 server-relayed UDP media transport. Set it to `false` only for trusted local
@@ -392,12 +396,13 @@ exist in TOML yet; successful pairing creates or updates the `[[users]]` entry.
 cargo run -p chatt -- join tcj1_...
 ```
 
-The join TUI asks for a server alias and display username, shows the server
-address and key, then pairs over the normal encrypted control channel. On
-successful pairing, the client writes a named `[[servers]]` entry with the new
-token, and the server writes `token-hash` plus the chosen `display-name`.
-Invites are only held in server memory and are removed when replaced, expired,
-or successfully used.
+The client derives a server alias from the address and seeds the display name
+from the operating system account name, then pairs over the normal encrypted
+control channel. On successful pairing, the client writes a named `[[servers]]`
+entry with the new token, and the server writes `token-hash` plus the
+`display-name`. The display name is editable afterward in settings. Invites are
+only held in server memory and are removed when replaced, expired, or
+successfully used.
 
 ## Security Notes
 

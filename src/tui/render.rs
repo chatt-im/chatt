@@ -459,10 +459,7 @@ fn draw_server_select_item(
             .with(Ellipsis(true))
             .text(
                 buf,
-                &format!(
-                    "  {} as {}  room {}",
-                    item.user, item.display_name, item.room_id
-                ),
+                &format!("  {}  room {}", item.display_name, item.room_id),
             );
     }
     if rows.h > 0 {

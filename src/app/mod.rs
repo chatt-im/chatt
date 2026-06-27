@@ -61,7 +61,7 @@ pub(crate) use dialogs::{UserVolumeDialog, UserVolumeEvent};
 pub(crate) use participants::{ParticipantState, Participants};
 pub(crate) use server::{
     PendingPair, ServerEditDraft, ServerEditEvent, ServerEditFocus, ServerSelectItem,
-    default_join_alias, random_token, server_entry_from_invite, title_case_ascii,
+    default_join_alias, default_join_display_name, random_token, server_entry_from_invite,
     unique_server_alias,
 };
 
@@ -550,13 +550,12 @@ impl App {
             .iter()
             .map(|server| ServerSelectItem {
                 alias: server.alias.clone(),
-                user: server.user.clone(),
                 display_name: server.display_name.clone(),
                 tcp_addr: server.tcp_addr.clone(),
                 room_id: server.room_id,
                 search_text: format!(
-                    "{} {} {} {} {}",
-                    server.alias, server.user, server.display_name, server.tcp_addr, server.room_id
+                    "{} {} {} {}",
+                    server.alias, server.display_name, server.tcp_addr, server.room_id
                 ),
             })
             .collect();
@@ -662,7 +661,7 @@ impl App {
 
     fn start_join_pairing(&mut self, ticket: InviteTicket) {
         let alias = unique_server_alias(&self.config, &default_join_alias(&ticket));
-        let display_name = title_case_ascii(&ticket.user);
+        let display_name = default_join_display_name();
         let token = match random_token() {
             Ok(token) => token,
             Err(error) => {
@@ -826,7 +825,7 @@ impl App {
                 online,
                 ..
             } => {
-                let name = participant.name.clone();
+                let name = participant.display_name.clone();
                 self.participants.set_presence(participant, online);
                 self.set_status(format!("{name} {}", if online { "joined" } else { "left" }));
             }
@@ -3815,7 +3814,8 @@ mod tests {
         app.user_id = Some(UserId(1));
         app.participants.replace_room(vec![ParticipantInfo {
             user_id: UserId(1),
-            name: "alice".to_string(),
+            display_name: "alice".to_string(),
+            identifier: "alice".to_string(),
             in_call: true,
             voice_status: ParticipantVoiceStatus::default(),
         }]);
@@ -3957,13 +3957,15 @@ mod tests {
         app.participants.replace_room(vec![
             ParticipantInfo {
                 user_id: UserId(1),
-                name: "alice".to_string(),
+                display_name: "alice".to_string(),
+                identifier: "alice".to_string(),
                 in_call: true,
                 voice_status: ParticipantVoiceStatus::default(),
             },
             ParticipantInfo {
                 user_id: UserId(2),
-                name: "bob".to_string(),
+                display_name: "bob".to_string(),
+                identifier: "bob".to_string(),
                 in_call: true,
                 voice_status: ParticipantVoiceStatus::default(),
             },
@@ -4093,13 +4095,15 @@ mod tests {
         app.participants.replace_room(vec![
             ParticipantInfo {
                 user_id: UserId(1),
-                name: "alice".to_string(),
+                display_name: "alice".to_string(),
+                identifier: "alice".to_string(),
                 in_call: true,
                 voice_status: ParticipantVoiceStatus::default(),
             },
             ParticipantInfo {
                 user_id: UserId(2),
-                name: "bob".to_string(),
+                display_name: "bob".to_string(),
+                identifier: "bob".to_string(),
                 in_call: true,
                 voice_status: ParticipantVoiceStatus::default(),
             },
@@ -4314,13 +4318,15 @@ mod tests {
         app.participants.replace_room(vec![
             ParticipantInfo {
                 user_id: UserId(1),
-                name: "alice".to_string(),
+                display_name: "alice".to_string(),
+                identifier: "alice".to_string(),
                 in_call: true,
                 voice_status: ParticipantVoiceStatus::default(),
             },
             ParticipantInfo {
                 user_id: UserId(2),
-                name: "bob".to_string(),
+                display_name: "bob".to_string(),
+                identifier: "bob".to_string(),
                 in_call: true,
                 voice_status: ParticipantVoiceStatus::default(),
             },
