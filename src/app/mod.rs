@@ -20,15 +20,14 @@ use extui::Rect;
 use extui::event::{
     KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
-use extui_bindings::InputKey;
-use extui_editor::{Editor, Mode as EditorMode, Span as EditorSpan, bindings as editor_bindings};
+use extui_editor::{Editor, Span as EditorSpan, bindings as editor_bindings};
 use rpc::{
     control::{ChatMessage, InviteTicket, ParticipantVoiceStatus},
     ids::{SessionId, UserId},
 };
 
 use crate::{
-    bindings::{self, BindCommand, PendingChord, Resolved},
+    bindings::{BindCommand, PendingChord},
     chat_buffer::{LineKind, VirtualChatBuffer, VisibleLine},
     client_net::{NetworkClient, NetworkCommand, NetworkEvent, spawn_pair_once},
     config::{self, Config, SoundboardClip, ThemeChoice, validate_server_entry},
@@ -37,15 +36,15 @@ use crate::{
         self, AudioInputPickerState, AudioOutputPickerState, SettingsDraft, SettingsFocus,
         SettingsMutation,
     },
-    theme::{self, Theme},
+    theme::Theme,
     tui::{
         Action,
         editor::EditorHighlighter,
-        focus::{FocusId, FocusManager, ServerField, SettingsField},
-        form::{FormAction, FormMouseIntent, FormState, rect_contains},
-        modes::{ModeKind, ModeStack},
+        form::{FormState, rect_contains},
+        mode::{AppMode, ModeTransition},
+        modes::{RoomMode, ServerEditMode, ServerListMode, SettingsMode},
+        overlay::DialogMode,
     },
-    ui::select::FuzzySelect,
 };
 
 use chatt::audio::{
@@ -60,9 +59,8 @@ use audio_diagnostics::AudioDiagnostics;
 pub(crate) use dialogs::{UserVolumeDialog, UserVolumeEvent};
 pub(crate) use participants::{ParticipantState, Participants};
 pub(crate) use server::{
-    PendingPair, ServerEditDraft, ServerEditEvent, ServerEditFocus, ServerSelectItem,
-    default_join_alias, default_join_display_name, random_token, server_entry_from_invite,
-    unique_server_alias,
+    PendingPair, ServerEditDraft, ServerEditEvent, ServerSelectItem, default_join_alias,
+    default_join_display_name, random_token, server_entry_from_invite, unique_server_alias,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -91,14 +89,6 @@ impl ChatPanelFocus {
         let next = (current as isize + delta).rem_euclid(Self::ORDER.len() as isize) as usize;
         Self::ORDER[next]
     }
-
-    fn focus_id(self) -> FocusId {
-        match self {
-            Self::Lobby => FocusId::Participants,
-            Self::ChatLog => FocusId::Chat,
-            Self::Compose => FocusId::Composer,
-        }
-    }
 }
 
 pub(crate) struct App {
@@ -111,10 +101,8 @@ pub(crate) struct App {
     pub(crate) status: String,
     pub(crate) status_kind: StatusKind,
     status_expires_at: Option<Instant>,
-    pub(crate) mode: theme::UiMode,
+    pub(crate) mode_transition: ModeTransition,
     pub(crate) chat_focus: ChatPanelFocus,
-    pub(crate) focus: FocusManager,
-    pub(crate) modes: ModeStack,
     pub(crate) composer: Editor,
     pub(crate) composer_hl: EditorHighlighter,
     pub(crate) chat: VirtualChatBuffer,
@@ -142,9 +130,6 @@ pub(crate) struct App {
     pub(crate) session_id: Option<SessionId>,
     pub(crate) user_id: Option<UserId>,
     pub(crate) server_items: Vec<ServerSelectItem>,
-    pub(crate) server_select: FuzzySelect,
-    pub(crate) server_select_searching: bool,
-    pub(crate) server_edit: Option<ServerEditDraft>,
     pub(crate) pending_pair: Option<PendingPair>,
     pub(crate) input_devices: Vec<DeviceInfo>,
     pub(crate) output_devices: Vec<DeviceInfo>,
@@ -152,9 +137,9 @@ pub(crate) struct App {
     pub(crate) audio_output_items: Vec<settings::AudioOutputItem>,
     pub(crate) audio_input_picker: AudioInputPickerState,
     pub(crate) audio_output_picker: AudioOutputPickerState,
-    pub(crate) settings_form: FormState<SettingsFocus>,
     pub(crate) settings: SettingsDraft,
     pub(crate) settings_dirty: bool,
+    pub(crate) settings_open: bool,
     pub(crate) mic_muted: Arc<AtomicBool>,
     pub(crate) deafened: Arc<AtomicBool>,
     pub(crate) voice_tx_enabled: Arc<AtomicBool>,
@@ -169,7 +154,7 @@ pub(crate) struct App {
     pub(crate) echo_control: Arc<EchoCancellationControl>,
     pub(crate) muted_users: HashSet<UserId>,
     pub(crate) stream_users: HashMap<u32, UserId>,
-    pub(crate) volume_dialog: Option<UserVolumeDialog>,
+    pub(crate) volume_preview: Option<(UserId, f32)>,
     pub(crate) voice_packets_received: u64,
     pub(crate) voice_bytes_received: u64,
     pub(crate) encoder_profile: LiveEncoderProfile,
@@ -394,11 +379,6 @@ impl App {
         let mut settings_draft = SettingsDraft::from_audio(&config.audio);
         settings_draft.set_form_bindings_from_config(config.ui.form_bindings);
         settings_draft.set_theme_from_config(config.ui.theme);
-        let settings_form = FormState::with_order(
-            SettingsFocus::CaptureDevice,
-            config.ui.form_bindings,
-            SettingsFocus::ORDER,
-        );
         let audio_input_items = settings::audio_input_items(&[]);
         let audio_output_items = settings::audio_output_items(&[]);
         let mut audio_input_picker = AudioInputPickerState::default();
@@ -430,10 +410,8 @@ impl App {
             status: "select a server".to_string(),
             status_kind: StatusKind::Info,
             status_expires_at: None,
-            mode: theme::UiMode::ServerSelect,
+            mode_transition: ModeTransition::None,
             chat_focus: ChatPanelFocus::Compose,
-            focus: FocusManager::new(FocusId::ServerList),
-            modes: ModeStack::new(ModeKind::ServerSelect),
             composer,
             composer_hl,
             chat: VirtualChatBuffer::new(config.ui.max_messages as usize, theme.syntax),
@@ -461,9 +439,6 @@ impl App {
             session_id: None,
             user_id: None,
             server_items: Vec::new(),
-            server_select: FuzzySelect::default(),
-            server_select_searching: false,
-            server_edit: None,
             pending_pair: None,
             input_devices: Vec::new(),
             output_devices: Vec::new(),
@@ -471,9 +446,9 @@ impl App {
             audio_output_items,
             audio_input_picker,
             audio_output_picker,
-            settings_form,
             settings: settings_draft,
             settings_dirty: false,
+            settings_open: false,
             mic_muted: Arc::new(AtomicBool::new(false)),
             deafened: Arc::new(AtomicBool::new(false)),
             voice_tx_enabled: Arc::new(AtomicBool::new(false)),
@@ -488,7 +463,7 @@ impl App {
             echo_control,
             muted_users: HashSet::new(),
             stream_users: HashMap::new(),
-            volume_dialog: None,
+            volume_preview: None,
             voice_packets_received: 0,
             voice_bytes_received: 0,
             encoder_profile: LiveEncoderProfile::DRED_20,
@@ -559,19 +534,19 @@ impl App {
                 ),
             })
             .collect();
-        self.server_select.refresh(&self.server_items);
     }
 
-    fn selected_server_alias(&self) -> Option<String> {
-        self.server_select
-            .current_item_index()
-            .and_then(|index| self.server_items.get(index))
-            .map(|item| item.alias.clone())
-    }
-
-    fn open_server_select(&mut self) {
-        self.set_mode(theme::UiMode::ServerSelect);
-        self.server_select_searching = false;
+    pub(crate) fn open_server_select(&mut self) {
+        if self.settings_open {
+            self.apply_active_capture_amplification(self.config.audio.max_amplification);
+            self.stop_settings_preview_capture();
+            self.audio_input_picker
+                .reset(&self.audio_input_items, self.settings.input_selection());
+            self.audio_output_picker
+                .reset(&self.audio_output_items, self.settings.output_selection());
+        }
+        self.settings_open = false;
+        self.mode_transition = ModeTransition::Set(Box::new(ServerListMode::new()));
         self.rebuild_server_items();
         if self.config.servers.is_empty() {
             self.set_status("no servers configured; run chatt join JOIN_STRING");
@@ -580,26 +555,29 @@ impl App {
         }
     }
 
-    fn open_server_edit(&mut self, alias: &str) {
+    pub(crate) fn open_server_edit(&mut self, alias: &str) {
         let Ok(server) = self.config.server(alias).cloned() else {
             self.set_error(format!("server {alias} is not configured"));
-            self.open_server_select();
             return;
         };
-        self.server_edit = Some(ServerEditDraft::from_server(
-            &server,
-            self.config.ui.form_bindings,
-        ));
-        self.set_mode(theme::UiMode::ServerEdit);
+        let draft = ServerEditDraft::from_server(&server, self.config.ui.form_bindings);
+        if self.settings_open {
+            self.apply_active_capture_amplification(self.config.audio.max_amplification);
+            self.stop_settings_preview_capture();
+            self.settings_open = false;
+            self.replace_mode(Box::new(ServerEditMode::new(draft)));
+        } else {
+            self.push_mode(Box::new(ServerEditMode::new(draft)));
+        }
         self.set_status(format!("editing server {}", server.alias));
     }
 
-    fn start_network(&mut self, alias: &str) {
+    pub(crate) fn start_network(&mut self, alias: &str) -> bool {
         let server = match self.config.server(alias) {
             Ok(server) => server.clone(),
             Err(error) => {
                 self.set_error(error);
-                return;
+                return false;
             }
         };
         self.disconnect_network();
@@ -610,7 +588,7 @@ impl App {
             Ok(network) => network,
             Err(error) => {
                 self.set_error(format!("failed to start network: {error}"));
-                return;
+                return false;
             }
         };
         self.control_socket =
@@ -636,6 +614,7 @@ impl App {
         self.network = Some(network);
         self.supervisor.network.reset();
         self.set_status("connecting");
+        true
     }
 
     fn disconnect_network(&mut self) {
@@ -686,7 +665,6 @@ impl App {
             self.event_tx.clone(),
         );
         self.pending_pair = Some(PendingPair { server });
-        self.set_mode(theme::UiMode::ServerSelect);
         self.set_status(format!("pairing {alias}"));
     }
 
@@ -747,7 +725,7 @@ impl App {
             output_ok = output_count.is_some(),
         );
 
-        if self.mode == theme::UiMode::Settings {
+        if self.settings_open {
             if errors.is_empty() {
                 self.set_status(format!(
                     "found {} input device(s), {} output device(s) (in {}, out {})",
@@ -762,7 +740,7 @@ impl App {
         }
 
         if refresh.restart_preview
-            && self.mode == theme::UiMode::Settings
+            && self.settings_open
             && !self.voice_tx_enabled.load(Ordering::Relaxed)
             && !self.deafened.load(Ordering::Relaxed)
         {
@@ -905,10 +883,8 @@ impl App {
             }
             NetworkEvent::AuthFailed(error) => {
                 kvlog::warn!("app auth failed", error = error.as_str());
-                self.stop_audio();
-                self.control_socket.take();
-                self.network.take();
-                self.stream_users.clear();
+                self.disconnect_network();
+                self.open_server_select();
                 self.push_network_notice("auth", &error);
                 self.set_error(auth_failure_status(&error));
             }
@@ -959,9 +935,9 @@ impl App {
                 self.schedule_network_recovery(Instant::now(), reason);
             }
             NetworkEvent::Disconnected => {
-                self.stop_audio();
-                self.stream_users.clear();
-                self.schedule_network_recovery(Instant::now(), "network worker disconnected");
+                self.disconnect_network();
+                self.open_server_select();
+                self.set_error("network disconnected");
             }
         }
     }
@@ -1056,24 +1032,36 @@ impl App {
         self.chat.bottom();
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn process_key(&mut self, key: KeyEvent) -> Action {
-        crate::tui::modes::process_key(self, key)
+        let mut mode = RoomMode;
+        mode.process_input(self, key)
     }
 
-    pub(crate) fn process_mouse(&mut self, mouse: MouseEvent) -> Action {
-        if self.process_top_bar_mouse(mouse) {
-            return Action::Continue;
-        }
-
-        match self.mode {
-            theme::UiMode::Settings => self.process_settings_mouse(mouse),
-            theme::UiMode::ServerEdit => self.process_server_edit_mouse(mouse),
-            theme::UiMode::Compose | theme::UiMode::Log => self.process_chat_mouse(mouse),
-            _ => Action::Continue,
+    /// Builds the fallback base mode used if the stack is ever popped empty.
+    pub(crate) fn base_mode(&self) -> Box<dyn AppMode> {
+        if self.network.is_some() {
+            Box::new(RoomMode)
+        } else {
+            Box::new(ServerListMode::new())
         }
     }
 
-    fn process_top_bar_mouse(&mut self, mouse: MouseEvent) -> bool {
+    /// Requests pushing `mode` as an overlay on top of the current stack.
+    pub(crate) fn push_mode(&mut self, mode: Box<dyn AppMode>) {
+        self.mode_transition = ModeTransition::Push(mode);
+    }
+
+    pub(crate) fn replace_mode(&mut self, mode: Box<dyn AppMode>) {
+        self.mode_transition = ModeTransition::Replace(mode);
+    }
+
+    /// Requests popping the active mode off the stack.
+    pub(crate) fn pop_mode(&mut self) {
+        self.mode_transition = ModeTransition::Pop;
+    }
+
+    pub(crate) fn process_top_bar_mouse(&mut self, mouse: MouseEvent) -> bool {
         if !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
             return false;
         }
@@ -1088,7 +1076,7 @@ impl App {
         false
     }
 
-    fn process_chat_mouse(&mut self, mouse: MouseEvent) -> Action {
+    pub(crate) fn process_chat_mouse(&mut self, mouse: MouseEvent) -> Action {
         let rect = self.last_chat_rect;
         let in_chat = rect_contains(rect, mouse.column, mouse.row);
         let in_chat_bar = rect_contains(self.last_chat_log_bar_rect, mouse.column, mouse.row);
@@ -1115,7 +1103,6 @@ impl App {
                 let row = mouse.row.saturating_sub(self.last_room_rect.y) as usize;
                 if self.participants.select_visible_row(row).is_some() {
                     self.keep_selected_room_user_visible();
-                    self.refresh_mode_and_focus();
                 }
             }
             MouseEventKind::Down(MouseButton::Left) if in_chat_bar => {
@@ -1209,94 +1196,47 @@ impl App {
         }
     }
 
+    pub(crate) fn select_chat_top(&mut self) {
+        if self.chat_focus == ChatPanelFocus::ChatLog {
+            self.chat.top(self.last_chat_width, self.last_chat_height);
+            self.chat.select_first_header();
+            self.chat.clear_selection();
+            self.keep_selected_chat_header_visible();
+        }
+    }
+
+    pub(crate) fn select_chat_bottom(&mut self) {
+        if self.chat_focus == ChatPanelFocus::ChatLog {
+            self.chat.bottom();
+            self.chat.select_last_header(self.last_chat_width);
+            self.chat.clear_selection();
+            self.keep_selected_chat_header_visible();
+        }
+    }
+
+    pub(crate) fn copy_chat_selection_if_focused(&mut self) {
+        if self.chat_focus == ChatPanelFocus::ChatLog {
+            self.copy_chat_selection();
+        }
+    }
+
+    pub(crate) fn toggle_chat_expand_if_focused(&mut self) {
+        if self.chat_focus == ChatPanelFocus::ChatLog {
+            self.toggle_selected_log_collapse();
+        }
+    }
+
     pub(crate) fn take_pending_clipboard(&mut self) -> Option<String> {
         self.pending_clipboard.take()
     }
 
-    /// Inserts terminal-pasted text at the composer cursor while composing.
-    pub(crate) fn handle_paste(&mut self, text: String) {
-        if self.mode != theme::UiMode::Compose {
-            return;
-        }
+    /// Inserts terminal-pasted text at the composer cursor.
+    pub(crate) fn insert_composer_paste(&mut self, text: String) {
         let span = EditorSpan::empty_at(self.composer.cursor_offset());
         self.composer.replace_range(span, &text);
     }
 
-    pub(crate) fn process_server_select_key(&mut self, key: KeyEvent) -> Action {
-        if matches!(key.kind, KeyEventKind::Release) {
-            return Action::Continue;
-        }
-        if self.server_select_searching {
-            match key.code {
-                KeyCode::Esc | KeyCode::Enter => {
-                    self.server_select_searching = false;
-                    return Action::Continue;
-                }
-                _ if self.server_select.edit_query(key) => {
-                    self.server_select.refresh(&self.server_items);
-                    return Action::Continue;
-                }
-                _ => return Action::Continue,
-            }
-        }
-
-        let Some(input) = InputKey::from_event(&key) else {
-            return Action::Continue;
-        };
-        match bindings::resolve(
-            &self.config.bindings.router,
-            bindings::PICKER_LAYER,
-            &mut self.pending_chord,
-            input,
-        ) {
-            Resolved::Action(id) => {
-                let command = self.config.bindings.actions.get(id).clone();
-                self.process_command(command)
-            }
-            Resolved::Consumed | Resolved::Unmatched => Action::Continue,
-        }
-    }
-
-    pub(crate) fn process_server_edit_key(&mut self, key: KeyEvent) -> Action {
-        let Some(draft) = self.server_edit.as_mut() else {
-            return Action::Continue;
-        };
-        match draft.handle_key(key) {
-            ServerEditEvent::Consumed => {
-                self.sync_focus();
-            }
-            ServerEditEvent::Cancel => {
-                self.server_edit = None;
-                self.open_server_select();
-            }
-            ServerEditEvent::Save { join_after_save } => {
-                self.save_server_edit(join_after_save);
-            }
-        }
-        Action::Continue
-    }
-
-    fn join_selected_server(&mut self) {
-        let Some(alias) = self.selected_server_alias() else {
-            self.set_error("no server selected");
-            return;
-        };
-        self.start_network(&alias);
-    }
-
-    fn edit_selected_server(&mut self) {
-        let Some(alias) = self.selected_server_alias() else {
-            self.set_error("no server selected");
-            return;
-        };
-        self.open_server_edit(&alias);
-    }
-
-    fn delete_selected_server(&mut self) {
-        let Some(alias) = self.selected_server_alias() else {
-            self.set_error("no server selected");
-            return;
-        };
+    pub(crate) fn delete_server(&mut self, alias: &str) {
         self.config.servers.retain(|server| server.alias != alias);
         self.config
             .user_audio
@@ -1320,11 +1260,7 @@ impl App {
         }
     }
 
-    fn save_server_edit(&mut self, join_after_save: bool) {
-        let Some(draft) = self.server_edit.as_ref() else {
-            self.set_error("no server edit is open");
-            return;
-        };
+    pub(crate) fn save_server_edit_with(&mut self, draft: &ServerEditDraft, join_after_save: bool) {
         let update = match draft.to_update() {
             Ok(update) => update,
             Err(error) => {
@@ -1368,12 +1304,13 @@ impl App {
         match self.config.save_runtime() {
             Ok(path) => {
                 self.config.config_path = Some(path.clone());
-                self.server_edit = None;
                 self.rebuild_server_items();
                 if join_after_save {
-                    self.start_network(&alias);
+                    if self.start_network(&alias) {
+                        self.replace_mode(Box::new(RoomMode));
+                    }
                 } else {
-                    self.open_server_select();
+                    self.pop_mode();
                     self.set_status(format!("server saved to {}", path.display()));
                 }
             }
@@ -1381,7 +1318,7 @@ impl App {
         }
     }
 
-    fn cancel_open_audio_picker(&mut self) -> bool {
+    pub(crate) fn cancel_open_audio_picker(&mut self) -> bool {
         if self.audio_input_picker.open {
             self.cancel_audio_input_picker();
             true
@@ -1397,124 +1334,17 @@ impl App {
         self.audio_input_picker.open || self.audio_output_picker.open
     }
 
-    pub(crate) fn process_settings_key(&mut self, key: KeyEvent) -> Action {
-        if self.mode != theme::UiMode::Settings || matches!(key.kind, KeyEventKind::Release) {
-            return Action::Continue;
-        }
-        if self.handle_open_settings_picker_key(key) {
-            self.sync_focus();
-            return Action::Continue;
-        }
-
-        let focus = self.settings_form.focus();
-        let kind = self.settings.field_kind(focus);
-        let text_focused = kind == crate::tui::form::FormFieldKind::Text;
-
-        let event = self.settings_form.handle_key(key, kind);
-        self.apply_settings_commit(event.commit);
-        match event.action {
-            FormAction::None => {
-                if !text_focused {
-                    return self.resolve_settings_binding(key);
-                }
-            }
-            FormAction::Cancel => {
-                if !self.cancel_open_audio_picker() {
-                    self.close_settings();
-                }
-            }
-            FormAction::Activate => self.activate_settings_focus(),
-            FormAction::Adjust(delta) => self.adjust_settings_focus(delta),
-            FormAction::FocusMoved => self.sync_focus(),
-            FormAction::TextChanged => self.mark_settings_dirty(),
-            FormAction::Scrolled => {}
-        }
-        Action::Continue
-    }
-
-    /// Dispatches a key the settings form left unhandled through the
-    /// `SETTINGS_LAYER` bindings, so command bindings such as `Ctrl-s`
-    /// (`SaveSettings`), `q`, `r`, and `w` work while the form keeps ownership
-    /// of movement and text editing.
-    fn resolve_settings_binding(&mut self, key: KeyEvent) -> Action {
-        let Some(input) = InputKey::from_event(&key) else {
-            return Action::Continue;
-        };
-        match bindings::resolve(
-            &self.config.bindings.router,
-            bindings::SETTINGS_LAYER,
-            &mut self.pending_chord,
-            input,
-        ) {
-            Resolved::Action(id) => {
-                let command = self.config.bindings.actions.get(id).clone();
-                self.process_command(command)
-            }
-            Resolved::Consumed | Resolved::Unmatched => Action::Continue,
-        }
-    }
-
-    fn process_settings_mouse(&mut self, mouse: MouseEvent) -> Action {
-        if self.handle_open_settings_picker_mouse(mouse) {
-            self.sync_focus();
-            return Action::Continue;
-        }
-
-        let event = self.settings_form.handle_mouse(mouse);
-        self.apply_settings_commit(event.commit);
-        match event.intent {
-            FormMouseIntent::None => {}
-            FormMouseIntent::Activate(field) => {
-                let _ = self.settings_form.set_focus(field);
-                self.activate_settings_focus();
-            }
-            FormMouseIntent::Adjust(field, delta) => {
-                let commit = self.settings_form.set_focus(field);
-                self.apply_settings_commit(commit);
-                self.adjust_settings_focus(delta);
-            }
-            FormMouseIntent::Text(field, area, column) => {
-                let value = self.settings.buffer_text(field);
-                let commit = self
-                    .settings_form
-                    .focus_text_at(field, &value, area, column, true);
-                self.apply_settings_commit(commit);
-            }
-            FormMouseIntent::PickerItem(field, item_index) => match field {
-                SettingsFocus::CaptureDevice => {
-                    if self
-                        .audio_input_picker
-                        .selector
-                        .select_item_index(item_index)
-                    {
-                        self.confirm_audio_input_picker();
-                    }
-                }
-                SettingsFocus::PlaybackDevice => {
-                    if self
-                        .audio_output_picker
-                        .selector
-                        .select_item_index(item_index)
-                    {
-                        self.confirm_audio_output_picker();
-                    }
-                }
-                _ => {}
-            },
-        }
-        if event.action == FormAction::Scrolled {
-            self.sync_focus();
-        }
-        Action::Continue
-    }
-
-    fn handle_open_settings_picker_mouse(&mut self, mouse: MouseEvent) -> bool {
+    pub(crate) fn handle_open_settings_picker_mouse(
+        &mut self,
+        focus: SettingsFocus,
+        mouse: MouseEvent,
+    ) -> bool {
         let delta = match mouse.kind {
             MouseEventKind::ScrollDown => 1,
             MouseEventKind::ScrollUp => -1,
             _ => return false,
         };
-        match self.settings_form.focus() {
+        match focus {
             SettingsFocus::CaptureDevice if self.audio_input_picker.open => {
                 self.audio_input_picker.move_selection(delta);
                 true
@@ -1527,23 +1357,11 @@ impl App {
         }
     }
 
-    fn process_server_edit_mouse(&mut self, mouse: MouseEvent) -> Action {
-        let Some(draft) = self.server_edit.as_mut() else {
-            return Action::Continue;
-        };
-        match draft.handle_mouse(mouse) {
-            ServerEditEvent::Consumed => self.sync_focus(),
-            ServerEditEvent::Cancel => {
-                self.server_edit = None;
-                self.open_server_select();
-            }
-            ServerEditEvent::Save { join_after_save } => self.save_server_edit(join_after_save),
-        }
-        Action::Continue
-    }
-
-    fn handle_open_settings_picker_key(&mut self, key: KeyEvent) -> bool {
-        let focus = self.settings_form.focus();
+    pub(crate) fn handle_open_settings_picker_key(
+        &mut self,
+        focus: SettingsFocus,
+        key: KeyEvent,
+    ) -> bool {
         match focus {
             SettingsFocus::CaptureDevice if self.audio_input_picker.open => {
                 if !self.audio_input_picker.searching {
@@ -1585,127 +1403,13 @@ impl App {
         }
     }
 
-    pub(crate) fn process_command(&mut self, command: BindCommand) -> Action {
+    pub(crate) fn process_global_command(&mut self, command: BindCommand) -> Action {
         use BindCommand::*;
         match command {
-            EnterCompose => self.enter_compose_insert_mode(),
-            EnterLog => self.set_chat_panel_focus(ChatPanelFocus::ChatLog),
             OpenSettings => self.open_settings(),
-            CloseSettings => self.close_settings(),
-            SubmitMessage => self.submit_input(),
-            Cancel => {
-                if self.mode == theme::UiMode::ServerSelect {
-                    if self.network.is_some() {
-                        self.enter_compose_insert_mode();
-                    }
-                } else if self.mode == theme::UiMode::Settings {
-                    if !self.cancel_open_audio_picker() {
-                        self.close_settings();
-                    }
-                } else if self.mode == theme::UiMode::Compose {
-                    self.composer.clear();
-                    self.enter_compose_insert_mode();
-                } else {
-                    self.enter_compose_insert_mode();
-                }
-            }
             Quit => return Action::Quit,
-            ScrollUp => self.scroll_focused_panel(-1, 1),
-            ScrollDown => self.scroll_focused_panel(1, 1),
-            RoomScrollUp => self.move_room_selection_with_focus(-1),
-            RoomScrollDown => self.move_room_selection_with_focus(1),
-            OpenSelectedUserVolume => {
-                if self.chat_focus == ChatPanelFocus::Lobby {
-                    self.open_selected_user_volume();
-                } else {
-                    self.set_status("focus lobby to adjust users");
-                }
-            }
-            ToggleSelectedUserMute => {
-                if self.chat_focus == ChatPanelFocus::Lobby {
-                    self.toggle_selected_user_mute();
-                } else {
-                    self.set_status("focus lobby to mute users");
-                }
-            }
-            HalfPageUp => self.scroll_chat_log_if_focused(-(self.chat_half_page_rows() as isize)),
-            HalfPageDown => self.scroll_chat_log_if_focused(self.chat_half_page_rows() as isize),
-            Top => {
-                if self.chat_focus == ChatPanelFocus::ChatLog {
-                    self.chat.top(self.last_chat_width, self.last_chat_height);
-                    self.chat.select_first_header();
-                    self.chat.clear_selection();
-                    self.keep_selected_chat_header_visible();
-                }
-            }
-            Bottom => {
-                if self.chat_focus == ChatPanelFocus::ChatLog {
-                    self.chat.bottom();
-                    self.chat.select_last_header(self.last_chat_width);
-                    self.chat.clear_selection();
-                    self.keep_selected_chat_header_visible();
-                }
-            }
-            CopySelection => {
-                if self.chat_focus == ChatPanelFocus::ChatLog {
-                    self.copy_chat_selection();
-                }
-            }
-            ToggleExpand => {
-                if self.chat_focus == ChatPanelFocus::ChatLog {
-                    self.toggle_selected_log_collapse();
-                }
-            }
             ToggleMute => self.toggle_mute(),
             ToggleDeafen => self.set_deafen(!self.deafened.load(Ordering::Relaxed)),
-            RefreshDevices => self.refresh_audio_devices(),
-            SaveSettings => self.save_settings(),
-            Activate => {
-                if self.mode == theme::UiMode::ServerSelect {
-                    self.join_selected_server();
-                } else {
-                    self.activate_settings_focus();
-                }
-            }
-            FocusNext => {
-                if self.mode == theme::UiMode::Settings {
-                    self.move_settings_focus(1);
-                } else {
-                    self.move_chat_panel_focus(1);
-                }
-            }
-            FocusPrev => {
-                if self.mode == theme::UiMode::Settings {
-                    self.move_settings_focus(-1);
-                } else {
-                    self.move_chat_panel_focus(-1);
-                }
-            }
-            SelectNext => {
-                if self.mode == theme::UiMode::ServerSelect {
-                    self.server_select.move_selection(1);
-                } else if self.mode == theme::UiMode::Settings {
-                    self.move_settings_selection(1);
-                } else if self.chat_focus == ChatPanelFocus::Lobby {
-                    self.move_room_selection_with_focus(1);
-                }
-            }
-            SelectPrev => {
-                if self.mode == theme::UiMode::ServerSelect {
-                    self.server_select.move_selection(-1);
-                } else if self.mode == theme::UiMode::Settings {
-                    self.move_settings_selection(-1);
-                } else if self.chat_focus == ChatPanelFocus::Lobby {
-                    self.move_room_selection_with_focus(-1);
-                }
-            }
-            AdjustLeft => self.adjust_settings_focus(-1),
-            AdjustRight => self.adjust_settings_focus(1),
-            ClearChat => {
-                if self.chat_focus == ChatPanelFocus::ChatLog {
-                    self.chat.clear();
-                }
-            }
             PlaySoundboard1 => self.trigger_soundboard_slot(0),
             PlaySoundboard2 => self.trigger_soundboard_slot(1),
             PlaySoundboard3 => self.trigger_soundboard_slot(2),
@@ -1716,29 +1420,26 @@ impl App {
             PlaySoundboard8 => self.trigger_soundboard_slot(7),
             PlaySoundboard9 => self.trigger_soundboard_slot(8),
             ToggleKeyPreview => self.key_preview_expanded = !self.key_preview_expanded,
-            EditServer => self.edit_selected_server(),
-            DeleteServer => self.delete_selected_server(),
-            SearchServers => {
-                self.server_select_searching = true;
-                self.server_select.clear_query();
-                self.server_select.refresh(&self.server_items);
-            }
+            _ => {}
         }
         Action::Continue
     }
 
     pub(crate) fn open_settings(&mut self) {
-        self.set_mode(theme::UiMode::Settings);
+        if self.settings_open {
+            return;
+        }
         self.settings = SettingsDraft::from_audio(&self.config.audio);
         self.settings
             .set_form_bindings_from_config(self.config.ui.form_bindings);
         self.settings.set_theme_from_config(self.config.ui.theme);
-        self.settings_form = FormState::with_order(
+        let form = FormState::with_order(
             SettingsFocus::CaptureDevice,
             self.config.ui.form_bindings,
             SettingsFocus::ORDER,
         );
         self.settings_dirty = false;
+        self.settings_open = true;
         if self.allow_settings_preview_capture
             && (self.input_devices.is_empty() || self.output_devices.is_empty())
         {
@@ -1746,37 +1447,40 @@ impl App {
         }
         self.rebuild_audio_device_pickers();
         self.start_settings_preview_capture();
+        self.push_mode(Box::new(SettingsMode::new(form)));
     }
 
-    fn close_settings(&mut self) {
-        self.commit_settings_form_text();
+    pub(crate) fn close_settings(&mut self, form: &mut FormState<SettingsFocus>) {
+        self.commit_settings_form_text(form);
         self.apply_active_capture_amplification(self.config.audio.max_amplification);
         self.stop_settings_preview_capture();
         self.audio_input_picker
             .reset(&self.audio_input_items, self.settings.input_selection());
         self.audio_output_picker
             .reset(&self.audio_output_items, self.settings.output_selection());
-        self.enter_compose_insert_mode();
+        self.settings_open = false;
+        self.pop_mode();
     }
 
-    fn move_settings_focus(&mut self, delta: isize) {
-        if self.mode != theme::UiMode::Settings {
-            return;
-        }
+    pub(crate) fn move_settings_focus(
+        &mut self,
+        form: &mut FormState<SettingsFocus>,
+        delta: isize,
+    ) {
         if self.audio_picker_open() {
-            self.move_active_audio_picker_selection(delta);
+            self.move_active_audio_picker_selection(form.focus(), delta);
             return;
         }
-        let commit = self.settings_form.move_focus(delta);
-        self.apply_settings_commit(commit);
-        self.sync_focus();
+        let commit = form.move_focus(delta);
+        self.apply_settings_commit(form, commit);
     }
 
-    fn adjust_settings_focus(&mut self, delta: isize) {
-        if self.mode != theme::UiMode::Settings {
-            return;
-        }
-        match self.settings_form.focus() {
+    pub(crate) fn adjust_settings_focus(
+        &mut self,
+        form: &mut FormState<SettingsFocus>,
+        delta: isize,
+    ) {
+        match form.focus() {
             SettingsFocus::CaptureDevice if self.settings.input_raw() => {}
             SettingsFocus::CaptureDevice if delta < 0 => self.cancel_audio_input_picker(),
             SettingsFocus::CaptureDevice => self.activate_audio_input_picker(),
@@ -1796,8 +1500,8 @@ impl App {
             | SettingsFocus::TypingVadRelease
             | SettingsFocus::FormBindings
             | SettingsFocus::Theme => {
-                let mutation = self.settings.adjust(self.settings_form.focus(), delta);
-                self.apply_settings_mutation(mutation);
+                let mutation = self.settings.adjust(form.focus(), delta);
+                self.apply_settings_mutation(form, mutation);
             }
             SettingsFocus::CaptureBuffer
             | SettingsFocus::PlaybackBuffer
@@ -1807,17 +1511,17 @@ impl App {
         }
     }
 
-    fn activate_settings_focus(&mut self) {
-        match self.settings_form.focus() {
+    pub(crate) fn activate_settings_focus(&mut self, form: &mut FormState<SettingsFocus>) {
+        match form.focus() {
             SettingsFocus::Refresh => self.refresh_audio_devices(),
-            SettingsFocus::Save => self.save_settings(),
-            SettingsFocus::Close => self.close_settings(),
+            SettingsFocus::Save => self.save_settings(form),
+            SettingsFocus::Close => self.close_settings(form),
             SettingsFocus::CaptureDevice if self.settings.input_raw() => {
-                self.move_settings_focus(1)
+                self.move_settings_focus(form, 1)
             }
             SettingsFocus::CaptureDevice => self.activate_audio_input_picker(),
             SettingsFocus::PlaybackDevice if self.settings.output_raw() => {
-                self.move_settings_focus(1)
+                self.move_settings_focus(form, 1)
             }
             SettingsFocus::PlaybackDevice => self.activate_audio_output_picker(),
             SettingsFocus::Denoise
@@ -1833,19 +1537,23 @@ impl App {
             | SettingsFocus::TypingVadRelease
             | SettingsFocus::FormBindings
             | SettingsFocus::Theme => {
-                let mutation = self.settings.activate(self.settings_form.focus());
-                self.apply_settings_mutation(mutation);
+                let mutation = self.settings.activate(form.focus());
+                self.apply_settings_mutation(form, mutation);
             }
             SettingsFocus::CaptureBuffer | SettingsFocus::PlaybackBuffer => {
-                self.move_settings_focus(1);
+                self.move_settings_focus(form, 1);
             }
         }
     }
 
-    fn apply_settings_mutation(&mut self, mutation: SettingsMutation) {
+    fn apply_settings_mutation(
+        &mut self,
+        form: &mut FormState<SettingsFocus>,
+        mutation: SettingsMutation,
+    ) {
         match mutation {
             SettingsMutation::None => return,
-            SettingsMutation::Changed => self.apply_settings_form_bindings(),
+            SettingsMutation::Changed => self.apply_settings_form_bindings(form),
             SettingsMutation::AmplificationChanged(_) => {}
         }
         self.sync_settings_change();
@@ -2319,39 +2027,42 @@ impl App {
         self.start_playback_stream(true);
     }
 
-    fn apply_settings_commit(&mut self, commit: Option<(SettingsFocus, String)>) {
+    pub(crate) fn apply_settings_commit(
+        &mut self,
+        form: &mut FormState<SettingsFocus>,
+        commit: Option<(SettingsFocus, String)>,
+    ) {
         let Some((field, text)) = commit else {
             return;
         };
         let mutation = self.settings.commit_field_text(field, text);
-        self.apply_settings_mutation(mutation);
+        self.apply_settings_mutation(form, mutation);
     }
 
-    fn commit_settings_form_text(&mut self) {
-        let commit = self.settings_form.clear_text();
-        self.apply_settings_commit(commit);
+    fn commit_settings_form_text(&mut self, form: &mut FormState<SettingsFocus>) {
+        let commit = form.clear_text();
+        self.apply_settings_commit(form, commit);
     }
 
-    fn apply_settings_form_bindings(&mut self) {
-        let commit = self
-            .settings_form
-            .set_bindings(self.settings.form_bindings());
-        self.apply_settings_commit(commit);
+    fn apply_settings_form_bindings(&mut self, form: &mut FormState<SettingsFocus>) {
+        let commit = form.set_bindings(self.settings.form_bindings());
+        self.apply_settings_commit(form, commit);
     }
 
-    fn move_settings_selection(&mut self, delta: isize) {
-        if self.mode != theme::UiMode::Settings {
-            return;
-        }
+    pub(crate) fn move_settings_selection(
+        &mut self,
+        form: &mut FormState<SettingsFocus>,
+        delta: isize,
+    ) {
         if self.audio_picker_open() {
-            self.move_active_audio_picker_selection(delta);
+            self.move_active_audio_picker_selection(form.focus(), delta);
         } else {
-            self.move_settings_focus(delta);
+            self.move_settings_focus(form, delta);
         }
     }
 
-    fn move_active_audio_picker_selection(&mut self, delta: isize) {
-        match self.settings_form.focus() {
+    fn move_active_audio_picker_selection(&mut self, focus: SettingsFocus, delta: isize) {
+        match focus {
             SettingsFocus::CaptureDevice if self.audio_input_picker.open => {
                 self.audio_input_picker.move_selection(delta);
             }
@@ -2371,7 +2082,6 @@ impl App {
             }
             self.audio_input_picker
                 .open(&self.audio_input_items, self.settings.input_selection());
-            self.sync_focus();
         }
     }
 
@@ -2384,7 +2094,6 @@ impl App {
             }
             self.audio_output_picker
                 .open(&self.audio_output_items, self.settings.output_selection());
-            self.sync_focus();
         }
     }
 
@@ -2395,14 +2104,12 @@ impl App {
         if self.settings.set_input_selection(next) {
             self.mark_settings_dirty();
         }
-        self.sync_focus();
     }
 
     fn cancel_audio_input_picker(&mut self) {
         if let Some(selection) = self.audio_input_picker.cancel(&self.audio_input_items) {
             self.settings.restore_input_selection(selection);
         }
-        self.sync_focus();
     }
 
     fn confirm_audio_output_picker(&mut self) {
@@ -2412,14 +2119,40 @@ impl App {
         if self.settings.set_output_selection(next) {
             self.mark_settings_dirty();
         }
-        self.sync_focus();
     }
 
     fn cancel_audio_output_picker(&mut self) {
         if let Some(selection) = self.audio_output_picker.cancel(&self.audio_output_items) {
             self.settings.restore_output_selection(selection);
         }
-        self.sync_focus();
+    }
+
+    pub(crate) fn activate_settings_picker_item(
+        &mut self,
+        field: SettingsFocus,
+        item_index: usize,
+    ) {
+        match field {
+            SettingsFocus::CaptureDevice => {
+                if self
+                    .audio_input_picker
+                    .selector
+                    .select_item_index(item_index)
+                {
+                    self.confirm_audio_input_picker();
+                }
+            }
+            SettingsFocus::PlaybackDevice => {
+                if self
+                    .audio_output_picker
+                    .selector
+                    .select_item_index(item_index)
+                {
+                    self.confirm_audio_output_picker();
+                }
+            }
+            _ => {}
+        }
     }
 
     fn rebuild_audio_device_pickers(&mut self) {
@@ -2441,12 +2174,12 @@ impl App {
         }
     }
 
-    fn mark_settings_dirty(&mut self) {
+    pub(crate) fn mark_settings_dirty(&mut self) {
         self.settings_dirty = true;
         self.set_status("settings draft changed; save config when ready");
     }
 
-    fn scroll_focused_panel(&mut self, direction: isize, _rows: usize) {
+    pub(crate) fn scroll_focused_panel(&mut self, direction: isize, _rows: usize) {
         match self.chat_focus {
             ChatPanelFocus::ChatLog => self.move_chat_log_selection(direction),
             ChatPanelFocus::Lobby => self.move_room_selection_with_focus(direction),
@@ -2454,7 +2187,7 @@ impl App {
         }
     }
 
-    fn scroll_chat_log_if_focused(&mut self, rows: isize) {
+    pub(crate) fn scroll_chat_log_if_focused(&mut self, rows: isize) {
         if self.chat_focus != ChatPanelFocus::ChatLog {
             return;
         }
@@ -2465,7 +2198,7 @@ impl App {
         }
     }
 
-    fn chat_half_page_rows(&self) -> usize {
+    pub(crate) fn chat_half_page_rows(&self) -> usize {
         (self.last_chat_height as usize / 2).max(1)
     }
 
@@ -2488,7 +2221,7 @@ impl App {
             .keep_selected_header_visible(self.last_chat_width, self.last_chat_height);
     }
 
-    fn move_room_selection_with_focus(&mut self, delta: isize) {
+    pub(crate) fn move_room_selection_with_focus(&mut self, delta: isize) {
         self.set_chat_panel_focus(ChatPanelFocus::Lobby);
         self.move_room_selection(delta);
     }
@@ -2500,7 +2233,6 @@ impl App {
         }
         self.keep_selected_room_user_visible();
         self.chat_focus = ChatPanelFocus::Lobby;
-        self.refresh_mode_and_focus();
     }
 
     fn keep_selected_room_user_visible(&mut self) {
@@ -2526,23 +2258,18 @@ impl App {
         Some((user_id, name))
     }
 
-    fn open_selected_user_volume(&mut self) {
+    pub(crate) fn open_selected_user_volume(&mut self) {
         let Some((user_id, name)) = self.selected_remote_room_user() else {
             return;
         };
         let value_db = self.config.user_volume_db(&self.server_alias, user_id.0);
-        self.volume_dialog = Some(UserVolumeDialog::new(
-            user_id,
-            name.clone(),
-            value_db,
-            &self.theme,
-        ));
-        self.focus.push_modal(FocusId::Dialog);
-        self.modes.push(ModeKind::Dialog);
+        self.volume_preview = Some((user_id, value_db));
+        let dialog = UserVolumeDialog::new(user_id, name.clone(), value_db, &self.theme);
+        self.push_mode(Box::new(DialogMode::new(dialog)));
         self.set_status(format!("adjusting local volume for {name}"));
     }
 
-    fn toggle_selected_user_mute(&mut self) {
+    pub(crate) fn toggle_selected_user_mute(&mut self) {
         let Some((user_id, name)) = self.selected_remote_room_user() else {
             return;
         };
@@ -2560,22 +2287,22 @@ impl App {
         ));
     }
 
-    pub(crate) fn handle_volume_dialog_key(&mut self, key: KeyEvent) -> bool {
-        let Some(mut dialog) = self.volume_dialog.take() else {
-            return false;
-        };
-        match dialog.handle_key(key) {
-            UserVolumeEvent::Consumed => {
-                self.volume_dialog = Some(dialog);
-            }
+    /// Applies a [`UserVolumeEvent`] produced by the volume dialog.
+    ///
+    /// Returns `true` when the dialog overlay should close (the user saved or
+    /// canceled). On a save error the dialog stays open with the error shown.
+    pub(crate) fn apply_volume_event(
+        &mut self,
+        event: UserVolumeEvent,
+        dialog: &mut UserVolumeDialog,
+    ) -> bool {
+        match event {
+            UserVolumeEvent::Consumed => {}
             UserVolumeEvent::Preview { user_id, value_db } => {
+                self.volume_preview = Some((user_id, value_db));
                 self.apply_user_audio_control_with_volume(user_id, value_db);
-                self.volume_dialog = Some(dialog);
             }
-            UserVolumeEvent::Invalid(error) => {
-                self.set_error(error);
-                self.volume_dialog = Some(dialog);
-            }
+            UserVolumeEvent::Invalid(error) => self.set_error(error),
             UserVolumeEvent::Cancel {
                 user_id,
                 user_name,
@@ -2584,9 +2311,9 @@ impl App {
                 self.config
                     .set_user_volume_db(&self.server_alias, user_id.0, original_db);
                 self.apply_user_audio_control_with_volume(user_id, original_db);
-                self.focus.pop_modal(FocusId::Participants);
-                self.modes.pop_or(ModeKind::from(self.mode));
+                self.volume_preview = None;
                 self.set_status(format!("canceled local volume for {user_name}"));
+                return true;
             }
             UserVolumeEvent::Save {
                 user_id,
@@ -2599,31 +2326,28 @@ impl App {
                 match self.config.save_runtime() {
                     Ok(path) => {
                         self.config.config_path = Some(path.clone());
-                        self.focus.pop_modal(FocusId::Participants);
-                        self.modes.pop_or(ModeKind::from(self.mode));
+                        self.volume_preview = None;
                         self.set_status(format!(
                             "saved local volume {}dB for {} to {}",
                             format_signed_db(value_db),
                             user_name,
                             path.display()
                         ));
+                        return true;
                     }
                     Err(error) => {
                         dialog.mark_save_error(error.clone());
-                        self.volume_dialog = Some(dialog);
                         self.set_error(error);
                     }
                 }
             }
         }
-        true
+        false
     }
 
     pub(crate) fn effective_user_volume_db(&self, user_id: UserId) -> f32 {
-        if let Some(value_db) = self
-            .volume_dialog
-            .as_ref()
-            .and_then(|dialog| dialog.preview_for(user_id))
+        if let Some((preview_user, value_db)) = self.volume_preview
+            && preview_user == user_id
         {
             return value_db;
         }
@@ -2684,10 +2408,10 @@ impl App {
             .set_enabled(self.config.audio.echo_cancellation);
     }
 
-    fn save_settings(&mut self) {
+    pub(crate) fn save_settings(&mut self, form: &mut FormState<SettingsFocus>) {
         // Edits already applied live; this captures any uncommitted buffer field
         // then persists the live config to disk.
-        self.commit_settings_form_text();
+        self.commit_settings_form_text(form);
         self.sync_settings_change();
         if let Some(reason) = self.settings.device_string_invalid() {
             self.set_error(format!("not saved: {reason}"));
@@ -2705,7 +2429,7 @@ impl App {
         }
     }
 
-    fn refresh_audio_devices(&mut self) {
+    pub(crate) fn refresh_audio_devices(&mut self) {
         if self.audio_device_refresh_in_flight {
             self.set_status("refreshing audio devices");
             return;
@@ -2751,7 +2475,7 @@ impl App {
         self.set_status("refreshing audio devices");
     }
 
-    fn submit_input(&mut self) {
+    pub(crate) fn submit_input(&mut self) {
         let text = self.composer.text();
         let input = text.trim();
         if input.is_empty() {
@@ -2771,6 +2495,7 @@ impl App {
             "/audio" => self.show_audio_status(),
             "/clear" => self.chat.clear(),
             "/config" | "/settings" => self.open_settings(),
+            "/servers" if self.network.is_some() => self.pop_mode(),
             "/servers" => self.open_server_select(),
             "/soundboard" => self.show_soundboard(),
             "/users" => self.show_users(),
@@ -3360,7 +3085,7 @@ impl App {
     }
 
     fn stop_audio(&mut self) {
-        let restart_settings_preview = self.mode == theme::UiMode::Settings
+        let restart_settings_preview = self.settings_open
             && self.allow_settings_preview_capture
             && !self.deafened.load(Ordering::Relaxed);
         self.voice_tx_enabled.store(false, Ordering::Relaxed);
@@ -3397,7 +3122,7 @@ impl App {
             .to_request(config::DEFAULT_OUTPUT_BUFFER_SAMPLES)
     }
 
-    fn set_status(&mut self, status: impl Into<String>) {
+    pub(crate) fn set_status(&mut self, status: impl Into<String>) {
         self.status = status.into();
         self.status_kind = StatusKind::Info;
         self.status_expires_at = None;
@@ -3408,7 +3133,7 @@ impl App {
         self.status_expires_at = Some(Instant::now() + TRANSIENT_STATUS_LIFETIME);
     }
 
-    fn set_error(&mut self, status: impl Into<String>) {
+    pub(crate) fn set_error(&mut self, status: impl Into<String>) {
         self.status = status.into();
         self.status_kind = StatusKind::Error;
         self.status_expires_at = None;
@@ -3435,128 +3160,11 @@ impl App {
 
     pub(crate) fn set_chat_panel_focus(&mut self, focus: ChatPanelFocus) {
         self.chat_focus = focus;
-        self.mode = match focus {
-            ChatPanelFocus::Compose => theme::UiMode::Compose,
-            ChatPanelFocus::Lobby | ChatPanelFocus::ChatLog => theme::UiMode::Log,
-        };
         if focus == ChatPanelFocus::Lobby {
             self.keep_selected_room_user_visible();
         } else if focus == ChatPanelFocus::ChatLog {
             self.chat.ensure_selected_header(self.last_chat_width);
         }
-        self.refresh_mode_and_focus();
-    }
-
-    pub(crate) fn refresh_mode_and_focus(&mut self) {
-        self.modes.set(self.active_mode_kind());
-        self.sync_focus();
-    }
-
-    fn active_mode_kind(&self) -> ModeKind {
-        match self.mode {
-            theme::UiMode::Compose if self.composer.mode() == EditorMode::Insert => {
-                ModeKind::Insert
-            }
-            theme::UiMode::Compose | theme::UiMode::Log => ModeKind::Workspace,
-            mode => ModeKind::from(mode),
-        }
-    }
-
-    pub(crate) fn active_binding_layer(&self) -> Option<extui_bindings::LayerId> {
-        if self.volume_dialog.is_some() {
-            return Some(bindings::DIALOG_LAYER);
-        }
-
-        match self.mode {
-            theme::UiMode::ServerSelect => Some(bindings::PICKER_LAYER),
-            theme::UiMode::ServerEdit => Some(bindings::FORM_LAYER),
-            theme::UiMode::Settings => Some(bindings::SETTINGS_LAYER),
-            theme::UiMode::Compose if self.chat_focus == ChatPanelFocus::Compose => {
-                if self.composer.mode() == EditorMode::Insert {
-                    Some(bindings::INSERT_LAYER)
-                } else {
-                    Some(bindings::COMPOSE_NORMAL_LAYER)
-                }
-            }
-            theme::UiMode::Compose | theme::UiMode::Log => Some(bindings::WORKSPACE_LAYER),
-        }
-    }
-
-    fn set_mode(&mut self, mode: theme::UiMode) {
-        match mode {
-            theme::UiMode::Compose => {
-                self.chat_focus = ChatPanelFocus::Compose;
-            }
-            theme::UiMode::Log => {
-                if self.chat_focus == ChatPanelFocus::Compose {
-                    self.chat_focus = ChatPanelFocus::ChatLog;
-                }
-            }
-            theme::UiMode::ServerSelect | theme::UiMode::ServerEdit | theme::UiMode::Settings => {}
-        }
-        self.mode = mode;
-        self.refresh_mode_and_focus();
-    }
-
-    fn sync_focus(&mut self) {
-        let focus = match self.mode {
-            theme::UiMode::ServerSelect => FocusId::ServerList,
-            theme::UiMode::ServerEdit => self
-                .server_edit
-                .as_ref()
-                .map(|draft| FocusId::ServerField(server_field(draft.focus())))
-                .unwrap_or(FocusId::ServerList),
-            theme::UiMode::Compose | theme::UiMode::Log => self.chat_focus.focus_id(),
-            theme::UiMode::Settings => {
-                if self.audio_input_picker.open {
-                    FocusId::InputPicker
-                } else if self.audio_output_picker.open {
-                    FocusId::OutputPicker
-                } else {
-                    FocusId::Settings(settings_field(self.settings_form.focus()))
-                }
-            }
-        };
-        self.focus.set(focus);
-    }
-}
-
-fn server_field(focus: ServerEditFocus) -> ServerField {
-    match focus {
-        ServerEditFocus::Alias => ServerField::Alias,
-        ServerEditFocus::DisplayName => ServerField::DisplayName,
-        ServerEditFocus::TcpAddr => ServerField::TcpAddr,
-        ServerEditFocus::UdpAddr => ServerField::UdpAddr,
-        ServerEditFocus::UdpProbeAddr => ServerField::UdpProbeAddr,
-        ServerEditFocus::RoomId => ServerField::RoomId,
-        ServerEditFocus::Save => ServerField::Save,
-        ServerEditFocus::SaveJoin => ServerField::SaveJoin,
-        ServerEditFocus::Cancel => ServerField::Cancel,
-    }
-}
-
-fn settings_field(focus: SettingsFocus) -> SettingsField {
-    match focus {
-        SettingsFocus::CaptureDevice => SettingsField::InputDevice,
-        SettingsFocus::RawCaptureDevice => SettingsField::RawInputDevice,
-        SettingsFocus::PlaybackDevice => SettingsField::OutputDevice,
-        SettingsFocus::RawPlaybackDevice => SettingsField::RawOutputDevice,
-        SettingsFocus::Bitrate => SettingsField::Bitrate,
-        SettingsFocus::Denoise => SettingsField::Denoise,
-        SettingsFocus::EchoCancellation => SettingsField::EchoCancellation,
-        SettingsFocus::Amplification => SettingsField::Amplification,
-        SettingsFocus::Suppression => SettingsField::Suppression,
-        SettingsFocus::Release => SettingsField::Release,
-        SettingsFocus::TypingSuppression => SettingsField::TypingSuppression,
-        SettingsFocus::TypingVadEnter => SettingsField::TypingVadEnter,
-        SettingsFocus::TypingVadRelease => SettingsField::TypingVadRelease,
-        SettingsFocus::CaptureBuffer => SettingsField::InputBuffer,
-        SettingsFocus::PlaybackBuffer => SettingsField::OutputBuffer,
-        SettingsFocus::FormBindings => SettingsField::FormBindings,
-        SettingsFocus::Theme => SettingsField::Theme,
-        SettingsFocus::Refresh => SettingsField::Refresh,
-        SettingsFocus::Save => SettingsField::Save,
-        SettingsFocus::Close => SettingsField::Close,
     }
 }
 
@@ -3686,10 +3294,63 @@ fn auth_failure_status(detail: &str) -> &'static str {
 mod tests {
     use super::*;
     use extui::{Buffer, event::KeyModifiers};
+    use extui_editor::Mode as EditorMode;
     use rpc::control::ParticipantInfo;
 
     fn test_app() -> App {
         App::new(Config::default(), None).expect("test app")
+    }
+
+    fn render_room(app: &mut App, buffer: &mut Buffer) {
+        RoomMode.render(app, buffer, 0);
+    }
+
+    /// Drives an [`App`] through a real mode stack so tests can exercise mode
+    /// transitions (push/pop of overlays) the same way the runtime loop does.
+    struct Harness {
+        app: App,
+        stack: Vec<Box<dyn AppMode>>,
+    }
+
+    impl Harness {
+        fn new(mut app: App) -> Self {
+            let base: Box<dyn AppMode> = if app.server_alias.is_empty() {
+                app.base_mode()
+            } else {
+                Box::new(RoomMode)
+            };
+            let mut stack: Vec<Box<dyn AppMode>> = vec![base];
+            stack.last_mut().unwrap().init(&mut app);
+            Self { app, stack }
+        }
+
+        fn apply(&mut self) {
+            crate::tui::mode::apply_mode_transition(&mut self.app, &mut self.stack);
+        }
+
+        fn key(&mut self, key: KeyEvent) -> Action {
+            let action = self
+                .stack
+                .last_mut()
+                .unwrap()
+                .process_input(&mut self.app, key);
+            self.apply();
+            action
+        }
+
+        fn overlay_active(&self) -> bool {
+            self.stack
+                .last()
+                .map(|mode| mode.is_overlay())
+                .unwrap_or(false)
+        }
+
+        fn top_theme_mode(&self) -> crate::theme::UiMode {
+            self.stack
+                .last()
+                .expect("mode stack is non-empty")
+                .theme_mode(&self.app)
+        }
     }
 
     #[test]
@@ -3928,7 +3589,12 @@ mod tests {
     #[test]
     fn mouse_wheel_moves_open_settings_device_picker() {
         let mut app = test_app();
-        app.set_mode(theme::UiMode::Settings);
+        let form = FormState::with_order(
+            SettingsFocus::CaptureDevice,
+            app.config.ui.form_bindings,
+            SettingsFocus::ORDER,
+        );
+        let mut mode = SettingsMode::new(form);
         app.audio_input_items = ["System default", "USB Mic", "Line In"]
             .into_iter()
             .enumerate()
@@ -3955,12 +3621,15 @@ mod tests {
             Some(0)
         );
 
-        app.process_mouse(MouseEvent {
-            kind: MouseEventKind::ScrollDown,
-            column: 4,
-            row: 4,
-            modifiers: KeyModifiers::empty(),
-        });
+        mode.process_mouse(
+            &mut app,
+            MouseEvent {
+                kind: MouseEventKind::ScrollDown,
+                column: 4,
+                row: 4,
+                modifiers: KeyModifiers::empty(),
+            },
+        );
 
         assert_eq!(
             app.audio_input_picker.selector.current_item_index(),
@@ -3969,11 +3638,43 @@ mod tests {
     }
 
     #[test]
+    fn settings_detour_returns_to_server_list() {
+        let mut h = Harness::new(test_app());
+
+        h.app.open_settings();
+        h.apply();
+        assert_eq!(h.stack.len(), 2);
+        assert_eq!(h.top_theme_mode(), crate::theme::UiMode::Settings);
+
+        h.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::empty()));
+
+        assert_eq!(h.stack.len(), 1);
+        assert_eq!(h.top_theme_mode(), crate::theme::UiMode::ServerSelect);
+        assert!(!h.app.settings_open);
+    }
+
+    #[test]
+    fn settings_detour_preserves_composer_draft() {
+        let mut app = test_app();
+        app.server_alias = "local".to_string();
+        app.composer.set_lines("unsent draft");
+        let mut h = Harness::new(app);
+
+        h.app.open_settings();
+        h.apply();
+        h.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::empty()));
+
+        assert_eq!(h.stack.len(), 1);
+        assert_eq!(h.top_theme_mode(), crate::theme::UiMode::Compose);
+        assert_eq!(h.app.composer.text(), "unsent draft");
+    }
+
+    #[test]
     fn volume_dialog_pushes_and_restores_focus() {
         let mut app = test_app();
         app.server_alias = "local".to_string();
         app.user_id = Some(UserId(1));
-        app.set_mode(theme::UiMode::Log);
+        app.set_chat_panel_focus(ChatPanelFocus::ChatLog);
         app.participants.replace_room(vec![
             ParticipantInfo {
                 user_id: UserId(1),
@@ -3992,22 +3693,25 @@ mod tests {
         ]);
         app.move_room_selection(1);
 
-        app.open_selected_user_volume();
+        let mut h = Harness::new(app);
+        h.app.open_selected_user_volume();
+        h.apply();
 
-        assert_eq!(app.focus.active(), FocusId::Dialog);
-        assert_eq!(app.modes.top(), ModeKind::Dialog);
+        assert_eq!(h.stack.len(), 2);
+        assert!(h.overlay_active());
+        assert_eq!(h.app.volume_preview.map(|(user, _)| user), Some(UserId(2)));
 
-        assert!(app.handle_volume_dialog_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::empty())));
+        h.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::empty()));
 
-        assert!(app.volume_dialog.is_none());
-        assert_eq!(app.focus.active(), FocusId::Participants);
-        assert_eq!(app.modes.top(), ModeKind::Workspace);
+        assert_eq!(h.stack.len(), 1);
+        assert!(!h.overlay_active());
+        assert_eq!(h.app.volume_preview, None);
     }
 
     #[test]
     fn escape_leaves_compose_focused_in_vim_normal_mode() {
         let mut app = test_app();
-        app.set_mode(theme::UiMode::Compose);
+        app.set_chat_panel_focus(ChatPanelFocus::Compose);
 
         assert!(matches!(
             app.process_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::empty())),
@@ -4019,9 +3723,7 @@ mod tests {
         ));
 
         assert_eq!(app.chat_focus, ChatPanelFocus::Compose);
-        assert_eq!(app.focus.active(), FocusId::Composer);
         assert_eq!(app.composer.mode(), EditorMode::Normal);
-        assert_eq!(app.modes.top(), ModeKind::Workspace);
 
         assert!(matches!(
             app.process_key(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::empty())),
@@ -4029,13 +3731,12 @@ mod tests {
         ));
         assert_eq!(app.chat_focus, ChatPanelFocus::Compose);
         assert_eq!(app.composer.mode(), EditorMode::Insert);
-        assert_eq!(app.modes.top(), ModeKind::Insert);
     }
 
     #[test]
     fn compose_normal_m_uses_binding_to_toggle_mute() {
         let mut app = test_app();
-        app.set_mode(theme::UiMode::Compose);
+        app.set_chat_panel_focus(ChatPanelFocus::Compose);
         app.process_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::empty()));
         assert_eq!(app.composer.mode(), EditorMode::Normal);
 
@@ -4049,7 +3750,7 @@ mod tests {
     #[test]
     fn compose_vim_text_object_commands_receive_i_key() {
         let mut app = test_app();
-        app.set_mode(theme::UiMode::Compose);
+        app.set_chat_panel_focus(ChatPanelFocus::Compose);
         app.composer.set_lines("alpha beta");
         app.composer.set_cursor_offset(2);
 
@@ -4068,20 +3769,20 @@ mod tests {
     #[test]
     fn shifted_jk_wraps_chat_panel_focus() {
         let mut app = test_app();
-        app.set_mode(theme::UiMode::Compose);
+        app.set_chat_panel_focus(ChatPanelFocus::Compose);
         app.process_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::empty()));
 
         app.process_key(KeyEvent::new(KeyCode::Char('K'), KeyModifiers::empty()));
         assert_eq!(app.chat_focus, ChatPanelFocus::ChatLog);
-        assert_eq!(app.focus.active(), FocusId::Chat);
+        assert_eq!(app.chat_focus, ChatPanelFocus::ChatLog);
 
         app.process_key(KeyEvent::new(KeyCode::Char('K'), KeyModifiers::empty()));
         assert_eq!(app.chat_focus, ChatPanelFocus::Lobby);
-        assert_eq!(app.focus.active(), FocusId::Participants);
+        assert_eq!(app.chat_focus, ChatPanelFocus::Lobby);
 
         app.process_key(KeyEvent::new(KeyCode::Char('K'), KeyModifiers::empty()));
         assert_eq!(app.chat_focus, ChatPanelFocus::Compose);
-        assert_eq!(app.focus.active(), FocusId::Composer);
+        assert_eq!(app.chat_focus, ChatPanelFocus::Compose);
         assert_eq!(app.composer.mode(), EditorMode::Normal);
 
         app.process_key(KeyEvent::new(KeyCode::Char('J'), KeyModifiers::empty()));
@@ -4091,19 +3792,19 @@ mod tests {
     #[test]
     fn super_jk_move_chat_panel_focus_from_compose_insert_mode() {
         let mut app = test_app();
-        app.set_mode(theme::UiMode::Compose);
+        app.set_chat_panel_focus(ChatPanelFocus::Compose);
         assert_eq!(app.composer.mode(), EditorMode::Insert);
 
         app.process_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::SUPER));
         assert_eq!(app.chat_focus, ChatPanelFocus::ChatLog);
-        assert_eq!(app.focus.active(), FocusId::Chat);
+        assert_eq!(app.chat_focus, ChatPanelFocus::ChatLog);
 
         app.set_chat_panel_focus(ChatPanelFocus::Compose);
         assert_eq!(app.composer.mode(), EditorMode::Insert);
 
         app.process_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::SUPER));
         assert_eq!(app.chat_focus, ChatPanelFocus::Lobby);
-        assert_eq!(app.focus.active(), FocusId::Participants);
+        assert_eq!(app.chat_focus, ChatPanelFocus::Lobby);
     }
 
     #[test]
@@ -4111,7 +3812,7 @@ mod tests {
         let mut app = test_app();
         app.server_alias = "local".to_string();
         app.user_id = Some(UserId(1));
-        app.set_mode(theme::UiMode::Log);
+        app.set_chat_panel_focus(ChatPanelFocus::ChatLog);
         app.participants.replace_room(vec![
             ParticipantInfo {
                 user_id: UserId(1),
@@ -4131,14 +3832,55 @@ mod tests {
         app.move_room_selection(1);
         app.set_chat_panel_focus(ChatPanelFocus::ChatLog);
 
-        app.process_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()));
-        assert!(app.volume_dialog.is_none());
-        assert_eq!(app.status, "focus lobby to adjust users");
+        let mut h = Harness::new(app);
+        h.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()));
+        assert_eq!(h.stack.len(), 1);
+        assert_eq!(h.app.status, "focus lobby to adjust users");
 
-        app.set_chat_panel_focus(ChatPanelFocus::Lobby);
-        app.process_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()));
-        assert!(app.volume_dialog.is_some());
-        assert_eq!(app.focus.active(), FocusId::Dialog);
+        h.app.set_chat_panel_focus(ChatPanelFocus::Lobby);
+        h.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()));
+        assert_eq!(h.stack.len(), 2);
+        assert!(h.overlay_active());
+    }
+
+    #[test]
+    fn delete_server_confirmation_gates_deletion() {
+        let mut app = test_app();
+        let temp_config =
+            std::env::temp_dir().join(format!("chatt-delete-test-{}.toml", std::process::id()));
+        app.config.config_path = Some(temp_config.clone());
+        app.config.servers.push(crate::config::ServerEntry {
+            alias: "s1".to_string(),
+            ..Default::default()
+        });
+        app.rebuild_server_items();
+
+        let mut h = Harness::new(app);
+        let mut server_mode = ServerListMode::new();
+        let mut buffer = Buffer::new(80, 24);
+        server_mode.render(&mut h.app, &mut buffer, 0);
+
+        // Opening the confirmation does not delete anything yet.
+        server_mode.process_action(&mut h.app, BindCommand::DeleteServer);
+        h.apply();
+        assert_eq!(h.stack.len(), 2);
+        assert!(h.overlay_active());
+        assert_eq!(h.app.config.servers.len(), 1);
+
+        // Canceling keeps the server.
+        h.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::empty()));
+        assert_eq!(h.stack.len(), 1);
+        assert!(!h.overlay_active());
+        assert_eq!(h.app.config.servers.len(), 1);
+
+        // Confirming with 'y' deletes it and pops the overlay.
+        server_mode.process_action(&mut h.app, BindCommand::DeleteServer);
+        h.apply();
+        h.key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::empty()));
+        assert_eq!(h.stack.len(), 1);
+        assert!(h.app.config.servers.is_empty());
+
+        let _ = std::fs::remove_file(&temp_config);
     }
 
     #[test]
@@ -4148,7 +3890,7 @@ mod tests {
         assert!(app.deafened.load(Ordering::Relaxed));
         assert!(app.mic_muted.load(Ordering::Relaxed));
 
-        app.process_command(BindCommand::ToggleMute);
+        app.process_global_command(BindCommand::ToggleMute);
 
         assert!(!app.deafened.load(Ordering::Relaxed));
         assert!(!app.mic_muted.load(Ordering::Relaxed));
@@ -4157,7 +3899,7 @@ mod tests {
     #[test]
     fn chat_log_jk_moves_selected_message() {
         let mut app = test_app();
-        app.set_mode(theme::UiMode::Compose);
+        app.set_chat_panel_focus(ChatPanelFocus::Compose);
         for index in 0..3 {
             app.push_chat(ChatMessage {
                 message_id: rpc::ids::MessageId(index + 1),
@@ -4182,7 +3924,7 @@ mod tests {
     #[test]
     fn chat_log_gg_and_g_select_edge_headers() {
         let mut app = test_app();
-        app.set_mode(theme::UiMode::Compose);
+        app.set_chat_panel_focus(ChatPanelFocus::Compose);
         for index in 0..20 {
             app.push_chat(ChatMessage {
                 message_id: rpc::ids::MessageId(index + 1),
@@ -4195,7 +3937,7 @@ mod tests {
         }
 
         let mut buffer = Buffer::new(80, 12);
-        crate::tui::render(&mut app, &mut buffer, 0);
+        render_room(&mut app, &mut buffer);
         app.set_chat_panel_focus(ChatPanelFocus::ChatLog);
 
         app.process_key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::empty()));
@@ -4211,7 +3953,7 @@ mod tests {
     #[test]
     fn chat_log_selection_change_scrolls_selected_header_into_view() {
         let mut app = test_app();
-        app.set_mode(theme::UiMode::Compose);
+        app.set_chat_panel_focus(ChatPanelFocus::Compose);
         for index in 0..30 {
             app.push_chat(ChatMessage {
                 message_id: rpc::ids::MessageId(index + 1),
@@ -4224,10 +3966,10 @@ mod tests {
         }
 
         let mut buffer = Buffer::new(80, 14);
-        crate::tui::render(&mut app, &mut buffer, 0);
+        render_room(&mut app, &mut buffer);
         app.set_chat_panel_focus(ChatPanelFocus::ChatLog);
         app.process_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::empty()));
-        crate::tui::render(&mut app, &mut buffer, 0);
+        render_room(&mut app, &mut buffer);
 
         let selected = app.chat.selected_message().expect("selected header");
         assert_eq!(selected, 12);
@@ -4242,7 +3984,7 @@ mod tests {
     #[test]
     fn tab_toggles_selected_chat_log_collapse() {
         let mut app = test_app();
-        app.set_mode(theme::UiMode::Compose);
+        app.set_chat_panel_focus(ChatPanelFocus::Compose);
         app.push_chat(ChatMessage {
             message_id: rpc::ids::MessageId(1),
             room_id: rpc::ids::RoomId(1),
@@ -4253,7 +3995,7 @@ mod tests {
         });
 
         let mut buffer = Buffer::new(80, 24);
-        crate::tui::render(&mut app, &mut buffer, 0);
+        render_room(&mut app, &mut buffer);
         app.set_chat_panel_focus(ChatPanelFocus::ChatLog);
         assert!(app.chat.is_collapsed(0));
 
@@ -4264,7 +4006,7 @@ mod tests {
     #[test]
     fn y_copies_selected_log_when_no_lines_are_selected() {
         let mut app = test_app();
-        app.set_mode(theme::UiMode::Compose);
+        app.set_chat_panel_focus(ChatPanelFocus::Compose);
         for (index, body) in ["first", "second"].into_iter().enumerate() {
             app.push_chat(ChatMessage {
                 message_id: rpc::ids::MessageId(index as u64 + 1),
@@ -4277,7 +4019,7 @@ mod tests {
         }
 
         let mut buffer = Buffer::new(80, 24);
-        crate::tui::render(&mut app, &mut buffer, 0);
+        render_room(&mut app, &mut buffer);
         app.set_chat_panel_focus(ChatPanelFocus::ChatLog);
         app.chat.select_first_header();
         app.process_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::empty()));
@@ -4298,7 +4040,7 @@ mod tests {
     #[test]
     fn mouse_down_on_chat_text_focuses_chat_log_and_selects_message() {
         let mut app = test_app();
-        app.set_mode(theme::UiMode::Compose);
+        app.set_chat_panel_focus(ChatPanelFocus::Compose);
         app.push_chat(ChatMessage {
             message_id: rpc::ids::MessageId(1),
             room_id: rpc::ids::RoomId(1),
@@ -4309,7 +4051,7 @@ mod tests {
         });
 
         let mut buffer = Buffer::new(80, 24);
-        crate::tui::render(&mut app, &mut buffer, 0);
+        render_room(&mut app, &mut buffer);
         let (row_index, line) = app
             .last_chat_lines
             .iter()
@@ -4317,16 +4059,21 @@ mod tests {
             .enumerate()
             .find(|(_, line)| line.kind == LineKind::Body)
             .expect("body line rendered");
+        let column = app.last_chat_rect.x + 2;
+        let row = app.last_chat_rect.y + row_index as u16;
 
-        app.process_mouse(MouseEvent {
-            kind: MouseEventKind::Down(MouseButton::Left),
-            column: app.last_chat_rect.x + 2,
-            row: app.last_chat_rect.y + row_index as u16,
-            modifiers: KeyModifiers::empty(),
-        });
+        RoomMode.process_mouse(
+            &mut app,
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column,
+                row,
+                modifiers: KeyModifiers::empty(),
+            },
+        );
 
         assert_eq!(app.chat_focus, ChatPanelFocus::ChatLog);
-        assert_eq!(app.focus.active(), FocusId::Chat);
+        assert_eq!(app.chat_focus, ChatPanelFocus::ChatLog);
         assert_eq!(app.chat.selected_message(), Some(line.message));
         assert!(app.chat.is_selecting());
     }
@@ -4334,7 +4081,7 @@ mod tests {
     #[test]
     fn mouse_down_on_lobby_row_focuses_lobby_and_selects_user() {
         let mut app = test_app();
-        app.set_mode(theme::UiMode::Compose);
+        app.set_chat_panel_focus(ChatPanelFocus::Compose);
         app.participants.replace_room(vec![
             ParticipantInfo {
                 user_id: UserId(1),
@@ -4353,23 +4100,28 @@ mod tests {
         ]);
 
         let mut buffer = Buffer::new(80, 24);
-        crate::tui::render(&mut app, &mut buffer, 0);
-        app.process_mouse(MouseEvent {
-            kind: MouseEventKind::Down(MouseButton::Left),
-            column: app.last_room_rect.x + 1,
-            row: app.last_room_rect.y,
-            modifiers: KeyModifiers::empty(),
-        });
+        render_room(&mut app, &mut buffer);
+        let column = app.last_room_rect.x + 1;
+        let row = app.last_room_rect.y;
+        RoomMode.process_mouse(
+            &mut app,
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column,
+                row,
+                modifiers: KeyModifiers::empty(),
+            },
+        );
 
         assert_eq!(app.chat_focus, ChatPanelFocus::Lobby);
-        assert_eq!(app.focus.active(), FocusId::Participants);
+        assert_eq!(app.chat_focus, ChatPanelFocus::Lobby);
         assert_eq!(app.participants.selected_user, Some(UserId(1)));
     }
 
     #[test]
     fn shift_enter_inserts_newline_in_composer() {
         let mut app = test_app();
-        app.set_mode(theme::UiMode::Compose);
+        app.set_chat_panel_focus(ChatPanelFocus::Compose);
 
         assert!(matches!(
             app.process_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::empty())),
@@ -4391,19 +4143,19 @@ mod tests {
     fn renders_smoke_frame() {
         let mut app = test_app();
         let mut buffer = Buffer::new(80, 24);
-        crate::tui::render(&mut app, &mut buffer, 0);
+        render_room(&mut app, &mut buffer);
     }
 
     #[test]
     fn chat_layout_reserves_top_bar_and_key_preview() {
         let mut app = test_app();
-        app.set_mode(theme::UiMode::Compose);
+        app.set_chat_panel_focus(ChatPanelFocus::Compose);
         app.server_alias = "local".to_string();
         app.user = "alice".to_string();
         app.room_name = "lobby".to_string();
 
         let mut buffer = Buffer::new(80, 24);
-        crate::tui::render(&mut app, &mut buffer, 0);
+        render_room(&mut app, &mut buffer);
 
         let expected_chat_top = 1 + app.config.ui.room_height + 1;
         let expected_chat_bottom = buffer.height() - 4;
@@ -4414,29 +4166,35 @@ mod tests {
     #[test]
     fn top_bar_audio_indicators_toggle_on_click() {
         let mut app = test_app();
-        app.set_mode(theme::UiMode::Compose);
+        app.set_chat_panel_focus(ChatPanelFocus::Compose);
 
         let mut buffer = Buffer::new(80, 24);
-        crate::tui::render(&mut app, &mut buffer, 0);
+        render_room(&mut app, &mut buffer);
 
         let mute_rect = app.top_bar_mute_rect;
         assert!(!mute_rect.is_empty());
-        app.process_mouse(MouseEvent {
-            kind: MouseEventKind::Down(MouseButton::Left),
-            column: mute_rect.x,
-            row: mute_rect.y,
-            modifiers: KeyModifiers::empty(),
-        });
+        RoomMode.process_mouse(
+            &mut app,
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: mute_rect.x,
+                row: mute_rect.y,
+                modifiers: KeyModifiers::empty(),
+            },
+        );
         assert!(app.mic_muted.load(Ordering::Relaxed));
 
         let deafen_rect = app.top_bar_deafen_rect;
         assert!(!deafen_rect.is_empty());
-        app.process_mouse(MouseEvent {
-            kind: MouseEventKind::Down(MouseButton::Left),
-            column: deafen_rect.x,
-            row: deafen_rect.y,
-            modifiers: KeyModifiers::empty(),
-        });
+        RoomMode.process_mouse(
+            &mut app,
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: deafen_rect.x,
+                row: deafen_rect.y,
+                modifiers: KeyModifiers::empty(),
+            },
+        );
         assert!(app.deafened.load(Ordering::Relaxed));
     }
 }

@@ -12,14 +12,19 @@ use unicode_width::UnicodeWidthStr;
 use chatt::audio::StatsSnapshot;
 
 use crate::{
-    app::{App, ChatPanelFocus, ParticipantState, ServerSelectItem, StatusKind, volume_db_label},
+    app::{
+        App, ChatPanelFocus, ParticipantState, ServerEditDraft, ServerSelectItem, StatusKind,
+        volume_db_label,
+    },
     bindings::{self, Reachable, ReachableKind},
     chat_buffer::{self, LineKind},
     theme::{self, Theme},
+    tui::modes::SettingsMode,
     ui,
+    ui::select::FuzzySelect,
 };
 
-pub(crate) fn render(app: &mut App, buf: &mut Buffer, now_ms: u64) {
+fn prepare_screen(app: &mut App, buf: &mut Buffer) -> Option<StatsSnapshot> {
     buf.rect().with(app.theme.background).fill(buf);
     buf.hide_cursor();
     let capture = app
@@ -33,30 +38,62 @@ pub(crate) fn render(app: &mut App, buf: &mut Buffer, now_ms: u64) {
     app.last_chat_log_bar_rect = Rect::EMPTY;
     app.last_composer_rect = Rect::EMPTY;
     app.last_compose_bar_rect = Rect::EMPTY;
+    capture
+}
 
+pub(crate) fn draw_server_select_screen(
+    app: &mut App,
+    select: &mut FuzzySelect,
+    searching: bool,
+    mode: theme::UiMode,
+    status_label: &'static str,
+    layer: LayerId,
+    buf: &mut Buffer,
+) {
+    let capture = prepare_screen(app, buf);
     let mut screen = buf.rect();
-    if matches!(
-        app.mode,
-        theme::UiMode::ServerSelect | theme::UiMode::ServerEdit
-    ) {
-        refresh_key_preview_cache(app);
-        let key_preview_height = key_preview_height(app, screen.w);
-        let key_preview_area = screen.take_bottom(key_preview_height as i32);
-        let status_area = screen.take_bottom(1);
-        match app.mode {
-            theme::UiMode::ServerSelect => draw_server_select(screen, app, buf),
-            theme::UiMode::ServerEdit => draw_server_edit(screen, app, buf),
-            _ => {}
-        }
-        draw_status(status_area, app, buf, capture.as_ref());
-        draw_key_preview(key_preview_area, app, buf);
-        return;
-    }
+    refresh_key_preview_cache(app, Some(layer));
+    let key_preview_height = key_preview_height(app, screen.w);
+    let key_preview_area = screen.take_bottom(key_preview_height as i32);
+    let status_area = screen.take_bottom(1);
+    draw_server_select(screen, app, select, searching, buf);
+    draw_status(status_area, app, buf, mode, status_label, capture.as_ref());
+    draw_key_preview(key_preview_area, app, buf);
+}
 
+pub(crate) fn draw_server_edit_screen(
+    app: &mut App,
+    draft: &mut ServerEditDraft,
+    mode: theme::UiMode,
+    status_label: &'static str,
+    layer: LayerId,
+    buf: &mut Buffer,
+) {
+    let capture = prepare_screen(app, buf);
+    let mut screen = buf.rect();
+    refresh_key_preview_cache(app, Some(layer));
+    let key_preview_height = key_preview_height(app, screen.w);
+    let key_preview_area = screen.take_bottom(key_preview_height as i32);
+    let status_area = screen.take_bottom(1);
+    draw_server_edit(screen, app, draft, buf);
+    draw_status(status_area, app, buf, mode, status_label, capture.as_ref());
+    draw_key_preview(key_preview_area, app, buf);
+}
+
+pub(crate) fn draw_settings_screen(
+    app: &mut App,
+    settings_mode: &mut SettingsMode,
+    mode: theme::UiMode,
+    status_label: &'static str,
+    layer: LayerId,
+    buf: &mut Buffer,
+) {
+    let capture = prepare_screen(app, buf);
+    let mut screen = buf.rect();
     let top_bar_area = screen.take_top(1);
     draw_top_bar(top_bar_area, app, buf, capture.as_ref());
 
-    refresh_key_preview_cache(app);
+    refresh_key_preview_cache(app, Some(layer));
     let composer_height = composer_height(app, screen.w);
     let key_preview_height = key_preview_height(app, screen.w);
     let key_preview_area = screen.take_bottom(key_preview_height as i32);
@@ -65,37 +102,54 @@ pub(crate) fn render(app: &mut App, buf: &mut Buffer, now_ms: u64) {
     app.last_composer_rect = composer_area;
     app.last_compose_bar_rect = status_area;
 
-    if app.mode == theme::UiMode::Settings {
-        draw_composer(composer_area, app, buf);
-        buf.hide_cursor();
-        ui::settings::draw_settings(
-            screen,
-            buf,
-            &app.theme,
-            &mut app.settings,
-            &mut app.settings_form,
-            app.settings_dirty,
-            capture.as_ref(),
-            &app.audio_input_items,
-            &mut app.audio_input_picker,
-            &app.audio_output_items,
-            &mut app.audio_output_picker,
-        );
-        draw_status(status_area, app, buf, capture.as_ref());
-        draw_key_preview(key_preview_area, app, buf);
-        draw_volume_dialog(buf.rect(), app, buf);
-        return;
-    }
+    draw_composer(composer_area, app, buf);
+    buf.hide_cursor();
+    ui::settings::draw_settings(
+        screen,
+        buf,
+        &app.theme,
+        &mut app.settings,
+        settings_mode.form_mut(),
+        app.settings_dirty,
+        capture.as_ref(),
+        &app.audio_input_items,
+        &mut app.audio_input_picker,
+        &app.audio_output_items,
+        &mut app.audio_output_picker,
+    );
+    draw_status(status_area, app, buf, mode, status_label, capture.as_ref());
+    draw_key_preview(key_preview_area, app, buf);
+}
 
+pub(crate) fn draw_room_screen(
+    app: &mut App,
+    mode: theme::UiMode,
+    status_label: &'static str,
+    layer: LayerId,
+    buf: &mut Buffer,
+    now_ms: u64,
+) {
+    let capture = prepare_screen(app, buf);
+    let mut screen = buf.rect();
+    let top_bar_area = screen.take_top(1);
+    draw_top_bar(top_bar_area, app, buf, capture.as_ref());
+
+    refresh_key_preview_cache(app, Some(layer));
+    let composer_height = composer_height(app, screen.w);
+    let key_preview_height = key_preview_height(app, screen.w);
+    let key_preview_area = screen.take_bottom(key_preview_height as i32);
+    let status_area = screen.take_bottom(1);
+    let composer_area = screen.take_bottom(composer_height as i32);
+    app.last_composer_rect = composer_area;
+    app.last_compose_bar_rect = status_area;
     let chat_log_bar_area = screen.take_bottom(1);
     app.last_chat_log_bar_rect = chat_log_bar_area;
     draw_workspace(screen, app, buf, now_ms);
     draw_chat_log_bar(chat_log_bar_area, app, buf);
 
-    draw_compose_bar(status_area, app, buf);
+    draw_compose_bar(status_area, app, buf, mode, status_label);
     draw_composer(composer_area, app, buf);
     draw_key_preview(key_preview_area, app, buf);
-    draw_volume_dialog(buf.rect(), app, buf);
 }
 
 fn composer_height(app: &mut App, width: u16) -> u16 {
@@ -188,7 +242,13 @@ fn draw_workspace(area: Rect, app: &mut App, buf: &mut Buffer, now_ms: u64) {
     }
 }
 
-fn draw_server_select(area: Rect, app: &mut App, buf: &mut Buffer) {
+fn draw_server_select(
+    area: Rect,
+    app: &mut App,
+    select: &mut FuzzySelect,
+    searching: bool,
+    buf: &mut Buffer,
+) {
     area.with(app.theme.background).fill(buf);
     let mut rows = area;
     rows.take_top(1)
@@ -205,22 +265,21 @@ fn draw_server_select(area: Rect, app: &mut App, buf: &mut Buffer) {
         return;
     }
 
-    if app.server_select_searching {
+    if searching {
         let search = body.take_top(1);
         search
             .with(app.theme.background.patch(app.theme.subtle))
             .with(Ellipsis(true))
-            .text(buf, &format!("/{}", app.server_select.query()));
+            .text(buf, &format!("/{}", select.query()));
     }
 
     let theme = &app.theme;
     let items = &app.server_items;
-    app.server_select
-        .render(body, 3, buf, |_, item_index, selected, area, buf| {
-            if let Some(item) = items.get(item_index) {
-                draw_server_select_item(area, buf, item, selected, theme);
-            }
-        });
+    select.render(body, 3, buf, |_, item_index, selected, area, buf| {
+        if let Some(item) = items.get(item_index) {
+            draw_server_select_item(area, buf, item, selected, theme);
+        }
+    });
 }
 
 enum ServerWelcomeLine {
@@ -470,15 +529,9 @@ fn draw_server_select_item(
     }
 }
 
-fn draw_server_edit(area: Rect, app: &mut App, buf: &mut Buffer) {
+fn draw_server_edit(area: Rect, app: &mut App, draft: &mut ServerEditDraft, buf: &mut Buffer) {
     area.with(app.theme.background).fill(buf);
     let theme = &app.theme;
-    let Some(draft) = app.server_edit.as_mut() else {
-        area.with(theme.subtle)
-            .with(HAlign::Center)
-            .text(buf, "No server edit is open");
-        return;
-    };
     draft.render(area, buf, theme);
 }
 
@@ -531,14 +584,6 @@ fn room_user_control_label(app: &App, participant: &ParticipantState) -> String 
         (true, true) => "muted".to_string(),
         (true, false) => format!("muted {}", volume_db_label(volume_db)),
     }
-}
-
-fn draw_volume_dialog(area: Rect, app: &mut App, buf: &mut Buffer) {
-    let theme = &app.theme;
-    let Some(dialog) = app.volume_dialog.as_mut() else {
-        return;
-    };
-    dialog.render(area, buf, theme);
 }
 
 fn draw_top_bar(area: Rect, app: &mut App, buf: &mut Buffer, capture: Option<&StatsSnapshot>) {
@@ -662,15 +707,24 @@ fn draw_chat_log_bar(area: Rect, app: &App, buf: &mut Buffer) {
     );
 }
 
-fn draw_compose_bar(area: Rect, app: &App, buf: &mut Buffer) {
+fn draw_compose_bar(
+    area: Rect,
+    app: &App,
+    buf: &mut Buffer,
+    mode: theme::UiMode,
+    status_label: &'static str,
+) {
     if area.is_empty() {
         return;
     }
     let focused = app.chat_focus == ChatPanelFocus::Compose;
-    let (fill, label, detail) = section_bar_styles(app.theme, ChatPanelFocus::Compose, focused);
+    let (fill, mut label, detail) = section_bar_styles(app.theme, ChatPanelFocus::Compose, focused);
+    if focused {
+        label = app.theme.mode_style(mode) | Modifier::BOLD;
+    }
     area.with(fill).fill(buf);
     let mut row = area;
-    draw_status_segment(&mut row, buf, label, " Compose ");
+    draw_status_segment(&mut row, buf, label, &format!(" {status_label} "));
     draw_status_segment(
         &mut row,
         buf,
@@ -931,19 +985,21 @@ fn chat_age(timestamp_ms: u64, now_ms: u64) -> String {
     chat_buffer::format_age(now_ms.saturating_sub(timestamp_ms))
 }
 
-fn draw_status(area: Rect, app: &App, buf: &mut Buffer, _capture: Option<&StatsSnapshot>) {
+fn draw_status(
+    area: Rect,
+    app: &App,
+    buf: &mut Buffer,
+    mode: theme::UiMode,
+    label: &'static str,
+    _capture: Option<&StatsSnapshot>,
+) {
     if area.is_empty() {
         return;
     }
     let theme = &app.theme;
     area.with(theme.status_fill).fill(buf);
     let mut row = area;
-    draw_status_segment(
-        &mut row,
-        buf,
-        theme.mode_style(app.mode),
-        &format!(" {} ", app.modes.top().label()),
-    );
+    draw_status_segment(&mut row, buf, theme.mode_style(mode), &format!(" {label} "));
     draw_status_text_right(row, app, buf, theme.status_fill);
 }
 
@@ -1081,8 +1137,7 @@ fn draw_key_preview(area: Rect, app: &App, buf: &mut Buffer) {
 /// chord layer has changed since the last render, and is a cheap key comparison
 /// otherwise. The stored entries back both [`key_preview_height`] and
 /// [`draw_key_preview`], which read them without recomputing.
-fn refresh_key_preview_cache(app: &mut App) {
-    let base = app.active_binding_layer();
+fn refresh_key_preview_cache(app: &mut App, base: Option<LayerId>) {
     let pending = app.pending_chord.as_ref().map(|chord| chord.layer);
     let key = Some((base, pending));
     if app.key_preview_cache.key == key {

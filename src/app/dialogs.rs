@@ -52,10 +52,6 @@ impl UserVolumeDialog {
         }
     }
 
-    pub(crate) fn preview_for(&self, user_id: UserId) -> Option<f32> {
-        (self.user_id == user_id).then_some(self.value_db)
-    }
-
     pub(crate) fn handle_key(&mut self, key: extui::event::KeyEvent) -> UserVolumeEvent {
         use extui::event::{KeyCode, KeyEventKind};
 
