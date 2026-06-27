@@ -7,7 +7,6 @@ use crate::{
         DEFAULT_MAX_AMPLIFICATION, DEFAULT_OUTPUT_BUFFER_SAMPLES, FormBindings, NotificationConfig,
         ThemeChoice, WebConfig,
     },
-    tui::form::FormFieldKind,
     ui::select::{FuzzySelect, SelectableItem},
 };
 
@@ -36,100 +35,38 @@ pub const MIN_BUFFER_SAMPLES: u32 = 32;
 /// Largest accepted explicit buffer in samples (~170 ms at 48 kHz).
 pub const MAX_BUFFER_SAMPLES: u32 = 8192;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum SettingsFocus {
-    CaptureDevice,
-    RawCaptureDevice,
-    PlaybackDevice,
-    RawPlaybackDevice,
-    Bitrate,
-    Denoise,
-    EchoCancellation,
-    Amplification,
-    Suppression,
-    Release,
-    TypingSuppression,
-    TypingVadEnter,
-    TypingVadRelease,
-    CaptureBuffer,
-    PlaybackBuffer,
-    WebEnabled,
-    WebBind,
-    MessageNotificationVolume,
-    PeerJoinNotificationVolume,
-    PeerLeaveNotificationVolume,
-    FormBindings,
-    Theme,
-    Refresh,
-    Save,
-    Close,
-}
-
-impl SettingsFocus {
-    pub const ORDER: [SettingsFocus; 25] = [
-        SettingsFocus::CaptureDevice,
-        SettingsFocus::RawCaptureDevice,
-        SettingsFocus::Bitrate,
-        SettingsFocus::Denoise,
-        SettingsFocus::EchoCancellation,
-        SettingsFocus::Amplification,
-        SettingsFocus::Suppression,
-        SettingsFocus::Release,
-        SettingsFocus::TypingSuppression,
-        SettingsFocus::TypingVadEnter,
-        SettingsFocus::TypingVadRelease,
-        SettingsFocus::CaptureBuffer,
-        SettingsFocus::PlaybackDevice,
-        SettingsFocus::RawPlaybackDevice,
-        SettingsFocus::PlaybackBuffer,
-        SettingsFocus::WebEnabled,
-        SettingsFocus::WebBind,
-        SettingsFocus::MessageNotificationVolume,
-        SettingsFocus::PeerJoinNotificationVolume,
-        SettingsFocus::PeerLeaveNotificationVolume,
-        SettingsFocus::FormBindings,
-        SettingsFocus::Theme,
-        SettingsFocus::Refresh,
-        SettingsFocus::Save,
-        SettingsFocus::Close,
-    ];
-}
-
+/// Mutable settings state. Fields are crate-visible so the immediate-mode
+/// settings form mutates them in place through `&mut`, replacing the previous
+/// focus-enum dispatch. The `*_index` fields select into the option tables
+/// ([`BITRATES`], [`MAX_AMPLIFICATIONS`], and the rest).
 pub struct SettingsDraft {
-    input_device_id: Option<String>,
-    output_device_id: Option<String>,
-    bitrate_index: usize,
-    amplification_index: usize,
-    suppression_index: usize,
-    release_index: usize,
-    typing_suppression: bool,
-    typing_vad_enter_index: usize,
-    typing_vad_release_index: usize,
+    pub(crate) input_device_id: Option<String>,
+    pub(crate) output_device_id: Option<String>,
+    pub(crate) bitrate_index: usize,
+    pub(crate) amplification_index: usize,
+    pub(crate) suppression_index: usize,
+    pub(crate) release_index: usize,
+    pub(crate) typing_suppression: bool,
+    pub(crate) typing_vad_enter_index: usize,
+    pub(crate) typing_vad_release_index: usize,
     /// Single-line field values holding a sample count or `"default"` (see
     /// [`parse_buffer_size`]). The shared form editor commits into these.
-    input_buffer: String,
-    output_buffer: String,
+    pub(crate) input_buffer: String,
+    pub(crate) output_buffer: String,
     /// When set, the device row is a free-form text field for a raw ALSA pcm
     /// string instead of the enumerated-device picker.
-    input_raw: bool,
-    output_raw: bool,
-    web_enabled: bool,
-    web_bind: String,
-    message_notification_volume_index: usize,
-    peer_join_notification_volume_index: usize,
-    peer_leave_notification_volume_index: usize,
-    form_bindings: FormBindings,
-    theme: ThemeChoice,
-    denoise: DenoiseConfig,
-    echo_cancellation: bool,
-    latency: AudioLatencyConfig,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub enum SettingsMutation {
-    None,
-    Changed,
-    AmplificationChanged(f32),
+    pub(crate) input_raw: bool,
+    pub(crate) output_raw: bool,
+    pub(crate) web_enabled: bool,
+    pub(crate) web_bind: String,
+    pub(crate) message_notification_volume_index: usize,
+    pub(crate) peer_join_notification_volume_index: usize,
+    pub(crate) peer_leave_notification_volume_index: usize,
+    pub(crate) form_bindings: FormBindings,
+    pub(crate) theme: ThemeChoice,
+    pub(crate) denoise: DenoiseConfig,
+    pub(crate) echo_cancellation: bool,
+    pub(crate) latency: AudioLatencyConfig,
 }
 
 impl SettingsDraft {
@@ -225,8 +162,8 @@ impl SettingsDraft {
             denoise_typing_suppression: self.typing_suppression,
             denoise_typing_vad_enter: self.typing_vad_enter(),
             denoise_typing_vad_release: self.typing_vad_release(),
-            input_buffer: parse_buffer_size(&self.buffer_text(SettingsFocus::CaptureBuffer)),
-            output_buffer: parse_buffer_size(&self.buffer_text(SettingsFocus::PlaybackBuffer)),
+            input_buffer: parse_buffer_size(&self.input_buffer),
+            output_buffer: parse_buffer_size(&self.output_buffer),
             latency: self.latency.clone(),
         }
     }
@@ -248,10 +185,6 @@ impl SettingsDraft {
 
     pub fn form_bindings(&self) -> FormBindings {
         self.form_bindings
-    }
-
-    pub fn bitrate_bps(&self) -> i32 {
-        BITRATES[self.bitrate_index]
     }
 
     pub fn input_selection(&self) -> Option<&str> {
@@ -286,410 +219,45 @@ impl SettingsDraft {
         self.output_device_id = selection;
     }
 
-    pub fn input_raw(&self) -> bool {
-        self.input_raw
-    }
-
-    pub fn output_raw(&self) -> bool {
-        self.output_raw
-    }
-
-    /// Returns the form field kind for `focus`, accounting for raw device mode:
-    /// a device row is a free-form [`FormFieldKind::Text`] field while its raw
-    /// flag is on, otherwise the enumerated-device [`FormFieldKind::Select`].
-    pub fn field_kind(&self, focus: SettingsFocus) -> FormFieldKind {
-        match focus {
-            SettingsFocus::CaptureDevice if self.input_raw => FormFieldKind::Text,
-            SettingsFocus::PlaybackDevice if self.output_raw => FormFieldKind::Text,
-            SettingsFocus::CaptureDevice | SettingsFocus::PlaybackDevice => FormFieldKind::Select,
-            focus if self.disabled_reason(focus).is_some() => FormFieldKind::Disabled,
-            SettingsFocus::CaptureBuffer
-            | SettingsFocus::PlaybackBuffer
-            | SettingsFocus::WebBind => FormFieldKind::Text,
-            SettingsFocus::RawCaptureDevice
-            | SettingsFocus::RawPlaybackDevice
-            | SettingsFocus::EchoCancellation
-            | SettingsFocus::TypingSuppression
-            | SettingsFocus::WebEnabled => FormFieldKind::Toggle,
-            SettingsFocus::Denoise
-            | SettingsFocus::Bitrate
-            | SettingsFocus::Amplification
-            | SettingsFocus::Suppression
-            | SettingsFocus::Release
-            | SettingsFocus::TypingVadEnter
-            | SettingsFocus::TypingVadRelease
-            | SettingsFocus::MessageNotificationVolume
-            | SettingsFocus::PeerJoinNotificationVolume
-            | SettingsFocus::PeerLeaveNotificationVolume
-            | SettingsFocus::FormBindings
-            | SettingsFocus::Theme => FormFieldKind::Choice,
-            SettingsFocus::Refresh | SettingsFocus::Save | SettingsFocus::Close => {
-                FormFieldKind::Action
-            }
-        }
-    }
-
-    /// Returns the validation error for a text field, or `None` when valid.
-    /// Buffer fields accept `default`/empty or an in-range sample count. Raw
-    /// device fields (only while raw mode is on) accept an empty value (system
-    /// default) or a string [`looks_like_alsa_pcm_name`].
-    ///
-    /// [`looks_like_alsa_pcm_name`]: crate::audio::looks_like_alsa_pcm_name
-    pub fn field_error(&self, focus: SettingsFocus) -> Option<String> {
-        match focus {
-            SettingsFocus::CaptureBuffer | SettingsFocus::PlaybackBuffer => {
-                buffer_field_error(&self.buffer_text(focus))
-            }
-            SettingsFocus::CaptureDevice if self.input_raw => {
-                raw_device_error(self.input_device_id.as_deref().unwrap_or(""))
-            }
-            SettingsFocus::PlaybackDevice if self.output_raw => {
-                raw_device_error(self.output_device_id.as_deref().unwrap_or(""))
-            }
-            SettingsFocus::WebBind => web_bind_error(&self.web_bind),
-            _ => None,
-        }
-    }
-
     /// Returns a blocking reason when either raw device string is invalid. Used
     /// to gate live apply and Save so a malformed ALSA string is never opened.
     pub fn device_string_invalid(&self) -> Option<String> {
-        self.field_error(SettingsFocus::CaptureDevice)
-            .or_else(|| self.field_error(SettingsFocus::PlaybackDevice))
+        let input = self
+            .input_raw
+            .then(|| raw_device_error(self.input_device_id.as_deref().unwrap_or("")))
+            .flatten();
+        let output = self
+            .output_raw
+            .then(|| raw_device_error(self.output_device_id.as_deref().unwrap_or("")))
+            .flatten();
+        input.or(output)
     }
 
     pub fn settings_text_invalid(&self) -> Option<String> {
         self.device_string_invalid()
-            .or_else(|| self.field_error(SettingsFocus::WebBind))
+            .or_else(|| web_bind_error(&self.web_bind))
     }
 
-    /// Commits editor text for a focusable text field. Buffer fields update the
-    /// buffer strings; raw device fields update the device selection (trimmed,
-    /// empty means system default).
-    pub fn commit_field_text(&mut self, focus: SettingsFocus, text: String) -> SettingsMutation {
-        match focus {
-            SettingsFocus::CaptureBuffer | SettingsFocus::PlaybackBuffer => {
-                self.set_buffer_text(focus, text)
-            }
-            SettingsFocus::CaptureDevice => {
-                let changed = self.set_input_selection(raw_device_selection(&text));
-                if changed {
-                    SettingsMutation::Changed
-                } else {
-                    SettingsMutation::None
-                }
-            }
-            SettingsFocus::PlaybackDevice => {
-                let changed = self.set_output_selection(raw_device_selection(&text));
-                if changed {
-                    SettingsMutation::Changed
-                } else {
-                    SettingsMutation::None
-                }
-            }
-            SettingsFocus::WebBind if self.web_bind != text => {
-                self.web_bind = text;
-                SettingsMutation::Changed
-            }
-            SettingsFocus::WebBind => SettingsMutation::None,
-            _ => SettingsMutation::None,
-        }
+    /// Reason the rnnoise-tuning rows are inert, or `None` when they apply. The
+    /// settings form uses this to grey out and skip the suppression, release,
+    /// and typing-gate rows.
+    pub(crate) fn denoise_tuning_disabled(&self) -> Option<&'static str> {
+        (self.denoise != DenoiseConfig::RnnNoise).then_some("Requires the rnnoise denoise engine.")
     }
 
-    pub fn option_label(&self, focus: SettingsFocus) -> String {
-        match focus {
-            SettingsFocus::Bitrate => format!("{} kbps", self.bitrate_bps() / 1000),
-            SettingsFocus::Denoise => self.denoise.label().to_string(),
-            SettingsFocus::EchoCancellation => on_off(self.echo_cancellation),
-            SettingsFocus::Amplification => {
-                let value = self.max_amplification();
-                if value <= 0.0 {
-                    "off".to_string()
-                } else {
-                    format!("{value:.0} dB")
-                }
-            }
-            SettingsFocus::Suppression => {
-                DENOISE_SUPPRESSION_LABELS[self.suppression_index].to_string()
-            }
-            SettingsFocus::Release => DENOISE_RELEASE_LABELS[self.release_index].to_string(),
-            SettingsFocus::TypingSuppression => on_off(self.typing_suppression),
-            SettingsFocus::TypingVadEnter => {
-                DENOISE_TYPING_VAD_LABELS[self.typing_vad_enter_index].to_string()
-            }
-            SettingsFocus::TypingVadRelease => {
-                DENOISE_TYPING_VAD_LABELS[self.typing_vad_release_index].to_string()
-            }
-            SettingsFocus::CaptureBuffer | SettingsFocus::PlaybackBuffer => self.buffer_text(focus),
-            SettingsFocus::WebEnabled => on_off(self.web_enabled),
-            SettingsFocus::WebBind => self.web_bind.clone(),
-            SettingsFocus::MessageNotificationVolume => {
-                volume_db_label(self.message_notification_volume_db())
-            }
-            SettingsFocus::PeerJoinNotificationVolume => {
-                volume_db_label(self.peer_join_notification_volume_db())
-            }
-            SettingsFocus::PeerLeaveNotificationVolume => {
-                volume_db_label(self.peer_leave_notification_volume_db())
-            }
-            SettingsFocus::FormBindings => form_bindings_label(self.form_bindings).to_string(),
-            SettingsFocus::Theme => self.theme.label().to_string(),
-            SettingsFocus::RawCaptureDevice => on_off(self.input_raw),
-            SettingsFocus::RawPlaybackDevice => on_off(self.output_raw),
-            SettingsFocus::CaptureDevice
-            | SettingsFocus::PlaybackDevice
-            | SettingsFocus::Refresh
-            | SettingsFocus::Save
-            | SettingsFocus::Close => String::new(),
-        }
-    }
-
-    pub fn option_detail(&self, focus: SettingsFocus) -> &'static str {
-        match focus {
-            SettingsFocus::CaptureDevice => "Capture device used when voice starts.",
-            SettingsFocus::PlaybackDevice => "Playback device used for remote voice.",
-            SettingsFocus::RawCaptureDevice | SettingsFocus::RawPlaybackDevice => {
-                "Type a raw ALSA device string (e.g. hw:0,0) instead of picking an enumerated device."
-            }
-            SettingsFocus::Bitrate => "Opus target bitrate for outgoing voice packets.",
-            SettingsFocus::Denoise => {
-                "Noise suppression before encoding. Useful for fans and room noise."
-            }
-            SettingsFocus::EchoCancellation => {
-                "Cancels speaker echo from the microphone path when supported."
-            }
-            SettingsFocus::Amplification => {
-                "Auto-gain ceiling for quiet microphones; 0 dB disables amplification."
-            }
-            SettingsFocus::Suppression => {
-                "RNNoise over-suppression of residual noise (typing, fans). off keeps stock denoising."
-            }
-            SettingsFocus::Release => {
-                "Smooths how fast RNNoise releases suppression, stopping noise swelling up after a pause."
-            }
-            SettingsFocus::TypingSuppression => {
-                "Ducks loud low-VAD desk and keyboard thumps after RNNoise."
-            }
-            SettingsFocus::TypingVadEnter => {
-                "Typing gate engages when Earshot VAD is below this threshold and acoustic guards match."
-            }
-            SettingsFocus::TypingVadRelease => {
-                "Typing gate releases only after Earshot VAD reaches this threshold."
-            }
-            SettingsFocus::CaptureBuffer => {
-                "Requested capture buffer in samples, or default for the host backend."
-            }
-            SettingsFocus::PlaybackBuffer => {
-                "Requested playback buffer in samples, or default for the host backend."
-            }
-            SettingsFocus::WebEnabled => {
-                "Starts the browser chat-log server. Bind is saved even while disabled."
-            }
-            SettingsFocus::WebBind => {
-                "Loopback socket address for the browser chat-log server, for example 127.0.0.1:8080."
-            }
-            SettingsFocus::MessageNotificationVolume => {
-                "Volume for incoming-message notification sounds."
-            }
-            SettingsFocus::PeerJoinNotificationVolume => {
-                "Volume for peer-joined notification sounds."
-            }
-            SettingsFocus::PeerLeaveNotificationVolume => {
-                "Volume for peer-left notification sounds."
-            }
-            SettingsFocus::FormBindings => {
-                "Keyboard model used by forms such as settings and server editing."
-            }
-            SettingsFocus::Theme => {
-                "Color theme for the interface. Applies immediately; Save persists it."
-            }
-            SettingsFocus::Refresh => "Re-scan audio devices using the current buffer requests.",
-            SettingsFocus::Save => "Persist the draft to chatt.toml.",
-            SettingsFocus::Close => "Return to chat without saving further changes.",
-        }
-    }
-
-    pub fn adjust(&mut self, focus: SettingsFocus, delta: isize) -> SettingsMutation {
-        match focus {
-            SettingsFocus::Bitrate => {
-                self.bitrate_index = cycle_index(self.bitrate_index, BITRATES.len(), delta);
-                SettingsMutation::Changed
-            }
-            SettingsFocus::Denoise => self.cycle_denoise(delta),
-            SettingsFocus::EchoCancellation => self.toggle_echo_cancellation(),
-            SettingsFocus::Amplification => {
-                self.amplification_index =
-                    cycle_index(self.amplification_index, MAX_AMPLIFICATIONS.len(), delta);
-                SettingsMutation::AmplificationChanged(self.max_amplification())
-            }
-            SettingsFocus::Suppression => {
-                self.suppression_index =
-                    cycle_index(self.suppression_index, DENOISE_SUPPRESSIONS.len(), delta);
-                SettingsMutation::Changed
-            }
-            SettingsFocus::Release => {
-                self.release_index = cycle_index(self.release_index, DENOISE_RELEASES.len(), delta);
-                SettingsMutation::Changed
-            }
-            SettingsFocus::TypingSuppression => self.toggle_typing_suppression(),
-            SettingsFocus::TypingVadEnter => {
-                self.typing_vad_enter_index = cycle_index(
-                    self.typing_vad_enter_index,
-                    DENOISE_TYPING_VAD_THRESHOLDS.len(),
-                    delta,
-                );
-                if self.typing_vad_release() < self.typing_vad_enter() {
-                    self.typing_vad_release_index = self.typing_vad_enter_index;
-                }
-                SettingsMutation::Changed
-            }
-            SettingsFocus::TypingVadRelease => {
-                self.typing_vad_release_index = cycle_index(
-                    self.typing_vad_release_index,
-                    DENOISE_TYPING_VAD_THRESHOLDS.len(),
-                    delta,
-                );
-                if self.typing_vad_release() < self.typing_vad_enter() {
-                    self.typing_vad_enter_index = self.typing_vad_release_index;
-                }
-                SettingsMutation::Changed
-            }
-            SettingsFocus::FormBindings => {
-                self.form_bindings = match self.form_bindings {
-                    FormBindings::Standard => FormBindings::Vim,
-                    FormBindings::Vim => FormBindings::Standard,
-                };
-                SettingsMutation::Changed
-            }
-            SettingsFocus::Theme => {
-                let current = ThemeChoice::ALL
-                    .iter()
-                    .position(|choice| *choice == self.theme)
-                    .unwrap_or(0);
-                let next = cycle_index(current, ThemeChoice::ALL.len(), delta);
-                self.theme = ThemeChoice::ALL[next];
-                SettingsMutation::Changed
-            }
-            SettingsFocus::WebEnabled => {
-                self.web_enabled = !self.web_enabled;
-                SettingsMutation::Changed
-            }
-            SettingsFocus::MessageNotificationVolume => {
-                self.message_notification_volume_index = cycle_index(
-                    self.message_notification_volume_index,
-                    NOTIFICATION_VOLUMES_DB.len(),
-                    delta,
-                );
-                SettingsMutation::Changed
-            }
-            SettingsFocus::PeerJoinNotificationVolume => {
-                self.peer_join_notification_volume_index = cycle_index(
-                    self.peer_join_notification_volume_index,
-                    NOTIFICATION_VOLUMES_DB.len(),
-                    delta,
-                );
-                SettingsMutation::Changed
-            }
-            SettingsFocus::PeerLeaveNotificationVolume => {
-                self.peer_leave_notification_volume_index = cycle_index(
-                    self.peer_leave_notification_volume_index,
-                    NOTIFICATION_VOLUMES_DB.len(),
-                    delta,
-                );
-                SettingsMutation::Changed
-            }
-            SettingsFocus::RawCaptureDevice => {
-                self.input_raw = !self.input_raw;
-                SettingsMutation::Changed
-            }
-            SettingsFocus::RawPlaybackDevice => {
-                self.output_raw = !self.output_raw;
-                SettingsMutation::Changed
-            }
-            SettingsFocus::CaptureDevice
-            | SettingsFocus::PlaybackDevice
-            | SettingsFocus::CaptureBuffer
-            | SettingsFocus::PlaybackBuffer
-            | SettingsFocus::WebBind
-            | SettingsFocus::Refresh
-            | SettingsFocus::Save
-            | SettingsFocus::Close => SettingsMutation::None,
-        }
-    }
-
-    pub fn activate(&mut self, focus: SettingsFocus) -> SettingsMutation {
-        match focus {
-            SettingsFocus::Denoise => self.cycle_denoise(1),
-            SettingsFocus::EchoCancellation
-            | SettingsFocus::RawCaptureDevice
-            | SettingsFocus::RawPlaybackDevice
-            | SettingsFocus::TypingSuppression
-            | SettingsFocus::WebEnabled => self.adjust(focus, 1),
-            SettingsFocus::Bitrate
-            | SettingsFocus::Amplification
-            | SettingsFocus::Suppression
-            | SettingsFocus::Release
-            | SettingsFocus::TypingVadEnter
-            | SettingsFocus::TypingVadRelease
-            | SettingsFocus::MessageNotificationVolume
-            | SettingsFocus::PeerJoinNotificationVolume
-            | SettingsFocus::PeerLeaveNotificationVolume
-            | SettingsFocus::FormBindings
-            | SettingsFocus::Theme => self.adjust(focus, 1),
-            SettingsFocus::CaptureDevice
-            | SettingsFocus::PlaybackDevice
-            | SettingsFocus::CaptureBuffer
-            | SettingsFocus::PlaybackBuffer
-            | SettingsFocus::WebBind
-            | SettingsFocus::Refresh
-            | SettingsFocus::Save
-            | SettingsFocus::Close => SettingsMutation::None,
-        }
+    /// Reason the typing-gate threshold rows are inert, or `None`. They require
+    /// both the rnnoise engine and the typing gate enabled.
+    pub(crate) fn typing_vad_disabled(&self) -> Option<&'static str> {
+        self.denoise_tuning_disabled()
+            .or_else(|| (!self.typing_suppression).then_some("Requires Typing Gate to be on."))
     }
 
     pub fn input_buffer_request(&self) -> BufferRequest {
-        parse_buffer_size(&self.buffer_text(SettingsFocus::CaptureBuffer))
-            .to_request(DEFAULT_INPUT_BUFFER_SAMPLES)
+        parse_buffer_size(&self.input_buffer).to_request(DEFAULT_INPUT_BUFFER_SAMPLES)
     }
 
     pub fn output_buffer_request(&self) -> BufferRequest {
-        parse_buffer_size(&self.buffer_text(SettingsFocus::PlaybackBuffer))
-            .to_request(DEFAULT_OUTPUT_BUFFER_SAMPLES)
-    }
-
-    pub fn buffer_text(&self, focus: SettingsFocus) -> String {
-        self.buffer_value(focus).to_string()
-    }
-
-    pub fn field_text(&self, focus: SettingsFocus) -> String {
-        match focus {
-            SettingsFocus::CaptureBuffer | SettingsFocus::PlaybackBuffer => self.buffer_text(focus),
-            SettingsFocus::WebBind => self.web_bind.clone(),
-            _ => String::new(),
-        }
-    }
-
-    fn buffer_value(&self, focus: SettingsFocus) -> &str {
-        match focus {
-            SettingsFocus::CaptureBuffer => &self.input_buffer,
-            SettingsFocus::PlaybackBuffer => &self.output_buffer,
-            _ => "",
-        }
-    }
-
-    pub fn set_buffer_text(&mut self, focus: SettingsFocus, text: String) -> SettingsMutation {
-        match focus {
-            SettingsFocus::CaptureBuffer if self.input_buffer != text => {
-                self.input_buffer = text;
-                SettingsMutation::Changed
-            }
-            SettingsFocus::PlaybackBuffer if self.output_buffer != text => {
-                self.output_buffer = text;
-                SettingsMutation::Changed
-            }
-            SettingsFocus::CaptureBuffer | SettingsFocus::PlaybackBuffer => SettingsMutation::None,
-            _ => SettingsMutation::None,
-        }
+        parse_buffer_size(&self.output_buffer).to_request(DEFAULT_OUTPUT_BUFFER_SAMPLES)
     }
 
     pub fn max_amplification(&self) -> f32 {
@@ -723,63 +291,9 @@ impl SettingsDraft {
     pub fn peer_leave_notification_volume_db(&self) -> f32 {
         NOTIFICATION_VOLUMES_DB[self.peer_leave_notification_volume_index]
     }
-
-    pub fn disabled_reason(&self, focus: SettingsFocus) -> Option<&'static str> {
-        match focus {
-            SettingsFocus::Suppression
-            | SettingsFocus::Release
-            | SettingsFocus::TypingSuppression
-                if self.denoise != DenoiseConfig::RnnNoise =>
-            {
-                Some("Requires the rnnoise denoise engine.")
-            }
-            SettingsFocus::TypingVadEnter | SettingsFocus::TypingVadRelease
-                if self.denoise != DenoiseConfig::RnnNoise =>
-            {
-                Some("Requires the rnnoise denoise engine.")
-            }
-            SettingsFocus::TypingVadEnter | SettingsFocus::TypingVadRelease
-                if !self.typing_suppression =>
-            {
-                Some("Requires Typing Gate to be on.")
-            }
-            _ => None,
-        }
-    }
-
-    fn cycle_denoise(&mut self, delta: isize) -> SettingsMutation {
-        let current = DenoiseConfig::ALL
-            .iter()
-            .position(|engine| *engine == self.denoise)
-            .unwrap_or(0);
-        let next = cycle_index(current, DenoiseConfig::ALL.len(), delta);
-        self.denoise = DenoiseConfig::ALL[next];
-        SettingsMutation::Changed
-    }
-
-    fn toggle_echo_cancellation(&mut self) -> SettingsMutation {
-        self.echo_cancellation = !self.echo_cancellation;
-        SettingsMutation::Changed
-    }
-
-    fn toggle_typing_suppression(&mut self) -> SettingsMutation {
-        self.typing_suppression = !self.typing_suppression;
-        SettingsMutation::Changed
-    }
 }
 
-fn cycle_index(index: usize, len: usize, delta: isize) -> usize {
-    if len == 0 {
-        return 0;
-    }
-    (index as isize + delta).rem_euclid(len as isize) as usize
-}
-
-fn on_off(value: bool) -> String {
-    (if value { "on" } else { "off" }).to_string()
-}
-
-fn volume_db_label(value: f32) -> String {
+pub(crate) fn volume_db_label(value: f32) -> String {
     if value == 0.0 {
         "0 dB".to_string()
     } else {
@@ -819,7 +333,7 @@ fn parse_buffer_size(text: &str) -> BufferSize {
 
 /// Validates buffer field text, returning an error message when it is neither
 /// `default`/empty nor an integer within `[MIN_BUFFER_SAMPLES, MAX_BUFFER_SAMPLES]`.
-fn buffer_field_error(text: &str) -> Option<String> {
+pub(crate) fn buffer_field_error(text: &str) -> Option<String> {
     let trimmed = text.trim();
     if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("default") {
         return None;
@@ -837,7 +351,7 @@ fn buffer_field_error(text: &str) -> Option<String> {
 
 /// Validates a raw ALSA device string. Empty means system default. Otherwise it
 /// must look like an ALSA pcm name.
-fn raw_device_error(text: &str) -> Option<String> {
+pub(crate) fn raw_device_error(text: &str) -> Option<String> {
     let trimmed = text.trim();
     let pcm = trimmed
         .strip_prefix("alsa:")
@@ -849,7 +363,7 @@ fn raw_device_error(text: &str) -> Option<String> {
     Some("not a valid ALSA device string (e.g. hw:0,0)".to_string())
 }
 
-fn web_bind_error(text: &str) -> Option<String> {
+pub(crate) fn web_bind_error(text: &str) -> Option<String> {
     let trimmed = text.trim();
     match trimmed.parse::<std::net::SocketAddr>() {
         Ok(_) => None,
@@ -859,7 +373,7 @@ fn web_bind_error(text: &str) -> Option<String> {
 
 /// Maps raw device editor text to a selection: trimmed, with an empty string
 /// becoming `None` (system default).
-fn raw_device_selection(text: &str) -> Option<String> {
+pub(crate) fn raw_device_selection(text: &str) -> Option<String> {
     let trimmed = text.trim();
     (!trimmed.is_empty()).then(|| trimmed.to_string())
 }
@@ -1490,7 +1004,7 @@ mod tests {
     }
 
     #[test]
-    fn settings_draft_cycles_and_round_trips_denoise_engine() {
+    fn settings_draft_round_trips_denoise_engine() {
         let config = AudioConfig {
             denoise: DenoiseConfig::Spectral,
             ..AudioConfig::default()
@@ -1498,34 +1012,8 @@ mod tests {
         let mut draft = SettingsDraft::from_audio(&config);
         assert_eq!(draft.to_audio().denoise, DenoiseConfig::Spectral);
 
-        // Forward cycles None -> Spectral -> RnnNoise and wraps.
-        draft.adjust(SettingsFocus::Denoise, 1);
+        draft.denoise = DenoiseConfig::RnnNoise;
         assert_eq!(draft.to_audio().denoise, DenoiseConfig::RnnNoise);
-        draft.adjust(SettingsFocus::Denoise, 1);
-        assert_eq!(draft.to_audio().denoise, DenoiseConfig::None);
-        // Backward steps wrap the other way.
-        draft.adjust(SettingsFocus::Denoise, -1);
-        assert_eq!(draft.to_audio().denoise, DenoiseConfig::RnnNoise);
-    }
-
-    #[test]
-    fn settings_draft_cycles_theme() {
-        let mut draft = SettingsDraft::from_audio(&AudioConfig::default());
-        draft.set_theme_from_config(ThemeChoice::TomorrowNight);
-
-        assert_eq!(
-            draft.adjust(SettingsFocus::Theme, 1),
-            SettingsMutation::Changed
-        );
-        assert_eq!(draft.theme(), ThemeChoice::Base16Dark);
-        draft.adjust(SettingsFocus::Theme, 1);
-        assert_eq!(draft.theme(), ThemeChoice::Base16Light);
-        // Forward wraps back to the first theme.
-        draft.adjust(SettingsFocus::Theme, 1);
-        assert_eq!(draft.theme(), ThemeChoice::TomorrowNight);
-        // Backward wraps the other way.
-        draft.adjust(SettingsFocus::Theme, -1);
-        assert_eq!(draft.theme(), ThemeChoice::Base16Light);
     }
 
     #[test]
@@ -1548,39 +1036,22 @@ mod tests {
     #[test]
     fn raw_device_error_only_flags_invalid_when_raw_mode_on() {
         let mut draft = SettingsDraft::from_audio(&AudioConfig::default());
-        // Off: device fields never report an error.
+        // Off: device strings never gate apply.
         let _ = draft.set_input_selection(Some("not a device".to_string()));
-        assert!(draft.field_error(SettingsFocus::CaptureDevice).is_none());
+        assert!(draft.device_string_invalid().is_none());
 
         // On: a garbage string is flagged, a valid ALSA pcm is accepted.
-        draft.activate(SettingsFocus::RawCaptureDevice);
-        assert!(draft.input_raw());
-        assert!(draft.field_error(SettingsFocus::CaptureDevice).is_some());
+        draft.input_raw = true;
         assert!(draft.device_string_invalid().is_some());
 
-        let _ = draft.commit_field_text(SettingsFocus::CaptureDevice, "hw:0,0".to_string());
-        assert!(draft.field_error(SettingsFocus::CaptureDevice).is_none());
+        let _ = draft.set_input_selection(raw_device_selection("hw:0,0"));
         assert_eq!(draft.input_selection(), Some("hw:0,0"));
         assert!(draft.device_string_invalid().is_none());
 
         // Empty means system default and is valid.
-        let _ = draft.commit_field_text(SettingsFocus::CaptureDevice, String::new());
+        let _ = draft.set_input_selection(raw_device_selection(""));
         assert_eq!(draft.input_selection(), None);
-        assert!(draft.field_error(SettingsFocus::CaptureDevice).is_none());
-    }
-
-    #[test]
-    fn field_kind_flips_device_row_with_raw_mode() {
-        let mut draft = SettingsDraft::from_audio(&AudioConfig::default());
-        assert_eq!(
-            draft.field_kind(SettingsFocus::CaptureDevice),
-            FormFieldKind::Select
-        );
-        draft.activate(SettingsFocus::RawCaptureDevice);
-        assert_eq!(
-            draft.field_kind(SettingsFocus::CaptureDevice),
-            FormFieldKind::Text
-        );
+        assert!(draft.device_string_invalid().is_none());
     }
 
     #[test]
@@ -1592,8 +1063,8 @@ mod tests {
         };
         let draft = SettingsDraft::from_audio(&config);
         // Bare pcm string is raw, a picker backend id (alsa:...) is not.
-        assert!(draft.input_raw());
-        assert!(!draft.output_raw());
+        assert!(draft.input_raw);
+        assert!(!draft.output_raw);
     }
 
     #[test]
@@ -1624,8 +1095,8 @@ mod tests {
         };
 
         let draft = SettingsDraft::from_audio(&config);
-        assert_eq!(draft.option_label(SettingsFocus::Suppression), "2x");
-        assert_eq!(draft.option_label(SettingsFocus::Release), "strong");
+        assert_eq!(DENOISE_SUPPRESSION_LABELS[draft.suppression_index], "2x");
+        assert_eq!(DENOISE_RELEASE_LABELS[draft.release_index], "strong");
 
         let audio = draft.to_audio();
         assert_eq!(audio.denoise_suppression, 2.0);
@@ -1642,15 +1113,20 @@ mod tests {
         };
 
         let mut draft = SettingsDraft::from_audio(&config);
-        assert_eq!(draft.option_label(SettingsFocus::TypingSuppression), "on");
-        assert_eq!(draft.option_label(SettingsFocus::TypingVadEnter), "75%");
-        assert_eq!(draft.option_label(SettingsFocus::TypingVadRelease), "85%");
+        assert!(draft.typing_suppression);
+        assert_eq!(
+            DENOISE_TYPING_VAD_LABELS[draft.typing_vad_enter_index],
+            "75%"
+        );
+        assert_eq!(
+            DENOISE_TYPING_VAD_LABELS[draft.typing_vad_release_index],
+            "85%"
+        );
         assert!(draft.to_audio().denoise_typing_suppression);
         assert_eq!(draft.to_audio().denoise_typing_vad_enter, 0.75);
         assert_eq!(draft.to_audio().denoise_typing_vad_release, 0.85);
 
-        draft.activate(SettingsFocus::TypingSuppression);
-        assert_eq!(draft.option_label(SettingsFocus::TypingSuppression), "off");
+        draft.typing_suppression = false;
         assert!(!draft.to_audio().denoise_typing_suppression);
     }
 
@@ -1659,11 +1135,17 @@ mod tests {
         let draft = SettingsDraft::from_audio(&AudioConfig::default());
         assert_eq!(draft.suppression_strength(), 1.0);
         assert_eq!(draft.release_value(), 1.0);
-        assert_eq!(draft.option_label(SettingsFocus::Suppression), "off");
-        assert_eq!(draft.option_label(SettingsFocus::Release), "off");
-        assert_eq!(draft.option_label(SettingsFocus::TypingSuppression), "off");
-        assert_eq!(draft.option_label(SettingsFocus::TypingVadEnter), "80%");
-        assert_eq!(draft.option_label(SettingsFocus::TypingVadRelease), "82%");
+        assert_eq!(DENOISE_SUPPRESSION_LABELS[draft.suppression_index], "off");
+        assert_eq!(DENOISE_RELEASE_LABELS[draft.release_index], "off");
+        assert!(!draft.typing_suppression);
+        assert_eq!(
+            DENOISE_TYPING_VAD_LABELS[draft.typing_vad_enter_index],
+            "80%"
+        );
+        assert_eq!(
+            DENOISE_TYPING_VAD_LABELS[draft.typing_vad_release_index],
+            "82%"
+        );
     }
 
     #[test]

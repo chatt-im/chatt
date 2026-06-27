@@ -7,14 +7,17 @@ use crate::{
     app::{App, ChatPanelFocus, ServerEditDraft, ServerEditEvent, ToggleExpandResult},
     bindings::{self, BindCommand, Resolved},
     chat_buffer::{LineKind, VisibleLine},
-    settings::{self, AudioInputPickerState, AudioOutputPickerState, SettingsDraft, SettingsFocus},
+    settings::{self, AudioInputPickerState, AudioOutputPickerState, SettingsDraft},
     theme,
     tui::{
-        form::{FormAction, FormMouseIntent, FormState},
+        form::{FormAction, FormFieldKind, FormMouseIntent, FormState},
         mode::{AppMode, ChromeSpec, ExitReason, ModePresentation, ModeTransition, is_quit_key},
         overlay::{ConfirmDisposition, ConfirmMode},
     },
-    ui::select::FuzzySelect,
+    ui::{
+        select::FuzzySelect,
+        settings::{FieldId, FieldIntent},
+    },
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -211,13 +214,13 @@ impl AppMode for ServerEditMode {
         if is_quit_key(&key) {
             return Action::Quit;
         }
-        let event = self.draft.handle_key(key);
+        let event = self.draft.handle_key(key, &app.theme);
         self.handle_event(app, event);
         Action::Continue
     }
 
     fn process_mouse(&mut self, app: &mut App, mouse: MouseEvent) -> Action {
-        let event = self.draft.handle_mouse(mouse);
+        let event = self.draft.handle_mouse(mouse, &app.theme);
         self.handle_event(app, event);
         Action::Continue
     }
@@ -232,7 +235,7 @@ impl AppMode for ServerEditMode {
 }
 
 pub(crate) struct SettingsSession {
-    pub(crate) form: FormState<SettingsFocus>,
+    pub(crate) form: FormState<FieldId>,
     pub(crate) draft: SettingsDraft,
     pub(crate) input_items: Vec<settings::AudioInputItem>,
     pub(crate) output_items: Vec<settings::AudioOutputItem>,
@@ -256,10 +259,9 @@ impl SettingsSession {
         let mut output_picker = AudioOutputPickerState::default();
         output_picker.reset(&output_items, draft.output_selection());
         Self {
-            form: FormState::with_order(
-                SettingsFocus::CaptureDevice,
+            form: FormState::new(
+                crate::ui::settings::initial_focus(),
                 app.config.ui.form_bindings,
-                SettingsFocus::ORDER,
             ),
             draft,
             input_items,
@@ -307,7 +309,7 @@ impl SettingsMode {
     }
 
     #[cfg(test)]
-    pub(crate) fn with_form_for_test(form: FormState<SettingsFocus>, app: &App) -> Self {
+    pub(crate) fn with_form_for_test(form: FormState<FieldId>, app: &App) -> Self {
         let mut mode = Self::new(app);
         mode.session.form = form;
         mode
@@ -321,13 +323,17 @@ impl SettingsMode {
         use BindCommand::*;
         match command {
             SaveSettings => app.save_settings(&mut self.session),
-            Activate => app.activate_settings_focus(&mut self.session),
+            Activate => app.drive_settings(&mut self.session, FieldIntent::Activate, None, None),
             FocusNext => app.move_settings_focus(&mut self.session, 1),
             FocusPrev => app.move_settings_focus(&mut self.session, -1),
             SelectNext => app.move_settings_selection(&mut self.session, 1),
             SelectPrev => app.move_settings_selection(&mut self.session, -1),
-            AdjustLeft => app.adjust_settings_focus(&mut self.session, -1),
-            AdjustRight => app.adjust_settings_focus(&mut self.session, 1),
+            AdjustLeft => {
+                app.drive_settings(&mut self.session, FieldIntent::Adjust(-1), None, None)
+            }
+            AdjustRight => {
+                app.drive_settings(&mut self.session, FieldIntent::Adjust(1), None, None)
+            }
             Cancel | CloseSettings => {
                 if !app.cancel_open_audio_picker(&mut self.session) {
                     app.close_settings(&mut self.session);
@@ -373,22 +379,39 @@ impl AppMode for SettingsMode {
             return Action::Continue;
         }
 
-        let focus = self.session.form.focus();
-        let kind = self.session.draft.field_kind(focus);
-        let text_focused = kind == crate::tui::form::FormFieldKind::Text;
+        let kind = self.session.form.focused_kind();
+        let text_focused = kind == FormFieldKind::Text;
         let event = self.session.form.handle_key(key, kind);
-        app.apply_settings_commit(&mut self.session, event.commit);
         match event.action {
             FormAction::None if !text_focused => return self.resolve_binding(app, key),
-            FormAction::None => {}
+            FormAction::None => {
+                app.drive_settings(&mut self.session, FieldIntent::None, event.commit, None);
+            }
             FormAction::Cancel => {
                 if !app.cancel_open_audio_picker(&mut self.session) {
                     app.close_settings(&mut self.session);
                 }
             }
-            FormAction::Activate => app.activate_settings_focus(&mut self.session),
-            FormAction::Adjust(delta) => app.adjust_settings_focus(&mut self.session, delta),
-            FormAction::FocusMoved | FormAction::Scrolled => {}
+            FormAction::Activate if text_focused => {
+                // Enter in a text field commits the edit then advances focus,
+                // matching the previous buffer/web-bind behavior.
+                app.drive_settings(&mut self.session, FieldIntent::None, event.commit, None);
+                app.move_settings_focus(&mut self.session, 1);
+            }
+            FormAction::Activate => {
+                app.drive_settings(&mut self.session, FieldIntent::Activate, event.commit, None);
+            }
+            FormAction::Adjust(delta) => {
+                app.drive_settings(
+                    &mut self.session,
+                    FieldIntent::Adjust(delta),
+                    event.commit,
+                    None,
+                );
+            }
+            FormAction::FocusMoved | FormAction::Scrolled => {
+                app.drive_settings(&mut self.session, FieldIntent::None, event.commit, None);
+            }
             FormAction::TextChanged => app.mark_settings_dirty(&mut self.session),
         }
         Action::Continue
@@ -404,25 +427,28 @@ impl AppMode for SettingsMode {
         }
 
         let event = self.session.form.handle_mouse(mouse);
-        app.apply_settings_commit(&mut self.session, event.commit);
         match event.intent {
-            FormMouseIntent::None => {}
-            FormMouseIntent::Activate(field) => {
-                let _ = self.session.form.set_focus(field);
-                app.activate_settings_focus(&mut self.session);
+            FormMouseIntent::None => {
+                app.drive_settings(&mut self.session, FieldIntent::None, event.commit, None);
             }
-            FormMouseIntent::Adjust(field, delta) => {
-                let commit = self.session.form.set_focus(field);
-                app.apply_settings_commit(&mut self.session, commit);
-                app.adjust_settings_focus(&mut self.session, delta);
+            FormMouseIntent::Activate(_) => {
+                app.drive_settings(&mut self.session, FieldIntent::Activate, event.commit, None);
             }
-            FormMouseIntent::Text(field, area, column) => {
-                let value = self.session.draft.field_text(field);
-                let commit = self
-                    .session
-                    .form
-                    .focus_text_at(field, &value, area, column, true);
-                app.apply_settings_commit(&mut self.session, commit);
+            FormMouseIntent::Adjust(_, delta) => {
+                app.drive_settings(
+                    &mut self.session,
+                    FieldIntent::Adjust(delta),
+                    event.commit,
+                    None,
+                );
+            }
+            FormMouseIntent::Text(_, _, column) => {
+                app.drive_settings(
+                    &mut self.session,
+                    FieldIntent::None,
+                    event.commit,
+                    Some(column),
+                );
             }
             FormMouseIntent::PickerItem(field, item_index) => {
                 app.activate_settings_picker_item(&mut self.session, field, item_index);

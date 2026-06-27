@@ -25,7 +25,6 @@ max-receive-bytes = 52428800
 [web]
 enabled = true
 bind = "127.0.0.1:8080"
-assets-dir = "web/dist"
 
 [bindings]
 
