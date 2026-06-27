@@ -17,6 +17,18 @@ export interface WebMessage {
 }
 
 // One JSON object per WebSocket text frame.
+//
+// `oldest_seq` is the server-assigned sequence number of the first message in a
+// window. `has_more` is true when still-older history can be paged in. The
+// browser requests older history with a `load_older` frame (see ClientRequest).
 export type ServerEnvelope =
-  | { type: "sync"; messages: WebMessage[] }
-  | { type: "message"; message: WebMessage };
+  | { type: "sync"; messages: WebMessage[]; oldest_seq: number; has_more: boolean }
+  | { type: "message"; message: WebMessage }
+  | { type: "older"; messages: WebMessage[]; oldest_seq: number; has_more: boolean };
+
+// The only frame the browser sends: a request for older history.
+export type ClientRequest = {
+  type: "load_older";
+  before_seq: number;
+  limit: number;
+};

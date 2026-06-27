@@ -80,16 +80,27 @@ body {
 
 .chat-log {
   flex: 1 1 auto;
-  overflow-y: auto;
-  padding: var(--space-lg);
-}
-
-/* The scroll content lives in its own wrapper so a ResizeObserver can watch it
- * grow (new messages, media decode) and keep the autoscroll pinned. */
-.chat-log-content {
   display: flex;
   flex-direction: column;
-  gap: var(--space);
+  overflow-y: auto;
+  /* No vertical padding: it skews virtua's align:"end" and the spacer math.
+   * Horizontal padding lives on the message instead. */
+  padding: 0;
+  /* The browser's scroll anchoring conflicts with virtua's own. */
+  overflow-anchor: none;
+}
+
+/* Bottom-aligns the messages when they do not fill the viewport. Collapses to
+ * zero once the content overflows, so it never offsets virtua's scroll math. */
+.chat-log-spacer {
+  flex: 1 1 auto;
+}
+
+/* Wraps the Virtualizer so a ResizeObserver can watch it grow (new messages,
+ * media decode) and keep the autoscroll pinned. virtua absolutely-positions its
+ * items, so message spacing lives inside the measured item, not here. */
+.chat-log-content {
+  flex: 0 0 auto;
 }
 
 .message {
@@ -97,6 +108,10 @@ body {
   flex-direction: column;
   gap: 2px;
   padding: var(--space);
+  /* Inter-message spacing is padding, not margin: child margins are excluded
+   * from the contentRect virtua measures, which would desync item sizes. */
+  padding-bottom: calc(var(--space) * 2);
+  margin: 0 var(--space-lg);
   background: var(--bg-elevated);
   border-left: 2px solid var(--border);
 }
