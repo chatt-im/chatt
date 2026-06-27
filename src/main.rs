@@ -13,6 +13,7 @@ mod settings;
 mod theme;
 mod tui;
 mod ui;
+mod web_server;
 
 pub(crate) use chatt::audio;
 pub(crate) use chatt::mdns;

@@ -1,0 +1,153 @@
+/*
+ * Chatt web chat-log styles.
+ *
+ * Flat, dark, hueless greys. Rectangular, no rounding. Restyle by overriding
+ * the custom properties under :root. Class names are semantic and stable so
+ * users can target them directly.
+ */
+
+:root {
+  --bg: #161616;
+  --bg-elevated: #1d1d1d;
+  --bg-header: #121212;
+  --border: #2a2a2a;
+  --text: #d8d8d8;
+  --text-dim: #8a8a8a;
+  --text-sender: #f0f0f0;
+  --accent: #4a4a4a;
+  --accent-live: #7ec77e;
+
+  --space: 8px;
+  --space-lg: 16px;
+  --font: "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace;
+  --font-size: 14px;
+  --line-height: 1.5;
+
+  color-scheme: dark;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--font);
+  font-size: var(--font-size);
+  line-height: var(--line-height);
+}
+
+.app {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+}
+
+.app-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: var(--space) var(--space-lg);
+  background: var(--bg-header);
+  border-bottom: 1px solid var(--border);
+  flex: 0 0 auto;
+}
+
+.app-title {
+  color: var(--text-sender);
+  font-weight: 600;
+  letter-spacing: 0.05em;
+}
+
+.conn-status {
+  color: var(--text-dim);
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+}
+
+.conn-status.is-online {
+  color: var(--accent-live);
+}
+
+.chat-log {
+  flex: 1 1 auto;
+  overflow-y: auto;
+  padding: var(--space-lg);
+}
+
+/* The scroll content lives in its own wrapper so a ResizeObserver can watch it
+ * grow (new messages, media decode) and keep the autoscroll pinned. */
+.chat-log-content {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space);
+}
+
+.message {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: var(--space);
+  background: var(--bg-elevated);
+  border-left: 2px solid var(--border);
+}
+
+.message-meta {
+  display: flex;
+  align-items: baseline;
+  gap: var(--space);
+}
+
+.message-sender {
+  color: var(--text-sender);
+  font-weight: 600;
+}
+
+.message-time {
+  color: var(--text-dim);
+  font-size: 12px;
+}
+
+.message-body {
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.message-media {
+  margin-top: 4px;
+}
+
+.media-image,
+.media-video {
+  display: block;
+  max-width: 100%;
+  max-height: 60vh;
+  background: var(--bg);
+}
+
+.media-audio {
+  width: 100%;
+  max-width: 480px;
+}
+
+.media-file {
+  display: inline-block;
+  padding: var(--space);
+  background: var(--bg);
+  border: 1px solid var(--border);
+  color: var(--text);
+  text-decoration: none;
+}
+
+.media-file:hover {
+  border-color: var(--accent);
+}
