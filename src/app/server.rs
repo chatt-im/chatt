@@ -104,10 +104,6 @@ impl ServerEditDraft {
         draft
     }
 
-    pub(crate) fn focus(&self) -> ServerEditFocus {
-        self.form.focus()
-    }
-
     pub(crate) fn handle_key(&mut self, key: KeyEvent) -> ServerEditEvent {
         let kind = self.focus_kind();
         let event = self.form.handle_key(key, kind);
