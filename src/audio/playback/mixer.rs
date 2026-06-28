@@ -21,6 +21,22 @@ const LIVE_PLAYBACK_MIX_SCRATCH: usize = 8_192;
 /// may conceal up to 10% of the callback, which is still bounded to the current
 /// callback and does not add queued latency.
 const SHORT_RING_CONCEALMENT_FLOOR_SAMPLES: usize = 96;
+/// Linear declick ramp length applied to each stream's output envelope. 5 ms at
+/// the mixer's fixed 48 kHz domain (the device resampler runs after the mixer) =
+/// 240 samples: long enough to kill boundary clicks at speech onset/offset, short
+/// enough to preserve plosives and syllable attacks.
+const LIVE_PLAYBACK_DECLICK_RAMP_SAMPLES: usize = 240;
+
+/// Shapes a linear `0.0..=1.0` ramp into a smoothstep S-curve with zero slope at
+/// both endpoints. Unlike a linear fade (continuous level but a kink in its
+/// slope at each end, which radiates a little spectral splatter), this has no
+/// derivative discontinuity at the silence boundary, so the fade to/from silence
+/// stays clean. Trig-free (`g²(3 - 2g)`), so it is cheap enough for the per-sample
+/// audio callback. Input is assumed already clamped to `[0, 1]` by the ramp.
+#[inline]
+fn smoothstep(gain: f32) -> f32 {
+    gain * gain * (3.0 - 2.0 * gain)
+}
 
 /// Consumer side of live playback: the cpal callback's pure ring-mixer.
 ///
@@ -54,6 +70,9 @@ struct ConsumerStream {
     reader: RingReader,
     control: PlaybackStreamControl,
     last_sample: f32,
+    /// Declick envelope, 0.0..=1.0. Starts at 0.0 so the stream's first audio
+    /// fades in instead of stepping from silence; ramps back to 0.0 on dry/mute.
+    declick_gain: f32,
 }
 
 impl Default for LivePlaybackMixer {
@@ -159,6 +178,7 @@ impl LivePlaybackMixer {
                 reader: unsafe { RingReader::new(ring) },
                 control: PlaybackStreamControl::default(),
                 last_sample: 0.0,
+                declick_gain: 0.0,
             });
     }
 
@@ -189,16 +209,39 @@ impl LivePlaybackMixer {
         self.active_scratch.clear();
         self.active_scratch.resize(frames, 0);
 
+        let declick_step = 1.0 / LIVE_PLAYBACK_DECLICK_RAMP_SAMPLES as f32;
         for stream in self.streams.values_mut() {
             let span = stream.reader.readable_span();
             let span_len = span.len();
             let covered = span_len.min(frames);
-            if !stream.control.muted {
-                let gain = db_to_gain(stream.control.volume_db);
-                for offset in 0..covered {
+            let gain = db_to_gain(stream.control.volume_db);
+            let muted = stream.control.muted;
+            // Walk the whole block, ramping a per-stream declick gain toward 1.0
+            // while the stream has audio and toward 0.0 while it is dry or muted.
+            // The gain is tracked linearly, then shaped through `smoothstep` when
+            // applied so the fade to/from silence has no slope kink. Multiplying
+            // that continuous envelope into the output removes the hard step at
+            // speech onset, offset, underrun, and mute that a raw jump between
+            // silence and a mid-amplitude sample would produce. Past the covered
+            // span we hold the last real sample, which only matters while the
+            // envelope is still ramping down; once it reaches 0 the contribution
+            // is silence regardless.
+            for offset in 0..frames {
+                let sample = if offset < covered {
                     let sample = span.get(offset).unwrap_or(0.0);
                     stream.last_sample = sample;
-                    out[offset] += sample * gain;
+                    sample
+                } else {
+                    stream.last_sample
+                };
+                let target = if !muted && offset < covered { 1.0 } else { 0.0 };
+                if stream.declick_gain < target {
+                    stream.declick_gain = (stream.declick_gain + declick_step).min(target);
+                } else if stream.declick_gain > target {
+                    stream.declick_gain = (stream.declick_gain - declick_step).max(target);
+                }
+                if stream.declick_gain > 0.0 {
+                    out[offset] += sample * gain * smoothstep(stream.declick_gain);
                     self.active_scratch[offset] += 1;
                 }
             }
@@ -206,21 +249,18 @@ impl LivePlaybackMixer {
             // must die before `advance` publishes the freed read cursor, or the
             // producer could overwrite still-borrowed slots.
             drop(span);
+            // Underrun bookkeeping is unchanged: a tiny partial miss within the
+            // concealment floor is a benign callback-edge gap, not a target-widening
+            // underrun. The envelope above already tapers it; this gate only decides
+            // whether it counts against the stream.
             let missing = frames.saturating_sub(covered);
             let concealment_limit = if frames >= FRAME_SAMPLES {
                 SHORT_RING_CONCEALMENT_FLOOR_SAMPLES.max(frames / 10)
             } else {
                 0
             };
-            if missing > 0 && covered > 0 && missing <= concealment_limit {
-                if !stream.control.muted {
-                    let gain = db_to_gain(stream.control.volume_db);
-                    for offset in covered..frames {
-                        out[offset] += stream.last_sample * gain;
-                        self.active_scratch[offset] += 1;
-                    }
-                }
-            } else if span_len < frames {
+            let concealed = missing > 0 && covered > 0 && missing <= concealment_limit;
+            if span_len < frames && !concealed {
                 stream.reader.note_underrun();
             }
             stream.reader.advance(covered);
@@ -411,26 +451,36 @@ mod tests {
         let mut out = vec![0.0; FRAME_SAMPLES];
         mixer.fill_block(&mut out);
 
+        // Sample past the declick ramp so both envelopes have reached unity.
         // Two equal streams: sum 0.8 over sqrt(2) ~= 0.566, then soft-limited.
-        assert!(out[0] > 0.4, "mixed {} should exceed one stream", out[0]);
-        assert!(
-            out[0] < 0.8,
-            "mixed {} should stay below the raw sum",
-            out[0]
-        );
+        let steady = out[FRAME_SAMPLES - 1];
+        assert!(steady > 0.4, "mixed {steady} should exceed one stream");
+        assert!(steady < 0.8, "mixed {steady} should stay below the raw sum");
     }
 
     #[test]
     fn dry_stream_bumps_underrun_and_outputs_silence_past_the_span() {
         let mut mixer = LivePlaybackMixer::new();
-        let ring = ring_with(&[0.5; 10]);
+        // Span and gap both exceed the declick ramp so the envelope reaches unity
+        // over the covered region and fully tapers to silence past it.
+        let covered = LIVE_PLAYBACK_DECLICK_RAMP_SAMPLES + 60;
+        let ring = ring_with(&vec![0.5; covered]);
         mixer.ensure_stream(1, Arc::clone(&ring));
 
-        let mut out = vec![0.0; 20];
+        let mut out = vec![0.0; covered + 2 * LIVE_PLAYBACK_DECLICK_RAMP_SAMPLES];
         mixer.fill_block(&mut out);
 
-        assert_eq!(out[0], 0.5);
-        assert_eq!(out[10], 0.0, "past the span is silence");
+        assert_eq!(out[covered - 1], 0.5, "covered span reached full level");
+        assert_eq!(
+            out[covered + LIVE_PLAYBACK_DECLICK_RAMP_SAMPLES],
+            0.0,
+            "past the span fades to silence",
+        );
+        assert!(
+            out[covered] > 0.0 && out[covered] < 0.5,
+            "the gap edge tapers rather than stepping to 0: {}",
+            out[covered]
+        );
         assert_eq!(ring.underruns(), 1, "short span bumped one underrun");
         assert_eq!(ring.depth(), 0, "the consumer drained what was available");
     }
@@ -445,8 +495,12 @@ mod tests {
         let mut out = vec![0.0; FRAME_SAMPLES];
         mixer.fill_block(&mut out);
 
-        assert_eq!(out[0], 0.5);
-        assert_eq!(out[FRAME_SAMPLES - 1], 0.5, "tail held last sample");
+        assert_eq!(out[FRAME_SAMPLES / 2], 0.5, "steady region at full level");
+        let tail = out[FRAME_SAMPLES - 1];
+        assert!(
+            tail > 0.0 && tail < 0.5,
+            "concealed tail fades the held sample rather than holding flat: {tail}"
+        );
         assert_eq!(ring.underruns(), 0, "tiny miss should not widen target");
         assert_eq!(ring.depth(), 0, "consumer drained the published span");
     }
@@ -485,8 +539,10 @@ mod tests {
 
         let mut out = vec![0.0; FRAME_SAMPLES];
         mixer.fill_block(&mut out);
-        assert!(out[0] > 0.25, "gain not applied: {}", out[0]);
-        assert!(out[0] <= 0.55);
+        // Read past the declick ramp so the envelope is at unity.
+        let steady = out[FRAME_SAMPLES - 1];
+        assert!(steady > 0.25, "gain not applied: {steady}");
+        assert!(steady <= 0.55);
     }
 
     #[test]
@@ -497,5 +553,155 @@ mod tests {
         let mut out = vec![0.0; FRAME_SAMPLES];
         mixer.fill_block(&mut out);
         assert!(out.iter().all(|&s| s == 0.0));
+    }
+
+    #[test]
+    fn onset_ramps_in_from_silence() {
+        let mut mixer = LivePlaybackMixer::new();
+        mixer.ensure_stream(1, ring_with(&[0.5; FRAME_SAMPLES]));
+
+        let mut out = vec![0.0; FRAME_SAMPLES];
+        mixer.fill_block(&mut out);
+
+        assert!(
+            out[0] < 0.05,
+            "first sample should be near silence: {}",
+            out[0]
+        );
+        for index in 1..LIVE_PLAYBACK_DECLICK_RAMP_SAMPLES {
+            assert!(
+                out[index] > out[index - 1],
+                "envelope should rise monotonically at {index}: {} !> {}",
+                out[index],
+                out[index - 1]
+            );
+        }
+        assert_eq!(
+            out[LIVE_PLAYBACK_DECLICK_RAMP_SAMPLES], 0.5,
+            "envelope reaches full level after the ramp"
+        );
+    }
+
+    #[test]
+    fn offset_ramps_out_to_silence() {
+        let mut mixer = LivePlaybackMixer::new();
+        let ring = ring_with(&[0.5; FRAME_SAMPLES]);
+        mixer.ensure_stream(1, Arc::clone(&ring));
+
+        // First block reaches steady state and drains the ring.
+        let mut out = vec![0.0; FRAME_SAMPLES];
+        mixer.fill_block(&mut out);
+        assert_eq!(out[FRAME_SAMPLES - 1], 0.5, "primed to full level");
+
+        // Second block is fully dry: the held sample fades out instead of stepping.
+        let mut out = vec![0.0; FRAME_SAMPLES];
+        mixer.fill_block(&mut out);
+        assert!(
+            out[0] > 0.45,
+            "fade-out starts from the held level: {}",
+            out[0]
+        );
+        for index in 1..LIVE_PLAYBACK_DECLICK_RAMP_SAMPLES {
+            assert!(
+                out[index] < out[index - 1],
+                "envelope should fall monotonically at {index}",
+            );
+        }
+        assert!(
+            out[LIVE_PLAYBACK_DECLICK_RAMP_SAMPLES..]
+                .iter()
+                .all(|&s| s == 0.0),
+            "stays silent after the fade completes"
+        );
+    }
+
+    #[test]
+    fn declick_envelope_is_smoothstep_shaped() {
+        // Endpoints and midpoint are preserved; the curve is an S, not a line.
+        assert_eq!(smoothstep(0.0), 0.0);
+        assert_eq!(smoothstep(1.0), 1.0);
+        assert!((smoothstep(0.5) - 0.5).abs() < 1e-6);
+
+        let mut mixer = LivePlaybackMixer::new();
+        mixer.ensure_stream(1, ring_with(&[0.5; FRAME_SAMPLES]));
+        let mut out = vec![0.0; FRAME_SAMPLES];
+        mixer.fill_block(&mut out);
+
+        let step = 1.0 / LIVE_PLAYBACK_DECLICK_RAMP_SAMPLES as f32;
+        let linear_at = |offset: usize| 0.5 * (offset as f32 + 1.0) * step;
+        // Toe sits below the matching linear ramp, shoulder sits above it — the
+        // smoothstep signature (flat start, flat finish).
+        assert!(out[4] < linear_at(4), "toe should be below the linear ramp");
+        assert!(
+            out[234] > linear_at(234),
+            "shoulder should be above the linear ramp"
+        );
+        // Ramp midpoint crosses the linear ramp at half level.
+        let mid = LIVE_PLAYBACK_DECLICK_RAMP_SAMPLES / 2 - 1;
+        assert!(
+            (out[mid] - 0.25).abs() < 1e-3,
+            "midpoint near half level: {}",
+            out[mid]
+        );
+    }
+
+    #[test]
+    fn steady_speech_is_unmodified() {
+        let mut mixer = LivePlaybackMixer::new();
+        // Two blocks of audio: prime the envelope to unity on the first, then
+        // assert the second passes through untouched (single stream, gain 0 dB).
+        let ring = ring_with(&[0.5; FRAME_SAMPLES * 2]);
+        mixer.ensure_stream(1, Arc::clone(&ring));
+
+        let mut out = vec![0.0; FRAME_SAMPLES];
+        mixer.fill_block(&mut out);
+        let mut out = vec![0.0; FRAME_SAMPLES];
+        mixer.fill_block(&mut out);
+
+        assert!(
+            out.iter().all(|&s| s == 0.5),
+            "steady-state envelope must be a no-op"
+        );
+    }
+
+    #[test]
+    fn mute_fades_out_and_unmute_fades_in() {
+        let mut mixer = LivePlaybackMixer::new();
+        let ring = ring_with(&[0.5; FRAME_SAMPLES * 3]);
+        mixer.ensure_stream(1, Arc::clone(&ring));
+
+        // Prime to full level.
+        let mut out = vec![0.0; FRAME_SAMPLES];
+        mixer.fill_block(&mut out);
+
+        // Muting tapers rather than cutting to silence instantly.
+        let control = |muted| PlaybackStreamControl {
+            muted,
+            volume_db: 0.0,
+        };
+        mixer.set_stream_control(1, control(true));
+        let mut out = vec![0.0; FRAME_SAMPLES];
+        mixer.fill_block(&mut out);
+        assert!(
+            out[0] > 0.45,
+            "mute fade starts from full level: {}",
+            out[0]
+        );
+        assert!(
+            out[LIVE_PLAYBACK_DECLICK_RAMP_SAMPLES..]
+                .iter()
+                .all(|&s| s == 0.0),
+            "mute reaches silence after the ramp"
+        );
+
+        // Unmuting fades back in from silence.
+        mixer.set_stream_control(1, control(false));
+        let mut out = vec![0.0; FRAME_SAMPLES];
+        mixer.fill_block(&mut out);
+        assert!(out[0] < 0.05, "unmute fades in from silence: {}", out[0]);
+        assert_eq!(
+            out[LIVE_PLAYBACK_DECLICK_RAMP_SAMPLES], 0.5,
+            "unmute reaches full level after the ramp"
+        );
     }
 }
