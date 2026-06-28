@@ -1,6 +1,6 @@
 use std::sync::{
     Arc,
-    atomic::{AtomicU32, Ordering},
+    atomic::{AtomicBool, AtomicU32, Ordering},
     mpsc::{Receiver, SyncSender},
 };
 
@@ -20,9 +20,11 @@ use crate::{
         resample::CaptureResampler,
         shared::{
             AudioStats, DenoiseConfig, DenoiseSuppression, DenoiseTypingSuppression, FRAME_SAMPLES,
-            LIVE_OPUS_FRAME_SAMPLES, LIVE_PACKET_FLAG_OPUS_RESET, LIVE_PACKET_FLAG_SILENCE_HINT,
+            LIVE_CAPTURE_MUTE_FADE, LIVE_OPUS_FRAME_SAMPLES, LIVE_PACKET_FLAG_MUTE,
+            LIVE_PACKET_FLAG_OPUS_RESET, LIVE_PACKET_FLAG_SILENCE_HINT,
             LIVE_PACKET_FLAG_SILENCE_RESUME, LiveAudioTuning, LiveEncoderProfile, LocalVoiceFrame,
-            MAX_OPUS_PACKET_BYTES, VoicePayload, convert_i16_scale_to_pcm_i16, vad_to_u8,
+            MAX_OPUS_PACKET_BYTES, VoicePayload, apply_gain_ramp, convert_i16_scale_to_pcm_i16,
+            mute_gain_step, samples_for_duration, vad_to_u8,
         },
     },
     network::{EncoderNetworkProfile, EncoderNetworkTuning},
@@ -67,6 +69,8 @@ pub(crate) fn run_live_encoder_worker<F>(
     denoise: DenoiseConfig,
     max_amplification_bits: Arc<AtomicU32>,
     encoder_loss_percent: Arc<AtomicU32>,
+    mic_muted: Arc<AtomicBool>,
+    deafened: Arc<AtomicBool>,
     tuning: LiveAudioTuning,
     suppression: DenoiseSuppression,
     typing_suppression: DenoiseTypingSuppression,
@@ -84,6 +88,8 @@ pub(crate) fn run_live_encoder_worker<F>(
         denoise,
         &max_amplification_bits,
         &encoder_loss_percent,
+        &mic_muted,
+        &deafened,
         tuning,
         suppression,
         typing_suppression,
@@ -157,6 +163,8 @@ pub(crate) fn run_live_encoder_worker_inner<F>(
     denoise: DenoiseConfig,
     max_amplification_bits: &AtomicU32,
     encoder_loss_percent: &AtomicU32,
+    mic_muted: &AtomicBool,
+    deafened: &AtomicBool,
     tuning: LiveAudioTuning,
     suppression: DenoiseSuppression,
     typing_suppression: DenoiseTypingSuppression,
@@ -178,6 +186,7 @@ where
         typing_suppression,
         echo_source,
         device_rate,
+        mic_muted.load(Ordering::Relaxed) || deafened.load(Ordering::Relaxed),
     );
     let mut applied_loss_percent = LiveEncoderProfile::DRED_20.packet_loss_percent;
 
@@ -189,9 +198,11 @@ where
             })?;
             applied_loss_percent = requested_loss_percent;
         }
+        let muted = mic_muted.load(Ordering::Relaxed) || deafened.load(Ordering::Relaxed);
         pipeline.push_chunk(
             &chunk,
             f32::from_bits(max_amplification_bits.load(Ordering::Relaxed)),
+            muted,
             stats,
             on_packet,
         )?;
@@ -226,6 +237,15 @@ pub(crate) struct LiveEncoderPipeline {
     sender_silence_active: bool,
     silence_keepalive_frames: usize,
     suppressed_frames: u64,
+    /// Moving mute gain: 1.0 fully open, 0.0 fully muted. It ramps toward the
+    /// current mute target over [`LIVE_CAPTURE_MUTE_FADE`], so muting fades out,
+    /// unmuting fades back in, and toggling mid-fade reverses without a step.
+    mute_gain: f32,
+    /// Per-sample ramp rate for `mute_gain`.
+    mute_gain_step: f32,
+    /// True once `mute_gain` has reached zero while muted, so the sender has
+    /// stopped encoding audio and is emitting only silence keepalive markers.
+    mute_suppressed: bool,
     echo_source: Option<EchoReferenceSource>,
 }
 
@@ -253,6 +273,7 @@ impl LiveEncoderPipeline {
         typing_suppression: DenoiseTypingSuppression,
         echo_source: Option<EchoReferenceSource>,
         device_rate: u32,
+        initial_muted: bool,
     ) -> Self {
         let echo_enabled = echo_source.as_ref().is_some_and(|source| source.enabled());
         let gain_max_db = if auto_gain_enabled {
@@ -282,6 +303,9 @@ impl LiveEncoderPipeline {
             sender_silence_active: false,
             silence_keepalive_frames: 0,
             suppressed_frames: 0,
+            mute_gain: if initial_muted { 0.0 } else { 1.0 },
+            mute_gain_step: mute_gain_step(samples_for_duration(LIVE_CAPTURE_MUTE_FADE)),
+            mute_suppressed: initial_muted,
             echo_source,
         }
     }
@@ -294,6 +318,7 @@ impl LiveEncoderPipeline {
         &mut self,
         chunk: &[f32],
         max_amplification: f32,
+        muted: bool,
         stats: &AudioStats,
         on_packet: &mut F,
     ) -> Result<(), String>
@@ -320,7 +345,7 @@ impl LiveEncoderPipeline {
         };
         let mut accumulator = self.take_accumulator();
         let result = accumulator.push_chunk(chunk, |frame| {
-            self.process_accumulated_frame(frame, stats, on_packet)
+            self.process_accumulated_frame(frame, muted, stats, on_packet)
         });
         self.accumulator = accumulator;
         if self.resampler.is_some() {
@@ -336,6 +361,7 @@ impl LiveEncoderPipeline {
     fn process_accumulated_frame<F>(
         &mut self,
         frame: &mut [f32],
+        muted: bool,
         stats: &AudioStats,
         on_packet: &mut F,
     ) -> Result<(), String>
@@ -344,7 +370,9 @@ impl LiveEncoderPipeline {
     {
         // One consolidated APM pass runs high-pass, AEC3, noise suppression, and
         // AGC2 in WebRTC order. The echo reference, present only while AEC is
-        // enabled, supplies the 48 kHz render frame to cancel against.
+        // enabled, supplies the 48 kHz render frame to cancel against. It runs
+        // even while muted so AEC3 and AGC2 keep adapting and the stream resumes
+        // cleanly on unmute.
         let reference = self
             .echo_source
             .as_ref()
@@ -366,7 +394,16 @@ impl LiveEncoderPipeline {
         stats.store_vad_probability(vad_probability);
         let vad = vad_to_u8(vad_probability);
         let silence = is_capture_skip_safe_silence(self.tuning, vad, frame);
-        stats.store_voice_active(!silence);
+        stats.store_voice_active(!muted && !silence);
+
+        // Mute takes precedence over the automatic silence gate: it transitions
+        // immediately rather than after the long-silence timeout, and works even
+        // when the gate is disabled. The fade-in/out and silence markers are
+        // handled here; only a fully-open, unmuted stream falls through to the
+        // normal gate path below.
+        if muted || self.mute_gain < 1.0 || self.mute_suppressed {
+            return self.process_mute_transition(frame, muted, stats, on_packet);
+        }
 
         let decision = self
             .long_silence
@@ -385,7 +422,7 @@ impl LiveEncoderPipeline {
             }
             CaptureGateDecision::SuppressCurrent => {
                 self.suppressed_frames = self.suppressed_frames.saturating_add(1);
-                self.maybe_emit_silence_marker(on_packet);
+                self.maybe_emit_silence_marker(0, on_packet);
             }
             CaptureGateDecision::Resume(frames) => {
                 self.reset_opus_stream()?;
@@ -396,6 +433,59 @@ impl LiveEncoderPipeline {
             }
         }
         Ok(())
+    }
+
+    /// Handles a captured frame during a mute fade-out, mute suppression, or
+    /// unmute fade-in. The mute gain ramps toward 0 (muted) or 1 (unmuted):
+    ///
+    /// - While fading out, the faded frame is transmitted flagged
+    ///   `MUTE | SILENCE_HINT` so the receiver fades the same tail and never treats
+    ///   the pause as loss.
+    /// - Once the gain reaches 0 the sender stops encoding and emits sparse
+    ///   `Silence` keepalive markers (flagged `MUTE`) that occupy the sequence
+    ///   numbers.
+    /// - On unmute it resumes from suppression with a fresh Opus stream
+    ///   (`OPUS_RESET | SILENCE_RESUME`) and fades the gain back in, so the tone
+    ///   returns smoothly. Toggling mid-fade simply reverses the gain with no step.
+    fn process_mute_transition<F>(
+        &mut self,
+        frame: &mut [f32],
+        muted: bool,
+        stats: &AudioStats,
+        on_packet: &mut F,
+    ) -> Result<(), String>
+    where
+        F: FnMut(LocalVoiceFrame),
+    {
+        let target = if muted { 0.0 } else { 1.0 };
+
+        if muted && self.mute_gain <= 0.0 {
+            // Fully faded out: stop encoding, emit only silence keepalives.
+            self.mute_suppressed = true;
+            self.suppressed_frames = self.suppressed_frames.saturating_add(1);
+            self.maybe_emit_silence_marker(LIVE_PACKET_FLAG_MUTE, on_packet);
+            return Ok(());
+        }
+
+        if self.mute_suppressed {
+            // Resuming after a suppressed pause: re-anchor the Opus stream so the
+            // first packet carries OPUS_RESET | SILENCE_RESUME, and drop the
+            // silence-gate state (its preroll holds stale pre-mute audio).
+            self.mute_suppressed = false;
+            self.reset_opus_stream()?;
+            if let Some(gate) = self.long_silence.as_mut() {
+                gate.reset();
+            }
+        }
+
+        let fading_out = target <= 0.0;
+        self.mute_gain = apply_gain_ramp(frame, self.mute_gain, target, self.mute_gain_step);
+        if fading_out {
+            // The receiver fades this tail too and skips concealment over it.
+            self.next_opus_packet_flags |= LIVE_PACKET_FLAG_MUTE | LIVE_PACKET_FLAG_SILENCE_HINT;
+        }
+        let frame = ProcessedCaptureFrame::new(frame);
+        self.queue_processed_capture_frame(frame, stats, on_packet)
     }
 
     fn queue_processed_capture_frame<F>(
@@ -435,7 +525,7 @@ impl LiveEncoderPipeline {
         Ok(())
     }
 
-    fn maybe_emit_silence_marker<F>(&mut self, on_packet: &mut F)
+    fn maybe_emit_silence_marker<F>(&mut self, extra_flags: u8, on_packet: &mut F)
     where
         F: FnMut(LocalVoiceFrame),
     {
@@ -450,7 +540,7 @@ impl LiveEncoderPipeline {
             self.silence_resume_hint_packets = SILENCE_RESUME_HINT_PACKETS;
         }
         on_packet(LocalVoiceFrame {
-            flags: LIVE_PACKET_FLAG_SILENCE_HINT,
+            flags: LIVE_PACKET_FLAG_SILENCE_HINT | extra_flags,
             payload: VoicePayload::Silence,
         });
     }
@@ -491,6 +581,26 @@ pub(crate) fn build_live_encoder_pipeline(
     network_profile: EncoderNetworkProfile,
     echo_reference: Option<Arc<EchoReference>>,
 ) -> Result<LiveEncoderPipeline, String> {
+    build_live_encoder_pipeline_with_initial_mute(
+        tuning,
+        denoise_enabled,
+        max_amplification,
+        auto_gain_enabled,
+        network_profile,
+        echo_reference,
+        false,
+    )
+}
+
+pub(crate) fn build_live_encoder_pipeline_with_initial_mute(
+    tuning: LiveAudioTuning,
+    denoise_enabled: bool,
+    max_amplification: f32,
+    auto_gain_enabled: bool,
+    network_profile: EncoderNetworkProfile,
+    echo_reference: Option<Arc<EchoReference>>,
+    initial_muted: bool,
+) -> Result<LiveEncoderPipeline, String> {
     // The simulation and benchmark callers express denoise as on/off; on maps to
     // the default RNNoise engine.
     let denoise = if denoise_enabled {
@@ -510,6 +620,7 @@ pub(crate) fn build_live_encoder_pipeline(
         DenoiseTypingSuppression::DISABLED,
         echo_reference.map(EchoReferenceSource::Always),
         crate::audio::shared::SAMPLE_RATE,
+        initial_muted,
     ))
 }
 
@@ -599,6 +710,7 @@ mod tests {
                 .push_chunk(
                     &chunk,
                     DEFAULT_LIVE_MAX_AMPLIFICATION,
+                    false,
                     &stats,
                     &mut |packet| packets.push(packet),
                 )
@@ -678,6 +790,7 @@ mod tests {
                 .push_chunk(
                     &speech,
                     DEFAULT_LIVE_MAX_AMPLIFICATION,
+                    false,
                     &stats,
                     &mut |packet| packets.push(packet),
                 )
@@ -688,6 +801,7 @@ mod tests {
                 .push_chunk(
                     &silence,
                     DEFAULT_LIVE_MAX_AMPLIFICATION,
+                    false,
                     &stats,
                     &mut |packet| packets.push(packet),
                 )
@@ -698,6 +812,7 @@ mod tests {
                 .push_chunk(
                     &speech,
                     DEFAULT_LIVE_MAX_AMPLIFICATION,
+                    false,
                     &stats,
                     &mut |packet| packets.push(packet),
                 )
@@ -772,7 +887,7 @@ mod tests {
         pipeline.silence_resume_hint_packets = 0;
         pipeline.sender_silence_active = false;
 
-        pipeline.maybe_emit_silence_marker(&mut |packet| silence_packets.push(packet));
+        pipeline.maybe_emit_silence_marker(0, &mut |packet| silence_packets.push(packet));
 
         assert_eq!(silence_packets.len(), 1);
         assert_ne!(silence_packets[0].flags & LIVE_PACKET_FLAG_SILENCE_HINT, 0);
@@ -803,6 +918,218 @@ mod tests {
         assert_eq!(first_opus.flags & LIVE_PACKET_FLAG_OPUS_RESET, 0);
     }
 
+    fn high_energy_speech_chunk() -> Vec<f32> {
+        let sampled = sample_high_energy_speech_frame()
+            .iter()
+            .map(|sample| (sample * 6.0).clamp(-1.0, 1.0))
+            .collect::<Vec<_>>();
+        normalized_to_i16_scale(&sampled)
+    }
+
+    /// Runs an unmuted -> muted -> unmuted episode, returning the emitted packets
+    /// and the index at which the post-unmute (resume) packets begin.
+    fn drive_mute_episode(silence_gate: bool) -> (Vec<LocalVoiceFrame>, usize) {
+        let mut tuning = test_tuning();
+        tuning.capture_silence_gate = silence_gate;
+        let mut pipeline = build_live_encoder_pipeline(
+            tuning,
+            false,
+            DEFAULT_LIVE_MAX_AMPLIFICATION,
+            true,
+            EncoderNetworkProfile::EXCELLENT,
+            None,
+        )
+        .unwrap();
+        let stats = AudioStats::new();
+        let speech = high_energy_speech_chunk();
+        let mut packets = Vec::new();
+        let push = |pipeline: &mut LiveEncoderPipeline, muted, packets: &mut Vec<_>| {
+            pipeline
+                .push_chunk(
+                    &speech,
+                    DEFAULT_LIVE_MAX_AMPLIFICATION,
+                    muted,
+                    &stats,
+                    &mut |p| packets.push(p),
+                )
+                .unwrap();
+        };
+
+        // Warm up unmuted, then mute for long enough to exit the fade and emit a
+        // silence marker, then unmute again.
+        for _ in 0..6 {
+            push(&mut pipeline, false, &mut packets);
+        }
+        for _ in 0..40 {
+            push(&mut pipeline, true, &mut packets);
+        }
+        let resume_start = packets.len();
+        for _ in 0..4 {
+            push(&mut pipeline, false, &mut packets);
+        }
+        (packets, resume_start)
+    }
+
+    #[test]
+    fn mute_fades_then_emits_silence_markers_and_resumes() {
+        let (packets, resume_start) = drive_mute_episode(true);
+
+        // The fade tail is whole Opus packets bounded by the 60 ms fade window
+        // (3 x 20 ms), each carrying the mute flag.
+        let mute_opus = packets
+            .iter()
+            .filter(|p| p.flags & LIVE_PACKET_FLAG_MUTE != 0)
+            .filter(|p| matches!(p.payload, VoicePayload::Opus(_)))
+            .count();
+        assert!(
+            (1..=3).contains(&mute_opus),
+            "expected 1..=3 faded mute Opus packets, got {mute_opus}"
+        );
+        assert!(
+            packets.iter().any(|p| p.flags & LIVE_PACKET_FLAG_MUTE != 0
+                && matches!(p.payload, VoicePayload::Silence)),
+            "mute should drop to silence markers after the fade tail"
+        );
+        assert!(
+            packets.iter().all(|p| {
+                p.flags & LIVE_PACKET_FLAG_MUTE == 0 || p.flags & LIVE_PACKET_FLAG_SILENCE_HINT != 0
+            }),
+            "mute packets must also carry the silence hint so the jitter buffer skips them"
+        );
+
+        // The first Opus packet after unmute re-anchors the Opus stream.
+        let resume = packets[resume_start..]
+            .iter()
+            .find(|p| matches!(p.payload, VoicePayload::Opus(_)))
+            .expect("unmute should produce an Opus packet");
+        assert_ne!(
+            resume.flags & LIVE_PACKET_FLAG_OPUS_RESET,
+            0,
+            "resume packet should reset the Opus stream"
+        );
+        assert_ne!(
+            resume.flags & LIVE_PACKET_FLAG_SILENCE_RESUME,
+            0,
+            "resume packet should advertise the mute pause it follows"
+        );
+        assert_eq!(
+            resume.flags & LIVE_PACKET_FLAG_MUTE,
+            0,
+            "resumed speech must not still be flagged as muted"
+        );
+    }
+
+    #[test]
+    fn brief_mute_toggle_stays_continuous() {
+        // Muting then unmuting before the fade completes must keep the Opus stream
+        // continuous: no suppression, no reset, no silence marker. A reset on a
+        // held tone is exactly what produces a click on a rapid toggle.
+        let mut pipeline = build_live_encoder_pipeline(
+            test_tuning(),
+            false,
+            DEFAULT_LIVE_MAX_AMPLIFICATION,
+            true,
+            EncoderNetworkProfile::EXCELLENT,
+            None,
+        )
+        .unwrap();
+        let stats = AudioStats::new();
+        let speech = high_energy_speech_chunk();
+        let mut packets = Vec::new();
+        let push = |pipeline: &mut LiveEncoderPipeline, muted, packets: &mut Vec<_>| {
+            pipeline
+                .push_chunk(
+                    &speech,
+                    DEFAULT_LIVE_MAX_AMPLIFICATION,
+                    muted,
+                    &stats,
+                    &mut |p| packets.push(p),
+                )
+                .unwrap();
+        };
+
+        for _ in 0..6 {
+            push(&mut pipeline, false, &mut packets);
+        }
+        let mark = packets.len();
+        // Two muted frames begin the 60 ms fade but never reach silence.
+        for _ in 0..2 {
+            push(&mut pipeline, true, &mut packets);
+        }
+        for _ in 0..8 {
+            push(&mut pipeline, false, &mut packets);
+        }
+
+        let after = &packets[mark..];
+        assert!(
+            after
+                .iter()
+                .all(|p| !matches!(p.payload, VoicePayload::Silence)),
+            "a brief toggle must not drop to silence markers"
+        );
+        assert!(
+            after
+                .iter()
+                .all(|p| p.flags & LIVE_PACKET_FLAG_OPUS_RESET == 0),
+            "a brief toggle must not reset the Opus stream (would click)"
+        );
+        assert!(
+            after.iter().any(|p| p.flags & LIVE_PACKET_FLAG_MUTE != 0),
+            "the brief fade-out should still be flagged so the receiver fades it"
+        );
+    }
+
+    #[test]
+    fn mute_works_with_silence_gate_disabled() {
+        // Mute must not depend on the optional long-silence gate.
+        let (packets, _) = drive_mute_episode(false);
+        assert!(
+            packets.iter().any(|p| p.flags & LIVE_PACKET_FLAG_MUTE != 0
+                && matches!(p.payload, VoicePayload::Silence)),
+            "mute should still emit silence markers when the capture gate is off"
+        );
+        assert!(
+            packets
+                .iter()
+                .any(|p| p.flags & LIVE_PACKET_FLAG_OPUS_RESET != 0
+                    && p.flags & LIVE_PACKET_FLAG_SILENCE_RESUME != 0),
+            "mute should still resume cleanly when the capture gate is off"
+        );
+    }
+
+    #[test]
+    fn mute_fade_tail_ramps_down_to_silence() {
+        // The concatenated fade tail must end near silence: a soft ramp rather
+        // than a hard cut, so the receiver hears no click into the mute.
+        let (packets, _) = drive_mute_episode(false);
+        let mut decoder = Decoder::new(SampleRate::Hz48000, Channels::Mono).unwrap();
+        let mut output = vec![0.0f32; LIVE_OPUS_FRAME_SAMPLES];
+        let mut tail = Vec::new();
+        for packet in &packets {
+            let VoicePayload::Opus(payload) = &packet.payload else {
+                continue;
+            };
+            let decoded = decoder.decode_float(payload, &mut output, false).unwrap();
+            if packet.flags & LIVE_PACKET_FLAG_MUTE != 0 {
+                tail.extend_from_slice(&output[..decoded]);
+            }
+        }
+        assert!(!tail.is_empty(), "no faded tail packets were produced");
+        // Opus decode is not sample-accurate, so assert a substantial decay rather
+        // than exact silence; the precise envelope is unit-tested on the fade
+        // helper itself in `shared`.
+        let last = &tail[tail.len().saturating_sub(FRAME_SAMPLES / 2)..];
+        let tail_peak = last.iter().fold(0.0f32, |acc, s| acc.max(s.abs()));
+        let start_peak = tail
+            .iter()
+            .take(FRAME_SAMPLES)
+            .fold(0.0f32, |acc, s| acc.max(s.abs()));
+        assert!(
+            tail_peak < start_peak * 0.5,
+            "fade tail must decay toward silence (start peak {start_peak}, end peak {tail_peak})"
+        );
+    }
+
     #[test]
     fn live_encoder_pipeline_resamples_non_48k_capture() {
         // A 44.1 kHz device is resampled to 48 kHz before the pipeline, so a
@@ -818,6 +1145,7 @@ mod tests {
             DenoiseTypingSuppression::DISABLED,
             None,
             44_100,
+            false,
         );
         let stats = AudioStats::new();
         let mut packets = Vec::new();
@@ -830,6 +1158,7 @@ mod tests {
                 .push_chunk(
                     chunk,
                     DEFAULT_LIVE_MAX_AMPLIFICATION,
+                    false,
                     &stats,
                     &mut |packet| packets.push(packet),
                 )
@@ -906,31 +1235,44 @@ mod tests {
             DenoiseTypingSuppression::DISABLED,
             Some(EchoReferenceSource::Controlled(Arc::clone(&control))),
             crate::audio::shared::SAMPLE_RATE,
+            false,
         );
         let stats = AudioStats::new();
         let chunk = vec![0.0; FRAME_SAMPLES];
         let mut packets = 0;
 
         pipeline
-            .push_chunk(&chunk, DEFAULT_LIVE_MAX_AMPLIFICATION, &stats, &mut |_| {
-                packets += 1
-            })
+            .push_chunk(
+                &chunk,
+                DEFAULT_LIVE_MAX_AMPLIFICATION,
+                false,
+                &stats,
+                &mut |_| packets += 1,
+            )
             .unwrap();
         assert!(!pipeline.aec_enabled());
 
         control.set_enabled(true);
         pipeline
-            .push_chunk(&chunk, DEFAULT_LIVE_MAX_AMPLIFICATION, &stats, &mut |_| {
-                packets += 1
-            })
+            .push_chunk(
+                &chunk,
+                DEFAULT_LIVE_MAX_AMPLIFICATION,
+                false,
+                &stats,
+                &mut |_| packets += 1,
+            )
             .unwrap();
         assert!(pipeline.aec_enabled());
 
         control.set_enabled(false);
         pipeline
-            .push_chunk(&chunk, DEFAULT_LIVE_MAX_AMPLIFICATION, &stats, &mut |_| {
-                packets += 1
-            })
+            .push_chunk(
+                &chunk,
+                DEFAULT_LIVE_MAX_AMPLIFICATION,
+                false,
+                &stats,
+                &mut |_| packets += 1,
+            )
             .unwrap();
         assert!(!pipeline.aec_enabled());
         assert!(packets <= 1);

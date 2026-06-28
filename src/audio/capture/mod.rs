@@ -8,7 +8,8 @@ pub use echo::EchoCancellationControl;
 pub(crate) use echo::{EchoReference, EchoReferenceSource};
 pub(crate) use encoder::OpusVoiceEncoder;
 pub(crate) use pipeline::{
-    LiveEncoderPipeline, build_live_encoder_pipeline, run_encoder_worker, run_live_encoder_worker,
+    LiveEncoderPipeline, build_live_encoder_pipeline_with_initial_mute, run_encoder_worker,
+    run_live_encoder_worker,
 };
 
 #[cfg(test)]

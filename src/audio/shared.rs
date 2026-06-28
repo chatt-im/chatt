@@ -152,6 +152,10 @@ pub(crate) const LIVE_PACKET_FLAG_OPUS_RESET: u8 = 0x01;
 pub(crate) const LIVE_PACKET_FLAG_SILENCE_HINT: u8 = 0x02;
 /// Sender has resumed after a silence-suppressed pause.
 pub(crate) const LIVE_PACKET_FLAG_SILENCE_RESUME: u8 = 0x04;
+/// The silence (or fade-out tail) is an intentional microphone mute rather than
+/// an automatic silence-suppressed pause. The receiver uses this to fade the
+/// tail and to suppress loss concealment without waiting for the control stream.
+pub(crate) const LIVE_PACKET_FLAG_MUTE: u8 = 0x08;
 pub(crate) const CALLBACK_QUEUE_CAPACITY: usize = 8;
 pub(crate) const LIVE_PLAYBACK_COMMAND_CAPACITY: usize = 256;
 pub(crate) const LIVE_PLAYBACK_TARGET_QUEUE: Duration = Duration::from_millis(60);
@@ -223,6 +227,11 @@ pub(crate) const DELAY_RESAMPLE_INTERVAL: Duration = Duration::from_millis(500);
 pub(crate) const LIVE_CAPTURE_LONG_SILENCE_STOP: Duration = Duration::from_secs(2);
 pub(crate) const LIVE_CAPTURE_SILENCE_PREROLL: Duration = Duration::from_millis(30);
 pub(crate) const LIVE_CAPTURE_SILENCE_RAMP: Duration = Duration::from_millis(10);
+// Smoothstep-shaped fade applied to outgoing voice when the microphone is muted,
+// before the sender drops to silence markers. Kept a multiple of the 20 ms Opus
+// frame so the fade tail packetizes into whole packets. The receiver fades the
+// same window again so a lost tail packet still ends on a soft boundary.
+pub(crate) const LIVE_CAPTURE_MUTE_FADE: Duration = Duration::from_millis(60);
 pub(crate) const MAX_OPUS_DECODE_SAMPLES: usize = 5_760;
 pub(crate) const MAX_OPUS_PACKET_BYTES: usize = 1_500;
 
@@ -763,6 +772,34 @@ pub(crate) fn samples_for_duration(duration: Duration) -> usize {
     (duration.as_secs_f64() * SAMPLE_RATE as f64).round() as usize
 }
 
+/// Ramps a per-sample gain from `gain` toward `target` at `step` per sample,
+/// multiplying it into `samples`, and returns the gain after the block. Used for
+/// the mute fade on both the capture and playback sides: a single moving gain
+/// fades out on mute and back in on unmute, and a toggle mid-fade simply reverses
+/// from the current gain with no step discontinuity (a one-shot cursor cannot).
+pub(crate) fn apply_gain_ramp(samples: &mut [f32], mut gain: f32, target: f32, step: f32) -> f32 {
+    for sample in samples.iter_mut() {
+        if gain < target {
+            gain = (gain + step).min(target);
+        } else if gain > target {
+            gain = (gain - step).max(target);
+        }
+        let shaped = gain * gain * (3.0 - 2.0 * gain);
+        *sample *= shaped;
+    }
+    gain
+}
+
+/// Per-sample step that ramps a gain across `fade` toward its target over the
+/// mute fade window. A zero window snaps immediately.
+pub(crate) fn mute_gain_step(fade_samples: usize) -> f32 {
+    if fade_samples == 0 {
+        1.0
+    } else {
+        1.0 / fade_samples as f32
+    }
+}
+
 pub(crate) fn frames_for_duration(duration: Duration) -> usize {
     samples_for_duration(duration).saturating_add(FRAME_SAMPLES.saturating_sub(1)) / FRAME_SAMPLES
 }
@@ -1104,5 +1141,31 @@ mod tests {
         );
 
         assert_eq!(output, [i16::MIN, i16::MIN, 16_384, 16_385, i16::MAX]);
+    }
+
+    #[test]
+    fn gain_ramp_fades_out_then_back_in_without_steps() {
+        let step = mute_gain_step(8);
+        // Fade out from unity toward zero across two blocks.
+        let mut block = vec![1.0f32; 8];
+        let gain = apply_gain_ramp(&mut block, 1.0, 0.0, step);
+        assert!(gain <= 0.0, "fade-out should reach zero, got {gain}");
+        for pair in block.windows(2) {
+            assert!(pair[1] <= pair[0], "fade-out must be monotonic: {block:?}");
+        }
+
+        // Reversing mid-fade ramps back up from the current gain (no jump to 1).
+        let mut up = vec![1.0f32; 4];
+        let resumed = apply_gain_ramp(&mut up, 0.0, 1.0, step);
+        assert!(up[0] > 0.0 && up[0] < 0.5, "fade-in starts low: {up:?}");
+        assert!(resumed > 0.0 && resumed <= 1.0);
+    }
+
+    #[test]
+    fn gain_ramp_holds_when_at_target() {
+        let mut samples = vec![0.5f32; 4];
+        let gain = apply_gain_ramp(&mut samples, 1.0, 1.0, mute_gain_step(8));
+        assert_eq!(gain, 1.0);
+        assert!(samples.iter().all(|&s| s == 0.5), "{samples:?}");
     }
 }

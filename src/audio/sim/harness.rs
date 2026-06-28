@@ -7,7 +7,9 @@ use std::{
 
 use crate::{
     audio::{
-        capture::{EchoReference, LiveEncoderPipeline, build_live_encoder_pipeline},
+        capture::{
+            EchoReference, LiveEncoderPipeline, build_live_encoder_pipeline_with_initial_mute,
+        },
         playback::{LiveDecodeStreams, LivePlaybackMixer},
         shared::{
             AudioStats, FRAME_SAMPLES, LIVE_OPUS_FRAME_SAMPLES, LiveAudioTraceWriter,
@@ -218,7 +220,6 @@ pub(crate) fn run_live_audio_direct_sample_simulation_output_inner(
             "direct sample simulation needs at least {FRAME_SAMPLES} samples"
         ));
     }
-
     let frame_count = input_pcm.len().div_ceil(FRAME_SAMPLES);
     let frame_duration = Duration::from_secs_f64(FRAME_SAMPLES as f64 / SAMPLE_RATE as f64);
     let input_duration = frame_duration.saturating_mul(frame_count as u32);
@@ -781,6 +782,9 @@ pub(crate) struct SimStreamState {
     loss: SimLossState,
     pub(crate) network: SimNetworkPipe,
     pub(crate) next_sequence: u32,
+    /// Microphone mute state fed into the capture pipeline, letting simulations
+    /// drive the mute fade / silence-marker transition deterministically.
+    pub(crate) capture_muted: bool,
 }
 
 impl SimStreamState {
@@ -789,19 +793,30 @@ impl SimStreamState {
         network_profile: EncoderNetworkProfile,
         echo_reference: Option<Arc<EchoReference>>,
     ) -> Result<Self, String> {
+        Self::new_with_initial_mute(config, network_profile, echo_reference, false)
+    }
+
+    pub(crate) fn new_with_initial_mute(
+        config: LiveAudioSimulationConfig,
+        network_profile: EncoderNetworkProfile,
+        echo_reference: Option<Arc<EchoReference>>,
+        initial_capture_muted: bool,
+    ) -> Result<Self, String> {
         Ok(Self {
-            capture: build_live_encoder_pipeline(
+            capture: build_live_encoder_pipeline_with_initial_mute(
                 config.tuning,
                 config.denoise,
                 config.max_amplification,
                 config.auto_gain,
                 network_profile,
                 echo_reference,
+                initial_capture_muted,
             )?,
             capture_stats: AudioStats::new(),
             loss: SimLossState::default(),
             network: SimNetworkPipe::default(),
             next_sequence: 0,
+            capture_muted: initial_capture_muted,
         })
     }
 
@@ -829,6 +844,7 @@ impl SimStreamState {
         self.capture.push_chunk(
             &chunk,
             config.max_amplification,
+            self.capture_muted,
             &self.capture_stats,
             &mut |packet| emitted.push(packet),
         )?;
@@ -1177,6 +1193,107 @@ mod tests {
                 || trace.contains("\"event\":\"plc_decode\"")
                 || trace.contains("\"event\":\"dred_decode\""),
             "trace did not include loss recovery events:\n{trace}"
+        );
+    }
+
+    #[test]
+    fn continuous_tone_mute_toggle_mixed_output_stays_declicked() {
+        let tuning = test_tuning();
+        let config = LiveAudioSimulationConfig {
+            scenario: LiveAudioSimulationScenario::LossySpeech,
+            tuning,
+            duration: Duration::from_secs(3),
+            producer_clock_ratio: 1.0,
+            output_block_samples: LIVE_OPUS_FRAME_SAMPLES,
+            streams: 1,
+            seed: 0x5eed_5eed,
+            packet_loss: LiveAudioPacketLossProfile::None,
+            max_amplification: 1.0,
+            denoise: false,
+            auto_gain: false,
+            echo_cancellation: false,
+            capture_dc_offset: 0.0,
+            capture_noise_rms: 0.0,
+        };
+        let mut state =
+            SimStreamState::new(config, simulation_encoder_profile(config), None).unwrap();
+        let mixer = Arc::new(Mutex::new(LivePlaybackMixer::with_tuning(tuning)));
+        let mut decode_streams = LiveDecodeStreams::new(tuning);
+        decode_streams.set_block_samples(LIVE_OPUS_FRAME_SAMPLES);
+        let mut report = LiveAudioSimulationReport {
+            scenario: "tone_mute_toggle",
+            ..Default::default()
+        };
+        let mut rng = SimRng::new(config.seed);
+        let mut trace = None;
+        let start = Instant::now();
+        let frame_duration = Duration::from_secs_f64(FRAME_SAMPLES as f64 / SAMPLE_RATE as f64);
+        let total_frames = 300usize;
+        let drain_frames = frames_for_duration(
+            tuning
+                .initial_buffer
+                .saturating_add(tuning.max_reorder_delay)
+                .saturating_add(tuning.target_queue)
+                .saturating_add(Duration::from_millis(300)),
+        );
+        let mut output = Vec::new();
+
+        for frame_index in 0..total_frames.saturating_add(drain_frames) {
+            let now = start + frame_duration.saturating_mul(frame_index as u32);
+            if frame_index < total_frames {
+                state.capture_muted = (90..150).contains(&frame_index);
+                let sample_offset = frame_index * FRAME_SAMPLES;
+                let frame = (0..FRAME_SAMPLES)
+                    .map(|index| {
+                        let n = sample_offset + index;
+                        (2.0 * std::f64::consts::PI * 1_000.0 * n as f64 / SAMPLE_RATE as f64).sin()
+                            as f32
+                            * 0.45
+                    })
+                    .collect::<Vec<_>>();
+                report.generated_frames = report.generated_frames.saturating_add(1);
+                state
+                    .encode_and_queue_frame(
+                        config,
+                        1,
+                        frame_index,
+                        &frame,
+                        now,
+                        start,
+                        &mut rng,
+                        &mut report,
+                        &mut trace,
+                    )
+                    .unwrap();
+            }
+
+            drain_simulation_network_and_playback(
+                now,
+                start,
+                std::slice::from_mut(&mut state),
+                &mixer,
+                &mut decode_streams,
+                &mut report,
+                &mut trace,
+            );
+
+            if frame_index % (LIVE_OPUS_FRAME_SAMPLES / FRAME_SAMPLES) == 0 {
+                let mut mixer = mixer.lock().unwrap();
+                for _ in 0..LIVE_OPUS_FRAME_SAMPLES {
+                    output.push(mixer.pop_mixed_output_sample(now, LIVE_OPUS_FRAME_SAMPLES));
+                }
+            }
+        }
+
+        let max_delta = max_adjacent_delta(&output);
+        assert!(
+            max_delta <= 0.35,
+            "mute/unmute produced an output discontinuity: max_delta={max_delta:.3}, report={report:?}"
+        );
+        assert_eq!(
+            decode_streams.stats().plc_fallbacks,
+            0,
+            "mute/unmute on loopback should not invoke PLC"
         );
     }
 

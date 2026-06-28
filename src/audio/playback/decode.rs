@@ -4,7 +4,7 @@ use std::{
         atomic::{AtomicUsize, Ordering},
         mpsc::{Receiver, RecvTimeoutError, Sender},
     },
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use hashbrown::{HashMap, HashSet};
@@ -19,14 +19,15 @@ use crate::{
             SpscSwapQueue,
         },
         shared::{
-            DecodedFrameSource, FRAME_SAMPLES, LIVE_OPUS_FRAME_SAMPLES,
-            LIVE_PACKET_FLAG_OPUS_RESET, LIVE_PACKET_FLAG_SILENCE_RESUME,
+            DecodedFrameSource, FRAME_SAMPLES, LIVE_CAPTURE_MUTE_FADE, LIVE_OPUS_FRAME_SAMPLES,
+            LIVE_PACKET_FLAG_MUTE, LIVE_PACKET_FLAG_OPUS_RESET, LIVE_PACKET_FLAG_SILENCE_RESUME,
             LIVE_PLAYBACK_DRAIN_INTERVAL, LIVE_PLAYBACK_DRED_MAX_SAMPLES, LiveAudioTraceWriter,
             LiveAudioTuning, LivePlaybackFeedback, LivePlaybackSnapshot,
             LivePlaybackStreamActivity, MAX_OPUS_DECODE_SAMPLES, PlayoutDelay, RemoteVoicePacket,
-            VoicePayload, duration_to_ms, samples_for_duration, samples_to_ms,
-            sequence_distance_forward, trace_decode_output, trace_decoder_reset, trace_dred_parse,
-            trace_dred_skip, trace_fast_forward, trace_jitter_item, trace_mixer_queue,
+            VoicePayload, apply_gain_ramp, duration_to_ms, mute_gain_step, samples_for_duration,
+            samples_to_ms, sequence_distance_forward, trace_decode_output, trace_decoder_reset,
+            trace_dred_parse, trace_dred_skip, trace_fast_forward, trace_jitter_item,
+            trace_mixer_queue,
         },
     },
     network::{AudioPacketRef, InsertOutcome, PlayoutItem},
@@ -118,6 +119,9 @@ pub(crate) fn handle_live_playback_command(
                 &mut streams.dropped_mixer_events,
                 LivePlaybackMixerEvent::SetStreamControl { stream_id, control },
             );
+        }
+        LivePlaybackCommand::SetSenderMuted { stream_id, muted } => {
+            streams.set_sender_muted(stream_id, muted);
         }
         LivePlaybackCommand::PlayNotification(samples) => {
             streams.play_notification(&samples, mixer_events);
@@ -325,7 +329,8 @@ impl LiveDecodeStreams {
         }
         let stream = self.streams.get_mut(&packet.stream_id)?;
         if packet.payload.is_silence() {
-            stream.observe_sender_silence(packet.sequence, now);
+            let muted = packet.flags & LIVE_PACKET_FLAG_MUTE != 0;
+            stream.observe_sender_silence(packet.sequence, muted, now);
             return Some(InsertOutcome::Accepted);
         }
         let packet_ref = AudioPacketRef {
@@ -340,6 +345,14 @@ impl LiveDecodeStreams {
         self.streams.remove(&stream_id);
         self.producers.remove(&stream_id);
         self.mixer_streams.remove(&stream_id);
+    }
+
+    /// Applies a control-stream mute update to a known stream. Unknown streams are
+    /// ignored: the media path re-establishes the state when the stream appears.
+    pub(crate) fn set_sender_muted(&mut self, stream_id: u32, muted: bool) {
+        if let Some(stream) = self.streams.get_mut(&stream_id) {
+            stream.set_control_muted(muted);
+        }
     }
 
     /// Producer step on the real worker: decode, pump every stream into its
@@ -525,6 +538,33 @@ pub(crate) struct LiveDecodeStream {
     feedback: LivePlaybackFeedbackState,
     output_frame: Vec<f32>,
     sender_silence_pending: bool,
+    /// True while the sender is muted (learned from `LIVE_PACKET_FLAG_MUTE` on the
+    /// media stream, or from the control stream as a fallback). Suppresses loss
+    /// concealment, since a muted sender produces no speech to recover.
+    sender_muted: bool,
+    /// True only when the current mute state was established by in-band media.
+    /// This prevents a later-arriving control command from re-arming fallback
+    /// after media already supplied the authoritative boundary.
+    media_muted: bool,
+    /// Pending control-stream mute state, applied on the next drain so the
+    /// worker can timestamp fallback activation against its own clock.
+    control_muted_pending: Option<bool>,
+    /// Last mute state received over the control stream. This is intentionally
+    /// not media-authoritative: it only arms a delayed fallback for missing
+    /// in-band mute markers.
+    control_muted: bool,
+    /// Deadline for the control-stream fallback to activate if no in-band mute
+    /// marker arrives first.
+    control_mute_fallback_at: Option<Instant>,
+    /// True once the control fallback, rather than an in-band media marker, is
+    /// currently holding the sender muted.
+    control_fallback_active: bool,
+    /// Moving receiver mute gain: ramps toward 0 while the sender is muted and
+    /// back to 1 otherwise, so a lost tail packet still ends softly and an unmute
+    /// fades back in. Mirrors the capture-side `mute_gain`.
+    mute_gain: f32,
+    /// Per-sample ramp rate for `mute_gain`.
+    mute_gain_step: f32,
 }
 
 impl LiveDecodeStream {
@@ -540,6 +580,14 @@ impl LiveDecodeStream {
             feedback: LivePlaybackFeedbackState::default(),
             output_frame: vec![0.0; MAX_OPUS_DECODE_SAMPLES],
             sender_silence_pending: false,
+            sender_muted: false,
+            media_muted: false,
+            control_muted_pending: None,
+            control_muted: false,
+            control_mute_fallback_at: None,
+            control_fallback_active: false,
+            mute_gain: 1.0,
+            mute_gain_step: mute_gain_step(samples_for_duration(LIVE_CAPTURE_MUTE_FADE)),
         })
     }
 
@@ -555,11 +603,59 @@ impl LiveDecodeStream {
         outcome
     }
 
-    pub(crate) fn observe_sender_silence(&mut self, sequence: u32, now: Instant) {
+    pub(crate) fn observe_sender_silence(&mut self, sequence: u32, muted: bool, now: Instant) {
         self.jitter.observe_sender_silence(sequence);
         self.feedback.observe_sender_silence(sequence, now);
         self.sender_silence_pending = true;
+        self.sender_muted = muted;
+        self.media_muted = muted;
+        if muted {
+            self.control_mute_fallback_at = None;
+            self.control_fallback_active = false;
+        }
         self.dred_gap = None;
+    }
+
+    /// Records a mute state learned from the control stream, applied on the next
+    /// drain. Control mute is a fallback for lost in-band media markers, not an
+    /// immediate playback boundary: TCP/control and UDP media are not causally
+    /// ordered.
+    pub(crate) fn set_control_muted(&mut self, muted: bool) {
+        self.control_muted_pending = Some(muted);
+    }
+
+    fn control_mute_fallback_delay(&self) -> Duration {
+        LIVE_CAPTURE_MUTE_FADE.saturating_add(self.tuning.max_reorder_delay)
+    }
+
+    fn apply_control_mute_pending(&mut self, now: Instant) {
+        let Some(muted) = self.control_muted_pending.take() else {
+            return;
+        };
+        self.control_muted = muted;
+        if muted {
+            self.control_mute_fallback_at =
+                (!self.media_muted).then_some(now + self.control_mute_fallback_delay());
+        } else {
+            self.control_mute_fallback_at = None;
+            self.control_fallback_active = false;
+        }
+    }
+
+    fn activate_control_mute_fallback_if_due(&mut self, now: Instant) {
+        let Some(deadline) = self.control_mute_fallback_at else {
+            return;
+        };
+        if !self.control_muted || now < deadline {
+            return;
+        }
+        self.control_mute_fallback_at = None;
+        self.control_fallback_active = true;
+        self.media_muted = false;
+        if !self.sender_muted {
+            self.sender_muted = true;
+            self.sender_silence_pending = true;
+        }
     }
 
     pub(crate) fn drain_ready<F>(
@@ -572,6 +668,9 @@ impl LiveDecodeStream {
     ) where
         F: FnMut(&mut Option<LiveAudioTraceWriter>, DrainEvent<'_>),
     {
+        self.apply_control_mute_pending(now);
+        self.activate_control_mute_fallback_if_due(now);
+
         if self.sender_silence_pending {
             self.sender_silence_pending = false;
             on_event(trace, DrainEvent::SenderSilence);
@@ -609,9 +708,25 @@ impl LiveDecodeStream {
                         }
                         trace_decoder_reset(trace, trace_start, now, stream_id, *sequence);
                     }
+                    // A mute fade-out tail frame drives the gain toward zero. If
+                    // all in-band mute markers were lost, an activated control
+                    // fallback also fades later audio down instead of treating it
+                    // as ordinary speech. A merely pending control mute does not
+                    // affect media, because control and media are not ordered.
+                    let media_muted = flags & LIVE_PACKET_FLAG_MUTE != 0;
+                    if media_muted {
+                        self.control_mute_fallback_at = None;
+                        self.control_fallback_active = false;
+                    }
+                    self.media_muted = media_muted;
+                    let effective_muted =
+                        media_muted || (self.control_muted && self.control_fallback_active);
+                    self.sender_muted = effective_muted;
+                    let mute_target = if effective_muted { 0.0 } else { 1.0 };
                     self.decode_playout(
                         payload,
                         DecodedFrameSource::Normal,
+                        mute_target,
                         trace_start,
                         now,
                         stream_id,
@@ -623,6 +738,12 @@ impl LiveDecodeStream {
                 }
                 PlayoutItem::Missing { sequence } => {
                     trace_jitter_item(trace, trace_start, now, stream_id, *sequence, "missing", 0);
+                    // A muted sender produces no speech, so a hole here is part of
+                    // the mute (e.g. a dropped keepalive marker) rather than lost
+                    // audio. Skip DRED/PLC and let the stream drain to silence.
+                    if self.sender_muted {
+                        continue;
+                    }
                     let playout_delay = self.feedback.playout_delay(*sequence, now);
                     if !self.decode_dred(
                         *sequence,
@@ -637,6 +758,7 @@ impl LiveDecodeStream {
                         self.decode_playout(
                             &[],
                             DecodedFrameSource::Plc,
+                            1.0,
                             trace_start,
                             now,
                             stream_id,
@@ -671,6 +793,7 @@ impl LiveDecodeStream {
         &mut self,
         payload: &[u8],
         source: DecodedFrameSource,
+        mute_target: f32,
         trace_start: Instant,
         now: Instant,
         stream_id: u32,
@@ -695,6 +818,14 @@ impl LiveDecodeStream {
         };
         match decoded {
             Ok(decoded) => {
+                // Ramp the receiver mute gain toward its target across this frame;
+                // a no-op once the gain has settled at unity for an open stream.
+                self.mute_gain = apply_gain_ramp(
+                    &mut self.output_frame[..decoded],
+                    self.mute_gain,
+                    mute_target,
+                    self.mute_gain_step,
+                );
                 let samples = &self.output_frame[..decoded];
                 trace_decode_output(
                     trace,
@@ -1052,8 +1183,8 @@ mod tests {
         audio::{
             capture::OpusVoiceEncoder,
             shared::{
-                LIVE_PACKET_FLAG_SILENCE_HINT, LIVE_PLAYBACK_INITIAL_BUFFER,
-                LIVE_PLAYBACK_MAX_REORDER_DELAY, SAMPLE_RATE,
+                LIVE_CAPTURE_MUTE_FADE, LIVE_PACKET_FLAG_SILENCE_HINT,
+                LIVE_PLAYBACK_INITIAL_BUFFER, LIVE_PLAYBACK_MAX_REORDER_DELAY, SAMPLE_RATE,
             },
         },
         network::EncoderNetworkProfile,
@@ -1266,6 +1397,175 @@ mod tests {
             feedback.recommended_target(&tuning),
             tuning.dynamic_target_floor,
             "silence gate resume inflated the delay histogram"
+        );
+    }
+
+    /// Plays one normal frame, then a one-frame gap, returning the number of PLC
+    /// frames the gap produced. With `control_muted`, the sender is marked muted
+    /// via the control-stream fallback before the gap is observed.
+    fn gap_plc_count(control_muted: bool) -> usize {
+        let tuning = test_tuning();
+        let start = Instant::now();
+        let mut encoder = OpusVoiceEncoder::new(32_000).unwrap();
+        let p0 = encode_test_frame(&mut encoder, 0);
+        let p2 = encode_test_frame(&mut encoder, 600);
+        let mut stream = LiveDecodeStream::new(tuning).unwrap();
+        let first_playout = start + tuning.initial_buffer;
+        let mut trace = None;
+
+        stream.insert(test_audio_packet(0, &p0), start);
+        stream.drain_ready(first_playout, start, 1, &mut trace, |_, _| {});
+
+        let gap_seen = first_playout + Duration::from_millis(1);
+        stream.insert(test_audio_packet(2, &p2), gap_seen);
+        // Register the hole so the reorder deadline starts ticking from here.
+        stream.drain_ready(gap_seen, start, 1, &mut trace, |_, _| {});
+
+        if control_muted {
+            stream.set_control_muted(true);
+            // Apply the control update now; it should arm the fallback but not
+            // suppress media until the grace window expires.
+            stream.drain_ready(gap_seen, start, 1, &mut trace, |_, _| {});
+        }
+
+        let mut plc = 0;
+        let fallback_delay = if control_muted {
+            LIVE_CAPTURE_MUTE_FADE + tuning.max_reorder_delay
+        } else {
+            tuning.max_reorder_delay
+        };
+        stream.drain_ready(
+            gap_seen + fallback_delay + Duration::from_millis(1),
+            start,
+            1,
+            &mut trace,
+            |_, event| {
+                if let DrainEvent::Samples {
+                    source: DecodedFrameSource::Plc,
+                    ..
+                } = event
+                {
+                    plc += 1;
+                }
+            },
+        );
+        plc
+    }
+
+    #[test]
+    fn control_mute_suppresses_loss_concealment() {
+        // The unflagged gap is concealed with PLC, but once the control stream
+        // fallback has had time to activate, the hole is treated as part of the
+        // mute and left to drain to silence instead of extrapolating speech.
+        assert_eq!(
+            gap_plc_count(false),
+            1,
+            "an ordinary gap is concealed with PLC"
+        );
+        assert_eq!(
+            gap_plc_count(true),
+            0,
+            "a muted sender's gap must not be concealed"
+        );
+    }
+
+    #[test]
+    fn control_mute_does_not_preempt_buffered_media() {
+        let tuning = test_tuning();
+        let start = Instant::now();
+        let mut encoder = OpusVoiceEncoder::new(32_000).unwrap();
+        let packet = encode_test_frame(&mut encoder, 0);
+        let mut stream = LiveDecodeStream::new(tuning).unwrap();
+        let mut trace = None;
+
+        stream.insert(test_audio_packet(0, &packet), start);
+        stream.set_control_muted(true);
+
+        let mut sender_silence = 0;
+        let mut samples = 0;
+        stream.drain_ready(
+            start + tuning.initial_buffer,
+            start,
+            1,
+            &mut trace,
+            |_, event| match event {
+                DrainEvent::SenderSilence => sender_silence += 1,
+                DrainEvent::Samples { samples: s, .. } => samples += s.len(),
+                DrainEvent::Discontinuity => {}
+            },
+        );
+
+        assert_eq!(
+            sender_silence, 0,
+            "control mute must not cut ahead of in-flight media"
+        );
+        assert!(samples > 0, "buffered media should still play");
+    }
+
+    #[test]
+    fn media_mute_marker_prevents_control_fallback_rearm() {
+        let tuning = test_tuning();
+        let start = Instant::now();
+        let mut stream = LiveDecodeStream::new(tuning).unwrap();
+        let mut trace = None;
+
+        stream.observe_sender_silence(0, true, start);
+        stream.set_control_muted(true);
+        stream.drain_ready(start, start, 1, &mut trace, |_, _| {});
+
+        assert!(
+            stream.control_mute_fallback_at.is_none(),
+            "media mute is already authoritative; control must not re-arm fallback"
+        );
+        assert!(
+            !stream.control_fallback_active,
+            "media mute should not be converted into control fallback"
+        );
+    }
+
+    #[test]
+    fn receiver_fades_mute_flagged_audio_tail() {
+        let tuning = test_tuning();
+        let start = Instant::now();
+        let frame = Duration::from_secs_f64(LIVE_OPUS_FRAME_SAMPLES as f64 / SAMPLE_RATE as f64);
+        let speech = encode_live_dred_packets(EncoderNetworkProfile::CRITICAL, 1)
+            .into_iter()
+            .next()
+            .unwrap();
+        let mut stream = LiveDecodeStream::new(tuning).unwrap();
+        let mut trace = None;
+
+        // Prime playout with a normal frame.
+        stream.insert(test_audio_packet(0, &speech), start);
+        let mut t = start + tuning.initial_buffer + Duration::from_millis(1);
+        stream.drain_ready(t, start, 1, &mut trace, |_, _| {});
+
+        // Three consecutive mute-flagged tail frames carrying identical audio, so
+        // the only thing changing the output level is the receiver fade.
+        let mut frame_rms = Vec::new();
+        for sequence in 1..=3u32 {
+            stream.insert(
+                AudioPacketRef {
+                    sequence,
+                    flags: LIVE_PACKET_FLAG_MUTE,
+                    payload: crate::audio::shared::VoicePayloadRef::Opus(&speech),
+                },
+                t,
+            );
+            t += frame;
+            let mut samples = Vec::new();
+            stream.drain_ready(t, start, 1, &mut trace, |_, event| {
+                if let DrainEvent::Samples { samples: s, .. } = event {
+                    samples.extend_from_slice(s);
+                }
+            });
+            let energy: f32 = samples.iter().map(|s| s * s).sum();
+            frame_rms.push((energy / samples.len().max(1) as f32).sqrt());
+        }
+
+        assert!(
+            frame_rms[2] < frame_rms[0] * 0.5,
+            "receiver mute fade must ramp the tail down, got {frame_rms:?}"
         );
     }
 

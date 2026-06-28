@@ -142,6 +142,16 @@ impl Participants {
         }
     }
 
+    /// Whether the given user is currently muted (or deafened), per the last
+    /// control-stream voice status. Used to seed a newly started stream's
+    /// sender-mute state.
+    pub(crate) fn voice_muted(&self, user_id: UserId) -> bool {
+        self.entries
+            .iter()
+            .find(|entry| entry.user_id == user_id)
+            .is_some_and(|entry| entry.voice_status.muted)
+    }
+
     pub(crate) fn update_talking_display(
         &mut self,
         user_id: UserId,
