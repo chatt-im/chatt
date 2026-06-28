@@ -186,6 +186,9 @@ enum WebFeed {
     /// A `share_config` envelope sent when playback starts. Transient: it targets
     /// a browser that already asked to play, so it is broadcast but not retained.
     ShareConfig(String),
+    /// A `share_error` envelope reporting a failed play request. Transient and
+    /// broadcast like [`ShareConfig`](WebFeed::ShareConfig), not retained.
+    ShareError(String),
     /// A `share_ended` envelope. Drops the retained `share_available` for its
     /// `stream_id`.
     ShareEnded {
@@ -250,6 +253,12 @@ impl WebFeedSender {
     /// Sends a decoder-config envelope when playback starts. Not retained.
     pub fn send_share_config(&self, payload: String) {
         let _ = self.tx.send(WebFeed::ShareConfig(payload));
+        self.wake.wake();
+    }
+
+    /// Sends a play-failure envelope to the browser. Not retained.
+    pub fn send_share_error(&self, payload: String) {
+        let _ = self.tx.send(WebFeed::ShareError(payload));
         self.wake.wake();
     }
 
@@ -407,7 +416,7 @@ fn run(
                         let _ = server.send_websocket_text(*id, &payload);
                     }
                 }
-                Ok(WebFeed::ShareConfig(payload)) => {
+                Ok(WebFeed::ShareConfig(payload)) | Ok(WebFeed::ShareError(payload)) => {
                     for id in &clients {
                         let _ = server.send_websocket_text(*id, &payload);
                     }

@@ -88,6 +88,21 @@ export default function App() {
   // Screen shares this browser can watch, and the stream ids currently playing.
   const [shares, setShares] = createSignal<ShareInfo[]>([]);
   const [playing, setPlaying] = createSignal<number[]>([]);
+  // Per-stream play-failure messages reported by the client, shown on the row.
+  const [shareErrors, setShareErrors] = createSignal<Record<number, string>>({});
+
+  function setShareError(streamId: number, message: string) {
+    setShareErrors((prev) => ({ ...prev, [streamId]: message }));
+  }
+
+  function clearShareError(streamId: number) {
+    setShareErrors((prev) => {
+      if (!(streamId in prev)) return prev;
+      const next = { ...prev };
+      delete next[streamId];
+      return next;
+    });
+  }
   // One decoder and canvas per stream, so several shares can play at once.
   const decoders = new Map<number, ScreenShareDecoder>();
   const canvases = new Map<number, HTMLCanvasElement>();
@@ -195,6 +210,7 @@ export default function App() {
 
   function playShare(streamId: number) {
     if (socket && socket.readyState === WebSocket.OPEN) {
+      clearShareError(streamId);
       socket.send(JSON.stringify({ type: "play_share", stream_id: streamId } as ClientRequest));
     }
   }
@@ -272,21 +288,25 @@ export default function App() {
       } else if (env.type === "share_config") {
         // Configure this stream's decoder from the codec and descriptor the
         // client supplies, then mark the share as playing. The canvas was
-        // mounted with the share's row, so it is already registered.
+        // mounted with the share's row, so it is already registered. The client
+        // broadcasts share_config on every play request so a tab that joined
+        // after the share started can bootstrap its decoder; a tab already
+        // playing this stream keeps its live decoder rather than resetting it.
         const canvas = canvases.get(env.stream_id);
-        if (canvas) {
-          let decoder = decoders.get(env.stream_id);
-          if (!decoder) {
-            decoder = new ScreenShareDecoder(canvas);
-            decoders.set(env.stream_id, decoder);
-          }
+        if (canvas && !decoders.has(env.stream_id)) {
+          clearShareError(env.stream_id);
+          const decoder = new ScreenShareDecoder(canvas);
+          decoders.set(env.stream_id, decoder);
           decoder.configure(env.codec, new Uint8Array(env.extradata));
           setPlaying((prev) =>
             prev.includes(env.stream_id) ? prev : [...prev, env.stream_id],
           );
         }
+      } else if (env.type === "share_error") {
+        setShareError(env.stream_id, env.message);
       } else if (env.type === "share_ended") {
         setShares((prev) => prev.filter((s) => s.stream_id !== env.stream_id));
+        clearShareError(env.stream_id);
         closeDecoder(env.stream_id);
       } else {
         // Upsert by file_id: a file's announcement placeholder and its later
@@ -346,6 +366,7 @@ export default function App() {
       <ScreenShare
         shares={shares()}
         playing={playing()}
+        errors={shareErrors()}
         onPlay={playShare}
         onStop={stopShare}
         canvasRef={registerCanvas}

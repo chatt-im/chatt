@@ -7,11 +7,13 @@ import type { ShareInfo } from "./types";
 export default function ScreenShare(props: {
   shares: ShareInfo[];
   playing: number[];
+  errors: Record<number, string>;
   onPlay: (streamId: number) => void;
   onStop: (streamId: number) => void;
   canvasRef: (streamId: number, el: HTMLCanvasElement) => void;
 }) {
   const isPlaying = (streamId: number) => props.playing.includes(streamId);
+  const errorFor = (streamId: number) => props.errors[streamId];
   return (
     <Show when={props.shares.length > 0}>
       <div class="screenshare">
@@ -33,6 +35,9 @@ export default function ScreenShare(props: {
                   </button>
                 </Show>
               </div>
+              <Show when={errorFor(share.stream_id)}>
+                <div class="screenshare-error">{errorFor(share.stream_id)}</div>
+              </Show>
               <canvas
                 class="screenshare-canvas"
                 classList={{ "is-playing": isPlaying(share.stream_id) }}

@@ -220,6 +220,11 @@ body {
   border-color: var(--accent);
 }
 
+.screenshare-error {
+  color: #d98a8a;
+  font-size: 0.9em;
+}
+
 .screenshare-canvas {
   display: none;
   width: 100%;
