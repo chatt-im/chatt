@@ -188,3 +188,46 @@ body {
 .media-file:hover {
   border-color: var(--accent);
 }
+
+.screenshare {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space);
+  padding: var(--space);
+  border-bottom: 1px solid var(--border);
+  background: var(--bg);
+}
+
+.screenshare-row {
+  display: flex;
+  align-items: center;
+  gap: var(--space);
+}
+
+.screenshare-sender {
+  color: var(--text);
+}
+
+.screenshare-button {
+  padding: 2px 12px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  color: var(--text);
+  cursor: pointer;
+}
+
+.screenshare-button:hover {
+  border-color: var(--accent);
+}
+
+.screenshare-canvas {
+  display: none;
+  width: 100%;
+  max-width: 960px;
+  background: #000;
+  border: 1px solid var(--border);
+}
+
+.screenshare-canvas.is-playing {
+  display: block;
+}

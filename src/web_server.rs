@@ -177,17 +177,36 @@ pub(crate) fn classify(name: &str) -> &'static str {
 /// What the app sends to the web thread.
 enum WebFeed {
     Message(WebMessage),
+    /// A decoder-config text envelope announcing or updating a screen share.
+    VideoConfig(String),
+    /// One plaintext video frame body (13-byte header plus H.264), forwarded to
+    /// browsers as a binary WebSocket message without re-framing.
+    VideoFrame(Vec<u8>),
     Stop,
 }
 
-/// A request a browser sends over the WebSocket. The feed is otherwise
-/// server-to-browser, so the only inbound message is a paging request.
+/// A request a browser sends back to the app, forwarded over the web-to-app
+/// channel. Screen-share playback is browser-initiated, so a play click must
+/// reach the app to spawn the viewer connection.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum WebRequest {
+    PlayShare { stream_id: u32 },
+    StopShare { stream_id: u32 },
+}
+
+/// A request a browser sends over the WebSocket.
 #[derive(Jsony)]
 #[jsony(Json, tag = "type")]
 enum ClientRequest {
     /// Asks for up to `limit` messages immediately older than `before_seq`.
     #[jsony(rename = "load_older")]
     LoadOlder { before_seq: u64, limit: u64 },
+    /// Asks the app to start streaming a screen share into this browser.
+    #[jsony(rename = "play_share")]
+    PlayShare { stream_id: u32 },
+    /// Asks the app to stop streaming a screen share.
+    #[jsony(rename = "stop_share")]
+    StopShare { stream_id: u32 },
 }
 
 /// A cloneable handle the app uses to push messages to the web view.
@@ -205,6 +224,18 @@ impl WebFeedSender {
     /// Pushes a message to every connected browser and records it in history.
     pub fn send(&self, message: WebMessage) {
         let _ = self.tx.send(WebFeed::Message(message));
+        self.wake.wake();
+    }
+
+    /// Sends a screen-share decoder-config envelope as a WebSocket text frame.
+    pub fn send_video_config(&self, payload: String) {
+        let _ = self.tx.send(WebFeed::VideoConfig(payload));
+        self.wake.wake();
+    }
+
+    /// Sends one plaintext video frame body as a binary WebSocket message.
+    pub fn send_video_frame(&self, frame: Vec<u8>) {
+        let _ = self.tx.send(WebFeed::VideoFrame(frame));
         self.wake.wake();
     }
 
@@ -227,6 +258,7 @@ pub fn spawn(
     cfg: &WebConfig,
     receive_dir: Option<PathBuf>,
     max_messages: usize,
+    web_requests: Sender<WebRequest>,
 ) -> io::Result<WebFeedSender> {
     let addr: SocketAddr = cfg.bind.parse().map_err(|error| {
         io::Error::new(
@@ -251,14 +283,19 @@ pub fn spawn(
     let (tx, rx) = mpsc::channel();
     thread::Builder::new()
         .name("web-server".to_string())
-        .spawn(move || run(server, rx, max_messages))?;
+        .spawn(move || run(server, rx, max_messages, web_requests))?;
 
     kvlog::info!("web server listening", addr = %local);
     Ok(WebFeedSender { tx, wake })
 }
 
 /// The web thread's event loop. Blocks until a socket event or a feed wake.
-fn run(mut server: Server, rx: Receiver<WebFeed>, max_messages: usize) {
+fn run(
+    mut server: Server,
+    rx: Receiver<WebFeed>,
+    max_messages: usize,
+    web_requests: Sender<WebRequest>,
+) {
     let mut history: Vec<WebMessage> = Vec::new();
     // The sequence number of `history[0]`. Sequence numbers are monotonic across
     // the whole feed and survive front-draining, so a browser can address older
@@ -284,11 +321,19 @@ fn run(mut server: Server, rx: Receiver<WebFeed>, max_messages: usize) {
                 ServerEvent::WebSocketMessage {
                     id,
                     message: WebSocketMessage::Text(text),
-                } => {
-                    if let Some(payload) = older_payload(&text, &history, base_seq) {
+                } => match jsony::from_json::<ClientRequest>(&text) {
+                    Ok(ClientRequest::LoadOlder { before_seq, limit }) => {
+                        let payload = older_window_payload(before_seq, limit, &history, base_seq);
                         let _ = server.send_websocket_text(id, &payload);
                     }
-                }
+                    Ok(ClientRequest::PlayShare { stream_id }) => {
+                        let _ = web_requests.send(WebRequest::PlayShare { stream_id });
+                    }
+                    Ok(ClientRequest::StopShare { stream_id }) => {
+                        let _ = web_requests.send(WebRequest::StopShare { stream_id });
+                    }
+                    Err(_) => {}
+                },
                 ServerEvent::WebSocketMessage { .. } => {}
             }
         }
@@ -323,6 +368,16 @@ fn run(mut server: Server, rx: Receiver<WebFeed>, max_messages: usize) {
                         let _ = server.send_websocket_text(*id, &payload);
                     }
                 }
+                Ok(WebFeed::VideoConfig(payload)) => {
+                    for id in &clients {
+                        let _ = server.send_websocket_text(*id, &payload);
+                    }
+                }
+                Ok(WebFeed::VideoFrame(frame)) => {
+                    for id in &clients {
+                        let _ = server.send_websocket_binary(*id, &frame);
+                    }
+                }
                 Ok(WebFeed::Stop) => return,
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => return,
@@ -342,10 +397,14 @@ fn sync_payload(history: &[WebMessage], base_seq: u64) -> String {
     )
 }
 
-/// Builds the `older` envelope answering a `load_older` request, or [`None`] if
-/// the request does not parse.
-fn older_payload(text: &str, history: &[WebMessage], base_seq: u64) -> Option<String> {
-    let ClientRequest::LoadOlder { before_seq, limit } = jsony::from_json(text).ok()?;
+/// Builds the `older` envelope for a `load_older` cursor: the `limit` messages
+/// immediately before `before_seq`.
+fn older_window_payload(
+    before_seq: u64,
+    limit: u64,
+    history: &[WebMessage],
+    base_seq: u64,
+) -> String {
     // Clamp the cursor into the retained range, then take the `limit` messages
     // immediately before it.
     let end = before_seq
@@ -353,12 +412,24 @@ fn older_payload(text: &str, history: &[WebMessage], base_seq: u64) -> Option<St
         .min(history.len() as u64) as usize;
     let limit = (limit as usize).clamp(1, MAX_PAGE);
     let start = end.saturating_sub(limit);
-    Some(window_payload(
+    window_payload(
         "older",
         &history[start..end],
         base_seq + start as u64,
         start > 0,
-    ))
+    )
+}
+
+/// Builds the `older` envelope answering a `load_older` request, or [`None`] if
+/// the request does not parse. Retained for unit tests of the parse-and-build path.
+#[cfg(test)]
+fn older_payload(text: &str, history: &[WebMessage], base_seq: u64) -> Option<String> {
+    match jsony::from_json(text).ok()? {
+        ClientRequest::LoadOlder { before_seq, limit } => {
+            Some(older_window_payload(before_seq, limit, history, base_seq))
+        }
+        _ => None,
+    }
 }
 
 /// Serializes a window of messages with its paging cursor.
@@ -645,7 +716,8 @@ mod tests {
             enabled: true,
             bind: "127.0.0.1:39517".to_string(),
         };
-        let sender = spawn(&cfg, None, 100).unwrap();
+        let (web_tx, _web_rx) = mpsc::channel();
+        let sender = spawn(&cfg, None, 100, web_tx).unwrap();
 
         let mut stream = TcpStream::connect("127.0.0.1:39517").unwrap();
         stream
@@ -735,7 +807,8 @@ Sec-WebSocket-Version: 13\r\n\
             enabled: true,
             bind: "127.0.0.1:39518".to_string(),
         };
-        let sender = spawn(&cfg, None, 100).unwrap();
+        let (web_tx, _web_rx) = mpsc::channel();
+        let sender = spawn(&cfg, None, 100, web_tx).unwrap();
 
         let mut stream = open_ws("127.0.0.1:39518");
         // Drain the initial empty sync frame.

@@ -32,11 +32,23 @@ export interface WebMessage {
 export type ServerEnvelope =
   | { type: "sync"; messages: WebMessage[]; oldest_seq: number; has_more: boolean }
   | { type: "message"; message: WebMessage }
-  | { type: "older"; messages: WebMessage[]; oldest_seq: number; has_more: boolean };
+  | { type: "older"; messages: WebMessage[]; oldest_seq: number; has_more: boolean }
+  // A room member started sharing their screen. The browser shows a play button.
+  | { type: "share_available"; stream_id: number; sender: string; codec: string; width: number; height: number }
+  // Playback started for a share; configure the decoder with this codec.
+  | { type: "share_config"; stream_id: number; codec: string }
+  // A share ended; tear down its decoder.
+  | { type: "share_ended"; stream_id: number };
 
-// The only frame the browser sends: a request for older history.
-export type ClientRequest = {
-  type: "load_older";
-  before_seq: number;
-  limit: number;
-};
+// A screen share this browser can watch.
+export interface ShareInfo {
+  stream_id: number;
+  sender: string;
+  codec: string;
+}
+
+// Frames the browser sends: paging requests and screen-share playback control.
+export type ClientRequest =
+  | { type: "load_older"; before_seq: number; limit: number }
+  | { type: "play_share"; stream_id: number }
+  | { type: "stop_share"; stream_id: number };

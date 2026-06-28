@@ -157,6 +157,18 @@ subcommand the state is toggled.",
             examples: &[],
         },
         Command {
+            name: "screencast",
+            aliases: &[],
+            about: "Share your screen to room members' web views.",
+            long_about: "Starts or stops a live screen share. `start` captures the \
+X11 desktop with the built-in ffmpeg command, or pass `--ffmpeg <ARGV>` after \
+`start` to run your own capture command writing H.264 Annex-B to stdout (pipe:1).",
+            args: &[],
+            flags: &[],
+            subs: &SCREENCAST_SUBS,
+            examples: &[],
+        },
+        Command {
             name: "help",
             aliases: &[],
             about: "Print help for a command.",
@@ -189,6 +201,34 @@ subcommand the state is toggled.",
     ],
 };
 
+/// The `start`/`stop` subcommands of `screencast`. The `--ffmpeg` passthrough on
+/// `start` is intercepted in [`run`] before parsing, because its trailing argv
+/// cannot be modeled in the static tree.
+static SCREENCAST_SUBS: [Command; 2] = [
+    Command {
+        name: "start",
+        aliases: &[],
+        about: "Start sharing your screen (built-in x11grab capture).",
+        long_about: "Captures the X11 desktop and shares it to room members' web \
+views. Pass `--ffmpeg <ARGV>` to run a custom capture command writing H.264 \
+Annex-B to stdout (pipe:1) instead of the built-in default.",
+        args: &[],
+        flags: &[],
+        subs: &[],
+        examples: &[],
+    },
+    Command {
+        name: "stop",
+        aliases: &[],
+        about: "Stop the active screen share.",
+        long_about: "",
+        args: &[],
+        flags: &[],
+        subs: &[],
+        examples: &[],
+    },
+];
+
 /// The shared `set <true|false>` subcommand used by `mute` and `deafen`.
 static VOICE_SET: Command = Command {
     name: "set",
@@ -216,6 +256,12 @@ pub(crate) fn run() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         kvlog::collector::init_closure_logger(|buf| buf.clear())
     };
+
+    // `screencast start --ffmpeg <ARGV>` is handled before the structured parser,
+    // which cannot model the arbitrary trailing argv the passthrough captures.
+    if let Some(result) = try_handle_screencast_passthrough(&args) {
+        return result;
+    }
 
     let matches = match command::parse(&ROOT, &args) {
         Ok(Parsed::Run(matches)) => matches,
@@ -249,6 +295,15 @@ fn dispatch(matches: &Matches) -> Result<(), Box<dyn std::error::Error>> {
         Some(("upload", sub)) => {
             let path = absolute_upload_path(Path::new(sub.value_of("path").unwrap_or_default()))?;
             let response = local_control::send_upload(&path)?;
+            println!("{response}");
+            Ok(())
+        }
+        Some(("screencast", sub)) => {
+            let command = match sub.subcommand() {
+                Some(("stop", _)) => local_control::ScreencastCommand::Stop,
+                _ => local_control::ScreencastCommand::Start { argv: Vec::new() },
+            };
+            let response = local_control::send_screencast(command)?;
             println!("{response}");
             Ok(())
         }
@@ -311,6 +366,35 @@ fn dispatch(matches: &Matches) -> Result<(), Box<dyn std::error::Error>> {
             runtime::run_app(config, None)
         }
     }
+}
+
+/// Intercepts `screencast start --ffmpeg <ARGV>` before the structured parser.
+///
+/// The passthrough captures every token after `--ffmpeg` as the verbatim capture
+/// command argv, which the static parser cannot model. Returns `None` when the
+/// args are not a `--ffmpeg` screencast invocation, so normal parsing proceeds.
+fn try_handle_screencast_passthrough(
+    args: &[String],
+) -> Option<Result<(), Box<dyn std::error::Error>>> {
+    let screencast = args.iter().position(|arg| arg == "screencast")?;
+    let rest = &args[screencast + 1..];
+    let ffmpeg = rest.iter().position(|arg| arg == "--ffmpeg")?;
+    if rest.first().map(String::as_str) != Some("start") {
+        return Some(Err(
+            "`--ffmpeg` is only valid with `screencast start`".into()
+        ));
+    }
+    let argv = rest[ffmpeg + 1..].to_vec();
+    if argv.is_empty() {
+        return Some(Err("`--ffmpeg` requires a command, for example: \
+             --ffmpeg ffmpeg -f x11grab -i :0 -f h264 pipe:1"
+            .into()));
+    }
+    Some(
+        local_control::send_screencast(local_control::ScreencastCommand::Start { argv })
+            .map(|response| println!("{response}"))
+            .map_err(Into::into),
+    )
 }
 
 /// Reads the `state` value of a `set` subcommand. The parser restricts it to

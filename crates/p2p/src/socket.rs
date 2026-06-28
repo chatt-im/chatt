@@ -210,7 +210,12 @@ fn ignore_icmp_errors(_fd: libc::c_int) {
     #[cfg(any(target_os = "linux", target_os = "android"))]
     {
         #[allow(clippy::unnecessary_cast)]
-        let _ = set_bool_opt(_fd, libc::IPPROTO_IP, libc::IP_RECVERR as libc::c_int, false);
+        let _ = set_bool_opt(
+            _fd,
+            libc::IPPROTO_IP,
+            libc::IP_RECVERR as libc::c_int,
+            false,
+        );
         #[allow(clippy::unnecessary_cast)]
         let _ = set_bool_opt(
             _fd,
