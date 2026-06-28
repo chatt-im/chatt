@@ -53,6 +53,12 @@ tests/test_opus_extensions
 tests/test_opus_padding
 tests/test_opus_projection
 celt/arm/armopts.s
+dnn/dred_rdovae_dec_data.c
+dnn/dred_rdovae_enc_data.c
+dnn/dred_rdovae_stats_data.c
+dnn/fargan_data.c
+dnn/pitchdnn_data.c
+dnn/plc_data.c
 celt/dump_modes/dump_modes
 celt/tests/test_unit_cwrs32
 celt/tests/test_unit_dft
