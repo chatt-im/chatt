@@ -722,12 +722,39 @@ struct NodeOverrides {
     quantum: Option<FrameCount>,
 }
 
+#[derive(Default)]
+struct DefaultNodes {
+    sink: Option<String>,
+    source: Option<String>,
+}
+
+pub(crate) struct DeviceSet {
+    pub(crate) devices: Vec<Device>,
+    pub(crate) default_input: Option<Device>,
+    pub(crate) default_output: Option<Device>,
+}
+
 /// Parses a PipeWire fraction string like "1/48000" or "256/48000" into its parts.
 fn parse_fraction(s: &str) -> Option<(u32, u32)> {
     let mut it = s.splitn(2, '/');
     let num: u32 = it.next()?.parse().ok()?;
     let den: u32 = it.next()?.parse().ok()?;
     Some((num, den))
+}
+
+fn parse_default_node_name(value: &str) -> Option<String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return None;
+    }
+    if !value.starts_with('{') {
+        return Some(value.to_owned());
+    }
+
+    let after_key = value.split_once("\"name\"")?.1;
+    let after_colon = after_key.split_once(':')?.1.trim_start();
+    let name = after_colon.strip_prefix('"')?.split_once('"')?.0;
+    (!name.is_empty()).then(|| name.to_owned())
 }
 
 fn remote_props() -> Option<PropertiesBox> {
@@ -737,7 +764,7 @@ fn remote_props() -> Option<PropertiesBox> {
     Some(props)
 }
 
-pub fn init_devices(connect_automatically: Arc<AtomicBool>) -> Option<Vec<Device>> {
+pub fn init_devices(connect_automatically: Arc<AtomicBool>) -> Option<DeviceSet> {
     let _pw = PwInitGuard::new();
     let mainloop = MainLoopRc::new(None).ok()?;
     let context = ContextRc::new(&mainloop, None).ok()?;
@@ -748,6 +775,7 @@ pub fn init_devices(connect_automatically: Arc<AtomicBool>) -> Option<Vec<Device
     let discovered: Rc<RefCell<Vec<(Device, NodeOverrides)>>> = Rc::new(RefCell::new(vec![]));
     let requests = Rc::new(RefCell::new(vec![]));
     let settings = Rc::new(RefCell::new(Settings::default()));
+    let default_nodes = Rc::new(RefCell::new(DefaultNodes::default()));
     let loop_clone = mainloop.clone();
 
     // Trigger the sync event. The server's answer won't be processed until we start the main loop,
@@ -784,74 +812,115 @@ pub fn init_devices(connect_automatically: Arc<AtomicBool>) -> Option<Vec<Device
             let registry = registry.clone();
             let requests = requests.clone();
             let settings = settings.clone();
+            let default_nodes = default_nodes.clone();
             move |global| match global.type_ {
                 ObjectType::Metadata => {
-                    if !global.props.is_some_and(|props| {
-                        props
-                            .get(METADATA_NAME)
-                            .is_some_and(|name| name == "settings")
-                    }) {
+                    let metadata_name = global
+                        .props
+                        .as_ref()
+                        .and_then(|props| props.get(METADATA_NAME));
+                    let Some(metadata_name) = metadata_name else {
                         return;
-                    }
-                    let meta_settings: Metadata = match registry.bind(global) {
-                        Ok(meta_settings) => meta_settings,
-                        Err(_) => {
-                            // TODO: do something about this error
-                            // Though it is already checked, but maybe something happened with
-                            // pipewire?
-                            return;
-                        }
                     };
-                    let settings = settings.clone();
-                    let listener = meta_settings
-                        .add_listener_local()
-                        .property(move |_, key, _, value| {
-                            match (key, value) {
-                                (Some(clock::RATE), Some(rate)) => {
-                                    let Ok(rate) = rate.parse() else {
-                                        return 0;
-                                    };
-                                    settings.borrow_mut().rate = rate;
+                    match metadata_name {
+                        "settings" => {
+                            let meta_settings: Metadata = match registry.bind(global) {
+                                Ok(meta_settings) => meta_settings,
+                                Err(_) => {
+                                    // TODO: do something about this error
+                                    // Though it is already checked, but maybe something happened with
+                                    // pipewire?
+                                    return;
                                 }
-                                (Some(clock::ALLOWED_RATES), Some(list)) => {
-                                    let Some(allow_rates) = parse_allow_rates(list) else {
-                                        return 0;
-                                    };
+                            };
+                            let settings = settings.clone();
+                            let listener = meta_settings
+                                .add_listener_local()
+                                .property(move |_, key, _, value| {
+                                    match (key, value) {
+                                        (Some(clock::RATE), Some(rate)) => {
+                                            let Ok(rate) = rate.parse() else {
+                                                return 0;
+                                            };
+                                            settings.borrow_mut().rate = rate;
+                                        }
+                                        (Some(clock::ALLOWED_RATES), Some(list)) => {
+                                            let Some(allow_rates) = parse_allow_rates(list) else {
+                                                return 0;
+                                            };
 
-                                    settings.borrow_mut().allow_rates =
-                                        allow_rates.into_boxed_slice();
+                                            settings.borrow_mut().allow_rates =
+                                                allow_rates.into_boxed_slice();
+                                        }
+                                        (Some(clock::QUANTUM), Some(quantum)) => {
+                                            let Ok(quantum) = quantum.parse() else {
+                                                return 0;
+                                            };
+                                            settings.borrow_mut().quantum = quantum;
+                                        }
+                                        (Some(clock::MIN_QUANTUM), Some(min_quantum)) => {
+                                            let Ok(min_quantum) = min_quantum.parse() else {
+                                                return 0;
+                                            };
+                                            settings.borrow_mut().min_quantum = min_quantum;
+                                        }
+                                        (Some(clock::MAX_QUANTUM), Some(max_quantum)) => {
+                                            let Ok(max_quantum) = max_quantum.parse() else {
+                                                return 0;
+                                            };
+                                            settings.borrow_mut().max_quantum = max_quantum;
+                                        }
+                                        _ => {}
+                                    }
+                                    0
+                                })
+                                .register();
+                            let Ok(pending) = core.sync(0) else {
+                                // TODO: maybe we should add a log?
+                                return;
+                            };
+                            pending_events.borrow_mut().push(pending);
+                            requests
+                                .borrow_mut()
+                                .push((meta_settings.upcast(), Request::Meta(listener)));
+                        }
+                        default::NAME => {
+                            let meta_default: Metadata = match registry.bind(global) {
+                                Ok(meta_default) => meta_default,
+                                Err(_) => {
+                                    return;
                                 }
-                                (Some(clock::QUANTUM), Some(quantum)) => {
-                                    let Ok(quantum) = quantum.parse() else {
+                            };
+                            let default_nodes = default_nodes.clone();
+                            let listener = meta_default
+                                .add_listener_local()
+                                .property(move |_, key, _, value| {
+                                    let Some(node_name) = value.and_then(parse_default_node_name)
+                                    else {
                                         return 0;
                                     };
-                                    settings.borrow_mut().quantum = quantum;
-                                }
-                                (Some(clock::MIN_QUANTUM), Some(min_quantum)) => {
-                                    let Ok(min_quantum) = min_quantum.parse() else {
-                                        return 0;
-                                    };
-                                    settings.borrow_mut().min_quantum = min_quantum;
-                                }
-                                (Some(clock::MAX_QUANTUM), Some(max_quantum)) => {
-                                    let Ok(max_quantum) = max_quantum.parse() else {
-                                        return 0;
-                                    };
-                                    settings.borrow_mut().max_quantum = max_quantum;
-                                }
-                                _ => {}
-                            }
-                            0
-                        })
-                        .register();
-                    let Ok(pending) = core.sync(0) else {
-                        // TODO: maybe we should add a log?
-                        return;
-                    };
-                    pending_events.borrow_mut().push(pending);
-                    requests
-                        .borrow_mut()
-                        .push((meta_settings.upcast(), Request::Meta(listener)));
+                                    match key {
+                                        Some(default::SINK) => {
+                                            default_nodes.borrow_mut().sink = Some(node_name);
+                                        }
+                                        Some(default::SOURCE) => {
+                                            default_nodes.borrow_mut().source = Some(node_name);
+                                        }
+                                        _ => {}
+                                    }
+                                    0
+                                })
+                                .register();
+                            let Ok(pending) = core.sync(0) else {
+                                return;
+                            };
+                            pending_events.borrow_mut().push(pending);
+                            requests
+                                .borrow_mut()
+                                .push((meta_default.upcast(), Request::Meta(listener)));
+                        }
+                        _ => {}
+                    }
                 }
                 ObjectType::Node => {
                     let Some(props) = global.props else {
@@ -1041,6 +1110,22 @@ pub fn init_devices(connect_automatically: Arc<AtomicBool>) -> Option<Vec<Device
     }
 
     let settings = settings.take();
+    let default_nodes = default_nodes.take();
+    let discovered = discovered.take();
+    let shared_rates: Arc<[SampleRate]> = Arc::from(settings.allow_rates.as_ref());
+
+    let configure_device = |device: &mut Device, overrides: Option<&NodeOverrides>| {
+        device.rate = overrides
+            .and_then(|overrides| overrides.rate)
+            .unwrap_or(settings.rate);
+        device.allow_rates = Arc::clone(&shared_rates);
+        device.quantum = overrides
+            .and_then(|overrides| overrides.quantum)
+            .unwrap_or(settings.quantum);
+        device.min_quantum = settings.min_quantum;
+        device.max_quantum = settings.max_quantum;
+        device.connect_automatically = connect_automatically.clone();
+    };
 
     // Build the three synthetic default devices and apply global clock settings to them.
     let mut devices = vec![
@@ -1048,34 +1133,65 @@ pub fn init_devices(connect_automatically: Arc<AtomicBool>) -> Option<Vec<Device
         Device::input_default(),
         Device::output_default(),
     ];
-    let shared_rates: Arc<[SampleRate]> = Arc::from(settings.allow_rates.as_ref());
     for device in devices.iter_mut() {
-        device.rate = settings.rate;
-        device.allow_rates = Arc::clone(&shared_rates);
-        device.quantum = settings.quantum;
-        device.min_quantum = settings.min_quantum;
-        device.max_quantum = settings.max_quantum;
-        device.connect_automatically = connect_automatically.clone();
+        configure_device(device, None);
     }
+
+    let default_from_node = |node_name: Option<&String>,
+                             class: Class,
+                             direction: DeviceDirection,
+                             role: Role|
+     -> Option<Device> {
+        let node_name = node_name?;
+        let (device, overrides) = discovered
+            .iter()
+            .find(|(device, _)| device.node_name == *node_name)?;
+        let mut device = device.clone();
+        device.class = class;
+        device.direction = direction;
+        device.role = role;
+        configure_device(&mut device, Some(overrides));
+        Some(device)
+    };
+
+    let default_input = default_from_node(
+        default_nodes.source.as_ref(),
+        Class::DefaultInput,
+        DeviceDirection::Input,
+        Role::Source,
+    )
+    .or_else(|| {
+        devices
+            .iter()
+            .find(|device| matches!(device.class(), Class::DefaultInput))
+            .cloned()
+    });
+
+    let default_output = default_from_node(
+        default_nodes.sink.as_ref(),
+        Class::DefaultOutput,
+        DeviceDirection::Output,
+        Role::Sink,
+    )
+    .or_else(|| {
+        devices
+            .iter()
+            .find(|device| matches!(device.class(), Class::DefaultOutput))
+            .cloned()
+    });
 
     // Resolve each discovered hardware node: global settings apply unless the node
     // advertised its own rate or quantum, in which case those take precedence.
-    devices.extend(
-        discovered
-            .take()
-            .into_iter()
-            .map(|(mut device, overrides)| {
-                device.rate = overrides.rate.unwrap_or(settings.rate);
-                device.allow_rates = Arc::clone(&shared_rates);
-                device.quantum = overrides.quantum.unwrap_or(settings.quantum);
-                device.min_quantum = settings.min_quantum;
-                device.max_quantum = settings.max_quantum;
-                device.connect_automatically = connect_automatically.clone();
-                device
-            }),
-    );
+    devices.extend(discovered.into_iter().map(|(mut device, overrides)| {
+        configure_device(&mut device, Some(&overrides));
+        device
+    }));
 
-    Some(devices)
+    Some(DeviceSet {
+        devices,
+        default_input,
+        default_output,
+    })
 }
 
 fn parse_allow_rates(list: &str) -> Option<Vec<SampleRate>> {
@@ -1090,7 +1206,7 @@ fn parse_allow_rates(list: &str) -> Option<Vec<SampleRate>> {
 
 #[cfg(test)]
 mod test {
-    use super::{parse_allow_rates, parse_fraction, Class, Device};
+    use super::{parse_allow_rates, parse_default_node_name, parse_fraction, Class, Device};
     use crate::host::pipewire::utils::default;
 
     #[test]
@@ -1128,6 +1244,21 @@ mod test {
         assert_eq!(parse_fraction("abc/def"), None);
         assert_eq!(parse_fraction("/48000"), None);
         assert_eq!(parse_fraction("256/"), None);
+    }
+
+    #[test]
+    fn default_node_name_parse() {
+        assert_eq!(
+            parse_default_node_name(r#"{"name":"alsa_output.pci-0000_00_1f.3.analog-stereo"}"#)
+                .as_deref(),
+            Some("alsa_output.pci-0000_00_1f.3.analog-stereo")
+        );
+        assert_eq!(
+            parse_default_node_name("bluez_output.20_F4_D4_61_20_AD.1").as_deref(),
+            Some("bluez_output.20_F4_D4_61_20_AD.1")
+        );
+        assert_eq!(parse_default_node_name(r#"{"missing":"name"}"#), None);
+        assert_eq!(parse_default_node_name(""), None);
     }
 
     #[test]

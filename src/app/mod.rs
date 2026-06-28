@@ -846,10 +846,7 @@ impl App {
         }
 
         let Some(tcp_addr) = self.active_tcp_addr.clone() else {
-            feed.send_share_error(share_error_envelope(
-                stream_id,
-                "not connected to a server",
-            ));
+            feed.send_share_error(share_error_envelope(stream_id, "not connected to a server"));
             return;
         };
         let handle = crate::video::start_subscriber(stream_id, view_secret, tcp_addr, feed);
@@ -1945,11 +1942,11 @@ impl App {
             return;
         };
         let mut applied = Vec::new();
-        if capture && self.capture.is_some() {
+        if capture {
             self.restart_capture_stream();
             applied.push("capture");
         }
-        if playback && self.playback.is_some() {
+        if playback {
             self.restart_playback_stream();
             applied.push("playback");
         }
@@ -2004,6 +2001,9 @@ impl App {
     }
 
     fn supervise_capture(&mut self, now: Instant) {
+        if let Some(reason) = self.supervisor.capture.take_due(now) {
+            self.recover_capture_stream(&reason);
+        }
         let Some(capture) = &self.capture else {
             self.supervisor.capture_watch = CaptureWatch::default();
             return;
@@ -2047,12 +2047,12 @@ impl App {
         if let Some(reason) = reason {
             self.schedule_capture_recovery(now, reason);
         }
-        if let Some(reason) = self.supervisor.capture.take_due(now) {
-            self.recover_capture_stream(&reason);
-        }
     }
 
     fn supervise_playback(&mut self, now: Instant) {
+        if let Some(reason) = self.supervisor.playback.take_due(now) {
+            self.recover_playback_stream(&reason);
+        }
         let Some(playback) = &self.playback else {
             self.supervisor.playback_watch = PlaybackWatch::default();
             return;
@@ -2068,9 +2068,6 @@ impl App {
 
         if let Some(reason) = reason {
             self.schedule_playback_recovery(now, reason);
-        }
-        if let Some(reason) = self.supervisor.playback.take_due(now) {
-            self.recover_playback_stream(&reason);
         }
     }
 
@@ -2231,27 +2228,28 @@ impl App {
                 self.schedule_capture_recovery(Instant::now(), error);
             }
         }
+        if self.voice_tx_enabled.load(Ordering::Relaxed) && !self.supervisor.playback.is_pending() {
+            self.restart_playback_stream();
+        }
     }
 
     fn recover_playback_stream(&mut self, reason: &str) {
         kvlog::warn!("recovering playback stream", reason);
         self.restart_playback_stream();
         if self.playback.is_some() {
-            self.supervisor.playback.reset();
             self.supervisor.playback_watch = PlaybackWatch::default();
             self.set_status("playback recovered");
-        } else {
-            let error = self
-                .playback_error
-                .clone()
-                .unwrap_or_else(|| reason.to_string());
-            self.schedule_playback_recovery(Instant::now(), error);
+        }
+        if self.capture_should_be_live() && !self.supervisor.capture.is_pending() {
+            self.restart_capture_stream();
         }
     }
 
     fn restart_capture_stream(&mut self) {
+        self.supervisor.capture.reset();
         if let Err(error) = self.restart_capture_stream_inner() {
             self.set_error(format!("failed to restart capture: {error}"));
+            self.schedule_capture_recovery(Instant::now(), error);
         }
     }
 
@@ -2274,9 +2272,17 @@ impl App {
         if self.network.is_none() {
             return;
         }
+        self.supervisor.playback.reset();
         self.set_network_playback_sink(None);
         self.playback.take();
         self.start_playback_stream(true);
+        if self.playback.is_none() {
+            let error = self
+                .playback_error
+                .clone()
+                .unwrap_or_else(|| "playback restart failed".to_string());
+            self.schedule_playback_recovery(Instant::now(), error);
+        }
     }
 
     /// Flushes the shared editor into the focused text field by replaying one
@@ -3109,11 +3115,15 @@ impl App {
             })
             .expect("failed to spawn playback feedback router");
         let configured_output = self.config.audio.output_device_id.clone();
+        let resolved_output = configured_output
+            .as_deref()
+            .filter(|id| !audio::configured_output_is_default(id))
+            .map(|id| id.to_string());
         let playback = match audio::start_live_playback(
-            self.live_playback_config(configured_output.clone(), Some(feedback_tx.clone())),
+            self.live_playback_config(resolved_output.clone(), Some(feedback_tx.clone())),
         ) {
             Ok(playback) => Ok(playback),
-            Err(error) if configured_output.is_some() => {
+            Err(error) if resolved_output.is_some() => {
                 kvlog::warn!(
                     "configured output failed, trying default",
                     error = error.as_str()
