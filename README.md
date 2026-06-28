@@ -192,17 +192,29 @@ cargo run -p chatt -- screencast start
 cargo run -p chatt -- screencast stop
 ```
 
+Pass `--hevc` to capture H.265/HEVC instead of H.264. HEVC compresses better but
+browser HEVC decode is platform-gated (absent in many Firefox builds), so H.264
+is the default and the reliable cross-browser path:
+
+```sh
+cargo run -p chatt -- screencast start --hevc
+```
+
 Override the capture command with `--ffmpeg`, passing the verbatim argv that
-writes H.264 Annex-B to stdout (`pipe:1`). Everything after `--ffmpeg` is the
-command, run directly with no shell:
+writes Annex-B to stdout (`pipe:1`). Everything after `--ffmpeg` is the command,
+run directly with no shell. Add `--hevc` (before `--ffmpeg`) when the custom
+command emits H.265:
 
 ```sh
 cargo run -p chatt -- screencast start --ffmpeg ffmpeg -f x11grab -i :0 -f h264 pipe:1
 ```
 
 A room member sees a play button in their web view (`[web] enabled = true`) and
-the live desktop renders to a canvas. Screen share needs `ffmpeg` on `PATH` and,
-for the default capture, an X11 session.
+the live desktop renders to a canvas. The sharer can watch their own outgoing
+stream the same way: it appears in their web view as a self-view, fed locally
+without a server round-trip. The web view lists every active share, including
+ones that started before the browser tab connected. Screen share needs `ffmpeg`
+on `PATH` and, for the default capture, an X11 session.
 
 Inspect audio input devices:
 

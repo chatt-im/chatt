@@ -93,10 +93,11 @@ mod imp {
     }
 
     /// A screen-share intent forwarded from the CLI to the running client. `Start`
-    /// carries the capture command argv, empty for the built-in x11grab default.
+    /// carries the capture command argv, empty for the built-in default, and
+    /// whether to capture H.265/HEVC instead of H.264.
     #[derive(Clone, Debug, PartialEq, Eq)]
     pub enum ScreencastCommand {
-        Start { argv: Vec<String> },
+        Start { argv: Vec<String>, hevc: bool },
         Stop,
     }
 
@@ -104,8 +105,9 @@ mod imp {
         fn encode(&self) -> Vec<u8> {
             let mut body = Vec::new();
             match self {
-                ScreencastCommand::Start { argv } => {
+                ScreencastCommand::Start { argv, hevc } => {
                     body.push(SCREENCAST_START);
+                    body.push(u8::from(*hevc));
                     body.extend_from_slice(&(argv.len() as u32).to_be_bytes());
                     for arg in argv {
                         let bytes = arg.as_bytes();
@@ -124,6 +126,10 @@ mod imp {
                 .ok_or_else(|| "empty screencast payload".to_string())?;
             match *action {
                 SCREENCAST_START => {
+                    let (&hevc, tail) = cursor
+                        .split_first()
+                        .ok_or_else(|| "screencast payload is truncated".to_string())?;
+                    cursor = tail;
                     let count = read_u32(&mut cursor)? as usize;
                     let mut argv = Vec::with_capacity(count.min(1024));
                     for _ in 0..count {
@@ -138,7 +144,10 @@ mod imp {
                         );
                         cursor = tail;
                     }
-                    Ok(ScreencastCommand::Start { argv })
+                    Ok(ScreencastCommand::Start {
+                        argv,
+                        hevc: hevc != 0,
+                    })
                 }
                 SCREENCAST_STOP => Ok(ScreencastCommand::Stop),
                 other => Err(format!("unknown screencast action {other}")),
@@ -718,13 +727,17 @@ mod imp {
         #[test]
         fn screencast_request_round_trips() {
             let commands = [
-                ScreencastCommand::Start { argv: Vec::new() },
+                ScreencastCommand::Start {
+                    argv: Vec::new(),
+                    hevc: false,
+                },
                 ScreencastCommand::Start {
                     argv: vec![
                         "ffmpeg".to_string(),
                         "-f".to_string(),
                         "x11grab".to_string(),
                     ],
+                    hevc: true,
                 },
                 ScreencastCommand::Stop,
             ];

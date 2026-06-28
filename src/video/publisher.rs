@@ -16,12 +16,14 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use rpc::{
+    bitstream::{self, Codec},
     crypto::{CHANNEL_VIDEO, TransportCipher},
     ids::StreamId,
     video::{self, VideoRole},
 };
 
 use crate::client_net::{CommandSender, NetworkCommand};
+use crate::web_server::WebFeedSender;
 
 use super::capture::{self, Capture, CapturedFrame};
 
@@ -62,23 +64,27 @@ impl Drop for ScreencastHandle {
 /// `commands` once the first keyframe is captured.
 pub fn start(
     argv: Vec<String>,
+    codec: Codec,
     commands: CommandSender,
     tcp_addr: String,
+    web_feed: Option<WebFeedSender>,
 ) -> Result<ScreencastHandle, String> {
     let stop = Arc::new(AtomicBool::new(false));
     let (frame_tx, frame_rx) = mpsc::channel();
     let (secret_tx, secret_rx) = mpsc::channel();
-    let capture = capture::spawn(&argv, frame_tx, stop.clone())?;
+    let capture = capture::spawn(&argv, codec, frame_tx, stop.clone())?;
     let manager_stop = stop.clone();
     let join = thread::Builder::new()
         .name("chatt-publish".to_string())
         .spawn(move || {
             run_manager(
                 capture,
+                codec,
                 frame_rx,
                 secret_rx,
                 commands,
                 tcp_addr,
+                web_feed,
                 manager_stop,
             )
         })
@@ -93,11 +99,25 @@ pub fn start(
 struct PublisherConn {
     stream: TcpStream,
     cipher: TransportCipher,
+    stream_id: u32,
+    codec: Codec,
 }
 
 impl PublisherConn {
-    fn send_frame(&mut self, frame: &CapturedFrame) -> Result<(), String> {
-        let inner = video::encode_video_frame(frame.ts_ms, frame.is_key, &frame.data);
+    /// Converts one captured frame to the length-prefixed wire body, seals it,
+    /// and writes it to the server. When `web_feed` is present the same plaintext
+    /// body is forwarded to the local browser so a sharer sees their own stream
+    /// without a server round-trip. The body carries `stream_id` so the browser
+    /// routes it to the matching decoder.
+    fn send_frame(
+        &mut self,
+        frame: &CapturedFrame,
+        web_feed: Option<&WebFeedSender>,
+    ) -> Result<(), String> {
+        let inner = encode_publish_frame(frame, self.stream_id, self.codec);
+        if let Some(feed) = web_feed {
+            feed.send_video_frame(inner.clone());
+        }
         let sealed = self
             .cipher
             .seal_next(CHANNEL_VIDEO, &inner)
@@ -112,10 +132,12 @@ impl PublisherConn {
 
 fn run_manager(
     mut capture: Capture,
+    codec: Codec,
     frame_rx: Receiver<CapturedFrame>,
     secret_rx: Receiver<(StreamId, Vec<u8>)>,
     commands: CommandSender,
     tcp_addr: String,
+    web_feed: Option<WebFeedSender>,
     stop: Arc<AtomicBool>,
 ) {
     let mut buffered: Vec<CapturedFrame> = Vec::new();
@@ -129,11 +151,11 @@ fn run_manager(
         if conn.is_none()
             && let Ok((stream_id, secret)) = secret_rx.try_recv()
         {
-            match connect(&tcp_addr, stream_id, &secret) {
+            match connect(&tcp_addr, stream_id, &secret, codec) {
                 Ok(mut publisher) => {
                     let mut failed = false;
                     for frame in buffered.drain(..) {
-                        if let Err(error) = publisher.send_frame(&frame) {
+                        if let Err(error) = publisher.send_frame(&frame, web_feed.as_ref()) {
                             kvlog::warn!("video publish burst failed", error = error.as_str());
                             failed = true;
                             break;
@@ -158,15 +180,20 @@ fn run_manager(
                     if !frame.is_key {
                         continue;
                     }
-                    let codec = capture::parse_codec(&frame.data)
-                        .unwrap_or_else(|| "avc1.42e01f".to_string());
+                    // The encoder emits parameter sets in band at every keyframe,
+                    // so a complete keyframe carries the codec metadata the
+                    // descriptor needs. A keyframe without them is incomplete, so
+                    // wait for the next.
+                    let Some(params) = bitstream::parse_keyframe(codec, &frame.data) else {
+                        continue;
+                    };
                     if commands
                         .send(NetworkCommand::StartShare {
-                            codec,
-                            coded_width: 0,
-                            coded_height: 0,
-                            annexb: true,
-                            extradata: Vec::new(),
+                            codec: params.codec,
+                            coded_width: params.width,
+                            coded_height: params.height,
+                            annexb: false,
+                            extradata: params.extra_data,
                         })
                         .is_err()
                     {
@@ -176,7 +203,7 @@ fn run_manager(
                 }
                 match &mut conn {
                     Some(publisher) => {
-                        if let Err(error) = publisher.send_frame(&frame) {
+                        if let Err(error) = publisher.send_frame(&frame, web_feed.as_ref()) {
                             kvlog::warn!("video publish failed", error = error.as_str());
                             break;
                         }
@@ -192,10 +219,29 @@ fn run_manager(
     kvlog::info!("video publisher stopped");
 }
 
-fn connect(tcp_addr: &str, stream_id: StreamId, secret: &[u8]) -> Result<PublisherConn, String> {
+/// Converts one captured Annex-B access unit to the wire frame body and frames
+/// it: the access unit becomes a length-prefixed bitstream with parameter sets
+/// stripped, tagged with `stream_id`. This is the exact body sealed to the server
+/// and teed to the local web feed, so a sharer's self-view decodes identically.
+fn encode_publish_frame(frame: &CapturedFrame, stream_id: u32, codec: Codec) -> Vec<u8> {
+    let body = bitstream::annex_b_to_length_prefixed(codec, &frame.data);
+    video::encode_video_frame(frame.ts_ms, frame.is_key, stream_id, &body)
+}
+
+fn connect(
+    tcp_addr: &str,
+    stream_id: StreamId,
+    secret: &[u8],
+    codec: Codec,
+) -> Result<PublisherConn, String> {
     let (stream, cipher, _residual) =
         super::open_video_connection(tcp_addr, stream_id, VideoRole::Publisher, secret)?;
-    Ok(PublisherConn { stream, cipher })
+    Ok(PublisherConn {
+        stream,
+        cipher,
+        stream_id: stream_id.0,
+        codec,
+    })
 }
 
 /// Appends a frame to the pre-connection buffer, trimming to the most recent
@@ -206,5 +252,30 @@ fn buffer_frame(buffered: &mut Vec<CapturedFrame>, frame: CapturedFrame) {
         && let Some(last_key) = buffered.iter().rposition(|frame| frame.is_key)
     {
         buffered.drain(..last_key);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn publish_frame_strips_parameter_sets_and_tags_stream() {
+        // An Annex-B keyframe: SPS(7), PPS(8), then the IDR slice(5).
+        let data = vec![
+            0, 0, 0, 1, 0x67, 0x42, 0, 0, 0, 1, 0x68, 0xce, 0, 0, 0, 1, 0x65, 0xaa, 0xbb,
+        ];
+        let frame = CapturedFrame {
+            ts_ms: 5,
+            is_key: true,
+            data,
+        };
+        let mut inner = encode_publish_frame(&frame, 9, Codec::H264);
+        let parsed = video::pop_video_frame(&mut inner).unwrap().unwrap();
+        assert_eq!(parsed.stream_id, 9);
+        assert!(parsed.is_key);
+        assert_eq!(parsed.ts_ms, 5);
+        // Only the IDR slice survives, length-prefixed; SPS/PPS are stripped.
+        assert_eq!(parsed.data, vec![0, 0, 0, 3, 0x65, 0xaa, 0xbb]);
     }
 }

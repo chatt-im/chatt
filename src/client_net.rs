@@ -185,6 +185,10 @@ pub enum NetworkEvent {
     ShareStarted {
         stream_id: StreamId,
         publish_secret: Vec<u8>,
+        codec: String,
+        coded_width: u32,
+        coded_height: u32,
+        extradata: Vec<u8>,
     },
     ShareAvailable {
         room_id: RoomId,
@@ -2337,11 +2341,19 @@ impl WorkerState {
             ServerControl::ShareStarted {
                 stream_id,
                 publish_secret,
+                codec,
+                coded_width,
+                coded_height,
+                extradata,
             } => {
                 kvlog::info!("client share started", stream_id = stream_id.0);
                 let _ = self.events.send(NetworkEvent::ShareStarted {
                     stream_id,
                     publish_secret,
+                    codec,
+                    coded_width,
+                    coded_height,
+                    extradata,
                 });
             }
             ServerControl::ShareAvailable {
