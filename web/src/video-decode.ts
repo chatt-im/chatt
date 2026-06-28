@@ -70,6 +70,7 @@ export class ScreenShareDecoder {
     this.codec = codec;
     this.description = description;
     this.preferSoftware = false;
+    console.info("[screenshare] configure", { codec, descriptorBytes: description.length });
     this.start();
   }
 
@@ -79,6 +80,13 @@ export class ScreenShareDecoder {
     const ctx = this.canvas.getContext("2d");
     this.decoder = new VideoDecoder({
       output: (decoded) => {
+        if (!this.decoded) {
+          console.info("[screenshare] first frame decoded", {
+            software: this.preferSoftware,
+            width: decoded.displayWidth,
+            height: decoded.displayHeight,
+          });
+        }
         this.decoded = true;
         this.replay.length = 0;
         if (ctx) {
@@ -94,7 +102,16 @@ export class ScreenShareDecoder {
     const config: VideoDecoderConfig = { codec: this.codec, optimizeForLatency: true };
     if (this.description.length > 0) config.description = this.description;
     if (this.preferSoftware) config.hardwareAcceleration = "prefer-software";
-    this.decoder.configure(config);
+    console.info("[screenshare] start decoder", {
+      codec: config.codec,
+      software: this.preferSoftware,
+      hardwareAcceleration: config.hardwareAcceleration ?? "(default)",
+    });
+    try {
+      this.decoder.configure(config);
+    } catch (error) {
+      console.error("[screenshare] configure threw", error);
+    }
     this.sawKey = false;
     this.decoded = false;
   }
@@ -103,23 +120,41 @@ export class ScreenShareDecoder {
   // replaying the frames since the last keyframe. A later error, or one after a
   // software retry, is terminal and only logged.
   private onError(error: DOMException) {
+    console.warn("[screenshare] decoder error", {
+      decoded: this.decoded,
+      alreadySoftware: this.preferSoftware,
+      state: this.decoder?.state,
+      buffered: this.replay.length,
+      message: error.message,
+    });
     if (this.decoded || this.preferSoftware) {
-      console.error("video decoder error", error);
+      console.error("[screenshare] decode failed (terminal)", error);
       return;
     }
-    console.warn("screen-share hardware decode failed, falling back to software", error);
+    console.warn("[screenshare] hardware decode failed, falling back to software");
     this.preferSoftware = true;
     const chunks = this.replay;
     this.replay = [];
     this.start();
+    console.info("[screenshare] replaying", chunks.length, "buffered chunks in software");
     for (const chunk of chunks) {
       if (chunk.type === "key") this.sawKey = true;
-      this.decoder?.decode(chunk);
+      try {
+        this.decoder?.decode(chunk);
+      } catch (replayError) {
+        console.error("[screenshare] replay decode threw", replayError);
+      }
     }
   }
 
   decode(frame: VideoFrame) {
-    if (!this.decoder || this.decoder.state === "closed") return;
+    if (!this.decoder || this.decoder.state === "closed") {
+      console.warn("[screenshare] decode skipped, decoder not ready", {
+        hasDecoder: !!this.decoder,
+        state: this.decoder?.state,
+      });
+      return;
+    }
     if (!this.sawKey) {
       if (!frame.isKey) return;
       this.sawKey = true;
@@ -135,7 +170,11 @@ export class ScreenShareDecoder {
       if (frame.isKey) this.replay.length = 0;
       this.replay.push(chunk);
     }
-    this.decoder.decode(chunk);
+    try {
+      this.decoder.decode(chunk);
+    } catch (error) {
+      console.error("[screenshare] decode threw", { type: chunk.type, error });
+    }
   }
 
   close() {
