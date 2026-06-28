@@ -11,8 +11,9 @@ use crate::audio::{
     shared::{
         DecodedFrameSource, LIVE_PLAYBACK_DYNAMIC_DEADBAND, LIVE_PLAYBACK_DYNAMIC_UNDERRUN_MIN,
         LIVE_PLAYBACK_DYNAMIC_UNDERRUN_WINDOW, LIVE_PLAYBACK_MAX_IDLE_EXPANSION,
-        LIVE_PLAYBACK_RECOVERY_DECLICK, LIVE_PLAYBACK_RECOVERY_DECLICK_MIN_DELTA, LiveAudioTuning,
-        PlayoutDelay, TIME_SCALE_DECISION_INTERVAL, TIME_SCALE_MARGIN, TIME_SCALE_MAX_LAG_48K,
+        LIVE_PLAYBACK_RECOVERY_DECLICK, LIVE_PLAYBACK_RECOVERY_DECLICK_MIN_DELTA,
+        LIVE_PLAYBACK_RESUME_TIME_SCALE_HOLD, LiveAudioTuning, PlayoutDelay,
+        TIME_SCALE_DECISION_INTERVAL, TIME_SCALE_MARGIN, TIME_SCALE_MAX_LAG_48K,
         TIME_SCALE_MIN_LAG_48K, TIME_SCALE_NOISE_FLOOR_MS, TIME_SCALE_OPERATION_HOLD,
         TIME_SCALE_OVERLAP, TIME_SCALE_REF_OFFSET, TIME_SCALE_VAD_RATIO, TIME_SCALE_WINDOW,
         samples_for_duration, samples_to_ms,
@@ -35,6 +36,7 @@ pub(crate) struct TuningSampleCounts {
     decision_interval: usize,
     operation_hold: usize,
     max_idle_expansion: usize,
+    resume_time_scale_hold: usize,
 }
 
 impl TuningSampleCounts {
@@ -51,6 +53,7 @@ impl TuningSampleCounts {
             decision_interval: samples_for_duration(TIME_SCALE_DECISION_INTERVAL).max(1),
             operation_hold: samples_for_duration(TIME_SCALE_OPERATION_HOLD),
             max_idle_expansion: samples_for_duration(LIVE_PLAYBACK_MAX_IDLE_EXPANSION),
+            resume_time_scale_hold: samples_for_duration(LIVE_PLAYBACK_RESUME_TIME_SCALE_HOLD),
         }
     }
 }
@@ -131,6 +134,24 @@ pub(crate) struct AdaptivePlaybackStream {
     /// (the consumer hears silence) until the buffer first reaches the target,
     /// then re-arms on a dry-ring underrun. Unused by the legacy pull path.
     ring_priming: bool,
+    /// Output samples remaining in the post-resume window during which catch-up
+    /// expansion is suppressed. Armed when audio returns after a sender-silence
+    /// pause, because the fade-in onset is not stationary enough for a
+    /// pitch-period crossfade to be click-free. Counts down as output is
+    /// produced on either the pull or the ring path.
+    ///
+    /// WebRTC NetEQ does the same gating in
+    /// `modules/audio_coding/neteq/decision_logic.cc`,
+    /// `DecisionLogic::ExpectedPacketAvailable`: it only considers
+    /// `kAccelerate`/`kPreemptiveExpand` when `status.last_mode !=
+    /// NetEq::Mode::kExpand`, so the first packet decoded after a concealment
+    /// (Expand/PLC) gap always plays as `kNormal` rather than being time-scaled.
+    /// Our sender-silence pause is the equivalent concealment region; because the
+    /// resume is a multi-frame fade-in rather than a single packet, we hold over a
+    /// short window instead of just the first frame. The companion refractory
+    /// after every time-scale op (`operation_hold_remaining`) mirrors NetEQ's
+    /// `timescale_countdown_`/`TimescaleAllowed()` in the same file.
+    resume_time_scale_hold_remaining: usize,
 }
 
 impl AdaptivePlaybackStream {
@@ -159,6 +180,7 @@ impl AdaptivePlaybackStream {
             pending_time_stretch: 0,
             ring_decision_published_samples: 0,
             ring_priming: true,
+            resume_time_scale_hold_remaining: 0,
         })
     }
 
@@ -198,6 +220,11 @@ impl AdaptivePlaybackStream {
         }
         self.declick_recovery_boundary(&mut samples, source);
         let passive_frame = samples_are_passive(&samples);
+        // Audio returning after a sender-silence pause: arm the post-resume window
+        // that suppresses catch-up expansion over the non-stationary fade-in onset.
+        if self.sender_silent {
+            self.resume_time_scale_hold_remaining = self.samples.resume_time_scale_hold;
+        }
         self.input
             .push_back_owned_with_delay(samples, source, playout_delay, now);
         self.sender_silent = false;
@@ -261,6 +288,8 @@ impl AdaptivePlaybackStream {
         }
         self.decision_countdown = self.decision_countdown.saturating_sub(1);
         self.operation_hold_remaining = self.operation_hold_remaining.saturating_sub(1);
+        self.resume_time_scale_hold_remaining =
+            self.resume_time_scale_hold_remaining.saturating_sub(1);
 
         let passive_front = self.front_is_passive_audio();
         match self.input.pop_front_sample() {
@@ -626,6 +655,12 @@ impl AdaptivePlaybackStream {
     }
 
     fn try_expand(&mut self, _now: Instant, stats: &mut LivePlaybackMixerStats) -> bool {
+        // A freshly resumed stream's onset (the mute/silence fade-in) is not
+        // stationary, so a pitch-period crossfade splices mismatched levels into
+        // an audible click. Hold off catch-up expansion until it restabilizes.
+        if self.resume_time_scale_hold_remaining > 0 {
+            return false;
+        }
         if self.idle_expansion_exhausted() {
             return false;
         }
@@ -659,6 +694,12 @@ impl AdaptivePlaybackStream {
     }
 
     fn try_short_buffer_expand(&mut self, stats: &mut LivePlaybackMixerStats) -> bool {
+        // See `try_expand`: the onset right after a resume is not stationary, so
+        // duplicating its tail pitch period steps back from the current sample to
+        // a lower one a period earlier, which is the click heard on unmute.
+        if self.resume_time_scale_hold_remaining > 0 {
+            return false;
+        }
         // This fallback is only for callbacks smaller than the playout target:
         // inside a full-target callback, dropping below target mid-block is
         // expected and should not synthesize extra audio.
@@ -1061,6 +1102,8 @@ impl AdaptivePlaybackStream {
             self.underrun_active = false;
             self.decision_countdown = self.decision_countdown.saturating_sub(moved);
             self.operation_hold_remaining = self.operation_hold_remaining.saturating_sub(moved);
+            self.resume_time_scale_hold_remaining =
+                self.resume_time_scale_hold_remaining.saturating_sub(moved);
             stats.direct_samples = stats.direct_samples.saturating_add(moved as u64);
         }
     }

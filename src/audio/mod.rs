@@ -1,6 +1,7 @@
 mod backend;
 mod capture;
 mod device;
+mod diagnostics;
 mod errors;
 mod lifecycle;
 mod notifications;

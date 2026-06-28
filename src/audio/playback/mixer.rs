@@ -7,7 +7,11 @@ use hashbrown::HashMap;
 
 use crate::audio::{
     playback::{RingReader, SampleRing},
-    shared::{FRAME_SAMPLES, LivePlaybackSnapshot, PlaybackStreamControl, db_to_gain, soft_limit},
+    shared::{
+        AUDIO_POP_DELTA_THRESHOLD, FRAME_SAMPLES, LivePlaybackSnapshot, PlaybackStreamControl,
+        audio_pop_logging_enabled, db_to_gain, max_adjacent_delta, peak_normalized, rms_normalized,
+        soft_limit,
+    },
 };
 
 const LIVE_PLAYBACK_BACKEND_ERROR_LOG_INTERVAL: Duration = Duration::from_secs(1);
@@ -64,6 +68,9 @@ pub(crate) struct LivePlaybackMixer {
     last_snapshot: LivePlaybackSnapshot,
     /// Optional publisher of the consumer's callback block back to the producer.
     block_hint: Option<Arc<std::sync::atomic::AtomicUsize>>,
+    last_output_sample: f32,
+    has_last_output_sample: bool,
+    output_block_index: u64,
 }
 
 struct ConsumerStream {
@@ -106,6 +113,9 @@ impl LivePlaybackMixer {
             fill_cursor: 0,
             last_snapshot: LivePlaybackSnapshot::default(),
             block_hint: None,
+            last_output_sample: 0.0,
+            has_last_output_sample: false,
+            output_block_index: 0,
         }
     }
 
@@ -151,6 +161,7 @@ impl LivePlaybackMixer {
             buf.clear();
             buf.resize(block, 0.0);
             self.fill_block(&mut buf);
+            self.log_output_block_if_needed(block, &buf);
             self.fill = buf;
             self.fill_cursor = 0;
         }
@@ -210,12 +221,20 @@ impl LivePlaybackMixer {
         self.active_scratch.resize(frames, 0);
 
         let declick_step = 1.0 / LIVE_PLAYBACK_DECLICK_RAMP_SAMPLES as f32;
-        for stream in self.streams.values_mut() {
+        for (stream_id, stream) in self.streams.iter_mut() {
             let span = stream.reader.readable_span();
             let span_len = span.len();
             let covered = span_len.min(frames);
             let gain = db_to_gain(stream.control.volume_db);
             let muted = stream.control.muted;
+            let declick_gain_before = stream.declick_gain;
+            let last_sample_before = stream.last_sample;
+            let first_span_sample = span.get(0).unwrap_or_default();
+            let first_span_delta = if covered > 0 {
+                (first_span_sample - last_sample_before).abs()
+            } else {
+                0.0
+            };
             // Walk the whole block, ramping a per-stream declick gain toward 1.0
             // while the stream has audio and toward 0.0 while it is dry or muted.
             // The gain is tracked linearly, then shaped through `smoothstep` when
@@ -260,6 +279,32 @@ impl LivePlaybackMixer {
                 0
             };
             let concealed = missing > 0 && covered > 0 && missing <= concealment_limit;
+            if audio_pop_logging_enabled()
+                && (first_span_delta >= AUDIO_POP_DELTA_THRESHOLD
+                    || concealed
+                    || (missing > 0 && covered > 0)
+                    || (declick_gain_before <= 0.0
+                        && covered > 0
+                        && first_span_sample.abs() >= 0.01))
+            {
+                kvlog::info!(
+                    "audio pop mixer stream block",
+                    stream_id = *stream_id,
+                    frames,
+                    span_len,
+                    covered,
+                    missing,
+                    concealed,
+                    muted,
+                    volume_db = stream.control.volume_db,
+                    declick_gain_before,
+                    declick_gain_after = stream.declick_gain,
+                    first_span_sample,
+                    last_sample_before,
+                    first_span_delta,
+                    last_sample_after = stream.last_sample
+                );
+            }
             if span_len < frames && !concealed {
                 stream.reader.note_underrun();
             }
@@ -273,6 +318,46 @@ impl LivePlaybackMixer {
                 _ => soft_limit(*sample / (active as f32).sqrt()),
             };
         }
+    }
+
+    fn log_output_block_if_needed(&mut self, block: usize, out: &[f32]) {
+        if out.is_empty() {
+            return;
+        }
+        let first_sample = out[0];
+        let first_delta = if self.has_last_output_sample {
+            (first_sample - self.last_output_sample).abs()
+        } else {
+            0.0
+        };
+        let max_delta = max_adjacent_delta(out);
+        if audio_pop_logging_enabled()
+            && (first_delta >= AUDIO_POP_DELTA_THRESHOLD
+                || max_delta >= AUDIO_POP_DELTA_THRESHOLD
+                || self.last_snapshot.backend_xruns > 0)
+        {
+            kvlog::info!(
+                "audio pop mixer output block",
+                block_index = self.output_block_index,
+                block_samples = block,
+                frames = out.len(),
+                first_delta,
+                max_delta,
+                rms = rms_normalized(out),
+                peak = peak_normalized(out),
+                first_sample,
+                last_sample = out.last().copied().unwrap_or_default(),
+                active_streams = self.streams.len(),
+                queued_samples = self.last_snapshot.queued_samples,
+                max_queue_ms = self.last_snapshot.max_queue_ms,
+                target_queue_ms = self.last_snapshot.target_queue_ms,
+                underrun_count = self.last_snapshot.underrun_count,
+                backend_xruns = self.last_snapshot.backend_xruns
+            );
+        }
+        self.last_output_sample = out.last().copied().unwrap_or_default();
+        self.has_last_output_sample = true;
+        self.output_block_index = self.output_block_index.wrapping_add(1);
     }
 
     pub(crate) fn record_backend_stream_error(

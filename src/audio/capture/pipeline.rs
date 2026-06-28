@@ -19,12 +19,14 @@ use crate::{
         },
         resample::CaptureResampler,
         shared::{
-            AudioStats, DenoiseConfig, DenoiseSuppression, DenoiseTypingSuppression, FRAME_SAMPLES,
-            LIVE_CAPTURE_MUTE_FADE, LIVE_OPUS_FRAME_SAMPLES, LIVE_PACKET_FLAG_MUTE,
-            LIVE_PACKET_FLAG_OPUS_RESET, LIVE_PACKET_FLAG_SILENCE_HINT,
-            LIVE_PACKET_FLAG_SILENCE_RESUME, LiveAudioTuning, LiveEncoderProfile, LocalVoiceFrame,
-            MAX_OPUS_PACKET_BYTES, VoicePayload, apply_gain_ramp, convert_i16_scale_to_pcm_i16,
-            mute_gain_step, samples_for_duration, vad_to_u8,
+            AUDIO_POP_DELTA_THRESHOLD, AudioStats, DenoiseConfig, DenoiseSuppression,
+            DenoiseTypingSuppression, FRAME_SAMPLES, LIVE_CAPTURE_MUTE_FADE,
+            LIVE_OPUS_FRAME_SAMPLES, LIVE_PACKET_FLAG_MUTE, LIVE_PACKET_FLAG_OPUS_RESET,
+            LIVE_PACKET_FLAG_SILENCE_HINT, LIVE_PACKET_FLAG_SILENCE_RESUME, LiveAudioTuning,
+            LiveEncoderProfile, LocalVoiceFrame, MAX_OPUS_PACKET_BYTES, VoicePayload,
+            apply_gain_ramp, audio_pop_logging_enabled, convert_i16_scale_to_pcm_i16,
+            max_adjacent_delta, mute_gain_step, peak_normalized, rms_normalized,
+            samples_for_duration, vad_to_u8,
         },
     },
     network::{EncoderNetworkProfile, EncoderNetworkTuning},
@@ -246,6 +248,8 @@ pub(crate) struct LiveEncoderPipeline {
     /// True once `mute_gain` has reached zero while muted, so the sender has
     /// stopped encoding audio and is emitting only silence keepalive markers.
     mute_suppressed: bool,
+    last_muted: bool,
+    mute_transition_id: u64,
     echo_source: Option<EchoReferenceSource>,
 }
 
@@ -306,6 +310,8 @@ impl LiveEncoderPipeline {
             mute_gain: if initial_muted { 0.0 } else { 1.0 },
             mute_gain_step: mute_gain_step(samples_for_duration(LIVE_CAPTURE_MUTE_FADE)),
             mute_suppressed: initial_muted,
+            last_muted: initial_muted,
+            mute_transition_id: 0,
             echo_source,
         }
     }
@@ -395,6 +401,7 @@ impl LiveEncoderPipeline {
         let vad = vad_to_u8(vad_probability);
         let silence = is_capture_skip_safe_silence(self.tuning, vad, frame);
         stats.store_voice_active(!muted && !silence);
+        self.log_mute_state_change_if_needed(muted, frame);
 
         // Mute takes precedence over the automatic silence gate: it transitions
         // immediately rather than after the long-silence timeout, and works even
@@ -435,6 +442,30 @@ impl LiveEncoderPipeline {
         Ok(())
     }
 
+    fn log_mute_state_change_if_needed(&mut self, muted: bool, frame: &[f32]) {
+        if muted == self.last_muted {
+            return;
+        }
+        self.mute_transition_id = self.mute_transition_id.wrapping_add(1);
+        self.last_muted = muted;
+        if !audio_pop_logging_enabled() {
+            return;
+        }
+        kvlog::info!(
+            "audio pop capture mute transition",
+            transition_id = self.mute_transition_id,
+            muted,
+            mute_gain = self.mute_gain,
+            mute_suppressed = self.mute_suppressed,
+            pending_opus_samples = self.pending_opus_samples.len(),
+            rms = rms_normalized(frame),
+            peak = peak_normalized(frame),
+            max_delta = max_adjacent_delta(frame),
+            first_sample = frame.first().copied().unwrap_or_default(),
+            last_sample = frame.last().copied().unwrap_or_default()
+        );
+    }
+
     /// Handles a captured frame during a mute fade-out, mute suppression, or
     /// unmute fade-in. The mute gain ramps toward 0 (muted) or 1 (unmuted):
     ///
@@ -458,6 +489,20 @@ impl LiveEncoderPipeline {
         F: FnMut(LocalVoiceFrame),
     {
         let target = if muted { 0.0 } else { 1.0 };
+        let log_enabled = audio_pop_logging_enabled();
+        let gain_before = self.mute_gain;
+        let was_suppressed = self.mute_suppressed;
+        let input_first = frame.first().copied().unwrap_or_default();
+        let input_last = frame.last().copied().unwrap_or_default();
+        let (input_rms, input_peak, input_max_delta) = if log_enabled {
+            (
+                rms_normalized(frame),
+                peak_normalized(frame),
+                max_adjacent_delta(frame),
+            )
+        } else {
+            (0.0, 0.0, 0.0)
+        };
 
         if muted && self.mute_gain <= 0.0 {
             // Fully faded out: stop encoding, emit only silence keepalives.
@@ -476,10 +521,50 @@ impl LiveEncoderPipeline {
             if let Some(gate) = self.long_silence.as_mut() {
                 gate.reset();
             }
+            if log_enabled {
+                kvlog::info!(
+                    "audio pop capture mute resume",
+                    transition_id = self.mute_transition_id,
+                    pending_opus_samples = self.pending_opus_samples.len(),
+                    mute_gain = self.mute_gain,
+                    input_rms,
+                    input_peak,
+                    input_max_delta,
+                    input_first_sample = input_first,
+                    input_last_sample = input_last
+                );
+            }
         }
 
         let fading_out = target <= 0.0;
         self.mute_gain = apply_gain_ramp(frame, self.mute_gain, target, self.mute_gain_step);
+        if log_enabled
+            && (muted
+                || was_suppressed
+                || gain_before < 1.0
+                || self.mute_gain < 1.0
+                || input_max_delta >= AUDIO_POP_DELTA_THRESHOLD)
+        {
+            kvlog::info!(
+                "audio pop capture mute ramp",
+                transition_id = self.mute_transition_id,
+                muted,
+                was_suppressed,
+                target_gain = target,
+                gain_before,
+                gain_after = self.mute_gain,
+                input_rms,
+                input_peak,
+                input_max_delta,
+                input_first_sample = input_first,
+                input_last_sample = input_last,
+                output_rms = rms_normalized(frame),
+                output_peak = peak_normalized(frame),
+                output_max_delta = max_adjacent_delta(frame),
+                output_first_sample = frame.first().copied().unwrap_or_default(),
+                output_last_sample = frame.last().copied().unwrap_or_default()
+            );
+        }
         if fading_out {
             // The receiver fades this tail too and skips concealment over it.
             self.next_opus_packet_flags |= LIVE_PACKET_FLAG_MUTE | LIVE_PACKET_FLAG_SILENCE_HINT;
@@ -511,6 +596,34 @@ impl LiveEncoderPipeline {
                 &mut self.opus_frame,
                 &mut self.encoded,
             )?;
+            if audio_pop_logging_enabled()
+                && (flags != 0
+                    || self.mute_gain < 1.0
+                    || self.mute_suppressed
+                    || max_adjacent_delta(&self.pending_opus_samples[..LIVE_OPUS_FRAME_SAMPLES])
+                        >= AUDIO_POP_DELTA_THRESHOLD)
+            {
+                let samples = &self.pending_opus_samples[..LIVE_OPUS_FRAME_SAMPLES];
+                kvlog::info!(
+                    "audio pop capture encoded packet",
+                    transition_id = self.mute_transition_id,
+                    flags,
+                    flag_opus_reset = flags & LIVE_PACKET_FLAG_OPUS_RESET != 0,
+                    flag_silence_hint = flags & LIVE_PACKET_FLAG_SILENCE_HINT != 0,
+                    flag_silence_resume = flags & LIVE_PACKET_FLAG_SILENCE_RESUME != 0,
+                    flag_mute = flags & LIVE_PACKET_FLAG_MUTE != 0,
+                    mute_gain = self.mute_gain,
+                    mute_suppressed = self.mute_suppressed,
+                    packet_samples = LIVE_OPUS_FRAME_SAMPLES,
+                    packet_rms = rms_normalized(samples),
+                    packet_peak = peak_normalized(samples),
+                    packet_max_delta = max_adjacent_delta(samples),
+                    packet_first_sample = samples.first().copied().unwrap_or_default(),
+                    packet_last_sample = samples.last().copied().unwrap_or_default(),
+                    pending_opus_samples = self.pending_opus_samples.len(),
+                    payload_size = payload.len()
+                );
+            }
             if self.silence_resume_hint_packets > 0 {
                 self.silence_resume_hint_packets -= 1;
             }
@@ -539,6 +652,19 @@ impl LiveEncoderPipeline {
         if entering_sender_silence {
             self.silence_resume_hint_packets = SILENCE_RESUME_HINT_PACKETS;
         }
+        if entering_sender_silence && audio_pop_logging_enabled() {
+            let flags = LIVE_PACKET_FLAG_SILENCE_HINT | extra_flags;
+            kvlog::info!(
+                "audio pop capture silence marker",
+                transition_id = self.mute_transition_id,
+                flags,
+                flag_silence_hint = flags & LIVE_PACKET_FLAG_SILENCE_HINT != 0,
+                flag_mute = flags & LIVE_PACKET_FLAG_MUTE != 0,
+                mute_gain = self.mute_gain,
+                suppressed_frames = self.suppressed_frames,
+                silence_resume_hint_packets = self.silence_resume_hint_packets
+            );
+        }
         on_packet(LocalVoiceFrame {
             flags: LIVE_PACKET_FLAG_SILENCE_HINT | extra_flags,
             payload: VoicePayload::Silence,
@@ -557,6 +683,14 @@ impl LiveEncoderPipeline {
         self.silence_resume_hint_packets = SILENCE_RESUME_HINT_PACKETS;
         self.sender_silence_active = true;
         self.silence_keepalive_frames = 0;
+        if audio_pop_logging_enabled() {
+            kvlog::info!(
+                "audio pop capture opus reset",
+                transition_id = self.mute_transition_id,
+                mute_gain = self.mute_gain,
+                mute_suppressed = self.mute_suppressed
+            );
+        }
         Ok(())
     }
 

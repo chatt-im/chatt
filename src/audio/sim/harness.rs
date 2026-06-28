@@ -1297,6 +1297,177 @@ mod tests {
         );
     }
 
+    /// Runs a steady `freq` Hz tone through the full e2e pipeline while toggling
+    /// capture mute once per second, and returns the rendered mixer output along
+    /// with the time-scaler stats. Loopback (no loss) so every transient is a
+    /// pipeline artifact rather than a recovery event. Setting `CHATT_DUMP` writes
+    /// the raw f32le output for offline inspection.
+    fn render_tone_mute_toggle(freq: f64) -> (Vec<f32>, LivePlaybackMixerStatsSnapshot) {
+        let tuning = test_tuning();
+        let config = LiveAudioSimulationConfig {
+            scenario: LiveAudioSimulationScenario::LossySpeech,
+            tuning,
+            duration: Duration::from_secs(12),
+            producer_clock_ratio: 1.0,
+            output_block_samples: LIVE_OPUS_FRAME_SAMPLES,
+            streams: 1,
+            seed: 0x5eed_5eed,
+            packet_loss: LiveAudioPacketLossProfile::None,
+            max_amplification: 1.0,
+            denoise: false,
+            auto_gain: false,
+            echo_cancellation: false,
+            capture_dc_offset: 0.0,
+            capture_noise_rms: 0.0,
+        };
+        let mut state =
+            SimStreamState::new(config, simulation_encoder_profile(config), None).unwrap();
+        let mixer = Arc::new(Mutex::new(LivePlaybackMixer::with_tuning(tuning)));
+        let mut decode_streams = LiveDecodeStreams::new(tuning);
+        decode_streams.set_block_samples(LIVE_OPUS_FRAME_SAMPLES);
+        let mut report = LiveAudioSimulationReport {
+            scenario: "tone_mute_toggle",
+            ..Default::default()
+        };
+        let mut rng = SimRng::new(config.seed);
+        let mut trace = None;
+        let start = Instant::now();
+        let frame_duration = Duration::from_secs_f64(FRAME_SAMPLES as f64 / SAMPLE_RATE as f64);
+        let total_frames = 600usize;
+        let drain_frames = frames_for_duration(
+            tuning
+                .initial_buffer
+                .saturating_add(tuning.max_reorder_delay)
+                .saturating_add(tuning.target_queue)
+                .saturating_add(Duration::from_millis(300)),
+        );
+        let mut output = Vec::new();
+
+        for frame_index in 0..total_frames.saturating_add(drain_frames) {
+            let now = start + frame_duration.saturating_mul(frame_index as u32);
+            if frame_index < total_frames {
+                // ~1 s unmuted, ~1 s muted, repeating: five unmute resumes total.
+                state.capture_muted = (frame_index % 100) >= 50;
+                let sample_offset = frame_index * FRAME_SAMPLES;
+                let frame = (0..FRAME_SAMPLES)
+                    .map(|index| {
+                        let n = sample_offset + index;
+                        (2.0 * std::f64::consts::PI * freq * n as f64 / SAMPLE_RATE as f64).sin()
+                            as f32
+                            * 0.45
+                    })
+                    .collect::<Vec<_>>();
+                report.generated_frames = report.generated_frames.saturating_add(1);
+                state
+                    .encode_and_queue_frame(
+                        config,
+                        1,
+                        frame_index,
+                        &frame,
+                        now,
+                        start,
+                        &mut rng,
+                        &mut report,
+                        &mut trace,
+                    )
+                    .unwrap();
+            }
+
+            drain_simulation_network_and_playback(
+                now,
+                start,
+                std::slice::from_mut(&mut state),
+                &mixer,
+                &mut decode_streams,
+                &mut report,
+                &mut trace,
+            );
+
+            if frame_index % (LIVE_OPUS_FRAME_SAMPLES / FRAME_SAMPLES) == 0 {
+                let mut mixer = mixer.lock().unwrap();
+                for _ in 0..LIVE_OPUS_FRAME_SAMPLES {
+                    output.push(mixer.pop_mixed_output_sample(now, LIVE_OPUS_FRAME_SAMPLES));
+                }
+            }
+        }
+
+        if let Some(dump_path) = std::env::var_os("CHATT_DUMP") {
+            let bytes: Vec<u8> = output.iter().flat_map(|s| s.to_le_bytes()).collect();
+            std::fs::write(&dump_path, &bytes).unwrap();
+        }
+        let s = decode_streams.stats();
+        (
+            output,
+            LivePlaybackMixerStatsSnapshot {
+                plc_fallbacks: s.plc_fallbacks,
+                accelerate_count: s.accelerate_count,
+                expand_count: s.expand_count,
+                underrun_count: s.underrun_count,
+            },
+        )
+    }
+
+    struct LivePlaybackMixerStatsSnapshot {
+        plc_fallbacks: u64,
+        accelerate_count: u64,
+        expand_count: u64,
+        underrun_count: u64,
+    }
+
+    /// Peak second-difference (linear-prediction) residual of a `freq` Hz tone,
+    /// over `samples[skip..]`. For a pure sinusoid `x[n] = A sin(wn + p)` the
+    /// 3-tap predictor `2cos(w)x[n-1] - x[n-2]` reproduces `x[n]` exactly, so the
+    /// residual stays at the codec noise floor (a few 1e-3 here) and any phase or
+    /// level splice — the click signature — spikes far above it. `max_adjacent_delta`
+    /// misses these because a 240 Hz tone already carries a comparable slope; the
+    /// predictor cancels the slope and leaves only the discontinuity.
+    fn peak_tone_prediction_residual(samples: &[f32], freq: f64, skip: usize) -> f32 {
+        let w = 2.0 * std::f64::consts::PI * freq / SAMPLE_RATE as f64;
+        let two_cos_w = 2.0 * w.cos() as f32;
+        samples
+            .windows(3)
+            .skip(skip)
+            .map(|window| (window[2] - two_cos_w * window[1] + window[0]).abs())
+            .fold(0.0f32, f32::max)
+    }
+
+    #[test]
+    fn unmute_resume_injects_no_time_scale_click() {
+        // A steady tone toggled mute/unmute once per second over a clean loopback.
+        // The unmute onset (capture + receiver fade-in after a sender-silence
+        // pause) is not stationary, and catch-up time-scale expansion used to
+        // crossfade a mismatched pitch period across it, leaving an audible click
+        // exactly at each resume. `peak_tone_prediction_residual` sees those splices
+        // even though they are small in absolute terms and invisible to a plain
+        // adjacent-sample delta. The first 0.15 s is skipped to ignore the one-time
+        // stream-startup onset, which is unrelated to mute resumes.
+        let freq = 240.0;
+        let (output, stats) = render_tone_mute_toggle(freq);
+        let skip = (SAMPLE_RATE as usize * 3) / 20; // 0.15 s
+        let residual = peak_tone_prediction_residual(&output, freq, skip);
+
+        assert_eq!(
+            stats.plc_fallbacks, 0,
+            "loopback mute toggle should never invoke PLC"
+        );
+        // The resumes still drain the ring (underruns) and still let later,
+        // stationary catch-up run; only the onset expansions are suppressed.
+        assert!(
+            stats.underrun_count > 0,
+            "the silence pauses are expected to drain the ring at least once"
+        );
+        // Fixed pipeline sits at ~0.0019 (codec floor); the pre-fix onset splice
+        // measured ~0.0087. 0.004 separates the two with margin on both sides.
+        assert!(
+            residual < 0.004,
+            "unmute resume injected a discontinuity: peak prediction residual {residual:.5} \
+             (expand_count={}, accel={}, underruns={})",
+            stats.expand_count,
+            stats.accelerate_count,
+            stats.underrun_count,
+        );
+    }
+
     #[test]
     fn direct_sample_simulation_handles_sixty_percent_loss_and_reordering() {
         let input = sample_direct_pcm_frames(800);

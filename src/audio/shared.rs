@@ -3,7 +3,7 @@ use std::{
     io::{BufWriter, Write},
     path::Path,
     sync::{
-        Arc, Mutex,
+        Arc, Mutex, OnceLock,
         atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering},
     },
     time::{Duration, Instant},
@@ -179,6 +179,13 @@ pub(crate) const LIVE_PLAYBACK_HARD_QUEUE_BOUND: Duration = Duration::from_milli
 // stalled stream drains to silence instead. Any genuine live stream (even under
 // heavy loss) keeps queuing real Normal/DRED/PLC frames well within this bound.
 pub(crate) const LIVE_PLAYBACK_MAX_IDLE_EXPANSION: Duration = Duration::from_millis(100);
+// After a sender-silence pause ends, the resumed stream fades in over
+// `LIVE_CAPTURE_MUTE_FADE` and its onset is not stationary. Catch-up time-scale
+// expansion duplicates or crossfades a pitch period, which on that rising onset
+// splices mismatched levels into an audible click. Suppress expansion for this
+// window (the fade plus a margin) so the onset plays out untouched and only
+// resumes time-scaling once the tone is steady again.
+pub(crate) const LIVE_PLAYBACK_RESUME_TIME_SCALE_HOLD: Duration = Duration::from_millis(80);
 // Priming cushion added on top of one output device callback when sizing the
 // playout target. A device whose host period exceeds the one-packet floor needs
 // its whole callback buffered, plus this slack, or it re-primes whenever
@@ -234,6 +241,8 @@ pub(crate) const LIVE_CAPTURE_SILENCE_RAMP: Duration = Duration::from_millis(10)
 pub(crate) const LIVE_CAPTURE_MUTE_FADE: Duration = Duration::from_millis(60);
 pub(crate) const MAX_OPUS_DECODE_SAMPLES: usize = 5_760;
 pub(crate) const MAX_OPUS_PACKET_BYTES: usize = 1_500;
+pub(crate) const AUDIO_POP_LOG_ENV: &str = "CHATT_AUDIO_POP_LOG";
+pub(crate) const AUDIO_POP_DELTA_THRESHOLD: f32 = 0.08;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BufferRequest {
@@ -737,6 +746,23 @@ pub(crate) fn peak_normalized(samples: &[f32]) -> f32 {
         .map(|sample| sample.abs())
         .fold(0.0, f32::max)
         .clamp(0.0, 1.0)
+}
+
+pub(crate) fn audio_pop_logging_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| env_flag_enabled(AUDIO_POP_LOG_ENV))
+}
+
+fn env_flag_enabled(name: &str) -> bool {
+    let Ok(value) = std::env::var(name) else {
+        return false;
+    };
+    let value = value.trim();
+    if value.is_empty() {
+        return false;
+    }
+    let normalized = value.to_ascii_lowercase();
+    !matches!(normalized.as_str(), "0" | "false" | "no" | "off")
 }
 
 pub(crate) fn vad_to_u8(vad_probability: f32) -> u8 {
