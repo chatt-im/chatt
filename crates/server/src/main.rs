@@ -3,8 +3,8 @@ use std::{
     collections::VecDeque,
     io::{self, Read, Write},
     net::SocketAddr,
-    sync::Arc,
     sync::mpsc,
+    sync::{Arc, OnceLock},
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -59,6 +59,11 @@ const VIDEO_RING_MAX_BYTES: usize = 8 * 1024 * 1024;
 /// A subscriber whose queued bytes exceed this after a flush is too slow to keep
 /// up and is dropped. It reconnects and fast-starts from the latest keyframe.
 const VIDEO_SUBSCRIBER_HIGH_WATER: usize = 8 * 1024 * 1024;
+const AUDIO_POP_LOG_ENV: &str = "CHATT_AUDIO_POP_LOG";
+const AUDIO_POP_PACKET_FLAG_OPUS_RESET: u8 = 0x01;
+const AUDIO_POP_PACKET_FLAG_SILENCE_HINT: u8 = 0x02;
+const AUDIO_POP_PACKET_FLAG_SILENCE_RESUME: u8 = 0x04;
+const AUDIO_POP_PACKET_FLAG_MUTE: u8 = 0x08;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = std::env::args().collect::<Vec<_>>();
@@ -2147,6 +2152,16 @@ impl Server {
             muted = status.muted,
             deafened = status.deafened
         );
+        if audio_pop_logging_enabled() {
+            kvlog::info!(
+                "audio pop control voice status relay",
+                session_id = session_id.0,
+                room_id = room_id.0,
+                user_id = user_id.0,
+                muted = status.muted,
+                deafened = status.deafened
+            );
+        }
         self.broadcast_control(
             room_id,
             &ServerControl::VoiceStatus {
@@ -2525,6 +2540,16 @@ impl Server {
             recipient_count = recipients.len(),
             payload_size = voice_payload.len()
         );
+        log_audio_pop_server_media_packet(
+            "rx",
+            sender_session_id,
+            Some(room_id),
+            stream_id,
+            sequence,
+            flags,
+            &voice_payload,
+            Some(recipients.len()),
+        );
         let payload = MediaPayload::Voice {
             stream_id,
             sequence,
@@ -2588,6 +2613,24 @@ impl Server {
         let Some(addr) = session.udp_addr else {
             return;
         };
+        if let MediaPayload::Voice {
+            stream_id,
+            sequence,
+            flags,
+            payload,
+        } = payload
+        {
+            log_audio_pop_server_media_packet(
+                "tx",
+                session_id,
+                session.room_id,
+                *stream_id,
+                *sequence,
+                *flags,
+                payload,
+                None,
+            );
+        }
         let counter = session.media_send_counter;
         session.media_send_counter = session.media_send_counter.wrapping_add(1);
         let packet = match &session.secrets {
@@ -3124,6 +3167,65 @@ fn format_bytes(bytes: u64) -> String {
         format!("{:.1} KiB", bytes as f64 / KIB as f64)
     } else {
         format!("{bytes} B")
+    }
+}
+
+fn audio_pop_logging_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| env_flag_enabled(AUDIO_POP_LOG_ENV))
+}
+
+fn env_flag_enabled(name: &str) -> bool {
+    let Ok(value) = std::env::var(name) else {
+        return false;
+    };
+    let value = value.trim();
+    if value.is_empty() {
+        return false;
+    }
+    let normalized = value.to_ascii_lowercase();
+    !matches!(normalized.as_str(), "0" | "false" | "no" | "off")
+}
+
+fn log_audio_pop_server_media_packet(
+    direction: &'static str,
+    session_id: SessionId,
+    room_id: Option<RoomId>,
+    stream_id: StreamId,
+    sequence: u32,
+    flags: u8,
+    payload: &media::VoicePayload,
+    recipient_count: Option<usize>,
+) {
+    if !audio_pop_logging_enabled() || !audio_pop_should_log_packet(flags, payload) {
+        return;
+    }
+    kvlog::info!(
+        "audio pop server media packet",
+        direction,
+        session_id = session_id.0,
+        room_id = room_id.map(|room_id| room_id.0),
+        stream_id = stream_id.0,
+        sequence,
+        flags,
+        flag_opus_reset = flags & AUDIO_POP_PACKET_FLAG_OPUS_RESET != 0,
+        flag_silence_hint = flags & AUDIO_POP_PACKET_FLAG_SILENCE_HINT != 0,
+        flag_silence_resume = flags & AUDIO_POP_PACKET_FLAG_SILENCE_RESUME != 0,
+        flag_mute = flags & AUDIO_POP_PACKET_FLAG_MUTE != 0,
+        payload_size = payload.len(),
+        payload_kind = server_voice_payload_kind(payload),
+        recipient_count
+    );
+}
+
+fn audio_pop_should_log_packet(flags: u8, payload: &media::VoicePayload) -> bool {
+    flags != 0 || matches!(payload, media::VoicePayload::Silence)
+}
+
+fn server_voice_payload_kind(payload: &media::VoicePayload) -> &'static str {
+    match payload {
+        media::VoicePayload::Opus(_) => "opus",
+        media::VoicePayload::Silence => "silence",
     }
 }
 

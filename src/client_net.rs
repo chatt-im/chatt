@@ -7,7 +7,7 @@ use std::{
     panic::{self, AssertUnwindSafe},
     path::{Path, PathBuf},
     sync::{
-        Arc,
+        Arc, OnceLock,
         mpsc::{self, Receiver, RecvTimeoutError, SendError, Sender, TryRecvError},
     },
     thread::{self, JoinHandle},
@@ -78,6 +78,11 @@ const P2P_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(1);
 /// is the hard send-stop, while staying well above [`P2P_KEEPALIVE_INTERVAL`] so
 /// answered keepalives keep it fresh.
 const P2P_CONSENT_TIMEOUT: Duration = Duration::from_secs(10);
+const AUDIO_POP_LOG_ENV: &str = "CHATT_AUDIO_POP_LOG";
+const AUDIO_POP_PACKET_FLAG_OPUS_RESET: u8 = 0x01;
+const AUDIO_POP_PACKET_FLAG_SILENCE_HINT: u8 = 0x02;
+const AUDIO_POP_PACKET_FLAG_SILENCE_RESUME: u8 = 0x04;
+const AUDIO_POP_PACKET_FLAG_MUTE: u8 = 0x08;
 const MAX_QUEUED_FILE_BYTES: usize = 128 * 1024;
 const MAX_FILE_CHUNKS_PER_TICK: usize = 4;
 const FILE_PROGRESS_STEP_BYTES: u64 = 1024 * 1024;
@@ -1471,6 +1476,15 @@ impl WorkerState {
                         payload_size,
                         payload_kind
                     );
+                    log_audio_pop_media_packet(
+                        "rx",
+                        "server",
+                        stream_id.0,
+                        sequence,
+                        flags,
+                        payload_size,
+                        payload_kind,
+                    );
                     self.dispatch_voice_packet(
                         RemoteVoicePacket {
                             stream_id: stream_id.0,
@@ -1675,6 +1689,13 @@ impl WorkerState {
                 }
             }
             NetworkCommand::SetVoiceStatus(status) => {
+                if audio_pop_logging_enabled() {
+                    kvlog::info!(
+                        "audio pop control voice status tx",
+                        muted = status.muted,
+                        deafened = status.deafened
+                    );
+                }
                 self.queue_control(ClientControl::SetVoiceStatus { status })?;
             }
             NetworkCommand::StartShare {
@@ -1718,6 +1739,15 @@ impl WorkerState {
             flags = frame.flags,
             payload_size = frame.payload.len(),
             payload_kind = voice_payload_kind(&frame.payload)
+        );
+        log_audio_pop_media_packet(
+            "tx",
+            "local",
+            stream_id.0,
+            sequence,
+            frame.flags,
+            frame.payload.len(),
+            voice_payload_kind(&frame.payload),
         );
         if !self.relay_suppressed(Instant::now()) {
             let relay_payload = MediaPayload::Voice {
@@ -2250,6 +2280,14 @@ impl WorkerState {
                     muted = status.muted,
                     deafened = status.deafened
                 );
+                if audio_pop_logging_enabled() {
+                    kvlog::info!(
+                        "audio pop control voice status rx",
+                        user_id = user_id.0,
+                        muted = status.muted,
+                        deafened = status.deafened
+                    );
+                }
                 let _ = self
                     .events
                     .send(NetworkEvent::VoiceStatus { user_id, status });
@@ -2977,6 +3015,15 @@ impl WorkerState {
                     payload_size,
                     payload_kind
                 );
+                log_audio_pop_media_packet(
+                    "rx",
+                    "p2p",
+                    stream_id.0,
+                    sequence,
+                    flags,
+                    payload_size,
+                    payload_kind,
+                );
                 self.p2p_stream_owners.insert(stream_id, session_id);
                 self.dispatch_voice_packet(
                     RemoteVoicePacket {
@@ -3464,6 +3511,55 @@ fn audio_payload_from_media(payload: MediaVoicePayload) -> AudioVoicePayload {
         MediaVoicePayload::Opus(opus) => AudioVoicePayload::Opus(opus),
         MediaVoicePayload::Silence => AudioVoicePayload::Silence,
     }
+}
+
+fn audio_pop_logging_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| env_flag_enabled(AUDIO_POP_LOG_ENV))
+}
+
+fn env_flag_enabled(name: &str) -> bool {
+    let Ok(value) = std::env::var(name) else {
+        return false;
+    };
+    let value = value.trim();
+    if value.is_empty() {
+        return false;
+    }
+    let normalized = value.to_ascii_lowercase();
+    !matches!(normalized.as_str(), "0" | "false" | "no" | "off")
+}
+
+fn log_audio_pop_media_packet(
+    direction: &'static str,
+    route: &'static str,
+    stream_id: u32,
+    sequence: u32,
+    flags: u8,
+    payload_size: usize,
+    payload_kind: &'static str,
+) {
+    if !audio_pop_logging_enabled() || !audio_pop_should_log_packet(flags, payload_kind) {
+        return;
+    }
+    kvlog::info!(
+        "audio pop media packet",
+        direction,
+        route,
+        stream_id,
+        sequence,
+        flags,
+        flag_opus_reset = flags & AUDIO_POP_PACKET_FLAG_OPUS_RESET != 0,
+        flag_silence_hint = flags & AUDIO_POP_PACKET_FLAG_SILENCE_HINT != 0,
+        flag_silence_resume = flags & AUDIO_POP_PACKET_FLAG_SILENCE_RESUME != 0,
+        flag_mute = flags & AUDIO_POP_PACKET_FLAG_MUTE != 0,
+        payload_size,
+        payload_kind
+    );
+}
+
+fn audio_pop_should_log_packet(flags: u8, payload_kind: &str) -> bool {
+    flags != 0 || payload_kind == "silence"
 }
 
 fn dispatch_voice_packet_to(

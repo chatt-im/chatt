@@ -27,6 +27,7 @@ use crate::{
             build_input_stream, build_live_output_stream, build_output_stream, select_input_config,
             select_input_device_by_id, select_output_config, select_output_device_by_id,
         },
+        diagnostics::LivePlaybackWavRecorder,
         errors::format_file_error,
         playback::{
             LivePlaybackMixer, LivePlaybackMixerEvent, LivePlaybackSharedSnapshot, SpscSwapQueue,
@@ -114,6 +115,7 @@ pub struct LivePlayback {
     /// True when the configured fixed buffer was unsupported and the host-default
     /// buffer was used instead. See [`LiveCapture::buffer_fallback`].
     buffer_fallback: bool,
+    playback_recording: Option<LivePlaybackWavRecorder>,
 }
 
 #[derive(Clone, Debug)]
@@ -266,6 +268,9 @@ impl LivePlayback {
 
     fn stop_inner(&mut self) {
         self.stream.take();
+        if let Some(recording) = self.playback_recording.take() {
+            recording.stop();
+        }
         if let Some(sender) = self.sender.take() {
             let _ = sender.send(LivePlaybackCommand::Shutdown);
         }
@@ -604,6 +609,10 @@ pub fn start_live_playback(config: LivePlaybackConfig) -> Result<LivePlayback, S
     let shared_snapshot = Arc::new(LivePlaybackSharedSnapshot::new(
         LivePlaybackMixer::with_live_capacity(config.tuning).snapshot(),
     ));
+    let playback_recording = LivePlaybackWavRecorder::from_env()?;
+    let playback_recording_handle = playback_recording
+        .as_ref()
+        .map(|recording| recording.handle());
 
     // Build the output stream, falling back to the host-default buffer if the configured
     // fixed buffer is unsupported on this device, so playback never fails to start over a
@@ -625,6 +634,7 @@ pub fn start_live_playback(config: LivePlaybackConfig) -> Result<LivePlayback, S
                 echo_control.clone(),
                 Some(Arc::clone(&observer)),
                 selection.device_rate,
+                playback_recording_handle.clone(),
             )
         })
     };
@@ -688,6 +698,7 @@ pub fn start_live_playback(config: LivePlaybackConfig) -> Result<LivePlayback, S
         sender: Some(sender),
         shared_snapshot,
         buffer_fallback,
+        playback_recording,
     })
 }
 

@@ -20,6 +20,7 @@ use hashbrown::HashSet;
 use crate::audio::{
     backend::with_audio_backend_stderr_suppressed,
     capture::EchoCancellationControl,
+    diagnostics::LivePlaybackWavRecorderHandle,
     playback::{
         LivePlaybackMixer, LivePlaybackMixerEvent, LivePlaybackSharedSnapshot, SpscSwapQueue,
     },
@@ -1080,6 +1081,7 @@ pub(crate) fn build_live_output_stream(
     echo_control: Option<Arc<EchoCancellationControl>>,
     callback_buffer_observer: Option<Arc<AudioCallbackBufferObserver>>,
     device_rate: u32,
+    playback_recorder: Option<LivePlaybackWavRecorderHandle>,
 ) -> Result<Stream, String> {
     let channels = CallbackChannelCount::new(channels, "live output")?;
     match sample_format {
@@ -1093,6 +1095,7 @@ pub(crate) fn build_live_output_stream(
             echo_control,
             callback_buffer_observer,
             device_rate,
+            playback_recorder,
         ),
         SampleFormat::I16 => build_typed_live_output_stream::<i16>(
             device,
@@ -1104,6 +1107,7 @@ pub(crate) fn build_live_output_stream(
             echo_control,
             callback_buffer_observer,
             device_rate,
+            playback_recorder,
         ),
         SampleFormat::I24 => build_typed_live_output_stream::<cpal::I24>(
             device,
@@ -1115,6 +1119,7 @@ pub(crate) fn build_live_output_stream(
             echo_control,
             callback_buffer_observer,
             device_rate,
+            playback_recorder,
         ),
         SampleFormat::I32 => build_typed_live_output_stream::<i32>(
             device,
@@ -1126,6 +1131,7 @@ pub(crate) fn build_live_output_stream(
             echo_control,
             callback_buffer_observer,
             device_rate,
+            playback_recorder,
         ),
         SampleFormat::I64 => build_typed_live_output_stream::<i64>(
             device,
@@ -1137,6 +1143,7 @@ pub(crate) fn build_live_output_stream(
             echo_control,
             callback_buffer_observer,
             device_rate,
+            playback_recorder,
         ),
         SampleFormat::U8 => build_typed_live_output_stream::<u8>(
             device,
@@ -1148,6 +1155,7 @@ pub(crate) fn build_live_output_stream(
             echo_control,
             callback_buffer_observer,
             device_rate,
+            playback_recorder,
         ),
         SampleFormat::U16 => build_typed_live_output_stream::<u16>(
             device,
@@ -1159,6 +1167,7 @@ pub(crate) fn build_live_output_stream(
             echo_control,
             callback_buffer_observer,
             device_rate,
+            playback_recorder,
         ),
         SampleFormat::U24 => build_typed_live_output_stream::<cpal::U24>(
             device,
@@ -1170,6 +1179,7 @@ pub(crate) fn build_live_output_stream(
             echo_control,
             callback_buffer_observer,
             device_rate,
+            playback_recorder,
         ),
         SampleFormat::U32 => build_typed_live_output_stream::<u32>(
             device,
@@ -1181,6 +1191,7 @@ pub(crate) fn build_live_output_stream(
             echo_control,
             callback_buffer_observer,
             device_rate,
+            playback_recorder,
         ),
         SampleFormat::U64 => build_typed_live_output_stream::<u64>(
             device,
@@ -1192,6 +1203,7 @@ pub(crate) fn build_live_output_stream(
             echo_control,
             callback_buffer_observer,
             device_rate,
+            playback_recorder,
         ),
         SampleFormat::F32 => build_typed_live_output_stream::<f32>(
             device,
@@ -1203,6 +1215,7 @@ pub(crate) fn build_live_output_stream(
             echo_control,
             callback_buffer_observer,
             device_rate,
+            playback_recorder,
         ),
         SampleFormat::F64 => build_typed_live_output_stream::<f64>(
             device,
@@ -1214,6 +1227,7 @@ pub(crate) fn build_live_output_stream(
             echo_control,
             callback_buffer_observer,
             device_rate,
+            playback_recorder,
         ),
         _ => Err(format!("unsupported output sample format: {sample_format}")),
     }
@@ -1229,6 +1243,7 @@ fn build_typed_live_output_stream<T>(
     echo_control: Option<Arc<EchoCancellationControl>>,
     callback_buffer_observer: Option<Arc<AudioCallbackBufferObserver>>,
     device_rate: u32,
+    playback_recorder: Option<LivePlaybackWavRecorderHandle>,
 ) -> Result<Stream, String>
 where
     T: Sample + cpal::SizedSample + FromSample<f32> + Send + 'static,
@@ -1239,6 +1254,7 @@ where
     let _ = shared_snapshot;
     let mut resampler = PlaybackResampler::new(device_rate);
     let mut pending_event = LivePlaybackMixerEvent::default();
+    let mut playback_record_block = Vec::with_capacity(SAMPLE_RATE as usize);
     device
         .build_output_stream(
             stream_config,
@@ -1253,6 +1269,8 @@ where
                     channels,
                     &mut mixer,
                     echo_control.as_ref(),
+                    playback_recorder.as_ref(),
+                    &mut playback_record_block,
                     resampler.as_mut(),
                     now,
                 );
@@ -1376,6 +1394,8 @@ fn live_playback_callback<T>(
     channels: CallbackChannelCount,
     mixer: &mut LivePlaybackMixer,
     echo_control: Option<&Arc<EchoCancellationControl>>,
+    playback_recorder: Option<&LivePlaybackWavRecorderHandle>,
+    playback_record_block: &mut Vec<f32>,
     mut resampler: Option<&mut PlaybackResampler>,
     now: Instant,
 ) where
@@ -1401,6 +1421,9 @@ fn live_playback_callback<T>(
                         }
                         *source = mixed;
                     }
+                    if let Some(recorder) = playback_recorder {
+                        recorder.record_samples(block);
+                    }
                 });
                 let output_sample = T::from_sample(sample.clamp(-1.0, 1.0));
                 for channel in frame {
@@ -1409,15 +1432,24 @@ fn live_playback_callback<T>(
             }
         }
         None => {
-            for frame in output.chunks_mut(channels.get()) {
+            if playback_recorder.is_some() {
+                playback_record_block.resize(output_frames, 0.0);
+            }
+            for (index, frame) in output.chunks_mut(channels.get()).enumerate() {
                 let sample = mixer.pop_mixed_output_sample(now, output_frames);
                 if let Some(writer) = echo_writer.as_mut() {
                     writer.push(sample);
+                }
+                if !playback_record_block.is_empty() {
+                    playback_record_block[index] = sample;
                 }
                 let output_sample = T::from_sample(sample.clamp(-1.0, 1.0));
                 for channel in frame {
                     *channel = output_sample;
                 }
+            }
+            if let Some(recorder) = playback_recorder {
+                recorder.record_samples(playback_record_block);
             }
         }
     }

@@ -246,6 +246,12 @@ impl ReadSpan<'_> {
         self.len() == 0
     }
 
+    /// Returns the two physical slices backing this logical span. The second
+    /// slice is empty unless the readable region wraps around the ring end.
+    pub(crate) fn slices(&self) -> (&[f32], &[f32]) {
+        (self.first, self.second)
+    }
+
     /// Sample at logical `offset`, or `None` past the end of the span.
     pub(crate) fn get(&self, offset: usize) -> Option<f32> {
         let split = self.first.len();

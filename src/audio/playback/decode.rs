@@ -19,15 +19,17 @@ use crate::{
             SpscSwapQueue,
         },
         shared::{
-            DecodedFrameSource, FRAME_SAMPLES, LIVE_CAPTURE_MUTE_FADE, LIVE_OPUS_FRAME_SAMPLES,
-            LIVE_PACKET_FLAG_MUTE, LIVE_PACKET_FLAG_OPUS_RESET, LIVE_PACKET_FLAG_SILENCE_RESUME,
-            LIVE_PLAYBACK_DRAIN_INTERVAL, LIVE_PLAYBACK_DRED_MAX_SAMPLES, LiveAudioTraceWriter,
-            LiveAudioTuning, LivePlaybackFeedback, LivePlaybackSnapshot,
-            LivePlaybackStreamActivity, MAX_OPUS_DECODE_SAMPLES, PlayoutDelay, RemoteVoicePacket,
-            VoicePayload, apply_gain_ramp, duration_to_ms, mute_gain_step, samples_for_duration,
-            samples_to_ms, sequence_distance_forward, trace_decode_output, trace_decoder_reset,
-            trace_dred_parse, trace_dred_skip, trace_fast_forward, trace_jitter_item,
-            trace_mixer_queue,
+            AUDIO_POP_DELTA_THRESHOLD, DecodedFrameSource, FRAME_SAMPLES, LIVE_CAPTURE_MUTE_FADE,
+            LIVE_OPUS_FRAME_SAMPLES, LIVE_PACKET_FLAG_MUTE, LIVE_PACKET_FLAG_OPUS_RESET,
+            LIVE_PACKET_FLAG_SILENCE_RESUME, LIVE_PLAYBACK_DRAIN_INTERVAL,
+            LIVE_PLAYBACK_DRED_MAX_SAMPLES, LiveAudioTraceWriter, LiveAudioTuning,
+            LivePlaybackFeedback, LivePlaybackSnapshot, LivePlaybackStreamActivity,
+            MAX_OPUS_DECODE_SAMPLES, PlayoutDelay, RemoteVoicePacket, VoicePayload,
+            apply_gain_ramp, audio_pop_logging_enabled, duration_to_ms, max_adjacent_delta,
+            mute_gain_step, peak_normalized, rms_normalized, samples_for_duration, samples_to_ms,
+            sequence_distance_forward, trace_decode_output, trace_decoder_reset, trace_dred_parse,
+            trace_dred_skip, trace_fast_forward, trace_jitter_item, trace_mixer_queue,
+            trace_source_name,
         },
     },
     network::{AudioPacketRef, InsertOutcome, PlayoutItem},
@@ -330,7 +332,7 @@ impl LiveDecodeStreams {
         let stream = self.streams.get_mut(&packet.stream_id)?;
         if packet.payload.is_silence() {
             let muted = packet.flags & LIVE_PACKET_FLAG_MUTE != 0;
-            stream.observe_sender_silence(packet.sequence, muted, now);
+            stream.observe_sender_silence(packet.stream_id, packet.sequence, muted, now);
             return Some(InsertOutcome::Accepted);
         }
         let packet_ref = AudioPacketRef {
@@ -351,6 +353,18 @@ impl LiveDecodeStreams {
     /// ignored: the media path re-establishes the state when the stream appears.
     pub(crate) fn set_sender_muted(&mut self, stream_id: u32, muted: bool) {
         if let Some(stream) = self.streams.get_mut(&stream_id) {
+            if audio_pop_logging_enabled() {
+                kvlog::info!(
+                    "audio pop decode control mute command",
+                    stream_id,
+                    muted,
+                    previous_control_muted = stream.control_muted,
+                    previous_sender_muted = stream.sender_muted,
+                    media_muted = stream.media_muted,
+                    control_fallback_active = stream.control_fallback_active,
+                    mute_gain = stream.mute_gain
+                );
+            }
             stream.set_control_muted(muted);
         }
     }
@@ -603,10 +617,17 @@ impl LiveDecodeStream {
         outcome
     }
 
-    pub(crate) fn observe_sender_silence(&mut self, sequence: u32, muted: bool, now: Instant) {
+    pub(crate) fn observe_sender_silence(
+        &mut self,
+        stream_id: u32,
+        sequence: u32,
+        muted: bool,
+        now: Instant,
+    ) {
         self.jitter.observe_sender_silence(sequence);
         self.feedback.observe_sender_silence(sequence, now);
         self.sender_silence_pending = true;
+        let previous_sender_muted = self.sender_muted;
         self.sender_muted = muted;
         self.media_muted = muted;
         if muted {
@@ -614,6 +635,18 @@ impl LiveDecodeStream {
             self.control_fallback_active = false;
         }
         self.dred_gap = None;
+        if audio_pop_logging_enabled() {
+            kvlog::info!(
+                "audio pop decode sender silence marker",
+                stream_id,
+                sequence,
+                muted,
+                previous_sender_muted,
+                control_muted = self.control_muted,
+                control_fallback_active = self.control_fallback_active,
+                mute_gain = self.mute_gain
+            );
+        }
     }
 
     /// Records a mute state learned from the control stream, applied on the next
@@ -628,7 +661,7 @@ impl LiveDecodeStream {
         LIVE_CAPTURE_MUTE_FADE.saturating_add(self.tuning.max_reorder_delay)
     }
 
-    fn apply_control_mute_pending(&mut self, now: Instant) {
+    fn apply_control_mute_pending(&mut self, now: Instant, stream_id: u32) {
         let Some(muted) = self.control_muted_pending.take() else {
             return;
         };
@@ -640,9 +673,22 @@ impl LiveDecodeStream {
             self.control_mute_fallback_at = None;
             self.control_fallback_active = false;
         }
+        if audio_pop_logging_enabled() {
+            kvlog::info!(
+                "audio pop decode control mute pending applied",
+                stream_id,
+                muted,
+                sender_muted = self.sender_muted,
+                media_muted = self.media_muted,
+                control_fallback_active = self.control_fallback_active,
+                fallback_delay_ms = duration_to_ms(self.control_mute_fallback_delay()),
+                fallback_armed = self.control_mute_fallback_at.is_some(),
+                mute_gain = self.mute_gain
+            );
+        }
     }
 
-    fn activate_control_mute_fallback_if_due(&mut self, now: Instant) {
+    fn activate_control_mute_fallback_if_due(&mut self, now: Instant, stream_id: u32) {
         let Some(deadline) = self.control_mute_fallback_at else {
             return;
         };
@@ -656,6 +702,15 @@ impl LiveDecodeStream {
             self.sender_muted = true;
             self.sender_silence_pending = true;
         }
+        if audio_pop_logging_enabled() {
+            kvlog::info!(
+                "audio pop decode control mute fallback activated",
+                stream_id,
+                sender_muted = self.sender_muted,
+                media_muted = self.media_muted,
+                mute_gain = self.mute_gain
+            );
+        }
     }
 
     pub(crate) fn drain_ready<F>(
@@ -668,8 +723,8 @@ impl LiveDecodeStream {
     ) where
         F: FnMut(&mut Option<LiveAudioTraceWriter>, DrainEvent<'_>),
     {
-        self.apply_control_mute_pending(now);
-        self.activate_control_mute_fallback_if_due(now);
+        self.apply_control_mute_pending(now, stream_id);
+        self.activate_control_mute_fallback_if_due(now, stream_id);
 
         if self.sender_silence_pending {
             self.sender_silence_pending = false;
@@ -719,10 +774,37 @@ impl LiveDecodeStream {
                         self.control_fallback_active = false;
                     }
                     self.media_muted = media_muted;
+                    let previous_sender_muted = self.sender_muted;
                     let effective_muted =
                         media_muted || (self.control_muted && self.control_fallback_active);
                     self.sender_muted = effective_muted;
                     let mute_target = if effective_muted { 0.0 } else { 1.0 };
+                    if audio_pop_logging_enabled()
+                        && (*flags != 0
+                            || previous_sender_muted != effective_muted
+                            || self.mute_gain < 1.0
+                            || media_muted)
+                    {
+                        kvlog::info!(
+                            "audio pop decode media mute state",
+                            stream_id,
+                            sequence = *sequence,
+                            flags = *flags,
+                            flag_opus_reset = flags & LIVE_PACKET_FLAG_OPUS_RESET != 0,
+                            flag_silence_resume = flags & LIVE_PACKET_FLAG_SILENCE_RESUME != 0,
+                            flag_mute = flags & LIVE_PACKET_FLAG_MUTE != 0,
+                            payload_size = payload.len(),
+                            media_muted,
+                            effective_muted,
+                            previous_sender_muted,
+                            control_muted = self.control_muted,
+                            control_fallback_active = self.control_fallback_active,
+                            mute_gain = self.mute_gain,
+                            mute_target,
+                            playout_delay_ms =
+                                playout_delay.map(|delay| duration_to_ms(delay.current))
+                        );
+                    }
                     self.decode_playout(
                         payload,
                         DecodedFrameSource::Normal,
@@ -818,6 +900,7 @@ impl LiveDecodeStream {
         };
         match decoded {
             Ok(decoded) => {
+                let gain_before = self.mute_gain;
                 // Ramp the receiver mute gain toward its target across this frame;
                 // a no-op once the gain has settled at unity for an open stream.
                 self.mute_gain = apply_gain_ramp(
@@ -827,6 +910,33 @@ impl LiveDecodeStream {
                     self.mute_gain_step,
                 );
                 let samples = &self.output_frame[..decoded];
+                if audio_pop_logging_enabled() {
+                    let max_delta = max_adjacent_delta(samples);
+                    if mute_target < 1.0
+                        || gain_before < 1.0
+                        || self.mute_gain < 1.0
+                        || max_delta >= AUDIO_POP_DELTA_THRESHOLD
+                        || !matches!(source, DecodedFrameSource::Normal)
+                    {
+                        kvlog::info!(
+                            "audio pop decode output",
+                            stream_id,
+                            sequence,
+                            source = trace_source_name(source),
+                            decoded_samples = decoded,
+                            mute_target,
+                            mute_gain_before = gain_before,
+                            mute_gain_after = self.mute_gain,
+                            rms = rms_normalized(samples),
+                            peak = peak_normalized(samples),
+                            max_delta,
+                            first_sample = samples.first().copied().unwrap_or_default(),
+                            last_sample = samples.last().copied().unwrap_or_default(),
+                            playout_delay_ms =
+                                playout_delay.map(|delay| duration_to_ms(delay.current))
+                        );
+                    }
+                }
                 trace_decode_output(
                     trace,
                     trace_start,
@@ -1509,7 +1619,7 @@ mod tests {
         let mut stream = LiveDecodeStream::new(tuning).unwrap();
         let mut trace = None;
 
-        stream.observe_sender_silence(0, true, start);
+        stream.observe_sender_silence(1, 0, true, start);
         stream.set_control_muted(true);
         stream.drain_ready(start, start, 1, &mut trace, |_, _| {});
 
