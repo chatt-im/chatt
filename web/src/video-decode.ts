@@ -37,10 +37,24 @@ export function parseFrame(buffer: ArrayBuffer): VideoFrame | null {
 /// Drives a `VideoDecoder` for one screen share, drawing decoded frames to a
 /// canvas. It configures from the codec string and `extra_data` descriptor the
 /// client supplies, then feeds each frame body straight to the decoder.
+///
+/// Firefox cannot always initialise a hardware H.264 decoder and, unlike Chrome,
+/// does not fall back to software on its own: the hardware attempt errors before
+/// the first frame decodes. So a hardware failure that happens before any frame
+/// is drawn retries once with software decoding preferred, replaying the frames
+/// buffered since the last keyframe so the picture recovers immediately.
 export class ScreenShareDecoder {
   private decoder: VideoDecoder | null = null;
   // Skip delta frames until the first keyframe so the decoder starts cleanly.
   private sawKey = false;
+  // Config retained so a hardware-decode failure can be retried in software.
+  private codec = "";
+  private description = new Uint8Array(0);
+  private preferSoftware = false;
+  // True once the decoder has drawn a frame. Until then the frames since the
+  // last keyframe are retained so a hardware failure can replay them in software.
+  private decoded = false;
+  private replay: EncodedVideoChunk[] = [];
 
   constructor(private canvas: HTMLCanvasElement) {}
 
@@ -53,9 +67,20 @@ export class ScreenShareDecoder {
   /// descriptor (empty when the stream needs none). Any prior decoder is closed.
   configure(codec: string, description: Uint8Array) {
     this.close();
+    this.codec = codec;
+    this.description = description;
+    this.preferSoftware = false;
+    this.start();
+  }
+
+  // Creates the decoder for the current codec, descriptor, and acceleration
+  // preference, resetting the keyframe and replay state for the fresh decoder.
+  private start() {
     const ctx = this.canvas.getContext("2d");
     this.decoder = new VideoDecoder({
       output: (decoded) => {
+        this.decoded = true;
+        this.replay.length = 0;
         if (ctx) {
           if (this.canvas.width !== decoded.displayWidth) this.canvas.width = decoded.displayWidth;
           if (this.canvas.height !== decoded.displayHeight)
@@ -64,12 +89,33 @@ export class ScreenShareDecoder {
         }
         decoded.close();
       },
-      error: (error) => console.error("video decoder error", error),
+      error: (error) => this.onError(error),
     });
-    const config: VideoDecoderConfig = { codec, optimizeForLatency: true };
-    if (description.length > 0) config.description = description;
+    const config: VideoDecoderConfig = { codec: this.codec, optimizeForLatency: true };
+    if (this.description.length > 0) config.description = this.description;
+    if (this.preferSoftware) config.hardwareAcceleration = "prefer-software";
     this.decoder.configure(config);
     this.sawKey = false;
+    this.decoded = false;
+  }
+
+  // Retries in software when a hardware decoder fails before drawing a frame,
+  // replaying the frames since the last keyframe. A later error, or one after a
+  // software retry, is terminal and only logged.
+  private onError(error: DOMException) {
+    if (this.decoded || this.preferSoftware) {
+      console.error("video decoder error", error);
+      return;
+    }
+    console.warn("screen-share hardware decode failed, falling back to software", error);
+    this.preferSoftware = true;
+    const chunks = this.replay;
+    this.replay = [];
+    this.start();
+    for (const chunk of chunks) {
+      if (chunk.type === "key") this.sawKey = true;
+      this.decoder?.decode(chunk);
+    }
   }
 
   decode(frame: VideoFrame) {
@@ -78,13 +124,18 @@ export class ScreenShareDecoder {
       if (!frame.isKey) return;
       this.sawKey = true;
     }
-    this.decoder.decode(
-      new EncodedVideoChunk({
-        type: frame.isKey ? "key" : "delta",
-        timestamp: frame.tsMs * 1000,
-        data: frame.data,
-      }),
-    );
+    const chunk = new EncodedVideoChunk({
+      type: frame.isKey ? "key" : "delta",
+      timestamp: frame.tsMs * 1000,
+      data: frame.data,
+    });
+    // Retain frames since the last keyframe until the first successful decode so
+    // a hardware failure can replay them in software.
+    if (!this.decoded) {
+      if (frame.isKey) this.replay.length = 0;
+      this.replay.push(chunk);
+    }
+    this.decoder.decode(chunk);
   }
 
   close() {
@@ -97,5 +148,7 @@ export class ScreenShareDecoder {
     }
     this.decoder = null;
     this.sawKey = false;
+    this.decoded = false;
+    this.replay.length = 0;
   }
 }
