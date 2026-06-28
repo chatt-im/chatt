@@ -2,7 +2,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc,
-        atomic::{AtomicU32, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering},
         mpsc::{Receiver, Sender, SyncSender, sync_channel},
     },
     thread::{self, JoinHandle},
@@ -64,6 +64,14 @@ pub struct LiveCaptureConfig {
     pub buffer_request: BufferRequest,
     pub tuning: LiveAudioTuning,
     pub echo_control: Option<Arc<EchoCancellationControl>>,
+    /// Microphone mute flag, shared with the app. The encoder worker reads it
+    /// each chunk so muting drives a fade-out and silence markers through the
+    /// pipeline instead of the audio just stopping (which the receiver would
+    /// mistake for packet loss).
+    pub mic_muted: Arc<AtomicBool>,
+    /// Deafen flag. Deafen force-mutes the microphone, so the encoder treats it
+    /// exactly like [`Self::mic_muted`] for the outgoing fade/silence transition.
+    pub deafened: Arc<AtomicBool>,
 }
 
 #[derive(Clone, Debug)]
@@ -117,6 +125,13 @@ pub(crate) enum LivePlaybackCommand {
     Packet(RemoteVoicePacket),
     StopStream(u32),
     SetStreamControl(u32, PlaybackStreamControl),
+    /// Control-stream mute state for a sender, a fallback for when the in-band
+    /// media mute markers are lost. Reaches the decoder (unlike `SetStreamControl`,
+    /// which only adjusts the mixer) so it can halt loss concealment.
+    SetSenderMuted {
+        stream_id: u32,
+        muted: bool,
+    },
     /// Mix a one-shot notification clip (48 kHz mono `f32`) into the output.
     PlayNotification(Arc<[f32]>),
     Shutdown,
@@ -222,6 +237,14 @@ impl LivePlayback {
     pub fn set_stream_control(&self, stream_id: u32, control: PlaybackStreamControl) {
         if let Some(sender) = &self.sender {
             let _ = sender.send(LivePlaybackCommand::SetStreamControl(stream_id, control));
+        }
+    }
+
+    /// Forwards a sender's control-stream mute state to the decoder so it can
+    /// halt loss concealment when the in-band media mute markers were lost.
+    pub fn set_sender_muted(&self, stream_id: u32, muted: bool) {
+        if let Some(sender) = &self.sender {
+            let _ = sender.send(LivePlaybackCommand::SetSenderMuted { stream_id, muted });
         }
     }
 
@@ -475,6 +498,8 @@ where
     let worker_stats = stats.clone();
     let worker_max_amplification = Arc::clone(&max_amplification_bits);
     let worker_encoder_loss_percent = Arc::clone(&encoder_loss_percent);
+    let worker_mic_muted = Arc::clone(&config.mic_muted);
+    let worker_deafened = Arc::clone(&config.deafened);
     let echo_source = config
         .echo_control
         .clone()
@@ -493,6 +518,8 @@ where
                 config.denoise,
                 worker_max_amplification,
                 worker_encoder_loss_percent,
+                worker_mic_muted,
+                worker_deafened,
                 config.tuning,
                 config.suppression,
                 config.typing_suppression,

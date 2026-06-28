@@ -238,6 +238,12 @@ impl RoomSession {
         self.participants.set_voice_status(user_id, status);
     }
 
+    /// Whether a user is currently muted/deafened per the last control-stream
+    /// voice status, used to seed a newly started stream's sender-mute fallback.
+    pub(super) fn voice_muted(&self, user_id: UserId) -> bool {
+        self.participants.voice_muted(user_id)
+    }
+
     pub(super) fn update_talking_display(
         &mut self,
         user_id: UserId,

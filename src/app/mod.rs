@@ -47,9 +47,10 @@ use crate::{
 
 use chatt::audio::{
     self, BufferRequest, DeviceInfo, EchoCancellationControl, LiveAudioFileSourceConfig,
-    LiveAudioFileSourceReport, LiveAudioPacketLossProfile, LiveCapture, LiveCaptureConfig,
-    LiveEncoderProfile, LivePlayback, LivePlaybackConfig, LivePlaybackFeedback, LivePlaybackSink,
-    LivePlaybackSnapshot, LocalVoiceFrame, NotificationSound, PlaybackStreamControl,
+    LiveAudioFileSourceReport, LiveAudioMuteState, LiveAudioPacketLossProfile, LiveCapture,
+    LiveCaptureConfig, LiveEncoderProfile, LivePlayback, LivePlaybackConfig, LivePlaybackFeedback,
+    LivePlaybackSink, LivePlaybackSnapshot, LocalVoiceFrame, NotificationSound,
+    PlaybackStreamControl,
 };
 
 use audio_diagnostics::AudioDiagnostics;
@@ -229,6 +230,10 @@ pub(crate) struct App {
     pub encoder_profile: LiveEncoderProfile,
     pub last_network_notice: Option<String>,
     pub pending_audio_apply: Option<PendingAudioApply>,
+    /// When set, the deadline at which outbound voice should be hard-disabled
+    /// after a deafen. The teardown is deferred so active senders can transmit
+    /// their mute fade-out tail before transport closes.
+    pending_voice_teardown_at: Option<Instant>,
     pending_network_commands: VecDeque<NetworkCommand>,
     supervisor: SupervisorState,
     /// The browser chat-log feed, present only when `[web] enabled = true`.
@@ -317,6 +322,12 @@ const LOBBY_TALKING_RMS_THRESHOLD: f32 = 0.001; // -60 dBFS
 /// Debounce window before a scheduled audio restart fires. Coalesces rapid
 /// settings edits (cycling a choice, typing a buffer size) into one restart.
 const AUDIO_APPLY_DEBOUNCE: Duration = Duration::from_millis(400);
+
+/// Grace period outbound voice keeps running after a deafen, so active senders
+/// transmit their mute fade-out tail (`LIVE_CAPTURE_MUTE_FADE`) plus an entry
+/// silence marker before transport is hard-disabled. Sized to comfortably cover
+/// the 60 ms fade and the marker that follows it.
+const VOICE_DEAFEN_GRACE: Duration = Duration::from_millis(120);
 
 impl RecoveryState {
     fn schedule(&mut self, now: Instant, reason: impl Into<String>) -> RecoverySchedule {
@@ -660,6 +671,7 @@ impl App {
             encoder_profile: LiveEncoderProfile::DRED_20,
             last_network_notice: None,
             pending_audio_apply: None,
+            pending_voice_teardown_at: None,
             pending_network_commands: VecDeque::new(),
             supervisor: SupervisorState::default(),
             web_feed,
@@ -964,6 +976,7 @@ impl App {
         self.room.reset_for_disconnect();
         self.last_network_notice = None;
         self.voice_tx_enabled.store(false, Ordering::Relaxed);
+        self.pending_voice_teardown_at = None;
         self.pending_network_commands.clear();
         self.supervisor.network.reset();
         self.supervisor.control_socket.reset();
@@ -1159,6 +1172,7 @@ impl App {
             NetworkEvent::VoiceStarted { user_id, stream_id } => {
                 let notice = self.room.voice_started(user_id, stream_id, self.user_id);
                 self.apply_user_audio_control(user_id);
+                self.apply_remote_sender_mute(user_id, self.room.voice_muted(user_id));
                 if notice.local {
                     if self.config.soundboard.enabled {
                         self.set_status("soundboard ready");
@@ -1202,6 +1216,7 @@ impl App {
             }
             NetworkEvent::VoiceStatus { user_id, status } => {
                 self.room.voice_status_changed(user_id, status);
+                self.apply_remote_sender_mute(user_id, status.muted);
             }
             NetworkEvent::EncoderProfileChanged(profile) => {
                 self.encoder_profile = profile;
@@ -1883,6 +1898,24 @@ impl App {
         self.supervise(now);
         self.update_lobby_talking(now);
         self.apply_pending_audio_restart();
+        self.supervise_voice_teardown(now);
+    }
+
+    /// Completes a deferred outbound-voice teardown once the deafen grace period
+    /// has elapsed, after active senders have had time to send their mute
+    /// fade-out tail. See [`Self::set_deafen`].
+    fn supervise_voice_teardown(&mut self, now: Instant) {
+        let Some(deadline) = self.pending_voice_teardown_at else {
+            return;
+        };
+        if now < deadline {
+            return;
+        }
+        self.pending_voice_teardown_at = None;
+        // A racing undeafen clears the deadline, so reaching here means we are
+        // still deafened and the fade tail has been sent.
+        self.voice_tx_enabled.store(false, Ordering::Relaxed);
+        self.stop_mic_capture();
     }
 
     fn update_lobby_talking(&mut self, now: Instant) {
@@ -2509,6 +2542,19 @@ impl App {
         }
     }
 
+    /// Pushes a remote sender's control-stream mute state to the decoder for every
+    /// stream that user owns, as a fallback when the in-band media mute markers are
+    /// lost. Distinct from [`Self::apply_user_audio_control`], which mutes a peer
+    /// locally at the mixer; this halts loss concealment for a sender who muted.
+    fn apply_remote_sender_mute(&self, user_id: UserId, muted: bool) {
+        let Some(playback) = &self.playback else {
+            return;
+        };
+        for stream_id in self.room.stream_ids_for_user(user_id) {
+            playback.set_sender_muted(stream_id, muted);
+        }
+    }
+
     fn apply_all_user_audio_controls(&self) {
         let users = self.room.users_with_streams().collect::<HashSet<UserId>>();
         for user_id in users {
@@ -2682,13 +2728,23 @@ impl App {
         self.deafened.store(deafened, Ordering::Relaxed);
         if deafened {
             self.mic_muted.store(true, Ordering::Relaxed);
-            self.voice_tx_enabled.store(false, Ordering::Relaxed);
-            self.stop_mic_capture();
+            // Keep active senders (and transport) alive briefly so they can send
+            // their mute fade-out tail before capture/transport closes; the
+            // deferred teardown in `supervise_voice_teardown` finishes the job.
+            // With no outbound source there is nothing to fade, so tear down
+            // immediately.
+            if self.capture.is_some() || self.soundboard_busy.load(Ordering::Relaxed) {
+                self.pending_voice_teardown_at = Some(Instant::now() + VOICE_DEAFEN_GRACE);
+            } else {
+                self.voice_tx_enabled.store(false, Ordering::Relaxed);
+                self.stop_mic_capture();
+            }
             self.set_network_playback_sink(None);
             self.playback.take();
             self.publish_voice_status();
             self.set_status("deafened");
         } else {
+            self.pending_voice_teardown_at = None;
             self.publish_voice_status();
             self.set_status("undeafened");
             self.start_room_voice();
@@ -2860,6 +2916,7 @@ impl App {
         let events = self.events.sender();
         let send_failed = Arc::new(AtomicBool::new(false));
         let busy = Arc::clone(&self.soundboard_busy);
+        let voice_tx_enabled = Arc::clone(&self.voice_tx_enabled);
         let source_config = LiveAudioFileSourceConfig {
             input_path,
             tuning: self.config.audio.latency.to_tuning(),
@@ -2869,6 +2926,11 @@ impl App {
             max_amplification: self.config.audio.max_amplification,
             denoise: self.config.audio.denoise.is_enabled(),
             auto_gain: true,
+            mute_state: LiveAudioMuteState::new(
+                Arc::clone(&self.mic_muted),
+                Arc::clone(&self.deafened),
+                Arc::clone(&self.voice_tx_enabled),
+            ),
         };
         self.set_status(format!(
             "soundboard playing {} ({})",
@@ -2883,6 +2945,9 @@ impl App {
             .spawn(move || {
                 let send_failed = Arc::clone(&send_failed);
                 let result = audio::run_live_audio_file_source(source_config, |sequence, frame| {
+                    if !voice_tx_enabled.load(Ordering::Relaxed) {
+                        return;
+                    }
                     if network_tx
                         .send(NetworkCommand::SequencedLocalVoicePacket { sequence, frame })
                         .is_err()
@@ -2924,6 +2989,8 @@ impl App {
             buffer_request: self.input_buffer_request(),
             tuning: self.config.audio.latency.to_tuning(),
             echo_control: Some(Arc::clone(&self.echo_control)),
+            mic_muted: Arc::clone(&self.mic_muted),
+            deafened: Arc::clone(&self.deafened),
         }
     }
 
@@ -2931,14 +2998,13 @@ impl App {
         let tx = self.network.as_ref().map(|network| network.sender());
         let event_tx = self.events.sender();
         let send_failed = Arc::new(AtomicBool::new(false));
-        let mic_muted = Arc::clone(&self.mic_muted);
-        let deafened = Arc::clone(&self.deafened);
         let voice_tx_enabled = Arc::clone(&self.voice_tx_enabled);
+        // Mute and deafen are handled inside the capture pipeline (fade-out tail
+        // plus silence markers), so this handler only gates the hard transport
+        // on/off. Dropping muted frames here would look like packet loss to the
+        // receiver's jitter buffer.
         move |payload| {
-            if mic_muted.load(Ordering::Relaxed)
-                || deafened.load(Ordering::Relaxed)
-                || !voice_tx_enabled.load(Ordering::Relaxed)
-            {
+            if !voice_tx_enabled.load(Ordering::Relaxed) {
                 return;
             }
             if let Some(tx) = &tx
@@ -3214,6 +3280,7 @@ impl App {
         let restart_settings_preview =
             self.settings_preview_capture && !self.deafened.load(Ordering::Relaxed);
         self.voice_tx_enabled.store(false, Ordering::Relaxed);
+        self.pending_voice_teardown_at = None;
         self.stop_mic_capture();
         self.set_network_playback_sink(None);
         self.playback.take();

@@ -57,8 +57,13 @@ const RNNOISE_PROFILE_ITERATIONS: u64 = 100_000;
 const PIPELINE_PROFILE_ITERATIONS: u64 = 15_000;
 const LIVE_CAPTURE_GATE_PROFILE_ITERATIONS: u64 = 160;
 const LIVE_PLAYBACK_MIXER_PROFILE_ITERATIONS: u64 = 150;
-const LIVE_CALL_SIM_PROFILE_ITERATIONS: u64 = 100;
-const LIVE_GROUP_CALL_SIM_PROFILE_ITERATIONS: u64 = 40;
+// Profile-mode iteration counts for the live call simulations. Each iteration
+// runs a full LIVE_SIM_DURATION call through the real capture+playback pipeline,
+// so these are kept low enough that `profile live/call_sim` finishes in a few
+// seconds for quick verification. (Plain `live/call_sim` is bench mode, which
+// sweeps the full parameter matrix and intentionally takes minutes.)
+const LIVE_CALL_SIM_PROFILE_ITERATIONS: u64 = 25;
+const LIVE_GROUP_CALL_SIM_PROFILE_ITERATIONS: u64 = 12;
 
 const PROFILES: [CodecProfile; 10] = [
     CodecProfile {

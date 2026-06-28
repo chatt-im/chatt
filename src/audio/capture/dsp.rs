@@ -473,6 +473,15 @@ impl LongSilenceGate {
         }
     }
 
+    /// Clears all accumulated state. Used when the microphone is muted: the mute
+    /// transition owns the fade and silence markers, and the gate's preroll holds
+    /// pre-mute audio that must not replay when the user unmutes.
+    pub(crate) fn reset(&mut self) {
+        self.silence_frames = 0;
+        self.suppressed = false;
+        self.preroll.clear();
+    }
+
     pub(crate) fn observe(&mut self, samples: &mut [f32], silence: bool) -> CaptureGateDecision {
         if silence {
             self.silence_frames = self.silence_frames.saturating_add(1);

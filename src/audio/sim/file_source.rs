@@ -1,6 +1,10 @@
 use std::{
     path::PathBuf,
-    sync::mpsc::Receiver,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+        mpsc::Receiver,
+    },
     thread,
     time::{Duration, Instant},
 };
@@ -18,6 +22,43 @@ use crate::audio::{
         network::{SimRng, simulation_encoder_profile},
     },
 };
+
+#[derive(Clone, Debug, Default)]
+pub struct LiveAudioMuteState {
+    pub muted: Option<Arc<AtomicBool>>,
+    pub deafened: Option<Arc<AtomicBool>>,
+    pub voice_tx_enabled: Option<Arc<AtomicBool>>,
+}
+
+impl LiveAudioMuteState {
+    pub fn new(
+        muted: Arc<AtomicBool>,
+        deafened: Arc<AtomicBool>,
+        voice_tx_enabled: Arc<AtomicBool>,
+    ) -> Self {
+        Self {
+            muted: Some(muted),
+            deafened: Some(deafened),
+            voice_tx_enabled: Some(voice_tx_enabled),
+        }
+    }
+
+    pub(crate) fn muted(&self) -> bool {
+        self.muted
+            .as_ref()
+            .is_some_and(|muted| muted.load(Ordering::Relaxed))
+            || self
+                .deafened
+                .as_ref()
+                .is_some_and(|deafened| deafened.load(Ordering::Relaxed))
+    }
+
+    pub(crate) fn voice_tx_enabled(&self) -> bool {
+        self.voice_tx_enabled
+            .as_ref()
+            .is_none_or(|enabled| enabled.load(Ordering::Relaxed))
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct LiveAudioFilePlaybackTestConfig {
@@ -62,6 +103,7 @@ pub struct LiveAudioFileSourceConfig {
     pub max_amplification: f32,
     pub denoise: bool,
     pub auto_gain: bool,
+    pub mute_state: LiveAudioMuteState,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -126,7 +168,12 @@ where
         capture_noise_rms: 0.0,
     };
     let network_profile = simulation_encoder_profile(sim_config);
-    let mut state = SimStreamState::new(sim_config, network_profile, None)?;
+    let mut state = SimStreamState::new_with_initial_mute(
+        sim_config,
+        network_profile,
+        None,
+        config.mute_state.muted(),
+    )?;
     state.next_sequence = config.first_sequence;
     let mut rng = SimRng::new(config.seed);
     let mut report = LiveAudioFileSourceReport {
@@ -153,6 +200,7 @@ where
     for frame_index in 0..padded_frames {
         sleep_until_instant(start + frame_duration.saturating_mul(frame_index as u32));
         let now = Instant::now();
+        state.capture_muted = config.mute_state.muted();
         let mut frame = vec![0.0f32; FRAME_SAMPLES];
         let offset = frame_index.saturating_mul(FRAME_SAMPLES);
         if offset < input_pcm.len() {
@@ -172,12 +220,20 @@ where
             &mut sim_report,
             &mut trace,
         )?;
-        deliver_ready_file_source_packets(&mut state, now, &mut sim_report, on_packet);
+        if config.mute_state.voice_tx_enabled() {
+            deliver_ready_file_source_packets(&mut state, now, &mut sim_report, on_packet);
+        } else {
+            let _ = state.network.drain_ready(now);
+        }
     }
 
     while !state.network.pending.is_empty() {
         let now = Instant::now();
-        deliver_ready_file_source_packets(&mut state, now, &mut sim_report, on_packet);
+        if config.mute_state.voice_tx_enabled() {
+            deliver_ready_file_source_packets(&mut state, now, &mut sim_report, on_packet);
+        } else {
+            let _ = state.network.drain_ready(now);
+        }
         thread::sleep(Duration::from_millis(5));
     }
 
@@ -429,15 +485,15 @@ pub(crate) fn drain_file_playback_feedback(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, Mutex};
+    use std::sync::{Arc, Mutex, atomic::AtomicBool};
 
     use super::*;
     use crate::{
         audio::{
             playback::{LiveDecodeStreams, LivePlaybackMixer},
             shared::{
-                DEFAULT_LIVE_MAX_AMPLIFICATION, LIVE_OPUS_FRAME_SAMPLES,
-                LIVE_PACKET_FLAG_OPUS_RESET, frames_for_duration,
+                DEFAULT_LIVE_MAX_AMPLIFICATION, LIVE_OPUS_FRAME_SAMPLES, LIVE_PACKET_FLAG_MUTE,
+                LIVE_PACKET_FLAG_OPUS_RESET, VoicePayload, frames_for_duration,
             },
         },
         network::InsertOutcome,
@@ -464,6 +520,7 @@ mod tests {
             max_amplification: DEFAULT_LIVE_MAX_AMPLIFICATION,
             denoise: false,
             auto_gain: false,
+            mute_state: LiveAudioMuteState::default(),
         }
     }
 
@@ -477,6 +534,7 @@ mod tests {
             max_amplification: 1.0,
             denoise: true,
             auto_gain: true,
+            mute_state: LiveAudioMuteState::default(),
         }
     }
 
@@ -510,8 +568,12 @@ mod tests {
             capture_dc_offset: 0.0,
             capture_noise_rms: 0.0,
         };
-        let mut state =
-            SimStreamState::new(sim_config, simulation_encoder_profile(sim_config), None)?;
+        let mut state = SimStreamState::new_with_initial_mute(
+            sim_config,
+            simulation_encoder_profile(sim_config),
+            None,
+            config.mute_state.muted(),
+        )?;
         state.next_sequence = config.first_sequence;
         let mut rng = SimRng::new(config.seed);
         let mut sim_report = LiveAudioSimulationReport {
@@ -546,6 +608,7 @@ mod tests {
         for frame_index in 0..padded_frames.saturating_add(drain_frames) {
             let now = start + frame_duration.saturating_mul(frame_index as u32);
             if frame_index < padded_frames {
+                state.capture_muted = config.mute_state.muted();
                 let mut frame = vec![0.0f32; FRAME_SAMPLES];
                 let offset = frame_index.saturating_mul(FRAME_SAMPLES);
                 if offset < input_pcm.len() {
@@ -718,6 +781,36 @@ mod tests {
                 .iter()
                 .all(|(_, flags)| flags & LIVE_PACKET_FLAG_OPUS_RESET == 0),
             "only the first packet of a fresh file-source encoder should reset Opus"
+        );
+    }
+
+    #[test]
+    fn file_source_started_muted_does_not_leak_opus_audio() {
+        let muted = Arc::new(AtomicBool::new(true));
+        let deafened = Arc::new(AtomicBool::new(false));
+        let tx_enabled = Arc::new(AtomicBool::new(true));
+        let mut config = file_source_test_config(0);
+        config.mute_state = LiveAudioMuteState::new(muted, deafened, tx_enabled);
+        let input = vec![0.5; FRAME_SAMPLES * 8];
+        let mut packets = Vec::new();
+
+        run_live_audio_file_source_inner(config, &input, &mut |sequence, frame| {
+            packets.push((sequence, frame));
+        })
+        .unwrap();
+
+        assert!(!packets.is_empty(), "muted source should emit markers");
+        assert!(
+            packets
+                .iter()
+                .all(|(_, frame)| matches!(frame.payload, VoicePayload::Silence)),
+            "muted source leaked Opus audio: {packets:?}"
+        );
+        assert!(
+            packets
+                .iter()
+                .all(|(_, frame)| frame.flags & LIVE_PACKET_FLAG_MUTE != 0),
+            "muted source markers must carry the mute flag"
         );
     }
 
