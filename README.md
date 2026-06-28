@@ -184,6 +184,26 @@ Upload a file into an already running client session:
 cargo run -p chatt -- upload ./path/to/file.ext
 ```
 
+Share your screen to other room members, who watch it live in their browser web
+view. `start` captures the X11 desktop with a built-in ffmpeg command:
+
+```sh
+cargo run -p chatt -- screencast start
+cargo run -p chatt -- screencast stop
+```
+
+Override the capture command with `--ffmpeg`, passing the verbatim argv that
+writes H.264 Annex-B to stdout (`pipe:1`). Everything after `--ffmpeg` is the
+command, run directly with no shell:
+
+```sh
+cargo run -p chatt -- screencast start --ffmpeg ffmpeg -f x11grab -i :0 -f h264 pipe:1
+```
+
+A room member sees a play button in their web view (`[web] enabled = true`) and
+the live desktop renders to a canvas. Screen share needs `ffmpeg` on `PATH` and,
+for the default capture, an X11 session.
+
 Inspect audio input devices:
 
 ```sh
@@ -229,6 +249,7 @@ cargo test --workspace
 Useful in-app slash commands:
 
 - `/upload path/to/file.ext`: relay a file to users in the room who accept files.
+- `screencast start` / `screencast stop` (CLI subcommands): share your screen to room members' web views.
 - `/mute` and `/unmute`: control microphone send.
 - `/deafen` and `/undeafen`: stop or resume receive/playback and microphone send.
 - `/audio`: show receive queue, adaptive catch-up, DRED/PLC, trim, and underrun diagnostics.

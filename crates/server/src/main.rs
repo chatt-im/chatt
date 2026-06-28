@@ -3,6 +3,7 @@ use std::{
     collections::VecDeque,
     io::{self, Read, Write},
     net::SocketAddr,
+    sync::Arc,
     sync::mpsc,
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -25,12 +26,14 @@ use rpc::{
         decode_client_hello, encode_invite_ticket, encode_server_control, encode_server_hello,
     },
     crypto::{
-        AntiReplay, CHANNEL_CONTROL, ControlTransport, KEY_LEN, KeyMaterial, SessionSecrets,
-        encode_hex, respond_to_client_hello, respond_to_client_hello_plaintext,
+        AntiReplay, CHANNEL_CONTROL, CHANNEL_VIDEO, ControlTransport, KEY_LEN, KeyMaterial,
+        SessionSecrets, TransportCipher, VideoKeyRole, derive_video_keys, encode_hex,
+        respond_to_client_hello, respond_to_client_hello_plaintext,
     },
     frame,
     ids::{FileTransferId, MessageId, RoomId, SessionId, StreamId, UserId},
     media::{self, MediaPayload},
+    video::{self, VideoAck, VideoHello, VideoRole},
 };
 
 use config::{Config as ServerConfig, UserConfig, hash_secret, value_arg, verify_secret_hash};
@@ -50,6 +53,12 @@ const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(20);
 const MAX_CLIENTS: usize = 1024;
 const MEDIA_SWEEP_INTERVAL: Duration = Duration::from_secs(30);
 const INVITE_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+/// Cap on a stream's fast-start ring. Keyframes reset the ring, so this only
+/// bounds a pathologically long GOP rather than normal operation.
+const VIDEO_RING_MAX_BYTES: usize = 8 * 1024 * 1024;
+/// A subscriber whose queued bytes exceed this after a flush is too slow to keep
+/// up and is dropped. It reconnects and fast-starts from the latest keyframe.
+const VIDEO_SUBSCRIBER_HIGH_WATER: usize = 8 * 1024 * 1024;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = std::env::args().collect::<Vec<_>>();
@@ -159,6 +168,7 @@ struct Server {
     plaintext_addr_to_session: HashMap<SocketAddr, SessionId>,
     peer_links: HashMap<(SessionId, SessionId), PeerLink>,
     rooms: HashMap<RoomId, RoomState>,
+    streams: HashMap<StreamId, VideoStream>,
     next_token: usize,
     next_session: u64,
     next_message: u64,
@@ -247,6 +257,7 @@ impl Server {
             plaintext_addr_to_session: HashMap::new(),
             peer_links: HashMap::new(),
             rooms,
+            streams: HashMap::new(),
             next_token: FIRST_CLIENT,
             next_session: 1,
             next_message: 1,
@@ -396,6 +407,7 @@ impl Server {
                     socket,
                     read_buf: Vec::new(),
                     write_buf: Vec::new(),
+                    kind: ConnKind::Unidentified,
                     state: ConnState::AwaitClientHello,
                     control: None,
                     secrets: None,
@@ -442,6 +454,34 @@ impl Server {
             return;
         }
 
+        // Classify a freshly accepted connection on its first bytes. A video
+        // connection opens with VIDEO_MAGIC, which reads as a control frame
+        // length far above MAX_FRAME_LEN, so it can never collide with a hello.
+        if matches!(
+            self.clients.get(&token).map(|client| &client.kind),
+            Some(ConnKind::Unidentified)
+        ) {
+            let client = self.clients.get_mut(&token).expect("classified token");
+            if client.read_buf.len() < video::VIDEO_MAGIC.len() {
+                return;
+            }
+            if client.read_buf.starts_with(&video::VIDEO_MAGIC) {
+                client.read_buf.drain(..video::VIDEO_MAGIC.len());
+                client.kind = ConnKind::Video(VideoConn::new());
+                kvlog::info!("video connection classified", token = token.0);
+            } else {
+                client.kind = ConnKind::Control;
+            }
+        }
+
+        if matches!(
+            self.clients.get(&token).map(|client| &client.kind),
+            Some(ConnKind::Video(_))
+        ) {
+            self.read_video_conn(token);
+            return;
+        }
+
         loop {
             let frame = match self.clients.get_mut(&token) {
                 Some(client) => match frame::pop_frame(&mut client.read_buf) {
@@ -465,6 +505,428 @@ impl Server {
                 self.disconnect(token);
                 break;
             }
+        }
+    }
+
+    fn read_video_conn(&mut self, token: Token) {
+        loop {
+            let record = match self.clients.get_mut(&token) {
+                Some(client) => match video::pop_record(&mut client.read_buf) {
+                    Ok(Some(record)) => record,
+                    Ok(None) => break,
+                    Err(error) => {
+                        kvlog::warn!(
+                            "video connection sent invalid record",
+                            token = token.0,
+                            error = %error
+                        );
+                        self.disconnect(token);
+                        break;
+                    }
+                },
+                None => break,
+            };
+
+            if let Err(error) = self.process_video_record(token, record) {
+                kvlog::warn!("video connection protocol error", token = token.0, error = %error);
+                self.disconnect(token);
+                break;
+            }
+        }
+    }
+
+    fn process_video_record(&mut self, token: Token, record: Vec<u8>) -> Result<(), String> {
+        let phase = match self.clients.get(&token).map(|client| &client.kind) {
+            Some(ConnKind::Video(video)) => video.phase,
+            _ => return Err("record on a non-video connection".to_string()),
+        };
+        match phase {
+            VideoPhase::AwaitHello => self.handle_video_hello(token, &record),
+            VideoPhase::AwaitAuth => self.handle_video_auth(token, &record),
+            VideoPhase::Streaming => self.handle_video_stream_record(token, record),
+        }
+    }
+
+    fn handle_video_hello(&mut self, token: Token, record: &[u8]) -> Result<(), String> {
+        let hello: VideoHello = video::decode_video_hello(record)?;
+        if hello.version != rpc::PROTOCOL_VERSION {
+            return Err(format!("unsupported video version {}", hello.version));
+        }
+        let stream = self
+            .streams
+            .get(&hello.stream_id)
+            .ok_or_else(|| "unknown video stream".to_string())?;
+        let secret = match hello.role {
+            VideoRole::Publisher => &stream.publish_secret,
+            VideoRole::Subscriber => &stream.view_secret,
+        };
+        let (send, recv) = derive_video_keys(secret, VideoKeyRole::Server);
+        let client = self
+            .clients
+            .get_mut(&token)
+            .ok_or_else(|| "unknown client token".to_string())?;
+        let ConnKind::Video(video) = &mut client.kind else {
+            return Err("hello on a non-video connection".to_string());
+        };
+        video.stream_id = Some(hello.stream_id);
+        video.role = Some(hello.role);
+        video.cipher = Some(TransportCipher::new(send, recv));
+        video.phase = VideoPhase::AwaitAuth;
+        kvlog::info!(
+            "video hello accepted",
+            token = token.0,
+            stream_id = hello.stream_id.0,
+            role = video_role_name(hello.role)
+        );
+        Ok(())
+    }
+
+    fn handle_video_auth(&mut self, token: Token, record: &[u8]) -> Result<(), String> {
+        let client = self
+            .clients
+            .get_mut(&token)
+            .ok_or_else(|| "unknown client token".to_string())?;
+        let ConnKind::Video(video) = &mut client.kind else {
+            return Err("auth on a non-video connection".to_string());
+        };
+        let cipher = video
+            .cipher
+            .as_mut()
+            .ok_or_else(|| "video auth before hello".to_string())?;
+        // The auth payload's contents are irrelevant: opening it proves the peer
+        // holds the per-stream secret. A peer that cannot seal a record the
+        // server opens is dropped, so guessing a stream id yields nothing.
+        cipher
+            .open_next(CHANNEL_VIDEO, record)
+            .map_err(|error| format!("video auth failed: {error}"))?;
+        let ack = video::encode_video_ack(&VideoAck::Ok);
+        let sealed = cipher
+            .seal_next(CHANNEL_VIDEO, &ack)
+            .map_err(|error| error.to_string())?;
+        video.phase = VideoPhase::Streaming;
+        let role = video
+            .role
+            .ok_or_else(|| "video auth before hello".to_string())?;
+        let stream_id = video
+            .stream_id
+            .ok_or_else(|| "video auth before hello".to_string())?;
+        video::write_record(&mut client.write_buf, &sealed).map_err(|error| error.to_string())?;
+        self.write_client(token);
+        match role {
+            VideoRole::Publisher => self.attach_publisher(token, stream_id),
+            VideoRole::Subscriber => self.attach_subscriber(token, stream_id),
+        }
+    }
+
+    fn attach_publisher(&mut self, token: Token, stream_id: StreamId) -> Result<(), String> {
+        let stream = self
+            .streams
+            .get_mut(&stream_id)
+            .ok_or_else(|| "unknown video stream".to_string())?;
+        if let Some(existing) = stream.publisher_conn
+            && existing != token
+        {
+            return Err("video stream already has a publisher".to_string());
+        }
+        stream.publisher_conn = Some(token);
+        kvlog::info!(
+            "video publisher attached",
+            token = token.0,
+            stream_id = stream_id.0
+        );
+        Ok(())
+    }
+
+    /// Adds a subscriber and replays the fast-start burst: the most recent
+    /// keyframe and every frame after it, so the viewer's decoder bootstraps
+    /// without waiting for the next GOP.
+    fn attach_subscriber(&mut self, token: Token, stream_id: StreamId) -> Result<(), String> {
+        let burst: Vec<Arc<[u8]>> = {
+            let stream = self
+                .streams
+                .get_mut(&stream_id)
+                .ok_or_else(|| "unknown video stream".to_string())?;
+            if !stream.subscribers.contains(&token) {
+                stream.subscribers.push(token);
+            }
+            match fast_start_index(&stream.ring) {
+                Some(index) => stream
+                    .ring
+                    .iter()
+                    .skip(index)
+                    .map(|frame| frame.data.clone())
+                    .collect(),
+                None => Vec::new(),
+            }
+        };
+        let burst_len = burst.len();
+        for data in &burst {
+            self.seal_video_to_subscriber(token, data)?;
+        }
+        kvlog::info!(
+            "video subscriber attached",
+            token = token.0,
+            stream_id = stream_id.0,
+            fast_start_frames = burst_len
+        );
+        Ok(())
+    }
+
+    /// Seals one inner frame for a single subscriber and queues it, then flushes.
+    /// Returns whether the subscriber's queue stayed under the high-water mark.
+    fn seal_video_to_subscriber(&mut self, token: Token, data: &[u8]) -> Result<bool, String> {
+        {
+            let client = self
+                .clients
+                .get_mut(&token)
+                .ok_or_else(|| "unknown subscriber token".to_string())?;
+            let ConnKind::Video(video) = &mut client.kind else {
+                return Err("subscriber is not a video connection".to_string());
+            };
+            let cipher = video
+                .cipher
+                .as_mut()
+                .ok_or_else(|| "subscriber missing cipher".to_string())?;
+            let sealed = cipher
+                .seal_next(CHANNEL_VIDEO, data)
+                .map_err(|error| error.to_string())?;
+            video::write_record(&mut client.write_buf, &sealed)
+                .map_err(|error| error.to_string())?;
+        }
+        self.write_client(token);
+        let within = self
+            .clients
+            .get(&token)
+            .map(|client| subscriber_within_limit(client.write_buf.len()))
+            .unwrap_or(false);
+        Ok(within)
+    }
+
+    fn handle_video_stream_record(&mut self, token: Token, record: Vec<u8>) -> Result<(), String> {
+        let (role, stream_id, plaintext) = {
+            let client = self
+                .clients
+                .get_mut(&token)
+                .ok_or_else(|| "unknown client token".to_string())?;
+            let ConnKind::Video(video) = &mut client.kind else {
+                return Err("stream record on a non-video connection".to_string());
+            };
+            let role = video
+                .role
+                .ok_or_else(|| "stream before hello".to_string())?;
+            let stream_id = video
+                .stream_id
+                .ok_or_else(|| "stream before hello".to_string())?;
+            let cipher = video
+                .cipher
+                .as_mut()
+                .ok_or_else(|| "stream before auth".to_string())?;
+            let plaintext = cipher
+                .open_next(CHANNEL_VIDEO, &record)
+                .map_err(|error| error.to_string())?;
+            (role, stream_id, plaintext)
+        };
+        match role {
+            VideoRole::Publisher => {
+                if plaintext.len() < video::VIDEO_FRAME_HEADER_LEN {
+                    return Err("video frame is shorter than its header".to_string());
+                }
+                let is_key = plaintext[12] == 1;
+                self.publish_video_frame(stream_id, Arc::from(plaintext), is_key);
+                Ok(())
+            }
+            // A subscriber sends nothing after authenticating.
+            VideoRole::Subscriber => Ok(()),
+        }
+    }
+
+    /// Caches one published frame and fans it out to every subscriber. On a
+    /// keyframe the ring resets so a new viewer starts from a self-contained
+    /// point. A subscriber whose queue overflows is dropped, it reconnects and
+    /// fast-starts cheaply.
+    fn publish_video_frame(&mut self, stream_id: StreamId, data: Arc<[u8]>, is_key: bool) {
+        let subscribers = {
+            let Some(stream) = self.streams.get_mut(&stream_id) else {
+                return;
+            };
+            if is_key {
+                stream.ring.clear();
+                stream.ring_bytes = 0;
+            }
+            stream.ring_bytes += data.len();
+            stream.ring.push_back(VideoRingFrame {
+                data: data.clone(),
+                is_key,
+            });
+            while stream.ring_bytes > VIDEO_RING_MAX_BYTES && stream.ring.len() > 1 {
+                if let Some(front) = stream.ring.pop_front() {
+                    stream.ring_bytes -= front.data.len();
+                }
+            }
+            stream.subscribers.clone()
+        };
+        let mut overflowed = Vec::new();
+        for token in subscribers {
+            match self.seal_video_to_subscriber(token, &data) {
+                Ok(true) => {}
+                Ok(false) | Err(_) => overflowed.push(token),
+            }
+        }
+        for token in overflowed {
+            if let Some(stream) = self.streams.get_mut(&stream_id) {
+                stream.subscribers.retain(|other| *other != token);
+            }
+            kvlog::warn!(
+                "video subscriber dropped for backpressure",
+                token = token.0,
+                stream_id = stream_id.0
+            );
+            self.disconnect(token);
+        }
+    }
+
+    fn start_share(
+        &mut self,
+        session_id: SessionId,
+        room_id: RoomId,
+        codec: String,
+        coded_width: u32,
+        coded_height: u32,
+        annexb: bool,
+        extradata: Vec<u8>,
+    ) -> Result<(), String> {
+        let (user_id, sender_name, in_room) = match self.sessions.get(&session_id) {
+            Some(session) => (
+                session.user_id,
+                session.display_name.clone(),
+                session.room_id == Some(room_id),
+            ),
+            None => return Err("unknown session".to_string()),
+        };
+        if !in_room {
+            return Err("join the room before sharing".to_string());
+        }
+        if self
+            .streams
+            .values()
+            .any(|stream| stream.owner_session == session_id)
+        {
+            return Err("a screen share is already active for this session".to_string());
+        }
+        let publish_secret = random_secret(&self.rng)?;
+        let view_secret = random_secret(&self.rng)?;
+        let stream_id = StreamId(self.next_stream);
+        self.next_stream = self.next_stream.wrapping_add(1).max(1);
+        self.streams.insert(
+            stream_id,
+            VideoStream {
+                room_id,
+                owner_session: session_id,
+                user_id,
+                sender_name: sender_name.clone(),
+                publish_secret,
+                view_secret,
+                codec: codec.clone(),
+                coded_width,
+                coded_height,
+                annexb,
+                extradata: extradata.clone(),
+                publisher_conn: None,
+                subscribers: Vec::new(),
+                ring: VecDeque::new(),
+                ring_bytes: 0,
+            },
+        );
+        kvlog::info!(
+            "screen share started",
+            session_id = session_id.0,
+            room_id = room_id.0,
+            stream_id = stream_id.0,
+            codec = codec.as_str()
+        );
+        if let Some(token) = self.live_token_for_session(session_id) {
+            self.send_control_to_token(
+                token,
+                &ServerControl::ShareStarted {
+                    stream_id,
+                    publish_secret: publish_secret.to_vec(),
+                },
+            )?;
+        }
+        self.broadcast_control_except(
+            room_id,
+            &ServerControl::ShareAvailable {
+                room_id,
+                stream_id,
+                user_id,
+                sender_name,
+                codec,
+                coded_width,
+                coded_height,
+                annexb,
+                extradata,
+                view_secret: view_secret.to_vec(),
+            },
+            Some(session_id),
+        );
+        Ok(())
+    }
+
+    fn stop_share(&mut self, session_id: SessionId, stream_id: StreamId) -> Result<(), String> {
+        match self.streams.get(&stream_id) {
+            Some(stream) if stream.owner_session == session_id => {}
+            Some(_) => return Err("not the owner of this share".to_string()),
+            None => return Ok(()),
+        }
+        self.end_share(stream_id);
+        Ok(())
+    }
+
+    fn end_share(&mut self, stream_id: StreamId) {
+        let Some(stream) = self.streams.remove(&stream_id) else {
+            return;
+        };
+        let room_id = stream.room_id;
+        let mut tokens = stream.subscribers.clone();
+        if let Some(publisher) = stream.publisher_conn {
+            tokens.push(publisher);
+        }
+        self.broadcast_control(room_id, &ServerControl::ShareEnded { room_id, stream_id });
+        for token in tokens {
+            self.disconnect(token);
+        }
+        kvlog::info!(
+            "screen share ended",
+            stream_id = stream_id.0,
+            room_id = room_id.0
+        );
+    }
+
+    fn end_shares_for_session(&mut self, session_id: SessionId) {
+        let stream_ids = self
+            .streams
+            .iter()
+            .filter(|(_, stream)| stream.owner_session == session_id)
+            .map(|(stream_id, _)| *stream_id)
+            .collect::<Vec<_>>();
+        for stream_id in stream_ids {
+            self.end_share(stream_id);
+        }
+    }
+
+    /// Prunes a dropped video connection's token from its stream. Called from
+    /// `disconnect` before the connection's `ClientConn` is gone.
+    fn detach_video_conn(&mut self, stream_id: StreamId, role: VideoRole, token: Token) {
+        let Some(stream) = self.streams.get_mut(&stream_id) else {
+            return;
+        };
+        match role {
+            VideoRole::Publisher => {
+                if stream.publisher_conn == Some(token) {
+                    stream.publisher_conn = None;
+                }
+            }
+            VideoRole::Subscriber => stream.subscribers.retain(|other| *other != token),
         }
     }
 
@@ -689,6 +1151,32 @@ impl Server {
                 let session_id = self.session_for_token(token)?;
                 self.cancel_file_upload(session_id, transfer_id, reason);
                 Ok(())
+            }
+            (
+                ConnState::Ready,
+                ClientControl::StartShare {
+                    room_id,
+                    codec,
+                    coded_width,
+                    coded_height,
+                    annexb,
+                    extradata,
+                },
+            ) => {
+                let session_id = self.session_for_token(token)?;
+                self.start_share(
+                    session_id,
+                    room_id,
+                    codec,
+                    coded_width,
+                    coded_height,
+                    annexb,
+                    extradata,
+                )
+            }
+            (ConnState::Ready, ClientControl::StopShare { stream_id }) => {
+                let session_id = self.session_for_token(token)?;
+                self.stop_share(session_id, stream_id)
             }
             (ConnState::Ready, ClientControl::Ping { nonce }) => {
                 self.send_control_to_token(token, &ServerControl::Pong { nonce })
@@ -1023,6 +1511,10 @@ impl Server {
             return;
         }
         self.send_existing_voice_streams_to_token(room_id, session_id, token);
+        if self.live_token_for_session(session_id).is_none() {
+            return;
+        }
+        self.send_existing_shares_to_token(room_id, session_id, token);
         if self.live_token_for_session(session_id).is_none() {
             return;
         }
@@ -1552,6 +2044,38 @@ impl Server {
                     stream_id,
                 },
             );
+        }
+    }
+
+    /// Announces every active share in the room to a member that just joined, so
+    /// a viewer who arrives mid-share still sees a play button with the codec.
+    fn send_existing_shares_to_token(
+        &mut self,
+        room_id: RoomId,
+        joining_session_id: SessionId,
+        token: Token,
+    ) {
+        let available = self
+            .streams
+            .iter()
+            .filter(|(_, stream)| {
+                stream.room_id == room_id && stream.owner_session != joining_session_id
+            })
+            .map(|(stream_id, stream)| ServerControl::ShareAvailable {
+                room_id,
+                stream_id: *stream_id,
+                user_id: stream.user_id,
+                sender_name: stream.sender_name.clone(),
+                codec: stream.codec.clone(),
+                coded_width: stream.coded_width,
+                coded_height: stream.coded_height,
+                annexb: stream.annexb,
+                extradata: stream.extradata.clone(),
+                view_secret: stream.view_secret.to_vec(),
+            })
+            .collect::<Vec<_>>();
+        for control in &available {
+            let _ = self.send_control_to_token(token, control);
         }
     }
 
@@ -2216,8 +2740,14 @@ impl Server {
             session_id = client.session_id.map(|id| id.0),
             user_id = client.user_id.map(|id| id.0)
         );
+        if let ConnKind::Video(video) = &client.kind
+            && let (Some(stream_id), Some(role)) = (video.stream_id, video.role)
+        {
+            self.detach_video_conn(stream_id, role, token);
+        }
         if let Some(session_id) = client.session_id {
             self.cancel_uploads_for_session(session_id, "sender disconnected");
+            self.end_shares_for_session(session_id);
             let room_id = self.sessions.get(&session_id).and_then(|s| s.room_id);
             if let Some(room_id) = room_id {
                 self.leave_room(session_id, room_id, Some(session_id));
@@ -2314,12 +2844,53 @@ struct ClientConn {
     socket: TcpStream,
     read_buf: Vec<u8>,
     write_buf: Vec<u8>,
+    kind: ConnKind,
     state: ConnState,
     control: Option<ControlTransport>,
     secrets: Option<SessionSecrets>,
     session_id: Option<SessionId>,
     user_id: Option<UserId>,
     disconnect: bool,
+}
+
+/// How a TCP connection has been classified on its first read.
+///
+/// Every connection starts [`ConnKind::Unidentified`]. The first bytes either
+/// match [`video::VIDEO_MAGIC`], promoting it to [`ConnKind::Video`], or fall
+/// through to the control handshake as [`ConnKind::Control`]. Control, voice,
+/// and file traffic only ever run under [`ConnKind::Control`].
+enum ConnKind {
+    Unidentified,
+    Control,
+    Video(VideoConn),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum VideoPhase {
+    AwaitHello,
+    AwaitAuth,
+    Streaming,
+}
+
+/// Per-connection state for a dedicated video connection. `stream_id`, `role`,
+/// and `cipher` are filled once the clear [`VideoHello`] arrives, before the
+/// sealed auth record is opened.
+struct VideoConn {
+    phase: VideoPhase,
+    stream_id: Option<StreamId>,
+    role: Option<VideoRole>,
+    cipher: Option<TransportCipher>,
+}
+
+impl VideoConn {
+    fn new() -> Self {
+        Self {
+            phase: VideoPhase::AwaitHello,
+            stream_id: None,
+            role: None,
+            cipher: None,
+        }
+    }
 }
 
 struct Session {
@@ -2376,6 +2947,36 @@ struct RoomState {
     active_streams: HashMap<StreamId, SessionId>,
 }
 
+/// Server-side state for one screen-share stream: the room it belongs to, the
+/// per-stream secrets distributed over the control channel, the codec metadata
+/// echoed to viewers, the live publisher and subscriber connections, and the
+/// fast-start ring of recent frames.
+struct VideoStream {
+    room_id: RoomId,
+    owner_session: SessionId,
+    user_id: UserId,
+    sender_name: String,
+    publish_secret: [u8; KEY_LEN],
+    view_secret: [u8; KEY_LEN],
+    codec: String,
+    coded_width: u32,
+    coded_height: u32,
+    annexb: bool,
+    extradata: Vec<u8>,
+    publisher_conn: Option<Token>,
+    subscribers: Vec<Token>,
+    ring: VecDeque<VideoRingFrame>,
+    ring_bytes: usize,
+}
+
+/// One cached frame in a stream's fast-start ring. `data` is the inner
+/// [`video::write_video_frame`] plaintext (13-byte header plus H.264), shared so
+/// fan-out to many subscribers does not copy it.
+struct VideoRingFrame {
+    data: Arc<[u8]>,
+    is_key: bool,
+}
+
 fn room_recipient_tokens(
     rooms: &HashMap<RoomId, RoomState>,
     sessions: &HashMap<SessionId, Session>,
@@ -2395,6 +2996,17 @@ fn room_recipient_tokens(
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// Index of the most recent keyframe in a fast-start ring, the point a new
+/// subscriber must begin from so its decoder bootstraps.
+fn fast_start_index(ring: &VecDeque<VideoRingFrame>) -> Option<usize> {
+    ring.iter().rposition(|frame| frame.is_key)
+}
+
+/// Whether a subscriber's queued bytes are still under the backpressure cap.
+fn subscriber_within_limit(write_buf_len: usize) -> bool {
+    write_buf_len <= VIDEO_SUBSCRIBER_HIGH_WATER
 }
 
 fn now_ms() -> u64 {
@@ -2430,6 +3042,13 @@ fn random_secret_hex(rng: &ring::rand::SystemRandom) -> Result<String, String> {
 
 fn ordered_pair(a: SessionId, b: SessionId) -> (SessionId, SessionId) {
     if a <= b { (a, b) } else { (b, a) }
+}
+
+fn random_secret(rng: &dyn SecureRandom) -> Result<[u8; KEY_LEN], String> {
+    let mut bytes = [0u8; KEY_LEN];
+    rng.fill(&mut bytes)
+        .map_err(|_| "failed to generate video secret".to_string())?;
+    Ok(bytes)
 }
 
 fn random_key(rng: &dyn SecureRandom) -> Result<KeyMaterial, String> {
@@ -2526,7 +3145,16 @@ fn client_control_kind(control: &ClientControl) -> &'static str {
         ClientControl::UploadFileChunk { .. } => "upload_file_chunk",
         ClientControl::UploadFileComplete { .. } => "upload_file_complete",
         ClientControl::UploadFileCancel { .. } => "upload_file_cancel",
+        ClientControl::StartShare { .. } => "start_share",
+        ClientControl::StopShare { .. } => "stop_share",
         ClientControl::Ping { .. } => "ping",
+    }
+}
+
+fn video_role_name(role: VideoRole) -> &'static str {
+    match role {
+        VideoRole::Publisher => "publisher",
+        VideoRole::Subscriber => "subscriber",
     }
 }
 
@@ -2548,6 +3176,9 @@ fn server_control_kind(control: &ServerControl) -> &'static str {
         ServerControl::FileChunk { .. } => "file_chunk",
         ServerControl::FileComplete { .. } => "file_complete",
         ServerControl::FileCanceled { .. } => "file_canceled",
+        ServerControl::ShareStarted { .. } => "share_started",
+        ServerControl::ShareAvailable { .. } => "share_available",
+        ServerControl::ShareEnded { .. } => "share_ended",
         ServerControl::Pong { .. } => "pong",
         ServerControl::Error { .. } => "error",
     }
@@ -2624,6 +3255,86 @@ mod tests {
                 deafened: true,
             }
         );
+    }
+
+    fn ring_frame(is_key: bool) -> VideoRingFrame {
+        let mut bytes = Vec::new();
+        video::write_video_frame(&mut bytes, 0, is_key, &[0u8; 8]);
+        VideoRingFrame {
+            data: Arc::from(bytes),
+            is_key,
+        }
+    }
+
+    fn test_stream(room_id: RoomId, owner: SessionId) -> VideoStream {
+        VideoStream {
+            room_id,
+            owner_session: owner,
+            user_id: UserId(1),
+            sender_name: "sharer".to_string(),
+            publish_secret: [1u8; KEY_LEN],
+            view_secret: [2u8; KEY_LEN],
+            codec: "avc1.42c01f".to_string(),
+            coded_width: 1280,
+            coded_height: 720,
+            annexb: true,
+            extradata: Vec::new(),
+            publisher_conn: None,
+            subscribers: Vec::new(),
+            ring: VecDeque::new(),
+            ring_bytes: 0,
+        }
+    }
+
+    #[test]
+    fn fast_start_index_points_at_last_keyframe() {
+        let mut ring = VecDeque::new();
+        ring.push_back(ring_frame(true));
+        ring.push_back(ring_frame(false));
+        ring.push_back(ring_frame(true));
+        ring.push_back(ring_frame(false));
+        let index = fast_start_index(&ring).unwrap();
+        assert_eq!(index, 2);
+        assert!(
+            ring[index].is_key,
+            "a late joiner's first frame is a keyframe"
+        );
+    }
+
+    #[test]
+    fn fast_start_index_is_none_without_a_keyframe() {
+        let mut ring = VecDeque::new();
+        ring.push_back(ring_frame(false));
+        ring.push_back(ring_frame(false));
+        assert_eq!(fast_start_index(&ring), None);
+    }
+
+    #[test]
+    fn subscriber_within_limit_trips_above_high_water() {
+        assert!(subscriber_within_limit(VIDEO_SUBSCRIBER_HIGH_WATER));
+        assert!(!subscriber_within_limit(VIDEO_SUBSCRIBER_HIGH_WATER + 1));
+    }
+
+    #[test]
+    fn publish_video_frame_resets_ring_on_keyframe() {
+        let mut server = test_server();
+        let stream_id = StreamId(1);
+        server
+            .streams
+            .insert(stream_id, test_stream(RoomId(1), SessionId(1)));
+
+        let delta = ring_frame(false).data;
+        let key = ring_frame(true).data;
+        server.publish_video_frame(stream_id, key.clone(), true);
+        server.publish_video_frame(stream_id, delta.clone(), false);
+        server.publish_video_frame(stream_id, delta.clone(), false);
+        // A new keyframe drops the earlier GOP so a fresh viewer starts clean.
+        server.publish_video_frame(stream_id, key.clone(), true);
+
+        let stream = server.streams.get(&stream_id).unwrap();
+        assert_eq!(stream.ring.len(), 1);
+        assert!(stream.ring[0].is_key);
+        assert_eq!(stream.ring_bytes, key.len());
     }
 
     #[test]

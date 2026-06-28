@@ -8,6 +8,8 @@ pub const DEFAULT_FILE_SIZE_LIMIT_BYTES: u64 = 50 * 1024 * 1024;
 pub const MAX_FILE_CHUNK_BYTES: usize = 32 * 1024;
 pub const MAX_FILE_NAME_BYTES: usize = 255;
 pub const MAX_AUTH_FIELD_BYTES: usize = 512;
+pub const MAX_VIDEO_CODEC_BYTES: usize = 64;
+pub const MAX_VIDEO_EXTRADATA_BYTES: usize = 4 * 1024;
 pub const MIN_PAIRING_SECRET_BYTES: usize = 16;
 pub const MIN_PAIRED_TOKEN_BYTES: usize = 32;
 pub const ERROR_AUTH_REJECTED: u16 = 401;
@@ -93,6 +95,17 @@ pub enum ClientControl {
         transfer_id: FileTransferId,
         reason: String,
     },
+    StartShare {
+        room_id: RoomId,
+        codec: String,
+        coded_width: u32,
+        coded_height: u32,
+        annexb: bool,
+        extradata: Vec<u8>,
+    },
+    StopShare {
+        stream_id: StreamId,
+    },
     Ping {
         nonce: u64,
     },
@@ -165,6 +178,26 @@ pub enum ServerControl {
     FileCanceled {
         transfer_id: FileTransferId,
         reason: String,
+    },
+    ShareStarted {
+        stream_id: StreamId,
+        publish_secret: Vec<u8>,
+    },
+    ShareAvailable {
+        room_id: RoomId,
+        stream_id: StreamId,
+        user_id: UserId,
+        sender_name: String,
+        codec: String,
+        coded_width: u32,
+        coded_height: u32,
+        annexb: bool,
+        extradata: Vec<u8>,
+        view_secret: Vec<u8>,
+    },
+    ShareEnded {
+        room_id: RoomId,
+        stream_id: StreamId,
     },
     Pong {
         nonce: u64,
@@ -474,6 +507,19 @@ fn validate_client_control(value: &ClientControl) -> Result<(), String> {
         ClientControl::UploadFileCancel { reason, .. } => {
             if reason.len() > 512 {
                 return Err("file cancel reason exceeds maximum length".to_string());
+            }
+        }
+        ClientControl::StartShare {
+            codec, extradata, ..
+        } => {
+            if codec.trim().is_empty() {
+                return Err("share codec is empty".to_string());
+            }
+            if codec.len() > MAX_VIDEO_CODEC_BYTES {
+                return Err("share codec exceeds maximum length".to_string());
+            }
+            if extradata.len() > MAX_VIDEO_EXTRADATA_BYTES {
+                return Err("share extradata exceeds maximum length".to_string());
             }
         }
         _ => {}
@@ -823,6 +869,48 @@ mod tests {
         };
         let encoded = encode_client_control(&control).unwrap();
         assert_eq!(decode_client_control(&encoded).unwrap(), control);
+    }
+
+    #[test]
+    fn share_control_round_trips() {
+        let start = ClientControl::StartShare {
+            room_id: RoomId(3),
+            codec: "avc1.42c01f".to_string(),
+            coded_width: 1280,
+            coded_height: 720,
+            annexb: true,
+            extradata: vec![],
+        };
+        let encoded = encode_client_control(&start).unwrap();
+        assert_eq!(decode_client_control(&encoded).unwrap(), start);
+
+        let available = ServerControl::ShareAvailable {
+            room_id: RoomId(3),
+            stream_id: StreamId(8),
+            user_id: UserId(4),
+            sender_name: "Alice".to_string(),
+            codec: "avc1.42c01f".to_string(),
+            coded_width: 1280,
+            coded_height: 720,
+            annexb: true,
+            extradata: vec![],
+            view_secret: vec![9; 32],
+        };
+        let encoded = encode_server_control(&available);
+        assert_eq!(decode_server_control(&encoded).unwrap(), available);
+    }
+
+    #[test]
+    fn rejects_empty_share_codec() {
+        let start = ClientControl::StartShare {
+            room_id: RoomId(1),
+            codec: "  ".to_string(),
+            coded_width: 0,
+            coded_height: 0,
+            annexb: true,
+            extradata: vec![],
+        };
+        assert!(encode_client_control(&start).is_err());
     }
 
     #[test]

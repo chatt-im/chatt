@@ -1,6 +1,8 @@
 import { createSignal, createEffect, onCleanup, onMount, Show } from "solid-js";
 import { Virtualizer, type VirtualizerHandle } from "./vendor/virtua/solid/Virtualizer";
-import type { WebMessage, ServerEnvelope, ClientRequest } from "./types";
+import type { WebMessage, ServerEnvelope, ClientRequest, ShareInfo } from "./types";
+import ScreenShare from "./ScreenShare";
+import { ScreenShareDecoder, parseFrame } from "./video-decode";
 
 // Pixel tolerance when deciding the view is "at the bottom". Scroll positions
 // are fractional, so an exact comparison would intermittently read as
@@ -82,6 +84,12 @@ export default function App() {
   // Drives virtua's `shift`: while true a data change is treated as a prepend so
   // scroll position is anchored from the end (reverse infinite scroll).
   const [prepend, setPrepend] = createSignal(false);
+
+  // Screen shares this browser can watch, and the one currently playing.
+  const [shares, setShares] = createSignal<ShareInfo[]>([]);
+  const [playing, setPlaying] = createSignal<number | null>(null);
+  let canvasEl: HTMLCanvasElement | undefined;
+  let decoder: ScreenShareDecoder | undefined;
 
   let logEl: HTMLDivElement | undefined;
   let contentEl: HTMLDivElement | undefined;
@@ -174,6 +182,20 @@ export default function App() {
     socket.send(JSON.stringify(req));
   }
 
+  function playShare(streamId: number) {
+    if (socket && socket.readyState === WebSocket.OPEN) {
+      socket.send(JSON.stringify({ type: "play_share", stream_id: streamId } as ClientRequest));
+    }
+  }
+
+  function stopShare(streamId: number) {
+    if (socket && socket.readyState === WebSocket.OPEN) {
+      socket.send(JSON.stringify({ type: "stop_share", stream_id: streamId } as ClientRequest));
+    }
+    decoder?.close();
+    setPlaying(null);
+  }
+
   function onScroll(offset: number) {
     // Page in older history when the user nears the top. Guarded so it never
     // duplicates an in-flight request; after a prepend the offset moves down
@@ -207,8 +229,15 @@ export default function App() {
 
   function connect() {
     const ws = new WebSocket(`ws://${location.host}/ws`);
+    // Video frames arrive as binary messages; everything else is JSON text.
+    ws.binaryType = "arraybuffer";
     ws.onopen = () => setConnected(true);
     ws.onmessage = (ev) => {
+      if (typeof ev.data !== "string") {
+        const frame = parseFrame(ev.data as ArrayBuffer);
+        if (frame && decoder) decoder.decode(frame);
+        return;
+      }
       const env: ServerEnvelope = JSON.parse(ev.data);
       if (env.type === "sync") {
         setMessages(env.messages);
@@ -224,6 +253,26 @@ export default function App() {
         }
         oldestSeq = env.oldest_seq;
         hasMore = env.has_more;
+      } else if (env.type === "share_available") {
+        setShares((prev) =>
+          prev.some((s) => s.stream_id === env.stream_id)
+            ? prev
+            : [...prev, { stream_id: env.stream_id, sender: env.sender, codec: env.codec }],
+        );
+      } else if (env.type === "share_config") {
+        // The decoder configures lazily from the first keyframe's SPS/PPS, so
+        // this only prepares it and marks the share as playing.
+        if (canvasEl) {
+          if (!decoder) decoder = new ScreenShareDecoder(canvasEl);
+          decoder.reset();
+          setPlaying(env.stream_id);
+        }
+      } else if (env.type === "share_ended") {
+        setShares((prev) => prev.filter((s) => s.stream_id !== env.stream_id));
+        if (playing() === env.stream_id) {
+          decoder?.close();
+          setPlaying(null);
+        }
       } else {
         // Upsert by file_id: a file's announcement placeholder and its later
         // inline version share an id, so the second arrival enriches the first
@@ -266,6 +315,7 @@ export default function App() {
     if (reconnectTimer) clearTimeout(reconnectTimer);
     if (suppressTimer) clearTimeout(suppressTimer);
     if (idleTimer) clearTimeout(idleTimer);
+    decoder?.close();
     socket?.close();
   });
 
@@ -277,6 +327,13 @@ export default function App() {
           {connected() ? "live" : "offline"}
         </span>
       </header>
+      <ScreenShare
+        shares={shares()}
+        playing={playing()}
+        onPlay={playShare}
+        onStop={stopShare}
+        canvasRef={(el) => (canvasEl = el)}
+      />
       <div
         class="chat-log"
         ref={logEl}

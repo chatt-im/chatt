@@ -120,6 +120,16 @@ pub enum NetworkCommand {
     SetPlaybackSink(Option<LivePlaybackSink>),
     PlaybackFeedback(LivePlaybackFeedback),
     SetVoiceStatus(ParticipantVoiceStatus),
+    StartShare {
+        codec: String,
+        coded_width: u32,
+        coded_height: u32,
+        annexb: bool,
+        extradata: Vec<u8>,
+    },
+    StopShare {
+        stream_id: StreamId,
+    },
     Shutdown,
 }
 
@@ -172,6 +182,26 @@ pub enum NetworkEvent {
         status: ParticipantVoiceStatus,
     },
     EncoderProfileChanged(LiveEncoderProfile),
+    ShareStarted {
+        stream_id: StreamId,
+        publish_secret: Vec<u8>,
+    },
+    ShareAvailable {
+        room_id: RoomId,
+        stream_id: StreamId,
+        user_id: UserId,
+        sender_name: String,
+        codec: String,
+        coded_width: u32,
+        coded_height: u32,
+        annexb: bool,
+        extradata: Vec<u8>,
+        view_secret: Vec<u8>,
+    },
+    ShareEnded {
+        room_id: RoomId,
+        stream_id: StreamId,
+    },
     Status(String),
     Error(String),
     AuthFailed(String),
@@ -1643,6 +1673,26 @@ impl WorkerState {
             NetworkCommand::SetVoiceStatus(status) => {
                 self.queue_control(ClientControl::SetVoiceStatus { status })?;
             }
+            NetworkCommand::StartShare {
+                codec,
+                coded_width,
+                coded_height,
+                annexb,
+                extradata,
+            } => {
+                let room_id = self.room_id.unwrap_or(self.config.room_id);
+                self.queue_control(ClientControl::StartShare {
+                    room_id,
+                    codec,
+                    coded_width,
+                    coded_height,
+                    annexb,
+                    extradata,
+                })?;
+            }
+            NetworkCommand::StopShare { stream_id } => {
+                self.queue_control(ClientControl::StopShare { stream_id })?;
+            }
             NetworkCommand::Shutdown => {
                 kvlog::info!("shutdown command handling");
                 self.shutdown = true;
@@ -2283,6 +2333,58 @@ impl WorkerState {
                 reason,
             } => {
                 self.handle_file_canceled(transfer_id, &reason);
+            }
+            ServerControl::ShareStarted {
+                stream_id,
+                publish_secret,
+            } => {
+                kvlog::info!("client share started", stream_id = stream_id.0);
+                let _ = self.events.send(NetworkEvent::ShareStarted {
+                    stream_id,
+                    publish_secret,
+                });
+            }
+            ServerControl::ShareAvailable {
+                room_id,
+                stream_id,
+                user_id,
+                sender_name,
+                codec,
+                coded_width,
+                coded_height,
+                annexb,
+                extradata,
+                view_secret,
+            } => {
+                kvlog::info!(
+                    "client share available",
+                    room_id = room_id.0,
+                    stream_id = stream_id.0,
+                    user_id = user_id.0,
+                    codec = codec.as_str()
+                );
+                let _ = self.events.send(NetworkEvent::ShareAvailable {
+                    room_id,
+                    stream_id,
+                    user_id,
+                    sender_name,
+                    codec,
+                    coded_width,
+                    coded_height,
+                    annexb,
+                    extradata,
+                    view_secret,
+                });
+            }
+            ServerControl::ShareEnded { room_id, stream_id } => {
+                kvlog::info!(
+                    "client share ended",
+                    room_id = room_id.0,
+                    stream_id = stream_id.0
+                );
+                let _ = self
+                    .events
+                    .send(NetworkEvent::ShareEnded { room_id, stream_id });
             }
             ServerControl::Pong { .. } => {}
             ServerControl::Error { code, message } => {
@@ -3141,6 +3243,8 @@ fn network_command_kind(command: &NetworkCommand) -> &'static str {
         NetworkCommand::SetPlaybackSink(_) => "set_playback_sink",
         NetworkCommand::PlaybackFeedback(_) => "playback_feedback",
         NetworkCommand::SetVoiceStatus(_) => "set_voice_status",
+        NetworkCommand::StartShare { .. } => "start_share",
+        NetworkCommand::StopShare { .. } => "stop_share",
         NetworkCommand::Shutdown => "shutdown",
     }
 }
@@ -3191,6 +3295,8 @@ fn client_control_kind(control: &ClientControl) -> &'static str {
         ClientControl::UploadFileChunk { .. } => "upload_file_chunk",
         ClientControl::UploadFileComplete { .. } => "upload_file_complete",
         ClientControl::UploadFileCancel { .. } => "upload_file_cancel",
+        ClientControl::StartShare { .. } => "start_share",
+        ClientControl::StopShare { .. } => "stop_share",
         ClientControl::Ping { .. } => "ping",
     }
 }
@@ -3213,6 +3319,9 @@ fn server_control_kind(control: &ServerControl) -> &'static str {
         ServerControl::FileChunk { .. } => "file_chunk",
         ServerControl::FileComplete { .. } => "file_complete",
         ServerControl::FileCanceled { .. } => "file_canceled",
+        ServerControl::ShareStarted { .. } => "share_started",
+        ServerControl::ShareAvailable { .. } => "share_available",
+        ServerControl::ShareEnded { .. } => "share_ended",
         ServerControl::Pong { .. } => "pong",
         ServerControl::Error { .. } => "error",
     }

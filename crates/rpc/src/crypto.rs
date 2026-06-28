@@ -15,6 +15,7 @@ pub const TAG_LEN: usize = 16;
 pub const TRANSPORT_HEADER_LEN: usize = 12;
 pub const CHANNEL_CONTROL: u8 = 1;
 pub const CHANNEL_MEDIA: u8 = 2;
+pub const CHANNEL_VIDEO: u8 = 3;
 pub const REKEY_AFTER_TIME_SECS: u64 = 120;
 pub const REJECT_AFTER_TIME_SECS: u64 = 180;
 pub const REJECT_AFTER_MESSAGES: u64 = u64::MAX - (1 << 4);
@@ -474,6 +475,47 @@ fn expand_key(prk: &hkdf::Prk, label: &'static [u8]) -> [u8; KEY_LEN] {
     out
 }
 
+/// Which side of a dedicated video connection is deriving keys.
+///
+/// The chatt client (whether it publishes a capture or views one) sends on the
+/// "up" key and receives on the "down" key. The server is the mirror: it sends
+/// on "down" and receives on "up". Both ends derive from the same per-stream
+/// secret distributed over the encrypted control channel, so the secret never
+/// appears on the video connection itself.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VideoKeyRole {
+    Client,
+    Server,
+}
+
+/// Derives the directional `(send, recv)` key pair for one end of a video
+/// connection from a per-stream secret, mirroring [`derive_session_secrets`].
+///
+/// The publisher's secret and a viewer's secret are independent HKDF inputs, so
+/// the same direction labels are reused for both connection kinds without
+/// collision.
+pub fn derive_video_keys(secret: &[u8; KEY_LEN], role: VideoKeyRole) -> (KeyMaterial, KeyMaterial) {
+    let salt = hkdf::Salt::new(hkdf::HKDF_SHA256, b"chatt video keys v1");
+    let prk = salt.extract(secret);
+    let up = expand_key(&prk, b"chatt video up key v1");
+    let down = expand_key(&prk, b"chatt video down key v1");
+    let ids = expand_key(&prk, b"chatt video key ids v1");
+    let up_id = u32::from_le_bytes(ids[0..4].try_into().unwrap()).max(1);
+    let down_id = u32::from_le_bytes(ids[4..8].try_into().unwrap()).max(1);
+    let up = KeyMaterial {
+        id: up_id,
+        bytes: up,
+    };
+    let down = KeyMaterial {
+        id: down_id,
+        bytes: down,
+    };
+    match role {
+        VideoKeyRole::Client => (up, down),
+        VideoKeyRole::Server => (down, up),
+    }
+}
+
 #[derive(Debug)]
 pub struct TransportCipher {
     send: KeyMaterial,
@@ -780,6 +822,21 @@ mod tests {
         assert_eq!(client_keys.control_recv, server.secrets.control_send);
         assert_eq!(client_keys.media_send, server.secrets.media_recv);
         assert_eq!(client_keys.media_recv, server.secrets.media_send);
+    }
+
+    #[test]
+    fn video_keys_derive_opposite_on_each_end() {
+        let secret = [7u8; KEY_LEN];
+        let (client_send, client_recv) = derive_video_keys(&secret, VideoKeyRole::Client);
+        let (server_send, server_recv) = derive_video_keys(&secret, VideoKeyRole::Server);
+        assert_eq!(client_send, server_recv);
+        assert_eq!(client_recv, server_send);
+
+        // A frame sealed by the client opens with the server's recv key.
+        let frame = seal_with_key(&client_send, CHANNEL_VIDEO, 0, b"frame").unwrap();
+        let (counter, plaintext) = open_with_key(&server_recv, CHANNEL_VIDEO, &frame).unwrap();
+        assert_eq!(counter, 0);
+        assert_eq!(plaintext, b"frame");
     }
 
     #[test]

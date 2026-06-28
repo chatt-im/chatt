@@ -13,6 +13,7 @@ mod settings;
 mod theme;
 mod tui;
 mod ui;
+mod video;
 mod web_server;
 
 pub(crate) use chatt::audio;

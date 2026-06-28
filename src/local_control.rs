@@ -25,6 +25,9 @@ mod imp {
     const MAGIC: &[u8] = b"chatt-control-v1\0";
     const OP_UPLOAD: u8 = 1;
     const OP_VOICE: u8 = 2;
+    const OP_SCREENCAST: u8 = 3;
+    const SCREENCAST_START: u8 = 0;
+    const SCREENCAST_STOP: u8 = 1;
     const STATUS_OK: u8 = 0;
     const STATUS_ERROR: u8 = 1;
     const MAX_PATH_BYTES: u32 = 64 * 1024;
@@ -87,6 +90,76 @@ mod imp {
                 VoiceCommand::SetDeafen(state) => format!("deafen set {state} requested"),
             }
         }
+    }
+
+    /// A screen-share intent forwarded from the CLI to the running client. `Start`
+    /// carries the capture command argv, empty for the built-in x11grab default.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub enum ScreencastCommand {
+        Start { argv: Vec<String> },
+        Stop,
+    }
+
+    impl ScreencastCommand {
+        fn encode(&self) -> Vec<u8> {
+            let mut body = Vec::new();
+            match self {
+                ScreencastCommand::Start { argv } => {
+                    body.push(SCREENCAST_START);
+                    body.extend_from_slice(&(argv.len() as u32).to_be_bytes());
+                    for arg in argv {
+                        let bytes = arg.as_bytes();
+                        body.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
+                        body.extend_from_slice(bytes);
+                    }
+                }
+                ScreencastCommand::Stop => body.push(SCREENCAST_STOP),
+            }
+            body
+        }
+
+        fn decode(body: &[u8]) -> Result<Self, String> {
+            let (action, mut cursor) = body
+                .split_first()
+                .ok_or_else(|| "empty screencast payload".to_string())?;
+            match *action {
+                SCREENCAST_START => {
+                    let count = read_u32(&mut cursor)? as usize;
+                    let mut argv = Vec::with_capacity(count.min(1024));
+                    for _ in 0..count {
+                        let len = read_u32(&mut cursor)? as usize;
+                        if len > cursor.len() {
+                            return Err("screencast arg length overflows payload".to_string());
+                        }
+                        let (arg, tail) = cursor.split_at(len);
+                        argv.push(
+                            String::from_utf8(arg.to_vec())
+                                .map_err(|_| "screencast arg is not UTF-8".to_string())?,
+                        );
+                        cursor = tail;
+                    }
+                    Ok(ScreencastCommand::Start { argv })
+                }
+                SCREENCAST_STOP => Ok(ScreencastCommand::Stop),
+                other => Err(format!("unknown screencast action {other}")),
+            }
+        }
+
+        fn ack_message(&self) -> String {
+            match self {
+                ScreencastCommand::Start { .. } => "screencast start requested".to_string(),
+                ScreencastCommand::Stop => "screencast stop requested".to_string(),
+            }
+        }
+    }
+
+    fn read_u32(cursor: &mut &[u8]) -> Result<u32, String> {
+        if cursor.len() < 4 {
+            return Err("screencast payload is truncated".to_string());
+        }
+        let (head, tail) = cursor.split_at(4);
+        *cursor = tail;
+        Ok(u32::from_be_bytes(head.try_into().unwrap()))
     }
 
     pub struct ControlSocket {
@@ -258,6 +331,7 @@ mod imp {
     enum Request {
         Upload(PathBuf),
         Voice(VoiceCommand),
+        Screencast(ScreencastCommand),
     }
 
     struct Response {
@@ -406,6 +480,19 @@ mod imp {
                     message: "chatt client is not running".to_string(),
                 },
             },
+            Ok(Request::Screencast(command)) => {
+                let ack = command.ack_message();
+                match voice.send(command) {
+                    Ok(()) => Response {
+                        status: STATUS_OK,
+                        message: ack,
+                    },
+                    Err(_) => Response {
+                        status: STATUS_ERROR,
+                        message: "chatt client is not running".to_string(),
+                    },
+                }
+            }
             Err(error) => Response {
                 status: STATUS_ERROR,
                 message: error,
@@ -447,6 +534,7 @@ mod imp {
                 std::ffi::OsString::from_vec(body),
             ))),
             OP_VOICE => Ok(Request::Voice(VoiceCommand::decode(&body)?)),
+            OP_SCREENCAST => Ok(Request::Screencast(ScreencastCommand::decode(&body)?)),
             opcode => Err(format!("unknown control request opcode {opcode}")),
         }
     }
@@ -474,6 +562,57 @@ mod imp {
         let mut frame = Vec::with_capacity(MAGIC.len() + 1 + 4 + payload.len());
         frame.extend_from_slice(MAGIC);
         frame.push(OP_VOICE);
+        frame.extend_from_slice(&len.to_be_bytes());
+        frame.extend_from_slice(&payload);
+        stream
+            .write_all(&frame)
+            .map_err(|error| format!("failed to write control request: {error}"))
+    }
+
+    pub fn send_screencast(command: ScreencastCommand) -> Result<String, String> {
+        let socket_path = socket_path()?;
+        send_screencast_to_path(&socket_path, command)
+    }
+
+    fn send_screencast_to_path(
+        socket_path: &Path,
+        command: ScreencastCommand,
+    ) -> Result<String, String> {
+        let mut stream = UnixStream::connect(socket_path).map_err(|error| {
+            format!(
+                "no active chatt control socket at {}; start chatt or set {SOCKET_ENV}: {error}",
+                socket_path.display()
+            )
+        })?;
+        stream
+            .set_read_timeout(Some(STREAM_TIMEOUT))
+            .map_err(|error| format!("failed to set control socket read timeout: {error}"))?;
+        stream
+            .set_write_timeout(Some(STREAM_TIMEOUT))
+            .map_err(|error| format!("failed to set control socket write timeout: {error}"))?;
+
+        write_screencast_request(&mut stream, &command)?;
+        let response = read_response(&mut stream)?;
+        match response.status {
+            STATUS_OK => Ok(response.message),
+            STATUS_ERROR => Err(response.message),
+            status => Err(format!("control socket returned unknown status {status}")),
+        }
+    }
+
+    fn write_screencast_request(
+        stream: &mut UnixStream,
+        command: &ScreencastCommand,
+    ) -> Result<(), String> {
+        let payload = command.encode();
+        let len = u32::try_from(payload.len())
+            .map_err(|_| "screencast request is too long for control socket".to_string())?;
+        if len > MAX_PATH_BYTES {
+            return Err(format!("screencast request exceeds {MAX_PATH_BYTES} bytes"));
+        }
+        let mut frame = Vec::with_capacity(MAGIC.len() + 1 + 4 + payload.len());
+        frame.extend_from_slice(MAGIC);
+        frame.push(OP_SCREENCAST);
         frame.extend_from_slice(&len.to_be_bytes());
         frame.extend_from_slice(&payload);
         stream
@@ -571,6 +710,29 @@ mod imp {
                 write_voice_request(&mut writer, command).unwrap();
                 match read_request(&mut reader).unwrap() {
                     Request::Voice(actual) => assert_eq!(actual, command),
+                    other => panic!("unexpected request: {other:?}"),
+                }
+            }
+        }
+
+        #[test]
+        fn screencast_request_round_trips() {
+            let commands = [
+                ScreencastCommand::Start { argv: Vec::new() },
+                ScreencastCommand::Start {
+                    argv: vec![
+                        "ffmpeg".to_string(),
+                        "-f".to_string(),
+                        "x11grab".to_string(),
+                    ],
+                },
+                ScreencastCommand::Stop,
+            ];
+            for command in commands {
+                let (mut writer, mut reader) = UnixStream::pair().unwrap();
+                write_screencast_request(&mut writer, &command).unwrap();
+                match read_request(&mut reader).unwrap() {
+                    Request::Screencast(actual) => assert_eq!(actual, command),
                     other => panic!("unexpected request: {other:?}"),
                 }
             }
@@ -687,6 +849,12 @@ mod imp {
         SetDeafen(bool),
     }
 
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub enum ScreencastCommand {
+        Start { argv: Vec<String> },
+        Stop,
+    }
+
     pub struct ControlSocket;
 
     impl ControlSocket {
@@ -710,6 +878,12 @@ mod imp {
     pub fn send_voice(_command: VoiceCommand) -> Result<String, String> {
         Err("chatt voice control is only supported on Unix".to_string())
     }
+
+    pub fn send_screencast(_command: ScreencastCommand) -> Result<String, String> {
+        Err("chatt screencast is only supported on Unix".to_string())
+    }
 }
 
-pub use imp::{ControlSocket, VoiceCommand, send_upload, send_voice};
+pub use imp::{
+    ControlSocket, ScreencastCommand, VoiceCommand, send_screencast, send_upload, send_voice,
+};

@@ -4,7 +4,7 @@ pub(crate) mod participants;
 pub(crate) mod room;
 pub(crate) mod server;
 
-use hashbrown::HashSet;
+use hashbrown::{HashMap, HashSet};
 use std::{
     collections::VecDeque,
     path::PathBuf,
@@ -22,7 +22,7 @@ use extui::event::{
 };
 use rpc::{
     control::{InviteTicket, ParticipantVoiceStatus},
-    ids::{SessionId, UserId},
+    ids::{SessionId, StreamId, UserId},
 };
 
 use crate::{
@@ -233,6 +233,25 @@ pub(crate) struct App {
     supervisor: SupervisorState,
     /// The browser chat-log feed, present only when `[web] enabled = true`.
     web_feed: Option<crate::web_server::WebFeedSender>,
+    /// The active outbound screen share, if this client is sharing.
+    screencast: Option<crate::video::ScreencastHandle>,
+    /// The stream id of our active outbound share, set on `ShareStarted`.
+    screencast_stream_id: Option<StreamId>,
+    /// Shares this client can view, keyed by stream id, learned from
+    /// `ShareAvailable`. Holds the per-stream view secret and codec metadata.
+    available_shares: HashMap<StreamId, AvailableShare>,
+    /// Active inbound viewer connections, keyed by stream id.
+    subscribers: HashMap<StreamId, crate::video::SubscriberHandle>,
+    /// TCP address of the connected server, reused by dedicated video
+    /// connections. Set on connect, cleared on disconnect.
+    active_tcp_addr: Option<String>,
+}
+
+/// A share this client can view: the secret to bring up a viewer connection and
+/// the codec to configure the browser decoder.
+struct AvailableShare {
+    view_secret: Vec<u8>,
+    codec: String,
 }
 
 /// A debounced request to restart audio streams so a slow settings-page change
@@ -411,6 +430,8 @@ pub(crate) enum AppEvent {
     AudioDeviceRefresh(AudioDeviceRefresh),
     Soundboard(SoundboardEvent),
     Voice(local_control::VoiceCommand),
+    Screencast(local_control::ScreencastCommand),
+    Web(crate::web_server::WebRequest),
 }
 
 impl From<NetworkEvent> for AppEvent {
@@ -435,6 +456,83 @@ impl From<local_control::VoiceCommand> for AppEvent {
     fn from(command: local_control::VoiceCommand) -> Self {
         AppEvent::Voice(command)
     }
+}
+
+impl From<local_control::ScreencastCommand> for AppEvent {
+    fn from(command: local_control::ScreencastCommand) -> Self {
+        AppEvent::Screencast(command)
+    }
+}
+
+impl From<crate::web_server::WebRequest> for AppEvent {
+    fn from(request: crate::web_server::WebRequest) -> Self {
+        AppEvent::Web(request)
+    }
+}
+
+/// The `share_available` envelope announcing a share so the browser shows a play
+/// button and pre-knows the codec.
+fn share_available_envelope(
+    stream_id: StreamId,
+    sender: &str,
+    codec: &str,
+    width: u32,
+    height: u32,
+) -> String {
+    format!(
+        "{{\"type\":\"share_available\",\"stream_id\":{},\"sender\":{},\"codec\":{},\"width\":{width},\"height\":{height}}}",
+        stream_id.0,
+        jsony::to_json(&sender.to_string()),
+        jsony::to_json(&codec.to_string())
+    )
+}
+
+/// The `share_config` envelope sent when playback starts, carrying the decoder
+/// codec string.
+fn share_config_envelope(stream_id: StreamId, codec: &str) -> String {
+    format!(
+        "{{\"type\":\"share_config\",\"stream_id\":{},\"codec\":{}}}",
+        stream_id.0,
+        jsony::to_json(&codec.to_string())
+    )
+}
+
+/// The `share_ended` envelope telling the browser to tear down its decoder.
+fn share_ended_envelope(stream_id: StreamId) -> String {
+    format!("{{\"type\":\"share_ended\",\"stream_id\":{}}}", stream_id.0)
+}
+
+/// Starts the web server and a relay thread that forwards browser requests into
+/// the app event channel, returning the feed handle. The relay bridges the
+/// otherwise one-directional web feed so a browser play click reaches the app.
+fn spawn_web_feed(
+    web: &config::WebConfig,
+    receive_dir: Option<PathBuf>,
+    max_messages: usize,
+    events: &EventSender,
+) -> Option<crate::web_server::WebFeedSender> {
+    let (web_tx, web_rx) = mpsc::channel();
+    let feed = match crate::web_server::spawn(web, receive_dir, max_messages, web_tx) {
+        Ok(feed) => feed,
+        Err(error) => {
+            kvlog::error!("web server failed to start", error = %error);
+            return None;
+        }
+    };
+    let relay = events.clone();
+    if let Err(error) = thread::Builder::new()
+        .name("chatt-web-relay".to_string())
+        .spawn(move || {
+            while let Ok(request) = web_rx.recv() {
+                if relay.send(request).is_err() {
+                    break;
+                }
+            }
+        })
+    {
+        kvlog::warn!("web request relay failed to start", error = %error);
+    }
+    Some(feed)
 }
 
 /// Sends events into the single application event channel. Worker threads keep
@@ -490,17 +588,12 @@ impl App {
         let room = RoomSession::new(&config, &theme);
         let echo_control = Arc::new(EchoCancellationControl::new(config.audio.echo_cancellation));
         let web_feed = if config.web.enabled {
-            match crate::web_server::spawn(
+            spawn_web_feed(
                 &config.web,
                 config.files.receive_dir_path(),
                 config.ui.max_messages as usize,
-            ) {
-                Ok(sender) => Some(sender),
-                Err(error) => {
-                    kvlog::error!("web server failed to start", error = %error);
-                    None
-                }
-            }
+                &events.tx,
+            )
         } else {
             None
         };
@@ -539,6 +632,11 @@ impl App {
             pending_network_commands: VecDeque::new(),
             supervisor: SupervisorState::default(),
             web_feed,
+            screencast: None,
+            screencast_stream_id: None,
+            available_shares: HashMap::new(),
+            subscribers: HashMap::new(),
+            active_tcp_addr: None,
             config,
         };
         app.rebuild_server_items();
@@ -567,6 +665,8 @@ impl App {
             AppEvent::AudioDeviceRefresh(refresh) => self.handle_audio_device_refresh(refresh),
             AppEvent::Soundboard(event) => self.handle_soundboard_event(event),
             AppEvent::Voice(command) => self.apply_voice_command(command),
+            AppEvent::Screencast(command) => self.handle_screencast_command(command),
+            AppEvent::Web(request) => self.handle_web_request(request),
         }
     }
 
@@ -580,6 +680,108 @@ impl App {
                 self.set_deafen(!self.deafened.load(Ordering::Relaxed))
             }
             local_control::VoiceCommand::SetDeafen(state) => self.set_deafen(state),
+        }
+    }
+
+    /// Applies a CLI-driven screencast command: spawns capture and the publisher
+    /// for `Start`, or tears the active share down for `Stop`.
+    fn handle_screencast_command(&mut self, command: local_control::ScreencastCommand) {
+        match command {
+            local_control::ScreencastCommand::Start { argv } => {
+                if self.screencast.is_some() {
+                    self.set_error("a screen share is already active");
+                    return;
+                }
+                let Some(network) = &self.network else {
+                    self.set_error("connect before sharing your screen");
+                    return;
+                };
+                let Some(tcp_addr) = self.active_tcp_addr.clone() else {
+                    self.set_error("no active server for screen share");
+                    return;
+                };
+                let argv = if argv.is_empty() {
+                    crate::video::capture::default_ffmpeg_argv()
+                } else {
+                    argv
+                };
+                match crate::video::start_screencast(argv, network.sender(), tcp_addr) {
+                    Ok(handle) => {
+                        self.screencast = Some(handle);
+                        self.set_status("starting screen share");
+                    }
+                    Err(error) => self.set_error(format!("screen share failed: {error}")),
+                }
+            }
+            local_control::ScreencastCommand::Stop => {
+                self.stop_own_share();
+                self.set_status("screen share stopped");
+            }
+        }
+    }
+
+    /// Stops this client's outbound share, notifying the server so viewers tear down.
+    fn stop_own_share(&mut self) {
+        if let Some(stream_id) = self.screencast_stream_id.take()
+            && let Some(network) = &self.network
+        {
+            let _ = network
+                .sender()
+                .send(NetworkCommand::StopShare { stream_id });
+        }
+        if let Some(mut handle) = self.screencast.take() {
+            handle.stop();
+        }
+    }
+
+    /// Stops the outbound share and every inbound viewer connection.
+    fn stop_all_shares(&mut self) {
+        self.stop_own_share();
+        self.screencast_stream_id = None;
+        self.available_shares.clear();
+        for (_, mut subscriber) in self.subscribers.drain() {
+            subscriber.stop();
+        }
+    }
+
+    /// Handles a browser request relayed from the web view.
+    fn handle_web_request(&mut self, request: crate::web_server::WebRequest) {
+        match request {
+            crate::web_server::WebRequest::PlayShare { stream_id } => {
+                self.start_view(StreamId(stream_id))
+            }
+            crate::web_server::WebRequest::StopShare { stream_id } => {
+                self.stop_view(StreamId(stream_id))
+            }
+        }
+    }
+
+    /// Spawns a viewer connection for `stream_id` and tells the browser to
+    /// configure its decoder.
+    fn start_view(&mut self, stream_id: StreamId) {
+        if self.subscribers.contains_key(&stream_id) {
+            return;
+        }
+        let Some(share) = self.available_shares.get(&stream_id) else {
+            self.set_error("that screen share is no longer available");
+            return;
+        };
+        let Some(tcp_addr) = self.active_tcp_addr.clone() else {
+            return;
+        };
+        let Some(feed) = self.web_feed.clone() else {
+            return;
+        };
+        feed.send_video_config(share_config_envelope(stream_id, &share.codec));
+        let handle =
+            crate::video::start_subscriber(stream_id, share.view_secret.clone(), tcp_addr, feed);
+        self.subscribers.insert(stream_id, handle);
+        self.set_status("viewing screen share");
+    }
+
+    fn stop_view(&mut self, stream_id: StreamId) {
+        if let Some(mut subscriber) = self.subscribers.remove(&stream_id) {
+            subscriber.stop();
         }
     }
 
@@ -663,6 +865,11 @@ impl App {
             };
         self.room
             .connect_to_server(server.alias.clone(), server.effective_display_name());
+        self.active_tcp_addr = Some(
+            server
+                .client_config(&self.config.files, &self.config.p2p)
+                .tcp_addr,
+        );
         self.network = Some(network);
         self.supervisor.network.reset();
         self.set_status("connecting");
@@ -671,6 +878,8 @@ impl App {
 
     fn disconnect_network(&mut self) {
         self.stop_audio();
+        self.stop_all_shares();
+        self.active_tcp_addr = None;
         self.control_socket.take();
         if let Some(network) = self.network.take() {
             network.stop();
@@ -923,6 +1132,63 @@ impl App {
                 self.encoder_profile = profile;
                 if let Some(capture) = &self.capture {
                     capture.set_encoder_profile(profile);
+                }
+            }
+            NetworkEvent::ShareStarted {
+                stream_id,
+                publish_secret,
+            } => {
+                self.screencast_stream_id = Some(stream_id);
+                if let Some(handle) = &self.screencast {
+                    handle.deliver_secret(stream_id, publish_secret);
+                    self.set_status("screen share live");
+                } else {
+                    kvlog::warn!(
+                        "share started without an active capture",
+                        stream_id = stream_id.0
+                    );
+                }
+            }
+            NetworkEvent::ShareAvailable {
+                stream_id,
+                sender_name,
+                codec,
+                coded_width,
+                coded_height,
+                view_secret,
+                ..
+            } => {
+                self.available_shares.insert(
+                    stream_id,
+                    AvailableShare {
+                        view_secret,
+                        codec: codec.clone(),
+                    },
+                );
+                if let Some(feed) = &self.web_feed {
+                    feed.send_video_config(share_available_envelope(
+                        stream_id,
+                        &sender_name,
+                        &codec,
+                        coded_width,
+                        coded_height,
+                    ));
+                }
+                self.set_status(format!("{sender_name} is sharing their screen"));
+            }
+            NetworkEvent::ShareEnded { stream_id, .. } => {
+                self.available_shares.remove(&stream_id);
+                if let Some(mut subscriber) = self.subscribers.remove(&stream_id) {
+                    subscriber.stop();
+                }
+                if self.screencast_stream_id == Some(stream_id) {
+                    self.screencast_stream_id = None;
+                    if let Some(mut handle) = self.screencast.take() {
+                        handle.stop();
+                    }
+                }
+                if let Some(feed) = &self.web_feed {
+                    feed.send_video_config(share_ended_envelope(stream_id));
                 }
             }
             NetworkEvent::Status(status) => self.set_status(status),
@@ -1457,20 +1723,22 @@ impl App {
         }
 
         if self.config.web.enabled && self.web_feed.is_none() {
-            match crate::web_server::spawn(
+            let feed = spawn_web_feed(
                 &self.config.web,
                 self.config.files.receive_dir_path(),
                 self.config.ui.max_messages as usize,
-            ) {
-                Ok(sender) => {
+                &self.events.tx,
+            );
+            match feed {
+                Some(sender) => {
                     self.web_feed = Some(sender);
                     self.set_status(format!(
                         "web log server listening on {}",
                         self.config.web.bind
                     ));
                 }
-                Err(error) => {
-                    self.set_error(format!("web log server failed: {error}"));
+                None => {
+                    self.set_error("web log server failed to start".to_string());
                 }
             }
         }
@@ -2967,6 +3235,9 @@ fn network_event_kind(event: &NetworkEvent) -> &'static str {
         NetworkEvent::ReconnectScheduled { .. } => "reconnect_scheduled",
         NetworkEvent::WorkerStopped { .. } => "worker_stopped",
         NetworkEvent::Disconnected => "disconnected",
+        NetworkEvent::ShareStarted { .. } => "share_started",
+        NetworkEvent::ShareAvailable { .. } => "share_available",
+        NetworkEvent::ShareEnded { .. } => "share_ended",
     }
 }
 
@@ -2979,6 +3250,8 @@ fn app_network_command_kind(command: &NetworkCommand) -> &'static str {
         NetworkCommand::SetPlaybackSink(_) => "set_playback_sink",
         NetworkCommand::PlaybackFeedback(_) => "playback_feedback",
         NetworkCommand::SetVoiceStatus(_) => "set_voice_status",
+        NetworkCommand::StartShare { .. } => "start_share",
+        NetworkCommand::StopShare { .. } => "stop_share",
         NetworkCommand::Shutdown => "shutdown",
     }
 }
