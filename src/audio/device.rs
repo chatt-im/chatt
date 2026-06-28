@@ -1676,7 +1676,9 @@ mod tests {
         assert_eq!(mixer.active_streams(), 1);
         let mut out = vec![0.0; crate::audio::shared::FRAME_SAMPLES];
         mixer.fill_block(&mut out);
-        assert!((out[0] - 0.25).abs() < 1e-6, "mixed sample {}", out[0]);
+        // Read past the declick ramp so the per-stream envelope is at unity.
+        let steady = out[crate::audio::shared::FRAME_SAMPLES - 1];
+        assert!((steady - 0.25).abs() < 1e-6, "mixed sample {steady}");
         assert_eq!(ring.depth(), 0, "consumer drained the ring");
     }
 }
