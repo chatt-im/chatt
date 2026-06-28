@@ -34,9 +34,18 @@ export type ServerEnvelope =
   | { type: "message"; message: WebMessage }
   | { type: "older"; messages: WebMessage[]; oldest_seq: number; has_more: boolean }
   // A room member started sharing their screen. The browser shows a play button.
-  | { type: "share_available"; stream_id: number; sender: string; codec: string; width: number; height: number }
-  // Playback started for a share; configure the decoder with this codec.
-  | { type: "share_config"; stream_id: number; codec: string }
+  | {
+      type: "share_available";
+      stream_id: number;
+      sender: string;
+      codec: string;
+      width: number;
+      height: number;
+      extradata: number[];
+    }
+  // Playback started for a share; configure the decoder with this codec and the
+  // `extra_data` descriptor (avcC/hvcC).
+  | { type: "share_config"; stream_id: number; codec: string; extradata: number[] }
   // A share ended; tear down its decoder.
   | { type: "share_ended"; stream_id: number };
 

@@ -248,10 +248,13 @@ pub(crate) struct App {
 }
 
 /// A share this client can view: the secret to bring up a viewer connection and
-/// the codec to configure the browser decoder.
+/// the codec metadata to configure the browser decoder.
 struct AvailableShare {
     view_secret: Vec<u8>,
     codec: String,
+    /// The decoder `extra_data` descriptor (`avcC`/`hvcC`), built by the
+    /// publisher from the stream's parameter sets.
+    extradata: Vec<u8>,
 }
 
 /// A debounced request to restart audio streams so a slow settings-page change
@@ -470,30 +473,48 @@ impl From<crate::web_server::WebRequest> for AppEvent {
     }
 }
 
+/// Serializes raw bytes as a JSON array of numbers, the form the browser reads
+/// back into a `Uint8Array` for the decoder `description`.
+fn json_byte_array(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(2 + bytes.len() * 4);
+    out.push('[');
+    for (index, byte) in bytes.iter().enumerate() {
+        if index > 0 {
+            out.push(',');
+        }
+        out.push_str(&byte.to_string());
+    }
+    out.push(']');
+    out
+}
+
 /// The `share_available` envelope announcing a share so the browser shows a play
-/// button and pre-knows the codec.
+/// button and pre-knows the codec and its decoder descriptor.
 fn share_available_envelope(
     stream_id: StreamId,
     sender: &str,
     codec: &str,
     width: u32,
     height: u32,
+    extradata: &[u8],
 ) -> String {
     format!(
-        "{{\"type\":\"share_available\",\"stream_id\":{},\"sender\":{},\"codec\":{},\"width\":{width},\"height\":{height}}}",
+        "{{\"type\":\"share_available\",\"stream_id\":{},\"sender\":{},\"codec\":{},\"width\":{width},\"height\":{height},\"extradata\":{}}}",
         stream_id.0,
         jsony::to_json(&sender.to_string()),
-        jsony::to_json(&codec.to_string())
+        jsony::to_json(&codec.to_string()),
+        json_byte_array(extradata),
     )
 }
 
 /// The `share_config` envelope sent when playback starts, carrying the decoder
-/// codec string.
-fn share_config_envelope(stream_id: StreamId, codec: &str) -> String {
+/// codec string and `extra_data` descriptor.
+fn share_config_envelope(stream_id: StreamId, codec: &str, extradata: &[u8]) -> String {
     format!(
-        "{{\"type\":\"share_config\",\"stream_id\":{},\"codec\":{}}}",
+        "{{\"type\":\"share_config\",\"stream_id\":{},\"codec\":{},\"extradata\":{}}}",
         stream_id.0,
-        jsony::to_json(&codec.to_string())
+        jsony::to_json(&codec.to_string()),
+        json_byte_array(extradata),
     )
 }
 
@@ -687,7 +708,7 @@ impl App {
     /// for `Start`, or tears the active share down for `Stop`.
     fn handle_screencast_command(&mut self, command: local_control::ScreencastCommand) {
         match command {
-            local_control::ScreencastCommand::Start { argv } => {
+            local_control::ScreencastCommand::Start { argv, hevc } => {
                 if self.screencast.is_some() {
                     self.set_error("a screen share is already active");
                     return;
@@ -700,12 +721,26 @@ impl App {
                     self.set_error("no active server for screen share");
                     return;
                 };
-                let argv = if argv.is_empty() {
-                    crate::video::capture::default_ffmpeg_argv()
+                let codec = if hevc {
+                    rpc::bitstream::Codec::Hevc
                 } else {
-                    argv
+                    rpc::bitstream::Codec::H264
                 };
-                match crate::video::start_screencast(argv, network.sender(), tcp_addr) {
+                let argv = if !argv.is_empty() {
+                    argv
+                } else if hevc {
+                    crate::video::capture::hevc_ffmpeg_argv()
+                } else {
+                    crate::video::capture::default_ffmpeg_argv()
+                };
+                let web_feed = self.web_feed.clone();
+                match crate::video::start_screencast(
+                    argv,
+                    codec,
+                    network.sender(),
+                    tcp_addr,
+                    web_feed,
+                ) {
                     Ok(handle) => {
                         self.screencast = Some(handle);
                         self.set_status("starting screen share");
@@ -720,14 +755,19 @@ impl App {
         }
     }
 
-    /// Stops this client's outbound share, notifying the server so viewers tear down.
+    /// Stops this client's outbound share, notifying the server so viewers tear
+    /// down and clearing the local self-view from this client's own browser.
     fn stop_own_share(&mut self) {
-        if let Some(stream_id) = self.screencast_stream_id.take()
-            && let Some(network) = &self.network
-        {
-            let _ = network
-                .sender()
-                .send(NetworkCommand::StopShare { stream_id });
+        if let Some(stream_id) = self.screencast_stream_id.take() {
+            if let Some(network) = &self.network {
+                let _ = network
+                    .sender()
+                    .send(NetworkCommand::StopShare { stream_id });
+            }
+            self.available_shares.remove(&stream_id);
+            if let Some(feed) = &self.web_feed {
+                feed.send_share_ended(stream_id.0, share_ended_envelope(stream_id));
+            }
         }
         if let Some(mut handle) = self.screencast.take() {
             handle.stop();
@@ -766,13 +806,30 @@ impl App {
             self.set_error("that screen share is no longer available");
             return;
         };
+        // The user's own share is fed to the browser by the publisher tee, so
+        // configure the decoder but open no subscriber connection.
+        if self.screencast_stream_id == Some(stream_id) {
+            if let Some(feed) = &self.web_feed {
+                feed.send_share_config(share_config_envelope(
+                    stream_id,
+                    &share.codec,
+                    &share.extradata,
+                ));
+            }
+            self.set_status("viewing your screen share");
+            return;
+        }
         let Some(tcp_addr) = self.active_tcp_addr.clone() else {
             return;
         };
         let Some(feed) = self.web_feed.clone() else {
             return;
         };
-        feed.send_video_config(share_config_envelope(stream_id, &share.codec));
+        feed.send_share_config(share_config_envelope(
+            stream_id,
+            &share.codec,
+            &share.extradata,
+        ));
         let handle =
             crate::video::start_subscriber(stream_id, share.view_secret.clone(), tcp_addr, feed);
         self.subscribers.insert(stream_id, handle);
@@ -1137,17 +1194,49 @@ impl App {
             NetworkEvent::ShareStarted {
                 stream_id,
                 publish_secret,
+                codec,
+                coded_width,
+                coded_height,
+                extradata,
             } => {
                 self.screencast_stream_id = Some(stream_id);
                 if let Some(handle) = &self.screencast {
                     handle.deliver_secret(stream_id, publish_secret);
-                    self.set_status("screen share live");
                 } else {
                     kvlog::warn!(
                         "share started without an active capture",
                         stream_id = stream_id.0
                     );
                 }
+                // Register the user's own share so their browser can watch it.
+                // The publisher tees frames straight to the web feed, so the
+                // local share needs no view secret or subscriber connection.
+                let sender = self
+                    .user_id
+                    .map(|user_id| self.room.participants.display_name_for(user_id).to_string())
+                    .unwrap_or_else(|| "you".to_string());
+                self.available_shares.insert(
+                    stream_id,
+                    AvailableShare {
+                        view_secret: Vec::new(),
+                        codec: codec.clone(),
+                        extradata: extradata.clone(),
+                    },
+                );
+                if let Some(feed) = &self.web_feed {
+                    feed.send_share_available(
+                        stream_id.0,
+                        share_available_envelope(
+                            stream_id,
+                            &sender,
+                            &codec,
+                            coded_width,
+                            coded_height,
+                            &extradata,
+                        ),
+                    );
+                }
+                self.set_status("screen share live");
             }
             NetworkEvent::ShareAvailable {
                 stream_id,
@@ -1155,6 +1244,7 @@ impl App {
                 codec,
                 coded_width,
                 coded_height,
+                extradata,
                 view_secret,
                 ..
             } => {
@@ -1163,16 +1253,21 @@ impl App {
                     AvailableShare {
                         view_secret,
                         codec: codec.clone(),
+                        extradata: extradata.clone(),
                     },
                 );
                 if let Some(feed) = &self.web_feed {
-                    feed.send_video_config(share_available_envelope(
-                        stream_id,
-                        &sender_name,
-                        &codec,
-                        coded_width,
-                        coded_height,
-                    ));
+                    feed.send_share_available(
+                        stream_id.0,
+                        share_available_envelope(
+                            stream_id,
+                            &sender_name,
+                            &codec,
+                            coded_width,
+                            coded_height,
+                            &extradata,
+                        ),
+                    );
                 }
                 self.set_status(format!("{sender_name} is sharing their screen"));
             }
@@ -1188,7 +1283,7 @@ impl App {
                     }
                 }
                 if let Some(feed) = &self.web_feed {
-                    feed.send_video_config(share_ended_envelope(stream_id));
+                    feed.send_share_ended(stream_id.0, share_ended_envelope(stream_id));
                 }
             }
             NetworkEvent::Status(status) => self.set_status(status),

@@ -11,10 +11,12 @@
 //! - Outer: a u32 length prefix per record ([`write_record`]/[`pop_record`]),
 //!   capped at [`MAX_VIDEO_FRAME_LEN`].
 //! - Inner (a frame record's sealed plaintext): the [`write_video_frame`] bytes,
-//!   a 13-byte header (`[u32 size_incl_header][i64 ts_ms][u8 is_key]`) followed
-//!   by H.264. This is byte-identical to what the browser decoder expects, so
-//!   the client forwards a decrypted frame body to the browser without
-//!   re-framing.
+//!   a 17-byte header (`[u32 size_incl_header][i64 ts_ms][u8 is_key][u32
+//!   stream_id]`) followed by the length-prefixed video bitstream. This is
+//!   byte-identical to what the browser decoder expects, so the client forwards
+//!   a decrypted frame body to the browser without re-framing. The `stream_id`
+//!   lets a browser route each frame to its per-stream decoder so it can watch
+//!   several shares at once.
 //!
 //! [`MAX_FRAME_LEN`]: crate::frame::MAX_FRAME_LEN
 
@@ -27,8 +29,9 @@ use crate::ids::StreamId;
 /// [`crate::frame::MAX_FRAME_LEN`], so a control hello can never collide with it.
 pub const VIDEO_MAGIC: [u8; 8] = *b"CHTVID01";
 
-/// Length of the per-frame header: `[u32 size_incl_header][i64 ts_ms][u8 is_key]`.
-pub const VIDEO_FRAME_HEADER_LEN: usize = 13;
+/// Length of the per-frame header:
+/// `[u32 size_incl_header][i64 ts_ms][u8 is_key][u32 stream_id]`.
+pub const VIDEO_FRAME_HEADER_LEN: usize = 17;
 
 /// Length prefix on each outer wire record.
 pub const VIDEO_LENGTH_PREFIX_LEN: usize = 4;
@@ -67,12 +70,13 @@ pub enum VideoAck {
     Rejected,
 }
 
-/// One decoded inner frame: its presentation timestamp, keyframe flag, and the
-/// Annex-B H.264 body.
+/// One decoded inner frame: its presentation timestamp, keyframe flag, source
+/// stream id, and the length-prefixed video bitstream body.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Frame {
     pub ts_ms: i64,
     pub is_key: bool,
+    pub stream_id: u32,
     pub data: Vec<u8>,
 }
 
@@ -127,20 +131,21 @@ pub fn pop_record(buffer: &mut Vec<u8>) -> Result<Option<Vec<u8>>, VideoFrameErr
     Ok(Some(payload))
 }
 
-/// Writes one inner frame record: the 13-byte header then the H.264 bytes. The
-/// size field counts the header, matching the browser-side reader.
-pub fn write_video_frame(out: &mut Vec<u8>, ts_ms: i64, is_key: bool, h264: &[u8]) {
-    let size = (h264.len() + VIDEO_FRAME_HEADER_LEN) as u32;
+/// Writes one inner frame record: the 17-byte header then the bitstream body.
+/// The size field counts the header, matching the browser-side reader.
+pub fn write_video_frame(out: &mut Vec<u8>, ts_ms: i64, is_key: bool, stream_id: u32, body: &[u8]) {
+    let size = (body.len() + VIDEO_FRAME_HEADER_LEN) as u32;
     out.extend_from_slice(&size.to_le_bytes());
     out.extend_from_slice(&ts_ms.to_le_bytes());
     out.push(u8::from(is_key));
-    out.extend_from_slice(h264);
+    out.extend_from_slice(&stream_id.to_le_bytes());
+    out.extend_from_slice(body);
 }
 
 /// Encodes one inner frame into a fresh buffer.
-pub fn encode_video_frame(ts_ms: i64, is_key: bool, h264: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(VIDEO_FRAME_HEADER_LEN + h264.len());
-    write_video_frame(&mut out, ts_ms, is_key, h264);
+pub fn encode_video_frame(ts_ms: i64, is_key: bool, stream_id: u32, body: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(VIDEO_FRAME_HEADER_LEN + body.len());
+    write_video_frame(&mut out, ts_ms, is_key, stream_id, body);
     out
 }
 
@@ -162,11 +167,13 @@ pub fn pop_video_frame(buffer: &mut Vec<u8>) -> Result<Option<Frame>, VideoFrame
     }
     let ts_ms = i64::from_le_bytes(buffer[4..12].try_into().unwrap());
     let is_key = buffer[12] == 1;
+    let stream_id = u32::from_le_bytes(buffer[13..17].try_into().unwrap());
     let data = buffer[VIDEO_FRAME_HEADER_LEN..size].to_vec();
     buffer.drain(..size);
     Ok(Some(Frame {
         ts_ms,
         is_key,
+        stream_id,
         data,
     }))
 }
@@ -200,10 +207,11 @@ mod tests {
     #[test]
     fn video_frame_round_trips() {
         let mut buffer = Vec::new();
-        write_video_frame(&mut buffer, 33, true, &[1, 2, 3, 4]);
+        write_video_frame(&mut buffer, 33, true, 7, &[1, 2, 3, 4]);
         let frame = pop_video_frame(&mut buffer).unwrap().unwrap();
         assert_eq!(frame.ts_ms, 33);
         assert!(frame.is_key);
+        assert_eq!(frame.stream_id, 7);
         assert_eq!(frame.data, vec![1, 2, 3, 4]);
         assert!(buffer.is_empty());
     }
@@ -211,7 +219,7 @@ mod tests {
     #[test]
     fn pop_video_frame_waits_for_whole_frame() {
         let mut full = Vec::new();
-        write_video_frame(&mut full, 0, false, &[9; 16]);
+        write_video_frame(&mut full, 0, false, 1, &[9; 16]);
         let mut partial = full[..full.len() - 1].to_vec();
         assert_eq!(pop_video_frame(&mut partial).unwrap(), None);
     }

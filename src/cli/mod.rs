@@ -210,10 +210,18 @@ static SCREENCAST_SUBS: [Command; 2] = [
         aliases: &[],
         about: "Start sharing your screen (built-in x11grab capture).",
         long_about: "Captures the X11 desktop and shares it to room members' web \
-views. Pass `--ffmpeg <ARGV>` to run a custom capture command writing H.264 \
-Annex-B to stdout (pipe:1) instead of the built-in default.",
+views. Pass `--hevc` to capture H.265/HEVC instead of H.264 (browser HEVC decode \
+is platform-gated). Pass `--ffmpeg <ARGV>` to run a custom capture command \
+writing Annex-B to stdout (pipe:1) instead of the built-in default.",
         args: &[],
-        flags: &[],
+        flags: &[Flag {
+            long: "hevc",
+            short: "",
+            value_name: "",
+            help: "Capture H.265/HEVC instead of H.264",
+            global: false,
+            possible: &[],
+        }],
         subs: &[],
         examples: &[],
     },
@@ -301,7 +309,14 @@ fn dispatch(matches: &Matches) -> Result<(), Box<dyn std::error::Error>> {
         Some(("screencast", sub)) => {
             let command = match sub.subcommand() {
                 Some(("stop", _)) => local_control::ScreencastCommand::Stop,
-                _ => local_control::ScreencastCommand::Start { argv: Vec::new() },
+                Some(("start", start)) => local_control::ScreencastCommand::Start {
+                    argv: Vec::new(),
+                    hevc: start.is_present("hevc"),
+                },
+                _ => local_control::ScreencastCommand::Start {
+                    argv: Vec::new(),
+                    hevc: false,
+                },
             };
             let response = local_control::send_screencast(command)?;
             println!("{response}");
@@ -384,6 +399,9 @@ fn try_handle_screencast_passthrough(
             "`--ffmpeg` is only valid with `screencast start`".into()
         ));
     }
+    // `--hevc` selects the HEVC NAL classifier for a custom capture command, and
+    // appears before `--ffmpeg` so it is not swallowed by the verbatim argv.
+    let hevc = rest[..ffmpeg].iter().any(|arg| arg == "--hevc");
     let argv = rest[ffmpeg + 1..].to_vec();
     if argv.is_empty() {
         return Some(Err("`--ffmpeg` requires a command, for example: \
@@ -391,7 +409,7 @@ fn try_handle_screencast_passthrough(
             .into()));
     }
     Some(
-        local_control::send_screencast(local_control::ScreencastCommand::Start { argv })
+        local_control::send_screencast(local_control::ScreencastCommand::Start { argv, hevc })
             .map(|response| println!("{response}"))
             .map_err(Into::into),
     )

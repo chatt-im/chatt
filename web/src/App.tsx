@@ -85,11 +85,22 @@ export default function App() {
   // scroll position is anchored from the end (reverse infinite scroll).
   const [prepend, setPrepend] = createSignal(false);
 
-  // Screen shares this browser can watch, and the one currently playing.
+  // Screen shares this browser can watch, and the stream ids currently playing.
   const [shares, setShares] = createSignal<ShareInfo[]>([]);
-  const [playing, setPlaying] = createSignal<number | null>(null);
-  let canvasEl: HTMLCanvasElement | undefined;
-  let decoder: ScreenShareDecoder | undefined;
+  const [playing, setPlaying] = createSignal<number[]>([]);
+  // One decoder and canvas per stream, so several shares can play at once.
+  const decoders = new Map<number, ScreenShareDecoder>();
+  const canvases = new Map<number, HTMLCanvasElement>();
+
+  function registerCanvas(streamId: number, el: HTMLCanvasElement) {
+    canvases.set(streamId, el);
+  }
+
+  function closeDecoder(streamId: number) {
+    decoders.get(streamId)?.close();
+    decoders.delete(streamId);
+    setPlaying((prev) => prev.filter((id) => id !== streamId));
+  }
 
   let logEl: HTMLDivElement | undefined;
   let contentEl: HTMLDivElement | undefined;
@@ -192,8 +203,7 @@ export default function App() {
     if (socket && socket.readyState === WebSocket.OPEN) {
       socket.send(JSON.stringify({ type: "stop_share", stream_id: streamId } as ClientRequest));
     }
-    decoder?.close();
-    setPlaying(null);
+    closeDecoder(streamId);
   }
 
   function onScroll(offset: number) {
@@ -235,7 +245,7 @@ export default function App() {
     ws.onmessage = (ev) => {
       if (typeof ev.data !== "string") {
         const frame = parseFrame(ev.data as ArrayBuffer);
-        if (frame && decoder) decoder.decode(frame);
+        if (frame) decoders.get(frame.streamId)?.decode(frame);
         return;
       }
       const env: ServerEnvelope = JSON.parse(ev.data);
@@ -260,19 +270,24 @@ export default function App() {
             : [...prev, { stream_id: env.stream_id, sender: env.sender, codec: env.codec }],
         );
       } else if (env.type === "share_config") {
-        // The decoder configures lazily from the first keyframe's SPS/PPS, so
-        // this only prepares it and marks the share as playing.
-        if (canvasEl) {
-          if (!decoder) decoder = new ScreenShareDecoder(canvasEl);
-          decoder.reset();
-          setPlaying(env.stream_id);
+        // Configure this stream's decoder from the codec and descriptor the
+        // client supplies, then mark the share as playing. The canvas was
+        // mounted with the share's row, so it is already registered.
+        const canvas = canvases.get(env.stream_id);
+        if (canvas) {
+          let decoder = decoders.get(env.stream_id);
+          if (!decoder) {
+            decoder = new ScreenShareDecoder(canvas);
+            decoders.set(env.stream_id, decoder);
+          }
+          decoder.configure(env.codec, new Uint8Array(env.extradata));
+          setPlaying((prev) =>
+            prev.includes(env.stream_id) ? prev : [...prev, env.stream_id],
+          );
         }
       } else if (env.type === "share_ended") {
         setShares((prev) => prev.filter((s) => s.stream_id !== env.stream_id));
-        if (playing() === env.stream_id) {
-          decoder?.close();
-          setPlaying(null);
-        }
+        closeDecoder(env.stream_id);
       } else {
         // Upsert by file_id: a file's announcement placeholder and its later
         // inline version share an id, so the second arrival enriches the first
@@ -315,7 +330,8 @@ export default function App() {
     if (reconnectTimer) clearTimeout(reconnectTimer);
     if (suppressTimer) clearTimeout(suppressTimer);
     if (idleTimer) clearTimeout(idleTimer);
-    decoder?.close();
+    for (const decoder of decoders.values()) decoder.close();
+    decoders.clear();
     socket?.close();
   });
 
@@ -332,7 +348,7 @@ export default function App() {
         playing={playing()}
         onPlay={playShare}
         onStop={stopShare}
-        canvasRef={(el) => (canvasEl = el)}
+        canvasRef={registerCanvas}
       />
       <div
         class="chat-log"

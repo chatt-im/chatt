@@ -4,8 +4,9 @@
 //! The default command captures the X11 desktop. `repeat-headers=1` makes x264
 //! emit SPS/PPS in band at every keyframe so a mid-stream viewer bootstraps, and
 //! `sliced-threads=0` keeps one slice per frame so an access unit is one NAL.
-//! The splitter promotes the Phase-0 spike's `split_access_units` and
-//! `codecFromSps` into the client.
+//! The splitter promotes the Phase-0 spike's `split_access_units` into the
+//! client. Codec metadata is derived from the parameter sets by
+//! [`rpc::bitstream`] in the publisher.
 
 use std::io::Read;
 use std::process::{Child, Command, Stdio};
@@ -14,6 +15,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
 use std::thread::{self, JoinHandle};
 use std::time::Instant;
+
+use rpc::bitstream::Codec;
 
 /// One captured access unit: a monotonic millisecond timestamp, whether it is a
 /// keyframe, and its Annex-B H.264 bytes.
@@ -84,10 +87,47 @@ pub fn default_ffmpeg_argv() -> Vec<String> {
     .collect()
 }
 
+/// The HEVC capture command: x11grab into low-latency H.265 on stdout. `repeat-
+/// headers=1` emits VPS/SPS/PPS in band at every keyframe so a mid-stream viewer
+/// bootstraps. HEVC decode in the browser is platform-gated, so this is opt-in.
+pub fn hevc_ffmpeg_argv() -> Vec<String> {
+    let display = std::env::var("DISPLAY").unwrap_or_else(|_| ":0".to_string());
+    [
+        "ffmpeg",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-f",
+        "x11grab",
+        "-framerate",
+        "30",
+        "-i",
+        &display,
+        "-c:v",
+        "libx265",
+        "-preset",
+        "ultrafast",
+        "-tune",
+        "zerolatency",
+        "-pix_fmt",
+        "yuv420p",
+        "-x265-params",
+        "repeat-headers=1:keyint=60:min-keyint=60:log-level=none",
+        "-f",
+        "hevc",
+        "pipe:1",
+    ]
+    .iter()
+    .map(|part| part.to_string())
+    .collect()
+}
+
 /// Spawns the capture command and a reader thread that streams access units to
-/// `frame_tx`. The reader exits when ffmpeg's stdout closes or `stop` is set.
+/// `frame_tx`. `codec` selects how NAL types are classified into access units.
+/// The reader exits when ffmpeg's stdout closes or `stop` is set.
 pub fn spawn(
     argv: &[String],
+    codec: Codec,
     frame_tx: Sender<CapturedFrame>,
     stop: Arc<AtomicBool>,
 ) -> Result<Capture, String> {
@@ -106,7 +146,7 @@ pub fn spawn(
         .ok_or_else(|| "capture command stdout was not piped".to_string())?;
     let reader = thread::Builder::new()
         .name("chatt-capture".to_string())
-        .spawn(move || read_loop(stdout, &frame_tx, &stop))
+        .spawn(move || read_loop(stdout, codec, &frame_tx, &stop))
         .map_err(|error| format!("failed to spawn capture reader: {error}"))?;
     Ok(Capture {
         child,
@@ -114,8 +154,13 @@ pub fn spawn(
     })
 }
 
-fn read_loop(mut stdout: impl Read, frame_tx: &Sender<CapturedFrame>, stop: &AtomicBool) {
-    let mut splitter = Splitter::new();
+fn read_loop(
+    mut stdout: impl Read,
+    codec: Codec,
+    frame_tx: &Sender<CapturedFrame>,
+    stop: &AtomicBool,
+) {
+    let mut splitter = Splitter::new(codec);
     let mut buf = [0u8; 64 * 1024];
     loop {
         if stop.load(Ordering::Relaxed) {
@@ -142,6 +187,7 @@ fn read_loop(mut stdout: impl Read, frame_tx: &Sender<CapturedFrame>, stop: &Ato
 /// start code arrives, so units emit with one frame of latency, which is
 /// negligible for live view.
 struct Splitter {
+    codec: Codec,
     buf: Vec<u8>,
     unit: Vec<u8>,
     unit_is_key: bool,
@@ -149,9 +195,42 @@ struct Splitter {
     started: Instant,
 }
 
+/// How one NAL classifies for access-unit splitting: whether it is a coded
+/// slice (VCL), starts a keyframe (IRAP/IDR), and whether it is a parameter set
+/// or other metadata that begins a new unit when a slice was already buffered.
+struct NalClass {
+    is_vcl: bool,
+    is_key: bool,
+    is_param_or_meta: bool,
+}
+
+/// Classifies one NAL by codec. H.264 types are the low 5 bits with VCL 1..=5 and
+/// IDR type 5; HEVC types are bits 1..7 with VCL below 32 and IRAP 16..=23.
+fn classify_nal(codec: Codec, nal: &[u8]) -> NalClass {
+    match codec {
+        Codec::H264 => {
+            let nal_type = nal.first().map(|byte| byte & 0x1f).unwrap_or(0);
+            NalClass {
+                is_vcl: (1..=5).contains(&nal_type),
+                is_key: nal_type == 5,
+                is_param_or_meta: matches!(nal_type, 6 | 7 | 8 | 9),
+            }
+        }
+        Codec::Hevc => {
+            let nal_type = nal.first().map(|byte| (byte >> 1) & 0x3f).unwrap_or(0);
+            NalClass {
+                is_vcl: nal_type < 32,
+                is_key: (16..=23).contains(&nal_type),
+                is_param_or_meta: nal_type >= 32,
+            }
+        }
+    }
+}
+
 impl Splitter {
-    fn new() -> Self {
+    fn new(codec: Codec) -> Self {
         Self {
+            codec,
             buf: Vec::new(),
             unit: Vec::new(),
             unit_is_key: false,
@@ -213,9 +292,8 @@ impl Splitter {
     /// Appends one NAL to the current unit, emitting the previous unit when this
     /// NAL begins a new one.
     fn push_nal(&mut self, nal: &[u8]) -> Option<CapturedFrame> {
-        let nal_type = nal.first().map(|byte| byte & 0x1f).unwrap_or(0);
-        let is_vcl = (1..=5).contains(&nal_type);
-        let starts_new_unit = self.unit_has_vcl && (is_vcl || matches!(nal_type, 6 | 7 | 8 | 9));
+        let class = classify_nal(self.codec, nal);
+        let starts_new_unit = self.unit_has_vcl && (class.is_vcl || class.is_param_or_meta);
         let emitted = if starts_new_unit {
             self.take_unit()
         } else {
@@ -223,10 +301,10 @@ impl Splitter {
         };
         self.unit.extend_from_slice(&[0, 0, 0, 1]);
         self.unit.extend_from_slice(nal);
-        if nal_type == 5 {
+        if class.is_key {
             self.unit_is_key = true;
         }
-        if is_vcl {
+        if class.is_vcl {
             self.unit_has_vcl = true;
         }
         emitted
@@ -262,24 +340,6 @@ fn start_code_offsets(stream: &[u8]) -> Vec<usize> {
     offsets
 }
 
-/// Derives the WebCodecs codec string from a keyframe's SPS NAL: `avc1.PPCCLL`
-/// where PP is profile_idc, CC the constraint flags, and LL the level_idc.
-/// Returns `None` when the unit carries no SPS.
-pub fn parse_codec(unit: &[u8]) -> Option<String> {
-    for offset in start_code_offsets(unit) {
-        let nal_start = offset + 3;
-        if nal_start + 3 < unit.len() && unit[nal_start] & 0x1f == 7 {
-            return Some(format!(
-                "avc1.{:02x}{:02x}{:02x}",
-                unit[nal_start + 1],
-                unit[nal_start + 2],
-                unit[nal_start + 3]
-            ));
-        }
-    }
-    None
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -304,7 +364,7 @@ mod tests {
             &[0x41, 0x9a],
         ]);
         let (tx, rx) = mpsc::channel();
-        let mut splitter = Splitter::new();
+        let mut splitter = Splitter::new(Codec::H264);
         splitter.push(&stream, &tx).unwrap();
         splitter.flush(&tx);
         let frames: Vec<_> = rx.try_iter().collect();
@@ -314,16 +374,31 @@ mod tests {
     }
 
     #[test]
-    fn parse_codec_reads_sps_profile() {
-        let unit = annexb(&[&[0x67, 0x42, 0xc0, 0x1f], &[0x65, 0x88]]);
-        assert_eq!(parse_codec(&unit).as_deref(), Some("avc1.42c01f"));
+    fn splits_hevc_access_units_with_keyframe_classification() {
+        // VPS(32) SPS(33) PPS(34) IDR(19) form one keyframe unit, then a
+        // non-IRAP TRAIL slice(1). HEVC NAL type is bits 1..7 of the first byte.
+        let stream = annexb(&[
+            &[0x40, 0x01, 0x0c], // VPS (type 32)
+            &[0x42, 0x01, 0x01], // SPS (type 33)
+            &[0x44, 0x01, 0xc1], // PPS (type 34)
+            &[0x26, 0x01, 0x88], // IDR_W_RADL (type 19)
+            &[0x02, 0x01, 0x9a], // TRAIL_R (type 1)
+        ]);
+        let (tx, rx) = mpsc::channel();
+        let mut splitter = Splitter::new(Codec::Hevc);
+        splitter.push(&stream, &tx).unwrap();
+        splitter.flush(&tx);
+        let frames: Vec<_> = rx.try_iter().collect();
+        assert_eq!(frames.len(), 2);
+        assert!(frames[0].is_key);
+        assert!(!frames[1].is_key);
     }
 
     #[test]
     fn split_survives_chunk_boundaries() {
         let stream = annexb(&[&[0x67, 0x42, 0xc0, 0x1f], &[0x65, 0x88], &[0x41, 0x9a]]);
         let (tx, rx) = mpsc::channel();
-        let mut splitter = Splitter::new();
+        let mut splitter = Splitter::new(Codec::H264);
         for chunk in stream.chunks(3) {
             splitter.push(chunk, &tx).unwrap();
         }

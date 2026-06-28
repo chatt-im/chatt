@@ -177,10 +177,23 @@ pub(crate) fn classify(name: &str) -> &'static str {
 /// What the app sends to the web thread.
 enum WebFeed {
     Message(WebMessage),
-    /// A decoder-config text envelope announcing or updating a screen share.
-    VideoConfig(String),
-    /// One plaintext video frame body (13-byte header plus H.264), forwarded to
-    /// browsers as a binary WebSocket message without re-framing.
+    /// A `share_available` envelope. The web thread retains it by `stream_id` and
+    /// replays it to a browser that connects after the share started.
+    ShareAvailable {
+        stream_id: u32,
+        payload: String,
+    },
+    /// A `share_config` envelope sent when playback starts. Transient: it targets
+    /// a browser that already asked to play, so it is broadcast but not retained.
+    ShareConfig(String),
+    /// A `share_ended` envelope. Drops the retained `share_available` for its
+    /// `stream_id`.
+    ShareEnded {
+        stream_id: u32,
+        payload: String,
+    },
+    /// One plaintext video frame body (the 17-byte header plus the bitstream),
+    /// forwarded to browsers as a binary WebSocket message without re-framing.
     VideoFrame(Vec<u8>),
     Stop,
 }
@@ -227,9 +240,22 @@ impl WebFeedSender {
         self.wake.wake();
     }
 
-    /// Sends a screen-share decoder-config envelope as a WebSocket text frame.
-    pub fn send_video_config(&self, payload: String) {
-        let _ = self.tx.send(WebFeed::VideoConfig(payload));
+    /// Announces a screen share to every browser, retained so a browser that
+    /// connects later still learns the share is available.
+    pub fn send_share_available(&self, stream_id: u32, payload: String) {
+        let _ = self.tx.send(WebFeed::ShareAvailable { stream_id, payload });
+        self.wake.wake();
+    }
+
+    /// Sends a decoder-config envelope when playback starts. Not retained.
+    pub fn send_share_config(&self, payload: String) {
+        let _ = self.tx.send(WebFeed::ShareConfig(payload));
+        self.wake.wake();
+    }
+
+    /// Tells every browser a share ended and drops its retained announcement.
+    pub fn send_share_ended(&self, stream_id: u32, payload: String) {
+        let _ = self.tx.send(WebFeed::ShareEnded { stream_id, payload });
         self.wake.wake();
     }
 
@@ -302,6 +328,10 @@ fn run(
     // history independent of the message ids (which span two id namespaces).
     let mut base_seq: u64 = 0;
     let mut clients: Vec<WebSocketId> = Vec::new();
+    // Active screen shares by stream id, replayed to a browser that connects
+    // after a share started so it still shows the play button.
+    let mut active_shares: std::collections::HashMap<u32, String> =
+        std::collections::HashMap::new();
 
     loop {
         if let Err(error) = server.poll_once(None) {
@@ -315,6 +345,9 @@ fn run(
                     if path == WS_PATH {
                         clients.push(id);
                         let _ = server.send_websocket_text(id, sync_payload(&history, base_seq));
+                        for payload in active_shares.values() {
+                            let _ = server.send_websocket_text(id, payload);
+                        }
                     }
                 }
                 ServerEvent::WebSocketClose { id } => clients.retain(|client| *client != id),
@@ -368,7 +401,19 @@ fn run(
                         let _ = server.send_websocket_text(*id, &payload);
                     }
                 }
-                Ok(WebFeed::VideoConfig(payload)) => {
+                Ok(WebFeed::ShareAvailable { stream_id, payload }) => {
+                    active_shares.insert(stream_id, payload.clone());
+                    for id in &clients {
+                        let _ = server.send_websocket_text(*id, &payload);
+                    }
+                }
+                Ok(WebFeed::ShareConfig(payload)) => {
+                    for id in &clients {
+                        let _ = server.send_websocket_text(*id, &payload);
+                    }
+                }
+                Ok(WebFeed::ShareEnded { stream_id, payload }) => {
+                    active_shares.remove(&stream_id);
                     for id in &clients {
                         let _ = server.send_websocket_text(*id, &payload);
                     }
@@ -842,5 +887,59 @@ Sec-WebSocket-Version: 13\r\n\
         assert!(text.contains("\"body\":\"m0\""), "{text}");
         assert!(text.contains("\"body\":\"m1\""), "{text}");
         assert!(!text.contains("\"body\":\"m2\""), "{text}");
+    }
+
+    #[test]
+    fn share_available_replays_to_late_client_until_ended() {
+        let cfg = WebConfig {
+            enabled: true,
+            bind: "127.0.0.1:39519".to_string(),
+        };
+        let (web_tx, _web_rx) = mpsc::channel();
+        let sender = spawn(&cfg, None, 100, web_tx).unwrap();
+
+        // A share starts before any browser connects.
+        sender.send_share_available(
+            5,
+            "{\"type\":\"share_available\",\"stream_id\":5}".to_string(),
+        );
+
+        // A browser that connects after the share still learns it is available:
+        // the retained announcement follows the initial sync frame.
+        let mut late = open_ws("127.0.0.1:39519");
+        let (_, sync) = read_ws_frame(&mut late);
+        assert!(String::from_utf8(sync).unwrap().contains("\"sync\""));
+        let (opcode, payload) = read_ws_frame(&mut late);
+        assert_eq!(opcode, 0x1);
+        let text = String::from_utf8(payload).unwrap();
+        assert!(text.contains("\"share_available\""), "{text}");
+        assert!(text.contains("\"stream_id\":5"), "{text}");
+
+        // The share ends, dropping the retained announcement.
+        sender.send_share_ended(5, "{\"type\":\"share_ended\",\"stream_id\":5}".to_string());
+        let (_, ended) = read_ws_frame(&mut late);
+        assert!(
+            String::from_utf8(ended)
+                .unwrap()
+                .contains("\"share_ended\"")
+        );
+
+        // A browser that connects now sees no share. After sync, the next frame
+        // is a live chat message, with no stale share_available before it.
+        let mut fresh = open_ws("127.0.0.1:39519");
+        let (_, sync2) = read_ws_frame(&mut fresh);
+        assert!(String::from_utf8(sync2).unwrap().contains("\"sync\""));
+        sender.send(WebMessage {
+            id: 1,
+            sender: "Bob".to_string(),
+            body: "hi".to_string(),
+            timestamp_ms: 0,
+            attachment: None,
+            file_id: None,
+        });
+        let (_, next) = read_ws_frame(&mut fresh);
+        let text = String::from_utf8(next).unwrap();
+        assert!(text.contains("\"message\""), "{text}");
+        assert!(!text.contains("share_available"), "{text}");
     }
 }

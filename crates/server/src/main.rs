@@ -850,6 +850,10 @@ impl Server {
                 &ServerControl::ShareStarted {
                     stream_id,
                     publish_secret: publish_secret.to_vec(),
+                    codec: codec.clone(),
+                    coded_width,
+                    coded_height,
+                    extradata: extradata.clone(),
                 },
             )?;
         }
@@ -3259,7 +3263,7 @@ mod tests {
 
     fn ring_frame(is_key: bool) -> VideoRingFrame {
         let mut bytes = Vec::new();
-        video::write_video_frame(&mut bytes, 0, is_key, &[0u8; 8]);
+        video::write_video_frame(&mut bytes, 0, is_key, 0, &[0u8; 8]);
         VideoRingFrame {
             data: Arc::from(bytes),
             is_key,

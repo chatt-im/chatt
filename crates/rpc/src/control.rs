@@ -182,6 +182,10 @@ pub enum ServerControl {
     ShareStarted {
         stream_id: StreamId,
         publish_secret: Vec<u8>,
+        codec: String,
+        coded_width: u32,
+        coded_height: u32,
+        extradata: Vec<u8>,
     },
     ShareAvailable {
         room_id: RoomId,
