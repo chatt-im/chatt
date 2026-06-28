@@ -15,9 +15,19 @@ const TOP_THRESHOLD = 200;
 // How many older messages one paging request asks for.
 const PAGE = 100;
 
+const DEFAULT_SHARE_PANE_HEIGHT = 360;
+const MIN_SHARE_PANE_HEIGHT = 160;
+const MIN_CHAT_PANE_HEIGHT = 140;
+const DIVIDER_SIZE = 9;
+const PANE_KEY_STEP = 32;
+
 // Builds the asset URL for an attachment served from the client's receive dir.
 function fileUrl(name: string): string {
   return `/files/${encodeURIComponent(name)}`;
+}
+
+function clamp(value: number, min: number, max: number): number {
+  return Math.min(max, Math.max(min, value));
 }
 
 function formatTime(ms: number): string {
@@ -90,6 +100,8 @@ export default function App() {
   const [playing, setPlaying] = createSignal<number[]>([]);
   // Per-stream play-failure messages reported by the client, shown on the row.
   const [shareErrors, setShareErrors] = createSignal<Record<number, string>>({});
+  const [sharePaneHeight, setSharePaneHeight] = createSignal(DEFAULT_SHARE_PANE_HEIGHT);
+  const [fullscreenStream, setFullscreenStream] = createSignal<number | null>(null);
 
   function setShareError(streamId: number, message: string) {
     setShareErrors((prev) => ({ ...prev, [streamId]: message }));
@@ -117,12 +129,20 @@ export default function App() {
     setPlaying((prev) => prev.filter((id) => id !== streamId));
   }
 
+  let mainEl: HTMLElement | undefined;
   let logEl: HTMLDivElement | undefined;
   let contentEl: HTMLDivElement | undefined;
   let handle: VirtualizerHandle | undefined;
   let resizeObserver: ResizeObserver | undefined;
+  let splitResizeObserver: ResizeObserver | undefined;
   let socket: WebSocket | undefined;
   let reconnectTimer: number | undefined;
+  let paneResize:
+    | {
+        move: (event: PointerEvent) => void;
+        up: (event: PointerEvent) => void;
+      }
+    | undefined;
 
   // Paging cursor: the sequence number of the oldest message currently held and
   // whether the server still has older history to send.
@@ -215,11 +235,91 @@ export default function App() {
     }
   }
 
+  function exitShareFullscreen() {
+    setFullscreenStream(null);
+    if (document.fullscreenElement === mainEl) document.exitFullscreen().catch(() => {});
+  }
+
   function stopShare(streamId: number) {
     if (socket && socket.readyState === WebSocket.OPEN) {
       socket.send(JSON.stringify({ type: "stop_share", stream_id: streamId } as ClientRequest));
     }
+    if (fullscreenStream() === streamId) exitShareFullscreen();
     closeDecoder(streamId);
+  }
+
+  function hasVideoPane(): boolean {
+    return shares().length > 0 && playing().length > 0;
+  }
+
+  function clampSharePaneHeight(height: number): number {
+    const total = mainEl?.clientHeight ?? 0;
+    if (total <= 0) return Math.max(MIN_SHARE_PANE_HEIGHT, height);
+    const minShare = Math.min(
+      MIN_SHARE_PANE_HEIGHT,
+      Math.max(96, total - MIN_CHAT_PANE_HEIGHT - DIVIDER_SIZE),
+    );
+    const maxShare = Math.max(minShare, total - MIN_CHAT_PANE_HEIGHT - DIVIDER_SIZE);
+    return clamp(height, minShare, maxShare);
+  }
+
+  function setClampedSharePaneHeight(height: number) {
+    setSharePaneHeight(clampSharePaneHeight(height));
+    pin();
+  }
+
+  function removePaneResizeListeners() {
+    if (!paneResize) return;
+    window.removeEventListener("pointermove", paneResize.move);
+    window.removeEventListener("pointerup", paneResize.up);
+    window.removeEventListener("pointercancel", paneResize.up);
+    paneResize = undefined;
+  }
+
+  function beginPaneResize(event: PointerEvent) {
+    if (fullscreenStream() !== null) return;
+    event.preventDefault();
+    removePaneResizeListeners();
+    const startY = event.clientY;
+    const startHeight = sharePaneHeight();
+    const move = (moveEvent: PointerEvent) => {
+      moveEvent.preventDefault();
+      setClampedSharePaneHeight(startHeight + moveEvent.clientY - startY);
+    };
+    const up = (upEvent: PointerEvent) => {
+      upEvent.preventDefault();
+      removePaneResizeListeners();
+    };
+    paneResize = { move, up };
+    window.addEventListener("pointermove", move);
+    window.addEventListener("pointerup", up);
+    window.addEventListener("pointercancel", up);
+  }
+
+  function onDividerKeyDown(event: KeyboardEvent) {
+    if (fullscreenStream() !== null) return;
+    if (event.key === "ArrowUp") {
+      event.preventDefault();
+      setClampedSharePaneHeight(sharePaneHeight() - PANE_KEY_STEP);
+    } else if (event.key === "ArrowDown") {
+      event.preventDefault();
+      setClampedSharePaneHeight(sharePaneHeight() + PANE_KEY_STEP);
+    }
+  }
+
+  async function toggleShareFullscreen(streamId: number) {
+    if (fullscreenStream() === streamId) {
+      exitShareFullscreen();
+      return;
+    }
+    setFullscreenStream(streamId);
+    if (mainEl?.requestFullscreen && document.fullscreenElement !== mainEl) {
+      await mainEl.requestFullscreen().catch(() => {});
+    }
+  }
+
+  function onDocumentFullscreenChange() {
+    if (!document.fullscreenElement) setFullscreenStream(null);
   }
 
   function onScroll(offset: number) {
@@ -280,11 +380,20 @@ export default function App() {
         oldestSeq = env.oldest_seq;
         hasMore = env.has_more;
       } else if (env.type === "share_available") {
-        setShares((prev) =>
-          prev.some((s) => s.stream_id === env.stream_id)
-            ? prev
-            : [...prev, { stream_id: env.stream_id, sender: env.sender, codec: env.codec }],
-        );
+        setShares((prev) => {
+          const share = {
+            stream_id: env.stream_id,
+            sender: env.sender,
+            codec: env.codec,
+            width: env.width,
+            height: env.height,
+          };
+          const index = prev.findIndex((s) => s.stream_id === env.stream_id);
+          if (index < 0) return [...prev, share];
+          const next = prev.slice();
+          next[index] = share;
+          return next;
+        });
       } else if (env.type === "share_config") {
         // Configure this stream's decoder from the codec and descriptor the
         // client supplies, then mark the share as playing. The canvas was
@@ -307,6 +416,9 @@ export default function App() {
       } else if (env.type === "share_ended") {
         setShares((prev) => prev.filter((s) => s.stream_id !== env.stream_id));
         clearShareError(env.stream_id);
+        if (fullscreenStream() === env.stream_id) {
+          exitShareFullscreen();
+        }
         closeDecoder(env.stream_id);
       } else {
         // Upsert by file_id: a file's announcement placeholder and its later
@@ -343,10 +455,21 @@ export default function App() {
       resizeObserver = new ResizeObserver(() => pin());
       resizeObserver.observe(contentEl);
     }
+    if (mainEl) {
+      splitResizeObserver = new ResizeObserver(() => {
+        setSharePaneHeight((height) => clampSharePaneHeight(height));
+        pin();
+      });
+      splitResizeObserver.observe(mainEl);
+    }
+    document.addEventListener("fullscreenchange", onDocumentFullscreenChange);
     connect();
   });
   onCleanup(() => {
     resizeObserver?.disconnect();
+    splitResizeObserver?.disconnect();
+    document.removeEventListener("fullscreenchange", onDocumentFullscreenChange);
+    removePaneResizeListeners();
     if (reconnectTimer) clearTimeout(reconnectTimer);
     if (suppressTimer) clearTimeout(suppressTimer);
     if (idleTimer) clearTimeout(idleTimer);
@@ -356,44 +479,71 @@ export default function App() {
   });
 
   return (
-    <div class="app">
+    <div class="app" classList={{ "is-share-fullscreen": fullscreenStream() !== null }}>
       <header class="app-header">
         <span class="app-title">chatt</span>
         <span class="conn-status" classList={{ "is-online": connected() }}>
           {connected() ? "live" : "offline"}
         </span>
       </header>
-      <ScreenShare
-        shares={shares()}
-        playing={playing()}
-        errors={shareErrors()}
-        onPlay={playShare}
-        onStop={stopShare}
-        canvasRef={registerCanvas}
-      />
-      <div
-        class="chat-log"
-        ref={logEl}
-        onWheel={markUser}
-        onTouchStart={markUser}
-        onTouchMove={markUser}
-        onPointerDown={markUser}
-        onKeyDown={onKeyDown}
+      <main
+        class="app-main"
+        classList={{
+          "has-video-pane": hasVideoPane(),
+          "is-share-fullscreen": fullscreenStream() !== null,
+        }}
+        ref={mainEl}
+        style={hasVideoPane() ? `--share-pane-height: ${sharePaneHeight()}px` : undefined}
       >
-        <div class="chat-log-spacer" />
-        <div class="chat-log-content" ref={contentEl}>
-          <Virtualizer
-            ref={(h) => (handle = h)}
-            scrollRef={logEl}
-            data={messages()}
-            shift={prepend()}
-            onScroll={onScroll}
-            onScrollEnd={onScrollEnd}
-          >
-            {(message) => <MessageRow message={message} />}
-          </Virtualizer>
+        <Show when={shares().length > 0}>
+          <section class="share-pane">
+            <ScreenShare
+              shares={shares()}
+              playing={playing()}
+              errors={shareErrors()}
+              fullscreenStream={fullscreenStream()}
+              onPlay={playShare}
+              onStop={stopShare}
+              onToggleFullscreen={toggleShareFullscreen}
+              canvasRef={registerCanvas}
+            />
+          </section>
+          <Show when={hasVideoPane()}>
+            <div
+              class="pane-divider"
+              role="separator"
+              aria-label="Resize chat"
+              aria-orientation="horizontal"
+              tabIndex={0}
+              onPointerDown={beginPaneResize}
+              onKeyDown={onDividerKeyDown}
+            />
+          </Show>
+        </Show>
+        <div
+          class="chat-log"
+          ref={logEl}
+          onWheel={markUser}
+          onTouchStart={markUser}
+          onTouchMove={markUser}
+          onPointerDown={markUser}
+          onKeyDown={onKeyDown}
+        >
+          <div class="chat-log-spacer" />
+          <div class="chat-log-content" ref={contentEl}>
+            <Virtualizer
+              ref={(h) => (handle = h)}
+              scrollRef={logEl}
+              data={messages()}
+              shift={prepend()}
+              onScroll={onScroll}
+              onScrollEnd={onScrollEnd}
+            >
+              {(message) => <MessageRow message={message} />}
+            </Virtualizer>
+          </div>
         </div>
-      </div>
+      </main>
     </div>
   );
 }

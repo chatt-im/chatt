@@ -56,6 +56,8 @@ export interface ShareInfo {
   stream_id: number;
   sender: string;
   codec: string;
+  width: number;
+  height: number;
 }
 
 // Frames the browser sends: paging requests and screen-share playback control.
