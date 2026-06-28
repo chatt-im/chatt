@@ -19,13 +19,6 @@ v3 = [
     "--config", "target.'cfg(target_arch = \"x86_64\")'.rustflags=['-C', 'target-cpu=x86-64-v3']",
 ]
 
-v3-rnnoise = [
-    "build",
-    "--profile", "release-v3",
-    "--features", "avx2 rnnoise-v2",
-    "--config", "target.'cfg(target_arch = \"x86_64\")'.rustflags=['-C', 'target-cpu=x86-64-v3']",
-]
-
 # Heap profiling with dhat. Builds the `dhat` profile (release + debug info),
 # drops the mimalloc allocator (`--no-default-features`), and arms the dhat
 # profiler. Extra args pass through, e.g.:

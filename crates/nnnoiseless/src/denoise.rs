@@ -1,10 +1,8 @@
-use std::borrow::Cow;
+use crate::FRAME_SIZE;
 
-use crate::{RnnModel, FRAME_SIZE, FREQ_SIZE, NB_BANDS};
-
-/// This is the low-level entry-point into `nnnoiseless`: by using the `DenoiseState` directly,
-/// you can denoise your audio while keeping copying to a minimum. For a higher-level
-/// denoising experience, try [`DenoiseSignal`](crate::DenoiseSignal).
+/// This is the entry-point into `nnnoiseless`: a `DenoiseState` denoises audio
+/// one [`FRAME_SIZE`](crate::FRAME_SIZE)-sample frame at a time using the
+/// vendored RNNoise model.
 ///
 /// This struct directly contains various memory buffers that are used while denoising. As such,
 /// this is quite a large struct, and should probably be kept behind some kind of pointer.
@@ -34,24 +32,9 @@ use crate::{RnnModel, FRAME_SIZE, FREQ_SIZE, NB_BANDS};
 /// }
 /// ```
 #[derive(Clone)]
-pub struct DenoiseState<'model> {
-    backend: DenoiseBackend<'model>,
+pub struct DenoiseState {
+    backend: crate::v2::V2DenoiseState,
     params: SuppressionParams,
-}
-
-#[derive(Clone)]
-enum DenoiseBackend<'model> {
-    #[cfg(feature = "rnnoise-v2")]
-    V2(crate::v2::V2DenoiseState),
-    Legacy(LegacyDenoiseState<'model>),
-}
-
-#[derive(Clone)]
-struct LegacyDenoiseState<'model> {
-    /// Most recent gains that we applied.
-    lastg: [f32; crate::NB_BANDS],
-    rnn: crate::rnn::RnnState<'model>,
-    feat: crate::features::DenoiseFeatures,
 }
 
 /// Tunable post-processing applied to the model's per-band suppression gains.
@@ -84,57 +67,16 @@ impl Default for SuppressionParams {
     }
 }
 
-impl DenoiseState<'static> {
+impl DenoiseState {
     /// A `DenoiseState` processes this many samples at a time.
     pub const FRAME_SIZE: usize = FRAME_SIZE;
 
-    pub(crate) fn default() -> Self {
-        #[cfg(feature = "rnnoise-v2")]
-        {
-            DenoiseState {
-                backend: DenoiseBackend::V2(crate::v2::V2DenoiseState::new()),
-                params: SuppressionParams::default(),
-            }
-        }
-        #[cfg(not(feature = "rnnoise-v2"))]
-        {
-            DenoiseState::from_model_owned(Cow::Owned(RnnModel::default()))
-        }
-    }
-
     /// Creates a new `DenoiseState`.
-    pub fn new() -> Box<DenoiseState<'static>> {
-        Box::new(Self::default())
-    }
-
-    /// Creates a new `DenoiseState` owning a custom model.
-    ///
-    /// The main difference between this method and `DenoiseState::with_model` is that here
-    /// `DenoiseState` will own the model; this might be more convenient.
-    pub fn from_model(model: RnnModel) -> Box<DenoiseState<'static>> {
-        Box::new(DenoiseState::from_model_owned(Cow::Owned(model)))
-    }
-}
-
-impl<'model> DenoiseState<'model> {
-    /// Creates a new `DenoiseState` using a custom model.
-    ///
-    /// The main difference between this method and `DenoiseState::from_model` is that here
-    /// `DenoiseState` will borrow the model; this might create some lifetime-related pain, but
-    /// it means that the same model can be shared between multiple `DenoiseState`s.
-    pub fn with_model(model: &'model RnnModel) -> Box<DenoiseState<'model>> {
-        Box::new(DenoiseState::from_model_owned(Cow::Borrowed(model)))
-    }
-
-    pub(crate) fn from_model_owned(model: Cow<'model, RnnModel>) -> DenoiseState<'model> {
-        DenoiseState {
-            backend: DenoiseBackend::Legacy(LegacyDenoiseState {
-                lastg: [0.0; NB_BANDS],
-                rnn: crate::rnn::RnnState::new(model),
-                feat: crate::features::DenoiseFeatures::new(),
-            }),
+    pub fn new() -> Box<DenoiseState> {
+        Box::new(DenoiseState {
+            backend: crate::v2::V2DenoiseState::new(),
             params: SuppressionParams::default(),
-        }
+        })
     }
 
     /// Replaces the gain post-processing parameters.
@@ -142,10 +84,7 @@ impl<'model> DenoiseState<'model> {
     /// Takes effect on the next [`process_frame`](Self::process_frame) call.
     pub fn set_suppression_params(&mut self, params: SuppressionParams) {
         self.params = params;
-        #[cfg(feature = "rnnoise-v2")]
-        if let DenoiseBackend::V2(v2) = &mut self.backend {
-            v2.set_suppression_params(params);
-        }
+        self.backend.set_suppression_params(params);
     }
 
     /// Returns the current gain post-processing parameters.
@@ -165,54 +104,7 @@ impl<'model> DenoiseState<'model> {
     /// preceding inputs. Because of this, you might prefer to discard the very first output; it
     /// will contain some fade-in artifacts.
     pub fn process_frame(&mut self, output: &mut [f32], input: &[f32]) -> f32 {
-        match &mut self.backend {
-            #[cfg(feature = "rnnoise-v2")]
-            DenoiseBackend::V2(v2) => v2.process_frame(output, input),
-            DenoiseBackend::Legacy(legacy) => legacy.process_frame(output, input, self.params),
-        }
-    }
-}
-
-impl<'model> LegacyDenoiseState<'model> {
-    fn process_frame(
-        &mut self,
-        output: &mut [f32],
-        input: &[f32],
-        params: SuppressionParams,
-    ) -> f32 {
-        let mut g = [0.0; NB_BANDS];
-        let mut gf = [1.0; FREQ_SIZE];
-        let mut vad_prob = [0.0];
-
-        self.feat.shift_and_filter_input(input);
-        let silence = self.feat.compute_frame_features();
-        if !silence {
-            self.rnn
-                .compute(&mut g[..], &mut vad_prob[..], self.feat.features());
-            // Over-suppression: reshape partial gains downward before the pitch
-            // comb and release floor see them, so the whole chain stays
-            // consistent. A near-unity (voice) gain is barely moved.
-            if params.gain_exponent != 1.0 {
-                for gain in g.iter_mut() {
-                    *gain = gain.powf(params.gain_exponent);
-                }
-            }
-            self.feat.pitch_filter(&g);
-            for i in 0..NB_BANDS {
-                g[i] = g[i].max(0.6 * self.lastg[i]);
-                // Attack clamp: cap the per-frame rise so suppression cannot
-                // release back to full level within a few frames after silence.
-                if params.attack < 1.0 && g[i] > self.lastg[i] {
-                    g[i] = self.lastg[i] + (g[i] - self.lastg[i]) * params.attack;
-                }
-                self.lastg[i] = g[i];
-            }
-            crate::interp_band_gain(&mut gf[..], &g[..]);
-            self.feat.apply_gain(&gf);
-        }
-
-        self.feat.frame_synthesis(output);
-        vad_prob[0]
+        self.backend.process_frame(output, input)
     }
 }
 
@@ -224,7 +116,7 @@ mod tests {
 
     #[test]
     fn denoise_state_is_send_sync() {
-        assert_send_sync::<DenoiseState<'static>>();
+        assert_send_sync::<DenoiseState>();
     }
 
     #[test]

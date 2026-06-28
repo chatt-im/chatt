@@ -4,30 +4,16 @@ use std::{
 };
 
 fn main() {
-    println!("cargo:rerun-if-env-changed=NNNOISELESS_RNNOISE_V2_WEIGHTS");
     println!("cargo:rerun-if-env-changed=CARGO_FEATURE_PRESUME_AVX2");
 
-    if env::var_os("CARGO_FEATURE_RNNOISE_V2").is_none() {
-        return;
-    }
-
-    let weights = env::var_os("NNNOISELESS_RNNOISE_V2_WEIGHTS").unwrap_or_else(|| {
-        panic!(
-            "rnnoise-v2 feature requires NNNOISELESS_RNNOISE_V2_WEIGHTS=/path/to/weights_blob.bin"
-        )
-    });
-    let weights = PathBuf::from(weights);
+    let manifest_dir = PathBuf::from(
+        env::var_os("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR is set by Cargo"),
+    );
+    let weights = manifest_dir.join("rnnoise_weights.bin");
     let target = env::var("TARGET").unwrap_or_default();
     let out_dir = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR is set by Cargo"));
-    let copied_weights = out_dir.join("rnnoise-v2-weights.bin");
-    fs::copy(&weights, &copied_weights).unwrap_or_else(|error| {
-        panic!(
-            "failed to copy RNNoise V2 weights from {}: {error}",
-            weights.display()
-        )
-    });
     println!("cargo:rerun-if-changed={}", weights.display());
-    build_weight_blob(&copied_weights, &out_dir, &target);
+    build_weight_blob(&weights, &out_dir, &target);
 
     let src = "c-rnnoise/src";
     let include = "c-rnnoise/include";
@@ -110,7 +96,7 @@ fn main() {
 
 fn build_weight_blob(weights: &Path, out_dir: &Path, target: &str) {
     if target.contains("msvc") {
-        panic!("rnnoise-v2 external weight embedding is not implemented for MSVC targets");
+        panic!("RNNoise weight embedding is not implemented for MSVC targets");
     }
 
     let symbol_prefix = if target.contains("apple") { "_" } else { "" };

@@ -42,7 +42,6 @@ default = ["audio-realtime", "mimalloc-allocator"]
 pipewire = ["cpal/pipewire"]
 audio-realtime = ["cpal/realtime"]
 audio-realtime-dbus = ["audio-realtime", "cpal/realtime-dbus"]
-rnnoise-v2 = ["nnnoiseless/rnnoise-v2"]
 # Use mimalloc as the global allocator. On by default. Mutually exclusive with
 # `dhat-heap`, which replaces the global allocator with the dhat profiler.
 mimalloc-allocator = ["dep:mimalloc"]

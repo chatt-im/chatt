@@ -108,28 +108,20 @@ and drops their per-call CPU dispatch. The result needs an Intel Haswell / AMD
 Excavator or newer CPU (2013+) and measures roughly 20% fewer cycles on the
 live call audio pipeline. The portable `release` build is unaffected.
 
-### Optional RNNoise V2 denoiser
+### RNNoise denoiser
 
-The default build uses the existing small Rust RNNoise backend. The modern
-RNNoise V2 backend is opt-in because its trained model is large. Build it by
-providing an external weight blob:
+The capture path denoises with the vendored RNNoise model in
+`crates/nnnoiseless`. The trained weights are checked in at
+`crates/nnnoiseless/rnnoise_weights.bin` and embedded at build time, so an
+ordinary `cargo build` just works with no extra features or environment
+variables.
 
-```sh
-NNNOISELESS_RNNOISE_V2_WEIGHTS=/tmp/rnnoise/weights_blob_little.bin \
-  cargo run -p chatt --features rnnoise-v2 -- --config chatt.toml
-```
+The `avx2` feature (and the `cargo v3` alias) compiles the bundled RNNoise C
+objects directly with AVX2/FMA and skips runtime CPU dispatch; the default build
+stays portable and selects SSE4.1/AVX2 kernels at runtime.
 
-For x86-64-v3 hardware, combine V2 with the optimized build set:
-
-```sh
-NNNOISELESS_RNNOISE_V2_WEIGHTS=/tmp/rnnoise/weights_blob_little.bin \
-  cargo v3 --features rnnoise-v2
-```
-
-The `avx2` feature alone does not enable RNNoise V2; it only says AVX2/FMA can
-be presumed when a backend that supports that mode is enabled.
-
-To acquire the upstream RNNoise model and generate a blob:
+The checked-in blob is the upstream "little" model. To regenerate it (for
+maintainers updating the model):
 
 ```sh
 git clone https://github.com/xiph/rnnoise /tmp/rnnoise
@@ -137,28 +129,11 @@ cd /tmp/rnnoise
 ./autogen.sh
 ./configure
 ./download_model.sh
+cp src/rnnoise_data_little.c src/rnnoise_data.c   # omit for the larger model
 make dump_weights_blob
 ./dump_weights_blob
-mv weights_blob.bin /tmp/rnnoise/weights_blob_regular.bin
+cp weights_blob.bin /code/chatt/crates/nnnoiseless/rnnoise_weights.bin
 ```
-
-Upstream also ships a smaller "little" model. To generate that blob, replace
-`src/rnnoise_data.c` with `src/rnnoise_data_little.c`, rebuild
-`dump_weights_blob`, and run it again:
-
-```sh
-cd /tmp/rnnoise
-cp src/rnnoise_data_little.c src/rnnoise_data.c
-make dump_weights_blob
-./dump_weights_blob
-mv weights_blob.bin /tmp/rnnoise/weights_blob_little.bin
-```
-
-On the desk-mounted microphone reference, release AVX2/FMA sweeps measured the
-little model at `5.70s` elapsed and the regular model at `13.76s` elapsed for
-the same evaluation. Quality was close: stock little was
-`speech_keep=0.904 typing_keep=0.007 typing_peak=227`; stock regular was
-`speech_keep=0.904 typing_keep=0.008 typing_peak=223`.
 
 Capture client diagnostics while running:
 

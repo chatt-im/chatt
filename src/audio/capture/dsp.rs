@@ -160,7 +160,7 @@ pub(crate) struct CaptureProcessor {
     denoise: DenoiseConfig,
     echo_enabled: bool,
     gain_max_db: f32,
-    rnnoise: Option<Box<DenoiseState<'static>>>,
+    rnnoise: Option<Box<DenoiseState>>,
     denoised: Vec<f32>,
     render: Vec<f32>,
     render_out: Vec<f32>,
