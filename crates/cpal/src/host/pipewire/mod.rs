@@ -3,7 +3,7 @@ use std::sync::{
     Arc,
 };
 
-use device::{init_devices, Class, Device, Devices};
+use device::{init_devices, Device, Devices};
 use stream::PwInitGuard;
 
 use crate::{traits::HostTrait, Error, ErrorKind};
@@ -23,6 +23,8 @@ pub struct Host {
     // pw_deinit() from running between device enumeration and stream creation.
     _pw: PwInitGuard,
     devices: Vec<Device>,
+    default_input: Option<Device>,
+    default_output: Option<Device>,
     connect_automatically: Arc<AtomicBool>,
 }
 
@@ -30,12 +32,14 @@ impl Host {
     pub fn new() -> Result<Self, Error> {
         let _pw = PwInitGuard::new();
         let connect_automatically = Arc::new(AtomicBool::new(true));
-        let devices = init_devices(connect_automatically.clone()).ok_or_else(|| {
+        let device_set = init_devices(connect_automatically.clone()).ok_or_else(|| {
             Error::with_message(ErrorKind::HostUnavailable, "PipeWire is not available")
         })?;
         Ok(Self {
             _pw,
-            devices,
+            devices: device_set.devices,
+            default_input: device_set.default_input,
+            default_output: device_set.default_output,
             connect_automatically,
         })
     }
@@ -67,16 +71,10 @@ impl HostTrait for Host {
     }
 
     fn default_input_device(&self) -> Option<Self::Device> {
-        self.devices
-            .iter()
-            .find(|device| matches!(device.class(), Class::DefaultInput))
-            .cloned()
+        self.default_input.clone()
     }
 
     fn default_output_device(&self) -> Option<Self::Device> {
-        self.devices
-            .iter()
-            .find(|device| matches!(device.class(), Class::DefaultOutput))
-            .cloned()
+        self.default_output.clone()
     }
 }

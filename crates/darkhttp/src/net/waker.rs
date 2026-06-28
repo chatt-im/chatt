@@ -17,7 +17,19 @@ pub(crate) struct Waker {
 impl Waker {
     pub(crate) fn new() -> io::Result<Self> {
         let mut fds = [0 as libc::c_int; 2];
+        #[cfg(any(target_os = "linux", target_os = "android"))]
         let rc = unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_NONBLOCK | libc::O_CLOEXEC) };
+        #[cfg(not(any(target_os = "linux", target_os = "android")))]
+        let rc = unsafe {
+            let rc = libc::pipe(fds.as_mut_ptr());
+            if rc == 0 {
+                libc::fcntl(fds[0], libc::F_SETFL, libc::O_NONBLOCK);
+                libc::fcntl(fds[0], libc::F_SETFD, libc::FD_CLOEXEC);
+                libc::fcntl(fds[1], libc::F_SETFL, libc::O_NONBLOCK);
+                libc::fcntl(fds[1], libc::F_SETFD, libc::FD_CLOEXEC);
+            }
+            rc
+        };
         if rc != 0 {
             return Err(io::Error::last_os_error());
         }

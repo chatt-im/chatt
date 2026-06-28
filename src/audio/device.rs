@@ -282,6 +282,24 @@ pub(crate) fn cpal_device_matches_config_id(device: &cpal::Device, configured_id
     device.id().is_ok_and(|device_id| device_id == parsed_id)
 }
 
+/// Returns `true` when `configured_id` matches the current system default output
+/// device by cpal DeviceId or by stable name. When the user selects the concrete
+/// device that is also the OS default, prefer the backend's default-device path
+/// so hosts that support default rerouting can follow device/profile changes.
+pub fn configured_output_is_default(configured_id: &str) -> bool {
+    let host = cpal::default_host();
+    let Some(default_device) = host.default_output_device() else {
+        return false;
+    };
+    if let Ok(device_id) = default_device.id().map(|id| id.to_string()) {
+        if device_id == configured_id {
+            return true;
+        }
+    }
+    let name = default_device.to_string();
+    stable_output_device_id(&name) == configured_id
+}
+
 pub(crate) fn cpal_device_from_config_id(
     host: &cpal::Host,
     configured_id: &str,
