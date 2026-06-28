@@ -1,11 +1,12 @@
+mod dnn_weights;
+
 use sha2::{Digest, Sha256};
 use std::borrow::Cow;
 use std::env;
+use std::fs;
 use std::path::{Path, PathBuf};
 
-const DRED_MODEL_SHA256: &str = "a5177ec6fb7d15058e99e57029746100121f68e4890b1467d4094aa336b6013e";
-const DRED_MODEL_ARCHIVE: &str =
-    "opus_data-a5177ec6fb7d15058e99e57029746100121f68e4890b1467d4094aa336b6013e.tar.gz";
+const COMPACT_DNN_ARTIFACT: &str = "dnn-weights/dnn_weights.bin";
 
 const BUNDLED_PACKET_OPS_FINGERPRINTS: &[SourceFingerprint] = &[
     SourceFingerprint {
@@ -130,10 +131,8 @@ fn emit_rerun_directives() {
     println!("cargo:rerun-if-changed=opus/src/repacketizer.c");
     println!("cargo:rerun-if-changed=opus/src/extensions.c");
     println!("cargo:rerun-if-changed=build.rs");
-    let cached_dred_archive = Path::new("opus").join(DRED_MODEL_ARCHIVE);
-    if cached_dred_archive.exists() {
-        println!("cargo:rerun-if-changed={}", cached_dred_archive.display());
-    }
+    println!("cargo:rerun-if-changed=dnn_weights.rs");
+    println!("cargo:rerun-if-changed={COMPACT_DNN_ARTIFACT}");
     println!("cargo:rerun-if-env-changed=CARGO_FEATURE_SYSTEM_LIB");
     println!("cargo:rerun-if-env-changed=CARGO_FEATURE_PRESUME_AVX2");
     println!("cargo:rerun-if-env-changed=CARGO_CFG_TARGET_ENV");
@@ -173,11 +172,44 @@ fn build_bundled_and_link(opts: &BuildOptions) {
 }
 
 fn bundled_opus_source(opts: &BuildOptions) -> PathBuf {
-    if opts.dred_enabled {
-        prepare_dred_opus_source()
-    } else {
-        PathBuf::from("opus")
+    if !opts.dred_enabled {
+        return PathBuf::from("opus");
     }
+
+    let out_dir = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR is set by Cargo"));
+    let opus_source = out_dir.join("opus-dred-src");
+    if opus_source.exists() {
+        fs::remove_dir_all(&opus_source).unwrap_or_else(|err| {
+            panic!(
+                "failed to remove stale DRED source copy {}: {err}",
+                opus_source.display()
+            )
+        });
+    }
+    copy_tree(Path::new("opus"), &opus_source).unwrap_or_else(|err| {
+        panic!(
+            "failed to copy bundled opus sources into {}: {err}",
+            opus_source.display()
+        )
+    });
+    dnn_weights::expand_into(&opus_source, Path::new(COMPACT_DNN_ARTIFACT))
+        .unwrap_or_else(|err| panic!("failed to expand compact DNN weights: {err}"));
+    opus_source
+}
+
+fn copy_tree(src: &Path, dst: &Path) -> std::io::Result<()> {
+    fs::create_dir_all(dst)?;
+    for entry in fs::read_dir(src)? {
+        let entry = entry?;
+        let file_type = entry.file_type()?;
+        let target = dst.join(entry.file_name());
+        if file_type.is_dir() {
+            copy_tree(&entry.path(), &target)?;
+        } else if file_type.is_file() {
+            fs::copy(entry.path(), target)?;
+        }
+    }
+    Ok(())
 }
 
 fn build_bundled(opts: &BuildOptions, opus_source: &Path) -> std::path::PathBuf {
@@ -309,161 +341,6 @@ fn normalize_source_line_endings(bytes: &[u8]) -> Cow<'_, [u8]> {
     Cow::Owned(normalized)
 }
 
-fn prepare_dred_opus_source() -> PathBuf {
-    let out_dir = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR is not set by Cargo"));
-    let opus_source = out_dir.join("opus-dred-src");
-    if opus_source.exists() {
-        std::fs::remove_dir_all(&opus_source)
-            .unwrap_or_else(|err| panic!("failed to remove {}: {err}", opus_source.display()));
-    }
-    copy_opus_source_tree(Path::new("opus"), &opus_source)
-        .unwrap_or_else(|err| panic!("failed to copy vendored opus source: {err}"));
-    ensure_dred_assets(&opus_source, &out_dir);
-    opus_source
-}
-
-fn copy_opus_source_tree(src: &Path, dst: &Path) -> std::io::Result<()> {
-    std::fs::create_dir_all(dst)?;
-    for entry in std::fs::read_dir(src)? {
-        let entry = entry?;
-        let src_path = entry.path();
-        let dst_path = dst.join(entry.file_name());
-        if should_skip_dred_generated_path(&src_path) {
-            continue;
-        }
-        let metadata = entry.metadata()?;
-        if metadata.is_dir() {
-            copy_opus_source_tree(&src_path, &dst_path)?;
-        } else if metadata.is_file() {
-            std::fs::copy(&src_path, &dst_path)?;
-        }
-    }
-    Ok(())
-}
-
-fn should_skip_dred_generated_path(path: &Path) -> bool {
-    let Ok(rel) = path.strip_prefix("opus") else {
-        return false;
-    };
-    let rel = rel.to_string_lossy().replace('\\', "/");
-    matches!(
-        rel.as_str(),
-        DRED_MODEL_ARCHIVE
-            | "dnn/bbwenet_data.c"
-            | "dnn/bbwenet_data.h"
-            | "dnn/dred_rdovae_constants.h"
-            | "dnn/dred_rdovae_dec_data.c"
-            | "dnn/dred_rdovae_dec_data.h"
-            | "dnn/dred_rdovae_enc_data.c"
-            | "dnn/dred_rdovae_enc_data.h"
-            | "dnn/dred_rdovae_stats_data.c"
-            | "dnn/dred_rdovae_stats_data.h"
-            | "dnn/fargan_data.c"
-            | "dnn/fargan_data.h"
-            | "dnn/lace_data.c"
-            | "dnn/lace_data.h"
-            | "dnn/lossgen_data.c"
-            | "dnn/lossgen_data.h"
-            | "dnn/nolace_data.c"
-            | "dnn/nolace_data.h"
-            | "dnn/pitchdnn_data.c"
-            | "dnn/pitchdnn_data.h"
-            | "dnn/plc_data.c"
-            | "dnn/plc_data.h"
-            | "dnn/models"
-    ) || rel.starts_with("dnn/models/")
-}
-
-fn ensure_dred_assets(opus_source: &Path, out_dir: &Path) {
-    use std::path::Component;
-    use std::process::Command;
-
-    const REQUIRED_FILE: &str = "dnn/fargan_data.h";
-    if opus_source.join(REQUIRED_FILE).exists() {
-        return;
-    }
-
-    let cached_archive_path = Path::new("opus").join(DRED_MODEL_ARCHIVE);
-    let archive_path = if cached_archive_path.exists() {
-        std::fs::canonicalize(&cached_archive_path).unwrap_or_else(|err| {
-            panic!(
-                "failed to canonicalize cached DRED archive {}: {err}",
-                cached_archive_path.display()
-            )
-        })
-    } else {
-        out_dir.join(DRED_MODEL_ARCHIVE)
-    };
-    if !archive_path.exists() {
-        let url = format!("https://media.xiph.org/opus/models/{DRED_MODEL_ARCHIVE}");
-        let status = Command::new("wget")
-            .arg("-O")
-            .arg(&archive_path)
-            .arg(&url)
-            .status()
-            .or_else(|_| {
-                Command::new("curl")
-                    .arg("-L")
-                    .arg("-o")
-                    .arg(&archive_path)
-                    .arg(&url)
-                    .status()
-            })
-            .expect("failed to spawn wget or curl for DRED model download");
-
-        if !status.success() {
-            panic!("downloading DRED model assets failed (exit status: {status})");
-        }
-    }
-
-    let actual = sha256_hex(&archive_path);
-    if actual != DRED_MODEL_SHA256 {
-        panic!(
-            "DRED model archive checksum mismatch for {}: expected {}, got {}",
-            archive_path.display(),
-            DRED_MODEL_SHA256,
-            actual
-        );
-    }
-
-    let listing = Command::new("tar")
-        .arg("tf")
-        .arg(&archive_path)
-        .output()
-        .expect("failed to list DRED model archive");
-    if !listing.status.success() {
-        panic!(
-            "listing DRED model archive failed (exit status: {})",
-            listing.status
-        );
-    }
-    for entry in String::from_utf8_lossy(&listing.stdout).lines() {
-        let path = Path::new(entry);
-        if path.components().any(|component| {
-            matches!(
-                component,
-                Component::ParentDir | Component::RootDir | Component::Prefix(_)
-            )
-        }) {
-            panic!("DRED model archive contains unsafe path: {entry}");
-        }
-    }
-
-    let status = Command::new("tar")
-        .arg("xvomf")
-        .arg(&archive_path)
-        .current_dir(opus_source)
-        .status()
-        .expect("failed to extract DRED model archive");
-    if !status.success() {
-        panic!("extracting DRED model assets failed (exit status: {status})");
-    }
-
-    if !opus_source.join(REQUIRED_FILE).exists() {
-        panic!("DRED model download completed but {REQUIRED_FILE} is still missing");
-    }
-}
-
 fn generate_bindings() {
     let bindings_path = std::path::Path::new("src/bindings.rs");
 
@@ -502,12 +379,6 @@ fn target_feature_enabled(feature_name: &str) -> bool {
             .any(|feature| feature == feature_name),
         Err(_) => false,
     }
-}
-
-fn sha256_hex(path: &Path) -> String {
-    let bytes = std::fs::read(path)
-        .unwrap_or_else(|err| panic!("failed to read {}: {err}", path.display()));
-    sha256_hex_bytes(&bytes)
 }
 
 fn sha256_hex_bytes(bytes: &[u8]) -> String {

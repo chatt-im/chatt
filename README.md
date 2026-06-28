@@ -51,9 +51,9 @@ Dependency notes:
   `cargo run -p chatt --features pipewire -- --config chatt.toml`; this path
   needs PipeWire development files discoverable by `pkg-config`.
 - `cmake` and the C toolchain build the bundled `crates/opus-codec` copy of
-  libopus. The default `chatt` build enables the Opus `dred` feature.
-- `wget`, `tar`, and CA certificates are used if the Opus DRED model archive is
-  not already present in the checkout.
+  libopus. The default `chatt` build enables the Opus `dred` feature. The DRED
+  model weights it needs are vendored in `crates/opus-codec/opus/dnn`, so the
+  build pulls nothing from the network.
 - The optional RNNoise V2 denoiser uses an external `weights_blob.bin` at build
   time. The blob is intentionally not checked into this repository. Generating
   it from upstream RNNoise requires the usual autotools stack in addition to the
