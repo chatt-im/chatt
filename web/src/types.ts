@@ -47,7 +47,9 @@ export type ServerEnvelope =
   // `extra_data` descriptor (avcC/hvcC).
   | { type: "share_config"; stream_id: number; codec: string; extradata: number[] }
   // A share ended; tear down its decoder.
-  | { type: "share_ended"; stream_id: number };
+  | { type: "share_ended"; stream_id: number }
+  // A play request failed; show the message on the share's row.
+  | { type: "share_error"; stream_id: number; message: string };
 
 // A screen share this browser can watch.
 export interface ShareInfo {

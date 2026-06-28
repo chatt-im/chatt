@@ -8,7 +8,7 @@
 //! client. Codec metadata is derived from the parameter sets by
 //! [`rpc::bitstream`] in the publisher.
 
-use std::io::Read;
+use std::io::{BufRead, BufReader, Read};
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -26,19 +26,23 @@ pub struct CapturedFrame {
     pub data: Vec<u8>,
 }
 
-/// A running capture: the ffmpeg child and its reader thread.
+/// A running capture: the ffmpeg child, its stdout reader, and its stderr logger.
 pub struct Capture {
     child: Child,
     reader: Option<JoinHandle<()>>,
+    log_reader: Option<JoinHandle<()>>,
 }
 
 impl Capture {
-    /// Kills ffmpeg and joins the reader thread.
+    /// Kills ffmpeg and joins the reader threads.
     pub fn shutdown(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
         if let Some(reader) = self.reader.take() {
             let _ = reader.join();
+        }
+        if let Some(log_reader) = self.log_reader.take() {
+            let _ = log_reader.join();
         }
     }
 }
@@ -136,22 +140,56 @@ pub fn spawn(
         .ok_or_else(|| "capture command is empty".to_string())?;
     let mut child = Command::new(program)
         .args(args)
+        // Pipe stderr instead of inheriting it: ffmpeg writes its diagnostics
+        // there, and the parent's stderr is the TUI, so an inherited handle would
+        // paint ffmpeg's output over the interface. A logger thread drains it.
         .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
+        .stderr(Stdio::piped())
         .spawn()
         .map_err(|error| format!("failed to spawn capture command `{program}`: {error}"))?;
     let stdout = child
         .stdout
         .take()
         .ok_or_else(|| "capture command stdout was not piped".to_string())?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| "capture command stderr was not piped".to_string())?;
     let reader = thread::Builder::new()
         .name("chatt-capture".to_string())
         .spawn(move || read_loop(stdout, codec, &frame_tx, &stop))
         .map_err(|error| format!("failed to spawn capture reader: {error}"))?;
+    let log_reader = thread::Builder::new()
+        .name("chatt-capture-log".to_string())
+        .spawn(move || log_loop(stderr))
+        .map_err(|error| format!("failed to spawn capture logger: {error}"))?;
     Ok(Capture {
         child,
         reader: Some(reader),
+        log_reader: Some(log_reader),
     })
+}
+
+/// Forwards ffmpeg's stderr to the diagnostics log a line at a time, keeping it
+/// off the terminal. The thread exits when ffmpeg's stderr closes. Lines are
+/// decoded lossily since ffmpeg can emit non-UTF-8 bytes.
+fn log_loop(stderr: impl Read) {
+    let mut reader = BufReader::new(stderr);
+    let mut line = Vec::new();
+    loop {
+        line.clear();
+        match reader.read_until(b'\n', &mut line) {
+            Ok(0) => break,
+            Ok(_) => {
+                let text = String::from_utf8_lossy(&line);
+                let trimmed = text.trim_end();
+                if !trimmed.is_empty() {
+                    kvlog::warn!("ffmpeg capture", message = trimmed);
+                }
+            }
+            Err(_) => break,
+        }
+    }
 }
 
 fn read_loop(

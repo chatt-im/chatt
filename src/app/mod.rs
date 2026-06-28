@@ -523,6 +523,16 @@ fn share_ended_envelope(stream_id: StreamId) -> String {
     format!("{{\"type\":\"share_ended\",\"stream_id\":{}}}", stream_id.0)
 }
 
+/// The `share_error` envelope reporting a failed play request to the browser
+/// that issued it, since the requester is watching the web view, not the TUI.
+fn share_error_envelope(stream_id: StreamId, message: &str) -> String {
+    format!(
+        "{{\"type\":\"share_error\",\"stream_id\":{},\"message\":{}}}",
+        stream_id.0,
+        jsony::to_json(&message.to_string()),
+    )
+}
+
 /// Starts the web server and a relay thread that forwards browser requests into
 /// the app event channel, returning the feed handle. The relay bridges the
 /// otherwise one-directional web feed so a browser play click reaches the app.
@@ -796,42 +806,53 @@ impl App {
         }
     }
 
-    /// Spawns a viewer connection for `stream_id` and tells the browser to
-    /// configure its decoder.
+    /// Tells the browser to configure its decoder for `stream_id` and ensures a
+    /// viewer connection is feeding it frames.
+    ///
+    /// The decoder config is broadcast on every play request, not just the
+    /// first. A browser tab that connects after a share started receives the
+    /// retained `share_available` button but missed the transient
+    /// `share_config`, so its play click must re-broadcast the config to
+    /// bootstrap its decoder. Frames are broadcast to every web client, so a
+    /// single subscriber connection serves all tabs and a play request for an
+    /// already-viewed stream reuses it instead of opening a second connection.
     fn start_view(&mut self, stream_id: StreamId) {
-        if self.subscribers.contains_key(&stream_id) {
-            return;
-        }
-        let Some(share) = self.available_shares.get(&stream_id) else {
-            self.set_error("that screen share is no longer available");
-            return;
-        };
-        // The user's own share is fed to the browser by the publisher tee, so
-        // configure the decoder but open no subscriber connection.
-        if self.screencast_stream_id == Some(stream_id) {
-            if let Some(feed) = &self.web_feed {
-                feed.send_share_config(share_config_envelope(
-                    stream_id,
-                    &share.codec,
-                    &share.extradata,
-                ));
-            }
-            self.set_status("viewing your screen share");
-            return;
-        }
-        let Some(tcp_addr) = self.active_tcp_addr.clone() else {
-            return;
-        };
+        // The play click came from the browser, so failures are reported back to
+        // the web view rather than the TUI, which that user is not watching.
         let Some(feed) = self.web_feed.clone() else {
             return;
         };
-        feed.send_share_config(share_config_envelope(
-            stream_id,
-            &share.codec,
-            &share.extradata,
-        ));
-        let handle =
-            crate::video::start_subscriber(stream_id, share.view_secret.clone(), tcp_addr, feed);
+        let Some(share) = self.available_shares.get(&stream_id) else {
+            feed.send_share_error(share_error_envelope(
+                stream_id,
+                "that screen share is no longer available",
+            ));
+            return;
+        };
+        let config = share_config_envelope(stream_id, &share.codec, &share.extradata);
+        let view_secret = share.view_secret.clone();
+        feed.send_share_config(config);
+
+        // The user's own share is teed to the browser by the publisher, and an
+        // already-subscribed remote share is teed by its existing subscriber, so
+        // in both cases the decoder config above is all the browser needs.
+        if self.screencast_stream_id == Some(stream_id) {
+            self.set_status("viewing your screen share");
+            return;
+        }
+        if self.subscribers.contains_key(&stream_id) {
+            self.set_status("viewing screen share");
+            return;
+        }
+
+        let Some(tcp_addr) = self.active_tcp_addr.clone() else {
+            feed.send_share_error(share_error_envelope(
+                stream_id,
+                "not connected to a server",
+            ));
+            return;
+        };
+        let handle = crate::video::start_subscriber(stream_id, view_secret, tcp_addr, feed);
         self.subscribers.insert(stream_id, handle);
         self.set_status("viewing screen share");
     }
@@ -3426,6 +3447,23 @@ mod tests {
                 .expect("base mode has chrome")
                 .theme_mode
         }
+    }
+
+    #[test]
+    fn share_error_envelope_carries_stream_and_message() {
+        // The web frontend parses this by `type`, `stream_id`, and `message`, so
+        // the shape is a cross-language contract with web/src/types.ts.
+        let json = share_error_envelope(StreamId(7), "that screen share is no longer available");
+        assert_eq!(
+            json,
+            "{\"type\":\"share_error\",\"stream_id\":7,\"message\":\"that screen share is no longer available\"}"
+        );
+    }
+
+    #[test]
+    fn share_error_envelope_escapes_message() {
+        let json = share_error_envelope(StreamId(1), "bad \"quote\"");
+        assert!(json.contains(r#""message":"bad \"quote\"""#), "{json}");
     }
 
     #[test]
