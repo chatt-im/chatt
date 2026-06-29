@@ -1341,9 +1341,14 @@ impl Server {
         receive_files: bool,
         file_receive_limit_bytes: u64,
     ) -> Result<(), String> {
+        let user_id = user.user_id();
+        // Supersede any earlier session for this user before standing up the new
+        // one, so a reconnect never leaves a stale ghost (and its last voice
+        // status) behind alongside the fresh session.
+        self.supersede_existing_sessions(user_id, token);
+
         let session_id = SessionId(self.next_session);
         self.next_session += 1;
-        let user_id = user.user_id();
         let display_name = user.display_name.clone();
         let identifier = user.name.clone();
 
@@ -2800,23 +2805,63 @@ impl Server {
             self.detach_video_conn(stream_id, role, token);
         }
         if let Some(session_id) = client.session_id {
-            self.cancel_uploads_for_session(session_id, "sender disconnected");
-            self.end_shares_for_session(session_id);
-            let room_id = self.sessions.get(&session_id).and_then(|s| s.room_id);
-            if let Some(room_id) = room_id {
-                self.leave_room(session_id, room_id, Some(session_id));
+            self.teardown_session(session_id, "sender disconnected");
+        }
+    }
+
+    /// Removes a session and everything keyed to it: its room membership (with a
+    /// `Presence` offline broadcast), media keys, active shares, pending uploads,
+    /// and peer links. Shared by the disconnect path and by the reconnect path
+    /// that supersedes a user's earlier session.
+    fn teardown_session(&mut self, session_id: SessionId, reason: &str) {
+        self.cancel_uploads_for_session(session_id, reason);
+        self.end_shares_for_session(session_id);
+        let room_id = self.sessions.get(&session_id).and_then(|s| s.room_id);
+        if let Some(room_id) = room_id {
+            self.leave_room(session_id, room_id, Some(session_id));
+        }
+        if let Some(session) = self.sessions.remove(&session_id) {
+            if let Some(secrets) = &session.secrets {
+                self.media_key_to_session.remove(&secrets.media_recv.id);
             }
-            if let Some(session) = self.sessions.remove(&session_id) {
-                if let Some(secrets) = &session.secrets {
-                    self.media_key_to_session.remove(&secrets.media_recv.id);
-                }
-                if let Some(addr) = session.udp_addr
-                    && self.plaintext_addr_to_session.get(&addr) == Some(&session_id)
-                {
-                    self.plaintext_addr_to_session.remove(&addr);
-                }
+            if let Some(addr) = session.udp_addr
+                && self.plaintext_addr_to_session.get(&addr) == Some(&session_id)
+            {
+                self.plaintext_addr_to_session.remove(&addr);
             }
-            self.remove_peer_links(session_id);
+        }
+        self.remove_peer_links(session_id);
+    }
+
+    /// Drops any session still held for `user_id` under a connection other than
+    /// `keep_token`, so a reconnecting user supersedes a session left behind by
+    /// an ungraceful disconnect rather than coexisting with it. Without this, a
+    /// stale session whose TCP close has not yet been observed lingers in the
+    /// room as a ghost participant carrying its last voice status — a user who
+    /// muted before dropping then reappears muted even after rejoining, because
+    /// the client roster is keyed by user and the duplicate's stale status wins.
+    fn supersede_existing_sessions(&mut self, user_id: UserId, keep_token: Token) {
+        let stale = self
+            .sessions
+            .iter()
+            .filter(|(_, session)| session.user_id == user_id && session.tcp_token != keep_token)
+            .map(|(session_id, session)| (*session_id, session.tcp_token))
+            .collect::<Vec<_>>();
+        for (session_id, token) in stale {
+            kvlog::info!(
+                "superseding stale session on reconnect",
+                user_id = user_id.0,
+                stale_session_id = session_id.0,
+                stale_token = token.0,
+                keep_token = keep_token.0
+            );
+            // A live ghost connection is fully disconnected (deregistering its
+            // socket); an orphaned session with no client is torn down directly.
+            if self.clients.contains_key(&token) {
+                self.disconnect(token);
+            } else {
+                self.teardown_session(session_id, "superseded by reconnecting user");
+            }
         }
     }
 
@@ -3367,6 +3412,58 @@ mod tests {
                 muted: true,
                 deafened: true,
             }
+        );
+    }
+
+    #[test]
+    fn reconnect_supersedes_stale_muted_session() {
+        // A user who muted, then dropped without a clean close, leaves a ghost
+        // session in the room carrying its muted voice status. Reconnecting must
+        // evict that ghost so it cannot reappear as a stale muted participant.
+        let mut server = test_server();
+        let room_id = RoomId(1);
+        let user_id = UserId(9);
+        let stale_id = SessionId(1);
+        server
+            .rooms
+            .insert(room_id, test_room(room_id, &[stale_id]));
+        let mut stale = test_session(user_id, Token(11), Some(room_id));
+        stale.voice_status = control::ParticipantVoiceStatus {
+            muted: true,
+            deafened: false,
+        };
+        server.sessions.insert(stale_id, stale);
+
+        // The reconnecting connection holds no session yet (keep_token differs).
+        server.supersede_existing_sessions(user_id, Token(22));
+
+        assert!(
+            !server.sessions.contains_key(&stale_id),
+            "stale session should be evicted on reconnect"
+        );
+        assert!(
+            server.participants(room_id).is_empty(),
+            "the ghost participant must not linger in the room"
+        );
+    }
+
+    #[test]
+    fn supersede_keeps_sessions_for_other_users() {
+        let mut server = test_server();
+        let room_id = RoomId(1);
+        let other_id = SessionId(2);
+        server
+            .rooms
+            .insert(room_id, test_room(room_id, &[other_id]));
+        server
+            .sessions
+            .insert(other_id, test_session(UserId(5), Token(33), Some(room_id)));
+
+        server.supersede_existing_sessions(UserId(9), Token(22));
+
+        assert!(
+            server.sessions.contains_key(&other_id),
+            "another user's session must be left untouched"
         );
     }
 
