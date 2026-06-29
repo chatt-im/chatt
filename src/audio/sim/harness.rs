@@ -765,12 +765,14 @@ pub(crate) fn drain_simulation_network_and_playback(
     let before_recovery_frames = decode_streams
         .stats()
         .dred_recoveries
-        .saturating_add(decode_streams.stats().plc_fallbacks);
+        .saturating_add(decode_streams.stats().plc_fallbacks)
+        .saturating_add(decode_streams.stats().concealment_expands);
     decode_streams.drain_into_mixer_with_trace(mixer, now, trace_start, trace, None);
     let after_recovery_frames = decode_streams
         .stats()
         .dred_recoveries
-        .saturating_add(decode_streams.stats().plc_fallbacks);
+        .saturating_add(decode_streams.stats().plc_fallbacks)
+        .saturating_add(decode_streams.stats().concealment_expands);
     report.missing_frames = report
         .missing_frames
         .saturating_add(after_recovery_frames.saturating_sub(before_recovery_frames));
@@ -1543,10 +1545,25 @@ mod tests {
     fn experiment_render_mute_toggle_500ms() {
         let speech = sample_speech_frames();
         for (name, denoise, loss, catch_up) in [
-            ("mute500_none", false, LiveAudioPacketLossProfile::None, true),
-            ("mute500_none_nocatchup", false, LiveAudioPacketLossProfile::None, false),
+            (
+                "mute500_none",
+                false,
+                LiveAudioPacketLossProfile::None,
+                true,
+            ),
+            (
+                "mute500_none_nocatchup",
+                false,
+                LiveAudioPacketLossProfile::None,
+                false,
+            ),
             ("mute500_rnn", true, LiveAudioPacketLossProfile::None, true),
-            ("mute500_rnn_random60", true, LiveAudioPacketLossProfile::Random60, true),
+            (
+                "mute500_rnn_random60",
+                true,
+                LiveAudioPacketLossProfile::Random60,
+                true,
+            ),
         ] {
             let mut tuning = test_tuning();
             tuning.adaptive_catch_up = catch_up;
@@ -1578,8 +1595,7 @@ mod tests {
             let mut rng = SimRng::new(config.seed);
             let mut trace = None;
             let start = Instant::now();
-            let frame_duration =
-                Duration::from_secs_f64(FRAME_SAMPLES as f64 / SAMPLE_RATE as f64);
+            let frame_duration = Duration::from_secs_f64(FRAME_SAMPLES as f64 / SAMPLE_RATE as f64);
             let total_frames = 2000usize;
             let drain_frames = frames_for_duration(Duration::from_millis(500));
             let mut output = Vec::new();
@@ -1591,7 +1607,14 @@ mod tests {
                     let frame = &speech[frame_index % speech.len()];
                     state
                         .encode_and_queue_frame(
-                            config, 1, frame_index, frame, now, start, &mut rng, &mut report,
+                            config,
+                            1,
+                            frame_index,
+                            frame,
+                            now,
+                            start,
+                            &mut rng,
+                            &mut report,
                             &mut trace,
                         )
                         .unwrap();
@@ -1637,7 +1660,10 @@ mod tests {
         let cases = [
             ("rnn_none", LiveAudioPacketLossProfile::None),
             ("rnn_random60", LiveAudioPacketLossProfile::Random60),
-            ("rnn_congested_wifi", LiveAudioPacketLossProfile::CongestedWifi),
+            (
+                "rnn_congested_wifi",
+                LiveAudioPacketLossProfile::CongestedWifi,
+            ),
             ("rnn_bursty_wifi", LiveAudioPacketLossProfile::BurstyWifi),
         ];
         for (name, loss) in cases {
@@ -1657,14 +1683,17 @@ mod tests {
                 capture_dc_offset: 0.0,
                 capture_noise_rms: 0.0,
             };
-            let out =
-                run_live_audio_simulation_with_speech_output(config, speech).unwrap();
+            let out = run_live_audio_simulation_with_speech_output(config, speech).unwrap();
             let bytes: Vec<u8> = out.samples.iter().flat_map(|x| x.to_le_bytes()).collect();
             std::fs::write(format!("/tmp/render_{name}.f32"), &bytes).unwrap();
             let s = &out.report.final_snapshot;
             eprintln!(
                 "{name}: dred={} plc={} underrun={} accel={} expand={}",
-                s.dred_recoveries, s.plc_fallbacks, s.underrun_count, s.accelerate_count, s.expand_count,
+                s.dred_recoveries,
+                s.plc_fallbacks,
+                s.underrun_count,
+                s.accelerate_count,
+                s.expand_count,
             );
         }
     }
@@ -1702,7 +1731,12 @@ mod tests {
         );
 
         assert!(snapshot.dred_recoveries > 0, "{:?}", output.report);
-        assert!(snapshot.plc_fallbacks > 0, "{:?}", output.report);
+        assert_eq!(
+            snapshot.plc_fallbacks, 0,
+            "sequence gaps should no longer route through Opus PLC: {:?}",
+            output.report
+        );
+        assert!(snapshot.expand_count > 0, "{:?}", output.report);
         assert_eq!(snapshot.hard_trim_count, 0, "{:?}", output.report);
         assert!(
             output.report.max_queue_ms <= duration_to_ms(test_tuning().hard_queue_bound),
@@ -2014,7 +2048,8 @@ mod tests {
         );
 
         assert!(report.lost_frames > 0, "{report:?}");
-        assert!(report.final_snapshot.plc_fallbacks > 0, "{report:?}");
+        assert_eq!(report.final_snapshot.plc_fallbacks, 0, "{report:?}");
+        assert!(report.final_snapshot.expand_count > 0, "{report:?}");
         assert!(
             report.max_queue_ms <= duration_to_ms(test_tuning().hard_queue_bound),
             "{report:?}"

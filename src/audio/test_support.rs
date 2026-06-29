@@ -185,22 +185,24 @@ pub(crate) fn drive_gap_recovery(
     // frames and the remainder in one pass so the gap-bounding packet is
     // visible to DRED recovery.
     let t1 = start + tuning.initial_buffer + Duration::from_millis(1);
-    stream.drain_ready(t1, start, 1, &mut trace, |_, event| {
-        if let DrainEvent::Samples {
+    stream.drain_ready(t1, start, 1, &mut trace, |_, event| match event {
+        DrainEvent::Samples {
             samples, source, ..
-        } = event
-        {
-            collected.push((source, samples.len()));
+        } => collected.push((source, samples.len())),
+        DrainEvent::Concealment { samples } => {
+            collected.push((DecodedFrameSource::Expand, samples));
         }
+        DrainEvent::Discontinuity | DrainEvent::SenderSilence => {}
     });
     let t2 = t1 + tuning.max_reorder_delay + Duration::from_millis(1);
-    stream.drain_ready(t2, start, 1, &mut trace, |_, event| {
-        if let DrainEvent::Samples {
+    stream.drain_ready(t2, start, 1, &mut trace, |_, event| match event {
+        DrainEvent::Samples {
             samples, source, ..
-        } = event
-        {
-            collected.push((source, samples.len()));
+        } => collected.push((source, samples.len())),
+        DrainEvent::Concealment { samples } => {
+            collected.push((DecodedFrameSource::Expand, samples));
         }
+        DrainEvent::Discontinuity | DrainEvent::SenderSilence => {}
     });
     (collected, stream)
 }

@@ -60,6 +60,9 @@ pub(crate) enum DrainEvent<'a> {
         source: DecodedFrameSource,
         playout_delay: Option<PlayoutDelay>,
     },
+    Concealment {
+        samples: usize,
+    },
     Discontinuity,
     SenderSilence,
 }
@@ -195,6 +198,9 @@ fn drain_pump_stream(
                     samples_to_ms(producer.buffered_samples() + samples.len()),
                 );
                 producer.queue_samples(samples, source, playout_delay, now, stats);
+            }
+            DrainEvent::Concealment { samples } => {
+                producer.queue_concealment(samples, now, stats);
             }
             DrainEvent::Discontinuity => producer.skip_speech_gap_backlog(now, stats),
             DrainEvent::SenderSilence => {
@@ -513,6 +519,7 @@ impl LiveDecodeStreams {
             underrun_count: self.stats.underrun_count,
             dred_recoveries: self.stats.dred_recoveries,
             plc_fallbacks: self.stats.plc_fallbacks,
+            concealment_expands: self.stats.concealment_expands,
             decode_errors: self.stats.decode_errors,
             direct_samples: self.stats.direct_samples,
             accelerate_count: self.stats.accelerate_count,
@@ -837,17 +844,11 @@ impl LiveDecodeStream {
                         playout_delay,
                         &mut on_event,
                     ) {
-                        self.decode_playout(
-                            &[],
-                            DecodedFrameSource::Plc,
-                            1.0,
-                            trace_start,
-                            now,
-                            stream_id,
-                            *sequence,
+                        on_event(
                             trace,
-                            playout_delay,
-                            &mut on_event,
+                            DrainEvent::Concealment {
+                                samples: LIVE_OPUS_FRAME_SAMPLES,
+                            },
                         );
                     }
                 }
@@ -890,6 +891,7 @@ impl LiveDecodeStream {
             DecodedFrameSource::Plc => LIVE_OPUS_FRAME_SAMPLES,
             DecodedFrameSource::Normal
             | DecodedFrameSource::Dred
+            | DecodedFrameSource::Expand
             | DecodedFrameSource::DecodeError => self.output_frame.len(),
         }
         .min(self.output_frame.len());
@@ -988,7 +990,7 @@ impl LiveDecodeStream {
     /// The bounding packet's DRED is parsed once per gap (cached for the gap's
     /// remaining missing frames), then a whole frame is decoded at the gap
     /// distance when the DRED reaches that far back. Returns `false` when DRED
-    /// cannot cover the frame, so the caller emits plain PLC. This mirrors
+    /// cannot cover the frame, so the caller emits NetEQ Expand. This mirrors
     /// `opus_demo` and the awebo reference: DRED fills only whole frames within
     /// reach and is never spliced with concealment.
     #[allow(clippy::too_many_arguments)]
@@ -1309,12 +1311,12 @@ mod tests {
             .iter()
             .filter(|(source, _)| matches!(source, DecodedFrameSource::Dred))
             .count();
-        let plc = collected
+        let expand = collected
             .iter()
-            .filter(|(source, _)| matches!(source, DecodedFrameSource::Plc))
+            .filter(|(source, _)| matches!(source, DecodedFrameSource::Expand))
             .count();
         assert_eq!(dred, 3, "all three gap frames should be DRED-recovered");
-        assert_eq!(plc, 0, "deep DRED leaves no PLC fallback");
+        assert_eq!(expand, 0, "deep DRED leaves no Expand fallback");
         assert!(
             collected
                 .iter()
@@ -1335,7 +1337,7 @@ mod tests {
     }
 
     #[test]
-    fn gap_beyond_dred_reach_falls_back_to_whole_plc_frames() {
+    fn gap_beyond_dred_reach_falls_back_to_whole_expand_frames() {
         // 32 kbps starves DRED below one frame of reach, so every gap frame must
         // fall back to a full PLC frame rather than a partial DRED splice.
         let starved = EncoderNetworkProfile {
@@ -1345,27 +1347,28 @@ mod tests {
         let packets = encode_live_dred_packets(starved, 40);
         let (collected, stream) = drive_gap_recovery(&packets, &[18, 19, 20]);
 
-        let plc = collected
+        let expand = collected
             .iter()
-            .filter(|(source, _)| matches!(source, DecodedFrameSource::Plc))
+            .filter(|(source, _)| matches!(source, DecodedFrameSource::Expand))
             .count();
         let dred = collected
             .iter()
             .filter(|(source, _)| matches!(source, DecodedFrameSource::Dred))
             .count();
-        assert_eq!(plc, 3, "out-of-reach gap frames use PLC");
+        assert_eq!(expand, 3, "out-of-reach gap frames use NetEQ Expand");
         assert_eq!(dred, 0, "no frame is partially recovered");
         assert_eq!(stream.dred_parses, 1, "the gap is still parsed once");
         assert!(
             collected
                 .iter()
                 .all(|(source, len)| matches!(source, DecodedFrameSource::Normal)
+                    || matches!(source, DecodedFrameSource::Expand)
                     || *len == LIVE_OPUS_FRAME_SAMPLES)
         );
     }
 
     #[test]
-    fn live_decode_stream_uses_opus_plc_for_missing_jitter_items() {
+    fn live_decode_stream_requests_expand_for_missing_jitter_items() {
         let start = Instant::now();
         let first_playout = start + LIVE_PLAYBACK_INITIAL_BUFFER;
         let gap_seen = first_playout + Duration::from_millis(1);
@@ -1399,18 +1402,20 @@ mod tests {
         });
         assert!(decoded.is_empty());
 
+        let mut concealed = 0;
         stream.drain_ready(
             gap_seen + LIVE_PLAYBACK_MAX_REORDER_DELAY,
             start,
             1,
             &mut trace,
-            |_, event| {
-                if let DrainEvent::Samples { samples, .. } = event {
-                    decoded.extend_from_slice(samples);
-                }
+            |_, event| match event {
+                DrainEvent::Samples { samples, .. } => decoded.extend_from_slice(samples),
+                DrainEvent::Concealment { samples } => concealed += samples,
+                DrainEvent::Discontinuity | DrainEvent::SenderSilence => {}
             },
         );
-        assert_eq!(decoded.len(), LIVE_OPUS_FRAME_SAMPLES * 2);
+        assert_eq!(concealed, LIVE_OPUS_FRAME_SAMPLES);
+        assert_eq!(decoded.len(), LIVE_OPUS_FRAME_SAMPLES);
     }
 
     #[test]
@@ -1510,10 +1515,10 @@ mod tests {
         );
     }
 
-    /// Plays one normal frame, then a one-frame gap, returning the number of PLC
+    /// Plays one normal frame, then a one-frame gap, returning the number of Expand
     /// frames the gap produced. With `control_muted`, the sender is marked muted
     /// via the control-stream fallback before the gap is observed.
-    fn gap_plc_count(control_muted: bool) -> usize {
+    fn gap_expand_count(control_muted: bool) -> usize {
         let tuning = test_tuning();
         let start = Instant::now();
         let mut encoder = OpusVoiceEncoder::new(32_000).unwrap();
@@ -1538,7 +1543,7 @@ mod tests {
             stream.drain_ready(gap_seen, start, 1, &mut trace, |_, _| {});
         }
 
-        let mut plc = 0;
+        let mut expand = 0;
         let fallback_delay = if control_muted {
             LIVE_CAPTURE_MUTE_FADE + tuning.max_reorder_delay
         } else {
@@ -1550,30 +1555,26 @@ mod tests {
             1,
             &mut trace,
             |_, event| {
-                if let DrainEvent::Samples {
-                    source: DecodedFrameSource::Plc,
-                    ..
-                } = event
-                {
-                    plc += 1;
+                if let DrainEvent::Concealment { .. } = event {
+                    expand += 1;
                 }
             },
         );
-        plc
+        expand
     }
 
     #[test]
     fn control_mute_suppresses_loss_concealment() {
-        // The unflagged gap is concealed with PLC, but once the control stream
+        // The unflagged gap is concealed with NetEQ Expand, but once the control stream
         // fallback has had time to activate, the hole is treated as part of the
         // mute and left to drain to silence instead of extrapolating speech.
         assert_eq!(
-            gap_plc_count(false),
+            gap_expand_count(false),
             1,
-            "an ordinary gap is concealed with PLC"
+            "an ordinary gap is concealed with NetEQ Expand"
         );
         assert_eq!(
-            gap_plc_count(true),
+            gap_expand_count(true),
             0,
             "a muted sender's gap must not be concealed"
         );
@@ -1601,6 +1602,7 @@ mod tests {
             |_, event| match event {
                 DrainEvent::SenderSilence => sender_silence += 1,
                 DrainEvent::Samples { samples: s, .. } => samples += s.len(),
+                DrainEvent::Concealment { .. } => {}
                 DrainEvent::Discontinuity => {}
             },
         );

@@ -176,15 +176,14 @@ pub(crate) const LIVE_PLAYBACK_HARD_QUEUE_BOUND: Duration = Duration::from_milli
 // silence-gated pause) delivers no further frames, so unbounded expansion would
 // loop the residual buffer forever and play a static drone. This caps how much
 // audio expansion may synthesize before a real decoded frame resets it, so a
-// stalled stream drains to silence instead. Any genuine live stream (even under
-// heavy loss) keeps queuing real Normal/DRED/PLC frames well within this bound.
+// stalled stream drains to silence instead. Any genuine live stream keeps
+// queuing real Normal/DRED frames within this bound.
 pub(crate) const LIVE_PLAYBACK_MAX_IDLE_EXPANSION: Duration = Duration::from_millis(100);
-// After a sender-silence pause ends, the resumed stream fades in over
-// `LIVE_CAPTURE_MUTE_FADE` and its onset is not stationary. Catch-up time-scale
-// expansion duplicates or crossfades a pitch period, which on that rising onset
-// splices mismatched levels into an audible click. Suppress expansion for this
-// window (the fade plus a margin) so the onset plays out untouched and only
-// resumes time-scaling once the tone is steady again.
+// NetEQ keeps time-scale decisions behind mode/countdown state: the first
+// packet after concealment is not accelerated/preemptively expanded, and
+// successful time-scale operations arm `timescale_countdown_`. A sender-silence
+// resume is Chatt's CNG/DTX-style concealment boundary; protect the capture
+// fade-in from pitch-period time scaling until it has stabilized.
 pub(crate) const LIVE_PLAYBACK_RESUME_TIME_SCALE_HOLD: Duration = Duration::from_millis(80);
 // Priming cushion added on top of one output device callback when sizing the
 // playout target. A device whose host period exceeds the one-packet floor needs
@@ -584,6 +583,7 @@ pub struct LivePlaybackSnapshot {
     pub underrun_count: u64,
     pub dred_recoveries: u64,
     pub plc_fallbacks: u64,
+    pub concealment_expands: u64,
     pub decode_errors: u64,
     pub direct_samples: u64,
     pub accelerate_count: u64,
@@ -780,6 +780,7 @@ pub(crate) fn convert_i16_scale_to_pcm_i16(input: &[f32], output: &mut [i16]) {
 pub(crate) enum DecodedFrameSource {
     Normal,
     Dred,
+    Expand,
     Plc,
     DecodeError,
 }
@@ -954,6 +955,7 @@ pub(crate) fn trace_source_name(source: DecodedFrameSource) -> &'static str {
     match source {
         DecodedFrameSource::Normal => "normal",
         DecodedFrameSource::Dred => "dred",
+        DecodedFrameSource::Expand => "expand",
         DecodedFrameSource::Plc => "plc",
         DecodedFrameSource::DecodeError => "decode_error",
     }
@@ -1104,6 +1106,7 @@ pub(crate) fn trace_decode_output(
         event: match source {
             DecodedFrameSource::Dred => "dred_decode",
             DecodedFrameSource::Normal => "normal_decode",
+            DecodedFrameSource::Expand => "expand_decode",
             DecodedFrameSource::Plc => "plc_decode",
             DecodedFrameSource::DecodeError => "decode_error",
         },

@@ -1,4 +1,5 @@
 mod adaptive;
+mod concealment;
 mod decode;
 mod events;
 mod feedback;
