@@ -38,8 +38,10 @@ use crate::audio::playback::time_scale::{
     TimeScaler, accelerate_one_period, expand_one_period, threshold_for_mode,
 };
 use crate::audio::shared::{
-    DecodedFrameSource, LIVE_OPUS_FRAME_SAMPLES, LIVE_PLAYBACK_DRED_MAX_SAMPLES,
-    MAX_OPUS_DECODE_SAMPLES, SAMPLE_RATE, TIME_SCALE_REF_OFFSET, TIME_SCALE_WINDOW,
+    DecodedFrameSource, LIVE_CAPTURE_MUTE_FADE, LIVE_OPUS_FRAME_SAMPLES,
+    LIVE_PACKET_FLAG_MUTE, LIVE_PLAYBACK_DRED_MAX_SAMPLES, MAX_OPUS_DECODE_SAMPLES, SAMPLE_RATE,
+    TIME_SCALE_REF_OFFSET, TIME_SCALE_WINDOW, apply_gain_ramp, mute_gain_step,
+    samples_for_duration,
 };
 
 /// 48 kHz. The live path is always 48 kHz mono.
@@ -104,6 +106,15 @@ pub(crate) struct NetEqCore {
     reset_decoder: bool,
     /// `generated_noise_stopwatch_`: counts ticks of concealment/CNG output.
     generated_noise_stopwatch: Option<Stopwatch>,
+    /// Moving receiver mute gain, ramped toward 0 across a muted fade-out tail and
+    /// back to 1 on normal audio. Mirrors the capture-side `mute_gain`, applied to
+    /// decoded normal/merge audio so a muted tail ends softly even if the sender's
+    /// own fade was clipped by loss.
+    mute_gain: f32,
+    mute_gain_step: f32,
+    /// The mute target (0.0 muted, 1.0 open) of the most recently decoded primary
+    /// packet, applied by the next `do_normal`/`do_merge`.
+    block_mute_target: f32,
 }
 
 impl NetEqCore {
@@ -137,6 +148,9 @@ impl NetEqCore {
             new_codec: false,
             reset_decoder: false,
             generated_noise_stopwatch: None,
+            mute_gain: 1.0,
+            mute_gain_step: mute_gain_step(samples_for_duration(LIVE_CAPTURE_MUTE_FADE)),
+            block_mute_target: 1.0,
         })
     }
 
@@ -169,15 +183,29 @@ impl NetEqCore {
         self.reset_decoder = false;
         self.generated_noise_stopwatch = None;
         self.dred_parse = None;
+        self.mute_gain = 1.0;
+        self.block_mute_target = 1.0;
         let _ = self.decoder.reset();
     }
 
+    /// True when there is real audio to play out — buffered packets or decoded
+    /// samples not yet emitted. The worker uses this to suppress speech
+    /// concealment while the sender is muted (a muted gap must drain to silence,
+    /// not extrapolate speech). Port-adjacent to NetEQ's `Empty` checks.
+    pub(crate) fn has_audio(&self) -> bool {
+        !self.packet_buffer.is_empty()
+            || self.sync_buffer.future_length() > EXPAND_OVERLAP_LENGTH
+    }
+
     /// Inserts one Opus voice packet, expanding its DRED into priority-ranked
-    /// recovery packets first. Port of `NetEqImpl::InsertPacketInternal`.
-    pub(crate) fn insert_packet(&mut self, timestamp: u32, sequence: u32, opus: &[u8]) {
+    /// recovery packets first. Port of `NetEqImpl::InsertPacketInternal`. `flags`
+    /// carries the Chatt media flags; `LIVE_PACKET_FLAG_MUTE` fades the decoded
+    /// tail on the receiver.
+    pub(crate) fn insert_packet(&mut self, timestamp: u32, sequence: u32, flags: u8, opus: &[u8]) {
         if opus.is_empty() {
             return;
         }
+        let muted = flags & LIVE_PACKET_FLAG_MUTE != 0;
         let datagram = Rc::new(opus.to_vec());
 
         // Compute the recovery gap behind this packet, exactly as the DRED fork's
@@ -200,6 +228,16 @@ impl NetEqCore {
             .iter()
             .filter(|packet| packet.priority.codec_level == 0)
             .count();
+        let mut packets = packets;
+        if muted {
+            // Tag the primary (codec_level 0) so the decode loop fades it.
+            if let Some(primary) = packets
+                .iter_mut()
+                .find(|packet| packet.priority.codec_level == 0)
+            {
+                primary.muted = true;
+            }
+        }
 
         if self.first_packet {
             self.packet_buffer.flush();
@@ -305,6 +343,7 @@ impl NetEqCore {
             };
         }
 
+        self.block_mute_target = 1.0;
         let (mut operation, packet_list) = self.get_decision();
         let (decoded_len, mut source) = self.decode(&mut operation, packet_list);
 
@@ -590,6 +629,9 @@ impl NetEqCore {
             if packet.priority.codec_level == 2 {
                 source = DecodedFrameSource::Dred;
             }
+            if packet.priority.codec_level == 0 {
+                self.block_mute_target = if packet.muted { 0.0 } else { 1.0 };
+            }
             let out_start = decoded_length;
             let decoded = self.decode_one(packet, out_start);
             match decoded {
@@ -688,6 +730,12 @@ impl NetEqCore {
             self.concealment
                 .normal_after_expand(&self.history_scratch, &mut decoded);
         }
+        self.mute_gain = apply_gain_ramp(
+            &mut decoded,
+            self.mute_gain,
+            self.block_mute_target,
+            self.mute_gain_step,
+        );
         self.sync_buffer.push_back(&decoded);
         self.last_mode = Mode::Normal;
     }
@@ -698,6 +746,12 @@ impl NetEqCore {
         self.copy_history();
         self.concealment
             .merge_after_expand(&self.history_scratch, &mut decoded);
+        self.mute_gain = apply_gain_ramp(
+            &mut decoded,
+            self.mute_gain,
+            self.block_mute_target,
+            self.mute_gain_step,
+        );
         self.sync_buffer.push_back(&decoded);
         self.last_mode = Mode::Merge;
     }
@@ -901,7 +955,7 @@ mod tests {
         let mut blocks = 0;
         for seq in 0..60u32 {
             let payload = encode_tone(&mut encoder, seq as usize * LIVE_OPUS_FRAME_SAMPLES);
-            core.insert_packet(seq * LIVE_OPUS_FRAME_SAMPLES as u32, seq, &payload);
+            core.insert_packet(seq * LIVE_OPUS_FRAME_SAMPLES as u32, seq, 0, &payload);
             // Two 10 ms output blocks per 20 ms packet.
             for _ in 0..2 {
                 let result = core.get_audio(&mut output);
@@ -925,7 +979,7 @@ mod tests {
         // Prime with a few real frames.
         for seq in 0..6u32 {
             let payload = encode_tone(&mut encoder, seq as usize * LIVE_OPUS_FRAME_SAMPLES);
-            core.insert_packet(seq * LIVE_OPUS_FRAME_SAMPLES as u32, seq, &payload);
+            core.insert_packet(seq * LIVE_OPUS_FRAME_SAMPLES as u32, seq, 0, &payload);
             core.get_audio(&mut output);
         }
         // Now starve the core: every block must conceal (Expand), and after a
@@ -956,7 +1010,7 @@ mod tests {
         let mut accelerated = false;
         for seq in 0..120u32 {
             let payload = encode_tone(&mut encoder, seq as usize * LIVE_OPUS_FRAME_SAMPLES);
-            core.insert_packet(seq * LIVE_OPUS_FRAME_SAMPLES as u32, seq, &payload);
+            core.insert_packet(seq * LIVE_OPUS_FRAME_SAMPLES as u32, seq, 0, &payload);
             // Drain only one 10 ms block per 20 ms packet inserted minus a deficit
             // so the buffer keeps growing.
             let result = core.get_audio(&mut output);
