@@ -12,8 +12,8 @@ use std::{
 use crate::audio::{
     lifecycle::{LivePlayback, LivePlaybackConfig, sleep_until_instant, start_live_playback},
     shared::{
-        BufferRequest, FRAME_SAMPLES, LiveAudioTuning, LivePlaybackFeedback, LivePlaybackSnapshot,
-        LocalVoiceFrame, SAMPLE_RATE, samples_to_ms,
+        BufferRequest, FRAME_SAMPLES, LIVE_OPUS_FRAME_SAMPLES, LiveAudioTuning,
+        LivePlaybackFeedback, LivePlaybackSnapshot, LocalVoiceFrame, SAMPLE_RATE, samples_to_ms,
     },
     sim::{
         LiveAudioPacketLossProfile, LiveAudioSimulationConfig, LiveAudioSimulationReport,
@@ -286,6 +286,10 @@ pub(crate) fn deliver_ready_file_source_packets<F>(
             LocalVoiceFrame {
                 flags: packet.packet.flags,
                 payload: packet.packet.payload,
+                timestamp: packet
+                    .packet
+                    .sequence
+                    .wrapping_mul(LIVE_OPUS_FRAME_SAMPLES as u32),
             },
         );
         if !silence {

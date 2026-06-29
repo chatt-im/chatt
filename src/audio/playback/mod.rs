@@ -5,6 +5,7 @@ mod events;
 mod feedback;
 mod jitter;
 mod mixer;
+mod neteq;
 mod producer;
 mod queue;
 mod sample_ring;

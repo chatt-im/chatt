@@ -402,6 +402,9 @@ impl LiveAudioTuning {
 pub struct RemoteVoicePacket {
     pub stream_id: u32,
     pub sequence: u32,
+    /// Media sample clock (48 kHz samples) for the first sample in this packet.
+    /// Advances across sender silence; the NetEQ packet buffer keys on it.
+    pub timestamp: u32,
     pub flags: u8,
     pub payload: VoicePayload,
     /// Wall-clock arrival time captured at the UDP socket read, before any
@@ -414,6 +417,11 @@ pub struct RemoteVoicePacket {
 pub struct LocalVoiceFrame {
     pub flags: u8,
     pub payload: VoicePayload,
+    /// Media sample clock (48 kHz samples) for the first sample in this frame,
+    /// stamped by the capture pipeline. Advances across sender silence so the
+    /// receiver can reconstruct true inter-packet gaps. See [`crate`] protocol
+    /// `MediaPayload::Voice::timestamp`.
+    pub timestamp: u32,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
