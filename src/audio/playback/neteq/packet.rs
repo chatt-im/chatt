@@ -81,6 +81,10 @@ pub(crate) struct Packet {
     /// 10 ms DRED chunk). Used for packet-buffer span accounting.
     pub duration_samples: usize,
     pub payload: PacketPayload,
+    /// True when the carrying datagram was flagged as a microphone-mute fade-out
+    /// tail (`LIVE_PACKET_FLAG_MUTE`). The core applies the receiver mute fade to
+    /// this packet's decoded audio so a muted tail still ends softly.
+    pub muted: bool,
     /// Set by the buffer on insert; measures how long the packet has waited.
     pub(super) waiting_time: Option<Stopwatch>,
 }
@@ -99,6 +103,7 @@ impl Packet {
             priority,
             duration_samples,
             payload,
+            muted: false,
             waiting_time: None,
         }
     }
