@@ -1762,7 +1762,13 @@ impl WorkerState {
             };
             self.send_media(&relay_payload);
         }
-        self.send_p2p_voice(stream_id, sequence, frame.timestamp, frame.flags, &frame.payload);
+        self.send_p2p_voice(
+            stream_id,
+            sequence,
+            frame.timestamp,
+            frame.flags,
+            &frame.payload,
+        );
     }
 
     fn queue_file_upload(&mut self, path: PathBuf) {

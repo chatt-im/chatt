@@ -412,9 +412,7 @@ impl LiveEncoderPipeline {
         // Account this 10 ms slot on the media sample clock before any emit, so
         // packets stamp a timestamp that tracks real elapsed time even when the
         // slot is suppressed and emits nothing.
-        self.next_capture_sample = self
-            .next_capture_sample
-            .wrapping_add(FRAME_SAMPLES as u32);
+        self.next_capture_sample = self.next_capture_sample.wrapping_add(FRAME_SAMPLES as u32);
 
         // Mute takes precedence over the automatic silence gate: it transitions
         // immediately rather than after the long-silence timeout, and works even
@@ -689,9 +687,7 @@ impl LiveEncoderPipeline {
         }
         // The marker stands in for the slot just accounted on the clock, so
         // stamp that slot's first sample index.
-        let timestamp = self
-            .next_capture_sample
-            .wrapping_sub(FRAME_SAMPLES as u32);
+        let timestamp = self.next_capture_sample.wrapping_sub(FRAME_SAMPLES as u32);
         on_packet(LocalVoiceFrame {
             flags: LIVE_PACKET_FLAG_SILENCE_HINT | extra_flags,
             payload: VoicePayload::Silence,
@@ -1153,7 +1149,10 @@ mod tests {
         // Every packet's timestamp is strictly increasing on the media clock.
         let all = opus_timestamps(&packets);
         for window in all.windows(2) {
-            assert!(window[1] > window[0], "timestamps must be monotonic: {all:?}");
+            assert!(
+                window[1] > window[0],
+                "timestamps must be monotonic: {all:?}"
+            );
         }
 
         // Across the ~40-slot muted gap the clock advanced through the silence,

@@ -115,6 +115,10 @@ mod tests {
             manager.update(100, false, &info(), &timer);
             timer.increment();
         }
-        assert!(manager.target_delay_ms() >= 80, "{}", manager.target_delay_ms());
+        assert!(
+            manager.target_delay_ms() >= 80,
+            "{}",
+            manager.target_delay_ms()
+        );
     }
 }

@@ -43,6 +43,5 @@ pub use sim::{
 };
 
 #[cfg(test)]
-mod experiments;
 #[cfg(test)]
 mod test_support;

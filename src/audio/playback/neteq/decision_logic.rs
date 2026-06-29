@@ -130,7 +130,11 @@ impl DecisionLogic {
         if status.target_timestamp == next_timestamp {
             return self.expected_packet_available(status, tick_timer);
         }
-        if !is_obsolete_timestamp(next_timestamp, status.target_timestamp, five_seconds_samples) {
+        if !is_obsolete_timestamp(
+            next_timestamp,
+            status.target_timestamp,
+            five_seconds_samples,
+        ) {
             return self.future_packet_available(status, tick_timer);
         }
         // available_timestamp < target_timestamp: signal a reset.
@@ -138,7 +142,8 @@ impl DecisionLogic {
     }
 
     pub(crate) fn target_level_ms(&self) -> i32 {
-        self.delay_constraints.clamp(self.delay_manager.target_delay_ms())
+        self.delay_constraints
+            .clamp(self.delay_manager.target_delay_ms())
     }
 
     pub(crate) fn filtered_buffer_level(&self) -> i32 {
@@ -191,8 +196,9 @@ impl DecisionLogic {
             && info.packet_length_samples != self.packet_length_samples
         {
             self.packet_length_samples = info.packet_length_samples;
-            self.delay_constraints
-                .set_packet_audio_length((self.packet_length_samples * 1000 / fs_hz as usize) as i32);
+            self.delay_constraints.set_packet_audio_length(
+                (self.packet_length_samples * 1000 / fs_hz as usize) as i32,
+            );
         }
         let inserted = self.packet_arrival_history.insert(
             info.main_timestamp,
@@ -238,8 +244,7 @@ impl DecisionLogic {
             .wrapping_add(status.target_timestamp)
             .wrapping_sub(next.timestamp) as i32;
         let optimal_level_samp = self.target_level_ms() * self.sample_rate_khz;
-        let excess_waiting_time_samp =
-            -(timestamp_diff as i64) - optimal_level_samp as i64;
+        let excess_waiting_time_samp = -(timestamp_diff as i64) - optimal_level_samp as i64;
         if excess_waiting_time_samp > optimal_level_samp as i64 / 2 {
             self.noise_fast_forward =
                 (self.noise_fast_forward as i64 + excess_waiting_time_samp).max(0) as usize;
@@ -257,9 +262,7 @@ impl DecisionLogic {
         match status.last_mode {
             Mode::Rfc3389Cng => Operation::Rfc3389CngNoPacket,
             Mode::CodecInternalCng => {
-                if status.generated_noise_samples
-                    > CNG_TIMEOUT_MS * self.sample_rate_khz as usize
-                {
+                if status.generated_noise_samples > CNG_TIMEOUT_MS * self.sample_rate_khz as usize {
                     Operation::Expand
                 } else {
                     Operation::CodecInternalCng
@@ -275,15 +278,8 @@ impl DecisionLogic {
         }
     }
 
-    fn expected_packet_available(
-        &self,
-        status: &NetEqStatus,
-        tick_timer: &TickTimer,
-    ) -> Operation {
-        if !self.disallow_time_stretching
-            && status.last_mode != Mode::Expand
-            && !status.play_dtmf
-        {
+    fn expected_packet_available(&self, status: &NetEqStatus, tick_timer: &TickTimer) -> Operation {
+        if !self.disallow_time_stretching && status.last_mode != Mode::Expand && !status.play_dtmf {
             let playout_delay_ms = self.playout_delay_ms(status, tick_timer) as i64;
             let low_limit = self.target_level_ms() as i64;
             let high_limit = low_limit
@@ -336,10 +332,9 @@ impl DecisionLogic {
     }
 
     fn postpone_decode(&self, status: &NetEqStatus) -> bool {
-        let min_buffer_level_samples = (self.target_level_ms() as i64
-            * self.sample_rate_khz as i64
-            * POSTPONE_DECODING_LEVEL
-            / 100) as usize;
+        let min_buffer_level_samples =
+            (self.target_level_ms() as i64 * self.sample_rate_khz as i64 * POSTPONE_DECODING_LEVEL
+                / 100) as usize;
         let buffer_level_samples = status.packet_buffer_info.span_samples_wait_time;
         if buffer_level_samples >= min_buffer_level_samples {
             return false;

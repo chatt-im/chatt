@@ -129,9 +129,7 @@ input-buffer = "default"
 output-buffer = "default"
 
 [audio.latency]
-adaptive-catch-up = true
 capture-silence-gate = true
-adaptive-target = true
 target-queue-ms = 60
 dynamic-target-floor-ms = 20
 base-minimum-target-ms = 0

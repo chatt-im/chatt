@@ -133,8 +133,7 @@ mod tests {
 
     #[test]
     fn no_gap_emits_only_primary() {
-        let packets =
-            parse_payload_redundancy(9600, 10, datagram(), 0, 960, None, None);
+        let packets = parse_payload_redundancy(9600, 10, datagram(), 0, 960, None, None);
         assert_eq!(descriptors(&packets), vec![(9600, 0)]);
     }
 
@@ -146,8 +145,7 @@ mod tests {
             samples: 2880,
             dred_end: 0,
         });
-        let packets =
-            parse_payload_redundancy(9600, 10, datagram(), 1920, 960, None, dred);
+        let packets = parse_payload_redundancy(9600, 10, datagram(), 1920, 960, None, dred);
         assert_eq!(
             descriptors(&packets),
             vec![

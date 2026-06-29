@@ -38,9 +38,9 @@ use crate::audio::playback::time_scale::{
     TimeScaler, accelerate_one_period, expand_one_period, threshold_for_mode,
 };
 use crate::audio::shared::{
-    DecodedFrameSource, LIVE_CAPTURE_MUTE_FADE, LIVE_OPUS_FRAME_SAMPLES,
-    LIVE_PACKET_FLAG_MUTE, LIVE_PLAYBACK_DRED_MAX_SAMPLES, MAX_OPUS_DECODE_SAMPLES, SAMPLE_RATE,
-    TIME_SCALE_REF_OFFSET, TIME_SCALE_WINDOW, apply_gain_ramp, mute_gain_step,
+    DecodedFrameSource, LIVE_CAPTURE_MUTE_FADE, LIVE_OPUS_FRAME_SAMPLES, LIVE_PACKET_FLAG_MUTE,
+    LIVE_PACKET_FLAG_OPUS_RESET, LIVE_PLAYBACK_DRED_MAX_SAMPLES, MAX_OPUS_DECODE_SAMPLES,
+    SAMPLE_RATE, TIME_SCALE_REF_OFFSET, TIME_SCALE_WINDOW, apply_gain_ramp, mute_gain_step,
     samples_for_duration,
 };
 
@@ -112,9 +112,10 @@ pub(crate) struct NetEqCore {
     /// own fade was clipped by loss.
     mute_gain: f32,
     mute_gain_step: f32,
-    /// The mute target (0.0 muted, 1.0 open) of the most recently decoded primary
-    /// packet, applied by the next `do_normal`/`do_merge`.
-    block_mute_target: f32,
+    /// The standing mute target (0.0 muted, 1.0 open), set when a primary packet
+    /// is decoded and held across the following concealment so the fade completes
+    /// smoothly even when decode stops mid-fade. Applied to every output block.
+    mute_target: f32,
 }
 
 impl NetEqCore {
@@ -150,7 +151,7 @@ impl NetEqCore {
             generated_noise_stopwatch: None,
             mute_gain: 1.0,
             mute_gain_step: mute_gain_step(samples_for_duration(LIVE_CAPTURE_MUTE_FADE)),
-            block_mute_target: 1.0,
+            mute_target: 1.0,
         })
     }
 
@@ -184,28 +185,37 @@ impl NetEqCore {
         self.generated_noise_stopwatch = None;
         self.dred_parse = None;
         self.mute_gain = 1.0;
-        self.block_mute_target = 1.0;
+        self.mute_target = 1.0;
         let _ = self.decoder.reset();
-    }
-
-    /// True when there is real audio to play out — buffered packets or decoded
-    /// samples not yet emitted. The worker uses this to suppress speech
-    /// concealment while the sender is muted (a muted gap must drain to silence,
-    /// not extrapolate speech). Port-adjacent to NetEQ's `Empty` checks.
-    pub(crate) fn has_audio(&self) -> bool {
-        !self.packet_buffer.is_empty()
-            || self.sync_buffer.future_length() > EXPAND_OVERLAP_LENGTH
     }
 
     /// Inserts one Opus voice packet, expanding its DRED into priority-ranked
     /// recovery packets first. Port of `NetEqImpl::InsertPacketInternal`. `flags`
     /// carries the Chatt media flags; `LIVE_PACKET_FLAG_MUTE` fades the decoded
     /// tail on the receiver.
-    pub(crate) fn insert_packet(&mut self, timestamp: u32, sequence: u32, flags: u8, opus: &[u8]) {
+    /// Returns `true` if the packet arrived after its playout slot had already
+    /// passed (older than the current playout point), i.e. too late to be played.
+    pub(crate) fn insert_packet(
+        &mut self,
+        timestamp: u32,
+        sequence: u32,
+        flags: u8,
+        opus: &[u8],
+    ) -> bool {
         if opus.is_empty() {
-            return;
+            return false;
         }
+        let playout_timestamp = self
+            .sync_buffer
+            .end_timestamp()
+            .wrapping_sub(self.sync_buffer.future_length() as u32);
+        let late = !self.first_packet && is_newer_timestamp(playout_timestamp, timestamp);
         let muted = flags & LIVE_PACKET_FLAG_MUTE != 0;
+        if flags & LIVE_PACKET_FLAG_OPUS_RESET != 0 {
+            // The sender restarted its encoder (e.g. resuming after a silence
+            // gap); reset the decoder before the next decode to match.
+            self.reset_decoder = true;
+        }
         let datagram = Rc::new(opus.to_vec());
 
         // Compute the recovery gap behind this packet, exactly as the DRED fork's
@@ -272,6 +282,7 @@ impl NetEqCore {
         let should_update_stats = !self.new_codec;
         self.decision_logic
             .packet_arrived(FS_HZ, should_update_stats, &info, &self.tick_timer);
+        late
     }
 
     /// The DRED recovery gap behind a packet at `timestamp`. Port of the
@@ -331,19 +342,12 @@ impl NetEqCore {
         debug_assert_eq!(output.len(), OUTPUT_SIZE_SAMPLES);
         self.tick_timer.increment();
 
-        // Muted state: a fully muted expand with an empty buffer outputs silence.
-        if self.concealment.muted() && self.packet_buffer.is_empty() {
-            output.fill(0.0);
-            self.last_mode = Mode::Expand;
-            return AudioResult {
-                mode: Mode::Expand,
-                source: DecodedFrameSource::Expand,
-                muted: true,
-                time_stretched: 0,
-            };
-        }
-
-        self.block_mute_target = 1.0;
+        // Note: WebRTC's `enable_muted_state_` short-circuit (zero-fill once expand
+        // has muted) defaults to off, and using it here breaks the resume catch-up
+        // because it freezes the sync buffer and bypasses GetDecision. We follow
+        // the default: keep running full GetDecision/Expand, which mutes itself to
+        // ~0 via the expand mute-slope, so an idle stream decays to silence while a
+        // resuming talkspurt still has continuous concealment to merge against.
         let (mut operation, packet_list) = self.get_decision();
         let (decoded_len, mut source) = self.decode(&mut operation, packet_list);
 
@@ -385,20 +389,36 @@ impl NetEqCore {
         if future < EXPAND_OVERLAP_LENGTH {
             let missing = EXPAND_OVERLAP_LENGTH - future;
             let next = self.sync_buffer.next_index();
-            self.sync_buffer.set_next_index(next.saturating_sub(missing));
+            self.sync_buffer
+                .set_next_index(next.saturating_sub(missing));
         }
+
+        // Receiver mute fade, applied to the final output of every operation so it
+        // ramps smoothly to silence on mute (continuing across the normal→expand
+        // boundary) and back up on unmute, regardless of which NetEQ operation
+        // produced the block. `mute_target` is held across concealment.
+        self.mute_gain = apply_gain_ramp(
+            output,
+            self.mute_gain,
+            self.mute_target,
+            self.mute_gain_step,
+        );
 
         // Background noise tracks audio written straight from the decoder.
         if matches!(
             self.last_mode,
-            Mode::Normal | Mode::AccelerateFail | Mode::PreemptiveExpandFail | Mode::CodecInternalCng
+            Mode::Normal
+                | Mode::AccelerateFail
+                | Mode::PreemptiveExpandFail
+                | Mode::CodecInternalCng
         ) {
             let data_len = self.sync_buffer.size();
             self.history_scratch.clear();
             self.history_scratch
                 .extend_from_slice(self.sync_buffer.data());
             let _ = data_len;
-            self.concealment.update_background_noise(&self.history_scratch);
+            self.concealment
+                .update_background_noise(&self.history_scratch);
         }
 
         // Reset the generated-noise stopwatch unless we are still concealing.
@@ -409,7 +429,9 @@ impl NetEqCore {
         AudioResult {
             mode: self.last_mode,
             source,
-            muted: false,
+            // "Muted" once expand has decayed to silence: the stream is idle and
+            // the output is ~0, which the worker uses only to mark voice inactive.
+            muted: self.last_mode.is_expand() && self.concealment.muted(),
             time_stretched,
         }
     }
@@ -434,11 +456,14 @@ impl NetEqCore {
         }
 
         let generated_noise_samples = self.generated_noise_samples();
-        let next_packet = self.packet_buffer.peek_next_packet().map(|packet| PacketInfo {
-            timestamp: packet.timestamp,
-            is_dtx: false,
-            is_cng: false,
-        });
+        let next_packet = self
+            .packet_buffer
+            .peek_next_packet()
+            .map(|packet| PacketInfo {
+                timestamp: packet.timestamp,
+                is_dtx: false,
+                is_cng: false,
+            });
         let packet_buffer_info = PacketBufferInfo {
             dtx_or_cng: false,
             num_samples: self.packet_buffer.num_samples(),
@@ -494,7 +519,11 @@ impl NetEqCore {
 
     /// The required-samples sizing and packet extraction tail of `GetDecision`
     /// (reference lines 1065-1186).
-    fn finish_decision(&mut self, mut operation: Operation, end_timestamp: u32) -> (Operation, Vec<Packet>) {
+    fn finish_decision(
+        &mut self,
+        mut operation: Operation,
+        end_timestamp: u32,
+    ) -> (Operation, Vec<Packet>) {
         let samples_left = self
             .sync_buffer
             .future_length()
@@ -534,7 +563,8 @@ impl NetEqCore {
                     self.decision_logic.set_prev_time_scale(true);
                     return (operation, Vec::new());
                 }
-                if samples_left < SAMPLES_20_MS as i32 && self.decoder_frame_length < SAMPLES_30_MS {
+                if samples_left < SAMPLES_20_MS as i32 && self.decoder_frame_length < SAMPLES_30_MS
+                {
                     required_samples = 2 * OUTPUT_SIZE_SAMPLES;
                 }
             }
@@ -593,10 +623,9 @@ impl NetEqCore {
             let payload_timestamp = packet.timestamp;
             packet_list.push(packet);
 
-            let next_available = self
-                .packet_buffer
-                .peek_next_packet()
-                .is_some_and(|next| next.timestamp == payload_timestamp.wrapping_add(packet_duration as u32));
+            let next_available = self.packet_buffer.peek_next_packet().is_some_and(|next| {
+                next.timestamp == payload_timestamp.wrapping_add(packet_duration as u32)
+            });
             if extracted_samples >= required_samples || !next_available {
                 break;
             }
@@ -630,7 +659,8 @@ impl NetEqCore {
                 source = DecodedFrameSource::Dred;
             }
             if packet.priority.codec_level == 0 {
-                self.block_mute_target = if packet.muted { 0.0 } else { 1.0 };
+                // Hold this target across the following concealment too.
+                self.mute_target = if packet.muted { 0.0 } else { 1.0 };
             }
             let out_start = decoded_length;
             let decoded = self.decode_one(packet, out_start);
@@ -666,12 +696,16 @@ impl NetEqCore {
             PacketPayload::Opus(bytes) => {
                 let end = (out_start + MAX_OPUS_DECODE_SAMPLES).min(self.decoded_buffer.len());
                 let output = &mut self.decoded_buffer[out_start..end];
-                self.decoder.decode_float(bytes, output, false).map_err(|_| ())
+                self.decoder
+                    .decode_float(bytes, output, false)
+                    .map_err(|_| ())
             }
             PacketPayload::OpusFec(bytes) => {
                 let end = (out_start + LIVE_OPUS_FRAME_SAMPLES).min(self.decoded_buffer.len());
                 let output = &mut self.decoded_buffer[out_start..end];
-                self.decoder.decode_float(bytes, output, true).map_err(|_| ())
+                self.decoder
+                    .decode_float(bytes, output, true)
+                    .map_err(|_| ())
             }
             PacketPayload::Dred { source, offset } => {
                 self.decode_dred(packet.sequence_number, source, *offset, out_start)
@@ -730,12 +764,6 @@ impl NetEqCore {
             self.concealment
                 .normal_after_expand(&self.history_scratch, &mut decoded);
         }
-        self.mute_gain = apply_gain_ramp(
-            &mut decoded,
-            self.mute_gain,
-            self.block_mute_target,
-            self.mute_gain_step,
-        );
         self.sync_buffer.push_back(&decoded);
         self.last_mode = Mode::Normal;
     }
@@ -746,12 +774,6 @@ impl NetEqCore {
         self.copy_history();
         self.concealment
             .merge_after_expand(&self.history_scratch, &mut decoded);
-        self.mute_gain = apply_gain_ramp(
-            &mut decoded,
-            self.mute_gain,
-            self.block_mute_target,
-            self.mute_gain_step,
-        );
         self.sync_buffer.push_back(&decoded);
         self.last_mode = Mode::Merge;
     }
@@ -803,26 +825,25 @@ impl NetEqCore {
         self.time_scale_window
             .extend_from_slice(&input[..TIME_SCALE_WINDOW]);
         let analysis = self.scaler.analyze(&self.time_scale_window);
-        let removed = if analysis.best_correlation <= threshold_for_mode(fast)
-            && analysis.active_speech
-        {
-            self.last_mode = Mode::AccelerateFail;
-            0
-        } else {
-            let peak_index = if fast {
-                let periods = TIME_SCALE_REF_OFFSET / analysis.peak_index.max(1);
-                (periods.max(1) * analysis.peak_index).min(TIME_SCALE_REF_OFFSET)
+        let removed =
+            if analysis.best_correlation <= threshold_for_mode(fast) && analysis.active_speech {
+                self.last_mode = Mode::AccelerateFail;
+                0
             } else {
-                analysis.peak_index
+                let peak_index = if fast {
+                    let periods = TIME_SCALE_REF_OFFSET / analysis.peak_index.max(1);
+                    (periods.max(1) * analysis.peak_index).min(TIME_SCALE_REF_OFFSET)
+                } else {
+                    analysis.peak_index
+                };
+                let removed = accelerate_one_period(&mut queue, 0, peak_index);
+                self.last_mode = if analysis.active_speech {
+                    Mode::AccelerateSuccess
+                } else {
+                    Mode::AccelerateLowEnergy
+                };
+                removed
             };
-            let removed = accelerate_one_period(&mut queue, 0, peak_index);
-            self.last_mode = if analysis.active_speech {
-                Mode::AccelerateSuccess
-            } else {
-                Mode::AccelerateLowEnergy
-            };
-            removed
-        };
         let mut algorithm = Vec::with_capacity(queue.frames());
         queue.copy_window(0, queue.frames(), &mut algorithm);
         self.apply_timescale_result(algorithm, borrowed);
@@ -843,20 +864,19 @@ impl NetEqCore {
         self.time_scale_window
             .extend_from_slice(&input[..TIME_SCALE_WINDOW]);
         let analysis = self.scaler.analyze(&self.time_scale_window);
-        let added = if analysis.best_correlation <= threshold_for_mode(false)
-            && analysis.active_speech
-        {
-            self.last_mode = Mode::PreemptiveExpandFail;
-            0
-        } else {
-            let added = expand_one_period(&mut queue, 0, analysis.peak_index);
-            self.last_mode = if analysis.active_speech {
-                Mode::PreemptiveExpandSuccess
+        let added =
+            if analysis.best_correlation <= threshold_for_mode(false) && analysis.active_speech {
+                self.last_mode = Mode::PreemptiveExpandFail;
+                0
             } else {
-                Mode::PreemptiveExpandLowEnergy
+                let added = expand_one_period(&mut queue, 0, analysis.peak_index);
+                self.last_mode = if analysis.active_speech {
+                    Mode::PreemptiveExpandSuccess
+                } else {
+                    Mode::PreemptiveExpandLowEnergy
+                };
+                added
             };
-            added
-        };
         let mut algorithm = Vec::with_capacity(queue.frames());
         queue.copy_window(0, queue.frames(), &mut algorithm);
         self.apply_timescale_result(algorithm, borrowed);
@@ -898,8 +918,11 @@ impl NetEqCore {
                 self.sync_buffer.push_front_zeros(borrowed - len);
                 algorithm.clear();
             } else {
-                self.sync_buffer
-                    .replace_at_index(&algorithm[..borrowed], borrowed, size - borrowed);
+                self.sync_buffer.replace_at_index(
+                    &algorithm[..borrowed],
+                    borrowed,
+                    size - borrowed,
+                );
                 algorithm.drain(..borrowed);
             }
         }

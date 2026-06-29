@@ -99,7 +99,8 @@ impl SyncBuffer {
             return;
         }
         // Shift [position, size-length) right by `length`, discarding the tail.
-        self.data.copy_within(position..size - length, position + length);
+        self.data
+            .copy_within(position..size - length, position + length);
         self.data[position..position + length].fill(0.0);
         if self.next_index >= position {
             self.set_next_index(self.next_index + length);
@@ -146,11 +147,12 @@ impl SyncBuffer {
         let overlap_start = overlap.len() - len;
         for index in 0..len {
             let window_index = overlap_start + index;
-            self.data[buffer_start + index] = super::super::concealment::blend_expand_overlap_sample(
-                self.data[buffer_start + index],
-                overlap[overlap_start + index],
-                window_index,
-            );
+            self.data[buffer_start + index] =
+                super::super::concealment::blend_expand_overlap_sample(
+                    self.data[buffer_start + index],
+                    overlap[overlap_start + index],
+                    window_index,
+                );
         }
     }
 

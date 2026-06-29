@@ -304,9 +304,7 @@ pub struct LivePlaybackFeedback {
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct LiveAudioTuning {
-    pub adaptive_catch_up: bool,
     pub capture_silence_gate: bool,
-    pub adaptive_target: bool,
     pub target_queue: Duration,
     pub dynamic_target_floor: Duration,
     pub base_minimum_target: Duration,
@@ -324,9 +322,7 @@ pub struct LiveAudioTuning {
 impl Default for LiveAudioTuning {
     fn default() -> Self {
         Self {
-            adaptive_catch_up: true,
             capture_silence_gate: true,
-            adaptive_target: true,
             target_queue: LIVE_PLAYBACK_TARGET_QUEUE,
             dynamic_target_floor: LIVE_PLAYBACK_DYNAMIC_TARGET_FLOOR,
             base_minimum_target: Duration::ZERO,

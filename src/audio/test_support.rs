@@ -10,14 +10,11 @@ use opus_codec::{Channels, Decoder, DredDecoder, DredState, SampleRate};
 use crate::{
     audio::{
         capture::OpusVoiceEncoder,
-        playback::{
-            AdaptivePlaybackStream, DrainEvent, LiveDecodeStream, LivePlaybackMixer,
-            LivePlaybackMixerStats,
-        },
+        playback::LivePlaybackMixer,
         shared::{
-            DEFAULT_LIVE_MAX_AMPLIFICATION, DecodedFrameSource, FRAME_SAMPLES,
-            LIVE_OPUS_FRAME_SAMPLES, LIVE_PLAYBACK_DRED_MAX_SAMPLES, LiveAudioTuning,
-            MAX_OPUS_PACKET_BYTES, normalized_to_i16_scale, peak_normalized, rms_normalized,
+            DEFAULT_LIVE_MAX_AMPLIFICATION, FRAME_SAMPLES, LIVE_OPUS_FRAME_SAMPLES,
+            LIVE_PLAYBACK_DRED_MAX_SAMPLES, LiveAudioTuning, MAX_OPUS_PACKET_BYTES,
+            normalized_to_i16_scale, peak_normalized, rms_normalized,
         },
         sim::{
             LiveAudioPacketLossProfile, LiveAudioSimulationConfig, LiveAudioSimulationReport,
@@ -151,80 +148,6 @@ pub(crate) fn encode_live_dred_packets(
         packets.push(packet[..encoded].to_vec());
     }
     packets
-}
-
-/// Delivers every packet except `dropped`, then drains across the gap and
-/// returns each decoded `(source, sample_count)` in playout order alongside
-/// the stream so callers can inspect `dred_parses`.
-pub(crate) fn drive_gap_recovery(
-    packets: &[Vec<u8>],
-    dropped: &[u32],
-) -> (Vec<(DecodedFrameSource, usize)>, LiveDecodeStream) {
-    let tuning = test_tuning();
-    let mut stream = LiveDecodeStream::new(tuning).unwrap();
-    let start = Instant::now();
-    for (index, payload) in packets.iter().enumerate() {
-        let sequence = index as u32;
-        if dropped.contains(&sequence) {
-            continue;
-        }
-        stream.insert(
-            AudioPacketRef {
-                sequence,
-                flags: 0,
-                payload: crate::audio::shared::VoicePayloadRef::Opus(payload),
-            },
-            start,
-        );
-    }
-
-    let mut collected = Vec::new();
-    let mut trace = None;
-    // First drain plays the contiguous run up to the gap and registers the
-    // gap as pending. The second, after the reorder delay, emits the missing
-    // frames and the remainder in one pass so the gap-bounding packet is
-    // visible to DRED recovery.
-    let t1 = start + tuning.initial_buffer + Duration::from_millis(1);
-    stream.drain_ready(t1, start, 1, &mut trace, |_, event| match event {
-        DrainEvent::Samples {
-            samples, source, ..
-        } => collected.push((source, samples.len())),
-        DrainEvent::Concealment { samples } => {
-            collected.push((DecodedFrameSource::Expand, samples));
-        }
-        DrainEvent::Discontinuity | DrainEvent::SenderSilence => {}
-    });
-    let t2 = t1 + tuning.max_reorder_delay + Duration::from_millis(1);
-    stream.drain_ready(t2, start, 1, &mut trace, |_, event| match event {
-        DrainEvent::Samples {
-            samples, source, ..
-        } => collected.push((source, samples.len())),
-        DrainEvent::Concealment { samples } => {
-            collected.push((DecodedFrameSource::Expand, samples));
-        }
-        DrainEvent::Discontinuity | DrainEvent::SenderSilence => {}
-    });
-    (collected, stream)
-}
-
-/// Drains a backlog through the stream while keeping its queue above target,
-/// returning every output sample. The look-ahead tail of three samples is
-/// left queued so playback never underruns at the end.
-pub(crate) fn drain_catch_up(stream: &mut AdaptivePlaybackStream, now: Instant) -> Vec<f32> {
-    let mut stats = LivePlaybackMixerStats::default();
-    let mut output = Vec::new();
-    while stream.queued_samples() > 8 {
-        match stream.pop_sample(now, &mut stats) {
-            Some(sample) => output.push(sample),
-            None => break,
-        }
-    }
-    assert_eq!(stats.underrun_count, 0, "catch-up must not underrun");
-    assert!(
-        stats.accelerate_count > 0 || stats.expand_count > 0,
-        "WSOLA path must engage"
-    );
-    output
 }
 
 pub(crate) fn pop_until_nonzero(mixer: &mut LivePlaybackMixer, now: Instant) -> f32 {

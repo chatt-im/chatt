@@ -66,4 +66,17 @@ impl Mode {
     pub(crate) fn is_expand(self) -> bool {
         matches!(self, Mode::Expand | Mode::CodecPlc)
     }
+
+    /// Whether the mode is an accelerate outcome (success or low-energy).
+    pub(crate) fn is_accelerate(self) -> bool {
+        matches!(self, Mode::AccelerateSuccess | Mode::AccelerateLowEnergy)
+    }
+
+    /// Whether the mode is a preemptive-expand outcome (success or low-energy).
+    pub(crate) fn is_preemptive_expand(self) -> bool {
+        matches!(
+            self,
+            Mode::PreemptiveExpandSuccess | Mode::PreemptiveExpandLowEnergy
+        )
+    }
 }

@@ -28,7 +28,4 @@ mod redundancy;
 mod sync_buffer;
 mod tick_timer;
 
-// Wired into the live decode worker in the next step; re-exported now so the
-// core compiles and is unit-tested in isolation first.
-#[allow(unused_imports)]
 pub(crate) use core::{AudioResult, NetEqCore};

@@ -52,8 +52,7 @@ impl UnderrunOptimizer {
                 self.resample_stopwatch = Some(tick_timer.new_stopwatch());
                 self.max_delay_in_interval_ms = 0;
             }
-            self.max_delay_in_interval_ms =
-                self.max_delay_in_interval_ms.max(relative_delay_ms);
+            self.max_delay_in_interval_ms = self.max_delay_in_interval_ms.max(relative_delay_ms);
         } else {
             histogram_update = Some(relative_delay_ms);
         }
@@ -131,8 +130,7 @@ impl ReorderOptimizer {
         let mut min_bucket = 0;
         for (i, bucket) in buckets.iter().enumerate() {
             loss_probability -= *bucket;
-            let delay_ms =
-                ((i as i32 * BUCKET_SIZE_MS - base_delay_ms).max(0) as i64) << 30;
+            let delay_ms = ((i as i32 * BUCKET_SIZE_MS - base_delay_ms).max(0) as i64) << 30;
             let cost = delay_ms + 100 * self.ms_per_loss_percent as i64 * loss_probability;
             if cost < min_cost {
                 min_cost = cost;
