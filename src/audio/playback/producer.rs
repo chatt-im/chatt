@@ -88,6 +88,7 @@ impl RingPlaybackProducer {
             DecodedFrameSource::Dred => {
                 stats.dred_recoveries = stats.dred_recoveries.saturating_add(1);
             }
+            DecodedFrameSource::Expand => {}
             DecodedFrameSource::Plc => {
                 stats.plc_fallbacks = stats.plc_fallbacks.saturating_add(1);
             }
@@ -101,6 +102,15 @@ impl RingPlaybackProducer {
         }
         self.stream
             .queue_samples_with_delay(samples, source, playout_delay, now, stats);
+    }
+
+    pub(crate) fn queue_concealment(
+        &mut self,
+        samples: usize,
+        now: Instant,
+        stats: &mut LivePlaybackMixerStats,
+    ) {
+        self.stream.queue_concealment(samples, now, stats);
     }
 
     pub(crate) fn apply_recommended_target(&mut self, recommended: Duration, now: Instant) {

@@ -6,22 +6,29 @@ use std::{
 use crate::audio::{
     playback::{
         LivePlaybackMixerStats, MonoSampleQueue,
+        concealment::NetEqConcealment,
         time_scale::{TimeScaler, accelerate_one_period, expand_one_period, threshold_for_mode},
     },
     shared::{
         DecodedFrameSource, LIVE_PLAYBACK_DYNAMIC_DEADBAND, LIVE_PLAYBACK_DYNAMIC_UNDERRUN_MIN,
         LIVE_PLAYBACK_DYNAMIC_UNDERRUN_WINDOW, LIVE_PLAYBACK_MAX_IDLE_EXPANSION,
-        LIVE_PLAYBACK_RECOVERY_DECLICK, LIVE_PLAYBACK_RECOVERY_DECLICK_MIN_DELTA,
         LIVE_PLAYBACK_RESUME_TIME_SCALE_HOLD, LiveAudioTuning, PlayoutDelay,
-        TIME_SCALE_DECISION_INTERVAL, TIME_SCALE_MARGIN, TIME_SCALE_MAX_LAG_48K,
-        TIME_SCALE_MIN_LAG_48K, TIME_SCALE_NOISE_FLOOR_MS, TIME_SCALE_OPERATION_HOLD,
-        TIME_SCALE_OVERLAP, TIME_SCALE_REF_OFFSET, TIME_SCALE_VAD_RATIO, TIME_SCALE_WINDOW,
-        samples_for_duration, samples_to_ms,
+        TIME_SCALE_DECISION_INTERVAL, TIME_SCALE_MARGIN, TIME_SCALE_NOISE_FLOOR_MS,
+        TIME_SCALE_OPERATION_HOLD, TIME_SCALE_OVERLAP, TIME_SCALE_REF_OFFSET, TIME_SCALE_VAD_RATIO,
+        TIME_SCALE_WINDOW, samples_for_duration, samples_to_ms,
     },
 };
 
 const LIVE_PLAYBACK_PREALLOCATED_FRAMES: usize = 256;
 const LIVE_PLAYBACK_PREALLOCATED_UNDERRUNS: usize = 128;
+const NETEQ_SYNC_BUFFER_HISTORY: Duration = Duration::from_millis(720);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NetEqMode {
+    Normal,
+    ExpandTiming,
+    ExpandLoss,
+}
 
 #[derive(Clone, Copy)]
 pub(crate) struct TuningSampleCounts {
@@ -106,7 +113,12 @@ pub(crate) struct AdaptivePlaybackStream {
     samples: TuningSampleCounts,
     input: MonoSampleQueue,
     scaler: TimeScaler,
+    concealment: NetEqConcealment,
     time_scale_window: Vec<f32>,
+    concealment_history: Vec<f32>,
+    playout_history: VecDeque<f32>,
+    playout_history_capacity: usize,
+    neteq_mode: NetEqMode,
     decision_countdown: usize,
     operation_hold_remaining: usize,
     /// Samples synthesized by overlap-add expansion since the last real decoded
@@ -125,6 +137,9 @@ pub(crate) struct AdaptivePlaybackStream {
     output_target_floor_samples: usize,
     buffer_level: BufferLevelFilter,
     pending_time_stretch: i64,
+    /// Samples from the current NetEQ recovery operation that must play as-is
+    /// before catch-up time scaling is considered again.
+    time_scale_protected_samples: usize,
     /// Ring samples already published to the callback during a ring-path
     /// time-scale decision. They are immutable, but they still count as
     /// protected output reserve when deciding whether it is safe to accelerate
@@ -134,23 +149,10 @@ pub(crate) struct AdaptivePlaybackStream {
     /// (the consumer hears silence) until the buffer first reaches the target,
     /// then re-arms on a dry-ring underrun. Unused by the legacy pull path.
     ring_priming: bool,
-    /// Output samples remaining in the post-resume window during which catch-up
-    /// expansion is suppressed. Armed when audio returns after a sender-silence
-    /// pause, because the fade-in onset is not stationary enough for a
-    /// pitch-period crossfade to be click-free. Counts down as output is
-    /// produced on either the pull or the ring path.
-    ///
-    /// WebRTC NetEQ does the same gating in
-    /// `modules/audio_coding/neteq/decision_logic.cc`,
-    /// `DecisionLogic::ExpectedPacketAvailable`: it only considers
-    /// `kAccelerate`/`kPreemptiveExpand` when `status.last_mode !=
-    /// NetEq::Mode::kExpand`, so the first packet decoded after a concealment
-    /// (Expand/PLC) gap always plays as `kNormal` rather than being time-scaled.
-    /// Our sender-silence pause is the equivalent concealment region; because the
-    /// resume is a multi-frame fade-in rather than a single packet, we hold over a
-    /// short window instead of just the first frame. The companion refractory
-    /// after every time-scale op (`operation_hold_remaining`) mirrors NetEQ's
-    /// `timescale_countdown_`/`TimescaleAllowed()` in the same file.
+    /// Countdown that mirrors NetEQ's mode/countdown gate around concealment
+    /// recovery: sender-silence resume is a CNG/DTX-style boundary, so catch-up
+    /// time scaling waits for the capture fade-in to leave the non-stationary
+    /// onset.
     resume_time_scale_hold_remaining: usize,
 }
 
@@ -162,7 +164,16 @@ impl AdaptivePlaybackStream {
             samples,
             input: MonoSampleQueue::with_capacity(LIVE_PLAYBACK_PREALLOCATED_FRAMES),
             scaler: TimeScaler::new(),
+            concealment: NetEqConcealment::new(),
             time_scale_window: Vec::with_capacity(TIME_SCALE_WINDOW),
+            concealment_history: Vec::with_capacity(samples_for_duration(
+                NETEQ_SYNC_BUFFER_HISTORY,
+            )),
+            playout_history: VecDeque::with_capacity(samples_for_duration(
+                NETEQ_SYNC_BUFFER_HISTORY,
+            )),
+            playout_history_capacity: samples_for_duration(NETEQ_SYNC_BUFFER_HISTORY),
+            neteq_mode: NetEqMode::Normal,
             decision_countdown: 0,
             operation_hold_remaining: 0,
             idle_expansion_samples: 0,
@@ -178,6 +189,7 @@ impl AdaptivePlaybackStream {
             output_target_floor_samples: 0,
             buffer_level: BufferLevelFilter::default(),
             pending_time_stretch: 0,
+            time_scale_protected_samples: 0,
             ring_decision_published_samples: 0,
             ring_priming: true,
             resume_time_scale_hold_remaining: 0,
@@ -218,15 +230,29 @@ impl AdaptivePlaybackStream {
         if samples.is_empty() {
             return;
         }
-        self.declick_recovery_boundary(&mut samples, source);
+        if matches!(
+            source,
+            DecodedFrameSource::Normal | DecodedFrameSource::Dred
+        ) {
+            self.concealment.update_background_noise(&samples);
+            self.apply_neteq_recovery_boundary(&mut samples);
+        }
         let passive_frame = samples_are_passive(&samples);
-        // Audio returning after a sender-silence pause: arm the post-resume window
-        // that suppresses catch-up expansion over the non-stationary fade-in onset.
+        // Audio returning after a sender-silence pause should start from buffered
+        // real packets. Do not synthesize the intentional silence gap.
         if self.sender_silent {
             self.resume_time_scale_hold_remaining = self.samples.resume_time_scale_hold;
+            self.output_priming = true;
+            self.ring_priming = true;
         }
         self.input
             .push_back_owned_with_delay(samples, source, playout_delay, now);
+        if matches!(
+            source,
+            DecodedFrameSource::Normal | DecodedFrameSource::Dred
+        ) {
+            self.neteq_mode = NetEqMode::Normal;
+        }
         self.sender_silent = false;
         self.passive_output_active = passive_frame;
         // A real decoded frame arrived, so the stream is live: clear the idle
@@ -294,9 +320,12 @@ impl AdaptivePlaybackStream {
         let passive_front = self.front_is_passive_audio();
         match self.input.pop_front_sample() {
             Some(sample) => {
+                self.time_scale_protected_samples =
+                    self.time_scale_protected_samples.saturating_sub(1);
                 self.underrun_active = false;
                 self.passive_output_active = passive_front;
                 stats.direct_samples = stats.direct_samples.saturating_add(1);
+                self.record_playout_history(&[sample]);
                 Some(sample)
             }
             None => {
@@ -409,6 +438,7 @@ impl AdaptivePlaybackStream {
             return 0.0;
         };
         stats.direct_samples = stats.direct_samples.saturating_add(1);
+        self.record_playout_history(&[sample]);
         sample
     }
 
@@ -439,6 +469,9 @@ impl AdaptivePlaybackStream {
         self.buffer_level.update(total, self.pending_time_stretch);
         self.pending_time_stretch = 0;
         if !self.tuning.adaptive_catch_up {
+            return;
+        }
+        if self.time_scale_protected_samples > 0 {
             return;
         }
         let active_recovery_front = self
@@ -484,7 +517,7 @@ impl AdaptivePlaybackStream {
             || should_preemptively_expand
         {
             if !self.try_expand(now, stats) {
-                self.try_short_buffer_expand(stats);
+                self.try_neteq_expand(stats, NetEqMode::ExpandTiming);
             }
             return;
         }
@@ -499,6 +532,9 @@ impl AdaptivePlaybackStream {
             .max(self.output_target_floor_samples);
         self.refresh_buffer_level_filter(target);
         if !self.tuning.adaptive_catch_up {
+            return;
+        }
+        if self.time_scale_protected_samples > 0 {
             return;
         }
         let active_recovery_front = self
@@ -565,7 +601,7 @@ impl AdaptivePlaybackStream {
             self.try_accelerate(now, stats, false);
         } else if current_delay.saturating_add(self.low_delay_expand_deadband()) < target {
             if !self.try_expand(now, stats) {
-                self.try_short_buffer_expand(stats);
+                self.try_neteq_expand(stats, NetEqMode::ExpandTiming);
             }
         }
     }
@@ -593,7 +629,7 @@ impl AdaptivePlaybackStream {
             || should_preemptively_expand
         {
             if !self.try_expand(now, stats) {
-                self.try_short_buffer_expand(stats);
+                self.try_neteq_expand(stats, NetEqMode::ExpandTiming);
             }
             return;
         }
@@ -616,12 +652,6 @@ impl AdaptivePlaybackStream {
         stats: &mut LivePlaybackMixerStats,
         fast: bool,
     ) -> bool {
-        // A freshly resumed stream's onset (the mute/silence fade-in) is not
-        // stationary, so a pitch-period crossfade splices mismatched levels into
-        // an audible click. WebRTC NetEQ suppresses accelerate and
-        // preemptive-expand together while `last_mode == kExpand`; mirror that by
-        // holding off catch-up acceleration over the post-resume window, the same
-        // gate `try_expand`/`try_short_buffer_expand` already apply.
         if self.resume_time_scale_hold_remaining > 0 {
             return false;
         }
@@ -664,9 +694,6 @@ impl AdaptivePlaybackStream {
     }
 
     fn try_expand(&mut self, _now: Instant, stats: &mut LivePlaybackMixerStats) -> bool {
-        // A freshly resumed stream's onset (the mute/silence fade-in) is not
-        // stationary, so a pitch-period crossfade splices mismatched levels into
-        // an audible click. Hold off catch-up expansion until it restabilizes.
         if self.resume_time_scale_hold_remaining > 0 {
             return false;
         }
@@ -702,41 +729,66 @@ impl AdaptivePlaybackStream {
         true
     }
 
-    fn try_short_buffer_expand(&mut self, stats: &mut LivePlaybackMixerStats) -> bool {
-        // See `try_expand`: the onset right after a resume is not stationary, so
-        // duplicating its tail pitch period steps back from the current sample to
-        // a lower one a period earlier, which is the click heard on unmute.
-        if self.resume_time_scale_hold_remaining > 0 {
+    fn try_neteq_expand(&mut self, stats: &mut LivePlaybackMixerStats, mode: NetEqMode) -> bool {
+        if self.sender_silent || self.resume_time_scale_hold_remaining > 0 {
             return false;
         }
-        // This fallback is only for callbacks smaller than the playout target:
-        // inside a full-target callback, dropping below target mid-block is
-        // expected and should not synthesize extra audio.
-        if self.output_target_floor_samples >= self.effective_target_samples() {
+        if matches!(mode, NetEqMode::ExpandTiming)
+            && (self.passive_output_active || self.front_is_passive_audio())
+        {
             return false;
         }
         if self.idle_expansion_exhausted() {
             return false;
         }
-        let queued = self.queued_samples();
-        if queued < TIME_SCALE_MIN_LAG_48K * 2 {
+        self.copy_concealment_history();
+        let generated = self.concealment.expand_chunk(&self.concealment_history);
+        if generated.samples.is_empty() {
             return false;
         }
-        let Some(segment) = self.tail_pitch_period(queued) else {
-            return false;
-        };
-        let before = self.input.frames();
-        self.input.overlap_add_expand(queued, segment);
-        let delta = self.input.frames().saturating_sub(before);
-        if delta == 0 {
-            return false;
-        }
+        self.input.blend_expand_overlap_tail(&generated.overlap);
+        let delta = generated.samples.len();
+        self.input
+            .push_back_owned(generated.samples, DecodedFrameSource::Expand);
         stats.expand_count = stats.expand_count.saturating_add(1);
         stats.expand_samples = stats.expand_samples.saturating_add(delta as u64);
         self.pending_time_stretch = self.pending_time_stretch.saturating_sub(delta as i64);
         self.idle_expansion_samples = self.idle_expansion_samples.saturating_add(delta);
         self.operation_hold_remaining = self.samples.operation_hold;
+        self.neteq_mode = mode;
         true
+    }
+
+    pub(crate) fn queue_concealment(
+        &mut self,
+        samples: usize,
+        _now: Instant,
+        stats: &mut LivePlaybackMixerStats,
+    ) {
+        if self.sender_silent
+            || self.resume_time_scale_hold_remaining > 0
+            || samples == 0
+            || self.idle_expansion_exhausted()
+        {
+            return;
+        }
+        self.copy_concealment_history();
+        let generated = self
+            .concealment
+            .expand_to_len_chunk(&self.concealment_history, samples);
+        if generated.samples.is_empty() {
+            return;
+        }
+        self.input.blend_expand_overlap_tail(&generated.overlap);
+        let delta = generated.samples.len();
+        self.input
+            .push_back_owned(generated.samples, DecodedFrameSource::Expand);
+        stats.concealment_expands = stats.concealment_expands.saturating_add(1);
+        stats.expand_count = stats.expand_count.saturating_add(1);
+        stats.expand_samples = stats.expand_samples.saturating_add(delta as u64);
+        self.pending_time_stretch = self.pending_time_stretch.saturating_sub(delta as i64);
+        self.idle_expansion_samples = self.idle_expansion_samples.saturating_add(delta);
+        self.neteq_mode = NetEqMode::ExpandLoss;
     }
 
     /// Whether overlap-add expansion has synthesized its full idle budget since
@@ -744,60 +796,6 @@ impl AdaptivePlaybackStream {
     /// ended and is allowed to drain to silence rather than looping its buffer.
     fn idle_expansion_exhausted(&self) -> bool {
         self.idle_expansion_samples >= self.samples.max_idle_expansion
-    }
-
-    fn tail_pitch_period(&mut self, queued: usize) -> Option<usize> {
-        let max_lag = TIME_SCALE_MAX_LAG_48K.min(queued / 2);
-        if max_lag < TIME_SCALE_MIN_LAG_48K {
-            return None;
-        }
-
-        // The correlation only ever reads the last `2 * max_lag` samples, so copy
-        // that tail into a contiguous scratch buffer once and index it directly.
-        // This replaces the per-sample `sample_at` ring lookups (each an O(frames)
-        // scan) with flat, autovectorizable slice reads.
-        let window = (2 * max_lag).min(queued);
-        let window_start = queued - window;
-        self.input
-            .copy_window(window_start, window, &mut self.time_scale_window);
-        let tail = self.time_scale_window.as_slice();
-
-        let mut best_lag = TIME_SCALE_MIN_LAG_48K;
-        let mut best_corr = -1.0f32;
-        let mut best_energy = 0.0f32;
-        for lag in TIME_SCALE_MIN_LAG_48K..=max_lag {
-            let len = lag.min(queued - lag);
-            if len < TIME_SCALE_MIN_LAG_48K {
-                continue;
-            }
-            let second_start = window - len;
-            let first_start = second_start - lag;
-            let first = &tail[first_start..first_start + len];
-            let second = &tail[second_start..second_start + len];
-            let mut cross = 0.0f32;
-            let mut e1 = 0.0f32;
-            let mut e2 = 0.0f32;
-            for index in 0..len {
-                let left = first[index];
-                let right = second[index];
-                cross += left * right;
-                e1 += left * left;
-                e2 += right * right;
-            }
-            let corr = cross.max(0.0) / (e1 * e2).sqrt().max(1.0e-12);
-            if corr > best_corr {
-                best_corr = corr;
-                best_lag = lag;
-                best_energy = (e1 + e2) / (2 * len).max(1) as f32;
-            }
-        }
-
-        let active_speech = best_energy > TIME_SCALE_VAD_RATIO * TIME_SCALE_NOISE_FLOOR_MS;
-        if best_corr >= threshold_for_mode(true) || !active_speech {
-            Some(best_lag)
-        } else {
-            None
-        }
     }
 
     fn note_underrun(&mut self, now: Instant) {
@@ -839,32 +837,51 @@ impl AdaptivePlaybackStream {
         self.note_underrun(now);
     }
 
-    fn declick_recovery_boundary(&self, samples: &mut [f32], source: DecodedFrameSource) {
-        if samples.is_empty() {
+    fn apply_neteq_recovery_boundary(&mut self, samples: &mut Vec<f32>) {
+        if samples.is_empty() || matches!(self.neteq_mode, NetEqMode::Normal) {
             return;
         }
-        let Some((previous_sample, previous_source)) = self.input.last_sample_and_source() else {
-            return;
-        };
-        if matches!(
-            (previous_source, source),
-            (DecodedFrameSource::Normal, DecodedFrameSource::Normal)
-        ) {
-            return;
+        self.copy_concealment_history();
+        match self.neteq_mode {
+            NetEqMode::Normal => {}
+            NetEqMode::ExpandTiming => self
+                .concealment
+                .normal_after_expand(&self.concealment_history, samples),
+            NetEqMode::ExpandLoss => self
+                .concealment
+                .merge_after_expand(&self.concealment_history, samples),
         }
+        self.time_scale_protected_samples = self
+            .time_scale_protected_samples
+            .saturating_add(samples.len());
+    }
 
-        let delta = samples[0] - previous_sample;
-        if delta.abs() < LIVE_PLAYBACK_RECOVERY_DECLICK_MIN_DELTA {
+    fn copy_concealment_history(&mut self) {
+        self.concealment_history.clear();
+        self.concealment_history
+            .extend(self.playout_history.iter().copied());
+        let queued = self.queued_samples();
+        if queued > 0 {
+            self.input
+                .copy_window(0, queued, &mut self.time_scale_window);
+            self.concealment_history
+                .extend_from_slice(&self.time_scale_window);
+        }
+    }
+
+    fn record_playout_history(&mut self, samples: &[f32]) {
+        if samples.is_empty() || self.playout_history_capacity == 0 {
             return;
         }
-
-        let ramp_samples = samples_for_duration(LIVE_PLAYBACK_RECOVERY_DECLICK)
-            .max(1)
-            .min(samples.len());
-        for (index, sample) in samples.iter_mut().take(ramp_samples).enumerate() {
-            let correction = 1.0 - (index as f32 / ramp_samples as f32);
-            *sample -= delta * correction;
+        let excess = self
+            .playout_history
+            .len()
+            .saturating_add(samples.len())
+            .saturating_sub(self.playout_history_capacity);
+        for _ in 0..excess {
+            self.playout_history.pop_front();
         }
+        self.playout_history.extend(samples.iter().copied());
     }
 
     pub(crate) fn skip_speech_gap_backlog(
@@ -872,6 +889,9 @@ impl AdaptivePlaybackStream {
         _now: Instant,
         stats: &mut LivePlaybackMixerStats,
     ) {
+        self.time_scale_protected_samples = 0;
+        self.concealment.reset();
+        self.neteq_mode = NetEqMode::Normal;
         let queued = self.queued_samples();
         let target = self.low_latency_target_samples();
         if queued <= target {
@@ -934,6 +954,9 @@ impl AdaptivePlaybackStream {
         let tail_trim_target = playout_target.saturating_add(passive_tail_reserve);
         self.sender_silent = true;
         self.passive_output_active = true;
+        self.concealment.reset();
+        self.neteq_mode = NetEqMode::Normal;
+        self.time_scale_protected_samples = 0;
         self.recommended_target_samples = playout_target;
         self.underrun_active = false;
         self.output_priming = false;
@@ -1131,6 +1154,13 @@ impl AdaptivePlaybackStream {
             let take = want.min(run.len());
             ring.write_samples(&run[..take])
         };
+        if written > 0 {
+            let mut committed = Vec::with_capacity(written);
+            self.input.copy_window(0, written, &mut committed);
+            self.record_playout_history(&committed);
+            self.time_scale_protected_samples =
+                self.time_scale_protected_samples.saturating_sub(written);
+        }
         self.input.drain_samples(written);
         written
     }
@@ -1168,69 +1198,36 @@ mod tests {
     use super::*;
     use crate::audio::{
         shared::{
-            FRAME_SAMPLES, LIVE_PLAYBACK_TARGET_QUEUE, PlayoutDelay, SAMPLE_RATE, duration_to_ms,
-            max_adjacent_delta, samples_for_duration, target_queue_samples,
+            FRAME_SAMPLES, LIVE_PLAYBACK_TARGET_QUEUE, PlayoutDelay, SAMPLE_RATE,
+            TIME_SCALE_MIN_LAG_48K, duration_to_ms, max_adjacent_delta, samples_for_duration,
+            target_queue_samples,
         },
         test_support::{drain_catch_up, sample_speech_frames, test_tuning},
     };
 
     #[test]
-    fn resume_hold_suppresses_accelerate_over_onset() {
-        // After a sender-silence pause, the resume onset (capture + receiver
-        // mute_gain fade-in) is not stationary, so a WSOLA pitch-period crossfade
-        // splices mismatched levels into a click. WebRTC NetEQ avoids this by
-        // suppressing BOTH accelerate and preemptive-expand until the first normal
-        // packet after an Expand gap; we hold over a short window. Verify that a
-        // deep resume buffer, which would otherwise accelerate immediately, runs
-        // no time-scale op until the hold expires, then catches up afterward.
+    fn sender_silence_resume_countdown_suppresses_concealment() {
         let now = Instant::now();
         let mut stream = AdaptivePlaybackStream::new(test_tuning()).unwrap();
         let mut stats = LivePlaybackMixerStats::default();
+        let history = sine(240.0, Duration::from_millis(220));
+        stream.record_playout_history(&history);
 
         stream.mark_sender_silent(now, &mut stats);
-        for _ in 0..samples_for_duration(Duration::from_millis(200)) {
-            let _ = stream.pop_sample(now, &mut stats);
-        }
+        stream.queue_concealment(FRAME_SAMPLES, now, &mut stats);
+        assert_eq!(stats.concealment_expands, 0);
+        assert_eq!(stats.expand_count, 0);
 
-        // Resume with a deep playout delay so the arrival-delay path would fire a
-        // fast-accelerate on the very first pop. The onset is exactly where the
-        // pitch-period crossfade clicks, so the hold must suppress it.
-        let resume = sine(240.0, Duration::from_millis(600));
-        stream.queue_samples_with_delay(
-            &resume,
-            DecodedFrameSource::Normal,
-            Some(PlayoutDelay {
-                current: Duration::from_millis(200),
-                peak: Duration::ZERO,
-            }),
-            now,
-            &mut stats,
-        );
+        stream.queue_samples(&history, DecodedFrameSource::Normal, now, &mut stats);
+        stream.queue_concealment(FRAME_SAMPLES, now, &mut stats);
+        assert_eq!(stats.concealment_expands, 0);
 
-        let hold = samples_for_duration(LIVE_PLAYBACK_RESUME_TIME_SCALE_HOLD);
-        for _ in 0..hold {
-            let _ = stream.pop_sample(now, &mut stats);
+        for _ in 0..stream.samples.resume_time_scale_hold {
+            assert!(stream.pop_sample(now, &mut stats).is_some());
         }
-        assert_eq!(
-            stats.accelerate_count, 0,
-            "accelerate fired during the resume hold: {stats:?}"
-        );
-        assert_eq!(
-            stats.expand_count, 0,
-            "expand fired during the resume hold: {stats:?}"
-        );
-
-        // Past the hold the stationary tone catches up again, so the suppression
-        // is bounded and does not strand the extra latency.
-        for _ in 0..samples_for_duration(Duration::from_millis(400)) {
-            if stream.pop_sample(now, &mut stats).is_none() {
-                break;
-            }
-        }
-        assert!(
-            stats.accelerate_count > 0,
-            "catch-up never resumed after the hold: {stats:?}"
-        );
+        stream.queue_concealment(FRAME_SAMPLES, now, &mut stats);
+        assert_eq!(stats.concealment_expands, 1);
+        assert_eq!(stream.neteq_mode, NetEqMode::ExpandLoss);
     }
 
     fn zero_cross_freq(samples: &[f32], rate: f64) -> f64 {
@@ -1697,16 +1694,30 @@ mod tests {
     }
 
     #[test]
-    fn adaptive_stream_declicks_recovery_boundaries() {
+    fn adaptive_stream_merges_recovery_after_expand() {
         let now = Instant::now();
         let mut stream = AdaptivePlaybackStream::new(test_tuning()).unwrap();
         let mut stats = LivePlaybackMixerStats::default();
 
-        stream.queue_samples(&[-0.1; 4], DecodedFrameSource::Dred, now, &mut stats);
-        stream.queue_samples(&[0.4; 4], DecodedFrameSource::Normal, now, &mut stats);
+        let speech = sine(220.0, Duration::from_millis(220));
+        stream.record_playout_history(&speech);
+        stream.queue_concealment(FRAME_SAMPLES, now, &mut stats);
+        let before_recovery = stream.queued_samples();
+        assert!(before_recovery >= FRAME_SAMPLES);
 
-        assert!((stream.input.sample_at(4).unwrap() - (-0.1)).abs() < f32::EPSILON);
-        assert!(stream.input.sample_at(5).unwrap() < 0.4);
+        let recovered = sine(220.0, Duration::from_millis(20));
+        stream.queue_samples(&recovered, DecodedFrameSource::Normal, now, &mut stats);
+
+        assert_eq!(stream.neteq_mode, NetEqMode::Normal);
+        assert!(
+            stream.queued_samples() > before_recovery,
+            "recovery frame was not queued after Expand"
+        );
+        assert_ne!(
+            stream.input.sample_at(before_recovery).unwrap_or_default(),
+            recovered[0],
+            "recovery should be merged/crossfaded, not appended raw"
+        );
     }
 
     #[test]

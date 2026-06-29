@@ -3,6 +3,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use super::concealment::blend_expand_overlap_sample;
 use crate::audio::shared::{
     DecodedFrameSource, PlayoutDelay, SAMPLE_RATE, peak_normalized, rms_normalized,
 };
@@ -268,6 +269,24 @@ impl MonoSampleQueue {
             inserted.push((1.0 - t) * upcoming + t * earlier);
         }
         self.insert_at_owned(start, inserted.as_slice());
+    }
+
+    pub(crate) fn blend_expand_overlap_tail(&mut self, overlap: &[f32]) {
+        if overlap.is_empty() || self.total == 0 {
+            return;
+        }
+        let len = overlap.len().min(self.total);
+        let queue_start = self.total - len;
+        let overlap_start = overlap.len() - len;
+        for index in 0..len {
+            if let Some(sample) = self.sample_mut(queue_start + index) {
+                *sample = blend_expand_overlap_sample(
+                    *sample,
+                    overlap[overlap_start + index],
+                    overlap_start + index,
+                );
+            }
+        }
     }
 
     pub(crate) fn insert_at_owned(&mut self, absolute_index: usize, samples: &[f32]) {
