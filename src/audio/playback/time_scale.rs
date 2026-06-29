@@ -22,7 +22,7 @@ const DOWNSAMPLE_48KHZ_Q12: [f32; 7] = [
 pub(crate) struct TimeScaler {
     downsampled: Vec<f32>,
     auto_correlation: Vec<f32>,
-    background_noise: BackgroundNoiseEstimate,
+    background_noise: VadBackgroundNoiseEstimate,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -37,7 +37,7 @@ impl TimeScaler {
         Self {
             downsampled: vec![0.0; TIME_SCALE_DOWNSAMPLED_LEN],
             auto_correlation: vec![0.0; TIME_SCALE_CORRELATION_LEN],
-            background_noise: BackgroundNoiseEstimate::new(),
+            background_noise: VadBackgroundNoiseEstimate::new(),
         }
     }
 
@@ -187,7 +187,7 @@ fn normalized_correlation_and_vad(
 }
 
 #[derive(Debug)]
-struct BackgroundNoiseEstimate {
+struct VadBackgroundNoiseEstimate {
     energy: f32,
     initialized: bool,
     update_threshold: f32,
@@ -195,7 +195,7 @@ struct BackgroundNoiseEstimate {
     max_energy: f32,
 }
 
-impl BackgroundNoiseEstimate {
+impl VadBackgroundNoiseEstimate {
     fn new() -> Self {
         Self {
             energy: TIME_SCALE_NOISE_FLOOR_MS,

@@ -242,7 +242,7 @@ pub(crate) const LIVE_CAPTURE_MUTE_FADE: Duration = Duration::from_millis(60);
 pub(crate) const MAX_OPUS_DECODE_SAMPLES: usize = 5_760;
 pub(crate) const MAX_OPUS_PACKET_BYTES: usize = 1_500;
 pub(crate) const AUDIO_POP_LOG_ENV: &str = "CHATT_AUDIO_POP_LOG";
-pub(crate) const AUDIO_POP_DELTA_THRESHOLD: f32 = 0.08;
+pub(crate) const AUDIO_POP_DELTA_THRESHOLD: f32 = 0.025;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BufferRequest {

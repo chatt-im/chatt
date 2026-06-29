@@ -1,0 +1,16 @@
+[project]
+name = "analysis"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = [
+    "librosa>=0.11.0",
+    "matplotlib>=3.11.0",
+    "numpy>=2.4.6",
+    "pandas>=3.0.4",
+    "scikit-learn>=1.9.0",
+    "scipy>=1.18.0",
+    "soundfile>=0.14.0",
+    "tqdm>=4.68.3",
+]

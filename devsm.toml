@@ -15,6 +15,41 @@ kvlog /tmp/chatt-alice.kvlog --json > /tmp/chatt-alice.json
 kvlog /tmp/chatt-soundboard.kvlog --json > /tmp/chatt-soundboard.json
 '''
 
+[service.audio-pop-server]
+sh = '''
+rm -f /tmp/chatt-server.kvlog /tmp/chatt-server.json
+cargo run --release -p server -- --config chatt-server.toml --logfile /tmp/chatt-server.kvlog
+'''
+ready.when.output_contains = "chatt server listening"
+ready.timeout = 10.0
+cache.never = true
+env.CHATT_AUDIO_POP_LOG = "1"
+info = "Release server with audio pop diagnostics"
+
+[action.audio-pop-alice]
+sh = '''
+rm -f /tmp/chatt-alice.kvlog /tmp/chatt-alice.json /tmp/chatt-alice-playback.wav
+cargo run --release -p chatt -- --config dev/chatt-alice.toml --logfile /tmp/chatt-alice.kvlog
+'''
+require = ["audio-pop-server"]
+managed = false
+env.CHATT_RUN_DIR = "/tmp/chatt-dev/alice"
+env.CHATT_AUDIO_POP_LOG = "1"
+env.CHATT_AUDIO_PLAYBACK_WAV = "/tmp/chatt-alice-playback.wav"
+info = "Run Alice in release mode with audio pop diagnostics"
+
+[action.audio-pop-soundboard]
+sh = '''
+rm -f /tmp/chatt-soundboard.kvlog /tmp/chatt-soundboard.json /tmp/chatt-soundboard-playback.wav
+cargo run --release -p chatt -- --config dev/chatt-soundboard.toml --logfile /tmp/chatt-soundboard.kvlog
+'''
+require = ["audio-pop-server"]
+managed = false
+env.CHATT_RUN_DIR = "/tmp/chatt-dev/soundboard"
+env.CHATT_AUDIO_POP_LOG = "1"
+env.CHATT_AUDIO_PLAYBACK_WAV = "/tmp/chatt-soundboard-playback.wav"
+info = "Run the soundboard in release mode with audio pop diagnostics"
+
 [action.client-alice]
 sh = '''
 rm /tmp/chatt-alice.kvlog
@@ -77,3 +112,4 @@ allow_multiple = true
 
 [group]
 clients = ["client-alice", "client-bob", "client-soundboard"]
+audio-pop = ["audio-pop-alice", "audio-pop-soundboard"]
