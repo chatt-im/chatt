@@ -122,6 +122,9 @@ impl RingPlaybackProducer {
         if matches!(result.source, DecodedFrameSource::Dred) {
             stats.dred_recoveries = stats.dred_recoveries.saturating_add(1);
         }
+        if matches!(result.source, DecodedFrameSource::Fec) {
+            stats.fec_recoveries = stats.fec_recoveries.saturating_add(1);
+        }
         if result.mode.is_accelerate() {
             stats.accelerate_count = stats.accelerate_count.saturating_add(1);
             stats.accelerate_samples = stats

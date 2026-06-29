@@ -40,6 +40,7 @@ pub(crate) fn trace_output_window(
         neteq_decision: snapshot.neteq_decision.as_str(),
         neteq_decision_reason: snapshot.neteq_decision_reason.as_str(),
         dred_recoveries: snapshot.dred_recoveries,
+        fec_recoveries: snapshot.fec_recoveries,
         dred_last_horizon_ms: snapshot.dred_last_horizon_ms,
         dred_missed_horizon_ms: snapshot.dred_missed_horizon_ms,
         dred_missed_horizon_count: snapshot.dred_missed_horizon_count,

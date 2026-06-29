@@ -603,6 +603,7 @@ pub struct LivePlaybackSnapshot {
     pub hard_trim_count: u64,
     pub underrun_count: u64,
     pub dred_recoveries: u64,
+    pub fec_recoveries: u64,
     pub plc_fallbacks: u64,
     pub concealment_expands: u64,
     pub decode_errors: u64,
@@ -801,6 +802,7 @@ pub(crate) fn convert_i16_scale_to_pcm_i16(input: &[f32], output: &mut [i16]) {
 pub(crate) enum DecodedFrameSource {
     Normal,
     Dred,
+    Fec,
     Expand,
     Plc,
     DecodeError,
@@ -976,6 +978,7 @@ pub(crate) fn trace_source_name(source: DecodedFrameSource) -> &'static str {
     match source {
         DecodedFrameSource::Normal => "normal",
         DecodedFrameSource::Dred => "dred",
+        DecodedFrameSource::Fec => "fec",
         DecodedFrameSource::Expand => "expand",
         DecodedFrameSource::Plc => "plc",
         DecodedFrameSource::DecodeError => "decode_error",
@@ -1126,6 +1129,7 @@ pub(crate) fn trace_decode_output(
     trace.write_event(jsony::object! {
         event: match source {
             DecodedFrameSource::Dred => "dred_decode",
+            DecodedFrameSource::Fec => "fec_decode",
             DecodedFrameSource::Normal => "normal_decode",
             DecodedFrameSource::Expand => "expand_decode",
             DecodedFrameSource::Plc => "plc_decode",

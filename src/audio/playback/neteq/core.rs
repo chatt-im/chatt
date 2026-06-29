@@ -20,7 +20,10 @@
 
 use std::rc::Rc;
 
-use opus_codec::{Channels, Decoder, DredDecoder, DredState, SampleRate};
+use opus_codec::{
+    Channels, Decoder, DredDecoder, DredState, SampleRate, packet_has_lbrr,
+    packet_samples_per_frame,
+};
 
 use super::decision_logic::DecisionLogic;
 use super::neteq_status::{
@@ -29,7 +32,7 @@ use super::neteq_status::{
 use super::operation::{Mode, Operation};
 use super::packet::{Packet, PacketPayload, is_newer_timestamp};
 use super::packet_buffer::PacketBuffer;
-use super::redundancy::{DredInfo, parse_payload_redundancy};
+use super::redundancy::{DredInfo, FecInfo, parse_payload_redundancy};
 use super::sync_buffer::SyncBuffer;
 use super::tick_timer::{Stopwatch, TickTimer};
 use crate::audio::playback::MonoSampleQueue;
@@ -296,6 +299,7 @@ impl NetEqCore {
         // InsertPacketInternal does: the hole between the most recent buffered (or
         // played) audio and this packet's timestamp.
         let current_gap = self.recovery_gap(timestamp);
+        let fec = Self::parse_fec(opus);
         let dred = self.parse_dred(sequence, &datagram);
         let dred_reach = dred
             .map(|info| info.samples.max(0) as u32)
@@ -314,7 +318,7 @@ impl NetEqCore {
             Rc::clone(&datagram),
             current_gap,
             DEFAULT_FRAME_SAMPLES as u32,
-            None,
+            fec,
             dred,
         );
         let main_timestamp = packets.first().map_or(timestamp, |packet| packet.timestamp);
@@ -395,6 +399,22 @@ impl NetEqCore {
         };
         let gap = timestamp.wrapping_sub(previous_timestamp);
         if (gap as i32) > 0 { gap } else { 0 }
+    }
+
+    /// Detects LBRR in-band FEC and returns the recovered frame duration, the
+    /// port of `PacketHasFec` + `WebRtcOpus_FecDurationEst`.
+    fn parse_fec(opus: &[u8]) -> Option<FecInfo> {
+        if !packet_has_lbrr(opus).unwrap_or(false) {
+            return None;
+        }
+        let duration = packet_samples_per_frame(opus, SampleRate::Hz48000).ok()?;
+        // The reference clamps to [10 ms, 120 ms] at 48 kHz = [480, 5760] samples.
+        if !(480..=5760).contains(&duration) {
+            return None;
+        }
+        Some(FecInfo {
+            duration: duration as u32,
+        })
     }
 
     /// Parses the DRED region of `datagram`, caching the parsed state for the
@@ -796,6 +816,9 @@ impl NetEqCore {
             if packet.priority.codec_level == 2 {
                 source = DecodedFrameSource::Dred;
             }
+            if packet.priority.codec_level == 1 {
+                source = DecodedFrameSource::Fec;
+            }
             if packet.priority.codec_level == 0 {
                 // Hold this target across the following concealment too.
                 self.mute_target = if packet.muted { 0.0 } else { 1.0 };
@@ -1093,6 +1116,7 @@ fn duration_to_i32_ms(duration: std::time::Duration) -> i32 {
 mod tests {
     use super::*;
     use crate::audio::capture::OpusVoiceEncoder;
+    use crate::network::EncoderNetworkProfile;
 
     fn encode_tone(encoder: &mut OpusVoiceEncoder, base: usize) -> Vec<u8> {
         let frame: Vec<i16> = (0..LIVE_OPUS_FRAME_SAMPLES)
@@ -1184,5 +1208,71 @@ mod tests {
             }
         }
         assert!(accelerated, "overfull buffer never accelerated");
+    }
+
+    #[test]
+    fn live_fec_packet_inserts_recovery_unit() {
+        // The live encoder profile encodes in-band FEC (LBRR) on every packet.
+        let packets = crate::audio::test_support::encode_live_dred_packets(
+            EncoderNetworkProfile::CRITICAL,
+            8,
+        );
+        let fec = NetEqCore::parse_fec(&packets[2]).expect("live profile encodes LBRR");
+        assert_eq!(fec.duration, LIVE_OPUS_FRAME_SAMPLES as u32);
+
+        // The detected FEC must lay an OpusFec recovery frame one frame before the
+        // primary, exactly where the dropped predecessor would have played.
+        let timestamp = 2 * LIVE_OPUS_FRAME_SAMPLES as u32;
+        let units = parse_payload_redundancy(
+            timestamp,
+            2,
+            Rc::new(packets[2].clone()),
+            0,
+            LIVE_OPUS_FRAME_SAMPLES as u32,
+            Some(fec),
+            None,
+        );
+        let recovered = timestamp - LIVE_OPUS_FRAME_SAMPLES as u32;
+        assert!(
+            units.iter().any(|packet| {
+                matches!(packet.payload, PacketPayload::OpusFec(_)) && packet.timestamp == recovered
+            }),
+            "FEC unit missing from parsed redundancy: {units:?}",
+        );
+    }
+
+    #[test]
+    fn dropped_primary_recovered_by_fec_not_expand() {
+        let packets = crate::audio::test_support::encode_live_dred_packets(
+            EncoderNetworkProfile::CRITICAL,
+            60,
+        );
+        let mut core = NetEqCore::new(LiveAudioTuning::default()).unwrap();
+        // Disable DRED so in-band FEC is the only redundancy that can conceal the
+        // drop. Without the FEC wiring the hole would surface as Expand.
+        core.dred_decoder = None;
+        let mut output = vec![0.0; OUTPUT_SIZE_SAMPLES];
+        let drop = 30u32;
+        let mut expand_after_drop = 0;
+        for seq in 0..packets.len() as u32 {
+            if seq != drop {
+                core.insert_packet(
+                    seq * LIVE_OPUS_FRAME_SAMPLES as u32,
+                    seq,
+                    0,
+                    &packets[seq as usize],
+                );
+            }
+            for _ in 0..2 {
+                let result = core.get_audio(&mut output);
+                if seq >= drop && matches!(result.mode, Mode::Expand) {
+                    expand_after_drop += 1;
+                }
+            }
+        }
+        assert_eq!(
+            expand_after_drop, 0,
+            "FEC should conceal the single drop without any expand",
+        );
     }
 }

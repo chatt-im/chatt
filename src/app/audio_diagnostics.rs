@@ -59,7 +59,7 @@ impl AudioDiagnostics {
         };
 
         format!(
-            "playback\n  output: ring max {}ms, queued {} samples, callback {}ms\n  neteq: playout {}ms ({} / 5s), target {}ms{} ({} / 5s)\n  buffers: decoded {}ms, packets wait {}ms span {}ms / {} pkts, next gap {}\n  decision: {} ({})\n  timing: accelerate {}ms / {}, expand {}ms / {}\n  recovery: dred {}, horizon {}ms, missed {}ms / {}, plc {}, trims {}, underruns {}\n  active streams: {}\nnetwork\n  voice rx: {} packets / {}\nencoder\n  profile: {}\n{}",
+            "playback\n  output: ring max {}ms, queued {} samples, callback {}ms\n  neteq: playout {}ms ({} / 5s), target {}ms{} ({} / 5s)\n  buffers: decoded {}ms, packets wait {}ms span {}ms / {} pkts, next gap {}\n  decision: {} ({})\n  timing: accelerate {}ms / {}, expand {}ms / {}\n  recovery: dred {}, fec {}, horizon {}ms, missed {}ms / {}, plc {}, trims {}, underruns {}\n  active streams: {}\nnetwork\n  voice rx: {} packets / {}\nencoder\n  profile: {}\n{}",
             self.snapshot.max_output_ring_ms,
             self.snapshot.output_ring_samples,
             self.snapshot.backend_block_ms,
@@ -80,6 +80,7 @@ impl AudioDiagnostics {
             live_samples_to_ms(self.snapshot.expand_samples as usize),
             self.snapshot.expand_count,
             self.snapshot.dred_recoveries,
+            self.snapshot.fec_recoveries,
             self.snapshot.dred_last_horizon_ms,
             self.snapshot.dred_missed_horizon_ms,
             self.snapshot.dred_missed_horizon_count,
