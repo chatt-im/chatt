@@ -94,6 +94,7 @@ fn exp1_drift_and_block_size_through_real_pipeline() {
                 let packet = RemoteVoicePacket {
                     stream_id: 1,
                     sequence: seq,
+                    timestamp: seq.wrapping_mul(LIVE_OPUS_FRAME_SAMPLES as u32),
                     flags: 0,
                     payload: VoicePayload::Opus(payload),
                     received_at: now,
@@ -481,6 +482,7 @@ fn run_clean_pipeline(
             let packet = RemoteVoicePacket {
                 stream_id: 1,
                 sequence: seq,
+                timestamp: seq.wrapping_mul(LIVE_OPUS_FRAME_SAMPLES as u32),
                 flags: 0,
                 payload: VoicePayload::Opus(packets[seq as usize % packets.len()].clone()),
                 received_at: now,

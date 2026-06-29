@@ -2442,9 +2442,10 @@ impl Server {
             MediaPayload::Voice {
                 stream_id,
                 sequence,
+                timestamp,
                 flags,
                 payload,
-            } => self.relay_voice(session_id, stream_id, sequence, flags, payload),
+            } => self.relay_voice(session_id, stream_id, sequence, timestamp, flags, payload),
             MediaPayload::VoiceFeedback {
                 stream_id,
                 feedback,
@@ -2509,6 +2510,7 @@ impl Server {
         sender_session_id: SessionId,
         stream_id: StreamId,
         sequence: u32,
+        timestamp: u32,
         flags: u8,
         voice_payload: media::VoicePayload,
     ) -> Result<(), String> {
@@ -2553,6 +2555,7 @@ impl Server {
         let payload = MediaPayload::Voice {
             stream_id,
             sequence,
+            timestamp,
             flags,
             payload: voice_payload,
         };
@@ -2616,6 +2619,7 @@ impl Server {
         if let MediaPayload::Voice {
             stream_id,
             sequence,
+            timestamp: _,
             flags,
             payload,
         } = payload

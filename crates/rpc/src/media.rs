@@ -1,7 +1,7 @@
 use crate::crypto::{self, AntiReplay, CryptoError, KeyMaterial};
 use crate::ids::{SessionId, StreamId};
 
-pub const UDP_VERSION: u8 = 3;
+pub const UDP_VERSION: u8 = 4;
 pub const UDP_HEADER_LEN: usize = 14;
 pub const SAFE_UDP_PAYLOAD_BYTES: usize = 1_200;
 pub const MAX_VOICE_PAYLOAD_BYTES: usize = 1_024;
@@ -38,6 +38,10 @@ pub enum MediaPayload {
     Voice {
         stream_id: StreamId,
         sequence: u32,
+        /// Media sample clock for the first sample in this packet, in 48 kHz
+        /// samples. Unlike `sequence` it advances across sender silence, so the
+        /// receiver's NetEQ packet buffer can reconstruct true inter-packet gaps.
+        timestamp: u32,
         flags: u8,
         payload: VoicePayload,
     },
@@ -45,6 +49,8 @@ pub enum MediaPayload {
         connection_id: u64,
         stream_id: StreamId,
         sequence: u32,
+        /// See [`MediaPayload::Voice::timestamp`].
+        timestamp: u32,
         flags: u8,
         payload: VoicePayload,
     },
@@ -305,11 +311,13 @@ pub fn encode_payload_into(payload: &MediaPayload, out: &mut Vec<u8>) -> Result<
         MediaPayload::Voice {
             stream_id,
             sequence,
+            timestamp,
             flags,
             payload,
         } => {
             out.extend_from_slice(&stream_id.0.to_le_bytes());
             out.extend_from_slice(&sequence.to_le_bytes());
+            out.extend_from_slice(&timestamp.to_le_bytes());
             out.push(*flags);
             encode_voice_payload(payload, out)?;
         }
@@ -317,12 +325,14 @@ pub fn encode_payload_into(payload: &MediaPayload, out: &mut Vec<u8>) -> Result<
             connection_id,
             stream_id,
             sequence,
+            timestamp,
             flags,
             payload,
         } => {
             out.extend_from_slice(&connection_id.to_le_bytes());
             out.extend_from_slice(&stream_id.0.to_le_bytes());
             out.extend_from_slice(&sequence.to_le_bytes());
+            out.extend_from_slice(&timestamp.to_le_bytes());
             out.push(*flags);
             encode_voice_payload(payload, out)?;
         }
@@ -375,33 +385,37 @@ pub fn decode_payload(kind: u8, bytes: &[u8]) -> Result<MediaPayload, MediaError
             })
         }
         KIND_VOICE => {
-            if bytes.len() < 12 {
+            if bytes.len() < 16 {
                 return Err(MediaError::InvalidPayload);
             }
             let stream_id = StreamId(u32::from_le_bytes(bytes[0..4].try_into().unwrap()));
             let sequence = u32::from_le_bytes(bytes[4..8].try_into().unwrap());
-            let flags = bytes[8];
-            let payload = decode_voice_payload(&bytes[9..])?;
+            let timestamp = u32::from_le_bytes(bytes[8..12].try_into().unwrap());
+            let flags = bytes[12];
+            let payload = decode_voice_payload(&bytes[13..])?;
             Ok(MediaPayload::Voice {
                 stream_id,
                 sequence,
+                timestamp,
                 flags,
                 payload,
             })
         }
         KIND_PEER_VOICE => {
-            if bytes.len() < 20 {
+            if bytes.len() < 24 {
                 return Err(MediaError::InvalidPayload);
             }
             let connection_id = u64::from_le_bytes(bytes[0..8].try_into().unwrap());
             let stream_id = StreamId(u32::from_le_bytes(bytes[8..12].try_into().unwrap()));
             let sequence = u32::from_le_bytes(bytes[12..16].try_into().unwrap());
-            let flags = bytes[16];
-            let payload = decode_voice_payload(&bytes[17..])?;
+            let timestamp = u32::from_le_bytes(bytes[16..20].try_into().unwrap());
+            let flags = bytes[20];
+            let payload = decode_voice_payload(&bytes[21..])?;
             Ok(MediaPayload::PeerVoice {
                 connection_id,
                 stream_id,
                 sequence,
+                timestamp,
                 flags,
                 payload,
             })
@@ -519,6 +533,7 @@ mod tests {
         let payload = MediaPayload::Voice {
             stream_id: StreamId(9),
             sequence: 42,
+            timestamp: 40_320,
             flags: 3,
             payload: VoicePayload::Opus(vec![1, 2, 3]),
         };
@@ -532,6 +547,7 @@ mod tests {
             connection_id: 99,
             stream_id: StreamId(9),
             sequence: 42,
+            timestamp: 40_320,
             flags: 3,
             payload: VoicePayload::Opus(vec![1, 2, 3]),
         };
@@ -544,6 +560,7 @@ mod tests {
         let payload = MediaPayload::Voice {
             stream_id: StreamId(9),
             sequence: 42,
+            timestamp: 40_320,
             flags: 3,
             payload: VoicePayload::Silence,
         };
@@ -649,6 +666,7 @@ mod tests {
         let payload = MediaPayload::Voice {
             stream_id: StreamId(5),
             sequence: 9,
+            timestamp: 8_640,
             flags: 0,
             payload: VoicePayload::Opus(vec![1, 2, 3, 4, 5, 6, 7, 8]),
         };

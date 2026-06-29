@@ -928,6 +928,7 @@ impl SimStreamState {
             RemoteVoicePacket {
                 stream_id,
                 sequence,
+                timestamp: sequence.wrapping_mul(LIVE_OPUS_FRAME_SAMPLES as u32),
                 flags: packet.flags,
                 payload: packet.payload,
                 received_at: deliver_at,

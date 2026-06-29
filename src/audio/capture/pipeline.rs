@@ -251,6 +251,11 @@ pub(crate) struct LiveEncoderPipeline {
     last_muted: bool,
     mute_transition_id: u64,
     echo_source: Option<EchoReferenceSource>,
+    /// Media sample clock in 48 kHz samples: the index the next captured sample
+    /// will occupy. Advances by [`FRAME_SAMPLES`] for every accumulated 10 ms
+    /// slot, including suppressed-silence slots, so an emitted packet's
+    /// timestamp reflects true elapsed media time across pauses.
+    next_capture_sample: u32,
 }
 
 #[derive(Clone, Copy)]
@@ -313,6 +318,7 @@ impl LiveEncoderPipeline {
             last_muted: initial_muted,
             mute_transition_id: 0,
             echo_source,
+            next_capture_sample: 0,
         }
     }
 
@@ -402,6 +408,13 @@ impl LiveEncoderPipeline {
         let silence = is_capture_skip_safe_silence(self.tuning, vad, frame);
         stats.store_voice_active(!muted && !silence);
         self.log_mute_state_change_if_needed(muted, frame);
+
+        // Account this 10 ms slot on the media sample clock before any emit, so
+        // packets stamp a timestamp that tracks real elapsed time even when the
+        // slot is suppressed and emits nothing.
+        self.next_capture_sample = self
+            .next_capture_sample
+            .wrapping_add(FRAME_SAMPLES as u32);
 
         // Mute takes precedence over the automatic silence gate: it transitions
         // immediately rather than after the long-silence timeout, and works even
@@ -630,7 +643,16 @@ impl LiveEncoderPipeline {
             let packet_len = payload.len();
             self.sender_silence_active = false;
             self.silence_keepalive_frames = 0;
-            on_packet(LocalVoiceFrame { flags, payload });
+            // The frame's first sample sits at the front of `pending`, whose
+            // index is the running clock minus the still-buffered tail.
+            let timestamp = self
+                .next_capture_sample
+                .wrapping_sub(self.pending_opus_samples.len() as u32);
+            on_packet(LocalVoiceFrame {
+                flags,
+                payload,
+                timestamp,
+            });
             stats.record_encoded_packet(packet_len);
             self.pending_opus_samples.drain(..LIVE_OPUS_FRAME_SAMPLES);
         }
@@ -665,9 +687,15 @@ impl LiveEncoderPipeline {
                 silence_resume_hint_packets = self.silence_resume_hint_packets
             );
         }
+        // The marker stands in for the slot just accounted on the clock, so
+        // stamp that slot's first sample index.
+        let timestamp = self
+            .next_capture_sample
+            .wrapping_sub(FRAME_SAMPLES as u32);
         on_packet(LocalVoiceFrame {
             flags: LIVE_PACKET_FLAG_SILENCE_HINT | extra_flags,
             payload: VoicePayload::Silence,
+            timestamp,
         });
     }
 
@@ -1102,6 +1130,40 @@ mod tests {
             push(&mut pipeline, false, &mut packets);
         }
         (packets, resume_start)
+    }
+
+    #[test]
+    fn capture_timestamp_advances_across_silence() {
+        // The whole point of the media timestamp is that it tracks real elapsed
+        // time even while the sender suppresses audio. A receiver therefore sees
+        // the resume packet jump far past the last pre-mute packet, instead of
+        // the small +1-per-emitted-packet step the sequence number takes.
+        let (packets, resume_start) = drive_mute_episode(true);
+        let opus_timestamps = |slice: &[LocalVoiceFrame]| -> Vec<u32> {
+            slice
+                .iter()
+                .filter(|p| matches!(p.payload, VoicePayload::Opus(_)))
+                .map(|p| p.timestamp)
+                .collect()
+        };
+        let pre = opus_timestamps(&packets[..resume_start]);
+        let post = opus_timestamps(&packets[resume_start..]);
+        assert!(!pre.is_empty() && !post.is_empty());
+
+        // Every packet's timestamp is strictly increasing on the media clock.
+        let all = opus_timestamps(&packets);
+        for window in all.windows(2) {
+            assert!(window[1] > window[0], "timestamps must be monotonic: {all:?}");
+        }
+
+        // Across the ~40-slot muted gap the clock advanced through the silence,
+        // so the resume timestamp jumps well past a single 20 ms opus frame.
+        let last_pre = *pre.last().unwrap();
+        let first_post = post[0];
+        assert!(
+            first_post - last_pre > LIVE_OPUS_FRAME_SAMPLES as u32 * 4,
+            "resume timestamp {first_post} should jump well past pre-mute {last_pre}"
+        );
     }
 
     #[test]

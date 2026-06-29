@@ -1433,6 +1433,7 @@ mod tests {
             RemoteVoicePacket {
                 stream_id: 7,
                 sequence: 12,
+                timestamp: 12 * LIVE_OPUS_FRAME_SAMPLES as u32,
                 flags: LIVE_PACKET_FLAG_SILENCE_HINT,
                 payload: VoicePayload::Silence,
                 received_at: now,
@@ -1464,6 +1465,7 @@ mod tests {
             let packet = RemoteVoicePacket {
                 stream_id: 1,
                 sequence,
+                timestamp: sequence.wrapping_mul(LIVE_OPUS_FRAME_SAMPLES as u32),
                 flags: 0,
                 payload: VoicePayload::Opus(vec![0u8; 8]),
                 received_at,

@@ -1225,6 +1225,7 @@ enum P2pMediaPacket {
     Voice {
         stream_id: StreamId,
         sequence: u32,
+        timestamp: u32,
         flags: u8,
         payload: MediaVoicePayload,
         action: Option<P2pAction>,
@@ -1461,6 +1462,7 @@ impl WorkerState {
                     MediaPayload::Voice {
                         stream_id,
                         sequence,
+                        timestamp,
                         flags,
                         payload,
                     },
@@ -1489,6 +1491,7 @@ impl WorkerState {
                         RemoteVoicePacket {
                             stream_id: stream_id.0,
                             sequence,
+                            timestamp,
                             flags,
                             payload: audio_payload_from_media(payload),
                             received_at: now,
@@ -1753,12 +1756,13 @@ impl WorkerState {
             let relay_payload = MediaPayload::Voice {
                 stream_id,
                 sequence,
+                timestamp: frame.timestamp,
                 flags: frame.flags,
                 payload: media_payload_from_audio(&frame.payload),
             };
             self.send_media(&relay_payload);
         }
-        self.send_p2p_voice(stream_id, sequence, frame.flags, &frame.payload);
+        self.send_p2p_voice(stream_id, sequence, frame.timestamp, frame.flags, &frame.payload);
     }
 
     fn queue_file_upload(&mut self, path: PathBuf) {
@@ -2958,6 +2962,7 @@ impl WorkerState {
                         connection_id,
                         stream_id,
                         sequence,
+                        timestamp,
                         flags,
                         payload,
                     },
@@ -2967,6 +2972,7 @@ impl WorkerState {
                     Ok(P2pMediaPacket::Voice {
                         stream_id,
                         sequence,
+                        timestamp,
                         flags,
                         payload,
                         action,
@@ -2997,6 +3003,7 @@ impl WorkerState {
             Ok(P2pMediaPacket::Voice {
                 stream_id,
                 sequence,
+                timestamp,
                 flags,
                 payload,
                 action,
@@ -3029,6 +3036,7 @@ impl WorkerState {
                     RemoteVoicePacket {
                         stream_id: stream_id.0,
                         sequence,
+                        timestamp,
                         flags,
                         payload: audio_payload_from_media(payload),
                         received_at: now,
@@ -3063,6 +3071,7 @@ impl WorkerState {
         &mut self,
         stream_id: StreamId,
         sequence: u32,
+        timestamp: u32,
         flags: u8,
         audio_payload: &AudioVoicePayload,
     ) {
@@ -3092,6 +3101,7 @@ impl WorkerState {
                 connection_id: route.connection_id,
                 stream_id,
                 sequence,
+                timestamp,
                 flags,
                 payload: media_payload_from_audio(audio_payload),
             };
@@ -4176,6 +4186,7 @@ mod tests {
         RemoteVoicePacket {
             stream_id,
             sequence,
+            timestamp: sequence.wrapping_mul(crate::audio::FRAME_SAMPLES as u32 * 2),
             flags: 0,
             payload: AudioVoicePayload::Opus(payload),
             received_at: Instant::now(),

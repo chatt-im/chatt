@@ -4,6 +4,11 @@ use crate::audio::shared::{
 
 const FS_MULT: usize = SAMPLE_RATE as usize / 8_000;
 const OVERLAP_LENGTH: usize = 5 * FS_MULT;
+/// The number of lookahead samples NetEQ keeps at the end of the sync buffer so
+/// the next Expand/Merge has a crossfade region. Equal to `Expand::overlap_length`
+/// in `expand.cc`; the `GetAudio` loop reinstalls this many samples after each
+/// extraction. Exposed for [`crate::audio::playback::neteq`].
+pub(crate) const EXPAND_OVERLAP_LENGTH: usize = OVERLAP_LENGTH;
 const SIGNAL_LENGTH: usize = 256 * FS_MULT;
 const DISTORTION_LENGTH: usize = 20 * FS_MULT;
 const LPC_ANALYSIS_LENGTH: usize = 160 * FS_MULT;
@@ -191,6 +196,13 @@ impl NetEqConcealment {
 
     pub(crate) fn muted(&self) -> bool {
         self.expand.muted()
+    }
+
+    /// The current expand mute factor in Q14 (16384 == 1.0), as the NetEQ
+    /// decision logic reads it via `Expand::MuteFactor`. Used to populate
+    /// [`crate::audio::playback::neteq`]'s decision status snapshot.
+    pub(crate) fn expand_mute_factor_q14(&self) -> i16 {
+        (self.expand.mute_factor() * 16_384.0).round().clamp(0.0, 16_384.0) as i16
     }
 }
 
