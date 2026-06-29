@@ -363,8 +363,16 @@ impl DecisionLogic {
     }
 
     pub(crate) fn playout_delay_ms(&self, status: &NetEqStatus, tick_timer: &TickTimer) -> i32 {
+        // `target_timestamp` (the sync buffer end timestamp) freezes during Expand
+        // because no decoded samples advance it, exactly as in WebRTC. WebRTC's
+        // timeline convention is `end_timestamp + generated_noise_samples`, so the
+        // synthetic samples played during concealment must be added back. Without
+        // this, Chatt's sustained idle Expand (see `NetEqCore::get_audio`) makes the
+        // playout position look frozen while wall-clock advances, so the estimated
+        // delay grows unbounded and wraps, spuriously driving constant Accelerate.
         let playout_timestamp = status
             .target_timestamp
+            .wrapping_add(status.generated_noise_samples as u32)
             .wrapping_sub(status.sync_buffer_samples as u32);
         self.packet_arrival_history
             .delay_ms(playout_timestamp, tick_timer)

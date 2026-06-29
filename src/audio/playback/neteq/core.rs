@@ -216,8 +216,12 @@ impl NetEqCore {
 
     pub(crate) fn diagnostics(&self) -> NetEqDiagnostics {
         let status = self.status();
+        // Match `DecisionLogic::playout_delay_ms`: the end timestamp freezes during
+        // Expand, so add the synthetic `generated_noise_samples` to recover the true
+        // playout position.
         let playout_timestamp = status
             .target_timestamp
+            .wrapping_add(status.generated_noise_samples as u32)
             .wrapping_sub(status.sync_buffer_samples as u32);
         let next_packet_gap_ms = status.next_packet.map(|packet| {
             let gap_samples = packet.timestamp.wrapping_sub(playout_timestamp) as i32;
@@ -333,13 +337,13 @@ impl NetEqCore {
             }
         }
 
+        let was_first_packet = self.first_packet;
         if self.first_packet {
             self.packet_buffer.flush();
             self.sync_buffer
                 .increase_end_timestamp(main_timestamp.wrapping_sub(self.timestamp));
             self.timestamp = main_timestamp;
             self.first_packet = false;
-            self.new_codec = true;
         }
 
         // Insert each redundancy unit and notify the controller once per unit,
@@ -372,6 +376,15 @@ impl NetEqCore {
             let should_update_stats = !self.new_codec;
             self.decision_logic
                 .packet_arrived(FS_HZ, should_update_stats, &info, &self.tick_timer);
+        }
+
+        // Reference sets `new_codec_` only after the arrival loop, inside the
+        // `first_packet_` block, so the first redundancy unit still records its
+        // arrival statistics (`MaybeChangePayloadType` returns false on the very
+        // first packet). Setting it before the loop dropped the startup arrival
+        // from `PacketArrivalHistory` and skewed the initial delay estimate.
+        if was_first_packet {
+            self.new_codec = true;
         }
         late
     }
@@ -727,8 +740,12 @@ impl NetEqCore {
                 }
             }
             Operation::Merge => {
-                // Merge needs enough future audio to correlate against.
-                required_samples = required_samples.max(SAMPLES_30_MS);
+                // `Merge::RequiredFutureSamples` is `fs_hz / 100` (10 ms), so the
+                // reference computes `max(output_size, output_size)`, leaving
+                // `required_samples` at one output block. Pulling 30 ms here
+                // over-extracted an extra frame on every loss recovery, inflating
+                // the buffer by ~20 ms per merge.
+                required_samples = required_samples.max(OUTPUT_SIZE_SAMPLES);
             }
             _ => {}
         }
@@ -1158,6 +1175,56 @@ mod tests {
         }
         assert!(blocks > 0);
         assert!(total_energy > 0.0, "no audio produced");
+    }
+
+    /// A clip plays, the sender goes idle for a long stretch (NetEQ keeps being
+    /// pulled and sustains Expand), then the clip resumes with a timestamp that
+    /// leaped forward across the silence. The reported playout delay must stay
+    /// bounded throughout: the sync-buffer end timestamp freezes during Expand,
+    /// and folding `generated_noise_samples` back in keeps the playout position
+    /// tracking wall-clock instead of ageing until it wraps (which previously
+    /// drove constant Accelerate and a wildly inflated jitter-buffer readout).
+    #[test]
+    fn silence_then_resume_keeps_playout_delay_bounded() {
+        let mut core = NetEqCore::new(LiveAudioTuning::default()).unwrap();
+        let mut encoder = OpusVoiceEncoder::new(32_000).unwrap();
+        let mut output = vec![0.0; OUTPUT_SIZE_SAMPLES];
+        // Play a clip: 100 packets (2 s) of tone.
+        let mut seq = 0u32;
+        let mut ts = 0u32;
+        for _ in 0..100u32 {
+            let payload = encode_tone(&mut encoder, (seq as usize) * LIVE_OPUS_FRAME_SAMPLES);
+            core.insert_packet(ts, seq, 0, &payload);
+            for _ in 0..2 {
+                core.get_audio(&mut output);
+            }
+            seq += 1;
+            ts += LIVE_OPUS_FRAME_SAMPLES as u32;
+        }
+        // Wait a while: 30 s of silence, NetEQ keeps being pulled (no packets).
+        let mut max_silence = 0u64;
+        for _ in 0..3000 {
+            core.get_audio(&mut output);
+            max_silence = max_silence.max(core.diagnostics().playout_delay_ms);
+        }
+        // Resume the clip. The capture media timestamp advanced across silence,
+        // so the new packet's timestamp leaps forward by the silence duration.
+        ts = ts.wrapping_add(30 * SAMPLE_RATE as u32);
+        let mut max_resume = 0u64;
+        for _ in 0..100u32 {
+            let payload = encode_tone(&mut encoder, (seq as usize) * LIVE_OPUS_FRAME_SAMPLES);
+            core.insert_packet(ts, seq, 0, &payload);
+            for _ in 0..2 {
+                core.get_audio(&mut output);
+                max_resume = max_resume.max(core.diagnostics().playout_delay_ms);
+            }
+            seq += 1;
+            ts += LIVE_OPUS_FRAME_SAMPLES as u32;
+        }
+        assert!(
+            max_silence < 1_000 && max_resume < 1_000,
+            "playout delay aged during sustained expand: silence={max_silence}ms resume={max_resume}ms"
+        );
     }
 
     #[test]
