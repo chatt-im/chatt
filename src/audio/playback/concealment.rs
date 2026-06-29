@@ -467,18 +467,34 @@ impl Expand {
         if self.consecutive_expands == 0 && self.params.onset {
             return;
         }
-        let mut factor = self.params.mute_factor;
+        // Reference `Expand::Process` applies a constant `mute_factor` (Q14
+        // affine) and then a separate window that decays from 1.0 by `mute_slope`
+        // per sample, so the gain at sample `i` is `mute_factor * (1 - i*slope)`
+        // and the carried-over factor is `mute_factor * (1 - lag*slope)`. The
+        // earlier code subtracted `slope` from `mute_factor` directly, which
+        // decays linearly instead of multiplicatively and mutes faster than the
+        // reference from the second expand period onward.
+        let start = self.params.mute_factor;
+        let mut window = 1.0f32;
         for sample in output.iter_mut() {
-            *sample *= factor;
+            *sample *= start * window;
             if !self.stop_muting {
-                factor = (factor - self.params.mute_slope).max(0.0);
+                window = (window - self.params.mute_slope).max(0.0);
             }
         }
         if !self.stop_muting {
-            if self.consecutive_expands > 3 && factor >= self.params.mute_factor {
+            // The reference carries `mute_factor` in Q14, so once the geometric
+            // decay rounds below half an LSB it snaps to zero. Float decay
+            // approaches zero asymptotically, so reproduce the flush to let the
+            // expand reach the muted state instead of decaying forever.
+            let mut gain = start * window;
+            if gain < 0.5 / 16384.0 {
+                gain = 0.0;
+            }
+            if self.consecutive_expands > 3 && gain >= start {
                 self.params.mute_factor = 0.0;
             } else {
-                self.params.mute_factor = factor;
+                self.params.mute_factor = gain;
             }
         }
     }
@@ -738,7 +754,11 @@ fn pitch_analysis(signal: &[f32]) -> PitchAnalysis {
 
 fn merge_correlation_offset(input: &[f32], expanded: &[f32], max_lag: usize) -> usize {
     let length = (40 * FS_MULT).min(input.len()).min(expanded.len()).max(1);
-    let stop = (max_lag / 2 + 1)
+    // Reference `Merge::CorrelateAndPeakSearch` searches lags up to
+    // `max_lag / (fs_mult*2) + 1` in the 4 kHz domain, i.e. roughly `max_lag`
+    // full-rate samples. Capping at `max_lag / 2` covered only half the range
+    // and could miss the best stitch offset for long (low-pitch) periods.
+    let stop = (max_lag + 1)
         .min(MERGE_CORRELATION_LENGTH)
         .min(expanded.len().saturating_sub(length));
     let mut best = 0usize;

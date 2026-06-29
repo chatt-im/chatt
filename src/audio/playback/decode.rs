@@ -887,9 +887,15 @@ mod tests {
         for _ in 0..700 {
             stream.core.get_audio(&mut output);
         }
+        // Sustained idle Expand freezes the sync-buffer end timestamp, but
+        // `playout_delay_ms` now folds in `generated_noise_samples` so the playout
+        // position tracks wall-clock instead of ageing. The delay stays bounded
+        // even without any explicit sender-silence signal, so it never wraps and
+        // never spuriously drives Accelerate.
         assert!(
-            stream.core.diagnostics().playout_delay_ms > 1_000,
-            "test setup should reproduce the aged arrival-history delay"
+            stream.core.diagnostics().playout_delay_ms < 500,
+            "playout delay aged during sustained expand: {}ms",
+            stream.core.diagnostics().playout_delay_ms,
         );
 
         stream.observe_sender_silence(7, 99, true, now + Duration::from_secs(7));
