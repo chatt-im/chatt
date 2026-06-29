@@ -95,7 +95,10 @@ pub struct VoiceFeedback {
     pub duplicate_packets: u16,
     pub reordered_packets: u16,
     pub window_ms: u16,
-    pub max_queue_ms: u16,
+    pub max_output_ring_ms: u16,
+    pub max_neteq_target_ms: u16,
+    pub max_neteq_playout_delay_ms: u16,
+    pub max_neteq_packet_buffer_ms: u16,
     pub max_interarrival_jitter_ms: u16,
 }
 
@@ -421,7 +424,7 @@ pub fn decode_payload(kind: u8, bytes: &[u8]) -> Result<MediaPayload, MediaError
             })
         }
         KIND_VOICE_FEEDBACK => {
-            if bytes.len() != 24 {
+            if bytes.len() != 30 {
                 return Err(MediaError::InvalidPayload);
             }
             Ok(MediaPayload::VoiceFeedback {
@@ -430,7 +433,7 @@ pub fn decode_payload(kind: u8, bytes: &[u8]) -> Result<MediaPayload, MediaError
             })
         }
         KIND_PEER_VOICE_FEEDBACK => {
-            if bytes.len() != 32 {
+            if bytes.len() != 38 {
                 return Err(MediaError::InvalidPayload);
             }
             Ok(MediaPayload::PeerVoiceFeedback {
@@ -462,7 +465,10 @@ fn encode_voice_feedback(feedback: VoiceFeedback, out: &mut Vec<u8>) {
     out.extend_from_slice(&feedback.duplicate_packets.to_le_bytes());
     out.extend_from_slice(&feedback.reordered_packets.to_le_bytes());
     out.extend_from_slice(&feedback.window_ms.to_le_bytes());
-    out.extend_from_slice(&feedback.max_queue_ms.to_le_bytes());
+    out.extend_from_slice(&feedback.max_output_ring_ms.to_le_bytes());
+    out.extend_from_slice(&feedback.max_neteq_target_ms.to_le_bytes());
+    out.extend_from_slice(&feedback.max_neteq_playout_delay_ms.to_le_bytes());
+    out.extend_from_slice(&feedback.max_neteq_packet_buffer_ms.to_le_bytes());
     out.extend_from_slice(&feedback.max_interarrival_jitter_ms.to_le_bytes());
 }
 
@@ -508,7 +514,7 @@ fn decode_voice_payload(bytes: &[u8]) -> Result<VoicePayload, MediaError> {
 }
 
 fn decode_voice_feedback(bytes: &[u8]) -> Result<VoiceFeedback, MediaError> {
-    if bytes.len() != 20 {
+    if bytes.len() != 26 {
         return Err(MediaError::InvalidPayload);
     }
     Ok(VoiceFeedback {
@@ -519,8 +525,11 @@ fn decode_voice_feedback(bytes: &[u8]) -> Result<VoiceFeedback, MediaError> {
         duplicate_packets: u16::from_le_bytes(bytes[10..12].try_into().unwrap()),
         reordered_packets: u16::from_le_bytes(bytes[12..14].try_into().unwrap()),
         window_ms: u16::from_le_bytes(bytes[14..16].try_into().unwrap()),
-        max_queue_ms: u16::from_le_bytes(bytes[16..18].try_into().unwrap()),
-        max_interarrival_jitter_ms: u16::from_le_bytes(bytes[18..20].try_into().unwrap()),
+        max_output_ring_ms: u16::from_le_bytes(bytes[16..18].try_into().unwrap()),
+        max_neteq_target_ms: u16::from_le_bytes(bytes[18..20].try_into().unwrap()),
+        max_neteq_playout_delay_ms: u16::from_le_bytes(bytes[20..22].try_into().unwrap()),
+        max_neteq_packet_buffer_ms: u16::from_le_bytes(bytes[22..24].try_into().unwrap()),
+        max_interarrival_jitter_ms: u16::from_le_bytes(bytes[24..26].try_into().unwrap()),
     })
 }
 
@@ -578,7 +587,10 @@ mod tests {
             duplicate_packets: 1,
             reordered_packets: 3,
             window_ms: 500,
-            max_queue_ms: 240,
+            max_output_ring_ms: 240,
+            max_neteq_target_ms: 120,
+            max_neteq_playout_delay_ms: 160,
+            max_neteq_packet_buffer_ms: 80,
             max_interarrival_jitter_ms: 87,
         };
         let payload = MediaPayload::VoiceFeedback {
@@ -602,7 +614,10 @@ mod tests {
             duplicate_packets: 2,
             reordered_packets: 4,
             window_ms: 501,
-            max_queue_ms: 241,
+            max_output_ring_ms: 241,
+            max_neteq_target_ms: 121,
+            max_neteq_playout_delay_ms: 161,
+            max_neteq_packet_buffer_ms: 81,
             max_interarrival_jitter_ms: 88,
         };
         let payload = MediaPayload::PeerVoiceFeedback {

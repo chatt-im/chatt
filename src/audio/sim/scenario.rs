@@ -181,17 +181,17 @@ pub struct LiveAudioSimulationReport {
     pub max_adjacent_delta: f32,
     pub non_finite_samples: u64,
     pub clipped_samples: u64,
-    pub max_queue_ms: u64,
-    pub max_playout_delay_ms: u64,
-    pub queue_area_ms: f64,
-    pub playout_delay_area_ms: f64,
-    pub steady_state_max_queue_ms: u64,
-    pub steady_state_avg_queue_ms: f64,
-    pub steady_state_max_playout_delay_ms: u64,
-    pub steady_state_avg_playout_delay_ms: f64,
-    /// Minimum adaptive playout target observed over the steady-state tail
-    /// window, in milliseconds. Captures how far the dynamic target relaxed.
-    pub steady_state_adaptive_target_ms: u64,
+    pub max_output_ring_ms: u64,
+    pub neteq_playout_delay_ms: u64,
+    pub output_ring_area_ms: f64,
+    pub neteq_playout_delay_area_ms: f64,
+    pub steady_state_max_output_ring_ms: u64,
+    pub steady_state_avg_output_ring_ms: f64,
+    pub steady_state_max_neteq_playout_delay_ms: u64,
+    pub steady_state_avg_neteq_playout_delay_ms: f64,
+    /// Minimum NetEQ target observed over the steady-state tail window, in
+    /// milliseconds. Captures how far the delay manager relaxed.
+    pub steady_state_min_neteq_target_ms: u64,
     /// Underrun episodes observed over the steady-state tail window, excluding
     /// startup priming.
     pub steady_state_underruns: u64,

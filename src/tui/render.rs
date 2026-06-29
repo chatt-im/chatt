@@ -560,8 +560,12 @@ fn room_user_voice_feedback_label(participant: &ParticipantState) -> String {
         return String::new();
     }
     format!(
-        "loss{} q{} j{}",
-        feedback.loss_percent, feedback.max_queue_ms, feedback.max_interarrival_jitter_ms
+        "loss{} jb{}/{} r{} j{}",
+        feedback.loss_percent,
+        feedback.max_neteq_playout_delay_ms,
+        feedback.max_neteq_target_ms,
+        feedback.max_output_ring_ms,
+        feedback.max_interarrival_jitter_ms
     )
 }
 

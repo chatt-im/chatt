@@ -28,4 +28,4 @@ mod redundancy;
 mod sync_buffer;
 mod tick_timer;
 
-pub(crate) use core::{AudioResult, NetEqCore};
+pub(crate) use core::{AudioResult, NetEqCore, NetEqDiagnostics};

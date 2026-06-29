@@ -1299,7 +1299,8 @@ impl EncoderFeedbackController {
             60 if self.smoothed_loss < 0.45 => Some(LiveEncoderProfile::DRED_50),
             50 if self.smoothed_loss < 0.30 => Some(LiveEncoderProfile::DRED_35),
             35 if self.smoothed_loss < 0.15
-                && feedback.max_queue_ms < 200
+                && feedback.max_neteq_target_ms < 200
+                && feedback.max_neteq_playout_delay_ms < 200
                 && feedback.max_interarrival_jitter_ms < 50 =>
             {
                 Some(LiveEncoderProfile::DRED_20)
@@ -1671,7 +1672,10 @@ impl WorkerState {
                     duplicate_packets = feedback.duplicate_packets,
                     reordered_packets = feedback.reordered_packets,
                     window_ms = feedback.window_ms,
-                    max_queue_ms = feedback.max_queue_ms,
+                    max_output_ring_ms = feedback.max_output_ring_ms,
+                    max_neteq_target_ms = feedback.max_neteq_target_ms,
+                    max_neteq_playout_delay_ms = feedback.max_neteq_playout_delay_ms,
+                    max_neteq_packet_buffer_ms = feedback.max_neteq_packet_buffer_ms,
                     max_interarrival_jitter_ms = feedback.max_interarrival_jitter_ms
                 );
                 let owner = self.p2p_stream_owners.get(&stream_id).copied();
@@ -3178,7 +3182,10 @@ impl WorkerState {
             duplicate_packets = feedback.duplicate_packets,
             reordered_packets = feedback.reordered_packets,
             window_ms = feedback.window_ms,
-            max_queue_ms = feedback.max_queue_ms,
+            max_output_ring_ms = feedback.max_output_ring_ms,
+            max_neteq_target_ms = feedback.max_neteq_target_ms,
+            max_neteq_playout_delay_ms = feedback.max_neteq_playout_delay_ms,
+            max_neteq_packet_buffer_ms = feedback.max_neteq_packet_buffer_ms,
             max_interarrival_jitter_ms = feedback.max_interarrival_jitter_ms
         );
         if self.active_stream != Some(StreamId(feedback.stream_id)) {
@@ -3333,7 +3340,10 @@ fn media_feedback_from_live(feedback: LivePlaybackFeedback) -> media::VoiceFeedb
         duplicate_packets: feedback.duplicate_packets,
         reordered_packets: feedback.reordered_packets,
         window_ms: feedback.window_ms,
-        max_queue_ms: feedback.max_queue_ms,
+        max_output_ring_ms: feedback.max_output_ring_ms,
+        max_neteq_target_ms: feedback.max_neteq_target_ms,
+        max_neteq_playout_delay_ms: feedback.max_neteq_playout_delay_ms,
+        max_neteq_packet_buffer_ms: feedback.max_neteq_packet_buffer_ms,
         max_interarrival_jitter_ms: feedback.max_interarrival_jitter_ms,
     }
 }
@@ -3351,7 +3361,10 @@ fn live_feedback_from_media(
         duplicate_packets: feedback.duplicate_packets,
         reordered_packets: feedback.reordered_packets,
         window_ms: feedback.window_ms,
-        max_queue_ms: feedback.max_queue_ms,
+        max_output_ring_ms: feedback.max_output_ring_ms,
+        max_neteq_target_ms: feedback.max_neteq_target_ms,
+        max_neteq_playout_delay_ms: feedback.max_neteq_playout_delay_ms,
+        max_neteq_packet_buffer_ms: feedback.max_neteq_packet_buffer_ms,
         max_interarrival_jitter_ms: feedback.max_interarrival_jitter_ms,
     }
 }
@@ -4167,7 +4180,7 @@ mod tests {
         expected_packets: u16,
         lost_packets: u16,
         late_packets: u16,
-        max_queue_ms: u16,
+        max_output_ring_ms: u16,
         max_interarrival_jitter_ms: u16,
     ) -> LivePlaybackFeedback {
         LivePlaybackFeedback {
@@ -4179,7 +4192,10 @@ mod tests {
             duplicate_packets: 0,
             reordered_packets: 0,
             window_ms: 500,
-            max_queue_ms,
+            max_output_ring_ms,
+            max_neteq_target_ms: max_output_ring_ms,
+            max_neteq_playout_delay_ms: max_output_ring_ms,
+            max_neteq_packet_buffer_ms: 0,
             max_interarrival_jitter_ms,
         }
     }

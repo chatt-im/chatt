@@ -158,9 +158,9 @@ pub(crate) const LIVE_PACKET_FLAG_SILENCE_RESUME: u8 = 0x04;
 pub(crate) const LIVE_PACKET_FLAG_MUTE: u8 = 0x08;
 pub(crate) const CALLBACK_QUEUE_CAPACITY: usize = 8;
 pub(crate) const LIVE_PLAYBACK_COMMAND_CAPACITY: usize = 256;
-pub(crate) const LIVE_PLAYBACK_TARGET_QUEUE: Duration = Duration::from_millis(60);
-pub(crate) const LIVE_PLAYBACK_DYNAMIC_TARGET_FLOOR: Duration = Duration::from_millis(20);
-pub(crate) const LIVE_PLAYBACK_MAX_TARGET: Duration = Duration::from_millis(1_000);
+pub(crate) const LIVE_NETEQ_START_DELAY: Duration = Duration::from_millis(60);
+pub(crate) const LIVE_NETEQ_MIN_DELAY: Duration = Duration::from_millis(20);
+pub(crate) const LIVE_NETEQ_MAX_DELAY: Duration = Duration::from_millis(1_000);
 // A lone playout underrun is usually a talkspurt draining to empty, not network
 // starvation. The target only re-widens when underruns recur: at least this
 // many within the window below. Each starvation episode produces one underrun
@@ -298,17 +298,20 @@ pub struct LivePlaybackFeedback {
     pub duplicate_packets: u16,
     pub reordered_packets: u16,
     pub window_ms: u16,
-    pub max_queue_ms: u16,
+    pub max_output_ring_ms: u16,
+    pub max_neteq_target_ms: u16,
+    pub max_neteq_playout_delay_ms: u16,
+    pub max_neteq_packet_buffer_ms: u16,
     pub max_interarrival_jitter_ms: u16,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct LiveAudioTuning {
     pub capture_silence_gate: bool,
-    pub target_queue: Duration,
-    pub dynamic_target_floor: Duration,
-    pub base_minimum_target: Duration,
-    pub max_target: Duration,
+    pub neteq_start_delay: Duration,
+    pub neteq_min_delay: Duration,
+    pub neteq_base_minimum_delay: Duration,
+    pub neteq_max_delay: Duration,
     pub hard_queue_bound: Duration,
     pub initial_buffer: Duration,
     pub max_reorder_delay: Duration,
@@ -323,10 +326,10 @@ impl Default for LiveAudioTuning {
     fn default() -> Self {
         Self {
             capture_silence_gate: true,
-            target_queue: LIVE_PLAYBACK_TARGET_QUEUE,
-            dynamic_target_floor: LIVE_PLAYBACK_DYNAMIC_TARGET_FLOOR,
-            base_minimum_target: Duration::ZERO,
-            max_target: LIVE_PLAYBACK_MAX_TARGET,
+            neteq_start_delay: LIVE_NETEQ_START_DELAY,
+            neteq_min_delay: LIVE_NETEQ_MIN_DELAY,
+            neteq_base_minimum_delay: Duration::ZERO,
+            neteq_max_delay: LIVE_NETEQ_MAX_DELAY,
             hard_queue_bound: LIVE_PLAYBACK_HARD_QUEUE_BOUND,
             initial_buffer: LIVE_PLAYBACK_INITIAL_BUFFER,
             max_reorder_delay: LIVE_PLAYBACK_MAX_REORDER_DELAY,
@@ -341,15 +344,15 @@ impl Default for LiveAudioTuning {
 
 impl LiveAudioTuning {
     pub fn validate(self) -> Result<(), String> {
-        validate_duration_ms("target-queue-ms", self.target_queue, 20, 1_000)?;
+        validate_duration_ms("neteq-start-delay-ms", self.neteq_start_delay, 20, 1_000)?;
+        validate_duration_ms("neteq-min-delay-ms", self.neteq_min_delay, 20, 1_000)?;
         validate_duration_ms(
-            "dynamic-target-floor-ms",
-            self.dynamic_target_floor,
-            20,
-            1_000,
+            "neteq-base-minimum-delay-ms",
+            self.neteq_base_minimum_delay,
+            0,
+            2_000,
         )?;
-        validate_duration_ms("base-minimum-target-ms", self.base_minimum_target, 0, 2_000)?;
-        validate_duration_ms("max-target-ms", self.max_target, 20, 2_000)?;
+        validate_duration_ms("neteq-max-delay-ms", self.neteq_max_delay, 20, 2_000)?;
         validate_duration_ms("hard-queue-bound-ms", self.hard_queue_bound, 40, 5_000)?;
         validate_duration_ms("initial-buffer-ms", self.initial_buffer, 0, 500)?;
         validate_duration_ms("max-reorder-delay-ms", self.max_reorder_delay, 0, 500)?;
@@ -367,26 +370,28 @@ impl LiveAudioTuning {
             1_000,
         )?;
         validate_duration_ms("capture-silence-ramp-ms", self.capture_silence_ramp, 0, 100)?;
-        if self.hard_queue_bound < self.target_queue {
-            return Err("hard-queue-bound-ms must be at least target-queue-ms".to_string());
+        if self.hard_queue_bound < self.neteq_start_delay {
+            return Err("hard-queue-bound-ms must be at least neteq-start-delay-ms".to_string());
         }
-        if self.dynamic_target_floor > self.target_queue {
-            return Err("dynamic-target-floor-ms must not exceed target-queue-ms".to_string());
+        if self.neteq_min_delay > self.neteq_start_delay {
+            return Err("neteq-min-delay-ms must not exceed neteq-start-delay-ms".to_string());
         }
-        if self.base_minimum_target > self.max_target {
-            return Err("base-minimum-target-ms must not exceed max-target-ms".to_string());
+        if self.neteq_base_minimum_delay > self.neteq_max_delay {
+            return Err(
+                "neteq-base-minimum-delay-ms must not exceed neteq-max-delay-ms".to_string(),
+            );
         }
-        if self.max_target < self.target_queue {
-            return Err("max-target-ms must be at least target-queue-ms".to_string());
+        if self.neteq_max_delay < self.neteq_start_delay {
+            return Err("neteq-max-delay-ms must be at least neteq-start-delay-ms".to_string());
         }
-        if self.hard_queue_bound < self.max_target {
-            return Err("hard-queue-bound-ms must be at least max-target-ms".to_string());
+        if self.hard_queue_bound < self.neteq_max_delay {
+            return Err("hard-queue-bound-ms must be at least neteq-max-delay-ms".to_string());
         }
         let capacity_target_cap =
             Duration::from_millis(duration_to_ms(self.hard_queue_bound).saturating_mul(3) / 4);
-        if self.dynamic_target_floor.max(self.base_minimum_target) > capacity_target_cap {
+        if self.neteq_min_delay.max(self.neteq_base_minimum_delay) > capacity_target_cap {
             return Err(
-                "dynamic-target-floor-ms/base-minimum-target-ms must not exceed 75% of hard-queue-bound-ms"
+                "neteq-min-delay-ms/neteq-base-minimum-delay-ms must not exceed 75% of hard-queue-bound-ms"
                     .to_string(),
             );
         }
@@ -576,13 +581,25 @@ pub struct LivePlaybackStreamActivity {
 pub struct LivePlaybackSnapshot {
     pub active_streams: usize,
     pub stream_activity: Vec<LivePlaybackStreamActivity>,
-    pub queued_samples: usize,
-    pub max_queue_ms: u64,
-    pub max_playout_delay_ms: u64,
+    pub output_ring_samples: usize,
+    pub max_output_ring_ms: u64,
+    pub neteq_playout_delay_ms: u64,
+    pub neteq_sync_buffer_ms: u64,
+    pub neteq_packet_buffer_ms: u64,
+    pub neteq_packet_buffer_wait_ms: u64,
+    pub neteq_packets_buffered: usize,
+    pub neteq_next_packet_gap_ms: Option<i64>,
     pub backend_block_ms: u64,
     pub playout_quantum_ms: u64,
-    pub target_queue_ms: u64,
-    pub adaptive_target_ms: u64,
+    pub neteq_start_delay_ms: u64,
+    pub neteq_target_ms: u64,
+    pub neteq_target_delta_5s_ms: i64,
+    pub neteq_playout_delta_5s_ms: i64,
+    pub neteq_decision: String,
+    pub neteq_decision_reason: String,
+    pub dred_last_horizon_ms: u64,
+    pub dred_missed_horizon_count: u64,
+    pub dred_missed_horizon_ms: u64,
     pub hard_trim_count: u64,
     pub underrun_count: u64,
     pub dred_recoveries: u64,
@@ -795,8 +812,8 @@ pub(crate) struct PlayoutDelay {
     pub(crate) peak: Duration,
 }
 
-pub(crate) fn target_queue_samples(tuning: LiveAudioTuning) -> usize {
-    samples_for_duration(tuning.target_queue)
+pub(crate) fn neteq_start_delay_samples(tuning: LiveAudioTuning) -> usize {
+    samples_for_duration(tuning.neteq_start_delay)
 }
 
 pub(crate) fn samples_for_duration(duration: Duration) -> usize {
@@ -1127,20 +1144,20 @@ pub(crate) fn trace_decode_output(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn trace_mixer_queue(
+pub(crate) fn trace_mixer_output_ring(
     trace: &mut Option<LiveAudioTraceWriter>,
     start: Instant,
     now: Instant,
     stream_id: u32,
     source: DecodedFrameSource,
     samples: &[f32],
-    max_queue_ms: u64,
+    max_output_ring_ms: u64,
 ) {
     let Some(trace) = trace else {
         return;
     };
     trace.write_event(jsony::object! {
-        event: "mixer_queue",
+        event: "mixer_output_ring",
         time_ms: trace_time_ms(start, now),
         stream_id,
         source: trace_source_name(source),
@@ -1148,7 +1165,7 @@ pub(crate) fn trace_mixer_queue(
         rms: rms_normalized(samples),
         peak: peak_normalized(samples),
         max_delta: max_adjacent_delta(samples),
-        max_queue_ms,
+        max_output_ring_ms,
     });
 }
 

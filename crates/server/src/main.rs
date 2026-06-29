@@ -2597,7 +2597,10 @@ impl Server {
             expected = feedback.expected_packets,
             lost = feedback.lost_packets,
             late = feedback.late_packets,
-            queue_ms = feedback.max_queue_ms
+            output_ring_ms = feedback.max_output_ring_ms,
+            neteq_target_ms = feedback.max_neteq_target_ms,
+            neteq_playout_delay_ms = feedback.max_neteq_playout_delay_ms,
+            neteq_packet_buffer_ms = feedback.max_neteq_packet_buffer_ms
         );
         self.send_udp_payload(
             owner_session_id,

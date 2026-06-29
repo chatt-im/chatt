@@ -3588,7 +3588,7 @@ mod tests {
         assert_eq!(audio_restart_flags(&base, &output_device), (false, true));
 
         let mut latency = base.clone();
-        latency.latency.target_queue_ms += 10;
+        latency.latency.neteq_start_delay_ms += 10;
         assert_eq!(audio_restart_flags(&base, &latency), (true, true));
     }
 

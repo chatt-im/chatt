@@ -60,5 +60,8 @@ pub(crate) struct PacketArrivedInfo {
 pub(crate) struct ControllerConfig {
     pub allow_time_stretching: bool,
     pub max_packets_in_buffer: i32,
+    pub start_delay_ms: i32,
+    pub min_delay_ms: i32,
     pub base_min_delay_ms: i32,
+    pub max_delay_ms: i32,
 }

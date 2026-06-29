@@ -21,7 +21,7 @@ const LIVE_PLAYBACK_PREALLOCATED_STREAMS: usize = 32;
 /// thread.
 const LIVE_PLAYBACK_MIX_SCRATCH: usize = 8_192;
 /// Conceal tiny producer/callback edge misses without escalating them into
-/// adaptive-target underruns. At 48 kHz the floor is 2 ms; larger host periods
+/// output-ring underruns. At 48 kHz the floor is 2 ms; larger host periods
 /// may conceal up to 10% of the callback, which is still bounded to the current
 /// callback and does not add queued latency.
 const SHORT_RING_CONCEALMENT_FLOOR_SAMPLES: usize = 96;
@@ -142,8 +142,8 @@ impl LivePlaybackMixer {
         self.last_snapshot.clone()
     }
 
-    pub(crate) fn queued_samples(&self) -> usize {
-        self.last_snapshot.queued_samples
+    pub(crate) fn output_ring_samples(&self) -> usize {
+        self.last_snapshot.output_ring_samples
     }
 
     /// Diagnostics logging now lives on the producer; kept as a no-op so the
@@ -348,9 +348,13 @@ impl LivePlaybackMixer {
                 first_sample,
                 last_sample = out.last().copied().unwrap_or_default(),
                 active_streams = self.streams.len(),
-                queued_samples = self.last_snapshot.queued_samples,
-                max_queue_ms = self.last_snapshot.max_queue_ms,
-                target_queue_ms = self.last_snapshot.target_queue_ms,
+                output_ring_samples = self.last_snapshot.output_ring_samples,
+                max_output_ring_ms = self.last_snapshot.max_output_ring_ms,
+                neteq_start_delay_ms = self.last_snapshot.neteq_start_delay_ms,
+                neteq_target_ms = self.last_snapshot.neteq_target_ms,
+                neteq_playout_delay_ms = self.last_snapshot.neteq_playout_delay_ms,
+                neteq_packet_buffer_ms = self.last_snapshot.neteq_packet_buffer_ms,
+                neteq_decision = self.last_snapshot.neteq_decision.as_str(),
                 underrun_count = self.last_snapshot.underrun_count,
                 backend_xruns = self.last_snapshot.backend_xruns
             );
@@ -457,10 +461,10 @@ impl LivePlaybackSharedSnapshot {
             .unwrap_or_default()
     }
 
-    pub(crate) fn queued_samples(&self) -> usize {
+    pub(crate) fn output_ring_samples(&self) -> usize {
         self.inner
             .lock()
-            .map(|inner| inner.snapshot.queued_samples)
+            .map(|inner| inner.snapshot.output_ring_samples)
             .unwrap_or_default()
     }
 

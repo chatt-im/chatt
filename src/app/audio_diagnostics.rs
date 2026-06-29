@@ -24,20 +24,25 @@ impl AudioDiagnostics {
 
     pub(crate) fn status_summary(&self) -> String {
         format!(
-            "audio queue {}ms target {}ms, rx {} packets / {}",
-            self.snapshot.max_queue_ms,
-            self.snapshot.adaptive_target_ms,
+            "audio neteq {}ms target {}ms, rx {} packets / {}",
+            self.snapshot.neteq_playout_delay_ms,
+            self.snapshot.neteq_target_ms,
             self.voice_packets_received,
             format_bytes_compact(self.voice_bytes_received)
         )
     }
 
     pub(crate) fn notice_body(&self) -> String {
-        let base_target = if self.snapshot.adaptive_target_ms == self.snapshot.target_queue_ms {
+        let base_target = if self.snapshot.neteq_target_ms == self.snapshot.neteq_start_delay_ms {
             String::new()
         } else {
-            format!(" (base {}ms)", self.snapshot.target_queue_ms)
+            format!(" start {}ms", self.snapshot.neteq_start_delay_ms)
         };
+        let next_gap = self
+            .snapshot
+            .neteq_next_packet_gap_ms
+            .map(format_signed_ms)
+            .unwrap_or_else(|| "none".to_string());
         let backend = if self.snapshot.backend_stream_errors == 0 {
             "backend: no stream errors".to_string()
         } else {
@@ -54,25 +59,47 @@ impl AudioDiagnostics {
         };
 
         format!(
-            "playback\n  queue: max {}ms, target {}ms{}\n  timing: accelerate {}ms / {}, expand {}ms / {}\n  recovery: dred {}, plc {}, trims {}, underruns {}\n  active streams: {}, queued {} samples\nnetwork\n  voice rx: {} packets / {}\nencoder\n  profile: {}\n{}",
-            self.snapshot.max_queue_ms,
-            self.snapshot.adaptive_target_ms,
+            "playback\n  output: ring max {}ms, queued {} samples, callback {}ms\n  neteq: playout {}ms ({} / 5s), target {}ms{} ({} / 5s)\n  buffers: decoded {}ms, packets wait {}ms span {}ms / {} pkts, next gap {}\n  decision: {} ({})\n  timing: accelerate {}ms / {}, expand {}ms / {}\n  recovery: dred {}, horizon {}ms, missed {}ms / {}, plc {}, trims {}, underruns {}\n  active streams: {}\nnetwork\n  voice rx: {} packets / {}\nencoder\n  profile: {}\n{}",
+            self.snapshot.max_output_ring_ms,
+            self.snapshot.output_ring_samples,
+            self.snapshot.backend_block_ms,
+            self.snapshot.neteq_playout_delay_ms,
+            format_signed_ms(self.snapshot.neteq_playout_delta_5s_ms),
+            self.snapshot.neteq_target_ms,
             base_target,
+            format_signed_ms(self.snapshot.neteq_target_delta_5s_ms),
+            self.snapshot.neteq_sync_buffer_ms,
+            self.snapshot.neteq_packet_buffer_wait_ms,
+            self.snapshot.neteq_packet_buffer_ms,
+            self.snapshot.neteq_packets_buffered,
+            next_gap,
+            self.snapshot.neteq_decision,
+            self.snapshot.neteq_decision_reason,
             live_samples_to_ms(self.snapshot.accelerate_samples as usize),
             self.snapshot.accelerate_count,
             live_samples_to_ms(self.snapshot.expand_samples as usize),
             self.snapshot.expand_count,
             self.snapshot.dred_recoveries,
+            self.snapshot.dred_last_horizon_ms,
+            self.snapshot.dred_missed_horizon_ms,
+            self.snapshot.dred_missed_horizon_count,
             self.snapshot.plc_fallbacks,
             self.snapshot.hard_trim_count,
             self.snapshot.underrun_count,
             self.snapshot.active_streams,
-            self.snapshot.queued_samples,
             self.voice_packets_received,
             format_bytes_compact(self.voice_bytes_received),
             self.encoder_profile.label(),
             backend
         )
+    }
+}
+
+fn format_signed_ms(value: i64) -> String {
+    if value >= 0 {
+        format!("+{value}ms")
+    } else {
+        format!("{value}ms")
     }
 }
 
@@ -100,8 +127,8 @@ mod tests {
     fn status_summary_stays_compact() {
         let report = AudioDiagnostics::new(
             LivePlaybackSnapshot {
-                max_queue_ms: 42,
-                adaptive_target_ms: 60,
+                max_output_ring_ms: 42,
+                neteq_target_ms: 60,
                 ..Default::default()
             },
             LiveEncoderProfile::DRED_20,
@@ -118,9 +145,9 @@ mod tests {
     fn notice_contains_structured_sections() {
         let report = AudioDiagnostics::new(
             LivePlaybackSnapshot {
-                max_queue_ms: 42,
-                adaptive_target_ms: 60,
-                target_queue_ms: 40,
+                max_output_ring_ms: 42,
+                neteq_target_ms: 60,
+                neteq_start_delay_ms: 40,
                 dred_recoveries: 2,
                 plc_fallbacks: 1,
                 ..Default::default()

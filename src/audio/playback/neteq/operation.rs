@@ -23,6 +23,24 @@ pub(crate) enum Operation {
     Undefined,
 }
 
+impl Operation {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Operation::Normal => "normal",
+            Operation::Merge => "merge",
+            Operation::Expand => "expand",
+            Operation::Accelerate => "accelerate",
+            Operation::FastAccelerate => "fast_accelerate",
+            Operation::PreemptiveExpand => "preemptive_expand",
+            Operation::Rfc3389Cng => "rfc3389_cng",
+            Operation::Rfc3389CngNoPacket => "rfc3389_cng_no_packet",
+            Operation::CodecInternalCng => "codec_internal_cng",
+            Operation::Dtmf => "dtmf",
+            Operation::Undefined => "undefined",
+        }
+    }
+}
+
 /// What the `GetAudio` loop actually did, reported back as `last_mode`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Mode {
@@ -44,6 +62,26 @@ pub(crate) enum Mode {
 }
 
 impl Mode {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Mode::Normal => "normal",
+            Mode::Expand => "expand",
+            Mode::Merge => "merge",
+            Mode::AccelerateSuccess => "accelerate_success",
+            Mode::AccelerateLowEnergy => "accelerate_low_energy",
+            Mode::AccelerateFail => "accelerate_fail",
+            Mode::PreemptiveExpandSuccess => "preemptive_expand_success",
+            Mode::PreemptiveExpandLowEnergy => "preemptive_expand_low_energy",
+            Mode::PreemptiveExpandFail => "preemptive_expand_fail",
+            Mode::Rfc3389Cng => "rfc3389_cng",
+            Mode::CodecInternalCng => "codec_internal_cng",
+            Mode::CodecPlc => "codec_plc",
+            Mode::Dtmf => "dtmf",
+            Mode::Error => "error",
+            Mode::Undefined => "undefined",
+        }
+    }
+
     /// Whether the mode is a successful time-stretch (accelerate or preemptive
     /// expand), used to arm the timescale refractory. Port of `IsTimestretch`.
     pub(crate) fn is_timestretch(self) -> bool {
