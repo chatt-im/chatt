@@ -222,8 +222,9 @@ pub(crate) fn run_live_audio_direct_sample_simulation_output_inner(
     let frame_count = input_pcm.len().div_ceil(FRAME_SAMPLES);
     let frame_duration = Duration::from_secs_f64(FRAME_SAMPLES as f64 / SAMPLE_RATE as f64);
     let input_duration = frame_duration.saturating_mul(frame_count as u32);
-    let drain_duration =
-        config.tuning.initial_buffer + config.tuning.max_reorder_delay + config.tuning.target_queue;
+    let drain_duration = config.tuning.initial_buffer
+        + config.tuning.max_reorder_delay
+        + config.tuning.neteq_start_delay;
     let drain_frames = frames_for_duration(drain_duration).saturating_add(2);
     let sim_config = LiveAudioSimulationConfig {
         scenario: LiveAudioSimulationScenario::ConstantSpeech,
@@ -311,13 +312,14 @@ pub(crate) fn run_live_audio_direct_sample_simulation_output_inner(
         }
         let snapshot = mixer.snapshot_at(now);
         trace_output_window(trace, start, now, &window, &snapshot);
-        report.max_queue_ms = report.max_queue_ms.max(snapshot.max_queue_ms);
-        report.max_playout_delay_ms = report
-            .max_playout_delay_ms
-            .max(snapshot.max_playout_delay_ms);
-        report.queue_area_ms += snapshot.max_queue_ms as f64 * frame_duration.as_secs_f64();
-        report.playout_delay_area_ms +=
-            snapshot.max_playout_delay_ms as f64 * frame_duration.as_secs_f64();
+        report.max_output_ring_ms = report.max_output_ring_ms.max(snapshot.max_output_ring_ms);
+        report.neteq_playout_delay_ms = report
+            .neteq_playout_delay_ms
+            .max(snapshot.neteq_playout_delay_ms);
+        report.output_ring_area_ms +=
+            snapshot.max_output_ring_ms as f64 * frame_duration.as_secs_f64();
+        report.neteq_playout_delay_area_ms +=
+            snapshot.neteq_playout_delay_ms as f64 * frame_duration.as_secs_f64();
     }
 
     let final_now = start + input_duration + drain_duration;
@@ -325,10 +327,12 @@ pub(crate) fn run_live_audio_direct_sample_simulation_output_inner(
         .lock()
         .map_err(|_| "direct sample simulation mixer lock poisoned")?
         .snapshot_at(final_now);
-    report.max_queue_ms = report.max_queue_ms.max(report.final_snapshot.max_queue_ms);
-    report.max_playout_delay_ms = report
-        .max_playout_delay_ms
-        .max(report.final_snapshot.max_playout_delay_ms);
+    report.max_output_ring_ms = report
+        .max_output_ring_ms
+        .max(report.final_snapshot.max_output_ring_ms);
+    report.neteq_playout_delay_ms = report
+        .neteq_playout_delay_ms
+        .max(report.final_snapshot.neteq_playout_delay_ms);
     report.output_samples = metrics.samples;
     report.output_ms = samples_to_ms(metrics.samples as usize);
     report.rms = metrics.rms();
@@ -417,17 +421,17 @@ pub(crate) fn run_live_audio_simulation_inner(
         .unwrap_or_default();
 
     // Isolate steady-state queue depth from the startup transient by measuring
-    // the queue only over the final window of the run.
+    // the output ring and NetEQ playout delay only over the final window.
     const STEADY_STATE_WINDOW: Duration = Duration::from_secs(10);
     let tail_callbacks = (STEADY_STATE_WINDOW.as_secs_f64() / output_block_secs)
         .ceil()
         .max(1.0) as usize;
     let tail_start_callback = total_callbacks.saturating_sub(tail_callbacks);
-    let mut tail_queue_sum_ms = 0.0f64;
-    let mut tail_queue_max_ms = 0u64;
-    let mut tail_playout_delay_sum_ms = 0.0f64;
-    let mut tail_playout_delay_max_ms = 0u64;
-    let mut tail_adaptive_target_min_ms = u64::MAX;
+    let mut tail_output_ring_sum_ms = 0.0f64;
+    let mut tail_output_ring_max_ms = 0u64;
+    let mut tail_neteq_playout_delay_sum_ms = 0.0f64;
+    let mut tail_neteq_playout_delay_max_ms = 0u64;
+    let mut tail_neteq_target_min_ms = u64::MAX;
     let mut tail_underruns_start = None;
     let mut tail_callbacks_seen = 0usize;
 
@@ -490,39 +494,39 @@ pub(crate) fn run_live_audio_simulation_inner(
             writer.commit();
         }
         let snapshot = mixer.snapshot_at(now);
-        report.max_queue_ms = report.max_queue_ms.max(snapshot.max_queue_ms);
-        report.max_playout_delay_ms = report
-            .max_playout_delay_ms
-            .max(snapshot.max_playout_delay_ms);
-        report.queue_area_ms += snapshot.max_queue_ms as f64 * output_block_duration.as_secs_f64();
-        report.playout_delay_area_ms +=
-            snapshot.max_playout_delay_ms as f64 * output_block_duration.as_secs_f64();
+        report.max_output_ring_ms = report.max_output_ring_ms.max(snapshot.max_output_ring_ms);
+        report.neteq_playout_delay_ms = report
+            .neteq_playout_delay_ms
+            .max(snapshot.neteq_playout_delay_ms);
+        report.output_ring_area_ms +=
+            snapshot.max_output_ring_ms as f64 * output_block_duration.as_secs_f64();
+        report.neteq_playout_delay_area_ms +=
+            snapshot.neteq_playout_delay_ms as f64 * output_block_duration.as_secs_f64();
         if callback_index >= tail_start_callback {
-            tail_queue_sum_ms += snapshot.max_queue_ms as f64;
-            tail_queue_max_ms = tail_queue_max_ms.max(snapshot.max_queue_ms);
-            tail_playout_delay_sum_ms += snapshot.max_playout_delay_ms as f64;
-            tail_playout_delay_max_ms =
-                tail_playout_delay_max_ms.max(snapshot.max_playout_delay_ms);
-            tail_adaptive_target_min_ms =
-                tail_adaptive_target_min_ms.min(snapshot.adaptive_target_ms);
+            tail_output_ring_sum_ms += snapshot.max_output_ring_ms as f64;
+            tail_output_ring_max_ms = tail_output_ring_max_ms.max(snapshot.max_output_ring_ms);
+            tail_neteq_playout_delay_sum_ms += snapshot.neteq_playout_delay_ms as f64;
+            tail_neteq_playout_delay_max_ms =
+                tail_neteq_playout_delay_max_ms.max(snapshot.neteq_playout_delay_ms);
+            tail_neteq_target_min_ms = tail_neteq_target_min_ms.min(snapshot.neteq_target_ms);
             tail_callbacks_seen += 1;
         }
     }
 
-    report.steady_state_max_queue_ms = tail_queue_max_ms;
-    report.steady_state_avg_queue_ms = if tail_callbacks_seen > 0 {
-        tail_queue_sum_ms / tail_callbacks_seen as f64
+    report.steady_state_max_output_ring_ms = tail_output_ring_max_ms;
+    report.steady_state_avg_output_ring_ms = if tail_callbacks_seen > 0 {
+        tail_output_ring_sum_ms / tail_callbacks_seen as f64
     } else {
         0.0
     };
-    report.steady_state_max_playout_delay_ms = tail_playout_delay_max_ms;
-    report.steady_state_avg_playout_delay_ms = if tail_callbacks_seen > 0 {
-        tail_playout_delay_sum_ms / tail_callbacks_seen as f64
+    report.steady_state_max_neteq_playout_delay_ms = tail_neteq_playout_delay_max_ms;
+    report.steady_state_avg_neteq_playout_delay_ms = if tail_callbacks_seen > 0 {
+        tail_neteq_playout_delay_sum_ms / tail_callbacks_seen as f64
     } else {
         0.0
     };
-    report.steady_state_adaptive_target_ms = if tail_callbacks_seen > 0 {
-        tail_adaptive_target_min_ms
+    report.steady_state_min_neteq_target_ms = if tail_callbacks_seen > 0 {
+        tail_neteq_target_min_ms
     } else {
         0
     };
@@ -536,10 +540,12 @@ pub(crate) fn run_live_audio_simulation_inner(
         .final_snapshot
         .underrun_count
         .saturating_sub(tail_underruns_start.unwrap_or(0));
-    report.max_queue_ms = report.max_queue_ms.max(report.final_snapshot.max_queue_ms);
-    report.max_playout_delay_ms = report
-        .max_playout_delay_ms
-        .max(report.final_snapshot.max_playout_delay_ms);
+    report.max_output_ring_ms = report
+        .max_output_ring_ms
+        .max(report.final_snapshot.max_output_ring_ms);
+    report.neteq_playout_delay_ms = report
+        .neteq_playout_delay_ms
+        .max(report.final_snapshot.neteq_playout_delay_ms);
     report.output_samples = metrics.samples;
     report.output_ms = samples_to_ms(metrics.samples as usize);
     report.rms = metrics.rms();
@@ -698,7 +704,7 @@ pub(crate) fn simulation_prebuffer_frames(config: LiveAudioSimulationConfig) -> 
             + config.tuning.device_period_margin;
     let base = match config.scenario {
         LiveAudioSimulationScenario::BacklogSilence => Duration::from_millis(500),
-        _ => config.tuning.target_queue,
+        _ => config.tuning.neteq_start_delay,
     };
     frames_for_duration(base.max(device_floor))
 }
@@ -1221,7 +1227,7 @@ mod tests {
             output.report
         );
         assert!(
-            output.report.max_queue_ms <= duration_to_ms(test_tuning().hard_queue_bound),
+            output.report.max_output_ring_ms <= duration_to_ms(test_tuning().hard_queue_bound),
             "{:?}",
             output.report
         );
@@ -1285,7 +1291,7 @@ mod tests {
             tuning
                 .initial_buffer
                 .saturating_add(tuning.max_reorder_delay)
-                .saturating_add(tuning.target_queue)
+                .saturating_add(tuning.neteq_start_delay)
                 .saturating_add(Duration::from_millis(300)),
         );
         let mut output = Vec::new();
@@ -1390,7 +1396,7 @@ mod tests {
             tuning
                 .initial_buffer
                 .saturating_add(tuning.max_reorder_delay)
-                .saturating_add(tuning.target_queue)
+                .saturating_add(tuning.neteq_start_delay)
                 .saturating_add(Duration::from_millis(300)),
         );
         let mut output = Vec::new();
@@ -1541,7 +1547,7 @@ mod tests {
             output.report
         );
         assert!(
-            output.report.max_queue_ms <= duration_to_ms(test_tuning().hard_queue_bound),
+            output.report.max_output_ring_ms <= duration_to_ms(test_tuning().hard_queue_bound),
             "{:?}",
             output.report
         );
@@ -1566,7 +1572,7 @@ mod tests {
         let churn_ms = accelerate_ms + expand_ms;
 
         eprintln!(
-            "random60 direct sample: dred={} plc={} underruns={} accel={}({}ms) expand={}({}ms) churn={}ms output={}ms max_queue={}ms max_delta={:.3}",
+            "random60 direct sample: dred={} plc={} underruns={} accel={}({}ms) expand={}({}ms) churn={}ms output={}ms max_output_ring={}ms max_delta={:.3}",
             snapshot.dred_recoveries,
             snapshot.plc_fallbacks,
             snapshot.underrun_count,
@@ -1576,7 +1582,7 @@ mod tests {
             expand_ms,
             churn_ms,
             output.report.output_ms,
-            output.report.max_queue_ms,
+            output.report.max_output_ring_ms,
             output.report.max_adjacent_delta,
         );
 
@@ -1589,7 +1595,7 @@ mod tests {
         assert!(snapshot.expand_count > 0, "{:?}", output.report);
         assert_eq!(snapshot.hard_trim_count, 0, "{:?}", output.report);
         assert!(
-            output.report.max_queue_ms <= duration_to_ms(test_tuning().hard_queue_bound),
+            output.report.max_output_ring_ms <= duration_to_ms(test_tuning().hard_queue_bound),
             "{:?}",
             output.report
         );
@@ -1617,13 +1623,13 @@ mod tests {
         );
         assert_eq!(report.lost_frames, 0);
         assert!(
-            report.max_queue_ms <= duration_to_ms(test_tuning().hard_queue_bound),
+            report.max_output_ring_ms <= duration_to_ms(test_tuning().hard_queue_bound),
             "{report:?}"
         );
         assert!(
-            report.steady_state_max_playout_delay_ms
+            report.steady_state_max_neteq_playout_delay_ms
                 <= duration_to_ms(
-                    test_tuning().dynamic_target_floor + crate::audio::shared::TIME_SCALE_MARGIN,
+                    test_tuning().neteq_min_delay + crate::audio::shared::TIME_SCALE_MARGIN,
                 ),
             "{report:?}"
         );
@@ -1694,7 +1700,7 @@ mod tests {
             enabled.suppressed_frames > disabled.suppressed_frames,
             "{enabled:?} vs {disabled:?}"
         );
-        assert!(enabled.max_queue_ms <= duration_to_ms(test_tuning().hard_queue_bound));
+        assert!(enabled.max_output_ring_ms <= duration_to_ms(test_tuning().hard_queue_bound));
         assert_coherent_output(&enabled, 0.002);
     }
 
@@ -1708,7 +1714,7 @@ mod tests {
             LiveAudioPacketLossProfile::CongestedWifi,
         );
 
-        let trim_budget_ms = duration_to_ms(test_tuning().target_queue) * 3;
+        let trim_budget_ms = duration_to_ms(test_tuning().neteq_start_delay) * 3;
         assert!(
             report.final_snapshot.skipped_speech_gap_ms <= trim_budget_ms,
             "sender-silence trimming removed too much low-energy tail audio: {report:?}"
@@ -1729,7 +1735,7 @@ mod tests {
         assert_eq!(report.final_snapshot.plc_fallbacks, 0, "{report:?}");
         assert!(report.final_snapshot.expand_count > 0, "{report:?}");
         assert!(
-            report.max_queue_ms <= duration_to_ms(test_tuning().hard_queue_bound),
+            report.max_output_ring_ms <= duration_to_ms(test_tuning().hard_queue_bound),
             "{report:?}"
         );
         assert_coherent_output(&report, 0.002);
@@ -1746,7 +1752,7 @@ mod tests {
 
         assert_eq!(report.final_snapshot.active_streams, 3);
         assert!(report.generated_frames > report.output_samples / FRAME_SAMPLES as u64);
-        assert!(report.max_queue_ms <= duration_to_ms(test_tuning().hard_queue_bound));
+        assert!(report.max_output_ring_ms <= duration_to_ms(test_tuning().hard_queue_bound));
         assert_coherent_output(&report, 0.002);
     }
 
@@ -1772,7 +1778,7 @@ mod tests {
             );
 
             assert!(
-                report.max_queue_ms <= duration_to_ms(test_tuning().hard_queue_bound),
+                report.max_output_ring_ms <= duration_to_ms(test_tuning().hard_queue_bound),
                 "{packet_loss:?}: {report:?}"
             );
             assert_coherent_output(&report, 0.002);
@@ -1793,7 +1799,7 @@ mod tests {
         assert!(report.late_frames > 0, "{report:?}");
         assert!(report.missing_frames > report.lost_frames, "{report:?}");
         assert!(
-            report.max_queue_ms <= duration_to_ms(test_tuning().hard_queue_bound),
+            report.max_output_ring_ms <= duration_to_ms(test_tuning().hard_queue_bound),
             "{report:?}"
         );
         assert_coherent_output(&report, 0.002);
@@ -1814,7 +1820,7 @@ mod tests {
         assert!(report.reordered_frames > 0, "{report:?}");
         assert!(report.missing_frames > 0, "{report:?}");
         assert!(
-            report.max_queue_ms <= duration_to_ms(test_tuning().hard_queue_bound),
+            report.max_output_ring_ms <= duration_to_ms(test_tuning().hard_queue_bound),
             "{report:?}"
         );
         assert_coherent_output(&report, 0.002);

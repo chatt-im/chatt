@@ -212,13 +212,13 @@ pub struct AudioLatencyConfig {
     #[toml(default = true)]
     pub capture_silence_gate: bool,
     #[toml(default = 60)]
-    pub target_queue_ms: u64,
+    pub neteq_start_delay_ms: u64,
     #[toml(default = 20)]
-    pub dynamic_target_floor_ms: u64,
+    pub neteq_min_delay_ms: u64,
     #[toml(default = 0)]
-    pub base_minimum_target_ms: u64,
+    pub neteq_base_minimum_delay_ms: u64,
     #[toml(default = 1_000)]
-    pub max_target_ms: u64,
+    pub neteq_max_delay_ms: u64,
     #[toml(default = 1_500)]
     pub hard_queue_bound_ms: u64,
     #[toml(default = 40)]
@@ -242,10 +242,10 @@ impl Default for AudioLatencyConfig {
         let tuning = LiveAudioTuning::default();
         Self {
             capture_silence_gate: tuning.capture_silence_gate,
-            target_queue_ms: duration_ms(tuning.target_queue),
-            dynamic_target_floor_ms: duration_ms(tuning.dynamic_target_floor),
-            base_minimum_target_ms: duration_ms(tuning.base_minimum_target),
-            max_target_ms: duration_ms(tuning.max_target),
+            neteq_start_delay_ms: duration_ms(tuning.neteq_start_delay),
+            neteq_min_delay_ms: duration_ms(tuning.neteq_min_delay),
+            neteq_base_minimum_delay_ms: duration_ms(tuning.neteq_base_minimum_delay),
+            neteq_max_delay_ms: duration_ms(tuning.neteq_max_delay),
             hard_queue_bound_ms: duration_ms(tuning.hard_queue_bound),
             initial_buffer_ms: duration_ms(tuning.initial_buffer),
             max_reorder_delay_ms: duration_ms(tuning.max_reorder_delay),
@@ -262,10 +262,10 @@ impl AudioLatencyConfig {
     pub fn to_tuning(&self) -> LiveAudioTuning {
         LiveAudioTuning {
             capture_silence_gate: self.capture_silence_gate,
-            target_queue: Duration::from_millis(self.target_queue_ms),
-            dynamic_target_floor: Duration::from_millis(self.dynamic_target_floor_ms),
-            base_minimum_target: Duration::from_millis(self.base_minimum_target_ms),
-            max_target: Duration::from_millis(self.max_target_ms),
+            neteq_start_delay: Duration::from_millis(self.neteq_start_delay_ms),
+            neteq_min_delay: Duration::from_millis(self.neteq_min_delay_ms),
+            neteq_base_minimum_delay: Duration::from_millis(self.neteq_base_minimum_delay_ms),
+            neteq_max_delay: Duration::from_millis(self.neteq_max_delay_ms),
             hard_queue_bound: Duration::from_millis(self.hard_queue_bound_ms),
             initial_buffer: Duration::from_millis(self.initial_buffer_ms),
             max_reorder_delay: Duration::from_millis(self.max_reorder_delay_ms),
@@ -1444,24 +1444,24 @@ input-device-index = 20
     #[test]
     fn runtime_config_writes_audio_latency_knobs() {
         let mut config = Config::default();
-        config.audio.latency.target_queue_ms = 80;
-        config.audio.latency.dynamic_target_floor_ms = 25;
-        config.audio.latency.base_minimum_target_ms = 90;
-        config.audio.latency.max_target_ms = 1_200;
+        config.audio.latency.neteq_start_delay_ms = 80;
+        config.audio.latency.neteq_min_delay_ms = 25;
+        config.audio.latency.neteq_base_minimum_delay_ms = 90;
+        config.audio.latency.neteq_max_delay_ms = 1_200;
         let content = render_runtime(&config);
 
         assert!(content.contains("[audio.latency]"));
-        assert!(content.contains("target-queue-ms = 80"));
-        assert!(content.contains("dynamic-target-floor-ms = 25"));
-        assert!(content.contains("base-minimum-target-ms = 90"));
-        assert!(content.contains("max-target-ms = 1200"));
+        assert!(content.contains("neteq-start-delay-ms = 80"));
+        assert!(content.contains("neteq-min-delay-ms = 25"));
+        assert!(content.contains("neteq-base-minimum-delay-ms = 90"));
+        assert!(content.contains("neteq-max-delay-ms = 1200"));
     }
 
     #[test]
     fn rejects_invalid_audio_latency_config() {
         let mut config = Config::default();
         config.audio.latency.hard_queue_bound_ms = 40;
-        config.audio.latency.max_target_ms = 1_000;
+        config.audio.latency.neteq_max_delay_ms = 1_000;
 
         let error = config.validate("<test>").unwrap_err();
 
@@ -1470,26 +1470,26 @@ input-device-index = 20
     }
 
     #[test]
-    fn audio_latency_max_target_must_cover_target_queue() {
+    fn audio_latency_neteq_max_delay_must_cover_start_delay() {
         let mut tuning = LiveAudioTuning::default();
-        tuning.max_target = tuning.target_queue;
+        tuning.neteq_max_delay = tuning.neteq_start_delay;
         assert!(tuning.validate().is_ok());
 
-        tuning.max_target = Duration::from_millis(20);
-        tuning.target_queue = Duration::from_millis(60);
+        tuning.neteq_max_delay = Duration::from_millis(20);
+        tuning.neteq_start_delay = Duration::from_millis(60);
         let error = tuning.validate().unwrap_err();
-        assert!(error.contains("max-target-ms"));
+        assert!(error.contains("neteq-max-delay-ms"));
     }
 
     #[test]
     fn audio_latency_base_minimum_must_fit_constraints() {
         let mut tuning = LiveAudioTuning::default();
-        tuning.base_minimum_target = Duration::from_millis(80);
+        tuning.neteq_base_minimum_delay = Duration::from_millis(80);
         assert!(tuning.validate().is_ok());
 
-        tuning.base_minimum_target = Duration::from_millis(1_200);
+        tuning.neteq_base_minimum_delay = Duration::from_millis(1_200);
         let error = tuning.validate().unwrap_err();
-        assert!(error.contains("base-minimum-target-ms"));
+        assert!(error.contains("neteq-base-minimum-delay-ms"));
     }
 
     #[test]

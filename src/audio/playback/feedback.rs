@@ -33,7 +33,10 @@ pub(crate) struct LivePlaybackFeedbackState {
     highest_arrived_sequence: Option<u32>,
     duplicate_packets: u32,
     reordered_packets: u32,
-    max_queue_ms: u64,
+    max_output_ring_ms: u64,
+    max_neteq_target_ms: u64,
+    max_neteq_playout_delay_ms: u64,
+    max_neteq_packet_buffer_ms: u64,
     max_interarrival_jitter_ms: u64,
     last_forward_arrival: Option<(u32, Instant)>,
     silence_hint_sequence: Option<u32>,
@@ -48,7 +51,10 @@ impl Default for LivePlaybackFeedbackState {
             highest_arrived_sequence: None,
             duplicate_packets: 0,
             reordered_packets: 0,
-            max_queue_ms: 0,
+            max_output_ring_ms: 0,
+            max_neteq_target_ms: 0,
+            max_neteq_playout_delay_ms: 0,
+            max_neteq_packet_buffer_ms: 0,
             max_interarrival_jitter_ms: 0,
             last_forward_arrival: None,
             silence_hint_sequence: None,
@@ -124,8 +130,19 @@ impl LivePlaybackFeedbackState {
         );
     }
 
-    pub(crate) fn observe_queue_ms(&mut self, max_queue_ms: u64) {
-        self.max_queue_ms = self.max_queue_ms.max(max_queue_ms);
+    pub(crate) fn observe_playback_ms(
+        &mut self,
+        output_ring_ms: u64,
+        neteq_target_ms: u64,
+        neteq_playout_delay_ms: u64,
+        neteq_packet_buffer_ms: u64,
+    ) {
+        self.max_output_ring_ms = self.max_output_ring_ms.max(output_ring_ms);
+        self.max_neteq_target_ms = self.max_neteq_target_ms.max(neteq_target_ms);
+        self.max_neteq_playout_delay_ms =
+            self.max_neteq_playout_delay_ms.max(neteq_playout_delay_ms);
+        self.max_neteq_packet_buffer_ms =
+            self.max_neteq_packet_buffer_ms.max(neteq_packet_buffer_ms);
     }
 
     fn update_silence_hint(&mut self, sequence: u32, flags: u8) {
@@ -173,7 +190,10 @@ impl LivePlaybackFeedbackState {
             duplicate_packets: clamp_u16_from_u32(self.duplicate_packets),
             reordered_packets: clamp_u16_from_u32(self.reordered_packets),
             window_ms: clamp_u16_from_u64(duration_to_ms(elapsed)),
-            max_queue_ms: clamp_u16_from_u64(self.max_queue_ms),
+            max_output_ring_ms: clamp_u16_from_u64(self.max_output_ring_ms),
+            max_neteq_target_ms: clamp_u16_from_u64(self.max_neteq_target_ms),
+            max_neteq_playout_delay_ms: clamp_u16_from_u64(self.max_neteq_playout_delay_ms),
+            max_neteq_packet_buffer_ms: clamp_u16_from_u64(self.max_neteq_packet_buffer_ms),
             max_interarrival_jitter_ms: clamp_u16_from_u64(self.max_interarrival_jitter_ms),
         };
         self.reset_window(now);
@@ -186,7 +206,10 @@ impl LivePlaybackFeedbackState {
         &mut self,
         stream_id: u32,
         now: Instant,
-        queue_ms: u64,
+        output_ring_ms: u64,
+        neteq_target_ms: u64,
+        neteq_playout_delay_ms: u64,
+        neteq_packet_buffer_ms: u64,
     ) -> LivePlaybackFeedback {
         self.ensure_started(now);
         let started_at = self.window_started_at.unwrap_or(now);
@@ -200,7 +223,10 @@ impl LivePlaybackFeedbackState {
             duplicate_packets: 0,
             reordered_packets: 0,
             window_ms: clamp_u16_from_u64(duration_to_ms(elapsed)),
-            max_queue_ms: clamp_u16_from_u64(queue_ms),
+            max_output_ring_ms: clamp_u16_from_u64(output_ring_ms),
+            max_neteq_target_ms: clamp_u16_from_u64(neteq_target_ms),
+            max_neteq_playout_delay_ms: clamp_u16_from_u64(neteq_playout_delay_ms),
+            max_neteq_packet_buffer_ms: clamp_u16_from_u64(neteq_packet_buffer_ms),
             max_interarrival_jitter_ms: 0,
         };
         self.reset_window(now);
@@ -232,7 +258,10 @@ impl LivePlaybackFeedbackState {
         self.base_sequence = None;
         self.duplicate_packets = 0;
         self.reordered_packets = 0;
-        self.max_queue_ms = 0;
+        self.max_output_ring_ms = 0;
+        self.max_neteq_target_ms = 0;
+        self.max_neteq_playout_delay_ms = 0;
+        self.max_neteq_packet_buffer_ms = 0;
         self.max_interarrival_jitter_ms = 0;
         // `highest_arrived_sequence`, `last_forward_arrival`, and the silence hint
         // persist across windows so the next report continues the same stream.
@@ -259,7 +288,7 @@ mod tests {
         feedback.observe_insert(2, 0, start + Duration::from_millis(60));
         feedback.observe_insert(1, 0, start + Duration::from_millis(70)); // reorder
         feedback.observe_insert(1, 0, start + Duration::from_millis(71)); // duplicate
-        feedback.observe_queue_ms(123);
+        feedback.observe_playback_ms(123, 80, 100, 60);
 
         let report = feedback
             .take_if_ready(9, start + LIVE_PLAYBACK_FEEDBACK_INTERVAL)
@@ -270,7 +299,10 @@ mod tests {
         assert_eq!(report.duplicate_packets, 1);
         assert_eq!(report.reordered_packets, 1);
         assert_eq!(report.highest_contiguous_sequence, 2);
-        assert_eq!(report.max_queue_ms, 123);
+        assert_eq!(report.max_output_ring_ms, 123);
+        assert_eq!(report.max_neteq_target_ms, 80);
+        assert_eq!(report.max_neteq_playout_delay_ms, 100);
+        assert_eq!(report.max_neteq_packet_buffer_ms, 60);
         // sequence 2 arrived 60 ms after sequence 0, two frames (40 ms) expected.
         assert_eq!(report.max_interarrival_jitter_ms, 20);
     }
@@ -304,11 +336,15 @@ mod tests {
         let start = Instant::now();
         let mut feedback = LivePlaybackFeedbackState::default();
         feedback.observe_insert(0, 0, start);
-        feedback.observe_queue_ms(200);
+        feedback.observe_playback_ms(200, 90, 110, 70);
         feedback.observe_sender_silence(1, start + Duration::from_millis(100));
-        let report = feedback.take_sender_silence(9, start + Duration::from_millis(100), 20);
+        let report =
+            feedback.take_sender_silence(9, start + Duration::from_millis(100), 20, 60, 80, 40);
         assert_eq!(report.expected_packets, 0);
-        assert_eq!(report.max_queue_ms, 20);
+        assert_eq!(report.max_output_ring_ms, 20);
+        assert_eq!(report.max_neteq_target_ms, 60);
+        assert_eq!(report.max_neteq_playout_delay_ms, 80);
+        assert_eq!(report.max_neteq_packet_buffer_ms, 40);
         assert!(
             feedback
                 .take_if_ready(9, start + LIVE_PLAYBACK_FEEDBACK_INTERVAL)

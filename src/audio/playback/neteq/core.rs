@@ -39,9 +39,9 @@ use crate::audio::playback::time_scale::{
 };
 use crate::audio::shared::{
     DecodedFrameSource, LIVE_CAPTURE_MUTE_FADE, LIVE_OPUS_FRAME_SAMPLES, LIVE_PACKET_FLAG_MUTE,
-    LIVE_PACKET_FLAG_OPUS_RESET, LIVE_PLAYBACK_DRED_MAX_SAMPLES, MAX_OPUS_DECODE_SAMPLES,
-    SAMPLE_RATE, TIME_SCALE_REF_OFFSET, TIME_SCALE_WINDOW, apply_gain_ramp, mute_gain_step,
-    samples_for_duration,
+    LIVE_PACKET_FLAG_OPUS_RESET, LIVE_PLAYBACK_DRED_MAX_SAMPLES, LiveAudioTuning,
+    MAX_OPUS_DECODE_SAMPLES, SAMPLE_RATE, TIME_SCALE_REF_OFFSET, TIME_SCALE_WINDOW,
+    apply_gain_ramp, duration_to_ms, mute_gain_step, samples_for_duration, samples_to_ms,
 };
 
 /// 48 kHz. The live path is always 48 kHz mono.
@@ -70,6 +70,22 @@ pub(crate) struct AudioResult {
     pub muted: bool,
     /// Samples removed by accelerate / added by preemptive-expand this block.
     pub time_stretched: i32,
+}
+
+#[derive(Clone, Debug, Default)]
+pub(crate) struct NetEqDiagnostics {
+    pub target_ms: u64,
+    pub playout_delay_ms: u64,
+    pub sync_buffer_ms: u64,
+    pub packet_buffer_ms: u64,
+    pub packet_buffer_wait_ms: u64,
+    pub packets_buffered: usize,
+    pub next_packet_gap_ms: Option<i64>,
+    pub operation: &'static str,
+    pub reason: &'static str,
+    pub dred_last_horizon_ms: u64,
+    pub dred_missed_horizon_count: u64,
+    pub dred_missed_horizon_ms: u64,
 }
 
 /// One cached DRED parse, reused across the 10 ms chunks recovered from the same
@@ -116,18 +132,37 @@ pub(crate) struct NetEqCore {
     /// is decoded and held across the following concealment so the fade completes
     /// smoothly even when decode stops mid-fade. Applied to every output block.
     mute_target: f32,
+    last_operation: Operation,
+    last_decision_reason: &'static str,
+    dred_last_horizon_samples: usize,
+    dred_missed_horizon_count: u64,
+    dred_missed_horizon_samples: u64,
 }
 
 impl NetEqCore {
-    pub(crate) fn new() -> Result<Self, String> {
+    pub(crate) fn new(tuning: LiveAudioTuning) -> Result<Self, String> {
+        tuning.validate()?;
         let tick_timer = TickTimer::new();
+        let start_delay_ms = duration_to_i32_ms(tuning.neteq_start_delay);
+        let min_delay_ms = duration_to_i32_ms(tuning.neteq_min_delay);
+        let base_min_delay_ms = duration_to_i32_ms(tuning.neteq_base_minimum_delay);
+        let max_delay_ms = duration_to_i32_ms(tuning.neteq_max_delay);
         let config = ControllerConfig {
             allow_time_stretching: true,
             max_packets_in_buffer: 200,
-            base_min_delay_ms: 0,
+            start_delay_ms,
+            min_delay_ms,
+            base_min_delay_ms,
+            max_delay_ms,
         };
         let mut decision_logic = DecisionLogic::new(config, &tick_timer);
         decision_logic.set_sample_rate(FS_HZ, OUTPUT_SIZE_SAMPLES);
+        if !decision_logic.set_minimum_delay(min_delay_ms)
+            || !decision_logic.set_base_minimum_delay(base_min_delay_ms)
+            || !decision_logic.set_maximum_delay(max_delay_ms)
+        {
+            return Err("invalid NetEQ delay constraints".to_string());
+        }
         Ok(Self {
             tick_timer,
             packet_buffer: PacketBuffer::new(200),
@@ -152,6 +187,11 @@ impl NetEqCore {
             mute_gain: 1.0,
             mute_gain_step: mute_gain_step(samples_for_duration(LIVE_CAPTURE_MUTE_FADE)),
             mute_target: 1.0,
+            last_operation: Operation::Normal,
+            last_decision_reason: "startup",
+            dred_last_horizon_samples: 0,
+            dred_missed_horizon_count: 0,
+            dred_missed_horizon_samples: 0,
         })
     }
 
@@ -171,6 +211,35 @@ impl NetEqCore {
         self.packet_buffer.num_packets()
     }
 
+    pub(crate) fn diagnostics(&self) -> NetEqDiagnostics {
+        let status = self.status();
+        let playout_timestamp = status
+            .target_timestamp
+            .wrapping_sub(status.sync_buffer_samples as u32);
+        let next_packet_gap_ms = status.next_packet.map(|packet| {
+            let gap_samples = packet.timestamp.wrapping_sub(playout_timestamp) as i32;
+            i64::from(gap_samples) / i64::from(FS_HZ / 1000)
+        });
+
+        NetEqDiagnostics {
+            target_ms: self.decision_logic.target_level_ms().max(0) as u64,
+            playout_delay_ms: self
+                .decision_logic
+                .playout_delay_ms(&status, &self.tick_timer)
+                .max(0) as u64,
+            sync_buffer_ms: samples_to_ms(status.sync_buffer_samples),
+            packet_buffer_ms: samples_to_ms(status.packet_buffer_info.span_samples),
+            packet_buffer_wait_ms: samples_to_ms(status.packet_buffer_info.span_samples_wait_time),
+            packets_buffered: status.packet_buffer_info.num_packets,
+            next_packet_gap_ms,
+            operation: self.last_operation.label(),
+            reason: self.last_decision_reason,
+            dred_last_horizon_ms: samples_to_ms(self.dred_last_horizon_samples),
+            dred_missed_horizon_count: self.dred_missed_horizon_count,
+            dred_missed_horizon_ms: samples_to_ms(self.dred_missed_horizon_samples as usize),
+        }
+    }
+
     /// Flushes all state for a hard stream restart (decoder reset boundary).
     pub(crate) fn flush(&mut self) {
         self.packet_buffer.flush();
@@ -186,6 +255,11 @@ impl NetEqCore {
         self.dred_parse = None;
         self.mute_gain = 1.0;
         self.mute_target = 1.0;
+        self.last_operation = Operation::Normal;
+        self.last_decision_reason = "flush";
+        self.dred_last_horizon_samples = 0;
+        self.dred_missed_horizon_count = 0;
+        self.dred_missed_horizon_samples = 0;
         let _ = self.decoder.reset();
     }
 
@@ -223,6 +297,16 @@ impl NetEqCore {
         // played) audio and this packet's timestamp.
         let current_gap = self.recovery_gap(timestamp);
         let dred = self.parse_dred(sequence, &datagram);
+        let dred_reach = dred
+            .map(|info| info.samples.max(0) as u32)
+            .unwrap_or_default();
+        self.dred_last_horizon_samples = dred_reach as usize;
+        if current_gap > dred_reach {
+            self.dred_missed_horizon_count = self.dred_missed_horizon_count.saturating_add(1);
+            self.dred_missed_horizon_samples = self
+                .dred_missed_horizon_samples
+                .saturating_add(u64::from(current_gap - dred_reach));
+        }
 
         let packets = parse_payload_redundancy(
             timestamp,
@@ -458,35 +542,11 @@ impl NetEqCore {
                 .add_sample_memory(-(samples_left + OUTPUT_SIZE_SAMPLES as i32));
         }
 
-        let generated_noise_samples = self.generated_noise_samples();
-        let next_packet = self
-            .packet_buffer
-            .peek_next_packet()
-            .map(|packet| PacketInfo {
-                timestamp: packet.timestamp,
-                is_dtx: false,
-                is_cng: false,
-            });
-        let packet_buffer_info = PacketBufferInfo {
-            dtx_or_cng: false,
-            num_samples: self.packet_buffer.num_samples(),
-            span_samples: self.packet_buffer.span_samples(false, &self.tick_timer),
-            span_samples_wait_time: self.packet_buffer.span_samples(true, &self.tick_timer),
-            num_packets: self.packet_buffer.num_packets(),
-        };
-        let status = NetEqStatus {
-            target_timestamp: self.sync_buffer.end_timestamp(),
-            expand_mutefactor: self.concealment.expand_mute_factor_q14(),
-            last_packet_samples: self.decoder_frame_length,
-            next_packet,
-            last_mode: self.last_mode,
-            play_dtmf: false,
-            generated_noise_samples: generated_noise_samples as usize,
-            packet_buffer_info,
-            sync_buffer_samples: self.sync_buffer.future_length(),
-        };
+        let status = self.status();
 
         let mut operation = self.decision_logic.get_decision(&status, &self.tick_timer);
+        self.last_operation = operation;
+        self.last_decision_reason = self.decision_reason(operation, &status);
 
         // Enough decoded samples already buffered → just play them out.
         if samples_left >= OUTPUT_SIZE_SAMPLES as i32
@@ -498,6 +558,8 @@ impl NetEqCore {
                     | Operation::PreemptiveExpand
             )
         {
+            self.last_operation = Operation::Normal;
+            self.last_decision_reason = "decoded_buffer_ready";
             return (Operation::Normal, Vec::new());
         }
 
@@ -510,14 +572,87 @@ impl NetEqCore {
             } else {
                 operation = Operation::Expand;
             }
+            self.last_operation = operation;
+            self.last_decision_reason = self.decision_reason(operation, &status);
             self.sync_buffer
                 .increase_end_timestamp(self.timestamp.wrapping_sub(end_timestamp));
             self.new_codec = false;
             self.decision_logic.soft_reset(&self.tick_timer);
-            return self.finish_decision(operation, self.timestamp);
+            let result = self.finish_decision(operation, self.timestamp);
+            self.last_operation = result.0;
+            self.last_decision_reason = self.decision_reason(result.0, &status);
+            return result;
         }
 
-        self.finish_decision(operation, end_timestamp)
+        let result = self.finish_decision(operation, end_timestamp);
+        self.last_operation = result.0;
+        self.last_decision_reason = self.decision_reason(result.0, &status);
+        result
+    }
+
+    fn status(&self) -> NetEqStatus {
+        let next_packet = self
+            .packet_buffer
+            .peek_next_packet()
+            .map(|packet| PacketInfo {
+                timestamp: packet.timestamp,
+                is_dtx: false,
+                is_cng: false,
+            });
+        NetEqStatus {
+            target_timestamp: self.sync_buffer.end_timestamp(),
+            expand_mutefactor: self.concealment.expand_mute_factor_q14(),
+            last_packet_samples: self.decoder_frame_length,
+            next_packet,
+            last_mode: self.last_mode,
+            play_dtmf: false,
+            generated_noise_samples: self.generated_noise_samples() as usize,
+            packet_buffer_info: PacketBufferInfo {
+                dtx_or_cng: false,
+                num_samples: self.packet_buffer.num_samples(),
+                span_samples: self.packet_buffer.span_samples(false, &self.tick_timer),
+                span_samples_wait_time: self.packet_buffer.span_samples(true, &self.tick_timer),
+                num_packets: self.packet_buffer.num_packets(),
+            },
+            sync_buffer_samples: self.sync_buffer.future_length(),
+        }
+    }
+
+    fn decision_reason(&self, operation: Operation, status: &NetEqStatus) -> &'static str {
+        match operation {
+            Operation::Normal => {
+                if status.next_packet.is_some() {
+                    "expected_packet"
+                } else {
+                    "decoded_buffer_ready"
+                }
+            }
+            Operation::Expand => {
+                if status.next_packet.is_none() {
+                    "no_packet"
+                } else if self.packet_too_early_for_status(status) {
+                    "packet_too_early_below_target"
+                } else {
+                    "concealment"
+                }
+            }
+            Operation::Merge => "merge_after_expand",
+            Operation::Accelerate | Operation::FastAccelerate => "above_target",
+            Operation::PreemptiveExpand => "below_target",
+            Operation::Rfc3389CngNoPacket => "cng_no_packet",
+            Operation::Rfc3389Cng => "cng",
+            Operation::CodecInternalCng => "codec_internal_cng",
+            Operation::Dtmf => "dtmf",
+            Operation::Undefined => "undefined",
+        }
+    }
+
+    fn packet_too_early_for_status(&self, status: &NetEqStatus) -> bool {
+        let Some(next) = status.next_packet else {
+            return false;
+        };
+        let timestamp_leap = next.timestamp.wrapping_sub(status.target_timestamp) as usize;
+        timestamp_leap > status.generated_noise_samples
     }
 
     /// The required-samples sizing and packet extraction tail of `GetDecision`
@@ -950,6 +1085,10 @@ impl NetEqCore {
     }
 }
 
+fn duration_to_i32_ms(duration: std::time::Duration) -> i32 {
+    duration_to_ms(duration).min(i32::MAX as u64) as i32
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -974,7 +1113,7 @@ mod tests {
 
     #[test]
     fn steady_stream_plays_back_continuously() {
-        let mut core = NetEqCore::new().unwrap();
+        let mut core = NetEqCore::new(LiveAudioTuning::default()).unwrap();
         let mut encoder = OpusVoiceEncoder::new(32_000).unwrap();
         let mut output = vec![0.0; OUTPUT_SIZE_SAMPLES];
         let mut total_energy = 0.0f64;
@@ -999,7 +1138,7 @@ mod tests {
 
     #[test]
     fn missing_packets_expand_then_mute() {
-        let mut core = NetEqCore::new().unwrap();
+        let mut core = NetEqCore::new(LiveAudioTuning::default()).unwrap();
         let mut encoder = OpusVoiceEncoder::new(32_000).unwrap();
         let mut output = vec![0.0; OUTPUT_SIZE_SAMPLES];
         // Prime with a few real frames.
@@ -1028,7 +1167,7 @@ mod tests {
 
     #[test]
     fn overfull_buffer_accelerates() {
-        let mut core = NetEqCore::new().unwrap();
+        let mut core = NetEqCore::new(LiveAudioTuning::default()).unwrap();
         let mut encoder = OpusVoiceEncoder::new(32_000).unwrap();
         let mut output = vec![0.0; OUTPUT_SIZE_SAMPLES];
         // Flood the buffer well past the target without draining much, so the

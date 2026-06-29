@@ -52,12 +52,13 @@ pub(crate) struct DecisionLogic {
 
 impl DecisionLogic {
     pub(crate) fn new(config: ControllerConfig, tick_timer: &TickTimer) -> Self {
+        let mut delay_constraints =
+            DelayConstraints::new(config.max_packets_in_buffer, config.base_min_delay_ms);
+        let _ = delay_constraints.set_minimum_delay(config.min_delay_ms);
+        let _ = delay_constraints.set_maximum_delay(config.max_delay_ms);
         Self {
-            delay_manager: DelayManager::new(),
-            delay_constraints: DelayConstraints::new(
-                config.max_packets_in_buffer,
-                config.base_min_delay_ms,
-            ),
+            delay_manager: DelayManager::new(config.start_delay_ms),
+            delay_constraints,
             buffer_level_filter: BufferLevelFilter::new(),
             packet_arrival_history: PacketArrivalHistory::new(PACKET_HISTORY_SIZE_MS),
             sample_rate_khz: 48,
@@ -361,7 +362,7 @@ impl DecisionLogic {
         self.timescale_countdown.finished(tick_timer)
     }
 
-    fn playout_delay_ms(&self, status: &NetEqStatus, tick_timer: &TickTimer) -> i32 {
+    pub(crate) fn playout_delay_ms(&self, status: &NetEqStatus, tick_timer: &TickTimer) -> i32 {
         let playout_timestamp = status
             .target_timestamp
             .wrapping_sub(status.sync_buffer_samples as u32);
@@ -379,7 +380,10 @@ mod tests {
         ControllerConfig {
             allow_time_stretching: true,
             max_packets_in_buffer: 200,
+            start_delay_ms: 60,
+            min_delay_ms: 20,
             base_min_delay_ms: 0,
+            max_delay_ms: 1_000,
         }
     }
 
@@ -433,7 +437,12 @@ mod tests {
             if reorder {
                 // The later packet arrives a slot early, then the expected one
                 // arrives late and out of order — each under its own timestamp.
-                logic.packet_arrived(48000, true, &info((seq + 1) * 960, (seq + 1) as u16), &timer);
+                logic.packet_arrived(
+                    48000,
+                    true,
+                    &info((seq + 1) * 960, (seq + 1) as u16),
+                    &timer,
+                );
                 timer.increment_by(2);
                 logic.packet_arrived(48000, true, &info(seq * 960, seq as u16), &timer);
                 timer.increment_by(2);

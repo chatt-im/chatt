@@ -288,21 +288,19 @@ terminal's color scheme. Use `base16-light` on a light terminal and
 through the themes and applies the change immediately; Save writes it to
 `chatt.toml`.
 
-Voice receive keeps a 60 ms playback target when the connection is unknown.
-When loss or DRED recovery is observed, playback temporarily permits a larger
-queue so Opus DRED can recover missing frames; adaptive resampling then catches
-up instead of letting latency grow for the rest of the call. On a consistent
-connection (low jitter, no loss) it lowers the target toward `dynamic-target-floor-ms`
-to cut latency, and raises it back immediately on any jitter spike, loss, or
-underrun. Use `/audio` or `--logfile` to inspect queue growth, DRED recovery,
-PLC fallback, hard trims, and underruns.
+Voice receive uses the NetEQ delay manager as the jitter buffer controller. It
+starts at `neteq-start-delay-ms`, clamps the delay target between
+`neteq-min-delay-ms` and `neteq-max-delay-ms`, and raises the target when packet
+arrival jitter or reordering requires a wider horizon. Use `/audio` or
+`--logfile` to inspect NetEQ target/playout delay, packet-buffer wait/span, the
+current decision, DRED horizon misses, PLC fallback, hard trims, and output-ring
+underruns.
 
 Latency controls live under `[audio.latency]` in `chatt.toml`. The defaults
-enable adaptive catch-up, playback silence skipping, capture silence gating, and
-the dynamic target; set `adaptive-catch-up`, `playback-silence-skip`,
-`capture-silence-gate`, or `adaptive-target` to `false` to isolate those
-behaviors during testing or profiling. `dynamic-target-floor-ms` (default 20)
-bounds how low the dynamic target may go.
+enable capture silence gating and a 60 ms NetEQ start delay. Set
+`capture-silence-gate = false` to isolate sender-side silence suppression during
+testing, and tune `neteq-min-delay-ms`, `neteq-base-minimum-delay-ms`, or
+`neteq-max-delay-ms` when profiling receive latency.
 
 Set `echo-cancellation = true` under `[audio]` to remove far-end speaker audio
 from the microphone before encoding. It uses the speaker mix as the echo

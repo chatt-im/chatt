@@ -1,4 +1,4 @@
-use std::{sync::Arc, time::Instant};
+use std::sync::Arc;
 
 use crate::audio::{
     playback::{LivePlaybackMixerStats, SampleRing, neteq::AudioResult},
@@ -23,7 +23,6 @@ const OUTPUT_BLOCK_SAMPLES: usize = SAMPLE_RATE as usize / 100;
 pub(crate) struct RingPlaybackProducer {
     ring: Arc<SampleRing>,
     block: [f32; OUTPUT_BLOCK_SAMPLES],
-    target_samples: usize,
     /// Consumer dry-ring underruns already folded into the stats.
     consumed_underruns: u64,
     last_voice_rms: f32,
@@ -34,17 +33,13 @@ impl RingPlaybackProducer {
     pub(crate) fn new(tuning: LiveAudioTuning) -> Result<Self, String> {
         let capacity = samples_for_duration(tuning.hard_queue_bound).max(OUTPUT_BLOCK_SAMPLES);
         let ring = Arc::new(SampleRing::with_capacity(capacity));
-        Self::with_ring(tuning, ring)
+        Self::with_ring(ring)
     }
 
-    pub(crate) fn with_ring(
-        tuning: LiveAudioTuning,
-        ring: Arc<SampleRing>,
-    ) -> Result<Self, String> {
+    pub(crate) fn with_ring(ring: Arc<SampleRing>) -> Result<Self, String> {
         Ok(Self {
             ring,
             block: [0.0; OUTPUT_BLOCK_SAMPLES],
-            target_samples: samples_for_duration(tuning.target_queue),
             consumed_underruns: 0,
             last_voice_rms: 0.0,
             last_voice_active: false,
@@ -59,15 +54,6 @@ impl RingPlaybackProducer {
     /// Samples currently staged in the ring for the consumer.
     pub(crate) fn buffered_samples(&self) -> usize {
         self.ring.depth()
-    }
-
-    /// Configured playout target, for diagnostics.
-    pub(crate) fn target_samples(&self) -> usize {
-        self.target_samples
-    }
-
-    pub(crate) fn playout_delay_samples(&self, _now: Instant) -> Option<usize> {
-        Some(self.ring.depth())
     }
 
     pub(crate) fn voice_active(&self) -> bool {

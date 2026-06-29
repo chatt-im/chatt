@@ -64,7 +64,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ));
         write_wav_i16(&output_path, &output.samples)?;
         println!(
-            "client={},loss={},lost={},reordered={},late={},missing={},dred={},plc={},max_queue_ms={},avg_queue_ms={:.1},rms={:.5},peak={:.5},max_delta={:.5},clipped={}",
+            "client={},loss={},lost={},reordered={},late={},missing={},dred={},plc={},max_output_ring_ms={},avg_output_ring_ms={:.1},rms={:.5},peak={:.5},max_delta={:.5},clipped={}",
             output_path.display(),
             packet_loss.as_name(),
             output.report.lost_frames,
@@ -73,8 +73,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             output.report.missing_frames,
             output.report.final_snapshot.dred_recoveries,
             output.report.final_snapshot.plc_fallbacks,
-            output.report.max_queue_ms,
-            output.report.queue_area_ms / base_config.duration.as_secs_f64(),
+            output.report.max_output_ring_ms,
+            output.report.output_ring_area_ms / base_config.duration.as_secs_f64(),
             output.report.rms,
             output.report.peak,
             output.report.max_adjacent_delta,
@@ -119,7 +119,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ));
         write_wav_i16(&output_path, &output.samples)?;
         println!(
-            "direct_client={},trace={},loss={},lost={},reordered={},late={},missing={},dred={},plc={},max_queue_ms={},avg_queue_ms={:.1},rms={:.5},peak={:.5},max_delta={:.5},clipped={}",
+            "direct_client={},trace={},loss={},lost={},reordered={},late={},missing={},dred={},plc={},max_output_ring_ms={},avg_output_ring_ms={:.1},rms={:.5},peak={:.5},max_delta={:.5},clipped={}",
             output_path.display(),
             trace_path.display(),
             packet_loss.as_name(),
@@ -129,8 +129,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             output.report.missing_frames,
             output.report.final_snapshot.dred_recoveries,
             output.report.final_snapshot.plc_fallbacks,
-            output.report.max_queue_ms,
-            output.report.queue_area_ms / (direct_sample.len() as f64 / SAMPLE_RATE as f64),
+            output.report.max_output_ring_ms,
+            output.report.output_ring_area_ms / (direct_sample.len() as f64 / SAMPLE_RATE as f64),
             output.report.rms,
             output.report.peak,
             output.report.max_adjacent_delta,

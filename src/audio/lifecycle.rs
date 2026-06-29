@@ -250,8 +250,8 @@ impl LivePlayback {
         }
     }
 
-    pub fn queued_samples(&self) -> usize {
-        self.shared_snapshot.queued_samples()
+    pub fn output_ring_samples(&self) -> usize {
+        self.shared_snapshot.output_ring_samples()
     }
 
     pub fn stats(&self) -> LivePlaybackSnapshot {

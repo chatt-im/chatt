@@ -567,7 +567,7 @@ fn bench_live(bench: &mut Bench<'_>, corpus: Arc<Corpus>) {
                         &frames,
                     )
                     .unwrap();
-                    black_box(report.max_queue_ms);
+                    black_box(report.max_output_ring_ms);
                     black_box(report.final_snapshot.accelerate_count);
                     black_box(report.final_snapshot.expand_count);
                 });
@@ -630,7 +630,7 @@ fn bench_live(bench: &mut Bench<'_>, corpus: Arc<Corpus>) {
                                             )
                                             .unwrap();
                                             black_box(report.rms);
-                                            black_box(report.queue_area_ms);
+                                            black_box(report.output_ring_area_ms);
                                         });
                                     },
                                 );
@@ -1071,7 +1071,7 @@ mod tests {
 
         assert_eq!(report.non_finite_samples, 0);
         assert!(report.rms > 0.0);
-        assert!(report.max_queue_ms <= 120);
+        assert!(report.max_output_ring_ms <= 120);
     }
 
     #[test]

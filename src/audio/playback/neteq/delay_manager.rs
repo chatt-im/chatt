@@ -10,8 +10,6 @@ use super::delay_optimizer::{ReorderOptimizer, UnderrunOptimizer};
 use super::neteq_status::PacketArrivedInfo;
 use super::tick_timer::TickTimer;
 
-const START_DELAY_MS: i32 = 80;
-
 // WebRTC `DelayManager::Config` defaults.
 const QUANTILE: f64 = 0.95;
 const FORGET_FACTOR: f64 = 0.983;
@@ -25,11 +23,12 @@ const MS_PER_LOSS_PERCENT: i32 = 20;
 pub(crate) struct DelayManager {
     underrun_optimizer: UnderrunOptimizer,
     reorder_optimizer: ReorderOptimizer,
+    start_delay_ms: i32,
     target_level_ms: i32,
 }
 
 impl DelayManager {
-    pub(crate) fn new() -> Self {
+    pub(crate) fn new(start_delay_ms: i32) -> Self {
         let underrun_optimizer = UnderrunOptimizer::new(
             ((1i64 << 30) as f64 * QUANTILE) as i32,
             ((1 << 15) as f64 * FORGET_FACTOR) as i32,
@@ -44,7 +43,8 @@ impl DelayManager {
         let mut manager = Self {
             underrun_optimizer,
             reorder_optimizer,
-            target_level_ms: START_DELAY_MS,
+            start_delay_ms,
+            target_level_ms: start_delay_ms,
         };
         manager.reset();
         manager
@@ -65,7 +65,7 @@ impl DelayManager {
         self.target_level_ms = self
             .underrun_optimizer
             .optimal_delay_ms()
-            .unwrap_or(START_DELAY_MS);
+            .unwrap_or(self.start_delay_ms);
         self.reorder_optimizer
             .update(arrival_delay_ms, reordered, self.target_level_ms);
         self.target_level_ms = self
@@ -76,7 +76,7 @@ impl DelayManager {
     pub(crate) fn reset(&mut self) {
         self.underrun_optimizer.reset();
         self.reorder_optimizer.reset();
-        self.target_level_ms = START_DELAY_MS;
+        self.target_level_ms = self.start_delay_ms;
     }
 
     /// The preferred buffer level in ms. Port of `TargetDelayMs`.
@@ -102,21 +102,21 @@ mod tests {
 
     #[test]
     fn starts_at_default_target() {
-        let manager = DelayManager::new();
-        assert_eq!(manager.target_delay_ms(), START_DELAY_MS);
+        let manager = DelayManager::new(60);
+        assert_eq!(manager.target_delay_ms(), 60);
     }
 
     #[test]
     fn target_rises_with_observed_delay() {
         let mut timer = TickTimer::new();
-        let mut manager = DelayManager::new();
+        let mut manager = DelayManager::new(60);
         // Feed a consistent 100 ms arrival delay; the target should climb.
         for _ in 0..2000 {
             manager.update(100, false, &info(), &timer);
             timer.increment();
         }
         assert!(
-            manager.target_delay_ms() >= 80,
+            manager.target_delay_ms() >= 60,
             "{}",
             manager.target_delay_ms()
         );

@@ -467,19 +467,24 @@ fn print_audio_playback_test_report(
         packet_loss.as_name()
     );
     println!(
-        "feedback_expected={},feedback_lost={},feedback_late={},feedback_reordered={},feedback_duplicates={},feedback_max_queue_ms={},feedback_max_jitter_ms={}",
+        "feedback_expected={},feedback_lost={},feedback_late={},feedback_reordered={},feedback_duplicates={},feedback_max_output_ring_ms={},feedback_max_neteq_target_ms={},feedback_max_neteq_playout_delay_ms={},feedback_max_neteq_packet_buffer_ms={},feedback_max_jitter_ms={}",
         report.feedback_expected_packets,
         report.feedback_lost_packets,
         report.feedback_late_packets,
         report.feedback_reordered_packets,
         report.feedback_duplicate_packets,
-        report.feedback_max_queue_ms,
+        report.feedback_max_output_ring_ms,
+        report.feedback_max_neteq_target_ms,
+        report.feedback_max_neteq_playout_delay_ms,
+        report.feedback_max_neteq_packet_buffer_ms,
         report.feedback_max_interarrival_jitter_ms
     );
     println!(
-        "playback_max_queue_ms={},adaptive_target_ms={},accelerate_count={},expand_count={},accelerate_ms={},expand_ms={},hard_trim_count={},underruns={},dred={},plc={},suppressed_frames={}",
-        report.final_snapshot.max_queue_ms,
-        report.final_snapshot.adaptive_target_ms,
+        "playback_max_output_ring_ms={},neteq_playout_delay_ms={},neteq_target_ms={},neteq_packet_buffer_ms={},accelerate_count={},expand_count={},accelerate_ms={},expand_ms={},hard_trim_count={},underruns={},dred={},plc={},suppressed_frames={}",
+        report.final_snapshot.max_output_ring_ms,
+        report.final_snapshot.neteq_playout_delay_ms,
+        report.final_snapshot.neteq_target_ms,
+        report.final_snapshot.neteq_packet_buffer_ms,
         report.final_snapshot.accelerate_count,
         report.final_snapshot.expand_count,
         live_samples_to_ms(report.final_snapshot.accelerate_samples as usize),

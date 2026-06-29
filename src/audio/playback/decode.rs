@@ -1,4 +1,5 @@
 use std::{
+    collections::VecDeque,
     sync::{
         Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
@@ -15,14 +16,15 @@ use crate::{
         playback::{
             LivePlaybackFeedbackState, LivePlaybackMixer, LivePlaybackMixerEvent,
             LivePlaybackMixerStats, LivePlaybackSharedSnapshot, RingPlaybackProducer, SampleRing,
-            SpscSwapQueue, neteq::NetEqCore,
+            SpscSwapQueue,
+            neteq::{NetEqCore, NetEqDiagnostics},
         },
         shared::{
             FRAME_SAMPLES, LIVE_CAPTURE_MUTE_FADE, LIVE_PACKET_FLAG_MUTE,
             LIVE_PLAYBACK_DRAIN_INTERVAL, LiveAudioTraceWriter, LiveAudioTuning,
             LivePlaybackFeedback, LivePlaybackSnapshot, LivePlaybackStreamActivity,
             RemoteVoicePacket, VoicePayload, audio_pop_logging_enabled, duration_to_ms,
-            samples_for_duration, samples_to_ms,
+            samples_to_ms,
         },
     },
     network::InsertOutcome,
@@ -33,6 +35,7 @@ use crate::{
 const NOTIFICATION_STREAM_ID: u32 = u32::MAX;
 /// Notification ring capacity, one second at 48 kHz.
 const NOTIFICATION_RING_SAMPLES: usize = 48_000;
+const NETEQ_DIAGNOSTIC_TREND_WINDOW: Duration = Duration::from_secs(5);
 
 /// Producer side of the notification stream: the write end of a [`SampleRing`]
 /// the cpal mixer reads, registered with the consumer only while a clip plays.
@@ -146,21 +149,63 @@ fn drain_pump_stream(
     stream.activate_control_mute_fallback_if_due(now, stream_id);
 
     let sender_silence = stream.take_sender_silence_pending();
-    let core = &mut stream.core;
-    // NetEQ is pulled at the constant output rate regardless of packet arrival,
-    // exactly as `NetEqImpl::GetAudio` is driven by the audio device. During a
-    // sender pause it expands (and `generated_noise_samples` accumulates on the
-    // tick timer); on resume the future-packet timestamp catches up to that noise
-    // so the talkspurt merges back in seamlessly. Never short-circuit this, or the
-    // catch-up cannot happen and the resume clicks. A muted sender's audio is
-    // faded to silence on the way in, so the expansion it conceals is silence too.
-    producer.pump(block, |out| Some(core.get_audio(out)), stats);
+    {
+        let core = &mut stream.core;
+        // NetEQ is pulled at the constant output rate regardless of packet arrival,
+        // exactly as `NetEqImpl::GetAudio` is driven by the audio device. During a
+        // sender pause it expands (and `generated_noise_samples` accumulates on the
+        // tick timer); on resume the future-packet timestamp catches up to that noise
+        // so the talkspurt merges back in seamlessly. Never short-circuit this, or the
+        // catch-up cannot happen and the resume clicks. A muted sender's audio is
+        // faded to silence on the way in, so the expansion it conceals is silence too.
+        producer.pump(block, |out| Some(core.get_audio(out)), stats);
+    }
 
-    let buffered_ms = samples_to_ms(producer.buffered_samples());
+    let output_ring_ms = samples_to_ms(producer.buffered_samples());
+    let neteq = stream.playback_diagnostics();
     if sender_silence {
-        stream.flush_sender_silence_feedback(stream_id, now, buffered_ms, feedback_sender);
+        stream.flush_sender_silence_feedback(
+            stream_id,
+            now,
+            output_ring_ms,
+            &neteq,
+            feedback_sender,
+        );
     } else {
-        stream.flush_feedback(stream_id, now, buffered_ms, feedback_sender);
+        stream.flush_feedback(stream_id, now, output_ring_ms, &neteq, feedback_sender);
+    }
+}
+
+#[derive(Default)]
+struct LivePlaybackTrend {
+    samples: VecDeque<LivePlaybackTrendSample>,
+}
+
+struct LivePlaybackTrendSample {
+    at: Instant,
+    target_ms: u64,
+    playout_ms: u64,
+}
+
+impl LivePlaybackTrend {
+    fn update(&mut self, now: Instant, target_ms: u64, playout_ms: u64) -> (i64, i64) {
+        self.samples.push_back(LivePlaybackTrendSample {
+            at: now,
+            target_ms,
+            playout_ms,
+        });
+        while self.samples.front().is_some_and(|sample| {
+            now.saturating_duration_since(sample.at) > NETEQ_DIAGNOSTIC_TREND_WINDOW
+        }) {
+            self.samples.pop_front();
+        }
+        let Some(anchor) = self.samples.front() else {
+            return (0, 0);
+        };
+        (
+            target_ms as i64 - anchor.target_ms as i64,
+            playout_ms as i64 - anchor.playout_ms as i64,
+        )
     }
 }
 
@@ -173,6 +218,7 @@ pub(crate) struct LiveDecodeStreams {
     block_samples: usize,
     dropped_mixer_events: u64,
     notification: Option<NotificationVoice>,
+    trend: LivePlaybackTrend,
 }
 
 impl LiveDecodeStreams {
@@ -186,6 +232,7 @@ impl LiveDecodeStreams {
             block_samples: FRAME_SAMPLES,
             dropped_mixer_events: 0,
             notification: None,
+            trend: LivePlaybackTrend::default(),
         }
     }
 
@@ -385,26 +432,36 @@ impl LiveDecodeStreams {
         }
     }
 
-    pub(crate) fn snapshot_at(&self, now: Instant) -> LivePlaybackSnapshot {
-        let queued_samples: usize = self.producers.values().map(|p| p.buffered_samples()).sum();
-        let max_queue_samples = self
+    pub(crate) fn snapshot_at(&mut self, now: Instant) -> LivePlaybackSnapshot {
+        let output_ring_samples: usize =
+            self.producers.values().map(|p| p.buffered_samples()).sum();
+        let max_output_ring_samples = self
             .producers
             .values()
             .map(|p| p.buffered_samples())
             .max()
             .unwrap_or_default();
-        let max_playout_delay_samples = self
-            .producers
+        let diagnostics: Vec<NetEqDiagnostics> = self
+            .streams
             .values()
-            .filter_map(|p| p.playout_delay_samples(now))
+            .map(|stream| stream.playback_diagnostics())
+            .collect();
+        let neteq_target_ms = diagnostics
+            .iter()
+            .map(|diagnostics| diagnostics.target_ms)
+            .max()
+            .unwrap_or_else(|| duration_to_ms(self.tuning.neteq_start_delay));
+        let neteq_playout_delay_ms = diagnostics
+            .iter()
+            .map(|diagnostics| diagnostics.playout_delay_ms)
             .max()
             .unwrap_or_default();
-        let adaptive_target = self
-            .producers
-            .values()
-            .map(|p| p.target_samples())
-            .max()
-            .unwrap_or_else(|| samples_for_duration(self.tuning.target_queue));
+        let representative = diagnostics
+            .iter()
+            .max_by_key(|diagnostics| neteq_operation_priority(diagnostics.operation));
+        let (neteq_target_delta_5s_ms, neteq_playout_delta_5s_ms) =
+            self.trend
+                .update(now, neteq_target_ms, neteq_playout_delay_ms);
 
         LivePlaybackSnapshot {
             active_streams: self.streams.len(),
@@ -417,13 +474,57 @@ impl LiveDecodeStreams {
                     rms: producer.voice_rms(),
                 })
                 .collect(),
-            queued_samples,
-            max_queue_ms: samples_to_ms(max_queue_samples),
-            max_playout_delay_ms: samples_to_ms(max_playout_delay_samples),
+            output_ring_samples,
+            max_output_ring_ms: samples_to_ms(max_output_ring_samples),
+            neteq_playout_delay_ms,
+            neteq_sync_buffer_ms: diagnostics
+                .iter()
+                .map(|diagnostics| diagnostics.sync_buffer_ms)
+                .max()
+                .unwrap_or_default(),
+            neteq_packet_buffer_ms: diagnostics
+                .iter()
+                .map(|diagnostics| diagnostics.packet_buffer_ms)
+                .max()
+                .unwrap_or_default(),
+            neteq_packet_buffer_wait_ms: diagnostics
+                .iter()
+                .map(|diagnostics| diagnostics.packet_buffer_wait_ms)
+                .max()
+                .unwrap_or_default(),
+            neteq_packets_buffered: diagnostics
+                .iter()
+                .map(|diagnostics| diagnostics.packets_buffered)
+                .sum(),
+            neteq_next_packet_gap_ms: diagnostics
+                .iter()
+                .filter_map(|diagnostics| diagnostics.next_packet_gap_ms)
+                .max_by_key(|gap| gap.abs()),
             backend_block_ms: samples_to_ms(self.block_samples),
             playout_quantum_ms: samples_to_ms(self.block_samples.min(FRAME_SAMPLES)),
-            target_queue_ms: duration_to_ms(self.tuning.target_queue),
-            adaptive_target_ms: samples_to_ms(adaptive_target),
+            neteq_start_delay_ms: duration_to_ms(self.tuning.neteq_start_delay),
+            neteq_target_ms,
+            neteq_target_delta_5s_ms,
+            neteq_playout_delta_5s_ms,
+            neteq_decision: representative
+                .map(|diagnostics| diagnostics.operation.to_string())
+                .unwrap_or_else(|| "idle".to_string()),
+            neteq_decision_reason: representative
+                .map(|diagnostics| diagnostics.reason.to_string())
+                .unwrap_or_else(|| "no_stream".to_string()),
+            dred_last_horizon_ms: diagnostics
+                .iter()
+                .map(|diagnostics| diagnostics.dred_last_horizon_ms)
+                .max()
+                .unwrap_or_default(),
+            dred_missed_horizon_count: diagnostics
+                .iter()
+                .map(|diagnostics| diagnostics.dred_missed_horizon_count)
+                .sum(),
+            dred_missed_horizon_ms: diagnostics
+                .iter()
+                .map(|diagnostics| diagnostics.dred_missed_horizon_ms)
+                .sum(),
             hard_trim_count: self.stats.hard_trim_count,
             underrun_count: self.stats.underrun_count,
             dred_recoveries: self.stats.dred_recoveries,
@@ -449,6 +550,17 @@ impl LiveDecodeStreams {
     }
 }
 
+fn neteq_operation_priority(operation: &str) -> u8 {
+    match operation {
+        "expand" | "rfc3389_cng_no_packet" => 5,
+        "merge" => 4,
+        "preemptive_expand" => 3,
+        "accelerate" | "fast_accelerate" => 2,
+        "normal" => 1,
+        _ => 0,
+    }
+}
+
 /// One remote voice stream: a NetEQ core plus the receiver-side feedback report
 /// and the mute/control-mute tracking that governs concealment during silence.
 pub(crate) struct LiveDecodeStream {
@@ -456,6 +568,7 @@ pub(crate) struct LiveDecodeStream {
     feedback: LivePlaybackFeedbackState,
     tuning: LiveAudioTuning,
     sender_silence_pending: bool,
+    sender_silence_active: bool,
     /// True while the sender is muted (in-band media flags or the control-stream
     /// fallback). Suppresses speech concealment, since a muted sender has no
     /// speech to recover.
@@ -472,10 +585,11 @@ pub(crate) struct LiveDecodeStream {
 impl LiveDecodeStream {
     pub(crate) fn new(tuning: LiveAudioTuning) -> Result<Self, String> {
         Ok(Self {
-            core: NetEqCore::new()?,
+            core: NetEqCore::new(tuning)?,
             feedback: LivePlaybackFeedbackState::default(),
             tuning,
             sender_silence_pending: false,
+            sender_silence_active: false,
             sender_muted: false,
             media_muted: false,
             control_muted_pending: None,
@@ -496,6 +610,7 @@ impl LiveDecodeStream {
         now: Instant,
     ) -> bool {
         self.feedback.observe_insert(sequence, flags, now);
+        self.sender_silence_active = false;
 
         let media_muted = flags & LIVE_PACKET_FLAG_MUTE != 0;
         if media_muted {
@@ -526,6 +641,7 @@ impl LiveDecodeStream {
     ) {
         self.feedback.observe_sender_silence(sequence, now);
         self.sender_silence_pending = true;
+        self.sender_silence_active = true;
         self.sender_muted = muted;
         self.media_muted = muted;
         if muted {
@@ -550,6 +666,23 @@ impl LiveDecodeStream {
 
     fn take_sender_silence_pending(&mut self) -> bool {
         std::mem::take(&mut self.sender_silence_pending)
+    }
+
+    fn playback_diagnostics(&self) -> NetEqDiagnostics {
+        let mut diagnostics = self.core.diagnostics();
+        if self.sender_silence_active && diagnostics.packets_buffered == 0 {
+            diagnostics.playout_delay_ms = 0;
+            diagnostics.packet_buffer_ms = 0;
+            diagnostics.packet_buffer_wait_ms = 0;
+            diagnostics.next_packet_gap_ms = None;
+            diagnostics.operation = "silence";
+            diagnostics.reason = if self.sender_muted {
+                "sender_muted"
+            } else {
+                "sender_silence"
+            };
+        }
+        diagnostics
     }
 
     fn control_mute_fallback_delay(&self) -> Duration {
@@ -607,10 +740,16 @@ impl LiveDecodeStream {
         &mut self,
         stream_id: u32,
         now: Instant,
-        max_queue_ms: u64,
+        output_ring_ms: u64,
+        neteq: &NetEqDiagnostics,
         feedback_sender: Option<&Sender<LivePlaybackFeedback>>,
     ) {
-        self.feedback.observe_queue_ms(max_queue_ms);
+        self.feedback.observe_playback_ms(
+            output_ring_ms,
+            neteq.target_ms,
+            neteq.playout_delay_ms,
+            neteq.packet_buffer_ms,
+        );
         let Some(feedback) = self.feedback.take_if_ready(stream_id, now) else {
             return;
         };
@@ -623,10 +762,18 @@ impl LiveDecodeStream {
         &mut self,
         stream_id: u32,
         now: Instant,
-        queue_ms: u64,
+        output_ring_ms: u64,
+        neteq: &NetEqDiagnostics,
         feedback_sender: Option<&Sender<LivePlaybackFeedback>>,
     ) {
-        let feedback = self.feedback.take_sender_silence(stream_id, now, queue_ms);
+        let feedback = self.feedback.take_sender_silence(
+            stream_id,
+            now,
+            output_ring_ms,
+            neteq.target_ms,
+            neteq.playout_delay_ms,
+            neteq.packet_buffer_ms,
+        );
         if let Some(sender) = feedback_sender {
             let _ = sender.send(feedback);
         }
@@ -721,6 +868,36 @@ mod tests {
         let feedback = feedback_receiver.try_recv().unwrap();
         assert_eq!(feedback.stream_id, 7);
         assert_eq!(feedback.expected_packets, 0);
+    }
+
+    #[test]
+    fn sender_silence_diagnostics_do_not_report_aged_playout_delay() {
+        let now = Instant::now();
+        let tuning = test_tuning();
+        let mut stream = LiveDecodeStream::new(tuning).unwrap();
+        let mut encoder = OpusVoiceEncoder::new(32_000).unwrap();
+        let mut output = vec![0.0; stream.core.output_size_samples()];
+
+        for seq in 0..4u32 {
+            let opus = tone_packet(&mut encoder, seq as usize * LIVE_OPUS_FRAME_SAMPLES);
+            stream.insert_audio(seq * LIVE_OPUS_FRAME_SAMPLES as u32, seq, 0, &opus, now);
+            stream.core.get_audio(&mut output);
+        }
+        for _ in 0..700 {
+            stream.core.get_audio(&mut output);
+        }
+        assert!(
+            stream.core.diagnostics().playout_delay_ms > 1_000,
+            "test setup should reproduce the aged arrival-history delay"
+        );
+
+        stream.observe_sender_silence(7, 99, true, now + Duration::from_secs(7));
+        let diagnostics = stream.playback_diagnostics();
+        assert_eq!(diagnostics.playout_delay_ms, 0);
+        assert_eq!(diagnostics.packet_buffer_ms, 0);
+        assert_eq!(diagnostics.packet_buffer_wait_ms, 0);
+        assert_eq!(diagnostics.operation, "silence");
+        assert_eq!(diagnostics.reason, "sender_muted");
     }
 
     #[test]

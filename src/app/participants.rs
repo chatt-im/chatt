@@ -35,7 +35,9 @@ impl ParticipantState {
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct ParticipantVoiceFeedback {
     pub(crate) loss_percent: u8,
-    pub(crate) max_queue_ms: u16,
+    pub(crate) max_output_ring_ms: u16,
+    pub(crate) max_neteq_target_ms: u16,
+    pub(crate) max_neteq_playout_delay_ms: u16,
     pub(crate) max_interarrival_jitter_ms: u16,
     pub(crate) updated_at: Instant,
 }
@@ -212,7 +214,9 @@ impl Participants {
             };
             entry.voice_feedback = Some(ParticipantVoiceFeedback {
                 loss_percent,
-                max_queue_ms: feedback.max_queue_ms,
+                max_output_ring_ms: feedback.max_output_ring_ms,
+                max_neteq_target_ms: feedback.max_neteq_target_ms,
+                max_neteq_playout_delay_ms: feedback.max_neteq_playout_delay_ms,
                 max_interarrival_jitter_ms: feedback.max_interarrival_jitter_ms,
                 updated_at: Instant::now(),
             });

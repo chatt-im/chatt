@@ -26,9 +26,9 @@ output-buffer = "default"
 
 [audio.latency]
 capture-silence-gate = true
-target-queue-ms = 60
-dynamic-target-floor-ms = 20
-max-target-ms = 1000
+neteq-start-delay-ms = 60
+neteq-min-delay-ms = 20
+neteq-max-delay-ms = 1000
 hard-queue-bound-ms = 1500
 initial-buffer-ms = 40
 max-reorder-delay-ms = 60

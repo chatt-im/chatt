@@ -88,7 +88,10 @@ pub struct LiveAudioFilePlaybackTestReport {
     pub feedback_late_packets: u64,
     pub feedback_duplicate_packets: u64,
     pub feedback_reordered_packets: u64,
-    pub feedback_max_queue_ms: u64,
+    pub feedback_max_output_ring_ms: u64,
+    pub feedback_max_neteq_target_ms: u64,
+    pub feedback_max_neteq_playout_delay_ms: u64,
+    pub feedback_max_neteq_packet_buffer_ms: u64,
     pub feedback_max_interarrival_jitter_ms: u64,
     pub final_snapshot: LivePlaybackSnapshot,
 }
@@ -410,7 +413,7 @@ pub(crate) fn run_live_audio_file_playback_test_inner(
         .tuning
         .initial_buffer
         .saturating_add(config.tuning.max_reorder_delay)
-        .saturating_add(config.tuning.target_queue)
+        .saturating_add(config.tuning.neteq_start_delay)
         .saturating_add(Duration::from_millis(500));
     let drain_deadline = Instant::now() + drain_for;
     while Instant::now() < drain_deadline {
@@ -475,9 +478,18 @@ pub(crate) fn drain_file_playback_feedback(
         report.feedback_reordered_packets = report
             .feedback_reordered_packets
             .saturating_add(u64::from(feedback.reordered_packets));
-        report.feedback_max_queue_ms = report
-            .feedback_max_queue_ms
-            .max(u64::from(feedback.max_queue_ms));
+        report.feedback_max_output_ring_ms = report
+            .feedback_max_output_ring_ms
+            .max(u64::from(feedback.max_output_ring_ms));
+        report.feedback_max_neteq_target_ms = report
+            .feedback_max_neteq_target_ms
+            .max(u64::from(feedback.max_neteq_target_ms));
+        report.feedback_max_neteq_playout_delay_ms = report
+            .feedback_max_neteq_playout_delay_ms
+            .max(u64::from(feedback.max_neteq_playout_delay_ms));
+        report.feedback_max_neteq_packet_buffer_ms = report
+            .feedback_max_neteq_packet_buffer_ms
+            .max(u64::from(feedback.max_neteq_packet_buffer_ms));
         report.feedback_max_interarrival_jitter_ms = report
             .feedback_max_interarrival_jitter_ms
             .max(u64::from(feedback.max_interarrival_jitter_ms));
@@ -506,7 +518,7 @@ mod tests {
     struct HeadlessSoundboardPlaybackReport {
         source: LiveAudioFileSourceReport,
         final_snapshot: LivePlaybackSnapshot,
-        max_queue_ms: u64,
+        max_output_ring_ms: u64,
         voice_packets_received: u64,
         voice_bytes_received: u64,
     }
@@ -598,11 +610,11 @@ mod tests {
                 .tuning
                 .initial_buffer
                 .saturating_add(config.tuning.max_reorder_delay)
-                .saturating_add(config.tuning.target_queue)
+                .saturating_add(config.tuning.neteq_start_delay)
                 .saturating_add(Duration::from_millis(500)),
         )
         .saturating_add(2);
-        let mut max_queue_ms = 0;
+        let mut max_output_ring_ms = 0;
         let mut voice_packets_received = 0u64;
         let mut voice_bytes_received = 0u64;
 
@@ -683,7 +695,8 @@ mod tests {
                 for _ in 0..LIVE_OPUS_FRAME_SAMPLES {
                     let _ = mixer.pop_mixed_output_sample(now, LIVE_OPUS_FRAME_SAMPLES);
                 }
-                max_queue_ms = max_queue_ms.max(mixer.snapshot_at(now).max_queue_ms);
+                max_output_ring_ms =
+                    max_output_ring_ms.max(mixer.snapshot_at(now).max_output_ring_ms);
             }
         }
 
@@ -698,12 +711,12 @@ mod tests {
             .lock()
             .map_err(|_| "headless soundboard mixer lock poisoned")?
             .snapshot_at(start + input_duration);
-        max_queue_ms = max_queue_ms.max(final_snapshot.max_queue_ms);
+        max_output_ring_ms = max_output_ring_ms.max(final_snapshot.max_output_ring_ms);
 
         Ok(HeadlessSoundboardPlaybackReport {
             source: source_report,
             final_snapshot,
-            max_queue_ms,
+            max_output_ring_ms,
             voice_packets_received,
             voice_bytes_received,
         })
@@ -712,25 +725,35 @@ mod tests {
     fn soundboard_audio_summary(report: &HeadlessSoundboardPlaybackReport) -> String {
         let snapshot = &report.final_snapshot;
         format!(
-            "playbackqueue: max {}ms, target {}ms (base {}ms)\n\
+            "playback\n\
+             output: ring max {}ms, queued {} samples\n\
+             neteq: playout {}ms, target {}ms (start {}ms), packets wait {}ms span {}ms / {} pkts\n\
              timing: accelerate {}ms / {}, expand {}ms / {}\n\
-             recovery: dred {}, plc {}, trims {}, underruns {}\n\
-             active streams: {}, queued {} samples\n\
-             networkvoice rx: {} packets / {}B\n\
+             recovery: dred {}, horizon {}ms, missed {}ms / {}, plc {}, trims {}, underruns {}\n\
+             active streams: {}\n\
+             network\n\
+             voice rx: {} packets / {}B\n\
              source: generated {}, queued {}, delivered {}, dropped {}, reordered {}, suppressed {}",
-            report.max_queue_ms,
-            snapshot.adaptive_target_ms,
-            snapshot.target_queue_ms,
+            report.max_output_ring_ms,
+            snapshot.output_ring_samples,
+            snapshot.neteq_playout_delay_ms,
+            snapshot.neteq_target_ms,
+            snapshot.neteq_start_delay_ms,
+            snapshot.neteq_packet_buffer_wait_ms,
+            snapshot.neteq_packet_buffer_ms,
+            snapshot.neteq_packets_buffered,
             samples_to_ms(snapshot.accelerate_samples as usize),
             snapshot.accelerate_count,
             samples_to_ms(snapshot.expand_samples as usize),
             snapshot.expand_count,
             snapshot.dred_recoveries,
+            snapshot.dred_last_horizon_ms,
+            snapshot.dred_missed_horizon_ms,
+            snapshot.dred_missed_horizon_count,
             snapshot.plc_fallbacks,
             snapshot.hard_trim_count,
             snapshot.underrun_count,
             snapshot.active_streams,
-            snapshot.queued_samples,
             report.voice_packets_received,
             report.voice_bytes_received,
             report.source.generated_frames,
