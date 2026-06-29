@@ -58,6 +58,11 @@ dhat-heap = ["dep:dhat"]
 # `-C target-cpu=x86-64-v3`; the `cargo v3` alias in `.cargo/config.toml` does
 # both. The default build leaves this off and stays portable.
 avx2 = ["opus-codec/presume-avx2", "nnnoiseless/presume-avx2"]
+# Bundle the built web frontend into the binary (served gzipped) instead of
+# reading it from `web/dist` at runtime. Off by default. Requires building the
+# frontend first (`cd web && bun run build`), which emits `web/dist/embed.rs`,
+# the generated asset resolver this feature includes.
+embed-web = []
 
 [workspace]
 members = [

@@ -191,6 +191,47 @@ fn serves_in_memory_static_routes() {
     );
 }
 
+fn embedded(path: &str) -> Option<(&'static str, &'static str, &'static [u8])> {
+    match path {
+        "/" | "/index.html" => Some(("text/html; charset=UTF-8", "gzip", b"GZIPPEDHTML")),
+        "/assets/app.js" => Some(("text/javascript; charset=UTF-8", "gzip", b"GZIPPEDJS")),
+        _ => None,
+    }
+}
+
+#[test]
+fn embedded_assets_serve_with_content_encoding() {
+    let router = Router::new().embedded_assets(embedded);
+    let server = EmbeddedServer::start(router);
+
+    // The body is sent verbatim with a Content-Encoding label, so read it raw
+    // rather than through an auto-decompressing client.
+    let response = raw_request(
+        server.addr,
+        "GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
+    );
+    assert!(response.starts_with("HTTP/1.1 200 OK\r\n"));
+    assert!(response.contains("Content-Type: text/html; charset=UTF-8\r\n"));
+    assert!(response.contains("Content-Encoding: gzip\r\n"));
+    assert!(response.contains("Vary: Accept-Encoding\r\n"));
+    assert!(response.contains("Content-Length: 11\r\n"));
+    assert!(response.ends_with("GZIPPEDHTML"));
+
+    let response = raw_request(
+        server.addr,
+        "GET /assets/app.js HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
+    );
+    assert!(response.contains("Content-Type: text/javascript; charset=UTF-8\r\n"));
+    assert!(response.contains("Content-Encoding: gzip\r\n"));
+    assert!(response.ends_with("GZIPPEDJS"));
+
+    let response = raw_request(
+        server.addr,
+        "GET /missing HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
+    );
+    assert!(response.starts_with("HTTP/1.1 404 Not Found\r\n"));
+}
+
 #[test]
 fn static_dir_serves_index_and_assets_without_listing() {
     let root = TestRoot::new("static-dir");

@@ -105,6 +105,7 @@ pub(crate) fn error(
 pub(crate) fn bytes(
     body: Arc<[u8]>,
     content_type: &str,
+    content_encoding: Option<&str>,
     keep_alive: bool,
     timeout: Duration,
     header_only: bool,
@@ -112,6 +113,12 @@ pub(crate) fn bytes(
     let mut header = common_header(200, "OK", keep_alive, timeout);
     header.line(b"Accept-Ranges: bytes");
     content_type_header(&mut header, content_type);
+    if let Some(encoding) = content_encoding {
+        header.push(b"Content-Encoding: ");
+        header.push_str(encoding);
+        header.crlf();
+        header.line(b"Vary: Accept-Encoding");
+    }
     finish_header(&mut header, body.len() as u64);
     PreparedResponse {
         header,

@@ -20,11 +20,18 @@ impl RoutePath {
     }
 }
 
+/// Resolves a request path to an embedded asset as
+/// `(content_type, content_encoding, body)`. Used by [`Router::embedded_assets`]
+/// to serve a frontend compiled into the binary. Returns `None` for a path the
+/// embed does not cover.
+pub type EmbeddedResolver = fn(&str) -> Option<(&'static str, &'static str, &'static [u8])>;
+
 #[derive(Clone, Default)]
 pub struct Router {
     static_assets: Vec<StaticAsset>,
     mounts: Vec<DirMount>,
     websocket_routes: Vec<RoutePath>,
+    embedded: Option<EmbeddedResolver>,
 }
 
 impl Router {
@@ -97,6 +104,22 @@ impl Router {
 
     pub fn add_file_dir(&mut self, prefix: impl AsRef<str>, dir: impl Into<PathBuf>) -> &mut Self {
         self.add_mount(prefix, dir.into(), MountKind::FileDir)
+    }
+
+    /// Serves assets compiled into the binary. The resolver maps a request path
+    /// to `(content_type, content_encoding, body)`, with `content_encoding`
+    /// empty for an identity body. It is consulted after registered static
+    /// routes and before filesystem mounts.
+    pub fn embedded_assets(mut self, resolver: EmbeddedResolver) -> Self {
+        self.embedded = Some(resolver);
+        self
+    }
+
+    pub(crate) fn embedded_asset(
+        &self,
+        path: &str,
+    ) -> Option<(&'static str, &'static str, &'static [u8])> {
+        self.embedded.and_then(|resolver| resolver(path))
     }
 
     pub fn websocket(mut self, path: impl AsRef<str>) -> Self {
