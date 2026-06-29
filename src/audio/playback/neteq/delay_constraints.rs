@@ -98,7 +98,11 @@ impl DelayConstraints {
 
     fn minimum_delay_upper_bound(&self) -> i32 {
         let q75 = self.max_packets_in_buffer * self.packet_len_ms * 3 / 4;
-        let q75 = if q75 > 0 { q75 } else { MAX_BASE_MINIMUM_DELAY_MS };
+        let q75 = if q75 > 0 {
+            q75
+        } else {
+            MAX_BASE_MINIMUM_DELAY_MS
+        };
         let maximum = if self.maximum_delay_ms > 0 {
             self.maximum_delay_ms
         } else {

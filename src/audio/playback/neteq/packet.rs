@@ -144,8 +144,7 @@ pub(crate) fn is_obsolete_timestamp(
 /// Wrap-around aware "is `timestamp` newer than `prev_timestamp`". Port of
 /// `IsNewerTimestamp` from `module_common_types_public.h`.
 pub(crate) fn is_newer_timestamp(timestamp: u32, prev_timestamp: u32) -> bool {
-    timestamp != prev_timestamp
-        && timestamp.wrapping_sub(prev_timestamp) < 0x8000_0000
+    timestamp != prev_timestamp && timestamp.wrapping_sub(prev_timestamp) < 0x8000_0000
 }
 
 #[cfg(test)]

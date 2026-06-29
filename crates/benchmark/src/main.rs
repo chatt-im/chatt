@@ -475,7 +475,7 @@ fn new_aec() -> AudioProcessing {
 
 fn bench_live(bench: &mut Bench<'_>, corpus: Arc<Corpus>) {
     let mut bench = bench.with_parameters(LIVE_BENCH_PARAMS);
-    let feature_sets = ["all_on", "catchup_off", "gate_off", "adaptive_target_off"];
+    let feature_sets = ["all_on", "gate_off"];
     let loss_profiles = [
         LiveAudioPacketLossProfile::ScenarioDefault.as_name(),
         LiveAudioPacketLossProfile::None.as_name(),
@@ -693,9 +693,7 @@ fn live_tuning_for_feature_set(feature: &str) -> LiveAudioTuning {
     let mut tuning = LiveAudioTuning::default();
     match feature {
         "all_on" => {}
-        "catchup_off" => tuning.adaptive_catch_up = false,
         "gate_off" => tuning.capture_silence_gate = false,
-        "adaptive_target_off" => tuning.adaptive_target = false,
         _ => panic!("unknown live feature set {feature}"),
     }
     tuning

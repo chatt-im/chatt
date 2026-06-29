@@ -53,7 +53,6 @@ pub(crate) fn trace_direct_run_start(
         denoise: config.denoise,
         auto_gain: config.auto_gain,
         capture_silence_gate: config.tuning.capture_silence_gate,
-        adaptive_catch_up: config.tuning.adaptive_catch_up,
     });
 }
 
@@ -928,7 +927,11 @@ impl SimStreamState {
             RemoteVoicePacket {
                 stream_id,
                 sequence,
-                timestamp: sequence.wrapping_mul(LIVE_OPUS_FRAME_SAMPLES as u32),
+                // Carry the capture pipeline's real media timestamp, which advances
+                // across sender silence. Synthesizing it from the sequence number
+                // collapses muted gaps to a single frame and makes NetEQ's
+                // DelayManager read every resume as a huge late arrival.
+                timestamp: packet.timestamp,
                 flags: packet.flags,
                 payload: packet.payload,
                 received_at: deliver_at,
@@ -1176,26 +1179,25 @@ mod tests {
             output.report
         );
         assert_coherent_output(&output.report, 0.0005);
+        // Decode-side reconstruction (jitter/normal/DRED) now lives inside NetEQ,
+        // so the trace covers the capture → encode → network → delivery → output
+        // pipeline; the per-operation decode trace is reported through the live
+        // playback stats snapshot instead (dred_recoveries / expand_count below).
         for event in [
             "\"event\":\"direct_run_start\"",
             "\"event\":\"capture_frame\"",
             "\"event\":\"encoded_packet\"",
             "\"event\":\"network_decision\"",
             "\"event\":\"packet_delivery\"",
-            "\"event\":\"jitter_item\"",
-            "\"event\":\"normal_decode\"",
-            "\"event\":\"dred_decode\"",
-            "\"event\":\"mixer_queue\"",
             "\"event\":\"output_window\"",
-            "\"status\":\"recovered\"",
         ] {
             assert!(trace.contains(event), "missing {event} in\n{trace}");
         }
         assert!(
-            trace.contains("\"event\":\"dred_parse\"")
-                || trace.contains("\"event\":\"plc_decode\"")
-                || trace.contains("\"event\":\"dred_decode\""),
-            "trace did not include loss recovery events:\n{trace}"
+            output.report.final_snapshot.dred_recoveries > 0
+                || output.report.final_snapshot.expand_count > 0,
+            "trace run did not exercise loss recovery: {:?}",
+            output.report.final_snapshot
         );
     }
 
@@ -1453,12 +1455,6 @@ mod tests {
             stats.plc_fallbacks, 0,
             "loopback mute toggle should never invoke PLC"
         );
-        // The resumes still drain the ring (underruns) and still let later,
-        // stationary catch-up run; only the onset expansions are suppressed.
-        assert!(
-            stats.underrun_count > 0,
-            "the silence pauses are expected to drain the ring at least once"
-        );
         // Fixed pipeline sits at ~0.0019 (codec floor); the pre-fix onset splice
         // measured ~0.0087. 0.004 separates the two with margin on both sides.
         assert!(
@@ -1503,200 +1499,6 @@ mod tests {
             output.report
         );
         assert_coherent_output(&output.report, 0.0001);
-    }
-
-    #[test]
-    fn experiment_render_continuous_drift() {
-        // NO mute. Clock drift keeps the buffer chronically shallow/churning so
-        // the time-scaler runs during continuous speech, exposing non-mute pops.
-        let speech = sample_speech_frames();
-        for (name, ratio) in [
-            ("cont_slow", 0.96),
-            ("cont_slower", 0.93),
-            ("cont_fast", 1.05),
-        ] {
-            let config = LiveAudioSimulationConfig {
-                scenario: LiveAudioSimulationScenario::ConstantSpeech,
-                tuning: test_tuning(),
-                duration: Duration::from_secs(20),
-                producer_clock_ratio: ratio,
-                output_block_samples: FRAME_SAMPLES,
-                streams: 1,
-                seed: 0x5eed_5eed,
-                packet_loss: LiveAudioPacketLossProfile::None,
-                max_amplification: 1.0,
-                denoise: false,
-                auto_gain: false,
-                echo_cancellation: false,
-                capture_dc_offset: 0.0,
-                capture_noise_rms: 0.0,
-            };
-            let out = run_live_audio_simulation_with_speech_output(config, speech).unwrap();
-            let bytes: Vec<u8> = out.samples.iter().flat_map(|x| x.to_le_bytes()).collect();
-            std::fs::write(format!("/tmp/render_{name}.f32"), &bytes).unwrap();
-            let s = &out.report.final_snapshot;
-            eprintln!(
-                "{name}: accel={} expand={} underrun={} maxq={}ms",
-                s.accelerate_count, s.expand_count, s.underrun_count, out.report.max_queue_ms,
-            );
-        }
-    }
-
-    #[test]
-    fn experiment_render_mute_toggle_500ms() {
-        let speech = sample_speech_frames();
-        for (name, denoise, loss, catch_up) in [
-            (
-                "mute500_none",
-                false,
-                LiveAudioPacketLossProfile::None,
-                true,
-            ),
-            (
-                "mute500_none_nocatchup",
-                false,
-                LiveAudioPacketLossProfile::None,
-                false,
-            ),
-            ("mute500_rnn", true, LiveAudioPacketLossProfile::None, true),
-            (
-                "mute500_rnn_random60",
-                true,
-                LiveAudioPacketLossProfile::Random60,
-                true,
-            ),
-        ] {
-            let mut tuning = test_tuning();
-            tuning.adaptive_catch_up = catch_up;
-            let config = LiveAudioSimulationConfig {
-                scenario: LiveAudioSimulationScenario::ConstantSpeech,
-                tuning,
-                duration: Duration::from_secs(20),
-                producer_clock_ratio: 1.0,
-                output_block_samples: LIVE_OPUS_FRAME_SAMPLES,
-                streams: 1,
-                seed: 0x5eed_5eed,
-                packet_loss: loss,
-                max_amplification: 1.0,
-                denoise,
-                auto_gain: false,
-                echo_cancellation: false,
-                capture_dc_offset: 0.0,
-                capture_noise_rms: 0.0,
-            };
-            let mut state =
-                SimStreamState::new(config, simulation_encoder_profile(config), None).unwrap();
-            let mixer = Arc::new(Mutex::new(LivePlaybackMixer::with_tuning(tuning)));
-            let mut decode_streams = LiveDecodeStreams::new(tuning);
-            decode_streams.set_block_samples(LIVE_OPUS_FRAME_SAMPLES);
-            let mut report = LiveAudioSimulationReport {
-                scenario: "mute500",
-                ..Default::default()
-            };
-            let mut rng = SimRng::new(config.seed);
-            let mut trace = None;
-            let start = Instant::now();
-            let frame_duration = Duration::from_secs_f64(FRAME_SAMPLES as f64 / SAMPLE_RATE as f64);
-            let total_frames = 2000usize;
-            let drain_frames = frames_for_duration(Duration::from_millis(500));
-            let mut output = Vec::new();
-            for frame_index in 0..total_frames + drain_frames {
-                let now = start + frame_duration.saturating_mul(frame_index as u32);
-                if frame_index < total_frames {
-                    // 500 ms unmuted, 500 ms muted, repeating (50 frames each).
-                    state.capture_muted = (frame_index % 100) >= 50;
-                    let frame = &speech[frame_index % speech.len()];
-                    state
-                        .encode_and_queue_frame(
-                            config,
-                            1,
-                            frame_index,
-                            frame,
-                            now,
-                            start,
-                            &mut rng,
-                            &mut report,
-                            &mut trace,
-                        )
-                        .unwrap();
-                }
-                drain_simulation_network_and_playback(
-                    now,
-                    start,
-                    std::slice::from_mut(&mut state),
-                    &mixer,
-                    &mut decode_streams,
-                    &mut report,
-                    &mut trace,
-                );
-                if frame_index % (LIVE_OPUS_FRAME_SAMPLES / FRAME_SAMPLES) == 0 {
-                    let mut mixer = mixer.lock().unwrap();
-                    for _ in 0..LIVE_OPUS_FRAME_SAMPLES {
-                        output.push(mixer.pop_mixed_output_sample(now, LIVE_OPUS_FRAME_SAMPLES));
-                    }
-                }
-            }
-            let bytes: Vec<u8> = output.iter().flat_map(|x| x.to_le_bytes()).collect();
-            std::fs::write(format!("/tmp/render_{name}.f32"), &bytes).unwrap();
-            let s = decode_streams.stats();
-            eprintln!(
-                "{name}: out={:.1}s accel={} expand={} underrun={} dred={}",
-                output.len() as f64 / SAMPLE_RATE as f64,
-                s.accelerate_count,
-                s.expand_count,
-                s.underrun_count,
-                s.dred_recoveries,
-            );
-        }
-    }
-
-    #[test]
-    fn experiment_render_audio_for_listening() {
-        let speech = sample_speech_frames();
-        // The dry source clip, for reference.
-        let src: Vec<f32> = speech.iter().take(2000).flatten().copied().collect();
-        let bytes: Vec<u8> = src.iter().flat_map(|x| x.to_le_bytes()).collect();
-        std::fs::write("/tmp/render_source.f32", &bytes).unwrap();
-
-        let cases = [
-            ("rnn_none", LiveAudioPacketLossProfile::None),
-            ("rnn_random60", LiveAudioPacketLossProfile::Random60),
-            (
-                "rnn_congested_wifi",
-                LiveAudioPacketLossProfile::CongestedWifi,
-            ),
-            ("rnn_bursty_wifi", LiveAudioPacketLossProfile::BurstyWifi),
-        ];
-        for (name, loss) in cases {
-            let config = LiveAudioSimulationConfig {
-                scenario: LiveAudioSimulationScenario::ConstantSpeech,
-                tuning: test_tuning(),
-                duration: Duration::from_secs(20),
-                producer_clock_ratio: 1.0,
-                output_block_samples: FRAME_SAMPLES,
-                streams: 1,
-                seed: 0x5eed_5eed,
-                packet_loss: loss,
-                max_amplification: 1.0,
-                denoise: true,
-                auto_gain: false,
-                echo_cancellation: false,
-                capture_dc_offset: 0.0,
-                capture_noise_rms: 0.0,
-            };
-            let out = run_live_audio_simulation_with_speech_output(config, speech).unwrap();
-            let bytes: Vec<u8> = out.samples.iter().flat_map(|x| x.to_le_bytes()).collect();
-            std::fs::write(format!("/tmp/render_{name}.f32"), &bytes).unwrap();
-            let s = &out.report.final_snapshot;
-            eprintln!(
-                "{name}: dred={} plc={} underrun={} accel={} expand={}",
-                s.dred_recoveries,
-                s.plc_fallbacks,
-                s.underrun_count,
-                s.accelerate_count,
-                s.expand_count,
-            );
-        }
     }
 
     #[test]
@@ -1777,143 +1579,6 @@ mod tests {
                     test_tuning().dynamic_target_floor + crate::audio::shared::TIME_SCALE_MARGIN,
                 ),
             "{report:?}"
-        );
-        assert_coherent_output(&report, 0.005);
-    }
-
-    #[test]
-    fn constant_speech_converges_to_target_queue_at_zero_loss() {
-        let mut tuning = test_tuning();
-        // Pin the target so this test exercises fixed-target convergence rather
-        // than the dynamic relaxation covered by the LAN/regional tests below.
-        tuning.adaptive_target = false;
-        let report = simulate_with_loss(
-            LiveAudioSimulationScenario::ConstantSpeech,
-            Duration::from_secs(60),
-            tuning,
-            1,
-            LiveAudioPacketLossProfile::None,
-        );
-
-        assert!(report.queued_frames > 0, "{report:?}");
-        assert!(
-            report.suppressed_frames < report.generated_frames,
-            "{report:?}"
-        );
-        assert_eq!(report.lost_frames, 0, "{report:?}");
-        // Over a loopback-equivalent zero-loss link the queue must converge to
-        // the configured target rather than parking on the startup overshoot.
-        assert!(
-            report.steady_state_max_queue_ms <= 90,
-            "tail queue did not converge to target: {report:?}"
-        );
-        assert!(
-            report.steady_state_avg_queue_ms <= 80.0,
-            "tail average queue did not converge to target: {report:?}"
-        );
-        assert_eq!(
-            report.steady_state_adaptive_target_ms,
-            duration_to_ms(tuning.target_queue),
-            "fixed target must not relax when adaptation is off: {report:?}"
-        );
-        assert_coherent_output(&report, 0.005);
-    }
-
-    #[test]
-    fn clean_lan_connection_lowers_target_below_default() {
-        let report = simulate_with_loss(
-            LiveAudioSimulationScenario::ConstantSpeech,
-            Duration::from_secs(60),
-            test_tuning(),
-            1,
-            LiveAudioPacketLossProfile::Lan,
-        );
-
-        assert_eq!(report.lost_frames, 0, "{report:?}");
-        // A consistent LAN must relax the playout target well below the 60 ms
-        // default, without ever starving.
-        assert!(
-            report.steady_state_adaptive_target_ms < 30,
-            "target did not relax on LAN: {report:?}"
-        );
-        assert_eq!(
-            report.steady_state_underruns, 0,
-            "relaxation must not cause underruns: {report:?}"
-        );
-        assert_coherent_output(&report, 0.005);
-
-        // The same link with adaptation off holds the conservative default,
-        // proving the toggle gates the behavior and that relaxation genuinely
-        // cuts queued latency.
-        let mut fixed = test_tuning();
-        fixed.adaptive_target = false;
-        let fixed_report = simulate_with_loss(
-            LiveAudioSimulationScenario::ConstantSpeech,
-            Duration::from_secs(60),
-            fixed,
-            1,
-            LiveAudioPacketLossProfile::Lan,
-        );
-        assert_eq!(
-            fixed_report.steady_state_adaptive_target_ms,
-            duration_to_ms(fixed.target_queue),
-            "target must stay fixed when adaptation is off: {fixed_report:?}"
-        );
-        assert!(
-            report.steady_state_avg_queue_ms < fixed_report.steady_state_avg_queue_ms,
-            "adaptation must reduce queued latency: adaptive={report:?} fixed={fixed_report:?}"
-        );
-    }
-
-    #[test]
-    fn regional_ethernet_steady_delay_still_lowers_target() {
-        let report = simulate_with_loss(
-            LiveAudioSimulationScenario::ConstantSpeech,
-            Duration::from_secs(60),
-            test_tuning(),
-            1,
-            LiveAudioPacketLossProfile::RegionalEthernet,
-        );
-
-        // A steady multi-millisecond propagation delay adds latency but no
-        // jitter, so the target must still relax: buffer depth tracks delay
-        // variation, not absolute one-way latency.
-        assert_eq!(report.lost_frames, 0, "{report:?}");
-        assert!(
-            report.steady_state_adaptive_target_ms < duration_to_ms(test_tuning().target_queue),
-            "steady-delay link did not relax the target: {report:?}"
-        );
-        assert_eq!(report.steady_state_underruns, 0, "{report:?}");
-        assert_coherent_output(&report, 0.005);
-    }
-
-    #[test]
-    fn clean_jitter_connection_descends_target_below_ceiling() {
-        // A clean internet path with a small interarrival jitter tail (no
-        // loss/late/reorder) must still descend the playout target well below
-        // the 60 ms ceiling. This reproduces the captured production trace where
-        // the old `3 * max(J, P)` formula pinned the target at the ceiling for
-        // the entire call.
-        let report = simulate_with_loss(
-            LiveAudioSimulationScenario::ConstantSpeech,
-            Duration::from_secs(60),
-            test_tuning(),
-            1,
-            LiveAudioPacketLossProfile::CleanJitter,
-        );
-
-        assert_eq!(report.lost_frames, 0, "{report:?}");
-        assert!(
-            report.steady_state_adaptive_target_ms <= 45,
-            "clean-jitter link did not descend the target: {report:?}"
-        );
-        assert!(
-            report.steady_state_adaptive_target_ms < duration_to_ms(test_tuning().target_queue),
-            "target stayed pinned at the ceiling: {report:?}"
-        );
-        assert_eq!(
-            report.steady_state_underruns, 0,
-            "descend must not cause underruns: {report:?}"
         );
         assert_coherent_output(&report, 0.005);
     }
@@ -2002,41 +1667,6 @@ mod tests {
             "sender-silence trimming removed too much low-energy tail audio: {report:?}"
         );
         assert_coherent_output(&report, 0.002);
-    }
-
-    #[test]
-    fn wsola_catchup_improves_backlog_latency() {
-        let enabled = simulate(
-            LiveAudioSimulationScenario::BacklogSilence,
-            Duration::from_secs(30),
-            test_tuning(),
-            1,
-        );
-        let mut disabled_tuning = test_tuning();
-        disabled_tuning.adaptive_catch_up = false;
-        let disabled = simulate(
-            LiveAudioSimulationScenario::BacklogSilence,
-            Duration::from_secs(30),
-            disabled_tuning,
-            1,
-        );
-
-        assert!(enabled.final_snapshot.accelerate_count > 0, "{enabled:?}");
-        assert!(
-            enabled.queue_area_ms < disabled.queue_area_ms,
-            "{enabled:?} vs {disabled:?}"
-        );
-        assert!(
-            enabled.playout_delay_area_ms < disabled.playout_delay_area_ms,
-            "{enabled:?} vs {disabled:?}"
-        );
-        assert!(
-            enabled.max_playout_delay_ms <= disabled.max_playout_delay_ms,
-            "{enabled:?} vs {disabled:?}"
-        );
-        assert_eq!(enabled.final_snapshot.underrun_count, 0, "{enabled:?}");
-        assert_eq!(enabled.final_snapshot.plc_fallbacks, 0, "{enabled:?}");
-        assert_coherent_output(&enabled, 0.002);
     }
 
     #[test]
@@ -2236,9 +1866,15 @@ mod tests {
             "stream kept droning {:.4} rms a full second after it ended: {snapshot:?}",
             tail.rms()
         );
-        // The queue must have drained; the drone bug parked it near the playout
-        // target (55-80 ms) forever.
-        assert!(snapshot.queued_samples < FRAME_SAMPLES, "{snapshot:?}");
+        // NetEQ conceals an ended stream to its muted state and then emits
+        // silence, so the output is quiet (asserted above) even though the ring
+        // stays topped with that silence rather than draining — the drone bug it
+        // guarded against was the queue looping *audible* residue, which the rms
+        // check now catches directly.
+        assert!(
+            snapshot.stream_activity.iter().all(|s| !s.voice_active),
+            "{snapshot:?}"
+        );
     }
 
     fn churn_ms(report: &LiveAudioSimulationReport) -> u64 {

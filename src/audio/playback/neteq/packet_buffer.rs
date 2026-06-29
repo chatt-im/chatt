@@ -109,9 +109,7 @@ impl PacketBuffer {
 
         // The element now at `insert_idx` is strictly later than the new packet.
         // If it shares the timestamp it is a lower-priority payload — replace it.
-        if insert_idx < self.buffer.len()
-            && packet.timestamp == self.buffer[insert_idx].timestamp
-        {
+        if insert_idx < self.buffer.len() && packet.timestamp == self.buffer[insert_idx].timestamp {
             let replaced = self.buffer.remove(insert_idx).expect("index in range");
             log_discard(
                 &replaced,
@@ -270,7 +268,10 @@ mod tests {
         buffer.insert_packet(opus(960, 11, Priority::new(2, 0)), &timer);
         buffer.insert_packet(opus(960, 11, Priority::PRIMARY), &timer);
         assert_eq!(buffer.num_packets(), 1);
-        assert_eq!(buffer.peek_next_packet().unwrap().priority, Priority::PRIMARY);
+        assert_eq!(
+            buffer.peek_next_packet().unwrap().priority,
+            Priority::PRIMARY
+        );
         assert_eq!(buffer.secondary_packets_discarded(), 1);
     }
 
@@ -282,7 +283,10 @@ mod tests {
         // A late DRED chunk for an already-present primary is dropped.
         buffer.insert_packet(opus(960, 11, Priority::new(2, 0)), &timer);
         assert_eq!(buffer.num_packets(), 1);
-        assert_eq!(buffer.peek_next_packet().unwrap().priority, Priority::PRIMARY);
+        assert_eq!(
+            buffer.peek_next_packet().unwrap().priority,
+            Priority::PRIMARY
+        );
         assert_eq!(buffer.secondary_packets_discarded(), 1);
     }
 

@@ -210,11 +210,7 @@ impl Default for AudioConfig {
 #[toml(FromToml, ToToml, rename_all = "kebab-case")]
 pub struct AudioLatencyConfig {
     #[toml(default = true)]
-    pub adaptive_catch_up: bool,
-    #[toml(default = true)]
     pub capture_silence_gate: bool,
-    #[toml(default = true)]
-    pub adaptive_target: bool,
     #[toml(default = 60)]
     pub target_queue_ms: u64,
     #[toml(default = 20)]
@@ -245,9 +241,7 @@ impl Default for AudioLatencyConfig {
     fn default() -> Self {
         let tuning = LiveAudioTuning::default();
         Self {
-            adaptive_catch_up: tuning.adaptive_catch_up,
             capture_silence_gate: tuning.capture_silence_gate,
-            adaptive_target: tuning.adaptive_target,
             target_queue_ms: duration_ms(tuning.target_queue),
             dynamic_target_floor_ms: duration_ms(tuning.dynamic_target_floor),
             base_minimum_target_ms: duration_ms(tuning.base_minimum_target),
@@ -267,9 +261,7 @@ impl Default for AudioLatencyConfig {
 impl AudioLatencyConfig {
     pub fn to_tuning(&self) -> LiveAudioTuning {
         LiveAudioTuning {
-            adaptive_catch_up: self.adaptive_catch_up,
             capture_silence_gate: self.capture_silence_gate,
-            adaptive_target: self.adaptive_target,
             target_queue: Duration::from_millis(self.target_queue_ms),
             dynamic_target_floor: Duration::from_millis(self.dynamic_target_floor_ms),
             base_minimum_target: Duration::from_millis(self.base_minimum_target_ms),
@@ -1453,7 +1445,6 @@ input-device-index = 20
     fn runtime_config_writes_audio_latency_knobs() {
         let mut config = Config::default();
         config.audio.latency.target_queue_ms = 80;
-        config.audio.latency.adaptive_target = false;
         config.audio.latency.dynamic_target_floor_ms = 25;
         config.audio.latency.base_minimum_target_ms = 90;
         config.audio.latency.max_target_ms = 1_200;
@@ -1461,7 +1452,6 @@ input-device-index = 20
 
         assert!(content.contains("[audio.latency]"));
         assert!(content.contains("target-queue-ms = 80"));
-        assert!(content.contains("adaptive-target = false"));
         assert!(content.contains("dynamic-target-floor-ms = 25"));
         assert!(content.contains("base-minimum-target-ms = 90"));
         assert!(content.contains("max-target-ms = 1200"));

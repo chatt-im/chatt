@@ -202,7 +202,9 @@ impl NetEqConcealment {
     /// decision logic reads it via `Expand::MuteFactor`. Used to populate
     /// [`crate::audio::playback::neteq`]'s decision status snapshot.
     pub(crate) fn expand_mute_factor_q14(&self) -> i16 {
-        (self.expand.mute_factor() * 16_384.0).round().clamp(0.0, 16_384.0) as i16
+        (self.expand.mute_factor() * 16_384.0)
+            .round()
+            .clamp(0.0, 16_384.0) as i16
     }
 }
 
