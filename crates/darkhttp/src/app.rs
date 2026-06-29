@@ -2,6 +2,7 @@ use std::collections::VecDeque;
 use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpListener};
 use std::os::fd::{AsRawFd, RawFd};
+use std::sync::Arc;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
@@ -339,6 +340,18 @@ impl App {
                     response::bytes(
                         asset.body.clone(),
                         &asset.content_type,
+                        None,
+                        request.keep_alive,
+                        self.config.timeout,
+                        request.is_head(),
+                    )
+                } else if let Some((content_type, encoding, body)) =
+                    self.router.embedded_asset(request.path.as_str())
+                {
+                    response::bytes(
+                        Arc::from(body),
+                        content_type,
+                        (!encoding.is_empty()).then_some(encoding),
                         request.keep_alive,
                         self.config.timeout,
                         request.is_head(),
