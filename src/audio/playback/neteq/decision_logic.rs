@@ -403,6 +403,54 @@ mod tests {
         }
     }
 
+    fn info(main_timestamp: u32, seq: u16) -> PacketArrivedInfo {
+        PacketArrivedInfo {
+            packet_length_samples: 960,
+            main_timestamp,
+            main_sequence_number: seq,
+            is_cng_or_dtmf: false,
+            is_dtx: false,
+            buffer_flush: false,
+        }
+    }
+
+    /// When each arriving packet reports its own primary timestamp — as
+    /// `core.rs::insert_packet` does after decoupling arrival stats from the
+    /// DRED `main_timestamp` rewrite — a reordered packet is `!is_newest` and the
+    /// reorder optimizer grows the target above the floor. (If a DRED-recovered
+    /// timestamp were reported instead, the genuine reordered arrival would
+    /// collide in `PacketArrivalHistory::Contains` and the reorder would never
+    /// reach the optimizer; see the end-to-end guard
+    /// `dred_must_not_starve_reorder_optimizer` in the sim harness.)
+    #[test]
+    fn visible_reordering_grows_target_above_floor() {
+        let mut timer = TickTimer::new();
+        let mut logic = logic(&timer);
+        let packets = 400u32;
+        let mut seq = 0u32;
+        while seq < packets {
+            let reorder = seq > 0 && seq % 8 == 0 && seq + 1 < packets;
+            if reorder {
+                // The later packet arrives a slot early, then the expected one
+                // arrives late and out of order — each under its own timestamp.
+                logic.packet_arrived(48000, true, &info((seq + 1) * 960, (seq + 1) as u16), &timer);
+                timer.increment_by(2);
+                logic.packet_arrived(48000, true, &info(seq * 960, seq as u16), &timer);
+                timer.increment_by(2);
+                seq += 2;
+            } else {
+                logic.packet_arrived(48000, true, &info(seq * 960, seq as u16), &timer);
+                timer.increment_by(2);
+                seq += 1;
+            }
+        }
+        assert!(
+            logic.target_level_ms() > 20,
+            "reordering left the target at the floor: {} ms",
+            logic.target_level_ms()
+        );
+    }
+
     #[test]
     fn no_packet_expands() {
         let timer = TickTimer::new();
