@@ -61,6 +61,10 @@ pub struct SecurityConfig {
     pub chat_history_limit: u64,
     #[toml(default = DEFAULT_FILE_SIZE_LIMIT_BYTES)]
     pub max_file_size_bytes: u64,
+    /// Directory where `/report-bug` bundles are saved. Bug reports are rejected
+    /// when unset.
+    #[toml(default)]
+    pub bug_report_dir: Option<String>,
 }
 
 impl Default for SecurityConfig {
@@ -71,6 +75,7 @@ impl Default for SecurityConfig {
             encryption: true,
             chat_history_limit: 0,
             max_file_size_bytes: DEFAULT_FILE_SIZE_LIMIT_BYTES,
+            bug_report_dir: None,
         }
     }
 }
@@ -401,9 +406,13 @@ impl Config {
             self.security.chat_history_limit
         ));
         out.push_str(&format!(
-            "max-file-size-bytes = {}\n\n",
+            "max-file-size-bytes = {}\n",
             self.security.max_file_size_bytes
         ));
+        if let Some(dir) = &self.security.bug_report_dir {
+            out.push_str(&format!("bug-report-dir = \"{}\"\n", toml_quote_value(dir)));
+        }
+        out.push('\n');
         for room in &self.rooms {
             out.push_str("[[rooms]]\n");
             out.push_str(&format!("id = {}\n", room.id));
@@ -973,6 +982,32 @@ mod tests {
         assert_eq!(restored.users[0].name, "paired-user");
         assert!(restored_content.contains("name = \"paired-user\""));
         assert!(corrupt_content.contains("this is not valid toml"));
+    }
+
+    #[test]
+    fn bug_report_dir_round_trips_through_persisted_config() {
+        let mut config = Config::default();
+        config.security.bug_report_dir = Some("/tmp/chatt-bugs".to_string());
+        let content = config.to_toml_string();
+        assert!(content.contains("bug-report-dir = \"/tmp/chatt-bugs\""));
+
+        let restored = parse_config_content(
+            &content,
+            "<persisted>",
+            Some(PathBuf::from("chatt-server.toml")),
+        )
+        .unwrap();
+        assert_eq!(
+            restored.security.bug_report_dir.as_deref(),
+            Some("/tmp/chatt-bugs")
+        );
+    }
+
+    #[test]
+    fn default_config_omits_bug_report_dir() {
+        let config = Config::default();
+        assert_eq!(config.security.bug_report_dir, None);
+        assert!(!config.to_toml_string().contains("bug-report-dir"));
     }
 
     #[test]

@@ -41,7 +41,7 @@ use rpc::{
         ed25519_public_key_from_hex, generate_client_hello,
     },
     frame,
-    ids::{FileTransferId, RoomId, SessionId, StreamId, UserId},
+    ids::{BugReportId, FileTransferId, RoomId, SessionId, StreamId, UserId},
     media::{self, MediaPayload, VoicePayload as MediaVoicePayload},
 };
 
@@ -134,6 +134,13 @@ pub enum NetworkCommand {
     },
     StopShare {
         stream_id: StreamId,
+    },
+    ReportBug {
+        description: String,
+        /// JSON metadata: app version, device/buffer config, `/audio` snapshot.
+        metadata: String,
+        /// zstd-compressed recent log text.
+        compressed_logs: Vec<u8>,
     },
     Shutdown,
 }
@@ -512,6 +519,8 @@ fn run_worker_inner(
         next_interface_poll: Instant::now() + INTERFACE_POLL_INTERVAL,
         next_file_transfer: 1,
         outgoing_uploads: VecDeque::new(),
+        next_bug_report: 1,
+        outgoing_bug_reports: VecDeque::new(),
         incoming_files: HashMap::new(),
         shutdown: false,
         disconnect_reason: None,
@@ -600,6 +609,9 @@ fn run_worker_inner(
             break;
         }
         if let Err(error) = worker.poll_uploads() {
+            return SessionEnd::Disconnected(error);
+        }
+        if let Err(error) = worker.poll_bug_reports() {
             return SessionEnd::Disconnected(error);
         }
         let now = Instant::now();
@@ -965,6 +977,8 @@ struct WorkerState {
     next_interface_poll: Instant,
     next_file_transfer: u64,
     outgoing_uploads: VecDeque<OutgoingUpload>,
+    next_bug_report: u64,
+    outgoing_bug_reports: VecDeque<OutgoingBugReport>,
     incoming_files: HashMap<FileTransferId, IncomingFile>,
     shutdown: bool,
     disconnect_reason: Option<String>,
@@ -1193,6 +1207,17 @@ struct OutgoingUpload {
     local_copy: Option<(PathBuf, File)>,
     /// Intrinsic image size, parsed from the first chunk as it streams.
     dimensions: Option<(u32, u32)>,
+}
+
+/// An in-flight bug report streamed to the server as a chunked control
+/// transfer, mirroring [`OutgoingUpload`] but sourced from an in-memory buffer.
+struct OutgoingBugReport {
+    report_id: BugReportId,
+    description: String,
+    metadata: String,
+    logs: Vec<u8>,
+    offset: u64,
+    started: bool,
 }
 
 struct IncomingFile {
@@ -1725,6 +1750,22 @@ impl WorkerState {
             NetworkCommand::StopShare { stream_id } => {
                 self.queue_control(ClientControl::StopShare { stream_id })?;
             }
+            NetworkCommand::ReportBug {
+                description,
+                metadata,
+                compressed_logs,
+            } => {
+                let report_id = BugReportId(self.next_bug_report);
+                self.next_bug_report = self.next_bug_report.wrapping_add(1).max(1);
+                self.outgoing_bug_reports.push_back(OutgoingBugReport {
+                    report_id,
+                    description,
+                    metadata,
+                    logs: compressed_logs,
+                    offset: 0,
+                    started: false,
+                });
+            }
             NetworkCommand::Shutdown => {
                 kvlog::info!("shutdown command handling");
                 self.shutdown = true;
@@ -1846,6 +1887,62 @@ impl WorkerState {
             }
         }
         Ok(())
+    }
+
+    fn poll_bug_reports(&mut self) -> Result<(), String> {
+        for _ in 0..MAX_FILE_CHUNKS_PER_TICK {
+            if self.write_buf.len() > MAX_QUEUED_FILE_BYTES {
+                break;
+            }
+            if !self.poll_one_bug_report()? {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    fn poll_one_bug_report(&mut self) -> Result<bool, String> {
+        let Some(mut report) = self.outgoing_bug_reports.pop_front() else {
+            return Ok(false);
+        };
+
+        if !report.started {
+            self.queue_control(ClientControl::BugReportStart {
+                report_id: report.report_id,
+                description: report.description.clone(),
+                metadata: report.metadata.clone(),
+                logs_size: report.logs.len() as u64,
+            })?;
+            report.started = true;
+            let _ = self.events.send(NetworkEvent::Status(format!(
+                "filing bug report ({})",
+                format_bytes(report.logs.len() as u64)
+            )));
+            self.outgoing_bug_reports.push_front(report);
+            return Ok(true);
+        }
+
+        if (report.offset as usize) < report.logs.len() {
+            let start = report.offset as usize;
+            let end = (start + MAX_FILE_CHUNK_BYTES).min(report.logs.len());
+            let data = report.logs[start..end].to_vec();
+            self.queue_control(ClientControl::BugReportChunk {
+                report_id: report.report_id,
+                offset: report.offset,
+                data,
+            })?;
+            report.offset = end as u64;
+            self.outgoing_bug_reports.push_front(report);
+            return Ok(true);
+        }
+
+        self.queue_control(ClientControl::BugReportComplete {
+            report_id: report.report_id,
+        })?;
+        let _ = self
+            .events
+            .send(NetworkEvent::Status("bug report sent".to_string()));
+        Ok(true)
     }
 
     fn poll_one_upload(&mut self) -> Result<bool, String> {
@@ -2451,6 +2548,9 @@ impl WorkerState {
                     .send(NetworkEvent::ShareEnded { room_id, stream_id });
             }
             ServerControl::Pong { .. } => {}
+            ServerControl::BugReportSaved { report_id } => {
+                kvlog::info!("server saved bug report", report_id = report_id.0);
+            }
             ServerControl::Error { code, message } => {
                 kvlog::warn!("server control error", error = message.as_str());
                 if self.session_id.is_none() && is_auth_failure_code(code) {
@@ -3327,6 +3427,7 @@ fn network_command_kind(command: &NetworkCommand) -> &'static str {
         NetworkCommand::SetVoiceStatus(_) => "set_voice_status",
         NetworkCommand::StartShare { .. } => "start_share",
         NetworkCommand::StopShare { .. } => "stop_share",
+        NetworkCommand::ReportBug { .. } => "report_bug",
         NetworkCommand::Shutdown => "shutdown",
     }
 }
@@ -3386,6 +3487,9 @@ fn client_control_kind(control: &ClientControl) -> &'static str {
         ClientControl::StartShare { .. } => "start_share",
         ClientControl::StopShare { .. } => "stop_share",
         ClientControl::Ping { .. } => "ping",
+        ClientControl::BugReportStart { .. } => "bug_report_start",
+        ClientControl::BugReportChunk { .. } => "bug_report_chunk",
+        ClientControl::BugReportComplete { .. } => "bug_report_complete",
     }
 }
 
@@ -3412,6 +3516,7 @@ fn server_control_kind(control: &ServerControl) -> &'static str {
         ServerControl::ShareEnded { .. } => "share_ended",
         ServerControl::Pong { .. } => "pong",
         ServerControl::Error { .. } => "error",
+        ServerControl::BugReportSaved { .. } => "bug_report_saved",
     }
 }
 

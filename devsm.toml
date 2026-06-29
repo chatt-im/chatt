@@ -11,8 +11,8 @@ info = "Local chatt development server"
 [action.json-snapshot-client-logs]
 sh = '''
 kvlog /tmp/chatt-server.kvlog --json > /tmp/chatt-server.json
-kvlog /tmp/chatt-alice.kvlog --json > /tmp/chatt-alice.json
 kvlog /tmp/chatt-soundboard.kvlog --json > /tmp/chatt-soundboard.json
+kvlog /tmp/chatt-alice.kvlog --json > /tmp/chatt-alice.json
 '''
 
 [service.audio-pop-server]

@@ -446,6 +446,8 @@ pub(crate) enum AppEvent {
     Voice(local_control::VoiceCommand),
     Screencast(local_control::ScreencastCommand),
     Web(crate::web_server::WebRequest),
+    /// A bug report request from `chatt report-bug`, carrying the description.
+    ReportBug(String),
 }
 
 impl From<NetworkEvent> for AppEvent {
@@ -710,6 +712,7 @@ impl App {
             AppEvent::Voice(command) => self.apply_voice_command(command),
             AppEvent::Screencast(command) => self.handle_screencast_command(command),
             AppEvent::Web(request) => self.handle_web_request(request),
+            AppEvent::ReportBug(description) => self.start_bug_report(description),
         }
     }
 
@@ -2670,6 +2673,10 @@ impl App {
             "/users" => self.show_users(),
             "/whoami" => self.show_current_user(),
             command if command.starts_with("/upload ") => self.upload_file_command(command),
+            command if command.starts_with("/report-bug ") => {
+                let description = command.trim_start_matches("/report-bug ").trim();
+                self.start_bug_report(description.to_string());
+            }
             command if command.starts_with("/sound") => self.soundboard_command(command),
             command if command.starts_with('/') => {
                 self.set_error(format!("unknown command: {command}"))
@@ -2798,6 +2805,77 @@ impl App {
         );
         self.room.push_notice("audio", diagnostics.notice_body());
         self.set_status(diagnostics.status_summary());
+    }
+
+    /// Bundles recent logs plus audio and device diagnostics and ships them to
+    /// the server as a bug report. Invoked by the `/report-bug` TUI command and
+    /// the `chatt report-bug` CLI subcommand.
+    fn start_bug_report(&mut self, description: String) {
+        if description.is_empty() {
+            self.set_error("usage: /report-bug what went wrong");
+            return;
+        }
+        if self.network.is_none() {
+            self.set_error("select a server before filing a bug report");
+            return;
+        }
+        let metadata = self.bug_report_metadata(&description);
+        let logs = crate::self_log::snapshot_plain_string();
+        let compressed_logs = match zstd::encode_all(logs.as_bytes(), 9) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                self.set_error(format!("failed to compress logs: {error}"));
+                return;
+            }
+        };
+        self.send_network_command(
+            NetworkCommand::ReportBug {
+                description,
+                metadata,
+                compressed_logs,
+            },
+            true,
+        );
+        self.set_status("filing bug report");
+    }
+
+    /// Builds the JSON metadata sidecar saved alongside the compressed logs:
+    /// app version, the `/audio` snapshot, and the device/buffer configuration.
+    fn bug_report_metadata(&self, description: &str) -> String {
+        let audio = match &self.playback {
+            Some(playback) => AudioDiagnostics::new(
+                playback.stats(),
+                self.encoder_profile,
+                self.voice_packets_received,
+                self.voice_bytes_received,
+            )
+            .notice_body(),
+            None => "audio inactive".to_string(),
+        };
+        let unix_time_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_millis() as u64)
+            .unwrap_or(0);
+        let report = jsony::object! {
+            version: env!("CARGO_PKG_VERSION"),
+            description: description,
+            unix_time_ms: unix_time_ms,
+            encoder_profile: self.encoder_profile.label(),
+            voice_packets_received: self.voice_packets_received,
+            voice_bytes_received: self.voice_bytes_received,
+            audio: audio,
+            device: {
+                input_device_id: self.config.audio.input_device_id.as_deref(),
+                output_device_id: self.config.audio.output_device_id.as_deref(),
+                input_buffer: format!("{:?}", self.config.audio.input_buffer),
+                output_buffer: format!("{:?}", self.config.audio.output_buffer),
+                bitrate_bps: self.config.audio.bitrate_bps,
+                max_amplification: self.config.audio.max_amplification,
+                denoise: self.config.audio.denoise.is_enabled(),
+                echo_cancellation: self.config.audio.echo_cancellation,
+            },
+        };
+        report.to_string()
     }
 
     fn show_users(&mut self) {
@@ -3445,6 +3523,7 @@ fn app_network_command_kind(command: &NetworkCommand) -> &'static str {
         NetworkCommand::SetVoiceStatus(_) => "set_voice_status",
         NetworkCommand::StartShare { .. } => "start_share",
         NetworkCommand::StopShare { .. } => "stop_share",
+        NetworkCommand::ReportBug { .. } => "report_bug",
         NetworkCommand::Shutdown => "shutdown",
     }
 }

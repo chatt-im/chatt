@@ -9,6 +9,8 @@ server-identity-seed = "546f6d636861742064657620736572766572206b6579207631000000
 encryption = true
 chat-history-limit = 0
 max-file-size-bytes = 52428800
+# Directory where `/report-bug` bundles are saved. Bug reports are rejected when unset.
+# bug-report-dir = "/tmp/chatt-bugs"
 
 [[rooms]]
 id = 1

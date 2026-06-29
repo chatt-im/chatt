@@ -20,10 +20,11 @@ use ring::rand::SecureRandom;
 use ring::signature::KeyPair;
 use rpc::{
     control::{
-        self, ChatMessage, ClientControl, ERROR_AUTH_REJECTED, ERROR_PAIRING_INVALID_REQUEST,
-        ERROR_PAIRING_NOT_ACTIVE, FileMetadata, InviteTicket, MAX_FILE_CHUNK_BYTES, P2pCandidate,
-        P2pKey, P2pNatKind, P2pPeerInfo, P2pRole, RoomInfo, ServerControl, decode_client_control,
-        decode_client_hello, encode_invite_ticket, encode_server_control, encode_server_hello,
+        self, ChatMessage, ClientControl, ERROR_AUTH_REJECTED, ERROR_BUG_REPORT_REJECTED,
+        ERROR_PAIRING_INVALID_REQUEST, ERROR_PAIRING_NOT_ACTIVE, FileMetadata, InviteTicket,
+        MAX_BUG_REPORT_BYTES, MAX_FILE_CHUNK_BYTES, P2pCandidate, P2pKey, P2pNatKind, P2pPeerInfo,
+        P2pRole, RoomInfo, ServerControl, decode_client_control, decode_client_hello,
+        encode_invite_ticket, encode_server_control, encode_server_hello,
     },
     crypto::{
         AntiReplay, CHANNEL_CONTROL, CHANNEL_VIDEO, ControlTransport, KEY_LEN, KeyMaterial,
@@ -31,7 +32,7 @@ use rpc::{
         respond_to_client_hello, respond_to_client_hello_plaintext,
     },
     frame,
-    ids::{FileTransferId, MessageId, RoomId, SessionId, StreamId, UserId},
+    ids::{BugReportId, FileTransferId, MessageId, RoomId, SessionId, StreamId, UserId},
     media::{self, MediaPayload},
     video::{self, VideoAck, VideoHello, VideoRole},
 };
@@ -181,6 +182,7 @@ struct Server {
     next_connection_id: u64,
     next_file_transfer: u64,
     active_uploads: HashMap<(SessionId, FileTransferId), ServerUpload>,
+    active_bug_reports: HashMap<(SessionId, BugReportId), ServerBugReport>,
     reserved_file_names: HashSet<String>,
     chat_history_limit: usize,
     file_size_limit_bytes: u64,
@@ -270,6 +272,7 @@ impl Server {
             next_connection_id: 1,
             next_file_transfer: 1,
             active_uploads: HashMap::new(),
+            active_bug_reports: HashMap::new(),
             reserved_file_names: HashSet::new(),
             chat_history_limit,
             file_size_limit_bytes,
@@ -1189,6 +1192,37 @@ impl Server {
             }
             (ConnState::Ready, ClientControl::Ping { nonce }) => {
                 self.send_control_to_token(token, &ServerControl::Pong { nonce })
+            }
+            (
+                ConnState::Ready,
+                ClientControl::BugReportStart {
+                    report_id,
+                    description,
+                    metadata,
+                    logs_size,
+                },
+            ) => {
+                let session_id = self.session_for_token(token)?;
+                let result =
+                    self.start_bug_report(session_id, report_id, description, metadata, logs_size);
+                self.report_bug_outcome(token, result)
+            }
+            (
+                ConnState::Ready,
+                ClientControl::BugReportChunk {
+                    report_id,
+                    offset,
+                    data,
+                },
+            ) => {
+                let session_id = self.session_for_token(token)?;
+                let result = self.receive_bug_report_chunk(session_id, report_id, offset, data);
+                self.report_bug_outcome(token, result)
+            }
+            (ConnState::Ready, ClientControl::BugReportComplete { report_id }) => {
+                let session_id = self.session_for_token(token)?;
+                let result = self.complete_bug_report(token, session_id, report_id);
+                self.report_bug_outcome(token, result)
             }
             (ConnState::AwaitClientHello, _) => Err("handshake is not complete".into()),
         }
@@ -2815,6 +2849,8 @@ impl Server {
     /// that supersedes a user's earlier session.
     fn teardown_session(&mut self, session_id: SessionId, reason: &str) {
         self.cancel_uploads_for_session(session_id, reason);
+        self.active_bug_reports
+            .retain(|(owner, _), _| *owner != session_id);
         self.end_shares_for_session(session_id);
         let room_id = self.sessions.get(&session_id).and_then(|s| s.room_id);
         if let Some(room_id) = room_id {
@@ -2930,6 +2966,171 @@ impl Server {
     fn allocate_file_name(&mut self, requested: &str) -> String {
         reserve_unique_file_name(&mut self.reserved_file_names, requested)
     }
+
+    /// Reports a bug-report handler failure to the client as a non-fatal
+    /// `Error` instead of propagating it, so a rejected report (for example
+    /// because no `bug-report-dir` is configured) never tears down the session.
+    fn report_bug_outcome(
+        &mut self,
+        token: Token,
+        result: Result<(), String>,
+    ) -> Result<(), String> {
+        match result {
+            Ok(()) => Ok(()),
+            Err(message) => {
+                kvlog::warn!(
+                    "bug report rejected",
+                    token = token.0,
+                    error = message.as_str()
+                );
+                self.send_control_to_token(
+                    token,
+                    &ServerControl::Error {
+                        code: ERROR_BUG_REPORT_REJECTED,
+                        message,
+                    },
+                )
+            }
+        }
+    }
+
+    fn start_bug_report(
+        &mut self,
+        session_id: SessionId,
+        report_id: BugReportId,
+        description: String,
+        metadata: String,
+        logs_size: u64,
+    ) -> Result<(), String> {
+        if self.config.security.bug_report_dir.is_none() {
+            return Err("bug reports are not enabled on this server".into());
+        }
+        if logs_size > MAX_BUG_REPORT_BYTES {
+            return Err("bug report logs exceed maximum length".into());
+        }
+        kvlog::info!(
+            "bug report starting",
+            session_id = session_id.0,
+            report_id = report_id.0,
+            logs_size
+        );
+        self.active_bug_reports.insert(
+            (session_id, report_id),
+            ServerBugReport {
+                description,
+                metadata,
+                logs: Vec::new(),
+                expected: logs_size,
+            },
+        );
+        Ok(())
+    }
+
+    fn receive_bug_report_chunk(
+        &mut self,
+        session_id: SessionId,
+        report_id: BugReportId,
+        offset: u64,
+        data: Vec<u8>,
+    ) -> Result<(), String> {
+        let report = self
+            .active_bug_reports
+            .get_mut(&(session_id, report_id))
+            .ok_or_else(|| "unknown bug report".to_string())?;
+        if report.logs.len() as u64 != offset {
+            return Err("bug report chunk offset mismatch".into());
+        }
+        let end = offset.saturating_add(data.len() as u64);
+        if end > report.expected {
+            return Err("bug report chunk exceeds declared size".into());
+        }
+        report.logs.extend_from_slice(&data);
+        Ok(())
+    }
+
+    fn complete_bug_report(
+        &mut self,
+        token: Token,
+        session_id: SessionId,
+        report_id: BugReportId,
+    ) -> Result<(), String> {
+        let report = self
+            .active_bug_reports
+            .remove(&(session_id, report_id))
+            .ok_or_else(|| "unknown bug report".to_string())?;
+        if report.logs.len() as u64 != report.expected {
+            return Err("bug report ended before all bytes arrived".into());
+        }
+        let Some(dir) = self.config.security.bug_report_dir.clone() else {
+            return Err("bug reports are not enabled on this server".into());
+        };
+        let display_name = self
+            .sessions
+            .get(&session_id)
+            .map(|session| session.display_name.clone())
+            .unwrap_or_default();
+        let saved = write_bug_report(&dir, &display_name, report_id, &report)?;
+        kvlog::info!(
+            "bug report saved",
+            session_id = session_id.0,
+            report_id = report_id.0,
+            description = report.description.as_str(),
+            logs = saved.as_str()
+        );
+        self.send_control_to_token(token, &ServerControl::BugReportSaved { report_id })
+    }
+}
+
+/// Writes a bug report bundle as two files sharing a unique prefix: the
+/// zstd-compressed logs (`.log.zst`, stored verbatim) and the metadata
+/// (`.json`). Returns the logs path.
+fn write_bug_report(
+    dir: &str,
+    display_name: &str,
+    report_id: BugReportId,
+    report: &ServerBugReport,
+) -> Result<String, String> {
+    let dir = std::path::Path::new(dir);
+    std::fs::create_dir_all(dir)
+        .map_err(|error| format!("failed to create bug-report dir: {error}"))?;
+
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|since| since.as_secs())
+        .unwrap_or(0);
+    let user = sanitize_file_name(if display_name.trim().is_empty() {
+        "anon"
+    } else {
+        display_name
+    });
+    let base = format!("{timestamp}-{user}-{}", report_id.0);
+
+    // Probe for a collision-free prefix using create_new on the logs file.
+    for index in 0u64.. {
+        let prefix = if index == 0 {
+            base.clone()
+        } else {
+            format!("{base}-{index}")
+        };
+        let logs_path = dir.join(format!("{prefix}.log.zst"));
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&logs_path)
+        {
+            Ok(mut file) => {
+                file.write_all(&report.logs)
+                    .map_err(|error| format!("failed to write bug report logs: {error}"))?;
+                let metadata_path = dir.join(format!("{prefix}.json"));
+                std::fs::write(&metadata_path, report.metadata.as_bytes())
+                    .map_err(|error| format!("failed to write bug report metadata: {error}"))?;
+                return Ok(logs_path.display().to_string());
+            }
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(format!("failed to create bug report file: {error}")),
+        }
+    }
+    unreachable!("u64 bug-report suffix space exhausted")
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -3015,6 +3216,15 @@ struct ServerUpload {
     size: u64,
     received: u64,
     recipients: HashSet<SessionId>,
+}
+
+/// An in-progress bug report upload, accumulated until completion then written
+/// to the configured `bug-report-dir`.
+struct ServerBugReport {
+    description: String,
+    metadata: String,
+    logs: Vec<u8>,
+    expected: u64,
 }
 
 #[derive(Clone)]
@@ -3306,6 +3516,9 @@ fn client_control_kind(control: &ClientControl) -> &'static str {
         ClientControl::StartShare { .. } => "start_share",
         ClientControl::StopShare { .. } => "stop_share",
         ClientControl::Ping { .. } => "ping",
+        ClientControl::BugReportStart { .. } => "bug_report_start",
+        ClientControl::BugReportChunk { .. } => "bug_report_chunk",
+        ClientControl::BugReportComplete { .. } => "bug_report_complete",
     }
 }
 
@@ -3339,12 +3552,41 @@ fn server_control_kind(control: &ServerControl) -> &'static str {
         ServerControl::ShareEnded { .. } => "share_ended",
         ServerControl::Pong { .. } => "pong",
         ServerControl::Error { .. } => "error",
+        ServerControl::BugReportSaved { .. } => "bug_report_saved",
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn write_bug_report_creates_paired_files() {
+        let dir = std::env::temp_dir().join(format!("chatt-bug-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let report = ServerBugReport {
+            description: "stuck mute".to_string(),
+            metadata: "{\"version\":\"0.1.0\"}".to_string(),
+            logs: vec![1, 2, 3, 4],
+            expected: 4,
+        };
+        let logs_path = write_bug_report(
+            dir.to_str().unwrap(),
+            "Alice Tester",
+            BugReportId(7),
+            &report,
+        )
+        .unwrap();
+
+        assert!(logs_path.ends_with(".log.zst"));
+        let logs = std::fs::read(&logs_path).unwrap();
+        assert_eq!(logs, vec![1, 2, 3, 4]);
+        let metadata_path = logs_path.replace(".log.zst", ".json");
+        let metadata = std::fs::read_to_string(&metadata_path).unwrap();
+        assert_eq!(metadata, "{\"version\":\"0.1.0\"}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     fn test_room(room_id: RoomId, members: &[SessionId]) -> RoomState {
         RoomState {

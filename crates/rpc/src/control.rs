@@ -1,12 +1,15 @@
 use jsony::Jsony;
 
-use crate::ids::{FileTransferId, MessageId, RoomId, SessionId, StreamId, UserId};
+use crate::ids::{BugReportId, FileTransferId, MessageId, RoomId, SessionId, StreamId, UserId};
 
 pub const MAX_CONTROL_PAYLOAD_BYTES: usize = 64 * 1024;
 pub const MAX_CHAT_BODY_BYTES: usize = 8 * 1024;
 pub const DEFAULT_FILE_SIZE_LIMIT_BYTES: u64 = 50 * 1024 * 1024;
 pub const MAX_FILE_CHUNK_BYTES: usize = 32 * 1024;
 pub const MAX_FILE_NAME_BYTES: usize = 255;
+pub const MAX_BUG_REPORT_DESC_BYTES: usize = 4 * 1024;
+pub const MAX_BUG_REPORT_METADATA_BYTES: usize = 32 * 1024;
+pub const MAX_BUG_REPORT_BYTES: u64 = 8 * 1024 * 1024;
 pub const MAX_AUTH_FIELD_BYTES: usize = 512;
 pub const MAX_VIDEO_CODEC_BYTES: usize = 64;
 pub const MAX_VIDEO_EXTRADATA_BYTES: usize = 4 * 1024;
@@ -16,6 +19,7 @@ pub const ERROR_AUTH_REJECTED: u16 = 401;
 pub const ERROR_PAIRING_NOT_ACTIVE: u16 = 410;
 pub const ERROR_PAIRING_CODE_MISMATCH: u16 = 409;
 pub const ERROR_PAIRING_INVALID_REQUEST: u16 = 422;
+pub const ERROR_BUG_REPORT_REJECTED: u16 = 400;
 pub const JOIN_STRING_PREFIX: &str = "tcj1_";
 const MAX_JOIN_STRING_BYTES: usize = 4096;
 const BASE64URL: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
@@ -108,6 +112,22 @@ pub enum ClientControl {
     },
     Ping {
         nonce: u64,
+    },
+    BugReportStart {
+        report_id: BugReportId,
+        description: String,
+        /// JSON metadata: app version, device/buffer config, `/audio` snapshot.
+        metadata: String,
+        /// Total length of the zstd-compressed log payload that follows.
+        logs_size: u64,
+    },
+    BugReportChunk {
+        report_id: BugReportId,
+        offset: u64,
+        data: Vec<u8>,
+    },
+    BugReportComplete {
+        report_id: BugReportId,
     },
 }
 
@@ -209,6 +229,9 @@ pub enum ServerControl {
     Error {
         code: u16,
         message: String,
+    },
+    BugReportSaved {
+        report_id: BugReportId,
     },
 }
 
@@ -511,6 +534,30 @@ fn validate_client_control(value: &ClientControl) -> Result<(), String> {
         ClientControl::UploadFileCancel { reason, .. } => {
             if reason.len() > 512 {
                 return Err("file cancel reason exceeds maximum length".to_string());
+            }
+        }
+        ClientControl::BugReportStart {
+            description,
+            metadata,
+            logs_size,
+            ..
+        } => {
+            if description.len() > MAX_BUG_REPORT_DESC_BYTES {
+                return Err("bug report description exceeds maximum length".to_string());
+            }
+            if metadata.len() > MAX_BUG_REPORT_METADATA_BYTES {
+                return Err("bug report metadata exceeds maximum length".to_string());
+            }
+            if *logs_size > MAX_BUG_REPORT_BYTES {
+                return Err("bug report logs exceed maximum length".to_string());
+            }
+        }
+        ClientControl::BugReportChunk { data, .. } => {
+            if data.is_empty() {
+                return Err("bug report chunk is empty".to_string());
+            }
+            if data.len() > MAX_FILE_CHUNK_BYTES {
+                return Err("bug report chunk exceeds maximum length".to_string());
             }
         }
         ClientControl::StartShare {
@@ -873,6 +920,37 @@ mod tests {
         };
         let encoded = encode_client_control(&control).unwrap();
         assert_eq!(decode_client_control(&encoded).unwrap(), control);
+    }
+
+    #[test]
+    fn bug_report_control_round_trips() {
+        let start = ClientControl::BugReportStart {
+            report_id: BugReportId(4),
+            description: "audio cut out after rejoin".to_string(),
+            metadata: "{\"version\":\"0.1.0\"}".to_string(),
+            logs_size: 2048,
+        };
+        let encoded = encode_client_control(&start).unwrap();
+        assert_eq!(decode_client_control(&encoded).unwrap(), start);
+
+        let chunk = ClientControl::BugReportChunk {
+            report_id: BugReportId(4),
+            offset: 32,
+            data: vec![9, 8, 7],
+        };
+        let encoded = encode_client_control(&chunk).unwrap();
+        assert_eq!(decode_client_control(&encoded).unwrap(), chunk);
+    }
+
+    #[test]
+    fn bug_report_rejects_oversize_logs() {
+        let control = ClientControl::BugReportStart {
+            report_id: BugReportId(1),
+            description: String::new(),
+            metadata: String::new(),
+            logs_size: MAX_BUG_REPORT_BYTES + 1,
+        };
+        assert!(encode_client_control(&control).is_err());
     }
 
     #[test]

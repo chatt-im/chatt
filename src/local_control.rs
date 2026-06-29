@@ -26,6 +26,8 @@ mod imp {
     const OP_UPLOAD: u8 = 1;
     const OP_VOICE: u8 = 2;
     const OP_SCREENCAST: u8 = 3;
+    const OP_CLIENT_LOGS: u8 = 4;
+    const OP_REPORT_BUG: u8 = 5;
     const SCREENCAST_START: u8 = 0;
     const SCREENCAST_STOP: u8 = 1;
     const STATUS_OK: u8 = 0;
@@ -34,6 +36,8 @@ mod imp {
     const MAX_RESPONSE_BYTES: u32 = 8 * 1024;
     const ACCEPT_SLEEP: Duration = Duration::from_millis(20);
     const STREAM_TIMEOUT: Duration = Duration::from_secs(2);
+    /// Poll interval for `client-logs --follow` streaming.
+    const FOLLOW_POLL: Duration = Duration::from_millis(150);
 
     const VOICE_TARGET_MUTE: u8 = 0;
     const VOICE_TARGET_DEAFEN: u8 = 1;
@@ -341,6 +345,8 @@ mod imp {
         Upload(PathBuf),
         Voice(VoiceCommand),
         Screencast(ScreencastCommand),
+        ClientLogs { follow: bool },
+        ReportBug(String),
     }
 
     struct Response {
@@ -465,7 +471,27 @@ mod imp {
     fn handle_connection(stream: &mut UnixStream, commands: &CommandSender, voice: &EventSender) {
         let _ = stream.set_read_timeout(Some(STREAM_TIMEOUT));
         let _ = stream.set_write_timeout(Some(STREAM_TIMEOUT));
-        let response = match read_request(stream) {
+        let request = read_request(stream);
+        // `client-logs` streams the in-memory ring directly, bypassing the
+        // bounded `Response` path (a snapshot far exceeds `MAX_RESPONSE_BYTES`).
+        if let Ok(Request::ClientLogs { follow }) = request {
+            stream_client_logs(stream, follow);
+            return;
+        }
+        let response = match request {
+            Ok(Request::ClientLogs { .. }) => unreachable!("handled above"),
+            Ok(Request::ReportBug(description)) => {
+                match voice.send(crate::app::AppEvent::ReportBug(description)) {
+                    Ok(()) => Response {
+                        status: STATUS_OK,
+                        message: "queued bug report".to_string(),
+                    },
+                    Err(_) => Response {
+                        status: STATUS_ERROR,
+                        message: "chatt client is not running".to_string(),
+                    },
+                }
+            }
             Ok(Request::Upload(path)) => {
                 let message = format!("queued upload {}", path.display());
                 match commands.send(NetworkCommand::UploadFile(path)) {
@@ -512,6 +538,115 @@ mod imp {
         }
     }
 
+    /// Writes the decoded log ring to `stream`. With `follow`, hands a cloned
+    /// stream to a detached thread that polls the ring and streams new records
+    /// until the reader disconnects, keeping the accept loop unblocked.
+    fn stream_client_logs(stream: &mut UnixStream, follow: bool) {
+        let _ = stream.set_write_timeout(Some(STREAM_TIMEOUT));
+        let mut raw = Vec::new();
+        let mut offset = crate::self_log::snapshot_from(0, &mut raw);
+        let mut text = String::new();
+        crate::self_log::decode_to_colored(&raw, &mut text);
+        if stream.write_all(text.as_bytes()).is_err() || !follow {
+            return;
+        }
+
+        let Ok(mut owned) = stream.try_clone() else {
+            return;
+        };
+        // No write timeout while following: block on a slow-but-live reader
+        // rather than tearing the stream down mid-read.
+        let _ = owned.set_write_timeout(None);
+        let spawned = thread::Builder::new()
+            .name("chatt-logs-follow".to_string())
+            .stack_size(256 * 1024)
+            .spawn(move || {
+                loop {
+                    thread::sleep(FOLLOW_POLL);
+                    let mut raw = Vec::new();
+                    let new_offset = crate::self_log::snapshot_from(offset, &mut raw);
+                    if new_offset == offset {
+                        continue;
+                    }
+                    offset = new_offset;
+                    let mut text = String::new();
+                    crate::self_log::decode_to_colored(&raw, &mut text);
+                    if owned.write_all(text.as_bytes()).is_err() {
+                        break;
+                    }
+                }
+            });
+        if let Err(error) = spawned {
+            kvlog::warn!("client-logs follow thread failed to start", error = %error);
+        }
+    }
+
+    pub fn send_client_logs(follow: bool) -> Result<(), String> {
+        let socket_path = socket_path()?;
+        let mut stream = UnixStream::connect(&socket_path).map_err(|error| {
+            format!(
+                "no active chatt control socket at {}; start chatt or set {SOCKET_ENV}: {error}",
+                socket_path.display()
+            )
+        })?;
+        write_simple_request(&mut stream, OP_CLIENT_LOGS, &[u8::from(follow)])?;
+        let mut stdout = io::stdout().lock();
+        let mut chunk = [0u8; 16 * 1024];
+        loop {
+            match stream.read(&mut chunk) {
+                Ok(0) => return Ok(()),
+                Ok(read) => stdout
+                    .write_all(&chunk[..read])
+                    .map_err(|error| format!("failed to write logs: {error}"))?,
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                Err(error) => return Err(format!("failed to read logs: {error}")),
+            }
+        }
+    }
+
+    pub fn send_report_bug(description: &str) -> Result<String, String> {
+        let socket_path = socket_path()?;
+        let mut stream = UnixStream::connect(&socket_path).map_err(|error| {
+            format!(
+                "no active chatt control socket at {}; start chatt or set {SOCKET_ENV}: {error}",
+                socket_path.display()
+            )
+        })?;
+        stream
+            .set_read_timeout(Some(STREAM_TIMEOUT))
+            .map_err(|error| format!("failed to set control socket read timeout: {error}"))?;
+        stream
+            .set_write_timeout(Some(STREAM_TIMEOUT))
+            .map_err(|error| format!("failed to set control socket write timeout: {error}"))?;
+        write_simple_request(&mut stream, OP_REPORT_BUG, description.as_bytes())?;
+        let response = read_response(&mut stream)?;
+        match response.status {
+            STATUS_OK => Ok(response.message),
+            STATUS_ERROR => Err(response.message),
+            status => Err(format!("control socket returned unknown status {status}")),
+        }
+    }
+
+    fn write_simple_request(
+        stream: &mut UnixStream,
+        opcode: u8,
+        body: &[u8],
+    ) -> Result<(), String> {
+        let len = u32::try_from(body.len())
+            .map_err(|_| "control request is too long for control socket".to_string())?;
+        if len > MAX_PATH_BYTES {
+            return Err(format!("control request exceeds {MAX_PATH_BYTES} bytes"));
+        }
+        let mut frame = Vec::with_capacity(MAGIC.len() + 1 + 4 + body.len());
+        frame.extend_from_slice(MAGIC);
+        frame.push(opcode);
+        frame.extend_from_slice(&len.to_be_bytes());
+        frame.extend_from_slice(body);
+        stream
+            .write_all(&frame)
+            .map_err(|error| format!("failed to write control request: {error}"))
+    }
+
     fn read_request(stream: &mut UnixStream) -> Result<Request, String> {
         let mut reader = BufReader::new(stream);
         let mut magic = vec![0u8; MAGIC.len()];
@@ -544,6 +679,12 @@ mod imp {
             ))),
             OP_VOICE => Ok(Request::Voice(VoiceCommand::decode(&body)?)),
             OP_SCREENCAST => Ok(Request::Screencast(ScreencastCommand::decode(&body)?)),
+            OP_CLIENT_LOGS => Ok(Request::ClientLogs {
+                follow: body.first().is_some_and(|byte| *byte != 0),
+            }),
+            OP_REPORT_BUG => String::from_utf8(body)
+                .map(Request::ReportBug)
+                .map_err(|_| "bug report description is not UTF-8".to_string()),
             opcode => Err(format!("unknown control request opcode {opcode}")),
         }
     }
@@ -895,8 +1036,17 @@ mod imp {
     pub fn send_screencast(_command: ScreencastCommand) -> Result<String, String> {
         Err("chatt screencast is only supported on Unix".to_string())
     }
+
+    pub fn send_client_logs(_follow: bool) -> Result<(), String> {
+        Err("chatt client-logs is only supported on Unix".to_string())
+    }
+
+    pub fn send_report_bug(_description: &str) -> Result<String, String> {
+        Err("chatt report-bug is only supported on Unix".to_string())
+    }
 }
 
 pub use imp::{
-    ControlSocket, ScreencastCommand, VoiceCommand, send_screencast, send_upload, send_voice,
+    ControlSocket, ScreencastCommand, VoiceCommand, send_client_logs, send_report_bug,
+    send_screencast, send_upload, send_voice,
 };
