@@ -729,7 +729,7 @@ mod tests {
              output: ring max {}ms, queued {} samples\n\
              neteq: playout {}ms, target {}ms (start {}ms), packets wait {}ms span {}ms / {} pkts\n\
              timing: accelerate {}ms / {}, expand {}ms / {}\n\
-             recovery: dred {}, horizon {}ms, missed {}ms / {}, plc {}, trims {}, underruns {}\n\
+             recovery: dred {}, fec {}, horizon {}ms, missed {}ms / {}, plc {}, trims {}, underruns {}\n\
              active streams: {}\n\
              network\n\
              voice rx: {} packets / {}B\n\
@@ -747,6 +747,7 @@ mod tests {
             samples_to_ms(snapshot.expand_samples as usize),
             snapshot.expand_count,
             snapshot.dred_recoveries,
+            snapshot.fec_recoveries,
             snapshot.dred_last_horizon_ms,
             snapshot.dred_missed_horizon_ms,
             snapshot.dred_missed_horizon_count,

@@ -411,6 +411,7 @@ pub(crate) struct LivePlaybackMixerStats {
     pub(crate) hard_trim_count: u64,
     pub(crate) underrun_count: u64,
     pub(crate) dred_recoveries: u64,
+    pub(crate) fec_recoveries: u64,
     pub(crate) plc_fallbacks: u64,
     pub(crate) concealment_expands: u64,
     pub(crate) decode_errors: u64,

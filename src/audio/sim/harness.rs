@@ -1572,8 +1572,9 @@ mod tests {
         let churn_ms = accelerate_ms + expand_ms;
 
         eprintln!(
-            "random60 direct sample: dred={} plc={} underruns={} accel={}({}ms) expand={}({}ms) churn={}ms output={}ms max_output_ring={}ms max_delta={:.3}",
+            "random60 direct sample: dred={} fec={} plc={} underruns={} accel={}({}ms) expand={}({}ms) churn={}ms output={}ms max_output_ring={}ms max_delta={:.3}",
             snapshot.dred_recoveries,
+            snapshot.fec_recoveries,
             snapshot.plc_fallbacks,
             snapshot.underrun_count,
             snapshot.accelerate_count,
@@ -1587,6 +1588,11 @@ mod tests {
         );
 
         assert!(snapshot.dred_recoveries > 0, "{:?}", output.report);
+        assert!(
+            snapshot.fec_recoveries > 0,
+            "in-band FEC should recover isolated losses: {:?}",
+            output.report
+        );
         assert_eq!(
             snapshot.plc_fallbacks, 0,
             "sequence gaps should no longer route through Opus PLC: {:?}",

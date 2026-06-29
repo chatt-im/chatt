@@ -528,6 +528,7 @@ impl LiveDecodeStreams {
             hard_trim_count: self.stats.hard_trim_count,
             underrun_count: self.stats.underrun_count,
             dred_recoveries: self.stats.dred_recoveries,
+            fec_recoveries: self.stats.fec_recoveries,
             plc_fallbacks: self.stats.plc_fallbacks,
             concealment_expands: self.stats.concealment_expands,
             decode_errors: self.stats.decode_errors,
