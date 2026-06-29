@@ -234,10 +234,6 @@ impl NetEqCore {
             dred,
         );
         let main_timestamp = packets.first().map_or(timestamp, |packet| packet.timestamp);
-        let primary_count = packets
-            .iter()
-            .filter(|packet| packet.priority.codec_level == 0)
-            .count();
         let mut packets = packets;
         if muted {
             // Tag the primary (codec_level 0) so the decode loop fades it.
@@ -258,30 +254,37 @@ impl NetEqCore {
             self.new_codec = true;
         }
 
-        let mut buffer_flush = false;
+        // Insert each redundancy unit and notify the controller once per unit,
+        // exactly as `NetEqImpl::InsertPacketInternal` loops over the parsed
+        // packet list calling `ToPacketArrivedInfo(packet)` + `PacketArrived` for
+        // every entry. Each unit reports its OWN timestamp and decoded duration
+        // (a 10 ms DRED chunk, a 20 ms FEC/primary frame), not a single rewritten
+        // `main_timestamp`. This is what keeps a genuinely reordered primary from
+        // colliding in `PacketArrivalHistory` with a DRED chunk that pre-recovered
+        // its timestamp: the chunk's 10 ms span does not contain the 20 ms primary,
+        // so the reorder still reaches the reorder optimizer.
         for packet in packets {
-            if matches!(
+            let packet_timestamp = packet.timestamp;
+            let packet_length_samples = packet.duration_samples;
+            let buffer_flush = matches!(
                 self.packet_buffer.insert_packet(packet, &self.tick_timer),
                 super::packet_buffer::InsertOutcome::Flushed
-            ) {
-                buffer_flush = true;
+            );
+            if buffer_flush {
+                self.new_codec = true;
             }
+            let info = PacketArrivedInfo {
+                packet_length_samples,
+                main_timestamp: packet_timestamp,
+                main_sequence_number: sequence as u16,
+                is_cng_or_dtmf: false,
+                is_dtx: false,
+                buffer_flush,
+            };
+            let should_update_stats = !self.new_codec;
+            self.decision_logic
+                .packet_arrived(FS_HZ, should_update_stats, &info, &self.tick_timer);
         }
-        if buffer_flush {
-            self.new_codec = true;
-        }
-
-        let info = PacketArrivedInfo {
-            packet_length_samples: primary_count * self.decoder_frame_length,
-            main_timestamp,
-            main_sequence_number: sequence as u16,
-            is_cng_or_dtmf: false,
-            is_dtx: false,
-            buffer_flush,
-        };
-        let should_update_stats = !self.new_codec;
-        self.decision_logic
-            .packet_arrived(FS_HZ, should_update_stats, &info, &self.tick_timer);
         late
     }
 

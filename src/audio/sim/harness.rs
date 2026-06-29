@@ -1112,6 +1112,53 @@ mod tests {
     use crate::audio::test_support::*;
     use crate::audio::{shared::samples_for_duration, sim::LiveAudioPacketLossProfile};
 
+    /// End-to-end regression for the DRED-vs-reorder interaction.
+    ///
+    /// On a heavily reordered link (`MobileHandoff`: sporadic 120–300 ms delay
+    /// spikes), DRED recovers the gap left by each delayed packet *and*, when its
+    /// recovered timestamp is fed to the delay manager, hides the genuine
+    /// reordered arrival from the reorder optimizer (it collides in
+    /// `PacketArrivalHistory`). The jitter-buffer target is then sized for a clean
+    /// link, so the controller fights the reorder spikes with constant
+    /// time-stretching instead. Keying arrival stats on each packet's own primary
+    /// timestamp (see `core.rs::insert_packet`) keeps the reorder visible, the
+    /// target grows to absorb it, and the Accelerate churn collapses
+    /// (~86 → ~5 operations over 30 s in this scenario).
+    #[test]
+    fn dred_must_not_starve_reorder_optimizer() {
+        let config = LiveAudioSimulationConfig {
+            scenario: LiveAudioSimulationScenario::ConstantSpeech,
+            tuning: test_tuning(),
+            duration: Duration::from_secs(30),
+            producer_clock_ratio: 1.0,
+            output_block_samples: LIVE_OPUS_FRAME_SAMPLES,
+            streams: 1,
+            seed: 0x1234_5678,
+            packet_loss: LiveAudioPacketLossProfile::MobileHandoff,
+            max_amplification: 1.0,
+            denoise: false,
+            auto_gain: false,
+            echo_cancellation: false,
+            capture_dc_offset: 0.0,
+            capture_noise_rms: 0.0,
+        };
+        let report = run_live_audio_simulation(config).unwrap();
+        // The scenario must actually exercise reordering and DRED recovery, or the
+        // guard proves nothing.
+        assert!(report.reordered_frames > 50, "{:?}", report);
+        assert!(report.final_snapshot.dred_recoveries > 50, "{:?}", report);
+        // With the reorder visible to the target, accelerate churn stays low.
+        // When DRED masks it the buffer is undersized and this climbs past 80.
+        assert!(
+            report.final_snapshot.accelerate_count < 40,
+            "excessive time-stretch churn under reordering: accelerate_count={} \
+             (reordered_frames={}, dred_recoveries={})",
+            report.final_snapshot.accelerate_count,
+            report.reordered_frames,
+            report.final_snapshot.dred_recoveries,
+        );
+    }
+
     #[test]
     fn simulation_speech_split_keeps_contiguous_frames_after_first_active_frame() {
         let mut pcm = Vec::new();
