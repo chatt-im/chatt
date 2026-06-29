@@ -616,6 +616,15 @@ impl AdaptivePlaybackStream {
         stats: &mut LivePlaybackMixerStats,
         fast: bool,
     ) -> bool {
+        // A freshly resumed stream's onset (the mute/silence fade-in) is not
+        // stationary, so a pitch-period crossfade splices mismatched levels into
+        // an audible click. WebRTC NetEQ suppresses accelerate and
+        // preemptive-expand together while `last_mode == kExpand`; mirror that by
+        // holding off catch-up acceleration over the post-resume window, the same
+        // gate `try_expand`/`try_short_buffer_expand` already apply.
+        if self.resume_time_scale_hold_remaining > 0 {
+            return false;
+        }
         let lead = 0;
         if self.queued_samples()
             < lead
@@ -1164,6 +1173,65 @@ mod tests {
         },
         test_support::{drain_catch_up, sample_speech_frames, test_tuning},
     };
+
+    #[test]
+    fn resume_hold_suppresses_accelerate_over_onset() {
+        // After a sender-silence pause, the resume onset (capture + receiver
+        // mute_gain fade-in) is not stationary, so a WSOLA pitch-period crossfade
+        // splices mismatched levels into a click. WebRTC NetEQ avoids this by
+        // suppressing BOTH accelerate and preemptive-expand until the first normal
+        // packet after an Expand gap; we hold over a short window. Verify that a
+        // deep resume buffer, which would otherwise accelerate immediately, runs
+        // no time-scale op until the hold expires, then catches up afterward.
+        let now = Instant::now();
+        let mut stream = AdaptivePlaybackStream::new(test_tuning()).unwrap();
+        let mut stats = LivePlaybackMixerStats::default();
+
+        stream.mark_sender_silent(now, &mut stats);
+        for _ in 0..samples_for_duration(Duration::from_millis(200)) {
+            let _ = stream.pop_sample(now, &mut stats);
+        }
+
+        // Resume with a deep playout delay so the arrival-delay path would fire a
+        // fast-accelerate on the very first pop. The onset is exactly where the
+        // pitch-period crossfade clicks, so the hold must suppress it.
+        let resume = sine(240.0, Duration::from_millis(600));
+        stream.queue_samples_with_delay(
+            &resume,
+            DecodedFrameSource::Normal,
+            Some(PlayoutDelay {
+                current: Duration::from_millis(200),
+                peak: Duration::ZERO,
+            }),
+            now,
+            &mut stats,
+        );
+
+        let hold = samples_for_duration(LIVE_PLAYBACK_RESUME_TIME_SCALE_HOLD);
+        for _ in 0..hold {
+            let _ = stream.pop_sample(now, &mut stats);
+        }
+        assert_eq!(
+            stats.accelerate_count, 0,
+            "accelerate fired during the resume hold: {stats:?}"
+        );
+        assert_eq!(
+            stats.expand_count, 0,
+            "expand fired during the resume hold: {stats:?}"
+        );
+
+        // Past the hold the stationary tone catches up again, so the suppression
+        // is bounded and does not strand the extra latency.
+        for _ in 0..samples_for_duration(Duration::from_millis(400)) {
+            if stream.pop_sample(now, &mut stats).is_none() {
+                break;
+            }
+        }
+        assert!(
+            stats.accelerate_count > 0,
+            "catch-up never resumed after the hold: {stats:?}"
+        );
+    }
 
     fn zero_cross_freq(samples: &[f32], rate: f64) -> f64 {
         let mut crossings = 0usize;
