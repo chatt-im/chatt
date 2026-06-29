@@ -1503,6 +1503,173 @@ mod tests {
     }
 
     #[test]
+    fn experiment_render_continuous_drift() {
+        // NO mute. Clock drift keeps the buffer chronically shallow/churning so
+        // the time-scaler runs during continuous speech, exposing non-mute pops.
+        let speech = sample_speech_frames();
+        for (name, ratio) in [
+            ("cont_slow", 0.96),
+            ("cont_slower", 0.93),
+            ("cont_fast", 1.05),
+        ] {
+            let config = LiveAudioSimulationConfig {
+                scenario: LiveAudioSimulationScenario::ConstantSpeech,
+                tuning: test_tuning(),
+                duration: Duration::from_secs(20),
+                producer_clock_ratio: ratio,
+                output_block_samples: FRAME_SAMPLES,
+                streams: 1,
+                seed: 0x5eed_5eed,
+                packet_loss: LiveAudioPacketLossProfile::None,
+                max_amplification: 1.0,
+                denoise: false,
+                auto_gain: false,
+                echo_cancellation: false,
+                capture_dc_offset: 0.0,
+                capture_noise_rms: 0.0,
+            };
+            let out = run_live_audio_simulation_with_speech_output(config, speech).unwrap();
+            let bytes: Vec<u8> = out.samples.iter().flat_map(|x| x.to_le_bytes()).collect();
+            std::fs::write(format!("/tmp/render_{name}.f32"), &bytes).unwrap();
+            let s = &out.report.final_snapshot;
+            eprintln!(
+                "{name}: accel={} expand={} underrun={} maxq={}ms",
+                s.accelerate_count, s.expand_count, s.underrun_count, out.report.max_queue_ms,
+            );
+        }
+    }
+
+    #[test]
+    fn experiment_render_mute_toggle_500ms() {
+        let speech = sample_speech_frames();
+        for (name, denoise, loss, catch_up) in [
+            ("mute500_none", false, LiveAudioPacketLossProfile::None, true),
+            ("mute500_none_nocatchup", false, LiveAudioPacketLossProfile::None, false),
+            ("mute500_rnn", true, LiveAudioPacketLossProfile::None, true),
+            ("mute500_rnn_random60", true, LiveAudioPacketLossProfile::Random60, true),
+        ] {
+            let mut tuning = test_tuning();
+            tuning.adaptive_catch_up = catch_up;
+            let config = LiveAudioSimulationConfig {
+                scenario: LiveAudioSimulationScenario::ConstantSpeech,
+                tuning,
+                duration: Duration::from_secs(20),
+                producer_clock_ratio: 1.0,
+                output_block_samples: LIVE_OPUS_FRAME_SAMPLES,
+                streams: 1,
+                seed: 0x5eed_5eed,
+                packet_loss: loss,
+                max_amplification: 1.0,
+                denoise,
+                auto_gain: false,
+                echo_cancellation: false,
+                capture_dc_offset: 0.0,
+                capture_noise_rms: 0.0,
+            };
+            let mut state =
+                SimStreamState::new(config, simulation_encoder_profile(config), None).unwrap();
+            let mixer = Arc::new(Mutex::new(LivePlaybackMixer::with_tuning(tuning)));
+            let mut decode_streams = LiveDecodeStreams::new(tuning);
+            decode_streams.set_block_samples(LIVE_OPUS_FRAME_SAMPLES);
+            let mut report = LiveAudioSimulationReport {
+                scenario: "mute500",
+                ..Default::default()
+            };
+            let mut rng = SimRng::new(config.seed);
+            let mut trace = None;
+            let start = Instant::now();
+            let frame_duration =
+                Duration::from_secs_f64(FRAME_SAMPLES as f64 / SAMPLE_RATE as f64);
+            let total_frames = 2000usize;
+            let drain_frames = frames_for_duration(Duration::from_millis(500));
+            let mut output = Vec::new();
+            for frame_index in 0..total_frames + drain_frames {
+                let now = start + frame_duration.saturating_mul(frame_index as u32);
+                if frame_index < total_frames {
+                    // 500 ms unmuted, 500 ms muted, repeating (50 frames each).
+                    state.capture_muted = (frame_index % 100) >= 50;
+                    let frame = &speech[frame_index % speech.len()];
+                    state
+                        .encode_and_queue_frame(
+                            config, 1, frame_index, frame, now, start, &mut rng, &mut report,
+                            &mut trace,
+                        )
+                        .unwrap();
+                }
+                drain_simulation_network_and_playback(
+                    now,
+                    start,
+                    std::slice::from_mut(&mut state),
+                    &mixer,
+                    &mut decode_streams,
+                    &mut report,
+                    &mut trace,
+                );
+                if frame_index % (LIVE_OPUS_FRAME_SAMPLES / FRAME_SAMPLES) == 0 {
+                    let mut mixer = mixer.lock().unwrap();
+                    for _ in 0..LIVE_OPUS_FRAME_SAMPLES {
+                        output.push(mixer.pop_mixed_output_sample(now, LIVE_OPUS_FRAME_SAMPLES));
+                    }
+                }
+            }
+            let bytes: Vec<u8> = output.iter().flat_map(|x| x.to_le_bytes()).collect();
+            std::fs::write(format!("/tmp/render_{name}.f32"), &bytes).unwrap();
+            let s = decode_streams.stats();
+            eprintln!(
+                "{name}: out={:.1}s accel={} expand={} underrun={} dred={}",
+                output.len() as f64 / SAMPLE_RATE as f64,
+                s.accelerate_count,
+                s.expand_count,
+                s.underrun_count,
+                s.dred_recoveries,
+            );
+        }
+    }
+
+    #[test]
+    fn experiment_render_audio_for_listening() {
+        let speech = sample_speech_frames();
+        // The dry source clip, for reference.
+        let src: Vec<f32> = speech.iter().take(2000).flatten().copied().collect();
+        let bytes: Vec<u8> = src.iter().flat_map(|x| x.to_le_bytes()).collect();
+        std::fs::write("/tmp/render_source.f32", &bytes).unwrap();
+
+        let cases = [
+            ("rnn_none", LiveAudioPacketLossProfile::None),
+            ("rnn_random60", LiveAudioPacketLossProfile::Random60),
+            ("rnn_congested_wifi", LiveAudioPacketLossProfile::CongestedWifi),
+            ("rnn_bursty_wifi", LiveAudioPacketLossProfile::BurstyWifi),
+        ];
+        for (name, loss) in cases {
+            let config = LiveAudioSimulationConfig {
+                scenario: LiveAudioSimulationScenario::ConstantSpeech,
+                tuning: test_tuning(),
+                duration: Duration::from_secs(20),
+                producer_clock_ratio: 1.0,
+                output_block_samples: FRAME_SAMPLES,
+                streams: 1,
+                seed: 0x5eed_5eed,
+                packet_loss: loss,
+                max_amplification: 1.0,
+                denoise: true,
+                auto_gain: false,
+                echo_cancellation: false,
+                capture_dc_offset: 0.0,
+                capture_noise_rms: 0.0,
+            };
+            let out =
+                run_live_audio_simulation_with_speech_output(config, speech).unwrap();
+            let bytes: Vec<u8> = out.samples.iter().flat_map(|x| x.to_le_bytes()).collect();
+            std::fs::write(format!("/tmp/render_{name}.f32"), &bytes).unwrap();
+            let s = &out.report.final_snapshot;
+            eprintln!(
+                "{name}: dred={} plc={} underrun={} accel={} expand={}",
+                s.dred_recoveries, s.plc_fallbacks, s.underrun_count, s.accelerate_count, s.expand_count,
+            );
+        }
+    }
+
+    #[test]
     fn random60_direct_sample_timescale_churn_stays_bounded() {
         let input = sample_direct_pcm_frames(1500);
         let output = run_live_audio_direct_sample_simulation_output(

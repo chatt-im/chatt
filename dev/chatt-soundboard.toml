@@ -22,18 +22,25 @@ max-receive-bytes = 52428800
 [audio]
 bitrate-bps = 48000
 echo-cancellation = false
+denoise = "rnn-noise"
 max-amplification = 1.0
 
 [soundboard]
 enabled = true
-#loss = "none"
-loss = "random_60"
+loss = "none"
+#loss = "random_60"
 #loss = "congested_wifi"
 seed = 8388357047376790533
 
 [[soundboard.clips]]
 name = "sample"
 path = "assets/sample-001.opus"
+
+# Clean 220 Hz sine (30 s) for isolating playback/time-scale crackle from
+# mic/AGC/denoise factors. Press 2 (PlaySoundboard2) to send it.
+[[soundboard.clips]]
+name = "tone"
+path = "/tmp/tone.wav"
 
 [bindings.compose]
 "1" = "PlaySoundboard1"
