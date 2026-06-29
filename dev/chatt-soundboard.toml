@@ -27,8 +27,8 @@ max-amplification = 1.0
 
 [soundboard]
 enabled = true
-#loss = "none"
-loss = "random_60"
+loss = "none"
+#loss = "random_60"
 #loss = "congested_wifi"
 seed = 8388357047376790533
 

@@ -9,6 +9,7 @@ mod config;
 mod fuzzy;
 mod local_control;
 mod runtime;
+mod self_log;
 mod settings;
 mod theme;
 mod tui;

@@ -82,6 +82,43 @@ without a subcommand to launch the interactive client.",
             examples: &[],
         },
         Command {
+            name: "client-logs",
+            aliases: &[],
+            about: "Print the running client's recent in-memory logs.",
+            long_about: "Reads the in-memory log ring from a running client over \
+the local control socket and prints it. With `--follow` the logs stream live \
+until interrupted.",
+            args: &[],
+            flags: &[Flag {
+                long: "follow",
+                short: "f",
+                value_name: "",
+                help: "Stream new log records live until interrupted",
+                global: false,
+                possible: &[],
+            }],
+            subs: &[],
+            examples: &[],
+        },
+        Command {
+            name: "report-bug",
+            aliases: &[],
+            about: "File a bug report from a running client session.",
+            long_about: "Sends the running client's recent logs plus audio and \
+device diagnostics to the server, which saves them if a bug-report directory is \
+configured.",
+            args: &[Arg {
+                name: "description",
+                value_name: "DESCRIPTION",
+                help: "What went wrong",
+                required: true,
+                possible: &[],
+            }],
+            flags: &[],
+            subs: &[],
+            examples: &[],
+        },
+        Command {
             name: "test-audio-playback",
             aliases: &["audio-playback-test"],
             about: "Play a file through the live playback pipeline.",
@@ -259,11 +296,7 @@ pub(crate) fn run() -> Result<(), Box<dyn std::error::Error>> {
     let args = std::env::args().collect::<Vec<_>>();
     let logfile =
         config::value_arg(&args, "--logfile").or_else(|| std::env::var("CHATT_LOGFILE").ok());
-    let _logger = if let Some(logfile) = logfile {
-        kvlog::collector::init_file_logger(&logfile)
-    } else {
-        kvlog::collector::init_closure_logger(|buf| buf.clear())
-    };
+    let _logger = crate::self_log::init_client_logging(logfile.as_deref());
 
     // `screencast start --ffmpeg <ARGV>` is handled before the structured parser,
     // which cannot model the arbitrary trailing argv the passthrough captures.
@@ -303,6 +336,18 @@ fn dispatch(matches: &Matches) -> Result<(), Box<dyn std::error::Error>> {
         Some(("upload", sub)) => {
             let path = absolute_upload_path(Path::new(sub.value_of("path").unwrap_or_default()))?;
             let response = local_control::send_upload(&path)?;
+            println!("{response}");
+            Ok(())
+        }
+        Some(("client-logs", sub)) => {
+            local_control::send_client_logs(sub.is_present("follow")).map_err(Into::into)
+        }
+        Some(("report-bug", sub)) => {
+            let description = sub.value_of("description").unwrap_or_default().trim();
+            if description.is_empty() {
+                return Err("usage: chatt report-bug DESCRIPTION".into());
+            }
+            let response = local_control::send_report_bug(description)?;
             println!("{response}");
             Ok(())
         }
