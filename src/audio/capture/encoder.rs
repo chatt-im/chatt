@@ -87,6 +87,13 @@ impl OpusVoiceEncoder {
         if result != opus_codec::OPUS_OK as i32 {
             return Err(format_opus_error("failed to reset opus encoder", result));
         }
+        // `OPUS_RESET_STATE` zeroes `dred_duration` (it lives past the encoder's
+        // reset boundary), silently disabling DRED for the rest of the stream.
+        // Re-apply the configured DRED and FEC so a reset preserves redundancy.
+        let dred_duration_10ms = self.dred_duration_10ms;
+        let inband_fec = self.inband_fec;
+        self.set_dred_duration_10ms(dred_duration_10ms)?;
+        self.set_inband_fec(inband_fec)?;
         Ok(())
     }
 
@@ -230,6 +237,62 @@ mod tests {
 
         assert!(encoded > 0);
         assert!(encoded <= output.len());
+    }
+
+    /// Regression guard for the mute-thrashing bug: a brief mute triggers an
+    /// encoder `reset_state` on resume, and `OPUS_RESET_STATE` zeroes
+    /// `dred_duration`. Without re-applying it the sender stops emitting DRED for
+    /// the rest of the call, so the receiver loses its main loss recovery under
+    /// packet loss and thrashes on Expand concealment.
+    #[test]
+    fn reset_state_preserves_dred() {
+        use crate::audio::shared::LIVE_PLAYBACK_DRED_MAX_SAMPLES;
+        use opus_codec::{DredDecoder, DredState, SampleRate};
+
+        let mut encoder = OpusVoiceEncoder::new(32_000).unwrap();
+        encoder
+            .apply_live_encoder_profile(LiveEncoderProfile::DRED_60)
+            .unwrap();
+        let mut dred_decoder = DredDecoder::new().unwrap();
+        let mut packet = vec![0u8; MAX_OPUS_PACKET_BYTES];
+
+        let mut measure = |encoder: &mut OpusVoiceEncoder, base: usize| -> usize {
+            let frame: Vec<i16> = (0..LIVE_OPUS_FRAME_SAMPLES)
+                .map(|n| {
+                    ((2.0 * std::f32::consts::PI * 220.0 * (base + n) as f32 / 48_000.0).sin()
+                        * 0.3
+                        * i16::MAX as f32)
+                        .round() as i16
+                })
+                .collect();
+            let encoded = encoder.encode(&frame, &mut packet).unwrap();
+            let mut state = DredState::new().unwrap();
+            let mut dred_end = 0;
+            dred_decoder
+                .parse(
+                    &mut state,
+                    &packet[..encoded],
+                    LIVE_PLAYBACK_DRED_MAX_SAMPLES,
+                    SampleRate::Hz48000,
+                    &mut dred_end,
+                    false,
+                )
+                .unwrap_or(0)
+        };
+
+        let mut before = 0;
+        for seq in 0..80usize {
+            before = measure(&mut encoder, seq * LIVE_OPUS_FRAME_SAMPLES);
+        }
+        assert!(before > 0, "DRED should be present before reset: {before}");
+
+        encoder.reset_state().unwrap();
+
+        let mut after = 0;
+        for seq in 80..200usize {
+            after = measure(&mut encoder, seq * LIVE_OPUS_FRAME_SAMPLES);
+        }
+        assert!(after > 0, "DRED collapsed after reset_state: {after}");
     }
 
     #[test]
