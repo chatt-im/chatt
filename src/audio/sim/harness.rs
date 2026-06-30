@@ -1118,6 +1118,18 @@ mod tests {
     use crate::audio::test_support::*;
     use crate::audio::{shared::samples_for_duration, sim::LiveAudioPacketLossProfile};
 
+    /// Ceiling for the pristine-link estimate (steady-state max NetEQ playout
+    /// delay + staging-ring depth). The NetEQ playout floor is ~27 ms here and the
+    /// ring holds one device double-buffer block plus its 10 ms staging cushion
+    /// (~20 ms); this bounds their sum with headroom so the floor cannot drift up.
+    const PRISTINE_ESTIMATE_BUDGET_MS: u64 = 55;
+    /// How far the alternating-speech playout floor may exceed the
+    /// continuous-speech floor before silence handling is judged to inflate
+    /// latency. The resume burst leaves a brief transient (~9 ms here); without
+    /// the resume-stat suppression in `NetEqCore::insert_packet` it is ~13 ms and
+    /// grows far larger under real jitter, so this margin guards that path.
+    const SILENCE_NEUTRALITY_MARGIN_MS: u64 = 12;
+
     /// End-to-end regression for the DRED-vs-reorder interaction.
     ///
     /// On a heavily reordered link (`MobileHandoff`: sporadic 120–300 ms delay
@@ -1662,6 +1674,73 @@ mod tests {
             report.steady_state_underruns, 0,
             "100ms output callback sustained underruns: {report:?}"
         );
+    }
+
+    #[test]
+    fn pristine_link_estimate_stays_bounded() {
+        // The user-facing per-participant latency estimate is
+        // `playout + output_ring + rtt/2` (see `tui::render`). On a pristine
+        // local link RTT is ~0, so the estimate is the NetEQ playout delay plus
+        // the staging-ring depth. The safe, reliable floor is the NetEQ target
+        // (`neteq_min_delay + TIME_SCALE_MARGIN`) plus one device double-buffer
+        // block and its staging cushion. Guard that floor so it cannot drift up.
+        let report = simulate_with_loss(
+            LiveAudioSimulationScenario::ConstantSpeech,
+            Duration::from_secs(60),
+            test_tuning(),
+            1,
+            LiveAudioPacketLossProfile::None,
+        );
+
+        assert_eq!(report.lost_frames, 0, "{report:?}");
+        assert!(
+            report.steady_state_max_neteq_playout_delay_ms
+                <= duration_to_ms(
+                    test_tuning().neteq_min_delay + crate::audio::shared::TIME_SCALE_MARGIN,
+                ),
+            "pristine-link playout floor regressed: {report:?}"
+        );
+        let estimate_ms =
+            report.steady_state_max_neteq_playout_delay_ms + report.steady_state_max_output_ring_ms;
+        assert!(
+            estimate_ms <= PRISTINE_ESTIMATE_BUDGET_MS,
+            "pristine-link estimate floor regressed to {estimate_ms}ms: {report:?}"
+        );
+        assert_coherent_output(&report, 0.005);
+    }
+
+    #[test]
+    fn alternating_silence_does_not_inflate_playout() {
+        // A no-loss link isolates the silence gate: the only thing that can move
+        // the playout floor between these two runs is the resume burst the gate
+        // emits after each silence pause. The resume-stat suppression in
+        // `NetEqCore::insert_packet` must keep the alternating-speech floor from
+        // drifting above the continuous-speech floor, otherwise intermittent
+        // speech pays a standing latency penalty (the ~25 ms regression).
+        let continuous = simulate_with_loss(
+            LiveAudioSimulationScenario::ConstantSpeech,
+            Duration::from_secs(60),
+            test_tuning(),
+            1,
+            LiveAudioPacketLossProfile::None,
+        );
+        let alternating = simulate_with_loss(
+            LiveAudioSimulationScenario::AlternatingSpeech,
+            Duration::from_secs(60),
+            test_tuning(),
+            1,
+            LiveAudioPacketLossProfile::None,
+        );
+
+        assert!(alternating.suppressed_frames > 0, "{alternating:?}");
+        assert!(
+            alternating.steady_state_max_neteq_playout_delay_ms
+                <= continuous.steady_state_max_neteq_playout_delay_ms
+                    + SILENCE_NEUTRALITY_MARGIN_MS,
+            "silence-gated resume inflated the playout floor: \
+             alternating={alternating:?} continuous={continuous:?}"
+        );
+        assert_coherent_output(&alternating, 0.002);
     }
 
     #[test]

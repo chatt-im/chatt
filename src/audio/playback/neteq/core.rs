@@ -42,9 +42,10 @@ use crate::audio::playback::time_scale::{
 };
 use crate::audio::shared::{
     DecodedFrameSource, LIVE_CAPTURE_MUTE_FADE, LIVE_OPUS_FRAME_SAMPLES, LIVE_PACKET_FLAG_MUTE,
-    LIVE_PACKET_FLAG_OPUS_RESET, LIVE_PLAYBACK_DRED_MAX_SAMPLES, LiveAudioTuning,
-    MAX_OPUS_DECODE_SAMPLES, SAMPLE_RATE, TIME_SCALE_REF_OFFSET, TIME_SCALE_WINDOW,
-    apply_gain_ramp, duration_to_ms, mute_gain_step, samples_for_duration, samples_to_ms,
+    LIVE_PACKET_FLAG_OPUS_RESET, LIVE_PACKET_FLAG_SILENCE_RESUME, LIVE_PLAYBACK_DRED_MAX_SAMPLES,
+    LiveAudioTuning, MAX_OPUS_DECODE_SAMPLES, SAMPLE_RATE, TIME_SCALE_REF_OFFSET,
+    TIME_SCALE_WINDOW, apply_gain_ramp, duration_to_ms, mute_gain_step, samples_for_duration,
+    samples_to_ms,
 };
 
 /// 48 kHz. The live path is always 48 kHz mono.
@@ -292,6 +293,16 @@ impl NetEqCore {
             .wrapping_sub(self.sync_buffer.future_length() as u32);
         let late = !self.first_packet && is_newer_timestamp(playout_timestamp, timestamp);
         let muted = flags & LIVE_PACKET_FLAG_MUTE != 0;
+        // The sender drains its buffered preroll tail as a burst of back-dated
+        // packets when resuming from a silence-gated pause. Those carry RTP
+        // timestamps trailing wall-clock by the preroll length, so feeding them
+        // to the arrival statistics reads as a ~preroll-sized late arrival,
+        // spiking `PacketArrivalHistory::max_delay_ms()` (and the optimizers) for
+        // up to the 2 s history window. That inflates the Accelerate `high_limit`
+        // and pins the playout buffer deep. Honor the sender's resume flag and
+        // withhold these transient packets from the controller's statistics; they
+        // are still buffered and decoded normally.
+        let silence_resume = flags & LIVE_PACKET_FLAG_SILENCE_RESUME != 0;
         if flags & LIVE_PACKET_FLAG_OPUS_RESET != 0 {
             // The sender restarted its encoder (e.g. resuming after a silence
             // gap); reset the decoder before the next decode to match.
@@ -373,7 +384,7 @@ impl NetEqCore {
                 is_dtx: false,
                 buffer_flush,
             };
-            let should_update_stats = !self.new_codec;
+            let should_update_stats = !self.new_codec && !silence_resume;
             self.decision_logic
                 .packet_arrived(FS_HZ, should_update_stats, &info, &self.tick_timer);
         }
