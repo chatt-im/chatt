@@ -721,6 +721,7 @@ impl RoomMode {
                             app.room
                                 .chat
                                 .toggle_expand(line.message, self.layout.chat_width);
+                            self.keep_selected_chat_header_visible(app);
                             app.room.chat.clear_selection();
                         }
                         LineKind::Body => {
@@ -1287,6 +1288,87 @@ mod tests {
 
         room.process_input(&mut app, KeyEvent::new(KeyCode::Tab, KeyModifiers::empty()));
         assert!(app.room.chat.is_expanded(0));
+    }
+
+    #[test]
+    fn mouse_collapse_reclamps_scroll_and_fills_viewport() {
+        // Regression: collapsing an expanded message via mouse must re-clamp the
+        // scroll offset so the top-anchored chat log re-fills the viewport
+        // instead of leaving blank rows where the expanded body used to be.
+        let mut app = test_app();
+        let mut room = RoomMode::with_focus(ChatPanelFocus::ChatLog);
+
+        // A lone collapsible message (over COLLAPSE_LIMIT wrapped lines) at the
+        // top, followed by enough short messages to keep the buffer taller than
+        // the viewport once the long message collapses.
+        let long_body = format!(
+            "```\n{}\n```",
+            (0..17).fold(String::new(), |mut acc, n| {
+                use std::fmt::Write;
+                let _ = writeln!(acc, "line {n}");
+                acc
+            })
+        );
+        push_room_message(&mut app, 1, UserId(2), 1_000, long_body);
+        for index in 0..20u64 {
+            push_room_message(
+                &mut app,
+                index + 2,
+                UserId(2),
+                2_000 + index * 1_000,
+                "short",
+            );
+        }
+
+        let mut buffer = Buffer::new(80, 24);
+        render_room(&mut app, &mut room, &mut buffer);
+        room.set_focus(&mut app, ChatPanelFocus::ChatLog);
+
+        let width = room.layout().chat_width;
+        let height = room.layout().chat_height;
+        assert!(
+            app.room.chat.is_collapsed(0),
+            "long message starts collapsed"
+        );
+
+        // Expand the long message and scroll to the very top so its heading sits
+        // at the top of the viewport. Collapsing now removes fewer rows than the
+        // viewport height, which lands the scroll offset in the window where
+        // `visible_lines` does not self-correct.
+        app.room.chat.toggle_expand(0, width);
+        assert!(app.room.chat.is_expanded(0));
+        app.room.chat.top(width, height);
+        render_room(&mut app, &mut room, &mut buffer);
+
+        let heading_row = room
+            .layout()
+            .visible_chat_lines
+            .iter()
+            .enumerate()
+            .find(|(_, line)| line.kind == LineKind::Heading && line.block_contains(0))
+            .map(|(row_index, _)| room.layout().chat_rect.y + row_index as u16)
+            .expect("expanded message heading visible at top");
+
+        room.process_mouse(
+            &mut app,
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: room.layout().chat_rect.x + 1,
+                row: heading_row,
+                modifiers: KeyModifiers::empty(),
+            },
+        );
+        assert!(
+            app.room.chat.is_collapsed(0),
+            "clicking the heading collapses it"
+        );
+
+        render_room(&mut app, &mut room, &mut buffer);
+        assert_eq!(
+            room.layout().visible_chat_lines.len(),
+            height as usize,
+            "viewport must stay full after collapse, with no trailing blank rows",
+        );
     }
 
     #[test]
