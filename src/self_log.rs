@@ -167,10 +167,11 @@ static CLIENT_LOGS: OnceLock<Arc<Mutex<ClientLogState>>> = OnceLock::new();
 
 /// Installs the global closure collector that fills the in-memory ring.
 ///
-/// When `logfile` is `Some`, the same records are also appended to that file as
-/// plain text, preserving the old `--logfile` behavior. Also installs a panic
-/// hook that dumps the last few records to stderr. The returned guard must be
-/// held for the lifetime of the process.
+/// When `logfile` is `Some`, the same records are also appended to that file in
+/// the kvlog binary format, matching [`kvlog::collector::init_file_logger`] so
+/// the server and client traces share one format. Also installs a panic hook
+/// that dumps the last few records to stderr. The returned guard must be held
+/// for the lifetime of the process.
 pub fn init_client_logging(logfile: Option<&str>) -> LoggerGuard {
     let state = Arc::new(Mutex::new(ClientLogState::new()));
     CLIENT_LOGS.set(state.clone()).ok();
@@ -202,9 +203,7 @@ pub fn init_client_logging(logfile: Option<&str>) -> LoggerGuard {
             }
         }
         if let Some(file) = &mut file {
-            let mut text = String::new();
-            decode_to_plain(bytes, &mut text);
-            let _ = file.write_all(text.as_bytes());
+            let _ = file.write_all(bytes);
         }
         log_buffer.clear();
     })
