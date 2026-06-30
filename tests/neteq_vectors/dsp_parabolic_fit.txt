@@ -1,0 +1,11 @@
+# dsp_parabolic_fit
+# fs_mult=6
+# layout=(index,value)_per_triple
+122
+2017
+120
+2000
+125
+9699
+118
+53

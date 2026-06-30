@@ -1,0 +1,25 @@
+# background_noise_params
+# layout=updated,initialized,energy,mute_factor,scale,scale_shift,filter[9],filter_state[8]
+1
+1
+238261
+0
+29961
+19
+4096
+-340
+-1
+-75
+356
+-432
+-320
+-215
+215
+314
+70
+-91
+-28
+542
+-780
+266
+720
