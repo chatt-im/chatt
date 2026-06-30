@@ -12,6 +12,7 @@ use crate::{
     },
     bindings::BindingRuntime,
     client_net::ClientConfig,
+    config_diagnostics::{self, Diag},
 };
 use rpc::{control::DEFAULT_FILE_SIZE_LIMIT_BYTES, ids::RoomId};
 
@@ -602,8 +603,46 @@ impl Default for Config {
     }
 }
 
+/// The result of [`Config::collect`]: the parsed config (when it could be
+/// built) plus every diagnostic gathered while parsing and validating.
+struct LoadOutcome {
+    source: String,
+    content: String,
+    config: Option<Config>,
+    diagnostics: Vec<Diag>,
+}
+
 impl Config {
+    /// Loads and validates the config file, rendering diagnostics to stderr.
+    ///
+    /// Unknown and deprecated keys render as warnings and startup continues.
+    /// Parse, type, and semantic-validation failures render as errors and this
+    /// returns `Err`. Diagnostics are written before the TUI enters the
+    /// alternate screen so they stay visible.
+    ///
+    /// # Errors
+    /// Returns a terse summary string when the file cannot be read or when any
+    /// error-level diagnostic was emitted. The detailed diagnostics have
+    /// already been printed.
     pub fn load(path: Option<&str>) -> Result<Self, String> {
+        let outcome = Self::collect(path)?;
+        config_diagnostics::render(&outcome.source, &outcome.content, &outcome.diagnostics);
+        let errors = outcome.diagnostics.iter().filter(|diag| diag.error).count();
+        match outcome.config {
+            Some(config) if errors == 0 => Ok(config),
+            _ => Err(format!(
+                "invalid configuration: {errors} error(s) in {}",
+                outcome.source
+            )),
+        }
+    }
+
+    /// Reads, parses, and validates the config, accumulating diagnostics.
+    ///
+    /// This is the pure half of [`Config::load`]: it performs no rendering so
+    /// tests can inspect the diagnostics directly. `Err` is reserved for a file
+    /// that cannot be read, where there is no source to annotate.
+    fn collect(path: Option<&str>) -> Result<LoadOutcome, String> {
         let config_path = path
             .map(PathBuf::from)
             .or_else(|| std::env::var_os("CHATT_CONFIG").map(PathBuf::from))
@@ -618,19 +657,33 @@ impl Config {
         };
 
         let arena = Arena::new();
-        let mut doc = toml_spanner::parse(&content, &arena)
-            .map_err(|err| format!("failed to parse {source}: {err}"))?;
-        reject_deprecated_config_keys(&doc, &source)?;
+        let mut doc = toml_spanner::parse_recoverable(&content, &arena);
         let udp_addr_configured = server_udp_addr_configured(&doc);
-        let mut config: Config = doc.to().map_err(|err| {
-            let errors: Vec<String> = err.errors.iter().map(ToString::to_string).collect();
-            format!("failed to deserialize {source}: {}", errors.join(", "))
-        })?;
-        config.config_path = config_path;
-        config.apply_inferred_addresses_from_doc(&udp_addr_configured);
-        config.normalize();
-        config.validate(&source)?;
-        Ok(config)
+        let (config, from_toml) = match doc.to_allowing_errors::<Config>() {
+            Ok((config, errors)) => (Some(config), errors),
+            Err(errors) => (None, errors),
+        };
+
+        let mut diagnostics: Vec<Diag> = from_toml
+            .errors
+            .iter()
+            .map(|err| config_diagnostics::from_toml_error(err, &content))
+            .collect();
+
+        let config = config.map(|mut config| {
+            config.config_path = config_path;
+            config.apply_inferred_addresses_from_doc(&udp_addr_configured);
+            config.normalize();
+            config.validate(&mut diagnostics);
+            config
+        });
+
+        Ok(LoadOutcome {
+            source,
+            content,
+            config,
+            diagnostics,
+        })
     }
 
     fn apply_inferred_addresses(&mut self, udp_addr_configured: bool, udp_addr_overridden: bool) {
@@ -675,20 +728,26 @@ impl Config {
         }
     }
 
-    fn validate(&self, source: &str) -> Result<(), String> {
-        self.audio
-            .latency
-            .validate()
-            .map_err(|error| format!("{source}: audio latency: {error}"))?;
+    /// Checks semantic constraints on the deserialized config, pushing one
+    /// error [`Diag`] per violation.
+    ///
+    /// These checks run on the normalized struct rather than the source
+    /// document, so the diagnostics are title-only (no span). Every check runs
+    /// so all violations report at once.
+    fn validate(&self, out: &mut Vec<Diag>) {
+        if let Err(error) = self.audio.latency.validate() {
+            out.push(Diag::error(format!("audio latency: {error}")));
+        }
         if !(8_000..=96_000).contains(&self.audio.bitrate_bps) {
-            return Err(format!(
-                "{source}: audio bitrate-bps must be between 8000 and 96000"
+            out.push(Diag::error(
+                "audio bitrate-bps must be between 8000 and 96000",
             ));
         }
-        self.web
-            .bind
-            .parse::<std::net::SocketAddr>()
-            .map_err(|error| format!("{source}: web bind must be a socket address: {error}"))?;
+        if let Err(error) = self.web.bind.parse::<std::net::SocketAddr>() {
+            out.push(Diag::error(format!(
+                "web bind must be a socket address: {error}"
+            )));
+        }
         for (name, volume_db) in [
             ("message-volume-db", self.notifications.message_volume_db),
             (
@@ -701,96 +760,97 @@ impl Config {
             ),
         ] {
             if !(MIN_NOTIFICATION_VOLUME_DB..=MAX_NOTIFICATION_VOLUME_DB).contains(&volume_db) {
-                return Err(format!(
-                    "{source}: notifications {name} must be between {:.1} and {:.1}",
+                out.push(Diag::error(format!(
+                    "notifications {name} must be between {:.1} and {:.1}",
                     MIN_NOTIFICATION_VOLUME_DB, MAX_NOTIFICATION_VOLUME_DB
-                ));
+                )));
             }
         }
         let mut aliases = HashSet::new();
         for server in &self.servers {
-            validate_server_alias(&server.alias)
-                .map_err(|error| format!("{source}: server {}: {error}", server.alias))?;
-            validate_non_empty(&server.token, "token")
-                .map_err(|error| format!("{source}: server {}: {error}", server.alias))?;
-            validate_non_empty(&server.display_name, "display-name")
-                .map_err(|error| format!("{source}: server {}: {error}", server.alias))?;
-            validate_endpoint(&server.tcp_addr, "tcp-addr")
-                .map_err(|error| format!("{source}: server {}: {error}", server.alias))?;
-            validate_endpoint(&server.effective_udp_addr(), "udp-addr")
-                .map_err(|error| format!("{source}: server {}: {error}", server.alias))?;
+            let alias = &server.alias;
+            if let Err(error) = validate_server_alias(alias) {
+                out.push(Diag::error(format!("server {alias}: {error}")));
+            }
+            if let Err(error) = validate_non_empty(&server.token, "token") {
+                out.push(Diag::error(format!("server {alias}: {error}")));
+            }
+            if let Err(error) = validate_non_empty(&server.display_name, "display-name") {
+                out.push(Diag::error(format!("server {alias}: {error}")));
+            }
+            if let Err(error) = validate_endpoint(&server.tcp_addr, "tcp-addr") {
+                out.push(Diag::error(format!("server {alias}: {error}")));
+            }
+            if let Err(error) = validate_endpoint(&server.effective_udp_addr(), "udp-addr") {
+                out.push(Diag::error(format!("server {alias}: {error}")));
+            }
             if let Some(addr) = &server.udp_probe_addr {
-                validate_endpoint(addr, "udp-probe-addr")
-                    .map_err(|error| format!("{source}: server {}: {error}", server.alias))?;
+                if let Err(error) = validate_endpoint(addr, "udp-probe-addr") {
+                    out.push(Diag::error(format!("server {alias}: {error}")));
+                }
             }
             if server.room_id == 0 {
-                return Err(format!(
-                    "{source}: server {}: room-id must be non-zero",
-                    server.alias
-                ));
+                out.push(Diag::error(format!(
+                    "server {alias}: room-id must be non-zero"
+                )));
             }
-            if !aliases.insert(server.alias.as_str()) {
-                return Err(format!("{source}: duplicate server alias {}", server.alias));
+            if !aliases.insert(alias.as_str()) {
+                out.push(Diag::error(format!("duplicate server alias {alias}")));
             }
         }
         let mut user_audio_keys = HashSet::new();
         for preference in &self.user_audio {
-            validate_server_alias(&preference.server_alias).map_err(|error| {
-                format!(
-                    "{source}: user-audio {}:{}: {error}",
-                    preference.server_alias, preference.user_id
-                )
-            })?;
-            if preference.user_id == 0 {
-                return Err(format!(
-                    "{source}: user-audio {}: user-id must be non-zero",
-                    preference.server_alias
-                ));
+            let alias = &preference.server_alias;
+            let user_id = preference.user_id;
+            if let Err(error) = validate_server_alias(alias) {
+                out.push(Diag::error(format!(
+                    "user-audio {alias}:{user_id}: {error}"
+                )));
+            }
+            if user_id == 0 {
+                out.push(Diag::error(format!(
+                    "user-audio {alias}: user-id must be non-zero"
+                )));
             }
             if !(MIN_USER_VOLUME_DB..=MAX_USER_VOLUME_DB).contains(&preference.volume_db) {
-                return Err(format!(
-                    "{source}: user-audio {}:{} volume-db must be between {:.1} and {:.1}",
-                    preference.server_alias,
-                    preference.user_id,
-                    MIN_USER_VOLUME_DB,
-                    MAX_USER_VOLUME_DB
-                ));
+                out.push(Diag::error(format!(
+                    "user-audio {alias}:{user_id} volume-db must be between {:.1} and {:.1}",
+                    MIN_USER_VOLUME_DB, MAX_USER_VOLUME_DB
+                )));
             }
-            if !user_audio_keys.insert((preference.server_alias.as_str(), preference.user_id)) {
-                return Err(format!(
-                    "{source}: duplicate user-audio entry for {}:{}",
-                    preference.server_alias, preference.user_id
-                ));
+            if !user_audio_keys.insert((alias.as_str(), user_id)) {
+                out.push(Diag::error(format!(
+                    "duplicate user-audio entry for {alias}:{user_id}"
+                )));
             }
         }
         if self.soundboard.enabled {
             if self.soundboard.packet_loss().is_none() {
-                return Err(format!(
-                    "{source}: soundboard loss must be one of: {}",
+                out.push(Diag::error(format!(
+                    "soundboard loss must be one of: {}",
                     LiveAudioPacketLossProfile::NAMES.join(", ")
-                ));
+                )));
             }
             if self.soundboard.clips.is_empty() {
-                return Err(format!(
-                    "{source}: soundboard enabled but no [[soundboard.clips]] entries are configured"
+                out.push(Diag::error(
+                    "soundboard enabled but no [[soundboard.clips]] entries are configured",
                 ));
             }
         }
         for (index, clip) in self.soundboard.clips.iter().enumerate() {
             if clip.name.is_empty() {
-                return Err(format!(
-                    "{source}: soundboard clip {}: name must not be empty",
+                out.push(Diag::error(format!(
+                    "soundboard clip {}: name must not be empty",
                     index + 1
-                ));
+                )));
             }
             if clip.path.is_empty() {
-                return Err(format!(
-                    "{source}: soundboard clip {}: path must not be empty",
+                out.push(Diag::error(format!(
+                    "soundboard clip {}: path must not be empty",
                     index + 1
-                ));
+                )));
             }
         }
-        Ok(())
     }
 
     pub fn server(&self, alias: &str) -> Result<&ServerEntry, String> {
@@ -920,77 +980,6 @@ pub fn snap_notification_volume_db(volume_db: f32) -> f32 {
     }
 }
 
-fn reject_deprecated_config_keys(
-    doc: &toml_spanner::Document<'_>,
-    source: &str,
-) -> Result<(), String> {
-    if doc.table().contains_key("network") {
-        return Err(format!(
-            "failed to deserialize {source}: [network] is not supported; use [[servers]]"
-        ));
-    }
-    if doc
-        .table()
-        .get("servers")
-        .and_then(Item::as_array)
-        .is_some_and(|servers| {
-            servers.iter().any(|server| {
-                server
-                    .as_table()
-                    .is_some_and(|server| server.contains_key("pairing-code"))
-            })
-        })
-    {
-        return Err(format!(
-            "failed to deserialize {source}: servers.pairing-code is not supported; use `chatt join JOIN_STRING`"
-        ));
-    }
-    if doc
-        .table()
-        .get("audio")
-        .and_then(Item::as_table)
-        .is_some_and(|audio| audio.contains_key("input-device-index"))
-    {
-        return Err(format!(
-            "failed to deserialize {source}: audio.input-device-index is not supported; use audio.input-device-id"
-        ));
-    }
-    const REMOVED_AUDIO_LATENCY_KEYS: &[&str] = &[
-        "playback-silence-skip",
-        "dynamic-target-margin-ms",
-        "dynamic-jitter-gain",
-        "dynamic-peak-weight",
-        "moderate-loss-queue-ms",
-        "dred-horizon-ms",
-        "loss-window-ms",
-        "loss-hold-ms",
-        "severe-loss-hold-ms",
-        "max-speed-up",
-        "catch-up-start-excess-ms",
-        "silence-min-gap-ms",
-        "silence-ramp-ms",
-        "silence-max-skip-ms",
-        "silence-min-skip-ms",
-    ];
-    if let Some(key) = doc
-        .table()
-        .get("audio")
-        .and_then(Item::as_table)
-        .and_then(|audio| audio.get("latency"))
-        .and_then(Item::as_table)
-        .and_then(|latency| {
-            REMOVED_AUDIO_LATENCY_KEYS
-                .iter()
-                .find(|key| latency.contains_key(**key))
-        })
-    {
-        return Err(format!(
-            "failed to deserialize {source}: audio.latency.{key} was removed by the WSOLA playback refactor"
-        ));
-    }
-    Ok(())
-}
-
 pub fn value_arg(args: &[String], key: &str) -> Option<String> {
     args.windows(2)
         .find_map(|window| (window[0] == key).then(|| window[1].clone()))
@@ -1115,6 +1104,18 @@ fn validate_non_empty(value: &str, name: &str) -> Result<(), String> {
 mod tests {
     use super::*;
 
+    /// Runs semantic validation and returns the error messages, joined.
+    fn validation_errors(config: &Config) -> String {
+        let mut diagnostics = Vec::new();
+        config.validate(&mut diagnostics);
+        diagnostics
+            .into_iter()
+            .filter(|diag| diag.error)
+            .map(|diag| diag.message)
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
     #[test]
     fn server_udp_addr_inherits_tcp_addr_when_omitted() {
         let arena = Arena::new();
@@ -1165,7 +1166,7 @@ room-id = 1
         config.apply_inferred_addresses_from_doc(&udp_addr_configured);
         config.normalize();
 
-        config.validate("<test>").unwrap();
+        assert!(validation_errors(&config).is_empty());
         assert_eq!(config.servers[0].display_name, "Alice");
     }
 
@@ -1224,7 +1225,7 @@ room-id = 1
         let mut config: Config = doc.to().unwrap();
         config.apply_inferred_addresses_from_doc(&udp_addr_configured);
         config.normalize();
-        config.validate("<test>").unwrap();
+        assert!(validation_errors(&config).is_empty());
 
         let server = config.server("prod").unwrap();
         assert_eq!(server.tcp_addr, "chat.example.com:443");
@@ -1267,7 +1268,7 @@ path = "assets/sample-001.opus"
         config.apply_inferred_addresses_from_doc(&udp_addr_configured);
         config.normalize();
 
-        config.validate("test").unwrap();
+        assert!(validation_errors(&config).is_empty());
         assert!(config.soundboard.enabled);
         assert_eq!(
             config.soundboard.packet_loss(),
@@ -1276,29 +1277,39 @@ path = "assets/sample-001.opus"
         assert_eq!(config.soundboard.clips[0].name, "sample");
     }
 
-    #[test]
-    fn rejects_legacy_input_device_index() {
-        let path = std::env::temp_dir().join(format!(
-            "chatt-config-legacy-input-device-index-{}.toml",
-            std::process::id()
-        ));
-        std::fs::write(
-            &path,
-            r#"
-[audio]
-input-device-index = 20
-"#,
-        )
-        .unwrap();
-
-        let error = match Config::load(Some(path.to_str().unwrap())) {
-            Ok(_) => panic!("legacy input-device-index should be rejected"),
-            Err(error) => error,
-        };
+    /// Parses `content` into a [`LoadOutcome`] via a temp file, exercising the
+    /// real `Config::collect` path.
+    fn collect_from(label: &str, content: &str) -> LoadOutcome {
+        let path =
+            std::env::temp_dir().join(format!("chatt-config-{label}-{}.toml", std::process::id()));
+        std::fs::write(&path, content).unwrap();
+        let outcome = Config::collect(Some(path.to_str().unwrap())).unwrap();
         let _ = std::fs::remove_file(path);
+        outcome
+    }
 
-        assert!(error.contains("audio.input-device-index"));
-        assert!(error.contains("audio.input-device-id"));
+    #[test]
+    fn unknown_key_warns_but_loads() {
+        let outcome = collect_from("unknown-key", "totally-unknown-key = 7\n");
+        assert!(outcome.config.is_some());
+        assert!(outcome.diagnostics.iter().all(|diag| !diag.error));
+        assert!(
+            outcome
+                .diagnostics
+                .iter()
+                .any(|diag| !diag.error && diag.span.is_some())
+        );
+    }
+
+    #[test]
+    fn invalid_value_is_error() {
+        let outcome = collect_from("invalid-bitrate", "[audio]\nbitrate-bps = 1\n");
+        assert!(
+            outcome
+                .diagnostics
+                .iter()
+                .any(|diag| diag.error && diag.message.contains("bitrate-bps"))
+        );
     }
 
     fn render_runtime(config: &Config) -> String {
@@ -1463,7 +1474,7 @@ input-device-index = 20
         config.audio.latency.hard_queue_bound_ms = 40;
         config.audio.latency.neteq_max_delay_ms = 1_000;
 
-        let error = config.validate("<test>").unwrap_err();
+        let error = validation_errors(&config);
 
         assert!(error.contains("audio latency"));
         assert!(error.contains("hard-queue-bound-ms"));
@@ -1497,7 +1508,7 @@ input-device-index = 20
         let mut config = Config::default();
         config.audio.bitrate_bps = 128_000;
 
-        let error = config.validate("<test>").unwrap_err();
+        let error = validation_errors(&config);
 
         assert!(error.contains("bitrate-bps"));
     }

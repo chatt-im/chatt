@@ -6,6 +6,7 @@ mod cli;
 mod client_net;
 mod clipboard;
 mod config;
+mod config_diagnostics;
 mod fuzzy;
 mod local_control;
 mod runtime;
@@ -28,7 +29,7 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 #[global_allocator]
 static ALLOC: dhat::Alloc = dhat::Alloc;
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() {
     // Held for the whole process. Dropping it on exit writes `dhat-heap.json`
     // (override the path with the `DHAT_HEAP_FILE` env var) and prints a
     // summary to stderr.
@@ -40,5 +41,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         builder.build()
     };
-    cli::run()
+    if let Err(error) = cli::run() {
+        // Print via Display, not the Debug formatting Rust applies to a
+        // `main` that returns `Result`, so messages read cleanly.
+        eprintln!("error: {error}");
+        // Drop the profiler before exiting so its report still flushes.
+        #[cfg(feature = "dhat-heap")]
+        drop(_profiler);
+        std::process::exit(1);
+    }
 }
