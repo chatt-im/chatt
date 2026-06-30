@@ -76,6 +76,21 @@ pub(crate) enum ToggleExpandResult {
     NotCollapsible,
 }
 
+/// Drops completely blank lines from the start and end of `text` while keeping
+/// the leading whitespace (indentation) of the remaining content lines. Returns
+/// an empty string when every line is blank.
+fn strip_blank_edge_lines(text: &str) -> String {
+    let lines: Vec<&str> = text.lines().collect();
+    let Some(first) = lines.iter().position(|line| !line.trim().is_empty()) else {
+        return String::new();
+    };
+    let last = lines
+        .iter()
+        .rposition(|line| !line.trim().is_empty())
+        .unwrap_or(first);
+    lines[first..=last].join("\n")
+}
+
 impl RoomSession {
     pub(super) fn new(config: &Config, theme: &Theme) -> Self {
         let mut composer =
@@ -311,7 +326,12 @@ impl RoomSession {
     }
 
     pub(crate) fn submit_composer(&mut self) -> Option<String> {
-        let input = self.composer.text().trim().to_string();
+        let text = self.composer.text();
+        let input = if text.trim_start().starts_with('/') {
+            text.trim().to_string()
+        } else {
+            strip_blank_edge_lines(&text)
+        };
         if input.is_empty() {
             return None;
         }
@@ -478,6 +498,33 @@ mod tests {
             body: body.to_string(),
             file_transfer_id: None,
         }
+    }
+
+    #[test]
+    fn submit_composer_preserves_leading_whitespace_except_for_commands() {
+        let mut room = test_room();
+
+        room.composer.set_lines("    indented hello");
+        assert_eq!(
+            room.submit_composer().as_deref(),
+            Some("    indented hello")
+        );
+
+        room.composer.set_lines("   /help   ");
+        assert_eq!(room.submit_composer().as_deref(), Some("/help"));
+
+        room.composer.set_lines("    \t  ");
+        assert_eq!(room.submit_composer(), None);
+
+        room.composer
+            .set_lines("\n  \n    keep indent\nsecond\n\n   \n");
+        assert_eq!(
+            room.submit_composer().as_deref(),
+            Some("    keep indent\nsecond")
+        );
+
+        room.composer.set_lines("\n\n   \n");
+        assert_eq!(room.submit_composer(), None);
     }
 
     #[test]
