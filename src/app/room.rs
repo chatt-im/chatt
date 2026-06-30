@@ -257,10 +257,6 @@ impl RoomSession {
         }
     }
 
-    pub(super) fn voice_packet_observed(&mut self, stream_id: u32, _payload_size: usize) {
-        self.participants.voice_packet(stream_id);
-    }
-
     pub(super) fn playback_feedback(&mut self, feedback: LivePlaybackFeedback) {
         self.participants.voice_feedback(feedback);
     }
@@ -485,6 +481,7 @@ mod tests {
             identifier: name.to_string(),
             in_call: false,
             voice_status: ParticipantVoiceStatus::default(),
+            joined_at_ms: 0,
         }
     }
 
@@ -556,7 +553,7 @@ mod tests {
         assert!(!update.local);
         assert!(update.should_scroll_bottom);
         assert_eq!(room.chat.scroll_offset(), 0);
-        assert_eq!(room.participants.entries[0].last_message_ms, Some(1_000));
+        assert_eq!(room.participants.entries[0].name.as_deref(), Some("user-2"));
 
         for id in 2..20 {
             room.chat_received(message(id, 2, "line"), Some(UserId(1)));

@@ -1407,12 +1407,11 @@ impl App {
         }
     }
 
-    fn observe_voice_packet(&mut self, stream_id: u32, payload_size: usize) {
+    fn observe_voice_packet(&mut self, _stream_id: u32, payload_size: usize) {
         self.voice_packets_received = self.voice_packets_received.saturating_add(1);
         self.voice_bytes_received = self
             .voice_bytes_received
             .saturating_add(payload_size as u64);
-        self.room.voice_packet_observed(stream_id, payload_size);
     }
 
     fn set_network_playback_sink(&mut self, sink: Option<LivePlaybackSink>) {
@@ -3609,6 +3608,7 @@ mod tests {
             identifier: display_name.to_string(),
             in_call: true,
             voice_status: ParticipantVoiceStatus::default(),
+            joined_at_ms: 0,
         }
     }
 

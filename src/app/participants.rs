@@ -1,4 +1,4 @@
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use rpc::{
     control::{ChatMessage, ParticipantInfo, ParticipantVoiceStatus},
@@ -20,8 +20,11 @@ pub(crate) struct ParticipantState {
     pub(crate) talking_display: bool,
     last_talking_at: Option<Instant>,
     pub(crate) p2p_direct: bool,
-    pub(crate) last_message_ms: Option<u64>,
-    pub(crate) last_voice_at: Option<Instant>,
+    /// Local instant the participant's current presence state began: while
+    /// online it is derived from the server's room-join time so late joiners see
+    /// the true age, while away it is stamped locally when the offline
+    /// transition is observed. Backs the lobby age column.
+    pub(crate) presence_since: Option<Instant>,
     pub(crate) active_stream: Option<StreamId>,
     pub(crate) voice_feedback: Option<ParticipantVoiceFeedback>,
     /// Smoothed round-trip time to this peer over its direct p2p path,
@@ -73,6 +76,20 @@ pub(crate) struct Participants {
     pub(crate) selected_user: Option<UserId>,
 }
 
+/// Converts a server room-join timestamp (UNIX ms) into a local [`Instant`],
+/// leaning on the same "server ms ≈ local ms" assumption the chat age display
+/// already relies on. A late joiner thus sees a participant's true presence age
+/// rather than restarting the count at zero.
+fn instant_from_server_ms(joined_at_ms: u64) -> Instant {
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_millis() as u64);
+    let elapsed = now_ms.saturating_sub(joined_at_ms);
+    Instant::now()
+        .checked_sub(Duration::from_millis(elapsed))
+        .unwrap_or_else(Instant::now)
+}
+
 impl Participants {
     pub(crate) fn replace_room(&mut self, participants: Vec<ParticipantInfo>) {
         let selected_user = self.selected_user;
@@ -92,11 +109,17 @@ impl Participants {
             .iter_mut()
             .find(|entry| entry.user_id == participant.user_id)
         {
+            let was_online = existing.online;
             existing.name = Some(participant.display_name);
             existing.identifier = Some(participant.identifier);
             existing.online = online;
             existing.voice_active = participant.in_call;
             existing.voice_status = participant.voice_status.normalized();
+            if online {
+                existing.presence_since = Some(instant_from_server_ms(participant.joined_at_ms));
+            } else if was_online {
+                existing.presence_since = Some(Instant::now());
+            }
             if !online || !participant.in_call || existing.voice_status.muted {
                 existing.p2p_direct = false;
                 existing.voice_feedback = None;
@@ -107,6 +130,11 @@ impl Participants {
             }
         } else {
             let voice_status = participant.voice_status.normalized();
+            let presence_since = Some(if online {
+                instant_from_server_ms(participant.joined_at_ms)
+            } else {
+                Instant::now()
+            });
             self.entries.push(ParticipantState {
                 user_id: participant.user_id,
                 name: Some(participant.display_name),
@@ -117,8 +145,7 @@ impl Participants {
                 talking_display: false,
                 last_talking_at: None,
                 p2p_direct: false,
-                last_message_ms: None,
-                last_voice_at: None,
+                presence_since,
                 active_stream: None,
                 voice_feedback: None,
                 peer_rtt_ms: None,
@@ -136,14 +163,12 @@ impl Participants {
     pub(crate) fn note_message(&mut self, message: &ChatMessage) {
         let entry = self.ensure_user(message.sender);
         entry.name = Some(message.sender_name.clone());
-        entry.last_message_ms = Some(message.timestamp_ms);
     }
 
     pub(crate) fn voice_started(&mut self, user_id: UserId, stream_id: StreamId) {
         let entry = self.ensure_user(user_id);
         entry.voice_active = true;
         entry.active_stream = Some(stream_id);
-        entry.last_voice_at = Some(Instant::now());
     }
 
     pub(crate) fn voice_stopped(&mut self, user_id: UserId, stream_id: StreamId) {
@@ -234,16 +259,6 @@ impl Participants {
         }
     }
 
-    pub(crate) fn voice_packet(&mut self, stream_id: u32) {
-        if let Some(entry) = self
-            .entries
-            .iter_mut()
-            .find(|entry| entry.active_stream == Some(StreamId(stream_id)))
-        {
-            entry.last_voice_at = Some(Instant::now());
-        }
-    }
-
     pub(crate) fn voice_feedback(&mut self, feedback: LivePlaybackFeedback) {
         if let Some(entry) = self
             .entries
@@ -315,8 +330,7 @@ impl Participants {
             talking_display: false,
             last_talking_at: None,
             p2p_direct: false,
-            last_message_ms: None,
-            last_voice_at: None,
+            presence_since: None,
             active_stream: None,
             voice_feedback: None,
             peer_rtt_ms: None,
@@ -415,6 +429,7 @@ mod tests {
             identifier: format!("id-{}", user_id.0),
             in_call: true,
             voice_status: ParticipantVoiceStatus::default(),
+            joined_at_ms: 0,
         }
     }
 
@@ -476,6 +491,41 @@ mod tests {
                 .unwrap()
                 .jitter_buffer_ms,
             90
+        );
+    }
+
+    #[test]
+    fn upsert_tracks_presence_age_and_away_transition() {
+        let mut participants = Participants::default();
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |elapsed| elapsed.as_millis() as u64);
+        let mut info = participant(UserId(1));
+        info.joined_at_ms = now_ms.saturating_sub(3_600_000);
+
+        // An online participant who joined an hour ago reads as ~1h, even though
+        // we only just learned about them.
+        participants.upsert(info.clone(), true);
+        let online_age = participants.entries[0]
+            .presence_since
+            .expect("online sets presence_since")
+            .elapsed()
+            .as_secs();
+        assert!(
+            (3599..=3610).contains(&online_age),
+            "expected ~1h, got {online_age}s"
+        );
+
+        // Going away restarts the timer from roughly zero.
+        participants.upsert(info, false);
+        let away_age = participants.entries[0]
+            .presence_since
+            .expect("away keeps presence_since")
+            .elapsed()
+            .as_secs();
+        assert!(
+            away_age < 5,
+            "away timer should restart near zero, got {away_age}s"
         );
     }
 

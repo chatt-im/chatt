@@ -1017,6 +1017,7 @@ mod tests {
             identifier: display_name.to_string(),
             in_call: true,
             voice_status: ParticipantVoiceStatus::default(),
+            joined_at_ms: 0,
         }
     }
 

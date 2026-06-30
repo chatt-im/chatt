@@ -1412,6 +1412,7 @@ impl Server {
                 p2p: None,
                 receive_files,
                 file_receive_limit_bytes,
+                joined_at_ms: now_ms(),
             },
         );
 
@@ -1501,6 +1502,7 @@ impl Server {
             return;
         };
         session.room_id = Some(room_id);
+        session.joined_at_ms = now_ms();
         if let Some(room) = self.rooms.get_mut(&room_id) {
             room.members.insert(session_id);
             kvlog::info!(
@@ -2955,6 +2957,7 @@ impl Server {
                 identifier: session.identifier.clone(),
                 in_call: session.room_id.is_some(),
                 voice_status: session.voice_status,
+                joined_at_ms: session.joined_at_ms,
             })
     }
 
@@ -3208,6 +3211,10 @@ struct Session {
     p2p: Option<P2pSessionState>,
     receive_files: bool,
     file_receive_limit_bytes: u64,
+    /// Server wall-clock (UNIX ms) the session joined its current room, set on
+    /// every room join so a late joiner can show how long each participant has
+    /// been present. Seeded at session establishment to keep it populated.
+    joined_at_ms: u64,
 }
 
 struct ServerUpload {
@@ -3614,6 +3621,7 @@ mod tests {
             p2p: None,
             receive_files: false,
             file_receive_limit_bytes: 0,
+            joined_at_ms: 0,
         }
     }
 

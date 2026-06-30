@@ -251,6 +251,9 @@ pub struct ParticipantInfo {
     pub identifier: String,
     pub in_call: bool,
     pub voice_status: ParticipantVoiceStatus,
+    /// Server wall-clock (UNIX ms) the participant joined the room. Lets a late
+    /// joiner render how long each participant has already been present.
+    pub joined_at_ms: u64,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Jsony)]
@@ -783,6 +786,7 @@ mod tests {
                 identifier: "alice-internal".to_string(),
                 in_call: true,
                 voice_status: ParticipantVoiceStatus::default(),
+                joined_at_ms: 0,
             },
             online: true,
         };
