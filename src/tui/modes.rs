@@ -1439,6 +1439,7 @@ mod tests {
         let mut app = test_app();
         let mut room = RoomMode::default();
         app.room.joined(
+            RoomId(1),
             vec![
                 participant(UserId(1), "alice"),
                 participant(UserId(2), "bob"),

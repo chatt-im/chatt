@@ -133,6 +133,37 @@ impl WebMessage {
 }
 
 impl WebMessage {
+    /// Builds a file message from persisted history: the chat announcement plus
+    /// the stored served name and image dimensions. Used to populate the web
+    /// backlog with a room's file messages when the room is entered.
+    pub fn from_history_file(
+        message: &ChatMessage,
+        served_name: &str,
+        dimensions: Option<(u32, u32)>,
+    ) -> Self {
+        let kind = classify(served_name);
+        let (width, height) = match (kind, dimensions) {
+            ("image", Some((w, h))) => (Some(w), Some(h)),
+            _ => (None, None),
+        };
+        let file_id = message.file_transfer_id.map(|transfer_id| transfer_id.0);
+        WebMessage {
+            id: file_id.unwrap_or(message.message_id.0),
+            sender: message.sender_name.clone(),
+            body: message.body.clone(),
+            timestamp_ms: message.timestamp_ms,
+            attachment: Some(WebAttachment {
+                kind: kind.to_string(),
+                name: served_name.to_string(),
+                width,
+                height,
+            }),
+            file_id,
+        }
+    }
+}
+
+impl WebMessage {
     /// Folds a later message for the same file into this one. Order-independent:
     /// the incoming fields win, but an attachment is never dropped, so the inline
     /// version's media survives whether it arrives before or after the
@@ -185,6 +216,10 @@ pub(crate) fn classify(name: &str) -> &'static str {
 /// What the app sends to the web thread.
 enum WebFeed {
     Message(WebMessage),
+    /// Replaces the backlog with the current room's messages (empty when there
+    /// is no current room) and re-syncs every connected browser. The web view
+    /// mirrors the room the client is in, nothing more.
+    SetRoom(Vec<WebMessage>),
     /// A `share_available` envelope. The web thread retains it by `stream_id` and
     /// replays it to a browser that connects after the share started.
     ShareAvailable {
@@ -248,6 +283,16 @@ impl WebFeedSender {
     /// Pushes a message to every connected browser and records it in history.
     pub fn send(&self, message: WebMessage) {
         let _ = self.tx.send(WebFeed::Message(message));
+        self.wake.wake();
+    }
+
+    /// Replaces the feed's backlog with `messages` and re-syncs every browser.
+    ///
+    /// Call this on entering a room (with that room's history) and on leaving
+    /// one (with an empty vector) so the web view always shows exactly the
+    /// current room's content.
+    pub fn set_room(&self, messages: Vec<WebMessage>) {
+        let _ = self.tx.send(WebFeed::SetRoom(messages));
         self.wake.wake();
     }
 
@@ -421,6 +466,22 @@ fn run(
                         }
                         payload
                     };
+                    for id in &clients {
+                        let _ = server.send_websocket_text(*id, &payload);
+                    }
+                }
+                Ok(WebFeed::SetRoom(messages)) => {
+                    // Advance the sequence past the dropped backlog so a browser
+                    // never confuses the new room's messages with the old ones,
+                    // then bound the replacement to the same window as live sends.
+                    base_seq += history.len() as u64;
+                    history = messages;
+                    if history.len() > max_messages {
+                        let excess = history.len() - max_messages;
+                        history.drain(0..excess);
+                        base_seq += excess as u64;
+                    }
+                    let payload = sync_payload(&history, base_seq);
                     for id in &clients {
                         let _ = server.send_websocket_text(*id, &payload);
                     }
@@ -868,6 +929,42 @@ Sec-WebSocket-Version: 13\r\n\
             "{headers}"
         );
         stream
+    }
+
+    #[test]
+    fn set_room_replaces_backlog_and_resyncs() {
+        let cfg = WebConfig {
+            enabled: true,
+            bind: "127.0.0.1:39520".to_string(),
+        };
+        let (web_tx, _web_rx) = mpsc::channel();
+        let sender = spawn(&cfg, None, 100, web_tx).unwrap();
+
+        let mut stream = open_ws("127.0.0.1:39520");
+        let (_, sync) = read_ws_frame(&mut stream);
+        assert!(String::from_utf8(sync).unwrap().contains("\"messages\":[]"));
+
+        // Entering a room re-syncs the connected browser with that room's history.
+        sender.set_room(vec![WebMessage {
+            id: 1,
+            sender: "Alice".to_string(),
+            body: "room one".to_string(),
+            timestamp_ms: 1,
+            attachment: None,
+            file_id: None,
+        }]);
+        let (opcode, payload) = read_ws_frame(&mut stream);
+        assert_eq!(opcode, 0x1);
+        let text = String::from_utf8(payload).unwrap();
+        assert!(text.starts_with("{\"type\":\"sync\""), "{text}");
+        assert!(text.contains("\"body\":\"room one\""), "{text}");
+
+        // Leaving the room clears the view to nothing.
+        sender.set_room(Vec::new());
+        let (_, cleared) = read_ws_frame(&mut stream);
+        let text = String::from_utf8(cleared).unwrap();
+        assert!(text.starts_with("{\"type\":\"sync\""), "{text}");
+        assert!(text.contains("\"messages\":[]"), "{text}");
     }
 
     #[test]

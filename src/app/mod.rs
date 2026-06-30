@@ -559,6 +559,29 @@ fn share_error_envelope(stream_id: StreamId, message: &str) -> String {
 /// Starts the web server and a relay thread that forwards browser requests into
 /// the app event channel, returning the feed handle. The relay bridges the
 /// otherwise one-directional web feed so a browser play click reaches the app.
+/// Builds the web view's backlog for a room from its loaded history, attaching
+/// stored image dimensions and served names to file messages.
+fn web_room_messages(
+    view: &crate::room_history::LoadedHistory,
+) -> Vec<crate::web_server::WebMessage> {
+    let mut messages = Vec::with_capacity(view.messages.len());
+    for message in &view.messages {
+        let web_message = match message.file_transfer_id {
+            Some(transfer_id) => match view.files.get(&transfer_id) {
+                Some(detail) => crate::web_server::WebMessage::from_history_file(
+                    message,
+                    &detail.file_name,
+                    detail.dimensions(),
+                ),
+                None => crate::web_server::WebMessage::from(message),
+            },
+            None => crate::web_server::WebMessage::from(message),
+        };
+        messages.push(web_message);
+    }
+    messages
+}
+
 fn spawn_web_feed(
     web: &config::WebConfig,
     receive_dir: Option<PathBuf>,
@@ -989,6 +1012,9 @@ impl App {
         self.session_id = None;
         self.user_id = None;
         self.room.reset_for_disconnect();
+        if let Some(feed) = &self.web_feed {
+            feed.set_room(Vec::new());
+        }
         self.server_rtt_ms = None;
         self.last_network_notice = None;
         self.voice_tx_enabled.store(false, Ordering::Relaxed);
@@ -1131,7 +1157,12 @@ impl App {
                 history,
                 participants,
             } => {
-                self.room.joined(participants, history, self.user_id);
+                let view = self
+                    .room
+                    .joined(room_id, participants, history, self.user_id);
+                if let Some(feed) = &self.web_feed {
+                    feed.set_room(web_room_messages(&view));
+                }
                 self.set_status(format!("joined room {}", room_id.0));
                 self.publish_voice_status();
                 self.start_room_voice();
@@ -1152,17 +1183,23 @@ impl App {
                 path,
                 dimensions,
             } => {
+                let served_name = path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or(&metadata.file_name);
                 if let Some(feed) = &self.web_feed {
-                    let served_name = path
-                        .file_name()
-                        .and_then(|name| name.to_str())
-                        .unwrap_or(&metadata.file_name);
                     feed.send(crate::web_server::WebMessage::from_file(
                         &metadata,
                         served_name,
                         dimensions,
                     ));
                 }
+                self.room.file_received(
+                    metadata.transfer_id,
+                    served_name,
+                    metadata.size,
+                    dimensions,
+                );
             }
             NetworkEvent::Presence {
                 participant,
@@ -3815,6 +3852,7 @@ mod tests {
         app.network = Some(NetworkClient::from_parts_for_test(tx));
         app.user_id = Some(UserId(1));
         app.room.joined(
+            rpc::ids::RoomId(1),
             vec![participant(UserId(1), "alice")],
             Vec::new(),
             app.user_id,
@@ -4044,6 +4082,7 @@ mod tests {
         app.room.server_alias = "local".to_string();
         app.user_id = Some(UserId(1));
         app.room.joined(
+            rpc::ids::RoomId(1),
             vec![
                 participant(UserId(1), "alice"),
                 participant(UserId(2), "bob"),
@@ -4094,6 +4133,7 @@ mod tests {
         app.room.server_alias = "local".to_string();
         app.user_id = Some(UserId(1));
         app.room.joined(
+            rpc::ids::RoomId(1),
             vec![
                 participant(UserId(1), "alice"),
                 participant(UserId(2), "bob"),
