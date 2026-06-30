@@ -5,7 +5,7 @@
 //! provably incomplete tail is truncated; other corruption is archived and
 //! only structurally validated records are copied into a clean active file.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::ops::Range;
@@ -415,7 +415,6 @@ enum ParsedRecord {
     Message(ChatMessage),
     FileDetail {
         key: FileHistoryKey,
-        qualified: bool,
         detail: FileDetail,
     },
 }
@@ -613,11 +612,8 @@ fn parse_fields(
             let file_name = file_name.ok_or(MunchError::InvalidValue)?;
             let length = length.ok_or(MunchError::InvalidValue)?;
             let packed_dims = size.ok_or(MunchError::InvalidValue)?;
-            let qualified = correlation_timestamp.is_some();
-            let correlation_timestamp = correlation_timestamp.unwrap_or(timestamp_ms);
-            if qualified
-                && (timestamp_nano % 1_000_000 != 0 || correlation_timestamp != timestamp_ms)
-            {
+            let correlation_timestamp = correlation_timestamp.ok_or(MunchError::InvalidValue)?;
+            if timestamp_nano % 1_000_000 != 0 || correlation_timestamp != timestamp_ms {
                 return Err(MunchError::InvalidValue);
             }
             Ok(ParsedRecord::FileDetail {
@@ -625,7 +621,6 @@ fn parse_fields(
                     timestamp_ms: correlation_timestamp,
                     transfer_id,
                 },
-                qualified,
                 detail: FileDetail {
                     file_name,
                     length,
@@ -679,47 +674,22 @@ fn fold_records(records: &[ValidatedRecord]) -> LoadedHistory {
                     message.clone(),
                 );
             }
-            ParsedRecord::FileDetail {
-                key,
-                qualified,
-                detail,
-            } => {
-                details.push((*key, *qualified, detail.clone()));
+            ParsedRecord::FileDetail { key, detail } => {
+                details.push((*key, detail.clone()));
             }
         }
     }
 
-    let mut file_message_times: HashMap<FileTransferId, Vec<u64>> = HashMap::new();
+    let mut message_keys: HashSet<(FileTransferId, u64)> = HashSet::new();
     for message in messages.values() {
         if let Some(transfer_id) = message.file_transfer_id {
-            file_message_times
-                .entry(transfer_id)
-                .or_default()
-                .push(message.timestamp_ms);
+            message_keys.insert((transfer_id, message.timestamp_ms));
         }
-    }
-    for times in file_message_times.values_mut() {
-        times.sort_unstable();
-        times.dedup();
     }
 
     let mut files = HashMap::new();
-    for (record_key, qualified, detail) in details {
-        let key = if qualified {
-            file_message_times
-                .get(&record_key.transfer_id)
-                .filter(|times| times.binary_search(&record_key.timestamp_ms).is_ok())
-                .map(|_| record_key)
-        } else {
-            file_message_times
-                .get(&record_key.transfer_id)
-                .filter(|times| times.len() == 1)
-                .map(|times| FileHistoryKey {
-                    timestamp_ms: times[0],
-                    transfer_id: record_key.transfer_id,
-                })
-        };
-        if let Some(key) = key {
+    for (key, detail) in details {
+        if message_keys.contains(&(key.transfer_id, key.timestamp_ms)) {
             files.insert(key, detail);
         }
     }
@@ -937,32 +907,6 @@ pub(crate) fn derive_server_id(token: &str) -> String {
     id
 }
 
-/// Best-effort one-time move of a server's history from the legacy alias-keyed
-/// directory to the stable id-keyed directory, so an existing install keeps its
-/// history across this change. A no-op once the id directory exists or no legacy
-/// directory is present.
-pub(crate) fn migrate_legacy_history(legacy_alias: &str, history_id: &str) {
-    if legacy_alias.is_empty() || history_id.is_empty() {
-        return;
-    }
-    let Some(base) = data_dir() else {
-        return;
-    };
-    let new_dir = base.join(sanitize_alias(history_id));
-    let old_dir = base.join(sanitize_alias(legacy_alias));
-    if new_dir == old_dir || new_dir.exists() || !old_dir.exists() {
-        return;
-    }
-    if let Err(error) = fs::rename(&old_dir, &new_dir) {
-        kvlog::warn!(
-            "room history migrate failed",
-            from = old_dir.display().to_string(),
-            to = new_dir.display().to_string(),
-            err = error.to_string()
-        );
-    }
-}
-
 fn history_path(history_id: &str, room_id: RoomId) -> Option<PathBuf> {
     if history_id.is_empty() {
         return None;
@@ -1079,69 +1023,45 @@ mod tests {
     }
 
     #[test]
-    fn legacy_detail_falls_back_only_for_unique_transfer_id() {
+    fn detail_is_kept_only_when_a_message_shares_its_transfer_id_and_timestamp() {
         let mut records = Vec::new();
-        let unique = text_message(1, 1_000, "unique");
-        let mut unique = unique;
-        unique.file_transfer_id = Some(FileTransferId(5));
+        let mut matched = text_message(1, 1_000, "matched");
+        matched.file_transfer_id = Some(FileTransferId(5));
         records.push(ValidatedRecord {
             range: 0..0,
-            parsed: ParsedRecord::Message(unique),
+            parsed: ParsedRecord::Message(matched),
+        });
+        records.push(ValidatedRecord {
+            range: 0..0,
+            parsed: ParsedRecord::FileDetail {
+                key: FileHistoryKey {
+                    timestamp_ms: 1_000,
+                    transfer_id: FileTransferId(5),
+                },
+                detail: FileDetail {
+                    file_name: "matched.png".to_string(),
+                    length: 1,
+                    packed_dims: 0,
+                },
+            },
+        });
+        // A detail whose timestamp does not match any message of its transfer id
+        // is dropped.
+        let mut other = text_message(2, 2_000, "other");
+        other.file_transfer_id = Some(FileTransferId(6));
+        records.push(ValidatedRecord {
+            range: 0..0,
+            parsed: ParsedRecord::Message(other),
         });
         records.push(ValidatedRecord {
             range: 0..0,
             parsed: ParsedRecord::FileDetail {
                 key: FileHistoryKey {
                     timestamp_ms: 9_000,
-                    transfer_id: FileTransferId(5),
-                },
-                qualified: false,
-                detail: FileDetail {
-                    file_name: "unique.png".to_string(),
-                    length: 1,
-                    packed_dims: 0,
-                },
-            },
-        });
-        for timestamp in [2_000, 3_000] {
-            let mut message = text_message(timestamp, timestamp, "ambiguous");
-            message.file_transfer_id = Some(FileTransferId(6));
-            records.push(ValidatedRecord {
-                range: 0..0,
-                parsed: ParsedRecord::Message(message),
-            });
-        }
-        records.push(ValidatedRecord {
-            range: 0..0,
-            parsed: ParsedRecord::FileDetail {
-                key: FileHistoryKey {
-                    timestamp_ms: 10_000,
                     transfer_id: FileTransferId(6),
                 },
-                qualified: false,
                 detail: FileDetail {
-                    file_name: "ambiguous.png".to_string(),
-                    length: 1,
-                    packed_dims: 0,
-                },
-            },
-        });
-        let mut mismatched = text_message(4, 4_000, "qualified");
-        mismatched.file_transfer_id = Some(FileTransferId(7));
-        records.push(ValidatedRecord {
-            range: 0..0,
-            parsed: ParsedRecord::Message(mismatched),
-        });
-        records.push(ValidatedRecord {
-            range: 0..0,
-            parsed: ParsedRecord::FileDetail {
-                key: FileHistoryKey {
-                    timestamp_ms: 40_000,
-                    transfer_id: FileTransferId(7),
-                },
-                qualified: true,
-                detail: FileDetail {
-                    file_name: "qualified.png".to_string(),
+                    file_name: "stale.png".to_string(),
                     length: 1,
                     packed_dims: 0,
                 },
@@ -1158,12 +1078,6 @@ mod tests {
                 .files
                 .keys()
                 .any(|key| key.transfer_id == FileTransferId(6))
-        );
-        assert!(
-            !loaded
-                .files
-                .keys()
-                .any(|key| key.transfer_id == FileTransferId(7))
         );
     }
 
@@ -1449,28 +1363,6 @@ mod tests {
         assert_eq!(ids, vec![1, 2, 3, 4, 5, 6]);
         let _ = fs::remove_file(&path);
         let _ = fs::remove_file(backup_path(&path));
-    }
-
-    #[test]
-    fn migrate_legacy_history_moves_directory_then_is_idempotent() {
-        let base = data_dir().expect("data dir");
-        let alias = "legacy-server-migrate";
-        let history_id = "00112233445566778899aabbccddeeff";
-        let old_dir = base.join(sanitize_alias(alias));
-        let new_dir = base.join(sanitize_alias(history_id));
-        let _ = fs::remove_dir_all(&old_dir);
-        let _ = fs::remove_dir_all(&new_dir);
-        create_private_dir(&old_dir).expect("old dir");
-        fs::write(old_dir.join("room-1.kvlog"), b"seed").expect("seed");
-
-        migrate_legacy_history(alias, history_id);
-        assert!(!old_dir.exists());
-        assert!(new_dir.join("room-1.kvlog").exists());
-
-        // A second call is a no-op because the id directory now exists.
-        migrate_legacy_history(alias, history_id);
-        assert!(new_dir.join("room-1.kvlog").exists());
-        let _ = fs::remove_dir_all(&new_dir);
     }
 
     #[cfg(unix)]

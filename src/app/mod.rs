@@ -992,7 +992,6 @@ impl App {
                 }
             };
         let history_id = crate::room_history::derive_server_id(&server.token);
-        crate::room_history::migrate_legacy_history(&server.alias, &history_id);
         self.room.connect_to_server(
             server.alias.clone(),
             history_id,
