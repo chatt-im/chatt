@@ -36,6 +36,10 @@ const NOTIFICATION_STREAM_ID: u32 = u32::MAX;
 /// Notification ring capacity, one second at 48 kHz.
 const NOTIFICATION_RING_SAMPLES: usize = 48_000;
 const NETEQ_DIAGNOSTIC_TREND_WINDOW: Duration = Duration::from_secs(5);
+/// How often the decoder worker emits a NetEQ diagnostics record to the kvlog
+/// ring, so a `/report-bug` bundle carries a latency time-series rather than a
+/// single instantaneous snapshot. Only emitted while a call is active.
+const NETEQ_DIAGNOSTIC_LOG_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Producer side of the notification stream: the write end of a [`SampleRing`]
 /// the cpal mixer reads, registered with the consumer only while a clip plays.
@@ -53,6 +57,7 @@ pub(crate) fn run_live_decoder_worker(
     block_hint: Arc<AtomicUsize>,
 ) {
     let mut streams = LiveDecodeStreams::new(tuning);
+    let mut last_diagnostic_log: Option<Instant> = None;
 
     loop {
         match receiver.recv_timeout(LIVE_PLAYBACK_DRAIN_INTERVAL) {
@@ -73,8 +78,44 @@ pub(crate) fn run_live_decoder_worker(
         let now = Instant::now();
         streams.set_block_samples(block_hint.load(Ordering::Relaxed));
         streams.drain_into_mixer_events(&mixer_events, now, feedback_sender.as_ref());
-        shared_snapshot.update_stream_snapshot(streams.snapshot_at(now));
+        let snapshot = streams.snapshot_at(now);
+        let due = last_diagnostic_log
+            .is_none_or(|at| now.saturating_duration_since(at) >= NETEQ_DIAGNOSTIC_LOG_INTERVAL);
+        if due && snapshot.active_streams > 0 {
+            log_neteq_diagnostics(&snapshot);
+            last_diagnostic_log = Some(now);
+        }
+        shared_snapshot.update_stream_snapshot(snapshot);
     }
+}
+
+/// Emits the latency-relevant NetEQ fields to the kvlog ring once per second
+/// while a call is live. This is the time-series a `/report-bug` bundle needs to
+/// tell target inflation (`target_ms` climbing well above `start` ms) apart from
+/// a buffer that will not drain (`playout`/`packet` deep while accelerate stays
+/// idle).
+fn log_neteq_diagnostics(snapshot: &LivePlaybackSnapshot) {
+    kvlog::info!(
+        "neteq playback diagnostics",
+        streams = snapshot.active_streams as u64,
+        target_ms = snapshot.neteq_target_ms,
+        target_delta_5s_ms = snapshot.neteq_target_delta_5s_ms,
+        start_delay_ms = snapshot.neteq_start_delay_ms,
+        playout_ms = snapshot.neteq_playout_delay_ms,
+        playout_delta_5s_ms = snapshot.neteq_playout_delta_5s_ms,
+        packet_buffer_ms = snapshot.neteq_packet_buffer_ms,
+        packet_buffer_wait_ms = snapshot.neteq_packet_buffer_wait_ms,
+        sync_buffer_ms = snapshot.neteq_sync_buffer_ms,
+        packets_buffered = snapshot.neteq_packets_buffered as u64,
+        next_packet_gap_ms = snapshot.neteq_next_packet_gap_ms,
+        output_ring_ms = snapshot.max_output_ring_ms,
+        decision = snapshot.neteq_decision.as_str(),
+        reason = snapshot.neteq_decision_reason.as_str(),
+        accelerate_count = snapshot.accelerate_count,
+        expand_count = snapshot.expand_count,
+        underrun_count = snapshot.underrun_count,
+        hard_trim_count = snapshot.hard_trim_count
+    );
 }
 
 pub(crate) fn handle_live_playback_command(

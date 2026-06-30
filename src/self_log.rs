@@ -14,7 +14,7 @@ use std::{
 use kvlog::collector::{LogBuffer, LoggerGuard};
 
 #[cfg(not(test))]
-const RING_BUFFER_SIZE: usize = 256 * 1024;
+const RING_BUFFER_SIZE: usize = 4 * 1024 * 1024;
 #[cfg(test)]
 const RING_BUFFER_SIZE: usize = 1024;
 
