@@ -23,7 +23,7 @@ use extui::event::{
 };
 use rpc::{
     control::{InviteTicket, ParticipantVoiceStatus},
-    ids::{SessionId, StreamId, UserId},
+    ids::{RoomId, SessionId, StreamId, UserId},
 };
 
 use crate::{
@@ -998,6 +998,12 @@ impl App {
             history_id,
             server.effective_display_name(),
         );
+        let view = self
+            .room
+            .load_offline_history(RoomId(server.room_id), self.user_id);
+        if let Some(feed) = &self.web_feed {
+            feed.set_room(web_room_messages(&view));
+        }
         self.active_tcp_addr = Some(
             server
                 .client_config(&self.config.files, &self.config.p2p)
@@ -1455,8 +1461,8 @@ impl App {
             }
             NetworkEvent::Disconnected => {
                 self.disconnect_network();
-                self.open_server_select();
-                self.set_error("network disconnected");
+                self.push_network_notice("network", "disconnected; viewing offline logs");
+                self.set_error("disconnected");
             }
         }
     }
@@ -1539,7 +1545,7 @@ impl App {
 
     /// Builds the fallback base mode used if the stack is ever popped empty.
     pub(crate) fn base_mode(&self) -> Box<dyn AppMode> {
-        if self.network.is_some() {
+        if self.network.is_some() || !self.room.server_alias.is_empty() {
             Box::new(RoomMode::default())
         } else {
             Box::new(ServerListMode::new())
@@ -3653,6 +3659,26 @@ mod tests {
 
     fn render_room(app: &mut App, room: &mut RoomMode, buffer: &mut Buffer) {
         room.render(app, buffer, 0);
+    }
+
+    fn base_mode_label(app: &App) -> &'static str {
+        app.base_mode()
+            .presentation(app)
+            .chrome
+            .expect("base mode has chrome")
+            .status_label
+    }
+
+    #[test]
+    fn base_mode_stays_in_room_while_a_server_is_selected() {
+        let mut app = test_app();
+        // No server selected and no network: the server picker is the base.
+        assert_eq!(base_mode_label(&app), "Servers");
+
+        // A selected server (kept across a disconnect) holds the room view so
+        // its offline logs stay readable.
+        app.room.server_alias = "lab".to_string();
+        assert_eq!(base_mode_label(&app), "Compose");
     }
 
     fn participant(user_id: UserId, display_name: &str) -> ParticipantInfo {
