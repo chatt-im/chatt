@@ -13,8 +13,8 @@ use chatt::audio::StatsSnapshot;
 
 use crate::{
     app::{
-        App, ChatPanelFocus, ParticipantState, ServerEditDraft, ServerSelectItem, StatusKind,
-        volume_db_label,
+        App, ChatPanelFocus, ParticipantState, ParticipantVoiceFeedback, ServerEditDraft,
+        ServerSelectItem, StatusKind, volume_db_label,
     },
     bindings::{self, Reachable, ReachableKind},
     chat_buffer::{self, LineKind},
@@ -211,7 +211,7 @@ fn draw_room(area: Rect, app: &App, focus: ChatPanelFocus, buf: &mut Buffer) {
         let marker = if selected { ">" } else { " " };
         let (status_marker, status_style) = room_user_status_indicator(app, participant);
         let control = room_user_control_label(app, participant);
-        let voice = room_user_voice_feedback_label(participant);
+        let voice = room_user_voice_feedback_label(app, participant);
         row.with(base).fill(buf);
         row.with(style).with(Ellipsis(true)).text(
             buf,
@@ -552,21 +552,45 @@ fn draw_server_edit(area: Rect, app: &mut App, draft: &mut ServerEditDraft, buf:
     draft.render(area, buf, theme);
 }
 
-fn room_user_voice_feedback_label(participant: &ParticipantState) -> String {
+fn room_user_voice_feedback_label(app: &App, participant: &ParticipantState) -> String {
     let Some(feedback) = participant.voice_feedback else {
         return String::new();
     };
     if !participant.voice_active || feedback.updated_at.elapsed() > Duration::from_secs(10) {
         return String::new();
     }
-    format!(
-        "loss{} jb{}/{} r{} j{}",
-        feedback.loss_percent,
-        feedback.max_neteq_playout_delay_ms,
-        feedback.max_neteq_target_ms,
-        feedback.max_output_ring_ms,
-        feedback.max_interarrival_jitter_ms
-    )
+    if app.lobby_details {
+        return format!(
+            "loss{} jb{}/{} r{} j{}",
+            feedback.loss_percent,
+            feedback.max_neteq_playout_delay_ms,
+            feedback.max_neteq_target_ms,
+            feedback.max_output_ring_ms,
+            feedback.max_interarrival_jitter_ms
+        );
+    }
+    // Collapsed default: a single mouth-to-ear-ish latency estimate. A directly
+    // connected peer uses its own measured RTT; everyone else rides the relay, so
+    // the shared server RTT is the network leg.
+    let rtt_ms = if participant.p2p_direct {
+        participant.peer_rtt_ms
+    } else {
+        app.server_rtt_ms
+    };
+    format!("~{}ms", participant_latency_estimate_ms(&feedback, rtt_ms))
+}
+
+/// Combines the stabilized jitter-buffer depth (an EWMA of the NetEQ target that
+/// holds steady through silence), the output device ring, and one-way network
+/// latency (half the measured RTT) into a single latency figure in milliseconds.
+fn participant_latency_estimate_ms(
+    feedback: &ParticipantVoiceFeedback,
+    rtt_ms: Option<u16>,
+) -> u16 {
+    feedback
+        .jitter_buffer_ms
+        .saturating_add(feedback.max_output_ring_ms)
+        .saturating_add(rtt_ms.unwrap_or(0) / 2)
 }
 
 fn room_user_status_indicator(app: &App, participant: &ParticipantState) -> (&'static str, Style) {
@@ -956,6 +980,33 @@ fn selected_chat_heading_style(theme: Theme, accent: Style) -> Option<Style> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn feedback(jitter_buffer_ms: u16, ring_ms: u16) -> ParticipantVoiceFeedback {
+        ParticipantVoiceFeedback {
+            loss_percent: 0,
+            max_output_ring_ms: ring_ms,
+            max_neteq_target_ms: jitter_buffer_ms,
+            max_neteq_playout_delay_ms: jitter_buffer_ms,
+            max_interarrival_jitter_ms: 0,
+            jitter_buffer_ms,
+            updated_at: std::time::Instant::now(),
+        }
+    }
+
+    #[test]
+    fn latency_estimate_sums_buffer_and_half_rtt() {
+        // jitter buffer 60 + ring 10 + rtt 40/2 = 90.
+        assert_eq!(
+            participant_latency_estimate_ms(&feedback(60, 10), Some(40)),
+            90
+        );
+    }
+
+    #[test]
+    fn latency_estimate_tolerates_missing_rtt() {
+        // Without an RTT sample the network leg contributes nothing.
+        assert_eq!(participant_latency_estimate_ms(&feedback(60, 10), None), 70);
+    }
 
     #[test]
     fn selected_chat_heading_uses_message_accent_as_fill() {

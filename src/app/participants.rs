@@ -24,6 +24,14 @@ pub(crate) struct ParticipantState {
     pub(crate) last_voice_at: Option<Instant>,
     pub(crate) active_stream: Option<StreamId>,
     pub(crate) voice_feedback: Option<ParticipantVoiceFeedback>,
+    /// Smoothed round-trip time to this peer over its direct p2p path,
+    /// milliseconds. Only meaningful while `p2p_direct` is set; used as the
+    /// network leg of the latency estimate for directly connected participants.
+    pub(crate) peer_rtt_ms: Option<u16>,
+    /// Running EWMA of the realized NetEQ playout delay (ms), updated only on
+    /// active feedback windows. Backs the stabilized `ParticipantVoiceFeedback::
+    /// jitter_buffer_ms`; `None` until the first sample seeds it.
+    jitter_buffer_ms: Option<f32>,
 }
 
 impl ParticipantState {
@@ -32,6 +40,16 @@ impl ParticipantState {
     }
 }
 
+/// Smoothing weight applied to each fresh jitter-buffer sample folded into the
+/// stabilized estimate. Low enough that a single noisy window barely moves it.
+const JITTER_BUFFER_EWMA_WEIGHT: f32 = 0.25;
+/// Minimum packets a feedback window must cover before its jitter-buffer reading
+/// is trusted to update the stabilized value. Silence-boundary reports carry
+/// `expected_packets == 0` and talk-gap windows carry only a few, so this gate
+/// keeps the estimate from wandering while a participant is muted or silent.
+/// A full active window is `LIVE_PLAYBACK_FEEDBACK_PACKETS` (25); this is ~⅔.
+const JITTER_ACTIVE_MIN_PACKETS: u16 = 16;
+
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct ParticipantVoiceFeedback {
     pub(crate) loss_percent: u8,
@@ -39,6 +57,12 @@ pub(crate) struct ParticipantVoiceFeedback {
     pub(crate) max_neteq_target_ms: u16,
     pub(crate) max_neteq_playout_delay_ms: u16,
     pub(crate) max_interarrival_jitter_ms: u16,
+    /// Stabilized jitter-buffer depth (ms): an EWMA of the realized NetEQ playout
+    /// delay that only advances on active windows, so the collapsed latency
+    /// estimate holds steady through mutes and silences instead of wandering
+    /// window-to-window. Used by the collapsed lobby view; the detailed view still
+    /// shows the raw `max_neteq_*` values.
+    pub(crate) jitter_buffer_ms: u16,
     pub(crate) updated_at: Instant,
 }
 
@@ -76,6 +100,8 @@ impl Participants {
             if !online || !participant.in_call || existing.voice_status.muted {
                 existing.p2p_direct = false;
                 existing.voice_feedback = None;
+                existing.peer_rtt_ms = None;
+                existing.jitter_buffer_ms = None;
                 existing.talking_display = false;
                 existing.last_talking_at = None;
             }
@@ -95,6 +121,8 @@ impl Participants {
                 last_voice_at: None,
                 active_stream: None,
                 voice_feedback: None,
+                peer_rtt_ms: None,
+                jitter_buffer_ms: None,
             });
         }
         self.sort();
@@ -127,6 +155,8 @@ impl Participants {
             entry.voice_active = false;
             entry.p2p_direct = false;
             entry.voice_feedback = None;
+            entry.peer_rtt_ms = None;
+            entry.jitter_buffer_ms = None;
             entry.talking_display = false;
             entry.last_talking_at = None;
             if entry.active_stream == Some(stream_id) {
@@ -186,7 +216,22 @@ impl Participants {
     pub(crate) fn set_peer_transport(&mut self, user_id: UserId, direct: bool) {
         let entry = self.ensure_user(user_id);
         entry.p2p_direct = direct;
+        if !direct {
+            // The direct path is gone, so any prior peer RTT no longer describes
+            // how this participant's audio reaches us.
+            entry.peer_rtt_ms = None;
+        }
         self.sort();
+    }
+
+    pub(crate) fn set_peer_rtt(&mut self, user_id: UserId, rtt_ms: u16) {
+        if let Some(entry) = self
+            .entries
+            .iter_mut()
+            .find(|entry| entry.user_id == user_id)
+        {
+            entry.peer_rtt_ms = Some(rtt_ms);
+        }
     }
 
     pub(crate) fn voice_packet(&mut self, stream_id: u32) {
@@ -212,12 +257,30 @@ impl Participants {
                 ((u32::from(loss_packets) * 100) / u32::from(feedback.expected_packets)).min(100)
                     as u8
             };
+            // Stabilize the jitter-buffer term off the realized NetEQ playout
+            // delay (what the listener actually experiences) rather than the
+            // target setpoint, which the buffer often fails to reach on bad
+            // networks. An EWMA over windows that actually carried speech tames
+            // its noise; silence-boundary and talk-gap windows hold the previous
+            // value so the estimate stays put through mutes and silences.
+            if feedback.expected_packets >= JITTER_ACTIVE_MIN_PACKETS {
+                let sample = f32::from(feedback.max_neteq_playout_delay_ms);
+                entry.jitter_buffer_ms = Some(match entry.jitter_buffer_ms {
+                    Some(prev) => prev + JITTER_BUFFER_EWMA_WEIGHT * (sample - prev),
+                    None => sample,
+                });
+            }
+            let jitter_buffer_ms = entry
+                .jitter_buffer_ms
+                .map(|value| value.round().clamp(0.0, f32::from(u16::MAX)) as u16)
+                .unwrap_or(feedback.max_neteq_playout_delay_ms);
             entry.voice_feedback = Some(ParticipantVoiceFeedback {
                 loss_percent,
                 max_output_ring_ms: feedback.max_output_ring_ms,
                 max_neteq_target_ms: feedback.max_neteq_target_ms,
                 max_neteq_playout_delay_ms: feedback.max_neteq_playout_delay_ms,
                 max_interarrival_jitter_ms: feedback.max_interarrival_jitter_ms,
+                jitter_buffer_ms,
                 updated_at: Instant::now(),
             });
         }
@@ -256,6 +319,8 @@ impl Participants {
             last_voice_at: None,
             active_stream: None,
             voice_feedback: None,
+            peer_rtt_ms: None,
+            jitter_buffer_ms: None,
         });
         if self.selected_user.is_none() {
             self.selected_user = Some(user_id);
@@ -351,6 +416,67 @@ mod tests {
             in_call: true,
             voice_status: ParticipantVoiceStatus::default(),
         }
+    }
+
+    fn live_feedback(
+        stream_id: u32,
+        expected_packets: u16,
+        target_ms: u16,
+    ) -> LivePlaybackFeedback {
+        LivePlaybackFeedback {
+            stream_id,
+            highest_contiguous_sequence: 0,
+            expected_packets,
+            lost_packets: 0,
+            late_packets: 0,
+            duplicate_packets: 0,
+            reordered_packets: 0,
+            window_ms: 500,
+            max_output_ring_ms: 0,
+            max_neteq_target_ms: target_ms,
+            max_neteq_playout_delay_ms: target_ms,
+            max_neteq_packet_buffer_ms: 0,
+            max_interarrival_jitter_ms: 0,
+        }
+    }
+
+    #[test]
+    fn jitter_buffer_estimate_holds_through_silence() {
+        let mut participants = Participants::default();
+        participants.replace_room(vec![participant(UserId(1))]);
+        participants.voice_started(UserId(1), StreamId(7));
+
+        // An active window seeds the stabilized jitter buffer at the target.
+        participants.voice_feedback(live_feedback(7, 25, 80));
+        assert_eq!(
+            participants.entries[0]
+                .voice_feedback
+                .unwrap()
+                .jitter_buffer_ms,
+            80
+        );
+
+        // A silence-boundary window (expected_packets == 0) reporting a wildly
+        // different target must not move the estimate.
+        participants.voice_feedback(live_feedback(7, 0, 400));
+        assert_eq!(
+            participants.entries[0]
+                .voice_feedback
+                .unwrap()
+                .jitter_buffer_ms,
+            80
+        );
+
+        // A fresh active window nudges it via the EWMA, not all the way: 80 +
+        // 0.25 * (120 - 80) = 90.
+        participants.voice_feedback(live_feedback(7, 25, 120));
+        assert_eq!(
+            participants.entries[0]
+                .voice_feedback
+                .unwrap()
+                .jitter_buffer_ms,
+            90
+        );
     }
 
     #[test]

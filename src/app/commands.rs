@@ -80,6 +80,11 @@ pub(crate) const SLASH_COMMANDS: &[SlashCommand] = &[
         description: "list soundboard clips",
     },
     SlashCommand {
+        name: "/stats",
+        usage: "/stats",
+        description: "toggle detailed lobby voice stats",
+    },
+    SlashCommand {
         name: "/undeafen",
         usage: "/undeafen",
         description: "resume playback and microphone send",
