@@ -16,6 +16,7 @@ mod buffer_level_filter;
 mod core;
 mod decision_logic;
 mod delay_constraints;
+mod dsp;
 mod delay_manager;
 mod delay_optimizer;
 mod histogram;
