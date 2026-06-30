@@ -235,13 +235,17 @@ cargo test --workspace
 
 Useful in-app slash commands:
 
+- `/help`: show the in-app command list. Type a prefix and press Tab to
+  complete a slash command; press Tab again to cycle other matches.
 - `/upload path/to/file.ext`: relay a file to users in the room who accept files.
+- `/report-bug what went wrong`: send recent logs and diagnostics to the server.
 - `screencast start` / `screencast stop` (CLI subcommands): share your screen to room members' web views.
 - `/mute` and `/unmute`: control microphone send.
 - `/deafen` and `/undeafen`: stop or resume receive/playback and microphone send.
 - `/audio`: show receive queue, adaptive catch-up, DRED/PLC, trim, and underrun diagnostics.
 - `/users`: show known or current room users.
 - `/whoami`: show the current authenticated user.
+- `/soundboard` and `/sound N|name`: list or trigger configured soundboard clips.
 - `/settings` or `/config`: open settings.
 - `/clear`: clear the local chat view.
 

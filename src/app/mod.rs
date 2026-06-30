@@ -1,4 +1,5 @@
 pub(crate) mod audio_diagnostics;
+pub(crate) mod commands;
 pub(crate) mod dialogs;
 pub(crate) mod participants;
 pub(crate) mod room;
@@ -54,6 +55,7 @@ use chatt::audio::{
 };
 
 use audio_diagnostics::AudioDiagnostics;
+use commands::slash_command_help;
 
 pub(crate) use dialogs::{UserVolumeDialog, UserVolumeEvent};
 pub(crate) use participants::{ParticipantState, Participants};
@@ -2666,13 +2668,16 @@ impl App {
             "/deafened" => self.show_deafen_status(),
             "/audio" => self.show_audio_status(),
             "/clear" => self.room.clear_chat(),
+            "/help" => self.show_command_help(),
             "/config" | "/settings" => self.open_settings(),
             "/servers" if self.network.is_some() => self.pop_mode(),
             "/servers" => self.open_server_select(),
             "/soundboard" => self.show_soundboard(),
             "/users" => self.show_users(),
             "/whoami" => self.show_current_user(),
+            "/upload" => self.set_error("usage: /upload file_path/filename.ext"),
             command if command.starts_with("/upload ") => self.upload_file_command(command),
+            "/report-bug" => self.set_error("usage: /report-bug what went wrong"),
             command if command.starts_with("/report-bug ") => {
                 let description = command.trim_start_matches("/report-bug ").trim();
                 self.start_bug_report(description.to_string());
@@ -2706,6 +2711,11 @@ impl App {
         } else {
             self.set_error("select a server before uploading files");
         }
+    }
+
+    fn show_command_help(&mut self) {
+        self.room.push_notice("help", slash_command_help());
+        self.set_status("slash commands listed");
     }
 
     fn set_mute(&mut self, muted: bool) {
@@ -3953,6 +3963,21 @@ mod tests {
         assert_eq!(h.stack.len(), 1);
         assert_eq!(h.top_theme_mode(), crate::theme::UiMode::Compose);
         assert_eq!(h.app.room.composer.text(), "unsent draft");
+    }
+
+    #[test]
+    fn slash_help_pushes_command_notice() {
+        let mut app = test_app();
+        app.room.composer.set_lines("/help");
+
+        app.submit_input();
+
+        assert_eq!(app.room.chat.len(), 1);
+        let notice = app.room.chat.message(0);
+        assert_eq!(notice.sender, "help");
+        assert!(notice.body.contains("/report-bug what went wrong"));
+        assert!(notice.body.contains("Press Tab again to cycle matches"));
+        assert_eq!(app.status.text(), "slash commands listed");
     }
 
     #[test]

@@ -11,6 +11,10 @@
 #
 # The rustflags are scoped to x86-64 targets so host build scripts are
 # unaffected when cross-compiling. Note env `RUSTFLAGS`, if set, overrides these.
+
+[build]
+target-dir = "/tmp/chatt/target"
+
 [alias]
 v3 = [
     "build",
