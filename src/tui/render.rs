@@ -191,10 +191,9 @@ fn draw_room(area: Rect, app: &App, focus: ChatPanelFocus, buf: &mut Buffer) {
             } else {
                 "away"
             };
-        let spoke = participant
-            .last_voice_at
+        let uptime = participant
+            .presence_since
             .map(age_label)
-            .or_else(|| participant.last_message_ms.map(|_| "msg".to_string()))
             .unwrap_or_else(|| "--".to_string());
         let base = if selected {
             app.theme.room_selected
@@ -219,7 +218,7 @@ fn draw_room(area: Rect, app: &App, focus: ChatPanelFocus, buf: &mut Buffer) {
                 "{marker}   {:<16} {:<7} {:<5} {:<16} {}",
                 participant.display_name(),
                 state,
-                spoke,
+                uptime,
                 voice,
                 control
             ),
@@ -1476,7 +1475,11 @@ fn age_label(instant: Instant) -> String {
     let secs = instant.elapsed().as_secs();
     if secs < 60 {
         format!("{secs}s")
-    } else {
+    } else if secs < 3600 {
         format!("{}m", secs / 60)
+    } else if secs < 86_400 {
+        format!("{}h", secs / 3600)
+    } else {
+        format!("{}d", secs / 86_400)
     }
 }

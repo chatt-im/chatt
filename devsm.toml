@@ -5,8 +5,27 @@ cargo run -p server -- --config chatt-server.toml --logfile /tmp/chatt-server.kv
 '''
 ready.when.output_contains = "chatt server listening"
 ready.timeout = 10.0
-cache.never = true
 info = "Local chatt development server"
+
+[action.client-alice]
+sh = '''
+rm /tmp/chatt-alice.kvlog
+cargo run -p chatt -- --config dev/chatt-alice.toml --logfile /tmp/chatt-alice.kvlog
+'''
+require = ["server"]
+managed = false
+env.CHATT_RUN_DIR = "/tmp/chatt-dev/alice"
+info = "Run the Alice client in this terminal"
+
+[action.client-bob]
+sh = '''
+rm /tmp/chatt-bob.kvlog
+cargo run -p chatt -- --config dev/chatt-bob.toml --logfile /tmp/chatt-bob.kvlog
+'''
+require = ["server"]
+managed = false
+env.CHATT_RUN_DIR = "/tmp/chatt-dev/bob"
+info = "Run the Bob client in this terminal"
 
 [action.json-snapshot-client-logs]
 sh = '''
@@ -50,25 +69,6 @@ env.CHATT_AUDIO_POP_LOG = "1"
 env.CHATT_AUDIO_PLAYBACK_WAV = "/tmp/chatt-soundboard-playback.wav"
 info = "Run the soundboard in release mode with audio pop diagnostics"
 
-[action.client-alice]
-sh = '''
-rm /tmp/chatt-alice.kvlog
-cargo run -p chatt -- --config dev/chatt-alice.toml --logfile /tmp/chatt-alice.kvlog
-'''
-require = ["server"]
-managed = false
-env.CHATT_RUN_DIR = "/tmp/chatt-dev/alice"
-info = "Run the Alice client in this terminal"
-
-[action.client-bob]
-sh = '''
-rm /tmp/chatt-bob.kvlog
-cargo run -p chatt -- --config dev/chatt-bob.toml --logfile /tmp/chatt-bob.kvlog
-'''
-require = ["server"]
-managed = false
-env.CHATT_RUN_DIR = "/tmp/chatt-dev/bob"
-info = "Run the Bob client in this terminal"
 
 [action.client-soundboard]
 sh = '''
