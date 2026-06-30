@@ -294,9 +294,35 @@ impl RoomSession {
         let mut merged: Vec<ChatMessage> = union.into_values().collect();
         merged.sort_by_key(|message| (message.timestamp_ms, message.message_id.0));
 
+        self.populate_history(&merged, local_user);
+
+        room_history::LoadedHistory {
+            messages: merged,
+            files: loaded.files,
+        }
+    }
+
+    /// Loads the on-disk history for the current server and shows it without a
+    /// live connection. Used so a selected server's persisted logs are visible
+    /// during connect, retries, and while offline. No append handle is kept
+    /// because nothing is written until a real join.
+    pub(crate) fn load_offline_history(
+        &mut self,
+        room_id: RoomId,
+        local_user: Option<UserId>,
+    ) -> room_history::LoadedHistory {
+        let loaded = room_history::open(&self.history_id, room_id).loaded;
+        self.populate_history(&loaded.messages, local_user);
+        loaded
+    }
+
+    /// Replaces the chat buffer and dedup set with `messages`, marking those
+    /// from `local_user` as locally sent. Shared by [`joined`](Self::joined) and
+    /// [`load_offline_history`](Self::load_offline_history).
+    fn populate_history(&mut self, messages: &[ChatMessage], local_user: Option<UserId>) {
         self.chat.clear();
         self.seen.clear();
-        for message in &merged {
+        for message in messages {
             let local = Some(message.sender) == local_user;
             self.seen
                 .insert((message.timestamp_ms, message.message_id.0));
@@ -304,11 +330,6 @@ impl RoomSession {
             self.chat.push_chat(message.clone(), local);
         }
         self.chat.bottom();
-
-        room_history::LoadedHistory {
-            messages: merged,
-            files: loaded.files,
-        }
     }
 
     pub(crate) fn chat_received(
@@ -724,6 +745,35 @@ mod tests {
         assert_eq!(room.chat.message(0).body, "duplicate");
         assert_eq!(room.chat.message(1).body, "second");
         assert_eq!(room.chat.message(2).body, "third");
+    }
+
+    #[test]
+    fn loads_persisted_logs_without_server() {
+        // Persist two messages, then show them in a fresh room with no live
+        // connection, as when selecting a server whose host is unreachable.
+        let history_id = "offline-load-test";
+        let room_id = RoomId(1);
+        let mut store = room_history::open(history_id, room_id)
+            .store
+            .expect("history store opens");
+        store.append_message(&message(1, 1, "first"));
+        store.append_message(&message(2, 2, "second"));
+        drop(store);
+
+        let mut room = test_room();
+        room.connect_to_server(
+            "alias".to_string(),
+            history_id.to_string(),
+            "me".to_string(),
+        );
+        let view = room.load_offline_history(room_id, None);
+
+        assert_eq!(room.chat.len(), 2);
+        assert_eq!(room.chat.message(0).body, "first");
+        assert_eq!(room.chat.message(1).body, "second");
+        assert_eq!(view.messages.len(), 2);
+        // No append handle is kept while offline.
+        assert!(room.history.is_none());
     }
 
     #[test]
