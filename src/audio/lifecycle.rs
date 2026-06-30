@@ -75,6 +75,59 @@ pub struct LiveCaptureConfig {
     pub deafened: Arc<AtomicBool>,
 }
 
+/// Resolved device parameters captured when a capture or playback stream
+/// starts. Surfaced by the `/audio` command so the active backend, device, and
+/// buffer are visible without reading the logfile.
+#[derive(Clone, Debug)]
+pub struct AudioDeviceInfo {
+    /// cpal host name backing the stream, e.g. `ALSA`, `CoreAudio`, `WASAPI`.
+    pub backend: &'static str,
+    /// Display name of the device the stream actually opened.
+    pub device_name: String,
+    /// True when no device was configured and the host default was used.
+    pub is_default: bool,
+    /// Channel count of the opened stream.
+    pub channels: u16,
+    /// Rate the device stream runs at, before resampling to 48 kHz.
+    pub device_rate: u32,
+    /// Human-readable buffer size label, e.g. `256 frames` or `host default`.
+    pub buffer_size: String,
+    /// Note describing why the buffer size was chosen.
+    pub buffer_note: String,
+    /// True when the configured fixed buffer was unsupported and the host
+    /// default was used instead.
+    pub buffer_fallback: bool,
+}
+
+impl AudioDeviceInfo {
+    /// Single-line summary for the `/audio` notice, e.g.
+    /// `ALSA / Built-in Audio (default), 1ch @ 48000Hz, buffer 256 frames`.
+    pub fn summary(&self) -> String {
+        let default = if self.is_default { " (default)" } else { "" };
+        let fallback = if self.buffer_fallback {
+            " (fallback)"
+        } else {
+            ""
+        };
+        let note = if self.buffer_note.is_empty() {
+            String::new()
+        } else {
+            format!(" [{}]", self.buffer_note)
+        };
+        format!(
+            "{} / {}{}, {}ch @ {}Hz, buffer {}{}{}",
+            self.backend,
+            self.device_name,
+            default,
+            self.channels,
+            self.device_rate,
+            self.buffer_size,
+            fallback,
+            note
+        )
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct LivePlaybackConfig {
     pub output_device_id: Option<String>,
@@ -100,6 +153,8 @@ pub struct LiveCapture {
     /// buffer was used instead. Surfaced so the UI can warn that the requested
     /// low-latency buffer did not take effect.
     buffer_fallback: bool,
+    /// Resolved backend, device, and buffer the capture stream opened.
+    device_info: AudioDeviceInfo,
 }
 
 pub struct Playback {
@@ -115,6 +170,8 @@ pub struct LivePlayback {
     /// True when the configured fixed buffer was unsupported and the host-default
     /// buffer was used instead. See [`LiveCapture::buffer_fallback`].
     buffer_fallback: bool,
+    /// Resolved backend, device, and buffer the playback stream opened.
+    device_info: AudioDeviceInfo,
     playback_recording: Option<LivePlaybackWavRecorder>,
 }
 
@@ -163,6 +220,11 @@ impl LiveCapture {
     /// to the host-default buffer.
     pub fn buffer_fallback(&self) -> bool {
         self.buffer_fallback
+    }
+
+    /// Resolved backend, device, and buffer the capture stream opened.
+    pub fn device_info(&self) -> &AudioDeviceInfo {
+        &self.device_info
     }
 
     pub fn worker_finished(&self) -> bool {
@@ -214,6 +276,11 @@ impl LivePlayback {
     /// to the host-default buffer.
     pub fn buffer_fallback(&self) -> bool {
         self.buffer_fallback
+    }
+
+    /// Resolved backend, device, and buffer the playback stream opened.
+    pub fn device_info(&self) -> &AudioDeviceInfo {
+        &self.device_info
     }
 
     pub fn push(&self, packet: RemoteVoicePacket) {
@@ -418,17 +485,19 @@ pub fn start_live_capture<F>(config: LiveCaptureConfig, on_packet: F) -> Result<
 where
     F: FnMut(LocalVoiceFrame) + Send + 'static,
 {
-    let (device, selection) = with_audio_backend_stderr_suppressed(|| {
+    let (device, selection, backend) = with_audio_backend_stderr_suppressed(|| {
         let host = cpal::default_host();
-        if let Some(id) = config.input_device_id.as_deref() {
-            select_input_device_by_id(&host, id, config.buffer_request)
+        let backend = host.id().name();
+        let (device, selection) = if let Some(id) = config.input_device_id.as_deref() {
+            select_input_device_by_id(&host, id, config.buffer_request)?
         } else {
             let device = host
                 .default_input_device()
                 .ok_or_else(|| "no default input device found".to_string())?;
             let selection = select_input_config(&device, config.buffer_request)?;
-            Ok::<_, String>((device, selection))
-        }
+            (device, selection)
+        };
+        Ok::<_, String>((device, selection, backend))
     })?;
 
     let device_name = device.to_string();
@@ -540,6 +609,16 @@ where
         .map_err(|error| format!("failed to start live input stream: {error}"))?;
 
     kvlog::info!("live capture started", device = device_name.as_str());
+    let device_info = AudioDeviceInfo {
+        backend,
+        device_name,
+        is_default: config.input_device_id.is_none(),
+        channels: selection.stream_config.channels,
+        device_rate: selection.device_rate,
+        buffer_size: audio_buffer_size_label(selection.preview.buffer_size),
+        buffer_note: selection.preview.buffer_note.clone(),
+        buffer_fallback,
+    };
     Ok(LiveCapture {
         stream: Some(stream),
         worker: Some(worker),
@@ -547,6 +626,7 @@ where
         max_amplification_bits,
         encoder_loss_percent,
         buffer_fallback,
+        device_info,
     })
 }
 
@@ -586,17 +666,19 @@ pub fn start_playback(path: &Path, buffer_request: BufferRequest) -> Result<Play
 }
 
 pub fn start_live_playback(config: LivePlaybackConfig) -> Result<LivePlayback, String> {
-    let (device, selection) = with_audio_backend_stderr_suppressed(|| {
+    let (device, selection, backend) = with_audio_backend_stderr_suppressed(|| {
         let host = cpal::default_host();
-        if let Some(id) = config.output_device_id.as_deref() {
-            select_output_device_by_id(&host, id, config.buffer_request)
+        let backend = host.id().name();
+        let (device, selection) = if let Some(id) = config.output_device_id.as_deref() {
+            select_output_device_by_id(&host, id, config.buffer_request)?
         } else {
             let device = host
                 .default_output_device()
                 .ok_or_else(|| "no default output device found".to_string())?;
             let selection = select_output_config(&device, config.buffer_request)?;
-            Ok::<_, String>((device, selection))
-        }
+            (device, selection)
+        };
+        Ok::<_, String>((device, selection, backend))
     })?;
 
     let device_name = device.to_string();
@@ -669,6 +751,16 @@ pub fn start_live_playback(config: LivePlaybackConfig) -> Result<LivePlayback, S
         .map_err(|error| format!("failed to start live output stream: {error}"))?;
 
     kvlog::info!("live playback started", device = device_name.as_str());
+    let device_info = AudioDeviceInfo {
+        backend,
+        device_name,
+        is_default: config.output_device_id.is_none(),
+        channels: selection.stream_config.channels,
+        device_rate: selection.device_rate,
+        buffer_size: audio_buffer_size_label(selection.preview.buffer_size),
+        buffer_note: selection.preview.buffer_note.clone(),
+        buffer_fallback,
+    };
     let (sender, receiver) = sync_channel(LIVE_PLAYBACK_COMMAND_CAPACITY);
     let worker_mixer_events = Arc::clone(&mixer_events);
     let worker_shared_snapshot = Arc::clone(&shared_snapshot);
@@ -698,6 +790,7 @@ pub fn start_live_playback(config: LivePlaybackConfig) -> Result<LivePlayback, S
         sender: Some(sender),
         shared_snapshot,
         buffer_fallback,
+        device_info,
         playback_recording,
     })
 }

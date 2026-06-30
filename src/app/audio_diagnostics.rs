@@ -1,10 +1,12 @@
-use chatt::audio::{LiveEncoderProfile, LivePlaybackSnapshot, SAMPLE_RATE};
+use chatt::audio::{AudioDeviceInfo, LiveEncoderProfile, LivePlaybackSnapshot, SAMPLE_RATE};
 
 pub(crate) struct AudioDiagnostics {
     snapshot: LivePlaybackSnapshot,
     encoder_profile: LiveEncoderProfile,
     voice_packets_received: u64,
     voice_bytes_received: u64,
+    input_device: Option<AudioDeviceInfo>,
+    output_device: Option<AudioDeviceInfo>,
 }
 
 impl AudioDiagnostics {
@@ -13,12 +15,16 @@ impl AudioDiagnostics {
         encoder_profile: LiveEncoderProfile,
         voice_packets_received: u64,
         voice_bytes_received: u64,
+        input_device: Option<AudioDeviceInfo>,
+        output_device: Option<AudioDeviceInfo>,
     ) -> Self {
         Self {
             snapshot,
             encoder_profile,
             voice_packets_received,
             voice_bytes_received,
+            input_device,
+            output_device,
         }
     }
 
@@ -58,8 +64,13 @@ impl AudioDiagnostics {
             )
         };
 
+        let input_device = format_device_line(self.input_device.as_ref());
+        let output_device = format_device_line(self.output_device.as_ref());
+
         format!(
-            "playback\n  output: ring max {}ms, queued {} samples, callback {}ms\n  neteq: playout {}ms ({} / 5s), target {}ms{} ({} / 5s)\n  buffers: decoded {}ms, packets wait {}ms span {}ms / {} pkts, next gap {}\n  decision: {} ({})\n  timing: accelerate {}ms / {}, expand {}ms / {}\n  recovery: dred {}, fec {}, horizon {}ms, missed {}ms / {}, plc {}, trims {}, underruns {}\n  active streams: {}\nnetwork\n  voice rx: {} packets / {}\nencoder\n  profile: {}\n{}",
+            "devices\n  input: {}\n  output: {}\nplayback\n  output: ring max {}ms, queued {} samples, callback {}ms\n  neteq: playout {}ms ({} / 5s), target {}ms{} ({} / 5s)\n  buffers: decoded {}ms, packets wait {}ms span {}ms / {} pkts, next gap {}\n  decision: {} ({})\n  timing: accelerate {}ms / {}, expand {}ms / {}\n  recovery: dred {}, fec {}, horizon {}ms, missed {}ms / {}, plc {}, trims {}, underruns {}\n  active streams: {}\nnetwork\n  voice rx: {} packets / {}\nencoder\n  profile: {}\n{}",
+            input_device,
+            output_device,
             self.snapshot.max_output_ring_ms,
             self.snapshot.output_ring_samples,
             self.snapshot.backend_block_ms,
@@ -93,6 +104,13 @@ impl AudioDiagnostics {
             self.encoder_profile.label(),
             backend
         )
+    }
+}
+
+fn format_device_line(device: Option<&AudioDeviceInfo>) -> String {
+    match device {
+        Some(device) => device.summary(),
+        None => "inactive".to_string(),
     }
 }
 
@@ -135,6 +153,8 @@ mod tests {
             LiveEncoderProfile::DRED_20,
             12,
             2048,
+            None,
+            None,
         );
 
         let summary = report.status_summary();
@@ -156,9 +176,32 @@ mod tests {
             LiveEncoderProfile::DRED_35,
             12,
             2048,
+            Some(AudioDeviceInfo {
+                backend: "ALSA",
+                device_name: "Built-in Microphone".to_string(),
+                is_default: true,
+                channels: 1,
+                device_rate: 48_000,
+                buffer_size: "256 frames".to_string(),
+                buffer_note: String::new(),
+                buffer_fallback: false,
+            }),
+            Some(AudioDeviceInfo {
+                backend: "ALSA",
+                device_name: "Built-in Speaker".to_string(),
+                is_default: false,
+                channels: 2,
+                device_rate: 48_000,
+                buffer_size: "host default".to_string(),
+                buffer_note: String::new(),
+                buffer_fallback: true,
+            }),
         );
 
         let body = report.notice_body();
+        assert!(body.contains("devices\n"));
+        assert!(body.contains("input: ALSA / Built-in Microphone (default)"));
+        assert!(body.contains("output: ALSA / Built-in Speaker"));
         assert!(body.contains("playback\n"));
         assert!(body.contains("network\n"));
         assert!(body.contains("profile: dred35"));

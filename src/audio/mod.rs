@@ -16,9 +16,9 @@ pub use device::{
     looks_like_alsa_pcm_name, output_devices, stable_input_device_id, stable_output_device_id,
 };
 pub use lifecycle::{
-    LiveCapture, LiveCaptureConfig, LivePlayback, LivePlaybackConfig, LivePlaybackSink, Playback,
-    Recording, RecordingConfig, start_live_capture, start_live_playback, start_playback,
-    start_recording,
+    AudioDeviceInfo, LiveCapture, LiveCaptureConfig, LivePlayback, LivePlaybackConfig,
+    LivePlaybackSink, Playback, Recording, RecordingConfig, start_live_capture,
+    start_live_playback, start_playback, start_recording,
 };
 pub use notifications::{NotificationSound, sound_samples};
 pub use shared::{

@@ -2838,6 +2838,10 @@ impl App {
             self.encoder_profile,
             self.voice_packets_received,
             self.voice_bytes_received,
+            self.capture
+                .as_ref()
+                .map(|capture| capture.device_info().clone()),
+            Some(playback.device_info().clone()),
         );
         self.room.push_notice("audio", diagnostics.notice_body());
         self.set_status(diagnostics.status_summary());
@@ -2884,6 +2888,10 @@ impl App {
                 self.encoder_profile,
                 self.voice_packets_received,
                 self.voice_bytes_received,
+                self.capture
+                    .as_ref()
+                    .map(|capture| capture.device_info().clone()),
+                Some(playback.device_info().clone()),
             )
             .notice_body(),
             None => "audio inactive".to_string(),
