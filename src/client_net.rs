@@ -509,6 +509,7 @@ fn run_worker_inner(
         room_id: None,
         active_stream: None,
         local_sequence: 0,
+        voice_timestamp: VoiceTimestampRebaser::default(),
         media_send_counter: 0,
         media_recv_replay: AntiReplay::new(),
         p2p_generation: 1,
@@ -972,6 +973,7 @@ struct WorkerState {
     room_id: Option<RoomId>,
     active_stream: Option<StreamId>,
     local_sequence: u32,
+    voice_timestamp: VoiceTimestampRebaser,
     media_send_counter: u64,
     media_recv_replay: AntiReplay,
     p2p_generation: u64,
@@ -1009,6 +1011,47 @@ struct WorkerState {
     shutdown: bool,
     disconnect_reason: Option<String>,
     auth_failure: Option<String>,
+}
+
+/// Keeps the outgoing voice media timestamp monotonic across capture-pipeline
+/// rebuilds.
+///
+/// The capture pipeline owns the 48 kHz media clock and restarts it from zero
+/// every time it is reconstructed (a device, codec, or settings change such as
+/// toggling DRED). The rebuild keeps the same server-assigned stream, so the
+/// receiver keeps one NetEQ keyed on that stream and a rewound timestamp reads
+/// as a large backward discontinuity that inflates its target delay. This
+/// applies a constant offset that absorbs each rewind, so the worker emits a
+/// monotonic clock the same way [`Self::local_sequence`] stays monotonic across
+/// the same rebuilds. Reset alongside `local_sequence` when a new stream starts.
+#[derive(Debug, Default)]
+struct VoiceTimestampRebaser {
+    /// Added to every pipeline timestamp. Zero until the first rewind, so an
+    /// uninterrupted stream is a pure passthrough.
+    offset: u32,
+    /// Previous emitted timestamp, used to detect a rewind.
+    last_out: Option<u32>,
+}
+
+impl VoiceTimestampRebaser {
+    /// Maps a per-instance pipeline timestamp onto the monotonic stream clock.
+    ///
+    /// Forward steps, including the large jumps a real silence gap produces, are
+    /// carried through unchanged because the offset is constant between
+    /// rebuilds. A backward step is a rebuilt pipeline (or the ~24.8 h `u32`
+    /// wrap, where one slot is also the correct gap), so it re-anchors the frame
+    /// one slot past the last emitted timestamp.
+    fn rebase(&mut self, pipeline_timestamp: u32) -> u32 {
+        let mut out = pipeline_timestamp.wrapping_add(self.offset);
+        if let Some(last) = self.last_out
+            && out.wrapping_sub(last) >= u32::MAX / 2
+        {
+            out = last.wrapping_add(crate::audio::FRAME_SAMPLES as u32);
+            self.offset = out.wrapping_sub(pipeline_timestamp);
+        }
+        self.last_out = Some(out);
+        out
+    }
 }
 
 #[derive(Debug)]
@@ -1830,6 +1873,9 @@ impl WorkerState {
         sequence: u32,
         frame: LocalVoiceFrame,
     ) {
+        // Rebase before send so a capture-pipeline rebuild that rewound its
+        // per-instance clock to zero cannot rewind the stream the receiver sees.
+        let timestamp = self.voice_timestamp.rebase(frame.timestamp);
         kvlog::info!(
             "voice packet sent",
             stream_id = stream_id.0,
@@ -1851,19 +1897,13 @@ impl WorkerState {
             let relay_payload = MediaPayload::Voice {
                 stream_id,
                 sequence,
-                timestamp: frame.timestamp,
+                timestamp,
                 flags: frame.flags,
                 payload: media_payload_from_audio(&frame.payload),
             };
             self.send_media(&relay_payload);
         }
-        self.send_p2p_voice(
-            stream_id,
-            sequence,
-            frame.timestamp,
-            frame.flags,
-            &frame.payload,
-        );
+        self.send_p2p_voice(stream_id, sequence, timestamp, frame.flags, &frame.payload);
     }
 
     fn queue_file_upload(&mut self, path: PathBuf) {
@@ -2406,6 +2446,7 @@ impl WorkerState {
                 if Some(user_id) == self.user_id {
                     self.active_stream = Some(stream_id);
                     self.local_sequence = 0;
+                    self.voice_timestamp = VoiceTimestampRebaser::default();
                     self.encoder_feedback = EncoderFeedbackController::new();
                     let _ = self.events.send(NetworkEvent::EncoderProfileChanged(
                         LiveEncoderProfile::DRED_20,
@@ -4434,6 +4475,45 @@ mod tests {
 
         advance_local_voice_sequence_past(&mut local_sequence, 20);
         assert_eq!(local_sequence, 21);
+    }
+
+    #[test]
+    fn voice_timestamp_rebaser_passes_through_a_monotonic_stream() {
+        let frame = crate::audio::FRAME_SAMPLES as u32;
+        let mut rebaser = VoiceTimestampRebaser::default();
+
+        // A normal stream, including a multi-second silence gap, is unchanged.
+        assert_eq!(rebaser.rebase(0), 0);
+        assert_eq!(rebaser.rebase(frame), frame);
+        assert_eq!(rebaser.rebase(2 * frame), 2 * frame);
+        let after_gap = 2 * frame + 48_000 * 3;
+        assert_eq!(rebaser.rebase(after_gap), after_gap);
+    }
+
+    #[test]
+    fn voice_timestamp_rebaser_absorbs_a_capture_rebuild() {
+        let frame = crate::audio::FRAME_SAMPLES as u32;
+        let mut rebaser = VoiceTimestampRebaser::default();
+
+        let last = rebaser.rebase(100 * frame);
+        // A rebuild restarts the pipeline clock near zero. The stream clock must
+        // step forward by exactly one slot rather than rewinding.
+        assert_eq!(rebaser.rebase(0), last + frame);
+        // The resumed instance keeps its own deltas on top of the new anchor.
+        assert_eq!(rebaser.rebase(frame), last + 2 * frame);
+        assert_eq!(rebaser.rebase(3 * frame), last + 4 * frame);
+    }
+
+    #[test]
+    fn voice_timestamp_rebaser_handles_clock_wrap_as_one_slot() {
+        let frame = crate::audio::FRAME_SAMPLES as u32;
+        let mut rebaser = VoiceTimestampRebaser::default();
+
+        let near_wrap = u32::MAX - frame + 1;
+        let last = rebaser.rebase(near_wrap);
+        // The 48 kHz clock wraps the u32 during continuous audio; the true gap
+        // is one slot, which is what re-anchoring produces.
+        assert_eq!(rebaser.rebase(0), last.wrapping_add(frame));
     }
 
     #[test]
