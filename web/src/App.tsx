@@ -16,9 +16,21 @@ const TOP_THRESHOLD = 200;
 // How many older messages one paging request asks for.
 const PAGE = 100;
 
+// Preload a bounded number of image attachments from each message batch. The
+// virtualizer may defer mounting rows while it measures and pins the bottom, but
+// attachment URLs are known as soon as the WebSocket message arrives.
+const IMAGE_PRELOAD_BATCH_LIMIT = 32;
+const IMAGE_PRELOAD_CACHE_LIMIT = 128;
+const RECENT_IMAGE_KEEP_MOUNTED = 12;
+
 // Consecutive messages from one sender within this window collapse into a group:
 // only the first carries the sender/time header (Discord-style).
 const GROUP_WINDOW_MS = 5 * 60 * 1000;
+
+type ImagePreload = {
+  image: HTMLImageElement;
+  link: HTMLLinkElement;
+};
 
 const DEFAULT_SHARE_PANE_HEIGHT = 360;
 const MIN_SHARE_PANE_HEIGHT = 160;
@@ -29,6 +41,32 @@ const PANE_KEY_STEP = 32;
 // Builds the asset URL for an attachment served from the client's receive dir.
 function fileUrl(name: string): string {
   return `/files/${encodeURIComponent(name)}`;
+}
+
+function imageDebugEnabled(): boolean {
+  if (typeof location === "undefined") return false;
+  if (new URLSearchParams(location.search).has("debugImages")) return true;
+  try {
+    return localStorage.getItem("chatt.debugImages") === "1";
+  } catch {
+    return false;
+  }
+}
+
+function debugImageTiming(stage: string, name: string, url: string) {
+  if (!imageDebugEnabled() || typeof performance === "undefined") return;
+  const href = new URL(url, location.href).href;
+  const entries = performance.getEntriesByName(href);
+  const timing = entries[entries.length - 1] as PerformanceResourceTiming | undefined;
+  console.debug("[chatt:image]", {
+    stage,
+    name,
+    t: Math.round(performance.now() * 10) / 10,
+    startTime: timing?.startTime,
+    requestStart: timing?.requestStart,
+    responseEnd: timing?.responseEnd,
+    url: href,
+  });
 }
 
 function clamp(value: number, min: number, max: number): number {
@@ -47,6 +85,9 @@ function Attachment(props: { message: WebMessage }) {
   // Fades the image in on decode instead of snapping. The box is already
   // reserved by width/height, so this only affects the pixels, never layout.
   const [loaded, setLoaded] = createSignal(false);
+  onMount(() => {
+    if (att().kind === "image") debugImageTiming("img:mount", att().name, url());
+  });
   return (
     <div class="message-media">
       <Show when={att().kind === "image"}>
@@ -57,8 +98,17 @@ function Attachment(props: { message: WebMessage }) {
           alt={att().name}
           width={att().width ?? undefined}
           height={att().height ?? undefined}
-          onLoad={() => setLoaded(true)}
-          onError={() => setLoaded(true)}
+          loading="eager"
+          decoding="async"
+          fetchpriority="high"
+          onLoad={() => {
+            debugImageTiming("img:load", att().name, url());
+            setLoaded(true);
+          }}
+          onError={() => {
+            debugImageTiming("img:error", att().name, url());
+            setLoaded(true);
+          }}
         />
       </Show>
       <Show when={att().kind === "video"}>
@@ -158,6 +208,7 @@ export default function App() {
   let splitResizeObserver: ResizeObserver | undefined;
   let socket: WebSocket | undefined;
   let reconnectTimer: number | undefined;
+  const imagePreloads = new Map<string, ImagePreload>();
   let paneResize:
     | {
         move: (event: PointerEvent) => void;
@@ -235,6 +286,68 @@ export default function App() {
     suppressTimer = window.setTimeout(() => {
       suppress = false;
     }, 250);
+  }
+
+  function preloadImage(message: WebMessage): boolean {
+    const att = message.attachment;
+    if (!att || att.kind !== "image") return false;
+
+    const url = fileUrl(att.name);
+    if (imagePreloads.has(url)) return false;
+
+    const link = document.createElement("link");
+    link.rel = "preload";
+    link.as = "image";
+    link.href = url;
+    link.fetchPriority = "high";
+    document.head.appendChild(link);
+    debugImageTiming("preload:link", att.name, url);
+
+    const img = new Image(att.width ?? undefined, att.height ?? undefined);
+    img.decoding = "async";
+    img.loading = "eager";
+    img.fetchPriority = "high";
+    img.addEventListener("load", () => debugImageTiming("preload:load", att.name, url), {
+      once: true,
+    });
+    img.addEventListener("error", () => debugImageTiming("preload:error", att.name, url), {
+      once: true,
+    });
+    imagePreloads.set(url, { image: img, link });
+    img.src = url;
+
+    while (imagePreloads.size > IMAGE_PRELOAD_CACHE_LIMIT) {
+      const oldest = imagePreloads.keys().next().value;
+      if (oldest === undefined) break;
+      imagePreloads.get(oldest)?.link.remove();
+      imagePreloads.delete(oldest);
+    }
+    return true;
+  }
+
+  function preloadRecentImages(batch: readonly WebMessage[]) {
+    let started = 0;
+    for (
+      let i = batch.length - 1;
+      i >= 0 && started < IMAGE_PRELOAD_BATCH_LIMIT;
+      i--
+    ) {
+      if (preloadImage(batch[i]!)) started++;
+    }
+  }
+
+  function recentImageIndexes(): number[] {
+    const items = messages();
+    const indexes: number[] = [];
+    for (
+      let i = items.length - 1;
+      i >= 0 && indexes.length < RECENT_IMAGE_KEEP_MOUNTED;
+      i--
+    ) {
+      if (items[i]?.attachment?.kind === "image") indexes.push(i);
+    }
+    indexes.reverse();
+    return indexes;
   }
 
   function requestOlder() {
@@ -387,6 +500,7 @@ export default function App() {
       }
       const env: ServerEnvelope = JSON.parse(ev.data);
       if (env.type === "sync") {
+        preloadRecentImages(env.messages);
         setMessages(env.messages);
         oldestSeq = env.oldest_seq;
         hasMore = env.has_more;
@@ -395,6 +509,7 @@ export default function App() {
       } else if (env.type === "older") {
         loadingOlder = false;
         if (env.messages.length > 0) {
+          preloadRecentImages(env.messages);
           setPrepend(true);
           setMessages((prev) => [...env.messages, ...prev]);
         }
@@ -445,6 +560,7 @@ export default function App() {
         // Upsert by the announcement timestamp and file id. Transfer ids are
         // reused after server restarts, while the pair identifies one file.
         const msg = env.message;
+        preloadImage(msg);
         setMessages((prev) => {
           if (msg.file_id !== null) {
             const i = prev.findIndex(
@@ -499,6 +615,8 @@ export default function App() {
     if (idleTimer) clearTimeout(idleTimer);
     for (const decoder of decoders.values()) decoder.close();
     decoders.clear();
+    for (const preload of imagePreloads.values()) preload.link.remove();
+    imagePreloads.clear();
     socket?.close();
   });
 
@@ -559,6 +677,7 @@ export default function App() {
               scrollRef={logEl}
               data={messages()}
               shift={prepend()}
+              keepMounted={recentImageIndexes()}
               onScroll={onScroll}
               onScrollEnd={onScrollEnd}
             >
