@@ -212,7 +212,11 @@ pub(crate) fn peak_detection(
 
         let (min_index, max_index) = if i != num_peaks - 1 {
             (
-                if peak_index[i] > 2 { peak_index[i] - 2 } else { 0 },
+                if peak_index[i] > 2 {
+                    peak_index[i] - 2
+                } else {
+                    0
+                },
                 (data_length - 1).min(peak_index[i] + 2),
             )
         } else {
@@ -221,11 +225,21 @@ pub(crate) fn peak_detection(
 
         if peak_index[i] != 0 && peak_index[i] != data_length - 2 {
             let base = peak_index[i] - 1;
-            parabolic_fit(&data[base..], fs_mult, &mut peak_index[i], &mut peak_value[i]);
+            parabolic_fit(
+                &data[base..],
+                fs_mult,
+                &mut peak_index[i],
+                &mut peak_value[i],
+            );
         } else if peak_index[i] == data_length - 2 {
             if data[peak_index[i]] > data[peak_index[i] + 1] {
                 let base = peak_index[i] - 1;
-                parabolic_fit(&data[base..], fs_mult, &mut peak_index[i], &mut peak_value[i]);
+                parabolic_fit(
+                    &data[base..],
+                    fs_mult,
+                    &mut peak_index[i],
+                    &mut peak_value[i],
+                );
             } else {
                 // Linear approximation.
                 peak_value[i] = (data[peak_index[i]] + data[peak_index[i] + 1]) >> 1;
@@ -246,7 +260,13 @@ pub(crate) fn peak_detection(
 
 /// `DspHelper::RampSignal`: scale `input` by `factor` (Q14), stepping the gain by
 /// `increment` (Q20) per sample. Returns the final Q14 factor.
-pub(crate) fn ramp_signal(input: &[i16], length: usize, factor: i32, increment: i32, output: &mut [i16]) -> i32 {
+pub(crate) fn ramp_signal(
+    input: &[i16],
+    length: usize,
+    factor: i32,
+    increment: i32,
+    output: &mut [i16],
+) -> i32 {
     let mut factor = factor;
     let mut factor_q20 = (factor << 6) + 32;
     for i in 0..length {
@@ -259,7 +279,12 @@ pub(crate) fn ramp_signal(input: &[i16], length: usize, factor: i32, increment: 
 }
 
 /// In-place `DspHelper::RampSignal(int16_t* signal, ...)`.
-pub(crate) fn ramp_signal_in_place(signal: &mut [i16], length: usize, factor: i32, increment: i32) -> i32 {
+pub(crate) fn ramp_signal_in_place(
+    signal: &mut [i16],
+    length: usize,
+    factor: i32,
+    increment: i32,
+) -> i32 {
     let mut factor = factor;
     let mut factor_q20 = (factor << 6) + 32;
     for i in 0..length {
@@ -273,7 +298,13 @@ pub(crate) fn ramp_signal_in_place(signal: &mut [i16], length: usize, factor: i3
 
 /// `DspHelper::UnmuteSignal`: scale `input` by an increasing Q14 gain starting at
 /// `factor`, stepping by `increment` (Q20). Writes the final factor back.
-pub(crate) fn unmute_signal(input: &[i16], length: usize, factor: &mut i16, increment: i32, output: &mut [i16]) {
+pub(crate) fn unmute_signal(
+    input: &[i16],
+    length: usize,
+    factor: &mut i16,
+    increment: i32,
+    output: &mut [i16],
+) {
     let mut factor_16b = *factor as u16;
     let mut factor_32b = ((factor_16b as i32) << 6) + 32;
     for i in 0..length {

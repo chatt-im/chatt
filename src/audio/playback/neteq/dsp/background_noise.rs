@@ -157,8 +157,9 @@ impl BackgroundNoise {
         // Spectral flatness: 5*residual >= 16*sample, and non-zero energy.
         if sample_energy > 0 && 5i64 * residual_energy as i64 >= 16i64 * sample_energy as i64 {
             let state_start = MAX_LPC_ORDER + VEC_LEN - MAX_LPC_ORDER;
-            let filter_state: [i16; MAX_LPC_ORDER] =
-                temp[state_start..state_start + MAX_LPC_ORDER].try_into().unwrap();
+            let filter_state: [i16; MAX_LPC_ORDER] = temp[state_start..state_start + MAX_LPC_ORDER]
+                .try_into()
+                .unwrap();
             self.save_parameters(&lpc, &filter_state, sample_energy, residual_energy);
             true
         } else {
@@ -228,11 +229,7 @@ impl BackgroundNoise {
     /// `BackgroundNoise::CalculateAutoCorrelation`: scaled self-correlation,
     /// returning the energy-per-sample. `temp` is the zero-padded buffer with
     /// the signal at offset `kMaxLpcOrder`.
-    fn calculate_auto_correlation(
-        &self,
-        temp: &[i16],
-        auto_correlation: &mut [i32],
-    ) -> i32 {
+    fn calculate_auto_correlation(&self, temp: &[i16], auto_correlation: &mut [i32]) -> i32 {
         let correlation_scale = spl::cross_correlation_with_auto_shift(
             &temp[MAX_LPC_ORDER..],
             temp,
@@ -278,7 +275,8 @@ impl BackgroundNoise {
         residual_energy: i32,
     ) {
         let p = &mut self.params;
-        p.filter.copy_from_slice(&lpc_coefficients[..MAX_LPC_ORDER + 1]);
+        p.filter
+            .copy_from_slice(&lpc_coefficients[..MAX_LPC_ORDER + 1]);
         p.filter_state.copy_from_slice(filter_state);
         p.energy = sample_energy.max(1);
         p.energy_update_threshold = p.energy;

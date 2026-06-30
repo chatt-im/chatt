@@ -6,17 +6,21 @@
 //!
 //! [`NetEqCore`] owns the timestamp-keyed [`PacketBuffer`], the [`SyncBuffer`] of
 //! decoded PCM, the [`DecisionLogic`] controller, the Opus/DRED decoders, and the
-//! reused DSP ([`NetEqConcealment`] for normal/merge/expand and [`TimeScaler`]
-//! for accelerate/preemptive-expand). [`NetEqCore::insert_packet`] expands a
-//! packet into its redundancy units and inserts them; [`NetEqCore::get_audio`]
-//! runs one decision, decodes what it needs, executes the operation against the
-//! sync buffer, and emits exactly one 10 ms output block.
+//! fixed-point DSP ([`Expand`]/[`merge`]/[`normal`] for normal/merge/expand and
+//! [`time_stretch`] for accelerate/preemptive-expand), sharing one
+//! [`BackgroundNoise`] and one [`RandomVector`] across them as WebRTC does.
+//! [`NetEqCore::insert_packet`] expands a packet into its redundancy units and
+//! inserts them; [`NetEqCore::get_audio`] runs one decision, decodes what it
+//! needs, executes the operation against the sync buffer, and emits exactly one
+//! 10 ms output block.
 //!
 //! Chatt is mono, single Opus stream, no DTMF and no RFC 3389 comfort noise, so
-//! those branches of the reference never fire; the sync buffer is `f32` this
-//! stage (the fixed-point re-port is the follow-up). The decoded buffer is the
-//! reference `decoded_buffer_`; operations build a `Vec<f32>` algorithm buffer
-//! and push it to the sync buffer, mirroring `algorithm_buffer_` + `PushBack`.
+//! those branches of the reference never fire. The sync buffer is `i16` PCM; the
+//! decoded buffer is the reference `decoded_buffer_`. Operations write into the
+//! sync buffer directly (overlap-add tails, merged prefixes) and push their
+//! emitted samples, mirroring `algorithm_buffer_` + `PushBack`. The only
+//! `i16`<->`f32` conversions are at decode (Opus i16 out) and the final output
+//! block (i16 -> f32 for the mixer/ring).
 
 use std::rc::Rc;
 
@@ -26,6 +30,11 @@ use opus_codec::{
 };
 
 use super::decision_logic::DecisionLogic;
+use super::dsp::background_noise::BackgroundNoise;
+use super::dsp::expand::Expand;
+use super::dsp::random_vector::RandomVector;
+use super::dsp::time_stretch::{self, ReturnCode};
+use super::dsp::{merge, normal};
 use super::neteq_status::{
     ControllerConfig, NetEqStatus, PacketArrivedInfo, PacketBufferInfo, PacketInfo,
 };
@@ -35,18 +44,16 @@ use super::packet_buffer::PacketBuffer;
 use super::redundancy::{DredInfo, FecInfo, parse_payload_redundancy};
 use super::sync_buffer::SyncBuffer;
 use super::tick_timer::{Stopwatch, TickTimer};
-use crate::audio::playback::MonoSampleQueue;
-use crate::audio::playback::concealment::{EXPAND_OVERLAP_LENGTH, NetEqConcealment};
-use crate::audio::playback::time_scale::{
-    TimeScaler, accelerate_one_period, expand_one_period, threshold_for_mode,
-};
 use crate::audio::shared::{
     DecodedFrameSource, LIVE_CAPTURE_MUTE_FADE, LIVE_OPUS_FRAME_SAMPLES, LIVE_PACKET_FLAG_MUTE,
     LIVE_PACKET_FLAG_OPUS_RESET, LIVE_PACKET_FLAG_SILENCE_RESUME, LIVE_PLAYBACK_DRED_MAX_SAMPLES,
-    LiveAudioTuning, MAX_OPUS_DECODE_SAMPLES, SAMPLE_RATE, TIME_SCALE_REF_OFFSET,
-    TIME_SCALE_WINDOW, apply_gain_ramp, duration_to_ms, mute_gain_step, samples_for_duration,
-    samples_to_ms,
+    LiveAudioTuning, MAX_OPUS_DECODE_SAMPLES, SAMPLE_RATE, apply_gain_ramp, duration_to_ms,
+    mute_gain_step, samples_for_duration, samples_to_ms,
 };
+
+/// Expand's overlap lookahead the sync buffer always retains (`5 * fs_mult` at
+/// 48 kHz). Matches `Expand::overlap_length`.
+const EXPAND_OVERLAP_LENGTH: usize = 30;
 
 /// 48 kHz. The live path is always 48 kHz mono.
 const FS_HZ: i32 = SAMPLE_RATE as i32;
@@ -108,14 +115,16 @@ pub(crate) struct NetEqCore {
     decoder: Decoder,
     dred_decoder: Option<DredDecoder>,
     dred_parse: Option<DredParse>,
-    concealment: NetEqConcealment,
-    scaler: TimeScaler,
+    /// The packet-loss concealment generator. Shares `background_noise` and
+    /// `random_vector` with the time-stretch ops, exactly as WebRTC does.
+    expand: Expand,
+    /// Comfort-noise model, updated from decoded audio and read by Expand and
+    /// the time-stretch VAD.
+    background_noise: BackgroundNoise,
+    /// Concealment RNG; its seed-increment ordering is part of bit-exactness.
+    random_vector: RandomVector,
     /// `decoded_buffer_`: scratch for freshly decoded PCM.
-    decoded_buffer: Vec<f32>,
-    /// Scratch copy of the sync-buffer history handed to the concealment DSP.
-    history_scratch: Vec<f32>,
-    /// Scratch for the 30 ms time-scale analysis window.
-    time_scale_window: Vec<f32>,
+    decoded_buffer: Vec<i16>,
     last_mode: Mode,
     /// `decoder_frame_length_`: samples per channel of the last decoded frame.
     decoder_frame_length: usize,
@@ -176,11 +185,10 @@ impl NetEqCore {
                 .map_err(|error| error.to_string())?,
             dred_decoder: DredDecoder::new().ok(),
             dred_parse: None,
-            concealment: NetEqConcealment::new(),
-            scaler: TimeScaler::new(),
-            decoded_buffer: vec![0.0; MAX_OPUS_DECODE_SAMPLES],
-            history_scratch: Vec::with_capacity(SyncBuffer::with_default_length().size()),
-            time_scale_window: vec![0.0; TIME_SCALE_WINDOW],
+            expand: Expand::new(),
+            background_noise: BackgroundNoise::new(),
+            random_vector: RandomVector::new(),
+            decoded_buffer: vec![0; MAX_OPUS_DECODE_SAMPLES],
             last_mode: Mode::Normal,
             decoder_frame_length: DEFAULT_FRAME_SAMPLES,
             timestamp: 0,
@@ -252,7 +260,8 @@ impl NetEqCore {
     pub(crate) fn flush(&mut self) {
         self.packet_buffer.flush();
         self.sync_buffer.flush();
-        self.concealment.reset();
+        self.expand.reset();
+        self.background_noise.reset();
         self.decision_logic.soft_reset(&self.tick_timer);
         self.last_mode = Mode::Normal;
         self.timestamp = 0;
@@ -511,9 +520,15 @@ impl NetEqCore {
         }
 
         // Extract the output block from the sync buffer and reinstall the
-        // overlap lookahead, mirroring GetAudioInternal lines 814-832.
-        let got_audio = self.sync_buffer.get_next_audio(output);
-        if !got_audio {
+        // overlap lookahead, mirroring GetAudioInternal lines 814-832. NetEQ
+        // works in i16; convert to the f32 the mixer/ring consume after.
+        let mut block = [0i16; OUTPUT_SIZE_SAMPLES];
+        let got_audio = self.sync_buffer.get_next_audio(&mut block);
+        if got_audio {
+            for (dst, &src) in output.iter_mut().zip(block.iter()) {
+                *dst = src as f32 / 32768.0;
+            }
+        } else {
             output.fill(0.0);
         }
         let future = self.sync_buffer.future_length();
@@ -543,13 +558,7 @@ impl NetEqCore {
                 | Mode::PreemptiveExpandFail
                 | Mode::CodecInternalCng
         ) {
-            let data_len = self.sync_buffer.size();
-            self.history_scratch.clear();
-            self.history_scratch
-                .extend_from_slice(self.sync_buffer.data());
-            let _ = data_len;
-            self.concealment
-                .update_background_noise(&self.history_scratch);
+            self.background_noise.update(self.sync_buffer.data());
         }
 
         // Reset the generated-noise stopwatch unless we are still concealing.
@@ -562,7 +571,7 @@ impl NetEqCore {
             source,
             // "Muted" once expand has decayed to silence: the stream is idle and
             // the output is ~0, which the worker uses only to mark voice inactive.
-            muted: self.last_mode.is_expand() && self.concealment.muted(),
+            muted: self.last_mode.is_expand() && self.expand.muted(),
             time_stretched,
         }
     }
@@ -645,7 +654,7 @@ impl NetEqCore {
             });
         NetEqStatus {
             target_timestamp: self.sync_buffer.end_timestamp(),
-            expand_mutefactor: self.concealment.expand_mute_factor_q14(),
+            expand_mutefactor: self.expand.mute_factor(),
             last_packet_samples: self.decoder_frame_length,
             next_packet,
             last_mode: self.last_mode,
@@ -885,16 +894,12 @@ impl NetEqCore {
             PacketPayload::Opus(bytes) => {
                 let end = (out_start + MAX_OPUS_DECODE_SAMPLES).min(self.decoded_buffer.len());
                 let output = &mut self.decoded_buffer[out_start..end];
-                self.decoder
-                    .decode_float(bytes, output, false)
-                    .map_err(|_| ())
+                self.decoder.decode(bytes, output, false).map_err(|_| ())
             }
             PacketPayload::OpusFec(bytes) => {
                 let end = (out_start + LIVE_OPUS_FRAME_SAMPLES).min(self.decoded_buffer.len());
                 let output = &mut self.decoded_buffer[out_start..end];
-                self.decoder
-                    .decode_float(bytes, output, true)
-                    .map_err(|_| ())
+                self.decoder.decode(bytes, output, true).map_err(|_| ())
             }
             PacketPayload::Dred { source, offset } => {
                 self.decode_dred(packet.sequence_number, source, *offset, out_start)
@@ -936,7 +941,7 @@ impl NetEqCore {
         let decoder = &mut self.decoder;
         let dred_decoder = self.dred_decoder.as_mut().expect("dred decoder present");
         dred_decoder
-            .decode_into_f32(decoder, &parse.state, offset, output)
+            .decode_into_i16(decoder, &parse.state, offset, output)
             .map_err(|_| ())
     }
 
@@ -947,23 +952,41 @@ impl NetEqCore {
         if decoded_len == 0 {
             return;
         }
-        let mut decoded = self.decoded_buffer[..decoded_len].to_vec();
+        let decoded = self.decoded_buffer[..decoded_len].to_vec();
         if matches!(self.last_mode, Mode::Expand | Mode::CodecPlc) {
-            self.copy_history();
-            self.concealment
-                .normal_after_expand(&self.history_scratch, &mut decoded);
+            // Resuming after concealment: unmute and cross-fade the seam.
+            // `process_after_expand` reads/writes the sync buffer and resets
+            // Expand internally (matching `Normal::Process`).
+            let mut out = Vec::new();
+            normal::process_after_expand(
+                &decoded,
+                self.sync_buffer.data_mut(),
+                &mut self.expand,
+                &mut self.background_noise,
+                &mut self.random_vector,
+                &mut out,
+            );
+            self.sync_buffer.push_back(&out);
+        } else {
+            self.sync_buffer.push_back(&decoded);
         }
-        self.sync_buffer.push_back(&decoded);
         self.last_mode = Mode::Normal;
     }
 
     /// Port of `NetEqImpl::DoMerge`: merge decoded audio onto the expand tail.
     fn do_merge(&mut self, decoded_len: usize) {
-        let mut decoded = self.decoded_buffer[..decoded_len].to_vec();
-        self.copy_history();
-        self.concealment
-            .merge_after_expand(&self.history_scratch, &mut decoded);
-        self.sync_buffer.push_back(&decoded);
+        let decoded = self.decoded_buffer[..decoded_len].to_vec();
+        let next_index = self.sync_buffer.next_index();
+        let result = merge::process(
+            &decoded,
+            self.sync_buffer.data_mut(),
+            next_index,
+            &mut self.expand,
+            &mut self.background_noise,
+            &mut self.random_vector,
+        );
+        self.sync_buffer.push_back(&result.output);
+        self.expand.reset();
         self.last_mode = Mode::Merge;
     }
 
@@ -980,7 +1003,7 @@ impl NetEqCore {
         // The output is bit-identical to the synthesized path and resume stays
         // faithful: a returning packet still merges against the zero tail exactly
         // as it would have against the muted (×0) synthesis.
-        if self.concealment.muted_silent() {
+        if self.expand.muted() && !self.background_noise.initialized() {
             let target = OUTPUT_SIZE_SAMPLES + EXPAND_OVERLAP_LENGTH;
             let future = self.sync_buffer.future_length();
             if future < target {
@@ -989,6 +1012,7 @@ impl NetEqCore {
             self.last_mode = Mode::Expand;
             return;
         }
+        let mut out = Vec::new();
         let mut guard = 0;
         while self
             .sync_buffer
@@ -996,18 +1020,20 @@ impl NetEqCore {
             .saturating_sub(EXPAND_OVERLAP_LENGTH)
             < OUTPUT_SIZE_SAMPLES
         {
-            // Only the first chunk of a run reads the history; later chunks
-            // extrapolate from cached parameters, so skip the full-history copy.
-            if self.concealment.needs_history() {
-                self.copy_history();
-            }
-            let chunk = self.concealment.expand_chunk(&self.history_scratch);
-            if chunk.samples.is_empty() {
+            // `process` analyzes the history on the first chunk of a run and
+            // overlap-adds into the sync-buffer tail, then fills `out` with the
+            // new concealment samples to append.
+            self.expand.process(
+                self.sync_buffer.data_mut(),
+                &mut self.background_noise,
+                &mut self.random_vector,
+                &mut out,
+            );
+            if out.is_empty() {
                 // No history to extrapolate from: emit silence to make progress.
-                self.sync_buffer.push_back(&vec![0.0; OUTPUT_SIZE_SAMPLES]);
+                self.sync_buffer.push_back_zeros(OUTPUT_SIZE_SAMPLES);
             } else {
-                self.sync_buffer.blend_overlap_tail(&chunk.overlap);
-                self.sync_buffer.push_back(&chunk.samples);
+                self.sync_buffer.push_back(&out);
             }
             self.last_mode = Mode::Expand;
             guard += 1;
@@ -1022,73 +1048,42 @@ impl NetEqCore {
     /// and the sync tail, time-compress one pitch period, and write back.
     fn do_accelerate(&mut self, decoded_len: usize, fast: bool) -> i32 {
         let (input, borrowed) = self.build_timescale_input(decoded_len);
-        if input.len() < TIME_SCALE_WINDOW {
-            // Not enough to analyze: fall back to normal copy.
-            self.apply_timescale_result(input, borrowed);
-            self.last_mode = Mode::AccelerateFail;
-            return 0;
-        }
-        let mut queue = MonoSampleQueue::new();
-        queue.push_back(&input);
-        self.time_scale_window.clear();
-        self.time_scale_window
-            .extend_from_slice(&input[..TIME_SCALE_WINDOW]);
-        let analysis = self.scaler.analyze(&self.time_scale_window);
-        let removed =
-            if analysis.best_correlation <= threshold_for_mode(fast) && analysis.active_speech {
-                self.last_mode = Mode::AccelerateFail;
-                0
-            } else {
-                let peak_index = if fast {
-                    let periods = TIME_SCALE_REF_OFFSET / analysis.peak_index.max(1);
-                    (periods.max(1) * analysis.peak_index).min(TIME_SCALE_REF_OFFSET)
-                } else {
-                    analysis.peak_index
-                };
-                let removed = accelerate_one_period(&mut queue, 0, peak_index);
-                self.last_mode = if analysis.active_speech {
-                    Mode::AccelerateSuccess
-                } else {
-                    Mode::AccelerateLowEnergy
-                };
-                removed
-            };
-        let mut algorithm = Vec::with_capacity(queue.frames());
-        queue.copy_window(0, queue.frames(), &mut algorithm);
-        self.apply_timescale_result(algorithm, borrowed);
+        let result = time_stretch::accelerate_process(&input, fast, &self.background_noise);
+        self.last_mode = match result.return_code {
+            ReturnCode::Success => Mode::AccelerateSuccess,
+            ReturnCode::SuccessLowEnergy => Mode::AccelerateLowEnergy,
+            ReturnCode::NoStretch | ReturnCode::Error => Mode::AccelerateFail,
+        };
+        let removed = result.length_change_samples;
+        self.apply_timescale_result(result.output, borrowed);
+        self.expand.reset();
         removed as i32
     }
 
     /// Port of `NetEqImpl::DoPreemptiveExpand`: insert one pitch period.
     fn do_preemptive_expand(&mut self, decoded_len: usize) -> i32 {
+        // `old_data_length` is how many of the borrowed samples were already
+        // played out (came from before `next_index`), exactly as
+        // `NetEqImpl::DoPreemptiveExpand` computes `old_borrowed_samples`.
+        let future = self.sync_buffer.future_length();
+        let borrowed = TIMESCALE_REQUIRED_SAMPLES.saturating_sub(decoded_len);
+        let old_data_length = borrowed.saturating_sub(future);
+        let overlap_samples = self.expand.overlap_length();
         let (input, borrowed) = self.build_timescale_input(decoded_len);
-        if input.len() < TIME_SCALE_WINDOW {
-            self.apply_timescale_result(input, borrowed);
-            self.last_mode = Mode::PreemptiveExpandFail;
-            return 0;
-        }
-        let mut queue = MonoSampleQueue::new();
-        queue.push_back(&input);
-        self.time_scale_window.clear();
-        self.time_scale_window
-            .extend_from_slice(&input[..TIME_SCALE_WINDOW]);
-        let analysis = self.scaler.analyze(&self.time_scale_window);
-        let added =
-            if analysis.best_correlation <= threshold_for_mode(false) && analysis.active_speech {
-                self.last_mode = Mode::PreemptiveExpandFail;
-                0
-            } else {
-                let added = expand_one_period(&mut queue, 0, analysis.peak_index);
-                self.last_mode = if analysis.active_speech {
-                    Mode::PreemptiveExpandSuccess
-                } else {
-                    Mode::PreemptiveExpandLowEnergy
-                };
-                added
-            };
-        let mut algorithm = Vec::with_capacity(queue.frames());
-        queue.copy_window(0, queue.frames(), &mut algorithm);
-        self.apply_timescale_result(algorithm, borrowed);
+        let result = time_stretch::preemptive_expand_process(
+            &input,
+            old_data_length,
+            overlap_samples,
+            &self.background_noise,
+        );
+        self.last_mode = match result.return_code {
+            ReturnCode::Success => Mode::PreemptiveExpandSuccess,
+            ReturnCode::SuccessLowEnergy => Mode::PreemptiveExpandLowEnergy,
+            ReturnCode::NoStretch | ReturnCode::Error => Mode::PreemptiveExpandFail,
+        };
+        let added = result.length_change_samples;
+        self.apply_timescale_result(result.output, borrowed);
+        self.expand.reset();
         added as i32
     }
 
@@ -1096,7 +1091,7 @@ impl NetEqCore {
     /// samples borrowed from the end of the sync buffer when the decoder gave
     /// fewer than 30 ms. Mirrors the `ReadInterleavedFromEnd` borrow in
     /// `DoAccelerate`/`DoPreemptiveExpand`.
-    fn build_timescale_input(&mut self, decoded_len: usize) -> (Vec<f32>, usize) {
+    fn build_timescale_input(&mut self, decoded_len: usize) -> (Vec<i16>, usize) {
         if decoded_len >= TIMESCALE_REQUIRED_SAMPLES {
             return (self.decoded_buffer[..decoded_len].to_vec(), 0);
         }
@@ -1107,7 +1102,7 @@ impl NetEqCore {
         // The borrow may be shorter than requested if the buffer is small; pad to
         // keep the analysis window full.
         if tail.len() < borrowed {
-            input.resize(borrowed - tail.len(), 0.0);
+            input.resize(borrowed - tail.len(), 0);
         }
         input.extend_from_slice(&tail);
         input.extend_from_slice(&self.decoded_buffer[..decoded_len]);
@@ -1117,7 +1112,7 @@ impl NetEqCore {
     /// Writes a time-scaled algorithm buffer back, restoring the borrowed sync
     /// tail in place and pushing the remainder. Port of the borrow-restore tail
     /// of `DoAccelerate`/`DoPreemptiveExpand`.
-    fn apply_timescale_result(&mut self, mut algorithm: Vec<f32>, borrowed: usize) {
+    fn apply_timescale_result(&mut self, mut algorithm: Vec<i16>, borrowed: usize) {
         if borrowed > 0 {
             let size = self.sync_buffer.size();
             if algorithm.len() < borrowed {
@@ -1138,13 +1133,6 @@ impl NetEqCore {
         if !algorithm.is_empty() {
             self.sync_buffer.push_back(&algorithm);
         }
-    }
-
-    fn copy_history(&mut self) {
-        let next = self.sync_buffer.next_index();
-        self.history_scratch.clear();
-        self.history_scratch
-            .extend_from_slice(&self.sync_buffer.data()[..next]);
     }
 
     fn generated_noise_samples(&self) -> u64 {

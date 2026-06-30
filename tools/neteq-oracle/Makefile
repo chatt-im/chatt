@@ -10,6 +10,19 @@
 #   make            # build ./oracle
 #   make vectors    # build then regenerate ../../tests/neteq_vectors/*.txt
 #
+# CasePipeline reads a real-audio fixture, tests/neteq_vectors/
+# pipeline_audio_in.txt (one decimal int16 per line). It is large and NOT
+# committed; generate it on demand from the repo's sample clip with:
+#   ffmpeg -v error -i assets/sample-001.opus -f s16le -ar 48000 -ac 1 - | \
+#     python3 -c 'import sys,array; a=array.array("h"); \
+#       a.frombytes(sys.stdin.buffer.read()); \
+#       print(chr(10).join(str(x) for x in a))' \
+#     > ../../tests/neteq_vectors/pipeline_audio_in.txt
+# Then `make vectors` writes pipeline_out.txt / pipeline_sync_after.txt and the
+# Rust test `pipeline_matches_oracle` asserts them byte-for-byte. The tape
+# repeats over as many whole cycles as the clip allows, so the entire audio is
+# exercised. Without the fixture the Rust test is a no-op.
+#
 # Everything compiles in one clang++ invocation. The source set mixes .c and
 # .cc translation units that share basenames (e.g. signal_processing's
 # cross_correlation.c vs neteq's cross_correlation.cc), so intermediate object

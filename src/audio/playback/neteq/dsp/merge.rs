@@ -52,7 +52,12 @@ pub(crate) fn process(
     let old_length = sync_buffer.len() - next_index;
     expand.set_parameters_for_merge_after_expand();
     let mut expanded_temp = Vec::new();
-    expand.process(sync_buffer, background_noise, random_vector, &mut expanded_temp);
+    expand.process(
+        sync_buffer,
+        background_noise,
+        random_vector,
+        &mut expanded_temp,
+    );
 
     let mut expanded: Vec<i16> = sync_buffer[next_index..].to_vec();
     if expanded.len() < REQUIRED_LENGTH {
@@ -95,8 +100,7 @@ pub(crate) fn process(
     // Ramp/unmute the new decoded frame (operates on a working copy of input).
     let mut input_channel = input.to_vec();
     if mute_factor < 16384 {
-        let back_to_fullscale_inc =
-            ((16384 - mute_factor as i32) << 6) / input_length as i32;
+        let back_to_fullscale_inc = ((16384 - mute_factor as i32) << 6) / input_length as i32;
         let increment = (4194 / FS_MULT as i32).max(back_to_fullscale_inc);
         let mut mf = dsp_helper::ramp_signal_in_place(
             &mut input_channel,
@@ -148,9 +152,13 @@ pub(crate) fn process(
 fn signal_scaling(input: &[i16], input_length: usize, expanded_signal: &[i16]) -> i16 {
     let mod_input_length = (64 * FS_MULT).min(input_length);
     let expanded_max = spl::max_abs_value_w16(&expanded_signal[..mod_input_length]);
-    let mut factor = (expanded_max as i32 * expanded_max as i32)
-        / (i32::MAX / mod_input_length as i32);
-    let expanded_shift = if factor == 0 { 0 } else { 31 - spl::norm_w32(factor) as i32 };
+    let mut factor =
+        (expanded_max as i32 * expanded_max as i32) / (i32::MAX / mod_input_length as i32);
+    let expanded_shift = if factor == 0 {
+        0
+    } else {
+        31 - spl::norm_w32(factor) as i32
+    };
     let mut energy_expanded = spl::dot_product_with_scale(
         expanded_signal,
         expanded_signal,
@@ -160,9 +168,12 @@ fn signal_scaling(input: &[i16], input_length: usize, expanded_signal: &[i16]) -
 
     let input_max = spl::max_abs_value_w16(&input[..mod_input_length]);
     factor = (input_max as i32 * input_max as i32) / (i32::MAX / mod_input_length as i32);
-    let input_shift = if factor == 0 { 0 } else { 31 - spl::norm_w32(factor) as i32 };
-    let mut energy_input =
-        spl::dot_product_with_scale(input, input, mod_input_length, input_shift);
+    let input_shift = if factor == 0 {
+        0
+    } else {
+        31 - spl::norm_w32(factor) as i32
+    };
+    let mut energy_input = spl::dot_product_with_scale(input, input, mod_input_length, input_shift);
 
     if input_shift > expanded_shift {
         energy_expanded >>= input_shift - expanded_shift;
@@ -249,8 +260,7 @@ fn correlate_and_peak_search(
     input_downsampled: &[i16],
     expanded_downsampled: &[i16],
 ) -> usize {
-    let stop_position_downsamp =
-        MAX_CORRELATION_LENGTH.min(expand.max_lag() / (FS_MULT * 2) + 1);
+    let stop_position_downsamp = MAX_CORRELATION_LENGTH.min(expand.max_lag() / (FS_MULT * 2) + 1);
 
     let mut correlation = [0i32; MAX_CORRELATION_LENGTH];
     spl::cross_correlation_with_auto_shift(
@@ -283,8 +293,8 @@ fn correlate_and_peak_search(
         start_index - input_length
     };
     let start_index_downsamp = start_index / (FS_MULT * 2);
-    let modified_stop_pos = stop_position_downsamp
-        .min(MAX_CORRELATION_LENGTH + pad_length - start_index_downsamp);
+    let modified_stop_pos =
+        stop_position_downsamp.min(MAX_CORRELATION_LENGTH + pad_length - start_index_downsamp);
 
     let mut peak_index = [0usize; 1];
     let mut peak_value = [0i16; 1];

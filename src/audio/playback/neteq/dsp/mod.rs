@@ -19,6 +19,9 @@ pub(crate) mod spl;
 pub(crate) mod time_stretch;
 
 #[cfg(test)]
+mod pipeline_tests;
+
+#[cfg(test)]
 pub(crate) mod test_vectors {
     //! Loader for the oracle reference vectors. A vector file is a list of
     //! decimal integers, one per line, with `#` comment lines ignored.

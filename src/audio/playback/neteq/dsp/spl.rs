@@ -173,7 +173,12 @@ pub(crate) fn sqrt_floor(value: i32) -> i32 {
 
 /// `WebRtcSpl_DotProductWithScale`: sum of `(v1*v2) >> scaling`, saturated to
 /// int32. The accumulator is 64-bit.
-pub(crate) fn dot_product_with_scale(vector1: &[i16], vector2: &[i16], length: usize, scaling: i32) -> i32 {
+pub(crate) fn dot_product_with_scale(
+    vector1: &[i16],
+    vector2: &[i16],
+    length: usize,
+    scaling: i32,
+) -> i32 {
     let mut sum: i64 = 0;
     for i in 0..length {
         sum += (((vector1[i] as i32) * (vector2[i] as i32)) >> scaling) as i64;
@@ -252,8 +257,7 @@ pub(crate) fn cross_correlation_with_auto_shift(
         &seq2[sequence_2_start as usize..(sequence_2_start as usize + sequence_2_length)];
     let max_2 = max_abs_element_w16(seq2_region);
 
-    let max_value =
-        (max_1 as i32 * max_2 as i32).unsigned_abs() as i64 * sequence_1_length as i64;
+    let max_value = (max_1 as i32 * max_2 as i32).unsigned_abs() as i64 * sequence_1_length as i64;
     let factor = (max_value >> 31) as i32;
     let scaling = if factor == 0 {
         0
@@ -295,8 +299,7 @@ pub(crate) fn auto_correlation(
     for i in 0..order + 1 {
         let mut sum: i32 = 0;
         for j in 0..in_vector_length - i {
-            sum = sum
-                .wrapping_add(((in_vector[j] as i32) * (in_vector[i + j] as i32)) >> scaling);
+            sum = sum.wrapping_add(((in_vector[j] as i32) * (in_vector[i + j] as i32)) >> scaling);
         }
         result[i] = sum;
     }
@@ -364,7 +367,9 @@ pub(crate) fn levinson_durbin(r: &[i32], a: &mut [i16], k: &mut [i16], order: us
         let mut temp1: i32 = 0;
         for j in 1..i {
             temp1 = temp1.wrapping_add(
-                (r_hi[j] as i32).wrapping_mul(a_hi[i - j] as i32).wrapping_mul(2)
+                (r_hi[j] as i32)
+                    .wrapping_mul(a_hi[i - j] as i32)
+                    .wrapping_mul(2)
                     + (((r_hi[j] as i32).wrapping_mul(a_low[i - j] as i32) >> 15)
                         + ((r_low[j] as i32).wrapping_mul(a_hi[i - j] as i32) >> 15))
                         .wrapping_mul(2),
@@ -372,8 +377,7 @@ pub(crate) fn levinson_durbin(r: &[i32], a: &mut [i16], k: &mut [i16], order: us
         }
 
         temp1 = temp1.wrapping_mul(16);
-        temp1 = temp1
-            .wrapping_add(((r_hi[i] as i32) * 65536).wrapping_add((r_low[i] as i32) << 1));
+        temp1 = temp1.wrapping_add(((r_hi[i] as i32) * 65536).wrapping_add((r_low[i] as i32) << 1));
 
         let temp2 = abs_w32(temp1);
         let mut temp3 = div_w32_hi_low(temp2, alpha_hi, alpha_low);
@@ -468,8 +472,7 @@ pub(crate) fn affine_transform_vector(
     vector_length: usize,
 ) {
     for i in 0..vector_length {
-        out[i] = (((in_vector[i] as i32).wrapping_mul(gain as i32))
-            .wrapping_add(add_constant)
+        out[i] = (((in_vector[i] as i32).wrapping_mul(gain as i32)).wrapping_add(add_constant)
             >> right_shifts) as i16;
     }
 }
@@ -554,10 +557,17 @@ pub(crate) fn max_index_w32(vector: &[i32]) -> usize {
 /// `WebRtcSpl_VectorBitShiftW16`: shift each int16 (arithmetic for shifts > 0,
 /// left otherwise). Operates in place when `out` and `in_vector` alias via the
 /// caller passing the same data through a temporary.
-pub(crate) fn vector_bit_shift_w16(out: &mut [i16], length: usize, in_vector: &[i16], right_shifts: i16) {
+pub(crate) fn vector_bit_shift_w16(
+    out: &mut [i16],
+    length: usize,
+    in_vector: &[i16],
+    right_shifts: i16,
+) {
     if right_shifts > 0 {
+        // C promotes the int16 operand to int before shifting, so a shift of 16
+        // (silence -> zero norm) is well defined there; mirror that in i32.
         for i in 0..length {
-            out[i] = in_vector[i] >> right_shifts;
+            out[i] = ((in_vector[i] as i32) >> right_shifts) as i16;
         }
     } else {
         for i in 0..length {
