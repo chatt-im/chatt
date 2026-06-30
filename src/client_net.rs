@@ -70,6 +70,14 @@ const DIRECT_FAILOVER_IDLE: Duration = Duration::from_millis(1500);
 /// Cadence of the server keepalive sent while the relay is suppressed, to keep
 /// the on-path NAT binding warm so relay resumes instantly.
 const RELAY_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(5);
+/// Cadence of media `Ping` probes used to estimate round-trip latency to the
+/// server relay and to each direct peer.
+const RTT_PROBE_INTERVAL: Duration = Duration::from_secs(5);
+/// Smoothing weight applied to each new RTT sample folded into the EWMA.
+const RTT_EWMA_WEIGHT: f32 = 0.2;
+/// Cap on outstanding RTT probes tracked per destination before the oldest is
+/// dropped, bounding memory if replies stop arriving.
+const RTT_IN_FLIGHT_CAP: usize = 8;
 /// STUN keepalive spacing for direct paths. Tightened from the agent default so
 /// path liveness is reconfirmed every second.
 const P2P_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(1);
@@ -189,6 +197,15 @@ pub enum NetworkEvent {
     },
     VoicePacket(RemoteVoicePacket),
     PlaybackFeedback(LivePlaybackFeedback),
+    /// Smoothed round-trip time to the server relay media socket, milliseconds.
+    ServerRtt {
+        rtt_ms: u16,
+    },
+    /// Smoothed round-trip time to a direct peer over its p2p path, milliseconds.
+    PeerRtt {
+        user_id: UserId,
+        rtt_ms: u16,
+    },
     VoiceStatus {
         user_id: UserId,
         status: ParticipantVoiceStatus,
@@ -509,6 +526,10 @@ fn run_worker_inner(
         p2p_stream_owners: HashMap::new(),
         online_others: HashSet::new(),
         next_relay_keepalive: Instant::now() + RELAY_KEEPALIVE_INTERVAL,
+        next_rtt_probe: Instant::now() + RTT_PROBE_INTERVAL,
+        rtt_probe_seq: 0,
+        server_rtt_in_flight: VecDeque::new(),
+        server_rtt_ms: None,
         playback_sink: None,
         pending_playback_packets: VecDeque::new(),
         voice_dedup: VoicePacketDeduplicator::new(),
@@ -623,6 +644,7 @@ fn run_worker_inner(
         }
         worker.poll_p2p(now);
         worker.poll_relay_keepalive(now);
+        worker.poll_rtt_probe(now);
         worker.poll_mdns(now);
         worker.read_udp();
         poll_timeout = if command_drain == CommandDrainOutcome::HitLimit {
@@ -967,6 +989,10 @@ struct WorkerState {
     p2p_stream_owners: HashMap<StreamId, SessionId>,
     online_others: HashSet<UserId>,
     next_relay_keepalive: Instant,
+    next_rtt_probe: Instant,
+    rtt_probe_seq: u64,
+    server_rtt_in_flight: VecDeque<(u64, Instant)>,
+    server_rtt_ms: Option<f32>,
     playback_sink: Option<LivePlaybackSink>,
     pending_playback_packets: VecDeque<RemoteVoicePacket>,
     voice_dedup: VoicePacketDeduplicator,
@@ -1244,6 +1270,12 @@ struct PeerConnection {
     direct_stable_since: Option<Instant>,
     /// Last inbound direct packet (media or STUN) from this peer.
     last_direct_inbound: Option<Instant>,
+    /// Outstanding RTT probe nonces sent over the direct path, paired with their
+    /// send time. Bounded by [`RTT_IN_FLIGHT_CAP`].
+    rtt_in_flight: VecDeque<(u64, Instant)>,
+    /// Smoothed round-trip time to this peer over the direct path, in
+    /// milliseconds. `None` until the first `Pong` arrives.
+    rtt_ms: Option<f32>,
 }
 
 enum P2pMediaPacket {
@@ -1258,6 +1290,14 @@ enum P2pMediaPacket {
     Feedback {
         stream_id: StreamId,
         feedback: media::VoiceFeedback,
+        action: Option<P2pAction>,
+    },
+    Ping {
+        nonce: u64,
+        action: Option<P2pAction>,
+    },
+    Pong {
+        rtt_ms: Option<u16>,
         action: Option<P2pAction>,
     },
 }
@@ -1525,7 +1565,17 @@ impl WorkerState {
                         "server",
                     );
                 }
-                Ok((_, MediaPayload::Pong { .. })) => {}
+                Ok((_, MediaPayload::Pong { nonce })) => {
+                    if let Some(sample) =
+                        take_rtt_sample(&mut self.server_rtt_in_flight, nonce, now)
+                    {
+                        let rtt = fold_rtt_ewma(self.server_rtt_ms, sample);
+                        self.server_rtt_ms = Some(rtt);
+                        let _ = self.events.send(NetworkEvent::ServerRtt {
+                            rtt_ms: clamp_rtt_ms(rtt),
+                        });
+                    }
+                }
                 Ok((
                     _,
                     MediaPayload::VoiceFeedback {
@@ -2893,6 +2943,8 @@ impl WorkerState {
                 connection_id: peer.connection_id,
                 direct_stable_since: None,
                 last_direct_inbound: None,
+                rtt_in_flight: VecDeque::new(),
+                rtt_ms: None,
             },
         );
         let now = Instant::now();
@@ -3000,6 +3052,82 @@ impl WorkerState {
         }
     }
 
+    /// Allocates the next monotonically increasing RTT probe nonce.
+    fn next_rtt_nonce(&mut self) -> u64 {
+        self.rtt_probe_seq = self.rtt_probe_seq.wrapping_add(1);
+        self.rtt_probe_seq
+    }
+
+    /// Sends a media `Ping` to the server relay and to every direct peer so the
+    /// latency estimate can track each path's round-trip time. Replies are timed
+    /// in the `Pong` handlers, which fold them into per-destination EWMAs.
+    fn poll_rtt_probe(&mut self, now: Instant) {
+        if now < self.next_rtt_probe {
+            return;
+        }
+        self.next_rtt_probe = now + RTT_PROBE_INTERVAL;
+        if self.session_id.is_some() {
+            let nonce = self.next_rtt_nonce();
+            push_rtt_in_flight(&mut self.server_rtt_in_flight, nonce, now);
+            self.send_media(&MediaPayload::Ping { nonce });
+        }
+        let peer_sessions: Vec<SessionId> = self
+            .p2p_peers
+            .iter()
+            .filter(|(_, peer)| peer.agent.selected().is_some())
+            .map(|(session_id, _)| *session_id)
+            .collect();
+        for session_id in peer_sessions {
+            let nonce = self.next_rtt_nonce();
+            self.send_p2p_ping(session_id, nonce, now);
+        }
+    }
+
+    /// Seals a media `Ping` with the peer's key and sends it over the direct
+    /// path, recording the send time so the matching `Pong` yields an RTT sample.
+    fn send_p2p_ping(&mut self, session_id: SessionId, nonce: u64, now: Instant) {
+        let Some((addr, packet)) = self.p2p_peers.get_mut(&session_id).and_then(|peer| {
+            let addr = peer.agent.selected()?.remote_addr;
+            let counter = peer.send_counter;
+            peer.send_counter = peer.send_counter.wrapping_add(1);
+            push_rtt_in_flight(&mut peer.rtt_in_flight, nonce, now);
+            Some((
+                addr,
+                media::seal_media(&peer.send_key, counter, &MediaPayload::Ping { nonce }),
+            ))
+        }) else {
+            return;
+        };
+        match packet {
+            Ok(packet) => self.send_udp_raw("p2p_ping", Some(session_id), addr, &packet),
+            Err(error) => {
+                kvlog::warn!("p2p ping seal failed", session_id = session_id.0, error = %error);
+            }
+        }
+    }
+
+    /// Echoes a media `Pong` back to a peer over the direct path so it can
+    /// measure its own round-trip time to us.
+    fn send_p2p_pong(&mut self, session_id: SessionId, nonce: u64) {
+        let Some((addr, packet)) = self.p2p_peers.get_mut(&session_id).and_then(|peer| {
+            let addr = peer.agent.selected()?.remote_addr;
+            let counter = peer.send_counter;
+            peer.send_counter = peer.send_counter.wrapping_add(1);
+            Some((
+                addr,
+                media::seal_media(&peer.send_key, counter, &MediaPayload::Pong { nonce }),
+            ))
+        }) else {
+            return;
+        };
+        match packet {
+            Ok(packet) => self.send_udp_raw("p2p_pong", Some(session_id), addr, &packet),
+            Err(error) => {
+                kvlog::warn!("p2p pong seal failed", session_id = session_id.0, error = %error);
+            }
+        }
+    }
+
     fn handle_p2p_stun(&mut self, now: Instant, src: SocketAddr, packet: &[u8]) {
         // Two-step contract: route by the unverified USERNAME, then reject by
         // verified integrity. The username is not a secret, so it only picks the
@@ -3104,6 +3232,22 @@ impl WorkerState {
                         action,
                     })
                 }
+                Ok((_, MediaPayload::Ping { nonce })) => {
+                    let action = peer.agent.observe_authenticated_packet(now, src);
+                    peer.last_direct_inbound = Some(now);
+                    Ok(P2pMediaPacket::Ping { nonce, action })
+                }
+                Ok((_, MediaPayload::Pong { nonce })) => {
+                    let action = peer.agent.observe_authenticated_packet(now, src);
+                    peer.last_direct_inbound = Some(now);
+                    let rtt_ms =
+                        take_rtt_sample(&mut peer.rtt_in_flight, nonce, now).map(|sample| {
+                            let rtt = fold_rtt_ewma(peer.rtt_ms, sample);
+                            peer.rtt_ms = Some(rtt);
+                            clamp_rtt_ms(rtt)
+                        });
+                    Ok(P2pMediaPacket::Pong { rtt_ms, action })
+                }
                 Ok(_) => Err("unexpected P2P media payload".to_string()),
                 Err(error) => Err(error.to_string()),
             }
@@ -3164,6 +3308,23 @@ impl WorkerState {
                 }
                 let feedback = live_feedback_from_media(stream_id, feedback);
                 self.handle_encoder_feedback(feedback, now);
+            }
+            Ok(P2pMediaPacket::Ping { nonce, action }) => {
+                if let Some(action) = action {
+                    self.apply_p2p_actions(session_id, vec![action]);
+                }
+                self.send_p2p_pong(session_id, nonce);
+            }
+            Ok(P2pMediaPacket::Pong { rtt_ms, action }) => {
+                if let Some(action) = action {
+                    self.apply_p2p_actions(session_id, vec![action]);
+                }
+                if let (Some(rtt_ms), Some(user_id)) = (
+                    rtt_ms,
+                    self.p2p_peers.get(&session_id).map(|peer| peer.user_id),
+                ) {
+                    let _ = self.events.send(NetworkEvent::PeerRtt { user_id, rtt_ms });
+                }
             }
             Err(error) => {
                 kvlog::warn!(
@@ -3430,6 +3591,37 @@ fn network_command_kind(command: &NetworkCommand) -> &'static str {
         NetworkCommand::ReportBug { .. } => "report_bug",
         NetworkCommand::Shutdown => "shutdown",
     }
+}
+
+/// Records an outstanding RTT probe, evicting the oldest entry once the queue
+/// reaches [`RTT_IN_FLIGHT_CAP`] so a destination that stops replying cannot grow
+/// the queue without bound.
+fn push_rtt_in_flight(queue: &mut VecDeque<(u64, Instant)>, nonce: u64, now: Instant) {
+    if queue.len() >= RTT_IN_FLIGHT_CAP {
+        queue.pop_front();
+    }
+    queue.push_back((nonce, now));
+}
+
+/// Matches a `Pong` nonce against the outstanding probes and, on a hit, removes
+/// it and returns the elapsed round-trip time in milliseconds.
+fn take_rtt_sample(queue: &mut VecDeque<(u64, Instant)>, nonce: u64, now: Instant) -> Option<f32> {
+    let index = queue.iter().position(|(probe, _)| *probe == nonce)?;
+    let (_, sent) = queue.remove(index)?;
+    Some(now.saturating_duration_since(sent).as_secs_f32() * 1000.0)
+}
+
+/// Folds a fresh RTT sample into the running EWMA, seeding it on the first sample.
+fn fold_rtt_ewma(current: Option<f32>, sample_ms: f32) -> f32 {
+    match current {
+        Some(previous) => previous + RTT_EWMA_WEIGHT * (sample_ms - previous),
+        None => sample_ms,
+    }
+}
+
+/// Rounds a smoothed RTT to whole milliseconds, clamped into `u16` range.
+fn clamp_rtt_ms(rtt_ms: f32) -> u16 {
+    rtt_ms.round().clamp(0.0, u16::MAX as f32) as u16
 }
 
 fn media_feedback_from_live(feedback: LivePlaybackFeedback) -> media::VoiceFeedback {
@@ -3895,6 +4087,35 @@ mod tests {
 
     fn user(id: u32) -> UserId {
         UserId(id)
+    }
+
+    #[test]
+    fn rtt_sample_matches_nonce_and_evicts_when_full() {
+        let mut queue = VecDeque::new();
+        let base = Instant::now();
+        for nonce in 0..(RTT_IN_FLIGHT_CAP as u64 + 2) {
+            push_rtt_in_flight(&mut queue, nonce, base);
+        }
+        // Capped, so the two oldest probes were dropped.
+        assert_eq!(queue.len(), RTT_IN_FLIGHT_CAP);
+        assert!(take_rtt_sample(&mut queue, 0, base).is_none());
+
+        let later = base + Duration::from_millis(25);
+        let sample = take_rtt_sample(&mut queue, 5, later).expect("nonce 5 outstanding");
+        assert!((sample - 25.0).abs() < 1.0, "sample was {sample}");
+        // The matched probe is consumed, so a duplicate Pong yields nothing.
+        assert!(take_rtt_sample(&mut queue, 5, later).is_none());
+    }
+
+    #[test]
+    fn rtt_ewma_seeds_then_smooths() {
+        let seeded = fold_rtt_ewma(None, 100.0);
+        assert_eq!(seeded, 100.0);
+        // Moves toward the new sample by RTT_EWMA_WEIGHT, not all the way.
+        let next = fold_rtt_ewma(Some(seeded), 200.0);
+        assert!((next - (100.0 + RTT_EWMA_WEIGHT * 100.0)).abs() < f32::EPSILON);
+        assert_eq!(clamp_rtt_ms(next), 120);
+        assert_eq!(clamp_rtt_ms(f32::from(u16::MAX) + 1000.0), u16::MAX);
     }
 
     fn cand(id: u32, kind: CandidateKind, addr: &str) -> Candidate {

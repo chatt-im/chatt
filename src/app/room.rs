@@ -254,6 +254,10 @@ impl RoomSession {
         self.participants.set_peer_transport(user_id, direct);
     }
 
+    pub(super) fn peer_rtt(&mut self, user_id: UserId, rtt_ms: u16) {
+        self.participants.set_peer_rtt(user_id, rtt_ms);
+    }
+
     pub(super) fn voice_status_changed(&mut self, user_id: UserId, status: ParticipantVoiceStatus) {
         self.participants.set_voice_status(user_id, status);
     }

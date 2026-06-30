@@ -58,7 +58,7 @@ use audio_diagnostics::AudioDiagnostics;
 use commands::slash_command_help;
 
 pub(crate) use dialogs::{UserVolumeDialog, UserVolumeEvent};
-pub(crate) use participants::{ParticipantState, Participants};
+pub(crate) use participants::{ParticipantState, ParticipantVoiceFeedback, Participants};
 pub(crate) use room::{RoomSession, ToggleExpandResult};
 pub(crate) use server::{
     PendingPair, ServerEditDraft, ServerEditEvent, ServerSelectItem, default_join_alias,
@@ -232,6 +232,13 @@ pub(crate) struct App {
     pub encoder_profile: LiveEncoderProfile,
     pub last_network_notice: Option<String>,
     pub pending_audio_apply: Option<PendingAudioApply>,
+    /// When `true`, the lobby shows the detailed developer voice stats instead of
+    /// the collapsed per-participant latency estimate. Toggled by `/stats`,
+    /// session-only (defaults off each launch).
+    pub lobby_details: bool,
+    /// Smoothed round-trip time to the server relay media socket, milliseconds.
+    /// Used as the network leg of the latency estimate for relayed participants.
+    pub server_rtt_ms: Option<u16>,
     /// When set, the deadline at which outbound voice should be hard-disabled
     /// after a deafen. The teardown is deferred so active senders can transmit
     /// their mute fade-out tail before transport closes.
@@ -675,6 +682,8 @@ impl App {
             encoder_profile: LiveEncoderProfile::DRED_20,
             last_network_notice: None,
             pending_audio_apply: None,
+            lobby_details: false,
+            server_rtt_ms: None,
             pending_voice_teardown_at: None,
             pending_network_commands: VecDeque::new(),
             supervisor: SupervisorState::default(),
@@ -979,6 +988,7 @@ impl App {
         self.session_id = None;
         self.user_id = None;
         self.room.reset_for_disconnect();
+        self.server_rtt_ms = None;
         self.last_network_notice = None;
         self.voice_tx_enabled.store(false, Ordering::Relaxed);
         self.pending_voice_teardown_at = None;
@@ -1218,6 +1228,12 @@ impl App {
             }
             NetworkEvent::PlaybackFeedback(feedback) => {
                 self.room.playback_feedback(feedback);
+            }
+            NetworkEvent::ServerRtt { rtt_ms } => {
+                self.server_rtt_ms = Some(rtt_ms);
+            }
+            NetworkEvent::PeerRtt { user_id, rtt_ms } => {
+                self.room.peer_rtt(user_id, rtt_ms);
             }
             NetworkEvent::VoiceStatus { user_id, status } => {
                 self.room.voice_status_changed(user_id, status);
@@ -2667,6 +2683,7 @@ impl App {
             "/muted" => self.show_mute_status(),
             "/deafened" => self.show_deafen_status(),
             "/audio" => self.show_audio_status(),
+            "/stats" => self.toggle_lobby_details(),
             "/clear" => self.room.clear_chat(),
             "/help" => self.show_command_help(),
             "/config" | "/settings" => self.open_settings(),
@@ -2716,6 +2733,15 @@ impl App {
     fn show_command_help(&mut self) {
         self.room.push_notice("help", slash_command_help());
         self.set_status("slash commands listed");
+    }
+
+    fn toggle_lobby_details(&mut self) {
+        self.lobby_details = !self.lobby_details;
+        if self.lobby_details {
+            self.set_status("lobby detail on (jitter buffer stats)");
+        } else {
+            self.set_status("lobby detail off (latency estimate)");
+        }
     }
 
     fn set_mute(&mut self, muted: bool) {
@@ -3506,6 +3532,8 @@ fn network_event_kind(event: &NetworkEvent) -> &'static str {
         NetworkEvent::VoicePacketObserved { .. } => "voice_packet_observed",
         NetworkEvent::VoicePacket(_) => "voice_packet",
         NetworkEvent::PlaybackFeedback(_) => "playback_feedback",
+        NetworkEvent::ServerRtt { .. } => "server_rtt",
+        NetworkEvent::PeerRtt { .. } => "peer_rtt",
         NetworkEvent::VoiceStatus { .. } => "voice_status",
         NetworkEvent::EncoderProfileChanged(_) => "encoder_profile_changed",
         NetworkEvent::Status(_) => "status",
@@ -3978,6 +4006,22 @@ mod tests {
         assert!(notice.body.contains("/report-bug what went wrong"));
         assert!(notice.body.contains("Press Tab again to cycle matches"));
         assert_eq!(app.status.text(), "slash commands listed");
+    }
+
+    #[test]
+    fn stats_command_toggles_lobby_details() {
+        let mut app = test_app();
+        assert!(!app.lobby_details);
+
+        app.room.composer.set_lines("/stats");
+        app.submit_input();
+        assert!(app.lobby_details);
+        assert_eq!(app.status.text(), "lobby detail on (jitter buffer stats)");
+
+        app.room.composer.set_lines("/stats");
+        app.submit_input();
+        assert!(!app.lobby_details);
+        assert_eq!(app.status.text(), "lobby detail off (latency estimate)");
     }
 
     #[test]
