@@ -1281,7 +1281,7 @@ impl Server {
                 }
             }
         };
-        self.establish_session(token, &user, receive_files, file_receive_limit_bytes)
+        self.establish_session(token, &user, receive_files, file_receive_limit_bytes, true)
     }
 
     fn pair_client(
@@ -1356,7 +1356,7 @@ impl Server {
             user_id = user.id,
             user = user.name.as_str()
         );
-        self.establish_session(token, &user, receive_files, file_receive_limit_bytes)
+        self.establish_session(token, &user, receive_files, file_receive_limit_bytes, false)
     }
 
     fn reject_auth(&mut self, token: Token, code: u16, message: String) -> Result<(), String> {
@@ -1374,6 +1374,7 @@ impl Server {
         user: &UserConfig,
         receive_files: bool,
         file_receive_limit_bytes: u64,
+        join_lobby: bool,
     ) -> Result<(), String> {
         let user_id = user.user_id();
         // Supersede any earlier session for this user before standing up the new
@@ -1436,13 +1437,12 @@ impl Server {
                 session_id,
                 user_id,
                 rooms,
-                current_room: Some(DEFAULT_ROOM),
+                current_room: join_lobby.then_some(DEFAULT_ROOM),
             },
         )?;
-        if self.live_token_for_session(session_id).is_none() {
-            return Ok(());
+        if join_lobby && self.live_token_for_session(session_id).is_some() {
+            self.join_room(session_id, DEFAULT_ROOM);
         }
-        self.join_room(session_id, DEFAULT_ROOM);
         Ok(())
     }
 
@@ -3974,6 +3974,84 @@ mod tests {
                 .sessions
                 .values()
                 .any(|session| session.identifier == "dana")
+        );
+    }
+
+    /// Builds a live `ClientConn` over a connected loopback socket with a
+    /// plaintext control transport, so server send paths run without a full
+    /// crypto handshake. The returned peer socket must be kept alive for the
+    /// test so the connection stays open.
+    fn test_live_client() -> (ClientConn, std::net::TcpStream) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+        let addr = listener.local_addr().expect("local addr");
+        let client = std::net::TcpStream::connect(addr).expect("connect loopback");
+        let (peer, _) = listener.accept().expect("accept loopback");
+        let conn = ClientConn {
+            socket: TcpStream::from_std(client),
+            read_buf: Vec::new(),
+            write_buf: Vec::new(),
+            kind: ConnKind::Control,
+            state: ConnState::Ready,
+            control: Some(ControlTransport::plaintext()),
+            secrets: None,
+            session_id: None,
+            user_id: None,
+            disconnect: false,
+        };
+        (conn, peer)
+    }
+
+    #[test]
+    fn pairing_does_not_join_lobby() {
+        // A pairing connection acknowledges with `Authenticated` but must not
+        // join the lobby. Otherwise it broadcasts a `Presence` online, then a
+        // matching offline when the throwaway socket drops, so other clients
+        // see the user flicker in and out before the real session joins.
+        let path = std::env::temp_dir().join(format!(
+            "chatt-server-pair-lobby-test-{}.toml",
+            std::process::id()
+        ));
+        let mut server = test_server();
+        server.config.config_path = Some(path.clone());
+        server.config.users = vec![UserConfig {
+            id: 4,
+            name: "gwen".to_string(),
+            display_name: "old".to_string(),
+            token_hash: String::new(),
+        }];
+        let code = "pairing-code-secret-2468013579";
+        server.invites.insert(
+            "gwen".to_string(),
+            InviteState {
+                pairing_code_hash: hash_secret(code),
+                expires_at: std::time::Instant::now() + INVITE_TTL,
+            },
+        );
+
+        // A live client under the pairing token makes `live_token_for_session`
+        // resolve, so the join path would run if it were not gated off.
+        let token = Token(7);
+        let (conn, _peer) = test_live_client();
+        server.clients.insert(token, conn);
+
+        let new_token = "gwen-client-generated-token-with-at-least-32-bytes";
+        let _ = server.pair_client(token, "Gwen", code, new_token, true, 0);
+
+        let _ = std::fs::remove_file(&path);
+
+        let session = server
+            .sessions
+            .values()
+            .find(|session| session.identifier == "gwen")
+            .expect("pairing session exists");
+        assert_eq!(session.room_id, None);
+        assert!(
+            server
+                .rooms
+                .get(&DEFAULT_ROOM)
+                .expect("lobby exists")
+                .members
+                .is_empty()
         );
     }
 
