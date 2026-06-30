@@ -26,9 +26,9 @@ pub use shared::{
     DEFAULT_DENOISE_TYPING_RELEASE_MS, DEFAULT_DENOISE_TYPING_SUPPRESSION,
     DEFAULT_DENOISE_TYPING_VAD_ENTER, DEFAULT_DENOISE_TYPING_VAD_RELEASE,
     DEFAULT_LIVE_MAX_AMPLIFICATION, DenoiseConfig, DenoiseSuppression, DenoiseTypingSuppression,
-    FRAME_SAMPLES, LiveAudioTuning, LiveEncoderProfile, LivePlaybackFeedback, LivePlaybackSnapshot,
-    LocalVoiceFrame, PlaybackSnapshot, PlaybackStats, PlaybackStreamControl, RemoteVoicePacket,
-    SAMPLE_RATE, StatsSnapshot, VoicePayload, VoicePayloadRef,
+    DredConfig, FRAME_SAMPLES, LiveAudioTuning, LiveEncoderProfile, LivePlaybackFeedback,
+    LivePlaybackSnapshot, LocalVoiceFrame, PlaybackSnapshot, PlaybackStats, PlaybackStreamControl,
+    RemoteVoicePacket, SAMPLE_RATE, StatsSnapshot, VoicePayload, VoicePayloadRef,
 };
 pub use sim::{
     LiveAudioDirectSampleSimulationConfig, LiveAudioFilePlaybackTestConfig,

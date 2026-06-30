@@ -1,5 +1,5 @@
 use crate::{
-    audio::{BufferRequest, DenoiseConfig, DeviceInfo, StreamPreview},
+    audio::{BufferRequest, DenoiseConfig, DeviceInfo, DredConfig, StreamPreview},
     config::{
         AudioConfig, AudioLatencyConfig, BufferSize, DEFAULT_DENOISE_RELEASE,
         DEFAULT_DENOISE_SUPPRESSION, DEFAULT_DENOISE_TYPING_VAD_ENTER,
@@ -65,6 +65,7 @@ pub struct SettingsDraft {
     pub(crate) form_bindings: FormBindings,
     pub(crate) theme: ThemeChoice,
     pub(crate) denoise: DenoiseConfig,
+    pub(crate) dred: DredConfig,
     pub(crate) echo_cancellation: bool,
     pub(crate) latency: AudioLatencyConfig,
 }
@@ -118,6 +119,7 @@ impl SettingsDraft {
             form_bindings: FormBindings::Standard,
             theme: ThemeChoice::default(),
             denoise: config.denoise,
+            dred: config.dred,
             echo_cancellation: config.echo_cancellation,
             latency: config.latency.clone(),
         }
@@ -155,6 +157,7 @@ impl SettingsDraft {
             output_device_id: self.output_device_id.clone(),
             bitrate_bps: BITRATES[self.bitrate_index],
             denoise: self.denoise,
+            dred: self.dred,
             echo_cancellation: self.echo_cancellation,
             max_amplification: self.max_amplification(),
             denoise_suppression: self.suppression_strength(),
@@ -1014,6 +1017,19 @@ mod tests {
 
         draft.denoise = DenoiseConfig::RnnNoise;
         assert_eq!(draft.to_audio().denoise, DenoiseConfig::RnnNoise);
+    }
+
+    #[test]
+    fn settings_draft_round_trips_dred() {
+        let config = AudioConfig {
+            dred: DredConfig::Off,
+            ..AudioConfig::default()
+        };
+        let mut draft = SettingsDraft::from_audio(&config);
+        assert_eq!(draft.to_audio().dred, DredConfig::Off);
+
+        draft.dred = DredConfig::On;
+        assert_eq!(draft.to_audio().dred, DredConfig::On);
     }
 
     #[test]

@@ -1,4 +1,4 @@
-use crate::audio::DenoiseConfig;
+use crate::audio::{DenoiseConfig, DredConfig};
 use crate::config::{FormBindings, ThemeChoice};
 use crate::{
     audio::StatsSnapshot,
@@ -412,6 +412,16 @@ fn settings_ui(
         .is_focus()
     {
         form.set_help("Noise suppression before encoding. Useful for fans and room noise.");
+    }
+    if form
+        .choice_value("DRED", &mut draft.dred, &DredConfig::ALL, |dred| {
+            dred.label().to_string()
+        })
+        .is_focus()
+    {
+        form.set_help(
+            "Embed Opus DRED redundancy in outgoing voice so peers recover lost packets. Auto matches on for now.",
+        );
     }
     if form
         .checkbox("Echo Cancel", &mut draft.echo_cancellation)

@@ -35,7 +35,7 @@ use crate::{
         },
         shared::{
             AudioStats, BufferRequest, CALLBACK_QUEUE_CAPACITY, CHANNELS, DenoiseConfig,
-            DenoiseSuppression, DenoiseTypingSuppression, FRAME_SAMPLES,
+            DenoiseSuppression, DenoiseTypingSuppression, DredConfig, FRAME_SAMPLES,
             LIVE_PLAYBACK_COMMAND_CAPACITY, LiveAudioTuning, LiveEncoderProfile,
             LivePlaybackFeedback, LivePlaybackSnapshot, LocalVoiceFrame, PlaybackSnapshot,
             PlaybackStats, PlaybackStreamControl, RemoteVoicePacket, SAMPLE_RATE, StatsSnapshot,
@@ -59,6 +59,7 @@ pub struct LiveCaptureConfig {
     pub input_device_id: Option<String>,
     pub bitrate_bps: i32,
     pub denoise: DenoiseConfig,
+    pub dred: DredConfig,
     pub max_amplification: f32,
     pub suppression: DenoiseSuppression,
     pub typing_suppression: DenoiseTypingSuppression,
@@ -502,6 +503,7 @@ where
 
     let device_name = device.to_string();
     let mut encoder = OpusVoiceEncoder::new(config.bitrate_bps)?;
+    encoder.set_configured_dred_10ms(config.dred.dred_duration_10ms())?;
     encoder.apply_live_encoder_profile(LiveEncoderProfile::DRED_20)?;
     let stats = AudioStats::new();
     let max_amplification_bits = Arc::new(AtomicU32::new(config.max_amplification.to_bits()));

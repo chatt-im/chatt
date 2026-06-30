@@ -1,6 +1,5 @@
 [[servers]]
 alias = "local"
-user = "alice"
 display-name = "Alice"
 token = "alice-dev-token"
 server-public-key = ""
@@ -118,6 +117,7 @@ UP = "AdjustRight"
 [audio]
 bitrate-bps = 48000
 denoise = "rnn-noise"
+dred = "off"
 echo-cancellation = true
 max-amplification = 0.0
 denoise-suppression = 1.0
