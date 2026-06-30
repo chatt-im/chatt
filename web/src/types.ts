@@ -18,9 +18,9 @@ export interface WebMessage {
   body: string;
   timestamp_ms: number;
   attachment: WebAttachment | null;
-  // The file transfer id for a file message, else null. A `message` frame with a
-  // file_id matching one already held replaces it in place (the announcement
-  // placeholder gains its inline attachment) instead of appending a second row.
+  // The file transfer id for a file message, else null. A `message` frame with
+  // both file_id and timestamp_ms matching one already held replaces it in
+  // place; transfer ids alone are reused after server restarts.
   file_id: number | null;
 }
 
