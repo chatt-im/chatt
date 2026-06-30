@@ -4,7 +4,7 @@ use crate::ids::{BugReportId, FileTransferId, MessageId, RoomId, SessionId, Stre
 
 pub const MAX_CONTROL_PAYLOAD_BYTES: usize = 64 * 1024;
 pub const MAX_CHAT_BODY_BYTES: usize = 8 * 1024;
-pub const DEFAULT_FILE_SIZE_LIMIT_BYTES: u64 = 50 * 1024 * 1024;
+pub const DEFAULT_FILE_SIZE_LIMIT_BYTES: u64 = 50 * 1024 * 1024; // default file size limit when unconfigured
 pub const MAX_FILE_CHUNK_BYTES: usize = 32 * 1024;
 pub const MAX_FILE_NAME_BYTES: usize = 255;
 pub const MAX_BUG_REPORT_DESC_BYTES: usize = 4 * 1024;
@@ -478,21 +478,13 @@ pub fn is_valid_mdns_candidate_name(name: &str) -> bool {
 
 fn validate_client_control(value: &ClientControl) -> Result<(), String> {
     match value {
-        ClientControl::Authenticate {
-            token,
-            file_receive_limit_bytes,
-            ..
-        } => {
+        ClientControl::Authenticate { token, .. } => {
             validate_auth_field("token", token)?;
-            if *file_receive_limit_bytes > DEFAULT_FILE_SIZE_LIMIT_BYTES {
-                return Err("file receive limit exceeds maximum".to_string());
-            }
         }
         ClientControl::Pair {
             display_name,
             pairing_code,
             token,
-            file_receive_limit_bytes,
             ..
         } => {
             validate_auth_field("display name", display_name)?;
@@ -503,9 +495,6 @@ fn validate_client_control(value: &ClientControl) -> Result<(), String> {
             }
             if token.len() < MIN_PAIRED_TOKEN_BYTES {
                 return Err("paired token is too short".to_string());
-            }
-            if *file_receive_limit_bytes > DEFAULT_FILE_SIZE_LIMIT_BYTES {
-                return Err("file receive limit exceeds maximum".to_string());
             }
         }
         ClientControl::SendChat { body, .. } => {
@@ -526,11 +515,8 @@ fn validate_client_control(value: &ClientControl) -> Result<(), String> {
                 }
             }
         }
-        ClientControl::UploadFileStart { name, size, .. } => {
+        ClientControl::UploadFileStart { name, .. } => {
             validate_file_name(name)?;
-            if *size > DEFAULT_FILE_SIZE_LIMIT_BYTES {
-                return Err("file exceeds maximum length".to_string());
-            }
         }
         ClientControl::UploadFileChunk { data, .. } => {
             if data.is_empty() {

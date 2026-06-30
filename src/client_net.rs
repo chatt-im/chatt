@@ -28,11 +28,11 @@ use mio::{
 use ring::rand::SecureRandom;
 use rpc::{
     control::{
-        ChatMessage, ClientControl, DEFAULT_FILE_SIZE_LIMIT_BYTES, ERROR_AUTH_REJECTED,
-        ERROR_PAIRING_CODE_MISMATCH, ERROR_PAIRING_INVALID_REQUEST, ERROR_PAIRING_NOT_ACTIVE,
-        FileMetadata, MAX_FILE_CHUNK_BYTES, MAX_FILE_NAME_BYTES, P2pCandidate, P2pCandidateKind,
-        P2pKey, P2pNatKind, P2pPeerInfo, P2pRole, ParticipantInfo, ParticipantVoiceStatus,
-        RoomInfo, ServerControl, decode_server_control, decode_server_hello, encode_client_control,
+        ChatMessage, ClientControl, ERROR_AUTH_REJECTED, ERROR_PAIRING_CODE_MISMATCH,
+        ERROR_PAIRING_INVALID_REQUEST, ERROR_PAIRING_NOT_ACTIVE, FileMetadata,
+        MAX_FILE_CHUNK_BYTES, MAX_FILE_NAME_BYTES, P2pCandidate, P2pCandidateKind, P2pKey,
+        P2pNatKind, P2pPeerInfo, P2pRole, ParticipantInfo, ParticipantVoiceStatus, RoomInfo,
+        ServerControl, decode_server_control, decode_server_hello, encode_client_control,
         encode_client_hello,
     },
     crypto::{
@@ -576,10 +576,7 @@ fn run_worker_inner(
         display_name: worker.config.display_name.clone(),
         token: worker.config.token.clone(),
         receive_files: worker.config.file_receive_dir.is_some(),
-        file_receive_limit_bytes: worker
-            .config
-            .max_receive_bytes
-            .min(DEFAULT_FILE_SIZE_LIMIT_BYTES),
+        file_receive_limit_bytes: worker.config.max_receive_bytes,
     };
     if let Err(error) = worker.queue_control(auth_control) {
         return SessionEnd::Disconnected(error);
@@ -856,7 +853,7 @@ fn pair_once(config: &ClientConfig, pairing_code: String) -> Result<(), String> 
             pairing_code,
             token: config.token.clone(),
             receive_files: config.file_receive_dir.is_some(),
-            file_receive_limit_bytes: config.max_receive_bytes.min(DEFAULT_FILE_SIZE_LIMIT_BYTES),
+            file_receive_limit_bytes: config.max_receive_bytes,
         },
     )?;
 
@@ -1938,10 +1935,7 @@ impl WorkerState {
         if !metadata.is_file() {
             return Err(format!("upload path is not a file: {}", path.display()));
         }
-        let limit = self
-            .config
-            .max_upload_bytes
-            .min(DEFAULT_FILE_SIZE_LIMIT_BYTES);
+        let limit = self.config.max_upload_bytes;
         let size = metadata.len();
         if size > limit {
             return Err(format!(
@@ -2217,21 +2211,12 @@ impl WorkerState {
             )));
             return;
         }
-        if file.size
-            > self
-                .config
-                .max_receive_bytes
-                .min(DEFAULT_FILE_SIZE_LIMIT_BYTES)
-        {
+        if file.size > self.config.max_receive_bytes {
             let _ = self.events.send(NetworkEvent::Error(format!(
                 "not receiving {}; size {} exceeds local limit {}",
                 file.file_name,
                 format_bytes(file.size),
-                format_bytes(
-                    self.config
-                        .max_receive_bytes
-                        .min(DEFAULT_FILE_SIZE_LIMIT_BYTES)
-                )
+                format_bytes(self.config.max_receive_bytes)
             )));
             return;
         }
