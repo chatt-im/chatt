@@ -1,5 +1,6 @@
 use hashbrown::{HashMap, HashSet};
 
+use extui::Style;
 use extui_editor::{Editor, Span as EditorSpan, bindings as editor_bindings};
 use rpc::{
     control::{ChatMessage, ParticipantInfo, ParticipantVoiceStatus},
@@ -12,7 +13,7 @@ use crate::{
     chat_buffer::VirtualChatBuffer, config::Config, theme::Theme, tui::editor::EditorHighlighter,
 };
 
-use super::Participants;
+use super::{Participants, commands::CommandCompletionState};
 
 pub(crate) struct RoomSession {
     pub server_alias: String,
@@ -20,6 +21,7 @@ pub(crate) struct RoomSession {
     pub room_name: String,
     pub composer: Editor,
     pub composer_hl: EditorHighlighter,
+    command_completion: CommandCompletionState,
     pub chat: VirtualChatBuffer,
     pub participants: Participants,
     pending_clipboard: Option<String>,
@@ -90,6 +92,7 @@ impl RoomSession {
             room_name: "servers".to_string(),
             composer,
             composer_hl,
+            command_completion: CommandCompletionState::default(),
             chat: VirtualChatBuffer::new(config.ui.max_messages as usize, theme.syntax),
             participants: Participants::default(),
             pending_clipboard: None,
@@ -115,6 +118,23 @@ impl RoomSession {
     pub(crate) fn insert_paste(&mut self, text: String) {
         let span = EditorSpan::empty_at(self.composer.cursor_offset());
         self.composer.replace_range(span, &text);
+    }
+
+    pub(crate) fn refresh_command_completion(&mut self, enabled: bool, style: Style) {
+        if !enabled {
+            self.command_completion.clear();
+            self.composer.clear_inline_completion();
+            return;
+        }
+        let completion = self
+            .command_completion
+            .inline_completion(&self.composer, style);
+        self.composer.set_inline_completion(completion);
+    }
+
+    pub(crate) fn complete_command(&mut self) -> bool {
+        self.composer.clear_inline_completion();
+        self.command_completion.complete(&mut self.composer)
     }
 
     pub(crate) fn connect_to_server(&mut self, server_alias: String, local_user_name: String) {
@@ -291,6 +311,8 @@ impl RoomSession {
         if input.is_empty() {
             return None;
         }
+        self.command_completion.clear();
+        self.composer.clear_inline_completion();
         self.composer.clear();
         self.composer.enter_insert_mode();
         Some(input)

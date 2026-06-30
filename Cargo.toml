@@ -7,13 +7,13 @@ edition = "2024"
 cpal = { path = "crates/cpal", default-features = false }
 libc = "0.2"
 nnnoiseless = { path = "crates/nnnoiseless" }
-extui = { git = "https://github.com/exrok/extui", rev = "515cad27fbc5d1275bb987d0fd732a8ce40009f5", features = [
+extui = { git = "https://github.com/exrok/extui", rev = "0438812f44b0394c220c520effc5dbd38a86aa1a", features = [
     "bracketed-paste",
 ] }
-extui-editor = { git = "https://github.com/exrok/extui", rev = "515cad27fbc5d1275bb987d0fd732a8ce40009f5" }
-extui-bindings = { git = "https://github.com/exrok/extui", rev = "515cad27fbc5d1275bb987d0fd732a8ce40009f5" }
+extui-editor = { git = "https://github.com/exrok/extui", rev = "0438812f44b0394c220c520effc5dbd38a86aa1a" }
+extui-bindings = { git = "https://github.com/exrok/extui", rev = "0438812f44b0394c220c520effc5dbd38a86aa1a" }
 bwrap.path = "crates/bwrap"
-tinyhl = { git = "https://github.com/exrok/extui", rev = "515cad27fbc5d1275bb987d0fd732a8ce40009f5" }
+tinyhl = { git = "https://github.com/exrok/extui", rev = "0438812f44b0394c220c520effc5dbd38a86aa1a" }
 unicode-width = "0.2"
 opus-codec = { path = "crates/opus-codec", features = ["dred"] }
 ring = "0.17.14"

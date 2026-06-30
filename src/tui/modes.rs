@@ -634,6 +634,12 @@ impl RoomMode {
 
     fn process_compose_key(&mut self, app: &mut App, key: KeyEvent) -> Action {
         if app.room.composer.mode() == EditorMode::Insert {
+            if key.code == extui::event::KeyCode::Tab
+                && key.modifiers.is_empty()
+                && app.room.complete_command()
+            {
+                return Action::Continue;
+            }
             if key.code != extui::event::KeyCode::Esc {
                 match resolve_binding(app, bindings::INSERT_LAYER, key) {
                     BindingResolution::Action(command) => {
@@ -972,6 +978,12 @@ mod tests {
         KeyEvent::new(KeyCode::Char(ch), KeyModifiers::empty())
     }
 
+    fn type_text(room: &mut RoomMode, app: &mut App, text: &str) {
+        for ch in text.chars() {
+            room.process_input(app, key(ch));
+        }
+    }
+
     fn render_room(app: &mut App, room: &mut RoomMode, buffer: &mut Buffer) {
         room.render(app, buffer, 0);
     }
@@ -1029,6 +1041,34 @@ mod tests {
         room.process_input(&mut app, key('q'));
 
         assert_eq!(app.room.composer.text(), "q");
+    }
+
+    #[test]
+    fn tab_completes_lobby_slash_command() {
+        let mut app = test_app();
+        let mut room = RoomMode::default();
+
+        type_text(&mut room, &mut app, "/rep");
+        room.process_input(&mut app, KeyEvent::new(KeyCode::Tab, KeyModifiers::empty()));
+
+        assert_eq!(app.room.composer.text(), "/report-bug");
+        assert_eq!(app.room.composer.mode(), EditorMode::Insert);
+    }
+
+    #[test]
+    fn repeated_tab_cycles_lobby_slash_commands() {
+        let mut app = test_app();
+        let mut room = RoomMode::default();
+
+        type_text(&mut room, &mut app, "/s");
+        room.process_input(&mut app, KeyEvent::new(KeyCode::Tab, KeyModifiers::empty()));
+        assert_eq!(app.room.composer.text(), "/servers");
+
+        room.process_input(&mut app, KeyEvent::new(KeyCode::Tab, KeyModifiers::empty()));
+        assert_eq!(app.room.composer.text(), "/settings");
+
+        room.process_input(&mut app, KeyEvent::new(KeyCode::Tab, KeyModifiers::empty()));
+        assert_eq!(app.room.composer.text(), "/sound");
     }
 
     #[test]

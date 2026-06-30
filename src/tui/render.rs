@@ -1328,6 +1328,8 @@ fn draw_composer(area: Rect, app: &mut App, focus: ChatPanelFocus, buf: &mut Buf
     area.with(app.theme.panel).fill(buf);
     app.room.composer.resize(area.w.max(1));
     app.room
+        .refresh_command_completion(focus == ChatPanelFocus::Compose, app.theme.subtle);
+    app.room
         .composer_hl
         .render(&mut app.room.composer, area, buf, &app.theme);
     if focus != ChatPanelFocus::Compose {
