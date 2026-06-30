@@ -275,11 +275,6 @@ impl Config {
         if self.users.is_empty() {
             return Err(format!("{source}: at least one user is required"));
         }
-        if self.security.max_file_size_bytes > DEFAULT_FILE_SIZE_LIMIT_BYTES {
-            return Err(format!(
-                "{source}: security.max-file-size-bytes exceeds protocol maximum"
-            ));
-        }
         server_key_pair_from_seed_hex(&self.security.server_identity_seed)
             .map_err(|error| format!("{source}: invalid security.server-identity-seed: {error}"))?;
         validate_endpoint(

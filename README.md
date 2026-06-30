@@ -332,6 +332,7 @@ p2p-enabled = true
 server-identity-seed = "546f6d636861742064657620736572766572206b657920763100000000000001"
 encryption = true
 chat-history-limit = 0
+# max upload size the server relays, any u64 (e.g. 68719476736 for 64 GiB); defaults to 50 MiB
 max-file-size-bytes = 52428800
 
 [[rooms]]
