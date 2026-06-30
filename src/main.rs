@@ -9,6 +9,7 @@ mod config;
 mod config_diagnostics;
 mod fuzzy;
 mod local_control;
+mod room_history;
 mod runtime;
 mod self_log;
 mod settings;

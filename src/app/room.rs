@@ -4,13 +4,17 @@ use extui::Style;
 use extui_editor::{Editor, Span as EditorSpan, bindings as editor_bindings};
 use rpc::{
     control::{ChatMessage, ParticipantInfo, ParticipantVoiceStatus},
-    ids::{StreamId, UserId},
+    ids::{FileTransferId, RoomId, StreamId, UserId},
 };
 
 use chatt::audio::{LivePlaybackFeedback, PlaybackStreamControl};
 
 use crate::{
-    chat_buffer::VirtualChatBuffer, config::Config, theme::Theme, tui::editor::EditorHighlighter,
+    chat_buffer::VirtualChatBuffer,
+    config::Config,
+    room_history::{self, RoomHistoryStore},
+    theme::Theme,
+    tui::editor::EditorHighlighter,
 };
 
 use super::{Participants, commands::CommandCompletionState};
@@ -28,6 +32,8 @@ pub(crate) struct RoomSession {
     muted_users: HashSet<UserId>,
     stream_users: HashMap<u32, UserId>,
     volume_preview: Option<(UserId, f32)>,
+    history: Option<RoomHistoryStore>,
+    seen: HashSet<(u64, u64)>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -114,6 +120,8 @@ impl RoomSession {
             muted_users: HashSet::new(),
             stream_users: HashMap::new(),
             volume_preview: None,
+            history: None,
+            seen: HashSet::new(),
         }
     }
 
@@ -163,11 +171,15 @@ impl RoomSession {
         self.server_alias.clear();
         self.local_user_name.clear();
         self.room_name = "servers".to_string();
+        self.history = None;
+        self.seen.clear();
     }
 
     pub(crate) fn reset_for_disconnect(&mut self) {
         self.participants = Participants::default();
         self.stream_users.clear();
+        self.history = None;
+        self.seen.clear();
     }
 
     pub(crate) fn authenticated(&mut self, room_name: Option<String>) {
@@ -176,19 +188,64 @@ impl RoomSession {
         }
     }
 
+    /// Merges the server's room history with the local on-disk store and shows
+    /// the union, deduped on `(timestamp_ms, message_id)` and sorted by it.
+    ///
+    /// The disk copy is authoritative on a key collision. Server messages not
+    /// yet on disk are appended so the local store accumulates beyond whatever
+    /// the server retains. Returns the merged history and the loaded file
+    /// details so the caller can mirror this room into the web view.
     pub(crate) fn joined(
         &mut self,
+        room_id: RoomId,
         participants: Vec<ParticipantInfo>,
-        history: Vec<ChatMessage>,
+        server_history: Vec<ChatMessage>,
         local_user: Option<UserId>,
-    ) {
-        self.chat.clear();
+    ) -> room_history::LoadedHistory {
         self.stream_users.clear();
         self.participants.replace_room(participants);
-        for message in history {
-            self.chat_received(message, local_user);
+
+        let loaded = room_history::load(&self.server_alias, room_id);
+        let disk_keys: HashSet<(u64, u64)> = loaded
+            .messages
+            .iter()
+            .map(|message| (message.timestamp_ms, message.message_id.0))
+            .collect();
+
+        self.history = RoomHistoryStore::open(&self.server_alias, room_id);
+        if let Some(store) = &mut self.history {
+            for message in &server_history {
+                if !disk_keys.contains(&(message.timestamp_ms, message.message_id.0)) {
+                    store.append_message(message);
+                }
+            }
+        }
+
+        let mut union: HashMap<(u64, u64), ChatMessage> = HashMap::new();
+        for message in server_history {
+            union.insert((message.timestamp_ms, message.message_id.0), message);
+        }
+        for message in loaded.messages {
+            union.insert((message.timestamp_ms, message.message_id.0), message);
+        }
+        let mut merged: Vec<ChatMessage> = union.into_values().collect();
+        merged.sort_by_key(|message| (message.timestamp_ms, message.message_id.0));
+
+        self.chat.clear();
+        self.seen.clear();
+        for message in &merged {
+            let local = Some(message.sender) == local_user;
+            self.seen
+                .insert((message.timestamp_ms, message.message_id.0));
+            self.participants.note_message(message);
+            self.chat.push_chat(message.clone(), local);
         }
         self.chat.bottom();
+
+        room_history::LoadedHistory {
+            messages: merged,
+            files: loaded.files,
+        }
     }
 
     pub(crate) fn chat_received(
@@ -198,14 +255,38 @@ impl RoomSession {
     ) -> RoomChatUpdate {
         let local = Some(message.sender) == local_user;
         let should_scroll_bottom = self.chat.scroll_offset() == 0;
-        self.participants.note_message(&message);
-        self.chat.push_chat(message, local);
-        if should_scroll_bottom {
-            self.chat.bottom();
+        if self
+            .seen
+            .insert((message.timestamp_ms, message.message_id.0))
+        {
+            if let Some(store) = &mut self.history {
+                store.append_message(&message);
+            }
+            self.participants.note_message(&message);
+            self.chat.push_chat(message, local);
+            if should_scroll_bottom {
+                self.chat.bottom();
+            }
         }
         RoomChatUpdate {
             local,
             should_scroll_bottom,
+        }
+    }
+
+    /// Persists the extra metadata for a received file as a correlated
+    /// append-only record, folded back into history on the next load.
+    pub(crate) fn file_received(
+        &mut self,
+        transfer_id: FileTransferId,
+        file_name: &str,
+        length: u64,
+        dimensions: Option<(u32, u32)>,
+    ) {
+        if let Some(store) = &mut self.history {
+            let packed_dims =
+                dimensions.map_or(0, |(width, height)| ((height as u64) << 32) | width as u64);
+            store.append_file_detail(transfer_id, file_name, length, packed_dims);
         }
     }
 
@@ -525,9 +606,10 @@ mod tests {
     }
 
     #[test]
-    fn joined_room_replaces_participants_and_history() {
+    fn joined_room_replaces_participants_and_streams() {
         let mut room = test_room();
         room.joined(
+            RoomId(1),
             vec![participant(1, "alice")],
             vec![message(1, 1, "old")],
             Some(UserId(1)),
@@ -535,6 +617,7 @@ mod tests {
         room.voice_started(UserId(1), StreamId(7), Some(UserId(1)));
 
         room.joined(
+            RoomId(1),
             vec![participant(2, "bob")],
             vec![message(2, 2, "new")],
             Some(UserId(1)),
@@ -542,8 +625,54 @@ mod tests {
 
         assert_eq!(room.participants.entries.len(), 1);
         assert_eq!(room.participants.entries[0].user_id, UserId(2));
-        assert_eq!(room.chat.len(), 1);
         assert!(room.stream_ids_for_user(UserId(1)).next().is_none());
+    }
+
+    #[test]
+    fn joined_merges_and_dedups_server_history() {
+        // Empty server alias disables disk, so this exercises the in-memory
+        // merge: dedup on (timestamp_ms, message_id) and sort by it. `message`
+        // sets timestamp_ms = id * 1000, so ids order the result.
+        let mut room = test_room();
+        room.joined(
+            RoomId(1),
+            vec![participant(1, "alice")],
+            vec![
+                message(3, 1, "third"),
+                message(1, 1, "first"),
+                message(1, 1, "duplicate"),
+                message(2, 1, "second"),
+            ],
+            Some(UserId(1)),
+        );
+
+        // The duplicate (timestamp_ms, message_id) collapses to the last one seen.
+        assert_eq!(room.chat.len(), 3);
+        assert_eq!(room.chat.message(0).body, "duplicate");
+        assert_eq!(room.chat.message(1).body, "second");
+        assert_eq!(room.chat.message(2).body, "third");
+    }
+
+    #[test]
+    fn live_chat_is_deduped_against_seen() {
+        let mut room = test_room();
+        room.joined(
+            RoomId(1),
+            vec![participant(1, "alice")],
+            vec![message(5, 2, "seeded")],
+            Some(UserId(1)),
+        );
+        assert_eq!(room.chat.len(), 1);
+
+        // Same (timestamp_ms, message_id) is skipped.
+        room.chat_received(message(5, 2, "echo"), Some(UserId(1)));
+        assert_eq!(room.chat.len(), 1);
+
+        // Same id with a different timestamp (post-restart) is a new message.
+        let mut restarted = message(5, 2, "post-restart");
+        restarted.timestamp_ms += 1;
+        room.chat_received(restarted, Some(UserId(1)));
+        assert_eq!(room.chat.len(), 2);
     }
 
     #[test]
@@ -576,13 +705,19 @@ mod tests {
         ));
 
         let mut room = test_room();
-        room.joined(vec![participant(1, "alice")], Vec::new(), Some(UserId(1)));
+        room.joined(
+            RoomId(1),
+            vec![participant(1, "alice")],
+            Vec::new(),
+            Some(UserId(1)),
+        );
         assert!(matches!(
             room.selected_remote_user(Some(UserId(1))),
             Err(UserSelectionError::LocalUser)
         ));
 
         room.joined(
+            RoomId(1),
             vec![participant(1, "alice"), participant(2, "bob")],
             Vec::new(),
             Some(UserId(1)),
