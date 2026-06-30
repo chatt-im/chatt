@@ -52,9 +52,8 @@ pub struct WebMessage {
     pub body: String,
     pub timestamp_ms: u64,
     pub attachment: Option<WebAttachment>,
-    /// `Some` for a file message, carrying the file transfer id. The feed upserts
-    /// by it so a file's announcement placeholder and its later inline version are
-    /// one entry, enriched in place rather than two separate messages.
+    /// `Some` for a file message. The feed upserts by this id together with
+    /// `timestamp_ms`, because transfer ids are reused after a server restart.
     pub file_id: Option<u64>,
 }
 
@@ -175,6 +174,12 @@ impl WebMessage {
             ..incoming
         };
     }
+}
+
+fn same_file(left: &WebMessage, right: &WebMessage) -> bool {
+    left.file_id.is_some()
+        && left.file_id == right.file_id
+        && left.timestamp_ms == right.timestamp_ms
 }
 
 /// Formats a byte count the way the server's file announcement does, so an
@@ -447,11 +452,11 @@ fn run(
                     // announcement placeholder, or the inline version if it
                     // arrived first), so a file is one message enriched in place,
                     // never two. The seq is preserved, so paging is untouched.
-                    let existing = message.file_id.and_then(|file_id| {
+                    let existing = message.file_id.and_then(|_| {
                         history
                             .iter_mut()
                             .rev()
-                            .find(|held| held.file_id == Some(file_id))
+                            .find(|held| same_file(held, &message))
                     });
                     let payload = if let Some(existing) = existing {
                         existing.merge_from(message);
@@ -756,6 +761,17 @@ mod tests {
             inline.attachment.is_some(),
             "a late placeholder must not drop the attachment"
         );
+    }
+
+    #[test]
+    fn file_identity_includes_announcement_timestamp() {
+        let first = WebMessage::from_file(&file_metadata(7), "first.png", None);
+        let mut second_metadata = file_metadata(7);
+        second_metadata.timestamp_ms += 1;
+        let second = WebMessage::from_file(&second_metadata, "second.png", None);
+
+        assert!(same_file(&first, &first));
+        assert!(!same_file(&first, &second));
     }
 
     #[test]

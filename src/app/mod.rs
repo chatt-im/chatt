@@ -567,7 +567,10 @@ fn web_room_messages(
     let mut messages = Vec::with_capacity(view.messages.len());
     for message in &view.messages {
         let web_message = match message.file_transfer_id {
-            Some(transfer_id) => match view.files.get(&transfer_id) {
+            Some(transfer_id) => match view.files.get(&crate::room_history::FileHistoryKey {
+                timestamp_ms: message.timestamp_ms,
+                transfer_id,
+            }) {
                 Some(detail) => crate::web_server::WebMessage::from_history_file(
                     message,
                     &detail.file_name,
@@ -1196,6 +1199,7 @@ impl App {
                 }
                 self.room.file_received(
                     metadata.transfer_id,
+                    metadata.timestamp_ms,
                     served_name,
                     metadata.size,
                     dimensions,

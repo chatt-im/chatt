@@ -421,13 +421,16 @@ export default function App() {
         }
         closeDecoder(env.stream_id);
       } else {
-        // Upsert by file_id: a file's announcement placeholder and its later
-        // inline version share an id, so the second arrival enriches the first
-        // in place rather than appearing as a separate message.
+        // Upsert by the announcement timestamp and file id. Transfer ids are
+        // reused after server restarts, while the pair identifies one file.
         const msg = env.message;
         setMessages((prev) => {
           if (msg.file_id !== null) {
-            const i = prev.findIndex((m) => m.file_id === msg.file_id);
+            const i = prev.findIndex(
+              (m) =>
+                m.file_id === msg.file_id &&
+                m.timestamp_ms === msg.timestamp_ms,
+            );
             if (i >= 0) {
               const next = prev.slice();
               next[i] = msg;

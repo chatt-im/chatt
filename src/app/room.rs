@@ -12,7 +12,7 @@ use chatt::audio::{LivePlaybackFeedback, PlaybackStreamControl};
 use crate::{
     chat_buffer::VirtualChatBuffer,
     config::Config,
-    room_history::{self, RoomHistoryStore},
+    room_history::{self, FileHistoryKey, RoomHistoryStore},
     theme::Theme,
     tui::editor::EditorHighlighter,
 };
@@ -205,14 +205,15 @@ impl RoomSession {
         self.stream_users.clear();
         self.participants.replace_room(participants);
 
-        let loaded = room_history::load(&self.server_alias, room_id);
+        let opened = room_history::open(&self.server_alias, room_id);
+        let loaded = opened.loaded;
         let disk_keys: HashSet<(u64, u64)> = loaded
             .messages
             .iter()
             .map(|message| (message.timestamp_ms, message.message_id.0))
             .collect();
 
-        self.history = RoomHistoryStore::open(&self.server_alias, room_id);
+        self.history = opened.store;
         if let Some(store) = &mut self.history {
             for message in &server_history {
                 if !disk_keys.contains(&(message.timestamp_ms, message.message_id.0)) {
@@ -279,6 +280,7 @@ impl RoomSession {
     pub(crate) fn file_received(
         &mut self,
         transfer_id: FileTransferId,
+        timestamp_ms: u64,
         file_name: &str,
         length: u64,
         dimensions: Option<(u32, u32)>,
@@ -286,7 +288,15 @@ impl RoomSession {
         if let Some(store) = &mut self.history {
             let packed_dims =
                 dimensions.map_or(0, |(width, height)| ((height as u64) << 32) | width as u64);
-            store.append_file_detail(transfer_id, file_name, length, packed_dims);
+            store.append_file_detail(
+                FileHistoryKey {
+                    timestamp_ms,
+                    transfer_id,
+                },
+                file_name,
+                length,
+                packed_dims,
+            );
         }
     }
 

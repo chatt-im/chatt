@@ -1798,6 +1798,16 @@ impl Server {
             file_transfer_id: Some(server_transfer_id),
         };
         self.next_message += 1;
+        let uploader_token = self
+            .live_token_for_session(session_id)
+            .ok_or_else(|| "uploading session disconnected".to_string())?;
+        self.send_control_to_token(
+            uploader_token,
+            &ServerControl::UploadFileAccepted {
+                client_transfer_id,
+                file: metadata.clone(),
+            },
+        )?;
         if self.chat_history_limit > 0
             && let Some(room) = self.rooms.get_mut(&room_id)
         {
@@ -3551,6 +3561,7 @@ fn server_control_kind(control: &ServerControl) -> &'static str {
         ServerControl::P2pPeer { .. } => "p2p_peer",
         ServerControl::P2pPeerGone { .. } => "p2p_peer_gone",
         ServerControl::FileOffered { .. } => "file_offered",
+        ServerControl::UploadFileAccepted { .. } => "upload_file_accepted",
         ServerControl::FileChunk { .. } => "file_chunk",
         ServerControl::FileComplete { .. } => "file_complete",
         ServerControl::FileCanceled { .. } => "file_canceled",

@@ -11,7 +11,7 @@ use std::{
         mpsc::{self, Receiver, RecvTimeoutError, SendError, Sender, TryRecvError},
     },
     thread::{self, JoinHandle},
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant},
 };
 
 use chatt_p2p::{
@@ -541,6 +541,7 @@ fn run_worker_inner(
         next_interface_poll: Instant::now() + INTERFACE_POLL_INTERVAL,
         next_file_transfer: 1,
         outgoing_uploads: VecDeque::new(),
+        pending_local_files: HashMap::new(),
         next_bug_report: 1,
         outgoing_bug_reports: VecDeque::new(),
         incoming_files: HashMap::new(),
@@ -1005,6 +1006,7 @@ struct WorkerState {
     next_interface_poll: Instant,
     next_file_transfer: u64,
     outgoing_uploads: VecDeque<OutgoingUpload>,
+    pending_local_files: HashMap<FileTransferId, PendingLocalFile>,
     next_bug_report: u64,
     outgoing_bug_reports: VecDeque<OutgoingBugReport>,
     incoming_files: HashMap<FileTransferId, IncomingFile>,
@@ -1263,6 +1265,8 @@ fn voice_sequence_distance_forward(from: u32, to: u32) -> Option<u32> {
 
 struct OutgoingUpload {
     transfer_id: FileTransferId,
+    /// Server-assigned identity shared with the room's chat announcement.
+    server_metadata: Option<FileMetadata>,
     room_id: RoomId,
     name: String,
     size: u64,
@@ -1275,6 +1279,11 @@ struct OutgoingUpload {
     /// from the same chunks sent to the server, never round-tripped through it.
     local_copy: Option<(PathBuf, File)>,
     /// Intrinsic image size, parsed from the first chunk as it streams.
+    dimensions: Option<(u32, u32)>,
+}
+
+struct PendingLocalFile {
+    path: PathBuf,
     dimensions: Option<(u32, u32)>,
 }
 
@@ -1955,6 +1964,7 @@ impl WorkerState {
         self.next_file_transfer = self.next_file_transfer.wrapping_add(1).max(1);
         Ok(OutgoingUpload {
             transfer_id,
+            server_metadata: None,
             room_id: self.room_id.unwrap_or(self.config.room_id),
             name,
             size,
@@ -2144,29 +2154,44 @@ impl WorkerState {
             )));
             return;
         }
-        let file_name = path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or(&upload.name)
-            .to_string();
-        let timestamp_ms = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|elapsed| elapsed.as_millis() as u64)
-            .unwrap_or(0);
-        let metadata = FileMetadata {
-            transfer_id: upload.transfer_id,
-            room_id: upload.room_id,
-            sender: self.user_id.unwrap_or(UserId(0)),
-            sender_name: self.config.display_name.clone(),
-            file_name,
-            original_name: upload.name.clone(),
-            size: upload.size,
-            timestamp_ms,
-        };
+        if let Some(metadata) = upload.server_metadata.take() {
+            self.emit_local_file(metadata, path, upload.dimensions);
+        } else {
+            self.pending_local_files.insert(
+                upload.transfer_id,
+                PendingLocalFile {
+                    path,
+                    dimensions: upload.dimensions,
+                },
+            );
+        }
+    }
+
+    fn handle_upload_accepted(
+        &mut self,
+        client_transfer_id: FileTransferId,
+        metadata: FileMetadata,
+    ) {
+        if let Some((metadata, local)) = correlate_upload_accepted(
+            &mut self.outgoing_uploads,
+            &mut self.pending_local_files,
+            client_transfer_id,
+            metadata,
+        ) {
+            self.emit_local_file(metadata, local.path, local.dimensions);
+        }
+    }
+
+    fn emit_local_file(
+        &self,
+        metadata: FileMetadata,
+        path: PathBuf,
+        dimensions: Option<(u32, u32)>,
+    ) {
         let _ = self.events.send(NetworkEvent::FileReceived {
             metadata,
             path,
-            dimensions: upload.dimensions,
+            dimensions,
         });
     }
 
@@ -2561,6 +2586,12 @@ impl WorkerState {
             }
             ServerControl::FileOffered { file, contents } => {
                 self.handle_file_offered(file, contents);
+            }
+            ServerControl::UploadFileAccepted {
+                client_transfer_id,
+                file,
+            } => {
+                self.handle_upload_accepted(client_transfer_id, file);
             }
             ServerControl::FileChunk {
                 transfer_id,
@@ -3618,6 +3649,24 @@ impl WorkerState {
     }
 }
 
+fn correlate_upload_accepted(
+    outgoing: &mut VecDeque<OutgoingUpload>,
+    pending: &mut HashMap<FileTransferId, PendingLocalFile>,
+    client_transfer_id: FileTransferId,
+    metadata: FileMetadata,
+) -> Option<(FileMetadata, PendingLocalFile)> {
+    if let Some(upload) = outgoing
+        .iter_mut()
+        .find(|upload| upload.transfer_id == client_transfer_id)
+    {
+        upload.server_metadata = Some(metadata);
+        return None;
+    }
+    pending
+        .remove(&client_transfer_id)
+        .map(|local| (metadata, local))
+}
+
 fn network_command_kind(command: &NetworkCommand) -> &'static str {
     match command {
         NetworkCommand::SendChat(_) => "send_chat",
@@ -3741,6 +3790,7 @@ fn server_control_kind(control: &ServerControl) -> &'static str {
         ServerControl::P2pPeer { .. } => "p2p_peer",
         ServerControl::P2pPeerGone { .. } => "p2p_peer_gone",
         ServerControl::FileOffered { .. } => "file_offered",
+        ServerControl::UploadFileAccepted { .. } => "upload_file_accepted",
         ServerControl::FileChunk { .. } => "file_chunk",
         ServerControl::FileComplete { .. } => "file_complete",
         ServerControl::FileCanceled { .. } => "file_canceled",
@@ -4574,6 +4624,81 @@ mod tests {
             Some("report-1.pdf")
         );
         let _ = fs::remove_dir_all(dir);
+    }
+
+    fn accepted_file_metadata() -> FileMetadata {
+        FileMetadata {
+            transfer_id: FileTransferId(20),
+            room_id: RoomId(1),
+            sender: UserId(3),
+            sender_name: "alice".to_string(),
+            file_name: "report.pdf".to_string(),
+            original_name: "report.pdf".to_string(),
+            size: 10,
+            timestamp_ms: 500,
+        }
+    }
+
+    #[test]
+    fn upload_acceptance_correlates_before_or_after_local_completion() {
+        let path =
+            std::env::temp_dir().join(format!("chatt-upload-correlation-{}", std::process::id()));
+        let file = File::create(&path).expect("create");
+        let client_id = FileTransferId(7);
+        let mut outgoing = VecDeque::from([OutgoingUpload {
+            transfer_id: client_id,
+            server_metadata: None,
+            room_id: RoomId(1),
+            name: "report.pdf".to_string(),
+            size: 10,
+            file,
+            offset: 0,
+            started: true,
+            next_status_at: 10,
+            local_copy: None,
+            dimensions: None,
+        }]);
+        let mut pending = HashMap::new();
+
+        assert!(
+            correlate_upload_accepted(
+                &mut outgoing,
+                &mut pending,
+                client_id,
+                accepted_file_metadata()
+            )
+            .is_none()
+        );
+        assert_eq!(
+            outgoing[0]
+                .server_metadata
+                .as_ref()
+                .map(|metadata| (metadata.transfer_id, metadata.timestamp_ms)),
+            Some((FileTransferId(20), 500))
+        );
+
+        outgoing.clear();
+        pending.insert(
+            client_id,
+            PendingLocalFile {
+                path: path.clone(),
+                dimensions: Some((4, 3)),
+            },
+        );
+        let (metadata, local) = correlate_upload_accepted(
+            &mut outgoing,
+            &mut pending,
+            client_id,
+            accepted_file_metadata(),
+        )
+        .expect("completion waiting for acceptance");
+        assert_eq!(
+            (metadata.transfer_id, metadata.timestamp_ms),
+            (FileTransferId(20), 500)
+        );
+        assert_eq!(local.dimensions, Some((4, 3)));
+        assert!(!pending.contains_key(&client_id));
+        let _ = fs::remove_file(path);
     }
 
     #[test]

@@ -187,6 +187,12 @@ pub enum ServerControl {
         file: FileMetadata,
         contents: bool,
     },
+    /// Maps an uploader's connection-local transfer id to the durable identity
+    /// assigned by the server and used by the room's chat announcement.
+    UploadFileAccepted {
+        client_transfer_id: FileTransferId,
+        file: FileMetadata,
+    },
     FileChunk {
         transfer_id: FileTransferId,
         offset: u64,
@@ -924,6 +930,22 @@ mod tests {
         };
         let encoded = encode_client_control(&control).unwrap();
         assert_eq!(decode_client_control(&encoded).unwrap(), control);
+
+        let accepted = ServerControl::UploadFileAccepted {
+            client_transfer_id: FileTransferId(9),
+            file: FileMetadata {
+                transfer_id: FileTransferId(17),
+                room_id: RoomId(2),
+                sender: UserId(3),
+                sender_name: "alice".to_string(),
+                file_name: "report.pdf".to_string(),
+                original_name: "report.pdf".to_string(),
+                size: 1234,
+                timestamp_ms: 55,
+            },
+        };
+        let encoded = encode_server_control(&accepted);
+        assert_eq!(decode_server_control(&encoded).unwrap(), accepted);
     }
 
     #[test]
