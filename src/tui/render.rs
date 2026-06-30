@@ -559,24 +559,25 @@ fn room_user_voice_feedback_label(app: &App, participant: &ParticipantState) -> 
     if !participant.voice_active || feedback.updated_at.elapsed() > Duration::from_secs(10) {
         return String::new();
     }
-    if app.lobby_details {
-        return format!(
-            "loss{} jb{}/{} r{} j{}",
-            feedback.loss_percent,
-            feedback.max_neteq_playout_delay_ms,
-            feedback.max_neteq_target_ms,
-            feedback.max_output_ring_ms,
-            feedback.max_interarrival_jitter_ms
-        );
-    }
-    // Collapsed default: a single mouth-to-ear-ish latency estimate. A directly
-    // connected peer uses its own measured RTT; everyone else rides the relay, so
-    // the shared server RTT is the network leg.
+    // A directly connected peer uses its own measured RTT, everyone else rides
+    // the relay so the shared server RTT is the network leg. Halved to one-way.
     let rtt_ms = if participant.p2p_direct {
         participant.peer_rtt_ms
     } else {
         app.server_rtt_ms
     };
+    if app.lobby_details {
+        return format!(
+            "loss{} jb{}/{} r{} j{} net{}",
+            feedback.loss_percent,
+            feedback.max_neteq_playout_delay_ms,
+            feedback.max_neteq_target_ms,
+            feedback.max_output_ring_ms,
+            feedback.max_interarrival_jitter_ms,
+            rtt_ms.unwrap_or(0) / 2
+        );
+    }
+    // Collapsed default: a single mouth-to-ear-ish latency estimate.
     format!("~{}ms", participant_latency_estimate_ms(&feedback, rtt_ms))
 }
 
