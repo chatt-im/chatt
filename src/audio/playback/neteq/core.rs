@@ -973,6 +973,22 @@ impl NetEqCore {
         if self.generated_noise_stopwatch.is_none() {
             self.generated_noise_stopwatch = Some(self.tick_timer.new_stopwatch());
         }
+        // Fast path for an idle stream. Once Expand has muted to silence and no
+        // comfort-noise floor is active, every synthesized concealment sample is
+        // exactly zero, so the LPC synthesis, the full-history copy, and the
+        // per-call allocations are wasted work. Shift in reused silence instead.
+        // The output is bit-identical to the synthesized path and resume stays
+        // faithful: a returning packet still merges against the zero tail exactly
+        // as it would have against the muted (×0) synthesis.
+        if self.concealment.muted_silent() {
+            let target = OUTPUT_SIZE_SAMPLES + EXPAND_OVERLAP_LENGTH;
+            let future = self.sync_buffer.future_length();
+            if future < target {
+                self.sync_buffer.push_back_zeros(target - future);
+            }
+            self.last_mode = Mode::Expand;
+            return;
+        }
         let mut guard = 0;
         while self
             .sync_buffer
@@ -980,7 +996,11 @@ impl NetEqCore {
             .saturating_sub(EXPAND_OVERLAP_LENGTH)
             < OUTPUT_SIZE_SAMPLES
         {
-            self.copy_history();
+            // Only the first chunk of a run reads the history; later chunks
+            // extrapolate from cached parameters, so skip the full-history copy.
+            if self.concealment.needs_history() {
+                self.copy_history();
+            }
             let chunk = self.concealment.expand_chunk(&self.history_scratch);
             if chunk.samples.is_empty() {
                 // No history to extrapolate from: emit silence to make progress.
@@ -1265,6 +1285,51 @@ mod tests {
         }
         assert!(saw_expand, "starvation did not produce expand");
         assert!(saw_muted, "expand never reached the muted state");
+    }
+
+    #[test]
+    fn muted_silence_emits_zero_then_resumes() {
+        let mut core = NetEqCore::new(LiveAudioTuning::default()).unwrap();
+        let mut encoder = OpusVoiceEncoder::new(32_000).unwrap();
+        let mut output = vec![0.0; OUTPUT_SIZE_SAMPLES];
+        // Prime with real frames, then starve the core until it mutes.
+        for seq in 0..6u32 {
+            let payload = encode_tone(&mut encoder, seq as usize * LIVE_OPUS_FRAME_SAMPLES);
+            core.insert_packet(seq * LIVE_OPUS_FRAME_SAMPLES as u32, seq, 0, &payload);
+            core.get_audio(&mut output);
+        }
+        let mut muted = false;
+        for _ in 0..400 {
+            if core.get_audio(&mut output).muted {
+                muted = true;
+                break;
+            }
+        }
+        assert!(muted, "expand never reached the muted state");
+
+        // Once muted with no comfort-noise floor, the fast path is taken and
+        // every concealment block is exactly silent.
+        for _ in 0..50 {
+            let result = core.get_audio(&mut output);
+            assert!(result.muted, "stream left the muted state while starved");
+            assert!(
+                output.iter().all(|sample| *sample == 0.0),
+                "muted concealment emitted non-zero audio"
+            );
+        }
+
+        // A resuming talkspurt still merges back to audible output.
+        let mut resumed = false;
+        for seq in 6..40u32 {
+            let payload = encode_tone(&mut encoder, seq as usize * LIVE_OPUS_FRAME_SAMPLES);
+            core.insert_packet(seq * LIVE_OPUS_FRAME_SAMPLES as u32, seq, 0, &payload);
+            core.get_audio(&mut output);
+            if output.iter().any(|sample| sample.abs() > 1e-3) {
+                resumed = true;
+                break;
+            }
+        }
+        assert!(resumed, "stream never resumed audible output after muting");
     }
 
     #[test]

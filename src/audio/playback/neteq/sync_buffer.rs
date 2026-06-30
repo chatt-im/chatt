@@ -89,6 +89,26 @@ impl SyncBuffer {
         self.next_index = self.next_index.saturating_sub(added);
     }
 
+    /// Shifts `count` zeros in at the back, dropping the same number from the
+    /// front so the size stays constant. Equivalent to `push_back` with a
+    /// `count`-long all-zero slice, but never allocates a temporary buffer. Used
+    /// by the muted-silence concealment fast path.
+    pub(crate) fn push_back_zeros(&mut self, count: usize) {
+        let len = self.data.len();
+        let added = count.min(len);
+        if added == 0 {
+            return;
+        }
+        if added == len {
+            self.data.fill(0.0);
+            self.next_index = 0;
+            return;
+        }
+        self.data.copy_within(added.., 0);
+        self.data[len - added..].fill(0.0);
+        self.next_index = self.next_index.saturating_sub(added);
+    }
+
     /// Inserts `length` zeros at `position`, purging `length` samples from the
     /// end to keep the size constant. Port of `InsertZerosAtIndex`.
     pub(crate) fn insert_zeros_at_index(&mut self, length: usize, position: usize) {
@@ -220,6 +240,24 @@ mod tests {
         assert_eq!(buffer.data(), &[3.0, 4.0, 5.0, 6.0]);
         assert_eq!(buffer.next_index(), 0);
         assert_eq!(buffer.future_length(), 4);
+    }
+
+    #[test]
+    fn push_back_zeros_matches_push_back_of_zeros() {
+        for count in [0usize, 1, 3, 8, 9, 20] {
+            let mut zeros = SyncBuffer::new(8);
+            let mut slice = SyncBuffer::new(8);
+            zeros.push_back(&[1.0, 2.0, 3.0, 4.0]);
+            slice.push_back(&[1.0, 2.0, 3.0, 4.0]);
+            zeros.push_back_zeros(count);
+            slice.push_back(&vec![0.0; count]);
+            assert_eq!(zeros.data(), slice.data(), "data mismatch at count {count}");
+            assert_eq!(
+                zeros.next_index(),
+                slice.next_index(),
+                "next_index mismatch at count {count}"
+            );
+        }
     }
 
     #[test]

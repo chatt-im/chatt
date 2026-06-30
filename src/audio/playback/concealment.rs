@@ -198,6 +198,25 @@ impl NetEqConcealment {
         self.expand.muted()
     }
 
+    /// True when Expand has muted to silence *and* no comfort-noise floor is
+    /// being rendered. In this state every concealment sample is exactly zero:
+    /// `apply_progressive_mute` scales the voiced/unvoiced excitation by a
+    /// `mute_factor` of 0, and an uninitialized [`BackgroundNoise`] contributes
+    /// nothing. The noise-suppressed capture path keeps background noise
+    /// uninitialized, so an idle stream stays here. Lets the GetAudio loop emit
+    /// reused silence instead of re-synthesizing zero every 10 ms tick.
+    pub(crate) fn muted_silent(&self) -> bool {
+        self.expand.muted() && !self.background_noise.initialized
+    }
+
+    /// True when the next [`expand_chunk`](Self::expand_chunk) reads the decode
+    /// history to derive its pitch and LPC parameters. Only the first expand of a
+    /// concealment run analyzes the history; later chunks extrapolate from cached
+    /// state and ignore it, so the caller can skip copying the history then.
+    pub(crate) fn needs_history(&self) -> bool {
+        self.expand.first_expand
+    }
+
     /// The current expand mute factor in Q14 (16384 == 1.0), as the NetEQ
     /// decision logic reads it via `Expand::MuteFactor`. Used to populate
     /// [`crate::audio::playback::neteq`]'s decision status snapshot.
