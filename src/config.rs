@@ -7,7 +7,7 @@ use toml_spanner::{Arena, Item};
 
 use crate::{
     audio::{
-        BufferRequest, DenoiseConfig, DenoiseSuppression, DenoiseTypingSuppression,
+        BufferRequest, DenoiseConfig, DenoiseSuppression, DenoiseTypingSuppression, DredConfig,
         LiveAudioPacketLossProfile, LiveAudioTuning, NotificationSound,
     },
     bindings::BindingRuntime,
@@ -144,6 +144,8 @@ pub struct AudioConfig {
     pub bitrate_bps: i32,
     #[toml(default)]
     pub denoise: DenoiseConfig,
+    #[toml(default)]
+    pub dred: DredConfig,
     #[toml(default = false)]
     pub echo_cancellation: bool,
     #[toml(default = DEFAULT_MAX_AMPLIFICATION)]
@@ -193,6 +195,7 @@ impl Default for AudioConfig {
             output_device_id: None,
             bitrate_bps: 48_000,
             denoise: DenoiseConfig::RnnNoise,
+            dred: DredConfig::default(),
             echo_cancellation: false,
             max_amplification: DEFAULT_MAX_AMPLIFICATION,
             denoise_suppression: DEFAULT_DENOISE_SUPPRESSION,

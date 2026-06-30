@@ -14,6 +14,10 @@ pub(crate) struct OpusVoiceEncoder {
     encoder: NonNull<opus_codec::OpusEncoder>,
     bitrate_bps: i32,
     dred_duration_10ms: i32,
+    /// DRED budget (in 10 ms units) the live encoder profile re-applies. Set
+    /// once from the client's DRED config so `Off` keeps `0` across profile
+    /// changes while `Auto`/`On` keep the full budget.
+    configured_dred_10ms: i32,
     packet_loss_percent: i32,
     inband_fec: bool,
 }
@@ -41,6 +45,7 @@ impl OpusVoiceEncoder {
             encoder,
             bitrate_bps,
             dred_duration_10ms: 0,
+            configured_dred_10ms: 100,
             packet_loss_percent: 0,
             inband_fec: false,
         };
@@ -143,6 +148,13 @@ impl OpusVoiceEncoder {
         )
     }
 
+    /// Sets the DRED budget the live encoder profile re-applies, and applies it
+    /// now. Called once from the capture path with the client's DRED config.
+    pub(crate) fn set_configured_dred_10ms(&mut self, duration_10ms: i32) -> Result<(), String> {
+        self.configured_dred_10ms = duration_10ms;
+        self.set_dred_duration_10ms(duration_10ms)
+    }
+
     fn set_dred_duration_10ms(&mut self, duration_10ms: i32) -> Result<(), String> {
         self.control(
             opus_codec::OPUS_SET_DRED_DURATION_REQUEST,
@@ -178,7 +190,7 @@ impl OpusVoiceEncoder {
         &mut self,
         profile: LiveEncoderProfile,
     ) -> Result<(), String> {
-        self.set_dred_duration_10ms(100)?;
+        self.set_dred_duration_10ms(self.configured_dred_10ms)?;
         self.set_inband_fec(true)?;
         self.set_packet_loss_percent(profile.packet_loss_percent)
     }
@@ -314,6 +326,21 @@ mod tests {
 
         assert_eq!(encoder.bitrate_bps, 96_000);
         assert_eq!(encoder.packet_loss_percent, 60);
+    }
+
+    #[test]
+    fn configured_dred_off_survives_profile_application() {
+        let mut encoder = OpusVoiceEncoder::new(48_000).unwrap();
+        encoder.set_configured_dred_10ms(0).unwrap();
+        assert_eq!(encoder.dred_duration_10ms, 0);
+
+        encoder
+            .apply_live_encoder_profile(LiveEncoderProfile::DRED_20)
+            .unwrap();
+        assert_eq!(encoder.dred_duration_10ms, 0);
+
+        encoder.reset_state().unwrap();
+        assert_eq!(encoder.dred_duration_10ms, 0);
     }
 
     /// Diagnostic, not a pass/fail gate. Run with:

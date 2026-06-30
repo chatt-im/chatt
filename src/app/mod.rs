@@ -398,6 +398,7 @@ fn audio_restart_flags(old: &config::AudioConfig, new: &config::AudioConfig) -> 
     let capture = old.input_device_id != new.input_device_id
         || old.bitrate_bps != new.bitrate_bps
         || old.denoise != new.denoise
+        || old.dred != new.dred
         || old.denoise_suppression != new.denoise_suppression
         || old.denoise_release != new.denoise_release
         || old.denoise_typing_suppression != new.denoise_typing_suppression
@@ -3105,6 +3106,7 @@ impl App {
             input_device_id,
             bitrate_bps: self.config.audio.bitrate_bps,
             denoise: self.config.audio.denoise,
+            dred: self.config.audio.dred,
             max_amplification: self.config.audio.max_amplification,
             suppression: self.config.audio.suppression(),
             typing_suppression: self.config.audio.typing_suppression(),
@@ -3688,6 +3690,10 @@ mod tests {
         denoise.denoise = audio::DenoiseConfig::None;
         let denoise_changed = denoise.denoise != base.denoise;
         assert_eq!(audio_restart_flags(&base, &denoise).0, denoise_changed);
+
+        let mut dred = base.clone();
+        dred.dred = audio::DredConfig::Off;
+        assert_eq!(audio_restart_flags(&base, &dred), (true, false));
 
         let mut typing_suppression = base.clone();
         typing_suppression.denoise_typing_suppression = !base.denoise_typing_suppression;

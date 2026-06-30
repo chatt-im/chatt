@@ -49,6 +49,43 @@ impl DenoiseConfig {
     }
 }
 
+/// Whether this client embeds Opus DRED (Deep REDundancy) in the voice it
+/// sends, letting peers reconstruct lost packets from in-band redundancy.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Toml)]
+#[toml(FromToml, ToToml, rename_all = "kebab-case")]
+pub enum DredConfig {
+    /// Embed no DRED in outgoing audio.
+    Off,
+    /// Adaptive DRED. Currently identical to [`DredConfig::On`].
+    #[default]
+    Auto,
+    /// Always embed DRED.
+    On,
+}
+
+impl DredConfig {
+    /// Settings in cycle order for the settings control.
+    pub const ALL: [DredConfig; 3] = [DredConfig::Off, DredConfig::Auto, DredConfig::On];
+
+    /// DRED frame budget in 10 ms units applied to the encoder. `Auto` and `On`
+    /// keep the 100 (1 s) budget, `Off` disables DRED.
+    pub fn dred_duration_10ms(self) -> i32 {
+        match self {
+            DredConfig::Off => 0,
+            DredConfig::Auto | DredConfig::On => 100,
+        }
+    }
+
+    /// Short label for the settings UI.
+    pub fn label(self) -> &'static str {
+        match self {
+            DredConfig::Off => "off",
+            DredConfig::Auto => "auto",
+            DredConfig::On => "on",
+        }
+    }
+}
+
 pub const SAMPLE_RATE: u32 = 48_000;
 pub const CHANNELS: u8 = 1;
 pub const FRAME_SAMPLES: usize = DenoiseState::FRAME_SIZE;
