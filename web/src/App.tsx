@@ -3,6 +3,7 @@ import { Virtualizer, type VirtualizerHandle } from "./vendor/virtua/solid/Virtu
 import type { WebMessage, ServerEnvelope, ClientRequest, ShareInfo } from "./types";
 import ScreenShare from "./ScreenShare";
 import { ScreenShareDecoder, parseFrame } from "./video-decode";
+import { renderMarkdown } from "./markdown";
 
 // Pixel tolerance when deciding the view is "at the bottom". Scroll positions
 // are fractional, so an exact comparison would intermittently read as
@@ -14,6 +15,10 @@ const TOP_THRESHOLD = 200;
 
 // How many older messages one paging request asks for.
 const PAGE = 100;
+
+// Consecutive messages from one sender within this window collapse into a group:
+// only the first carries the sender/time header (Discord-style).
+const GROUP_WINDOW_MS = 5 * 60 * 1000;
 
 const DEFAULT_SHARE_PANE_HEIGHT = 360;
 const MIN_SHARE_PANE_HEIGHT = 160;
@@ -71,15 +76,31 @@ function Attachment(props: { message: WebMessage }) {
   );
 }
 
-function MessageRow(props: { message: WebMessage }) {
+function MessageRow(props: { message: WebMessage; prev?: WebMessage }) {
+  // A continuation hides the header and shows its time only on hover, in the
+  // reserved left gutter. `prev` is supplied reactively from the message list,
+  // so prepended history re-evaluates the boundary row's grouping.
+  const continuation = () => {
+    const prev = props.prev;
+    const msg = props.message;
+    return (
+      !!prev &&
+      prev.sender === msg.sender &&
+      msg.timestamp_ms - prev.timestamp_ms < GROUP_WINDOW_MS
+    );
+  };
   return (
-    <div class="message">
-      <div class="message-meta">
-        <span class="message-sender">{props.message.sender}</span>
-        <span class="message-time">{formatTime(props.message.timestamp_ms)}</span>
-      </div>
+    <div class="message" classList={{ "is-continuation": continuation() }}>
+      {/* The time always lives in the left gutter so it sits in one consistent
+        * column: shown on a group's first row, revealed on hover for the rest. */}
+      <span class="message-time-gutter">{formatTime(props.message.timestamp_ms)}</span>
+      <Show when={!continuation()}>
+        <div class="message-meta">
+          <span class="message-sender">{props.message.sender}</span>
+        </div>
+      </Show>
       <Show when={props.message.body}>
-        <div class="message-body">{props.message.body}</div>
+        <div class="message-body" innerHTML={renderMarkdown(props.message.body)} />
       </Show>
       <Show when={props.message.attachment}>
         <Attachment message={props.message} />
@@ -482,13 +503,10 @@ export default function App() {
   });
 
   return (
-    <div class="app" classList={{ "is-share-fullscreen": fullscreenStream() !== null }}>
-      <header class="app-header">
-        <span class="app-title">chatt</span>
-        <span class="conn-status" classList={{ "is-online": connected() }}>
-          {connected() ? "live" : "offline"}
-        </span>
-      </header>
+    <div class="app">
+      <Show when={!connected()}>
+        <div class="conn-overlay">offline — reconnecting…</div>
+      </Show>
       <main
         class="app-main"
         classList={{
@@ -510,18 +528,21 @@ export default function App() {
               onToggleFullscreen={toggleShareFullscreen}
               canvasRef={registerCanvas}
             />
+            {/* Drag the bottom edge of the black video area to resize the chat
+              * below. The grabber overlays the pane's lower edge; no separator
+              * line is drawn. */}
+            <Show when={hasVideoPane()}>
+              <div
+                class="pane-resize"
+                role="separator"
+                aria-label="Resize chat"
+                aria-orientation="horizontal"
+                tabIndex={0}
+                onPointerDown={beginPaneResize}
+                onKeyDown={onDividerKeyDown}
+              />
+            </Show>
           </section>
-          <Show when={hasVideoPane()}>
-            <div
-              class="pane-divider"
-              role="separator"
-              aria-label="Resize chat"
-              aria-orientation="horizontal"
-              tabIndex={0}
-              onPointerDown={beginPaneResize}
-              onKeyDown={onDividerKeyDown}
-            />
-          </Show>
         </Show>
         <div
           class="chat-log"
@@ -532,7 +553,6 @@ export default function App() {
           onPointerDown={markUser}
           onKeyDown={onKeyDown}
         >
-          <div class="chat-log-spacer" />
           <div class="chat-log-content" ref={contentEl}>
             <Virtualizer
               ref={(h) => (handle = h)}
@@ -542,7 +562,9 @@ export default function App() {
               onScroll={onScroll}
               onScrollEnd={onScrollEnd}
             >
-              {(message) => <MessageRow message={message} />}
+              {(message, index) => (
+                <MessageRow message={message} prev={messages()[index() - 1]} />
+              )}
             </Virtualizer>
           </div>
         </div>

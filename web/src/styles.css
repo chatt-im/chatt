@@ -1,28 +1,31 @@
 /*
  * Chatt web chat-log styles.
  *
- * Flat, dark, hueless greys. Rectangular, no rounding. Restyle by overriding
- * the custom properties under :root. Class names are semantic and stable so
- * users can target them directly.
+ * Flat, dark, hueless greys. Rectangular, no rounding. Proportional type for
+ * prose; monospace is reserved for code. Restyle by overriding the custom
+ * properties under :root. Class names are semantic and stable so users can
+ * target them directly.
  */
 
 :root {
   --bg: #161616;
   --bg-elevated: #1d1d1d;
-  --bg-header: #121212;
+  --bg-code: #0e0e0e;
   --border: #2a2a2a;
   --text: #d8d8d8;
   --text-dim: #8a8a8a;
   --text-sender: #f0f0f0;
   --accent: #4a4a4a;
-  --accent-live: #7ec77e;
+  --warn: #d98a8a;
 
   --space: 8px;
   --space-lg: 16px;
+  --gutter: 56px;
   --media-video-height: 240px;
-  --font: "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace;
-  --font-size: 14px;
-  --line-height: 1.5;
+  --font: system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  --font-mono: "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace;
+  --font-size: 15px;
+  --line-height: 1.45;
 
   color-scheme: dark;
 }
@@ -47,36 +50,24 @@ body {
 }
 
 .app {
+  position: relative;
   display: flex;
   flex-direction: column;
   height: 100%;
 }
 
-.app-header {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  padding: var(--space) var(--space-lg);
-  background: var(--bg-header);
-  border-bottom: 1px solid var(--border);
-  flex: 0 0 auto;
-}
-
-.app-title {
-  color: var(--text-sender);
-  font-weight: 600;
-  letter-spacing: 0.05em;
-}
-
-.conn-status {
-  color: var(--text-dim);
+/* Shown only while disconnected: a small pill pinned to the top-left, floating
+ * over the chat rather than occupying a permanent header bar. */
+.conn-overlay {
+  position: absolute;
+  top: var(--space);
+  left: var(--space);
+  z-index: 10;
+  padding: 4px 10px;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border);
+  color: var(--warn);
   font-size: 12px;
-  text-transform: uppercase;
-  letter-spacing: 0.08em;
-}
-
-.conn-status.is-online {
-  color: var(--accent-live);
 }
 
 .app-main {
@@ -87,31 +78,35 @@ body {
   background: var(--bg);
 }
 
+/* The whole share area is one solid black block; its bottom edge is the resize
+ * grabber (.pane-resize), so no separator line is drawn between it and the chat. */
 .share-pane {
+  position: relative;
   display: flex;
-  min-height: 0;
+  background: #000;
 }
 
 .app-main.has-video-pane .share-pane {
   flex: 0 0 var(--share-pane-height);
 }
 
-.pane-divider {
-  flex: 0 0 9px;
-  background: var(--bg);
-  border-top: 1px solid var(--border);
-  border-bottom: 1px solid var(--border);
+/* Invisible row-resize strip overlaying the lower edge of the black pane. It
+ * only reveals a faint bar on hover/focus. */
+.pane-resize {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  height: 8px;
+  z-index: 2;
+  background: transparent;
   cursor: row-resize;
 }
 
-.pane-divider:hover,
-.pane-divider:focus-visible {
-  border-color: var(--accent);
+.pane-resize:hover,
+.pane-resize:focus-visible {
+  background: var(--accent);
   outline: none;
-}
-
-.app.is-share-fullscreen .app-header {
-  display: none;
 }
 
 .app-main.is-share-fullscreen,
@@ -124,7 +119,7 @@ body {
   flex: 1 1 auto;
 }
 
-.app-main.is-share-fullscreen .pane-divider,
+.app-main.is-share-fullscreen .pane-resize,
 .app-main.is-share-fullscreen .chat-log {
   display: none;
 }
@@ -142,12 +137,6 @@ body {
   overflow-anchor: none;
 }
 
-/* Bottom-aligns the messages when they do not fill the viewport. Collapses to
- * zero once the content overflows, so it never offsets virtua's scroll math. */
-.chat-log-spacer {
-  flex: 1 1 auto;
-}
-
 /* Wraps the Virtualizer so a ResizeObserver can watch it grow (new messages,
  * media decode) and keep the autoscroll pinned. virtua absolutely-positions its
  * items, so message spacing lives inside the measured item, not here. */
@@ -155,17 +144,23 @@ body {
   flex: 0 0 auto;
 }
 
+/* Flat, Discord-style rows: no card, no border. A fixed left gutter is reserved
+ * for the hover timestamp so revealing it never shifts layout. Spacing is
+ * padding, not margin: child margins are excluded from the contentRect virtua
+ * measures, which would desync item sizes. */
 .message {
-  display: flex;
-  flex-direction: column;
-  gap: 2px;
-  padding: var(--space);
-  /* Inter-message spacing is padding, not margin: child margins are excluded
-   * from the contentRect virtua measures, which would desync item sizes. */
-  padding-bottom: calc(var(--space) * 2);
-  margin: 0 var(--space-lg);
+  position: relative;
+  padding: 1px var(--space-lg) 1px var(--gutter);
+}
+
+/* The first message of a group gets extra headroom to separate it from the one
+ * above; continuations stay tight. */
+.message:not(.is-continuation) {
+  padding-top: var(--space);
+}
+
+.message:hover {
   background: var(--bg-elevated);
-  border-left: 2px solid var(--border);
 }
 
 .message-meta {
@@ -179,14 +174,97 @@ body {
   font-weight: 600;
 }
 
-.message-time {
+/* The timestamp always occupies the reserved gutter as a single right-aligned
+ * column. Absolute, so revealing it never affects layout or virtua's measure. */
+.message-time-gutter {
+  position: absolute;
+  left: 0;
+  top: 1px;
+  width: var(--gutter);
+  padding-right: var(--space);
+  text-align: right;
   color: var(--text-dim);
-  font-size: 12px;
+  font-size: 11px;
+  /* Match the content's line-box height so the smaller time sits centered on
+   * the same line as the sender/body text it labels, rather than riding high. */
+  line-height: calc(var(--font-size) * var(--line-height));
+  opacity: 0;
+}
+
+/* On a group's first row the time is always shown and aligns with the sender
+ * line; on continuations it is revealed only on hover. */
+.message:not(.is-continuation) .message-time-gutter {
+  top: var(--space);
+  opacity: 1;
+}
+
+.message:hover .message-time-gutter {
+  opacity: 1;
 }
 
 .message-body {
-  white-space: pre-wrap;
   word-break: break-word;
+}
+
+/* Markdown output. Margins are tight so multi-paragraph messages stay compact. */
+.message-body p {
+  margin: 0;
+}
+
+.message-body p + p,
+.message-body ul,
+.message-body ol,
+.message-body blockquote,
+.message-body pre {
+  margin: 0.35em 0 0;
+}
+
+.message-body ul,
+.message-body ol {
+  padding-left: 1.4em;
+}
+
+.message-body blockquote {
+  padding-left: 0.8em;
+  border-left: 3px solid var(--border);
+  color: var(--text-dim);
+}
+
+.message-body h1,
+.message-body h2,
+.message-body h3,
+.message-body h4 {
+  margin: 0.4em 0 0.2em;
+  font-size: 1.05em;
+}
+
+.message-body a {
+  color: var(--text-sender);
+  text-decoration: underline;
+}
+
+.message-body img {
+  max-width: 100%;
+}
+
+/* Code is the one place monospace lives. */
+.message-body code {
+  font-family: var(--font-mono);
+  font-size: 0.88em;
+  background: rgba(255, 255, 255, 0.08);
+  padding: 1px 4px;
+}
+
+.message-body pre {
+  padding: var(--space);
+  background: var(--bg-code);
+  border: 1px solid var(--border);
+  overflow-x: auto;
+}
+
+.message-body pre code {
+  background: none;
+  padding: 0;
 }
 
 .message-media {
@@ -243,13 +321,10 @@ body {
 .screenshare {
   display: flex;
   flex-direction: column;
-  gap: var(--space);
   flex: 1 1 auto;
   min-height: 0;
   overflow: hidden;
-  padding: var(--space);
-  border-bottom: 1px solid var(--border);
-  background: var(--bg);
+  background: #000;
 }
 
 .screenshare-item {
@@ -257,7 +332,6 @@ body {
   flex: 1 1 0;
   flex-direction: column;
   min-height: 0;
-  gap: var(--space);
   overflow: hidden;
 }
 
@@ -271,6 +345,7 @@ body {
   gap: var(--space);
   flex: 0 0 auto;
   min-width: 0;
+  padding: var(--space) var(--space-lg);
 }
 
 .screenshare-sender {
@@ -301,8 +376,9 @@ body {
 }
 
 .screenshare-error {
-  color: #d98a8a;
+  color: var(--warn);
   font-size: 0.9em;
+  padding: 0 var(--space-lg) var(--space);
 }
 
 .screenshare-zoom {
@@ -319,7 +395,6 @@ body {
   position: relative;
   overflow: hidden;
   background: #000;
-  border: 1px solid var(--border);
   cursor: grab;
   touch-action: none;
   user-select: none;
@@ -343,20 +418,4 @@ body {
   background: #000;
   transform-origin: 0 0;
   will-change: transform;
-}
-
-.app-main.is-share-fullscreen .screenshare {
-  gap: 0;
-  padding: 0;
-  border-bottom: 0;
-}
-
-.app-main.is-share-fullscreen .screenshare-row {
-  padding: var(--space) var(--space-lg);
-  background: var(--bg-header);
-  border-bottom: 1px solid var(--border);
-}
-
-.app-main.is-share-fullscreen .screenshare-viewport {
-  border: 0;
 }
