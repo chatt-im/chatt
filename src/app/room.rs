@@ -1,3 +1,5 @@
+use std::collections::VecDeque;
+
 use hashbrown::{HashMap, HashSet};
 
 use extui::Style;
@@ -21,6 +23,9 @@ use super::{Participants, commands::CommandCompletionState};
 
 pub(crate) struct RoomSession {
     pub server_alias: String,
+    /// Stable per-server storage id for history, independent of the mutable
+    /// alias and endpoint. Empty when not connected, which disables persistence.
+    history_id: String,
     pub local_user_name: String,
     pub room_name: String,
     pub composer: Editor,
@@ -33,7 +38,56 @@ pub(crate) struct RoomSession {
     stream_users: HashMap<u32, UserId>,
     volume_preview: Option<(UserId, f32)>,
     history: Option<RoomHistoryStore>,
-    seen: HashSet<(u64, u64)>,
+    seen: BoundedKeySet,
+}
+
+/// Bounded membership set of `(timestamp_ms, message_id)` keys that evicts the
+/// oldest inserted key once full. It mirrors the chat buffer's message cap so
+/// live-message dedup state cannot outgrow the visible scrollback, even when a
+/// peer keeps sending or a long join history is loaded.
+struct BoundedKeySet {
+    keys: HashSet<(u64, u64)>,
+    order: VecDeque<(u64, u64)>,
+    capacity: usize,
+}
+
+impl BoundedKeySet {
+    fn with_capacity(capacity: usize) -> Self {
+        Self {
+            keys: HashSet::new(),
+            order: VecDeque::new(),
+            capacity: capacity.max(1),
+        }
+    }
+
+    /// Inserts `key`, evicting the oldest key when over capacity. Returns whether
+    /// the key was newly inserted.
+    fn insert(&mut self, key: (u64, u64)) -> bool {
+        if !self.keys.insert(key) {
+            return false;
+        }
+        self.order.push_back(key);
+        while self.order.len() > self.capacity {
+            if let Some(evicted) = self.order.pop_front() {
+                self.keys.remove(&evicted);
+            }
+        }
+        true
+    }
+
+    fn set_capacity(&mut self, capacity: usize) {
+        self.capacity = capacity.max(1);
+        while self.order.len() > self.capacity {
+            if let Some(evicted) = self.order.pop_front() {
+                self.keys.remove(&evicted);
+            }
+        }
+    }
+
+    fn clear(&mut self) {
+        self.keys.clear();
+        self.order.clear();
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -109,6 +163,7 @@ impl RoomSession {
 
         Self {
             server_alias: String::new(),
+            history_id: String::new(),
             local_user_name: String::new(),
             room_name: "servers".to_string(),
             composer,
@@ -121,7 +176,7 @@ impl RoomSession {
             stream_users: HashMap::new(),
             volume_preview: None,
             history: None,
-            seen: HashSet::new(),
+            seen: BoundedKeySet::with_capacity(config.ui.max_messages as usize),
         }
     }
 
@@ -160,8 +215,14 @@ impl RoomSession {
         self.command_completion.complete(&mut self.composer)
     }
 
-    pub(crate) fn connect_to_server(&mut self, server_alias: String, local_user_name: String) {
+    pub(crate) fn connect_to_server(
+        &mut self,
+        server_alias: String,
+        history_id: String,
+        local_user_name: String,
+    ) {
         self.server_alias = server_alias;
+        self.history_id = history_id;
         self.local_user_name = local_user_name;
         self.room_name = "lobby".to_string();
         self.composer.enter_insert_mode();
@@ -169,6 +230,7 @@ impl RoomSession {
 
     pub(crate) fn reset_for_server_list(&mut self) {
         self.server_alias.clear();
+        self.history_id.clear();
         self.local_user_name.clear();
         self.room_name = "servers".to_string();
         self.history = None;
@@ -205,7 +267,7 @@ impl RoomSession {
         self.stream_users.clear();
         self.participants.replace_room(participants);
 
-        let opened = room_history::open(&self.server_alias, room_id);
+        let opened = room_history::open(&self.history_id, room_id);
         let loaded = opened.loaded;
         let disk_keys: HashSet<(u64, u64)> = loaded
             .messages
@@ -440,6 +502,7 @@ impl RoomSession {
 
     pub(super) fn set_max_messages(&mut self, max_messages: u32) {
         self.chat.set_max_messages(max_messages as usize);
+        self.seen.set_capacity(max_messages as usize);
     }
 
     pub(super) fn participant_names(&self) -> Option<String> {
