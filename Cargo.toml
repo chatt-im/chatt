@@ -23,6 +23,7 @@ chatt-p2p.path = "crates/p2p"
 darkhttp.path = "crates/darkhttp"
 mio = { version = "1.2.1", features = ["os-poll", "net"] }
 kvlog = "0.1.5"
+annotate-snippets = "0.12.10"
 toml-spanner = { version = "1.0.3", features = [
     "to-toml",
     "from-toml",
