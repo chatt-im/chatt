@@ -88,7 +88,8 @@ fn analyze(signal: &[i16], background_noise: &BackgroundNoise) -> Analysis {
     // Compensate for the down-sampled starting position.
     let peak_index = peak_index_arr[0] + MIN_LAG * FS_MULT * 2;
 
-    let scaling = (31 - spl::norm_w32(max_input_value.wrapping_mul(max_input_value)) as i32
+    let scaling = (31
+        - spl::norm_w32(max_input_value.wrapping_mul(max_input_value)) as i32
         - spl::norm_w32(peak_index as i32) as i32)
         .max(0);
 
@@ -98,8 +99,13 @@ fn analyze(signal: &[i16], background_noise: &BackgroundNoise) -> Analysis {
     let vec2_energy = spl::dot_product_with_scale(vec2, vec2, peak_index, scaling);
     let mut cross_corr = spl::dot_product_with_scale(vec1, vec2, peak_index, scaling);
 
-    let active_speech =
-        speech_detection(vec1_energy, vec2_energy, peak_index, scaling, background_noise);
+    let active_speech = speech_detection(
+        vec1_energy,
+        vec2_energy,
+        peak_index,
+        scaling,
+        background_noise,
+    );
 
     let mut best_correlation = 0i16;
     if active_speech {
@@ -134,8 +140,8 @@ fn speech_detection(
     scaling: i32,
     background_noise: &BackgroundNoise,
 ) -> bool {
-    let mut left_side =
-        ((vec1_energy as i64 + vec2_energy as i64) / 16).clamp(i32::MIN as i64, i32::MAX as i64) as i32;
+    let mut left_side = ((vec1_energy as i64 + vec2_energy as i64) / 16)
+        .clamp(i32::MIN as i64, i32::MAX as i64) as i32;
     let mut right_side = if background_noise.initialized() {
         background_noise.energy()
     } else {
@@ -166,8 +172,8 @@ fn cross_fade(out: &mut Vec<i16>, append: &[i16], fade_length: usize) {
     for i in 0..fade_length {
         alpha -= alpha_step;
         let idx = position + i;
-        out[idx] = ((alpha * out[idx] as i32 + (16384 - alpha) * append[i] as i32 + 8192) >> 14)
-            as i16;
+        out[idx] =
+            ((alpha * out[idx] as i32 + (16384 - alpha) * append[i] as i32 + 8192) >> 14) as i16;
     }
     out.extend_from_slice(&append[fade_length..]);
 }
@@ -188,7 +194,11 @@ pub(crate) fn accelerate_process(
     let peak_index = analysis.peak_index;
     let active_speech = analysis.active_speech;
 
-    let threshold = if fast_mode { 8192 } else { CORRELATION_THRESHOLD };
+    let threshold = if fast_mode {
+        8192
+    } else {
+        CORRELATION_THRESHOLD
+    };
     if (best_correlation as i32) > threshold || !active_speech {
         // The reported length change is the original peak; fast mode only
         // rescales the local copy used to build the stretched output.
@@ -231,9 +241,7 @@ pub(crate) fn preemptive_expand_process(
 ) -> StretchResult {
     // Length guard from PreemptiveExpand::Process (mono).
     let input_length = input.len();
-    if input_length < (2 * 120 - 1) * FS_MULT
-        || old_data_length >= input_length - overlap_samples
-    {
+    if input_length < (2 * 120 - 1) * FS_MULT || old_data_length >= input_length - overlap_samples {
         return StretchResult {
             output: input.to_vec(),
             return_code: ReturnCode::Error,
@@ -247,10 +255,7 @@ pub(crate) fn preemptive_expand_process(
         (analysis.best_correlation, analysis.peak_index)
     } else {
         // PreemptiveExpand::SetParametersForPassiveSpeech.
-        (
-            0,
-            analysis.peak_index.min(input_length - old_data_length),
-        )
+        (0, analysis.peak_index.min(input_length - old_data_length))
     };
 
     if ((best_correlation as i32) > CORRELATION_THRESHOLD && old_data_length <= FS_MULT_120)

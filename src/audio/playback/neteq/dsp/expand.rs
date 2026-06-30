@@ -9,7 +9,7 @@
 
 use super::background_noise::BackgroundNoise;
 use super::dsp_helper;
-use super::random_vector::{RandomVector, RANDOM_TABLE};
+use super::random_vector::{RANDOM_TABLE, RandomVector};
 use super::spl;
 
 const FS_HZ: i32 = 48000;
@@ -189,7 +189,12 @@ impl Expand {
         let mut unvoiced_array_memory = [0i16; NOISE_LPC_ORDER + 48000 / 8000 * 125];
 
         if self.first_expand {
-            self.analyze_signal(sync_buffer, background_noise, random_vector, &mut rng_buffer);
+            self.analyze_signal(
+                sync_buffer,
+                background_noise,
+                random_vector,
+                &mut rng_buffer,
+            );
             self.first_expand = false;
             self.expand_duration_samples = 0;
         } else {
@@ -209,8 +214,8 @@ impl Expand {
         match self.current_lag_index {
             0 => {
                 voiced_vector_storage.copy_from_slice(
-                    &self.params.expand_vector0
-                        [expansion_vector_position..expansion_vector_position + expansion_temp_length],
+                    &self.params.expand_vector0[expansion_vector_position
+                        ..expansion_vector_position + expansion_temp_length],
                 );
             }
             1 => {
@@ -254,11 +259,10 @@ impl Expand {
             let start_ix = sync_buffer.len() - OVERLAP_LENGTH;
             for i in 0..OVERLAP_LENGTH {
                 let sb = sync_buffer[start_ix + i] as i32;
-                let mixed = (self.params.mute_factor as i32 * voiced_vector_storage[i] as i32) >> 14;
-                sync_buffer[start_ix + i] = ((sb * muting_window
-                    + mixed * unmuting_window
-                    + 16384)
-                    >> 15) as i16;
+                let mixed =
+                    (self.params.mute_factor as i32 * voiced_vector_storage[i] as i32) >> 14;
+                sync_buffer[start_ix + i] =
+                    ((sb * muting_window + mixed * unmuting_window + 16384) >> 15) as i16;
                 muting_window += dsp_helper::MUTE_FACTOR_INCREMENT_48KHZ;
                 unmuting_window += dsp_helper::UNMUTE_FACTOR_INCREMENT_48KHZ;
             }
@@ -364,9 +368,8 @@ impl Expand {
             );
             if !self.stop_muting {
                 dsp_helper::mute_signal(&mut temp_data, self.params.mute_slope, current_lag);
-                let mut gain = (16384
-                    - (((current_lag as i32 * self.params.mute_slope) + 8192) >> 6))
-                    as i16;
+                let mut gain =
+                    (16384 - (((current_lag as i32 * self.params.mute_slope) + 8192) >> 6)) as i16;
                 gain = (((gain as i32 * self.params.mute_factor as i32) + 8192) >> 14) as i16;
                 if self.consecutive_expands > 3 && gain >= self.params.mute_factor {
                     self.params.mute_factor = 0;
@@ -499,7 +502,8 @@ impl Expand {
             );
             best_distortion_index[i] = idx;
             best_distortion_w32[i] = dist;
-            distortion_scale = (16 - spl::norm_w32(best_distortion_w32[i]) as i32).max(distortion_scale);
+            distortion_scale =
+                (16 - spl::norm_w32(best_distortion_w32[i]) as i32).max(distortion_scale);
         }
         let mut best_distortion = [0i16; NUM_CORRELATION_CANDIDATES];
         spl::vector_bit_shift_w32_to_w16(
@@ -542,7 +546,8 @@ impl Expand {
                 ..SIGNAL_LENGTH - correlation_length - start_index - correlation_lags
                     + (correlation_length + start_index + correlation_lags - 1)],
         );
-        let correlation_scale = ((31 - spl::norm_w32(signal_max as i32 * signal_max as i32) as i32)
+        let correlation_scale = ((31
+            - spl::norm_w32(signal_max as i32 * signal_max as i32) as i32)
             + (31 - spl::norm_w32(correlation_length as i32) as i32)
             - 31)
             .max(0);
@@ -588,8 +593,7 @@ impl Expand {
             let sqrt_energy_product = spl::sqrt_floor(scaled_energy1 * scaled_energy2) as i16;
             let cc_shift = 14 - (energy1_scale + energy2_scale) / 2;
             max_correlation = spl::shift_w32(max_correlation, cc_shift);
-            corr_coefficient =
-                spl::div_w32w16(max_correlation, sqrt_energy_product).min(16384);
+            corr_coefficient = spl::div_w32w16(max_correlation, sqrt_energy_product).min(16384);
         } else {
             corr_coefficient = 0;
         }
@@ -705,8 +709,9 @@ impl Expand {
             .ar_filter_state
             .copy_from_slice(&audio_history[SIGNAL_LENGTH - UNVOICED_LPC_ORDER..]);
         let mut unvoiced_buf = vec![0i16; UNVOICED_LPC_ORDER + 128];
-        unvoiced_buf[..UNVOICED_LPC_ORDER]
-            .copy_from_slice(&audio_history[SIGNAL_LENGTH - 128 - UNVOICED_LPC_ORDER..SIGNAL_LENGTH - 128]);
+        unvoiced_buf[..UNVOICED_LPC_ORDER].copy_from_slice(
+            &audio_history[SIGNAL_LENGTH - 128 - UNVOICED_LPC_ORDER..SIGNAL_LENGTH - 128],
+        );
         spl::filter_ma_fast_q12(
             &audio_history,
             (SIGNAL_LENGTH - 128) as isize,
@@ -716,14 +721,15 @@ impl Expand {
         );
         let unvoiced_vector = &unvoiced_buf[UNVOICED_LPC_ORDER..];
         let max_abs = spl::max_abs_value_w16(&unvoiced_vector[..128]);
-        let unvoiced_max_abs = if max_abs == i16::MAX { max_abs as i32 + 1 } else { max_abs as i32 };
-        let unvoiced_prescale = (2 * spl::get_size_in_bits(unvoiced_max_abs as u32) as i32 - 24).max(0);
-        let mut unvoiced_energy = spl::dot_product_with_scale(
-            unvoiced_vector,
-            unvoiced_vector,
-            128,
-            unvoiced_prescale,
-        );
+        let unvoiced_max_abs = if max_abs == i16::MAX {
+            max_abs as i32 + 1
+        } else {
+            max_abs as i32
+        };
+        let unvoiced_prescale =
+            (2 * spl::get_size_in_bits(unvoiced_max_abs as u32) as i32 - 24).max(0);
+        let mut unvoiced_energy =
+            spl::dot_product_with_scale(unvoiced_vector, unvoiced_vector, 128, unvoiced_prescale);
         let mut unvoiced_scale = spl::norm_w32(unvoiced_energy) - 3;
         unvoiced_scale += (unvoiced_scale & 0x1) ^ 0x1;
         unvoiced_energy = spl::shift_w32(unvoiced_energy, unvoiced_scale as i32);

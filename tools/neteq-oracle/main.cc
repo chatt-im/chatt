@@ -75,6 +75,30 @@ std::vector<int16_t> Sine(size_t n, double period, int amplitude) {
   return v;
 }
 
+// Reads a vector file written by Dump (or hand-authored): one decimal integer
+// per non-comment line. Used by CasePipeline to read the real-audio input that
+// the Rust test also reads, so both sides drive identical samples.
+std::vector<int16_t> LoadI16(const std::string& name) {
+  std::string path = g_out_dir + "/" + name + ".txt";
+  FILE* f = std::fopen(path.c_str(), "r");
+  if (!f) {
+    std::fprintf(stderr, "cannot open %s for reading\n", path.c_str());
+    std::exit(1);
+  }
+  std::vector<int16_t> out;
+  // getline reads whole lines regardless of length, so long comment lines are
+  // never split into spurious numeric fragments (a 64-byte fgets buffer was).
+  char* line = nullptr;
+  size_t cap = 0;
+  while (getline(&line, &cap, f) != -1) {
+    if (line[0] == '#' || line[0] == '\n' || line[0] == '\0') continue;
+    out.push_back(static_cast<int16_t>(std::atoi(line)));
+  }
+  std::free(line);
+  std::fclose(f);
+  return out;
+}
+
 template <typename T>
 void Dump(const std::string& name,
           const std::vector<std::string>& meta,
@@ -490,6 +514,219 @@ void CaseMerge() {
   Dump("merge_sync_after", {"sync buffer after merge"}, after);
 }
 
+// ---- whole-pipeline case --------------------------------------------------
+//
+// Drives a long, fixed operation tape over REAL decoded speech
+// (pipeline_audio_in.txt) through the actual WebRTC Expand/Merge/Normal/
+// Accelerate/PreemptiveExpand classes, sharing one BackgroundNoise and one
+// RandomVector exactly as NetEqImpl does. Each "tick" runs one operation, then
+// extracts one 10 ms block and reinstates the overlap lookahead, mirroring the
+// body of `NetEqCore::get_audio` and its `do_*` handlers in the Rust port. The
+// concatenation of every extracted block (plus the final sync buffer) is the
+// reference the Rust `pipeline_matches_oracle` test asserts byte-for-byte.
+//
+// This is a differential test of the DSP layer + sync buffer + shared
+// RNG/background-noise interplay over realistic input. The operation tape is
+// fixed (not NetEQ's decision logic, which the port intentionally does not
+// mirror), so both languages execute the identical sequence.
+
+namespace pipeline {
+
+constexpr int kFs = 48000;
+constexpr size_t kSync = 5760 + 60 * 48;  // 8640, SYNC_BUFFER_SAMPLES.
+constexpr size_t kOut = 480;              // 10 ms.
+constexpr size_t kOverlap = 30;           // Expand overlap lookahead.
+constexpr size_t kReq = 1440;             // 30 ms time-scale window.
+
+enum Op { N, E, M, A, FA, P };
+
+// Mirrors `Mode` insofar as the harness branches on it.
+enum LastMode {
+  LM_NORMAL,
+  LM_EXPAND,
+  LM_MERGE,
+  LM_ACC_SUCCESS,
+  LM_ACC_LOW,
+  LM_ACC_FAIL,
+  LM_PE_SUCCESS,
+  LM_PE_LOW,
+  LM_PE_FAIL,
+};
+
+void PushZeros(webrtc::SyncBuffer& sync, size_t count) {
+  if (count == 0) return;
+  webrtc::AudioMultiVector z(1);
+  std::vector<int16_t> zz(count, 0);
+  z.PushBackInterleaved(zz);
+  sync.PushBack(z);
+}
+
+void PushSamples(webrtc::SyncBuffer& sync, const std::vector<int16_t>& s) {
+  webrtc::AudioMultiVector v(1);
+  v.PushBackInterleaved(s);
+  sync.PushBack(v);
+}
+
+}  // namespace pipeline
+
+void CasePipeline() {
+  using namespace pipeline;
+  std::vector<int16_t> audio = LoadI16("pipeline_audio_in");
+
+  webrtc::SyncBuffer sync(1, kSync);
+  sync.Channel(0).OverwriteAt(audio.data(), kSync, 0);  // next_index_ defaults to kSync.
+
+  webrtc::BackgroundNoise bg(1);
+  webrtc::RandomVector rv;
+  webrtc::TickTimer tick;
+  webrtc::StatisticsCalculator stats(&tick);
+  webrtc::Expand expand(&bg, &sync, &rv, &stats, kFs, 1);
+  webrtc::Normal normal(kFs, nullptr, bg, &expand, &stats);
+  webrtc::Merge merge(kFs, 1, &expand, &sync);
+  webrtc::Accelerate accel(kFs, 1, bg);
+  webrtc::PreemptiveExpand preempt(kFs, 1, bg, kOverlap);
+
+  size_t cursor = kSync;
+  int last_mode = LM_NORMAL;
+  std::vector<int16_t> out_stream;
+
+  auto next_frame = [&](size_t n) {
+    std::vector<int16_t> f(audio.begin() + cursor, audio.begin() + cursor + n);
+    cursor += n;
+    return f;
+  };
+
+  // Build the operation tape. One cycle decodes kCycleDecode samples (40 Normal
+  // x 480 + 3 Merge x 480 + 3 time-stretch x 1440); repeat it as many whole
+  // cycles as the audio allows so the entire clip flows through the DSP.
+  constexpr size_t kCycleDecode = 24960;
+  size_t num_cycles = (audio.size() - kSync) / kCycleDecode;
+  std::vector<Op> tape;
+  auto repeat = [&](Op op, int times) {
+    for (int i = 0; i < times; ++i) tape.push_back(op);
+  };
+  for (size_t c = 0; c < num_cycles; ++c) {
+    repeat(N, 8);
+    repeat(E, 2);
+    tape.push_back(M);
+    repeat(N, 4);
+    tape.push_back(A);
+    repeat(N, 3);
+    tape.push_back(FA);
+    repeat(N, 3);
+    tape.push_back(P);
+    repeat(N, 4);
+    repeat(E, 6);
+    tape.push_back(M);
+    repeat(N, 8);
+    repeat(E, 3);
+    tape.push_back(M);
+    repeat(N, 10);
+  }
+
+  for (Op op : tape) {
+    switch (op) {
+      case N: {
+        auto decoded = next_frame(kOut);
+        if (last_mode == LM_EXPAND) {
+          webrtc::AudioMultiVector o(1);
+          normal.Process(decoded.data(), decoded.size(),
+                         webrtc::NetEq::Mode::kExpand, &o);
+          sync.PushBack(o);
+        } else {
+          PushSamples(sync, decoded);
+        }
+        last_mode = LM_NORMAL;
+        break;
+      }
+      case M: {
+        auto decoded = next_frame(kOut);
+        std::vector<int16_t> in = decoded;
+        webrtc::AudioMultiVector o(1);
+        merge.Process(in.data(), in.size(), &o);
+        sync.PushBack(o);
+        expand.Reset();
+        last_mode = LM_MERGE;
+        break;
+      }
+      case E: {
+        if (expand.Muted() && !bg.initialized()) {
+          size_t target = kOut + kOverlap;
+          size_t future = sync.FutureLength();
+          if (future < target) PushZeros(sync, target - future);
+          last_mode = LM_EXPAND;
+          break;
+        }
+        int guard = 0;
+        while ((sync.FutureLength() > kOverlap ? sync.FutureLength() - kOverlap
+                                               : 0) < kOut) {
+          webrtc::AudioMultiVector o(1);
+          expand.Process(&o);
+          if (o.Size() == 0) {
+            PushZeros(sync, kOut);
+          } else {
+            sync.PushBack(o);
+          }
+          last_mode = LM_EXPAND;
+          if (++guard > 64) break;
+        }
+        last_mode = LM_EXPAND;
+        break;
+      }
+      case A:
+      case FA: {
+        auto decoded = next_frame(kReq);
+        bool fast = (op == FA);
+        webrtc::AudioMultiVector o(1);
+        size_t removed = 0;
+        auto rc = accel.Process(decoded.data(), decoded.size(), fast, &o,
+                                &removed);
+        sync.PushBack(o);
+        last_mode = rc == webrtc::Accelerate::kSuccess
+                        ? LM_ACC_SUCCESS
+                        : (rc == webrtc::Accelerate::kSuccessLowEnergy
+                               ? LM_ACC_LOW
+                               : LM_ACC_FAIL);
+        expand.Reset();
+        break;
+      }
+      case P: {
+        auto decoded = next_frame(kReq);
+        webrtc::AudioMultiVector o(1);
+        size_t added = 0;
+        auto rc = preempt.Process(decoded.data(), decoded.size(), 0, &o, &added);
+        sync.PushBack(o);
+        last_mode = rc == webrtc::PreemptiveExpand::kSuccess
+                        ? LM_PE_SUCCESS
+                        : (rc == webrtc::PreemptiveExpand::kSuccessLowEnergy
+                               ? LM_PE_LOW
+                               : LM_PE_FAIL);
+        expand.Reset();
+        break;
+      }
+    }
+
+    // Extract one 10 ms output block, mirroring get_audio's output stage.
+    if (sync.FutureLength() < kOut) PushZeros(sync, kOut - sync.FutureLength());
+    size_t ni = sync.next_index();
+    for (size_t i = 0; i < kOut; ++i) out_stream.push_back(sync[0][ni + i]);
+    sync.set_next_index(ni + kOut);
+    if (sync.FutureLength() < kOverlap) {
+      sync.set_next_index(sync.next_index() - (kOverlap - sync.FutureLength()));
+    }
+    if (last_mode == LM_NORMAL || last_mode == LM_ACC_FAIL ||
+        last_mode == LM_PE_FAIL) {
+      bg.Update(sync);
+    }
+  }
+
+  Dump("pipeline_out", {"concatenated 10 ms blocks across the operation tape"},
+       out_stream);
+  std::vector<int16_t> after(sync.Size());
+  sync.Channel(0).CopyTo(sync.Size(), 0, after.data());
+  Dump("pipeline_sync_after", {"sync buffer after the full tape"}, after);
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -513,5 +750,6 @@ int main(int argc, char** argv) {
   CaseExpand();
   CaseNormal();
   CaseMerge();
+  CasePipeline();
   return 0;
 }

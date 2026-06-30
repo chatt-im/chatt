@@ -44,8 +44,8 @@ pub(crate) fn process_after_expand(
 
     let decoded_max = spl::max_abs_value_w16(input);
     let energy_length = ((FS_MULT * 64) as usize).min(length_per_channel);
-    let mut scaling = (6 + fs_shift - spl::norm_w32(decoded_max as i32 * decoded_max as i32) as i32)
-        .max(0);
+    let mut scaling =
+        (6 + fs_shift - spl::norm_w32(decoded_max as i32 * decoded_max as i32) as i32).max(0);
     let mut energy = spl::dot_product_with_scale(input, input, energy_length, scaling);
     let scaled_energy_length = (energy_length >> scaling) as i32;
     energy = if scaled_energy_length > 0 {
@@ -118,7 +118,14 @@ mod tests {
         }
 
         let mut output = Vec::new();
-        process_after_expand(&input, &mut sync, &mut expand, &mut bg, &mut rv, &mut output);
+        process_after_expand(
+            &input,
+            &mut sync,
+            &mut expand,
+            &mut bg,
+            &mut rv,
+            &mut output,
+        );
         let mut got = vec![output.len() as i64];
         got.extend(output.iter().map(|&x| x as i64));
         assert_eq!(got, load("normal_out"));
