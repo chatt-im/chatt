@@ -7,8 +7,10 @@
 
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
-use std::io::Write;
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::ops::Range;
+#[cfg(unix)]
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -16,11 +18,23 @@ use kvlog::encoding::{
     Encoder, Key, LogFields, MunchError, SpanInfo, StaticKey, Value, log_len, munch_log_with_span,
 };
 use kvlog::{Encode, LogLevel};
+use ring::digest::{SHA256, digest};
 use rpc::control::{ChatMessage, MAX_CHAT_BODY_BYTES};
 use rpc::ids::{FileTransferId, MessageId, RoomId, UserId};
 
 const RECOVERY_MIN_RECORDS: usize = 2;
 const MAX_ROOM_RECORD_BYTES: usize = 128 * 1024;
+
+/// Rotation threshold for one room's active log. When an append crosses this
+/// size the file is renamed to a single `.1` backup and a fresh file is opened,
+/// bounding steady-state history to roughly twice this per room so a chatty peer
+/// cannot grow it without limit.
+const MAX_HISTORY_BYTES: u64 = 4 * 1024 * 1024;
+
+/// Upper bound on bytes read from one history file. A larger file (left by an
+/// older build, or tampered with) is read from its tail and resynced to a record
+/// boundary, so load memory stays bounded regardless of the file's size.
+const MAX_LOAD_BYTES: u64 = MAX_HISTORY_BYTES + 1024 * 1024;
 
 /// Durable identity for file metadata. Server transfer ids restart at one, so
 /// they are unique only when paired with the announcement timestamp.
@@ -75,6 +89,8 @@ pub(crate) struct RoomHistoryStore {
     file: Option<File>,
     path: PathBuf,
     encoder: Encoder,
+    /// Bytes in the active file, tracked to trigger size-based rotation.
+    bytes_written: u64,
 }
 
 impl RoomHistoryStore {
@@ -147,6 +163,7 @@ impl RoomHistoryStore {
         let Some(file) = &mut self.file else {
             return;
         };
+        let written = self.encoder.bytes().len() as u64;
         let result = file
             .write_all(self.encoder.bytes())
             .and_then(|()| file.flush());
@@ -157,14 +174,54 @@ impl RoomHistoryStore {
                 path = self.path.display().to_string(),
                 err = error.to_string()
             );
+            return;
         }
+        self.bytes_written = self.bytes_written.saturating_add(written);
+        if self.bytes_written >= MAX_HISTORY_BYTES {
+            self.rotate();
+        }
+    }
+
+    /// Renames the full active file to a single `.1` backup and opens a fresh
+    /// active file. A failure leaves the handle appending to the current file and
+    /// resets the counter so rotation is retried only after more growth, never on
+    /// every record.
+    fn rotate(&mut self) {
+        let backup = backup_path(&self.path);
+        if let Err(error) = fs::rename(&self.path, &backup) {
+            kvlog::warn!(
+                "room history rotate failed",
+                path = self.path.display().to_string(),
+                err = error.to_string()
+            );
+            self.bytes_written = 0;
+            return;
+        }
+        self.bytes_written = 0;
+        match open_append_file(&self.path) {
+            Some(file) => self.file = Some(file),
+            None => {
+                self.file = None;
+                kvlog::warn!(
+                    "room history reopen after rotate failed; persistence disabled",
+                    path = self.path.display().to_string()
+                );
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn rotate_now(&mut self) {
+        self.rotate();
     }
 }
 
 /// Loads and validates one room's history, repairing its active file before
 /// returning an append handle. Filesystem failures degrade to read-only history.
-pub(crate) fn open(server_alias: &str, room_id: RoomId) -> OpenedHistory {
-    let Some(path) = history_path(server_alias, room_id) else {
+/// `history_id` is the stable per-server id from [`derive_server_id`], empty when
+/// not connected.
+pub(crate) fn open(history_id: &str, room_id: RoomId) -> OpenedHistory {
+    let Some(path) = history_path(history_id, room_id) else {
         return OpenedHistory {
             loaded: LoadedHistory::default(),
             store: None,
@@ -175,7 +232,7 @@ pub(crate) fn open(server_alias: &str, room_id: RoomId) -> OpenedHistory {
 
 fn open_path(path: &Path, default_room: u32) -> OpenedHistory {
     if let Some(parent) = path.parent()
-        && let Err(error) = fs::create_dir_all(parent)
+        && let Err(error) = create_private_dir(parent)
     {
         kvlog::warn!(
             "room history dir create failed",
@@ -188,6 +245,34 @@ fn open_path(path: &Path, default_room: u32) -> OpenedHistory {
         };
     }
 
+    // A pre-existing oversized active file (from a build without rotation, or
+    // tampering) is moved aside so the full read below and the append handle stay
+    // bounded. Its tail is recovered through the backup path that follows.
+    let active_len = fs::metadata(path)
+        .map(|metadata| metadata.len())
+        .unwrap_or(0);
+    if active_len > MAX_LOAD_BYTES {
+        if let Err(error) = fs::rename(path, backup_path(path)) {
+            kvlog::warn!(
+                "room history oversize rotate failed; loading read-only",
+                path = path.display().to_string(),
+                err = error.to_string()
+            );
+            let records = read_archived_records(path, default_room);
+            return OpenedHistory {
+                loaded: fold_records(&records),
+                store: None,
+            };
+        }
+        kvlog::warn!(
+            "room history oversized; rotated to backup",
+            path = path.display().to_string(),
+            bytes = active_len
+        );
+    }
+
+    let mut records = read_archived_records(&backup_path(path), default_room);
+
     let bytes = match fs::read(path) {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
@@ -198,29 +283,43 @@ fn open_path(path: &Path, default_room: u32) -> OpenedHistory {
                 err = error.to_string()
             );
             return OpenedHistory {
-                loaded: LoadedHistory::default(),
+                loaded: fold_records(&records),
                 store: None,
             };
         }
     };
     let scan = scan_bytes(&bytes, default_room);
-    let loaded = fold_records(&scan.records);
     let append_safe = match scan.repair {
         Repair::Clean => true,
         Repair::IncompleteTail { valid_end } => truncate_tail(path, bytes.len(), valid_end),
         Repair::Corrupt => rotate_corrupt(path, &bytes, &scan.records),
     };
+    records.extend(scan.records);
+    let loaded = fold_records(&records);
     let store = append_safe.then(|| open_append(path)).flatten();
     OpenedHistory { loaded, store }
 }
 
 fn open_append(path: &Path) -> Option<RoomHistoryStore> {
-    match OpenOptions::new().create(true).append(true).open(path) {
-        Ok(file) => Some(RoomHistoryStore {
-            file: Some(file),
-            path: path.to_path_buf(),
-            encoder: Encoder::with_capacity(512),
-        }),
+    let file = open_append_file(path)?;
+    let bytes_written = file.metadata().map(|metadata| metadata.len()).unwrap_or(0);
+    Some(RoomHistoryStore {
+        file: Some(file),
+        path: path.to_path_buf(),
+        encoder: Encoder::with_capacity(512),
+        bytes_written,
+    })
+}
+
+/// Opens (creating it private) a room file for append. Files are mode `0600` so
+/// chat contents are not exposed to other local users.
+fn open_append_file(path: &Path) -> Option<File> {
+    let mut options = OpenOptions::new();
+    options.create(true).append(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    match options.open(path) {
+        Ok(file) => Some(file),
         Err(error) => {
             kvlog::warn!(
                 "room history open failed",
@@ -230,6 +329,85 @@ fn open_append(path: &Path) -> Option<RoomHistoryStore> {
             None
         }
     }
+}
+
+/// Creates `dir` and any missing parents with mode `0700` so the history tree is
+/// readable only by its owner.
+fn create_private_dir(dir: &Path) -> std::io::Result<()> {
+    let mut builder = fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    builder.mode(0o700);
+    builder.create(dir)
+}
+
+/// The single rotation backup beside `path`, named by appending `.1`.
+fn backup_path(path: &Path) -> PathBuf {
+    let mut raw = path.as_os_str().to_os_string();
+    raw.push(".1");
+    PathBuf::from(raw)
+}
+
+/// Reads a history file read-only and returns its structurally valid records.
+/// Missing files yield none. An oversized file is read from its tail and
+/// resynced to a record boundary, bounding memory at the cost of the oldest
+/// records.
+fn read_archived_records(path: &Path, default_room: u32) -> Vec<ValidatedRecord> {
+    let Some((bytes, trimmed)) = read_capped(path) else {
+        return Vec::new();
+    };
+    if !trimmed {
+        return scan_bytes(&bytes, default_room).records;
+    }
+    match find_resync(&bytes, 0, default_room) {
+        Some(start) => scan_bytes(&bytes[start..], default_room).records,
+        None => Vec::new(),
+    }
+}
+
+/// Reads a file, capping memory at [`MAX_LOAD_BYTES`]. Returns the bytes and
+/// whether the read was a tail of an oversized file. A missing file returns
+/// `None`.
+fn read_capped(path: &Path) -> Option<(Vec<u8>, bool)> {
+    let mut file = match File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(error) => {
+            kvlog::warn!(
+                "room history read failed",
+                path = path.display().to_string(),
+                err = error.to_string()
+            );
+            return None;
+        }
+    };
+    let len = file.metadata().map(|metadata| metadata.len()).unwrap_or(0);
+    let trimmed = len > MAX_LOAD_BYTES;
+    if trimmed && let Err(error) = file.seek(SeekFrom::Start(len - MAX_LOAD_BYTES)) {
+        kvlog::warn!(
+            "room history seek failed",
+            path = path.display().to_string(),
+            err = error.to_string()
+        );
+        return None;
+    }
+    let mut bytes = Vec::new();
+    if let Err(error) = file.take(MAX_LOAD_BYTES).read_to_end(&mut bytes) {
+        kvlog::warn!(
+            "room history read failed",
+            path = path.display().to_string(),
+            err = error.to_string()
+        );
+        return None;
+    }
+    if trimmed {
+        kvlog::warn!(
+            "room history oversized on load; tail read",
+            path = path.display().to_string(),
+            dropped = len - MAX_LOAD_BYTES
+        );
+    }
+    Some((bytes, trimmed))
 }
 
 #[derive(Clone, Debug)]
@@ -673,11 +851,11 @@ fn create_unique_sibling(path: &Path, kind: &str) -> Option<(PathBuf, File)> {
     let timestamp = now_millis();
     for counter in 0..10_000 {
         let candidate = parent.join(format!("{stem}.{kind}-{timestamp}-{counter}.kvlog"));
-        match OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .open(&candidate)
-        {
+        let mut options = OpenOptions::new();
+        options.create_new(true).write(true);
+        #[cfg(unix)]
+        options.mode(0o600);
+        match options.open(&candidate) {
             Ok(file) => return Some((candidate, file)),
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
             Err(error) => {
@@ -745,15 +923,55 @@ fn sanitize_alias(alias: &str) -> String {
     out
 }
 
-fn history_path(server_alias: &str, room_id: RoomId) -> Option<PathBuf> {
-    if server_alias.is_empty() {
-        return None;
+/// Stable per-server storage id derived from the server token. It survives alias
+/// renames and endpoint edits, and a re-paired server that reuses an alias gets a
+/// fresh token and id, so unrelated servers never share a history directory.
+pub(crate) fn derive_server_id(token: &str) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let hash = digest(&SHA256, token.as_bytes());
+    let mut id = String::with_capacity(32);
+    for byte in &hash.as_ref()[..16] {
+        id.push(HEX[(byte >> 4) as usize] as char);
+        id.push(HEX[(byte & 0x0f) as usize] as char);
     }
-    Some(room_file_path(&data_dir()?, server_alias, room_id))
+    id
 }
 
-fn room_file_path(base: &Path, server_alias: &str, room_id: RoomId) -> PathBuf {
-    base.join(sanitize_alias(server_alias))
+/// Best-effort one-time move of a server's history from the legacy alias-keyed
+/// directory to the stable id-keyed directory, so an existing install keeps its
+/// history across this change. A no-op once the id directory exists or no legacy
+/// directory is present.
+pub(crate) fn migrate_legacy_history(legacy_alias: &str, history_id: &str) {
+    if legacy_alias.is_empty() || history_id.is_empty() {
+        return;
+    }
+    let Some(base) = data_dir() else {
+        return;
+    };
+    let new_dir = base.join(sanitize_alias(history_id));
+    let old_dir = base.join(sanitize_alias(legacy_alias));
+    if new_dir == old_dir || new_dir.exists() || !old_dir.exists() {
+        return;
+    }
+    if let Err(error) = fs::rename(&old_dir, &new_dir) {
+        kvlog::warn!(
+            "room history migrate failed",
+            from = old_dir.display().to_string(),
+            to = new_dir.display().to_string(),
+            err = error.to_string()
+        );
+    }
+}
+
+fn history_path(history_id: &str, room_id: RoomId) -> Option<PathBuf> {
+    if history_id.is_empty() {
+        return None;
+    }
+    Some(room_file_path(&data_dir()?, history_id, room_id))
+}
+
+fn room_file_path(base: &Path, history_id: &str, room_id: RoomId) -> PathBuf {
+    base.join(sanitize_alias(history_id))
         .join(format!("room-{}.kvlog", room_id.0))
 }
 
@@ -771,6 +989,7 @@ mod tests {
 
     fn fresh_store(path: &Path) -> RoomHistoryStore {
         let _ = fs::remove_file(path);
+        let _ = fs::remove_file(backup_path(path));
         open_path(path, 7).store.expect("open")
     }
 
@@ -1198,5 +1417,78 @@ mod tests {
         let path = room_file_path(Path::new("/data/chatt"), "srv", RoomId(5));
         assert_eq!(path, PathBuf::from("/data/chatt/srv/room-5.kvlog"));
         assert_eq!(history_path("", RoomId(5)), None);
+    }
+
+    #[test]
+    fn derive_server_id_is_stable_and_distinct() {
+        assert_eq!(derive_server_id("token-a"), derive_server_id("token-a"));
+        assert_ne!(derive_server_id("token-a"), derive_server_id("token-b"));
+        assert_eq!(derive_server_id("token-a").len(), 32);
+    }
+
+    #[test]
+    fn rotation_splits_into_backup_and_merges_on_load() {
+        let path = scratch_path("rotation");
+        let mut store = fresh_store(&path);
+        for id in 1..4 {
+            store.append_message(&text_message(id, id * 1_000, &format!("message-{id}")));
+        }
+        store.rotate_now();
+        for id in 4..7 {
+            store.append_message(&text_message(id, id * 1_000, &format!("message-{id}")));
+        }
+        drop(store);
+
+        assert!(backup_path(&path).exists());
+        let ids: Vec<u64> = open_path(&path, 7)
+            .loaded
+            .messages
+            .iter()
+            .map(|message| message.message_id.0)
+            .collect();
+        assert_eq!(ids, vec![1, 2, 3, 4, 5, 6]);
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(backup_path(&path));
+    }
+
+    #[test]
+    fn migrate_legacy_history_moves_directory_then_is_idempotent() {
+        let base = data_dir().expect("data dir");
+        let alias = "legacy-server-migrate";
+        let history_id = "00112233445566778899aabbccddeeff";
+        let old_dir = base.join(sanitize_alias(alias));
+        let new_dir = base.join(sanitize_alias(history_id));
+        let _ = fs::remove_dir_all(&old_dir);
+        let _ = fs::remove_dir_all(&new_dir);
+        create_private_dir(&old_dir).expect("old dir");
+        fs::write(old_dir.join("room-1.kvlog"), b"seed").expect("seed");
+
+        migrate_legacy_history(alias, history_id);
+        assert!(!old_dir.exists());
+        assert!(new_dir.join("room-1.kvlog").exists());
+
+        // A second call is a no-op because the id directory now exists.
+        migrate_legacy_history(alias, history_id);
+        assert!(new_dir.join("room-1.kvlog").exists());
+        let _ = fs::remove_dir_all(&new_dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn history_dir_and_file_are_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = data_dir().expect("data dir");
+        let dir = base.join("private-perms-test");
+        let _ = fs::remove_dir_all(&dir);
+        let file = dir.join("room-9.kvlog");
+        let mut store = open_path(&file, 9).store.expect("store");
+        store.append_message(&text_message(1, 1_000, "private"));
+        drop(store);
+
+        let dir_mode = fs::metadata(&dir).expect("dir meta").permissions().mode() & 0o777;
+        let file_mode = fs::metadata(&file).expect("file meta").permissions().mode() & 0o777;
+        assert_eq!(dir_mode, 0o700);
+        assert_eq!(file_mode, 0o600);
+        let _ = fs::remove_dir_all(&dir);
     }
 }

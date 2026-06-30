@@ -991,8 +991,13 @@ impl App {
                     None
                 }
             };
-        self.room
-            .connect_to_server(server.alias.clone(), server.effective_display_name());
+        let history_id = crate::room_history::derive_server_id(&server.token);
+        crate::room_history::migrate_legacy_history(&server.alias, &history_id);
+        self.room.connect_to_server(
+            server.alias.clone(),
+            history_id,
+            server.effective_display_name(),
+        );
         self.active_tcp_addr = Some(
             server
                 .client_config(&self.config.files, &self.config.p2p)
@@ -1014,10 +1019,7 @@ impl App {
         }
         self.session_id = None;
         self.user_id = None;
-        self.room.reset_for_disconnect();
-        if let Some(feed) = &self.web_feed {
-            feed.set_room(Vec::new());
-        }
+        self.reset_room_for_disconnect();
         self.server_rtt_ms = None;
         self.last_network_notice = None;
         self.voice_tx_enabled.store(false, Ordering::Relaxed);
@@ -1029,6 +1031,17 @@ impl App {
         self.supervisor.playback.reset();
         self.supervisor.capture_watch = CaptureWatch::default();
         self.supervisor.playback_watch = PlaybackWatch::default();
+    }
+
+    /// Resets per-room session state and clears the web feed's room so a browser
+    /// stops showing a room the client has left. Used by every disconnect path,
+    /// including reconnect and worker-failure recovery, so the feed never retains
+    /// stale history while the client is detached.
+    fn reset_room_for_disconnect(&mut self) {
+        self.room.reset_for_disconnect();
+        if let Some(feed) = &self.web_feed {
+            feed.set_room(Vec::new());
+        }
     }
 
     fn start_join_pairing(&mut self, ticket: InviteTicket) {
@@ -1424,7 +1437,7 @@ impl App {
             }
             NetworkEvent::ReconnectScheduled { retry_in, reason } => {
                 self.stop_audio();
-                self.room.reset_for_disconnect();
+                self.reset_room_for_disconnect();
                 self.push_network_notice("network", &format!("Connection failed: {reason}"));
                 self.set_error(format!(
                     "connection failed; retrying in {}s",
@@ -1433,7 +1446,7 @@ impl App {
             }
             NetworkEvent::WorkerStopped { reason } => {
                 self.stop_audio();
-                self.room.reset_for_disconnect();
+                self.reset_room_for_disconnect();
                 self.push_network_notice(
                     "network",
                     &format!("Network worker stopped: {reason}; reconnecting"),
@@ -2070,7 +2083,7 @@ impl App {
             // until the restart fires. The `is_pending` guard keeps this from
             // re-running every tick while recovery is already scheduled.
             self.stop_audio();
-            self.room.reset_for_disconnect();
+            self.reset_room_for_disconnect();
             self.schedule_network_recovery(now, "network worker stopped");
         }
         if let Some(reason) = self.supervisor.network.take_due(now) {
@@ -2191,7 +2204,7 @@ impl App {
                 if let Some(network) = self.network.take() {
                     network.stop();
                 }
-                self.room.reset_for_disconnect();
+                self.reset_room_for_disconnect();
                 self.set_error(format!("network recovery exhausted: {reason}"));
             }
         }
