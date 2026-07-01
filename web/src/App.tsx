@@ -19,6 +19,10 @@ const TOP_THRESHOLD = 200;
 // How many older messages one paging request asks for.
 const PAGE = 100;
 
+// Size of each file-upload chunk frame. Kept well under the server's WebSocket
+// payload cap so a browser never has to fragment a single frame.
+const UPLOAD_CHUNK_BYTES = 256 * 1024;
+
 // Preload a bounded number of image attachments from each message batch. The
 // virtualizer may defer mounting rows while it measures and pins the bottom, but
 // attachment URLs are known as soon as the WebSocket message arrives.
@@ -216,6 +220,17 @@ export default function App() {
   const [openFile, setOpenFile] = createSignal<string | null>(null);
   const [filePanelWidth, setFilePanelWidth] = createSignal(DEFAULT_FILE_PANEL_WIDTH);
   const [filePanelResizing, setFilePanelResizing] = createSignal(false);
+
+  // The compose box is hidden until the client reports a writable feed in its
+  // `config` envelope, so a read-only view never shows controls it cannot use.
+  const [readonly, setReadonly] = createSignal(true);
+  const [draft, setDraft] = createSignal("");
+  // Files dragged onto the composer, held until the message is submitted.
+  const [queued, setQueued] = createSignal<File[]>([]);
+  const [dragActive, setDragActive] = createSignal(false);
+  // A per-connection counter naming each upload so its chunk frames route to the
+  // right server-side file.
+  let nextUploadId = 1;
 
   function setShareError(streamId: number, message: string) {
     setShareErrors((prev) => ({ ...prev, [streamId]: message }));
@@ -431,6 +446,68 @@ export default function App() {
     }
     if (fullscreenStream() === streamId) exitShareFullscreen();
     closeDecoder(streamId);
+  }
+
+  function sendJson(req: ClientRequest) {
+    if (socket && socket.readyState === WebSocket.OPEN) {
+      socket.send(JSON.stringify(req));
+    }
+  }
+
+  // Streams one queued file to the client: an `upload_start`, then binary chunks
+  // each prefixed with the little-endian upload id, then `upload_finish`. The
+  // server reassembles them into a temp file and relays it as a normal upload.
+  async function sendFile(file: File) {
+    if (!socket || socket.readyState !== WebSocket.OPEN) return;
+    const uploadId = nextUploadId++;
+    sendJson({ type: "upload_start", upload_id: uploadId, name: file.name, size: file.size });
+    const bytes = new Uint8Array(await file.arrayBuffer());
+    for (let offset = 0; offset < bytes.length; offset += UPLOAD_CHUNK_BYTES) {
+      const chunk = bytes.subarray(offset, offset + UPLOAD_CHUNK_BYTES);
+      const frame = new Uint8Array(4 + chunk.length);
+      new DataView(frame.buffer).setUint32(0, uploadId, true);
+      frame.set(chunk, 4);
+      socket.send(frame);
+    }
+    sendJson({ type: "upload_finish", upload_id: uploadId });
+  }
+
+  function submitCompose() {
+    const body = draft().trim();
+    const files = queued();
+    if (!body && files.length === 0) return;
+    if (body) sendJson({ type: "send_message", body });
+    for (const file of files) void sendFile(file);
+    setDraft("");
+    setQueued([]);
+  }
+
+  function onComposeKeyDown(event: KeyboardEvent) {
+    if (event.key === "Enter" && !event.shiftKey) {
+      event.preventDefault();
+      submitCompose();
+    }
+  }
+
+  function onComposeDragOver(event: DragEvent) {
+    event.preventDefault();
+    setDragActive(true);
+  }
+
+  function onComposeDragLeave(event: DragEvent) {
+    event.preventDefault();
+    setDragActive(false);
+  }
+
+  function onComposeDrop(event: DragEvent) {
+    event.preventDefault();
+    setDragActive(false);
+    const files = event.dataTransfer ? Array.from(event.dataTransfer.files) : [];
+    if (files.length > 0) setQueued((prev) => [...prev, ...files]);
+  }
+
+  function removeQueued(index: number) {
+    setQueued((prev) => prev.filter((_, i) => i !== index));
   }
 
   function hasVideoPane(): boolean {
@@ -684,6 +761,8 @@ export default function App() {
             prev.includes(env.stream_id) ? prev : [...prev, env.stream_id],
           );
         }
+      } else if (env.type === "config") {
+        setReadonly(env.readonly);
       } else if (env.type === "share_error") {
         setShareError(env.stream_id, env.message);
       } else if (env.type === "share_ended") {
@@ -821,6 +900,48 @@ export default function App() {
               </Virtualizer>
             </div>
           </div>
+          <Show when={!readonly()}>
+            <section
+              class="composer"
+              classList={{ "is-drag-active": dragActive() }}
+              onDragOver={onComposeDragOver}
+              onDragLeave={onComposeDragLeave}
+              onDrop={onComposeDrop}
+            >
+              <Show when={queued().length > 0}>
+                <div class="composer-files">
+                  <For each={queued()}>
+                    {(file, index) => (
+                      <span class="composer-chip">
+                        <span class="composer-chip-name">{file.name}</span>
+                        <button
+                          class="composer-chip-remove"
+                          type="button"
+                          aria-label={`Remove ${file.name}`}
+                          onClick={() => removeQueued(index())}
+                        >
+                          ×
+                        </button>
+                      </span>
+                    )}
+                  </For>
+                </div>
+              </Show>
+              <div class="composer-input">
+                <textarea
+                  class="composer-text"
+                  rows={1}
+                  placeholder="Message… (drag files to attach)"
+                  value={draft()}
+                  onInput={(e) => setDraft(e.currentTarget.value)}
+                  onKeyDown={onComposeKeyDown}
+                />
+                <button class="composer-send" type="button" onClick={submitCompose}>
+                  Send
+                </button>
+              </div>
+            </section>
+          </Show>
         </main>
         <Show when={openFile()}>
           <>

@@ -663,3 +663,105 @@ body {
 .code-line-text {
   font-family: inherit;
 }
+
+/* The compose box pinned below the chat log when the feed is writable. */
+.composer {
+  flex: 0 0 auto;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space);
+  padding: var(--space) var(--space-lg);
+  border-top: 1px solid var(--border);
+  background: var(--bg-elevated);
+}
+
+/* A dashed accent border signals the composer is a drop target while dragging. */
+.composer.is-drag-active {
+  outline: 2px dashed var(--accent);
+  outline-offset: -4px;
+}
+
+/* Hidden together with the chat log when a share fills the screen. */
+.app-main.is-share-fullscreen .composer {
+  display: none;
+}
+
+.composer-files {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space);
+}
+
+.composer-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  max-width: 240px;
+  padding: 4px 8px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--bg);
+  color: var(--text);
+  font-size: 13px;
+}
+
+.composer-chip-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.composer-chip-remove {
+  border: 0;
+  background: none;
+  color: var(--text-dim);
+  cursor: pointer;
+  font-size: 16px;
+  line-height: 1;
+  padding: 0;
+}
+
+.composer-chip-remove:hover {
+  color: var(--text);
+}
+
+.composer-input {
+  display: flex;
+  align-items: flex-end;
+  gap: var(--space);
+}
+
+.composer-text {
+  flex: 1 1 auto;
+  min-height: 38px;
+  max-height: 160px;
+  resize: vertical;
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--font);
+  font-size: var(--font-size);
+  line-height: var(--line-height);
+}
+
+.composer-text:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+
+.composer-send {
+  flex: 0 0 auto;
+  padding: 8px 16px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--bg);
+  color: var(--text);
+  cursor: pointer;
+  font-size: var(--font-size);
+}
+
+.composer-send:hover {
+  border-color: var(--accent);
+}

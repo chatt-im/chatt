@@ -506,19 +506,6 @@ impl From<crate::web_server::WebRequest> for AppEvent {
 
 /// Serializes raw bytes as a JSON array of numbers, the form the browser reads
 /// back into a `Uint8Array` for the decoder `description`.
-fn json_byte_array(bytes: &[u8]) -> String {
-    let mut out = String::with_capacity(2 + bytes.len() * 4);
-    out.push('[');
-    for (index, byte) in bytes.iter().enumerate() {
-        if index > 0 {
-            out.push(',');
-        }
-        out.push_str(&byte.to_string());
-    }
-    out.push(']');
-    out
-}
-
 /// The `share_available` envelope announcing a share so the browser shows a play
 /// button and pre-knows the codec and its decoder descriptor.
 fn share_available_envelope(
@@ -529,39 +516,41 @@ fn share_available_envelope(
     height: u32,
     extradata: &[u8],
 ) -> String {
-    format!(
-        "{{\"type\":\"share_available\",\"stream_id\":{},\"sender\":{},\"codec\":{},\"width\":{width},\"height\":{height},\"extradata\":{}}}",
-        stream_id.0,
-        jsony::to_json(&sender.to_string()),
-        jsony::to_json(&codec.to_string()),
-        json_byte_array(extradata),
-    )
+    jsony::object! {
+        type: "share_available",
+        stream_id: stream_id.0,
+        sender: sender,
+        codec: codec,
+        width: width,
+        height: height,
+        extradata: extradata,
+    }
 }
 
 /// The `share_config` envelope sent when playback starts, carrying the decoder
 /// codec string and `extra_data` descriptor.
 fn share_config_envelope(stream_id: StreamId, codec: &str, extradata: &[u8]) -> String {
-    format!(
-        "{{\"type\":\"share_config\",\"stream_id\":{},\"codec\":{},\"extradata\":{}}}",
-        stream_id.0,
-        jsony::to_json(&codec.to_string()),
-        json_byte_array(extradata),
-    )
+    jsony::object! {
+        type: "share_config",
+        stream_id: stream_id.0,
+        codec: codec,
+        extradata: extradata,
+    }
 }
 
 /// The `share_ended` envelope telling the browser to tear down its decoder.
 fn share_ended_envelope(stream_id: StreamId) -> String {
-    format!("{{\"type\":\"share_ended\",\"stream_id\":{}}}", stream_id.0)
+    jsony::object! { type: "share_ended", stream_id: stream_id.0 }
 }
 
 /// The `share_error` envelope reporting a failed play request to the browser
 /// that issued it, since the requester is watching the web view, not the TUI.
 fn share_error_envelope(stream_id: StreamId, message: &str) -> String {
-    format!(
-        "{{\"type\":\"share_error\",\"stream_id\":{},\"message\":{}}}",
-        stream_id.0,
-        jsony::to_json(&message.to_string()),
-    )
+    jsony::object! {
+        type: "share_error",
+        stream_id: stream_id.0,
+        message: message,
+    }
 }
 
 /// Starts the web server and a relay thread that forwards browser requests into
@@ -600,7 +589,8 @@ fn spawn_web_feed(
     events: &EventSender,
 ) -> Option<crate::web_server::WebFeedSender> {
     let (web_tx, web_rx) = mpsc::channel();
-    let feed = match crate::web_server::spawn(web, receive_dir, max_messages, web_tx) {
+    let feed = match crate::web_server::spawn(web, receive_dir, max_messages, web_tx, web.readonly)
+    {
         Ok(feed) => feed,
         Err(error) => {
             kvlog::error!("web server failed to start", error = %error);
@@ -890,6 +880,12 @@ impl App {
             }
             crate::web_server::WebRequest::StopShare { stream_id } => {
                 self.stop_view(StreamId(stream_id))
+            }
+            crate::web_server::WebRequest::SendChat { body } => {
+                self.send_network_command(NetworkCommand::SendChat(body), true);
+            }
+            crate::web_server::WebRequest::UploadFile { path } => {
+                self.send_network_command(NetworkCommand::UploadFile(path), true);
             }
         }
     }

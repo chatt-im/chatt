@@ -59,6 +59,9 @@ pub struct SettingsDraft {
     pub(crate) output_raw: bool,
     pub(crate) web_enabled: bool,
     pub(crate) web_bind: String,
+    /// Preserved across the settings round-trip. The compose box is a dev-only
+    /// flag with no settings-UI control, so it is carried but never edited here.
+    pub(crate) web_readonly: bool,
     pub(crate) message_notification_volume_index: usize,
     pub(crate) peer_join_notification_volume_index: usize,
     pub(crate) peer_leave_notification_volume_index: usize,
@@ -113,6 +116,7 @@ impl SettingsDraft {
                 .is_some_and(is_raw_device_selection),
             web_enabled: WebConfig::default().enabled,
             web_bind: WebConfig::default().bind,
+            web_readonly: WebConfig::default().readonly,
             message_notification_volume_index: notification_volume_index(0.0),
             peer_join_notification_volume_index: notification_volume_index(0.0),
             peer_leave_notification_volume_index: notification_volume_index(0.0),
@@ -128,6 +132,7 @@ impl SettingsDraft {
     pub fn set_web_from_config(&mut self, web: &WebConfig) {
         self.web_enabled = web.enabled;
         self.web_bind = web.bind.clone();
+        self.web_readonly = web.readonly;
     }
 
     pub fn set_notifications_from_config(&mut self, notifications: &NotificationConfig) {
@@ -175,6 +180,7 @@ impl SettingsDraft {
         WebConfig {
             enabled: self.web_enabled,
             bind: self.web_bind.trim().to_string(),
+            readonly: self.web_readonly,
         }
     }
 

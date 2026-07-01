@@ -406,6 +406,10 @@ pub struct WebConfig {
     /// The loopback address the web server binds.
     #[toml(default = default_web_bind())]
     pub bind: String,
+    /// Whether the browser view is view-only. When `true` (the default) the page
+    /// cannot send chat messages or files. Set `false` to enable the compose box.
+    #[toml(default = default_true())]
+    pub readonly: bool,
 }
 
 impl Default for WebConfig {
@@ -413,6 +417,7 @@ impl Default for WebConfig {
         Self {
             enabled: false,
             bind: default_web_bind(),
+            readonly: true,
         }
     }
 }
@@ -997,6 +1002,10 @@ fn default_server_alias() -> String {
 
 fn default_web_bind() -> String {
     "127.0.0.1:8080".to_string()
+}
+
+fn default_true() -> bool {
+    true
 }
 
 fn default_servers() -> Vec<ServerEntry> {
