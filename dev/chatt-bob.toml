@@ -1,7 +1,6 @@
 [[servers]]
-alias = "local"
-user = "bob"
-display-name = "Bob"
+label = "local"
+username = "Bob"
 token = "bob-dev-token"
 server-public-key = ""
 tcp-addr = "127.0.0.1:41000"

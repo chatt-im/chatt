@@ -31,8 +31,8 @@ const ACTIONS: [ActionButton<'static, ServerEditButton>; 3] = [
 
 #[derive(Clone, Debug)]
 pub(crate) struct ServerSelectItem {
-    pub(crate) alias: String,
-    pub(crate) display_name: String,
+    pub(crate) label: String,
+    pub(crate) username: String,
     pub(crate) tcp_addr: String,
     pub(crate) room_id: u32,
     pub(crate) search_text: String,
@@ -52,11 +52,11 @@ pub(crate) enum ServerEditEvent {
 }
 
 pub(crate) struct ServerEditDraft {
-    original_alias: String,
+    original_label: String,
     token: String,
     server_public_key: String,
-    alias: String,
-    display_name: String,
+    label: String,
+    username: String,
     tcp_addr: String,
     udp_addr: String,
     udp_probe_addr: String,
@@ -65,7 +65,7 @@ pub(crate) struct ServerEditDraft {
 }
 
 pub(crate) struct ServerEditUpdate {
-    pub(crate) original_alias: String,
+    pub(crate) original_label: String,
     pub(crate) server: ServerEntry,
 }
 
@@ -76,16 +76,16 @@ pub(crate) struct PendingPair {
 impl ServerEditDraft {
     pub(crate) fn from_server(server: &ServerEntry, bindings: FormBindings) -> Self {
         Self {
-            original_alias: server.alias.clone(),
+            original_label: server.label.clone(),
             token: server.token.clone(),
             server_public_key: server.server_public_key.clone(),
-            alias: server.alias.clone(),
-            display_name: server.display_name.clone(),
+            label: server.label.clone(),
+            username: server.username.clone(),
             tcp_addr: server.tcp_addr.clone(),
             udp_addr: server.udp_addr.clone(),
             udp_probe_addr: server.udp_probe_addr.clone().unwrap_or_default(),
             room_id: server.room_id.to_string(),
-            form: form::state_with_focus(bindings, SERVER_SECTION, "Alias"),
+            form: form::state_with_focus(bindings, SERVER_SECTION, "Label"),
         }
     }
 
@@ -157,11 +157,11 @@ impl ServerEditDraft {
             )
             .with_label_width(LABEL_WIDTH);
             let values = ServerEditValues {
-                original_alias: &self.original_alias,
+                original_label: &self.original_label,
                 token: &self.token,
                 server_public_key: &self.server_public_key,
-                alias: &mut self.alias,
-                display_name: &mut self.display_name,
+                label: &mut self.label,
+                username: &mut self.username,
                 tcp_addr: &mut self.tcp_addr,
                 udp_addr: &mut self.udp_addr,
                 udp_probe_addr: &mut self.udp_probe_addr,
@@ -194,19 +194,18 @@ impl ServerEditDraft {
             .map_err(|_| "room-id must be a positive integer".to_string())?;
         let udp_probe_addr = non_empty_text(&draft.udp_probe_addr);
         let server = ServerEntry {
-            alias: draft.alias.trim().to_string(),
+            label: draft.label.trim().to_string(),
             tcp_addr: draft.tcp_addr.trim().to_string(),
             udp_addr: draft.udp_addr.trim().to_string(),
             udp_probe_addr,
-            legacy_user: String::new(),
-            display_name: draft.display_name.trim().to_string(),
+            username: draft.username.trim().to_string(),
             token: self.token.clone(),
             server_public_key: self.server_public_key.clone(),
             room_id,
         };
         validate_server_entry(&server)?;
         Ok(ServerEditUpdate {
-            original_alias: self.original_alias.clone(),
+            original_label: self.original_label.clone(),
             server,
         })
     }
@@ -232,11 +231,11 @@ impl ServerEditDraft {
             )
             .with_label_width(LABEL_WIDTH);
             let values = ServerEditValues {
-                original_alias: &self.original_alias,
+                original_label: &self.original_label,
                 token: &self.token,
                 server_public_key: &self.server_public_key,
-                alias: &mut self.alias,
-                display_name: &mut self.display_name,
+                label: &mut self.label,
+                username: &mut self.username,
                 tcp_addr: &mut self.tcp_addr,
                 udp_addr: &mut self.udp_addr,
                 udp_probe_addr: &mut self.udp_probe_addr,
@@ -276,26 +275,26 @@ impl ServerEditDraft {
 
     fn clone_values(&self) -> Self {
         Self {
-            original_alias: self.original_alias.clone(),
+            original_label: self.original_label.clone(),
             token: self.token.clone(),
             server_public_key: self.server_public_key.clone(),
-            alias: self.alias.clone(),
-            display_name: self.display_name.clone(),
+            label: self.label.clone(),
+            username: self.username.clone(),
             tcp_addr: self.tcp_addr.clone(),
             udp_addr: self.udp_addr.clone(),
             udp_probe_addr: self.udp_probe_addr.clone(),
             room_id: self.room_id.clone(),
-            form: form::state_with_focus(FormBindings::Standard, SERVER_SECTION, "Alias"),
+            form: form::state_with_focus(FormBindings::Standard, SERVER_SECTION, "Label"),
         }
     }
 }
 
 struct ServerEditValues<'a> {
-    original_alias: &'a str,
+    original_label: &'a str,
     token: &'a str,
     server_public_key: &'a str,
-    alias: &'a mut String,
-    display_name: &'a mut String,
+    label: &'a mut String,
+    username: &'a mut String,
     tcp_addr: &'a mut String,
     udp_addr: &'a mut String,
     udp_probe_addr: &'a mut String,
@@ -303,15 +302,15 @@ struct ServerEditValues<'a> {
 }
 
 fn server_edit_ui(form: &mut Form, values: ServerEditValues<'_>) -> Option<ServerEditButton> {
-    let title = format!("Edit Server {}", values.original_alias);
+    let title = format!("Edit Server {}", values.original_label);
     let token = short_key(values.token);
     let server_public_key = short_key(values.server_public_key);
     form.section_with_id(&title, SERVER_SECTION);
     form.static_row("Token", &token);
     form.static_row("Key", &server_public_key);
     form.spacer(1);
-    form.text("Alias", values.alias, |_| None);
-    form.text("Display", values.display_name, |_| None);
+    form.text("Label", values.label, |_| None);
+    form.text("Username", values.username, |_| None);
     form.text("TCP", values.tcp_addr, |_| None);
     form.text("UDP", values.udp_addr, |_| None);
     form.text("Probe", values.udp_probe_addr, |_| None);
@@ -347,17 +346,16 @@ fn non_empty_text(value: &str) -> Option<String> {
 
 pub(crate) fn server_entry_from_invite(
     ticket: &InviteTicket,
-    alias: String,
-    display_name: String,
+    label: String,
+    username: String,
     token: String,
 ) -> Result<ServerEntry, String> {
     Ok(ServerEntry {
-        alias,
+        label,
         tcp_addr: ticket.tcp_addr.clone(),
         udp_addr: ticket.udp_addr.clone(),
         udp_probe_addr: ticket.udp_probe_addr.clone(),
-        legacy_user: String::new(),
-        display_name,
+        username,
         token,
         server_public_key: ticket.server_public_key.clone(),
         room_id: ticket.room_id,
@@ -404,7 +402,7 @@ pub(crate) fn default_join_alias(ticket: &InviteTicket) -> String {
 
 pub(crate) fn unique_server_alias(config: &Config, base: &str) -> String {
     let base = sanitize_server_alias(base);
-    if !config.servers.iter().any(|server| server.alias == base) {
+    if !config.servers.iter().any(|server| server.label == base) {
         return base;
     }
     for index in 2..10_000 {
@@ -415,7 +413,7 @@ pub(crate) fn unique_server_alias(config: &Config, base: &str) -> String {
         if !config
             .servers
             .iter()
-            .any(|server| server.alias == candidate)
+            .any(|server| server.label == candidate)
         {
             return candidate;
         }

@@ -24,7 +24,7 @@ use super::{Participants, commands::CommandCompletionState};
 pub(crate) struct RoomSession {
     pub server_alias: String,
     /// Stable per-server storage id for history, independent of the mutable
-    /// alias and endpoint. Empty when not connected, which disables persistence.
+    /// label and endpoint. Empty when not connected, which disables persistence.
     history_id: String,
     pub local_user_name: String,
     pub room_name: String,
@@ -724,7 +724,7 @@ mod tests {
 
     #[test]
     fn joined_merges_and_dedups_server_history() {
-        // Empty server alias disables disk, so this exercises the in-memory
+        // Empty server label disables disk, so this exercises the in-memory
         // merge: dedup on (timestamp_ms, message_id) and sort by it. `message`
         // sets timestamp_ms = id * 1000, so ids order the result.
         let mut room = test_room();

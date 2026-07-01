@@ -329,7 +329,7 @@ fn draw_server_welcome(area: Rect, buf: &mut Buffer, theme: &Theme) {
     let quick_start = [
         Section("Quick start:"),
         Binding {
-            key: "chatt join",
+            key: "chatt pair",
             desc: "Pair with a server from a join string",
         },
         Binding {
@@ -527,15 +527,12 @@ fn draw_server_select_item(
         .text(buf, if selected { ">" } else { " " });
     top.with(base.patch(theme.text | Modifier::BOLD))
         .with(Ellipsis(true))
-        .text(buf, &item.alias);
+        .text(buf, &item.label);
     if rows.h > 0 {
         rows.take_top(1)
             .with(base.patch(theme.muted))
             .with(Ellipsis(true))
-            .text(
-                buf,
-                &format!("  {}  room {}", item.display_name, item.room_id),
-            );
+            .text(buf, &format!("  {}  room {}", item.username, item.room_id));
     }
     if rows.h > 0 {
         rows.take_top(1)

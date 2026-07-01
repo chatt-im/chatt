@@ -37,19 +37,13 @@ pub const NOTIFICATION_VOLUME_DB_STEP: f32 = 0.5;
 #[derive(Clone, Debug, Toml)]
 #[toml(FromToml, ToToml, rename_all = "kebab-case")]
 pub struct ServerEntry {
-    pub alias: String,
+    pub label: String,
     pub tcp_addr: String,
     #[toml(default, ToToml skip_if = String::is_empty)]
     pub udp_addr: String,
     #[toml(default)]
     pub udp_probe_addr: Option<String>,
-    /// Deprecated. Older configs stored an admin-chosen `user` identifier here.
-    /// The server now identifies clients by token, so this value is accepted for
-    /// backward compatibility, ignored, and dropped on the next config save.
-    #[toml(default, rename = "user", ToToml skip)]
-    #[allow(dead_code)]
-    pub legacy_user: String,
-    pub display_name: String,
+    pub username: String,
     pub token: String,
     #[toml(default)]
     pub server_public_key: String,
@@ -59,12 +53,11 @@ pub struct ServerEntry {
 impl Default for ServerEntry {
     fn default() -> Self {
         Self {
-            alias: default_server_alias(),
+            label: default_server_alias(),
             tcp_addr: "127.0.0.1:41000".to_string(),
             udp_addr: String::new(),
             udp_probe_addr: None,
-            legacy_user: String::new(),
-            display_name: "Alice".to_string(),
+            username: "Alice".to_string(),
             token: "alice-dev-token".to_string(),
             server_public_key: String::new(),
             room_id: 1,
@@ -91,7 +84,7 @@ impl ServerEntry {
     }
 
     pub fn effective_display_name(&self) -> String {
-        self.display_name.trim().to_string()
+        self.username.trim().to_string()
     }
 
     pub fn effective_udp_addr(&self) -> String {
@@ -708,8 +701,8 @@ impl Config {
 
     fn normalize(&mut self) {
         for server in &mut self.servers {
-            server.alias = server.alias.trim().to_string();
-            server.display_name = server.effective_display_name();
+            server.label = server.label.trim().to_string();
+            server.username = server.effective_display_name();
         }
         for preference in &mut self.user_audio {
             preference.server_alias = preference.server_alias.trim().to_string();
@@ -770,61 +763,61 @@ impl Config {
                 )));
             }
         }
-        let mut aliases = HashSet::new();
+        let mut labels = HashSet::new();
         for server in &self.servers {
-            let alias = &server.alias;
-            if let Err(error) = validate_server_alias(alias) {
-                out.push(Diag::error(format!("server {alias}: {error}")));
+            let label = &server.label;
+            if let Err(error) = validate_server_label(label) {
+                out.push(Diag::error(format!("server {label}: {error}")));
             }
             if let Err(error) = validate_non_empty(&server.token, "token") {
-                out.push(Diag::error(format!("server {alias}: {error}")));
+                out.push(Diag::error(format!("server {label}: {error}")));
             }
-            if let Err(error) = validate_non_empty(&server.display_name, "display-name") {
-                out.push(Diag::error(format!("server {alias}: {error}")));
+            if let Err(error) = validate_non_empty(&server.username, "username") {
+                out.push(Diag::error(format!("server {label}: {error}")));
             }
             if let Err(error) = validate_endpoint(&server.tcp_addr, "tcp-addr") {
-                out.push(Diag::error(format!("server {alias}: {error}")));
+                out.push(Diag::error(format!("server {label}: {error}")));
             }
             if let Err(error) = validate_endpoint(&server.effective_udp_addr(), "udp-addr") {
-                out.push(Diag::error(format!("server {alias}: {error}")));
+                out.push(Diag::error(format!("server {label}: {error}")));
             }
             if let Some(addr) = &server.udp_probe_addr {
                 if let Err(error) = validate_endpoint(addr, "udp-probe-addr") {
-                    out.push(Diag::error(format!("server {alias}: {error}")));
+                    out.push(Diag::error(format!("server {label}: {error}")));
                 }
             }
             if server.room_id == 0 {
                 out.push(Diag::error(format!(
-                    "server {alias}: room-id must be non-zero"
+                    "server {label}: room-id must be non-zero"
                 )));
             }
-            if !aliases.insert(alias.as_str()) {
-                out.push(Diag::error(format!("duplicate server alias {alias}")));
+            if !labels.insert(label.as_str()) {
+                out.push(Diag::error(format!("duplicate server label {label}")));
             }
         }
         let mut user_audio_keys = HashSet::new();
         for preference in &self.user_audio {
-            let alias = &preference.server_alias;
+            let label = &preference.server_alias;
             let user_id = preference.user_id;
-            if let Err(error) = validate_server_alias(alias) {
+            if let Err(error) = validate_server_label(label) {
                 out.push(Diag::error(format!(
-                    "user-audio {alias}:{user_id}: {error}"
+                    "user-audio {label}:{user_id}: {error}"
                 )));
             }
             if user_id.0 == 0 {
                 out.push(Diag::error(format!(
-                    "user-audio {alias}: user-id must be non-zero"
+                    "user-audio {label}: user-id must be non-zero"
                 )));
             }
             if !(MIN_USER_VOLUME_DB..=MAX_USER_VOLUME_DB).contains(&preference.volume_db) {
                 out.push(Diag::error(format!(
-                    "user-audio {alias}:{user_id} volume-db must be between {:.1} and {:.1}",
+                    "user-audio {label}:{user_id} volume-db must be between {:.1} and {:.1}",
                     MIN_USER_VOLUME_DB, MAX_USER_VOLUME_DB
                 )));
             }
-            if !user_audio_keys.insert((alias.as_str(), user_id)) {
+            if !user_audio_keys.insert((label.as_str(), user_id)) {
                 out.push(Diag::error(format!(
-                    "duplicate user-audio entry for {alias}:{user_id}"
+                    "duplicate user-audio entry for {label}:{user_id}"
                 )));
             }
         }
@@ -860,7 +853,7 @@ impl Config {
     pub fn server(&self, alias: &str) -> Result<&ServerEntry, String> {
         self.servers
             .iter()
-            .find(|server| server.alias == alias)
+            .find(|server| server.label == alias)
             .ok_or_else(|| format!("server {alias} is not configured"))
     }
 
@@ -868,7 +861,7 @@ impl Config {
         if let Some(existing) = self
             .servers
             .iter_mut()
-            .find(|existing| existing.alias == server.alias)
+            .find(|existing| existing.label == server.label)
         {
             *existing = server;
         } else {
@@ -1036,36 +1029,36 @@ fn non_empty_string(value: &str) -> Option<String> {
     (!value.is_empty()).then(|| value.to_string())
 }
 
-pub fn validate_server_alias(alias: &str) -> Result<(), String> {
-    let alias = alias.trim();
-    if alias.is_empty() {
-        return Err("alias is empty".to_string());
+pub fn validate_server_label(label: &str) -> Result<(), String> {
+    let label = label.trim();
+    if label.is_empty() {
+        return Err("label is empty".to_string());
     }
-    if alias.len() > 64 {
-        return Err("alias exceeds 64 bytes".to_string());
+    if label.len() > 64 {
+        return Err("label exceeds 64 bytes".to_string());
     }
-    if !alias
+    if !label
         .bytes()
         .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
     {
-        return Err("alias must use ASCII letters, numbers, '-' or '_'".to_string());
+        return Err("label must use ASCII letters, numbers, '-' or '_'".to_string());
     }
     Ok(())
 }
 
-pub fn validate_display_name(display_name: &str) -> Result<(), String> {
-    let display_name = display_name.trim();
-    validate_non_empty(display_name, "display-name")?;
-    if display_name.len() > 64 {
-        return Err("display-name exceeds 64 bytes".to_string());
+pub fn validate_username(username: &str) -> Result<(), String> {
+    let username = username.trim();
+    validate_non_empty(username, "username")?;
+    if username.len() > 64 {
+        return Err("username exceeds 64 bytes".to_string());
     }
     Ok(())
 }
 
 pub fn validate_server_entry(server: &ServerEntry) -> Result<(), String> {
-    validate_server_alias(&server.alias)?;
+    validate_server_label(&server.label)?;
     validate_non_empty(&server.token, "token")?;
-    validate_display_name(&server.display_name)?;
+    validate_username(&server.username)?;
     validate_endpoint(&server.tcp_addr, "tcp-addr")?;
     validate_endpoint(&server.effective_udp_addr(), "udp-addr")?;
     if let Some(addr) = &server.udp_probe_addr {
@@ -1128,8 +1121,8 @@ mod tests {
 active-server = "lab"
 
 [[servers]]
-alias = "lab"
-display-name = "Alice"
+label = "lab"
+username = "Alice"
 token = "alice-dev-token"
 tcp-addr = "127.0.0.1:42000"
 server-public-key = ""
@@ -1147,34 +1140,6 @@ room-id = 1
     }
 
     #[test]
-    fn server_ignores_legacy_user_key() {
-        let arena = Arena::new();
-        let mut doc = toml_spanner::parse(
-            r#"
-active-server = "lab"
-
-[[servers]]
-alias = "lab"
-user = "stale-internal-name"
-display-name = "Alice"
-token = "alice-dev-token"
-tcp-addr = "127.0.0.1:42000"
-server-public-key = ""
-room-id = 1
-"#,
-            &arena,
-        )
-        .unwrap();
-        let udp_addr_configured = server_udp_addr_configured(&doc);
-        let mut config: Config = doc.to().unwrap();
-        config.apply_inferred_addresses_from_doc(&udp_addr_configured);
-        config.normalize();
-
-        assert!(validation_errors(&config).is_empty());
-        assert_eq!(config.servers[0].display_name, "Alice");
-    }
-
-    #[test]
     fn server_parses_explicit_udp_and_probe_addrs() {
         let arena = Arena::new();
         let mut doc = toml_spanner::parse(
@@ -1182,8 +1147,8 @@ room-id = 1
 active-server = "lab"
 
 [[servers]]
-alias = "lab"
-display-name = "Alice"
+label = "lab"
+username = "Alice"
 token = "alice-dev-token"
 tcp-addr = "127.0.0.1:42000"
 udp-addr = "127.0.0.1:42001"
@@ -1213,8 +1178,8 @@ room-id = 1
 active-server = "prod"
 
 [[servers]]
-alias = "prod"
-display-name = "Alice"
+label = "prod"
+username = "Alice"
 token = "client-generated-token-with-at-least-32-bytes"
 tcp-addr = "chat.example.com:443"
 udp-addr = "media.example.com:54100"
@@ -1248,8 +1213,8 @@ room-id = 1
 active-server = "lab"
 
 [[servers]]
-alias = "lab"
-display-name = "Carol"
+label = "lab"
+username = "Carol"
 token = "carol-dev-token"
 tcp-addr = "127.0.0.1:42000"
 server-public-key = ""

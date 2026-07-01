@@ -1,6 +1,6 @@
 [[servers]]
-alias = "local"
-display-name = "Carol Soundboard"
+label = "local"
+username = "Carol Soundboard"
 token = "carol-dev-token"
 server-public-key = ""
 tcp-addr = "127.0.0.1:41000"
