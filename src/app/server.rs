@@ -71,6 +71,15 @@ pub(crate) struct ServerEditUpdate {
 
 pub(crate) struct PendingPair {
     pub(crate) server: ServerEntry,
+    /// Open-pairing context: the existing token to preserve identity on re-pair
+    /// (empty on a first join). `None` for invite pairing.
+    pub(crate) open: Option<String>,
+    pub(crate) completion: PairCompletion,
+}
+
+pub(crate) enum PairCompletion {
+    OpenEditor,
+    Reconnect { label: String },
 }
 
 impl ServerEditDraft {
@@ -371,14 +380,19 @@ pub(crate) fn random_token() -> Result<String, String> {
 }
 
 pub(crate) fn default_join_alias(ticket: &InviteTicket) -> String {
-    let host = if let Ok(addr) = ticket.tcp_addr.parse::<std::net::SocketAddr>() {
+    alias_from_tcp_addr(&ticket.tcp_addr)
+}
+
+/// Derives a friendly server alias from a `host:port` control address, matching
+/// [`default_join_alias`] so open pairing and invite pairing name servers alike.
+pub(crate) fn alias_from_tcp_addr(tcp_addr: &str) -> String {
+    let host = if let Ok(addr) = tcp_addr.parse::<std::net::SocketAddr>() {
         if addr.ip().is_loopback() {
             return "local".to_string();
         }
         addr.ip().to_string()
     } else {
-        ticket
-            .tcp_addr
+        tcp_addr
             .rsplit_once(':')
             .map(|(host, _)| host.trim_matches(['[', ']']).to_string())
             .unwrap_or_else(|| "server".to_string())

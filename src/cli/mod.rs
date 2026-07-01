@@ -52,12 +52,12 @@ without a subcommand to launch the interactive client.",
         Command {
             name: "pair",
             aliases: &[],
-            about: "Pair with a server from an invite ticket.",
+            about: "Pair with a server from an invite ticket or a public address.",
             long_about: "",
             args: &[Arg {
                 name: "join_string",
-                value_name: "JOIN_STRING",
-                help: "The invite ticket to decode for pairing",
+                value_name: "TICKET_OR_ADDRESS",
+                help: "An invite ticket (tcj1_...) or a public server host:port",
                 required: true,
                 possible: &[],
             }],
@@ -328,10 +328,16 @@ fn dispatch(matches: &Matches) -> Result<(), Box<dyn std::error::Error>> {
 
     match matches.subcommand() {
         Some(("pair", sub)) => {
-            let join_string = sub.value_of("join_string").unwrap_or_default();
-            let ticket = rpc::control::decode_invite_ticket(join_string)?;
+            let target = sub.value_of("join_string").unwrap_or_default().trim();
+            let pending = if target.starts_with(rpc::control::JOIN_STRING_PREFIX) {
+                crate::app::PendingJoin::Invite(rpc::control::decode_invite_ticket(target)?)
+            } else {
+                crate::app::PendingJoin::Open {
+                    addr: parse_pair_address(target)?,
+                }
+            };
             let config = Config::load(config_path)?;
-            runtime::run_app(config, Some(ticket))
+            runtime::run_app(config, Some(pending))
         }
         Some(("upload", sub)) => {
             let path = absolute_upload_path(Path::new(sub.value_of("path").unwrap_or_default()))?;
@@ -553,6 +559,25 @@ fn parse_u64_cli_value(value: &str, name: &str) -> Result<u64, String> {
         value
             .parse::<u64>()
             .map_err(|error| format!("invalid {name}: {error}"))
+    }
+}
+
+/// Validates a `chatt pair` argument that is not an invite ticket as a
+/// `host:port` server address, returning it unchanged.
+fn parse_pair_address(target: &str) -> Result<String, String> {
+    if target.is_empty() {
+        return Err("usage: chatt pair <host:port | invite-ticket>".to_string());
+    }
+    if target.parse::<std::net::SocketAddr>().is_ok() {
+        return Ok(target.to_string());
+    }
+    match target.rsplit_once(':') {
+        Some((host, port)) if !host.trim().is_empty() && port.parse::<u16>().is_ok() => {
+            Ok(target.to_string())
+        }
+        _ => Err(format!(
+            "invalid server address '{target}'; expected host:port or an invite ticket"
+        )),
     }
 }
 

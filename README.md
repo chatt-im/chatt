@@ -345,9 +345,10 @@ token-hash = "sha256:..."
 
 `tcp-addr`, `udp-addr`, and `udp-probe-addr` are bind addresses on the server
 host. `public-tcp-addr`, `public-udp-addr`, and `public-udp-probe-addr` are the
-connection details embedded in invites. Set the public fields when clients need
-a DNS name, public IP, reverse proxy port, or NAT-forwarded port. When omitted,
-the public fields default to the corresponding bind address.
+connection details embedded in invites and returned during open pairing. Set the
+public fields when clients need a DNS name, public IP, reverse proxy port, or
+NAT-forwarded port. When omitted, the public fields default to the corresponding
+bind address.
 
 Replace the development `server-identity-seed` and user token hashes before
 using a server outside local testing. `name` is the admin-chosen internal
@@ -361,6 +362,19 @@ server-relayed UDP media transport. Set it to `false` only for trusted local
 networks or debugging; the server still signs that plaintext decision, but user
 tokens, pairing codes, chat, files, and server-relayed media are sent without
 confidentiality.
+
+`public = true` opens the server to self-service joining: a client runs
+`chatt pair <host:port>` with no admin invite. The server stores no row per
+open user. It hands out ids from `next-dynamic-user-id` (starting at
+`4294967296`, leaving ids below that for explicit `[[users]]`) and issues a
+sealed bearer token that carries the user id and the `password-epoch`. Set
+`password` to gate open joining behind a shared secret. New anonymous dynamic
+user allocations are rate-limited per source IP and globally to protect the
+server config write path. Bump `password-epoch` to invalidate every issued
+dynamic token, forcing affected clients to re-pair with the current password
+while keeping their user id. Changing `password` without bumping the epoch
+leaves existing tokens valid. `public` defaults to `false`; when false, dynamic
+tokens are rejected and only invite-based and explicit users can authenticate.
 
 `chat-history-limit = 0` means the server relays chat without retaining message
 bodies for future room joins. Raising the value keeps that many messages in
@@ -412,6 +426,23 @@ entry with the new token, and the server writes `token-hash` plus the
 only held in server memory and are removed when replaced, expired, or
 successfully used.
 
+### Open Pairing
+
+When the server sets `public = true`, no invite is needed. Pair with a bare
+address:
+
+```sh
+cargo run -p chatt -- pair 127.0.0.1:41000
+```
+
+The client trusts the server's public key on first use and pins it. If the
+server has a `password`, the client shows a prompt (input masked), pins the key
+from the first response, and retries only against that key. The server allocates
+a dynamic user id, issues a bearer token, returns its public UDP endpoints, and
+the client stores a labeled `[[servers]]` entry exactly like invite pairing.
+After the admin bumps `password-epoch`, the next connection is prompted to
+re-enter the password and keeps its user id.
+
 ## Security Notes
 
 See [docs/encryption-protocol.md](docs/encryption-protocol.md) for the protocol
@@ -423,8 +454,12 @@ Current status:
   encrypted after the handshake. Encryption is enabled by default.
 - UDP media uses an anti-replay window. Encrypted TCP control uses strict
   counters.
-- User tokens are stored on the server as `sha256:` hashes. Invite codes are
-  ephemeral server memory only and expire after 24 hours.
+- Explicit user tokens are stored on the server as `sha256:` hashes. Invite
+  codes are ephemeral server memory only and expire after 24 hours.
+- Open-pairing tokens are stateless: the server stores no per-user row, only a
+  counter and the password epoch. A token is a ChaCha20-Poly1305 sealed blob
+  keyed from `server-identity-seed`, so only the issuing server can mint or read
+  one. Revocation is global, by disabling `public` or bumping `password-epoch`.
 - The server is trusted and not end-to-end encrypted.
 - The current handshake uses X25519 and Ed25519. It is not yet
   quantum-resistant; the documented next step is a hybrid X25519 + ML-KEM

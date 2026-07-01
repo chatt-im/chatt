@@ -17,6 +17,9 @@ use toml_spanner::{Item, Toml};
 pub const DEFAULT_SERVER_CONFIG: &str = include_str!("../../../chatt-server.toml");
 const SECRET_HASH_PREFIX: &str = "sha256:";
 const SHA256_HEX_LEN: usize = 64;
+/// First user id handed out to a dynamic (open-paired) user. Ids below this are
+/// reserved for explicit `[[users]]` entries.
+pub const FIRST_DYNAMIC_USER_ID: u64 = u32::MAX as u64 + 1;
 
 #[derive(Clone, Debug, Toml)]
 #[toml(FromToml, rename_all = "kebab-case")]
@@ -65,6 +68,19 @@ pub struct SecurityConfig {
     /// when unset.
     #[toml(default)]
     pub bug_report_dir: Option<String>,
+    /// Whether users may self-join via `chatt pair <addr>` without an admin invite.
+    #[toml(default)]
+    pub public: bool,
+    /// Shared secret required for open pairing. `None`/empty means no password.
+    #[toml(default)]
+    pub password: Option<String>,
+    /// Current password epoch. Dynamic tokens embed the epoch they were issued
+    /// under. Bumping this invalidates existing tokens.
+    #[toml(default)]
+    pub password_epoch: u32,
+    /// Next id to hand out to a dynamic user. Persisted so ids never repeat.
+    #[toml(default = FIRST_DYNAMIC_USER_ID)]
+    pub next_dynamic_user_id: u64,
 }
 
 impl Default for SecurityConfig {
@@ -76,6 +92,10 @@ impl Default for SecurityConfig {
             chat_history_limit: 0,
             max_file_size_bytes: DEFAULT_FILE_SIZE_LIMIT_BYTES,
             bug_report_dir: None,
+            public: false,
+            password: None,
+            password_epoch: 0,
+            next_dynamic_user_id: FIRST_DYNAMIC_USER_ID,
         }
     }
 }
@@ -119,7 +139,7 @@ pub struct Config {
     pub security: SecurityConfig,
     #[toml(default = default_rooms())]
     pub rooms: Vec<RoomConfig>,
-    #[toml(default = default_users())]
+    #[toml(default)]
     pub users: Vec<UserConfig>,
     #[toml(skip)]
     pub config_path: Option<PathBuf>,
@@ -220,6 +240,42 @@ impl Config {
         Ok(self.users.last().expect("user was just inserted").clone())
     }
 
+    pub fn is_public(&self) -> bool {
+        self.security.public
+    }
+
+    pub fn password(&self) -> Option<&str> {
+        self.security
+            .password
+            .as_deref()
+            .filter(|password| !password.is_empty())
+    }
+
+    pub fn password_epoch(&self) -> u32 {
+        self.security.password_epoch
+    }
+
+    /// Reserves the next dynamic user id, persisting the advanced counter so ids
+    /// never repeat across restarts. Rolls back the in-memory counter if the
+    /// config write fails.
+    pub fn allocate_dynamic_user_id(&mut self) -> Result<UserId, String> {
+        let id = self.security.next_dynamic_user_id;
+        if id < FIRST_DYNAMIC_USER_ID {
+            return Err(format!(
+                "next dynamic user id must be at least {FIRST_DYNAMIC_USER_ID}"
+            ));
+        }
+        let next = id
+            .checked_add(1)
+            .ok_or_else(|| "no dynamic user ids are available".to_string())?;
+        self.security.next_dynamic_user_id = next;
+        if let Err(error) = self.save_runtime() {
+            self.security.next_dynamic_user_id = id;
+            return Err(error);
+        }
+        Ok(UserId(id))
+    }
+
     pub fn set_user_display_name(
         &mut self,
         user_name: &str,
@@ -273,9 +329,6 @@ impl Config {
         if self.rooms.is_empty() {
             return Err(format!("{source}: at least one room is required"));
         }
-        if self.users.is_empty() {
-            return Err(format!("{source}: at least one user is required"));
-        }
         server_key_pair_from_seed_hex(&self.security.server_identity_seed)
             .map_err(|error| format!("{source}: invalid security.server-identity-seed: {error}"))?;
         validate_endpoint(
@@ -290,6 +343,11 @@ impl Config {
         )?;
         if let Some(addr) = &self.network.public_udp_probe_addr {
             validate_endpoint(source, "network.public-udp-probe-addr", addr)?;
+        }
+        if self.security.next_dynamic_user_id < FIRST_DYNAMIC_USER_ID {
+            return Err(format!(
+                "{source}: security.next-dynamic-user-id must be at least {FIRST_DYNAMIC_USER_ID}"
+            ));
         }
 
         let mut room_ids = HashSet::new();
@@ -315,6 +373,12 @@ impl Config {
         for user in &self.users {
             if user.id == UserId(0) {
                 return Err(format!("{source}: user id must be non-zero"));
+            }
+            if user.id.0 >= FIRST_DYNAMIC_USER_ID {
+                return Err(format!(
+                    "{source}: user {} id must be below {FIRST_DYNAMIC_USER_ID}; higher ids are reserved for dynamic users",
+                    user.name
+                ));
             }
             if user.name.trim().is_empty() {
                 return Err(format!("{source}: user name must not be empty"));
@@ -408,6 +472,18 @@ impl Config {
         if let Some(dir) = &self.security.bug_report_dir {
             out.push_str(&format!("bug-report-dir = \"{}\"\n", toml_quote_value(dir)));
         }
+        out.push_str(&format!("public = {}\n", self.security.public));
+        if let Some(password) = &self.security.password {
+            out.push_str(&format!("password = \"{}\"\n", toml_quote_value(password)));
+        }
+        out.push_str(&format!(
+            "password-epoch = {}\n",
+            self.security.password_epoch
+        ));
+        out.push_str(&format!(
+            "next-dynamic-user-id = {}\n",
+            self.security.next_dynamic_user_id
+        ));
         out.push('\n');
         for room in &self.rooms {
             out.push_str("[[rooms]]\n");
@@ -441,11 +517,6 @@ fn parse_config_content(
     let mut doc = toml_spanner::parse(content, &arena)
         .map_err(|err| format!("failed to parse {source}: {err}"))?;
     reject_deprecated_config_keys(&doc, source)?;
-    if config_path.is_some() && !doc.table().contains_key("users") {
-        return Err(format!(
-            "{source}: persisted server config must contain a users section"
-        ));
-    }
     let udp_addr_configured = network_contains_key(&doc, "udp-addr");
     let mut config: Config = doc.to().map_err(|err| {
         let errors: Vec<String> = err.errors.iter().map(ToString::to_string).collect();
@@ -604,7 +675,7 @@ pub fn verify_secret_hash(stored_hash: &str, secret: &str) -> bool {
     constant_time_eq(&expected, digest.as_ref())
 }
 
-fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+pub fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
     if left.len() != right.len() {
         return false;
     }
@@ -703,32 +774,6 @@ fn default_rooms() -> Vec<RoomConfig> {
     }]
 }
 
-fn default_users() -> Vec<UserConfig> {
-    vec![
-        UserConfig {
-            id: UserId(1),
-            name: "alice".to_string(),
-            display_name: "Alice".to_string(),
-            token_hash: "sha256:8989ee243a8829e3364b6eb9cae74f1edfa53e327e5718fe337d23d6ab8b4625"
-                .to_string(),
-        },
-        UserConfig {
-            id: UserId(2),
-            name: "bob".to_string(),
-            display_name: "Bob".to_string(),
-            token_hash: "sha256:fd57e39ef28a47298ae51762fd3c907253ac7d4b7507fdf28fcf6d5e4bbaeb8a"
-                .to_string(),
-        },
-        UserConfig {
-            id: UserId(3),
-            name: "carol".to_string(),
-            display_name: "Carol".to_string(),
-            token_hash: "sha256:f93be296b384d5f0f8760bdb53cf3ea52a5e41e6f7a532645458784ece411f62"
-                .to_string(),
-        },
-    ]
-}
-
 fn toml_quote_value(value: &str) -> String {
     let mut out = String::with_capacity(value.len());
     for ch in value.chars() {
@@ -763,6 +808,83 @@ mod tests {
         assert!(config.security.encryption);
         assert_eq!(config.security.chat_history_limit, 0);
         assert_eq!(config.rooms[0].room_id(), RoomId(1));
+    }
+
+    #[test]
+    fn config_with_zero_users_validates() {
+        let mut config = Config::default();
+        config.config_path = None;
+        config.users.clear();
+        config.validate("<test>").unwrap();
+    }
+
+    #[test]
+    fn allocate_dynamic_user_id_starts_increments_and_persists() {
+        let path = std::env::temp_dir().join(format!(
+            "chatt-open-alloc-{}-{}.toml",
+            std::process::id(),
+            FIRST_DYNAMIC_USER_ID
+        ));
+        let _ = fs::remove_file(&path);
+        let mut config = Config::default();
+        config.config_path = Some(path.clone());
+
+        assert_eq!(
+            config.allocate_dynamic_user_id().unwrap(),
+            UserId(FIRST_DYNAMIC_USER_ID)
+        );
+        assert_eq!(
+            config.allocate_dynamic_user_id().unwrap(),
+            UserId(FIRST_DYNAMIC_USER_ID + 1)
+        );
+        assert_eq!(
+            config.security.next_dynamic_user_id,
+            FIRST_DYNAMIC_USER_ID + 2
+        );
+
+        let content = fs::read_to_string(&path).unwrap();
+        let reloaded = parse_config_content(&content, "<test>", Some(path.clone())).unwrap();
+        assert_eq!(
+            reloaded.security.next_dynamic_user_id,
+            FIRST_DYNAMIC_USER_ID + 2
+        );
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn allocate_dynamic_user_id_rejects_explicit_range_counter() {
+        let mut config = Config::default();
+        config.security.next_dynamic_user_id = FIRST_DYNAMIC_USER_ID - 1;
+
+        let error = config.allocate_dynamic_user_id().unwrap_err();
+
+        assert!(error.contains("next dynamic user id"));
+    }
+
+    #[test]
+    fn config_rejects_dynamic_counter_below_reserved_range() {
+        let content = DEFAULT_SERVER_CONFIG.replace(
+            "next-dynamic-user-id = 4294967296",
+            "next-dynamic-user-id = 42",
+        );
+
+        let error = parse_config_content(&content, "<test>", Some(PathBuf::from("server.toml")))
+            .unwrap_err();
+
+        assert!(error.contains("next-dynamic-user-id"));
+    }
+
+    #[test]
+    fn config_rejects_explicit_user_id_in_dynamic_range() {
+        let content = DEFAULT_SERVER_CONFIG.replace(
+            "id = 1\nname = \"alice\"",
+            &format!("id = {FIRST_DYNAMIC_USER_ID}\nname = \"alice\""),
+        );
+
+        let error = parse_config_content(&content, "<test>", Some(PathBuf::from("server.toml")))
+            .unwrap_err();
+
+        assert!(error.contains("reserved for dynamic users"));
     }
 
     #[test]
@@ -1007,20 +1129,21 @@ mod tests {
     }
 
     #[test]
-    fn persisted_config_without_users_is_rejected() {
+    fn persisted_public_config_without_users_is_accepted() {
         let content = Config::default().to_toml_string();
         let content = content
             .split("[[users]]")
             .next()
             .expect("default config has users")
-            .to_string();
-        let error = parse_config_content(
+            .replace("public = false", "public = true");
+        let config = parse_config_content(
             &content,
             "<persisted>",
             Some(PathBuf::from("chatt-server.toml")),
         )
-        .unwrap_err();
+        .unwrap();
 
-        assert!(error.contains("users section"));
+        assert!(config.security.public);
+        assert!(config.users.is_empty());
     }
 }
