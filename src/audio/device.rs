@@ -22,7 +22,8 @@ use crate::audio::{
     capture::EchoCancellationControl,
     diagnostics::LivePlaybackWavRecorderHandle,
     playback::{
-        LivePlaybackMixer, LivePlaybackMixerEvent, LivePlaybackSharedSnapshot, SpscSwapQueue,
+        LivePlaybackMixer, LivePlaybackMixerEvent, LivePlaybackSharedSnapshot, MIX_FRAME_SAMPLES,
+        SpscSwapQueue,
     },
     resample::PlaybackResampler,
     shared::{
@@ -1254,6 +1255,7 @@ where
     let _ = shared_snapshot;
     let mut resampler = PlaybackResampler::new(device_rate);
     let mut pending_event = LivePlaybackMixerEvent::default();
+    let mut mix_adapter = LivePlaybackMixAdapter::new();
     let mut playback_record_block = Vec::with_capacity(SAMPLE_RATE as usize);
     device
         .build_output_stream(
@@ -1271,6 +1273,7 @@ where
                     echo_control.as_ref(),
                     playback_recorder.as_ref(),
                     &mut playback_record_block,
+                    &mut mix_adapter,
                     resampler.as_mut(),
                     now,
                 );
@@ -1318,7 +1321,60 @@ fn drain_live_playback_mixer_events(
             LivePlaybackMixerEvent::SetStreamControl { stream_id, control } => {
                 mixer.set_stream_control(stream_id, control);
             }
+            LivePlaybackMixerEvent::SetStreamIntentionalDrain {
+                stream_id,
+                intentional,
+            } => {
+                mixer.set_stream_intentional_drain(stream_id, intentional);
+            }
         }
+    }
+}
+
+struct LivePlaybackMixAdapter {
+    carry: [f32; MIX_FRAME_SAMPLES],
+    carry_cursor: usize,
+    carry_len: usize,
+}
+
+impl LivePlaybackMixAdapter {
+    fn new() -> Self {
+        Self {
+            carry: [0.0; MIX_FRAME_SAMPLES],
+            carry_cursor: MIX_FRAME_SAMPLES,
+            carry_len: MIX_FRAME_SAMPLES,
+        }
+    }
+
+    fn fill(&mut self, mixer: &mut LivePlaybackMixer, out: &mut [f32], callback_frames: usize) {
+        mixer.note_device_callback_frames(callback_frames);
+        let mut written = 0;
+        while written < out.len() {
+            if self.carry_cursor >= self.carry_len {
+                mixer.mix_10ms(&mut self.carry);
+                self.carry_cursor = 0;
+                self.carry_len = MIX_FRAME_SAMPLES;
+            }
+
+            let available = self.carry_len - self.carry_cursor;
+            let count = available.min(out.len() - written);
+            out[written..written + count]
+                .copy_from_slice(&self.carry[self.carry_cursor..self.carry_cursor + count]);
+            self.carry_cursor += count;
+            written += count;
+        }
+    }
+
+    fn next_sample(&mut self, mixer: &mut LivePlaybackMixer, callback_frames: usize) -> f32 {
+        mixer.note_device_callback_frames(callback_frames);
+        if self.carry_cursor >= self.carry_len {
+            mixer.mix_10ms(&mut self.carry);
+            self.carry_cursor = 0;
+            self.carry_len = MIX_FRAME_SAMPLES;
+        }
+        let sample = self.carry[self.carry_cursor];
+        self.carry_cursor += 1;
+        sample
     }
 }
 
@@ -1396,8 +1452,9 @@ fn live_playback_callback<T>(
     echo_control: Option<&Arc<EchoCancellationControl>>,
     playback_recorder: Option<&LivePlaybackWavRecorderHandle>,
     playback_record_block: &mut Vec<f32>,
+    mix_adapter: &mut LivePlaybackMixAdapter,
     mut resampler: Option<&mut PlaybackResampler>,
-    now: Instant,
+    _now: Instant,
 ) where
     T: Sample + FromSample<f32>,
 {
@@ -1414,12 +1471,11 @@ fn live_playback_callback<T>(
             let source_block = resampler.source_block_samples(output_frames);
             for frame in output.chunks_mut(channels.get()) {
                 let sample = resampler.next_sample(|block| {
-                    for source in block.iter_mut() {
-                        let mixed = mixer.pop_mixed_output_sample(now, source_block);
+                    mix_adapter.fill(mixer, block, source_block);
+                    for &mixed in block.iter() {
                         if let Some(writer) = echo_writer.as_mut() {
                             writer.push(mixed);
                         }
-                        *source = mixed;
                     }
                     if let Some(recorder) = playback_recorder {
                         recorder.record_samples(block);
@@ -1436,7 +1492,7 @@ fn live_playback_callback<T>(
                 playback_record_block.resize(output_frames, 0.0);
             }
             for (index, frame) in output.chunks_mut(channels.get()).enumerate() {
-                let sample = mixer.pop_mixed_output_sample(now, output_frames);
+                let sample = mix_adapter.next_sample(mixer, output_frames);
                 if let Some(writer) = echo_writer.as_mut() {
                     writer.push(sample);
                 }
@@ -1685,6 +1741,54 @@ mod tests {
         downmix_to_mono_i16_scale_into(&[0.1f32, 0.2, 0.3, 0.4], 2, &mut mono);
         assert_eq!(mono.len(), 2);
         assert_eq!(mono.capacity(), capacity_before);
+    }
+
+    fn sample_ring_with(samples: &[f32]) -> Arc<crate::audio::playback::SampleRing> {
+        let ring = Arc::new(crate::audio::playback::SampleRing::with_capacity(
+            samples.len().max(1) * 2,
+        ));
+        ring.write_samples(samples);
+        ring
+    }
+
+    #[test]
+    fn adapter_serves_arbitrary_callback_sizes_deterministically() {
+        let callback_sizes = [137, 480, 843, 33, 511, 960, 17];
+        let total = callback_sizes.iter().sum::<usize>();
+        let samples: Vec<f32> = (0..total + MIX_FRAME_SAMPLES * 2)
+            .map(|index| (index % 97) as f32 / 1000.0)
+            .collect();
+
+        let mut reference_mixer = LivePlaybackMixer::new();
+        reference_mixer.ensure_stream(1, sample_ring_with(&samples));
+        let mut reference = Vec::new();
+        while reference.len() < total {
+            let mut frame = [0.0; MIX_FRAME_SAMPLES];
+            reference_mixer.mix_10ms(&mut frame);
+            reference.extend_from_slice(&frame);
+        }
+
+        let mut mixer = LivePlaybackMixer::new();
+        mixer.ensure_stream(1, sample_ring_with(&samples));
+        let mut adapter = LivePlaybackMixAdapter::new();
+        let mut served = Vec::new();
+        for callback_frames in callback_sizes {
+            let start = served.len();
+            served.resize(start + callback_frames, 0.0);
+            adapter.fill(
+                &mut mixer,
+                &mut served[start..start + callback_frames],
+                callback_frames,
+            );
+        }
+
+        assert_eq!(served.len(), total);
+        for (index, (&served, &expected)) in served.iter().zip(reference.iter()).enumerate() {
+            assert!(
+                (served - expected).abs() < 1e-6,
+                "sample {index}: served {served}, expected {expected}"
+            );
+        }
     }
 
     #[test]

@@ -15,8 +15,8 @@ use crate::{
         lifecycle::LivePlaybackCommand,
         playback::{
             LivePlaybackFeedbackState, LivePlaybackMixer, LivePlaybackMixerEvent,
-            LivePlaybackMixerStats, LivePlaybackSharedSnapshot, RingPlaybackProducer, SampleRing,
-            SpscSwapQueue,
+            LivePlaybackMixerStats, LivePlaybackSharedSnapshot, ProducedBlock,
+            RingPlaybackProducer, SampleRing, SpscSwapQueue,
             neteq::{NetEqCore, NetEqDiagnostics},
         },
         shared::{
@@ -173,6 +173,29 @@ fn push_mixer_event(
     false
 }
 
+fn push_intentional_drain_event(
+    stream_id: u32,
+    intentional: bool,
+    mixer_intentional_drains: &mut HashMap<u32, bool>,
+    mixer_events: &SpscSwapQueue<LivePlaybackMixerEvent>,
+    dropped_mixer_events: &mut u64,
+) {
+    if mixer_intentional_drains
+        .get(&stream_id)
+        .is_some_and(|&previous| previous == intentional)
+    {
+        return;
+    }
+
+    let event = LivePlaybackMixerEvent::SetStreamIntentionalDrain {
+        stream_id,
+        intentional,
+    };
+    if push_mixer_event(mixer_events, dropped_mixer_events, event) {
+        mixer_intentional_drains.insert(stream_id, intentional);
+    }
+}
+
 /// Pumps one stream's NetEQ output into its ring and closes the feedback window.
 /// Takes the stream and producer as disjoint borrows so the `get_audio` closure
 /// (which borrows the stream's core) and the producer can be mutated together.
@@ -199,7 +222,18 @@ fn drain_pump_stream(
         // so the talkspurt merges back in seamlessly. Never short-circuit this, or the
         // catch-up cannot happen and the resume clicks. A muted sender's audio is
         // faded to silence on the way in, so the expansion it conceals is silence too.
-        producer.pump(block, |out| Some(core.get_audio(out)), stats);
+        producer.pump(
+            block,
+            |out| {
+                let result = core.get_audio(out);
+                if result.muted {
+                    ProducedBlock::Muted(result)
+                } else {
+                    ProducedBlock::Audio(result)
+                }
+            },
+            stats,
+        );
     }
 
     let output_ring_ms = samples_to_ms(producer.buffered_samples());
@@ -255,6 +289,7 @@ pub(crate) struct LiveDecodeStreams {
     streams: HashMap<u32, LiveDecodeStream>,
     producers: HashMap<u32, RingPlaybackProducer>,
     mixer_streams: HashSet<u32>,
+    mixer_intentional_drains: HashMap<u32, bool>,
     stats: LivePlaybackMixerStats,
     block_samples: usize,
     dropped_mixer_events: u64,
@@ -269,6 +304,7 @@ impl LiveDecodeStreams {
             streams: HashMap::new(),
             producers: HashMap::new(),
             mixer_streams: HashSet::new(),
+            mixer_intentional_drains: HashMap::new(),
             stats: LivePlaybackMixerStats::default(),
             block_samples: FRAME_SAMPLES,
             dropped_mixer_events: 0,
@@ -319,7 +355,11 @@ impl LiveDecodeStreams {
     }
 
     pub(crate) fn set_block_samples(&mut self, block_samples: usize) {
-        self.block_samples = block_samples.max(FRAME_SAMPLES);
+        self.block_samples = if block_samples == 0 {
+            FRAME_SAMPLES
+        } else {
+            block_samples
+        };
     }
 
     pub(crate) fn stats(&self) -> &LivePlaybackMixerStats {
@@ -378,6 +418,7 @@ impl LiveDecodeStreams {
         self.streams.remove(&stream_id);
         self.producers.remove(&stream_id);
         self.mixer_streams.remove(&stream_id);
+        self.mixer_intentional_drains.remove(&stream_id);
     }
 
     pub(crate) fn set_sender_muted(&mut self, stream_id: u32, muted: bool) {
@@ -420,6 +461,13 @@ impl LiveDecodeStreams {
                 now,
                 block,
                 feedback_sender,
+            );
+            push_intentional_drain_event(
+                *stream_id,
+                producer.intentional_drain(),
+                &mut self.mixer_intentional_drains,
+                mixer_events,
+                dropped,
             );
         }
         self.retire_drained_notification(mixer_events);
@@ -466,6 +514,19 @@ impl LiveDecodeStreams {
                 block,
                 feedback_sender,
             );
+            let intentional = producer.intentional_drain();
+            let previous = self
+                .mixer_intentional_drains
+                .get(stream_id)
+                .copied()
+                .unwrap_or(false);
+            if previous != intentional
+                && let Ok(mut mixer) = mixer.lock()
+            {
+                mixer.set_stream_intentional_drain(*stream_id, intentional);
+                self.mixer_intentional_drains
+                    .insert(*stream_id, intentional);
+            }
         }
         let snapshot = self.snapshot_at(now);
         if let Ok(mut mixer) = mixer.lock() {

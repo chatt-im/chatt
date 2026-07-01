@@ -32,6 +32,7 @@ toml-spanner = { version = "1.0.3", features = [
 earshot = "1.1.0"
 zstd = "0.13"
 sonora.path = "crates/sonora/crates/sonora"
+sonora-agc2.path = "crates/sonora/crates/sonora-agc2"
 sonora-common-audio.path = "crates/sonora/crates/sonora-common-audio/"
 foldhash = "0.2.0"
 hashbrown = "0.17.1"

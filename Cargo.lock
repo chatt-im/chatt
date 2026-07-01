@@ -299,6 +299,7 @@ dependencies = [
  "rpc",
  "server",
  "sonora 0.1.0",
+ "sonora-agc2 0.1.0",
  "sonora-common-audio 0.1.0",
  "tempfile",
  "tinyhl",

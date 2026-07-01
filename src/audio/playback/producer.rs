@@ -11,6 +11,83 @@ use crate::audio::{
 /// One 10 ms NetEQ output block at 48 kHz.
 const OUTPUT_BLOCK_SAMPLES: usize = SAMPLE_RATE as usize / 100;
 
+pub(crate) enum ProducedBlock {
+    Audio(AudioResult),
+    Muted(AudioResult),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::audio::{
+        playback::neteq::Mode, shared::DecodedFrameSource, test_support::test_tuning,
+    };
+
+    fn audio_result(muted: bool) -> AudioResult {
+        AudioResult {
+            mode: if muted { Mode::Expand } else { Mode::Normal },
+            source: if muted {
+                DecodedFrameSource::Expand
+            } else {
+                DecodedFrameSource::Normal
+            },
+            muted,
+            time_stretched: 0,
+        }
+    }
+
+    #[test]
+    fn muted_output_is_not_written_to_ring() {
+        let mut producer = RingPlaybackProducer::new(test_tuning()).unwrap();
+        let mut stats = LivePlaybackMixerStats::default();
+
+        producer.pump(
+            OUTPUT_BLOCK_SAMPLES,
+            |out| {
+                out.fill(0.5);
+                ProducedBlock::Muted(audio_result(true))
+            },
+            &mut stats,
+        );
+
+        assert_eq!(producer.buffered_samples(), 0);
+        assert!(producer.intentional_drain());
+        assert!(!producer.voice_active());
+        assert_eq!(producer.voice_rms(), 0.0);
+        assert_eq!(stats.concealment_expands, 1);
+        assert_eq!(stats.expand_samples, OUTPUT_BLOCK_SAMPLES as u64);
+    }
+
+    #[test]
+    fn audio_output_clears_intentional_drain() {
+        let mut producer = RingPlaybackProducer::new(test_tuning()).unwrap();
+        let mut stats = LivePlaybackMixerStats::default();
+
+        producer.pump(
+            OUTPUT_BLOCK_SAMPLES,
+            |_| ProducedBlock::Muted(audio_result(true)),
+            &mut stats,
+        );
+        assert!(producer.intentional_drain());
+
+        producer.pump(
+            OUTPUT_BLOCK_SAMPLES,
+            |out| {
+                out.fill(0.25);
+                ProducedBlock::Audio(audio_result(false))
+            },
+            &mut stats,
+        );
+
+        assert!(!producer.intentional_drain());
+        assert_eq!(
+            producer.buffered_samples(),
+            OUTPUT_BLOCK_SAMPLES * 2,
+            "producer fills one block plus a 10 ms cushion"
+        );
+    }
+}
+
 /// Producer side of one live playback stream.
 ///
 /// Owns the write end of the stream's [`SampleRing`] and pumps 10 ms blocks from
@@ -27,6 +104,7 @@ pub(crate) struct RingPlaybackProducer {
     consumed_underruns: u64,
     last_voice_rms: f32,
     last_voice_active: bool,
+    intentional_drain: bool,
 }
 
 impl RingPlaybackProducer {
@@ -43,6 +121,7 @@ impl RingPlaybackProducer {
             consumed_underruns: 0,
             last_voice_rms: 0.0,
             last_voice_active: false,
+            intentional_drain: false,
         })
     }
 
@@ -64,6 +143,10 @@ impl RingPlaybackProducer {
         self.last_voice_rms
     }
 
+    pub(crate) fn intentional_drain(&self) -> bool {
+        self.intentional_drain
+    }
+
     /// Pumps 10 ms blocks from `produce` into the ring until it holds one device
     /// block plus a 10 ms cushion. `produce` is the stream's `NetEqCore::get_audio`
     /// (or silence while the sender is muted). Folds each block's operation into
@@ -74,7 +157,7 @@ impl RingPlaybackProducer {
         mut produce: F,
         stats: &mut LivePlaybackMixerStats,
     ) where
-        F: FnMut(&mut [f32]) -> Option<AudioResult>,
+        F: FnMut(&mut [f32]) -> ProducedBlock,
     {
         // Fold consumer dry-ring underruns into the stats.
         let observed = self.ring.underruns();
@@ -90,20 +173,23 @@ impl RingPlaybackProducer {
         let mut guard = 0;
         while self.ring.depth() < target && self.ring.free() >= OUTPUT_BLOCK_SAMPLES {
             self.block.fill(0.0);
-            // `None` means the stream has fallen silent (muted, or concealment has
-            // reached the muted state). Stop topping the ring and let it drain, so
-            // an idle or muted stream goes quiet instead of looping silence
-            // forever; the consumer reads the drained ring as silence.
-            let Some(result) = produce(&mut self.block) else {
-                self.last_voice_rms = 0.0;
-                self.last_voice_active = false;
-                break;
+            let produced = produce(&mut self.block);
+            let result = match produced {
+                ProducedBlock::Audio(result) => result,
+                ProducedBlock::Muted(result) => {
+                    self.record_stats(stats, &result);
+                    self.last_voice_rms = 0.0;
+                    self.last_voice_active = false;
+                    self.intentional_drain = true;
+                    break;
+                }
             };
             self.record_stats(stats, &result);
             self.last_voice_rms = rms_normalized(&self.block);
             let energy = self.last_voice_rms * self.last_voice_rms;
             self.last_voice_active =
                 !result.muted && energy > TIME_SCALE_VAD_RATIO * TIME_SCALE_NOISE_FLOOR_MS;
+            self.intentional_drain = false;
             self.ring.write_samples(&self.block);
             guard += 1;
             if guard > 64 {

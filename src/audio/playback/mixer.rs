@@ -5,21 +5,17 @@ use std::{
 
 use hashbrown::HashMap;
 
+use super::frame_combiner::{FrameCombiner, MIX_FRAME_SAMPLES};
 use crate::audio::{
     playback::{RingReader, SampleRing},
     shared::{
-        AUDIO_POP_DELTA_THRESHOLD, FRAME_SAMPLES, LivePlaybackSnapshot, PlaybackStreamControl,
+        AUDIO_POP_DELTA_THRESHOLD, LivePlaybackSnapshot, PlaybackStreamControl,
         audio_pop_logging_enabled, db_to_gain, max_adjacent_delta, peak_normalized, rms_normalized,
-        soft_limit,
     },
 };
 
 const LIVE_PLAYBACK_BACKEND_ERROR_LOG_INTERVAL: Duration = Duration::from_secs(1);
 const LIVE_PLAYBACK_PREALLOCATED_STREAMS: usize = 32;
-/// Reusable per-frame active-stream tally capacity. Large enough for the
-/// deepest device callback so the consumer never reallocates on the audio
-/// thread.
-const LIVE_PLAYBACK_MIX_SCRATCH: usize = 8_192;
 /// Conceal tiny producer/callback edge misses without escalating them into
 /// output-ring underruns. At 48 kHz the floor is 2 ms; larger host periods
 /// may conceal up to 10% of the callback, which is still bounded to the current
@@ -56,12 +52,12 @@ pub(crate) struct LivePlaybackMixer {
     backend_stream_errors: u64,
     last_backend_error: Option<String>,
     last_backend_error_log_at: Option<Instant>,
-    /// Per-frame count of streams that contributed a sample, reused across
-    /// callbacks to avoid allocation.
-    active_scratch: Vec<u32>,
-    /// Block-fill cache backing the per-sample `pop_mixed_*` interface. One
-    /// `fill_block` runs per block; per-sample callers read out of `fill`.
-    fill: Vec<f32>,
+    /// Per-stream rendered 10 ms source frames, reused across callbacks to avoid
+    /// allocation on the audio thread.
+    source_frames: Vec<[f32; MIX_FRAME_SAMPLES]>,
+    combiner: FrameCombiner,
+    /// Fixed 10 ms cache backing the legacy per-sample `pop_mixed_*` interface.
+    fill: [f32; MIX_FRAME_SAMPLES],
     fill_cursor: usize,
     /// Diagnostics snapshot the producer stashes here, so the UI and the
     /// single-threaded simulation can read depth through this consumer.
@@ -80,6 +76,9 @@ struct ConsumerStream {
     /// Declick envelope, 0.0..=1.0. Starts at 0.0 so the stream's first audio
     /// fades in instead of stepping from silence; ramps back to 0.0 on dry/mute.
     declick_gain: f32,
+    /// The producer has reached NetEQ muted output and is intentionally letting
+    /// the ring drain instead of writing all-zero blocks.
+    intentional_drain: bool,
 }
 
 impl Default for LivePlaybackMixer {
@@ -108,9 +107,10 @@ impl LivePlaybackMixer {
             backend_stream_errors: 0,
             last_backend_error: None,
             last_backend_error_log_at: None,
-            active_scratch: Vec::with_capacity(LIVE_PLAYBACK_MIX_SCRATCH),
-            fill: Vec::with_capacity(LIVE_PLAYBACK_MIX_SCRATCH),
-            fill_cursor: 0,
+            source_frames: Vec::with_capacity(LIVE_PLAYBACK_PREALLOCATED_STREAMS),
+            combiner: FrameCombiner::default(),
+            fill: [0.0; MIX_FRAME_SAMPLES],
+            fill_cursor: MIX_FRAME_SAMPLES,
             last_snapshot: LivePlaybackSnapshot::default(),
             block_hint: None,
             last_output_sample: 0.0,
@@ -152,17 +152,13 @@ impl LivePlaybackMixer {
 
     /// Mixes one mono sample, refilling the block cache once per `block`.
     pub(crate) fn pop_mixed_output_sample(&mut self, _now: Instant, block: usize) -> f32 {
-        let block = block.max(1);
-        if self.fill_cursor >= self.fill.len() {
+        if self.fill_cursor >= MIX_FRAME_SAMPLES {
             if let Some(hint) = &self.block_hint {
-                hint.store(block, std::sync::atomic::Ordering::Relaxed);
+                hint.store(block.max(1), std::sync::atomic::Ordering::Relaxed);
             }
-            let mut buf = std::mem::take(&mut self.fill);
-            buf.clear();
-            buf.resize(block, 0.0);
-            self.fill_block(&mut buf);
-            self.log_output_block_if_needed(block, &buf);
-            self.fill = buf;
+            let mut fill = [0.0; MIX_FRAME_SAMPLES];
+            self.mix_10ms(&mut fill);
+            self.fill = fill;
             self.fill_cursor = 0;
         }
         let sample = self.fill[self.fill_cursor];
@@ -190,7 +186,11 @@ impl LivePlaybackMixer {
                 control: PlaybackStreamControl::default(),
                 last_sample: 0.0,
                 declick_gain: 0.0,
+                intentional_drain: false,
             });
+        while self.source_frames.len() < self.streams.len() {
+            self.source_frames.push([0.0; MIX_FRAME_SAMPLES]);
+        }
     }
 
     pub(crate) fn remove_stream(&mut self, stream_id: u32) {
@@ -203,123 +203,150 @@ impl LivePlaybackMixer {
         }
     }
 
+    pub(crate) fn set_stream_intentional_drain(&mut self, stream_id: u32, intentional: bool) {
+        if let Some(stream) = self.streams.get_mut(&stream_id) {
+            stream.intentional_drain = intentional;
+        }
+    }
+
     pub(crate) fn active_streams(&self) -> usize {
         self.streams.len()
     }
 
-    /// Mixes one callback block of mono samples into `out`.
-    ///
-    /// For each stream: one acquire-load span snapshot, a plain index mix into
-    /// the accumulator, a dry-ring underrun bump when the span is short, and one
-    /// release-store read advance. Streams are summed and the per-frame total is
-    /// divided by the square root of the active count, then soft-limited, the
-    /// same headroom policy as the old per-sample mixer.
-    pub(crate) fn fill_block(&mut self, out: &mut [f32]) {
-        let frames = out.len();
-        out.fill(0.0);
-        self.active_scratch.clear();
-        self.active_scratch.resize(frames, 0);
-
-        let declick_step = 1.0 / LIVE_PLAYBACK_DECLICK_RAMP_SAMPLES as f32;
-        for (stream_id, stream) in self.streams.iter_mut() {
-            let span = stream.reader.readable_span();
-            let span_len = span.len();
-            let covered = span_len.min(frames);
-            let gain = db_to_gain(stream.control.volume_db);
-            let muted = stream.control.muted;
-            let declick_gain_before = stream.declick_gain;
-            let last_sample_before = stream.last_sample;
-            let first_span_sample = span.get(0).unwrap_or_default();
-            let first_span_delta = if covered > 0 {
-                (first_span_sample - last_sample_before).abs()
-            } else {
-                0.0
-            };
-            // Walk the whole block, ramping a per-stream declick gain toward 1.0
-            // while the stream has audio and toward 0.0 while it is dry or muted.
-            // The gain is tracked linearly, then shaped through `smoothstep` when
-            // applied so the fade to/from silence has no slope kink. Multiplying
-            // that continuous envelope into the output removes the hard step at
-            // speech onset, offset, underrun, and mute that a raw jump between
-            // silence and a mid-amplitude sample would produce. Past the covered
-            // span we hold the last real sample, which only matters while the
-            // envelope is still ramping down; once it reaches 0 the contribution
-            // is silence regardless.
-            for offset in 0..frames {
-                let sample = if offset < covered {
-                    let sample = span.get(offset).unwrap_or(0.0);
-                    stream.last_sample = sample;
-                    sample
-                } else {
-                    stream.last_sample
-                };
-                let target = if !muted && offset < covered { 1.0 } else { 0.0 };
-                if stream.declick_gain < target {
-                    stream.declick_gain = (stream.declick_gain + declick_step).min(target);
-                } else if stream.declick_gain > target {
-                    stream.declick_gain = (stream.declick_gain - declick_step).max(target);
-                }
-                if stream.declick_gain > 0.0 {
-                    out[offset] += sample * gain * smoothstep(stream.declick_gain);
-                    self.active_scratch[offset] += 1;
-                }
-            }
-            // Drop the span before releasing samples: its `&[f32]` into the ring
-            // must die before `advance` publishes the freed read cursor, or the
-            // producer could overwrite still-borrowed slots.
-            drop(span);
-            // Underrun bookkeeping is unchanged: a tiny partial miss within the
-            // concealment floor is a benign callback-edge gap, not a target-widening
-            // underrun. The envelope above already tapers it; this gate only decides
-            // whether it counts against the stream.
-            let missing = frames.saturating_sub(covered);
-            let concealment_limit = if frames >= FRAME_SAMPLES {
-                SHORT_RING_CONCEALMENT_FLOOR_SAMPLES.max(frames / 10)
-            } else {
-                0
-            };
-            let concealed = missing > 0 && covered > 0 && missing <= concealment_limit;
-            if audio_pop_logging_enabled()
-                && (first_span_delta >= AUDIO_POP_DELTA_THRESHOLD
-                    || concealed
-                    || (missing > 0 && covered > 0)
-                    || (declick_gain_before <= 0.0
-                        && covered > 0
-                        && first_span_sample.abs() >= 0.01))
-            {
-                kvlog::info!(
-                    "audio pop mixer stream block",
-                    stream_id = *stream_id,
-                    frames,
-                    span_len,
-                    covered,
-                    missing,
-                    concealed,
-                    muted,
-                    volume_db = stream.control.volume_db,
-                    declick_gain_before,
-                    declick_gain_after = stream.declick_gain,
-                    first_span_sample,
-                    last_sample_before,
-                    first_span_delta,
-                    last_sample_after = stream.last_sample
-                );
-            }
-            if span_len < frames && !concealed {
-                stream.reader.note_underrun();
-            }
-            stream.reader.advance(covered);
-        }
-
-        for (sample, &active) in out.iter_mut().zip(self.active_scratch.iter()) {
-            *sample = match active {
-                0 => 0.0,
-                1 => sample.clamp(-1.0, 1.0),
-                _ => soft_limit(*sample / (active as f32).sqrt()),
-            };
+    pub(crate) fn note_device_callback_frames(&mut self, block: usize) {
+        if let Some(hint) = &self.block_hint {
+            hint.store(block.max(1), std::sync::atomic::Ordering::Relaxed);
         }
     }
 
+    /// Mixes an arbitrary mono block by serving fixed 10 ms mixer frames.
+    pub(crate) fn fill_block(&mut self, out: &mut [f32]) {
+        for sample in out {
+            if self.fill_cursor >= MIX_FRAME_SAMPLES {
+                let mut fill = [0.0; MIX_FRAME_SAMPLES];
+                self.mix_10ms(&mut fill);
+                self.fill = fill;
+                self.fill_cursor = 0;
+            }
+            *sample = self.fill[self.fill_cursor];
+            self.fill_cursor += 1;
+        }
+    }
+
+    pub(crate) fn mix_10ms(&mut self, out: &mut [f32; MIX_FRAME_SAMPLES]) {
+        let number_of_streams = self.streams.len();
+        while self.source_frames.len() < number_of_streams {
+            self.source_frames.push([0.0; MIX_FRAME_SAMPLES]);
+        }
+
+        // Match `/tmp/webrtc/modules/audio_mixer/audio_mixer_impl.cc`: muted
+        // sources are excluded from the normal mix list, while
+        // `number_of_streams` remains the registered source count passed to the
+        // combiner.
+        let mut normal_frames = 0;
+        for (stream_id, stream) in self.streams.iter_mut() {
+            let frame = &mut self.source_frames[normal_frames];
+            if render_stream_10ms(*stream_id, stream, frame) {
+                normal_frames += 1;
+            }
+        }
+
+        self.combiner.combine_contiguous(
+            &self.source_frames[..normal_frames],
+            number_of_streams,
+            out,
+        );
+        self.log_output_block_if_needed(MIX_FRAME_SAMPLES, out);
+    }
+}
+
+fn render_stream_10ms(
+    stream_id: u32,
+    stream: &mut ConsumerStream,
+    out: &mut [f32; MIX_FRAME_SAMPLES],
+) -> bool {
+    out.fill(0.0);
+    let frames = MIX_FRAME_SAMPLES;
+    let declick_step = 1.0 / LIVE_PLAYBACK_DECLICK_RAMP_SAMPLES as f32;
+    let span = stream.reader.readable_span();
+    let span_len = span.len();
+    let covered = span_len.min(frames);
+    let gain = db_to_gain(stream.control.volume_db);
+    let muted = stream.control.muted;
+    let declick_gain_before = stream.declick_gain;
+    let last_sample_before = stream.last_sample;
+    let first_span_sample = span.get(0).unwrap_or_default();
+    let first_span_delta = if covered > 0 {
+        (first_span_sample - last_sample_before).abs()
+    } else {
+        0.0
+    };
+    let mut normal = false;
+    // Walk the whole 10 ms frame, ramping a per-stream declick gain toward 1.0
+    // while the stream has audio and toward 0.0 while it is dry or muted. The
+    // gain is tracked linearly, then shaped through `smoothstep` when applied so
+    // the fade to/from silence has no slope kink. Past the covered span we hold
+    // the last real sample, which only matters while the envelope is still
+    // ramping down; once it reaches 0 the source is excluded from the combiner.
+    for (offset, dst) in out.iter_mut().enumerate() {
+        let sample = if offset < covered {
+            let sample = span.get(offset).unwrap_or(0.0);
+            stream.last_sample = sample;
+            sample
+        } else {
+            stream.last_sample
+        };
+        let target = if !muted && offset < covered { 1.0 } else { 0.0 };
+        if stream.declick_gain < target {
+            stream.declick_gain = (stream.declick_gain + declick_step).min(target);
+        } else if stream.declick_gain > target {
+            stream.declick_gain = (stream.declick_gain - declick_step).max(target);
+        }
+        if stream.declick_gain > 0.0 {
+            *dst = sample * gain * smoothstep(stream.declick_gain);
+            normal = true;
+        }
+    }
+    // Drop the span before releasing samples: its `&[f32]` into the ring must die
+    // before `advance` publishes the freed read cursor, or the producer could
+    // overwrite still-borrowed slots.
+    drop(span);
+    let missing = frames.saturating_sub(covered);
+    let concealment_limit = SHORT_RING_CONCEALMENT_FLOOR_SAMPLES.max(frames / 10);
+    let concealed = missing > 0 && covered > 0 && missing <= concealment_limit;
+    if audio_pop_logging_enabled()
+        && (first_span_delta >= AUDIO_POP_DELTA_THRESHOLD
+            || concealed
+            || (missing > 0 && covered > 0)
+            || (declick_gain_before <= 0.0 && covered > 0 && first_span_sample.abs() >= 0.01))
+    {
+        kvlog::info!(
+            "audio pop mixer stream block",
+            stream_id,
+            frames,
+            span_len,
+            covered,
+            missing,
+            concealed,
+            muted,
+            intentional_drain = stream.intentional_drain,
+            volume_db = stream.control.volume_db,
+            declick_gain_before,
+            declick_gain_after = stream.declick_gain,
+            first_span_sample,
+            last_sample_before,
+            first_span_delta,
+            last_sample_after = stream.last_sample
+        );
+    }
+    if span_len < frames && !concealed && !stream.intentional_drain {
+        stream.reader.note_underrun();
+    }
+    stream.reader.advance(covered);
+    normal
+}
+
+impl LivePlaybackMixer {
     fn log_output_block_if_needed(&mut self, block: usize, out: &[f32]) {
         if out.is_empty() {
             return;
@@ -534,19 +561,68 @@ mod tests {
     }
 
     #[test]
-    fn mixes_concurrent_streams_with_headroom() {
+    fn two_normal_sources_use_sum_limiter_not_sqrt_divisor() {
         let mut mixer = LivePlaybackMixer::new();
-        mixer.ensure_stream(1, ring_with(&[0.4; FRAME_SAMPLES]));
-        mixer.ensure_stream(2, ring_with(&[0.4; FRAME_SAMPLES]));
+        mixer.ensure_stream(1, ring_with(&[0.2; FRAME_SAMPLES]));
+        mixer.ensure_stream(2, ring_with(&[0.2; FRAME_SAMPLES]));
 
         let mut out = vec![0.0; FRAME_SAMPLES];
         mixer.fill_block(&mut out);
 
         // Sample past the declick ramp so both envelopes have reached unity.
-        // Two equal streams: sum 0.8 over sqrt(2) ~= 0.566, then soft-limited.
         let steady = out[FRAME_SAMPLES - 1];
-        assert!(steady > 0.4, "mixed {steady} should exceed one stream");
-        assert!(steady < 0.8, "mixed {steady} should stay below the raw sum");
+        assert!(
+            (steady - 0.4).abs() < 1e-4,
+            "mixed {steady} should be the raw sum"
+        );
+    }
+
+    #[test]
+    fn silent_registered_source_does_not_attenuate_talker() {
+        let mut mixer = LivePlaybackMixer::new();
+        mixer.ensure_stream(1, ring_with(&[0.25; FRAME_SAMPLES]));
+        mixer.ensure_stream(2, ring_with(&[0.0; FRAME_SAMPLES]));
+
+        let mut out = vec![0.0; FRAME_SAMPLES];
+        mixer.fill_block(&mut out);
+
+        let steady = out[FRAME_SAMPLES - 1];
+        assert!(
+            (steady - 0.25).abs() < 1e-6,
+            "silent source attenuated talker to {steady}"
+        );
+    }
+
+    #[test]
+    fn quiet_open_mic_does_not_attenuate_talker() {
+        let mut mixer = LivePlaybackMixer::new();
+        mixer.ensure_stream(1, ring_with(&[0.25; FRAME_SAMPLES]));
+        mixer.ensure_stream(2, ring_with(&[0.000001; FRAME_SAMPLES]));
+
+        let mut out = vec![0.0; FRAME_SAMPLES];
+        mixer.fill_block(&mut out);
+
+        let steady = out[FRAME_SAMPLES - 1];
+        assert!(
+            (steady - 0.250001).abs() < 1e-5,
+            "quiet open mic changed talker level unexpectedly: {steady}"
+        );
+    }
+
+    #[test]
+    fn notification_does_not_duck_speech_by_count() {
+        let mut mixer = LivePlaybackMixer::new();
+        mixer.ensure_stream(1, ring_with(&[0.25; FRAME_SAMPLES]));
+        mixer.ensure_stream(u32::MAX, ring_with(&[0.05; FRAME_SAMPLES]));
+
+        let mut out = vec![0.0; FRAME_SAMPLES];
+        mixer.fill_block(&mut out);
+
+        let steady = out[FRAME_SAMPLES - 1];
+        assert!(
+            (steady - 0.3).abs() < 1e-4,
+            "notification ducked speech instead of summing: {steady}"
+        );
     }
 
     #[test]
@@ -572,7 +648,11 @@ mod tests {
             "the gap edge tapers rather than stepping to 0: {}",
             out[covered]
         );
-        assert_eq!(ring.underruns(), 1, "short span bumped one underrun");
+        assert_eq!(
+            ring.underruns(),
+            2,
+            "fixed 10 ms chunks report each dry chunk as an underrun"
+        );
         assert_eq!(ring.depth(), 0, "the consumer drained what was available");
     }
 
@@ -614,6 +694,24 @@ mod tests {
 
         assert!(out.iter().all(|&s| s == 0.0), "muted stream produced audio");
         assert_eq!(ring.depth(), 0, "muted stream still drained its ring");
+    }
+
+    #[test]
+    fn intentional_muted_drain_does_not_count_as_underrun() {
+        let mut mixer = LivePlaybackMixer::new();
+        let ring = ring_with(&[]);
+        mixer.ensure_stream(1, Arc::clone(&ring));
+        mixer.set_stream_intentional_drain(1, true);
+
+        let mut out = vec![0.0; FRAME_SAMPLES];
+        mixer.fill_block(&mut out);
+
+        assert!(out.iter().all(|&sample| sample == 0.0));
+        assert_eq!(
+            ring.underruns(),
+            0,
+            "intentional muted drain must not look like starvation"
+        );
     }
 
     #[test]
