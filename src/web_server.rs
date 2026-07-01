@@ -279,11 +279,23 @@ enum WebFeed {
 /// reach the app to spawn the viewer connection.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum WebRequest {
-    PlayShare { stream_id: u32 },
-    StopShare { stream_id: u32 },
+    PlayShare {
+        stream_id: u32,
+    },
+    StopShare {
+        stream_id: u32,
+    },
+    /// A chat line the browser composed, sent to the current room.
+    SendChat {
+        body: String,
+    },
+    /// A file the browser uploaded, reassembled to `path` on disk.
+    UploadFile {
+        path: PathBuf,
+    },
 }
 
-/// A request a browser sends over the WebSocket.
+/// A request a browser sends over the WebSocket as a JSON text frame.
 #[derive(Jsony)]
 #[jsony(Json, tag = "type")]
 enum ClientRequest {
@@ -296,6 +308,22 @@ enum ClientRequest {
     /// Asks the app to stop streaming a screen share.
     #[jsony(rename = "stop_share")]
     StopShare { stream_id: u32 },
+    /// A composed chat line to send to the current room. Ignored when read-only.
+    #[jsony(rename = "send_message")]
+    SendMessage { body: String },
+    /// Opens a file upload. The binary chunk frames that follow carry its bytes,
+    /// keyed by `upload_id`, and `upload_finish` closes it. Ignored when
+    /// read-only.
+    #[jsony(rename = "upload_start")]
+    UploadStart {
+        upload_id: u32,
+        name: String,
+        size: u64,
+    },
+    /// Closes the upload opened with the matching `upload_id`, queuing the
+    /// reassembled file for sending.
+    #[jsony(rename = "upload_finish")]
+    UploadFinish { upload_id: u32 },
 }
 
 /// A cloneable handle the app uses to push messages to the web view.
@@ -423,6 +451,7 @@ pub fn spawn(
     receive_dir: Option<PathBuf>,
     max_messages: usize,
     web_requests: Sender<WebRequest>,
+    readonly: bool,
 ) -> io::Result<WebFeedSender> {
     let addr: SocketAddr = cfg.bind.parse().map_err(|error| {
         io::Error::new(
@@ -456,7 +485,7 @@ pub fn spawn(
     let (tx, rx) = mpsc::channel();
     thread::Builder::new()
         .name("web-server".to_string())
-        .spawn(move || run(server, rx, max_messages, web_requests))?;
+        .spawn(move || run(server, rx, max_messages, web_requests, readonly))?;
 
     kvlog::info!("web server listening", addr = %local);
     Ok(WebFeedSender { tx, wake })
@@ -468,7 +497,15 @@ fn run(
     rx: Receiver<WebFeed>,
     max_messages: usize,
     web_requests: Sender<WebRequest>,
+    readonly: bool,
 ) {
+    // Open uploads keyed by connection and browser-assigned id, each an
+    // append-mode file the binary chunk frames stream into until `upload_finish`.
+    // Scoping by connection keeps two browsers (or a reconnect reusing an id)
+    // from colliding, and lets a disconnect drop that client's in-flight files.
+    // Empty and unused when read-only.
+    let mut uploads: std::collections::HashMap<(WebSocketId, u32), UploadSink> =
+        std::collections::HashMap::new();
     let mut history: Vec<WebMessage> = Vec::new();
     // The sequence number of `history[0]`. Sequence numbers are monotonic across
     // the whole feed and survive front-draining, so a browser can address older
@@ -492,12 +529,24 @@ fn run(
                     if path == WS_PATH {
                         clients.push(id);
                         let _ = server.send_websocket_binary(id, &sync_frame(&history, base_seq));
+                        let _ = server.send_websocket_text(id, &config_envelope(readonly));
                         for payload in active_shares.values() {
                             let _ = server.send_websocket_text(id, payload);
                         }
                     }
                 }
-                ServerEvent::WebSocketClose { id } => clients.retain(|client| *client != id),
+                ServerEvent::WebSocketClose { id } => {
+                    clients.retain(|client| *client != id);
+                    // Drop and delete any uploads this client left unfinished.
+                    uploads.retain(|(client, _), sink| {
+                        if *client == id {
+                            let _ = fs::remove_file(&sink.path);
+                            false
+                        } else {
+                            true
+                        }
+                    });
+                }
                 ServerEvent::WebSocketMessage {
                     id,
                     message: WebSocketMessage::Text(text),
@@ -512,9 +561,46 @@ fn run(
                     Ok(ClientRequest::StopShare { stream_id }) => {
                         let _ = web_requests.send(WebRequest::StopShare { stream_id });
                     }
-                    Err(_) => {}
+                    // Writes are refused wholesale in read-only mode, matching a
+                    // browser that never shows the compose box.
+                    Ok(ClientRequest::SendMessage { body }) if !readonly => {
+                        let _ = web_requests.send(WebRequest::SendChat { body });
+                    }
+                    Ok(ClientRequest::UploadStart {
+                        upload_id,
+                        name,
+                        size: _,
+                    }) if !readonly => match UploadSink::create(upload_id, &name) {
+                        Ok(sink) => {
+                            uploads.insert((id, upload_id), sink);
+                        }
+                        Err(error) => {
+                            kvlog::warn!("web upload could not be opened", error = %error);
+                        }
+                    },
+                    Ok(ClientRequest::UploadFinish { upload_id }) if !readonly => {
+                        if let Some(sink) = uploads.remove(&(id, upload_id)) {
+                            let _ = web_requests.send(WebRequest::UploadFile { path: sink.path });
+                        }
+                    }
+                    Ok(_) | Err(_) => {}
                 },
-                ServerEvent::WebSocketMessage { .. } => {}
+                ServerEvent::WebSocketMessage {
+                    id,
+                    message: WebSocketMessage::Binary(payload),
+                } => {
+                    // A browser binary frame is one upload chunk: a little-endian
+                    // `u32` id followed by the bytes to append to that upload.
+                    if !readonly && payload.len() >= 4 {
+                        let upload_id = u32::from_le_bytes(payload[0..4].try_into().unwrap());
+                        if let Some(sink) = uploads.get_mut(&(id, upload_id)) {
+                            if let Err(error) = sink.append(&payload[4..]) {
+                                kvlog::warn!("web upload chunk write failed", error = %error);
+                                uploads.remove(&(id, upload_id));
+                            }
+                        }
+                    }
+                }
             }
         }
 
@@ -621,6 +707,48 @@ fn older_frame(before_seq: u64, limit: u64, history: &[WebMessage], base_seq: u6
         base_seq + start as u64,
         start > 0,
     )
+}
+
+/// The JSON envelope sent on connect telling the browser whether it may compose.
+fn config_envelope(readonly: bool) -> String {
+    jsony::object! { type: "config", readonly: readonly }
+}
+
+/// An in-progress browser upload: the temp file its chunk frames stream into.
+struct UploadSink {
+    path: PathBuf,
+    file: fs::File,
+}
+
+impl UploadSink {
+    /// Creates the temp file for `upload_id` under a dedicated web-uploads
+    /// directory, named from a sanitized `name` so the served file keeps a
+    /// recognizable extension.
+    fn create(upload_id: u32, name: &str) -> io::Result<Self> {
+        let dir = std::env::temp_dir().join("chatt-web-uploads");
+        fs::create_dir_all(&dir)?;
+        let path = dir.join(format!("{upload_id}-{}", sanitize_upload_name(name)));
+        let file = fs::File::create(&path)?;
+        Ok(Self { path, file })
+    }
+
+    /// Appends one chunk's bytes to the temp file.
+    fn append(&mut self, bytes: &[u8]) -> io::Result<()> {
+        use std::io::Write;
+        self.file.write_all(bytes)
+    }
+}
+
+/// Reduces an uploaded file name to a flat, safe base name. Path separators and
+/// parent references are stripped so the temp file never escapes its directory.
+fn sanitize_upload_name(name: &str) -> String {
+    let base = name.rsplit(['/', '\\']).next().unwrap_or(name);
+    let trimmed = base.trim_matches('.');
+    if trimmed.is_empty() {
+        "upload".to_string()
+    } else {
+        trimmed.to_string()
+    }
 }
 
 #[cfg(test)]
@@ -895,10 +1023,11 @@ mod tests {
 
         let cfg = WebConfig {
             enabled: true,
+            readonly: true,
             bind: "127.0.0.1:39521".to_string(),
         };
         let (web_tx, _web_rx) = mpsc::channel();
-        let _sender = spawn(&cfg, Some(dir.clone()), 100, web_tx).unwrap();
+        let _sender = spawn(&cfg, Some(dir.clone()), 100, web_tx, true).unwrap();
 
         let mut stream = TcpStream::connect("127.0.0.1:39521").unwrap();
         stream
@@ -931,10 +1060,11 @@ mod tests {
 
         let cfg = WebConfig {
             enabled: true,
+            readonly: true,
             bind: "127.0.0.1:39523".to_string(),
         };
         let (web_tx, _web_rx) = mpsc::channel();
-        let _sender = spawn(&cfg, Some(dir.clone()), 100, web_tx).unwrap();
+        let _sender = spawn(&cfg, Some(dir.clone()), 100, web_tx, true).unwrap();
 
         let mut stream = TcpStream::connect("127.0.0.1:39523").unwrap();
         stream
@@ -958,10 +1088,11 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let cfg = WebConfig {
             enabled: true,
+            readonly: true,
             bind: "127.0.0.1:39522".to_string(),
         };
         let (web_tx, _web_rx) = mpsc::channel();
-        let _sender = spawn(&cfg, Some(dir.clone()), 100, web_tx).unwrap();
+        let _sender = spawn(&cfg, Some(dir.clone()), 100, web_tx, true).unwrap();
 
         let mut stream = TcpStream::connect("127.0.0.1:39522").unwrap();
         stream
@@ -1009,10 +1140,11 @@ mod tests {
     fn live_message_broadcasts_to_connected_client() {
         let cfg = WebConfig {
             enabled: true,
+            readonly: true,
             bind: "127.0.0.1:39517".to_string(),
         };
         let (web_tx, _web_rx) = mpsc::channel();
-        let sender = spawn(&cfg, None, 100, web_tx).unwrap();
+        let sender = spawn(&cfg, None, 100, web_tx, true).unwrap();
 
         let mut stream = TcpStream::connect("127.0.0.1:39517").unwrap();
         stream
@@ -1043,6 +1175,10 @@ Sec-WebSocket-Version: 13\r\n\
         assert_eq!(sync.kind, web_wire::KIND_SYNC);
         assert!(sync.messages.is_empty());
 
+        // The config envelope follows the sync frame as a text frame.
+        let (opcode, _) = read_ws_frame(&mut stream);
+        assert_eq!(opcode, 0x1);
+
         sender.send(WebMessage::text_for_test(1, "hello web"));
 
         let (opcode, payload) = read_ws_frame(&mut stream);
@@ -1065,6 +1201,38 @@ Sec-WebSocket-Version: 13\r\n\
             frame.push(byte ^ mask[i % 4]);
         }
         stream.write_all(&frame).unwrap();
+    }
+
+    /// Sends a client-to-server binary frame, masked as RFC 6455 requires.
+    fn write_ws_binary(stream: &mut TcpStream, payload: &[u8]) {
+        assert!(
+            payload.len() < 126,
+            "test payloads stay in the short length"
+        );
+        let mask = [0x37u8, 0xfa, 0x21, 0x3d];
+        let mut frame = vec![0x82, 0x80 | payload.len() as u8];
+        frame.extend_from_slice(&mask);
+        for (i, byte) in payload.iter().enumerate() {
+            frame.push(byte ^ mask[i % 4]);
+        }
+        stream.write_all(&frame).unwrap();
+    }
+
+    /// Consumes the config envelope that follows the sync frame on every connect.
+    fn drain_config(stream: &mut TcpStream) {
+        let (opcode, config) = read_ws_frame(stream);
+        assert_eq!(opcode, 0x1);
+        assert!(String::from_utf8(config).unwrap().contains("\"config\""));
+    }
+
+    /// Opens a browser feed, draining the sync frame and the config envelope that
+    /// always follow a connect, and returns the socket ready for live frames.
+    fn open_ready_ws(addr: &str) -> TcpStream {
+        let mut stream = open_ws(addr);
+        let (_, sync) = read_ws_frame(&mut stream);
+        assert_eq!(web_wire::decode_window(&sync).kind, web_wire::KIND_SYNC);
+        drain_config(&mut stream);
+        stream
     }
 
     fn open_ws(addr: &str) -> TcpStream {
@@ -1095,14 +1263,16 @@ Sec-WebSocket-Version: 13\r\n\
     fn set_room_replaces_backlog_and_resyncs() {
         let cfg = WebConfig {
             enabled: true,
+            readonly: true,
             bind: "127.0.0.1:39520".to_string(),
         };
         let (web_tx, _web_rx) = mpsc::channel();
-        let sender = spawn(&cfg, None, 100, web_tx).unwrap();
+        let sender = spawn(&cfg, None, 100, web_tx, true).unwrap();
 
         let mut stream = open_ws("127.0.0.1:39520");
         let (_, sync) = read_ws_frame(&mut stream);
         assert!(web_wire::decode_window(&sync).messages.is_empty());
+        drain_config(&mut stream);
 
         // Entering a room re-syncs the connected browser with that room's history.
         sender.set_room(vec![WebMessage::text_for_test(1, "room one")]);
@@ -1127,15 +1297,17 @@ Sec-WebSocket-Version: 13\r\n\
     fn load_older_request_returns_older_frame() {
         let cfg = WebConfig {
             enabled: true,
+            readonly: true,
             bind: "127.0.0.1:39518".to_string(),
         };
         let (web_tx, _web_rx) = mpsc::channel();
-        let sender = spawn(&cfg, None, 100, web_tx).unwrap();
+        let sender = spawn(&cfg, None, 100, web_tx, true).unwrap();
 
         let mut stream = open_ws("127.0.0.1:39518");
-        // Drain the initial empty sync frame.
+        // Drain the initial empty sync frame and the config envelope.
         let (_, payload) = read_ws_frame(&mut stream);
         assert_eq!(web_wire::decode_window(&payload).kind, web_wire::KIND_SYNC);
+        drain_config(&mut stream);
 
         // Three live messages take sequence numbers 0, 1, 2.
         for i in 0..3 {
@@ -1172,10 +1344,11 @@ Sec-WebSocket-Version: 13\r\n\
     fn share_available_replays_to_late_client_until_ended() {
         let cfg = WebConfig {
             enabled: true,
+            readonly: true,
             bind: "127.0.0.1:39519".to_string(),
         };
         let (web_tx, _web_rx) = mpsc::channel();
-        let sender = spawn(&cfg, None, 100, web_tx).unwrap();
+        let sender = spawn(&cfg, None, 100, web_tx, true).unwrap();
 
         // A share starts before any browser connects.
         sender.send_share_available(
@@ -1188,6 +1361,7 @@ Sec-WebSocket-Version: 13\r\n\
         let mut late = open_ws("127.0.0.1:39519");
         let (_, sync) = read_ws_frame(&mut late);
         assert_eq!(web_wire::decode_window(&sync).kind, web_wire::KIND_SYNC);
+        drain_config(&mut late);
         // Share announcements stay JSON text frames (opcode 0x1).
         let (opcode, payload) = read_ws_frame(&mut late);
         assert_eq!(opcode, 0x1);
@@ -1209,11 +1383,109 @@ Sec-WebSocket-Version: 13\r\n\
         let mut fresh = open_ws("127.0.0.1:39519");
         let (_, sync2) = read_ws_frame(&mut fresh);
         assert_eq!(web_wire::decode_window(&sync2).kind, web_wire::KIND_SYNC);
+        drain_config(&mut fresh);
         sender.send(WebMessage::text_for_test(1, "hi"));
         // The next frame is the live message (binary), not a stale share.
         let (opcode, next) = read_ws_frame(&mut fresh);
         assert_eq!(opcode, 0x2);
         let message = web_wire::decode_single(&next);
         assert_eq!(message.fragments, vec![Fragment::Text("hi".to_string())]);
+    }
+
+    #[test]
+    fn config_envelope_reports_readonly_on_connect() {
+        let cfg = WebConfig {
+            enabled: true,
+            readonly: true,
+            bind: "127.0.0.1:39524".to_string(),
+        };
+        let (web_tx, _web_rx) = mpsc::channel();
+        let _sender = spawn(&cfg, None, 100, web_tx, true).unwrap();
+
+        let mut stream = open_ws("127.0.0.1:39524");
+        // The sync frame comes first, then the config envelope as a text frame.
+        let (opcode, sync) = read_ws_frame(&mut stream);
+        assert_eq!(opcode, 0x2);
+        assert_eq!(web_wire::decode_window(&sync).kind, web_wire::KIND_SYNC);
+        let (opcode, config) = read_ws_frame(&mut stream);
+        assert_eq!(opcode, 0x1);
+        let text = String::from_utf8(config).unwrap();
+        assert!(text.contains("\"config\""), "{text}");
+        assert!(text.contains("\"readonly\":true"), "{text}");
+    }
+
+    #[test]
+    fn send_message_forwards_when_writable() {
+        let cfg = WebConfig {
+            enabled: true,
+            readonly: false,
+            bind: "127.0.0.1:39525".to_string(),
+        };
+        let (web_tx, web_rx) = mpsc::channel();
+        let _sender = spawn(&cfg, None, 100, web_tx, false).unwrap();
+
+        let mut stream = open_ready_ws("127.0.0.1:39525");
+        write_ws_text(&mut stream, r#"{"type":"send_message","body":"hi there"}"#);
+
+        let request = web_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert_eq!(
+            request,
+            WebRequest::SendChat {
+                body: "hi there".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn send_message_ignored_when_readonly() {
+        let cfg = WebConfig {
+            enabled: true,
+            readonly: true,
+            bind: "127.0.0.1:39526".to_string(),
+        };
+        let (web_tx, web_rx) = mpsc::channel();
+        let _sender = spawn(&cfg, None, 100, web_tx, true).unwrap();
+
+        let mut stream = open_ready_ws("127.0.0.1:39526");
+        write_ws_text(&mut stream, r#"{"type":"send_message","body":"hi there"}"#);
+
+        // A read-only feed drops the write, so nothing reaches the app.
+        assert!(web_rx.recv_timeout(Duration::from_millis(300)).is_err());
+    }
+
+    #[test]
+    fn chunked_upload_assembles_temp_file() {
+        let cfg = WebConfig {
+            enabled: true,
+            readonly: false,
+            bind: "127.0.0.1:39527".to_string(),
+        };
+        let (web_tx, web_rx) = mpsc::channel();
+        let _sender = spawn(&cfg, None, 100, web_tx, false).unwrap();
+
+        let mut stream = open_ready_ws("127.0.0.1:39527");
+        write_ws_text(
+            &mut stream,
+            r#"{"type":"upload_start","upload_id":42,"name":"note.txt","size":11}"#,
+        );
+        // A chunk frame is the little-endian upload id followed by the bytes.
+        let mut chunk = 42u32.to_le_bytes().to_vec();
+        chunk.extend_from_slice(b"hello world");
+        write_ws_binary(&mut stream, &chunk);
+        write_ws_text(&mut stream, r#"{"type":"upload_finish","upload_id":42}"#);
+
+        let request = web_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let WebRequest::UploadFile { path } = request else {
+            panic!("expected an upload request, got {request:?}");
+        };
+        assert_eq!(fs::read(&path).unwrap(), b"hello world");
+        assert!(
+            path.file_name()
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .ends_with("note.txt")
+        );
+        let _ = fs::remove_file(&path);
     }
 }

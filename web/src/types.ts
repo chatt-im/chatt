@@ -52,7 +52,9 @@ export type ServerEnvelope =
   // A share ended; tear down its decoder.
   | { type: "share_ended"; stream_id: number }
   // A play request failed; show the message on the share's row.
-  | { type: "share_error"; stream_id: number; message: string };
+  | { type: "share_error"; stream_id: number; message: string }
+  // Sent once on connect. `readonly` true hides the compose box.
+  | { type: "config"; readonly: boolean };
 
 // A screen share this browser can watch.
 export interface ShareInfo {
@@ -63,8 +65,14 @@ export interface ShareInfo {
   height: number;
 }
 
-// Frames the browser sends: paging requests and screen-share playback control.
+// Frames the browser sends: paging requests, screen-share playback control, and
+// (when not read-only) composing chat messages and file uploads. File bytes
+// travel as separate binary frames between `upload_start` and `upload_finish`,
+// each prefixed with the little-endian upload id.
 export type ClientRequest =
   | { type: "load_older"; before_seq: number; limit: number }
   | { type: "play_share"; stream_id: number }
-  | { type: "stop_share"; stream_id: number };
+  | { type: "stop_share"; stream_id: number }
+  | { type: "send_message"; body: string }
+  | { type: "upload_start"; upload_id: number; name: string; size: number }
+  | { type: "upload_finish"; upload_id: number };
