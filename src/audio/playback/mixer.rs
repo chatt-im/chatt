@@ -48,6 +48,11 @@ fn smoothstep(gain: f32) -> f32 {
 /// time-scaling happen on the decode worker behind the rings.
 pub(crate) struct LivePlaybackMixer {
     streams: HashMap<u32, ConsumerStream>,
+    /// Controls received before the stream registered. The app applies local
+    /// mute/volume at `VoiceStarted`, which precedes the first media packet that
+    /// creates the stream; held here and consumed by [`Self::ensure_stream`] so
+    /// they stick instead of silently dropping.
+    pending_controls: HashMap<u32, PlaybackStreamControl>,
     backend_xruns: u64,
     backend_stream_errors: u64,
     last_backend_error: Option<String>,
@@ -103,6 +108,7 @@ impl LivePlaybackMixer {
     fn with_streams(streams: HashMap<u32, ConsumerStream>) -> Self {
         Self {
             streams,
+            pending_controls: HashMap::new(),
             backend_xruns: 0,
             backend_stream_errors: 0,
             last_backend_error: None,
@@ -176,6 +182,10 @@ impl LivePlaybackMixer {
     /// it to one per `stream_id`, and the producer hands each ring to exactly one
     /// stream, so each ring gets exactly one reader.
     pub(crate) fn ensure_stream(&mut self, stream_id: u32, ring: Arc<SampleRing>) {
+        // A pending control never coexists with a registered stream:
+        // `set_stream_control` applies directly once registered, so consuming it
+        // here (even on the occupied path) discards nothing.
+        let control = self.pending_controls.remove(&stream_id).unwrap_or_default();
         self.streams
             .entry(stream_id)
             .or_insert_with(|| ConsumerStream {
@@ -183,7 +193,7 @@ impl LivePlaybackMixer {
                 // runs once per `stream_id`, and the producer routes each ring to a
                 // single stream, so no other reader is ever built for it.
                 reader: unsafe { RingReader::new(ring) },
-                control: PlaybackStreamControl::default(),
+                control,
                 last_sample: 0.0,
                 declick_gain: 0.0,
                 intentional_drain: false,
@@ -195,11 +205,15 @@ impl LivePlaybackMixer {
 
     pub(crate) fn remove_stream(&mut self, stream_id: u32) {
         self.streams.remove(&stream_id);
+        self.pending_controls.remove(&stream_id);
     }
 
     pub(crate) fn set_stream_control(&mut self, stream_id: u32, control: PlaybackStreamControl) {
-        if let Some(stream) = self.streams.get_mut(&stream_id) {
-            stream.control = control;
+        match self.streams.get_mut(&stream_id) {
+            Some(stream) => stream.control = control,
+            None => {
+                self.pending_controls.insert(stream_id, control);
+            }
         }
     }
 
@@ -694,6 +708,50 @@ mod tests {
 
         assert!(out.iter().all(|&s| s == 0.0), "muted stream produced audio");
         assert_eq!(ring.depth(), 0, "muted stream still drained its ring");
+    }
+
+    #[test]
+    fn control_set_before_registration_applies_at_ensure_stream() {
+        let mut mixer = LivePlaybackMixer::new();
+        mixer.set_stream_control(
+            1,
+            PlaybackStreamControl {
+                muted: true,
+                volume_db: 0.0,
+            },
+        );
+        mixer.ensure_stream(1, ring_with(&[0.5; FRAME_SAMPLES]));
+
+        let mut out = vec![0.0; FRAME_SAMPLES];
+        mixer.fill_block(&mut out);
+
+        assert!(
+            out.iter().all(|&s| s == 0.0),
+            "pre-registration mute was dropped"
+        );
+    }
+
+    #[test]
+    fn removed_stream_clears_pending_control() {
+        let mut mixer = LivePlaybackMixer::new();
+        mixer.set_stream_control(
+            1,
+            PlaybackStreamControl {
+                muted: true,
+                volume_db: 0.0,
+            },
+        );
+        mixer.remove_stream(1);
+        mixer.ensure_stream(1, ring_with(&[0.5; FRAME_SAMPLES]));
+
+        let mut out = vec![0.0; FRAME_SAMPLES];
+        mixer.fill_block(&mut out);
+
+        assert_eq!(
+            out[FRAME_SAMPLES - 1],
+            0.5,
+            "stale pending control outlived its stream"
+        );
     }
 
     #[test]

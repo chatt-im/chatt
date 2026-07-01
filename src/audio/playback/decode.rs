@@ -290,6 +290,10 @@ pub(crate) struct LiveDecodeStreams {
     producers: HashMap<u32, RingPlaybackProducer>,
     mixer_streams: HashSet<u32>,
     mixer_intentional_drains: HashMap<u32, bool>,
+    /// Sender-mute fallback state received before the stream's first packet
+    /// created its entry, consumed by [`Self::ensure_entry`]. The app pushes it
+    /// at `VoiceStarted`, which always precedes the first media packet.
+    pending_sender_muted: HashMap<u32, bool>,
     stats: LivePlaybackMixerStats,
     block_samples: usize,
     dropped_mixer_events: u64,
@@ -305,6 +309,7 @@ impl LiveDecodeStreams {
             producers: HashMap::new(),
             mixer_streams: HashSet::new(),
             mixer_intentional_drains: HashMap::new(),
+            pending_sender_muted: HashMap::new(),
             stats: LivePlaybackMixerStats::default(),
             block_samples: FRAME_SAMPLES,
             dropped_mixer_events: 0,
@@ -371,13 +376,16 @@ impl LiveDecodeStreams {
         if self.streams.contains_key(&stream_id) {
             return true;
         }
-        let stream = match LiveDecodeStream::new(self.tuning) {
+        let mut stream = match LiveDecodeStream::new(self.tuning) {
             Ok(stream) => stream,
             Err(error) => {
                 eprintln!("failed to create live neteq core: {error}");
                 return false;
             }
         };
+        if let Some(muted) = self.pending_sender_muted.remove(&stream_id) {
+            stream.set_control_muted(muted);
+        }
         let producer = match RingPlaybackProducer::new(self.tuning) {
             Ok(producer) => producer,
             Err(error) => {
@@ -420,11 +428,15 @@ impl LiveDecodeStreams {
         self.producers.remove(&stream_id);
         self.mixer_streams.remove(&stream_id);
         self.mixer_intentional_drains.remove(&stream_id);
+        self.pending_sender_muted.remove(&stream_id);
     }
 
     pub(crate) fn set_sender_muted(&mut self, stream_id: u32, muted: bool) {
-        if let Some(stream) = self.streams.get_mut(&stream_id) {
-            stream.set_control_muted(muted);
+        match self.streams.get_mut(&stream_id) {
+            Some(stream) => stream.set_control_muted(muted),
+            None => {
+                self.pending_sender_muted.insert(stream_id, muted);
+            }
         }
     }
 
@@ -961,6 +973,44 @@ mod tests {
         assert!(
             streams.stats().direct_samples > 0,
             "no decoded audio reached the ring"
+        );
+    }
+
+    #[test]
+    fn sender_mute_before_first_packet_sticks() {
+        let now = Instant::now();
+        let tuning = test_tuning();
+        let mut streams = LiveDecodeStreams::new(tuning);
+        let mixer = Arc::new(Mutex::new(LivePlaybackMixer::with_tuning(tuning)));
+        let mut encoder = OpusVoiceEncoder::new(32_000).unwrap();
+
+        streams.set_sender_muted(7, true);
+        let opus = tone_packet(&mut encoder, 0);
+        streams.insert_packet(voice_packet(7, 0, 0, opus, now), now);
+        streams.drain_into_mixer(&mixer, now, None);
+
+        let stream = streams.get(7).unwrap();
+        assert!(stream.control_muted, "pre-stream sender mute was dropped");
+    }
+
+    #[test]
+    fn removed_stream_clears_pending_sender_mute() {
+        let now = Instant::now();
+        let tuning = test_tuning();
+        let mut streams = LiveDecodeStreams::new(tuning);
+        let mixer = Arc::new(Mutex::new(LivePlaybackMixer::with_tuning(tuning)));
+        let mut encoder = OpusVoiceEncoder::new(32_000).unwrap();
+
+        streams.set_sender_muted(7, true);
+        streams.remove_stream(7);
+        let opus = tone_packet(&mut encoder, 0);
+        streams.insert_packet(voice_packet(7, 0, 0, opus, now), now);
+        streams.drain_into_mixer(&mixer, now, None);
+
+        let stream = streams.get(7).unwrap();
+        assert!(
+            !stream.control_muted,
+            "stale pending sender mute outlived its stream"
         );
     }
 
