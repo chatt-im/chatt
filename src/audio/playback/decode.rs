@@ -225,7 +225,7 @@ fn drain_pump_stream(
         producer.pump(
             block,
             |out| {
-                let result = core.get_audio(out);
+                let result = core.get_audio(now, out);
                 if result.muted {
                     ProducedBlock::Muted(result)
                 } else {
@@ -607,6 +607,14 @@ impl LiveDecodeStreams {
                 .iter()
                 .map(|diagnostics| diagnostics.packets_buffered)
                 .sum(),
+            neteq_packets_discarded: diagnostics
+                .iter()
+                .map(|diagnostics| diagnostics.packets_discarded)
+                .sum(),
+            neteq_secondary_packets_discarded: diagnostics
+                .iter()
+                .map(|diagnostics| diagnostics.secondary_packets_discarded)
+                .sum(),
             neteq_next_packet_gap_ms: diagnostics
                 .iter()
                 .filter_map(|diagnostics| diagnostics.next_packet_gap_ms)
@@ -741,7 +749,7 @@ impl LiveDecodeStream {
             flags
         };
         self.core
-            .insert_packet(timestamp, sequence, effective_flags, opus)
+            .insert_packet(now, timestamp, sequence, effective_flags, opus)
     }
 
     pub(crate) fn observe_sender_silence(
@@ -993,10 +1001,10 @@ mod tests {
         for seq in 0..4u32 {
             let opus = tone_packet(&mut encoder, seq as usize * LIVE_OPUS_FRAME_SAMPLES);
             stream.insert_audio(seq * LIVE_OPUS_FRAME_SAMPLES as u32, seq, 0, &opus, now);
-            stream.core.get_audio(&mut output);
+            stream.core.get_audio(now, &mut output);
         }
         for _ in 0..700 {
-            stream.core.get_audio(&mut output);
+            stream.core.get_audio(now, &mut output);
         }
         // Sustained idle Expand freezes the sync-buffer end timestamp, but
         // `playout_delay_ms` now folds in `generated_noise_samples` so the playout
@@ -1064,15 +1072,15 @@ mod tests {
             for seq in 0..6u32 {
                 let opus = tone_packet(&mut encoder, seq as usize * LIVE_OPUS_FRAME_SAMPLES);
                 stream.insert_audio(seq * LIVE_OPUS_FRAME_SAMPLES as u32, seq, 0, &opus, now);
-                stream.core.get_audio(&mut output);
+                stream.core.get_audio(now, &mut output);
             }
             for _ in 0..400 {
-                if stream.core.get_audio(&mut output).muted {
+                if stream.core.get_audio(now, &mut output).muted {
                     break;
                 }
             }
             assert!(
-                stream.core.get_audio(&mut output).muted,
+                stream.core.get_audio(now, &mut output).muted,
                 "stream should be in muted expand before the registration retry test"
             );
         }

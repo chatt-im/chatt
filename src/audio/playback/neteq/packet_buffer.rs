@@ -208,12 +208,10 @@ impl PacketBuffer {
         self.buffer.iter().map(|p| p.duration_samples).sum()
     }
 
-    #[cfg(test)]
     pub(crate) fn packets_discarded(&self) -> u64 {
         self.packets_discarded
     }
 
-    #[cfg(test)]
     pub(crate) fn secondary_packets_discarded(&self) -> u64 {
         self.secondary_packets_discarded
     }

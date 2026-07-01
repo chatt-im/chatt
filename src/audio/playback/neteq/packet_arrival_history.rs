@@ -1,14 +1,19 @@
 //! A port of WebRTC's `modules/audio_coding/neteq/packet_arrival_history.cc`.
 //!
-//! Records when packets arrived (in media-sample units derived from the tick
-//! timer) keyed by unwrapped RTP timestamp, within a fixed window. The delay of
-//! a timestamp is measured against the packet in history that maximizes it, via
-//! monotonic min/max deques. The decision logic uses this for the playout-delay
-//! estimate and `GetMaxDelayMs`.
+//! Records when packets arrived (in media-sample units of a caller-supplied
+//! wall clock) keyed by unwrapped RTP timestamp, within a fixed window. The
+//! delay of a timestamp is measured against the packet in history that
+//! maximizes it, via monotonic min/max deques. The decision logic uses this for
+//! the playout-delay estimate and `GetMaxDelayMs`.
+//!
+//! WebRTC derives arrival times from its tick timer because the audio device
+//! calls `GetAudio` at an unwavering 10 ms cadence, making ticks a wall clock.
+//! Chatt's playback pulls are ring-scheduled — a muted-suppression drain or
+//! refill bunches several `get_audio` calls into one instant — so tick-derived
+//! arrival times wobble around wall time and read as phantom jitter. The
+//! caller passes real wall-clock sample counts instead.
 
 use std::collections::{BTreeMap, VecDeque};
-
-use super::tick_timer::TickTimer;
 
 /// A forward packet after a long receive-side idle period can belong to a new
 /// talkspurt or source instance even if the sender failed to advance RTP time
@@ -105,7 +110,7 @@ impl PacketArrivalHistory {
     pub(crate) fn reset_for_timing_discontinuity(
         &mut self,
         rtp_timestamp: u32,
-        tick_timer: &TickTimer,
+        now_samples: i64,
     ) -> bool {
         if self.sample_rate_khz <= 0 {
             return false;
@@ -118,8 +123,7 @@ impl PacketArrivalHistory {
             return false;
         }
 
-        let arrival_gap_ms =
-            (self.now_samples(tick_timer) - newest.arrival_timestamp) / self.sample_rate_khz;
+        let arrival_gap_ms = (now_samples - newest.arrival_timestamp) / self.sample_rate_khz;
         let media_gap_ms = (unwrapped - newest.rtp_timestamp) / self.sample_rate_khz;
         if arrival_gap_ms >= TIMING_DISCONTINUITY_MIN_GAP_MS
             && arrival_gap_ms.saturating_sub(media_gap_ms) >= TIMING_DISCONTINUITY_MIN_EXCESS_MS
@@ -136,9 +140,8 @@ impl PacketArrivalHistory {
         &mut self,
         rtp_timestamp: u32,
         packet_length_samples: i32,
-        tick_timer: &TickTimer,
+        arrival_timestamp: i64,
     ) -> bool {
-        let arrival_timestamp = self.now_samples(tick_timer);
         let packet = PacketArrival {
             rtp_timestamp: self.unwrapper.unwrap(rtp_timestamp),
             arrival_timestamp,
@@ -193,10 +196,10 @@ impl PacketArrivalHistory {
 
     /// Delay (ms) of `rtp_timestamp` measured against the min-delay packet at the
     /// current time. Port of `GetDelayMs`.
-    pub(crate) fn delay_ms(&self, rtp_timestamp: u32, tick_timer: &TickTimer) -> i32 {
+    pub(crate) fn delay_ms(&self, rtp_timestamp: u32, now_samples: i64) -> i32 {
         let packet = PacketArrival {
             rtp_timestamp: self.unwrapper.peek_unwrap(rtp_timestamp),
-            arrival_timestamp: self.now_samples(tick_timer),
+            arrival_timestamp: now_samples,
             length_samples: 0,
         };
         self.packet_arrival_delay_ms(&packet)
@@ -216,10 +219,6 @@ impl PacketArrivalHistory {
             None => true,
             Some(newest) => self.unwrapper.peek_unwrap(rtp_timestamp) == newest.rtp_timestamp,
         }
-    }
-
-    fn now_samples(&self, tick_timer: &TickTimer) -> i64 {
-        tick_timer.ticks() as i64 * tick_timer.ms_per_tick() as i64 * self.sample_rate_khz
     }
 
     fn packet_arrival_delay_ms(&self, packet: &PacketArrival) -> i32 {
@@ -255,76 +254,68 @@ impl PacketArrivalHistory {
 mod tests {
     use super::*;
 
+    /// 10 ms of wall clock in 48 kHz sample units.
+    const TICK: i64 = 480;
+
     #[test]
     fn steady_arrivals_have_zero_delay() {
-        let mut timer = TickTimer::new();
         let mut history = PacketArrivalHistory::new(2000);
         history.set_sample_rate(48000);
-        // One 20 ms packet every 20 ms (2 ticks): perfectly on time.
+        // One 20 ms packet every 20 ms: perfectly on time.
         for seq in 0..50u32 {
-            history.insert(seq * 960, 960, &timer);
-            timer.increment_by(2);
+            history.insert(seq * 960, 960, seq as i64 * 2 * TICK);
         }
         assert!(history.max_delay_ms() <= 1, "{}", history.max_delay_ms());
     }
 
     #[test]
     fn late_packet_registers_positive_delay() {
-        let mut timer = TickTimer::new();
         let mut history = PacketArrivalHistory::new(2000);
         history.set_sample_rate(48000);
-        history.insert(0, 960, &timer);
-        timer.increment_by(2);
-        history.insert(960, 960, &timer);
-        // Third packet arrives 40 ms late (extra 4 ticks).
-        timer.increment_by(6);
-        history.insert(1920, 960, &timer);
+        history.insert(0, 960, 0);
+        history.insert(960, 960, 2 * TICK);
+        // Third packet arrives 40 ms late.
+        history.insert(1920, 960, 8 * TICK);
         assert!(history.max_delay_ms() >= 30, "{}", history.max_delay_ms());
     }
 
     #[test]
     fn duplicate_timestamp_is_rejected() {
-        let timer = TickTimer::new();
         let mut history = PacketArrivalHistory::new(2000);
         history.set_sample_rate(48000);
-        assert!(history.insert(0, 960, &timer));
-        assert!(!history.insert(0, 960, &timer));
+        assert!(history.insert(0, 960, 0));
+        assert!(!history.insert(0, 960, 0));
     }
 
     #[test]
     fn long_wall_gap_without_matching_media_gap_resets_baseline() {
-        let mut timer = TickTimer::new();
         let mut history = PacketArrivalHistory::new(2000);
         history.set_sample_rate(48000);
-        assert!(history.insert(0, 960, &timer));
-        timer.increment_by(2);
-        assert!(history.insert(960, 960, &timer));
+        assert!(history.insert(0, 960, 0));
+        assert!(history.insert(960, 960, 2 * TICK));
 
         // The next packet is only one media frame later, but arrives 30 seconds
         // later. Treat this as a source/talkspurt timing discontinuity instead
         // of reporting a 30 s playout delay.
-        timer.increment_by(3000);
-        assert!(history.reset_for_timing_discontinuity(1920, &timer));
-        assert!(history.insert(1920, 960, &timer));
-        assert_eq!(history.delay_ms(1920, &timer), 0);
+        let mut now = 3002 * TICK;
+        assert!(history.reset_for_timing_discontinuity(1920, now));
+        assert!(history.insert(1920, 960, now));
+        assert_eq!(history.delay_ms(1920, now), 0);
 
-        timer.increment_by(2);
-        assert!(!history.reset_for_timing_discontinuity(2880, &timer));
-        assert!(history.insert(2880, 960, &timer));
+        now += 2 * TICK;
+        assert!(!history.reset_for_timing_discontinuity(2880, now));
+        assert!(history.insert(2880, 960, now));
         assert!(history.max_delay_ms() <= 1, "{}", history.max_delay_ms());
     }
 
     #[test]
     fn long_gap_with_matching_media_gap_keeps_baseline() {
-        let mut timer = TickTimer::new();
         let mut history = PacketArrivalHistory::new(2000);
         history.set_sample_rate(48000);
-        assert!(history.insert(0, 960, &timer));
-        timer.increment_by(2);
-        assert!(history.insert(960, 960, &timer));
+        assert!(history.insert(0, 960, 0));
+        assert!(history.insert(960, 960, 2 * TICK));
 
-        timer.increment_by(3000);
         let media_advanced = 960 + 3000 * 10 * 48;
-        assert!(!history.reset_for_timing_discontinuity(media_advanced, &timer));
+        assert!(!history.reset_for_timing_discontinuity(media_advanced, 3002 * TICK));
     }
 }

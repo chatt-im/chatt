@@ -234,6 +234,11 @@ pub(crate) struct LiveEncoderPipeline {
     opus_frame: Vec<i16>,
     encoded: Vec<u8>,
     pending_opus_samples: Vec<f32>,
+    /// Media timestamp (48 kHz sample index) of the first sample currently in
+    /// `pending_opus_samples`. Valid while `pending_opus_samples` is non-empty;
+    /// re-anchored whenever queued frames transition pending from empty to
+    /// non-empty.
+    pending_start_sample: u32,
     next_opus_packet_flags: u8,
     silence_resume_hint_packets: u8,
     sender_silence_active: bool,
@@ -307,6 +312,7 @@ impl LiveEncoderPipeline {
             opus_frame: vec![0i16; LIVE_OPUS_FRAME_SAMPLES],
             encoded: vec![0u8; MAX_OPUS_PACKET_BYTES],
             pending_opus_samples: Vec::with_capacity(LIVE_OPUS_FRAME_SAMPLES),
+            pending_start_sample: 0,
             next_opus_packet_flags: LIVE_PACKET_FLAG_OPUS_RESET,
             silence_resume_hint_packets: 0,
             sender_silence_active: false,
@@ -435,8 +441,9 @@ impl LiveEncoderPipeline {
                 if silence_hint {
                     self.next_opus_packet_flags |= LIVE_PACKET_FLAG_SILENCE_HINT;
                 }
+                let slot_start = self.next_capture_sample.wrapping_sub(FRAME_SAMPLES as u32);
                 let frame = ProcessedCaptureFrame::new(frame);
-                self.queue_processed_capture_frame(frame, stats, on_packet)?;
+                self.queue_processed_capture_frame(frame, slot_start, stats, on_packet)?;
             }
             CaptureGateDecision::SuppressCurrent => {
                 self.suppressed_frames = self.suppressed_frames.saturating_add(1);
@@ -444,9 +451,13 @@ impl LiveEncoderPipeline {
             }
             CaptureGateDecision::Resume(frames) => {
                 self.reset_opus_stream()?;
-                for frame in frames {
+                let count = frames.len() as u32;
+                for (index, frame) in frames.iter().enumerate() {
+                    let slot_start = self
+                        .next_capture_sample
+                        .wrapping_sub(FRAME_SAMPLES as u32 * (count - index as u32));
                     let frame = ProcessedCaptureFrame::new(&frame.samples);
-                    self.queue_processed_capture_frame(frame, stats, on_packet)?;
+                    self.queue_processed_capture_frame(frame, slot_start, stats, on_packet)?;
                 }
             }
         }
@@ -580,19 +591,31 @@ impl LiveEncoderPipeline {
             // The receiver fades this tail too and skips concealment over it.
             self.next_opus_packet_flags |= LIVE_PACKET_FLAG_MUTE | LIVE_PACKET_FLAG_SILENCE_HINT;
         }
+        let slot_start = self.next_capture_sample.wrapping_sub(FRAME_SAMPLES as u32);
         let frame = ProcessedCaptureFrame::new(frame);
-        self.queue_processed_capture_frame(frame, stats, on_packet)
+        self.queue_processed_capture_frame(frame, slot_start, stats, on_packet)
     }
 
     fn queue_processed_capture_frame<F>(
         &mut self,
         frame: ProcessedCaptureFrame<'_>,
+        slot_start_sample: u32,
         stats: &AudioStats,
         on_packet: &mut F,
     ) -> Result<(), String>
     where
         F: FnMut(LocalVoiceFrame),
     {
+        if self.pending_opus_samples.is_empty() {
+            self.pending_start_sample = slot_start_sample;
+        } else {
+            debug_assert_eq!(
+                self.pending_start_sample
+                    .wrapping_add(self.pending_opus_samples.len() as u32),
+                slot_start_sample,
+                "queued capture frame is not contiguous with pending samples"
+            );
+        }
         self.pending_opus_samples.extend_from_slice(frame.samples);
 
         while self.pending_opus_samples.len() >= LIVE_OPUS_FRAME_SAMPLES {
@@ -641,11 +664,7 @@ impl LiveEncoderPipeline {
             let packet_len = payload.len();
             self.sender_silence_active = false;
             self.silence_keepalive_frames = 0;
-            // The frame's first sample sits at the front of `pending`, whose
-            // index is the running clock minus the still-buffered tail.
-            let timestamp = self
-                .next_capture_sample
-                .wrapping_sub(self.pending_opus_samples.len() as u32);
+            let timestamp = self.pending_start_sample;
             on_packet(LocalVoiceFrame {
                 flags,
                 payload,
@@ -653,6 +672,9 @@ impl LiveEncoderPipeline {
             });
             stats.record_encoded_packet(packet_len);
             self.pending_opus_samples.drain(..LIVE_OPUS_FRAME_SAMPLES);
+            self.pending_start_sample = self
+                .pending_start_sample
+                .wrapping_add(LIVE_OPUS_FRAME_SAMPLES as u32);
         }
 
         Ok(())
@@ -841,7 +863,8 @@ mod tests {
     use super::*;
     use crate::audio::EchoCancellationControl;
     use crate::audio::shared::{
-        DEFAULT_LIVE_MAX_AMPLIFICATION, LIVE_PLAYBACK_DRED_MAX_SAMPLES, normalized_to_i16_scale,
+        DEFAULT_LIVE_MAX_AMPLIFICATION, LIVE_PLAYBACK_DRED_MAX_SAMPLES, frames_for_duration,
+        normalized_to_i16_scale,
     };
     #[allow(unused_imports)]
     use crate::audio::test_support::*;
@@ -1059,12 +1082,15 @@ mod tests {
             .map(|sample| (sample * 6.0).clamp(-1.0, 1.0))
             .collect::<Vec<_>>();
         let mut speech_packets = Vec::new();
-        for _ in 0..2 {
+        for slot in 0..2 {
             let frame = ProcessedCaptureFrame::new(&sampled_speech);
             pipeline
-                .queue_processed_capture_frame(frame, &stats, &mut |packet| {
-                    speech_packets.push(packet)
-                })
+                .queue_processed_capture_frame(
+                    frame,
+                    FRAME_SAMPLES as u32 * slot,
+                    &stats,
+                    &mut |packet| speech_packets.push(packet),
+                )
                 .unwrap();
         }
 
@@ -1082,6 +1108,195 @@ mod tests {
             .map(|sample| (sample * 6.0).clamp(-1.0, 1.0))
             .collect::<Vec<_>>();
         normalized_to_i16_scale(&sampled)
+    }
+
+    fn drive_silence_gate_cycles(
+        preroll: Duration,
+        cycles: usize,
+    ) -> (Vec<LocalVoiceFrame>, Vec<u32>, usize) {
+        let mut tuning = test_tuning();
+        tuning.capture_silence_gate = true;
+        tuning.capture_long_silence_stop = Duration::from_millis(20);
+        tuning.capture_silence_preroll = preroll;
+        tuning.capture_silence_ramp = Duration::ZERO;
+        tuning.silence_vad_max = u8::MAX;
+
+        let mut pipeline = build_live_encoder_pipeline(
+            tuning,
+            false,
+            DEFAULT_LIVE_MAX_AMPLIFICATION,
+            true,
+            EncoderNetworkProfile::EXCELLENT,
+            None,
+        )
+        .unwrap();
+        let stats = AudioStats::new();
+        let speech = high_energy_speech_chunk();
+        let silence = vec![0.0f32; FRAME_SAMPLES];
+        let mut packets = Vec::new();
+        let mut pushed_frames = 0u32;
+        let mut resume_slot_starts = Vec::new();
+
+        let push = |pipeline: &mut LiveEncoderPipeline,
+                    frame: &[f32],
+                    slot_start: u32,
+                    packets: &mut Vec<LocalVoiceFrame>,
+                    resume_slot_starts: &mut Vec<u32>| {
+            let had_opus = packets
+                .iter()
+                .any(|packet| matches!(packet.payload, VoicePayload::Opus(_)));
+            let before = packets.len();
+            pipeline
+                .push_chunk(
+                    frame,
+                    DEFAULT_LIVE_MAX_AMPLIFICATION,
+                    false,
+                    &stats,
+                    &mut |packet| packets.push(packet),
+                )
+                .unwrap();
+            if had_opus
+                && packets[before..].iter().any(|packet| {
+                    matches!(packet.payload, VoicePayload::Opus(_))
+                        && packet.flags & LIVE_PACKET_FLAG_OPUS_RESET != 0
+                })
+            {
+                resume_slot_starts.push(slot_start);
+            }
+        };
+
+        for _ in 0..4 {
+            let slot_start = pushed_frames * FRAME_SAMPLES as u32;
+            push(
+                &mut pipeline,
+                &speech,
+                slot_start,
+                &mut packets,
+                &mut resume_slot_starts,
+            );
+            pushed_frames += 1;
+        }
+
+        for _ in 0..cycles {
+            for _ in 0..10 {
+                let slot_start = pushed_frames * FRAME_SAMPLES as u32;
+                push(
+                    &mut pipeline,
+                    &silence,
+                    slot_start,
+                    &mut packets,
+                    &mut resume_slot_starts,
+                );
+                pushed_frames += 1;
+            }
+            for _ in 0..4 {
+                let slot_start = pushed_frames * FRAME_SAMPLES as u32;
+                push(
+                    &mut pipeline,
+                    &speech,
+                    slot_start,
+                    &mut packets,
+                    &mut resume_slot_starts,
+                );
+                pushed_frames += 1;
+            }
+        }
+
+        let preroll_frames = frames_for_duration(preroll);
+        (packets, resume_slot_starts, preroll_frames)
+    }
+
+    fn opus_packets(packets: &[LocalVoiceFrame]) -> Vec<&LocalVoiceFrame> {
+        packets
+            .iter()
+            .filter(|packet| matches!(packet.payload, VoicePayload::Opus(_)))
+            .collect()
+    }
+
+    fn assert_resume_timestamps(
+        packets: &[LocalVoiceFrame],
+        resume_slot_starts: &[u32],
+        preroll_frames: usize,
+    ) {
+        let opus = opus_packets(packets);
+        let timestamps = opus
+            .iter()
+            .map(|packet| packet.timestamp)
+            .collect::<Vec<_>>();
+        for (index, timestamp) in timestamps.iter().enumerate() {
+            assert!(
+                !timestamps[..index].contains(timestamp),
+                "duplicate Opus timestamp {timestamp} in {timestamps:?}"
+            );
+        }
+
+        let resume_indexes = opus
+            .iter()
+            .enumerate()
+            .filter_map(|(index, packet)| {
+                (index > 0 && packet.flags & LIVE_PACKET_FLAG_OPUS_RESET != 0).then_some(index)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            resume_indexes.len(),
+            resume_slot_starts.len(),
+            "unexpected resume packets in {timestamps:?}"
+        );
+
+        let replayed_frames = preroll_frames + 1;
+        let immediate_resume_packets = replayed_frames / 2;
+        assert!(
+            immediate_resume_packets > 0,
+            "test scenario must replay enough frames to emit a resume packet"
+        );
+        for (&resume_index, &resume_slot_start) in resume_indexes.iter().zip(resume_slot_starts) {
+            let first_resume = opus[resume_index].timestamp;
+            let expected_first =
+                resume_slot_start.wrapping_sub(FRAME_SAMPLES as u32 * preroll_frames as u32);
+            assert_eq!(
+                first_resume, expected_first,
+                "first resume packet should be back-dated by the preroll"
+            );
+
+            let burst_end = resume_index + immediate_resume_packets;
+            assert!(
+                burst_end < opus.len(),
+                "resume should be followed by a live packet: {timestamps:?}"
+            );
+            for index in resume_index + 1..=burst_end {
+                assert_eq!(
+                    opus[index]
+                        .timestamp
+                        .wrapping_sub(opus[index - 1].timestamp),
+                    LIVE_OPUS_FRAME_SAMPLES as u32,
+                    "resume packets must be contiguous: {timestamps:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn silence_gate_resume_emits_backdated_contiguous_timestamps() {
+        let preroll = Duration::from_millis(30);
+        let (packets, resume_slot_starts, preroll_frames) = drive_silence_gate_cycles(preroll, 1);
+
+        assert_resume_timestamps(&packets, &resume_slot_starts, preroll_frames);
+    }
+
+    #[test]
+    fn silence_gate_resume_with_leftover_pending_samples_stays_contiguous() {
+        let preroll = Duration::from_millis(20);
+        let (packets, resume_slot_starts, preroll_frames) = drive_silence_gate_cycles(preroll, 1);
+
+        assert_resume_timestamps(&packets, &resume_slot_starts, preroll_frames);
+    }
+
+    #[test]
+    fn silence_gate_resume_timestamps_reanchor_across_cycles() {
+        let preroll = Duration::from_millis(30);
+        let (packets, resume_slot_starts, preroll_frames) = drive_silence_gate_cycles(preroll, 3);
+
+        assert_resume_timestamps(&packets, &resume_slot_starts, preroll_frames);
     }
 
     /// Runs an unmuted -> muted -> unmuted episode, returning the emitted packets

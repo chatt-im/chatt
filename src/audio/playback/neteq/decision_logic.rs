@@ -93,10 +93,12 @@ impl DecisionLogic {
     }
 
     /// The core decision tree. Port of `DecisionLogic::GetDecision`.
+    /// `now_samples` is the wall clock in sample units, for arrival-delay reads.
     pub(crate) fn get_decision(
         &mut self,
         status: &NetEqStatus,
         tick_timer: &TickTimer,
+        now_samples: i64,
     ) -> Operation {
         self.prev_time_scale = self.prev_time_scale && status.last_mode.is_timestretch();
         if self.prev_time_scale {
@@ -129,7 +131,7 @@ impl DecisionLogic {
         let five_seconds_samples = (5000 * self.sample_rate_khz) as u32;
         let next_timestamp = status.next_packet.expect("checked above").timestamp;
         if status.target_timestamp == next_timestamp {
-            return self.expected_packet_available(status, tick_timer);
+            return self.expected_packet_available(status, tick_timer, now_samples);
         }
         if !is_obsolete_timestamp(
             next_timestamp,
@@ -181,12 +183,14 @@ impl DecisionLogic {
 
     /// Notifies the controller of a packet arrival; returns the relative arrival
     /// delay if it can be computed. Port of `DecisionLogic::PacketArrived`.
+    /// `arrival_samples` is the wall-clock arrival time in sample units.
     pub(crate) fn packet_arrived(
         &mut self,
         fs_hz: i32,
         should_update_stats: bool,
         info: &PacketArrivedInfo,
         tick_timer: &TickTimer,
+        arrival_samples: i64,
     ) -> Option<i32> {
         self.buffer_flush = self.buffer_flush || info.buffer_flush;
         if !should_update_stats || info.is_cng_or_dtmf {
@@ -202,18 +206,18 @@ impl DecisionLogic {
             );
         }
         self.packet_arrival_history
-            .reset_for_timing_discontinuity(info.main_timestamp, tick_timer);
+            .reset_for_timing_discontinuity(info.main_timestamp, arrival_samples);
         let inserted = self.packet_arrival_history.insert(
             info.main_timestamp,
             info.packet_length_samples as i32,
-            tick_timer,
+            arrival_samples,
         );
         if !inserted || self.packet_arrival_history.size() < 2 {
             return None;
         }
         let arrival_delay_ms = self
             .packet_arrival_history
-            .delay_ms(info.main_timestamp, tick_timer);
+            .delay_ms(info.main_timestamp, arrival_samples);
         let reordered = !self
             .packet_arrival_history
             .is_newest_rtp_timestamp(info.main_timestamp);
@@ -281,9 +285,14 @@ impl DecisionLogic {
         }
     }
 
-    fn expected_packet_available(&self, status: &NetEqStatus, tick_timer: &TickTimer) -> Operation {
+    fn expected_packet_available(
+        &self,
+        status: &NetEqStatus,
+        tick_timer: &TickTimer,
+        now_samples: i64,
+    ) -> Operation {
         if !self.disallow_time_stretching && status.last_mode != Mode::Expand && !status.play_dtmf {
-            let playout_delay_ms = self.playout_delay_ms(status, tick_timer) as i64;
+            let playout_delay_ms = self.playout_delay_ms(status, now_samples) as i64;
             let low_limit = self.target_level_ms() as i64;
             let high_limit = low_limit
                 + self.packet_arrival_history.max_delay_ms() as i64
@@ -364,7 +373,7 @@ impl DecisionLogic {
         self.timescale_countdown.finished(tick_timer)
     }
 
-    pub(crate) fn playout_delay_ms(&self, status: &NetEqStatus, tick_timer: &TickTimer) -> i32 {
+    pub(crate) fn playout_delay_ms(&self, status: &NetEqStatus, now_samples: i64) -> i32 {
         // `target_timestamp` (the sync buffer end timestamp) freezes during Expand
         // because no decoded samples advance it, exactly as in WebRTC. WebRTC's
         // timeline convention is `end_timestamp + generated_noise_samples`, so the
@@ -377,7 +386,7 @@ impl DecisionLogic {
             .wrapping_add(status.generated_noise_samples as u32)
             .wrapping_sub(status.sync_buffer_samples as u32);
         self.packet_arrival_history
-            .delay_ms(playout_timestamp, tick_timer)
+            .delay_ms(playout_timestamp, now_samples)
     }
 }
 
@@ -401,6 +410,11 @@ mod tests {
         let mut logic = DecisionLogic::new(config(), tick_timer);
         logic.set_sample_rate(48000, 480);
         logic
+    }
+
+    /// Wall clock tracking the test's tick timer: 480 samples per 10 ms tick.
+    fn now_samples(timer: &TickTimer) -> i64 {
+        timer.ticks() as i64 * 480
     }
 
     fn status(next: Option<PacketInfo>, last_mode: Mode) -> NetEqStatus {
@@ -452,13 +466,26 @@ mod tests {
                     true,
                     &info((seq + 1) * 960, (seq + 1) as u16),
                     &timer,
+                    now_samples(&timer),
                 );
                 timer.increment_by(2);
-                logic.packet_arrived(48000, true, &info(seq * 960, seq as u16), &timer);
+                logic.packet_arrived(
+                    48000,
+                    true,
+                    &info(seq * 960, seq as u16),
+                    &timer,
+                    now_samples(&timer),
+                );
                 timer.increment_by(2);
                 seq += 2;
             } else {
-                logic.packet_arrived(48000, true, &info(seq * 960, seq as u16), &timer);
+                logic.packet_arrived(
+                    48000,
+                    true,
+                    &info(seq * 960, seq as u16),
+                    &timer,
+                    now_samples(&timer),
+                );
                 timer.increment_by(2);
                 seq += 1;
             }
@@ -477,12 +504,12 @@ mod tests {
 
         assert!(
             logic
-                .packet_arrived(48000, true, &info(0, 0), &timer)
+                .packet_arrived(48000, true, &info(0, 0), &timer, now_samples(&timer))
                 .is_none()
         );
         timer.increment_by(2);
         assert_eq!(
-            logic.packet_arrived(48000, true, &info(960, 1), &timer),
+            logic.packet_arrived(48000, true, &info(960, 1), &timer, now_samples(&timer)),
             Some(0)
         );
 
@@ -492,12 +519,12 @@ mod tests {
         timer.increment_by(3000);
         assert!(
             logic
-                .packet_arrived(48000, true, &info(1920, 2), &timer)
+                .packet_arrived(48000, true, &info(1920, 2), &timer, now_samples(&timer))
                 .is_none()
         );
         timer.increment_by(2);
         assert_eq!(
-            logic.packet_arrived(48000, true, &info(2880, 3), &timer),
+            logic.packet_arrived(48000, true, &info(2880, 3), &timer, now_samples(&timer)),
             Some(0)
         );
     }
@@ -506,7 +533,7 @@ mod tests {
     fn no_packet_expands() {
         let timer = TickTimer::new();
         let mut logic = logic(&timer);
-        let op = logic.get_decision(&status(None, Mode::Normal), &timer);
+        let op = logic.get_decision(&status(None, Mode::Normal), &timer, now_samples(&timer));
         assert_eq!(op, Operation::Expand);
     }
 
@@ -522,7 +549,7 @@ mod tests {
         let mut st = status(next, Mode::Normal);
         // Buffer at target so neither accelerate nor preemptive-expand fire.
         st.packet_buffer_info.span_samples_wait_time = 80 * 48;
-        let op = logic.get_decision(&st, &timer);
+        let op = logic.get_decision(&st, &timer, now_samples(&timer));
         assert_eq!(op, Operation::Normal);
     }
 
@@ -539,7 +566,7 @@ mod tests {
         let mut st = status(next, Mode::Expand);
         st.generated_noise_samples = 960; // not "too early": leap == noise
         st.packet_buffer_info.span_samples_wait_time = 200 * 48;
-        let op = logic.get_decision(&st, &timer);
+        let op = logic.get_decision(&st, &timer, now_samples(&timer));
         assert_eq!(op, Operation::Merge);
     }
 
@@ -557,7 +584,7 @@ mod tests {
         let mut st = status(next, Mode::Expand);
         st.expand_mutefactor = 1000;
         st.packet_buffer_info.span_samples_wait_time = 0;
-        let op = logic.get_decision(&st, &timer);
+        let op = logic.get_decision(&st, &timer, now_samples(&timer));
         assert_eq!(op, Operation::Expand);
     }
 
@@ -576,7 +603,7 @@ mod tests {
                 is_dtx: false,
                 buffer_flush: false,
             };
-            logic.packet_arrived(48000, true, &info, &timer);
+            logic.packet_arrived(48000, true, &info, &timer, now_samples(&timer));
             timer.increment_by(2); // 20 ms cadence: on time.
         }
         // The playout point still sits at the very first timestamp while 1 s of
@@ -589,7 +616,7 @@ mod tests {
         let mut st = status(next, Mode::Normal);
         st.target_timestamp = 0;
         st.sync_buffer_samples = 0;
-        let op = logic.get_decision(&st, &timer);
+        let op = logic.get_decision(&st, &timer, now_samples(&timer));
         assert!(
             matches!(op, Operation::Accelerate | Operation::FastAccelerate),
             "op={op:?}"

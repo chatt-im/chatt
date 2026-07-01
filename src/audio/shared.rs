@@ -625,6 +625,8 @@ pub struct LivePlaybackSnapshot {
     pub neteq_packet_buffer_ms: u64,
     pub neteq_packet_buffer_wait_ms: u64,
     pub neteq_packets_buffered: usize,
+    pub neteq_packets_discarded: u64,
+    pub neteq_secondary_packets_discarded: u64,
     pub neteq_next_packet_gap_ms: Option<i64>,
     pub backend_block_ms: u64,
     pub playout_quantum_ms: u64,

@@ -23,6 +23,7 @@
 //! block (i16 -> f32 for the mixer/ring).
 
 use std::rc::Rc;
+use std::time::Instant;
 
 use opus_codec::{
     Channels, Decoder, DredDecoder, DredState, SampleRate, packet_has_lbrr,
@@ -91,6 +92,8 @@ pub(crate) struct NetEqDiagnostics {
     pub packet_buffer_ms: u64,
     pub packet_buffer_wait_ms: u64,
     pub packets_buffered: usize,
+    pub packets_discarded: u64,
+    pub secondary_packets_discarded: u64,
     pub next_packet_gap_ms: Option<i64>,
     pub operation: &'static str,
     pub reason: &'static str,
@@ -110,6 +113,13 @@ struct DredParse {
 /// The faithful NetEQ control + decode loop for the live playback path.
 pub(crate) struct NetEqCore {
     tick_timer: TickTimer,
+    /// Origin of the wall-clock arrival timeline, set on first observation.
+    /// WebRTC uses tick counts as its arrival clock because its `GetAudio` is
+    /// device-locked to 10 ms; Chatt's pulls are ring-scheduled and bunch
+    /// around muted-suppression drains, so arrival statistics use wall time.
+    wall_origin: Option<Instant>,
+    /// The latest wall-clock observation in 48 kHz sample units.
+    wall_now_samples: i64,
     packet_buffer: PacketBuffer,
     sync_buffer: SyncBuffer,
     decision_logic: DecisionLogic,
@@ -179,6 +189,8 @@ impl NetEqCore {
         }
         Ok(Self {
             tick_timer,
+            wall_origin: None,
+            wall_now_samples: 0,
             packet_buffer: PacketBuffer::new(200),
             sync_buffer: SyncBuffer::with_default_length(),
             decision_logic,
@@ -212,6 +224,15 @@ impl NetEqCore {
         OUTPUT_SIZE_SAMPLES
     }
 
+    /// Advances the wall-clock arrival timeline to `now`, returning it in
+    /// 48 kHz sample units since the first observation.
+    fn observe_wall_clock(&mut self, now: Instant) -> i64 {
+        let origin = *self.wall_origin.get_or_insert(now);
+        let micros = now.saturating_duration_since(origin).as_micros() as i64;
+        self.wall_now_samples = micros * (FS_HZ as i64) / 1_000_000;
+        self.wall_now_samples
+    }
+
     pub(crate) fn target_level_ms(&self) -> i32 {
         self.decision_logic.target_level_ms()
     }
@@ -242,12 +263,14 @@ impl NetEqCore {
             target_ms: self.decision_logic.target_level_ms().max(0) as u64,
             playout_delay_ms: self
                 .decision_logic
-                .playout_delay_ms(&status, &self.tick_timer)
+                .playout_delay_ms(&status, self.wall_now_samples)
                 .max(0) as u64,
             sync_buffer_ms: samples_to_ms(status.sync_buffer_samples),
             packet_buffer_ms: samples_to_ms(status.packet_buffer_info.span_samples),
             packet_buffer_wait_ms: samples_to_ms(status.packet_buffer_info.span_samples_wait_time),
             packets_buffered: status.packet_buffer_info.num_packets,
+            packets_discarded: self.packet_buffer.packets_discarded(),
+            secondary_packets_discarded: self.packet_buffer.secondary_packets_discarded(),
             next_packet_gap_ms,
             operation: self.last_operation.label(),
             reason: self.last_decision_reason,
@@ -287,8 +310,10 @@ impl NetEqCore {
     /// tail on the receiver.
     /// Returns `true` if the packet arrived after its playout slot had already
     /// passed (older than the current playout point), i.e. too late to be played.
+    /// `now` is the packet's wall-clock arrival time.
     pub(crate) fn insert_packet(
         &mut self,
+        now: Instant,
         timestamp: u32,
         sequence: u32,
         flags: u8,
@@ -297,6 +322,7 @@ impl NetEqCore {
         if opus.is_empty() {
             return false;
         }
+        let arrival_samples = self.observe_wall_clock(now);
         let playout_timestamp = self
             .sync_buffer
             .end_timestamp()
@@ -392,8 +418,13 @@ impl NetEqCore {
                 buffer_flush,
             };
             let should_update_stats = !self.new_codec && !silence_resume;
-            self.decision_logic
-                .packet_arrived(FS_HZ, should_update_stats, &info, &self.tick_timer);
+            self.decision_logic.packet_arrived(
+                FS_HZ,
+                should_update_stats,
+                &info,
+                &self.tick_timer,
+                arrival_samples,
+            );
         }
 
         // Reference sets `new_codec_` only after the arrival loop, inside the
@@ -513,9 +544,11 @@ impl NetEqCore {
     }
 
     /// Produces one 10 ms output block. Port of `NetEqImpl::GetAudioInternal`.
-    pub(crate) fn get_audio(&mut self, output: &mut [f32]) -> AudioResult {
+    /// `now` is the wall-clock time of this pull.
+    pub(crate) fn get_audio(&mut self, now: Instant, output: &mut [f32]) -> AudioResult {
         debug_assert_eq!(output.len(), OUTPUT_SIZE_SAMPLES);
         self.tick_timer.increment();
+        self.observe_wall_clock(now);
 
         // Note: WebRTC's `enable_muted_state_` short-circuit (zero-fill once expand
         // has muted) defaults to off, and using it here breaks the resume catch-up
@@ -632,7 +665,9 @@ impl NetEqCore {
 
         let status = self.status();
 
-        let mut operation = self.decision_logic.get_decision(&status, &self.tick_timer);
+        let mut operation =
+            self.decision_logic
+                .get_decision(&status, &self.tick_timer, self.wall_now_samples);
         self.last_operation = operation;
         self.last_decision_reason = self.decision_reason(operation, &status);
 
@@ -1201,9 +1236,28 @@ fn duration_to_i32_ms(duration: std::time::Duration) -> i32 {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::*;
     use crate::audio::capture::OpusVoiceEncoder;
     use crate::network::EncoderNetworkProfile;
+
+    /// Wall clock advancing like a real device: 10 ms per `get_audio` pull.
+    struct WallClock(Instant);
+
+    impl WallClock {
+        fn new() -> Self {
+            Self(Instant::now())
+        }
+
+        fn now(&self) -> Instant {
+            self.0
+        }
+
+        fn advance_block(&mut self) {
+            self.0 += Duration::from_millis(10);
+        }
+    }
 
     fn encode_tone(encoder: &mut OpusVoiceEncoder, base: usize) -> Vec<u8> {
         let frame: Vec<i16> = (0..LIVE_OPUS_FRAME_SAMPLES)
@@ -1229,12 +1283,20 @@ mod tests {
         let mut output = vec![0.0; OUTPUT_SIZE_SAMPLES];
         let mut total_energy = 0.0f64;
         let mut blocks = 0;
+        let mut clock = WallClock::new();
         for seq in 0..60u32 {
             let payload = encode_tone(&mut encoder, seq as usize * LIVE_OPUS_FRAME_SAMPLES);
-            core.insert_packet(seq * LIVE_OPUS_FRAME_SAMPLES as u32, seq, 0, &payload);
+            core.insert_packet(
+                clock.now(),
+                seq * LIVE_OPUS_FRAME_SAMPLES as u32,
+                seq,
+                0,
+                &payload,
+            );
             // Two 10 ms output blocks per 20 ms packet.
             for _ in 0..2 {
-                let result = core.get_audio(&mut output);
+                let result = core.get_audio(clock.now(), &mut output);
+                clock.advance_block();
                 if seq > 4 {
                     // After priming, audio should be flowing (normal or stretch).
                     assert!(!result.muted, "unexpected mute at seq {seq}");
@@ -1260,13 +1322,15 @@ mod tests {
         let mut encoder = OpusVoiceEncoder::new(32_000).unwrap();
         let mut output = vec![0.0; OUTPUT_SIZE_SAMPLES];
         // Play a clip: 100 packets (2 s) of tone.
+        let mut clock = WallClock::new();
         let mut seq = 0u32;
         let mut ts = 0u32;
         for _ in 0..100u32 {
             let payload = encode_tone(&mut encoder, (seq as usize) * LIVE_OPUS_FRAME_SAMPLES);
-            core.insert_packet(ts, seq, 0, &payload);
+            core.insert_packet(clock.now(), ts, seq, 0, &payload);
             for _ in 0..2 {
-                core.get_audio(&mut output);
+                core.get_audio(clock.now(), &mut output);
+                clock.advance_block();
             }
             seq += 1;
             ts += LIVE_OPUS_FRAME_SAMPLES as u32;
@@ -1274,7 +1338,8 @@ mod tests {
         // Wait a while: 30 s of silence, NetEQ keeps being pulled (no packets).
         let mut max_silence = 0u64;
         for _ in 0..3000 {
-            core.get_audio(&mut output);
+            core.get_audio(clock.now(), &mut output);
+            clock.advance_block();
             max_silence = max_silence.max(core.diagnostics().playout_delay_ms);
         }
         // Resume the clip. The capture media timestamp advanced across silence,
@@ -1283,9 +1348,10 @@ mod tests {
         let mut max_resume = 0u64;
         for _ in 0..100u32 {
             let payload = encode_tone(&mut encoder, (seq as usize) * LIVE_OPUS_FRAME_SAMPLES);
-            core.insert_packet(ts, seq, 0, &payload);
+            core.insert_packet(clock.now(), ts, seq, 0, &payload);
             for _ in 0..2 {
-                core.get_audio(&mut output);
+                core.get_audio(clock.now(), &mut output);
+                clock.advance_block();
                 max_resume = max_resume.max(core.diagnostics().playout_delay_ms);
             }
             seq += 1;
@@ -1303,14 +1369,16 @@ mod tests {
         let mut encoder = OpusVoiceEncoder::new(32_000).unwrap();
         let mut output = vec![0.0; OUTPUT_SIZE_SAMPLES];
 
+        let mut clock = WallClock::new();
         let mut seq = 0u32;
         let mut ts = 0u32;
         let mut last_ts = 0u32;
         for _ in 0..100u32 {
             let payload = encode_tone(&mut encoder, (seq as usize) * LIVE_OPUS_FRAME_SAMPLES);
-            core.insert_packet(ts, seq, 0, &payload);
+            core.insert_packet(clock.now(), ts, seq, 0, &payload);
             for _ in 0..2 {
-                core.get_audio(&mut output);
+                core.get_audio(clock.now(), &mut output);
+                clock.advance_block();
             }
             last_ts = ts;
             seq += 1;
@@ -1318,7 +1386,8 @@ mod tests {
         }
 
         for _ in 0..3000 {
-            core.get_audio(&mut output);
+            core.get_audio(clock.now(), &mut output);
+            clock.advance_block();
         }
 
         // A replayed source may restart its local media clock; if the sender only
@@ -1334,9 +1403,10 @@ mod tests {
                 0
             };
             let payload = encode_tone(&mut encoder, (seq as usize) * LIVE_OPUS_FRAME_SAMPLES);
-            core.insert_packet(ts, seq, flags, &payload);
+            core.insert_packet(clock.now(), ts, seq, flags, &payload);
             for _ in 0..2 {
-                core.get_audio(&mut output);
+                core.get_audio(clock.now(), &mut output);
+                clock.advance_block();
                 max_resume = max_resume.max(core.diagnostics().playout_delay_ms);
             }
             seq += 1;
@@ -1355,17 +1425,26 @@ mod tests {
         let mut encoder = OpusVoiceEncoder::new(32_000).unwrap();
         let mut output = vec![0.0; OUTPUT_SIZE_SAMPLES];
         // Prime with a few real frames.
+        let mut clock = WallClock::new();
         for seq in 0..6u32 {
             let payload = encode_tone(&mut encoder, seq as usize * LIVE_OPUS_FRAME_SAMPLES);
-            core.insert_packet(seq * LIVE_OPUS_FRAME_SAMPLES as u32, seq, 0, &payload);
-            core.get_audio(&mut output);
+            core.insert_packet(
+                clock.now(),
+                seq * LIVE_OPUS_FRAME_SAMPLES as u32,
+                seq,
+                0,
+                &payload,
+            );
+            core.get_audio(clock.now(), &mut output);
+            clock.advance_block();
         }
         // Now starve the core: every block must conceal (Expand), and after a
         // long run it must reach the muted state rather than loop forever.
         let mut saw_expand = false;
         let mut saw_muted = false;
         for _ in 0..400 {
-            let result = core.get_audio(&mut output);
+            let result = core.get_audio(clock.now(), &mut output);
+            clock.advance_block();
             if matches!(result.mode, Mode::Expand) {
                 saw_expand = true;
             }
@@ -1384,14 +1463,26 @@ mod tests {
         let mut encoder = OpusVoiceEncoder::new(32_000).unwrap();
         let mut output = vec![0.0; OUTPUT_SIZE_SAMPLES];
         // Prime with real frames, then starve the core until it mutes.
+        let mut clock = WallClock::new();
         for seq in 0..6u32 {
             let payload = encode_tone(&mut encoder, seq as usize * LIVE_OPUS_FRAME_SAMPLES);
-            core.insert_packet(seq * LIVE_OPUS_FRAME_SAMPLES as u32, seq, 0, &payload);
-            core.get_audio(&mut output);
+            core.insert_packet(
+                clock.now(),
+                seq * LIVE_OPUS_FRAME_SAMPLES as u32,
+                seq,
+                0,
+                &payload,
+            );
+            core.get_audio(clock.now(), &mut output);
+            clock.advance_block();
         }
+        // The block on which expand reaches the muted state can still carry the
+        // final fade-out samples, so wait for the first fully silent one.
         let mut muted = false;
         for _ in 0..400 {
-            if core.get_audio(&mut output).muted {
+            let result = core.get_audio(clock.now(), &mut output);
+            clock.advance_block();
+            if result.muted && output.iter().all(|sample| *sample == 0.0) {
                 muted = true;
                 break;
             }
@@ -1401,7 +1492,8 @@ mod tests {
         // Once muted with no comfort-noise floor, the fast path is taken and
         // every concealment block is exactly silent.
         for _ in 0..50 {
-            let result = core.get_audio(&mut output);
+            let result = core.get_audio(clock.now(), &mut output);
+            clock.advance_block();
             assert!(result.muted, "stream left the muted state while starved");
             assert!(
                 output.iter().all(|sample| *sample == 0.0),
@@ -1413,8 +1505,15 @@ mod tests {
         let mut resumed = false;
         for seq in 6..40u32 {
             let payload = encode_tone(&mut encoder, seq as usize * LIVE_OPUS_FRAME_SAMPLES);
-            core.insert_packet(seq * LIVE_OPUS_FRAME_SAMPLES as u32, seq, 0, &payload);
-            core.get_audio(&mut output);
+            core.insert_packet(
+                clock.now(),
+                seq * LIVE_OPUS_FRAME_SAMPLES as u32,
+                seq,
+                0,
+                &payload,
+            );
+            core.get_audio(clock.now(), &mut output);
+            clock.advance_block();
             if output.iter().any(|sample| sample.abs() > 1e-3) {
                 resumed = true;
                 break;
@@ -1431,12 +1530,20 @@ mod tests {
         // Flood the buffer well past the target without draining much, so the
         // controller should choose to accelerate.
         let mut accelerated = false;
+        let mut clock = WallClock::new();
         for seq in 0..120u32 {
             let payload = encode_tone(&mut encoder, seq as usize * LIVE_OPUS_FRAME_SAMPLES);
-            core.insert_packet(seq * LIVE_OPUS_FRAME_SAMPLES as u32, seq, 0, &payload);
+            core.insert_packet(
+                clock.now(),
+                seq * LIVE_OPUS_FRAME_SAMPLES as u32,
+                seq,
+                0,
+                &payload,
+            );
             // Drain only one 10 ms block per 20 ms packet inserted minus a deficit
             // so the buffer keeps growing.
-            let result = core.get_audio(&mut output);
+            let result = core.get_audio(clock.now(), &mut output);
+            clock.advance_block();
             if result.time_stretched > 0 {
                 accelerated = true;
             }
@@ -1483,13 +1590,17 @@ mod tests {
         );
         let mut core = NetEqCore::new(LiveAudioTuning::default()).unwrap();
 
+        let mut clock = WallClock::new();
         for (seq, payload) in packets.iter().enumerate() {
             core.insert_packet(
+                clock.now(),
                 seq as u32 * LIVE_OPUS_FRAME_SAMPLES as u32,
                 seq as u32,
                 0,
                 payload,
             );
+            clock.advance_block();
+            clock.advance_block();
             assert!(
                 core.dred_parse.is_none(),
                 "zero-gap insert parsed DRED at seq {seq}",
@@ -1540,7 +1651,7 @@ mod tests {
         );
 
         let timestamp = LIVE_OPUS_FRAME_SAMPLES as u32 + gap_samples;
-        core.insert_packet(timestamp, sequence, 0, &payload);
+        core.insert_packet(Instant::now(), timestamp, sequence, 0, &payload);
 
         let diagnostics = core.diagnostics();
         assert_eq!(
@@ -1574,9 +1685,11 @@ mod tests {
         let mut output = vec![0.0; OUTPUT_SIZE_SAMPLES];
         let drop = 30u32;
         let mut expand_after_drop = 0;
+        let mut clock = WallClock::new();
         for seq in 0..packets.len() as u32 {
             if seq != drop {
                 core.insert_packet(
+                    clock.now(),
                     seq * LIVE_OPUS_FRAME_SAMPLES as u32,
                     seq,
                     0,
@@ -1584,7 +1697,8 @@ mod tests {
                 );
             }
             for _ in 0..2 {
-                let result = core.get_audio(&mut output);
+                let result = core.get_audio(clock.now(), &mut output);
+                clock.advance_block();
                 if seq >= drop && matches!(result.mode, Mode::Expand) {
                     expand_after_drop += 1;
                 }
