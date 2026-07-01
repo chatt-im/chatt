@@ -92,8 +92,11 @@ const AUDIO_POP_PACKET_FLAG_OPUS_RESET: u8 = 0x01;
 const AUDIO_POP_PACKET_FLAG_SILENCE_HINT: u8 = 0x02;
 const AUDIO_POP_PACKET_FLAG_SILENCE_RESUME: u8 = 0x04;
 const AUDIO_POP_PACKET_FLAG_MUTE: u8 = 0x08;
-const MAX_QUEUED_FILE_BYTES: usize = 128 * 1024;
-const MAX_FILE_CHUNKS_PER_TICK: usize = 4;
+const MAX_QUEUED_FILE_BYTES: usize = 1024 * 1024;
+const MAX_FILE_CHUNKS_PER_TICK: usize = 64;
+/// Capacity of the reusable TCP read scratch buffer. Sized to swallow a full
+/// file chunk frame in one `read` on a fast link.
+const TCP_READ_BUFFER_BYTES: usize = 256 * 1024;
 const FILE_PROGRESS_STEP_BYTES: u64 = 1024 * 1024;
 const ENCODER_FEEDBACK_ALPHA: f32 = 0.35;
 const ENCODER_PROFILE_HOLD: Duration = Duration::from_secs(10);
@@ -639,6 +642,7 @@ fn run_worker_inner(
         server_udp_probe_addr,
         read_buf: Vec::new(),
         write_buf: Vec::new(),
+        read_scratch: vec![0u8; TCP_READ_BUFFER_BYTES],
         media_packet: Vec::new(),
         media_scratch: Vec::new(),
         p2p_routes: Vec::new(),
@@ -786,7 +790,15 @@ fn run_worker_inner(
         worker.poll_rtt_probe(now);
         worker.poll_mdns(now);
         worker.read_udp();
-        poll_timeout = if command_drain == CommandDrainOutcome::HitLimit {
+        // A pending file upload or bug report can keep the loop spinning at zero
+        // timeout so chunks stream at socket speed instead of one small batch per
+        // `POLL_TIMEOUT`. This only applies while `write_buf` is below the
+        // backpressure gate: once the socket refuses more (`write_buf` past the
+        // gate after a `WouldBlock`), the loop parks on the writable edge rather
+        // than busy-looping.
+        let transfers_ready = worker.write_buf.len() <= MAX_QUEUED_FILE_BYTES
+            && (!worker.outgoing_uploads.is_empty() || !worker.outgoing_bug_reports.is_empty());
+        poll_timeout = if command_drain == CommandDrainOutcome::HitLimit || transfers_ready {
             Duration::ZERO
         } else {
             POLL_TIMEOUT
@@ -1118,6 +1130,9 @@ struct WorkerState {
     udp_local_addr: SocketAddr,
     read_buf: Vec<u8>,
     write_buf: Vec<u8>,
+    /// Persistent scratch the TCP read loop reads into, allocated once and
+    /// reused so bulk transfers do not allocate or zero a fresh buffer per read.
+    read_scratch: Vec<u8>,
     /// Reusable buffers for the outbound media seal path, cleared on each use so
     /// the per-frame voice send does not allocate. `media_packet` holds the UDP
     /// datagram, `media_scratch` the encoded plaintext, and `p2p_routes` the
@@ -1605,29 +1620,25 @@ impl EncoderFeedbackController {
 
 impl WorkerState {
     fn queue_control(&mut self, control: ClientControl) -> Result<(), String> {
-        let kind = client_control_kind(&control);
         let payload = encode_client_control(&control)?;
-        let payload_size = payload.len();
         let encrypted = self
             .control
             .seal_next(CHANNEL_CONTROL, &payload)
             .map_err(|error| error.to_string())?;
-        let encrypted_size = encrypted.len();
         frame::encode_frame(&encrypted, &mut self.write_buf).map_err(|error| error.to_string())?;
-        kvlog::info!(
+        kvlog::debug!(
             "client control queued",
-            kind,
-            payload_size,
-            encrypted_size,
+            kind = client_control_kind(&control),
+            payload_size = payload.len(),
+            encrypted_size = encrypted.len(),
             queued_bytes = self.write_buf.len()
         );
         self.write_tcp()
     }
 
     fn read_tcp(&mut self) -> Result<(), String> {
-        let mut buf = [0u8; 8192];
         loop {
-            match self.tcp.read(&mut buf) {
+            match self.tcp.read(&mut self.read_scratch) {
                 Ok(0) => {
                     kvlog::info!("tcp server closed connection");
                     self.shutdown = true;
@@ -1635,8 +1646,8 @@ impl WorkerState {
                     break;
                 }
                 Ok(n) => {
-                    self.read_buf.extend_from_slice(&buf[..n]);
-                    kvlog::info!(
+                    self.read_buf.extend_from_slice(&self.read_scratch[..n]);
+                    kvlog::debug!(
                         "tcp bytes received",
                         size = n,
                         buffered = self.read_buf.len()
@@ -1656,12 +1667,12 @@ impl WorkerState {
                 Ok(None) => break,
                 Err(error) => return Err(format!("invalid server frame: {error}")),
             };
-            kvlog::info!("server frame received", frame_size = frame.len());
+            kvlog::debug!("server frame received", frame_size = frame.len());
             let plaintext = self
                 .control
                 .open_next(CHANNEL_CONTROL, &frame)
                 .map_err(|error| error.to_string())?;
-            kvlog::info!("server control decrypted", payload_size = plaintext.len());
+            kvlog::debug!("server control decrypted", payload_size = plaintext.len());
             let control = decode_server_control(&plaintext)?;
             self.handle_server_control(control);
         }
@@ -1674,7 +1685,7 @@ impl WorkerState {
                 Ok(0) => break,
                 Ok(n) => {
                     self.write_buf.drain(..n);
-                    kvlog::info!(
+                    kvlog::debug!(
                         "tcp bytes written",
                         size = n,
                         remaining = self.write_buf.len()

@@ -483,7 +483,10 @@ fn test_ffmpeg_sample_rate_check_from_wav() {
             recon.truncate(pcm.len());
 
             // Write WAV and query via ffprobe
-            let wav = tmp_path(&dir, &format!("roundtrip-{}-{}.wav", sr.as_i32(), ch.as_i32()));
+            let wav = tmp_path(
+                &dir,
+                &format!("roundtrip-{}-{}.wav", sr.as_i32(), ch.as_i32()),
+            );
             write_wav_i16(&wav, sr.as_i32(), ch.as_i32(), &recon);
             let probed_sr = ffprobe_entry(&wav, "stream=sample_rate").expect("ffprobe sr");
             assert_eq!(probed_sr as i32, sr.as_i32(), "sample rate mismatch");

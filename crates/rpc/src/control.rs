@@ -2,10 +2,14 @@ use jsony::Jsony;
 
 use crate::ids::{BugReportId, FileTransferId, MessageId, RoomId, SessionId, StreamId, UserId};
 
-pub const MAX_CONTROL_PAYLOAD_BYTES: usize = 64 * 1024;
+pub const MAX_CONTROL_PAYLOAD_BYTES: usize = 224 * 1024;
 pub const MAX_CHAT_BODY_BYTES: usize = 8 * 1024;
 pub const DEFAULT_FILE_SIZE_LIMIT_BYTES: u64 = 50 * 1024 * 1024; // default file size limit when unconfigured
-pub const MAX_FILE_CHUNK_BYTES: usize = 32 * 1024;
+/// Payload bytes carried by one `UploadFileChunk`/`BugReportChunk`. Sized so the
+/// encoded control message plus transport header, AEAD tag, and length prefix
+/// stays under [`crate::frame::MAX_FRAME_LEN`], keeping a 50 MB transfer to a few
+/// hundred frames rather than thousands.
+pub const MAX_FILE_CHUNK_BYTES: usize = 192 * 1024;
 pub const MAX_FILE_NAME_BYTES: usize = 255;
 pub const MAX_BUG_REPORT_DESC_BYTES: usize = 4 * 1024;
 pub const MAX_BUG_REPORT_METADATA_BYTES: usize = 32 * 1024;
