@@ -602,7 +602,7 @@ impl RoomSession {
         {
             return value_db;
         }
-        config.user_volume_db(&self.server_alias, user_id.0)
+        config.user_volume_db(&self.server_alias, user_id)
     }
 
     pub(super) fn playback_control_for_volume(
@@ -649,9 +649,9 @@ mod tests {
         RoomSession::new(&Config::default(), &Theme::tomorrow_night())
     }
 
-    fn participant(user_id: u32, name: &str) -> ParticipantInfo {
+    fn participant(user_id: UserId, name: &str) -> ParticipantInfo {
         ParticipantInfo {
-            user_id: UserId(user_id),
+            user_id,
             display_name: name.to_string(),
             identifier: name.to_string(),
             in_call: false,
@@ -660,11 +660,11 @@ mod tests {
         }
     }
 
-    fn message(id: u64, sender: u32, body: &str) -> ChatMessage {
+    fn message(id: u64, sender: UserId, body: &str) -> ChatMessage {
         ChatMessage {
             message_id: MessageId(id),
             room_id: RoomId(1),
-            sender: UserId(sender),
+            sender,
             sender_name: format!("user-{sender}"),
             timestamp_ms: id * 1_000,
             body: body.to_string(),
@@ -704,16 +704,16 @@ mod tests {
         let mut room = test_room();
         room.joined(
             RoomId(1),
-            vec![participant(1, "alice")],
-            vec![message(1, 1, "old")],
+            vec![participant(UserId(1), "alice")],
+            vec![message(1, UserId(1), "old")],
             Some(UserId(1)),
         );
         room.voice_started(UserId(1), StreamId(7), Some(UserId(1)));
 
         room.joined(
             RoomId(1),
-            vec![participant(2, "bob")],
-            vec![message(2, 2, "new")],
+            vec![participant(UserId(2), "bob")],
+            vec![message(2, UserId(2), "new")],
             Some(UserId(1)),
         );
 
@@ -730,12 +730,12 @@ mod tests {
         let mut room = test_room();
         room.joined(
             RoomId(1),
-            vec![participant(1, "alice")],
+            vec![participant(UserId(1), "alice")],
             vec![
-                message(3, 1, "third"),
-                message(1, 1, "first"),
-                message(1, 1, "duplicate"),
-                message(2, 1, "second"),
+                message(3, UserId(1), "third"),
+                message(1, UserId(1), "first"),
+                message(1, UserId(1), "duplicate"),
+                message(2, UserId(1), "second"),
             ],
             Some(UserId(1)),
         );
@@ -756,8 +756,8 @@ mod tests {
         let mut store = room_history::open(history_id, room_id)
             .store
             .expect("history store opens");
-        store.append_message(&message(1, 1, "first"));
-        store.append_message(&message(2, 2, "second"));
+        store.append_message(&message(1, UserId(1), "first"));
+        store.append_message(&message(2, UserId(2), "second"));
         drop(store);
 
         let mut room = test_room();
@@ -781,18 +781,18 @@ mod tests {
         let mut room = test_room();
         room.joined(
             RoomId(1),
-            vec![participant(1, "alice")],
-            vec![message(5, 2, "seeded")],
+            vec![participant(UserId(1), "alice")],
+            vec![message(5, UserId(2), "seeded")],
             Some(UserId(1)),
         );
         assert_eq!(room.chat.len(), 1);
 
         // Same (timestamp_ms, message_id) is skipped.
-        room.chat_received(message(5, 2, "echo"), Some(UserId(1)));
+        room.chat_received(message(5, UserId(2), "echo"), Some(UserId(1)));
         assert_eq!(room.chat.len(), 1);
 
         // Same id with a different timestamp (post-restart) is a new message.
-        let mut restarted = message(5, 2, "post-restart");
+        let mut restarted = message(5, UserId(2), "post-restart");
         restarted.timestamp_ms += 1;
         room.chat_received(restarted, Some(UserId(1)));
         assert_eq!(room.chat.len(), 2);
@@ -801,20 +801,20 @@ mod tests {
     #[test]
     fn incoming_chat_notes_activity_and_preserves_bottom_scroll_behavior() {
         let mut room = test_room();
-        let update = room.chat_received(message(1, 2, "hello"), Some(UserId(1)));
+        let update = room.chat_received(message(1, UserId(2), "hello"), Some(UserId(1)));
         assert!(!update.local);
         assert!(update.should_scroll_bottom);
         assert_eq!(room.chat.scroll_offset(), 0);
         assert_eq!(room.participants.entries[0].name.as_deref(), Some("user-2"));
 
         for id in 2..20 {
-            room.chat_received(message(id, 2, "line"), Some(UserId(1)));
+            room.chat_received(message(id, UserId(2), "line"), Some(UserId(1)));
         }
         room.chat.scroll_up(3, 80, 1);
         let offset = room.chat.scroll_offset();
         assert!(offset > 0);
 
-        let update = room.chat_received(message(20, 2, "while reading"), Some(UserId(1)));
+        let update = room.chat_received(message(20, UserId(2), "while reading"), Some(UserId(1)));
         assert!(!update.should_scroll_bottom);
         assert_eq!(room.chat.scroll_offset(), offset);
     }
@@ -830,7 +830,7 @@ mod tests {
         let mut room = test_room();
         room.joined(
             RoomId(1),
-            vec![participant(1, "alice")],
+            vec![participant(UserId(1), "alice")],
             Vec::new(),
             Some(UserId(1)),
         );
@@ -841,7 +841,10 @@ mod tests {
 
         room.joined(
             RoomId(1),
-            vec![participant(1, "alice"), participant(2, "bob")],
+            vec![
+                participant(UserId(1), "alice"),
+                participant(UserId(2), "bob"),
+            ],
             Vec::new(),
             Some(UserId(1)),
         );
@@ -858,7 +861,7 @@ mod tests {
         let mut config = Config::default();
         let mut room = test_room();
         room.server_alias = "local".to_string();
-        config.set_user_volume_db("local", 2, -6.0);
+        config.set_user_volume_db("local", UserId(2), -6.0);
 
         assert_eq!(room.effective_user_volume_db(&config, UserId(2)), -6.0);
         room.begin_volume_preview(UserId(2), 3.0);

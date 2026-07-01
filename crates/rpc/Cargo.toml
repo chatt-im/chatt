@@ -6,3 +6,4 @@ edition = "2024"
 [dependencies]
 jsony = "0.1.10"
 ring = "0.17.14"
+toml-spanner = "1.0.3"
