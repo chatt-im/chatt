@@ -333,6 +333,9 @@ pub(crate) fn run_live_audio_direct_sample_simulation_output_inner(
     report.neteq_playout_delay_ms = report
         .neteq_playout_delay_ms
         .max(report.final_snapshot.neteq_playout_delay_ms);
+    report.neteq_packets_discarded = report.final_snapshot.neteq_packets_discarded;
+    report.neteq_secondary_packets_discarded =
+        report.final_snapshot.neteq_secondary_packets_discarded;
     report.output_samples = metrics.samples;
     report.output_ms = samples_to_ms(metrics.samples as usize);
     report.rms = metrics.rms();
@@ -546,6 +549,9 @@ pub(crate) fn run_live_audio_simulation_inner(
     report.neteq_playout_delay_ms = report
         .neteq_playout_delay_ms
         .max(report.final_snapshot.neteq_playout_delay_ms);
+    report.neteq_packets_discarded = report.final_snapshot.neteq_packets_discarded;
+    report.neteq_secondary_packets_discarded =
+        report.final_snapshot.neteq_secondary_packets_discarded;
     report.output_samples = metrics.samples;
     report.output_ms = samples_to_ms(metrics.samples as usize);
     report.rms = metrics.rms();
@@ -1747,6 +1753,11 @@ mod tests {
              alternating={alternating:?} continuous={continuous:?}"
         );
         assert_eq!(alternating.steady_state_underruns, 0, "{alternating:?}");
+        assert_eq!(alternating.neteq_packets_discarded, 0, "{alternating:?}");
+        assert_eq!(
+            alternating.neteq_secondary_packets_discarded, 0,
+            "{alternating:?}"
+        );
         assert_coherent_output(&alternating, 0.002);
     }
 

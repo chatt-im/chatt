@@ -173,6 +173,8 @@ pub struct LiveAudioSimulationReport {
     pub lost_frames: u64,
     pub reordered_frames: u64,
     pub late_frames: u64,
+    pub neteq_packets_discarded: u64,
+    pub neteq_secondary_packets_discarded: u64,
     pub missing_frames: u64,
     pub output_samples: u64,
     pub output_ms: u64,
