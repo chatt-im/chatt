@@ -307,6 +307,28 @@ fn default_placeholder() -> String {
     "Message #lobby".to_string()
 }
 
+/// The platform default URL opener: `open` on macOS, `xdg-open` on Linux, and
+/// nothing elsewhere (clicks are then inert until `url-open` is configured).
+fn default_url_open() -> Vec<String> {
+    #[cfg(target_os = "macos")]
+    {
+        vec!["open".to_string()]
+    }
+    #[cfg(target_os = "linux")]
+    {
+        vec!["xdg-open".to_string()]
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        Vec::new()
+    }
+}
+
+/// Whether `value` equals the platform default, so a save omits the key.
+fn is_default_url_open(value: &Vec<String>) -> bool {
+    *value == default_url_open()
+}
+
 impl Default for UiConfig {
     fn default() -> Self {
         Self {
@@ -565,6 +587,10 @@ pub struct Config {
     #[allow(dead_code)]
     #[toml(default, rename = "active-server", ToToml skip)]
     legacy_active_server: Option<String>,
+    /// Program and fixed arguments that open a clicked chat URL, with the URL
+    /// appended as the final argument. Defaults to the platform launcher.
+    #[toml(default = default_url_open(), ToToml skip_if = is_default_url_open)]
+    pub url_open: Vec<String>,
     #[toml(default = default_servers(), style = Header)]
     pub servers: Vec<ServerEntry>,
     #[toml(default, style = Header)]
@@ -852,6 +878,11 @@ impl Config {
                     index + 1
                 )));
             }
+        }
+        if let Some(program) = self.url_open.first()
+            && program.is_empty()
+        {
+            out.push(Diag::error("url-open program must not be empty"));
         }
     }
 

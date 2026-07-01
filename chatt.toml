@@ -1,6 +1,11 @@
 # Default chatt configuration. User configuration is loaded from
 # ~/.config/chatt.toml unless --config or CHATT_CONFIG is provided.
 
+# Program (and fixed arguments) used to open a clicked chat URL. The URL is
+# appended as the final argument. Defaults to the platform launcher: "open" on
+# macOS, "xdg-open" on Linux.
+# url-open = ["firefox", "--private-window"]
+
 [audio]
 bitrate-bps = 48000
 # Noise suppression engine: "none", "spectral" (WebRTC), or "rnn-noise" (RNNoise).

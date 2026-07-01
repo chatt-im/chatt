@@ -34,6 +34,7 @@ pub(crate) struct RoomSession {
     pub chat: VirtualChatBuffer,
     pub participants: Participants,
     pending_clipboard: Option<String>,
+    pending_url_open: Option<String>,
     muted_users: HashSet<UserId>,
     stream_users: HashMap<u32, UserId>,
     volume_preview: Option<(UserId, f32)>,
@@ -172,6 +173,7 @@ impl RoomSession {
             chat: VirtualChatBuffer::new(config.ui.max_messages as usize, theme.syntax),
             participants: Participants::default(),
             pending_clipboard: None,
+            pending_url_open: None,
             muted_users: HashSet::new(),
             stream_users: HashMap::new(),
             volume_preview: None,
@@ -191,6 +193,15 @@ impl RoomSession {
 
     pub(crate) fn take_pending_clipboard(&mut self) -> Option<String> {
         self.pending_clipboard.take()
+    }
+
+    /// Queues `url` to be opened by the external opener on the next runtime tick.
+    pub(crate) fn request_open_url(&mut self, url: impl Into<String>) {
+        self.pending_url_open = Some(url.into());
+    }
+
+    pub(crate) fn take_pending_url_open(&mut self) -> Option<String> {
+        self.pending_url_open.take()
     }
 
     pub(crate) fn insert_paste(&mut self, text: String) {

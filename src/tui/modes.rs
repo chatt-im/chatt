@@ -773,12 +773,41 @@ impl RoomMode {
                 self.set_focus(app, ChatPanelFocus::ChatLog);
                 self.drag_chat_selection(app, mouse.row);
             }
+            extui::event::MouseEventKind::Up(extui::event::MouseButton::Left) if in_chat => {
+                // A collapsed selection (press and release without a drag) over a
+                // URL opens it; a drag remains a text selection.
+                if app.room.chat.selection_is_click()
+                    && let Some(url) = self.chat_link_at(app, mouse.column, mouse.row)
+                {
+                    app.room.request_open_url(url);
+                }
+                app.room.chat.end_selection();
+            }
             extui::event::MouseEventKind::Up(extui::event::MouseButton::Left) => {
                 app.room.chat.end_selection();
             }
             _ => {}
         }
         Action::Continue
+    }
+
+    /// Resolves a screen cell to the URL of a link under it, if any. Returns an
+    /// owned string so the caller can mutably borrow `app` to queue the open.
+    fn chat_link_at(&self, app: &App, column: u16, row: u16) -> Option<String> {
+        let line = self.layout.chat_line_at(row)?;
+        if line.kind != LineKind::Body {
+            return None;
+        }
+        // Content starts one column right of the marker gutter (see render.rs).
+        let content_x = self.layout.chat_rect.x.saturating_add(1);
+        if column < content_x {
+            return None;
+        }
+        let col_in_line = column - content_x;
+        app.room
+            .chat
+            .link_at(line.message, line.line, col_in_line)
+            .map(str::to_owned)
     }
 
     fn drag_chat_selection(&mut self, app: &mut App, row: u16) {

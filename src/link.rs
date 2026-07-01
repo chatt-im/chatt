@@ -51,7 +51,9 @@ fn scheme_at(bytes: &[u8], pos: usize) -> Option<usize> {
 /// Whether `byte` can appear inside a URL. Stops at whitespace, controls, and
 /// the delimiters commonly used to wrap a URL in prose.
 fn is_url_byte(byte: u8) -> bool {
-    !byte.is_ascii_whitespace() && !byte.is_ascii_control() && !matches!(byte, b'<' | b'>' | b'"' | b'`')
+    !byte.is_ascii_whitespace()
+        && !byte.is_ascii_control()
+        && !matches!(byte, b'<' | b'>' | b'"' | b'`')
 }
 
 /// Trims trailing punctuation from `[start, end)`, dropping a closing paren only
@@ -61,8 +63,10 @@ fn trim_trailing(bytes: &[u8], start: usize, mut end: usize) -> usize {
         let last = bytes[end - 1];
         let trim = match last {
             b'.' | b',' | b';' | b':' | b'!' | b'?' | b'\'' => true,
-            b')' => bytes[start..end].iter().filter(|&&b| b == b'(').count()
-                < bytes[start..end].iter().filter(|&&b| b == b')').count(),
+            b')' => {
+                bytes[start..end].iter().filter(|&&b| b == b'(').count()
+                    < bytes[start..end].iter().filter(|&&b| b == b')').count()
+            }
             _ => false,
         };
         if !trim {
