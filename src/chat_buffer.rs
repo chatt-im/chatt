@@ -2,6 +2,7 @@ use std::ops::Range;
 
 use extui::Style;
 use rpc::control::ChatMessage;
+use rpc::ids::FileTransferId;
 use tinyhl::{Highlighter, Language, Source, Span};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
@@ -62,6 +63,9 @@ pub struct ChatEntry {
     pub body: String,
     pub timestamp_ms: u64,
     pub local: bool,
+    /// The server file transfer this message announces, when it is a file. Keys
+    /// the render-time progress overlay in [`crate::app::room::RoomSession`].
+    pub file_transfer_id: Option<FileTransferId>,
     /// Byte ranges of `http`/`https` URLs in `body`, computed once at push time.
     pub links: Vec<Range<u32>>,
     /// Whether a collapsible (over [`COLLAPSE_LIMIT`] lines) message is expanded.
@@ -147,6 +151,7 @@ impl VirtualChatBuffer {
             body: message.body,
             timestamp_ms: message.timestamp_ms,
             local,
+            file_transfer_id: message.file_transfer_id,
             links,
             expanded: false,
             layout: MessageLayout::new(),
@@ -163,6 +168,7 @@ impl VirtualChatBuffer {
             body,
             timestamp_ms: 0,
             local: false,
+            file_transfer_id: None,
             links,
             expanded: false,
             layout: MessageLayout::new(),
@@ -1320,6 +1326,7 @@ mod tests {
                 body: body.to_string(),
                 timestamp_ms,
                 local,
+                file_transfer_id: None,
                 links: crate::link::find_urls(body),
                 expanded: false,
                 layout: MessageLayout::new(),

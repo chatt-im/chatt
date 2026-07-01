@@ -262,6 +262,10 @@ enum WebFeed {
     /// A `share_error` envelope reporting a failed play request. Transient and
     /// broadcast like [`ShareConfig`](WebFeed::ShareConfig), not retained.
     ShareError(String),
+    /// A `file_progress` envelope for an in-flight transfer. Transient: browsers
+    /// merge it into the matching placeholder message and it is not retained, so a
+    /// browser that connects mid-transfer simply sees the file once it lands.
+    FileProgress(String),
     /// A `share_ended` envelope. Drops the retained `share_available` for its
     /// `stream_id`.
     ShareEnded {
@@ -370,6 +374,13 @@ impl WebFeedSender {
     /// Sends a play-failure envelope to the browser. Not retained.
     pub fn send_share_error(&self, payload: String) {
         let _ = self.tx.send(WebFeed::ShareError(payload));
+        self.wake.wake();
+    }
+
+    /// Broadcasts a file-transfer progress envelope. Not retained: browsers merge
+    /// it into the matching placeholder message.
+    pub fn send_file_progress(&self, payload: String) {
+        let _ = self.tx.send(WebFeed::FileProgress(payload));
         self.wake.wake();
     }
 
@@ -656,7 +667,9 @@ fn run(
                         let _ = server.send_websocket_text(*id, &payload);
                     }
                 }
-                Ok(WebFeed::ShareConfig(payload)) | Ok(WebFeed::ShareError(payload)) => {
+                Ok(WebFeed::ShareConfig(payload))
+                | Ok(WebFeed::ShareError(payload))
+                | Ok(WebFeed::FileProgress(payload)) => {
                     for id in &clients {
                         let _ = server.send_websocket_text(*id, &payload);
                     }

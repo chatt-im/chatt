@@ -318,6 +318,35 @@ body {
   border-color: var(--accent);
 }
 
+.message-progress {
+  display: flex;
+  align-items: center;
+  gap: var(--space);
+  margin-top: 2px;
+  max-width: 360px;
+}
+
+.message-progress-track {
+  flex: 1 1 auto;
+  height: 6px;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border);
+  overflow: hidden;
+}
+
+.message-progress-fill {
+  height: 100%;
+  background: var(--text-dim);
+  transition: width 0.15s linear;
+}
+
+.message-progress-label {
+  flex: 0 0 auto;
+  color: var(--text-dim);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+
 .screenshare {
   display: flex;
   flex-direction: column;

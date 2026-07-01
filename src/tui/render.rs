@@ -14,10 +14,11 @@ use chatt::audio::StatsSnapshot;
 use crate::{
     app::{
         App, ChatPanelFocus, ParticipantState, ParticipantVoiceFeedback, ServerEditDraft,
-        ServerSelectItem, StatusKind, volume_db_label,
+        ServerSelectItem, StatusKind, room::TransferProgress, volume_db_label,
     },
     bindings::{self, Reachable, ReachableKind},
     chat_buffer::{self, LineKind},
+    client_net::{TransferDirection, format_bytes},
     theme::{self, Theme},
     tui::modes::{RoomLayout, SettingsMode},
     ui,
@@ -904,6 +905,10 @@ fn draw_chat(
             ),
             LineKind::Body => {
                 let msg = app.room.chat.message(line.message);
+                // A file message in flight overlays a progress bar on its single
+                // body line, keyed by the server transfer id. `transfer` returns a
+                // `Copy` snapshot, so no borrow of `app.room` outlives this read.
+                let progress = msg.file_transfer_id.and_then(|id| app.room.transfer(id));
                 let selected = chat_focused && app.room.chat.is_selected(line.message, line.line);
                 let base = if selected {
                     app.theme.selected_line
@@ -920,22 +925,29 @@ fn draw_chat(
                 marker.with(base).fill(buf);
                 marker.with(base.patch(accent)).text(buf, "▌");
                 row.with(base).fill(buf);
-                for seg in app.room.chat.line(line.message, line.line) {
-                    let start = seg.start as usize;
-                    let end = seg.end as usize;
-                    let text = &msg.body[start..end];
-                    let mut style = base.patch(app.theme.text).patch(seg.style);
-                    if msg
-                        .links
-                        .iter()
-                        .any(|link| seg.start < link.end && link.start < seg.end)
-                    {
-                        style = style.patch(app.theme.syntax.namespace)
-                            | extui::vt::Modifier::UNDERLINED;
-                    }
-                    let max_width = row.w.saturating_sub(seg.col) as usize;
-                    if max_width > 0 {
-                        buf.set_stringn(row.x + seg.col, row.y, text, max_width, style);
+                if line.line == 0
+                    && let Some(progress) = progress
+                {
+                    let name = msg.body.split('`').nth(1).unwrap_or(msg.body.as_str());
+                    draw_transfer_progress(row, base, progress, name, app, buf);
+                } else {
+                    for seg in app.room.chat.line(line.message, line.line) {
+                        let start = seg.start as usize;
+                        let end = seg.end as usize;
+                        let text = &msg.body[start..end];
+                        let mut style = base.patch(app.theme.text).patch(seg.style);
+                        if msg
+                            .links
+                            .iter()
+                            .any(|link| seg.start < link.end && link.start < seg.end)
+                        {
+                            style = style.patch(app.theme.syntax.namespace)
+                                | extui::vt::Modifier::UNDERLINED;
+                        }
+                        let max_width = row.w.saturating_sub(seg.col) as usize;
+                        if max_width > 0 {
+                            buf.set_stringn(row.x + seg.col, row.y, text, max_width, style);
+                        }
                     }
                 }
             }
@@ -948,6 +960,58 @@ fn draw_chat(
                     .text(buf, "...");
             }
         }
+    }
+}
+
+/// Overlays an in-flight file transfer's progress on its chat-line `row`: the
+/// filled portion is drawn reversed over a `verb name done/total (pct%)` label,
+/// so the bar reads left to right and reverts to the plain body text once the
+/// overlay is cleared on completion.
+fn draw_transfer_progress(
+    row: Rect,
+    base: Style,
+    progress: TransferProgress,
+    file_name: &str,
+    app: &App,
+    buf: &mut Buffer,
+) {
+    let width = row.w as usize;
+    if width == 0 {
+        return;
+    }
+    let ratio = if progress.total == 0 {
+        0.0
+    } else {
+        (progress.transferred as f64 / progress.total as f64).clamp(0.0, 1.0)
+    };
+    let pct = (ratio * 100.0).round() as u64;
+    let verb = match progress.direction {
+        TransferDirection::Incoming => "receiving",
+        TransferDirection::Outgoing => "sending",
+    };
+    let label = format!(
+        " {verb} {file_name}  {}/{} ({pct}%)",
+        format_bytes(progress.transferred),
+        format_bytes(progress.total)
+    );
+    let filled = (width as f64 * ratio).round() as usize;
+    let text_style = base.patch(app.theme.text);
+    let chars: Vec<char> = label.chars().collect();
+    let mut encoded = [0u8; 4];
+    for col in 0..width {
+        let ch = chars.get(col).copied().unwrap_or(' ');
+        let style = if col < filled {
+            text_style.with_modifier(extui::vt::Modifier::REVERSED)
+        } else {
+            text_style
+        };
+        buf.set_stringn(
+            row.x + col as u16,
+            row.y,
+            ch.encode_utf8(&mut encoded),
+            1,
+            style,
+        );
     }
 }
 

@@ -97,6 +97,7 @@ fn client_config(
         file_receive_dir: receive_dir,
         max_upload_bytes: LIMIT_BYTES,
         max_receive_bytes: LIMIT_BYTES,
+        upload_rate_bytes: 0,
         candidate_privacy: CandidatePrivacy::Disabled,
         prefer_ipv6: false,
     }
