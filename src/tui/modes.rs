@@ -639,6 +639,9 @@ impl RoomMode {
                 self.move_room_selection_with_focus(app, -1);
             }
             ClearChat if self.focus == ChatPanelFocus::ChatLog => app.room.clear_chat(),
+            PasteClipboard => {
+                self.paste_from_clipboard(app, &crate::clipboard_paste::HelperClipboard)
+            }
             _ => return app.process_global_command(command),
         }
         Action::Continue
@@ -672,6 +675,27 @@ impl RoomMode {
         }
         let _ = app.room.composer.send_key(&key);
         Action::Continue
+    }
+
+    /// Reads the clipboard and either inserts text into the composer or opens
+    /// the image upload dialog. Text focuses the composer first so the paste is
+    /// visible from any room focus.
+    fn paste_from_clipboard(
+        &mut self,
+        app: &mut App,
+        provider: &dyn crate::clipboard_paste::ClipboardPasteProvider,
+    ) {
+        use crate::clipboard_paste::PastePayload;
+        match provider.read_paste() {
+            Ok(PastePayload::Text(text)) => {
+                self.enter_compose_insert_mode(app);
+                app.room.insert_paste(text);
+            }
+            Ok(PastePayload::Image(image)) => app.open_paste_image_dialog(image),
+            Ok(PastePayload::Empty) => app.set_status("clipboard is empty"),
+            Ok(PastePayload::Unsupported(reason)) => app.set_status(reason),
+            Err(error) => app.set_error(error.to_string()),
+        }
     }
 
     fn process_chat_mouse(&mut self, app: &mut App, mouse: MouseEvent) -> Action {
@@ -932,9 +956,8 @@ impl AppMode for RoomMode {
     }
 
     fn process_paste(&mut self, app: &mut App, text: String) {
-        if self.focus == ChatPanelFocus::Compose {
-            app.room.insert_paste(text);
-        }
+        self.enter_compose_insert_mode(app);
+        app.room.insert_paste(text);
     }
 
     fn presentation(&self, app: &App) -> ModePresentation {
@@ -989,6 +1012,54 @@ mod tests {
 
     fn key(ch: char) -> KeyEvent {
         KeyEvent::new(KeyCode::Char(ch), KeyModifiers::empty())
+    }
+
+    fn ctrl(ch: char) -> KeyEvent {
+        KeyEvent::new(KeyCode::Char(ch), KeyModifiers::CONTROL)
+    }
+
+    #[test]
+    fn bracketed_paste_inserts_from_any_focus() {
+        for focus in [
+            ChatPanelFocus::Lobby,
+            ChatPanelFocus::ChatLog,
+            ChatPanelFocus::Compose,
+        ] {
+            let mut app = test_app();
+            let mut room = RoomMode::with_focus(focus);
+            room.process_paste(&mut app, "pasted".to_string());
+            assert!(
+                app.room.composer.text().contains("pasted"),
+                "focus {focus:?} did not receive paste"
+            );
+        }
+    }
+
+    #[test]
+    fn paste_command_resolves_from_room_layers() {
+        let mut app = test_app();
+        let cases = [
+            (bindings::WORKSPACE_LAYER, key('p')),
+            (bindings::COMPOSE_NORMAL_LAYER, key('p')),
+            (bindings::WORKSPACE_LAYER, ctrl('v')),
+            (bindings::COMPOSE_NORMAL_LAYER, ctrl('v')),
+            (bindings::INSERT_LAYER, ctrl('v')),
+        ];
+        for (layer, event) in cases {
+            match resolve_binding(&mut app, layer, event) {
+                BindingResolution::Action(BindCommand::PasteClipboard) => {}
+                other => panic!("expected paste command, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn insert_layer_p_stays_literal_text() {
+        let mut app = test_app();
+        match resolve_binding(&mut app, bindings::INSERT_LAYER, key('p')) {
+            BindingResolution::Unmatched => {}
+            other => panic!("expected unmatched, got {other:?}"),
+        }
     }
 
     fn type_text(room: &mut RoomMode, app: &mut App, text: &str) {

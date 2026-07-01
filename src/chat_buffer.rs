@@ -62,6 +62,8 @@ pub struct ChatEntry {
     pub body: String,
     pub timestamp_ms: u64,
     pub local: bool,
+    /// Byte ranges of `http`/`https` URLs in `body`, computed once at push time.
+    pub links: Vec<Range<u32>>,
     /// Whether a collapsible (over [`COLLAPSE_LIMIT`] lines) message is expanded.
     expanded: bool,
     layout: MessageLayout,
@@ -138,12 +140,14 @@ impl VirtualChatBuffer {
     }
 
     pub fn push_chat(&mut self, message: ChatMessage, local: bool) {
+        let links = crate::link::find_urls(&message.body);
         self.messages.push(ChatEntry {
             id: message.message_id.0,
             sender: message.sender_name,
             body: message.body,
             timestamp_ms: message.timestamp_ms,
             local,
+            links,
             expanded: false,
             layout: MessageLayout::new(),
         });
@@ -151,12 +155,15 @@ impl VirtualChatBuffer {
     }
 
     pub fn push_notice(&mut self, sender: impl Into<String>, body: impl Into<String>) {
+        let body = body.into();
+        let links = crate::link::find_urls(&body);
         self.messages.push(ChatEntry {
             id: 0,
             sender: sender.into(),
-            body: body.into(),
+            body,
             timestamp_ms: 0,
             local: false,
+            links,
             expanded: false,
             layout: MessageLayout::new(),
         });
@@ -184,6 +191,35 @@ impl VirtualChatBuffer {
 
     pub fn line(&self, message: usize, line: usize) -> &[Segment] {
         self.messages[message].layout.line(line)
+    }
+
+    /// Returns the URL at `col_in_line` on wrapped `line` of `message`, when a
+    /// link segment covers that column. `col_in_line` is measured from the start
+    /// of the message content, the same origin as [`Segment::col`].
+    pub fn link_at(&self, message: usize, line: usize, col_in_line: u16) -> Option<&str> {
+        let entry = self.messages.get(message)?;
+        if entry.links.is_empty() {
+            return None;
+        }
+        for seg in entry.layout.line(line) {
+            let text = &entry.body[seg.start as usize..seg.end as usize];
+            let width = UnicodeWidthStr::width(text).min(u16::MAX as usize) as u16;
+            if col_in_line < seg.col || col_in_line >= seg.col.saturating_add(width) {
+                continue;
+            }
+            let range = entry
+                .links
+                .iter()
+                .find(|r| r.start < seg.end && seg.start < r.end)?;
+            return Some(&entry.body[range.start as usize..range.end as usize]);
+        }
+        None
+    }
+
+    /// Whether the current selection is a collapsed click (anchor equals head),
+    /// i.e. the pointer was pressed and released without dragging.
+    pub fn selection_is_click(&self) -> bool {
+        self.selection.map_or(false, |s| s.anchor == s.head)
     }
 
     pub fn scroll_offset(&self) -> usize {

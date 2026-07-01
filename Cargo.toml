@@ -36,6 +36,7 @@ sonora-common-audio.path = "crates/sonora/crates/sonora-common-audio/"
 foldhash = "0.2.0"
 hashbrown = "0.17.1"
 imagesize = "0.14"
+tempfile = "3.27.0"
 mimalloc = { version = "0.1.52", features = ["override"], optional = true }
 dhat = { version = "0.3", optional = true }
 

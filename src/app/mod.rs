@@ -29,7 +29,8 @@ use rpc::{
 use crate::{
     bindings::BindCommand,
     client_net::{
-        NetworkClient, NetworkCommand, NetworkEvent, spawn_open_pair_once, spawn_pair_once,
+        NetworkClient, NetworkCommand, NetworkEvent, UploadFileRequest, spawn_open_pair_once,
+        spawn_pair_once,
     },
     config::{self, Config, ServerEntry, SoundboardClip, ThemeChoice, validate_server_entry},
     local_control, settings,
@@ -40,7 +41,7 @@ use crate::{
         form::rect_contains,
         mode::{AppMode, ModeTransition, PendingTransition},
         modes::{RoomMode, ServerEditMode, ServerListMode, SettingsMode, SettingsSession},
-        overlay::{DialogMode, PasswordPromptMode},
+        overlay::{DialogMode, PasswordPromptMode, PasteImageUploadMode},
     },
     ui::settings::{
         DeviceAction, DeviceSide, FieldId, FieldIntent, SettingsButton, SettingsOutput,
@@ -885,7 +886,10 @@ impl App {
                 self.send_network_command(NetworkCommand::SendChat(body), true);
             }
             crate::web_server::WebRequest::UploadFile { path } => {
-                self.send_network_command(NetworkCommand::UploadFile(path), true);
+                self.send_network_command(
+                    NetworkCommand::UploadFile(UploadFileRequest::new(path)),
+                    true,
+                );
             }
         }
     }
@@ -3093,13 +3097,43 @@ impl App {
         }
         if self.network.is_some() {
             self.send_network_command(
-                NetworkCommand::UploadFile(std::path::PathBuf::from(path)),
+                NetworkCommand::UploadFile(UploadFileRequest::new(std::path::PathBuf::from(path))),
                 true,
             );
             self.set_status(format!("queued upload {}", path));
         } else {
             self.set_error("select a server before uploading files");
         }
+    }
+
+    /// Opens the filename confirmation dialog for a pasted image or file.
+    pub(crate) fn open_paste_image_dialog(&mut self, image: crate::clipboard_paste::ImagePaste) {
+        let dialog = PasteImageUploadMode::new(image, &self.theme);
+        self.push_mode(Box::new(dialog));
+    }
+
+    /// Validates the chosen name and queues the pasted upload. Returns `Err`
+    /// with a message when the dialog should stay open (no server, bad name).
+    pub(crate) fn confirm_paste_image_upload(
+        &mut self,
+        source: &crate::clipboard_paste::ImagePasteSource,
+        raw_name: String,
+    ) -> Result<(), String> {
+        if self.network.is_none() {
+            return Err("select a server before uploading files".to_string());
+        }
+        let name = crate::client_net::sanitize_file_name(&raw_name);
+        if name.len() > rpc::control::MAX_FILE_NAME_BYTES {
+            return Err("file name is too long".to_string());
+        }
+        let request = UploadFileRequest {
+            path: source.path().clone(),
+            name_override: Some(name.clone()),
+            delete_after_open: source.is_staged(),
+        };
+        self.send_network_command(NetworkCommand::UploadFile(request), true);
+        self.set_status(format!("queued upload {name}"));
+        Ok(())
     }
 
     fn show_command_help(&mut self) {

@@ -125,10 +125,35 @@ pub struct ClientConfig {
     pub prefer_ipv6: bool,
 }
 
+/// A request to upload a file to the current room.
+///
+/// `name_override` supplies the uploaded name when the source path name is not
+/// what the user wants shown (e.g. a staged clipboard temp file). `path` is
+/// still validated and streamed as-is. `delete_after_open` removes the source
+/// after the upload handle is opened, used to clean up staged temp files.
+#[derive(Debug)]
+pub struct UploadFileRequest {
+    pub path: PathBuf,
+    pub name_override: Option<String>,
+    pub delete_after_open: bool,
+}
+
+impl UploadFileRequest {
+    /// A plain upload that keeps the source path's file name and leaves the
+    /// source in place.
+    pub fn new(path: PathBuf) -> Self {
+        Self {
+            path,
+            name_override: None,
+            delete_after_open: false,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub enum NetworkCommand {
     SendChat(String),
-    UploadFile(PathBuf),
+    UploadFile(UploadFileRequest),
     LocalVoicePacket(LocalVoiceFrame),
     SequencedLocalVoicePacket {
         sequence: u32,
@@ -1939,8 +1964,8 @@ impl WorkerState {
                 );
                 self.queue_control(ClientControl::SendChat { room_id, body })?;
             }
-            NetworkCommand::UploadFile(path) => {
-                self.queue_file_upload(path);
+            NetworkCommand::UploadFile(request) => {
+                self.queue_file_upload(request);
             }
             NetworkCommand::LocalVoicePacket(frame) => {
                 if let Some(stream_id) = self.active_stream {
@@ -2086,8 +2111,8 @@ impl WorkerState {
         self.send_p2p_voice(stream_id, sequence, timestamp, frame.flags, &frame.payload);
     }
 
-    fn queue_file_upload(&mut self, path: PathBuf) {
-        match self.prepare_file_upload(path) {
+    fn queue_file_upload(&mut self, request: UploadFileRequest) {
+        match self.prepare_file_upload(request) {
             Ok(upload) => {
                 let name = upload.name.clone();
                 let size = upload.size;
@@ -2103,7 +2128,15 @@ impl WorkerState {
         }
     }
 
-    fn prepare_file_upload(&mut self, path: PathBuf) -> Result<OutgoingUpload, String> {
+    fn prepare_file_upload(
+        &mut self,
+        request: UploadFileRequest,
+    ) -> Result<OutgoingUpload, String> {
+        let UploadFileRequest {
+            path,
+            name_override,
+            delete_after_open,
+        } = request;
         let metadata = fs::metadata(&path)
             .map_err(|error| format!("failed to read {}: {error}", path.display()))?;
         if !metadata.is_file() {
@@ -2118,15 +2151,8 @@ impl WorkerState {
                 format_bytes(limit)
             ));
         }
-        let name = sanitize_file_name(
-            path.file_name()
-                .and_then(|name| name.to_str())
-                .ok_or_else(|| "upload path must end in a UTF-8 file name".to_string())?,
-        );
-        if name.len() > MAX_FILE_NAME_BYTES {
-            return Err("file name exceeds maximum length".to_string());
-        }
-        let file = File::open(&path)
+        let name = upload_display_name(name_override, &path)?;
+        let file = open_upload_source(&path, delete_after_open)
             .map_err(|error| format!("failed to open {}: {error}", path.display()))?;
         let transfer_id = FileTransferId(self.next_file_transfer);
         self.next_file_transfer = self.next_file_transfer.wrapping_add(1).max(1);
@@ -4008,7 +4034,37 @@ fn create_receive_file(dir: &Path, requested_name: &str) -> Result<(PathBuf, Fil
     ))
 }
 
-fn sanitize_file_name(name: &str) -> String {
+/// Resolves the sanitized upload name from an optional override, falling back
+/// to the source path's file name. Returns an error when the name is unusable
+/// or exceeds the protocol limit.
+fn upload_display_name(name_override: Option<String>, path: &Path) -> Result<String, String> {
+    let raw = match name_override {
+        Some(name) => name,
+        None => path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| "upload path must end in a UTF-8 file name".to_string())?
+            .to_string(),
+    };
+    let name = sanitize_file_name(&raw);
+    if name.len() > MAX_FILE_NAME_BYTES {
+        return Err("file name exceeds maximum length".to_string());
+    }
+    Ok(name)
+}
+
+/// Opens the upload source, then unlinks it when `delete_after_open` is set. The
+/// returned handle keeps the bytes reachable for streaming, so staged temp files
+/// clean themselves up without waiting for the upload to finish.
+fn open_upload_source(path: &Path, delete_after_open: bool) -> std::io::Result<File> {
+    let file = File::open(path)?;
+    if delete_after_open {
+        let _ = fs::remove_file(path);
+    }
+    Ok(file)
+}
+
+pub(crate) fn sanitize_file_name(name: &str) -> String {
     let trimmed = name.rsplit(['/', '\\']).next().unwrap_or("file").trim();
     let mut out = String::with_capacity(trimmed.len().max(4));
     for ch in trimmed.chars() {
@@ -4877,6 +4933,48 @@ mod tests {
     fn sanitize_file_name_removes_path_components() {
         assert_eq!(sanitize_file_name("../unsafe/report.pdf"), "report.pdf");
         assert_eq!(sanitize_file_name("bad/name?.txt"), "name_.txt");
+    }
+
+    #[test]
+    fn upload_display_name_prefers_override() {
+        let path = PathBuf::from("/tmp/staged-abc.png");
+        assert_eq!(
+            upload_display_name(Some("holiday.png".to_string()), &path).unwrap(),
+            "holiday.png"
+        );
+        assert_eq!(upload_display_name(None, &path).unwrap(), "staged-abc.png");
+    }
+
+    #[test]
+    fn upload_display_name_rejects_overlong_name() {
+        let path = PathBuf::from("/tmp/x.png");
+        let long = "a".repeat(MAX_FILE_NAME_BYTES + 1);
+        assert!(upload_display_name(Some(long), &path).is_err());
+    }
+
+    #[test]
+    fn open_upload_source_deletes_staged_file_but_keeps_handle() {
+        use std::io::Read;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("staged.png");
+        fs::write(&path, b"staged bytes").unwrap();
+
+        let mut file = open_upload_source(&path, true).unwrap();
+        assert!(!path.exists());
+        let mut contents = Vec::new();
+        file.read_to_end(&mut contents).unwrap();
+        assert_eq!(contents, b"staged bytes");
+    }
+
+    #[test]
+    fn open_upload_source_keeps_existing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("keep.png");
+        fs::write(&path, b"bytes").unwrap();
+
+        let _file = open_upload_source(&path, false).unwrap();
+        assert!(path.exists());
     }
 
     fn feedback_window(

@@ -263,6 +263,21 @@ Useful in-app slash commands:
 
 The default key bindings are in `chatt.toml` under `[bindings.*]`.
 
+### Pasting from the clipboard
+
+In a room, `Ctrl+V` or `Ctrl+Alt+V` pastes from the system clipboard, from any
+focus. In the composer's normal (vim) mode `p` does the same. Text is inserted
+into the composer. An image or file opens a small dialog to confirm the upload
+name before it goes through the normal upload pipeline. `Enter` uploads, `Esc`
+cancels.
+
+Clipboard reads use the same command-line helpers as copying: `wl-paste` on
+Wayland, `xclip`/`xsel` on X11, and `pbpaste` (plus `pngpaste` for images) on
+macOS. A missing helper reports a status message rather than failing.
+
+Because `Ctrl+V` is paste, the compose-mode microphone toggle is `Alt+M`
+(`M-m`). Mute is still `m` in the room's normal and workspace layers.
+
 ## Client Configuration
 
 Client config is loaded from `~/.config/chatt.toml` when present, or from

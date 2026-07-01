@@ -16,7 +16,7 @@ mod imp {
     };
 
     use crate::app::EventSender;
-    use crate::client_net::{CommandSender, NetworkCommand};
+    use crate::client_net::{CommandSender, NetworkCommand, UploadFileRequest};
 
     pub const SOCKET_ENV: &str = "CHATT_CONTROL_SOCKET";
     pub const RUN_DIR_ENV: &str = "CHATT_RUN_DIR";
@@ -494,7 +494,7 @@ mod imp {
             }
             Ok(Request::Upload(path)) => {
                 let message = format!("queued upload {}", path.display());
-                match commands.send(NetworkCommand::UploadFile(path)) {
+                match commands.send(NetworkCommand::UploadFile(UploadFileRequest::new(path))) {
                     Ok(()) => Response {
                         status: STATUS_OK,
                         message,
@@ -923,7 +923,7 @@ mod imp {
 
             assert_eq!(response, format!("queued upload {}", upload_path.display()));
             match command {
-                NetworkCommand::UploadFile(path) => assert_eq!(path, upload_path),
+                NetworkCommand::UploadFile(request) => assert_eq!(request.path, upload_path),
                 other => panic!("unexpected command: {other:?}"),
             }
 
@@ -993,7 +993,7 @@ mod imp {
     use std::path::Path;
 
     use crate::app::EventSender;
-    use crate::client_net::{CommandSender, NetworkCommand};
+    use crate::client_net::{CommandSender, NetworkCommand, UploadFileRequest};
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub enum VoiceCommand {

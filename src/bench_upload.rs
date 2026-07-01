@@ -23,7 +23,9 @@ use rpc::crypto::dev_server_seed_hex;
 use rpc::ids::{RoomId, UserId};
 
 use crate::app::{AppEvent, EventSender};
-use crate::client_net::{ClientConfig, NetworkClient, NetworkCommand, NetworkEvent};
+use crate::client_net::{
+    ClientConfig, NetworkClient, NetworkCommand, NetworkEvent, UploadFileRequest,
+};
 use crate::config::CandidatePrivacy;
 
 use server::Server;
@@ -220,7 +222,9 @@ fn upload_50mb_loopback() {
     let start = Instant::now();
     uploader
         .handle
-        .send(NetworkCommand::UploadFile(source.clone()));
+        .send(NetworkCommand::UploadFile(UploadFileRequest::new(
+            source.clone(),
+        )));
 
     let received = wait_for(
         "receiver",

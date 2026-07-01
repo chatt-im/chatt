@@ -5,18 +5,22 @@ use extui::{
     },
     vt::Modifier,
 };
-use extui_bindings::InputKey;
+use extui_bindings::{InputKey, LayerId};
+use extui_editor::{Editor, Mode as EditorMode, Span as EditorSpan};
+use unicode_width::UnicodeWidthStr;
 
 use crate::{
     app::{App, AppEvent, UserVolumeDialog},
     bindings::{self, BindCommand, Resolved},
     client_net::NetworkEvent,
+    clipboard_paste::{ImagePaste, ImagePasteOrigin, ImagePasteSource},
     theme,
     theme::Theme,
     tui::{
         Action,
         form::rect_contains,
         mode::{AppMode, ChromeSpec, Coverage, ModePresentation, ModeTransition, is_quit_key},
+        widgets::draw_labeled_editor_frame,
     },
 };
 
@@ -461,11 +465,19 @@ impl PasswordPromptMode {
 
         let cancel = button_label(
             "Cancel",
-            command_key_hint(&app.config.bindings, BindCommand::Cancel),
+            command_key_hint(
+                &app.config.bindings,
+                bindings::PASSWORD_LAYER,
+                BindCommand::Cancel,
+            ),
         );
         let submit = button_label(
             "Submit",
-            command_key_hint(&app.config.bindings, BindCommand::SubmitPassword),
+            command_key_hint(
+                &app.config.bindings,
+                bindings::PASSWORD_LAYER,
+                BindCommand::SubmitPassword,
+            ),
         );
         draw_button(
             self.cancel_button,
@@ -477,9 +489,321 @@ impl PasswordPromptMode {
     }
 }
 
-fn command_key_hint(bindings: &bindings::BindingRuntime, target: BindCommand) -> Option<String> {
+/// Confirmation dialog for uploading a pasted image or file.
+///
+/// The filename field is a real single-line [`Editor`] seeded with a default
+/// name. `Enter` uploads under the edited name, `Esc` cancels and removes any
+/// staged temp file. The upload pipeline takes over once confirmed.
+pub(crate) struct PasteImageUploadMode {
+    editor: Editor,
+    source: ImagePasteSource,
+    origin: ImagePasteOrigin,
+    dimensions: Option<(u32, u32)>,
+    size: Option<u64>,
+    default_name: String,
+    error: Option<String>,
+    cancel_button: Rect,
+    upload_button: Rect,
+}
+
+impl PasteImageUploadMode {
+    pub(crate) fn new(image: ImagePaste, theme: &Theme) -> Self {
+        let size = std::fs::metadata(image.source.path())
+            .ok()
+            .map(|metadata| metadata.len());
+        let editor = filename_editor(theme);
+        Self {
+            editor,
+            source: image.source,
+            origin: image.origin,
+            dimensions: image.dimensions,
+            size,
+            default_name: image.default_name,
+            error: None,
+            cancel_button: Rect::EMPTY,
+            upload_button: Rect::EMPTY,
+        }
+    }
+
+    /// The upload name: the edited field, or the default when left blank, with
+    /// the default extension appended when the typed name has none.
+    fn finalize_name(&self) -> String {
+        let typed = self.editor.text();
+        let trimmed = typed.trim();
+        let base = if trimmed.is_empty() {
+            self.default_name.trim()
+        } else {
+            trimmed
+        };
+        let mut name = base.to_string();
+        if std::path::Path::new(&name).extension().is_none() {
+            if let Some(extension) = std::path::Path::new(&self.default_name)
+                .extension()
+                .and_then(|extension| extension.to_str())
+            {
+                name = format!("{name}.{extension}");
+            }
+        }
+        name
+    }
+
+    /// The muted suffix shown after the typed text: the full default name when
+    /// the field is empty, or the extension that would be appended, or nothing
+    /// when the user already typed an extension.
+    fn ghost_text(&self, typed: &str) -> String {
+        if typed.is_empty() {
+            return self.default_name.clone();
+        }
+        if std::path::Path::new(typed).extension().is_some() {
+            return String::new();
+        }
+        match std::path::Path::new(&self.default_name)
+            .extension()
+            .and_then(|extension| extension.to_str())
+        {
+            Some(extension) => format!(".{extension}"),
+            None => String::new(),
+        }
+    }
+
+    fn submit(&mut self, app: &mut App) {
+        let name = self.finalize_name();
+        match app.confirm_paste_image_upload(&self.source, name) {
+            Ok(()) => app.pop_mode(),
+            Err(error) => self.error = Some(error),
+        }
+    }
+
+    fn cancel(&mut self, app: &mut App) {
+        if self.source.is_staged() {
+            let _ = std::fs::remove_file(self.source.path());
+        }
+        app.pop_mode();
+    }
+
+    fn process_command(&mut self, app: &mut App, command: BindCommand) -> Action {
+        match command {
+            BindCommand::Cancel => self.cancel(app),
+            BindCommand::Activate => self.submit(app),
+            command => return app.process_global_command(command),
+        }
+        Action::Continue
+    }
+
+    fn metadata_line(&self) -> String {
+        let mut parts = Vec::new();
+        if let Some((width, height)) = self.dimensions {
+            parts.push(format!("{width}x{height}"));
+        }
+        if let Some(size) = self.size {
+            parts.push(format_size(size));
+        }
+        parts.push(self.origin.label().to_string());
+        parts.join("  ·  ")
+    }
+
+    fn render_buttons(&mut self, area: Rect, app: &App, buf: &mut Buffer, theme: &Theme) {
+        if area.is_empty() {
+            self.cancel_button = Rect::EMPTY;
+            self.upload_button = Rect::EMPTY;
+            return;
+        }
+
+        let mut row = area;
+        let gap = u16::from(row.w > 20);
+        let button_width = row.w.saturating_sub(gap) / 2;
+        self.cancel_button = row.take_left(button_width as i32);
+        if gap > 0 {
+            row.take_left(gap as i32).with(theme.dialog_panel).fill(buf);
+        }
+        self.upload_button = row;
+
+        let cancel = button_label(
+            "Cancel",
+            command_key_hint(
+                &app.config.bindings,
+                bindings::PASTE_LAYER,
+                BindCommand::Cancel,
+            ),
+        );
+        let upload = button_label(
+            "Upload",
+            command_key_hint(
+                &app.config.bindings,
+                bindings::PASTE_LAYER,
+                BindCommand::Activate,
+            ),
+        );
+        draw_button(
+            self.cancel_button,
+            buf,
+            theme.dialog_panel.patch(theme.muted),
+            &cancel,
+        );
+        draw_button(self.upload_button, buf, theme.selected_focused, &upload);
+    }
+}
+
+impl AppMode for PasteImageUploadMode {
+    fn render(&mut self, app: &mut App, buf: &mut Buffer, _now_ms: u64) {
+        let theme = &app.theme;
+        let area = buf.rect();
+        if area.w < 28 || area.h < 7 {
+            return;
+        }
+        let width = area.w.min(58).max(28);
+        let height = area.h.min(7);
+        let panel = Rect {
+            x: area.x + area.w.saturating_sub(width) / 2,
+            y: area.y + area.h.saturating_sub(height) / 2,
+            w: width,
+            h: height,
+        };
+        buf.clear_rect(panel, theme.dialog_panel);
+
+        let mut rows = panel;
+        rows.take_top(1)
+            .with(theme.dialog_header | Modifier::BOLD)
+            .fill(buf)
+            .with(HAlign::Center)
+            .with(Ellipsis(true))
+            .text(buf, "Upload image");
+
+        let mut body = rows.inset(2, 1);
+        body.take_top(1)
+            .with(theme.dialog_panel.patch(theme.muted))
+            .with(Ellipsis(true))
+            .text(buf, &self.metadata_line());
+
+        let field = draw_labeled_editor_frame(
+            body.take_top(1),
+            buf,
+            theme,
+            6,
+            "Name",
+            true,
+            self.error.is_some(),
+        );
+        self.editor.render(field, buf);
+        let typed = self.editor.text();
+        let ghost = self.ghost_text(&typed);
+        if !ghost.is_empty() {
+            let mut rest = field;
+            rest.take_left(UnicodeWidthStr::width(typed.as_str()) as i32);
+            rest.with(theme.join_input_active.patch(theme.muted))
+                .with(Ellipsis(true))
+                .text(buf, &ghost);
+        }
+
+        // One padding line above the buttons, reused to show a validation error.
+        if body.h > 0 {
+            let row = body.take_top(1);
+            if let Some(error) = &self.error {
+                row.with(theme.dialog_panel.patch(theme.error))
+                    .with(Ellipsis(true))
+                    .text(buf, error);
+            }
+        }
+        if body.h > 0 {
+            self.render_buttons(body.take_top(1), app, buf, theme);
+        }
+        crate::tui::render::draw_overlay_key_preview(app, bindings::PASTE_LAYER, buf);
+    }
+
+    fn process_input(&mut self, app: &mut App, key: KeyEvent) -> Action {
+        if is_quit_key(&key) {
+            return Action::Quit;
+        }
+        if matches!(key.kind, KeyEventKind::Release) {
+            return Action::Continue;
+        }
+        // In insert mode, Esc leaves the editor's insert mode rather than
+        // cancelling the dialog. Cancel is reachable with a second Esc from
+        // normal mode.
+        if key.code == KeyCode::Esc && self.editor.mode() == EditorMode::Insert {
+            self.editor.send_key(&key);
+            return Action::Continue;
+        }
+        if let Some(input) = InputKey::from_event(&key) {
+            match bindings::resolve(
+                &app.config.bindings.router,
+                bindings::PASTE_LAYER,
+                &mut app.chrome.binding.pending_chord,
+                input,
+            ) {
+                Resolved::Action(id) => {
+                    let command = app.config.bindings.actions.get(id).clone();
+                    return self.process_command(app, command);
+                }
+                Resolved::Consumed => return Action::Continue,
+                Resolved::Unmatched => {}
+            }
+        }
+        if self.editor.send_key(&key) {
+            self.error = None;
+        }
+        Action::Continue
+    }
+
+    fn process_paste(&mut self, _app: &mut App, text: String) {
+        let span = EditorSpan::empty_at(self.editor.cursor_offset());
+        self.editor.replace_range(span, text.trim());
+    }
+
+    fn process_mouse(&mut self, app: &mut App, mouse: MouseEvent) -> Action {
+        if !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+            return Action::Continue;
+        }
+        if rect_contains(self.cancel_button, mouse.column, mouse.row) {
+            self.cancel(app);
+        } else if rect_contains(self.upload_button, mouse.column, mouse.row) {
+            self.submit(app);
+        }
+        Action::Continue
+    }
+
+    fn presentation(&self, _app: &App) -> ModePresentation {
+        ModePresentation {
+            coverage: Coverage::Overlay,
+            chrome: Some(ChromeSpec {
+                theme_mode: theme::UiMode::Compose,
+                status_label: "Upload",
+                layer: bindings::PASTE_LAYER,
+            }),
+        }
+    }
+}
+
+fn filename_editor(theme: &Theme) -> Editor {
+    let mut editor = Editor::new();
+    editor.set_single_line(true);
+    editor.set_wrap(false);
+    editor.set_height_bounds(1, 1);
+    editor.set_theme(theme.join_input_editor_theme());
+    editor.enter_insert_mode();
+    editor
+}
+
+/// Formats a byte count as a short human-readable size for dialog metadata.
+fn format_size(bytes: u64) -> String {
+    const KIB: u64 = 1024;
+    const MIB: u64 = KIB * 1024;
+    if bytes >= MIB {
+        format!("{:.1} MB", bytes as f64 / MIB as f64)
+    } else if bytes >= KIB {
+        format!("{:.1} KB", bytes as f64 / KIB as f64)
+    } else {
+        format!("{bytes} B")
+    }
+}
+
+fn command_key_hint(
+    bindings: &bindings::BindingRuntime,
+    layer: LayerId,
+    target: BindCommand,
+) -> Option<String> {
     let pending = None;
-    for reachable in bindings::reachable(bindings, bindings::PASSWORD_LAYER, &pending) {
+    for reachable in bindings::reachable(bindings, layer, &pending) {
         let bindings::ReachableKind::Action(command) = reachable.kind else {
             continue;
         };
@@ -508,6 +832,142 @@ mod tests {
 
     fn test_app() -> App {
         App::new(Config::default(), None).expect("test app")
+    }
+
+    fn image_paste(source: ImagePasteSource, default_name: &str) -> ImagePaste {
+        ImagePaste {
+            source,
+            default_name: default_name.to_string(),
+            dimensions: Some((2, 2)),
+            origin: ImagePasteOrigin::ClipboardImageData,
+        }
+    }
+
+    #[test]
+    fn paste_dialog_finalize_name_defaults_when_blank() {
+        let app = test_app();
+        let mut mode = PasteImageUploadMode::new(
+            image_paste(
+                ImagePasteSource::ExistingPath("/tmp/pic.png".into()),
+                "pic.png",
+            ),
+            &app.theme,
+        );
+        mode.editor.set_lines("");
+        assert_eq!(mode.finalize_name(), "pic.png");
+    }
+
+    #[test]
+    fn paste_dialog_appends_missing_extension() {
+        let app = test_app();
+        let mut mode = PasteImageUploadMode::new(
+            image_paste(
+                ImagePasteSource::StagedFile("/tmp/staged.png".into()),
+                "clipboard-image.png",
+            ),
+            &app.theme,
+        );
+        mode.editor.set_lines("holiday");
+        assert_eq!(mode.finalize_name(), "holiday.png");
+        mode.editor.set_lines("holiday.jpg");
+        assert_eq!(mode.finalize_name(), "holiday.jpg");
+    }
+
+    #[test]
+    fn paste_dialog_ghost_text_shows_default_then_extension() {
+        let app = test_app();
+        let mode = PasteImageUploadMode::new(
+            image_paste(
+                ImagePasteSource::StagedFile("/tmp/staged.png".into()),
+                "clipboard.png",
+            ),
+            &app.theme,
+        );
+        assert_eq!(mode.ghost_text(""), "clipboard.png");
+        assert_eq!(mode.ghost_text("cat"), ".png");
+        assert_eq!(mode.ghost_text("cat.apng"), "");
+    }
+
+    #[test]
+    fn paste_dialog_submit_without_network_keeps_open() {
+        let mut app = test_app();
+        let mut mode = PasteImageUploadMode::new(
+            image_paste(
+                ImagePasteSource::ExistingPath("/tmp/pic.png".into()),
+                "pic.png",
+            ),
+            &app.theme,
+        );
+        mode.submit(&mut app);
+        assert!(mode.error.is_some());
+        assert!(app.pending_transition.is_empty());
+    }
+
+    #[test]
+    fn paste_dialog_esc_leaves_insert_before_cancelling() {
+        let mut app = test_app();
+        let mut mode = PasteImageUploadMode::new(
+            image_paste(
+                ImagePasteSource::ExistingPath("/tmp/pic.png".into()),
+                "pic.png",
+            ),
+            &app.theme,
+        );
+        let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::empty());
+
+        // First Esc: editor leaves insert mode, dialog stays open.
+        mode.process_input(&mut app, esc);
+        assert_eq!(mode.editor.mode(), EditorMode::Normal);
+        assert!(app.pending_transition.is_empty());
+
+        // Second Esc: from normal mode this cancels the dialog.
+        mode.process_input(&mut app, esc);
+        assert!(!app.pending_transition.is_empty());
+    }
+
+    #[test]
+    fn paste_dialog_cancel_removes_staged_file() {
+        let mut app = test_app();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("staged.png");
+        std::fs::write(&path, b"bytes").unwrap();
+        let mut mode = PasteImageUploadMode::new(
+            image_paste(ImagePasteSource::StagedFile(path.clone()), "staged.png"),
+            &app.theme,
+        );
+        mode.cancel(&mut app);
+        assert!(!path.exists());
+        assert!(!app.pending_transition.is_empty());
+    }
+
+    #[test]
+    fn paste_dialog_uses_paste_layer_and_binding_hints() {
+        let app = test_app();
+        let mode = PasteImageUploadMode::new(
+            image_paste(
+                ImagePasteSource::ExistingPath("/tmp/pic.png".into()),
+                "pic.png",
+            ),
+            &app.theme,
+        );
+        let chrome = mode.presentation(&app).chrome.expect("dialog chrome");
+        assert!(chrome.layer == bindings::PASTE_LAYER);
+        assert_eq!(
+            command_key_hint(
+                &app.config.bindings,
+                bindings::PASTE_LAYER,
+                BindCommand::Cancel
+            ),
+            Some("Esc".to_string())
+        );
+        assert_eq!(
+            command_key_hint(
+                &app.config.bindings,
+                bindings::PASTE_LAYER,
+                BindCommand::Activate
+            ),
+            Some("Enter".to_string())
+        );
     }
 
     fn pending_open_pair() -> PendingPair {
@@ -564,14 +1024,22 @@ mod tests {
         assert_eq!(
             button_label(
                 "Cancel",
-                command_key_hint(&app.config.bindings, BindCommand::Cancel)
+                command_key_hint(
+                    &app.config.bindings,
+                    bindings::PASSWORD_LAYER,
+                    BindCommand::Cancel
+                )
             ),
             "Cancel [Esc]"
         );
         assert_eq!(
             button_label(
                 "Submit",
-                command_key_hint(&app.config.bindings, BindCommand::SubmitPassword)
+                command_key_hint(
+                    &app.config.bindings,
+                    bindings::PASSWORD_LAYER,
+                    BindCommand::SubmitPassword
+                )
             ),
             "Submit [Enter]"
         );
