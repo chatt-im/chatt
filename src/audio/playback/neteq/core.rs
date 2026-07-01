@@ -1247,6 +1247,58 @@ mod tests {
     }
 
     #[test]
+    fn stale_resume_timestamp_after_idle_keeps_playout_delay_bounded() {
+        let mut core = NetEqCore::new(LiveAudioTuning::default()).unwrap();
+        let mut encoder = OpusVoiceEncoder::new(32_000).unwrap();
+        let mut output = vec![0.0; OUTPUT_SIZE_SAMPLES];
+
+        let mut seq = 0u32;
+        let mut ts = 0u32;
+        let mut last_ts = 0u32;
+        for _ in 0..100u32 {
+            let payload = encode_tone(&mut encoder, (seq as usize) * LIVE_OPUS_FRAME_SAMPLES);
+            core.insert_packet(ts, seq, 0, &payload);
+            for _ in 0..2 {
+                core.get_audio(&mut output);
+            }
+            last_ts = ts;
+            seq += 1;
+            ts += LIVE_OPUS_FRAME_SAMPLES as u32;
+        }
+
+        for _ in 0..3000 {
+            core.get_audio(&mut output);
+        }
+
+        // A replayed source may restart its local media clock; if the sender only
+        // rebases it just past the previous packet instead of across the whole
+        // idle wall-clock gap, the receiver must discard the old arrival-history
+        // baseline so diagnostics do not report the idle as queued latency.
+        ts = last_ts.wrapping_add(OUTPUT_SIZE_SAMPLES as u32);
+        let mut max_resume = 0u64;
+        for offset in 0..100u32 {
+            let flags = if offset == 0 {
+                LIVE_PACKET_FLAG_OPUS_RESET
+            } else {
+                0
+            };
+            let payload = encode_tone(&mut encoder, (seq as usize) * LIVE_OPUS_FRAME_SAMPLES);
+            core.insert_packet(ts, seq, flags, &payload);
+            for _ in 0..2 {
+                core.get_audio(&mut output);
+                max_resume = max_resume.max(core.diagnostics().playout_delay_ms);
+            }
+            seq += 1;
+            ts = ts.wrapping_add(LIVE_OPUS_FRAME_SAMPLES as u32);
+        }
+
+        assert!(
+            max_resume < 1_000,
+            "stale resume timestamp inflated playout delay to {max_resume}ms"
+        );
+    }
+
+    #[test]
     fn missing_packets_expand_then_mute() {
         let mut core = NetEqCore::new(LiveAudioTuning::default()).unwrap();
         let mut encoder = OpusVoiceEncoder::new(32_000).unwrap();
