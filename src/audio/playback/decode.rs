@@ -23,8 +23,8 @@ use crate::{
             FRAME_SAMPLES, LIVE_CAPTURE_MUTE_FADE, LIVE_PACKET_FLAG_MUTE,
             LIVE_PLAYBACK_DRAIN_INTERVAL, LiveAudioTraceWriter, LiveAudioTuning,
             LivePlaybackFeedback, LivePlaybackSnapshot, LivePlaybackStreamActivity,
-            RemoteVoicePacket, VoicePayload, audio_pop_logging_enabled, duration_to_ms,
-            samples_to_ms,
+            PlaybackStreamControl, RemoteVoicePacket, VoicePayload, audio_pop_logging_enabled,
+            duration_to_ms, samples_to_ms,
         },
     },
     network::InsertOutcome,
@@ -137,11 +137,7 @@ pub(crate) fn handle_live_playback_command(
             );
         }
         LivePlaybackCommand::SetStreamControl(stream_id, control) => {
-            push_mixer_event(
-                mixer_events,
-                &mut streams.dropped_mixer_events,
-                LivePlaybackMixerEvent::SetStreamControl { stream_id, control },
-            );
+            streams.set_stream_control(stream_id, control, mixer_events);
         }
         LivePlaybackCommand::SetSenderMuted { stream_id, muted } => {
             streams.set_sender_muted(stream_id, muted);
@@ -294,6 +290,10 @@ pub(crate) struct LiveDecodeStreams {
     /// created its entry, consumed by [`Self::ensure_entry`]. The app pushes it
     /// at `VoiceStarted`, which always precedes the first media packet.
     pending_sender_muted: HashMap<u32, bool>,
+    /// Controls whose `SetStreamControl` push was rejected by a full mixer event
+    /// queue, re-pushed each drain cycle until delivered so a mute is deferred
+    /// rather than lost. A later delivered control clears the pending entry.
+    pending_mixer_controls: HashMap<u32, PlaybackStreamControl>,
     stats: LivePlaybackMixerStats,
     block_samples: usize,
     dropped_mixer_events: u64,
@@ -310,6 +310,7 @@ impl LiveDecodeStreams {
             mixer_streams: HashSet::new(),
             mixer_intentional_drains: HashMap::new(),
             pending_sender_muted: HashMap::new(),
+            pending_mixer_controls: HashMap::new(),
             stats: LivePlaybackMixerStats::default(),
             block_samples: FRAME_SAMPLES,
             dropped_mixer_events: 0,
@@ -429,6 +430,37 @@ impl LiveDecodeStreams {
         self.mixer_streams.remove(&stream_id);
         self.mixer_intentional_drains.remove(&stream_id);
         self.pending_sender_muted.remove(&stream_id);
+        self.pending_mixer_controls.remove(&stream_id);
+    }
+
+    pub(crate) fn set_stream_control(
+        &mut self,
+        stream_id: u32,
+        control: PlaybackStreamControl,
+        mixer_events: &SpscSwapQueue<LivePlaybackMixerEvent>,
+    ) {
+        let event = LivePlaybackMixerEvent::SetStreamControl { stream_id, control };
+        if push_mixer_event(mixer_events, &mut self.dropped_mixer_events, event) {
+            // A stale pending control must not be re-pushed after this newer one,
+            // or a later flush would revert it.
+            self.pending_mixer_controls.remove(&stream_id);
+        } else {
+            self.pending_mixer_controls.insert(stream_id, control);
+        }
+    }
+
+    fn flush_pending_mixer_controls(
+        &mut self,
+        mixer_events: &SpscSwapQueue<LivePlaybackMixerEvent>,
+    ) {
+        let dropped = &mut self.dropped_mixer_events;
+        self.pending_mixer_controls.retain(|stream_id, control| {
+            let event = LivePlaybackMixerEvent::SetStreamControl {
+                stream_id: *stream_id,
+                control: *control,
+            };
+            !push_mixer_event(mixer_events, dropped, event)
+        });
     }
 
     pub(crate) fn set_sender_muted(&mut self, stream_id: u32, muted: bool) {
@@ -448,6 +480,7 @@ impl LiveDecodeStreams {
         now: Instant,
         feedback_sender: Option<&Sender<LivePlaybackFeedback>>,
     ) {
+        self.flush_pending_mixer_controls(mixer_events);
         let block = self.block_samples;
         let producers = &mut self.producers;
         let dropped = &mut self.dropped_mixer_events;
@@ -1177,6 +1210,95 @@ mod tests {
         }
         assert!(streams.mixer_streams.contains(&7));
         assert_eq!(streams.mixer_intentional_drains.get(&7), Some(&true));
+    }
+
+    fn stream_control(muted: bool) -> PlaybackStreamControl {
+        PlaybackStreamControl {
+            muted,
+            volume_db: 0.0,
+        }
+    }
+
+    #[test]
+    fn control_rejected_by_full_queue_is_resent_on_drain() {
+        let queue = SpscSwapQueue::<LivePlaybackMixerEvent>::with_capacity(1);
+        let mut streams = LiveDecodeStreams::new(test_tuning());
+        let mut filler = LivePlaybackMixerEvent::StopStream { stream_id: 99 };
+        assert!(queue.insert(&mut filler));
+
+        assert!(handle_live_playback_command(
+            LivePlaybackCommand::SetStreamControl(7, stream_control(true)),
+            &mut streams,
+            &queue,
+        ));
+
+        let mut drained = LivePlaybackMixerEvent::Empty;
+        assert!(queue.remove(&mut drained));
+        assert!(matches!(
+            drained,
+            LivePlaybackMixerEvent::StopStream { stream_id: 99 }
+        ));
+
+        streams.drain_into_mixer_events(&queue, Instant::now(), None);
+
+        let mut event = LivePlaybackMixerEvent::Empty;
+        assert!(
+            queue.remove(&mut event),
+            "rejected control was never resent"
+        );
+        match event {
+            LivePlaybackMixerEvent::SetStreamControl { stream_id, control } => {
+                assert_eq!(stream_id, 7);
+                assert!(control.muted);
+            }
+            other => panic!("expected resent SetStreamControl, got {}", other.kind()),
+        }
+        assert!(
+            streams.pending_mixer_controls.is_empty(),
+            "delivered control should leave the pending map"
+        );
+    }
+
+    #[test]
+    fn delivered_control_clears_stale_pending_control() {
+        let queue = SpscSwapQueue::<LivePlaybackMixerEvent>::with_capacity(1);
+        let mut streams = LiveDecodeStreams::new(test_tuning());
+        let mut filler = LivePlaybackMixerEvent::StopStream { stream_id: 99 };
+        assert!(queue.insert(&mut filler));
+
+        assert!(handle_live_playback_command(
+            LivePlaybackCommand::SetStreamControl(7, stream_control(true)),
+            &mut streams,
+            &queue,
+        ));
+
+        let mut drained = LivePlaybackMixerEvent::Empty;
+        assert!(queue.remove(&mut drained));
+
+        assert!(handle_live_playback_command(
+            LivePlaybackCommand::SetStreamControl(7, stream_control(false)),
+            &mut streams,
+            &queue,
+        ));
+        streams.drain_into_mixer_events(&queue, Instant::now(), None);
+
+        let mut event = LivePlaybackMixerEvent::Empty;
+        assert!(queue.remove(&mut event));
+        match event {
+            LivePlaybackMixerEvent::SetStreamControl { stream_id, control } => {
+                assert_eq!(stream_id, 7);
+                assert!(
+                    !control.muted,
+                    "stale pending mute reverted a newer control"
+                );
+            }
+            other => panic!("expected SetStreamControl, got {}", other.kind()),
+        }
+        let mut event = LivePlaybackMixerEvent::Empty;
+        assert!(
+            !queue.remove(&mut event),
+            "stale pending control was resent after a newer one was delivered"
+        );
     }
 
     fn take_notification_ring(
