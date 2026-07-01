@@ -2,7 +2,7 @@ use hashbrown::{HashMap, HashSet};
 use std::{
     collections::VecDeque,
     io::{self, Read, Write},
-    net::SocketAddr,
+    net::{IpAddr, SocketAddr},
     sync::mpsc,
     sync::{Arc, OnceLock},
     thread,
@@ -21,15 +21,18 @@ use ring::signature::KeyPair;
 use rpc::{
     control::{
         self, ChatMessage, ClientControl, ERROR_AUTH_REJECTED, ERROR_BUG_REPORT_REJECTED,
-        ERROR_PAIRING_INVALID_REQUEST, ERROR_PAIRING_NOT_ACTIVE, FileMetadata, InviteTicket,
-        MAX_BUG_REPORT_BYTES, MAX_FILE_CHUNK_BYTES, P2pCandidate, P2pKey, P2pNatKind, P2pPeerInfo,
-        P2pRole, RoomInfo, ServerControl, decode_client_control, decode_client_hello,
-        encode_invite_ticket, encode_server_control, encode_server_hello,
+        ERROR_OPEN_PAIR_RATE_LIMITED, ERROR_PAIRING_INVALID_REQUEST, ERROR_PAIRING_NOT_ACTIVE,
+        ERROR_PASSWORD_MISMATCH, ERROR_PASSWORD_REQUIRED, ERROR_PUBLIC_DISABLED,
+        ERROR_TOKEN_STALE_EPOCH, FileMetadata, InviteTicket, MAX_BUG_REPORT_BYTES,
+        MAX_FILE_CHUNK_BYTES, P2pCandidate, P2pKey, P2pNatKind, P2pPeerInfo, P2pRole, RoomInfo,
+        ServerControl, decode_client_control, decode_client_hello, encode_invite_ticket,
+        encode_server_control, encode_server_hello,
     },
     crypto::{
-        AntiReplay, CHANNEL_CONTROL, CHANNEL_VIDEO, ControlTransport, KEY_LEN, KeyMaterial,
-        SessionSecrets, TransportCipher, VideoKeyRole, derive_video_keys, encode_hex,
-        respond_to_client_hello, respond_to_client_hello_plaintext,
+        AntiReplay, CHANNEL_CONTROL, CHANNEL_VIDEO, ControlTransport, DYNAMIC_TOKEN_PREFIX,
+        DynamicTokenClaims, KEY_LEN, KeyMaterial, SessionSecrets, TransportCipher, VideoKeyRole,
+        derive_video_keys, encode_hex, issue_dynamic_token, respond_to_client_hello,
+        respond_to_client_hello_plaintext, verify_dynamic_token,
     },
     frame,
     ids::{BugReportId, FileTransferId, MessageId, RoomId, SessionId, StreamId, UserId},
@@ -37,7 +40,10 @@ use rpc::{
     video::{self, VideoAck, VideoHello, VideoRole},
 };
 
-use config::{Config as ServerConfig, UserConfig, hash_secret, value_arg, verify_secret_hash};
+use config::{
+    Config as ServerConfig, UserConfig, constant_time_eq, hash_secret, value_arg,
+    verify_secret_hash,
+};
 use local_admin::{AdminCommand, AdminSocket};
 use mimalloc::MiMalloc;
 
@@ -54,6 +60,9 @@ const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(20);
 const MAX_CLIENTS: usize = 1024;
 const MEDIA_SWEEP_INTERVAL: Duration = Duration::from_secs(30);
 const INVITE_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+const OPEN_PAIR_RATE_WINDOW: Duration = Duration::from_secs(60);
+const OPEN_PAIR_PER_IP_LIMIT: usize = 6;
+const OPEN_PAIR_GLOBAL_LIMIT: usize = 30;
 /// Cap on a stream's fast-start ring. Keyframes reset the ring, so this only
 /// bounds a pathologically long GOP rather than normal operation.
 const VIDEO_RING_MAX_BYTES: usize = 8 * 1024 * 1024;
@@ -187,6 +196,8 @@ struct Server {
     chat_history_limit: usize,
     file_size_limit_bytes: u64,
     invites: HashMap<String, InviteState>,
+    open_pair_global_allocations: VecDeque<Instant>,
+    open_pair_ip_allocations: HashMap<IpAddr, VecDeque<Instant>>,
     rng: ring::rand::SystemRandom,
     server_key_pair: ring::signature::Ed25519KeyPair,
     next_media_sweep_at: Option<Instant>,
@@ -277,6 +288,8 @@ impl Server {
             chat_history_limit,
             file_size_limit_bytes,
             invites: HashMap::new(),
+            open_pair_global_allocations: VecDeque::new(),
+            open_pair_ip_allocations: HashMap::new(),
             rng: ring::rand::SystemRandom::new(),
             server_key_pair,
             next_media_sweep_at: None,
@@ -413,6 +426,7 @@ impl Server {
                 token,
                 ClientConn {
                     socket,
+                    addr,
                     read_buf: Vec::new(),
                     write_buf: Vec::new(),
                     kind: ConnKind::Unidentified,
@@ -1077,10 +1091,30 @@ impl Server {
                 receive_files,
                 file_receive_limit_bytes,
             ),
+            (
+                ConnState::AwaitAuth,
+                ClientControl::OpenPair {
+                    display_name,
+                    password,
+                    existing_token,
+                    receive_files,
+                    file_receive_limit_bytes,
+                },
+            ) => self.open_pair_client(
+                token,
+                &display_name,
+                &password,
+                &existing_token,
+                receive_files,
+                file_receive_limit_bytes,
+            ),
             (ConnState::AwaitAuth, _) => Err("authenticate before sending control messages".into()),
-            (ConnState::Ready, ClientControl::Authenticate { .. } | ClientControl::Pair { .. }) => {
-                Err("session is already authenticated".into())
-            }
+            (
+                ConnState::Ready,
+                ClientControl::Authenticate { .. }
+                | ClientControl::Pair { .. }
+                | ClientControl::OpenPair { .. },
+            ) => Err("session is already authenticated".into()),
             (ConnState::Ready, ClientControl::JoinRoom { room_id }) => {
                 let session_id = self.session_for_token(token)?;
                 self.join_room(session_id, room_id);
@@ -1237,6 +1271,15 @@ impl Server {
         file_receive_limit_bytes: u64,
     ) -> Result<(), String> {
         kvlog::info!("authenticate attempt", token = token.0);
+        if auth_token.starts_with(DYNAMIC_TOKEN_PREFIX) {
+            return self.authenticate_dynamic(
+                token,
+                display_name,
+                auth_token,
+                receive_files,
+                file_receive_limit_bytes,
+            );
+        }
         let Some(user) = self
             .config
             .users
@@ -1281,7 +1324,32 @@ impl Server {
                 }
             }
         };
-        self.establish_session(token, &user, receive_files, file_receive_limit_bytes, true)
+        self.establish_session(
+            token,
+            &user,
+            receive_files,
+            file_receive_limit_bytes,
+            true,
+            None,
+        )
+    }
+
+    /// Builds a transient [`UserConfig`] for a dynamic (open-paired) user, whose
+    /// details are never stored server-side. The user id doubles as the internal
+    /// identifier since there is no username.
+    fn dynamic_user(user_id: UserId, display_name: &str) -> UserConfig {
+        let display_name = display_name.trim();
+        let display_name = if display_name.is_empty() || display_name.len() > 64 {
+            user_id.to_string()
+        } else {
+            display_name.to_string()
+        };
+        UserConfig {
+            id: user_id,
+            name: user_id.to_string(),
+            display_name,
+            token_hash: String::new(),
+        }
     }
 
     fn pair_client(
@@ -1356,7 +1424,250 @@ impl Server {
             user_id = user.id.0,
             user = user.name.as_str()
         );
-        self.establish_session(token, &user, receive_files, file_receive_limit_bytes, false)
+        self.establish_session(
+            token,
+            &user,
+            receive_files,
+            file_receive_limit_bytes,
+            false,
+            None,
+        )
+    }
+
+    /// Authenticates a dynamic user from a server-issued bearer token. No config
+    /// lookup: the token's AEAD tag proves authenticity and the claims carry the
+    /// user id.
+    fn authenticate_dynamic(
+        &mut self,
+        token: Token,
+        display_name: &str,
+        auth_token: &str,
+        receive_files: bool,
+        file_receive_limit_bytes: u64,
+    ) -> Result<(), String> {
+        if !self.config.is_public() {
+            kvlog::warn!(
+                "authenticate rejected",
+                token = token.0,
+                reason = "public_disabled"
+            );
+            return self.reject_auth(
+                token,
+                ERROR_PUBLIC_DISABLED,
+                "authentication failed: public dynamic users are disabled on this server"
+                    .to_string(),
+            );
+        }
+        let claims = verify_dynamic_token(&self.config.security.server_identity_seed, auth_token);
+        let Ok(claims) = claims else {
+            kvlog::warn!(
+                "authenticate rejected",
+                token = token.0,
+                reason = "invalid_dynamic_token"
+            );
+            return self.reject_auth(
+                token,
+                ERROR_AUTH_REJECTED,
+                "authentication failed: the token is not valid for this server".to_string(),
+            );
+        };
+        if !is_dynamic_user_id(claims.user_id) {
+            kvlog::warn!(
+                "authenticate rejected",
+                token = token.0,
+                reason = "invalid_dynamic_user_id",
+                user_id = claims.user_id.0
+            );
+            return self.reject_auth(
+                token,
+                ERROR_AUTH_REJECTED,
+                "authentication failed: the token is not valid for this server".to_string(),
+            );
+        }
+        if claims.password_epoch != self.config.password_epoch() {
+            kvlog::warn!(
+                "authenticate rejected",
+                token = token.0,
+                reason = "stale_epoch"
+            );
+            return self.reject_auth(
+                token,
+                ERROR_TOKEN_STALE_EPOCH,
+                "authentication failed: the server password changed; re-pair to refresh your token"
+                    .to_string(),
+            );
+        }
+        let user = Self::dynamic_user(claims.user_id, display_name);
+        self.establish_session(
+            token,
+            &user,
+            receive_files,
+            file_receive_limit_bytes,
+            true,
+            None,
+        )
+    }
+
+    /// Self-service join on a public server. Verifies the password, allocates (or
+    /// reuses, when `existing_token` still decodes) a dynamic user id, and issues
+    /// a fresh bearer token bound to the current password epoch.
+    fn open_pair_client(
+        &mut self,
+        token: Token,
+        display_name: &str,
+        password: &str,
+        existing_token: &str,
+        receive_files: bool,
+        file_receive_limit_bytes: u64,
+    ) -> Result<(), String> {
+        kvlog::info!("open pair attempt", token = token.0);
+        if !self.config.is_public() {
+            kvlog::warn!(
+                "open pair rejected",
+                token = token.0,
+                reason = "public_disabled"
+            );
+            return self.reject_auth(
+                token,
+                ERROR_PUBLIC_DISABLED,
+                "open pairing is disabled on this server".to_string(),
+            );
+        }
+        if !self.check_open_pair_attempt_rate(token)? {
+            return Ok(());
+        }
+        let required_password = self.config.password().map(str::to_string);
+        if let Some(required) = required_password {
+            if password.is_empty() {
+                return self.reject_auth(
+                    token,
+                    ERROR_PASSWORD_REQUIRED,
+                    "open pairing requires a password".to_string(),
+                );
+            }
+            if !constant_time_eq(required.as_bytes(), password.as_bytes()) {
+                kvlog::warn!(
+                    "open pair rejected",
+                    token = token.0,
+                    reason = "password_mismatch"
+                );
+                return self.reject_auth(
+                    token,
+                    ERROR_PASSWORD_MISMATCH,
+                    "open pairing password is incorrect".to_string(),
+                );
+            }
+        }
+        let display_name = display_name.trim();
+        if display_name.is_empty() || display_name.len() > 64 {
+            return self.reject_auth(
+                token,
+                ERROR_PAIRING_INVALID_REQUEST,
+                "open pairing failed: display name must be 1-64 bytes".to_string(),
+            );
+        }
+        let seed = self.config.security.server_identity_seed.clone();
+        let existing_user_id = (!existing_token.is_empty())
+            .then(|| verify_dynamic_token(&seed, existing_token).ok())
+            .flatten()
+            .map(|claims| claims.user_id)
+            .filter(|user_id| is_dynamic_user_id(*user_id));
+        let user_id = match existing_user_id {
+            Some(user_id) => user_id,
+            None => {
+                if !self.check_open_pair_allocation_rate(token)? {
+                    return Ok(());
+                }
+                self.config.allocate_dynamic_user_id()?
+            }
+        };
+        let issued = issue_dynamic_token(
+            &seed,
+            &DynamicTokenClaims {
+                user_id,
+                password_epoch: self.config.password_epoch(),
+            },
+        )
+        .map_err(|error| error.to_string())?;
+        kvlog::info!("open pair accepted", token = token.0, user_id = user_id.0);
+        let user = Self::dynamic_user(user_id, display_name);
+        self.establish_session(
+            token,
+            &user,
+            receive_files,
+            file_receive_limit_bytes,
+            false,
+            Some(issued),
+        )
+    }
+
+    fn check_open_pair_attempt_rate(&mut self, token: Token) -> Result<bool, String> {
+        let now = Instant::now();
+        self.prune_open_pair_rate_windows(now);
+        let global_count = self.open_pair_global_allocations.len();
+        if global_count >= OPEN_PAIR_GLOBAL_LIMIT {
+            kvlog::warn!(
+                "open pair rejected",
+                token = token.0,
+                reason = "rate_limited",
+                global_count
+            );
+            return self
+                .reject_auth(
+                    token,
+                    ERROR_OPEN_PAIR_RATE_LIMITED,
+                    "open pairing is rate limited; retry later".to_string(),
+                )
+                .map(|()| false);
+        }
+        self.open_pair_global_allocations.push_back(now);
+        Ok(true)
+    }
+
+    fn check_open_pair_allocation_rate(&mut self, token: Token) -> Result<bool, String> {
+        let Some(source_ip) = self.clients.get(&token).map(|client| client.addr.ip()) else {
+            return Ok(true);
+        };
+        let now = Instant::now();
+        self.prune_open_pair_rate_windows(now);
+        let ip_count = self
+            .open_pair_ip_allocations
+            .get(&source_ip)
+            .map(VecDeque::len)
+            .unwrap_or(0);
+        if ip_count >= OPEN_PAIR_PER_IP_LIMIT {
+            kvlog::warn!(
+                "open pair rejected",
+                token = token.0,
+                reason = "rate_limited",
+                source_ip = %source_ip,
+                ip_count
+            );
+            return self
+                .reject_auth(
+                    token,
+                    ERROR_OPEN_PAIR_RATE_LIMITED,
+                    "open pairing is rate limited; retry later".to_string(),
+                )
+                .map(|()| false);
+        }
+        self.open_pair_ip_allocations
+            .entry(source_ip)
+            .or_default()
+            .push_back(now);
+        Ok(true)
+    }
+
+    fn prune_open_pair_rate_windows(&mut self, now: Instant) {
+        prune_instants(
+            &mut self.open_pair_global_allocations,
+            now,
+            OPEN_PAIR_RATE_WINDOW,
+        );
+        self.open_pair_ip_allocations.retain(|_, allocations| {
+            prune_instants(allocations, now, OPEN_PAIR_RATE_WINDOW);
+            !allocations.is_empty()
+        });
     }
 
     fn reject_auth(&mut self, token: Token, code: u16, message: String) -> Result<(), String> {
@@ -1375,6 +1686,7 @@ impl Server {
         receive_files: bool,
         file_receive_limit_bytes: u64,
         join_lobby: bool,
+        issued_token: Option<String>,
     ) -> Result<(), String> {
         let user_id = user.user_id();
         // Supersede any earlier session for this user before standing up the new
@@ -1432,15 +1744,25 @@ impl Server {
             file_receive_limit_bytes
         );
         let rooms = self.room_infos();
-        self.send_control_to_token(
-            token,
-            &ServerControl::Authenticated {
+        let current_room = join_lobby.then_some(DEFAULT_ROOM);
+        let response = match issued_token {
+            Some(token) => ServerControl::OpenPaired {
+                token,
+                udp_addr: self.config.network.public_udp_addr.clone(),
+                udp_probe_addr: self.config.network.public_udp_probe_addr.clone(),
                 session_id,
                 user_id,
                 rooms,
-                current_room: join_lobby.then_some(DEFAULT_ROOM),
+                current_room,
             },
-        )?;
+            None => ServerControl::Authenticated {
+                session_id,
+                user_id,
+                rooms,
+                current_room,
+            },
+        };
+        self.send_control_to_token(token, &response)?;
         if join_lobby && self.live_token_for_session(session_id).is_some() {
             self.join_room(session_id, DEFAULT_ROOM);
         }
@@ -3155,6 +3477,7 @@ enum ConnState {
 
 struct ClientConn {
     socket: TcpStream,
+    addr: SocketAddr,
     read_buf: Vec<u8>,
     write_buf: Vec<u8>,
     kind: ConnKind,
@@ -3333,6 +3656,19 @@ fn fast_start_index(ring: &VecDeque<VideoRingFrame>) -> Option<usize> {
 /// Whether a subscriber's queued bytes are still under the backpressure cap.
 fn subscriber_within_limit(write_buf_len: usize) -> bool {
     write_buf_len <= VIDEO_SUBSCRIBER_HIGH_WATER
+}
+
+fn is_dynamic_user_id(user_id: UserId) -> bool {
+    user_id.0 >= config::FIRST_DYNAMIC_USER_ID
+}
+
+fn prune_instants(queue: &mut VecDeque<Instant>, now: Instant, window: Duration) {
+    while queue
+        .front()
+        .is_some_and(|then| now.saturating_duration_since(*then) >= window)
+    {
+        queue.pop_front();
+    }
 }
 
 fn now_ms() -> u64 {
@@ -3520,6 +3856,7 @@ fn client_control_kind(control: &ClientControl) -> &'static str {
     match control {
         ClientControl::Authenticate { .. } => "authenticate",
         ClientControl::Pair { .. } => "pair",
+        ClientControl::OpenPair { .. } => "open_pair",
         ClientControl::JoinRoom { .. } => "join_room",
         ClientControl::SendChat { .. } => "send_chat",
         ClientControl::StartVoice { .. } => "start_voice",
@@ -3549,6 +3886,7 @@ fn video_role_name(role: VideoRole) -> &'static str {
 fn server_control_kind(control: &ServerControl) -> &'static str {
     match control {
         ServerControl::Authenticated { .. } => "authenticated",
+        ServerControl::OpenPaired { .. } => "open_paired",
         ServerControl::RoomJoined { .. } => "room_joined",
         ServerControl::Chat { .. } => "chat",
         ServerControl::Presence { .. } => "presence",
@@ -3950,6 +4288,339 @@ mod tests {
         assert!(server.sessions.is_empty());
     }
 
+    fn open_pair_test_server(suffix: &str) -> (Server, std::path::PathBuf) {
+        let path = std::env::temp_dir().join(format!(
+            "chatt-open-pair-{}-{}.toml",
+            std::process::id(),
+            suffix
+        ));
+        let _ = std::fs::remove_file(&path);
+        let mut server = test_server();
+        server.config.config_path = Some(path.clone());
+        server.config.security.public = true;
+        (server, path)
+    }
+
+    fn session_for(server: &Server, token: Token) -> Option<&Session> {
+        server
+            .sessions
+            .values()
+            .find(|session| session.tcp_token == token)
+    }
+
+    #[test]
+    fn open_pair_allocates_dynamic_user_and_issues_token() {
+        let (mut server, path) = open_pair_test_server("alloc");
+
+        let _ = server.open_pair_client(Token(1), "Zoe", "", "", true, 0);
+
+        let session = session_for(&server, Token(1)).expect("session established");
+        assert_eq!(session.user_id, UserId(config::FIRST_DYNAMIC_USER_ID));
+        assert_eq!(session.display_name, "Zoe");
+        assert_eq!(
+            session.identifier,
+            config::FIRST_DYNAMIC_USER_ID.to_string()
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn open_pair_rejected_when_not_public() {
+        let (mut server, path) = open_pair_test_server("private");
+        server.config.security.public = false;
+
+        let _ = server.open_pair_client(Token(1), "Zoe", "", "", true, 0);
+
+        assert!(server.sessions.is_empty());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn open_pair_enforces_password() {
+        let (mut server, path) = open_pair_test_server("password");
+        server.config.security.password = Some("hunter2".to_string());
+
+        let _ = server.open_pair_client(Token(1), "Zoe", "", "", true, 0);
+        assert!(session_for(&server, Token(1)).is_none());
+
+        let _ = server.open_pair_client(Token(2), "Zoe", "wrong", "", true, 0);
+        assert!(session_for(&server, Token(2)).is_none());
+
+        let _ = server.open_pair_client(Token(3), "Zoe", "hunter2", "", true, 0);
+        assert!(session_for(&server, Token(3)).is_some());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn open_pair_preserves_identity_on_re_pair() {
+        let (mut server, path) = open_pair_test_server("reuse");
+        server.config.security.password_epoch = 7;
+        let seed = server.config.security.server_identity_seed.clone();
+        let existing = issue_dynamic_token(
+            &seed,
+            &DynamicTokenClaims {
+                user_id: UserId(config::FIRST_DYNAMIC_USER_ID + 5),
+                password_epoch: 0,
+            },
+        )
+        .unwrap();
+
+        let _ = server.open_pair_client(Token(1), "Zoe", "", &existing, true, 0);
+
+        let session = session_for(&server, Token(1)).expect("session established");
+        assert_eq!(session.user_id, UserId(config::FIRST_DYNAMIC_USER_ID + 5));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn open_pair_reissues_current_epoch_token_on_re_pair() {
+        let (mut server, path) = open_pair_test_server("reuse-token");
+        server.config.security.password_epoch = 7;
+        server.config.network.public_udp_addr = "198.51.100.20:54100".to_string();
+        server.config.network.public_udp_probe_addr = Some("198.51.100.20:54101".to_string());
+        let seed = server.config.security.server_identity_seed.clone();
+        let user_id = UserId(config::FIRST_DYNAMIC_USER_ID + 5);
+        let existing = issue_dynamic_token(
+            &seed,
+            &DynamicTokenClaims {
+                user_id,
+                password_epoch: 0,
+            },
+        )
+        .unwrap();
+        let token = Token(17);
+        let (conn, mut peer) = test_live_client();
+        server.clients.insert(token, conn);
+
+        server
+            .open_pair_client(token, "Zoe", "", &existing, true, 0)
+            .unwrap();
+
+        let response = read_plaintext_server_control(&mut peer);
+        let ServerControl::OpenPaired {
+            token,
+            udp_addr,
+            udp_probe_addr,
+            ..
+        } = response
+        else {
+            panic!("expected OpenPaired");
+        };
+        let claims = verify_dynamic_token(&seed, &token).unwrap();
+        assert_eq!(claims.user_id, user_id);
+        assert_eq!(claims.password_epoch, 7);
+        assert_eq!(udp_addr, "198.51.100.20:54100");
+        assert_eq!(udp_probe_addr.as_deref(), Some("198.51.100.20:54101"));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn open_pairing_does_not_join_lobby() {
+        let (mut server, path) = open_pair_test_server("no-lobby");
+        let token = Token(11);
+        let (conn, _peer) = test_live_client();
+        server.clients.insert(token, conn);
+
+        server
+            .open_pair_client(token, "Zoe", "", "", true, 0)
+            .unwrap();
+
+        let session = session_for(&server, token).expect("session established");
+        assert_eq!(session.room_id, None);
+        assert!(
+            server
+                .rooms
+                .get(&DEFAULT_ROOM)
+                .expect("lobby exists")
+                .members
+                .is_empty()
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn authenticate_accepts_issued_dynamic_token() {
+        let (mut server, path) = open_pair_test_server("auth");
+        let seed = server.config.security.server_identity_seed.clone();
+        let token = issue_dynamic_token(
+            &seed,
+            &DynamicTokenClaims {
+                user_id: UserId(config::FIRST_DYNAMIC_USER_ID),
+                password_epoch: 0,
+            },
+        )
+        .unwrap();
+
+        let _ = server.authenticate_client(Token(1), "Zoe", &token, true, 0);
+
+        let session = session_for(&server, Token(1)).expect("session established");
+        assert_eq!(session.user_id, UserId(config::FIRST_DYNAMIC_USER_ID));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn authenticate_rejects_dynamic_token_when_public_disabled() {
+        let (mut server, path) = open_pair_test_server("auth-private");
+        server.config.security.public = false;
+        let seed = server.config.security.server_identity_seed.clone();
+        let token = issue_dynamic_token(
+            &seed,
+            &DynamicTokenClaims {
+                user_id: UserId(config::FIRST_DYNAMIC_USER_ID),
+                password_epoch: 0,
+            },
+        )
+        .unwrap();
+
+        let _ = server.authenticate_client(Token(1), "Zoe", &token, true, 0);
+
+        assert!(server.sessions.is_empty());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn authenticate_rejects_stale_dynamic_token_epoch() {
+        let (mut server, path) = open_pair_test_server("stale");
+        server.config.security.password = Some("hunter2".to_string());
+        server.config.security.password_epoch = 1;
+        let seed = server.config.security.server_identity_seed.clone();
+        let token = issue_dynamic_token(
+            &seed,
+            &DynamicTokenClaims {
+                user_id: UserId(config::FIRST_DYNAMIC_USER_ID),
+                password_epoch: 0,
+            },
+        )
+        .unwrap();
+
+        let _ = server.authenticate_client(Token(1), "Zoe", &token, true, 0);
+
+        assert!(server.sessions.is_empty());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn authenticate_rejects_stale_dynamic_token_epoch_without_password() {
+        let (mut server, path) = open_pair_test_server("stale-no-password");
+        server.config.security.password = None;
+        server.config.security.password_epoch = 1;
+        let seed = server.config.security.server_identity_seed.clone();
+        let token = issue_dynamic_token(
+            &seed,
+            &DynamicTokenClaims {
+                user_id: UserId(config::FIRST_DYNAMIC_USER_ID),
+                password_epoch: 0,
+            },
+        )
+        .unwrap();
+
+        let _ = server.authenticate_client(Token(1), "Zoe", &token, true, 0);
+
+        assert!(server.sessions.is_empty());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn authenticate_rejects_dynamic_token_for_explicit_id_range() {
+        let (mut server, path) = open_pair_test_server("explicit-range");
+        let seed = server.config.security.server_identity_seed.clone();
+        let token = issue_dynamic_token(
+            &seed,
+            &DynamicTokenClaims {
+                user_id: UserId(7),
+                password_epoch: 0,
+            },
+        )
+        .unwrap();
+
+        let _ = server.authenticate_client(Token(1), "Zoe", &token, true, 0);
+
+        assert!(server.sessions.is_empty());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn open_pair_rate_limits_new_allocations_per_ip() {
+        let (mut server, path) = open_pair_test_server("rate-ip");
+        let mut peers = Vec::new();
+        for index in 0..OPEN_PAIR_PER_IP_LIMIT {
+            let token = Token(100 + index);
+            let (conn, peer) = test_live_client();
+            server.clients.insert(token, conn);
+            server
+                .open_pair_client(token, "Zoe", "", "", true, 0)
+                .unwrap();
+            assert!(session_for(&server, token).is_some());
+            peers.push(peer);
+        }
+        let blocked = Token(200);
+        let (conn, peer) = test_live_client();
+        server.clients.insert(blocked, conn);
+        peers.push(peer);
+
+        server
+            .open_pair_client(blocked, "Zoe", "", "", true, 0)
+            .unwrap();
+
+        assert!(session_for(&server, blocked).is_none());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn open_pair_rate_limits_new_allocations_globally() {
+        let (mut server, path) = open_pair_test_server("rate-global");
+        let now = Instant::now();
+        for _ in 0..OPEN_PAIR_GLOBAL_LIMIT {
+            server.open_pair_global_allocations.push_back(now);
+        }
+        let token = Token(300);
+        let (conn, _peer) = test_live_client();
+        server.clients.insert(token, conn);
+
+        server
+            .open_pair_client(token, "Zoe", "", "", true, 0)
+            .unwrap();
+
+        assert!(session_for(&server, token).is_none());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn open_pair_rate_limits_password_attempts_globally() {
+        let (mut server, path) = open_pair_test_server("rate-password");
+        server.config.security.password = Some("hunter2".to_string());
+        let now = Instant::now();
+        for _ in 0..(OPEN_PAIR_GLOBAL_LIMIT - 1) {
+            server.open_pair_global_allocations.push_back(now);
+        }
+
+        let wrong = Token(400);
+        let (conn, mut wrong_peer) = test_live_client();
+        server.clients.insert(wrong, conn);
+        server
+            .open_pair_client(wrong, "Zoe", "wrong", "", true, 0)
+            .unwrap();
+        let ServerControl::Error { code, .. } = read_plaintext_server_control(&mut wrong_peer)
+        else {
+            panic!("expected password mismatch error");
+        };
+        assert_eq!(code, ERROR_PASSWORD_MISMATCH);
+
+        let blocked = Token(401);
+        let (conn, mut blocked_peer) = test_live_client();
+        server.clients.insert(blocked, conn);
+        server
+            .open_pair_client(blocked, "Zoe", "hunter2", "", true, 0)
+            .unwrap();
+        let ServerControl::Error { code, .. } = read_plaintext_server_control(&mut blocked_peer)
+        else {
+            panic!("expected rate-limit error");
+        };
+        assert_eq!(code, ERROR_OPEN_PAIR_RATE_LIMITED);
+        assert!(session_for(&server, blocked).is_none());
+        let _ = std::fs::remove_file(&path);
+    }
+
     #[test]
     fn pairing_resolves_user_from_code() {
         let path = std::env::temp_dir().join(format!(
@@ -4004,9 +4675,11 @@ mod tests {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
         let addr = listener.local_addr().expect("local addr");
         let client = std::net::TcpStream::connect(addr).expect("connect loopback");
+        let client_addr = client.local_addr().expect("client addr");
         let (peer, _) = listener.accept().expect("accept loopback");
         let conn = ClientConn {
             socket: TcpStream::from_std(client),
+            addr: client_addr,
             read_buf: Vec::new(),
             write_buf: Vec::new(),
             kind: ConnKind::Control,
@@ -4018,6 +4691,16 @@ mod tests {
             disconnect: false,
         };
         (conn, peer)
+    }
+
+    fn read_plaintext_server_control(peer: &mut std::net::TcpStream) -> ServerControl {
+        peer.set_read_timeout(Some(Duration::from_secs(1)))
+            .expect("set read timeout");
+        let mut len = [0u8; 4];
+        peer.read_exact(&mut len).expect("read frame length");
+        let mut frame = vec![0u8; u32::from_le_bytes(len) as usize];
+        peer.read_exact(&mut frame).expect("read frame body");
+        rpc::control::decode_server_control(&frame).expect("decode server control")
     }
 
     #[test]

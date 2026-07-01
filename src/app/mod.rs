@@ -22,14 +22,16 @@ use extui::event::{
     KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
 use rpc::{
-    control::{InviteTicket, ParticipantVoiceStatus},
+    control::{ERROR_TOKEN_STALE_EPOCH, InviteTicket, ParticipantVoiceStatus},
     ids::{RoomId, SessionId, StreamId, UserId},
 };
 
 use crate::{
     bindings::BindCommand,
-    client_net::{NetworkClient, NetworkCommand, NetworkEvent, spawn_pair_once},
-    config::{self, Config, SoundboardClip, ThemeChoice, validate_server_entry},
+    client_net::{
+        NetworkClient, NetworkCommand, NetworkEvent, spawn_open_pair_once, spawn_pair_once,
+    },
+    config::{self, Config, ServerEntry, SoundboardClip, ThemeChoice, validate_server_entry},
     local_control, settings,
     theme::Theme,
     tui::{
@@ -38,7 +40,7 @@ use crate::{
         form::rect_contains,
         mode::{AppMode, ModeTransition, PendingTransition},
         modes::{RoomMode, ServerEditMode, ServerListMode, SettingsMode, SettingsSession},
-        overlay::DialogMode,
+        overlay::{DialogMode, PasswordPromptMode},
     },
     ui::settings::{
         DeviceAction, DeviceSide, FieldId, FieldIntent, SettingsButton, SettingsOutput,
@@ -61,8 +63,9 @@ pub(crate) use dialogs::{UserVolumeDialog, UserVolumeEvent};
 pub(crate) use participants::{ParticipantState, ParticipantVoiceFeedback, Participants};
 pub(crate) use room::{RoomSession, ToggleExpandResult};
 pub(crate) use server::{
-    PendingPair, ServerEditDraft, ServerEditEvent, ServerSelectItem, default_join_alias,
-    default_join_display_name, random_token, server_entry_from_invite, unique_server_alias,
+    PairCompletion, PendingPair, ServerEditDraft, ServerEditEvent, ServerSelectItem,
+    alias_from_tcp_addr, default_join_alias, default_join_display_name, random_token,
+    server_entry_from_invite, unique_server_alias,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -259,6 +262,7 @@ pub(crate) struct App {
     /// TCP address of the connected server, reused by dedicated video
     /// connections. Set on connect, cleared on disconnect.
     active_tcp_addr: Option<String>,
+    active_server_label: Option<String>,
 }
 
 /// A share this client can view: the secret to bring up a viewer connection and
@@ -657,11 +661,16 @@ impl AppEvents {
     }
 }
 
+/// A join requested on the command line, to be started once the app is running.
+pub(crate) enum PendingJoin {
+    /// Invite-based pairing from a `tcj1_` join string.
+    Invite(InviteTicket),
+    /// Open pairing against a bare `host:port` address.
+    Open { addr: String },
+}
+
 impl App {
-    pub(crate) fn new(
-        config: Config,
-        pending_invite: Option<InviteTicket>,
-    ) -> Result<Self, String> {
+    pub(crate) fn new(config: Config, pending_join: Option<PendingJoin>) -> Result<Self, String> {
         let events = AppEvents::new();
         let soundboard_enabled = config.soundboard.enabled;
         let theme = Theme::from_choice(config.ui.theme);
@@ -720,13 +729,17 @@ impl App {
             available_shares: HashMap::new(),
             subscribers: HashMap::new(),
             active_tcp_addr: None,
+            active_server_label: None,
             config,
         };
         app.rebuild_server_items();
-        if let Some(ticket) = pending_invite {
-            app.start_join_pairing(ticket);
-        } else if app.config.servers.is_empty() {
-            app.set_status("no servers configured; run chatt pair JOIN_STRING");
+        match pending_join {
+            Some(PendingJoin::Invite(ticket)) => app.start_join_pairing(ticket),
+            Some(PendingJoin::Open { addr }) => app.start_open_pairing(addr),
+            None if app.config.servers.is_empty() => {
+                app.set_status("no servers configured; run chatt pair <server>");
+            }
+            None => {}
         }
         Ok(app)
     }
@@ -1008,6 +1021,7 @@ impl App {
                 .client_config(&self.config.files, &self.config.p2p)
                 .tcp_addr,
         );
+        self.active_server_label = Some(server.label.clone());
         self.network = Some(network);
         self.supervisor.network.reset();
         self.set_status("connecting");
@@ -1018,6 +1032,7 @@ impl App {
         self.stop_audio();
         self.stop_all_shares();
         self.active_tcp_addr = None;
+        self.active_server_label = None;
         self.control_socket.take();
         if let Some(network) = self.network.take() {
             network.stop();
@@ -1075,8 +1090,146 @@ impl App {
             ticket.pairing_code,
             self.events.sender(),
         );
-        self.pending_pair = Some(PendingPair { server });
+        self.pending_pair = Some(PendingPair {
+            server,
+            open: None,
+            completion: PairCompletion::OpenEditor,
+        });
         self.set_status(format!("pairing {alias}"));
+    }
+
+    /// Begins self-service pairing against a bare `host:port` address. The
+    /// server's public key is trusted on first use, the token is server-issued,
+    /// and the server prompts for a password only when it requires one.
+    pub(crate) fn start_open_pairing(&mut self, addr: String) {
+        let alias = unique_server_alias(&self.config, &alias_from_tcp_addr(&addr));
+        let server = ServerEntry {
+            label: alias.clone(),
+            tcp_addr: addr,
+            udp_addr: String::new(),
+            udp_probe_addr: None,
+            username: default_join_display_name(),
+            token: String::new(),
+            server_public_key: String::new(),
+            room_id: 1,
+        };
+        spawn_open_pair_once(
+            server.client_config(&self.config.files, &self.config.p2p),
+            String::new(),
+            String::new(),
+            self.events.sender(),
+        );
+        self.pending_pair = Some(PendingPair {
+            server,
+            open: Some(String::new()),
+            completion: PairCompletion::OpenEditor,
+        });
+        self.set_status(format!("pairing {alias}"));
+    }
+
+    /// Re-runs the open-pairing worker with a user-entered password, preserving
+    /// the pending server and its existing token.
+    pub(crate) fn submit_open_pair_password(&mut self, password: String) {
+        self.pop_mode();
+        let Some(pending) = self.pending_pair.as_ref() else {
+            return;
+        };
+        let Some(existing_token) = pending.open.clone() else {
+            return;
+        };
+        let alias = pending.server.label.clone();
+        let client_config = pending
+            .server
+            .client_config(&self.config.files, &self.config.p2p);
+        spawn_open_pair_once(
+            client_config,
+            password,
+            existing_token,
+            self.events.sender(),
+        );
+        self.set_status(format!("pairing {alias}"));
+    }
+
+    /// Cancels an in-progress open pairing when the user dismisses the password
+    /// prompt.
+    pub(crate) fn cancel_open_pairing(&mut self) {
+        self.pop_mode();
+        self.pending_pair.take();
+        self.set_status("pairing canceled");
+    }
+
+    fn start_stale_token_repair(&mut self, reason: &str) -> bool {
+        let Some(label) = self.active_server_label.clone() else {
+            return false;
+        };
+        let server = match self.config.server(&label).cloned() {
+            Ok(server) => server,
+            Err(error) => {
+                self.push_network_notice("auth", &error);
+                return false;
+            }
+        };
+        let existing_token = server.token.clone();
+        if existing_token.trim().is_empty() {
+            return false;
+        }
+        let client_config = server.client_config(&self.config.files, &self.config.p2p);
+        self.disconnect_network();
+        self.push_network_notice("auth", reason);
+        spawn_open_pair_once(
+            client_config,
+            String::new(),
+            existing_token.clone(),
+            self.events.sender(),
+        );
+        self.pending_pair = Some(PendingPair {
+            server,
+            open: Some(existing_token),
+            completion: PairCompletion::Reconnect {
+                label: label.clone(),
+            },
+        });
+        self.set_status(format!("refreshing {label}"));
+        true
+    }
+
+    /// Persists a freshly paired server and applies the caller's post-save action.
+    fn complete_pairing(&mut self, server: ServerEntry, completion: PairCompletion) {
+        let alias = server.label.clone();
+        self.config.upsert_server(server);
+        match self.config.save_runtime() {
+            Ok(path) => {
+                self.config.config_path = Some(path.clone());
+                self.rebuild_server_items();
+                match completion {
+                    PairCompletion::OpenEditor => {
+                        self.replace_with_server_edit(&alias);
+                        self.set_status(format!(
+                            "paired {alias}; config saved to {}",
+                            path.display()
+                        ));
+                    }
+                    PairCompletion::Reconnect { label } => {
+                        self.set_status(format!(
+                            "refreshed {label}; config saved to {}",
+                            path.display()
+                        ));
+                        if !self.start_network(&label) {
+                            self.open_server_select();
+                        }
+                    }
+                }
+            }
+            Err(error) => {
+                self.rebuild_server_items();
+                if matches!(completion, PairCompletion::OpenEditor) {
+                    self.replace_with_server_edit(&alias);
+                } else {
+                    self.open_server_select();
+                }
+                self.set_error(error);
+            }
+        }
     }
 
     fn handle_soundboard_event(&mut self, event: SoundboardEvent) {
@@ -1405,36 +1558,58 @@ impl App {
                 kvlog::warn!("app network error", error = error.as_str());
                 self.set_error(format!("error: {error}"));
             }
-            NetworkEvent::AuthFailed(error) => {
-                kvlog::warn!("app auth failed", error = error.as_str());
+            NetworkEvent::AuthFailed { code, message } => {
+                kvlog::warn!("app auth failed", code, error = message.as_str());
+                if code == ERROR_TOKEN_STALE_EPOCH && self.start_stale_token_repair(&message) {
+                    return;
+                }
                 self.disconnect_network();
                 self.open_server_select();
-                self.push_network_notice("auth", &error);
-                self.set_error(auth_failure_status(&error));
+                self.push_network_notice("auth", &message);
+                self.set_error(auth_failure_status(&message));
             }
             NetworkEvent::PairingSucceeded => {
                 let Some(pair) = self.pending_pair.take() else {
                     self.set_status("pairing succeeded");
                     return;
                 };
-                let alias = pair.server.label.clone();
-                self.config.upsert_server(pair.server);
-                match self.config.save_runtime() {
-                    Ok(path) => {
-                        self.config.config_path = Some(path.clone());
-                        self.rebuild_server_items();
-                        self.replace_with_server_edit(&alias);
-                        self.set_status(format!(
-                            "paired {alias}; config saved to {}",
-                            path.display()
-                        ));
-                    }
-                    Err(error) => {
-                        self.rebuild_server_items();
-                        self.replace_with_server_edit(&alias);
-                        self.set_error(error);
-                    }
+                self.complete_pairing(pair.server, pair.completion);
+            }
+            NetworkEvent::OpenPairingSucceeded {
+                token,
+                server_public_key,
+                udp_addr,
+                udp_probe_addr,
+            } => {
+                let Some(mut pair) = self.pending_pair.take() else {
+                    self.set_status("pairing succeeded");
+                    return;
+                };
+                pair.server.token = token;
+                pair.server.server_public_key = server_public_key;
+                pair.server.udp_addr = udp_addr;
+                pair.server.udp_probe_addr = udp_probe_addr;
+                if let Err(error) = validate_server_entry(&pair.server) {
+                    self.set_error(error);
+                    return;
                 }
+                self.complete_pairing(pair.server, pair.completion);
+            }
+            NetworkEvent::OpenPairingNeedsPassword {
+                retry,
+                server_public_key,
+            } => {
+                let Some(pair) = self.pending_pair.as_mut() else {
+                    return;
+                };
+                if pair.server.server_public_key.is_empty() {
+                    pair.server.server_public_key = server_public_key;
+                } else if pair.server.server_public_key != server_public_key {
+                    self.pending_pair.take();
+                    self.set_error("pairing failed: server key changed during password retry");
+                    return;
+                }
+                self.push_mode(Box::new(PasswordPromptMode::new(retry)));
             }
             NetworkEvent::PairingFailed(error) => {
                 self.pending_pair.take();
@@ -3604,9 +3779,11 @@ fn network_event_kind(event: &NetworkEvent) -> &'static str {
         NetworkEvent::EncoderProfileChanged(_) => "encoder_profile_changed",
         NetworkEvent::Status(_) => "status",
         NetworkEvent::Error(_) => "error",
-        NetworkEvent::AuthFailed(_) => "auth_failed",
+        NetworkEvent::AuthFailed { .. } => "auth_failed",
         NetworkEvent::PairingSucceeded => "pairing_succeeded",
         NetworkEvent::PairingFailed(_) => "pairing_failed",
+        NetworkEvent::OpenPairingSucceeded { .. } => "open_pairing_succeeded",
+        NetworkEvent::OpenPairingNeedsPassword { .. } => "open_pairing_needs_password",
         NetworkEvent::ReconnectScheduled { .. } => "reconnect_scheduled",
         NetworkEvent::WorkerStopped { .. } => "worker_stopped",
         NetworkEvent::Disconnected => "disconnected",
@@ -3654,6 +3831,23 @@ mod tests {
         App::new(Config::default(), None).expect("test app")
     }
 
+    fn pending_open_pair(label: &str) -> PendingPair {
+        PendingPair {
+            server: ServerEntry {
+                label: label.to_string(),
+                tcp_addr: "chat.example.com:443".to_string(),
+                udp_addr: String::new(),
+                udp_probe_addr: None,
+                username: "Zoe".to_string(),
+                token: String::new(),
+                server_public_key: String::new(),
+                room_id: 1,
+            },
+            open: Some(String::new()),
+            completion: PairCompletion::OpenEditor,
+        }
+    }
+
     fn render_room(app: &mut App, room: &mut RoomMode, buffer: &mut Buffer) {
         room.render(app, buffer, 0);
     }
@@ -3676,6 +3870,95 @@ mod tests {
         // its offline logs stay readable.
         app.room.server_alias = "lab".to_string();
         assert_eq!(base_mode_label(&app), "Compose");
+    }
+
+    #[test]
+    fn open_pair_password_prompt_pins_trusted_key_before_retry() {
+        let mut app = test_app();
+        app.pending_pair = Some(pending_open_pair("public"));
+        let key = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+        app.handle_app_event(
+            NetworkEvent::OpenPairingNeedsPassword {
+                retry: false,
+                server_public_key: key.to_string(),
+            }
+            .into(),
+        );
+
+        assert_eq!(
+            app.pending_pair.as_ref().unwrap().server.server_public_key,
+            key
+        );
+    }
+
+    #[test]
+    fn stale_dynamic_token_auth_failure_starts_repair_pairing() {
+        let mut app = test_app();
+        app.config.servers.push(ServerEntry {
+            label: "public".to_string(),
+            tcp_addr: "127.0.0.1:9".to_string(),
+            udp_addr: "127.0.0.1:9".to_string(),
+            udp_probe_addr: None,
+            username: "Zoe".to_string(),
+            token: "tct1_existing-token".to_string(),
+            server_public_key: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+                .to_string(),
+            room_id: 1,
+        });
+        app.active_server_label = Some("public".to_string());
+
+        app.handle_app_event(
+            NetworkEvent::AuthFailed {
+                code: ERROR_TOKEN_STALE_EPOCH,
+                message: "authentication failed: the server password changed; re-pair to refresh your token"
+                    .to_string(),
+            }
+            .into(),
+        );
+
+        let pending = app.pending_pair.as_ref().expect("repair pairing pending");
+        assert_eq!(pending.server.label, "public");
+        assert_eq!(pending.open.as_deref(), Some("tct1_existing-token"));
+        assert!(matches!(
+            &pending.completion,
+            PairCompletion::Reconnect { label } if label == "public"
+        ));
+    }
+
+    #[test]
+    fn open_pair_success_persists_token_key_and_udp_endpoints() {
+        let path = std::env::temp_dir().join(format!(
+            "chatt-open-pair-client-{}.toml",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let mut app = test_app();
+        app.config.config_path = Some(path.clone());
+        app.pending_pair = Some(pending_open_pair("public"));
+        let key = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+        app.handle_app_event(
+            NetworkEvent::OpenPairingSucceeded {
+                token: "tct1_token-with-enough-content".to_string(),
+                server_public_key: key.to_string(),
+                udp_addr: "198.51.100.20:54100".to_string(),
+                udp_probe_addr: Some("198.51.100.20:54101".to_string()),
+            }
+            .into(),
+        );
+
+        let saved = app
+            .config
+            .servers
+            .iter()
+            .find(|server| server.label == "public")
+            .expect("paired server saved");
+        assert_eq!(saved.token, "tct1_token-with-enough-content");
+        assert_eq!(saved.server_public_key, key);
+        assert_eq!(saved.udp_addr, "198.51.100.20:54100");
+        assert_eq!(saved.udp_probe_addr.as_deref(), Some("198.51.100.20:54101"));
+        let _ = std::fs::remove_file(path);
     }
 
     fn participant(user_id: UserId, display_name: &str) -> ParticipantInfo {

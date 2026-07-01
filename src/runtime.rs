@@ -5,17 +5,15 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+use crate::{
+    app::{App, PendingJoin},
+    config::Config,
+    tui::{Action, mode_stack::ModeStack},
+};
 use extui::{
     Buffer, Terminal, TerminalFlags,
     event::{self, Event, Events, polling::GlobalWakerConfig},
     vt,
-};
-use rpc::control::InviteTicket;
-
-use crate::{
-    app::App,
-    config::Config,
-    tui::{Action, mode_stack::ModeStack},
 };
 
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
@@ -23,10 +21,10 @@ static PANIC_HOOK: Once = Once::new();
 
 pub(crate) fn run_app(
     config: Config,
-    pending_invite: Option<InviteTicket>,
+    pending_join: Option<PendingJoin>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     install_panic_hook();
-    let mut app = App::new(config, pending_invite)?;
+    let mut app = App::new(config, pending_join)?;
     event::polling::initialize_global_waker(GlobalWakerConfig {
         resize: true,
         termination: true,

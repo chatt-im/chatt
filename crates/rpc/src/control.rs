@@ -19,6 +19,17 @@ pub const ERROR_AUTH_REJECTED: u16 = 401;
 pub const ERROR_PAIRING_NOT_ACTIVE: u16 = 410;
 pub const ERROR_PAIRING_CODE_MISMATCH: u16 = 409;
 pub const ERROR_PAIRING_INVALID_REQUEST: u16 = 422;
+/// Open pairing was attempted against a server that does not allow it.
+pub const ERROR_PUBLIC_DISABLED: u16 = 403;
+/// Open pairing requires a password and none was supplied.
+pub const ERROR_PASSWORD_REQUIRED: u16 = 428;
+/// Open pairing supplied the wrong password.
+pub const ERROR_PASSWORD_MISMATCH: u16 = 423;
+/// A dynamic token's password epoch is older than the server's current epoch;
+/// the client should re-pair with the current password to refresh it.
+pub const ERROR_TOKEN_STALE_EPOCH: u16 = 426;
+/// Open pairing is being attempted too frequently.
+pub const ERROR_OPEN_PAIR_RATE_LIMITED: u16 = 429;
 pub const ERROR_BUG_REPORT_REJECTED: u16 = 400;
 pub const JOIN_STRING_PREFIX: &str = "tcj1_";
 const MAX_JOIN_STRING_BYTES: usize = 4096;
@@ -39,6 +50,7 @@ pub struct ServerHello {
     pub encrypted: bool,
     pub server_nonce: Vec<u8>,
     pub server_ephemeral: Vec<u8>,
+    pub server_public_key: Vec<u8>,
     pub signature: Vec<u8>,
 }
 
@@ -55,6 +67,16 @@ pub enum ClientControl {
         display_name: String,
         pairing_code: String,
         token: String,
+        receive_files: bool,
+        file_receive_limit_bytes: u64,
+    },
+    /// Self-service join on a public server. The server allocates (or, when
+    /// `existing_token` is a valid dynamic token, reuses) a user id and issues a
+    /// fresh bearer token. `password` is empty when the server requires none.
+    OpenPair {
+        display_name: String,
+        password: String,
+        existing_token: String,
         receive_files: bool,
         file_receive_limit_bytes: u64,
     },
@@ -135,6 +157,17 @@ pub enum ClientControl {
 #[jsony(Binary, version)]
 pub enum ServerControl {
     Authenticated {
+        session_id: SessionId,
+        user_id: UserId,
+        rooms: Vec<RoomInfo>,
+        current_room: Option<RoomId>,
+    },
+    /// Open pairing succeeded. Carries the issued bearer token the client must
+    /// store, alongside the same session details as [`ServerControl::Authenticated`].
+    OpenPaired {
+        token: String,
+        udp_addr: String,
+        udp_probe_addr: Option<String>,
         session_id: SessionId,
         user_id: UserId,
         rooms: Vec<RoomInfo>,
@@ -497,6 +530,16 @@ fn validate_client_control(value: &ClientControl) -> Result<(), String> {
                 return Err("paired token is too short".to_string());
             }
         }
+        ClientControl::OpenPair {
+            display_name,
+            password,
+            existing_token,
+            ..
+        } => {
+            validate_auth_field("display name", display_name)?;
+            validate_optional_auth_field("password", password)?;
+            validate_optional_auth_field("existing token", existing_token)?;
+        }
         ClientControl::SendChat { body, .. } => {
             if body.trim().is_empty() {
                 return Err("chat message is empty".to_string());
@@ -619,6 +662,10 @@ fn validate_auth_field(name: &str, value: &str) -> Result<(), String> {
     if value.trim().is_empty() {
         return Err(format!("{name} is empty"));
     }
+    validate_optional_auth_field(name, value)
+}
+
+fn validate_optional_auth_field(name: &str, value: &str) -> Result<(), String> {
     if value.len() > MAX_AUTH_FIELD_BYTES {
         return Err(format!("{name} exceeds maximum length"));
     }
@@ -889,6 +936,43 @@ mod tests {
     }
 
     #[test]
+    fn open_pair_allows_empty_optional_password_and_existing_token() {
+        let control = ClientControl::OpenPair {
+            display_name: "Alice".to_string(),
+            password: String::new(),
+            existing_token: String::new(),
+            receive_files: true,
+            file_receive_limit_bytes: DEFAULT_FILE_SIZE_LIMIT_BYTES,
+        };
+
+        let encoded = encode_client_control(&control).unwrap();
+
+        assert_eq!(decode_client_control(&encoded).unwrap(), control);
+    }
+
+    #[test]
+    fn open_pair_caps_optional_auth_fields() {
+        let long = "x".repeat(MAX_AUTH_FIELD_BYTES + 1);
+        let password = ClientControl::OpenPair {
+            display_name: "Alice".to_string(),
+            password: long.clone(),
+            existing_token: String::new(),
+            receive_files: true,
+            file_receive_limit_bytes: DEFAULT_FILE_SIZE_LIMIT_BYTES,
+        };
+        assert!(encode_client_control(&password).is_err());
+
+        let existing = ClientControl::OpenPair {
+            display_name: "Alice".to_string(),
+            password: String::new(),
+            existing_token: long,
+            receive_files: true,
+            file_receive_limit_bytes: DEFAULT_FILE_SIZE_LIMIT_BYTES,
+        };
+        assert!(encode_client_control(&existing).is_err());
+    }
+
+    #[test]
     fn invite_ticket_round_trips_join_string() {
         let ticket = InviteTicket {
             version: crate::PROTOCOL_VERSION,
@@ -905,6 +989,27 @@ mod tests {
 
         assert!(encoded.starts_with(JOIN_STRING_PREFIX));
         assert_eq!(decode_invite_ticket(&encoded).unwrap(), ticket);
+    }
+
+    #[test]
+    fn open_paired_control_round_trips_endpoints() {
+        let control = ServerControl::OpenPaired {
+            token: "tct1_token".to_string(),
+            udp_addr: "198.51.100.20:54100".to_string(),
+            udp_probe_addr: Some("198.51.100.20:54101".to_string()),
+            session_id: SessionId(7),
+            user_id: UserId(4_294_967_296),
+            rooms: vec![RoomInfo {
+                room_id: RoomId(1),
+                name: "lobby".to_string(),
+                participants: 1,
+            }],
+            current_room: Some(RoomId(1)),
+        };
+
+        let encoded = encode_server_control(&control);
+
+        assert_eq!(decode_server_control(&encoded).unwrap(), control);
     }
 
     #[test]

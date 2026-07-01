@@ -1,11 +1,15 @@
 use ring::{
     aead::{self, Aad, CHACHA20_POLY1305, LessSafeKey, Nonce, UnboundKey},
     agreement, digest, hkdf, hmac, rand,
+    rand::SecureRandom,
     signature::{self, KeyPair},
 };
 
+use jsony::Jsony;
+
 use crate::PROTOCOL_VERSION;
 use crate::control::{ClientHello, ServerHello};
+use crate::ids::UserId;
 
 pub const KEY_LEN: usize = 32;
 pub const NONCE_LEN: usize = 32;
@@ -16,6 +20,11 @@ pub const TRANSPORT_HEADER_LEN: usize = 12;
 pub const CHANNEL_CONTROL: u8 = 1;
 pub const CHANNEL_MEDIA: u8 = 2;
 pub const CHANNEL_VIDEO: u8 = 3;
+/// Prefix marking an opaque dynamic-user bearer token, distinguishing it from an
+/// explicit user's plaintext token during authentication.
+pub const DYNAMIC_TOKEN_PREFIX: &str = "tct1_";
+/// AEAD channel byte domain-separating dynamic token sealing from transport frames.
+const TOKEN_CHANNEL: u8 = 0;
 pub const REKEY_AFTER_TIME_SECS: u64 = 120;
 pub const REJECT_AFTER_TIME_SECS: u64 = 180;
 pub const REJECT_AFTER_MESSAGES: u64 = u64::MAX - (1 << 4);
@@ -223,6 +232,7 @@ pub fn respond_to_client_hello(
         encrypted: true,
         server_nonce: nonce.to_vec(),
         server_ephemeral: public.as_ref().to_vec(),
+        server_public_key: server_key_pair.public_key().as_ref().to_vec(),
         signature: signature.as_ref().to_vec(),
     };
     let transcript = full_transcript(client_hello, &hello, server_key_pair.public_key().as_ref())?;
@@ -253,22 +263,33 @@ pub fn respond_to_client_hello_plaintext(
             encrypted: false,
             server_nonce: nonce.to_vec(),
             server_ephemeral: Vec::new(),
+            server_public_key: server_key_pair.public_key().as_ref().to_vec(),
             signature: signature.as_ref().to_vec(),
         },
     })
 }
 
+/// Completes the client handshake, returning the negotiated transport mode and
+/// the Ed25519 key that was trusted. When `pinned_server_public_key` is `None`
+/// the server's presented key is trusted on first use and returned so the caller
+/// can pin it for later connections.
 pub fn complete_client_transport_handshake(
     handshake: ClientHandshake,
     server_hello: &ServerHello,
-    pinned_server_public_key: &[u8; ED25519_PUBLIC_KEY_LEN],
-) -> Result<HandshakeMode, CryptoError> {
+    pinned_server_public_key: Option<&[u8; ED25519_PUBLIC_KEY_LEN]>,
+) -> Result<(HandshakeMode, [u8; ED25519_PUBLIC_KEY_LEN]), CryptoError> {
     if server_hello.encrypted {
-        complete_client_handshake(handshake, server_hello, pinned_server_public_key)
-            .map(HandshakeMode::Encrypted)
+        validate_server_hello(server_hello)?;
     } else {
-        verify_plaintext_server_hello(&handshake.hello, server_hello, pinned_server_public_key)?;
-        Ok(HandshakeMode::Plaintext)
+        validate_plaintext_server_hello(server_hello)?;
+    }
+    let trusted = resolve_server_public_key(server_hello, pinned_server_public_key)?;
+    if server_hello.encrypted {
+        let secrets = complete_client_handshake(handshake, server_hello, &trusted)?;
+        Ok((HandshakeMode::Encrypted(secrets), trusted))
+    } else {
+        verify_plaintext_server_hello(&handshake.hello, server_hello, &trusted)?;
+        Ok((HandshakeMode::Plaintext, trusted))
     }
 }
 
@@ -344,6 +365,7 @@ fn validate_server_hello(hello: &ServerHello) -> Result<(), CryptoError> {
     if !hello.encrypted
         || hello.server_nonce.len() != NONCE_LEN
         || hello.server_ephemeral.len() != X25519_PUBLIC_KEY_LEN
+        || hello.server_public_key.len() != ED25519_PUBLIC_KEY_LEN
         || hello.signature.is_empty()
     {
         return Err(CryptoError::InvalidHandshake);
@@ -358,11 +380,32 @@ fn validate_plaintext_server_hello(hello: &ServerHello) -> Result<(), CryptoErro
     if hello.encrypted
         || hello.server_nonce.len() != NONCE_LEN
         || !hello.server_ephemeral.is_empty()
+        || hello.server_public_key.len() != ED25519_PUBLIC_KEY_LEN
         || hello.signature.is_empty()
     {
         return Err(CryptoError::InvalidHandshake);
     }
     Ok(())
+}
+
+/// Resolves the Ed25519 key the client will trust for this handshake.
+///
+/// With a pinned key, the presented key must match it exactly (defense against a
+/// substituted server). Without one, the presented key is trusted on first use
+/// and returned so the caller can store it.
+fn resolve_server_public_key(
+    server_hello: &ServerHello,
+    pinned_server_public_key: Option<&[u8; ED25519_PUBLIC_KEY_LEN]>,
+) -> Result<[u8; ED25519_PUBLIC_KEY_LEN], CryptoError> {
+    let presented: [u8; ED25519_PUBLIC_KEY_LEN] = server_hello
+        .server_public_key
+        .as_slice()
+        .try_into()
+        .map_err(|_| CryptoError::InvalidHandshake)?;
+    match pinned_server_public_key {
+        Some(pinned) if pinned != &presented => Err(CryptoError::InvalidSignature),
+        _ => Ok(presented),
+    }
 }
 
 fn server_transcript(
@@ -697,6 +740,61 @@ pub fn open_with_key(
     Ok((counter, plaintext.to_vec()))
 }
 
+/// Claims carried inside a dynamic-user bearer token. The server issues one at
+/// pairing time and reads it back on every authentication instead of storing a
+/// row per user.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Jsony)]
+#[jsony(Binary)]
+pub struct DynamicTokenClaims {
+    pub user_id: UserId,
+    pub password_epoch: u32,
+}
+
+/// Derives the static ChaCha20-Poly1305 key that seals dynamic tokens from the
+/// server identity seed. The seed already gates the Ed25519 identity, so the
+/// same secret authenticates tokens without new key material to configure.
+fn dynamic_token_key(seed_hex: &str) -> Result<KeyMaterial, CryptoError> {
+    let seed = decode_fixed_hex::<KEY_LEN>(seed_hex)?;
+    let salt = hkdf::Salt::new(hkdf::HKDF_SHA256, b"chatt dynamic token salt v1");
+    let prk = salt.extract(&seed);
+    let bytes = expand_key(&prk, b"chatt dynamic token key v1");
+    Ok(KeyMaterial { id: 0, bytes })
+}
+
+/// Seals `claims` into an opaque bearer token string. The AEAD tag authenticates
+/// the token, so a client cannot forge or alter its `user_id` or `password_epoch`.
+pub fn issue_dynamic_token(
+    seed_hex: &str,
+    claims: &DynamicTokenClaims,
+) -> Result<String, CryptoError> {
+    let key = dynamic_token_key(seed_hex)?;
+    let plaintext = jsony::to_binary(claims);
+    let mut counter_bytes = [0u8; 8];
+    rand::SystemRandom::new()
+        .fill(&mut counter_bytes)
+        .map_err(|_| CryptoError::Random)?;
+    // Keep the random nonce counter below REJECT_AFTER_MESSAGES by clearing the
+    // top four bits.
+    let counter = u64::from_le_bytes(counter_bytes) & 0x0fff_ffff_ffff_ffff;
+    let frame = seal_with_key(&key, TOKEN_CHANNEL, counter, &plaintext)?;
+    Ok(format!("{DYNAMIC_TOKEN_PREFIX}{}", encode_hex(&frame)))
+}
+
+/// Opens a dynamic token and returns its claims. Fails when the token was not
+/// issued by this server seed or was tampered with.
+pub fn verify_dynamic_token(
+    seed_hex: &str,
+    token: &str,
+) -> Result<DynamicTokenClaims, CryptoError> {
+    let hex = token
+        .strip_prefix(DYNAMIC_TOKEN_PREFIX)
+        .ok_or(CryptoError::InvalidEncoding)?;
+    let frame = decode_hex(hex)?;
+    let key = dynamic_token_key(seed_hex)?;
+    let (_counter, plaintext) = open_with_key(&key, TOKEN_CHANNEL, &frame)?;
+    jsony::from_binary(&plaintext).map_err(|_| CryptoError::InvalidEncoding)
+}
+
 /// Computes the STUN `MESSAGE-INTEGRITY-SHA256` value for a message prefix.
 ///
 /// `key` is the shared per-pair STUN key and `message_prefix` is the STUN
@@ -810,6 +908,48 @@ mod tests {
     use super::*;
 
     #[test]
+    fn dynamic_token_round_trips() {
+        let seed = dev_server_seed_hex();
+        let claims = DynamicTokenClaims {
+            user_id: UserId(FIRST_DYNAMIC_USER_ID_TEST),
+            password_epoch: 7,
+        };
+        let token = issue_dynamic_token(&seed, &claims).unwrap();
+        assert!(token.starts_with(DYNAMIC_TOKEN_PREFIX));
+        assert_eq!(verify_dynamic_token(&seed, &token).unwrap(), claims);
+    }
+
+    #[test]
+    fn dynamic_token_rejects_wrong_seed() {
+        let seed = dev_server_seed_hex();
+        let other_seed = encode_hex(&[0x11u8; KEY_LEN]);
+        let claims = DynamicTokenClaims {
+            user_id: UserId(42),
+            password_epoch: 0,
+        };
+        let token = issue_dynamic_token(&seed, &claims).unwrap();
+        assert!(verify_dynamic_token(&other_seed, &token).is_err());
+    }
+
+    #[test]
+    fn dynamic_token_rejects_tampering() {
+        let seed = dev_server_seed_hex();
+        let claims = DynamicTokenClaims {
+            user_id: UserId(9),
+            password_epoch: 1,
+        };
+        let token = issue_dynamic_token(&seed, &claims).unwrap();
+        // Flip the last hex nibble of the sealed body.
+        let mut bytes = token.into_bytes();
+        let last = bytes.last_mut().unwrap();
+        *last = if *last == b'a' { b'b' } else { b'a' };
+        let tampered = String::from_utf8(bytes).unwrap();
+        assert!(verify_dynamic_token(&seed, &tampered).is_err());
+    }
+
+    const FIRST_DYNAMIC_USER_ID_TEST: u64 = u32::MAX as u64 + 1;
+
+    #[test]
     fn client_and_server_derive_opposite_keys() {
         let rng = rand::SystemRandom::new();
         let client = generate_client_hello(&rng).unwrap();
@@ -848,11 +988,14 @@ mod tests {
             respond_to_client_hello_plaintext(&rng, &dev_server_key_pair(), &client_hello).unwrap();
 
         assert!(!server.hello.encrypted);
-        assert_eq!(
-            complete_client_transport_handshake(client, &server.hello, &dev_server_public_key())
-                .unwrap(),
-            HandshakeMode::Plaintext
-        );
+        let (mode, trusted) = complete_client_transport_handshake(
+            client,
+            &server.hello,
+            Some(&dev_server_public_key()),
+        )
+        .unwrap();
+        assert_eq!(mode, HandshakeMode::Plaintext);
+        assert_eq!(trusted, dev_server_public_key());
     }
 
     #[test]

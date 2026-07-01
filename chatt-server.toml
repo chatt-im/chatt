@@ -11,6 +11,14 @@ chat-history-limit = 0
 max-file-size-bytes = 52428800
 # Directory where `/report-bug` bundles are saved. Bug reports are rejected when unset.
 # bug-report-dir = "/tmp/chatt-bugs"
+# Allow users to self-join with `chatt pair <addr>` without an admin invite.
+public = false
+# Shared secret required for open pairing. Omit or leave empty for no password.
+# password = "hunter2"
+# Bumping this invalidates every dynamic token issued under the old epoch.
+password-epoch = 0
+# Next id handed to a dynamic user. Ids below u32::MAX + 1 are for explicit users.
+next-dynamic-user-id = 4294967296
 
 [[rooms]]
 id = 1
@@ -39,4 +47,3 @@ id = 4
 name = "billy"
 display-name = "Billy"
 token-hash = "sha256:5c2bc883be6ee4037447e72a76dcd748d01b236a31669cb1bde9e5d460eb9519"
-

@@ -29,7 +29,8 @@ use ring::rand::SecureRandom;
 use rpc::{
     control::{
         ChatMessage, ClientControl, ERROR_AUTH_REJECTED, ERROR_PAIRING_CODE_MISMATCH,
-        ERROR_PAIRING_INVALID_REQUEST, ERROR_PAIRING_NOT_ACTIVE, FileMetadata,
+        ERROR_PAIRING_INVALID_REQUEST, ERROR_PAIRING_NOT_ACTIVE, ERROR_PASSWORD_MISMATCH,
+        ERROR_PASSWORD_REQUIRED, ERROR_PUBLIC_DISABLED, ERROR_TOKEN_STALE_EPOCH, FileMetadata,
         MAX_FILE_CHUNK_BYTES, MAX_FILE_NAME_BYTES, P2pCandidate, P2pCandidateKind, P2pKey,
         P2pNatKind, P2pPeerInfo, P2pRole, ParticipantInfo, ParticipantVoiceStatus, RoomInfo,
         ServerControl, decode_server_control, decode_server_hello, encode_client_control,
@@ -38,7 +39,7 @@ use rpc::{
     crypto::{
         AntiReplay, CHANNEL_CONTROL, ControlTransport, HandshakeMode, KEY_LEN, KeyMaterial,
         SessionSecrets, complete_client_transport_handshake, dev_server_public_key,
-        ed25519_public_key_from_hex, generate_client_hello,
+        ed25519_public_key_from_hex, encode_hex, generate_client_hello,
     },
     frame,
     ids::{BugReportId, FileTransferId, RoomId, SessionId, StreamId, UserId},
@@ -237,9 +238,27 @@ pub enum NetworkEvent {
     },
     Status(String),
     Error(String),
-    AuthFailed(String),
+    AuthFailed {
+        code: u16,
+        message: String,
+    },
     PairingSucceeded,
     PairingFailed(String),
+    /// Open pairing succeeded. Carries the issued bearer token and the server's
+    /// trusted-on-first-use Ed25519 public key (hex), both to be persisted.
+    OpenPairingSucceeded {
+        token: String,
+        server_public_key: String,
+        udp_addr: String,
+        udp_probe_addr: Option<String>,
+    },
+    /// Open pairing needs a password (either required or the last one was wrong).
+    /// `retry` is true when a password was already tried and rejected. Carries
+    /// the trusted-on-first-use Ed25519 public key (hex) to pin before retrying.
+    OpenPairingNeedsPassword {
+        retry: bool,
+        server_public_key: String,
+    },
     ReconnectScheduled {
         retry_in: Duration,
         reason: String,
@@ -394,6 +413,124 @@ pub fn spawn_pair_once(
         .expect("failed to spawn pairing worker")
 }
 
+enum OpenPairOutcome {
+    Paired {
+        token: String,
+        server_public_key: String,
+        udp_addr: String,
+        udp_probe_addr: Option<String>,
+    },
+    NeedsPassword {
+        retry: bool,
+        server_public_key: String,
+    },
+    Failed(String),
+}
+
+/// Runs one open-pairing attempt: TOFU handshake, send `OpenPair`, await the
+/// server's decision. Returns the issued token and trusted key on success, a
+/// password prompt request when the server demands one, or a fatal error.
+fn open_pair_once(
+    config: &ClientConfig,
+    password: String,
+    existing_token: String,
+) -> OpenPairOutcome {
+    let (mut stream, mut control, _secrets, trusted) = match connect_and_handshake(config, true) {
+        Ok(value) => value,
+        Err(error) => return OpenPairOutcome::Failed(error),
+    };
+    let request = ClientControl::OpenPair {
+        display_name: config.display_name.clone(),
+        password,
+        existing_token,
+        receive_files: config.file_receive_dir.is_some(),
+        file_receive_limit_bytes: config.max_receive_bytes,
+    };
+    if let Err(error) = write_blocking_control(&mut stream, &mut control, request) {
+        return OpenPairOutcome::Failed(error);
+    }
+    loop {
+        let frame = match read_blocking_frame(&mut stream) {
+            Ok(frame) => frame,
+            Err(error) => {
+                return OpenPairOutcome::Failed(format!(
+                    "failed to read pairing response: {error}"
+                ));
+            }
+        };
+        let plaintext = match control.open_next(CHANNEL_CONTROL, &frame) {
+            Ok(plaintext) => plaintext,
+            Err(error) => return OpenPairOutcome::Failed(error.to_string()),
+        };
+        match decode_server_control(&plaintext) {
+            Ok(ServerControl::OpenPaired {
+                token,
+                udp_addr,
+                udp_probe_addr,
+                ..
+            }) => {
+                return OpenPairOutcome::Paired {
+                    token,
+                    server_public_key: encode_hex(&trusted),
+                    udp_addr,
+                    udp_probe_addr,
+                };
+            }
+            Ok(ServerControl::Error { code, message }) => {
+                return match code {
+                    ERROR_PASSWORD_REQUIRED => OpenPairOutcome::NeedsPassword {
+                        retry: false,
+                        server_public_key: encode_hex(&trusted),
+                    },
+                    ERROR_PASSWORD_MISMATCH => OpenPairOutcome::NeedsPassword {
+                        retry: true,
+                        server_public_key: encode_hex(&trusted),
+                    },
+                    _ => OpenPairOutcome::Failed(message),
+                };
+            }
+            Ok(_) => {}
+            Err(error) => return OpenPairOutcome::Failed(error),
+        }
+    }
+}
+
+pub fn spawn_open_pair_once(
+    config: ClientConfig,
+    password: String,
+    existing_token: String,
+    events: EventSender,
+) -> JoinHandle<()> {
+    thread::Builder::new()
+        .name("chatt-open-pair".to_string())
+        .stack_size(256 * 1024)
+        .spawn(move || {
+            let event = match open_pair_once(&config, password, existing_token) {
+                OpenPairOutcome::Paired {
+                    token,
+                    server_public_key,
+                    udp_addr,
+                    udp_probe_addr,
+                } => NetworkEvent::OpenPairingSucceeded {
+                    token,
+                    server_public_key,
+                    udp_addr,
+                    udp_probe_addr,
+                },
+                OpenPairOutcome::NeedsPassword {
+                    retry,
+                    server_public_key,
+                } => NetworkEvent::OpenPairingNeedsPassword {
+                    retry,
+                    server_public_key,
+                },
+                OpenPairOutcome::Failed(error) => NetworkEvent::PairingFailed(error),
+            };
+            let _ = events.send(event);
+        })
+        .expect("failed to spawn open pairing worker")
+}
+
 fn run_worker(
     config: ClientConfig,
     events: EventSender,
@@ -427,9 +564,12 @@ fn run_worker(
                     break;
                 }
             }
-            SessionEnd::AuthFailed(reason) => {
-                kvlog::warn!("network auth failed", reason = reason.as_str());
-                let _ = events.send(NetworkEvent::AuthFailed(reason));
+            SessionEnd::AuthFailed { code, reason } => {
+                kvlog::warn!("network auth failed", code, reason = reason.as_str());
+                let _ = events.send(NetworkEvent::AuthFailed {
+                    code,
+                    message: reason,
+                });
                 break;
             }
         }
@@ -443,7 +583,7 @@ fn run_worker_inner(
     commands: &Receiver<NetworkCommand>,
     poll: &mut Poll,
 ) -> SessionEnd {
-    let (std_tcp, control, secrets) = match connect_and_handshake(config) {
+    let (std_tcp, control, secrets, _trusted) = match connect_and_handshake(config, false) {
         Ok(value) => value,
         Err(error) => return SessionEnd::ConnectFailed(error),
     };
@@ -655,8 +795,8 @@ fn run_worker_inner(
             poll_timeout = poll_timeout.min(deadline);
         }
     }
-    if let Some(reason) = worker.auth_failure.take() {
-        SessionEnd::AuthFailed(reason)
+    if let Some((code, reason)) = worker.auth_failure.take() {
+        SessionEnd::AuthFailed { code, reason }
     } else if let Some(reason) = worker.disconnect_reason.take() {
         SessionEnd::Disconnected(reason)
     } else {
@@ -669,7 +809,7 @@ enum SessionEnd {
     Shutdown,
     ConnectFailed(String),
     Disconnected(String),
-    AuthFailed(String),
+    AuthFailed { code: u16, reason: String },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -788,7 +928,16 @@ fn wait_for_reconnect(commands: &Receiver<NetworkCommand>, delay: Duration) -> R
 
 fn connect_and_handshake(
     config: &ClientConfig,
-) -> Result<(StdTcpStream, ControlTransport, Option<SessionSecrets>), String> {
+    allow_tofu: bool,
+) -> Result<
+    (
+        StdTcpStream,
+        ControlTransport,
+        Option<SessionSecrets>,
+        [u8; 32],
+    ),
+    String,
+> {
     kvlog::info!(
         "tcp connecting",
         tcp_addr = %config.tcp_addr,
@@ -815,10 +964,13 @@ fn connect_and_handshake(
     let response = read_blocking_frame(&mut stream)
         .map_err(|error| format!("failed to read server hello: {error}"))?;
     let server_hello = decode_server_hello(&response)?;
-    let pinned_server_public_key = pinned_server_public_key(config)?;
-    let mode =
-        complete_client_transport_handshake(client, &server_hello, &pinned_server_public_key)
-            .map_err(|error| error.to_string())?;
+    let pinned_server_public_key = pinned_server_public_key(config, allow_tofu)?;
+    let (mode, trusted_key) = complete_client_transport_handshake(
+        client,
+        &server_hello,
+        pinned_server_public_key.as_ref(),
+    )
+    .map_err(|error| error.to_string())?;
     let (control, secrets) = match mode {
         HandshakeMode::Encrypted(secrets) => {
             let control = ControlTransport::encrypted(
@@ -840,11 +992,11 @@ fn connect_and_handshake(
             (ControlTransport::plaintext(), None)
         }
     };
-    Ok((stream, control, secrets))
+    Ok((stream, control, secrets, trusted_key))
 }
 
 fn pair_once(config: &ClientConfig, pairing_code: String) -> Result<(), String> {
-    let (mut stream, mut control, _secrets) = connect_and_handshake(config)?;
+    let (mut stream, mut control, _secrets, _trusted) = connect_and_handshake(config, false)?;
     write_blocking_control(
         &mut stream,
         &mut control,
@@ -895,11 +1047,22 @@ fn resolve_endpoint(endpoint: &str) -> Result<SocketAddr, String> {
         .ok_or_else(|| format!("{endpoint}: no socket addresses resolved"))
 }
 
-fn pinned_server_public_key(config: &ClientConfig) -> Result<[u8; 32], String> {
+/// Resolves the Ed25519 key to pin for a connection.
+///
+/// A configured key is always pinned. With no configured key, `allow_tofu`
+/// returns `None` so the server's presented key is trusted on first use (open
+/// pairing), while a normal connection falls back to pinning the well-known dev
+/// server key.
+fn pinned_server_public_key(
+    config: &ClientConfig,
+    allow_tofu: bool,
+) -> Result<Option<[u8; 32]>, String> {
     match config.server_public_key.as_deref() {
         Some(public_key) => ed25519_public_key_from_hex(public_key)
+            .map(Some)
             .map_err(|error| format!("invalid configured server-public-key: {error}")),
-        None => Ok(dev_server_public_key()),
+        None if allow_tofu => Ok(None),
+        None => Ok(Some(dev_server_public_key())),
     }
 }
 
@@ -1009,7 +1172,7 @@ struct WorkerState {
     incoming_files: HashMap<FileTransferId, IncomingFile>,
     shutdown: bool,
     disconnect_reason: Option<String>,
-    auth_failure: Option<String>,
+    auth_failure: Option<(u16, String)>,
 }
 
 /// Keeps the outgoing voice media timestamp monotonic across capture-pipeline
@@ -2382,6 +2545,9 @@ impl WorkerState {
                     });
                 }
             }
+            ServerControl::OpenPaired { .. } => {
+                kvlog::warn!("unexpected open-paired on established session; ignoring");
+            }
             ServerControl::RoomJoined {
                 room_id,
                 history,
@@ -2661,7 +2827,7 @@ impl WorkerState {
             ServerControl::Error { code, message } => {
                 kvlog::warn!("server control error", error = message.as_str());
                 if self.session_id.is_none() && is_auth_failure_code(code) {
-                    self.auth_failure = Some(message);
+                    self.auth_failure = Some((code, message));
                     self.shutdown = true;
                 } else {
                     let _ = self.events.send(NetworkEvent::Error(message));
@@ -3741,6 +3907,7 @@ fn client_control_kind(control: &ClientControl) -> &'static str {
     match control {
         ClientControl::Authenticate { .. } => "authenticate",
         ClientControl::Pair { .. } => "pair",
+        ClientControl::OpenPair { .. } => "open_pair",
         ClientControl::JoinRoom { .. } => "join_room",
         ClientControl::SendChat { .. } => "send_chat",
         ClientControl::StartVoice { .. } => "start_voice",
@@ -3763,6 +3930,7 @@ fn client_control_kind(control: &ClientControl) -> &'static str {
 fn server_control_kind(control: &ServerControl) -> &'static str {
     match control {
         ServerControl::Authenticated { .. } => "authenticated",
+        ServerControl::OpenPaired { .. } => "open_paired",
         ServerControl::RoomJoined { .. } => "room_joined",
         ServerControl::Chat { .. } => "chat",
         ServerControl::Presence { .. } => "presence",
@@ -3795,6 +3963,8 @@ fn is_auth_failure_code(code: u16) -> bool {
             | ERROR_PAIRING_NOT_ACTIVE
             | ERROR_PAIRING_CODE_MISMATCH
             | ERROR_PAIRING_INVALID_REQUEST
+            | ERROR_PUBLIC_DISABLED
+            | ERROR_TOKEN_STALE_EPOCH
     )
 }
 
@@ -4390,6 +4560,12 @@ mod tests {
         schedule.reset();
 
         assert_eq!(schedule.next_delay(), Duration::from_secs(1));
+    }
+
+    #[test]
+    fn dynamic_token_rejections_are_auth_failures() {
+        assert!(is_auth_failure_code(ERROR_TOKEN_STALE_EPOCH));
+        assert!(is_auth_failure_code(ERROR_PUBLIC_DISABLED));
     }
 
     #[test]

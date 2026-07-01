@@ -1,6 +1,6 @@
 use extui::{
     Buffer, Ellipsis, HAlign, Rect,
-    event::{KeyCode, KeyEvent, KeyEventKind, MouseEvent},
+    event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent},
     vt::Modifier,
 };
 
@@ -162,6 +162,100 @@ impl AppMode for ConfirmMode {
             | KeyCode::BackTab
             | KeyCode::Char('h')
             | KeyCode::Char('l') => self.selected_confirm = !self.selected_confirm,
+            _ => {}
+        }
+        Action::Continue
+    }
+
+    fn process_mouse(&mut self, _app: &mut App, _mouse: MouseEvent) -> Action {
+        Action::Continue
+    }
+
+    fn presentation(&self, _app: &App) -> ModePresentation {
+        ModePresentation::OVERLAY
+    }
+}
+
+/// Transient overlay prompting for the open-pairing password.
+///
+/// The entered password is held verbatim but rendered as `*` characters. Enter
+/// submits it to the pairing worker, Esc cancels pairing.
+pub(crate) struct PasswordPromptMode {
+    input: String,
+    retry: bool,
+}
+
+impl PasswordPromptMode {
+    pub(crate) fn new(retry: bool) -> Self {
+        Self {
+            input: String::new(),
+            retry,
+        }
+    }
+}
+
+impl AppMode for PasswordPromptMode {
+    fn render(&mut self, app: &mut App, buf: &mut Buffer, _now_ms: u64) {
+        let theme = &app.theme;
+        let area = buf.rect();
+        if area.w < 24 || area.h < 6 {
+            return;
+        }
+        let width = area.w.min(54).max(24);
+        let height = area.h.min(6);
+        let panel = Rect {
+            x: area.x + area.w.saturating_sub(width) / 2,
+            y: area.y + area.h.saturating_sub(height) / 2,
+            w: width,
+            h: height,
+        };
+        buf.clear_rect(panel, theme.dialog_panel);
+
+        let mut rows = panel.inset(2, 1);
+        let prompt = if self.retry {
+            "Incorrect password, try again"
+        } else {
+            "Server password required"
+        };
+        rows.take_top(1)
+            .with(theme.dialog_header | Modifier::BOLD)
+            .with(HAlign::Center)
+            .with(Ellipsis(true))
+            .text(buf, prompt);
+        rows.take_top(1);
+        let masked = "*".repeat(self.input.chars().count());
+        rows.take_top(1)
+            .with(theme.dialog_panel.patch(theme.selected_focused))
+            .with(HAlign::Center)
+            .with(Ellipsis(true))
+            .text(buf, &masked);
+        rows.take_top(1);
+        rows.take_top(1)
+            .with(theme.dialog_panel.patch(theme.muted))
+            .with(HAlign::Center)
+            .with(Ellipsis(true))
+            .text(buf, "Enter to submit · Esc to cancel");
+    }
+
+    fn process_input(&mut self, app: &mut App, key: KeyEvent) -> Action {
+        if is_quit_key(&key) {
+            return Action::Quit;
+        }
+        if matches!(key.kind, KeyEventKind::Release) {
+            return Action::Continue;
+        }
+        match key.code {
+            KeyCode::Esc => app.cancel_open_pairing(),
+            KeyCode::Enter => {
+                let password = std::mem::take(&mut self.input);
+                app.submit_open_pair_password(password);
+            }
+            KeyCode::Backspace => {
+                self.input.pop();
+            }
+            KeyCode::Char(ch) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.input.push(ch);
+            }
             _ => {}
         }
         Action::Continue
