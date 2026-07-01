@@ -8,6 +8,7 @@ mod clipboard;
 mod config;
 mod config_diagnostics;
 mod fuzzy;
+mod highlight;
 mod local_control;
 mod room_history;
 mod runtime;
@@ -18,6 +19,7 @@ mod tui;
 mod ui;
 mod video;
 mod web_server;
+mod web_wire;
 
 pub(crate) use chatt::audio;
 pub(crate) use chatt::mdns;

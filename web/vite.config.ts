@@ -10,6 +10,7 @@ export default defineConfig({
     proxy: {
       "/ws": { target: "ws://127.0.0.1:8080", ws: true },
       "/files": { target: "http://127.0.0.1:8080" },
+      "/highlight": { target: "http://127.0.0.1:8080" },
     },
   },
 });

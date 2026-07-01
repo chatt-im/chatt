@@ -1,4 +1,5 @@
-// Mirrors the Rust DTOs in `src/web_server.rs`. Keep the two in sync.
+// Mirrors the Rust DTOs. Chat messages arrive as binary feed frames (decoded in
+// `feed.ts`, encoded in `src/web_wire.rs`); share control stays JSON text.
 
 export type MediaKind = "image" | "video" | "audio" | "file";
 
@@ -12,27 +13,29 @@ export interface WebAttachment {
   height: number | null;
 }
 
+// One piece of a message body. Prose renders as markdown; a code block renders
+// from its precomputed highlight spans (see `highlight.ts`). A code fragment's
+// `text` is UTF-8 bytes, because the spans are byte offsets into it.
+export type Fragment =
+  | { kind: "text"; text: string }
+  | { kind: "code"; lang: string; text: Uint8Array; spans: Uint8Array };
+
 export interface WebMessage {
   id: number;
   sender: string;
-  body: string;
   timestamp_ms: number;
   attachment: WebAttachment | null;
-  // The file transfer id for a file message, else null. A `message` frame with
-  // both file_id and timestamp_ms matching one already held replaces it in
-  // place; transfer ids alone are reused after server restarts.
+  // The file transfer id for a file message, else null. A message with both
+  // file_id and timestamp_ms matching one already held replaces it in place;
+  // transfer ids alone are reused after server restarts.
   file_id: number | null;
+  // The body pre-split into prose and code fragments.
+  fragments: Fragment[];
 }
 
-// One JSON object per WebSocket text frame.
-//
-// `oldest_seq` is the server-assigned sequence number of the first message in a
-// window. `has_more` is true when still-older history can be paged in. The
-// browser requests older history with a `load_older` frame (see ClientRequest).
+// One JSON object per WebSocket text frame. Chat sync/message/older frames are
+// binary now, so only screen-share control travels as JSON.
 export type ServerEnvelope =
-  | { type: "sync"; messages: WebMessage[]; oldest_seq: number; has_more: boolean }
-  | { type: "message"; message: WebMessage }
-  | { type: "older"; messages: WebMessage[]; oldest_seq: number; has_more: boolean }
   // A room member started sharing their screen. The browser shows a play button.
   | {
       type: "share_available";

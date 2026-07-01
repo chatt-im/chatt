@@ -26,10 +26,60 @@ impl RoutePath {
 /// embed does not cover.
 pub type EmbeddedResolver = fn(&str) -> Option<(&'static str, &'static str, &'static [u8])>;
 
+/// The request passed to a [generated route](Router::mount_generated) handler.
+pub struct GeneratedRequest<'a> {
+    /// The full request path.
+    pub path: &'a str,
+    /// The path with the mount prefix stripped, e.g. `report.txt` for a
+    /// `/highlight/report.txt` request on a `/highlight` mount.
+    pub relative: &'a str,
+    /// True for a `HEAD` request, whose body must be omitted.
+    pub is_head: bool,
+}
+
+/// A computed response from a generated-route handler.
+pub struct GeneratedResponse {
+    pub status: u16,
+    pub content_type: String,
+    pub body: Vec<u8>,
+}
+
+impl GeneratedResponse {
+    /// A `200 OK` response with the given body and content type.
+    pub fn ok(content_type: impl Into<String>, body: Vec<u8>) -> Self {
+        Self {
+            status: 200,
+            content_type: content_type.into(),
+            body,
+        }
+    }
+
+    /// An error response with an empty body.
+    pub fn error(status: u16) -> Self {
+        Self {
+            status,
+            content_type: "text/plain; charset=UTF-8".to_string(),
+            body: Vec::new(),
+        }
+    }
+}
+
+/// A handler that computes a response for any path under its mount prefix. It
+/// runs on the server's I/O thread pool, so it may block on disk or CPU without
+/// stalling the event loop.
+pub type GeneratedHandler = Arc<dyn Fn(&GeneratedRequest) -> GeneratedResponse + Send + Sync>;
+
+#[derive(Clone)]
+pub(crate) struct GeneratedMount {
+    pub(crate) prefix: RoutePath,
+    pub(crate) handler: GeneratedHandler,
+}
+
 #[derive(Clone, Default)]
 pub struct Router {
     static_assets: Vec<StaticAsset>,
     mounts: Vec<DirMount>,
+    generated: Vec<GeneratedMount>,
     websocket_routes: Vec<RoutePath>,
     embedded: Option<EmbeddedResolver>,
 }
@@ -122,6 +172,48 @@ impl Router {
         self.embedded.and_then(|resolver| resolver(path))
     }
 
+    /// Mounts a handler that computes responses for every path under `prefix`.
+    ///
+    /// The handler runs on the I/O thread pool, so it may read files or do
+    /// heavy work without blocking the event loop. It is consulted after static
+    /// routes and embedded assets, and before directory mounts, so a specific
+    /// generated prefix wins over a catch-all `/` static mount.
+    pub fn mount_generated(mut self, prefix: impl AsRef<str>, handler: GeneratedHandler) -> Self {
+        self.add_generated(prefix, handler);
+        self
+    }
+
+    pub fn add_generated(
+        &mut self,
+        prefix: impl AsRef<str>,
+        handler: GeneratedHandler,
+    ) -> &mut Self {
+        let mut prefix = RoutePath::parse(prefix.as_ref()).unwrap_or_else(|| {
+            panic!("invalid generated route prefix: {:?}", prefix.as_ref());
+        });
+        if prefix.0.len() > 1 {
+            while prefix.0.ends_with('/') {
+                prefix.0.pop();
+            }
+        }
+        self.generated.retain(|mount| mount.prefix != prefix);
+        self.generated.push(GeneratedMount { prefix, handler });
+        self
+    }
+
+    /// Resolves a request path to a generated handler and the path relative to
+    /// its mount prefix, choosing the longest matching prefix.
+    pub(crate) fn resolve_generated<'m, 'p>(
+        &'m self,
+        path: &'p RoutePath,
+    ) -> Option<(&'m GeneratedHandler, &'p str)> {
+        self.generated
+            .iter()
+            .filter_map(|mount| Some((mount, relative_to_prefix(&mount.prefix, path)?)))
+            .max_by_key(|(mount, _)| mount.prefix.as_str().len())
+            .map(|(mount, relative)| (&mount.handler, relative))
+    }
+
     pub fn websocket(mut self, path: impl AsRef<str>) -> Self {
         self.add_websocket(path);
         self
@@ -199,21 +291,27 @@ pub(crate) struct DirMount {
 
 impl DirMount {
     fn relative_path<'a>(&self, path: &'a RoutePath) -> Option<&'a str> {
-        let prefix = self.prefix.as_str();
-        let path = path.as_str();
-        if prefix == "/" {
-            return Some(path.trim_start_matches('/'));
-        }
-        if path == prefix {
-            return Some("");
-        }
-        path.strip_prefix(prefix)
-            .and_then(|rest| rest.strip_prefix('/'))
+        relative_to_prefix(&self.prefix, path)
     }
 
     pub(crate) fn root(&self) -> &Path {
         &self.root
     }
+}
+
+/// Strips a mount `prefix` from a request `path`, returning the remainder or
+/// [`None`] when the path is not under the prefix.
+fn relative_to_prefix<'a>(prefix: &RoutePath, path: &'a RoutePath) -> Option<&'a str> {
+    let prefix = prefix.as_str();
+    let path = path.as_str();
+    if prefix == "/" {
+        return Some(path.trim_start_matches('/'));
+    }
+    if path == prefix {
+        return Some("");
+    }
+    path.strip_prefix(prefix)
+        .and_then(|rest| rest.strip_prefix('/'))
 }
 
 pub(crate) struct ResolvedMount<'m, 'p> {

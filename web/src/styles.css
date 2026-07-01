@@ -419,3 +419,210 @@ body {
   transform-origin: 0 0;
   will-change: transform;
 }
+
+/* ---------------------------------------------------------------------------
+ * Syntax highlighting.
+ *
+ * The backend streams span buffers whose class byte indexes `HlClass` in
+ * `src/highlight.rs`; the frontend paints each run as `hl-<n>`. Colors are
+ * grouped so several fine-grained classes can share a hue. Class 0 (plain) is
+ * left unstyled and inherits the surrounding text color.
+ * ------------------------------------------------------------------------- */
+:root {
+  --hl-keyword: #cc7dd6;
+  --hl-type: #4ec9b0;
+  --hl-function: #dcdcaa;
+  --hl-variable: #9cdcfe;
+  --hl-string: #ce9178;
+  --hl-number: #b5cea8;
+  --hl-comment: #6a9955;
+  --hl-operator: #c4c4c4;
+  --hl-punctuation: #a6a6a6;
+  --hl-tag: #569cd6;
+  --hl-attr: #d7ba7d;
+  --hl-error: #f14c4c;
+}
+
+.hl-1,
+.hl-33 { color: var(--hl-keyword); }
+.hl-2 { color: var(--hl-type); }
+.hl-3,
+.hl-4,
+.hl-23 { color: var(--hl-function); }
+.hl-5,
+.hl-11,
+.hl-13 { color: var(--hl-attr); }
+.hl-6,
+.hl-7,
+.hl-8,
+.hl-9,
+.hl-10,
+.hl-25 { color: var(--hl-variable); }
+.hl-12,
+.hl-26,
+.hl-27 { color: var(--hl-type); }
+.hl-14,
+.hl-15 { color: var(--hl-string); }
+.hl-16 { color: var(--hl-error); }
+.hl-17 { color: var(--hl-number); }
+.hl-18,
+.hl-19,
+.hl-31,
+.hl-32 { color: var(--hl-comment); }
+.hl-20 { color: var(--hl-operator); }
+.hl-21,
+.hl-22 { color: var(--hl-punctuation); }
+.hl-24,
+.hl-30 { color: var(--hl-tag); }
+.hl-28 { color: var(--hl-tag); font-weight: 600; }
+.hl-29 { font-style: italic; }
+.hl-30 { text-decoration: underline; }
+.hl-34 { color: var(--hl-error); }
+
+/* A fenced code block in a message, rendered from highlight spans (not marked). */
+.code-block {
+  margin: 0.35em 0 0;
+  padding: var(--space);
+  background: var(--bg-code);
+  border: 1px solid var(--border);
+  overflow-x: auto;
+  font-family: var(--font-mono);
+  font-size: 0.88em;
+  line-height: 1.4;
+}
+
+.code-block code {
+  font-family: inherit;
+  white-space: pre;
+}
+
+/* ---------------------------------------------------------------------------
+ * File card and the expandable line-numbered viewer.
+ * ------------------------------------------------------------------------- */
+.media-file {
+  display: flex;
+  align-items: center;
+  gap: var(--space);
+}
+
+.media-file-open {
+  font: inherit;
+  color: var(--text-sender);
+  background: var(--bg-elevated);
+  border: 1px solid var(--border);
+  padding: 4px 10px;
+  cursor: pointer;
+}
+
+.media-file-open:hover {
+  border-color: var(--accent);
+}
+
+.media-file-download {
+  color: var(--text-dim);
+  font-size: 12px;
+  text-decoration: underline;
+}
+
+/* The viewer opens in a resizable side panel on wide screens (a flex sibling of
+ * the chat), and takes over the width as a full overlay when the window is
+ * narrow. */
+.app-body {
+  flex: 1 1 auto;
+  min-height: 0;
+  display: flex;
+  flex-direction: row;
+}
+
+.app-body .app-main {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.file-panel {
+  flex: 0 0 clamp(360px, 45%, 820px);
+  min-width: 0;
+  border-left: 1px solid var(--border);
+  background: var(--bg);
+}
+
+@media (max-width: 820px) {
+  .file-panel {
+    position: absolute;
+    inset: 0;
+    z-index: 20;
+    flex: none;
+    border-left: 0;
+  }
+}
+
+.file-viewer {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+}
+
+.file-viewer-head {
+  display: flex;
+  align-items: center;
+  gap: var(--space);
+  padding: var(--space);
+  border-bottom: 1px solid var(--border);
+  background: var(--bg-elevated);
+}
+
+.file-viewer-name {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text-sender);
+  font-family: var(--font-mono);
+  font-size: 0.9em;
+}
+
+.file-viewer-download,
+.file-viewer-close {
+  font: inherit;
+  font-size: 12px;
+  color: var(--text-dim);
+  background: none;
+  border: 0;
+  text-decoration: underline;
+  cursor: pointer;
+}
+
+.file-viewer-status {
+  padding: var(--space-lg);
+  color: var(--text-dim);
+}
+
+.file-viewer-body {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: auto;
+  font-family: var(--font-mono);
+  font-size: 0.85em;
+  line-height: 1.5;
+}
+
+/* One source line: a right-aligned number gutter and the highlighted text. The
+ * text keeps its whitespace and does not wrap, matching an editor. */
+.code-line {
+  display: flex;
+  white-space: pre;
+}
+
+.code-line-no {
+  flex: 0 0 auto;
+  width: 4em;
+  padding-right: var(--space);
+  text-align: right;
+  color: var(--text-dim);
+  user-select: none;
+}
+
+.code-line-text {
+  font-family: inherit;
+}
