@@ -79,18 +79,19 @@ storing the token or invite secret in plaintext config.
    carry the internal user identifier. The addresses come from
    `network.public-*`, not from the local bind addresses, so deployments behind
    NAT or DNS use their externally reachable connection details.
-3. The user runs `chatt join JOIN_STRING`. The client derives a local server
-   alias from the address, seeds the display name from the operating system
+3. The user runs `chatt pair JOIN_STRING`. The client derives a local server
+   label from the address, seeds the username from the operating system
    account name, and generates a long client token.
 4. The client performs the normal server-authenticated handshake. Inside the
    server-selected control channel, it sends `ClientControl::Pair` containing
-   the display name, invite secret, and new token. No user identifier is sent.
+   the display name derived from the username, invite secret, and new token. No
+   user identifier is sent.
 5. The server matches the invite by its secret, which selects the user the
    invite was issued for, removes the invite, rejects the token if its hash
    already belongs to another user, hashes the new token, creates or updates
    the `[[users]]` entry with `token-hash` and `display-name`, and authenticates
    the current session.
-6. After successful authentication, the client writes a named `[[servers]]`
+6. After successful authentication, the client writes a labeled `[[servers]]`
    entry with the generated token. The invite secret is never written to client
    config. Future logins use `ClientControl::Authenticate` with the token.
 
@@ -172,8 +173,8 @@ Client:
 
 - `src/config.rs`: client TOML fields in `ServerEntry` and runtime persistence
   in `write_runtime_config`.
-- `src/main.rs`: join-string setup UI in `run_join_setup` and named-server
-  persistence after successful pairing.
+- `src/cli/mod.rs`: join-string pairing CLI and named-server persistence after
+  successful pairing.
 - `src/client_net.rs`: server connection and handshake in
   `connect_and_handshake`; public key pin selection in
   `pinned_server_public_key`; first auth or pairing message in

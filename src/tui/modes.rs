@@ -64,22 +64,22 @@ impl ServerListMode {
         }
     }
 
-    fn selected_alias(&self, app: &App) -> Option<String> {
+    fn selected_label(&self, app: &App) -> Option<String> {
         self.select
             .current_item_index()
             .and_then(|index| app.server_items().get(index))
-            .map(|item| item.alias.clone())
+            .map(|item| item.label.clone())
     }
 
     pub(crate) fn process_action(&mut self, app: &mut App, command: BindCommand) -> Action {
         use BindCommand::*;
         match command {
             Activate => {
-                let Some(alias) = self.selected_alias(app) else {
+                let Some(label) = self.selected_label(app) else {
                     app.set_error("no server selected");
                     return Action::Continue;
                 };
-                if app.start_network(&alias) {
+                if app.start_network(&label) {
                     app.push_mode(Box::new(RoomMode::default()));
                 }
             }
@@ -90,24 +90,24 @@ impl ServerListMode {
                 self.select.move_selection(-1);
             }
             EditServer => {
-                let Some(alias) = self.selected_alias(app) else {
+                let Some(label) = self.selected_label(app) else {
                     app.set_error("no server selected");
                     return Action::Continue;
                 };
-                app.open_server_edit(&alias);
+                app.open_server_edit(&label);
             }
             DeleteServer => {
-                let Some(alias) = self.selected_alias(app) else {
+                let Some(label) = self.selected_label(app) else {
                     app.set_error("no server selected");
                     return Action::Continue;
                 };
-                let prompt = format!("Delete server '{alias}'?");
+                let prompt = format!("Delete server '{label}'?");
                 app.push_mode(Box::new(ConfirmMode::new(
                     prompt,
                     "Delete",
                     "Cancel",
                     move |app| {
-                        app.delete_server(&alias);
+                        app.delete_server(&label);
                         ConfirmDisposition::Transition(ModeTransition::Pop)
                     },
                 )));

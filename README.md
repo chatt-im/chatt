@@ -147,10 +147,10 @@ Invite a configured user from a running server:
 cargo run -p server -- invite alice
 ```
 
-Join from the generated string:
+Pair from the generated string:
 
 ```sh
-cargo run -p chatt -- join tcj1_...
+cargo run -p chatt -- pair tcj1_...
 ```
 
 Upload a file into an already running client session:
@@ -263,22 +263,19 @@ Important client fields:
 active-server = "local"
 
 [[servers]]
-alias = "local"
-display-name = "Alice"
+label = "local"
+username = "Alice"
 token = "alice-dev-token"
 server-public-key = ""
 tcp-addr = "127.0.0.1:41000"
 room-id = 1
 ```
 
-`active-server` selects one `[[servers]]` entry. `alias` is the local name for
+`active-server` selects one `[[servers]]` entry. `label` is the local name for
 that server. `token` is the secret that identifies the client to the server, so
-there is no separate user field. `display-name` is the name shown in chat.
+there is no separate user field. `username` is the name shown in chat.
 `server-public-key` is pinned from the server invite; if it is empty, the client
 falls back to the compiled development server key.
-
-Older configs may still contain a `user` key. It is now ignored and removed the
-next time the client saves its config.
 
 UDP media shares `tcp-addr` by default. Set `udp-addr` only when the server uses
 a separate UDP media address.
@@ -401,17 +398,17 @@ cargo run -p server -- invite dana
 The `dana` value is the server's internal user identifier. It does not need to
 exist in TOML yet; successful pairing creates or updates the `[[users]]` entry.
 
-3. On the client, join with the printed string:
+3. On the client, pair with the printed string:
 
 ```sh
-cargo run -p chatt -- join tcj1_...
+cargo run -p chatt -- pair tcj1_...
 ```
 
-The client derives a server alias from the address and seeds the display name
+The client derives a server label from the address and seeds the username
 from the operating system account name, then pairs over the normal encrypted
-control channel. On successful pairing, the client writes a named `[[servers]]`
+control channel. On successful pairing, the client writes a labeled `[[servers]]`
 entry with the new token, and the server writes `token-hash` plus the
-`display-name`. The display name is editable afterward in settings. Invites are
+`display-name`. The username is editable afterward in the server editor. Invites are
 only held in server memory and are removed when replaced, expired, or
 successfully used.
 

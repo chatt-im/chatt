@@ -50,14 +50,14 @@ without a subcommand to launch the interactive client.",
     ],
     subs: &[
         Command {
-            name: "join",
+            name: "pair",
             aliases: &[],
-            about: "Join a call from an invite ticket.",
+            about: "Pair with a server from an invite ticket.",
             long_about: "",
             args: &[Arg {
                 name: "join_string",
                 value_name: "JOIN_STRING",
-                help: "The invite ticket to decode and join",
+                help: "The invite ticket to decode for pairing",
                 required: true,
                 possible: &[],
             }],
@@ -224,8 +224,8 @@ X11 desktop with the built-in ffmpeg command, or pass `--ffmpeg <ARGV>` after \
     ],
     examples: &[
         Example {
-            cmd: "join <TICKET>",
-            help: "Join a call from an invite ticket.",
+            cmd: "pair <JOIN_STRING>",
+            help: "Pair with a server from an invite ticket.",
         },
         Example {
             cmd: "upload ./photo.png",
@@ -327,7 +327,7 @@ fn dispatch(matches: &Matches) -> Result<(), Box<dyn std::error::Error>> {
     let config_path = matches.value_of("config");
 
     match matches.subcommand() {
-        Some(("join", sub)) => {
+        Some(("pair", sub)) => {
             let join_string = sub.value_of("join_string").unwrap_or_default();
             let ticket = rpc::control::decode_invite_ticket(join_string)?;
             let config = Config::load(config_path)?;
@@ -697,6 +697,14 @@ mod tests {
     }
 
     #[test]
+    fn parses_pair_subcommand() {
+        let matches = run_matches(&["chatt", "pair", "tcj1_abc"]);
+        let (name, sub) = matches.subcommand().unwrap();
+        assert_eq!(name, "pair");
+        assert_eq!(sub.value_of("join_string"), Some("tcj1_abc"));
+    }
+
+    #[test]
     fn parses_test_audio_playback_subcommand_after_value_options() {
         let matches = run_matches(&[
             "chatt",
@@ -773,6 +781,7 @@ mod tests {
     fn unknown_flag_and_subcommand_error() {
         assert!(command::parse(&ROOT, &argv(&["chatt", "--bogus"])).is_err());
         assert!(command::parse(&ROOT, &argv(&["chatt", "frobnicate"])).is_err());
+        assert!(command::parse(&ROOT, &argv(&["chatt", "join", "tcj1_abc"])).is_err());
     }
 
     #[test]

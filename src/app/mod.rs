@@ -153,13 +153,13 @@ impl ServerCatalog {
             .servers
             .iter()
             .map(|server| ServerSelectItem {
-                alias: server.alias.clone(),
-                display_name: server.display_name.clone(),
+                label: server.label.clone(),
+                username: server.username.clone(),
                 tcp_addr: server.tcp_addr.clone(),
                 room_id: server.room_id,
                 search_text: format!(
                     "{} {} {} {}",
-                    server.alias, server.display_name, server.tcp_addr, server.room_id
+                    server.label, server.username, server.tcp_addr, server.room_id
                 ),
             })
             .collect();
@@ -726,7 +726,7 @@ impl App {
         if let Some(ticket) = pending_invite {
             app.start_join_pairing(ticket);
         } else if app.config.servers.is_empty() {
-            app.set_status("no servers configured; run chatt join JOIN_STRING");
+            app.set_status("no servers configured; run chatt pair JOIN_STRING");
         }
         Ok(app)
     }
@@ -925,35 +925,35 @@ impl App {
         self.request_mode_transition(ModeTransition::Set(Box::new(ServerListMode::new())));
         self.rebuild_server_items();
         if self.config.servers.is_empty() {
-            self.set_status("no servers configured; run chatt join JOIN_STRING");
+            self.set_status("no servers configured; run chatt pair JOIN_STRING");
         } else {
             self.set_status("select a server");
         }
     }
 
-    pub(crate) fn open_server_edit(&mut self, alias: &str) {
-        let Some((server_alias, draft)) = self.server_edit_draft(alias) else {
+    pub(crate) fn open_server_edit(&mut self, label: &str) {
+        let Some((server_label, draft)) = self.server_edit_draft(label) else {
             return;
         };
         self.push_mode(Box::new(ServerEditMode::new(draft)));
-        self.set_status(format!("editing server {server_alias}"));
+        self.set_status(format!("editing server {server_label}"));
     }
 
-    pub(crate) fn replace_with_server_edit(&mut self, alias: &str) {
-        let Some((server_alias, draft)) = self.server_edit_draft(alias) else {
+    pub(crate) fn replace_with_server_edit(&mut self, label: &str) {
+        let Some((server_label, draft)) = self.server_edit_draft(label) else {
             return;
         };
         self.replace_mode(Box::new(ServerEditMode::new(draft)));
-        self.set_status(format!("editing server {server_alias}"));
+        self.set_status(format!("editing server {server_label}"));
     }
 
-    fn server_edit_draft(&mut self, alias: &str) -> Option<(String, ServerEditDraft)> {
-        let Ok(server) = self.config.server(alias).cloned() else {
-            self.set_error(format!("server {alias} is not configured"));
+    fn server_edit_draft(&mut self, label: &str) -> Option<(String, ServerEditDraft)> {
+        let Ok(server) = self.config.server(label).cloned() else {
+            self.set_error(format!("server {label} is not configured"));
             return None;
         };
         let draft = ServerEditDraft::from_server(&server, self.config.ui.form_bindings);
-        Some((server.alias, draft))
+        Some((server.label, draft))
     }
 
     pub(crate) fn start_network(&mut self, alias: &str) -> bool {
@@ -993,7 +993,7 @@ impl App {
             };
         let history_id = crate::room_history::derive_server_id(&server.token);
         self.room.connect_to_server(
-            server.alias.clone(),
+            server.label.clone(),
             history_id,
             server.effective_display_name(),
         );
@@ -1417,7 +1417,7 @@ impl App {
                     self.set_status("pairing succeeded");
                     return;
                 };
-                let alias = pair.server.alias.clone();
+                let alias = pair.server.label.clone();
                 self.config.upsert_server(pair.server);
                 match self.config.save_runtime() {
                     Ok(path) => {
@@ -1588,12 +1588,12 @@ impl App {
         false
     }
 
-    pub(crate) fn delete_server(&mut self, alias: &str) {
-        self.config.servers.retain(|server| server.alias != alias);
+    pub(crate) fn delete_server(&mut self, label: &str) {
+        self.config.servers.retain(|server| server.label != label);
         self.config
             .user_audio
-            .retain(|preference| preference.server_alias != alias);
-        if self.room.server_alias == alias {
+            .retain(|preference| preference.server_alias != label);
+        if self.room.server_alias == label {
             self.disconnect_network();
             self.room.reset_for_server_list();
         }
@@ -1602,7 +1602,7 @@ impl App {
                 self.config.config_path = Some(path.clone());
                 self.rebuild_server_items();
                 self.set_status(format!(
-                    "deleted {alias}; config saved to {}",
+                    "deleted {label}; config saved to {}",
                     path.display()
                 ));
             }
@@ -1618,37 +1618,37 @@ impl App {
                 return;
             }
         };
-        let original_alias = update.original_alias;
+        let original_label = update.original_label;
         let server = update.server;
-        if server.alias != original_alias
+        if server.label != original_label
             && self
                 .config
                 .servers
                 .iter()
-                .any(|existing| existing.alias == server.alias)
+                .any(|existing| existing.label == server.label)
         {
-            self.set_error(format!("server alias {} already exists", server.alias));
+            self.set_error(format!("server label {} already exists", server.label));
             return;
         }
-        let alias = server.alias.clone();
+        let label = server.label.clone();
         if let Some(existing) = self
             .config
             .servers
             .iter_mut()
-            .find(|existing| existing.alias == original_alias)
+            .find(|existing| existing.label == original_label)
         {
             *existing = server;
         } else {
             self.config.upsert_server(server);
         }
-        if alias != original_alias {
+        if label != original_label {
             for preference in &mut self.config.user_audio {
-                if preference.server_alias == original_alias {
-                    preference.server_alias = alias.clone();
+                if preference.server_alias == original_label {
+                    preference.server_alias = label.clone();
                 }
             }
-            if self.room.server_alias == original_alias {
-                self.room.server_alias = alias.clone();
+            if self.room.server_alias == original_label {
+                self.room.server_alias = label.clone();
             }
         }
         match self.config.save_runtime() {
@@ -1656,7 +1656,7 @@ impl App {
                 self.config.config_path = Some(path.clone());
                 self.rebuild_server_items();
                 if join_after_save {
-                    if self.start_network(&alias) {
+                    if self.start_network(&label) {
                         self.replace_mode(Box::new(RoomMode::default()));
                     }
                 } else {
@@ -3946,8 +3946,8 @@ mod tests {
         draft.set_active_editor_text("Alice Dev");
 
         let server = draft.to_update().unwrap().server;
-        assert_eq!(server.alias, "local-dev");
-        assert_eq!(server.display_name, "Alice Dev");
+        assert_eq!(server.label, "local-dev");
+        assert_eq!(server.username, "Alice Dev");
     }
 
     #[test]
@@ -4212,7 +4212,7 @@ mod tests {
             std::env::temp_dir().join(format!("chatt-delete-test-{}.toml", std::process::id()));
         app.config.config_path = Some(temp_config.clone());
         app.config.servers.push(crate::config::ServerEntry {
-            alias: "s1".to_string(),
+            label: "s1".to_string(),
             ..Default::default()
         });
         app.rebuild_server_items();
@@ -4250,7 +4250,7 @@ mod tests {
         let mut app = test_app();
         let initial_generation = app.server_catalog.generation();
         app.config.servers.push(crate::config::ServerEntry {
-            alias: "s1".to_string(),
+            label: "s1".to_string(),
             ..Default::default()
         });
 
