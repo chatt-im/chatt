@@ -544,6 +544,43 @@ fn share_ended_envelope(stream_id: StreamId) -> String {
     jsony::object! { type: "share_ended", stream_id: stream_id.0 }
 }
 
+/// Parses an `/upload-rate` argument into bytes per second. Accepts `off`/`none`
+/// (unlimited, `0`), a plain byte count, or a count with a `K`/`M`/`G` suffix
+/// (powers of 1024).
+fn parse_upload_rate(arg: &str) -> Result<u64, String> {
+    let arg = arg.trim();
+    if arg.is_empty() {
+        return Err("usage: /upload-rate 200K|off".to_string());
+    }
+    if arg.eq_ignore_ascii_case("off") || arg.eq_ignore_ascii_case("none") {
+        return Ok(0);
+    }
+    let (digits, multiplier) = match arg.as_bytes().last() {
+        Some(b'k' | b'K') => (&arg[..arg.len() - 1], 1024),
+        Some(b'm' | b'M') => (&arg[..arg.len() - 1], 1024 * 1024),
+        Some(b'g' | b'G') => (&arg[..arg.len() - 1], 1024 * 1024 * 1024),
+        _ => (arg, 1),
+    };
+    let value: u64 = digits
+        .trim()
+        .parse()
+        .map_err(|_| format!("invalid upload rate: {arg}"))?;
+    Ok(value.saturating_mul(multiplier))
+}
+
+/// The `file_progress` envelope updating a placeholder file message's progress
+/// bar. Keyed by `file_id` (the server transfer id) plus `timestamp_ms`, matching
+/// the browser's placeholder upsert. Dropped once the enriched attachment arrives.
+fn file_progress_envelope(file_id: u64, timestamp_ms: u64, transferred: u64, total: u64) -> String {
+    jsony::object! {
+        type: "file_progress",
+        file_id: file_id,
+        timestamp_ms: timestamp_ms,
+        transferred: transferred,
+        total: total,
+    }
+}
+
 /// The `share_error` envelope reporting a failed play request to the browser
 /// that issued it, since the requester is watching the web view, not the TUI.
 fn share_error_envelope(stream_id: StreamId, message: &str) -> String {
@@ -1532,6 +1569,7 @@ impl App {
                         dimensions,
                     ));
                 }
+                self.room.clear_transfer(metadata.transfer_id);
                 self.room.file_received(
                     metadata.transfer_id,
                     metadata.timestamp_ms,
@@ -1539,6 +1577,27 @@ impl App {
                     metadata.size,
                     dimensions,
                 );
+            }
+            NetworkEvent::TransferProgress {
+                transfer_id,
+                timestamp_ms,
+                transferred,
+                total,
+                direction,
+            } => {
+                self.room
+                    .transfer_progress(transfer_id, transferred, total, direction);
+                if let Some(feed) = &self.web_feed {
+                    feed.send_file_progress(file_progress_envelope(
+                        transfer_id.0,
+                        timestamp_ms,
+                        transferred,
+                        total,
+                    ));
+                }
+            }
+            NetworkEvent::TransferCanceled { transfer_id } => {
+                self.room.clear_transfer(transfer_id);
             }
             NetworkEvent::Presence {
                 participant,
@@ -3070,6 +3129,10 @@ impl App {
             "/whoami" => self.show_current_user(),
             "/upload" => self.set_error("usage: /upload file_path/filename.ext"),
             command if command.starts_with("/upload ") => self.upload_file_command(command),
+            "/upload-rate" => self.set_error("usage: /upload-rate 200K|off"),
+            command if command.starts_with("/upload-rate ") => {
+                self.set_upload_rate_command(command)
+            }
             "/report-bug" => self.set_error("usage: /report-bug what went wrong"),
             command if command.starts_with("/report-bug ") => {
                 let description = command.trim_start_matches("/report-bug ").trim();
@@ -3104,6 +3167,23 @@ impl App {
         } else {
             self.set_error("select a server before uploading files");
         }
+    }
+
+    fn set_upload_rate_command(&mut self, command: &str) {
+        let arg = command.trim_start_matches("/upload-rate ").trim();
+        let rate = match parse_upload_rate(arg) {
+            Ok(rate) => rate,
+            Err(message) => {
+                self.set_error(message);
+                return;
+            }
+        };
+        if self.network.is_none() {
+            self.set_error("select a server before setting the upload rate");
+            return;
+        }
+        // The worker acknowledges with a `Status` event, so no status is set here.
+        self.send_network_command(NetworkCommand::SetUploadRate(rate), true);
     }
 
     /// Opens the filename confirmation dialog for a pasted image or file.
@@ -3940,6 +4020,8 @@ fn network_event_kind(event: &NetworkEvent) -> &'static str {
         NetworkEvent::RoomJoined { .. } => "room_joined",
         NetworkEvent::Chat(_) => "chat",
         NetworkEvent::FileReceived { .. } => "file_received",
+        NetworkEvent::TransferProgress { .. } => "transfer_progress",
+        NetworkEvent::TransferCanceled { .. } => "transfer_canceled",
         NetworkEvent::Presence { .. } => "presence",
         NetworkEvent::VoiceStarted { .. } => "voice_started",
         NetworkEvent::VoiceStopped { .. } => "voice_stopped",
@@ -3979,6 +4061,7 @@ fn app_network_command_kind(command: &NetworkCommand) -> &'static str {
         NetworkCommand::StartShare { .. } => "start_share",
         NetworkCommand::StopShare { .. } => "stop_share",
         NetworkCommand::ReportBug { .. } => "report_bug",
+        NetworkCommand::SetUploadRate(_) => "set_upload_rate",
         NetworkCommand::Shutdown => "shutdown",
     }
 }
@@ -4003,6 +4086,20 @@ mod tests {
 
     fn test_app() -> App {
         App::new(Config::default(), None).expect("test app")
+    }
+
+    #[test]
+    fn parse_upload_rate_accepts_suffixes_and_off() {
+        assert_eq!(parse_upload_rate("off"), Ok(0));
+        assert_eq!(parse_upload_rate("none"), Ok(0));
+        assert_eq!(parse_upload_rate("0"), Ok(0));
+        assert_eq!(parse_upload_rate("500000"), Ok(500_000));
+        assert_eq!(parse_upload_rate("200K"), Ok(200 * 1024));
+        assert_eq!(parse_upload_rate("2m"), Ok(2 * 1024 * 1024));
+        assert_eq!(parse_upload_rate("1G"), Ok(1024 * 1024 * 1024));
+        assert!(parse_upload_rate("").is_err());
+        assert!(parse_upload_rate("fast").is_err());
+        assert!(parse_upload_rate("12x").is_err());
     }
 
     fn pending_open_pair(label: &str) -> PendingPair {

@@ -29,6 +29,10 @@ export interface WebMessage {
   // file_id and timestamp_ms matching one already held replaces it in place;
   // transfer ids alone are reused after server restarts.
   file_id: number | null;
+  // Live receive progress for an in-flight file, set from `file_progress`
+  // envelopes while the host client pulls the file off the relay. Cleared when
+  // the enriched attachment replaces the placeholder.
+  progress?: { transferred: number; total: number };
   // The body pre-split into prose and code fragments.
   fragments: Fragment[];
 }
@@ -53,6 +57,9 @@ export type ServerEnvelope =
   | { type: "share_ended"; stream_id: number }
   // A play request failed; show the message on the share's row.
   | { type: "share_error"; stream_id: number; message: string }
+  // Live receive progress for an in-flight file, merged into the placeholder
+  // message matched by `file_id` and `timestamp_ms`.
+  | { type: "file_progress"; file_id: number; timestamp_ms: number; transferred: number; total: number }
   // Sent once on connect. `readonly` true hides the compose box.
   | { type: "config"; readonly: boolean };
 

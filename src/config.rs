@@ -78,6 +78,7 @@ impl ServerEntry {
             file_receive_dir: files.receive_dir_path(),
             max_upload_bytes: files.max_upload_bytes,
             max_receive_bytes: files.max_receive_bytes,
+            upload_rate_bytes: files.upload_rate_bytes,
             candidate_privacy: p2p.candidate_privacy,
             prefer_ipv6: p2p.prefer_ipv6,
         }
@@ -351,6 +352,10 @@ pub enum FormBindings {
     Vim,
 }
 
+/// Default upload pacing ceiling. `0` disables throttling: uploads stream at
+/// full socket speed.
+pub const DEFAULT_UPLOAD_RATE_BYTES: u64 = 0;
+
 #[derive(Clone, Debug, Toml)]
 #[toml(FromToml, ToToml, rename_all = "kebab-case")]
 pub struct FileConfig {
@@ -358,6 +363,11 @@ pub struct FileConfig {
     pub max_upload_bytes: u64,
     #[toml(default = DEFAULT_FILE_SIZE_LIMIT_BYTES)]
     pub max_receive_bytes: u64,
+    /// Upload pacing ceiling in bytes per second. `0` streams at full socket
+    /// speed. Primarily a test lever to stretch a transfer so its progress is
+    /// observable, and a mild bandwidth cap.
+    #[toml(default = DEFAULT_UPLOAD_RATE_BYTES)]
+    pub upload_rate_bytes: u64,
     #[toml(default)]
     pub receive_dir: String,
 }
@@ -367,6 +377,7 @@ impl Default for FileConfig {
         Self {
             max_upload_bytes: DEFAULT_FILE_SIZE_LIMIT_BYTES,
             max_receive_bytes: DEFAULT_FILE_SIZE_LIMIT_BYTES,
+            upload_rate_bytes: DEFAULT_UPLOAD_RATE_BYTES,
             receive_dir: String::new(),
         }
     }

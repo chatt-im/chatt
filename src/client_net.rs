@@ -97,7 +97,10 @@ const MAX_FILE_CHUNKS_PER_TICK: usize = 64;
 /// Capacity of the reusable TCP read scratch buffer. Sized to swallow a full
 /// file chunk frame in one `read` on a fast link.
 const TCP_READ_BUFFER_BYTES: usize = 256 * 1024;
-const FILE_PROGRESS_STEP_BYTES: u64 = 1024 * 1024;
+/// Byte step between [`NetworkEvent::TransferProgress`] ticks. Small enough for a
+/// smooth progress bar, coarse enough to keep the event channel and web feed from
+/// flooding on a fast transfer. First and final ticks are always emitted.
+const FILE_PROGRESS_STEP_BYTES: u64 = 256 * 1024;
 const ENCODER_FEEDBACK_ALPHA: f32 = 0.35;
 const ENCODER_PROFILE_HOLD: Duration = Duration::from_secs(10);
 const MAX_COMMANDS_PER_ITERATION: usize = 8;
@@ -121,6 +124,10 @@ pub struct ClientConfig {
     pub file_receive_dir: Option<PathBuf>,
     pub max_upload_bytes: u64,
     pub max_receive_bytes: u64,
+    /// Upload pacing ceiling in bytes per second, `0` for unlimited. Seeds
+    /// [`UploadThrottle`] and is adjustable at runtime via
+    /// [`NetworkCommand::SetUploadRate`].
+    pub upload_rate_bytes: u64,
     pub candidate_privacy: crate::config::CandidatePrivacy,
     pub prefer_ipv6: bool,
 }
@@ -179,7 +186,18 @@ pub enum NetworkCommand {
         /// zstd-compressed recent log text.
         compressed_logs: Vec<u8>,
     },
+    /// Sets the upload pacing ceiling in bytes per second, `0` for unlimited.
+    SetUploadRate(u64),
     Shutdown,
+}
+
+/// Which side of a file transfer a [`NetworkEvent::TransferProgress`] describes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TransferDirection {
+    /// A file being received from the relay.
+    Incoming,
+    /// A file being uploaded to the relay.
+    Outgoing,
 }
 
 #[derive(Clone, Debug)]
@@ -202,6 +220,23 @@ pub enum NetworkEvent {
         /// Intrinsic pixel size, parsed from the file's header as it streamed.
         /// `Some` only for images whose header fit the captured prefix.
         dimensions: Option<(u32, u32)>,
+    },
+    /// A live byte-count update for an in-flight file transfer, correlated to the
+    /// chat announcement by the server `transfer_id`. Emitted at coarse steps plus
+    /// mandatory first and final ticks. A tick with `transferred == total` is
+    /// terminal for the progress overlay.
+    TransferProgress {
+        transfer_id: FileTransferId,
+        /// Announcement timestamp, the web upsert key alongside `transfer_id`.
+        timestamp_ms: u64,
+        transferred: u64,
+        total: u64,
+        direction: TransferDirection,
+    },
+    /// A file transfer failed or was canceled before completion. Clears any
+    /// progress overlay for `transfer_id`.
+    TransferCanceled {
+        transfer_id: FileTransferId,
     },
     Presence {
         room_id: RoomId,
@@ -710,6 +745,7 @@ fn run_worker_inner(
         next_interface_poll: Instant::now() + INTERFACE_POLL_INTERVAL,
         next_file_transfer: 1,
         outgoing_uploads: VecDeque::new(),
+        upload_throttle: UploadThrottle::new(config.upload_rate_bytes),
         pending_local_files: HashMap::new(),
         next_bug_report: 1,
         outgoing_bug_reports: VecDeque::new(),
@@ -797,6 +833,7 @@ fn run_worker_inner(
         if worker.shutdown {
             break;
         }
+        worker.upload_throttle.refill(Instant::now());
         if let Err(error) = worker.poll_uploads() {
             return SessionEnd::Disconnected(error);
         }
@@ -820,14 +857,34 @@ fn run_worker_inner(
         // `POLL_TIMEOUT`. This only applies while `write_buf` is below the
         // backpressure gate: once the socket refuses more (`write_buf` past the
         // gate after a `WouldBlock`), the loop parks on the writable edge rather
-        // than busy-looping.
-        let transfers_ready = worker.write_buf.len() <= MAX_QUEUED_FILE_BYTES
-            && (!worker.outgoing_uploads.is_empty() || !worker.outgoing_bug_reports.is_empty());
-        poll_timeout = if command_drain == CommandDrainOutcome::HitLimit || transfers_ready {
+        // than busy-looping. A throttled upload whose token bucket is empty parks
+        // on the refill delay instead of spinning.
+        let write_ok = worker.write_buf.len() <= MAX_QUEUED_FILE_BYTES;
+        let bug_ready = write_ok && !worker.outgoing_bug_reports.is_empty();
+        let upload_delay = if write_ok {
+            worker.outgoing_uploads.front().map(|front| {
+                let remaining = front.size.saturating_sub(front.offset);
+                if !front.started || remaining == 0 {
+                    // Start and complete controls carry no bytes, so they are not
+                    // throttled.
+                    Duration::ZERO
+                } else {
+                    worker
+                        .upload_throttle
+                        .delay_until(remaining.min(MAX_FILE_CHUNK_BYTES as u64))
+                }
+            })
+        } else {
+            None
+        };
+        poll_timeout = if command_drain == CommandDrainOutcome::HitLimit || bug_ready {
             Duration::ZERO
         } else {
             POLL_TIMEOUT
         };
+        if let Some(delay) = upload_delay {
+            poll_timeout = poll_timeout.min(delay);
+        }
         if let Some(deadline) = worker.mdns.next_timeout(now) {
             poll_timeout = poll_timeout.min(deadline);
         }
@@ -1206,6 +1263,7 @@ struct WorkerState {
     next_interface_poll: Instant,
     next_file_transfer: u64,
     outgoing_uploads: VecDeque<OutgoingUpload>,
+    upload_throttle: UploadThrottle,
     pending_local_files: HashMap<FileTransferId, PendingLocalFile>,
     next_bug_report: u64,
     outgoing_bug_reports: VecDeque<OutgoingBugReport>,
@@ -1460,6 +1518,75 @@ fn voice_sequence_distance_forward(from: u32, to: u32) -> Option<u32> {
         Some(distance)
     } else {
         None
+    }
+}
+
+/// A token bucket that paces upload chunk emission to a byte-per-second ceiling.
+///
+/// A `rate` of `0` disables pacing: [`budget`](Self::budget) is unbounded and the
+/// other operations are no-ops. Otherwise tokens accrue at `rate` bytes per
+/// second, capped at one second's worth so a poll loop that parked between
+/// transfers cannot bank credit and then burst.
+struct UploadThrottle {
+    /// Ceiling in bytes per second. `0` disables throttling.
+    rate: u64,
+    /// Byte budget available for the next chunk.
+    tokens: u64,
+    /// When `tokens` was last refilled.
+    last: Instant,
+}
+
+impl UploadThrottle {
+    fn new(rate: u64) -> Self {
+        Self {
+            rate,
+            tokens: rate,
+            last: Instant::now(),
+        }
+    }
+
+    /// Replaces the rate, clamping the current budget to the new ceiling.
+    fn set_rate(&mut self, rate: u64) {
+        self.rate = rate;
+        self.tokens = self.tokens.min(rate);
+    }
+
+    /// Accrues tokens for the elapsed time, capped at one second's worth.
+    fn refill(&mut self, now: Instant) {
+        if self.rate == 0 {
+            return;
+        }
+        let elapsed = now.saturating_duration_since(self.last).as_secs_f64();
+        self.last = now;
+        let gained = (elapsed * self.rate as f64) as u64;
+        self.tokens = self.tokens.saturating_add(gained).min(self.rate);
+    }
+
+    /// The byte budget for the next chunk, [`u64::MAX`] when unthrottled.
+    fn budget(&self) -> u64 {
+        if self.rate == 0 {
+            u64::MAX
+        } else {
+            self.tokens
+        }
+    }
+
+    /// Deducts `bytes` after a chunk is queued.
+    fn consume(&mut self, bytes: u64) {
+        if self.rate == 0 {
+            return;
+        }
+        self.tokens = self.tokens.saturating_sub(bytes);
+    }
+
+    /// The delay until `bytes` of budget accrues, for parking the poll loop
+    /// instead of busy-spinning. Zero when already available or unthrottled.
+    fn delay_until(&self, bytes: u64) -> Duration {
+        if self.rate == 0 || self.tokens >= bytes {
+            return Duration::ZERO;
+        }
+        let needed = bytes - self.tokens;
+        Duration::from_secs_f64(needed as f64 / self.rate as f64)
     }
 }
 
@@ -1967,6 +2094,17 @@ impl WorkerState {
             NetworkCommand::UploadFile(request) => {
                 self.queue_file_upload(request);
             }
+            NetworkCommand::SetUploadRate(rate) => {
+                self.upload_throttle.set_rate(rate);
+                let label = if rate == 0 {
+                    "unlimited".to_string()
+                } else {
+                    format!("{}/s", format_bytes(rate))
+                };
+                let _ = self
+                    .events
+                    .send(NetworkEvent::Status(format!("upload rate set to {label}")));
+            }
             NetworkCommand::LocalVoicePacket(frame) => {
                 if let Some(stream_id) = self.active_stream {
                     let sequence = allocate_local_voice_sequence(&mut self.local_sequence);
@@ -2273,7 +2411,16 @@ impl WorkerState {
         }
 
         if upload.offset < upload.size {
-            let remaining = (upload.size - upload.offset).min(MAX_FILE_CHUNK_BYTES as u64);
+            let budget = self.upload_throttle.budget();
+            if budget == 0 {
+                // Bucket empty: stop the pump and let the poll loop park on the
+                // refill delay rather than busy-spin.
+                self.outgoing_uploads.push_front(upload);
+                return Ok(false);
+            }
+            let remaining = (upload.size - upload.offset)
+                .min(MAX_FILE_CHUNK_BYTES as u64)
+                .min(budget);
             let mut data = vec![0; remaining as usize];
             let read = upload
                 .file
@@ -2284,6 +2431,11 @@ impl WorkerState {
                     transfer_id: upload.transfer_id,
                     reason: "local file ended early".to_string(),
                 })?;
+                if let Some(meta) = upload.server_metadata.as_ref() {
+                    let _ = self.events.send(NetworkEvent::TransferCanceled {
+                        transfer_id: meta.transfer_id,
+                    });
+                }
                 return Err(format!("file ended early while uploading {}", upload.name));
             }
             data.truncate(read);
@@ -2306,17 +2458,24 @@ impl WorkerState {
                 offset,
                 data,
             })?;
+            self.upload_throttle.consume(read as u64);
             upload.offset += read as u64;
             if upload.offset >= upload.next_status_at || upload.offset == upload.size {
-                let _ = self.events.send(NetworkEvent::Status(format!(
-                    "uploaded {} of {} for {}",
-                    format_bytes(upload.offset),
-                    format_bytes(upload.size),
-                    upload.name
-                )));
                 upload.next_status_at = upload
                     .next_status_at
                     .saturating_add(FILE_PROGRESS_STEP_BYTES);
+                // The overlay keys on the server transfer id, learned only once the
+                // upload is accepted. Ticks before then are dropped; acceptance
+                // emits the first tick itself.
+                if let Some(meta) = upload.server_metadata.as_ref() {
+                    let _ = self.events.send(NetworkEvent::TransferProgress {
+                        transfer_id: meta.transfer_id,
+                        timestamp_ms: meta.timestamp_ms,
+                        transferred: upload.offset,
+                        total: upload.size,
+                        direction: TransferDirection::Outgoing,
+                    });
+                }
             }
             self.outgoing_uploads.push_front(upload);
             return Ok(true);
@@ -2373,6 +2532,21 @@ impl WorkerState {
             metadata,
         ) {
             self.emit_local_file(metadata, local.path, local.dimensions);
+        } else if let Some(upload) = self
+            .outgoing_uploads
+            .iter()
+            .find(|upload| upload.transfer_id == client_transfer_id)
+            && let Some(meta) = upload.server_metadata.as_ref()
+        {
+            // Show the bar immediately at acceptance, at whatever offset streaming
+            // has already reached.
+            let _ = self.events.send(NetworkEvent::TransferProgress {
+                transfer_id: meta.transfer_id,
+                timestamp_ms: meta.timestamp_ms,
+                transferred: upload.offset,
+                total: upload.size,
+                direction: TransferDirection::Outgoing,
+            });
         }
     }
 
@@ -2435,8 +2609,11 @@ impl WorkerState {
                     "receiving {} from {}",
                     file.file_name, file.sender_name
                 )));
+                let transfer_id = file.transfer_id;
+                let timestamp_ms = file.timestamp_ms;
+                let total = file.size;
                 self.incoming_files.insert(
-                    file.transfer_id,
+                    transfer_id,
                     IncomingFile {
                         metadata: file,
                         path,
@@ -2446,6 +2623,13 @@ impl WorkerState {
                         dimensions: None,
                     },
                 );
+                let _ = self.events.send(NetworkEvent::TransferProgress {
+                    transfer_id,
+                    timestamp_ms,
+                    transferred: 0,
+                    total,
+                    direction: TransferDirection::Incoming,
+                });
             }
             Err(error) => {
                 let _ = self.events.send(NetworkEvent::Error(error));
@@ -2465,6 +2649,9 @@ impl WorkerState {
             let _ = self.events.send(NetworkEvent::Error(format!(
                 "file transfer offset mismatch for {name}"
             )));
+            let _ = self
+                .events
+                .send(NetworkEvent::TransferCanceled { transfer_id });
             return;
         }
         if offset.saturating_add(data.len() as u64) > incoming.metadata.size {
@@ -2475,6 +2662,9 @@ impl WorkerState {
             let _ = self.events.send(NetworkEvent::Error(format!(
                 "file transfer exceeded declared size for {name}"
             )));
+            let _ = self
+                .events
+                .send(NetworkEvent::TransferCanceled { transfer_id });
             return;
         }
         if let Err(error) = incoming.file.write_all(&data) {
@@ -2485,6 +2675,9 @@ impl WorkerState {
             let _ = self.events.send(NetworkEvent::Error(format!(
                 "failed to write {name}: {error}"
             )));
+            let _ = self
+                .events
+                .send(NetworkEvent::TransferCanceled { transfer_id });
             return;
         }
         if offset == 0 && is_image_name(&incoming.metadata.file_name) {
@@ -2494,15 +2687,16 @@ impl WorkerState {
         if incoming.received >= incoming.next_status_at
             || incoming.received == incoming.metadata.size
         {
-            let _ = self.events.send(NetworkEvent::Status(format!(
-                "received {} of {} for {}",
-                format_bytes(incoming.received),
-                format_bytes(incoming.metadata.size),
-                incoming.metadata.file_name
-            )));
             incoming.next_status_at = incoming
                 .next_status_at
                 .saturating_add(FILE_PROGRESS_STEP_BYTES);
+            let _ = self.events.send(NetworkEvent::TransferProgress {
+                transfer_id: incoming.metadata.transfer_id,
+                timestamp_ms: incoming.metadata.timestamp_ms,
+                transferred: incoming.received,
+                total: incoming.metadata.size,
+                direction: TransferDirection::Incoming,
+            });
         }
     }
 
@@ -2545,6 +2739,9 @@ impl WorkerState {
                 "file transfer canceled for {}: {reason}",
                 incoming.metadata.file_name
             )));
+            let _ = self
+                .events
+                .send(NetworkEvent::TransferCanceled { transfer_id });
         }
     }
 
@@ -3867,6 +4064,7 @@ fn network_command_kind(command: &NetworkCommand) -> &'static str {
         NetworkCommand::StartShare { .. } => "start_share",
         NetworkCommand::StopShare { .. } => "stop_share",
         NetworkCommand::ReportBug { .. } => "report_bug",
+        NetworkCommand::SetUploadRate(_) => "set_upload_rate",
         NetworkCommand::Shutdown => "shutdown",
     }
 }
@@ -4089,7 +4287,7 @@ fn split_extension(name: &str) -> (&str, &str) {
     }
 }
 
-fn format_bytes(bytes: u64) -> String {
+pub(crate) fn format_bytes(bytes: u64) -> String {
     const KIB: u64 = 1024;
     const MIB: u64 = 1024 * KIB;
     if bytes >= MIB {
@@ -4400,6 +4598,51 @@ mod tests {
 
     fn user(id: u64) -> UserId {
         UserId(id)
+    }
+
+    #[test]
+    fn upload_throttle_paces_and_caps_budget() {
+        let now = Instant::now();
+        let mut throttle = UploadThrottle::new(1000);
+        // Starts with one second of budget.
+        assert_eq!(throttle.budget(), 1000);
+        throttle.consume(600);
+        assert_eq!(throttle.budget(), 400);
+        // Refill accrues rate * elapsed.
+        throttle.last = now;
+        throttle.refill(now + Duration::from_millis(500));
+        assert_eq!(throttle.budget(), 900);
+        // Accrual is capped at one second's worth so a long park cannot bank a
+        // burst.
+        throttle.refill(now + Duration::from_secs(10));
+        assert_eq!(throttle.budget(), 1000);
+    }
+
+    #[test]
+    fn upload_throttle_unlimited_bypasses() {
+        let mut throttle = UploadThrottle::new(0);
+        assert_eq!(throttle.budget(), u64::MAX);
+        throttle.consume(1_000_000);
+        assert_eq!(throttle.budget(), u64::MAX);
+        assert_eq!(throttle.delay_until(1_000_000), Duration::ZERO);
+    }
+
+    #[test]
+    fn upload_throttle_delay_waits_for_refill() {
+        let mut throttle = UploadThrottle::new(1000);
+        throttle.consume(1000);
+        assert_eq!(throttle.budget(), 0);
+        // 500 bytes at 1000 B/s is half a second.
+        assert_eq!(throttle.delay_until(500), Duration::from_secs_f64(0.5));
+        assert_eq!(throttle.delay_until(0), Duration::ZERO);
+    }
+
+    #[test]
+    fn upload_throttle_set_rate_clamps_budget() {
+        let mut throttle = UploadThrottle::new(1000);
+        throttle.set_rate(200);
+        // The budget cannot exceed the new, lower ceiling.
+        assert_eq!(throttle.budget(), 200);
     }
 
     #[test]

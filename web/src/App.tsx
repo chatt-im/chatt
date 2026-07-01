@@ -91,6 +91,41 @@ function formatTime(ms: number): string {
   return d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
 }
 
+function formatBytes(bytes: number): string {
+  const KIB = 1024;
+  const MIB = 1024 * KIB;
+  if (bytes >= MIB) return `${(bytes / MIB).toFixed(1)} MiB`;
+  if (bytes >= KIB) return `${(bytes / KIB).toFixed(1)} KiB`;
+  return `${bytes} B`;
+}
+
+// Progress bar shown on a file's placeholder message while the host client
+// pulls the file off the relay. Replaced by the attachment on completion.
+function TransferProgressBar(props: { progress: { transferred: number; total: number } }) {
+  const ratio = () => {
+    const { transferred, total } = props.progress;
+    return total > 0 ? Math.min(1, transferred / total) : 0;
+  };
+  const pct = () => Math.round(ratio() * 100);
+  return (
+    <div
+      class="message-progress"
+      role="progressbar"
+      aria-valuenow={pct()}
+      aria-valuemin={0}
+      aria-valuemax={100}
+    >
+      <div class="message-progress-track">
+        <div class="message-progress-fill" style={{ width: `${pct()}%` }} />
+      </div>
+      <span class="message-progress-label">
+        receiving {formatBytes(props.progress.transferred)} / {formatBytes(props.progress.total)} (
+        {pct()}%)
+      </span>
+    </div>
+  );
+}
+
 // Renders a message body from its fragments: prose as markdown, code blocks
 // from their precomputed highlight spans. Nothing is re-highlighted here.
 function MessageBody(props: { fragments: Fragment[] }) {
@@ -197,6 +232,9 @@ function MessageRow(props: {
       <MessageBody fragments={props.message.fragments} />
       <Show when={props.message.attachment}>
         <Attachment message={props.message} onOpenFile={props.onOpenFile} />
+      </Show>
+      <Show when={!props.message.attachment && props.message.progress}>
+        <TransferProgressBar progress={props.message.progress!} />
       </Show>
     </div>
   );
@@ -761,6 +799,22 @@ export default function App() {
             prev.includes(env.stream_id) ? prev : [...prev, env.stream_id],
           );
         }
+      } else if (env.type === "file_progress") {
+        // Merge into the still-placeholder message (no attachment yet). Once the
+        // file lands and the enriched message replaces it, `progress` is gone and
+        // the bar disappears on its own.
+        setMessages((prev) => {
+          const i = prev.findIndex(
+            (m) =>
+              m.file_id === env.file_id &&
+              m.timestamp_ms === env.timestamp_ms &&
+              !m.attachment,
+          );
+          if (i < 0) return prev;
+          const next = prev.slice();
+          next[i] = { ...next[i], progress: { transferred: env.transferred, total: env.total } };
+          return next;
+        });
       } else if (env.type === "config") {
         setReadonly(env.readonly);
       } else if (env.type === "share_error") {

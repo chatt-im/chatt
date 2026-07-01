@@ -100,6 +100,11 @@ pub(crate) const SLASH_COMMANDS: &[SlashCommand] = &[
         description: "relay a file to room members",
     },
     SlashCommand {
+        name: "/upload-rate",
+        usage: "/upload-rate 200K|off",
+        description: "throttle upload speed (bytes/s, K/M suffix, off)",
+    },
+    SlashCommand {
         name: "/users",
         usage: "/users",
         description: "show known room users",

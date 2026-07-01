@@ -13,6 +13,7 @@ use chatt::audio::{LivePlaybackFeedback, PlaybackStreamControl};
 
 use crate::{
     chat_buffer::VirtualChatBuffer,
+    client_net::TransferDirection,
     config::Config,
     room_history::{self, FileHistoryKey, RoomHistoryStore},
     theme::Theme,
@@ -40,6 +41,21 @@ pub(crate) struct RoomSession {
     volume_preview: Option<(UserId, f32)>,
     history: Option<RoomHistoryStore>,
     seen: BoundedKeySet,
+    /// Live progress for in-flight file transfers, keyed by the server transfer
+    /// id. An entry exists only while a transfer is running: it is inserted on
+    /// the first tick and removed when it completes, cancels, or errors, so the
+    /// file's chat line reverts to its normal completed rendering. Cleared on
+    /// room switch.
+    transfers: HashMap<FileTransferId, TransferProgress>,
+}
+
+/// A render-time snapshot of an in-flight transfer, overlaid on the file's chat
+/// line by [`crate::tui::render`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct TransferProgress {
+    pub(crate) transferred: u64,
+    pub(crate) total: u64,
+    pub(crate) direction: TransferDirection,
 }
 
 /// Bounded membership set of `(timestamp_ms, message_id)` keys that evicts the
@@ -179,6 +195,7 @@ impl RoomSession {
             volume_preview: None,
             history: None,
             seen: BoundedKeySet::with_capacity(config.ui.max_messages as usize),
+            transfers: HashMap::new(),
         }
     }
 
@@ -333,6 +350,7 @@ impl RoomSession {
     fn populate_history(&mut self, messages: &[ChatMessage], local_user: Option<UserId>) {
         self.chat.clear();
         self.seen.clear();
+        self.transfers.clear();
         for message in messages {
             let local = Some(message.sender) == local_user;
             self.seen
@@ -392,6 +410,41 @@ impl RoomSession {
                 packed_dims,
             );
         }
+    }
+
+    /// Records a progress tick for an in-flight transfer. A tick that reaches or
+    /// passes `total` is terminal: the entry is removed so the file line renders
+    /// as completed. This is the only clear path for an uploader without a
+    /// receive directory, which never emits a terminal `FileReceived`.
+    pub(crate) fn transfer_progress(
+        &mut self,
+        transfer_id: FileTransferId,
+        transferred: u64,
+        total: u64,
+        direction: TransferDirection,
+    ) {
+        if transferred >= total {
+            self.transfers.remove(&transfer_id);
+            return;
+        }
+        self.transfers.insert(
+            transfer_id,
+            TransferProgress {
+                transferred,
+                total,
+                direction,
+            },
+        );
+    }
+
+    /// Removes any progress overlay for `transfer_id`, on completion or cancel.
+    pub(crate) fn clear_transfer(&mut self, transfer_id: FileTransferId) {
+        self.transfers.remove(&transfer_id);
+    }
+
+    /// The live progress for `transfer_id`, if a transfer is in flight.
+    pub(crate) fn transfer(&self, transfer_id: FileTransferId) -> Option<TransferProgress> {
+        self.transfers.get(&transfer_id).copied()
     }
 
     pub(super) fn push_notice(&mut self, sender: impl Into<String>, body: impl Into<String>) {
@@ -681,6 +734,32 @@ mod tests {
             body: body.to_string(),
             file_transfer_id: None,
         }
+    }
+
+    #[test]
+    fn transfer_progress_tracks_then_clears_on_completion() {
+        let mut room = test_room();
+        let id = FileTransferId(7);
+        room.transfer_progress(id, 0, 100, TransferDirection::Incoming);
+        let progress = room.transfer(id).expect("progress recorded");
+        assert_eq!(progress.transferred, 0);
+        assert_eq!(progress.total, 100);
+        room.transfer_progress(id, 40, 100, TransferDirection::Incoming);
+        assert_eq!(room.transfer(id).unwrap().transferred, 40);
+        // Reaching total is terminal: the entry is dropped so the line reverts to
+        // its completed rendering.
+        room.transfer_progress(id, 100, 100, TransferDirection::Incoming);
+        assert!(room.transfer(id).is_none());
+    }
+
+    #[test]
+    fn clear_transfer_removes_overlay() {
+        let mut room = test_room();
+        let id = FileTransferId(3);
+        room.transfer_progress(id, 10, 100, TransferDirection::Outgoing);
+        assert!(room.transfer(id).is_some());
+        room.clear_transfer(id);
+        assert!(room.transfer(id).is_none());
     }
 
     #[test]
