@@ -924,7 +924,14 @@ fn draw_chat(
                     let start = seg.start as usize;
                     let end = seg.end as usize;
                     let text = &msg.body[start..end];
-                    let style = base.patch(app.theme.text).patch(seg.style);
+                    let mut style = base.patch(app.theme.text).patch(seg.style);
+                    if msg
+                        .links
+                        .iter()
+                        .any(|link| seg.start < link.end && link.start < seg.end)
+                    {
+                        style = style.patch(app.theme.namespace) | extui::vt::Modifier::UNDERLINED;
+                    }
                     let max_width = row.w.saturating_sub(seg.col) as usize;
                     if max_width > 0 {
                         buf.set_stringn(row.x + seg.col, row.y, text, max_width, style);

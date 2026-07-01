@@ -14,6 +14,7 @@ pub const SETTINGS_LAYER: LayerId = LayerId::new(5);
 pub const DIALOG_LAYER: LayerId = LayerId::new(6);
 pub const COMPOSE_NORMAL_LAYER: LayerId = LayerId::new(7);
 pub const PASSWORD_LAYER: LayerId = LayerId::new(8);
+pub const PASTE_LAYER: LayerId = LayerId::new(9);
 
 #[derive(Clone, Debug, Toml)]
 pub enum BindCommand {
@@ -48,6 +49,7 @@ pub enum BindCommand {
     AdjustLeft,
     AdjustRight,
     ClearChat,
+    PasteClipboard,
     PlaySoundboard1,
     PlaySoundboard2,
     PlaySoundboard3,
@@ -100,6 +102,7 @@ impl std::fmt::Display for BindCommand {
             AdjustLeft => "AdjustLeft",
             AdjustRight => "AdjustRight",
             ClearChat => "ClearChat",
+            PasteClipboard => "PasteClipboard",
             PlaySoundboard1 => "PlaySoundboard1",
             PlaySoundboard2 => "PlaySoundboard2",
             PlaySoundboard3 => "PlaySoundboard3",
@@ -164,6 +167,7 @@ impl BindCommand {
             AdjustLeft => spec("Left", NAV),
             AdjustRight => spec("Right", NAV),
             ClearChat => spec("Clear", DESTRUCTIVE),
+            PasteClipboard => spec("Paste", ACTION),
             PlaySoundboard1 => spec("Sound 1", ACTION),
             PlaySoundboard2 => spec("Sound 2", ACTION),
             PlaySoundboard3 => spec("Sound 3", ACTION),
@@ -366,6 +370,7 @@ impl<'de> FromToml<'de> for BindingRuntime {
             ("settings", SETTINGS_LAYER),
             ("dialog", DIALOG_LAYER),
             ("password", PASSWORD_LAYER),
+            ("paste", PASTE_LAYER),
         ] {
             if let Some(bindings) = default_table.get(name) {
                 extend_layer(ctx, bindings, &mut actions, &mut builder, layer)?;

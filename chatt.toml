@@ -71,7 +71,9 @@ prefer-ipv6 = true
 "ENTER" = "SubmitMessage"
 "C-m" = "SubmitMessage"
 "C-g" = "Cancel"
-"C-v" = "ToggleMute"
+"M-m" = "ToggleMute"
+"C-v" = "PasteClipboard"
+"C-M-v" = "PasteClipboard"
 "C-h" = "ToggleDeafen"
 "D-j" = "FocusNext"
 "D-k" = "FocusPrev"
@@ -84,6 +86,9 @@ prefer-ipv6 = true
 "D-j" = "FocusNext"
 "D-k" = "FocusPrev"
 "m" = "ToggleMute"
+"p" = "PasteClipboard"
+"C-v" = "PasteClipboard"
+"C-M-v" = "PasteClipboard"
 "." = "ToggleKeyPreview"
 
 [bindings.workspace]
@@ -111,6 +116,9 @@ prefer-ipv6 = true
 "c" = "ClearChat"
 "y" = "CopySelection"
 "e" = "ToggleExpand"
+"p" = "PasteClipboard"
+"C-v" = "PasteClipboard"
+"C-M-v" = "PasteClipboard"
 "TAB" = "ToggleExpand"
 "." = "ToggleKeyPreview"
 
@@ -177,3 +185,8 @@ prefer-ipv6 = true
 "ESC" = "Cancel"
 "ENTER" = "SubmitPassword"
 "C-r" = "TogglePasswordVisibility"
+
+[bindings.paste]
+"C-c" = "Quit"
+"ESC" = "Cancel"
+"ENTER" = "Activate"
