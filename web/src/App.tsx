@@ -40,6 +40,11 @@ const MIN_SHARE_PANE_HEIGHT = 160;
 const MIN_CHAT_PANE_HEIGHT = 140;
 const DIVIDER_SIZE = 9;
 const PANE_KEY_STEP = 32;
+const DEFAULT_FILE_PANEL_WIDTH = 560;
+const MIN_FILE_PANEL_WIDTH = 320;
+const MIN_CHAT_SPLIT_WIDTH = 320;
+const FILE_PANEL_DIVIDER_SIZE = 3;
+const FILE_PANEL_KEY_STEP = 32;
 
 // Builds the asset URL for an attachment served from the client's receive dir.
 function fileUrl(name: string): string {
@@ -209,6 +214,8 @@ export default function App() {
   const [fullscreenStream, setFullscreenStream] = createSignal<number | null>(null);
   // The file currently expanded into the viewer panel, or null when none is.
   const [openFile, setOpenFile] = createSignal<string | null>(null);
+  const [filePanelWidth, setFilePanelWidth] = createSignal(DEFAULT_FILE_PANEL_WIDTH);
+  const [filePanelResizing, setFilePanelResizing] = createSignal(false);
 
   function setShareError(streamId: number, message: string) {
     setShareErrors((prev) => ({ ...prev, [streamId]: message }));
@@ -237,15 +244,23 @@ export default function App() {
   }
 
   let mainEl: HTMLElement | undefined;
+  let appBodyEl: HTMLDivElement | undefined;
   let logEl: HTMLDivElement | undefined;
   let contentEl: HTMLDivElement | undefined;
   let handle: VirtualizerHandle | undefined;
   let resizeObserver: ResizeObserver | undefined;
   let splitResizeObserver: ResizeObserver | undefined;
+  let fileSplitResizeObserver: ResizeObserver | undefined;
   let socket: WebSocket | undefined;
   let reconnectTimer: number | undefined;
   const imagePreloads = new Map<string, ImagePreload>();
   let paneResize:
+    | {
+        move: (event: PointerEvent) => void;
+        up: (event: PointerEvent) => void;
+      }
+    | undefined;
+  let filePanelResize:
     | {
         move: (event: PointerEvent) => void;
         up: (event: PointerEvent) => void;
@@ -438,12 +453,40 @@ export default function App() {
     pin();
   }
 
+  function clampFilePanelWidth(width: number): number {
+    const total = appBodyEl?.clientWidth ?? 0;
+    if (total <= 0) return Math.max(MIN_FILE_PANEL_WIDTH, width);
+    const minFile = Math.min(
+      MIN_FILE_PANEL_WIDTH,
+      Math.max(240, total - MIN_CHAT_SPLIT_WIDTH - FILE_PANEL_DIVIDER_SIZE),
+    );
+    const maxFile = Math.max(
+      minFile,
+      total - MIN_CHAT_SPLIT_WIDTH - FILE_PANEL_DIVIDER_SIZE,
+    );
+    return clamp(width, minFile, maxFile);
+  }
+
+  function setClampedFilePanelWidth(width: number) {
+    setFilePanelWidth(clampFilePanelWidth(width));
+    pin();
+  }
+
   function removePaneResizeListeners() {
     if (!paneResize) return;
     window.removeEventListener("pointermove", paneResize.move);
     window.removeEventListener("pointerup", paneResize.up);
     window.removeEventListener("pointercancel", paneResize.up);
     paneResize = undefined;
+  }
+
+  function removeFilePanelResizeListeners() {
+    if (!filePanelResize) return;
+    window.removeEventListener("pointermove", filePanelResize.move);
+    window.removeEventListener("pointerup", filePanelResize.up);
+    window.removeEventListener("pointercancel", filePanelResize.up);
+    filePanelResize = undefined;
+    setFilePanelResizing(false);
   }
 
   function beginPaneResize(event: PointerEvent) {
@@ -466,6 +509,26 @@ export default function App() {
     window.addEventListener("pointercancel", up);
   }
 
+  function beginFilePanelResize(event: PointerEvent) {
+    event.preventDefault();
+    removeFilePanelResizeListeners();
+    const startX = event.clientX;
+    const startWidth = filePanelWidth();
+    const move = (moveEvent: PointerEvent) => {
+      moveEvent.preventDefault();
+      setClampedFilePanelWidth(startWidth + startX - moveEvent.clientX);
+    };
+    const up = (upEvent: PointerEvent) => {
+      upEvent.preventDefault();
+      removeFilePanelResizeListeners();
+    };
+    filePanelResize = { move, up };
+    setFilePanelResizing(true);
+    window.addEventListener("pointermove", move);
+    window.addEventListener("pointerup", up);
+    window.addEventListener("pointercancel", up);
+  }
+
   function onDividerKeyDown(event: KeyboardEvent) {
     if (fullscreenStream() !== null) return;
     if (event.key === "ArrowUp") {
@@ -474,6 +537,16 @@ export default function App() {
     } else if (event.key === "ArrowDown") {
       event.preventDefault();
       setClampedSharePaneHeight(sharePaneHeight() + PANE_KEY_STEP);
+    }
+  }
+
+  function onFileDividerKeyDown(event: KeyboardEvent) {
+    if (event.key === "ArrowLeft") {
+      event.preventDefault();
+      setClampedFilePanelWidth(filePanelWidth() + FILE_PANEL_KEY_STEP);
+    } else if (event.key === "ArrowRight") {
+      event.preventDefault();
+      setClampedFilePanelWidth(filePanelWidth() - FILE_PANEL_KEY_STEP);
     }
   }
 
@@ -645,14 +718,23 @@ export default function App() {
       });
       splitResizeObserver.observe(mainEl);
     }
+    if (appBodyEl) {
+      fileSplitResizeObserver = new ResizeObserver(() => {
+        setFilePanelWidth((width) => clampFilePanelWidth(width));
+        pin();
+      });
+      fileSplitResizeObserver.observe(appBodyEl);
+    }
     document.addEventListener("fullscreenchange", onDocumentFullscreenChange);
     connect();
   });
   onCleanup(() => {
     resizeObserver?.disconnect();
     splitResizeObserver?.disconnect();
+    fileSplitResizeObserver?.disconnect();
     document.removeEventListener("fullscreenchange", onDocumentFullscreenChange);
     removePaneResizeListeners();
+    removeFilePanelResizeListeners();
     if (reconnectTimer) clearTimeout(reconnectTimer);
     if (suppressTimer) clearTimeout(suppressTimer);
     if (idleTimer) clearTimeout(idleTimer);
@@ -668,79 +750,99 @@ export default function App() {
       <Show when={!connected()}>
         <div class="conn-overlay">offline — reconnecting…</div>
       </Show>
-      <div class="app-body">
-      <main
-        class="app-main"
-        classList={{
-          "has-video-pane": hasVideoPane(),
-          "is-share-fullscreen": fullscreenStream() !== null,
-        }}
-        ref={mainEl}
-        style={hasVideoPane() ? `--share-pane-height: ${sharePaneHeight()}px` : undefined}
+      <div
+        class="app-body"
+        classList={{ "is-resizing-file-panel": filePanelResizing() }}
+        ref={appBodyEl}
       >
-        <Show when={shares().length > 0}>
-          <section class="share-pane">
-            <ScreenShare
-              shares={shares()}
-              playing={playing()}
-              errors={shareErrors()}
-              fullscreenStream={fullscreenStream()}
-              onPlay={playShare}
-              onStop={stopShare}
-              onToggleFullscreen={toggleShareFullscreen}
-              canvasRef={registerCanvas}
-            />
-            {/* Drag the bottom edge of the black video area to resize the chat
-              * below. The grabber overlays the pane's lower edge; no separator
-              * line is drawn. */}
-            <Show when={hasVideoPane()}>
-              <div
-                class="pane-resize"
-                role="separator"
-                aria-label="Resize chat"
-                aria-orientation="horizontal"
-                tabIndex={0}
-                onPointerDown={beginPaneResize}
-                onKeyDown={onDividerKeyDown}
-              />
-            </Show>
-          </section>
-        </Show>
-        <div
-          class="chat-log"
-          ref={logEl}
-          onWheel={markUser}
-          onTouchStart={markUser}
-          onTouchMove={markUser}
-          onPointerDown={markUser}
-          onKeyDown={onKeyDown}
+        <main
+          class="app-main"
+          classList={{
+            "has-video-pane": hasVideoPane(),
+            "is-share-fullscreen": fullscreenStream() !== null,
+          }}
+          ref={mainEl}
+          style={hasVideoPane() ? `--share-pane-height: ${sharePaneHeight()}px` : undefined}
         >
-          <div class="chat-log-content" ref={contentEl}>
-            <Virtualizer
-              ref={(h) => (handle = h)}
-              scrollRef={logEl}
-              data={messages()}
-              shift={prepend()}
-              keepMounted={recentImageIndexes()}
-              onScroll={onScroll}
-              onScrollEnd={onScrollEnd}
-            >
-              {(message, index) => (
-                <MessageRow
-                  message={message}
-                  prev={messages()[index() - 1]}
-                  onOpenFile={setOpenFile}
+          <Show when={shares().length > 0}>
+            <section class="share-pane">
+              <ScreenShare
+                shares={shares()}
+                playing={playing()}
+                errors={shareErrors()}
+                fullscreenStream={fullscreenStream()}
+                onPlay={playShare}
+                onStop={stopShare}
+                onToggleFullscreen={toggleShareFullscreen}
+                canvasRef={registerCanvas}
+              />
+              {/* Drag the bottom edge of the black video area to resize the chat
+                * below. The grabber overlays the pane's lower edge; no separator
+                * line is drawn. */}
+              <Show when={hasVideoPane()}>
+                <div
+                  class="pane-resize"
+                  role="separator"
+                  aria-label="Resize chat"
+                  aria-orientation="horizontal"
+                  tabIndex={0}
+                  onPointerDown={beginPaneResize}
+                  onKeyDown={onDividerKeyDown}
                 />
-              )}
-            </Virtualizer>
+              </Show>
+            </section>
+          </Show>
+          <div
+            class="chat-log"
+            ref={logEl}
+            onWheel={markUser}
+            onTouchStart={markUser}
+            onTouchMove={markUser}
+            onPointerDown={markUser}
+            onKeyDown={onKeyDown}
+          >
+            <div class="chat-log-content" ref={contentEl}>
+              <Virtualizer
+                ref={(h) => (handle = h)}
+                scrollRef={logEl}
+                data={messages()}
+                shift={prepend()}
+                keepMounted={recentImageIndexes()}
+                onScroll={onScroll}
+                onScrollEnd={onScrollEnd}
+              >
+                {(message, index) => (
+                  <MessageRow
+                    message={message}
+                    prev={messages()[index() - 1]}
+                    onOpenFile={setOpenFile}
+                  />
+                )}
+              </Virtualizer>
+            </div>
           </div>
-        </div>
-      </main>
-      <Show when={openFile()}>
-        <aside class="file-panel">
-          <FileViewer name={openFile()!} onClose={() => setOpenFile(null)} />
-        </aside>
-      </Show>
+        </main>
+        <Show when={openFile()}>
+          <>
+            <div
+              class="file-panel-resize"
+              role="separator"
+              aria-label="Resize code view"
+              aria-orientation="vertical"
+              aria-valuemin={MIN_FILE_PANEL_WIDTH}
+              aria-valuenow={Math.round(filePanelWidth())}
+              tabIndex={0}
+              onPointerDown={beginFilePanelResize}
+              onKeyDown={onFileDividerKeyDown}
+            />
+            <aside
+              class="file-panel"
+              style={`--file-panel-width: ${filePanelWidth()}px`}
+            >
+              <FileViewer name={openFile()!} onClose={() => setOpenFile(null)} />
+            </aside>
+          </>
+        </Show>
       </div>
     </div>
   );
