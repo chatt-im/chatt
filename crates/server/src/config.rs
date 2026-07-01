@@ -9,7 +9,7 @@ use std::{
 use ring::{digest, rand::SecureRandom, signature::KeyPair};
 use rpc::{
     control::{DEFAULT_FILE_SIZE_LIMIT_BYTES, MAX_AUTH_FIELD_BYTES},
-    crypto::{dev_server_seed_hex, encode_hex, server_key_pair_from_seed_hex},
+    crypto::{encode_hex, server_key_pair_from_seed_hex},
     ids::{RoomId, UserId},
 };
 use toml_spanner::{Item, Toml};
@@ -397,11 +397,6 @@ impl Config {
         }
         server_key_pair_from_seed_hex(&self.security.server_identity_seed)
             .map_err(|error| format!("{source}: invalid security.server-identity-seed: {error}"))?;
-        if self.security.server_identity_seed.trim() == dev_server_seed_hex() {
-            return Err(format!(
-                "{source}: security.server-identity-seed uses the development seed; run `chatt-server init-config PATH` to generate a private server config"
-            ));
-        }
         if let Some(password) = &self.security.password
             && password.len() > MAX_AUTH_FIELD_BYTES
         {
@@ -891,6 +886,7 @@ fn toml_quote_value(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rpc::crypto::dev_server_seed_hex;
 
     fn config_with_users() -> Config {
         let mut config = Config::default();
@@ -980,23 +976,6 @@ mod tests {
             .unwrap_err();
 
         assert!(error.contains("server-identity-seed is required"));
-    }
-
-    #[test]
-    fn config_rejects_development_identity_seed() {
-        let config = Config::default();
-        let content = config.to_toml_string().replace(
-            &format!(
-                "server-identity-seed = \"{}\"",
-                config.security.server_identity_seed
-            ),
-            &format!("server-identity-seed = \"{}\"", dev_server_seed_hex()),
-        );
-
-        let error = parse_config_content(&content, "<test>", Some(PathBuf::from("server.toml")))
-            .unwrap_err();
-
-        assert!(error.contains("development seed"));
     }
 
     #[test]

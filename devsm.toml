@@ -1,32 +1,72 @@
 [service.server]
+profiles = ["default", "pop"]
 sh = '''
-rm /tmp/chatt-server.kvlog
-test -f chatt-server.toml || cargo run -p server -- init-config chatt-server.toml
-cargo run -p server -- --logfile /tmp/chatt-server.kvlog serve chatt-server.toml
+rm -f /tmp/chatt-server.kvlog
+cargo run $CARGO_FLAGS -p server -- --logfile /tmp/chatt-server.kvlog serve dev/chatt-server.toml
 '''
+env.CARGO_FLAGS = { if.profile = "pop", then = "--release", or_else = "" }
+env.CHATT_AUDIO_POP_LOG = { if.profile = "pop", then = "1", or_else = "0" }
 ready.when.output_contains = "chatt server listening"
 ready.timeout = 10.0
 info = "Local chatt development server"
 
-[action.client-alice]
-sh = '''
-rm /tmp/chatt-alice.kvlog
-cargo run -p chatt -- --config dev/chatt-alice.toml --logfile /tmp/chatt-alice.kvlog
-'''
+[action.alice]
+profiles = ["default", "pop"]
 require = ["server"]
 managed = false
+allow_multiple = true
+cli.forward_arguments = true
 env.CHATT_RUN_DIR = "/tmp/chatt-dev/alice"
-info = "Run the Alice client in this terminal"
-
-[action.client-bob]
+env.CARGO_FLAGS = { if.profile = "pop", then = "--release", or_else = "" }
+env.CHATT_AUDIO_POP_LOG = { if.profile = "pop", then = "1", or_else = "0" }
+env.CHATT_AUDIO_PLAYBACK_WAV = { if.profile = "pop", then = "/tmp/chatt-alice-playback.wav", or_else = "" }
 sh = '''
-rm /tmp/chatt-bob.kvlog
-cargo run -p chatt -- --config dev/chatt-bob.toml --logfile /tmp/chatt-bob.kvlog
+if [ "$#" -gt 0 ]; then
+  cargo run $CARGO_FLAGS -p chatt -- --config dev/chatt-alice.toml "$@"
+else
+  rm -f /tmp/chatt-alice.kvlog
+  cargo run $CARGO_FLAGS -p chatt -- --config dev/chatt-alice.toml --logfile /tmp/chatt-alice.kvlog
+fi
 '''
+info = "Run the Alice client; trailing args run a chatt subcommand against it"
+
+[action.bob]
+profiles = ["default", "pop"]
 require = ["server"]
 managed = false
+cli.forward_arguments = true
 env.CHATT_RUN_DIR = "/tmp/chatt-dev/bob"
-info = "Run the Bob client in this terminal"
+env.CARGO_FLAGS = { if.profile = "pop", then = "--release", or_else = "" }
+env.CHATT_AUDIO_POP_LOG = { if.profile = "pop", then = "1", or_else = "0" }
+env.CHATT_AUDIO_PLAYBACK_WAV = { if.profile = "pop", then = "/tmp/chatt-bob-playback.wav", or_else = "" }
+sh = '''
+if [ "$#" -gt 0 ]; then
+  cargo run $CARGO_FLAGS -p chatt -- --config dev/chatt-bob.toml "$@"
+else
+  rm -f /tmp/chatt-bob.kvlog
+  cargo run $CARGO_FLAGS -p chatt -- --config dev/chatt-bob.toml --logfile /tmp/chatt-bob.kvlog
+fi
+'''
+info = "Run the Bob client; trailing args run a chatt subcommand against it"
+
+[action.soundboard]
+profiles = ["default", "pop"]
+require = ["server"]
+managed = false
+cli.forward_arguments = true
+env.CHATT_RUN_DIR = "/tmp/chatt-dev/soundboard"
+env.CARGO_FLAGS = { if.profile = "pop", then = "--release", or_else = "" }
+env.CHATT_AUDIO_POP_LOG = { if.profile = "pop", then = "1", or_else = "0" }
+env.CHATT_AUDIO_PLAYBACK_WAV = { if.profile = "pop", then = "/tmp/chatt-soundboard-playback.wav", or_else = "" }
+sh = '''
+if [ "$#" -gt 0 ]; then
+  cargo run $CARGO_FLAGS -p chatt -- --config dev/chatt-soundboard.toml "$@"
+else
+  rm -f /tmp/chatt-soundboard.kvlog
+  cargo run $CARGO_FLAGS -p chatt -- --config dev/chatt-soundboard.toml --logfile /tmp/chatt-soundboard.kvlog
+fi
+'''
+info = "Run the Carol prerecorded-audio soundboard client; trailing args run a chatt subcommand against it"
 
 [action.json-snapshot-client-logs]
 sh = '''
@@ -34,55 +74,6 @@ kvlog /tmp/chatt-server.kvlog --json > /tmp/chatt-server.json
 kvlog /tmp/chatt-soundboard.kvlog --json > /tmp/chatt-soundboard.json
 kvlog /tmp/chatt-alice.kvlog --json > /tmp/chatt-alice.json
 '''
-
-[service.audio-pop-server]
-sh = '''
-rm -f /tmp/chatt-server.kvlog /tmp/chatt-server.json
-test -f chatt-server.toml || cargo run --release -p server -- init-config chatt-server.toml
-cargo run --release -p server -- --logfile /tmp/chatt-server.kvlog serve chatt-server.toml
-'''
-ready.when.output_contains = "chatt server listening"
-ready.timeout = 10.0
-cache.never = true
-env.CHATT_AUDIO_POP_LOG = "1"
-info = "Release server with audio pop diagnostics"
-
-[action.audio-pop-alice]
-sh = '''
-rm -f /tmp/chatt-alice.kvlog /tmp/chatt-alice.json /tmp/chatt-alice-playback.wav
-cargo run --release -p chatt -- --config dev/chatt-alice.toml --logfile /tmp/chatt-alice.kvlog
-'''
-require = ["audio-pop-server"]
-managed = false
-env.CHATT_RUN_DIR = "/tmp/chatt-dev/alice"
-env.CHATT_AUDIO_POP_LOG = "1"
-env.CHATT_AUDIO_PLAYBACK_WAV = "/tmp/chatt-alice-playback.wav"
-info = "Run Alice in release mode with audio pop diagnostics"
-
-[action.audio-pop-soundboard]
-sh = '''
-rm -f /tmp/chatt-soundboard.kvlog /tmp/chatt-soundboard.json /tmp/chatt-soundboard-playback.wav
-cargo run --release -p chatt -- --config dev/chatt-soundboard.toml --logfile /tmp/chatt-soundboard.kvlog
-'''
-require = ["audio-pop-server"]
-managed = false
-env.CHATT_RUN_DIR = "/tmp/chatt-dev/soundboard"
-env.CHATT_AUDIO_POP_LOG = "1"
-env.CHATT_AUDIO_PLAYBACK_WAV = "/tmp/chatt-soundboard-playback.wav"
-info = "Run the soundboard in release mode with audio pop diagnostics"
-
-
-[action.client-soundboard]
-sh = '''
-rm /tmp/chatt-soundboard.json
-rm /tmp/chatt-soundboard.kvlog
-cargo run -p chatt -- --config dev/chatt-soundboard.toml --logfile /tmp/chatt-soundboard.kvlog
-kvlog /tmp/chatt-soundboard.kvlog --json > /tmp/chatt-soundboard.json
-'''
-require = ["server"]
-managed = false
-env.CHATT_RUN_DIR = "/tmp/chatt-dev/soundboard"
-info = "Run the Carol prerecorded-audio soundboard client in this terminal"
 
 [action.bench]
 pwd = "crates/benchmark"
@@ -111,7 +102,3 @@ env.DEBUGINFOD_URLS = "https://debuginfod.archlinux.org"
 env.SAMPLY_USE_DEBUGINFOD = "1"
 cli.forward_arguments = true
 allow_multiple = true
-
-[group]
-clients = ["client-alice", "client-bob", "client-soundboard"]
-audio-pop = ["audio-pop-alice", "audio-pop-soundboard"]
