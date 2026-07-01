@@ -933,8 +933,11 @@ mod tests {
 
     impl Scratch {
         fn new(label: &str) -> Scratch {
-            let dir = std::env::temp_dir()
-                .join(format!("chatt-history-{}-{}", std::process::id(), label));
+            let dir = std::env::temp_dir().join(format!(
+                "chatt-history-{}-{}",
+                std::process::id(),
+                label
+            ));
             let _ = fs::remove_dir_all(&dir);
             fs::create_dir_all(&dir).expect("scratch dir");
             let path = dir.join("room-7.kvlog");

@@ -245,10 +245,7 @@ impl Config {
         let content = fs::read_to_string(path)
             .map_err(|err| format!("failed to read {}: {err}", path.display()))?;
         let source = path.display().to_string();
-        match parse_config_content(&content, &source, Some(path.to_path_buf())) {
-            Ok(config) => Ok(config),
-            Err(error) => recover_config_from_backup(path, &content, &error),
-        }
+        parse_config_content(&content, &source, Some(path.to_path_buf()))
     }
 
     pub fn server_key_pair(&self) -> Result<ring::signature::Ed25519KeyPair, String> {
@@ -492,7 +489,7 @@ impl Config {
             fs::create_dir_all(parent)
                 .map_err(|err| format!("failed to create {}: {err}", parent.display()))?;
         }
-        atomic_write_config(path, &self.to_toml_string(), true)
+        atomic_write_config(path, &self.to_toml_string())
     }
 
     fn to_toml_string(&self) -> String {
@@ -607,18 +604,11 @@ fn parse_config_content(
     Ok(config)
 }
 
-fn atomic_write_config(path: &Path, content: &str, backup_existing: bool) -> Result<(), String> {
+/// Writes `content` to a sibling temp file, fsyncs it, then atomically renames
+/// it over `path`. The rename is atomic, so a reader never sees a partial or
+/// missing config even if the process dies mid-write.
+fn atomic_write_config(path: &Path, content: &str) -> Result<(), String> {
     let tmp = temp_config_path(path);
-    let bak = backup_config_path(path);
-    if backup_existing && path.exists() {
-        fs::copy(path, &bak).map_err(|err| {
-            format!(
-                "failed to back up {} to {}: {err}",
-                path.display(),
-                bak.display()
-            )
-        })?;
-    }
 
     let mut file = OpenOptions::new()
         .write(true)
@@ -657,75 +647,8 @@ fn open_new_config_file(path: &Path) -> Result<File, String> {
         .map_err(|err| format!("failed to create {}: {err}", path.display()))
 }
 
-fn recover_config_from_backup(
-    path: &Path,
-    corrupt_content: &str,
-    load_error: &str,
-) -> Result<Config, String> {
-    let corrupt_path = preserve_corrupt_config(path, corrupt_content)?;
-    let bak = backup_config_path(path);
-    let backup_content = fs::read_to_string(&bak).map_err(|err| {
-        format!(
-            "{load_error}; preserved corrupt config as {}; no usable backup at {}: {err}",
-            corrupt_path.display(),
-            bak.display()
-        )
-    })?;
-    let config = parse_config_content(
-        &backup_content,
-        &bak.display().to_string(),
-        Some(path.to_path_buf()),
-    )
-    .map_err(|backup_error| {
-        format!(
-            "{load_error}; preserved corrupt config as {}; backup {} is not usable: {backup_error}",
-            corrupt_path.display(),
-            bak.display()
-        )
-    })?;
-    atomic_write_config(path, &backup_content, false)?;
-    kvlog::warn!(
-        "server config restored from backup",
-        path = %path.display(),
-        backup = %bak.display(),
-        corrupt = %corrupt_path.display(),
-        error = load_error
-    );
-    Ok(config)
-}
-
-fn preserve_corrupt_config(path: &Path, content: &str) -> Result<PathBuf, String> {
-    let corrupt_path = next_corrupt_config_path(path);
-    fs::write(&corrupt_path, content).map_err(|err| {
-        format!(
-            "failed to preserve corrupt config {} as {}: {err}",
-            path.display(),
-            corrupt_path.display()
-        )
-    })?;
-    Ok(corrupt_path)
-}
-
 fn temp_config_path(path: &Path) -> PathBuf {
     extension_path(path, "tmp")
-}
-
-fn backup_config_path(path: &Path) -> PathBuf {
-    extension_path(path, "bak")
-}
-
-fn next_corrupt_config_path(path: &Path) -> PathBuf {
-    let first = extension_path(path, "corrupt");
-    if !first.exists() {
-        return first;
-    }
-    for index in 1.. {
-        let candidate = extension_path(path, &format!("corrupt.{index}"));
-        if !candidate.exists() {
-            return candidate;
-        }
-    }
-    unreachable!("unbounded corrupt config suffix search must return")
 }
 
 fn extension_path(path: &Path, suffix: &str) -> PathBuf {
@@ -1248,12 +1171,11 @@ mod tests {
     }
 
     #[test]
-    fn save_runtime_keeps_backup_of_previous_config() {
+    fn save_runtime_writes_atomically_without_backup_or_temp_residue() {
         let path = std::env::temp_dir().join(format!(
-            "chatt-server-backup-save-test-{}.toml",
+            "chatt-server-atomic-save-test-{}.toml",
             std::process::id()
         ));
-        let bak = backup_config_path(&path);
         let tmp = temp_config_path(&path);
         let mut config = Config::default();
         config.config_path = Some(path.clone());
@@ -1268,49 +1190,34 @@ mod tests {
             .unwrap();
 
         let current = std::fs::read_to_string(&path).unwrap();
-        let backup = std::fs::read_to_string(&bak).unwrap();
+        let bak_exists = extension_path(&path, "bak").exists();
+        let tmp_exists = tmp.exists();
         let _ = std::fs::remove_file(&path);
-        let _ = std::fs::remove_file(&bak);
-        let _ = std::fs::remove_file(&tmp);
 
         assert!(current.contains("display-name = \"Alice Two\""));
         assert!(current.contains(&format!("token-hash = \"{second_hash}\"")));
-        assert!(backup.contains("display-name = \"Alice One\""));
-        assert!(backup.contains(&format!("token-hash = \"{first_hash}\"")));
-        assert!(!tmp.exists());
+        // The atomic rename leaves no backup or temp file behind.
+        assert!(!bak_exists);
+        assert!(!tmp_exists);
     }
 
     #[test]
-    fn corrupt_config_restores_from_backup_without_demo_user_fallback() {
+    fn unparseable_config_errors_and_leaves_the_file_untouched() {
         let path = std::env::temp_dir().join(format!(
-            "chatt-server-corrupt-restore-test-{}.toml",
+            "chatt-server-unparseable-test-{}.toml",
             std::process::id()
         ));
-        let bak = backup_config_path(&path);
-        let corrupt = extension_path(&path, "corrupt");
-        let mut config = Config::default();
-        config.config_path = Some(path.clone());
-        config.users = vec![UserConfig {
-            id: UserId(9),
-            name: "paired-user".to_string(),
-            display_name: "Paired User".to_string(),
-            token_hash: hash_secret("paired-client-generated-token-with-at-least-32-bytes"),
-        }];
-        let backup_content = config.to_toml_string();
-        std::fs::write(&bak, &backup_content).unwrap();
         std::fs::write(&path, "this is not valid toml = [").unwrap();
 
-        let restored = Config::load(&path).unwrap();
-        let restored_content = std::fs::read_to_string(&path).unwrap();
-        let corrupt_content = std::fs::read_to_string(&corrupt).unwrap();
+        let error = Config::load(&path).unwrap_err();
+        let content = std::fs::read_to_string(&path).unwrap();
+        // The operator's file must survive verbatim, with no `.corrupt` sibling.
+        let corrupt_exists = extension_path(&path, "corrupt").exists();
         let _ = std::fs::remove_file(&path);
-        let _ = std::fs::remove_file(&bak);
-        let _ = std::fs::remove_file(&corrupt);
 
-        assert_eq!(restored.users.len(), 1);
-        assert_eq!(restored.users[0].name, "paired-user");
-        assert!(restored_content.contains("name = \"paired-user\""));
-        assert!(corrupt_content.contains("this is not valid toml"));
+        assert!(error.contains("failed to parse"));
+        assert_eq!(content, "this is not valid toml = [");
+        assert!(!corrupt_exists);
     }
 
     #[test]
