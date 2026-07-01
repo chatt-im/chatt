@@ -219,7 +219,7 @@ impl VirtualChatBuffer {
     /// Whether the current selection is a collapsed click (anchor equals head),
     /// i.e. the pointer was pressed and released without dragging.
     pub fn selection_is_click(&self) -> bool {
-        self.selection.map_or(false, |s| s.anchor == s.head)
+        self.selection.is_some_and(|s| s.anchor == s.head)
     }
 
     pub fn scroll_offset(&self) -> usize {
@@ -1320,6 +1320,7 @@ mod tests {
                 body: body.to_string(),
                 timestamp_ms,
                 local,
+                links: crate::link::find_urls(body),
                 expanded: false,
                 layout: MessageLayout::new(),
             });

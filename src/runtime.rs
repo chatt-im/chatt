@@ -50,6 +50,7 @@ pub(crate) fn run_app(
     buffer.set_rgb_supported(true);
     let mut events = Events::default();
     let mut clipboard = crate::clipboard::Clipboard::new();
+    let mut url_opener = crate::url_open::UrlOpener::new(app.config.url_open.clone());
     let stdin = std::io::stdin();
 
     let mut mode_stack = ModeStack::new(app.base_mode(), &mut app);
@@ -101,6 +102,9 @@ pub(crate) fn run_app(
 
         if let Some(text) = app.room.take_pending_clipboard() {
             clipboard.copy(&mut terminal, &text);
+        }
+        if let Some(url) = app.room.take_pending_url_open() {
+            url_opener.open(&url);
         }
     }
 }

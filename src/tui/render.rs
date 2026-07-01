@@ -930,7 +930,8 @@ fn draw_chat(
                         .iter()
                         .any(|link| seg.start < link.end && link.start < seg.end)
                     {
-                        style = style.patch(app.theme.namespace) | extui::vt::Modifier::UNDERLINED;
+                        style = style.patch(app.theme.syntax.namespace)
+                            | extui::vt::Modifier::UNDERLINED;
                     }
                     let max_width = row.w.saturating_sub(seg.col) as usize;
                     if max_width > 0 {
