@@ -297,6 +297,7 @@ dependencies = [
  "opus-codec",
  "ring",
  "rpc",
+ "server",
  "sonora 0.1.0",
  "sonora-common-audio 0.1.0",
  "tinyhl",

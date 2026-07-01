@@ -1,4 +1,6 @@
 mod app;
+#[cfg(test)]
+mod bench_upload;
 mod bindings;
 mod chat_buffer;
 mod cli;
