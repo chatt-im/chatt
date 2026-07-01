@@ -41,6 +41,11 @@ impl FuzzySelect {
         self.entries.get(self.cursor).map(|entry| entry.item_index)
     }
 
+    pub fn set_query(&mut self, query: &str) {
+        self.query.clear();
+        self.query.push_str(query);
+    }
+
     pub fn clear_query(&mut self) -> bool {
         if self.query.is_empty() {
             return false;

@@ -64,6 +64,18 @@ impl ServerListMode {
         }
     }
 
+    /// Builds the picker with `query` pre-applied and search mode active, so a
+    /// `chatt join` specifier that could mean several servers opens filtered and
+    /// editable.
+    pub(crate) fn with_query(query: String) -> Self {
+        let mut select = FuzzySelect::default();
+        select.set_query(&query);
+        Self {
+            select,
+            searching: true,
+        }
+    }
+
     fn selected_label(&self, app: &App) -> Option<String> {
         self.select
             .current_item_index()

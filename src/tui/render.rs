@@ -36,6 +36,19 @@ fn prepare_screen(app: &mut App, buf: &mut Buffer) -> Option<StatsSnapshot> {
     capture
 }
 
+/// Draws the `chatt join` fallback warning as a warm header block when set,
+/// consuming the top row of `screen`.
+fn draw_join_notice(screen: &mut Rect, app: &App, buf: &mut Buffer) {
+    let Some(notice) = app.join_notice.as_deref() else {
+        return;
+    };
+    screen
+        .take_top(1)
+        .with(app.theme.status_section.patch(app.theme.warn) | Modifier::BOLD)
+        .with(Ellipsis(true))
+        .text(buf, &format!(" {notice} "));
+}
+
 pub(crate) fn draw_server_select_screen(
     app: &mut App,
     select: &mut FuzzySelect,
@@ -51,6 +64,7 @@ pub(crate) fn draw_server_select_screen(
     let key_preview_height = key_preview_height(app, screen.w);
     let key_preview_area = screen.take_bottom(key_preview_height as i32);
     let status_area = screen.take_bottom(1);
+    draw_join_notice(&mut screen, app, buf);
     draw_server_select(screen, app, select, searching, buf);
     draw_status(status_area, app, buf, mode, status_label, capture.as_ref());
     draw_key_preview(key_preview_area, app, buf);
@@ -70,6 +84,7 @@ pub(crate) fn draw_server_edit_screen(
     let key_preview_height = key_preview_height(app, screen.w);
     let key_preview_area = screen.take_bottom(key_preview_height as i32);
     let status_area = screen.take_bottom(1);
+    draw_join_notice(&mut screen, app, buf);
     draw_server_edit(screen, app, draft, buf);
     draw_status(status_area, app, buf, mode, status_label, capture.as_ref());
     draw_key_preview(key_preview_area, app, buf);

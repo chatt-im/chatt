@@ -66,6 +66,25 @@ without a subcommand to launch the interactive client.",
             examples: &[],
         },
         Command {
+            name: "join",
+            aliases: &[],
+            about: "Connect to a configured server, or pair if none matches.",
+            long_about: "Connects to an already-configured server named by its label \
+or host:port address. When the specifier matches several servers the picker opens \
+filtered to them. When nothing matches but the specifier is a public host:port, \
+open pairing starts instead.",
+            args: &[Arg {
+                name: "specifier",
+                value_name: "SERVER",
+                help: "A configured server label or a public server host:port",
+                required: true,
+                possible: &[],
+            }],
+            flags: &[],
+            subs: &[],
+            examples: &[],
+        },
+        Command {
             name: "upload",
             aliases: &[],
             about: "Send a file into a running client session.",
@@ -339,6 +358,22 @@ fn dispatch(matches: &Matches) -> Result<(), Box<dyn std::error::Error>> {
             let config = Config::load(config_path)?;
             runtime::run_app(config, Some(pending))
         }
+        Some(("join", sub)) => {
+            let target = sub.value_of("specifier").unwrap_or_default().trim();
+            if target.is_empty() {
+                return Err("usage: chatt join <label | host:port>".into());
+            }
+            if target.starts_with(rpc::control::JOIN_STRING_PREFIX) {
+                return Err(join_ticket_redirect_message(target).into());
+            }
+            let config = Config::load(config_path)?;
+            runtime::run_app(
+                config,
+                Some(crate::app::PendingJoin::Named {
+                    specifier: target.to_string(),
+                }),
+            )
+        }
         Some(("upload", sub)) => {
             let path = absolute_upload_path(Path::new(sub.value_of("path").unwrap_or_default()))?;
             let response = local_control::send_upload(&path)?;
@@ -562,9 +597,22 @@ fn parse_u64_cli_value(value: &str, name: &str) -> Result<u64, String> {
     }
 }
 
+/// Builds the message shown when a pairing ticket is passed to `chatt join`.
+///
+/// A ticket pairs a device once and is not a join target, so this redirects the
+/// user to `chatt pair` and explains the one-time nature of the ticket.
+fn join_ticket_redirect_message(ticket: &str) -> String {
+    format!(
+        "'{ticket}' is a pairing ticket, not a join target. Run `chatt pair {ticket}` \
+instead.\nA pairing ticket is single-use: it pairs this device once and writes the \
+server to your config. If you lose your config you will need a fresh ticket.\nAfter \
+pairing, reconnect with `chatt join <label>` or just run `chatt`."
+    )
+}
+
 /// Validates a `chatt pair` argument that is not an invite ticket as a
 /// `host:port` server address, returning it unchanged.
-fn parse_pair_address(target: &str) -> Result<String, String> {
+pub(crate) fn parse_pair_address(target: &str) -> Result<String, String> {
     if target.is_empty() {
         return Err("usage: chatt pair <host:port | invite-ticket>".to_string());
     }
@@ -707,6 +755,23 @@ mod tests {
     }
 
     #[test]
+    fn parses_join_specifier() {
+        let matches = run_matches(&["chatt", "join", "my-server-label"]);
+        let (name, sub) = matches.subcommand().unwrap();
+        assert_eq!(name, "join");
+        assert_eq!(sub.value_of("specifier"), Some("my-server-label"));
+    }
+
+    #[test]
+    fn join_with_ticket_redirects_to_pair_without_launching() {
+        let matches = run_matches(&["chatt", "join", "tcj1_example"]);
+        let err = dispatch(&matches).expect_err("a ticket is not a join target");
+        let message = err.to_string();
+        assert!(message.contains("chatt pair tcj1_example"));
+        assert!(message.contains("single-use"));
+    }
+
+    #[test]
     fn parses_upload_subcommand_after_value_options() {
         let matches = run_matches(&[
             "chatt",
@@ -806,7 +871,6 @@ mod tests {
     fn unknown_flag_and_subcommand_error() {
         assert!(command::parse(&ROOT, &argv(&["chatt", "--bogus"])).is_err());
         assert!(command::parse(&ROOT, &argv(&["chatt", "frobnicate"])).is_err());
-        assert!(command::parse(&ROOT, &argv(&["chatt", "join", "tcj1_abc"])).is_err());
     }
 
     #[test]

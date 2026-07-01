@@ -154,6 +154,17 @@ Pair from the generated string:
 cargo run -p chatt -- pair tcj1_...
 ```
 
+Connect to an already-configured server by label or address:
+
+```sh
+cargo run -p chatt -- join my-server-label
+cargo run -p chatt -- join 192.168.0.1:4000
+```
+
+`join` connects directly when the specifier matches one configured server, opens
+the picker filtered to the matches when it is ambiguous, and falls back to open
+pairing when nothing matches but the address is a public `host:port`.
+
 Upload a file into an already running client session:
 
 ```sh
@@ -442,6 +453,21 @@ a dynamic user id, issues a bearer token, returns its public UDP endpoints, and
 the client stores a labeled `[[servers]]` entry exactly like invite pairing.
 After the admin bumps `password-epoch`, the next connection is prompted to
 re-enter the password and keeps its user id when public pairing has a password.
+
+### Rejoining a Configured Server
+
+Once a server is paired, `chatt join <specifier>` reaches it without the picker.
+The specifier is a server label or a `host:port` address:
+
+```sh
+cargo run -p chatt -- join my-server-label
+cargo run -p chatt -- join 192.168.0.1:4000
+```
+
+An exact match on a label or address connects directly. A specifier that could
+mean several configured servers opens the picker filtered to them. When nothing
+matches but the specifier is a public `host:port`, `join` starts open pairing
+instead.
 
 ## Security Notes
 

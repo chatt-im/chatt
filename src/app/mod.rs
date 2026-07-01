@@ -234,6 +234,10 @@ pub(crate) struct App {
     pub voice_bytes_received: u64,
     pub encoder_profile: LiveEncoderProfile,
     pub last_network_notice: Option<String>,
+    /// A warn banner shown while a `chatt join` falls back to pairing because no
+    /// configured server matched. Cleared once the client connects, disconnects,
+    /// or cancels the pairing.
+    pub join_notice: Option<String>,
     pub pending_audio_apply: Option<PendingAudioApply>,
     /// When `true`, the lobby shows the detailed developer voice stats instead of
     /// the collapsed per-participant latency estimate. Toggled by `/stats`,
@@ -667,6 +671,22 @@ pub(crate) enum PendingJoin {
     Invite(InviteTicket),
     /// Open pairing against a bare `host:port` address.
     Open { addr: String },
+    /// A `chatt join` request naming a server by label or `host:port`. Resolved
+    /// against the configured servers once the app is constructed.
+    Named { specifier: String },
+}
+
+/// The outcome of resolving a `chatt join` specifier against configured servers.
+#[derive(Debug, PartialEq, Eq)]
+enum JoinResolution {
+    /// Exactly one configured server matched; connect to it by label.
+    Connect(String),
+    /// Several servers could be meant; open the picker filtered to the specifier.
+    Filter,
+    /// No server matched but the specifier is a pairable `host:port`.
+    Pair(String),
+    /// No server matched and the specifier is not a pairable address.
+    NoMatch,
 }
 
 impl App {
@@ -717,6 +737,7 @@ impl App {
             voice_bytes_received: 0,
             encoder_profile: LiveEncoderProfile::DRED_20,
             last_network_notice: None,
+            join_notice: None,
             pending_audio_apply: None,
             lobby_details: false,
             server_rtt_ms: None,
@@ -736,6 +757,7 @@ impl App {
         match pending_join {
             Some(PendingJoin::Invite(ticket)) => app.start_join_pairing(ticket),
             Some(PendingJoin::Open { addr }) => app.start_open_pairing(addr),
+            Some(PendingJoin::Named { specifier }) => app.start_named_join(specifier),
             None if app.config.servers.is_empty() => {
                 app.set_status("no servers configured; run chatt pair <server>");
             }
@@ -1024,6 +1046,7 @@ impl App {
         self.active_server_label = Some(server.label.clone());
         self.network = Some(network);
         self.supervisor.network.reset();
+        self.join_notice = None;
         self.set_status("connecting");
         true
     }
@@ -1042,6 +1065,7 @@ impl App {
         self.reset_room_for_disconnect();
         self.server_rtt_ms = None;
         self.last_network_notice = None;
+        self.join_notice = None;
         self.voice_tx_enabled.store(false, Ordering::Relaxed);
         self.pending_voice_teardown_at = None;
         self.pending_network_commands.clear();
@@ -1127,6 +1151,70 @@ impl App {
         self.set_status(format!("pairing {alias}"));
     }
 
+    /// Resolves and acts on a `chatt join` specifier: connect directly, open the
+    /// filtered picker, or fall back to open pairing behind a warn banner.
+    fn start_named_join(&mut self, specifier: String) {
+        match self.resolve_join(&specifier) {
+            JoinResolution::Connect(label) => {
+                self.start_network(&label);
+            }
+            JoinResolution::Filter => {
+                self.open_filtered_server_select(&specifier);
+                self.set_status(format!("servers matching '{specifier}'"));
+            }
+            JoinResolution::Pair(addr) => {
+                self.join_notice =
+                    Some(format!("no server matching '{specifier}', pairing instead"));
+                self.start_open_pairing(addr);
+            }
+            JoinResolution::NoMatch => {
+                self.open_filtered_server_select(&specifier);
+                self.set_error(format!("no server matching '{specifier}'"));
+            }
+        }
+    }
+
+    /// Decides what a `chatt join` specifier means against the configured servers.
+    ///
+    /// An exact match on a single server's `label` or `tcp_addr` connects. Several
+    /// matches, or a non-exact substring match, open the filtered picker. With no
+    /// match, a valid `host:port` pairs and anything else opens the empty picker.
+    fn resolve_join(&self, specifier: &str) -> JoinResolution {
+        let exact: Vec<&str> = self
+            .config
+            .servers
+            .iter()
+            .filter(|server| server.label == specifier || server.tcp_addr == specifier)
+            .map(|server| server.label.as_str())
+            .collect();
+        if exact.len() == 1 {
+            return JoinResolution::Connect(exact[0].to_string());
+        }
+        if !exact.is_empty() {
+            return JoinResolution::Filter;
+        }
+        let has_substring =
+            self.config.servers.iter().any(|server| {
+                server.label.contains(specifier) || server.tcp_addr.contains(specifier)
+            });
+        if has_substring {
+            return JoinResolution::Filter;
+        }
+        match crate::cli::parse_pair_address(specifier) {
+            Ok(addr) => JoinResolution::Pair(addr),
+            Err(_) => JoinResolution::NoMatch,
+        }
+    }
+
+    /// Opens the server picker with `query` pre-applied so the list starts filtered
+    /// to the servers a `chatt join` specifier could mean.
+    fn open_filtered_server_select(&mut self, query: &str) {
+        self.request_mode_transition(ModeTransition::Set(Box::new(ServerListMode::with_query(
+            query.to_string(),
+        ))));
+        self.rebuild_server_items();
+    }
+
     /// Re-runs the open-pairing worker with a user-entered password, preserving
     /// the pending server and its existing token.
     pub(crate) fn submit_open_pair_password(&mut self, password: String) {
@@ -1155,6 +1243,7 @@ impl App {
     pub(crate) fn cancel_open_pairing(&mut self) {
         self.pop_mode();
         self.pending_pair.take();
+        self.join_notice = None;
         self.set_status("pairing canceled");
     }
 
@@ -4617,6 +4706,74 @@ mod tests {
             },
         );
         assert!(app.deafened.load(Ordering::Relaxed));
+    }
+
+    fn app_with_servers(entries: &[(&str, &str)]) -> App {
+        let mut app = test_app();
+        app.config.servers.clear();
+        for (label, tcp_addr) in entries {
+            app.config.servers.push(ServerEntry {
+                label: label.to_string(),
+                tcp_addr: tcp_addr.to_string(),
+                udp_addr: String::new(),
+                udp_probe_addr: None,
+                username: "Zoe".to_string(),
+                token: "tct1_existing-token".to_string(),
+                server_public_key: String::new(),
+                room_id: 1,
+            });
+        }
+        app
+    }
+
+    #[test]
+    fn join_exact_label_resolves_to_direct_connect() {
+        let app = app_with_servers(&[("lab", "10.0.0.1:4000"), ("home", "10.0.0.2:4000")]);
+        assert_eq!(
+            app.resolve_join("home"),
+            JoinResolution::Connect("home".to_string())
+        );
+    }
+
+    #[test]
+    fn join_exact_address_shared_by_two_servers_opens_filtered_picker() {
+        let app = app_with_servers(&[("work-a", "10.0.0.9:4000"), ("work-b", "10.0.0.9:4000")]);
+        assert_eq!(app.resolve_join("10.0.0.9:4000"), JoinResolution::Filter);
+    }
+
+    #[test]
+    fn join_substring_only_match_opens_filtered_picker() {
+        let app = app_with_servers(&[
+            ("home-desk", "10.0.0.1:4000"),
+            ("home-lap", "10.0.0.2:4000"),
+        ]);
+        // "home" is exact for neither label, but a substring of both.
+        assert_eq!(app.resolve_join("home"), JoinResolution::Filter);
+    }
+
+    #[test]
+    fn join_no_match_pairable_address_falls_back_to_pairing() {
+        let mut app = app_with_servers(&[("lab", "10.0.0.1:4000")]);
+        assert_eq!(
+            app.resolve_join("192.168.0.1:4000"),
+            JoinResolution::Pair("192.168.0.1:4000".to_string())
+        );
+        app.start_named_join("192.168.0.1:4000".to_string());
+        assert!(app.pending_pair.is_some());
+        assert!(app.join_notice.is_some());
+    }
+
+    #[test]
+    fn join_no_match_bad_label_opens_picker_without_pairing() {
+        let mut app = app_with_servers(&[("lab", "10.0.0.1:4000")]);
+        assert_eq!(app.resolve_join("does-not-exist"), JoinResolution::NoMatch);
+        app.start_named_join("does-not-exist".to_string());
+        assert!(app.pending_pair.is_none());
+        assert_eq!(app.status.kind(), StatusKind::Error);
+        assert!(matches!(
+            app.take_mode_transition(),
+            Some(ModeTransition::Set(_))
+        ));
     }
 }
 
