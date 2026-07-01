@@ -13,6 +13,7 @@ pub(crate) enum LivePlaybackMixerEvent {
     EnsureStream {
         stream_id: u32,
         ring: Arc<SampleRing>,
+        intentional_drain: bool,
     },
     StopStream {
         stream_id: u32,
