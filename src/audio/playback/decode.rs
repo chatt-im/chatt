@@ -129,12 +129,7 @@ pub(crate) fn handle_live_playback_command(
             let _ = streams.insert_packet(packet, received_at);
         }
         LivePlaybackCommand::StopStream(stream_id) => {
-            streams.remove_stream(stream_id);
-            push_mixer_event(
-                mixer_events,
-                &mut streams.dropped_mixer_events,
-                LivePlaybackMixerEvent::StopStream { stream_id },
-            );
+            streams.stop_stream(stream_id, mixer_events);
         }
         LivePlaybackCommand::SetStreamControl(stream_id, control) => {
             streams.set_stream_control(stream_id, control, mixer_events);
@@ -294,6 +289,12 @@ pub(crate) struct LiveDecodeStreams {
     /// queue, re-pushed each drain cycle until delivered so a mute is deferred
     /// rather than lost. A later delivered control clears the pending entry.
     pending_mixer_controls: HashMap<u32, PlaybackStreamControl>,
+    /// Streams whose `StopStream` push was rejected by a full mixer event queue,
+    /// re-pushed each drain cycle until delivered. While an id is pending here
+    /// its `EnsureStream` is withheld: the mixer's `ensure_stream` no-ops on an
+    /// occupied id, so a straggler-recreated stream registered before the stop
+    /// lands would leave the mixer reading the dead ring forever.
+    pending_mixer_stops: HashSet<u32>,
     stats: LivePlaybackMixerStats,
     block_samples: usize,
     dropped_mixer_events: u64,
@@ -311,6 +312,7 @@ impl LiveDecodeStreams {
             mixer_intentional_drains: HashMap::new(),
             pending_sender_muted: HashMap::new(),
             pending_mixer_controls: HashMap::new(),
+            pending_mixer_stops: HashSet::new(),
             stats: LivePlaybackMixerStats::default(),
             block_samples: FRAME_SAMPLES,
             dropped_mixer_events: 0,
@@ -433,6 +435,28 @@ impl LiveDecodeStreams {
         self.pending_mixer_controls.remove(&stream_id);
     }
 
+    pub(crate) fn stop_stream(
+        &mut self,
+        stream_id: u32,
+        mixer_events: &SpscSwapQueue<LivePlaybackMixerEvent>,
+    ) {
+        self.remove_stream(stream_id);
+        let event = LivePlaybackMixerEvent::StopStream { stream_id };
+        if !push_mixer_event(mixer_events, &mut self.dropped_mixer_events, event) {
+            self.pending_mixer_stops.insert(stream_id);
+        }
+    }
+
+    fn flush_pending_mixer_stops(&mut self, mixer_events: &SpscSwapQueue<LivePlaybackMixerEvent>) {
+        let dropped = &mut self.dropped_mixer_events;
+        self.pending_mixer_stops.retain(|stream_id| {
+            let event = LivePlaybackMixerEvent::StopStream {
+                stream_id: *stream_id,
+            };
+            !push_mixer_event(mixer_events, dropped, event)
+        });
+    }
+
     pub(crate) fn set_stream_control(
         &mut self,
         stream_id: u32,
@@ -480,6 +504,7 @@ impl LiveDecodeStreams {
         now: Instant,
         feedback_sender: Option<&Sender<LivePlaybackFeedback>>,
     ) {
+        self.flush_pending_mixer_stops(mixer_events);
         self.flush_pending_mixer_controls(mixer_events);
         let block = self.block_samples;
         let producers = &mut self.producers;
@@ -500,6 +525,13 @@ impl LiveDecodeStreams {
             );
             let intentional = producer.intentional_drain();
             if !self.mixer_streams.contains(stream_id) {
+                // The consumer may drain the queue between the failed stop flush
+                // above and this push, so without this guard the EnsureStream
+                // could land ahead of the retried StopStream and be destroyed by
+                // it (or no-op against the occupied entry the stop targets).
+                if self.pending_mixer_stops.contains(stream_id) {
+                    continue;
+                }
                 let event = LivePlaybackMixerEvent::EnsureStream {
                     stream_id: *stream_id,
                     ring: producer.ring(),
@@ -1299,6 +1331,73 @@ mod tests {
             !queue.remove(&mut event),
             "stale pending control was resent after a newer one was delivered"
         );
+    }
+
+    #[test]
+    fn stop_dropped_by_full_queue_is_resent_before_stream_reregistration() {
+        let now = Instant::now();
+        let tuning = test_tuning();
+        let mut streams = LiveDecodeStreams::new(tuning);
+        let mut encoder = OpusVoiceEncoder::new(32_000).unwrap();
+        let queue = SpscSwapQueue::<LivePlaybackMixerEvent>::with_capacity(2);
+
+        let opus = tone_packet(&mut encoder, 0);
+        streams.insert_packet(voice_packet(7, 0, 0, opus, now), now);
+        streams.drain_into_mixer_events(&queue, now, None);
+        let mut event = LivePlaybackMixerEvent::Empty;
+        assert!(queue.remove(&mut event));
+        assert!(matches!(
+            event,
+            LivePlaybackMixerEvent::EnsureStream { stream_id: 7, .. }
+        ));
+
+        // The audio callback stalls and stops draining: the queue fills up.
+        let mut filler = LivePlaybackMixerEvent::StopStream { stream_id: 99 };
+        while queue.insert(&mut filler) {
+            filler = LivePlaybackMixerEvent::StopStream { stream_id: 99 };
+        }
+
+        // The peer leaves voice while the queue is full, so the StopStream
+        // event is rejected; a straggler media packet then recreates the
+        // stream with a fresh ring.
+        assert!(handle_live_playback_command(
+            LivePlaybackCommand::StopStream(7),
+            &mut streams,
+            &queue,
+        ));
+        let opus = tone_packet(&mut encoder, LIVE_OPUS_FRAME_SAMPLES);
+        streams.insert_packet(voice_packet(7, 1, 0, opus, now), now);
+
+        // The callback resumes and drains the backlog.
+        let mut drained = LivePlaybackMixerEvent::Empty;
+        while queue.remove(&mut drained) {
+            drained = LivePlaybackMixerEvent::Empty;
+        }
+
+        streams.drain_into_mixer_events(&queue, now, None);
+
+        // The stop must reach the mixer before the re-registration: its
+        // ensure_stream no-ops on an occupied id, so without the stop it keeps
+        // reading the dead ring and the recreated stream is never audible.
+        let mut event = LivePlaybackMixerEvent::Empty;
+        assert!(
+            queue.remove(&mut event),
+            "dropped StopStream was never resent"
+        );
+        assert!(
+            matches!(event, LivePlaybackMixerEvent::StopStream { stream_id: 7 }),
+            "expected the resent StopStream first, got {}",
+            event.kind()
+        );
+        let mut event = LivePlaybackMixerEvent::Empty;
+        assert!(
+            queue.remove(&mut event),
+            "recreated stream was never re-registered"
+        );
+        assert!(matches!(
+            event,
+            LivePlaybackMixerEvent::EnsureStream { stream_id: 7, .. }
+        ));
     }
 
     fn take_notification_ring(
