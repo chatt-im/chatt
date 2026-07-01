@@ -1,12 +1,15 @@
 [service.server]
-profiles = ["default", "pop"]
+profiles = ["private", "pop", "public"]
 sh = '''
 rm -f /tmp/chatt-server.kvlog
-cargo run $CARGO_FLAGS -p server -- --logfile /tmp/chatt-server.kvlog serve dev/chatt-server.toml
+cargo run $CARGO_FLAGS -p server -- --logfile /tmp/chatt-server.kvlog serve $CHATT_SERVER_CONFIG
 '''
+env.CHATT_RUN_DIR = { if.profile = "public", then = "/tmp/public-dev-chatt-server/", or_else = "/tmp/private-dev-chatt-server/" }
+env.CHATT_SERVER_CONFIG = { if.profile = "public", then = "dev/public-server.toml", or_else = "dev/private-server.toml" }
 env.CARGO_FLAGS = { if.profile = "pop", then = "--release", or_else = "" }
 env.CHATT_AUDIO_POP_LOG = { if.profile = "pop", then = "1", or_else = "0" }
 ready.when.output_contains = "chatt server listening"
+allow_multiple = "distinct_profiles"
 ready.timeout = 10.0
 info = "Local chatt development server"
 
@@ -34,6 +37,7 @@ info = "Run the Alice client; trailing args run a chatt subcommand against it"
 profiles = ["default", "pop"]
 require = ["server"]
 managed = false
+allow_multiple = true
 cli.forward_arguments = true
 env.CHATT_RUN_DIR = "/tmp/chatt-dev/bob"
 env.CARGO_FLAGS = { if.profile = "pop", then = "--release", or_else = "" }
@@ -53,6 +57,7 @@ info = "Run the Bob client; trailing args run a chatt subcommand against it"
 profiles = ["default", "pop"]
 require = ["server"]
 managed = false
+allow_multiple = true
 cli.forward_arguments = true
 env.CHATT_RUN_DIR = "/tmp/chatt-dev/soundboard"
 env.CARGO_FLAGS = { if.profile = "pop", then = "--release", or_else = "" }

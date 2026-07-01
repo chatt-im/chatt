@@ -1,0 +1,20 @@
+# chatt server configuration
+
+[network]
+tcp-addr = "127.0.0.1:42000"
+p2p-enabled = false
+
+[security]
+server-identity-seed = "546f6d636861742064657620736572766572206b657920763100000000000001"
+encryption = true
+chat-history-limit = 0
+max-file-size-bytes = 52428800
+public = true
+password = "123"
+password-epoch = 0
+next-dynamic-user-id = 4294967298
+
+[[rooms]]
+id = 1
+name = "lobby"
+
