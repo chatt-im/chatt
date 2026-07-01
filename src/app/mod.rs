@@ -1163,8 +1163,9 @@ impl App {
                 self.set_status(format!("servers matching '{specifier}'"));
             }
             JoinResolution::Pair(addr) => {
-                self.join_notice =
-                    Some(format!("no server matching '{specifier}', pairing instead"));
+                self.join_notice = Some(format!(
+                    "   No saved server matches '{specifier}'; pairing with {addr} instead"
+                ));
                 self.start_open_pairing(addr);
             }
             JoinResolution::NoMatch => {
@@ -1218,7 +1219,6 @@ impl App {
     /// Re-runs the open-pairing worker with a user-entered password, preserving
     /// the pending server and its existing token.
     pub(crate) fn submit_open_pair_password(&mut self, password: String) {
-        self.pop_mode();
         let Some(pending) = self.pending_pair.as_ref() else {
             return;
         };
@@ -1236,6 +1236,81 @@ impl App {
             self.events.sender(),
         );
         self.set_status(format!("pairing {alias}"));
+    }
+
+    /// Pins or verifies the trusted server key carried by an open-pairing
+    /// password challenge. The prompt owns the visible retry/error text; this
+    /// only mutates durable pairing state.
+    pub(crate) fn accept_open_pairing_password_challenge(
+        &mut self,
+        server_public_key: String,
+    ) -> Result<(), String> {
+        let Some(pair) = self.pending_pair.as_mut() else {
+            return Err("pairing password prompt is no longer active".to_string());
+        };
+        if pair.server.server_public_key.is_empty() {
+            pair.server.server_public_key = server_public_key;
+            return Ok(());
+        }
+        if pair.server.server_public_key != server_public_key {
+            self.pending_pair.take();
+            return Err("pairing failed: server key changed during password retry".to_string());
+        }
+        Ok(())
+    }
+
+    pub(crate) fn complete_open_pairing(
+        &mut self,
+        token: String,
+        server_public_key: String,
+        udp_addr: String,
+        udp_probe_addr: Option<String>,
+    ) {
+        self.complete_open_pairing_inner(token, server_public_key, udp_addr, udp_probe_addr, false);
+    }
+
+    pub(crate) fn complete_open_pairing_from_password_prompt(
+        &mut self,
+        token: String,
+        server_public_key: String,
+        udp_addr: String,
+        udp_probe_addr: Option<String>,
+    ) {
+        self.complete_open_pairing_inner(token, server_public_key, udp_addr, udp_probe_addr, true);
+    }
+
+    fn complete_open_pairing_inner(
+        &mut self,
+        token: String,
+        server_public_key: String,
+        udp_addr: String,
+        udp_probe_addr: Option<String>,
+        close_prompt_if_idle: bool,
+    ) {
+        let Some(mut pair) = self.pending_pair.take() else {
+            self.set_status("pairing succeeded");
+            if close_prompt_if_idle && self.pending_transition.is_empty() {
+                self.pop_mode();
+            }
+            return;
+        };
+        pair.server.token = token;
+        pair.server.server_public_key = server_public_key;
+        pair.server.udp_addr = udp_addr;
+        pair.server.udp_probe_addr = udp_probe_addr;
+        if let Err(error) = validate_server_entry(&pair.server) {
+            self.set_error(error);
+            if close_prompt_if_idle && self.pending_transition.is_empty() {
+                self.pop_mode();
+            }
+            return;
+        }
+        let close_after_reconnect =
+            close_prompt_if_idle && matches!(pair.completion, PairCompletion::Reconnect { .. });
+        self.complete_pairing(pair.server, pair.completion);
+        if close_after_reconnect && self.pending_transition.is_empty() {
+            self.pop_mode();
+        }
     }
 
     /// Cancels an in-progress open pairing when the user dismisses the password
@@ -1669,33 +1744,13 @@ impl App {
                 server_public_key,
                 udp_addr,
                 udp_probe_addr,
-            } => {
-                let Some(mut pair) = self.pending_pair.take() else {
-                    self.set_status("pairing succeeded");
-                    return;
-                };
-                pair.server.token = token;
-                pair.server.server_public_key = server_public_key;
-                pair.server.udp_addr = udp_addr;
-                pair.server.udp_probe_addr = udp_probe_addr;
-                if let Err(error) = validate_server_entry(&pair.server) {
-                    self.set_error(error);
-                    return;
-                }
-                self.complete_pairing(pair.server, pair.completion);
-            }
+            } => self.complete_open_pairing(token, server_public_key, udp_addr, udp_probe_addr),
             NetworkEvent::OpenPairingNeedsPassword {
                 retry,
                 server_public_key,
             } => {
-                let Some(pair) = self.pending_pair.as_mut() else {
-                    return;
-                };
-                if pair.server.server_public_key.is_empty() {
-                    pair.server.server_public_key = server_public_key;
-                } else if pair.server.server_public_key != server_public_key {
-                    self.pending_pair.take();
-                    self.set_error("pairing failed: server key changed during password retry");
+                if let Err(error) = self.accept_open_pairing_password_challenge(server_public_key) {
+                    self.set_error(error);
                     return;
                 }
                 self.push_mode(Box::new(PasswordPromptMode::new(retry)));

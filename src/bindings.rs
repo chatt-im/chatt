@@ -13,6 +13,7 @@ pub const FORM_LAYER: LayerId = LayerId::new(4);
 pub const SETTINGS_LAYER: LayerId = LayerId::new(5);
 pub const DIALOG_LAYER: LayerId = LayerId::new(6);
 pub const COMPOSE_NORMAL_LAYER: LayerId = LayerId::new(7);
+pub const PASSWORD_LAYER: LayerId = LayerId::new(8);
 
 #[derive(Clone, Debug, Toml)]
 pub enum BindCommand {
@@ -57,6 +58,8 @@ pub enum BindCommand {
     PlaySoundboard8,
     PlaySoundboard9,
     ToggleKeyPreview,
+    SubmitPassword,
+    TogglePasswordVisibility,
     EditServer,
     DeleteServer,
     SearchServers,
@@ -107,6 +110,8 @@ impl std::fmt::Display for BindCommand {
             PlaySoundboard8 => "PlaySoundboard8",
             PlaySoundboard9 => "PlaySoundboard9",
             ToggleKeyPreview => "ToggleKeyPreview",
+            SubmitPassword => "SubmitPassword",
+            TogglePasswordVisibility => "TogglePasswordVisibility",
             EditServer => "EditServer",
             DeleteServer => "DeleteServer",
             SearchServers => "SearchServers",
@@ -169,6 +174,8 @@ impl BindCommand {
             PlaySoundboard8 => spec("Sound 8", ACTION),
             PlaySoundboard9 => spec("Sound 9", ACTION),
             ToggleKeyPreview => spec("More", APP),
+            SubmitPassword => spec("Submit", ACTION),
+            TogglePasswordVisibility => spec("Reveal", ACTION),
             EditServer => spec("Edit", ACTION),
             DeleteServer => spec("Delete", DESTRUCTIVE),
             SearchServers => spec("Search", ACTION),
@@ -358,6 +365,7 @@ impl<'de> FromToml<'de> for BindingRuntime {
             ("form", FORM_LAYER),
             ("settings", SETTINGS_LAYER),
             ("dialog", DIALOG_LAYER),
+            ("password", PASSWORD_LAYER),
         ] {
             if let Some(bindings) = default_table.get(name) {
                 extend_layer(ctx, bindings, &mut actions, &mut builder, layer)?;

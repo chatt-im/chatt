@@ -56,7 +56,7 @@ pub(crate) fn run_app(
 
     loop {
         while let Some(event) = app.next_event() {
-            app.handle_app_event(event);
+            mode_stack.process_app_event(&mut app, event);
             mode_stack.apply_pending(&mut app);
         }
         app.tick();

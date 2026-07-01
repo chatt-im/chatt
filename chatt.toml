@@ -171,3 +171,9 @@ prefer-ipv6 = true
 "DOWN" = "AdjustLeft"
 "UP" = "AdjustRight"
 "." = "ToggleKeyPreview"
+
+[bindings.password]
+"C-c" = "Quit"
+"ESC" = "Cancel"
+"ENTER" = "SubmitPassword"
+"C-r" = "TogglePasswordVisibility"
