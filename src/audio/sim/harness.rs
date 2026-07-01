@@ -1711,12 +1711,12 @@ mod tests {
 
     #[test]
     fn alternating_silence_does_not_inflate_playout() {
-        // A no-loss link isolates the silence gate: the only thing that can move
-        // the playout floor between these two runs is the resume burst the gate
-        // emits after each silence pause. The resume-stat suppression in
-        // `NetEqCore::insert_packet` must keep the alternating-speech floor from
-        // drifting above the continuous-speech floor, otherwise intermittent
-        // speech pays a standing latency penalty (the ~25 ms regression).
+        // A no-loss link isolates the silence gate. Muted NetEQ output is now
+        // suppressed at the producer boundary instead of being queued as zero
+        // blocks, so resume can have a larger instantaneous playout-delay
+        // transient while the actual ring is empty. The invariant is that the
+        // NetEQ target floor and average steady-state playout do not drift up,
+        // and intentional muted drain is not counted as starvation.
         let continuous = simulate_with_loss(
             LiveAudioSimulationScenario::ConstantSpeech,
             Duration::from_secs(60),
@@ -1734,12 +1734,19 @@ mod tests {
 
         assert!(alternating.suppressed_frames > 0, "{alternating:?}");
         assert!(
-            alternating.steady_state_max_neteq_playout_delay_ms
-                <= continuous.steady_state_max_neteq_playout_delay_ms
-                    + SILENCE_NEUTRALITY_MARGIN_MS,
-            "silence-gated resume inflated the playout floor: \
+            alternating.steady_state_min_neteq_target_ms
+                <= continuous.steady_state_min_neteq_target_ms,
+            "silence-gated resume inflated the NetEQ target floor: \
              alternating={alternating:?} continuous={continuous:?}"
         );
+        assert!(
+            alternating.steady_state_avg_neteq_playout_delay_ms
+                <= continuous.steady_state_avg_neteq_playout_delay_ms
+                    + SILENCE_NEUTRALITY_MARGIN_MS as f64,
+            "silence-gated resume inflated average playout delay: \
+             alternating={alternating:?} continuous={continuous:?}"
+        );
+        assert_eq!(alternating.steady_state_underruns, 0, "{alternating:?}");
         assert_coherent_output(&alternating, 0.002);
     }
 

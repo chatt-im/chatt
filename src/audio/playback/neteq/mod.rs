@@ -30,3 +30,5 @@ mod sync_buffer;
 mod tick_timer;
 
 pub(crate) use core::{AudioResult, NetEqCore, NetEqDiagnostics};
+#[cfg(test)]
+pub(crate) use operation::Mode;

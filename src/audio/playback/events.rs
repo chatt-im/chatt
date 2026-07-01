@@ -21,6 +21,10 @@ pub(crate) enum LivePlaybackMixerEvent {
         stream_id: u32,
         control: PlaybackStreamControl,
     },
+    SetStreamIntentionalDrain {
+        stream_id: u32,
+        intentional: bool,
+    },
 }
 
 impl Default for LivePlaybackMixerEvent {
@@ -36,6 +40,7 @@ impl LivePlaybackMixerEvent {
             Self::EnsureStream { .. } => "ensure_stream",
             Self::StopStream { .. } => "stop_stream",
             Self::SetStreamControl { .. } => "set_stream_control",
+            Self::SetStreamIntentionalDrain { .. } => "set_stream_intentional_drain",
         }
     }
 }
