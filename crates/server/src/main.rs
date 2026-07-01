@@ -3,6 +3,7 @@ use std::{
     collections::VecDeque,
     io::{self, Read, Write},
     net::{IpAddr, SocketAddr},
+    path::Path,
     sync::mpsc,
     sync::{Arc, OnceLock},
     thread,
@@ -85,20 +86,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some(logfile) => kvlog::collector::init_file_logger(&logfile),
         None => kvlog::spawn_collector_from_env(Some("chatt-server"), false),
     };
-    if args.get(1).is_some_and(|arg| arg == "invite") {
-        let user = args
-            .get(2)
-            .ok_or_else(|| invalid_config("usage: chatt-server invite USER".to_string()))?;
-        if args.len() != 3 || user.trim().is_empty() {
-            return Err(invalid_config("usage: chatt-server invite USER".to_string()).into());
-        }
-        let join_string = local_admin::send_invite(user).map_err(invalid_config)?;
-        println!("{join_string}");
-        return Ok(());
-    }
 
-    let config_path = value_arg(&args, "--config");
-    let config = ServerConfig::load(config_path.as_deref()).map_err(invalid_config)?;
+    let command = positional_args(&args);
+    let config = match command.as_slice() {
+        ["invite", user] if !user.trim().is_empty() => {
+            let join_string = local_admin::send_invite(user).map_err(invalid_config)?;
+            println!("{join_string}");
+            return Ok(());
+        }
+        ["init-config", path] if !path.trim().is_empty() => {
+            config::write_generated_template(Path::new(path)).map_err(invalid_config)?;
+            println!("wrote chatt server config template to {path}");
+            return Ok(());
+        }
+        ["serve", path] if !path.trim().is_empty() => {
+            ServerConfig::load(Path::new(path)).map_err(invalid_config)?
+        }
+        _ => return Err(invalid_config(server_usage()).into()),
+    };
     let server_public_key = config.server_public_key_hex().map_err(invalid_config)?;
     let udp_probe_addr = config.network.udp_probe_addr;
     let udp_probe_label = udp_probe_addr
@@ -1537,6 +1542,7 @@ impl Server {
             return Ok(());
         }
         let required_password = self.config.password().map(str::to_string);
+        let mut current_password_verified = false;
         if let Some(required) = required_password {
             if password.is_empty() {
                 return self.reject_auth(
@@ -1557,6 +1563,7 @@ impl Server {
                     "open pairing password is incorrect".to_string(),
                 );
             }
+            current_password_verified = true;
         }
         let display_name = display_name.trim();
         if display_name.is_empty() || display_name.len() > 64 {
@@ -1567,9 +1574,11 @@ impl Server {
             );
         }
         let seed = self.config.security.server_identity_seed.clone();
+        let current_epoch = self.config.password_epoch();
         let existing_user_id = (!existing_token.is_empty())
             .then(|| verify_dynamic_token(&seed, existing_token).ok())
             .flatten()
+            .filter(|claims| claims.password_epoch == current_epoch || current_password_verified)
             .map(|claims| claims.user_id)
             .filter(|user_id| is_dynamic_user_id(*user_id));
         let user_id = match existing_user_id {
@@ -1585,7 +1594,7 @@ impl Server {
             &seed,
             &DynamicTokenClaims {
                 user_id,
-                password_epoch: self.config.password_epoch(),
+                password_epoch: current_epoch,
             },
         )
         .map_err(|error| error.to_string())?;
@@ -3685,6 +3694,24 @@ fn invalid_config(error: String) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, error)
 }
 
+fn server_usage() -> String {
+    "usage: chatt-server serve CONFIG_PATH | chatt-server init-config CONFIG_PATH | chatt-server invite USER".to_string()
+}
+
+fn positional_args(args: &[String]) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut index = 1;
+    while index < args.len() {
+        if args[index] == "--logfile" {
+            index += 2;
+        } else {
+            out.push(args[index].as_str());
+            index += 1;
+        }
+    }
+    out
+}
+
 fn is_interrupted_io_error(error: &io::Error) -> bool {
     error.kind() == io::ErrorKind::Interrupted || error.raw_os_error() == Some(libc::EINTR)
 }
@@ -3972,6 +3999,19 @@ mod tests {
             file_receive_limit_bytes: 0,
             joined_at_ms: 0,
         }
+    }
+
+    #[test]
+    fn positional_args_skip_global_logfile_pair() {
+        let args = vec![
+            "chatt-server".to_string(),
+            "--logfile".to_string(),
+            "/tmp/chatt-server.log".to_string(),
+            "serve".to_string(),
+            "server.toml".to_string(),
+        ];
+
+        assert_eq!(positional_args(&args), vec!["serve", "server.toml"]);
     }
 
     fn test_server() -> Server {
@@ -4354,6 +4394,28 @@ mod tests {
     #[test]
     fn open_pair_preserves_identity_on_re_pair() {
         let (mut server, path) = open_pair_test_server("reuse");
+        server.config.security.password = Some("hunter2".to_string());
+        server.config.security.password_epoch = 7;
+        let seed = server.config.security.server_identity_seed.clone();
+        let existing = issue_dynamic_token(
+            &seed,
+            &DynamicTokenClaims {
+                user_id: UserId(config::FIRST_DYNAMIC_USER_ID + 5),
+                password_epoch: 0,
+            },
+        )
+        .unwrap();
+
+        let _ = server.open_pair_client(Token(1), "Zoe", "hunter2", &existing, true, 0);
+
+        let session = session_for(&server, Token(1)).expect("session established");
+        assert_eq!(session.user_id, UserId(config::FIRST_DYNAMIC_USER_ID + 5));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn open_pair_without_password_does_not_preserve_stale_identity() {
+        let (mut server, path) = open_pair_test_server("reuse-stale-no-password");
         server.config.security.password_epoch = 7;
         let seed = server.config.security.server_identity_seed.clone();
         let existing = issue_dynamic_token(
@@ -4368,13 +4430,14 @@ mod tests {
         let _ = server.open_pair_client(Token(1), "Zoe", "", &existing, true, 0);
 
         let session = session_for(&server, Token(1)).expect("session established");
-        assert_eq!(session.user_id, UserId(config::FIRST_DYNAMIC_USER_ID + 5));
+        assert_eq!(session.user_id, UserId(config::FIRST_DYNAMIC_USER_ID));
         let _ = std::fs::remove_file(&path);
     }
 
     #[test]
     fn open_pair_reissues_current_epoch_token_on_re_pair() {
         let (mut server, path) = open_pair_test_server("reuse-token");
+        server.config.security.password = Some("hunter2".to_string());
         server.config.security.password_epoch = 7;
         server.config.network.public_udp_addr = "198.51.100.20:54100".to_string();
         server.config.network.public_udp_probe_addr = Some("198.51.100.20:54101".to_string());
@@ -4393,7 +4456,7 @@ mod tests {
         server.clients.insert(token, conn);
 
         server
-            .open_pair_client(token, "Zoe", "", &existing, true, 0)
+            .open_pair_client(token, "Zoe", "hunter2", &existing, true, 0)
             .unwrap();
 
         let response = read_plaintext_server_control(&mut peer);
