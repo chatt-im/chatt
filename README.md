@@ -78,12 +78,13 @@ Dependency notes:
 Run the development server:
 
 ```sh
-cargo run -p server
+cargo run -p server -- init-config chatt-server.toml
+cargo run -p server -- serve chatt-server.toml
 ```
 
-The server loads `./chatt-server.toml` by default and prints its Ed25519 public
-key at startup. Keep that public key for client pinning outside local
-development.
+The server requires an explicit config path. `init-config` writes a commented
+template with a generated Ed25519 identity seed; `serve` loads that path and
+prints the server public key for client pinning.
 
 Run the client:
 
@@ -313,8 +314,13 @@ The client accepts `--config` / `CHATT_CONFIG` for config path selection.
 
 ## Server Configuration
 
-Server config is loaded from `./chatt-server.toml` when present, or from
-`--config` / `CHATT_SERVER_CONFIG`.
+Server config is never loaded implicitly. Generate a private template once, then
+start the server with that path:
+
+```sh
+cargo run -p server -- init-config chatt-server.toml
+cargo run -p server -- serve chatt-server.toml
+```
 
 Important server fields:
 
@@ -326,7 +332,7 @@ tcp-addr = "127.0.0.1:41000"
 p2p-enabled = true
 
 [security]
-server-identity-seed = "546f6d636861742064657620736572766572206b657920763100000000000001"
+server-identity-seed = "<generated 64 hex chars>"
 encryption = true
 chat-history-limit = 0
 # max upload size the server relays, any u64 (e.g. 68719476736 for 64 GiB); defaults to 50 MiB
@@ -335,12 +341,6 @@ max-file-size-bytes = 52428800
 [[rooms]]
 id = 1
 name = "lobby"
-
-[[users]]
-id = 1
-name = "alice"
-display-name = "Alice"
-token-hash = "sha256:..."
 ```
 
 `tcp-addr`, `udp-addr`, and `udp-probe-addr` are bind addresses on the server
@@ -350,12 +350,11 @@ public fields when clients need a DNS name, public IP, reverse proxy port, or
 NAT-forwarded port. When omitted, the public fields default to the corresponding
 bind address.
 
-Replace the development `server-identity-seed` and user token hashes before
-using a server outside local testing. `name` is the admin-chosen internal
-identifier. It is used by `invite` and distinguishes users server-side, and it
-is never sent by or shown to clients, which authenticate by token alone.
-`display-name` is updated when a user successfully joins. Room id `1` is required
-as the default lobby by the current client flow.
+The generated `server-identity-seed` must stay private. Explicit users are added
+by `chatt-server invite USER` when the invite is accepted; `name` is the
+admin-chosen internal identifier, while `display-name` is updated when a user
+successfully joins. Room id `1` is required as the default lobby by the current
+client flow.
 
 `encryption = true` makes the server require encrypted TCP control and
 server-relayed UDP media transport. Set it to `false` only for trusted local
@@ -371,10 +370,11 @@ sealed bearer token that carries the user id and the `password-epoch`. Set
 `password` to gate open joining behind a shared secret. New anonymous dynamic
 user allocations are rate-limited per source IP and globally to protect the
 server config write path. Bump `password-epoch` to invalidate every issued
-dynamic token, forcing affected clients to re-pair with the current password
-while keeping their user id. Changing `password` without bumping the epoch
-leaves existing tokens valid. `public` defaults to `false`; when false, dynamic
-tokens are rejected and only invite-based and explicit users can authenticate.
+dynamic token. With a configured password, affected clients can re-pair with the
+current password and keep their user id; without a password, stale-token re-pair
+allocates a new dynamic id. Changing `password` without bumping the epoch leaves
+existing tokens valid. `public` defaults to `false`; when false, dynamic tokens
+are rejected and only invite-based and explicit users can authenticate.
 
 `chat-history-limit = 0` means the server relays chat without retaining message
 bodies for future room joins. Raising the value keeps that many messages in
@@ -389,8 +389,8 @@ control and media sockets. `udp-probe-addr` is optional and only enables a
 second UDP endpoint for P2P NAT classification; ordinary voice relay does not
 need it.
 
-The server accepts `--config` / `CHATT_SERVER_CONFIG` for config path
-selection. Network, P2P, encryption, and history settings live in TOML.
+Network, P2P, encryption, and history settings live in the explicit TOML path
+passed to `chatt-server serve`.
 
 ## Pairing Procedure
 
@@ -400,7 +400,7 @@ pairing code in either config file.
 1. Start the server with a writable config path:
 
 ```sh
-cargo run -p server -- --config chatt-server.toml
+cargo run -p server -- serve chatt-server.toml
 ```
 
 2. On the server host, create an in-memory 24-hour invite:
@@ -441,7 +441,7 @@ from the first response, and retries only against that key. The server allocates
 a dynamic user id, issues a bearer token, returns its public UDP endpoints, and
 the client stores a labeled `[[servers]]` entry exactly like invite pairing.
 After the admin bumps `password-epoch`, the next connection is prompted to
-re-enter the password and keeps its user id.
+re-enter the password and keeps its user id when public pairing has a password.
 
 ## Security Notes
 

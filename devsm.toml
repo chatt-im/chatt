@@ -1,7 +1,8 @@
 [service.server]
 sh = '''
 rm /tmp/chatt-server.kvlog
-cargo run -p server -- --config chatt-server.toml --logfile /tmp/chatt-server.kvlog
+test -f chatt-server.toml || cargo run -p server -- init-config chatt-server.toml
+cargo run -p server -- --logfile /tmp/chatt-server.kvlog serve chatt-server.toml
 '''
 ready.when.output_contains = "chatt server listening"
 ready.timeout = 10.0
@@ -37,7 +38,8 @@ kvlog /tmp/chatt-alice.kvlog --json > /tmp/chatt-alice.json
 [service.audio-pop-server]
 sh = '''
 rm -f /tmp/chatt-server.kvlog /tmp/chatt-server.json
-cargo run --release -p server -- --config chatt-server.toml --logfile /tmp/chatt-server.kvlog
+test -f chatt-server.toml || cargo run --release -p server -- init-config chatt-server.toml
+cargo run --release -p server -- --logfile /tmp/chatt-server.kvlog serve chatt-server.toml
 '''
 ready.when.output_contains = "chatt server listening"
 ready.timeout = 10.0
