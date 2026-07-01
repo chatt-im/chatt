@@ -172,6 +172,21 @@ impl DredDecoder {
         Ok(())
     }
 
+    /// Complete deferred processing in-place.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidState`] if pointers are invalid, or a mapped libopus
+    /// error when [`opus_dred_process`] fails.
+    pub fn process_in_place(&mut self, state: &mut DredState) -> Result<()> {
+        let r =
+            unsafe { opus_dred_process(self.raw.as_ptr(), state.raw.as_ptr(), state.raw.as_ptr()) };
+        if r != 0 {
+            return Err(Error::from_code(r));
+        }
+        Ok(())
+    }
+
     /// Decode redundancy into i16 PCM using a normal Opus decoder.
     ///
     /// # Errors

@@ -104,6 +104,7 @@ pub(crate) struct NetEqDiagnostics {
 struct DredParse {
     sequence: u32,
     state: DredState,
+    processed: bool,
 }
 
 /// The faithful NetEQ control + decode loop for the live playback path.
@@ -324,16 +325,13 @@ impl NetEqCore {
         // played) audio and this packet's timestamp.
         let current_gap = self.recovery_gap(timestamp);
         let fec = Self::parse_fec(opus);
-        let dred = self.parse_dred(sequence, &datagram);
-        let dred_reach = dred
-            .map(|info| info.samples.max(0) as u32)
-            .unwrap_or_default();
-        self.dred_last_horizon_samples = dred_reach as usize;
-        if current_gap > dred_reach {
+        let (dred, available_horizon_samples) = self.parse_dred(sequence, &datagram, current_gap);
+        self.dred_last_horizon_samples = available_horizon_samples as usize;
+        if current_gap > available_horizon_samples {
             self.dred_missed_horizon_count = self.dred_missed_horizon_count.saturating_add(1);
             self.dred_missed_horizon_samples = self
                 .dred_missed_horizon_samples
-                .saturating_add(u64::from(current_gap - dred_reach));
+                .saturating_add(u64::from(current_gap - available_horizon_samples));
         }
 
         let packets = parse_payload_redundancy(
@@ -450,31 +448,68 @@ impl NetEqCore {
         })
     }
 
-    /// Parses the DRED region of `datagram`, caching the parsed state for the
-    /// decode loop. Returns the DRED span so [`parse_payload_redundancy`] can
-    /// place the recovery chunks.
-    fn parse_dred(&mut self, sequence: u32, datagram: &Rc<Vec<u8>>) -> Option<DredInfo> {
-        let decoder = self.dred_decoder.as_mut()?;
+    /// Parses the DRED region of `datagram`, caching a gap-bounded state for the
+    /// decode loop. Returns the gap-bounded DRED span for recovery placement plus
+    /// the packet's full available DRED horizon for diagnostics.
+    fn parse_dred(
+        &mut self,
+        sequence: u32,
+        datagram: &Rc<Vec<u8>>,
+        current_gap: u32,
+    ) -> (Option<DredInfo>, u32) {
+        if current_gap == 0 {
+            return (None, 0);
+        }
+        let Some(decoder) = self.dred_decoder.as_mut() else {
+            return (None, 0);
+        };
+        let available_horizon_samples =
+            Self::parse_dred_state(decoder, datagram, LIVE_PLAYBACK_DRED_MAX_SAMPLES)
+                .map(|(_, reach, _)| reach as u32)
+                .unwrap_or_default();
+        let max_dred_samples = usize::try_from(current_gap)
+            .unwrap_or(usize::MAX)
+            .min(LIVE_PLAYBACK_DRED_MAX_SAMPLES);
+        let Some((state, reach, dred_end)) =
+            Self::parse_dred_state(decoder, datagram, max_dred_samples)
+        else {
+            return (None, available_horizon_samples);
+        };
+        if reach == 0 {
+            return (None, available_horizon_samples);
+        }
+        self.dred_parse = Some(DredParse {
+            sequence,
+            state,
+            processed: false,
+        });
+        (
+            Some(DredInfo {
+                samples: reach as i32,
+                dred_end,
+            }),
+            available_horizon_samples,
+        )
+    }
+
+    fn parse_dred_state(
+        decoder: &mut DredDecoder,
+        datagram: &[u8],
+        max_dred_samples: usize,
+    ) -> Option<(DredState, usize, i32)> {
         let mut state = DredState::new().ok()?;
         let mut dred_end = 0;
         let reach = decoder
             .parse(
                 &mut state,
                 datagram,
-                LIVE_PLAYBACK_DRED_MAX_SAMPLES,
+                max_dred_samples,
                 SampleRate::Hz48000,
                 &mut dred_end,
-                false,
+                true,
             )
             .unwrap_or(0);
-        self.dred_parse = Some(DredParse { sequence, state });
-        if reach == 0 {
-            return None;
-        }
-        Some(DredInfo {
-            samples: reach as i32,
-            dred_end,
-        })
+        Some((state, reach, dred_end))
     }
 
     /// Produces one 10 ms output block. Port of `NetEqImpl::GetAudioInternal`.
@@ -925,15 +960,31 @@ impl NetEqCore {
         if !cached {
             let mut state = DredState::new().map_err(|_| ())?;
             let mut dred_end = 0;
+            let max_dred_samples = usize::try_from(offset.max(DRED_CHUNK_SAMPLES as i32))
+                .unwrap_or(usize::MAX)
+                .min(LIVE_PLAYBACK_DRED_MAX_SAMPLES);
             let _ = dred_decoder.parse(
                 &mut state,
                 source,
-                LIVE_PLAYBACK_DRED_MAX_SAMPLES,
+                max_dred_samples,
                 SampleRate::Hz48000,
                 &mut dred_end,
-                false,
+                true,
             );
-            self.dred_parse = Some(DredParse { sequence, state });
+            self.dred_parse = Some(DredParse {
+                sequence,
+                state,
+                processed: false,
+            });
+        }
+        {
+            let parse = self.dred_parse.as_mut().expect("dred parse present");
+            if !parse.processed {
+                dred_decoder
+                    .process_in_place(&mut parse.state)
+                    .map_err(|_| ())?;
+                parse.processed = true;
+            }
         }
         let parse = self.dred_parse.as_ref().expect("dred parse present");
         let end = (out_start + DRED_CHUNK_SAMPLES).min(self.decoded_buffer.len());
@@ -1422,6 +1473,92 @@ mod tests {
             }),
             "FEC unit missing from parsed redundancy: {units:?}",
         );
+    }
+
+    #[test]
+    fn contiguous_packets_do_not_parse_dred_on_insert() {
+        let packets = crate::audio::test_support::encode_live_dred_packets(
+            EncoderNetworkProfile::CRITICAL,
+            24,
+        );
+        let mut core = NetEqCore::new(LiveAudioTuning::default()).unwrap();
+
+        for (seq, payload) in packets.iter().enumerate() {
+            core.insert_packet(
+                seq as u32 * LIVE_OPUS_FRAME_SAMPLES as u32,
+                seq as u32,
+                0,
+                payload,
+            );
+            assert!(
+                core.dred_parse.is_none(),
+                "zero-gap insert parsed DRED at seq {seq}",
+            );
+        }
+    }
+
+    #[test]
+    fn dred_horizon_diagnostic_reports_available_horizon_not_gap_capped_reach() {
+        let packets = crate::audio::test_support::encode_live_dred_packets(
+            EncoderNetworkProfile::CRITICAL,
+            80,
+        );
+        let gap_samples = (3 * DRED_CHUNK_SAMPLES) as u32;
+        let mut probe = NetEqCore::new(LiveAudioTuning::default()).unwrap();
+        let (sequence, payload, available_horizon) = packets
+            .iter()
+            .enumerate()
+            .find_map(|(sequence, payload)| {
+                let datagram = Rc::new(payload.clone());
+                let (dred, available_horizon) =
+                    probe.parse_dred(sequence as u32, &datagram, gap_samples);
+                let usable_reach = dred
+                    .map(|info| {
+                        let mut samples = info.samples;
+                        if info.dred_end < samples {
+                            samples -= info.dred_end;
+                        }
+                        samples.max(0) as u32
+                    })
+                    .unwrap_or_default();
+                (available_horizon > gap_samples && usable_reach >= gap_samples)
+                    .then(|| (sequence as u32, payload.clone(), available_horizon))
+            })
+            .expect("test profile should emit DRED beyond a 30 ms gap");
+
+        let mut core = NetEqCore::new(LiveAudioTuning::default()).unwrap();
+        core.first_packet = false;
+        core.packet_buffer.insert_packet(
+            Packet::new(
+                0,
+                0,
+                super::super::packet::Priority::PRIMARY,
+                LIVE_OPUS_FRAME_SAMPLES,
+                PacketPayload::Opus(Rc::new(vec![0xF8])),
+            ),
+            &core.tick_timer,
+        );
+
+        let timestamp = LIVE_OPUS_FRAME_SAMPLES as u32 + gap_samples;
+        core.insert_packet(timestamp, sequence, 0, &payload);
+
+        let diagnostics = core.diagnostics();
+        assert_eq!(
+            diagnostics.dred_last_horizon_ms,
+            samples_to_ms(available_horizon as usize),
+        );
+        assert_eq!(diagnostics.dred_missed_horizon_count, 0);
+        assert_eq!(diagnostics.dred_missed_horizon_ms, 0);
+
+        let mut dred_units = 0;
+        while let Some(packet) = core.packet_buffer.get_next_packet() {
+            if matches!(packet.payload, PacketPayload::Dred { .. }) {
+                dred_units += 1;
+                assert_eq!(packet.timestamp, timestamp - gap_samples);
+                assert_eq!(packet.duration_samples, DRED_CHUNK_SAMPLES);
+            }
+        }
+        assert_eq!(dred_units, 1);
     }
 
     #[test]
