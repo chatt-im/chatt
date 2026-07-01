@@ -328,6 +328,7 @@ impl LiveDecodeStreams {
             let event = LivePlaybackMixerEvent::EnsureStream {
                 stream_id: NOTIFICATION_STREAM_ID,
                 ring: Arc::clone(&notification.ring),
+                intentional_drain: false,
             };
             if push_mixer_event(mixer_events, dropped, event) {
                 notification.registered = true;
@@ -437,22 +438,12 @@ impl LiveDecodeStreams {
     ) {
         let block = self.block_samples;
         let producers = &mut self.producers;
-        let mixer_streams = &mut self.mixer_streams;
         let dropped = &mut self.dropped_mixer_events;
         let stats = &mut self.stats;
         for (stream_id, stream) in &mut self.streams {
             let Some(producer) = producers.get_mut(stream_id) else {
                 continue;
             };
-            if mixer_streams.insert(*stream_id) {
-                let event = LivePlaybackMixerEvent::EnsureStream {
-                    stream_id: *stream_id,
-                    ring: producer.ring(),
-                };
-                if !push_mixer_event(mixer_events, dropped, event) {
-                    mixer_streams.remove(stream_id);
-                }
-            }
             drain_pump_stream(
                 stream,
                 producer,
@@ -462,13 +453,27 @@ impl LiveDecodeStreams {
                 block,
                 feedback_sender,
             );
-            push_intentional_drain_event(
-                *stream_id,
-                producer.intentional_drain(),
-                &mut self.mixer_intentional_drains,
-                mixer_events,
-                dropped,
-            );
+            let intentional = producer.intentional_drain();
+            if !self.mixer_streams.contains(stream_id) {
+                let event = LivePlaybackMixerEvent::EnsureStream {
+                    stream_id: *stream_id,
+                    ring: producer.ring(),
+                    intentional_drain: intentional,
+                };
+                if push_mixer_event(mixer_events, dropped, event) {
+                    self.mixer_streams.insert(*stream_id);
+                    self.mixer_intentional_drains
+                        .insert(*stream_id, intentional);
+                }
+            } else {
+                push_intentional_drain_event(
+                    *stream_id,
+                    intentional,
+                    &mut self.mixer_intentional_drains,
+                    mixer_events,
+                    dropped,
+                );
+            }
         }
         self.retire_drained_notification(mixer_events);
     }
@@ -494,17 +499,11 @@ impl LiveDecodeStreams {
     ) {
         let block = self.block_samples;
         let producers = &mut self.producers;
-        let mixer_streams = &mut self.mixer_streams;
         let stats = &mut self.stats;
         for (stream_id, stream) in &mut self.streams {
             let Some(producer) = producers.get_mut(stream_id) else {
                 continue;
             };
-            if mixer_streams.insert(*stream_id)
-                && let Ok(mut mixer) = mixer.lock()
-            {
-                mixer.ensure_stream(*stream_id, producer.ring());
-            }
             drain_pump_stream(
                 stream,
                 producer,
@@ -515,6 +514,16 @@ impl LiveDecodeStreams {
                 feedback_sender,
             );
             let intentional = producer.intentional_drain();
+            if !self.mixer_streams.contains(stream_id) {
+                if let Ok(mut mixer) = mixer.lock() {
+                    mixer.ensure_stream(*stream_id, producer.ring());
+                    mixer.set_stream_intentional_drain(*stream_id, intentional);
+                    self.mixer_streams.insert(*stream_id);
+                    self.mixer_intentional_drains
+                        .insert(*stream_id, intentional);
+                }
+                continue;
+            }
             let previous = self
                 .mixer_intentional_drains
                 .get(stream_id)
@@ -1041,12 +1050,85 @@ mod tests {
         );
     }
 
+    #[test]
+    fn failed_registration_retries_with_current_intentional_drain() {
+        let now = Instant::now();
+        let tuning = test_tuning();
+        let mut streams = LiveDecodeStreams::new(tuning);
+        let mut encoder = OpusVoiceEncoder::new(32_000).unwrap();
+        assert!(streams.ensure_entry(7));
+
+        {
+            let stream = streams.streams.get_mut(&7).unwrap();
+            let mut output = vec![0.0; stream.core.output_size_samples()];
+            for seq in 0..6u32 {
+                let opus = tone_packet(&mut encoder, seq as usize * LIVE_OPUS_FRAME_SAMPLES);
+                stream.insert_audio(seq * LIVE_OPUS_FRAME_SAMPLES as u32, seq, 0, &opus, now);
+                stream.core.get_audio(&mut output);
+            }
+            for _ in 0..400 {
+                if stream.core.get_audio(&mut output).muted {
+                    break;
+                }
+            }
+            assert!(
+                stream.core.get_audio(&mut output).muted,
+                "stream should be in muted expand before the registration retry test"
+            );
+        }
+
+        let queue = SpscSwapQueue::<LivePlaybackMixerEvent>::with_capacity(1);
+        let mut filler = LivePlaybackMixerEvent::StopStream { stream_id: 99 };
+        assert!(queue.insert(&mut filler));
+
+        streams.drain_into_mixer_events(&queue, now, None);
+
+        assert!(
+            !streams.mixer_streams.contains(&7),
+            "failed EnsureStream must not cache registration"
+        );
+        assert!(
+            !streams.mixer_intentional_drains.contains_key(&7),
+            "failed EnsureStream must not cache drain state"
+        );
+
+        let mut drained = LivePlaybackMixerEvent::Empty;
+        assert!(queue.remove(&mut drained));
+        assert!(matches!(
+            drained,
+            LivePlaybackMixerEvent::StopStream { stream_id: 99 }
+        ));
+
+        streams.drain_into_mixer_events(&queue, now, None);
+
+        let mut event = LivePlaybackMixerEvent::Empty;
+        assert!(queue.remove(&mut event));
+        match event {
+            LivePlaybackMixerEvent::EnsureStream {
+                stream_id,
+                intentional_drain,
+                ..
+            } => {
+                assert_eq!(stream_id, 7);
+                assert!(
+                    intentional_drain,
+                    "retried registration should carry current intentional drain"
+                );
+            }
+            other => panic!("expected retried EnsureStream, got {}", other.kind()),
+        }
+        assert!(streams.mixer_streams.contains(&7));
+        assert_eq!(streams.mixer_intentional_drains.get(&7), Some(&true));
+    }
+
     fn take_notification_ring(
         queue: &SpscSwapQueue<LivePlaybackMixerEvent>,
     ) -> Option<Arc<SampleRing>> {
         let mut event = LivePlaybackMixerEvent::Empty;
         while queue.remove(&mut event) {
-            if let LivePlaybackMixerEvent::EnsureStream { stream_id, ring } = &event
+            if let LivePlaybackMixerEvent::EnsureStream {
+                stream_id, ring, ..
+            } = &event
                 && *stream_id == NOTIFICATION_STREAM_ID
             {
                 return Some(Arc::clone(ring));
