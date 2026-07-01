@@ -37,16 +37,45 @@ fn prepare_screen(app: &mut App, buf: &mut Buffer) -> Option<StatsSnapshot> {
 }
 
 /// Draws the `chatt join` fallback warning as a warm header block when set,
-/// consuming the top row of `screen`.
+/// consuming the top three rows of `screen` when there is enough space.
 fn draw_join_notice(screen: &mut Rect, app: &App, buf: &mut Buffer) {
     let Some(notice) = app.join_notice.as_deref() else {
         return;
     };
-    screen
-        .take_top(1)
-        .with(app.theme.status_section.patch(app.theme.warn) | Modifier::BOLD)
-        .with(Ellipsis(true))
-        .text(buf, &format!(" {notice} "));
+    let height = screen.h.min(3);
+    if height == 0 {
+        return;
+    }
+    let block = screen.take_top(height as i32);
+    let style = app.theme.status_section.patch(app.theme.warn);
+    let header_style = join_notice_header_style(&app.theme);
+    block.with(style).fill(buf);
+    let lines = [
+        " ! No saved server matched the join target",
+        notice,
+        "   Pairing with that address instead; verify the prompt before continuing",
+    ];
+    let mut rows = block;
+    if let Some(heading) = lines.first() {
+        rows.take_top(1)
+            .with(header_style | Modifier::BOLD)
+            .fill(buf)
+            .with(Ellipsis(true))
+            .text(buf, heading);
+    }
+    for line in lines.iter().skip(1).take(height.saturating_sub(1) as usize) {
+        rows.take_top(1)
+            .with(style | Modifier::BOLD)
+            .with(Ellipsis(true))
+            .text(buf, line);
+    }
+}
+
+fn join_notice_header_style(theme: &Theme) -> Style {
+    match theme.warn.fg().or_else(|| theme.warn.bg()) {
+        Some(warn) => theme.mode_server_edit.with_bg(warn),
+        None => theme.status_section.patch(theme.warn),
+    }
 }
 
 pub(crate) fn draw_server_select_screen(
@@ -281,13 +310,7 @@ fn draw_server_select(
     buf: &mut Buffer,
 ) {
     area.with(app.theme.background).fill(buf);
-    let mut rows = area;
-    rows.take_top(1)
-        .with(app.theme.status_section | Modifier::BOLD)
-        .with(Ellipsis(true))
-        .text(buf, " SERVERS ");
-
-    let mut body = rows;
+    let mut body = area;
     if body.h == 0 {
         return;
     }
@@ -1065,6 +1088,27 @@ mod tests {
         build_key_preview_entries(&runtime, &None, layer, &mut buffer);
         assert_eq!(first, snapshot(&buffer));
     }
+
+    #[test]
+    fn password_key_preview_uses_password_layer_only() {
+        let runtime = bindings::BindingRuntime::default();
+        let mut entries = Vec::new();
+
+        build_key_preview_entries(&runtime, &None, bindings::PASSWORD_LAYER, &mut entries);
+
+        assert!(
+            entries.iter().any(|entry| entry.label == "Reveal"),
+            "password layer should expose the reveal toggle"
+        );
+        assert!(
+            entries.iter().all(|entry| entry.key_hint != "q"),
+            "picker cancel binding must not leak into password prompt"
+        );
+        assert!(
+            entries.iter().all(|entry| entry.key_hint != "/"),
+            "picker search binding must not leak into password prompt"
+        );
+    }
 }
 
 /// Formats a message age for the heading. Empty for notices (`timestamp_ms == 0`).
@@ -1221,6 +1265,31 @@ fn draw_key_preview(area: Rect, app: &App, buf: &mut Buffer) {
             .with(HAlign::Right)
             .text(buf, &label);
     }
+}
+
+pub(crate) fn draw_overlay_key_preview(app: &mut App, layer: LayerId, buf: &mut Buffer) {
+    let mut screen = buf.rect();
+    let previous_height = key_preview_height(app, screen.w);
+    refresh_key_preview_cache(app, Some(layer));
+    let height = key_preview_height(app, screen.w);
+    let clear_height = previous_height.max(height);
+    if clear_height == 0 {
+        return;
+    }
+
+    let clear = screen.take_bottom(clear_height as i32);
+    clear.with(key_preview_bar_style()).fill(buf);
+    if height == 0 {
+        return;
+    }
+
+    let preview = Rect {
+        x: clear.x,
+        y: clear.y.saturating_add(clear.h.saturating_sub(height)),
+        w: clear.w,
+        h: height,
+    };
+    draw_key_preview(preview, app, buf);
 }
 
 /// Rebuilds the shared key-preview cache when the active binding layer or pending

@@ -4,7 +4,11 @@ use extui::{
 };
 use extui_bindings::LayerId;
 
-use crate::{app::App, theme, tui::Action};
+use crate::{
+    app::{App, AppEvent},
+    theme,
+    tui::Action,
+};
 
 /// Whether `key` is the global quit chord (Ctrl-C). Overlay modes check this so
 /// quit is never trapped by a modal.
@@ -70,6 +74,11 @@ pub(crate) trait AppMode {
         let _ = (app, text);
     }
 
+    fn process_app_event(&mut self, app: &mut App, event: AppEvent) -> Option<AppEvent> {
+        let _ = app;
+        Some(event)
+    }
+
     fn on_enter(&mut self, _app: &mut App) {}
 
     fn on_exit(&mut self, _app: &mut App, _reason: ExitReason) {}
@@ -106,7 +115,6 @@ impl PendingTransition {
         self.0.take()
     }
 
-    #[cfg(test)]
     pub(crate) fn is_empty(&self) -> bool {
         self.0.is_none()
     }
@@ -128,6 +136,15 @@ impl ModeStack {
             .last_mut()
             .map(Box::as_mut)
             .expect("mode stack always has a root")
+    }
+
+    /// Gives the active mode first chance to consume an application event. Most
+    /// events are global and fall through to [`App`], while modal flows can keep
+    /// their own transient UI state local.
+    pub(crate) fn process_app_event(&mut self, app: &mut App, event: AppEvent) {
+        if let Some(event) = self.active_mut().process_app_event(app, event) {
+            app.handle_app_event(event);
+        }
     }
 
     /// Applies at most one requested transition. A root pop is an explicit
@@ -208,7 +225,10 @@ impl ModeStack {
 
 #[cfg(test)]
 mod tests {
-    use std::{cell::RefCell, rc::Rc};
+    use std::{
+        cell::{Cell, RefCell},
+        rc::Rc,
+    };
 
     use extui::event::{KeyEvent, MouseEvent};
 
@@ -313,6 +333,49 @@ mod tests {
 
         assert!(app.chrome.binding.pending_chord.is_none());
         assert_eq!(stack.depth(), 2);
+    }
+
+    #[test]
+    fn active_mode_can_consume_app_event_before_global_app_handler() {
+        struct EventConsumer {
+            consumed: Rc<Cell<bool>>,
+        }
+
+        impl AppMode for EventConsumer {
+            fn render(&mut self, _app: &mut App, _buf: &mut Buffer, _now_ms: u64) {}
+
+            fn process_input(&mut self, _app: &mut App, _key: KeyEvent) -> Action {
+                Action::Continue
+            }
+
+            fn process_app_event(&mut self, _app: &mut App, event: AppEvent) -> Option<AppEvent> {
+                if matches!(event, AppEvent::ReportBug(_)) {
+                    self.consumed.set(true);
+                    None
+                } else {
+                    Some(event)
+                }
+            }
+
+            fn presentation(&self, _app: &App) -> ModePresentation {
+                ModePresentation::OVERLAY
+            }
+        }
+
+        let mut app = app();
+        let status_before = app.status.text().to_string();
+        let consumed = Rc::new(Cell::new(false));
+        let mut stack = ModeStack::new(
+            Box::new(EventConsumer {
+                consumed: Rc::clone(&consumed),
+            }),
+            &mut app,
+        );
+
+        stack.process_app_event(&mut app, AppEvent::ReportBug("details".to_string()));
+
+        assert!(consumed.get());
+        assert_eq!(app.status.text(), status_before);
     }
 
     #[test]
