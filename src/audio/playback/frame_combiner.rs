@@ -134,40 +134,135 @@ fn float_s16_to_s16(sample: f32) -> i16 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
-    #[test]
-    fn webrtc_combiner_zero_frames_matches_silence() {
-        let mut combiner = FrameCombiner::new(false);
-        let mut out = [1.0; MIX_FRAME_SAMPLES];
+    fn load_vector(name: &str) -> Vec<i64> {
+        let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        path.push("tests/mixer_vectors");
+        path.push(format!("{name}.txt"));
+        let text = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+        let mut out = Vec::new();
+        for line in text.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            out.push(
+                line.parse::<i64>()
+                    .unwrap_or_else(|e| panic!("parse {line:?} in {name}: {e}")),
+            );
+        }
+        out
+    }
 
-        combiner.combine(&[], 0, &mut out);
+    fn load_i16_vector(name: &str) -> Vec<i16> {
+        load_vector(name)
+            .into_iter()
+            .map(|sample| i16::try_from(sample).expect("mixer vector sample must fit i16"))
+            .collect()
+    }
 
-        assert!(out.iter().all(|&sample| sample == 0.0));
+    fn load_frame(name: &str) -> [f32; MIX_FRAME_SAMPLES] {
+        let samples = load_i16_vector(name);
+        assert_eq!(samples.len(), MIX_FRAME_SAMPLES);
+        let mut frame = [0.0; MIX_FRAME_SAMPLES];
+        for (dst, sample) in frame.iter_mut().zip(samples) {
+            *dst = sample as f32 / FLOAT_S16_SCALE;
+        }
+        frame
+    }
+
+    fn quantize_output(out: &[f32; MIX_FRAME_SAMPLES]) -> Vec<i16> {
+        out.iter()
+            .map(|&sample| float_s16_to_s16(sample * FLOAT_S16_SCALE))
+            .collect()
+    }
+
+    fn combine_to_i16(
+        combiner: &mut FrameCombiner,
+        frames: &[MixerFrameRef<'_>],
+        number_of_streams: usize,
+    ) -> Vec<i16> {
+        let mut out = [0.0; MIX_FRAME_SAMPLES];
+        combiner.combine(frames, number_of_streams, &mut out);
+        quantize_output(&out)
     }
 
     #[test]
-    fn webrtc_combiner_one_frame_matches_float_s16_conversion() {
+    fn webrtc_combiner_zero_frames_matches_fixture() {
         let mut combiner = FrameCombiner::new(false);
-        let input = [0.25; MIX_FRAME_SAMPLES];
+        let got = combine_to_i16(&mut combiner, &[], 0);
+
+        assert_eq!(got, load_i16_vector("combiner_zero_no_limiter"));
+    }
+
+    #[test]
+    fn webrtc_combiner_one_frame_matches_fixture() {
+        let mut combiner = FrameCombiner::new(false);
+        let input = load_frame("combiner_input_a");
         let frames = [MixerFrameRef::new(&input)];
-        let mut out = [0.0; MIX_FRAME_SAMPLES];
+        let got = combine_to_i16(&mut combiner, &frames, 1);
 
-        combiner.combine(&frames, 1, &mut out);
-
-        assert!(out.iter().all(|&sample| sample == 0.25));
+        assert_eq!(got, load_i16_vector("combiner_one_no_limiter"));
     }
 
     #[test]
-    fn webrtc_combiner_two_frames_no_limiter_sums_then_rounds() {
+    fn webrtc_combiner_two_frames_no_limiter_matches_fixture() {
         let mut combiner = FrameCombiner::new(false);
-        let first = [0.25; MIX_FRAME_SAMPLES];
-        let second = [0.125; MIX_FRAME_SAMPLES];
+        let first = load_frame("combiner_input_a");
+        let second = load_frame("combiner_input_b");
         let frames = [MixerFrameRef::new(&first), MixerFrameRef::new(&second)];
-        let mut out = [0.0; MIX_FRAME_SAMPLES];
+        let got = combine_to_i16(&mut combiner, &frames, 2);
 
-        combiner.combine(&frames, 2, &mut out);
+        assert_eq!(got, load_i16_vector("combiner_two_no_limiter"));
+    }
 
-        assert!(out.iter().all(|&sample| sample == 0.375));
+    #[test]
+    fn webrtc_combiner_one_normal_two_streams_limiter_matches_fixture() {
+        let mut combiner = FrameCombiner::new(true);
+        let input = load_frame("combiner_input_a");
+        let frames = [MixerFrameRef::new(&input)];
+        let got = combine_to_i16(&mut combiner, &frames, 2);
+
+        assert_eq!(
+            got,
+            load_i16_vector("combiner_one_normal_two_streams_limiter")
+        );
+    }
+
+    #[test]
+    fn webrtc_combiner_two_frames_limiter_matches_fixture() {
+        let mut combiner = FrameCombiner::new(true);
+        let first = load_frame("combiner_input_hot_a");
+        let second = load_frame("combiner_input_hot_b");
+        let frames = [MixerFrameRef::new(&first), MixerFrameRef::new(&second)];
+        let got = combine_to_i16(&mut combiner, &frames, 2);
+
+        assert_eq!(got, load_i16_vector("combiner_two_with_limiter"));
+    }
+
+    #[test]
+    fn sonora_limiter_matches_fixture() {
+        let input = load_i16_vector("limiter_sequence_input");
+        let expected = load_i16_vector("limiter_sequence_quantized");
+        assert_eq!(input.len() % MIX_FRAME_SAMPLES, 0);
+        let mut limiter = Limiter::new(MIX_FRAME_SAMPLES);
+        let mut got = Vec::with_capacity(input.len());
+
+        for chunk in input.chunks_exact(MIX_FRAME_SAMPLES) {
+            let mut frame = [0.0; MIX_FRAME_SAMPLES];
+            for (dst, &sample) in frame.iter_mut().zip(chunk) {
+                *dst = sample as f32;
+            }
+            {
+                let mut channels = [frame.as_mut_slice()];
+                limiter.process(&mut channels);
+            }
+            got.extend(frame.iter().map(|&sample| float_s16_to_s16(sample)));
+        }
+
+        assert_eq!(got, expected);
     }
 
     #[test]
