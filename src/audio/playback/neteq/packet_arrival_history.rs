@@ -10,6 +10,12 @@ use std::collections::{BTreeMap, VecDeque};
 
 use super::tick_timer::TickTimer;
 
+/// A forward packet after a long receive-side idle period can belong to a new
+/// talkspurt or source instance even if the sender failed to advance RTP time
+/// across that idle. Do not let that stale baseline read as queued playout.
+const TIMING_DISCONTINUITY_MIN_GAP_MS: i64 = 1_000;
+const TIMING_DISCONTINUITY_MIN_EXCESS_MS: i64 = 250;
+
 /// Unwraps wrap-around `u32` RTP timestamps into a monotonic `i64`. Port of
 /// `RtpTimestampUnwrapper` (signed-delta form).
 #[derive(Debug, Default)]
@@ -87,6 +93,41 @@ impl PacketArrivalHistory {
 
     pub(crate) fn size(&self) -> usize {
         self.history.len()
+    }
+
+    /// Drops the current arrival baseline if the next forward packet follows a
+    /// large wall-clock receive gap that the media timestamp did not also cover.
+    ///
+    /// This catches sender implementations that restart a source or miss a
+    /// silence marker without advancing RTP time across the quiet period. Genuine
+    /// silence-aware streams, where RTP time advances with wall time, keep the
+    /// existing history and continue through the usual obsolete-window pruning.
+    pub(crate) fn reset_for_timing_discontinuity(
+        &mut self,
+        rtp_timestamp: u32,
+        tick_timer: &TickTimer,
+    ) -> bool {
+        if self.sample_rate_khz <= 0 {
+            return false;
+        }
+        let Some(newest) = self.history.values().next_back().copied() else {
+            return false;
+        };
+        let unwrapped = self.unwrapper.peek_unwrap(rtp_timestamp);
+        if unwrapped <= newest.rtp_timestamp {
+            return false;
+        }
+
+        let arrival_gap_ms =
+            (self.now_samples(tick_timer) - newest.arrival_timestamp) / self.sample_rate_khz;
+        let media_gap_ms = (unwrapped - newest.rtp_timestamp) / self.sample_rate_khz;
+        if arrival_gap_ms >= TIMING_DISCONTINUITY_MIN_GAP_MS
+            && arrival_gap_ms.saturating_sub(media_gap_ms) >= TIMING_DISCONTINUITY_MIN_EXCESS_MS
+        {
+            self.reset();
+            return true;
+        }
+        false
     }
 
     /// Records a packet arrival. Returns false if it is too old or a duplicate.
@@ -248,5 +289,42 @@ mod tests {
         history.set_sample_rate(48000);
         assert!(history.insert(0, 960, &timer));
         assert!(!history.insert(0, 960, &timer));
+    }
+
+    #[test]
+    fn long_wall_gap_without_matching_media_gap_resets_baseline() {
+        let mut timer = TickTimer::new();
+        let mut history = PacketArrivalHistory::new(2000);
+        history.set_sample_rate(48000);
+        assert!(history.insert(0, 960, &timer));
+        timer.increment_by(2);
+        assert!(history.insert(960, 960, &timer));
+
+        // The next packet is only one media frame later, but arrives 30 seconds
+        // later. Treat this as a source/talkspurt timing discontinuity instead
+        // of reporting a 30 s playout delay.
+        timer.increment_by(3000);
+        assert!(history.reset_for_timing_discontinuity(1920, &timer));
+        assert!(history.insert(1920, 960, &timer));
+        assert_eq!(history.delay_ms(1920, &timer), 0);
+
+        timer.increment_by(2);
+        assert!(!history.reset_for_timing_discontinuity(2880, &timer));
+        assert!(history.insert(2880, 960, &timer));
+        assert!(history.max_delay_ms() <= 1, "{}", history.max_delay_ms());
+    }
+
+    #[test]
+    fn long_gap_with_matching_media_gap_keeps_baseline() {
+        let mut timer = TickTimer::new();
+        let mut history = PacketArrivalHistory::new(2000);
+        history.set_sample_rate(48000);
+        assert!(history.insert(0, 960, &timer));
+        timer.increment_by(2);
+        assert!(history.insert(960, 960, &timer));
+
+        timer.increment_by(3000);
+        let media_advanced = 960 + 3000 * 10 * 48;
+        assert!(!history.reset_for_timing_discontinuity(media_advanced, &timer));
     }
 }

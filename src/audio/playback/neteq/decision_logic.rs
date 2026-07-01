@@ -201,6 +201,8 @@ impl DecisionLogic {
                 (self.packet_length_samples * 1000 / fs_hz as usize) as i32,
             );
         }
+        self.packet_arrival_history
+            .reset_for_timing_discontinuity(info.main_timestamp, tick_timer);
         let inserted = self.packet_arrival_history.insert(
             info.main_timestamp,
             info.packet_length_samples as i32,
@@ -465,6 +467,38 @@ mod tests {
             logic.target_level_ms() > 20,
             "reordering left the target at the floor: {} ms",
             logic.target_level_ms()
+        );
+    }
+
+    #[test]
+    fn timing_discontinuity_does_not_poison_arrival_delay() {
+        let mut timer = TickTimer::new();
+        let mut logic = logic(&timer);
+
+        assert!(
+            logic
+                .packet_arrived(48000, true, &info(0, 0), &timer)
+                .is_none()
+        );
+        timer.increment_by(2);
+        assert_eq!(
+            logic.packet_arrived(48000, true, &info(960, 1), &timer),
+            Some(0)
+        );
+
+        // A sender/source restart after a long idle can keep RTP timestamps near
+        // the previous talkspurt. The stale baseline must be discarded before it
+        // reads as tens of seconds of playout delay.
+        timer.increment_by(3000);
+        assert!(
+            logic
+                .packet_arrived(48000, true, &info(1920, 2), &timer)
+                .is_none()
+        );
+        timer.increment_by(2);
+        assert_eq!(
+            logic.packet_arrived(48000, true, &info(2880, 3), &timer),
+            Some(0)
         );
     }
 
