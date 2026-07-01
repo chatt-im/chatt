@@ -923,12 +923,47 @@ fn room_file_path(base: &Path, history_id: &str, room_id: RoomId) -> PathBuf {
 mod tests {
     use super::*;
 
-    fn scratch_path(label: &str) -> PathBuf {
-        std::env::temp_dir().join(format!(
-            "chatt-history-{}-{}.kvlog",
-            std::process::id(),
-            label
-        ))
+    /// Owns a private scratch directory holding one history file. Dropping it
+    /// removes the whole directory, so the file, its backup, and any recovery
+    /// siblings (`.corrupt-*`, `.recovering-*`) are cleaned up even on panic.
+    struct Scratch {
+        dir: PathBuf,
+        path: PathBuf,
+    }
+
+    impl Scratch {
+        fn new(label: &str) -> Scratch {
+            let dir = std::env::temp_dir()
+                .join(format!("chatt-history-{}-{}", std::process::id(), label));
+            let _ = fs::remove_dir_all(&dir);
+            fs::create_dir_all(&dir).expect("scratch dir");
+            let path = dir.join("room-7.kvlog");
+            Scratch { dir, path }
+        }
+    }
+
+    impl std::ops::Deref for Scratch {
+        type Target = Path;
+
+        fn deref(&self) -> &Path {
+            &self.path
+        }
+    }
+
+    impl AsRef<Path> for Scratch {
+        fn as_ref(&self) -> &Path {
+            &self.path
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    fn scratch(label: &str) -> Scratch {
+        Scratch::new(label)
     }
 
     fn fresh_store(path: &Path) -> RoomHistoryStore {
@@ -969,7 +1004,7 @@ mod tests {
 
     #[test]
     fn round_trip_text_message() {
-        let path = scratch_path("round-trip-text");
+        let path = scratch("round-trip-text");
         let mut store = fresh_store(&path);
         let original = text_message(11, 1_700_000_000_000, "hello world");
         store.append_message(&original);
@@ -977,12 +1012,11 @@ mod tests {
 
         let opened = open_path(&path, 7);
         assert_eq!(opened.loaded.messages, vec![original]);
-        let _ = fs::remove_file(&path);
     }
 
     #[test]
     fn same_transfer_id_at_different_timestamps_keeps_both_details() {
-        let path = scratch_path("file-identity");
+        let path = scratch("file-identity");
         let mut store = fresh_store(&path);
         for (id, timestamp, name) in [(20, 1_000, "old.png"), (21, 2_000, "new.png")] {
             let mut message = text_message(id, timestamp, name);
@@ -1019,7 +1053,6 @@ mod tests {
                 .file_name,
             "new.png"
         );
-        let _ = fs::remove_file(&path);
     }
 
     #[test]
@@ -1083,7 +1116,7 @@ mod tests {
 
     #[test]
     fn incomplete_tail_is_truncated_before_future_appends() {
-        let path = scratch_path("torn-tail-repair");
+        let path = scratch("torn-tail-repair");
         append_messages(&path, 1..4);
         let full = fs::metadata(&path).expect("metadata").len();
         OpenOptions::new()
@@ -1109,12 +1142,11 @@ mod tests {
             .map(|message| message.message_id.0)
             .collect();
         assert_eq!(ids, vec![1, 2, 4]);
-        let _ = fs::remove_file(&path);
     }
 
     #[test]
     fn partial_header_tail_is_truncated() {
-        let path = scratch_path("partial-header");
+        let path = scratch("partial-header");
         append_messages(&path, 1..3);
         let valid_len = fs::metadata(&path).expect("metadata").len();
         let mut file = OpenOptions::new().append(true).open(&path).expect("append");
@@ -1124,12 +1156,11 @@ mod tests {
         let opened = open_path(&path, 7);
         assert!(opened.store.is_some());
         assert_eq!(fs::metadata(&path).expect("metadata").len(), valid_len);
-        let _ = fs::remove_file(&path);
     }
 
     #[test]
     fn middle_corruption_rotates_and_recovers_valid_suffix() {
-        let path = scratch_path("middle-corruption");
+        let path = scratch("middle-corruption");
         append_messages(&path, 1..6);
         let bytes = fs::read(&path).expect("read");
         let ranges = record_ranges(&bytes);
@@ -1168,12 +1199,11 @@ mod tests {
                 .to_string_lossy()
                 .starts_with(&format!("{stem}.corrupt-"))
         }));
-        let _ = fs::remove_file(&path);
     }
 
     #[test]
     fn invalid_utf8_record_is_corruption_and_suffix_is_recovered() {
-        let path = scratch_path("invalid-utf8");
+        let path = scratch("invalid-utf8");
         append_messages(&path, 1..6);
         let mut bytes = fs::read(&path).expect("read");
         let body = b"message-3";
@@ -1191,12 +1221,11 @@ mod tests {
             .map(|message| message.message_id.0)
             .collect();
         assert_eq!(ids, vec![1, 2, 4, 5]);
-        let _ = fs::remove_file(&path);
     }
 
     #[test]
     fn complete_invalid_tail_rotates_instead_of_truncating_in_place() {
-        let path = scratch_path("invalid-tail");
+        let path = scratch("invalid-tail");
         append_messages(&path, 1..4);
         let mut bytes = fs::read(&path).expect("read");
         let body = b"message-3";
@@ -1228,12 +1257,11 @@ mod tests {
                         .starts_with(&format!("{stem}.corrupt-"))
                 })
         );
-        let _ = fs::remove_file(&path);
     }
 
     #[test]
     fn embedded_magic_does_not_create_a_false_record_boundary() {
-        let path = scratch_path("embedded-magic");
+        let path = scratch("embedded-magic");
         let mut store = fresh_store(&path);
         for id in 1..6 {
             let body = if id == 3 {
@@ -1256,12 +1284,11 @@ mod tests {
             .map(|message| message.message_id.0)
             .collect();
         assert_eq!(ids, vec![1, 2, 4, 5]);
-        let _ = fs::remove_file(&path);
     }
 
     #[test]
     fn clean_eof_accepts_short_recovered_suffix() {
-        let path = scratch_path("eof-recovery");
+        let path = scratch("eof-recovery");
         append_messages(&path, 1..5);
         let bytes = fs::read(&path).expect("read");
         let ranges = record_ranges(&bytes);
@@ -1276,12 +1303,11 @@ mod tests {
             .map(|message| message.message_id.0)
             .collect();
         assert_eq!(ids, vec![1, 2, 4]);
-        let _ = fs::remove_file(&path);
     }
 
     #[test]
     fn insufficient_prefix_does_not_resynchronize() {
-        let path = scratch_path("short-prefix");
+        let path = scratch("short-prefix");
         append_messages(&path, 1..5);
         let bytes = fs::read(&path).expect("read");
         let ranges = record_ranges(&bytes);
@@ -1296,12 +1322,11 @@ mod tests {
             .map(|message| message.message_id.0)
             .collect();
         assert_eq!(ids, vec![1]);
-        let _ = fs::remove_file(&path);
     }
 
     #[test]
     fn dedup_and_sort_on_load() {
-        let path = scratch_path("dedup-sort");
+        let path = scratch("dedup-sort");
         let mut store = fresh_store(&path);
         store.append_message(&text_message(2, 3_000, "third"));
         store.append_message(&text_message(1, 1_000, "first"));
@@ -1316,7 +1341,6 @@ mod tests {
             .map(|message| message.body.as_str())
             .collect();
         assert_eq!(bodies, vec!["first-updated", "post-restart", "third"]);
-        let _ = fs::remove_file(&path);
     }
 
     #[test]
@@ -1342,7 +1366,7 @@ mod tests {
 
     #[test]
     fn rotation_splits_into_backup_and_merges_on_load() {
-        let path = scratch_path("rotation");
+        let path = scratch("rotation");
         let mut store = fresh_store(&path);
         for id in 1..4 {
             store.append_message(&text_message(id, id * 1_000, &format!("message-{id}")));
@@ -1361,8 +1385,6 @@ mod tests {
             .map(|message| message.message_id.0)
             .collect();
         assert_eq!(ids, vec![1, 2, 3, 4, 5, 6]);
-        let _ = fs::remove_file(&path);
-        let _ = fs::remove_file(backup_path(&path));
     }
 
     #[cfg(unix)]
@@ -1381,6 +1403,6 @@ mod tests {
         let file_mode = fs::metadata(&file).expect("file meta").permissions().mode() & 0o777;
         assert_eq!(dir_mode, 0o700);
         assert_eq!(file_mode, 0o600);
-        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::remove_dir_all(&base);
     }
 }
