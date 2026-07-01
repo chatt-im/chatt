@@ -558,7 +558,7 @@ fn parse_fields(
         match key {
             Key::Static(StaticKey::id) => set_once(&mut id, exact_u64(value)?)?,
             Key::Static(StaticKey::msg) => set_once(&mut body, exact_string(value)?)?,
-            Key::Static(StaticKey::user_id) => set_once(&mut user, exact_u32(value)?)?,
+            Key::Static(StaticKey::user_id) => set_once(&mut user, exact_u64(value)?)?,
             Key::Static(StaticKey::caller) => set_once(&mut caller, exact_string(value)?)?,
             Key::Static(StaticKey::object_id) => set_once(&mut object, exact_u64(value)?)?,
             Key::Static(StaticKey::conn_id) => set_once(&mut room, exact_u32(value)?)?,

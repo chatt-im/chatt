@@ -96,7 +96,7 @@ impl RoomConfig {
 #[derive(Clone, Debug, Toml)]
 #[toml(FromToml, ToToml, rename_all = "kebab-case")]
 pub struct UserConfig {
-    pub id: u32,
+    pub id: UserId,
     pub name: String,
     #[toml(default)]
     pub display_name: String,
@@ -106,7 +106,7 @@ pub struct UserConfig {
 
 impl UserConfig {
     pub fn user_id(&self) -> UserId {
-        UserId(self.id)
+        self.id
     }
 }
 
@@ -200,10 +200,11 @@ impl Config {
         let id = self
             .users
             .iter()
-            .map(|user| user.id)
+            .map(|user| user.id.0)
             .max()
             .unwrap_or(0)
             .checked_add(1)
+            .map(UserId)
             .ok_or_else(|| "no user ids are available".to_string())?;
         let user = UserConfig {
             id,
@@ -312,7 +313,7 @@ impl Config {
         let mut user_ids = HashSet::new();
         let mut user_names = HashSet::new();
         for user in &self.users {
-            if user.id == 0 {
+            if user.id == UserId(0) {
                 return Err(format!("{source}: user id must be non-zero"));
             }
             if user.name.trim().is_empty() {
@@ -705,21 +706,21 @@ fn default_rooms() -> Vec<RoomConfig> {
 fn default_users() -> Vec<UserConfig> {
     vec![
         UserConfig {
-            id: 1,
+            id: UserId(1),
             name: "alice".to_string(),
             display_name: "Alice".to_string(),
             token_hash: "sha256:8989ee243a8829e3364b6eb9cae74f1edfa53e327e5718fe337d23d6ab8b4625"
                 .to_string(),
         },
         UserConfig {
-            id: 2,
+            id: UserId(2),
             name: "bob".to_string(),
             display_name: "Bob".to_string(),
             token_hash: "sha256:fd57e39ef28a47298ae51762fd3c907253ac7d4b7507fdf28fcf6d5e4bbaeb8a"
                 .to_string(),
         },
         UserConfig {
-            id: 3,
+            id: UserId(3),
             name: "carol".to_string(),
             display_name: "Carol".to_string(),
             token_hash: "sha256:f93be296b384d5f0f8760bdb53cf3ea52a5e41e6f7a532645458784ece411f62"
@@ -904,7 +905,7 @@ mod tests {
         let content = std::fs::read_to_string(&path).unwrap();
         let _ = std::fs::remove_file(path);
 
-        assert_eq!(user.id, 4);
+        assert_eq!(user.id, UserId(4));
         assert_eq!(user.name, "billy");
         assert_eq!(user.display_name, "Billy");
         assert_eq!(user.token_hash, token_hash);
@@ -957,7 +958,7 @@ mod tests {
         let mut config = Config::default();
         config.config_path = Some(path.clone());
         config.users = vec![UserConfig {
-            id: 9,
+            id: UserId(9),
             name: "paired-user".to_string(),
             display_name: "Paired User".to_string(),
             token_hash: hash_secret("paired-client-generated-token-with-at-least-32-bytes"),

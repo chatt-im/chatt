@@ -1353,7 +1353,7 @@ impl Server {
         kvlog::info!(
             "pairing accepted",
             token = token.0,
-            user_id = user.id,
+            user_id = user.id.0,
             user = user.name.as_str()
         );
         self.establish_session(token, &user, receive_files, file_receive_limit_bytes, false)
@@ -3913,7 +3913,7 @@ mod tests {
         let mut server = test_server();
         let token_secret = "alice-client-generated-token-with-at-least-32-bytes";
         server.config.users = vec![UserConfig {
-            id: 7,
+            id: UserId(7),
             name: "alice-internal".to_string(),
             display_name: "Alice".to_string(),
             token_hash: hash_secret(token_secret),
@@ -3939,7 +3939,7 @@ mod tests {
     fn authenticate_rejects_unknown_token() {
         let mut server = test_server();
         server.config.users = vec![UserConfig {
-            id: 7,
+            id: UserId(7),
             name: "alice-internal".to_string(),
             display_name: "Alice".to_string(),
             token_hash: hash_secret("alice-client-generated-token-with-at-least-32-bytes"),
@@ -3959,7 +3959,7 @@ mod tests {
         let mut server = test_server();
         server.config.config_path = Some(path.clone());
         server.config.users = vec![UserConfig {
-            id: 3,
+            id: UserId(3),
             name: "dana".to_string(),
             display_name: "old".to_string(),
             token_hash: String::new(),
@@ -4033,7 +4033,7 @@ mod tests {
         let mut server = test_server();
         server.config.config_path = Some(path.clone());
         server.config.users = vec![UserConfig {
-            id: 4,
+            id: UserId(4),
             name: "gwen".to_string(),
             display_name: "old".to_string(),
             token_hash: String::new(),
@@ -4085,13 +4085,13 @@ mod tests {
         server.config.config_path = Some(path.clone());
         server.config.users = vec![
             UserConfig {
-                id: 1,
+                id: UserId(1),
                 name: "erin".to_string(),
                 display_name: "Erin".to_string(),
                 token_hash: hash_secret(new_token),
             },
             UserConfig {
-                id: 2,
+                id: UserId(2),
                 name: "frank".to_string(),
                 display_name: "old".to_string(),
                 token_hash: String::new(),

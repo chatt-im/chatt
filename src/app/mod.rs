@@ -2518,9 +2518,7 @@ impl App {
         };
         let user_id = selected.user_id;
         let name = selected.display_name;
-        let value_db = self
-            .config
-            .user_volume_db(&self.room.server_alias, user_id.0);
+        let value_db = self.config.user_volume_db(&self.room.server_alias, user_id);
         self.room.begin_volume_preview(user_id, value_db);
         let dialog = UserVolumeDialog::new(user_id, name.clone(), value_db, &self.theme);
         self.push_mode(Box::new(DialogMode::new(dialog)));
@@ -2567,7 +2565,7 @@ impl App {
                 original_db,
             } => {
                 self.config
-                    .set_user_volume_db(&self.room.server_alias, user_id.0, original_db);
+                    .set_user_volume_db(&self.room.server_alias, user_id, original_db);
                 self.apply_user_audio_control_with_volume(user_id, original_db);
                 self.room.clear_volume_preview();
                 self.set_status(format!("canceled local volume for {user_name}"));
@@ -2579,7 +2577,7 @@ impl App {
                 value_db,
             } => {
                 self.config
-                    .set_user_volume_db(&self.room.server_alias, user_id.0, value_db);
+                    .set_user_volume_db(&self.room.server_alias, user_id, value_db);
                 self.apply_user_audio_control_with_volume(user_id, value_db);
                 match self.config.save_runtime() {
                     Ok(path) => {

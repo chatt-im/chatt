@@ -1,4 +1,5 @@
 use hashbrown::HashSet;
+use rpc::ids::UserId;
 use std::path::PathBuf;
 use std::{fs, time::Duration};
 
@@ -468,7 +469,7 @@ impl NotificationConfig {
 #[toml(FromToml, ToToml, rename_all = "kebab-case")]
 pub struct UserAudioPreference {
     pub server_alias: String,
-    pub user_id: u32,
+    pub user_id: UserId,
     pub volume_db: f32,
 }
 
@@ -810,7 +811,7 @@ impl Config {
                     "user-audio {alias}:{user_id}: {error}"
                 )));
             }
-            if user_id == 0 {
+            if user_id.0 == 0 {
                 out.push(Diag::error(format!(
                     "user-audio {alias}: user-id must be non-zero"
                 )));
@@ -875,7 +876,7 @@ impl Config {
         }
     }
 
-    pub fn user_volume_db(&self, server_alias: &str, user_id: u32) -> f32 {
+    pub fn user_volume_db(&self, server_alias: &str, user_id: UserId) -> f32 {
         self.user_audio
             .iter()
             .find(|preference| {
@@ -884,7 +885,7 @@ impl Config {
             .map_or(0.0, |preference| preference.volume_db)
     }
 
-    pub fn set_user_volume_db(&mut self, server_alias: &str, user_id: u32, volume_db: f32) {
+    pub fn set_user_volume_db(&mut self, server_alias: &str, user_id: UserId, volume_db: f32) {
         let volume_db = snap_user_volume_db(volume_db);
         if volume_db == 0.0 {
             self.user_audio.retain(|preference| {
@@ -1520,24 +1521,24 @@ path = "assets/sample-001.opus"
     fn user_volume_preferences_snap_sort_and_remove_zero() {
         let mut config = Config::default();
 
-        config.set_user_volume_db("local", 3, -5.4);
-        config.set_user_volume_db("local", 2, 7.6);
+        config.set_user_volume_db("local", UserId(3), -5.4);
+        config.set_user_volume_db("local", UserId(2), 7.6);
 
-        assert_eq!(config.user_volume_db("local", 3), -5.5);
-        assert_eq!(config.user_volume_db("local", 2), 7.5);
-        assert_eq!(config.user_audio[0].user_id, 2);
-        assert_eq!(config.user_audio[1].user_id, 3);
+        assert_eq!(config.user_volume_db("local", UserId(3)), -5.5);
+        assert_eq!(config.user_volume_db("local", UserId(2)), 7.5);
+        assert_eq!(config.user_audio[0].user_id, UserId(2));
+        assert_eq!(config.user_audio[1].user_id, UserId(3));
 
-        config.set_user_volume_db("local", 2, 0.0);
+        config.set_user_volume_db("local", UserId(2), 0.0);
 
-        assert_eq!(config.user_volume_db("local", 2), 0.0);
+        assert_eq!(config.user_volume_db("local", UserId(2)), 0.0);
         assert_eq!(config.user_audio.len(), 1);
     }
 
     #[test]
     fn runtime_config_writes_user_audio_as_array_of_tables() {
         let mut config = Config::default();
-        config.set_user_volume_db("local", 2, -5.5);
+        config.set_user_volume_db("local", UserId(2), -5.5);
         let content = render_runtime(&config);
 
         assert!(content.contains("[[user-audio]]"));

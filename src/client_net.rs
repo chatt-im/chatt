@@ -4161,7 +4161,7 @@ mod tests {
     use super::*;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    fn user(id: u32) -> UserId {
+    fn user(id: u64) -> UserId {
         UserId(id)
     }
 
