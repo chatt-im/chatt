@@ -3015,6 +3015,7 @@ impl App {
         let users = self.room.users_with_streams().collect::<HashSet<UserId>>();
         for user_id in users {
             self.apply_user_audio_control(user_id);
+            self.apply_remote_sender_mute(user_id, self.room.voice_muted(user_id));
         }
     }
 
