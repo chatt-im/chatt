@@ -2,7 +2,7 @@ use std::fs::File;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use tempfile::NamedTempFile;
+use tempfile::TempDir;
 
 use opus_codec::{Application, Channels, Decoder, Encoder, SampleRate};
 use opus_codec::{Mapping, MultistreamDecoder, MultistreamEncoder};
@@ -278,12 +278,10 @@ fn test_ffmpeg_sine_roundtrip_f32_encode() {
     assert!(snr > 18.0, "SNR too low (f32 path): {:.2} dB", snr);
 }
 
-fn tmp_path(_name: &str, ext: &str) -> PathBuf {
-    let file = NamedTempFile::new().expect("tmp file");
-    let mut p = file.into_temp_path().to_path_buf();
-    // Ensure extension for ffmpeg/ffprobe clarity
-    p.set_extension(ext);
-    p
+/// Path to a fresh artifact inside `dir`. The whole directory is removed when
+/// the `TempDir` drops, so callers never leak the ffmpeg/ffprobe outputs.
+fn tmp_path(dir: &TempDir, name: &str) -> PathBuf {
+    dir.path().join(name)
 }
 
 fn ffmpeg_encode_opus_to_file(pcm: &[i16], sr: i32, ch: i32, bitrate_kbps: i32, out_path: &Path) {
@@ -419,8 +417,9 @@ fn test_ffmpeg_bitrate_target_compare() {
     );
 
     // ffmpeg reference encodes
-    let p24 = tmp_path("ff_ref_24", "opus");
-    let p96 = tmp_path("ff_ref_96", "opus");
+    let dir = tempfile::tempdir().expect("tmp dir");
+    let p24 = tmp_path(&dir, "ff_ref_24.opus");
+    let p96 = tmp_path(&dir, "ff_ref_96.opus");
     ffmpeg_encode_opus_to_file(&pcm, sr.as_i32(), ch.as_i32(), 24, &p24);
     ffmpeg_encode_opus_to_file(&pcm, sr.as_i32(), ch.as_i32(), 96, &p96);
     let ff_bps24 = ffprobe_entry(&p24, "format=bit_rate").expect("ffprobe bitrate 24");
@@ -443,8 +442,6 @@ fn test_ffmpeg_bitrate_target_compare() {
         "96k ratio out of bounds: {}",
         ratio96
     );
-
-    // tempfile handles cleanup when TempPath drops
 }
 
 #[test]
@@ -456,6 +453,7 @@ fn test_ffmpeg_sample_rate_check_from_wav() {
         SampleRate::Hz48000,
     ];
     let chans = [Channels::Mono, Channels::Stereo];
+    let dir = tempfile::tempdir().expect("tmp dir");
     for &sr in &rates {
         for &ch in &chans {
             let pcm = gen_sine_pcm_s16le(sr.as_i32(), ch.as_i32(), 1.0);
@@ -485,7 +483,7 @@ fn test_ffmpeg_sample_rate_check_from_wav() {
             recon.truncate(pcm.len());
 
             // Write WAV and query via ffprobe
-            let wav = tmp_path("roundtrip", "wav");
+            let wav = tmp_path(&dir, &format!("roundtrip-{}-{}.wav", sr.as_i32(), ch.as_i32()));
             write_wav_i16(&wav, sr.as_i32(), ch.as_i32(), &recon);
             let probed_sr = ffprobe_entry(&wav, "stream=sample_rate").expect("ffprobe sr");
             assert_eq!(probed_sr as i32, sr.as_i32(), "sample rate mismatch");
