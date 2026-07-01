@@ -8,9 +8,11 @@
 //! demand by sending a `load_older` request as it scrolls up, addressed by a
 //! server-assigned monotonic sequence number.
 
+use std::fs;
 use std::io;
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::thread;
 use std::time::Duration;
@@ -22,6 +24,7 @@ use jsony::Jsony;
 use rpc::control::{ChatMessage, FileMetadata};
 
 use crate::config::WebConfig;
+use crate::web_wire::{self, Fragment, split_fragments};
 
 /// The path a browser opens a WebSocket on for the live feed.
 const WS_PATH: &str = "/ws";
@@ -43,23 +46,29 @@ const SYNC_WINDOW: usize = 100;
 /// misbehaving client cannot ask for an unbounded slice.
 const MAX_PAGE: usize = 200;
 
-/// A single chat entry in the JSON view the frontend renders.
-#[derive(Clone, Jsony)]
-#[jsony(Json)]
+/// Largest UTF-8 file the highlighted preview endpoint will read and encode.
+const MAX_HIGHLIGHT_FILE_BYTES: u64 = 2 * 1024 * 1024;
+
+/// A single chat entry the frontend renders.
+///
+/// The body is split into [`Fragment`]s (prose and highlighted code) that the
+/// browser composes directly. The wire form is the binary encoding in
+/// [`crate::web_wire`], not JSON.
+#[derive(Clone)]
 pub struct WebMessage {
     pub id: u64,
     pub sender: String,
-    pub body: String,
     pub timestamp_ms: u64,
     pub attachment: Option<WebAttachment>,
     /// `Some` for a file message. The feed upserts by this id together with
     /// `timestamp_ms`, because transfer ids are reused after a server restart.
     pub file_id: Option<u64>,
+    /// The body pre-split into prose and highlighted code fragments.
+    pub fragments: Vec<Fragment>,
 }
 
 /// An inline media file attached to a [`WebMessage`], served from `/files`.
-#[derive(Clone, Jsony)]
-#[jsony(Json)]
+#[derive(Clone)]
 pub struct WebAttachment {
     /// The served file name. The frontend builds the URL as `/files/<name>`.
     pub name: String,
@@ -82,7 +91,7 @@ impl From<&ChatMessage> for WebMessage {
             // the inline file message that later enriches it.
             id: file_id.unwrap_or(message.message_id.0),
             sender: message.sender_name.clone(),
-            body: message.body.clone(),
+            fragments: split_fragments(&message.body),
             timestamp_ms: message.timestamp_ms,
             attachment: None,
             file_id,
@@ -109,16 +118,17 @@ impl WebMessage {
             ("image", Some((w, h))) => (Some(w), Some(h)),
             _ => (None, None),
         };
+        // Mirror the server's announcement body so the size metadata survives
+        // whichever of the two messages wins the upsert merge.
+        let body = format!(
+            "sent file `{}` ({})",
+            metadata.original_name,
+            format_size(metadata.size)
+        );
         WebMessage {
             id: metadata.transfer_id.0,
             sender: metadata.sender_name.clone(),
-            // Mirror the server's announcement body so the size metadata survives
-            // whichever of the two messages wins the upsert merge.
-            body: format!(
-                "sent file `{}` ({})",
-                metadata.original_name,
-                format_size(metadata.size)
-            ),
+            fragments: split_fragments(&body),
             timestamp_ms: metadata.timestamp_ms,
             attachment: Some(WebAttachment {
                 kind: kind.to_string(),
@@ -149,7 +159,7 @@ impl WebMessage {
         WebMessage {
             id: file_id.unwrap_or(message.message_id.0),
             sender: message.sender_name.clone(),
-            body: message.body.clone(),
+            fragments: split_fragments(&message.body),
             timestamp_ms: message.timestamp_ms,
             attachment: Some(WebAttachment {
                 kind: kind.to_string(),
@@ -173,6 +183,21 @@ impl WebMessage {
             attachment,
             ..incoming
         };
+    }
+}
+
+#[cfg(test)]
+impl WebMessage {
+    /// A plain text message with a fixed sender and timestamp, for tests.
+    pub(crate) fn text_for_test(id: u64, body: &str) -> Self {
+        WebMessage {
+            id,
+            sender: "Alice".to_string(),
+            fragments: split_fragments(body),
+            timestamp_ms: 100,
+            attachment: None,
+            file_id: None,
+        }
     }
 }
 
@@ -338,6 +363,52 @@ impl WebFeedSender {
     }
 }
 
+/// Builds the `/highlight/<name>` handler serving a file's line-indexed
+/// highlight buffer (see [`crate::highlight::encode_file`]).
+///
+/// The name resolves against `dir`, the same flat receive directory `/files`
+/// serves. A missing file is `404`, a file over [`MAX_HIGHLIGHT_FILE_BYTES`] is
+/// `413`, a non-UTF-8 file is `415`, and any text file returns the binary
+/// buffer regardless of whether its extension maps to a highlighter (an unknown
+/// extension renders as plain text).
+fn highlight_route(dir: PathBuf) -> darkhttp::GeneratedHandler {
+    Arc::new(move |request: &darkhttp::GeneratedRequest| {
+        let name = request.relative;
+        // The receive directory is flat, so a name with a separator or parent
+        // reference is never valid and is refused rather than resolved.
+        if !valid_highlight_name(name) {
+            return darkhttp::GeneratedResponse::error(404);
+        }
+        let path = dir.join(name);
+        let Ok(metadata) = fs::metadata(&path) else {
+            return darkhttp::GeneratedResponse::error(404);
+        };
+        if !metadata.is_file() {
+            return darkhttp::GeneratedResponse::error(404);
+        }
+        if metadata.len() > MAX_HIGHLIGHT_FILE_BYTES {
+            return darkhttp::GeneratedResponse::error(413);
+        }
+        let Ok(bytes) = fs::read(&path) else {
+            return darkhttp::GeneratedResponse::error(404);
+        };
+        if bytes.len() as u64 > MAX_HIGHLIGHT_FILE_BYTES {
+            return darkhttp::GeneratedResponse::error(413);
+        }
+        let Ok(text) = String::from_utf8(bytes) else {
+            return darkhttp::GeneratedResponse::error(415);
+        };
+        let extension = name.rsplit('.').next().unwrap_or("");
+        let language = crate::highlight::language_for_extension(extension);
+        let buffer = crate::highlight::encode_file(&text, language);
+        darkhttp::GeneratedResponse::ok("application/octet-stream", buffer)
+    })
+}
+
+fn valid_highlight_name(name: &str) -> bool {
+    !name.is_empty() && name != "." && name != ".." && !name.contains('/') && !name.contains('\\')
+}
+
 /// Starts the web server on its own thread and returns a feed handle.
 ///
 /// `receive_dir`, when set, is mounted at `/files` so inline media resolves.
@@ -362,7 +433,9 @@ pub fn spawn(
 
     let mut router = Router::new().websocket(WS_PATH);
     if let Some(dir) = receive_dir {
-        router = router.mount_file_dir("/files", dir);
+        router = router
+            .mount_file_dir("/files", dir.clone())
+            .mount_generated("/highlight", highlight_route(dir));
     }
     #[cfg(not(feature = "embed-web"))]
     {
@@ -418,7 +491,7 @@ fn run(
                 ServerEvent::WebSocketOpen { id, path } => {
                     if path == WS_PATH {
                         clients.push(id);
-                        let _ = server.send_websocket_text(id, sync_payload(&history, base_seq));
+                        let _ = server.send_websocket_binary(id, &sync_frame(&history, base_seq));
                         for payload in active_shares.values() {
                             let _ = server.send_websocket_text(id, payload);
                         }
@@ -430,8 +503,8 @@ fn run(
                     message: WebSocketMessage::Text(text),
                 } => match jsony::from_json::<ClientRequest>(&text) {
                     Ok(ClientRequest::LoadOlder { before_seq, limit }) => {
-                        let payload = older_window_payload(before_seq, limit, &history, base_seq);
-                        let _ = server.send_websocket_text(id, &payload);
+                        let frame = older_frame(before_seq, limit, &history, base_seq);
+                        let _ = server.send_websocket_binary(id, &frame);
                     }
                     Ok(ClientRequest::PlayShare { stream_id }) => {
                         let _ = web_requests.send(WebRequest::PlayShare { stream_id });
@@ -458,21 +531,21 @@ fn run(
                             .rev()
                             .find(|held| same_file(held, &message))
                     });
-                    let payload = if let Some(existing) = existing {
+                    let frame = if let Some(existing) = existing {
                         existing.merge_from(message);
-                        message_payload(existing)
+                        web_wire::encode_single(existing)
                     } else {
-                        let payload = message_payload(&message);
+                        let frame = web_wire::encode_single(&message);
                         history.push(message);
                         if history.len() > max_messages {
                             let excess = history.len() - max_messages;
                             history.drain(0..excess);
                             base_seq += excess as u64;
                         }
-                        payload
+                        frame
                     };
                     for id in &clients {
-                        let _ = server.send_websocket_text(*id, &payload);
+                        let _ = server.send_websocket_binary(*id, &frame);
                     }
                 }
                 Ok(WebFeed::SetRoom(messages)) => {
@@ -486,9 +559,9 @@ fn run(
                         history.drain(0..excess);
                         base_seq += excess as u64;
                     }
-                    let payload = sync_payload(&history, base_seq);
+                    let frame = sync_frame(&history, base_seq);
                     for id in &clients {
-                        let _ = server.send_websocket_text(*id, &payload);
+                        let _ = server.send_websocket_binary(*id, &frame);
                     }
                 }
                 Ok(WebFeed::ShareAvailable { stream_id, payload }) => {
@@ -521,25 +594,20 @@ fn run(
     }
 }
 
-/// The `sync` envelope sent on connect: the most recent [`SYNC_WINDOW`] messages.
-fn sync_payload(history: &[WebMessage], base_seq: u64) -> String {
+/// The `sync` frame sent on connect: the most recent [`SYNC_WINDOW`] messages.
+fn sync_frame(history: &[WebMessage], base_seq: u64) -> Vec<u8> {
     let start = history.len().saturating_sub(SYNC_WINDOW);
-    window_payload(
-        "sync",
+    web_wire::encode_window(
+        web_wire::KIND_SYNC,
         &history[start..],
         base_seq + start as u64,
         start > 0,
     )
 }
 
-/// Builds the `older` envelope for a `load_older` cursor: the `limit` messages
+/// Builds the `older` frame for a `load_older` cursor: the `limit` messages
 /// immediately before `before_seq`.
-fn older_window_payload(
-    before_seq: u64,
-    limit: u64,
-    history: &[WebMessage],
-    base_seq: u64,
-) -> String {
+fn older_frame(before_seq: u64, limit: u64, history: &[WebMessage], base_seq: u64) -> Vec<u8> {
     // Clamp the cursor into the retained range, then take the `limit` messages
     // immediately before it.
     let end = before_seq
@@ -547,41 +615,12 @@ fn older_window_payload(
         .min(history.len() as u64) as usize;
     let limit = (limit as usize).clamp(1, MAX_PAGE);
     let start = end.saturating_sub(limit);
-    window_payload(
-        "older",
+    web_wire::encode_window(
+        web_wire::KIND_OLDER,
         &history[start..end],
         base_seq + start as u64,
         start > 0,
     )
-}
-
-/// Builds the `older` envelope answering a `load_older` request, or [`None`] if
-/// the request does not parse. Retained for unit tests of the parse-and-build path.
-#[cfg(test)]
-fn older_payload(text: &str, history: &[WebMessage], base_seq: u64) -> Option<String> {
-    match jsony::from_json(text).ok()? {
-        ClientRequest::LoadOlder { before_seq, limit } => {
-            Some(older_window_payload(before_seq, limit, history, base_seq))
-        }
-        _ => None,
-    }
-}
-
-/// Serializes a window of messages with its paging cursor.
-///
-/// `oldest_seq` is the sequence number of the first message in `messages`.
-/// `has_more` is true when still-older retained history exists before it.
-fn window_payload(kind: &str, messages: &[WebMessage], oldest_seq: u64, has_more: bool) -> String {
-    let messages = jsony::to_json(messages);
-    format!(
-        "{{\"type\":\"{kind}\",\"messages\":{messages},\"oldest_seq\":{oldest_seq},\"has_more\":{has_more}}}"
-    )
-}
-
-/// The `message` envelope sent for each new message.
-fn message_payload(message: &WebMessage) -> String {
-    let message = jsony::to_json(message);
-    format!("{{\"type\":\"message\",\"message\":{message}}}")
 }
 
 #[cfg(test)]
@@ -598,66 +637,84 @@ mod tests {
     }
 
     fn text_message(id: u64, body: &str) -> WebMessage {
-        WebMessage {
-            id,
-            sender: "Alice".to_string(),
-            body: body.to_string(),
-            timestamp_ms: 100,
-            attachment: None,
-            file_id: None,
+        WebMessage::text_for_test(id, body)
+    }
+
+    #[test]
+    fn highlight_name_validation_allows_flat_dotted_names() {
+        assert!(valid_highlight_name("trace..old.rs"));
+        assert!(valid_highlight_name("main.rs"));
+        assert!(!valid_highlight_name(""));
+        assert!(!valid_highlight_name("."));
+        assert!(!valid_highlight_name(".."));
+        assert!(!valid_highlight_name("nested/main.rs"));
+        assert!(!valid_highlight_name(r"nested\main.rs"));
+    }
+
+    /// Parses a `load_older` request and builds its frame, mirroring the run
+    /// loop's request handling.
+    fn older_frame_for(request: &str, history: &[WebMessage], base_seq: u64) -> Option<Vec<u8>> {
+        match jsony::from_json(request).ok()? {
+            ClientRequest::LoadOlder { before_seq, limit } => {
+                Some(older_frame(before_seq, limit, history, base_seq))
+            }
+            _ => None,
         }
     }
 
     #[test]
-    fn sync_payload_wraps_recent_window() {
+    fn sync_frame_wraps_recent_window() {
         let history = vec![text_message(7, "hi")];
-        let payload = sync_payload(&history, 0);
-        assert!(payload.starts_with("{\"type\":\"sync\",\"messages\":["));
-        assert!(payload.contains("\"sender\":\"Alice\""));
-        assert!(payload.contains("\"oldest_seq\":0"));
-        assert!(payload.contains("\"has_more\":false"));
+        let window = web_wire::decode_window(&sync_frame(&history, 0));
+        assert_eq!(window.kind, web_wire::KIND_SYNC);
+        assert_eq!(window.oldest_seq, 0);
+        assert!(!window.has_more);
+        assert_eq!(window.messages.len(), 1);
+        assert_eq!(window.messages[0].sender, "Alice");
     }
 
     #[test]
-    fn sync_payload_caps_window_and_flags_more() {
+    fn sync_frame_caps_window_and_flags_more() {
         let history: Vec<WebMessage> = (0..SYNC_WINDOW as u64 + 5)
             .map(|i| text_message(i, "m"))
             .collect();
-        let payload = sync_payload(&history, 0);
+        let window = web_wire::decode_window(&sync_frame(&history, 0));
         // Only the last SYNC_WINDOW messages, starting at seq 5, with older
         // history still available.
-        assert!(payload.contains("\"oldest_seq\":5"));
-        assert!(payload.contains("\"has_more\":true"));
-        assert_eq!(payload.matches("\"sender\"").count(), SYNC_WINDOW);
+        assert_eq!(window.oldest_seq, 5);
+        assert!(window.has_more);
+        assert_eq!(window.messages.len(), SYNC_WINDOW);
     }
 
     #[test]
-    fn older_payload_returns_window_before_cursor() {
+    fn older_frame_returns_window_before_cursor() {
         let history: Vec<WebMessage> = (0..10).map(|i| text_message(i, "m")).collect();
         // Ask for the 3 messages before seq 5, while base_seq is 0.
         let request = r#"{"type":"load_older","before_seq":5,"limit":3}"#;
-        let payload = older_payload(request, &history, 0).expect("valid request");
-        assert!(payload.starts_with("{\"type\":\"older\","));
-        assert!(payload.contains("\"oldest_seq\":2"));
-        assert!(payload.contains("\"has_more\":true"));
-        assert_eq!(payload.matches("\"sender\"").count(), 3);
+        let frame = older_frame_for(request, &history, 0).expect("valid request");
+        let window = web_wire::decode_window(&frame);
+        assert_eq!(window.kind, web_wire::KIND_OLDER);
+        assert_eq!(window.oldest_seq, 2);
+        assert!(window.has_more);
+        assert_eq!(window.messages.len(), 3);
     }
 
     #[test]
-    fn older_payload_clears_more_at_start() {
+    fn older_frame_clears_more_at_start() {
         let history: Vec<WebMessage> = (0..10).map(|i| text_message(i, "m")).collect();
         let request = r#"{"type":"load_older","before_seq":2,"limit":50}"#;
-        let payload = older_payload(request, &history, 0).expect("valid request");
-        assert!(payload.contains("\"oldest_seq\":0"));
-        assert!(payload.contains("\"has_more\":false"));
-        assert_eq!(payload.matches("\"sender\"").count(), 2);
+        let frame = older_frame_for(request, &history, 0).expect("valid request");
+        let window = web_wire::decode_window(&frame);
+        assert_eq!(window.oldest_seq, 0);
+        assert!(!window.has_more);
+        assert_eq!(window.messages.len(), 2);
     }
 
     #[test]
-    fn older_payload_rejects_garbage() {
+    fn older_frame_rejects_garbage() {
         let history = vec![text_message(0, "m")];
-        assert!(older_payload("not json", &history, 0).is_none());
-        assert!(older_payload(r#"{"type":"other"}"#, &history, 0).is_none());
+        assert!(older_frame_for("not json", &history, 0).is_none());
+        assert!(older_frame_for(r#"{"type":"other"}"#, &history, 0).is_none());
     }
 
     use rpc::control::FileMetadata;
@@ -683,14 +740,24 @@ mod tests {
         assert_eq!(attachment.width, Some(640));
         assert_eq!(attachment.height, Some(480));
 
-        let json = jsony::to_json(&message);
-        assert!(json.contains("\"attachment\":{"), "{json}");
-        assert!(json.contains("\"name\":\"wide-1.png\""), "{json}");
+        // The encoded frame carries the served name in its attachment.
+        let frame = web_wire::encode_single(&message);
+        let window_like =
+            web_wire::encode_window(web_wire::KIND_SYNC, &[message.clone()], 0, false);
+        let decoded = web_wire::decode_window(&window_like);
+        assert_eq!(
+            decoded.messages[0].attachment_name.as_deref(),
+            Some("wide-1.png")
+        );
+        assert!(!frame.is_empty());
 
         // The file id carries the transfer id and the body keeps the size, so the
         // inline message correlates with and reads like its announcement.
         assert_eq!(message.file_id, Some(3));
-        assert_eq!(message.body, "sent file `wide.png` (10 B)");
+        let Fragment::Text(body) = &message.fragments[0] else {
+            panic!("expected a text fragment");
+        };
+        assert_eq!(body, "sent file `wide.png` (10 B)");
     }
 
     fn file_metadata(transfer_id: u64) -> FileMetadata {
@@ -729,14 +796,7 @@ mod tests {
 
     #[test]
     fn merge_enriches_placeholder_in_place() {
-        let mut placeholder: WebMessage = WebMessage {
-            id: 7,
-            sender: "Alice".to_string(),
-            body: "sent file `wide.png` (2.0 KiB)".to_string(),
-            timestamp_ms: 5,
-            attachment: None,
-            file_id: Some(7),
-        };
+        let mut placeholder = file_placeholder(7, "sent file `wide.png` (2.0 KiB)");
         let inline = WebMessage::from_file(&file_metadata(7), "wide.png", Some((4, 2)));
         placeholder.merge_from(inline);
         let attachment = placeholder.attachment.as_ref().expect("attachment kept");
@@ -748,14 +808,7 @@ mod tests {
     fn merge_keeps_attachment_when_placeholder_arrives_last() {
         // Reverse order: the inline file arrived first, then the announcement.
         let mut inline = WebMessage::from_file(&file_metadata(7), "wide.png", Some((4, 2)));
-        let placeholder = WebMessage {
-            id: 7,
-            sender: "Alice".to_string(),
-            body: "sent file `wide.png` (2.0 KiB)".to_string(),
-            timestamp_ms: 5,
-            attachment: None,
-            file_id: Some(7),
-        };
+        let placeholder = file_placeholder(7, "sent file `wide.png` (2.0 KiB)");
         inline.merge_from(placeholder);
         assert!(
             inline.attachment.is_some(),
@@ -810,22 +863,118 @@ mod tests {
         assert_eq!(attachment.height, None);
     }
 
-    #[test]
-    fn text_message_serializes_null_attachment() {
-        let message = WebMessage {
-            id: 1,
-            sender: "Bob".to_string(),
-            body: "hi".to_string(),
-            timestamp_ms: 0,
+    /// A file announcement placeholder: a file id and body but no attachment yet.
+    fn file_placeholder(id: u64, body: &str) -> WebMessage {
+        WebMessage {
+            id,
+            sender: "Alice".to_string(),
+            fragments: split_fragments(body),
+            timestamp_ms: 5,
             attachment: None,
-            file_id: None,
-        };
-        assert!(jsony::to_json(&message).contains("\"attachment\":null"));
+            file_id: Some(id),
+        }
+    }
+
+    #[test]
+    fn text_message_encodes_without_attachment() {
+        let message = WebMessage::text_for_test(1, "hi");
+        let frame = web_wire::encode_window(web_wire::KIND_SYNC, &[message], 0, false);
+        let decoded = web_wire::decode_window(&frame);
+        assert!(decoded.messages[0].attachment_name.is_none());
     }
 
     use std::io::{Read, Write};
     use std::net::TcpStream;
     use std::time::Duration;
+
+    #[test]
+    fn highlight_endpoint_serves_file_buffer() {
+        let dir = std::env::temp_dir().join(format!("chatt-hl-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("trace..old.rs"), "fn main() {}\n").unwrap();
+
+        let cfg = WebConfig {
+            enabled: true,
+            bind: "127.0.0.1:39521".to_string(),
+        };
+        let (web_tx, _web_rx) = mpsc::channel();
+        let _sender = spawn(&cfg, Some(dir.clone()), 100, web_tx).unwrap();
+
+        let mut stream = TcpStream::connect("127.0.0.1:39521").unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        stream
+            .write_all(
+                b"GET /highlight/trace..old.rs HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
+            )
+            .unwrap();
+        let headers = read_http_headers(&mut stream);
+        assert!(headers.starts_with("HTTP/1.1 200 OK"), "{headers}");
+        assert!(headers.contains("application/octet-stream"), "{headers}");
+
+        let mut body = Vec::new();
+        stream.read_to_end(&mut body).unwrap();
+        // The first byte is the format version; a Rust body highlights a keyword.
+        assert_eq!(body[0], 1);
+        assert!(body.contains(&crate::highlight::HlClass::Keyword.as_u8()));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn highlight_endpoint_rejects_large_file() {
+        let dir = std::env::temp_dir().join(format!("chatt-hl-large-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let large = vec![b'a'; MAX_HIGHLIGHT_FILE_BYTES as usize + 1];
+        std::fs::write(dir.join("large.txt"), large).unwrap();
+
+        let cfg = WebConfig {
+            enabled: true,
+            bind: "127.0.0.1:39523".to_string(),
+        };
+        let (web_tx, _web_rx) = mpsc::channel();
+        let _sender = spawn(&cfg, Some(dir.clone()), 100, web_tx).unwrap();
+
+        let mut stream = TcpStream::connect("127.0.0.1:39523").unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        stream
+            .write_all(b"GET /highlight/large.txt HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+            .unwrap();
+        let headers = read_http_headers(&mut stream);
+        assert!(
+            headers.starts_with("HTTP/1.1 413 Payload Too Large"),
+            "{headers}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn highlight_endpoint_rejects_missing_file() {
+        let dir = std::env::temp_dir().join(format!("chatt-hl-miss-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfg = WebConfig {
+            enabled: true,
+            bind: "127.0.0.1:39522".to_string(),
+        };
+        let (web_tx, _web_rx) = mpsc::channel();
+        let _sender = spawn(&cfg, Some(dir.clone()), 100, web_tx).unwrap();
+
+        let mut stream = TcpStream::connect("127.0.0.1:39522").unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        stream
+            .write_all(b"GET /highlight/absent.rs HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+            .unwrap();
+        let headers = read_http_headers(&mut stream);
+        assert!(headers.starts_with("HTTP/1.1 404"), "{headers}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     fn read_http_headers(stream: &mut TcpStream) -> String {
         let mut out = Vec::new();
@@ -887,27 +1036,22 @@ Sec-WebSocket-Version: 13\r\n\
             "{headers}"
         );
 
+        // The feed frames are binary (opcode 0x2). The first is an empty sync.
         let (opcode, payload) = read_ws_frame(&mut stream);
-        assert_eq!(opcode, 0x1);
+        assert_eq!(opcode, 0x2);
+        let sync = web_wire::decode_window(&payload);
+        assert_eq!(sync.kind, web_wire::KIND_SYNC);
+        assert!(sync.messages.is_empty());
+
+        sender.send(WebMessage::text_for_test(1, "hello web"));
+
+        let (opcode, payload) = read_ws_frame(&mut stream);
+        assert_eq!(opcode, 0x2);
+        let message = web_wire::decode_single(&payload);
         assert_eq!(
-            payload,
-            b"{\"type\":\"sync\",\"messages\":[],\"oldest_seq\":0,\"has_more\":false}"
+            message.fragments,
+            vec![Fragment::Text("hello web".to_string())]
         );
-
-        sender.send(WebMessage {
-            id: 1,
-            sender: "Bob".to_string(),
-            body: "hello web".to_string(),
-            timestamp_ms: 42,
-            attachment: None,
-            file_id: None,
-        });
-
-        let (opcode, payload) = read_ws_frame(&mut stream);
-        assert_eq!(opcode, 0x1);
-        let text = String::from_utf8(payload).unwrap();
-        assert!(text.starts_with("{\"type\":\"message\""), "{text}");
-        assert!(text.contains("\"body\":\"hello web\""), "{text}");
     }
 
     /// Sends a client-to-server text frame, which RFC 6455 requires to be masked.
@@ -958,29 +1102,25 @@ Sec-WebSocket-Version: 13\r\n\
 
         let mut stream = open_ws("127.0.0.1:39520");
         let (_, sync) = read_ws_frame(&mut stream);
-        assert!(String::from_utf8(sync).unwrap().contains("\"messages\":[]"));
+        assert!(web_wire::decode_window(&sync).messages.is_empty());
 
         // Entering a room re-syncs the connected browser with that room's history.
-        sender.set_room(vec![WebMessage {
-            id: 1,
-            sender: "Alice".to_string(),
-            body: "room one".to_string(),
-            timestamp_ms: 1,
-            attachment: None,
-            file_id: None,
-        }]);
+        sender.set_room(vec![WebMessage::text_for_test(1, "room one")]);
         let (opcode, payload) = read_ws_frame(&mut stream);
-        assert_eq!(opcode, 0x1);
-        let text = String::from_utf8(payload).unwrap();
-        assert!(text.starts_with("{\"type\":\"sync\""), "{text}");
-        assert!(text.contains("\"body\":\"room one\""), "{text}");
+        assert_eq!(opcode, 0x2);
+        let window = web_wire::decode_window(&payload);
+        assert_eq!(window.kind, web_wire::KIND_SYNC);
+        assert_eq!(
+            window.messages[0].fragments,
+            vec![Fragment::Text("room one".to_string())]
+        );
 
         // Leaving the room clears the view to nothing.
         sender.set_room(Vec::new());
         let (_, cleared) = read_ws_frame(&mut stream);
-        let text = String::from_utf8(cleared).unwrap();
-        assert!(text.starts_with("{\"type\":\"sync\""), "{text}");
-        assert!(text.contains("\"messages\":[]"), "{text}");
+        let window = web_wire::decode_window(&cleared);
+        assert_eq!(window.kind, web_wire::KIND_SYNC);
+        assert!(window.messages.is_empty());
     }
 
     #[test]
@@ -995,18 +1135,11 @@ Sec-WebSocket-Version: 13\r\n\
         let mut stream = open_ws("127.0.0.1:39518");
         // Drain the initial empty sync frame.
         let (_, payload) = read_ws_frame(&mut stream);
-        assert!(String::from_utf8(payload).unwrap().contains("\"sync\""));
+        assert_eq!(web_wire::decode_window(&payload).kind, web_wire::KIND_SYNC);
 
         // Three live messages take sequence numbers 0, 1, 2.
         for i in 0..3 {
-            sender.send(WebMessage {
-                id: i,
-                sender: "Bob".to_string(),
-                body: format!("m{i}"),
-                timestamp_ms: 1,
-                attachment: None,
-                file_id: None,
-            });
+            sender.send(WebMessage::text_for_test(i, &format!("m{i}")));
             let _ = read_ws_frame(&mut stream);
         }
 
@@ -1016,14 +1149,23 @@ Sec-WebSocket-Version: 13\r\n\
             r#"{"type":"load_older","before_seq":2,"limit":5}"#,
         );
         let (opcode, payload) = read_ws_frame(&mut stream);
-        assert_eq!(opcode, 0x1);
-        let text = String::from_utf8(payload).unwrap();
-        assert!(text.starts_with("{\"type\":\"older\""), "{text}");
-        assert!(text.contains("\"oldest_seq\":0"), "{text}");
-        assert!(text.contains("\"has_more\":false"), "{text}");
-        assert!(text.contains("\"body\":\"m0\""), "{text}");
-        assert!(text.contains("\"body\":\"m1\""), "{text}");
-        assert!(!text.contains("\"body\":\"m2\""), "{text}");
+        assert_eq!(opcode, 0x2);
+        let window = web_wire::decode_window(&payload);
+        assert_eq!(window.kind, web_wire::KIND_OLDER);
+        assert_eq!(window.oldest_seq, 0);
+        assert!(!window.has_more);
+        let bodies: Vec<&Fragment> = window
+            .messages
+            .iter()
+            .flat_map(|message| &message.fragments)
+            .collect();
+        assert_eq!(
+            bodies,
+            vec![
+                &Fragment::Text("m0".to_string()),
+                &Fragment::Text("m1".to_string()),
+            ]
+        );
     }
 
     #[test]
@@ -1045,7 +1187,8 @@ Sec-WebSocket-Version: 13\r\n\
         // the retained announcement follows the initial sync frame.
         let mut late = open_ws("127.0.0.1:39519");
         let (_, sync) = read_ws_frame(&mut late);
-        assert!(String::from_utf8(sync).unwrap().contains("\"sync\""));
+        assert_eq!(web_wire::decode_window(&sync).kind, web_wire::KIND_SYNC);
+        // Share announcements stay JSON text frames (opcode 0x1).
         let (opcode, payload) = read_ws_frame(&mut late);
         assert_eq!(opcode, 0x1);
         let text = String::from_utf8(payload).unwrap();
@@ -1065,18 +1208,12 @@ Sec-WebSocket-Version: 13\r\n\
         // is a live chat message, with no stale share_available before it.
         let mut fresh = open_ws("127.0.0.1:39519");
         let (_, sync2) = read_ws_frame(&mut fresh);
-        assert!(String::from_utf8(sync2).unwrap().contains("\"sync\""));
-        sender.send(WebMessage {
-            id: 1,
-            sender: "Bob".to_string(),
-            body: "hi".to_string(),
-            timestamp_ms: 0,
-            attachment: None,
-            file_id: None,
-        });
-        let (_, next) = read_ws_frame(&mut fresh);
-        let text = String::from_utf8(next).unwrap();
-        assert!(text.contains("\"message\""), "{text}");
-        assert!(!text.contains("share_available"), "{text}");
+        assert_eq!(web_wire::decode_window(&sync2).kind, web_wire::KIND_SYNC);
+        sender.send(WebMessage::text_for_test(1, "hi"));
+        // The next frame is the live message (binary), not a stale share.
+        let (opcode, next) = read_ws_frame(&mut fresh);
+        assert_eq!(opcode, 0x2);
+        let message = web_wire::decode_single(&next);
+        assert_eq!(message.fragments, vec![Fragment::Text("hi".to_string())]);
     }
 }

@@ -191,6 +191,35 @@ fn serves_in_memory_static_routes() {
     );
 }
 
+#[test]
+fn generated_route_serves_computed_body() {
+    let router = Router::new().mount_generated(
+        "/echo",
+        Arc::new(|request: &darkhttp::GeneratedRequest| {
+            if request.relative == "missing" {
+                return darkhttp::GeneratedResponse::error(404);
+            }
+            darkhttp::GeneratedResponse::ok(
+                "application/octet-stream",
+                format!("relative={}", request.relative).into_bytes(),
+            )
+        }),
+    );
+    let server = EmbeddedServer::start(router);
+    let agent = agent();
+
+    let mut res = agent.get(server.url("/echo/report.txt")).call().unwrap();
+    assert_eq!(res.status().as_u16(), 200);
+    assert_eq!(header(&res, "Content-Type"), "application/octet-stream");
+    assert_eq!(
+        res.body_mut().read_to_string().unwrap(),
+        "relative=report.txt"
+    );
+
+    let res = agent.get(server.url("/echo/missing")).call().unwrap();
+    assert_eq!(res.status().as_u16(), 404);
+}
+
 fn embedded(path: &str) -> Option<(&'static str, &'static str, &'static [u8])> {
     match path {
         "/" | "/index.html" => Some(("text/html; charset=UTF-8", "gzip", b"GZIPPEDHTML")),

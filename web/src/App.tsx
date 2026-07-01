@@ -1,9 +1,12 @@
-import { createSignal, createEffect, onCleanup, onMount, Show } from "solid-js";
+import { createSignal, createEffect, onCleanup, onMount, For, Show } from "solid-js";
 import { Virtualizer, type VirtualizerHandle } from "./vendor/virtua/solid/Virtualizer";
-import type { WebMessage, ServerEnvelope, ClientRequest, ShareInfo } from "./types";
+import type { WebMessage, ServerEnvelope, ClientRequest, ShareInfo, Fragment } from "./types";
 import ScreenShare from "./ScreenShare";
 import { ScreenShareDecoder, parseFrame } from "./video-decode";
 import { renderMarkdown } from "./markdown";
+import { renderInline } from "./highlight";
+import { decodeFeed } from "./feed";
+import FileViewer from "./FileViewer";
 
 // Pixel tolerance when deciding the view is "at the bottom". Scroll positions
 // are fractional, so an exact comparison would intermittently read as
@@ -79,7 +82,25 @@ function formatTime(ms: number): string {
   return d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
 }
 
-function Attachment(props: { message: WebMessage }) {
+// Renders a message body from its fragments: prose as markdown, code blocks
+// from their precomputed highlight spans. Nothing is re-highlighted here.
+function MessageBody(props: { fragments: Fragment[] }) {
+  return (
+    <For each={props.fragments}>
+      {(fragment) =>
+        fragment.kind === "text" ? (
+          <div class="message-body" innerHTML={renderMarkdown(fragment.text)} />
+        ) : (
+          <pre class="code-block">
+            <code innerHTML={renderInline(fragment.text, fragment.spans)} />
+          </pre>
+        )
+      }
+    </For>
+  );
+}
+
+function Attachment(props: { message: WebMessage; onOpenFile: (name: string) => void }) {
   const att = () => props.message.attachment!;
   const url = () => fileUrl(att().name);
   // Fades the image in on decode instead of snapping. The box is already
@@ -118,15 +139,30 @@ function Attachment(props: { message: WebMessage }) {
         <audio class="media-audio" src={url()} controls preload="metadata" />
       </Show>
       <Show when={att().kind === "file"}>
-        <a class="media-file" href={url()} download={att().name}>
-          {att().name}
-        </a>
+        {/* Collapsed file card. Expanding opens the highlighted viewer, which
+          * falls back to a download for a non-text file. */}
+        <div class="media-file">
+          <button
+            class="media-file-open"
+            type="button"
+            onClick={() => props.onOpenFile(att().name)}
+          >
+            {att().name}
+          </button>
+          <a class="media-file-download" href={url()} download={att().name}>
+            download
+          </a>
+        </div>
       </Show>
     </div>
   );
 }
 
-function MessageRow(props: { message: WebMessage; prev?: WebMessage }) {
+function MessageRow(props: {
+  message: WebMessage;
+  prev?: WebMessage;
+  onOpenFile: (name: string) => void;
+}) {
   // A continuation hides the header and shows its time only on hover, in the
   // reserved left gutter. `prev` is supplied reactively from the message list,
   // so prepended history re-evaluates the boundary row's grouping.
@@ -149,11 +185,9 @@ function MessageRow(props: { message: WebMessage; prev?: WebMessage }) {
           <span class="message-sender">{props.message.sender}</span>
         </div>
       </Show>
-      <Show when={props.message.body}>
-        <div class="message-body" innerHTML={renderMarkdown(props.message.body)} />
-      </Show>
+      <MessageBody fragments={props.message.fragments} />
       <Show when={props.message.attachment}>
-        <Attachment message={props.message} />
+        <Attachment message={props.message} onOpenFile={props.onOpenFile} />
       </Show>
     </div>
   );
@@ -173,6 +207,8 @@ export default function App() {
   const [shareErrors, setShareErrors] = createSignal<Record<number, string>>({});
   const [sharePaneHeight, setSharePaneHeight] = createSignal(DEFAULT_SHARE_PANE_HEIGHT);
   const [fullscreenStream, setFullscreenStream] = createSignal<number | null>(null);
+  // The file currently expanded into the viewer panel, or null when none is.
+  const [openFile, setOpenFile] = createSignal<string | null>(null);
 
   function setShareError(streamId: number, message: string) {
     setShareErrors((prev) => ({ ...prev, [streamId]: message }));
@@ -494,28 +530,56 @@ export default function App() {
     ws.onopen = () => setConnected(true);
     ws.onmessage = (ev) => {
       if (typeof ev.data !== "string") {
-        const frame = parseFrame(ev.data as ArrayBuffer);
-        if (frame) decoders.get(frame.streamId)?.decode(frame);
+        // A binary message is either a chat feed frame (zero sentinel) or a
+        // video frame. decodeFeed returns null for the latter.
+        const buffer = ev.data as ArrayBuffer;
+        const feed = decodeFeed(buffer);
+        if (!feed) {
+          const frame = parseFrame(buffer);
+          if (frame) decoders.get(frame.streamId)?.decode(frame);
+          return;
+        }
+        if (feed.kind === "sync") {
+          preloadRecentImages(feed.messages);
+          setMessages(feed.messages);
+          oldestSeq = feed.oldest_seq;
+          hasMore = feed.has_more;
+          following = true;
+          pin();
+        } else if (feed.kind === "older") {
+          loadingOlder = false;
+          if (feed.messages.length > 0) {
+            preloadRecentImages(feed.messages);
+            setPrepend(true);
+            setMessages((prev) => [...feed.messages, ...prev]);
+          }
+          oldestSeq = feed.oldest_seq;
+          hasMore = feed.has_more;
+        } else {
+          // A live message. Upsert by the announcement timestamp and file id;
+          // transfer ids are reused after server restarts, while the pair
+          // identifies one file.
+          const msg = feed.message;
+          preloadImage(msg);
+          setMessages((prev) => {
+            if (msg.file_id !== null) {
+              const i = prev.findIndex(
+                (m) => m.file_id === msg.file_id && m.timestamp_ms === msg.timestamp_ms,
+              );
+              if (i >= 0) {
+                const next = prev.slice();
+                next[i] = msg;
+                return next;
+              }
+            }
+            return [...prev, msg];
+          });
+          pin();
+        }
         return;
       }
       const env: ServerEnvelope = JSON.parse(ev.data);
-      if (env.type === "sync") {
-        preloadRecentImages(env.messages);
-        setMessages(env.messages);
-        oldestSeq = env.oldest_seq;
-        hasMore = env.has_more;
-        following = true;
-        pin();
-      } else if (env.type === "older") {
-        loadingOlder = false;
-        if (env.messages.length > 0) {
-          preloadRecentImages(env.messages);
-          setPrepend(true);
-          setMessages((prev) => [...env.messages, ...prev]);
-        }
-        oldestSeq = env.oldest_seq;
-        hasMore = env.has_more;
-      } else if (env.type === "share_available") {
+      if (env.type === "share_available") {
         setShares((prev) => {
           const share = {
             stream_id: env.stream_id,
@@ -556,27 +620,6 @@ export default function App() {
           exitShareFullscreen();
         }
         closeDecoder(env.stream_id);
-      } else {
-        // Upsert by the announcement timestamp and file id. Transfer ids are
-        // reused after server restarts, while the pair identifies one file.
-        const msg = env.message;
-        preloadImage(msg);
-        setMessages((prev) => {
-          if (msg.file_id !== null) {
-            const i = prev.findIndex(
-              (m) =>
-                m.file_id === msg.file_id &&
-                m.timestamp_ms === msg.timestamp_ms,
-            );
-            if (i >= 0) {
-              const next = prev.slice();
-              next[i] = msg;
-              return next;
-            }
-          }
-          return [...prev, msg];
-        });
-        pin();
       }
     };
     ws.onclose = () => {
@@ -625,6 +668,7 @@ export default function App() {
       <Show when={!connected()}>
         <div class="conn-overlay">offline — reconnecting…</div>
       </Show>
+      <div class="app-body">
       <main
         class="app-main"
         classList={{
@@ -682,12 +726,22 @@ export default function App() {
               onScrollEnd={onScrollEnd}
             >
               {(message, index) => (
-                <MessageRow message={message} prev={messages()[index() - 1]} />
+                <MessageRow
+                  message={message}
+                  prev={messages()[index() - 1]}
+                  onOpenFile={setOpenFile}
+                />
               )}
             </Virtualizer>
           </div>
         </div>
       </main>
+      <Show when={openFile()}>
+        <aside class="file-panel">
+          <FileViewer name={openFile()!} onClose={() => setOpenFile(null)} />
+        </aside>
+      </Show>
+      </div>
     </div>
   );
 }

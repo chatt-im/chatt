@@ -102,6 +102,31 @@ pub(crate) fn error(
     }
 }
 
+/// An in-memory response with an arbitrary status, for a handler that computes
+/// its body. Unlike [`bytes`], the status and reason are the caller's.
+pub(crate) fn owned(
+    status: u16,
+    reason: &'static str,
+    body: Arc<[u8]>,
+    content_type: &str,
+    keep_alive: bool,
+    timeout: Duration,
+    header_only: bool,
+) -> PreparedResponse {
+    let mut header = common_header(status, reason, keep_alive, timeout);
+    content_type_header(&mut header, content_type);
+    finish_header(&mut header, body.len() as u64);
+    PreparedResponse {
+        header,
+        body: if header_only {
+            Body::Empty
+        } else {
+            Body::Bytes(body)
+        },
+        keep_alive,
+    }
+}
+
 pub(crate) fn bytes(
     body: Arc<[u8]>,
     content_type: &str,

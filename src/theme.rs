@@ -1,8 +1,9 @@
 use extui::{AnsiColor, Style};
 use extui_editor::{EditorTheme, SelectionTheme};
-use tinyhl::{RenderSpan, SemanticKind, kind};
+use tinyhl::RenderSpan;
 
 use crate::config::ThemeChoice;
+use crate::highlight::{HlClass, classify_span};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum UiMode {
@@ -371,51 +372,44 @@ impl Theme {
 
 impl SyntaxTheme {
     pub fn style(&self, span: &RenderSpan) -> Style {
-        if span.delimiter.is_some() {
-            return self.fg;
-        }
-        match span.local_kind {
-            kind::STRING
-            | kind::TEMPLATE_STRING
-            | kind::REGEX
-            | kind::CHAR
-            | kind::CDATA
-            | kind::CODE_INLINE
-            | kind::CODE_FENCE
-            | kind::CODE_BLOCK => self.string,
-            kind::NUMBER => self.number,
-            kind::KEYWORD => match span.semantic {
-                Some(SemanticKind::TypeDefinition | SemanticKind::TypeName) => self.type_,
-                _ => self.keyword,
-            },
-            kind::DOCTYPE | kind::AT_KEYWORD => self.keyword,
-            kind::COMMENT | kind::DOC_COMMENT => self.comment,
-            kind::TAG_NAME | kind::ATTR_NAME => self.function,
-            kind::ENTITY_REF | kind::HASH_TOKEN => self.namespace,
-            kind::HEADING_MARKER | kind::HEADING_TEXT => self.function,
-            kind::LINK_TEXT | kind::LINK_URL => self.namespace,
-            kind::LIST_MARKER => self.keyword,
-            kind::BLOCKQUOTE => self.namespace,
-            kind::EMPHASIS => self.comment,
-            _ => match span.semantic {
-                Some(SemanticKind::TypeDefinition | SemanticKind::TypeName) => self.type_,
-                Some(
-                    SemanticKind::FunctionDefinition
-                    | SemanticKind::FunctionCall
-                    | SemanticKind::MethodDefinition
-                    | SemanticKind::MethodCall
-                    | SemanticKind::MacroCall,
-                ) => self.function,
-                Some(
-                    SemanticKind::Parameter
-                    | SemanticKind::VariableDefinition
-                    | SemanticKind::Lifetime
-                    | SemanticKind::FieldDefinition
-                    | SemanticKind::Field,
-                ) => self.binding,
-                Some(SemanticKind::PathComponent) => self.namespace,
-                _ => self.fg,
-            },
+        self.style_for(classify_span(span))
+    }
+
+    /// Folds a highlight class onto one of the nine terminal palette slots.
+    ///
+    /// The web view distinguishes far more roles than the terminal has colors,
+    /// so several classes share a slot here. This mapping reproduces the
+    /// terminal's original per-token coloring exactly.
+    pub fn style_for(&self, class: HlClass) -> Style {
+        match class {
+            HlClass::Plain
+            | HlClass::Variable
+            | HlClass::PropertyAccess
+            | HlClass::MetaVariable
+            | HlClass::Operator
+            | HlClass::Punctuation
+            | HlClass::Delimiter
+            | HlClass::Error => self.fg,
+            HlClass::Type => self.type_,
+            HlClass::Function
+            | HlClass::Method
+            | HlClass::Macro
+            | HlClass::Tag
+            | HlClass::AttrName
+            | HlClass::Heading => self.function,
+            HlClass::Parameter | HlClass::VariableDef | HlClass::Property | HlClass::Lifetime => {
+                self.binding
+            }
+            HlClass::Namespace
+            | HlClass::EntityRef
+            | HlClass::HashToken
+            | HlClass::Link
+            | HlClass::LinkUrl
+            | HlClass::Blockquote => self.namespace,
+            HlClass::Keyword | HlClass::Attribute | HlClass::ListMarker => self.keyword,
+            HlClass::String | HlClass::Char | HlClass::Regex => self.string,
+            HlClass::Number => self.number,
+            HlClass::Comment | HlClass::DocComment | HlClass::Emphasis => self.comment,
         }
     }
 }

@@ -356,6 +356,22 @@ impl App {
                         self.config.timeout,
                         request.is_head(),
                     )
+                } else if let Some((handler, relative)) =
+                    self.router.resolve_generated(&request.path)
+                {
+                    let handler = handler.clone();
+                    let path = request.path.as_str().to_owned();
+                    let relative = relative.to_owned();
+                    let is_head = request.is_head();
+                    self.dispatch_generated_task(
+                        idx,
+                        handler,
+                        path,
+                        relative,
+                        is_head,
+                        request.keep_alive,
+                    );
+                    return;
                 } else if let Some(resolved) = self.router.resolve_mount(&request.path) {
                     let root = resolved.mount.root().to_path_buf();
                     let kind = resolved.mount.kind;
@@ -391,6 +407,43 @@ impl App {
             AfterResponse::Close
         };
         self.conns[idx].set_response(response, after);
+    }
+
+    fn dispatch_generated_task(
+        &mut self,
+        idx: usize,
+        handler: crate::router::GeneratedHandler,
+        path: String,
+        relative: String,
+        is_head: bool,
+        keep_alive: bool,
+    ) {
+        let conn_id = self.conns[idx].id;
+        let file_tx = self.file_tx.clone();
+        let notifier = self.waker.notifier();
+        let timeout = self.config.timeout;
+        self.conns[idx].request.clear();
+        self.conns[idx].state = ConnState::AwaitFile;
+        self.pending_files += 1;
+        self.io_pool.execute(move || {
+            let request = crate::router::GeneratedRequest {
+                path: &path,
+                relative: &relative,
+                is_head,
+            };
+            let result = handler(&request);
+            let response = response::owned(
+                result.status,
+                reason_phrase(result.status),
+                Arc::from(result.body),
+                &result.content_type,
+                keep_alive,
+                timeout,
+                is_head,
+            );
+            let _ = file_tx.send(FileResult { conn_id, response });
+            notifier.wake();
+        });
     }
 
     fn dispatch_file_task(&mut self, idx: usize, task: FileTask) {
@@ -775,4 +828,17 @@ fn send_file(socket: RawFd, file: RawFd, offset: u64, remaining: u64) -> io::Res
 fn request_complete(buf: &[u8]) -> bool {
     buf.windows(4).any(|window| window == b"\r\n\r\n")
         || buf.windows(2).any(|window| window == b"\n\n")
+}
+
+/// The reason phrase for the status codes a generated route returns.
+fn reason_phrase(status: u16) -> &'static str {
+    match status {
+        200 => "OK",
+        400 => "Bad Request",
+        404 => "Not Found",
+        413 => "Payload Too Large",
+        415 => "Unsupported Media Type",
+        500 => "Internal Server Error",
+        _ => "OK",
+    }
 }
