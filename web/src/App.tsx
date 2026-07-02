@@ -22,9 +22,11 @@ const TOP_THRESHOLD = 200;
 // How many older messages one paging request asks for.
 const PAGE = 100;
 
-// Size of each file-upload chunk frame. Kept well under the server's WebSocket
-// payload cap so a browser never has to fragment a single frame.
+// Size of each file-upload message. Kept well under the server's payload cap;
+// the server also accepts webviews that fragment the WebSocket frame on the wire.
 const UPLOAD_CHUNK_BYTES = 256 * 1024;
+const UPLOAD_MAX_BUFFERED_BYTES = 1024 * 1024;
+const UPLOAD_DRAIN_POLL_MS = 10;
 
 // Preload a bounded number of image attachments from each message batch. The
 // virtualizer may defer mounting rows while it measures and pins the bottom, but
@@ -73,6 +75,24 @@ function imageDebugEnabled(): boolean {
   }
 }
 
+function debugFlagEnabled(queryParam: string, storageKey: string): boolean {
+  if (typeof location === "undefined") return false;
+  if (new URLSearchParams(location.search).has(queryParam)) return true;
+  try {
+    return localStorage.getItem(storageKey) === "1";
+  } catch {
+    return false;
+  }
+}
+
+function uploadDebugEnabled(): boolean {
+  return debugFlagEnabled("debugUpload", "chatt.debugUpload");
+}
+
+function socketDebugEnabled(): boolean {
+  return debugFlagEnabled("debugSocket", "chatt.debugSocket") || uploadDebugEnabled();
+}
+
 function debugImageTiming(stage: string, name: string, url: string) {
   if (!imageDebugEnabled() || typeof performance === "undefined") return;
   const href = new URL(url, location.href).href;
@@ -87,6 +107,28 @@ function debugImageTiming(stage: string, name: string, url: string) {
     responseEnd: timing?.responseEnd,
     url: href,
   });
+}
+
+function debugUpload(stage: string, fields: Record<string, unknown>) {
+  if (!uploadDebugEnabled()) return;
+  console.debug("[chatt:upload]", {
+    stage,
+    t: typeof performance === "undefined" ? undefined : Math.round(performance.now() * 10) / 10,
+    ...fields,
+  });
+}
+
+function debugSocket(stage: string, fields: Record<string, unknown> = {}) {
+  if (!socketDebugEnabled()) return;
+  console.debug("[chatt:ws]", {
+    stage,
+    t: typeof performance === "undefined" ? undefined : Math.round(performance.now() * 10) / 10,
+    ...fields,
+  });
+}
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => window.setTimeout(resolve, ms));
 }
 
 function clamp(value: number, min: number, max: number): number {
@@ -627,6 +669,38 @@ export default function App() {
     }
   }
 
+  function openSocketOrThrow(): WebSocket {
+    if (!socket || socket.readyState !== WebSocket.OPEN) {
+      throw new Error("websocket is not open");
+    }
+    return socket;
+  }
+
+  async function waitForUploadDrain(uploadId: number) {
+    let waiting = false;
+    while (true) {
+      const ws = openSocketOrThrow();
+      if (ws.bufferedAmount <= UPLOAD_MAX_BUFFERED_BYTES) {
+        if (waiting) {
+          debugUpload("buffer_drained", {
+            upload_id: uploadId,
+            buffered_amount: ws.bufferedAmount,
+          });
+        }
+        return;
+      }
+      if (!waiting) {
+        waiting = true;
+        debugUpload("buffer_wait", {
+          upload_id: uploadId,
+          buffered_amount: ws.bufferedAmount,
+          max_buffered_bytes: UPLOAD_MAX_BUFFERED_BYTES,
+        });
+      }
+      await delay(UPLOAD_DRAIN_POLL_MS);
+    }
+  }
+
   function hideConnectionError() {
     if (connectionErrorTimer !== undefined) {
       clearTimeout(connectionErrorTimer);
@@ -661,18 +735,69 @@ export default function App() {
   // each prefixed with the little-endian upload id, then `upload_finish`. The
   // server reassembles them into a temp file and relays it as a normal upload.
   async function sendFile(file: File) {
-    if (!socket || socket.readyState !== WebSocket.OPEN) return;
+    const ws = openSocketOrThrow();
     const uploadId = nextUploadId++;
-    sendJson({ type: "upload_start", upload_id: uploadId, name: file.name, size: file.size });
-    const bytes = new Uint8Array(await file.arrayBuffer());
-    for (let offset = 0; offset < bytes.length; offset += UPLOAD_CHUNK_BYTES) {
-      const chunk = bytes.subarray(offset, offset + UPLOAD_CHUNK_BYTES);
+    debugUpload("start", {
+      upload_id: uploadId,
+      name: file.name,
+      size: file.size,
+      buffered_amount: ws.bufferedAmount,
+    });
+    ws.send(
+      JSON.stringify({
+        type: "upload_start",
+        upload_id: uploadId,
+        name: file.name,
+        size: file.size,
+      }),
+    );
+    for (let offset = 0; offset < file.size; offset += UPLOAD_CHUNK_BYTES) {
+      const end = Math.min(file.size, offset + UPLOAD_CHUNK_BYTES);
+      const chunk = new Uint8Array(await file.slice(offset, end).arrayBuffer());
       const frame = new Uint8Array(4 + chunk.length);
       new DataView(frame.buffer).setUint32(0, uploadId, true);
       frame.set(chunk, 4);
-      socket.send(frame);
+      const current = openSocketOrThrow();
+      current.send(frame);
+      debugUpload("chunk", {
+        upload_id: uploadId,
+        name: file.name,
+        offset,
+        chunk_bytes: chunk.length,
+        sent_bytes: end,
+        total_bytes: file.size,
+        buffered_amount: current.bufferedAmount,
+      });
+      await waitForUploadDrain(uploadId);
     }
-    sendJson({ type: "upload_finish", upload_id: uploadId });
+    const current = openSocketOrThrow();
+    current.send(JSON.stringify({ type: "upload_finish", upload_id: uploadId }));
+    debugUpload("finish", {
+      upload_id: uploadId,
+      name: file.name,
+      size: file.size,
+      buffered_amount: current.bufferedAmount,
+    });
+  }
+
+  async function sendQueuedFiles(files: File[]) {
+    for (const file of files) {
+      try {
+        await sendFile(file);
+      } catch (error) {
+        console.warn("[chatt:upload] failed", {
+          name: file.name,
+          size: file.size,
+          error,
+        });
+        debugUpload("error", {
+          name: file.name,
+          size: file.size,
+          error: error instanceof Error ? error.message : String(error),
+        });
+        return;
+      }
+    }
   }
 
   function submitCompose() {
@@ -680,7 +805,7 @@ export default function App() {
     const files = queued();
     if (!body && files.length === 0) return;
     if (body) sendJson({ type: "send_message", body });
-    for (const file of files) void sendFile(file);
+    if (files.length > 0) void sendQueuedFiles(files);
     setDraft("");
     setQueued([]);
     queueMicrotask(resizeComposer);
@@ -958,10 +1083,13 @@ export default function App() {
   });
 
   function connect() {
-    const ws = new WebSocket(`ws://${location.host}/ws`);
+    const url = `ws://${location.host}/ws`;
+    debugSocket("connect", { url });
+    const ws = new WebSocket(url);
     // Video frames arrive as binary messages; everything else is JSON text.
     ws.binaryType = "arraybuffer";
     ws.onopen = () => {
+      debugSocket("open", { url });
       setConnected(true);
       hideConnectionError();
     };
@@ -1077,12 +1205,26 @@ export default function App() {
         closeDecoder(env.stream_id);
       }
     };
-    ws.onclose = () => {
+    ws.onclose = (event) => {
+      console.warn("[chatt:ws] closed", {
+        code: event.code,
+        reason: event.reason,
+        was_clean: event.wasClean,
+      });
+      debugSocket("close", {
+        code: event.code,
+        reason: event.reason,
+        was_clean: event.wasClean,
+      });
       setConnected(false);
       scheduleConnectionError();
       reconnectTimer = window.setTimeout(connect, 1000);
     };
-    ws.onerror = () => ws.close();
+    ws.onerror = (event) => {
+      console.warn("[chatt:ws] error", event);
+      debugSocket("error");
+      ws.close();
+    };
     socket = ws;
   }
 

@@ -30,9 +30,15 @@ pub(crate) struct Connection {
     pub(crate) after_response: AfterResponse,
     pub(crate) websocket_id: Option<WebSocketId>,
     pub(crate) websocket_read: Vec<u8>,
+    pub(crate) websocket_fragment: Option<WebSocketFragment>,
     pub(crate) websocket_out: VecDeque<Vec<u8>>,
     pub(crate) websocket_close_sent: bool,
     pub(crate) last_active: Instant,
+}
+
+pub(crate) struct WebSocketFragment {
+    pub(crate) opcode: u8,
+    pub(crate) payload: Vec<u8>,
 }
 
 impl Connection {
@@ -48,6 +54,7 @@ impl Connection {
             after_response: AfterResponse::Close,
             websocket_id: None,
             websocket_read: Vec::new(),
+            websocket_fragment: None,
             websocket_out: VecDeque::new(),
             websocket_close_sent: false,
             last_active: Instant::now(),

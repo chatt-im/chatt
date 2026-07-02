@@ -23,6 +23,18 @@ pub enum WebSocketMessage {
     Binary(Vec<u8>),
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WebSocketCloseReason {
+    ClientEof,
+    ClientClose { code: Option<u16> },
+    Protocol { code: u16, detail: &'static str },
+    InvalidUtf8,
+    ReadError,
+    WriteError,
+    Timeout,
+    ConnectionDropped,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ServerEvent {
     WebSocketOpen {
@@ -35,6 +47,7 @@ pub enum ServerEvent {
     },
     WebSocketClose {
         id: WebSocketId,
+        reason: WebSocketCloseReason,
     },
 }
 
