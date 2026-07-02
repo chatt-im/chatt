@@ -1194,7 +1194,7 @@ mod tests {
         let Fragment::Text(body) = &message.fragments[0] else {
             panic!("expected a text fragment");
         };
-        assert_eq!(body, "sent file `wide.png` (10 B)");
+        assert_eq!(body, "<p>sent file <code>wide.png</code> (10 B)</p>");
     }
 
     fn file_metadata(transfer_id: u64) -> FileMetadata {
@@ -1497,7 +1497,7 @@ Sec-WebSocket-Version: 13\r\n\
         let message = web_wire::decode_single(&payload);
         assert_eq!(
             message.fragments,
-            vec![Fragment::Text("hello web".to_string())]
+            vec![Fragment::Text("<p>hello web</p>".to_string())]
         );
     }
 
@@ -1592,7 +1592,7 @@ Sec-WebSocket-Version: 13\r\n\
         assert_eq!(window.kind, web_wire::KIND_SYNC);
         assert_eq!(
             window.messages[0].fragments,
-            vec![Fragment::Text("room one".to_string())]
+            vec![Fragment::Text("<p>room one</p>".to_string())]
         );
 
         // Leaving the room clears the view to nothing.
@@ -1644,8 +1644,8 @@ Sec-WebSocket-Version: 13\r\n\
         assert_eq!(
             bodies,
             vec![
-                &Fragment::Text("m0".to_string()),
-                &Fragment::Text("m1".to_string()),
+                &Fragment::Text("<p>m0</p>".to_string()),
+                &Fragment::Text("<p>m1</p>".to_string()),
             ]
         );
     }
@@ -1699,7 +1699,10 @@ Sec-WebSocket-Version: 13\r\n\
         let (opcode, next) = read_ws_frame(&mut fresh);
         assert_eq!(opcode, 0x2);
         let message = web_wire::decode_single(&next);
-        assert_eq!(message.fragments, vec![Fragment::Text("hi".to_string())]);
+        assert_eq!(
+            message.fragments,
+            vec![Fragment::Text("<p>hi</p>".to_string())]
+        );
     }
 
     #[test]

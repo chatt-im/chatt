@@ -15,6 +15,7 @@ mod fuzzy;
 mod highlight;
 mod link;
 mod local_control;
+mod markdown;
 mod room_history;
 mod runtime;
 mod self_log;

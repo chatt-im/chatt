@@ -1,10 +1,11 @@
 //! Binary wire format for the browser chat feed.
 //!
 //! A message is split server-side into an ordered list of [`Fragment`]s: prose
-//! the frontend renders as markdown, and fenced code blocks carrying their
-//! text alongside a precomputed highlight-span buffer (see [`crate::highlight`]).
-//! The frontend composes a message straight from its fragments, so there is no
-//! reparsing or reprojection of highlights onto rendered HTML.
+//! rendered from Chatt's canonical Markdown-subset token stream as safe HTML,
+//! and fenced code blocks carrying their text alongside a precomputed
+//! highlight-span buffer (see [`crate::highlight`]). The frontend composes a
+//! message straight from its fragments, so it does not parse Markdown or
+//! reproject highlights onto rendered HTML.
 //!
 //! Frames are delivered as binary WebSocket messages. Every feed frame begins
 //! with a four-byte zero sentinel followed by a kind byte. A video frame never
@@ -13,6 +14,7 @@
 //! integers are little-endian. Keep `web/src/feed.ts` in sync.
 
 use crate::highlight;
+use crate::markdown::{Token, TokenKind};
 use crate::web_server::WebMessage;
 
 /// Marks a feed frame, distinguishing it from a raw video frame.
@@ -30,7 +32,7 @@ const FRAG_CODE: u8 = 1;
 /// One piece of a message body.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Fragment {
-    /// Markdown prose, rendered by the frontend markdown renderer.
+    /// Safe HTML for prose rendered from the shared Markdown-subset tokenizer.
     Text(String),
     /// A fenced code block.
     Code {
@@ -43,97 +45,114 @@ pub enum Fragment {
     },
 }
 
-/// Splits a message body into fragments, highlighting each fenced code block.
+/// Splits a message body into rendered prose and highlighted fenced code blocks.
 ///
-/// Prose between fences becomes [`Fragment::Text`]; a fenced block becomes a
-/// [`Fragment::Code`] whose text matches the fence content and whose spans are
-/// keyed to the block's language. Runs of whitespace-only prose are dropped.
+/// Prose between fences becomes [`Fragment::Text`] holding safe HTML generated
+/// from tokenizer events; a fenced block becomes a [`Fragment::Code`] whose text
+/// matches the fence content and whose spans are keyed to the block's language.
 pub fn split_fragments(body: &str) -> Vec<Fragment> {
+    let mut tokens = Vec::new();
+    crate::markdown::tokenize(body, &mut tokens);
     let mut fragments = Vec::new();
-    let mut text = String::new();
-    let mut lines = body.split('\n').peekable();
+    let mut prose_start = 0usize;
 
-    while let Some(line) = lines.next() {
-        if let Some(fence) = fence_opener(line) {
-            flush_text(&mut fragments, &mut text);
-            let mut code = String::new();
-            let mut closed = false;
-            for inner in lines.by_ref() {
-                if fence_closer(inner, fence.marker, fence.len) {
-                    closed = true;
-                    break;
-                }
-                if !code.is_empty() {
-                    code.push('\n');
-                }
-                code.push_str(inner);
-            }
-            let _ = closed;
-            let language = highlight::language_for_tag(&fence.info);
+    for (i, token) in tokens.iter().enumerate() {
+        if let TokenKind::CodeBlock { lang, content } = &token.kind {
+            flush_html(&mut fragments, body, &tokens[prose_start..i]);
+            let lang = lang
+                .as_ref()
+                .map_or("", |range| &body[range.start as usize..range.end as usize])
+                .to_string();
+            let code = body[content.start as usize..content.end as usize].to_string();
+            let language = highlight::language_for_tag(&lang);
             fragments.push(Fragment::Code {
-                lang: fence.info,
+                lang,
                 spans: highlight::encode_inline(&code, language),
                 text: code,
             });
-        } else {
-            if !text.is_empty() {
-                text.push('\n');
-            }
-            text.push_str(line);
+            prose_start = i + 1;
         }
     }
-    flush_text(&mut fragments, &mut text);
+    flush_html(&mut fragments, body, &tokens[prose_start..]);
     fragments
 }
 
-/// Pushes the accumulated prose as a fragment unless it is empty or all
-/// whitespace, then clears the buffer.
-fn flush_text(fragments: &mut Vec<Fragment>, text: &mut String) {
-    if !text.trim().is_empty() {
-        fragments.push(Fragment::Text(std::mem::take(text)));
-    } else {
-        text.clear();
+fn flush_html(fragments: &mut Vec<Fragment>, source: &str, tokens: &[Token]) {
+    if tokens.is_empty() {
+        return;
+    }
+    let html = render_html(source, tokens);
+    if !html.trim().is_empty() {
+        fragments.push(Fragment::Text(html));
     }
 }
 
-/// An opening code fence.
-struct Fence {
-    marker: u8,
-    len: usize,
-    info: String,
-}
+fn render_html(source: &str, tokens: &[Token]) -> String {
+    let mut html = String::new();
+    let mut lists = Vec::new();
 
-/// Recognizes an opening fence line (up to three leading spaces, then at least
-/// three `` ` `` or `~`), returning its marker, run length, and info string.
-fn fence_opener(line: &str) -> Option<Fence> {
-    let trimmed = line.strip_prefix(indent(line))?;
-    let marker = trimmed.bytes().next().filter(|&b| b == b'`' || b == b'~')?;
-    let len = trimmed.bytes().take_while(|&b| b == marker).count();
-    if len < 3 {
-        return None;
+    for token in tokens {
+        match &token.kind {
+            TokenKind::ParagraphStart => html.push_str("<p>"),
+            TokenKind::ParagraphEnd => html.push_str("</p>"),
+            TokenKind::HeaderStart => html.push_str("<h3>"),
+            TokenKind::HeaderEnd => html.push_str("</h3>"),
+            TokenKind::UnorderedListStart => {
+                lists.push("ul");
+                html.push_str("<ul>");
+            }
+            TokenKind::OrderedListStart => {
+                lists.push("ol");
+                html.push_str("<ol>");
+            }
+            TokenKind::ListEnd => match lists.pop() {
+                Some("ul") => html.push_str("</ul>"),
+                Some("ol") => html.push_str("</ol>"),
+                _ => {}
+            },
+            TokenKind::ListItemStart { .. } => html.push_str("<li>"),
+            TokenKind::ListItemEnd => html.push_str("</li>"),
+            TokenKind::Text => escape_html(slice(source, &token.range), &mut html),
+            TokenKind::BoldStart => html.push_str("<strong>"),
+            TokenKind::BoldEnd => html.push_str("</strong>"),
+            TokenKind::ItalicStart => html.push_str("<em>"),
+            TokenKind::ItalicEnd => html.push_str("</em>"),
+            TokenKind::InlineCode => {
+                html.push_str("<code>");
+                escape_html(slice(source, &token.range), &mut html);
+                html.push_str("</code>");
+            }
+            TokenKind::Url => {
+                let url = slice(source, &token.range);
+                html.push_str("<a href=\"");
+                escape_html(url, &mut html);
+                html.push_str("\">");
+                escape_html(url, &mut html);
+                html.push_str("</a>");
+            }
+            TokenKind::HardBreak => html.push_str("<br>"),
+            TokenKind::CodeBlock { .. } => {}
+        }
     }
-    let info = trimmed[len..].trim().to_string();
-    // A backtick fence's info string cannot itself contain a backtick.
-    if marker == b'`' && info.contains('`') {
-        return None;
+
+    html
+}
+
+fn slice<'a>(source: &'a str, range: &std::ops::Range<u32>) -> &'a str {
+    &source[range.start as usize..range.end as usize]
+}
+
+fn escape_html(text: &str, out: &mut String) {
+    for ch in text.chars() {
+        match ch {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&#39;"),
+            _ => out.push(ch),
+        }
     }
-    Some(Fence { marker, len, info })
-}
-
-/// Recognizes a closing fence: the same marker, at least as long, and nothing
-/// but the marker after up to three leading spaces.
-fn fence_closer(line: &str, marker: u8, open_len: usize) -> bool {
-    let Some(trimmed) = line.strip_prefix(indent(line)) else {
-        return false;
-    };
-    let len = trimmed.bytes().take_while(|&b| b == marker).count();
-    len >= open_len && trimmed[len..].trim().is_empty()
-}
-
-/// The leading run of up to three spaces a fence may be indented by.
-fn indent(line: &str) -> &str {
-    let spaces = line.bytes().take(3).take_while(|&b| b == b' ').count();
-    &line[..spaces]
 }
 
 /// Encodes a `sync` or `older` window frame: sentinel, kind, cursor, then each
@@ -367,7 +386,9 @@ mod tests {
         let fragments = split_fragments("hello **world**");
         assert_eq!(
             fragments,
-            vec![Fragment::Text("hello **world**".to_string())]
+            vec![Fragment::Text(
+                "<p>hello <strong>world</strong></p>".to_string()
+            )]
         );
     }
 
@@ -376,24 +397,24 @@ mod tests {
         let body = "before\n```rust\nfn main() {}\n```\nafter";
         let fragments = split_fragments(body);
         assert_eq!(fragments.len(), 3);
-        assert_eq!(fragments[0], Fragment::Text("before".to_string()));
+        assert_eq!(fragments[0], Fragment::Text("<p>before</p>".to_string()));
         let Fragment::Code { lang, text, spans } = &fragments[1] else {
             panic!("expected code fragment, got {:?}", fragments[1]);
         };
         assert_eq!(lang, "rust");
         assert_eq!(text, "fn main() {}");
         assert!(!spans.is_empty());
-        assert_eq!(fragments[2], Fragment::Text("after".to_string()));
+        assert_eq!(fragments[2], Fragment::Text("<p>after</p>".to_string()));
     }
 
     #[test]
-    fn unclosed_fence_captures_remaining_lines() {
+    fn unclosed_fence_is_rendered_as_prose() {
         let fragments = split_fragments("```\nline one\nline two");
         assert_eq!(fragments.len(), 1);
-        let Fragment::Code { text, .. } = &fragments[0] else {
-            panic!("expected code fragment");
-        };
-        assert_eq!(text, "line one\nline two");
+        assert_eq!(
+            fragments[0],
+            Fragment::Text("<p>```<br>line one<br>line two</p>".to_string())
+        );
     }
 
     #[test]

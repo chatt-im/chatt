@@ -13,11 +13,12 @@ export interface WebAttachment {
   height: number | null;
 }
 
-// One piece of a message body. Prose renders as markdown; a code block renders
-// from its precomputed highlight spans (see `highlight.ts`). A code fragment's
-// `text` is UTF-8 bytes, because the spans are byte offsets into it.
+// One piece of a message body. Prose is safe HTML rendered by Rust from the
+// canonical Markdown subset token stream; a code block renders from its
+// precomputed highlight spans (see `highlight.ts`). A code fragment's `text` is
+// UTF-8 bytes, because the spans are byte offsets into it.
 export type Fragment =
-  | { kind: "text"; text: string }
+  | { kind: "text"; html: string }
   | { kind: "code"; lang: string; text: Uint8Array; spans: Uint8Array };
 
 export interface WebMessage {

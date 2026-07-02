@@ -3,7 +3,6 @@ import { Virtualizer, type VirtualizerHandle } from "./vendor/virtua/solid/Virtu
 import type { WebMessage, ServerEnvelope, ClientRequest, ShareInfo, Fragment } from "./types";
 import ScreenShare from "./ScreenShare";
 import { ScreenShareDecoder, parseFrame } from "./video-decode";
-import { renderMarkdown } from "./markdown";
 import { renderInline } from "./highlight";
 import { decodeFeed } from "./feed";
 import PreviewPanel, {
@@ -219,7 +218,7 @@ function TransferProgressBar(props: { progress: { transferred: number; total: nu
 }
 
 // The virtualizer unmounts rows that scroll out of the window, so a fragment's
-// body would otherwise be re-parsed every time its row scrolls back in. A
+// body HTML would otherwise be re-read every time its row scrolls back in. A
 // fragment object is created once per decoded message and never mutated
 // (progress merges keep the same fragments array), so it is a stable cache
 // key; replaced messages simply fall out with GC.
@@ -230,15 +229,15 @@ function fragmentHtml(fragment: Fragment): string {
   if (html === undefined) {
     html =
       fragment.kind === "text"
-        ? renderMarkdown(fragment.text)
+        ? fragment.html
         : renderInline(fragment.text, fragment.spans);
     fragmentHtmlCache.set(fragment, html);
   }
   return html;
 }
 
-// Renders a message body from its fragments: prose as markdown, code blocks
-// from their precomputed highlight spans. Nothing is re-highlighted here.
+// Renders a message body from Rust-produced subset HTML and precomputed code
+// highlight spans. Nothing is parsed or highlighted in the browser.
 function MessageBody(props: { fragments: Fragment[] }) {
   return (
     <For each={props.fragments}>
