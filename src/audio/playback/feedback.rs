@@ -376,7 +376,10 @@ mod tests {
             .take_if_ready(1, late_at + LIVE_PLAYBACK_FEEDBACK_INTERVAL)
             .unwrap();
         assert_eq!(report.expected_packets, 2); // 4..=5 only
-        assert_eq!(report.lost_packets, 0, "phantom loss across window boundary");
+        assert_eq!(
+            report.lost_packets, 0,
+            "phantom loss across window boundary"
+        );
         assert_eq!(report.reordered_packets, 1);
     }
 
