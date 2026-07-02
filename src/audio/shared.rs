@@ -548,11 +548,24 @@ impl AudioStats {
         self.store_levels(rms, peak);
     }
 
-    /// Records a capture chunk dropped under worker backpressure and returns the
-    /// new running total, so the caller can surface a host that cannot keep up
-    /// rather than letting it silently emit gappy, irregularly paced packets.
-    pub(crate) fn record_dropped_chunk(&self) -> u64 {
+    /// Records a capture chunk of `samples` mono device-rate samples dropped
+    /// under worker backpressure and returns the new running chunk total, so the
+    /// caller can surface a host that cannot keep up. The dropped duration is
+    /// accumulated separately for [`Self::take_dropped_capture_samples`], which
+    /// the live encoder worker drains to advance its media clock across the
+    /// hole instead of splicing the timeline.
+    pub(crate) fn record_dropped_chunk(&self, samples: u64) -> u64 {
+        self.inner
+            .dropped_capture_samples
+            .fetch_add(samples, Ordering::Relaxed);
         self.inner.dropped_chunks.fetch_add(1, Ordering::Relaxed) + 1
+    }
+
+    /// Drains the mono device-rate sample count dropped since the last call.
+    pub(crate) fn take_dropped_capture_samples(&self) -> u64 {
+        self.inner
+            .dropped_capture_samples
+            .swap(0, Ordering::Relaxed)
     }
 
     pub(crate) fn record_encoded_packet(&self, packet_len: usize) {
@@ -737,6 +750,7 @@ struct SharedStats {
     encoded_packets: AtomicU64,
     encoded_bytes: AtomicU64,
     dropped_chunks: AtomicU64,
+    dropped_capture_samples: AtomicU64,
     stream_errors: AtomicU64,
     rms_bits: AtomicU32,
     peak_bits: AtomicU32,

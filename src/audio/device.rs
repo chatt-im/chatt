@@ -1538,10 +1538,10 @@ fn capture_callback<T>(
     if sender.try_send(mono).is_err() {
         // The encoder worker is behind, so this chunk is lost. Surface the
         // backpressure (throttled to powers of two so a sustained overload does
-        // not flood the log) instead of dropping it silently: a slow host that
-        // drops chunks emits gappy packets the receiver would otherwise see as
-        // network loss.
-        let dropped = stats.record_dropped_chunk();
+        // not flood the log) instead of dropping it silently, and account the
+        // dropped duration so the worker leaves a concealable timestamp gap
+        // rather than splicing the media clock across the hole.
+        let dropped = stats.record_dropped_chunk(samples);
         if dropped.is_power_of_two() {
             kvlog::warn!(
                 "capture worker backpressure dropped chunk",
@@ -1722,6 +1722,26 @@ mod tests {
                 "{node_name} should not be listed as an output endpoint"
             );
         }
+    }
+
+    #[test]
+    fn dropped_capture_chunk_records_dropped_samples() {
+        let (sender, _receiver) = std::sync::mpsc::sync_channel::<Vec<f32>>(1);
+        sender.try_send(vec![0.0]).unwrap();
+        let stats = AudioStats::new();
+        let channels = CallbackChannelCount::new(2, "input").unwrap();
+
+        // The channel is full, so this stereo chunk (48 mono frames) is dropped
+        // and its sample count must be surfaced for the media clock.
+        capture_callback(&[0.1f32; 96], channels, Vec::new(), &sender, &stats);
+
+        assert_eq!(stats.take_dropped_capture_samples(), 48);
+        assert_eq!(
+            stats.take_dropped_capture_samples(),
+            0,
+            "taking the dropped samples must drain the counter"
+        );
+        assert_eq!(stats.snapshot().dropped_chunks, 1);
     }
 
     #[test]
