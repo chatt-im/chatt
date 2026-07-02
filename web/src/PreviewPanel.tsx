@@ -7,6 +7,7 @@ import {
   Show,
 } from "solid-js";
 import FileViewer from "./FileViewer";
+import Icon from "./Icon";
 import ImageViewer from "./ImageViewer";
 
 export type PreviewItem =
@@ -28,6 +29,7 @@ export default function PreviewPanel(props: {
   activeKey: string;
   onSelect: (key: string) => void;
   onClose: () => void;
+  onCloseTab: (key: string) => void;
 }) {
   let tabsEl: HTMLDivElement | undefined;
   let tabsResizeObserver: ResizeObserver | undefined;
@@ -150,24 +152,38 @@ export default function PreviewPanel(props: {
                 const key = previewKey(item);
                 const selected = () => key === props.activeKey;
                 return (
-                  <button
+                  <div
                     class="preview-tab"
                     classList={{ "is-active": selected() }}
-                    ref={(element) => {
-                      tabButtons.set(key, element);
-                    }}
-                    id={`preview-tab-${index()}`}
-                    type="button"
-                    role="tab"
-                    aria-selected={selected()}
-                    aria-controls="preview-panel-content"
-                    tabIndex={selected() ? 0 : -1}
-                    title={item.name}
-                    onClick={() => selectTab(key)}
-                    onKeyDown={(event) => onTabKeyDown(event, index())}
                   >
-                    {item.name}
-                  </button>
+                    <button
+                      class="preview-tab-select"
+                      ref={(element) => {
+                        tabButtons.set(key, element);
+                      }}
+                      id={`preview-tab-${index()}`}
+                      type="button"
+                      role="tab"
+                      aria-selected={selected()}
+                      aria-controls="preview-panel-content"
+                      tabIndex={selected() ? 0 : -1}
+                      title={item.name}
+                      onClick={() => selectTab(key)}
+                      onKeyDown={(event) => onTabKeyDown(event, index())}
+                    >
+                      <Icon name={item.kind === "image" ? "image" : "file-text"} />
+                      <span class="preview-tab-label">{item.name}</span>
+                    </button>
+                    <button
+                      class="preview-tab-close"
+                      type="button"
+                      aria-label={`Close ${item.name}`}
+                      title="Close"
+                      onClick={() => props.onCloseTab(key)}
+                    >
+                      <Icon name="x" />
+                    </button>
+                  </div>
                 );
               }}
             </For>
@@ -178,11 +194,19 @@ export default function PreviewPanel(props: {
             class="preview-panel-download"
             href={`/files/${encodeURIComponent(props.active.name)}`}
             download={props.active.name}
+            aria-label={`Download ${props.active.name}`}
+            title="Download"
           >
-            download
+            <Icon name="download" />
           </a>
-          <button class="preview-panel-close" type="button" onClick={props.onClose}>
-            close
+          <button
+            class="preview-panel-close"
+            type="button"
+            aria-label="Close preview"
+            title="Close"
+            onClick={props.onClose}
+          >
+            <Icon name="x" />
           </button>
         </div>
       </div>

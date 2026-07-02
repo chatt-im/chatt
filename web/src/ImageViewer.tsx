@@ -7,6 +7,7 @@ import {
   onMount,
   Show,
 } from "solid-js";
+import Icon from "./Icon";
 
 type Point = { x: number; y: number };
 type Size = { width: number; height: number };
@@ -312,19 +313,30 @@ export default function ImageViewer(props: {
         role="toolbar"
         aria-label="Image zoom controls"
       >
-        <button type="button" onClick={resetFit}>
-          Fit
+        <button
+          type="button"
+          aria-label="Fit image"
+          title="Fit"
+          onClick={resetFit}
+        >
+          <Icon name="maximize-2" />
         </button>
-        <button type="button" onClick={resetNative}>
+        <button
+          class="image-viewer-text-button"
+          type="button"
+          title="Actual size"
+          onClick={resetNative}
+        >
           100%
         </button>
         <button
           type="button"
           aria-label="Zoom out"
+          title="Zoom out"
           disabled={scale() <= minScale()}
           onClick={() => zoomFromCenter(-ZOOM_STEP)}
         >
-          −
+          <Icon name="zoom-out" />
         </button>
         <output class="image-viewer-zoom">
           {zoomPercent()}%
@@ -332,10 +344,11 @@ export default function ImageViewer(props: {
         <button
           type="button"
           aria-label="Zoom in"
+          title="Zoom in"
           disabled={scale() >= maxScale()}
           onClick={() => zoomFromCenter(ZOOM_STEP)}
         >
-          +
+          <Icon name="zoom-in" />
         </button>
       </div>
       <div

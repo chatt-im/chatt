@@ -5,6 +5,7 @@ import ScreenShare from "./ScreenShare";
 import { ScreenShareDecoder, parseFrame } from "./video-decode";
 import { renderInline } from "./highlight";
 import { decodeFeed } from "./feed";
+import Icon, { IconSprite } from "./Icon";
 import PreviewPanel, {
   previewKey,
   type PreviewItem,
@@ -326,10 +327,17 @@ function Attachment(props: {
               )
             }
           >
-            {att().name}
+            <Icon name="file-text" />
+            <span class="media-file-name">{att().name}</span>
           </button>
-          <a class="media-file-download" href={url()} download={att().name}>
-            download
+          <a
+            class="media-file-download"
+            href={url()}
+            download={att().name}
+            aria-label={`Download ${att().name}`}
+            title="Download"
+          >
+            <Icon name="download" />
           </a>
         </div>
       </Show>
@@ -425,6 +433,20 @@ export default function App() {
     queueMicrotask(() => {
       if (previewOpener?.isConnected) previewOpener.focus({ preventScroll: true });
     });
+  }
+
+  function closePreviewTab(key: string) {
+    const current = previewHistory();
+    const index = current.findIndex((item) => previewKey(item) === key);
+    if (index < 0) return;
+
+    const next = current.filter((item) => previewKey(item) !== key);
+    setPreviewHistory(next);
+    if (activePreviewKey() !== key) return;
+
+    const replacement = next[index] ?? next[index - 1] ?? null;
+    if (replacement) setActivePreviewKey(previewKey(replacement));
+    else closePreview();
   }
 
   // The compose box is hidden until the client reports a writable feed in its
@@ -1301,6 +1323,7 @@ export default function App() {
 
   return (
     <div class="app">
+      <IconSprite />
       <Show when={connectionErrorVisible()}>
         <div class="conn-overlay" role="status" aria-live="polite">
           Unable to connect — retrying…
@@ -1395,9 +1418,10 @@ export default function App() {
                           class="composer-chip-remove"
                           type="button"
                           aria-label={`Remove ${file.name}`}
+                          title="Remove"
                           onClick={() => removeQueued(index())}
                         >
-                          ×
+                          <Icon name="x" />
                         </button>
                       </span>
                     )}
@@ -1444,6 +1468,7 @@ export default function App() {
                   activeKey={activePreviewKey()!}
                   onSelect={setActivePreviewKey}
                   onClose={closePreview}
+                  onCloseTab={closePreviewTab}
                 />
               </aside>
             </>

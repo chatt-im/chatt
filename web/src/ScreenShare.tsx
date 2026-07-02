@@ -1,4 +1,5 @@
 import { For, Show, createEffect, createMemo, createSignal, onCleanup } from "solid-js";
+import Icon from "./Icon";
 import type { ShareInfo } from "./types";
 
 const MIN_ZOOM = 1;
@@ -261,23 +262,44 @@ function ScreenShareItem(props: {
           <Show
             when={props.playing}
             fallback={
-              <button class="screenshare-button" onClick={() => props.onPlay(props.share.stream_id)}>
-                play
+              <button
+                class="screenshare-button"
+                type="button"
+                aria-label="Play screen share"
+                title="Play"
+                onClick={() => props.onPlay(props.share.stream_id)}
+              >
+                <Icon name="play" />
               </button>
             }
           >
-            <button class="screenshare-button" onClick={resetView}>
-              reset
+            <button
+              class="screenshare-button"
+              type="button"
+              aria-label="Reset screen share view"
+              title="Reset view"
+              onClick={resetView}
+            >
+              <Icon name="rotate-ccw" />
             </button>
             <span class="screenshare-zoom">{view().zoom.toFixed(1)}x</span>
             <button
               class="screenshare-button"
+              type="button"
+              aria-label={props.fullscreen ? "Exit fullscreen" : "Enter fullscreen"}
+              title={props.fullscreen ? "Exit fullscreen" : "Fullscreen"}
               onClick={() => props.onToggleFullscreen(props.share.stream_id)}
             >
-              {props.fullscreen ? "exit" : "full"}
+              <Icon name={props.fullscreen ? "minimize-2" : "maximize-2"} />
             </button>
-            <button class="screenshare-button" onClick={() => props.onStop(props.share.stream_id)}>
-              stop
+            <button
+              class="screenshare-button"
+              type="button"
+              aria-label="Stop screen share"
+              title="Stop"
+              onClick={() => props.onStop(props.share.stream_id)}
+            >
+              <Icon name="square" />
             </button>
           </Show>
         </div>
