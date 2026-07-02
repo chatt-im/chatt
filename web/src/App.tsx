@@ -80,6 +80,39 @@ function fileUrl(name: string): string {
   return `/files/${encodeURIComponent(name)}`;
 }
 
+function previewKind(value: string | undefined): PreviewItem["kind"] | null {
+  switch (value) {
+    case "image":
+    case "video":
+    case "audio":
+    case "file":
+      return value;
+    default:
+      return null;
+  }
+}
+
+function optionalDataNumber(value: string | undefined): number | null {
+  if (!value) return null;
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function previewItemFromRef(anchor: HTMLElement): PreviewItem | null {
+  const name = anchor.dataset.mediaName;
+  const kind = previewKind(anchor.dataset.mediaKind);
+  if (!name || !kind) return null;
+  if (kind === "image") {
+    return {
+      kind,
+      name,
+      width: optionalDataNumber(anchor.dataset.mediaWidth),
+      height: optionalDataNumber(anchor.dataset.mediaHeight),
+    };
+  }
+  return { kind, name };
+}
+
 function imageDebugEnabled(): boolean {
   if (typeof location === "undefined") return false;
   if (new URLSearchParams(location.search).has("debugImages")) return true;
@@ -986,14 +1019,20 @@ export default function App() {
     resizeComposer();
   }
 
-  // Reference anchors live inside Rust-rendered fragment HTML, so their clicks
-  // are caught by delegation on the log container rather than per-element
-  // handlers.
+  // Reference anchors live inside Rust-rendered fragment HTML. Media references
+  // include backend-filled preview metadata; shift-click keeps the jump action.
   function onLogClick(event: MouseEvent) {
     const target = event.target as HTMLElement;
     const anchor = target.closest?.("a.msg-ref");
     if (!(anchor instanceof HTMLElement)) return;
     event.preventDefault();
+    if (!event.shiftKey) {
+      const preview = previewItemFromRef(anchor);
+      if (preview) {
+        openPreview(preview, anchor);
+        return;
+      }
+    }
     const ts = Number(anchor.dataset.ts);
     const mid = Number(anchor.dataset.mid);
     if (!Number.isFinite(ts) || !Number.isFinite(mid)) return;

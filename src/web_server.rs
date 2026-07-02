@@ -81,7 +81,7 @@ pub struct WebMessage {
 }
 
 /// An inline media file attached to a [`WebMessage`], served from `/files`.
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WebAttachment {
     /// The served file name. The frontend builds the URL as `/files/<name>`.
     pub name: String,
@@ -94,6 +94,22 @@ pub struct WebAttachment {
     pub width: Option<u32>,
     /// Intrinsic pixel height, paired with [`width`](WebAttachment::width).
     pub height: Option<u32>,
+}
+
+impl WebAttachment {
+    pub fn from_served_file(served_name: &str, dimensions: Option<(u32, u32)>) -> Self {
+        let kind = classify(served_name);
+        let (width, height) = match (kind, dimensions) {
+            ("image", Some((w, h))) => (Some(w), Some(h)),
+            _ => (None, None),
+        };
+        Self {
+            kind: kind.to_string(),
+            name: served_name.to_string(),
+            width,
+            height,
+        }
+    }
 }
 
 /// The `@@` code identifying `message`, precomputed for the browser.
@@ -140,11 +156,6 @@ impl WebMessage {
         served_name: &str,
         dimensions: Option<(u32, u32)>,
     ) -> Self {
-        let kind = classify(served_name);
-        let (width, height) = match (kind, dimensions) {
-            ("image", Some((w, h))) => (Some(w), Some(h)),
-            _ => (None, None),
-        };
         // Mirror the server's announcement body so the size metadata survives
         // whichever of the two messages wins the upsert merge.
         let body = format!(
@@ -157,12 +168,7 @@ impl WebMessage {
             sender: metadata.sender_name.clone(),
             fragments: split_fragments(&body, &|_| None),
             timestamp_ms: metadata.timestamp_ms,
-            attachment: Some(WebAttachment {
-                kind: kind.to_string(),
-                name: served_name.to_string(),
-                width,
-                height,
-            }),
+            attachment: Some(WebAttachment::from_served_file(served_name, dimensions)),
             file_id: Some(metadata.transfer_id.0),
             // The announcement message carries the identity; merge_from keeps it.
             message_id: 0,
@@ -180,23 +186,13 @@ impl WebMessage {
         served_name: &str,
         dimensions: Option<(u32, u32)>,
     ) -> Self {
-        let kind = classify(served_name);
-        let (width, height) = match (kind, dimensions) {
-            ("image", Some((w, h))) => (Some(w), Some(h)),
-            _ => (None, None),
-        };
         let file_id = message.file_transfer_id.map(|transfer_id| transfer_id.0);
         WebMessage {
             id: file_id.unwrap_or(message.message_id.0),
             sender: message.sender_name.clone(),
             fragments: split_fragments(&message.body, &|_| None),
             timestamp_ms: message.timestamp_ms,
-            attachment: Some(WebAttachment {
-                kind: kind.to_string(),
-                name: served_name.to_string(),
-                width,
-                height,
-            }),
+            attachment: Some(WebAttachment::from_served_file(served_name, dimensions)),
             file_id,
             message_id: message.message_id.0,
             ref_code: chat_ref_code(message),
