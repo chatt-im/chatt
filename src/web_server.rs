@@ -13,12 +13,14 @@ use std::io;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::thread;
 use std::time::Duration;
 
 use darkhttp::{
-    Router, Server, ServerConfig, ServerEvent, WakeHandle, WebSocketId, WebSocketMessage,
+    Router, Server, ServerConfig, ServerEvent, WakeHandle, WebSocketCloseReason, WebSocketId,
+    WebSocketMessage,
 };
 use jsony::Jsony;
 use rpc::control::{ChatMessage, FileMetadata};
@@ -48,6 +50,8 @@ const MAX_PAGE: usize = 200;
 
 /// Largest UTF-8 file the highlighted preview endpoint will read and encode.
 const MAX_HIGHLIGHT_FILE_BYTES: u64 = 2 * 1024 * 1024;
+
+static NEXT_UPLOAD_TEMP_ID: AtomicU64 = AtomicU64::new(1);
 
 /// A single chat entry the frontend renders.
 ///
@@ -296,6 +300,7 @@ pub enum WebRequest {
     /// A file the browser uploaded, reassembled to `path` on disk.
     UploadFile {
         path: PathBuf,
+        name: String,
     },
 }
 
@@ -537,6 +542,12 @@ fn run(
             match event {
                 ServerEvent::WebSocketOpen { id, path } => {
                     if path == WS_PATH {
+                        kvlog::info!(
+                            "websocket opened",
+                            ws_id = id.get(),
+                            path = path.as_str(),
+                            readonly
+                        );
                         clients.push(id);
                         let _ = server.send_websocket_binary(id, &sync_frame(&history, base_seq));
                         let _ = server.send_websocket_text(id, &config_envelope(readonly));
@@ -545,55 +556,182 @@ fn run(
                         }
                     }
                 }
-                ServerEvent::WebSocketClose { id } => {
+                ServerEvent::WebSocketClose { id, reason } => {
                     clients.retain(|client| *client != id);
                     // Drop and delete any uploads this client left unfinished.
+                    let mut abandoned_uploads = 0u32;
                     uploads.retain(|(client, _), sink| {
                         if *client == id {
+                            abandoned_uploads += 1;
+                            kvlog::warn!(
+                                "web upload abandoned",
+                                ws_id = id.get(),
+                                upload_id = sink.upload_id,
+                                name = sink.name.as_str(),
+                                received_bytes = sink.received,
+                                expected_bytes = sink.expected_size,
+                                path = %sink.path.display()
+                            );
                             let _ = fs::remove_file(&sink.path);
                             false
                         } else {
                             true
                         }
                     });
+                    log_websocket_close(id, reason, clients.len(), abandoned_uploads);
                 }
                 ServerEvent::WebSocketMessage {
                     id,
                     message: WebSocketMessage::Text(text),
                 } => match jsony::from_json::<ClientRequest>(&text) {
                     Ok(ClientRequest::LoadOlder { before_seq, limit }) => {
+                        kvlog::debug!(
+                            "websocket request",
+                            ws_id = id.get(),
+                            kind = "load_older",
+                            before_seq,
+                            limit
+                        );
                         let frame = older_frame(before_seq, limit, &history, base_seq);
                         let _ = server.send_websocket_binary(id, &frame);
                     }
                     Ok(ClientRequest::PlayShare { stream_id }) => {
+                        kvlog::debug!(
+                            "websocket request",
+                            ws_id = id.get(),
+                            kind = "play_share",
+                            stream_id
+                        );
                         let _ = web_requests.send(WebRequest::PlayShare { stream_id });
                     }
                     Ok(ClientRequest::StopShare { stream_id }) => {
+                        kvlog::debug!(
+                            "websocket request",
+                            ws_id = id.get(),
+                            kind = "stop_share",
+                            stream_id
+                        );
                         let _ = web_requests.send(WebRequest::StopShare { stream_id });
                     }
                     // Writes are refused wholesale in read-only mode, matching a
                     // browser that never shows the compose box.
                     Ok(ClientRequest::SendMessage { body }) if !readonly => {
+                        kvlog::info!(
+                            "websocket request",
+                            ws_id = id.get(),
+                            kind = "send_message",
+                            body_len = body.len()
+                        );
                         let _ = web_requests.send(WebRequest::SendChat { body });
                     }
                     Ok(ClientRequest::UploadStart {
                         upload_id,
                         name,
-                        size: _,
-                    }) if !readonly => match UploadSink::create(upload_id, &name) {
+                        size,
+                    }) if !readonly => match UploadSink::create(id, upload_id, &name, size) {
                         Ok(sink) => {
+                            kvlog::info!(
+                                "web upload started",
+                                ws_id = id.get(),
+                                upload_id,
+                                name = sink.name.as_str(),
+                                expected_bytes = sink.expected_size,
+                                path = %sink.path.display()
+                            );
                             uploads.insert((id, upload_id), sink);
                         }
                         Err(error) => {
-                            kvlog::warn!("web upload could not be opened", error = %error);
+                            kvlog::warn!(
+                                "web upload could not be opened",
+                                ws_id = id.get(),
+                                upload_id,
+                                name = name.as_str(),
+                                expected_bytes = size,
+                                error = %error
+                            );
                         }
                     },
                     Ok(ClientRequest::UploadFinish { upload_id }) if !readonly => {
                         if let Some(sink) = uploads.remove(&(id, upload_id)) {
-                            let _ = web_requests.send(WebRequest::UploadFile { path: sink.path });
+                            let name = sink.name.clone();
+                            let received = sink.received;
+                            let expected = sink.expected_size;
+                            let path_for_cleanup = sink.path.clone();
+                            match sink.finish() {
+                                Ok(path) if received == expected => {
+                                    kvlog::info!(
+                                        "web upload finished",
+                                        ws_id = id.get(),
+                                        upload_id,
+                                        name = name.as_str(),
+                                        received_bytes = received,
+                                        expected_bytes = expected,
+                                        path = %path.display()
+                                    );
+                                    if let Err(error) = web_requests.send(WebRequest::UploadFile {
+                                        path: path.clone(),
+                                        name,
+                                    }) {
+                                        kvlog::warn!(
+                                            "web upload handoff failed",
+                                            ws_id = id.get(),
+                                            upload_id,
+                                            error = %error
+                                        );
+                                        let _ = fs::remove_file(path);
+                                    }
+                                }
+                                Ok(path) => {
+                                    kvlog::warn!(
+                                        "web upload size mismatch",
+                                        ws_id = id.get(),
+                                        upload_id,
+                                        name = name.as_str(),
+                                        received_bytes = received,
+                                        expected_bytes = expected,
+                                        path = %path.display()
+                                    );
+                                    let _ = fs::remove_file(path);
+                                }
+                                Err(error) => {
+                                    kvlog::warn!(
+                                        "web upload flush failed",
+                                        ws_id = id.get(),
+                                        upload_id,
+                                        name = name.as_str(),
+                                        received_bytes = received,
+                                        expected_bytes = expected,
+                                        path = %path_for_cleanup.display(),
+                                        error = %error
+                                    );
+                                    let _ = fs::remove_file(path_for_cleanup);
+                                }
+                            }
+                        } else {
+                            kvlog::warn!(
+                                "web upload finish without start",
+                                ws_id = id.get(),
+                                upload_id
+                            );
                         }
                     }
-                    Ok(_) | Err(_) => {}
+                    Ok(request) => {
+                        let kind = client_request_kind(&request);
+                        kvlog::info!(
+                            "websocket request ignored",
+                            ws_id = id.get(),
+                            kind,
+                            readonly
+                        );
+                    }
+                    Err(error) => {
+                        kvlog::warn!(
+                            "websocket request parse failed",
+                            ws_id = id.get(),
+                            text_len = text.len(),
+                            error = %error
+                        );
+                    }
                 },
                 ServerEvent::WebSocketMessage {
                     id,
@@ -601,14 +739,55 @@ fn run(
                 } => {
                     // A browser binary frame is one upload chunk: a little-endian
                     // `u32` id followed by the bytes to append to that upload.
-                    if !readonly && payload.len() >= 4 {
+                    if readonly {
+                        kvlog::debug!(
+                            "websocket binary ignored",
+                            ws_id = id.get(),
+                            payload_bytes = payload.len(),
+                            readonly
+                        );
+                    } else if payload.len() >= 4 {
                         let upload_id = u32::from_le_bytes(payload[0..4].try_into().unwrap());
                         if let Some(sink) = uploads.get_mut(&(id, upload_id)) {
                             if let Err(error) = sink.append(&payload[4..]) {
-                                kvlog::warn!("web upload chunk write failed", error = %error);
+                                let path = sink.path.clone();
+                                kvlog::warn!(
+                                    "web upload chunk write failed",
+                                    ws_id = id.get(),
+                                    upload_id,
+                                    name = sink.name.as_str(),
+                                    received_bytes = sink.received,
+                                    expected_bytes = sink.expected_size,
+                                    chunk_bytes = payload.len().saturating_sub(4),
+                                    error = %error
+                                );
+                                let _ = fs::remove_file(path);
                                 uploads.remove(&(id, upload_id));
+                            } else {
+                                kvlog::debug!(
+                                    "web upload chunk received",
+                                    ws_id = id.get(),
+                                    upload_id,
+                                    name = sink.name.as_str(),
+                                    received_bytes = sink.received,
+                                    expected_bytes = sink.expected_size,
+                                    chunk_bytes = payload.len().saturating_sub(4)
+                                );
                             }
+                        } else {
+                            kvlog::warn!(
+                                "web upload chunk without start",
+                                ws_id = id.get(),
+                                upload_id,
+                                chunk_bytes = payload.len().saturating_sub(4)
+                            );
                         }
+                    } else {
+                        kvlog::warn!(
+                            "websocket binary frame too short",
+                            ws_id = id.get(),
+                            payload_bytes = payload.len()
+                        );
                     }
                 }
             }
@@ -726,8 +905,93 @@ fn config_envelope(readonly: bool) -> String {
     jsony::object! { type: "config", readonly: readonly }
 }
 
+fn client_request_kind(request: &ClientRequest) -> &'static str {
+    match request {
+        ClientRequest::LoadOlder { .. } => "load_older",
+        ClientRequest::PlayShare { .. } => "play_share",
+        ClientRequest::StopShare { .. } => "stop_share",
+        ClientRequest::SendMessage { .. } => "send_message",
+        ClientRequest::UploadStart { .. } => "upload_start",
+        ClientRequest::UploadFinish { .. } => "upload_finish",
+    }
+}
+
+fn log_websocket_close(
+    id: WebSocketId,
+    reason: WebSocketCloseReason,
+    remaining_clients: usize,
+    abandoned_uploads: u32,
+) {
+    match reason {
+        WebSocketCloseReason::ClientEof => kvlog::info!(
+            "websocket closed",
+            ws_id = id.get(),
+            reason = "client_eof",
+            remaining_clients,
+            abandoned_uploads
+        ),
+        WebSocketCloseReason::ClientClose { code } => kvlog::info!(
+            "websocket closed",
+            ws_id = id.get(),
+            reason = "client_close",
+            close_code = code.unwrap_or(0),
+            remaining_clients,
+            abandoned_uploads
+        ),
+        WebSocketCloseReason::Protocol { code, detail } => kvlog::warn!(
+            "websocket closed",
+            ws_id = id.get(),
+            reason = "protocol",
+            close_code = code,
+            detail,
+            remaining_clients,
+            abandoned_uploads
+        ),
+        WebSocketCloseReason::InvalidUtf8 => kvlog::warn!(
+            "websocket closed",
+            ws_id = id.get(),
+            reason = "invalid_utf8",
+            close_code = 1007,
+            remaining_clients,
+            abandoned_uploads
+        ),
+        WebSocketCloseReason::ReadError => kvlog::warn!(
+            "websocket closed",
+            ws_id = id.get(),
+            reason = "read_error",
+            remaining_clients,
+            abandoned_uploads
+        ),
+        WebSocketCloseReason::WriteError => kvlog::warn!(
+            "websocket closed",
+            ws_id = id.get(),
+            reason = "write_error",
+            remaining_clients,
+            abandoned_uploads
+        ),
+        WebSocketCloseReason::Timeout => kvlog::warn!(
+            "websocket closed",
+            ws_id = id.get(),
+            reason = "timeout",
+            remaining_clients,
+            abandoned_uploads
+        ),
+        WebSocketCloseReason::ConnectionDropped => kvlog::warn!(
+            "websocket closed",
+            ws_id = id.get(),
+            reason = "connection_dropped",
+            remaining_clients,
+            abandoned_uploads
+        ),
+    }
+}
+
 /// An in-progress browser upload: the temp file its chunk frames stream into.
 struct UploadSink {
+    upload_id: u32,
+    name: String,
+    expected_size: u64,
+    received: u64,
     path: PathBuf,
     file: fs::File,
 }
@@ -736,18 +1000,50 @@ impl UploadSink {
     /// Creates the temp file for `upload_id` under a dedicated web-uploads
     /// directory, named from a sanitized `name` so the served file keeps a
     /// recognizable extension.
-    fn create(upload_id: u32, name: &str) -> io::Result<Self> {
+    fn create(id: WebSocketId, upload_id: u32, name: &str, expected_size: u64) -> io::Result<Self> {
         let dir = std::env::temp_dir().join("chatt-web-uploads");
         fs::create_dir_all(&dir)?;
-        let path = dir.join(format!("{upload_id}-{}", sanitize_upload_name(name)));
+        let name = sanitize_upload_name(name);
+        let temp_id = NEXT_UPLOAD_TEMP_ID.fetch_add(1, Ordering::Relaxed);
+        let path = dir.join(format!(
+            "{}-{temp_id}-{}-{upload_id}-{name}",
+            std::process::id(),
+            id.get()
+        ));
         let file = fs::File::create(&path)?;
-        Ok(Self { path, file })
+        Ok(Self {
+            upload_id,
+            name,
+            expected_size,
+            received: 0,
+            path,
+            file,
+        })
     }
 
     /// Appends one chunk's bytes to the temp file.
     fn append(&mut self, bytes: &[u8]) -> io::Result<()> {
         use std::io::Write;
-        self.file.write_all(bytes)
+        let received = self
+            .received
+            .checked_add(bytes.len() as u64)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "upload size overflow"))?;
+        if received > self.expected_size {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "upload exceeds declared size",
+            ));
+        }
+        self.file.write_all(bytes)?;
+        self.received = received;
+        Ok(())
+    }
+
+    fn finish(mut self) -> io::Result<PathBuf> {
+        use std::io::Write;
+        self.file.flush()?;
+        drop(self.file);
+        Ok(self.path)
     }
 }
 
@@ -1204,25 +1500,24 @@ Sec-WebSocket-Version: 13\r\n\
 
     /// Sends a client-to-server text frame, which RFC 6455 requires to be masked.
     fn write_ws_text(stream: &mut TcpStream, text: &str) {
-        let bytes = text.as_bytes();
-        assert!(bytes.len() < 126, "test payloads stay in the short length");
-        let mask = [0x37u8, 0xfa, 0x21, 0x3d];
-        let mut frame = vec![0x81, 0x80 | bytes.len() as u8];
-        frame.extend_from_slice(&mask);
-        for (i, byte) in bytes.iter().enumerate() {
-            frame.push(byte ^ mask[i % 4]);
-        }
-        stream.write_all(&frame).unwrap();
+        write_ws_frame(stream, true, 0x1, text.as_bytes());
     }
 
     /// Sends a client-to-server binary frame, masked as RFC 6455 requires.
     fn write_ws_binary(stream: &mut TcpStream, payload: &[u8]) {
+        write_ws_frame(stream, true, 0x2, payload);
+    }
+
+    fn write_ws_frame(stream: &mut TcpStream, fin: bool, opcode: u8, payload: &[u8]) {
         assert!(
             payload.len() < 126,
             "test payloads stay in the short length"
         );
         let mask = [0x37u8, 0xfa, 0x21, 0x3d];
-        let mut frame = vec![0x82, 0x80 | payload.len() as u8];
+        let mut frame = vec![
+            if fin { 0x80 | opcode } else { opcode },
+            0x80 | payload.len() as u8,
+        ];
         frame.extend_from_slice(&mask);
         for (i, byte) in payload.iter().enumerate() {
             frame.push(byte ^ mask[i % 4]);
@@ -1487,10 +1782,11 @@ Sec-WebSocket-Version: 13\r\n\
         write_ws_text(&mut stream, r#"{"type":"upload_finish","upload_id":42}"#);
 
         let request = web_rx.recv_timeout(Duration::from_secs(2)).unwrap();
-        let WebRequest::UploadFile { path } = request else {
+        let WebRequest::UploadFile { path, name } = request else {
             panic!("expected an upload request, got {request:?}");
         };
         assert_eq!(fs::read(&path).unwrap(), b"hello world");
+        assert_eq!(name, "note.txt");
         assert!(
             path.file_name()
                 .unwrap()
@@ -1498,6 +1794,38 @@ Sec-WebSocket-Version: 13\r\n\
                 .unwrap()
                 .ends_with("note.txt")
         );
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn chunked_upload_accepts_fragmented_binary_frame() {
+        let cfg = WebConfig {
+            enabled: true,
+            readonly: false,
+            bind: "127.0.0.1:39528".to_string(),
+        };
+        let (web_tx, web_rx) = mpsc::channel();
+        let _sender = spawn(&cfg, None, 100, web_tx, false).unwrap();
+
+        let mut stream = open_ready_ws("127.0.0.1:39528");
+        write_ws_text(
+            &mut stream,
+            r#"{"type":"upload_start","upload_id":42,"name":"note.txt","size":11}"#,
+        );
+        // Some webviews fragment larger WebSocket messages. The app-level
+        // binary payload is still one upload chunk once the continuation frames
+        // are reassembled by darkhttp.
+        write_ws_frame(&mut stream, false, 0x2, &42u32.to_le_bytes());
+        write_ws_frame(&mut stream, false, 0x0, b"hello ");
+        write_ws_frame(&mut stream, true, 0x0, b"world");
+        write_ws_text(&mut stream, r#"{"type":"upload_finish","upload_id":42}"#);
+
+        let request = web_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let WebRequest::UploadFile { path, name } = request else {
+            panic!("expected an upload request, got {request:?}");
+        };
+        assert_eq!(fs::read(&path).unwrap(), b"hello world");
+        assert_eq!(name, "note.txt");
         let _ = fs::remove_file(&path);
     }
 }

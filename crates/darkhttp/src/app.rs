@@ -7,7 +7,7 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use crate::config::ServerConfig;
-use crate::connection::{AfterResponse, ConnState, Connection};
+use crate::connection::{AfterResponse, ConnState, Connection, WebSocketFragment};
 use crate::files::FileTask;
 use crate::http::request::{Method, Request};
 use crate::http::response::{self, Body, PreparedResponse};
@@ -15,7 +15,7 @@ use crate::net::io_pool::IoPool;
 use crate::net::socket;
 use crate::net::waker::Waker;
 use crate::router::Router;
-use crate::server::{ServerEvent, WebSocketId, WebSocketMessage};
+use crate::server::{ServerEvent, WebSocketCloseReason, WebSocketId, WebSocketMessage};
 use crate::websocket::{frame, handshake};
 
 const READ_BUF_SIZE: usize = 32 * 1024;
@@ -616,7 +616,7 @@ impl App {
         loop {
             match self.conns[idx].stream.read(self.read_buf.as_mut_slice()) {
                 Ok(0) => {
-                    self.emit_websocket_close(idx);
+                    self.emit_websocket_close(idx, WebSocketCloseReason::ClientEof);
                     self.conns[idx].state = ConnState::Done;
                     return;
                 }
@@ -635,20 +635,27 @@ impl App {
                                 self.handle_websocket_frame(idx, frame)
                             }
                             frame::ParseResult::NeedMore => break,
-                            frame::ParseResult::ProtocolError => {
-                                self.queue_close(idx, 1002);
-                                self.emit_websocket_close(idx);
+                            frame::ParseResult::ProtocolError(error) => {
+                                let code = error.close_code();
+                                let detail = error.detail();
+                                self.queue_close(idx, code);
+                                self.emit_websocket_close(
+                                    idx,
+                                    WebSocketCloseReason::Protocol { code, detail },
+                                );
                                 return;
                             }
                         }
-                        if matches!(self.conns[idx].state, ConnState::Done) {
+                        if self.conns[idx].websocket_id.is_none()
+                            || matches!(self.conns[idx].state, ConnState::Done)
+                        {
                             return;
                         }
                     }
                 }
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => return,
                 Err(_) => {
-                    self.emit_websocket_close(idx);
+                    self.emit_websocket_close(idx, WebSocketCloseReason::ReadError);
                     self.conns[idx].state = ConnState::Done;
                     return;
                 }
@@ -662,20 +669,8 @@ impl App {
             return;
         };
         match frame.opcode {
-            0x1 => match String::from_utf8(frame.payload) {
-                Ok(text) => self.events.push_back(ServerEvent::WebSocketMessage {
-                    id,
-                    message: WebSocketMessage::Text(text),
-                }),
-                Err(_) => {
-                    self.queue_close(idx, 1007);
-                    self.emit_websocket_close(idx);
-                }
-            },
-            0x2 => self.events.push_back(ServerEvent::WebSocketMessage {
-                id,
-                message: WebSocketMessage::Binary(frame.payload),
-            }),
+            0x0 => self.handle_websocket_continuation(idx, id, frame),
+            0x1 | 0x2 => self.handle_websocket_data(idx, id, frame),
             0x8 => {
                 if !self.conns[idx].websocket_close_sent {
                     self.conns[idx]
@@ -683,7 +678,12 @@ impl App {
                         .push_back(frame::encode(0x8, &frame.payload));
                     self.conns[idx].websocket_close_sent = true;
                 }
-                self.emit_websocket_close(idx);
+                self.emit_websocket_close(
+                    idx,
+                    WebSocketCloseReason::ClientClose {
+                        code: close_code(&frame.payload),
+                    },
+                );
             }
             0x9 => self.conns[idx]
                 .websocket_out
@@ -691,8 +691,91 @@ impl App {
             0xA => {}
             _ => {
                 self.queue_close(idx, 1002);
-                self.emit_websocket_close(idx);
+                self.emit_websocket_close(
+                    idx,
+                    WebSocketCloseReason::Protocol {
+                        code: 1002,
+                        detail: "websocket frame has an invalid opcode",
+                    },
+                );
             }
+        }
+    }
+
+    fn handle_websocket_data(&mut self, idx: usize, id: WebSocketId, frame: frame::Frame) {
+        if self.conns[idx].websocket_fragment.is_some() {
+            self.protocol_close(
+                idx,
+                1002,
+                "new websocket data frame before continuation ended",
+            );
+            return;
+        }
+        if frame.fin {
+            self.emit_websocket_message(idx, id, frame.opcode, frame.payload);
+        } else {
+            self.conns[idx].websocket_fragment = Some(WebSocketFragment {
+                opcode: frame.opcode,
+                payload: frame.payload,
+            });
+        }
+    }
+
+    fn handle_websocket_continuation(&mut self, idx: usize, id: WebSocketId, frame: frame::Frame) {
+        if self.conns[idx].websocket_fragment.is_none() {
+            self.protocol_close(idx, 1002, "websocket continuation without a data frame");
+            return;
+        }
+        let max_payload = self.config.max_websocket_payload;
+        let exceeds_limit = {
+            let fragment = self.conns[idx].websocket_fragment.as_ref().unwrap();
+            match fragment.payload.len().checked_add(frame.payload.len()) {
+                Some(len) => len > max_payload,
+                None => true,
+            }
+        };
+        if exceeds_limit {
+            self.protocol_close(
+                idx,
+                1009,
+                "websocket fragmented message exceeds maximum payload",
+            );
+            return;
+        }
+
+        {
+            let fragment = self.conns[idx].websocket_fragment.as_mut().unwrap();
+            fragment.payload.extend_from_slice(&frame.payload);
+        }
+        if frame.fin {
+            let fragment = self.conns[idx].websocket_fragment.take().unwrap();
+            self.emit_websocket_message(idx, id, fragment.opcode, fragment.payload);
+        }
+    }
+
+    fn emit_websocket_message(
+        &mut self,
+        idx: usize,
+        id: WebSocketId,
+        opcode: u8,
+        payload: Vec<u8>,
+    ) {
+        match opcode {
+            0x1 => match String::from_utf8(payload) {
+                Ok(text) => self.events.push_back(ServerEvent::WebSocketMessage {
+                    id,
+                    message: WebSocketMessage::Text(text),
+                }),
+                Err(_) => {
+                    self.queue_close(idx, 1007);
+                    self.emit_websocket_close(idx, WebSocketCloseReason::InvalidUtf8);
+                }
+            },
+            0x2 => self.events.push_back(ServerEvent::WebSocketMessage {
+                id,
+                message: WebSocketMessage::Binary(payload),
+            }),
+            _ => self.protocol_close(idx, 1002, "websocket message has an invalid data opcode"),
         }
     }
 
@@ -704,6 +787,7 @@ impl App {
             match self.conns[idx].stream.write(&frame) {
                 Ok(0) => {
                     self.conns[idx].websocket_out.push_front(frame);
+                    self.emit_websocket_close(idx, WebSocketCloseReason::WriteError);
                     self.conns[idx].state = ConnState::Done;
                     return;
                 }
@@ -721,6 +805,7 @@ impl App {
                 }
                 Err(_) => {
                     self.conns[idx].websocket_out.push_front(frame);
+                    self.emit_websocket_close(idx, WebSocketCloseReason::WriteError);
                     self.conns[idx].state = ConnState::Done;
                     return;
                 }
@@ -741,9 +826,16 @@ impl App {
         self.conns[idx].websocket_close_sent = true;
     }
 
-    fn emit_websocket_close(&mut self, idx: usize) {
+    fn protocol_close(&mut self, idx: usize, code: u16, detail: &'static str) {
+        self.queue_close(idx, code);
+        self.emit_websocket_close(idx, WebSocketCloseReason::Protocol { code, detail });
+    }
+
+    fn emit_websocket_close(&mut self, idx: usize, reason: WebSocketCloseReason) {
         if let Some(id) = self.conns[idx].websocket_id.take() {
-            self.events.push_back(ServerEvent::WebSocketClose { id });
+            self.conns[idx].websocket_fragment = None;
+            self.events
+                .push_back(ServerEvent::WebSocketClose { id, reason });
         }
     }
 
@@ -754,7 +846,7 @@ impl App {
         let now = Instant::now();
         for idx in 0..self.conns.len() {
             if now.duration_since(self.conns[idx].last_active) >= self.config.timeout {
-                self.emit_websocket_close(idx);
+                self.emit_websocket_close(idx, WebSocketCloseReason::Timeout);
                 self.conns[idx].state = ConnState::Done;
             }
         }
@@ -764,13 +856,18 @@ impl App {
         let mut i = 0;
         while i < self.conns.len() {
             if matches!(self.conns[i].state, ConnState::Done) {
-                self.emit_websocket_close(i);
+                self.emit_websocket_close(i, WebSocketCloseReason::ConnectionDropped);
                 self.conns.swap_remove(i);
             } else {
                 i += 1;
             }
         }
     }
+}
+
+fn close_code(payload: &[u8]) -> Option<u16> {
+    let bytes = payload.get(..2)?;
+    Some(u16::from_be_bytes([bytes[0], bytes[1]]))
 }
 
 #[derive(Clone, Copy)]

@@ -971,9 +971,13 @@ impl App {
             crate::web_server::WebRequest::SendChat { body } => {
                 self.send_network_command(NetworkCommand::SendChat(body), true);
             }
-            crate::web_server::WebRequest::UploadFile { path } => {
+            crate::web_server::WebRequest::UploadFile { path, name } => {
                 self.send_network_command(
-                    NetworkCommand::UploadFile(UploadFileRequest::new(path)),
+                    NetworkCommand::UploadFile(UploadFileRequest {
+                        path,
+                        name_override: Some(name),
+                        delete_after_open: true,
+                    }),
                     true,
                 );
             }

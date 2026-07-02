@@ -12,4 +12,4 @@ mod websocket;
 pub use config::ServerConfig;
 pub use net::waker::WakeHandle;
 pub use router::{GeneratedHandler, GeneratedRequest, GeneratedResponse, Router};
-pub use server::{Server, ServerEvent, WebSocketId, WebSocketMessage};
+pub use server::{Server, ServerEvent, WebSocketCloseReason, WebSocketId, WebSocketMessage};

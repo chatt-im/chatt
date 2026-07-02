@@ -1,12 +1,45 @@
 pub(crate) struct Frame {
+    pub(crate) fin: bool,
     pub(crate) opcode: u8,
     pub(crate) payload: Vec<u8>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ProtocolError {
+    ReservedBits,
+    Unmasked,
+    InvalidOpcode,
+    FragmentedControl,
+    PayloadTooLarge,
+    ControlPayloadTooLarge,
+    InvalidClosePayload,
+}
+
+impl ProtocolError {
+    pub(crate) fn close_code(self) -> u16 {
+        match self {
+            Self::PayloadTooLarge => 1009,
+            _ => 1002,
+        }
+    }
+
+    pub(crate) fn detail(self) -> &'static str {
+        match self {
+            Self::ReservedBits => "reserved websocket bits are set",
+            Self::Unmasked => "client websocket frame is not masked",
+            Self::InvalidOpcode => "websocket frame has an invalid opcode",
+            Self::FragmentedControl => "websocket control frame is fragmented",
+            Self::PayloadTooLarge => "websocket frame exceeds maximum payload",
+            Self::ControlPayloadTooLarge => "websocket control frame exceeds maximum payload",
+            Self::InvalidClosePayload => "websocket close frame has an invalid payload",
+        }
+    }
 }
 
 pub(crate) enum ParseResult {
     Frame(Frame),
     NeedMore,
-    ProtocolError,
+    ProtocolError(ProtocolError),
 }
 
 pub(crate) fn parse_next(buf: &mut Vec<u8>, max_payload: usize) -> ParseResult {
@@ -19,8 +52,17 @@ pub(crate) fn parse_next(buf: &mut Vec<u8>, max_payload: usize) -> ParseResult {
     let rsv = b0 & 0x70 != 0;
     let opcode = b0 & 0x0f;
     let masked = b1 & 0x80 != 0;
-    if rsv || !fin || !masked || !valid_opcode(opcode) {
-        return ParseResult::ProtocolError;
+    if rsv {
+        return ParseResult::ProtocolError(ProtocolError::ReservedBits);
+    }
+    if !masked {
+        return ParseResult::ProtocolError(ProtocolError::Unmasked);
+    }
+    if !valid_opcode(opcode) {
+        return ParseResult::ProtocolError(ProtocolError::InvalidOpcode);
+    }
+    if is_control(opcode) && !fin {
+        return ParseResult::ProtocolError(ProtocolError::FragmentedControl);
     }
     let mut len = (b1 & 0x7f) as usize;
     let mut pos = 2;
@@ -45,13 +87,16 @@ pub(crate) fn parse_next(buf: &mut Vec<u8>, max_payload: usize) -> ParseResult {
             buf[pos + 7],
         ]);
         let Ok(wire_len) = usize::try_from(wire_len) else {
-            return ParseResult::ProtocolError;
+            return ParseResult::ProtocolError(ProtocolError::PayloadTooLarge);
         };
         len = wire_len;
         pos += 8;
     }
-    if len > max_payload || is_control(opcode) && len > 125 {
-        return ParseResult::ProtocolError;
+    if is_control(opcode) && len > 125 {
+        return ParseResult::ProtocolError(ProtocolError::ControlPayloadTooLarge);
+    }
+    if len > max_payload {
+        return ParseResult::ProtocolError(ProtocolError::PayloadTooLarge);
     }
     if buf.len() < pos + 4 + len {
         return ParseResult::NeedMore;
@@ -63,10 +108,14 @@ pub(crate) fn parse_next(buf: &mut Vec<u8>, max_payload: usize) -> ParseResult {
         *byte ^= mask[i % 4];
     }
     if opcode == 0x8 && !valid_close_payload(&payload) {
-        return ParseResult::ProtocolError;
+        return ParseResult::ProtocolError(ProtocolError::InvalidClosePayload);
     }
     buf.drain(..pos + len);
-    ParseResult::Frame(Frame { opcode, payload })
+    ParseResult::Frame(Frame {
+        fin,
+        opcode,
+        payload,
+    })
 }
 
 pub(crate) fn encode(opcode: u8, payload: &[u8]) -> Vec<u8> {
@@ -86,7 +135,7 @@ pub(crate) fn encode(opcode: u8, payload: &[u8]) -> Vec<u8> {
 }
 
 fn valid_opcode(opcode: u8) -> bool {
-    matches!(opcode, 0x1 | 0x2 | 0x8 | 0x9 | 0xA)
+    matches!(opcode, 0x0 | 0x1 | 0x2 | 0x8 | 0x9 | 0xA)
 }
 
 fn is_control(opcode: u8) -> bool {

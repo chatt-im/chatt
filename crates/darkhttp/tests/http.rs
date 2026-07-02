@@ -153,9 +153,13 @@ fn read_ws_frame(stream: &mut TcpStream) -> (u8, Vec<u8>) {
 }
 
 fn write_masked_ws_frame(stream: &mut TcpStream, opcode: u8, payload: &[u8]) {
+    write_masked_ws_frame_with_fin(stream, true, opcode, payload);
+}
+
+fn write_masked_ws_frame_with_fin(stream: &mut TcpStream, fin: bool, opcode: u8, payload: &[u8]) {
     let mask = [1u8, 2, 3, 4];
     let mut frame = Vec::new();
-    frame.push(0x80 | opcode);
+    frame.push(if fin { 0x80 | opcode } else { opcode });
     if payload.len() < 126 {
         frame.push(0x80 | payload.len() as u8);
     } else if payload.len() <= u16::MAX as usize {
@@ -441,6 +445,55 @@ Sec-WebSocket-Version: 13\r\n\
     let (opcode, payload) = read_ws_frame(&mut stream);
     assert_eq!(opcode, 0x8);
     assert_eq!(payload, b"");
+}
+
+#[test]
+fn fragmented_websocket_text_reassembles() {
+    let router = Router::new().websocket("/chat");
+    let server = EmbeddedServer::start_with_events(router, |event, server| match event {
+        ServerEvent::WebSocketOpen { id, .. } => {
+            server.send_websocket_text(id, "hello").unwrap();
+        }
+        ServerEvent::WebSocketMessage {
+            id,
+            message: WebSocketMessage::Text(text),
+        } => {
+            server
+                .send_websocket_text(id, format!("echo:{text}"))
+                .unwrap();
+        }
+        ServerEvent::WebSocketMessage { .. } | ServerEvent::WebSocketClose { .. } => {}
+    });
+
+    let mut stream = TcpStream::connect(server.addr).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    stream
+        .write_all(
+            b"GET /chat HTTP/1.1\r\n\
+Host: localhost\r\n\
+Upgrade: websocket\r\n\
+Connection: Upgrade\r\n\
+Sec-WebSocket-Key: x3JJHMbDL1EzLkh9GBhXDw==\r\n\
+Sec-WebSocket-Version: 13\r\n\
+\r\n",
+        )
+        .unwrap();
+    let headers = read_http_headers(&mut stream);
+    assert!(headers.starts_with("HTTP/1.1 101 Switching Protocols"));
+
+    let (opcode, payload) = read_ws_frame(&mut stream);
+    assert_eq!(opcode, 0x1);
+    assert_eq!(payload, b"hello");
+
+    write_masked_ws_frame_with_fin(&mut stream, false, 0x1, b"frag");
+    write_masked_ws_frame_with_fin(&mut stream, false, 0x0, b"men");
+    write_masked_ws_frame_with_fin(&mut stream, true, 0x0, b"ted");
+
+    let (opcode, payload) = read_ws_frame(&mut stream);
+    assert_eq!(opcode, 0x1);
+    assert_eq!(payload, b"echo:fragmented");
 }
 
 #[test]
