@@ -30,6 +30,12 @@ pub(crate) struct LivePlaybackFeedbackState {
     /// Sequences accepted this window, for duplicate detection and loss counting.
     received: HashSet<u32>,
     base_sequence: Option<u32>,
+    /// First sequence the next report's expected span starts at: one past the
+    /// highest arrived when the previous window closed. Keeps a reordered
+    /// packet that opens a window from re-expecting (and charging as lost)
+    /// sequences the previous report already covered, and keeps packets lost
+    /// between windows charged exactly once.
+    next_window_sequence: Option<u32>,
     highest_arrived_sequence: Option<u32>,
     duplicate_packets: u32,
     reordered_packets: u32,
@@ -48,6 +54,7 @@ impl Default for LivePlaybackFeedbackState {
             window_started_at: None,
             received: HashSet::new(),
             base_sequence: None,
+            next_window_sequence: None,
             highest_arrived_sequence: None,
             duplicate_packets: 0,
             reordered_packets: 0,
@@ -170,7 +177,20 @@ impl LivePlaybackFeedbackState {
         now: Instant,
     ) -> Option<LivePlaybackFeedback> {
         let started_at = self.window_started_at?;
-        let (base, highest) = self.base_sequence.zip(self.highest_arrived_sequence)?;
+        let (first, highest) = self.base_sequence.zip(self.highest_arrived_sequence)?;
+        // The expected span resumes where the previous report stopped; only when
+        // the stream has never reported does it anchor at the first arrival. A
+        // window whose arrivals were all at or below the previous span (late
+        // stragglers, duplicates) has nothing new to account.
+        let base = match self.next_window_sequence {
+            Some(next) => {
+                if sequence_distance_forward(next, highest).is_none() {
+                    return None;
+                }
+                next
+            }
+            None => first,
+        };
         let expected = sequence_distance_forward(base, highest).map_or(1, |distance| distance + 1);
         if expected == 0 {
             return None;
@@ -179,7 +199,14 @@ impl LivePlaybackFeedbackState {
         if expected < LIVE_PLAYBACK_FEEDBACK_PACKETS && elapsed < LIVE_PLAYBACK_FEEDBACK_INTERVAL {
             return None;
         }
-        let received = self.received.len() as u32;
+        let received = self
+            .received
+            .iter()
+            .filter(|sequence| {
+                sequence_distance_forward(base, **sequence)
+                    .is_some_and(|distance| distance < expected)
+            })
+            .count() as u32;
         let lost = expected.saturating_sub(received);
         let feedback = LivePlaybackFeedback {
             stream_id,
@@ -256,6 +283,9 @@ impl LivePlaybackFeedbackState {
         self.window_started_at = Some(now);
         self.received.clear();
         self.base_sequence = None;
+        self.next_window_sequence = self
+            .highest_arrived_sequence
+            .map(|highest| highest.wrapping_add(1));
         self.duplicate_packets = 0;
         self.reordered_packets = 0;
         self.max_output_ring_ms = 0;
@@ -320,6 +350,78 @@ mod tests {
         assert_eq!(report.expected_packets, 5); // 0..=4
         assert_eq!(report.lost_packets, 1); // sequence 2 never arrived
         assert_eq!(report.highest_contiguous_sequence, 1);
+    }
+
+    #[test]
+    fn reordered_packet_across_window_boundary_is_not_phantom_loss() {
+        let start = Instant::now();
+        let mut feedback = LivePlaybackFeedbackState::default();
+        for seq in [0u32, 1, 3] {
+            feedback.observe_insert(seq, 0, start);
+        }
+        let report = feedback
+            .take_if_ready(1, start + LIVE_PLAYBACK_FEEDBACK_INTERVAL)
+            .unwrap();
+        assert_eq!(report.expected_packets, 4); // 0..=3
+        assert_eq!(report.lost_packets, 1); // sequence 2 still outstanding
+
+        // Sequence 2 arrives late, opening the next window, then 4 and 5 follow
+        // in order. The new window must not re-expect the sequences the previous
+        // report already covered.
+        let late_at = start + LIVE_PLAYBACK_FEEDBACK_INTERVAL;
+        feedback.observe_insert(2, 0, late_at);
+        feedback.observe_insert(4, 0, late_at + Duration::from_millis(20));
+        feedback.observe_insert(5, 0, late_at + Duration::from_millis(40));
+        let report = feedback
+            .take_if_ready(1, late_at + LIVE_PLAYBACK_FEEDBACK_INTERVAL)
+            .unwrap();
+        assert_eq!(report.expected_packets, 2); // 4..=5 only
+        assert_eq!(report.lost_packets, 0, "phantom loss across window boundary");
+        assert_eq!(report.reordered_packets, 1);
+    }
+
+    #[test]
+    fn packets_lost_between_windows_are_charged_in_the_next_window() {
+        let start = Instant::now();
+        let mut feedback = LivePlaybackFeedbackState::default();
+        feedback.observe_insert(0, 0, start);
+        feedback.observe_insert(1, 0, start);
+        let report = feedback
+            .take_if_ready(1, start + LIVE_PLAYBACK_FEEDBACK_INTERVAL)
+            .unwrap();
+        assert_eq!(report.expected_packets, 2);
+        assert_eq!(report.lost_packets, 0);
+
+        // Sequences 2..=4 are lost while no window is open; the next report must
+        // still expect them rather than silently skipping to the new base.
+        let later = start + 2 * LIVE_PLAYBACK_FEEDBACK_INTERVAL;
+        feedback.observe_insert(5, 0, later);
+        let report = feedback
+            .take_if_ready(1, later + LIVE_PLAYBACK_FEEDBACK_INTERVAL)
+            .unwrap();
+        assert_eq!(report.expected_packets, 4); // 2..=5
+        assert_eq!(report.lost_packets, 3);
+    }
+
+    #[test]
+    fn window_with_only_stale_arrivals_reports_nothing_new() {
+        let start = Instant::now();
+        let mut feedback = LivePlaybackFeedbackState::default();
+        feedback.observe_insert(0, 0, start);
+        feedback.observe_insert(1, 0, start);
+        feedback
+            .take_if_ready(1, start + LIVE_PLAYBACK_FEEDBACK_INTERVAL)
+            .unwrap();
+
+        // Only a duplicate of an already-reported sequence arrives: there is no
+        // new expected span, so no report should claim loss.
+        let later = start + 2 * LIVE_PLAYBACK_FEEDBACK_INTERVAL;
+        feedback.observe_insert(1, 0, later);
+        assert!(
+            feedback
+                .take_if_ready(1, later + LIVE_PLAYBACK_FEEDBACK_INTERVAL)
+                .is_none()
+        );
     }
 
     #[test]
