@@ -28,12 +28,12 @@ const UPLOAD_CHUNK_BYTES = 256 * 1024;
 const UPLOAD_MAX_BUFFERED_BYTES = 1024 * 1024;
 const UPLOAD_DRAIN_POLL_MS = 10;
 
-// Preload a bounded number of image attachments from each message batch. The
-// virtualizer may defer mounting rows while it measures and pins the bottom, but
-// attachment URLs are known as soon as the WebSocket message arrives.
-const IMAGE_PRELOAD_BATCH_LIMIT = 32;
-const IMAGE_PRELOAD_CACHE_LIMIT = 128;
-const RECENT_IMAGE_KEEP_MOUNTED = 12;
+// Warm a small number of image attachments from the edge of each message batch.
+// This keeps near-viewport images responsive without fetching the whole sync or
+// history page when a room contains many images.
+const IMAGE_PRELOAD_BATCH_LIMIT = 6;
+const IMAGE_PRELOAD_SCAN_LIMIT = 24;
+const IMAGE_PRELOAD_CACHE_LIMIT = 32;
 const PREVIEW_HISTORY_LIMIT = 16;
 
 // Consecutive messages from one sender within this window collapse into a group:
@@ -46,7 +46,6 @@ const CONNECTION_ERROR_DELAY_MS = 3_000;
 
 type ImagePreload = {
   image: HTMLImageElement;
-  link: HTMLLinkElement;
 };
 
 const DEFAULT_SHARE_PANE_HEIGHT = 360;
@@ -270,10 +269,16 @@ function Attachment(props: {
   return (
     <div class="message-media">
       <Show when={att().kind === "image"}>
-        <button
-          class="media-image-open"
-          type="button"
-          aria-label={`Open image preview: ${att().name}`}
+        <img
+          class="media-image"
+          classList={{ "is-loaded": loaded() }}
+          src={url()}
+          alt={att().name}
+          width={att().width ?? undefined}
+          height={att().height ?? undefined}
+          loading="eager"
+          decoding="async"
+          fetchpriority="high"
           onClick={(event) =>
             props.onOpenPreview(
               {
@@ -285,27 +290,15 @@ function Attachment(props: {
               event.currentTarget,
             )
           }
-        >
-          <img
-            class="media-image"
-            classList={{ "is-loaded": loaded() }}
-            src={url()}
-            alt={att().name}
-            width={att().width ?? undefined}
-            height={att().height ?? undefined}
-            loading="eager"
-            decoding="async"
-            fetchpriority="high"
-            onLoad={() => {
-              debugImageTiming("img:load", att().name, url());
-              setLoaded(true);
-            }}
-            onError={() => {
-              debugImageTiming("img:error", att().name, url());
-              setLoaded(true);
-            }}
-          />
-        </button>
+          onLoad={() => {
+            debugImageTiming("img:load", att().name, url());
+            setLoaded(true);
+          }}
+          onError={() => {
+            debugImageTiming("img:error", att().name, url());
+            setLoaded(true);
+          }}
+        />
       </Show>
       <Show when={att().kind === "video"}>
         <video class="media-video" src={url()} controls preload="metadata" />
@@ -597,31 +590,22 @@ export default function App() {
     const url = fileUrl(att.name);
     if (imagePreloads.has(url)) return false;
 
-    const link = document.createElement("link");
-    link.rel = "preload";
-    link.as = "image";
-    link.href = url;
-    link.fetchPriority = "high";
-    document.head.appendChild(link);
-    debugImageTiming("preload:link", att.name, url);
-
     const img = new Image(att.width ?? undefined, att.height ?? undefined);
     img.decoding = "async";
     img.loading = "eager";
-    img.fetchPriority = "high";
+    img.fetchPriority = "auto";
     img.addEventListener("load", () => debugImageTiming("preload:load", att.name, url), {
       once: true,
     });
     img.addEventListener("error", () => debugImageTiming("preload:error", att.name, url), {
       once: true,
     });
-    imagePreloads.set(url, { image: img, link });
+    imagePreloads.set(url, { image: img });
     img.src = url;
 
     while (imagePreloads.size > IMAGE_PRELOAD_CACHE_LIMIT) {
       const oldest = imagePreloads.keys().next().value;
       if (oldest === undefined) break;
-      imagePreloads.get(oldest)?.link.remove();
       imagePreloads.delete(oldest);
     }
     return true;
@@ -629,27 +613,15 @@ export default function App() {
 
   function preloadRecentImages(batch: readonly WebMessage[]) {
     let started = 0;
+    let scanned = 0;
     for (
       let i = batch.length - 1;
-      i >= 0 && started < IMAGE_PRELOAD_BATCH_LIMIT;
+      i >= 0 && started < IMAGE_PRELOAD_BATCH_LIMIT && scanned < IMAGE_PRELOAD_SCAN_LIMIT;
       i--
     ) {
+      scanned++;
       if (preloadImage(batch[i]!)) started++;
     }
-  }
-
-  function recentImageIndexes(): number[] {
-    const items = messages();
-    const indexes: number[] = [];
-    for (
-      let i = items.length - 1;
-      i >= 0 && indexes.length < RECENT_IMAGE_KEEP_MOUNTED;
-      i--
-    ) {
-      if (items[i]?.attachment?.kind === "image") indexes.push(i);
-    }
-    indexes.reverse();
-    return indexes;
   }
 
   function requestOlder() {
@@ -1316,7 +1288,6 @@ export default function App() {
     if (idleTimer) clearTimeout(idleTimer);
     for (const decoder of decoders.values()) decoder.close();
     decoders.clear();
-    for (const preload of imagePreloads.values()) preload.link.remove();
     imagePreloads.clear();
     socket?.close();
   });
@@ -1386,7 +1357,6 @@ export default function App() {
                 scrollRef={logEl}
                 data={messages()}
                 shift={prepend()}
-                keepMounted={recentImageIndexes()}
                 onScroll={onScroll}
                 onScrollEnd={onScrollEnd}
               >
