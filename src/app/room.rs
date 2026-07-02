@@ -18,6 +18,7 @@ use crate::{
     room_history::{self, FileHistoryKey, RoomHistoryStore},
     theme::Theme,
     tui::editor::EditorHighlighter,
+    web_server::WebAttachment,
 };
 
 use super::{
@@ -45,6 +46,8 @@ pub(crate) struct RoomSession {
     volume_preview: Option<(UserId, f32)>,
     history: Option<RoomHistoryStore>,
     seen: BoundedKeySet,
+    web_attachments: HashMap<(u64, u64), WebAttachment>,
+    web_file_attachments: HashMap<FileHistoryKey, WebAttachment>,
     /// Live progress for in-flight file transfers, keyed by the server transfer
     /// id. An entry exists only while a transfer is running: it is inserted on
     /// the first tick and removed when it completes, cancels, or errors, so the
@@ -208,6 +211,8 @@ impl RoomSession {
             volume_preview: None,
             history: None,
             seen: BoundedKeySet::with_capacity(config.ui.max_messages as usize),
+            web_attachments: HashMap::new(),
+            web_file_attachments: HashMap::new(),
             transfers: HashMap::new(),
         }
     }
@@ -284,6 +289,8 @@ impl RoomSession {
         self.room_name = "servers".to_string();
         self.history = None;
         self.seen.clear();
+        self.web_attachments.clear();
+        self.web_file_attachments.clear();
     }
 
     pub(crate) fn reset_for_disconnect(&mut self) {
@@ -291,6 +298,8 @@ impl RoomSession {
         self.stream_users.clear();
         self.history = None;
         self.seen.clear();
+        self.web_attachments.clear();
+        self.web_file_attachments.clear();
     }
 
     pub(crate) fn authenticated(&mut self, room_name: Option<String>) {
@@ -318,6 +327,7 @@ impl RoomSession {
 
         let opened = room_history::open(&self.history_id, room_id);
         let loaded = opened.loaded;
+        let files = loaded.files;
         let disk_keys: HashSet<(u64, u64)> = loaded
             .messages
             .iter()
@@ -344,10 +354,11 @@ impl RoomSession {
         merged.sort_by_key(|message| (message.timestamp_ms, message.message_id.0));
 
         self.populate_history(room_id, &merged, local_user);
+        self.populate_web_attachments(&merged, &files);
 
         room_history::LoadedHistory {
             messages: merged,
-            files: loaded.files,
+            files,
         }
     }
 
@@ -363,6 +374,7 @@ impl RoomSession {
         self.participants = Participants::default();
         let loaded = room_history::open(&self.history_id, room_id).loaded;
         self.populate_history(room_id, &loaded.messages, local_user);
+        self.populate_web_attachments(&loaded.messages, &loaded.files);
         loaded
     }
 
@@ -382,6 +394,8 @@ impl RoomSession {
         self.chat.set_room_id(room_id);
         self.seen.clear();
         self.transfers.clear();
+        self.web_attachments.clear();
+        self.web_file_attachments.clear();
         for message in messages {
             let local = Some(message.sender) == local_user;
             self.seen
@@ -391,6 +405,44 @@ impl RoomSession {
         self.chat.bottom();
     }
 
+    fn populate_web_attachments(
+        &mut self,
+        messages: &[ChatMessage],
+        files: &std::collections::HashMap<FileHistoryKey, room_history::FileDetail>,
+    ) {
+        self.web_attachments.clear();
+        self.web_file_attachments.clear();
+        for message in messages {
+            let Some(transfer_id) = message.file_transfer_id else {
+                continue;
+            };
+            let key = FileHistoryKey {
+                timestamp_ms: message.timestamp_ms,
+                transfer_id,
+            };
+            let Some(detail) = files.get(&key) else {
+                continue;
+            };
+            let attachment =
+                WebAttachment::from_served_file(&detail.file_name, detail.dimensions());
+            self.web_file_attachments.insert(key, attachment.clone());
+            self.web_attachments
+                .insert((message.timestamp_ms, message.message_id.0), attachment);
+        }
+    }
+
+    pub(crate) fn web_ref_for(
+        &self,
+        target: rpc::msgref::MessageRef,
+    ) -> Option<crate::web_wire::ResolvedRef> {
+        let label = self.chat.ref_label_for(target)?;
+        let attachment = self
+            .web_attachments
+            .get(&(target.timestamp_ms, target.message_id.0))
+            .cloned();
+        Some(crate::web_wire::ResolvedRef { label, attachment })
+    }
+
     pub(crate) fn chat_received(
         &mut self,
         message: ChatMessage,
@@ -398,6 +450,17 @@ impl RoomSession {
     ) -> RoomChatUpdate {
         let local = Some(message.sender) == local_user;
         let should_scroll_bottom = self.chat.scroll_offset() == 0;
+        let web_attachment = message
+            .file_transfer_id
+            .and_then(|transfer_id| {
+                self.web_file_attachments
+                    .get(&FileHistoryKey {
+                        timestamp_ms: message.timestamp_ms,
+                        transfer_id,
+                    })
+                    .cloned()
+            })
+            .map(|attachment| (message.timestamp_ms, message.message_id.0, attachment));
         if self
             .seen
             .insert((message.timestamp_ms, message.message_id.0))
@@ -407,6 +470,10 @@ impl RoomSession {
             }
             self.participants.note_message(&message);
             self.chat.push_chat(message, local);
+            if let Some((timestamp_ms, message_id, attachment)) = web_attachment {
+                self.web_attachments
+                    .insert((timestamp_ms, message_id), attachment);
+            }
             if should_scroll_bottom {
                 self.chat.bottom();
             }
@@ -440,6 +507,26 @@ impl RoomSession {
                 packed_dims,
             );
         }
+        let attachment = WebAttachment::from_served_file(file_name, dimensions);
+        self.web_file_attachments.insert(
+            FileHistoryKey {
+                timestamp_ms,
+                transfer_id,
+            },
+            attachment.clone(),
+        );
+        if let Some(message_id) = self.file_message_id(timestamp_ms, transfer_id) {
+            self.web_attachments
+                .insert((timestamp_ms, message_id), attachment);
+        }
+    }
+
+    fn file_message_id(&self, timestamp_ms: u64, transfer_id: FileTransferId) -> Option<u64> {
+        (0..self.chat.len()).rev().find_map(|index| {
+            let message = self.chat.message(index);
+            (message.timestamp_ms == timestamp_ms && message.file_transfer_id == Some(transfer_id))
+                .then_some(message.id)
+        })
     }
 
     /// Records a progress tick for an in-flight transfer. A tick that reaches or

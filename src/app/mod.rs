@@ -645,9 +645,9 @@ fn share_error_envelope(stream_id: StreamId, message: &str) -> String {
 /// stored image dimensions and served names to file messages.
 fn web_room_messages(
     view: &crate::room_history::LoadedHistory,
-    chat: &crate::chat_buffer::VirtualChatBuffer,
+    room: &RoomSession,
 ) -> Vec<crate::web_server::WebMessage> {
-    let resolver = |target| chat.ref_label_for(target);
+    let resolver = |target| room.web_ref_for(target);
     let mut messages = Vec::with_capacity(view.messages.len());
     for message in &view.messages {
         let web_message = match message.file_transfer_id {
@@ -1128,7 +1128,7 @@ impl App {
             .room
             .load_offline_history(RoomId(server.room_id), self.user_id);
         if let Some(feed) = &self.web_feed {
-            feed.set_room(web_room_messages(&view, &self.room.chat));
+            feed.set_room(web_room_messages(&view, &self.room));
         }
         self.active_tcp_addr = Some(
             server
@@ -1591,7 +1591,7 @@ impl App {
                     .room
                     .joined(room_id, participants, history, self.user_id);
                 if let Some(feed) = &self.web_feed {
-                    feed.set_room(web_room_messages(&view, &self.room.chat));
+                    feed.set_room(web_room_messages(&view, &self.room));
                 }
                 self.set_status(format!("joined room {}", room_id.0));
                 self.publish_voice_status();
@@ -1600,10 +1600,9 @@ impl App {
             }
             NetworkEvent::Chat(message) => {
                 if let Some(feed) = &self.web_feed {
-                    let chat = &self.room.chat;
                     feed.send(crate::web_server::WebMessage::from_chat(
                         &message,
-                        &|target| chat.ref_label_for(target),
+                        &|target| self.room.web_ref_for(target),
                     ));
                 }
                 let update = RoomSession::chat_received(&mut self.room, message, self.user_id);

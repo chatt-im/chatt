@@ -15,7 +15,7 @@
 
 use crate::highlight;
 use crate::markdown::{Token, TokenKind};
-use crate::web_server::WebMessage;
+use crate::web_server::{WebAttachment, WebMessage};
 
 /// Marks a feed frame, distinguishing it from a raw video frame.
 const SENTINEL: [u8; 4] = [0, 0, 0, 0];
@@ -45,10 +45,18 @@ pub enum Fragment {
     },
 }
 
-/// Resolves a decoded message reference to its pill label, or `None` when the
-/// target is unknown so the literal code renders instead. Labels bake into the
-/// fragment HTML at encode time; they refresh on the next room sync, not live.
-pub type RefResolver<'a> = &'a dyn Fn(rpc::msgref::MessageRef) -> Option<String>;
+/// Resolved metadata for a decoded message reference.
+#[derive(Clone)]
+pub struct ResolvedRef {
+    pub label: String,
+    pub attachment: Option<WebAttachment>,
+}
+
+/// Resolves a decoded message reference to its pill label plus optional
+/// attachment metadata, or `None` when the target is unknown so the literal code
+/// renders instead. Resolved data bakes into the fragment HTML at encode time;
+/// it refreshes on the next room sync, not live.
+pub type RefResolver<'a> = &'a dyn Fn(rpc::msgref::MessageRef) -> Option<ResolvedRef>;
 
 /// Splits a message body into rendered prose and highlighted fenced code blocks.
 ///
@@ -163,19 +171,36 @@ fn render_ref(code: &str, resolver: RefResolver, html: &mut String) {
         html.push_str("</span>");
         return;
     };
-    let label = resolver(target);
-    let class = if label.is_some() {
+    let resolved = resolver(target);
+    let class = if resolved.is_some() {
         "msg-ref"
     } else {
         "msg-ref msg-ref-unresolved"
     };
     let _ = write!(
         html,
-        "<a href=\"#\" class=\"{class}\" data-ts=\"{}\" data-mid=\"{}\" data-room=\"{}\">",
+        "<a href=\"#\" class=\"{class}\" data-ts=\"{}\" data-mid=\"{}\" data-room=\"{}\"",
         target.timestamp_ms, target.message_id.0, target.room_id.0,
     );
-    match &label {
-        Some(label) => escape_html(label, html),
+    if let Some(attachment) = resolved
+        .as_ref()
+        .and_then(|resolved| resolved.attachment.as_ref())
+    {
+        html.push_str(" data-media-name=\"");
+        escape_html(&attachment.name, html);
+        html.push_str("\" data-media-kind=\"");
+        escape_html(&attachment.kind, html);
+        html.push('"');
+        if let (Some(width), Some(height)) = (attachment.width, attachment.height) {
+            let _ = write!(
+                html,
+                " data-media-width=\"{width}\" data-media-height=\"{height}\""
+            );
+        }
+    }
+    html.push('>');
+    match &resolved {
+        Some(resolved) => escape_html(&resolved.label, html),
         None => escape_html(code, html),
     }
     html.push_str("</a>");
@@ -485,7 +510,12 @@ mod tests {
         let code = target.encode();
 
         let body = format!("see @@{code}");
-        let resolved = split_fragments(&body, &|_| Some("↩ alice: <hi>".to_string()));
+        let resolved = split_fragments(&body, &|_| {
+            Some(ResolvedRef {
+                label: "↩ alice: <hi>".to_string(),
+                attachment: None,
+            })
+        });
         let Fragment::Text(html) = &resolved[0] else {
             panic!("expected text fragment");
         };
@@ -507,6 +537,38 @@ mod tests {
         };
         assert!(html.contains("msg-ref-dead"), "html: {html}");
         assert!(!html.contains("<a"), "html: {html}");
+    }
+
+    #[test]
+    fn resolved_media_ref_carries_attachment_metadata() {
+        let target = rpc::msgref::MessageRef {
+            room_id: rpc::ids::RoomId(1),
+            timestamp_ms: 1_000_000,
+            message_id: rpc::ids::MessageId(7),
+        };
+        let code = target.encode();
+        let body = format!("see @@{code}");
+        let fragments = split_fragments(&body, &|_| {
+            Some(ResolvedRef {
+                label: "↩ alice: sent file".to_string(),
+                attachment: Some(WebAttachment {
+                    name: "wide \"one\".png".to_string(),
+                    kind: "image".to_string(),
+                    width: Some(640),
+                    height: Some(480),
+                }),
+            })
+        });
+        let Fragment::Text(html) = &fragments[0] else {
+            panic!("expected text fragment");
+        };
+        assert!(html.contains("data-media-kind=\"image\""), "html: {html}");
+        assert!(
+            html.contains("data-media-name=\"wide &quot;one&quot;.png\""),
+            "html: {html}"
+        );
+        assert!(html.contains("data-media-width=\"640\""), "html: {html}");
+        assert!(html.contains("data-media-height=\"480\""), "html: {html}");
     }
 
     #[test]

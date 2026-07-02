@@ -9,9 +9,12 @@ import {
 import FileViewer from "./FileViewer";
 import Icon from "./Icon";
 import ImageViewer from "./ImageViewer";
+import type { IconName } from "./icons";
 
 export type PreviewItem =
   | { kind: "file"; name: string }
+  | { kind: "video"; name: string }
+  | { kind: "audio"; name: string }
   | {
       kind: "image";
       name: string;
@@ -21,6 +24,22 @@ export type PreviewItem =
 
 export function previewKey(item: PreviewItem): string {
   return `${item.kind}:${item.name}`;
+}
+
+function fileUrl(name: string): string {
+  return `/files/${encodeURIComponent(name)}`;
+}
+
+function previewIcon(item: PreviewItem): IconName {
+  switch (item.kind) {
+    case "image":
+      return "image";
+    case "file":
+      return "file-text";
+    case "video":
+    case "audio":
+      return "play";
+  }
 }
 
 export default function PreviewPanel(props: {
@@ -171,7 +190,7 @@ export default function PreviewPanel(props: {
                       onClick={() => selectTab(key)}
                       onKeyDown={(event) => onTabKeyDown(event, index())}
                     >
-                      <Icon name={item.kind === "image" ? "image" : "file-text"} />
+                      <Icon name={previewIcon(item)} />
                       <span class="preview-tab-label">{item.name}</span>
                     </button>
                     <button
@@ -226,6 +245,22 @@ export default function PreviewPanel(props: {
                 width={item.width}
                 height={item.height}
               />
+            ) : item.kind === "video" ? (
+              <video
+                class="preview-media-video"
+                src={fileUrl(item.name)}
+                controls
+                preload="metadata"
+              />
+            ) : item.kind === "audio" ? (
+              <div class="preview-media-audio-frame">
+                <audio
+                  class="preview-media-audio"
+                  src={fileUrl(item.name)}
+                  controls
+                  preload="metadata"
+                />
+              </div>
             ) : (
               <FileViewer name={item.name} />
             )
