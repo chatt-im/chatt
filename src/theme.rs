@@ -377,18 +377,23 @@ impl SyntaxTheme {
 
     /// Folds a highlight class onto one of the nine terminal palette slots.
     ///
-    /// The web view distinguishes far more roles than the terminal has colors,
-    /// so several classes share a slot here. This mapping reproduces the
-    /// terminal's original per-token coloring exactly.
+    /// The web view retains finer semantic roles, while this mapping reproduces
+    /// exgit's Tomorrow Night token groups exactly.
     pub fn style_for(&self, class: HlClass) -> Style {
         match class {
             HlClass::Plain
             | HlClass::Variable
             | HlClass::PropertyAccess
             | HlClass::MetaVariable
+            | HlClass::Argument
             | HlClass::Operator
             | HlClass::Punctuation
             | HlClass::Delimiter
+            | HlClass::Delimiter1
+            | HlClass::Delimiter2
+            | HlClass::Delimiter3
+            | HlClass::Delimiter4
+            | HlClass::Delimiter5
             | HlClass::Error => self.fg,
             HlClass::Type => self.type_,
             HlClass::Function
@@ -404,12 +409,12 @@ impl SyntaxTheme {
             | HlClass::EntityRef
             | HlClass::HashToken
             | HlClass::Link
-            | HlClass::LinkUrl
-            | HlClass::Blockquote => self.namespace,
-            HlClass::Keyword | HlClass::Attribute | HlClass::ListMarker => self.keyword,
+            | HlClass::LinkUrl => self.namespace,
+            HlClass::Keyword | HlClass::Attribute => self.keyword,
             HlClass::String | HlClass::Char | HlClass::Regex => self.string,
             HlClass::Number => self.number,
-            HlClass::Comment | HlClass::DocComment | HlClass::Emphasis => self.comment,
+            HlClass::Comment | HlClass::DocComment => self.comment,
+            HlClass::Blockquote | HlClass::ListMarker | HlClass::Emphasis => self.fg,
         }
     }
 }
