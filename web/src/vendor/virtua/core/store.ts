@@ -50,9 +50,11 @@ export const ACTION_ITEMS_LENGTH_CHANGE = 5;
 /** @internal */
 export const ACTION_START_OFFSET_CHANGE = 6;
 /** @internal */
-export const ACTION_MANUAL_SCROLL = 7;
+export const ACTION_END_OFFSET_CHANGE = 7;
 /** @internal */
-export const ACTION_BEFORE_MANUAL_SMOOTH_SCROLL = 8;
+export const ACTION_MANUAL_SCROLL = 8;
+/** @internal */
+export const ACTION_BEFORE_MANUAL_SMOOTH_SCROLL = 9;
 
 type Actions =
   | [type: typeof ACTION_SCROLL, offset: number]
@@ -64,6 +66,7 @@ type Actions =
       arg: [length: number, isShift?: boolean | undefined],
     ]
   | [type: typeof ACTION_START_OFFSET_CHANGE, offset: number]
+  | [type: typeof ACTION_END_OFFSET_CHANGE, offset: number]
   | [type: typeof ACTION_MANUAL_SCROLL, dummy?: void]
   | [type: typeof ACTION_BEFORE_MANUAL_SMOOTH_SCROLL, offset: number];
 
@@ -106,6 +109,7 @@ export type VirtualStore = {
   $isScrolling(): boolean;
   $getViewportSize(): number;
   $getStartSpacerSize(): number;
+  $getEndSpacerSize(): number;
   $getTotalSize(): number;
   _flushJump(): [number, boolean];
   $subscribe(target: number, cb: Subscriber): () => void;
@@ -126,6 +130,7 @@ export const createVirtualStore = (
   let stateVersion: StateVersion = 1;
   let viewportSize = 0;
   let startSpacerSize = 0;
+  let endSpacerSize = 0;
   let scrollOffset = 0;
   let jump = 0;
   let pendingJump = 0;
@@ -150,11 +155,12 @@ export const createVirtualStore = (
   const getRange = (startOffset: number, endOffset: number) => {
     return computeRange(cache, startOffset, endOffset, _prevRange[0]);
   };
-  const getTotalSize = (): number => _getItemOffset(cache, cache._length);
+  const getItemsSize = (): number => _getItemOffset(cache, cache._length);
+  const getTotalSize = (): number => getItemsSize() + endSpacerSize;
   const getItemOffset = (index: number, fromEnd?: boolean): number => {
     const offset = _getItemOffset(cache, index) - pendingJump;
     if (fromEnd) {
-      return getTotalSize() - offset - getItemSize(index);
+      return getItemsSize() - offset - getItemSize(index);
     }
     return offset;
   };
@@ -239,6 +245,7 @@ export const createVirtualStore = (
     $isScrolling: () => _scrollDirection !== SCROLL_IDLE,
     $getViewportSize: () => viewportSize,
     $getStartSpacerSize: () => startSpacerSize,
+    $getEndSpacerSize: () => endSpacerSize,
     $getTotalSize: getTotalSize,
     _flushJump: () => {
       _flushedJump = jump;
@@ -440,7 +447,17 @@ export const createVirtualStore = (
           break;
         }
         case ACTION_START_OFFSET_CHANGE: {
-          startSpacerSize = payload;
+          if (startSpacerSize !== payload) {
+            startSpacerSize = payload;
+            mutated = UPDATE_VIRTUAL_STATE + UPDATE_SIZE_EVENT;
+          }
+          break;
+        }
+        case ACTION_END_OFFSET_CHANGE: {
+          if (endSpacerSize !== payload) {
+            endSpacerSize = payload;
+            mutated = UPDATE_VIRTUAL_STATE + UPDATE_SIZE_EVENT;
+          }
           break;
         }
         case ACTION_MANUAL_SCROLL: {
