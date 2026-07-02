@@ -34,6 +34,10 @@ const RECENT_IMAGE_KEEP_MOUNTED = 12;
 // only the first carries the sender/time header (Discord-style).
 const GROUP_WINDOW_MS = 5 * 60 * 1000;
 
+// Do not flash a connection error while the initial WebSocket handshake (or a
+// quick reconnect) is still in progress.
+const CONNECTION_ERROR_DELAY_MS = 3_000;
+
 type ImagePreload = {
   image: HTMLImageElement;
   link: HTMLLinkElement;
@@ -262,6 +266,7 @@ function MessageRow(props: {
 export default function App() {
   const [messages, setMessages] = createSignal<WebMessage[]>([]);
   const [connected, setConnected] = createSignal(false);
+  const [connectionErrorVisible, setConnectionErrorVisible] = createSignal(false);
   // Drives virtua's `shift`: while true a data change is treated as a prepend so
   // scroll position is anchored from the end (reverse infinite scroll).
   const [prepend, setPrepend] = createSignal(false);
@@ -319,12 +324,16 @@ export default function App() {
   let appBodyEl: HTMLDivElement | undefined;
   let logEl: HTMLDivElement | undefined;
   let contentEl: HTMLDivElement | undefined;
+  let composerTextEl: HTMLTextAreaElement | undefined;
   let handle: VirtualizerHandle | undefined;
   let resizeObserver: ResizeObserver | undefined;
+  let chatViewportResizeObserver: ResizeObserver | undefined;
   let splitResizeObserver: ResizeObserver | undefined;
   let fileSplitResizeObserver: ResizeObserver | undefined;
+  let viewportPinFrame = 0;
   let socket: WebSocket | undefined;
   let reconnectTimer: number | undefined;
+  let connectionErrorTimer: number | undefined;
   const imagePreloads = new Map<string, ImagePreload>();
   let paneResize:
     | {
@@ -515,6 +524,36 @@ export default function App() {
     }
   }
 
+  function hideConnectionError() {
+    if (connectionErrorTimer !== undefined) {
+      clearTimeout(connectionErrorTimer);
+      connectionErrorTimer = undefined;
+    }
+    setConnectionErrorVisible(false);
+  }
+
+  function scheduleConnectionError() {
+    if (connectionErrorVisible() || connectionErrorTimer !== undefined) return;
+    connectionErrorTimer = window.setTimeout(() => {
+      connectionErrorTimer = undefined;
+      if (!connected()) setConnectionErrorVisible(true);
+    }, CONNECTION_ERROR_DELAY_MS);
+  }
+
+  function resizeComposer() {
+    const textArea = composerTextEl;
+    if (!textArea) return;
+
+    textArea.style.height = "auto";
+    const maxHeight = Number.parseFloat(getComputedStyle(textArea).maxHeight);
+    const nextHeight = Number.isFinite(maxHeight)
+      ? Math.min(textArea.scrollHeight, maxHeight)
+      : textArea.scrollHeight;
+    textArea.style.height = `${nextHeight}px`;
+    textArea.style.overflowY =
+      Number.isFinite(maxHeight) && textArea.scrollHeight > maxHeight ? "auto" : "hidden";
+  }
+
   // Streams one queued file to the client: an `upload_start`, then binary chunks
   // each prefixed with the little-endian upload id, then `upload_finish`. The
   // server reassembles them into a temp file and relays it as a normal upload.
@@ -541,6 +580,7 @@ export default function App() {
     for (const file of files) void sendFile(file);
     setDraft("");
     setQueued([]);
+    queueMicrotask(resizeComposer);
   }
 
   function onComposeKeyDown(event: KeyboardEvent) {
@@ -784,7 +824,10 @@ export default function App() {
     const ws = new WebSocket(`ws://${location.host}/ws`);
     // Video frames arrive as binary messages; everything else is JSON text.
     ws.binaryType = "arraybuffer";
-    ws.onopen = () => setConnected(true);
+    ws.onopen = () => {
+      setConnected(true);
+      hideConnectionError();
+    };
     ws.onmessage = (ev) => {
       if (typeof ev.data !== "string") {
         // A binary message is either a chat feed frame (zero sentinel) or a
@@ -899,6 +942,7 @@ export default function App() {
     };
     ws.onclose = () => {
       setConnected(false);
+      scheduleConnectionError();
       reconnectTimer = window.setTimeout(connect, 1000);
     };
     ws.onerror = () => ws.close();
@@ -912,6 +956,24 @@ export default function App() {
       // grows later is followed rather than stranded (rule 2).
       resizeObserver = new ResizeObserver(() => pin());
       resizeObserver.observe(contentEl);
+    }
+    if (logEl) {
+      let observedHeight = -1;
+      chatViewportResizeObserver = new ResizeObserver((entries) => {
+        const rect = entries[entries.length - 1]?.contentRect;
+        if (!rect || Math.abs(rect.height - observedHeight) < 0.01) return;
+        observedHeight = rect.height;
+
+        // The virtualizer observes this element too. Pin on the next frame so
+        // its viewport measurement is current before scrollToIndex aligns the
+        // final message. `pin` remains a no-op when the user is detached.
+        if (viewportPinFrame) cancelAnimationFrame(viewportPinFrame);
+        viewportPinFrame = requestAnimationFrame(() => {
+          viewportPinFrame = 0;
+          pin();
+        });
+      });
+      chatViewportResizeObserver.observe(logEl);
     }
     if (mainEl) {
       let observedHeight = -1;
@@ -936,16 +998,20 @@ export default function App() {
       fileSplitResizeObserver.observe(appBodyEl);
     }
     document.addEventListener("fullscreenchange", onDocumentFullscreenChange);
+    scheduleConnectionError();
     connect();
   });
   onCleanup(() => {
     resizeObserver?.disconnect();
+    chatViewportResizeObserver?.disconnect();
     splitResizeObserver?.disconnect();
     fileSplitResizeObserver?.disconnect();
+    if (viewportPinFrame) cancelAnimationFrame(viewportPinFrame);
     document.removeEventListener("fullscreenchange", onDocumentFullscreenChange);
     removePaneResizeListeners();
     removeFilePanelResizeListeners();
     if (reconnectTimer) clearTimeout(reconnectTimer);
+    if (connectionErrorTimer !== undefined) clearTimeout(connectionErrorTimer);
     if (suppressTimer) clearTimeout(suppressTimer);
     if (idleTimer) clearTimeout(idleTimer);
     for (const decoder of decoders.values()) decoder.close();
@@ -957,8 +1023,10 @@ export default function App() {
 
   return (
     <div class="app">
-      <Show when={!connected()}>
-        <div class="conn-overlay">offline — reconnecting…</div>
+      <Show when={connectionErrorVisible()}>
+        <div class="conn-overlay" role="status" aria-live="polite">
+          Unable to connect — retrying…
+        </div>
       </Show>
       <div
         class="app-body"
@@ -1058,19 +1126,18 @@ export default function App() {
                   </For>
                 </div>
               </Show>
-              <div class="composer-input">
-                <textarea
-                  class="composer-text"
-                  rows={1}
-                  placeholder="Message… (drag files to attach)"
-                  value={draft()}
-                  onInput={(e) => setDraft(e.currentTarget.value)}
-                  onKeyDown={onComposeKeyDown}
-                />
-                <button class="composer-send" type="button" onClick={submitCompose}>
-                  Send
-                </button>
-              </div>
+              <textarea
+                class="composer-text"
+                ref={composerTextEl}
+                rows={1}
+                placeholder="Write a message… (drag files to attach)"
+                value={draft()}
+                onInput={(event) => {
+                  setDraft(event.currentTarget.value);
+                  resizeComposer();
+                }}
+                onKeyDown={onComposeKeyDown}
+              />
             </section>
           </Show>
         </main>
