@@ -339,6 +339,7 @@ impl RoomSession {
         room_id: RoomId,
         local_user: Option<UserId>,
     ) -> room_history::LoadedHistory {
+        self.participants = Participants::default();
         let loaded = room_history::open(&self.history_id, room_id).loaded;
         self.populate_history(&loaded.messages, local_user);
         loaded
@@ -355,7 +356,6 @@ impl RoomSession {
             let local = Some(message.sender) == local_user;
             self.seen
                 .insert((message.timestamp_ms, message.message_id.0));
-            self.participants.note_message(message);
             self.chat.push_chat(message.clone(), local);
         }
         self.chat.bottom();
@@ -813,6 +813,21 @@ mod tests {
     }
 
     #[test]
+    fn joined_history_does_not_populate_lobby() {
+        let mut room = test_room();
+        room.joined(
+            RoomId(1),
+            vec![participant(UserId(1), "alice")],
+            vec![message(1, UserId(2), "historical")],
+            Some(UserId(1)),
+        );
+
+        assert_eq!(room.chat.len(), 1);
+        assert_eq!(room.participants.entries.len(), 1);
+        assert_eq!(room.participants.entries[0].user_id, UserId(1));
+    }
+
+    #[test]
     fn joined_merges_and_dedups_server_history() {
         // Empty server label disables disk, so this exercises the in-memory
         // merge: dedup on (timestamp_ms, message_id) and sort by it. `message`
@@ -862,8 +877,34 @@ mod tests {
         assert_eq!(room.chat.message(0).body, "first");
         assert_eq!(room.chat.message(1).body, "second");
         assert_eq!(view.messages.len(), 2);
+        assert!(room.participants.entries.is_empty());
         // No append handle is kept while offline.
         assert!(room.history.is_none());
+    }
+
+    #[test]
+    fn offline_history_clears_stale_lobby_entries() {
+        let history_id = "offline-clear-participants-test";
+        let room_id = RoomId(1);
+        let mut store = room_history::open(history_id, room_id)
+            .store
+            .expect("history store opens");
+        store.append_message(&message(1, UserId(2), "offline"));
+        drop(store);
+
+        let mut room = test_room();
+        room.connect_to_server(
+            "alias".to_string(),
+            history_id.to_string(),
+            "me".to_string(),
+        );
+        room.participants
+            .replace_room(vec![participant(UserId(1), "alice")]);
+
+        room.load_offline_history(room_id, Some(UserId(1)));
+
+        assert_eq!(room.chat.len(), 1);
+        assert!(room.participants.entries.is_empty());
     }
 
     #[test]
