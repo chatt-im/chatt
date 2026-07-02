@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use chatt::audio::{AudioDeviceInfo, LiveEncoderProfile, LivePlaybackSnapshot, SAMPLE_RATE};
 
 pub(crate) struct AudioDiagnostics {
@@ -7,6 +9,11 @@ pub(crate) struct AudioDiagnostics {
     voice_bytes_received: u64,
     input_device: Option<AudioDeviceInfo>,
     output_device: Option<AudioDeviceInfo>,
+    /// Pre-formatted per-stream recovery health, e.g.
+    /// `mic: reconnecting (attempt 4, 12s) | last: device not available`.
+    health_lines: Vec<String>,
+    /// Pre-formatted recent device events, newest first.
+    recent_events: Vec<String>,
 }
 
 impl AudioDiagnostics {
@@ -17,6 +24,8 @@ impl AudioDiagnostics {
         voice_bytes_received: u64,
         input_device: Option<AudioDeviceInfo>,
         output_device: Option<AudioDeviceInfo>,
+        health_lines: Vec<String>,
+        recent_events: Vec<String>,
     ) -> Self {
         Self {
             snapshot,
@@ -25,6 +34,8 @@ impl AudioDiagnostics {
             voice_bytes_received,
             input_device,
             output_device,
+            health_lines,
+            recent_events,
         }
     }
 
@@ -66,6 +77,16 @@ impl AudioDiagnostics {
 
         let input_device = format_device_line(self.input_device.as_ref());
         let output_device = format_device_line(self.output_device.as_ref());
+        let health = if self.health_lines.is_empty() {
+            String::new()
+        } else {
+            format!("\nhealth\n  {}", self.health_lines.join("\n  "))
+        };
+        let events = if self.recent_events.is_empty() {
+            String::new()
+        } else {
+            format!("\nevents\n  {}", self.recent_events.join("\n  "))
+        };
 
         format!(
             "devices\n  input: {}\n  output: {}\nplayback\n  output: ring max {}ms, queued {} samples, callback {}ms\n  neteq: playout {}ms ({} / 5s), target {}ms{} ({} / 5s)\n  buffers: decoded {}ms, packets wait {}ms span {}ms / {} pkts, next gap {}\n  decision: {} ({})\n  timing: accelerate {}ms / {}, expand {}ms / {}\n  recovery: dred {}, fec {}, horizon {}ms, missed {}ms / {}, plc {}, trims {}, underruns {}\n  active streams: {}\nnetwork\n  voice rx: {} packets / {}\nencoder\n  profile: {}\n{}",
@@ -103,7 +124,19 @@ impl AudioDiagnostics {
             format_bytes_compact(self.voice_bytes_received),
             self.encoder_profile.label(),
             backend
-        )
+        ) + &health
+            + &events
+    }
+}
+
+pub(crate) fn format_event_age(elapsed: Duration) -> String {
+    let secs = elapsed.as_secs();
+    if secs < 60 {
+        format!("{secs}s")
+    } else if secs < 3600 {
+        format!("{}m", secs / 60)
+    } else {
+        format!("{}h", secs / 3600)
     }
 }
 
@@ -155,6 +188,8 @@ mod tests {
             2048,
             None,
             None,
+            Vec::new(),
+            Vec::new(),
         );
 
         let summary = report.status_summary();
@@ -179,6 +214,7 @@ mod tests {
             Some(AudioDeviceInfo {
                 backend: "ALSA",
                 device_name: "Built-in Microphone".to_string(),
+                stable_id: "built-in microphone".to_string(),
                 is_default: true,
                 channels: 1,
                 device_rate: 48_000,
@@ -189,6 +225,7 @@ mod tests {
             Some(AudioDeviceInfo {
                 backend: "ALSA",
                 device_name: "Built-in Speaker".to_string(),
+                stable_id: "built-in speaker".to_string(),
                 is_default: false,
                 channels: 2,
                 device_rate: 48_000,
@@ -196,6 +233,11 @@ mod tests {
                 buffer_note: String::new(),
                 buffer_fallback: true,
             }),
+            vec![
+                "mic: healthy".to_string(),
+                "spk: reconnecting (attempt 2, 5s) | last: device gone".to_string(),
+            ],
+            vec!["3s  device lost: spk: USB Audio".to_string()],
         );
 
         let body = report.notice_body();
@@ -205,5 +247,14 @@ mod tests {
         assert!(body.contains("playback\n"));
         assert!(body.contains("network\n"));
         assert!(body.contains("profile: dred35"));
+        assert!(body.contains("health\n  mic: healthy\n  spk: reconnecting (attempt 2, 5s)"));
+        assert!(body.contains("events\n  3s  device lost: spk: USB Audio"));
+    }
+
+    #[test]
+    fn event_ages_render_compactly() {
+        assert_eq!(format_event_age(Duration::from_secs(3)), "3s");
+        assert_eq!(format_event_age(Duration::from_secs(200)), "3m");
+        assert_eq!(format_event_age(Duration::from_secs(8000)), "2h");
     }
 }

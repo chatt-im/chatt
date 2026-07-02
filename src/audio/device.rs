@@ -21,6 +21,7 @@ use crate::audio::{
     backend::with_audio_backend_stderr_suppressed,
     capture::EchoCancellationControl,
     diagnostics::LivePlaybackWavRecorderHandle,
+    errors::{AudioErrorKind, AudioStartError},
     playback::{
         LivePlaybackMixer, LivePlaybackMixerEvent, LivePlaybackSharedSnapshot, MIX_FRAME_SAMPLES,
         SpscSwapQueue,
@@ -516,14 +517,187 @@ pub(crate) fn parse_alsa_pcm_address(address: &str) -> Option<(u32, u32)> {
     Some((card.parse().ok()?, device.parse().ok()?))
 }
 
+/// Identity of one present audio device, as seen by a cheap enumeration scan.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DeviceIdentity {
+    /// cpal device id string, when the backend provides one.
+    pub id: Option<String>,
+    /// Normalized name identity (see [`stable_input_device_id`]).
+    pub stable_id: String,
+    pub name: String,
+}
+
+impl DeviceIdentity {
+    fn from_device(device: &cpal::Device) -> Self {
+        let name = device.to_string();
+        Self {
+            id: cpal_device_id(device),
+            stable_id: stable_device_id(&name),
+            name,
+        }
+    }
+
+    /// True when this device matches a configured device id or a stream's
+    /// stable id, accepting the same spellings as
+    /// [`cpal_device_matches_config_id`]: raw cpal id, stable name, bare ALSA
+    /// PCM name, or `alsa/<pcm>`.
+    pub fn matches_target(&self, target: &str) -> bool {
+        if self.stable_id == target {
+            return true;
+        }
+        let Some(id) = self.id.as_deref() else {
+            return false;
+        };
+        if id == target {
+            return true;
+        }
+        let Some(alsa_pcm) = id.strip_prefix("alsa:") else {
+            return false;
+        };
+        alsa_pcm == target || target.strip_prefix("alsa/") == Some(alsa_pcm)
+    }
+}
+
+/// Snapshot of present devices and OS defaults, by identity only.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct DeviceIdentityProbe {
+    pub default_input: Option<DeviceIdentity>,
+    pub default_output: Option<DeviceIdentity>,
+    pub inputs: Vec<DeviceIdentity>,
+    pub outputs: Vec<DeviceIdentity>,
+}
+
+impl DeviceIdentityProbe {
+    pub fn inputs_contain(&self, target: &str) -> bool {
+        self.inputs
+            .iter()
+            .any(|identity| identity.matches_target(target))
+    }
+
+    pub fn outputs_contain(&self, target: &str) -> bool {
+        self.outputs
+            .iter()
+            .any(|identity| identity.matches_target(target))
+    }
+}
+
+/// Enumerates device identities and OS defaults without negotiating stream
+/// configs, so no PCM is opened. Cheap enough for periodic polling from a
+/// background thread; still never call it on the UI thread.
+pub fn probe_device_identities() -> Result<DeviceIdentityProbe, String> {
+    with_audio_backend_stderr_suppressed(probe_device_identities_inner)
+}
+
+fn probe_device_identities_inner() -> Result<DeviceIdentityProbe, String> {
+    let host = cpal::default_host();
+    let mut probe = DeviceIdentityProbe::default();
+    let inputs = host
+        .input_devices()
+        .map_err(|error| format!("failed to list input devices: {error}"))?;
+    for device in inputs {
+        if !device_matches_picker_direction(&device, AudioDeviceDirection::Input) {
+            continue;
+        }
+        probe.inputs.push(DeviceIdentity::from_device(&device));
+    }
+    let outputs = host
+        .output_devices()
+        .map_err(|error| format!("failed to list output devices: {error}"))?;
+    for device in outputs {
+        if !device_matches_picker_direction(&device, AudioDeviceDirection::Output) {
+            continue;
+        }
+        probe.outputs.push(DeviceIdentity::from_device(&device));
+    }
+    append_alsa_physical_identities(AudioDeviceDirection::Input, &mut probe.inputs);
+    append_alsa_physical_identities(AudioDeviceDirection::Output, &mut probe.outputs);
+    probe.default_input = host
+        .default_input_device()
+        .map(|device| DeviceIdentity::from_device(&device));
+    probe.default_output = host
+        .default_output_device()
+        .map(|device| DeviceIdentity::from_device(&device));
+    Ok(probe)
+}
+
+#[cfg(any(
+    target_os = "linux",
+    target_os = "dragonfly",
+    target_os = "freebsd",
+    target_os = "netbsd"
+))]
+fn append_alsa_physical_identities(
+    direction: AudioDeviceDirection,
+    list: &mut Vec<DeviceIdentity>,
+) {
+    for pcm in alsa_physical_pcm_devices(direction) {
+        for prefix in ["plughw", "hw"] {
+            let pcm_id = format!("{prefix}:CARD={},DEV={}", pcm.card, pcm.device);
+            let name = format!("{} ({pcm_id})", pcm.name);
+            list.push(DeviceIdentity {
+                id: Some(format!("alsa:{pcm_id}")),
+                stable_id: stable_device_id(&name),
+                name,
+            });
+        }
+    }
+}
+
+#[cfg(not(any(
+    target_os = "linux",
+    target_os = "dragonfly",
+    target_os = "freebsd",
+    target_os = "netbsd"
+)))]
+fn append_alsa_physical_identities(
+    _direction: AudioDeviceDirection,
+    _list: &mut Vec<DeviceIdentity>,
+) {
+}
+
+/// Why a configured device id failed to resolve to an opened config, split by
+/// the recovery strategy the failure calls for.
+pub(crate) enum DeviceSelectError {
+    /// No present device matches the configured id.
+    NotFound(String),
+    /// A matching device exists but offers no usable config.
+    Unsupported(String),
+    /// Device enumeration itself failed.
+    Backend(String),
+}
+
+impl From<DeviceSelectError> for String {
+    fn from(error: DeviceSelectError) -> Self {
+        match error {
+            DeviceSelectError::NotFound(message)
+            | DeviceSelectError::Unsupported(message)
+            | DeviceSelectError::Backend(message) => message,
+        }
+    }
+}
+
+impl From<DeviceSelectError> for AudioStartError {
+    fn from(error: DeviceSelectError) -> Self {
+        match error {
+            DeviceSelectError::NotFound(message) => {
+                AudioStartError::new(AudioErrorKind::DeviceGone, message)
+            }
+            DeviceSelectError::Unsupported(message) => {
+                AudioStartError::new(AudioErrorKind::ConfigInvalid, message)
+            }
+            DeviceSelectError::Backend(message) => AudioStartError::transient(message),
+        }
+    }
+}
+
 pub(crate) fn select_input_device_by_id(
     host: &cpal::Host,
     id: &str,
     buffer_request: BufferRequest,
-) -> Result<(cpal::Device, ConfigSelection), String> {
-    let devices = host
-        .input_devices()
-        .map_err(|error| format!("failed to list input devices: {error}"))?;
+) -> Result<(cpal::Device, ConfigSelection), DeviceSelectError> {
+    let devices = host.input_devices().map_err(|error| {
+        DeviceSelectError::Backend(format!("failed to list input devices: {error}"))
+    })?;
     let mut matched = false;
     let mut first_error = None;
     for device in devices {
@@ -540,16 +714,22 @@ pub(crate) fn select_input_device_by_id(
     }
 
     if matched {
-        Err(format!(
+        Err(DeviceSelectError::Unsupported(format!(
             "selected input device `{id}` is present but unsupported: {}",
             first_error.unwrap_or_else(|| "no supported PCM input config".to_string())
-        ))
+        )))
     } else if let Some(device) = cpal_device_from_config_id(host, id) {
         select_input_config(&device, buffer_request)
             .map(|selection| (device, selection))
-            .map_err(|error| format!("configured input device `{id}` could not be opened: {error}"))
+            .map_err(|error| {
+                DeviceSelectError::Unsupported(format!(
+                    "configured input device `{id}` could not be opened: {error}"
+                ))
+            })
     } else {
-        Err(format!("selected input device `{id}` is unavailable"))
+        Err(DeviceSelectError::NotFound(format!(
+            "selected input device `{id}` is unavailable"
+        )))
     }
 }
 
@@ -557,10 +737,10 @@ pub(crate) fn select_output_device_by_id(
     host: &cpal::Host,
     id: &str,
     buffer_request: BufferRequest,
-) -> Result<(cpal::Device, ConfigSelection), String> {
-    let devices = host
-        .output_devices()
-        .map_err(|error| format!("failed to list output devices: {error}"))?;
+) -> Result<(cpal::Device, ConfigSelection), DeviceSelectError> {
+    let devices = host.output_devices().map_err(|error| {
+        DeviceSelectError::Backend(format!("failed to list output devices: {error}"))
+    })?;
     let mut matched = false;
     let mut first_error = None;
     for device in devices {
@@ -577,18 +757,22 @@ pub(crate) fn select_output_device_by_id(
     }
 
     if matched {
-        Err(format!(
+        Err(DeviceSelectError::Unsupported(format!(
             "selected output device `{id}` is present but unsupported: {}",
             first_error.unwrap_or_else(|| "no supported PCM output config".to_string())
-        ))
+        )))
     } else if let Some(device) = cpal_device_from_config_id(host, id) {
         select_output_config(&device, buffer_request)
             .map(|selection| (device, selection))
             .map_err(|error| {
-                format!("configured output device `{id}` could not be opened: {error}")
+                DeviceSelectError::Unsupported(format!(
+                    "configured output device `{id}` could not be opened: {error}"
+                ))
             })
     } else {
-        Err(format!("selected output device `{id}` is unavailable"))
+        Err(DeviceSelectError::NotFound(format!(
+            "selected output device `{id}` is unavailable"
+        )))
     }
 }
 
@@ -1014,7 +1198,10 @@ where
                         hint = "grant rtprio or build with audio-realtime-dbus on rtkit systems"
                     );
                 }
-                error_stats.record_stream_error(format!("stream error: {error}"));
+                error_stats.record_stream_error(
+                    AudioErrorKind::from_cpal(error.kind()),
+                    format!("stream error: {error}"),
+                );
             },
             None,
         )
@@ -1290,10 +1477,9 @@ fn record_live_playback_stream_error(
     shared_snapshot: &Arc<LivePlaybackSharedSnapshot>,
     error: cpal::Error,
 ) {
-    let is_xrun = error.kind() == ErrorKind::Xrun;
-    let is_realtime_denied = error.kind() == ErrorKind::RealtimeDenied;
+    let kind = AudioErrorKind::from_cpal(error.kind());
     let error = error.to_string();
-    if is_realtime_denied {
+    if kind == AudioErrorKind::RealtimeDenied {
         kvlog::warn!(
             "audio realtime priority denied",
             direction = "live playback",
@@ -1301,7 +1487,7 @@ fn record_live_playback_stream_error(
             hint = "grant rtprio or build with audio-realtime-dbus on rtkit systems"
         );
     }
-    shared_snapshot.record_backend_stream_error(error, is_xrun, Instant::now());
+    shared_snapshot.record_backend_stream_error(error, kind, Instant::now());
 }
 
 fn drain_live_playback_mixer_events(

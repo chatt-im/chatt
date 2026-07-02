@@ -737,6 +737,8 @@ impl LiveDecodeStreams {
             skipped_speech_gap_ms: samples_to_ms(self.stats.skipped_speech_gap_samples as usize),
             backend_xruns: 0,
             backend_stream_errors: 0,
+            backend_fatal_stream_errors: 0,
+            last_backend_error_kind: None,
             last_backend_error: None,
         }
     }

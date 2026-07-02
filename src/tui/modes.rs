@@ -719,6 +719,15 @@ impl RoomMode {
             extui::event::MouseEventKind::Down(extui::event::MouseButton::Left) if in_composer => {
                 self.enter_compose_insert_mode(app);
             }
+            extui::event::MouseEventKind::Down(extui::event::MouseButton::Left)
+                if crate::tui::form::rect_contains(
+                    app.chrome.lobby_bar.audio_reset,
+                    mouse.column,
+                    mouse.row,
+                ) =>
+            {
+                app.audio_manual_reset();
+            }
             extui::event::MouseEventKind::Down(extui::event::MouseButton::Left) if in_lobby_bar => {
                 self.set_focus(app, ChatPanelFocus::Lobby);
             }

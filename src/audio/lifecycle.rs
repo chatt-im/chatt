@@ -26,9 +26,10 @@ use crate::{
             AudioCallbackBufferObserver, ConfigSelection, audio_buffer_size_label,
             build_input_stream, build_live_output_stream, build_output_stream, select_input_config,
             select_input_device_by_id, select_output_config, select_output_device_by_id,
+            stable_device_id,
         },
         diagnostics::LivePlaybackWavRecorder,
-        errors::format_file_error,
+        errors::{AudioErrorKind, AudioStartError, format_file_error},
         playback::{
             LivePlaybackMixer, LivePlaybackMixerEvent, LivePlaybackSharedSnapshot, SpscSwapQueue,
             run_live_decoder_worker,
@@ -85,6 +86,10 @@ pub struct AudioDeviceInfo {
     pub backend: &'static str,
     /// Display name of the device the stream actually opened.
     pub device_name: String,
+    /// Normalized identity of the opened device (see
+    /// [`crate::audio::stable_input_device_id`]), for presence checks against
+    /// later device enumerations.
+    pub stable_id: String,
     /// True when no device was configured and the host default was used.
     pub is_default: bool,
     /// Channel count of the opened stream.
@@ -482,7 +487,10 @@ pub fn start_recording(config: RecordingConfig) -> Result<Recording, String> {
     })
 }
 
-pub fn start_live_capture<F>(config: LiveCaptureConfig, on_packet: F) -> Result<LiveCapture, String>
+pub fn start_live_capture<F>(
+    config: LiveCaptureConfig,
+    on_packet: F,
+) -> Result<LiveCapture, AudioStartError>
 where
     F: FnMut(LocalVoiceFrame) + Send + 'static,
 {
@@ -494,17 +502,23 @@ where
         } else {
             let device = host
                 .default_input_device()
-                .ok_or_else(|| "no default input device found".to_string())?;
-            let selection = select_input_config(&device, config.buffer_request)?;
+                .ok_or_else(|| AudioStartError::device_gone("no default input device found"))?;
+            let selection = select_input_config(&device, config.buffer_request)
+                .map_err(|error| AudioStartError::new(AudioErrorKind::ConfigInvalid, error))?;
             (device, selection)
         };
-        Ok::<_, String>((device, selection, backend))
+        Ok::<_, AudioStartError>((device, selection, backend))
     })?;
 
     let device_name = device.to_string();
-    let mut encoder = OpusVoiceEncoder::new(config.bitrate_bps)?;
-    encoder.set_configured_dred_10ms(config.dred.dred_duration_10ms())?;
-    encoder.apply_live_encoder_profile(LiveEncoderProfile::DRED_20)?;
+    let mut encoder =
+        OpusVoiceEncoder::new(config.bitrate_bps).map_err(AudioStartError::transient)?;
+    encoder
+        .set_configured_dred_10ms(config.dred.dred_duration_10ms())
+        .map_err(AudioStartError::transient)?;
+    encoder
+        .apply_live_encoder_profile(LiveEncoderProfile::DRED_20)
+        .map_err(AudioStartError::transient)?;
     let stats = AudioStats::new();
     let max_amplification_bits = Arc::new(AtomicU32::new(config.max_amplification.to_bits()));
     let encoder_loss_percent = Arc::new(AtomicU32::new(
@@ -544,11 +558,13 @@ where
             );
             let fallback = with_audio_backend_stderr_suppressed(|| {
                 select_input_config(&device, BufferRequest::Default)
-            })?;
-            let (stream, receiver, recycle_tx) = build(&fallback)?;
+            })
+            .map_err(AudioStartError::transient)?;
+            let (stream, receiver, recycle_tx) =
+                build(&fallback).map_err(AudioStartError::transient)?;
             (stream, receiver, recycle_tx, fallback, true)
         }
-        Err(error) => return Err(error),
+        Err(error) => return Err(AudioStartError::transient(error)),
     };
 
     kvlog::info!(
@@ -605,14 +621,21 @@ where
                 on_packet,
             );
         })
-        .map_err(|error| format!("failed to spawn chatt-audio-live-enc: {error}"))?;
+        .map_err(|error| {
+            AudioStartError::transient(format!("failed to spawn chatt-audio-live-enc: {error}"))
+        })?;
 
-    with_audio_backend_stderr_suppressed(|| stream.play())
-        .map_err(|error| format!("failed to start live input stream: {error}"))?;
+    with_audio_backend_stderr_suppressed(|| stream.play()).map_err(|error| {
+        AudioStartError::new(
+            AudioErrorKind::from_cpal(error.kind()),
+            format!("failed to start live input stream: {error}"),
+        )
+    })?;
 
     kvlog::info!("live capture started", device = device_name.as_str());
     let device_info = AudioDeviceInfo {
         backend,
+        stable_id: stable_device_id(&device_name),
         device_name,
         is_default: config.input_device_id.is_none(),
         channels: selection.stream_config.channels,
@@ -667,7 +690,7 @@ pub fn start_playback(path: &Path, buffer_request: BufferRequest) -> Result<Play
     })
 }
 
-pub fn start_live_playback(config: LivePlaybackConfig) -> Result<LivePlayback, String> {
+pub fn start_live_playback(config: LivePlaybackConfig) -> Result<LivePlayback, AudioStartError> {
     let (device, selection, backend) = with_audio_backend_stderr_suppressed(|| {
         let host = cpal::default_host();
         let backend = host.id().name();
@@ -676,11 +699,12 @@ pub fn start_live_playback(config: LivePlaybackConfig) -> Result<LivePlayback, S
         } else {
             let device = host
                 .default_output_device()
-                .ok_or_else(|| "no default output device found".to_string())?;
-            let selection = select_output_config(&device, config.buffer_request)?;
+                .ok_or_else(|| AudioStartError::device_gone("no default output device found"))?;
+            let selection = select_output_config(&device, config.buffer_request)
+                .map_err(|error| AudioStartError::new(AudioErrorKind::ConfigInvalid, error))?;
             (device, selection)
         };
-        Ok::<_, String>((device, selection, backend))
+        Ok::<_, AudioStartError>((device, selection, backend))
     })?;
 
     let device_name = device.to_string();
@@ -693,7 +717,8 @@ pub fn start_live_playback(config: LivePlaybackConfig) -> Result<LivePlayback, S
     let shared_snapshot = Arc::new(LivePlaybackSharedSnapshot::new(
         LivePlaybackMixer::with_live_capacity(config.tuning).snapshot(),
     ));
-    let playback_recording = LivePlaybackWavRecorder::from_env()?;
+    let playback_recording =
+        LivePlaybackWavRecorder::from_env().map_err(AudioStartError::transient)?;
     let playback_recording_handle = playback_recording
         .as_ref()
         .map(|recording| recording.handle());
@@ -733,11 +758,12 @@ pub fn start_live_playback(config: LivePlaybackConfig) -> Result<LivePlayback, S
             );
             let fallback = with_audio_backend_stderr_suppressed(|| {
                 select_output_config(&device, BufferRequest::Default)
-            })?;
-            let stream = build(&fallback)?;
+            })
+            .map_err(AudioStartError::transient)?;
+            let stream = build(&fallback).map_err(AudioStartError::transient)?;
             (stream, fallback, true)
         }
-        Err(error) => return Err(error),
+        Err(error) => return Err(AudioStartError::transient(error)),
     };
 
     kvlog::info!(
@@ -749,12 +775,17 @@ pub fn start_live_playback(config: LivePlaybackConfig) -> Result<LivePlayback, S
         buffer_note = selection.preview.buffer_note.as_str(),
         buffer_fallback = buffer_fallback
     );
-    with_audio_backend_stderr_suppressed(|| stream.play())
-        .map_err(|error| format!("failed to start live output stream: {error}"))?;
+    with_audio_backend_stderr_suppressed(|| stream.play()).map_err(|error| {
+        AudioStartError::new(
+            AudioErrorKind::from_cpal(error.kind()),
+            format!("failed to start live output stream: {error}"),
+        )
+    })?;
 
     kvlog::info!("live playback started", device = device_name.as_str());
     let device_info = AudioDeviceInfo {
         backend,
+        stable_id: stable_device_id(&device_name),
         device_name,
         is_default: config.output_device_id.is_none(),
         channels: selection.stream_config.channels,
@@ -784,7 +815,9 @@ pub fn start_live_playback(config: LivePlaybackConfig) -> Result<LivePlayback, S
                 worker_block_hint,
             )
         })
-        .map_err(|error| format!("failed to spawn chatt-audio-live-dec: {error}"))?;
+        .map_err(|error| {
+            AudioStartError::transient(format!("failed to spawn chatt-audio-live-dec: {error}"))
+        })?;
 
     Ok(LivePlayback {
         stream: Some(stream),

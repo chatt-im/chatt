@@ -4,13 +4,15 @@ use std::{
     path::Path,
     sync::{
         Arc, Mutex, OnceLock,
-        atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering},
     },
     time::{Duration, Instant},
 };
 
 use nnnoiseless::DenoiseState;
 use toml_spanner::Toml;
+
+use crate::audio::errors::AudioErrorKind;
 
 /// Capture noise-suppression engine.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Toml)]
@@ -575,8 +577,16 @@ impl AudioStats {
             .fetch_add(packet_len as u64, Ordering::Relaxed);
     }
 
-    pub(crate) fn record_stream_error(&self, error: String) {
+    pub(crate) fn record_stream_error(&self, kind: AudioErrorKind, error: String) {
         self.inner.stream_errors.fetch_add(1, Ordering::Relaxed);
+        if kind.triggers_recovery() {
+            self.inner
+                .fatal_stream_errors
+                .fetch_add(1, Ordering::Relaxed);
+            self.inner
+                .last_error_kind
+                .store(kind as u8, Ordering::Relaxed);
+        }
         self.set_error(error);
     }
 
@@ -606,6 +616,10 @@ pub struct StatsSnapshot {
     pub encoded_bytes: u64,
     pub dropped_chunks: u64,
     pub stream_errors: u64,
+    /// Stream errors whose [`AudioErrorKind`] warrants a stream rebuild.
+    /// Excludes xruns, refused realtime priority, and host-side reroutes.
+    pub fatal_stream_errors: u64,
+    pub last_error_kind: Option<AudioErrorKind>,
     pub rms: f32,
     pub peak: f32,
     pub vad_probability: f32,
@@ -668,6 +682,10 @@ pub struct LivePlaybackSnapshot {
     pub skipped_speech_gap_ms: u64,
     pub backend_xruns: u64,
     pub backend_stream_errors: u64,
+    /// Backend stream errors whose [`AudioErrorKind`] warrants a stream
+    /// rebuild. Excludes xruns, refused realtime priority, and reroutes.
+    pub backend_fatal_stream_errors: u64,
+    pub last_backend_error_kind: Option<AudioErrorKind>,
     pub last_backend_error: Option<String>,
 }
 
@@ -752,6 +770,8 @@ struct SharedStats {
     dropped_chunks: AtomicU64,
     dropped_capture_samples: AtomicU64,
     stream_errors: AtomicU64,
+    fatal_stream_errors: AtomicU64,
+    last_error_kind: AtomicU8,
     rms_bits: AtomicU32,
     peak_bits: AtomicU32,
     vad_bits: AtomicU32,
@@ -769,6 +789,10 @@ impl SharedStats {
             encoded_bytes: self.encoded_bytes.load(Ordering::Relaxed),
             dropped_chunks: self.dropped_chunks.load(Ordering::Relaxed),
             stream_errors: self.stream_errors.load(Ordering::Relaxed),
+            fatal_stream_errors: self.fatal_stream_errors.load(Ordering::Relaxed),
+            last_error_kind: AudioErrorKind::from_index(
+                self.last_error_kind.load(Ordering::Relaxed),
+            ),
             rms: f32::from_bits(self.rms_bits.load(Ordering::Relaxed)),
             peak: f32::from_bits(self.peak_bits.load(Ordering::Relaxed)),
             vad_probability: f32::from_bits(self.vad_bits.load(Ordering::Relaxed)),
@@ -1274,5 +1298,23 @@ mod tests {
         let gain = apply_gain_ramp(&mut samples, 1.0, 1.0, mute_gain_step(8));
         assert_eq!(gain, 1.0);
         assert!(samples.iter().all(|&s| s == 0.5), "{samples:?}");
+    }
+
+    #[test]
+    fn stream_error_counts_fatal_only_for_recovery_kinds() {
+        let stats = AudioStats::new();
+        stats.record_stream_error(AudioErrorKind::Xrun, "xrun".to_string());
+        stats.record_stream_error(AudioErrorKind::RealtimeDenied, "rt denied".to_string());
+        let snapshot = stats.snapshot();
+        assert_eq!(snapshot.stream_errors, 2);
+        assert_eq!(snapshot.fatal_stream_errors, 0);
+        assert_eq!(snapshot.last_error_kind, None);
+
+        stats.record_stream_error(AudioErrorKind::DeviceGone, "device unplugged".to_string());
+        let snapshot = stats.snapshot();
+        assert_eq!(snapshot.stream_errors, 3);
+        assert_eq!(snapshot.fatal_stream_errors, 1);
+        assert_eq!(snapshot.last_error_kind, Some(AudioErrorKind::DeviceGone));
+        assert_eq!(snapshot.last_error.as_deref(), Some("device unplugged"));
     }
 }
