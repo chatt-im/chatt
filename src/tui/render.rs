@@ -1010,14 +1010,13 @@ fn draw_chat(
                     draw_transfer_progress(row, base, progress, name, app, buf);
                 } else {
                     for seg in app.room.chat.line(line.message, line.line) {
-                        let start = seg.start as usize;
-                        let end = seg.end as usize;
-                        let text = &msg.body[start..end];
+                        let text = app.room.chat.segment_text(line.message, seg);
                         let mut style = base.patch(app.theme.text).patch(seg.style);
-                        if msg
-                            .links
-                            .iter()
-                            .any(|link| seg.start < link.end && link.start < seg.end)
+                        if !seg.synth
+                            && msg
+                                .links
+                                .iter()
+                                .any(|link| seg.start < link.end && link.start < seg.end)
                         {
                             style = style.patch(app.theme.syntax.namespace)
                                 | extui::vt::Modifier::UNDERLINED;

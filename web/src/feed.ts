@@ -79,6 +79,8 @@ class Reader {
   message(): WebMessage {
     const id = this.u53();
     const timestamp_ms = this.u53();
+    const message_id = this.u53();
+    const ref_code = this.string();
     const sender = this.string();
     let attachment: WebMessage["attachment"] = null;
     if (this.u8() === 1) {
@@ -107,6 +109,6 @@ class Reader {
         fragments.push({ kind: "code", lang, text, spans });
       }
     }
-    return { id, sender, timestamp_ms, attachment, file_id, fragments };
+    return { id, sender, timestamp_ms, attachment, file_id, message_id, ref_code, fragments };
   }
 }

@@ -4,6 +4,7 @@ pub mod crypto;
 pub mod frame;
 pub mod ids;
 pub mod media;
+pub mod msgref;
 pub mod video;
 
 pub const PROTOCOL_VERSION: u16 = 15;

@@ -67,6 +67,15 @@ pub struct WebMessage {
     /// `Some` for a file message. The feed upserts by this id together with
     /// `timestamp_ms`, because transfer ids are reused after a server restart.
     pub file_id: Option<u64>,
+    /// The chat message id, distinct from [`id`](Self::id), which collapses to
+    /// the transfer id for file messages. Paired with `timestamp_ms` it is the
+    /// durable key message references target; `0` when unknown (a bare inline
+    /// file with no announcement).
+    pub message_id: u64,
+    /// The precomputed `@@` reference code for this message (without the
+    /// prefix), so the browser can copy or quote a reference without a codec.
+    /// Empty when the message is not referenceable.
+    pub ref_code: String,
     /// The body pre-split into prose and highlighted code fragments.
     pub fragments: Vec<Fragment>,
 }
@@ -87,18 +96,32 @@ pub struct WebAttachment {
     pub height: Option<u32>,
 }
 
-impl From<&ChatMessage> for WebMessage {
-    fn from(message: &ChatMessage) -> Self {
+/// The `@@` code identifying `message`, precomputed for the browser.
+fn chat_ref_code(message: &ChatMessage) -> String {
+    rpc::msgref::MessageRef {
+        room_id: message.room_id,
+        timestamp_ms: message.timestamp_ms,
+        message_id: message.message_id,
+    }
+    .encode()
+}
+
+impl WebMessage {
+    /// Builds a message from a relayed chat message, resolving any `@@`
+    /// references in its body through `resolver`.
+    pub fn from_chat(message: &ChatMessage, resolver: web_wire::RefResolver) -> Self {
         let file_id = message.file_transfer_id.map(|transfer_id| transfer_id.0);
         WebMessage {
             // A file announcement keys on the transfer id so it shares an id with
             // the inline file message that later enriches it.
             id: file_id.unwrap_or(message.message_id.0),
             sender: message.sender_name.clone(),
-            fragments: split_fragments(&message.body),
+            fragments: split_fragments(&message.body, resolver),
             timestamp_ms: message.timestamp_ms,
             attachment: None,
             file_id,
+            message_id: message.message_id.0,
+            ref_code: chat_ref_code(message),
         }
     }
 }
@@ -132,7 +155,7 @@ impl WebMessage {
         WebMessage {
             id: metadata.transfer_id.0,
             sender: metadata.sender_name.clone(),
-            fragments: split_fragments(&body),
+            fragments: split_fragments(&body, &|_| None),
             timestamp_ms: metadata.timestamp_ms,
             attachment: Some(WebAttachment {
                 kind: kind.to_string(),
@@ -141,6 +164,9 @@ impl WebMessage {
                 height,
             }),
             file_id: Some(metadata.transfer_id.0),
+            // The announcement message carries the identity; merge_from keeps it.
+            message_id: 0,
+            ref_code: String::new(),
         }
     }
 }
@@ -163,7 +189,7 @@ impl WebMessage {
         WebMessage {
             id: file_id.unwrap_or(message.message_id.0),
             sender: message.sender_name.clone(),
-            fragments: split_fragments(&message.body),
+            fragments: split_fragments(&message.body, &|_| None),
             timestamp_ms: message.timestamp_ms,
             attachment: Some(WebAttachment {
                 kind: kind.to_string(),
@@ -172,6 +198,8 @@ impl WebMessage {
                 height,
             }),
             file_id,
+            message_id: message.message_id.0,
+            ref_code: chat_ref_code(message),
         }
     }
 }
@@ -180,11 +208,24 @@ impl WebMessage {
     /// Folds a later message for the same file into this one. Order-independent:
     /// the incoming fields win, but an attachment is never dropped, so the inline
     /// version's media survives whether it arrives before or after the
-    /// announcement placeholder.
+    /// announcement placeholder. The reference identity survives the same way:
+    /// only the announcement message knows it, the inline file does not.
     fn merge_from(&mut self, incoming: WebMessage) {
         let attachment = incoming.attachment.or_else(|| self.attachment.take());
+        let message_id = if incoming.message_id != 0 {
+            incoming.message_id
+        } else {
+            self.message_id
+        };
+        let ref_code = if incoming.ref_code.is_empty() {
+            std::mem::take(&mut self.ref_code)
+        } else {
+            incoming.ref_code.clone()
+        };
         *self = WebMessage {
             attachment,
+            message_id,
+            ref_code,
             ..incoming
         };
     }
@@ -197,10 +238,12 @@ impl WebMessage {
         WebMessage {
             id,
             sender: "Alice".to_string(),
-            fragments: split_fragments(body),
+            fragments: split_fragments(body, &|_| None),
             timestamp_ms: 100,
             attachment: None,
             file_id: None,
+            message_id: id,
+            ref_code: String::new(),
         }
     }
 }
@@ -1224,7 +1267,7 @@ mod tests {
             body: "sent file `wide.png` (2.0 KiB)".to_string(),
             file_transfer_id: Some(FileTransferId(7)),
         };
-        let message: WebMessage = (&announcement).into();
+        let message = WebMessage::from_chat(&announcement, &|_| None);
         // The file id keys the upsert, and the message id matches it so the
         // placeholder shares an id with the inline version that enriches it.
         assert_eq!(message.file_id, Some(7));
@@ -1252,6 +1295,24 @@ mod tests {
             inline.attachment.is_some(),
             "a late placeholder must not drop the attachment"
         );
+    }
+
+    #[test]
+    fn merge_preserves_reference_identity_from_either_side() {
+        // Inline file enriches the announcement: the announcement's message
+        // identity must survive, since the inline side has none.
+        let mut placeholder = file_placeholder(7, "sent file `wide.png` (2.0 KiB)");
+        let inline = WebMessage::from_file(&file_metadata(7), "wide.png", Some((4, 2)));
+        placeholder.merge_from(inline);
+        assert_eq!(placeholder.message_id, 99);
+        assert_eq!(placeholder.ref_code, "testref");
+
+        // Reverse order: the announcement arrives last and its identity wins.
+        let mut inline = WebMessage::from_file(&file_metadata(7), "wide.png", Some((4, 2)));
+        assert_eq!(inline.message_id, 0);
+        inline.merge_from(file_placeholder(7, "sent file `wide.png` (2.0 KiB)"));
+        assert_eq!(inline.message_id, 99);
+        assert_eq!(inline.ref_code, "testref");
     }
 
     #[test]
@@ -1307,10 +1368,12 @@ mod tests {
         WebMessage {
             id,
             sender: "Alice".to_string(),
-            fragments: split_fragments(body),
+            fragments: split_fragments(body, &|_| None),
             timestamp_ms: 5,
             attachment: None,
             file_id: Some(id),
+            message_id: 99,
+            ref_code: "testref".to_string(),
         }
     }
 

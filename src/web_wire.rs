@@ -45,12 +45,17 @@ pub enum Fragment {
     },
 }
 
+/// Resolves a decoded message reference to its pill label, or `None` when the
+/// target is unknown so the literal code renders instead. Labels bake into the
+/// fragment HTML at encode time; they refresh on the next room sync, not live.
+pub type RefResolver<'a> = &'a dyn Fn(rpc::msgref::MessageRef) -> Option<String>;
+
 /// Splits a message body into rendered prose and highlighted fenced code blocks.
 ///
 /// Prose between fences becomes [`Fragment::Text`] holding safe HTML generated
 /// from tokenizer events; a fenced block becomes a [`Fragment::Code`] whose text
 /// matches the fence content and whose spans are keyed to the block's language.
-pub fn split_fragments(body: &str) -> Vec<Fragment> {
+pub fn split_fragments(body: &str, resolver: RefResolver) -> Vec<Fragment> {
     let mut tokens = Vec::new();
     crate::markdown::tokenize(body, &mut tokens);
     let mut fragments = Vec::new();
@@ -58,7 +63,7 @@ pub fn split_fragments(body: &str) -> Vec<Fragment> {
 
     for (i, token) in tokens.iter().enumerate() {
         if let TokenKind::CodeBlock { lang, content } = &token.kind {
-            flush_html(&mut fragments, body, &tokens[prose_start..i]);
+            flush_html(&mut fragments, body, &tokens[prose_start..i], resolver);
             let lang = lang
                 .as_ref()
                 .map_or("", |range| &body[range.start as usize..range.end as usize])
@@ -73,21 +78,26 @@ pub fn split_fragments(body: &str) -> Vec<Fragment> {
             prose_start = i + 1;
         }
     }
-    flush_html(&mut fragments, body, &tokens[prose_start..]);
+    flush_html(&mut fragments, body, &tokens[prose_start..], resolver);
     fragments
 }
 
-fn flush_html(fragments: &mut Vec<Fragment>, source: &str, tokens: &[Token]) {
+fn flush_html(
+    fragments: &mut Vec<Fragment>,
+    source: &str,
+    tokens: &[Token],
+    resolver: RefResolver,
+) {
     if tokens.is_empty() {
         return;
     }
-    let html = render_html(source, tokens);
+    let html = render_html(source, tokens, resolver);
     if !html.trim().is_empty() {
         fragments.push(Fragment::Text(html));
     }
 }
 
-fn render_html(source: &str, tokens: &[Token]) -> String {
+fn render_html(source: &str, tokens: &[Token], resolver: RefResolver) -> String {
     let mut html = String::new();
     let mut lists = Vec::new();
 
@@ -130,12 +140,45 @@ fn render_html(source: &str, tokens: &[Token]) -> String {
                 escape_html(url, &mut html);
                 html.push_str("</a>");
             }
+            TokenKind::MessageRef => render_ref(slice(source, &token.range), resolver, &mut html),
             TokenKind::HardBreak => html.push_str("<br>"),
             TokenKind::CodeBlock { .. } => {}
         }
     }
 
     html
+}
+
+/// Renders a `@@code` reference: a pill anchor labeled with the target message
+/// when it resolves, the literal code (still clickable) when the target is
+/// merely absent, and inert dead text when the code does not decode. The
+/// decoded key rides along as data attributes so the browser needs no codec.
+fn render_ref(code: &str, resolver: RefResolver, html: &mut String) {
+    use std::fmt::Write;
+
+    let stripped = &code[rpc::msgref::REF_PREFIX.len()..];
+    let Some(target) = rpc::msgref::MessageRef::decode(stripped) else {
+        html.push_str("<span class=\"msg-ref-dead\">");
+        escape_html(code, html);
+        html.push_str("</span>");
+        return;
+    };
+    let label = resolver(target);
+    let class = if label.is_some() {
+        "msg-ref"
+    } else {
+        "msg-ref msg-ref-unresolved"
+    };
+    let _ = write!(
+        html,
+        "<a href=\"#\" class=\"{class}\" data-ts=\"{}\" data-mid=\"{}\" data-room=\"{}\">",
+        target.timestamp_ms, target.message_id.0, target.room_id.0,
+    );
+    match &label {
+        Some(label) => escape_html(label, html),
+        None => escape_html(code, html),
+    }
+    html.push_str("</a>");
 }
 
 fn slice<'a>(source: &'a str, range: &std::ops::Range<u32>) -> &'a str {
@@ -189,6 +232,8 @@ pub fn encode_single(message: &WebMessage) -> Vec<u8> {
 fn encode_message(buf: &mut Vec<u8>, message: &WebMessage) {
     put_u64(buf, message.id);
     put_u64(buf, message.timestamp_ms);
+    put_u64(buf, message.message_id);
+    put_str(buf, &message.ref_code);
     put_str(buf, &message.sender);
     match &message.attachment {
         None => buf.push(0),
@@ -344,6 +389,8 @@ impl Reader<'_> {
     fn message(&mut self) -> DecodedMessage {
         let _id = self.u64();
         let _timestamp_ms = self.u64();
+        let _message_id = self.u64();
+        let _ref_code = self.string();
         let sender = self.string();
         let attachment_name = if self.u8() == 1 {
             let name = self.string();
@@ -383,7 +430,7 @@ mod tests {
 
     #[test]
     fn plain_body_is_one_text_fragment() {
-        let fragments = split_fragments("hello **world**");
+        let fragments = split_fragments("hello **world**", &|_| None);
         assert_eq!(
             fragments,
             vec![Fragment::Text(
@@ -395,7 +442,7 @@ mod tests {
     #[test]
     fn fence_becomes_code_fragment() {
         let body = "before\n```rust\nfn main() {}\n```\nafter";
-        let fragments = split_fragments(body);
+        let fragments = split_fragments(body, &|_| None);
         assert_eq!(fragments.len(), 3);
         assert_eq!(fragments[0], Fragment::Text("<p>before</p>".to_string()));
         let Fragment::Code { lang, text, spans } = &fragments[1] else {
@@ -409,7 +456,7 @@ mod tests {
 
     #[test]
     fn unclosed_fence_is_rendered_as_prose() {
-        let fragments = split_fragments("```\nline one\nline two");
+        let fragments = split_fragments("```\nline one\nline two", &|_| None);
         assert_eq!(fragments.len(), 1);
         assert_eq!(
             fragments[0],
@@ -419,13 +466,47 @@ mod tests {
 
     #[test]
     fn empty_language_tag_still_splits() {
-        let fragments = split_fragments("```\ncode\n```");
+        let fragments = split_fragments("```\ncode\n```", &|_| None);
         assert_eq!(fragments.len(), 1);
         let Fragment::Code { lang, text, .. } = &fragments[0] else {
             panic!("expected code fragment");
         };
         assert!(lang.is_empty());
         assert_eq!(text, "code");
+    }
+
+    #[test]
+    fn message_ref_renders_by_resolution_state() {
+        let target = rpc::msgref::MessageRef {
+            room_id: rpc::ids::RoomId(1),
+            timestamp_ms: 1_000_000,
+            message_id: rpc::ids::MessageId(7),
+        };
+        let code = target.encode();
+
+        let body = format!("see @@{code}");
+        let resolved = split_fragments(&body, &|_| Some("↩ alice: <hi>".to_string()));
+        let Fragment::Text(html) = &resolved[0] else {
+            panic!("expected text fragment");
+        };
+        assert!(html.contains("class=\"msg-ref\""), "html: {html}");
+        assert!(html.contains("data-ts=\"1000000\""), "html: {html}");
+        assert!(html.contains("data-mid=\"7\""), "html: {html}");
+        assert!(html.contains("↩ alice: &lt;hi&gt;"), "html: {html}");
+
+        let unresolved = split_fragments(&body, &|_| None);
+        let Fragment::Text(html) = &unresolved[0] else {
+            panic!("expected text fragment");
+        };
+        assert!(html.contains("msg-ref-unresolved"), "html: {html}");
+        assert!(html.contains(&format!("@@{code}")), "html: {html}");
+
+        let dead = split_fragments("see @@000000000000", &|_| None);
+        let Fragment::Text(html) = &dead[0] else {
+            panic!("expected text fragment");
+        };
+        assert!(html.contains("msg-ref-dead"), "html: {html}");
+        assert!(!html.contains("<a"), "html: {html}");
     }
 
     #[test]

@@ -30,6 +30,13 @@ export interface WebMessage {
   // file_id and timestamp_ms matching one already held replaces it in place;
   // transfer ids alone are reused after server restarts.
   file_id: number | null;
+  // The chat message id (distinct from `id`, which collapses to the transfer id
+  // for file messages). With timestamp_ms it is the key `@@` references target.
+  // Zero when unknown.
+  message_id: number;
+  // Precomputed `@@` reference code (without the prefix) for copying/quoting a
+  // reference to this message. Empty when the message is not referenceable.
+  ref_code: string;
   // Live receive progress for an in-flight file, set from `file_progress`
   // envelopes while the host client pulls the file off the relay. Cleared when
   // the enriched attachment replaces the placeholder.
