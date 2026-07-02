@@ -30,11 +30,11 @@ use rpc::{
     control::{
         ChatMessage, ClientControl, ERROR_AUTH_REJECTED, ERROR_PAIRING_CODE_MISMATCH,
         ERROR_PAIRING_INVALID_REQUEST, ERROR_PAIRING_NOT_ACTIVE, ERROR_PASSWORD_MISMATCH,
-        ERROR_PASSWORD_REQUIRED, ERROR_PUBLIC_DISABLED, ERROR_TOKEN_STALE_EPOCH, FileMetadata,
-        MAX_FILE_CHUNK_BYTES, MAX_FILE_NAME_BYTES, P2pCandidate, P2pCandidateKind, P2pKey,
-        P2pNatKind, P2pPeerInfo, P2pRole, ParticipantInfo, ParticipantVoiceStatus, RoomInfo,
-        ServerControl, decode_server_control, decode_server_hello, encode_client_control,
-        encode_client_hello,
+        ERROR_PASSWORD_REQUIRED, ERROR_PUBLIC_DISABLED, ERROR_TOKEN_STALE_EPOCH,
+        FileContentEncoding, FileMetadata, MAX_FILE_CHUNK_BYTES, MAX_FILE_NAME_BYTES, P2pCandidate,
+        P2pCandidateKind, P2pKey, P2pNatKind, P2pPeerInfo, P2pRole, ParticipantInfo,
+        ParticipantVoiceStatus, RoomInfo, ServerControl, decode_server_control,
+        decode_server_hello, encode_client_control, encode_client_hello, max_file_wire_bytes,
     },
     crypto::{
         AntiReplay, CHANNEL_CONTROL, ControlTransport, HandshakeMode, KEY_LEN, KeyMaterial,
@@ -52,6 +52,9 @@ use crate::audio::{
     VoicePayload as AudioVoicePayload,
 };
 use crate::config::CandidatePrivacy;
+use crate::file_compression::{
+    self, COMPRESSION_PROBE_BYTES, FastCompressionDecision, ZSTD_WINDOW_LOG,
+};
 use crate::mdns::{MdnsSystem, generate_mdns_name};
 
 const TCP: Token = Token(0);
@@ -97,6 +100,12 @@ const AUDIO_POP_PACKET_FLAG_SILENCE_RESUME: u8 = 0x04;
 const AUDIO_POP_PACKET_FLAG_MUTE: u8 = 0x08;
 const MAX_QUEUED_FILE_BYTES: usize = 1024 * 1024;
 const MAX_FILE_CHUNKS_PER_TICK: usize = 64;
+const MAX_FILE_SOURCE_BYTES_PER_TICK: usize = 1024 * 1024;
+const MAX_COMPRESSED_UPLOAD_SOURCE_AHEAD_BYTES: u64 = 4 * 1024 * 1024;
+const MAX_FILE_WIRE_BYTES_PER_TICK: usize = 1024 * 1024;
+const MAX_FILE_DECODED_BYTES_PER_TICK: usize = 1024 * 1024;
+const MAX_SERVER_CONTROLS_PER_FILE_PUMP: usize = 8;
+const MAX_BUFFERED_SERVER_BYTES: usize = 2 * 1024 * 1024;
 /// Capacity of the reusable TCP read scratch buffer. Sized to swallow a full
 /// file chunk frame in one `read` on a fast link.
 const TCP_READ_BUFFER_BYTES: usize = 256 * 1024;
@@ -114,6 +123,15 @@ const RECENT_VOICE_SEQUENCE_WORD_BITS: usize = u64::BITS as usize;
 const RECENT_VOICE_SEQUENCE_WORDS: usize =
     MAX_RECENT_VOICE_SEQUENCES / RECENT_VOICE_SEQUENCE_WORD_BITS;
 const _: () = assert!(MAX_RECENT_VOICE_SEQUENCES % RECENT_VOICE_SEQUENCE_WORD_BITS == 0);
+
+#[cfg(test)]
+static LAST_RECEIVED_FILE_WIRE_BYTES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+#[cfg(test)]
+pub(super) fn last_received_file_wire_bytes() -> u64 {
+    LAST_RECEIVED_FILE_WIRE_BYTES.load(std::sync::atomic::Ordering::Relaxed)
+}
 
 #[derive(Clone, Debug)]
 pub struct ClientConfig {
@@ -825,6 +843,9 @@ fn run_worker_inner(
                 _ => {}
             }
         }
+        if let Err(error) = worker.process_server_controls() {
+            return SessionEnd::Disconnected(error);
+        }
 
         let command_drain =
             match drain_commands_with(commands, MAX_COMMANDS_PER_ITERATION, |command| {
@@ -869,25 +890,36 @@ fn run_worker_inner(
         let bug_ready = write_ok && !worker.outgoing_bug_reports.is_empty();
         let upload_delay = if write_ok {
             worker.outgoing_uploads.front().map(|front| {
-                let remaining = front.size.saturating_sub(front.offset);
-                if !front.started || remaining == 0 {
-                    // Start and complete controls carry no bytes, so they are not
-                    // throttled.
+                let pending = front.body.pending().len();
+                if !front.started
+                    || (!front.source_finished
+                        && pending < MAX_QUEUED_FILE_BYTES
+                        && upload_source_read_capacity(front, &worker.upload_throttle) > 0)
+                    || upload_should_flush_source_read_ahead(front, &worker.upload_throttle)
+                    || (front.source_finished && !front.encoder_finished)
+                    || (front.encoder_finished && pending == 0)
+                {
                     Duration::ZERO
                 } else {
                     worker
                         .upload_throttle
-                        .delay_until(remaining.min(MAX_FILE_CHUNK_BYTES as u64))
+                        .delay_until(pending.min(MAX_FILE_CHUNK_BYTES) as u64)
                 }
             })
         } else {
             None
         };
-        poll_timeout = if command_drain == CommandDrainOutcome::HitLimit || bug_ready {
-            Duration::ZERO
-        } else {
-            POLL_TIMEOUT
-        };
+        let incoming_ready = !worker.read_buf.is_empty()
+            || worker.incoming_files.values().any(|incoming| {
+                incoming.pending_wire_offset < incoming.pending_wire.len()
+                    || incoming.complete_received
+            });
+        poll_timeout =
+            if command_drain == CommandDrainOutcome::HitLimit || bug_ready || incoming_ready {
+                Duration::ZERO
+            } else {
+                POLL_TIMEOUT
+            };
         if let Some(delay) = upload_delay {
             poll_timeout = poll_timeout.min(delay);
         }
@@ -1579,6 +1611,10 @@ impl UploadThrottle {
         }
     }
 
+    fn is_limited(&self) -> bool {
+        self.rate != 0
+    }
+
     /// Deducts `bytes` after a chunk is queued.
     fn consume(&mut self, bytes: u64) {
         if self.rate == 0 {
@@ -1606,7 +1642,17 @@ struct OutgoingUpload {
     name: String,
     size: u64,
     file: File,
-    offset: u64,
+    source_offset: u64,
+    /// Raw source bytes fed to the compressor since its encoded output was last
+    /// fully queued. Used only for throttled compressed uploads to prevent
+    /// scanning an entire highly-compressible file ahead of the network pace.
+    source_read_ahead: u64,
+    wire_offset: u64,
+    source_prefix: Vec<u8>,
+    source_prefix_offset: usize,
+    body: UploadBody,
+    source_finished: bool,
+    encoder_finished: bool,
     started: bool,
     next_status_at: u64,
     /// A copy of the upload written into the local receive directory so the
@@ -1615,6 +1661,108 @@ struct OutgoingUpload {
     local_copy: Option<(PathBuf, File)>,
     /// Intrinsic image size, parsed from the first chunk as it streams.
     dimensions: Option<(u32, u32)>,
+    image_prefix: Vec<u8>,
+}
+
+#[derive(Default)]
+struct PendingWire {
+    bytes: Vec<u8>,
+    offset: usize,
+}
+
+impl PendingWire {
+    fn len(&self) -> usize {
+        self.bytes.len().saturating_sub(self.offset)
+    }
+
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    fn take(&mut self, limit: usize) -> Vec<u8> {
+        let end = self.offset.saturating_add(limit).min(self.bytes.len());
+        let data = self.bytes[self.offset..end].to_vec();
+        self.offset = end;
+        if self.offset == self.bytes.len() {
+            self.bytes.clear();
+            self.offset = 0;
+        }
+        data
+    }
+
+    fn compact(&mut self) {
+        if self.offset == 0 {
+            return;
+        }
+        self.bytes.copy_within(self.offset.., 0);
+        self.bytes.truncate(self.bytes.len() - self.offset);
+        self.offset = 0;
+    }
+}
+
+impl Write for PendingWire {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        if self.offset > 0
+            && (self.offset == self.bytes.len() || self.offset >= MAX_FILE_CHUNK_BYTES)
+        {
+            self.compact();
+        }
+        self.bytes.extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+enum UploadBody {
+    Identity(PendingWire),
+    Zstd(zstd::stream::write::Encoder<'static, PendingWire>),
+}
+
+impl UploadBody {
+    fn encoding(&self) -> FileContentEncoding {
+        match self {
+            Self::Identity(_) => FileContentEncoding::Identity,
+            Self::Zstd(_) => FileContentEncoding::Zstd,
+        }
+    }
+
+    fn pending(&self) -> &PendingWire {
+        match self {
+            Self::Identity(pending) => pending,
+            Self::Zstd(encoder) => encoder.get_ref(),
+        }
+    }
+
+    fn pending_mut(&mut self) -> &mut PendingWire {
+        match self {
+            Self::Identity(pending) => pending,
+            Self::Zstd(encoder) => encoder.get_mut(),
+        }
+    }
+
+    fn feed(&mut self, raw: &[u8]) -> io::Result<()> {
+        match self {
+            Self::Identity(pending) => pending.write_all(raw),
+            Self::Zstd(encoder) => encoder.write_all(raw),
+        }
+    }
+
+    fn finish(&mut self) -> io::Result<()> {
+        match self {
+            Self::Identity(_) => Ok(()),
+            Self::Zstd(encoder) => encoder.do_finish(),
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        match self {
+            Self::Identity(pending) => pending.flush(),
+            Self::Zstd(encoder) => encoder.flush(),
+        }
+    }
 }
 
 struct PendingLocalFile {
@@ -1636,11 +1784,195 @@ struct OutgoingBugReport {
 struct IncomingFile {
     metadata: FileMetadata,
     path: PathBuf,
-    file: File,
-    received: u64,
+    body: IncomingBody,
+    pending_wire: Vec<u8>,
+    pending_wire_offset: usize,
+    wire_received: u64,
+    complete_received: bool,
+    decoder_finished: bool,
     next_status_at: u64,
-    /// Intrinsic image size, parsed from the first chunk as it streams.
-    dimensions: Option<(u32, u32)>,
+}
+
+struct ReceiveSink {
+    file: File,
+    expected: u64,
+    decoded: u64,
+    work_budget: usize,
+    capture_image_prefix: bool,
+    image_prefix: Vec<u8>,
+}
+
+impl ReceiveSink {
+    fn new(file: File, expected: u64, capture_image_prefix: bool) -> Self {
+        Self {
+            file,
+            expected,
+            decoded: 0,
+            work_budget: 0,
+            capture_image_prefix,
+            image_prefix: Vec::new(),
+        }
+    }
+
+    fn set_work_budget(&mut self, budget: usize) {
+        self.work_budget = budget;
+    }
+}
+
+impl Write for ReceiveSink {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        if self.decoded.saturating_add(buf.len() as u64) > self.expected {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "decoded file exceeds declared size",
+            ));
+        }
+        if self.work_budget == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "file decode work budget exhausted",
+            ));
+        }
+        let write_len = buf.len().min(self.work_budget);
+        let written = self.file.write(&buf[..write_len])?;
+        if self.capture_image_prefix && self.image_prefix.len() < MAX_FILE_CHUNK_BYTES {
+            let capture = written.min(MAX_FILE_CHUNK_BYTES - self.image_prefix.len());
+            self.image_prefix.extend_from_slice(&buf[..capture]);
+        }
+        self.decoded += written as u64;
+        self.work_budget -= written;
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.file.flush()
+    }
+}
+
+enum IncomingBody {
+    Identity(ReceiveSink),
+    Zstd(zstd::stream::zio::Writer<ReceiveSink, zstd::stream::raw::Decoder<'static>>),
+}
+
+impl IncomingBody {
+    fn sink(&self) -> &ReceiveSink {
+        match self {
+            Self::Identity(sink) => sink,
+            Self::Zstd(decoder) => decoder.writer(),
+        }
+    }
+
+    fn sink_mut(&mut self) -> &mut ReceiveSink {
+        match self {
+            Self::Identity(sink) => sink,
+            Self::Zstd(decoder) => decoder.writer_mut(),
+        }
+    }
+}
+
+impl IncomingFile {
+    fn pump(&mut self, wire_budget: &mut usize, decoded_budget: &mut usize) -> io::Result<()> {
+        self.body.sink_mut().set_work_budget(*decoded_budget);
+
+        loop {
+            if self.pending_wire_offset < self.pending_wire.len() && *wire_budget > 0 {
+                let input_end = self
+                    .pending_wire_offset
+                    .saturating_add(*wire_budget)
+                    .min(self.pending_wire.len());
+                let input = &self.pending_wire[self.pending_wire_offset..input_end];
+                let consumed = match &mut self.body {
+                    IncomingBody::Identity(sink) => match sink.write(input) {
+                        Ok(consumed) => consumed,
+                        Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
+                        Err(error) => return Err(error),
+                    },
+                    IncomingBody::Zstd(decoder) => match decoder.write(input) {
+                        Ok(consumed) => consumed,
+                        Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
+                        Err(error) => return Err(error),
+                    },
+                };
+                if consumed == 0 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::WriteZero,
+                        "file decoder accepted no input",
+                    ));
+                }
+                self.pending_wire_offset += consumed;
+                *wire_budget -= consumed;
+                if self.body.sink().work_budget == 0 {
+                    break;
+                }
+                continue;
+            }
+
+            if self.pending_wire_offset == self.pending_wire.len() && self.pending_wire_offset != 0
+            {
+                self.pending_wire.clear();
+                self.pending_wire_offset = 0;
+            }
+            if !self.pending_wire.is_empty() {
+                break;
+            }
+            if !self.complete_received || self.decoder_finished {
+                break;
+            }
+            match &mut self.body {
+                IncomingBody::Identity(_) => self.decoder_finished = true,
+                IncomingBody::Zstd(decoder) => match decoder.finish() {
+                    Ok(()) => self.decoder_finished = true,
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
+                    Err(error) => return Err(error),
+                },
+            }
+            break;
+        }
+
+        *decoded_budget = self.body.sink().work_budget;
+        if self.decoder_finished && self.body.sink().decoded != self.metadata.size {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "decoded size {} does not match declared size {}",
+                    self.body.sink().decoded,
+                    self.metadata.size
+                ),
+            ));
+        }
+        Ok(())
+    }
+
+    fn ready_to_finalize(&self) -> bool {
+        self.complete_received
+            && self.decoder_finished
+            && self.pending_wire_offset == self.pending_wire.len()
+    }
+
+    fn finalize(
+        self,
+    ) -> Result<(FileMetadata, PathBuf, Option<(u32, u32)>, u64), (PathBuf, String, io::Error)>
+    {
+        let Self {
+            metadata,
+            path,
+            body,
+            wire_received,
+            ..
+        } = self;
+        let mut sink = match body {
+            IncomingBody::Identity(sink) => sink,
+            IncomingBody::Zstd(decoder) => decoder.into_inner().0,
+        };
+        if let Err(error) = sink.flush() {
+            return Err((path, metadata.file_name, error));
+        }
+        let dimensions = sink
+            .capture_image_prefix
+            .then(|| crate::web_server::image_dimensions(&sink.image_prefix))
+            .flatten();
+        Ok((metadata, path, dimensions, wire_received))
+    }
 }
 
 struct PeerConnection {
@@ -1797,7 +2129,7 @@ impl WorkerState {
     }
 
     fn read_tcp(&mut self) -> Result<(), String> {
-        loop {
+        while self.read_buf.len() < MAX_BUFFERED_SERVER_BYTES {
             match self.tcp.read(&mut self.read_scratch) {
                 Ok(0) => {
                     kvlog::info!("tcp server closed connection");
@@ -1820,11 +2152,27 @@ impl WorkerState {
                 }
             }
         }
+        Ok(())
+    }
 
+    fn process_server_controls(&mut self) -> Result<(), String> {
+        let mut wire_budget = MAX_FILE_WIRE_BYTES_PER_TICK;
+        let mut decoded_budget = MAX_FILE_DECODED_BYTES_PER_TICK;
+        let mut controls_since_file_pump = 0;
         loop {
+            if controls_since_file_pump >= MAX_SERVER_CONTROLS_PER_FILE_PUMP {
+                self.pump_incoming_files(&mut wire_budget, &mut decoded_budget);
+                controls_since_file_pump = 0;
+                if wire_budget == 0 || decoded_budget == 0 {
+                    break;
+                }
+            }
             let frame = match frame::pop_frame(&mut self.read_buf) {
                 Ok(Some(frame)) => frame,
-                Ok(None) => break,
+                Ok(None) => {
+                    self.pump_incoming_files(&mut wire_budget, &mut decoded_budget);
+                    break;
+                }
                 Err(error) => return Err(format!("invalid server frame: {error}")),
             };
             kvlog::debug!("server frame received", frame_size = frame.len());
@@ -1835,6 +2183,7 @@ impl WorkerState {
             kvlog::debug!("server control decrypted", payload_size = plaintext.len());
             let control = decode_server_control(&plaintext)?;
             self.handle_server_control(control);
+            controls_since_file_pump += 1;
         }
         Ok(())
     }
@@ -2300,8 +2649,71 @@ impl WorkerState {
             ));
         }
         let name = upload_display_name(name_override, &path)?;
-        let file = open_upload_source(&path, delete_after_open)
+        let mut file = open_upload_source(&path, delete_after_open)
             .map_err(|error| format!("failed to open {}: {error}", path.display()))?;
+        let mut source_prefix = Vec::new();
+        let mut _probe_encoded_len = None;
+        let (body, _decision) = match file_compression::fast_compression_decision(&name, size) {
+            FastCompressionDecision::BelowMinimum => (
+                UploadBody::Identity(PendingWire::default()),
+                "below_minimum",
+            ),
+            FastCompressionDecision::ExcludedExtension => (
+                UploadBody::Identity(PendingWire::default()),
+                "excluded_extension",
+            ),
+            FastCompressionDecision::Probe => {
+                let probe_len = usize::try_from(size.min(COMPRESSION_PROBE_BYTES as u64))
+                    .expect("compression probe length fits usize");
+                source_prefix.resize(probe_len, 0);
+                file.read_exact(&mut source_prefix).map_err(|error| {
+                    format!(
+                        "failed to read compression probe for {}: {error}",
+                        path.display()
+                    )
+                })?;
+                match file_compression::compressed_probe_len(&source_prefix) {
+                    Ok(encoded_len) => {
+                        _probe_encoded_len = Some(encoded_len);
+                        if file_compression::probe_has_minimum_savings(probe_len, encoded_len) {
+                            match file_compression::new_encoder(PendingWire::default(), size) {
+                                Ok(encoder) => (UploadBody::Zstd(encoder), "probe_accepted"),
+                                Err(error) => {
+                                    kvlog::warn!(
+                                        "file compression encoder setup failed",
+                                        file_name = name.as_str(),
+                                        error = %error
+                                    );
+                                    (UploadBody::Identity(PendingWire::default()), "probe_error")
+                                }
+                            }
+                        } else {
+                            (
+                                UploadBody::Identity(PendingWire::default()),
+                                "probe_rejected",
+                            )
+                        }
+                    }
+                    Err(error) => {
+                        kvlog::warn!(
+                            "file compression probe failed",
+                            file_name = name.as_str(),
+                            error = %error
+                        );
+                        (UploadBody::Identity(PendingWire::default()), "probe_error")
+                    }
+                }
+            }
+        };
+        kvlog::debug!(
+            "file compression decision",
+            file_name = name.as_str(),
+            original_size = size,
+            decision = _decision,
+            probe_raw_bytes = source_prefix.len(),
+            probe_encoded_bytes = _probe_encoded_len.unwrap_or(0),
+            encoding = file_content_encoding_name(body.encoding())
+        );
         let transfer_id = FileTransferId(self.next_file_transfer);
         self.next_file_transfer = self.next_file_transfer.wrapping_add(1).max(1);
         Ok(OutgoingUpload {
@@ -2311,20 +2723,29 @@ impl WorkerState {
             name,
             size,
             file,
-            offset: 0,
+            source_offset: 0,
+            source_read_ahead: 0,
+            wire_offset: 0,
+            source_prefix,
+            source_prefix_offset: 0,
+            body,
+            source_finished: size == 0,
+            encoder_finished: false,
             started: false,
             next_status_at: FILE_PROGRESS_STEP_BYTES.min(size),
             local_copy: None,
             dimensions: None,
+            image_prefix: Vec::new(),
         })
     }
 
     fn poll_uploads(&mut self) -> Result<(), String> {
+        let mut source_budget = MAX_FILE_SOURCE_BYTES_PER_TICK;
         for _ in 0..MAX_FILE_CHUNKS_PER_TICK {
             if self.write_buf.len() > MAX_QUEUED_FILE_BYTES {
                 break;
             }
-            if !self.poll_one_upload()? {
+            if !self.poll_one_upload(&mut source_budget)? {
                 break;
             }
         }
@@ -2387,7 +2808,7 @@ impl WorkerState {
         Ok(true)
     }
 
-    fn poll_one_upload(&mut self) -> Result<bool, String> {
+    fn poll_one_upload(&mut self, source_budget: &mut usize) -> Result<bool, String> {
         let Some(mut upload) = self.outgoing_uploads.pop_front() else {
             return Ok(false);
         };
@@ -2398,6 +2819,7 @@ impl WorkerState {
                 transfer_id: upload.transfer_id,
                 name: upload.name.clone(),
                 size: upload.size,
+                encoding: upload.body.encoding(),
             })?;
             upload.started = true;
             if let Some(receive_dir) = self.config.file_receive_dir.clone() {
@@ -2420,57 +2842,92 @@ impl WorkerState {
             return Ok(true);
         }
 
-        if upload.offset < upload.size {
-            let budget = self.upload_throttle.budget();
-            if budget == 0 {
-                // Bucket empty: stop the pump and let the poll loop park on the
-                // refill delay rather than busy-spin.
-                self.outgoing_uploads.push_front(upload);
-                return Ok(false);
-            }
-            let remaining = (upload.size - upload.offset)
-                .min(MAX_FILE_CHUNK_BYTES as u64)
-                .min(budget);
-            let mut data = vec![0; remaining as usize];
-            let read = upload
-                .file
-                .read(&mut data)
-                .map_err(|error| format!("failed to read {}: {error}", upload.name))?;
-            if read == 0 {
-                self.queue_control(ClientControl::UploadFileCancel {
-                    transfer_id: upload.transfer_id,
-                    reason: "local file ended early".to_string(),
-                })?;
-                if let Some(meta) = upload.server_metadata.as_ref() {
-                    let _ = self.events.send(NetworkEvent::TransferCanceled {
-                        transfer_id: meta.transfer_id,
-                    });
-                }
-                return Err(format!("file ended early while uploading {}", upload.name));
-            }
-            data.truncate(read);
-            if upload.offset == 0 && is_image_name(&upload.name) {
-                upload.dimensions = crate::web_server::image_dimensions(&data);
-            }
-            if let Some((path, file)) = upload.local_copy.as_mut()
-                && let Err(error) = file.write_all(&data)
-            {
-                let _ = self.events.send(NetworkEvent::Error(format!(
-                    "failed to write local copy {}: {error}",
-                    path.display()
-                )));
-                let _ = fs::remove_file(&*path);
-                upload.local_copy = None;
-            }
-            let offset = upload.offset;
+        let throttle_budget = self.upload_throttle.budget();
+        if !upload.body.pending().is_empty() && throttle_budget > 0 {
+            let send_len = upload
+                .body
+                .pending()
+                .len()
+                .min(MAX_FILE_CHUNK_BYTES)
+                .min(throttle_budget as usize);
+            let data = upload.body.pending_mut().take(send_len);
+            let offset = upload.wire_offset;
             self.queue_control(ClientControl::UploadFileChunk {
                 transfer_id: upload.transfer_id,
                 offset,
                 data,
             })?;
-            self.upload_throttle.consume(read as u64);
-            upload.offset += read as u64;
-            if upload.offset >= upload.next_status_at || upload.offset == upload.size {
+            self.upload_throttle.consume(send_len as u64);
+            upload.wire_offset += send_len as u64;
+            if upload.body.pending().is_empty() {
+                upload.source_read_ahead = 0;
+            }
+            self.outgoing_uploads.push_front(upload);
+            return Ok(true);
+        }
+
+        if upload_should_flush_source_read_ahead(&upload, &self.upload_throttle) {
+            if let Err(error) = upload.body.flush() {
+                return self.cancel_outgoing_upload(
+                    upload,
+                    "compression failed",
+                    &format!("failed to flush compressed upload: {error}"),
+                );
+            }
+            if upload.body.pending().is_empty() {
+                upload.source_read_ahead = 0;
+            }
+            self.outgoing_uploads.push_front(upload);
+            return Ok(true);
+        }
+
+        let source_read_capacity = upload_source_read_capacity(&upload, &self.upload_throttle);
+        if !upload.source_finished
+            && *source_budget > 0
+            && upload.body.pending().len() < MAX_QUEUED_FILE_BYTES
+            && source_read_capacity > 0
+        {
+            let read_limit = (*source_budget)
+                .min(MAX_FILE_CHUNK_BYTES)
+                .min((upload.size - upload.source_offset) as usize)
+                .min(source_read_capacity.min(usize::MAX as u64) as usize);
+            let data = match read_upload_source(&mut upload, read_limit) {
+                Ok(data) if !data.is_empty() => data,
+                Ok(_) => {
+                    return self.cancel_outgoing_upload(
+                        upload,
+                        "local file ended early",
+                        "file ended early while uploading",
+                    );
+                }
+                Err(error) => {
+                    return self.cancel_outgoing_upload(
+                        upload,
+                        "failed to read local file",
+                        &format!("failed to read file while uploading: {error}"),
+                    );
+                }
+            };
+            write_upload_local_copy(&self.events, &mut upload, &data);
+            capture_upload_image_prefix(&mut upload, &data);
+            if let Err(error) = upload.body.feed(&data) {
+                return self.cancel_outgoing_upload(
+                    upload,
+                    "compression failed",
+                    &format!("failed to compress upload: {error}"),
+                );
+            }
+            if compressed_upload_source_read_ahead_is_limited(&upload, &self.upload_throttle) {
+                upload.source_read_ahead =
+                    upload.source_read_ahead.saturating_add(data.len() as u64);
+            } else {
+                upload.source_read_ahead = 0;
+            }
+            upload.source_offset += data.len() as u64;
+            *source_budget -= data.len();
+            upload.source_finished = upload.source_offset == upload.size;
+            if upload.source_offset >= upload.next_status_at || upload.source_offset == upload.size
+            {
                 upload.next_status_at = upload
                     .next_status_at
                     .saturating_add(FILE_PROGRESS_STEP_BYTES);
@@ -2481,7 +2938,7 @@ impl WorkerState {
                     let _ = self.events.send(NetworkEvent::TransferProgress {
                         transfer_id: meta.transfer_id,
                         timestamp_ms: meta.timestamp_ms,
-                        transferred: upload.offset,
+                        transferred: upload.source_offset,
                         total: upload.size,
                         direction: TransferDirection::Outgoing,
                     });
@@ -2491,15 +2948,70 @@ impl WorkerState {
             return Ok(true);
         }
 
+        if upload.source_finished && !upload.encoder_finished {
+            if let Err(error) = upload.body.finish() {
+                return self.cancel_outgoing_upload(
+                    upload,
+                    "compression failed",
+                    &format!("failed to finish compressed upload: {error}"),
+                );
+            }
+            upload.encoder_finished = true;
+            self.outgoing_uploads.push_front(upload);
+            return Ok(true);
+        }
+
+        if !upload.body.pending().is_empty() {
+            self.outgoing_uploads.push_front(upload);
+            return Ok(false);
+        }
+
+        if !upload.encoder_finished {
+            self.outgoing_uploads.push_front(upload);
+            return Ok(false);
+        }
+
         self.queue_control(ClientControl::UploadFileComplete {
             transfer_id: upload.transfer_id,
         })?;
+        kvlog::debug!(
+            "file upload encoding completed",
+            file_name = upload.name.as_str(),
+            encoding = file_content_encoding_name(upload.body.encoding()),
+            original_bytes = upload.size,
+            wire_bytes = upload.wire_offset,
+            savings_percent = wire_savings_percent(upload.size, upload.wire_offset)
+        );
         let _ = self.events.send(NetworkEvent::Status(format!(
             "upload complete: {} ({})",
             upload.name,
             format_bytes(upload.size)
         )));
         self.finish_local_copy(&mut upload);
+        Ok(true)
+    }
+
+    fn cancel_outgoing_upload(
+        &mut self,
+        mut upload: OutgoingUpload,
+        wire_reason: &str,
+        error: &str,
+    ) -> Result<bool, String> {
+        self.queue_control(ClientControl::UploadFileCancel {
+            transfer_id: upload.transfer_id,
+            reason: wire_reason.to_string(),
+        })?;
+        if let Some((path, _)) = upload.local_copy.take() {
+            let _ = fs::remove_file(path);
+        }
+        if let Some(metadata) = upload.server_metadata {
+            let _ = self.events.send(NetworkEvent::TransferCanceled {
+                transfer_id: metadata.transfer_id,
+            });
+        }
+        let _ = self
+            .events
+            .send(NetworkEvent::Error(format!("{error} {}", upload.name)));
         Ok(true)
     }
 
@@ -2553,7 +3065,7 @@ impl WorkerState {
             let _ = self.events.send(NetworkEvent::TransferProgress {
                 transfer_id: meta.transfer_id,
                 timestamp_ms: meta.timestamp_ms,
-                transferred: upload.offset,
+                transferred: upload.source_offset,
                 total: upload.size,
                 direction: TransferDirection::Outgoing,
             });
@@ -2615,6 +3127,34 @@ impl WorkerState {
         };
         match create_receive_file(&receive_dir, &file.file_name) {
             Ok((path, handle)) => {
+                let sink = ReceiveSink::new(handle, file.size, is_image_name(&file.file_name));
+                let body = match file.encoding {
+                    FileContentEncoding::Identity => IncomingBody::Identity(sink),
+                    FileContentEncoding::Zstd => {
+                        let mut decoder = match zstd::stream::raw::Decoder::new() {
+                            Ok(decoder) => decoder,
+                            Err(error) => {
+                                let _ = fs::remove_file(&path);
+                                let _ = self.events.send(NetworkEvent::Error(format!(
+                                    "failed to initialize decompression for {}: {error}",
+                                    file.file_name
+                                )));
+                                return;
+                            }
+                        };
+                        if let Err(error) = decoder.set_parameter(
+                            zstd::stream::raw::DParameter::WindowLogMax(ZSTD_WINDOW_LOG),
+                        ) {
+                            let _ = fs::remove_file(&path);
+                            let _ = self.events.send(NetworkEvent::Error(format!(
+                                "failed to limit decompression for {}: {error}",
+                                file.file_name
+                            )));
+                            return;
+                        }
+                        IncomingBody::Zstd(zstd::stream::zio::Writer::new(sink, decoder))
+                    }
+                };
                 let _ = self.events.send(NetworkEvent::Status(format!(
                     "receiving {} from {}",
                     file.file_name, file.sender_name
@@ -2627,10 +3167,13 @@ impl WorkerState {
                     IncomingFile {
                         metadata: file,
                         path,
-                        file: handle,
-                        received: 0,
+                        body,
+                        pending_wire: Vec::new(),
+                        pending_wire_offset: 0,
+                        wire_received: 0,
+                        complete_received: false,
+                        decoder_finished: false,
                         next_status_at: FILE_PROGRESS_STEP_BYTES,
-                        dimensions: None,
                     },
                 );
                 let _ = self.events.send(NetworkEvent::TransferProgress {
@@ -2651,95 +3194,33 @@ impl WorkerState {
         let Some(incoming) = self.incoming_files.get_mut(&transfer_id) else {
             return;
         };
-        if incoming.received != offset {
-            let path = incoming.path.clone();
-            let name = incoming.metadata.file_name.clone();
-            self.incoming_files.remove(&transfer_id);
-            let _ = fs::remove_file(path);
-            let _ = self.events.send(NetworkEvent::Error(format!(
-                "file transfer offset mismatch for {name}"
-            )));
-            let _ = self
-                .events
-                .send(NetworkEvent::TransferCanceled { transfer_id });
+        if incoming.wire_received != offset {
+            self.fail_incoming_file(transfer_id, "file transfer offset mismatch");
             return;
         }
-        if offset.saturating_add(data.len() as u64) > incoming.metadata.size {
-            let path = incoming.path.clone();
-            let name = incoming.metadata.file_name.clone();
-            self.incoming_files.remove(&transfer_id);
-            let _ = fs::remove_file(path);
-            let _ = self.events.send(NetworkEvent::Error(format!(
-                "file transfer exceeded declared size for {name}"
-            )));
-            let _ = self
-                .events
-                .send(NetworkEvent::TransferCanceled { transfer_id });
+        let end = offset.saturating_add(data.len() as u64);
+        if end > max_file_wire_bytes(incoming.metadata.encoding, incoming.metadata.size) {
+            self.fail_incoming_file(transfer_id, "file transfer exceeded allowed wire size");
             return;
         }
-        if let Err(error) = incoming.file.write_all(&data) {
-            let path = incoming.path.clone();
-            let name = incoming.metadata.file_name.clone();
-            self.incoming_files.remove(&transfer_id);
-            let _ = fs::remove_file(path);
-            let _ = self.events.send(NetworkEvent::Error(format!(
-                "failed to write {name}: {error}"
-            )));
-            let _ = self
-                .events
-                .send(NetworkEvent::TransferCanceled { transfer_id });
-            return;
+        if incoming.pending_wire_offset > 0 {
+            incoming
+                .pending_wire
+                .copy_within(incoming.pending_wire_offset.., 0);
+            incoming
+                .pending_wire
+                .truncate(incoming.pending_wire.len() - incoming.pending_wire_offset);
+            incoming.pending_wire_offset = 0;
         }
-        if offset == 0 && is_image_name(&incoming.metadata.file_name) {
-            incoming.dimensions = crate::web_server::image_dimensions(&data);
-        }
-        incoming.received += data.len() as u64;
-        if incoming.received >= incoming.next_status_at
-            || incoming.received == incoming.metadata.size
-        {
-            incoming.next_status_at = incoming
-                .next_status_at
-                .saturating_add(FILE_PROGRESS_STEP_BYTES);
-            let _ = self.events.send(NetworkEvent::TransferProgress {
-                transfer_id: incoming.metadata.transfer_id,
-                timestamp_ms: incoming.metadata.timestamp_ms,
-                transferred: incoming.received,
-                total: incoming.metadata.size,
-                direction: TransferDirection::Incoming,
-            });
-        }
+        incoming.pending_wire.extend_from_slice(&data);
+        incoming.wire_received = end;
     }
 
     fn handle_file_complete(&mut self, transfer_id: FileTransferId) {
-        let Some(mut incoming) = self.incoming_files.remove(&transfer_id) else {
+        let Some(incoming) = self.incoming_files.get_mut(&transfer_id) else {
             return;
         };
-        if incoming.received != incoming.metadata.size {
-            let _ = fs::remove_file(&incoming.path);
-            let _ = self.events.send(NetworkEvent::Error(format!(
-                "file transfer ended early for {}",
-                incoming.metadata.file_name
-            )));
-            return;
-        }
-        if let Err(error) = incoming.file.flush() {
-            let _ = fs::remove_file(&incoming.path);
-            let _ = self.events.send(NetworkEvent::Error(format!(
-                "failed to flush {}: {error}",
-                incoming.metadata.file_name
-            )));
-            return;
-        }
-        let _ = self.events.send(NetworkEvent::Status(format!(
-            "saved {} to {}",
-            incoming.metadata.file_name,
-            incoming.path.display()
-        )));
-        let _ = self.events.send(NetworkEvent::FileReceived {
-            metadata: incoming.metadata.clone(),
-            path: incoming.path.clone(),
-            dimensions: incoming.dimensions,
-        });
+        incoming.complete_received = true;
     }
 
     fn handle_file_canceled(&mut self, transfer_id: FileTransferId, reason: &str) {
@@ -2753,6 +3234,106 @@ impl WorkerState {
                 .events
                 .send(NetworkEvent::TransferCanceled { transfer_id });
         }
+    }
+
+    fn pump_incoming_files(&mut self, wire_budget: &mut usize, decoded_budget: &mut usize) {
+        let transfer_ids = self.incoming_files.keys().copied().collect::<Vec<_>>();
+        for transfer_id in transfer_ids {
+            if *wire_budget == 0 || *decoded_budget == 0 {
+                break;
+            }
+            let before;
+            let pump_result;
+            {
+                let Some(incoming) = self.incoming_files.get_mut(&transfer_id) else {
+                    continue;
+                };
+                before = incoming.body.sink().decoded;
+                pump_result = incoming.pump(wire_budget, decoded_budget);
+            }
+            if let Err(error) = pump_result {
+                self.fail_incoming_file(
+                    transfer_id,
+                    &format!("file transfer decode failed: {error}"),
+                );
+                continue;
+            }
+
+            let Some(incoming) = self.incoming_files.get_mut(&transfer_id) else {
+                continue;
+            };
+            let decoded = incoming.body.sink().decoded;
+            if decoded != before
+                && (decoded >= incoming.next_status_at || decoded == incoming.metadata.size)
+            {
+                incoming.next_status_at = incoming
+                    .next_status_at
+                    .saturating_add(FILE_PROGRESS_STEP_BYTES);
+                let _ = self.events.send(NetworkEvent::TransferProgress {
+                    transfer_id,
+                    timestamp_ms: incoming.metadata.timestamp_ms,
+                    transferred: decoded,
+                    total: incoming.metadata.size,
+                    direction: TransferDirection::Incoming,
+                });
+            }
+            if !incoming.ready_to_finalize() {
+                continue;
+            }
+
+            let incoming = self
+                .incoming_files
+                .remove(&transfer_id)
+                .expect("incoming file exists");
+            match incoming.finalize() {
+                Ok((metadata, path, dimensions, _wire_bytes)) => {
+                    #[cfg(test)]
+                    LAST_RECEIVED_FILE_WIRE_BYTES
+                        .store(_wire_bytes, std::sync::atomic::Ordering::Relaxed);
+                    kvlog::debug!(
+                        "file receive decoding completed",
+                        file_name = metadata.file_name.as_str(),
+                        encoding = file_content_encoding_name(metadata.encoding),
+                        original_bytes = metadata.size,
+                        wire_bytes = _wire_bytes,
+                        savings_percent = wire_savings_percent(metadata.size, _wire_bytes)
+                    );
+                    let _ = self.events.send(NetworkEvent::Status(format!(
+                        "saved {} to {}",
+                        metadata.file_name,
+                        path.display()
+                    )));
+                    let _ = self.events.send(NetworkEvent::FileReceived {
+                        metadata,
+                        path,
+                        dimensions,
+                    });
+                }
+                Err((path, name, error)) => {
+                    let _ = fs::remove_file(path);
+                    let _ = self.events.send(NetworkEvent::Error(format!(
+                        "failed to finish receiving {name}: {error}"
+                    )));
+                    let _ = self
+                        .events
+                        .send(NetworkEvent::TransferCanceled { transfer_id });
+                }
+            }
+        }
+    }
+
+    fn fail_incoming_file(&mut self, transfer_id: FileTransferId, reason: &str) {
+        let Some(incoming) = self.incoming_files.remove(&transfer_id) else {
+            return;
+        };
+        let _ = fs::remove_file(&incoming.path);
+        let _ = self.events.send(NetworkEvent::Error(format!(
+            "{reason} for {}",
+            incoming.metadata.file_name
+        )));
+        let _ = self
+            .events
+            .send(NetworkEvent::TransferCanceled { transfer_id });
     }
 
     fn handle_server_control(&mut self, control: ServerControl) {
@@ -4128,6 +4709,99 @@ fn correlate_upload_accepted(
         .map(|local| (metadata, local))
 }
 
+fn compressed_upload_source_read_ahead_is_limited(
+    upload: &OutgoingUpload,
+    throttle: &UploadThrottle,
+) -> bool {
+    throttle.is_limited() && upload.body.encoding() == FileContentEncoding::Zstd
+}
+
+fn upload_source_read_capacity(upload: &OutgoingUpload, throttle: &UploadThrottle) -> u64 {
+    if compressed_upload_source_read_ahead_is_limited(upload, throttle) {
+        MAX_COMPRESSED_UPLOAD_SOURCE_AHEAD_BYTES.saturating_sub(upload.source_read_ahead)
+    } else {
+        u64::MAX
+    }
+}
+
+fn upload_should_flush_source_read_ahead(
+    upload: &OutgoingUpload,
+    throttle: &UploadThrottle,
+) -> bool {
+    compressed_upload_source_read_ahead_is_limited(upload, throttle)
+        && !upload.source_finished
+        && upload.source_read_ahead >= MAX_COMPRESSED_UPLOAD_SOURCE_AHEAD_BYTES
+        && upload.body.pending().is_empty()
+}
+
+fn read_upload_source(upload: &mut OutgoingUpload, limit: usize) -> io::Result<Vec<u8>> {
+    if upload.source_prefix_offset < upload.source_prefix.len() {
+        let end = upload
+            .source_prefix_offset
+            .saturating_add(limit)
+            .min(upload.source_prefix.len());
+        let data = upload.source_prefix[upload.source_prefix_offset..end].to_vec();
+        upload.source_prefix_offset = end;
+        if upload.source_prefix_offset == upload.source_prefix.len() {
+            upload.source_prefix.clear();
+            upload.source_prefix_offset = 0;
+        }
+        return Ok(data);
+    }
+
+    let mut data = vec![0; limit];
+    let read = upload.file.read(&mut data)?;
+    data.truncate(read);
+    Ok(data)
+}
+
+fn write_upload_local_copy(events: &EventSender, upload: &mut OutgoingUpload, data: &[u8]) {
+    let failure = upload.local_copy.as_mut().and_then(|(path, file)| {
+        file.write_all(data)
+            .err()
+            .map(|error| (path.clone(), error))
+    });
+    let Some((path, error)) = failure else {
+        return;
+    };
+    let _ = events.send(NetworkEvent::Error(format!(
+        "failed to write local copy {}: {error}",
+        path.display()
+    )));
+    let _ = fs::remove_file(&path);
+    upload.local_copy = None;
+}
+
+fn capture_upload_image_prefix(upload: &mut OutgoingUpload, data: &[u8]) {
+    if upload.dimensions.is_some()
+        || !is_image_name(&upload.name)
+        || upload.image_prefix.len() >= MAX_FILE_CHUNK_BYTES
+    {
+        return;
+    }
+    let capture = data
+        .len()
+        .min(MAX_FILE_CHUNK_BYTES - upload.image_prefix.len());
+    upload.image_prefix.extend_from_slice(&data[..capture]);
+    upload.dimensions = crate::web_server::image_dimensions(&upload.image_prefix);
+}
+
+fn wire_savings_percent(original_size: u64, wire_size: u64) -> i64 {
+    if original_size == 0 {
+        return 0;
+    }
+    let percent =
+        (i128::from(original_size) - i128::from(wire_size)) * 100 / i128::from(original_size);
+    percent.clamp(i128::from(i64::MIN), i128::from(i64::MAX)) as i64
+}
+
+fn file_content_encoding_name(encoding: FileContentEncoding) -> &'static str {
+    match encoding {
+        FileContentEncoding::Identity => "identity",
+        FileContentEncoding::Zstd => "zstd",
+    }
+}
+
 fn network_command_kind(command: &NetworkCommand) -> &'static str {
     match command {
         NetworkCommand::SendChat(_) => "send_chat",
@@ -5185,6 +5859,366 @@ mod tests {
         );
     }
 
+    fn encode_test_stream(data: &[u8], source_chunk: usize, wire_chunk: usize) -> Vec<u8> {
+        let encoder =
+            file_compression::new_encoder(PendingWire::default(), data.len() as u64).unwrap();
+        let mut body = UploadBody::Zstd(encoder);
+        let mut encoded = Vec::new();
+        for chunk in data.chunks(source_chunk) {
+            body.feed(chunk).unwrap();
+            while !body.pending().is_empty() {
+                encoded.extend(body.pending_mut().take(wire_chunk));
+            }
+        }
+        body.finish().unwrap();
+        while !body.pending().is_empty() {
+            encoded.extend(body.pending_mut().take(wire_chunk));
+        }
+        encoded
+    }
+
+    fn incoming_test_file(
+        path: &Path,
+        original_size: u64,
+        encoding: FileContentEncoding,
+        image: bool,
+    ) -> IncomingFile {
+        let sink = ReceiveSink::new(File::create(path).unwrap(), original_size, image);
+        let body = match encoding {
+            FileContentEncoding::Identity => IncomingBody::Identity(sink),
+            FileContentEncoding::Zstd => {
+                let mut decoder = zstd::stream::raw::Decoder::new().unwrap();
+                decoder
+                    .set_parameter(zstd::stream::raw::DParameter::WindowLogMax(ZSTD_WINDOW_LOG))
+                    .unwrap();
+                IncomingBody::Zstd(zstd::stream::zio::Writer::new(sink, decoder))
+            }
+        };
+        IncomingFile {
+            metadata: FileMetadata {
+                transfer_id: FileTransferId(1),
+                room_id: RoomId(1),
+                sender: UserId(1),
+                sender_name: "sender".to_string(),
+                file_name: if image {
+                    "image.png".to_string()
+                } else {
+                    "data.bin".to_string()
+                },
+                original_name: "data.bin".to_string(),
+                size: original_size,
+                encoding,
+                timestamp_ms: 1,
+            },
+            path: path.to_path_buf(),
+            body,
+            pending_wire: Vec::new(),
+            pending_wire_offset: 0,
+            wire_received: 0,
+            complete_received: false,
+            decoder_finished: false,
+            next_status_at: FILE_PROGRESS_STEP_BYTES,
+        }
+    }
+
+    fn pump_test_input(
+        incoming: &mut IncomingFile,
+        encoded: &[u8],
+        wire_chunk: usize,
+        decoded_budget: usize,
+    ) -> io::Result<Vec<u64>> {
+        let mut decoded_deltas = Vec::new();
+        for chunk in encoded.chunks(wire_chunk) {
+            incoming.pending_wire.extend_from_slice(chunk);
+            incoming.wire_received += chunk.len() as u64;
+            while incoming.pending_wire_offset < incoming.pending_wire.len() {
+                let before_decoded = incoming.body.sink().decoded;
+                let before_wire = incoming.pending_wire.len() - incoming.pending_wire_offset;
+                let mut wire_budget = usize::MAX;
+                let mut budget = decoded_budget;
+                incoming.pump(&mut wire_budget, &mut budget)?;
+                decoded_deltas.push(incoming.body.sink().decoded - before_decoded);
+                let after_wire = incoming.pending_wire.len() - incoming.pending_wire_offset;
+                assert!(
+                    after_wire < before_wire || incoming.body.sink().decoded > before_decoded,
+                    "decoder made no progress"
+                );
+            }
+        }
+        incoming.complete_received = true;
+        for _ in 0..10_000 {
+            if incoming.ready_to_finalize() {
+                return Ok(decoded_deltas);
+            }
+            let before_decoded = incoming.body.sink().decoded;
+            let mut wire_budget = usize::MAX;
+            let mut budget = decoded_budget;
+            incoming.pump(&mut wire_budget, &mut budget)?;
+            decoded_deltas.push(incoming.body.sink().decoded - before_decoded);
+        }
+        panic!("decoder did not finish");
+    }
+
+    #[test]
+    fn zstd_stream_round_trips_across_source_and_wire_boundaries() {
+        for data in [
+            b"small source".repeat(4_000),
+            b"many zstd windows\n".repeat(180_000),
+        ] {
+            for source_chunk in [1, 97, 64 * 1024] {
+                let encoded = encode_test_stream(&data, source_chunk, 211);
+                let dir = tempfile::tempdir().unwrap();
+                let path = dir.path().join("received.bin");
+                let mut incoming =
+                    incoming_test_file(&path, data.len() as u64, FileContentEncoding::Zstd, false);
+                pump_test_input(&mut incoming, &encoded, 313, 64 * 1024).unwrap();
+                let (_, path, _, _) = incoming.finalize().unwrap();
+                assert_eq!(fs::read(path).unwrap(), data);
+            }
+        }
+    }
+
+    #[test]
+    fn zstd_finish_rejects_truncation_and_checksum_corruption() {
+        let data = b"checksum-protected contents".repeat(10_000);
+        let encoded = encode_test_stream(&data, 4096, 1024);
+
+        for broken in [encoded[..encoded.len() - 3].to_vec(), {
+            let mut corrupted = encoded.clone();
+            let index = corrupted.len() - 2;
+            corrupted[index] ^= 0x80;
+            corrupted
+        }] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("broken.bin");
+            let mut incoming =
+                incoming_test_file(&path, data.len() as u64, FileContentEncoding::Zstd, false);
+            assert!(pump_test_input(&mut incoming, &broken, 127, 32 * 1024).is_err());
+        }
+    }
+
+    #[test]
+    fn decoded_size_limit_stops_destination_growth() {
+        let data = vec![b'x'; 512 * 1024];
+        let encoded = encode_test_stream(&data, 8192, 4096);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("limited.bin");
+        let declared = 64 * 1024;
+        let mut incoming = incoming_test_file(&path, declared, FileContentEncoding::Zstd, false);
+
+        assert!(pump_test_input(&mut incoming, &encoded, 1024, 16 * 1024).is_err());
+        assert!(fs::metadata(path).unwrap().len() <= declared);
+    }
+
+    #[test]
+    fn decoder_rejects_frames_requiring_a_larger_window() {
+        let data = b"large-window-pattern".repeat(180_000);
+        let mut encoder = zstd::stream::write::Encoder::new(Vec::new(), 3).unwrap();
+        encoder
+            .set_pledged_src_size(Some(data.len() as u64))
+            .unwrap();
+        encoder.window_log(ZSTD_WINDOW_LOG + 1).unwrap();
+        encoder.write_all(&data).unwrap();
+        let encoded = encoder.finish().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("window.bin");
+        let mut incoming =
+            incoming_test_file(&path, data.len() as u64, FileContentEncoding::Zstd, false);
+
+        assert!(pump_test_input(&mut incoming, &encoded, 4096, 64 * 1024).is_err());
+    }
+
+    #[test]
+    fn receive_sink_preserves_image_prefix_for_identity_and_zstd() {
+        let mut png = vec![0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a];
+        png.extend_from_slice(&13u32.to_be_bytes());
+        png.extend_from_slice(b"IHDR");
+        png.extend_from_slice(&320u32.to_be_bytes());
+        png.extend_from_slice(&180u32.to_be_bytes());
+        png.extend_from_slice(&[8, 2, 0, 0, 0]);
+        png.resize(32 * 1024, 0);
+
+        for encoding in [FileContentEncoding::Identity, FileContentEncoding::Zstd] {
+            let wire = match encoding {
+                FileContentEncoding::Identity => png.clone(),
+                FileContentEncoding::Zstd => encode_test_stream(&png, 777, 333),
+            };
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("image.png");
+            let mut incoming = incoming_test_file(&path, png.len() as u64, encoding, true);
+            pump_test_input(&mut incoming, &wire, 191, 4096).unwrap();
+            let (_, _, dimensions, _) = incoming.finalize().unwrap();
+            assert_eq!(dimensions, Some((320, 180)));
+        }
+    }
+
+    #[test]
+    fn decompression_respects_per_pump_work_budget() {
+        let data = vec![b'a'; 4 * 1024 * 1024];
+        let encoded = encode_test_stream(&data, 64 * 1024, 64 * 1024);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bounded.bin");
+        let mut incoming =
+            incoming_test_file(&path, data.len() as u64, FileContentEncoding::Zstd, false);
+        let budget = 32 * 1024;
+        let deltas = pump_test_input(&mut incoming, &encoded, encoded.len(), budget).unwrap();
+        assert!(deltas.iter().all(|delta| *delta <= budget as u64));
+        assert!(deltas.iter().filter(|delta| **delta != 0).count() > 1);
+    }
+
+    #[test]
+    fn incoming_pump_respects_encoded_input_budget() {
+        let data = vec![b'a'; 128 * 1024];
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wire-bounded.bin");
+        let mut incoming = incoming_test_file(
+            &path,
+            data.len() as u64,
+            FileContentEncoding::Identity,
+            false,
+        );
+        incoming.pending_wire = data;
+        incoming.wire_received = incoming.pending_wire.len() as u64;
+        let mut wire_budget = 4096;
+        let mut decoded_budget = usize::MAX;
+
+        incoming
+            .pump(&mut wire_budget, &mut decoded_budget)
+            .unwrap();
+
+        assert_eq!(wire_budget, 0);
+        assert_eq!(incoming.body.sink().decoded, 4096);
+        assert_eq!(incoming.pending_wire_offset, 4096);
+    }
+
+    #[test]
+    fn retained_probe_prefix_is_read_exactly_once() {
+        let data = b"prefix and remaining source bytes".repeat(10_000);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("source.bin");
+        fs::write(&path, &data).unwrap();
+        let mut file = File::open(&path).unwrap();
+        let prefix_len = 4096;
+        let mut prefix = vec![0; prefix_len];
+        file.read_exact(&mut prefix).unwrap();
+        let mut upload = OutgoingUpload {
+            transfer_id: FileTransferId(1),
+            server_metadata: None,
+            room_id: RoomId(1),
+            name: "source.bin".to_string(),
+            size: data.len() as u64,
+            file,
+            source_offset: 0,
+            source_read_ahead: 0,
+            wire_offset: 0,
+            source_prefix: prefix,
+            source_prefix_offset: 0,
+            body: UploadBody::Identity(PendingWire::default()),
+            source_finished: false,
+            encoder_finished: false,
+            started: false,
+            next_status_at: FILE_PROGRESS_STEP_BYTES,
+            local_copy: None,
+            dimensions: None,
+            image_prefix: Vec::new(),
+        };
+        let mut read_back = Vec::new();
+        while read_back.len() < data.len() {
+            let chunk = read_upload_source(&mut upload, 997).unwrap();
+            assert!(!chunk.is_empty());
+            read_back.extend_from_slice(&chunk);
+        }
+        assert_eq!(read_back, data);
+    }
+
+    #[test]
+    fn compressed_upload_local_copy_stays_uncompressed() {
+        let raw = b"local raw upload bytes".repeat(10_000);
+        let dir = tempfile::tempdir().unwrap();
+        let source_path = dir.path().join("source.bin");
+        let local_path = dir.path().join("local.bin");
+        fs::write(&source_path, &raw).unwrap();
+        let mut upload = OutgoingUpload {
+            transfer_id: FileTransferId(1),
+            server_metadata: None,
+            room_id: RoomId(1),
+            name: "source.bin".to_string(),
+            size: raw.len() as u64,
+            file: File::open(source_path).unwrap(),
+            source_offset: 0,
+            source_read_ahead: 0,
+            wire_offset: 0,
+            source_prefix: Vec::new(),
+            source_prefix_offset: 0,
+            body: UploadBody::Zstd(
+                file_compression::new_encoder(PendingWire::default(), raw.len() as u64).unwrap(),
+            ),
+            source_finished: false,
+            encoder_finished: false,
+            started: true,
+            next_status_at: FILE_PROGRESS_STEP_BYTES,
+            local_copy: Some((local_path.clone(), File::create(&local_path).unwrap())),
+            dimensions: None,
+            image_prefix: Vec::new(),
+        };
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let events = EventSender(tx);
+
+        write_upload_local_copy(&events, &mut upload, &raw);
+        upload.body.feed(&raw).unwrap();
+        upload.body.finish().unwrap();
+        upload.local_copy.as_mut().unwrap().1.flush().unwrap();
+
+        assert_eq!(fs::read(local_path).unwrap(), raw);
+        assert!(upload.body.pending().len() < raw.len());
+    }
+
+    #[test]
+    fn throttled_zstd_upload_caps_source_read_ahead() {
+        let dir = tempfile::tempdir().unwrap();
+        let source_path = dir.path().join("source.bin");
+        fs::write(&source_path, b"source").unwrap();
+        let mut upload = OutgoingUpload {
+            transfer_id: FileTransferId(1),
+            server_metadata: None,
+            room_id: RoomId(1),
+            name: "source.bin".to_string(),
+            size: 16 * 1024 * 1024,
+            file: File::open(source_path).unwrap(),
+            source_offset: 0,
+            source_read_ahead: MAX_COMPRESSED_UPLOAD_SOURCE_AHEAD_BYTES - 1,
+            wire_offset: 0,
+            source_prefix: Vec::new(),
+            source_prefix_offset: 0,
+            body: UploadBody::Zstd(
+                file_compression::new_encoder(PendingWire::default(), 16 * 1024 * 1024).unwrap(),
+            ),
+            source_finished: false,
+            encoder_finished: false,
+            started: true,
+            next_status_at: FILE_PROGRESS_STEP_BYTES,
+            local_copy: None,
+            dimensions: None,
+            image_prefix: Vec::new(),
+        };
+        let limited = UploadThrottle::new(1024);
+
+        assert_eq!(upload_source_read_capacity(&upload, &limited), 1);
+        assert!(!upload_should_flush_source_read_ahead(&upload, &limited));
+
+        upload.source_read_ahead = MAX_COMPRESSED_UPLOAD_SOURCE_AHEAD_BYTES;
+        assert_eq!(upload_source_read_capacity(&upload, &limited), 0);
+        assert!(upload_should_flush_source_read_ahead(&upload, &limited));
+
+        let unlimited = UploadThrottle::new(0);
+        assert_eq!(upload_source_read_capacity(&upload, &unlimited), u64::MAX);
+        assert!(!upload_should_flush_source_read_ahead(&upload, &unlimited));
+
+        upload.body = UploadBody::Identity(PendingWire::default());
+        assert_eq!(upload_source_read_capacity(&upload, &limited), u64::MAX);
+        assert!(!upload_should_flush_source_read_ahead(&upload, &limited));
+    }
+
     #[test]
     fn receive_file_path_preserves_extension_when_colliding() {
         let dir = std::env::temp_dir().join(format!(
@@ -5216,6 +6250,7 @@ mod tests {
             file_name: "report.pdf".to_string(),
             original_name: "report.pdf".to_string(),
             size: 10,
+            encoding: FileContentEncoding::Identity,
             timestamp_ms: 500,
         }
     }
@@ -5233,11 +6268,19 @@ mod tests {
             name: "report.pdf".to_string(),
             size: 10,
             file,
-            offset: 0,
+            source_offset: 0,
+            source_read_ahead: 0,
+            wire_offset: 0,
+            source_prefix: Vec::new(),
+            source_prefix_offset: 0,
+            body: UploadBody::Identity(PendingWire::default()),
+            source_finished: false,
+            encoder_finished: false,
             started: true,
             next_status_at: 10,
             local_copy: None,
             dimensions: None,
+            image_prefix: Vec::new(),
         }]);
         let mut pending = HashMap::new();
 

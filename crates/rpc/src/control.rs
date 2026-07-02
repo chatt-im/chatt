@@ -111,10 +111,14 @@ pub enum ClientControl {
         room_id: RoomId,
         transfer_id: FileTransferId,
         name: String,
+        /// Original/decompressed byte length.
         size: u64,
+        encoding: FileContentEncoding,
     },
     UploadFileChunk {
         transfer_id: FileTransferId,
+        /// Contiguous offset in the relayed representation. For identity this
+        /// is also the logical offset; for zstd it is the encoded stream offset.
         offset: u64,
         data: Vec<u8>,
     },
@@ -239,6 +243,8 @@ pub enum ServerControl {
     },
     FileChunk {
         transfer_id: FileTransferId,
+        /// Contiguous offset in the relayed representation. For identity this
+        /// is also the logical offset; for zstd it is the encoded stream offset.
         offset: u64,
         data: Vec<u8>,
     },
@@ -352,8 +358,31 @@ pub struct FileMetadata {
     pub sender_name: String,
     pub file_name: String,
     pub original_name: String,
+    /// Original/decompressed byte length.
     pub size: u64,
+    pub encoding: FileContentEncoding,
     pub timestamp_ms: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Jsony)]
+#[jsony(Binary, version)]
+pub enum FileContentEncoding {
+    Identity,
+    Zstd,
+}
+
+/// Maximum relayed byte count allowed for the encoded representation of a file.
+///
+/// `FileMetadata::size` and `UploadFileStart::size` carry the original logical
+/// size. Identity transfers must match it exactly, while zstd streams are
+/// allowed bounded expansion for frame headers, blocks, and incompressible data.
+pub fn max_file_wire_bytes(encoding: FileContentEncoding, original_size: u64) -> u64 {
+    match encoding {
+        FileContentEncoding::Identity => original_size,
+        FileContentEncoding::Zstd => original_size
+            .saturating_add(original_size / 128)
+            .saturating_add(64 * 1024),
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Jsony)]
@@ -1051,29 +1080,58 @@ mod tests {
 
     #[test]
     fn file_upload_control_round_trips() {
+        for encoding in [FileContentEncoding::Identity, FileContentEncoding::Zstd] {
+            let start = ClientControl::UploadFileStart {
+                room_id: RoomId(2),
+                transfer_id: FileTransferId(9),
+                name: "report.bin".to_string(),
+                size: 1234,
+                encoding,
+            };
+            let encoded = encode_client_control(&start).unwrap();
+            assert_eq!(decode_client_control(&encoded).unwrap(), start);
+        }
+
         let control = ClientControl::UploadFileChunk {
             transfer_id: FileTransferId(9),
             offset: 32,
-            data: vec![1, 2, 3],
+            data: vec![0x28, 0xb5, 0x2f, 0xfd, 0, 0xff],
         };
         let encoded = encode_client_control(&control).unwrap();
         assert_eq!(decode_client_control(&encoded).unwrap(), control);
 
-        let accepted = ServerControl::UploadFileAccepted {
-            client_transfer_id: FileTransferId(9),
-            file: FileMetadata {
-                transfer_id: FileTransferId(17),
-                room_id: RoomId(2),
-                sender: UserId(3),
-                sender_name: "alice".to_string(),
-                file_name: "report.pdf".to_string(),
-                original_name: "report.pdf".to_string(),
-                size: 1234,
-                timestamp_ms: 55,
-            },
-        };
-        let encoded = encode_server_control(&accepted);
-        assert_eq!(decode_server_control(&encoded).unwrap(), accepted);
+        for encoding in [FileContentEncoding::Identity, FileContentEncoding::Zstd] {
+            let accepted = ServerControl::UploadFileAccepted {
+                client_transfer_id: FileTransferId(9),
+                file: FileMetadata {
+                    transfer_id: FileTransferId(17),
+                    room_id: RoomId(2),
+                    sender: UserId(3),
+                    sender_name: "alice".to_string(),
+                    file_name: "report.pdf".to_string(),
+                    original_name: "report.pdf".to_string(),
+                    size: 1234,
+                    encoding,
+                    timestamp_ms: 55,
+                },
+            };
+            let encoded = encode_server_control(&accepted);
+            assert_eq!(decode_server_control(&encoded).unwrap(), accepted);
+        }
+    }
+
+    #[test]
+    fn file_wire_bound_depends_on_content_encoding() {
+        let original = 50 * 1024 * 1024;
+
+        assert_eq!(
+            max_file_wire_bytes(FileContentEncoding::Identity, original),
+            original
+        );
+        assert_eq!(
+            max_file_wire_bytes(FileContentEncoding::Zstd, original),
+            original + original / 128 + 64 * 1024
+        );
     }
 
     #[test]

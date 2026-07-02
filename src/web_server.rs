@@ -1153,7 +1153,7 @@ mod tests {
         assert!(older_frame_for(r#"{"type":"other"}"#, &history, 0).is_none());
     }
 
-    use rpc::control::FileMetadata;
+    use rpc::control::{FileContentEncoding, FileMetadata};
     use rpc::ids::{FileTransferId, RoomId, UserId};
 
     #[test]
@@ -1166,6 +1166,7 @@ mod tests {
             file_name: "wide.png".to_string(),
             original_name: "wide.png".to_string(),
             size: 10,
+            encoding: FileContentEncoding::Identity,
             timestamp_ms: 5,
         };
         // A save-time collision renamed the file on disk.
@@ -1205,6 +1206,7 @@ mod tests {
             file_name: "wide.png".to_string(),
             original_name: "wide.png".to_string(),
             size: 2048,
+            encoding: FileContentEncoding::Identity,
             timestamp_ms: 5,
         }
     }
@@ -1290,6 +1292,7 @@ mod tests {
             file_name: "clip.mp4".to_string(),
             original_name: "clip.mp4".to_string(),
             size: 10,
+            encoding: FileContentEncoding::Identity,
             timestamp_ms: 5,
         };
         let message = WebMessage::from_file(&metadata, "clip.mp4", Some((1920, 1080)));

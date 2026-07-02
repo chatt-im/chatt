@@ -10,6 +10,7 @@ mod clipboard;
 mod clipboard_paste;
 mod config;
 mod config_diagnostics;
+mod file_compression;
 mod fuzzy;
 mod highlight;
 mod link;

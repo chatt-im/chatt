@@ -24,10 +24,10 @@ use rpc::{
         self, ChatMessage, ClientControl, ERROR_AUTH_REJECTED, ERROR_BUG_REPORT_REJECTED,
         ERROR_OPEN_PAIR_RATE_LIMITED, ERROR_PAIRING_INVALID_REQUEST, ERROR_PAIRING_NOT_ACTIVE,
         ERROR_PASSWORD_MISMATCH, ERROR_PASSWORD_REQUIRED, ERROR_PUBLIC_DISABLED,
-        ERROR_TOKEN_STALE_EPOCH, FileMetadata, InviteTicket, MAX_BUG_REPORT_BYTES,
-        MAX_FILE_CHUNK_BYTES, P2pCandidate, P2pKey, P2pNatKind, P2pPeerInfo, P2pRole, RoomInfo,
-        ServerControl, decode_client_control, decode_client_hello, encode_invite_ticket,
-        encode_server_control, encode_server_hello,
+        ERROR_TOKEN_STALE_EPOCH, FileContentEncoding, FileMetadata, InviteTicket,
+        MAX_BUG_REPORT_BYTES, MAX_FILE_CHUNK_BYTES, P2pCandidate, P2pKey, P2pNatKind, P2pPeerInfo,
+        P2pRole, RoomInfo, ServerControl, decode_client_control, decode_client_hello,
+        encode_invite_ticket, encode_server_control, encode_server_hello, max_file_wire_bytes,
     },
     crypto::{
         AntiReplay, CHANNEL_CONTROL, CHANNEL_VIDEO, ControlTransport, DYNAMIC_TOKEN_PREFIX,
@@ -1195,10 +1195,11 @@ impl Server {
                     transfer_id,
                     name,
                     size,
+                    encoding,
                 },
             ) => {
                 let session_id = self.session_for_token(token)?;
-                self.start_file_upload(session_id, room_id, transfer_id, name, size)
+                self.start_file_upload(session_id, room_id, transfer_id, name, size, encoding)
             }
             (
                 ConnState::Ready,
@@ -2078,16 +2079,18 @@ impl Server {
         room_id: RoomId,
         client_transfer_id: FileTransferId,
         name: String,
-        size: u64,
+        original_size: u64,
+        encoding: FileContentEncoding,
     ) -> Result<(), String> {
         kvlog::info!(
             "file upload start requested",
             session_id = session_id.0,
             room_id = room_id.0,
             client_transfer_id = client_transfer_id.0,
-            file_size = size
+            original_size,
+            encoding = file_content_encoding_name(encoding)
         );
-        if size > self.file_size_limit_bytes {
+        if original_size > self.file_size_limit_bytes {
             return Err("file exceeds server maximum length".into());
         }
         let key = (session_id, client_transfer_id);
@@ -2128,9 +2131,9 @@ impl Server {
             .iter()
             .copied()
             .filter(|member_id| {
-                self.sessions.get(member_id).is_some_and(|session| {
-                    session.receive_files && size <= session.file_receive_limit_bytes
-                })
+                self.sessions
+                    .get(member_id)
+                    .is_some_and(|session| session_accepts_file(session, original_size))
             })
             .collect::<HashSet<_>>();
         let metadata = FileMetadata {
@@ -2140,7 +2143,8 @@ impl Server {
             sender_name: sender_name.clone(),
             file_name: file_name.clone(),
             original_name,
-            size,
+            size: original_size,
+            encoding,
             timestamp_ms,
         };
 
@@ -2150,7 +2154,11 @@ impl Server {
             sender,
             sender_name,
             timestamp_ms,
-            body: format!("sent file `{}` ({})", file_name, format_bytes(size)),
+            body: format!(
+                "sent file `{}` ({})",
+                file_name,
+                format_bytes(original_size)
+            ),
             file_transfer_id: Some(server_transfer_id),
         };
         self.next_message += 1;
@@ -2200,8 +2208,9 @@ impl Server {
             ServerUpload {
                 server_transfer_id,
                 room_id,
-                size,
-                received: 0,
+                encoding,
+                original_size,
+                wire_received: 0,
                 recipients,
             },
         );
@@ -2224,14 +2233,14 @@ impl Server {
                 .active_uploads
                 .get_mut(&key)
                 .ok_or_else(|| "unknown file transfer".to_string())?;
-            if upload.received != offset {
+            if upload.wire_received != offset {
                 return Err("file chunk offset mismatch".into());
             }
             let end = offset.saturating_add(data.len() as u64);
-            if end > upload.size {
-                return Err("file chunk exceeds declared file size".into());
+            if end > max_file_wire_bytes(upload.encoding, upload.original_size) {
+                return Err("file chunk exceeds allowed relay size".into());
             }
-            upload.received = end;
+            upload.wire_received = end;
             (upload.server_transfer_id, upload.recipients.clone())
         };
         kvlog::debug!(
@@ -2281,7 +2290,8 @@ impl Server {
             .active_uploads
             .remove(&key)
             .ok_or_else(|| "unknown file transfer".to_string())?;
-        if upload.received != upload.size {
+        if !upload_completion_is_valid(upload.encoding, upload.original_size, upload.wire_received)
+        {
             self.send_file_canceled(&upload, "upload ended before all bytes arrived");
             return Err("file upload ended before all bytes arrived".into());
         }
@@ -2291,7 +2301,10 @@ impl Server {
             room_id = upload.room_id.0,
             client_transfer_id = client_transfer_id.0,
             server_transfer_id = upload.server_transfer_id.0,
-            file_size = upload.size
+            encoding = file_content_encoding_name(upload.encoding),
+            original_bytes = upload.original_size,
+            wire_bytes = upload.wire_received,
+            savings_percent = wire_savings_percent(upload.original_size, upload.wire_received)
         );
         for recipient in &upload.recipients {
             let Some(token) = self.live_token_for_session(*recipient) else {
@@ -3659,9 +3672,41 @@ impl Session {
 struct ServerUpload {
     server_transfer_id: FileTransferId,
     room_id: RoomId,
-    size: u64,
-    received: u64,
+    encoding: FileContentEncoding,
+    original_size: u64,
+    wire_received: u64,
     recipients: HashSet<SessionId>,
+}
+
+fn session_accepts_file(session: &Session, original_size: u64) -> bool {
+    session.receive_files && original_size <= session.file_receive_limit_bytes
+}
+
+fn upload_completion_is_valid(
+    encoding: FileContentEncoding,
+    original_size: u64,
+    wire_received: u64,
+) -> bool {
+    match encoding {
+        FileContentEncoding::Identity => wire_received == original_size,
+        FileContentEncoding::Zstd => original_size == 0 || wire_received != 0,
+    }
+}
+
+fn wire_savings_percent(original_size: u64, wire_size: u64) -> i64 {
+    if original_size == 0 {
+        return 0;
+    }
+    let percent =
+        (i128::from(original_size) - i128::from(wire_size)) * 100 / i128::from(original_size);
+    percent.clamp(i128::from(i64::MIN), i128::from(i64::MAX)) as i64
+}
+
+fn file_content_encoding_name(encoding: FileContentEncoding) -> &'static str {
+    match encoding {
+        FileContentEncoding::Identity => "identity",
+        FileContentEncoding::Zstd => "zstd",
+    }
 }
 
 /// An in-progress bug report upload, accumulated until completion then written
@@ -4365,6 +4410,63 @@ mod tests {
             reserve_unique_file_name(&mut reserved, "report.pdf"),
             "report-2.pdf"
         );
+    }
+
+    #[test]
+    fn file_upload_wire_bounds_depend_on_encoding() {
+        let original = 50 * 1024 * 1024;
+        assert_eq!(
+            max_file_wire_bytes(FileContentEncoding::Identity, original),
+            original
+        );
+        assert_eq!(
+            max_file_wire_bytes(FileContentEncoding::Zstd, original),
+            original + original / 128 + 64 * 1024
+        );
+    }
+
+    #[test]
+    fn file_upload_completion_validates_identity_but_not_zstd_ratio() {
+        assert!(upload_completion_is_valid(
+            FileContentEncoding::Identity,
+            100,
+            100
+        ));
+        assert!(!upload_completion_is_valid(
+            FileContentEncoding::Identity,
+            100,
+            99
+        ));
+        assert!(upload_completion_is_valid(
+            FileContentEncoding::Zstd,
+            100,
+            12
+        ));
+        assert!(!upload_completion_is_valid(
+            FileContentEncoding::Zstd,
+            100,
+            0
+        ));
+        assert!(upload_completion_is_valid(FileContentEncoding::Zstd, 0, 0));
+    }
+
+    #[test]
+    fn file_upload_savings_support_expansion_and_empty_files() {
+        assert_eq!(wire_savings_percent(100, 25), 75);
+        assert_eq!(wire_savings_percent(100, 101), -1);
+        assert_eq!(wire_savings_percent(0, 0), 0);
+    }
+
+    #[test]
+    fn file_recipient_limit_uses_original_size() {
+        let mut session = test_session(UserId(1), Token(1), Some(RoomId(1)));
+        session.receive_files = true;
+        session.file_receive_limit_bytes = 1024;
+
+        assert!(session_accepts_file(&session, 1024));
+        assert!(!session_accepts_file(&session, 1025));
+        session.receive_files = false;
+        assert!(!session_accepts_file(&session, 1));
     }
 
     #[test]
