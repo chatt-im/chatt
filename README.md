@@ -187,21 +187,28 @@ is the default and the reliable cross-browser path:
 cargo run -p chatt -- screencast start --hevc
 ```
 
-Override the capture command with `--ffmpeg`, passing the verbatim argv that
-writes Annex-B to stdout (`pipe:1`). Everything after `--ffmpeg` is the command,
-run directly with no shell. Add `--hevc` (before `--ffmpeg`) when the custom
-command emits H.265:
+Override the capture with your own command, passing the verbatim argv after
+`start`. Everything after `start` is the command, run directly with no shell, and
+it must write Annex-B to stdout. Add `--hevc` (before the command) when it emits
+H.265:
 
 ```sh
-cargo run -p chatt -- screencast start --ffmpeg ffmpeg -f x11grab -i :0 -f h264 pipe:1
+cargo run -p chatt -- screencast start ffmpeg -f x11grab -i :0 -f h264 pipe:1
+cargo run -p chatt -- screencast start wl-screenrec -o HDMI-A-1 --ffmpeg-muxer h264 -f -
 ```
+
+The command need not be ffmpeg. `wl-screenrec` (Wayland) or any capture tool that
+emits an Annex-B H.264 stream on stdout works. When the capture command fails to
+start a stream or exits early, the client shows the reason (the tail of the
+command's stderr). The full stderr is in the client logfile (`--logfile`).
 
 A room member sees a play button in their web view (`[web] enabled = true`) and
 the live desktop renders to a canvas. The sharer can watch their own outgoing
 stream the same way: it appears in their web view as a self-view, fed locally
 without a server round-trip. The web view lists every active share, including
-ones that started before the browser tab connected. Screen share needs `ffmpeg`
-on `PATH` and, for the default capture, an X11 session.
+ones that started before the browser tab connected. The default capture needs
+`ffmpeg` on `PATH` and an X11 session. A custom command needs only its own
+program on `PATH`.
 
 Inspect audio input devices:
 

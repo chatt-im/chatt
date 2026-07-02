@@ -413,17 +413,20 @@ function Attachment(props: {
   return (
     <div class="message-media">
       <Show when={att().kind === "image"}>
-        <img
-          class="media-image"
-          classList={{ "is-loaded": loaded() }}
-          src={url()}
-          alt={att().name}
-          width={att().width ?? undefined}
-          height={att().height ?? undefined}
-          loading="eager"
-          decoding="async"
-          fetchpriority="high"
-          onClick={(event) =>
+        <a
+          class="media-image-link"
+          href={url()}
+          onClick={(event) => {
+            if (
+              event.button !== 0 ||
+              event.ctrlKey ||
+              event.metaKey ||
+              event.shiftKey ||
+              event.altKey
+            ) {
+              return;
+            }
+            event.preventDefault();
             props.onOpenPreview(
               {
                 kind: "image",
@@ -432,19 +435,31 @@ function Attachment(props: {
                 height: att().height,
               },
               event.currentTarget
-            )
-          }
-          onLoad={(event) => {
-            markImageLoaded(url(), event.currentTarget);
-            debugImageTiming("img:load", att().name, url());
-            setLoaded(true);
+            );
           }}
-          onError={() => {
-            markImageError(url());
-            debugImageTiming("img:error", att().name, url());
-            setLoaded(true);
-          }}
-        />
+        >
+          <img
+            class="media-image"
+            classList={{ "is-loaded": loaded() }}
+            src={url()}
+            alt={att().name}
+            width={att().width ?? undefined}
+            height={att().height ?? undefined}
+            loading="eager"
+            decoding="async"
+            fetchpriority="high"
+            onLoad={(event) => {
+              markImageLoaded(url(), event.currentTarget);
+              debugImageTiming("img:load", att().name, url());
+              setLoaded(true);
+            }}
+            onError={() => {
+              markImageError(url());
+              debugImageTiming("img:error", att().name, url());
+              setLoaded(true);
+            }}
+          />
+        </a>
       </Show>
       <Show when={att().kind === "video"}>
         <video class="media-video" src={url()} controls preload="metadata" />
