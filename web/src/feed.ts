@@ -97,7 +97,7 @@ class Reader {
     const fragments: Fragment[] = [];
     for (let i = 0; i < fragmentCount; i++) {
       if (this.u8() === FRAG_TEXT) {
-        fragments.push({ kind: "text", text: this.string() });
+        fragments.push({ kind: "text", html: this.string() });
       } else {
         // Keep the code bytes rather than a string: highlight spans are byte
         // offsets, so per-run byte slicing is what renders correctly.

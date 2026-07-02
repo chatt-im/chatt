@@ -1,9 +1,8 @@
 //! Detection of `http`/`https` URLs in plain message text.
 //!
-//! Chat bodies are rendered as Markdown, but bare URLs are not markup, so the
-//! renderer and click handler need their own scan. [`find_urls`] returns the
-//! byte ranges of every URL in a body, which the chat buffer caches per message
-//! for underline styling and click hit-testing.
+//! Chat bodies use Chatt's Markdown subset, but bare URLs are not markup, so
+//! renderers and click handlers need their own scan. [`find_urls`] returns the
+//! byte ranges of every URL in a body.
 
 use std::ops::Range;
 

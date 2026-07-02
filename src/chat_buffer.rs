@@ -1,11 +1,11 @@
 use std::ops::Range;
 
-use extui::Style;
+use extui::{Style, vt::Modifier};
 use rpc::control::ChatMessage;
 use rpc::ids::FileTransferId;
-use tinyhl::{Highlighter, Language, Source, Span};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
+use crate::markdown::{Token, TokenKind};
 use crate::theme::SyntaxTheme;
 
 const REFLOW_TARGET: usize = 95;
@@ -144,7 +144,7 @@ impl VirtualChatBuffer {
     }
 
     pub fn push_chat(&mut self, message: ChatMessage, local: bool) {
-        let links = crate::link::find_urls(&message.body);
+        let links = crate::markdown::link_ranges(&message.body);
         self.messages.push(ChatEntry {
             id: message.message_id.0,
             sender: message.sender_name,
@@ -161,7 +161,7 @@ impl VirtualChatBuffer {
 
     pub fn push_notice(&mut self, sender: impl Into<String>, body: impl Into<String>) {
         let body = body.into();
-        let links = crate::link::find_urls(&body);
+        let links = crate::markdown::link_ranges(&body);
         self.messages.push(ChatEntry {
             id: 0,
             sender: sender.into(),
@@ -763,8 +763,8 @@ impl VirtualChatBuffer {
 
 struct MessageLayout {
     wrap_width: u16,
-    hl: Highlighter,
     cursor: usize,
+    tokens: Vec<Token>,
     line_starts: Vec<u32>,
     line_sources: Vec<(u32, u32)>,
     segments: Vec<Segment>,
@@ -773,20 +773,29 @@ struct MessageLayout {
     syntax: SyntaxTheme,
 }
 
-enum BlockKind {
-    Fence { fence: u8, count: usize },
-    Heading { marker_len: usize },
-    Blockquote { indent: usize },
-    ListItem { indent: usize, marker_len: usize },
-    Paragraph,
+struct RenderPiece {
+    source: Range<usize>,
+    display: Range<usize>,
+    style: Style,
+}
+
+struct InvisibleSource {
+    source: Range<usize>,
+    display_pos: usize,
+}
+
+#[derive(Default)]
+struct LinePrefix {
+    visible: Option<(Range<usize>, Style)>,
+    invisible: Vec<Range<usize>>,
 }
 
 impl MessageLayout {
     fn new() -> Self {
         Self {
             wrap_width: 0,
-            hl: Highlighter::new(Language::Markdown),
             cursor: 0,
+            tokens: Vec::new(),
             line_starts: Vec::new(),
             line_sources: Vec::new(),
             segments: Vec::new(),
@@ -806,7 +815,6 @@ impl MessageLayout {
     fn ensure(&mut self, width: u16, text: &str, syntax: SyntaxTheme) {
         self.syntax = syntax;
         if self.wrap_width != width {
-            self.hl.rebuild(&text as &dyn Source);
             self.reset_layout(width, text);
         }
         while !self.complete {
@@ -872,6 +880,7 @@ impl MessageLayout {
     fn reset_layout(&mut self, width: u16, text: &str) {
         self.wrap_width = width;
         self.cursor = 0;
+        crate::markdown::tokenize(text, &mut self.tokens);
         self.line_starts.clear();
         self.line_sources.clear();
         self.segments.clear();
@@ -880,202 +889,319 @@ impl MessageLayout {
     }
 
     fn layout_next_block(&mut self, text: &str) {
-        let bytes = text.as_bytes();
-        let mut pos = self.cursor;
-        let blank_start = pos;
-        let mut saw_blank = false;
-        loop {
-            if pos >= bytes.len() {
-                self.cursor = pos;
-                self.complete = true;
-                return;
-            }
-            if !is_blank_line(bytes, pos) {
-                break;
-            }
-            saw_blank = true;
-            let (_, next) = line_bounds(bytes, pos);
-            pos = next;
-        }
-        if saw_blank && !self.line_starts.is_empty() {
-            self.push_line();
-            self.note_source_range(blank_start, pos);
-        }
         let avail = (self.wrap_width as usize).max(1);
         let target = avail.min(REFLOW_TARGET);
-        self.cursor = match classify(bytes, pos) {
-            BlockKind::Fence { fence, count } => self.layout_fence(text, pos, fence, count, avail),
-            BlockKind::Heading { marker_len } => self.layout_heading(text, pos, marker_len, target),
-            BlockKind::Blockquote { indent } => self.layout_quote(text, pos, indent, target),
-            BlockKind::ListItem { indent, marker_len } => {
-                self.layout_list_item(text, pos, indent, marker_len, target)
-            }
-            BlockKind::Paragraph => self.layout_paragraph(text, pos, target),
-        };
-    }
 
-    fn layout_paragraph(&mut self, text: &str, pos: usize, target: usize) -> usize {
-        let bytes = text.as_bytes();
-        let mut line_pos = pos;
-        loop {
-            let (content_end, next) = line_bounds(bytes, line_pos);
-            self.wrap_unit(text, line_pos..content_end, (target, target), (0, 0), false);
-            let ends_block =
-                next >= bytes.len() || is_blank_line(bytes, next) || starts_new_block(bytes, next);
-            if ends_block {
-                return next;
-            }
-            line_pos = next;
+        if self.cursor >= self.tokens.len() {
+            self.complete = true;
+            return;
         }
-    }
 
-    fn layout_heading(
-        &mut self,
-        text: &str,
-        pos: usize,
-        marker_len: usize,
-        target: usize,
-    ) -> usize {
-        let bytes = text.as_bytes();
-        let (content_end, next) = line_bounds(bytes, pos);
-        let cont_col = (marker_len + 1).min(u16::MAX as usize) as u16;
-        let cont_width = target.saturating_sub(marker_len + 1).max(1);
-        self.wrap_unit(
-            text,
-            pos..content_end,
-            (target, cont_width),
-            (0, cont_col),
-            false,
-        );
-        next
-    }
-
-    fn layout_list_item(
-        &mut self,
-        text: &str,
-        pos: usize,
-        indent: usize,
-        marker_len: usize,
-        target: usize,
-    ) -> usize {
-        let bytes = text.as_bytes();
-        let mut line_pos = pos;
-        let last_content_end = loop {
-            let (content_end, next) = line_bounds(bytes, line_pos);
-            if next >= bytes.len() || is_blank_line(bytes, next) || starts_new_block(bytes, next) {
-                line_pos = next;
-                break content_end;
-            }
-            line_pos = next;
-        };
-        let marker_start = pos + indent;
-        let content_start = marker_start + marker_len;
-        let content_col = (indent + marker_len).min(u16::MAX as usize) as u16;
-        let width = target.saturating_sub(indent + marker_len).max(1);
-        self.push_line();
-        self.emit_text(text, marker_start, content_start, indent as u16);
-        self.wrap_unit(
-            text,
-            content_start..last_content_end,
-            (width, width),
-            (content_col, content_col),
-            true,
-        );
-        line_pos
-    }
-
-    fn layout_quote(&mut self, text: &str, pos: usize, indent: usize, target: usize) -> usize {
-        let bytes = text.as_bytes();
-        let content_col = (indent + 2).min(u16::MAX as usize) as u16;
-        let width = target.saturating_sub(indent + 2).max(1);
-        let mut line_pos = pos;
-        loop {
-            let (content_end, next) = line_bounds(bytes, line_pos);
-            let line_indent = bytes[line_pos..content_end]
-                .iter()
-                .take_while(|b| matches!(b, b' ' | b'\t'))
-                .count();
-            let marker_start = line_pos + line_indent;
-            let mut content_start = marker_start + 1;
-            if bytes.get(content_start) == Some(&b' ') {
-                content_start += 1;
-            }
-            let content_start = content_start.min(content_end);
-            let mut wrapped = false;
-            for range in bwrap::wrap_ranges(&text[content_start..content_end], width, width) {
-                self.push_line();
-                self.emit_text(text, marker_start, marker_start + 1, indent as u16);
-                self.emit_text(
+        match &self.tokens[self.cursor].kind {
+            TokenKind::ParagraphStart => {
+                let end = self.find_token(self.cursor + 1, |kind| {
+                    matches!(kind, TokenKind::ParagraphEnd)
+                });
+                self.layout_inline_lines(
                     text,
-                    content_start + range.start,
-                    content_start + range.end,
-                    content_col,
+                    self.cursor + 1,
+                    end,
+                    Style::DEFAULT,
+                    (target, target),
+                    (0, 0),
                 );
-                wrapped = true;
+                self.cursor = end.saturating_add(1);
             }
-            if !wrapped {
-                self.push_line();
-                self.emit_text(text, marker_start, marker_start + 1, indent as u16);
+            TokenKind::HeaderStart => {
+                let marker = token_range(&self.tokens[self.cursor]);
+                let end =
+                    self.find_token(self.cursor + 1, |kind| matches!(kind, TokenKind::HeaderEnd));
+                let prefix = LinePrefix {
+                    visible: None,
+                    invisible: vec![marker],
+                };
+                self.layout_inline_line(
+                    text,
+                    self.cursor + 1,
+                    end,
+                    Style::DEFAULT | Modifier::BOLD,
+                    (target, target),
+                    (0, 0),
+                    prefix,
+                );
+                self.cursor = end.saturating_add(1);
             }
-            line_pos = next;
-            if line_pos >= bytes.len()
-                || !matches!(classify(bytes, line_pos), BlockKind::Blockquote { .. })
-            {
-                return line_pos;
+            TokenKind::UnorderedListStart | TokenKind::OrderedListStart => {
+                self.cursor = self.layout_list(text, self.cursor + 1, target);
             }
+            TokenKind::CodeBlock { content, .. } => {
+                let content = content.start as usize..content.end as usize;
+                let source = token_range(&self.tokens[self.cursor]);
+                self.layout_code_block(text, content, source, avail);
+                self.cursor += 1;
+            }
+            _ => self.cursor += 1,
         }
     }
 
-    fn layout_fence(
-        &mut self,
-        text: &str,
-        pos: usize,
-        fence: u8,
-        count: usize,
-        avail: usize,
-    ) -> usize {
-        let bytes = text.as_bytes();
-        let mut line_pos = pos;
-        let mut first = true;
-        loop {
-            if line_pos >= bytes.len() {
-                return line_pos;
-            }
-            let (content_end, next) = line_bounds(bytes, line_pos);
-            self.emit_verbatim(text, line_pos, content_end, avail);
-            let closes = !first && is_fence_closer(&bytes[line_pos..content_end], fence, count);
-            first = false;
-            line_pos = next;
-            if closes {
-                return line_pos;
-            }
-        }
+    fn find_token(&self, start: usize, pred: impl Fn(&TokenKind) -> bool) -> usize {
+        self.tokens[start..]
+            .iter()
+            .position(|token| pred(&token.kind))
+            .map_or(self.tokens.len(), |offset| start + offset)
     }
 
-    fn wrap_unit(
+    fn layout_inline_lines(
         &mut self,
         text: &str,
-        range: Range<usize>,
+        start: usize,
+        end: usize,
+        base_style: Style,
         widths: (usize, usize),
         cols: (u16, u16),
-        continue_line: bool,
     ) {
-        let mut first = true;
-        for wrapped in bwrap::wrap_ranges(&text[range.clone()], widths.0, widths.1) {
-            if !(first && continue_line) {
-                self.push_line();
+        let mut line_start = start;
+        for i in start..end {
+            if matches!(self.tokens[i].kind, TokenKind::HardBreak) {
+                self.layout_inline_line(
+                    text,
+                    line_start,
+                    i,
+                    base_style,
+                    widths,
+                    cols,
+                    LinePrefix::default(),
+                );
+                line_start = i + 1;
             }
-            let col = if first { cols.0 } else { cols.1 };
-            self.emit_text(
-                text,
-                range.start + wrapped.start,
-                range.start + wrapped.end,
-                col,
-            );
-            first = false;
         }
-        if first && !continue_line {
+        self.layout_inline_line(
+            text,
+            line_start,
+            end,
+            base_style,
+            widths,
+            cols,
+            LinePrefix::default(),
+        );
+    }
+
+    fn layout_list(&mut self, text: &str, mut cursor: usize, target: usize) -> usize {
+        while cursor < self.tokens.len() {
+            match &self.tokens[cursor].kind {
+                TokenKind::ListItemStart { marker } => {
+                    let marker = marker.start as usize..marker.end as usize;
+                    let end =
+                        self.find_token(cursor + 1, |kind| matches!(kind, TokenKind::ListItemEnd));
+                    let marker_width = UnicodeWidthStr::width(&text[marker.clone()]);
+                    let content_col = marker_width.min(u16::MAX as usize) as u16;
+                    let content_width = target.saturating_sub(marker_width).max(1);
+                    let prefix = LinePrefix {
+                        visible: Some((marker, self.syntax.keyword | Modifier::BOLD)),
+                        invisible: Vec::new(),
+                    };
+                    self.layout_inline_line(
+                        text,
+                        cursor + 1,
+                        end,
+                        Style::DEFAULT,
+                        (target, content_width),
+                        (0, content_col),
+                        prefix,
+                    );
+                    cursor = end.saturating_add(1);
+                }
+                TokenKind::ListEnd => return cursor + 1,
+                _ => cursor += 1,
+            }
+        }
+        cursor
+    }
+
+    fn layout_inline_line(
+        &mut self,
+        text: &str,
+        start: usize,
+        end: usize,
+        base_style: Style,
+        widths: (usize, usize),
+        cols: (u16, u16),
+        prefix: LinePrefix,
+    ) {
+        let mut display = String::new();
+        let mut pieces = Vec::new();
+        let mut invisible = Vec::new();
+
+        if let Some((source, style)) = prefix.visible {
+            append_piece(text, &mut display, &mut pieces, source, style);
+        }
+        for source in prefix.invisible {
+            invisible.push(InvisibleSource {
+                source,
+                display_pos: display.len(),
+            });
+        }
+
+        self.collect_inline_pieces(
+            text,
+            start,
+            end,
+            base_style,
+            &mut display,
+            &mut pieces,
+            &mut invisible,
+        );
+        self.wrap_pieces(&display, &pieces, &invisible, widths, cols);
+    }
+
+    fn collect_inline_pieces(
+        &self,
+        text: &str,
+        start: usize,
+        end: usize,
+        base_style: Style,
+        display: &mut String,
+        pieces: &mut Vec<RenderPiece>,
+        invisible: &mut Vec<InvisibleSource>,
+    ) {
+        let mut bold = false;
+        let mut italic = false;
+
+        for token in &self.tokens[start..end] {
+            match &token.kind {
+                TokenKind::Text | TokenKind::Url => append_piece(
+                    text,
+                    display,
+                    pieces,
+                    token_range(token),
+                    self.inline_style(base_style, bold, italic, false),
+                ),
+                TokenKind::InlineCode => append_piece(
+                    text,
+                    display,
+                    pieces,
+                    token_range(token),
+                    self.inline_style(base_style, bold, italic, true),
+                ),
+                TokenKind::BoldStart => {
+                    invisible.push(InvisibleSource {
+                        source: token_range(token),
+                        display_pos: display.len(),
+                    });
+                    bold = true;
+                }
+                TokenKind::BoldEnd => {
+                    invisible.push(InvisibleSource {
+                        source: token_range(token),
+                        display_pos: display.len(),
+                    });
+                    bold = false;
+                }
+                TokenKind::ItalicStart => {
+                    invisible.push(InvisibleSource {
+                        source: token_range(token),
+                        display_pos: display.len(),
+                    });
+                    italic = true;
+                }
+                TokenKind::ItalicEnd => {
+                    invisible.push(InvisibleSource {
+                        source: token_range(token),
+                        display_pos: display.len(),
+                    });
+                    italic = false;
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn inline_style(&self, base: Style, bold: bool, italic: bool, code: bool) -> Style {
+        let mut style = base;
+        if code {
+            style = style.patch(self.syntax.string);
+        }
+        if bold {
+            style = style | Modifier::BOLD;
+        }
+        if italic {
+            style = style | Modifier::ITALIC;
+        }
+        style
+    }
+
+    fn wrap_pieces(
+        &mut self,
+        display: &str,
+        pieces: &[RenderPiece],
+        invisible: &[InvisibleSource],
+        widths: (usize, usize),
+        cols: (u16, u16),
+    ) {
+        if display.is_empty() {
             self.push_line();
+            for source in invisible {
+                self.note_source_range(source.source.start, source.source.end);
+            }
+            return;
+        }
+
+        let mut wrapped_any = false;
+        for wrapped in bwrap::wrap_ranges(display, widths.0, widths.1) {
+            let base_col = if wrapped_any { cols.1 } else { cols.0 };
+            wrapped_any = true;
+            self.push_line();
+            for source in invisible {
+                if wrapped.start <= source.display_pos && source.display_pos <= wrapped.end {
+                    self.note_source_range(source.source.start, source.source.end);
+                }
+            }
+            for piece in pieces {
+                let start = piece.display.start.max(wrapped.start);
+                let end = piece.display.end.min(wrapped.end);
+                if start >= end {
+                    continue;
+                }
+                let source_start = piece.source.start + (start - piece.display.start);
+                let source_end = piece.source.start + (end - piece.display.start);
+                let prefix_width = UnicodeWidthStr::width(&display[wrapped.start..start]);
+                let col = base_col.saturating_add(prefix_width.min(u16::MAX as usize) as u16);
+                self.emit_segment(source_start..source_end, col, piece.style);
+            }
+        }
+
+        if !wrapped_any {
+            self.push_line();
+            for source in invisible {
+                self.note_source_range(source.source.start, source.source.end);
+            }
+            for piece in pieces {
+                self.note_source_range(piece.source.start, piece.source.end);
+            }
+        }
+    }
+
+    fn layout_code_block(
+        &mut self,
+        text: &str,
+        content: Range<usize>,
+        source: Range<usize>,
+        avail: usize,
+    ) {
+        if content.is_empty() {
+            self.push_line();
+            self.note_source_range(source.start, source.end);
+            return;
+        }
+
+        let mut pos = content.start;
+        while pos <= content.end {
+            let (line_end, next) = line_bounds_limited(text.as_bytes(), pos, content.end);
+            self.emit_verbatim(text, pos, line_end, avail, self.syntax.string);
+            if next >= content.end {
+                break;
+            }
+            pos = next;
         }
     }
 
@@ -1084,7 +1210,7 @@ impl MessageLayout {
         self.line_sources.push((u32::MAX, 0));
     }
 
-    fn emit_verbatim(&mut self, text: &str, start: usize, end: usize, avail: usize) {
+    fn emit_verbatim(&mut self, text: &str, start: usize, end: usize, avail: usize, style: Style) {
         self.push_line();
         if start == end {
             self.note_source_range(start, end);
@@ -1096,7 +1222,7 @@ impl MessageLayout {
         for (i, ch) in text[start..end].char_indices() {
             let w = UnicodeWidthChar::width(ch).unwrap_or(1);
             if width + w > avail && width > 0 {
-                self.emit_text(text, chunk_start, start + i, 0);
+                self.emit_segment(chunk_start..start + i, 0, style);
                 self.push_line();
                 chunk_start = start + i;
                 width = 0;
@@ -1104,71 +1230,20 @@ impl MessageLayout {
             width += w;
         }
         if chunk_start < end {
-            self.emit_text(text, chunk_start, end, 0);
+            self.emit_segment(chunk_start..end, 0, style);
         }
     }
 
-    fn emit_text(&mut self, text: &str, mut start: usize, end: usize, mut col: u16) {
-        self.note_source_range(start, end);
-        let bytes = text.as_bytes();
-        while start < end {
-            let mut brk = start;
-            while brk < end && bytes[brk] != b'\n' && bytes[brk] != b'\r' {
-                brk += 1;
-            }
-            let mut piece_end = brk;
-            while piece_end > start && matches!(bytes[piece_end - 1], b' ' | b'\t') {
-                piece_end -= 1;
-            }
-            if piece_end > start {
-                col = self.emit_styled(text, start, piece_end, col);
-            }
-            if brk >= end {
-                break;
-            }
-            let mut next = brk;
-            while next < end && matches!(bytes[next], b' ' | b'\t' | b'\n' | b'\r') {
-                next += 1;
-            }
-            col = col.saturating_add(1);
-            start = next;
-        }
-    }
-
-    fn emit_styled(&mut self, text: &str, start: usize, end: usize, mut col: u16) -> u16 {
-        let syntax = self.syntax;
-        let Self { hl, segments, .. } = self;
-        let mut push = |s: usize, e: usize, style: Style, col: u16| -> u16 {
-            segments.push(Segment {
+    fn emit_segment(&mut self, range: Range<usize>, col: u16, style: Style) {
+        self.note_source_range(range.start, range.end);
+        if range.start < range.end {
+            self.segments.push(Segment {
                 col,
-                start: s as u32,
-                end: e as u32,
+                start: range.start as u32,
+                end: range.end as u32,
                 style,
             });
-            col.saturating_add(UnicodeWidthStr::width(&text[s..e]).min(u16::MAX as usize) as u16)
-        };
-        let mut cursor = start;
-        for span in hl.render(Span::new(start as u32, (end - start) as u32)) {
-            let s = (span.span.offset as usize).max(cursor);
-            let e = (span.span.end() as usize).min(end);
-            if e <= s {
-                continue;
-            }
-            if s > cursor {
-                col = push(cursor, s, Style::DEFAULT, col);
-            }
-            let style = if span.local_kind == tinyhl::kind::WHITESPACE {
-                Style::DEFAULT
-            } else {
-                syntax.style(&span)
-            };
-            col = push(s, e, style, col);
-            cursor = e;
         }
-        if cursor < end {
-            col = push(cursor, end, Style::DEFAULT, col);
-        }
-        col
     }
 
     fn note_source_range(&mut self, start: usize, end: usize) {
@@ -1195,74 +1270,41 @@ impl MessageLayout {
     }
 }
 
-fn line_bounds(bytes: &[u8], pos: usize) -> (usize, usize) {
+fn append_piece(
+    text: &str,
+    display: &mut String,
+    pieces: &mut Vec<RenderPiece>,
+    source: Range<usize>,
+    style: Style,
+) {
+    if source.is_empty() {
+        return;
+    }
+    let start = display.len();
+    display.push_str(&text[source.clone()]);
+    pieces.push(RenderPiece {
+        source,
+        display: start..display.len(),
+        style,
+    });
+}
+
+fn token_range(token: &Token) -> Range<usize> {
+    token.range.start as usize..token.range.end as usize
+}
+
+fn line_bounds_limited(bytes: &[u8], pos: usize, limit: usize) -> (usize, usize) {
     let mut end = pos;
-    while end < bytes.len() && bytes[end] != b'\n' {
+    while end < limit && bytes[end] != b'\n' {
         end += 1;
     }
-    let next = if end < bytes.len() { end + 1 } else { end };
+    let next = if end < limit { end + 1 } else { end };
     let content_end = if end > pos && bytes[end - 1] == b'\r' {
         end - 1
     } else {
         end
     };
     (content_end, next)
-}
-
-fn is_blank_line(bytes: &[u8], pos: usize) -> bool {
-    let (content_end, _) = line_bounds(bytes, pos);
-    bytes[pos..content_end]
-        .iter()
-        .all(|b| matches!(b, b' ' | b'\t'))
-}
-
-fn list_marker_len(rest: &[u8]) -> Option<usize> {
-    match rest.first()? {
-        b'-' | b'+' | b'*' => (rest.get(1) == Some(&b' ')).then_some(2),
-        b'0'..=b'9' => {
-            let digits = rest.iter().take_while(|b| b.is_ascii_digit()).count();
-            if digits > 9 {
-                return None;
-            }
-            match (rest.get(digits), rest.get(digits + 1)) {
-                (Some(b'.') | Some(b')'), Some(b' ')) => Some(digits + 2),
-                _ => None,
-            }
-        }
-        _ => None,
-    }
-}
-
-fn classify(bytes: &[u8], pos: usize) -> BlockKind {
-    let (content_end, _) = line_bounds(bytes, pos);
-    let line = &bytes[pos..content_end];
-    let indent = line
-        .iter()
-        .take_while(|b| matches!(b, b' ' | b'\t'))
-        .count();
-    let rest = &line[indent..];
-    if indent <= 3 && (rest.starts_with(b"```") || rest.starts_with(b"~~~")) {
-        let fence = rest[0];
-        let count = rest.iter().take_while(|&&b| b == fence).count();
-        return BlockKind::Fence { fence, count };
-    }
-    if indent == 0 && rest.first() == Some(&b'#') {
-        let hashes = rest.iter().take_while(|&&b| b == b'#').count();
-        if hashes <= 6 && matches!(rest.get(hashes), None | Some(b' ') | Some(b'\t')) {
-            return BlockKind::Heading { marker_len: hashes };
-        }
-    }
-    if rest.first() == Some(&b'>') {
-        return BlockKind::Blockquote { indent };
-    }
-    if let Some(marker_len) = list_marker_len(rest) {
-        return BlockKind::ListItem { indent, marker_len };
-    }
-    BlockKind::Paragraph
-}
-
-fn starts_new_block(bytes: &[u8], pos: usize) -> bool {
-    !matches!(classify(bytes, pos), BlockKind::Paragraph)
 }
 
 fn estimate_lines(text: &str, avail: usize) -> usize {
@@ -1292,19 +1334,6 @@ pub fn format_age(elapsed_ms: u64) -> String {
     format!("{}d", elapsed_ms / 86_400_000)
 }
 
-fn is_fence_closer(line: &[u8], fence: u8, count: usize) -> bool {
-    let indent = line
-        .iter()
-        .take_while(|b| matches!(b, b' ' | b'\t'))
-        .count();
-    if indent > 3 {
-        return false;
-    }
-    let rest = &line[indent..];
-    let n = rest.iter().take_while(|&&b| b == fence).count();
-    n >= count && rest[n..].iter().all(|b| matches!(b, b' ' | b'\t'))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1327,7 +1356,7 @@ mod tests {
                 timestamp_ms,
                 local,
                 file_transfer_id: None,
-                links: crate::link::find_urls(body),
+                links: crate::markdown::link_ranges(body),
                 expanded: false,
                 layout: MessageLayout::new(),
             });
@@ -1343,12 +1372,13 @@ mod tests {
             .collect()
     }
 
-    /// A fenced code block laying out to exactly `n` rendered lines (`n >= 2`):
-    /// an opening fence, `n - 2` content lines, and a closing fence.
+    /// A fenced code block laying out to exactly `n` rendered content lines.
     fn fenced(n: usize) -> String {
-        let mut body = String::from("```");
-        for i in 0..n.saturating_sub(2) {
-            body.push('\n');
+        let mut body = String::from("```\n");
+        for i in 0..n {
+            if i > 0 {
+                body.push('\n');
+            }
             body.push_str(&i.to_string());
         }
         body.push_str("\n```");
