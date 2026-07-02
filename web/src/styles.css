@@ -258,6 +258,7 @@ body {
 
 .message-media {
   margin-top: 4px;
+  margin-bottom: 6px;
 }
 
 /* The width/height attributes carry the intrinsic aspect ratio, so the box is
@@ -297,15 +298,11 @@ body {
 
 .media-file {
   display: inline-block;
-  padding: var(--space);
-  background: var(--bg);
-  border: 1px solid var(--border);
+  padding: 0;
+  background: transparent;
+  border: 0;
   color: var(--text);
   text-decoration: none;
-}
-
-.media-file:hover {
-  border-color: var(--accent);
 }
 
 .message-progress {
@@ -388,14 +385,20 @@ body {
   width: 28px;
   height: 28px;
   padding: 0;
-  background: var(--bg);
-  border: 1px solid var(--border);
+  background: var(--bg-elevated);
+  border: 0;
   color: var(--text);
   cursor: pointer;
 }
 
-.screenshare-button:hover {
-  border-color: var(--accent);
+.screenshare-button:hover,
+.screenshare-button:focus-visible {
+  background: var(--accent);
+}
+
+.screenshare-button:focus-visible {
+  outline: 1px solid var(--text-dim);
+  outline-offset: 1px;
 }
 
 .screenshare-error {
@@ -508,9 +511,15 @@ body {
 .hl-40 { color: var(--hl-fg); }
 
 /* A fenced code block in a message, rendered from Rust highlight spans. */
+.code-block-frame {
+  position: relative;
+  max-width: 100%;
+  margin: 0.35em 0 0.7em;
+}
+
 .code-block {
-  margin: 0.35em 0 0;
-  padding: var(--space);
+  margin: 0;
+  padding: var(--space) calc(var(--space) + 32px) var(--space) var(--space);
   background: var(--bg-code);
   border: 1px solid var(--border);
   overflow-x: auto;
@@ -523,6 +532,43 @@ body {
   font-family: inherit;
   white-space: pre;
   color: var(--hl-fg);
+}
+
+.code-block-copy {
+  position: absolute;
+  top: 4px;
+  right: 4px;
+  z-index: 1;
+  display: inline-grid;
+  place-items: center;
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  color: var(--text-dim);
+  background: var(--bg-elevated);
+  border: 0;
+  cursor: pointer;
+  opacity: 0;
+  pointer-events: none;
+}
+
+.code-block-frame:hover .code-block-copy,
+.code-block-frame:focus-within .code-block-copy,
+.code-block-copy:hover,
+.code-block-copy:focus-visible {
+  opacity: 1;
+  pointer-events: auto;
+}
+
+.code-block-copy:hover,
+.code-block-copy:focus-visible {
+  color: var(--text);
+  background: var(--accent);
+}
+
+.code-block-copy:focus-visible {
+  outline: 1px solid var(--text-dim);
+  outline-offset: 1px;
 }
 
 /* ---------------------------------------------------------------------------
@@ -545,13 +591,20 @@ body {
   font: inherit;
   color: var(--text-sender);
   background: var(--bg-elevated);
-  border: 1px solid var(--border);
+  border: 0;
   padding: 4px 10px;
   cursor: pointer;
 }
 
-.media-file-open:hover {
-  border-color: var(--accent);
+.media-file-open:hover,
+.media-file-open:focus-visible {
+  color: var(--text);
+  background: var(--accent);
+}
+
+.media-file-open:focus-visible {
+  outline: 1px solid var(--text-dim);
+  outline-offset: 1px;
 }
 
 .media-file-name {
@@ -723,7 +776,6 @@ body {
   background: transparent;
   border: 0;
   border-right: 1px solid var(--border);
-  border-bottom: 2px solid transparent;
   font: inherit;
   font-family: var(--font-mono);
   font-size: 12px;
@@ -785,7 +837,6 @@ body {
 .preview-tab.is-active {
   color: var(--text-sender);
   background: var(--bg);
-  border-bottom-color: var(--text-dim);
 }
 
 .preview-tab-select:focus-visible,
@@ -823,6 +874,13 @@ body {
 .preview-panel-close:hover,
 .preview-panel-close:focus-visible {
   color: var(--text);
+  background: var(--bg);
+}
+
+.preview-panel-download:focus-visible,
+.preview-panel-close:focus-visible {
+  outline: 1px solid var(--text-dim);
+  outline-offset: 1px;
 }
 
 .preview-panel-content {
@@ -855,7 +913,7 @@ body {
   padding: 0 8px;
   color: var(--text);
   background: var(--bg-elevated);
-  border: 1px solid var(--border);
+  border: 0;
   font: inherit;
   font-size: 12px;
   cursor: pointer;
@@ -863,11 +921,12 @@ body {
 
 .image-viewer-toolbar button:hover:not(:disabled),
 .image-viewer-toolbar button:focus-visible {
-  border-color: var(--text-dim);
+  background: var(--accent);
 }
 
 .image-viewer-toolbar button:focus-visible {
-  outline: none;
+  outline: 1px solid var(--text-dim);
+  outline-offset: 1px;
 }
 
 .image-viewer-toolbar button:disabled {
@@ -898,10 +957,6 @@ body {
   touch-action: none;
   user-select: none;
   outline: none;
-}
-
-.image-viewer-viewport:focus-visible {
-  box-shadow: inset 0 0 0 1px var(--text-dim);
 }
 
 .image-viewer-viewport.is-pannable {
@@ -1013,6 +1068,7 @@ body {
   display: flex;
   flex-wrap: wrap;
   gap: var(--space);
+  padding-left: calc(var(--gutter) - var(--space-lg));
 }
 
 .composer-chip {
@@ -1047,12 +1103,64 @@ body {
   padding: 0;
 }
 
-.composer-chip-remove:hover {
+.composer-chip-remove:hover,
+.composer-chip-remove:focus-visible {
+  background: var(--accent);
   color: var(--text);
+}
+
+.composer-chip-remove:focus-visible {
+  outline: 1px solid var(--text-dim);
+  outline-offset: 1px;
+}
+
+.composer-input-row {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--space);
+  min-width: 0;
+}
+
+.composer-attach {
+  display: inline-grid;
+  place-items: center;
+  flex: 0 0 calc(var(--gutter) - var(--space-lg) - var(--space));
+  width: calc(var(--gutter) - var(--space-lg) - var(--space));
+  height: calc(1lh + 16px);
+  padding: 0;
+  color: var(--text);
+  background: transparent;
+  border: 0;
+  cursor: pointer;
+  font: inherit;
+  line-height: var(--line-height);
+}
+
+.composer-attach:hover,
+.composer-attach:focus-visible {
+  color: var(--text-sender);
+  background: transparent;
+}
+
+.composer-attach:focus-visible {
+  outline: 1px solid var(--text-dim);
+  outline-offset: 1px;
+}
+
+.composer-attach .icon {
+  width: 24px;
+  height: 24px;
+  opacity: 0.5;
+}
+
+.composer-file-input {
+  display: none;
 }
 
 .composer-text {
   display: block;
+  flex: 1 1 auto;
+  min-width: 0;
   width: 100%;
   min-height: calc(1lh + 16px);
   max-height: calc(12lh + 16px);

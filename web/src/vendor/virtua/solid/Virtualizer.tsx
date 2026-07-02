@@ -21,6 +21,7 @@ import {
   createVirtualStore,
   ACTION_ITEMS_LENGTH_CHANGE,
   getScrollSize,
+  ACTION_END_OFFSET_CHANGE,
   ACTION_START_OFFSET_CHANGE,
   createResizer,
   createScroller,
@@ -150,6 +151,10 @@ export interface VirtualizerProps<T> {
    */
   startMargin?: number;
   /**
+   * Extra scrollable space after the last item in pixels.
+   */
+  endMargin?: number;
+  /**
    * Callback invoked whenever scroll offset changes.
    * @param offset Current scrollTop, or scrollLeft if horizontal: true.
    */
@@ -251,6 +256,17 @@ export const Virtualizer = <T,>(props: VirtualizerProps<T>): JSX.Element => {
       (value) => {
         if (value !== store.$getStartSpacerSize()) {
           store.$update(ACTION_START_OFFSET_CHANGE, value);
+        }
+      },
+    ),
+  );
+
+  createComputed(
+    on(
+      () => props.endMargin || 0,
+      (value) => {
+        if (value !== store.$getEndSpacerSize()) {
+          store.$update(ACTION_END_OFFSET_CHANGE, value);
         }
       },
     ),

@@ -1,15 +1,30 @@
-import { createSignal, createEffect, onCleanup, onMount, For, Show } from "solid-js";
-import { Virtualizer, type VirtualizerHandle } from "./vendor/virtua/solid/Virtualizer";
-import type { WebMessage, ServerEnvelope, ClientRequest, ShareInfo, Fragment } from "./types";
+import {
+  batch,
+  createSignal,
+  createEffect,
+  onCleanup,
+  onMount,
+  For,
+  Show,
+} from "solid-js";
+import {
+  Virtualizer,
+  type VirtualizerHandle,
+} from "./vendor/virtua/solid/Virtualizer";
+import type {
+  WebMessage,
+  ServerEnvelope,
+  ClientRequest,
+  ShareInfo,
+  Fragment,
+} from "./types";
 import ScreenShare from "./ScreenShare";
 import { ScreenShareDecoder, parseFrame } from "./video-decode";
 import { renderInline } from "./highlight";
 import { decodeFeed } from "./feed";
+import { markImageError, markImageLoaded } from "./image-cache";
 import Icon, { IconSprite } from "./Icon";
-import PreviewPanel, {
-  previewKey,
-  type PreviewItem,
-} from "./PreviewPanel";
+import PreviewPanel, { previewKey, type PreviewItem } from "./PreviewPanel";
 
 // Pixel tolerance when deciding the view is "at the bottom". Scroll positions
 // are fractional, so an exact comparison would intermittently read as
@@ -58,6 +73,7 @@ const MIN_PREVIEW_PANEL_WIDTH = 320;
 const MIN_CHAT_SPLIT_WIDTH = 320;
 const PREVIEW_PANEL_DIVIDER_SIZE = 3;
 const PREVIEW_PANEL_KEY_STEP = 32;
+const CHAT_END_MARGIN_PX = 8;
 
 // Builds the asset URL for an attachment served from the client's receive dir.
 function fileUrl(name: string): string {
@@ -89,14 +105,18 @@ function uploadDebugEnabled(): boolean {
 }
 
 function socketDebugEnabled(): boolean {
-  return debugFlagEnabled("debugSocket", "chatt.debugSocket") || uploadDebugEnabled();
+  return (
+    debugFlagEnabled("debugSocket", "chatt.debugSocket") || uploadDebugEnabled()
+  );
 }
 
 function debugImageTiming(stage: string, name: string, url: string) {
   if (!imageDebugEnabled() || typeof performance === "undefined") return;
   const href = new URL(url, location.href).href;
   const entries = performance.getEntriesByName(href);
-  const timing = entries[entries.length - 1] as PerformanceResourceTiming | undefined;
+  const timing = entries[entries.length - 1] as
+    | PerformanceResourceTiming
+    | undefined;
   console.debug("[chatt:image]", {
     stage,
     name,
@@ -112,7 +132,10 @@ function debugUpload(stage: string, fields: Record<string, unknown>) {
   if (!uploadDebugEnabled()) return;
   console.debug("[chatt:upload]", {
     stage,
-    t: typeof performance === "undefined" ? undefined : Math.round(performance.now() * 10) / 10,
+    t:
+      typeof performance === "undefined"
+        ? undefined
+        : Math.round(performance.now() * 10) / 10,
     ...fields,
   });
 }
@@ -121,7 +144,10 @@ function debugSocket(stage: string, fields: Record<string, unknown> = {}) {
   if (!socketDebugEnabled()) return;
   console.debug("[chatt:ws]", {
     stage,
-    t: typeof performance === "undefined" ? undefined : Math.round(performance.now() * 10) / 10,
+    t:
+      typeof performance === "undefined"
+        ? undefined
+        : Math.round(performance.now() * 10) / 10,
     ...fields,
   });
 }
@@ -170,29 +196,39 @@ function imageExtension(type: string): string {
 }
 
 function timestampForFileName(date: Date): string {
-  return date.toISOString().replace(/\.\d{3}Z$/, "Z").replace(/[:.]/g, "-");
+  return date
+    .toISOString()
+    .replace(/\.\d{3}Z$/, "Z")
+    .replace(/[:.]/g, "-");
 }
 
 function withPastedImageName(file: File, pastedAt: Date, index: number): File {
   const name = file.name.trim();
-  if (name && !/^image\.(?:png|jpe?g|gif|webp|bmp|svg|avif|heic|heif)$/i.test(name)) {
+  if (
+    name &&
+    !/^image\.(?:png|jpe?g|gif|webp|bmp|svg|avif|heic|heif)$/i.test(name)
+  ) {
     return file;
   }
 
   const suffix = index === 0 ? "" : `-${index + 1}`;
   return new File(
     [file],
-    `pasted-image-${timestampForFileName(pastedAt)}${suffix}.${imageExtension(file.type)}`,
+    `pasted-image-${timestampForFileName(pastedAt)}${suffix}.${imageExtension(
+      file.type
+    )}`,
     {
       type: file.type,
       lastModified: file.lastModified,
-    },
+    }
   );
 }
 
 // Progress bar shown on a file's placeholder message while the host client
 // pulls the file off the relay. Replaced by the attachment on completion.
-function TransferProgressBar(props: { progress: { transferred: number; total: number } }) {
+function TransferProgressBar(props: {
+  progress: { transferred: number; total: number };
+}) {
   const ratio = () => {
     const { transferred, total } = props.progress;
     return total > 0 ? Math.min(1, transferred / total) : 0;
@@ -210,8 +246,8 @@ function TransferProgressBar(props: { progress: { transferred: number; total: nu
         <div class="message-progress-fill" style={{ width: `${pct()}%` }} />
       </div>
       <span class="message-progress-label">
-        receiving {formatBytes(props.progress.transferred)} / {formatBytes(props.progress.total)} (
-        {pct()}%)
+        receiving {formatBytes(props.progress.transferred)} /{" "}
+        {formatBytes(props.progress.total)} ({pct()}%)
       </span>
     </div>
   );
@@ -223,6 +259,8 @@ function TransferProgressBar(props: { progress: { transferred: number; total: nu
 // (progress merges keep the same fragments array), so it is a stable cache
 // key; replaced messages simply fall out with GC.
 const fragmentHtmlCache = new WeakMap<Fragment, string>();
+type CodeFragment = Extract<Fragment, { kind: "code" }>;
+const codeTextDecoder = new TextDecoder();
 
 function fragmentHtml(fragment: Fragment): string {
   let html = fragmentHtmlCache.get(fragment);
@@ -236,6 +274,80 @@ function fragmentHtml(fragment: Fragment): string {
   return html;
 }
 
+function codeFragmentText(fragment: CodeFragment): string {
+  return codeTextDecoder.decode(fragment.text);
+}
+
+async function copyTextToClipboard(text: string): Promise<void> {
+  if (navigator.clipboard?.writeText && window.isSecureContext) {
+    await navigator.clipboard.writeText(text);
+    return;
+  }
+
+  const previousSelection = document.getSelection();
+  const previousRange =
+    previousSelection && previousSelection.rangeCount > 0
+      ? previousSelection.getRangeAt(0)
+      : null;
+  const textarea = document.createElement("textarea");
+  textarea.value = text;
+  textarea.setAttribute("readonly", "");
+  textarea.style.position = "fixed";
+  textarea.style.top = "0";
+  textarea.style.left = "-9999px";
+  document.body.append(textarea);
+  textarea.select();
+  const copied = document.execCommand("copy");
+  textarea.remove();
+
+  if (previousSelection) {
+    previousSelection.removeAllRanges();
+    if (previousRange) previousSelection.addRange(previousRange);
+  }
+
+  if (!copied) throw new Error("copy command was rejected");
+}
+
+function CodeBlock(props: { fragment: CodeFragment }) {
+  const [copied, setCopied] = createSignal(false);
+  let resetTimer: number | undefined;
+
+  onCleanup(() => {
+    if (resetTimer !== undefined) clearTimeout(resetTimer);
+  });
+
+  async function copyCode() {
+    try {
+      await copyTextToClipboard(codeFragmentText(props.fragment));
+      setCopied(true);
+      if (resetTimer !== undefined) clearTimeout(resetTimer);
+      resetTimer = window.setTimeout(() => {
+        setCopied(false);
+        resetTimer = undefined;
+      }, 1500);
+    } catch (error) {
+      console.warn("[chatt:clipboard] copy failed", error);
+    }
+  }
+
+  return (
+    <div class="code-block-frame">
+      <pre class="code-block">
+        <code innerHTML={fragmentHtml(props.fragment)} />
+      </pre>
+      <button
+        class="code-block-copy"
+        type="button"
+        aria-label={copied() ? "Copied code" : "Copy code"}
+        title={copied() ? "Copied" : "Copy"}
+        onClick={copyCode}
+      >
+        <Icon name={copied() ? "check" : "copy"} />
+      </button>
+    </div>
+  );
+}
+
 // Renders a message body from Rust-produced subset HTML and precomputed code
 // highlight spans. Nothing is parsed or highlighted in the browser.
 function MessageBody(props: { fragments: Fragment[] }) {
@@ -245,9 +357,7 @@ function MessageBody(props: { fragments: Fragment[] }) {
         fragment.kind === "text" ? (
           <div class="message-body" innerHTML={fragmentHtml(fragment)} />
         ) : (
-          <pre class="code-block">
-            <code innerHTML={fragmentHtml(fragment)} />
-          </pre>
+          <CodeBlock fragment={fragment} />
         )
       }
     </For>
@@ -264,7 +374,8 @@ function Attachment(props: {
   // reserved by width/height, so this only affects the pixels, never layout.
   const [loaded, setLoaded] = createSignal(false);
   onMount(() => {
-    if (att().kind === "image") debugImageTiming("img:mount", att().name, url());
+    if (att().kind === "image")
+      debugImageTiming("img:mount", att().name, url());
   });
   return (
     <div class="message-media">
@@ -287,14 +398,16 @@ function Attachment(props: {
                 width: att().width,
                 height: att().height,
               },
-              event.currentTarget,
+              event.currentTarget
             )
           }
-          onLoad={() => {
+          onLoad={(event) => {
+            markImageLoaded(url(), event.currentTarget);
             debugImageTiming("img:load", att().name, url());
             setLoaded(true);
           }}
           onError={() => {
+            markImageError(url());
             debugImageTiming("img:error", att().name, url());
             setLoaded(true);
           }}
@@ -308,7 +421,7 @@ function Attachment(props: {
       </Show>
       <Show when={att().kind === "file"}>
         {/* Collapsed file card. Expanding opens the highlighted viewer, which
-          * falls back to a download for a non-text file. */}
+         * falls back to a download for a non-text file. */}
         <div class="media-file">
           <button
             class="media-file-open"
@@ -316,7 +429,7 @@ function Attachment(props: {
             onClick={(event) =>
               props.onOpenPreview(
                 { kind: "file", name: att().name },
-                event.currentTarget,
+                event.currentTarget
               )
             }
           >
@@ -358,8 +471,10 @@ function MessageRow(props: {
   return (
     <div class="message" classList={{ "is-continuation": continuation() }}>
       {/* The time always lives in the left gutter so it sits in one consistent
-        * column: shown on a group's first row, revealed on hover for the rest. */}
-      <span class="message-time-gutter">{formatTime(props.message.timestamp_ms)}</span>
+       * column: shown on a group's first row, revealed on hover for the rest. */}
+      <span class="message-time-gutter">
+        {formatTime(props.message.timestamp_ms)}
+      </span>
       <Show when={!continuation()}>
         <div class="message-meta">
           <span class="message-sender">{props.message.sender}</span>
@@ -382,7 +497,8 @@ function MessageRow(props: {
 export default function App() {
   const [messages, setMessages] = createSignal<WebMessage[]>([]);
   const [connected, setConnected] = createSignal(false);
-  const [connectionErrorVisible, setConnectionErrorVisible] = createSignal(false);
+  const [connectionErrorVisible, setConnectionErrorVisible] =
+    createSignal(false);
   // Drives virtua's `shift`: while true a data change is treated as a prepend so
   // scroll position is anchored from the end (reverse infinite scroll).
   const [prepend, setPrepend] = createSignal(false);
@@ -391,15 +507,23 @@ export default function App() {
   const [shares, setShares] = createSignal<ShareInfo[]>([]);
   const [playing, setPlaying] = createSignal<number[]>([]);
   // Per-stream play-failure messages reported by the client, shown on the row.
-  const [shareErrors, setShareErrors] = createSignal<Record<number, string>>({});
-  const [sharePaneHeight, setSharePaneHeight] = createSignal(DEFAULT_SHARE_PANE_HEIGHT);
-  const [fullscreenStream, setFullscreenStream] = createSignal<number | null>(null);
+  const [shareErrors, setShareErrors] = createSignal<Record<number, string>>(
+    {}
+  );
+  const [sharePaneHeight, setSharePaneHeight] = createSignal(
+    DEFAULT_SHARE_PANE_HEIGHT
+  );
+  const [fullscreenStream, setFullscreenStream] = createSignal<number | null>(
+    null
+  );
   // Direct opens promote an item to the front of this bounded history. Closing
   // the panel clears only the active key, so history survives until reload.
   const [previewHistory, setPreviewHistory] = createSignal<PreviewItem[]>([]);
-  const [activePreviewKey, setActivePreviewKey] = createSignal<string | null>(null);
+  const [activePreviewKey, setActivePreviewKey] = createSignal<string | null>(
+    null
+  );
   const [previewPanelWidth, setPreviewPanelWidth] = createSignal(
-    DEFAULT_PREVIEW_PANEL_WIDTH,
+    DEFAULT_PREVIEW_PANEL_WIDTH
   );
   const [previewPanelResizing, setPreviewPanelResizing] = createSignal(false);
   let previewOpener: HTMLElement | undefined;
@@ -414,17 +538,27 @@ export default function App() {
   function openPreview(item: PreviewItem, opener: HTMLElement) {
     const key = previewKey(item);
     previewOpener = opener;
-    setPreviewHistory((current) => [
-      item,
-      ...current.filter((candidate) => previewKey(candidate) !== key),
-    ].slice(0, PREVIEW_HISTORY_LIMIT));
-    setActivePreviewKey(key);
+    batch(() => {
+      setPreviewHistory((current) => {
+        const existing = current.find(
+          (candidate) => previewKey(candidate) === key
+        );
+        const nextItem = existing ?? item;
+        if (current[0] === nextItem) return current;
+        return [
+          nextItem,
+          ...current.filter((candidate) => previewKey(candidate) !== key),
+        ].slice(0, PREVIEW_HISTORY_LIMIT);
+      });
+      setActivePreviewKey(key);
+    });
   }
 
   function closePreview() {
     setActivePreviewKey(null);
     queueMicrotask(() => {
-      if (previewOpener?.isConnected) previewOpener.focus({ preventScroll: true });
+      if (previewOpener?.isConnected)
+        previewOpener.focus({ preventScroll: true });
     });
   }
 
@@ -434,12 +568,14 @@ export default function App() {
     if (index < 0) return;
 
     const next = current.filter((item) => previewKey(item) !== key);
-    setPreviewHistory(next);
-    if (activePreviewKey() !== key) return;
+    batch(() => {
+      setPreviewHistory(next);
+      if (activePreviewKey() !== key) return;
 
-    const replacement = next[index] ?? next[index - 1] ?? null;
-    if (replacement) setActivePreviewKey(previewKey(replacement));
-    else closePreview();
+      const replacement = next[index] ?? next[index - 1] ?? null;
+      if (replacement) setActivePreviewKey(previewKey(replacement));
+      else closePreview();
+    });
   }
 
   // The compose box is hidden until the client reports a writable feed in its
@@ -484,6 +620,7 @@ export default function App() {
   let logEl: HTMLDivElement | undefined;
   let contentEl: HTMLDivElement | undefined;
   let composerTextEl: HTMLTextAreaElement | undefined;
+  let composerFileInputEl: HTMLInputElement | undefined;
   let handle: VirtualizerHandle | undefined;
   let resizeObserver: ResizeObserver | undefined;
   let chatViewportResizeObserver: ResizeObserver | undefined;
@@ -536,7 +673,8 @@ export default function App() {
   function atBottom(): boolean {
     if (!handle) return true;
     return (
-      handle.scrollOffset >= handle.scrollSize - handle.viewportSize - BOTTOM_EPSILON
+      handle.scrollOffset >=
+      handle.scrollSize - handle.viewportSize - BOTTOM_EPSILON
     );
   }
 
@@ -571,9 +709,9 @@ export default function App() {
     const last = messages().length - 1;
     if (last < 0) return;
     suppress = true;
-    // scrollToIndex re-resolves the target as the last item (and a late-decoding
-    // image inside it) gets measured, so it lands exactly at the newest message.
-    handle.scrollToIndex(last, { align: "end" });
+    // Scroll to the virtual bottom so the configured end margin remains visible
+    // after the newest message.
+    handle.scrollTo(Math.max(0, handle.scrollSize - handle.viewportSize));
     // scrollToIndex is multi-frame and may emit zero scroll events when already
     // at the bottom, so clearing `suppress` from onScrollEnd would deadlock it.
     // Always clear on a timer that outlives the measurement window.
@@ -594,12 +732,22 @@ export default function App() {
     img.decoding = "async";
     img.loading = "eager";
     img.fetchPriority = "auto";
-    img.addEventListener("load", () => debugImageTiming("preload:load", att.name, url), {
-      once: true,
-    });
-    img.addEventListener("error", () => debugImageTiming("preload:error", att.name, url), {
-      once: true,
-    });
+    img.addEventListener(
+      "load",
+      () => {
+        markImageLoaded(url, img);
+        debugImageTiming("preload:load", att.name, url);
+      },
+      { once: true }
+    );
+    img.addEventListener(
+      "error",
+      () => {
+        markImageError(url);
+        debugImageTiming("preload:error", att.name, url);
+      },
+      { once: true }
+    );
     imagePreloads.set(url, { image: img });
     img.src = url;
 
@@ -616,7 +764,9 @@ export default function App() {
     let scanned = 0;
     for (
       let i = batch.length - 1;
-      i >= 0 && started < IMAGE_PRELOAD_BATCH_LIMIT && scanned < IMAGE_PRELOAD_SCAN_LIMIT;
+      i >= 0 &&
+      started < IMAGE_PRELOAD_BATCH_LIMIT &&
+      scanned < IMAGE_PRELOAD_SCAN_LIMIT;
       i--
     ) {
       scanned++;
@@ -639,18 +789,29 @@ export default function App() {
   function playShare(streamId: number) {
     if (socket && socket.readyState === WebSocket.OPEN) {
       clearShareError(streamId);
-      socket.send(JSON.stringify({ type: "play_share", stream_id: streamId } as ClientRequest));
+      socket.send(
+        JSON.stringify({
+          type: "play_share",
+          stream_id: streamId,
+        } as ClientRequest)
+      );
     }
   }
 
   function exitShareFullscreen() {
     setFullscreenStream(null);
-    if (document.fullscreenElement === mainEl) document.exitFullscreen().catch(() => {});
+    if (document.fullscreenElement === mainEl)
+      document.exitFullscreen().catch(() => {});
   }
 
   function stopShare(streamId: number) {
     if (socket && socket.readyState === WebSocket.OPEN) {
-      socket.send(JSON.stringify({ type: "stop_share", stream_id: streamId } as ClientRequest));
+      socket.send(
+        JSON.stringify({
+          type: "stop_share",
+          stream_id: streamId,
+        } as ClientRequest)
+      );
     }
     if (fullscreenStream() === streamId) exitShareFullscreen();
     closeDecoder(streamId);
@@ -721,7 +882,9 @@ export default function App() {
       : textArea.scrollHeight;
     textArea.style.height = `${nextHeight}px`;
     textArea.style.overflowY =
-      Number.isFinite(maxHeight) && textArea.scrollHeight > maxHeight ? "auto" : "hidden";
+      Number.isFinite(maxHeight) && textArea.scrollHeight > maxHeight
+        ? "auto"
+        : "hidden";
   }
 
   // Streams one queued file to the client: an `upload_start`, then binary chunks
@@ -742,7 +905,7 @@ export default function App() {
         upload_id: uploadId,
         name: file.name,
         size: file.size,
-      }),
+      })
     );
     for (let offset = 0; offset < file.size; offset += UPLOAD_CHUNK_BYTES) {
       const end = Math.min(file.size, offset + UPLOAD_CHUNK_BYTES);
@@ -764,7 +927,9 @@ export default function App() {
       await waitForUploadDrain(uploadId);
     }
     const current = openSocketOrThrow();
-    current.send(JSON.stringify({ type: "upload_finish", upload_id: uploadId }));
+    current.send(
+      JSON.stringify({ type: "upload_finish", upload_id: uploadId })
+    );
     debugUpload("finish", {
       upload_id: uploadId,
       name: file.name,
@@ -824,8 +989,22 @@ export default function App() {
   function onComposeDrop(event: DragEvent) {
     event.preventDefault();
     setDragActive(false);
-    const files = event.dataTransfer ? Array.from(event.dataTransfer.files) : [];
+    const files = event.dataTransfer
+      ? Array.from(event.dataTransfer.files)
+      : [];
     if (files.length > 0) setQueued((prev) => [...prev, ...files]);
+  }
+
+  function openComposeFileDialog() {
+    composerFileInputEl?.click();
+  }
+
+  function onComposeFileInput(
+    event: Event & { currentTarget: HTMLInputElement }
+  ) {
+    const files = Array.from(event.currentTarget.files ?? []);
+    if (files.length > 0) setQueued((prev) => [...prev, ...files]);
+    event.currentTarget.value = "";
   }
 
   function pastedImageFiles(data: DataTransfer | null): File[] {
@@ -845,7 +1024,9 @@ export default function App() {
     }
 
     const pastedAt = new Date();
-    return files.map((file, index) => withPastedImageName(file, pastedAt, index));
+    return files.map((file, index) =>
+      withPastedImageName(file, pastedAt, index)
+    );
   }
 
   function onComposePaste(event: ClipboardEvent) {
@@ -868,9 +1049,12 @@ export default function App() {
     if (total <= 0) return Math.max(MIN_SHARE_PANE_HEIGHT, height);
     const minShare = Math.min(
       MIN_SHARE_PANE_HEIGHT,
-      Math.max(96, total - MIN_CHAT_PANE_HEIGHT - DIVIDER_SIZE),
+      Math.max(96, total - MIN_CHAT_PANE_HEIGHT - DIVIDER_SIZE)
     );
-    const maxShare = Math.max(minShare, total - MIN_CHAT_PANE_HEIGHT - DIVIDER_SIZE);
+    const maxShare = Math.max(
+      minShare,
+      total - MIN_CHAT_PANE_HEIGHT - DIVIDER_SIZE
+    );
     return clamp(height, minShare, maxShare);
   }
 
@@ -884,11 +1068,11 @@ export default function App() {
     if (total <= 0) return Math.max(MIN_PREVIEW_PANEL_WIDTH, width);
     const minPreview = Math.min(
       MIN_PREVIEW_PANEL_WIDTH,
-      Math.max(240, total - MIN_CHAT_SPLIT_WIDTH - PREVIEW_PANEL_DIVIDER_SIZE),
+      Math.max(240, total - MIN_CHAT_SPLIT_WIDTH - PREVIEW_PANEL_DIVIDER_SIZE)
     );
     const maxPreview = Math.max(
       minPreview,
-      total - MIN_CHAT_SPLIT_WIDTH - PREVIEW_PANEL_DIVIDER_SIZE,
+      total - MIN_CHAT_SPLIT_WIDTH - PREVIEW_PANEL_DIVIDER_SIZE
     );
     return clamp(width, minPreview, maxPreview);
   }
@@ -950,15 +1134,15 @@ export default function App() {
             MIN_PREVIEW_PANEL_WIDTH,
             Math.max(
               240,
-              total - MIN_CHAT_SPLIT_WIDTH - PREVIEW_PANEL_DIVIDER_SIZE,
-            ),
+              total - MIN_CHAT_SPLIT_WIDTH - PREVIEW_PANEL_DIVIDER_SIZE
+            )
           )
         : MIN_PREVIEW_PANEL_WIDTH;
     const maxWidth =
       total > 0
         ? Math.max(
             minWidth,
-            total - MIN_CHAT_SPLIT_WIDTH - PREVIEW_PANEL_DIVIDER_SIZE,
+            total - MIN_CHAT_SPLIT_WIDTH - PREVIEW_PANEL_DIVIDER_SIZE
           )
         : Number.POSITIVE_INFINITY;
     let nextWidth = startWidth;
@@ -1018,14 +1202,10 @@ export default function App() {
   function onPreviewDividerKeyDown(event: KeyboardEvent) {
     if (event.key === "ArrowLeft") {
       event.preventDefault();
-      setClampedPreviewPanelWidth(
-        previewPanelWidth() + PREVIEW_PANEL_KEY_STEP,
-      );
+      setClampedPreviewPanelWidth(previewPanelWidth() + PREVIEW_PANEL_KEY_STEP);
     } else if (event.key === "ArrowRight") {
       event.preventDefault();
-      setClampedPreviewPanelWidth(
-        previewPanelWidth() - PREVIEW_PANEL_KEY_STEP,
-      );
+      setClampedPreviewPanelWidth(previewPanelWidth() - PREVIEW_PANEL_KEY_STEP);
     }
   }
 
@@ -1122,7 +1302,9 @@ export default function App() {
           setMessages((prev) => {
             if (msg.file_id !== null) {
               const i = prev.findIndex(
-                (m) => m.file_id === msg.file_id && m.timestamp_ms === msg.timestamp_ms,
+                (m) =>
+                  m.file_id === msg.file_id &&
+                  m.timestamp_ms === msg.timestamp_ms
               );
               if (i >= 0) {
                 const next = prev.slice();
@@ -1166,7 +1348,7 @@ export default function App() {
           decoders.set(env.stream_id, decoder);
           decoder.configure(env.codec, new Uint8Array(env.extradata));
           setPlaying((prev) =>
-            prev.includes(env.stream_id) ? prev : [...prev, env.stream_id],
+            prev.includes(env.stream_id) ? prev : [...prev, env.stream_id]
           );
         }
       } else if (env.type === "file_progress") {
@@ -1178,11 +1360,14 @@ export default function App() {
             (m) =>
               m.file_id === env.file_id &&
               m.timestamp_ms === env.timestamp_ms &&
-              !m.attachment,
+              !m.attachment
           );
           if (i < 0) return prev;
           const next = prev.slice();
-          next[i] = { ...next[i], progress: { transferred: env.transferred, total: env.total } };
+          next[i] = {
+            ...next[i],
+            progress: { transferred: env.transferred, total: env.total },
+          };
           return next;
         });
       } else if (env.type === "config") {
@@ -1279,7 +1464,10 @@ export default function App() {
     splitResizeObserver?.disconnect();
     previewSplitResizeObserver?.disconnect();
     if (viewportPinFrame) cancelAnimationFrame(viewportPinFrame);
-    document.removeEventListener("fullscreenchange", onDocumentFullscreenChange);
+    document.removeEventListener(
+      "fullscreenchange",
+      onDocumentFullscreenChange
+    );
     removePaneResizeListeners();
     removePreviewPanelResizeListeners();
     if (reconnectTimer) clearTimeout(reconnectTimer);
@@ -1312,7 +1500,11 @@ export default function App() {
             "is-share-fullscreen": fullscreenStream() !== null,
           }}
           ref={mainEl}
-          style={hasVideoPane() ? `--share-pane-height: ${sharePaneHeight()}px` : undefined}
+          style={
+            hasVideoPane()
+              ? `--share-pane-height: ${sharePaneHeight()}px`
+              : undefined
+          }
         >
           <Show when={shares().length > 0}>
             <section class="share-pane">
@@ -1327,8 +1519,8 @@ export default function App() {
                 canvasRef={registerCanvas}
               />
               {/* Drag the bottom edge of the black video area to resize the chat
-                * below. The grabber overlays the pane's lower edge; no separator
-                * line is drawn. */}
+               * below. The grabber overlays the pane's lower edge; no separator
+               * line is drawn. */}
               <Show when={hasVideoPane()}>
                 <div
                   class="pane-resize"
@@ -1356,6 +1548,7 @@ export default function App() {
                 ref={(h) => (handle = h)}
                 scrollRef={logEl}
                 data={messages()}
+                endMargin={CHAT_END_MARGIN_PX}
                 shift={prepend()}
                 onScroll={onScroll}
                 onScrollEnd={onScrollEnd}
@@ -1398,19 +1591,38 @@ export default function App() {
                   </For>
                 </div>
               </Show>
-              <textarea
-                class="composer-text"
-                ref={composerTextEl}
-                rows={1}
-                placeholder="Write a message… (drag files to attach)"
-                value={draft()}
-                onInput={(event) => {
-                  setDraft(event.currentTarget.value);
-                  resizeComposer();
-                }}
-                onKeyDown={onComposeKeyDown}
-                onPaste={onComposePaste}
-              />
+              <div class="composer-input-row">
+                <button
+                  class="composer-attach"
+                  type="button"
+                  aria-label="Attach files"
+                  title="Attach files"
+                  onClick={openComposeFileDialog}
+                >
+                  <Icon name="plus" />
+                </button>
+                <textarea
+                  class="composer-text"
+                  ref={composerTextEl}
+                  rows={1}
+                  placeholder="Write a message…"
+                  value={draft()}
+                  onInput={(event) => {
+                    setDraft(event.currentTarget.value);
+                    resizeComposer();
+                  }}
+                  onKeyDown={onComposeKeyDown}
+                  onPaste={onComposePaste}
+                />
+                <input
+                  class="composer-file-input"
+                  ref={composerFileInputEl}
+                  type="file"
+                  multiple
+                  tabIndex={-1}
+                  onChange={onComposeFileInput}
+                />
+              </div>
             </section>
           </Show>
         </main>

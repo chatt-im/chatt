@@ -2,12 +2,12 @@ import { createResource, Show, Suspense } from "solid-js";
 import CodeList from "./CodeList";
 import { decodeFileBuffer, type FileHighlight } from "./highlight";
 
+type FileLoadResult = { highlight: FileHighlight } | { error: string };
+
 // Fetches and decodes a file's highlight buffer from `/highlight/<name>`.
 // A 413 means the file is too large to preview, 415 means it is not UTF-8 text,
 // and any other non-200 is an error.
-async function loadFile(
-  name: string,
-): Promise<{ highlight: FileHighlight } | { error: string }> {
+async function loadFile(name: string): Promise<FileLoadResult> {
   try {
     const response = await fetch(`/highlight/${encodeURIComponent(name)}`);
     if (response.status === 413) return { error: "file too large to preview" };
@@ -30,22 +30,28 @@ async function loadFile(
 // Only visible lines build HTML, keeping very large files responsive.
 export default function FileViewer(props: { name: string }) {
   const [state] = createResource(() => props.name, loadFile);
+  const error = () => {
+    const result = state();
+    return result && "error" in result ? result.error : undefined;
+  };
+  const highlight = () => {
+    const result = state();
+    return result && "highlight" in result ? result.highlight : undefined;
+  };
 
   return (
     <div class="file-viewer">
       <Suspense fallback={<div class="file-viewer-status">loading…</div>}>
-        {(() => {
-          const result = state();
-          if (result && "error" in result) {
-            return <div class="file-viewer-status">{result.error}</div>;
-          }
-          const highlight = result?.highlight;
-          return (
-            <Show when={highlight}>
-              <CodeList highlight={highlight!} />
+        <Show
+          when={error()}
+          fallback={
+            <Show when={highlight()} keyed>
+              {(loadedHighlight) => <CodeList highlight={loadedHighlight} />}
             </Show>
-          );
-        })()}
+          }
+        >
+          {(message) => <div class="file-viewer-status">{message()}</div>}
+        </Show>
       </Suspense>
     </div>
   );

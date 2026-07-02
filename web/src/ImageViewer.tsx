@@ -3,14 +3,17 @@ import {
   createEffect,
   createMemo,
   createSignal,
+  on,
   onCleanup,
   onMount,
   Show,
 } from "solid-js";
+import { cachedImageState, markImageError, markImageLoaded } from "./image-cache";
 import Icon from "./Icon";
 
 type Point = { x: number; y: number };
 type Size = { width: number; height: number };
+type ImageLoadState = "loading" | "loaded" | "error";
 
 const MANUAL_ZOOM_MIN = 0.1;
 const MANUAL_ZOOM_MAX = 8;
@@ -29,6 +32,44 @@ function pointsEqual(a: Point, b: Point): boolean {
   return a.x === b.x && a.y === b.y;
 }
 
+function fileUrl(name: string): string {
+  return `/files/${encodeURIComponent(name)}`;
+}
+
+function hintedSize(width: number | null, height: number | null): Size {
+  return {
+    width: width && width > 0 ? width : 0,
+    height: height && height > 0 ? height : 0,
+  };
+}
+
+function measuredSize(image: HTMLImageElement): Size {
+  return {
+    width: image.naturalWidth > 0 ? image.naturalWidth : 0,
+    height: image.naturalHeight > 0 ? image.naturalHeight : 0,
+  };
+}
+
+function hasSize(size: Size): boolean {
+  return size.width > 0 && size.height > 0;
+}
+
+function initialStateForImage(
+  src: string,
+  width: number | null,
+  height: number | null,
+): { naturalSize: Size; loadState: ImageLoadState } {
+  const hint = hintedSize(width, height);
+  const cached = cachedImageState(src);
+  if (!cached) return { naturalSize: hint, loadState: "loading" };
+
+  const cachedSize = { width: cached.width, height: cached.height };
+  return {
+    naturalSize: hasSize(cachedSize) ? cachedSize : hint,
+    loadState: cached.status,
+  };
+}
+
 export default function ImageViewer(props: {
   name: string;
   width: number | null;
@@ -39,19 +80,29 @@ export default function ImageViewer(props: {
   let gestureFrame = 0;
   let resizeObserver: ResizeObserver | undefined;
 
-  const initialWidth = props.width && props.width > 0 ? props.width : 0;
-  const initialHeight = props.height && props.height > 0 ? props.height : 0;
-  const [naturalSize, setNaturalSize] = createSignal<Size>({
-    width: initialWidth,
-    height: initialHeight,
-  });
+  const source = createMemo(() => ({
+    src: fileUrl(props.name),
+    width: props.width,
+    height: props.height,
+  }));
+  const initialImageState = initialStateForImage(
+    source().src,
+    source().width,
+    source().height,
+  );
+  const [naturalSize, setNaturalSize] = createSignal<Size>(
+    initialImageState.naturalSize,
+  );
   const [viewportSize, setViewportSize] = createSignal<Size>({ width: 0, height: 0 });
   const [mode, setMode] = createSignal<"fit" | "manual">("fit");
   const [manualScale, setManualScale] = createSignal(1);
   const [pan, setPan] = createSignal<Point>({ x: 0, y: 0 });
-  const [loaded, setLoaded] = createSignal(false);
-  const [loadError, setLoadError] = createSignal(false);
+  const [loadState, setLoadState] = createSignal<ImageLoadState>(
+    initialImageState.loadState,
+  );
   const [dragging, setDragging] = createSignal(false);
+  const loaded = createMemo(() => loadState() !== "loading");
+  const loadError = createMemo(() => loadState() === "error");
 
   const pointers = new Map<number, Point>();
   const renderedPointers = new Map<number, Point>();
@@ -107,6 +158,23 @@ export default function ImageViewer(props: {
       return pointsEqual(current, next) ? current : next;
     });
   });
+
+  createEffect(
+    on(
+      source,
+      ({ src, width, height }) => {
+        const next = initialStateForImage(src, width, height);
+        batch(() => {
+          setNaturalSize(next.naturalSize);
+          setLoadState(next.loadState);
+          setMode("fit");
+          setManualScale(1);
+          setPan({ x: 0, y: 0 });
+        });
+      },
+      { defer: true },
+    ),
+  );
 
   onMount(() => {
     if (!viewportEl) return;
@@ -306,6 +374,31 @@ export default function ImageViewer(props: {
     panBy(dx, dy);
   }
 
+  function applyLoadedImage(image: HTMLImageElement) {
+    const size = measuredSize(image);
+    markImageLoaded(source().src, image);
+    batch(() => {
+      if (hasSize(size)) setNaturalSize(size);
+      setLoadState("loaded");
+    });
+  }
+
+  function applyImageError() {
+    markImageError(source().src);
+    setLoadState("error");
+  }
+
+  function syncLoadedImage(image: HTMLImageElement) {
+    queueMicrotask(() => {
+      if (image.getAttribute("src") !== source().src || !image.complete) return;
+      if (image.naturalWidth > 0 || image.naturalHeight > 0) {
+        applyLoadedImage(image);
+      } else {
+        applyImageError();
+      }
+    });
+  }
+
   return (
     <div class="image-viewer">
       <div
@@ -371,7 +464,8 @@ export default function ImageViewer(props: {
         <img
           class="image-viewer-image"
           classList={{ "is-loaded": loaded() && !loadError() }}
-          src={`/files/${encodeURIComponent(props.name)}`}
+          ref={syncLoadedImage}
+          src={source().src}
           alt={props.name}
           draggable={false}
           style={{
@@ -380,20 +474,9 @@ export default function ImageViewer(props: {
             transform: `translate(-50%, -50%) translate3d(${pan().x}px, ${pan().y}px, 0) scale(${scale()})`,
           }}
           onLoad={(event) => {
-            const image = event.currentTarget;
-            batch(() => {
-              setNaturalSize({
-                width: image.naturalWidth,
-                height: image.naturalHeight,
-              });
-              setLoaded(true);
-              setLoadError(false);
-            });
+            applyLoadedImage(event.currentTarget);
           }}
-          onError={() => {
-            setLoaded(true);
-            setLoadError(true);
-          }}
+          onError={applyImageError}
         />
         <Show when={!loaded()}>
           <div class="image-viewer-status">loading…</div>
