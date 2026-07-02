@@ -24,12 +24,13 @@ const DRED_CHUNK_SAMPLES: u32 = 480;
 /// Result of parsing a packet's DRED region (`WebRtcOpus_DredParse`).
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct DredInfo {
-    /// Total DRED samples available in the packet.
+    /// Span from the packet start back to the oldest recoverable DRED sample.
+    /// Includes the trailing `dred_end` silence, so the decodable latents cover
+    /// `samples - dred_end` samples; `dred_end >= samples` means the packet
+    /// carried zero latents and nothing is decodable.
     pub samples: i32,
     /// Trailing non-encoded (silence) samples between the end of the DRED data
-    /// and the packet timestamp: the newest recoverable sample sits `dred_end`
-    /// samples before the packet. `dred_end >= samples` means the whole DRED
-    /// span is silence and no chunk is recoverable.
+    /// and the packet timestamp.
     pub dred_end: i32,
 }
 
@@ -72,22 +73,25 @@ pub(crate) fn parse_payload_redundancy(
 
     if current_gap > 0 {
         if let Some(dred) = dred {
-            // `opus_dred_parse` returns the span from the packet start back to the
-            // oldest recoverable sample, which includes the trailing `dred_end`
-            // silence; decodable audio occupies offsets in
-            // `(dred_end, dred_end + usable]` samples before the packet
-            // (`opus_decode_native` maps anything at or below `dred_end` to
-            // non-existent features). A `dred_end >= samples` span is all silence.
-            let dred_end = dred.dred_end.max(0) as u32;
-            let usable = (dred.samples - dred.dred_end.max(0)).max(0) as u32;
-            // Number of 10 ms chunks available vs. needed to fill the gap ahead
-            // of the silent tail; chunks past the gap would overlap buffered audio.
-            let mut dred_count = usable / DRED_CHUNK_SAMPLES;
-            let desired = current_gap.saturating_sub(dred_end) / DRED_CHUNK_SAMPLES;
+            // Only latent-backed chunks are worth emitting: a span that is all
+            // trailing silence (`dred_end >= samples`, i.e. zero latents) has
+            // nothing to decode. Placement stays adjacent to the packet — decode
+            // offsets are positions relative to the packet start and the decoder
+            // maps each position to its features internally (positions inside
+            // the silent tail extrapolate toward the encoder's silence), exactly
+            // as libopus's own `opus_demo` consumes DRED.
+            let usable = if dred.dred_end < dred.samples {
+                dred.samples - dred.dred_end.max(0)
+            } else {
+                0
+            };
+            // Number of 10 ms chunks available vs. needed to fill the gap.
+            let mut dred_count = usable as u32 / DRED_CHUNK_SAMPLES;
+            let desired = current_gap / DRED_CHUNK_SAMPLES;
             if dred_count > 0 && desired > 0 {
                 dred_count = dred_count.min(desired);
                 let mut recovery_timestamp =
-                    timestamp.wrapping_sub(dred_end + dred_count * DRED_CHUNK_SAMPLES);
+                    timestamp.wrapping_sub(dred_count * DRED_CHUNK_SAMPLES);
                 for i in 0..dred_count {
                     // Keep DRED strictly before the FEC/primary region.
                     if begin_timestamp == recovery_timestamp
@@ -95,7 +99,7 @@ pub(crate) fn parse_payload_redundancy(
                     {
                         break;
                     }
-                    let offset = (dred_end + (dred_count - i) * DRED_CHUNK_SAMPLES) as i32;
+                    let offset = ((dred_count - i) * DRED_CHUNK_SAMPLES) as i32;
                     results.push(Packet::new(
                         recovery_timestamp,
                         sequence_number,
@@ -186,36 +190,10 @@ mod tests {
     }
 
     #[test]
-    fn dred_end_shifts_chunks_behind_the_silent_tail() {
-        // 10 ms of trailing silence (dred_end 480) inside a 60 ms parse span: the
-        // usable 50 ms rounds down to five chunks, the gap ahead of the silence
-        // (1920 - 480 = 1440) allows three, and every chunk is anchored before
-        // `timestamp - dred_end` with its decode offset shifted past the silence.
-        let dred = Some(DredInfo {
-            samples: 2880,
-            dred_end: 480,
-        });
-        let packets = parse_payload_redundancy(9600, 10, datagram(), 1920, 960, None, dred);
-        assert_eq!(
-            descriptors(&packets),
-            vec![
-                (9600 - 480 - 3 * 480, 2),
-                (9600 - 480 - 2 * 480, 2),
-                (9600 - 480 - 480, 2),
-                (9600, 0),
-            ]
-        );
-        if let PacketPayload::Dred { offset, .. } = &packets[0].payload {
-            assert_eq!(*offset, 480 + 3 * 480);
-        } else {
-            panic!("expected DRED payload");
-        }
-    }
-
-    #[test]
-    fn dred_end_covering_the_whole_span_emits_no_chunks() {
-        // The parse span is all trailing silence: nothing is decodable, so only
-        // the primary is emitted instead of garbage chunks.
+    fn all_silent_dred_span_emits_no_chunks() {
+        // `dred_end >= samples` means the packet carried zero DRED latents (the
+        // parse span is all trailing silence): nothing is decodable, so only the
+        // primary is emitted instead of feature-less hallucinated chunks.
         let dred = Some(DredInfo {
             samples: 2880,
             dred_end: 2880,
@@ -232,15 +210,32 @@ mod tests {
     }
 
     #[test]
-    fn gap_shorter_than_dred_end_emits_no_chunks() {
-        // The hole behind the packet is entirely within the silent tail; a chunk
-        // would either overlap buffered audio or decode silence.
+    fn partially_silent_dred_span_bridges_the_gap_adjacent_to_primary() {
+        // 20 ms of trailing silence inside a 60 ms parse span leaves 40 ms of
+        // real latents: the chunk count drops to four, but placement stays
+        // adjacent to the primary — the decoder resolves each requested position
+        // to its features internally (silent positions extrapolate quiet), so
+        // the newest part of the hole is still bridged.
         let dred = Some(DredInfo {
             samples: 2880,
             dred_end: 960,
         });
-        let packets = parse_payload_redundancy(9600, 10, datagram(), 960, 960, None, dred);
-        assert_eq!(descriptors(&packets), vec![(9600, 0)]);
+        let packets = parse_payload_redundancy(9600, 10, datagram(), 2880, 960, None, dred);
+        assert_eq!(
+            descriptors(&packets),
+            vec![
+                (9600 - 4 * 480, 2),
+                (9600 - 3 * 480, 2),
+                (9600 - 2 * 480, 2),
+                (9600 - 480, 2),
+                (9600, 0),
+            ]
+        );
+        if let PacketPayload::Dred { offset, .. } = &packets[0].payload {
+            assert_eq!(*offset, 4 * 480);
+        } else {
+            panic!("expected DRED payload");
+        }
     }
 
     #[test]
