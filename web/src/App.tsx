@@ -455,6 +455,7 @@ function MessageRow(props: {
   message: WebMessage;
   prev?: WebMessage;
   onOpenPreview: (item: PreviewItem, opener: HTMLElement) => void;
+  onQuoteRef?: (refCode: string) => void;
 }) {
   // A continuation hides the header and shows its time only on hover, in the
   // reserved left gutter. `prev` is supplied reactively from the message list,
@@ -468,8 +469,31 @@ function MessageRow(props: {
       msg.timestamp_ms - prev.timestamp_ms < GROUP_WINDOW_MS
     );
   };
+  const [refCopied, setRefCopied] = createSignal(false);
+  let refCopyResetTimer: number | undefined;
+  onCleanup(() => {
+    if (refCopyResetTimer !== undefined) clearTimeout(refCopyResetTimer);
+  });
+  async function copyRef() {
+    try {
+      await copyTextToClipboard(`@@${props.message.ref_code}`);
+      setRefCopied(true);
+      if (refCopyResetTimer !== undefined) clearTimeout(refCopyResetTimer);
+      refCopyResetTimer = window.setTimeout(() => {
+        setRefCopied(false);
+        refCopyResetTimer = undefined;
+      }, 1500);
+    } catch (error) {
+      console.warn("[chatt:clipboard] reference copy failed", error);
+    }
+  }
   return (
-    <div class="message" classList={{ "is-continuation": continuation() }}>
+    <div
+      class="message"
+      classList={{ "is-continuation": continuation() }}
+      data-ts={props.message.timestamp_ms}
+      data-mid={props.message.message_id}
+    >
       {/* The time always lives in the left gutter so it sits in one consistent
        * column: shown on a group's first row, revealed on hover for the rest. */}
       <span class="message-time-gutter">
@@ -490,12 +514,37 @@ function MessageRow(props: {
       <Show when={!props.message.attachment && props.message.progress}>
         <TransferProgressBar progress={props.message.progress!} />
       </Show>
+      <Show when={props.message.ref_code}>
+        <div class="message-actions">
+          <Show when={props.onQuoteRef}>
+            <button
+              class="message-action"
+              type="button"
+              aria-label="Quote message"
+              title="Quote"
+              onClick={() => props.onQuoteRef!(props.message.ref_code)}
+            >
+              <Icon name="corner-up-left" />
+            </button>
+          </Show>
+          <button
+            class="message-action"
+            type="button"
+            aria-label={refCopied() ? "Copied reference" : "Copy reference"}
+            title={refCopied() ? "Copied" : "Copy reference"}
+            onClick={copyRef}
+          >
+            <Icon name={refCopied() ? "check" : "at-sign"} />
+          </button>
+        </div>
+      </Show>
     </div>
   );
 }
 
 export default function App() {
   const [messages, setMessages] = createSignal<WebMessage[]>([]);
+  const [refToast, setRefToast] = createSignal<string | null>(null);
   const [connected, setConnected] = createSignal(false);
   const [connectionErrorVisible, setConnectionErrorVisible] =
     createSignal(false);
@@ -663,10 +712,13 @@ export default function App() {
   let following = true;
   // True while a real user input gesture controls the scroll.
   let userDriving = false;
-  // True while a pin() we initiated is in flight, so onScroll ignores it.
+  // True while a scroll we initiated is in flight, so onScroll ignores it.
   let suppress = false;
   let suppressTimer: number | undefined;
   let idleTimer: number | undefined;
+  let refJumping = false;
+  let refJumpTimer: number | undefined;
+  let pendingJumpFrame: number | undefined;
 
   // Use virtua's measured geometry, not DOM scrollHeight: when tail items are
   // still unmeasured, totalSize is an estimate and scrollHeight can disagree.
@@ -681,6 +733,56 @@ export default function App() {
   // The ONLY thing allowed to flip `following`. Bound to genuine input events.
   function markUser() {
     userDriving = true;
+    if (idleTimer) {
+      clearTimeout(idleTimer);
+      idleTimer = undefined;
+    }
+  }
+
+  function clearSuppressTimer() {
+    if (suppressTimer) {
+      clearTimeout(suppressTimer);
+      suppressTimer = undefined;
+    }
+  }
+
+  function suppressProgrammaticScroll(ms: number) {
+    suppress = true;
+    clearSuppressTimer();
+    suppressTimer = window.setTimeout(() => {
+      suppress = false;
+      suppressTimer = undefined;
+    }, ms);
+  }
+
+  function clearRefJumpTimer() {
+    if (refJumpTimer) {
+      clearTimeout(refJumpTimer);
+      refJumpTimer = undefined;
+    }
+  }
+
+  function clearRefJumpFrame() {
+    if (pendingJumpFrame) {
+      cancelAnimationFrame(pendingJumpFrame);
+      pendingJumpFrame = undefined;
+    }
+  }
+
+  function holdRefJump(ms: number) {
+    refJumping = true;
+    clearRefJumpTimer();
+    refJumpTimer = window.setTimeout(() => {
+      refJumping = false;
+      refJumpTimer = undefined;
+    }, ms);
+  }
+
+  function detachForRefJump() {
+    following = false;
+    userDriving = false;
+    suppress = false;
+    clearSuppressTimer();
     if (idleTimer) {
       clearTimeout(idleTimer);
       idleTimer = undefined;
@@ -705,20 +807,16 @@ export default function App() {
     // Changing the split width can resize every mounted chat row. Let the
     // virtualizer process those measurements without repeatedly restarting
     // scrollToIndex's measurement loop; the drag end performs one final pin.
-    if (previewPanelResize || !handle || !following) return;
+    if (previewPanelResize || !handle || refJumping || !following) return;
     const last = messages().length - 1;
     if (last < 0) return;
-    suppress = true;
+    suppressProgrammaticScroll(250);
     // Scroll to the virtual bottom so the configured end margin remains visible
     // after the newest message.
     handle.scrollTo(Math.max(0, handle.scrollSize - handle.viewportSize));
-    // scrollToIndex is multi-frame and may emit zero scroll events when already
-    // at the bottom, so clearing `suppress` from onScrollEnd would deadlock it.
+    // Programmatic scrolls may emit zero scroll events when already at the
+    // destination, so clearing `suppress` from onScrollEnd would deadlock it.
     // Always clear on a timer that outlives the measurement window.
-    if (suppressTimer) clearTimeout(suppressTimer);
-    suppressTimer = window.setTimeout(() => {
-      suppress = false;
-    }, 250);
   }
 
   function preloadImage(message: WebMessage): boolean {
@@ -784,6 +882,135 @@ export default function App() {
       limit: PAGE,
     };
     socket.send(JSON.stringify(req));
+  }
+
+  // A click on a `@@` reference jumps to its target, paging older history in
+  // until the target loads. Capped so a reference outside this room's history
+  // does not drain the whole backlog.
+  const MAX_JUMP_PAGES = 10;
+  let pendingJump: { ts: number; mid: number; tries: number } | undefined;
+  let refToastTimer: number | undefined;
+
+  function showRefToast(text: string) {
+    setRefToast(text);
+    if (refToastTimer) clearTimeout(refToastTimer);
+    refToastTimer = window.setTimeout(() => setRefToast(null), 2500);
+  }
+
+  function findMessageIndex(ts: number, mid: number): number {
+    return messages().findIndex(
+      (m) => m.message_id === mid && m.timestamp_ms === ts
+    );
+  }
+
+  function flashMessage(ts: number, mid: number) {
+    const row = logEl?.querySelector(
+      `.message[data-ts="${ts}"][data-mid="${mid}"]`
+    );
+    if (!(row instanceof HTMLElement)) return;
+    row.classList.remove("msg-flash");
+    // Force a reflow so a repeated jump restarts the animation.
+    void row.offsetWidth;
+    row.classList.add("msg-flash");
+    window.setTimeout(() => row.classList.remove("msg-flash"), 1600);
+  }
+
+  function scrollToMessage(index: number, ts: number, mid: number) {
+    detachForRefJump();
+    holdRefJump(1200);
+    suppressProgrammaticScroll(1200);
+    handle?.scrollToIndex(index, { align: "center" });
+    // The row mounts as the virtualizer approaches it; flash once it settles.
+    window.setTimeout(() => flashMessage(ts, mid), 350);
+  }
+
+  function jumpToRef(ts: number, mid: number) {
+    detachForRefJump();
+    holdRefJump(2000);
+    const index = findMessageIndex(ts, mid);
+    if (index >= 0) {
+      pendingJump = undefined;
+      scrollToMessage(index, ts, mid);
+      return;
+    }
+    if (hasMore) {
+      if (!pendingJump || pendingJump.ts !== ts || pendingJump.mid !== mid) {
+        pendingJump = { ts, mid, tries: 0 };
+      }
+      requestOlder();
+      return;
+    }
+    pendingJump = undefined;
+    showRefToast("Referenced message isn't in the loaded history");
+  }
+
+  function scheduleResumePendingJump() {
+    clearRefJumpFrame();
+    pendingJumpFrame = requestAnimationFrame(() => {
+      pendingJumpFrame = requestAnimationFrame(() => {
+        pendingJumpFrame = undefined;
+        resumePendingJump();
+      });
+    });
+  }
+
+  // Called after an `older` page lands: keep driving a jump that is still
+  // waiting for its target to load.
+  function resumePendingJump() {
+    if (!pendingJump) return;
+    holdRefJump(2000);
+    const { ts, mid } = pendingJump;
+    const index = findMessageIndex(ts, mid);
+    if (index >= 0) {
+      pendingJump = undefined;
+      scrollToMessage(index, ts, mid);
+      return;
+    }
+    pendingJump.tries += 1;
+    if (pendingJump.tries >= MAX_JUMP_PAGES || !hasMore) {
+      pendingJump = undefined;
+      showRefToast("Referenced message isn't in the loaded history");
+      return;
+    }
+    requestOlder();
+  }
+
+  // Splices a `@@code ` reference into the composer draft, from a message row's
+  // quote button.
+  function quoteRef(refCode: string) {
+    const code = `@@${refCode} `;
+    setDraft((prev) =>
+      prev.length > 0 && !prev.endsWith(" ") ? `${prev} ${code}` : prev + code
+    );
+    composerTextEl?.focus();
+    resizeComposer();
+  }
+
+  // Reference anchors live inside Rust-rendered fragment HTML, so their clicks
+  // are caught by delegation on the log container rather than per-element
+  // handlers.
+  function onLogClick(event: MouseEvent) {
+    const target = event.target as HTMLElement;
+    const anchor = target.closest?.("a.msg-ref");
+    if (!(anchor instanceof HTMLElement)) return;
+    event.preventDefault();
+    const ts = Number(anchor.dataset.ts);
+    const mid = Number(anchor.dataset.mid);
+    if (!Number.isFinite(ts) || !Number.isFinite(mid)) return;
+    jumpToRef(ts, mid);
+  }
+
+  function onLogPointerDown(event: PointerEvent) {
+    const target = event.target;
+    if (target instanceof Element && target.closest("a.msg-ref")) return;
+    if (target !== logEl) return;
+    markUser();
+  }
+
+  function onLogTouchStart(event: TouchEvent) {
+    const target = event.target;
+    if (target instanceof Element && target.closest("a.msg-ref")) return;
+    markUser();
   }
 
   function playShare(streamId: number) {
@@ -1293,6 +1520,7 @@ export default function App() {
           }
           oldestSeq = feed.oldest_seq;
           hasMore = feed.has_more;
+          scheduleResumePendingJump();
         } else {
           // A live message. Upsert by the announcement timestamp and file id;
           // transfer ids are reused after server restarts, while the pair
@@ -1474,6 +1702,9 @@ export default function App() {
     if (connectionErrorTimer !== undefined) clearTimeout(connectionErrorTimer);
     if (suppressTimer) clearTimeout(suppressTimer);
     if (idleTimer) clearTimeout(idleTimer);
+    if (refJumpTimer) clearTimeout(refJumpTimer);
+    if (pendingJumpFrame) cancelAnimationFrame(pendingJumpFrame);
+    if (refToastTimer) clearTimeout(refToastTimer);
     for (const decoder of decoders.values()) decoder.close();
     decoders.clear();
     imagePreloads.clear();
@@ -1486,6 +1717,11 @@ export default function App() {
       <Show when={connectionErrorVisible()}>
         <div class="conn-overlay" role="status" aria-live="polite">
           Unable to connect — retrying…
+        </div>
+      </Show>
+      <Show when={refToast()}>
+        <div class="ref-toast" role="status" aria-live="polite">
+          {refToast()}
         </div>
       </Show>
       <div
@@ -1538,10 +1774,11 @@ export default function App() {
             class="chat-log"
             ref={logEl}
             onWheel={markUser}
-            onTouchStart={markUser}
+            onTouchStart={onLogTouchStart}
             onTouchMove={markUser}
-            onPointerDown={markUser}
+            onPointerDown={onLogPointerDown}
             onKeyDown={onKeyDown}
+            onClick={onLogClick}
           >
             <div class="chat-log-content" ref={contentEl}>
               <Virtualizer
@@ -1558,6 +1795,7 @@ export default function App() {
                     message={message}
                     prev={messages()[index() - 1]}
                     onOpenPreview={openPreview}
+                    onQuoteRef={readonly() ? undefined : quoteRef}
                   />
                 )}
               </Virtualizer>

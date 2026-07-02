@@ -36,6 +36,7 @@ pub enum TokenKind {
     ItalicEnd,
     InlineCode,
     Url,
+    MessageRef,
     HardBreak,
 }
 
@@ -160,14 +161,28 @@ pub fn tokenize(source: &str, out: &mut Vec<Token>) {
     close_list(out, &mut open_list, pos);
 }
 
-/// Returns the URL ranges produced by the tokenizer.
-pub fn link_ranges(source: &str) -> Vec<Range<u32>> {
+/// The URL and message-reference ranges of a message body.
+pub struct InlineRanges {
+    pub urls: Vec<Range<u32>>,
+    pub refs: Vec<Range<u32>>,
+}
+
+/// Returns the URL and message-reference ranges produced by the tokenizer.
+pub fn inline_ranges(source: &str) -> InlineRanges {
     let mut tokens = Vec::new();
     tokenize(source, &mut tokens);
-    tokens
-        .into_iter()
-        .filter_map(|token| (token.kind == TokenKind::Url).then_some(token.range))
-        .collect()
+    let mut ranges = InlineRanges {
+        urls: Vec::new(),
+        refs: Vec::new(),
+    };
+    for token in tokens {
+        match token.kind {
+            TokenKind::Url => ranges.urls.push(token.range),
+            TokenKind::MessageRef => ranges.refs.push(token.range),
+            _ => {}
+        }
+    }
+    ranges
 }
 
 fn close_list(out: &mut Vec<Token>, open_list: &mut Option<ListKind>, pos: usize) {
@@ -288,15 +303,52 @@ fn emit_text_with_urls(source: &str, range: Range<usize>, out: &mut Vec<Token>) 
     for url in crate::link::find_urls(&source[range.clone()]) {
         let start = range.start + url.start as usize;
         let end = range.start + url.end as usize;
-        if cursor < start {
-            push(out, TokenKind::Text, cursor..start);
-        }
+        emit_text_with_refs(source, cursor..start, out);
         push(out, TokenKind::Url, start..end);
         cursor = end;
+    }
+    emit_text_with_refs(source, cursor..range.end, out);
+}
+
+fn emit_text_with_refs(source: &str, range: Range<usize>, out: &mut Vec<Token>) {
+    let bytes = source.as_bytes();
+    let mut cursor = range.start;
+    let mut pos = range.start;
+    while pos + 1 < range.end {
+        if bytes[pos] != b'@' || bytes[pos + 1] != b'@' || !ref_boundary(bytes, range.start, pos) {
+            pos += 1;
+            continue;
+        }
+        let code_start = pos + 2;
+        let mut code_end = code_start;
+        while code_end < range.end && rpc::msgref::is_ref_char(bytes[code_end]) {
+            code_end += 1;
+        }
+        let len = code_end - code_start;
+        let terminated = code_end >= range.end || !bytes[code_end].is_ascii_alphanumeric();
+        let gated = (rpc::msgref::MIN_CODE_LEN..=rpc::msgref::MAX_CODE_LEN).contains(&len);
+        if gated && terminated {
+            if cursor < pos {
+                push(out, TokenKind::Text, cursor..pos);
+            }
+            push(out, TokenKind::MessageRef, pos..code_end);
+            cursor = code_end;
+            pos = code_end;
+        } else {
+            pos = code_end.max(pos + 1);
+        }
     }
     if cursor < range.end {
         push(out, TokenKind::Text, cursor..range.end);
     }
+}
+
+fn ref_boundary(bytes: &[u8], start: usize, pos: usize) -> bool {
+    if pos == start {
+        return true;
+    }
+    let prev = bytes[pos - 1];
+    !prev.is_ascii_alphanumeric() && prev != b'@'
 }
 
 fn find_inline_code_close(source: &str, open: usize, end: usize) -> Option<usize> {
@@ -697,6 +749,62 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["https://example.com"]
         );
+    }
+
+    #[test]
+    fn message_refs_are_tokenized_at_word_boundaries() {
+        let source = "see @@1c9k3m5n7p2tq for context";
+        let tokens = pairs(source);
+        assert_eq!(
+            tokens
+                .iter()
+                .filter(|(kind, _)| *kind == TokenKind::MessageRef)
+                .map(|(_, range)| &source[range.start as usize..range.end as usize])
+                .collect::<Vec<_>>(),
+            vec!["@@1c9k3m5n7p2tq"]
+        );
+        let ranges = inline_ranges(source);
+        assert_eq!(ranges.refs.len(), 1);
+        assert!(ranges.urls.is_empty());
+    }
+
+    #[test]
+    fn message_ref_rejections_stay_text() {
+        for source in [
+            "hi@@1c9k3m5n7p2tq",
+            "@@@1c9k3m5n7p2tq",
+            "bare @@ marks",
+            "@@abc",
+            "@@1c9k3m5n7p2tqu2",
+            "email@@example",
+        ] {
+            let tokens = pairs(source);
+            assert!(
+                tokens
+                    .iter()
+                    .all(|(kind, _)| *kind != TokenKind::MessageRef),
+                "false positive in {source:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn message_refs_inert_inside_code() {
+        let source = "`@@1c9k3m5n7p2tq` and\n```\n@@1c9k3m5n7p2tq\n```";
+        let tokens = pairs(source);
+        assert!(
+            tokens
+                .iter()
+                .all(|(kind, _)| *kind != TokenKind::MessageRef)
+        );
+    }
+
+    #[test]
+    fn message_refs_coexist_with_urls() {
+        let source = "@@1c9k3m5n7p2tq https://example.com @@0abcdefgh2";
+        let ranges = inline_ranges(source);
+        assert_eq!(ranges.urls.len(), 1);
+        assert_eq!(ranges.refs.len(), 2);
     }
 
     #[test]

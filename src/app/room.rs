@@ -20,7 +20,10 @@ use crate::{
     tui::editor::EditorHighlighter,
 };
 
-use super::{Participants, commands::CommandCompletionState};
+use super::{
+    Participants,
+    commands::{CommandCompletionState, RefCompletionState},
+};
 
 pub(crate) struct RoomSession {
     pub server_alias: String,
@@ -32,6 +35,7 @@ pub(crate) struct RoomSession {
     pub composer: Editor,
     pub composer_hl: EditorHighlighter,
     command_completion: CommandCompletionState,
+    ref_completion: RefCompletionState,
     pub chat: VirtualChatBuffer,
     pub participants: Participants,
     pending_clipboard: Option<String>,
@@ -153,6 +157,14 @@ pub(crate) enum ToggleExpandResult {
     NotCollapsible,
 }
 
+/// Outcome of [`RoomSession::jump_to_ref`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RefJump {
+    Jumped,
+    NotFound,
+    OtherRoom,
+}
+
 /// Drops completely blank lines from the start and end of `text` while keeping
 /// the leading whitespace (indentation) of the remaining content lines. Returns
 /// an empty string when every line is blank.
@@ -186,6 +198,7 @@ impl RoomSession {
             composer,
             composer_hl,
             command_completion: CommandCompletionState::default(),
+            ref_completion: RefCompletionState::default(),
             chat: VirtualChatBuffer::new(config.ui.max_messages as usize, theme.syntax),
             participants: Participants::default(),
             pending_clipboard: None,
@@ -229,18 +242,26 @@ impl RoomSession {
     pub(crate) fn refresh_command_completion(&mut self, enabled: bool, style: Style) {
         if !enabled {
             self.command_completion.clear();
+            self.ref_completion.clear();
             self.composer.clear_inline_completion();
             return;
         }
         let completion = self
             .command_completion
-            .inline_completion(&self.composer, style);
+            .inline_completion(&self.composer, style)
+            .or_else(|| {
+                self.ref_completion
+                    .inline_completion(&self.composer, &self.chat, style)
+            });
         self.composer.set_inline_completion(completion);
     }
 
     pub(crate) fn complete_command(&mut self) -> bool {
         self.composer.clear_inline_completion();
-        self.command_completion.complete(&mut self.composer)
+        if self.command_completion.complete(&mut self.composer) {
+            return true;
+        }
+        self.ref_completion.complete(&mut self.composer, &self.chat)
     }
 
     pub(crate) fn connect_to_server(
@@ -322,7 +343,7 @@ impl RoomSession {
         let mut merged: Vec<ChatMessage> = union.into_values().collect();
         merged.sort_by_key(|message| (message.timestamp_ms, message.message_id.0));
 
-        self.populate_history(&merged, local_user);
+        self.populate_history(room_id, &merged, local_user);
 
         room_history::LoadedHistory {
             messages: merged,
@@ -341,15 +362,24 @@ impl RoomSession {
     ) -> room_history::LoadedHistory {
         self.participants = Participants::default();
         let loaded = room_history::open(&self.history_id, room_id).loaded;
-        self.populate_history(&loaded.messages, local_user);
+        self.populate_history(room_id, &loaded.messages, local_user);
         loaded
     }
 
     /// Replaces the chat buffer and dedup set with `messages`, marking those
     /// from `local_user` as locally sent. Shared by [`joined`](Self::joined) and
     /// [`load_offline_history`](Self::load_offline_history).
-    fn populate_history(&mut self, messages: &[ChatMessage], local_user: Option<UserId>) {
+    ///
+    /// `room_id` is set before any push so message references resolve while the
+    /// history populates.
+    fn populate_history(
+        &mut self,
+        room_id: RoomId,
+        messages: &[ChatMessage],
+        local_user: Option<UserId>,
+    ) {
         self.chat.clear();
+        self.chat.set_room_id(room_id);
         self.seen.clear();
         self.transfers.clear();
         for message in messages {
@@ -570,6 +600,7 @@ impl RoomSession {
             return None;
         }
         self.command_completion.clear();
+        self.ref_completion.clear();
         self.composer.clear_inline_completion();
         self.composer.clear();
         self.composer.enter_insert_mode();
@@ -623,6 +654,79 @@ impl RoomSession {
             .or_else(|| self.chat.selected_header_text(width))?;
         self.pending_clipboard = Some(text.clone());
         Some(text)
+    }
+
+    /// The reference identifying the keyboard-selected message, when one is
+    /// selected and referenceable (notices have no durable key).
+    fn selected_message_ref(&mut self, width: u16) -> Option<rpc::msgref::MessageRef> {
+        let room_id = self.chat.room_id()?;
+        let selected = self.chat.ensure_selected_header(width)?;
+        let entry = self.chat.message(selected);
+        if entry.timestamp_ms == 0 {
+            return None;
+        }
+        Some(rpc::msgref::MessageRef {
+            room_id,
+            timestamp_ms: entry.timestamp_ms,
+            message_id: rpc::ids::MessageId(entry.id),
+        })
+    }
+
+    /// Copies the selected message's `@@code` to the clipboard, returning it.
+    pub(crate) fn copy_message_ref(&mut self, width: u16) -> Option<String> {
+        let code = self.selected_message_ref(width)?.encode();
+        let code = format!("{}{code}", rpc::msgref::REF_PREFIX);
+        self.pending_clipboard = Some(code.clone());
+        Some(code)
+    }
+
+    /// Inserts the selected message's `@@code ` into the composer, returning it.
+    pub(crate) fn insert_message_ref(&mut self, width: u16) -> Option<String> {
+        let code = self.selected_message_ref(width)?.encode();
+        let code = format!("{}{code} ", rpc::msgref::REF_PREFIX);
+        self.insert_paste(code.clone());
+        Some(code)
+    }
+
+    /// Previews a reference into another room from that room's on-disk history:
+    /// `sender: first line`. The append handle opened alongside the load is
+    /// dropped immediately; nothing is written.
+    pub(crate) fn cross_room_ref_preview(&self, target: rpc::msgref::MessageRef) -> Option<String> {
+        if self.history_id.is_empty() {
+            return None;
+        }
+        let loaded = room_history::open(&self.history_id, target.room_id).loaded;
+        let message = loaded.messages.iter().find(|message| {
+            message.timestamp_ms == target.timestamp_ms && message.message_id == target.message_id
+        })?;
+        let first_line = message.body.lines().next().unwrap_or("");
+        Some(format!(
+            "room {}: {}: {first_line}",
+            target.room_id.0, message.sender_name
+        ))
+    }
+
+    /// Selects and scrolls to the message a reference targets. Never touches
+    /// the view unless the target is present in the buffer.
+    pub(crate) fn jump_to_ref(
+        &mut self,
+        target: rpc::msgref::MessageRef,
+        width: u16,
+        height: u16,
+    ) -> RefJump {
+        if self.chat.room_id() != Some(target.room_id) {
+            return RefJump::OtherRoom;
+        }
+        let Some(index) = self
+            .chat
+            .find_message(target.timestamp_ms, target.message_id.0)
+        else {
+            return RefJump::NotFound;
+        };
+        self.chat.clear_selection();
+        self.chat.select_header_containing(index, width);
+        self.chat.scroll_message_into_view(index, width, height);
+        RefJump::Jumped
     }
 
     pub(crate) fn toggle_selected_message_expand(&mut self, width: u16) -> ToggleExpandResult {
@@ -948,6 +1052,30 @@ mod tests {
         let update = room.chat_received(message(20, UserId(2), "while reading"), Some(UserId(1)));
         assert!(!update.should_scroll_bottom);
         assert_eq!(room.chat.scroll_offset(), offset);
+    }
+
+    #[test]
+    fn ref_jump_detaches_from_bottom_follow_before_next_message() {
+        let mut room = test_room();
+        let history = (1..=8)
+            .map(|id| {
+                let sender = if id % 2 == 0 { UserId(2) } else { UserId(3) };
+                message(id, sender, "tail message")
+            })
+            .collect();
+        room.joined(RoomId(1), Vec::new(), history, Some(UserId(1)));
+
+        let target = rpc::msgref::MessageRef {
+            room_id: RoomId(1),
+            timestamp_ms: 7_000,
+            message_id: MessageId(7),
+        };
+        assert_eq!(room.jump_to_ref(target, 40, 5), RefJump::Jumped);
+        assert_eq!(room.chat.scroll_offset(), 1);
+
+        let update = room.chat_received(message(9, UserId(2), "new tail"), Some(UserId(1)));
+        assert!(!update.should_scroll_bottom);
+        assert!(room.chat.scroll_offset() > 0);
     }
 
     #[test]

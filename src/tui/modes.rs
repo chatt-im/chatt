@@ -629,6 +629,9 @@ impl RoomMode {
             Top => self.select_chat_top(app),
             Bottom => self.select_chat_bottom(app),
             CopySelection => self.copy_chat_selection_if_focused(app),
+            CopyMessageRef => self.copy_message_ref_if_focused(app),
+            InsertMessageRef => self.insert_message_ref_if_focused(app),
+            OpenMessageRef => self.open_message_ref_if_focused(app),
             ToggleExpand => self.toggle_chat_expand_if_focused(app),
             FocusNext => self.move_focus(app, 1),
             FocusPrev => self.move_focus(app, -1),
@@ -784,11 +787,14 @@ impl RoomMode {
             }
             extui::event::MouseEventKind::Up(extui::event::MouseButton::Left) if in_chat => {
                 // A collapsed selection (press and release without a drag) over a
-                // URL opens it; a drag remains a text selection.
-                if app.room.chat.selection_is_click()
-                    && let Some(url) = self.chat_link_at(app, mouse.column, mouse.row)
-                {
-                    app.room.request_open_url(url);
+                // message reference jumps to it and over a URL opens it; a drag
+                // remains a text selection.
+                if app.room.chat.selection_is_click() {
+                    if let Some(target) = self.chat_ref_at(app, mouse.column, mouse.row) {
+                        self.jump_to_ref(app, target);
+                    } else if let Some(url) = self.chat_link_at(app, mouse.column, mouse.row) {
+                        app.room.request_open_url(url);
+                    }
                 }
                 app.room.chat.end_selection();
             }
@@ -817,6 +823,74 @@ impl RoomMode {
             .chat
             .link_at(line.message, line.line, col_in_line)
             .map(str::to_owned)
+    }
+
+    /// Resolves a screen cell to the message reference under it, if any.
+    fn chat_ref_at(&self, app: &App, column: u16, row: u16) -> Option<rpc::msgref::MessageRef> {
+        let line = self.layout.chat_line_at(row)?;
+        if line.kind != LineKind::Body {
+            return None;
+        }
+        let content_x = self.layout.chat_rect.x.saturating_add(1);
+        if column < content_x {
+            return None;
+        }
+        let col_in_line = column - content_x;
+        app.room.chat.ref_at(line.message, line.line, col_in_line)
+    }
+
+    /// Jumps to a reference's target: selects and scrolls to the message when
+    /// present in the buffer, otherwise reports why not.
+    fn jump_to_ref(&mut self, app: &mut App, target: rpc::msgref::MessageRef) {
+        match app
+            .room
+            .jump_to_ref(target, self.layout.chat_width, self.layout.chat_height)
+        {
+            crate::app::room::RefJump::Jumped => self.set_focus(app, ChatPanelFocus::ChatLog),
+            crate::app::room::RefJump::NotFound => {
+                app.set_status("referenced message is not in this room's history");
+            }
+            crate::app::room::RefJump::OtherRoom => match app.room.cross_room_ref_preview(target) {
+                Some(preview) => app.set_status(preview),
+                None => app.set_status("reference points to another room"),
+            },
+        }
+    }
+
+    fn copy_message_ref_if_focused(&mut self, app: &mut App) {
+        if self.focus != ChatPanelFocus::ChatLog {
+            return;
+        }
+        match app.room.copy_message_ref(self.layout.chat_width) {
+            Some(code) => app.set_status(format!("copied {code}")),
+            None => app.set_status("select a message to reference"),
+        }
+    }
+
+    fn insert_message_ref_if_focused(&mut self, app: &mut App) {
+        if self.focus != ChatPanelFocus::ChatLog {
+            return;
+        }
+        if app
+            .room
+            .insert_message_ref(self.layout.chat_width)
+            .is_some()
+        {
+            self.enter_compose_insert_mode(app);
+        } else {
+            app.set_status("select a message to reference");
+        }
+    }
+
+    fn open_message_ref_if_focused(&mut self, app: &mut App) {
+        if self.focus != ChatPanelFocus::ChatLog {
+            return;
+        }
+        let Some(target) = app.room.chat.selected_ref(self.layout.chat_width) else {
+            app.set_status("selected message contains no reference");
+            return;
+        };
+        self.jump_to_ref(app, target);
     }
 
     fn drag_chat_selection(&mut self, app: &mut App, row: u16) {

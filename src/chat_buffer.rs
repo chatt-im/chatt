@@ -23,6 +23,20 @@ pub struct Segment {
     pub start: u32,
     pub end: u32,
     pub style: Style,
+    /// Whether `start..end` indexes the layout's synthetic text (a resolved
+    /// message-reference pill label) instead of the message body.
+    pub synth: bool,
+}
+
+/// A message reference found in a body at push time.
+///
+/// `target` is `None` when the code failed to decode; `label` is `None` when
+/// the referenced message is not in the local buffer (or in another room), in
+/// which case the literal `@@code` renders dimmed instead of a pill.
+pub struct MsgRefSpan {
+    pub range: Range<u32>,
+    pub target: Option<rpc::msgref::MessageRef>,
+    pub label: Option<String>,
 }
 
 /// The role a rendered chat row plays within its block.
@@ -57,7 +71,6 @@ impl VisibleLine {
 }
 
 pub struct ChatEntry {
-    #[allow(dead_code)]
     pub id: u64,
     pub sender: String,
     pub body: String,
@@ -68,6 +81,8 @@ pub struct ChatEntry {
     pub file_transfer_id: Option<FileTransferId>,
     /// Byte ranges of `http`/`https` URLs in `body`, computed once at push time.
     pub links: Vec<Range<u32>>,
+    /// Message references in `body`, decoded and resolved once at push time.
+    pub refs: Vec<MsgRefSpan>,
     /// Whether a collapsible (over [`COLLAPSE_LIMIT`] lines) message is expanded.
     expanded: bool,
     layout: MessageLayout,
@@ -111,6 +126,7 @@ pub struct VirtualChatBuffer {
     selection: Option<Selection>,
     selected_message: Option<usize>,
     syntax: SyntaxTheme,
+    room_id: Option<rpc::ids::RoomId>,
 }
 
 impl VirtualChatBuffer {
@@ -122,7 +138,18 @@ impl VirtualChatBuffer {
             selection: None,
             selected_message: None,
             syntax,
+            room_id: None,
         }
+    }
+
+    /// Sets the room this buffer displays, the scope against which message
+    /// references resolve.
+    pub fn set_room_id(&mut self, room_id: rpc::ids::RoomId) {
+        self.room_id = Some(room_id);
+    }
+
+    pub fn room_id(&self) -> Option<rpc::ids::RoomId> {
+        self.room_id
     }
 
     pub fn set_max_messages(&mut self, max_messages: usize) {
@@ -144,7 +171,8 @@ impl VirtualChatBuffer {
     }
 
     pub fn push_chat(&mut self, message: ChatMessage, local: bool) {
-        let links = crate::markdown::link_ranges(&message.body);
+        let inline = crate::markdown::inline_ranges(&message.body);
+        let refs = self.build_ref_spans(&message.body, inline.refs);
         self.messages.push(ChatEntry {
             id: message.message_id.0,
             sender: message.sender_name,
@@ -152,7 +180,8 @@ impl VirtualChatBuffer {
             timestamp_ms: message.timestamp_ms,
             local,
             file_transfer_id: message.file_transfer_id,
-            links,
+            links: inline.urls,
+            refs,
             expanded: false,
             layout: MessageLayout::new(),
         });
@@ -161,7 +190,8 @@ impl VirtualChatBuffer {
 
     pub fn push_notice(&mut self, sender: impl Into<String>, body: impl Into<String>) {
         let body = body.into();
-        let links = crate::markdown::link_ranges(&body);
+        let inline = crate::markdown::inline_ranges(&body);
+        let refs = self.build_ref_spans(&body, inline.refs);
         self.messages.push(ChatEntry {
             id: 0,
             sender: sender.into(),
@@ -169,11 +199,70 @@ impl VirtualChatBuffer {
             timestamp_ms: 0,
             local: false,
             file_transfer_id: None,
-            links,
+            links: inline.urls,
+            refs,
             expanded: false,
             layout: MessageLayout::new(),
         });
         self.trim_front();
+    }
+
+    fn build_ref_spans(&self, body: &str, ranges: Vec<Range<u32>>) -> Vec<MsgRefSpan> {
+        let mut spans = Vec::with_capacity(ranges.len());
+        for range in ranges {
+            let code_start = range.start as usize + rpc::msgref::REF_PREFIX.len();
+            let target = rpc::msgref::MessageRef::decode(&body[code_start..range.end as usize]);
+            let label = target.and_then(|target| self.resolve_label(target));
+            spans.push(MsgRefSpan {
+                range,
+                target,
+                label,
+            });
+        }
+        spans
+    }
+
+    /// Resolves a reference target to its pill label when the message is in
+    /// this buffer and this room, the same lookup pushes use. The web feed
+    /// resolves through this so both views label references identically.
+    pub fn ref_label_for(&self, target: rpc::msgref::MessageRef) -> Option<String> {
+        self.resolve_label(target)
+    }
+
+    /// The reference and pill label of the message at `index`, for the composer
+    /// reference picker. `None` for notices, which have no durable key.
+    pub fn ref_for_index(&self, index: usize) -> Option<(rpc::msgref::MessageRef, String)> {
+        let room_id = self.room_id?;
+        let entry = self.messages.get(index)?;
+        if entry.timestamp_ms == 0 {
+            return None;
+        }
+        let target = rpc::msgref::MessageRef {
+            room_id,
+            timestamp_ms: entry.timestamp_ms,
+            message_id: rpc::ids::MessageId(entry.id),
+        };
+        Some((target, ref_label(&entry.sender, &entry.body)))
+    }
+
+    fn resolve_label(&self, target: rpc::msgref::MessageRef) -> Option<String> {
+        if self.room_id != Some(target.room_id) {
+            return None;
+        }
+        let index = self.find_message(target.timestamp_ms, target.message_id.0)?;
+        let entry = &self.messages[index];
+        Some(ref_label(&entry.sender, &entry.body))
+    }
+
+    /// Returns the index of the message with the given durable key, preferring
+    /// the newest on the (never expected) chance of a duplicate.
+    pub fn find_message(&self, timestamp_ms: u64, message_id: u64) -> Option<usize> {
+        for (index, entry) in self.messages.iter().enumerate().rev() {
+            if entry.timestamp_ms == timestamp_ms && entry.id == message_id {
+                return Some(index);
+            }
+        }
+        None
     }
 
     pub fn clear(&mut self) {
@@ -181,6 +270,7 @@ impl VirtualChatBuffer {
         self.scroll_offset = 0;
         self.selection = None;
         self.selected_message = None;
+        self.room_id = None;
     }
 
     pub fn len(&self) -> usize {
@@ -207,19 +297,46 @@ impl VirtualChatBuffer {
         if entry.links.is_empty() {
             return None;
         }
-        for seg in entry.layout.line(line) {
-            let text = &entry.body[seg.start as usize..seg.end as usize];
-            let width = UnicodeWidthStr::width(text).min(u16::MAX as usize) as u16;
-            if col_in_line < seg.col || col_in_line >= seg.col.saturating_add(width) {
-                continue;
-            }
-            let range = entry
-                .links
-                .iter()
-                .find(|r| r.start < seg.end && seg.start < r.end)?;
-            return Some(&entry.body[range.start as usize..range.end as usize]);
+        let seg = entry.layout.segment_at(&entry.body, line, col_in_line)?;
+        if seg.synth {
+            return None;
         }
-        None
+        let range = entry
+            .links
+            .iter()
+            .find(|r| r.start < seg.end && seg.start < r.end)?;
+        Some(&entry.body[range.start as usize..range.end as usize])
+    }
+
+    /// Returns the decoded message reference at `col_in_line` on wrapped `line`
+    /// of `message`, whether rendered as a pill or as a literal code.
+    pub fn ref_at(
+        &self,
+        message: usize,
+        line: usize,
+        col_in_line: u16,
+    ) -> Option<rpc::msgref::MessageRef> {
+        let entry = self.messages.get(message)?;
+        if entry.refs.is_empty() {
+            return None;
+        }
+        let seg = entry.layout.segment_at(&entry.body, line, col_in_line)?;
+        if seg.synth {
+            let index = entry.layout.pill_ref_at(seg)?;
+            return entry.refs.get(index)?.target;
+        }
+        let span = entry
+            .refs
+            .iter()
+            .find(|span| span.range.start < seg.end && seg.start < span.range.end)?;
+        span.target
+    }
+
+    /// Returns the text a segment displays: a body slice, or a slice of the
+    /// layout's synthetic pill text.
+    pub fn segment_text(&self, message: usize, seg: &Segment) -> &str {
+        let entry = &self.messages[message];
+        entry.layout.segment_str(&entry.body, seg)
     }
 
     /// Whether the current selection is a collapsed click (anchor equals head),
@@ -424,9 +541,52 @@ impl VirtualChatBuffer {
         Some(out)
     }
 
+    /// The first decodable reference contained in the selected header's block,
+    /// for keyboard-driven "open the reference in this message".
+    pub fn selected_ref(&mut self, width: u16) -> Option<rpc::msgref::MessageRef> {
+        let selected = self.ensure_selected_message()?;
+        let (first, last) = self.header_block_containing(selected, width)?;
+        for message in first..=last {
+            for span in &self.messages[message].refs {
+                if let Some(target) = span.target {
+                    return Some(target);
+                }
+            }
+        }
+        None
+    }
+
     pub fn keep_selected_header_visible(&mut self, width: u16, height: u16) -> Option<()> {
         let selected = self.ensure_selected_message()?;
         self.keep_header_visible(selected, width, height)
+    }
+
+    pub fn scroll_message_into_view(
+        &mut self,
+        message: usize,
+        width: u16,
+        height: u16,
+    ) -> Option<()> {
+        let height = height as usize;
+        if height == 0 {
+            return None;
+        }
+        let (message_row, total_rows) = self.message_row_and_total(message, width)?;
+        let max_scroll = total_rows.saturating_sub(height);
+        let max_top = total_rows.saturating_sub(height);
+        let desired_top = message_row.saturating_sub(height / 2);
+        let top = desired_top.min(max_top);
+        self.scroll_offset = total_rows
+            .saturating_sub(top.saturating_add(height))
+            .min(max_scroll);
+
+        // A reference jump is an explicit navigation action. When the target is
+        // already in the tail viewport, move one row off the bottom if possible
+        // so the bottom-follow rule cannot immediately reclaim the view.
+        if self.scroll_offset == 0 && max_scroll > 0 && message_row + 1 < total_rows {
+            self.scroll_offset = 1;
+        }
+        Some(())
     }
 
     /// Toggles the expand/collapse state of `message` when it is collapsible
@@ -525,7 +685,7 @@ impl VirtualChatBuffer {
         let width = width.max(1);
         let syntax = self.syntax;
         let msg = &mut self.messages[idx];
-        msg.layout.ensure(width, &msg.body, syntax);
+        msg.layout.ensure(width, &msg.body, &msg.refs, syntax);
         msg.layout.lines().max(1)
     }
 
@@ -747,6 +907,34 @@ impl VirtualChatBuffer {
         header_row.map(|header| (header, row.max(1)))
     }
 
+    fn message_row_and_total(&mut self, message: usize, width: u16) -> Option<(usize, usize)> {
+        if message >= self.messages.len() {
+            return None;
+        }
+        let width = width.max(1);
+        let mut message_row = None;
+        let mut row = 0usize;
+        let mut cursor = 0usize;
+        while cursor < self.messages.len() {
+            let run_end = self.run_end(cursor, width);
+            for block in self.pack_run(cursor, run_end, width) {
+                if block.first <= message && message <= block.last {
+                    let body_offset = if block.collapsed {
+                        1
+                    } else {
+                        1 + (block.first..message)
+                            .map(|idx| self.messages[idx].layout.lines().max(1))
+                            .sum::<usize>()
+                    };
+                    message_row = Some(row.saturating_add(body_offset));
+                }
+                row = row.saturating_add(Self::block_rows(&block));
+            }
+            cursor = run_end + 1;
+        }
+        message_row.map(|target| (target, row.max(1)))
+    }
+
     fn trim_front(&mut self) {
         let excess = self.messages.len().saturating_sub(self.max_messages);
         if excess > 0 {
@@ -768,6 +956,12 @@ struct MessageLayout {
     line_starts: Vec<u32>,
     line_sources: Vec<(u32, u32)>,
     segments: Vec<Segment>,
+    /// Display-only text with no body counterpart: resolved reference pill
+    /// labels. Synthetic segments index into this buffer.
+    synthetic: String,
+    /// Synthetic ranges of rendered pills paired with their `ChatEntry::refs`
+    /// index, for hit-testing clicks on pill segments.
+    pill_spans: Vec<(Range<u32>, u32)>,
     complete: bool,
     estimated_lines: usize,
     syntax: SyntaxTheme,
@@ -777,6 +971,10 @@ struct RenderPiece {
     source: Range<usize>,
     display: Range<usize>,
     style: Style,
+    /// `Some(refs index)` when `source` indexes the synthetic pill text. Such
+    /// pieces never contribute to clipboard source mapping; the hidden literal
+    /// `@@code` range does instead.
+    synth: Option<u32>,
 }
 
 struct InvisibleSource {
@@ -799,6 +997,8 @@ impl MessageLayout {
             line_starts: Vec::new(),
             line_sources: Vec::new(),
             segments: Vec::new(),
+            synthetic: String::new(),
+            pill_spans: Vec::new(),
             complete: false,
             estimated_lines: 1,
             syntax: SyntaxTheme::default(),
@@ -812,13 +1012,13 @@ impl MessageLayout {
         self.wrap_width = 0;
     }
 
-    fn ensure(&mut self, width: u16, text: &str, syntax: SyntaxTheme) {
+    fn ensure(&mut self, width: u16, text: &str, refs: &[MsgRefSpan], syntax: SyntaxTheme) {
         self.syntax = syntax;
         if self.wrap_width != width {
             self.reset_layout(width, text);
         }
         while !self.complete {
-            self.layout_next_block(text);
+            self.layout_next_block(text, refs);
         }
         if self.line_starts.is_empty() {
             self.push_line();
@@ -884,11 +1084,13 @@ impl MessageLayout {
         self.line_starts.clear();
         self.line_sources.clear();
         self.segments.clear();
+        self.synthetic.clear();
+        self.pill_spans.clear();
         self.complete = false;
         self.estimated_lines = estimate_lines(text, width.max(1) as usize);
     }
 
-    fn layout_next_block(&mut self, text: &str) {
+    fn layout_next_block(&mut self, text: &str, refs: &[MsgRefSpan]) {
         let avail = (self.wrap_width as usize).max(1);
         let target = avail.min(REFLOW_TARGET);
 
@@ -904,6 +1106,7 @@ impl MessageLayout {
                 });
                 self.layout_inline_lines(
                     text,
+                    refs,
                     self.cursor + 1,
                     end,
                     Style::DEFAULT,
@@ -922,6 +1125,7 @@ impl MessageLayout {
                 };
                 self.layout_inline_line(
                     text,
+                    refs,
                     self.cursor + 1,
                     end,
                     Style::DEFAULT | Modifier::BOLD,
@@ -932,7 +1136,7 @@ impl MessageLayout {
                 self.cursor = end.saturating_add(1);
             }
             TokenKind::UnorderedListStart | TokenKind::OrderedListStart => {
-                self.cursor = self.layout_list(text, self.cursor + 1, target);
+                self.cursor = self.layout_list(text, refs, self.cursor + 1, target);
             }
             TokenKind::CodeBlock { content, .. } => {
                 let content = content.start as usize..content.end as usize;
@@ -954,6 +1158,7 @@ impl MessageLayout {
     fn layout_inline_lines(
         &mut self,
         text: &str,
+        refs: &[MsgRefSpan],
         start: usize,
         end: usize,
         base_style: Style,
@@ -965,6 +1170,7 @@ impl MessageLayout {
             if matches!(self.tokens[i].kind, TokenKind::HardBreak) {
                 self.layout_inline_line(
                     text,
+                    refs,
                     line_start,
                     i,
                     base_style,
@@ -977,6 +1183,7 @@ impl MessageLayout {
         }
         self.layout_inline_line(
             text,
+            refs,
             line_start,
             end,
             base_style,
@@ -986,7 +1193,13 @@ impl MessageLayout {
         );
     }
 
-    fn layout_list(&mut self, text: &str, mut cursor: usize, target: usize) -> usize {
+    fn layout_list(
+        &mut self,
+        text: &str,
+        refs: &[MsgRefSpan],
+        mut cursor: usize,
+        target: usize,
+    ) -> usize {
         while cursor < self.tokens.len() {
             match &self.tokens[cursor].kind {
                 TokenKind::ListItemStart { marker } => {
@@ -1002,6 +1215,7 @@ impl MessageLayout {
                     };
                     self.layout_inline_line(
                         text,
+                        refs,
                         cursor + 1,
                         end,
                         Style::DEFAULT,
@@ -1021,6 +1235,7 @@ impl MessageLayout {
     fn layout_inline_line(
         &mut self,
         text: &str,
+        refs: &[MsgRefSpan],
         start: usize,
         end: usize,
         base_style: Style,
@@ -1031,6 +1246,7 @@ impl MessageLayout {
         let mut display = String::new();
         let mut pieces = Vec::new();
         let mut invisible = Vec::new();
+        let mut synthetic = String::new();
 
         if let Some((source, style)) = prefix.visible {
             append_piece(text, &mut display, &mut pieces, source, style);
@@ -1044,25 +1260,30 @@ impl MessageLayout {
 
         self.collect_inline_pieces(
             text,
+            refs,
             start,
             end,
             base_style,
             &mut display,
             &mut pieces,
             &mut invisible,
+            &mut synthetic,
         );
+        self.synthetic.push_str(&synthetic);
         self.wrap_pieces(&display, &pieces, &invisible, widths, cols);
     }
 
     fn collect_inline_pieces(
         &self,
         text: &str,
+        refs: &[MsgRefSpan],
         start: usize,
         end: usize,
         base_style: Style,
         display: &mut String,
         pieces: &mut Vec<RenderPiece>,
         invisible: &mut Vec<InvisibleSource>,
+        synthetic: &mut String,
     ) {
         let mut bold = false;
         let mut italic = false;
@@ -1076,6 +1297,40 @@ impl MessageLayout {
                     token_range(token),
                     self.inline_style(base_style, bold, italic, false),
                 ),
+                TokenKind::MessageRef => {
+                    let span = refs
+                        .iter()
+                        .enumerate()
+                        .find(|(_, span)| span.range == token.range);
+                    let pill = span.and_then(|(index, span)| {
+                        let label = span.label.as_deref()?;
+                        Some((index, label))
+                    });
+                    match pill {
+                        Some((index, label)) => {
+                            invisible.push(InvisibleSource {
+                                source: token_range(token),
+                                display_pos: display.len(),
+                            });
+                            append_pill_piece(
+                                label,
+                                self.synthetic.len(),
+                                synthetic,
+                                display,
+                                pieces,
+                                self.syntax.namespace | Modifier::UNDERLINED,
+                                index as u32,
+                            );
+                        }
+                        None => append_piece(
+                            text,
+                            display,
+                            pieces,
+                            token_range(token),
+                            self.syntax.comment,
+                        ),
+                    }
+                }
                 TokenKind::InlineCode => append_piece(
                     text,
                     display,
@@ -1166,7 +1421,15 @@ impl MessageLayout {
                 let source_end = piece.source.start + (end - piece.display.start);
                 let prefix_width = UnicodeWidthStr::width(&display[wrapped.start..start]);
                 let col = base_col.saturating_add(prefix_width.min(u16::MAX as usize) as u16);
-                self.emit_segment(source_start..source_end, col, piece.style);
+                match piece.synth {
+                    Some(ref_index) => self.emit_pill_segment(
+                        source_start..source_end,
+                        col,
+                        piece.style,
+                        ref_index,
+                    ),
+                    None => self.emit_segment(source_start..source_end, col, piece.style),
+                }
             }
         }
 
@@ -1176,7 +1439,9 @@ impl MessageLayout {
                 self.note_source_range(source.source.start, source.source.end);
             }
             for piece in pieces {
-                self.note_source_range(piece.source.start, piece.source.end);
+                if piece.synth.is_none() {
+                    self.note_source_range(piece.source.start, piece.source.end);
+                }
             }
         }
     }
@@ -1242,8 +1507,59 @@ impl MessageLayout {
                 start: range.start as u32,
                 end: range.end as u32,
                 style,
+                synth: false,
             });
         }
+    }
+
+    /// Emits a segment of synthetic pill text. Unlike [`Self::emit_segment`]
+    /// this never notes a source range: the pill's clipboard text is the hidden
+    /// literal `@@code`, already noted through its `InvisibleSource`.
+    fn emit_pill_segment(&mut self, range: Range<usize>, col: u16, style: Style, ref_index: u32) {
+        if range.start < range.end {
+            let range = range.start as u32..range.end as u32;
+            self.pill_spans.push((range.clone(), ref_index));
+            self.segments.push(Segment {
+                col,
+                start: range.start,
+                end: range.end,
+                style,
+                synth: true,
+            });
+        }
+    }
+
+    /// Returns the first segment of wrapped `line` whose rendered text covers
+    /// `col_in_line`.
+    fn segment_at(&self, body: &str, line: usize, col_in_line: u16) -> Option<&Segment> {
+        if line >= self.lines() {
+            return None;
+        }
+        for seg in self.line(line) {
+            let text = self.segment_str(body, seg);
+            let width = UnicodeWidthStr::width(text).min(u16::MAX as usize) as u16;
+            if col_in_line >= seg.col && col_in_line < seg.col.saturating_add(width) {
+                return Some(seg);
+            }
+        }
+        None
+    }
+
+    fn segment_str<'a>(&'a self, body: &'a str, seg: &Segment) -> &'a str {
+        if seg.synth {
+            &self.synthetic[seg.start as usize..seg.end as usize]
+        } else {
+            &body[seg.start as usize..seg.end as usize]
+        }
+    }
+
+    fn pill_ref_at(&self, seg: &Segment) -> Option<usize> {
+        for (range, index) in &self.pill_spans {
+            if range.start < seg.end && seg.start < range.end {
+                return Some(*index as usize);
+            }
+        }
+        None
     }
 
     fn note_source_range(&mut self, start: usize, end: usize) {
@@ -1286,7 +1602,56 @@ fn append_piece(
         source,
         display: start..display.len(),
         style,
+        synth: None,
     });
+}
+
+/// Appends a resolved reference's pill label: the label text joins the display
+/// string for wrapping like any piece, but its source range indexes the
+/// layout's synthetic buffer (`base` is the buffer length before this line's
+/// local `synthetic` additions).
+fn append_pill_piece(
+    label: &str,
+    base: usize,
+    synthetic: &mut String,
+    display: &mut String,
+    pieces: &mut Vec<RenderPiece>,
+    style: Style,
+    ref_index: u32,
+) {
+    if label.is_empty() {
+        return;
+    }
+    let start = display.len();
+    display.push_str(label);
+    let source_start = base + synthetic.len();
+    synthetic.push_str(label);
+    pieces.push(RenderPiece {
+        source: source_start..source_start + label.len(),
+        display: start..display.len(),
+        style,
+        synth: Some(ref_index),
+    });
+}
+
+/// Builds the display label of a resolved reference pill from its target's
+/// sender and body.
+fn ref_label(sender: &str, body: &str) -> String {
+    const SNIPPET_CHARS: usize = 40;
+    let mut label = format!("↩ {sender}: ");
+    let snippet = body.lines().next().unwrap_or("");
+    let mut truncated = body.lines().nth(1).is_some();
+    for (count, ch) in snippet.chars().enumerate() {
+        if count == SNIPPET_CHARS {
+            truncated = true;
+            break;
+        }
+        label.push(ch);
+    }
+    if truncated {
+        label.push('…');
+    }
+    label
 }
 
 fn token_range(token: &Token) -> Range<usize> {
@@ -1349,6 +1714,8 @@ mod tests {
     impl VirtualChatBuffer {
         fn push_test(&mut self, sender: &str, body: &str, timestamp_ms: u64, local: bool) {
             let id = self.messages.len() as u64;
+            let inline = crate::markdown::inline_ranges(body);
+            let refs = self.build_ref_spans(body, inline.refs);
             self.messages.push(ChatEntry {
                 id,
                 sender: sender.to_string(),
@@ -1356,7 +1723,8 @@ mod tests {
                 timestamp_ms,
                 local,
                 file_transfer_id: None,
-                links: crate::markdown::link_ranges(body),
+                links: inline.urls,
+                refs,
                 expanded: false,
                 layout: MessageLayout::new(),
             });
@@ -1627,6 +1995,31 @@ mod tests {
     }
 
     #[test]
+    fn ref_scroll_detaches_when_target_is_visible_in_tail() {
+        let mut buf = VirtualChatBuffer::new(1000, SyntaxTheme::default());
+        for i in 0..8 {
+            let sender = if i % 2 == 0 { "alice" } else { "bob" };
+            buf.push_test(sender, &format!("message {i}"), 1_000_000 + i as u64, false);
+        }
+
+        let (width, height) = (40, 5);
+        buf.bottom();
+        assert_eq!(buf.scroll_offset(), 0);
+
+        let target = buf.messages.len() - 2;
+        buf.scroll_message_into_view(target, width, height)
+            .expect("target message is present");
+
+        assert_eq!(buf.scroll_offset(), 1);
+        let rows = buf.visible_lines(width, height, 0);
+        assert!(
+            rows.iter()
+                .any(|row| row.kind == LineKind::Body && row.message == target),
+            "target body should remain visible after detaching from bottom"
+        );
+    }
+
+    #[test]
     fn selected_text_is_body_content_joined_by_newlines() {
         let mut buf = buffer_with_notices(3);
         // Lay out every message so line segments exist.
@@ -1663,6 +2056,122 @@ mod tests {
         buf.extend_selection((0, 1));
 
         assert_eq!(buf.selected_text().as_deref(), Some("alpha beta"));
+    }
+
+    fn ref_code(timestamp_ms: u64, message_id: u64) -> String {
+        rpc::msgref::MessageRef {
+            room_id: rpc::ids::RoomId(1),
+            timestamp_ms,
+            message_id: rpc::ids::MessageId(message_id),
+        }
+        .encode()
+    }
+
+    fn pill_segments(buf: &VirtualChatBuffer, message: usize) -> Vec<(Segment, String)> {
+        let entry = &buf.messages[message];
+        let mut found = Vec::new();
+        for line in 0..entry.layout.lines() {
+            for seg in entry.layout.line(line) {
+                if seg.synth {
+                    found.push((*seg, buf.segment_text(message, seg).to_string()));
+                }
+            }
+        }
+        found
+    }
+
+    #[test]
+    fn resolved_ref_lays_out_a_pill_with_the_target_label() {
+        let mut buf = VirtualChatBuffer::new(1000, SyntaxTheme::default());
+        buf.set_room_id(rpc::ids::RoomId(1));
+        buf.push_test("alice", "the delay manager change is in", 1_000_000, false);
+        let code = ref_code(1_000_000, 0);
+        buf.push_test(
+            "bob",
+            &format!("see @@{code} for context"),
+            1_060_000,
+            false,
+        );
+        let _ = buf.total_lines_exact(95);
+
+        let entry = &buf.messages[1];
+        assert!(entry.refs[0].target.is_some());
+        assert!(entry.refs[0].label.is_some());
+        let pills = pill_segments(&buf, 1);
+        assert!(!pills.is_empty(), "no synthetic pill segment emitted");
+        assert!(
+            pills[0].1.starts_with("↩ alice: the delay manager"),
+            "unexpected pill text {:?}",
+            pills[0].1
+        );
+    }
+
+    #[test]
+    fn ref_at_resolves_a_click_on_the_pill() {
+        let mut buf = VirtualChatBuffer::new(1000, SyntaxTheme::default());
+        buf.set_room_id(rpc::ids::RoomId(1));
+        buf.push_test("alice", "target", 1_000_000, false);
+        let code = ref_code(1_000_000, 0);
+        buf.push_test("bob", &format!("see @@{code}"), 1_060_000, false);
+        let _ = buf.total_lines_exact(95);
+
+        let (pill, _) = pill_segments(&buf, 1)[0];
+        let target = buf.ref_at(1, 0, pill.col).expect("pill click resolves");
+        assert_eq!(target.timestamp_ms, 1_000_000);
+        assert_eq!(target.message_id.0, 0);
+        assert_eq!(buf.find_message(1_000_000, 0), Some(0));
+    }
+
+    #[test]
+    fn unresolved_ref_renders_the_literal_code() {
+        let mut buf = VirtualChatBuffer::new(1000, SyntaxTheme::default());
+        buf.set_room_id(rpc::ids::RoomId(1));
+        let code = ref_code(999, 42);
+        buf.push_test("bob", &format!("see @@{code}"), 1_060_000, false);
+        let _ = buf.total_lines_exact(95);
+
+        let entry = &buf.messages[0];
+        assert!(entry.refs[0].target.is_some());
+        assert!(entry.refs[0].label.is_none());
+        assert!(pill_segments(&buf, 0).is_empty());
+        let target = buf.ref_at(0, 0, 5).expect("literal ref is clickable");
+        assert_eq!(target.message_id.0, 42);
+    }
+
+    #[test]
+    fn undecodable_ref_is_not_clickable() {
+        let mut buf = VirtualChatBuffer::new(1000, SyntaxTheme::default());
+        buf.set_room_id(rpc::ids::RoomId(1));
+        let mut code = ref_code(999, 42);
+        let flipped = if code.ends_with('0') { '1' } else { '0' };
+        code.pop();
+        code.push(flipped);
+        buf.push_test("bob", &format!("see @@{code}"), 1_060_000, false);
+        let _ = buf.total_lines_exact(95);
+
+        let entry = &buf.messages[0];
+        assert_eq!(entry.refs.len(), 1);
+        assert!(entry.refs[0].target.is_none());
+        assert!(buf.ref_at(0, 0, 5).is_none());
+    }
+
+    #[test]
+    fn selection_over_a_pill_line_copies_the_literal_code() {
+        let mut buf = VirtualChatBuffer::new(1000, SyntaxTheme::default());
+        buf.set_room_id(rpc::ids::RoomId(1));
+        buf.push_test("alice", "target message", 1_000_000, false);
+        let code = ref_code(1_000_000, 0);
+        let body = format!("intro\nsee @@{code} tail");
+        buf.push_test("bob", &body, 1_060_000, false);
+        let _ = buf.total_lines_exact(95);
+        assert_eq!(buf.messages[1].layout.lines(), 2);
+
+        buf.begin_selection((1, 1));
+        buf.extend_selection((1, 1));
+        assert_eq!(
+            buf.selected_text().as_deref(),
+            Some(format!("see @@{code} tail").as_str())
+        );
     }
 
     #[test]
