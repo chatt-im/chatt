@@ -594,22 +594,26 @@ fn room_user_voice_feedback_label(app: &App, participant: &ParticipantState) -> 
     if !participant.voice_active || feedback.updated_at.elapsed() > Duration::from_secs(10) {
         return String::new();
     }
-    // A directly connected peer uses its own measured RTT, everyone else rides
-    // the relay so the shared server RTT is the network leg. Halved to one-way.
-    let rtt_ms = if participant.p2p_direct {
-        participant.peer_rtt_ms
-    } else {
+    // Every remote participant carries its own end-to-end RTT (direct p2p, or
+    // relayed peer pings covering both network legs). The self row has no peer
+    // to probe, so its network leg is the link to the relay. Halved to one-way.
+    let rtt_ms = if Some(participant.user_id) == app.user_id {
         app.server_rtt_ms
+    } else {
+        participant.peer_rtt_ms
     };
     if app.lobby_details {
+        let net = match rtt_ms {
+            Some(rtt) => format!("net{}", rtt / 2),
+            None => "net?".to_string(),
+        };
         return format!(
-            "loss{} jb{}/{} r{} j{} net{}",
+            "loss{} jb{}/{} r{} j{} {net}",
             feedback.loss_percent,
             feedback.max_neteq_playout_delay_ms,
             feedback.max_neteq_target_ms,
             feedback.max_output_ring_ms,
             feedback.max_interarrival_jitter_ms,
-            rtt_ms.unwrap_or(0) / 2
         );
     }
     // Collapsed default: a single mouth-to-ear-ish latency estimate.

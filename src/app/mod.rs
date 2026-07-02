@@ -1666,7 +1666,7 @@ impl App {
                 self.room.playback_feedback(feedback);
             }
             NetworkEvent::ServerRtt { rtt_ms } => {
-                self.server_rtt_ms = Some(rtt_ms);
+                self.server_rtt_ms = rtt_ms;
             }
             NetworkEvent::PeerRtt { user_id, rtt_ms } => {
                 self.room.peer_rtt(user_id, rtt_ms);

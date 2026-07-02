@@ -503,7 +503,7 @@ impl RoomSession {
         self.participants.set_peer_transport(user_id, direct);
     }
 
-    pub(super) fn peer_rtt(&mut self, user_id: UserId, rtt_ms: u16) {
+    pub(super) fn peer_rtt(&mut self, user_id: UserId, rtt_ms: Option<u16>) {
         self.participants.set_peer_rtt(user_id, rtt_ms);
     }
 
