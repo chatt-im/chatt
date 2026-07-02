@@ -14,7 +14,8 @@ use chatt::audio::StatsSnapshot;
 use crate::{
     app::{
         App, ChatPanelFocus, ParticipantState, ParticipantVoiceFeedback, ServerEditDraft,
-        ServerSelectItem, StatusKind, room::TransferProgress, volume_db_label,
+        ServerSelectItem, StatusKind, audio_supervisor::AudioHealthState, room::TransferProgress,
+        volume_db_label,
     },
     bindings::{self, Reachable, ReachableKind},
     chat_buffer::{self, LineKind},
@@ -744,7 +745,7 @@ fn draw_top_bar(area: Rect, app: &mut App, buf: &mut Buffer, capture: Option<&St
     );
 }
 
-fn draw_lobby_bar(area: Rect, app: &App, focus: ChatPanelFocus, buf: &mut Buffer) {
+fn draw_lobby_bar(area: Rect, app: &mut App, focus: ChatPanelFocus, buf: &mut Buffer) {
     if area.is_empty() {
         return;
     }
@@ -772,6 +773,79 @@ fn draw_lobby_bar(area: Rect, app: &App, focus: ChatPanelFocus, buf: &mut Buffer
             voice_count
         ),
     );
+    draw_lobby_audio_widget(row, app, fill, buf);
+}
+
+/// The audio health widget on the right of the lobby bar: compact device
+/// names while healthy, recovery state plus a clickable `[reset]` button
+/// while a stream is reconnecting or waiting for a device.
+fn draw_lobby_audio_widget(remaining: Rect, app: &mut App, fill: Style, buf: &mut Buffer) {
+    app.chrome.lobby_bar.audio_widget = Rect::EMPTY;
+    app.chrome.lobby_bar.audio_reset = Rect::EMPTY;
+    let theme = app.theme;
+    let mic = app.capture_audio_health();
+    let spk = app.playback_audio_health();
+    let mut right = remaining;
+
+    let mut trouble = Vec::new();
+    if let Some(text) = audio_health_status_text("mic", mic.state) {
+        trouble.push(text);
+    }
+    if let Some(text) = audio_health_status_text("spk", spk.state) {
+        trouble.push(text);
+    }
+    if !trouble.is_empty() {
+        app.chrome.lobby_bar.audio_reset = draw_status_segment_right(
+            &mut right,
+            buf,
+            theme.status_section.patch(theme.warn) | Modifier::BOLD,
+            " [reset] ",
+        );
+        app.chrome.lobby_bar.audio_widget = draw_status_segment_right(
+            &mut right,
+            buf,
+            fill.patch(theme.warn),
+            &format!(" {} ", trouble.join(" | ")),
+        );
+        return;
+    }
+
+    let mut devices = Vec::new();
+    if let Some(name) = spk.device_name.as_deref() {
+        devices.push(format!("spk:{}", truncate_device_name(name)));
+    }
+    if let Some(name) = mic.device_name.as_deref() {
+        devices.push(format!("mic:{}", truncate_device_name(name)));
+    }
+    if devices.is_empty() {
+        return;
+    }
+    app.chrome.lobby_bar.audio_widget = draw_status_segment_right(
+        &mut right,
+        buf,
+        fill.patch(theme.muted),
+        &format!(" {} ", devices.join(" | ")),
+    );
+}
+
+fn audio_health_status_text(prefix: &str, state: AudioHealthState) -> Option<String> {
+    match state {
+        AudioHealthState::Healthy => None,
+        AudioHealthState::Settling => Some(format!("{prefix}: reconnecting…")),
+        AudioHealthState::Reconnecting { attempt } => {
+            Some(format!("{prefix}: reconnecting ({attempt})"))
+        }
+        AudioHealthState::WaitingForDevice => Some(format!("{prefix}: waiting for device")),
+    }
+}
+
+fn truncate_device_name(name: &str) -> String {
+    const MAX_CHARS: usize = 14;
+    if name.chars().count() <= MAX_CHARS {
+        return name.to_string();
+    }
+    let head: String = name.chars().take(MAX_CHARS.saturating_sub(1)).collect();
+    format!("{head}…")
 }
 
 fn draw_chat_log_bar(area: Rect, app: &App, focus: ChatPanelFocus, buf: &mut Buffer) {
@@ -1578,10 +1652,20 @@ fn voice_style(app: &App) -> Style {
 /// Drives the persistent status-bar indicator so a dead audio path is visible
 /// rather than only flashing a transient status line.
 fn audio_failed(app: &App) -> bool {
-    app.user_id.is_some() && (app.mic_error.is_some() || app.playback_error.is_some())
+    app.user_id.is_some()
+        && (!app.capture_audio_health().is_healthy()
+            || !app.playback_audio_health().is_healthy()
+            || app.mic_error.is_some()
+            || app.playback_error.is_some())
 }
 
 fn mic_status_compact(app: &App, capture: Option<&StatsSnapshot>) -> String {
+    if !app.capture_audio_health().is_healthy() {
+        return "mic reconnecting".to_string();
+    }
+    if !app.playback_audio_health().is_healthy() {
+        return "speaker reconnecting".to_string();
+    }
     if app.mic_error.is_some() {
         return "mic unavailable".to_string();
     }

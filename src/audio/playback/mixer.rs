@@ -7,6 +7,7 @@ use hashbrown::HashMap;
 
 use super::frame_combiner::{FrameCombiner, MIX_FRAME_SAMPLES};
 use crate::audio::{
+    errors::AudioErrorKind,
     playback::{RingReader, SampleRing},
     shared::{
         AUDIO_POP_DELTA_THRESHOLD, LivePlaybackSnapshot, PlaybackStreamControl,
@@ -55,6 +56,8 @@ pub(crate) struct LivePlaybackMixer {
     pending_controls: HashMap<u32, PlaybackStreamControl>,
     backend_xruns: u64,
     backend_stream_errors: u64,
+    backend_fatal_stream_errors: u64,
+    last_backend_error_kind: Option<AudioErrorKind>,
     last_backend_error: Option<String>,
     last_backend_error_log_at: Option<Instant>,
     /// Per-stream rendered 10 ms source frames, reused across callbacks to avoid
@@ -111,6 +114,8 @@ impl LivePlaybackMixer {
             pending_controls: HashMap::new(),
             backend_xruns: 0,
             backend_stream_errors: 0,
+            backend_fatal_stream_errors: 0,
+            last_backend_error_kind: None,
             last_backend_error: None,
             last_backend_error_log_at: None,
             source_frames: Vec::with_capacity(LIVE_PLAYBACK_PREALLOCATED_STREAMS),
@@ -136,6 +141,8 @@ impl LivePlaybackMixer {
     pub(crate) fn set_snapshot(&mut self, mut snapshot: LivePlaybackSnapshot) {
         snapshot.backend_xruns = self.backend_xruns;
         snapshot.backend_stream_errors = self.backend_stream_errors;
+        snapshot.backend_fatal_stream_errors = self.backend_fatal_stream_errors;
+        snapshot.last_backend_error_kind = self.last_backend_error_kind;
         snapshot.last_backend_error = self.last_backend_error.clone();
         self.last_snapshot = snapshot;
     }
@@ -408,12 +415,17 @@ impl LivePlaybackMixer {
     pub(crate) fn record_backend_stream_error(
         &mut self,
         error: String,
-        is_xrun: bool,
+        kind: AudioErrorKind,
         now: Instant,
     ) {
+        let is_xrun = kind == AudioErrorKind::Xrun;
         self.backend_stream_errors = self.backend_stream_errors.saturating_add(1);
         if is_xrun {
             self.backend_xruns = self.backend_xruns.saturating_add(1);
+        }
+        if kind.triggers_recovery() {
+            self.backend_fatal_stream_errors = self.backend_fatal_stream_errors.saturating_add(1);
+            self.last_backend_error_kind = Some(kind);
         }
         self.last_backend_error = Some(error.clone());
 
@@ -518,11 +530,19 @@ impl LivePlaybackSharedSnapshot {
         };
         snapshot.backend_xruns = inner.snapshot.backend_xruns;
         snapshot.backend_stream_errors = inner.snapshot.backend_stream_errors;
+        snapshot.backend_fatal_stream_errors = inner.snapshot.backend_fatal_stream_errors;
+        snapshot.last_backend_error_kind = inner.snapshot.last_backend_error_kind;
         snapshot.last_backend_error = inner.snapshot.last_backend_error.clone();
         inner.snapshot = snapshot;
     }
 
-    pub(crate) fn record_backend_stream_error(&self, error: String, is_xrun: bool, now: Instant) {
+    pub(crate) fn record_backend_stream_error(
+        &self,
+        error: String,
+        kind: AudioErrorKind,
+        now: Instant,
+    ) {
+        let is_xrun = kind == AudioErrorKind::Xrun;
         let Ok(mut inner) = self.inner.lock() else {
             if is_xrun {
                 kvlog::warn!("live playback backend xrun", error = error.as_str());
@@ -536,6 +556,11 @@ impl LivePlaybackSharedSnapshot {
             inner.snapshot.backend_stream_errors.saturating_add(1);
         if is_xrun {
             inner.snapshot.backend_xruns = inner.snapshot.backend_xruns.saturating_add(1);
+        }
+        if kind.triggers_recovery() {
+            inner.snapshot.backend_fatal_stream_errors =
+                inner.snapshot.backend_fatal_stream_errors.saturating_add(1);
+            inner.snapshot.last_backend_error_kind = Some(kind);
         }
         inner.snapshot.last_backend_error = Some(error.clone());
 

@@ -15,6 +15,11 @@ pub(crate) const SLASH_COMMANDS: &[SlashCommand] = &[
         description: "show receive and playback diagnostics",
     },
     SlashCommand {
+        name: "/audio-reset",
+        usage: "/audio-reset",
+        description: "rebuild audio streams and re-scan devices",
+    },
+    SlashCommand {
         name: "/clear",
         usage: "/clear",
         description: "clear the local chat view",

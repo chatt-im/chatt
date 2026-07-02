@@ -1,4 +1,5 @@
 pub(crate) mod audio_diagnostics;
+pub(crate) mod audio_supervisor;
 pub(crate) mod commands;
 pub(crate) mod dialogs;
 pub(crate) mod participants;
@@ -50,14 +51,18 @@ use crate::{
 };
 
 use chatt::audio::{
-    self, BufferRequest, DeviceInfo, EchoCancellationControl, LiveAudioFileSourceConfig,
-    LiveAudioFileSourceReport, LiveAudioMuteState, LiveAudioPacketLossProfile, LiveCapture,
-    LiveCaptureConfig, LiveEncoderProfile, LivePlayback, LivePlaybackConfig, LivePlaybackFeedback,
-    LivePlaybackSink, LivePlaybackSnapshot, LocalVoiceFrame, NotificationSound,
-    PlaybackStreamControl,
+    self, AudioStartError, BufferRequest, DeviceInfo, EchoCancellationControl,
+    LiveAudioFileSourceConfig, LiveAudioFileSourceReport, LiveAudioMuteState,
+    LiveAudioPacketLossProfile, LiveCapture, LiveCaptureConfig, LiveEncoderProfile, LivePlayback,
+    LivePlaybackConfig, LivePlaybackFeedback, LivePlaybackSink, LivePlaybackSnapshot,
+    LocalVoiceFrame, NotificationSound, PlaybackStreamControl,
 };
 
 use audio_diagnostics::AudioDiagnostics;
+use audio_supervisor::{
+    AudioDeviceEventKind, AudioEventLog, AudioHealthState, AudioStreamSupervisor, RebuildCause,
+};
+use chatt::audio::{AudioErrorKind, DeviceIdentityProbe};
 use commands::slash_command_help;
 
 pub(crate) use dialogs::{UserVolumeDialog, UserVolumeEvent};
@@ -253,6 +258,9 @@ pub(crate) struct App {
     pending_voice_teardown_at: Option<Instant>,
     pending_network_commands: VecDeque<NetworkCommand>,
     supervisor: SupervisorState,
+    /// Recent audio device events (losses, recoveries, default changes) shown
+    /// by `/audio`.
+    audio_events: AudioEventLog,
     /// The browser chat-log feed, present only when `[web] enabled = true`.
     web_feed: Option<crate::web_server::WebFeedSender>,
     /// The active outbound screen share, if this client is sharing.
@@ -293,25 +301,50 @@ pub(crate) struct PendingAudioApply {
 struct SupervisorState {
     network: RecoveryState,
     control_socket: RecoveryState,
-    capture: RecoveryState,
-    playback: RecoveryState,
+    capture: AudioStreamSupervisor,
+    playback: AudioStreamSupervisor,
     capture_watch: CaptureWatch,
     playback_watch: PlaybackWatch,
+    device_probe: DeviceProbeState,
 }
 
+/// Scheduling state for the background device-identity observer.
+#[derive(Default)]
+struct DeviceProbeState {
+    next_at: Option<Instant>,
+    in_flight: bool,
+    last: Option<DeviceIdentityProbe>,
+}
+
+/// One audio direction's health plus its opened device, for the TUI.
+pub(crate) struct AudioSideHealth {
+    pub(crate) state: AudioHealthState,
+    pub(crate) device_name: Option<String>,
+}
+
+impl AudioSideHealth {
+    pub(crate) fn is_healthy(&self) -> bool {
+        self.state == AudioHealthState::Healthy
+    }
+}
+
+/// Edge detectors over the capture stats snapshot, so each failure episode
+/// feeds the supervisor exactly once instead of re-arming it every tick.
 #[derive(Default)]
 struct CaptureWatch {
     callbacks: u64,
     captured_samples: u64,
-    stream_errors: u64,
+    fatal_stream_errors: u64,
     worker_stopped: bool,
+    worker_finished: bool,
+    stall_reported: bool,
     last_progress_at: Option<Instant>,
 }
 
 #[derive(Default)]
 struct PlaybackWatch {
-    backend_stream_errors: u64,
-    backend_xruns: u64,
+    backend_fatal_stream_errors: u64,
+    worker_finished: bool,
 }
 
 #[derive(Default)]
@@ -332,6 +365,11 @@ enum RecoverySchedule {
 const RECOVERY_WINDOW: Duration = Duration::from_secs(30);
 const RECOVERY_MAX_ATTEMPTS: usize = 3;
 const CAPTURE_STALL_TIMEOUT: Duration = Duration::from_millis(750);
+/// Device-observer poll cadence while streams are open and healthy.
+const DEVICE_PROBE_INTERVAL_HEALTHY: Duration = Duration::from_secs(5);
+/// Faster cadence while a stream is recovering or waiting to move back onto
+/// its configured device, so a (re)appearing device is noticed promptly.
+const DEVICE_PROBE_INTERVAL_RECOVERING: Duration = Duration::from_secs(2);
 const LOBBY_TALKING_RELEASE: Duration = Duration::from_millis(200);
 /// The talking indicator is intentionally more sensitive than NetEQ's
 /// time-scaling VAD so quiet but audible decoded speech still registers.
@@ -421,25 +459,21 @@ fn audio_restart_flags(old: &config::AudioConfig, new: &config::AudioConfig) -> 
     (capture, playback)
 }
 
-fn playback_backend_recovery_reason(
+fn playback_backend_failure(
     snapshot: &LivePlaybackSnapshot,
     watch: &PlaybackWatch,
-) -> Option<String> {
-    let previous_non_xrun_errors = watch
-        .backend_stream_errors
-        .saturating_sub(watch.backend_xruns);
-    let current_non_xrun_errors = snapshot
-        .backend_stream_errors
-        .saturating_sub(snapshot.backend_xruns);
-    if current_non_xrun_errors <= previous_non_xrun_errors {
+) -> Option<(AudioErrorKind, String)> {
+    if snapshot.backend_fatal_stream_errors <= watch.backend_fatal_stream_errors {
         return None;
     }
-    Some(
-        snapshot
-            .last_backend_error
-            .clone()
-            .unwrap_or_else(|| "playback stream error".to_string()),
-    )
+    let kind = snapshot
+        .last_backend_error_kind
+        .unwrap_or(AudioErrorKind::Transient);
+    let message = snapshot
+        .last_backend_error
+        .clone()
+        .unwrap_or_else(|| "playback stream error".to_string());
+    Some((kind, message))
 }
 
 pub(crate) struct AudioDeviceRefresh {
@@ -456,11 +490,18 @@ pub(crate) struct SoundboardEvent {
     pub(crate) result: Result<LiveAudioFileSourceReport, String>,
 }
 
+/// Result of one background device-identity probe (the audio hotplug and
+/// default-device observer).
+pub(crate) struct AudioDeviceProbeEvent {
+    pub(crate) result: Result<DeviceIdentityProbe, String>,
+}
+
 /// An event delivered from a worker thread to the UI thread over the single
 /// application event channel.
 pub(crate) enum AppEvent {
     Network(NetworkEvent),
     AudioDeviceRefresh(AudioDeviceRefresh),
+    AudioDeviceProbe(AudioDeviceProbeEvent),
     Soundboard(SoundboardEvent),
     Voice(local_control::VoiceCommand),
     Screencast(local_control::ScreencastCommand),
@@ -478,6 +519,12 @@ impl From<NetworkEvent> for AppEvent {
 impl From<AudioDeviceRefresh> for AppEvent {
     fn from(refresh: AudioDeviceRefresh) -> Self {
         AppEvent::AudioDeviceRefresh(refresh)
+    }
+}
+
+impl From<AudioDeviceProbeEvent> for AppEvent {
+    fn from(probe: AudioDeviceProbeEvent) -> Self {
+        AppEvent::AudioDeviceProbe(probe)
     }
 }
 
@@ -772,6 +819,7 @@ impl App {
             pending_voice_teardown_at: None,
             pending_network_commands: VecDeque::new(),
             supervisor: SupervisorState::default(),
+            audio_events: AudioEventLog::default(),
             web_feed,
             screencast: None,
             screencast_stream_id: None,
@@ -809,6 +857,7 @@ impl App {
         match event {
             AppEvent::Network(event) => self.handle_network_event(event),
             AppEvent::AudioDeviceRefresh(refresh) => self.handle_audio_device_refresh(refresh),
+            AppEvent::AudioDeviceProbe(probe) => self.handle_audio_device_probe(probe.result),
             AppEvent::Soundboard(event) => self.handle_soundboard_event(event),
             AppEvent::Voice(command) => self.apply_voice_command(command),
             AppEvent::Screencast(command) => self.handle_screencast_command(command),
@@ -2438,6 +2487,7 @@ impl App {
             applied.push("capture");
         }
         if playback {
+            self.supervisor.playback.reset();
             self.restart_playback_stream();
             applied.push("playback");
         }
@@ -2446,11 +2496,247 @@ impl App {
         }
     }
 
+    /// Health of the capture side plus the opened device name, for the
+    /// lobby-bar widget and top-bar indicators.
+    pub(crate) fn capture_audio_health(&self) -> AudioSideHealth {
+        AudioSideHealth {
+            state: self.supervisor.capture.health().state,
+            device_name: self
+                .capture
+                .as_ref()
+                .map(|capture| capture.device_info().device_name.clone()),
+        }
+    }
+
+    pub(crate) fn playback_audio_health(&self) -> AudioSideHealth {
+        AudioSideHealth {
+            state: self.supervisor.playback.health().state,
+            device_name: self
+                .playback
+                .as_ref()
+                .map(|playback| playback.device_info().device_name.clone()),
+        }
+    }
+
+    /// Full manual audio reset: forgets all recovery state and backoff,
+    /// rebuilds both streams, and re-enumerates the device catalog. Wired to
+    /// `/audio-reset` and the lobby-bar reset button.
+    pub(crate) fn audio_manual_reset(&mut self) {
+        let now = Instant::now();
+        self.audio_events.push(
+            now,
+            AudioDeviceEventKind::ManualReset,
+            "user requested audio reset",
+        );
+        self.pending_audio_apply = None;
+        self.supervisor.capture.reset();
+        self.supervisor.playback.reset();
+        self.supervisor.capture_watch = CaptureWatch::default();
+        self.supervisor.playback_watch = PlaybackWatch::default();
+        self.mic_error = None;
+        self.playback_error = None;
+        self.restart_capture_stream();
+        let playback_should_run =
+            self.voice_tx_enabled.load(Ordering::Relaxed) && !self.deafened.load(Ordering::Relaxed);
+        if playback_should_run || self.playback.is_some() {
+            self.restart_playback_stream();
+        }
+        self.refresh_audio_devices();
+        self.set_status("audio reset: rebuilding streams");
+    }
+
     fn supervise(&mut self, now: Instant) {
         self.supervise_network(now);
         self.supervise_control_socket(now);
         self.supervise_capture(now);
         self.supervise_playback(now);
+        self.supervise_device_probe(now);
+    }
+
+    /// Schedules the background device-identity probe: paused while no stream
+    /// is open and everything is healthy, 5 s while streams run, 2 s while a
+    /// stream is recovering or displaced from its configured device.
+    /// Enumeration always happens off-thread; only scheduling runs here.
+    fn supervise_device_probe(&mut self, now: Instant) {
+        let streams_active = self.capture.is_some() || self.playback.is_some();
+        let recovering = self.supervisor.capture.is_recovering()
+            || self.supervisor.playback.is_recovering()
+            || self.supervisor.capture.wants_configured_device()
+            || self.supervisor.playback.wants_configured_device();
+        if !streams_active && !recovering {
+            self.supervisor.device_probe.next_at = None;
+            return;
+        }
+        if self.supervisor.device_probe.in_flight {
+            return;
+        }
+        let interval = if recovering {
+            DEVICE_PROBE_INTERVAL_RECOVERING
+        } else {
+            DEVICE_PROBE_INTERVAL_HEALTHY
+        };
+        let due = match self.supervisor.device_probe.next_at {
+            None => now,
+            Some(next_at) => next_at.min(now + interval),
+        };
+        if now < due {
+            self.supervisor.device_probe.next_at = Some(due);
+            return;
+        }
+        self.supervisor.device_probe.in_flight = true;
+        self.supervisor.device_probe.next_at = Some(now + interval);
+        let tx = self.events.sender();
+        thread::Builder::new()
+            .name("chatt-dev-probe".to_string())
+            .stack_size(256 * 1024)
+            .spawn(move || {
+                let _ = tx.send(AudioDeviceProbeEvent {
+                    result: audio::probe_device_identities(),
+                });
+            })
+            .expect("failed to spawn audio device probe");
+    }
+
+    fn handle_audio_device_probe(&mut self, result: Result<DeviceIdentityProbe, String>) {
+        self.supervisor.device_probe.in_flight = false;
+        let probe = match result {
+            Ok(probe) => probe,
+            Err(error) => {
+                kvlog::warn!("audio device probe failed", error = error.as_str());
+                return;
+            }
+        };
+        let now = Instant::now();
+        let previous = self.supervisor.device_probe.last.take();
+        if let Some(previous) = &previous {
+            self.note_default_device_changes(now, previous, &probe);
+            self.note_missing_stream_devices(now, previous, &probe);
+        }
+        self.note_target_device_sightings(now, &probe);
+        self.supervisor.device_probe.last = Some(probe);
+    }
+
+    /// Follows OS default-device changes for streams opened on the default
+    /// path. The rebuild is debounced by the supervisor so an AirPods
+    /// A2DP/HFP profile flap that reverts within the window coalesces away.
+    fn note_default_device_changes(
+        &mut self,
+        now: Instant,
+        previous: &DeviceIdentityProbe,
+        probe: &DeviceIdentityProbe,
+    ) {
+        if self.capture.is_some()
+            && self.config.audio.input_device_id.is_none()
+            && let (Some(old), Some(new)) = (&previous.default_input, &probe.default_input)
+            && old.stable_id != new.stable_id
+        {
+            self.audio_events.push(
+                now,
+                AudioDeviceEventKind::DefaultInputChanged,
+                format!("{} → {}", old.name, new.name),
+            );
+            self.supervisor.capture.on_default_changed(now);
+        }
+        // A configured output that matched the previous default was opened on
+        // the default path; a default change there also warrants a rebuild,
+        // which re-resolves onto the now-concrete configured device.
+        let output_follows_default = match self.config.audio.output_device_id.as_deref() {
+            None => true,
+            Some(id) => previous
+                .default_output
+                .as_ref()
+                .is_some_and(|identity| identity.matches_target(id)),
+        };
+        if self.playback.is_some()
+            && output_follows_default
+            && let (Some(old), Some(new)) = (&previous.default_output, &probe.default_output)
+            && old.stable_id != new.stable_id
+        {
+            self.audio_events.push(
+                now,
+                AudioDeviceEventKind::DefaultOutputChanged,
+                format!("{} → {}", old.name, new.name),
+            );
+            self.supervisor.playback.on_default_changed(now);
+        }
+    }
+
+    /// Detects a concrete stream device dropping out of the enumeration while
+    /// its stream still looks healthy (the error callback or stall watchdog
+    /// usually fires first; this is the backstop). Edge-triggered on
+    /// present-in-previous-probe so identity spelling mismatches can never
+    /// produce a stream of false losses.
+    fn note_missing_stream_devices(
+        &mut self,
+        now: Instant,
+        previous: &DeviceIdentityProbe,
+        probe: &DeviceIdentityProbe,
+    ) {
+        if let Some(capture) = &self.capture
+            && self.supervisor.capture.is_healthy()
+        {
+            let info = capture.device_info();
+            if !info.is_default
+                && previous.inputs_contain(&info.stable_id)
+                && !probe.inputs_contain(&info.stable_id)
+            {
+                let message = format!("device `{}` no longer present", info.device_name);
+                self.audio_events.push(
+                    now,
+                    AudioDeviceEventKind::DeviceLost,
+                    format!("mic: {}", info.device_name),
+                );
+                self.supervisor
+                    .capture
+                    .on_error(now, AudioErrorKind::DeviceGone, message);
+            }
+        }
+        if let Some(playback) = &self.playback
+            && self.supervisor.playback.is_healthy()
+        {
+            let info = playback.device_info();
+            if !info.is_default
+                && previous.outputs_contain(&info.stable_id)
+                && !probe.outputs_contain(&info.stable_id)
+            {
+                let message = format!("device `{}` no longer present", info.device_name);
+                self.audio_events.push(
+                    now,
+                    AudioDeviceEventKind::DeviceLost,
+                    format!("spk: {}", info.device_name),
+                );
+                self.supervisor
+                    .playback
+                    .on_error(now, AudioErrorKind::DeviceGone, message);
+            }
+        }
+    }
+
+    /// Rebuilds immediately when the device a stream is waiting for — or the
+    /// configured device it was displaced from — shows up in the probe.
+    fn note_target_device_sightings(&mut self, now: Instant, probe: &DeviceIdentityProbe) {
+        let capture_target_present = match self.config.audio.input_device_id.as_deref() {
+            Some(id) => probe.inputs_contain(id),
+            None => probe.default_input.is_some(),
+        };
+        if capture_target_present && self.supervisor.capture.on_target_device_seen(now) {
+            self.audio_events.push(
+                now,
+                AudioDeviceEventKind::DeviceReturned,
+                "mic device available again",
+            );
+        }
+        let playback_target_present = match self.config.audio.output_device_id.as_deref() {
+            Some(id) => probe.outputs_contain(id),
+            None => probe.default_output.is_some(),
+        };
+        if playback_target_present && self.supervisor.playback.on_target_device_seen(now) {
+            self.audio_events.push(
+                now,
+                AudioDeviceEventKind::DeviceReturned,
+                "speaker device available again",
+            );
+        }
     }
 
     fn supervise_network(&mut self, now: Instant) {
@@ -2492,74 +2778,137 @@ impl App {
     }
 
     fn supervise_capture(&mut self, now: Instant) {
-        if let Some(reason) = self.supervisor.capture.take_due(now) {
-            self.recover_capture_stream(&reason);
+        let apply_owns_restart = self
+            .pending_audio_apply
+            .as_ref()
+            .is_some_and(|pending| pending.capture);
+        if !apply_owns_restart && let Some(cause) = self.supervisor.capture.take_due_rebuild(now) {
+            self.recover_capture_stream(now, cause);
         }
         let Some(capture) = &self.capture else {
             self.supervisor.capture_watch = CaptureWatch::default();
+            let should_run =
+                self.voice_tx_enabled.load(Ordering::Relaxed) || self.settings_preview_capture;
+            if !should_run {
+                self.supervisor.capture.reset();
+            }
             return;
         };
         let snapshot = capture.stats().snapshot();
-        let mut reason = None;
-        if snapshot.stream_errors > self.supervisor.capture_watch.stream_errors {
-            reason = Some(
+        let mut failure = None;
+        if snapshot.fatal_stream_errors > self.supervisor.capture_watch.fatal_stream_errors {
+            failure = Some((
+                snapshot
+                    .last_error_kind
+                    .unwrap_or(AudioErrorKind::Transient),
                 snapshot
                     .last_error
                     .clone()
                     .unwrap_or_else(|| "capture stream error".to_string()),
-            );
+            ));
         }
         if snapshot.worker_stopped && !self.supervisor.capture_watch.worker_stopped {
-            reason = Some("capture worker stopped".to_string());
+            failure = Some((
+                AudioErrorKind::Transient,
+                "capture worker stopped".to_string(),
+            ));
         }
-        if capture.worker_finished() {
-            reason = Some("capture worker exited".to_string());
+        let worker_finished = capture.worker_finished();
+        if worker_finished && !self.supervisor.capture_watch.worker_finished {
+            failure = Some((
+                AudioErrorKind::Transient,
+                "capture worker exited".to_string(),
+            ));
         }
 
         let progressed = snapshot.callbacks != self.supervisor.capture_watch.callbacks
             || snapshot.captured_samples != self.supervisor.capture_watch.captured_samples;
         if progressed || self.supervisor.capture_watch.last_progress_at.is_none() {
             self.supervisor.capture_watch.last_progress_at = Some(now);
+            self.supervisor.capture_watch.stall_reported = false;
         } else if self.capture_should_be_live()
+            && !self.supervisor.capture_watch.stall_reported
             && self
                 .supervisor
                 .capture_watch
                 .last_progress_at
                 .is_some_and(|last| now.saturating_duration_since(last) >= CAPTURE_STALL_TIMEOUT)
         {
-            reason = Some("capture stream stopped delivering audio".to_string());
+            self.supervisor.capture_watch.stall_reported = true;
+            // The typical shape of a device vanishing on ALSA and CoreAudio is
+            // callbacks silently stopping, not an error callback.
+            failure = Some((
+                AudioErrorKind::Transient,
+                "capture stream stopped delivering audio".to_string(),
+            ));
         }
 
         self.supervisor.capture_watch.callbacks = snapshot.callbacks;
         self.supervisor.capture_watch.captured_samples = snapshot.captured_samples;
-        self.supervisor.capture_watch.stream_errors = snapshot.stream_errors;
+        self.supervisor.capture_watch.fatal_stream_errors = snapshot.fatal_stream_errors;
         self.supervisor.capture_watch.worker_stopped = snapshot.worker_stopped;
+        self.supervisor.capture_watch.worker_finished = worker_finished;
 
-        if let Some(reason) = reason {
-            self.schedule_capture_recovery(now, reason);
+        if let Some((kind, message)) = failure {
+            self.note_capture_failure(now, kind, message);
         }
     }
 
     fn supervise_playback(&mut self, now: Instant) {
-        if let Some(reason) = self.supervisor.playback.take_due(now) {
-            self.recover_playback_stream(&reason);
+        let apply_owns_restart = self
+            .pending_audio_apply
+            .as_ref()
+            .is_some_and(|pending| pending.playback);
+        if !apply_owns_restart && let Some(cause) = self.supervisor.playback.take_due_rebuild(now) {
+            self.recover_playback_stream(now, cause);
         }
         let Some(playback) = &self.playback else {
             self.supervisor.playback_watch = PlaybackWatch::default();
+            let should_run = self.voice_tx_enabled.load(Ordering::Relaxed)
+                && !self.deafened.load(Ordering::Relaxed);
+            if !should_run {
+                self.supervisor.playback.reset();
+            }
             return;
         };
         let snapshot = playback.stats();
-        let mut reason =
-            playback_backend_recovery_reason(&snapshot, &self.supervisor.playback_watch);
-        if playback.worker_finished() {
-            reason = Some("playback decoder worker exited".to_string());
+        let mut failure = playback_backend_failure(&snapshot, &self.supervisor.playback_watch);
+        let worker_finished = playback.worker_finished();
+        if worker_finished && !self.supervisor.playback_watch.worker_finished {
+            failure = Some((
+                AudioErrorKind::Transient,
+                "playback decoder worker exited".to_string(),
+            ));
         }
-        self.supervisor.playback_watch.backend_stream_errors = snapshot.backend_stream_errors;
-        self.supervisor.playback_watch.backend_xruns = snapshot.backend_xruns;
+        self.supervisor.playback_watch.backend_fatal_stream_errors =
+            snapshot.backend_fatal_stream_errors;
+        self.supervisor.playback_watch.worker_finished = worker_finished;
 
-        if let Some(reason) = reason {
-            self.schedule_playback_recovery(now, reason);
+        if let Some((kind, message)) = failure {
+            self.note_playback_failure(now, kind, message);
         }
+    }
+
+    fn note_capture_failure(&mut self, now: Instant, kind: AudioErrorKind, message: String) {
+        kvlog::warn!("capture stream failure", reason = message.as_str());
+        self.audio_events.push(
+            now,
+            AudioDeviceEventKind::StreamError,
+            format!("mic: {message}"),
+        );
+        self.supervisor.capture.on_error(now, kind, message);
+        self.set_transient_status("microphone error; reconnecting");
+    }
+
+    fn note_playback_failure(&mut self, now: Instant, kind: AudioErrorKind, message: String) {
+        kvlog::warn!("playback stream failure", reason = message.as_str());
+        self.audio_events.push(
+            now,
+            AudioDeviceEventKind::StreamError,
+            format!("spk: {message}"),
+        );
+        self.supervisor.playback.on_error(now, kind, message);
+        self.set_transient_status("playback error; reconnecting");
     }
 
     fn capture_should_be_live(&self) -> bool {
@@ -2608,44 +2957,6 @@ impl App {
             RecoverySchedule::Exhausted => {
                 self.control_socket.take();
                 self.set_error(format!("file-upload socket down: {reason}"));
-            }
-        }
-    }
-
-    fn schedule_capture_recovery(&mut self, now: Instant, reason: impl Into<String>) {
-        let reason = reason.into();
-        match self.supervisor.capture.schedule(now, reason.clone()) {
-            RecoverySchedule::Scheduled(delay) => {
-                if !delay.is_zero() {
-                    self.set_status(format!(
-                        "microphone recovery retrying in {}s",
-                        delay.as_secs()
-                    ));
-                }
-            }
-            RecoverySchedule::Pending => {}
-            RecoverySchedule::Exhausted => {
-                self.mic_error = Some(reason.clone());
-                self.set_error(format!("mic unavailable: {reason}"));
-            }
-        }
-    }
-
-    fn schedule_playback_recovery(&mut self, now: Instant, reason: impl Into<String>) {
-        let reason = reason.into();
-        match self.supervisor.playback.schedule(now, reason.clone()) {
-            RecoverySchedule::Scheduled(delay) => {
-                if !delay.is_zero() {
-                    self.set_status(format!(
-                        "playback recovery retrying in {}s",
-                        delay.as_secs()
-                    ));
-                }
-            }
-            RecoverySchedule::Pending => {}
-            RecoverySchedule::Exhausted => {
-                self.playback_error = Some(reason.clone());
-                self.set_error(format!("playback unavailable: {reason}"));
             }
         }
     }
@@ -2703,35 +3014,62 @@ impl App {
         }
     }
 
-    fn recover_capture_stream(&mut self, reason: &str) {
-        kvlog::warn!("recovering capture stream", reason);
+    fn recover_capture_stream(&mut self, now: Instant, cause: RebuildCause) {
+        kvlog::warn!("recovering capture stream", cause = cause.label());
+        self.audio_events.push(
+            now,
+            AudioDeviceEventKind::RebuildStarted,
+            format!("mic rebuild ({})", cause.label()),
+        );
         match self.restart_capture_stream_inner() {
             Ok(restarted) => {
-                self.supervisor.capture.reset();
+                self.supervisor.capture.on_rebuild_ok(now);
                 self.supervisor.capture_watch = CaptureWatch::default();
+                self.mic_error = None;
                 if restarted {
+                    self.audio_events.push(
+                        now,
+                        AudioDeviceEventKind::Recovered,
+                        "microphone recovered",
+                    );
                     self.set_status("microphone recovered");
                 }
             }
             Err(error) => {
-                self.mic_error = Some(error.clone());
-                self.set_error(format!("mic unavailable: {error}"));
-                self.schedule_capture_recovery(Instant::now(), error);
+                self.mic_error = Some(error.message.clone());
+                self.audio_events.push(
+                    now,
+                    AudioDeviceEventKind::StreamError,
+                    format!("mic rebuild failed: {}", error.message),
+                );
+                self.supervisor
+                    .capture
+                    .on_rebuild_failed(now, error.kind, error.message);
             }
         }
-        if self.voice_tx_enabled.load(Ordering::Relaxed) && !self.supervisor.playback.is_pending() {
+        // Restart the paired stream so the echo canceller's render reference is
+        // rebuilt alongside capture, and an AirPods profile flip that changed
+        // both directions converges in one pass.
+        if self.voice_tx_enabled.load(Ordering::Relaxed) && self.supervisor.playback.is_healthy() {
             self.restart_playback_stream();
         }
     }
 
-    fn recover_playback_stream(&mut self, reason: &str) {
-        kvlog::warn!("recovering playback stream", reason);
+    fn recover_playback_stream(&mut self, now: Instant, cause: RebuildCause) {
+        kvlog::warn!("recovering playback stream", cause = cause.label());
+        self.audio_events.push(
+            now,
+            AudioDeviceEventKind::RebuildStarted,
+            format!("spk rebuild ({})", cause.label()),
+        );
         self.restart_playback_stream();
         if self.playback.is_some() {
             self.supervisor.playback_watch = PlaybackWatch::default();
+            self.audio_events
+                .push(now, AudioDeviceEventKind::Recovered, "playback recovered");
             self.set_status("playback recovered");
         }
-        if self.capture_should_be_live() && !self.supervisor.capture.is_pending() {
+        if self.capture_should_be_live() && self.supervisor.capture.is_healthy() {
             self.restart_capture_stream();
         }
     }
@@ -2740,11 +3078,13 @@ impl App {
         self.supervisor.capture.reset();
         if let Err(error) = self.restart_capture_stream_inner() {
             self.set_error(format!("failed to restart capture: {error}"));
-            self.schedule_capture_recovery(Instant::now(), error);
+            self.supervisor
+                .capture
+                .on_rebuild_failed(Instant::now(), error.kind, error.message);
         }
     }
 
-    fn restart_capture_stream_inner(&mut self) -> Result<bool, String> {
+    fn restart_capture_stream_inner(&mut self) -> Result<bool, AudioStartError> {
         let was_preview = self.settings_preview_capture;
         let in_call = self.voice_tx_enabled.load(Ordering::Relaxed);
         self.stop_mic_capture();
@@ -2763,17 +3103,9 @@ impl App {
         if self.network.is_none() {
             return;
         }
-        self.supervisor.playback.reset();
         self.set_network_playback_sink(None);
         self.playback.take();
         self.start_playback_stream(true);
-        if self.playback.is_none() {
-            let error = self
-                .playback_error
-                .clone()
-                .unwrap_or_else(|| "playback restart failed".to_string());
-            self.schedule_playback_recovery(Instant::now(), error);
-        }
     }
 
     /// Flushes the shared editor into the focused text field by replaying one
@@ -3119,6 +3451,7 @@ impl App {
             "/muted" => self.show_mute_status(),
             "/deafened" => self.show_deafen_status(),
             "/audio" => self.show_audio_status(),
+            "/audio-reset" => self.audio_manual_reset(),
             "/stats" => self.toggle_lobby_details(),
             "/clear" => self.room.clear_chat(),
             "/help" => self.show_command_help(),
@@ -3315,20 +3648,48 @@ impl App {
         });
     }
 
+    /// Formatted `health` and `events` sections for `/audio`. Built even while
+    /// streams are down: that is exactly when diagnostics matter.
+    fn audio_diagnostics_sections(&self) -> (Vec<String>, Vec<String>) {
+        let now = Instant::now();
+        let health_lines = vec![
+            format!("mic: {}", self.supervisor.capture.health().describe(now)),
+            format!("spk: {}", self.supervisor.playback.health().describe(now)),
+        ];
+        let recent_events = self
+            .audio_events
+            .iter_recent()
+            .take(12)
+            .map(|event| {
+                format!(
+                    "{:>3}  {}: {}",
+                    audio_diagnostics::format_event_age(now.saturating_duration_since(event.at)),
+                    event.kind.label(),
+                    event.detail
+                )
+            })
+            .collect();
+        (health_lines, recent_events)
+    }
+
     fn show_audio_status(&mut self) {
-        let Some(playback) = &self.playback else {
-            self.set_status("audio inactive");
-            return;
-        };
+        let (health_lines, recent_events) = self.audio_diagnostics_sections();
         let diagnostics = AudioDiagnostics::new(
-            playback.stats(),
+            self.playback
+                .as_ref()
+                .map(|playback| playback.stats())
+                .unwrap_or_default(),
             self.encoder_profile,
             self.voice_packets_received,
             self.voice_bytes_received,
             self.capture
                 .as_ref()
                 .map(|capture| capture.device_info().clone()),
-            Some(playback.device_info().clone()),
+            self.playback
+                .as_ref()
+                .map(|playback| playback.device_info().clone()),
+            health_lines,
+            recent_events,
         );
         self.room.push_notice("audio", diagnostics.notice_body());
         self.set_status(diagnostics.status_summary());
@@ -3369,20 +3730,25 @@ impl App {
     /// Builds the JSON metadata sidecar saved alongside the compressed logs:
     /// app version, the `/audio` snapshot, and the device/buffer configuration.
     fn bug_report_metadata(&self, description: &str) -> String {
-        let audio = match &self.playback {
-            Some(playback) => AudioDiagnostics::new(
-                playback.stats(),
-                self.encoder_profile,
-                self.voice_packets_received,
-                self.voice_bytes_received,
-                self.capture
-                    .as_ref()
-                    .map(|capture| capture.device_info().clone()),
-                Some(playback.device_info().clone()),
-            )
-            .notice_body(),
-            None => "audio inactive".to_string(),
-        };
+        let (health_lines, recent_events) = self.audio_diagnostics_sections();
+        let audio = AudioDiagnostics::new(
+            self.playback
+                .as_ref()
+                .map(|playback| playback.stats())
+                .unwrap_or_default(),
+            self.encoder_profile,
+            self.voice_packets_received,
+            self.voice_bytes_received,
+            self.capture
+                .as_ref()
+                .map(|capture| capture.device_info().clone()),
+            self.playback
+                .as_ref()
+                .map(|playback| playback.device_info().clone()),
+            health_lines,
+            recent_events,
+        )
+        .notice_body();
         let unix_time_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|elapsed| elapsed.as_millis() as u64)
@@ -3629,7 +3995,7 @@ impl App {
         }
     }
 
-    fn ensure_mic_capture(&mut self) -> Result<(), String> {
+    fn ensure_mic_capture(&mut self) -> Result<(), AudioStartError> {
         if self.capture.is_some() {
             return Ok(());
         }
@@ -3646,7 +4012,7 @@ impl App {
                             .clone()
                             .unwrap_or_else(|| "selected input device is unsupported".to_string());
                         self.mic_error = Some(error.clone());
-                        return Err(error);
+                        return Err(AudioStartError::new(AudioErrorKind::ConfigInvalid, error));
                     }
                 }
             }
@@ -3657,23 +4023,37 @@ impl App {
             self.live_capture_config(configured_input.clone()),
             self.capture_packet_handler(),
         ) {
-            Ok(capture) => Ok(capture),
+            Ok(capture) => {
+                self.supervisor.capture.set_wants_configured_device(false);
+                Ok(capture)
+            }
             Err(error) if configured_input.is_some() => {
                 kvlog::warn!(
                     "configured input failed, trying default",
-                    error = error.as_str()
+                    error = error.message.as_str()
                 );
                 self.push_network_notice(
                     "audio",
                     &format!("Input device failed; trying system default: {error}"),
                 );
-                audio::start_live_capture(
+                match audio::start_live_capture(
                     self.live_capture_config(None),
                     self.capture_packet_handler(),
-                )
-                .map_err(|fallback_error| {
-                    format!("{error}; default input fallback failed: {fallback_error}")
-                })
+                ) {
+                    Ok(capture) => {
+                        self.supervisor.capture.set_wants_configured_device(true);
+                        self.audio_events.push(
+                            Instant::now(),
+                            AudioDeviceEventKind::FallbackToDefault,
+                            format!("mic: {error}"),
+                        );
+                        Ok(capture)
+                    }
+                    Err(fallback_error) => Err(AudioStartError::new(
+                        fallback_error.kind,
+                        format!("{error}; default input fallback failed: {fallback_error}"),
+                    )),
+                }
             }
             Err(error) => Err(error),
         };
@@ -3681,12 +4061,12 @@ impl App {
             Ok(capture) => {
                 self.capture = Some(capture);
                 self.mic_error = None;
-                self.supervisor.capture.reset();
+                self.supervisor.capture.on_rebuild_ok(Instant::now());
                 self.supervisor.capture_watch = CaptureWatch::default();
                 Ok(())
             }
             Err(error) => {
-                self.mic_error = Some(error.clone());
+                self.mic_error = Some(error.message.clone());
                 Err(error)
             }
         }
@@ -3700,11 +4080,11 @@ impl App {
 
     fn start_settings_preview_capture(&mut self) {
         if let Err(error) = self.start_settings_preview_capture_inner() {
-            self.mic_error = Some(error);
+            self.mic_error = Some(error.message);
         }
     }
 
-    fn start_settings_preview_capture_inner(&mut self) -> Result<(), String> {
+    fn start_settings_preview_capture_inner(&mut self) -> Result<(), AudioStartError> {
         if !self.allow_settings_preview_capture
             || self.capture.is_some()
             || self.voice_tx_enabled.load(Ordering::Relaxed)
@@ -3798,20 +4178,35 @@ impl App {
         let playback = match audio::start_live_playback(
             self.live_playback_config(resolved_output.clone(), Some(feedback_tx.clone())),
         ) {
-            Ok(playback) => Ok(playback),
+            Ok(playback) => {
+                self.supervisor.playback.set_wants_configured_device(false);
+                Ok(playback)
+            }
             Err(error) if resolved_output.is_some() => {
                 kvlog::warn!(
                     "configured output failed, trying default",
-                    error = error.as_str()
+                    error = error.message.as_str()
                 );
                 self.push_network_notice(
                     "audio",
                     &format!("Output device failed; trying system default: {error}"),
                 );
-                audio::start_live_playback(self.live_playback_config(None, Some(feedback_tx)))
-                    .map_err(|fallback_error| {
-                        format!("{error}; default output fallback failed: {fallback_error}")
-                    })
+                match audio::start_live_playback(self.live_playback_config(None, Some(feedback_tx)))
+                {
+                    Ok(playback) => {
+                        self.supervisor.playback.set_wants_configured_device(true);
+                        self.audio_events.push(
+                            Instant::now(),
+                            AudioDeviceEventKind::FallbackToDefault,
+                            format!("spk: {error}"),
+                        );
+                        Ok(playback)
+                    }
+                    Err(fallback_error) => Err(AudioStartError::new(
+                        fallback_error.kind,
+                        format!("{error}; default output fallback failed: {fallback_error}"),
+                    )),
+                }
             }
             Err(error) => Err(error),
         };
@@ -3821,7 +4216,7 @@ impl App {
                 let sink = playback.sink();
                 self.playback = Some(playback);
                 self.playback_error = None;
-                self.supervisor.playback.reset();
+                self.supervisor.playback.on_rebuild_ok(Instant::now());
                 self.supervisor.playback_watch = PlaybackWatch::default();
                 self.set_network_playback_sink(sink);
                 self.apply_all_user_audio_controls();
@@ -3846,8 +4241,17 @@ impl App {
             Err(error) => {
                 self.set_network_playback_sink(None);
                 self.playback = None;
-                self.playback_error = Some(error.clone());
+                self.playback_error = Some(error.message.clone());
                 self.set_error(format!("voice playback unavailable: {error}"));
+                let now = Instant::now();
+                self.audio_events.push(
+                    now,
+                    AudioDeviceEventKind::StreamError,
+                    format!("spk start failed: {}", error.message),
+                );
+                self.supervisor
+                    .playback
+                    .on_rebuild_failed(now, error.kind, error.message);
             }
         }
     }
@@ -4889,6 +5293,40 @@ mod tests {
             },
         );
         assert!(app.deafened.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn lobby_bar_shows_recovery_state_and_reset_button_resets_on_click() {
+        let mut app = test_app();
+        let mut room = RoomMode::default();
+
+        let mut buffer = Buffer::new(80, 24);
+        render_room(&mut app, &mut room, &mut buffer);
+        assert!(app.chrome.lobby_bar.audio_reset.is_empty());
+
+        app.supervisor.capture.on_rebuild_failed(
+            Instant::now(),
+            AudioErrorKind::DeviceGone,
+            "device unplugged".to_string(),
+        );
+        render_room(&mut app, &mut room, &mut buffer);
+        let reset_rect = app.chrome.lobby_bar.audio_reset;
+        assert!(!reset_rect.is_empty());
+        assert!(!app.chrome.lobby_bar.audio_widget.is_empty());
+
+        room.process_mouse(
+            &mut app,
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: reset_rect.x,
+                row: reset_rect.y,
+                modifiers: KeyModifiers::empty(),
+            },
+        );
+        assert!(app.supervisor.capture.is_healthy());
+
+        render_room(&mut app, &mut room, &mut buffer);
+        assert!(app.chrome.lobby_bar.audio_reset.is_empty());
     }
 
     fn app_with_servers(entries: &[(&str, &str)]) -> App {

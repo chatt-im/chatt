@@ -12,9 +12,11 @@ mod sim;
 
 pub use capture::EchoCancellationControl;
 pub use device::{
-    DeviceInfo, StreamPreview, configured_output_is_default, input_devices,
-    looks_like_alsa_pcm_name, output_devices, stable_input_device_id, stable_output_device_id,
+    DeviceIdentity, DeviceIdentityProbe, DeviceInfo, StreamPreview, configured_output_is_default,
+    input_devices, looks_like_alsa_pcm_name, output_devices, probe_device_identities,
+    stable_input_device_id, stable_output_device_id,
 };
+pub use errors::{AudioErrorKind, AudioStartError};
 pub use lifecycle::{
     AudioDeviceInfo, LiveCapture, LiveCaptureConfig, LivePlayback, LivePlaybackConfig,
     LivePlaybackSink, Playback, Recording, RecordingConfig, start_live_capture,
