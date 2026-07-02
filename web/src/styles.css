@@ -260,26 +260,6 @@ body {
   margin-top: 4px;
 }
 
-.media-image-open {
-  display: block;
-  width: fit-content;
-  max-width: 100%;
-  max-height: 50vh;
-  margin: 0;
-  padding: 0;
-  overflow: hidden;
-  color: inherit;
-  background: none;
-  border: 0;
-  line-height: 0;
-  cursor: zoom-in;
-}
-
-.media-image-open:focus-visible {
-  outline: 1px solid var(--text-sender);
-  outline-offset: 2px;
-}
-
 /* The width/height attributes carry the intrinsic aspect ratio, so the box is
  * reserved at its final size before the bytes decode: zero layout shift. auto
  * on both axes lets the caps scale it while the ratio holds. */
@@ -290,7 +270,7 @@ body {
   max-width: 100%;
   max-height: 50vh;
   background: var(--bg);
-  pointer-events: none;
+  cursor: pointer;
   /* opacity: 0;
   transition: opacity 0.05s ease; */
 }
