@@ -74,6 +74,9 @@ const RELAY_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(5);
 /// Cadence of media `Ping` probes used to estimate round-trip latency to the
 /// server relay and to each direct peer.
 const RTT_PROBE_INTERVAL: Duration = Duration::from_secs(5);
+/// A server RTT without a successful probe for this long no longer describes
+/// the current relay path and is reported as unavailable.
+const RTT_STALE_AFTER: Duration = Duration::from_secs(15);
 /// Smoothing weight applied to each new RTT sample folded into the EWMA.
 const RTT_EWMA_WEIGHT: f32 = 0.2;
 /// Cap on outstanding RTT probes tracked per destination before the oldest is
@@ -263,12 +266,13 @@ pub enum NetworkEvent {
     PlaybackFeedback(LivePlaybackFeedback),
     /// Smoothed round-trip time to the server relay media socket, milliseconds.
     ServerRtt {
-        rtt_ms: u16,
+        rtt_ms: Option<u16>,
     },
-    /// Smoothed round-trip time to a direct peer over its p2p path, milliseconds.
+    /// Smoothed round-trip time to a peer over its current transport (direct
+    /// p2p path, or end-to-end through the server relay), milliseconds.
     PeerRtt {
         user_id: UserId,
-        rtt_ms: u16,
+        rtt_ms: Option<u16>,
     },
     VoiceStatus {
         user_id: UserId,
@@ -730,11 +734,13 @@ fn run_worker_inner(
         p2p_peers: HashMap::new(),
         p2p_stream_owners: HashMap::new(),
         online_others: HashSet::new(),
+        room_server_rtts: HashMap::new(),
         next_relay_keepalive: Instant::now() + RELAY_KEEPALIVE_INTERVAL,
         next_rtt_probe: Instant::now() + RTT_PROBE_INTERVAL,
         rtt_probe_seq: 0,
         server_rtt_in_flight: VecDeque::new(),
         server_rtt_ms: None,
+        server_rtt_last_sample_at: None,
         playback_sink: None,
         pending_playback_packets: VecDeque::new(),
         voice_dedup: VoicePacketDeduplicator::new(),
@@ -1248,11 +1254,13 @@ struct WorkerState {
     p2p_peers: HashMap<SessionId, PeerConnection>,
     p2p_stream_owners: HashMap<StreamId, SessionId>,
     online_others: HashSet<UserId>,
+    room_server_rtts: HashMap<UserId, u16>,
     next_relay_keepalive: Instant,
     next_rtt_probe: Instant,
     rtt_probe_seq: u64,
     server_rtt_in_flight: VecDeque<(u64, Instant)>,
     server_rtt_ms: Option<f32>,
+    server_rtt_last_sample_at: Option<Instant>,
     playback_sink: Option<LivePlaybackSink>,
     pending_playback_packets: VecDeque<RemoteVoicePacket>,
     voice_dedup: VoicePacketDeduplicator,
@@ -1946,9 +1954,11 @@ impl WorkerState {
                     {
                         let rtt = fold_rtt_ewma(self.server_rtt_ms, sample);
                         self.server_rtt_ms = Some(rtt);
+                        self.server_rtt_last_sample_at = Some(now);
                         let _ = self.events.send(NetworkEvent::ServerRtt {
-                            rtt_ms: clamp_rtt_ms(rtt),
+                            rtt_ms: Some(clamp_rtt_ms(rtt)),
                         });
+                        self.publish_all_relay_rtts();
                     }
                 }
                 Ok((
@@ -1961,7 +1971,7 @@ impl WorkerState {
                     let feedback = live_feedback_from_media(stream_id, feedback);
                     self.handle_encoder_feedback(feedback, now);
                 }
-                Ok((_, MediaPayload::Ping { nonce })) => {
+                Ok((_, MediaPayload::Ping { nonce, .. })) => {
                     self.send_media(&MediaPayload::Pong { nonce });
                 }
                 Ok((_, MediaPayload::Bind { .. })) => {}
@@ -2799,6 +2809,7 @@ impl WorkerState {
                     .map(|participant| participant.user_id)
                     .filter(|user_id| Some(*user_id) != self.user_id)
                     .collect();
+                self.room_server_rtts.clear();
                 let _ = self.events.send(NetworkEvent::RoomJoined {
                     room_id,
                     history,
@@ -2833,6 +2844,9 @@ impl WorkerState {
                         self.online_others.insert(participant.user_id);
                     } else {
                         self.online_others.remove(&participant.user_id);
+                    }
+                    if !online {
+                        self.room_server_rtts.remove(&participant.user_id);
                     }
                 }
                 let _ = self.events.send(NetworkEvent::Status(format!(
@@ -2904,6 +2918,17 @@ impl WorkerState {
                     .events
                     .send(NetworkEvent::VoiceStatus { user_id, status });
             }
+            ServerControl::RoomRttSnapshot { room_id, members } => {
+                if self.room_id == Some(room_id) {
+                    self.room_server_rtts = members
+                        .into_iter()
+                        .filter_map(|member| {
+                            member.server_rtt_ms.map(|rtt_ms| (member.user_id, rtt_ms))
+                        })
+                        .collect();
+                    self.publish_all_relay_rtts();
+                }
+            }
             ServerControl::UdpBound => {
                 kvlog::info!("client udp bound");
                 let _ = self
@@ -2963,6 +2988,7 @@ impl WorkerState {
                     user_id,
                     direct: false,
                 });
+                self.publish_relay_rtt(user_id);
                 kvlog::info!(
                     "p2p peer removed",
                     session_id = session_id.0,
@@ -3166,6 +3192,7 @@ impl WorkerState {
                             format!("failed to register rebound UDP socket: {error}")
                         })?;
                     kvlog::info!("udp socket rebound", addr = %self.udp_local_addr);
+                    self.reset_server_rtt();
                     self.bind_udp();
                     return Ok(());
                 }
@@ -3509,16 +3536,48 @@ impl WorkerState {
         }
     }
 
+    fn publish_relay_rtt(&self, user_id: UserId) {
+        if self
+            .p2p_peers
+            .values()
+            .any(|peer| peer.user_id == user_id && peer.agent.selected().is_some())
+        {
+            return;
+        }
+        let rtt_ms = combined_relay_rtt(
+            self.server_rtt_ms,
+            self.room_server_rtts.get(&user_id).copied(),
+        );
+        let _ = self.events.send(NetworkEvent::PeerRtt { user_id, rtt_ms });
+    }
+
+    fn publish_all_relay_rtts(&self) {
+        for user_id in &self.online_others {
+            self.publish_relay_rtt(*user_id);
+        }
+    }
+
+    fn reset_server_rtt(&mut self) {
+        self.server_rtt_ms = None;
+        self.server_rtt_last_sample_at = None;
+        self.server_rtt_in_flight.clear();
+        let _ = self.events.send(NetworkEvent::ServerRtt { rtt_ms: None });
+        self.publish_all_relay_rtts();
+    }
+
     /// Allocates the next monotonically increasing RTT probe nonce.
     fn next_rtt_nonce(&mut self) -> u64 {
         self.rtt_probe_seq = self.rtt_probe_seq.wrapping_add(1);
         self.rtt_probe_seq
     }
 
-    /// Sends a media `Ping` to the server relay and to every direct peer so the
-    /// latency estimate can track each path's round-trip time. Replies are timed
-    /// in the `Pong` handlers, which fold them into per-destination EWMAs.
+    /// Sends a media `Ping` to the server relay and to every peer with a selected
+    /// direct path. The server ping reports the previous relay RTT estimate so
+    /// the server can include it in batched room snapshots.
     fn poll_rtt_probe(&mut self, now: Instant) {
+        if rtt_sample_is_stale(self.server_rtt_last_sample_at, now) {
+            self.reset_server_rtt();
+        }
         if now < self.next_rtt_probe {
             return;
         }
@@ -3526,7 +3585,10 @@ impl WorkerState {
         if self.session_id.is_some() {
             let nonce = self.next_rtt_nonce();
             push_rtt_in_flight(&mut self.server_rtt_in_flight, nonce, now);
-            self.send_media(&MediaPayload::Ping { nonce });
+            self.send_media(&MediaPayload::Ping {
+                nonce,
+                observed_rtt_ms: self.server_rtt_ms.map(clamp_rtt_ms),
+            });
         }
         let peer_sessions: Vec<SessionId> = self
             .p2p_peers
@@ -3550,7 +3612,14 @@ impl WorkerState {
             push_rtt_in_flight(&mut peer.rtt_in_flight, nonce, now);
             Some((
                 addr,
-                media::seal_media(&peer.send_key, counter, &MediaPayload::Ping { nonce }),
+                media::seal_media(
+                    &peer.send_key,
+                    counter,
+                    &MediaPayload::Ping {
+                        nonce,
+                        observed_rtt_ms: None,
+                    },
+                ),
             ))
         }) else {
             return;
@@ -3689,7 +3758,7 @@ impl WorkerState {
                         action,
                     })
                 }
-                Ok((_, MediaPayload::Ping { nonce })) => {
+                Ok((_, MediaPayload::Ping { nonce, .. })) => {
                     let action = peer.agent.observe_authenticated_packet(now, src);
                     peer.last_direct_inbound = Some(now);
                     Ok(P2pMediaPacket::Ping { nonce, action })
@@ -3780,7 +3849,10 @@ impl WorkerState {
                     rtt_ms,
                     self.p2p_peers.get(&session_id).map(|peer| peer.user_id),
                 ) {
-                    let _ = self.events.send(NetworkEvent::PeerRtt { user_id, rtt_ms });
+                    let _ = self.events.send(NetworkEvent::PeerRtt {
+                        user_id,
+                        rtt_ms: Some(rtt_ms),
+                    });
                 }
             }
             Err(error) => {
@@ -3931,6 +4003,7 @@ impl WorkerState {
                             user_id,
                             direct: false,
                         });
+                        self.publish_relay_rtt(user_id);
                     }
                     kvlog::info!(
                         "p2p using relay",
@@ -3973,6 +4046,7 @@ impl WorkerState {
                             user_id: peer.user_id,
                             direct: false,
                         });
+                        self.publish_relay_rtt(peer.user_id);
                     }
                     let _ = self.events.send(NetworkEvent::Status(
                         "p2p direct path timed out; using relay".to_string(),
@@ -3987,10 +4061,12 @@ impl WorkerState {
                     kvlog::warn!("p2p consent to send expired", session_id = session_id.0);
                     if let Some(peer) = self.p2p_peers.get_mut(&session_id) {
                         peer.direct_stable_since = None;
+                        let user_id = peer.user_id;
                         let _ = self.events.send(NetworkEvent::PeerTransport {
-                            user_id: peer.user_id,
+                            user_id,
                             direct: false,
                         });
+                        self.publish_relay_rtt(user_id);
                     }
                     let _ = self.events.send(NetworkEvent::Status(
                         "p2p consent expired; using relay".to_string(),
@@ -4100,6 +4176,14 @@ fn clamp_rtt_ms(rtt_ms: f32) -> u16 {
     rtt_ms.round().clamp(0.0, u16::MAX as f32) as u16
 }
 
+fn combined_relay_rtt(local_rtt_ms: Option<f32>, remote_rtt_ms: Option<u16>) -> Option<u16> {
+    Some(clamp_rtt_ms(local_rtt_ms?).saturating_add(remote_rtt_ms?))
+}
+
+fn rtt_sample_is_stale(sample_at: Option<Instant>, now: Instant) -> bool {
+    sample_at.is_some_and(|sample_at| now.saturating_duration_since(sample_at) >= RTT_STALE_AFTER)
+}
+
 fn media_feedback_from_live(feedback: LivePlaybackFeedback) -> media::VoiceFeedback {
     media::VoiceFeedback {
         highest_contiguous_sequence: feedback.highest_contiguous_sequence,
@@ -4172,6 +4256,7 @@ fn server_control_kind(control: &ServerControl) -> &'static str {
         ServerControl::VoiceStarted { .. } => "voice_started",
         ServerControl::VoiceStopped { .. } => "voice_stopped",
         ServerControl::VoiceStatus { .. } => "voice_status",
+        ServerControl::RoomRttSnapshot { .. } => "room_rtt_snapshot",
         ServerControl::UdpBound => "udp_bound",
         ServerControl::UdpReflexive { .. } => "udp_reflexive",
         ServerControl::P2pNatProbe { .. } => "p2p_nat_probe",
@@ -4817,6 +4902,31 @@ mod tests {
             &others,
             [(user(2), Some(stable))].into_iter(),
         ));
+    }
+
+    #[test]
+    fn combined_relay_rtt_requires_both_links_and_saturates() {
+        assert_eq!(combined_relay_rtt(Some(35.4), Some(40)), Some(75));
+        assert_eq!(combined_relay_rtt(None, Some(40)), None);
+        assert_eq!(combined_relay_rtt(Some(35.0), None), None);
+        assert_eq!(
+            combined_relay_rtt(Some(u16::MAX as f32), Some(1)),
+            Some(u16::MAX)
+        );
+    }
+
+    #[test]
+    fn server_rtt_expires_after_three_probe_intervals() {
+        let sample_at = Instant::now();
+        assert!(!rtt_sample_is_stale(
+            Some(sample_at),
+            sample_at + RTT_STALE_AFTER - Duration::from_millis(1)
+        ));
+        assert!(rtt_sample_is_stale(
+            Some(sample_at),
+            sample_at + RTT_STALE_AFTER
+        ));
+        assert!(!rtt_sample_is_stale(None, sample_at + RTT_STALE_AFTER));
     }
 
     #[test]

@@ -6,4 +6,4 @@ pub mod ids;
 pub mod media;
 pub mod video;
 
-pub const PROTOCOL_VERSION: u16 = 12;
+pub const PROTOCOL_VERSION: u16 = 14;

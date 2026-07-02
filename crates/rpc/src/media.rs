@@ -65,6 +65,9 @@ pub enum MediaPayload {
     },
     Ping {
         nonce: u64,
+        /// The sender's previous RTT estimate for its server link. Populated
+        /// only on client-to-server probes; direct peer probes leave it `None`.
+        observed_rtt_ms: Option<u16>,
     },
     Pong {
         nonce: u64,
@@ -355,7 +358,20 @@ pub fn encode_payload_into(payload: &MediaPayload, out: &mut Vec<u8>) -> Result<
             out.extend_from_slice(&stream_id.0.to_le_bytes());
             encode_voice_feedback(*feedback, out);
         }
-        MediaPayload::Ping { nonce } | MediaPayload::Pong { nonce } => {
+        MediaPayload::Ping {
+            nonce,
+            observed_rtt_ms,
+        } => {
+            out.extend_from_slice(&nonce.to_le_bytes());
+            match observed_rtt_ms {
+                Some(rtt_ms) => {
+                    out.push(1);
+                    out.extend_from_slice(&rtt_ms.to_le_bytes());
+                }
+                None => out.push(0),
+            }
+        }
+        MediaPayload::Pong { nonce } => {
             out.extend_from_slice(&nonce.to_le_bytes());
         }
     }
@@ -442,16 +458,27 @@ pub fn decode_payload(kind: u8, bytes: &[u8]) -> Result<MediaPayload, MediaError
                 feedback: decode_voice_feedback(&bytes[12..])?,
             })
         }
-        KIND_PING | KIND_PONG => {
+        KIND_PING => {
+            if bytes.len() != 9 && bytes.len() != 11 {
+                return Err(MediaError::InvalidPayload);
+            }
+            let nonce = u64::from_le_bytes(bytes[0..8].try_into().unwrap());
+            let observed_rtt_ms = match (bytes[8], bytes.len()) {
+                (0, 9) => None,
+                (1, 11) => Some(u16::from_le_bytes(bytes[9..11].try_into().unwrap())),
+                _ => return Err(MediaError::InvalidPayload),
+            };
+            Ok(MediaPayload::Ping {
+                nonce,
+                observed_rtt_ms,
+            })
+        }
+        KIND_PONG => {
             if bytes.len() != 8 {
                 return Err(MediaError::InvalidPayload);
             }
             let nonce = u64::from_le_bytes(bytes.try_into().unwrap());
-            if kind == KIND_PING {
-                Ok(MediaPayload::Ping { nonce })
-            } else {
-                Ok(MediaPayload::Pong { nonce })
-            }
+            Ok(MediaPayload::Pong { nonce })
         }
         _ => Err(MediaError::UnknownKind(kind)),
     }
@@ -643,12 +670,35 @@ mod tests {
     }
 
     #[test]
+    fn ping_payload_round_trips_with_observed_rtt() {
+        let payload = MediaPayload::Ping {
+            nonce: 456,
+            observed_rtt_ms: Some(37),
+        };
+        let encoded = encode_payload(&payload).unwrap();
+        assert_eq!(decode_payload(KIND_PING, &encoded).unwrap(), payload);
+    }
+
+    #[test]
+    fn ping_payload_round_trips_without_observed_rtt() {
+        let payload = MediaPayload::Ping {
+            nonce: 456,
+            observed_rtt_ms: None,
+        };
+        let encoded = encode_payload(&payload).unwrap();
+        assert_eq!(decode_payload(KIND_PING, &encoded).unwrap(), payload);
+    }
+
+    #[test]
     fn encrypted_media_round_trips_and_rejects_replay() {
         let key = KeyMaterial {
             id: 77,
             bytes: [8; crypto::KEY_LEN],
         };
-        let payload = MediaPayload::Ping { nonce: 123 };
+        let payload = MediaPayload::Ping {
+            nonce: 123,
+            observed_rtt_ms: Some(25),
+        };
         let packet = seal_media(&key, 0, &payload).unwrap();
         let mut replay = AntiReplay::new();
         assert_eq!(open_media(&key, &mut replay, &packet).unwrap().1, payload);
@@ -660,7 +710,10 @@ mod tests {
 
     #[test]
     fn plaintext_media_round_trips_and_rejects_replay() {
-        let payload = MediaPayload::Ping { nonce: 123 };
+        let payload = MediaPayload::Ping {
+            nonce: 123,
+            observed_rtt_ms: None,
+        };
         let packet = seal_plaintext_media(0, &payload).unwrap();
         let (header, decoded) = open_plaintext_media(&packet).unwrap();
         assert_eq!(header.key_id, PLAINTEXT_KEY_ID);

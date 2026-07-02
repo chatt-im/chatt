@@ -27,9 +27,9 @@ pub(crate) struct ParticipantState {
     pub(crate) presence_since: Option<Instant>,
     pub(crate) active_stream: Option<StreamId>,
     pub(crate) voice_feedback: Option<ParticipantVoiceFeedback>,
-    /// Smoothed round-trip time to this peer over its direct p2p path,
-    /// milliseconds. Only meaningful while `p2p_direct` is set; used as the
-    /// network leg of the latency estimate for directly connected participants.
+    /// Smoothed round-trip time to this peer over its current audio transport
+    /// (direct p2p, or end-to-end through the server relay), milliseconds. The
+    /// network leg of the latency estimate.
     pub(crate) peer_rtt_ms: Option<u16>,
     /// Running EWMA of the realized NetEQ playout delay (ms), updated only on
     /// active feedback windows. Backs the stabilized `ParticipantVoiceFeedback::
@@ -240,22 +240,22 @@ impl Participants {
 
     pub(crate) fn set_peer_transport(&mut self, user_id: UserId, direct: bool) {
         let entry = self.ensure_user(user_id);
-        entry.p2p_direct = direct;
-        if !direct {
-            // The direct path is gone, so any prior peer RTT no longer describes
-            // how this participant's audio reaches us.
+        if entry.p2p_direct != direct {
+            // The prior RTT was measured over the previous transport and no
+            // longer describes how this participant's audio reaches us.
             entry.peer_rtt_ms = None;
         }
+        entry.p2p_direct = direct;
         self.sort();
     }
 
-    pub(crate) fn set_peer_rtt(&mut self, user_id: UserId, rtt_ms: u16) {
+    pub(crate) fn set_peer_rtt(&mut self, user_id: UserId, rtt_ms: Option<u16>) {
         if let Some(entry) = self
             .entries
             .iter_mut()
             .find(|entry| entry.user_id == user_id)
         {
-            entry.peer_rtt_ms = Some(rtt_ms);
+            entry.peer_rtt_ms = rtt_ms;
         }
     }
 
@@ -492,6 +492,38 @@ mod tests {
                 .jitter_buffer_ms,
             90
         );
+    }
+
+    #[test]
+    fn transport_change_clears_peer_rtt_in_both_directions() {
+        let mut participants = Participants::default();
+        participants.replace_room(vec![participant(UserId(1))]);
+
+        participants.set_peer_rtt(UserId(1), Some(40));
+        participants.set_peer_transport(UserId(1), true);
+        assert_eq!(participants.entries[0].peer_rtt_ms, None);
+
+        participants.set_peer_rtt(UserId(1), Some(12));
+        participants.set_peer_transport(UserId(1), true);
+        assert_eq!(
+            participants.entries[0].peer_rtt_ms,
+            Some(12),
+            "restating the same transport must keep the measurement"
+        );
+
+        participants.set_peer_transport(UserId(1), false);
+        assert_eq!(participants.entries[0].peer_rtt_ms, None);
+    }
+
+    #[test]
+    fn unknown_peer_rtt_clears_previous_measurement() {
+        let mut participants = Participants::default();
+        participants.replace_room(vec![participant(UserId(1))]);
+
+        participants.set_peer_rtt(UserId(1), Some(40));
+        participants.set_peer_rtt(UserId(1), None);
+
+        assert_eq!(participants.entries[0].peer_rtt_ms, None);
     }
 
     #[test]

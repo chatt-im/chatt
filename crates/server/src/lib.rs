@@ -59,6 +59,8 @@ const MAX_CLIENTS: usize = 1024;
 /// swallow a full file chunk frame in one `read` on a fast link.
 const TCP_READ_BUFFER_BYTES: usize = 256 * 1024;
 const MEDIA_SWEEP_INTERVAL: Duration = Duration::from_secs(30);
+const RTT_SNAPSHOT_INTERVAL: Duration = Duration::from_secs(5);
+const RTT_STALE_AFTER: Duration = Duration::from_secs(15);
 const INVITE_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 const OPEN_PAIR_RATE_WINDOW: Duration = Duration::from_secs(60);
 const OPEN_PAIR_PER_IP_LIMIT: usize = 6;
@@ -208,6 +210,7 @@ pub struct Server {
     rng: ring::rand::SystemRandom,
     server_key_pair: ring::signature::Ed25519KeyPair,
     next_media_sweep_at: Option<Instant>,
+    next_rtt_snapshot_at: Instant,
     /// Persistent scratch the per-client TCP read loop reads into, allocated
     /// once and reused so relaying bulk transfers does not allocate or zero a
     /// fresh buffer per read.
@@ -315,6 +318,7 @@ impl Server {
             rng: ring::rand::SystemRandom::new(),
             server_key_pair,
             next_media_sweep_at: None,
+            next_rtt_snapshot_at: Instant::now() + RTT_SNAPSHOT_INTERVAL,
             read_scratch: vec![0u8; TCP_READ_BUFFER_BYTES],
         })
     }
@@ -349,7 +353,9 @@ impl Server {
             }
             self.handle_admin_commands(admin_rx);
             self.flush_disconnects();
-            self.sweep_stale_media_keys(Instant::now());
+            let now = Instant::now();
+            self.sweep_stale_media_keys(now);
+            self.poll_room_rtt_snapshots(now);
         }
     }
 
@@ -1747,6 +1753,8 @@ impl Server {
                 media_recv_replay: AntiReplay::new(),
                 active_stream: None,
                 voice_status: control::ParticipantVoiceStatus::default(),
+                reported_server_rtt_ms: None,
+                server_rtt_reported_at: None,
                 p2p: None,
                 receive_files,
                 file_receive_limit_bytes,
@@ -2764,14 +2772,14 @@ impl Server {
         packet: &[u8],
     ) -> Result<(), String> {
         let (header, _) = media::parse_header(packet).map_err(|error| error.to_string())?;
-        let (session_id, payload) = if header.key_id == media::PLAINTEXT_KEY_ID {
+        let (session_id, payload, udp_addr_changed) = if header.key_id == media::PLAINTEXT_KEY_ID {
             self.open_plaintext_udp_packet(src, packet)?
         } else {
             let session_id = *self
                 .media_key_to_session
                 .get(&header.key_id)
                 .ok_or_else(|| "unknown UDP key id".to_string())?;
-            let payload = {
+            let (payload, udp_addr_changed) = {
                 let session = self
                     .sessions
                     .get_mut(&session_id)
@@ -2783,10 +2791,10 @@ impl Server {
                 let (_, payload) =
                     media::open_media(&secrets.media_recv, &mut session.media_recv_replay, packet)
                         .map_err(|error| error.to_string())?;
-                session.udp_addr = Some(src);
-                payload
+                let old_addr = session.observe_udp_addr(src);
+                (payload, old_addr.is_some_and(|old| old != src))
             };
-            (session_id, payload)
+            (session_id, payload, udp_addr_changed)
         };
 
         match payload {
@@ -2851,7 +2859,18 @@ impl Server {
             } => self.relay_voice_feedback(session_id, stream_id, feedback),
             MediaPayload::PeerVoice { .. } => Ok(()),
             MediaPayload::PeerVoiceFeedback { .. } => Ok(()),
-            MediaPayload::Ping { nonce } => {
+            MediaPayload::Ping {
+                nonce,
+                observed_rtt_ms,
+            } => {
+                if let Some(session) = self.sessions.get_mut(&session_id) {
+                    let reported_rtt_ms = if udp_addr_changed {
+                        None
+                    } else {
+                        observed_rtt_ms
+                    };
+                    session.report_server_rtt(reported_rtt_ms, Instant::now());
+                }
                 self.send_udp_payload(session_id, &MediaPayload::Pong { nonce });
                 Ok(())
             }
@@ -2863,7 +2882,7 @@ impl Server {
         &mut self,
         src: SocketAddr,
         packet: &[u8],
-    ) -> Result<(SessionId, MediaPayload), String> {
+    ) -> Result<(SessionId, MediaPayload, bool), String> {
         let (header, payload) =
             media::open_plaintext_media(packet).map_err(|error| error.to_string())?;
         let session_id = match &payload {
@@ -2892,7 +2911,7 @@ impl Server {
             if !session.media_recv_replay.update(header.counter) {
                 return Err(media::MediaError::Replay.to_string());
             }
-            session.udp_addr.replace(src)
+            session.observe_udp_addr(src)
         };
         if let Some(old_addr) = old_addr
             && old_addr != src
@@ -2901,7 +2920,7 @@ impl Server {
             self.plaintext_addr_to_session.remove(&old_addr);
         }
         self.plaintext_addr_to_session.insert(src, session_id);
-        Ok((session_id, payload))
+        Ok((session_id, payload, old_addr.is_some_and(|old| old != src)))
     }
 
     fn relay_voice(
@@ -3279,6 +3298,46 @@ impl Server {
         }
     }
 
+    fn poll_room_rtt_snapshots(&mut self, now: Instant) {
+        if now < self.next_rtt_snapshot_at {
+            return;
+        }
+        self.next_rtt_snapshot_at = now + RTT_SNAPSHOT_INTERVAL;
+        let room_ids = self
+            .rooms
+            .values()
+            .filter(|room| !room.members.is_empty())
+            .map(|room| room.id)
+            .collect::<Vec<_>>();
+        for room_id in room_ids {
+            let members = self.room_rtt_snapshot(room_id, now);
+            self.broadcast_control(
+                room_id,
+                &ServerControl::RoomRttSnapshot { room_id, members },
+            );
+        }
+    }
+
+    fn room_rtt_snapshot(
+        &self,
+        room_id: RoomId,
+        now: Instant,
+    ) -> Vec<control::ParticipantServerRtt> {
+        let mut members = self
+            .rooms
+            .get(&room_id)
+            .into_iter()
+            .flat_map(|room| room.members.iter())
+            .filter_map(|session_id| self.sessions.get(session_id))
+            .map(|session| control::ParticipantServerRtt {
+                user_id: session.user_id,
+                server_rtt_ms: session.fresh_server_rtt(now),
+            })
+            .collect::<Vec<_>>();
+        members.sort_by_key(|member| member.user_id.0);
+        members
+    }
+
     fn session_for_token(&self, token: Token) -> Result<SessionId, String> {
         self.clients
             .get(&token)
@@ -3564,6 +3623,8 @@ struct Session {
     media_recv_replay: AntiReplay,
     active_stream: Option<StreamId>,
     voice_status: control::ParticipantVoiceStatus,
+    reported_server_rtt_ms: Option<u16>,
+    server_rtt_reported_at: Option<Instant>,
     p2p: Option<P2pSessionState>,
     receive_files: bool,
     file_receive_limit_bytes: u64,
@@ -3571,6 +3632,28 @@ struct Session {
     /// every room join so a late joiner can show how long each participant has
     /// been present. Seeded at session establishment to keep it populated.
     joined_at_ms: u64,
+}
+
+impl Session {
+    fn observe_udp_addr(&mut self, addr: SocketAddr) -> Option<SocketAddr> {
+        let old_addr = self.udp_addr.replace(addr);
+        if old_addr.is_some_and(|old| old != addr) {
+            self.reported_server_rtt_ms = None;
+            self.server_rtt_reported_at = None;
+        }
+        old_addr
+    }
+
+    fn report_server_rtt(&mut self, rtt_ms: Option<u16>, now: Instant) {
+        self.reported_server_rtt_ms = rtt_ms;
+        self.server_rtt_reported_at = Some(now);
+    }
+
+    fn fresh_server_rtt(&self, now: Instant) -> Option<u16> {
+        self.server_rtt_reported_at
+            .filter(|reported_at| now.saturating_duration_since(*reported_at) < RTT_STALE_AFTER)
+            .and(self.reported_server_rtt_ms)
+    }
 }
 
 struct ServerUpload {
@@ -3934,6 +4017,7 @@ fn server_control_kind(control: &ServerControl) -> &'static str {
         ServerControl::VoiceStarted { .. } => "voice_started",
         ServerControl::VoiceStopped { .. } => "voice_stopped",
         ServerControl::VoiceStatus { .. } => "voice_status",
+        ServerControl::RoomRttSnapshot { .. } => "room_rtt_snapshot",
         ServerControl::UdpBound => "udp_bound",
         ServerControl::UdpReflexive { .. } => "udp_reflexive",
         ServerControl::P2pNatProbe { .. } => "p2p_nat_probe",
@@ -4008,6 +4092,8 @@ mod tests {
             media_recv_replay: AntiReplay::new(),
             active_stream: None,
             voice_status: control::ParticipantVoiceStatus::default(),
+            reported_server_rtt_ms: None,
+            server_rtt_reported_at: None,
             p2p: None,
             receive_files: false,
             file_receive_limit_bytes: 0,
@@ -4035,6 +4121,55 @@ mod tests {
         config.network.udp_probe_addr = None;
         config.network.p2p_enabled = false;
         Server::bind(config).expect("test server")
+    }
+
+    #[test]
+    fn room_rtt_snapshot_is_sorted_and_expires_stale_reports() {
+        let mut server = test_server();
+        let now = Instant::now();
+        let room_id = RoomId(1);
+        let first_id = SessionId(1);
+        let second_id = SessionId(2);
+        server
+            .rooms
+            .insert(room_id, test_room(room_id, &[first_id, second_id]));
+        let mut first = test_session(UserId(9), Token(11), Some(room_id));
+        first.report_server_rtt(Some(45), now);
+        let mut second = test_session(UserId(5), Token(22), Some(room_id));
+        second.report_server_rtt(Some(30), now - RTT_STALE_AFTER);
+        server.sessions.insert(first_id, first);
+        server.sessions.insert(second_id, second);
+
+        assert_eq!(
+            server.room_rtt_snapshot(room_id, now),
+            vec![
+                control::ParticipantServerRtt {
+                    user_id: UserId(5),
+                    server_rtt_ms: None,
+                },
+                control::ParticipantServerRtt {
+                    user_id: UserId(9),
+                    server_rtt_ms: Some(45),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn udp_address_change_clears_reported_server_rtt() {
+        let mut session = test_session(UserId(9), Token(11), Some(RoomId(1)));
+        let now = Instant::now();
+        let first: SocketAddr = "127.0.0.1:1000".parse().unwrap();
+        let second: SocketAddr = "127.0.0.1:2000".parse().unwrap();
+        session.observe_udp_addr(first);
+        session.report_server_rtt(Some(40), now);
+
+        session.observe_udp_addr(first);
+        assert_eq!(session.fresh_server_rtt(now), Some(40));
+
+        session.observe_udp_addr(second);
+        assert_eq!(session.fresh_server_rtt(now), None);
+        assert_eq!(session.server_rtt_reported_at, None);
     }
 
     #[test]

@@ -205,6 +205,13 @@ pub enum ServerControl {
         user_id: UserId,
         status: ParticipantVoiceStatus,
     },
+    /// Periodic authoritative snapshot of each room member's measured
+    /// client-to-server RTT. Clients combine their local RTT with a remote
+    /// member's value to estimate the full relayed path.
+    RoomRttSnapshot {
+        room_id: RoomId,
+        members: Vec<ParticipantServerRtt>,
+    },
     UdpBound,
     UdpReflexive {
         addr: String,
@@ -297,6 +304,13 @@ pub struct ParticipantInfo {
     /// Server wall-clock (UNIX ms) the participant joined the room. Lets a late
     /// joiner render how long each participant has already been present.
     pub joined_at_ms: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Jsony)]
+#[jsony(Binary, version)]
+pub struct ParticipantServerRtt {
+    pub user_id: UserId,
+    pub server_rtt_ms: Option<u16>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Jsony)]
@@ -904,6 +918,25 @@ mod tests {
             room_id: RoomId(1),
             user_id: UserId(2),
             status,
+        };
+        let encoded = encode_server_control(&server);
+        assert_eq!(decode_server_control(&encoded).unwrap(), server);
+    }
+
+    #[test]
+    fn room_rtt_snapshot_round_trips() {
+        let server = ServerControl::RoomRttSnapshot {
+            room_id: RoomId(1),
+            members: vec![
+                ParticipantServerRtt {
+                    user_id: UserId(2),
+                    server_rtt_ms: Some(34),
+                },
+                ParticipantServerRtt {
+                    user_id: UserId(3),
+                    server_rtt_ms: None,
+                },
+            ],
         };
         let encoded = encode_server_control(&server);
         assert_eq!(decode_server_control(&encoded).unwrap(), server);
