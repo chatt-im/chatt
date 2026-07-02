@@ -193,6 +193,12 @@ where
     let mut applied_loss_percent = LiveEncoderProfile::DRED_20.packet_loss_percent;
 
     for chunk in receiver {
+        let dropped_samples = stats.take_dropped_capture_samples();
+        if dropped_samples > 0 {
+            let gap = dropped_samples * u64::from(crate::audio::shared::SAMPLE_RATE)
+                / u64::from(device_rate.max(1));
+            pipeline.note_capture_gap(gap as u32)?;
+        }
         let requested_loss_percent = encoder_loss_percent.load(Ordering::Relaxed).min(100) as i32;
         if requested_loss_percent != applied_loss_percent {
             pipeline.apply_encoder_profile(LiveEncoderProfile {
@@ -374,6 +380,25 @@ impl LiveEncoderPipeline {
 
     fn apply_encoder_profile(&mut self, profile: LiveEncoderProfile) -> Result<(), String> {
         self.encoder.apply_live_encoder_profile(profile)
+    }
+
+    /// Accounts `gap_samples` (48 kHz) of capture dropped under load. The media
+    /// clock advances across the hole so the receiver sees the true elapsed time
+    /// as a concealable timestamp gap instead of a hard splice, and the Opus
+    /// stream re-anchors because the encoder state on either side of the hole is
+    /// no longer continuous. Partial samples accumulated before the hole are
+    /// discarded onto the clock rather than spliced against post-gap audio.
+    pub(crate) fn note_capture_gap(&mut self, gap_samples: u32) -> Result<(), String> {
+        if gap_samples == 0 {
+            return Ok(());
+        }
+        let pending = self.accumulator.pending.len() as u32;
+        self.accumulator.pending.clear();
+        self.next_capture_sample = self
+            .next_capture_sample
+            .wrapping_add(gap_samples)
+            .wrapping_add(pending);
+        self.reset_opus_stream()
     }
 
     fn process_accumulated_frame<F>(
@@ -863,8 +888,8 @@ mod tests {
     use super::*;
     use crate::audio::EchoCancellationControl;
     use crate::audio::shared::{
-        DEFAULT_LIVE_MAX_AMPLIFICATION, LIVE_PLAYBACK_DRED_MAX_SAMPLES, frames_for_duration,
-        normalized_to_i16_scale,
+        DEFAULT_LIVE_MAX_AMPLIFICATION, LIVE_PLAYBACK_DRED_MAX_SAMPLES, SAMPLE_RATE,
+        frames_for_duration, normalized_to_i16_scale,
     };
     #[allow(unused_imports)]
     use crate::audio::test_support::*;
@@ -1297,6 +1322,127 @@ mod tests {
         let (packets, resume_slot_starts, preroll_frames) = drive_silence_gate_cycles(preroll, 3);
 
         assert_resume_timestamps(&packets, &resume_slot_starts, preroll_frames);
+    }
+
+    #[test]
+    fn capture_gap_advances_media_clock_and_resets_stream() {
+        let mut tuning = test_tuning();
+        tuning.capture_silence_gate = false;
+        let mut pipeline = build_live_encoder_pipeline(
+            tuning,
+            false,
+            DEFAULT_LIVE_MAX_AMPLIFICATION,
+            true,
+            EncoderNetworkProfile::EXCELLENT,
+            None,
+        )
+        .unwrap();
+        let stats = AudioStats::new();
+        let speech = high_energy_speech_chunk();
+        let mut packets = Vec::new();
+        for _ in 0..4 {
+            pipeline
+                .push_chunk(
+                    &speech,
+                    DEFAULT_LIVE_MAX_AMPLIFICATION,
+                    false,
+                    &stats,
+                    &mut |packet| packets.push(packet),
+                )
+                .unwrap();
+        }
+        let last_pre_gap = opus_packets(&packets)
+            .last()
+            .expect("speech before the gap should emit Opus packets")
+            .timestamp;
+        let pre_gap_count = packets.len();
+
+        // One second of capture was dropped under load.
+        pipeline.note_capture_gap(SAMPLE_RATE).unwrap();
+
+        for _ in 0..4 {
+            pipeline
+                .push_chunk(
+                    &speech,
+                    DEFAULT_LIVE_MAX_AMPLIFICATION,
+                    false,
+                    &stats,
+                    &mut |packet| packets.push(packet),
+                )
+                .unwrap();
+        }
+        let resumed = packets[pre_gap_count..]
+            .iter()
+            .find(|packet| matches!(packet.payload, VoicePayload::Opus(_)))
+            .expect("speech after the gap should emit Opus packets");
+        assert_ne!(
+            resumed.flags & LIVE_PACKET_FLAG_OPUS_RESET,
+            0,
+            "the stream must re-anchor rather than continue the encoder over the hole"
+        );
+        let jump = resumed.timestamp.wrapping_sub(last_pre_gap);
+        assert!(
+            jump >= SAMPLE_RATE,
+            "media clock spliced across the dropped capture: jump {jump}"
+        );
+    }
+
+    #[test]
+    fn live_worker_applies_dropped_capture_samples_to_the_media_clock() {
+        use std::sync::mpsc::sync_channel;
+
+        let mut tuning = test_tuning();
+        tuning.capture_silence_gate = false;
+        let stats = AudioStats::new();
+        // A whole second at a 24 kHz device rate was dropped before any chunk
+        // reached the worker; the media clock must advance by the 48 kHz
+        // equivalent before the first packet is stamped.
+        let device_rate = 24_000u32;
+        stats.record_dropped_chunk(u64::from(device_rate));
+
+        let (sender, receiver) = sync_channel::<Vec<f32>>(64);
+        let (recycle_sender, _recycle_receiver) = sync_channel::<Vec<f32>>(64);
+        let tone: Vec<f32> = (0..device_rate as usize / 100)
+            .map(|n| (n as f32 * 0.07).sin() * 8_000.0)
+            .collect();
+        for _ in 0..24 {
+            sender.send(tone.clone()).unwrap();
+        }
+        drop(sender);
+
+        let max_amplification_bits = AtomicU32::new(DEFAULT_LIVE_MAX_AMPLIFICATION.to_bits());
+        let encoder_loss_percent =
+            AtomicU32::new(LiveEncoderProfile::DRED_20.packet_loss_percent as u32);
+        let mic_muted = AtomicBool::new(false);
+        let deafened = AtomicBool::new(false);
+        let mut packets = Vec::new();
+        run_live_encoder_worker_inner(
+            receiver,
+            recycle_sender,
+            OpusVoiceEncoder::new(48_000).unwrap(),
+            DenoiseConfig::None,
+            &max_amplification_bits,
+            &encoder_loss_percent,
+            &mic_muted,
+            &deafened,
+            tuning,
+            DenoiseSuppression::IDENTITY,
+            DenoiseTypingSuppression::DISABLED,
+            None,
+            device_rate,
+            &stats,
+            &mut |packet| packets.push(packet),
+        )
+        .unwrap();
+
+        let first = opus_packets(&packets)
+            .first()
+            .expect("worker should emit Opus packets")
+            .timestamp;
+        assert!(
+            first >= SAMPLE_RATE,
+            "dropped device samples were not applied to the 48 kHz media clock: first timestamp {first}"
+        );
     }
 
     /// Runs an unmuted -> muted -> unmuted episode, returning the emitted packets
