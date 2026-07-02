@@ -19,6 +19,7 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
+use rpc::control::FileContentEncoding;
 use rpc::crypto::dev_server_seed_hex;
 use rpc::ids::{RoomId, UserId};
 
@@ -235,19 +236,90 @@ fn upload_50mb_loopback() {
     );
     let elapsed = start.elapsed();
 
-    let NetworkEvent::FileReceived { path, .. } = received else {
+    let NetworkEvent::FileReceived { metadata, path, .. } = received else {
         unreachable!("predicate guarantees FileReceived")
     };
 
     let got = std::fs::read(&path).expect("read received file");
     assert_eq!(got.len(), PAYLOAD_BYTES, "received size mismatch");
     assert_eq!(sha256(&got), expected_digest, "received content mismatch");
+    assert_eq!(metadata.size, PAYLOAD_BYTES as u64);
+    assert_eq!(metadata.encoding, FileContentEncoding::Zstd);
 
     let mib = PAYLOAD_BYTES as f64 / (1024.0 * 1024.0);
     let secs = elapsed.as_secs_f64();
+    let wire_bytes = crate::client_net::last_received_file_wire_bytes();
+    assert!(wire_bytes < PAYLOAD_BYTES as u64);
     println!(
-        "upload_50mb_loopback: {mib:.0} MiB relayed uploader -> server -> receiver in {secs:.3}s = {:.1} MiB/s",
-        mib / secs
+        "upload_50mb_loopback: {mib:.0} logical MiB relayed in {secs:.3}s = {:.1} logical MiB/s; wire {:.3} MiB ({:.2}% of original)",
+        mib / secs,
+        wire_bytes as f64 / (1024.0 * 1024.0),
+        wire_bytes as f64 * 100.0 / PAYLOAD_BYTES as f64
+    );
+
+    drop(got);
+    drop(payload);
+
+    let incompressible_source = dir.join("incompressible.bin");
+    let mut incompressible = vec![0u8; PAYLOAD_BYTES];
+    let mut state = 0x1234_5678_9abc_def0u64;
+    for byte in &mut incompressible {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        *byte = state as u8;
+    }
+    let expected_digest = sha256(&incompressible);
+    std::fs::write(&incompressible_source, &incompressible).expect("write incompressible payload");
+    let identity_start = Instant::now();
+    uploader
+        .handle
+        .send(NetworkCommand::UploadFile(UploadFileRequest::new(
+            incompressible_source,
+        )));
+    let received = wait_for(
+        "receiver identity",
+        &receiver.events,
+        Duration::from_secs(180),
+        |event| matches!(event, NetworkEvent::FileReceived { .. }),
+    );
+    let identity_elapsed = identity_start.elapsed();
+    let NetworkEvent::FileReceived { metadata, path, .. } = received else {
+        unreachable!("predicate guarantees FileReceived")
+    };
+    let got = std::fs::read(path).expect("read identity file");
+    assert_eq!(sha256(&got), expected_digest);
+    assert_eq!(metadata.encoding, FileContentEncoding::Identity);
+    let identity_wire_bytes = crate::client_net::last_received_file_wire_bytes();
+    assert_eq!(identity_wire_bytes, PAYLOAD_BYTES as u64);
+    println!(
+        "upload_50mb_loopback identity: {mib:.0} MiB in {:.3}s = {:.1} MiB/s; wire ratio 100.00%",
+        identity_elapsed.as_secs_f64(),
+        mib / identity_elapsed.as_secs_f64()
+    );
+
+    let excluded_source = dir.join("excluded.png");
+    let excluded = vec![b'p'; 1024 * 1024];
+    std::fs::write(&excluded_source, &excluded).expect("write excluded payload");
+    uploader
+        .handle
+        .send(NetworkCommand::UploadFile(UploadFileRequest::new(
+            excluded_source,
+        )));
+    let received = wait_for(
+        "receiver excluded",
+        &receiver.events,
+        Duration::from_secs(30),
+        |event| matches!(event, NetworkEvent::FileReceived { .. }),
+    );
+    let NetworkEvent::FileReceived { metadata, path, .. } = received else {
+        unreachable!("predicate guarantees FileReceived")
+    };
+    assert_eq!(std::fs::read(path).unwrap(), excluded);
+    assert_eq!(metadata.encoding, FileContentEncoding::Identity);
+    assert_eq!(
+        crate::client_net::last_received_file_wire_bytes(),
+        excluded.len() as u64
     );
 
     uploader.handle.stop();
