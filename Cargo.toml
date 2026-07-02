@@ -83,7 +83,7 @@ members = [
     "crates/nnnoiseless",
     "crates/darkhttp",
 ]
-exclude = ["crates/cpal", "crates/sonora"]
+exclude = ["crates/cpal", "crates/sonora", "crates/pathify_svg"]
 
 [profile.dev]
 debug = 0
