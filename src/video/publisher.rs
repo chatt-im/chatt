@@ -22,6 +22,7 @@ use rpc::{
     video::{self, VideoRole},
 };
 
+use crate::app::{AppEvent, EventSender};
 use crate::client_net::{CommandSender, NetworkCommand};
 use crate::web_server::WebFeedSender;
 
@@ -68,6 +69,7 @@ pub fn start(
     commands: CommandSender,
     tcp_addr: String,
     web_feed: Option<WebFeedSender>,
+    events: EventSender,
 ) -> Result<ScreencastHandle, String> {
     let stop = Arc::new(AtomicBool::new(false));
     let (frame_tx, frame_rx) = mpsc::channel();
@@ -85,6 +87,7 @@ pub fn start(
                 commands,
                 tcp_addr,
                 web_feed,
+                events,
                 manager_stop,
             )
         })
@@ -138,11 +141,16 @@ fn run_manager(
     commands: CommandSender,
     tcp_addr: String,
     web_feed: Option<WebFeedSender>,
+    events: EventSender,
     stop: Arc<AtomicBool>,
 ) {
     let mut buffered: Vec<CapturedFrame> = Vec::new();
     let mut start_share_sent = false;
     let mut conn: Option<PublisherConn> = None;
+    // Set when the loop breaks for a reason the user should see. `None` after the
+    // loop means either a clean stop or that the capture ended on its own, which
+    // the exit diagnostics then explain.
+    let mut error: Option<String> = None;
 
     loop {
         if stop.load(Ordering::SeqCst) {
@@ -155,8 +163,8 @@ fn run_manager(
                 Ok(mut publisher) => {
                     let mut failed = false;
                     for frame in buffered.drain(..) {
-                        if let Err(error) = publisher.send_frame(&frame, web_feed.as_ref()) {
-                            kvlog::warn!("video publish burst failed", error = error.as_str());
+                        if let Err(reason) = publisher.send_frame(&frame, web_feed.as_ref()) {
+                            error = Some(format!("screen publish failed: {reason}"));
                             failed = true;
                             break;
                         }
@@ -167,8 +175,8 @@ fn run_manager(
                     kvlog::info!("video publisher connected", stream_id = stream_id.0);
                     conn = Some(publisher);
                 }
-                Err(error) => {
-                    kvlog::warn!("video publisher connect failed", error = error.as_str());
+                Err(reason) => {
+                    error = Some(format!("screen share connect failed: {reason}"));
                     break;
                 }
             }
@@ -197,14 +205,15 @@ fn run_manager(
                         })
                         .is_err()
                     {
+                        error = Some("screen share control channel closed".to_string());
                         break;
                     }
                     start_share_sent = true;
                 }
                 match &mut conn {
                     Some(publisher) => {
-                        if let Err(error) = publisher.send_frame(&frame, web_feed.as_ref()) {
-                            kvlog::warn!("video publish failed", error = error.as_str());
+                        if let Err(reason) = publisher.send_frame(&frame, web_feed.as_ref()) {
+                            error = Some(format!("screen publish failed: {reason}"));
                             break;
                         }
                     }
@@ -212,11 +221,19 @@ fn run_manager(
                 }
             }
             Err(RecvTimeoutError::Timeout) => {}
+            // The capture reader thread dropped its sender, so the capture process
+            // closed its stdout. The exit diagnostics classify why.
             Err(RecvTimeoutError::Disconnected) => break,
         }
     }
-    capture.shutdown();
-    kvlog::info!("video publisher stopped");
+    let exit = capture.shutdown();
+    if stop.load(Ordering::SeqCst) {
+        kvlog::info!("video publisher stopped");
+        return;
+    }
+    let message = error.unwrap_or_else(|| exit.reason(start_share_sent));
+    kvlog::warn!("screen share failed", message = message.as_str());
+    let _ = events.send(AppEvent::ScreencastFailed(message));
 }
 
 /// Converts one captured Annex-B access unit to the wire frame body and frames

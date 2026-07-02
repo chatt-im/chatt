@@ -1,5 +1,7 @@
-//! Screen capture: spawns an ffmpeg subprocess, reads its H.264 Annex-B stdout,
-//! and splits it into access units the publisher streams.
+//! Screen capture: spawns a capture subprocess, reads its H.264 Annex-B stdout,
+//! and splits it into access units the publisher streams. The subprocess is
+//! ffmpeg by default, but `screencast start <COMMAND...>` runs any program that
+//! writes Annex-B to stdout.
 //!
 //! The default command captures the X11 desktop. `repeat-headers=1` makes x264
 //! emit SPS/PPS in band at every keyframe so a mid-stream viewer bootstraps, and
@@ -8,15 +10,19 @@
 //! client. Codec metadata is derived from the parameter sets by
 //! [`rpc::bitstream`] in the publisher.
 
+use std::collections::VecDeque;
 use std::io::{BufRead, BufReader, Read};
-use std::process::{Child, Command, Stdio};
-use std::sync::Arc;
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
+use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Instant;
 
 use rpc::bitstream::Codec;
+
+/// How many trailing stderr lines to retain so a capture failure can report why.
+const STDERR_TAIL_LINES: usize = 8;
 
 /// One captured access unit: a monotonic millisecond timestamp, whether it is a
 /// keyframe, and its Annex-B H.264 bytes.
@@ -26,24 +32,71 @@ pub struct CapturedFrame {
     pub data: Vec<u8>,
 }
 
-/// A running capture: the ffmpeg child, its stdout reader, and its stderr logger.
+/// A running capture: the child process, its stdout reader, its stderr logger,
+/// and the retained tail of stderr for failure diagnostics.
 pub struct Capture {
     child: Child,
     reader: Option<JoinHandle<()>>,
     log_reader: Option<JoinHandle<()>>,
+    stderr_tail: Arc<Mutex<VecDeque<String>>>,
+}
+
+/// Why a capture ended: the process exit status (absent if it was never reaped)
+/// and the retained tail of its stderr, which usually explains a failure.
+pub struct CaptureExit {
+    pub status: Option<ExitStatus>,
+    pub stderr_tail: String,
+}
+
+impl CaptureExit {
+    /// A one-line reason built from the exit status and stderr tail, for the UI.
+    /// `started` marks whether the share had already begun publishing, which
+    /// distinguishes a capture that never produced video from one that stopped.
+    pub fn reason(&self, started: bool) -> String {
+        let mut message = if started {
+            "screen capture stopped".to_string()
+        } else {
+            "screen capture exited before producing video".to_string()
+        };
+        if let Some(status) = self.status
+            && !status.success()
+            && let Some(code) = status.code()
+        {
+            message.push_str(&format!(" (exit {code})"));
+        }
+        if !self.stderr_tail.is_empty() {
+            message.push_str(": ");
+            message.push_str(&self.stderr_tail);
+        }
+        message
+    }
 }
 
 impl Capture {
-    /// Kills ffmpeg and joins the reader threads.
-    pub fn shutdown(&mut self) {
+    /// Kills the child, joins the reader threads, and returns its exit
+    /// diagnostics. Idempotent: a second call reaps nothing and returns the
+    /// retained stderr tail.
+    pub fn shutdown(&mut self) -> CaptureExit {
         let _ = self.child.kill();
-        let _ = self.child.wait();
+        let status = self.child.wait().ok();
         if let Some(reader) = self.reader.take() {
             let _ = reader.join();
         }
         if let Some(log_reader) = self.log_reader.take() {
             let _ = log_reader.join();
         }
+        CaptureExit {
+            status,
+            stderr_tail: self.recent_stderr(),
+        }
+    }
+
+    /// Joins the retained trailing stderr lines into one line for a status message.
+    fn recent_stderr(&self) -> String {
+        self.stderr_tail
+            .lock()
+            .map(|lines| lines.iter().cloned().collect::<Vec<_>>().join(" / "))
+            .unwrap_or_default()
     }
 }
 
@@ -155,25 +208,29 @@ pub fn spawn(
         .stderr
         .take()
         .ok_or_else(|| "capture command stderr was not piped".to_string())?;
+    let stderr_tail = Arc::new(Mutex::new(VecDeque::new()));
     let reader = thread::Builder::new()
         .name("chatt-capture".to_string())
         .spawn(move || read_loop(stdout, codec, &frame_tx, &stop))
         .map_err(|error| format!("failed to spawn capture reader: {error}"))?;
+    let log_tail = stderr_tail.clone();
     let log_reader = thread::Builder::new()
         .name("chatt-capture-log".to_string())
-        .spawn(move || log_loop(stderr))
+        .spawn(move || log_loop(stderr, &log_tail))
         .map_err(|error| format!("failed to spawn capture logger: {error}"))?;
     Ok(Capture {
         child,
         reader: Some(reader),
         log_reader: Some(log_reader),
+        stderr_tail,
     })
 }
 
-/// Forwards ffmpeg's stderr to the diagnostics log a line at a time, keeping it
-/// off the terminal. The thread exits when ffmpeg's stderr closes. Lines are
-/// decoded lossily since ffmpeg can emit non-UTF-8 bytes.
-fn log_loop(stderr: impl Read) {
+/// Forwards the capture's stderr to the diagnostics log a line at a time, keeping
+/// it off the terminal, and retains the trailing lines in `tail` so a failure can
+/// report why. The thread exits when stderr closes. Lines are decoded lossily
+/// since the capture can emit non-UTF-8 bytes.
+fn log_loop(stderr: impl Read, tail: &Mutex<VecDeque<String>>) {
     let mut reader = BufReader::new(stderr);
     let mut line = Vec::new();
     loop {
@@ -184,7 +241,13 @@ fn log_loop(stderr: impl Read) {
                 let text = String::from_utf8_lossy(&line);
                 let trimmed = text.trim_end();
                 if !trimmed.is_empty() {
-                    kvlog::warn!("ffmpeg capture", message = trimmed);
+                    kvlog::warn!("capture stderr", message = trimmed);
+                    if let Ok(mut lines) = tail.lock() {
+                        lines.push_back(trimmed.to_string());
+                        while lines.len() > STDERR_TAIL_LINES {
+                            lines.pop_front();
+                        }
+                    }
                 }
             }
             Err(_) => break,
@@ -430,6 +493,26 @@ mod tests {
         assert_eq!(frames.len(), 2);
         assert!(frames[0].is_key);
         assert!(!frames[1].is_key);
+    }
+
+    #[test]
+    fn exit_reason_reports_no_video_with_stderr_tail() {
+        let exit = CaptureExit {
+            status: None,
+            stderr_tail: "wl-screenrec: unknown option --low-power".to_string(),
+        };
+        let reason = exit.reason(false);
+        assert!(reason.starts_with("screen capture exited before producing video"));
+        assert!(reason.ends_with("wl-screenrec: unknown option --low-power"));
+    }
+
+    #[test]
+    fn exit_reason_distinguishes_a_started_share() {
+        let exit = CaptureExit {
+            status: None,
+            stderr_tail: String::new(),
+        };
+        assert_eq!(exit.reason(true), "screen capture stopped");
     }
 
     #[test]

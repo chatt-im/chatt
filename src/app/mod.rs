@@ -508,6 +508,9 @@ pub(crate) enum AppEvent {
     Web(crate::web_server::WebRequest),
     /// A bug report request from `chatt report-bug`, carrying the description.
     ReportBug(String),
+    /// The outbound screen share's capture or publisher thread ended abnormally,
+    /// carrying a one-line reason for the user.
+    ScreencastFailed(String),
 }
 
 impl From<NetworkEvent> for AppEvent {
@@ -865,6 +868,7 @@ impl App {
             AppEvent::Screencast(command) => self.handle_screencast_command(command),
             AppEvent::Web(request) => self.handle_web_request(request),
             AppEvent::ReportBug(description) => self.start_bug_report(description),
+            AppEvent::ScreencastFailed(reason) => self.handle_screencast_failed(reason),
         }
     }
 
@@ -911,12 +915,14 @@ impl App {
                     crate::video::capture::default_ffmpeg_argv()
                 };
                 let web_feed = self.web_feed.clone();
+                let events = self.events.sender();
                 match crate::video::start_screencast(
                     argv,
                     codec,
                     network.sender(),
                     tcp_addr,
                     web_feed,
+                    events,
                 ) {
                     Ok(handle) => {
                         self.screencast = Some(handle);
@@ -930,6 +936,17 @@ impl App {
                 self.set_status("screen share stopped");
             }
         }
+    }
+
+    /// Handles the publisher reporting that its capture or connection ended
+    /// abnormally. Tears the dead share down so a retry starts clean, and surfaces
+    /// the reason (the capture's stderr tail explains a bad command).
+    fn handle_screencast_failed(&mut self, reason: String) {
+        if self.screencast.is_none() {
+            return;
+        }
+        self.stop_own_share();
+        self.set_error(reason);
     }
 
     /// Stops this client's outbound share, notifying the server so viewers tear
