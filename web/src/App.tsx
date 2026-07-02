@@ -6,7 +6,10 @@ import { ScreenShareDecoder, parseFrame } from "./video-decode";
 import { renderMarkdown } from "./markdown";
 import { renderInline } from "./highlight";
 import { decodeFeed } from "./feed";
-import FileViewer from "./FileViewer";
+import PreviewPanel, {
+  previewKey,
+  type PreviewItem,
+} from "./PreviewPanel";
 
 // Pixel tolerance when deciding the view is "at the bottom". Scroll positions
 // are fractional, so an exact comparison would intermittently read as
@@ -29,6 +32,7 @@ const UPLOAD_CHUNK_BYTES = 256 * 1024;
 const IMAGE_PRELOAD_BATCH_LIMIT = 32;
 const IMAGE_PRELOAD_CACHE_LIMIT = 128;
 const RECENT_IMAGE_KEEP_MOUNTED = 12;
+const PREVIEW_HISTORY_LIMIT = 16;
 
 // Consecutive messages from one sender within this window collapse into a group:
 // only the first carries the sender/time header (Discord-style).
@@ -48,11 +52,11 @@ const MIN_SHARE_PANE_HEIGHT = 160;
 const MIN_CHAT_PANE_HEIGHT = 140;
 const DIVIDER_SIZE = 9;
 const PANE_KEY_STEP = 32;
-const DEFAULT_FILE_PANEL_WIDTH = 560;
-const MIN_FILE_PANEL_WIDTH = 320;
+const DEFAULT_PREVIEW_PANEL_WIDTH = 560;
+const MIN_PREVIEW_PANEL_WIDTH = 320;
 const MIN_CHAT_SPLIT_WIDTH = 320;
-const FILE_PANEL_DIVIDER_SIZE = 3;
-const FILE_PANEL_KEY_STEP = 32;
+const PREVIEW_PANEL_DIVIDER_SIZE = 3;
+const PREVIEW_PANEL_KEY_STEP = 32;
 
 // Builds the asset URL for an attachment served from the client's receive dir.
 function fileUrl(name: string): string {
@@ -101,6 +105,48 @@ function formatBytes(bytes: number): string {
   if (bytes >= MIB) return `${(bytes / MIB).toFixed(1)} MiB`;
   if (bytes >= KIB) return `${(bytes / KIB).toFixed(1)} KiB`;
   return `${bytes} B`;
+}
+
+function imageExtension(type: string): string {
+  const subtype = type.split("/")[1]?.split(";")[0]?.toLowerCase() ?? "";
+  switch (subtype) {
+    case "jpeg":
+    case "pjpeg":
+      return "jpg";
+    case "svg+xml":
+      return "svg";
+    case "png":
+    case "gif":
+    case "webp":
+    case "bmp":
+    case "avif":
+    case "heic":
+    case "heif":
+      return subtype;
+    default:
+      return subtype.replace(/[^a-z0-9]+/g, "") || "png";
+  }
+}
+
+function timestampForFileName(date: Date): string {
+  return date.toISOString().replace(/\.\d{3}Z$/, "Z").replace(/[:.]/g, "-");
+}
+
+function withPastedImageName(file: File, pastedAt: Date, index: number): File {
+  const name = file.name.trim();
+  if (name && !/^image\.(?:png|jpe?g|gif|webp|bmp|svg|avif|heic|heif)$/i.test(name)) {
+    return file;
+  }
+
+  const suffix = index === 0 ? "" : `-${index + 1}`;
+  return new File(
+    [file],
+    `pasted-image-${timestampForFileName(pastedAt)}${suffix}.${imageExtension(file.type)}`,
+    {
+      type: file.type,
+      lastModified: file.lastModified,
+    },
+  );
 }
 
 // Progress bar shown on a file's placeholder message while the host client
@@ -167,7 +213,10 @@ function MessageBody(props: { fragments: Fragment[] }) {
   );
 }
 
-function Attachment(props: { message: WebMessage; onOpenFile: (name: string) => void }) {
+function Attachment(props: {
+  message: WebMessage;
+  onOpenPreview: (item: PreviewItem, opener: HTMLElement) => void;
+}) {
   const att = () => props.message.attachment!;
   const url = () => fileUrl(att().name);
   // Fades the image in on decode instead of snapping. The box is already
@@ -179,25 +228,42 @@ function Attachment(props: { message: WebMessage; onOpenFile: (name: string) => 
   return (
     <div class="message-media">
       <Show when={att().kind === "image"}>
-        <img
-          class="media-image"
-          classList={{ "is-loaded": loaded() }}
-          src={url()}
-          alt={att().name}
-          width={att().width ?? undefined}
-          height={att().height ?? undefined}
-          loading="eager"
-          decoding="async"
-          fetchpriority="high"
-          onLoad={() => {
-            debugImageTiming("img:load", att().name, url());
-            setLoaded(true);
-          }}
-          onError={() => {
-            debugImageTiming("img:error", att().name, url());
-            setLoaded(true);
-          }}
-        />
+        <button
+          class="media-image-open"
+          type="button"
+          aria-label={`Open image preview: ${att().name}`}
+          onClick={(event) =>
+            props.onOpenPreview(
+              {
+                kind: "image",
+                name: att().name,
+                width: att().width,
+                height: att().height,
+              },
+              event.currentTarget,
+            )
+          }
+        >
+          <img
+            class="media-image"
+            classList={{ "is-loaded": loaded() }}
+            src={url()}
+            alt={att().name}
+            width={att().width ?? undefined}
+            height={att().height ?? undefined}
+            loading="eager"
+            decoding="async"
+            fetchpriority="high"
+            onLoad={() => {
+              debugImageTiming("img:load", att().name, url());
+              setLoaded(true);
+            }}
+            onError={() => {
+              debugImageTiming("img:error", att().name, url());
+              setLoaded(true);
+            }}
+          />
+        </button>
       </Show>
       <Show when={att().kind === "video"}>
         <video class="media-video" src={url()} controls preload="metadata" />
@@ -212,7 +278,12 @@ function Attachment(props: { message: WebMessage; onOpenFile: (name: string) => 
           <button
             class="media-file-open"
             type="button"
-            onClick={() => props.onOpenFile(att().name)}
+            onClick={(event) =>
+              props.onOpenPreview(
+                { kind: "file", name: att().name },
+                event.currentTarget,
+              )
+            }
           >
             {att().name}
           </button>
@@ -228,7 +299,7 @@ function Attachment(props: { message: WebMessage; onOpenFile: (name: string) => 
 function MessageRow(props: {
   message: WebMessage;
   prev?: WebMessage;
-  onOpenFile: (name: string) => void;
+  onOpenPreview: (item: PreviewItem, opener: HTMLElement) => void;
 }) {
   // A continuation hides the header and shows its time only on hover, in the
   // reserved left gutter. `prev` is supplied reactively from the message list,
@@ -254,7 +325,10 @@ function MessageRow(props: {
       </Show>
       <MessageBody fragments={props.message.fragments} />
       <Show when={props.message.attachment}>
-        <Attachment message={props.message} onOpenFile={props.onOpenFile} />
+        <Attachment
+          message={props.message}
+          onOpenPreview={props.onOpenPreview}
+        />
       </Show>
       <Show when={!props.message.attachment && props.message.progress}>
         <TransferProgressBar progress={props.message.progress!} />
@@ -278,10 +352,39 @@ export default function App() {
   const [shareErrors, setShareErrors] = createSignal<Record<number, string>>({});
   const [sharePaneHeight, setSharePaneHeight] = createSignal(DEFAULT_SHARE_PANE_HEIGHT);
   const [fullscreenStream, setFullscreenStream] = createSignal<number | null>(null);
-  // The file currently expanded into the viewer panel, or null when none is.
-  const [openFile, setOpenFile] = createSignal<string | null>(null);
-  const [filePanelWidth, setFilePanelWidth] = createSignal(DEFAULT_FILE_PANEL_WIDTH);
-  const [filePanelResizing, setFilePanelResizing] = createSignal(false);
+  // Direct opens promote an item to the front of this bounded history. Closing
+  // the panel clears only the active key, so history survives until reload.
+  const [previewHistory, setPreviewHistory] = createSignal<PreviewItem[]>([]);
+  const [activePreviewKey, setActivePreviewKey] = createSignal<string | null>(null);
+  const [previewPanelWidth, setPreviewPanelWidth] = createSignal(
+    DEFAULT_PREVIEW_PANEL_WIDTH,
+  );
+  const [previewPanelResizing, setPreviewPanelResizing] = createSignal(false);
+  let previewOpener: HTMLElement | undefined;
+
+  const activePreview = () => {
+    const key = activePreviewKey();
+    return key
+      ? previewHistory().find((item) => previewKey(item) === key) ?? null
+      : null;
+  };
+
+  function openPreview(item: PreviewItem, opener: HTMLElement) {
+    const key = previewKey(item);
+    previewOpener = opener;
+    setPreviewHistory((current) => [
+      item,
+      ...current.filter((candidate) => previewKey(candidate) !== key),
+    ].slice(0, PREVIEW_HISTORY_LIMIT));
+    setActivePreviewKey(key);
+  }
+
+  function closePreview() {
+    setActivePreviewKey(null);
+    queueMicrotask(() => {
+      if (previewOpener?.isConnected) previewOpener.focus({ preventScroll: true });
+    });
+  }
 
   // The compose box is hidden until the client reports a writable feed in its
   // `config` envelope, so a read-only view never shows controls it cannot use.
@@ -329,7 +432,7 @@ export default function App() {
   let resizeObserver: ResizeObserver | undefined;
   let chatViewportResizeObserver: ResizeObserver | undefined;
   let splitResizeObserver: ResizeObserver | undefined;
-  let fileSplitResizeObserver: ResizeObserver | undefined;
+  let previewSplitResizeObserver: ResizeObserver | undefined;
   let viewportPinFrame = 0;
   let socket: WebSocket | undefined;
   let reconnectTimer: number | undefined;
@@ -341,7 +444,7 @@ export default function App() {
         up: (event: PointerEvent) => void;
       }
     | undefined;
-  let filePanelResize:
+  let previewPanelResize:
     | {
         move: (event: PointerEvent) => void;
         up: (event: PointerEvent) => void;
@@ -408,7 +511,7 @@ export default function App() {
     // Changing the split width can resize every mounted chat row. Let the
     // virtualizer process those measurements without repeatedly restarting
     // scrollToIndex's measurement loop; the drag end performs one final pin.
-    if (filePanelResize || !handle || !following) return;
+    if (previewPanelResize || !handle || !following) return;
     const last = messages().length - 1;
     if (last < 0) return;
     suppress = true;
@@ -607,6 +710,33 @@ export default function App() {
     if (files.length > 0) setQueued((prev) => [...prev, ...files]);
   }
 
+  function pastedImageFiles(data: DataTransfer | null): File[] {
+    if (!data) return [];
+
+    const files: File[] = [];
+    for (const item of Array.from(data.items)) {
+      if (item.kind !== "file" || !item.type.startsWith("image/")) continue;
+      const file = item.getAsFile();
+      if (file) files.push(file);
+    }
+
+    if (files.length === 0) {
+      for (const file of Array.from(data.files)) {
+        if (file.type.startsWith("image/")) files.push(file);
+      }
+    }
+
+    const pastedAt = new Date();
+    return files.map((file, index) => withPastedImageName(file, pastedAt, index));
+  }
+
+  function onComposePaste(event: ClipboardEvent) {
+    const files = pastedImageFiles(event.clipboardData);
+    if (files.length === 0) return;
+    event.preventDefault();
+    setQueued((prev) => [...prev, ...files]);
+  }
+
   function removeQueued(index: number) {
     setQueued((prev) => prev.filter((_, i) => i !== index));
   }
@@ -631,22 +761,22 @@ export default function App() {
     pin();
   }
 
-  function clampFilePanelWidth(width: number): number {
+  function clampPreviewPanelWidth(width: number): number {
     const total = appBodyEl?.clientWidth ?? 0;
-    if (total <= 0) return Math.max(MIN_FILE_PANEL_WIDTH, width);
-    const minFile = Math.min(
-      MIN_FILE_PANEL_WIDTH,
-      Math.max(240, total - MIN_CHAT_SPLIT_WIDTH - FILE_PANEL_DIVIDER_SIZE),
+    if (total <= 0) return Math.max(MIN_PREVIEW_PANEL_WIDTH, width);
+    const minPreview = Math.min(
+      MIN_PREVIEW_PANEL_WIDTH,
+      Math.max(240, total - MIN_CHAT_SPLIT_WIDTH - PREVIEW_PANEL_DIVIDER_SIZE),
     );
-    const maxFile = Math.max(
-      minFile,
-      total - MIN_CHAT_SPLIT_WIDTH - FILE_PANEL_DIVIDER_SIZE,
+    const maxPreview = Math.max(
+      minPreview,
+      total - MIN_CHAT_SPLIT_WIDTH - PREVIEW_PANEL_DIVIDER_SIZE,
     );
-    return clamp(width, minFile, maxFile);
+    return clamp(width, minPreview, maxPreview);
   }
 
-  function setClampedFilePanelWidth(width: number) {
-    setFilePanelWidth(clampFilePanelWidth(width));
+  function setClampedPreviewPanelWidth(width: number) {
+    setPreviewPanelWidth(clampPreviewPanelWidth(width));
     pin();
   }
 
@@ -658,14 +788,14 @@ export default function App() {
     paneResize = undefined;
   }
 
-  function removeFilePanelResizeListeners() {
-    if (!filePanelResize) return;
-    window.removeEventListener("pointermove", filePanelResize.move);
-    window.removeEventListener("pointerup", filePanelResize.up);
-    window.removeEventListener("pointercancel", filePanelResize.up);
-    filePanelResize.cancelFrame();
-    filePanelResize = undefined;
-    setFilePanelResizing(false);
+  function removePreviewPanelResizeListeners() {
+    if (!previewPanelResize) return;
+    window.removeEventListener("pointermove", previewPanelResize.move);
+    window.removeEventListener("pointerup", previewPanelResize.up);
+    window.removeEventListener("pointercancel", previewPanelResize.up);
+    previewPanelResize.cancelFrame();
+    previewPanelResize = undefined;
+    setPreviewPanelResizing(false);
   }
 
   function beginPaneResize(event: PointerEvent) {
@@ -688,26 +818,29 @@ export default function App() {
     window.addEventListener("pointercancel", up);
   }
 
-  function beginFilePanelResize(event: PointerEvent) {
+  function beginPreviewPanelResize(event: PointerEvent) {
     event.preventDefault();
-    removeFilePanelResizeListeners();
+    removePreviewPanelResizeListeners();
     const startX = event.clientX;
-    const startWidth = filePanelWidth();
+    const startWidth = previewPanelWidth();
     // The app body's width does not change as its children are resized. Read
     // it once so pointer moves never force layout merely to recompute bounds.
     const total = appBodyEl?.clientWidth ?? 0;
     const minWidth =
       total > 0
         ? Math.min(
-            MIN_FILE_PANEL_WIDTH,
-            Math.max(240, total - MIN_CHAT_SPLIT_WIDTH - FILE_PANEL_DIVIDER_SIZE),
+            MIN_PREVIEW_PANEL_WIDTH,
+            Math.max(
+              240,
+              total - MIN_CHAT_SPLIT_WIDTH - PREVIEW_PANEL_DIVIDER_SIZE,
+            ),
           )
-        : MIN_FILE_PANEL_WIDTH;
+        : MIN_PREVIEW_PANEL_WIDTH;
     const maxWidth =
       total > 0
         ? Math.max(
             minWidth,
-            total - MIN_CHAT_SPLIT_WIDTH - FILE_PANEL_DIVIDER_SIZE,
+            total - MIN_CHAT_SPLIT_WIDTH - PREVIEW_PANEL_DIVIDER_SIZE,
           )
         : Number.POSITIVE_INFINITY;
     let nextWidth = startWidth;
@@ -718,7 +851,7 @@ export default function App() {
     const flush = () => {
       if (frame) cancelAnimationFrame(frame);
       frame = 0;
-      setFilePanelWidth(nextWidth);
+      setPreviewPanelWidth(nextWidth);
     };
     const move = (moveEvent: PointerEvent) => {
       moveEvent.preventDefault();
@@ -728,7 +861,7 @@ export default function App() {
       if (!frame) {
         frame = requestAnimationFrame(() => {
           frame = 0;
-          setFilePanelWidth(nextWidth);
+          setPreviewPanelWidth(nextWidth);
         });
       }
     };
@@ -736,10 +869,10 @@ export default function App() {
       upEvent.preventDefault();
       if (upEvent.type === "pointerup") updateWidth(upEvent.clientX);
       flush();
-      removeFilePanelResizeListeners();
+      removePreviewPanelResizeListeners();
       pin();
     };
-    filePanelResize = {
+    previewPanelResize = {
       move,
       up,
       cancelFrame: () => {
@@ -747,7 +880,7 @@ export default function App() {
         frame = 0;
       },
     };
-    setFilePanelResizing(true);
+    setPreviewPanelResizing(true);
     window.addEventListener("pointermove", move);
     window.addEventListener("pointerup", up);
     window.addEventListener("pointercancel", up);
@@ -764,13 +897,17 @@ export default function App() {
     }
   }
 
-  function onFileDividerKeyDown(event: KeyboardEvent) {
+  function onPreviewDividerKeyDown(event: KeyboardEvent) {
     if (event.key === "ArrowLeft") {
       event.preventDefault();
-      setClampedFilePanelWidth(filePanelWidth() + FILE_PANEL_KEY_STEP);
+      setClampedPreviewPanelWidth(
+        previewPanelWidth() + PREVIEW_PANEL_KEY_STEP,
+      );
     } else if (event.key === "ArrowRight") {
       event.preventDefault();
-      setClampedFilePanelWidth(filePanelWidth() - FILE_PANEL_KEY_STEP);
+      setClampedPreviewPanelWidth(
+        previewPanelWidth() - PREVIEW_PANEL_KEY_STEP,
+      );
     }
   }
 
@@ -988,14 +1125,14 @@ export default function App() {
     }
     if (appBodyEl) {
       let observedWidth = -1;
-      fileSplitResizeObserver = new ResizeObserver((entries) => {
+      previewSplitResizeObserver = new ResizeObserver((entries) => {
         const rect = entries[entries.length - 1]?.contentRect;
         if (!rect || Math.abs(rect.width - observedWidth) < 0.01) return;
         observedWidth = rect.width;
-        setFilePanelWidth((width) => clampFilePanelWidth(width));
+        setPreviewPanelWidth((width) => clampPreviewPanelWidth(width));
         pin();
       });
-      fileSplitResizeObserver.observe(appBodyEl);
+      previewSplitResizeObserver.observe(appBodyEl);
     }
     document.addEventListener("fullscreenchange", onDocumentFullscreenChange);
     scheduleConnectionError();
@@ -1005,11 +1142,11 @@ export default function App() {
     resizeObserver?.disconnect();
     chatViewportResizeObserver?.disconnect();
     splitResizeObserver?.disconnect();
-    fileSplitResizeObserver?.disconnect();
+    previewSplitResizeObserver?.disconnect();
     if (viewportPinFrame) cancelAnimationFrame(viewportPinFrame);
     document.removeEventListener("fullscreenchange", onDocumentFullscreenChange);
     removePaneResizeListeners();
-    removeFilePanelResizeListeners();
+    removePreviewPanelResizeListeners();
     if (reconnectTimer) clearTimeout(reconnectTimer);
     if (connectionErrorTimer !== undefined) clearTimeout(connectionErrorTimer);
     if (suppressTimer) clearTimeout(suppressTimer);
@@ -1030,7 +1167,7 @@ export default function App() {
       </Show>
       <div
         class="app-body"
-        classList={{ "is-resizing-file-panel": filePanelResizing() }}
+        classList={{ "is-resizing-preview-panel": previewPanelResizing() }}
         ref={appBodyEl}
       >
         <main
@@ -1093,7 +1230,7 @@ export default function App() {
                   <MessageRow
                     message={message}
                     prev={messages()[index() - 1]}
-                    onOpenFile={setOpenFile}
+                    onOpenPreview={openPreview}
                   />
                 )}
               </Virtualizer>
@@ -1137,30 +1274,39 @@ export default function App() {
                   resizeComposer();
                 }}
                 onKeyDown={onComposeKeyDown}
+                onPaste={onComposePaste}
               />
             </section>
           </Show>
         </main>
-        <Show when={openFile()}>
-          <>
-            <div
-              class="file-panel-resize"
-              role="separator"
-              aria-label="Resize code view"
-              aria-orientation="vertical"
-              aria-valuemin={MIN_FILE_PANEL_WIDTH}
-              aria-valuenow={Math.round(filePanelWidth())}
-              tabIndex={0}
-              onPointerDown={beginFilePanelResize}
-              onKeyDown={onFileDividerKeyDown}
-            />
-            <aside
-              class="file-panel"
-              style={`--file-panel-width: ${filePanelWidth()}px`}
-            >
-              <FileViewer name={openFile()!} onClose={() => setOpenFile(null)} />
-            </aside>
-          </>
+        <Show when={activePreview()}>
+          {(preview) => (
+            <>
+              <div
+                class="preview-panel-resize"
+                role="separator"
+                aria-label="Resize preview panel"
+                aria-orientation="vertical"
+                aria-valuemin={MIN_PREVIEW_PANEL_WIDTH}
+                aria-valuenow={Math.round(previewPanelWidth())}
+                tabIndex={0}
+                onPointerDown={beginPreviewPanelResize}
+                onKeyDown={onPreviewDividerKeyDown}
+              />
+              <aside
+                class="preview-panel-aside"
+                style={`--preview-panel-width: ${previewPanelWidth()}px`}
+              >
+                <PreviewPanel
+                  history={previewHistory()}
+                  active={preview()}
+                  activeKey={activePreviewKey()!}
+                  onSelect={setActivePreviewKey}
+                  onClose={closePreview}
+                />
+              </aside>
+            </>
+          )}
         </Show>
       </div>
     </div>

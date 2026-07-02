@@ -437,8 +437,7 @@ fn highlight_route(dir: PathBuf) -> darkhttp::GeneratedHandler {
         let Ok(text) = String::from_utf8(bytes) else {
             return darkhttp::GeneratedResponse::error(415);
         };
-        let extension = name.rsplit('.').next().unwrap_or("");
-        let language = crate::highlight::language_for_extension(extension);
+        let language = crate::highlight::language_for_path(name);
         let buffer = crate::highlight::encode_file(&text, language);
         darkhttp::GeneratedResponse::ok("application/octet-stream", buffer)
     })

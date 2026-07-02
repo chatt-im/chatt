@@ -25,23 +25,14 @@ async function loadFile(
   }
 }
 
-// The expanded, line-numbered, syntax-highlighted view of a text file. Only the
-// visible lines build HTML, so a file with tens of thousands of lines stays
-// responsive. Highlighting is done by Rust; this view just paints spans.
-export default function FileViewer(props: { name: string; onClose: () => void }) {
+// The expanded, line-numbered, syntax-highlighted view of a text file. Panel
+// chrome is owned by PreviewPanel so code and image previews share one history.
+// Only visible lines build HTML, keeping very large files responsive.
+export default function FileViewer(props: { name: string }) {
   const [state] = createResource(() => props.name, loadFile);
 
   return (
     <div class="file-viewer">
-      <div class="file-viewer-head">
-        <span class="file-viewer-name">{props.name}</span>
-        <a class="file-viewer-download" href={`/files/${encodeURIComponent(props.name)}`} download={props.name}>
-          download
-        </a>
-        <button class="file-viewer-close" type="button" onClick={props.onClose}>
-          close
-        </button>
-      </div>
       <Suspense fallback={<div class="file-viewer-status">loading…</div>}>
         {(() => {
           const result = state();

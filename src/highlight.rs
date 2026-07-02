@@ -6,7 +6,11 @@
 //! compact binary buffers below, which the browser decodes into colored spans
 //! without running a highlighter itself.
 
-use tinyhl::{Highlighter, Language, RenderSpan, SemanticKind, Source, Span, kind};
+use std::path::Path;
+
+use tinyhl::{
+    DelimiterTable, Highlighter, Language, RenderSpan, SemanticKind, Source, Span, TokenTable, kind,
+};
 
 /// Format version prefixed to every encoded buffer.
 const VERSION: u8 = 1;
@@ -60,6 +64,12 @@ pub enum HlClass {
     Blockquote = 32,
     ListMarker = 33,
     Error = 34,
+    Argument = 35,
+    Delimiter1 = 36,
+    Delimiter2 = 37,
+    Delimiter3 = 38,
+    Delimiter4 = 39,
+    Delimiter5 = 40,
 }
 
 impl HlClass {
@@ -73,8 +83,15 @@ impl HlClass {
 /// This is the single source of truth both the TUI theme and the web encoder
 /// read, so highlighting stays identical across the two front ends.
 pub fn classify_span(span: &RenderSpan) -> HlClass {
-    if span.delimiter.is_some() {
-        return HlClass::Delimiter;
+    if let Some(depth) = span.delimiter {
+        return match depth % 6 {
+            0 => HlClass::Delimiter,
+            1 => HlClass::Delimiter1,
+            2 => HlClass::Delimiter2,
+            3 => HlClass::Delimiter3,
+            4 => HlClass::Delimiter4,
+            _ => HlClass::Delimiter5,
+        };
     }
     match span.local_kind {
         kind::COMMENT => HlClass::Comment,
@@ -118,7 +135,8 @@ fn classify_semantic(semantic: Option<SemanticKind>) -> Option<HlClass> {
         SemanticKind::MethodDefinition | SemanticKind::MethodCall => HlClass::Method,
         SemanticKind::MacroCall => HlClass::Macro,
         SemanticKind::Parameter => HlClass::Parameter,
-        SemanticKind::Argument | SemanticKind::Variable => HlClass::Variable,
+        SemanticKind::Argument => HlClass::Argument,
+        SemanticKind::Variable => HlClass::Variable,
         SemanticKind::VariableDefinition => HlClass::VariableDef,
         SemanticKind::FieldDefinition | SemanticKind::Field => HlClass::Property,
         SemanticKind::FieldAccess => HlClass::PropertyAccess,
@@ -141,29 +159,81 @@ fn symbol_class(local_kind: u16) -> Option<HlClass> {
     Some(class)
 }
 
+/// Resolves a file name or path to a highlighter language using the same names
+/// and extensions as exgit.
+pub fn language_for_path(path: &str) -> Option<Language> {
+    let path = Path::new(path);
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+
+    match file_name.as_str() {
+        "cargo.lock" | "pipfile" | "poetry.lock" | "pyproject.toml" | "uv.lock" => {
+            return Some(Language::Toml);
+        }
+        "cmakelists.txt" => return Some(Language::Cmake),
+        "makefile" | "gnumakefile" | "bsdmakefile" | "makefile.am" | "makefile.in" => {
+            return Some(Language::Make);
+        }
+        "readme" | "changelog" | "contributing" | "license" | "copying" | "authors" | "news"
+        | "todo" => return Some(Language::Markdown),
+        ".bashrc" | ".bash_profile" | ".bash_login" | ".profile" | ".envrc" | ".zshrc"
+        | ".zprofile" | ".zlogin" | ".zshenv" => return Some(Language::Sh),
+        ".editorconfig" | ".gitconfig" => return Some(Language::Ini),
+        ".dockerignore" | ".gitattributes" | ".gitignore" | ".ignore" => {
+            return Some(Language::Conf);
+        }
+        _ => {}
+    }
+
+    if file_name == ".env" || file_name.starts_with(".env.") {
+        return Some(Language::Conf);
+    }
+
+    let extension = path.extension().and_then(|extension| extension.to_str())?;
+    language_for_extension(extension)
+}
+
 /// Resolves a file extension (without the dot, any case) to a highlighter
 /// language. Returns [`None`] for extensions with no highlighter, which the
 /// callers render as plain text.
 pub fn language_for_extension(ext: &str) -> Option<Language> {
     let lower = ext.to_ascii_lowercase();
     let language = match lower.as_str() {
-        "rs" => Language::Rust,
-        "ts" | "mts" | "cts" => Language::Ts,
-        "tsx" | "jsx" | "js" | "mjs" | "cjs" => Language::Tsx,
-        "py" | "pyi" => Language::Python,
-        "c" | "h" => Language::C,
-        "cc" | "cpp" | "cxx" | "hpp" | "hh" | "hxx" => Language::Cpp,
-        "go" => Language::Go,
-        "json" => Language::Json,
-        "toml" => Language::Toml,
-        "css" => Language::Css,
-        "html" | "htm" | "xml" => Language::Html,
-        "sh" | "bash" | "zsh" => Language::Sh,
-        "sql" => Language::Sql,
-        "lua" => Language::Lua,
-        "yaml" | "yml" => Language::Yaml,
+        "c" | "h" | "i" => Language::C,
+        "cc" | "cpp" | "cxx" | "c++" | "hh" | "hpp" | "hxx" | "h++" | "ipp" | "tpp" | "txx" => {
+            Language::Cpp
+        }
+        "cmake" => Language::Cmake,
+        "conf" | "config" | "cfg" | "cnf" | "env" | "properties" => Language::Conf,
+        "cs" | "csx" => Language::Csharp,
+        "css" | "scss" | "sass" => Language::Css,
         "csv" => Language::Csv,
-        "md" | "markdown" => Language::Markdown,
+        "go" => Language::Go,
+        "htm" | "html" | "shtml" | "xhtml" => Language::Html,
+        "ini" | "dosini" => Language::Ini,
+        "java" => Language::Java,
+        "js" | "cjs" | "mjs" | "ts" | "cts" | "mts" => Language::Ts,
+        "json" | "har" | "ipynb" | "webmanifest" => Language::Json,
+        "jsx" | "tsx" => Language::Tsx,
+        "cl" | "clj" | "cljc" | "cljs" | "edn" | "el" | "lisp" | "lsp" | "rkt" | "rktd"
+        | "rktl" | "scm" | "sld" | "sls" | "ss" => Language::Lisp,
+        "lua" | "nse" | "rockspec" => Language::Lua,
+        "make" | "mak" | "mk" => Language::Make,
+        "md" | "markdown" | "mdown" | "mdtext" | "mdwn" | "mkd" | "mkdn" => Language::Markdown,
+        "cgi" | "perl" | "pl" | "pm" | "psgi" | "t" => Language::Perl,
+        "proto" => Language::Protobuf,
+        "py" | "py3" | "pyi" | "pyw" => Language::Python,
+        "rs" => Language::Rust,
+        "bash" | "command" | "ksh" | "sh" | "zsh" => Language::Sh,
+        "ddl" | "dml" | "sql" => Language::Sql,
+        "toml" => Language::Toml,
+        "wesl" | "wgsl" => Language::Wgsl,
+        "atom" | "csproj" | "fsproj" | "plist" | "rss" | "svg" | "vbproj" | "xml" | "xsd"
+        | "xsl" | "xslt" => Language::Xml,
+        "yaml" | "yml" => Language::Yaml,
         _ => return None,
     };
     Some(language)
@@ -184,18 +254,29 @@ pub fn language_for_tag(tag: &str) -> Option<Language> {
     let language = match lower.as_str() {
         "rust" | "rs" => Language::Rust,
         "ts" | "typescript" | "mts" | "cts" => Language::Ts,
-        "tsx" | "jsx" | "js" | "javascript" | "mjs" | "cjs" => Language::Tsx,
+        "js" | "javascript" | "mjs" | "cjs" => Language::Ts,
+        "tsx" | "jsx" => Language::Tsx,
         "py" | "python" => Language::Python,
         "c" | "h" => Language::C,
         "cpp" | "c++" | "cc" | "cxx" | "hpp" => Language::Cpp,
+        "cmake" => Language::Cmake,
+        "conf" | "config" | "env" | "properties" => Language::Conf,
+        "cs" | "csharp" => Language::Csharp,
         "go" | "golang" => Language::Go,
         "json" => Language::Json,
         "toml" => Language::Toml,
         "css" => Language::Css,
         "html" | "htm" | "xml" => Language::Html,
+        "ini" => Language::Ini,
+        "java" => Language::Java,
+        "lisp" | "clojure" => Language::Lisp,
+        "make" | "makefile" => Language::Make,
+        "perl" | "pl" => Language::Perl,
+        "proto" | "protobuf" => Language::Protobuf,
         "sh" | "bash" | "shell" | "zsh" | "console" => Language::Sh,
         "sql" => Language::Sql,
         "lua" => Language::Lua,
+        "wgsl" | "wesl" => Language::Wgsl,
         "yaml" | "yml" => Language::Yaml,
         "csv" => Language::Csv,
         "md" | "markdown" => Language::Markdown,
@@ -282,25 +363,112 @@ fn contiguous_runs(text: &str, language: Option<Language>) -> Vec<(u32, u32, u8)
         push_contig(&mut out, 0, len, HlClass::Plain.as_u8());
         return out;
     };
-    let mut highlighter = Highlighter::new(language);
-    highlighter.rebuild(&text as &dyn Source);
+
+    let source = &text as &dyn Source;
     let mut cursor = 0u32;
+
+    // Exgit deliberately uses the lexical token table for languages without a
+    // semantic analyzer. Besides avoiding needless semantic work, this keeps
+    // their classification independent of analyzer heuristics.
+    if semantic_free_language(language) {
+        let table = TokenTable::new(language, source);
+        let all = Span::new(0, table.source_len());
+        let delimiters = DelimiterTable::new(&table);
+        let mut delimiter_iter = delimiters.query(all).peekable();
+
+        for token in table.query(all) {
+            while let Some(delimiter) = delimiter_iter.peek() {
+                if delimiter.span.offset < token.span.offset {
+                    delimiter_iter.next();
+                } else {
+                    break;
+                }
+            }
+            let delimiter = match delimiter_iter.peek() {
+                Some(delimiter) if delimiter.span.offset == token.span.offset => {
+                    Some(delimiter.depth)
+                }
+                _ => None,
+            };
+            push_render_span(
+                &mut out,
+                &mut cursor,
+                len,
+                RenderSpan {
+                    span: token.span,
+                    lang_tag: token.lang_tag(),
+                    local_kind: token.local_kind(),
+                    semantic: None,
+                    delimiter,
+                },
+            );
+        }
+        if cursor < len {
+            push_contig(&mut out, cursor, len, HlClass::Plain.as_u8());
+        }
+        return out;
+    }
+
+    let mut highlighter = Highlighter::new(language);
+    highlighter.rebuild(source);
     for span in highlighter.render(Span::new(0, len)) {
-        let start = span.span.offset.max(cursor);
-        let end = span.span.end().min(len);
-        if end <= start {
-            continue;
-        }
-        if start > cursor {
-            push_contig(&mut out, cursor, start, HlClass::Plain.as_u8());
-        }
-        push_contig(&mut out, start, end, classify_span(&span).as_u8());
-        cursor = end;
+        push_render_span(&mut out, &mut cursor, len, span);
     }
     if cursor < len {
         push_contig(&mut out, cursor, len, HlClass::Plain.as_u8());
     }
     out
+}
+
+/// Appends one exgit-compatible render span, leaving whitespace as plain text.
+fn push_render_span(
+    out: &mut Vec<(u32, u32, u8)>,
+    cursor: &mut u32,
+    source_len: u32,
+    span: RenderSpan,
+) {
+    if span.local_kind == kind::WHITESPACE {
+        return;
+    }
+
+    let start = span.span.offset.max(*cursor);
+    let end = span.span.end().min(source_len);
+    if end <= start {
+        return;
+    }
+    if start > *cursor {
+        push_contig(out, *cursor, start, HlClass::Plain.as_u8());
+    }
+    push_contig(out, start, end, classify_span(&span).as_u8());
+    *cursor = end;
+}
+
+/// Languages exgit highlights lexically because tinyhl has no semantic pass
+/// for them.
+fn semantic_free_language(language: Language) -> bool {
+    matches!(
+        language,
+        Language::Json
+            | Language::Toml
+            | Language::Csv
+            | Language::Xml
+            | Language::Css
+            | Language::Sql
+            | Language::Go
+            | Language::Sh
+            | Language::Yaml
+            | Language::Lua
+            | Language::Make
+            | Language::Cmake
+            | Language::Protobuf
+            | Language::Ini
+            | Language::Conf
+            | Language::Wgsl
+            | Language::Perl
+            | Language::Csharp
+            | Language::Java
+            | Language::Lisp
+    )
 }
 
 /// Appends `[start, end)` with `class`, extending the last run when it is the
