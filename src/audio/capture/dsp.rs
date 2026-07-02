@@ -147,6 +147,15 @@ fn capture_apm_config(denoise: DenoiseConfig, echo: bool, max_gain_db: f32) -> A
     }
 }
 
+/// Ring backlog setpoint for the paced render feed, in 10 ms frames (~40 ms).
+/// Large enough to absorb an output device period of render production per
+/// tick; small enough that the render staleness it adds stays well inside
+/// AEC3's ~150 ms causal matched-filter coverage.
+const ECHO_BACKLOG_TARGET_FRAMES: usize = 4;
+/// Most render frames fed to AEC3 in one capture tick while draining a backlog
+/// above the setpoint, keeping per-tick API-call jitter bounded.
+const ECHO_MAX_FEED_FRAMES: usize = 2;
+
 /// Consolidated live capture front-end: one sonora WebRTC `AudioProcessing`
 /// instance running the high-pass filter, AEC3, optional spectral noise
 /// suppression, and AGC2 in the canonical WebRTC order in a single pass. With
@@ -230,9 +239,10 @@ impl CaptureProcessor {
     }
 
     /// Processes one `FRAME_SAMPLES` i16-scale capture frame in place. When echo
-    /// cancellation is enabled, `reference` supplies the latest 48 kHz render
-    /// frame to align against. The module works in normalized `[-1.0, 1.0]`, so
-    /// the frame is scaled in and back out. Returns the RNNoise voice-activity
+    /// cancellation is enabled, `reference` supplies the 48 kHz render stream to
+    /// cancel against; see [`Self::feed_render`] for how the pull rate follows
+    /// the playback clock. The module works in normalized `[-1.0, 1.0]`, so the
+    /// frame is scaled in and back out. Returns the RNNoise voice-activity
     /// probability when the RNNoise engine is active, otherwise `None`.
     pub(crate) fn process(
         &mut self,
@@ -244,10 +254,7 @@ impl CaptureProcessor {
         }
         if self.echo_enabled {
             if let Some(reference) = reference {
-                reference.pull_frame(&mut self.render);
-                let _ = self
-                    .apm
-                    .process_render_f32(&[&self.render], &mut [&mut self.render_out]);
+                self.feed_render(reference);
             }
         }
         for (near, sample) in self.near.iter_mut().zip(frame.iter()) {
@@ -267,6 +274,34 @@ impl CaptureProcessor {
             return Some(vad);
         }
         None
+    }
+
+    /// Feeds the render reference to AEC3 at a rate paced to the ring backlog
+    /// rather than strictly 1:1 with capture frames. Upstream AEC3 expects
+    /// render and capture driven at their true hardware rates and absorbs the
+    /// difference internally (`render_delay_buffer.cc` realigns on over/underrun
+    /// and `clockdrift_detector.cc` widens the filter), so a mismatched playback
+    /// clock must surface as a render:capture call imbalance, not be hidden by a
+    /// fixed pull rate that lets the ring drift into overflow (a permanently
+    /// stale reference) or underflow (zeros spliced into the stream). A
+    /// bang-bang feed of 0, 1, or 2 whole frames per capture tick holds the
+    /// backlog near [`ECHO_BACKLOG_TARGET_FRAMES`]; its steady-state average
+    /// tracks the true production rate.
+    fn feed_render(&mut self, reference: &EchoReference) {
+        let available_frames = reference.fill() / FRAME_SAMPLES;
+        let feed = if available_frames > ECHO_BACKLOG_TARGET_FRAMES + 1 {
+            ECHO_MAX_FEED_FRAMES
+        } else if available_frames < ECHO_BACKLOG_TARGET_FRAMES {
+            0
+        } else {
+            1
+        };
+        for _ in 0..feed {
+            reference.pull_frame(&mut self.render);
+            let _ = self
+                .apm
+                .process_render_f32(&[&self.render], &mut [&mut self.render_out]);
+        }
     }
 }
 
@@ -649,6 +684,115 @@ mod tests {
         assert!(
             frame.iter().all(|sample| sample.abs() <= I16_SCALE + 1.0),
             "limiter let a sample exceed full scale"
+        );
+    }
+
+    /// Drives `ticks` capture frames while pushing `push_per_tick` render
+    /// samples per tick, returning the ring fill's (max, min-after-warmup).
+    fn drive_drifting_reference(
+        processor: &mut CaptureProcessor,
+        reference: &EchoReference,
+        push_per_tick: usize,
+        ticks: usize,
+        warmup: usize,
+    ) -> (usize, usize) {
+        let mut frame = vec![0.0f32; FRAME_SAMPLES];
+        let mut phase = 0.0f32;
+        let mut max_fill = 0usize;
+        let mut min_fill = usize::MAX;
+        for tick in 0..ticks {
+            let render: Vec<f32> = (0..push_per_tick)
+                .map(|_| {
+                    phase += 0.03;
+                    phase.sin() * 0.2
+                })
+                .collect();
+            reference.push_frame(&render);
+            frame.fill(0.0);
+            processor.process(&mut frame, Some(reference));
+            let fill = reference.fill();
+            max_fill = max_fill.max(fill);
+            if tick >= warmup {
+                min_fill = min_fill.min(fill);
+            }
+        }
+        (max_fill, min_fill)
+    }
+
+    fn echo_processor() -> CaptureProcessor {
+        CaptureProcessor::new(DenoiseConfig::None, 0.0, true, DenoiseSuppression::IDENTITY)
+    }
+
+    #[test]
+    fn paced_feed_bounds_ring_under_positive_drift() {
+        // The playback clock runs ~2% fast (490 samples produced per 480-sample
+        // capture tick). Strict 1:1 consumption would let the backlog drift
+        // monotonically until the reference is permanently stale; the paced feed
+        // must drain the excess and hold the ring near its setpoint.
+        let reference = EchoReference::new();
+        let mut processor = echo_processor();
+        let (max_fill, _) = drive_drifting_reference(&mut processor, &reference, 490, 3_000, 100);
+        assert!(
+            max_fill <= 12 * FRAME_SAMPLES,
+            "backlog drifted deep under a fast playback clock: max fill {max_fill}"
+        );
+        let fill = reference.fill();
+        assert!(
+            fill <= 8 * FRAME_SAMPLES,
+            "backlog did not settle near the setpoint: fill {fill}"
+        );
+    }
+
+    #[test]
+    fn paced_feed_survives_negative_drift() {
+        // The playback clock runs ~2% slow (470 per 480). Strict 1:1 pulls pin
+        // the ring at empty and splice zeros into the reference every tick; the
+        // paced feed must instead pause and keep whole real frames flowing.
+        let reference = EchoReference::new();
+        let mut processor = echo_processor();
+        let (_, min_fill) = drive_drifting_reference(&mut processor, &reference, 470, 2_000, 100);
+        assert!(
+            min_fill >= FRAME_SAMPLES,
+            "ring emptied under a slow playback clock: min fill {min_fill}"
+        );
+    }
+
+    #[test]
+    fn paced_feed_absorbs_large_bursts() {
+        // An oversized output buffer pushes eight frames at once. The backlog
+        // must stay bounded and never run dry between bursts, so the reference
+        // keeps feeding whole real frames instead of zero-padded partials.
+        let reference = EchoReference::new();
+        let mut processor = echo_processor();
+        let mut frame = vec![0.0f32; FRAME_SAMPLES];
+        let mut phase = 0.0f32;
+        let mut max_fill = 0usize;
+        let mut min_fill = usize::MAX;
+        for tick in 0..2_000 {
+            if tick % 8 == 0 {
+                let render: Vec<f32> = (0..8 * FRAME_SAMPLES)
+                    .map(|_| {
+                        phase += 0.03;
+                        phase.sin() * 0.2
+                    })
+                    .collect();
+                reference.push_frame(&render);
+            }
+            frame.fill(0.0);
+            processor.process(&mut frame, Some(&reference));
+            let fill = reference.fill();
+            max_fill = max_fill.max(fill);
+            if tick >= 100 {
+                min_fill = min_fill.min(fill);
+            }
+        }
+        assert!(
+            max_fill <= 16 * FRAME_SAMPLES,
+            "bursts overflowed the backlog: max fill {max_fill}"
+        );
+        assert!(
+            min_fill >= FRAME_SAMPLES,
+            "ring ran dry between bursts: min fill {min_fill}"
         );
     }
 

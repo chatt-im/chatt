@@ -13,7 +13,10 @@ use std::{
 /// The playback CPAL callback is the sole producer and the capture worker is
 /// the sole consumer. Samples are mono in the `[-1.0, 1.0]` range, matching the
 /// mixer output. On overflow the newest sample is dropped, on underflow the
-/// reader zero-fills, so neither side ever blocks.
+/// reader zero-fills, so neither side ever blocks. The capture worker paces its
+/// pulls by [`Self::fill`] (see the paced render feed in `dsp.rs`), so the ring
+/// acts as the jitter buffer between the two hardware clocks and whole frames
+/// are only pulled when actually buffered.
 pub struct EchoReference {
     slots: Box<[UnsafeCell<f32>]>,
     mask: usize,
@@ -139,6 +142,24 @@ impl EchoReference {
             .store(head.wrapping_add(available), Ordering::Release);
         available
     }
+
+    /// Render samples currently buffered (producer tail minus consumer head).
+    /// Consumer side; the capture worker paces its pulls with this so whole
+    /// frames are only pulled when actually buffered.
+    pub(crate) fn fill(&self) -> usize {
+        let tail = self.tail.load(Ordering::Acquire);
+        let head = self.head.load(Ordering::Relaxed);
+        tail.wrapping_sub(head)
+    }
+
+    /// Drops everything buffered so the next pull starts from freshly produced
+    /// render audio. Consumer side only — the consumer owns `head` — called when
+    /// the AEC reference (re-)activates, since anything buffered from before the
+    /// transition is stale.
+    pub(crate) fn clear(&self) {
+        let tail = self.tail.load(Ordering::Acquire);
+        self.head.store(tail, Ordering::Release);
+    }
 }
 
 /// Producer-side batch writer for [`EchoReference`].
@@ -198,6 +219,31 @@ impl fmt::Debug for EchoReference {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fill_tracks_the_buffered_backlog() {
+        let reference = EchoReference::with_capacity(64);
+        assert_eq!(reference.fill(), 0);
+        reference.push_frame(&[1.0, 2.0, 3.0]);
+        assert_eq!(reference.fill(), 3);
+
+        let mut out = [0.0f32; 2];
+        assert_eq!(reference.pull_frame(&mut out), 2);
+        assert_eq!(reference.fill(), 1);
+    }
+
+    #[test]
+    fn clear_drops_the_buffered_backlog() {
+        let reference = EchoReference::with_capacity(64);
+        reference.push_frame(&[1.0, 2.0, 3.0, 4.0]);
+        reference.clear();
+        assert_eq!(reference.fill(), 0);
+
+        reference.push_frame(&[5.0, 6.0]);
+        let mut out = [0.0f32; 2];
+        assert_eq!(reference.pull_frame(&mut out), 2);
+        assert_eq!(out, [5.0, 6.0]);
+    }
 
     #[test]
     fn echo_reference_writes_and_reads_in_order() {

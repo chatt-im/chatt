@@ -262,6 +262,11 @@ pub(crate) struct LiveEncoderPipeline {
     last_muted: bool,
     mute_transition_id: u64,
     echo_source: Option<EchoReferenceSource>,
+    /// Whether the previous frame consumed the echo reference. On a
+    /// disabled-to-enabled transition (AEC toggle or a fresh pipeline after a
+    /// device change) the ring's backlog predates the transition and is stale,
+    /// so it is cleared before the first pull.
+    echo_reference_active: bool,
     /// Media sample clock in 48 kHz samples: the index the next captured sample
     /// will occupy. Advances by [`FRAME_SAMPLES`] for every accumulated 10 ms
     /// slot, including suppressed-silence slots, so an emitted packet's
@@ -330,6 +335,7 @@ impl LiveEncoderPipeline {
             last_muted: initial_muted,
             mute_transition_id: 0,
             echo_source,
+            echo_reference_active: false,
             next_capture_sample: 0,
         }
     }
@@ -421,6 +427,12 @@ impl LiveEncoderPipeline {
             .as_ref()
             .filter(|source| source.enabled())
             .map(|source| source.reference());
+        if let Some(reference) = reference
+            && !self.echo_reference_active
+        {
+            reference.clear();
+        }
+        self.echo_reference_active = reference.is_some();
         self.processor.set_echo_enabled(reference.is_some());
         // The RNNoise engine supplies its own VAD and drives gating directly.
         // Earshot, which holds a non-zero floor on steady background noise, only
@@ -1775,6 +1787,63 @@ mod tests {
         )
         .unwrap();
         assert!(with.aec_enabled());
+    }
+
+    #[test]
+    fn enabling_aec_clears_the_stale_render_backlog() {
+        let control = Arc::new(EchoCancellationControl::new(false));
+        // Render audio accumulates in the reference while AEC is disabled (the
+        // pipeline is not consuming it); once AEC turns on, this backlog is
+        // stale by the whole disabled span and must be dropped, not cancelled
+        // against.
+        control.reference().push_frame(&vec![0.5; 4_800]);
+
+        let encoder = OpusVoiceEncoder::new(48_000).unwrap();
+        let mut pipeline = LiveEncoderPipeline::new(
+            encoder,
+            DenoiseConfig::None,
+            test_tuning(),
+            DEFAULT_LIVE_MAX_AMPLIFICATION,
+            true,
+            DenoiseSuppression::IDENTITY,
+            DenoiseTypingSuppression::DISABLED,
+            Some(EchoReferenceSource::Controlled(Arc::clone(&control))),
+            crate::audio::shared::SAMPLE_RATE,
+            false,
+        );
+        let stats = AudioStats::new();
+        let chunk = vec![0.0; FRAME_SAMPLES];
+
+        pipeline
+            .push_chunk(
+                &chunk,
+                DEFAULT_LIVE_MAX_AMPLIFICATION,
+                false,
+                &stats,
+                &mut |_| {},
+            )
+            .unwrap();
+        assert_eq!(
+            control.reference().fill(),
+            4_800,
+            "disabled AEC must not consume the reference"
+        );
+
+        control.set_enabled(true);
+        pipeline
+            .push_chunk(
+                &chunk,
+                DEFAULT_LIVE_MAX_AMPLIFICATION,
+                false,
+                &stats,
+                &mut |_| {},
+            )
+            .unwrap();
+        assert_eq!(
+            control.reference().fill(),
+            0,
+            "enabling AEC must clear the stale render backlog"
+        );
     }
 
     #[test]
