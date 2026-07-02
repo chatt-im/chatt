@@ -20,29 +20,6 @@ function escapeHtml(text: string): string {
   return text.replace(/[&<>]/g, (c) => HTML_ESCAPES[c]!);
 }
 
-// Renders a run list over `source` bytes into HTML. `spans` starts at `spanPos`
-// with a u32 run count already consumed by the caller; here we take the runs
-// directly. `runCount` runs of (u32 len, u8 class) follow at `pos`.
-function renderRuns(
-  view: DataView,
-  pos: number,
-  runCount: number,
-  source: Uint8Array,
-  sourceStart: number,
-): string {
-  let html = "";
-  let offset = sourceStart;
-  for (let i = 0; i < runCount; i++) {
-    const len = view.getUint32(pos, true);
-    const cls = view.getUint8(pos + 4);
-    pos += 5;
-    const text = escapeHtml(decoder.decode(source.subarray(offset, offset + len)));
-    offset += len;
-    html += cls === 0 ? text : `<span class="hl-${cls}">${text}</span>`;
-  }
-  return html;
-}
-
 // Decodes an inline span buffer (a code fragment's `[version][(len,class)...]`)
 // applied to `textBytes`, returning the highlighted inner HTML for a `<code>`.
 export function renderInline(textBytes: Uint8Array, spans: Uint8Array): string {
@@ -62,11 +39,14 @@ export function renderInline(textBytes: Uint8Array, spans: Uint8Array): string {
 }
 
 // A whole file decoded for the line viewer. Lines render lazily so a file with
-// tens of thousands of lines only builds HTML for the visible window.
+// tens of thousands of lines only builds DOM for the visible window.
 export interface FileHighlight {
   readonly lineCount: number;
-  // The highlighted inner HTML for a `<code>` on line `index` (0-based).
-  lineHtml(index: number): string;
+  // Walks the highlight runs of line `index` (0-based) in order. `cls` is the
+  // `HlClass` byte (0 = plain). The viewer feeds each run into a recycled
+  // span slot, so no HTML string, escaping, parsing, or node creation happens
+  // on the hot recycle path.
+  forEachLineRun(index: number, fn: (text: string, cls: number) => void): void;
 }
 
 // Decodes a file highlight buffer from `/highlight/<name>`. Layout (see
@@ -116,13 +96,20 @@ export function decodeFileBuffer(buffer: ArrayBuffer): FileHighlight {
 
   return {
     lineCount,
-    lineHtml(index: number): string {
-      if (index < 0 || index >= lineCount) return "";
+    forEachLineRun(index: number, fn: (text: string, cls: number) => void): void {
+      if (index < 0 || index >= lineCount) return;
       const recordOffset = view.getUint32(offsetsStart + index * 4, true);
       let pos = recordsStart + recordOffset;
       const runCount = view.getUint32(pos, true);
       pos += 4;
-      return renderRuns(view, pos, runCount, bytes, lineStart[index]!);
+      let offset = lineStart[index]!;
+      for (let i = 0; i < runCount; i++) {
+        const len = view.getUint32(pos, true);
+        const cls = view.getUint8(pos + 4);
+        pos += 5;
+        fn(decoder.decode(bytes.subarray(offset, offset + len)), cls);
+        offset += len;
+      }
     },
   };
 }
