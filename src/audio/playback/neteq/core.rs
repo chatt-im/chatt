@@ -71,6 +71,11 @@ const SAMPLES_30_MS: usize = 3 * SAMPLES_10_MS;
 const DEFAULT_FRAME_SAMPLES: usize = LIVE_OPUS_FRAME_SAMPLES;
 /// One DRED chunk, 10 ms at 48 kHz.
 const DRED_CHUNK_SAMPLES: usize = SAMPLE_RATE as usize / 100;
+/// How far a sequence-advancing packet's timestamp may trail the playout point
+/// before it is treated as a sender media-clock rebase (capture restart) rather
+/// than late data. Must stay well above the silence-gate preroll back-dating
+/// and any plausible reorder delay, both of which are a few hundred ms at most.
+const TIMELINE_REBASE_TOLERANCE_SAMPLES: u32 = SAMPLE_RATE;
 
 /// What [`NetEqCore::get_audio`] produced for one output block. The mode feeds
 /// back as `last_mode` and drives stats/provenance.
@@ -158,6 +163,17 @@ pub(crate) struct NetEqCore {
     mute_target: f32,
     last_operation: Operation,
     last_decision_reason: &'static str,
+    /// The newest wire sequence inserted, distinguishing a sender media-clock
+    /// rebase (sequence advances, timestamp leaps backward) from a straggler
+    /// (both are old). WebRTC gets this signal from an SSRC change; Chatt's wire
+    /// sequence is monotonic across sender capture restarts, so the timestamp
+    /// discontinuity itself is the restart marker.
+    last_sequence: Option<u32>,
+    /// Sequence of the packet that triggered the last timeline rebase. Packets
+    /// with older sequences belong to the abandoned timeline: their timestamps
+    /// read as far-future on the new one and would jam the buffer, so they are
+    /// dropped as late.
+    rebase_floor_sequence: Option<u32>,
     dred_last_horizon_samples: usize,
     dred_missed_horizon_count: u64,
     dred_missed_horizon_samples: u64,
@@ -214,6 +230,8 @@ impl NetEqCore {
             mute_target: 1.0,
             last_operation: Operation::Normal,
             last_decision_reason: "startup",
+            last_sequence: None,
+            rebase_floor_sequence: None,
             dred_last_horizon_samples: 0,
             dred_missed_horizon_count: 0,
             dred_missed_horizon_samples: 0,
@@ -323,10 +341,37 @@ impl NetEqCore {
             return false;
         }
         let arrival_samples = self.observe_wall_clock(now);
+        if let Some(floor) = self.rebase_floor_sequence
+            && is_newer_timestamp(floor, sequence)
+        {
+            return true;
+        }
         let playout_timestamp = self
             .sync_buffer
             .end_timestamp()
             .wrapping_sub(self.sync_buffer.future_length() as u32);
+        // A sender capture restart (e.g. a mic device switch mid-call) rebases
+        // its media clock to zero while the stream and its wire sequence persist.
+        // Relative to the old timeline the new timestamps read as a huge
+        // backward leap, which the buffer decision would treat as far-future
+        // (wrapped) data and expand over until the packet buffer overflowed.
+        // Mirror WebRTC's SSRC-change reinitialization instead: flush everything
+        // and let the first-packet path below re-anchor to the new timeline. A
+        // straggler cannot trigger this because its sequence is old too.
+        let sequence_advanced = self
+            .last_sequence
+            .is_none_or(|last| is_newer_timestamp(sequence, last));
+        if !self.first_packet
+            && sequence_advanced
+            && is_newer_timestamp(playout_timestamp, timestamp)
+            && playout_timestamp.wrapping_sub(timestamp) > TIMELINE_REBASE_TOLERANCE_SAMPLES
+        {
+            self.flush();
+            self.rebase_floor_sequence = Some(sequence);
+        }
+        if sequence_advanced {
+            self.last_sequence = Some(sequence);
+        }
         let late = !self.first_packet && is_newer_timestamp(playout_timestamp, timestamp);
         let muted = flags & LIVE_PACKET_FLAG_MUTE != 0;
         // The sender drains its buffered preroll tail as a burst of back-dated
@@ -1416,6 +1461,159 @@ mod tests {
         assert!(
             max_resume < 1_000,
             "stale resume timestamp inflated playout delay to {max_resume}ms"
+        );
+    }
+
+    /// A sender capture restart rebases its media clock to zero mid-stream while
+    /// the wire sequence keeps counting. The receiver must flush and re-anchor
+    /// immediately instead of expanding until the 200-packet buffer overflows
+    /// (a multi-second outage).
+    #[test]
+    fn backward_timestamp_rebase_recovers_immediately() {
+        let mut core = NetEqCore::new(LiveAudioTuning::default()).unwrap();
+        let mut encoder = OpusVoiceEncoder::new(32_000).unwrap();
+        let mut output = vec![0.0; OUTPUT_SIZE_SAMPLES];
+        let mut clock = WallClock::new();
+        let mut seq = 0u32;
+        // Five minutes into the old timeline.
+        let base_ts = 5 * 60 * SAMPLE_RATE;
+        for offset in 0..100u32 {
+            let payload = encode_tone(&mut encoder, (seq as usize) * LIVE_OPUS_FRAME_SAMPLES);
+            let ts = base_ts + offset * LIVE_OPUS_FRAME_SAMPLES as u32;
+            core.insert_packet(clock.now(), ts, seq, 0, &payload);
+            for _ in 0..2 {
+                core.get_audio(clock.now(), &mut output);
+                clock.advance_block();
+            }
+            seq += 1;
+        }
+
+        // The capture pipeline restarts: timestamps rebase to zero, the first
+        // packet carries OPUS_RESET, and the sequence keeps advancing.
+        let mut blocks_until_audio = None;
+        let mut blocks = 0usize;
+        let mut max_playout = 0u64;
+        for offset in 0..50u32 {
+            let flags = if offset == 0 {
+                LIVE_PACKET_FLAG_OPUS_RESET
+            } else {
+                0
+            };
+            let payload = encode_tone(&mut encoder, (seq as usize) * LIVE_OPUS_FRAME_SAMPLES);
+            let ts = offset * LIVE_OPUS_FRAME_SAMPLES as u32;
+            core.insert_packet(clock.now(), ts, seq, flags, &payload);
+            for _ in 0..2 {
+                let result = core.get_audio(clock.now(), &mut output);
+                clock.advance_block();
+                blocks += 1;
+                max_playout = max_playout.max(core.diagnostics().playout_delay_ms);
+                if blocks_until_audio.is_none()
+                    && !result.muted
+                    && output.iter().any(|sample| sample.abs() > 1e-3)
+                {
+                    blocks_until_audio = Some(blocks);
+                }
+            }
+            seq += 1;
+        }
+        let blocks_until_audio =
+            blocks_until_audio.expect("stream never recovered from the backward rebase");
+        assert!(
+            blocks_until_audio <= 20,
+            "recovery took {blocks_until_audio} blocks ({}ms)",
+            blocks_until_audio * 10
+        );
+        assert!(
+            max_playout < 1_000,
+            "rebased stream reported {max_playout}ms of playout delay"
+        );
+    }
+
+    /// A network straggler carries an old sequence along with its old timestamp,
+    /// so it must be reported late without flushing the healthy stream.
+    #[test]
+    fn late_straggler_does_not_rebase_timeline() {
+        let mut core = NetEqCore::new(LiveAudioTuning::default()).unwrap();
+        let mut encoder = OpusVoiceEncoder::new(32_000).unwrap();
+        let mut output = vec![0.0; OUTPUT_SIZE_SAMPLES];
+        let mut clock = WallClock::new();
+        let base_ts = 5 * 60 * SAMPLE_RATE;
+        for seq in 0..300u32 {
+            let payload = encode_tone(&mut encoder, seq as usize * LIVE_OPUS_FRAME_SAMPLES);
+            let ts = base_ts + seq * LIVE_OPUS_FRAME_SAMPLES as u32;
+            core.insert_packet(clock.now(), ts, seq, 0, &payload);
+            for _ in 0..2 {
+                core.get_audio(clock.now(), &mut output);
+                clock.advance_block();
+            }
+        }
+
+        // A packet from four seconds ago finally arrives: old sequence, old
+        // timestamp, both far outside the rebase tolerance.
+        let straggler = encode_tone(&mut encoder, 0);
+        let late = core.insert_packet(
+            clock.now(),
+            base_ts + 100 * LIVE_OPUS_FRAME_SAMPLES as u32,
+            100,
+            0,
+            &straggler,
+        );
+        assert!(late, "straggler should be reported late");
+
+        let payload = encode_tone(&mut encoder, 300 * LIVE_OPUS_FRAME_SAMPLES);
+        core.insert_packet(
+            clock.now(),
+            base_ts + 300 * LIVE_OPUS_FRAME_SAMPLES as u32,
+            300,
+            0,
+            &payload,
+        );
+        let result = core.get_audio(clock.now(), &mut output);
+        assert!(
+            !result.muted,
+            "straggler flushed the stream: {:?}",
+            core.diagnostics()
+        );
+    }
+
+    /// Old-timeline packets still in flight when the rebase lands read as
+    /// far-future on the new timeline; they must be dropped rather than jamming
+    /// the packet buffer as never-playable data.
+    #[test]
+    fn old_timeline_stragglers_after_rebase_are_dropped() {
+        let mut core = NetEqCore::new(LiveAudioTuning::default()).unwrap();
+        let mut encoder = OpusVoiceEncoder::new(32_000).unwrap();
+        let mut output = vec![0.0; OUTPUT_SIZE_SAMPLES];
+        let mut clock = WallClock::new();
+        let base_ts = 5 * 60 * SAMPLE_RATE;
+        for seq in 0..100u32 {
+            let payload = encode_tone(&mut encoder, seq as usize * LIVE_OPUS_FRAME_SAMPLES);
+            let ts = base_ts + seq * LIVE_OPUS_FRAME_SAMPLES as u32;
+            core.insert_packet(clock.now(), ts, seq, 0, &payload);
+            for _ in 0..2 {
+                core.get_audio(clock.now(), &mut output);
+                clock.advance_block();
+            }
+        }
+
+        let payload = encode_tone(&mut encoder, 100 * LIVE_OPUS_FRAME_SAMPLES);
+        core.insert_packet(clock.now(), 0, 100, LIVE_PACKET_FLAG_OPUS_RESET, &payload);
+        let buffered_after_rebase = core.packets_buffered();
+
+        // A reordered pre-restart packet (sequence 99, old timeline) arrives.
+        let straggler = encode_tone(&mut encoder, 99 * LIVE_OPUS_FRAME_SAMPLES);
+        let late = core.insert_packet(
+            clock.now(),
+            base_ts + 99 * LIVE_OPUS_FRAME_SAMPLES as u32,
+            99,
+            0,
+            &straggler,
+        );
+        assert!(late, "old-timeline straggler should be reported late");
+        assert_eq!(
+            core.packets_buffered(),
+            buffered_after_rebase,
+            "old-timeline straggler was buffered as far-future data"
         );
     }
 
