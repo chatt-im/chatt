@@ -671,11 +671,29 @@ body {
   font-family: var(--font-mono);
   font-size: 0.85em;
   line-height: 1.5;
+  /* The browser's scroll anchoring fights the windowed list's row recycling. */
+  overflow-anchor: none;
+  contain: layout paint style;
+}
+
+/* The full-height spacer the windowed rows position themselves within. Its
+ * height is lineCount * rowHeight, so the scrollbar reflects the whole file
+ * while only the visible rows exist in the DOM. */
+.code-list {
+  position: relative;
 }
 
 /* One source line: a right-aligned number gutter and the highlighted text. The
- * text keeps its whitespace and does not wrap, matching an editor. */
+ * text keeps its whitespace and does not wrap, matching an editor. Rows are
+ * absolutely positioned at the top and placed purely by translateY, so a
+ * recycled row moves without relayout. No `contain` here: layout containment
+ * would demote a long line's overflow to ink overflow and break the
+ * container's horizontal scrolling. */
 .code-line {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 100%;
   display: flex;
   white-space: pre;
 }

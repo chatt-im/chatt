@@ -1,5 +1,5 @@
-import { createResource, createMemo, Show, Suspense } from "solid-js";
-import { Virtualizer } from "./vendor/virtua/solid/Virtualizer";
+import { createResource, Show, Suspense } from "solid-js";
+import CodeList from "./CodeList";
 import { decodeFileBuffer, type FileHighlight } from "./highlight";
 
 // Fetches and decodes a file's highlight buffer from `/highlight/<name>`.
@@ -31,16 +31,6 @@ async function loadFile(
 export default function FileViewer(props: { name: string; onClose: () => void }) {
   const [state] = createResource(() => props.name, loadFile);
 
-  // A stable line-index array for the virtualizer. Rebuilt only when the file
-  // changes, not per scroll.
-  const lines = createMemo<number[]>(() => {
-    const result = state();
-    if (!result || "error" in result) return [];
-    return Array.from({ length: result.highlight.lineCount }, (_, i) => i);
-  });
-
-  let scrollEl: HTMLDivElement | undefined;
-
   return (
     <div class="file-viewer">
       <div class="file-viewer-head">
@@ -61,16 +51,7 @@ export default function FileViewer(props: { name: string; onClose: () => void })
           const highlight = result?.highlight;
           return (
             <Show when={highlight}>
-              <div class="file-viewer-body" ref={scrollEl}>
-                <Virtualizer scrollRef={scrollEl} data={lines()}>
-                  {(line) => (
-                    <div class="code-line">
-                      <span class="code-line-no">{line + 1}</span>
-                      <code class="code-line-text" innerHTML={highlight!.lineHtml(line)} />
-                    </div>
-                  )}
-                </Virtualizer>
-              </div>
+              <CodeList highlight={highlight!} />
             </Show>
           );
         })()}

@@ -126,6 +126,25 @@ function TransferProgressBar(props: { progress: { transferred: number; total: nu
   );
 }
 
+// The virtualizer unmounts rows that scroll out of the window, so a fragment's
+// body would otherwise be re-parsed every time its row scrolls back in. A
+// fragment object is created once per decoded message and never mutated
+// (progress merges keep the same fragments array), so it is a stable cache
+// key; replaced messages simply fall out with GC.
+const fragmentHtmlCache = new WeakMap<Fragment, string>();
+
+function fragmentHtml(fragment: Fragment): string {
+  let html = fragmentHtmlCache.get(fragment);
+  if (html === undefined) {
+    html =
+      fragment.kind === "text"
+        ? renderMarkdown(fragment.text)
+        : renderInline(fragment.text, fragment.spans);
+    fragmentHtmlCache.set(fragment, html);
+  }
+  return html;
+}
+
 // Renders a message body from its fragments: prose as markdown, code blocks
 // from their precomputed highlight spans. Nothing is re-highlighted here.
 function MessageBody(props: { fragments: Fragment[] }) {
@@ -133,10 +152,10 @@ function MessageBody(props: { fragments: Fragment[] }) {
     <For each={props.fragments}>
       {(fragment) =>
         fragment.kind === "text" ? (
-          <div class="message-body" innerHTML={renderMarkdown(fragment.text)} />
+          <div class="message-body" innerHTML={fragmentHtml(fragment)} />
         ) : (
           <pre class="code-block">
-            <code innerHTML={renderInline(fragment.text, fragment.spans)} />
+            <code innerHTML={fragmentHtml(fragment)} />
           </pre>
         )
       }
@@ -317,6 +336,7 @@ export default function App() {
     | {
         move: (event: PointerEvent) => void;
         up: (event: PointerEvent) => void;
+        cancelFrame: () => void;
       }
     | undefined;
 
@@ -376,7 +396,10 @@ export default function App() {
 
   // Re-pin to the newest message. A no-op while detached. Safe to over-call.
   function pin() {
-    if (!handle || !following) return;
+    // Changing the split width can resize every mounted chat row. Let the
+    // virtualizer process those measurements without repeatedly restarting
+    // scrollToIndex's measurement loop; the drag end performs one final pin.
+    if (filePanelResize || !handle || !following) return;
     const last = messages().length - 1;
     if (last < 0) return;
     suppress = true;
@@ -600,6 +623,7 @@ export default function App() {
     window.removeEventListener("pointermove", filePanelResize.move);
     window.removeEventListener("pointerup", filePanelResize.up);
     window.removeEventListener("pointercancel", filePanelResize.up);
+    filePanelResize.cancelFrame();
     filePanelResize = undefined;
     setFilePanelResizing(false);
   }
@@ -629,15 +653,60 @@ export default function App() {
     removeFilePanelResizeListeners();
     const startX = event.clientX;
     const startWidth = filePanelWidth();
+    // The app body's width does not change as its children are resized. Read
+    // it once so pointer moves never force layout merely to recompute bounds.
+    const total = appBodyEl?.clientWidth ?? 0;
+    const minWidth =
+      total > 0
+        ? Math.min(
+            MIN_FILE_PANEL_WIDTH,
+            Math.max(240, total - MIN_CHAT_SPLIT_WIDTH - FILE_PANEL_DIVIDER_SIZE),
+          )
+        : MIN_FILE_PANEL_WIDTH;
+    const maxWidth =
+      total > 0
+        ? Math.max(
+            minWidth,
+            total - MIN_CHAT_SPLIT_WIDTH - FILE_PANEL_DIVIDER_SIZE,
+          )
+        : Number.POSITIVE_INFINITY;
+    let nextWidth = startWidth;
+    let frame = 0;
+    const updateWidth = (clientX: number) => {
+      nextWidth = clamp(startWidth + startX - clientX, minWidth, maxWidth);
+    };
+    const flush = () => {
+      if (frame) cancelAnimationFrame(frame);
+      frame = 0;
+      setFilePanelWidth(nextWidth);
+    };
     const move = (moveEvent: PointerEvent) => {
       moveEvent.preventDefault();
-      setClampedFilePanelWidth(startWidth + startX - moveEvent.clientX);
+      updateWidth(moveEvent.clientX);
+      // Chrome can deliver pointer events faster than it can lay out both
+      // panes. Coalesce them so there is at most one flex relayout per paint.
+      if (!frame) {
+        frame = requestAnimationFrame(() => {
+          frame = 0;
+          setFilePanelWidth(nextWidth);
+        });
+      }
     };
     const up = (upEvent: PointerEvent) => {
       upEvent.preventDefault();
+      if (upEvent.type === "pointerup") updateWidth(upEvent.clientX);
+      flush();
       removeFilePanelResizeListeners();
+      pin();
     };
-    filePanelResize = { move, up };
+    filePanelResize = {
+      move,
+      up,
+      cancelFrame: () => {
+        if (frame) cancelAnimationFrame(frame);
+        frame = 0;
+      },
+    };
     setFilePanelResizing(true);
     window.addEventListener("pointermove", move);
     window.addEventListener("pointerup", up);
@@ -845,14 +914,22 @@ export default function App() {
       resizeObserver.observe(contentEl);
     }
     if (mainEl) {
-      splitResizeObserver = new ResizeObserver(() => {
+      let observedHeight = -1;
+      splitResizeObserver = new ResizeObserver((entries) => {
+        const rect = entries[entries.length - 1]?.contentRect;
+        if (!rect || Math.abs(rect.height - observedHeight) < 0.01) return;
+        observedHeight = rect.height;
         setSharePaneHeight((height) => clampSharePaneHeight(height));
         pin();
       });
       splitResizeObserver.observe(mainEl);
     }
     if (appBodyEl) {
-      fileSplitResizeObserver = new ResizeObserver(() => {
+      let observedWidth = -1;
+      fileSplitResizeObserver = new ResizeObserver((entries) => {
+        const rect = entries[entries.length - 1]?.contentRect;
+        if (!rect || Math.abs(rect.width - observedWidth) < 0.01) return;
+        observedWidth = rect.width;
         setFilePanelWidth((width) => clampFilePanelWidth(width));
         pin();
       });
