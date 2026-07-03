@@ -202,7 +202,7 @@ pub struct Server {
     active_uploads: HashMap<(SessionId, FileTransferId), ServerUpload>,
     active_bug_reports: HashMap<(SessionId, BugReportId), ServerBugReport>,
     reserved_file_names: HashSet<String>,
-    chat_history_limit: usize,
+    default_room: RoomId,
     file_size_limit_bytes: u64,
     invites: HashMap<String, InviteState>,
     open_pair_global_allocations: VecDeque<Instant>,
@@ -260,6 +260,7 @@ impl Server {
                     name: room.name.clone(),
                     members: HashSet::new(),
                     history: VecDeque::new(),
+                    history_limit: room.memory_history_limit(),
                     active_streams: HashMap::new(),
                 },
             );
@@ -272,10 +273,12 @@ impl Server {
                     name: "lobby".to_string(),
                     members: HashSet::new(),
                     history: VecDeque::new(),
+                    history_limit: 0,
                     active_streams: HashMap::new(),
                 },
             );
         }
+        let default_room = config.default_room_id();
 
         let server_key_pair = config
             .server_key_pair()
@@ -284,8 +287,6 @@ impl Server {
             "server identity loaded",
             public_key = encode_hex(server_key_pair.public_key().as_ref()).as_str()
         );
-        let chat_history_limit =
-            usize::try_from(config.security.chat_history_limit).unwrap_or(usize::MAX);
         let file_size_limit_bytes = config.security.max_file_size_bytes;
 
         Ok(Self {
@@ -310,7 +311,7 @@ impl Server {
             active_uploads: HashMap::new(),
             active_bug_reports: HashMap::new(),
             reserved_file_names: HashSet::new(),
-            chat_history_limit,
+            default_room,
             file_size_limit_bytes,
             invites: HashMap::new(),
             open_pair_global_allocations: VecDeque::new(),
@@ -389,7 +390,7 @@ impl Server {
             udp_addr: self.config.network.public_udp_addr.clone(),
             udp_probe_addr: self.config.network.public_udp_probe_addr.clone(),
             server_public_key: encode_hex(self.server_key_pair.public_key().as_ref()),
-            room_id: DEFAULT_ROOM.0,
+            room_id: self.default_room.0,
         };
         let join_string = encode_invite_ticket(&ticket)?;
         self.invites.insert(
@@ -1779,7 +1780,7 @@ impl Server {
             file_receive_limit_bytes
         );
         let rooms = self.room_infos();
-        let current_room = join_lobby.then_some(DEFAULT_ROOM);
+        let current_room = join_lobby.then_some(self.default_room);
         let response = match issued_token {
             Some(token) => ServerControl::OpenPaired {
                 token,
@@ -1799,7 +1800,7 @@ impl Server {
         };
         self.send_control_to_token(token, &response)?;
         if join_lobby && self.live_token_for_session(session_id).is_some() {
-            self.join_room(session_id, DEFAULT_ROOM);
+            self.join_room(session_id, self.default_room);
         }
         Ok(())
     }
@@ -2051,11 +2052,11 @@ impl Server {
         };
         self.next_message += 1;
         let mut history_len = 0;
-        if self.chat_history_limit > 0
-            && let Some(room) = self.rooms.get_mut(&room_id)
+        if let Some(room) = self.rooms.get_mut(&room_id)
+            && room.history_limit > 0
         {
             room.history.push_back(message.clone());
-            while room.history.len() > self.chat_history_limit {
+            while room.history.len() > room.history_limit {
                 room.history.pop_front();
             }
             history_len = room.history.len();
@@ -2172,11 +2173,11 @@ impl Server {
                 file: metadata.clone(),
             },
         )?;
-        if self.chat_history_limit > 0
-            && let Some(room) = self.rooms.get_mut(&room_id)
+        if let Some(room) = self.rooms.get_mut(&room_id)
+            && room.history_limit > 0
         {
             room.history.push_back(message.clone());
-            while room.history.len() > self.chat_history_limit {
+            while room.history.len() > room.history_limit {
                 room.history.pop_front();
             }
         }
@@ -2717,7 +2718,7 @@ impl Server {
             (&link.high_to_low, &link.low_to_high)
         };
         Ok(P2pPeerInfo {
-            room_id: recipient_session.room_id.unwrap_or(DEFAULT_ROOM),
+            room_id: recipient_session.room_id.unwrap_or(self.default_room),
             session_id: peer,
             user_id: peer_session.user_id,
             generation: peer_p2p.generation,
@@ -3744,6 +3745,9 @@ struct RoomState {
     name: String,
     members: HashSet<SessionId>,
     history: VecDeque<ChatMessage>,
+    /// In-memory ring bound from the room's persistence config; zero keeps no
+    /// history.
+    history_limit: usize,
     active_streams: HashMap<StreamId, SessionId>,
 }
 
@@ -4120,6 +4124,7 @@ mod tests {
             name: "test".to_string(),
             members: members.iter().copied().collect(),
             history: VecDeque::new(),
+            history_limit: 0,
             active_streams: HashMap::new(),
         }
     }

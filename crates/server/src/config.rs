@@ -19,6 +19,12 @@ const SHA256_HEX_LEN: usize = 64;
 /// First user id handed out to a dynamic (open-paired) user. Ids below this are
 /// reserved for explicit `[[users]]` entries.
 pub const FIRST_DYNAMIC_USER_ID: u64 = u32::MAX as u64 + 1;
+/// First room id handed out to a runtime-created (DM) room. Ids below this are
+/// reserved for explicit `[[rooms]]` entries.
+pub const FIRST_DYNAMIC_ROOM_ID: u32 = 0x8000_0000;
+/// Ring size used for `persistence = "memory"` rooms without an explicit
+/// `memory-limit`.
+pub const DEFAULT_MEMORY_HISTORY_LIMIT: usize = 512;
 
 #[derive(Clone, Debug, Toml)]
 #[toml(FromToml, rename_all = "kebab-case")]
@@ -59,8 +65,6 @@ pub struct SecurityConfig {
     pub server_identity_seed: String,
     #[toml(default = true)]
     pub encryption: bool,
-    #[toml(default)]
-    pub chat_history_limit: u64,
     #[toml(default = DEFAULT_FILE_SIZE_LIMIT_BYTES)]
     pub max_file_size_bytes: u64,
     /// Directory where `/report-bug` bundles are saved. Bug reports are rejected
@@ -88,7 +92,6 @@ impl Default for SecurityConfig {
             server_identity_seed: generate_identity_seed_hex()
                 .expect("system random is available for default test config"),
             encryption: true,
-            chat_history_limit: 0,
             max_file_size_bytes: DEFAULT_FILE_SIZE_LIMIT_BYTES,
             bug_report_dir: None,
             public: false,
@@ -99,17 +102,70 @@ impl Default for SecurityConfig {
     }
 }
 
+/// Server-side retention for a room's messages.
+///
+/// `None` relays without retaining, `Memory` keeps a bounded in-memory ring
+/// that is lost on restart, and `Durable` appends to an on-disk log under the
+/// storage data dir.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Toml)]
+#[toml(FromToml, ToToml, rename_all = "kebab-case")]
+pub enum RoomPersistenceConfig {
+    #[default]
+    None,
+    Memory,
+    Durable,
+}
+
 #[derive(Clone, Debug, Toml)]
 #[toml(FromToml, ToToml, rename_all = "kebab-case")]
 pub struct RoomConfig {
     pub id: u32,
     pub name: String,
+    /// `None` means public: every user on the server can access the room.
+    /// `Some` restricts access to the listed `[[users]]` names.
+    #[toml(default)]
+    pub members: Option<Vec<String>>,
+    #[toml(default)]
+    pub persistence: RoomPersistenceConfig,
+    /// Ring size for `persistence = "memory"`; rejected for other settings.
+    #[toml(default)]
+    pub memory_limit: Option<u64>,
+    /// Marks the room clients drop into on connect. At most one room; when
+    /// absent the lowest-id public room is the default.
+    #[toml(default, rename = "default")]
+    pub is_default: bool,
 }
 
 impl RoomConfig {
     pub fn room_id(&self) -> RoomId {
         RoomId(self.id)
     }
+
+    pub fn is_public(&self) -> bool {
+        self.members.is_none()
+    }
+
+    /// In-memory ring size backing this room until durable storage takes over:
+    /// the configured `memory-limit` (or the default) for memory rooms, zero
+    /// otherwise.
+    pub fn memory_history_limit(&self) -> usize {
+        if self.persistence != RoomPersistenceConfig::Memory {
+            return 0;
+        }
+        let Some(limit) = self.memory_limit else {
+            return DEFAULT_MEMORY_HISTORY_LIMIT;
+        };
+        usize::try_from(limit).unwrap_or(usize::MAX)
+    }
+}
+
+#[derive(Clone, Debug, Default, Toml)]
+#[toml(FromToml, rename_all = "kebab-case")]
+pub struct StorageConfig {
+    /// Directory for server-side room data (durable logs, DM registry).
+    /// Defaults to `<config stem>-data` beside the config file.
+    #[toml(default)]
+    pub data_dir: Option<String>,
 }
 
 #[derive(Clone, Debug, Toml)]
@@ -136,6 +192,8 @@ pub struct Config {
     pub network: NetworkConfig,
     #[toml(default)]
     pub security: SecurityConfig,
+    #[toml(default)]
+    pub storage: StorageConfig,
     #[toml(default = default_rooms())]
     pub rooms: Vec<RoomConfig>,
     #[toml(default)]
@@ -149,6 +207,7 @@ impl Default for Config {
         let mut config = Self {
             network: NetworkConfig::default(),
             security: SecurityConfig::default(),
+            storage: StorageConfig::default(),
             rooms: default_rooms(),
             users: Vec::new(),
             config_path: None,
@@ -209,7 +268,6 @@ p2p-enabled = true
 [security]
 server-identity-seed = "{seed}"
 encryption = true
-chat-history-limit = 0
 max-file-size-bytes = {max_file_size_bytes}
 # Directory where `/report-bug` bundles are saved. Bug reports are rejected when
 # unset.
@@ -226,9 +284,24 @@ password-epoch = 0
 # this range.
 next-dynamic-user-id = {first_dynamic_user_id}
 
+# Server-side room data (durable message logs, the DM room registry) lives in
+# storage.data-dir. Defaults to "<config stem>-data" beside this file.
+# [storage]
+# data-dir = "chatt-server-data"
+
 [[rooms]]
 id = 1
 name = "lobby"
+# Rooms are public unless they list members; members are [[users]] names.
+# members = ["alice", "bob"]
+# Server-side retention: "none" (relay only), "memory" (ring, lost on
+# restart), or "durable" (on-disk log under storage.data-dir).
+persistence = "none"
+# Ring size for persistence = "memory".
+# memory-limit = 512
+# Clients drop into the default room on connect. At most one room; when
+# omitted the lowest-id public room is the default.
+default = true
 
 # Create invite users with:
 #   chatt-server invite USER
@@ -318,6 +391,33 @@ impl Config {
         self.security.password_epoch
     }
 
+    /// The room clients drop into on connect: the room marked `default = true`,
+    /// or the lowest-id public room.
+    pub fn default_room_id(&self) -> RoomId {
+        if let Some(room) = self.rooms.iter().find(|room| room.is_default) {
+            return room.room_id();
+        }
+        self.rooms
+            .iter()
+            .filter(|room| room.is_public())
+            .map(|room| room.id)
+            .min()
+            .map(RoomId)
+            .unwrap_or(RoomId(1))
+    }
+
+    /// Directory for server-side room data: `storage.data-dir` when set,
+    /// otherwise `<config stem>-data` beside the config file. `None` only for
+    /// in-memory test configs with no config path.
+    pub fn data_dir(&self) -> Option<PathBuf> {
+        if let Some(dir) = &self.storage.data_dir {
+            return Some(PathBuf::from(dir));
+        }
+        let path = self.config_path.as_ref()?;
+        let stem = path.file_stem()?.to_string_lossy();
+        Some(path.with_file_name(format!("{stem}-data")))
+    }
+
     /// Reserves the next dynamic user id, persisting the advanced counter so ids
     /// never repeat across restarts. Rolls back the in-memory counter if the
     /// config write fails.
@@ -379,6 +479,14 @@ impl Config {
             .filter(|addr| !addr.is_empty())
             .map(str::to_string)
             .or_else(|| self.network.udp_probe_addr.map(|addr| addr.to_string()));
+        for room in &mut self.rooms {
+            room.name = room.name.trim().to_string();
+            if let Some(members) = &mut room.members {
+                for member in members {
+                    *member = member.trim().to_string();
+                }
+            }
+        }
         for user in &mut self.users {
             user.name = user.name.trim().to_string();
             user.display_name = user.display_name.trim().to_string();
@@ -420,24 +528,6 @@ impl Config {
             ));
         }
 
-        let mut room_ids = HashSet::new();
-        for room in &self.rooms {
-            if room.id == 0 {
-                return Err(format!("{source}: room id must be non-zero"));
-            }
-            if room.name.trim().is_empty() {
-                return Err(format!("{source}: room name must not be empty"));
-            }
-            if !room_ids.insert(room.id) {
-                return Err(format!("{source}: duplicate room id {}", room.id));
-            }
-        }
-        if !room_ids.contains(&1) {
-            return Err(format!(
-                "{source}: room id 1 is required as the default lobby"
-            ));
-        }
-
         let mut user_ids = HashSet::new();
         let mut user_names = HashSet::new();
         for user in &self.users {
@@ -476,6 +566,80 @@ impl Config {
                 &format!("user {} token-hash", user.name),
                 &user.token_hash,
             )?;
+        }
+
+        let mut room_ids = HashSet::new();
+        let mut room_names = HashSet::new();
+        let mut default_room = None;
+        let mut has_public_room = false;
+        for room in &self.rooms {
+            if room.id == 0 {
+                return Err(format!("{source}: room id must be non-zero"));
+            }
+            if room.id >= FIRST_DYNAMIC_ROOM_ID {
+                return Err(format!(
+                    "{source}: room {} id must be below {FIRST_DYNAMIC_ROOM_ID}; higher ids are reserved for runtime-created rooms",
+                    room.name
+                ));
+            }
+            if room.name.is_empty() {
+                return Err(format!("{source}: room name must not be empty"));
+            }
+            if !room_ids.insert(room.id) {
+                return Err(format!("{source}: duplicate room id {}", room.id));
+            }
+            if !room_names.insert(room.name.as_str()) {
+                return Err(format!("{source}: duplicate room name {}", room.name));
+            }
+            match &room.members {
+                None => has_public_room = true,
+                Some(members) => {
+                    if members.is_empty() {
+                        return Err(format!(
+                            "{source}: private room {} must list at least one member",
+                            room.name
+                        ));
+                    }
+                    for member in members {
+                        if !user_names.contains(member.as_str()) {
+                            return Err(format!(
+                                "{source}: room {} member {member} does not match any [[users]] name",
+                                room.name
+                            ));
+                        }
+                    }
+                }
+            }
+            if room.memory_limit.is_some() && room.persistence != RoomPersistenceConfig::Memory {
+                return Err(format!(
+                    "{source}: room {} memory-limit requires persistence = \"memory\"",
+                    room.name
+                ));
+            }
+            if room.memory_limit == Some(0) {
+                return Err(format!(
+                    "{source}: room {} memory-limit must be non-zero",
+                    room.name
+                ));
+            }
+            if room.is_default {
+                if let Some(previous) = default_room {
+                    return Err(format!(
+                        "{source}: rooms {previous} and {} both set default = true",
+                        room.name
+                    ));
+                }
+                if !room.is_public() {
+                    return Err(format!(
+                        "{source}: default room {} must be public",
+                        room.name
+                    ));
+                }
+                default_room = Some(room.name.as_str());
+            }
+        }
+        if !has_public_room {
+            return Err(format!("{source}: at least one public room is required"));
         }
         Ok(())
     }
@@ -532,10 +696,6 @@ impl Config {
         ));
         out.push_str(&format!("encryption = {}\n", self.security.encryption));
         out.push_str(&format!(
-            "chat-history-limit = {}\n",
-            self.security.chat_history_limit
-        ));
-        out.push_str(&format!(
             "max-file-size-bytes = {}\n",
             self.security.max_file_size_bytes
         ));
@@ -555,10 +715,39 @@ impl Config {
             self.security.next_dynamic_user_id
         ));
         out.push('\n');
+        if let Some(data_dir) = &self.storage.data_dir {
+            out.push_str("[storage]\n");
+            out.push_str(&format!(
+                "data-dir = \"{}\"\n\n",
+                toml_quote_value(data_dir)
+            ));
+        }
         for room in &self.rooms {
             out.push_str("[[rooms]]\n");
             out.push_str(&format!("id = {}\n", room.id));
-            out.push_str(&format!("name = \"{}\"\n\n", toml_quote_value(&room.name)));
+            out.push_str(&format!("name = \"{}\"\n", toml_quote_value(&room.name)));
+            if let Some(members) = &room.members {
+                let members: Vec<String> = members
+                    .iter()
+                    .map(|member| format!("\"{}\"", toml_quote_value(member)))
+                    .collect();
+                out.push_str(&format!("members = [{}]\n", members.join(", ")));
+            }
+            let persistence = match room.persistence {
+                RoomPersistenceConfig::None => None,
+                RoomPersistenceConfig::Memory => Some("memory"),
+                RoomPersistenceConfig::Durable => Some("durable"),
+            };
+            if let Some(persistence) = persistence {
+                out.push_str(&format!("persistence = \"{persistence}\"\n"));
+            }
+            if let Some(memory_limit) = room.memory_limit {
+                out.push_str(&format!("memory-limit = {memory_limit}\n"));
+            }
+            if room.is_default {
+                out.push_str("default = true\n");
+            }
+            out.push('\n');
         }
         for user in &self.users {
             out.push_str("[[users]]\n");
@@ -780,6 +969,10 @@ fn default_rooms() -> Vec<RoomConfig> {
     vec![RoomConfig {
         id: 1,
         name: "lobby".to_string(),
+        members: None,
+        persistence: RoomPersistenceConfig::None,
+        memory_limit: None,
+        is_default: true,
     }]
 }
 
@@ -850,8 +1043,10 @@ mod tests {
         assert!(config.network.p2p_enabled);
         assert!(config.security.encryption);
         assert_ne!(config.security.server_identity_seed, dev_server_seed_hex());
-        assert_eq!(config.security.chat_history_limit, 0);
         assert_eq!(config.rooms[0].room_id(), RoomId(1));
+        assert!(config.rooms[0].is_public());
+        assert_eq!(config.rooms[0].persistence, RoomPersistenceConfig::None);
+        assert_eq!(config.default_room_id(), RoomId(1));
     }
 
     #[test]
@@ -1244,6 +1439,213 @@ mod tests {
         let config = Config::default();
         assert_eq!(config.security.bug_report_dir, None);
         assert!(!config.to_toml_string().contains("bug-report-dir"));
+    }
+
+    fn parse(content: &str) -> Result<Config, String> {
+        parse_config_content(content, "<test>", Some(PathBuf::from("chatt-server.toml")))
+    }
+
+    fn rooms_section(rooms: &str) -> String {
+        let base = config_with_users().to_toml_string();
+        let default_room = "[[rooms]]\nid = 1\nname = \"lobby\"\ndefault = true\n";
+        assert!(base.contains(default_room), "unexpected default room block");
+        base.replace(default_room, rooms)
+    }
+
+    #[test]
+    fn room_config_parses_members_persistence_and_default() {
+        let config = parse(&rooms_section(
+            "[[rooms]]\nid = 1\nname = \"lobby\"\npersistence = \"durable\"\ndefault = true\n\n\
+             [[rooms]]\nid = 2\nname = \"dev\"\npersistence = \"memory\"\nmemory-limit = 200\n\n\
+             [[rooms]]\nid = 3\nname = \"secret\"\nmembers = [\"alice\", \"bob\"]\n",
+        ))
+        .unwrap();
+
+        assert_eq!(config.rooms.len(), 3);
+        assert_eq!(config.rooms[0].persistence, RoomPersistenceConfig::Durable);
+        assert!(config.rooms[0].is_default);
+        assert_eq!(config.rooms[1].persistence, RoomPersistenceConfig::Memory);
+        assert_eq!(config.rooms[1].memory_history_limit(), 200);
+        assert_eq!(
+            config.rooms[2].members.as_deref(),
+            Some(["alice".to_string(), "bob".to_string()].as_slice())
+        );
+        assert!(!config.rooms[2].is_public());
+        assert_eq!(config.rooms[2].memory_history_limit(), 0);
+        assert_eq!(config.default_room_id(), RoomId(1));
+    }
+
+    #[test]
+    fn memory_room_without_limit_uses_the_default_ring_size() {
+        let config = parse(&rooms_section(
+            "[[rooms]]\nid = 1\nname = \"lobby\"\npersistence = \"memory\"\n",
+        ))
+        .unwrap();
+
+        assert_eq!(
+            config.rooms[0].memory_history_limit(),
+            DEFAULT_MEMORY_HISTORY_LIMIT
+        );
+    }
+
+    #[test]
+    fn config_rejects_duplicate_room_names() {
+        let error = parse(&rooms_section(
+            "[[rooms]]\nid = 1\nname = \"lobby\"\n\n[[rooms]]\nid = 2\nname = \"lobby\"\n",
+        ))
+        .unwrap_err();
+
+        assert!(error.contains("duplicate room name"));
+    }
+
+    #[test]
+    fn config_rejects_unknown_private_member() {
+        let error = parse(&rooms_section(
+            "[[rooms]]\nid = 1\nname = \"lobby\"\n\n\
+             [[rooms]]\nid = 2\nname = \"secret\"\nmembers = [\"mallory\"]\n",
+        ))
+        .unwrap_err();
+
+        assert!(error.contains("member mallory does not match"));
+    }
+
+    #[test]
+    fn config_rejects_empty_private_members() {
+        let error = parse(&rooms_section(
+            "[[rooms]]\nid = 1\nname = \"lobby\"\n\n\
+             [[rooms]]\nid = 2\nname = \"secret\"\nmembers = []\n",
+        ))
+        .unwrap_err();
+
+        assert!(error.contains("at least one member"));
+    }
+
+    #[test]
+    fn config_rejects_multiple_default_rooms() {
+        let error = parse(&rooms_section(
+            "[[rooms]]\nid = 1\nname = \"lobby\"\ndefault = true\n\n\
+             [[rooms]]\nid = 2\nname = \"dev\"\ndefault = true\n",
+        ))
+        .unwrap_err();
+
+        assert!(error.contains("both set default"));
+    }
+
+    #[test]
+    fn config_rejects_private_default_room() {
+        let error = parse(&rooms_section(
+            "[[rooms]]\nid = 1\nname = \"lobby\"\n\n\
+             [[rooms]]\nid = 2\nname = \"secret\"\nmembers = [\"alice\"]\ndefault = true\n",
+        ))
+        .unwrap_err();
+
+        assert!(error.contains("default room secret must be public"));
+    }
+
+    #[test]
+    fn config_requires_a_public_room() {
+        let error = parse(&rooms_section(
+            "[[rooms]]\nid = 1\nname = \"secret\"\nmembers = [\"alice\"]\n",
+        ))
+        .unwrap_err();
+
+        assert!(error.contains("at least one public room"));
+    }
+
+    #[test]
+    fn config_rejects_room_id_in_dynamic_range() {
+        let error = parse(&rooms_section(&format!(
+            "[[rooms]]\nid = {FIRST_DYNAMIC_ROOM_ID}\nname = \"lobby\"\n"
+        )))
+        .unwrap_err();
+
+        assert!(error.contains("reserved for runtime-created rooms"));
+    }
+
+    #[test]
+    fn config_rejects_memory_limit_without_memory_persistence() {
+        let error = parse(&rooms_section(
+            "[[rooms]]\nid = 1\nname = \"lobby\"\npersistence = \"durable\"\nmemory-limit = 10\n",
+        ))
+        .unwrap_err();
+
+        assert!(error.contains("memory-limit requires"));
+    }
+
+    #[test]
+    fn default_room_falls_back_to_lowest_public_id() {
+        let config = parse(&rooms_section(
+            "[[rooms]]\nid = 7\nname = \"annex\"\n\n\
+             [[rooms]]\nid = 2\nname = \"den\"\n\n\
+             [[rooms]]\nid = 3\nname = \"secret\"\nmembers = [\"alice\"]\n",
+        ))
+        .unwrap();
+
+        assert_eq!(config.default_room_id(), RoomId(2));
+    }
+
+    #[test]
+    fn data_dir_defaults_beside_config_file() {
+        let mut config = Config::default();
+        config.config_path = Some(PathBuf::from("/srv/chatt/chatt-server.toml"));
+        assert_eq!(
+            config.data_dir(),
+            Some(PathBuf::from("/srv/chatt/chatt-server-data"))
+        );
+
+        config.storage.data_dir = Some("/var/lib/chatt".to_string());
+        assert_eq!(config.data_dir(), Some(PathBuf::from("/var/lib/chatt")));
+
+        config.storage.data_dir = None;
+        config.config_path = None;
+        assert_eq!(config.data_dir(), None);
+    }
+
+    #[test]
+    fn room_settings_round_trip_through_persisted_config() {
+        let mut config = config_with_users();
+        config.storage.data_dir = Some("room-data".to_string());
+        config.rooms = vec![
+            RoomConfig {
+                id: 1,
+                name: "lobby".to_string(),
+                members: None,
+                persistence: RoomPersistenceConfig::Durable,
+                memory_limit: None,
+                is_default: true,
+            },
+            RoomConfig {
+                id: 2,
+                name: "dev".to_string(),
+                members: None,
+                persistence: RoomPersistenceConfig::Memory,
+                memory_limit: Some(200),
+                is_default: false,
+            },
+            RoomConfig {
+                id: 3,
+                name: "secret".to_string(),
+                members: Some(vec!["alice".to_string(), "bob".to_string()]),
+                persistence: RoomPersistenceConfig::None,
+                memory_limit: None,
+                is_default: false,
+            },
+        ];
+
+        let restored = parse(&config.to_toml_string()).unwrap();
+
+        assert_eq!(restored.storage.data_dir.as_deref(), Some("room-data"));
+        assert_eq!(restored.rooms.len(), 3);
+        assert_eq!(
+            restored.rooms[0].persistence,
+            RoomPersistenceConfig::Durable
+        );
+        assert!(restored.rooms[0].is_default);
+        assert_eq!(restored.rooms[1].memory_limit, Some(200));
+        assert_eq!(
+            restored.rooms[2].members.as_deref(),
+            Some(["alice".to_string(), "bob".to_string()].as_slice())
+        );
     }
 
     #[test]

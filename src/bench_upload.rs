@@ -63,6 +63,10 @@ fn server_config() -> ServerConfig {
     config.rooms = vec![RoomConfig {
         id: ROOM,
         name: "lobby".to_string(),
+        members: None,
+        persistence: server::config::RoomPersistenceConfig::None,
+        memory_limit: None,
+        is_default: true,
     }];
     config.users = vec![
         UserConfig {
