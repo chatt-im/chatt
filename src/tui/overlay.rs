@@ -980,7 +980,6 @@ mod tests {
                 username: "Zoe".to_string(),
                 token: String::new(),
                 server_public_key: String::new(),
-                room_id: 1,
             },
             open: Some(String::new()),
             completion: PairCompletion::OpenEditor,

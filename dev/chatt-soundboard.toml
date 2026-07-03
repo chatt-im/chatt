@@ -5,7 +5,6 @@ token = "carol-dev-token"
 server-public-key = ""
 tcp-addr = "127.0.0.1:41000"
 udp-addr = "127.0.0.1:41000"
-room-id = 1
 
 [ui]
 placeholder = "Soundboard: press 1 or type /sound 1"

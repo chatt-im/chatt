@@ -165,11 +165,7 @@ impl ServerCatalog {
                 label: server.label.clone(),
                 username: server.username.clone(),
                 tcp_addr: server.tcp_addr.clone(),
-                room_id: server.room_id,
-                search_text: format!(
-                    "{} {} {} {}",
-                    server.label, server.username, server.tcp_addr, server.room_id
-                ),
+                search_text: format!("{} {} {}", server.label, server.username, server.tcp_addr),
             })
             .collect();
         self.generation = self.generation.saturating_add(1);
@@ -221,6 +217,9 @@ pub(crate) struct App {
     pub control_socket: Option<local_control::ControlSocket>,
     pub session_id: Option<SessionId>,
     pub user_id: Option<UserId>,
+    /// The room whose voice call this client is in, independent of the viewed
+    /// room. Mirrors the worker's view; confirmed by our own `VoiceStarted`.
+    pub voice_room: Option<RoomId>,
     pub server_catalog: ServerCatalog,
     pub pending_pair: Option<PendingPair>,
     pub mic_muted: Arc<AtomicBool>,
@@ -798,6 +797,7 @@ impl App {
             control_socket: None,
             session_id: None,
             user_id: None,
+            voice_room: None,
             server_catalog: ServerCatalog::default(),
             pending_pair: None,
             mic_muted: Arc::new(AtomicBool::new(false)),
@@ -988,7 +988,7 @@ impl App {
                 self.stop_view(StreamId(stream_id))
             }
             crate::web_server::WebRequest::SendChat { body } => {
-                self.send_network_command(NetworkCommand::SendChat(body), true);
+                self.send_chat_to_viewed(body);
             }
             crate::web_server::WebRequest::UploadFile { path, name } => {
                 self.send_network_command(
@@ -1138,13 +1138,13 @@ impl App {
         let history_id = crate::room_history::derive_server_id(&server.token);
         self.room.connect_to_server(
             server.label.clone(),
-            history_id,
+            history_id.clone(),
             server.effective_display_name(),
         );
-        let view = self
-            .room
-            .load_offline_history(RoomId(server.room_id), self.user_id);
+        let catalog = crate::room_catalog::load(&history_id);
+        self.room.load_offline_catalog(&catalog, self.user_id);
         if let Some(feed) = &self.web_feed {
+            let view = self.room.viewed_history();
             feed.set_room(web_room_messages(&view, &self.room));
         }
         self.active_tcp_addr = Some(
@@ -1186,15 +1186,61 @@ impl App {
         self.supervisor.playback_watch = PlaybackWatch::default();
     }
 
-    /// Resets per-room session state and clears the web feed's room so a browser
-    /// stops showing a room the client has left. Used by every disconnect path,
-    /// including reconnect and worker-failure recovery, so the feed never retains
-    /// stale history while the client is detached.
+    /// Resets live session state (presence, voice) while keeping room buffers
+    /// browsable offline. Used by every disconnect path, including reconnect
+    /// and worker-failure recovery.
     fn reset_room_for_disconnect(&mut self) {
+        self.save_room_catalog();
+        self.voice_room = None;
         self.room.reset_for_disconnect();
+    }
+
+    /// Mirrors the viewed room into the web feed and tells the worker which
+    /// room externally injected uploads target.
+    fn sync_viewed_room_to_feeds(&mut self) {
         if let Some(feed) = &self.web_feed {
-            feed.set_room(Vec::new());
+            let view = self.room.viewed_history();
+            feed.set_room(web_room_messages(&view, &self.room));
         }
+        if let Some(room_id) = self.room.viewed_room {
+            self.send_network_command(NetworkCommand::SetActiveRoom(room_id), false);
+        }
+    }
+
+    /// Switches the viewed room, updating the web feed, upload target, and the
+    /// persisted catalog. Returns false when the room is unknown.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn set_viewed_room(&mut self, room_id: RoomId) -> bool {
+        if !self.room.set_viewed_room(room_id, self.user_id) {
+            return false;
+        }
+        self.after_view_switch();
+        true
+    }
+
+    fn after_view_switch(&mut self) {
+        self.sync_viewed_room_to_feeds();
+        self.save_room_catalog();
+        self.set_status(format!("viewing {}", self.room.room_name));
+    }
+
+    /// Sends a chat message to the currently viewed room.
+    fn send_chat_to_viewed(&mut self, body: String) {
+        let Some(room_id) = self.room.viewed_room else {
+            self.set_error("no room selected");
+            return;
+        };
+        self.send_network_command(NetworkCommand::SendChat { room_id, body }, true);
+    }
+
+    /// Persists the room catalog (names, kinds, read state, last viewed/voice
+    /// rooms) so rooms stay navigable offline.
+    fn save_room_catalog(&self) {
+        let history_id = self.room.history_id();
+        if history_id.is_empty() {
+            return;
+        }
+        crate::room_catalog::save(history_id, &self.room.catalog(self.voice_room));
     }
 
     fn start_join_pairing(&mut self, ticket: InviteTicket) {
@@ -1244,7 +1290,6 @@ impl App {
             username: default_join_display_name(),
             token: String::new(),
             server_public_key: String::new(),
-            room_id: 1,
         };
         spawn_open_pair_once(
             server.client_config(&self.config.files, &self.config.p2p),
@@ -1591,42 +1636,83 @@ impl App {
                 session_id,
                 user_id,
                 rooms,
+                users,
+                default_room,
             } => {
                 self.session_id = Some(session_id);
                 self.user_id = Some(user_id);
                 self.last_network_notice = None;
-                self.room
-                    .authenticated(rooms.first().map(|room| room.name.clone()));
-                self.set_status(format!("authenticated as {}", self.room.local_user_name));
-            }
-            NetworkEvent::RoomJoined {
-                room_id,
-                history,
-                participants,
-            } => {
-                let view = self
-                    .room
-                    .joined(room_id, participants, history, self.user_id);
-                if let Some(feed) = &self.web_feed {
-                    feed.set_room(web_room_messages(&view, &self.room));
+                let catalog = crate::room_catalog::load(self.room.history_id());
+                let known = self.room.authenticated(
+                    &rooms,
+                    users,
+                    default_room,
+                    catalog.last_viewed_room,
+                    Some(user_id),
+                );
+                self.sync_viewed_room_to_feeds();
+                for room_id in known {
+                    self.send_network_command(
+                        NetworkCommand::FetchHistory {
+                            room_id,
+                            before: None,
+                            limit: rpc::control::MAX_HISTORY_FETCH_MESSAGES,
+                        },
+                        false,
+                    );
                 }
-                self.set_status(format!("joined room {}", room_id.0));
+                let voice_target = catalog
+                    .last_voice_room
+                    .filter(|room_id| self.room.room_meta(*room_id).is_some())
+                    .unwrap_or(default_room);
+                self.voice_room = Some(voice_target);
+                self.send_network_command(NetworkCommand::JoinVoice(voice_target), true);
                 self.publish_voice_status();
                 self.start_room_voice();
+                self.save_room_catalog();
+                self.set_status(format!("authenticated as {}", self.room.local_user_name));
                 self.flush_pending_network_commands();
             }
+            NetworkEvent::RoomUpserted(info) => {
+                self.room.upsert_room(&info, self.user_id);
+                self.send_network_command(
+                    NetworkCommand::FetchHistory {
+                        room_id: info.room_id,
+                        before: None,
+                        limit: rpc::control::MAX_HISTORY_FETCH_MESSAGES,
+                    },
+                    false,
+                );
+                self.save_room_catalog();
+            }
+            NetworkEvent::DmOpened { room_id, peer } => {
+                if self.room.set_viewed_room(room_id, self.user_id) {
+                    self.after_view_switch();
+                    self.set_status(format!("dm with {}", self.room.display_name_of(peer)));
+                }
+            }
+            NetworkEvent::HistoryChunk {
+                room_id, messages, ..
+            } => {
+                self.room.merge_history(room_id, messages, self.user_id);
+                if self.room.viewed_room == Some(room_id) {
+                    self.sync_viewed_room_to_feeds();
+                }
+            }
             NetworkEvent::Chat(message) => {
-                if let Some(feed) = &self.web_feed {
+                let viewed = self.room.viewed_room == Some(message.room_id);
+                if viewed && let Some(feed) = &self.web_feed {
                     feed.send(crate::web_server::WebMessage::from_chat(
                         &message,
                         &|target| self.room.web_ref_for(target),
                     ));
                 }
                 let update = RoomSession::chat_received(&mut self.room, message, self.user_id);
-                if !update.local {
+                if let Some(update) = update
+                    && !update.local
+                {
                     self.play_notification(NotificationSound::MessageReceived);
                 }
-                let _ = update.should_scroll_bottom;
             }
             NetworkEvent::FileReceived {
                 metadata,
@@ -1674,14 +1760,8 @@ impl App {
             NetworkEvent::TransferCanceled { transfer_id } => {
                 self.room.clear_transfer(transfer_id);
             }
-            NetworkEvent::Presence {
-                participant,
-                online,
-                ..
-            } => {
-                let notice = self
-                    .room
-                    .presence_changed(participant, online, self.user_id);
+            NetworkEvent::Presence { user, online } => {
+                let notice = self.room.presence_changed(user, online, self.user_id);
                 if !notice.local {
                     self.play_notification(if online {
                         NotificationSound::PeerJoin
@@ -1695,30 +1775,55 @@ impl App {
                     if online { "joined" } else { "left" }
                 ));
             }
-            NetworkEvent::VoiceStarted { user_id, stream_id } => {
-                let notice = self.room.voice_started(user_id, stream_id, self.user_id);
-                self.apply_user_audio_control(user_id);
-                self.apply_remote_sender_mute(user_id, self.room.voice_muted(user_id));
+            NetworkEvent::VoiceStarted {
+                room_id,
+                user_id,
+                stream_id,
+            } => {
+                if Some(user_id) == self.user_id {
+                    self.voice_room = Some(room_id);
+                }
+                let notice = self.room.voice_started(
+                    room_id,
+                    user_id,
+                    stream_id,
+                    self.user_id,
+                    self.voice_room,
+                );
+                if self.voice_room == Some(room_id) {
+                    self.apply_user_audio_control(user_id);
+                    self.apply_remote_sender_mute(user_id, self.room.voice_muted(user_id));
+                }
                 if notice.local {
                     if self.config.soundboard.enabled {
                         self.set_status("soundboard ready");
                     } else {
                         self.set_status("voice stream ready");
                     }
-                } else {
+                    self.save_room_catalog();
+                } else if self.voice_room == Some(room_id) {
                     self.set_status(format!("{} voice ready", notice.display_name));
                 }
             }
-            NetworkEvent::VoiceStopped { user_id, stream_id } => {
-                let notice = self.room.voice_stopped(user_id, stream_id, self.user_id);
+            NetworkEvent::VoiceStopped {
+                room_id,
+                user_id,
+                stream_id,
+            } => {
+                let notice = self
+                    .room
+                    .voice_stopped(room_id, user_id, stream_id, self.user_id);
                 if notice.local {
+                    self.voice_room = None;
                     self.stop_audio();
                     self.set_status("voice stopped");
                 } else {
                     if let Some(playback) = &self.playback {
                         playback.stop_stream(stream_id.0);
                     }
-                    self.set_status(format!("{} left voice", notice.display_name));
+                    if self.voice_room == Some(room_id) {
+                        self.set_status(format!("{} left voice", notice.display_name));
+                    }
                 }
             }
             NetworkEvent::PeerTransport { user_id, direct } => {
@@ -3472,7 +3577,7 @@ impl App {
             ComposerSubmission::Command(input) => input,
             ComposerSubmission::Message(body) => {
                 if self.network.is_some() {
-                    self.send_network_command(NetworkCommand::SendChat(body), true);
+                    self.send_chat_to_viewed(body);
                 } else {
                     self.set_error("select a server before sending messages");
                 }
@@ -4450,7 +4555,9 @@ fn network_event_kind(event: &NetworkEvent) -> &'static str {
     match event {
         NetworkEvent::Connected => "connected",
         NetworkEvent::Authenticated { .. } => "authenticated",
-        NetworkEvent::RoomJoined { .. } => "room_joined",
+        NetworkEvent::RoomUpserted(_) => "room_upserted",
+        NetworkEvent::DmOpened { .. } => "dm_opened",
+        NetworkEvent::HistoryChunk { .. } => "history_chunk",
         NetworkEvent::Chat(_) => "chat",
         NetworkEvent::FileReceived { .. } => "file_received",
         NetworkEvent::TransferProgress { .. } => "transfer_progress",
@@ -4484,8 +4591,13 @@ fn network_event_kind(event: &NetworkEvent) -> &'static str {
 
 fn app_network_command_kind(command: &NetworkCommand) -> &'static str {
     match command {
-        NetworkCommand::SendChat(_) => "send_chat",
+        NetworkCommand::SendChat { .. } => "send_chat",
         NetworkCommand::UploadFile(_) => "upload_file",
+        NetworkCommand::SetActiveRoom(_) => "set_active_room",
+        NetworkCommand::JoinVoice(_) => "join_voice",
+        NetworkCommand::LeaveVoice => "leave_voice",
+        NetworkCommand::FetchHistory { .. } => "fetch_history",
+        NetworkCommand::OpenDm(_) => "open_dm",
         NetworkCommand::LocalVoicePacket(_) => "local_voice_packet",
         NetworkCommand::SequencedLocalVoicePacket { .. } => "sequenced_local_voice_packet",
         NetworkCommand::SetPlaybackSink(_) => "set_playback_sink",
@@ -4545,7 +4657,6 @@ mod tests {
                 username: "Zoe".to_string(),
                 token: String::new(),
                 server_public_key: String::new(),
-                room_id: 1,
             },
             open: Some(String::new()),
             completion: PairCompletion::OpenEditor,
@@ -4608,7 +4719,6 @@ mod tests {
             token: "tct1_existing-token".to_string(),
             server_public_key: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
                 .to_string(),
-            room_id: 1,
         });
         app.active_server_label = Some("public".to_string());
 
@@ -4665,15 +4775,41 @@ mod tests {
         let _ = std::fs::remove_file(path);
     }
 
-    fn participant(user_id: UserId, display_name: &str) -> ParticipantInfo {
-        ParticipantInfo {
+    fn user_summary(user_id: UserId, display_name: &str) -> rpc::control::UserSummary {
+        rpc::control::UserSummary {
             user_id,
             display_name: display_name.to_string(),
             identifier: display_name.to_string(),
-            in_call: true,
+            online: true,
+            connected_at_ms: 0,
             voice_status: ParticipantVoiceStatus::default(),
-            joined_at_ms: 0,
         }
+    }
+
+    fn test_room_info(id: u32) -> rpc::control::RoomInfo {
+        rpc::control::RoomInfo {
+            room_id: rpc::ids::RoomId(id),
+            name: format!("room-{id}"),
+            participants: 0,
+            kind: rpc::control::RoomKind::Public,
+            head: None,
+            voice_users: Vec::new(),
+        }
+    }
+
+    /// Registers room 1 as the viewed room with `users` in the directory.
+    fn enter_room_with_users(app: &mut App, users: Vec<rpc::control::UserSummary>) {
+        app.room.authenticated(
+            &[test_room_info(1)],
+            users,
+            rpc::ids::RoomId(1),
+            None,
+            app.user_id,
+        );
+    }
+
+    fn enter_test_room(app: &mut App) {
+        enter_room_with_users(app, Vec::new());
     }
 
     /// Drives an [`App`] through a real mode stack so tests can exercise mode
@@ -4844,13 +4980,19 @@ mod tests {
         drop(rx);
         app.network = Some(NetworkClient::from_parts_for_test(tx));
 
-        let sent = app.send_network_command(NetworkCommand::SendChat("hello".to_string()), true);
+        let sent = app.send_network_command(
+            NetworkCommand::SendChat {
+                room_id: rpc::ids::RoomId(1),
+                body: "hello".to_string(),
+            },
+            true,
+        );
 
         assert!(!sent);
         assert_eq!(app.pending_network_commands.len(), 1);
         assert!(matches!(
             app.pending_network_commands.front(),
-            Some(NetworkCommand::SendChat(body)) if body == "hello"
+            Some(NetworkCommand::SendChat { body, .. }) if body == "hello"
         ));
         assert_eq!(app.status.kind(), StatusKind::Error);
     }
@@ -4860,12 +5002,13 @@ mod tests {
         let mut app = test_app();
         let (tx, rx) = mpsc::channel();
         app.network = Some(NetworkClient::from_parts_for_test(tx));
+        enter_test_room(&mut app);
         app.room.composer.set_lines(" /help");
 
         app.submit_input();
 
         match rx.try_recv().unwrap() {
-            NetworkCommand::SendChat(body) => assert_eq!(body, "/help"),
+            NetworkCommand::SendChat { body, .. } => assert_eq!(body, "/help"),
             other => panic!("unexpected command: {other:?}"),
         }
     }
@@ -4876,12 +5019,15 @@ mod tests {
         let (tx, rx) = mpsc::channel();
         app.network = Some(NetworkClient::from_parts_for_test(tx));
         app.pending_network_commands
-            .push_back(NetworkCommand::SendChat("hello".to_string()));
+            .push_back(NetworkCommand::SendChat {
+                room_id: rpc::ids::RoomId(1),
+                body: "hello".to_string(),
+            });
 
         app.flush_pending_network_commands();
 
         match rx.try_recv().unwrap() {
-            NetworkCommand::SendChat(body) => assert_eq!(body, "hello"),
+            NetworkCommand::SendChat { body, .. } => assert_eq!(body, "hello"),
             other => panic!("unexpected command: {other:?}"),
         }
         assert!(app.pending_network_commands.is_empty());
@@ -4893,12 +5039,7 @@ mod tests {
         let (tx, rx) = mpsc::channel();
         app.network = Some(NetworkClient::from_parts_for_test(tx));
         app.user_id = Some(UserId(1));
-        app.room.joined(
-            rpc::ids::RoomId(1),
-            vec![participant(UserId(1), "alice")],
-            Vec::new(),
-            app.user_id,
-        );
+        enter_room_with_users(&mut app, vec![user_summary(UserId(1), "alice")]);
 
         app.set_mute(true);
 
@@ -5123,14 +5264,12 @@ mod tests {
         let mut app = test_app();
         app.room.server_alias = "local".to_string();
         app.user_id = Some(UserId(1));
-        app.room.joined(
-            rpc::ids::RoomId(1),
+        enter_room_with_users(
+            &mut app,
             vec![
-                participant(UserId(1), "alice"),
-                participant(UserId(2), "bob"),
+                user_summary(UserId(1), "alice"),
+                user_summary(UserId(2), "bob"),
             ],
-            Vec::new(),
-            app.user_id,
         );
         app.room.move_participant_selection(1);
 
@@ -5174,14 +5313,12 @@ mod tests {
         let mut app = test_app();
         app.room.server_alias = "local".to_string();
         app.user_id = Some(UserId(1));
-        app.room.joined(
-            rpc::ids::RoomId(1),
+        enter_room_with_users(
+            &mut app,
             vec![
-                participant(UserId(1), "alice"),
-                participant(UserId(2), "bob"),
+                user_summary(UserId(1), "alice"),
+                user_summary(UserId(2), "bob"),
             ],
-            Vec::new(),
-            app.user_id,
         );
         app.room.move_participant_selection(1);
 
@@ -5384,7 +5521,6 @@ mod tests {
                 username: "Zoe".to_string(),
                 token: "tct1_existing-token".to_string(),
                 server_public_key: String::new(),
-                room_id: 1,
             });
         }
         app

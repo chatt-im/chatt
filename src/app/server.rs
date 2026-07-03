@@ -34,7 +34,6 @@ pub(crate) struct ServerSelectItem {
     pub(crate) label: String,
     pub(crate) username: String,
     pub(crate) tcp_addr: String,
-    pub(crate) room_id: u32,
     pub(crate) search_text: String,
 }
 
@@ -60,7 +59,6 @@ pub(crate) struct ServerEditDraft {
     tcp_addr: String,
     udp_addr: String,
     udp_probe_addr: String,
-    room_id: String,
     form: UiFormState,
 }
 
@@ -93,7 +91,6 @@ impl ServerEditDraft {
             tcp_addr: server.tcp_addr.clone(),
             udp_addr: server.udp_addr.clone(),
             udp_probe_addr: server.udp_probe_addr.clone().unwrap_or_default(),
-            room_id: server.room_id.to_string(),
             form: form::state_with_focus(bindings, SERVER_SECTION, "Label"),
         }
     }
@@ -174,7 +171,6 @@ impl ServerEditDraft {
                 tcp_addr: &mut self.tcp_addr,
                 udp_addr: &mut self.udp_addr,
                 udp_probe_addr: &mut self.udp_probe_addr,
-                room_id: &mut self.room_id,
             };
             server_edit_ui(&mut form, values);
         }
@@ -196,11 +192,6 @@ impl ServerEditDraft {
                 None,
             );
         }
-        let room_id = draft
-            .room_id
-            .trim()
-            .parse::<u32>()
-            .map_err(|_| "room-id must be a positive integer".to_string())?;
         let udp_probe_addr = non_empty_text(&draft.udp_probe_addr);
         let server = ServerEntry {
             label: draft.label.trim().to_string(),
@@ -210,7 +201,6 @@ impl ServerEditDraft {
             username: draft.username.trim().to_string(),
             token: self.token.clone(),
             server_public_key: self.server_public_key.clone(),
-            room_id,
         };
         validate_server_entry(&server)?;
         Ok(ServerEditUpdate {
@@ -248,7 +238,6 @@ impl ServerEditDraft {
                 tcp_addr: &mut self.tcp_addr,
                 udp_addr: &mut self.udp_addr,
                 udp_probe_addr: &mut self.udp_probe_addr,
-                room_id: &mut self.room_id,
             };
             server_edit_ui(&mut form, values)
         };
@@ -292,7 +281,6 @@ impl ServerEditDraft {
             tcp_addr: self.tcp_addr.clone(),
             udp_addr: self.udp_addr.clone(),
             udp_probe_addr: self.udp_probe_addr.clone(),
-            room_id: self.room_id.clone(),
             form: form::state_with_focus(FormBindings::Standard, SERVER_SECTION, "Label"),
         }
     }
@@ -307,7 +295,6 @@ struct ServerEditValues<'a> {
     tcp_addr: &'a mut String,
     udp_addr: &'a mut String,
     udp_probe_addr: &'a mut String,
-    room_id: &'a mut String,
 }
 
 fn server_edit_ui(form: &mut Form, values: ServerEditValues<'_>) -> Option<ServerEditButton> {
@@ -323,7 +310,6 @@ fn server_edit_ui(form: &mut Form, values: ServerEditValues<'_>) -> Option<Serve
     form.text("TCP", values.tcp_addr, |_| None);
     form.text("UDP", values.udp_addr, |_| None);
     form.text("Probe", values.udp_probe_addr, |_| None);
-    form.text("Room", values.room_id, |_| None);
     form.section(ACTIONS_SECTION);
     form.actions(&ACTIONS).activated
 }
@@ -367,7 +353,6 @@ pub(crate) fn server_entry_from_invite(
         username,
         token,
         server_public_key: ticket.server_public_key.clone(),
-        room_id: ticket.room_id,
     })
 }
 

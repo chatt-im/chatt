@@ -1101,7 +1101,7 @@ mod tests {
     };
     use extui_editor::Mode as EditorMode;
     use rpc::{
-        control::{ChatMessage, ParticipantInfo, ParticipantVoiceStatus},
+        control::{ChatMessage, ParticipantVoiceStatus},
         ids::{MessageId, RoomId, UserId},
     };
     use toml_spanner::Arena;
@@ -1184,6 +1184,26 @@ mod tests {
         room.render(app, buffer, 0);
     }
 
+    fn enter_room_one(app: &mut App) {
+        if app.room.viewed_room.is_some() {
+            return;
+        }
+        app.room.authenticated(
+            &[rpc::control::RoomInfo {
+                room_id: RoomId(1),
+                name: "lobby".to_string(),
+                participants: 0,
+                kind: rpc::control::RoomKind::Public,
+                head: None,
+                voice_users: Vec::new(),
+            }],
+            Vec::new(),
+            RoomId(1),
+            None,
+            None,
+        );
+    }
+
     fn push_room_message(
         app: &mut App,
         message_id: u64,
@@ -1191,6 +1211,7 @@ mod tests {
         timestamp_ms: u64,
         body: impl Into<String>,
     ) {
+        enter_room_one(app);
         app.room.chat_received(
             ChatMessage {
                 message_id: MessageId(message_id),
@@ -1205,14 +1226,14 @@ mod tests {
         );
     }
 
-    fn participant(user_id: UserId, display_name: &str) -> ParticipantInfo {
-        ParticipantInfo {
+    fn participant(user_id: UserId, display_name: &str) -> rpc::control::UserSummary {
+        rpc::control::UserSummary {
             user_id,
             display_name: display_name.to_string(),
             identifier: display_name.to_string(),
-            in_call: true,
+            online: true,
+            connected_at_ms: 0,
             voice_status: ParticipantVoiceStatus::default(),
-            joined_at_ms: 0,
         }
     }
 
@@ -1633,13 +1654,22 @@ mod tests {
     fn mouse_down_on_lobby_row_focuses_lobby_and_selects_user() {
         let mut app = test_app();
         let mut room = RoomMode::default();
-        app.room.joined(
-            RoomId(1),
+        app.user_id = Some(UserId(1));
+        app.room.authenticated(
+            &[rpc::control::RoomInfo {
+                room_id: RoomId(1),
+                name: "lobby".to_string(),
+                participants: 0,
+                kind: rpc::control::RoomKind::Public,
+                head: None,
+                voice_users: Vec::new(),
+            }],
             vec![
                 participant(UserId(1), "alice"),
                 participant(UserId(2), "bob"),
             ],
-            Vec::new(),
+            RoomId(1),
+            None,
             Some(UserId(1)),
         );
 

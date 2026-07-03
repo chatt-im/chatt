@@ -15,7 +15,7 @@ use crate::{
     client_net::ClientConfig,
     config_diagnostics::{self, Diag},
 };
-use rpc::{control::DEFAULT_FILE_SIZE_LIMIT_BYTES, ids::RoomId};
+use rpc::control::DEFAULT_FILE_SIZE_LIMIT_BYTES;
 
 pub const DEFAULT_CONFIG: &str = include_str!("../chatt.toml");
 pub const DEFAULT_MAX_AMPLIFICATION: f32 = crate::audio::DEFAULT_LIVE_MAX_AMPLIFICATION;
@@ -47,7 +47,6 @@ pub struct ServerEntry {
     pub token: String,
     #[toml(default)]
     pub server_public_key: String,
-    pub room_id: u32,
 }
 
 impl Default for ServerEntry {
@@ -60,7 +59,6 @@ impl Default for ServerEntry {
             username: "Alice".to_string(),
             token: "alice-dev-token".to_string(),
             server_public_key: String::new(),
-            room_id: 1,
         }
     }
 }
@@ -74,7 +72,6 @@ impl ServerEntry {
             display_name: self.effective_display_name(),
             token: self.token.clone(),
             server_public_key: non_empty_string(&self.server_public_key),
-            room_id: RoomId(self.room_id),
             file_receive_dir: files.receive_dir_path(),
             max_upload_bytes: files.max_upload_bytes,
             max_receive_bytes: files.max_receive_bytes,
@@ -878,11 +875,6 @@ impl Config {
                     out.push(Diag::error(format!("server {label}: {error}")));
                 }
             }
-            if server.room_id == 0 {
-                out.push(Diag::error(format!(
-                    "server {label}: room-id must be non-zero"
-                )));
-            }
             if !labels.insert(label.as_str()) {
                 out.push(Diag::error(format!("duplicate server label {label}")));
             }
@@ -1165,9 +1157,6 @@ pub fn validate_server_entry(server: &ServerEntry) -> Result<(), String> {
     if let Some(addr) = &server.udp_probe_addr {
         validate_endpoint(addr, "udp-probe-addr")?;
     }
-    if server.room_id == 0 {
-        return Err("room-id must be non-zero".to_string());
-    }
     Ok(())
 }
 
@@ -1227,7 +1216,6 @@ username = "Alice"
 token = "alice-dev-token"
 tcp-addr = "127.0.0.1:42000"
 server-public-key = ""
-room-id = 1
 "#,
             &arena,
         )
@@ -1255,7 +1243,6 @@ tcp-addr = "127.0.0.1:42000"
 udp-addr = "127.0.0.1:42001"
 udp-probe-addr = "127.0.0.1:42002"
 server-public-key = ""
-room-id = 1
 "#,
             &arena,
         )
@@ -1286,7 +1273,6 @@ tcp-addr = "chat.example.com:443"
 udp-addr = "media.example.com:54100"
 udp-probe-addr = "probe.example.com:54101"
 server-public-key = ""
-room-id = 1
 "#,
             &arena,
         )
@@ -1319,7 +1305,6 @@ username = "Carol"
 token = "carol-dev-token"
 tcp-addr = "127.0.0.1:42000"
 server-public-key = ""
-room-id = 1
 
 [soundboard]
 enabled = true
