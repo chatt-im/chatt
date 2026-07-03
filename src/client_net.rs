@@ -293,11 +293,13 @@ pub enum NetworkEvent {
     },
     VoiceStarted {
         room_id: RoomId,
+        session_id: SessionId,
         user_id: UserId,
         stream_id: StreamId,
     },
     VoiceStopped {
         room_id: RoomId,
+        session_id: SessionId,
         user_id: UserId,
         stream_id: StreamId,
     },
@@ -3472,6 +3474,7 @@ impl WorkerState {
             }
             ServerControl::VoiceStarted {
                 room_id,
+                session_id,
                 user_id,
                 stream_id,
             } => {
@@ -3480,7 +3483,7 @@ impl WorkerState {
                     user_id = user_id.0,
                     stream_id = stream_id.0
                 );
-                if Some(user_id) == self.user_id {
+                if Some(session_id) == self.session_id {
                     self.reset_voice_peer_state();
                     self.voice_room = Some(room_id);
                     self.requested_voice_room = None;
@@ -3498,12 +3501,14 @@ impl WorkerState {
                 }
                 let _ = self.events.send(NetworkEvent::VoiceStarted {
                     room_id,
+                    session_id,
                     user_id,
                     stream_id,
                 });
             }
             ServerControl::VoiceStopped {
                 room_id,
+                session_id,
                 user_id,
                 stream_id,
             } => {
@@ -3525,6 +3530,7 @@ impl WorkerState {
                 self.clear_pending_playback_stream(stream_id);
                 let _ = self.events.send(NetworkEvent::VoiceStopped {
                     room_id,
+                    session_id,
                     user_id,
                     stream_id,
                 });

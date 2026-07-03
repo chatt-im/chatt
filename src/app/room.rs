@@ -9,7 +9,7 @@ use extui::Style;
 use extui_editor::{Editor, Span as EditorSpan, bindings as editor_bindings};
 use rpc::{
     control::{ChatMessage, ParticipantVoiceStatus, RoomInfo, RoomKind, UserSummary},
-    ids::{FileTransferId, MessageId, RoomId, StreamId, UserId},
+    ids::{FileTransferId, MessageId, RoomId, SessionId, StreamId, UserId},
 };
 
 use chatt::audio::{LivePlaybackFeedback, PlaybackStreamControl};
@@ -1616,9 +1616,10 @@ impl RoomSession {
     pub(super) fn voice_started(
         &mut self,
         room_id: RoomId,
+        session_id: SessionId,
         user_id: UserId,
         stream_id: StreamId,
-        local_user: Option<UserId>,
+        local_session: Option<SessionId>,
         voice_room: Option<RoomId>,
     ) -> VoiceNotice {
         if let Some(meta) = self.metas.get_mut(&room_id) {
@@ -1641,16 +1642,17 @@ impl RoomSession {
         }
         VoiceNotice {
             display_name: self.display_name_of(user_id),
-            local: Some(user_id) == local_user,
+            local: Some(session_id) == local_session,
         }
     }
 
     pub(super) fn voice_stopped(
         &mut self,
         room_id: RoomId,
+        session_id: SessionId,
         user_id: UserId,
         stream_id: StreamId,
-        local_user: Option<UserId>,
+        local_session: Option<SessionId>,
     ) -> VoiceNotice {
         if let Some(meta) = self.metas.get_mut(&room_id) {
             meta.voice_users.remove(&user_id);
@@ -1661,7 +1663,7 @@ impl RoomSession {
         self.stream_users.remove(&stream_id.0);
         VoiceNotice {
             display_name: self.display_name_of(user_id),
-            local: Some(user_id) == local_user,
+            local: Some(session_id) == local_session,
         }
     }
 
@@ -2300,9 +2302,10 @@ mod tests {
 
         room.voice_started(
             RoomId(1),
+            SessionId(2),
             UserId(2),
             StreamId(10),
-            Some(UserId(1)),
+            Some(SessionId(1)),
             Some(RoomId(1)),
         );
 
@@ -2685,9 +2688,10 @@ mod tests {
         );
         room.voice_started(
             RoomId(1),
+            SessionId(1),
             UserId(1),
             StreamId(1),
-            Some(UserId(1)),
+            Some(SessionId(1)),
             Some(RoomId(1)),
         );
         assert!(matches!(
@@ -2704,16 +2708,18 @@ mod tests {
         );
         room.voice_started(
             RoomId(1),
+            SessionId(1),
             UserId(1),
             StreamId(1),
-            Some(UserId(1)),
+            Some(SessionId(1)),
             Some(RoomId(1)),
         );
         room.voice_started(
             RoomId(1),
+            SessionId(2),
             UserId(2),
             StreamId(2),
-            Some(UserId(1)),
+            Some(SessionId(1)),
             Some(RoomId(1)),
         );
         room.move_participant_selection(1);
@@ -2743,14 +2749,34 @@ mod tests {
         let mut room = test_room();
         enter(&mut room, Vec::new(), Vec::new(), Some(UserId(1)));
         let voice = Some(RoomId(1));
-        room.voice_started(RoomId(1), UserId(2), StreamId(10), Some(UserId(1)), voice);
-        room.voice_started(RoomId(1), UserId(2), StreamId(11), Some(UserId(1)), voice);
+        room.voice_started(
+            RoomId(1),
+            SessionId(2),
+            UserId(2),
+            StreamId(10),
+            Some(SessionId(1)),
+            voice,
+        );
+        room.voice_started(
+            RoomId(1),
+            SessionId(2),
+            UserId(2),
+            StreamId(11),
+            Some(SessionId(1)),
+            voice,
+        );
 
         let mut streams = room.stream_ids_for_user(UserId(2)).collect::<Vec<_>>();
         streams.sort_unstable();
         assert_eq!(streams, vec![10, 11]);
 
-        room.voice_stopped(RoomId(1), UserId(2), StreamId(10), Some(UserId(1)));
+        room.voice_stopped(
+            RoomId(1),
+            SessionId(2),
+            UserId(2),
+            StreamId(10),
+            Some(SessionId(1)),
+        );
         let streams = room.stream_ids_for_user(UserId(2)).collect::<Vec<_>>();
         assert_eq!(streams, vec![11]);
     }
@@ -2761,7 +2787,14 @@ mod tests {
         enter(&mut room, Vec::new(), Vec::new(), Some(UserId(1)));
         let voice = Some(RoomId(1));
 
-        room.voice_started(RoomId(2), UserId(2), StreamId(10), Some(UserId(1)), voice);
+        room.voice_started(
+            RoomId(2),
+            SessionId(2),
+            UserId(2),
+            StreamId(10),
+            Some(SessionId(1)),
+            voice,
+        );
 
         assert!(room.stream_ids_for_user(UserId(2)).next().is_none());
         assert!(
@@ -2780,13 +2813,33 @@ mod tests {
         let voice = Some(RoomId(1));
         assert!(!room.local_voice_stream_ready(Some(UserId(1))));
 
-        room.voice_started(RoomId(1), UserId(2), StreamId(10), Some(UserId(1)), voice);
+        room.voice_started(
+            RoomId(1),
+            SessionId(2),
+            UserId(2),
+            StreamId(10),
+            Some(SessionId(1)),
+            voice,
+        );
         assert!(!room.local_voice_stream_ready(Some(UserId(1))));
 
-        room.voice_started(RoomId(1), UserId(1), StreamId(11), Some(UserId(1)), voice);
+        room.voice_started(
+            RoomId(1),
+            SessionId(1),
+            UserId(1),
+            StreamId(11),
+            Some(SessionId(1)),
+            voice,
+        );
         assert!(room.local_voice_stream_ready(Some(UserId(1))));
 
-        room.voice_stopped(RoomId(1), UserId(1), StreamId(11), Some(UserId(1)));
+        room.voice_stopped(
+            RoomId(1),
+            SessionId(1),
+            UserId(1),
+            StreamId(11),
+            Some(SessionId(1)),
+        );
         assert!(!room.local_voice_stream_ready(Some(UserId(1))));
     }
 }

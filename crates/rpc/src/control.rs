@@ -206,13 +206,18 @@ pub enum ServerControl {
     Chat {
         message: ChatMessage,
     },
+    /// A session began publishing voice in the room. `session_id` is how a
+    /// client recognizes its own stream: the same user may hold several
+    /// sessions, so matching on `user_id` would adopt another device's stream.
     VoiceStarted {
         room_id: RoomId,
+        session_id: SessionId,
         user_id: UserId,
         stream_id: StreamId,
     },
     VoiceStopped {
         room_id: RoomId,
+        session_id: SessionId,
         user_id: UserId,
         stream_id: StreamId,
     },

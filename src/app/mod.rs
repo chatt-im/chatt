@@ -1890,18 +1890,20 @@ impl App {
             }
             NetworkEvent::VoiceStarted {
                 room_id,
+                session_id,
                 user_id,
                 stream_id,
             } => {
-                if Some(user_id) == self.user_id {
+                if Some(session_id) == self.session_id {
                     self.voice_room = Some(room_id);
                     self.requested_voice_room = None;
                 }
                 let notice = self.room.voice_started(
                     room_id,
+                    session_id,
                     user_id,
                     stream_id,
-                    self.user_id,
+                    self.session_id,
                     self.voice_room,
                 );
                 if self.voice_room == Some(room_id) {
@@ -1922,12 +1924,17 @@ impl App {
             }
             NetworkEvent::VoiceStopped {
                 room_id,
+                session_id,
                 user_id,
                 stream_id,
             } => {
-                let notice = self
-                    .room
-                    .voice_stopped(room_id, user_id, stream_id, self.user_id);
+                let notice = self.room.voice_stopped(
+                    room_id,
+                    session_id,
+                    user_id,
+                    stream_id,
+                    self.session_id,
+                );
                 if notice.local {
                     if self.voice_room == Some(room_id) {
                         self.clear_shares_for_voice_room(room_id);
@@ -5023,9 +5030,10 @@ mod tests {
     fn observe_room_voice(app: &mut App, user_id: UserId, stream_id: u32) {
         app.room.voice_started(
             RoomId(1),
+            SessionId(user_id.0),
             user_id,
             StreamId(stream_id),
-            app.user_id,
+            app.session_id,
             Some(RoomId(1)),
         );
     }
@@ -5341,16 +5349,19 @@ mod tests {
             None,
             app.user_id,
         );
+        app.session_id = Some(SessionId(1));
         app.voice_room = Some(RoomId(1));
         app.voice_tx_enabled.store(true, Ordering::Relaxed);
 
         app.handle_network_event(NetworkEvent::VoiceStopped {
             room_id: RoomId(1),
+            session_id: SessionId(1),
             user_id: UserId(1),
             stream_id: StreamId(10),
         });
         app.handle_network_event(NetworkEvent::VoiceStarted {
             room_id: RoomId(2),
+            session_id: SessionId(1),
             user_id: UserId(1),
             stream_id: StreamId(11),
         });
@@ -5373,6 +5384,7 @@ mod tests {
             None,
             app.user_id,
         );
+        app.session_id = Some(SessionId(1));
         app.voice_room = Some(RoomId(1));
         let available = |room_id, stream_id| NetworkEvent::ShareAvailable {
             room_id,
@@ -5395,6 +5407,7 @@ mod tests {
 
         app.handle_network_event(NetworkEvent::VoiceStopped {
             room_id: RoomId(1),
+            session_id: SessionId(1),
             user_id: UserId(1),
             stream_id: StreamId(1),
         });
