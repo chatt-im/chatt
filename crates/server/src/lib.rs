@@ -2116,7 +2116,7 @@ impl Server {
             }
         };
         if !already_active && let Some((user_id, stream_id)) = voice_started {
-            self.broadcast_voice_started(room_id, user_id, stream_id);
+            self.broadcast_voice_started(room_id, session_id, user_id, stream_id);
         }
         if let Some(token) = self.live_token_for_session(session_id) {
             self.send_existing_voice_streams_to_token(room_id, session_id, token);
@@ -2710,11 +2710,18 @@ impl Server {
         Ok((user_id, stream_id))
     }
 
-    fn broadcast_voice_started(&mut self, room_id: RoomId, user_id: UserId, stream_id: StreamId) {
+    fn broadcast_voice_started(
+        &mut self,
+        room_id: RoomId,
+        session_id: SessionId,
+        user_id: UserId,
+        stream_id: StreamId,
+    ) {
         self.broadcast_control(
             room_id,
             &ServerControl::VoiceStarted {
                 room_id,
+                session_id,
                 user_id,
                 stream_id,
             },
@@ -2751,6 +2758,7 @@ impl Server {
                 token,
                 &ServerControl::VoiceStarted {
                     room_id,
+                    session_id,
                     user_id,
                     stream_id,
                 },
@@ -2796,6 +2804,7 @@ impl Server {
             room_id,
             &ServerControl::VoiceStopped {
                 room_id,
+                session_id,
                 user_id,
                 stream_id,
             },
