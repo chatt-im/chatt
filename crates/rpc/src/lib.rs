@@ -7,4 +7,4 @@ pub mod media;
 pub mod msgref;
 pub mod video;
 
-pub const PROTOCOL_VERSION: u16 = 15;
+pub const PROTOCOL_VERSION: u16 = 16;

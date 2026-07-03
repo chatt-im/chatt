@@ -416,7 +416,6 @@ impl Server {
             udp_addr: self.config.network.public_udp_addr.clone(),
             udp_probe_addr: self.config.network.public_udp_probe_addr.clone(),
             server_public_key: encode_hex(self.server_key_pair.public_key().as_ref()),
-            room_id: self.default_room.0,
         };
         let join_string = encode_invite_ticket(&ticket)?;
         self.invites.insert(
@@ -1170,21 +1169,6 @@ impl Server {
                 | ClientControl::Pair { .. }
                 | ClientControl::OpenPair { .. },
             ) => Err("session is already authenticated".into()),
-            (
-                ConnState::Ready,
-                ClientControl::JoinRoom { .. }
-                | ClientControl::StartVoice { .. }
-                | ClientControl::StopVoice { .. },
-            ) => {
-                self.send_control_to_token(
-                    token,
-                    &ServerControl::Error {
-                        code: 400,
-                        message: "legacy room protocol is no longer supported".to_string(),
-                    },
-                )?;
-                Ok(())
-            }
             (ConnState::Ready, ClientControl::SendChat { room_id, body }) => {
                 let session_id = self.session_for_token(token)?;
                 self.send_chat(session_id, room_id, body)
@@ -1842,7 +1826,6 @@ impl Server {
                 session_id,
                 user_id,
                 rooms,
-                current_room: None,
                 users,
                 default_room: self.default_room,
             },
@@ -1850,7 +1833,6 @@ impl Server {
                 session_id,
                 user_id,
                 rooms,
-                current_room: None,
                 users,
                 default_room: self.default_room,
             },
@@ -1878,7 +1860,6 @@ impl Server {
         RoomInfo {
             room_id: room.id,
             name: room.name.clone(),
-            participants: 0,
             kind: room.access.kind(),
             head: self.store.head(room.id),
             voice_users: room
@@ -1945,7 +1926,7 @@ impl Server {
         };
         let own_token = session.tcp_token;
         let user = Self::session_user_summary(session, online);
-        let control = ServerControl::PresenceV2 { user, online };
+        let control = ServerControl::Presence { user, online };
         let tokens: Vec<Token> = self
             .sessions
             .values()
@@ -3394,7 +3375,7 @@ impl Server {
     }
 
     /// Removes a session and everything keyed to it: its voice call (with a
-    /// `VoiceStopped` broadcast), a `PresenceV2` offline broadcast, media keys,
+    /// `VoiceStopped` broadcast), a `Presence` offline broadcast, media keys,
     /// active shares, pending uploads, and peer links. Shared by the disconnect
     /// path and by the reconnect path that supersedes a user's earlier session.
     fn teardown_session(&mut self, session_id: SessionId, reason: &str) {
@@ -3787,7 +3768,7 @@ struct Session {
     p2p: Option<P2pSessionState>,
     receive_files: bool,
     file_receive_limit_bytes: u64,
-    /// Whether this session was announced with a `PresenceV2` online
+    /// Whether this session was announced with a `Presence` online
     /// broadcast; pairing throwaway connections are not, so their teardown
     /// must not broadcast a matching offline.
     announced: bool,
@@ -4212,10 +4193,7 @@ fn client_control_kind(control: &ClientControl) -> &'static str {
         ClientControl::Authenticate { .. } => "authenticate",
         ClientControl::Pair { .. } => "pair",
         ClientControl::OpenPair { .. } => "open_pair",
-        ClientControl::JoinRoom { .. } => "join_room",
         ClientControl::SendChat { .. } => "send_chat",
-        ClientControl::StartVoice { .. } => "start_voice",
-        ClientControl::StopVoice { .. } => "stop_voice",
         ClientControl::SetVoiceStatus { .. } => "set_voice_status",
         ClientControl::PublishP2p { .. } => "publish_p2p",
         ClientControl::UploadFileStart { .. } => "upload_file_start",
@@ -4246,7 +4224,6 @@ fn server_control_kind(control: &ServerControl) -> &'static str {
     match control {
         ServerControl::Authenticated { .. } => "authenticated",
         ServerControl::OpenPaired { .. } => "open_paired",
-        ServerControl::RoomJoined { .. } => "room_joined",
         ServerControl::Chat { .. } => "chat",
         ServerControl::Presence { .. } => "presence",
         ServerControl::VoiceStarted { .. } => "voice_started",
@@ -4272,7 +4249,6 @@ fn server_control_kind(control: &ServerControl) -> &'static str {
         ServerControl::RoomUpserted { .. } => "room_upserted",
         ServerControl::DmOpened { .. } => "dm_opened",
         ServerControl::HistoryChunk { .. } => "history_chunk",
-        ServerControl::PresenceV2 { .. } => "presence_v2",
     }
 }
 

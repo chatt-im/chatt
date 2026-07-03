@@ -90,18 +90,9 @@ pub enum ClientControl {
         receive_files: bool,
         file_receive_limit_bytes: u64,
     },
-    JoinRoom {
-        room_id: RoomId,
-    },
     SendChat {
         room_id: RoomId,
         body: String,
-    },
-    StartVoice {
-        room_id: RoomId,
-    },
-    StopVoice {
-        stream_id: StreamId,
     },
     SetVoiceStatus {
         status: ParticipantVoiceStatus,
@@ -194,7 +185,6 @@ pub enum ServerControl {
         session_id: SessionId,
         user_id: UserId,
         rooms: Vec<RoomInfo>,
-        current_room: Option<RoomId>,
         /// Server-wide user directory: every configured user plus online
         /// dynamic users.
         users: Vec<UserSummary>,
@@ -210,22 +200,11 @@ pub enum ServerControl {
         session_id: SessionId,
         user_id: UserId,
         rooms: Vec<RoomInfo>,
-        current_room: Option<RoomId>,
         users: Vec<UserSummary>,
         default_room: RoomId,
     },
-    RoomJoined {
-        room_id: RoomId,
-        history: Vec<ChatMessage>,
-        participants: Vec<ParticipantInfo>,
-    },
     Chat {
         message: ChatMessage,
-    },
-    Presence {
-        room_id: RoomId,
-        participant: ParticipantInfo,
-        online: bool,
     },
     VoiceStarted {
         room_id: RoomId,
@@ -340,9 +319,8 @@ pub enum ServerControl {
         /// True when the page reaches the oldest message the server retains.
         at_start: bool,
     },
-    /// Server-wide presence for one user. Replaces the per-room `Presence`
-    /// message once the legacy room protocol is removed.
-    PresenceV2 {
+    /// Server-wide presence for one user.
+    Presence {
         user: UserSummary,
         online: bool,
     },
@@ -353,7 +331,6 @@ pub enum ServerControl {
 pub struct RoomInfo {
     pub room_id: RoomId,
     pub name: String,
-    pub participants: u32,
     pub kind: RoomKind,
     /// Latest message id assigned in the room, `None` before the first
     /// message. Clients compare it against their local read watermark for
@@ -387,19 +364,6 @@ pub struct UserSummary {
     /// when offline.
     pub connected_at_ms: u64,
     pub voice_status: ParticipantVoiceStatus,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Jsony)]
-#[jsony(Binary, version)]
-pub struct ParticipantInfo {
-    pub user_id: UserId,
-    pub display_name: String,
-    pub identifier: String,
-    pub in_call: bool,
-    pub voice_status: ParticipantVoiceStatus,
-    /// Server wall-clock (UNIX ms) the participant joined the room. Lets a late
-    /// joiner render how long each participant has already been present.
-    pub joined_at_ms: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Jsony)]
@@ -546,7 +510,6 @@ pub struct InviteTicket {
     pub udp_addr: String,
     pub udp_probe_addr: Option<String>,
     pub server_public_key: String,
-    pub room_id: u32,
 }
 
 pub fn encode_client_hello(value: &ClientHello) -> Vec<u8> {
@@ -775,9 +738,6 @@ fn validate_invite_ticket(value: &InviteTicket) -> Result<(), String> {
     if let Some(addr) = &value.udp_probe_addr {
         validate_endpoint("invite UDP probe address", addr)?;
     }
-    if value.room_id == 0 {
-        return Err("invite room id must be non-zero".to_string());
-    }
     Ok(())
 }
 
@@ -961,16 +921,18 @@ mod tests {
     }
 
     #[test]
-    fn participant_info_round_trips_identifier() {
+    fn presence_round_trips_user_summary() {
         let message = ServerControl::Presence {
-            room_id: RoomId(1),
-            participant: ParticipantInfo {
+            user: UserSummary {
                 user_id: UserId(5),
                 display_name: "Alice".to_string(),
                 identifier: "alice-internal".to_string(),
-                in_call: true,
-                voice_status: ParticipantVoiceStatus::default(),
-                joined_at_ms: 0,
+                online: true,
+                connected_at_ms: 1_700_000_000_000,
+                voice_status: ParticipantVoiceStatus {
+                    muted: true,
+                    deafened: false,
+                },
             },
             online: true,
         };
@@ -1146,7 +1108,6 @@ mod tests {
             udp_probe_addr: Some("127.0.0.1:41002".to_string()),
             server_public_key: "de1235b52a8b96f16f91124a8b462d463f2af83756946effa70e842142a6d7cf"
                 .to_string(),
-            room_id: 1,
         };
 
         let encoded = encode_invite_ticket(&ticket).unwrap();
@@ -1166,12 +1127,10 @@ mod tests {
             rooms: vec![RoomInfo {
                 room_id: RoomId(1),
                 name: "lobby".to_string(),
-                participants: 1,
                 kind: RoomKind::Public,
                 head: Some(MessageId(42)),
                 voice_users: vec![UserId(4_294_967_296)],
             }],
-            current_room: Some(RoomId(1)),
             users: vec![UserSummary {
                 user_id: UserId(4_294_967_296),
                 display_name: "Zoe".to_string(),
@@ -1204,7 +1163,6 @@ mod tests {
                 room: RoomInfo {
                     room_id: RoomId(9),
                     name: "dev".to_string(),
-                    participants: 0,
                     kind,
                     head: None,
                     voice_users: Vec::new(),
@@ -1284,26 +1242,6 @@ mod tests {
         };
         let encoded = encode_server_control(&opened);
         assert_eq!(decode_server_control(&encoded).unwrap(), opened);
-    }
-
-    #[test]
-    fn presence_v2_round_trips_user_summary() {
-        let control = ServerControl::PresenceV2 {
-            user: UserSummary {
-                user_id: UserId(5),
-                display_name: "Alice".to_string(),
-                identifier: "alice-internal".to_string(),
-                online: true,
-                connected_at_ms: 1_700_000_000_000,
-                voice_status: ParticipantVoiceStatus {
-                    muted: true,
-                    deafened: false,
-                },
-            },
-            online: true,
-        };
-        let encoded = encode_server_control(&control);
-        assert_eq!(decode_server_control(&encoded).unwrap(), control);
     }
 
     #[test]
