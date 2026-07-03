@@ -197,9 +197,90 @@ body {
   gap: var(--space);
 }
 
+.message:not(.is-continuation) .message-meta {
+  padding-right: 40px;
+}
+
 .message-sender {
   color: var(--text-sender);
   font-weight: 600;
+}
+
+/* Every sender header has a persistent, full-size group control at the far
+ * right. Inward/outward list icons describe the action without relying on a
+ * small rotating disclosure arrow. */
+.message-group-toggle {
+  position: absolute;
+  top: calc(var(--space) - 3px);
+  right: var(--space-lg);
+  z-index: 2;
+  display: inline-grid;
+  place-items: center;
+  width: 32px;
+  height: 28px;
+  padding: 0;
+  color: var(--text-dim);
+  background: transparent;
+  border: 0;
+  cursor: pointer;
+  opacity: 0;
+  pointer-events: none;
+}
+
+.message-group-toggle .icon {
+  width: 20px;
+  height: 20px;
+}
+
+.message:hover .message-group-toggle,
+.message:focus-within .message-group-toggle,
+.message-group-toggle:hover,
+.message-group-toggle:focus-visible,
+.message.is-group-collapsed .message-group-toggle {
+  opacity: 1;
+  pointer-events: auto;
+}
+
+.message-group-toggle:hover,
+.message-group-toggle:focus-visible {
+  color: var(--text);
+  background: var(--accent);
+}
+
+.message-group-toggle:focus-visible {
+  outline: 1px solid var(--text-dim);
+  outline-offset: 1px;
+}
+
+.message-group-summary {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--text-dim);
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.message-group-summary::before {
+  content: "·";
+  margin-right: var(--space);
+}
+
+/* A collapsed group is one deliberately compact state row: identity and time
+ * remain, while every potentially large body or attachment is removed. */
+.message.is-group-collapsed {
+  padding-top: 6px;
+  padding-bottom: 6px;
+  background: var(--bg-elevated);
+  cursor: pointer;
+}
+
+.message.is-group-collapsed .message-time-gutter {
+  top: 6px;
+}
+
+.message.is-group-collapsed .message-group-toggle {
+  top: 3px;
 }
 
 /* The timestamp always occupies the reserved gutter as a single right-aligned
@@ -636,6 +717,11 @@ body {
   z-index: 1;
   display: flex;
   gap: 2px;
+}
+
+.message:not(.is-continuation) .message-actions {
+  top: calc(var(--space) - 3px);
+  right: calc(var(--space-lg) + 34px);
 }
 
 .message-action {

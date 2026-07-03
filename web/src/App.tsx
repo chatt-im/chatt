@@ -1,5 +1,6 @@
 import {
   batch,
+  createMemo,
   createSignal,
   createEffect,
   onCleanup,
@@ -53,9 +54,82 @@ const IMAGE_PRELOAD_SCAN_LIMIT = 24;
 const IMAGE_PRELOAD_CACHE_LIMIT = 32;
 const PREVIEW_HISTORY_LIMIT = 16;
 
-// Consecutive messages from one sender within this window collapse into a group:
+// Consecutive messages from one sender within this window form a group:
 // only the first carries the sender/time header (Discord-style).
 const GROUP_WINDOW_MS = 5 * 60 * 1000;
+
+type MessageGroupInfo = {
+  key: string;
+  continuation: boolean;
+  messageCount: number;
+  collapsed: boolean;
+};
+
+type MessageList = {
+  visible: WebMessage[];
+  groups: Map<WebMessage, MessageGroupInfo>;
+};
+
+function isMessageContinuation(
+  message: WebMessage,
+  previous: WebMessage | undefined
+): boolean {
+  return (
+    !!previous &&
+    previous.sender === message.sender &&
+    message.timestamp_ms - previous.timestamp_ms < GROUP_WINDOW_MS
+  );
+}
+
+function messageGroupKey(message: WebMessage): string {
+  return `${message.timestamp_ms}:${message.message_id}:${message.id}`;
+}
+
+// Projects the flat feed into header-led sender groups. A collapsed group keeps
+// one compact header row in the virtualizer and omits every message body.
+function buildMessageList(
+  messages: readonly WebMessage[],
+  collapsedGroups: ReadonlySet<string>
+): MessageList {
+  const visible: WebMessage[] = [];
+  const groups = new Map<WebMessage, MessageGroupInfo>();
+
+  for (let start = 0; start < messages.length; ) {
+    let end = start + 1;
+    while (
+      end < messages.length &&
+      isMessageContinuation(messages[end]!, messages[end - 1])
+    ) {
+      end++;
+    }
+
+    const header = messages[start]!;
+    const key = messageGroupKey(header);
+    const messageCount = end - start;
+    const collapsed = collapsedGroups.has(key);
+    visible.push(header);
+    groups.set(header, {
+      key,
+      continuation: false,
+      messageCount,
+      collapsed,
+    });
+
+    for (let index = start + 1; index < end; index++) {
+      const child = messages[index]!;
+      groups.set(child, {
+        key,
+        continuation: true,
+        messageCount,
+        collapsed,
+      });
+      if (!collapsed) visible.push(child);
+    }
+    start = end;
+  }
+
+  return { visible, groups };
+}
 
 // Do not flash a connection error while the initial WebSocket handshake (or a
 // quick reconnect) is still in progress.
@@ -551,22 +625,20 @@ function Attachment(props: {
 
 function MessageRow(props: {
   message: WebMessage;
-  prev?: WebMessage;
+  group: MessageGroupInfo;
+  onToggleGroup: (key: string) => void;
   onOpenPreview: (item: PreviewItem, opener: HTMLElement) => void;
   onQuoteRef?: (refCode: string) => void;
   autoplay: AutoplayMode;
 }) {
   // A continuation hides the header and shows its time only on hover, in the
-  // reserved left gutter. `prev` is supplied reactively from the message list,
-  // so prepended history re-evaluates the boundary row's grouping.
-  const continuation = () => {
-    const prev = props.prev;
-    const msg = props.message;
-    return (
-      !!prev &&
-      prev.sender === msg.sender &&
-      msg.timestamp_ms - prev.timestamp_ms < GROUP_WINDOW_MS
-    );
+  // reserved left gutter. Group metadata is projected reactively from the full
+  // feed so prepended history can still change the boundary row's grouping.
+  const continuation = () => props.group.continuation;
+  const groupLabel = () => {
+    const action = props.group.collapsed ? "Expand" : "Collapse";
+    const noun = props.group.messageCount === 1 ? "message" : "messages";
+    return `${action} ${props.group.messageCount} ${noun} from ${props.message.sender}`;
   };
   const [refCopied, setRefCopied] = createSignal(false);
   let refCopyResetTimer: number | undefined;
@@ -589,9 +661,15 @@ function MessageRow(props: {
   return (
     <div
       class="message"
-      classList={{ "is-continuation": continuation() }}
+      classList={{
+        "is-continuation": continuation(),
+        "is-group-collapsed": props.group.collapsed,
+      }}
       data-ts={props.message.timestamp_ms}
       data-mid={props.message.message_id}
+      onClick={() => {
+        if (props.group.collapsed) props.onToggleGroup(props.group.key);
+      }}
     >
       {/* The time always lives in the left gutter so it sits in one consistent
        * column: shown on a group's first row, revealed on hover for the rest. */}
@@ -601,42 +679,73 @@ function MessageRow(props: {
       <Show when={!continuation()}>
         <div class="message-meta">
           <span class="message-sender">{props.message.sender}</span>
+          <Show when={props.group.collapsed}>
+            <span class="message-group-summary">
+              {props.group.messageCount}{" "}
+              {props.group.messageCount === 1 ? "message" : "messages"} collapsed
+            </span>
+          </Show>
         </div>
+        <button
+          class="message-group-toggle"
+          type="button"
+          aria-expanded={!props.group.collapsed}
+          aria-label={groupLabel()}
+          title={
+            props.group.collapsed
+              ? "Expand message group"
+              : "Collapse message group"
+          }
+          onClick={(event) => {
+            event.stopPropagation();
+            props.onToggleGroup(props.group.key);
+          }}
+        >
+          <Icon
+            name={
+              props.group.collapsed
+                ? "list-chevrons-up-down"
+                : "list-chevrons-down-up"
+            }
+          />
+        </button>
       </Show>
-      <MessageBody fragments={props.message.fragments} />
-      <Show when={props.message.attachment}>
-        <Attachment
-          message={props.message}
-          onOpenPreview={props.onOpenPreview}
-          autoplay={props.autoplay}
-        />
-      </Show>
-      <Show when={!props.message.attachment && props.message.progress}>
-        <TransferProgressBar progress={props.message.progress!} />
-      </Show>
-      <Show when={props.message.ref_code}>
-        <div class="message-actions">
-          <Show when={props.onQuoteRef}>
+      <Show when={!props.group.collapsed}>
+        <MessageBody fragments={props.message.fragments} />
+        <Show when={props.message.attachment}>
+          <Attachment
+            message={props.message}
+            onOpenPreview={props.onOpenPreview}
+            autoplay={props.autoplay}
+          />
+        </Show>
+        <Show when={!props.message.attachment && props.message.progress}>
+          <TransferProgressBar progress={props.message.progress!} />
+        </Show>
+        <Show when={props.message.ref_code}>
+          <div class="message-actions">
+            <Show when={props.onQuoteRef}>
+              <button
+                class="message-action"
+                type="button"
+                aria-label="Quote message"
+                title="Quote"
+                onClick={() => props.onQuoteRef!(props.message.ref_code)}
+              >
+                <Icon name="corner-up-left" />
+              </button>
+            </Show>
             <button
               class="message-action"
               type="button"
-              aria-label="Quote message"
-              title="Quote"
-              onClick={() => props.onQuoteRef!(props.message.ref_code)}
+              aria-label={refCopied() ? "Copied reference" : "Copy reference"}
+              title={refCopied() ? "Copied" : "Copy reference"}
+              onClick={copyRef}
             >
-              <Icon name="corner-up-left" />
+              <Icon name={refCopied() ? "check" : "at-sign"} />
             </button>
-          </Show>
-          <button
-            class="message-action"
-            type="button"
-            aria-label={refCopied() ? "Copied reference" : "Copy reference"}
-            title={refCopied() ? "Copied" : "Copy reference"}
-            onClick={copyRef}
-          >
-            <Icon name={refCopied() ? "check" : "at-sign"} />
-          </button>
-        </div>
+          </div>
+        </Show>
       </Show>
     </div>
   );
@@ -665,6 +774,12 @@ export default function App() {
   }
 
   const [messages, setMessages] = createSignal<WebMessage[]>([]);
+  const [collapsedGroups, setCollapsedGroups] = createSignal<
+    ReadonlySet<string>
+  >(new Set());
+  const messageList = createMemo(() =>
+    buildMessageList(messages(), collapsedGroups())
+  );
   const [refToast, setRefToast] = createSignal<string | null>(null);
   const [connected, setConnected] = createSignal(false);
   const [connectionErrorVisible, setConnectionErrorVisible] =
@@ -1033,6 +1148,15 @@ export default function App() {
     );
   }
 
+  function toggleMessageGroup(key: string) {
+    setCollapsedGroups((current) => {
+      const next = new Set(current);
+      if (next.has(key)) next.delete(key);
+      else next.add(key);
+      return next;
+    });
+  }
+
   function flashMessage(ts: number, mid: number) {
     const row = logEl?.querySelector(
       `.message[data-ts="${ts}"][data-mid="${mid}"]`
@@ -1049,9 +1173,30 @@ export default function App() {
     detachForRefJump();
     holdRefJump(1200);
     suppressProgrammaticScroll(1200);
-    handle?.scrollToIndex(index, { align: "center" });
-    // The row mounts as the virtualizer approaches it; flash once it settles.
-    window.setTimeout(() => flashMessage(ts, mid), 350);
+    const target = messages()[index];
+    if (!target) return;
+
+    const group = messageList().groups.get(target);
+    const groupKeyToExpand = group?.collapsed ? group.key : null;
+    if (groupKeyToExpand) {
+      setCollapsedGroups((current) => {
+        const next = new Set(current);
+        next.delete(groupKeyToExpand);
+        return next;
+      });
+    }
+
+    const scroll = () => {
+      const visibleIndex = messageList().visible.indexOf(target);
+      if (visibleIndex < 0) return;
+      handle?.scrollToIndex(visibleIndex, { align: "center" });
+      // The row mounts as the virtualizer approaches it; flash once it settles.
+      window.setTimeout(() => flashMessage(ts, mid), 350);
+    };
+
+    // Let the virtualizer register restored child rows before addressing one.
+    if (groupKeyToExpand) requestAnimationFrame(scroll);
+    else scroll();
   }
 
   function jumpToRef(ts: number, mid: number) {
@@ -1927,16 +2072,17 @@ export default function App() {
               <Virtualizer
                 ref={(h) => (handle = h)}
                 scrollRef={logEl}
-                data={messages()}
+                data={messageList().visible}
                 endMargin={CHAT_END_MARGIN_PX}
                 shift={prepend()}
                 onScroll={onScroll}
                 onScrollEnd={onScrollEnd}
               >
-                {(message, index) => (
+                {(message) => (
                   <MessageRow
                     message={message}
-                    prev={messages()[index() - 1]}
+                    group={messageList().groups.get(message)!}
+                    onToggleGroup={toggleMessageGroup}
                     onOpenPreview={openPreview}
                     onQuoteRef={readonly() ? undefined : quoteRef}
                     autoplay={message.autoplay ?? "disabled"}
