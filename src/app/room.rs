@@ -1,4 +1,7 @@
-use std::collections::{BTreeMap, VecDeque};
+use std::{
+    collections::{BTreeMap, VecDeque},
+    time::Instant,
+};
 
 use hashbrown::{HashMap, HashSet};
 
@@ -111,6 +114,11 @@ struct ClientRoom {
     transfers: HashMap<FileTransferId, TransferProgress>,
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+struct RoomParticipantPresence {
+    away_since: Option<Instant>,
+}
+
 pub(crate) struct RoomSession {
     pub server_alias: String,
     /// Stable per-server storage id for history, independent of the mutable
@@ -145,6 +153,11 @@ pub(crate) struct RoomSession {
     metas: BTreeMap<RoomId, RoomMeta>,
     /// Buffered state of rooms other than the viewed one.
     parked: HashMap<RoomId, ClientRoom>,
+    /// Users this client process has actually shown or observed in each room.
+    /// Offline entries render only when they carry a real observed-away
+    /// timestamp, so the lobby cannot invent "away for 0s" rows from the server
+    /// directory.
+    participant_presence: HashMap<RoomId, HashMap<UserId, RoomParticipantPresence>>,
     /// Rooms omitted by the latest authenticated snapshot. They remain
     /// available as local history whenever the client is offline.
     archived_metas: BTreeMap<RoomId, RoomMeta>,
@@ -429,6 +442,7 @@ impl RoomSession {
             files: std::collections::HashMap::new(),
             metas: BTreeMap::new(),
             parked: HashMap::new(),
+            participant_presence: HashMap::new(),
             archived_metas: BTreeMap::new(),
             archived_rooms: HashMap::new(),
             viewed_room: None,
@@ -502,6 +516,7 @@ impl RoomSession {
         history_id: String,
         local_user_name: String,
     ) {
+        let same_server = !history_id.is_empty() && self.history_id == history_id;
         self.clear_active_room_state();
         self.server_alias = server_alias;
         self.history_id = history_id;
@@ -509,6 +524,9 @@ impl RoomSession {
         self.room_name = "lobby".to_string();
         self.metas.clear();
         self.parked.clear();
+        if !same_server {
+            self.participant_presence.clear();
+        }
         self.archived_metas.clear();
         self.archived_rooms.clear();
         self.users.clear();
@@ -530,6 +548,7 @@ impl RoomSession {
         self.room_name = "servers".to_string();
         self.metas.clear();
         self.parked.clear();
+        self.participant_presence.clear();
         self.archived_metas.clear();
         self.archived_rooms.clear();
         self.users.clear();
@@ -558,6 +577,15 @@ impl RoomSession {
     pub(crate) fn reset_for_disconnect(&mut self) {
         self.restore_archived_rooms();
         self.stream_users.clear();
+        let disconnected_at = Instant::now();
+        let users = &self.users;
+        for room in self.participant_presence.values_mut() {
+            for (user_id, presence) in room {
+                if users.get(user_id).is_some_and(|user| user.online) {
+                    presence.away_since.get_or_insert(disconnected_at);
+                }
+            }
+        }
         for user in self.users.values_mut() {
             user.online = false;
             user.connected_at_ms = 0;
@@ -631,6 +659,9 @@ impl RoomSession {
                     },
                 );
             }
+        }
+        for user_id in &info.voice_users {
+            self.mark_participant_online_in_room(info.room_id, *user_id);
         }
     }
 
@@ -1162,9 +1193,55 @@ impl RoomSession {
         matches.next().is_none().then_some(first.user_id)
     }
 
+    fn mark_participant_online_in_room(&mut self, room_id: RoomId, user_id: UserId) {
+        self.participant_presence
+            .entry(room_id)
+            .or_default()
+            .entry(user_id)
+            .or_default()
+            .away_since = None;
+    }
+
+    fn mark_participant_online_in_seen_rooms(&mut self, user_id: UserId) {
+        for room in self.participant_presence.values_mut() {
+            if let Some(presence) = room.get_mut(&user_id) {
+                presence.away_since = None;
+            }
+        }
+    }
+
+    fn mark_participant_away_in_seen_rooms(&mut self, user_id: UserId, away_since: Instant) {
+        for room in self.participant_presence.values_mut() {
+            if let Some(presence) = room.get_mut(&user_id) {
+                presence.away_since.get_or_insert(away_since);
+            }
+        }
+    }
+
+    fn participant_seen_in_room(&self, room_id: RoomId, user_id: UserId) -> bool {
+        self.participant_presence
+            .get(&room_id)
+            .is_some_and(|room| room.contains_key(&user_id))
+    }
+
+    fn participant_away_since(&self, room_id: RoomId, user_id: UserId) -> Option<Instant> {
+        self.participant_presence
+            .get(&room_id)
+            .and_then(|room| room.get(&user_id))
+            .and_then(|presence| presence.away_since)
+    }
+
+    fn user_belongs_to_room_kind(user_id: UserId, kind: &ClientRoomKind) -> bool {
+        match kind {
+            ClientRoomKind::Public => true,
+            ClientRoomKind::Private { members } => members.contains(&user_id),
+            ClientRoomKind::Dm { user_a, user_b } => user_id == *user_a || user_id == *user_b,
+        }
+    }
+
     /// Rebuilds the viewed room's roster from the user directory and the
-    /// room's kind: private/DM rooms show their member set, public rooms show
-    /// everyone known.
+    /// room's kind. Offline users are shown only after this client process has
+    /// actually observed them in this room and recorded a real away timestamp.
     pub(crate) fn rebuild_roster(&mut self) {
         let Some(room_id) = self.viewed_room else {
             self.participants.replace_room(Vec::new());
@@ -1173,21 +1250,39 @@ impl RoomSession {
         let Some(meta) = self.metas.get(&room_id) else {
             return;
         };
+        let kind = meta.kind.clone();
+        let voice_users = meta.voice_users.clone();
         let seeds: Vec<RosterSeed> = self
             .users
             .values()
-            .filter(|user| match &meta.kind {
-                ClientRoomKind::Public => true,
-                ClientRoomKind::Private { members } => members.contains(&user.user_id),
-                ClientRoomKind::Dm { user_a, user_b } => {
-                    user.user_id == *user_a || user.user_id == *user_b
+            .filter_map(|user| {
+                if !Self::user_belongs_to_room_kind(user.user_id, &kind) {
+                    return None;
                 }
-            })
-            .map(|user| RosterSeed {
-                user: user.clone(),
-                in_call: meta.voice_users.contains(&user.user_id),
+                if !self.participant_seen_in_room(room_id, user.user_id) {
+                    return None;
+                }
+                let in_call = voice_users.contains(&user.user_id);
+                let away_since = self.participant_away_since(room_id, user.user_id);
+                if !user.online && !in_call && away_since.is_none() {
+                    return None;
+                }
+                let mut user = user.clone();
+                if in_call {
+                    user.online = true;
+                }
+                Some(RosterSeed {
+                    user,
+                    in_call,
+                    away_since,
+                })
             })
             .collect();
+        for seed in &seeds {
+            if seed.user.online {
+                self.mark_participant_online_in_room(room_id, seed.user.user_id);
+            }
+        }
         self.participants.replace_room(seeds);
     }
 
@@ -1255,6 +1350,7 @@ impl RoomSession {
     ) -> Option<RoomChatUpdate> {
         let local = Some(message.sender) == local_user;
         let room_id = message.room_id;
+        let sender = message.sender;
         if let Some(meta) = self.metas.get_mut(&room_id) {
             meta.head = Some(message.message_id).max(meta.head);
         }
@@ -1278,6 +1374,7 @@ impl RoomSession {
                 if let Some(store) = &mut self.history {
                     store.append_message(&message);
                 }
+                self.mark_participant_online_in_room(room_id, sender);
                 self.participants.note_message(&message);
                 self.messages.push(message.clone());
                 trim_messages(&mut self.messages, self.max_messages);
@@ -1315,6 +1412,9 @@ impl RoomSession {
                 false
             }
         };
+        if fresh {
+            self.mark_participant_online_in_room(room_id, sender);
+        }
         if fresh
             && !local
             && let Some(meta) = self.metas.get_mut(&room_id)
@@ -1464,8 +1564,8 @@ impl RoomSession {
         self.chat.bottom();
     }
 
-    /// Applies a server-wide presence update to the user directory and, when
-    /// the user belongs to the viewed room's roster, to the visible roster.
+    /// Applies a server-wide presence update to the user directory and to rooms
+    /// where this client process has already observed the user.
     pub(super) fn presence_changed(
         &mut self,
         user: rpc::control::UserSummary,
@@ -1477,21 +1577,32 @@ impl RoomSession {
         let display_name = user.display_name.clone();
         let local = Some(user.user_id) == local_user;
         let user_id = user.user_id;
+        if online {
+            self.mark_participant_online_in_seen_rooms(user_id);
+        } else {
+            self.mark_participant_away_in_seen_rooms(user_id, Instant::now());
+        }
         self.users.insert(user_id, user.clone());
-        let in_roster = self
-            .viewed_room
-            .and_then(|room_id| self.metas.get(&room_id))
-            .is_some_and(|meta| match &meta.kind {
-                ClientRoomKind::Public => true,
-                ClientRoomKind::Private { members } => members.contains(&user_id),
-                ClientRoomKind::Dm { user_a, user_b } => user_id == *user_a || user_id == *user_b,
-            });
-        if in_roster {
+        if let Some(room_id) = self.viewed_room
+            && self
+                .metas
+                .get(&room_id)
+                .is_some_and(|meta| Self::user_belongs_to_room_kind(user_id, &meta.kind))
+            && self.participant_seen_in_room(room_id, user_id)
+        {
             let in_call = self
-                .viewed_room
-                .and_then(|room_id| self.metas.get(&room_id))
+                .metas
+                .get(&room_id)
                 .is_some_and(|meta| meta.voice_users.contains(&user_id));
-            self.participants.upsert(RosterSeed { user, in_call });
+            self.participants.upsert(RosterSeed {
+                user,
+                in_call,
+                away_since: if online {
+                    None
+                } else {
+                    self.participant_away_since(room_id, user_id)
+                },
+            });
         }
         ParticipantNotice {
             display_name,
@@ -1513,10 +1624,19 @@ impl RoomSession {
         if let Some(meta) = self.metas.get_mut(&room_id) {
             meta.voice_users.insert(user_id);
         }
+        self.mark_participant_online_in_room(room_id, user_id);
         if voice_room == Some(room_id) {
             self.stream_users.insert(stream_id.0, user_id);
         }
         if self.viewed_room == Some(room_id) {
+            if let Some(mut user) = self.users.get(&user_id).cloned() {
+                user.online = true;
+                self.participants.upsert(RosterSeed {
+                    user,
+                    in_call: true,
+                    away_since: None,
+                });
+            }
             self.participants.voice_started(user_id, stream_id);
         }
         VoiceNotice {
@@ -1550,7 +1670,12 @@ impl RoomSession {
     }
 
     pub(super) fn peer_transport_changed(&mut self, user_id: UserId, direct: bool) {
-        self.participants.set_peer_transport(user_id, direct);
+        if self
+            .viewed_room
+            .is_some_and(|room_id| self.participant_seen_in_room(room_id, user_id))
+        {
+            self.participants.set_peer_transport(user_id, direct);
+        }
     }
 
     pub(super) fn peer_rtt(&mut self, user_id: UserId, rtt_ms: Option<u16>) {
@@ -1562,13 +1687,22 @@ impl RoomSession {
         if let Some(user) = self.users.get_mut(&user_id) {
             user.voice_status = status;
         }
-        self.participants.set_voice_status(user_id, status);
+        if self
+            .viewed_room
+            .is_some_and(|room_id| self.participant_seen_in_room(room_id, user_id))
+        {
+            self.participants.set_voice_status(user_id, status);
+        }
     }
 
     /// Whether a user is currently muted/deafened per the last control-stream
     /// voice status, used to seed a newly started stream's sender-mute fallback.
     pub(super) fn voice_muted(&self, user_id: UserId) -> bool {
         self.participants.voice_muted(user_id)
+            || self
+                .users
+                .get(&user_id)
+                .is_some_and(|user| user.voice_status.normalized().muted)
     }
 
     pub(super) fn update_talking_display(
@@ -1865,6 +1999,12 @@ mod tests {
         }
     }
 
+    fn offline_user(user_id: UserId, name: &str) -> UserSummary {
+        let mut user = user(user_id, name);
+        user.online = false;
+        user
+    }
+
     fn room_info(id: u32) -> RoomInfo {
         RoomInfo {
             room_id: RoomId(id),
@@ -2143,6 +2283,61 @@ mod tests {
     }
 
     #[test]
+    fn auth_roster_hides_directory_users_until_room_observed() {
+        let mut room = test_room();
+        enter(
+            &mut room,
+            vec![
+                user(UserId(1), "alice"),
+                user(UserId(2), "bob"),
+                offline_user(UserId(3), "carol"),
+            ],
+            Vec::new(),
+            Some(UserId(1)),
+        );
+
+        assert!(room.participants.entries.is_empty());
+
+        room.voice_started(
+            RoomId(1),
+            UserId(2),
+            StreamId(10),
+            Some(UserId(1)),
+            Some(RoomId(1)),
+        );
+
+        assert_eq!(room.participants.entries.len(), 1);
+        assert_eq!(room.participants.entries[0].display_name(), "bob");
+        assert!(room.participants.entries[0].online);
+    }
+
+    #[test]
+    fn away_rows_require_an_observed_transition_in_that_room() {
+        let mut room = test_room();
+        enter(
+            &mut room,
+            vec![
+                user(UserId(1), "alice"),
+                user(UserId(2), "bob"),
+                offline_user(UserId(3), "carol"),
+            ],
+            Vec::new(),
+            Some(UserId(1)),
+        );
+
+        room.chat_received(message(1, UserId(2), "seen here"), Some(UserId(1)));
+        room.presence_changed(offline_user(UserId(2), "bob"), false, Some(UserId(1)));
+
+        assert_eq!(room.participants.entries.len(), 1);
+        assert_eq!(room.participants.entries[0].display_name(), "bob");
+        assert!(!room.participants.entries[0].online);
+        assert!(room.participants.entries[0].presence_since.is_some());
+
+        assert!(room.set_viewed_room(RoomId(2), Some(UserId(1))));
+        assert!(room.participants.entries.is_empty());
+    }
+
+    #[test]
     fn voice_status_survives_roster_rebuilds() {
         let mut room = test_room();
         enter(
@@ -2371,7 +2566,8 @@ mod tests {
         );
 
         assert_eq!(room.room_name, "renamed");
-        assert_eq!(room.participants.entries.len(), 2);
+        assert_eq!(room.participants.entries.len(), 1);
+        assert_eq!(room.participants.entries[0].display_name(), "alice");
         assert!(room.chat.message(0).local);
     }
 
@@ -2487,6 +2683,13 @@ mod tests {
             Vec::new(),
             Some(UserId(1)),
         );
+        room.voice_started(
+            RoomId(1),
+            UserId(1),
+            StreamId(1),
+            Some(UserId(1)),
+            Some(RoomId(1)),
+        );
         assert!(matches!(
             room.selected_remote_user(Some(UserId(1))),
             Err(UserSelectionError::LocalUser)
@@ -2498,6 +2701,20 @@ mod tests {
             vec![user(UserId(1), "alice"), user(UserId(2), "bob")],
             Vec::new(),
             Some(UserId(1)),
+        );
+        room.voice_started(
+            RoomId(1),
+            UserId(1),
+            StreamId(1),
+            Some(UserId(1)),
+            Some(RoomId(1)),
+        );
+        room.voice_started(
+            RoomId(1),
+            UserId(2),
+            StreamId(2),
+            Some(UserId(1)),
+            Some(RoomId(1)),
         );
         room.move_participant_selection(1);
         let selected = room

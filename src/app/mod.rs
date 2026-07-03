@@ -5020,6 +5020,16 @@ mod tests {
         );
     }
 
+    fn observe_room_voice(app: &mut App, user_id: UserId, stream_id: u32) {
+        app.room.voice_started(
+            RoomId(1),
+            user_id,
+            StreamId(stream_id),
+            app.user_id,
+            Some(RoomId(1)),
+        );
+    }
+
     fn enter_test_room(app: &mut App) {
         enter_room_with_users(app, Vec::new());
     }
@@ -5746,6 +5756,8 @@ mod tests {
                 user_summary(UserId(2), "bob"),
             ],
         );
+        observe_room_voice(&mut app, UserId(1), 1);
+        observe_room_voice(&mut app, UserId(2), 2);
         app.room.move_participant_selection(1);
 
         let mut h = Harness::new(app);
@@ -5795,6 +5807,8 @@ mod tests {
                 user_summary(UserId(2), "bob"),
             ],
         );
+        observe_room_voice(&mut app, UserId(1), 1);
+        observe_room_voice(&mut app, UserId(2), 2);
         app.room.move_participant_selection(1);
 
         let mut h = Harness::new(app);
