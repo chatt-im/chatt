@@ -1,13 +1,22 @@
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use rpc::{
-    control::{ChatMessage, ParticipantInfo, ParticipantVoiceStatus},
+    control::{ChatMessage, ParticipantVoiceStatus, UserSummary},
     ids::{StreamId, UserId},
 };
 
 use chatt::audio::LivePlaybackFeedback;
 
 const UNKNOWN_NAME: &str = "…";
+
+/// One row's worth of directory + room facts used to (re)build the roster: the
+/// server-wide user summary plus whether the user is in the viewed room's
+/// voice call.
+#[derive(Clone, Debug)]
+pub(crate) struct RosterSeed {
+    pub(crate) user: UserSummary,
+    pub(crate) in_call: bool,
+}
 
 #[derive(Clone, Debug)]
 pub(crate) struct ParticipantState {
@@ -91,11 +100,14 @@ fn instant_from_server_ms(joined_at_ms: u64) -> Instant {
 }
 
 impl Participants {
-    pub(crate) fn replace_room(&mut self, participants: Vec<ParticipantInfo>) {
+    /// Rebuilds the roster for a newly viewed room, keeping the transient
+    /// voice display state (streams, feedback, talking) of users that remain.
+    pub(crate) fn replace_room(&mut self, seeds: Vec<RosterSeed>) {
         let selected_user = self.selected_user;
-        self.entries.clear();
-        for participant in participants {
-            self.upsert(participant, true);
+        self.entries
+            .retain(|entry| seeds.iter().any(|seed| seed.user.user_id == entry.user_id));
+        for seed in seeds {
+            self.upsert(seed);
         }
         self.sort();
         self.selected_user = selected_user.filter(|user_id| self.contains_user(*user_id));
@@ -103,24 +115,26 @@ impl Participants {
         self.scroll = 0;
     }
 
-    pub(crate) fn upsert(&mut self, participant: ParticipantInfo, online: bool) {
+    pub(crate) fn upsert(&mut self, seed: RosterSeed) {
+        let RosterSeed { user, in_call } = seed;
+        let online = user.online;
         if let Some(existing) = self
             .entries
             .iter_mut()
-            .find(|entry| entry.user_id == participant.user_id)
+            .find(|entry| entry.user_id == user.user_id)
         {
             let was_online = existing.online;
-            existing.name = Some(participant.display_name);
-            existing.identifier = Some(participant.identifier);
+            existing.name = Some(user.display_name);
+            existing.identifier = Some(user.identifier);
             existing.online = online;
-            existing.voice_active = participant.in_call;
-            existing.voice_status = participant.voice_status.normalized();
+            existing.voice_active = in_call;
+            existing.voice_status = user.voice_status.normalized();
             if online {
-                existing.presence_since = Some(instant_from_server_ms(participant.joined_at_ms));
+                existing.presence_since = Some(instant_from_server_ms(user.connected_at_ms));
             } else if was_online {
                 existing.presence_since = Some(Instant::now());
             }
-            if !online || !participant.in_call || existing.voice_status.muted {
+            if !online || !in_call || existing.voice_status.muted {
                 existing.p2p_direct = false;
                 existing.voice_feedback = None;
                 existing.peer_rtt_ms = None;
@@ -129,18 +143,18 @@ impl Participants {
                 existing.last_talking_at = None;
             }
         } else {
-            let voice_status = participant.voice_status.normalized();
+            let voice_status = user.voice_status.normalized();
             let presence_since = Some(if online {
-                instant_from_server_ms(participant.joined_at_ms)
+                instant_from_server_ms(user.connected_at_ms)
             } else {
                 Instant::now()
             });
             self.entries.push(ParticipantState {
-                user_id: participant.user_id,
-                name: Some(participant.display_name),
-                identifier: Some(participant.identifier),
+                user_id: user.user_id,
+                name: Some(user.display_name),
+                identifier: Some(user.identifier),
                 online,
-                voice_active: participant.in_call,
+                voice_active: in_call,
                 voice_status,
                 talking_display: false,
                 last_talking_at: None,
@@ -156,8 +170,11 @@ impl Participants {
         self.ensure_selection();
     }
 
-    pub(crate) fn set_presence(&mut self, participant: ParticipantInfo, online: bool) {
-        self.upsert(participant, online);
+    /// Removes a user that is no longer part of the viewed room's roster.
+    #[allow(dead_code)]
+    pub(crate) fn remove_user(&mut self, user_id: UserId) {
+        self.entries.retain(|entry| entry.user_id != user_id);
+        self.ensure_selection();
     }
 
     pub(crate) fn note_message(&mut self, message: &ChatMessage) {
@@ -422,14 +439,17 @@ impl Participants {
 mod tests {
     use super::*;
 
-    fn participant(user_id: UserId) -> ParticipantInfo {
-        ParticipantInfo {
-            user_id,
-            display_name: format!("user-{}", user_id.0),
-            identifier: format!("id-{}", user_id.0),
+    fn participant(user_id: UserId) -> RosterSeed {
+        RosterSeed {
+            user: UserSummary {
+                user_id,
+                display_name: format!("user-{}", user_id.0),
+                identifier: format!("id-{}", user_id.0),
+                online: true,
+                connected_at_ms: 0,
+                voice_status: ParticipantVoiceStatus::default(),
+            },
             in_call: true,
-            voice_status: ParticipantVoiceStatus::default(),
-            joined_at_ms: 0,
         }
     }
 
@@ -533,11 +553,11 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .map_or(0, |elapsed| elapsed.as_millis() as u64);
         let mut info = participant(UserId(1));
-        info.joined_at_ms = now_ms.saturating_sub(3_600_000);
+        info.user.connected_at_ms = now_ms.saturating_sub(3_600_000);
 
         // An online participant who joined an hour ago reads as ~1h, even though
         // we only just learned about them.
-        participants.upsert(info.clone(), true);
+        participants.upsert(info.clone());
         let online_age = participants.entries[0]
             .presence_since
             .expect("online sets presence_since")
@@ -549,7 +569,9 @@ mod tests {
         );
 
         // Going away restarts the timer from roughly zero.
-        participants.upsert(info, false);
+        let mut info = info;
+        info.user.online = false;
+        participants.upsert(info);
         let away_age = participants.entries[0]
             .presence_since
             .expect("away keeps presence_since")
@@ -594,7 +616,7 @@ mod tests {
         assert_eq!(participants.entries[0].name, None);
         assert_eq!(participants.entries[0].display_name(), UNKNOWN_NAME);
 
-        participants.set_presence(participant(UserId(7)), true);
+        participants.upsert(participant(UserId(7)));
         assert_eq!(participants.entries[0].display_name(), "user-7");
     }
 
@@ -602,8 +624,8 @@ mod tests {
     fn authoritative_name_starting_with_user_is_preserved() {
         let mut participants = Participants::default();
         let mut info = participant(UserId(3));
-        info.display_name = "user friend".to_string();
-        participants.set_presence(info, true);
+        info.user.display_name = "user friend".to_string();
+        participants.upsert(info);
         participants.voice_started(UserId(3), StreamId(9));
         assert_eq!(participants.entries[0].display_name(), "user friend");
     }

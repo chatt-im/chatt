@@ -32,9 +32,9 @@ use rpc::{
         ERROR_PAIRING_INVALID_REQUEST, ERROR_PAIRING_NOT_ACTIVE, ERROR_PASSWORD_MISMATCH,
         ERROR_PASSWORD_REQUIRED, ERROR_PUBLIC_DISABLED, ERROR_TOKEN_STALE_EPOCH,
         FileContentEncoding, FileMetadata, MAX_FILE_CHUNK_BYTES, MAX_FILE_NAME_BYTES, P2pCandidate,
-        P2pCandidateKind, P2pKey, P2pNatKind, P2pPeerInfo, P2pRole, ParticipantInfo,
-        ParticipantVoiceStatus, RoomInfo, ServerControl, decode_server_control,
-        decode_server_hello, encode_client_control, encode_client_hello, max_file_wire_bytes,
+        P2pCandidateKind, P2pKey, P2pNatKind, P2pPeerInfo, P2pRole, ParticipantVoiceStatus,
+        RoomInfo, ServerControl, UserSummary, decode_server_control, decode_server_hello,
+        encode_client_control, encode_client_hello, max_file_wire_bytes,
     },
     crypto::{
         AntiReplay, CHANNEL_CONTROL, ControlTransport, HandshakeMode, KEY_LEN, KeyMaterial,
@@ -42,7 +42,7 @@ use rpc::{
         ed25519_public_key_from_hex, encode_hex, generate_client_hello,
     },
     frame,
-    ids::{BugReportId, FileTransferId, RoomId, SessionId, StreamId, UserId},
+    ids::{BugReportId, FileTransferId, MessageId, RoomId, SessionId, StreamId, UserId},
     media::{self, MediaPayload, VoicePayload as MediaVoicePayload},
 };
 
@@ -141,7 +141,6 @@ pub struct ClientConfig {
     pub display_name: String,
     pub token: String,
     pub server_public_key: Option<String>,
-    pub room_id: RoomId,
     pub file_receive_dir: Option<PathBuf>,
     pub max_upload_bytes: u64,
     pub max_receive_bytes: u64,
@@ -180,8 +179,24 @@ impl UploadFileRequest {
 
 #[derive(Debug)]
 pub enum NetworkCommand {
-    SendChat(String),
+    SendChat {
+        room_id: RoomId,
+        body: String,
+    },
     UploadFile(UploadFileRequest),
+    /// Tells the worker which room the client is viewing, the target for
+    /// uploads injected outside the app thread (`chatt upload`, web sends
+    /// without a room).
+    SetActiveRoom(RoomId),
+    /// Joins the room's voice call, leaving any current one.
+    JoinVoice(RoomId),
+    LeaveVoice,
+    FetchHistory {
+        room_id: RoomId,
+        before: Option<MessageId>,
+        limit: u16,
+    },
+    OpenDm(UserId),
     LocalVoicePacket(LocalVoiceFrame),
     SequencedLocalVoicePacket {
         sequence: u32,
@@ -228,11 +243,21 @@ pub enum NetworkEvent {
         session_id: SessionId,
         user_id: UserId,
         rooms: Vec<RoomInfo>,
+        users: Vec<UserSummary>,
+        default_room: RoomId,
     },
-    RoomJoined {
+    /// A room appeared or changed shape (today: DM creation).
+    RoomUpserted(RoomInfo),
+    /// Reply to an [`NetworkCommand::OpenDm`] naming the DM room.
+    DmOpened {
         room_id: RoomId,
-        history: Vec<ChatMessage>,
-        participants: Vec<ParticipantInfo>,
+        peer: UserId,
+    },
+    /// One page of server-retained history for a room.
+    HistoryChunk {
+        room_id: RoomId,
+        messages: Vec<ChatMessage>,
+        at_start: bool,
     },
     Chat(ChatMessage),
     FileReceived {
@@ -259,16 +284,18 @@ pub enum NetworkEvent {
     TransferCanceled {
         transfer_id: FileTransferId,
     },
+    /// Server-wide presence for one user.
     Presence {
-        room_id: RoomId,
-        participant: ParticipantInfo,
+        user: UserSummary,
         online: bool,
     },
     VoiceStarted {
+        room_id: RoomId,
         user_id: UserId,
         stream_id: StreamId,
     },
     VoiceStopped {
+        room_id: RoomId,
         user_id: UserId,
         stream_id: StreamId,
     },
@@ -397,8 +424,7 @@ impl NetworkClient {
             "network client spawning",
             display_name = config.display_name.as_str(),
             tcp_addr = %config.tcp_addr,
-            udp_addr = %config.udp_addr,
-            room_id = config.room_id.0
+            udp_addr = %config.udp_addr
         );
         let poll = Poll::new().map_err(|error| format!("failed to create poll: {error}"))?;
         let waker = Waker::new(poll.registry(), WAKE)
@@ -626,8 +652,7 @@ fn run_worker(
         "network worker starting",
         display_name = config.display_name.as_str(),
         tcp_addr = %config.tcp_addr,
-        udp_addr = %config.udp_addr,
-        room_id = config.room_id.0
+        udp_addr = %config.udp_addr
     );
     let mut reconnect = ReconnectSchedule::new();
     loop {
@@ -732,7 +757,8 @@ fn run_worker_inner(
         secrets,
         session_id: None,
         user_id: None,
-        room_id: None,
+        active_room: None,
+        voice_room: None,
         active_stream: None,
         local_sequence: 0,
         voice_timestamp: VoiceTimestampRebaser::default(),
@@ -1266,7 +1292,12 @@ struct WorkerState {
     server_udp_probe_addr: Option<SocketAddr>,
     session_id: Option<SessionId>,
     user_id: Option<UserId>,
-    room_id: Option<RoomId>,
+    /// The room the app is viewing, target for uploads injected outside the
+    /// app thread. Set by [`NetworkCommand::SetActiveRoom`].
+    active_room: Option<RoomId>,
+    /// The room whose voice call this client is in, target for screen shares
+    /// and P2P publication.
+    voice_room: Option<RoomId>,
     active_stream: Option<StreamId>,
     local_sequence: u32,
     voice_timestamp: VoiceTimestampRebaser,
@@ -2441,8 +2472,7 @@ impl WorkerState {
             );
         }
         match command {
-            NetworkCommand::SendChat(body) => {
-                let room_id = self.room_id.unwrap_or(self.config.room_id);
+            NetworkCommand::SendChat { room_id, body } => {
                 kvlog::info!(
                     "send chat command handling",
                     room_id = room_id.0,
@@ -2452,6 +2482,31 @@ impl WorkerState {
             }
             NetworkCommand::UploadFile(request) => {
                 self.queue_file_upload(request);
+            }
+            NetworkCommand::SetActiveRoom(room_id) => {
+                self.active_room = Some(room_id);
+            }
+            NetworkCommand::JoinVoice(room_id) => {
+                self.voice_room = Some(room_id);
+                self.queue_control(ClientControl::JoinVoice { room_id })?;
+            }
+            NetworkCommand::LeaveVoice => {
+                self.voice_room = None;
+                self.queue_control(ClientControl::LeaveVoice)?;
+            }
+            NetworkCommand::FetchHistory {
+                room_id,
+                before,
+                limit,
+            } => {
+                self.queue_control(ClientControl::FetchHistory {
+                    room_id,
+                    before,
+                    limit,
+                })?;
+            }
+            NetworkCommand::OpenDm(user_id) => {
+                self.queue_control(ClientControl::OpenDm { user_id })?;
             }
             NetworkCommand::SetUploadRate(rate) => {
                 self.upload_throttle.set_rate(rate);
@@ -2532,7 +2587,12 @@ impl WorkerState {
                 annexb,
                 extradata,
             } => {
-                let room_id = self.room_id.unwrap_or(self.config.room_id);
+                let Some(room_id) = self.voice_room else {
+                    let _ = self.events.send(NetworkEvent::Error(
+                        "join a voice call before sharing".to_string(),
+                    ));
+                    return Ok(());
+                };
                 self.queue_control(ClientControl::StartShare {
                     room_id,
                     codec,
@@ -2716,10 +2776,13 @@ impl WorkerState {
         );
         let transfer_id = FileTransferId(self.next_file_transfer);
         self.next_file_transfer = self.next_file_transfer.wrapping_add(1).max(1);
+        let room_id = self
+            .active_room
+            .ok_or_else(|| "no active room for upload".to_string())?;
         Ok(OutgoingUpload {
             transfer_id,
             server_metadata: None,
-            room_id: self.room_id.unwrap_or(self.config.room_id),
+            room_id,
             name,
             size,
             file,
@@ -3346,57 +3409,40 @@ impl WorkerState {
                 session_id,
                 user_id,
                 rooms,
-                current_room,
+                users,
+                default_room,
                 ..
             } => {
                 self.session_id = Some(session_id);
                 self.user_id = Some(user_id);
-                self.room_id = current_room;
+                self.active_room = Some(default_room);
+                self.online_others = users
+                    .iter()
+                    .filter(|user| user.online && Some(user.user_id) != Some(user_id))
+                    .map(|user| user.user_id)
+                    .collect();
+                self.room_server_rtts.clear();
                 kvlog::info!(
                     "client authenticated",
                     session_id = session_id.0,
                     user_id = user_id.0,
-                    room_id = current_room.map(|room_id| room_id.0),
-                    room_count = rooms.len()
+                    room_count = rooms.len(),
+                    user_count = users.len()
                 );
                 let _ = self.events.send(NetworkEvent::Authenticated {
                     session_id,
                     user_id,
                     rooms,
+                    users,
+                    default_room,
                 });
                 self.bind_udp();
-                if current_room.is_none() {
-                    let _ = self.queue_control(ClientControl::JoinRoom {
-                        room_id: self.config.room_id,
-                    });
-                }
             }
             ServerControl::OpenPaired { .. } => {
                 kvlog::warn!("unexpected open-paired on established session; ignoring");
             }
-            ServerControl::RoomJoined {
-                room_id,
-                history,
-                participants,
-            } => {
-                self.room_id = Some(room_id);
-                kvlog::info!(
-                    "client room joined",
-                    room_id = room_id.0,
-                    history_len = history.len(),
-                    participant_count = participants.len()
-                );
-                self.online_others = participants
-                    .iter()
-                    .map(|participant| participant.user_id)
-                    .filter(|user_id| Some(*user_id) != self.user_id)
-                    .collect();
-                self.room_server_rtts.clear();
-                let _ = self.events.send(NetworkEvent::RoomJoined {
-                    room_id,
-                    history,
-                    participants,
-                });
+            ServerControl::RoomJoined { .. } => {
+                kvlog::warn!("legacy room joined ignored");
             }
             ServerControl::Chat { message } => {
                 kvlog::info!(
@@ -3408,41 +3454,13 @@ impl WorkerState {
                 );
                 let _ = self.events.send(NetworkEvent::Chat(message));
             }
-            ServerControl::Presence {
-                room_id,
-                participant,
-                online,
-            } => {
-                kvlog::info!(
-                    "client presence received",
-                    user_id = participant.user_id.0,
-                    display_name = participant.display_name.as_str(),
-                    identifier = participant.identifier.as_str(),
-                    online
-                );
-                let verb = if online { "joined" } else { "left" };
-                if Some(participant.user_id) != self.user_id {
-                    if online {
-                        self.online_others.insert(participant.user_id);
-                    } else {
-                        self.online_others.remove(&participant.user_id);
-                    }
-                    if !online {
-                        self.room_server_rtts.remove(&participant.user_id);
-                    }
-                }
-                let _ = self.events.send(NetworkEvent::Status(format!(
-                    "{} {verb}",
-                    participant.display_name
-                )));
-                let _ = self.events.send(NetworkEvent::Presence {
-                    room_id,
-                    participant,
-                    online,
-                });
+            ServerControl::Presence { .. } => {
+                kvlog::warn!("legacy per-room presence ignored");
             }
             ServerControl::VoiceStarted {
-                user_id, stream_id, ..
+                room_id,
+                user_id,
+                stream_id,
             } => {
                 kvlog::info!(
                     "client voice started",
@@ -3450,6 +3468,7 @@ impl WorkerState {
                     stream_id = stream_id.0
                 );
                 if Some(user_id) == self.user_id {
+                    self.voice_room = Some(room_id);
                     self.active_stream = Some(stream_id);
                     self.local_sequence = 0;
                     self.voice_timestamp = VoiceTimestampRebaser::default();
@@ -3458,12 +3477,16 @@ impl WorkerState {
                         LiveEncoderProfile::DRED_20,
                     ));
                 }
-                let _ = self
-                    .events
-                    .send(NetworkEvent::VoiceStarted { user_id, stream_id });
+                let _ = self.events.send(NetworkEvent::VoiceStarted {
+                    room_id,
+                    user_id,
+                    stream_id,
+                });
             }
             ServerControl::VoiceStopped {
-                user_id, stream_id, ..
+                room_id,
+                user_id,
+                stream_id,
             } => {
                 kvlog::info!(
                     "client voice stopped",
@@ -3472,12 +3495,15 @@ impl WorkerState {
                 );
                 if Some(stream_id) == self.active_stream {
                     self.active_stream = None;
+                    self.voice_room = None;
                 }
                 self.p2p_stream_owners.remove(&stream_id);
                 self.clear_pending_playback_stream(stream_id);
-                let _ = self
-                    .events
-                    .send(NetworkEvent::VoiceStopped { user_id, stream_id });
+                let _ = self.events.send(NetworkEvent::VoiceStopped {
+                    room_id,
+                    user_id,
+                    stream_id,
+                });
             }
             ServerControl::VoiceStatus {
                 user_id, status, ..
@@ -3501,7 +3527,7 @@ impl WorkerState {
                     .send(NetworkEvent::VoiceStatus { user_id, status });
             }
             ServerControl::RoomRttSnapshot { room_id, members } => {
-                if self.room_id == Some(room_id) {
+                if self.voice_room == Some(room_id) {
                     self.room_server_rtts = members
                         .into_iter()
                         .filter_map(|member| {
@@ -3675,11 +3701,50 @@ impl WorkerState {
                     let _ = self.events.send(NetworkEvent::Error(message));
                 }
             }
-            ServerControl::RoomUpserted { .. }
-            | ServerControl::DmOpened { .. }
-            | ServerControl::HistoryChunk { .. }
-            | ServerControl::PresenceV2 { .. } => {
-                kvlog::info!("multi-room control ignored pending client support");
+            ServerControl::RoomUpserted { room } => {
+                kvlog::info!(
+                    "client room upserted",
+                    room_id = room.room_id.0,
+                    name = room.name.as_str()
+                );
+                let _ = self.events.send(NetworkEvent::RoomUpserted(room));
+            }
+            ServerControl::DmOpened { room_id, peer } => {
+                let _ = self.events.send(NetworkEvent::DmOpened { room_id, peer });
+            }
+            ServerControl::HistoryChunk {
+                room_id,
+                messages,
+                at_start,
+            } => {
+                kvlog::info!(
+                    "client history chunk received",
+                    room_id = room_id.0,
+                    message_count = messages.len(),
+                    at_start
+                );
+                let _ = self.events.send(NetworkEvent::HistoryChunk {
+                    room_id,
+                    messages,
+                    at_start,
+                });
+            }
+            ServerControl::PresenceV2 { user, online } => {
+                kvlog::info!(
+                    "client presence received",
+                    user_id = user.user_id.0,
+                    display_name = user.display_name.as_str(),
+                    online
+                );
+                if Some(user.user_id) != self.user_id {
+                    if online {
+                        self.online_others.insert(user.user_id);
+                    } else {
+                        self.online_others.remove(&user.user_id);
+                        self.room_server_rtts.remove(&user.user_id);
+                    }
+                }
+                let _ = self.events.send(NetworkEvent::Presence { user, online });
             }
         }
     }
@@ -3861,7 +3926,7 @@ impl WorkerState {
     }
 
     fn publish_p2p_candidates(&mut self) {
-        let Some(room_id) = self.room_id else {
+        let Some(room_id) = self.voice_room else {
             return;
         };
         if self.session_id.is_none() {
@@ -4811,8 +4876,13 @@ fn file_content_encoding_name(encoding: FileContentEncoding) -> &'static str {
 
 fn network_command_kind(command: &NetworkCommand) -> &'static str {
     match command {
-        NetworkCommand::SendChat(_) => "send_chat",
+        NetworkCommand::SendChat { .. } => "send_chat",
         NetworkCommand::UploadFile(_) => "upload_file",
+        NetworkCommand::SetActiveRoom(_) => "set_active_room",
+        NetworkCommand::JoinVoice(_) => "join_voice",
+        NetworkCommand::LeaveVoice => "leave_voice",
+        NetworkCommand::FetchHistory { .. } => "fetch_history",
+        NetworkCommand::OpenDm(_) => "open_dm",
         NetworkCommand::LocalVoicePacket(_) => "local_voice_packet",
         NetworkCommand::SequencedLocalVoicePacket { .. } => "sequenced_local_voice_packet",
         NetworkCommand::SetPlaybackSink(_) => "set_playback_sink",

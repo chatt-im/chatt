@@ -98,7 +98,6 @@ fn client_config(
         display_name: name.to_string(),
         token: token.to_string(),
         server_public_key: None,
-        room_id: RoomId(ROOM),
         file_receive_dir: receive_dir,
         max_upload_bytes: LIMIT_BYTES,
         max_receive_bytes: LIMIT_BYTES,
@@ -219,11 +218,14 @@ fn upload_50mb_loopback() {
 
     let joined = Duration::from_secs(15);
     wait_for("uploader", &uploader.events, joined, |event| {
-        matches!(event, NetworkEvent::RoomJoined { .. })
+        matches!(event, NetworkEvent::Authenticated { .. })
     });
     wait_for("receiver", &receiver.events, joined, |event| {
-        matches!(event, NetworkEvent::RoomJoined { .. })
+        matches!(event, NetworkEvent::Authenticated { .. })
     });
+    uploader
+        .handle
+        .send(NetworkCommand::SetActiveRoom(RoomId(ROOM)));
 
     let start = Instant::now();
     uploader

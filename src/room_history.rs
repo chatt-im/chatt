@@ -914,6 +914,15 @@ fn history_path(history_id: &str, room_id: RoomId) -> Option<PathBuf> {
     Some(room_file_path(&data_dir()?, history_id, room_id))
 }
 
+/// The server's local data directory, holding its per-room captures and the
+/// room catalog. `None` when `history_id` is empty or no data dir resolves.
+pub(crate) fn server_dir(history_id: &str) -> Option<PathBuf> {
+    if history_id.is_empty() {
+        return None;
+    }
+    Some(data_dir()?.join(sanitize_alias(history_id)))
+}
+
 fn room_file_path(base: &Path, history_id: &str, room_id: RoomId) -> PathBuf {
     base.join(sanitize_alias(history_id))
         .join(format!("room-{}.kvlog", room_id.0))

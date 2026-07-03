@@ -4,7 +4,6 @@ username = "Bob"
 token = "bob-dev-token"
 server-public-key = ""
 tcp-addr = "127.0.0.1:41000"
-room-id = 1
 
 [ui]
 placeholder = "Bob #lobby"
