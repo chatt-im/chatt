@@ -653,7 +653,7 @@ impl Config {
             fs::create_dir_all(parent)
                 .map_err(|err| format!("failed to create {}: {err}", parent.display()))?;
         }
-        atomic_write_config(path, &self.to_toml_string())
+        atomic_write_toml(path, &self.to_toml_string())
     }
 
     fn to_toml_string(&self) -> String {
@@ -796,7 +796,7 @@ fn parse_config_content(
 /// Writes `content` to a sibling temp file, fsyncs it, then atomically renames
 /// it over `path`. The rename is atomic, so a reader never sees a partial or
 /// missing config even if the process dies mid-write.
-fn atomic_write_config(path: &Path, content: &str) -> Result<(), String> {
+pub(crate) fn atomic_write_toml(path: &Path, content: &str) -> Result<(), String> {
     let tmp = temp_config_path(path);
 
     let mut file = OpenOptions::new()

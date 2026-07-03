@@ -12,6 +12,7 @@ use std::{
 
 pub mod config;
 pub mod local_admin;
+pub mod room_store;
 
 use mio::{
     Events, Interest, Poll, Token,
@@ -36,7 +37,7 @@ use rpc::{
         respond_to_client_hello_plaintext, verify_dynamic_token,
     },
     frame,
-    ids::{BugReportId, FileTransferId, MessageId, RoomId, SessionId, StreamId, UserId},
+    ids::{BugReportId, FileTransferId, RoomId, SessionId, StreamId, UserId},
     media::{self, MediaPayload},
     video::{self, VideoAck, VideoHello, VideoRole},
 };
@@ -46,6 +47,7 @@ use config::{
     verify_secret_hash,
 };
 use local_admin::{AdminCommand, AdminSocket};
+use room_store::RoomStore;
 
 const LISTENER: Token = Token(0);
 const UDP: Token = Token(1);
@@ -55,6 +57,8 @@ const DEFAULT_ROOM: RoomId = RoomId(1);
 const POLL_TIMEOUT: Duration = Duration::from_millis(100);
 const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(20);
 const MAX_CLIENTS: usize = 1024;
+/// Most recent retained messages replayed to a joining session.
+const JOIN_BACKFILL_LIMIT: usize = 500;
 /// Capacity of the reusable per-client TCP read scratch buffer. Sized to
 /// swallow a full file chunk frame in one `read` on a fast link.
 const TCP_READ_BUFFER_BYTES: usize = 256 * 1024;
@@ -195,7 +199,6 @@ pub struct Server {
     streams: HashMap<StreamId, VideoStream>,
     next_token: usize,
     next_session: u64,
-    next_message: u64,
     next_stream: u32,
     next_connection_id: u64,
     next_file_transfer: u64,
@@ -203,6 +206,7 @@ pub struct Server {
     active_bug_reports: HashMap<(SessionId, BugReportId), ServerBugReport>,
     reserved_file_names: HashSet<String>,
     default_room: RoomId,
+    store: RoomStore,
     file_size_limit_bytes: u64,
     invites: HashMap<String, InviteState>,
     open_pair_global_allocations: VecDeque<Instant>,
@@ -259,8 +263,6 @@ impl Server {
                     id: room.room_id(),
                     name: room.name.clone(),
                     members: HashSet::new(),
-                    history: VecDeque::new(),
-                    history_limit: room.memory_history_limit(),
                     active_streams: HashMap::new(),
                 },
             );
@@ -272,13 +274,12 @@ impl Server {
                     id: DEFAULT_ROOM,
                     name: "lobby".to_string(),
                     members: HashSet::new(),
-                    history: VecDeque::new(),
-                    history_limit: 0,
                     active_streams: HashMap::new(),
                 },
             );
         }
         let default_room = config.default_room_id();
+        let store = RoomStore::open(config.data_dir(), &config.rooms);
 
         let server_key_pair = config
             .server_key_pair()
@@ -304,7 +305,6 @@ impl Server {
             streams: HashMap::new(),
             next_token: FIRST_CLIENT,
             next_session: 1,
-            next_message: 1,
             next_stream: 1,
             next_connection_id: 1,
             next_file_transfer: 1,
@@ -312,6 +312,7 @@ impl Server {
             active_bug_reports: HashMap::new(),
             reserved_file_names: HashSet::new(),
             default_room,
+            store,
             file_size_limit_bytes,
             invites: HashMap::new(),
             open_pair_global_allocations: VecDeque::new(),
@@ -1896,17 +1897,11 @@ impl Server {
             );
         }
 
-        let (history, participants, token) = match (
-            self.rooms.get(&room_id),
-            self.live_token_for_session(session_id),
-        ) {
-            (Some(room), Some(token)) => (
-                room.history.iter().cloned().collect::<Vec<_>>(),
-                self.participants(room_id),
-                token,
-            ),
-            _ => return,
+        let Some(token) = self.live_token_for_session(session_id) else {
+            return;
         };
+        let history = self.store.recent(room_id, JOIN_BACKFILL_LIMIT);
+        let participants = self.participants(room_id);
         let _ = self.send_control_to_token(
             token,
             &ServerControl::RoomJoined {
@@ -2042,7 +2037,7 @@ impl Server {
             return Err("join the room before sending chat".into());
         }
         let message = ChatMessage {
-            message_id: MessageId(self.next_message),
+            message_id: self.store.allocate_message_id(room_id),
             room_id,
             sender,
             sender_name,
@@ -2050,17 +2045,7 @@ impl Server {
             body,
             file_transfer_id: None,
         };
-        self.next_message += 1;
-        let mut history_len = 0;
-        if let Some(room) = self.rooms.get_mut(&room_id)
-            && room.history_limit > 0
-        {
-            room.history.push_back(message.clone());
-            while room.history.len() > room.history_limit {
-                room.history.pop_front();
-            }
-            history_len = room.history.len();
-        }
+        let history_len = self.store.append(room_id, &message);
         kvlog::info!(
             "chat message accepted",
             session_id = session_id.0,
@@ -2150,7 +2135,7 @@ impl Server {
         };
 
         let message = ChatMessage {
-            message_id: MessageId(self.next_message),
+            message_id: self.store.allocate_message_id(room_id),
             room_id,
             sender,
             sender_name,
@@ -2162,7 +2147,6 @@ impl Server {
             ),
             file_transfer_id: Some(server_transfer_id),
         };
-        self.next_message += 1;
         let uploader_token = self
             .live_token_for_session(session_id)
             .ok_or_else(|| "uploading session disconnected".to_string())?;
@@ -2173,14 +2157,7 @@ impl Server {
                 file: metadata.clone(),
             },
         )?;
-        if let Some(room) = self.rooms.get_mut(&room_id)
-            && room.history_limit > 0
-        {
-            room.history.push_back(message.clone());
-            while room.history.len() > room.history_limit {
-                room.history.pop_front();
-            }
-        }
+        self.store.append(room_id, &message);
         self.broadcast_control(room_id, &ServerControl::Chat { message });
         if self.live_token_for_session(session_id).is_none() {
             return Ok(());
@@ -3744,10 +3721,6 @@ struct RoomState {
     id: RoomId,
     name: String,
     members: HashSet<SessionId>,
-    history: VecDeque<ChatMessage>,
-    /// In-memory ring bound from the room's persistence config; zero keeps no
-    /// history.
-    history_limit: usize,
     active_streams: HashMap<StreamId, SessionId>,
 }
 
@@ -4123,8 +4096,6 @@ mod tests {
             id: room_id,
             name: "test".to_string(),
             members: members.iter().copied().collect(),
-            history: VecDeque::new(),
-            history_limit: 0,
             active_streams: HashMap::new(),
         }
     }
