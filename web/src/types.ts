@@ -2,6 +2,7 @@
 // `feed.ts`, encoded in `src/web_wire.rs`); share control stays JSON text.
 
 export type MediaKind = "image" | "video" | "audio" | "file";
+export type AutoplayMode = "disabled" | "muted" | "with-audio";
 
 export interface WebAttachment {
   // Served file name. The URL is `/files/${name}`.
@@ -41,6 +42,9 @@ export interface WebMessage {
   // envelopes while the host client pulls the file off the relay. Cleared when
   // the enriched attachment replaces the placeholder.
   progress?: { transferred: number; total: number };
+  // Client-only playback intent attached to a newly received video. History
+  // sync messages omit it so reconnecting does not autoplay old media.
+  autoplay?: AutoplayMode;
   // The body pre-split into prose and code fragments.
   fragments: Fragment[];
 }
@@ -68,8 +72,13 @@ export type ServerEnvelope =
   // Live receive progress for an in-flight file, merged into the placeholder
   // message matched by `file_id` and `timestamp_ms`.
   | { type: "file_progress"; file_id: number; timestamp_ms: number; transferred: number; total: number }
-  // Sent once on connect. `readonly` true hides the compose box.
-  | { type: "config"; readonly: boolean };
+  // Sent once on connect with browser-only behavior settings.
+  | {
+      type: "config";
+      readonly: boolean;
+      autoplay: AutoplayMode;
+      viewer_in_seperate_browser_tab: boolean;
+    };
 
 // A screen share this browser can watch.
 export interface ShareInfo {

@@ -9,7 +9,9 @@ import {
 import FileViewer from "./FileViewer";
 import Icon from "./Icon";
 import ImageViewer from "./ImageViewer";
+import VideoPlayer from "./VideoPlayer";
 import type { IconName } from "./icons";
+import type { AutoplayMode } from "./types";
 
 export type PreviewItem =
   | { kind: "file"; name: string }
@@ -49,6 +51,8 @@ export default function PreviewPanel(props: {
   onSelect: (key: string) => void;
   onClose: () => void;
   onCloseTab: (key: string) => void;
+  autoplay: AutoplayMode;
+  standalone?: boolean;
 }) {
   let tabsEl: HTMLDivElement | undefined;
   let tabsResizeObserver: ResizeObserver | undefined;
@@ -148,94 +152,108 @@ export default function PreviewPanel(props: {
     tabButtons.clear();
   });
 
+  const imageUsesStandaloneToolbar = () =>
+    props.standalone && props.active.kind === "image";
+
   return (
-    <div class="preview-panel">
-      <div class="preview-panel-head">
-        <div
-          class="preview-tabs-frame"
-          classList={{
-            "has-overflow-before": hasOverflowBefore(),
-            "has-overflow-after": hasOverflowAfter(),
-          }}
-        >
-          <div
-            class="preview-tabs"
-            ref={tabsEl}
-            role="tablist"
-            aria-label="Preview history"
-            onScroll={updateOverflowEdges}
-            onWheel={onTabsWheel}
-          >
-            <For each={props.history}>
-              {(item, index) => {
-                const key = previewKey(item);
-                const selected = () => key === props.activeKey;
-                return (
-                  <div
-                    class="preview-tab"
-                    classList={{ "is-active": selected() }}
-                  >
-                    <button
-                      class="preview-tab-select"
-                      ref={(element) => {
-                        tabButtons.set(key, element);
-                      }}
-                      id={`preview-tab-${index()}`}
-                      type="button"
-                      role="tab"
-                      aria-selected={selected()}
-                      aria-controls="preview-panel-content"
-                      tabIndex={selected() ? 0 : -1}
-                      title={item.name}
-                      onClick={() => selectTab(key)}
-                      onKeyDown={(event) => onTabKeyDown(event, index())}
-                    >
-                      <Icon name={previewIcon(item)} />
-                      <span class="preview-tab-label">{item.name}</span>
-                    </button>
-                    <button
-                      class="preview-tab-close"
-                      type="button"
-                      aria-label={`Close ${item.name}`}
-                      title="Close"
-                      onClick={() => props.onCloseTab(key)}
-                    >
-                      <Icon name="x" />
-                    </button>
-                  </div>
-                );
+    <div
+      class="preview-panel"
+      classList={{ "is-standalone": props.standalone }}
+    >
+      <Show when={!imageUsesStandaloneToolbar()}>
+        <div class="preview-panel-head">
+          <Show when={!props.standalone}>
+            <div
+              class="preview-tabs-frame"
+              classList={{
+                "has-overflow-before": hasOverflowBefore(),
+                "has-overflow-after": hasOverflowAfter(),
               }}
-            </For>
+            >
+              <div
+                class="preview-tabs"
+                ref={tabsEl}
+                role="tablist"
+                aria-label="Preview history"
+                onScroll={updateOverflowEdges}
+                onWheel={onTabsWheel}
+              >
+                <For each={props.history}>
+                  {(item, index) => {
+                    const key = previewKey(item);
+                    const selected = () => key === props.activeKey;
+                    return (
+                      <div
+                        class="preview-tab"
+                        classList={{ "is-active": selected() }}
+                      >
+                        <button
+                          class="preview-tab-select"
+                          ref={(element) => {
+                            tabButtons.set(key, element);
+                          }}
+                          id={`preview-tab-${index()}`}
+                          type="button"
+                          role="tab"
+                          aria-selected={selected()}
+                          aria-controls="preview-panel-content"
+                          tabIndex={selected() ? 0 : -1}
+                          title={item.name}
+                          onClick={() => selectTab(key)}
+                          onKeyDown={(event) => onTabKeyDown(event, index())}
+                        >
+                          <Icon name={previewIcon(item)} />
+                          <span class="preview-tab-label">{item.name}</span>
+                        </button>
+                        <button
+                          class="preview-tab-close"
+                          type="button"
+                          aria-label={`Close ${item.name}`}
+                          title="Close"
+                          onClick={() => props.onCloseTab(key)}
+                        >
+                          <Icon name="x" />
+                        </button>
+                      </div>
+                    );
+                  }}
+                </For>
+              </div>
+            </div>
+          </Show>
+          <div class="preview-panel-actions">
+            <a
+              class="preview-panel-download"
+              href={`/files/${encodeURIComponent(props.active.name)}`}
+              download={props.active.name}
+              aria-label={`Download ${props.active.name}`}
+              title="Download"
+            >
+              <Icon name="download" />
+            </a>
+            <button
+              class="preview-panel-close"
+              type="button"
+              aria-label="Close preview"
+              title="Close"
+              onClick={props.onClose}
+            >
+              <Icon name="x" />
+            </button>
           </div>
         </div>
-        <div class="preview-panel-actions">
-          <a
-            class="preview-panel-download"
-            href={`/files/${encodeURIComponent(props.active.name)}`}
-            download={props.active.name}
-            aria-label={`Download ${props.active.name}`}
-            title="Download"
-          >
-            <Icon name="download" />
-          </a>
-          <button
-            class="preview-panel-close"
-            type="button"
-            aria-label="Close preview"
-            title="Close"
-            onClick={props.onClose}
-          >
-            <Icon name="x" />
-          </button>
-        </div>
-      </div>
+      </Show>
       <div
         class="preview-panel-content"
         id="preview-panel-content"
         role="tabpanel"
-        aria-labelledby={`preview-tab-${props.history.findIndex(
-          (item) => previewKey(item) === props.activeKey,
-        )}`}
+        aria-labelledby={
+          props.standalone
+            ? undefined
+            : `preview-tab-${props.history.findIndex(
+                (item) => previewKey(item) === props.activeKey,
+              )}`
+        }
       >
         <Show when={props.active} keyed>
           {(item) =>
@@ -244,13 +262,15 @@ export default function PreviewPanel(props: {
                 name={item.name}
                 width={item.width}
                 height={item.height}
+                standaloneActions={
+                  props.standalone ? { onClose: props.onClose } : undefined
+                }
               />
             ) : item.kind === "video" ? (
-              <video
+              <VideoPlayer
                 class="preview-media-video"
                 src={fileUrl(item.name)}
-                controls
-                preload="metadata"
+                autoplay={props.autoplay}
               />
             ) : item.kind === "audio" ? (
               <div class="preview-media-audio-frame">

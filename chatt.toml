@@ -70,6 +70,13 @@ candidate-privacy = "mdns"
 # revert to IPv4-first for diagnostics.
 prefer-ipv6 = true
 
+[web]
+# Automatically play newly received videos. `true` autoplays muted; use
+# "with-audio" to request audio when the browser's autoplay policy allows it.
+autoplay = false
+# Open each preview in a separate browser tab instead of the side panel.
+viewer-in-seperate-browser-tab = false
+
 [bindings.insert]
 "C-c" = "Quit"
 "F2" = "OpenSettings"

@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::{fs, time::Duration};
 
 use toml_spanner::Toml;
-use toml_spanner::{Arena, Item};
+use toml_spanner::{Arena, Context, Failed, FromToml, Item, ToToml, ToTomlError};
 
 use crate::{
     audio::{
@@ -430,6 +430,45 @@ impl P2pConfig {
 }
 
 /// The optional browser chat-log view served over `darkhttp`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum WebAutoplay {
+    #[default]
+    Disabled,
+    Muted,
+    WithAudio,
+}
+
+impl WebAutoplay {
+    pub fn wire_name(self) -> &'static str {
+        match self {
+            Self::Disabled => "disabled",
+            Self::Muted => "muted",
+            Self::WithAudio => "with-audio",
+        }
+    }
+}
+
+impl<'de> FromToml<'de> for WebAutoplay {
+    fn from_toml(ctx: &mut Context<'de>, item: &Item<'de>) -> Result<Self, Failed> {
+        match (item.as_bool(), item.as_str()) {
+            (Some(false), _) => Ok(Self::Disabled),
+            (Some(true), _) => Ok(Self::Muted),
+            (_, Some("with-audio")) => Ok(Self::WithAudio),
+            _ => Err(ctx.report_custom_error("expected false, true, or \"with-audio\"", item)),
+        }
+    }
+}
+
+impl ToToml for WebAutoplay {
+    fn to_toml<'a>(&'a self, _arena: &'a Arena) -> Result<Item<'a>, ToTomlError> {
+        Ok(match self {
+            Self::Disabled => Item::from(false),
+            Self::Muted => Item::from(true),
+            Self::WithAudio => Item::string("with-audio"),
+        })
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Toml)]
 #[toml(FromToml, ToToml, rename_all = "kebab-case")]
 pub struct WebConfig {
@@ -443,6 +482,15 @@ pub struct WebConfig {
     /// cannot send chat messages or files. Set `false` to enable the compose box.
     #[toml(default = default_true())]
     pub readonly: bool,
+    /// Automatically play newly received videos. `true` uses muted playback so
+    /// browsers can start it without interaction; `"with-audio"` also requests
+    /// audio, which browsers may reject under their autoplay policy.
+    #[toml(default)]
+    pub autoplay: WebAutoplay,
+    /// Open each file preview in its own browser tab instead of the side panel.
+    /// The misspelling is part of the user-facing configuration key.
+    #[toml(default)]
+    pub viewer_in_seperate_browser_tab: bool,
 }
 
 impl Default for WebConfig {
@@ -451,6 +499,8 @@ impl Default for WebConfig {
             enabled: false,
             bind: default_web_bind(),
             readonly: true,
+            autoplay: WebAutoplay::Disabled,
+            viewer_in_seperate_browser_tab: false,
         }
     }
 }
@@ -1345,6 +1395,41 @@ path = "assets/sample-001.opus"
         assert!(content.contains("[[servers]]"));
         assert!(!content.contains("active-server"));
         assert!(!content.contains("pairing-code"));
+    }
+
+    #[test]
+    fn web_autoplay_parses_supported_values() {
+        for (value, expected) in [
+            ("false", WebAutoplay::Disabled),
+            ("true", WebAutoplay::Muted),
+            ("\"with-audio\"", WebAutoplay::WithAudio),
+        ] {
+            let source = format!("[web]\nautoplay = {value}\n");
+            let arena = Arena::new();
+            let config: Config = toml_spanner::parse(&source, &arena).unwrap().to().unwrap();
+            assert_eq!(config.web.autoplay, expected);
+        }
+    }
+
+    #[test]
+    fn web_autoplay_rejects_other_values() {
+        let arena = Arena::new();
+        let result = toml_spanner::parse("[web]\nautoplay = \"audio\"\n", &arena)
+            .unwrap()
+            .to::<Config>();
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn runtime_config_writes_web_view_settings() {
+        let mut config = Config::default();
+        config.web.autoplay = WebAutoplay::WithAudio;
+        config.web.viewer_in_seperate_browser_tab = true;
+        let content = render_runtime(&config);
+
+        assert!(content.contains("autoplay = \"with-audio\""));
+        assert!(content.contains("viewer-in-seperate-browser-tab = true"));
     }
 
     #[test]

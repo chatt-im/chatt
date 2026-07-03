@@ -210,6 +210,21 @@ ones that started before the browser tab connected. The default capture needs
 `ffmpeg` on `PATH` and an X11 session. A custom command needs only its own
 program on `PATH`.
 
+The web view can autoplay newly received video attachments and move previews
+from the side panel into separate browser tabs:
+
+```toml
+[web]
+# false (default), true (muted), or "with-audio"
+autoplay = "with-audio"
+# false (default) keeps the side panel; true opens one preview per browser tab
+viewer-in-seperate-browser-tab = false
+```
+
+Unmuted autoplay remains subject to the browser's media policy. A standalone
+preview tab contains only the selected preview and its controls, without the
+side panel's internal preview-history tabs.
+
 Inspect audio input devices:
 
 ```sh

@@ -25,6 +25,8 @@ max-receive-bytes = 52428800
 enabled = true
 bind = "127.0.0.1:8080"
 readonly = false
+autoplay = "with-audio"
+viewer-in-seperate-browser-tab = true
 
 
 [audio]

@@ -5,7 +5,7 @@ use crate::{
         DEFAULT_DENOISE_SUPPRESSION, DEFAULT_DENOISE_TYPING_VAD_ENTER,
         DEFAULT_DENOISE_TYPING_VAD_RELEASE, DEFAULT_INPUT_BUFFER_SAMPLES,
         DEFAULT_MAX_AMPLIFICATION, DEFAULT_OUTPUT_BUFFER_SAMPLES, FormBindings, NotificationConfig,
-        ThemeChoice, WebConfig,
+        ThemeChoice, WebAutoplay, WebConfig,
     },
     ui::select::{FuzzySelect, SelectableItem},
 };
@@ -62,6 +62,10 @@ pub struct SettingsDraft {
     /// Preserved across the settings round-trip. The compose box is a dev-only
     /// flag with no settings-UI control, so it is carried but never edited here.
     pub(crate) web_readonly: bool,
+    /// Config-file-only web viewer settings, preserved when the settings form
+    /// writes the rest of `[web]`.
+    pub(crate) web_autoplay: WebAutoplay,
+    pub(crate) web_viewer_in_seperate_browser_tab: bool,
     pub(crate) message_notification_volume_index: usize,
     pub(crate) peer_join_notification_volume_index: usize,
     pub(crate) peer_leave_notification_volume_index: usize,
@@ -117,6 +121,8 @@ impl SettingsDraft {
             web_enabled: WebConfig::default().enabled,
             web_bind: WebConfig::default().bind,
             web_readonly: WebConfig::default().readonly,
+            web_autoplay: WebConfig::default().autoplay,
+            web_viewer_in_seperate_browser_tab: WebConfig::default().viewer_in_seperate_browser_tab,
             message_notification_volume_index: notification_volume_index(0.0),
             peer_join_notification_volume_index: notification_volume_index(0.0),
             peer_leave_notification_volume_index: notification_volume_index(0.0),
@@ -133,6 +139,8 @@ impl SettingsDraft {
         self.web_enabled = web.enabled;
         self.web_bind = web.bind.clone();
         self.web_readonly = web.readonly;
+        self.web_autoplay = web.autoplay;
+        self.web_viewer_in_seperate_browser_tab = web.viewer_in_seperate_browser_tab;
     }
 
     pub fn set_notifications_from_config(&mut self, notifications: &NotificationConfig) {
@@ -181,6 +189,8 @@ impl SettingsDraft {
             enabled: self.web_enabled,
             bind: self.web_bind.trim().to_string(),
             readonly: self.web_readonly,
+            autoplay: self.web_autoplay,
+            viewer_in_seperate_browser_tab: self.web_viewer_in_seperate_browser_tab,
         }
     }
 
@@ -1036,6 +1046,20 @@ mod tests {
 
         draft.dred = DredConfig::On;
         assert_eq!(draft.to_audio().dred, DredConfig::On);
+    }
+
+    #[test]
+    fn settings_draft_preserves_config_file_only_web_options() {
+        let mut draft = SettingsDraft::from_audio(&AudioConfig::default());
+        let web = WebConfig {
+            autoplay: WebAutoplay::WithAudio,
+            viewer_in_seperate_browser_tab: true,
+            ..WebConfig::default()
+        };
+
+        draft.set_web_from_config(&web);
+
+        assert_eq!(draft.to_web(), web);
     }
 
     #[test]

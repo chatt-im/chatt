@@ -817,6 +817,11 @@ body {
   background: var(--bg-elevated);
 }
 
+.preview-panel.is-standalone .preview-panel-head {
+  min-height: 39px;
+  justify-content: flex-end;
+}
+
 .preview-tabs-frame {
   position: relative;
   flex: 1 1 auto;
@@ -1056,6 +1061,39 @@ body {
 
 .image-viewer-toolbar .image-viewer-text-button {
   min-width: 48px;
+}
+
+.image-viewer-toolbar-actions {
+  display: flex;
+  align-items: center;
+  gap: var(--space);
+  margin-left: auto;
+}
+
+.image-viewer-toolbar .image-viewer-toolbar-action {
+  display: inline-grid;
+  place-items: center;
+  width: 28px;
+  min-width: 28px;
+  height: 28px;
+  padding: 0;
+  color: var(--text-dim);
+  background: none;
+  border: 0;
+  font: inherit;
+  text-decoration: none;
+  cursor: pointer;
+}
+
+.image-viewer-toolbar .image-viewer-toolbar-action:hover,
+.image-viewer-toolbar .image-viewer-toolbar-action:focus-visible {
+  color: var(--text);
+  background: var(--bg-elevated);
+}
+
+.image-viewer-toolbar .image-viewer-toolbar-action:focus-visible {
+  outline: 1px solid var(--text-dim);
+  outline-offset: 1px;
 }
 
 .image-viewer-zoom {
