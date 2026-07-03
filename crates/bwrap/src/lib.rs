@@ -129,8 +129,8 @@ mod segment;
 mod uwidth;
 mod wrapper;
 
-pub use segment::wrap_ranges;
 pub use segment::WrapRanges;
+pub use segment::{wrap_ranges, wrap_ranges_preserve_leading};
 pub use wrapper::ExistNlPref;
 pub use wrapper::WrapStyle;
 pub use wrapper::Wrapper;

@@ -200,6 +200,7 @@ fn render_html(source: &str, tokens: &[Token], resolver: RefResolver) -> String 
             }
             TokenKind::MessageRef => render_ref(slice(source, &token.range), resolver, &mut html),
             TokenKind::HardBreak => html.push_str("<br>"),
+            TokenKind::BlankLine => {}
             TokenKind::CodeBlockStart { .. }
             | TokenKind::CodeBlockLine
             | TokenKind::CodeBlockEnd => {}

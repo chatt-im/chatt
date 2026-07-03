@@ -43,6 +43,26 @@ pub fn wrap_ranges(text: &str, first_width: usize, cont_width: usize) -> WrapRan
         cont_width: cont_width.max(1),
         cursor: 0,
         started: false,
+        preserve_leading: false,
+    }
+}
+
+/// Wraps `text` like [`wrap_ranges`], but includes leading spaces and tabs in
+/// the yielded ranges.
+///
+/// Whitespace at soft-wrap boundaries and trailing whitespace remains trimmed.
+pub fn wrap_ranges_preserve_leading(
+    text: &str,
+    first_width: usize,
+    cont_width: usize,
+) -> WrapRanges<'_> {
+    WrapRanges {
+        text,
+        first_width: first_width.max(1),
+        cont_width: cont_width.max(1),
+        cursor: 0,
+        started: false,
+        preserve_leading: true,
     }
 }
 
@@ -55,6 +75,7 @@ pub struct WrapRanges<'a> {
     cont_width: usize,
     cursor: usize,
     started: bool,
+    preserve_leading: bool,
 }
 
 #[inline]
@@ -131,23 +152,41 @@ impl<'a> Iterator for WrapRanges<'a> {
 
     fn next(&mut self) -> Option<Range<usize>> {
         let bytes = self.text.as_bytes();
-        while self.cursor < bytes.len() && is_wrap_space(bytes[self.cursor]) {
-            self.cursor += 1;
-        }
-        if self.cursor >= bytes.len() {
-            return None;
-        }
         let max_width = if self.started {
             self.cont_width
         } else {
             self.first_width
         };
+        let preserve_leading = self.preserve_leading;
         self.started = true;
 
         let line_start = self.cursor;
-        let mut line_end = line_start;
-        let mut line_width = 0usize;
         let mut pos = line_start;
+        while pos < bytes.len() && is_wrap_space(bytes[pos]) {
+            pos += 1;
+        }
+        if pos >= bytes.len() {
+            if preserve_leading && line_start < pos {
+                let end = (line_start + max_width).min(pos);
+                self.cursor = end;
+                return Some(line_start..end);
+            }
+            self.cursor = pos;
+            return None;
+        }
+
+        let (line_start, mut line_end, mut line_width) = if preserve_leading {
+            let leading_width = separator_width(&self.text[line_start..pos]);
+            if leading_width >= max_width {
+                let end = line_start + max_width;
+                self.cursor = end;
+                return Some(line_start..end);
+            }
+            self.preserve_leading = false;
+            (line_start, pos, leading_width)
+        } else {
+            (pos, pos, 0)
+        };
 
         while pos < bytes.len() {
             let word_start = pos;
@@ -179,5 +218,50 @@ impl<'a> Iterator for WrapRanges<'a> {
 
         self.cursor = line_end;
         Some(line_start..line_end)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    extern crate std;
+
+    use super::*;
+    use std::{vec, vec::Vec};
+
+    fn slices<'a>(text: &'a str, ranges: impl Iterator<Item = Range<usize>>) -> Vec<&'a str> {
+        ranges.map(|range| &text[range]).collect()
+    }
+
+    #[test]
+    fn default_ranges_trim_leading_whitespace() {
+        let text = "    alpha beta";
+        assert_eq!(slices(text, wrap_ranges(text, 40, 40)), vec!["alpha beta"]);
+    }
+
+    #[test]
+    fn preserving_ranges_keep_leading_whitespace() {
+        let text = "    alpha beta";
+        assert_eq!(
+            slices(text, wrap_ranges_preserve_leading(text, 40, 40)),
+            vec!["    alpha beta"]
+        );
+    }
+
+    #[test]
+    fn preserving_ranges_count_indentation_toward_wrap_width() {
+        let text = "    alpha beta";
+        assert_eq!(
+            slices(text, wrap_ranges_preserve_leading(text, 9, 9)),
+            vec!["    alpha", "beta"]
+        );
+    }
+
+    #[test]
+    fn preserving_ranges_keep_indentation_wider_than_a_line() {
+        let text = "      alpha";
+        assert_eq!(
+            slices(text, wrap_ranges_preserve_leading(text, 4, 4)),
+            vec!["    ", "  ", "alph", "a"]
+        );
     }
 }

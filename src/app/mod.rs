@@ -67,7 +67,7 @@ use commands::slash_command_help;
 
 pub(crate) use dialogs::{UserVolumeDialog, UserVolumeEvent};
 pub(crate) use participants::{ParticipantState, ParticipantVoiceFeedback, Participants};
-pub(crate) use room::{RoomSession, ToggleExpandResult};
+pub(crate) use room::{ComposerSubmission, RoomSession, ToggleExpandResult};
 pub(crate) use server::{
     PairCompletion, PendingPair, ServerEditDraft, ServerEditEvent, ServerSelectItem,
     alias_from_tcp_addr, default_join_alias, default_join_display_name, random_token,
@@ -3465,8 +3465,19 @@ impl App {
     }
 
     pub(crate) fn submit_input(&mut self) {
-        let Some(input) = self.room.submit_composer() else {
+        let Some(submission) = self.room.submit_composer() else {
             return;
+        };
+        let input = match submission {
+            ComposerSubmission::Command(input) => input,
+            ComposerSubmission::Message(body) => {
+                if self.network.is_some() {
+                    self.send_network_command(NetworkCommand::SendChat(body), true);
+                } else {
+                    self.set_error("select a server before sending messages");
+                }
+                return;
+            }
         };
         match input.as_str() {
             "/quit" => self.set_status("use Ctrl-C to quit"),
@@ -3499,16 +3510,7 @@ impl App {
                 self.start_bug_report(description.to_string());
             }
             command if command.starts_with("/sound") => self.soundboard_command(command),
-            command if command.starts_with('/') => {
-                self.set_error(format!("unknown command: {command}"))
-            }
-            body => {
-                if self.network.is_some() {
-                    self.send_network_command(NetworkCommand::SendChat(body.to_string()), true);
-                } else {
-                    self.set_error("select a server before sending messages");
-                }
-            }
+            command => self.set_error(format!("unknown command: {command}")),
         }
     }
 
@@ -4851,6 +4853,21 @@ mod tests {
             Some(NetworkCommand::SendChat(body)) if body == "hello"
         ));
         assert_eq!(app.status.kind(), StatusKind::Error);
+    }
+
+    #[test]
+    fn leading_space_escapes_slash_command_as_chat() {
+        let mut app = test_app();
+        let (tx, rx) = mpsc::channel();
+        app.network = Some(NetworkClient::from_parts_for_test(tx));
+        app.room.composer.set_lines(" /help");
+
+        app.submit_input();
+
+        match rx.try_recv().unwrap() {
+            NetworkCommand::SendChat(body) => assert_eq!(body, "/help"),
+            other => panic!("unexpected command: {other:?}"),
+        }
     }
 
     #[test]
