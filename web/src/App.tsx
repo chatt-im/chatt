@@ -410,11 +410,14 @@ function TransferProgressBar(props: {
 // fragment object is created once per decoded message and never mutated
 // (progress merges keep the same fragments array), so it is a stable cache
 // key; replaced messages simply fall out with GC.
-const fragmentHtmlCache = new WeakMap<Fragment, string>();
+type TextFragment = Extract<Fragment, { kind: "text" }>;
 type CodeFragment = Extract<Fragment, { kind: "code" }>;
+type ContentFragment = TextFragment | CodeFragment;
+
+const fragmentHtmlCache = new WeakMap<ContentFragment, string>();
 const codeTextDecoder = new TextDecoder();
 
-function fragmentHtml(fragment: Fragment): string {
+function fragmentHtml(fragment: ContentFragment): string {
   let html = fragmentHtmlCache.get(fragment);
   if (html === undefined) {
     html =
@@ -500,7 +503,7 @@ function CodeBlock(props: { fragment: CodeFragment }) {
   );
 }
 
-function MessageFragment(props: { fragment: Fragment }) {
+function MessageFragment(props: { fragment: ContentFragment }) {
   const content = () =>
     props.fragment.kind === "text" ? (
       <div class="message-body" innerHTML={fragmentHtml(props.fragment)} />
@@ -508,13 +511,64 @@ function MessageFragment(props: { fragment: Fragment }) {
       <CodeBlock fragment={props.fragment} />
     );
 
-  if (props.fragment.quote_depth === 0) return content();
+  return content();
+}
+
+type MessageNode =
+  | { kind: "fragment"; fragment: ContentFragment }
+  | { kind: "quote"; children: MessageNode[] };
+
+function pruneEmptyQuotes(nodes: MessageNode[]): MessageNode[] {
+  const pruned: MessageNode[] = [];
+  for (const node of nodes) {
+    if (node.kind === "fragment") {
+      pruned.push(node);
+      continue;
+    }
+
+    const children = pruneEmptyQuotes(node.children);
+    if (children.length > 0) pruned.push({ kind: "quote", children });
+  }
+  return pruned;
+}
+
+function messageNodes(fragments: readonly Fragment[]): MessageNode[] {
+  const root: MessageNode[] = [];
+  const stack: MessageNode[][] = [root];
+
+  for (const fragment of fragments) {
+    const current = stack[stack.length - 1]!;
+    switch (fragment.kind) {
+      case "quote_start": {
+        const node: MessageNode = { kind: "quote", children: [] };
+        current.push(node);
+        stack.push(node.children);
+        break;
+      }
+      case "quote_end":
+        if (stack.length > 1) stack.pop();
+        break;
+      default:
+        current.push({ kind: "fragment", fragment });
+        break;
+    }
+  }
+
+  return pruneEmptyQuotes(root);
+}
+
+function MessageNodeView(props: { node: MessageNode }) {
+  if (props.node.kind === "fragment") {
+    return <MessageFragment fragment={props.node.fragment} />;
+  }
+
   return (
     <blockquote class="message-quote">
-      <span class="message-quote-markers" aria-hidden="true">
-        {"> ".repeat(props.fragment.quote_depth)}
-      </span>
-      <div class="message-quote-content">{content()}</div>
+      <div class="message-quote-content">
+        <For each={props.node.children}>
+          {(child) => <MessageNodeView node={child} />}
+        </For>
+      </div>
     </blockquote>
   );
 }
@@ -522,9 +576,11 @@ function MessageFragment(props: { fragment: Fragment }) {
 // Renders a message body from Rust-produced subset HTML and precomputed code
 // highlight spans. Nothing is parsed or highlighted in the browser.
 function MessageBody(props: { fragments: Fragment[] }) {
+  const nodes = createMemo(() => messageNodes(props.fragments));
+
   return (
-    <For each={props.fragments}>
-      {(fragment) => <MessageFragment fragment={fragment} />}
+    <For each={nodes()}>
+      {(node) => <MessageNodeView node={node} />}
     </For>
   );
 }

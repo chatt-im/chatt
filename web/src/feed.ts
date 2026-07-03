@@ -11,6 +11,9 @@ const KIND_SYNC = 1;
 const KIND_MESSAGE = 2;
 
 const FRAG_TEXT = 0;
+const FRAG_CODE = 1;
+const FRAG_QUOTE_START = 2;
+const FRAG_QUOTE_END = 3;
 
 const MEDIA_KINDS: MediaKind[] = ["image", "video", "audio", "file"];
 
@@ -99,16 +102,27 @@ class Reader {
     const fragments: Fragment[] = [];
     for (let i = 0; i < fragmentCount; i++) {
       const kind = this.u8();
-      const quote_depth = this.u32();
-      if (kind === FRAG_TEXT) {
-        fragments.push({ kind: "text", quote_depth, html: this.string() });
-      } else {
-        // Keep the code bytes rather than a string: highlight spans are byte
-        // offsets, so per-run byte slicing is what renders correctly.
-        const lang = this.string();
-        const text = this.slice().slice();
-        const spans = this.slice().slice();
-        fragments.push({ kind: "code", quote_depth, lang, text, spans });
+      switch (kind) {
+        case FRAG_TEXT:
+          fragments.push({ kind: "text", html: this.string() });
+          break;
+        case FRAG_CODE: {
+          // Keep the code bytes rather than a string: highlight spans are byte
+          // offsets, so per-run byte slicing is what renders correctly.
+          const lang = this.string();
+          const text = this.slice().slice();
+          const spans = this.slice().slice();
+          fragments.push({ kind: "code", lang, text, spans });
+          break;
+        }
+        case FRAG_QUOTE_START:
+          fragments.push({ kind: "quote_start" });
+          break;
+        case FRAG_QUOTE_END:
+          fragments.push({ kind: "quote_end" });
+          break;
+        default:
+          throw new Error(`unknown chat fragment kind ${kind}`);
       }
     }
     return { id, sender, timestamp_ms, attachment, file_id, message_id, ref_code, fragments };
