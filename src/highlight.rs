@@ -291,14 +291,23 @@ pub fn language_for_tag(tag: &str) -> Option<Language> {
 /// The frontend walks `text` in step with the runs, wrapping each run in a
 /// class-colored span. A [`None`] language yields one plain run.
 pub fn encode_inline(text: &str, language: Option<Language>) -> Vec<u8> {
-    let runs = contiguous_runs(text, language);
+    let source: &dyn Source = &text;
+    let runs = contiguous_runs(source, language);
     let mut buf = Vec::with_capacity(1 + runs.len() * 5);
     buf.push(VERSION);
     for (start, end, class) in runs {
         buf.extend_from_slice(&(end - start).to_le_bytes());
-        buf.push(class);
+        buf.push(class.as_u8());
     }
     buf
+}
+
+/// Returns contiguous highlight runs for a paged source.
+///
+/// The returned byte offsets are relative to `source`, which lets callers
+/// highlight a logical view without first copying it into a temporary string.
+pub fn source_runs(source: &dyn Source, language: Option<Language>) -> Vec<(u32, u32, HlClass)> {
+    contiguous_runs(source, language)
 }
 
 /// Encodes a whole file for the line-numbered viewer.
@@ -309,7 +318,8 @@ pub fn encode_inline(text: &str, language: Option<Language>) -> Vec<u8> {
 /// that many `(u32 byte_len, u8 class)` runs. Runs never cross a line boundary,
 /// so the offset table gives the frontend O(1) seek to any line's highlight.
 pub fn encode_file(text: &str, language: Option<Language>) -> Vec<u8> {
-    let runs = contiguous_runs(text, language);
+    let source: &dyn Source = &text;
+    let runs = contiguous_runs(source, language);
     let lines = line_ranges(text);
 
     let mut offsets: Vec<u32> = Vec::with_capacity(lines.len());
@@ -329,7 +339,7 @@ pub fn encode_file(text: &str, language: Option<Language>) -> Vec<u8> {
             let start = run_start.max(line_start);
             let end = run_end.min(line_end);
             if end > start {
-                push_run(&mut line_runs, end - start, class);
+                push_run(&mut line_runs, end - start, class.as_u8());
             }
             j += 1;
         }
@@ -356,15 +366,14 @@ pub fn encode_file(text: &str, language: Option<Language>) -> Vec<u8> {
 /// Builds the merged, contiguous `(start, end, class)` runs covering all of
 /// `text`. Gaps the highlighter leaves become [`HlClass::Plain`], and adjacent
 /// runs of the same class are merged. A [`None`] language yields one plain run.
-fn contiguous_runs(text: &str, language: Option<Language>) -> Vec<(u32, u32, u8)> {
-    let len = text.len() as u32;
-    let mut out: Vec<(u32, u32, u8)> = Vec::new();
+fn contiguous_runs(source: &dyn Source, language: Option<Language>) -> Vec<(u32, u32, HlClass)> {
+    let len = source.len();
+    let mut out: Vec<(u32, u32, HlClass)> = Vec::new();
     let Some(language) = language else {
-        push_contig(&mut out, 0, len, HlClass::Plain.as_u8());
+        push_contig(&mut out, 0, len, HlClass::Plain);
         return out;
     };
 
-    let source = &text as &dyn Source;
     let mut cursor = 0u32;
 
     // Exgit deliberately uses the lexical token table for languages without a
@@ -404,7 +413,7 @@ fn contiguous_runs(text: &str, language: Option<Language>) -> Vec<(u32, u32, u8)
             );
         }
         if cursor < len {
-            push_contig(&mut out, cursor, len, HlClass::Plain.as_u8());
+            push_contig(&mut out, cursor, len, HlClass::Plain);
         }
         return out;
     }
@@ -415,14 +424,14 @@ fn contiguous_runs(text: &str, language: Option<Language>) -> Vec<(u32, u32, u8)
         push_render_span(&mut out, &mut cursor, len, span);
     }
     if cursor < len {
-        push_contig(&mut out, cursor, len, HlClass::Plain.as_u8());
+        push_contig(&mut out, cursor, len, HlClass::Plain);
     }
     out
 }
 
 /// Appends one exgit-compatible render span, leaving whitespace as plain text.
 fn push_render_span(
-    out: &mut Vec<(u32, u32, u8)>,
+    out: &mut Vec<(u32, u32, HlClass)>,
     cursor: &mut u32,
     source_len: u32,
     span: RenderSpan,
@@ -437,9 +446,9 @@ fn push_render_span(
         return;
     }
     if start > *cursor {
-        push_contig(out, *cursor, start, HlClass::Plain.as_u8());
+        push_contig(out, *cursor, start, HlClass::Plain);
     }
-    push_contig(out, start, end, classify_span(&span).as_u8());
+    push_contig(out, start, end, classify_span(&span));
     *cursor = end;
 }
 
@@ -473,7 +482,7 @@ fn semantic_free_language(language: Language) -> bool {
 
 /// Appends `[start, end)` with `class`, extending the last run when it is the
 /// same class and abuts this one.
-fn push_contig(out: &mut Vec<(u32, u32, u8)>, start: u32, end: u32, class: u8) {
+fn push_contig(out: &mut Vec<(u32, u32, HlClass)>, start: u32, end: u32, class: HlClass) {
     if end <= start {
         return;
     }
@@ -641,9 +650,11 @@ mod tests {
     fn operators_and_punctuation_are_distinct_from_plain() {
         // Guards against the flat-highlight failure: symbols must not all fold
         // into one plain run.
-        let runs = contiguous_runs("a = b + c;", Some(Language::Rust));
-        let classes: Vec<u8> = runs.iter().map(|&(_, _, class)| class).collect();
-        assert!(classes.contains(&HlClass::Operator.as_u8()));
-        assert!(classes.contains(&HlClass::Punctuation.as_u8()));
+        let text = "a = b + c;";
+        let source: &dyn Source = &text;
+        let runs = contiguous_runs(source, Some(Language::Rust));
+        let classes: Vec<HlClass> = runs.iter().map(|&(_, _, class)| class).collect();
+        assert!(classes.contains(&HlClass::Operator));
+        assert!(classes.contains(&HlClass::Punctuation));
     }
 }

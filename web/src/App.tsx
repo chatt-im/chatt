@@ -500,18 +500,31 @@ function CodeBlock(props: { fragment: CodeFragment }) {
   );
 }
 
+function MessageFragment(props: { fragment: Fragment }) {
+  const content = () =>
+    props.fragment.kind === "text" ? (
+      <div class="message-body" innerHTML={fragmentHtml(props.fragment)} />
+    ) : (
+      <CodeBlock fragment={props.fragment} />
+    );
+
+  if (props.fragment.quote_depth === 0) return content();
+  return (
+    <blockquote class="message-quote">
+      <span class="message-quote-markers" aria-hidden="true">
+        {"> ".repeat(props.fragment.quote_depth)}
+      </span>
+      <div class="message-quote-content">{content()}</div>
+    </blockquote>
+  );
+}
+
 // Renders a message body from Rust-produced subset HTML and precomputed code
 // highlight spans. Nothing is parsed or highlighted in the browser.
 function MessageBody(props: { fragments: Fragment[] }) {
   return (
     <For each={props.fragments}>
-      {(fragment) =>
-        fragment.kind === "text" ? (
-          <div class="message-body" innerHTML={fragmentHtml(fragment)} />
-        ) : (
-          <CodeBlock fragment={fragment} />
-        )
-      }
+      {(fragment) => <MessageFragment fragment={fragment} />}
     </For>
   );
 }

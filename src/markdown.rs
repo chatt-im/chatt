@@ -21,14 +21,13 @@ pub enum TokenKind {
     UnorderedListStart,
     OrderedListStart,
     ListEnd,
-    ListItemStart {
-        marker: Range<u32>,
-    },
+    ListItemStart { marker: Range<u32> },
     ListItemEnd,
-    CodeBlock {
-        lang: Option<Range<u32>>,
-        content: Range<u32>,
-    },
+    CodeBlockStart { lang: Option<Range<u32>> },
+    CodeBlockLine,
+    CodeBlockEnd,
+    BlockQuoteStart,
+    BlockQuoteEnd,
     Text,
     BoldStart,
     BoldEnd,
@@ -47,25 +46,44 @@ enum ListKind {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-enum Block {
-    Code {
-        lang: Option<Range<usize>>,
-        content: Range<usize>,
-        range: Range<usize>,
-        next: usize,
-    },
-    UnclosedFence,
-    Header {
-        marker: Range<usize>,
-        text: Range<usize>,
-        next: usize,
-    },
-    ListItem {
-        kind: ListKind,
-        marker: Range<usize>,
-        text: Range<usize>,
-        next: usize,
-    },
+enum Fence {
+    Bare,
+    WithLanguage(Range<usize>),
+}
+
+enum LineKind {
+    Blank,
+    Fence(Fence),
+    Header,
+    ListItem(ListKind, usize),
+    Text,
+}
+
+struct SourceLine {
+    start: usize,
+    content_end: usize,
+    next: usize,
+    prefix_ends: Range<usize>,
+    kind: LineKind,
+    closing_fence: Option<usize>,
+}
+
+impl SourceLine {
+    fn quote_depth(&self) -> usize {
+        self.prefix_ends.len()
+    }
+
+    fn content_start(&self, prefix_ends: &[usize]) -> usize {
+        self.content_at_depth(prefix_ends, self.quote_depth())
+    }
+
+    fn content_at_depth(&self, prefix_ends: &[usize], depth: usize) -> usize {
+        if depth == 0 {
+            self.start
+        } else {
+            prefix_ends[self.prefix_ends.start + depth - 1]
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -84,81 +102,207 @@ struct EmphasisSpan {
 }
 
 /// Tokenizes `source` into `out`, replacing any previous contents.
+///
+/// Block parsing has three linear stages: [`scan_lines`] consumes the raw block
+/// structure and quote markers once, [`match_fences`] pairs fences using only
+/// line metadata, then this function emits block events from those indexed
+/// lines. Only inline-capable line contents are subsequently read by the inline
+/// tokenizer.
 pub fn tokenize(source: &str, out: &mut Vec<Token>) {
     out.clear();
     let bytes = source.as_bytes();
-    let mut pos = 0usize;
-    let mut open_list = None;
+    let (mut lines, prefix_ends) = scan_lines(bytes);
+    match_fences(&mut lines);
 
-    while pos < bytes.len() {
-        if is_blank_line(bytes, pos) {
-            close_list(out, &mut open_list, pos);
-            pos = line_bounds(bytes, pos).2;
+    let mut quote_depth = 0usize;
+    let mut paragraph_end = None;
+    let mut suppress_blocks = false;
+    let mut open_list = None;
+    let mut line_index = 0usize;
+
+    while line_index < lines.len() {
+        let line = &lines[line_index];
+        let depth = line.quote_depth();
+        let content_start = line.content_start(&prefix_ends);
+
+        if depth != quote_depth {
+            close_paragraph(out, &mut paragraph_end, &mut suppress_blocks, line.start);
+            close_list(out, &mut open_list, line.start);
+            change_quote_depth(out, &mut quote_depth, depth, line.start);
+        }
+
+        if matches!(line.kind, LineKind::Blank) {
+            close_paragraph(out, &mut paragraph_end, &mut suppress_blocks, line.start);
+            close_list(out, &mut open_list, line.start);
+            line_index += 1;
             continue;
         }
 
-        match block_at(bytes, pos) {
-            Some(Block::Code {
-                lang,
-                content,
-                range,
-                next,
-            }) => {
-                close_list(out, &mut open_list, pos);
-                push(
-                    out,
-                    TokenKind::CodeBlock {
-                        lang: lang.map(to_u32_range),
-                        content: to_u32_range(content),
-                    },
-                    range,
-                );
-                pos = next;
+        if !suppress_blocks && let Some(closing_index) = line.closing_fence {
+            close_paragraph(out, &mut paragraph_end, &mut suppress_blocks, line.start);
+            close_list(out, &mut open_list, line.start);
+            let lang = match &line.kind {
+                LineKind::Fence(Fence::Bare) => None,
+                LineKind::Fence(Fence::WithLanguage(range)) => Some(to_u32_range(range.clone())),
+                _ => unreachable!("only fence openers have a closing fence"),
+            };
+            push(
+                out,
+                TokenKind::CodeBlockStart { lang },
+                content_start..line.content_end,
+            );
+            for code_line in &lines[line_index + 1..closing_index] {
+                let start = code_line.content_at_depth(&prefix_ends, depth);
+                push(out, TokenKind::CodeBlockLine, start..code_line.content_end);
             }
-            Some(Block::Header { marker, text, next }) => {
-                close_list(out, &mut open_list, pos);
-                push(out, TokenKind::HeaderStart, marker);
-                tokenize_inline(source, text, out);
-                push_empty(out, TokenKind::HeaderEnd, next);
-                pos = next;
-            }
-            Some(Block::ListItem {
-                kind,
-                marker,
-                text,
-                next,
-            }) => {
-                if open_list != Some(kind) {
-                    close_list(out, &mut open_list, pos);
-                    push_empty(
-                        out,
-                        match kind {
-                            ListKind::Unordered => TokenKind::UnorderedListStart,
-                            ListKind::Ordered => TokenKind::OrderedListStart,
-                        },
-                        pos,
-                    );
-                    open_list = Some(kind);
-                }
-                push(
-                    out,
-                    TokenKind::ListItemStart {
-                        marker: to_u32_range(marker.clone()),
-                    },
-                    marker,
-                );
-                tokenize_inline(source, text, out);
-                push_empty(out, TokenKind::ListItemEnd, next);
-                pos = next;
-            }
-            Some(Block::UnclosedFence) | None => {
-                close_list(out, &mut open_list, pos);
-                pos = tokenize_paragraph(source, pos, out);
-            }
+            let closing = &lines[closing_index];
+            push(
+                out,
+                TokenKind::CodeBlockEnd,
+                closing.content_start(&prefix_ends)..closing.content_end,
+            );
+            line_index = closing_index + 1;
+            continue;
         }
+
+        if !suppress_blocks && matches!(line.kind, LineKind::Header) {
+            close_paragraph(out, &mut paragraph_end, &mut suppress_blocks, line.start);
+            close_list(out, &mut open_list, line.start);
+            push(
+                out,
+                TokenKind::HeaderStart,
+                content_start..content_start + 2,
+            );
+            tokenize_inline(source, content_start + 2..line.content_end, out);
+            push_empty(out, TokenKind::HeaderEnd, line.next);
+            line_index += 1;
+            continue;
+        }
+
+        let list_item = if suppress_blocks {
+            None
+        } else {
+            match line.kind {
+                LineKind::ListItem(kind, marker_len) => Some((kind, marker_len)),
+                _ => None,
+            }
+        };
+        if let Some((kind, marker_len)) = list_item {
+            close_paragraph(out, &mut paragraph_end, &mut suppress_blocks, line.start);
+            if open_list != Some(kind) {
+                close_list(out, &mut open_list, line.start);
+                push_empty(
+                    out,
+                    match kind {
+                        ListKind::Unordered => TokenKind::UnorderedListStart,
+                        ListKind::Ordered => TokenKind::OrderedListStart,
+                    },
+                    line.start,
+                );
+                open_list = Some(kind);
+            }
+            let marker = content_start..content_start + marker_len;
+            push(
+                out,
+                TokenKind::ListItemStart {
+                    marker: to_u32_range(marker.clone()),
+                },
+                marker,
+            );
+            tokenize_inline(source, content_start + marker_len..line.content_end, out);
+            push_empty(out, TokenKind::ListItemEnd, line.next);
+            line_index += 1;
+            continue;
+        }
+
+        close_list(out, &mut open_list, line.start);
+        if let Some(previous_end) = paragraph_end {
+            push(out, TokenKind::HardBreak, previous_end..line.start);
+        } else {
+            push_empty(out, TokenKind::ParagraphStart, line.start);
+        }
+        tokenize_inline(source, content_start..line.content_end, out);
+        paragraph_end = Some(line.content_end);
+        suppress_blocks |= matches!(line.kind, LineKind::Fence(_));
+        line_index += 1;
     }
 
-    close_list(out, &mut open_list, pos);
+    close_paragraph(out, &mut paragraph_end, &mut suppress_blocks, bytes.len());
+    close_list(out, &mut open_list, bytes.len());
+    change_quote_depth(out, &mut quote_depth, 0, bytes.len());
+}
+
+/// Scans physical lines and all quote-prefix boundaries exactly once. The
+/// flattened prefix table lets later block parsers address content at any quote
+/// depth without walking the markers again.
+fn scan_lines(bytes: &[u8]) -> (Vec<SourceLine>, Vec<usize>) {
+    let mut lines = Vec::new();
+    let mut prefix_ends = Vec::new();
+    let mut pos = 0usize;
+    while pos < bytes.len() {
+        let prefix_start = prefix_ends.len();
+        let mut content_start = pos;
+        while bytes.get(content_start) == Some(&b'>') {
+            content_start += 1;
+            if bytes.get(content_start) == Some(&b' ') {
+                content_start += 1;
+            }
+            prefix_ends.push(content_start);
+        }
+        let mut end = content_start;
+        while end < bytes.len() && bytes[end] != b'\n' {
+            end += 1;
+        }
+        let next = if end < bytes.len() { end + 1 } else { end };
+        let content_end = if end > pos && bytes[end - 1] == b'\r' {
+            end - 1
+        } else {
+            end
+        };
+        let kind = classify_line(bytes, content_start, content_end);
+        lines.push(SourceLine {
+            start: pos,
+            content_end,
+            next,
+            prefix_ends: prefix_start..prefix_ends.len(),
+            kind,
+            closing_fence: None,
+        });
+        pos = next;
+    }
+    (lines, prefix_ends)
+}
+
+/// Matches every possible fence opener to the next bare fence at the same quote
+/// depth, provided no intervening line leaves that quote. The reverse pass is
+/// linear: lowering the depth truncates candidates from quote scopes that ended.
+fn match_fences(lines: &mut [SourceLine]) {
+    let mut next_fence = vec![None];
+    for index in (0..lines.len()).rev() {
+        let depth = lines[index].quote_depth();
+        if next_fence.len() > depth + 1 {
+            next_fence.truncate(depth + 1);
+        } else {
+            next_fence.resize(depth + 1, None);
+        }
+        if matches!(lines[index].kind, LineKind::Fence(_)) {
+            lines[index].closing_fence = next_fence[depth];
+        }
+        if matches!(lines[index].kind, LineKind::Fence(Fence::Bare)) {
+            next_fence[depth] = Some(index);
+        }
+    }
+}
+
+fn change_quote_depth(out: &mut Vec<Token>, current: &mut usize, target: usize, pos: usize) {
+    while *current > target {
+        push_empty(out, TokenKind::BlockQuoteEnd, pos);
+        *current -= 1;
+    }
+    while *current < target {
+        push_empty(out, TokenKind::BlockQuoteStart, pos);
+        *current += 1;
+    }
 }
 
 /// The URL and message-reference ranges of a message body.
@@ -191,33 +335,16 @@ fn close_list(out: &mut Vec<Token>, open_list: &mut Option<ListKind>, pos: usize
     }
 }
 
-fn tokenize_paragraph(source: &str, pos: usize, out: &mut Vec<Token>) -> usize {
-    let bytes = source.as_bytes();
-    let mut line_pos = pos;
-    let mut suppress_blocks = false;
-
-    push_empty(out, TokenKind::ParagraphStart, pos);
-    loop {
-        let (content_end, _, next) = line_bounds(bytes, line_pos);
-        tokenize_inline(source, line_pos..content_end, out);
-        if matches!(block_at(bytes, line_pos), Some(Block::UnclosedFence)) {
-            suppress_blocks = true;
-        }
-        if next >= bytes.len() || is_blank_line(bytes, next) {
-            line_pos = next;
-            break;
-        }
-        if !suppress_blocks
-            && matches!(block_at(bytes, next), Some(block) if block != Block::UnclosedFence)
-        {
-            line_pos = next;
-            break;
-        }
-        push(out, TokenKind::HardBreak, content_end..next);
-        line_pos = next;
+fn close_paragraph(
+    out: &mut Vec<Token>,
+    paragraph_end: &mut Option<usize>,
+    suppress_blocks: &mut bool,
+    pos: usize,
+) {
+    if paragraph_end.take().is_some() {
+        push_empty(out, TokenKind::ParagraphEnd, pos);
+        *suppress_blocks = false;
     }
-    push_empty(out, TokenKind::ParagraphEnd, line_pos);
-    line_pos
 }
 
 fn tokenize_inline(source: &str, range: Range<usize>, out: &mut Vec<Token>) {
@@ -427,78 +554,34 @@ fn find_emphasis_close(
     None
 }
 
-fn block_at(bytes: &[u8], pos: usize) -> Option<Block> {
-    let (content_end, _, next) = line_bounds(bytes, pos);
-    let line = &bytes[pos..content_end];
-
-    if let Some(lang) = fence_opener(bytes, pos, content_end) {
-        let content_start = next;
-        let Some((closing_start, closing_next)) = find_closing_fence(bytes, next) else {
-            return Some(Block::UnclosedFence);
-        };
-        let mut code_end = closing_start;
-        if code_end > content_start && bytes[code_end - 1] == b'\n' {
-            code_end -= 1;
-            if code_end > content_start && bytes[code_end - 1] == b'\r' {
-                code_end -= 1;
-            }
-        }
-        return Some(Block::Code {
-            lang,
-            content: content_start..code_end,
-            range: pos..closing_next,
-            next: closing_next,
-        });
-    }
-
-    if line.starts_with(b"# ") {
-        return Some(Block::Header {
-            marker: pos..pos + 2,
-            text: pos + 2..content_end,
-            next,
-        });
-    }
-
-    if line.starts_with(b"- ") || line.starts_with(b"* ") {
-        return Some(Block::ListItem {
-            kind: ListKind::Unordered,
-            marker: pos..pos + 2,
-            text: pos + 2..content_end,
-            next,
-        });
-    }
-
-    if let Some(marker_len) = ordered_marker_len(line) {
-        return Some(Block::ListItem {
-            kind: ListKind::Ordered,
-            marker: pos..pos + marker_len,
-            text: pos + marker_len..content_end,
-            next,
-        });
-    }
-
-    None
-}
-
-fn fence_opener(bytes: &[u8], pos: usize, content_end: usize) -> Option<Option<Range<usize>>> {
+fn fence_opener(bytes: &[u8], pos: usize, content_end: usize) -> Option<Fence> {
     let line = &bytes[pos..content_end];
     if line == b"```" {
-        return Some(None);
+        return Some(Fence::Bare);
     }
     let lang = line.strip_prefix(b"```")?;
     (!lang.is_empty() && lang.iter().all(|b| b.is_ascii_alphanumeric()))
-        .then_some(Some(pos + 3..content_end))
+        .then_some(Fence::WithLanguage(pos + 3..content_end))
 }
 
-fn find_closing_fence(bytes: &[u8], mut pos: usize) -> Option<(usize, usize)> {
-    while pos < bytes.len() {
-        let (content_end, _, next) = line_bounds(bytes, pos);
-        if &bytes[pos..content_end] == b"```" {
-            return Some((pos, next));
-        }
-        pos = next;
+fn classify_line(bytes: &[u8], start: usize, end: usize) -> LineKind {
+    let line = &bytes[start..end];
+    if line.iter().all(|byte| matches!(byte, b' ' | b'\t')) {
+        return LineKind::Blank;
     }
-    None
+    if let Some(fence) = fence_opener(bytes, start, end) {
+        return LineKind::Fence(fence);
+    }
+    if line.starts_with(b"# ") {
+        return LineKind::Header;
+    }
+    if line.starts_with(b"- ") || line.starts_with(b"* ") {
+        return LineKind::ListItem(ListKind::Unordered, 2);
+    }
+    if let Some(marker_len) = ordered_marker_len(line) {
+        return LineKind::ListItem(ListKind::Ordered, marker_len);
+    }
+    LineKind::Text
 }
 
 fn ordered_marker_len(line: &[u8]) -> Option<usize> {
@@ -507,27 +590,6 @@ fn ordered_marker_len(line: &[u8]) -> Option<usize> {
         return None;
     }
     (line.get(digits) == Some(&b'.') && line.get(digits + 1) == Some(&b' ')).then_some(digits + 2)
-}
-
-fn line_bounds(bytes: &[u8], pos: usize) -> (usize, usize, usize) {
-    let mut end = pos;
-    while end < bytes.len() && bytes[end] != b'\n' {
-        end += 1;
-    }
-    let next = if end < bytes.len() { end + 1 } else { end };
-    let content_end = if end > pos && bytes[end - 1] == b'\r' {
-        end - 1
-    } else {
-        end
-    };
-    (content_end, end, next)
-}
-
-fn is_blank_line(bytes: &[u8], pos: usize) -> bool {
-    let (content_end, _, _) = line_bounds(bytes, pos);
-    bytes[pos..content_end]
-        .iter()
-        .all(|b| matches!(b, b' ' | b'\t'))
 }
 
 fn is_single_backtick(bytes: &[u8], pos: usize, bounds: Range<usize>) -> bool {
@@ -635,23 +697,19 @@ mod tests {
     fn exact_fenced_code_block() {
         assert_eq!(
             pairs("```rust\nfn\n```"),
-            vec![(
-                TokenKind::CodeBlock {
-                    lang: Some(3..7),
-                    content: 8..10,
-                },
-                0..14,
-            )]
+            vec![
+                (TokenKind::CodeBlockStart { lang: Some(3..7) }, 0..7,),
+                (TokenKind::CodeBlockLine, 8..10),
+                (TokenKind::CodeBlockEnd, 11..14),
+            ]
         );
         assert_eq!(
             pairs("```\ncode\n```"),
-            vec![(
-                TokenKind::CodeBlock {
-                    lang: None,
-                    content: 4..8,
-                },
-                0..12,
-            )]
+            vec![
+                (TokenKind::CodeBlockStart { lang: None }, 0..3),
+                (TokenKind::CodeBlockLine, 4..8),
+                (TokenKind::CodeBlockEnd, 9..12),
+            ]
         );
     }
 
@@ -662,7 +720,7 @@ mod tests {
             assert!(
                 tokens
                     .iter()
-                    .all(|(kind, _)| !matches!(kind, TokenKind::CodeBlock { .. }))
+                    .all(|(kind, _)| !matches!(kind, TokenKind::CodeBlockStart { .. }))
             );
         }
     }
@@ -673,7 +731,7 @@ mod tests {
         let tokens = pairs(source);
         assert!(tokens.iter().all(|(kind, _)| !matches!(
             kind,
-            TokenKind::CodeBlock { .. } | TokenKind::HeaderStart
+            TokenKind::CodeBlockStart { .. } | TokenKind::HeaderStart
         )));
         assert_eq!(texts(source, &tokens), vec!["```", "# still text"]);
     }
@@ -825,5 +883,129 @@ mod tests {
             vec!["https://x.test", "https://i.test"]
         );
         assert!(texts(source, &tokens).join("").contains("<b>raw</b>"));
+    }
+
+    fn kinds(source: &str) -> Vec<TokenKind> {
+        pairs(source).into_iter().map(|(kind, _)| kind).collect()
+    }
+
+    #[test]
+    fn recognizes_block_quotes() {
+        let source = "> a\n> b";
+        assert_eq!(
+            kinds(source),
+            vec![
+                TokenKind::BlockQuoteStart,
+                TokenKind::ParagraphStart,
+                TokenKind::Text,
+                TokenKind::HardBreak,
+                TokenKind::Text,
+                TokenKind::ParagraphEnd,
+                TokenKind::BlockQuoteEnd,
+            ]
+        );
+        assert_eq!(texts(source, &pairs(source)), vec!["a", "b"]);
+    }
+
+    #[test]
+    fn block_quote_without_space_and_bare_gt_is_plain() {
+        assert_eq!(texts(">quote", &pairs(">quote")), vec!["quote"]);
+        assert_eq!(
+            kinds(">quote").first(),
+            Some(&TokenKind::BlockQuoteStart),
+            "a bare `>` opens a quote even without a following space"
+        );
+        // A `>` with nothing after it is an empty quote line, still a quote.
+        assert_eq!(kinds(">").first(), Some(&TokenKind::BlockQuoteStart));
+    }
+
+    #[test]
+    fn nested_block_quotes() {
+        let source = "> outer\n>> inner\n> outer again";
+        assert_eq!(
+            kinds(source),
+            vec![
+                TokenKind::BlockQuoteStart,
+                TokenKind::ParagraphStart,
+                TokenKind::Text,
+                TokenKind::ParagraphEnd,
+                TokenKind::BlockQuoteStart,
+                TokenKind::ParagraphStart,
+                TokenKind::Text,
+                TokenKind::ParagraphEnd,
+                TokenKind::BlockQuoteEnd,
+                TokenKind::ParagraphStart,
+                TokenKind::Text,
+                TokenKind::ParagraphEnd,
+                TokenKind::BlockQuoteEnd,
+            ]
+        );
+        assert_eq!(
+            texts(source, &pairs(source)),
+            vec!["outer", "inner", "outer again"]
+        );
+    }
+
+    #[test]
+    fn code_block_inside_quote() {
+        let source = "> ```rust\n> fn f() {}\n> ```";
+        let tokens = pairs(source);
+        assert_eq!(
+            tokens.iter().map(|(k, _)| k.clone()).collect::<Vec<_>>(),
+            vec![
+                TokenKind::BlockQuoteStart,
+                TokenKind::CodeBlockStart { lang: Some(5..9) },
+                TokenKind::CodeBlockLine,
+                TokenKind::CodeBlockEnd,
+                TokenKind::BlockQuoteEnd,
+            ]
+        );
+        let (_, range) = tokens
+            .iter()
+            .find(|(k, _)| matches!(k, TokenKind::CodeBlockLine))
+            .map(|(k, r)| (k.clone(), r.clone()))
+            .unwrap();
+        assert_eq!(range, 12..21, "code line excludes the quote prefix");
+    }
+
+    #[test]
+    fn quote_ends_at_unprefixed_line() {
+        let source = "> quoted\nplain";
+        assert_eq!(
+            kinds(source),
+            vec![
+                TokenKind::BlockQuoteStart,
+                TokenKind::ParagraphStart,
+                TokenKind::Text,
+                TokenKind::ParagraphEnd,
+                TokenKind::BlockQuoteEnd,
+                TokenKind::ParagraphStart,
+                TokenKind::Text,
+                TokenKind::ParagraphEnd,
+            ]
+        );
+    }
+
+    #[test]
+    fn maximum_message_quote_depth_is_iterative() {
+        let source = format!(
+            "{}x",
+            ">".repeat(rpc::control::MAX_CHAT_BODY_BYTES.saturating_sub(1))
+        );
+        let tokens = pairs(&source);
+        assert_eq!(
+            tokens
+                .iter()
+                .filter(|(kind, _)| matches!(kind, TokenKind::BlockQuoteStart))
+                .count(),
+            rpc::control::MAX_CHAT_BODY_BYTES - 1
+        );
+        assert_eq!(
+            tokens
+                .iter()
+                .filter(|(kind, _)| matches!(kind, TokenKind::BlockQuoteEnd))
+                .count(),
+            rpc::control::MAX_CHAT_BODY_BYTES - 1
+        );
     }
 }

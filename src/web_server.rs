@@ -1256,7 +1256,7 @@ mod tests {
         // The file id carries the transfer id and the body keeps the size, so the
         // inline message correlates with and reads like its announcement.
         assert_eq!(message.file_id, Some(3));
-        let Fragment::Text(body) = &message.fragments[0] else {
+        let Fragment::Text { html: body, .. } = &message.fragments[0] else {
             panic!("expected a text fragment");
         };
         assert_eq!(body, "<p>sent file <code>wide.png</code> (10 B)</p>");
@@ -1584,10 +1584,7 @@ Sec-WebSocket-Version: 13\r\n\
         let (opcode, payload) = read_ws_frame(&mut stream);
         assert_eq!(opcode, 0x2);
         let message = web_wire::decode_single(&payload);
-        assert_eq!(
-            message.fragments,
-            vec![Fragment::Text("<p>hello web</p>".to_string())]
-        );
+        assert_eq!(message.fragments, vec![Fragment::text("<p>hello web</p>")]);
     }
 
     /// Sends a client-to-server text frame, which RFC 6455 requires to be masked.
@@ -1682,7 +1679,7 @@ Sec-WebSocket-Version: 13\r\n\
         assert_eq!(window.kind, web_wire::KIND_SYNC);
         assert_eq!(
             window.messages[0].fragments,
-            vec![Fragment::Text("<p>room one</p>".to_string())]
+            vec![Fragment::text("<p>room one</p>")]
         );
 
         // Leaving the room clears the view to nothing.
@@ -1734,10 +1731,7 @@ Sec-WebSocket-Version: 13\r\n\
             .collect();
         assert_eq!(
             bodies,
-            vec![
-                &Fragment::Text("<p>m0</p>".to_string()),
-                &Fragment::Text("<p>m1</p>".to_string()),
-            ]
+            vec![&Fragment::text("<p>m0</p>"), &Fragment::text("<p>m1</p>"),]
         );
     }
 
@@ -1791,10 +1785,7 @@ Sec-WebSocket-Version: 13\r\n\
         let (opcode, next) = read_ws_frame(&mut fresh);
         assert_eq!(opcode, 0x2);
         let message = web_wire::decode_single(&next);
-        assert_eq!(
-            message.fragments,
-            vec![Fragment::Text("<p>hi</p>".to_string())]
-        );
+        assert_eq!(message.fragments, vec![Fragment::text("<p>hi</p>")]);
     }
 
     #[test]

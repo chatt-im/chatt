@@ -17,10 +17,18 @@ export interface WebAttachment {
 // One piece of a message body. Prose is safe HTML rendered by Rust from the
 // canonical Markdown subset token stream; a code block renders from its
 // precomputed highlight spans (see `highlight.ts`). A code fragment's `text` is
-// UTF-8 bytes, because the spans are byte offsets into it.
+// UTF-8 bytes, because the spans are byte offsets into it. `quote_depth` is
+// presentation metadata shared by both kinds, so quoted code stays on the
+// normal highlighted-code path.
 export type Fragment =
-  | { kind: "text"; html: string }
-  | { kind: "code"; lang: string; text: Uint8Array; spans: Uint8Array };
+  | { kind: "text"; quote_depth: number; html: string }
+  | {
+      kind: "code";
+      quote_depth: number;
+      lang: string;
+      text: Uint8Array;
+      spans: Uint8Array;
+    };
 
 export interface WebMessage {
   id: number;

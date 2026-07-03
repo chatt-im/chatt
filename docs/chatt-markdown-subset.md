@@ -1,6 +1,6 @@
 # Chatt Markdown Subset
 
-Version: 1.0.0
+Version: 1.1.0
 
 Chatt messages use a small Markdown subset for chat text. This language is
 designed to be parsed identically by terminal and browser views, without raw
@@ -123,6 +123,31 @@ Rules:
 - If an opening fence has no matching closing fence in the same message, the
   fence and following lines are plain text.
 
+### Block Quote
+
+Syntax:
+
+```text
+> quoted text
+>> nested quote
+```
+
+Rules:
+
+- The marker must start at column 0.
+- The marker is a single `>` with an optional single following space. `>text`
+  and `> text` are both quotes.
+- Consecutive quoted lines form one block quote.
+- A block quote is a container: its content is parsed as full block content,
+  including paragraphs, headers, lists, and fenced code blocks.
+- Block quotes nest. A quoted line whose content itself opens with `>` starts a
+  nested quote one level deeper, so `>>` is two levels.
+- A block quote ends at the first line that drops the required markers.
+
+A block quote is the only container block. Renderers indent and visually
+distinguish it, keeping the quoted content otherwise styled like top-level
+content.
+
 ## Supported Inline Elements
 
 Inline parsing applies only to paragraph text, header text, and list item text.
@@ -206,7 +231,6 @@ The following Markdown features are not part of this language and are rendered
 as plain text:
 
 - Headers other than `# `.
-- Blockquotes such as `> quote`.
 - Nested lists and indented list items.
 - List continuation paragraphs.
 - Images such as `![alt](url)`.
@@ -235,7 +259,8 @@ Block parsing has this precedence:
 2. Header.
 3. Unordered list item.
 4. Ordered list item.
-5. Paragraph.
+5. Block quote, whose content is parsed recursively as blocks.
+6. Paragraph.
 
 Inline parsing has this precedence:
 
@@ -255,6 +280,9 @@ Renderers may choose different visual styling, but they must agree on structure:
 - Headers use a single modest emphasis level equivalent to an HTML `h3`.
 - Lists are flat.
 - Code blocks and inline code use monospace styling.
+- Block quotes render as an indented block that nests with depth, visually
+  distinct through dimmed text and either a left border or restyled `>` markers.
+  A renderer may hide the markers or keep them recolored.
 - HTML is never interpreted from message text.
 - Only raw `http://` and `https://` URLs become links.
 

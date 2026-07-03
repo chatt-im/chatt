@@ -5,6 +5,7 @@ use rpc::control::ChatMessage;
 use rpc::ids::FileTransferId;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
+use crate::highlight::{self, HlClass};
 use crate::markdown::{Token, TokenKind};
 use crate::theme::SyntaxTheme;
 
@@ -962,6 +963,9 @@ struct MessageLayout {
     /// Synthetic ranges of rendered pills paired with their `ChatEntry::refs`
     /// index, for hit-testing clicks on pill segments.
     pill_spans: Vec<(Range<u32>, u32)>,
+    /// Current block-quote nesting while laying out; drives the grey `> ` prefix
+    /// and dimmed text of quoted lines.
+    quote_depth: usize,
     complete: bool,
     estimated_lines: usize,
     syntax: SyntaxTheme,
@@ -971,15 +975,80 @@ struct RenderPiece {
     source: Range<usize>,
     display: Range<usize>,
     style: Style,
-    /// `Some(refs index)` when `source` indexes the synthetic pill text. Such
-    /// pieces never contribute to clipboard source mapping; the hidden literal
-    /// `@@code` range does instead.
-    synth: Option<u32>,
+    kind: PieceKind,
+}
+
+/// What a [`RenderPiece`]'s `source` range points at and how it maps to the
+/// clipboard.
+enum PieceKind {
+    /// Real message-body text; contributes to clipboard source mapping.
+    Body,
+    /// A resolved reference pill label in the synthetic buffer, paired with its
+    /// `ChatEntry::refs` index. Never contributes to clipboard mapping; the
+    /// hidden literal `@@code` range does instead.
+    Pill(u32),
+    /// Display-only synthetic text such as a block-quote `> ` marker. Never
+    /// contributes to clipboard mapping.
+    Synthetic,
 }
 
 struct InvisibleSource {
     source: Range<usize>,
     display_pos: usize,
+}
+
+#[derive(Clone, Copy)]
+struct CodeLine {
+    source_start: usize,
+    source_end: usize,
+    logical_start: u32,
+}
+
+impl CodeLine {
+    fn source_range(self) -> Range<usize> {
+        self.source_start..self.source_end
+    }
+
+    fn len(self) -> u32 {
+        self.source_end
+            .saturating_sub(self.source_start)
+            .min(u32::MAX as usize) as u32
+    }
+
+    fn logical_end(self) -> u32 {
+        self.logical_start.saturating_add(self.len())
+    }
+}
+
+struct CodeBlockSource<'a> {
+    text: &'a str,
+    lines: &'a [CodeLine],
+    len: u32,
+}
+
+impl tinyhl::Source for CodeBlockSource<'_> {
+    fn len(&self) -> u32 {
+        self.len
+    }
+
+    fn page(&self, offset: u32) -> (u32, &[u8]) {
+        if offset >= self.len {
+            return (self.len, &[]);
+        }
+
+        let line_index = self
+            .lines
+            .partition_point(|line| line.logical_start <= offset)
+            .saturating_sub(1);
+        let line = self.lines[line_index];
+        let line_end = line.logical_end();
+        if offset < line_end {
+            let source_start = line.source_start + (offset - line.logical_start) as usize;
+            return (offset, &self.text.as_bytes()[source_start..line.source_end]);
+        }
+
+        (line_end, b"\n")
+    }
 }
 
 #[derive(Default)]
@@ -999,6 +1068,7 @@ impl MessageLayout {
             segments: Vec::new(),
             synthetic: String::new(),
             pill_spans: Vec::new(),
+            quote_depth: 0,
             complete: false,
             estimated_lines: 1,
             syntax: SyntaxTheme::default(),
@@ -1086,6 +1156,7 @@ impl MessageLayout {
         self.segments.clear();
         self.synthetic.clear();
         self.pill_spans.clear();
+        self.quote_depth = 0;
         self.complete = false;
         self.estimated_lines = estimate_lines(text, width.max(1) as usize);
     }
@@ -1138,10 +1209,15 @@ impl MessageLayout {
             TokenKind::UnorderedListStart | TokenKind::OrderedListStart => {
                 self.cursor = self.layout_list(text, refs, self.cursor + 1, target);
             }
-            TokenKind::CodeBlock { content, .. } => {
-                let content = content.start as usize..content.end as usize;
-                let source = token_range(&self.tokens[self.cursor]);
-                self.layout_code_block(text, content, source, avail);
+            TokenKind::CodeBlockStart { .. } => {
+                self.cursor = self.layout_code_block(text, self.cursor, avail);
+            }
+            TokenKind::BlockQuoteStart => {
+                self.quote_depth = self.quote_depth.saturating_add(1);
+                self.cursor += 1;
+            }
+            TokenKind::BlockQuoteEnd => {
+                self.quote_depth = self.quote_depth.saturating_sub(1);
                 self.cursor += 1;
             }
             _ => self.cursor += 1,
@@ -1238,15 +1314,36 @@ impl MessageLayout {
         refs: &[MsgRefSpan],
         start: usize,
         end: usize,
-        base_style: Style,
-        widths: (usize, usize),
-        cols: (u16, u16),
+        mut base_style: Style,
+        mut widths: (usize, usize),
+        mut cols: (u16, u16),
         prefix: LinePrefix,
     ) {
         let mut display = String::new();
         let mut pieces = Vec::new();
         let mut invisible = Vec::new();
         let mut synthetic = String::new();
+
+        // Inside a block quote every line leads with a grey `> ` per nesting
+        // level and its text is dimmed. The marker is synthetic (display-only)
+        // so it stays out of the clipboard; wrapped continuation rows hang under
+        // the content, mirroring list layout.
+        if self.quote_depth > 0 {
+            base_style = base_style.patch(self.syntax.comment);
+            let marker = "> ".repeat(self.quote_depth);
+            let marker_width = UnicodeWidthStr::width(marker.as_str());
+            append_synth_prefix(
+                &marker,
+                self.synthetic.len(),
+                &mut synthetic,
+                &mut display,
+                &mut pieces,
+                self.syntax.comment,
+            );
+            let marker_col = marker_width.min(u16::MAX as usize) as u16;
+            cols.1 = cols.1.saturating_add(marker_col);
+            widths.1 = widths.1.saturating_sub(marker_width).max(1);
+        }
 
         if let Some((source, style)) = prefix.visible {
             append_piece(text, &mut display, &mut pieces, source, style);
@@ -1421,14 +1518,19 @@ impl MessageLayout {
                 let source_end = piece.source.start + (end - piece.display.start);
                 let prefix_width = UnicodeWidthStr::width(&display[wrapped.start..start]);
                 let col = base_col.saturating_add(prefix_width.min(u16::MAX as usize) as u16);
-                match piece.synth {
-                    Some(ref_index) => self.emit_pill_segment(
+                match piece.kind {
+                    PieceKind::Pill(ref_index) => self.emit_pill_segment(
                         source_start..source_end,
                         col,
                         piece.style,
                         ref_index,
                     ),
-                    None => self.emit_segment(source_start..source_end, col, piece.style),
+                    PieceKind::Synthetic => {
+                        self.emit_synth_segment(source_start..source_end, col, piece.style)
+                    }
+                    PieceKind::Body => {
+                        self.emit_segment(source_start..source_end, col, piece.style)
+                    }
                 }
             }
         }
@@ -1439,35 +1541,116 @@ impl MessageLayout {
                 self.note_source_range(source.source.start, source.source.end);
             }
             for piece in pieces {
-                if piece.synth.is_none() {
+                if matches!(piece.kind, PieceKind::Body) {
                     self.note_source_range(piece.source.start, piece.source.end);
                 }
             }
         }
     }
 
-    fn layout_code_block(
-        &mut self,
-        text: &str,
-        content: Range<usize>,
-        source: Range<usize>,
-        avail: usize,
-    ) {
-        if content.is_empty() {
-            self.push_line();
-            self.note_source_range(source.start, source.end);
-            return;
+    fn layout_code_block(&mut self, text: &str, start: usize, avail: usize) -> usize {
+        let lang = match &self.tokens[start].kind {
+            TokenKind::CodeBlockStart { lang } => lang
+                .as_ref()
+                .map(|range| &text[range.start as usize..range.end as usize]),
+            _ => None,
+        };
+        let lines_start = start + 1;
+        let mut cursor = lines_start;
+        while self
+            .tokens
+            .get(cursor)
+            .is_some_and(|token| matches!(token.kind, TokenKind::CodeBlockLine))
+        {
+            cursor += 1;
         }
 
-        let mut pos = content.start;
-        while pos <= content.end {
-            let (line_end, next) = line_bounds_limited(text.as_bytes(), pos, content.end);
-            self.emit_verbatim(text, pos, line_end, avail, self.syntax.string);
-            if next >= content.end {
-                break;
-            }
-            pos = next;
+        if cursor == lines_start {
+            let source_pos = token_range(&self.tokens[start]).end;
+            debug_assert!(
+                self.tokens
+                    .get(cursor)
+                    .is_some_and(|token| matches!(token.kind, TokenKind::CodeBlockEnd))
+            );
+            self.push_line();
+            self.emit_quote_marker();
+            self.note_source_range(source_pos, source_pos);
+            return cursor.saturating_add(1);
         }
+
+        match lang.and_then(highlight::language_for_tag) {
+            Some(language) => {
+                let lines = self.code_lines(lines_start, cursor);
+                let source = CodeBlockSource {
+                    text,
+                    len: lines.last().map_or(0, |line| line.logical_end()),
+                    lines: &lines,
+                };
+                let runs = highlight::source_runs(&source, Some(language));
+                let mut run_index = 0usize;
+                for line in lines {
+                    self.emit_highlighted_verbatim(text, line, avail, &runs, &mut run_index);
+                }
+            }
+            None => {
+                for index in lines_start..cursor {
+                    let range = token_range(&self.tokens[index]);
+                    self.emit_plain_verbatim(
+                        text,
+                        range.start,
+                        range.end,
+                        avail,
+                        self.syntax.string,
+                    );
+                }
+            }
+        }
+
+        debug_assert!(
+            self.tokens
+                .get(cursor)
+                .is_some_and(|token| matches!(token.kind, TokenKind::CodeBlockEnd))
+        );
+        cursor.saturating_add(1)
+    }
+
+    fn code_lines(&self, start: usize, end: usize) -> Vec<CodeLine> {
+        let mut lines = Vec::with_capacity(end.saturating_sub(start));
+        let mut logical_start = 0u32;
+        for index in start..end {
+            let range = token_range(&self.tokens[index]);
+            let line = CodeLine {
+                source_start: range.start,
+                source_end: range.end,
+                logical_start,
+            };
+            logical_start = line.logical_end();
+            if index + 1 < end {
+                logical_start = logical_start.saturating_add(1);
+            }
+            lines.push(line);
+        }
+        lines
+    }
+
+    /// Emits the grey `> ` marker run for the current quote depth on the current
+    /// line and returns its rendered width (0 when not in a quote).
+    fn emit_quote_marker(&mut self) -> usize {
+        if self.quote_depth == 0 {
+            return 0;
+        }
+        let marker = "> ".repeat(self.quote_depth);
+        let start = self.synthetic.len();
+        self.synthetic.push_str(&marker);
+        let width = UnicodeWidthStr::width(marker.as_str());
+        self.segments.push(Segment {
+            col: 0,
+            start: start as u32,
+            end: self.synthetic.len() as u32,
+            style: self.syntax.comment,
+            synth: true,
+        });
+        width
     }
 
     fn push_line(&mut self) {
@@ -1475,19 +1658,28 @@ impl MessageLayout {
         self.line_sources.push((u32::MAX, 0));
     }
 
-    fn emit_verbatim(&mut self, text: &str, start: usize, end: usize, avail: usize, style: Style) {
+    fn emit_plain_verbatim(
+        &mut self,
+        text: &str,
+        start: usize,
+        end: usize,
+        avail: usize,
+        style: Style,
+    ) {
         self.push_line();
+        let lead = self.emit_quote_marker();
         if start == end {
             self.note_source_range(start, end);
             return;
         }
-        let avail = avail.max(1);
+        let avail = avail.saturating_sub(lead).max(1);
+        let base = lead.min(u16::MAX as usize) as u16;
         let mut chunk_start = start;
         let mut width = 0usize;
         for (i, ch) in text[start..end].char_indices() {
             let w = UnicodeWidthChar::width(ch).unwrap_or(1);
             if width + w > avail && width > 0 {
-                self.emit_segment(chunk_start..start + i, 0, style);
+                self.emit_segment(chunk_start..start + i, base, style);
                 self.push_line();
                 chunk_start = start + i;
                 width = 0;
@@ -1495,7 +1687,122 @@ impl MessageLayout {
             width += w;
         }
         if chunk_start < end {
-            self.emit_segment(chunk_start..end, 0, style);
+            self.emit_segment(chunk_start..end, base, style);
+        }
+    }
+
+    fn emit_highlighted_verbatim(
+        &mut self,
+        text: &str,
+        line: CodeLine,
+        avail: usize,
+        runs: &[(u32, u32, HlClass)],
+        run_index: &mut usize,
+    ) {
+        self.push_line();
+        let lead = self.emit_quote_marker();
+        if line.source_start == line.source_end {
+            self.note_source_range(line.source_start, line.source_end);
+            return;
+        }
+
+        let avail = avail.saturating_sub(lead).max(1);
+        let base = lead.min(u16::MAX as usize) as u16;
+        let fallback = self.syntax.string;
+        let mut chunk_start = line.source_start;
+        let mut chunk_logical_start = line.logical_start;
+        let mut width = 0usize;
+
+        for (i, ch) in text[line.source_range()].char_indices() {
+            let w = UnicodeWidthChar::width(ch).unwrap_or(1);
+            if width + w > avail && width > 0 {
+                let chunk_end = line.source_start + i;
+                self.emit_highlighted_chunk(
+                    text,
+                    chunk_start,
+                    chunk_end,
+                    chunk_logical_start,
+                    base,
+                    runs,
+                    run_index,
+                    fallback,
+                );
+                self.push_line();
+                chunk_start = chunk_end;
+                chunk_logical_start = line.logical_start.saturating_add(i as u32);
+                width = 0;
+            }
+            width += w;
+        }
+
+        if chunk_start < line.source_end {
+            self.emit_highlighted_chunk(
+                text,
+                chunk_start,
+                line.source_end,
+                chunk_logical_start,
+                base,
+                runs,
+                run_index,
+                fallback,
+            );
+        }
+    }
+
+    fn emit_highlighted_chunk(
+        &mut self,
+        text: &str,
+        source_start: usize,
+        source_end: usize,
+        logical_start: u32,
+        base: u16,
+        runs: &[(u32, u32, HlClass)],
+        run_index: &mut usize,
+        fallback: Style,
+    ) {
+        let logical_end =
+            logical_start.saturating_add((source_end - source_start).min(u32::MAX as usize) as u32);
+        while *run_index < runs.len() && runs[*run_index].1 <= logical_start {
+            *run_index += 1;
+        }
+
+        let mut cursor = source_start;
+        let mut width = 0usize;
+        let mut index = *run_index;
+        while index < runs.len() && runs[index].0 < logical_end {
+            let (run_start, run_end, class) = runs[index];
+            let start = run_start.max(logical_start);
+            let end = run_end.min(logical_end);
+            if end > start {
+                let styled_start = source_start + (start - logical_start) as usize;
+                let styled_end = source_start + (end - logical_start) as usize;
+                if cursor < styled_start {
+                    let col = base.saturating_add(width.min(u16::MAX as usize) as u16);
+                    self.emit_segment(cursor..styled_start, col, fallback);
+                    width =
+                        width.saturating_add(UnicodeWidthStr::width(&text[cursor..styled_start]));
+                }
+
+                let col = base.saturating_add(width.min(u16::MAX as usize) as u16);
+                self.emit_segment(styled_start..styled_end, col, self.syntax.style_for(class));
+                width =
+                    width.saturating_add(UnicodeWidthStr::width(&text[styled_start..styled_end]));
+                cursor = styled_end;
+            }
+
+            if run_end > logical_end {
+                break;
+            }
+            index += 1;
+        }
+
+        if cursor < source_end {
+            let col = base.saturating_add(width.min(u16::MAX as usize) as u16);
+            self.emit_segment(cursor..source_end, col, fallback);
+        }
+
+        while *run_index < runs.len() && runs[*run_index].1 <= logical_end {
+            *run_index += 1;
         }
     }
 
@@ -1508,6 +1815,21 @@ impl MessageLayout {
                 end: range.end as u32,
                 style,
                 synth: false,
+            });
+        }
+    }
+
+    /// Emits a display-only synthetic segment (a block-quote `> ` marker). Like
+    /// [`Self::emit_pill_segment`] it notes no source range, so the markers stay
+    /// out of the clipboard, but it registers no pill span.
+    fn emit_synth_segment(&mut self, range: Range<usize>, col: u16, style: Style) {
+        if range.start < range.end {
+            self.segments.push(Segment {
+                col,
+                start: range.start as u32,
+                end: range.end as u32,
+                style,
+                synth: true,
             });
         }
     }
@@ -1602,7 +1924,7 @@ fn append_piece(
         source,
         display: start..display.len(),
         style,
-        synth: None,
+        kind: PieceKind::Body,
     });
 }
 
@@ -1630,7 +1952,34 @@ fn append_pill_piece(
         source: source_start..source_start + label.len(),
         display: start..display.len(),
         style,
-        synth: Some(ref_index),
+        kind: PieceKind::Pill(ref_index),
+    });
+}
+
+/// Appends a display-only synthetic prefix (a block-quote `> ` marker run) as a
+/// leading piece. Like a pill its `source` indexes the synthetic buffer, but it
+/// carries no reference and never enters clipboard mapping. `base` is the
+/// committed synthetic length before this line's local additions.
+fn append_synth_prefix(
+    marker: &str,
+    base: usize,
+    synthetic: &mut String,
+    display: &mut String,
+    pieces: &mut Vec<RenderPiece>,
+    style: Style,
+) {
+    if marker.is_empty() {
+        return;
+    }
+    let start = display.len();
+    display.push_str(marker);
+    let source_start = base + synthetic.len();
+    synthetic.push_str(marker);
+    pieces.push(RenderPiece {
+        source: source_start..source_start + marker.len(),
+        display: start..display.len(),
+        style,
+        kind: PieceKind::Synthetic,
     });
 }
 
@@ -1656,20 +2005,6 @@ fn ref_label(sender: &str, body: &str) -> String {
 
 fn token_range(token: &Token) -> Range<usize> {
     token.range.start as usize..token.range.end as usize
-}
-
-fn line_bounds_limited(bytes: &[u8], pos: usize, limit: usize) -> (usize, usize) {
-    let mut end = pos;
-    while end < limit && bytes[end] != b'\n' {
-        end += 1;
-    }
-    let next = if end < limit { end + 1 } else { end };
-    let content_end = if end > pos && bytes[end - 1] == b'\r' {
-        end - 1
-    } else {
-        end
-    };
-    (content_end, next)
 }
 
 fn estimate_lines(text: &str, avail: usize) -> usize {
@@ -2184,5 +2519,172 @@ mod tests {
         buf.extend_selection((0, buf.messages[0].layout.lines() - 1));
 
         assert_eq!(buf.selected_text().as_deref(), Some("alpha\nbeta"));
+    }
+
+    /// A theme whose `comment` slot is a distinct grey, so quote dimming is
+    /// observable (the derived default leaves every slot blank).
+    fn grey_theme() -> SyntaxTheme {
+        let mut syntax = SyntaxTheme::default();
+        syntax.comment = Style::DEFAULT.with_fg_rgb(0x8a, 0x8c, 0x8a);
+        syntax
+    }
+
+    fn syntax_probe_theme() -> SyntaxTheme {
+        let mut syntax = SyntaxTheme::default();
+        syntax.fg = Style::DEFAULT.with_fg_rgb(0x01, 0x01, 0x01);
+        syntax.keyword = Style::DEFAULT.with_fg_rgb(0x02, 0x02, 0x02);
+        syntax.function = Style::DEFAULT.with_fg_rgb(0x03, 0x03, 0x03);
+        syntax.string = Style::DEFAULT.with_fg_rgb(0x04, 0x04, 0x04);
+        syntax
+    }
+
+    /// Renders `body` into a standalone layout and returns its segments paired
+    /// with their rendered text.
+    fn quote_segments(body: &str) -> Vec<(Segment, String)> {
+        let mut layout = MessageLayout::new();
+        layout.ensure(40, body, &[], grey_theme());
+        (0..layout.lines())
+            .flat_map(|line| layout.line(line).to_vec())
+            .map(|seg| {
+                let text = layout.segment_str(body, &seg).to_string();
+                (seg, text)
+            })
+            .collect()
+    }
+
+    fn styled_segments(body: &str, syntax: SyntaxTheme) -> Vec<(String, Style)> {
+        let mut layout = MessageLayout::new();
+        layout.ensure(80, body, &[], syntax);
+        (0..layout.lines())
+            .flat_map(|line| layout.line(line).to_vec())
+            .filter(|seg| !seg.synth)
+            .map(|seg| (layout.segment_str(body, &seg).to_string(), seg.style))
+            .collect()
+    }
+
+    #[test]
+    fn fenced_code_block_uses_declared_language_highlighting() {
+        let syntax = syntax_probe_theme();
+        let segments = styled_segments("```rust\nfn main() {\n    let value = 1;\n}\n```", syntax);
+
+        let fn_style = segments
+            .iter()
+            .find_map(|(text, style)| (text == "fn").then_some(*style))
+            .expect("rust keyword segment");
+        assert_eq!(fn_style, syntax.keyword);
+
+        let main_style = segments
+            .iter()
+            .find_map(|(text, style)| (text == "main").then_some(*style))
+            .expect("rust function segment");
+        assert_eq!(main_style, syntax.function);
+    }
+
+    #[test]
+    fn quoted_fenced_code_block_uses_declared_language_highlighting() {
+        let syntax = syntax_probe_theme();
+        let segments = styled_segments("> ```rust\n> fn main() {}\n> ```", syntax);
+
+        let fn_style = segments
+            .iter()
+            .find_map(|(text, style)| (text == "fn").then_some(*style))
+            .expect("rust keyword segment");
+        assert_eq!(fn_style, syntax.keyword);
+
+        let main_style = segments
+            .iter()
+            .find_map(|(text, style)| (text == "main").then_some(*style))
+            .expect("rust function segment");
+        assert_eq!(main_style, syntax.function);
+    }
+
+    #[test]
+    fn unknown_code_block_language_keeps_code_style() {
+        let syntax = syntax_probe_theme();
+        let segments = styled_segments("```madeup\nfn main\n```", syntax);
+
+        assert!(
+            segments
+                .iter()
+                .any(|(text, style)| text == "fn main" && *style == syntax.string),
+            "unrecognized fences fall back to the code string color"
+        );
+    }
+
+    #[test]
+    fn block_quote_prefixes_grey_marker_and_dims_text() {
+        let grey = grey_theme().comment;
+        let segs = quote_segments("> quoted");
+
+        let (marker, _) = segs
+            .iter()
+            .find(|(seg, text)| seg.synth && text == "> ")
+            .expect("synthetic grey marker preserving the `>`");
+        assert_eq!(marker.style, grey);
+
+        let (body, _) = segs
+            .iter()
+            .find(|(seg, text)| !seg.synth && text == "quoted")
+            .expect("dimmed quote text");
+        assert_eq!(
+            body.style,
+            Style::DEFAULT.patch(grey),
+            "quote text is dimmed"
+        );
+    }
+
+    #[test]
+    fn nested_block_quote_marker_repeats_per_level() {
+        let segs = quote_segments(">> deep");
+        assert!(
+            segs.iter().any(|(seg, text)| seg.synth && text == "> > "),
+            "two nesting levels render two grey markers"
+        );
+    }
+
+    #[test]
+    fn quoted_marker_stays_out_of_line_selection() {
+        let mut buf = VirtualChatBuffer::new(1000, grey_theme());
+        buf.push_test("alice", "> a\n> b", 1_000_000, false);
+        let _ = buf.total_lines_exact(40);
+
+        // Selecting only the first rendered line copies its content, not the
+        // synthetic `> ` marker.
+        buf.begin_selection((0, 0));
+        buf.extend_selection((0, 0));
+        assert_eq!(buf.selected_text().as_deref(), Some("a"));
+    }
+
+    #[test]
+    fn quoted_code_selection_uses_logical_line_ranges() {
+        let mut buf = VirtualChatBuffer::new(1000, grey_theme());
+        buf.push_test(
+            "alice",
+            "intro\n> ```\n>> literal marker\n> ```\noutro",
+            1_000_000,
+            false,
+        );
+        let _ = buf.total_lines_exact(40);
+        assert_eq!(buf.messages[0].layout.lines(), 3);
+
+        buf.begin_selection((0, 1));
+        buf.extend_selection((0, 1));
+        assert_eq!(
+            buf.selected_text().as_deref(),
+            Some("> literal marker"),
+            "the container prefix is absent while the deeper literal marker remains"
+        );
+    }
+
+    #[test]
+    fn empty_quoted_code_has_no_synthetic_contiguous_source_range() {
+        let mut buf = VirtualChatBuffer::new(1000, grey_theme());
+        buf.push_test("alice", "intro\n> ```\n> ```\noutro", 1_000_000, false);
+        let _ = buf.total_lines_exact(40);
+        assert_eq!(buf.messages[0].layout.lines(), 3);
+
+        buf.begin_selection((0, 1));
+        buf.extend_selection((0, 1));
+        assert_eq!(buf.selected_text().as_deref(), Some(""));
     }
 }
