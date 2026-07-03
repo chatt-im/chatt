@@ -195,6 +195,11 @@ pub enum ServerControl {
         user_id: UserId,
         rooms: Vec<RoomInfo>,
         current_room: Option<RoomId>,
+        /// Server-wide user directory: every configured user plus online
+        /// dynamic users.
+        users: Vec<UserSummary>,
+        /// The room clients drop into (voice and first view) on connect.
+        default_room: RoomId,
     },
     /// Open pairing succeeded. Carries the issued bearer token the client must
     /// store, alongside the same session details as [`ServerControl::Authenticated`].
@@ -206,6 +211,8 @@ pub enum ServerControl {
         user_id: UserId,
         rooms: Vec<RoomInfo>,
         current_room: Option<RoomId>,
+        users: Vec<UserSummary>,
+        default_room: RoomId,
     },
     RoomJoined {
         room_id: RoomId,
@@ -1165,6 +1172,15 @@ mod tests {
                 voice_users: vec![UserId(4_294_967_296)],
             }],
             current_room: Some(RoomId(1)),
+            users: vec![UserSummary {
+                user_id: UserId(4_294_967_296),
+                display_name: "Zoe".to_string(),
+                identifier: "4294967296".to_string(),
+                online: true,
+                connected_at_ms: 1_700_000_000_000,
+                voice_status: ParticipantVoiceStatus::default(),
+            }],
+            default_room: RoomId(1),
         };
 
         let encoded = encode_server_control(&control);

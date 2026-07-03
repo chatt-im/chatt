@@ -27,8 +27,9 @@ use rpc::{
         ERROR_PASSWORD_MISMATCH, ERROR_PASSWORD_REQUIRED, ERROR_PUBLIC_DISABLED,
         ERROR_TOKEN_STALE_EPOCH, FileContentEncoding, FileMetadata, InviteTicket,
         MAX_BUG_REPORT_BYTES, MAX_FILE_CHUNK_BYTES, P2pCandidate, P2pKey, P2pNatKind, P2pPeerInfo,
-        P2pRole, RoomInfo, RoomKind, ServerControl, decode_client_control, decode_client_hello,
-        encode_invite_ticket, encode_server_control, encode_server_hello, max_file_wire_bytes,
+        P2pRole, RoomInfo, RoomKind, ServerControl, UserSummary, decode_client_control,
+        decode_client_hello, encode_invite_ticket, encode_server_control, encode_server_hello,
+        max_file_wire_bytes,
     },
     crypto::{
         AntiReplay, CHANNEL_CONTROL, CHANNEL_VIDEO, ControlTransport, DYNAMIC_TOKEN_PREFIX,
@@ -37,7 +38,7 @@ use rpc::{
         respond_to_client_hello_plaintext, verify_dynamic_token,
     },
     frame,
-    ids::{BugReportId, FileTransferId, RoomId, SessionId, StreamId, UserId},
+    ids::{BugReportId, FileTransferId, MessageId, RoomId, SessionId, StreamId, UserId},
     media::{self, MediaPayload},
     video::{self, VideoAck, VideoHello, VideoRole},
 };
@@ -57,8 +58,6 @@ const DEFAULT_ROOM: RoomId = RoomId(1);
 const POLL_TIMEOUT: Duration = Duration::from_millis(100);
 const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(20);
 const MAX_CLIENTS: usize = 1024;
-/// Most recent retained messages replayed to a joining session.
-const JOIN_BACKFILL_LIMIT: usize = 500;
 /// Capacity of the reusable per-client TCP read scratch buffer. Sized to
 /// swallow a full file chunk frame in one `read` on a fast link.
 const TCP_READ_BUFFER_BYTES: usize = 256 * 1024;
@@ -257,12 +256,27 @@ impl Server {
 
         let mut rooms = HashMap::new();
         for room in &config.rooms {
+            let access = match &room.members {
+                None => RoomAccess::Public,
+                Some(members) => RoomAccess::Private(
+                    members
+                        .iter()
+                        .filter_map(|member| {
+                            config
+                                .users
+                                .iter()
+                                .find(|user| user.name == *member)
+                                .map(|user| user.id)
+                        })
+                        .collect(),
+                ),
+            };
             rooms.insert(
                 room.room_id(),
                 RoomState {
                     id: room.room_id(),
                     name: room.name.clone(),
-                    members: HashSet::new(),
+                    access,
                     active_streams: HashMap::new(),
                 },
             );
@@ -273,13 +287,24 @@ impl Server {
                 RoomState {
                     id: DEFAULT_ROOM,
                     name: "lobby".to_string(),
-                    members: HashSet::new(),
+                    access: RoomAccess::Public,
                     active_streams: HashMap::new(),
                 },
             );
         }
         let default_room = config.default_room_id();
         let store = RoomStore::open(config.data_dir(), &config.rooms);
+        for dm in store.dm_rooms() {
+            rooms.insert(
+                dm.room_id,
+                RoomState {
+                    id: dm.room_id,
+                    name: dm_room_name(dm.user_a, dm.user_b),
+                    access: RoomAccess::Dm(dm.user_a, dm.user_b),
+                    active_streams: HashMap::new(),
+                },
+            );
+        }
 
         let server_key_pair = config
             .server_key_pair()
@@ -847,16 +872,16 @@ impl Server {
         annexb: bool,
         extradata: Vec<u8>,
     ) -> Result<(), String> {
-        let (user_id, sender_name, in_room) = match self.sessions.get(&session_id) {
+        let (user_id, sender_name, in_voice) = match self.sessions.get(&session_id) {
             Some(session) => (
                 session.user_id,
                 session.display_name.clone(),
-                session.room_id == Some(room_id),
+                session.voice_room == Some(room_id),
             ),
             None => return Err("unknown session".to_string()),
         };
-        if !in_room {
-            return Err("join the room before sharing".to_string());
+        if !in_voice {
+            return Err("join the room's voice call before sharing".to_string());
         }
         if self
             .streams
@@ -1145,40 +1170,50 @@ impl Server {
                 | ClientControl::Pair { .. }
                 | ClientControl::OpenPair { .. },
             ) => Err("session is already authenticated".into()),
-            (ConnState::Ready, ClientControl::JoinRoom { room_id }) => {
-                let session_id = self.session_for_token(token)?;
-                self.join_room(session_id, room_id);
+            (
+                ConnState::Ready,
+                ClientControl::JoinRoom { .. }
+                | ClientControl::StartVoice { .. }
+                | ClientControl::StopVoice { .. },
+            ) => {
+                self.send_control_to_token(
+                    token,
+                    &ServerControl::Error {
+                        code: 400,
+                        message: "legacy room protocol is no longer supported".to_string(),
+                    },
+                )?;
                 Ok(())
             }
             (ConnState::Ready, ClientControl::SendChat { room_id, body }) => {
                 let session_id = self.session_for_token(token)?;
                 self.send_chat(session_id, room_id, body)
             }
-            (ConnState::Ready, ClientControl::StartVoice { room_id }) => {
-                let session_id = self.session_for_token(token)?;
-                self.start_voice(session_id, room_id)
-            }
-            (ConnState::Ready, ClientControl::StopVoice { stream_id }) => {
-                kvlog::info!(
-                    "client stop voice ignored; voice follows room membership",
-                    stream_id = stream_id.0
-                );
-                Ok(())
-            }
             (
                 ConnState::Ready,
-                ClientControl::FetchHistory { .. }
-                | ClientControl::JoinVoice { .. }
-                | ClientControl::LeaveVoice
-                | ClientControl::OpenDm { .. },
+                ClientControl::FetchHistory {
+                    room_id,
+                    before,
+                    limit,
+                },
             ) => {
-                self.send_control_to_token(
-                    token,
-                    &ServerControl::Error {
-                        code: 400,
-                        message: "not supported yet".to_string(),
-                    },
-                )?;
+                let session_id = self.session_for_token(token)?;
+                self.fetch_history(session_id, room_id, before, limit);
+                Ok(())
+            }
+            (ConnState::Ready, ClientControl::JoinVoice { room_id }) => {
+                let session_id = self.session_for_token(token)?;
+                self.join_voice(session_id, room_id);
+                Ok(())
+            }
+            (ConnState::Ready, ClientControl::LeaveVoice) => {
+                let session_id = self.session_for_token(token)?;
+                self.leave_voice(session_id, None);
+                Ok(())
+            }
+            (ConnState::Ready, ClientControl::OpenDm { user_id }) => {
+                let session_id = self.session_for_token(token)?;
+                self.open_dm(session_id, user_id);
                 Ok(())
             }
             (ConnState::Ready, ClientControl::SetVoiceStatus { status }) => {
@@ -1736,7 +1771,7 @@ impl Server {
         user: &UserConfig,
         receive_files: bool,
         file_receive_limit_bytes: u64,
-        join_lobby: bool,
+        announce: bool,
         issued_token: Option<String>,
     ) -> Result<(), String> {
         let user_id = user.user_id();
@@ -1765,7 +1800,7 @@ impl Server {
                 display_name: display_name.clone(),
                 identifier: identifier.clone(),
                 tcp_token: token,
-                room_id: None,
+                voice_room: None,
                 udp_addr: None,
                 secrets,
                 media_send_counter: 0,
@@ -1777,7 +1812,8 @@ impl Server {
                 p2p: None,
                 receive_files,
                 file_receive_limit_bytes,
-                joined_at_ms: now_ms(),
+                announced: announce,
+                connected_at_ms: now_ms(),
             },
         );
 
@@ -1796,8 +1832,8 @@ impl Server {
             receive_files,
             file_receive_limit_bytes
         );
-        let rooms = self.room_infos();
-        let current_room = join_lobby.then_some(self.default_room);
+        let rooms = self.accessible_room_infos(user_id);
+        let users = self.user_summaries();
         let response = match issued_token {
             Some(token) => ServerControl::OpenPaired {
                 token,
@@ -1806,101 +1842,212 @@ impl Server {
                 session_id,
                 user_id,
                 rooms,
-                current_room,
+                current_room: None,
+                users,
+                default_room: self.default_room,
             },
             None => ServerControl::Authenticated {
                 session_id,
                 user_id,
                 rooms,
-                current_room,
+                current_room: None,
+                users,
+                default_room: self.default_room,
             },
         };
         self.send_control_to_token(token, &response)?;
-        if join_lobby && self.live_token_for_session(session_id).is_some() {
-            self.join_room(session_id, self.default_room);
+        if announce && self.live_token_for_session(session_id).is_some() {
+            self.broadcast_presence(session_id, true);
+            self.replay_accessible_shares(session_id);
         }
         Ok(())
     }
 
-    fn room_infos(&self) -> Vec<RoomInfo> {
-        self.rooms
+    /// Every room `user_id` can access, in stable id order.
+    fn accessible_room_infos(&self, user_id: UserId) -> Vec<RoomInfo> {
+        let mut rooms: Vec<&RoomState> = self
+            .rooms
             .values()
-            .map(|room| RoomInfo {
-                room_id: room.id,
-                name: room.name.clone(),
-                participants: room.members.len() as u32,
-                kind: RoomKind::Public,
-                head: self.store.head(room.id),
-                voice_users: room
-                    .active_streams
-                    .values()
-                    .filter_map(|session_id| self.sessions.get(session_id))
-                    .map(|session| session.user_id)
-                    .collect(),
-            })
-            .collect()
+            .filter(|room| room.access.allows(user_id))
+            .collect();
+        rooms.sort_by_key(|room| room.id.0);
+        rooms.iter().map(|room| self.room_info(room)).collect()
     }
 
-    fn join_room(&mut self, session_id: SessionId, room_id: RoomId) {
+    fn room_info(&self, room: &RoomState) -> RoomInfo {
+        RoomInfo {
+            room_id: room.id,
+            name: room.name.clone(),
+            participants: 0,
+            kind: room.access.kind(),
+            head: self.store.head(room.id),
+            voice_users: room
+                .active_streams
+                .values()
+                .filter_map(|session_id| self.sessions.get(session_id))
+                .map(|session| session.user_id)
+                .collect(),
+        }
+    }
+
+    /// The server-wide user directory: every configured user (online or not)
+    /// plus currently-online dynamic users.
+    fn user_summaries(&self) -> Vec<UserSummary> {
+        let mut users: Vec<UserSummary> = self
+            .config
+            .users
+            .iter()
+            .map(|user| {
+                let session = self
+                    .sessions
+                    .values()
+                    .find(|session| session.user_id == user.id);
+                UserSummary {
+                    user_id: user.id,
+                    display_name: user.display_name.clone(),
+                    identifier: user.name.clone(),
+                    online: session.is_some(),
+                    connected_at_ms: session.map(|s| s.connected_at_ms).unwrap_or(0),
+                    voice_status: session.map(|s| s.voice_status).unwrap_or_default(),
+                }
+            })
+            .collect();
+        for session in self.sessions.values() {
+            if is_dynamic_user_id(session.user_id) {
+                users.push(Self::session_user_summary(session, true));
+            }
+        }
+        users.sort_by_key(|user| user.user_id.0);
+        users.dedup_by_key(|user| user.user_id.0);
+        users
+    }
+
+    fn session_user_summary(session: &Session, online: bool) -> UserSummary {
+        UserSummary {
+            user_id: session.user_id,
+            display_name: session.display_name.clone(),
+            identifier: session.identifier.clone(),
+            online,
+            connected_at_ms: if online { session.connected_at_ms } else { 0 },
+            voice_status: if online {
+                session.voice_status
+            } else {
+                control::ParticipantVoiceStatus::default()
+            },
+        }
+    }
+
+    /// Announces a session's user coming online or going offline to every
+    /// other connected client.
+    fn broadcast_presence(&mut self, session_id: SessionId, online: bool) {
+        let Some(session) = self.sessions.get(&session_id) else {
+            return;
+        };
+        let own_token = session.tcp_token;
+        let user = Self::session_user_summary(session, online);
+        let control = ServerControl::PresenceV2 { user, online };
+        let tokens: Vec<Token> = self
+            .sessions
+            .values()
+            .map(|candidate| candidate.tcp_token)
+            .filter(|token| *token != own_token && self.clients.contains_key(token))
+            .collect();
+        for token in tokens {
+            let _ = self.send_control_to_token(token, &control);
+        }
+    }
+
+    /// Replays every active share in rooms the new session can access, so a
+    /// client that connects mid-share still sees it.
+    fn replay_accessible_shares(&mut self, session_id: SessionId) {
+        let Some(token) = self.live_token_for_session(session_id) else {
+            return;
+        };
+        let Some(user_id) = self
+            .sessions
+            .get(&session_id)
+            .map(|session| session.user_id)
+        else {
+            return;
+        };
+        let available: Vec<ServerControl> = self
+            .streams
+            .iter()
+            .filter(|(_, stream)| {
+                stream.owner_session != session_id
+                    && self
+                        .rooms
+                        .get(&stream.room_id)
+                        .is_some_and(|room| room.access.allows(user_id))
+            })
+            .map(|(stream_id, stream)| ServerControl::ShareAvailable {
+                room_id: stream.room_id,
+                stream_id: *stream_id,
+                user_id: stream.user_id,
+                sender_name: stream.sender_name.clone(),
+                codec: stream.codec.clone(),
+                coded_width: stream.coded_width,
+                coded_height: stream.coded_height,
+                annexb: stream.annexb,
+                extradata: stream.extradata.clone(),
+                view_secret: stream.view_secret.to_vec(),
+            })
+            .collect();
+        for control in &available {
+            if self.live_token_for_session(session_id).is_none() {
+                return;
+            }
+            let _ = self.send_control_to_token(token, control);
+        }
+    }
+
+    /// Whether the session's user may access the room; sends the deliberate
+    /// `404 room not found` (indistinguishable from a missing room) otherwise.
+    fn check_room_access(&mut self, session_id: SessionId, room_id: RoomId) -> bool {
+        let allowed = match (self.sessions.get(&session_id), self.rooms.get(&room_id)) {
+            (Some(session), Some(room)) => room.access.allows(session.user_id),
+            _ => false,
+        };
+        if !allowed && let Some(token) = self.live_token_for_session(session_id) {
+            let _ = self.send_control_to_token(
+                token,
+                &ServerControl::Error {
+                    code: control::ERROR_ROOM_NOT_FOUND,
+                    message: "room not found".to_string(),
+                },
+            );
+        }
+        allowed
+    }
+
+    fn join_voice(&mut self, session_id: SessionId, room_id: RoomId) {
         kvlog::info!(
-            "join room requested",
+            "join voice requested",
             session_id = session_id.0,
             room_id = room_id.0
         );
-        if !self.rooms.contains_key(&room_id) {
-            kvlog::warn!(
-                "join room rejected",
-                session_id = session_id.0,
-                room_id = room_id.0,
-                error = "room not found"
-            );
-            if let Some(token) = self.live_token_for_session(session_id) {
-                let _ = self.send_control_to_token(
-                    token,
-                    &ServerControl::Error {
-                        code: 404,
-                        message: "room not found".to_string(),
-                    },
-                );
-            }
+        if !self.check_room_access(session_id, room_id) {
             return;
         }
-
-        if let Some(previous) = self.sessions.get(&session_id).and_then(|s| s.room_id) {
-            if previous != room_id {
-                kvlog::info!(
-                    "leaving previous room before join",
-                    session_id = session_id.0,
-                    previous_room_id = previous.0,
-                    room_id = room_id.0
-                );
-                self.leave_room(session_id, previous, None);
-                if self.live_token_for_session(session_id).is_none() {
-                    return;
-                }
+        let previous = self.sessions.get(&session_id).and_then(|s| s.voice_room);
+        if previous.is_some_and(|previous| previous != room_id) {
+            self.leave_voice(session_id, None);
+            if self.live_token_for_session(session_id).is_none() {
+                return;
             }
         }
-
-        let Some(session) = self.sessions.get_mut(&session_id) else {
-            return;
-        };
-        session.room_id = Some(room_id);
-        session.joined_at_ms = now_ms();
-        if let Some(room) = self.rooms.get_mut(&room_id) {
-            room.members.insert(session_id);
-            kvlog::info!(
-                "room membership updated",
-                session_id = session_id.0,
-                room_id = room_id.0,
-                member_count = room.members.len()
-            );
+        let already_active = self
+            .sessions
+            .get(&session_id)
+            .is_some_and(|session| session.voice_room == Some(room_id));
+        if let Some(session) = self.sessions.get_mut(&session_id) {
+            session.voice_room = Some(room_id);
         }
-
         let voice_started = match self.ensure_voice_stream(session_id, room_id) {
             Ok(voice) => Some(voice),
             Err(error) => {
                 kvlog::warn!(
-                    "automatic voice stream failed",
+                    "voice stream failed",
                     session_id = session_id.0,
                     room_id = room_id.0,
                     error = error.as_str()
@@ -1908,84 +2055,153 @@ impl Server {
                 None
             }
         };
-
-        let participant = self.participant_for_session(session_id);
-        if let Some(participant) = participant.clone() {
-            self.broadcast_control(
-                room_id,
-                &ServerControl::Presence {
-                    room_id,
-                    participant,
-                    online: true,
-                },
-            );
+        if let Some(token) = self.live_token_for_session(session_id) {
+            self.send_existing_voice_streams_to_token(room_id, session_id, token);
+            if self.live_token_for_session(session_id).is_none() {
+                return;
+            }
         }
-
-        let Some(token) = self.live_token_for_session(session_id) else {
-            return;
-        };
-        let history = self.store.recent(room_id, JOIN_BACKFILL_LIMIT);
-        let participants = self.participants(room_id);
-        let _ = self.send_control_to_token(
-            token,
-            &ServerControl::RoomJoined {
-                room_id,
-                history,
-                participants,
-            },
-        );
-        if self.live_token_for_session(session_id).is_none() {
-            return;
-        }
-        self.send_existing_voice_streams_to_token(room_id, session_id, token);
-        if self.live_token_for_session(session_id).is_none() {
-            return;
-        }
-        self.send_existing_shares_to_token(room_id, session_id, token);
-        if self.live_token_for_session(session_id).is_none() {
-            return;
-        }
-        if let Some((user_id, stream_id)) = voice_started {
+        if !already_active && let Some((user_id, stream_id)) = voice_started {
             self.broadcast_voice_started(room_id, user_id, stream_id);
         }
-        kvlog::info!(
-            "room joined sent",
-            session_id = session_id.0,
-            room_id = room_id.0
-        );
     }
 
-    fn leave_room(
+    /// Leaves the session's current voice call: stops its stream, tears down
+    /// P2P pairings, and clears the voice room.
+    fn leave_voice(
         &mut self,
         session_id: SessionId,
-        room_id: RoomId,
         excluded_broadcast_session: Option<SessionId>,
     ) {
+        let Some(room_id) = self.sessions.get(&session_id).and_then(|s| s.voice_room) else {
+            return;
+        };
         kvlog::info!(
-            "leave room requested",
+            "leave voice",
             session_id = session_id.0,
             room_id = room_id.0
         );
         self.stop_voice(session_id, None, excluded_broadcast_session);
         self.broadcast_p2p_gone(session_id, room_id);
-        if let Some(room) = self.rooms.get_mut(&room_id) {
-            room.members.remove(&session_id);
-        }
         if let Some(session) = self.sessions.get_mut(&session_id) {
-            session.room_id = None;
+            session.voice_room = None;
             session.p2p = None;
         }
         self.remove_peer_links(session_id);
-        let participant = self.participant_for_session(session_id);
-        if let Some(participant) = participant {
-            self.broadcast_control(
+    }
+
+    /// Answers a history page from the room's retained messages.
+    fn fetch_history(
+        &mut self,
+        session_id: SessionId,
+        room_id: RoomId,
+        before: Option<MessageId>,
+        limit: u16,
+    ) {
+        if !self.check_room_access(session_id, room_id) {
+            return;
+        }
+        let Some(token) = self.live_token_for_session(session_id) else {
+            return;
+        };
+        let (messages, at_start) = self
+            .store
+            .messages_before(room_id, before, usize::from(limit));
+        kvlog::info!(
+            "history chunk sent",
+            session_id = session_id.0,
+            room_id = room_id.0,
+            message_count = messages.len(),
+            at_start
+        );
+        let _ = self.send_control_to_token(
+            token,
+            &ServerControl::HistoryChunk {
                 room_id,
-                &ServerControl::Presence {
-                    room_id,
-                    participant,
-                    online: false,
+                messages,
+                at_start,
+            },
+        );
+    }
+
+    /// Opens (or returns) the DM room between the requesting session's user
+    /// and `peer`, creating and persisting it on first use.
+    fn open_dm(&mut self, session_id: SessionId, peer: UserId) {
+        let Some(requester) = self
+            .sessions
+            .get(&session_id)
+            .map(|session| session.user_id)
+        else {
+            return;
+        };
+        let peer_known = self.config.users.iter().any(|user| user.id == peer)
+            || self
+                .sessions
+                .values()
+                .any(|session| session.user_id == peer)
+            || self.store.dm_room_for(requester, peer).is_some();
+        let Some(token) = self.live_token_for_session(session_id) else {
+            return;
+        };
+        if !peer_known {
+            let _ = self.send_control_to_token(
+                token,
+                &ServerControl::Error {
+                    code: control::ERROR_ROOM_NOT_FOUND,
+                    message: "user not found".to_string(),
                 },
             );
+            return;
+        }
+        let existing = self.store.dm_room_for(requester, peer);
+        let room_id = match self.store.open_dm(requester, peer, now_ms()) {
+            Ok(room_id) => room_id,
+            Err(error) => {
+                let _ = self.send_control_to_token(
+                    token,
+                    &ServerControl::Error {
+                        code: 500,
+                        message: error,
+                    },
+                );
+                return;
+            }
+        };
+        if !self.rooms.contains_key(&room_id) {
+            self.rooms.insert(
+                room_id,
+                RoomState {
+                    id: room_id,
+                    name: dm_room_name(requester, peer),
+                    access: RoomAccess::Dm(requester, peer),
+                    active_streams: HashMap::new(),
+                },
+            );
+        }
+        kvlog::info!(
+            "dm room opened",
+            session_id = session_id.0,
+            requester = requester.0,
+            peer = peer.0,
+            room_id = room_id.0,
+            created = existing.is_none()
+        );
+        if existing.is_none() {
+            let room = self.room_info(self.rooms.get(&room_id).expect("dm room inserted"));
+            let control = ServerControl::RoomUpserted { room };
+            let endpoint_tokens: Vec<Token> = self
+                .sessions
+                .values()
+                .filter(|session| session.user_id == requester || session.user_id == peer)
+                .map(|session| session.tcp_token)
+                .filter(|token| self.clients.contains_key(token))
+                .collect();
+            for endpoint in endpoint_tokens {
+                let _ = self.send_control_to_token(endpoint, &control);
+            }
+        }
+        if self.live_token_for_session(session_id).is_some() {
+            let _ = self.send_control_to_token(token, &ServerControl::DmOpened { room_id, peer });
         }
     }
 
@@ -2000,18 +2216,12 @@ impl Server {
         else {
             return;
         };
-        let tokens = self
-            .rooms
-            .get(&room_id)
-            .map(|room| {
-                room.members
-                    .iter()
-                    .copied()
-                    .filter(|member| *member != session_id)
-                    .filter_map(|member| self.live_token_for_session(member))
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
+        let tokens: Vec<Token> = self
+            .voice_member_sessions(room_id)
+            .into_iter()
+            .filter(|member| *member != session_id)
+            .filter_map(|member| self.live_token_for_session(member))
+            .collect();
         for token in tokens {
             let _ = self.send_control_to_token(
                 token,
@@ -2021,6 +2231,14 @@ impl Server {
                 },
             );
         }
+    }
+
+    /// Sessions currently in the room's voice call.
+    fn voice_member_sessions(&self, room_id: RoomId) -> Vec<SessionId> {
+        self.rooms
+            .get(&room_id)
+            .map(|room| room.active_streams.values().copied().collect())
+            .unwrap_or_default()
     }
 
     fn send_chat(
@@ -2036,12 +2254,8 @@ impl Server {
             room_id = room_id.0,
             body_size
         );
-        let (sender, sender_name, member) = match self.sessions.get(&session_id) {
-            Some(session) => (
-                session.user_id,
-                session.display_name.clone(),
-                session.room_id == Some(room_id),
-            ),
+        let (sender, sender_name) = match self.sessions.get(&session_id) {
+            Some(session) => (session.user_id, session.display_name.clone()),
             None => {
                 kvlog::warn!(
                     "chat send rejected",
@@ -2051,14 +2265,14 @@ impl Server {
                 return Err("unknown session".into());
             }
         };
-        if !member {
+        if !self.check_room_access(session_id, room_id) {
             kvlog::warn!(
                 "chat send rejected",
                 session_id = session_id.0,
                 room_id = room_id.0,
-                error = "not a room member"
+                error = "room not accessible"
             );
-            return Err("join the room before sending chat".into());
+            return Ok(());
         }
         let message = ChatMessage {
             message_id: self.store.allocate_message_id(room_id),
@@ -2107,25 +2321,25 @@ impl Server {
         if self.active_uploads.contains_key(&key) {
             return Err("file transfer id is already active".into());
         }
-        let (sender, sender_name, member) = match self.sessions.get(&session_id) {
-            Some(session) => (
-                session.user_id,
-                session.display_name.clone(),
-                session.room_id == Some(room_id),
-            ),
+        let (sender, sender_name) = match self.sessions.get(&session_id) {
+            Some(session) => (session.user_id, session.display_name.clone()),
             None => return Err("unknown session".into()),
         };
-        if !member {
-            return Err("join the room before uploading files".into());
+        if !self.check_room_access(session_id, room_id) {
+            return Ok(());
         }
 
-        let Some(member_ids) = self
+        let member_ids: Vec<SessionId> = self
             .rooms
             .get(&room_id)
-            .map(|room| room.members.iter().copied().collect::<Vec<_>>())
-        else {
-            return Err("room not found".into());
-        };
+            .map(|room| {
+                self.sessions
+                    .iter()
+                    .filter(|(_, session)| room.access.allows(session.user_id))
+                    .map(|(session_id, _)| *session_id)
+                    .collect()
+            })
+            .unwrap_or_default();
 
         let original_name = sanitize_file_name(&name);
         let file_name = self.allocate_file_name(&original_name);
@@ -2368,36 +2582,23 @@ impl Server {
         }
     }
 
-    fn start_voice(&mut self, session_id: SessionId, room_id: RoomId) -> Result<(), String> {
-        let already_active = self
-            .sessions
-            .get(&session_id)
-            .and_then(|session| session.active_stream)
-            .is_some();
-        let (user_id, stream_id) = self.ensure_voice_stream(session_id, room_id)?;
-        if !already_active {
-            self.broadcast_voice_started(room_id, user_id, stream_id);
-        }
-        Ok(())
-    }
-
     fn ensure_voice_stream(
         &mut self,
         session_id: SessionId,
         room_id: RoomId,
     ) -> Result<(UserId, StreamId), String> {
-        let (user_id, in_room) = match self.sessions.get(&session_id) {
-            Some(session) => (session.user_id, session.room_id == Some(room_id)),
+        let (user_id, in_voice) = match self.sessions.get(&session_id) {
+            Some(session) => (session.user_id, session.voice_room == Some(room_id)),
             None => return Err("unknown session".into()),
         };
-        if !in_room {
+        if !in_voice {
             kvlog::warn!(
                 "voice start rejected",
                 session_id = session_id.0,
                 room_id = room_id.0,
-                error = "not a room member"
+                error = "not in this room's voice call"
             );
-            return Err("join the room before starting voice".into());
+            return Err("join the room's voice call first".into());
         }
         if self
             .sessions
@@ -2480,36 +2681,6 @@ impl Server {
 
     /// Announces every active share in the room to a member that just joined, so
     /// a viewer who arrives mid-share still sees a play button with the codec.
-    fn send_existing_shares_to_token(
-        &mut self,
-        room_id: RoomId,
-        joining_session_id: SessionId,
-        token: Token,
-    ) {
-        let available = self
-            .streams
-            .iter()
-            .filter(|(_, stream)| {
-                stream.room_id == room_id && stream.owner_session != joining_session_id
-            })
-            .map(|(stream_id, stream)| ServerControl::ShareAvailable {
-                room_id,
-                stream_id: *stream_id,
-                user_id: stream.user_id,
-                sender_name: stream.sender_name.clone(),
-                codec: stream.codec.clone(),
-                coded_width: stream.coded_width,
-                coded_height: stream.coded_height,
-                annexb: stream.annexb,
-                extradata: stream.extradata.clone(),
-                view_secret: stream.view_secret.to_vec(),
-            })
-            .collect::<Vec<_>>();
-        for control in &available {
-            let _ = self.send_control_to_token(token, control);
-        }
-    }
-
     fn stop_voice(
         &mut self,
         session_id: SessionId,
@@ -2525,7 +2696,7 @@ impl Server {
                     return;
                 }
                 session.active_stream = None;
-                (session.room_id, session.user_id, stream_id)
+                (session.voice_room, session.user_id, stream_id)
             }
             None => return,
         };
@@ -2562,7 +2733,7 @@ impl Server {
             return;
         }
         session.voice_status = status;
-        let Some(room_id) = session.room_id else {
+        let Some(room_id) = session.voice_room else {
             return;
         };
         let user_id = session.user_id;
@@ -2617,12 +2788,12 @@ impl Server {
             self.remove_peer_links(session_id);
             return Ok(());
         }
-        let in_room = self
+        let in_voice = self
             .sessions
             .get(&session_id)
-            .is_some_and(|session| session.room_id == Some(room_id));
-        if !in_room {
-            return Err("join the room before publishing P2P candidates".into());
+            .is_some_and(|session| session.voice_room == Some(room_id));
+        if !in_voice {
+            return Err("join the room's voice call before publishing P2P candidates".into());
         }
         kvlog::info!(
             "p2p candidates published",
@@ -2640,24 +2811,18 @@ impl Server {
             });
         }
 
-        let peers = self
-            .rooms
-            .get(&room_id)
-            .map(|room| {
-                room.members
-                    .iter()
-                    .copied()
-                    .filter(|peer| *peer != session_id)
-                    .filter(|peer| self.live_token_for_session(*peer).is_some())
-                    .filter(|peer| {
-                        self.sessions
-                            .get(peer)
-                            .and_then(|s| s.p2p.as_ref())
-                            .is_some()
-                    })
-                    .collect::<Vec<_>>()
+        let peers: Vec<SessionId> = self
+            .voice_member_sessions(room_id)
+            .into_iter()
+            .filter(|peer| *peer != session_id)
+            .filter(|peer| self.live_token_for_session(*peer).is_some())
+            .filter(|peer| {
+                self.sessions
+                    .get(peer)
+                    .and_then(|s| s.p2p.as_ref())
+                    .is_some()
             })
-            .unwrap_or_default();
+            .collect();
 
         for peer_session_id in peers {
             if self.live_token_for_session(session_id).is_none() {
@@ -2719,7 +2884,7 @@ impl Server {
             (&link.high_to_low, &link.low_to_high)
         };
         Ok(P2pPeerInfo {
-            room_id: recipient_session.room_id.unwrap_or(self.default_room),
+            room_id: recipient_session.voice_room.unwrap_or(self.default_room),
             session_id: peer,
             user_id: peer_session.user_id,
             generation: peer_p2p.generation,
@@ -2949,23 +3114,17 @@ impl Server {
     ) -> Result<(), String> {
         let room_id = match self.sessions.get(&sender_session_id) {
             Some(session)
-                if session.active_stream == Some(stream_id) && session.room_id.is_some() =>
+                if session.active_stream == Some(stream_id) && session.voice_room.is_some() =>
             {
-                session.room_id.unwrap()
+                session.voice_room.unwrap()
             }
             _ => return Ok(()),
         };
-        let recipients = self
-            .rooms
-            .get(&room_id)
-            .map(|room| {
-                room.members
-                    .iter()
-                    .copied()
-                    .filter(|session_id| *session_id != sender_session_id)
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
+        let recipients: Vec<SessionId> = self
+            .voice_member_sessions(room_id)
+            .into_iter()
+            .filter(|session_id| *session_id != sender_session_id)
+            .collect();
         kvlog::info!(
             "voice packet relaying",
             session_id = sender_session_id.0,
@@ -3005,7 +3164,7 @@ impl Server {
         feedback: media::VoiceFeedback,
     ) -> Result<(), String> {
         let room_id = match self.sessions.get(&receiver_session_id) {
-            Some(session) => session.room_id,
+            Some(session) => session.voice_room,
             None => None,
         };
         let Some(room_id) = room_id else {
@@ -3063,7 +3222,7 @@ impl Server {
             log_audio_pop_server_media_packet(
                 "tx",
                 session_id,
-                session.room_id,
+                session.voice_room,
                 *stream_id,
                 *sequence,
                 *flags,
@@ -3136,7 +3295,7 @@ impl Server {
         excluded_session: Option<SessionId>,
     ) {
         let kind = server_control_kind(control);
-        let tokens = room_recipient_tokens(
+        let tokens = accessible_recipient_tokens(
             &self.rooms,
             &self.sessions,
             room_id,
@@ -3234,18 +3393,22 @@ impl Server {
         }
     }
 
-    /// Removes a session and everything keyed to it: its room membership (with a
-    /// `Presence` offline broadcast), media keys, active shares, pending uploads,
-    /// and peer links. Shared by the disconnect path and by the reconnect path
-    /// that supersedes a user's earlier session.
+    /// Removes a session and everything keyed to it: its voice call (with a
+    /// `VoiceStopped` broadcast), a `PresenceV2` offline broadcast, media keys,
+    /// active shares, pending uploads, and peer links. Shared by the disconnect
+    /// path and by the reconnect path that supersedes a user's earlier session.
     fn teardown_session(&mut self, session_id: SessionId, reason: &str) {
         self.cancel_uploads_for_session(session_id, reason);
         self.active_bug_reports
             .retain(|(owner, _), _| *owner != session_id);
         self.end_shares_for_session(session_id);
-        let room_id = self.sessions.get(&session_id).and_then(|s| s.room_id);
-        if let Some(room_id) = room_id {
-            self.leave_room(session_id, room_id, Some(session_id));
+        self.leave_voice(session_id, Some(session_id));
+        if self
+            .sessions
+            .get(&session_id)
+            .is_some_and(|session| session.announced)
+        {
+            self.broadcast_presence(session_id, false);
         }
         if let Some(session) = self.sessions.remove(&session_id) {
             if let Some(secrets) = &session.secrets {
@@ -3321,29 +3484,33 @@ impl Server {
         let room_ids = self
             .rooms
             .values()
-            .filter(|room| !room.members.is_empty())
+            .filter(|room| !room.active_streams.is_empty())
             .map(|room| room.id)
             .collect::<Vec<_>>();
         for room_id in room_ids {
             let members = self.room_rtt_snapshot(room_id, now);
-            self.broadcast_control(
-                room_id,
-                &ServerControl::RoomRttSnapshot { room_id, members },
-            );
+            let control = ServerControl::RoomRttSnapshot { room_id, members };
+            let tokens: Vec<Token> = self
+                .voice_member_sessions(room_id)
+                .into_iter()
+                .filter_map(|session_id| self.live_token_for_session(session_id))
+                .collect();
+            for token in tokens {
+                let _ = self.send_control_to_token(token, &control);
+            }
         }
     }
 
+    /// RTT snapshot of the room's voice call members.
     fn room_rtt_snapshot(
         &self,
         room_id: RoomId,
         now: Instant,
     ) -> Vec<control::ParticipantServerRtt> {
         let mut members = self
-            .rooms
-            .get(&room_id)
+            .voice_member_sessions(room_id)
             .into_iter()
-            .flat_map(|room| room.members.iter())
-            .filter_map(|session_id| self.sessions.get(session_id))
+            .filter_map(|session_id| self.sessions.get(&session_id))
             .map(|session| control::ParticipantServerRtt {
                 user_id: session.user_id,
                 server_rtt_ms: session.fresh_server_rtt(now),
@@ -3363,31 +3530,6 @@ impl Server {
     fn live_token_for_session(&self, session_id: SessionId) -> Option<Token> {
         let token = self.sessions.get(&session_id)?.tcp_token;
         self.clients.contains_key(&token).then_some(token)
-    }
-
-    fn participants(&self, room_id: RoomId) -> Vec<control::ParticipantInfo> {
-        self.rooms
-            .get(&room_id)
-            .map(|room| {
-                room.members
-                    .iter()
-                    .filter_map(|session_id| self.participant_for_session(*session_id))
-                    .collect()
-            })
-            .unwrap_or_default()
-    }
-
-    fn participant_for_session(&self, session_id: SessionId) -> Option<control::ParticipantInfo> {
-        self.sessions
-            .get(&session_id)
-            .map(|session| control::ParticipantInfo {
-                user_id: session.user_id,
-                display_name: session.display_name.clone(),
-                identifier: session.identifier.clone(),
-                in_call: session.room_id.is_some(),
-                voice_status: session.voice_status,
-                joined_at_ms: session.joined_at_ms,
-            })
     }
 
     fn remove_peer_links(&mut self, session_id: SessionId) {
@@ -3631,7 +3773,9 @@ struct Session {
     display_name: String,
     identifier: String,
     tcp_token: Token,
-    room_id: Option<RoomId>,
+    /// The room whose voice call this session is in, independent of which
+    /// room's chat the client is reading.
+    voice_room: Option<RoomId>,
     udp_addr: Option<SocketAddr>,
     secrets: Option<SessionSecrets>,
     media_send_counter: u64,
@@ -3643,10 +3787,12 @@ struct Session {
     p2p: Option<P2pSessionState>,
     receive_files: bool,
     file_receive_limit_bytes: u64,
-    /// Server wall-clock (UNIX ms) the session joined its current room, set on
-    /// every room join so a late joiner can show how long each participant has
-    /// been present. Seeded at session establishment to keep it populated.
-    joined_at_ms: u64,
+    /// Whether this session was announced with a `PresenceV2` online
+    /// broadcast; pairing throwaway connections are not, so their teardown
+    /// must not broadcast a matching offline.
+    announced: bool,
+    /// Server wall-clock (UNIX ms) the session connected.
+    connected_at_ms: u64,
 }
 
 impl Session {
@@ -3744,8 +3890,42 @@ struct InviteState {
 struct RoomState {
     id: RoomId,
     name: String,
-    members: HashSet<SessionId>,
+    access: RoomAccess,
     active_streams: HashMap<StreamId, SessionId>,
+}
+
+/// Who may read, post to, and join voice in a room. Doubles as the source of
+/// the wire-facing [`RoomKind`].
+#[derive(Clone, Debug)]
+enum RoomAccess {
+    Public,
+    Private(HashSet<UserId>),
+    Dm(UserId, UserId),
+}
+
+impl RoomAccess {
+    fn allows(&self, user_id: UserId) -> bool {
+        match self {
+            RoomAccess::Public => true,
+            RoomAccess::Private(members) => members.contains(&user_id),
+            RoomAccess::Dm(a, b) => *a == user_id || *b == user_id,
+        }
+    }
+
+    fn kind(&self) -> RoomKind {
+        match self {
+            RoomAccess::Public => RoomKind::Public,
+            RoomAccess::Private(members) => {
+                let mut members: Vec<UserId> = members.iter().copied().collect();
+                members.sort_unstable();
+                RoomKind::Private { members }
+            }
+            RoomAccess::Dm(a, b) => RoomKind::Dm {
+                user_a: *a,
+                user_b: *b,
+            },
+        }
+    }
 }
 
 /// Server-side state for one screen-share stream: the room it belongs to, the
@@ -3778,25 +3958,30 @@ struct VideoRingFrame {
     is_key: bool,
 }
 
-fn room_recipient_tokens(
+/// Live tokens of every connected session whose user can access the room —
+/// the fan-out set for chat, files, presence-in-room events, and catalog
+/// updates. Text delivery is not gated on any join.
+fn accessible_recipient_tokens(
     rooms: &HashMap<RoomId, RoomState>,
     sessions: &HashMap<SessionId, Session>,
     room_id: RoomId,
     excluded_session: Option<SessionId>,
     mut is_token_active: impl FnMut(Token) -> bool,
 ) -> Vec<Token> {
-    rooms
-        .get(&room_id)
-        .map(|room| {
-            room.members
-                .iter()
-                .copied()
-                .filter(|session_id| Some(*session_id) != excluded_session)
-                .filter_map(|session_id| sessions.get(&session_id).map(|session| session.tcp_token))
-                .filter(|token| is_token_active(*token))
-                .collect()
-        })
-        .unwrap_or_default()
+    let Some(room) = rooms.get(&room_id) else {
+        return Vec::new();
+    };
+    sessions
+        .iter()
+        .filter(|(session_id, _)| Some(**session_id) != excluded_session)
+        .filter(|(_, session)| room.access.allows(session.user_id))
+        .map(|(_, session)| session.tcp_token)
+        .filter(|token| is_token_active(*token))
+        .collect()
+}
+
+fn dm_room_name(a: UserId, b: UserId) -> String {
+    format!("dm:{}:{}", a.0, b.0)
 }
 
 /// Index of the most recent keyframe in a fast-start ring, the point a new
@@ -4123,22 +4308,35 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    fn test_room(room_id: RoomId, members: &[SessionId]) -> RoomState {
+    fn test_room(room_id: RoomId, voice_members: &[SessionId]) -> RoomState {
         RoomState {
             id: room_id,
             name: "test".to_string(),
-            members: members.iter().copied().collect(),
+            access: RoomAccess::Public,
+            active_streams: voice_members
+                .iter()
+                .enumerate()
+                .map(|(index, session_id)| (StreamId(index as u32 + 100), *session_id))
+                .collect(),
+        }
+    }
+
+    fn private_room(room_id: RoomId, members: &[UserId]) -> RoomState {
+        RoomState {
+            id: room_id,
+            name: "secret".to_string(),
+            access: RoomAccess::Private(members.iter().copied().collect()),
             active_streams: HashMap::new(),
         }
     }
 
-    fn test_session(user_id: UserId, token: Token, room_id: Option<RoomId>) -> Session {
+    fn test_session(user_id: UserId, token: Token, voice_room: Option<RoomId>) -> Session {
         Session {
             user_id,
             display_name: format!("user-{}", user_id.0),
             identifier: format!("user-{}", user_id.0),
             tcp_token: token,
-            room_id,
+            voice_room,
             udp_addr: None,
             secrets: None,
             media_send_counter: 0,
@@ -4150,7 +4348,8 @@ mod tests {
             p2p: None,
             receive_files: false,
             file_receive_limit_bytes: 0,
-            joined_at_ms: 0,
+            announced: true,
+            connected_at_ms: 0,
         }
     }
 
@@ -4226,7 +4425,7 @@ mod tests {
     }
 
     #[test]
-    fn voice_status_updates_participant_snapshot() {
+    fn voice_status_normalizes_deafened_to_muted() {
         let mut server = test_server();
         let room_id = RoomId(1);
         let session_id = SessionId(1);
@@ -4246,9 +4445,9 @@ mod tests {
             },
         );
 
-        let participant = server.participant_for_session(session_id).unwrap();
+        let session = server.sessions.get(&session_id).expect("session exists");
         assert_eq!(
-            participant.voice_status,
+            session.voice_status,
             control::ParticipantVoiceStatus {
                 muted: true,
                 deafened: true,
@@ -4283,8 +4482,11 @@ mod tests {
             "stale session should be evicted on reconnect"
         );
         assert!(
-            server.participants(room_id).is_empty(),
-            "the ghost participant must not linger in the room"
+            server
+                .user_summaries()
+                .iter()
+                .all(|user| user.user_id != user_id || !user.online),
+            "the ghost user must not linger online in the directory"
         );
     }
 
@@ -4305,6 +4507,397 @@ mod tests {
         assert!(
             server.sessions.contains_key(&other_id),
             "another user's session must be left untouched"
+        );
+    }
+
+    fn live_user(
+        server: &mut Server,
+        token: Token,
+        session_id: SessionId,
+        user_id: UserId,
+    ) -> std::net::TcpStream {
+        let (conn, peer) = test_live_client();
+        server.clients.insert(token, conn);
+        server
+            .sessions
+            .insert(session_id, test_session(user_id, token, None));
+        peer
+    }
+
+    fn read_until(
+        peer: &mut std::net::TcpStream,
+        accept: impl Fn(&ServerControl) -> bool,
+    ) -> ServerControl {
+        for _ in 0..64 {
+            let control = read_plaintext_server_control(peer);
+            if accept(&control) {
+                return control;
+            }
+        }
+        panic!("expected control was not received");
+    }
+
+    fn assert_no_control(peer: &mut std::net::TcpStream) {
+        peer.set_read_timeout(Some(Duration::from_millis(200)))
+            .expect("set read timeout");
+        let mut byte = [0u8; 1];
+        match peer.read(&mut byte) {
+            Ok(0) => {}
+            Ok(_) => panic!("unexpected control bytes received"),
+            Err(error) => assert!(
+                matches!(
+                    error.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                ),
+                "unexpected read error: {error}"
+            ),
+        }
+    }
+
+    #[test]
+    fn chat_fans_out_to_all_accessible_sessions() {
+        let mut server = test_server();
+        let sender = SessionId(1);
+        let reader = SessionId(2);
+        let mut sender_peer = live_user(&mut server, Token(11), sender, UserId(1));
+        let mut reader_peer = live_user(&mut server, Token(22), reader, UserId(2));
+
+        server
+            .send_chat(sender, RoomId(1), "hello everyone".to_string())
+            .unwrap();
+
+        for peer in [&mut sender_peer, &mut reader_peer] {
+            let control = read_until(peer, |control| {
+                matches!(control, ServerControl::Chat { .. })
+            });
+            let ServerControl::Chat { message } = control else {
+                unreachable!();
+            };
+            assert_eq!(message.body, "hello everyone");
+            assert_eq!(message.room_id, RoomId(1));
+            assert_eq!(message.message_id, MessageId(1));
+        }
+    }
+
+    #[test]
+    fn private_room_is_indistinguishable_from_missing() {
+        let mut server = test_server();
+        let secret = RoomId(3);
+        server
+            .rooms
+            .insert(secret, private_room(secret, &[UserId(1)]));
+        let outsider = SessionId(2);
+        let mut outsider_peer = live_user(&mut server, Token(22), outsider, UserId(2));
+
+        server
+            .send_chat(outsider, secret, "let me in".to_string())
+            .unwrap();
+        let denied = read_until(&mut outsider_peer, |control| {
+            matches!(control, ServerControl::Error { .. })
+        });
+
+        server.fetch_history(outsider, RoomId(99), None, 10);
+        let missing = read_until(&mut outsider_peer, |control| {
+            matches!(control, ServerControl::Error { .. })
+        });
+
+        assert_eq!(
+            denied, missing,
+            "private and missing rooms must answer identically"
+        );
+        let ServerControl::Error { code, .. } = denied else {
+            unreachable!();
+        };
+        assert_eq!(code, control::ERROR_ROOM_NOT_FOUND);
+    }
+
+    #[test]
+    fn private_room_chat_reaches_members_only() {
+        let mut server = test_server();
+        let secret = RoomId(3);
+        server
+            .rooms
+            .insert(secret, private_room(secret, &[UserId(1)]));
+        let member = SessionId(1);
+        let outsider = SessionId(2);
+        let mut member_peer = live_user(&mut server, Token(11), member, UserId(1));
+        let mut outsider_peer = live_user(&mut server, Token(22), outsider, UserId(2));
+
+        server
+            .send_chat(member, secret, "members only".to_string())
+            .unwrap();
+
+        let control = read_until(&mut member_peer, |control| {
+            matches!(control, ServerControl::Chat { .. })
+        });
+        let ServerControl::Chat { message } = control else {
+            unreachable!();
+        };
+        assert_eq!(message.body, "members only");
+        assert_no_control(&mut outsider_peer);
+    }
+
+    #[test]
+    fn dm_open_is_idempotent_per_user_pair() {
+        let dir = std::env::temp_dir().join(format!("chatt-dm-idem-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut server = test_server();
+        server.config.storage.data_dir = Some(dir.display().to_string());
+        let requester = SessionId(1);
+        let peer_session = SessionId(2);
+        let mut requester_peer = live_user(&mut server, Token(11), requester, UserId(1));
+        let mut endpoint_peer = live_user(&mut server, Token(22), peer_session, UserId(2));
+
+        server.open_dm(requester, UserId(2));
+        let upserted = read_until(&mut requester_peer, |control| {
+            matches!(control, ServerControl::RoomUpserted { .. })
+        });
+        let ServerControl::RoomUpserted { room } = upserted else {
+            unreachable!();
+        };
+        assert_eq!(
+            room.kind,
+            RoomKind::Dm {
+                user_a: UserId(1),
+                user_b: UserId(2),
+            }
+        );
+        let opened = read_until(&mut requester_peer, |control| {
+            matches!(control, ServerControl::DmOpened { .. })
+        });
+        let ServerControl::DmOpened { room_id, peer } = opened else {
+            unreachable!();
+        };
+        assert_eq!(room_id, room.room_id);
+        assert_eq!(peer, UserId(2));
+        read_until(&mut endpoint_peer, |control| {
+            matches!(control, ServerControl::RoomUpserted { .. })
+        });
+
+        server.open_dm(peer_session, UserId(1));
+        let reopened = read_until(&mut endpoint_peer, |control| {
+            matches!(control, ServerControl::DmOpened { .. })
+        });
+        let ServerControl::DmOpened {
+            room_id: second_id, ..
+        } = reopened
+        else {
+            unreachable!();
+        };
+        assert_eq!(second_id, room_id, "reopening must reuse the same DM room");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn dm_room_survives_restart() {
+        let dir = std::env::temp_dir().join(format!("chatt-dm-restart-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut server = test_server();
+        server.config.storage.data_dir = Some(dir.display().to_string());
+        server.store = RoomStore::open(server.config.data_dir(), &server.config.rooms);
+        let requester = SessionId(1);
+        let _requester_peer = live_user(&mut server, Token(11), requester, UserId(1));
+        let _peer_peer = live_user(&mut server, Token(22), SessionId(2), UserId(2));
+        server.open_dm(requester, UserId(2));
+        let dm_room = server
+            .store
+            .dm_room_for(UserId(1), UserId(2))
+            .expect("dm registered");
+        let mut config = server.config.clone();
+        config.network.tcp_addr = "127.0.0.1:0".parse().unwrap();
+        config.network.udp_addr = "127.0.0.1:0".parse().unwrap();
+        drop(server);
+
+        let restarted = Server::bind(config).expect("restarted server");
+
+        let room = restarted.rooms.get(&dm_room).expect("dm room restored");
+        assert!(matches!(
+            room.access,
+            RoomAccess::Dm(UserId(1), UserId(2)) | RoomAccess::Dm(UserId(2), UserId(1))
+        ));
+        assert_eq!(
+            restarted.store.dm_room_for(UserId(1), UserId(2)),
+            Some(dm_room)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn history_fetch_paginates_backwards() {
+        let mut config = ServerConfig::default();
+        config.network.tcp_addr = "127.0.0.1:0".parse().unwrap();
+        config.network.udp_addr = "127.0.0.1:0".parse().unwrap();
+        config.network.p2p_enabled = false;
+        config.rooms[0].persistence = config::RoomPersistenceConfig::Memory;
+        config.rooms[0].memory_limit = Some(100);
+        let mut server = Server::bind(config).expect("test server");
+        let session = SessionId(1);
+        let mut peer = live_user(&mut server, Token(11), session, UserId(1));
+        for index in 0..9 {
+            server
+                .send_chat(session, RoomId(1), format!("message {index}"))
+                .unwrap();
+        }
+
+        server.fetch_history(session, RoomId(1), Some(MessageId(6)), 4);
+
+        let chunk = read_until(&mut peer, |control| {
+            matches!(control, ServerControl::HistoryChunk { .. })
+        });
+        let ServerControl::HistoryChunk {
+            room_id,
+            messages,
+            at_start,
+        } = chunk
+        else {
+            unreachable!();
+        };
+        assert_eq!(room_id, RoomId(1));
+        let ids: Vec<u64> = messages
+            .iter()
+            .map(|message| message.message_id.0)
+            .collect();
+        assert_eq!(ids, vec![2, 3, 4, 5]);
+        assert!(!at_start);
+
+        server.fetch_history(session, RoomId(1), Some(MessageId(2)), 4);
+        let chunk = read_until(&mut peer, |control| {
+            matches!(control, ServerControl::HistoryChunk { .. })
+        });
+        let ServerControl::HistoryChunk {
+            messages, at_start, ..
+        } = chunk
+        else {
+            unreachable!();
+        };
+        assert_eq!(messages.len(), 1);
+        assert!(at_start);
+    }
+
+    #[test]
+    fn voice_in_room_a_persists_while_chatting_in_b() {
+        let mut server = test_server();
+        let room_a = RoomId(1);
+        let room_b = RoomId(2);
+        server.rooms.insert(room_b, test_room(room_b, &[]));
+        let talker = SessionId(1);
+        let listener = SessionId(2);
+        let mut talker_peer = live_user(&mut server, Token(11), talker, UserId(1));
+        let _listener_peer = live_user(&mut server, Token(22), listener, UserId(2));
+
+        server.join_voice(talker, room_a);
+        server
+            .send_chat(talker, room_b, "reading elsewhere".to_string())
+            .unwrap();
+
+        let session = server.sessions.get(&talker).expect("session exists");
+        assert_eq!(session.voice_room, Some(room_a));
+        assert!(session.active_stream.is_some());
+        assert_eq!(server.voice_member_sessions(room_a), vec![talker]);
+        let control = read_until(&mut talker_peer, |control| {
+            matches!(control, ServerControl::Chat { .. })
+        });
+        let ServerControl::Chat { message } = control else {
+            unreachable!();
+        };
+        assert_eq!(message.room_id, room_b);
+    }
+
+    #[test]
+    fn join_voice_moves_the_call_between_rooms() {
+        let mut server = test_server();
+        let room_a = RoomId(1);
+        let room_b = RoomId(2);
+        server.rooms.insert(room_b, test_room(room_b, &[]));
+        let talker = SessionId(1);
+        let _talker_peer = live_user(&mut server, Token(11), talker, UserId(1));
+
+        server.join_voice(talker, room_a);
+        server.join_voice(talker, room_b);
+
+        let session = server.sessions.get(&talker).expect("session exists");
+        assert_eq!(session.voice_room, Some(room_b));
+        assert!(server.voice_member_sessions(room_a).is_empty());
+        assert_eq!(server.voice_member_sessions(room_b), vec![talker]);
+    }
+
+    #[test]
+    fn leave_voice_stops_stream_and_broadcasts() {
+        let mut server = test_server();
+        let room_a = RoomId(1);
+        let talker = SessionId(1);
+        let watcher = SessionId(2);
+        let _talker_peer = live_user(&mut server, Token(11), talker, UserId(1));
+        let mut watcher_peer = live_user(&mut server, Token(22), watcher, UserId(2));
+
+        server.join_voice(talker, room_a);
+        read_until(&mut watcher_peer, |control| {
+            matches!(control, ServerControl::VoiceStarted { .. })
+        });
+        server.leave_voice(talker, None);
+
+        let stopped = read_until(&mut watcher_peer, |control| {
+            matches!(control, ServerControl::VoiceStopped { .. })
+        });
+        let ServerControl::VoiceStopped {
+            room_id, user_id, ..
+        } = stopped
+        else {
+            unreachable!();
+        };
+        assert_eq!(room_id, room_a);
+        assert_eq!(user_id, UserId(1));
+        let session = server.sessions.get(&talker).expect("session exists");
+        assert_eq!(session.voice_room, None);
+        assert!(session.active_stream.is_none());
+        assert!(server.voice_member_sessions(room_a).is_empty());
+    }
+
+    #[test]
+    fn join_voice_answers_404_for_inaccessible_room() {
+        let mut server = test_server();
+        let secret = RoomId(3);
+        server
+            .rooms
+            .insert(secret, private_room(secret, &[UserId(1)]));
+        let outsider = SessionId(2);
+        let mut outsider_peer = live_user(&mut server, Token(22), outsider, UserId(2));
+
+        server.join_voice(outsider, secret);
+
+        let control = read_until(&mut outsider_peer, |control| {
+            matches!(control, ServerControl::Error { .. })
+        });
+        let ServerControl::Error { code, .. } = control else {
+            unreachable!();
+        };
+        assert_eq!(code, control::ERROR_ROOM_NOT_FOUND);
+        let session = server.sessions.get(&outsider).expect("session exists");
+        assert_eq!(session.voice_room, None);
+    }
+
+    #[test]
+    fn rtt_snapshot_covers_voice_room_only() {
+        let mut server = test_server();
+        let room_a = RoomId(1);
+        let talker = SessionId(1);
+        let idler = SessionId(2);
+        let _talker_peer = live_user(&mut server, Token(11), talker, UserId(1));
+        let _idler_peer = live_user(&mut server, Token(22), idler, UserId(2));
+        server.join_voice(talker, room_a);
+        let now = Instant::now();
+        if let Some(session) = server.sessions.get_mut(&talker) {
+            session.report_server_rtt(Some(45), now);
+        }
+
+        let members = server.room_rtt_snapshot(room_a, now);
+
+        assert_eq!(
+            members,
+            vec![control::ParticipantServerRtt {
+                user_id: UserId(1),
+                server_rtt_ms: Some(45),
+            }]
         );
     }
 
@@ -4478,71 +5071,65 @@ mod tests {
     }
 
     #[test]
-    fn room_recipient_tokens_excludes_leaving_session() {
+    fn accessible_recipient_tokens_exclude_the_acting_session() {
         let room_id = RoomId(1);
-        let leaving_session = SessionId(1);
-        let remaining_session = SessionId(2);
+        let acting_session = SessionId(1);
+        let other_session = SessionId(2);
         let mut rooms = HashMap::new();
-        rooms.insert(
-            room_id,
-            test_room(room_id, &[leaving_session, remaining_session]),
-        );
+        rooms.insert(room_id, test_room(room_id, &[]));
         let mut sessions = HashMap::new();
-        sessions.insert(
-            leaving_session,
-            test_session(UserId(1), Token(3), Some(room_id)),
-        );
-        sessions.insert(
-            remaining_session,
-            test_session(UserId(2), Token(4), Some(room_id)),
-        );
+        sessions.insert(acting_session, test_session(UserId(1), Token(3), None));
+        sessions.insert(other_session, test_session(UserId(2), Token(4), None));
 
         let tokens =
-            room_recipient_tokens(&rooms, &sessions, room_id, Some(leaving_session), |_| true);
+            accessible_recipient_tokens(&rooms, &sessions, room_id, Some(acting_session), |_| true);
 
         assert_eq!(tokens, vec![Token(4)]);
     }
 
     #[test]
-    fn room_recipient_tokens_includes_all_sessions_without_exclusion() {
+    fn accessible_recipient_tokens_cover_every_session_for_public_rooms() {
         let room_id = RoomId(1);
         let mut rooms = HashMap::new();
-        rooms.insert(room_id, test_room(room_id, &[SessionId(1), SessionId(2)]));
+        rooms.insert(room_id, test_room(room_id, &[]));
         let mut sessions = HashMap::new();
-        sessions.insert(
-            SessionId(1),
-            test_session(UserId(1), Token(3), Some(room_id)),
-        );
-        sessions.insert(
-            SessionId(2),
-            test_session(UserId(2), Token(4), Some(room_id)),
-        );
+        sessions.insert(SessionId(1), test_session(UserId(1), Token(3), None));
+        sessions.insert(SessionId(2), test_session(UserId(2), Token(4), None));
 
-        let mut tokens = room_recipient_tokens(&rooms, &sessions, room_id, None, |_| true);
+        let mut tokens = accessible_recipient_tokens(&rooms, &sessions, room_id, None, |_| true);
         tokens.sort_by_key(|token| token.0);
 
         assert_eq!(tokens, vec![Token(3), Token(4)]);
     }
 
     #[test]
-    fn room_recipient_tokens_skips_inactive_tokens() {
+    fn accessible_recipient_tokens_skip_inactive_tokens() {
         let room_id = RoomId(1);
         let mut rooms = HashMap::new();
-        rooms.insert(room_id, test_room(room_id, &[SessionId(1), SessionId(2)]));
+        rooms.insert(room_id, test_room(room_id, &[]));
         let mut sessions = HashMap::new();
-        sessions.insert(
-            SessionId(1),
-            test_session(UserId(1), Token(3), Some(room_id)),
-        );
-        sessions.insert(
-            SessionId(2),
-            test_session(UserId(2), Token(4), Some(room_id)),
-        );
+        sessions.insert(SessionId(1), test_session(UserId(1), Token(3), None));
+        sessions.insert(SessionId(2), test_session(UserId(2), Token(4), None));
 
-        let tokens =
-            room_recipient_tokens(&rooms, &sessions, room_id, None, |token| token != Token(3));
+        let tokens = accessible_recipient_tokens(&rooms, &sessions, room_id, None, |token| {
+            token != Token(3)
+        });
 
         assert_eq!(tokens, vec![Token(4)]);
+    }
+
+    #[test]
+    fn accessible_recipient_tokens_respect_private_membership() {
+        let room_id = RoomId(2);
+        let mut rooms = HashMap::new();
+        rooms.insert(room_id, private_room(room_id, &[UserId(1)]));
+        let mut sessions = HashMap::new();
+        sessions.insert(SessionId(1), test_session(UserId(1), Token(3), None));
+        sessions.insert(SessionId(2), test_session(UserId(2), Token(4), None));
+
+        let tokens = accessible_recipient_tokens(&rooms, &sessions, room_id, None, |_| true);
+
+        assert_eq!(tokens, vec![Token(3)]);
     }
 
     #[test]
@@ -4737,7 +5324,7 @@ mod tests {
     }
 
     #[test]
-    fn open_pairing_does_not_join_lobby() {
+    fn open_pairing_does_not_announce_or_join_voice() {
         let (mut server, path) = open_pair_test_server("no-lobby");
         let token = Token(11);
         let (conn, _peer) = test_live_client();
@@ -4748,13 +5335,14 @@ mod tests {
             .unwrap();
 
         let session = session_for(&server, token).expect("session established");
-        assert_eq!(session.room_id, None);
+        assert_eq!(session.voice_room, None);
+        assert!(!session.announced);
         assert!(
             server
                 .rooms
                 .get(&DEFAULT_ROOM)
                 .expect("lobby exists")
-                .members
+                .active_streams
                 .is_empty()
         );
         let _ = std::fs::remove_file(&path);
@@ -5026,11 +5614,11 @@ mod tests {
     }
 
     #[test]
-    fn pairing_does_not_join_lobby() {
+    fn pairing_does_not_announce_or_join_voice() {
         // A pairing connection acknowledges with `Authenticated` but must not
-        // join the lobby. Otherwise it broadcasts a `Presence` online, then a
-        // matching offline when the throwaway socket drops, so other clients
-        // see the user flicker in and out before the real session joins.
+        // announce presence or join voice. Otherwise it broadcasts an online
+        // presence, then a matching offline when the throwaway socket drops,
+        // so other clients see the user flicker before the real session joins.
         let path = std::env::temp_dir().join(format!(
             "chatt-server-pair-lobby-test-{}.toml",
             std::process::id()
@@ -5068,13 +5656,14 @@ mod tests {
             .values()
             .find(|session| session.identifier == "gwen")
             .expect("pairing session exists");
-        assert_eq!(session.room_id, None);
+        assert_eq!(session.voice_room, None);
+        assert!(!session.announced);
         assert!(
             server
                 .rooms
                 .get(&DEFAULT_ROOM)
                 .expect("lobby exists")
-                .members
+                .active_streams
                 .is_empty()
         );
     }

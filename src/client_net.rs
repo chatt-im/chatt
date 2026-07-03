@@ -3347,6 +3347,7 @@ impl WorkerState {
                 user_id,
                 rooms,
                 current_room,
+                ..
             } => {
                 self.session_id = Some(session_id);
                 self.user_id = Some(user_id);
