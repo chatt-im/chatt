@@ -108,9 +108,16 @@ impl RoomStore {
             .as_deref()
             .map(load_state)
             .unwrap_or_else(StoreState::default);
+        let mut next_room_id = state.next_room_id.max(FIRST_DYNAMIC_ROOM_ID);
+        for entry in &state.dm_rooms {
+            next_room_id = next_room_id.max(entry.room_id.saturating_add(1));
+        }
+        if let Some(dir) = &data_dir {
+            next_room_id = next_room_id.max(next_room_id_above_existing_logs(dir));
+        }
         let mut store = Self {
             data_dir,
-            next_room_id: state.next_room_id.max(FIRST_DYNAMIC_ROOM_ID),
+            next_room_id,
             next_ids: HashMap::new(),
             watermarks: HashMap::new(),
             heads: HashMap::new(),
@@ -310,8 +317,11 @@ impl RoomStore {
             .map(|dm| dm.room_id)
     }
 
-    /// Creates (or returns) the DM room for the unordered user pair, persisting
-    /// the registry. DM rooms are always durable.
+    /// Creates (or returns) the DM room for the unordered user pair. DM rooms
+    /// are always durable, and creation fails (rolling the allocation back)
+    /// when the registry cannot be persisted: a registry entry that exists
+    /// only in memory would let a later process reuse the room id — and its
+    /// surviving log — for a different pair.
     pub fn open_dm(
         &mut self,
         first: UserId,
@@ -334,13 +344,30 @@ impl RoomStore {
             user_b: second,
             created_at_ms: now_ms,
         });
-        self.persist_state();
+        if let Err(error) = self.try_persist_state() {
+            self.dm_rooms.pop();
+            self.rooms.remove(&room_id);
+            self.next_ids.remove(&room_id);
+            self.watermarks.remove(&room_id);
+            self.heads.remove(&room_id);
+            self.next_room_id = room_id.0;
+            return Err(format!("dm room registry write failed: {error}"));
+        }
         Ok(room_id)
     }
 
     fn persist_state(&self) {
+        if let Err(error) = self.try_persist_state() {
+            kvlog::error!(
+                "room state write failed; ids may repeat after restart",
+                error = error.as_str()
+            );
+        }
+    }
+
+    fn try_persist_state(&self) -> Result<(), String> {
         let Some(dir) = &self.data_dir else {
-            return;
+            return Ok(());
         };
         let mut watermarks: Vec<(u32, u64)> = self
             .watermarks
@@ -362,13 +389,34 @@ impl RoomStore {
                 dm.room_id.0, dm.user_a.0, dm.user_b.0, dm.created_at_ms
             ));
         }
-        if let Err(error) = atomic_write_toml(&dir.join(STATE_FILE), &out) {
-            kvlog::error!(
-                "room state write failed; ids may repeat after restart",
-                error = error.as_str()
-            );
+        atomic_write_toml(&dir.join(STATE_FILE), &out)
+    }
+}
+
+/// The lowest dynamic room id above every room log already on disk. Guards id
+/// allocation when `state.toml` is lost or corrupt: reusing an id whose log
+/// survives would seed the new room with the old room's private history.
+fn next_room_id_above_existing_logs(dir: &Path) -> u32 {
+    let mut next = FIRST_DYNAMIC_ROOM_ID;
+    let Ok(entries) = fs::read_dir(dir.join("rooms")) else {
+        return next;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        let Some((room_id, _)) = name.split_once('.') else {
+            continue;
+        };
+        let Ok(room_id) = room_id.parse::<u32>() else {
+            continue;
+        };
+        if room_id >= FIRST_DYNAMIC_ROOM_ID {
+            next = next.max(room_id.saturating_add(1));
         }
     }
+    next
 }
 
 #[derive(Default, Toml)]
@@ -730,6 +778,58 @@ mod tests {
         let first = store.open_dm(UserId(1), UserId(2), 0).unwrap();
         let second = store.open_dm(UserId(1), UserId(3), 0).unwrap();
         assert_ne!(first, second);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn dm_room_id_never_reused_after_state_loss() {
+        let dir = temp_dir("dm-state-loss");
+        let mut store = RoomStore::open(Some(dir.clone()), &[]);
+        let dm = store.open_dm(UserId(1), UserId(2), 1_000).unwrap();
+        let id = store.allocate_message_id(dm);
+        store.append(dm, &test_message(dm, id.0));
+        drop(store);
+
+        fs::remove_file(dir.join(STATE_FILE)).unwrap();
+        let mut store = RoomStore::open(Some(dir.clone()), &[]);
+        let fresh = store.open_dm(UserId(3), UserId(4), 2_000).unwrap();
+        assert_ne!(fresh, dm, "id with a surviving log was handed out again");
+        assert!(store.recent(fresh, 10).is_empty());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn dm_room_id_floors_over_backup_logs() {
+        let dir = temp_dir("dm-backup-floor");
+        let mut store = RoomStore::open(Some(dir.clone()), &[]);
+        let dm = store.open_dm(UserId(1), UserId(2), 1_000).unwrap();
+        let id = store.allocate_message_id(dm);
+        store.append(dm, &test_message(dm, id.0));
+        drop(store);
+
+        fs::remove_file(dir.join(STATE_FILE)).unwrap();
+        let log = dir.join("rooms").join(format!("{}.log", dm.0));
+        fs::rename(&log, backup_path(&log)).unwrap();
+        let mut store = RoomStore::open(Some(dir.clone()), &[]);
+        let fresh = store.open_dm(UserId(3), UserId(4), 2_000).unwrap();
+        assert!(fresh.0 > dm.0, "backup log {} vs fresh {}", dm.0, fresh.0);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn open_dm_rolls_back_when_state_persist_fails() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = temp_dir("dm-rollback");
+        let mut store = RoomStore::open(Some(dir.clone()), &[]);
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o555)).unwrap();
+        let result = store.open_dm(UserId(1), UserId(2), 1_000);
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(result.is_err(), "unpersistable dm creation must fail");
+        assert_eq!(store.dm_room_for(UserId(1), UserId(2)), None);
+
+        let retry = store.open_dm(UserId(1), UserId(2), 1_000).unwrap();
+        assert_eq!(store.dm_room_for(UserId(1), UserId(2)), Some(retry));
         let _ = fs::remove_dir_all(&dir);
     }
 
