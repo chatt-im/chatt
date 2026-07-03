@@ -16,6 +16,7 @@ const UNKNOWN_NAME: &str = "…";
 pub(crate) struct RosterSeed {
     pub(crate) user: UserSummary,
     pub(crate) in_call: bool,
+    pub(crate) away_since: Option<Instant>,
 }
 
 #[derive(Clone, Debug)]
@@ -116,7 +117,11 @@ impl Participants {
     }
 
     pub(crate) fn upsert(&mut self, seed: RosterSeed) {
-        let RosterSeed { user, in_call } = seed;
+        let RosterSeed {
+            user,
+            in_call,
+            away_since,
+        } = seed;
         let online = user.online;
         if let Some(existing) = self
             .entries
@@ -131,6 +136,8 @@ impl Participants {
             existing.voice_status = user.voice_status.normalized();
             if online {
                 existing.presence_since = Some(instant_from_server_ms(user.connected_at_ms));
+            } else if let Some(away_since) = away_since {
+                existing.presence_since = Some(away_since);
             } else if was_online {
                 existing.presence_since = Some(Instant::now());
             }
@@ -143,12 +150,15 @@ impl Participants {
                 existing.last_talking_at = None;
             }
         } else {
+            if !online && away_since.is_none() {
+                return;
+            }
             let voice_status = user.voice_status.normalized();
-            let presence_since = Some(if online {
+            let presence_since = if online {
                 instant_from_server_ms(user.connected_at_ms)
             } else {
-                Instant::now()
-            });
+                away_since.expect("offline participant seed was checked")
+            };
             self.entries.push(ParticipantState {
                 user_id: user.user_id,
                 name: Some(user.display_name),
@@ -159,7 +169,7 @@ impl Participants {
                 talking_display: false,
                 last_talking_at: None,
                 p2p_direct: false,
-                presence_since,
+                presence_since: Some(presence_since),
                 active_stream: None,
                 voice_feedback: None,
                 peer_rtt_ms: None,
@@ -443,6 +453,7 @@ mod tests {
                 voice_status: ParticipantVoiceStatus::default(),
             },
             in_call: true,
+            away_since: None,
         }
     }
 
@@ -574,6 +585,24 @@ mod tests {
             away_age < 5,
             "away timer should restart near zero, got {away_age}s"
         );
+    }
+
+    #[test]
+    fn offline_seed_without_observed_away_time_is_ignored() {
+        let mut participants = Participants::default();
+        let mut info = participant(UserId(1));
+        info.user.online = false;
+
+        participants.upsert(info.clone());
+        assert!(participants.entries.is_empty());
+
+        let away_since = Instant::now();
+        info.away_since = Some(away_since);
+        participants.upsert(info);
+
+        assert_eq!(participants.entries.len(), 1);
+        assert!(!participants.entries[0].online);
+        assert_eq!(participants.entries[0].presence_since, Some(away_since));
     }
 
     #[test]

@@ -1847,7 +1847,7 @@ mod tests {
                 name: "lobby".to_string(),
                 kind: rpc::control::RoomKind::Public,
                 head: None,
-                voice_users: Vec::new(),
+                voice_users: vec![UserId(1), UserId(2)],
             }],
             vec![
                 participant(UserId(1), "alice"),
