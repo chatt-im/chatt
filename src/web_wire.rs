@@ -1,11 +1,11 @@
 //! Binary wire format for the browser chat feed.
 //!
-//! A message is split server-side into an ordered list of [`Fragment`]s: prose
-//! rendered from Chatt's canonical Markdown-subset token stream as safe HTML,
-//! and fenced code blocks carrying their text alongside a precomputed
-//! highlight-span buffer (see [`crate::highlight`]). The frontend composes a
-//! message straight from its fragments, so it does not parse Markdown or
-//! reproject highlights onto rendered HTML.
+//! A message is split server-side into an ordered list of [`Fragment`]s: quote
+//! boundaries, prose rendered from Chatt's canonical Markdown-subset token
+//! stream as safe HTML, and fenced code blocks carrying their text alongside a
+//! precomputed highlight-span buffer (see [`crate::highlight`]). The frontend
+//! composes a message straight from its fragments, so it does not parse Markdown
+//! or reproject highlights onto rendered HTML.
 //!
 //! Frames are delivered as binary WebSocket messages. Every feed frame begins
 //! with a four-byte zero sentinel followed by a kind byte. A video frame never
@@ -25,20 +25,21 @@ pub const KIND_SYNC: u8 = 1;
 pub const KIND_MESSAGE: u8 = 2;
 pub const KIND_OLDER: u8 = 3;
 
-/// Fragment kind bytes. Every fragment record stores its kind byte followed by
-/// a little-endian `u32` quote depth, then its kind-specific payload.
+/// Fragment kind bytes.
 const FRAG_TEXT: u8 = 0;
 const FRAG_CODE: u8 = 1;
+const FRAG_QUOTE_START: u8 = 2;
+const FRAG_QUOTE_END: u8 = 3;
 
-/// One piece of a message body. Prose and normal highlighted code fragments
-/// carry the same block-quote nesting metadata.
+/// One piece of a message body. Quote boundaries are explicit so the frontend
+/// can render one continuous rule for a quote scope and nested rules only where
+/// deeper scopes are open.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Fragment {
     /// Safe HTML for prose rendered from the shared Markdown-subset tokenizer.
-    Text { quote_depth: u32, html: String },
+    Text { html: String },
     /// A fenced code block.
     Code {
-        quote_depth: u32,
         /// The fence info string (`rust`, `ts`, ...), empty when none was given.
         lang: String,
         /// The raw code text, without the fences.
@@ -46,15 +47,16 @@ pub enum Fragment {
         /// The inline highlight-span buffer from [`highlight::encode_inline`].
         spans: Vec<u8>,
     },
+    /// Opens a Markdown block quote.
+    QuoteStart,
+    /// Closes a Markdown block quote.
+    QuoteEnd,
 }
 
 impl Fragment {
     #[cfg(test)]
     pub(crate) fn text(html: impl Into<String>) -> Self {
-        Self::Text {
-            quote_depth: 0,
-            html: html.into(),
-        }
+        Self::Text { html: html.into() }
     }
 }
 
@@ -81,43 +83,24 @@ pub fn split_fragments(body: &str, resolver: RefResolver) -> Vec<Fragment> {
     crate::markdown::tokenize(body, &mut tokens);
     let mut fragments = Vec::new();
     let mut prose_start = 0usize;
-    let mut quote_depth = 0u32;
 
     let mut index = 0usize;
     while index < tokens.len() {
         match &tokens[index].kind {
             TokenKind::BlockQuoteStart => {
-                flush_html(
-                    &mut fragments,
-                    body,
-                    &tokens[prose_start..index],
-                    resolver,
-                    quote_depth,
-                );
-                quote_depth = quote_depth.saturating_add(1);
+                flush_html(&mut fragments, body, &tokens[prose_start..index], resolver);
+                fragments.push(Fragment::QuoteStart);
                 index += 1;
                 prose_start = index;
             }
             TokenKind::BlockQuoteEnd => {
-                flush_html(
-                    &mut fragments,
-                    body,
-                    &tokens[prose_start..index],
-                    resolver,
-                    quote_depth,
-                );
-                quote_depth = quote_depth.saturating_sub(1);
+                flush_html(&mut fragments, body, &tokens[prose_start..index], resolver);
+                fragments.push(Fragment::QuoteEnd);
                 index += 1;
                 prose_start = index;
             }
             TokenKind::CodeBlockStart { lang } => {
-                flush_html(
-                    &mut fragments,
-                    body,
-                    &tokens[prose_start..index],
-                    resolver,
-                    quote_depth,
-                );
+                flush_html(&mut fragments, body, &tokens[prose_start..index], resolver);
                 let lang = lang
                     .as_ref()
                     .map_or("", |range| &body[range.start as usize..range.end as usize])
@@ -142,7 +125,6 @@ pub fn split_fragments(body: &str, resolver: RefResolver) -> Vec<Fragment> {
                 );
                 let language = highlight::language_for_tag(&lang);
                 fragments.push(Fragment::Code {
-                    quote_depth,
                     lang,
                     spans: highlight::encode_inline(&code, language),
                     text: code,
@@ -153,13 +135,7 @@ pub fn split_fragments(body: &str, resolver: RefResolver) -> Vec<Fragment> {
             _ => index += 1,
         }
     }
-    flush_html(
-        &mut fragments,
-        body,
-        &tokens[prose_start..],
-        resolver,
-        quote_depth,
-    );
+    flush_html(&mut fragments, body, &tokens[prose_start..], resolver);
     fragments
 }
 
@@ -168,14 +144,13 @@ fn flush_html(
     source: &str,
     tokens: &[Token],
     resolver: RefResolver,
-    quote_depth: u32,
 ) {
     if tokens.is_empty() {
         return;
     }
     let html = render_html(source, tokens, resolver);
     if !html.trim().is_empty() {
-        fragments.push(Fragment::Text { quote_depth, html });
+        fragments.push(Fragment::Text { html });
     }
 }
 
@@ -363,23 +338,18 @@ fn encode_message(buf: &mut Vec<u8>, message: &WebMessage) {
     put_u32(buf, message.fragments.len() as u32);
     for fragment in &message.fragments {
         match fragment {
-            Fragment::Text { quote_depth, html } => {
+            Fragment::Text { html } => {
                 buf.push(FRAG_TEXT);
-                put_u32(buf, *quote_depth);
                 put_str(buf, html);
             }
-            Fragment::Code {
-                quote_depth,
-                lang,
-                text,
-                spans,
-            } => {
+            Fragment::Code { lang, text, spans } => {
                 buf.push(FRAG_CODE);
-                put_u32(buf, *quote_depth);
                 put_str(buf, lang);
                 put_str(buf, text);
                 put_bytes(buf, spans);
             }
+            Fragment::QuoteStart => buf.push(FRAG_QUOTE_START),
+            Fragment::QuoteEnd => buf.push(FRAG_QUOTE_END),
         }
     }
 }
@@ -517,18 +487,17 @@ impl Reader<'_> {
         let fragments = (0..fragment_count)
             .map(|_| {
                 let kind = self.u8();
-                let quote_depth = self.u32();
                 match kind {
                     FRAG_TEXT => Fragment::Text {
-                        quote_depth,
                         html: self.string(),
                     },
                     FRAG_CODE => Fragment::Code {
-                        quote_depth,
                         lang: self.string(),
                         text: self.string(),
                         spans: self.bytes(),
                     },
+                    FRAG_QUOTE_START => Fragment::QuoteStart,
+                    FRAG_QUOTE_END => Fragment::QuoteEnd,
                     other => panic!("unknown fragment kind {other}"),
                 }
             })
@@ -560,16 +529,9 @@ mod tests {
         let fragments = split_fragments(body, &|_| None);
         assert_eq!(fragments.len(), 3);
         assert_eq!(fragments[0], Fragment::text("<p>before</p>"));
-        let Fragment::Code {
-            quote_depth,
-            lang,
-            text,
-            spans,
-        } = &fragments[1]
-        else {
+        let Fragment::Code { lang, text, spans } = &fragments[1] else {
             panic!("expected code fragment, got {:?}", fragments[1]);
         };
-        assert_eq!(*quote_depth, 0);
         assert_eq!(lang, "rust");
         assert_eq!(text, "fn main() {}");
         assert!(!spans.is_empty());
@@ -695,10 +657,11 @@ mod tests {
     fn block_quote_becomes_blockquote() {
         assert_eq!(
             split_fragments("> a\n> b", &|_| None),
-            vec![Fragment::Text {
-                quote_depth: 1,
-                html: "<p>a<br>b</p>".to_string(),
-            }]
+            vec![
+                Fragment::QuoteStart,
+                Fragment::text("<p>a<br>b</p>"),
+                Fragment::QuoteEnd,
+            ]
         );
     }
 
@@ -707,14 +670,42 @@ mod tests {
         assert_eq!(
             split_fragments("> outer\n>> inner", &|_| None),
             vec![
-                Fragment::Text {
-                    quote_depth: 1,
-                    html: "<p>outer</p>".to_string(),
-                },
-                Fragment::Text {
-                    quote_depth: 2,
-                    html: "<p>inner</p>".to_string(),
-                },
+                Fragment::QuoteStart,
+                Fragment::text("<p>outer</p>"),
+                Fragment::QuoteStart,
+                Fragment::text("<p>inner</p>"),
+                Fragment::QuoteEnd,
+                Fragment::QuoteEnd,
+            ]
+        );
+    }
+
+    #[test]
+    fn nested_quote_scope_can_outlive_inner_quote() {
+        assert_eq!(
+            split_fragments("> > a\n> b", &|_| None),
+            vec![
+                Fragment::QuoteStart,
+                Fragment::QuoteStart,
+                Fragment::text("<p>a</p>"),
+                Fragment::QuoteEnd,
+                Fragment::text("<p>b</p>"),
+                Fragment::QuoteEnd,
+            ]
+        );
+    }
+
+    #[test]
+    fn same_depth_quotes_separate_after_unquoted_blank_line() {
+        assert_eq!(
+            split_fragments("> a\n\n> b", &|_| None),
+            vec![
+                Fragment::QuoteStart,
+                Fragment::text("<p>a</p>"),
+                Fragment::QuoteEnd,
+                Fragment::QuoteStart,
+                Fragment::text("<p>b</p>"),
+                Fragment::QuoteEnd,
             ]
         );
     }
@@ -723,17 +714,13 @@ mod tests {
     fn quoted_code_is_a_normal_highlighted_code_fragment() {
         let fragments = split_fragments("> ```rust\n> fn f() {}\n> ```", &|_| None);
         let [
-            Fragment::Code {
-                quote_depth,
-                lang,
-                text,
-                spans,
-            },
+            Fragment::QuoteStart,
+            Fragment::Code { lang, text, spans },
+            Fragment::QuoteEnd,
         ] = fragments.as_slice()
         else {
             panic!("quoted fence must use the normal code-fragment path");
         };
-        assert_eq!(*quote_depth, 1);
         assert_eq!(lang, "rust");
         assert_eq!(text, "fn f() {}");
         assert!(!spans.is_empty());
@@ -743,25 +730,16 @@ mod tests {
     fn quoted_code_and_top_level_code_coexist() {
         let body = "> ```\n> quoted\n> ```\n```rust\ntop\n```";
         let fragments = split_fragments(body, &|_| None);
-        assert_eq!(fragments.len(), 2);
-        let Fragment::Code {
-            quote_depth, text, ..
-        } = &fragments[0]
-        else {
+        assert_eq!(fragments.len(), 4);
+        assert_eq!(fragments[0], Fragment::QuoteStart);
+        let Fragment::Code { text, .. } = &fragments[1] else {
             panic!("quoted code is a code fragment");
         };
-        assert_eq!(*quote_depth, 1);
         assert_eq!(text, "quoted");
-        let Fragment::Code {
-            quote_depth,
-            lang,
-            text,
-            spans,
-        } = &fragments[1]
-        else {
-            panic!("top-level code is a code fragment, got {:?}", fragments[1]);
+        assert_eq!(fragments[2], Fragment::QuoteEnd);
+        let Fragment::Code { lang, text, spans } = &fragments[3] else {
+            panic!("top-level code is a code fragment, got {:?}", fragments[3]);
         };
-        assert_eq!(*quote_depth, 0);
         assert_eq!(lang, "rust");
         assert_eq!(text, "top");
         assert!(!spans.is_empty(), "top-level code is highlighted");
@@ -772,19 +750,18 @@ mod tests {
         let body = "> ```text\n>\n>> still code\n> tail\n> ```";
         let fragments = split_fragments(body, &|_| None);
         let [
-            Fragment::Code {
-                quote_depth, text, ..
-            },
+            Fragment::QuoteStart,
+            Fragment::Code { text, .. },
+            Fragment::QuoteEnd,
         ] = fragments.as_slice()
         else {
             panic!("expected one quoted code fragment");
         };
-        assert_eq!(*quote_depth, 1);
         assert_eq!(text, "\n> still code\ntail");
     }
 
     #[test]
-    fn fragment_quote_depth_round_trips_on_the_wire() {
+    fn quote_boundaries_round_trip_on_the_wire() {
         let message = WebMessage::text_for_test(1, "> ```rust\n> fn f() {}\n> ```");
         let decoded = decode_single(&encode_single(&message));
         assert_eq!(decoded.fragments, message.fragments);
