@@ -11,6 +11,7 @@ pub(crate) fn content_type(path: &Path) -> &'static str {
         "json" => "application/json",
         "txt" | "log" => "text/plain; charset=UTF-8",
         "svg" => "image/svg+xml",
+        "ico" => "image/x-icon",
         "png" => "image/png",
         "jpg" | "jpeg" | "jfif" => "image/jpeg",
         "gif" => "image/gif",
