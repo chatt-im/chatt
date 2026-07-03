@@ -1539,7 +1539,6 @@ mod tests {
         RoomInfo {
             room_id: RoomId(id),
             name: format!("room-{id}"),
-            participants: 0,
             kind: RoomKind::Public,
             head: None,
             voice_users: Vec::new(),
@@ -1688,7 +1687,6 @@ mod tests {
         let dm = RoomInfo {
             room_id: RoomId(0x8000_0001),
             name: "dm:1:2".to_string(),
-            participants: 0,
             kind: RoomKind::Dm {
                 user_a: UserId(1),
                 user_b: UserId(2),

@@ -4905,7 +4905,6 @@ mod tests {
         rpc::control::RoomInfo {
             room_id: rpc::ids::RoomId(id),
             name: format!("room-{id}"),
-            participants: 0,
             kind: rpc::control::RoomKind::Public,
             head: None,
             voice_users: Vec::new(),

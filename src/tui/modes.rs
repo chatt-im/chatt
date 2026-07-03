@@ -1353,7 +1353,6 @@ mod tests {
                 } else {
                     format!("room-{id}")
                 },
-                participants: 0,
                 kind: rpc::control::RoomKind::Public,
                 head: None,
                 voice_users: Vec::new(),
@@ -1844,7 +1843,6 @@ mod tests {
             &[rpc::control::RoomInfo {
                 room_id: RoomId(1),
                 name: "lobby".to_string(),
-                participants: 0,
                 kind: rpc::control::RoomKind::Public,
                 head: None,
                 voice_users: Vec::new(),

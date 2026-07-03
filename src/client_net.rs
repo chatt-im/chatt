@@ -3441,9 +3441,6 @@ impl WorkerState {
             ServerControl::OpenPaired { .. } => {
                 kvlog::warn!("unexpected open-paired on established session; ignoring");
             }
-            ServerControl::RoomJoined { .. } => {
-                kvlog::warn!("legacy room joined ignored");
-            }
             ServerControl::Chat { message } => {
                 kvlog::info!(
                     "client chat received",
@@ -3453,9 +3450,6 @@ impl WorkerState {
                     body_size = message.body.len()
                 );
                 let _ = self.events.send(NetworkEvent::Chat(message));
-            }
-            ServerControl::Presence { .. } => {
-                kvlog::warn!("legacy per-room presence ignored");
             }
             ServerControl::VoiceStarted {
                 room_id,
@@ -3729,7 +3723,7 @@ impl WorkerState {
                     at_start,
                 });
             }
-            ServerControl::PresenceV2 { user, online } => {
+            ServerControl::Presence { user, online } => {
                 kvlog::info!(
                     "client presence received",
                     user_id = user.user_id.0,
@@ -4978,10 +4972,7 @@ fn client_control_kind(control: &ClientControl) -> &'static str {
         ClientControl::Authenticate { .. } => "authenticate",
         ClientControl::Pair { .. } => "pair",
         ClientControl::OpenPair { .. } => "open_pair",
-        ClientControl::JoinRoom { .. } => "join_room",
         ClientControl::SendChat { .. } => "send_chat",
-        ClientControl::StartVoice { .. } => "start_voice",
-        ClientControl::StopVoice { .. } => "stop_voice",
         ClientControl::SetVoiceStatus { .. } => "set_voice_status",
         ClientControl::PublishP2p { .. } => "publish_p2p",
         ClientControl::UploadFileStart { .. } => "upload_file_start",
@@ -5005,7 +4996,6 @@ fn server_control_kind(control: &ServerControl) -> &'static str {
     match control {
         ServerControl::Authenticated { .. } => "authenticated",
         ServerControl::OpenPaired { .. } => "open_paired",
-        ServerControl::RoomJoined { .. } => "room_joined",
         ServerControl::Chat { .. } => "chat",
         ServerControl::Presence { .. } => "presence",
         ServerControl::VoiceStarted { .. } => "voice_started",
@@ -5031,7 +5021,6 @@ fn server_control_kind(control: &ServerControl) -> &'static str {
         ServerControl::RoomUpserted { .. } => "room_upserted",
         ServerControl::DmOpened { .. } => "dm_opened",
         ServerControl::HistoryChunk { .. } => "history_chunk",
-        ServerControl::PresenceV2 { .. } => "presence_v2",
     }
 }
 
