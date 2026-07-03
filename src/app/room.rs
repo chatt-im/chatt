@@ -168,6 +168,12 @@ pub(crate) enum RefJump {
     OtherRoom,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ComposerSubmission {
+    Command(String),
+    Message(String),
+}
+
 /// Drops completely blank lines from the start and end of `text` while keeping
 /// the leading whitespace (indentation) of the remaining content lines. Returns
 /// an empty string when every line is blank.
@@ -676,22 +682,26 @@ impl RoomSession {
         })
     }
 
-    pub(crate) fn submit_composer(&mut self) -> Option<String> {
+    pub(crate) fn submit_composer(&mut self) -> Option<ComposerSubmission> {
         let text = self.composer.text();
-        let input = if text.trim_start().starts_with('/') {
-            text.trim().to_string()
-        } else {
-            strip_blank_edge_lines(&text)
-        };
+        let mut input = strip_blank_edge_lines(&text);
         if input.is_empty() {
             return None;
         }
+        let submission = if input.starts_with('/') {
+            ComposerSubmission::Command(input.trim().to_string())
+        } else {
+            if input.starts_with(" /") {
+                input.remove(0);
+            }
+            ComposerSubmission::Message(input)
+        };
         self.command_completion.clear();
         self.ref_completion.clear();
         self.composer.clear_inline_completion();
         self.composer.clear();
         self.composer.enter_insert_mode();
-        Some(input)
+        Some(submission)
     }
 
     pub(crate) fn clear_chat(&mut self) {
@@ -959,12 +969,29 @@ mod tests {
 
         room.composer.set_lines("    indented hello");
         assert_eq!(
-            room.submit_composer().as_deref(),
-            Some("    indented hello")
+            room.submit_composer(),
+            Some(ComposerSubmission::Message(
+                "    indented hello".to_string()
+            ))
+        );
+
+        room.composer.set_lines("/help   ");
+        assert_eq!(
+            room.submit_composer(),
+            Some(ComposerSubmission::Command("/help".to_string()))
+        );
+
+        room.composer.set_lines(" /help");
+        assert_eq!(
+            room.submit_composer(),
+            Some(ComposerSubmission::Message("/help".to_string()))
         );
 
         room.composer.set_lines("   /help   ");
-        assert_eq!(room.submit_composer().as_deref(), Some("/help"));
+        assert_eq!(
+            room.submit_composer(),
+            Some(ComposerSubmission::Message("   /help   ".to_string()))
+        );
 
         room.composer.set_lines("    \t  ");
         assert_eq!(room.submit_composer(), None);
@@ -972,8 +999,10 @@ mod tests {
         room.composer
             .set_lines("\n  \n    keep indent\nsecond\n\n   \n");
         assert_eq!(
-            room.submit_composer().as_deref(),
-            Some("    keep indent\nsecond")
+            room.submit_composer(),
+            Some(ComposerSubmission::Message(
+                "    keep indent\nsecond".to_string()
+            ))
         );
 
         room.composer.set_lines("\n\n   \n");

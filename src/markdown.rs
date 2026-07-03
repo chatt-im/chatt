@@ -37,6 +37,7 @@ pub enum TokenKind {
     Url,
     MessageRef,
     HardBreak,
+    BlankLine,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -134,7 +135,22 @@ pub fn tokenize(source: &str, out: &mut Vec<Token>) {
         if matches!(line.kind, LineKind::Blank) {
             close_paragraph(out, &mut paragraph_end, &mut suppress_blocks, line.start);
             close_list(out, &mut open_list, line.start);
-            line_index += 1;
+            let blank_start = line.content_start(&prefix_ends);
+            let mut next_index = line_index + 1;
+            while lines
+                .get(next_index)
+                .is_some_and(|line| matches!(line.kind, LineKind::Blank))
+            {
+                next_index += 1;
+            }
+            if line_index > 0 && next_index < lines.len() {
+                let blank_end = lines[next_index - 1].content_end;
+                push(out, TokenKind::BlankLine, blank_start..blank_end);
+            }
+            for blank in &lines[line_index + 1..next_index] {
+                change_quote_depth(out, &mut quote_depth, blank.quote_depth(), blank.start);
+            }
+            line_index = next_index;
             continue;
         }
 
@@ -905,6 +921,43 @@ mod tests {
             ]
         );
         assert_eq!(texts(source, &pairs(source)), vec!["a", "b"]);
+    }
+
+    #[test]
+    fn internal_blank_lines_collapse_to_one_token() {
+        let source = "\n  \nalpha\n\n \n\nbeta\n\n";
+        assert_eq!(
+            kinds(source),
+            vec![
+                TokenKind::ParagraphStart,
+                TokenKind::Text,
+                TokenKind::ParagraphEnd,
+                TokenKind::BlankLine,
+                TokenKind::ParagraphStart,
+                TokenKind::Text,
+                TokenKind::ParagraphEnd,
+            ]
+        );
+    }
+
+    #[test]
+    fn blank_line_between_quotes_is_preserved() {
+        assert_eq!(
+            kinds("> Quote 1\n\n> Quote 2"),
+            vec![
+                TokenKind::BlockQuoteStart,
+                TokenKind::ParagraphStart,
+                TokenKind::Text,
+                TokenKind::ParagraphEnd,
+                TokenKind::BlockQuoteEnd,
+                TokenKind::BlankLine,
+                TokenKind::BlockQuoteStart,
+                TokenKind::ParagraphStart,
+                TokenKind::Text,
+                TokenKind::ParagraphEnd,
+                TokenKind::BlockQuoteEnd,
+            ]
+        );
     }
 
     #[test]

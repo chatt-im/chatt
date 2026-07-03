@@ -1220,6 +1220,13 @@ impl MessageLayout {
                 self.quote_depth = self.quote_depth.saturating_sub(1);
                 self.cursor += 1;
             }
+            TokenKind::BlankLine => {
+                let range = token_range(&self.tokens[self.cursor]);
+                self.push_line();
+                self.emit_quote_marker();
+                self.note_source_range(range.start, range.end);
+                self.cursor += 1;
+            }
             _ => self.cursor += 1,
         }
     }
@@ -1499,7 +1506,7 @@ impl MessageLayout {
         }
 
         let mut wrapped_any = false;
-        for wrapped in bwrap::wrap_ranges(display, widths.0, widths.1) {
+        for wrapped in bwrap::wrap_ranges_preserve_leading(display, widths.0, widths.1) {
             let base_col = if wrapped_any { cols.1 } else { cols.0 };
             wrapped_any = true;
             self.push_line();
@@ -2560,6 +2567,35 @@ mod tests {
             .filter(|seg| !seg.synth)
             .map(|seg| (layout.segment_str(body, &seg).to_string(), seg.style))
             .collect()
+    }
+
+    fn rendered_lines(body: &str, width: u16) -> Vec<String> {
+        let mut layout = MessageLayout::new();
+        layout.ensure(width, body, &[], grey_theme());
+        (0..layout.lines())
+            .map(|line| {
+                layout
+                    .line(line)
+                    .iter()
+                    .map(|segment| layout.segment_str(body, segment))
+                    .collect()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn ordinary_lines_preserve_leading_whitespace() {
+        let body = "sh ./script.sh /\n    arg1\n    arg2";
+        assert_eq!(
+            rendered_lines(body, 80),
+            vec!["sh ./script.sh /", "    arg1", "    arg2"]
+        );
+    }
+
+    #[test]
+    fn internal_blank_lines_render_once_and_edge_blanks_are_omitted() {
+        let body = "\n\n> Quote 1\n\n \n\n> Quote 2\n\n";
+        assert_eq!(rendered_lines(body, 80), vec!["> Quote 1", "", "> Quote 2"]);
     }
 
     #[test]
