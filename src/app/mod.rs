@@ -223,6 +223,9 @@ pub(crate) struct App {
     /// room. Mirrors the worker's view; confirmed by our own `VoiceStarted`.
     pub voice_room: Option<RoomId>,
     requested_voice_room: Option<RoomId>,
+    /// The user explicitly left voice this session; suppresses the voice
+    /// auto-join on (re-)authentication until the next explicit join.
+    voice_left: bool,
     pub server_catalog: ServerCatalog,
     pub pending_pair: Option<PendingPair>,
     pub mic_muted: Arc<AtomicBool>,
@@ -803,6 +806,7 @@ impl App {
             user_id: None,
             voice_room: None,
             requested_voice_room: None,
+            voice_left: false,
             server_catalog: ServerCatalog::default(),
             pending_pair: None,
             mic_muted: Arc::new(AtomicBool::new(false)),
@@ -1766,13 +1770,15 @@ impl App {
                         );
                     }
                 }
-                let voice_target = catalog
-                    .last_voice_room
-                    .filter(|room_id| self.room.room_meta(*room_id).is_some())
-                    .unwrap_or(default_room);
-                self.requested_voice_room = Some(voice_target);
-                self.send_network_command(NetworkCommand::JoinVoice(voice_target), true);
-                self.publish_voice_status();
+                if !self.voice_left {
+                    let voice_target = catalog
+                        .last_voice_room
+                        .filter(|room_id| self.room.room_meta(*room_id).is_some())
+                        .unwrap_or(default_room);
+                    self.requested_voice_room = Some(voice_target);
+                    self.send_network_command(NetworkCommand::JoinVoice(voice_target), true);
+                    self.publish_voice_status();
+                }
                 self.save_room_catalog();
                 self.set_status(format!("authenticated as {}", self.room.local_user_name));
                 self.flush_pending_network_commands();
@@ -3825,6 +3831,7 @@ impl App {
             self.set_status("already in this room's voice call");
             return;
         }
+        self.voice_left = false;
         self.requested_voice_room = Some(target);
         self.send_network_command(NetworkCommand::JoinVoice(target), true);
         self.publish_voice_status();
@@ -3835,6 +3842,7 @@ impl App {
             self.set_status("not in a voice call");
             return;
         }
+        self.voice_left = true;
         self.requested_voice_room = None;
         self.send_network_command(NetworkCommand::LeaveVoice, true);
         self.set_status("leaving voice");
@@ -5333,6 +5341,57 @@ mod tests {
             NetworkCommand::LeaveVoice => {}
             other => panic!("unexpected command: {other:?}"),
         }
+    }
+
+    #[test]
+    fn reauth_skips_voice_auto_join_after_explicit_leave() {
+        let mut app = test_app();
+        let (tx, rx) = mpsc::channel();
+        app.network = Some(NetworkClient::from_parts_for_test(tx));
+        app.deafened.store(true, Ordering::Relaxed);
+        enter_test_room(&mut app);
+        app.voice_room = Some(rpc::ids::RoomId(1));
+
+        app.room.composer.set_lines("/voice-leave");
+        app.submit_input();
+        while rx.try_recv().is_ok() {}
+
+        let authenticated = || NetworkEvent::Authenticated {
+            session_id: SessionId(1),
+            user_id: UserId(1),
+            rooms: vec![test_room_info(1)],
+            users: vec![user_summary(UserId(1), "alice")],
+            default_room: RoomId(1),
+        };
+        app.handle_network_event(authenticated());
+        let mut commands = Vec::new();
+        while let Ok(command) = rx.try_recv() {
+            commands.push(command);
+        }
+        assert!(
+            !commands
+                .iter()
+                .any(|command| matches!(command, NetworkCommand::JoinVoice(_))),
+            "auto-join must stay suppressed after /voice-leave, got {commands:?}"
+        );
+
+        app.voice_room = None;
+        app.room.composer.set_lines("/voice");
+        app.submit_input();
+        assert!(!app.voice_left);
+        while rx.try_recv().is_ok() {}
+
+        app.handle_network_event(authenticated());
+        let mut commands = Vec::new();
+        while let Ok(command) = rx.try_recv() {
+            commands.push(command);
+        }
+        assert!(
+            commands
+                .iter()
+                .any(|command| matches!(command, NetworkCommand::JoinVoice(_))),
+            "explicit join re-enables the auto-join, got {commands:?}"
+        );
     }
 
     #[test]
