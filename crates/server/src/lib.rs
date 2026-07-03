@@ -26,10 +26,10 @@ use rpc::{
         ERROR_OPEN_PAIR_RATE_LIMITED, ERROR_PAIRING_INVALID_REQUEST, ERROR_PAIRING_NOT_ACTIVE,
         ERROR_PASSWORD_MISMATCH, ERROR_PASSWORD_REQUIRED, ERROR_PUBLIC_DISABLED,
         ERROR_TOKEN_STALE_EPOCH, FileContentEncoding, FileMetadata, InviteTicket,
-        MAX_BUG_REPORT_BYTES, MAX_FILE_CHUNK_BYTES, P2pCandidate, P2pKey, P2pNatKind, P2pPeerInfo,
-        P2pRole, RoomInfo, RoomKind, ServerControl, UserSummary, decode_client_control,
-        decode_client_hello, encode_invite_ticket, encode_server_control, encode_server_hello,
-        max_file_wire_bytes,
+        MAX_BUG_REPORT_BYTES, MAX_CONTROL_PAYLOAD_BYTES, MAX_FILE_CHUNK_BYTES, P2pCandidate,
+        P2pKey, P2pNatKind, P2pPeerInfo, P2pRole, RoomInfo, RoomKind, ServerControl, UserSummary,
+        decode_client_control, decode_client_hello, encode_invite_ticket, encode_server_control,
+        encode_server_hello, max_file_wire_bytes,
     },
     crypto::{
         AntiReplay, CHANNEL_CONTROL, CHANNEL_VIDEO, ControlTransport, DYNAMIC_TOKEN_PREFIX,
@@ -632,11 +632,25 @@ impl Server {
             .streams
             .get(&hello.stream_id)
             .ok_or_else(|| "unknown video stream".to_string())?;
+        if self.live_token_for_session(hello.session_id).is_none() {
+            return Err("video session is not active".to_string());
+        }
+        let in_voice_room = self
+            .sessions
+            .get(&hello.session_id)
+            .is_some_and(|session| session.voice_room == Some(stream.room_id));
         let secret = match hello.role {
-            VideoRole::Publisher => &stream.publish_secret,
-            VideoRole::Subscriber => &stream.view_secret,
+            VideoRole::Publisher if stream.owner_session == hello.session_id && in_voice_room => {
+                stream.publish_secret
+            }
+            VideoRole::Subscriber if in_voice_room => stream
+                .view_secrets
+                .get(&hello.session_id)
+                .copied()
+                .ok_or_else(|| "video viewer access was not granted".to_string())?,
+            _ => return Err("video session is not authorized for this stream".to_string()),
         };
-        let (send, recv) = derive_video_keys(secret, VideoKeyRole::Server);
+        let (send, recv) = derive_video_keys(&secret, VideoKeyRole::Server);
         let client = self
             .clients
             .get_mut(&token)
@@ -644,6 +658,7 @@ impl Server {
         let ConnKind::Video(video) = &mut client.kind else {
             return Err("hello on a non-video connection".to_string());
         };
+        video.session_id = Some(hello.session_id);
         video.stream_id = Some(hello.stream_id);
         video.role = Some(hello.role);
         video.cipher = Some(TransportCipher::new(send, recv));
@@ -890,7 +905,6 @@ impl Server {
             return Err("a screen share is already active for this session".to_string());
         }
         let publish_secret = random_secret(&self.rng)?;
-        let view_secret = random_secret(&self.rng)?;
         let stream_id = StreamId(self.next_stream);
         self.next_stream = self.next_stream.wrapping_add(1).max(1);
         self.streams.insert(
@@ -901,7 +915,7 @@ impl Server {
                 user_id,
                 sender_name: sender_name.clone(),
                 publish_secret,
-                view_secret,
+                view_secrets: HashMap::new(),
                 codec: codec.clone(),
                 coded_width,
                 coded_height,
@@ -924,6 +938,7 @@ impl Server {
             self.send_control_to_token(
                 token,
                 &ServerControl::ShareStarted {
+                    room_id,
                     stream_id,
                     publish_secret: publish_secret.to_vec(),
                     codec: codec.clone(),
@@ -933,22 +948,7 @@ impl Server {
                 },
             )?;
         }
-        self.broadcast_control_except(
-            room_id,
-            &ServerControl::ShareAvailable {
-                room_id,
-                stream_id,
-                user_id,
-                sender_name,
-                codec,
-                coded_width,
-                coded_height,
-                annexb,
-                extradata,
-                view_secret: view_secret.to_vec(),
-            },
-            Some(session_id),
-        );
+        self.announce_share_to_voice_members(stream_id, Some(session_id));
         Ok(())
     }
 
@@ -971,7 +971,13 @@ impl Server {
         if let Some(publisher) = stream.publisher_conn {
             tokens.push(publisher);
         }
-        self.broadcast_control(room_id, &ServerControl::ShareEnded { room_id, stream_id });
+        let control = ServerControl::ShareEnded { room_id, stream_id };
+        let recipients = self.voice_member_sessions(room_id);
+        for session_id in recipients {
+            if let Some(token) = self.live_token_for_session(session_id) {
+                let _ = self.send_control_to_token(token, &control);
+            }
+        }
         for token in tokens {
             self.disconnect(token);
         }
@@ -991,6 +997,124 @@ impl Server {
             .collect::<Vec<_>>();
         for stream_id in stream_ids {
             self.end_share(stream_id);
+        }
+    }
+
+    fn share_available_for_session(
+        &mut self,
+        stream_id: StreamId,
+        session_id: SessionId,
+    ) -> Result<ServerControl, String> {
+        let (room_id, owner_session) = self
+            .streams
+            .get(&stream_id)
+            .map(|stream| (stream.room_id, stream.owner_session))
+            .ok_or_else(|| "unknown screen share".to_string())?;
+        if owner_session == session_id {
+            return Err("share owner does not need viewer access".to_string());
+        }
+        if !self
+            .sessions
+            .get(&session_id)
+            .is_some_and(|session| session.voice_room == Some(room_id))
+        {
+            return Err("viewer is not in the share's voice room".to_string());
+        }
+        let existing = self
+            .streams
+            .get(&stream_id)
+            .and_then(|stream| stream.view_secrets.get(&session_id).copied());
+        let view_secret = match existing {
+            Some(secret) => secret,
+            None => {
+                let secret = random_secret(&self.rng)?;
+                self.streams
+                    .get_mut(&stream_id)
+                    .ok_or_else(|| "unknown screen share".to_string())?
+                    .view_secrets
+                    .insert(session_id, secret);
+                secret
+            }
+        };
+        let stream = self
+            .streams
+            .get(&stream_id)
+            .ok_or_else(|| "unknown screen share".to_string())?;
+        Ok(ServerControl::ShareAvailable {
+            room_id: stream.room_id,
+            stream_id,
+            user_id: stream.user_id,
+            sender_name: stream.sender_name.clone(),
+            codec: stream.codec.clone(),
+            coded_width: stream.coded_width,
+            coded_height: stream.coded_height,
+            annexb: stream.annexb,
+            extradata: stream.extradata.clone(),
+            view_secret: view_secret.to_vec(),
+        })
+    }
+
+    fn send_share_available_to_session(&mut self, stream_id: StreamId, session_id: SessionId) {
+        let Some(token) = self.live_token_for_session(session_id) else {
+            return;
+        };
+        let Ok(control) = self.share_available_for_session(stream_id, session_id) else {
+            return;
+        };
+        let _ = self.send_control_to_token(token, &control);
+    }
+
+    fn announce_share_to_voice_members(
+        &mut self,
+        stream_id: StreamId,
+        excluded_session: Option<SessionId>,
+    ) {
+        let Some(room_id) = self.streams.get(&stream_id).map(|stream| stream.room_id) else {
+            return;
+        };
+        let recipients = self
+            .voice_member_sessions(room_id)
+            .into_iter()
+            .filter(|session_id| Some(*session_id) != excluded_session)
+            .collect::<Vec<_>>();
+        for session_id in recipients {
+            self.send_share_available_to_session(stream_id, session_id);
+        }
+    }
+
+    fn replay_voice_room_shares(&mut self, room_id: RoomId, session_id: SessionId) {
+        let streams = self
+            .streams
+            .iter()
+            .filter_map(|(stream_id, stream)| {
+                (stream.room_id == room_id && stream.owner_session != session_id)
+                    .then_some(*stream_id)
+            })
+            .collect::<Vec<_>>();
+        for stream_id in streams {
+            self.send_share_available_to_session(stream_id, session_id);
+        }
+    }
+
+    fn revoke_share_access_for_session(&mut self, session_id: SessionId) {
+        for stream in self.streams.values_mut() {
+            stream.view_secrets.remove(&session_id);
+        }
+        let tokens = self
+            .clients
+            .iter()
+            .filter_map(|(token, client)| match &client.kind {
+                ConnKind::Video(video)
+                    if video.session_id == Some(session_id)
+                        && video.role == Some(VideoRole::Subscriber) =>
+                {
+                    Some(*token)
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        for token in tokens {
+            self.disconnect(token);
         }
     }
 
@@ -1840,7 +1964,6 @@ impl Server {
         self.send_control_to_token(token, &response)?;
         if announce && self.live_token_for_session(session_id).is_some() {
             self.broadcast_presence(session_id, true);
-            self.replay_accessible_shares(session_id);
         }
         Ok(())
     }
@@ -1938,50 +2061,6 @@ impl Server {
         }
     }
 
-    /// Replays every active share in rooms the new session can access, so a
-    /// client that connects mid-share still sees it.
-    fn replay_accessible_shares(&mut self, session_id: SessionId) {
-        let Some(token) = self.live_token_for_session(session_id) else {
-            return;
-        };
-        let Some(user_id) = self
-            .sessions
-            .get(&session_id)
-            .map(|session| session.user_id)
-        else {
-            return;
-        };
-        let available: Vec<ServerControl> = self
-            .streams
-            .iter()
-            .filter(|(_, stream)| {
-                stream.owner_session != session_id
-                    && self
-                        .rooms
-                        .get(&stream.room_id)
-                        .is_some_and(|room| room.access.allows(user_id))
-            })
-            .map(|(stream_id, stream)| ServerControl::ShareAvailable {
-                room_id: stream.room_id,
-                stream_id: *stream_id,
-                user_id: stream.user_id,
-                sender_name: stream.sender_name.clone(),
-                codec: stream.codec.clone(),
-                coded_width: stream.coded_width,
-                coded_height: stream.coded_height,
-                annexb: stream.annexb,
-                extradata: stream.extradata.clone(),
-                view_secret: stream.view_secret.to_vec(),
-            })
-            .collect();
-        for control in &available {
-            if self.live_token_for_session(session_id).is_none() {
-                return;
-            }
-            let _ = self.send_control_to_token(token, control);
-        }
-    }
-
     /// Whether the session's user may access the room; sends the deliberate
     /// `404 room not found` (indistinguishable from a missing room) otherwise.
     fn check_room_access(&mut self, session_id: SessionId, room_id: RoomId) -> bool {
@@ -2036,15 +2115,13 @@ impl Server {
                 None
             }
         };
-        if let Some(token) = self.live_token_for_session(session_id) {
-            self.send_existing_voice_streams_to_token(room_id, session_id, token);
-            if self.live_token_for_session(session_id).is_none() {
-                return;
-            }
-        }
         if !already_active && let Some((user_id, stream_id)) = voice_started {
             self.broadcast_voice_started(room_id, user_id, stream_id);
         }
+        if let Some(token) = self.live_token_for_session(session_id) {
+            self.send_existing_voice_streams_to_token(room_id, session_id, token);
+        }
+        self.replay_voice_room_shares(room_id, session_id);
     }
 
     /// Leaves the session's current voice call: stops its stream, tears down
@@ -2062,6 +2139,8 @@ impl Server {
             session_id = session_id.0,
             room_id = room_id.0
         );
+        self.end_shares_for_session(session_id);
+        self.revoke_share_access_for_session(session_id);
         self.stop_voice(session_id, None, excluded_broadcast_session);
         self.broadcast_p2p_gone(session_id, room_id);
         if let Some(session) = self.sessions.get_mut(&session_id) {
@@ -2088,6 +2167,18 @@ impl Server {
         let (messages, at_start) = self
             .store
             .messages_before(room_id, before, usize::from(limit));
+        let original_count = messages.len();
+        let (messages, at_start) =
+            trim_history_chunk_to_control_budget(room_id, messages, at_start);
+        if messages.len() != original_count {
+            kvlog::warn!(
+                "history chunk trimmed to fit control frame",
+                session_id = session_id.0,
+                room_id = room_id.0,
+                requested_messages = original_count,
+                sent_messages = messages.len()
+            );
+        }
         kvlog::info!(
             "history chunk sent",
             session_id = session_id.0,
@@ -2095,14 +2186,21 @@ impl Server {
             message_count = messages.len(),
             at_start
         );
-        let _ = self.send_control_to_token(
+        if let Err(error) = self.send_control_to_token(
             token,
             &ServerControl::HistoryChunk {
                 room_id,
                 messages,
                 at_start,
             },
-        );
+        ) {
+            kvlog::warn!(
+                "history chunk send failed",
+                session_id = session_id.0,
+                room_id = room_id.0,
+                error = error.as_str()
+            );
+        }
     }
 
     /// Opens (or returns) the DM room between the requesting session's user
@@ -3733,6 +3831,7 @@ enum VideoPhase {
 /// sealed auth record is opened.
 struct VideoConn {
     phase: VideoPhase,
+    session_id: Option<SessionId>,
     stream_id: Option<StreamId>,
     role: Option<VideoRole>,
     cipher: Option<TransportCipher>,
@@ -3742,6 +3841,7 @@ impl VideoConn {
     fn new() -> Self {
         Self {
             phase: VideoPhase::AwaitHello,
+            session_id: None,
             stream_id: None,
             role: None,
             cipher: None,
@@ -3919,7 +4019,7 @@ struct VideoStream {
     user_id: UserId,
     sender_name: String,
     publish_secret: [u8; KEY_LEN],
-    view_secret: [u8; KEY_LEN],
+    view_secrets: HashMap<SessionId, [u8; KEY_LEN]>,
     codec: String,
     coded_width: u32,
     coded_height: u32,
@@ -3959,6 +4059,48 @@ fn accessible_recipient_tokens(
         .map(|(_, session)| session.tcp_token)
         .filter(|token| is_token_active(*token))
         .collect()
+}
+
+/// Shrinks an ascending history page until it fits in one control payload.
+///
+/// When a page is too large, the oldest records are dropped first so the client
+/// still receives the newest messages before its cursor. A byte-trimmed page is
+/// never `at_start`, even if the untrimmed slice reached the store's oldest
+/// retained message.
+fn trim_history_chunk_to_control_budget(
+    room_id: RoomId,
+    messages: Vec<ChatMessage>,
+    at_start: bool,
+) -> (Vec<ChatMessage>, bool) {
+    if history_chunk_fits_control_budget(room_id, &messages, at_start) {
+        return (messages, at_start);
+    }
+
+    let mut low = 0usize;
+    let mut high = messages.len();
+    while low < high {
+        let mid = (low + high) / 2;
+        if history_chunk_fits_control_budget(room_id, &messages[mid..], false) {
+            high = mid;
+        } else {
+            low = mid + 1;
+        }
+    }
+    let trimmed = messages[low..].to_vec();
+    (trimmed, false)
+}
+
+fn history_chunk_fits_control_budget(
+    room_id: RoomId,
+    messages: &[ChatMessage],
+    at_start: bool,
+) -> bool {
+    let encoded = encode_server_control(&ServerControl::HistoryChunk {
+        room_id,
+        messages: messages.to_vec(),
+        at_start,
+    });
+    encoded.len() <= MAX_CONTROL_PAYLOAD_BYTES
 }
 
 fn dm_room_name(a: UserId, b: UserId) -> String {
@@ -4751,6 +4893,50 @@ mod tests {
     }
 
     #[test]
+    fn history_fetch_trims_page_to_one_control_frame() {
+        let mut config = ServerConfig::default();
+        config.network.tcp_addr = "127.0.0.1:0".parse().unwrap();
+        config.network.udp_addr = "127.0.0.1:0".parse().unwrap();
+        config.network.p2p_enabled = false;
+        config.rooms[0].persistence = config::RoomPersistenceConfig::Memory;
+        config.rooms[0].memory_limit = Some(256);
+        let mut server = Server::bind(config).expect("test server");
+        let session = SessionId(1);
+        server
+            .sessions
+            .insert(session, test_session(UserId(1), Token(11), None));
+        let body = "x".repeat(rpc::control::MAX_CHAT_BODY_BYTES);
+        for _ in 0..80 {
+            server.send_chat(session, RoomId(1), body.clone()).unwrap();
+        }
+        let mut peer = live_user(&mut server, Token(11), session, UserId(1));
+
+        server.fetch_history(
+            session,
+            RoomId(1),
+            None,
+            rpc::control::MAX_HISTORY_FETCH_MESSAGES,
+        );
+
+        let chunk = read_plaintext_server_control(&mut peer);
+        let ServerControl::HistoryChunk {
+            messages, at_start, ..
+        } = chunk
+        else {
+            panic!("expected history chunk");
+        };
+        assert!(!messages.is_empty());
+        assert!(messages.len() < 80);
+        assert!(!at_start, "a byte-trimmed page has not reached the start");
+        let encoded = encode_server_control(&ServerControl::HistoryChunk {
+            room_id: RoomId(1),
+            messages,
+            at_start,
+        });
+        assert!(encoded.len() <= rpc::control::MAX_CONTROL_PAYLOAD_BYTES);
+    }
+
+    #[test]
     fn voice_in_room_a_persists_while_chatting_in_b() {
         let mut server = test_server();
         let room_a = RoomId(1);
@@ -4795,6 +4981,211 @@ mod tests {
         assert_eq!(session.voice_room, Some(room_b));
         assert!(server.voice_member_sessions(room_a).is_empty());
         assert_eq!(server.voice_member_sessions(room_b), vec![talker]);
+    }
+
+    #[test]
+    fn join_voice_confirms_self_before_replaying_existing_members() {
+        let mut server = test_server();
+        let room_id = RoomId(1);
+        let existing = SessionId(1);
+        let joining = SessionId(2);
+        let _existing_peer = live_user(&mut server, Token(11), existing, UserId(1));
+        let mut joining_peer = live_user(&mut server, Token(22), joining, UserId(2));
+        server.sessions.get_mut(&existing).unwrap().voice_room = Some(room_id);
+        server.ensure_voice_stream(existing, room_id).unwrap();
+
+        server.join_voice(joining, room_id);
+
+        let ServerControl::VoiceStarted { user_id, .. } =
+            read_plaintext_server_control(&mut joining_peer)
+        else {
+            panic!("voice confirmation must be the first control");
+        };
+        assert_eq!(user_id, UserId(2));
+        let ServerControl::VoiceStarted { user_id, .. } =
+            read_plaintext_server_control(&mut joining_peer)
+        else {
+            panic!("existing voice member must follow local confirmation");
+        };
+        assert_eq!(user_id, UserId(1));
+    }
+
+    #[test]
+    fn screen_share_is_announced_only_to_voice_members() {
+        let mut server = test_server();
+        let room_id = RoomId(1);
+        let owner = SessionId(1);
+        let viewer = SessionId(2);
+        let idler = SessionId(3);
+        let _owner_peer = live_user(&mut server, Token(11), owner, UserId(1));
+        let mut viewer_peer = live_user(&mut server, Token(22), viewer, UserId(2));
+        let mut idler_peer = live_user(&mut server, Token(33), idler, UserId(3));
+        for session_id in [owner, viewer] {
+            server.sessions.get_mut(&session_id).unwrap().voice_room = Some(room_id);
+            server.ensure_voice_stream(session_id, room_id).unwrap();
+        }
+
+        server
+            .start_share(
+                owner,
+                room_id,
+                "avc1.42c01f".to_string(),
+                1280,
+                720,
+                true,
+                Vec::new(),
+            )
+            .unwrap();
+
+        let available = read_until(&mut viewer_peer, |control| {
+            matches!(control, ServerControl::ShareAvailable { .. })
+        });
+        assert!(matches!(
+            available,
+            ServerControl::ShareAvailable {
+                room_id: RoomId(1),
+                ..
+            }
+        ));
+        assert_no_control(&mut idler_peer);
+    }
+
+    #[test]
+    fn leaving_voice_ends_the_owners_screen_share() {
+        let mut server = test_server();
+        let owner = SessionId(1);
+        let room_id = RoomId(1);
+        let _owner_peer = live_user(&mut server, Token(11), owner, UserId(1));
+        server.sessions.get_mut(&owner).unwrap().voice_room = Some(room_id);
+        server.ensure_voice_stream(owner, room_id).unwrap();
+        server
+            .start_share(
+                owner,
+                room_id,
+                "avc1.42c01f".to_string(),
+                1280,
+                720,
+                true,
+                Vec::new(),
+            )
+            .unwrap();
+        assert_eq!(server.streams.len(), 1);
+
+        server.leave_voice(owner, None);
+
+        assert!(server.streams.is_empty());
+    }
+
+    #[test]
+    fn leaving_voice_revokes_session_specific_video_access() {
+        let mut server = test_server();
+        let room_id = RoomId(1);
+        let owner = SessionId(1);
+        let viewer = SessionId(2);
+        let idler = SessionId(3);
+        let _owner_peer = live_user(&mut server, Token(11), owner, UserId(1));
+        let _viewer_peer = live_user(&mut server, Token(22), viewer, UserId(2));
+        let _idler_peer = live_user(&mut server, Token(33), idler, UserId(3));
+        for session_id in [owner, viewer] {
+            server.sessions.get_mut(&session_id).unwrap().voice_room = Some(room_id);
+            server.ensure_voice_stream(session_id, room_id).unwrap();
+        }
+        server
+            .start_share(
+                owner,
+                room_id,
+                "avc1.42c01f".to_string(),
+                1280,
+                720,
+                true,
+                Vec::new(),
+            )
+            .unwrap();
+        let stream_id = *server.streams.keys().next().unwrap();
+        assert!(
+            server.streams[&stream_id]
+                .view_secrets
+                .contains_key(&viewer)
+        );
+        assert!(!server.streams[&stream_id].view_secrets.contains_key(&idler));
+
+        let (mut conn, _video_peer) = test_live_client();
+        conn.kind = ConnKind::Video(VideoConn::new());
+        server.clients.insert(Token(44), conn);
+        let hello = VideoHello {
+            version: rpc::PROTOCOL_VERSION,
+            session_id: viewer,
+            stream_id,
+            role: VideoRole::Subscriber,
+        };
+        server
+            .handle_video_hello(Token(44), &video::encode_video_hello(&hello))
+            .unwrap();
+
+        let (mut unauthorized, _unauthorized_peer) = test_live_client();
+        unauthorized.kind = ConnKind::Video(VideoConn::new());
+        server.clients.insert(Token(55), unauthorized);
+        let hello = VideoHello {
+            session_id: idler,
+            ..hello
+        };
+        assert!(
+            server
+                .handle_video_hello(Token(55), &video::encode_video_hello(&hello))
+                .is_err()
+        );
+
+        server.leave_voice(viewer, None);
+
+        assert!(!server.clients.contains_key(&Token(44)));
+        assert!(
+            !server.streams[&stream_id]
+                .view_secrets
+                .contains_key(&viewer)
+        );
+    }
+
+    #[test]
+    fn joining_voice_replays_active_shares_with_viewer_secret() {
+        let mut server = test_server();
+        let room_id = RoomId(1);
+        let owner = SessionId(1);
+        let viewer = SessionId(2);
+        let _owner_peer = live_user(&mut server, Token(11), owner, UserId(1));
+        let mut viewer_peer = live_user(&mut server, Token(22), viewer, UserId(2));
+        server.sessions.get_mut(&owner).unwrap().voice_room = Some(room_id);
+        server.ensure_voice_stream(owner, room_id).unwrap();
+        server
+            .start_share(
+                owner,
+                room_id,
+                "avc1.42c01f".to_string(),
+                1280,
+                720,
+                true,
+                Vec::new(),
+            )
+            .unwrap();
+
+        server.join_voice(viewer, room_id);
+
+        let available = read_until(&mut viewer_peer, |control| {
+            matches!(control, ServerControl::ShareAvailable { .. })
+        });
+        let ServerControl::ShareAvailable {
+            view_secret,
+            stream_id,
+            ..
+        } = available
+        else {
+            unreachable!();
+        };
+        assert_eq!(view_secret.len(), KEY_LEN);
+        assert!(
+            server.streams[&stream_id]
+                .view_secrets
+                .contains_key(&viewer)
+        );
     }
 
     #[test]
@@ -4893,7 +5284,7 @@ mod tests {
             user_id: UserId(1),
             sender_name: "sharer".to_string(),
             publish_secret: [1u8; KEY_LEN],
-            view_secret: [2u8; KEY_LEN],
+            view_secrets: HashMap::new(),
             codec: "avc1.42c01f".to_string(),
             coded_width: 1280,
             coded_height: 720,

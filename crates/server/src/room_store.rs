@@ -83,6 +83,7 @@ pub struct RoomStore {
     next_room_id: u32,
     next_ids: HashMap<RoomId, u64>,
     watermarks: HashMap<RoomId, u64>,
+    heads: HashMap<RoomId, MessageId>,
     dm_rooms: Vec<DmRoom>,
     rooms: HashMap<RoomId, Retention>,
 }
@@ -112,6 +113,7 @@ impl RoomStore {
             next_room_id: state.next_room_id.max(FIRST_DYNAMIC_ROOM_ID),
             next_ids: HashMap::new(),
             watermarks: HashMap::new(),
+            heads: HashMap::new(),
             dm_rooms: Vec::new(),
             rooms: HashMap::new(),
         };
@@ -158,6 +160,7 @@ impl RoomStore {
         {
             let next = self.next_ids.entry(room_id).or_insert(1);
             *next = (*next).max(last.message_id.0 + 1);
+            self.heads.insert(room_id, last.message_id);
         }
         self.rooms.insert(room_id, retention);
     }
@@ -216,6 +219,7 @@ impl RoomStore {
         let Some(retention) = self.rooms.get_mut(&room_id) else {
             return 0;
         };
+        self.heads.insert(room_id, message.message_id);
         match retention {
             Retention::None => 0,
             Retention::Memory { messages, limit } => {
@@ -267,8 +271,7 @@ impl RoomStore {
 
     /// Latest message id assigned in the room, `None` before the first message.
     pub fn head(&self, room_id: RoomId) -> Option<MessageId> {
-        let next = self.next_ids.get(&room_id).copied().unwrap_or(1);
-        (next > 1).then(|| MessageId(next - 1))
+        self.heads.get(&room_id).copied()
     }
 
     /// Retained messages strictly before `before` (or the newest when `None`),
@@ -602,8 +605,46 @@ mod tests {
         let next = store.allocate_message_id(room);
         assert!(next.0 > 3, "id {} must not reuse 1..=3", next.0);
         assert_eq!(store.recent(room, 10).len(), 3);
-        assert_eq!(store.head(room), Some(next));
+        assert_eq!(store.head(room), Some(MessageId(3)));
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn allocation_does_not_advance_head_until_append() {
+        let mut store = RoomStore::open(None, &[memory_room(1, 16)]);
+        let room = RoomId(1);
+
+        let id = store.allocate_message_id(room);
+        assert_eq!(store.head(room), None);
+
+        store.append(room, &test_message(room, id.0));
+        assert_eq!(store.head(room), Some(id));
+    }
+
+    #[test]
+    fn restart_head_tracks_retained_messages_not_reserved_ids() {
+        let durable_dir = temp_dir("durable-head");
+        let room = RoomId(1);
+        let mut store = RoomStore::open(Some(durable_dir.clone()), &[durable_room(1)]);
+        let id = store.allocate_message_id(room);
+        store.append(room, &test_message(room, id.0));
+        drop(store);
+
+        let store = RoomStore::open(Some(durable_dir.clone()), &[durable_room(1)]);
+        assert_eq!(store.head(room), Some(MessageId(1)));
+        drop(store);
+
+        let memory_dir = temp_dir("memory-head");
+        let mut store = RoomStore::open(Some(memory_dir.clone()), &[memory_room(1, 16)]);
+        let id = store.allocate_message_id(room);
+        store.append(room, &test_message(room, id.0));
+        drop(store);
+
+        let store = RoomStore::open(Some(memory_dir.clone()), &[memory_room(1, 16)]);
+        assert_eq!(store.head(room), None);
+
+        let _ = fs::remove_dir_all(durable_dir);
+        let _ = fs::remove_dir_all(memory_dir);
     }
 
     #[test]

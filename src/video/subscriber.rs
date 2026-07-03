@@ -14,7 +14,7 @@ use std::time::Duration;
 
 use rpc::{
     crypto::CHANNEL_VIDEO,
-    ids::StreamId,
+    ids::{SessionId, StreamId},
     video::{self, VideoRole},
 };
 
@@ -46,6 +46,7 @@ impl Drop for SubscriberHandle {
 
 /// Spawns a viewer thread that streams `stream_id` to the browser via `feed`.
 pub fn start(
+    session_id: SessionId,
     stream_id: StreamId,
     view_secret: Vec<u8>,
     tcp_addr: String,
@@ -55,12 +56,22 @@ pub fn start(
     let thread_stop = stop.clone();
     let join = thread::Builder::new()
         .name("chatt-subscribe".to_string())
-        .spawn(move || run(stream_id, &view_secret, &tcp_addr, &feed, &thread_stop))
+        .spawn(move || {
+            run(
+                session_id,
+                stream_id,
+                &view_secret,
+                &tcp_addr,
+                &feed,
+                &thread_stop,
+            )
+        })
         .ok();
     SubscriberHandle { stop, join }
 }
 
 fn run(
+    session_id: SessionId,
     stream_id: StreamId,
     secret: &[u8],
     tcp_addr: &str,
@@ -68,7 +79,7 @@ fn run(
     stop: &AtomicBool,
 ) {
     while !stop.load(Ordering::SeqCst) {
-        match run_once(stream_id, secret, tcp_addr, feed, stop) {
+        match run_once(session_id, stream_id, secret, tcp_addr, feed, stop) {
             Ok(()) => break,
             Err(error) => {
                 kvlog::warn!(
@@ -84,14 +95,20 @@ fn run(
 }
 
 fn run_once(
+    session_id: SessionId,
     stream_id: StreamId,
     secret: &[u8],
     tcp_addr: &str,
     feed: &WebFeedSender,
     stop: &AtomicBool,
 ) -> Result<(), String> {
-    let (mut stream, mut cipher, mut buf) =
-        super::open_video_connection(tcp_addr, stream_id, VideoRole::Subscriber, secret)?;
+    let (mut stream, mut cipher, mut buf) = super::open_video_connection(
+        tcp_addr,
+        session_id,
+        stream_id,
+        VideoRole::Subscriber,
+        secret,
+    )?;
     stream
         .set_read_timeout(Some(READ_TIMEOUT))
         .map_err(|error| error.to_string())?;

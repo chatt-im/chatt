@@ -42,6 +42,10 @@ pub(crate) struct RoomMeta {
     pub(crate) last_read: Option<MessageId>,
     /// Live messages received while the room was not viewed.
     pub(crate) unread: u32,
+    /// Oldest message in the most recent server history page.
+    history_before: Option<MessageId>,
+    history_at_start: bool,
+    history_in_flight: bool,
 }
 
 /// One row of the room switcher and rooms strip, in catalog order (public and
@@ -141,6 +145,10 @@ pub(crate) struct RoomSession {
     metas: BTreeMap<RoomId, RoomMeta>,
     /// Buffered state of rooms other than the viewed one.
     parked: HashMap<RoomId, ClientRoom>,
+    /// Rooms omitted by the latest authenticated snapshot. They remain
+    /// available as local history whenever the client is offline.
+    archived_metas: BTreeMap<RoomId, RoomMeta>,
+    archived_rooms: HashMap<RoomId, ClientRoom>,
     /// The room the chat panel shows. `None` before any room is known.
     pub viewed_room: Option<RoomId>,
     /// Server-wide user directory seeded at auth and updated by presence.
@@ -305,6 +313,72 @@ fn collect_web_attachments(
     }
 }
 
+fn file_message_id(
+    chat: &VirtualChatBuffer,
+    timestamp_ms: u64,
+    transfer_id: FileTransferId,
+) -> Option<u64> {
+    (0..chat.len()).rev().find_map(|index| {
+        let message = chat.message(index);
+        (message.timestamp_ms == timestamp_ms && message.file_transfer_id == Some(transfer_id))
+            .then_some(message.id)
+    })
+}
+
+fn record_room_file(
+    room: &mut ClientRoom,
+    transfer_id: FileTransferId,
+    timestamp_ms: u64,
+    file_name: &str,
+    length: u64,
+    dimensions: Option<(u32, u32)>,
+) {
+    let packed_dims =
+        dimensions.map_or(0, |(width, height)| ((height as u64) << 32) | width as u64);
+    let key = FileHistoryKey {
+        timestamp_ms,
+        transfer_id,
+    };
+    if let Some(store) = &mut room.history {
+        store.append_file_detail(key, file_name, length, packed_dims);
+    }
+    room.files.insert(
+        key,
+        room_history::FileDetail {
+            file_name: file_name.to_string(),
+            length,
+            packed_dims,
+        },
+    );
+    let attachment = WebAttachment::from_served_file(file_name, dimensions);
+    room.web_file_attachments.insert(key, attachment.clone());
+    if let Some(message_id) = file_message_id(&room.chat, timestamp_ms, transfer_id) {
+        room.web_attachments
+            .insert((timestamp_ms, message_id), attachment);
+    }
+}
+
+fn update_transfer_progress(
+    transfers: &mut HashMap<FileTransferId, TransferProgress>,
+    transfer_id: FileTransferId,
+    transferred: u64,
+    total: u64,
+    direction: TransferDirection,
+) {
+    if transferred >= total {
+        transfers.remove(&transfer_id);
+        return;
+    }
+    transfers.insert(
+        transfer_id,
+        TransferProgress {
+            transferred,
+            total,
+            direction,
+        },
+    );
+}
+
 /// Drops completely blank lines from the start and end of `text` while keeping
 /// the leading whitespace (indentation) of the remaining content lines. Returns
 /// an empty string when every line is blank.
@@ -355,6 +429,8 @@ impl RoomSession {
             files: std::collections::HashMap::new(),
             metas: BTreeMap::new(),
             parked: HashMap::new(),
+            archived_metas: BTreeMap::new(),
+            archived_rooms: HashMap::new(),
             viewed_room: None,
             users: BTreeMap::new(),
             default_room: None,
@@ -426,38 +502,61 @@ impl RoomSession {
         history_id: String,
         local_user_name: String,
     ) {
+        self.clear_active_room_state();
         self.server_alias = server_alias;
         self.history_id = history_id;
         self.local_user_name = local_user_name;
         self.room_name = "lobby".to_string();
         self.metas.clear();
         self.parked.clear();
+        self.archived_metas.clear();
+        self.archived_rooms.clear();
         self.users.clear();
         self.viewed_room = None;
         self.default_room = None;
+        self.local_user = None;
+        self.muted_users.clear();
+        self.stream_users.clear();
+        self.volume_preview = None;
+        self.composer.clear();
         self.composer.enter_insert_mode();
     }
 
     pub(crate) fn reset_for_server_list(&mut self) {
+        self.clear_active_room_state();
         self.server_alias.clear();
         self.history_id.clear();
         self.local_user_name.clear();
         self.room_name = "servers".to_string();
+        self.metas.clear();
+        self.parked.clear();
+        self.archived_metas.clear();
+        self.archived_rooms.clear();
+        self.users.clear();
+        self.viewed_room = None;
+        self.default_room = None;
+        self.local_user = None;
+        self.muted_users.clear();
+        self.stream_users.clear();
+        self.volume_preview = None;
+    }
+
+    fn clear_active_room_state(&mut self) {
+        self.chat.clear();
+        self.messages.clear();
+        self.files.clear();
         self.history = None;
         self.seen.clear();
         self.web_attachments.clear();
         self.web_file_attachments.clear();
-        self.metas.clear();
-        self.parked.clear();
-        self.users.clear();
-        self.viewed_room = None;
-        self.default_room = None;
-        self.chat.clear();
+        self.transfers.clear();
+        self.participants.replace_room(Vec::new());
     }
 
     /// Marks every user offline and clears live voice state while keeping the
     /// room buffers, so captured logs stay browsable offline.
     pub(crate) fn reset_for_disconnect(&mut self) {
+        self.restore_archived_rooms();
         self.stream_users.clear();
         for user in self.users.values_mut() {
             user.online = false;
@@ -472,8 +571,8 @@ impl RoomSession {
     /// Applies the authenticated snapshot: the accessible room catalog, the
     /// user directory, and the server default room. Chooses the viewed room
     /// (preferring `preferred_view`, then the previous view, then the default)
-    /// and returns the ids of every known room so the caller can request
-    /// history backfill.
+    /// and returns the viewed room id, if any, so the caller can request its
+    /// initial history backfill. Other rooms are backfilled when first viewed.
     pub(crate) fn authenticated(
         &mut self,
         rooms: &[RoomInfo],
@@ -485,7 +584,10 @@ impl RoomSession {
         self.local_user = local_user;
         self.users = users.into_iter().map(|user| (user.user_id, user)).collect();
         self.default_room = Some(default_room);
+        let accessible: HashSet<RoomId> = rooms.iter().map(|room| room.room_id).collect();
+        self.archive_inaccessible_rooms(&accessible, local_user);
         for info in rooms {
+            self.restore_archived_room(info.room_id);
             self.upsert_room(info, local_user);
         }
         let view = preferred_view
@@ -493,12 +595,14 @@ impl RoomSession {
             .filter(|room_id| self.metas.contains_key(room_id))
             .unwrap_or(default_room);
         self.set_viewed_room(view, local_user);
-        self.metas.keys().copied().collect()
+        self.refresh_viewed_room(local_user);
+        self.viewed_room.into_iter().collect()
     }
 
-    /// Registers or refreshes a room from its wire description, materializing
-    /// its buffer from the local capture on first sight.
-    pub(crate) fn upsert_room(&mut self, info: &RoomInfo, local_user: Option<UserId>) {
+    /// Registers or refreshes a room from its wire description. The room's
+    /// buffer is materialized lazily when viewed or when background activity
+    /// needs somewhere to land.
+    pub(crate) fn upsert_room(&mut self, info: &RoomInfo, _local_user: Option<UserId>) {
         let kind = ClientRoomKind::from_wire(&info.kind);
         let name = self.display_room_name(&info.name, &kind);
         match self.metas.get_mut(&info.room_id) {
@@ -506,7 +610,10 @@ impl RoomSession {
                 meta.name = name;
                 meta.kind = kind;
                 meta.voice_users = info.voice_users.iter().copied().collect();
-                meta.head = info.head.or(meta.head);
+                meta.head = info.head;
+                meta.history_before = None;
+                meta.history_at_start = false;
+                meta.history_in_flight = false;
             }
             None => {
                 self.metas.insert(
@@ -518,13 +625,12 @@ impl RoomSession {
                         head: info.head,
                         last_read: None,
                         unread: 0,
+                        history_before: None,
+                        history_at_start: false,
+                        history_in_flight: false,
                     },
                 );
             }
-        }
-        if self.viewed_room != Some(info.room_id) && !self.parked.contains_key(&info.room_id) {
-            let room = self.materialize_room(info.room_id, local_user);
-            self.parked.insert(info.room_id, room);
         }
     }
 
@@ -560,6 +666,21 @@ impl RoomSession {
         room
     }
 
+    fn ensure_parked_room(
+        &mut self,
+        room_id: RoomId,
+        local_user: Option<UserId>,
+    ) -> Option<&mut ClientRoom> {
+        if !self.metas.contains_key(&room_id) {
+            return None;
+        }
+        if !self.parked.contains_key(&room_id) {
+            let room = self.materialize_room(room_id, local_user);
+            self.parked.insert(room_id, room);
+        }
+        self.parked.get_mut(&room_id)
+    }
+
     /// Switches the chat panel to `room_id`, parking the current room's state
     /// (including the composer draft) and checking out the target's. Returns
     /// false when the room is unknown.
@@ -571,24 +692,7 @@ impl RoomSession {
             self.mark_viewed_read();
             return true;
         }
-        if let Some(previous) = self.viewed_room {
-            let empty = VirtualChatBuffer::new(self.max_messages, self.syntax);
-            let parked = ClientRoom {
-                chat: std::mem::replace(&mut self.chat, empty),
-                messages: std::mem::take(&mut self.messages),
-                files: std::mem::take(&mut self.files),
-                seen: std::mem::replace(
-                    &mut self.seen,
-                    BoundedKeySet::with_capacity(self.max_messages),
-                ),
-                history: self.history.take(),
-                draft: self.composer.text(),
-                web_attachments: std::mem::take(&mut self.web_attachments),
-                web_file_attachments: std::mem::take(&mut self.web_file_attachments),
-                transfers: std::mem::take(&mut self.transfers),
-            };
-            self.parked.insert(previous, parked);
-        }
+        self.park_viewed_room();
         let room = match self.parked.remove(&room_id) {
             Some(room) => room,
             None => self.materialize_room(room_id, local_user),
@@ -617,6 +721,97 @@ impl RoomSession {
         true
     }
 
+    fn park_viewed_room(&mut self) {
+        let Some(previous) = self.viewed_room.take() else {
+            return;
+        };
+        let empty = VirtualChatBuffer::new(self.max_messages, self.syntax);
+        let parked = ClientRoom {
+            chat: std::mem::replace(&mut self.chat, empty),
+            messages: std::mem::take(&mut self.messages),
+            files: std::mem::take(&mut self.files),
+            seen: std::mem::replace(
+                &mut self.seen,
+                BoundedKeySet::with_capacity(self.max_messages),
+            ),
+            history: self.history.take(),
+            draft: self.composer.text(),
+            web_attachments: std::mem::take(&mut self.web_attachments),
+            web_file_attachments: std::mem::take(&mut self.web_file_attachments),
+            transfers: std::mem::take(&mut self.transfers),
+        };
+        self.parked.insert(previous, parked);
+    }
+
+    fn archive_inaccessible_rooms(
+        &mut self,
+        accessible: &HashSet<RoomId>,
+        local_user: Option<UserId>,
+    ) {
+        if self
+            .viewed_room
+            .is_some_and(|room_id| !accessible.contains(&room_id))
+        {
+            self.park_viewed_room();
+        }
+        let removed = self
+            .metas
+            .keys()
+            .filter(|room_id| !accessible.contains(*room_id))
+            .copied()
+            .collect::<Vec<_>>();
+        for room_id in removed {
+            let Some(meta) = self.metas.remove(&room_id) else {
+                continue;
+            };
+            let room = self
+                .parked
+                .remove(&room_id)
+                .unwrap_or_else(|| self.materialize_room(room_id, local_user));
+            self.archived_metas.insert(room_id, meta);
+            self.archived_rooms.insert(room_id, room);
+        }
+    }
+
+    fn restore_archived_room(&mut self, room_id: RoomId) {
+        if let Some(meta) = self.archived_metas.remove(&room_id) {
+            self.metas.insert(room_id, meta);
+        }
+        if let Some(room) = self.archived_rooms.remove(&room_id) {
+            self.parked.insert(room_id, room);
+        }
+    }
+
+    fn restore_archived_rooms(&mut self) {
+        let room_ids = self.archived_metas.keys().copied().collect::<Vec<_>>();
+        for room_id in room_ids {
+            self.restore_archived_room(room_id);
+        }
+    }
+
+    fn refresh_viewed_room(&mut self, local_user: Option<UserId>) {
+        let Some(room_id) = self.viewed_room else {
+            return;
+        };
+        self.room_name = self
+            .metas
+            .get(&room_id)
+            .map(|meta| meta.name.clone())
+            .unwrap_or_default();
+        self.chat.clear();
+        self.chat.set_room_id(room_id);
+        self.seen.clear();
+        for message in &self.messages {
+            let local = Some(message.sender) == local_user;
+            self.seen
+                .insert((message.timestamp_ms, message.message_id.0));
+            self.chat.push_chat(message.clone(), local);
+        }
+        self.chat.bottom();
+        self.mark_viewed_read();
+        self.rebuild_roster();
+    }
+
     /// Marks the viewed room read up to its newest buffered message and clears
     /// its unread count.
     pub(crate) fn mark_viewed_read(&mut self) {
@@ -630,8 +825,7 @@ impl RoomSession {
             .map(MessageId);
         if let Some(meta) = self.metas.get_mut(&room_id) {
             meta.unread = 0;
-            let read_to = newest.max(meta.head);
-            meta.last_read = read_to.max(meta.last_read);
+            meta.last_read = newest.max(meta.last_read);
         }
     }
 
@@ -644,6 +838,8 @@ impl RoomSession {
     ) {
         self.metas.clear();
         self.parked.clear();
+        self.archived_metas.clear();
+        self.archived_rooms.clear();
         self.viewed_room = None;
         for room in &catalog.rooms {
             let kind = match &room.kind {
@@ -677,6 +873,9 @@ impl RoomSession {
                     head: None,
                     last_read: room.last_read,
                     unread: 0,
+                    history_before: None,
+                    history_at_start: false,
+                    history_in_flight: false,
                 },
             );
         }
@@ -687,41 +886,101 @@ impl RoomSession {
         if let Some(view) = view {
             self.set_viewed_room(view, local_user);
         } else {
-            self.chat.clear();
+            self.clear_active_room_state();
         }
     }
 
     /// Exports the catalog state to persist for offline sessions.
     pub(crate) fn catalog(&self, voice_room: Option<RoomId>) -> RoomCatalog {
+        let mut rooms = self
+            .metas
+            .iter()
+            .chain(self.archived_metas.iter())
+            .map(|(room_id, meta)| CatalogRoom {
+                room_id: *room_id,
+                name: meta.name.clone(),
+                kind: match &meta.kind {
+                    ClientRoomKind::Public => CatalogRoomKind::Public,
+                    ClientRoomKind::Private { .. } => CatalogRoomKind::Private,
+                    ClientRoomKind::Dm { user_a, user_b } => {
+                        let peer = self.dm_peer(*user_a, *user_b);
+                        let mut peer_name = self.display_name_of(peer);
+                        if peer_name.is_empty()
+                            && let Some(archived_name) = meta.name.strip_prefix('@')
+                        {
+                            peer_name = archived_name.to_string();
+                        }
+                        CatalogRoomKind::Dm { peer, peer_name }
+                    }
+                },
+                last_read: meta.last_read,
+            })
+            .collect::<Vec<_>>();
+        rooms.sort_by_key(|room| room.room_id);
         RoomCatalog {
             last_viewed_room: self.viewed_room,
             last_voice_room: voice_room,
-            rooms: self
-                .metas
-                .iter()
-                .map(|(room_id, meta)| CatalogRoom {
-                    room_id: *room_id,
-                    name: meta.name.clone(),
-                    kind: match &meta.kind {
-                        ClientRoomKind::Public => CatalogRoomKind::Public,
-                        ClientRoomKind::Private { .. } => CatalogRoomKind::Private,
-                        ClientRoomKind::Dm { user_a, user_b } => {
-                            let peer = self.dm_peer(*user_a, *user_b);
-                            CatalogRoomKind::Dm {
-                                peer,
-                                peer_name: self.display_name_of(peer),
-                            }
-                        }
-                    },
-                    last_read: meta.last_read,
-                })
-                .collect(),
+            rooms,
         }
     }
 
     /// Merges a server history page into the room, deduped against what the
     /// room already holds, appending unseen messages to the local capture and
     /// rebuilding the buffer in `(timestamp_ms, message_id)` order.
+    pub(crate) fn begin_history_fetch(
+        &mut self,
+        room_id: RoomId,
+        before: Option<MessageId>,
+    ) -> bool {
+        let Some(meta) = self.metas.get_mut(&room_id) else {
+            return false;
+        };
+        if meta.history_in_flight {
+            return false;
+        }
+        if before.is_none() && (meta.history_before.is_some() || meta.history_at_start) {
+            return false;
+        }
+        meta.history_in_flight = true;
+        true
+    }
+
+    pub(crate) fn complete_history_fetch(
+        &mut self,
+        room_id: RoomId,
+        messages: &[ChatMessage],
+        at_start: bool,
+    ) {
+        let Some(meta) = self.metas.get_mut(&room_id) else {
+            return;
+        };
+        meta.history_in_flight = false;
+        if let Some(first) = messages.first() {
+            meta.history_before = Some(first.message_id);
+        }
+        meta.history_at_start = at_start || messages.is_empty();
+    }
+
+    /// Starts one older-page request for the viewed room, coalescing repeated
+    /// top-of-scroll attempts until the outstanding response arrives.
+    pub(crate) fn older_history_request(&mut self) -> Option<(RoomId, Option<MessageId>, u16)> {
+        let room_id = self.viewed_room?;
+        let meta = self.metas.get_mut(&room_id)?;
+        if meta.history_at_start
+            || meta.history_in_flight
+            || self.messages.len() >= self.max_messages
+        {
+            return None;
+        }
+        let before = meta.history_before?;
+        let remaining = self.max_messages.saturating_sub(self.messages.len());
+        let limit = remaining
+            .min(usize::from(rpc::control::MAX_HISTORY_FETCH_MESSAGES))
+            .max(1) as u16;
+        meta.history_in_flight = true;
+        Some((room_id, Some(before), limit))
+    }
+
     pub(crate) fn merge_history(
         &mut self,
         room_id: RoomId,
@@ -729,6 +988,11 @@ impl RoomSession {
         local_user: Option<UserId>,
     ) {
         if self.viewed_room == Some(room_id) {
+            let scroll_offset = self.chat.scroll_offset();
+            let selected = self.chat.selected_message().map(|index| {
+                let message = self.chat.message(index);
+                (message.timestamp_ms, message.id)
+            });
             let mut fresh = false;
             for message in messages {
                 if self
@@ -747,9 +1011,19 @@ impl RoomSession {
             }
             self.messages
                 .sort_by_key(|message| (message.timestamp_ms, message.message_id.0));
+            trim_messages(&mut self.messages, self.max_messages);
             let all = std::mem::take(&mut self.messages);
             self.populate_history(room_id, &all, local_user);
             self.messages = all;
+            self.chat.restore_scroll_offset(scroll_offset);
+            if let Some(selected) = selected
+                && let Some(index) = self
+                    .messages
+                    .iter()
+                    .position(|message| (message.timestamp_ms, message.message_id.0) == selected)
+            {
+                self.chat.select_message(index);
+            }
             let files = std::mem::take(&mut self.files);
             self.populate_web_attachments_list(&files);
             self.files = files;
@@ -777,6 +1051,7 @@ impl RoomSession {
         }
         room.messages
             .sort_by_key(|message| (message.timestamp_ms, message.message_id.0));
+        trim_messages(&mut room.messages, self.max_messages);
         room.chat.clear();
         room.chat.set_room_id(room_id);
         for message in &room.messages {
@@ -813,7 +1088,9 @@ impl RoomSession {
                 room_id: *room_id,
                 name: meta.name.clone(),
                 unread: meta.unread,
-                behind_head: meta.unread == 0 && meta.head > meta.last_read,
+                behind_head: self.viewed_room != Some(*room_id)
+                    && meta.unread == 0
+                    && meta.head > meta.last_read,
                 voice: voice_room == Some(*room_id),
                 viewed: self.viewed_room == Some(*room_id),
             });
@@ -1020,21 +1297,29 @@ impl RoomSession {
             });
         }
         let max_messages = self.max_messages;
-        let room = self.parked.get_mut(&room_id)?;
-        if room
-            .seen
-            .insert((message.timestamp_ms, message.message_id.0))
+        let fresh = {
+            let room = self.ensure_parked_room(room_id, local_user)?;
+            if room
+                .seen
+                .insert((message.timestamp_ms, message.message_id.0))
+            {
+                if let Some(store) = &mut room.history {
+                    store.append_message(&message);
+                }
+                room.messages.push(message.clone());
+                trim_messages(&mut room.messages, max_messages);
+                room.chat.push_chat(message, local);
+                room.chat.bottom();
+                true
+            } else {
+                false
+            }
+        };
+        if fresh
+            && !local
+            && let Some(meta) = self.metas.get_mut(&room_id)
         {
-            if let Some(store) = &mut room.history {
-                store.append_message(&message);
-            }
-            room.messages.push(message.clone());
-            trim_messages(&mut room.messages, max_messages);
-            room.chat.push_chat(message, local);
-            room.chat.bottom();
-            if !local && let Some(meta) = self.metas.get_mut(&room_id) {
-                meta.unread = meta.unread.saturating_add(1);
-            }
+            meta.unread = meta.unread.saturating_add(1);
         }
         Some(RoomChatUpdate {
             local,
@@ -1046,12 +1331,37 @@ impl RoomSession {
     /// append-only record, folded back into history on the next load.
     pub(crate) fn file_received(
         &mut self,
+        room_id: RoomId,
         transfer_id: FileTransferId,
         timestamp_ms: u64,
         file_name: &str,
         length: u64,
         dimensions: Option<(u32, u32)>,
     ) {
+        if self.viewed_room != Some(room_id) {
+            if let Some(room) = self.archived_rooms.get_mut(&room_id) {
+                record_room_file(
+                    room,
+                    transfer_id,
+                    timestamp_ms,
+                    file_name,
+                    length,
+                    dimensions,
+                );
+                return;
+            }
+            if let Some(room) = self.ensure_parked_room(room_id, self.local_user) {
+                record_room_file(
+                    room,
+                    transfer_id,
+                    timestamp_ms,
+                    file_name,
+                    length,
+                    dimensions,
+                );
+            }
+            return;
+        }
         let packed_dims =
             dimensions.map_or(0, |(width, height)| ((height as u64) << 32) | width as u64);
         if let Some(store) = &mut self.history {
@@ -1084,18 +1394,10 @@ impl RoomSession {
             },
             attachment.clone(),
         );
-        if let Some(message_id) = self.file_message_id(timestamp_ms, transfer_id) {
+        if let Some(message_id) = file_message_id(&self.chat, timestamp_ms, transfer_id) {
             self.web_attachments
                 .insert((timestamp_ms, message_id), attachment);
         }
-    }
-
-    fn file_message_id(&self, timestamp_ms: u64, transfer_id: FileTransferId) -> Option<u64> {
-        (0..self.chat.len()).rev().find_map(|index| {
-            let message = self.chat.message(index);
-            (message.timestamp_ms == timestamp_ms && message.file_transfer_id == Some(transfer_id))
-                .then_some(message.id)
-        })
     }
 
     /// Records a progress tick for an in-flight transfer. A tick that reaches or
@@ -1104,28 +1406,52 @@ impl RoomSession {
     /// receive directory, which never emits a terminal `FileReceived`.
     pub(crate) fn transfer_progress(
         &mut self,
+        room_id: RoomId,
         transfer_id: FileTransferId,
         transferred: u64,
         total: u64,
         direction: TransferDirection,
     ) {
-        if transferred >= total {
-            self.transfers.remove(&transfer_id);
+        if self.viewed_room != Some(room_id) {
+            if let Some(room) = self.archived_rooms.get_mut(&room_id) {
+                update_transfer_progress(
+                    &mut room.transfers,
+                    transfer_id,
+                    transferred,
+                    total,
+                    direction,
+                );
+                return;
+            }
+            if let Some(room) = self.ensure_parked_room(room_id, self.local_user) {
+                update_transfer_progress(
+                    &mut room.transfers,
+                    transfer_id,
+                    transferred,
+                    total,
+                    direction,
+                );
+            }
             return;
         }
-        self.transfers.insert(
+        update_transfer_progress(
+            &mut self.transfers,
             transfer_id,
-            TransferProgress {
-                transferred,
-                total,
-                direction,
-            },
+            transferred,
+            total,
+            direction,
         );
     }
 
     /// Removes any progress overlay for `transfer_id`, on completion or cancel.
-    pub(crate) fn clear_transfer(&mut self, transfer_id: FileTransferId) {
-        self.transfers.remove(&transfer_id);
+    pub(crate) fn clear_transfer(&mut self, room_id: RoomId, transfer_id: FileTransferId) {
+        if self.viewed_room == Some(room_id) {
+            self.transfers.remove(&transfer_id);
+        } else if let Some(room) = self.archived_rooms.get_mut(&room_id) {
+            room.transfers.remove(&transfer_id);
+        } else if let Some(room) = self.ensure_parked_room(room_id, self.local_user) {
+            room.transfers.remove(&transfer_id);
+        }
     }
 
     /// The live progress for `transfer_id`, if a transfer is in flight.
@@ -1232,6 +1558,10 @@ impl RoomSession {
     }
 
     pub(super) fn voice_status_changed(&mut self, user_id: UserId, status: ParticipantVoiceStatus) {
+        let status = status.normalized();
+        if let Some(user) = self.users.get_mut(&user_id) {
+            user.voice_status = status;
+        }
         self.participants.set_voice_status(user_id, status);
     }
 
@@ -1585,15 +1915,16 @@ mod tests {
     fn transfer_progress_tracks_then_clears_on_completion() {
         let mut room = test_room();
         let id = FileTransferId(7);
-        room.transfer_progress(id, 0, 100, TransferDirection::Incoming);
+        room.viewed_room = Some(RoomId(1));
+        room.transfer_progress(RoomId(1), id, 0, 100, TransferDirection::Incoming);
         let progress = room.transfer(id).expect("progress recorded");
         assert_eq!(progress.transferred, 0);
         assert_eq!(progress.total, 100);
-        room.transfer_progress(id, 40, 100, TransferDirection::Incoming);
+        room.transfer_progress(RoomId(1), id, 40, 100, TransferDirection::Incoming);
         assert_eq!(room.transfer(id).unwrap().transferred, 40);
         // Reaching total is terminal: the entry is dropped so the line reverts to
         // its completed rendering.
-        room.transfer_progress(id, 100, 100, TransferDirection::Incoming);
+        room.transfer_progress(RoomId(1), id, 100, 100, TransferDirection::Incoming);
         assert!(room.transfer(id).is_none());
     }
 
@@ -1601,10 +1932,24 @@ mod tests {
     fn clear_transfer_removes_overlay() {
         let mut room = test_room();
         let id = FileTransferId(3);
-        room.transfer_progress(id, 10, 100, TransferDirection::Outgoing);
+        room.viewed_room = Some(RoomId(1));
+        room.transfer_progress(RoomId(1), id, 10, 100, TransferDirection::Outgoing);
         assert!(room.transfer(id).is_some());
-        room.clear_transfer(id);
+        room.clear_transfer(RoomId(1), id);
         assert!(room.transfer(id).is_none());
+    }
+
+    #[test]
+    fn background_transfer_progress_stays_with_its_room() {
+        let mut room = test_room();
+        enter(&mut room, Vec::new(), Vec::new(), Some(UserId(1)));
+        let id = FileTransferId(12);
+
+        room.transfer_progress(RoomId(2), id, 25, 100, TransferDirection::Incoming);
+
+        assert!(room.transfer(id).is_none());
+        assert!(room.set_viewed_room(RoomId(2), Some(UserId(1))));
+        assert_eq!(room.transfer(id).unwrap().transferred, 25);
     }
 
     #[test]
@@ -1740,6 +2085,39 @@ mod tests {
     }
 
     #[test]
+    fn viewing_room_does_not_persist_read_watermark_past_local_messages() {
+        let mut room = test_room();
+        let mut viewed = room_info(1);
+        viewed.head = Some(MessageId(10));
+
+        room.authenticated(
+            &[viewed],
+            vec![user(UserId(1), "alice")],
+            RoomId(1),
+            None,
+            Some(UserId(1)),
+        );
+
+        assert_eq!(room.room_meta(RoomId(1)).unwrap().last_read, None);
+        assert_eq!(room.catalog(None).rooms[0].last_read, None);
+    }
+
+    #[test]
+    fn authenticated_requests_initial_history_only_for_viewed_room() {
+        let mut room = test_room();
+
+        let fetches = room.authenticated(
+            &[room_info(1), room_info(2)],
+            Vec::new(),
+            RoomId(1),
+            None,
+            Some(UserId(1)),
+        );
+
+        assert_eq!(fetches, vec![RoomId(1)]);
+    }
+
+    #[test]
     fn unread_increments_only_for_unviewed_rooms() {
         let mut room = test_room();
         enter(
@@ -1765,6 +2143,31 @@ mod tests {
     }
 
     #[test]
+    fn voice_status_survives_roster_rebuilds() {
+        let mut room = test_room();
+        enter(
+            &mut room,
+            vec![user(UserId(1), "alice"), user(UserId(2), "bob")],
+            Vec::new(),
+            Some(UserId(1)),
+        );
+
+        room.voice_status_changed(
+            UserId(2),
+            ParticipantVoiceStatus {
+                muted: true,
+                deafened: false,
+            },
+        );
+        assert!(room.voice_muted(UserId(2)));
+
+        assert!(room.set_viewed_room(RoomId(2), Some(UserId(1))));
+        assert!(room.set_viewed_room(RoomId(1), Some(UserId(1))));
+
+        assert!(room.voice_muted(UserId(2)));
+    }
+
+    #[test]
     fn history_merge_dedups_and_orders() {
         // Empty history id disables disk, so this exercises the in-memory
         // merge: dedup on (timestamp_ms, message_id) and sort by it. `message`
@@ -1787,6 +2190,58 @@ mod tests {
         assert_eq!(room.chat.message(0).body, "first");
         assert_eq!(room.chat.message(1).body, "second");
         assert_eq!(room.chat.message(2).body, "third");
+    }
+
+    #[test]
+    fn history_paging_coalesces_requests_and_stops_at_start() {
+        let mut room = test_room();
+        enter(
+            &mut room,
+            vec![user(UserId(1), "alice")],
+            Vec::new(),
+            Some(UserId(1)),
+        );
+        assert!(room.begin_history_fetch(RoomId(1), None));
+        let newest = (6..=9)
+            .map(|id| message(id, UserId(2), "newest"))
+            .collect::<Vec<_>>();
+        room.complete_history_fetch(RoomId(1), &newest, false);
+        room.merge_history(RoomId(1), newest, Some(UserId(1)));
+
+        assert_eq!(
+            room.older_history_request(),
+            Some((
+                RoomId(1),
+                Some(MessageId(6)),
+                rpc::control::MAX_HISTORY_FETCH_MESSAGES
+            ))
+        );
+        assert_eq!(room.older_history_request(), None);
+
+        let oldest = (1..=5)
+            .map(|id| message(id, UserId(2), "oldest"))
+            .collect::<Vec<_>>();
+        room.complete_history_fetch(RoomId(1), &oldest, true);
+        room.merge_history(RoomId(1), oldest, Some(UserId(1)));
+        assert_eq!(room.older_history_request(), None);
+    }
+
+    #[test]
+    fn older_history_merge_preserves_scroll_offset() {
+        let mut room = test_room();
+        let newest = (10..=30)
+            .map(|id| message(id, UserId(2), "newest"))
+            .collect::<Vec<_>>();
+        enter(&mut room, Vec::new(), newest, Some(UserId(1)));
+        room.chat.scroll_up(8, 40, 5);
+        let before = room.chat.scroll_offset();
+
+        let older = (1..10)
+            .map(|id| message(id, UserId(2), "older"))
+            .collect::<Vec<_>>();
+        room.merge_history(RoomId(1), older, Some(UserId(1)));
+
+        assert_eq!(room.chat.scroll_offset(), before);
     }
 
     #[test]
@@ -1833,6 +2288,114 @@ mod tests {
         assert_eq!(room.chat.message(1).body, "second");
         assert!(room.set_viewed_room(RoomId(2), None));
         assert_eq!(room.chat.len(), 0);
+    }
+
+    #[test]
+    fn authenticated_snapshot_archives_removed_rooms_until_disconnect() {
+        let catalog = RoomCatalog {
+            last_viewed_room: Some(RoomId(2)),
+            last_voice_room: Some(RoomId(2)),
+            rooms: vec![
+                CatalogRoom {
+                    room_id: RoomId(1),
+                    name: "lobby".to_string(),
+                    kind: CatalogRoomKind::Public,
+                    last_read: Some(MessageId(3)),
+                },
+                CatalogRoom {
+                    room_id: RoomId(2),
+                    name: "retired".to_string(),
+                    kind: CatalogRoomKind::Private,
+                    last_read: Some(MessageId(7)),
+                },
+            ],
+        };
+        let mut room = test_room();
+        room.connect_to_server("alias".to_string(), String::new(), "me".to_string());
+        room.load_offline_catalog(&catalog, None);
+
+        let known = room.authenticated(
+            &[room_info(1)],
+            vec![user(UserId(1), "alice")],
+            RoomId(1),
+            catalog.last_viewed_room,
+            Some(UserId(1)),
+        );
+
+        assert_eq!(known, vec![RoomId(1)]);
+        assert_eq!(
+            room.room_metas()
+                .map(|(room_id, _)| room_id)
+                .collect::<Vec<_>>(),
+            vec![RoomId(1)]
+        );
+        assert_eq!(room.viewed_room, Some(RoomId(1)));
+        assert_eq!(room.catalog(None).rooms.len(), 2);
+
+        room.reset_for_disconnect();
+        assert_eq!(
+            room.room_metas()
+                .map(|(room_id, _)| room_id)
+                .collect::<Vec<_>>(),
+            vec![RoomId(1), RoomId(2)]
+        );
+        assert!(room.set_viewed_room(RoomId(2), Some(UserId(1))));
+    }
+
+    #[test]
+    fn authentication_refreshes_an_already_viewed_offline_room() {
+        let catalog = RoomCatalog {
+            last_viewed_room: Some(RoomId(1)),
+            last_voice_room: None,
+            rooms: vec![CatalogRoom {
+                room_id: RoomId(1),
+                name: "old-name".to_string(),
+                kind: CatalogRoomKind::Public,
+                last_read: None,
+            }],
+        };
+        let mut room = test_room();
+        room.connect_to_server("alias".to_string(), String::new(), "me".to_string());
+        room.load_offline_catalog(&catalog, None);
+        room.chat_received(message(1, UserId(1), "mine"), None);
+        assert!(!room.chat.message(0).local);
+
+        let mut live = room_info(1);
+        live.name = "renamed".to_string();
+        room.authenticated(
+            &[live],
+            vec![user(UserId(1), "alice"), user(UserId(2), "bob")],
+            RoomId(1),
+            catalog.last_viewed_room,
+            Some(UserId(1)),
+        );
+
+        assert_eq!(room.room_name, "renamed");
+        assert_eq!(room.participants.entries.len(), 2);
+        assert!(room.chat.message(0).local);
+    }
+
+    #[test]
+    fn connecting_to_another_server_clears_active_room_payload() {
+        let mut room = test_room();
+        enter(
+            &mut room,
+            vec![user(UserId(1), "alice")],
+            vec![message(1, UserId(1), "old server")],
+            Some(UserId(1)),
+        );
+        assert_eq!(room.viewed_history().messages.len(), 1);
+
+        room.connect_to_server(
+            "new".to_string(),
+            "new-history".to_string(),
+            "alice".to_string(),
+        );
+        room.load_offline_catalog(&RoomCatalog::default(), Some(UserId(1)));
+
+        assert!(room.viewed_history().messages.is_empty());
+        assert!(room.viewed_history().files.is_empty());
+        assert_eq!(room.viewed_room, None);
     }
 
     #[test]
