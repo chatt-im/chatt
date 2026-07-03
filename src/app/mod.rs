@@ -222,6 +222,7 @@ pub(crate) struct App {
     /// The room whose voice call this client is in, independent of the viewed
     /// room. Mirrors the worker's view; confirmed by our own `VoiceStarted`.
     pub voice_room: Option<RoomId>,
+    requested_voice_room: Option<RoomId>,
     pub server_catalog: ServerCatalog,
     pub pending_pair: Option<PendingPair>,
     pub mic_muted: Arc<AtomicBool>,
@@ -282,6 +283,7 @@ pub(crate) struct App {
 /// A share this client can view: the secret to bring up a viewer connection and
 /// the codec metadata to configure the browser decoder.
 struct AvailableShare {
+    room_id: RoomId,
     view_secret: Vec<u8>,
     codec: String,
     /// The decoder `extra_data` descriptor (`avcC`/`hvcC`), built by the
@@ -800,6 +802,7 @@ impl App {
             session_id: None,
             user_id: None,
             voice_room: None,
+            requested_voice_room: None,
             server_catalog: ServerCatalog::default(),
             pending_pair: None,
             mic_muted: Arc::new(AtomicBool::new(false)),
@@ -980,6 +983,29 @@ impl App {
         }
     }
 
+    fn clear_shares_for_voice_room(&mut self, room_id: RoomId) {
+        let stream_ids = self
+            .available_shares
+            .iter()
+            .filter_map(|(stream_id, share)| (share.room_id == room_id).then_some(*stream_id))
+            .collect::<Vec<_>>();
+        for stream_id in stream_ids {
+            self.available_shares.remove(&stream_id);
+            if let Some(mut subscriber) = self.subscribers.remove(&stream_id) {
+                subscriber.stop();
+            }
+            if let Some(feed) = &self.web_feed {
+                feed.send_share_ended(stream_id.0, share_ended_envelope(stream_id));
+            }
+            if self.screencast_stream_id == Some(stream_id) {
+                self.screencast_stream_id = None;
+                if let Some(mut handle) = self.screencast.take() {
+                    handle.stop();
+                }
+            }
+        }
+    }
+
     /// Handles a browser request relayed from the web view.
     fn handle_web_request(&mut self, request: crate::web_server::WebRequest) {
         match request {
@@ -1028,6 +1054,13 @@ impl App {
             ));
             return;
         };
+        if self.voice_room != Some(share.room_id) {
+            feed.send_share_error(share_error_envelope(
+                stream_id,
+                "join the share's voice room before viewing",
+            ));
+            return;
+        }
         let config = share_config_envelope(stream_id, &share.codec, &share.extradata);
         let view_secret = share.view_secret.clone();
         feed.send_share_config(config);
@@ -1048,7 +1081,15 @@ impl App {
             feed.send_share_error(share_error_envelope(stream_id, "not connected to a server"));
             return;
         };
-        let handle = crate::video::start_subscriber(stream_id, view_secret, tcp_addr, feed);
+        let Some(session_id) = self.session_id else {
+            feed.send_share_error(share_error_envelope(
+                stream_id,
+                "the voice session is no longer active",
+            ));
+            return;
+        };
+        let handle =
+            crate::video::start_subscriber(session_id, stream_id, view_secret, tcp_addr, feed);
         self.subscribers.insert(stream_id, handle);
         self.set_status("viewing screen share");
     }
@@ -1194,6 +1235,7 @@ impl App {
     fn reset_room_for_disconnect(&mut self) {
         self.save_room_catalog();
         self.voice_room = None;
+        self.requested_voice_room = None;
         self.room.reset_for_disconnect();
     }
 
@@ -1217,6 +1259,23 @@ impl App {
         }
         self.after_view_switch();
         true
+    }
+
+    pub(crate) fn request_older_history_if_at_top(&mut self, width: u16, height: u16) {
+        if !self.room.chat.is_at_top(width, height) {
+            return;
+        }
+        let Some((room_id, before, limit)) = self.room.older_history_request() else {
+            return;
+        };
+        self.send_network_command(
+            NetworkCommand::FetchHistory {
+                room_id,
+                before,
+                limit,
+            },
+            false,
+        );
     }
 
     /// The switcher and rooms-strip rows for the current catalog, voice, and
@@ -1247,8 +1306,25 @@ impl App {
 
     fn after_view_switch(&mut self) {
         self.sync_viewed_room_to_feeds();
+        self.request_initial_history_for_viewed_room();
         self.save_room_catalog();
         self.set_status(format!("viewing {}", self.room.room_name));
+    }
+
+    fn request_initial_history_for_viewed_room(&mut self) {
+        let Some(room_id) = self.room.viewed_room else {
+            return;
+        };
+        if self.room.begin_history_fetch(room_id, None) {
+            self.send_network_command(
+                NetworkCommand::FetchHistory {
+                    room_id,
+                    before: None,
+                    limit: rpc::control::MAX_HISTORY_FETCH_MESSAGES,
+                },
+                false,
+            );
+        }
     }
 
     /// Sends a chat message to the currently viewed room.
@@ -1679,37 +1755,33 @@ impl App {
                 );
                 self.sync_viewed_room_to_feeds();
                 for room_id in known {
-                    self.send_network_command(
-                        NetworkCommand::FetchHistory {
-                            room_id,
-                            before: None,
-                            limit: rpc::control::MAX_HISTORY_FETCH_MESSAGES,
-                        },
-                        false,
-                    );
+                    if self.room.begin_history_fetch(room_id, None) {
+                        self.send_network_command(
+                            NetworkCommand::FetchHistory {
+                                room_id,
+                                before: None,
+                                limit: rpc::control::MAX_HISTORY_FETCH_MESSAGES,
+                            },
+                            false,
+                        );
+                    }
                 }
                 let voice_target = catalog
                     .last_voice_room
                     .filter(|room_id| self.room.room_meta(*room_id).is_some())
                     .unwrap_or(default_room);
-                self.voice_room = Some(voice_target);
+                self.requested_voice_room = Some(voice_target);
                 self.send_network_command(NetworkCommand::JoinVoice(voice_target), true);
                 self.publish_voice_status();
-                self.start_room_voice();
                 self.save_room_catalog();
                 self.set_status(format!("authenticated as {}", self.room.local_user_name));
                 self.flush_pending_network_commands();
             }
             NetworkEvent::RoomUpserted(info) => {
                 self.room.upsert_room(&info, self.user_id);
-                self.send_network_command(
-                    NetworkCommand::FetchHistory {
-                        room_id: info.room_id,
-                        before: None,
-                        limit: rpc::control::MAX_HISTORY_FETCH_MESSAGES,
-                    },
-                    false,
-                );
+                if self.room.viewed_room == Some(info.room_id) {
+                    self.request_initial_history_for_viewed_room();
+                }
                 self.save_room_catalog();
             }
             NetworkEvent::DmOpened { room_id, peer } => {
@@ -1719,8 +1791,12 @@ impl App {
                 }
             }
             NetworkEvent::HistoryChunk {
-                room_id, messages, ..
+                room_id,
+                messages,
+                at_start,
             } => {
+                self.room
+                    .complete_history_fetch(room_id, &messages, at_start);
                 self.room.merge_history(room_id, messages, self.user_id);
                 if self.room.viewed_room == Some(room_id) {
                     self.sync_viewed_room_to_feeds();
@@ -1750,15 +1826,19 @@ impl App {
                     .file_name()
                     .and_then(|name| name.to_str())
                     .unwrap_or(&metadata.file_name);
-                if let Some(feed) = &self.web_feed {
+                if self.room.viewed_room == Some(metadata.room_id)
+                    && let Some(feed) = &self.web_feed
+                {
                     feed.send(crate::web_server::WebMessage::from_file(
                         &metadata,
                         served_name,
                         dimensions,
                     ));
                 }
-                self.room.clear_transfer(metadata.transfer_id);
+                self.room
+                    .clear_transfer(metadata.room_id, metadata.transfer_id);
                 self.room.file_received(
+                    metadata.room_id,
                     metadata.transfer_id,
                     metadata.timestamp_ms,
                     served_name,
@@ -1767,6 +1847,7 @@ impl App {
                 );
             }
             NetworkEvent::TransferProgress {
+                room_id,
                 transfer_id,
                 timestamp_ms,
                 transferred,
@@ -1774,8 +1855,10 @@ impl App {
                 direction,
             } => {
                 self.room
-                    .transfer_progress(transfer_id, transferred, total, direction);
-                if let Some(feed) = &self.web_feed {
+                    .transfer_progress(room_id, transfer_id, transferred, total, direction);
+                if self.room.viewed_room == Some(room_id)
+                    && let Some(feed) = &self.web_feed
+                {
                     feed.send_file_progress(file_progress_envelope(
                         transfer_id.0,
                         timestamp_ms,
@@ -1784,8 +1867,11 @@ impl App {
                     ));
                 }
             }
-            NetworkEvent::TransferCanceled { transfer_id } => {
-                self.room.clear_transfer(transfer_id);
+            NetworkEvent::TransferCanceled {
+                room_id,
+                transfer_id,
+            } => {
+                self.room.clear_transfer(room_id, transfer_id);
             }
             NetworkEvent::Presence { user, online } => {
                 let notice = self.room.presence_changed(user, online, self.user_id);
@@ -1809,6 +1895,7 @@ impl App {
             } => {
                 if Some(user_id) == self.user_id {
                     self.voice_room = Some(room_id);
+                    self.requested_voice_room = None;
                 }
                 let notice = self.room.voice_started(
                     room_id,
@@ -1822,6 +1909,7 @@ impl App {
                     self.apply_remote_sender_mute(user_id, self.room.voice_muted(user_id));
                 }
                 if notice.local {
+                    self.start_room_voice();
                     if self.config.soundboard.enabled {
                         self.set_status("soundboard ready");
                     } else {
@@ -1841,9 +1929,12 @@ impl App {
                     .room
                     .voice_stopped(room_id, user_id, stream_id, self.user_id);
                 if notice.local {
-                    self.voice_room = None;
-                    self.stop_audio();
-                    self.set_status("voice stopped");
+                    if self.voice_room == Some(room_id) {
+                        self.clear_shares_for_voice_room(room_id);
+                        self.voice_room = None;
+                        self.stop_audio();
+                        self.set_status("voice stopped");
+                    }
                 } else {
                     if let Some(playback) = &self.playback {
                         playback.stop_stream(stream_id.0);
@@ -1889,6 +1980,7 @@ impl App {
                 }
             }
             NetworkEvent::ShareStarted {
+                room_id,
                 stream_id,
                 publish_secret,
                 codec,
@@ -1897,8 +1989,8 @@ impl App {
                 extradata,
             } => {
                 self.screencast_stream_id = Some(stream_id);
-                if let Some(handle) = &self.screencast {
-                    handle.deliver_secret(stream_id, publish_secret);
+                if let (Some(handle), Some(session_id)) = (&self.screencast, self.session_id) {
+                    handle.deliver_secret(session_id, stream_id, publish_secret);
                 } else {
                     kvlog::warn!(
                         "share started without an active capture",
@@ -1915,6 +2007,7 @@ impl App {
                 self.available_shares.insert(
                     stream_id,
                     AvailableShare {
+                        room_id,
                         view_secret: Vec::new(),
                         codec: codec.clone(),
                         extradata: extradata.clone(),
@@ -1936,6 +2029,7 @@ impl App {
                 self.set_status("screen share live");
             }
             NetworkEvent::ShareAvailable {
+                room_id,
                 stream_id,
                 sender_name,
                 codec,
@@ -1945,9 +2039,13 @@ impl App {
                 view_secret,
                 ..
             } => {
+                if self.voice_room != Some(room_id) {
+                    return;
+                }
                 self.available_shares.insert(
                     stream_id,
                     AvailableShare {
+                        room_id,
                         view_secret,
                         codec: codec.clone(),
                         extradata: extradata.clone(),
@@ -3716,21 +3814,21 @@ impl App {
             self.set_error("select a server before joining voice");
             return;
         }
-        if self.voice_room == Some(target) {
+        if self.voice_room == Some(target) || self.requested_voice_room == Some(target) {
             self.set_status("already in this room's voice call");
             return;
         }
-        self.voice_room = Some(target);
+        self.requested_voice_room = Some(target);
         self.send_network_command(NetworkCommand::JoinVoice(target), true);
         self.publish_voice_status();
-        self.start_room_voice();
     }
 
     fn leave_voice_command(&mut self) {
-        if self.voice_room.is_none() {
+        if self.voice_room.is_none() && self.requested_voice_room.is_none() {
             self.set_status("not in a voice call");
             return;
         }
+        self.requested_voice_room = None;
         self.send_network_command(NetworkCommand::LeaveVoice, true);
         self.set_status("leaving voice");
     }
@@ -5188,7 +5286,8 @@ mod tests {
         app.room.composer.set_lines("/voice");
         app.submit_input();
 
-        assert_eq!(app.voice_room, Some(rpc::ids::RoomId(1)));
+        assert_eq!(app.voice_room, None);
+        assert_eq!(app.requested_voice_room, Some(rpc::ids::RoomId(1)));
         let mut commands = Vec::new();
         while let Ok(command) = rx.try_recv() {
             commands.push(command);
@@ -5219,6 +5318,80 @@ mod tests {
     }
 
     #[test]
+    fn voice_switch_restarts_audio_after_old_stream_stops() {
+        let mut app = test_app();
+        let (tx, _rx) = mpsc::channel();
+        app.network = Some(NetworkClient::from_parts_for_test(tx));
+        app.config.soundboard.enabled = true;
+        app.user_id = Some(UserId(1));
+        app.room.authenticated(
+            &[test_room_info(1), test_room_info(2)],
+            vec![user_summary(UserId(1), "alice")],
+            RoomId(1),
+            None,
+            app.user_id,
+        );
+        app.voice_room = Some(RoomId(1));
+        app.voice_tx_enabled.store(true, Ordering::Relaxed);
+
+        app.handle_network_event(NetworkEvent::VoiceStopped {
+            room_id: RoomId(1),
+            user_id: UserId(1),
+            stream_id: StreamId(10),
+        });
+        app.handle_network_event(NetworkEvent::VoiceStarted {
+            room_id: RoomId(2),
+            user_id: UserId(1),
+            stream_id: StreamId(11),
+        });
+
+        assert_eq!(app.voice_room, Some(RoomId(2)));
+        assert!(app.voice_tx_enabled.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn share_availability_follows_the_confirmed_voice_room() {
+        let mut app = test_app();
+        app.user_id = Some(UserId(1));
+        app.room.authenticated(
+            &[test_room_info(1), test_room_info(2)],
+            vec![
+                user_summary(UserId(1), "alice"),
+                user_summary(UserId(2), "bob"),
+            ],
+            RoomId(1),
+            None,
+            app.user_id,
+        );
+        app.voice_room = Some(RoomId(1));
+        let available = |room_id, stream_id| NetworkEvent::ShareAvailable {
+            room_id,
+            stream_id,
+            user_id: UserId(2),
+            sender_name: "bob".to_string(),
+            codec: "avc1.42c01f".to_string(),
+            coded_width: 1280,
+            coded_height: 720,
+            annexb: false,
+            extradata: Vec::new(),
+            view_secret: vec![7; 32],
+        };
+
+        app.handle_network_event(available(RoomId(2), StreamId(20)));
+        assert!(app.available_shares.is_empty());
+
+        app.handle_network_event(available(RoomId(1), StreamId(10)));
+        assert!(app.available_shares.contains_key(&StreamId(10)));
+
+        app.handle_network_event(NetworkEvent::VoiceStopped {
+            room_id: RoomId(1),
+            user_id: UserId(1),
+            stream_id: StreamId(1),
+        });
+        assert!(app.available_shares.is_empty());
+    }
+
+    #[test]
     fn cycle_room_wraps_in_catalog_order() {
         let mut app = test_app();
         app.room.authenticated(
@@ -5235,6 +5408,84 @@ mod tests {
         assert_eq!(app.room.viewed_room, Some(rpc::ids::RoomId(1)));
         app.cycle_room(-1);
         assert_eq!(app.room.viewed_room, Some(rpc::ids::RoomId(2)));
+    }
+
+    #[test]
+    fn background_room_file_completion_updates_its_own_history() {
+        let mut app = test_app();
+        app.user_id = Some(UserId(1));
+        app.room.authenticated(
+            &[test_room_info(1), test_room_info(2)],
+            vec![user_summary(UserId(1), "alice")],
+            RoomId(1),
+            None,
+            app.user_id,
+        );
+        let transfer_id = rpc::ids::FileTransferId(9);
+        let metadata = rpc::control::FileMetadata {
+            transfer_id,
+            room_id: RoomId(2),
+            sender: UserId(2),
+            sender_name: "bob".to_string(),
+            file_name: "room-two.bin".to_string(),
+            original_name: "room-two.bin".to_string(),
+            size: 12,
+            encoding: rpc::control::FileContentEncoding::Identity,
+            timestamp_ms: 44,
+        };
+
+        app.handle_network_event(NetworkEvent::FileReceived {
+            metadata,
+            path: PathBuf::from("/tmp/room-two.bin"),
+            dimensions: None,
+        });
+
+        assert!(app.room.viewed_history().files.is_empty());
+        assert!(app.set_viewed_room(RoomId(2)));
+        assert_eq!(app.room.viewed_history().files.len(), 1);
+    }
+
+    #[test]
+    fn reaching_chat_top_requests_one_older_history_page() {
+        let mut app = test_app();
+        let (tx, rx) = mpsc::channel();
+        app.network = Some(NetworkClient::from_parts_for_test(tx));
+        app.user_id = Some(UserId(1));
+        enter_test_room(&mut app);
+        assert!(app.room.begin_history_fetch(RoomId(1), None));
+        let messages = (6..=20)
+            .map(|id| rpc::control::ChatMessage {
+                message_id: rpc::ids::MessageId(id),
+                room_id: RoomId(1),
+                sender: UserId(2),
+                sender_name: "bob".to_string(),
+                timestamp_ms: id * 1_000,
+                body: format!("message {id}"),
+                file_transfer_id: None,
+            })
+            .collect::<Vec<_>>();
+        app.room.complete_history_fetch(RoomId(1), &messages, false);
+        app.room.merge_history(RoomId(1), messages, app.user_id);
+
+        app.request_older_history_if_at_top(40, 5);
+        assert!(rx.try_recv().is_err());
+
+        app.room.chat.top(40, 5);
+        app.request_older_history_if_at_top(40, 5);
+        match rx.try_recv().unwrap() {
+            NetworkCommand::FetchHistory {
+                room_id,
+                before,
+                limit,
+            } => {
+                assert_eq!(room_id, RoomId(1));
+                assert_eq!(before, Some(rpc::ids::MessageId(6)));
+                assert_eq!(limit, rpc::control::MAX_HISTORY_FETCH_MESSAGES);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+        app.request_older_history_if_at_top(40, 5);
+        assert!(rx.try_recv().is_err());
     }
 
     #[test]

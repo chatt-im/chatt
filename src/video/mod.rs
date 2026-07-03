@@ -17,7 +17,7 @@ use std::time::Duration;
 
 use rpc::{
     crypto::{CHANNEL_VIDEO, KEY_LEN, TransportCipher, VideoKeyRole, derive_video_keys},
-    ids::StreamId,
+    ids::{SessionId, StreamId},
     video::{self, VideoAck, VideoHello, VideoRole},
 };
 
@@ -35,6 +35,7 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 /// stream, the transport cipher, and any bytes already buffered past the ack.
 fn open_video_connection(
     addr: &str,
+    session_id: SessionId,
     stream_id: StreamId,
     role: VideoRole,
     secret: &[u8],
@@ -56,6 +57,7 @@ fn open_video_connection(
     out.extend_from_slice(&video::VIDEO_MAGIC);
     let hello = VideoHello {
         version: rpc::PROTOCOL_VERSION,
+        session_id,
         stream_id,
         role,
     };

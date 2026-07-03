@@ -268,6 +268,7 @@ pub enum ServerControl {
         reason: String,
     },
     ShareStarted {
+        room_id: RoomId,
         stream_id: StreamId,
         publish_secret: Vec<u8>,
         codec: String,
@@ -1343,6 +1344,18 @@ mod tests {
         };
         let encoded = encode_client_control(&start).unwrap();
         assert_eq!(decode_client_control(&encoded).unwrap(), start);
+
+        let started = ServerControl::ShareStarted {
+            room_id: RoomId(3),
+            stream_id: StreamId(8),
+            publish_secret: vec![7; 32],
+            codec: "avc1.42c01f".to_string(),
+            coded_width: 1280,
+            coded_height: 720,
+            extradata: vec![],
+        };
+        let encoded = encode_server_control(&started);
+        assert_eq!(decode_server_control(&encoded).unwrap(), started);
 
         let available = ServerControl::ShareAvailable {
             room_id: RoomId(3),

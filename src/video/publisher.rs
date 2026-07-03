@@ -18,7 +18,7 @@ use std::time::Duration;
 use rpc::{
     bitstream::{self, Codec},
     crypto::{CHANNEL_VIDEO, TransportCipher},
-    ids::StreamId,
+    ids::{SessionId, StreamId},
     video::{self, VideoRole},
 };
 
@@ -36,15 +36,15 @@ const MAX_BUFFERED_FRAMES: usize = 300;
 /// publisher connection.
 pub struct ScreencastHandle {
     stop: Arc<AtomicBool>,
-    secret_tx: Sender<(StreamId, Vec<u8>)>,
+    secret_tx: Sender<(SessionId, StreamId, Vec<u8>)>,
     join: Option<JoinHandle<()>>,
 }
 
 impl ScreencastHandle {
     /// Relays the per-stream publish secret (from `ShareStarted`) to the manager
     /// so it can bring up the dedicated connection.
-    pub fn deliver_secret(&self, stream_id: StreamId, secret: Vec<u8>) {
-        let _ = self.secret_tx.send((stream_id, secret));
+    pub fn deliver_secret(&self, session_id: SessionId, stream_id: StreamId, secret: Vec<u8>) {
+        let _ = self.secret_tx.send((session_id, stream_id, secret));
     }
 
     pub fn stop(&mut self) {
@@ -137,7 +137,7 @@ fn run_manager(
     mut capture: Capture,
     codec: Codec,
     frame_rx: Receiver<CapturedFrame>,
-    secret_rx: Receiver<(StreamId, Vec<u8>)>,
+    secret_rx: Receiver<(SessionId, StreamId, Vec<u8>)>,
     commands: CommandSender,
     tcp_addr: String,
     web_feed: Option<WebFeedSender>,
@@ -157,9 +157,9 @@ fn run_manager(
             break;
         }
         if conn.is_none()
-            && let Ok((stream_id, secret)) = secret_rx.try_recv()
+            && let Ok((session_id, stream_id, secret)) = secret_rx.try_recv()
         {
-            match connect(&tcp_addr, stream_id, &secret, codec) {
+            match connect(&tcp_addr, session_id, stream_id, &secret, codec) {
                 Ok(mut publisher) => {
                     let mut failed = false;
                     for frame in buffered.drain(..) {
@@ -247,12 +247,18 @@ fn encode_publish_frame(frame: &CapturedFrame, stream_id: u32, codec: Codec) -> 
 
 fn connect(
     tcp_addr: &str,
+    session_id: SessionId,
     stream_id: StreamId,
     secret: &[u8],
     codec: Codec,
 ) -> Result<PublisherConn, String> {
-    let (stream, cipher, _residual) =
-        super::open_video_connection(tcp_addr, stream_id, VideoRole::Publisher, secret)?;
+    let (stream, cipher, _residual) = super::open_video_connection(
+        tcp_addr,
+        session_id,
+        stream_id,
+        VideoRole::Publisher,
+        secret,
+    )?;
     Ok(PublisherConn {
         stream,
         cipher,

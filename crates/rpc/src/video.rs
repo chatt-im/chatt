@@ -22,7 +22,7 @@
 
 use jsony::Jsony;
 
-use crate::ids::StreamId;
+use crate::ids::{SessionId, StreamId};
 
 /// Preamble that distinguishes a video connection from a control connection. Its
 /// first four bytes (`0x56544843`) read as a little-endian length far above
@@ -58,6 +58,7 @@ pub enum VideoRole {
 #[jsony(Binary, version)]
 pub struct VideoHello {
     pub version: u16,
+    pub session_id: SessionId,
     pub stream_id: StreamId,
     pub role: VideoRole,
 }
@@ -239,6 +240,7 @@ mod tests {
     fn video_hello_round_trips() {
         let hello = VideoHello {
             version: crate::PROTOCOL_VERSION,
+            session_id: SessionId(7),
             stream_id: StreamId(42),
             role: VideoRole::Subscriber,
         };

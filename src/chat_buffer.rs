@@ -363,6 +363,14 @@ impl VirtualChatBuffer {
         self.scroll_offset = 0;
     }
 
+    pub fn restore_scroll_offset(&mut self, scroll_offset: usize) {
+        self.scroll_offset = scroll_offset;
+    }
+
+    pub fn is_at_top(&mut self, width: u16, height: u16) -> bool {
+        self.scroll_offset == self.max_scroll(width, height)
+    }
+
     pub fn top(&mut self, width: u16, height: u16) {
         self.scroll_offset = self.max_scroll(width, height);
     }
@@ -403,7 +411,6 @@ impl VirtualChatBuffer {
         self.selection = None;
     }
 
-    #[cfg(test)]
     pub fn selected_message(&self) -> Option<usize> {
         self.selected_message
     }

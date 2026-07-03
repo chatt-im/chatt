@@ -1075,6 +1075,7 @@ impl RoomMode {
         app.room
             .chat
             .scroll_up(rows, self.layout.chat_width, self.layout.chat_height);
+        app.request_older_history_if_at_top(self.layout.chat_width, self.layout.chat_height);
     }
 
     fn copy_chat_selection(&mut self, app: &mut App) {
@@ -1095,6 +1096,7 @@ impl RoomMode {
             app.room.chat.select_first_header();
             app.room.chat.clear_selection();
             self.keep_selected_chat_header_visible(app);
+            app.request_older_history_if_at_top(self.layout.chat_width, self.layout.chat_height);
         }
     }
 

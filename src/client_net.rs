@@ -272,6 +272,7 @@ pub enum NetworkEvent {
     /// mandatory first and final ticks. A tick with `transferred == total` is
     /// terminal for the progress overlay.
     TransferProgress {
+        room_id: RoomId,
         transfer_id: FileTransferId,
         /// Announcement timestamp, the web upsert key alongside `transfer_id`.
         timestamp_ms: u64,
@@ -282,6 +283,7 @@ pub enum NetworkEvent {
     /// A file transfer failed or was canceled before completion. Clears any
     /// progress overlay for `transfer_id`.
     TransferCanceled {
+        room_id: RoomId,
         transfer_id: FileTransferId,
     },
     /// Server-wide presence for one user.
@@ -325,6 +327,7 @@ pub enum NetworkEvent {
     },
     EncoderProfileChanged(LiveEncoderProfile),
     ShareStarted {
+        room_id: RoomId,
         stream_id: StreamId,
         publish_secret: Vec<u8>,
         codec: String,
@@ -759,6 +762,7 @@ fn run_worker_inner(
         user_id: None,
         active_room: None,
         voice_room: None,
+        requested_voice_room: None,
         active_stream: None,
         local_sequence: 0,
         voice_timestamp: VoiceTimestampRebaser::default(),
@@ -778,6 +782,7 @@ fn run_worker_inner(
         p2p_peers: HashMap::new(),
         p2p_stream_owners: HashMap::new(),
         online_others: HashSet::new(),
+        voice_others: HashSet::new(),
         room_server_rtts: HashMap::new(),
         next_relay_keepalive: Instant::now() + RELAY_KEEPALIVE_INTERVAL,
         next_rtt_probe: Instant::now() + RTT_PROBE_INTERVAL,
@@ -1298,6 +1303,7 @@ struct WorkerState {
     /// The room whose voice call this client is in, target for screen shares
     /// and P2P publication.
     voice_room: Option<RoomId>,
+    requested_voice_room: Option<RoomId>,
     active_stream: Option<StreamId>,
     local_sequence: u32,
     voice_timestamp: VoiceTimestampRebaser,
@@ -1317,6 +1323,7 @@ struct WorkerState {
     p2p_peers: HashMap<SessionId, PeerConnection>,
     p2p_stream_owners: HashMap<StreamId, SessionId>,
     online_others: HashSet<UserId>,
+    voice_others: HashSet<UserId>,
     room_server_rtts: HashMap<UserId, u16>,
     next_relay_keepalive: Instant,
     next_rtt_probe: Instant,
@@ -2487,11 +2494,11 @@ impl WorkerState {
                 self.active_room = Some(room_id);
             }
             NetworkCommand::JoinVoice(room_id) => {
-                self.voice_room = Some(room_id);
+                self.requested_voice_room = Some(room_id);
                 self.queue_control(ClientControl::JoinVoice { room_id })?;
             }
             NetworkCommand::LeaveVoice => {
-                self.voice_room = None;
+                self.requested_voice_room = None;
                 self.queue_control(ClientControl::LeaveVoice)?;
             }
             NetworkCommand::FetchHistory {
@@ -2999,6 +3006,7 @@ impl WorkerState {
                 // emits the first tick itself.
                 if let Some(meta) = upload.server_metadata.as_ref() {
                     let _ = self.events.send(NetworkEvent::TransferProgress {
+                        room_id: meta.room_id,
                         transfer_id: meta.transfer_id,
                         timestamp_ms: meta.timestamp_ms,
                         transferred: upload.source_offset,
@@ -3069,6 +3077,7 @@ impl WorkerState {
         }
         if let Some(metadata) = upload.server_metadata {
             let _ = self.events.send(NetworkEvent::TransferCanceled {
+                room_id: metadata.room_id,
                 transfer_id: metadata.transfer_id,
             });
         }
@@ -3126,6 +3135,7 @@ impl WorkerState {
             // Show the bar immediately at acceptance, at whatever offset streaming
             // has already reached.
             let _ = self.events.send(NetworkEvent::TransferProgress {
+                room_id: meta.room_id,
                 transfer_id: meta.transfer_id,
                 timestamp_ms: meta.timestamp_ms,
                 transferred: upload.source_offset,
@@ -3223,6 +3233,7 @@ impl WorkerState {
                     file.file_name, file.sender_name
                 )));
                 let transfer_id = file.transfer_id;
+                let room_id = file.room_id;
                 let timestamp_ms = file.timestamp_ms;
                 let total = file.size;
                 self.incoming_files.insert(
@@ -3240,6 +3251,7 @@ impl WorkerState {
                     },
                 );
                 let _ = self.events.send(NetworkEvent::TransferProgress {
+                    room_id,
                     transfer_id,
                     timestamp_ms,
                     transferred: 0,
@@ -3288,14 +3300,16 @@ impl WorkerState {
 
     fn handle_file_canceled(&mut self, transfer_id: FileTransferId, reason: &str) {
         if let Some(incoming) = self.incoming_files.remove(&transfer_id) {
+            let room_id = incoming.metadata.room_id;
             let _ = fs::remove_file(&incoming.path);
             let _ = self.events.send(NetworkEvent::Status(format!(
                 "file transfer canceled for {}: {reason}",
                 incoming.metadata.file_name
             )));
-            let _ = self
-                .events
-                .send(NetworkEvent::TransferCanceled { transfer_id });
+            let _ = self.events.send(NetworkEvent::TransferCanceled {
+                room_id,
+                transfer_id,
+            });
         }
     }
 
@@ -3333,6 +3347,7 @@ impl WorkerState {
                     .next_status_at
                     .saturating_add(FILE_PROGRESS_STEP_BYTES);
                 let _ = self.events.send(NetworkEvent::TransferProgress {
+                    room_id: incoming.metadata.room_id,
                     transfer_id,
                     timestamp_ms: incoming.metadata.timestamp_ms,
                     transferred: decoded,
@@ -3348,6 +3363,7 @@ impl WorkerState {
                 .incoming_files
                 .remove(&transfer_id)
                 .expect("incoming file exists");
+            let room_id = incoming.metadata.room_id;
             match incoming.finalize() {
                 Ok((metadata, path, dimensions, _wire_bytes)) => {
                     #[cfg(test)]
@@ -3377,9 +3393,10 @@ impl WorkerState {
                     let _ = self.events.send(NetworkEvent::Error(format!(
                         "failed to finish receiving {name}: {error}"
                     )));
-                    let _ = self
-                        .events
-                        .send(NetworkEvent::TransferCanceled { transfer_id });
+                    let _ = self.events.send(NetworkEvent::TransferCanceled {
+                        room_id,
+                        transfer_id,
+                    });
                 }
             }
         }
@@ -3389,14 +3406,16 @@ impl WorkerState {
         let Some(incoming) = self.incoming_files.remove(&transfer_id) else {
             return;
         };
+        let room_id = incoming.metadata.room_id;
         let _ = fs::remove_file(&incoming.path);
         let _ = self.events.send(NetworkEvent::Error(format!(
             "{reason} for {}",
             incoming.metadata.file_name
         )));
-        let _ = self
-            .events
-            .send(NetworkEvent::TransferCanceled { transfer_id });
+        let _ = self.events.send(NetworkEvent::TransferCanceled {
+            room_id,
+            transfer_id,
+        });
     }
 
     fn handle_server_control(&mut self, control: ServerControl) {
@@ -3462,14 +3481,20 @@ impl WorkerState {
                     stream_id = stream_id.0
                 );
                 if Some(user_id) == self.user_id {
+                    self.reset_voice_peer_state();
                     self.voice_room = Some(room_id);
+                    self.requested_voice_room = None;
                     self.active_stream = Some(stream_id);
+                    self.voice_others.clear();
                     self.local_sequence = 0;
                     self.voice_timestamp = VoiceTimestampRebaser::default();
                     self.encoder_feedback = EncoderFeedbackController::new();
                     let _ = self.events.send(NetworkEvent::EncoderProfileChanged(
                         LiveEncoderProfile::DRED_20,
                     ));
+                    self.publish_p2p_candidates();
+                } else if self.voice_room == Some(room_id) {
+                    self.voice_others.insert(user_id);
                 }
                 let _ = self.events.send(NetworkEvent::VoiceStarted {
                     room_id,
@@ -3489,7 +3514,12 @@ impl WorkerState {
                 );
                 if Some(stream_id) == self.active_stream {
                     self.active_stream = None;
-                    self.voice_room = None;
+                    if self.voice_room == Some(room_id) {
+                        self.voice_room = None;
+                    }
+                    self.reset_voice_peer_state();
+                } else if self.voice_room == Some(room_id) {
+                    self.voice_others.remove(&user_id);
                 }
                 self.p2p_stream_owners.remove(&stream_id);
                 self.clear_pending_playback_stream(stream_id);
@@ -3623,6 +3653,7 @@ impl WorkerState {
                 self.handle_file_canceled(transfer_id, &reason);
             }
             ServerControl::ShareStarted {
+                room_id,
                 stream_id,
                 publish_secret,
                 codec,
@@ -3632,6 +3663,7 @@ impl WorkerState {
             } => {
                 kvlog::info!("client share started", stream_id = stream_id.0);
                 let _ = self.events.send(NetworkEvent::ShareStarted {
+                    room_id,
                     stream_id,
                     publish_secret,
                     codec,
@@ -3944,6 +3976,25 @@ impl WorkerState {
         });
     }
 
+    fn reset_voice_peer_state(&mut self) {
+        let users = self
+            .p2p_peers
+            .values()
+            .map(|peer| peer.user_id)
+            .collect::<HashSet<_>>();
+        self.p2p_peers.clear();
+        self.p2p_stream_owners.clear();
+        self.mdns_pending.clear();
+        self.room_server_rtts.clear();
+        self.voice_others.clear();
+        for user_id in users {
+            let _ = self.events.send(NetworkEvent::PeerTransport {
+                user_id,
+                direct: false,
+            });
+        }
+    }
+
     /// Builds the local candidate set from interface enumeration and applies the
     /// configured candidate privacy mode. The returned `local` candidates always
     /// carry literal addresses for the IP-only agent, while `published` carries
@@ -4010,6 +4061,9 @@ impl WorkerState {
     }
 
     fn install_p2p_peer(&mut self, peer: P2pPeerInfo) -> Result<(), String> {
+        if self.voice_room != Some(peer.room_id) {
+            return Err("P2P peer belongs to a different voice room".to_string());
+        }
         let send_key = key_from_control(&peer.send_key)?;
         let recv_key = key_from_control(&peer.recv_key)?;
         let stun_key = key_from_control(&peer.stun_key)?.bytes;
@@ -4160,7 +4214,7 @@ impl WorkerState {
         relay_suppressed(
             now,
             DIRECT_CONFIRM_WINDOW,
-            &self.online_others,
+            &self.voice_others,
             self.p2p_peers
                 .values()
                 .map(|peer| (peer.user_id, peer.direct_stable_since)),
@@ -4199,7 +4253,7 @@ impl WorkerState {
     }
 
     fn publish_all_relay_rtts(&self) {
-        for user_id in &self.online_others {
+        for user_id in &self.voice_others {
             self.publish_relay_rtt(*user_id);
         }
     }
