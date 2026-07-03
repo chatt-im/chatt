@@ -270,6 +270,7 @@ fn static_dir_serves_index_and_assets_without_listing() {
     let root = TestRoot::new("static-dir");
     root.write("index.html", "home");
     root.write("app.js", "console.log('ok');");
+    root.write("favicon.ico", [0u8, 0, 1, 0]);
     root.mkdir("empty");
     let router = Router::new().mount_static_dir("/", root.path());
     let server = EmbeddedServer::start(router);
@@ -290,6 +291,11 @@ fn static_dir_serves_index_and_assets_without_listing() {
         res.body_mut().read_to_string().unwrap(),
         "console.log('ok');"
     );
+
+    let mut res = agent.get(server.url("/favicon.ico")).call().unwrap();
+    assert_eq!(res.status().as_u16(), 200);
+    assert_eq!(header(&res, "Content-Type"), "image/x-icon");
+    assert_eq!(res.body_mut().read_to_vec().unwrap(), [0u8, 0, 1, 0]);
 
     let res = agent.get(server.url("/empty/")).call().unwrap();
     assert_eq!(res.status().as_u16(), 404);
