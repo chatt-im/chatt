@@ -389,6 +389,31 @@ body {
   padding: 1px 4px;
 }
 
+/* Quote depth is carried by each parsed fragment. Recolored source-style
+ * markers keep arbitrary nesting iterative and bounded to one DOM wrapper. */
+.message-quote {
+  display: flex;
+  min-width: 0;
+  margin: 0.35em 0 0;
+  color: var(--text-dim);
+}
+
+.message-quote-markers {
+  flex: 0 0 auto;
+  color: var(--text-dim);
+  user-select: none;
+  white-space: pre;
+}
+
+.message-quote-content {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.message-quote .code-block-frame {
+  margin-top: 0;
+}
+
 .message-media {
   margin-top: 4px;
   margin-bottom: 6px;

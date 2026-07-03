@@ -98,15 +98,17 @@ class Reader {
     const fragmentCount = this.u32();
     const fragments: Fragment[] = [];
     for (let i = 0; i < fragmentCount; i++) {
-      if (this.u8() === FRAG_TEXT) {
-        fragments.push({ kind: "text", html: this.string() });
+      const kind = this.u8();
+      const quote_depth = this.u32();
+      if (kind === FRAG_TEXT) {
+        fragments.push({ kind: "text", quote_depth, html: this.string() });
       } else {
         // Keep the code bytes rather than a string: highlight spans are byte
         // offsets, so per-run byte slicing is what renders correctly.
         const lang = this.string();
         const text = this.slice().slice();
         const spans = this.slice().slice();
-        fragments.push({ kind: "code", lang, text, spans });
+        fragments.push({ kind: "code", quote_depth, lang, text, spans });
       }
     }
     return { id, sender, timestamp_ms, attachment, file_id, message_id, ref_code, fragments };
