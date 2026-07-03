@@ -35,6 +35,12 @@ pub const ERROR_TOKEN_STALE_EPOCH: u16 = 426;
 /// Open pairing is being attempted too frequently.
 pub const ERROR_OPEN_PAIR_RATE_LIMITED: u16 = 429;
 pub const ERROR_BUG_REPORT_REJECTED: u16 = 400;
+/// The room does not exist for the requesting user. Deliberately also the
+/// answer for rooms the user cannot access, so private rooms are
+/// indistinguishable from missing ones.
+pub const ERROR_ROOM_NOT_FOUND: u16 = 404;
+/// Most messages one `FetchHistory` may request.
+pub const MAX_HISTORY_FETCH_MESSAGES: u16 = 500;
 pub const JOIN_STRING_PREFIX: &str = "tcj1_";
 const MAX_JOIN_STRING_BYTES: usize = 4096;
 const BASE64URL: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
@@ -158,6 +164,26 @@ pub enum ClientControl {
     },
     BugReportComplete {
         report_id: BugReportId,
+    },
+    /// Page a room's retained history backwards from `before` (or the newest
+    /// retained message when `None`). Answered with
+    /// [`ServerControl::HistoryChunk`].
+    FetchHistory {
+        room_id: RoomId,
+        before: Option<MessageId>,
+        limit: u16,
+    },
+    /// Join the room's voice call, leaving any current call first. Voice
+    /// membership is independent of which room's chat the client is reading.
+    JoinVoice {
+        room_id: RoomId,
+    },
+    LeaveVoice,
+    /// Open (or return) the DM room shared with `user_id`. Answered with
+    /// [`ServerControl::DmOpened`]; both endpoints also receive
+    /// [`ServerControl::RoomUpserted`] on first creation.
+    OpenDm {
+        user_id: UserId,
     },
 }
 
@@ -289,6 +315,30 @@ pub enum ServerControl {
     BugReportSaved {
         report_id: BugReportId,
     },
+    /// A room appeared or changed shape (today: DM creation). Pushed to every
+    /// connected session that can access the room.
+    RoomUpserted {
+        room: RoomInfo,
+    },
+    /// Reply to [`ClientControl::OpenDm`] naming the DM room for the pair.
+    DmOpened {
+        room_id: RoomId,
+        peer: UserId,
+    },
+    /// One page of retained history: ascending by message id, strictly before
+    /// the request's `before` cursor.
+    HistoryChunk {
+        room_id: RoomId,
+        messages: Vec<ChatMessage>,
+        /// True when the page reaches the oldest message the server retains.
+        at_start: bool,
+    },
+    /// Server-wide presence for one user. Replaces the per-room `Presence`
+    /// message once the legacy room protocol is removed.
+    PresenceV2 {
+        user: UserSummary,
+        online: bool,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Jsony)]
@@ -297,6 +347,39 @@ pub struct RoomInfo {
     pub room_id: RoomId,
     pub name: String,
     pub participants: u32,
+    pub kind: RoomKind,
+    /// Latest message id assigned in the room, `None` before the first
+    /// message. Clients compare it against their local read watermark for
+    /// unread markers.
+    pub head: Option<MessageId>,
+    /// Users currently in the room's voice call.
+    pub voice_users: Vec<UserId>,
+}
+
+/// Who can access a room and how it should be labeled.
+#[derive(Clone, Debug, PartialEq, Eq, Jsony)]
+#[jsony(Binary, version)]
+pub enum RoomKind {
+    /// Every user on the server.
+    Public,
+    /// The configured member subset; doubles as the room's roster.
+    Private { members: Vec<UserId> },
+    /// Runtime-created DM. Clients label the room after the other endpoint.
+    Dm { user_a: UserId, user_b: UserId },
+}
+
+/// Server-wide user directory entry.
+#[derive(Clone, Debug, PartialEq, Eq, Jsony)]
+#[jsony(Binary, version)]
+pub struct UserSummary {
+    pub user_id: UserId,
+    pub display_name: String,
+    pub identifier: String,
+    pub online: bool,
+    /// Server wall-clock (UNIX ms) the user's current session connected; 0
+    /// when offline.
+    pub connected_at_ms: u64,
+    pub voice_status: ParticipantVoiceStatus,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Jsony)]
@@ -643,6 +726,14 @@ fn validate_client_control(value: &ClientControl) -> Result<(), String> {
             }
             if data.len() > MAX_FILE_CHUNK_BYTES {
                 return Err("bug report chunk exceeds maximum length".to_string());
+            }
+        }
+        ClientControl::FetchHistory { limit, .. } => {
+            if *limit == 0 {
+                return Err("history fetch limit must be non-zero".to_string());
+            }
+            if *limit > MAX_HISTORY_FETCH_MESSAGES {
+                return Err("history fetch limit exceeds maximum".to_string());
             }
         }
         ClientControl::StartShare {
@@ -1069,12 +1160,133 @@ mod tests {
                 room_id: RoomId(1),
                 name: "lobby".to_string(),
                 participants: 1,
+                kind: RoomKind::Public,
+                head: Some(MessageId(42)),
+                voice_users: vec![UserId(4_294_967_296)],
             }],
             current_room: Some(RoomId(1)),
         };
 
         let encoded = encode_server_control(&control);
 
+        assert_eq!(decode_server_control(&encoded).unwrap(), control);
+    }
+
+    #[test]
+    fn room_info_round_trips_kind_head_and_voice() {
+        for kind in [
+            RoomKind::Public,
+            RoomKind::Private {
+                members: vec![UserId(1), UserId(2)],
+            },
+            RoomKind::Dm {
+                user_a: UserId(3),
+                user_b: UserId(4_294_967_296),
+            },
+        ] {
+            let control = ServerControl::RoomUpserted {
+                room: RoomInfo {
+                    room_id: RoomId(9),
+                    name: "dev".to_string(),
+                    participants: 0,
+                    kind,
+                    head: None,
+                    voice_users: Vec::new(),
+                },
+            };
+            let encoded = encode_server_control(&control);
+            assert_eq!(decode_server_control(&encoded).unwrap(), control);
+        }
+    }
+
+    #[test]
+    fn history_controls_round_trip() {
+        let request = ClientControl::FetchHistory {
+            room_id: RoomId(2),
+            before: Some(MessageId(300)),
+            limit: 100,
+        };
+        let encoded = encode_client_control(&request).unwrap();
+        assert_eq!(decode_client_control(&encoded).unwrap(), request);
+
+        let chunk = ServerControl::HistoryChunk {
+            room_id: RoomId(2),
+            messages: vec![ChatMessage {
+                message_id: MessageId(299),
+                room_id: RoomId(2),
+                sender: UserId(1),
+                sender_name: "Alice".to_string(),
+                timestamp_ms: 1_000,
+                body: "hello".to_string(),
+                file_transfer_id: None,
+            }],
+            at_start: false,
+        };
+        let encoded = encode_server_control(&chunk);
+        assert_eq!(decode_server_control(&encoded).unwrap(), chunk);
+    }
+
+    #[test]
+    fn fetch_history_rejects_zero_and_oversize_limits() {
+        let zero = ClientControl::FetchHistory {
+            room_id: RoomId(2),
+            before: None,
+            limit: 0,
+        };
+        assert!(encode_client_control(&zero).is_err());
+
+        let oversize = ClientControl::FetchHistory {
+            room_id: RoomId(2),
+            before: None,
+            limit: MAX_HISTORY_FETCH_MESSAGES + 1,
+        };
+        assert!(encode_client_control(&oversize).is_err());
+    }
+
+    #[test]
+    fn voice_membership_controls_round_trip() {
+        let join = ClientControl::JoinVoice { room_id: RoomId(3) };
+        let encoded = encode_client_control(&join).unwrap();
+        assert_eq!(decode_client_control(&encoded).unwrap(), join);
+
+        let leave = ClientControl::LeaveVoice;
+        let encoded = encode_client_control(&leave).unwrap();
+        assert_eq!(decode_client_control(&encoded).unwrap(), leave);
+    }
+
+    #[test]
+    fn dm_controls_round_trip() {
+        let open = ClientControl::OpenDm {
+            user_id: UserId(4_294_967_296),
+        };
+        let encoded = encode_client_control(&open).unwrap();
+        assert_eq!(decode_client_control(&encoded).unwrap(), open);
+
+        let opened = ServerControl::DmOpened {
+            room_id: RoomId(0x8000_0000),
+            peer: UserId(4_294_967_296),
+        };
+        let encoded = encode_server_control(&opened);
+        assert_eq!(decode_server_control(&encoded).unwrap(), opened);
+    }
+
+    #[test]
+    fn presence_v2_round_trips_user_summary() {
+        let control = ServerControl::PresenceV2 {
+            user: UserSummary {
+                user_id: UserId(5),
+                display_name: "Alice".to_string(),
+                identifier: "alice-internal".to_string(),
+                online: true,
+                connected_at_ms: 1_700_000_000_000,
+                voice_status: ParticipantVoiceStatus {
+                    muted: true,
+                    deafened: false,
+                },
+            },
+            online: true,
+        };
+        let encoded = encode_server_control(&control);
         assert_eq!(decode_server_control(&encoded).unwrap(), control);
     }
 

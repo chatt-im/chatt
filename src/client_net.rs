@@ -3674,6 +3674,12 @@ impl WorkerState {
                     let _ = self.events.send(NetworkEvent::Error(message));
                 }
             }
+            ServerControl::RoomUpserted { .. }
+            | ServerControl::DmOpened { .. }
+            | ServerControl::HistoryChunk { .. }
+            | ServerControl::PresenceV2 { .. } => {
+                kvlog::info!("multi-room control ignored pending client support");
+            }
         }
     }
 
@@ -4917,6 +4923,10 @@ fn client_control_kind(control: &ClientControl) -> &'static str {
         ClientControl::BugReportStart { .. } => "bug_report_start",
         ClientControl::BugReportChunk { .. } => "bug_report_chunk",
         ClientControl::BugReportComplete { .. } => "bug_report_complete",
+        ClientControl::FetchHistory { .. } => "fetch_history",
+        ClientControl::JoinVoice { .. } => "join_voice",
+        ClientControl::LeaveVoice => "leave_voice",
+        ClientControl::OpenDm { .. } => "open_dm",
     }
 }
 
@@ -4947,6 +4957,10 @@ fn server_control_kind(control: &ServerControl) -> &'static str {
         ServerControl::Pong { .. } => "pong",
         ServerControl::Error { .. } => "error",
         ServerControl::BugReportSaved { .. } => "bug_report_saved",
+        ServerControl::RoomUpserted { .. } => "room_upserted",
+        ServerControl::DmOpened { .. } => "dm_opened",
+        ServerControl::HistoryChunk { .. } => "history_chunk",
+        ServerControl::PresenceV2 { .. } => "presence_v2",
     }
 }
 

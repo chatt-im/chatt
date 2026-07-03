@@ -27,7 +27,7 @@ use rpc::{
         ERROR_PASSWORD_MISMATCH, ERROR_PASSWORD_REQUIRED, ERROR_PUBLIC_DISABLED,
         ERROR_TOKEN_STALE_EPOCH, FileContentEncoding, FileMetadata, InviteTicket,
         MAX_BUG_REPORT_BYTES, MAX_FILE_CHUNK_BYTES, P2pCandidate, P2pKey, P2pNatKind, P2pPeerInfo,
-        P2pRole, RoomInfo, ServerControl, decode_client_control, decode_client_hello,
+        P2pRole, RoomInfo, RoomKind, ServerControl, decode_client_control, decode_client_hello,
         encode_invite_ticket, encode_server_control, encode_server_hello, max_file_wire_bytes,
     },
     crypto::{
@@ -1165,6 +1165,22 @@ impl Server {
                 );
                 Ok(())
             }
+            (
+                ConnState::Ready,
+                ClientControl::FetchHistory { .. }
+                | ClientControl::JoinVoice { .. }
+                | ClientControl::LeaveVoice
+                | ClientControl::OpenDm { .. },
+            ) => {
+                self.send_control_to_token(
+                    token,
+                    &ServerControl::Error {
+                        code: 400,
+                        message: "not supported yet".to_string(),
+                    },
+                )?;
+                Ok(())
+            }
             (ConnState::Ready, ClientControl::SetVoiceStatus { status }) => {
                 let session_id = self.session_for_token(token)?;
                 self.set_voice_status(session_id, status);
@@ -1813,6 +1829,14 @@ impl Server {
                 room_id: room.id,
                 name: room.name.clone(),
                 participants: room.members.len() as u32,
+                kind: RoomKind::Public,
+                head: self.store.head(room.id),
+                voice_users: room
+                    .active_streams
+                    .values()
+                    .filter_map(|session_id| self.sessions.get(session_id))
+                    .map(|session| session.user_id)
+                    .collect(),
             })
             .collect()
     }
@@ -4019,6 +4043,10 @@ fn client_control_kind(control: &ClientControl) -> &'static str {
         ClientControl::BugReportStart { .. } => "bug_report_start",
         ClientControl::BugReportChunk { .. } => "bug_report_chunk",
         ClientControl::BugReportComplete { .. } => "bug_report_complete",
+        ClientControl::FetchHistory { .. } => "fetch_history",
+        ClientControl::JoinVoice { .. } => "join_voice",
+        ClientControl::LeaveVoice => "leave_voice",
+        ClientControl::OpenDm { .. } => "open_dm",
     }
 }
 
@@ -4056,6 +4084,10 @@ fn server_control_kind(control: &ServerControl) -> &'static str {
         ServerControl::Pong { .. } => "pong",
         ServerControl::Error { .. } => "error",
         ServerControl::BugReportSaved { .. } => "bug_report_saved",
+        ServerControl::RoomUpserted { .. } => "room_upserted",
+        ServerControl::DmOpened { .. } => "dm_opened",
+        ServerControl::HistoryChunk { .. } => "history_chunk",
+        ServerControl::PresenceV2 { .. } => "presence_v2",
     }
 }
 
