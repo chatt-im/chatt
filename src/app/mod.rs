@@ -2138,6 +2138,10 @@ impl App {
             }
             NetworkEvent::ReconnectScheduled { retry_in, reason } => {
                 self.stop_audio();
+                // The reconnect issues a fresh session id, so every share and
+                // viewer tied to the old one is dead; subscribers would retry
+                // against the stale id forever.
+                self.stop_all_shares();
                 self.reset_room_for_disconnect();
                 self.push_network_notice("network", &format!("Connection failed: {reason}"));
                 self.set_error(format!(
@@ -5471,6 +5475,45 @@ mod tests {
             stream_id: StreamId(1),
         });
         assert!(app.available_shares.is_empty());
+    }
+
+    #[test]
+    fn reconnect_clears_shares_tied_to_the_dead_session() {
+        let mut app = test_app();
+        app.user_id = Some(UserId(1));
+        app.session_id = Some(SessionId(1));
+        app.room.authenticated(
+            &[test_room_info(1)],
+            vec![
+                user_summary(UserId(1), "alice"),
+                user_summary(UserId(2), "bob"),
+            ],
+            RoomId(1),
+            None,
+            app.user_id,
+        );
+        app.voice_room = Some(RoomId(1));
+        app.handle_network_event(NetworkEvent::ShareAvailable {
+            room_id: RoomId(1),
+            stream_id: StreamId(10),
+            user_id: UserId(2),
+            sender_name: "bob".to_string(),
+            codec: "avc1.42c01f".to_string(),
+            coded_width: 1280,
+            coded_height: 720,
+            annexb: false,
+            extradata: Vec::new(),
+            view_secret: vec![7; 32],
+        });
+        assert!(app.available_shares.contains_key(&StreamId(10)));
+
+        app.handle_network_event(NetworkEvent::ReconnectScheduled {
+            retry_in: Duration::from_secs(2),
+            reason: "connection reset".to_string(),
+        });
+
+        assert!(app.available_shares.is_empty());
+        assert_eq!(app.screencast_stream_id, None);
     }
 
     #[test]
