@@ -68,6 +68,9 @@ pub enum BindCommand {
     EditServer,
     DeleteServer,
     SearchServers,
+    RoomSwitcher,
+    NextRoom,
+    PrevRoom,
 }
 
 impl std::fmt::Display for BindCommand {
@@ -124,6 +127,9 @@ impl std::fmt::Display for BindCommand {
             EditServer => "EditServer",
             DeleteServer => "DeleteServer",
             SearchServers => "SearchServers",
+            RoomSwitcher => "RoomSwitcher",
+            NextRoom => "NextRoom",
+            PrevRoom => "PrevRoom",
         })
     }
 }
@@ -192,6 +198,9 @@ impl BindCommand {
             EditServer => spec("Edit", ACTION),
             DeleteServer => spec("Delete", DESTRUCTIVE),
             SearchServers => spec("Search", ACTION),
+            RoomSwitcher => spec("Rooms", NAV),
+            NextRoom => spec("Next Room", NAV),
+            PrevRoom => spec("Prev Room", NAV),
         }
     }
 }

@@ -42,6 +42,11 @@ pub(crate) const SLASH_COMMANDS: &[SlashCommand] = &[
         description: "show deafen status",
     },
     SlashCommand {
+        name: "/dm",
+        usage: "/dm user",
+        description: "open a direct message room with a user",
+    },
+    SlashCommand {
         name: "/help",
         usage: "/help",
         description: "show this command list",
@@ -65,6 +70,16 @@ pub(crate) const SLASH_COMMANDS: &[SlashCommand] = &[
         name: "/report-bug",
         usage: "/report-bug what went wrong",
         description: "send recent logs and diagnostics to the server",
+    },
+    SlashCommand {
+        name: "/room",
+        usage: "/room name",
+        description: "switch the viewed room by name",
+    },
+    SlashCommand {
+        name: "/rooms",
+        usage: "/rooms",
+        description: "open the room switcher",
     },
     SlashCommand {
         name: "/servers",
@@ -115,6 +130,16 @@ pub(crate) const SLASH_COMMANDS: &[SlashCommand] = &[
         name: "/users",
         usage: "/users",
         description: "show known room users",
+    },
+    SlashCommand {
+        name: "/voice",
+        usage: "/voice [room]",
+        description: "join a room's voice call (default: the viewed room)",
+    },
+    SlashCommand {
+        name: "/voice-leave",
+        usage: "/voice-leave",
+        description: "leave the voice call",
     },
     SlashCommand {
         name: "/whoami",

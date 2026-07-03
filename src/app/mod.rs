@@ -41,7 +41,9 @@ use crate::{
         chrome::ChromeState,
         form::rect_contains,
         mode::{AppMode, ModeTransition, PendingTransition},
-        modes::{RoomMode, ServerEditMode, ServerListMode, SettingsMode, SettingsSession},
+        modes::{
+            RoomMode, RoomSwitchMode, ServerEditMode, ServerListMode, SettingsMode, SettingsSession,
+        },
         overlay::{DialogMode, PasswordPromptMode, PasteImageUploadMode},
     },
     ui::settings::{
@@ -1209,13 +1211,38 @@ impl App {
 
     /// Switches the viewed room, updating the web feed, upload target, and the
     /// persisted catalog. Returns false when the room is unknown.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn set_viewed_room(&mut self, room_id: RoomId) -> bool {
         if !self.room.set_viewed_room(room_id, self.user_id) {
             return false;
         }
         self.after_view_switch();
         true
+    }
+
+    /// The switcher and rooms-strip rows for the current catalog, voice, and
+    /// view state.
+    pub(crate) fn room_select_items(&self) -> Vec<room::RoomSelectItem> {
+        self.room.room_select_items(self.voice_room)
+    }
+
+    pub(crate) fn open_room_switcher(&mut self) {
+        self.push_mode(Box::new(RoomSwitchMode::new()));
+    }
+
+    /// Switches the view to the neighboring room in catalog order, wrapping.
+    pub(crate) fn cycle_room(&mut self, delta: isize) {
+        let rooms: Vec<RoomId> = self.room.room_metas().map(|(room_id, _)| room_id).collect();
+        if rooms.is_empty() {
+            self.set_status("no rooms yet");
+            return;
+        }
+        let current = self
+            .room
+            .viewed_room
+            .and_then(|viewed| rooms.iter().position(|room_id| *room_id == viewed))
+            .unwrap_or(0);
+        let next = (current as isize + delta).rem_euclid(rooms.len() as isize) as usize;
+        self.set_viewed_room(rooms[next]);
     }
 
     fn after_view_switch(&mut self) {
@@ -3603,6 +3630,17 @@ impl App {
             "/soundboard" => self.show_soundboard(),
             "/users" => self.show_users(),
             "/whoami" => self.show_current_user(),
+            "/rooms" => self.open_room_switcher(),
+            "/room" => self.set_error("usage: /room name"),
+            command if command.starts_with("/room ") => self.switch_room_command(command),
+            "/dm" => self.set_error("usage: /dm user"),
+            command if command.starts_with("/dm ") => self.open_dm_command(command),
+            "/voice" => self.join_voice_command(None),
+            command if command.starts_with("/voice ") => {
+                let name = command.trim_start_matches("/voice ").trim().to_string();
+                self.join_voice_command(Some(&name));
+            }
+            "/voice-leave" => self.leave_voice_command(),
             "/upload" => self.set_error("usage: /upload file_path/filename.ext"),
             command if command.starts_with("/upload ") => self.upload_file_command(command),
             "/upload-rate" => self.set_error("usage: /upload-rate 200K|off"),
@@ -3617,6 +3655,84 @@ impl App {
             command if command.starts_with("/sound") => self.soundboard_command(command),
             command => self.set_error(format!("unknown command: {command}")),
         }
+    }
+
+    fn switch_room_command(&mut self, command: &str) {
+        let name = command.trim_start_matches("/room ").trim();
+        if name.is_empty() {
+            self.set_error("usage: /room name");
+            return;
+        }
+        let Some(room_id) = self.room.find_room_by_name(name) else {
+            self.set_error(format!("no room named {name}"));
+            return;
+        };
+        self.set_viewed_room(room_id);
+    }
+
+    /// Asks the server for the DM room with the named user; the view switches
+    /// when `DmOpened` arrives.
+    fn open_dm_command(&mut self, command: &str) {
+        let name = command.trim_start_matches("/dm ").trim();
+        if name.is_empty() {
+            self.set_error("usage: /dm user");
+            return;
+        }
+        let Some(user_id) = self.room.user_id_by_name(name) else {
+            self.set_error(format!("no user named {name}"));
+            return;
+        };
+        if self.network.is_none() {
+            self.set_error("select a server before opening dms");
+            return;
+        }
+        self.send_network_command(NetworkCommand::OpenDm(user_id), true);
+        self.set_status(format!(
+            "opening dm with {}",
+            self.room.display_name_of(user_id)
+        ));
+    }
+
+    /// Moves the voice call to `name`'s room, or the viewed room without an
+    /// argument. Mirrors the auto-join in the `Authenticated` handler.
+    fn join_voice_command(&mut self, name: Option<&str>) {
+        let target = match name {
+            Some(name) => match self.room.find_room_by_name(name) {
+                Some(room_id) => room_id,
+                None => {
+                    self.set_error(format!("no room named {name}"));
+                    return;
+                }
+            },
+            None => match self.room.viewed_room {
+                Some(room_id) => room_id,
+                None => {
+                    self.set_error("no room selected");
+                    return;
+                }
+            },
+        };
+        if self.network.is_none() {
+            self.set_error("select a server before joining voice");
+            return;
+        }
+        if self.voice_room == Some(target) {
+            self.set_status("already in this room's voice call");
+            return;
+        }
+        self.voice_room = Some(target);
+        self.send_network_command(NetworkCommand::JoinVoice(target), true);
+        self.publish_voice_status();
+        self.start_room_voice();
+    }
+
+    fn leave_voice_command(&mut self) {
+        if self.voice_room.is_none() {
+            self.set_status("not in a voice call");
+            return;
+        }
+        self.send_network_command(NetworkCommand::LeaveVoice, true);
+        self.set_status("leaving voice");
     }
 
     fn upload_file_command(&mut self, command: &str) {
@@ -4627,7 +4743,6 @@ mod tests {
     use crate::{settings::SettingsDraft, tui::form::FormState};
     use extui::{Buffer, event::KeyModifiers};
     use extui_editor::Mode as EditorMode;
-    use rpc::control::ParticipantInfo;
 
     fn test_app() -> App {
         App::new(Config::default(), None).expect("test app")
@@ -5011,6 +5126,116 @@ mod tests {
             NetworkCommand::SendChat { body, .. } => assert_eq!(body, "/help"),
             other => panic!("unexpected command: {other:?}"),
         }
+    }
+
+    #[test]
+    fn room_command_switches_viewed_room_by_name() {
+        let mut app = test_app();
+        let (tx, _rx) = mpsc::channel();
+        app.network = Some(NetworkClient::from_parts_for_test(tx));
+        app.user_id = Some(UserId(1));
+        app.room.authenticated(
+            &[test_room_info(1), test_room_info(2)],
+            vec![user_summary(UserId(1), "alice")],
+            rpc::ids::RoomId(1),
+            None,
+            app.user_id,
+        );
+
+        app.room.composer.set_lines("/room room-2");
+        app.submit_input();
+        assert_eq!(app.room.viewed_room, Some(rpc::ids::RoomId(2)));
+
+        app.room.composer.set_lines("/room nowhere");
+        app.submit_input();
+        assert_eq!(app.room.viewed_room, Some(rpc::ids::RoomId(2)));
+        assert_eq!(app.status.kind(), StatusKind::Error);
+    }
+
+    #[test]
+    fn dm_command_sends_open_dm_for_named_user() {
+        let mut app = test_app();
+        let (tx, rx) = mpsc::channel();
+        app.network = Some(NetworkClient::from_parts_for_test(tx));
+        app.user_id = Some(UserId(1));
+        enter_room_with_users(
+            &mut app,
+            vec![
+                user_summary(UserId(1), "alice"),
+                user_summary(UserId(2), "bob"),
+            ],
+        );
+
+        app.room.composer.set_lines("/dm bob");
+        app.submit_input();
+
+        match rx.try_recv().unwrap() {
+            NetworkCommand::OpenDm(user_id) => assert_eq!(user_id, UserId(2)),
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn voice_command_moves_the_call_to_the_viewed_room() {
+        let mut app = test_app();
+        let (tx, rx) = mpsc::channel();
+        app.network = Some(NetworkClient::from_parts_for_test(tx));
+        app.user_id = Some(UserId(1));
+        enter_test_room(&mut app);
+        // The deafened path skips audio device startup, keeping the test
+        // hermetic; the join command must still go out.
+        app.deafened.store(true, Ordering::Relaxed);
+
+        app.room.composer.set_lines("/voice");
+        app.submit_input();
+
+        assert_eq!(app.voice_room, Some(rpc::ids::RoomId(1)));
+        let mut commands = Vec::new();
+        while let Ok(command) = rx.try_recv() {
+            commands.push(command);
+        }
+        assert!(
+            commands
+                .iter()
+                .any(|command| matches!(command, NetworkCommand::JoinVoice(rpc::ids::RoomId(1)))),
+            "expected JoinVoice, got {commands:?}"
+        );
+    }
+
+    #[test]
+    fn voice_leave_command_sends_leave_voice() {
+        let mut app = test_app();
+        let (tx, rx) = mpsc::channel();
+        app.network = Some(NetworkClient::from_parts_for_test(tx));
+        enter_test_room(&mut app);
+        app.voice_room = Some(rpc::ids::RoomId(1));
+
+        app.room.composer.set_lines("/voice-leave");
+        app.submit_input();
+
+        match rx.try_recv().unwrap() {
+            NetworkCommand::LeaveVoice => {}
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cycle_room_wraps_in_catalog_order() {
+        let mut app = test_app();
+        app.room.authenticated(
+            &[test_room_info(1), test_room_info(2)],
+            Vec::new(),
+            rpc::ids::RoomId(1),
+            None,
+            None,
+        );
+
+        app.cycle_room(1);
+        assert_eq!(app.room.viewed_room, Some(rpc::ids::RoomId(2)));
+        app.cycle_room(1);
+        assert_eq!(app.room.viewed_room, Some(rpc::ids::RoomId(1)));
+        app.cycle_room(-1);
+        assert_eq!(app.room.viewed_room, Some(rpc::ids::RoomId(2)));
     }
 
     #[test]

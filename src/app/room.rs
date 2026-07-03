@@ -44,6 +44,29 @@ pub(crate) struct RoomMeta {
     pub(crate) unread: u32,
 }
 
+/// One row of the room switcher and rooms strip, in catalog order (public and
+/// private rooms by id, then DMs whose ids sort last).
+#[derive(Clone, Debug)]
+pub(crate) struct RoomSelectItem {
+    pub(crate) room_id: RoomId,
+    pub(crate) name: String,
+    /// Live messages received while the room was parked.
+    pub(crate) unread: u32,
+    /// The server head is past the local read watermark but no live count is
+    /// known, so the row shows a dot instead of a number.
+    pub(crate) behind_head: bool,
+    /// This room hosts the local user's voice call.
+    pub(crate) voice: bool,
+    /// This room is the one the chat panel shows.
+    pub(crate) viewed: bool,
+}
+
+impl crate::ui::select::SelectableItem for RoomSelectItem {
+    fn search_text(&self) -> &str {
+        &self.name
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum ClientRoomKind {
     Public,
@@ -773,7 +796,6 @@ impl RoomSession {
     }
 
     /// Every known room in id order: `(room_id, meta)`.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn room_metas(&self) -> impl Iterator<Item = (RoomId, &RoomMeta)> {
         self.metas.iter().map(|(room_id, meta)| (*room_id, meta))
     }
@@ -782,8 +804,24 @@ impl RoomSession {
         self.metas.get(&room_id)
     }
 
+    /// Builds the switcher and rooms-strip rows: every known room in catalog
+    /// order with its unread, voice, and viewed markers.
+    pub(crate) fn room_select_items(&self, voice_room: Option<RoomId>) -> Vec<RoomSelectItem> {
+        let mut items = Vec::with_capacity(self.metas.len());
+        for (room_id, meta) in &self.metas {
+            items.push(RoomSelectItem {
+                room_id: *room_id,
+                name: meta.name.clone(),
+                unread: meta.unread,
+                behind_head: meta.unread == 0 && meta.head > meta.last_read,
+                voice: voice_room == Some(*room_id),
+                viewed: self.viewed_room == Some(*room_id),
+            });
+        }
+        items
+    }
+
     /// Resolves a room by display name, exact match first then unique prefix.
-    #[allow(dead_code)]
     pub(crate) fn find_room_by_name(&self, name: &str) -> Option<RoomId> {
         let lowered = name.to_lowercase();
         if let Some((room_id, _)) = self
@@ -832,7 +870,6 @@ impl RoomSession {
             .unwrap_or_default()
     }
 
-    #[allow(dead_code)]
     pub(crate) fn user_id_by_name(&self, name: &str) -> Option<UserId> {
         let lowered = name.to_lowercase();
         if let Some(user) = self.users.values().find(|user| {
@@ -1643,6 +1680,65 @@ mod tests {
         assert_eq!(room.chat.len(), 1);
         assert_eq!(room.chat.message(0).body, "in one");
         assert_eq!(room.composer.text().trim(), "draft for one");
+    }
+
+    #[test]
+    fn room_select_items_keep_catalog_order_and_room_markers() {
+        let mut room = test_room();
+        let dm = RoomInfo {
+            room_id: RoomId(0x8000_0001),
+            name: "dm:1:2".to_string(),
+            participants: 0,
+            kind: RoomKind::Dm {
+                user_a: UserId(1),
+                user_b: UserId(2),
+            },
+            head: None,
+            voice_users: Vec::new(),
+        };
+        room.authenticated(
+            &[room_info(1), room_info(2), dm],
+            vec![user(UserId(1), "alice"), user(UserId(2), "bob")],
+            RoomId(1),
+            None,
+            Some(UserId(1)),
+        );
+        room.chat_received(
+            message_in(RoomId(2), 1, UserId(2), "parked"),
+            Some(UserId(1)),
+        );
+
+        let items = room.room_select_items(Some(RoomId(1)));
+        let ids: Vec<RoomId> = items.iter().map(|item| item.room_id).collect();
+        assert_eq!(ids, vec![RoomId(1), RoomId(2), RoomId(0x8000_0001)]);
+        assert!(items[0].viewed);
+        assert!(items[0].voice);
+        assert_eq!(items[0].unread, 0);
+        assert!(!items[1].viewed);
+        assert!(!items[1].voice);
+        assert_eq!(items[1].unread, 1);
+        assert_eq!(items[2].name, "@bob");
+    }
+
+    #[test]
+    fn room_select_items_dot_unviewed_room_behind_server_head() {
+        let mut room = test_room();
+        let mut viewed = room_info(1);
+        viewed.head = Some(MessageId(3));
+        let mut parked = room_info(2);
+        parked.head = Some(MessageId(5));
+        room.authenticated(
+            &[viewed, parked],
+            Vec::new(),
+            RoomId(1),
+            None,
+            Some(UserId(1)),
+        );
+
+        let items = room.room_select_items(None);
+        assert!(!items[0].behind_head, "checkout marks the viewed room read");
+        assert!(items[1].behind_head);
+        assert_eq!(items[1].unread, 0);
     }
 
     #[test]
