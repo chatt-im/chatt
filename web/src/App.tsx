@@ -12,6 +12,7 @@ import {
   type VirtualizerHandle,
 } from "./vendor/virtua/solid/Virtualizer";
 import type {
+  AutoplayMode,
   WebMessage,
   ServerEnvelope,
   ClientRequest,
@@ -25,6 +26,7 @@ import { decodeFeed } from "./feed";
 import { markImageError, markImageLoaded } from "./image-cache";
 import Icon, { IconSprite } from "./Icon";
 import PreviewPanel, { previewKey, type PreviewItem } from "./PreviewPanel";
+import VideoPlayer from "./VideoPlayer";
 
 // Pixel tolerance when deciding the view is "at the bottom". Scroll positions
 // are fractional, so an exact comparison would intermittently read as
@@ -111,6 +113,49 @@ function previewItemFromRef(anchor: HTMLElement): PreviewItem | null {
     };
   }
   return { kind, name };
+}
+
+function standalonePreviewFromLocation(): {
+  item: PreviewItem;
+  autoplay: AutoplayMode;
+} | null {
+  const params = new URLSearchParams(location.search);
+  const kind = previewKind(params.get("preview") ?? undefined);
+  const name = params.get("name");
+  if (!kind || !name) return null;
+
+  const autoplayValue = params.get("autoplay");
+  const autoplay: AutoplayMode =
+    autoplayValue === "muted" || autoplayValue === "with-audio"
+      ? autoplayValue
+      : "disabled";
+  if (kind !== "image") return { item: { kind, name }, autoplay };
+
+  return {
+    item: {
+      kind,
+      name,
+      width: optionalDataNumber(params.get("width") ?? undefined),
+      height: optionalDataNumber(params.get("height") ?? undefined),
+    },
+    autoplay,
+  };
+}
+
+function standalonePreviewUrl(
+  item: PreviewItem,
+  autoplay: AutoplayMode,
+): string {
+  const url = new URL("/", location.href);
+  url.searchParams.set("preview", item.kind);
+  url.searchParams.set("name", item.name);
+  url.searchParams.set("autoplay", autoplay);
+  if (item.kind === "image") {
+    if (item.width !== null) url.searchParams.set("width", String(item.width));
+    if (item.height !== null)
+      url.searchParams.set("height", String(item.height));
+  }
+  return url.href;
 }
 
 function imageDebugEnabled(): boolean {
@@ -400,6 +445,7 @@ function MessageBody(props: { fragments: Fragment[] }) {
 function Attachment(props: {
   message: WebMessage;
   onOpenPreview: (item: PreviewItem, opener: HTMLElement) => void;
+  autoplay: AutoplayMode;
 }) {
   const att = () => props.message.attachment!;
   const url = () => fileUrl(att().name);
@@ -462,7 +508,11 @@ function Attachment(props: {
         </a>
       </Show>
       <Show when={att().kind === "video"}>
-        <video class="media-video" src={url()} controls preload="metadata" />
+        <VideoPlayer
+          class="media-video"
+          src={url()}
+          autoplay={props.autoplay}
+        />
       </Show>
       <Show when={att().kind === "audio"}>
         <audio class="media-audio" src={url()} controls preload="metadata" />
@@ -504,6 +554,7 @@ function MessageRow(props: {
   prev?: WebMessage;
   onOpenPreview: (item: PreviewItem, opener: HTMLElement) => void;
   onQuoteRef?: (refCode: string) => void;
+  autoplay: AutoplayMode;
 }) {
   // A continuation hides the header and shows its time only on hover, in the
   // reserved left gutter. `prev` is supplied reactively from the message list,
@@ -557,6 +608,7 @@ function MessageRow(props: {
         <Attachment
           message={props.message}
           onOpenPreview={props.onOpenPreview}
+          autoplay={props.autoplay}
         />
       </Show>
       <Show when={!props.message.attachment && props.message.progress}>
@@ -591,6 +643,27 @@ function MessageRow(props: {
 }
 
 export default function App() {
+  const standalone = standalonePreviewFromLocation();
+  if (standalone) {
+    const key = previewKey(standalone.item);
+    document.title = `${standalone.item.name} — chatt`;
+    return (
+      <div class="app">
+        <IconSprite />
+        <PreviewPanel
+          history={[standalone.item]}
+          active={standalone.item}
+          activeKey={key}
+          onSelect={() => {}}
+          onClose={() => window.close()}
+          onCloseTab={() => window.close()}
+          autoplay={standalone.autoplay}
+          standalone
+        />
+      </div>
+    );
+  }
+
   const [messages, setMessages] = createSignal<WebMessage[]>([]);
   const [refToast, setRefToast] = createSignal<string | null>(null);
   const [connected, setConnected] = createSignal(false);
@@ -623,6 +696,10 @@ export default function App() {
     DEFAULT_PREVIEW_PANEL_WIDTH
   );
   const [previewPanelResizing, setPreviewPanelResizing] = createSignal(false);
+  const [autoplay, setAutoplay] =
+    createSignal<AutoplayMode>("disabled");
+  const [viewerInSeparateBrowserTab, setViewerInSeparateBrowserTab] =
+    createSignal(false);
   let previewOpener: HTMLElement | undefined;
 
   const activePreview = () => {
@@ -633,6 +710,11 @@ export default function App() {
   };
 
   function openPreview(item: PreviewItem, opener: HTMLElement) {
+    if (viewerInSeparateBrowserTab()) {
+      window.open(standalonePreviewUrl(item, autoplay()), "_blank", "noopener");
+      return;
+    }
+
     const key = previewKey(item);
     previewOpener = opener;
     batch(() => {
@@ -1581,6 +1663,9 @@ export default function App() {
           // identifies one file.
           const msg = feed.message;
           preloadImage(msg);
+          if (msg.attachment?.kind === "video" && autoplay() !== "disabled") {
+            msg.autoplay = autoplay();
+          }
           setMessages((prev) => {
             if (msg.file_id !== null) {
               const i = prev.findIndex(
@@ -1654,6 +1739,10 @@ export default function App() {
         });
       } else if (env.type === "config") {
         setReadonly(env.readonly);
+        setAutoplay(env.autoplay);
+        setViewerInSeparateBrowserTab(
+          env.viewer_in_seperate_browser_tab
+        );
       } else if (env.type === "share_error") {
         setShareError(env.stream_id, env.message);
       } else if (env.type === "share_ended") {
@@ -1850,6 +1939,7 @@ export default function App() {
                     prev={messages()[index() - 1]}
                     onOpenPreview={openPreview}
                     onQuoteRef={readonly() ? undefined : quoteRef}
+                    autoplay={message.autoplay ?? "disabled"}
                   />
                 )}
               </Virtualizer>
@@ -1943,6 +2033,7 @@ export default function App() {
                   onSelect={setActivePreviewKey}
                   onClose={closePreview}
                   onCloseTab={closePreviewTab}
+                  autoplay={autoplay()}
                 />
               </aside>
             </>

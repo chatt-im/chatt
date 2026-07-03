@@ -74,6 +74,9 @@ export default function ImageViewer(props: {
   name: string;
   width: number | null;
   height: number | null;
+  standaloneActions?: {
+    onClose: () => void;
+  };
 }) {
   let viewportEl: HTMLDivElement | undefined;
   let gestureRect: DOMRect | undefined;
@@ -404,7 +407,7 @@ export default function ImageViewer(props: {
       <div
         class="image-viewer-toolbar"
         role="toolbar"
-        aria-label="Image zoom controls"
+        aria-label="Image controls"
       >
         <button
           type="button"
@@ -443,6 +446,30 @@ export default function ImageViewer(props: {
         >
           <Icon name="zoom-in" />
         </button>
+        <Show when={props.standaloneActions}>
+          {(actions) => (
+            <div class="image-viewer-toolbar-actions">
+              <a
+                class="image-viewer-toolbar-action"
+                href={source().src}
+                download={props.name}
+                aria-label={`Download ${props.name}`}
+                title="Download"
+              >
+                <Icon name="download" />
+              </a>
+              <button
+                class="image-viewer-toolbar-action"
+                type="button"
+                aria-label="Close preview"
+                title="Close"
+                onClick={actions().onClose}
+              >
+                <Icon name="x" />
+              </button>
+            </div>
+          )}
+        </Show>
       </div>
       <div
         class="image-viewer-viewport"

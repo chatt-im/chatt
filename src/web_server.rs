@@ -25,7 +25,7 @@ use darkhttp::{
 use jsony::Jsony;
 use rpc::control::{ChatMessage, FileMetadata};
 
-use crate::config::WebConfig;
+use crate::config::{WebAutoplay, WebConfig};
 use crate::web_wire::{self, Fragment, split_fragments};
 
 /// The path a browser opens a WebSocket on for the live feed.
@@ -537,9 +537,21 @@ pub fn spawn(
     let local = server.local_addr()?;
 
     let (tx, rx) = mpsc::channel();
+    let autoplay = cfg.autoplay;
+    let viewer_in_seperate_browser_tab = cfg.viewer_in_seperate_browser_tab;
     thread::Builder::new()
         .name("web-server".to_string())
-        .spawn(move || run(server, rx, max_messages, web_requests, readonly))?;
+        .spawn(move || {
+            run(
+                server,
+                rx,
+                max_messages,
+                web_requests,
+                readonly,
+                autoplay,
+                viewer_in_seperate_browser_tab,
+            )
+        })?;
 
     kvlog::info!("web server listening", addr = %local);
     Ok(WebFeedSender { tx, wake })
@@ -552,6 +564,8 @@ fn run(
     max_messages: usize,
     web_requests: Sender<WebRequest>,
     readonly: bool,
+    autoplay: WebAutoplay,
+    viewer_in_seperate_browser_tab: bool,
 ) {
     // Open uploads keyed by connection and browser-assigned id, each an
     // append-mode file the binary chunk frames stream into until `upload_finish`.
@@ -589,7 +603,10 @@ fn run(
                         );
                         clients.push(id);
                         let _ = server.send_websocket_binary(id, &sync_frame(&history, base_seq));
-                        let _ = server.send_websocket_text(id, &config_envelope(readonly));
+                        let _ = server.send_websocket_text(
+                            id,
+                            &config_envelope(readonly, autoplay, viewer_in_seperate_browser_tab),
+                        );
                         for payload in active_shares.values() {
                             let _ = server.send_websocket_text(id, payload);
                         }
@@ -939,9 +956,18 @@ fn older_frame(before_seq: u64, limit: u64, history: &[WebMessage], base_seq: u6
     )
 }
 
-/// The JSON envelope sent on connect telling the browser whether it may compose.
-fn config_envelope(readonly: bool) -> String {
-    jsony::object! { type: "config", readonly: readonly }
+/// The JSON envelope sent on connect with browser-only behavior settings.
+fn config_envelope(
+    readonly: bool,
+    autoplay: WebAutoplay,
+    viewer_in_seperate_browser_tab: bool,
+) -> String {
+    jsony::object! {
+        type: "config",
+        readonly: readonly,
+        autoplay: autoplay.wire_name(),
+        viewer_in_seperate_browser_tab: viewer_in_seperate_browser_tab,
+    }
 }
 
 fn client_request_kind(request: &ClientRequest) -> &'static str {
@@ -1395,6 +1421,7 @@ mod tests {
             enabled: true,
             readonly: true,
             bind: "127.0.0.1:39521".to_string(),
+            ..WebConfig::default()
         };
         let (web_tx, _web_rx) = mpsc::channel();
         let _sender = spawn(&cfg, Some(dir.clone()), 100, web_tx, true).unwrap();
@@ -1432,6 +1459,7 @@ mod tests {
             enabled: true,
             readonly: true,
             bind: "127.0.0.1:39523".to_string(),
+            ..WebConfig::default()
         };
         let (web_tx, _web_rx) = mpsc::channel();
         let _sender = spawn(&cfg, Some(dir.clone()), 100, web_tx, true).unwrap();
@@ -1460,6 +1488,7 @@ mod tests {
             enabled: true,
             readonly: true,
             bind: "127.0.0.1:39522".to_string(),
+            ..WebConfig::default()
         };
         let (web_tx, _web_rx) = mpsc::channel();
         let _sender = spawn(&cfg, Some(dir.clone()), 100, web_tx, true).unwrap();
@@ -1512,6 +1541,7 @@ mod tests {
             enabled: true,
             readonly: true,
             bind: "127.0.0.1:39517".to_string(),
+            ..WebConfig::default()
         };
         let (web_tx, _web_rx) = mpsc::channel();
         let sender = spawn(&cfg, None, 100, web_tx, true).unwrap();
@@ -1634,6 +1664,7 @@ Sec-WebSocket-Version: 13\r\n\
             enabled: true,
             readonly: true,
             bind: "127.0.0.1:39520".to_string(),
+            ..WebConfig::default()
         };
         let (web_tx, _web_rx) = mpsc::channel();
         let sender = spawn(&cfg, None, 100, web_tx, true).unwrap();
@@ -1668,6 +1699,7 @@ Sec-WebSocket-Version: 13\r\n\
             enabled: true,
             readonly: true,
             bind: "127.0.0.1:39518".to_string(),
+            ..WebConfig::default()
         };
         let (web_tx, _web_rx) = mpsc::channel();
         let sender = spawn(&cfg, None, 100, web_tx, true).unwrap();
@@ -1715,6 +1747,7 @@ Sec-WebSocket-Version: 13\r\n\
             enabled: true,
             readonly: true,
             bind: "127.0.0.1:39519".to_string(),
+            ..WebConfig::default()
         };
         let (web_tx, _web_rx) = mpsc::channel();
         let sender = spawn(&cfg, None, 100, web_tx, true).unwrap();
@@ -1765,11 +1798,13 @@ Sec-WebSocket-Version: 13\r\n\
     }
 
     #[test]
-    fn config_envelope_reports_readonly_on_connect() {
+    fn config_envelope_reports_web_view_settings_on_connect() {
         let cfg = WebConfig {
             enabled: true,
             readonly: true,
             bind: "127.0.0.1:39524".to_string(),
+            autoplay: WebAutoplay::WithAudio,
+            viewer_in_seperate_browser_tab: true,
         };
         let (web_tx, _web_rx) = mpsc::channel();
         let _sender = spawn(&cfg, None, 100, web_tx, true).unwrap();
@@ -1784,6 +1819,11 @@ Sec-WebSocket-Version: 13\r\n\
         let text = String::from_utf8(config).unwrap();
         assert!(text.contains("\"config\""), "{text}");
         assert!(text.contains("\"readonly\":true"), "{text}");
+        assert!(text.contains("\"autoplay\":\"with-audio\""), "{text}");
+        assert!(
+            text.contains("\"viewer_in_seperate_browser_tab\":true"),
+            "{text}"
+        );
     }
 
     #[test]
@@ -1792,6 +1832,7 @@ Sec-WebSocket-Version: 13\r\n\
             enabled: true,
             readonly: false,
             bind: "127.0.0.1:39525".to_string(),
+            ..WebConfig::default()
         };
         let (web_tx, web_rx) = mpsc::channel();
         let _sender = spawn(&cfg, None, 100, web_tx, false).unwrap();
@@ -1814,6 +1855,7 @@ Sec-WebSocket-Version: 13\r\n\
             enabled: true,
             readonly: true,
             bind: "127.0.0.1:39526".to_string(),
+            ..WebConfig::default()
         };
         let (web_tx, web_rx) = mpsc::channel();
         let _sender = spawn(&cfg, None, 100, web_tx, true).unwrap();
@@ -1831,6 +1873,7 @@ Sec-WebSocket-Version: 13\r\n\
             enabled: true,
             readonly: false,
             bind: "127.0.0.1:39527".to_string(),
+            ..WebConfig::default()
         };
         let (web_tx, web_rx) = mpsc::channel();
         let _sender = spawn(&cfg, None, 100, web_tx, false).unwrap();
@@ -1868,6 +1911,7 @@ Sec-WebSocket-Version: 13\r\n\
             enabled: true,
             readonly: false,
             bind: "127.0.0.1:39528".to_string(),
+            ..WebConfig::default()
         };
         let (web_tx, web_rx) = mpsc::channel();
         let _sender = spawn(&cfg, None, 100, web_tx, false).unwrap();
