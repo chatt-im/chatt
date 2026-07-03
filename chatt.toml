@@ -89,6 +89,9 @@ viewer-in-seperate-browser-tab = false
 "C-h" = "ToggleDeafen"
 "D-j" = "FocusNext"
 "D-k" = "FocusPrev"
+"C-k" = "RoomSwitcher"
+"M-DOWN" = "NextRoom"
+"M-UP" = "PrevRoom"
 "M-." = "ToggleKeyPreview"
 
 [bindings.compose-normal]
@@ -101,6 +104,9 @@ viewer-in-seperate-browser-tab = false
 "p" = "PasteClipboard"
 "C-v" = "PasteClipboard"
 "C-M-v" = "PasteClipboard"
+"C-k" = "RoomSwitcher"
+"M-DOWN" = "NextRoom"
+"M-UP" = "PrevRoom"
 "." = "ToggleKeyPreview"
 
 [bindings.workspace]
@@ -135,12 +141,16 @@ viewer-in-seperate-browser-tab = false
 "C-v" = "PasteClipboard"
 "C-M-v" = "PasteClipboard"
 "TAB" = "ToggleExpand"
+"C-k" = "RoomSwitcher"
+"M-DOWN" = "NextRoom"
+"M-UP" = "PrevRoom"
 "." = "ToggleKeyPreview"
 
 [bindings.picker]
 "C-c" = "Quit"
 "ESC" = "Cancel"
 "q" = "Cancel"
+"C-k" = "RoomSwitcher"
 "j" = "SelectNext"
 "k" = "SelectPrev"
 "DOWN" = "SelectNext"

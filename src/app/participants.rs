@@ -170,13 +170,6 @@ impl Participants {
         self.ensure_selection();
     }
 
-    /// Removes a user that is no longer part of the viewed room's roster.
-    #[allow(dead_code)]
-    pub(crate) fn remove_user(&mut self, user_id: UserId) {
-        self.entries.retain(|entry| entry.user_id != user_id);
-        self.ensure_selection();
-    }
-
     pub(crate) fn note_message(&mut self, message: &ChatMessage) {
         let entry = self.ensure_user(message.sender);
         entry.name = Some(message.sender_name.clone());

@@ -14,7 +14,9 @@ use chatt::audio::StatsSnapshot;
 use crate::{
     app::{
         App, ChatPanelFocus, ParticipantState, ParticipantVoiceFeedback, ServerEditDraft,
-        ServerSelectItem, StatusKind, audio_supervisor::AudioHealthState, room::TransferProgress,
+        ServerSelectItem, StatusKind,
+        audio_supervisor::AudioHealthState,
+        room::{RoomSelectItem, TransferProgress},
         volume_db_label,
     },
     bindings::{self, Reachable, ReachableKind},
@@ -286,7 +288,12 @@ fn draw_workspace(
     let mut rows = area;
     let room_height = app.config.ui.room_height.min(rows.h.saturating_sub(1));
     if room_height > 0 {
-        let room_area = rows.take_top(room_height as i32);
+        let mut room_area = rows.take_top(room_height as i32);
+        if room_height >= 2 {
+            let rooms_row = room_area.take_top(1);
+            layout.rooms_row_rect = rooms_row;
+            draw_rooms_row(rooms_row, app, layout, buf);
+        }
         layout.room_rect = room_area;
         draw_room(room_area, app, focus, buf);
     }
@@ -302,6 +309,142 @@ fn draw_workspace(
     } else {
         layout.clear_chat();
     }
+}
+
+/// The one-line rooms strip at the top of the lobby panel: one flat segment
+/// per room with unread and voice markers, hit boxes recorded for clicks.
+fn draw_rooms_row(area: Rect, app: &App, layout: &mut RoomLayout, buf: &mut Buffer) {
+    if area.is_empty() {
+        return;
+    }
+    let theme = app.theme;
+    area.with(theme.panel_alt).fill(buf);
+    let mut row = area;
+    for item in app.room_select_items() {
+        let mut label = format!(" {}", item.name);
+        if item.unread > 0 {
+            label.push_str(&format!(" {}", item.unread));
+        } else if item.behind_head {
+            label.push_str(" •");
+        }
+        if item.voice {
+            label.push_str(" V");
+        }
+        label.push(' ');
+        let style = if item.viewed {
+            theme.room_selected.patch(theme.text) | Modifier::BOLD
+        } else if item.unread > 0 || item.behind_head {
+            theme.panel_alt.patch(theme.warn)
+        } else {
+            theme.panel_alt.patch(theme.muted)
+        };
+        let rect = draw_status_segment(&mut row, buf, style, &label);
+        if rect.is_empty() {
+            break;
+        }
+        layout.room_hits.push((rect, item.room_id));
+    }
+}
+
+pub(crate) fn draw_room_select_screen(
+    app: &mut App,
+    select: &mut FuzzySelect,
+    items: &[RoomSelectItem],
+    searching: bool,
+    mode: theme::UiMode,
+    status_label: &'static str,
+    layer: LayerId,
+    buf: &mut Buffer,
+) {
+    let capture = prepare_screen(app, buf);
+    let mut screen = buf.rect();
+    refresh_key_preview_cache(app, Some(layer));
+    let key_preview_height = key_preview_height(app, screen.w);
+    let key_preview_area = screen.take_bottom(key_preview_height as i32);
+    let status_area = screen.take_bottom(1);
+    draw_room_select(screen, app, select, items, searching, buf);
+    draw_status(status_area, app, buf, mode, status_label, capture.as_ref());
+    draw_key_preview(key_preview_area, app, buf);
+}
+
+fn draw_room_select(
+    area: Rect,
+    app: &App,
+    select: &mut FuzzySelect,
+    items: &[RoomSelectItem],
+    searching: bool,
+    buf: &mut Buffer,
+) {
+    area.with(app.theme.background).fill(buf);
+    let mut body = area;
+    if body.h == 0 {
+        return;
+    }
+    if items.is_empty() {
+        body.take_top(1)
+            .with(app.theme.background.patch(app.theme.muted))
+            .with(Ellipsis(true))
+            .text(buf, " No rooms known yet.");
+        return;
+    }
+
+    if searching {
+        let search = body.take_top(1);
+        search
+            .with(app.theme.background.patch(app.theme.subtle))
+            .with(Ellipsis(true))
+            .text(buf, &format!("/{}", select.query()));
+    }
+
+    let theme = &app.theme;
+    select.render(body, 1, buf, |_, item_index, selected, area, buf| {
+        if let Some(item) = items.get(item_index) {
+            draw_room_select_item(area, buf, item, selected, theme);
+        }
+    });
+}
+
+fn draw_room_select_item(
+    area: Rect,
+    buf: &mut Buffer,
+    item: &RoomSelectItem,
+    selected: bool,
+    theme: &Theme,
+) {
+    let base = if selected {
+        theme.room_selected
+    } else {
+        theme.background
+    };
+    buf.clear_rect(area, base);
+    let mut row = area;
+    row.take_left(2)
+        .with(base.patch(if selected { theme.good } else { theme.subtle }))
+        .text(buf, if selected { ">" } else { " " });
+    if item.voice {
+        draw_status_segment_right(&mut row, buf, base.patch(theme.good), " voice ");
+    }
+    if item.unread > 0 {
+        draw_status_segment_right(
+            &mut row,
+            buf,
+            base.patch(theme.warn) | Modifier::BOLD,
+            &format!(" {} ", item.unread),
+        );
+    } else if item.behind_head {
+        draw_status_segment_right(&mut row, buf, base.patch(theme.warn), " • ");
+    }
+    if item.viewed {
+        draw_status_segment_right(&mut row, buf, base.patch(theme.accent), " viewing ");
+    }
+    let name_style = if item.viewed {
+        base.patch(theme.text | Modifier::BOLD)
+    } else {
+        base.patch(theme.text)
+    };
+    row.with(name_style)
+        .with(Ellipsis(true))
+        .text(buf, &item.name);
 }
 
 fn draw_server_select(
@@ -752,13 +895,13 @@ fn draw_lobby_bar(area: Rect, app: &mut App, focus: ChatPanelFocus, buf: &mut Bu
     let focused = focus == ChatPanelFocus::Lobby;
     let (fill, label, detail) = section_bar_styles(app.theme, ChatPanelFocus::Lobby, focused);
     area.with(fill).fill(buf);
-    let voice_count = app
-        .room
-        .participants
-        .entries
-        .iter()
-        .filter(|participant| participant.online && participant.voice_active)
-        .count();
+    let voice_label = match app
+        .voice_room
+        .and_then(|room_id| app.room.room_meta(room_id))
+    {
+        Some(meta) => format!("voice: {} {}", meta.name, meta.voice_users.len()),
+        None => "voice: off".to_string(),
+    };
     let mut row = area;
     draw_status_segment(&mut row, buf, label, " Lobby ");
     draw_status_segment(
@@ -766,11 +909,11 @@ fn draw_lobby_bar(area: Rect, app: &mut App, focus: ChatPanelFocus, buf: &mut Bu
         buf,
         detail,
         &format!(
-            " room {}  online {}/{}  voice {} ",
+            " {} | online {}/{} | {} ",
             app.room.room_name,
             app.room.participants.online_count(),
             app.room.participants.entries.len(),
-            voice_count
+            voice_label
         ),
     );
     draw_lobby_audio_widget(row, app, fill, buf);
@@ -1581,15 +1724,14 @@ fn key_preview_label_style() -> Style {
     Style::default().with_fg_ansi(AnsiColor::Grey[14])
 }
 
-fn draw_status_segment(row: &mut Rect, buf: &mut Buffer, style: Style, text: &str) {
+fn draw_status_segment(row: &mut Rect, buf: &mut Buffer, style: Style, text: &str) -> Rect {
     if row.is_empty() {
-        return;
+        return Rect::EMPTY;
     }
     let width = UnicodeWidthStr::width(text).min(u16::MAX as usize) as u16;
-    row.take_left(width as i32)
-        .with(style)
-        .with(Ellipsis(true))
-        .text(buf, text);
+    let area = row.take_left(width as i32);
+    area.with(style).with(Ellipsis(true)).text(buf, text);
+    area
 }
 
 fn draw_status_segment_right(row: &mut Rect, buf: &mut Buffer, style: Style, text: &str) -> Rect {

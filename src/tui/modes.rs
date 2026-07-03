@@ -189,6 +189,113 @@ impl AppMode for ServerListMode {
     }
 }
 
+/// Fuzzy room picker pushed over [`RoomMode`] by `/rooms` or the switcher key.
+pub(crate) struct RoomSwitchMode {
+    select: FuzzySelect,
+    searching: bool,
+    /// Rows rebuilt every render so unread and voice markers stay live; actions
+    /// index into the same list the last `refresh` saw.
+    items: Vec<crate::app::room::RoomSelectItem>,
+}
+
+impl RoomSwitchMode {
+    pub(crate) fn new() -> Self {
+        Self {
+            select: FuzzySelect::default(),
+            searching: false,
+            items: Vec::new(),
+        }
+    }
+
+    fn selected_room(&self) -> Option<rpc::ids::RoomId> {
+        self.select
+            .current_item_index()
+            .and_then(|index| self.items.get(index))
+            .map(|item| item.room_id)
+    }
+
+    fn refresh(&mut self, app: &App) {
+        self.items = app.room_select_items();
+        self.select.refresh(&self.items);
+    }
+
+    pub(crate) fn process_action(&mut self, app: &mut App, command: BindCommand) -> Action {
+        use BindCommand::*;
+        match command {
+            Activate => {
+                let Some(room_id) = self.selected_room() else {
+                    app.set_error("no room selected");
+                    return Action::Continue;
+                };
+                app.set_viewed_room(room_id);
+                app.pop_mode();
+            }
+            SelectNext => {
+                self.select.move_selection(1);
+            }
+            SelectPrev => {
+                self.select.move_selection(-1);
+            }
+            SearchServers => {
+                self.searching = true;
+                self.select.clear_query();
+                self.refresh(app);
+            }
+            Cancel | RoomSwitcher => app.pop_mode(),
+            _ => return app.process_global_command(command),
+        }
+        Action::Continue
+    }
+}
+
+impl AppMode for RoomSwitchMode {
+    fn render(&mut self, app: &mut App, buf: &mut Buffer, _now_ms: u64) {
+        self.refresh(app);
+        let chrome = self.presentation(app).chrome.expect("base mode has chrome");
+        crate::tui::render::draw_room_select_screen(
+            app,
+            &mut self.select,
+            &self.items,
+            self.searching,
+            chrome.theme_mode,
+            chrome.status_label,
+            chrome.layer,
+            buf,
+        );
+    }
+
+    fn process_input(&mut self, app: &mut App, key: KeyEvent) -> Action {
+        if is_quit_key(&key) {
+            return Action::Quit;
+        }
+        if matches!(key.kind, KeyEventKind::Release) {
+            return Action::Continue;
+        }
+        if self.searching {
+            match key.code {
+                extui::event::KeyCode::Esc | extui::event::KeyCode::Enter => {
+                    self.searching = false;
+                }
+                _ if self.select.edit_query(key) => self.refresh(app),
+                _ => {}
+            }
+            return Action::Continue;
+        }
+        match resolve_binding(app, bindings::PICKER_LAYER, key) {
+            BindingResolution::Action(command) => self.process_action(app, command),
+            BindingResolution::Consumed | BindingResolution::Unmatched => Action::Continue,
+        }
+    }
+
+    fn presentation(&self, _app: &App) -> ModePresentation {
+        ModePresentation::full_screen(ChromeSpec {
+            theme_mode: theme::UiMode::ServerSelect,
+            status_label: "Rooms",
+            layer: bindings::PICKER_LAYER,
+        })
+    }
+}
+
 pub(crate) struct ServerEditMode {
     draft: ServerEditDraft,
 }
@@ -489,6 +596,9 @@ pub(crate) struct RoomLayout {
     pub(crate) chat_rect: Rect,
     pub(crate) visible_chat_lines: Vec<VisibleLine>,
     pub(crate) room_rect: Rect,
+    pub(crate) rooms_row_rect: Rect,
+    /// Hit boxes of the room segments drawn in the rooms row.
+    pub(crate) room_hits: Vec<(Rect, rpc::ids::RoomId)>,
     pub(crate) lobby_bar_rect: Rect,
     pub(crate) chat_log_bar_rect: Rect,
     pub(crate) composer_rect: Rect,
@@ -503,6 +613,8 @@ impl Default for RoomLayout {
             chat_rect: Rect::EMPTY,
             visible_chat_lines: Vec::new(),
             room_rect: Rect::EMPTY,
+            rooms_row_rect: Rect::EMPTY,
+            room_hits: Vec::new(),
             lobby_bar_rect: Rect::EMPTY,
             chat_log_bar_rect: Rect::EMPTY,
             composer_rect: Rect::EMPTY,
@@ -514,10 +626,19 @@ impl Default for RoomLayout {
 impl RoomLayout {
     pub(crate) fn clear_workspace(&mut self) {
         self.room_rect = Rect::EMPTY;
+        self.rooms_row_rect = Rect::EMPTY;
+        self.room_hits.clear();
         self.lobby_bar_rect = Rect::EMPTY;
         self.chat_log_bar_rect = Rect::EMPTY;
         self.composer_rect = Rect::EMPTY;
         self.compose_bar_rect = Rect::EMPTY;
+    }
+
+    fn room_hit(&self, column: u16, row: u16) -> Option<rpc::ids::RoomId> {
+        self.room_hits
+            .iter()
+            .find(|(rect, _)| crate::tui::form::rect_contains(*rect, column, row))
+            .map(|(_, room_id)| *room_id)
     }
 
     pub(crate) fn clear_chat(&mut self) {
@@ -645,6 +766,9 @@ impl RoomMode {
             PasteClipboard => {
                 self.paste_from_clipboard(app, &crate::clipboard_paste::HelperClipboard)
             }
+            RoomSwitcher => app.open_room_switcher(),
+            NextRoom => app.cycle_room(1),
+            PrevRoom => app.cycle_room(-1),
             _ => return app.process_global_command(command),
         }
         Action::Continue
@@ -708,6 +832,8 @@ impl RoomMode {
             crate::tui::form::rect_contains(self.layout.chat_log_bar_rect, mouse.column, mouse.row);
         let in_room =
             crate::tui::form::rect_contains(self.layout.room_rect, mouse.column, mouse.row);
+        let in_rooms_row =
+            crate::tui::form::rect_contains(self.layout.rooms_row_rect, mouse.column, mouse.row);
         let in_lobby_bar =
             crate::tui::form::rect_contains(self.layout.lobby_bar_rect, mouse.column, mouse.row);
         let in_composer =
@@ -734,6 +860,13 @@ impl RoomMode {
             extui::event::MouseEventKind::Down(extui::event::MouseButton::Left) if in_lobby_bar => {
                 self.set_focus(app, ChatPanelFocus::Lobby);
             }
+            extui::event::MouseEventKind::Down(extui::event::MouseButton::Left) if in_rooms_row => {
+                if let Some(room_id) = self.layout.room_hit(mouse.column, mouse.row) {
+                    app.set_viewed_room(room_id);
+                }
+            }
+            extui::event::MouseEventKind::ScrollUp if in_rooms_row => app.cycle_room(-1),
+            extui::event::MouseEventKind::ScrollDown if in_rooms_row => app.cycle_room(1),
             extui::event::MouseEventKind::ScrollUp if in_room => {
                 self.move_room_selection_with_focus(app, -1);
             }
@@ -850,10 +983,25 @@ impl RoomMode {
             crate::app::room::RefJump::NotFound => {
                 app.set_status("referenced message is not in this room's history");
             }
-            crate::app::room::RefJump::OtherRoom => match app.room.cross_room_ref_preview(target) {
-                Some(preview) => app.set_status(preview),
-                None => app.set_status("reference points to another room"),
-            },
+            crate::app::room::RefJump::OtherRoom => {
+                if app.set_viewed_room(target.room_id) {
+                    match app.room.jump_to_ref(
+                        target,
+                        self.layout.chat_width,
+                        self.layout.chat_height,
+                    ) {
+                        crate::app::room::RefJump::Jumped => {
+                            self.set_focus(app, ChatPanelFocus::ChatLog)
+                        }
+                        _ => app.set_status("referenced message is not in this room's history"),
+                    }
+                    return;
+                }
+                match app.room.cross_room_ref_preview(target) {
+                    Some(preview) => app.set_status(preview),
+                    None => app.set_status("reference points to another room"),
+                }
+            }
         }
     }
 
@@ -1027,7 +1175,10 @@ impl RoomMode {
     }
 
     fn keep_selected_room_user_visible(&mut self, app: &mut App) {
-        let visible_rows = self.layout.room_rect.h.max(app.config.ui.room_height) as usize;
+        // Before the first render the participant rect is empty; fall back to
+        // the configured panel height minus the rooms row it will contain.
+        let fallback = app.config.ui.room_height.saturating_sub(1).max(1);
+        let visible_rows = self.layout.room_rect.h.max(fallback) as usize;
         app.room.keep_selected_participant_visible(visible_rows);
     }
 }
@@ -1188,20 +1339,54 @@ mod tests {
         if app.room.viewed_room.is_some() {
             return;
         }
-        app.room.authenticated(
-            &[rpc::control::RoomInfo {
-                room_id: RoomId(1),
-                name: "lobby".to_string(),
+        enter_rooms(app, &[1]);
+    }
+
+    /// Registers public rooms named `room-<id>`, viewing the first.
+    fn enter_rooms(app: &mut App, ids: &[u32]) {
+        let rooms: Vec<rpc::control::RoomInfo> = ids
+            .iter()
+            .map(|id| rpc::control::RoomInfo {
+                room_id: RoomId(*id),
+                name: if *id == 1 {
+                    "lobby".to_string()
+                } else {
+                    format!("room-{id}")
+                },
                 participants: 0,
                 kind: rpc::control::RoomKind::Public,
                 head: None,
                 voice_users: Vec::new(),
-            }],
-            Vec::new(),
-            RoomId(1),
-            None,
-            None,
-        );
+            })
+            .collect();
+        app.room
+            .authenticated(&rooms, Vec::new(), RoomId(ids[0]), None, None);
+    }
+
+    #[test]
+    fn room_switcher_query_filters_and_enter_switches_view() {
+        let mut app = test_app();
+        enter_rooms(&mut app, &[1, 2, 3]);
+        assert_eq!(app.room.viewed_room, Some(RoomId(1)));
+
+        let mut switcher = RoomSwitchMode::new();
+        switcher.select.set_query("room-2");
+        switcher.refresh(&app);
+        assert_eq!(switcher.select.filtered_len(), 1);
+        assert_eq!(switcher.selected_room(), Some(RoomId(2)));
+
+        switcher.process_action(&mut app, BindCommand::Activate);
+        assert_eq!(app.room.viewed_room, Some(RoomId(2)));
+    }
+
+    #[test]
+    fn room_switcher_lists_every_room_without_a_query() {
+        let mut app = test_app();
+        enter_rooms(&mut app, &[1, 2, 3]);
+
+        let mut switcher = RoomSwitchMode::new();
+        switcher.refresh(&app);
+        assert_eq!(switcher.select.filtered_len(), 3);
     }
 
     fn push_room_message(
