@@ -3,3 +3,4 @@
 /assets/sample-001.opus
 /docs/smooth-adaptive-catch-up.md
 .rgignore
+/dev/private-server-data

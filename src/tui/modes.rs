@@ -26,6 +26,13 @@ pub(crate) enum Action {
     Quit,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum LobbyListFocus {
+    Rooms,
+    #[default]
+    Users,
+}
+
 #[derive(Debug)]
 enum BindingResolution {
     Action(BindCommand),
@@ -591,18 +598,19 @@ impl AppMode for SettingsMode {
 
 #[derive(Debug)]
 pub(crate) struct RoomLayout {
-    pub(crate) chat_width: u16,
-    pub(crate) chat_height: u16,
-    pub(crate) chat_rect: Rect,
-    pub(crate) visible_chat_lines: Vec<VisibleLine>,
-    pub(crate) room_rect: Rect,
-    pub(crate) rooms_row_rect: Rect,
-    /// Hit boxes of the room segments drawn in the rooms row.
-    pub(crate) room_hits: Vec<(Rect, rpc::ids::RoomId)>,
-    pub(crate) lobby_bar_rect: Rect,
-    pub(crate) chat_log_bar_rect: Rect,
-    pub(crate) composer_rect: Rect,
-    pub(crate) compose_bar_rect: Rect,
+    pub chat_width: u16,
+    pub chat_height: u16,
+    pub chat_rect: Rect,
+    pub visible_chat_lines: Vec<VisibleLine>,
+    pub room_list_rect: Rect,
+    pub lobby_divider_rect: Rect,
+    pub user_list_rect: Rect,
+    /// Hit boxes of the room rows drawn in the room list.
+    pub room_hits: Vec<(Rect, rpc::ids::RoomId)>,
+    pub lobby_bar_rect: Rect,
+    pub chat_log_bar_rect: Rect,
+    pub composer_rect: Rect,
+    pub compose_bar_rect: Rect,
 }
 
 impl Default for RoomLayout {
@@ -612,8 +620,9 @@ impl Default for RoomLayout {
             chat_height: 0,
             chat_rect: Rect::EMPTY,
             visible_chat_lines: Vec::new(),
-            room_rect: Rect::EMPTY,
-            rooms_row_rect: Rect::EMPTY,
+            room_list_rect: Rect::EMPTY,
+            lobby_divider_rect: Rect::EMPTY,
+            user_list_rect: Rect::EMPTY,
             room_hits: Vec::new(),
             lobby_bar_rect: Rect::EMPTY,
             chat_log_bar_rect: Rect::EMPTY,
@@ -625,8 +634,9 @@ impl Default for RoomLayout {
 
 impl RoomLayout {
     pub(crate) fn clear_workspace(&mut self) {
-        self.room_rect = Rect::EMPTY;
-        self.rooms_row_rect = Rect::EMPTY;
+        self.room_list_rect = Rect::EMPTY;
+        self.lobby_divider_rect = Rect::EMPTY;
+        self.user_list_rect = Rect::EMPTY;
         self.room_hits.clear();
         self.lobby_bar_rect = Rect::EMPTY;
         self.chat_log_bar_rect = Rect::EMPTY;
@@ -656,6 +666,7 @@ impl RoomLayout {
 #[derive(Debug)]
 pub(crate) struct RoomMode {
     focus: ChatPanelFocus,
+    lobby_list_focus: LobbyListFocus,
     layout: RoomLayout,
 }
 
@@ -669,6 +680,7 @@ impl RoomMode {
     pub(crate) fn new() -> Self {
         Self {
             focus: ChatPanelFocus::Compose,
+            lobby_list_focus: LobbyListFocus::Users,
             layout: RoomLayout::default(),
         }
     }
@@ -677,6 +689,7 @@ impl RoomMode {
     pub(crate) fn with_focus(focus: ChatPanelFocus) -> Self {
         Self {
             focus,
+            lobby_list_focus: LobbyListFocus::Users,
             layout: RoomLayout::default(),
         }
     }
@@ -687,6 +700,11 @@ impl RoomMode {
     }
 
     #[cfg(test)]
+    pub(crate) fn lobby_list_focus(&self) -> LobbyListFocus {
+        self.lobby_list_focus
+    }
+
+    #[cfg(test)]
     pub(crate) fn layout(&self) -> &RoomLayout {
         &self.layout
     }
@@ -694,7 +712,10 @@ impl RoomMode {
     pub(crate) fn set_focus(&mut self, app: &mut App, focus: ChatPanelFocus) {
         self.focus = focus;
         match focus {
-            ChatPanelFocus::Lobby => self.keep_selected_room_user_visible(app),
+            ChatPanelFocus::Lobby if self.lobby_list_focus == LobbyListFocus::Users => {
+                self.keep_selected_room_user_visible(app);
+            }
+            ChatPanelFocus::Lobby => {}
             ChatPanelFocus::ChatLog => {
                 app.room
                     .active
@@ -714,6 +735,11 @@ impl RoomMode {
         self.set_focus(app, self.focus.moved(delta));
     }
 
+    fn set_lobby_list_focus(&mut self, app: &mut App, focus: LobbyListFocus) {
+        self.lobby_list_focus = focus;
+        self.set_focus(app, ChatPanelFocus::Lobby);
+    }
+
     fn process_action(&mut self, app: &mut App, command: BindCommand) -> Action {
         use BindCommand::*;
         match command {
@@ -728,20 +754,24 @@ impl RoomMode {
             }
             ScrollUp => self.scroll_focused_panel(app, -1),
             ScrollDown => self.scroll_focused_panel(app, 1),
-            RoomScrollUp => self.move_room_selection_with_focus(app, -1),
-            RoomScrollDown => self.move_room_selection_with_focus(app, 1),
+            RoomScrollUp => self.move_user_selection_with_focus(app, -1),
+            RoomScrollDown => self.move_user_selection_with_focus(app, 1),
             OpenSelectedUserVolume => {
-                if self.focus == ChatPanelFocus::Lobby {
+                if self.focus != ChatPanelFocus::Lobby {
+                    app.set_status("focus lobby to adjust users");
+                } else if self.lobby_list_focus == LobbyListFocus::Users {
                     app.open_selected_user_volume();
                 } else {
-                    app.set_status("focus lobby to adjust users");
+                    app.set_status("focus users list to adjust volume");
                 }
             }
             ToggleSelectedUserMute => {
-                if self.focus == ChatPanelFocus::Lobby {
+                if self.focus != ChatPanelFocus::Lobby {
+                    app.set_status("focus lobby to mute users");
+                } else if self.lobby_list_focus == LobbyListFocus::Users {
                     app.toggle_selected_user_mute();
                 } else {
-                    app.set_status("focus lobby to mute users");
+                    app.set_status("focus users list to mute users");
                 }
             }
             HalfPageUp => {
@@ -759,11 +789,13 @@ impl RoomMode {
             ToggleExpand => self.toggle_chat_expand_if_focused(app),
             FocusNext => self.move_focus(app, 1),
             FocusPrev => self.move_focus(app, -1),
-            SelectNext if self.focus == ChatPanelFocus::Lobby => {
-                self.move_room_selection_with_focus(app, 1);
+            SelectNext if self.focus == ChatPanelFocus::Lobby => self.scroll_focused_panel(app, 1),
+            SelectPrev if self.focus == ChatPanelFocus::Lobby => self.scroll_focused_panel(app, -1),
+            AdjustLeft if self.focus == ChatPanelFocus::Lobby => {
+                self.set_lobby_list_focus(app, LobbyListFocus::Rooms);
             }
-            SelectPrev if self.focus == ChatPanelFocus::Lobby => {
-                self.move_room_selection_with_focus(app, -1);
+            AdjustRight if self.focus == ChatPanelFocus::Lobby => {
+                self.set_lobby_list_focus(app, LobbyListFocus::Users);
             }
             ClearChat if self.focus == ChatPanelFocus::ChatLog => app.room.clear_chat(),
             PasteClipboard => {
@@ -833,10 +865,10 @@ impl RoomMode {
         let in_chat = crate::tui::form::rect_contains(rect, mouse.column, mouse.row);
         let in_chat_bar =
             crate::tui::form::rect_contains(self.layout.chat_log_bar_rect, mouse.column, mouse.row);
-        let in_room =
-            crate::tui::form::rect_contains(self.layout.room_rect, mouse.column, mouse.row);
-        let in_rooms_row =
-            crate::tui::form::rect_contains(self.layout.rooms_row_rect, mouse.column, mouse.row);
+        let in_room_list =
+            crate::tui::form::rect_contains(self.layout.room_list_rect, mouse.column, mouse.row);
+        let in_user_list =
+            crate::tui::form::rect_contains(self.layout.user_list_rect, mouse.column, mouse.row);
         let in_lobby_bar =
             crate::tui::form::rect_contains(self.layout.lobby_bar_rect, mouse.column, mouse.row);
         let in_composer =
@@ -863,22 +895,29 @@ impl RoomMode {
             extui::event::MouseEventKind::Down(extui::event::MouseButton::Left) if in_lobby_bar => {
                 self.set_focus(app, ChatPanelFocus::Lobby);
             }
-            extui::event::MouseEventKind::Down(extui::event::MouseButton::Left) if in_rooms_row => {
+            extui::event::MouseEventKind::Down(extui::event::MouseButton::Left) if in_room_list => {
+                self.set_lobby_list_focus(app, LobbyListFocus::Rooms);
                 if let Some(room_id) = self.layout.room_hit(mouse.column, mouse.row) {
                     app.set_viewed_room(room_id);
                 }
             }
-            extui::event::MouseEventKind::ScrollUp if in_rooms_row => app.cycle_room(-1),
-            extui::event::MouseEventKind::ScrollDown if in_rooms_row => app.cycle_room(1),
-            extui::event::MouseEventKind::ScrollUp if in_room => {
-                self.move_room_selection_with_focus(app, -1);
+            extui::event::MouseEventKind::ScrollUp if in_room_list => {
+                self.set_lobby_list_focus(app, LobbyListFocus::Rooms);
+                app.cycle_room(-1);
             }
-            extui::event::MouseEventKind::ScrollDown if in_room => {
-                self.move_room_selection_with_focus(app, 1);
+            extui::event::MouseEventKind::ScrollDown if in_room_list => {
+                self.set_lobby_list_focus(app, LobbyListFocus::Rooms);
+                app.cycle_room(1);
             }
-            extui::event::MouseEventKind::Down(extui::event::MouseButton::Left) if in_room => {
-                self.set_focus(app, ChatPanelFocus::Lobby);
-                let row = mouse.row.saturating_sub(self.layout.room_rect.y) as usize;
+            extui::event::MouseEventKind::ScrollUp if in_user_list => {
+                self.move_user_selection_with_focus(app, -1);
+            }
+            extui::event::MouseEventKind::ScrollDown if in_user_list => {
+                self.move_user_selection_with_focus(app, 1);
+            }
+            extui::event::MouseEventKind::Down(extui::event::MouseButton::Left) if in_user_list => {
+                self.set_lobby_list_focus(app, LobbyListFocus::Users);
+                let row = mouse.row.saturating_sub(self.layout.user_list_rect.y) as usize;
                 if app.room.select_visible_participant(row).is_some() {
                     self.keep_selected_room_user_visible(app);
                 }
@@ -1144,7 +1183,10 @@ impl RoomMode {
     fn scroll_focused_panel(&mut self, app: &mut App, direction: isize) {
         match self.focus {
             ChatPanelFocus::ChatLog => self.move_chat_log_selection(app, direction),
-            ChatPanelFocus::Lobby => self.move_room_selection_with_focus(app, direction),
+            ChatPanelFocus::Lobby => match self.lobby_list_focus {
+                LobbyListFocus::Rooms => self.move_room_view_with_focus(app, direction),
+                LobbyListFocus::Users => self.move_user_selection_with_focus(app, direction),
+            },
             ChatPanelFocus::Compose => {}
         }
     }
@@ -1183,25 +1225,33 @@ impl RoomMode {
             .keep_selected_header_visible(self.layout.chat_width, self.layout.chat_height);
     }
 
-    fn move_room_selection_with_focus(&mut self, app: &mut App, delta: isize) {
+    fn move_room_view_with_focus(&mut self, app: &mut App, delta: isize) {
+        self.lobby_list_focus = LobbyListFocus::Rooms;
         self.set_focus(app, ChatPanelFocus::Lobby);
-        self.move_room_selection(app, delta);
+        app.cycle_room(delta);
     }
 
-    fn move_room_selection(&mut self, app: &mut App, delta: isize) {
+    fn move_user_selection_with_focus(&mut self, app: &mut App, delta: isize) {
+        self.lobby_list_focus = LobbyListFocus::Users;
+        self.set_focus(app, ChatPanelFocus::Lobby);
+        self.move_user_selection(app, delta);
+    }
+
+    fn move_user_selection(&mut self, app: &mut App, delta: isize) {
         if app.room.move_participant_selection(delta).is_none() {
             app.set_status("no users in the current room yet");
             return;
         }
         self.keep_selected_room_user_visible(app);
         self.focus = ChatPanelFocus::Lobby;
+        self.lobby_list_focus = LobbyListFocus::Users;
     }
 
     fn keep_selected_room_user_visible(&mut self, app: &mut App) {
         // Before the first render the participant rect is empty; fall back to
-        // the configured panel height minus the rooms row it will contain.
-        let fallback = app.config.ui.room_height.saturating_sub(1).max(1);
-        let visible_rows = self.layout.room_rect.h.max(fallback) as usize;
+        // the configured lobby height.
+        let fallback = app.config.ui.room_height.max(1);
+        let visible_rows = self.layout.user_list_rect.h.max(fallback) as usize;
         app.room.keep_selected_participant_visible(visible_rows);
     }
 }
@@ -1212,6 +1262,7 @@ impl AppMode for RoomMode {
         crate::tui::render::draw_room_screen(
             app,
             self.focus,
+            self.lobby_list_focus,
             &mut self.layout,
             chrome.theme_mode,
             chrome.status_label,
@@ -1269,8 +1320,10 @@ impl AppMode for RoomMode {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::Ordering;
+
     use extui::{
-        Buffer,
+        Buffer, Style,
         event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind},
     };
     use extui_editor::Mode as EditorMode;
@@ -1356,6 +1409,21 @@ mod tests {
 
     fn render_room(app: &mut App, room: &mut RoomMode, buffer: &mut Buffer) {
         room.render(app, buffer, 0);
+    }
+
+    fn cell_style(buffer: &mut Buffer, column: u16, row: u16) -> Style {
+        let grid = buffer.current();
+        grid.cells()[(row as usize * grid.width() as usize) + column as usize].style()
+    }
+
+    fn cell_text(buffer: &mut Buffer, column: u16, row: u16) -> String {
+        let grid = buffer.current();
+        let cell = grid.cells()[(row as usize * grid.width() as usize) + column as usize];
+        if cell.is_handle() {
+            String::from_utf8_lossy(grid.handle_text(cell).unwrap_or_default()).to_string()
+        } else {
+            cell.text_inline().unwrap_or_default().to_string()
+        }
     }
 
     fn enter_room_one(app: &mut App) {
@@ -1886,8 +1954,8 @@ mod tests {
 
         let mut buffer = Buffer::new(80, 24);
         render_room(&mut app, &mut room, &mut buffer);
-        let column = room.layout().room_rect.x + 1;
-        let row = room.layout().room_rect.y;
+        let column = room.layout().user_list_rect.x + 1;
+        let row = room.layout().user_list_rect.y;
         room.process_mouse(
             &mut app,
             MouseEvent {
@@ -1899,7 +1967,203 @@ mod tests {
         );
 
         assert_eq!(room.focus(), ChatPanelFocus::Lobby);
+        assert_eq!(room.lobby_list_focus(), LobbyListFocus::Users);
         assert_eq!(app.room.participants.selected_user, Some(UserId(1)));
+    }
+
+    #[test]
+    fn lobby_layout_splits_rooms_and_users_full_height() {
+        let mut app = test_app();
+        app.config.ui.room_height = 4;
+        enter_rooms(&mut app, &[1, 2, 3]);
+        let mut room = RoomMode::with_focus(ChatPanelFocus::Lobby);
+        let mut buffer = Buffer::new(90, 24);
+
+        render_room(&mut app, &mut room, &mut buffer);
+        let layout = room.layout();
+
+        assert_eq!(
+            layout.room_list_rect,
+            Rect {
+                x: 0,
+                y: 1,
+                w: 30,
+                h: 4,
+            }
+        );
+        assert_eq!(
+            layout.lobby_divider_rect,
+            Rect {
+                x: 30,
+                y: 1,
+                w: 1,
+                h: 4,
+            }
+        );
+        assert_eq!(
+            layout.user_list_rect,
+            Rect {
+                x: 31,
+                y: 1,
+                w: 59,
+                h: 4,
+            }
+        );
+        assert_eq!(layout.lobby_bar_rect.y, 5);
+        assert_eq!(
+            cell_text(
+                &mut buffer,
+                layout.room_list_rect.x + 1,
+                layout.lobby_bar_rect.y
+            ),
+            "R",
+        );
+        assert_eq!(
+            cell_text(
+                &mut buffer,
+                layout.user_list_rect.x + 1,
+                layout.lobby_bar_rect.y
+            ),
+            "L",
+        );
+        assert_eq!(layout.room_hits.len(), 3);
+        assert!(
+            layout
+                .room_hits
+                .iter()
+                .all(|(rect, _)| rect.x == 0 && rect.w == layout.room_list_rect.w && rect.h == 1)
+        );
+        assert_eq!(
+            cell_style(
+                &mut buffer,
+                layout.lobby_divider_rect.x,
+                layout.lobby_divider_rect.y
+            ),
+            app.theme.status_fill,
+        );
+    }
+
+    #[test]
+    fn lobby_room_column_caps_and_narrow_layout_omits_divider() {
+        let mut app = test_app();
+        app.config.ui.room_height = 3;
+        enter_rooms(&mut app, &[1, 2]);
+        let mut room = RoomMode::with_focus(ChatPanelFocus::Lobby);
+        let mut wide = Buffer::new(180, 18);
+
+        render_room(&mut app, &mut room, &mut wide);
+        assert_eq!(room.layout().room_list_rect.w, 50);
+        assert_eq!(room.layout().lobby_divider_rect.w, 1);
+        assert_eq!(room.layout().user_list_rect.w, 129);
+
+        let mut narrow = Buffer::new(2, 12);
+        render_room(&mut app, &mut room, &mut narrow);
+        assert_eq!(room.layout().room_list_rect.w, 1);
+        assert_eq!(room.layout().lobby_divider_rect, Rect::EMPTY);
+        assert_eq!(room.layout().user_list_rect.w, 1);
+    }
+
+    #[test]
+    fn lobby_h_l_switch_subfocus_and_jk_route_to_active_list() {
+        let mut app = test_app();
+        enter_rooms(&mut app, &[1, 2, 3]);
+        let mut room = RoomMode::with_focus(ChatPanelFocus::Lobby);
+
+        assert_eq!(room.lobby_list_focus(), LobbyListFocus::Users);
+
+        room.process_input(&mut app, key('h'));
+        assert_eq!(room.focus(), ChatPanelFocus::Lobby);
+        assert_eq!(room.lobby_list_focus(), LobbyListFocus::Rooms);
+        assert_eq!(app.room.viewed_room, Some(RoomId(1)));
+
+        room.process_input(&mut app, key('j'));
+        assert_eq!(room.lobby_list_focus(), LobbyListFocus::Rooms);
+        assert_eq!(app.room.viewed_room, Some(RoomId(2)));
+
+        room.process_input(&mut app, key('k'));
+        assert_eq!(app.room.viewed_room, Some(RoomId(1)));
+
+        room.process_input(&mut app, key('l'));
+        assert_eq!(room.lobby_list_focus(), LobbyListFocus::Users);
+        room.process_input(&mut app, key('j'));
+        assert_eq!(app.room.viewed_room, Some(RoomId(1)));
+        assert_eq!(app.status.text(), "no users in the current room yet");
+    }
+
+    #[test]
+    fn workspace_deafen_uses_ctrl_h_after_h_moves_to_rooms() {
+        let mut app = test_app();
+        let mut room = RoomMode::with_focus(ChatPanelFocus::Lobby);
+
+        room.process_input(&mut app, key('h'));
+        assert_eq!(room.lobby_list_focus(), LobbyListFocus::Rooms);
+        assert!(!app.deafened.load(Ordering::Relaxed));
+
+        room.process_input(&mut app, ctrl('h'));
+        assert!(app.deafened.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn user_actions_require_users_list_subfocus() {
+        let mut app = test_app();
+        let mut room = RoomMode::with_focus(ChatPanelFocus::Lobby);
+        room.process_input(&mut app, key('h'));
+
+        room.process_input(
+            &mut app,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
+        );
+
+        assert_eq!(app.status.text(), "focus users list to adjust volume");
+    }
+
+    #[test]
+    fn mouse_down_on_room_list_full_row_focuses_rooms_and_switches_view() {
+        let mut app = test_app();
+        enter_rooms(&mut app, &[1, 2, 3]);
+        let mut room = RoomMode::default();
+        let mut buffer = Buffer::new(80, 24);
+        render_room(&mut app, &mut room, &mut buffer);
+
+        let (rect, room_id) = room.layout().room_hits[1];
+        room.process_mouse(
+            &mut app,
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: rect.x + rect.w - 1,
+                row: rect.y,
+                modifiers: KeyModifiers::empty(),
+            },
+        );
+
+        assert_eq!(room_id, RoomId(2));
+        assert_eq!(room.focus(), ChatPanelFocus::Lobby);
+        assert_eq!(room.lobby_list_focus(), LobbyListFocus::Rooms);
+        assert_eq!(app.room.viewed_room, Some(RoomId(2)));
+    }
+
+    #[test]
+    fn mouse_wheel_on_room_list_cycles_rooms() {
+        let mut app = test_app();
+        enter_rooms(&mut app, &[1, 2, 3]);
+        let mut room = RoomMode::default();
+        let mut buffer = Buffer::new(80, 24);
+        render_room(&mut app, &mut room, &mut buffer);
+
+        let rect = room.layout().room_list_rect;
+        room.process_mouse(
+            &mut app,
+            MouseEvent {
+                kind: MouseEventKind::ScrollDown,
+                column: rect.x,
+                row: rect.y,
+                modifiers: KeyModifiers::empty(),
+            },
+        );
+
+        assert_eq!(room.focus(), ChatPanelFocus::Lobby);
+        assert_eq!(room.lobby_list_focus(), LobbyListFocus::Rooms);
+        assert_eq!(app.room.viewed_room, Some(RoomId(2)));
     }
 
     #[test]

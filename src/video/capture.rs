@@ -318,8 +318,14 @@ fn read_loop(
 /// zero byte), then routes everything to the NUT demuxer or the Annex-B
 /// splitter.
 enum Ingest {
-    Probing { codec: Codec, buffered: Vec<u8> },
-    Nut { demuxer: NutDemuxer, frames: Vec<CapturedFrame> },
+    Probing {
+        codec: Codec,
+        buffered: Vec<u8>,
+    },
+    Nut {
+        demuxer: NutDemuxer,
+        frames: Vec<CapturedFrame>,
+    },
     AnnexB(Splitter),
 }
 
@@ -331,11 +337,7 @@ impl Ingest {
         }
     }
 
-    fn push(
-        &mut self,
-        bytes: &[u8],
-        frame_tx: &Sender<CapturedFrame>,
-    ) -> Result<(), IngestError> {
+    fn push(&mut self, bytes: &[u8], frame_tx: &Sender<CapturedFrame>) -> Result<(), IngestError> {
         if let Ingest::Probing { codec, buffered } = self {
             buffered.extend_from_slice(bytes);
             if buffered.len() < NUT_MAGIC.len() && NUT_MAGIC.starts_with(buffered) {
@@ -356,11 +358,7 @@ impl Ingest {
         self.feed(bytes, frame_tx)
     }
 
-    fn feed(
-        &mut self,
-        bytes: &[u8],
-        frame_tx: &Sender<CapturedFrame>,
-    ) -> Result<(), IngestError> {
+    fn feed(&mut self, bytes: &[u8], frame_tx: &Sender<CapturedFrame>) -> Result<(), IngestError> {
         match self {
             Ingest::Probing { .. } => unreachable!("push resolves probing before feeding"),
             Ingest::AnnexB(splitter) => splitter.push(bytes, frame_tx),
@@ -472,11 +470,7 @@ impl Splitter {
         }
     }
 
-    fn push(
-        &mut self,
-        bytes: &[u8],
-        frame_tx: &Sender<CapturedFrame>,
-    ) -> Result<(), IngestError> {
+    fn push(&mut self, bytes: &[u8], frame_tx: &Sender<CapturedFrame>) -> Result<(), IngestError> {
         self.buf.extend_from_slice(bytes);
         let codes = start_code_offsets(&self.buf);
         if codes.len() < 2 {

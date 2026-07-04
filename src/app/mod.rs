@@ -1462,8 +1462,8 @@ impl App {
         }
     }
 
-    /// The switcher and rooms-strip rows for the current catalog, voice, and
-    /// view state.
+    /// The switcher and lobby room-list rows for the current catalog, voice,
+    /// and view state.
     pub(crate) fn room_select_items(&self) -> Vec<room::RoomSelectItem> {
         self.room.room_select_items(self.voice_room)
     }
