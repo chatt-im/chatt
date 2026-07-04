@@ -1,7 +1,8 @@
 use std::hash::BuildHasher;
 
-use extui::{Buffer, Rect};
+use extui::{Buffer, Ellipsis, Rect};
 use foldhash::fast;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::{
     config::FormBindings,
@@ -13,6 +14,9 @@ use crate::{
 };
 
 const DEFAULT_LABEL_WIDTH: u16 = 18;
+pub(crate) const DEFAULT_DETAIL_WIDTH: u16 = 34;
+pub(crate) const DEFAULT_DETAIL_PADDING: u16 = 1;
+pub(crate) const DEFAULT_DETAIL_MIN_WIDTH: u16 = 96;
 
 /// Stable per-field identity for immediate-mode forms. Derived from the
 /// enclosing section salt plus the row label, so focus survives conditional
@@ -71,28 +75,6 @@ pub(crate) struct ActionButton<'a, T> {
     pub(crate) primary: bool,
 }
 
-impl<'a, T> ActionButton<'a, T> {
-    pub(crate) const fn new(label: &'a str, value: T) -> Self {
-        Self {
-            key: label,
-            label,
-            value,
-            help: "",
-            primary: false,
-        }
-    }
-
-    pub(crate) const fn primary(label: &'a str, value: T) -> Self {
-        Self {
-            key: label,
-            label,
-            value,
-            help: "",
-            primary: true,
-        }
-    }
-}
-
 pub(crate) struct ActionResponse<T> {
     pub(crate) focused: Option<T>,
     pub(crate) activated: Option<T>,
@@ -110,6 +92,116 @@ pub(crate) type Commit = (FieldId, String);
 
 pub(crate) fn state_with_focus(bindings: FormBindings, section: &str, label: &str) -> State {
     FormState::new(FieldId::new(section, label), bindings)
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct FormDetail {
+    current: String,
+    error: Option<String>,
+    help: &'static str,
+}
+
+/// Thin detail-tracking wrapper for settings-style forms. The inner form still
+/// owns focus, input, and rendering; this wrapper records what the focused row
+/// should show in the side detail panel.
+pub(crate) struct DetailForm<'a> {
+    form: Form<'a>,
+    detail: Option<FormDetail>,
+}
+
+impl<'a> DetailForm<'a> {
+    pub(crate) fn new(form: Form<'a>) -> Self {
+        Self { form, detail: None }
+    }
+
+    pub(crate) fn detail(&self) -> Option<&FormDetail> {
+        self.detail.as_ref()
+    }
+
+    pub(crate) fn set_help(&mut self, help: &'static str) {
+        if let Some(detail) = &mut self.detail {
+            detail.help = help;
+        }
+    }
+
+    pub(crate) fn section(&mut self, title: &str) {
+        self.form.section(title);
+    }
+
+    pub(crate) fn section_with_id(&mut self, title: &str, id_title: &str) {
+        self.form.section_with_id(title, id_title);
+    }
+
+    pub(crate) fn spacer(&mut self, height: u16) {
+        self.form.spacer(height);
+    }
+
+    pub(crate) fn static_row(&mut self, label: &str, value: &str) {
+        self.form.static_row(label, value);
+    }
+
+    pub(crate) fn choice_value<T: Copy + PartialEq>(
+        &mut self,
+        label: &str,
+        value: &mut T,
+        options: &[T],
+        fmt: impl Fn(T) -> String,
+    ) -> Response {
+        let response = self.form.choice_value(label, value, options, &fmt);
+        if response.is_focus() {
+            self.set_option_detail(fmt(*value), None);
+        }
+        response
+    }
+
+    pub(crate) fn text(
+        &mut self,
+        label: &str,
+        value: &mut String,
+        validate: impl Fn(&str) -> Option<String>,
+    ) -> Response {
+        self.text_with_placeholder(label, value, None, validate)
+    }
+
+    pub(crate) fn text_with_placeholder(
+        &mut self,
+        label: &str,
+        value: &mut String,
+        placeholder: Option<&str>,
+        validate: impl Fn(&str) -> Option<String>,
+    ) -> Response {
+        let response = self
+            .form
+            .text_with_placeholder(label, value, placeholder, &validate);
+        if response.is_focus() {
+            let current = if value.is_empty() {
+                placeholder.unwrap_or_default().to_string()
+            } else {
+                value.clone()
+            };
+            self.set_option_detail(current, validate(value));
+        }
+        response
+    }
+
+    pub(crate) fn actions<T: Copy>(&mut self, specs: &[ActionButton<'_, T>]) -> ActionResponse<T> {
+        let response = self.form.actions(specs);
+        if response.focused.is_some() {
+            self.set_option_detail(String::new(), None);
+            if let Some(help) = response.help {
+                self.set_help(help);
+            }
+        }
+        response
+    }
+
+    fn set_option_detail(&mut self, current: String, error: Option<String>) {
+        self.detail = Some(FormDetail {
+            current,
+            error,
+            help: "",
+        });
+    }
 }
 
 /// Immediate-mode form context. Each widget call lays out one row, optionally
@@ -366,6 +458,19 @@ impl<'a> Form<'a> {
         value: &mut String,
         validate: impl Fn(&str) -> Option<String>,
     ) -> Response {
+        self.text_with_placeholder(label, value, None, validate)
+    }
+
+    /// Text field with display-only placeholder text when `value` is empty.
+    /// The placeholder is never committed into `value`; empty still saves as
+    /// empty and keeps the caller's inherit/default semantics.
+    pub(crate) fn text_with_placeholder(
+        &mut self,
+        label: &str,
+        value: &mut String,
+        placeholder: Option<&str>,
+        validate: impl Fn(&str) -> Option<String>,
+    ) -> Response {
         if !self.enabled {
             return self.disabled_row(label, value.clone());
         }
@@ -388,7 +493,15 @@ impl<'a> Form<'a> {
             self.seed_editor(id, value, area);
         }
         let error = validate(value);
-        self.render_text_row(id, label, value, focused, error.is_some(), area);
+        self.render_text_row(
+            id,
+            label,
+            value,
+            placeholder,
+            focused,
+            error.is_some(),
+            area,
+        );
         self.respond(focused, changed)
     }
 
@@ -485,6 +598,7 @@ impl<'a> Form<'a> {
         id: FieldId,
         label: &str,
         value: &str,
+        placeholder: Option<&str>,
         focused: bool,
         error: bool,
         area: Option<Rect>,
@@ -494,7 +608,14 @@ impl<'a> Form<'a> {
         };
         if !focused {
             if let Some(buf) = self.buf.as_deref_mut() {
-                let shown = if value.is_empty() && label == "Device" {
+                let mut placeholder_visible = false;
+                let shown = if value.is_empty()
+                    && let Some(placeholder) = placeholder
+                    && !placeholder.is_empty()
+                {
+                    placeholder_visible = true;
+                    placeholder
+                } else if value.is_empty() && label == "Device" {
                     "system default"
                 } else {
                     value
@@ -507,6 +628,7 @@ impl<'a> Form<'a> {
                     self.label_width,
                     label,
                     shown,
+                    placeholder_visible,
                     false,
                     self.dirty,
                     error,
@@ -527,7 +649,16 @@ impl<'a> Form<'a> {
                 true,
                 error,
             );
+            let placeholder = placeholder
+                .filter(|placeholder| !placeholder.is_empty())
+                .filter(|_| self.state.text().is_empty());
             self.state.render_editor(input, buf, self.theme);
+            if let Some(placeholder) = placeholder {
+                input
+                    .with(self.theme.join_input_active.patch(self.theme.muted))
+                    .with(Ellipsis(true))
+                    .text(buf, placeholder);
+            }
         }
     }
 
@@ -621,19 +752,24 @@ fn draw_value_row(
     label_width: u16,
     label: &str,
     value: &str,
+    placeholder: bool,
     focused: bool,
     dirty: bool,
     error: bool,
 ) {
+    let mut palette = row_palette(theme, surface);
+    if placeholder {
+        palette.value = theme.muted;
+    }
     widgets::draw_labeled_value_with(
         area,
         buf,
-        row_palette(theme, surface),
+        palette,
         label_width,
         label,
         value,
         focused,
-        dirty,
+        dirty && !placeholder,
         error,
     );
 }
@@ -670,6 +806,79 @@ fn row_palette(theme: &Theme, surface: FormSurface) -> RowPalette {
     }
 }
 
+pub(crate) fn take_detail_area(
+    body: &mut Rect,
+    buf: &mut Buffer,
+    theme: &Theme,
+    surface: FormSurface,
+) -> Option<Rect> {
+    if body.w < DEFAULT_DETAIL_MIN_WIDTH {
+        return None;
+    }
+    let detail = body.take_right((DEFAULT_DETAIL_WIDTH + DEFAULT_DETAIL_PADDING) as i32);
+    body.take_right(1)
+        .with(surface_base(theme, surface))
+        .fill(buf);
+    Some(expand_detail_area(detail, surface))
+}
+
+fn expand_detail_area(detail: Rect, surface: FormSurface) -> Rect {
+    match surface {
+        FormSurface::Page => detail,
+        FormSurface::Dialog => Rect {
+            x: detail.x,
+            y: detail.y.saturating_sub(DEFAULT_DETAIL_PADDING),
+            w: detail.w.saturating_add(DEFAULT_DETAIL_PADDING),
+            h: detail
+                .h
+                .saturating_add(DEFAULT_DETAIL_PADDING.saturating_mul(2)),
+        },
+    }
+}
+
+pub(crate) fn draw_detail(
+    area: Rect,
+    buf: &mut Buffer,
+    theme: &Theme,
+    detail: Option<&FormDetail>,
+) {
+    area.with(theme.detail_panel).fill(buf);
+    let mut rows = area.inset(DEFAULT_DETAIL_PADDING, DEFAULT_DETAIL_PADDING);
+    let Some(detail) = detail else {
+        return;
+    };
+    if !detail.current.is_empty() {
+        rows.take_top(1)
+            .with(theme.detail_panel.patch(theme.muted))
+            .with(Ellipsis(true))
+            .text(buf, &format!("Current: {}", detail.current));
+    }
+    if let Some(error) = detail.error.as_deref() {
+        for line in wrap_detail(error, rows.w as usize) {
+            rows.take_top(1)
+                .with(theme.detail_panel.patch(theme.error))
+                .with(Ellipsis(true))
+                .text(buf, &line);
+        }
+    }
+    if !detail.help.is_empty() {
+        rows.take_top(1).with(theme.detail_panel).fill(buf);
+        for line in wrap_detail(detail.help, rows.w as usize) {
+            rows.take_top(1)
+                .with(theme.detail_panel.patch(theme.muted))
+                .with(Ellipsis(true))
+                .text(buf, &line);
+        }
+    }
+}
+
+fn surface_base(theme: &Theme, surface: FormSurface) -> extui::Style {
+    match surface {
+        FormSurface::Page => theme.background,
+        FormSurface::Dialog => theme.dialog_panel,
+    }
+}
+
 fn on_off(value: bool) -> String {
     if value {
         "on".to_string()
@@ -683,4 +892,197 @@ fn cycle_index(current: usize, len: usize, delta: isize) -> usize {
         return 0;
     }
     (current as isize + delta).rem_euclid(len as isize) as usize
+}
+
+fn wrap_detail(text: &str, width: usize) -> Vec<String> {
+    if width == 0 {
+        return Vec::new();
+    }
+    let mut lines = Vec::new();
+    let mut current = String::new();
+    for word in text.split_whitespace() {
+        let mut pending = word;
+        while pending.width() > width {
+            if !current.is_empty() {
+                lines.push(std::mem::take(&mut current));
+            }
+            let (chunk, rest) = split_cells(pending, width);
+            if chunk.is_empty() {
+                break;
+            }
+            lines.push(chunk.to_string());
+            pending = rest;
+        }
+        if pending.is_empty() {
+            continue;
+        }
+        let next_width = if current.is_empty() {
+            pending.width()
+        } else {
+            current.width() + 1 + pending.width()
+        };
+        if next_width > width && !current.is_empty() {
+            lines.push(std::mem::take(&mut current));
+        }
+        if !current.is_empty() {
+            current.push(' ');
+        }
+        current.push_str(pending);
+    }
+    if !current.is_empty() {
+        lines.push(current);
+    }
+    lines
+}
+
+fn split_cells(text: &str, width: usize) -> (&str, &str) {
+    if width == 0 {
+        return ("", text);
+    }
+    let mut cells = 0;
+    let mut split = 0;
+    for (index, ch) in text.char_indices() {
+        let ch_width = ch.width().unwrap_or(0);
+        if cells > 0 && cells + ch_width > width {
+            break;
+        }
+        cells += ch_width;
+        split = index + ch.len_utf8();
+        if cells >= width {
+            break;
+        }
+    }
+    if split == 0 {
+        split = text
+            .char_indices()
+            .nth(1)
+            .map(|(index, _)| index)
+            .unwrap_or(text.len());
+    }
+    text.split_at(split)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cell_text(buffer: &mut Buffer, column: u16, row: u16) -> String {
+        let grid = buffer.current();
+        let cell = grid.cells()[(row as usize * grid.width() as usize) + column as usize];
+        if cell.is_handle() {
+            String::from_utf8_lossy(grid.handle_text(cell).unwrap_or_default()).to_string()
+        } else {
+            cell.text_inline().unwrap_or_default().to_string()
+        }
+    }
+
+    fn cell_style(buffer: &mut Buffer, column: u16, row: u16) -> extui::Style {
+        let grid = buffer.current();
+        grid.cells()[(row as usize * grid.width() as usize) + column as usize].style()
+    }
+
+    #[test]
+    fn dialog_detail_area_reaches_dialog_content_edges() {
+        let theme = Theme::tomorrow_night();
+        let mut body = Rect {
+            x: 1,
+            y: 2,
+            w: 110,
+            h: 13,
+        };
+        let mut buf = Buffer::new(120, 20);
+
+        let detail = take_detail_area(&mut body, &mut buf, &theme, FormSurface::Dialog).unwrap();
+
+        assert_eq!(
+            body,
+            Rect {
+                x: 1,
+                y: 2,
+                w: 74,
+                h: 13,
+            }
+        );
+        assert_eq!(
+            detail,
+            Rect {
+                x: 76,
+                y: 1,
+                w: 36,
+                h: 15,
+            }
+        );
+    }
+
+    #[test]
+    fn empty_text_placeholder_renders_muted_without_changing_value() {
+        let theme = Theme::tomorrow_night();
+        let mut state = state_with_focus(FormBindings::Standard, "Other", "Other");
+        let mut buf = Buffer::new(24, 1);
+        let mut value = String::new();
+
+        state.begin_frame(Rect {
+            x: 0,
+            y: 0,
+            w: 24,
+            h: 1,
+        });
+        {
+            let mut form = Form::new(
+                &mut state,
+                Some(&mut buf),
+                &theme,
+                true,
+                FieldIntent::None,
+                None,
+                None,
+            )
+            .with_label_width(8);
+            form.text_with_placeholder("Limit", &mut value, Some("50M"), |_| None);
+        }
+        state.finish_frame();
+
+        assert!(value.is_empty());
+        assert_eq!(cell_text(&mut buf, 8, 0), "5");
+        assert_eq!(
+            cell_style(&mut buf, 8, 0),
+            theme.background.patch(theme.muted)
+        );
+    }
+
+    #[test]
+    fn focused_empty_text_placeholder_renders_in_editor() {
+        let theme = Theme::tomorrow_night();
+        let mut state = state_with_focus(FormBindings::Standard, "root", "Limit");
+        let mut buf = Buffer::new(24, 1);
+        let mut value = String::new();
+
+        state.begin_frame(Rect {
+            x: 0,
+            y: 0,
+            w: 24,
+            h: 1,
+        });
+        {
+            let mut form = Form::new(
+                &mut state,
+                Some(&mut buf),
+                &theme,
+                false,
+                FieldIntent::None,
+                None,
+                None,
+            )
+            .with_label_width(8);
+            form.text_with_placeholder("Limit", &mut value, Some("50M"), |_| None);
+        }
+        state.finish_frame();
+
+        assert!(value.is_empty());
+        assert_eq!(cell_text(&mut buf, 8, 0), "5");
+        assert_eq!(
+            cell_style(&mut buf, 8, 0),
+            theme.join_input_active.patch(theme.muted)
+        );
+    }
 }

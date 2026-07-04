@@ -76,6 +76,8 @@ pub struct SettingsDraft {
     pub(crate) accept_downloads: bool,
     pub(crate) download_path: String,
     pub(crate) history_enabled: bool,
+    /// Base directory for persisted history; empty means the platform default.
+    pub(crate) history_location: String,
     pub(crate) denoise: DenoiseConfig,
     pub(crate) dred: DredConfig,
     pub(crate) echo_cancellation: bool,
@@ -137,6 +139,7 @@ impl SettingsDraft {
             accept_downloads: false,
             download_path: default_download_path_text(),
             history_enabled: HistoryConfig::default().enabled,
+            history_location: String::new(),
             denoise: config.denoise,
             dred: config.dred,
             echo_cancellation: config.echo_cancellation,
@@ -184,6 +187,7 @@ impl SettingsDraft {
 
     pub fn set_history_from_config(&mut self, history: &HistoryConfig) {
         self.history_enabled = history.enabled;
+        self.history_location = history.location.clone().unwrap_or_default();
     }
 
     pub fn theme(&self) -> ThemeChoice {
@@ -249,8 +253,10 @@ impl SettingsDraft {
     }
 
     pub fn to_history(&self) -> HistoryConfig {
+        let location = self.history_location.trim();
         HistoryConfig {
             enabled: self.history_enabled,
+            location: (!location.is_empty()).then(|| location.to_string()),
         }
     }
 
@@ -373,6 +379,101 @@ pub fn form_bindings_label(value: FormBindings) -> &'static str {
     match value {
         FormBindings::Standard => "Standard",
         FormBindings::Vim => "Vim",
+    }
+}
+
+/// Tri-state control for a per-server or per-room override of an on/off
+/// setting. `Inherit` maps to an unset (`None`) config field.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OverrideToggle {
+    Inherit,
+    On,
+    Off,
+}
+
+impl OverrideToggle {
+    pub const ALL: [OverrideToggle; 3] = [
+        OverrideToggle::Inherit,
+        OverrideToggle::On,
+        OverrideToggle::Off,
+    ];
+
+    pub fn from_option(value: Option<bool>) -> Self {
+        match value {
+            None => OverrideToggle::Inherit,
+            Some(true) => OverrideToggle::On,
+            Some(false) => OverrideToggle::Off,
+        }
+    }
+
+    pub fn to_option(self) -> Option<bool> {
+        match self {
+            OverrideToggle::Inherit => None,
+            OverrideToggle::On => Some(true),
+            OverrideToggle::Off => Some(false),
+        }
+    }
+
+    /// The visible option label. `inherited` is the effective value one level
+    /// up, so `Inherit` reads as what it resolves to.
+    pub fn label(self, inherited: bool) -> String {
+        match self {
+            OverrideToggle::Inherit => {
+                format!("inherit ({})", if inherited { "on" } else { "off" })
+            }
+            OverrideToggle::On => "on".to_string(),
+            OverrideToggle::Off => "off".to_string(),
+        }
+    }
+}
+
+/// Parses a byte count with an optional `K`/`M`/`G` suffix (powers of 1024).
+pub fn parse_byte_size(text: &str) -> Option<u64> {
+    let text = text.trim();
+    let (digits, multiplier) = match text.as_bytes().last() {
+        Some(b'k' | b'K') => (&text[..text.len() - 1], 1024),
+        Some(b'm' | b'M') => (&text[..text.len() - 1], 1024 * 1024),
+        Some(b'g' | b'G') => (&text[..text.len() - 1], 1024 * 1024 * 1024),
+        _ => (text, 1),
+    };
+    let value: u64 = digits.trim().parse().ok()?;
+    Some(value.saturating_mul(multiplier))
+}
+
+/// Parses a byte-limit override field. Empty inherits (`None`); otherwise a
+/// byte count with an optional `K`/`M`/`G` suffix.
+pub fn parse_byte_limit(text: &str) -> Result<Option<u64>, String> {
+    let text = text.trim();
+    if text.is_empty() {
+        return Ok(None);
+    }
+    match parse_byte_size(text) {
+        Some(bytes) => Ok(Some(bytes)),
+        None => Err(format!("invalid size limit: {text}")),
+    }
+}
+
+pub fn byte_limit_error(text: &str) -> Option<String> {
+    parse_byte_limit(text).err()
+}
+
+/// Renders a byte-limit override as editable text: empty for inherit, a
+/// `K`/`M`/`G` suffix form when exact, else the raw byte count.
+pub fn byte_limit_text(value: Option<u64>) -> String {
+    const KIB: u64 = 1024;
+    const MIB: u64 = 1024 * 1024;
+    const GIB: u64 = 1024 * 1024 * 1024;
+    let Some(bytes) = value else {
+        return String::new();
+    };
+    if bytes >= GIB && bytes % GIB == 0 {
+        format!("{}G", bytes / GIB)
+    } else if bytes >= MIB && bytes % MIB == 0 {
+        format!("{}M", bytes / MIB)
+    } else if bytes >= KIB && bytes % KIB == 0 {
+        format!("{}K", bytes / KIB)
+    } else {
+        bytes.to_string()
     }
 }
 

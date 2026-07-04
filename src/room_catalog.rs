@@ -6,7 +6,11 @@
 //! navigation available offline, alongside the per-room `room-<id>.kvlog`
 //! message captures.
 
-use std::{fs, io::Write, path::PathBuf};
+use std::{
+    fs,
+    io::Write,
+    path::{Path, PathBuf},
+};
 
 use rpc::ids::{MessageId, RoomId, UserId};
 use toml_spanner::Toml;
@@ -65,13 +69,12 @@ struct CatalogFileRoom {
     last_read: u64,
 }
 
-fn catalog_path(history_id: &str) -> Option<PathBuf> {
-    let dir = room_history::server_dir(history_id)?;
-    Some(dir.join("rooms.toml"))
+fn catalog_path(dir: Option<&Path>) -> Option<PathBuf> {
+    Some(dir?.join("rooms.toml"))
 }
 
-pub(crate) fn load(history_id: &str) -> RoomCatalog {
-    let Some(path) = catalog_path(history_id) else {
+pub(crate) fn load(dir: Option<&Path>) -> RoomCatalog {
+    let Some(path) = catalog_path(dir) else {
         return RoomCatalog::default();
     };
     let Ok(content) = fs::read_to_string(&path) else {
@@ -117,12 +120,14 @@ pub(crate) fn load(history_id: &str) -> RoomCatalog {
 
 /// Atomically rewrites the catalog file. Best-effort: failures are logged and
 /// the in-memory state stays authoritative for the session.
-pub(crate) fn save(history_id: &str, catalog: &RoomCatalog) {
-    let Some(path) = catalog_path(history_id) else {
+pub(crate) fn save(dir: Option<&Path>, catalog: &RoomCatalog) {
+    let Some(path) = catalog_path(dir) else {
         return;
     };
+    // Private (0700) because the location may sit under a world-writable root
+    // like /tmp and the catalog names every room the user has seen.
     if let Some(parent) = path.parent()
-        && let Err(error) = fs::create_dir_all(parent)
+        && let Err(error) = room_history::create_private_dir(parent)
     {
         kvlog::warn!("room catalog dir create failed", error = %error);
         return;
@@ -186,7 +191,7 @@ mod tests {
 
     #[test]
     fn catalog_round_trips_rooms_and_watermarks() {
-        let history_id = "catalog-round-trip-test";
+        let dir = room_history::server_dir("catalog-round-trip-test");
         let catalog = RoomCatalog {
             last_viewed_room: Some(RoomId(2)),
             last_voice_room: Some(RoomId(1)),
@@ -215,15 +220,34 @@ mod tests {
             ],
         };
 
-        save(history_id, &catalog);
-        let loaded = load(history_id);
+        save(dir.as_deref(), &catalog);
+        let loaded = load(dir.as_deref());
 
         assert_eq!(loaded, catalog);
     }
 
     #[test]
     fn missing_catalog_loads_empty() {
-        let loaded = load("catalog-missing-test");
-        assert_eq!(loaded, RoomCatalog::default());
+        let dir = room_history::server_dir("catalog-missing-test");
+        assert_eq!(load(dir.as_deref()), RoomCatalog::default());
+        assert_eq!(load(None), RoomCatalog::default());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn catalog_dir_is_created_with_owner_only_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = room_history::server_dir("catalog-private-perms-test").expect("test dir");
+        let _ = fs::remove_dir_all(&dir);
+
+        save(Some(&dir), &RoomCatalog::default());
+
+        let mode = fs::metadata(&dir)
+            .expect("catalog dir exists")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o700);
+        let _ = fs::remove_dir_all(&dir);
     }
 }

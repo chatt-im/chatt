@@ -13,8 +13,11 @@ impl std::fmt::Display for UserId {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord, Jsony)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord, Jsony, toml_spanner::Toml,
+)]
 #[jsony(Binary)]
+#[toml(Toml)]
 pub struct RoomId(pub u32);
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord, Jsony)]

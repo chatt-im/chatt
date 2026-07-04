@@ -16,7 +16,7 @@ use crate::{
     client_net::TransferDirection,
     config::Config,
     room_catalog::{CatalogRoom, CatalogRoomKind, RoomCatalog},
-    room_history::{self, FileHistoryKey, RoomHistoryStore},
+    room_history::{self, FileHistoryKey, HistoryStorage, RoomHistoryStore},
     theme::Theme,
     tui::editor::EditorHighlighter,
     web_server::WebAttachment,
@@ -264,9 +264,9 @@ impl ClientRoom {
 
 pub(crate) struct RoomSession {
     pub server_alias: String,
-    /// Stable per-server storage id for history, independent of the mutable
-    /// label and endpoint. Empty when not connected, which disables persistence.
-    history_id: String,
+    /// Where this connection persists chat, resolved from the `[history]`
+    /// overrides. Disabled when not connected.
+    history: HistoryStorage,
     pub local_user_name: String,
     pub room_name: String,
     pub composer: Editor,
@@ -654,7 +654,7 @@ impl RoomSession {
 
         Self {
             server_alias: String::new(),
-            history_id: String::new(),
+            history: HistoryStorage::disabled(),
             local_user_name: String::new(),
             room_name: "servers".to_string(),
             composer,
@@ -687,12 +687,12 @@ impl RoomSession {
         self.muted_users.contains(&user_id)
     }
 
-    pub(crate) fn history_id(&self) -> &str {
-        &self.history_id
+    pub(crate) fn history_storage(&self) -> &HistoryStorage {
+        &self.history
     }
 
     pub(crate) fn disable_history(&mut self) {
-        self.history_id.clear();
+        self.history = HistoryStorage::disabled();
         self.active.history = None;
         for room in self.parked.values_mut() {
             room.history = None;
@@ -754,16 +754,18 @@ impl RoomSession {
     pub(crate) fn connect_to_server(
         &mut self,
         server_alias: String,
-        history_id: String,
+        history: HistoryStorage,
         local_user_name: String,
     ) -> ServerContinuity {
-        let continuity = if !history_id.is_empty() && self.history_id == history_id {
+        let continuity = if !history.history_id().is_empty()
+            && self.history.history_id() == history.history_id()
+        {
             ServerContinuity::SameServer
         } else {
             ServerContinuity::NewServer
         };
         self.server_alias = server_alias;
-        self.history_id = history_id;
+        self.history = history;
         self.local_user_name = local_user_name;
 
         match continuity {
@@ -797,7 +799,7 @@ impl RoomSession {
     pub(crate) fn reset_for_server_list(&mut self) {
         self.clear_active_room_state();
         self.server_alias.clear();
-        self.history_id.clear();
+        self.history = HistoryStorage::disabled();
         self.local_user_name.clear();
         self.room_name = "servers".to_string();
         self.metas.clear();
@@ -945,7 +947,7 @@ impl RoomSession {
     /// capture is trimmed to the message cap so it cannot lock out server
     /// history paging.
     fn materialize_room(&self, room_id: RoomId, local_user: Option<UserId>) -> ClientRoom {
-        let opened = room_history::open(&self.history_id, room_id);
+        let opened = room_history::open_in(self.history.room_dir(room_id), room_id);
         let mut room = ClientRoom::empty(self.max_messages, self.syntax);
         room.messages = MessageLog::from_sorted(opened.loaded.messages);
         room.messages.trim_front(self.max_messages);
@@ -2154,10 +2156,8 @@ impl RoomSession {
     /// `sender: first line`. The append handle opened alongside the load is
     /// dropped immediately; nothing is written.
     pub(crate) fn cross_room_ref_preview(&self, target: rpc::msgref::MessageRef) -> Option<String> {
-        if self.history_id.is_empty() {
-            return None;
-        }
-        let loaded = room_history::open(&self.history_id, target.room_id).loaded;
+        let dir = self.history.room_dir(target.room_id)?;
+        let loaded = room_history::open_in(Some(dir), target.room_id).loaded;
         let message = loaded.messages.iter().find(|message| {
             message.timestamp_ms == target.timestamp_ms && message.message_id == target.message_id
         })?;
@@ -3404,7 +3404,7 @@ mod tests {
         room.set_max_messages(4);
         room.connect_to_server(
             "alias".to_string(),
-            history_id.to_string(),
+            HistoryStorage::for_test(history_id),
             "me".to_string(),
         );
         room.load_offline_catalog(&catalog, None);
@@ -3447,7 +3447,7 @@ mod tests {
         let mut room = test_room();
         room.connect_to_server(
             "alias".to_string(),
-            history_id.to_string(),
+            HistoryStorage::for_test(history_id),
             "me".to_string(),
         );
         room.load_offline_catalog(&catalog, None);
@@ -3482,7 +3482,11 @@ mod tests {
             ],
         };
         let mut room = test_room();
-        room.connect_to_server("alias".to_string(), String::new(), "me".to_string());
+        room.connect_to_server(
+            "alias".to_string(),
+            HistoryStorage::disabled(),
+            "me".to_string(),
+        );
         room.load_offline_catalog(&catalog, None);
 
         let known = room.authenticated(
@@ -3526,7 +3530,11 @@ mod tests {
             }],
         };
         let mut room = test_room();
-        room.connect_to_server("alias".to_string(), String::new(), "me".to_string());
+        room.connect_to_server(
+            "alias".to_string(),
+            HistoryStorage::disabled(),
+            "me".to_string(),
+        );
         room.load_offline_catalog(&catalog, None);
         room.chat_received(message(1, UserId(1), "mine"), None);
         assert!(!room.active.chat.message(0).local);
@@ -3560,7 +3568,11 @@ mod tests {
             }],
         };
         let mut room = test_room();
-        room.connect_to_server("alias".to_string(), String::new(), "me".to_string());
+        room.connect_to_server(
+            "alias".to_string(),
+            HistoryStorage::disabled(),
+            "me".to_string(),
+        );
         room.load_offline_catalog(&catalog, None);
         room.chat_received(message(1, UserId(1), "mine"), None);
         room.push_notice("system", "worker stopped");
@@ -3591,7 +3603,7 @@ mod tests {
         assert_eq!(
             room.connect_to_server(
                 "alias".to_string(),
-                "same-history".to_string(),
+                HistoryStorage::for_test("same-history"),
                 "alice".to_string(),
             ),
             ServerContinuity::NewServer
@@ -3622,7 +3634,7 @@ mod tests {
         assert_eq!(
             room.connect_to_server(
                 "renamed".to_string(),
-                "same-history".to_string(),
+                HistoryStorage::for_test("same-history"),
                 "alice-new".to_string(),
             ),
             ServerContinuity::SameServer
@@ -3661,7 +3673,7 @@ mod tests {
 
         room.connect_to_server(
             "new".to_string(),
-            "new-history".to_string(),
+            HistoryStorage::for_test("new-history"),
             "alice".to_string(),
         );
         room.load_offline_catalog(&RoomCatalog::default(), Some(UserId(1)));

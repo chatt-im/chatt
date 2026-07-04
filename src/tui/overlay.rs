@@ -957,6 +957,7 @@ mod tests {
                 username: "Zoe".to_string(),
                 token: String::new(),
                 server_public_key: String::new(),
+                ..ServerEntry::default()
             },
             open: Some(String::new()),
             completion: PairCompletion::OpenEditor,

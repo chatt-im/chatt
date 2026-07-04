@@ -216,18 +216,112 @@ impl RoomHistoryStore {
     }
 }
 
-/// Loads and validates one room's history, repairing its active file before
-/// returning an append handle. Filesystem failures degrade to read-only history.
-/// `history_id` is the stable per-server id from [`derive_server_id`], empty when
-/// not connected.
-pub(crate) fn open(history_id: &str, room_id: RoomId) -> OpenedHistory {
-    let Some(path) = history_path(history_id, room_id) else {
+/// Where one server connection persists chat, after room > server > global
+/// resolution of the `[history]` overrides.
+///
+/// `history_id` is the stable per-server id from [`derive_server_id`], empty
+/// when persistence is fully disabled. Every stored directory already ends in
+/// the sanitized id, so distinct servers sharing a `location` never collide.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct HistoryStorage {
+    history_id: String,
+    server_dir: Option<PathBuf>,
+    room_dirs: HashMap<RoomId, Option<PathBuf>>,
+}
+
+impl HistoryStorage {
+    pub(crate) fn disabled() -> Self {
+        Self::default()
+    }
+
+    /// Resolves the storage layout for `server`: the server-level directory
+    /// plus one entry per room whose `[servers.rooms.history]` overrides
+    /// change it (enabling, disabling, or relocating that room's capture).
+    pub(crate) fn resolve(
+        config: &crate::config::Config,
+        server: &crate::config::ServerEntry,
+    ) -> Self {
+        let server_effective = config.effective_history(server, None);
+        let mut room_effective = Vec::new();
+        let mut any_enabled = server_effective.enabled;
+        for room in &server.rooms {
+            if room.history.is_empty() {
+                continue;
+            }
+            let effective = config.effective_history(server, Some(room.room_id));
+            any_enabled |= effective.enabled;
+            room_effective.push((room.room_id, effective));
+        }
+        if !any_enabled {
+            return Self::disabled();
+        }
+        let history_id = derive_server_id(&server.token);
+        let leaf = sanitize_alias(&history_id);
+        let dir_for = |effective: &crate::config::EffectiveHistory| {
+            if !effective.enabled {
+                return None;
+            }
+            let base = effective.location.clone().or_else(data_dir)?;
+            Some(base.join(&leaf))
+        };
+        let server_dir = dir_for(&server_effective);
+        let mut room_dirs = HashMap::new();
+        for (room_id, effective) in &room_effective {
+            room_dirs.insert(*room_id, dir_for(effective));
+        }
+        Self {
+            history_id,
+            server_dir,
+            room_dirs,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(history_id: &str) -> Self {
+        Self {
+            history_id: history_id.to_string(),
+            server_dir: server_dir(history_id),
+            room_dirs: HashMap::new(),
+        }
+    }
+
+    pub(crate) fn history_id(&self) -> &str {
+        &self.history_id
+    }
+
+    /// The directory holding `room_id`'s capture: the room override when one
+    /// exists, else the server-level directory. `None` disables persistence
+    /// for that room.
+    pub(crate) fn room_dir(&self, room_id: RoomId) -> Option<&Path> {
+        match self.room_dirs.get(&room_id) {
+            Some(dir) => dir.as_deref(),
+            None => self.server_dir.as_deref(),
+        }
+    }
+
+    /// The directory holding the server's `rooms.toml` catalog. The catalog is
+    /// server-scoped, so room-level overrides never move it.
+    pub(crate) fn catalog_dir(&self) -> Option<&Path> {
+        self.server_dir.as_deref()
+    }
+}
+
+/// Loads and validates one room's history from `dir`, repairing its active
+/// file before returning an append handle. Filesystem failures degrade to
+/// read-only history. A `None` dir means persistence is disabled for the room.
+pub(crate) fn open_in(dir: Option<&Path>, room_id: RoomId) -> OpenedHistory {
+    let Some(dir) = dir else {
         return OpenedHistory {
             loaded: LoadedHistory::default(),
             store: None,
         };
     };
-    open_path(&path, room_id.0)
+    open_path(&dir.join(room_file_name(room_id)), room_id.0)
+}
+
+#[cfg(test)]
+pub(crate) fn open(history_id: &str, room_id: RoomId) -> OpenedHistory {
+    open_in(server_dir(history_id).as_deref(), room_id)
 }
 
 fn open_path(path: &Path, default_room: u32) -> OpenedHistory {
@@ -332,8 +426,9 @@ fn open_append_file(path: &Path) -> Option<File> {
 }
 
 /// Creates `dir` and any missing parents with mode `0700` so the history tree is
-/// readable only by its owner.
-fn create_private_dir(dir: &Path) -> std::io::Result<()> {
+/// readable only by its owner. Required for user-configured locations under
+/// world-writable roots like `/tmp`.
+pub(crate) fn create_private_dir(dir: &Path) -> std::io::Result<()> {
     let mut builder = fs::DirBuilder::new();
     builder.recursive(true);
     #[cfg(unix)]
@@ -903,15 +998,10 @@ pub(crate) fn derive_server_id(token: &str) -> String {
     id
 }
 
-fn history_path(history_id: &str, room_id: RoomId) -> Option<PathBuf> {
-    if history_id.is_empty() {
-        return None;
-    }
-    Some(room_file_path(&data_dir()?, history_id, room_id))
-}
-
-/// The server's local data directory, holding its per-room captures and the
-/// room catalog. `None` when `history_id` is empty or no data dir resolves.
+/// The server's default local data directory, used by tests that bypass
+/// [`HistoryStorage::resolve`]. `None` when `history_id` is empty or no data
+/// dir resolves.
+#[cfg(test)]
 pub(crate) fn server_dir(history_id: &str) -> Option<PathBuf> {
     if history_id.is_empty() {
         return None;
@@ -919,9 +1009,8 @@ pub(crate) fn server_dir(history_id: &str) -> Option<PathBuf> {
     Some(data_dir()?.join(sanitize_alias(history_id)))
 }
 
-fn room_file_path(base: &Path, history_id: &str, room_id: RoomId) -> PathBuf {
-    base.join(sanitize_alias(history_id))
-        .join(format!("room-{}.kvlog", room_id.0))
+fn room_file_name(room_id: RoomId) -> String {
+    format!("room-{}.kvlog", room_id.0)
 }
 
 #[cfg(test)]
@@ -1359,10 +1448,81 @@ mod tests {
     }
 
     #[test]
-    fn room_file_path_layout() {
-        let path = room_file_path(Path::new("/data/chatt"), "srv", RoomId(5));
-        assert_eq!(path, PathBuf::from("/data/chatt/srv/room-5.kvlog"));
-        assert_eq!(history_path("", RoomId(5)), None);
+    fn room_file_name_layout() {
+        assert_eq!(room_file_name(RoomId(5)), "room-5.kvlog");
+        assert_eq!(server_dir(""), None);
+    }
+
+    #[test]
+    fn history_storage_room_dir_prefers_room_override() {
+        use crate::config::{Config, HistoryOverrides, RoomOverrides, ServerEntry};
+
+        let mut config = Config::default();
+        config.history.enabled = true;
+        let mut server = ServerEntry::default();
+        server.history.location = Some("/srv/base".to_string());
+        server.rooms = vec![
+            RoomOverrides {
+                room_id: RoomId(3),
+                history: HistoryOverrides {
+                    enabled: None,
+                    location: Some("/tmp/.chatt-data".to_string()),
+                },
+                ..Default::default()
+            },
+            RoomOverrides {
+                room_id: RoomId(4),
+                history: HistoryOverrides {
+                    enabled: Some(false),
+                    location: None,
+                },
+                ..Default::default()
+            },
+        ];
+
+        let storage = HistoryStorage::resolve(&config, &server);
+        let leaf = sanitize_alias(&derive_server_id(&server.token));
+        let server_dir = PathBuf::from("/srv/base").join(&leaf);
+        assert_eq!(storage.history_id(), derive_server_id(&server.token));
+        assert_eq!(storage.catalog_dir(), Some(server_dir.as_path()));
+        assert_eq!(storage.room_dir(RoomId(1)), Some(server_dir.as_path()));
+        assert_eq!(
+            storage.room_dir(RoomId(3)),
+            Some(PathBuf::from("/tmp/.chatt-data").join(&leaf).as_path())
+        );
+        assert_eq!(storage.room_dir(RoomId(4)), None);
+    }
+
+    #[test]
+    fn history_storage_room_enables_persistence_with_server_off() {
+        use crate::config::{Config, HistoryOverrides, RoomOverrides, ServerEntry};
+
+        let config = Config::default();
+        let mut server = ServerEntry::default();
+        server.rooms = vec![RoomOverrides {
+            room_id: RoomId(3),
+            history: HistoryOverrides {
+                enabled: Some(true),
+                location: None,
+            },
+            ..Default::default()
+        }];
+
+        let storage = HistoryStorage::resolve(&config, &server);
+        assert!(!storage.history_id().is_empty());
+        assert_eq!(storage.catalog_dir(), None);
+        assert_eq!(storage.room_dir(RoomId(1)), None);
+        assert!(storage.room_dir(RoomId(3)).is_some());
+    }
+
+    #[test]
+    fn history_storage_fully_disabled_without_any_enabled_level() {
+        use crate::config::{Config, ServerEntry};
+
+        let storage = HistoryStorage::resolve(&Config::default(), &ServerEntry::default());
+        assert_eq!(storage, HistoryStorage::disabled());
+        assert!(storage.history_id().is_empty());
+        assert_eq!(storage.room_dir(RoomId(1)), None);
     }
 
     #[test]

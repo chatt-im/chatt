@@ -51,7 +51,7 @@ use crate::audio::{
     LiveEncoderProfile, LivePlaybackFeedback, LivePlaybackSink, LocalVoiceFrame, RemoteVoicePacket,
     VoicePayload as AudioVoicePayload,
 };
-use crate::config::CandidatePrivacy;
+use crate::config::{CandidatePrivacy, EffectiveFiles};
 use crate::file_compression::{
     self, COMPRESSION_PROBE_BYTES, FastCompressionDecision, ZSTD_WINDOW_LOG,
 };
@@ -141,9 +141,8 @@ pub struct ClientConfig {
     pub display_name: String,
     pub token: String,
     pub server_public_key: Option<String>,
-    pub file_receive_dir: Option<PathBuf>,
+    pub file_policy: FilePolicy,
     pub max_upload_bytes: u64,
-    pub max_receive_bytes: u64,
     /// Upload pacing ceiling in bytes per second, `0` for unlimited. Seeds
     /// [`UploadThrottle`] and is adjustable at runtime via
     /// [`NetworkCommand::SetUploadRate`].
@@ -151,6 +150,56 @@ pub struct ClientConfig {
     pub p2p_enabled: bool,
     pub candidate_privacy: crate::config::CandidatePrivacy,
     pub prefer_ipv6: bool,
+}
+
+/// The resolved per-room download policy the worker enforces at receive time.
+///
+/// `default` is the server-level effective config; `rooms` holds the rooms
+/// whose overrides differ from it. Built by [`Config::file_policy`] and
+/// refreshed over [`NetworkCommand::SetFilePolicy`] when a save changes it.
+///
+/// [`Config::file_policy`]: crate::config::Config::file_policy
+#[derive(Clone, Debug, Default)]
+pub struct FilePolicy {
+    pub default: EffectiveFiles,
+    pub rooms: Vec<(RoomId, EffectiveFiles)>,
+}
+
+impl FilePolicy {
+    pub fn for_room(&self, room_id: RoomId) -> &EffectiveFiles {
+        for (id, files) in &self.rooms {
+            if *id == room_id {
+                return files;
+            }
+        }
+        &self.default
+    }
+
+    /// Whether any room accepts downloads: the `receive_files` flag advertised
+    /// to the server at join time.
+    pub fn receives_any(&self) -> bool {
+        if self.default.receive_dir.is_some() {
+            return true;
+        }
+        self.rooms
+            .iter()
+            .any(|(_, files)| files.receive_dir.is_some())
+    }
+
+    /// The receive limit advertised to the server: the largest limit among the
+    /// receiving levels. Tighter per-room limits are enforced locally.
+    pub fn advertised_limit(&self) -> u64 {
+        let mut limit = match self.default.receive_dir {
+            Some(_) => self.default.max_receive_bytes,
+            None => 0,
+        };
+        for (_, files) in &self.rooms {
+            if files.receive_dir.is_some() {
+                limit = limit.max(files.max_receive_bytes);
+            }
+        }
+        limit
+    }
 }
 
 /// A request to upload a file to the current room.
@@ -225,6 +274,9 @@ pub enum NetworkCommand {
     },
     /// Sets the upload pacing ceiling in bytes per second, `0` for unlimited.
     SetUploadRate(u64),
+    /// Replaces the resolved per-room download policy after a config save.
+    /// The join-time advertisement to the server refreshes on reconnect.
+    SetFilePolicy(FilePolicy),
     SetP2pEnabled(bool),
     Shutdown,
 }
@@ -574,8 +626,8 @@ fn open_pair_once(
         display_name: config.display_name.clone(),
         password,
         existing_token,
-        receive_files: config.file_receive_dir.is_some(),
-        file_receive_limit_bytes: config.max_receive_bytes,
+        receive_files: config.file_policy.receives_any(),
+        file_receive_limit_bytes: config.file_policy.advertised_limit(),
     };
     if let Err(error) = write_blocking_control(&mut stream, &mut control, request) {
         return OpenPairOutcome::Failed(error);
@@ -853,8 +905,8 @@ fn run_worker_inner(
     let auth_control = ClientControl::Authenticate {
         display_name: worker.config.display_name.clone(),
         token: worker.config.token.clone(),
-        receive_files: worker.config.file_receive_dir.is_some(),
-        file_receive_limit_bytes: worker.config.max_receive_bytes,
+        receive_files: worker.config.file_policy.receives_any(),
+        file_receive_limit_bytes: worker.config.file_policy.advertised_limit(),
     };
     if let Err(error) = worker.queue_control(auth_control) {
         return SessionEnd::Disconnected(error);
@@ -1185,8 +1237,8 @@ fn pair_once(config: &ClientConfig, pairing_code: String) -> Result<(), String> 
             display_name: config.display_name.clone(),
             pairing_code,
             token: config.token.clone(),
-            receive_files: config.file_receive_dir.is_some(),
-            file_receive_limit_bytes: config.max_receive_bytes,
+            receive_files: config.file_policy.receives_any(),
+            file_receive_limit_bytes: config.file_policy.advertised_limit(),
         },
     )?;
 
@@ -2555,6 +2607,9 @@ impl WorkerState {
                     .events
                     .send(NetworkEvent::Status(format!("upload rate set to {label}")));
             }
+            NetworkCommand::SetFilePolicy(policy) => {
+                self.config.file_policy = policy;
+            }
             NetworkCommand::SetP2pEnabled(enabled) => {
                 if self.p2p_enabled == enabled {
                     return Ok(());
@@ -2941,7 +2996,13 @@ impl WorkerState {
                 encoding: upload.body.encoding(),
             })?;
             upload.started = true;
-            if let Some(receive_dir) = self.config.file_receive_dir.clone() {
+            if let Some(receive_dir) = self
+                .config
+                .file_policy
+                .for_room(upload.room_id)
+                .receive_dir
+                .clone()
+            {
                 match create_receive_file(&receive_dir, &upload.name) {
                     Ok((path, file)) => upload.local_copy = Some((path, file)),
                     Err(error) => {
@@ -3215,8 +3276,9 @@ impl WorkerState {
             file_size = file.size,
             contents
         );
+        let policy = self.config.file_policy.for_room(file.room_id);
         if !contents {
-            let reason = if self.config.file_receive_dir.is_some() {
+            let reason = if policy.receive_dir.is_some() {
                 "receive limit"
             } else {
                 "receive-dir disabled"
@@ -3229,16 +3291,16 @@ impl WorkerState {
             )));
             return;
         }
-        if file.size > self.config.max_receive_bytes {
+        if file.size > policy.max_receive_bytes {
             let _ = self.events.send(NetworkEvent::Error(format!(
                 "not receiving {}; size {} exceeds local limit {}",
                 file.file_name,
                 format_bytes(file.size),
-                format_bytes(self.config.max_receive_bytes)
+                format_bytes(policy.max_receive_bytes)
             )));
             return;
         }
-        let Some(receive_dir) = self.config.file_receive_dir.clone() else {
+        let Some(receive_dir) = policy.receive_dir.clone() else {
             let _ = self.events.send(NetworkEvent::Status(format!(
                 "{} sent {} ({}, metadata only)",
                 file.sender_name,
@@ -5058,6 +5120,7 @@ fn network_command_kind(command: &NetworkCommand) -> &'static str {
         NetworkCommand::StopShare { .. } => "stop_share",
         NetworkCommand::ReportBug { .. } => "report_bug",
         NetworkCommand::SetUploadRate(_) => "set_upload_rate",
+        NetworkCommand::SetFilePolicy(_) => "set_file_policy",
         NetworkCommand::SetP2pEnabled(_) => "set_p2p_enabled",
         NetworkCommand::Shutdown => "shutdown",
     }
@@ -5618,6 +5681,67 @@ mod tests {
 
     fn user(id: u64) -> UserId {
         UserId(id)
+    }
+
+    fn receiving(dir: &str, limit: u64) -> EffectiveFiles {
+        EffectiveFiles {
+            receive_dir: Some(PathBuf::from(dir)),
+            max_receive_bytes: limit,
+        }
+    }
+
+    #[test]
+    fn file_policy_for_room_falls_back_to_default() {
+        let policy = FilePolicy {
+            default: receiving("/dl", 100),
+            rooms: vec![(RoomId(3), receiving("/room", 300))],
+        };
+
+        assert_eq!(policy.for_room(RoomId(3)), &policy.rooms[0].1);
+        assert_eq!(policy.for_room(RoomId(9)), &policy.default);
+    }
+
+    #[test]
+    fn file_policy_advertises_max_limit_across_receiving_rooms() {
+        let policy = FilePolicy {
+            default: receiving("/dl", 100),
+            rooms: vec![
+                (RoomId(3), receiving("/room", 300)),
+                (
+                    RoomId(4),
+                    EffectiveFiles {
+                        receive_dir: None,
+                        max_receive_bytes: 900,
+                    },
+                ),
+            ],
+        };
+        assert!(policy.receives_any());
+        // Room 4 has downloads disabled, so its limit is not advertised.
+        assert_eq!(policy.advertised_limit(), 300);
+
+        let disabled = FilePolicy {
+            default: EffectiveFiles {
+                receive_dir: None,
+                max_receive_bytes: 100,
+            },
+            rooms: Vec::new(),
+        };
+        assert!(!disabled.receives_any());
+        assert_eq!(disabled.advertised_limit(), 0);
+    }
+
+    #[test]
+    fn file_policy_receives_any_when_only_a_room_accepts() {
+        let policy = FilePolicy {
+            default: EffectiveFiles {
+                receive_dir: None,
+                max_receive_bytes: 100,
+            },
+            rooms: vec![(RoomId(3), receiving("/room", 300))],
+        };
+        assert!(policy.receives_any());
+        assert_eq!(policy.advertised_limit(), 300);
     }
 
     #[test]

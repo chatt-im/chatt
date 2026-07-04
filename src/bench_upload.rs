@@ -25,9 +25,9 @@ use rpc::ids::{RoomId, UserId};
 
 use crate::app::{AppEvent, EventSender};
 use crate::client_net::{
-    ClientConfig, NetworkClient, NetworkCommand, NetworkEvent, UploadFileRequest,
+    ClientConfig, FilePolicy, NetworkClient, NetworkCommand, NetworkEvent, UploadFileRequest,
 };
-use crate::config::CandidatePrivacy;
+use crate::config::{CandidatePrivacy, EffectiveFiles};
 
 use server::Server;
 use server::config::{Config as ServerConfig, RoomConfig, UserConfig, hash_secret};
@@ -98,9 +98,14 @@ fn client_config(
         display_name: name.to_string(),
         token: token.to_string(),
         server_public_key: None,
-        file_receive_dir: receive_dir,
+        file_policy: FilePolicy {
+            default: EffectiveFiles {
+                receive_dir,
+                max_receive_bytes: LIMIT_BYTES,
+            },
+            rooms: Vec::new(),
+        },
         max_upload_bytes: LIMIT_BYTES,
-        max_receive_bytes: LIMIT_BYTES,
         upload_rate_bytes: 0,
         candidate_privacy: CandidatePrivacy::Disabled,
         p2p_enabled: false,

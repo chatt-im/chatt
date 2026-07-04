@@ -283,7 +283,7 @@ impl<'a> SettingsForm<'a> {
                 self.set_option_detail(shown, error.clone());
             }
             self.form
-                .render_text_row(id, "Device", &current, focused, error.is_some(), area);
+                .render_text_row(id, "Device", &current, None, focused, error.is_some(), area);
             if changed {
                 self.output.changed = true;
             }
@@ -682,6 +682,15 @@ fn settings_ui(
     {
         form.set_help(
             "Stores local room catalogs and chat logs under the chatt data directory for offline browsing.",
+        );
+    }
+    if draft.history_enabled
+        && form
+            .text("Persistence Path", &mut draft.history_location, |_| None)
+            .is_focus()
+    {
+        form.set_help(
+            "Base directory for room catalogs and chat logs. Empty uses the chatt data directory. Applies on the next connection.",
         );
     }
 

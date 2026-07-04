@@ -154,6 +154,7 @@ viewer-in-seperate-browser-tab = false
 "M-DOWN" = "NextRoom"
 "M-UP" = "PrevRoom"
 "F3" = "OpenUserList"
+"F4" = "OpenRoomSettings"
 "." = "ToggleKeyPreview"
 
 [bindings.list]

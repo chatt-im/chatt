@@ -1,5 +1,5 @@
 use hashbrown::HashSet;
-use rpc::ids::UserId;
+use rpc::ids::{RoomId, UserId};
 use std::path::PathBuf;
 use std::{fs, time::Duration};
 
@@ -12,7 +12,7 @@ use crate::{
         LiveAudioPacketLossProfile, LiveAudioTuning, NotificationSound,
     },
     bindings::BindingRuntime,
-    client_net::ClientConfig,
+    client_net::{ClientConfig, FilePolicy},
     config_diagnostics::{self, Diag},
     paths,
 };
@@ -48,6 +48,12 @@ pub struct ServerEntry {
     pub token: String,
     #[toml(default)]
     pub server_public_key: String,
+    #[toml(default, style = Header, ToToml skip_if = FileOverrides::is_empty)]
+    pub files: FileOverrides,
+    #[toml(default, style = Header, ToToml skip_if = HistoryOverrides::is_empty)]
+    pub history: HistoryOverrides,
+    #[toml(default, style = Header, ToToml skip_if = Vec::is_empty)]
+    pub rooms: Vec<RoomOverrides>,
 }
 
 impl Default for ServerEntry {
@@ -60,12 +66,15 @@ impl Default for ServerEntry {
             username: "Alice".to_string(),
             token: "alice-dev-token".to_string(),
             server_public_key: String::new(),
+            files: FileOverrides::default(),
+            history: HistoryOverrides::default(),
+            rooms: Vec::new(),
         }
     }
 }
 
 impl ServerEntry {
-    pub fn client_config(&self, files: &FileConfig, p2p: &P2pConfig) -> ClientConfig {
+    pub fn client_config(&self, config: &Config) -> ClientConfig {
         ClientConfig {
             tcp_addr: self.tcp_addr.clone(),
             udp_addr: self.effective_udp_addr(),
@@ -73,13 +82,12 @@ impl ServerEntry {
             display_name: self.effective_display_name(),
             token: self.token.clone(),
             server_public_key: non_empty_string(&self.server_public_key),
-            file_receive_dir: files.receive_dir_path(),
-            max_upload_bytes: files.max_upload_bytes,
-            max_receive_bytes: files.max_receive_bytes,
-            upload_rate_bytes: files.upload_rate_bytes,
-            p2p_enabled: p2p.enabled,
-            candidate_privacy: p2p.candidate_privacy,
-            prefer_ipv6: p2p.prefer_ipv6,
+            file_policy: config.file_policy(self),
+            max_upload_bytes: config.files.max_upload_bytes,
+            upload_rate_bytes: config.files.upload_rate_bytes,
+            p2p_enabled: config.p2p.enabled,
+            candidate_privacy: config.p2p.candidate_privacy,
+            prefer_ipv6: config.p2p.prefer_ipv6,
         }
     }
 
@@ -391,6 +399,22 @@ impl FileConfig {
     }
 }
 
+/// Download settings after room > server > global resolution.
+/// `receive_dir: None` means downloads are disabled.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct EffectiveFiles {
+    pub receive_dir: Option<PathBuf>,
+    pub max_receive_bytes: u64,
+}
+
+/// Persistence settings after room > server > global resolution.
+/// `location: None` means the platform data dir.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EffectiveHistory {
+    pub enabled: bool,
+    pub location: Option<PathBuf>,
+}
+
 /// How local host candidates are exposed to peers, mirroring RFC 8828.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Toml)]
 #[toml(FromToml, ToToml, rename_all = "kebab-case")]
@@ -525,6 +549,56 @@ pub struct NotificationConfig {
 pub struct HistoryConfig {
     #[toml(default)]
     pub enabled: bool,
+    /// Base directory for persisted history. `None` uses the platform data dir.
+    pub location: Option<String>,
+}
+
+/// Per-server or per-room download overrides. `None` inherits the next level
+/// up; an explicitly empty `receive-dir` disables downloads at this level.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Toml)]
+#[toml(FromToml, ToToml, rename_all = "kebab-case")]
+pub struct FileOverrides {
+    pub receive_dir: Option<String>,
+    pub max_receive_bytes: Option<u64>,
+}
+
+impl FileOverrides {
+    pub fn is_empty(&self) -> bool {
+        *self == FileOverrides::default()
+    }
+}
+
+/// Per-server or per-room persistence overrides. `None` inherits the next
+/// level up.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Toml)]
+#[toml(FromToml, ToToml, rename_all = "kebab-case")]
+pub struct HistoryOverrides {
+    pub enabled: Option<bool>,
+    pub location: Option<String>,
+}
+
+impl HistoryOverrides {
+    pub fn is_empty(&self) -> bool {
+        *self == HistoryOverrides::default()
+    }
+}
+
+/// Download and persistence overrides for one room of a server, keyed by the
+/// server-scoped room id.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Toml)]
+#[toml(FromToml, ToToml, rename_all = "kebab-case")]
+pub struct RoomOverrides {
+    pub room_id: RoomId,
+    #[toml(default, style = Header, ToToml skip_if = FileOverrides::is_empty)]
+    pub files: FileOverrides,
+    #[toml(default, style = Header, ToToml skip_if = HistoryOverrides::is_empty)]
+    pub history: HistoryOverrides,
+}
+
+impl RoomOverrides {
+    pub fn is_empty(&self) -> bool {
+        self.files.is_empty() && self.history.is_empty()
+    }
 }
 
 impl Default for NotificationConfig {
@@ -844,7 +918,19 @@ impl Config {
         for server in &mut self.servers {
             server.label = server.label.trim().to_string();
             server.username = server.effective_display_name();
+            normalize_file_overrides(&mut server.files);
+            normalize_history_overrides(&mut server.history);
+            for room in &mut server.rooms {
+                normalize_file_overrides(&mut room.files);
+                normalize_history_overrides(&mut room.history);
+            }
+            server.rooms.retain(|room| !room.is_empty());
         }
+        self.history.location = self
+            .history
+            .location
+            .take()
+            .and_then(|location| non_empty_string(&location));
         for preference in &mut self.user_audio {
             preference.server_alias = preference.server_alias.trim().to_string();
             preference.volume_db = snap_user_volume_db(preference.volume_db);
@@ -930,6 +1016,15 @@ impl Config {
             if !labels.insert(label.as_str()) {
                 out.push(Diag::error(format!("duplicate server label {label}")));
             }
+            let mut room_ids = HashSet::new();
+            for room in &server.rooms {
+                if !room_ids.insert(room.room_id) {
+                    out.push(Diag::error(format!(
+                        "server {label}: duplicate room override for room-id {}",
+                        room.room_id.0
+                    )));
+                }
+            }
         }
         let mut user_audio_keys = HashSet::new();
         for preference in &self.user_audio {
@@ -988,6 +1083,63 @@ impl Config {
             && program.is_empty()
         {
             out.push(Diag::error("url-open program must not be empty"));
+        }
+    }
+
+    /// Resolves download settings room > server > global, per field. A `None`
+    /// `room_id` (or a room without overrides) yields the server-level value.
+    pub fn effective_files(&self, server: &ServerEntry, room_id: Option<RoomId>) -> EffectiveFiles {
+        let room = room_overrides(server, room_id).map(|room| &room.files);
+        let receive_dir = room
+            .and_then(|files| files.receive_dir.clone())
+            .or_else(|| server.files.receive_dir.clone())
+            .unwrap_or_else(|| self.files.receive_dir.clone());
+        let receive_dir = receive_dir.trim();
+        let max_receive_bytes = room
+            .and_then(|files| files.max_receive_bytes)
+            .or(server.files.max_receive_bytes)
+            .unwrap_or(self.files.max_receive_bytes);
+        EffectiveFiles {
+            receive_dir: (!receive_dir.is_empty()).then(|| PathBuf::from(receive_dir)),
+            max_receive_bytes,
+        }
+    }
+
+    /// Resolves persistence settings room > server > global, per field.
+    pub fn effective_history(
+        &self,
+        server: &ServerEntry,
+        room_id: Option<RoomId>,
+    ) -> EffectiveHistory {
+        let room = room_overrides(server, room_id).map(|room| &room.history);
+        let enabled = room
+            .and_then(|history| history.enabled)
+            .or(server.history.enabled)
+            .unwrap_or(self.history.enabled);
+        let location = room
+            .and_then(|history| history.location.clone())
+            .or_else(|| server.history.location.clone())
+            .or_else(|| self.history.location.clone())
+            .map(PathBuf::from);
+        EffectiveHistory { enabled, location }
+    }
+
+    /// The fully-resolved per-room download policy handed to the network
+    /// worker for one server connection.
+    pub fn file_policy(&self, server: &ServerEntry) -> FilePolicy {
+        let mut rooms = Vec::new();
+        for room in &server.rooms {
+            if room.files.is_empty() {
+                continue;
+            }
+            rooms.push((
+                room.room_id,
+                self.effective_files(server, Some(room.room_id)),
+            ));
+        }
+        FilePolicy {
+            default: self.effective_files(server, None),
+            rooms,
         }
     }
 
@@ -1163,6 +1315,25 @@ fn server_udp_addr_configured(doc: &toml_spanner::Document<'_>) -> Vec<bool> {
 fn non_empty_string(value: &str) -> Option<String> {
     let value = value.trim();
     (!value.is_empty()).then(|| value.to_string())
+}
+
+fn room_overrides(server: &ServerEntry, room_id: Option<RoomId>) -> Option<&RoomOverrides> {
+    let room_id = room_id?;
+    server.rooms.iter().find(|room| room.room_id == room_id)
+}
+
+fn normalize_file_overrides(files: &mut FileOverrides) {
+    // `Some("")` stays: it means downloads are explicitly disabled here.
+    if let Some(dir) = &mut files.receive_dir {
+        *dir = dir.trim().to_string();
+    }
+}
+
+fn normalize_history_overrides(history: &mut HistoryOverrides) {
+    history.location = history
+        .location
+        .take()
+        .and_then(|location| non_empty_string(&location));
 }
 
 pub fn validate_server_label(label: &str) -> Result<(), String> {
@@ -1455,6 +1626,193 @@ path = "assets/sample-001.opus"
         assert!(content.contains("[history]\nenabled = false"));
         assert!(content.contains("receive-dir = \"\""));
         assert!(!content.contains("form-bindings"));
+    }
+
+    #[test]
+    fn server_overrides_round_trip_nested_tables() {
+        let mut config = Config::default();
+        let mut server = ServerEntry::default();
+        server.files = FileOverrides {
+            receive_dir: Some("/srv/dl".to_string()),
+            max_receive_bytes: None,
+        };
+        server.history = HistoryOverrides {
+            enabled: Some(true),
+            location: Some("/tmp/.chatt-data".to_string()),
+        };
+        server.rooms = vec![
+            RoomOverrides {
+                room_id: RoomId(3),
+                files: FileOverrides {
+                    receive_dir: None,
+                    max_receive_bytes: Some(104_857_600),
+                },
+                history: HistoryOverrides::default(),
+            },
+            RoomOverrides {
+                room_id: RoomId(7),
+                files: FileOverrides {
+                    receive_dir: Some(String::new()),
+                    max_receive_bytes: None,
+                },
+                history: HistoryOverrides {
+                    enabled: Some(false),
+                    location: None,
+                },
+            },
+        ];
+        config.servers.push(server);
+        let content = render_runtime(&config);
+
+        assert!(content.contains("[servers.files]"), "{content}");
+        assert!(content.contains("[servers.history]"), "{content}");
+        assert!(content.contains("[[servers.rooms]]"), "{content}");
+        assert!(
+            content.contains("max-receive-bytes = 104857600"),
+            "{content}"
+        );
+
+        let arena = Arena::new();
+        let parsed: Config = toml_spanner::parse(&content, &arena).unwrap().to().unwrap();
+        let original = &config.servers[0];
+        let reloaded = &parsed.servers[0];
+        assert_eq!(reloaded.files, original.files);
+        assert_eq!(reloaded.history, original.history);
+        assert_eq!(reloaded.rooms, original.rooms);
+    }
+
+    #[test]
+    fn unset_override_fields_are_omitted_from_save() {
+        let mut config = Config::default();
+        config.servers.push(ServerEntry::default());
+        let content = render_runtime(&config);
+
+        assert!(!content.contains("[servers.files]"));
+        assert!(!content.contains("[servers.history]"));
+        assert!(!content.contains("[[servers.rooms]]"));
+    }
+
+    fn overridden_server() -> (Config, ServerEntry) {
+        let mut config = Config::default();
+        config.files.receive_dir = "/global/dl".to_string();
+        config.files.max_receive_bytes = 100;
+        config.history.enabled = false;
+        config.history.location = None;
+        let mut server = ServerEntry::default();
+        server.files = FileOverrides {
+            receive_dir: Some("/server/dl".to_string()),
+            max_receive_bytes: None,
+        };
+        server.history = HistoryOverrides {
+            enabled: None,
+            location: Some("/server/data".to_string()),
+        };
+        server.rooms = vec![RoomOverrides {
+            room_id: RoomId(3),
+            files: FileOverrides {
+                receive_dir: None,
+                max_receive_bytes: Some(300),
+            },
+            history: HistoryOverrides {
+                enabled: Some(true),
+                location: None,
+            },
+        }];
+        (config, server)
+    }
+
+    #[test]
+    fn effective_files_prefers_room_then_server_then_global() {
+        let (config, server) = overridden_server();
+
+        let global_only = config.effective_files(&ServerEntry::default(), None);
+        assert_eq!(global_only.receive_dir, Some(PathBuf::from("/global/dl")));
+        assert_eq!(global_only.max_receive_bytes, 100);
+
+        let server_level = config.effective_files(&server, None);
+        assert_eq!(server_level.receive_dir, Some(PathBuf::from("/server/dl")));
+        assert_eq!(server_level.max_receive_bytes, 100);
+
+        let room_level = config.effective_files(&server, Some(RoomId(3)));
+        assert_eq!(room_level.receive_dir, Some(PathBuf::from("/server/dl")));
+        assert_eq!(room_level.max_receive_bytes, 300);
+
+        let unknown_room = config.effective_files(&server, Some(RoomId(9)));
+        assert_eq!(unknown_room, server_level);
+    }
+
+    #[test]
+    fn explicit_empty_receive_dir_disables_downloads_at_room_level() {
+        let (config, mut server) = overridden_server();
+        server.rooms[0].files.receive_dir = Some(String::new());
+
+        let room_level = config.effective_files(&server, Some(RoomId(3)));
+        assert_eq!(room_level.receive_dir, None);
+        assert!(config.effective_files(&server, None).receive_dir.is_some());
+    }
+
+    #[test]
+    fn effective_history_location_falls_back_per_field() {
+        let (config, server) = overridden_server();
+
+        let server_level = config.effective_history(&server, None);
+        assert!(!server_level.enabled);
+        assert_eq!(server_level.location, Some(PathBuf::from("/server/data")));
+
+        let room_level = config.effective_history(&server, Some(RoomId(3)));
+        assert!(room_level.enabled);
+        assert_eq!(room_level.location, Some(PathBuf::from("/server/data")));
+
+        let mut config = config;
+        config.history.location = Some("/global/data".to_string());
+        let plain = config.effective_history(&ServerEntry::default(), None);
+        assert_eq!(plain.location, Some(PathBuf::from("/global/data")));
+    }
+
+    #[test]
+    fn file_policy_only_lists_rooms_with_file_overrides() {
+        let (mut config, mut server) = overridden_server();
+        server.rooms.push(RoomOverrides {
+            room_id: RoomId(5),
+            files: FileOverrides::default(),
+            history: HistoryOverrides {
+                enabled: Some(true),
+                location: None,
+            },
+        });
+        config.servers.push(server.clone());
+
+        let policy = config.file_policy(&server);
+        assert_eq!(policy.rooms.len(), 1);
+        assert_eq!(policy.rooms[0].0, RoomId(3));
+        assert_eq!(policy.default, config.effective_files(&server, None));
+    }
+
+    #[test]
+    fn duplicate_room_override_ids_are_rejected() {
+        let mut config = Config::default();
+        let mut server = ServerEntry::default();
+        server.rooms = vec![
+            RoomOverrides {
+                room_id: RoomId(3),
+                files: FileOverrides {
+                    receive_dir: Some("/a".to_string()),
+                    max_receive_bytes: None,
+                },
+                history: HistoryOverrides::default(),
+            },
+            RoomOverrides {
+                room_id: RoomId(3),
+                files: FileOverrides {
+                    receive_dir: Some("/b".to_string()),
+                    max_receive_bytes: None,
+                },
+                history: HistoryOverrides::default(),
+            },
+        ];
+        config.servers.push(server);
+
+        assert!(validation_errors(&config).contains("duplicate room override for room-id 3"));
     }
 
     #[test]

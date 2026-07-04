@@ -3,11 +3,20 @@ use ring::rand::SecureRandom;
 use rpc::{control::InviteTicket, crypto::encode_hex};
 
 use crate::{
-    config::{Config, FormBindings, ServerEntry, validate_server_entry},
+    config::{
+        Config, FileOverrides, FormBindings, HistoryOverrides, RoomOverrides, ServerEntry,
+        validate_server_entry,
+    },
+    settings::{
+        OverrideToggle, byte_limit_error, byte_limit_text, download_path_error, parse_byte_limit,
+    },
     theme::Theme,
     tui::form::{FormAction, FormFieldKind, FormMouseIntent},
     ui::{
-        form::{self, ActionButton, Commit, FieldIntent, Form, State as UiFormState},
+        form::{
+            self, ActionButton, Commit, DetailForm, FieldIntent, Form, FormSurface,
+            State as UiFormState,
+        },
         select::SelectableItem,
     },
 };
@@ -23,9 +32,27 @@ enum ServerEditButton {
 }
 
 const ACTIONS: [ActionButton<'static, ServerEditButton>; 3] = [
-    ActionButton::new("Save", ServerEditButton::Save),
-    ActionButton::primary("Save and join", ServerEditButton::SaveJoin),
-    ActionButton::new("Cancel", ServerEditButton::Cancel),
+    ActionButton {
+        key: "Save",
+        label: "Save",
+        value: ServerEditButton::Save,
+        help: "Persist these server settings to chatt.toml and return to the server list.",
+        primary: false,
+    },
+    ActionButton {
+        key: "Save and join",
+        label: "Save and join",
+        value: ServerEditButton::SaveJoin,
+        help: "Persist these server settings, then connect to this server.",
+        primary: true,
+    },
+    ActionButton {
+        key: "Cancel",
+        label: "Cancel",
+        value: ServerEditButton::Cancel,
+        help: "Discard this edit and return to the previous screen.",
+        primary: false,
+    },
 ];
 
 #[derive(Clone, Debug)]
@@ -58,6 +85,18 @@ pub(crate) struct ServerEditDraft {
     tcp_addr: String,
     udp_addr: String,
     udp_probe_addr: String,
+    files_choice: OverrideToggle,
+    download_path: String,
+    receive_limit: String,
+    history_choice: OverrideToggle,
+    history_location: String,
+    /// Global effective values, shown as what `inherit` resolves to.
+    inherited_downloads_on: bool,
+    inherited_receive_limit: String,
+    inherited_history_on: bool,
+    /// Room overrides pass through an edit untouched; the room settings popup
+    /// owns them.
+    rooms: Vec<RoomOverrides>,
     form: UiFormState,
 }
 
@@ -80,7 +119,12 @@ pub(crate) enum PairCompletion {
 }
 
 impl ServerEditDraft {
-    pub(crate) fn from_server(server: &ServerEntry, bindings: FormBindings) -> Self {
+    pub(crate) fn from_server(server: &ServerEntry, config: &Config) -> Self {
+        let (files_choice, download_path) = match &server.files.receive_dir {
+            None => (OverrideToggle::Inherit, String::new()),
+            Some(dir) if dir.trim().is_empty() => (OverrideToggle::Off, String::new()),
+            Some(dir) => (OverrideToggle::On, dir.clone()),
+        };
         Self {
             original_label: server.label.clone(),
             token: server.token.clone(),
@@ -90,8 +134,26 @@ impl ServerEditDraft {
             tcp_addr: server.tcp_addr.clone(),
             udp_addr: server.udp_addr.clone(),
             udp_probe_addr: server.udp_probe_addr.clone().unwrap_or_default(),
-            form: form::state_with_focus(bindings, SERVER_SECTION, "Label"),
+            files_choice,
+            download_path,
+            receive_limit: byte_limit_text(server.files.max_receive_bytes),
+            history_choice: OverrideToggle::from_option(server.history.enabled),
+            history_location: server.history.location.clone().unwrap_or_default(),
+            inherited_downloads_on: config.files.receive_dir_path().is_some(),
+            inherited_receive_limit: byte_limit_text(Some(config.files.max_receive_bytes)),
+            inherited_history_on: config.history.enabled,
+            rooms: server.rooms.clone(),
+            form: form::state_with_focus(config.ui.default_bindings, SERVER_SECTION, "Label"),
         }
+    }
+
+    pub(crate) fn title(&self) -> String {
+        format!("Edit Server {}", self.original_label)
+    }
+
+    /// The number of form rows the dialog body currently lays out.
+    pub(crate) fn form_height(&self) -> u16 {
+        20 + u16::from(self.files_choice == OverrideToggle::On)
     }
 
     pub(crate) fn handle_key(&mut self, key: KeyEvent, theme: &Theme) -> ServerEditEvent {
@@ -148,10 +210,11 @@ impl ServerEditDraft {
     }
 
     pub(crate) fn render(&mut self, area: Rect, buf: &mut Buffer, theme: &Theme) {
-        area.with(theme.background).fill(buf);
-        self.form.begin_frame(area);
-        {
-            let mut form = Form::new(
+        let mut body = area;
+        let detail_area = form::take_detail_area(&mut body, buf, theme, FormSurface::Dialog);
+        self.form.begin_frame(body);
+        let detail = {
+            let core = Form::new(
                 &mut self.form,
                 Some(buf),
                 theme,
@@ -160,9 +223,10 @@ impl ServerEditDraft {
                 None,
                 None,
             )
-            .with_label_width(LABEL_WIDTH);
+            .with_label_width(LABEL_WIDTH)
+            .with_surface(FormSurface::Dialog);
+            let mut form = DetailForm::new(core);
             let values = ServerEditValues {
-                original_label: &self.original_label,
                 token: &self.token,
                 server_public_key: &self.server_public_key,
                 label: &mut self.label,
@@ -170,10 +234,22 @@ impl ServerEditDraft {
                 tcp_addr: &mut self.tcp_addr,
                 udp_addr: &mut self.udp_addr,
                 udp_probe_addr: &mut self.udp_probe_addr,
+                files_choice: &mut self.files_choice,
+                download_path: &mut self.download_path,
+                receive_limit: &mut self.receive_limit,
+                history_choice: &mut self.history_choice,
+                history_location: &mut self.history_location,
+                inherited_downloads_on: self.inherited_downloads_on,
+                inherited_receive_limit: &self.inherited_receive_limit,
+                inherited_history_on: self.inherited_history_on,
             };
             server_edit_ui(&mut form, values);
-        }
+            form.detail().cloned()
+        };
         self.form.finish_frame();
+        if let Some(area) = detail_area {
+            form::draw_detail(area, buf, theme, detail.as_ref());
+        }
     }
 
     fn move_focus(&mut self, theme: &Theme, delta: isize) {
@@ -192,6 +268,25 @@ impl ServerEditDraft {
             );
         }
         let udp_probe_addr = non_empty_text(&draft.udp_probe_addr);
+        let receive_dir = match draft.files_choice {
+            OverrideToggle::Inherit => None,
+            OverrideToggle::On => {
+                let path = draft.download_path.trim();
+                if path.is_empty() {
+                    return Err("download path cannot be empty while downloads are on".to_string());
+                }
+                Some(path.to_string())
+            }
+            OverrideToggle::Off => Some(String::new()),
+        };
+        let files = FileOverrides {
+            receive_dir,
+            max_receive_bytes: parse_byte_limit(&draft.receive_limit)?,
+        };
+        let history = HistoryOverrides {
+            enabled: draft.history_choice.to_option(),
+            location: non_empty_text(&draft.history_location),
+        };
         let server = ServerEntry {
             label: draft.label.trim().to_string(),
             tcp_addr: draft.tcp_addr.trim().to_string(),
@@ -200,6 +295,9 @@ impl ServerEditDraft {
             username: draft.username.trim().to_string(),
             token: self.token.clone(),
             server_public_key: self.server_public_key.clone(),
+            files,
+            history,
+            rooms: self.rooms.clone(),
         };
         validate_server_entry(&server)?;
         Ok(ServerEditUpdate {
@@ -218,7 +316,7 @@ impl ServerEditDraft {
         let viewport = self.form.viewport();
         self.form.begin_frame(viewport);
         let activated = {
-            let mut form = Form::new(
+            let core = Form::new(
                 &mut self.form,
                 None,
                 theme,
@@ -227,9 +325,10 @@ impl ServerEditDraft {
                 commit,
                 focus_column,
             )
-            .with_label_width(LABEL_WIDTH);
+            .with_label_width(LABEL_WIDTH)
+            .with_surface(FormSurface::Dialog);
+            let mut form = DetailForm::new(core);
             let values = ServerEditValues {
-                original_label: &self.original_label,
                 token: &self.token,
                 server_public_key: &self.server_public_key,
                 label: &mut self.label,
@@ -237,6 +336,14 @@ impl ServerEditDraft {
                 tcp_addr: &mut self.tcp_addr,
                 udp_addr: &mut self.udp_addr,
                 udp_probe_addr: &mut self.udp_probe_addr,
+                files_choice: &mut self.files_choice,
+                download_path: &mut self.download_path,
+                receive_limit: &mut self.receive_limit,
+                history_choice: &mut self.history_choice,
+                history_location: &mut self.history_location,
+                inherited_downloads_on: self.inherited_downloads_on,
+                inherited_receive_limit: &self.inherited_receive_limit,
+                inherited_history_on: self.inherited_history_on,
             };
             server_edit_ui(&mut form, values)
         };
@@ -280,13 +387,21 @@ impl ServerEditDraft {
             tcp_addr: self.tcp_addr.clone(),
             udp_addr: self.udp_addr.clone(),
             udp_probe_addr: self.udp_probe_addr.clone(),
+            files_choice: self.files_choice,
+            download_path: self.download_path.clone(),
+            receive_limit: self.receive_limit.clone(),
+            history_choice: self.history_choice,
+            history_location: self.history_location.clone(),
+            inherited_downloads_on: self.inherited_downloads_on,
+            inherited_receive_limit: self.inherited_receive_limit.clone(),
+            inherited_history_on: self.inherited_history_on,
+            rooms: self.rooms.clone(),
             form: form::state_with_focus(FormBindings::Standard, SERVER_SECTION, "Label"),
         }
     }
 }
 
 struct ServerEditValues<'a> {
-    original_label: &'a str,
     token: &'a str,
     server_public_key: &'a str,
     label: &'a mut String,
@@ -294,21 +409,97 @@ struct ServerEditValues<'a> {
     tcp_addr: &'a mut String,
     udp_addr: &'a mut String,
     udp_probe_addr: &'a mut String,
+    files_choice: &'a mut OverrideToggle,
+    download_path: &'a mut String,
+    receive_limit: &'a mut String,
+    history_choice: &'a mut OverrideToggle,
+    history_location: &'a mut String,
+    inherited_downloads_on: bool,
+    inherited_receive_limit: &'a str,
+    inherited_history_on: bool,
 }
 
-fn server_edit_ui(form: &mut Form, values: ServerEditValues<'_>) -> Option<ServerEditButton> {
-    let title = format!("Edit Server {}", values.original_label);
+fn server_edit_ui(
+    form: &mut DetailForm<'_>,
+    values: ServerEditValues<'_>,
+) -> Option<ServerEditButton> {
     let token = short_key(values.token);
     let server_public_key = short_key(values.server_public_key);
-    form.section_with_id(&title, SERVER_SECTION);
+    form.section_with_id("Server", SERVER_SECTION);
     form.static_row("Token", &token);
     form.static_row("Key", &server_public_key);
     form.spacer(1);
-    form.text("Label", values.label, |_| None);
-    form.text("Username", values.username, |_| None);
-    form.text("TCP", values.tcp_addr, |_| None);
-    form.text("UDP", values.udp_addr, |_| None);
-    form.text("Probe", values.udp_probe_addr, |_| None);
+    if form.text("Label", values.label, |_| None).is_focus() {
+        form.set_help("Local alias for this server in the server list and commands.");
+    }
+    if form.text("Username", values.username, |_| None).is_focus() {
+        form.set_help("Display name sent to this server when connecting.");
+    }
+    if form.text("TCP", values.tcp_addr, |_| None).is_focus() {
+        form.set_help("TCP control address for login, room state, and chat messages.");
+    }
+    if form.text("UDP", values.udp_addr, |_| None).is_focus() {
+        form.set_help("UDP media relay address. Empty uses the TCP address host and port.");
+    }
+    if form
+        .text("Probe", values.udp_probe_addr, |_| None)
+        .is_focus()
+    {
+        form.set_help("Optional UDP NAT-probe address for direct peer media checks. Empty disables the separate probe endpoint.");
+    }
+    form.section("Downloads");
+    let inherited_downloads_on = values.inherited_downloads_on;
+    if form
+        .choice_value(
+            "Downloads",
+            values.files_choice,
+            &OverrideToggle::ALL,
+            |choice| choice.label(inherited_downloads_on),
+        )
+        .is_focus()
+    {
+        form.set_help("Controls whether files from this server are accepted, inherited from global settings, or disabled here.");
+    }
+    if *values.files_choice == OverrideToggle::On {
+        if form
+            .text("Path", values.download_path, |value| {
+                download_path_error(true, value)
+            })
+            .is_focus()
+        {
+            form.set_help("Directory where files received from this server are saved.");
+        }
+    }
+    if form
+        .text_with_placeholder(
+            "Limit",
+            values.receive_limit,
+            Some(values.inherited_receive_limit),
+            |value| byte_limit_error(value),
+        )
+        .is_focus()
+    {
+        form.set_help("Maximum file size accepted from this server. Empty inherits the global limit shown in the field.");
+    }
+    form.section("Persistence");
+    let inherited_history_on = values.inherited_history_on;
+    if form
+        .choice_value(
+            "Persistence",
+            values.history_choice,
+            &OverrideToggle::ALL,
+            |choice| choice.label(inherited_history_on),
+        )
+        .is_focus()
+    {
+        form.set_help("Controls whether chat history for this server is persisted, inherited, or disabled here.");
+    }
+    if form
+        .text("Location", values.history_location, |_| None)
+        .is_focus()
+    {
+        form.set_help("Base directory for this server's persisted room catalogs and chat logs. Empty inherits the global location.");
+    }
     form.spacer(1);
     form.actions(&ACTIONS).activated
 }
@@ -352,6 +543,7 @@ pub(crate) fn server_entry_from_invite(
         username,
         token,
         server_public_key: ticket.server_public_key.clone(),
+        ..ServerEntry::default()
     })
 }
 
@@ -482,5 +674,86 @@ pub(crate) fn default_join_display_name() -> String {
         "User".to_string()
     } else {
         name
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rpc::ids::RoomId;
+
+    fn overridden_entry() -> ServerEntry {
+        let mut server = ServerEntry::default();
+        server.files = FileOverrides {
+            receive_dir: Some("/srv/dl".to_string()),
+            max_receive_bytes: Some(100 * 1024 * 1024),
+        };
+        server.history = HistoryOverrides {
+            enabled: Some(true),
+            location: Some("/tmp/.chatt-data".to_string()),
+        };
+        server.rooms = vec![RoomOverrides {
+            room_id: RoomId(3),
+            files: FileOverrides {
+                receive_dir: Some(String::new()),
+                max_receive_bytes: None,
+            },
+            history: HistoryOverrides::default(),
+        }];
+        server
+    }
+
+    #[test]
+    fn draft_round_trips_inherit_and_explicit_values() {
+        let config = Config::default();
+        let original = overridden_entry();
+
+        let draft = ServerEditDraft::from_server(&original, &config);
+        let saved = draft.to_update().unwrap().server;
+        assert_eq!(saved.files, original.files);
+        assert_eq!(saved.history, original.history);
+
+        let plain = ServerEntry::default();
+        let draft = ServerEditDraft::from_server(&plain, &config);
+        let saved = draft.to_update().unwrap().server;
+        assert_eq!(saved.files, FileOverrides::default());
+        assert_eq!(saved.history, HistoryOverrides::default());
+    }
+
+    #[test]
+    fn empty_limit_uses_global_limit_placeholder() {
+        let mut config = Config::default();
+        config.files.max_receive_bytes = 125 * 1024 * 1024;
+        let draft = ServerEditDraft::from_server(&ServerEntry::default(), &config);
+
+        assert!(draft.receive_limit.is_empty());
+        assert_eq!(draft.inherited_receive_limit, "125M");
+        assert_eq!(
+            draft.to_update().unwrap().server.files.max_receive_bytes,
+            None
+        );
+    }
+
+    #[test]
+    fn save_preserves_untouched_room_overrides() {
+        let config = Config::default();
+        let original = overridden_entry();
+
+        let draft = ServerEditDraft::from_server(&original, &config);
+        let saved = draft.to_update().unwrap().server;
+
+        assert_eq!(saved.rooms, original.rooms);
+    }
+
+    #[test]
+    fn downloads_on_requires_a_path() {
+        let config = Config::default();
+        let mut server = ServerEntry::default();
+        server.files.receive_dir = Some("/srv/dl".to_string());
+
+        let mut draft = ServerEditDraft::from_server(&server, &config);
+        draft.download_path.clear();
+
+        assert!(draft.to_update().is_err());
     }
 }
