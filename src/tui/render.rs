@@ -938,15 +938,15 @@ fn draw_top_bar(area: Rect, app: &mut App, buf: &mut Buffer, capture: Option<&St
     }
 
     let mut right = area;
-    app.chrome.top_bar.video = draw_video_status_block(&mut right, app, buf);
     draw_top_bar_voice_buttons(&mut right, app, buf);
-    draw_status_segment_right(&mut right, buf, theme.status_fill, " ");
 
     let meter_width = right.w.min(14);
     if meter_width > 0 {
         let meter = right.take_right(meter_width as i32);
         ui::vu::draw_status_vu(meter, buf, capture, &theme);
     }
+
+    app.chrome.top_bar.video = draw_video_status_block(&mut right, app, buf);
 }
 
 fn draw_video_status_block(row: &mut Rect, app: &App, buf: &mut Buffer) -> Rect {
