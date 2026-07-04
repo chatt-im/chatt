@@ -1810,16 +1810,23 @@ impl App {
             }
             NetworkEvent::Chat(message) => {
                 let viewed = self.room.viewed_room == Some(message.room_id);
-                if viewed && let Some(feed) = &self.web_feed {
+                let feed_message = (viewed && self.web_feed.is_some()).then(|| message.clone());
+                let update = RoomSession::chat_received(&mut self.room, message, self.user_id);
+                let Some(update) = update else {
+                    return;
+                };
+                if !update.fresh {
+                    return;
+                }
+                if let Some(message) = feed_message
+                    && let Some(feed) = &self.web_feed
+                {
                     feed.send(crate::web_server::WebMessage::from_chat(
                         &message,
                         &|target| self.room.web_ref_for(target),
                     ));
                 }
-                let update = RoomSession::chat_received(&mut self.room, message, self.user_id);
-                if let Some(update) = update
-                    && !update.local
-                {
+                if !update.local {
                     self.play_notification(NotificationSound::MessageReceived);
                 }
             }

@@ -128,6 +128,34 @@ impl ClientRoom {
             transfers: HashMap::new(),
         }
     }
+
+    /// Applies one live message: dedup, disk capture, canonical list, buffer,
+    /// and web-attachment correlation. Returns whether it was fresh.
+    fn receive_chat(&mut self, message: &ChatMessage, local: bool, max_messages: usize) -> bool {
+        if !self
+            .seen
+            .insert((message.timestamp_ms, message.message_id.0))
+        {
+            return false;
+        }
+        if let Some(store) = &mut self.history {
+            store.append_message(message);
+        }
+        self.messages.push(message.clone());
+        trim_messages(&mut self.messages, max_messages);
+        self.chat.push_chat(message.clone(), local);
+        if let Some(transfer_id) = message.file_transfer_id {
+            let key = FileHistoryKey {
+                timestamp_ms: message.timestamp_ms,
+                transfer_id,
+            };
+            if let Some(attachment) = self.web_file_attachments.get(&key).cloned() {
+                self.web_attachments
+                    .insert((message.timestamp_ms, message.message_id.0), attachment);
+            }
+        }
+        true
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -263,6 +291,9 @@ impl UserSelectionError {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct RoomChatUpdate {
     pub(crate) local: bool,
+    /// Whether the message was new to the room rather than a replayed frame
+    /// dropped by dedup. Notifications and feed pushes key off this.
+    pub(crate) fresh: bool,
     pub(crate) should_scroll_bottom: bool,
 }
 
@@ -696,6 +727,34 @@ impl RoomSession {
             self.parked.insert(room_id, room);
         }
         self.parked.get_mut(&room_id)
+    }
+
+    /// The in-memory state for `room_id`: the active room when viewed, else
+    /// an archived or parked buffer. Never materializes from disk.
+    fn room_mut(&mut self, room_id: RoomId) -> Option<&mut ClientRoom> {
+        if self.viewed_room == Some(room_id) {
+            return Some(&mut self.active);
+        }
+        if self.archived_rooms.contains_key(&room_id) {
+            return self.archived_rooms.get_mut(&room_id);
+        }
+        self.parked.get_mut(&room_id)
+    }
+
+    /// Like [`room_mut`](Self::room_mut), but materializes a known but
+    /// unloaded room from its disk capture.
+    fn room_mut_materializing(
+        &mut self,
+        room_id: RoomId,
+        local_user: Option<UserId>,
+    ) -> Option<&mut ClientRoom> {
+        if self.viewed_room == Some(room_id) {
+            return Some(&mut self.active);
+        }
+        if self.archived_rooms.contains_key(&room_id) {
+            return self.archived_rooms.get_mut(&room_id);
+        }
+        self.ensure_parked_room(room_id, local_user)
     }
 
     /// Switches the chat panel to `room_id`, parking the current room's state
@@ -1328,79 +1387,27 @@ impl RoomSession {
         if let Some(meta) = self.metas.get_mut(&room_id) {
             meta.head = Some(message.message_id).max(meta.head);
         }
-        if self.viewed_room == Some(room_id) {
-            let should_scroll_bottom = self.active.chat.scroll_offset() == 0;
-            let web_attachment = message
-                .file_transfer_id
-                .and_then(|transfer_id| {
-                    self.active
-                        .web_file_attachments
-                        .get(&FileHistoryKey {
-                            timestamp_ms: message.timestamp_ms,
-                            transfer_id,
-                        })
-                        .cloned()
-                })
-                .map(|attachment| (message.timestamp_ms, message.message_id.0, attachment));
-            if self
-                .active
-                .seen
-                .insert((message.timestamp_ms, message.message_id.0))
-            {
-                if let Some(store) = &mut self.active.history {
-                    store.append_message(&message);
-                }
-                self.mark_participant_online_in_room(room_id, sender);
-                self.participants.note_message(&message);
-                self.active.messages.push(message.clone());
-                trim_messages(&mut self.active.messages, self.max_messages);
-                self.active.chat.push_chat(message, local);
-                if let Some((timestamp_ms, message_id, attachment)) = web_attachment {
-                    self.active
-                        .web_attachments
-                        .insert((timestamp_ms, message_id), attachment);
-                }
-                if should_scroll_bottom {
-                    self.active.chat.bottom();
-                }
-                self.mark_viewed_read();
-            }
-            return Some(RoomChatUpdate {
-                local,
-                should_scroll_bottom,
-            });
-        }
+        let viewed = self.viewed_room == Some(room_id);
         let max_messages = self.max_messages;
-        let fresh = {
-            let room = self.ensure_parked_room(room_id, local_user)?;
-            if room
-                .seen
-                .insert((message.timestamp_ms, message.message_id.0))
-            {
-                if let Some(store) = &mut room.history {
-                    store.append_message(&message);
-                }
-                room.messages.push(message.clone());
-                trim_messages(&mut room.messages, max_messages);
-                room.chat.push_chat(message, local);
-                room.chat.bottom();
-                true
-            } else {
-                false
-            }
-        };
+        let room = self.room_mut_materializing(room_id, local_user)?;
+        let should_scroll_bottom = viewed && room.chat.scroll_offset() == 0;
+        let fresh = room.receive_chat(&message, local, max_messages);
+        if fresh && (!viewed || should_scroll_bottom) {
+            room.chat.bottom();
+        }
         if fresh {
             self.mark_participant_online_in_room(room_id, sender);
-        }
-        if fresh
-            && !local
-            && let Some(meta) = self.metas.get_mut(&room_id)
-        {
-            meta.unread = meta.unread.saturating_add(1);
+            if viewed {
+                self.participants.note_message(&message);
+                self.mark_viewed_read();
+            } else if !local && let Some(meta) = self.metas.get_mut(&room_id) {
+                meta.unread = meta.unread.saturating_add(1);
+            }
         }
         Some(RoomChatUpdate {
             local,
-            should_scroll_bottom: false,
+            fresh,
+            should_scroll_bottom,
         })
     }
 
@@ -1415,67 +1422,18 @@ impl RoomSession {
         length: u64,
         dimensions: Option<(u32, u32)>,
     ) {
-        if self.viewed_room != Some(room_id) {
-            if let Some(room) = self.archived_rooms.get_mut(&room_id) {
-                record_room_file(
-                    room,
-                    transfer_id,
-                    timestamp_ms,
-                    file_name,
-                    length,
-                    dimensions,
-                );
-                return;
-            }
-            if let Some(room) = self.ensure_parked_room(room_id, self.local_user) {
-                record_room_file(
-                    room,
-                    transfer_id,
-                    timestamp_ms,
-                    file_name,
-                    length,
-                    dimensions,
-                );
-            }
+        let local_user = self.local_user;
+        let Some(room) = self.room_mut_materializing(room_id, local_user) else {
             return;
-        }
-        let packed_dims =
-            dimensions.map_or(0, |(width, height)| ((height as u64) << 32) | width as u64);
-        if let Some(store) = &mut self.active.history {
-            store.append_file_detail(
-                FileHistoryKey {
-                    timestamp_ms,
-                    transfer_id,
-                },
-                file_name,
-                length,
-                packed_dims,
-            );
-        }
-        self.active.files.insert(
-            FileHistoryKey {
-                timestamp_ms,
-                transfer_id,
-            },
-            room_history::FileDetail {
-                file_name: file_name.to_string(),
-                length,
-                packed_dims,
-            },
+        };
+        record_room_file(
+            room,
+            transfer_id,
+            timestamp_ms,
+            file_name,
+            length,
+            dimensions,
         );
-        let attachment = WebAttachment::from_served_file(file_name, dimensions);
-        self.active.web_file_attachments.insert(
-            FileHistoryKey {
-                timestamp_ms,
-                transfer_id,
-            },
-            attachment.clone(),
-        );
-        if let Some(message_id) = file_message_id(&self.active.chat, timestamp_ms, transfer_id) {
-            self.active
-                .web_attachments
-                .insert((timestamp_ms, message_id), attachment);
-        }
     }
 
     /// Records a progress tick for an in-flight transfer. A tick that reaches or
@@ -1490,30 +1448,12 @@ impl RoomSession {
         total: u64,
         direction: TransferDirection,
     ) {
-        if self.viewed_room != Some(room_id) {
-            if let Some(room) = self.archived_rooms.get_mut(&room_id) {
-                update_transfer_progress(
-                    &mut room.transfers,
-                    transfer_id,
-                    transferred,
-                    total,
-                    direction,
-                );
-                return;
-            }
-            if let Some(room) = self.ensure_parked_room(room_id, self.local_user) {
-                update_transfer_progress(
-                    &mut room.transfers,
-                    transfer_id,
-                    transferred,
-                    total,
-                    direction,
-                );
-            }
+        let local_user = self.local_user;
+        let Some(room) = self.room_mut_materializing(room_id, local_user) else {
             return;
-        }
+        };
         update_transfer_progress(
-            &mut self.active.transfers,
+            &mut room.transfers,
             transfer_id,
             transferred,
             total,
@@ -1521,15 +1461,14 @@ impl RoomSession {
         );
     }
 
-    /// Removes any progress overlay for `transfer_id`, on completion or cancel.
+    /// Removes any progress overlay for `transfer_id`, on completion or
+    /// cancel. A room with no in-memory state has no overlay to clear, so
+    /// this never materializes one from disk.
     pub(crate) fn clear_transfer(&mut self, room_id: RoomId, transfer_id: FileTransferId) {
-        if self.viewed_room == Some(room_id) {
-            self.active.transfers.remove(&transfer_id);
-        } else if let Some(room) = self.archived_rooms.get_mut(&room_id) {
-            room.transfers.remove(&transfer_id);
-        } else if let Some(room) = self.ensure_parked_room(room_id, self.local_user) {
-            room.transfers.remove(&transfer_id);
-        }
+        let Some(room) = self.room_mut(room_id) else {
+            return;
+        };
+        room.transfers.remove(&transfer_id);
     }
 
     /// The live progress for `transfer_id`, if a transfer is in flight.
@@ -2069,6 +2008,52 @@ mod tests {
         assert!(room.transfer(id).is_some());
         room.clear_transfer(RoomId(1), id);
         assert!(room.transfer(id).is_none());
+    }
+
+    #[test]
+    fn clear_transfer_skips_unmaterialized_rooms() {
+        let mut room = test_room();
+        enter(&mut room, Vec::new(), Vec::new(), Some(UserId(1)));
+        assert_eq!(room.parked.len(), 0);
+
+        room.clear_transfer(RoomId(2), FileTransferId(9));
+
+        assert_eq!(
+            room.parked.len(),
+            0,
+            "no disk materialize for a no-op clear"
+        );
+    }
+
+    #[test]
+    fn chat_received_reports_duplicates_symmetrically() {
+        let mut room = test_room();
+        enter(&mut room, Vec::new(), Vec::new(), Some(UserId(1)));
+
+        let update = room
+            .chat_received(message(1, UserId(2), "viewed"), Some(UserId(1)))
+            .expect("known room");
+        assert!(update.fresh);
+        let update = room
+            .chat_received(message(1, UserId(2), "viewed dupe"), Some(UserId(1)))
+            .expect("known room");
+        assert!(!update.fresh);
+
+        let update = room
+            .chat_received(
+                message_in(RoomId(2), 1, UserId(2), "parked"),
+                Some(UserId(1)),
+            )
+            .expect("known room");
+        assert!(update.fresh);
+        let update = room
+            .chat_received(
+                message_in(RoomId(2), 1, UserId(2), "parked dupe"),
+                Some(UserId(1)),
+            )
+            .expect("known room");
+        assert!(!update.fresh);
+        assert_eq!(room.room_meta(RoomId(2)).unwrap().unread, 1);
     }
 
     #[test]
