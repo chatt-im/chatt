@@ -41,7 +41,7 @@ use rpc::{
         SessionSecrets, complete_client_transport_handshake, dev_server_public_key,
         ed25519_public_key_from_hex, encode_hex, generate_client_hello,
     },
-    frame,
+    frame, history,
     ids::{BugReportId, FileTransferId, MessageId, RoomId, SessionId, StreamId, UserId},
     media::{self, MediaPayload, VoicePayload as MediaVoicePayload},
 };
@@ -253,11 +253,13 @@ pub enum NetworkEvent {
         room_id: RoomId,
         peer: UserId,
     },
-    /// One page of server-retained history for a room.
+    /// One chunk of server-retained history for a room.
     HistoryChunk {
         room_id: RoomId,
         messages: Vec<ChatMessage>,
         at_start: bool,
+        /// True on the final chunk for one fetch request.
+        complete: bool,
     },
     Chat(ChatMessage),
     FileReceived {
@@ -2221,6 +2223,10 @@ impl WorkerState {
                 .open_next(CHANNEL_CONTROL, &frame)
                 .map_err(|error| error.to_string())?;
             kvlog::debug!("server control decrypted", payload_size = plaintext.len());
+            if self.handle_history_chunk_payload(&plaintext)? {
+                controls_since_file_pump += 1;
+                continue;
+            }
             let control = decode_server_control(&plaintext)?;
             self.handle_server_control(control);
             controls_since_file_pump += 1;
@@ -3420,6 +3426,26 @@ impl WorkerState {
         });
     }
 
+    fn handle_history_chunk_payload(&mut self, payload: &[u8]) -> Result<bool, String> {
+        let Some(chunk) = history::decode_chunk(payload)? else {
+            return Ok(false);
+        };
+        kvlog::info!(
+            "client history chunk received",
+            room_id = chunk.room_id.0,
+            message_count = chunk.messages.len(),
+            at_start = chunk.at_start,
+            complete = chunk.complete
+        );
+        let _ = self.events.send(NetworkEvent::HistoryChunk {
+            room_id: chunk.room_id,
+            messages: chunk.messages,
+            at_start: chunk.at_start,
+            complete: chunk.complete,
+        });
+        Ok(true)
+    }
+
     fn handle_server_control(&mut self, control: ServerControl) {
         kvlog::info!(
             "server control handling",
@@ -3743,23 +3769,6 @@ impl WorkerState {
             }
             ServerControl::DmOpened { room_id, peer } => {
                 let _ = self.events.send(NetworkEvent::DmOpened { room_id, peer });
-            }
-            ServerControl::HistoryChunk {
-                room_id,
-                messages,
-                at_start,
-            } => {
-                kvlog::info!(
-                    "client history chunk received",
-                    room_id = room_id.0,
-                    message_count = messages.len(),
-                    at_start
-                );
-                let _ = self.events.send(NetworkEvent::HistoryChunk {
-                    room_id,
-                    messages,
-                    at_start,
-                });
             }
             ServerControl::Presence { user, online } => {
                 kvlog::info!(
@@ -5080,7 +5089,6 @@ fn server_control_kind(control: &ServerControl) -> &'static str {
         ServerControl::BugReportSaved { .. } => "bug_report_saved",
         ServerControl::RoomUpserted { .. } => "room_upserted",
         ServerControl::DmOpened { .. } => "dm_opened",
-        ServerControl::HistoryChunk { .. } => "history_chunk",
     }
 }
 

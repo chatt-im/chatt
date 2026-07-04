@@ -157,8 +157,8 @@ pub enum ClientControl {
         report_id: BugReportId,
     },
     /// Page a room's retained history backwards from `before` (or the newest
-    /// retained message when `None`). Answered with
-    /// [`ServerControl::HistoryChunk`].
+    /// retained message when `None`). Answered with raw history chunks from
+    /// [`crate::history`].
     FetchHistory {
         room_id: RoomId,
         before: Option<MessageId>,
@@ -316,14 +316,6 @@ pub enum ServerControl {
     DmOpened {
         room_id: RoomId,
         peer: UserId,
-    },
-    /// One page of retained history: ascending by message id, strictly before
-    /// the request's `before` cursor.
-    HistoryChunk {
-        room_id: RoomId,
-        messages: Vec<ChatMessage>,
-        /// True when the page reaches the oldest message the server retains.
-        at_start: bool,
     },
     /// Server-wide presence for one user.
     Presence {
@@ -1180,7 +1172,7 @@ mod tests {
     }
 
     #[test]
-    fn history_controls_round_trip() {
+    fn fetch_history_request_round_trips() {
         let request = ClientControl::FetchHistory {
             room_id: RoomId(2),
             before: Some(MessageId(300)),
@@ -1188,22 +1180,6 @@ mod tests {
         };
         let encoded = encode_client_control(&request).unwrap();
         assert_eq!(decode_client_control(&encoded).unwrap(), request);
-
-        let chunk = ServerControl::HistoryChunk {
-            room_id: RoomId(2),
-            messages: vec![ChatMessage {
-                message_id: MessageId(299),
-                room_id: RoomId(2),
-                sender: UserId(1),
-                sender_name: "Alice".to_string(),
-                timestamp_ms: 1_000,
-                body: "hello".to_string(),
-                file_transfer_id: None,
-            }],
-            at_start: false,
-        };
-        let encoded = encode_server_control(&chunk);
-        assert_eq!(decode_server_control(&encoded).unwrap(), chunk);
     }
 
     #[test]

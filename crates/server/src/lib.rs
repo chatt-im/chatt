@@ -50,6 +50,9 @@ use config::{
 use local_admin::{AdminCommand, AdminSocket};
 use room_store::RoomStore;
 
+#[cfg(test)]
+use rpc::history;
+
 const LISTENER: Token = Token(0);
 const UDP: Token = Token(1);
 const UDP_PROBE: Token = Token(2);
@@ -68,6 +71,10 @@ const INVITE_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 const OPEN_PAIR_RATE_WINDOW: Duration = Duration::from_secs(60);
 const OPEN_PAIR_PER_IP_LIMIT: usize = 6;
 const OPEN_PAIR_GLOBAL_LIMIT: usize = 30;
+/// Soft target for retained encoded history carried by one control chunk.
+/// The protocol hard cap is higher; this leaves room for framing, encryption,
+/// and future metadata while allowing one fetch to stream over several chunks.
+const HISTORY_CHUNK_TARGET_BYTES: usize = 192 * 1024;
 /// Cap on a stream's fast-start ring. Keyframes reset the ring, so this only
 /// bounds a pathologically long GOP rather than normal operation.
 const VIDEO_RING_MAX_BYTES: usize = 8 * 1024 * 1024;
@@ -2164,42 +2171,48 @@ impl Server {
         let Some(token) = self.live_token_for_session(session_id) else {
             return;
         };
-        let (messages, at_start) = self
-            .store
-            .messages_before(room_id, before, usize::from(limit));
-        let original_count = messages.len();
-        let (messages, at_start) =
-            trim_history_chunk_to_control_budget(room_id, messages, at_start);
-        if messages.len() != original_count {
-            kvlog::warn!(
-                "history chunk trimmed to fit control frame",
-                session_id = session_id.0,
-                room_id = room_id.0,
-                requested_messages = original_count,
-                sent_messages = messages.len()
-            );
-        }
+        let plan = self.store.history_fetch_plan_before(
+            room_id,
+            before,
+            usize::from(limit),
+            HISTORY_CHUNK_TARGET_BYTES,
+        );
+        let chunk_count = plan.chunk_count();
         kvlog::info!(
-            "history chunk sent",
+            "history chunks queued",
             session_id = session_id.0,
             room_id = room_id.0,
-            message_count = messages.len(),
-            at_start
+            message_count = plan.message_count,
+            chunk_count,
+            at_start = plan.at_start
         );
-        if let Err(error) = self.send_control_to_token(
-            token,
-            &ServerControl::HistoryChunk {
-                room_id,
-                messages,
-                at_start,
-            },
-        ) {
-            kvlog::warn!(
-                "history chunk send failed",
-                session_id = session_id.0,
-                room_id = room_id.0,
-                error = error.as_str()
-            );
+        for chunk_index in 0..chunk_count {
+            let payload = match self.store.encode_history_chunk(&plan, chunk_index) {
+                Ok(payload) => payload,
+                Err(error) => {
+                    kvlog::warn!(
+                        "history chunk encode failed",
+                        session_id = session_id.0,
+                        room_id = room_id.0,
+                        chunk_index,
+                        chunk_count,
+                        error = error.as_str()
+                    );
+                    break;
+                }
+            };
+            if let Err(error) = self.queue_control_payload_to_token(token, "history_chunk", payload)
+            {
+                kvlog::warn!(
+                    "history chunk send failed",
+                    session_id = session_id.0,
+                    room_id = room_id.0,
+                    chunk_index,
+                    chunk_count,
+                    error = error.as_str()
+                );
+                break;
+            }
         }
     }
 
@@ -3348,6 +3361,18 @@ impl Server {
         control: &ServerControl,
     ) -> Result<(), String> {
         let payload = encode_server_control(control);
+        self.queue_control_payload_to_token(token, server_control_kind(control), payload)
+    }
+
+    fn queue_control_payload_to_token(
+        &mut self,
+        token: Token,
+        kind: &'static str,
+        payload: Vec<u8>,
+    ) -> Result<(), String> {
+        if payload.len() > MAX_CONTROL_PAYLOAD_BYTES {
+            return Err(format!("{kind} exceeds control payload limit"));
+        }
         let client = self
             .clients
             .get_mut(&token)
@@ -3363,7 +3388,7 @@ impl Server {
         kvlog::debug!(
             "server control queued",
             token = token.0,
-            kind = server_control_kind(control),
+            kind = kind,
             payload_size = payload.len(),
             encrypted_size = encrypted.len(),
             queued_bytes = client.write_buf.len()
@@ -4070,48 +4095,6 @@ fn accessible_recipient_tokens(
         .collect()
 }
 
-/// Shrinks an ascending history page until it fits in one control payload.
-///
-/// When a page is too large, the oldest records are dropped first so the client
-/// still receives the newest messages before its cursor. A byte-trimmed page is
-/// never `at_start`, even if the untrimmed slice reached the store's oldest
-/// retained message.
-fn trim_history_chunk_to_control_budget(
-    room_id: RoomId,
-    messages: Vec<ChatMessage>,
-    at_start: bool,
-) -> (Vec<ChatMessage>, bool) {
-    if history_chunk_fits_control_budget(room_id, &messages, at_start) {
-        return (messages, at_start);
-    }
-
-    let mut low = 0usize;
-    let mut high = messages.len();
-    while low < high {
-        let mid = (low + high) / 2;
-        if history_chunk_fits_control_budget(room_id, &messages[mid..], false) {
-            high = mid;
-        } else {
-            low = mid + 1;
-        }
-    }
-    let trimmed = messages[low..].to_vec();
-    (trimmed, false)
-}
-
-fn history_chunk_fits_control_budget(
-    room_id: RoomId,
-    messages: &[ChatMessage],
-    at_start: bool,
-) -> bool {
-    let encoded = encode_server_control(&ServerControl::HistoryChunk {
-        room_id,
-        messages: messages.to_vec(),
-        at_start,
-    });
-    encoded.len() <= MAX_CONTROL_PAYLOAD_BYTES
-}
-
 fn dm_room_name(a: UserId, b: UserId) -> String {
     format!("dm:{}:{}", a.0, b.0)
 }
@@ -4399,7 +4382,6 @@ fn server_control_kind(control: &ServerControl) -> &'static str {
         ServerControl::BugReportSaved { .. } => "bug_report_saved",
         ServerControl::RoomUpserted { .. } => "room_upserted",
         ServerControl::DmOpened { .. } => "dm_opened",
-        ServerControl::HistoryChunk { .. } => "history_chunk",
     }
 }
 
@@ -4478,6 +4460,12 @@ mod tests {
             announced: true,
             connected_at_ms: 0,
         }
+    }
+
+    fn decode_history_chunk(payload: &[u8]) -> history::HistoryChunk {
+        history::decode_chunk(payload)
+            .expect("decode history chunk")
+            .expect("history chunk payload")
     }
 
     #[test]
@@ -4662,6 +4650,17 @@ mod tests {
             }
         }
         panic!("expected control was not received");
+    }
+
+    fn read_until_history_chunk(peer: &mut std::net::TcpStream) -> history::HistoryChunk {
+        for _ in 0..64 {
+            let payload = read_plaintext_server_payload(peer);
+            if let Some(chunk) = history::decode_chunk(&payload).expect("decode history chunk") {
+                return chunk;
+            }
+            let _ = rpc::control::decode_server_control(&payload).expect("decode server control");
+        }
+        panic!("expected history chunk was not received");
     }
 
     fn assert_no_control(peer: &mut std::net::TcpStream) {
@@ -4868,41 +4867,26 @@ mod tests {
 
         server.fetch_history(session, RoomId(1), Some(MessageId(6)), 4);
 
-        let chunk = read_until(&mut peer, |control| {
-            matches!(control, ServerControl::HistoryChunk { .. })
-        });
-        let ServerControl::HistoryChunk {
-            room_id,
-            messages,
-            at_start,
-        } = chunk
-        else {
-            unreachable!();
-        };
-        assert_eq!(room_id, RoomId(1));
-        let ids: Vec<u64> = messages
+        let chunk = read_until_history_chunk(&mut peer);
+        assert_eq!(chunk.room_id, RoomId(1));
+        assert!(chunk.complete);
+        let ids: Vec<u64> = chunk
+            .messages
             .iter()
             .map(|message| message.message_id.0)
             .collect();
         assert_eq!(ids, vec![2, 3, 4, 5]);
-        assert!(!at_start);
+        assert!(!chunk.at_start);
 
         server.fetch_history(session, RoomId(1), Some(MessageId(2)), 4);
-        let chunk = read_until(&mut peer, |control| {
-            matches!(control, ServerControl::HistoryChunk { .. })
-        });
-        let ServerControl::HistoryChunk {
-            messages, at_start, ..
-        } = chunk
-        else {
-            unreachable!();
-        };
-        assert_eq!(messages.len(), 1);
-        assert!(at_start);
+        let chunk = read_until_history_chunk(&mut peer);
+        assert!(chunk.complete);
+        assert_eq!(chunk.messages.len(), 1);
+        assert!(chunk.at_start);
     }
 
     #[test]
-    fn history_fetch_trims_page_to_one_control_frame() {
+    fn history_fetch_streams_page_over_bounded_chunks() {
         let mut config = ServerConfig::default();
         config.network.tcp_addr = "127.0.0.1:0".parse().unwrap();
         config.network.udp_addr = "127.0.0.1:0".parse().unwrap();
@@ -4927,22 +4911,26 @@ mod tests {
             rpc::control::MAX_HISTORY_FETCH_MESSAGES,
         );
 
-        let chunk = read_plaintext_server_control(&mut peer);
-        let ServerControl::HistoryChunk {
-            messages, at_start, ..
-        } = chunk
-        else {
-            panic!("expected history chunk");
-        };
-        assert!(!messages.is_empty());
-        assert!(messages.len() < 80);
-        assert!(!at_start, "a byte-trimmed page has not reached the start");
-        let encoded = encode_server_control(&ServerControl::HistoryChunk {
-            room_id: RoomId(1),
-            messages,
-            at_start,
-        });
-        assert!(encoded.len() <= rpc::control::MAX_CONTROL_PAYLOAD_BYTES);
+        let mut chunk_count = 0usize;
+        let mut message_count = 0usize;
+        let mut completed = false;
+        let mut final_at_start = false;
+        while !completed {
+            let payload = read_plaintext_server_payload(&mut peer);
+            assert!(payload.len() <= rpc::control::MAX_CONTROL_PAYLOAD_BYTES);
+            let chunk = decode_history_chunk(&payload);
+            assert_eq!(chunk.room_id, RoomId(1));
+            if !chunk.complete {
+                assert!(!chunk.at_start, "only the final chunk carries at_start");
+            }
+            message_count += chunk.messages.len();
+            chunk_count += 1;
+            completed = chunk.complete;
+            final_at_start = chunk.at_start;
+        }
+        assert!(chunk_count > 1, "large history response should be chunked");
+        assert_eq!(message_count, 80);
+        assert!(final_at_start);
     }
 
     #[test]
@@ -5979,13 +5967,18 @@ mod tests {
         (conn, peer)
     }
 
-    fn read_plaintext_server_control(peer: &mut std::net::TcpStream) -> ServerControl {
+    fn read_plaintext_server_payload(peer: &mut std::net::TcpStream) -> Vec<u8> {
         peer.set_read_timeout(Some(Duration::from_secs(1)))
             .expect("set read timeout");
         let mut len = [0u8; 4];
         peer.read_exact(&mut len).expect("read frame length");
         let mut frame = vec![0u8; u32::from_le_bytes(len) as usize];
         peer.read_exact(&mut frame).expect("read frame body");
+        frame
+    }
+
+    fn read_plaintext_server_control(peer: &mut std::net::TcpStream) -> ServerControl {
+        let frame = read_plaintext_server_payload(peer);
         rpc::control::decode_server_control(&frame).expect("decode server control")
     }
 
