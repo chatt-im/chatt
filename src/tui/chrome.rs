@@ -16,6 +16,7 @@ pub(crate) struct KeyPreviewState {
 pub(crate) struct TopBarLayout {
     pub(crate) mute: Rect,
     pub(crate) deafen: Rect,
+    pub(crate) video: Rect,
 }
 
 impl Default for TopBarLayout {
@@ -23,6 +24,7 @@ impl Default for TopBarLayout {
         Self {
             mute: Rect::EMPTY,
             deafen: Rect::EMPTY,
+            video: Rect::EMPTY,
         }
     }
 }

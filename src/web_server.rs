@@ -8,6 +8,7 @@
 //! demand by sending a `load_older` request as it scrolls up, addressed by a
 //! server-assigned monotonic sequence number.
 
+use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::io;
 use std::net::SocketAddr;
@@ -23,7 +24,10 @@ use darkhttp::{
     WebSocketMessage,
 };
 use jsony::Jsony;
-use rpc::control::{ChatMessage, FileMetadata};
+use rpc::{
+    control::{ChatMessage, FileMetadata},
+    video,
+};
 
 use crate::config::{WebAutoplay, WebConfig};
 use crate::web_wire::{self, Fragment, split_fragments};
@@ -51,7 +55,60 @@ const MAX_PAGE: usize = 200;
 /// Largest UTF-8 file the highlighted preview endpoint will read and encode.
 const MAX_HIGHLIGHT_FILE_BYTES: u64 = 2 * 1024 * 1024;
 
+/// Maximum encoded bytes retained per stream for browser fast-start. If one GOP
+/// exceeds this bound, caching pauses until the next keyframe rather than
+/// retaining an undecodable delta suffix.
+const VIDEO_FAST_START_MAX_BYTES: usize = video::MAX_VIDEO_FRAME_LEN;
+
 static NEXT_UPLOAD_TEMP_ID: AtomicU64 = AtomicU64::new(1);
+
+/// The latest complete keyframe-led GOP forwarded to local web clients.
+#[derive(Default)]
+struct VideoFastStart {
+    frames: VecDeque<Vec<u8>>,
+    bytes: usize,
+}
+
+impl VideoFastStart {
+    fn push(&mut self, frame: Vec<u8>, is_key: bool) {
+        if is_key {
+            self.frames.clear();
+            self.bytes = 0;
+        } else if self.frames.is_empty() {
+            return;
+        }
+
+        if self.bytes.saturating_add(frame.len()) > VIDEO_FAST_START_MAX_BYTES {
+            self.frames.clear();
+            self.bytes = 0;
+            return;
+        }
+        self.bytes += frame.len();
+        self.frames.push_back(frame);
+    }
+}
+
+/// Reads only the routing fields from an inner video frame after validating its
+/// declared length. The encoded payload remains untouched.
+fn video_frame_meta(frame: &[u8]) -> Option<(u32, bool)> {
+    if frame.len() < video::VIDEO_FRAME_HEADER_LEN {
+        return None;
+    }
+    let size = u32::from_le_bytes(frame[0..4].try_into().ok()?) as usize;
+    if size < video::VIDEO_FRAME_HEADER_LEN
+        || size > video::MAX_VIDEO_FRAME_LEN
+        || size != frame.len()
+    {
+        return None;
+    }
+    let is_key = match frame[12] {
+        0 => false,
+        1 => true,
+        _ => return None,
+    };
+    let stream_id = u32::from_le_bytes(frame[13..17].try_into().ok()?);
+    Some((stream_id, is_key))
+}
 
 /// A single chat entry the frontend renders.
 ///
@@ -301,7 +358,12 @@ enum WebFeed {
     },
     /// A `share_config` envelope sent when playback starts. Transient: it targets
     /// a browser that already asked to play, so it is broadcast but not retained.
-    ShareConfig(String),
+    /// The stream id selects the cached keyframe-led burst sent immediately
+    /// after the config.
+    ShareConfig {
+        stream_id: u32,
+        payload: String,
+    },
     /// A `share_error` envelope reporting a failed play request. Transient and
     /// broadcast like [`ShareConfig`](WebFeed::ShareConfig), not retained.
     ShareError(String),
@@ -417,8 +479,8 @@ impl WebFeedSender {
     }
 
     /// Sends a decoder-config envelope when playback starts. Not retained.
-    pub fn send_share_config(&self, payload: String) {
-        let _ = self.tx.send(WebFeed::ShareConfig(payload));
+    pub fn send_share_config(&self, stream_id: u32, payload: String) {
+        let _ = self.tx.send(WebFeed::ShareConfig { stream_id, payload });
         self.wake.wake();
     }
 
@@ -584,8 +646,7 @@ fn run(
     // Scoping by connection keeps two browsers (or a reconnect reusing an id)
     // from colliding, and lets a disconnect drop that client's in-flight files.
     // Empty and unused when read-only.
-    let mut uploads: std::collections::HashMap<(WebSocketId, u32), UploadSink> =
-        std::collections::HashMap::new();
+    let mut uploads: HashMap<(WebSocketId, u32), UploadSink> = HashMap::new();
     let mut history: Vec<WebMessage> = Vec::new();
     // The sequence number of `history[0]`. Sequence numbers are monotonic across
     // the whole feed and survive front-draining, so a browser can address older
@@ -594,8 +655,12 @@ fn run(
     let mut clients: Vec<WebSocketId> = Vec::new();
     // Active screen shares by stream id, replayed to a browser that connects
     // after a share started so it still shows the play button.
-    let mut active_shares: std::collections::HashMap<u32, String> =
-        std::collections::HashMap::new();
+    let mut active_shares: HashMap<u32, String> = HashMap::new();
+    // Unlike the room server's subscriber ring, this cache covers the final
+    // client-to-browser hop. It is required when a fresh tab reuses an already
+    // running local publisher or remote subscriber and would otherwise begin
+    // with live delta frames.
+    let mut video_fast_start: HashMap<u32, VideoFastStart> = HashMap::new();
 
     loop {
         if let Err(error) = server.poll_once(None) {
@@ -913,23 +978,43 @@ fn run(
                         let _ = server.send_websocket_text(*id, &payload);
                     }
                 }
-                Ok(WebFeed::ShareConfig(payload))
-                | Ok(WebFeed::ShareError(payload))
-                | Ok(WebFeed::FileProgress(payload)) => {
+                Ok(WebFeed::ShareConfig { stream_id, payload }) => {
+                    for id in &clients {
+                        let _ = server.send_websocket_text(*id, &payload);
+                        if let Some(cached) = video_fast_start.get(&stream_id) {
+                            for frame in &cached.frames {
+                                let _ = server.send_websocket_binary(*id, frame);
+                            }
+                        }
+                    }
+                }
+                Ok(WebFeed::ShareError(payload)) | Ok(WebFeed::FileProgress(payload)) => {
                     for id in &clients {
                         let _ = server.send_websocket_text(*id, &payload);
                     }
                 }
                 Ok(WebFeed::ShareEnded { stream_id, payload }) => {
                     active_shares.remove(&stream_id);
+                    video_fast_start.remove(&stream_id);
                     for id in &clients {
                         let _ = server.send_websocket_text(*id, &payload);
                     }
                 }
                 Ok(WebFeed::VideoFrame(frame)) => {
+                    let Some((stream_id, is_key)) = video_frame_meta(&frame) else {
+                        kvlog::warn!(
+                            "dropping malformed browser video frame",
+                            frame_bytes = frame.len()
+                        );
+                        continue;
+                    };
                     for id in &clients {
                         let _ = server.send_websocket_binary(*id, &frame);
                     }
+                    video_fast_start
+                        .entry(stream_id)
+                        .or_default()
+                        .push(frame, is_key);
                 }
                 Ok(WebFeed::Stop) => return,
                 Err(TryRecvError::Empty) => break,
@@ -1139,6 +1224,42 @@ fn sanitize_upload_name(name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn video_fast_start_keeps_only_latest_keyframe_led_gop() {
+        let delta_before_key = video::encode_video_frame(1, false, 7, &[1]);
+        let old_key = video::encode_video_frame(2, true, 7, &[2]);
+        let old_delta = video::encode_video_frame(3, false, 7, &[3]);
+        let new_key = video::encode_video_frame(4, true, 7, &[4]);
+        let new_delta = video::encode_video_frame(5, false, 7, &[5]);
+        let mut cache = VideoFastStart::default();
+
+        cache.push(delta_before_key, false);
+        assert!(cache.frames.is_empty());
+        cache.push(old_key, true);
+        cache.push(old_delta, false);
+        cache.push(new_key.clone(), true);
+        cache.push(new_delta.clone(), false);
+
+        assert_eq!(
+            cache.frames.iter().collect::<Vec<_>>(),
+            vec![&new_key, &new_delta]
+        );
+    }
+
+    #[test]
+    fn video_frame_meta_validates_header_and_key_flag() {
+        let frame = video::encode_video_frame(9, true, 42, &[1, 2, 3]);
+        assert_eq!(video_frame_meta(&frame), Some((42, true)));
+
+        let mut bad_size = frame.clone();
+        bad_size[0..4].copy_from_slice(&(frame.len() as u32 + 1).to_le_bytes());
+        assert_eq!(video_frame_meta(&bad_size), None);
+
+        let mut bad_key_flag = frame;
+        bad_key_flag[12] = 2;
+        assert_eq!(video_frame_meta(&bad_key_flag), None);
+    }
 
     #[test]
     fn classifies_media_by_extension() {
@@ -1798,6 +1919,43 @@ Sec-WebSocket-Version: 13\r\n\
         assert_eq!(opcode, 0x2);
         let message = web_wire::decode_single(&next);
         assert_eq!(message.fragments, vec![Fragment::text("<p>hi</p>")]);
+    }
+
+    #[test]
+    fn share_config_replays_cached_video_from_latest_keyframe() {
+        let cfg = WebConfig {
+            enabled: true,
+            readonly: true,
+            bind: "127.0.0.1:0".to_string(),
+            ..WebConfig::default()
+        };
+        let (web_tx, _web_rx) = mpsc::channel();
+        let sender = spawn(&cfg, None, 100, web_tx, true).unwrap();
+        let mut stream = open_ready_ws(sender.local_addr());
+
+        let old_key = video::encode_video_frame(1, true, 15, &[1]);
+        let old_delta = video::encode_video_frame(2, false, 15, &[2]);
+        let key = video::encode_video_frame(3, true, 15, &[3]);
+        let delta = video::encode_video_frame(4, false, 15, &[4]);
+        for frame in [&old_key, &old_delta, &key, &delta] {
+            sender.send_video_frame(frame.clone());
+            let (opcode, live) = read_ws_frame(&mut stream);
+            assert_eq!(opcode, 0x2);
+            assert_eq!(live, *frame);
+        }
+
+        let config = "{\"type\":\"share_config\",\"stream_id\":15}".to_string();
+        sender.send_share_config(15, config.clone());
+
+        let (opcode, payload) = read_ws_frame(&mut stream);
+        assert_eq!(opcode, 0x1);
+        assert_eq!(String::from_utf8(payload).unwrap(), config);
+        let (opcode, replayed_key) = read_ws_frame(&mut stream);
+        assert_eq!(opcode, 0x2);
+        assert_eq!(replayed_key, key);
+        let (opcode, replayed_delta) = read_ws_frame(&mut stream);
+        assert_eq!(opcode, 0x2);
+        assert_eq!(replayed_delta, delta);
     }
 
     #[test]

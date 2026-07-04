@@ -23,6 +23,7 @@ use rpc::bitstream::Codec;
 
 /// How many trailing stderr lines to retain so a capture failure can report why.
 const STDERR_TAIL_LINES: usize = 8;
+const FORMAT_PROBE_BYTES: usize = 512 * 1024;
 
 /// One captured access unit: a monotonic millisecond timestamp, whether it is a
 /// keyframe, and its Annex-B H.264 bytes.
@@ -39,6 +40,7 @@ pub struct Capture {
     reader: Option<JoinHandle<()>>,
     log_reader: Option<JoinHandle<()>>,
     stderr_tail: Arc<Mutex<VecDeque<String>>>,
+    failure_reason: Arc<Mutex<Option<String>>>,
 }
 
 /// Why a capture ended: the process exit status (absent if it was never reaped)
@@ -46,6 +48,7 @@ pub struct Capture {
 pub struct CaptureExit {
     pub status: Option<ExitStatus>,
     pub stderr_tail: String,
+    pub failure_reason: Option<String>,
 }
 
 impl CaptureExit {
@@ -53,7 +56,9 @@ impl CaptureExit {
     /// `started` marks whether the share had already begun publishing, which
     /// distinguishes a capture that never produced video from one that stopped.
     pub fn reason(&self, started: bool) -> String {
-        let mut message = if started {
+        let mut message = if let Some(reason) = &self.failure_reason {
+            reason.clone()
+        } else if started {
             "screen capture stopped".to_string()
         } else {
             "screen capture exited before producing video".to_string()
@@ -88,6 +93,11 @@ impl Capture {
         CaptureExit {
             status,
             stderr_tail: self.recent_stderr(),
+            failure_reason: self
+                .failure_reason
+                .lock()
+                .ok()
+                .and_then(|reason| reason.clone()),
         }
     }
 
@@ -209,9 +219,13 @@ pub fn spawn(
         .take()
         .ok_or_else(|| "capture command stderr was not piped".to_string())?;
     let stderr_tail = Arc::new(Mutex::new(VecDeque::new()));
+    let failure_reason = Arc::new(Mutex::new(None));
     let reader = thread::Builder::new()
         .name("chatt-capture".to_string())
-        .spawn(move || read_loop(stdout, codec, &frame_tx, &stop))
+        .spawn({
+            let failure_reason = failure_reason.clone();
+            move || read_loop(stdout, codec, &frame_tx, &stop, &failure_reason)
+        })
         .map_err(|error| format!("failed to spawn capture reader: {error}"))?;
     let log_tail = stderr_tail.clone();
     let log_reader = thread::Builder::new()
@@ -223,6 +237,7 @@ pub fn spawn(
         reader: Some(reader),
         log_reader: Some(log_reader),
         stderr_tail,
+        failure_reason,
     })
 }
 
@@ -260,6 +275,7 @@ fn read_loop(
     codec: Codec,
     frame_tx: &Sender<CapturedFrame>,
     stop: &AtomicBool,
+    failure_reason: &Mutex<Option<String>>,
 ) {
     let mut splitter = Splitter::new(codec);
     let mut buf = [0u8; 64 * 1024];
@@ -269,11 +285,16 @@ fn read_loop(
         }
         match stdout.read(&mut buf) {
             Ok(0) => break,
-            Ok(n) => {
-                if splitter.push(&buf[..n], frame_tx).is_err() {
+            Ok(n) => match splitter.push(&buf[..n], frame_tx) {
+                Ok(()) => {}
+                Err(SplitterError::SenderClosed) => return,
+                Err(error) => {
+                    if let Ok(mut reason) = failure_reason.lock() {
+                        *reason = Some(error.to_string());
+                    }
                     return;
                 }
-            }
+            },
             Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
             Err(error) => {
                 kvlog::warn!("capture read failed", error = %error);
@@ -294,6 +315,27 @@ struct Splitter {
     unit_is_key: bool,
     unit_has_vcl: bool,
     started: Instant,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SplitterError {
+    SenderClosed,
+    MissingAnnexBStartCode,
+    CodecMismatch,
+}
+
+impl std::fmt::Display for SplitterError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SplitterError::SenderClosed => f.write_str("screen capture reader stopped"),
+            SplitterError::MissingAnnexBStartCode => {
+                f.write_str("screen capture output is not Annex-B video")
+            }
+            SplitterError::CodecMismatch => {
+                f.write_str("screen capture output does not match the selected video codec")
+            }
+        }
+    }
 }
 
 /// How one NAL classifies for access-unit splitting: whether it is a coded
@@ -340,10 +382,17 @@ impl Splitter {
         }
     }
 
-    fn push(&mut self, bytes: &[u8], frame_tx: &Sender<CapturedFrame>) -> Result<(), ()> {
+    fn push(
+        &mut self,
+        bytes: &[u8],
+        frame_tx: &Sender<CapturedFrame>,
+    ) -> Result<(), SplitterError> {
         self.buf.extend_from_slice(bytes);
         let codes = start_code_offsets(&self.buf);
         if codes.len() < 2 {
+            if codes.is_empty() && self.buf.len() >= FORMAT_PROBE_BYTES {
+                return Err(SplitterError::MissingAnnexBStartCode);
+            }
             return Ok(());
         }
         // Every NAL but the last is complete, the last begins an in-progress NAL.
@@ -355,8 +404,10 @@ impl Splitter {
             }
             if body_start < body_end {
                 let nal = self.buf[body_start..body_end].to_vec();
-                if let Some(frame) = self.push_nal(&nal) {
-                    frame_tx.send(frame).map_err(|_| ())?;
+                if let Some(frame) = self.push_nal(&nal)? {
+                    frame_tx
+                        .send(frame)
+                        .map_err(|_| SplitterError::SenderClosed)?;
                 }
             }
         }
@@ -379,7 +430,7 @@ impl Splitter {
             };
             if body_start < body_end {
                 let nal = self.buf[body_start..body_end].to_vec();
-                if let Some(frame) = self.push_nal(&nal) {
+                if let Ok(Some(frame)) = self.push_nal(&nal) {
                     let _ = frame_tx.send(frame);
                 }
             }
@@ -392,7 +443,10 @@ impl Splitter {
 
     /// Appends one NAL to the current unit, emitting the previous unit when this
     /// NAL begins a new one.
-    fn push_nal(&mut self, nal: &[u8]) -> Option<CapturedFrame> {
+    fn push_nal(&mut self, nal: &[u8]) -> Result<Option<CapturedFrame>, SplitterError> {
+        if !nal_compatible_with_codec(self.codec, nal) {
+            return Err(SplitterError::CodecMismatch);
+        }
         let class = classify_nal(self.codec, nal);
         let starts_new_unit = self.unit_has_vcl && (class.is_vcl || class.is_param_or_meta);
         let emitted = if starts_new_unit {
@@ -408,7 +462,7 @@ impl Splitter {
         if class.is_vcl {
             self.unit_has_vcl = true;
         }
-        emitted
+        Ok(emitted)
     }
 
     fn take_unit(&mut self) -> Option<CapturedFrame> {
@@ -439,6 +493,25 @@ fn start_code_offsets(stream: &[u8]) -> Vec<usize> {
         }
     }
     offsets
+}
+
+fn nal_compatible_with_codec(codec: Codec, nal: &[u8]) -> bool {
+    match codec {
+        Codec::H264 => {
+            let Some(header) = nal.first() else {
+                return false;
+            };
+            matches!(header & 0x1f, 1..=12)
+        }
+        Codec::Hevc => {
+            if nal.len() < 2 {
+                return false;
+            }
+            let nal_type = (nal[0] >> 1) & 0x3f;
+            let temporal_id_plus_one = nal[1] & 0x07;
+            nal[0] & 0x80 == 0 && nal_type <= 40 && temporal_id_plus_one != 0
+        }
+    }
 }
 
 #[cfg(test)]
@@ -500,6 +573,7 @@ mod tests {
         let exit = CaptureExit {
             status: None,
             stderr_tail: "wl-screenrec: unknown option --low-power".to_string(),
+            failure_reason: None,
         };
         let reason = exit.reason(false);
         assert!(reason.starts_with("screen capture exited before producing video"));
@@ -511,8 +585,22 @@ mod tests {
         let exit = CaptureExit {
             status: None,
             stderr_tail: String::new(),
+            failure_reason: None,
         };
         assert_eq!(exit.reason(true), "screen capture stopped");
+    }
+
+    #[test]
+    fn exit_reason_prefers_format_failure() {
+        let exit = CaptureExit {
+            status: None,
+            stderr_tail: "ffmpeg stderr".to_string(),
+            failure_reason: Some("screen capture output is not Annex-B video".to_string()),
+        };
+        assert_eq!(
+            exit.reason(false),
+            "screen capture output is not Annex-B video: ffmpeg stderr"
+        );
     }
 
     #[test]
@@ -527,5 +615,24 @@ mod tests {
         let frames: Vec<_> = rx.try_iter().collect();
         assert_eq!(frames.len(), 2);
         assert!(frames[0].is_key);
+    }
+
+    #[test]
+    fn rejects_output_without_annex_b_start_code() {
+        let (tx, _rx) = mpsc::channel();
+        let mut splitter = Splitter::new(Codec::H264);
+        let bytes = vec![b'x'; FORMAT_PROBE_BYTES];
+        assert_eq!(
+            splitter.push(&bytes, &tx),
+            Err(SplitterError::MissingAnnexBStartCode)
+        );
+    }
+
+    #[test]
+    fn rejects_codec_mismatched_nal_headers() {
+        let (tx, _rx) = mpsc::channel();
+        let mut splitter = Splitter::new(Codec::Hevc);
+        let h264 = annexb(&[&[0x67, 0x42, 0xc0, 0x1f], &[0x68, 0x00]]);
+        assert_eq!(splitter.push(&h264, &tx), Err(SplitterError::CodecMismatch));
     }
 }

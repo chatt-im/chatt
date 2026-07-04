@@ -84,6 +84,106 @@ pub(crate) enum StatusKind {
 
 const TRANSIENT_STATUS_LIFETIME: Duration = Duration::from_secs(3);
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ScreencastPhase {
+    Idle,
+    Starting,
+    Live,
+    Failed,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ScreencastIssue {
+    pub(crate) reason: String,
+    pub(crate) at: Instant,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ScreencastStatus {
+    pub(crate) phase: ScreencastPhase,
+    pub(crate) stream_id: Option<StreamId>,
+    pub(crate) codec: Option<String>,
+    pub(crate) coded_width: Option<u32>,
+    pub(crate) coded_height: Option<u32>,
+    pub(crate) started_at: Option<Instant>,
+    pub(crate) ended_at: Option<Instant>,
+    pub(crate) total_bytes: u64,
+    pub(crate) total_frames: u64,
+    pub(crate) rolling_bytes_per_sec: u64,
+    pub(crate) last_issue: Option<ScreencastIssue>,
+}
+
+impl Default for ScreencastStatus {
+    fn default() -> Self {
+        Self {
+            phase: ScreencastPhase::Idle,
+            stream_id: None,
+            codec: None,
+            coded_width: None,
+            coded_height: None,
+            started_at: None,
+            ended_at: None,
+            total_bytes: 0,
+            total_frames: 0,
+            rolling_bytes_per_sec: 0,
+            last_issue: None,
+        }
+    }
+}
+
+impl ScreencastStatus {
+    fn start(&mut self) {
+        self.phase = ScreencastPhase::Starting;
+        self.stream_id = None;
+        self.codec = None;
+        self.coded_width = None;
+        self.coded_height = None;
+        self.started_at = Some(Instant::now());
+        self.ended_at = None;
+        self.total_bytes = 0;
+        self.total_frames = 0;
+        self.rolling_bytes_per_sec = 0;
+    }
+
+    fn live(&mut self, stream_id: StreamId, codec: String, coded_width: u32, coded_height: u32) {
+        self.phase = ScreencastPhase::Live;
+        self.stream_id = Some(stream_id);
+        self.codec = Some(codec);
+        self.coded_width = Some(coded_width);
+        self.coded_height = Some(coded_height);
+        self.started_at.get_or_insert_with(Instant::now);
+        self.ended_at = None;
+    }
+
+    fn progress(&mut self, stream_id: StreamId, total_bytes: u64, total_frames: u64, rate: u64) {
+        if self.stream_id == Some(stream_id) {
+            self.total_bytes = total_bytes;
+            self.total_frames = total_frames;
+            self.rolling_bytes_per_sec = rate;
+        }
+    }
+
+    fn fail(&mut self, reason: String) {
+        let now = Instant::now();
+        self.phase = ScreencastPhase::Failed;
+        self.ended_at = Some(now);
+        self.last_issue = Some(ScreencastIssue { reason, at: now });
+    }
+
+    fn clear_active(&mut self) {
+        self.phase = ScreencastPhase::Idle;
+        self.stream_id = None;
+        self.codec = None;
+        self.coded_width = None;
+        self.coded_height = None;
+        self.started_at = None;
+        self.ended_at = Some(Instant::now());
+        self.total_bytes = 0;
+        self.total_frames = 0;
+        self.rolling_bytes_per_sec = 0;
+    }
+}
+
 pub(crate) struct StatusState {
     text: String,
     kind: StatusKind,
@@ -275,6 +375,7 @@ pub(crate) struct App {
     screencast: Option<crate::video::ScreencastHandle>,
     /// The stream id of our active outbound share, set on `ShareStarted`.
     screencast_stream_id: Option<StreamId>,
+    pub(crate) screencast_status: ScreencastStatus,
     /// Shares this client can view, keyed by stream id, learned from
     /// `ShareAvailable`. Holds the per-stream view secret and codec metadata.
     available_shares: HashMap<StreamId, AvailableShare>,
@@ -510,6 +611,14 @@ pub(crate) struct AudioDeviceProbeEvent {
     pub(crate) result: Result<DeviceIdentityProbe, String>,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ScreencastProgress {
+    pub(crate) stream_id: StreamId,
+    pub(crate) total_bytes: u64,
+    pub(crate) total_frames: u64,
+    pub(crate) rolling_bytes_per_sec: u64,
+}
+
 /// An event delivered from a worker thread to the UI thread over the single
 /// application event channel.
 pub(crate) enum AppEvent {
@@ -525,6 +634,9 @@ pub(crate) enum AppEvent {
     /// The outbound screen share's capture or publisher thread ended abnormally,
     /// carrying a one-line reason for the user.
     ScreencastFailed(String),
+    /// The outbound publisher sent frames successfully and has fresh throughput
+    /// counters for the top-bar video badge.
+    ScreencastProgress(ScreencastProgress),
 }
 
 impl From<NetworkEvent> for AppEvent {
@@ -848,6 +960,7 @@ impl App {
             web_feed,
             screencast: None,
             screencast_stream_id: None,
+            screencast_status: ScreencastStatus::default(),
             available_shares: HashMap::new(),
             subscribers: HashMap::new(),
             active_tcp_addr: None,
@@ -889,6 +1002,7 @@ impl App {
             AppEvent::Web(request) => self.handle_web_request(request),
             AppEvent::ReportBug(description) => self.start_bug_report(description),
             AppEvent::ScreencastFailed(reason) => self.handle_screencast_failed(reason),
+            AppEvent::ScreencastProgress(progress) => self.handle_screencast_progress(progress),
         }
     }
 
@@ -914,12 +1028,16 @@ impl App {
                     self.set_error("a screen share is already active");
                     return;
                 }
+                if self.voice_room.is_none() {
+                    self.fail_screencast_start("join a voice call before sharing");
+                    return;
+                }
                 let Some(network) = &self.network else {
-                    self.set_error("connect before sharing your screen");
+                    self.fail_screencast_start("connect before sharing your screen");
                     return;
                 };
                 let Some(tcp_addr) = self.active_tcp_addr.clone() else {
-                    self.set_error("no active server for screen share");
+                    self.fail_screencast_start("no active server for screen share");
                     return;
                 };
                 let codec = if hevc {
@@ -945,35 +1063,73 @@ impl App {
                     events,
                 ) {
                     Ok(handle) => {
+                        self.screencast_status.start();
                         self.screencast = Some(handle);
                         self.set_status("starting screen share");
                     }
-                    Err(error) => self.set_error(format!("screen share failed: {error}")),
+                    Err(error) => {
+                        self.fail_screencast_start(format!("screen share failed: {error}"))
+                    }
                 }
             }
             local_control::ScreencastCommand::Stop => {
-                self.stop_own_share();
+                self.teardown_own_share(true);
+                self.screencast_status.clear_active();
                 self.set_status("screen share stopped");
             }
         }
+    }
+
+    fn fail_screencast_start(&mut self, reason: impl Into<String>) {
+        let reason = reason.into();
+        self.screencast_status.fail(reason.clone());
+        self.set_error(reason);
     }
 
     /// Handles the publisher reporting that its capture or connection ended
     /// abnormally. Tears the dead share down so a retry starts clean, and surfaces
     /// the reason (the capture's stderr tail explains a bad command).
     fn handle_screencast_failed(&mut self, reason: String) {
-        if self.screencast.is_none() {
+        if self.screencast.is_none()
+            && !matches!(
+                self.screencast_status.phase,
+                ScreencastPhase::Starting | ScreencastPhase::Live
+            )
+        {
             return;
         }
-        self.stop_own_share();
+        self.screencast_status.fail(reason.clone());
+        self.teardown_own_share(true);
         self.set_error(reason);
+    }
+
+    fn fail_screencast_if_running(&mut self, reason: impl Into<String>, notify_server: bool) {
+        if self.screencast.is_none()
+            && !matches!(
+                self.screencast_status.phase,
+                ScreencastPhase::Starting | ScreencastPhase::Live
+            )
+        {
+            return;
+        }
+        self.screencast_status.fail(reason.into());
+        self.teardown_own_share(notify_server);
+    }
+
+    fn handle_screencast_progress(&mut self, progress: ScreencastProgress) {
+        self.screencast_status.progress(
+            progress.stream_id,
+            progress.total_bytes,
+            progress.total_frames,
+            progress.rolling_bytes_per_sec,
+        );
     }
 
     /// Stops this client's outbound share, notifying the server so viewers tear
     /// down and clearing the local self-view from this client's own browser.
-    fn stop_own_share(&mut self) {
+    fn teardown_own_share(&mut self, notify_server: bool) {
         if let Some(stream_id) = self.screencast_stream_id.take() {
-            if let Some(network) = &self.network {
+            if notify_server && let Some(network) = &self.network {
                 let _ = network
                     .sender()
                     .send(NetworkCommand::StopShare { stream_id });
@@ -990,7 +1146,10 @@ impl App {
 
     /// Stops the outbound share and every inbound viewer connection.
     fn stop_all_shares(&mut self) {
-        self.stop_own_share();
+        self.teardown_own_share(true);
+        if self.screencast_status.phase != ScreencastPhase::Failed {
+            self.screencast_status.clear_active();
+        }
         self.screencast_stream_id = None;
         self.available_shares.clear();
         for (_, mut subscriber) in self.subscribers.drain() {
@@ -1013,6 +1172,8 @@ impl App {
                 feed.send_share_ended(stream_id.0, share_ended_envelope(stream_id));
             }
             if self.screencast_stream_id == Some(stream_id) {
+                self.screencast_status
+                    .fail("voice call ended during screen share".to_string());
                 self.screencast_stream_id = None;
                 if let Some(mut handle) = self.screencast.take() {
                     handle.stop();
@@ -1078,7 +1239,7 @@ impl App {
         }
         let config = share_config_envelope(stream_id, &share.codec, &share.extradata);
         let view_secret = share.view_secret.clone();
-        feed.send_share_config(config);
+        feed.send_share_config(stream_id.0, config);
 
         // The user's own share is teed to the browser by the publisher, and an
         // already-subscribed remote share is teed by its existing subscriber, so
@@ -2109,6 +2270,8 @@ impl App {
                 extradata,
             } => {
                 self.screencast_stream_id = Some(stream_id);
+                self.screencast_status
+                    .live(stream_id, codec.clone(), coded_width, coded_height);
                 if let (Some(handle), Some(session_id)) = (&self.screencast, self.session_id) {
                     handle.deliver_secret(session_id, stream_id, publish_secret);
                 } else {
@@ -2187,19 +2350,22 @@ impl App {
                 self.set_status(format!("{sender_name} is sharing their screen"));
             }
             NetworkEvent::ShareEnded { stream_id, .. } => {
-                self.available_shares.remove(&stream_id);
-                if let Some(mut subscriber) = self.subscribers.remove(&stream_id) {
-                    subscriber.stop();
-                }
                 if self.screencast_stream_id == Some(stream_id) {
-                    self.screencast_stream_id = None;
-                    if let Some(mut handle) = self.screencast.take() {
-                        handle.stop();
+                    self.screencast_status
+                        .fail("screen share ended by server".to_string());
+                    self.teardown_own_share(false);
+                } else {
+                    self.available_shares.remove(&stream_id);
+                    if let Some(mut subscriber) = self.subscribers.remove(&stream_id) {
+                        subscriber.stop();
+                    }
+                    if let Some(feed) = &self.web_feed {
+                        feed.send_share_ended(stream_id.0, share_ended_envelope(stream_id));
                     }
                 }
-                if let Some(feed) = &self.web_feed {
-                    feed.send_share_ended(stream_id.0, share_ended_envelope(stream_id));
-                }
+            }
+            NetworkEvent::ShareStartRejected { message } => {
+                self.handle_screencast_failed(message);
             }
             NetworkEvent::Status(status) => self.set_status(status),
             NetworkEvent::Error(error) => {
@@ -2211,6 +2377,10 @@ impl App {
                 if code == ERROR_TOKEN_STALE_EPOCH && self.start_stale_token_repair(&message) {
                     return;
                 }
+                self.fail_screencast_if_running(
+                    format!("screen share stopped: authentication failed: {message}"),
+                    false,
+                );
                 self.disconnect_network();
                 self.open_server_select();
                 self.push_network_notice("auth", &message);
@@ -2246,6 +2416,10 @@ impl App {
             NetworkEvent::ReconnectScheduled { retry_in, reason } => {
                 self.network_disconnected = true;
                 self.stop_audio();
+                self.fail_screencast_if_running(
+                    format!("screen share stopped: connection failed: {reason}"),
+                    false,
+                );
                 // The reconnect issues a fresh session id, so every share and
                 // viewer tied to the old one is dead; subscribers would retry
                 // against the stale id forever.
@@ -2259,6 +2433,11 @@ impl App {
             }
             NetworkEvent::WorkerStopped { reason } => {
                 self.stop_audio();
+                self.fail_screencast_if_running(
+                    format!("screen share stopped: network worker stopped: {reason}"),
+                    false,
+                );
+                self.stop_all_shares();
                 self.reset_room_for_disconnect();
                 self.push_network_notice(
                     "network",
@@ -2267,6 +2446,7 @@ impl App {
                 self.schedule_network_recovery(Instant::now(), reason);
             }
             NetworkEvent::Disconnected => {
+                self.fail_screencast_if_running("screen share stopped: disconnected", false);
                 self.disconnect_network();
                 self.push_network_notice("network", "disconnected; viewing offline logs");
                 self.set_error("disconnected");
@@ -2405,6 +2585,10 @@ impl App {
         }
         if rect_contains(self.chrome.top_bar.deafen, mouse.column, mouse.row) {
             self.set_deafen(!self.deafened.load(Ordering::Relaxed));
+            return true;
+        }
+        if rect_contains(self.chrome.top_bar.video, mouse.column, mouse.row) {
+            self.show_video_status();
             return true;
         }
         false
@@ -3889,6 +4073,7 @@ impl App {
                 self.join_voice_command(Some(&name));
             }
             "/voice-leave" => self.leave_voice_command(),
+            "/video" => self.show_video_status(),
             "/upload" => self.set_error("usage: /upload file_path/filename.ext"),
             command if command.starts_with("/upload ") => self.upload_file_command(command),
             "/upload-rate" => self.set_error("usage: /upload-rate 200K|off"),
@@ -4145,6 +4330,77 @@ impl App {
         } else {
             "not deafened"
         });
+    }
+
+    fn show_video_status(&mut self) {
+        self.room
+            .push_notice("video", self.video_diagnostics_notice());
+        self.set_status(self.video_status_summary());
+    }
+
+    fn video_status_summary(&self) -> String {
+        match self.screencast_status.phase {
+            ScreencastPhase::Idle => match &self.screencast_status.last_issue {
+                Some(issue) => format!("video idle; last issue: {}", issue.reason),
+                None => "video idle".to_string(),
+            },
+            ScreencastPhase::Starting => "video starting".to_string(),
+            ScreencastPhase::Live => format!(
+                "video live: {}",
+                video_rate_label(self.screencast_status.rolling_bytes_per_sec)
+            ),
+            ScreencastPhase::Failed => self
+                .screencast_status
+                .last_issue
+                .as_ref()
+                .map(|issue| format!("video failed: {}", issue.reason))
+                .unwrap_or_else(|| "video failed".to_string()),
+        }
+    }
+
+    fn video_diagnostics_notice(&self) -> String {
+        let status = &self.screencast_status;
+        let mut lines = Vec::new();
+        lines.push(format!("state: {}", screencast_phase_label(status.phase)));
+        if let Some(stream_id) = status.stream_id {
+            lines.push(format!("stream: {}", stream_id.0));
+        }
+        if let Some(codec) = &status.codec {
+            let size = match (status.coded_width, status.coded_height) {
+                (Some(width), Some(height)) if width != 0 && height != 0 => {
+                    format!(" {width}x{height}")
+                }
+                _ => String::new(),
+            };
+            lines.push(format!("codec: {codec}{size}"));
+        }
+        lines.push(format!(
+            "transfer: {} frames / {} total / {} recent",
+            status.total_frames,
+            crate::client_net::format_bytes(status.total_bytes),
+            video_rate_label(status.rolling_bytes_per_sec)
+        ));
+        if let Some(started) = status.started_at {
+            lines.push(format!(
+                "started: {} ago",
+                audio_diagnostics::format_event_age(started.elapsed())
+            ));
+        }
+        if let Some(ended) = status.ended_at {
+            lines.push(format!(
+                "ended: {} ago",
+                audio_diagnostics::format_event_age(ended.elapsed())
+            ));
+        }
+        match &status.last_issue {
+            Some(issue) => lines.push(format!(
+                "last issue: {} ago: {}",
+                audio_diagnostics::format_event_age(issue.at.elapsed()),
+                issue.reason
+            )),
+            None => lines.push("last issue: none".to_string()),
+        }
+        lines.join("\n")
     }
 
     /// Formatted `health` and `events` sections for `/audio`. Built even while
@@ -4917,6 +5173,19 @@ fn lobby_voice_level_active(rms: f32) -> bool {
     rms.is_finite() && rms >= LOBBY_TALKING_RMS_THRESHOLD
 }
 
+fn screencast_phase_label(phase: ScreencastPhase) -> &'static str {
+    match phase {
+        ScreencastPhase::Idle => "idle",
+        ScreencastPhase::Starting => "starting",
+        ScreencastPhase::Live => "live",
+        ScreencastPhase::Failed => "failed",
+    }
+}
+
+fn video_rate_label(bytes_per_sec: u64) -> String {
+    format!("{}/s", crate::client_net::format_bytes(bytes_per_sec))
+}
+
 fn network_event_kind(event: &NetworkEvent) -> &'static str {
     match event {
         NetworkEvent::Connected => "connected",
@@ -4953,6 +5222,7 @@ fn network_event_kind(event: &NetworkEvent) -> &'static str {
         NetworkEvent::ShareStarted { .. } => "share_started",
         NetworkEvent::ShareAvailable { .. } => "share_available",
         NetworkEvent::ShareEnded { .. } => "share_ended",
+        NetworkEvent::ShareStartRejected { .. } => "share_start_rejected",
     }
 }
 
@@ -6173,6 +6443,65 @@ mod tests {
     }
 
     #[test]
+    fn video_command_pushes_diagnostics_notice() {
+        let mut app = test_app();
+        app.screencast_status
+            .fail("screen capture output is not Annex-B video".to_string());
+        app.room.composer.set_lines("/video");
+
+        app.submit_input();
+
+        assert_eq!(app.room.active.chat.len(), 1);
+        let notice = app.room.active.chat.message(0);
+        assert_eq!(notice.sender, "video");
+        assert!(notice.body.contains("state: failed"));
+        assert!(notice.body.contains("last issue:"));
+        assert!(app.status.text().contains("video failed:"));
+    }
+
+    #[test]
+    fn screencast_start_without_voice_fails_before_spawning_capture() {
+        let mut app = test_app();
+
+        app.handle_screencast_command(local_control::ScreencastCommand::Start {
+            argv: Vec::new(),
+            hevc: false,
+        });
+
+        assert!(app.screencast.is_none());
+        assert_eq!(app.screencast_status.phase, ScreencastPhase::Failed);
+        assert_eq!(
+            app.screencast_status
+                .last_issue
+                .as_ref()
+                .map(|issue| issue.reason.as_str()),
+            Some("join a voice call before sharing")
+        );
+        assert_eq!(app.status.kind(), StatusKind::Error);
+    }
+
+    #[test]
+    fn share_start_rejection_tears_down_local_screencast() {
+        let mut app = test_app();
+        app.screencast = Some(crate::video::ScreencastHandle::for_test());
+        app.screencast_status.start();
+
+        app.handle_network_event(NetworkEvent::ShareStartRejected {
+            message: "join the room's voice call before sharing".to_string(),
+        });
+
+        assert!(app.screencast.is_none());
+        assert_eq!(app.screencast_status.phase, ScreencastPhase::Failed);
+        assert_eq!(
+            app.screencast_status
+                .last_issue
+                .as_ref()
+                .map(|issue| issue.reason.as_str()),
+            Some("join the room's voice call before sharing")
+        );
+    }
+
+    #[test]
     fn stats_command_toggles_lobby_details() {
         let mut app = test_app();
         assert!(!app.lobby_details);
@@ -6406,6 +6735,34 @@ mod tests {
             },
         );
         assert!(app.deafened.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn failed_video_badge_opens_video_diagnostics_on_click() {
+        let mut app = test_app();
+        let mut room = RoomMode::default();
+        app.screencast_status
+            .fail("screen publish failed: connection reset".to_string());
+
+        let mut buffer = Buffer::new(100, 24);
+        render_room(&mut app, &mut room, &mut buffer);
+
+        let video_rect = app.chrome.top_bar.video;
+        assert!(!video_rect.is_empty());
+        room.process_mouse(
+            &mut app,
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: video_rect.x,
+                row: video_rect.y,
+                modifiers: KeyModifiers::empty(),
+            },
+        );
+
+        assert_eq!(app.room.active.chat.len(), 1);
+        let notice = app.room.active.chat.message(0);
+        assert_eq!(notice.sender, "video");
+        assert!(notice.body.contains("connection reset"));
     }
 
     #[test]
