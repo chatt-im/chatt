@@ -14,6 +14,7 @@ pub(crate) struct KeyPreviewState {
 }
 
 pub(crate) struct TopBarLayout {
+    pub(crate) live: Rect,
     pub(crate) mute: Rect,
     pub(crate) deafen: Rect,
     pub(crate) video: Rect,
@@ -22,6 +23,7 @@ pub(crate) struct TopBarLayout {
 impl Default for TopBarLayout {
     fn default() -> Self {
         Self {
+            live: Rect::EMPTY,
             mute: Rect::EMPTY,
             deafen: Rect::EMPTY,
             video: Rect::EMPTY,
