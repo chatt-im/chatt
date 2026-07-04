@@ -4,6 +4,7 @@ pub(crate) mod commands;
 pub(crate) mod dialogs;
 pub(crate) mod participants;
 pub(crate) mod room;
+pub(crate) mod room_settings;
 pub(crate) mod server;
 
 use hashbrown::{HashMap, HashSet};
@@ -71,6 +72,7 @@ use commands::slash_command_help;
 pub(crate) use dialogs::{UserVolumeDialog, UserVolumeEvent};
 pub(crate) use participants::{ParticipantState, ParticipantVoiceFeedback, Participants};
 pub(crate) use room::{ComposerSubmission, RoomSession, ToggleExpandResult};
+pub(crate) use room_settings::{RoomSettingsDraft, RoomSettingsEvent};
 pub(crate) use server::{
     PairCompletion, PendingPair, ServerEditDraft, ServerEditEvent, ServerSelectItem,
     alias_from_tcp_addr, default_join_alias, default_join_display_name, random_token,
@@ -735,17 +737,7 @@ fn parse_upload_rate(arg: &str) -> Result<u64, String> {
     if arg.eq_ignore_ascii_case("off") || arg.eq_ignore_ascii_case("none") {
         return Ok(0);
     }
-    let (digits, multiplier) = match arg.as_bytes().last() {
-        Some(b'k' | b'K') => (&arg[..arg.len() - 1], 1024),
-        Some(b'm' | b'M') => (&arg[..arg.len() - 1], 1024 * 1024),
-        Some(b'g' | b'G') => (&arg[..arg.len() - 1], 1024 * 1024 * 1024),
-        _ => (arg, 1),
-    };
-    let value: u64 = digits
-        .trim()
-        .parse()
-        .map_err(|_| format!("invalid upload rate: {arg}"))?;
-    Ok(value.saturating_mul(multiplier))
+    crate::settings::parse_byte_size(arg).ok_or_else(|| format!("invalid upload rate: {arg}"))
 }
 
 /// The `file_progress` envelope updating a placeholder file message's progress
@@ -907,6 +899,9 @@ impl App {
         let room = RoomSession::new(&config, &theme);
         let echo_control = Arc::new(EchoCancellationControl::new(config.audio.echo_cancellation));
         let web_feed = if config.web.enabled {
+            // The web feed is app-wide and spawns before any server
+            // connection, so it uses the global receive dir, not a per-room
+            // effective one.
             spawn_web_feed(
                 &config.web,
                 config.files.receive_dir_path(),
@@ -1372,7 +1367,7 @@ impl App {
             self.set_error(format!("server {label} is not configured"));
             return None;
         };
-        let draft = ServerEditDraft::from_server(&server, self.config.ui.default_bindings);
+        let draft = ServerEditDraft::from_server(&server, &self.config);
         Some((server.label, draft))
     }
 
@@ -1385,16 +1380,14 @@ impl App {
             }
         };
         self.disconnect_network();
-        let network = match NetworkClient::spawn(
-            server.client_config(&self.config.files, &self.config.p2p),
-            self.events.sender(),
-        ) {
-            Ok(network) => network,
-            Err(error) => {
-                self.set_error(format!("failed to start network: {error}"));
-                return false;
-            }
-        };
+        let network =
+            match NetworkClient::spawn(server.client_config(&self.config), self.events.sender()) {
+                Ok(network) => network,
+                Err(error) => {
+                    self.set_error(format!("failed to start network: {error}"));
+                    return false;
+                }
+            };
         self.control_socket =
             match local_control::ControlSocket::spawn(network.sender(), self.events.sender()) {
                 Ok(socket) => {
@@ -1411,29 +1404,24 @@ impl App {
                     None
                 }
             };
-        let history_id = if self.config.history.enabled {
-            crate::room_history::derive_server_id(&server.token)
-        } else {
-            String::new()
-        };
+        let storage = crate::room_history::HistoryStorage::resolve(&self.config, &server);
         let continuity = self.room.connect_to_server(
             server.label.clone(),
-            history_id.clone(),
+            storage,
             server.effective_display_name(),
         );
-        if self.config.history.enabled && continuity == room::ServerContinuity::NewServer {
-            let catalog = crate::room_catalog::load(&history_id);
-            self.room.load_offline_catalog(&catalog, self.user_id);
+        if continuity == room::ServerContinuity::NewServer {
+            let catalog_dir = self.room.history_storage().catalog_dir();
+            if catalog_dir.is_some() {
+                let catalog = crate::room_catalog::load(catalog_dir);
+                self.room.load_offline_catalog(&catalog, self.user_id);
+            }
         }
         if let Some(feed) = &self.web_feed {
             let view = self.room.viewed_history();
             feed.set_room(web_room_messages(&view, &self.room));
         }
-        self.active_tcp_addr = Some(
-            server
-                .client_config(&self.config.files, &self.config.p2p)
-                .tcp_addr,
-        );
+        self.active_tcp_addr = Some(server.client_config(&self.config).tcp_addr);
         self.active_server_label = Some(server.label.clone());
         self.network = Some(network);
         self.network_disconnected = false;
@@ -1537,6 +1525,79 @@ impl App {
         self.push_mode(Box::new(crate::tui::user_list::UserListMode::new()));
     }
 
+    pub(crate) fn open_room_settings(&mut self) {
+        let Some(alias) = self.active_server_label.clone() else {
+            self.set_error("connect to a server first");
+            return;
+        };
+        let Some(room_id) = self.room.viewed_room else {
+            self.set_error("view a room first");
+            return;
+        };
+        let server = match self.config.server(&alias) {
+            Ok(server) => server,
+            Err(error) => {
+                self.set_error(error);
+                return;
+            }
+        };
+        let draft = RoomSettingsDraft::from_config(
+            &self.config,
+            server,
+            room_id,
+            self.room.room_name.clone(),
+        );
+        self.push_mode(Box::new(crate::tui::room_settings::RoomSettingsMode::new(
+            draft,
+        )));
+    }
+
+    pub(crate) fn save_room_settings(&mut self, draft: &RoomSettingsDraft) {
+        let overrides = match draft.to_overrides() {
+            Ok(overrides) => overrides,
+            Err(error) => {
+                self.set_error(error);
+                return;
+            }
+        };
+        let Some(server) = self
+            .config
+            .servers
+            .iter_mut()
+            .find(|server| server.label == draft.server_label())
+        else {
+            self.set_error(format!("server {} is not configured", draft.server_label()));
+            return;
+        };
+        let previous_history = server
+            .rooms
+            .iter()
+            .find(|room| room.room_id == overrides.room_id)
+            .map(|room| room.history.clone())
+            .unwrap_or_default();
+        let history_changed = previous_history != overrides.history;
+        server
+            .rooms
+            .retain(|room| room.room_id != overrides.room_id);
+        if !overrides.is_empty() {
+            server.rooms.push(overrides);
+            server.rooms.sort_by_key(|room| room.room_id);
+        }
+        match self.config.save_runtime() {
+            Ok(path) => {
+                self.config.config_path = Some(path.clone());
+                self.push_file_policy();
+                self.pop_mode();
+                if history_changed && self.network.is_some() {
+                    self.set_status("room settings saved; persistence changes apply on reconnect");
+                } else {
+                    self.set_status(format!("room settings saved to {}", path.display()));
+                }
+            }
+            Err(error) => self.set_error(error),
+        }
+    }
+
     /// Switches the view to the neighboring room in catalog order, wrapping.
     pub(crate) fn cycle_room(&mut self, delta: isize) {
         let rooms: Vec<RoomId> = self.room.room_metas().map(|(room_id, _)| room_id).collect();
@@ -1610,7 +1671,7 @@ impl App {
     }
 
     fn mark_room_catalog_dirty(&mut self) {
-        if !self.config.history.enabled || self.room.history_id().is_empty() {
+        if self.room.history_storage().catalog_dir().is_none() {
             return;
         }
         self.pending_room_catalog_save = Some(PendingRoomCatalogSave {
@@ -1626,14 +1687,11 @@ impl App {
     }
 
     fn write_room_catalog(&self) {
-        if !self.config.history.enabled {
+        let catalog_dir = self.room.history_storage().catalog_dir();
+        if catalog_dir.is_none() {
             return;
         }
-        let history_id = self.room.history_id();
-        if history_id.is_empty() {
-            return;
-        }
-        crate::room_catalog::save(history_id, &self.room.catalog(self.voice_room));
+        crate::room_catalog::save(catalog_dir, &self.room.catalog(self.voice_room));
     }
 
     fn start_join_pairing(&mut self, ticket: InviteTicket) {
@@ -1658,7 +1716,7 @@ impl App {
             return;
         }
         spawn_pair_once(
-            server.client_config(&self.config.files, &self.config.p2p),
+            server.client_config(&self.config),
             ticket.pairing_code,
             self.events.sender(),
         );
@@ -1683,9 +1741,10 @@ impl App {
             username: default_join_display_name(),
             token: String::new(),
             server_public_key: String::new(),
+            ..ServerEntry::default()
         };
         spawn_open_pair_once(
-            server.client_config(&self.config.files, &self.config.p2p),
+            server.client_config(&self.config),
             String::new(),
             String::new(),
             self.events.sender(),
@@ -1773,9 +1832,7 @@ impl App {
             return;
         };
         let alias = pending.server.label.clone();
-        let client_config = pending
-            .server
-            .client_config(&self.config.files, &self.config.p2p);
+        let client_config = pending.server.client_config(&self.config);
         spawn_open_pair_once(
             client_config,
             password,
@@ -1884,7 +1941,7 @@ impl App {
         if existing_token.trim().is_empty() {
             return false;
         }
-        let client_config = server.client_config(&self.config.files, &self.config.p2p);
+        let client_config = server.client_config(&self.config);
         self.disconnect_network();
         self.push_network_notice("auth", reason);
         spawn_open_pair_once(
@@ -2036,7 +2093,7 @@ impl App {
                 self.user_id = Some(user_id);
                 self.network_disconnected = false;
                 self.last_network_notice = None;
-                let catalog = crate::room_catalog::load(self.room.history_id());
+                let catalog = crate::room_catalog::load(self.room.history_storage().catalog_dir());
                 let known = self.room.authenticated(
                     &rooms,
                     users,
@@ -2709,6 +2766,12 @@ impl App {
             return;
         }
         let label = server.label.clone();
+        let history_changed = self
+            .config
+            .servers
+            .iter()
+            .find(|existing| existing.label == original_label)
+            .is_some_and(|existing| existing.history != server.history);
         if let Some(existing) = self
             .config
             .servers
@@ -2733,13 +2796,23 @@ impl App {
             Ok(path) => {
                 self.config.config_path = Some(path.clone());
                 self.rebuild_server_items();
+                if self.active_server_label.as_deref() == Some(label.as_str()) {
+                    self.push_file_policy();
+                }
                 if join_after_save {
                     if self.start_network(&label) {
                         self.replace_mode(Box::new(RoomMode::default()));
                     }
                 } else {
                     self.pop_mode();
-                    self.set_status(format!("server saved to {}", path.display()));
+                    if history_changed
+                        && self.network.is_some()
+                        && self.active_server_label.as_deref() == Some(label.as_str())
+                    {
+                        self.set_status("server saved; persistence changes apply on reconnect");
+                    } else {
+                        self.set_status(format!("server saved to {}", path.display()));
+                    }
                 }
             }
             Err(error) => self.set_error(error),
@@ -4074,10 +4147,27 @@ impl App {
                 self.config.config_path = Some(path.clone());
                 session.dirty = false;
                 self.room.set_max_messages(self.config.ui.max_messages);
+                self.push_file_policy();
                 self.set_status(format!("settings saved to {}", path.display()));
             }
             Err(error) => self.set_error(error),
         }
+    }
+
+    /// Refreshes the network worker's resolved download policy after a config
+    /// save. The join-time advertisement to the server updates on reconnect.
+    pub(crate) fn push_file_policy(&mut self) {
+        if self.network.is_none() {
+            return;
+        }
+        let Some(alias) = self.active_server_label.clone() else {
+            return;
+        };
+        let Ok(server) = self.config.server(&alias) else {
+            return;
+        };
+        let policy = self.config.file_policy(server);
+        self.send_network_command(NetworkCommand::SetFilePolicy(policy), false);
     }
 
     pub(crate) fn refresh_audio_devices(&mut self) {
@@ -4177,6 +4267,7 @@ impl App {
             "/users" => self.show_users(),
             "/whoami" => self.show_current_user(),
             "/rooms" => self.open_room_switcher(),
+            "/room-settings" => self.open_room_settings(),
             "/room" => self.set_error("usage: /room name"),
             command if command.starts_with("/room ") => self.switch_room_command(command),
             "/dm" => self.set_error("usage: /dm user"),
@@ -5416,6 +5507,7 @@ fn app_network_command_kind(command: &NetworkCommand) -> &'static str {
         NetworkCommand::StopShare { .. } => "stop_share",
         NetworkCommand::ReportBug { .. } => "report_bug",
         NetworkCommand::SetUploadRate(_) => "set_upload_rate",
+        NetworkCommand::SetFilePolicy(_) => "set_file_policy",
         NetworkCommand::SetP2pEnabled(_) => "set_p2p_enabled",
         NetworkCommand::Shutdown => "shutdown",
     }
@@ -5466,6 +5558,7 @@ mod tests {
                 username: "Zoe".to_string(),
                 token: String::new(),
                 server_public_key: String::new(),
+                ..ServerEntry::default()
             },
             open: Some(String::new()),
             completion: PairCompletion::OpenEditor,
@@ -5528,6 +5621,7 @@ mod tests {
             token: "tct1_existing-token".to_string(),
             server_public_key: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
                 .to_string(),
+            ..ServerEntry::default()
         });
         app.active_server_label = Some("public".to_string());
 
@@ -6449,7 +6543,7 @@ mod tests {
     fn server_edit_reuses_one_editor_across_text_fields() {
         let mut draft = ServerEditDraft::from_server(
             &crate::config::ServerEntry::default(),
-            crate::config::FormBindings::Standard,
+            &crate::config::Config::default(),
         );
         let first_editor = draft.active_editor_address().unwrap();
         draft.set_active_editor_text("local-dev");
@@ -7010,6 +7104,7 @@ mod tests {
                 username: "Zoe".to_string(),
                 token: "tct1_existing-token".to_string(),
                 server_public_key: String::new(),
+                ..ServerEntry::default()
             });
         }
         app

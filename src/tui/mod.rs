@@ -8,6 +8,7 @@ pub(crate) mod mode_stack {
 pub(crate) mod modes;
 pub(crate) mod overlay;
 pub(crate) mod render;
+pub(crate) mod room_settings;
 pub(crate) mod user_list;
 pub(crate) mod widgets;
 

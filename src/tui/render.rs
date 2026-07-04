@@ -105,24 +105,54 @@ pub(crate) fn draw_server_select_screen(
     draw_key_preview(key_preview_area, app, buf);
 }
 
-pub(crate) fn draw_server_edit_screen(
+/// Centered panel geometry for a form dialog overlay: `form_height` body rows
+/// plus a header row and vertical padding. `None` when the screen is too small
+/// for a useful dialog.
+pub(crate) fn form_dialog_panel(area: Rect, form_height: u16) -> Option<Rect> {
+    if area.w < 30 || area.h < 8 {
+        return None;
+    }
+    let width = area.w.saturating_sub(4).min(112);
+    let height = form_height.saturating_add(3).min(area.h.saturating_sub(2));
+    Some(Rect {
+        x: area.x + area.w.saturating_sub(width) / 2,
+        y: area.y + area.h.saturating_sub(height) / 2,
+        w: width,
+        h: height,
+    })
+}
+
+/// Clears the dialog panel, draws its header row, and returns the padded body
+/// rect the caller renders the form into.
+pub(crate) fn draw_form_dialog_frame(
+    panel: Rect,
+    buf: &mut Buffer,
+    theme: &Theme,
+    title: &str,
+) -> Rect {
+    buf.clear_rect(panel, theme.dialog_panel);
+    let mut rows = panel;
+    rows.take_top(1)
+        .with(theme.dialog_header | Modifier::BOLD)
+        .fill(buf)
+        .with(HAlign::Center)
+        .with(Ellipsis(true))
+        .text(buf, &format!(" {title} "));
+    rows.inset(1, 1)
+}
+
+pub(crate) fn draw_server_edit_overlay(
     app: &mut App,
     draft: &mut ServerEditDraft,
-    mode: theme::UiMode,
-    status_label: &'static str,
-    layer: LayerId,
     buf: &mut Buffer,
 ) {
-    let capture = prepare_screen(app, buf);
-    let mut screen = buf.rect();
-    refresh_key_preview_cache(app, Some(layer));
-    let key_preview_height = key_preview_height(app, screen.w);
-    let key_preview_area = screen.take_bottom(key_preview_height as i32);
-    let status_area = screen.take_bottom(1);
-    draw_join_notice(&mut screen, app, buf);
-    draw_server_edit(screen, app, draft, buf);
-    draw_status(status_area, app, buf, mode, status_label, capture.as_ref());
-    draw_key_preview(key_preview_area, app, buf);
+    let area = buf.rect();
+    let Some(panel) = form_dialog_panel(area, draft.form_height()) else {
+        return;
+    };
+    let body = draw_form_dialog_frame(panel, buf, &app.theme, &draft.title());
+    draft.render(body, buf, &app.theme);
+    draw_overlay_key_preview(app, bindings::FORM_LAYER, buf);
 }
 
 pub(crate) fn draw_settings_screen(
@@ -831,12 +861,6 @@ fn draw_server_select_item(
             .with(Ellipsis(true))
             .text(buf, &format!("  {}", item.tcp_addr));
     }
-}
-
-fn draw_server_edit(area: Rect, app: &mut App, draft: &mut ServerEditDraft, buf: &mut Buffer) {
-    area.with(app.theme.background).fill(buf);
-    let theme = &app.theme;
-    draft.render(area, buf, theme);
 }
 
 fn room_user_voice_feedback_label(app: &App, participant: &ParticipantState) -> String {

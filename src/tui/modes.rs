@@ -11,7 +11,10 @@ use crate::{
     theme,
     tui::{
         form::{FormAction, FormFieldKind, FormMouseIntent, FormState},
-        mode::{AppMode, ChromeSpec, ExitReason, ModePresentation, ModeTransition, is_quit_key},
+        mode::{
+            AppMode, ChromeSpec, Coverage, ExitReason, ModePresentation, ModeTransition,
+            is_quit_key,
+        },
         overlay::{ConfirmDisposition, ConfirmMode},
     },
     ui::{
@@ -556,15 +559,7 @@ impl ServerEditMode {
 
 impl AppMode for ServerEditMode {
     fn render(&mut self, app: &mut App, buf: &mut Buffer, _now_ms: u64) {
-        let chrome = self.presentation(app).chrome.expect("base mode has chrome");
-        crate::tui::render::draw_server_edit_screen(
-            app,
-            &mut self.draft,
-            chrome.theme_mode,
-            chrome.status_label,
-            chrome.layer,
-            buf,
-        );
+        crate::tui::render::draw_server_edit_overlay(app, &mut self.draft, buf);
     }
 
     fn process_input(&mut self, app: &mut App, key: KeyEvent) -> Action {
@@ -583,11 +578,14 @@ impl AppMode for ServerEditMode {
     }
 
     fn presentation(&self, _app: &App) -> ModePresentation {
-        ModePresentation::full_screen(ChromeSpec {
-            theme_mode: theme::UiMode::ServerEdit,
-            status_label: "Server",
-            layer: bindings::FORM_LAYER,
-        })
+        ModePresentation {
+            coverage: Coverage::Overlay,
+            chrome: Some(ChromeSpec {
+                theme_mode: theme::UiMode::ServerEdit,
+                status_label: "Server",
+                layer: bindings::FORM_LAYER,
+            }),
+        }
     }
 }
 
@@ -1041,6 +1039,7 @@ impl RoomMode {
             }
             RoomSwitcher => app.open_room_switcher(),
             OpenUserList => app.open_user_list(),
+            OpenRoomSettings => app.open_room_settings(),
             NextRoom => app.cycle_room(1),
             PrevRoom => app.cycle_room(-1),
             _ => return app.process_global_command(command),

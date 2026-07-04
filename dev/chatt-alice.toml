@@ -12,13 +12,22 @@ room-height = 4
 max-composer-height = 6
 max-messages = 50000
 overscan = 24
-form-bindings = "vim"
+default-bindings = "standard"
 theme = "tomorrow-night"
 
 [files]
 receive-dir = "/tmp/chatt-alice"
 max-upload-bytes = 52428800
 max-receive-bytes = 52428800
+upload-rate-bytes = 0
+
+[p2p]
+enabled = false
+candidate-privacy = "mdns"
+prefer-ipv6 = true
+
+[history]
+enabled = true
 
 [web]
 enabled = true
@@ -26,6 +35,162 @@ bind = "127.0.0.1:8080"
 readonly = false
 autoplay = "with-audio"
 viewer-in-seperate-browser-tab = true
+
+[bindings]
+
+[bindings.insert]
+C-c = "Quit"
+F2 = "OpenSettings"
+ENTER = "SubmitMessage"
+C-m = "SubmitMessage"
+C-g = "Cancel"
+M-m = "ToggleMute"
+C-v = "PasteClipboard"
+C-M-v = "PasteClipboard"
+C-h = "ToggleDeafen"
+D-j = "FocusNext"
+D-k = "FocusPrev"
+C-k = "RoomSwitcher"
+M-DOWN = "NextRoom"
+M-UP = "PrevRoom"
+"M-." = "ToggleKeyPreview"
+
+[bindings.compose-normal]
+F2 = "OpenSettings"
+J = "FocusNext"
+K = "FocusPrev"
+D-j = "FocusNext"
+D-k = "FocusPrev"
+m = "ToggleMute"
+p = "PasteClipboard"
+C-v = "PasteClipboard"
+C-M-v = "PasteClipboard"
+C-k = "RoomSwitcher"
+M-DOWN = "NextRoom"
+M-UP = "PrevRoom"
+"." = "ToggleKeyPreview"
+
+[bindings.workspace]
+C-c = "Quit"
+i = "EnterCompose"
+a = "EnterCompose"
+F2 = "OpenSettings"
+q = "EnterCompose"
+j = "ScrollDown"
+k = "ScrollUp"
+J = "FocusNext"
+K = "FocusPrev"
+D-j = "FocusNext"
+D-k = "FocusPrev"
+ENTER = "OpenSelectedUserVolume"
+M = "ToggleSelectedUserMute"
+DOWN = "ScrollDown"
+UP = "ScrollUp"
+C-d = "HalfPageDown"
+C-u = "HalfPageUp"
+G = "Bottom"
+"g g" = "Top"
+m = "ToggleMute"
+C-h = "ToggleDeafen"
+h = "AdjustLeft"
+l = "AdjustRight"
+LEFT = "AdjustLeft"
+RIGHT = "AdjustRight"
+c = "ClearChat"
+y = "CopySelection"
+Y = "CopyMessageRef"
+r = "InsertMessageRef"
+o = "OpenMessageRef"
+e = "ToggleExpand"
+p = "PasteClipboard"
+C-v = "PasteClipboard"
+C-M-v = "PasteClipboard"
+TAB = "ToggleExpand"
+C-k = "RoomSwitcher"
+M-DOWN = "NextRoom"
+M-UP = "PrevRoom"
+F3 = "OpenUserList"
+"." = "ToggleKeyPreview"
+
+[bindings.list]
+C-c = "Quit"
+ESC = "Cancel"
+q = "Cancel"
+F3 = "Cancel"
+j = "SelectNext"
+k = "SelectPrev"
+DOWN = "SelectNext"
+UP = "SelectPrev"
+C-d = "HalfPageDown"
+C-u = "HalfPageUp"
+ENTER = "Activate"
+"." = "ToggleKeyPreview"
+
+[bindings.picker]
+inherit = ["list"]
+C-k = "RoomSwitcher"
+e = "EditServer"
+d = "DeleteServer"
+"/" = "SearchServers"
+F2 = "OpenSettings"
+
+[bindings.users]
+inherit = ["list"]
+d = "StartDm"
+"/" = "SearchServers"
+
+[bindings.form]
+C-c = "Quit"
+ESC = "Cancel"
+TAB = "FocusNext"
+BACKTAB = "FocusPrev"
+DOWN = "FocusNext"
+UP = "FocusPrev"
+ENTER = "Activate"
+
+[bindings.settings]
+C-c = "Quit"
+ESC = "Cancel"
+q = "CloseSettings"
+F2 = "CloseSettings"
+j = "FocusNext"
+k = "FocusPrev"
+DOWN = "SelectNext"
+UP = "SelectPrev"
+C-j = "SelectNext"
+C-k = "SelectPrev"
+TAB = "FocusNext"
+BACKTAB = "FocusPrev"
+h = "AdjustLeft"
+l = "AdjustRight"
+C-l = "AdjustRight"
+LEFT = "AdjustLeft"
+RIGHT = "AdjustRight"
+ENTER = "Activate"
+r = "RefreshDevices"
+C-s = "SaveSettings"
+"." = "ToggleKeyPreview"
+
+[bindings.dialog]
+C-c = "Quit"
+ESC = "Cancel"
+ENTER = "Activate"
+LEFT = "AdjustLeft"
+RIGHT = "AdjustRight"
+DOWN = "AdjustLeft"
+UP = "AdjustRight"
+"." = "ToggleKeyPreview"
+
+[bindings.password]
+C-c = "Quit"
+ESC = "Cancel"
+ENTER = "SubmitPassword"
+C-r = "TogglePasswordVisibility"
+
+[bindings.paste]
+C-c = "Quit"
+ESC = "Cancel"
+ENTER = "Activate"
 
 
 [audio]

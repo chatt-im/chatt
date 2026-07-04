@@ -88,6 +88,7 @@ pub enum BindCommand {
     NextRoom,
     PrevRoom,
     OpenUserList,
+    OpenRoomSettings,
     StartDm,
 }
 
@@ -149,6 +150,7 @@ impl std::fmt::Display for BindCommand {
             NextRoom => "NextRoom",
             PrevRoom => "PrevRoom",
             OpenUserList => "OpenUserList",
+            OpenRoomSettings => "OpenRoomSettings",
             StartDm => "StartDm",
         })
     }
@@ -222,6 +224,7 @@ impl BindCommand {
             NextRoom => spec("Next Room", NAV),
             PrevRoom => spec("Prev Room", NAV),
             OpenUserList => spec("Users", NAV),
+            OpenRoomSettings => spec("Room Settings", NAV),
             StartDm => spec("DM", ACTION),
         }
     }

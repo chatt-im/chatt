@@ -77,6 +77,11 @@ pub(crate) const SLASH_COMMANDS: &[SlashCommand] = &[
         description: "switch the viewed room by name",
     },
     SlashCommand {
+        name: "/room-settings",
+        usage: "/room-settings",
+        description: "open per-room download and persistence overrides",
+    },
+    SlashCommand {
         name: "/rooms",
         usage: "/rooms",
         description: "open the room switcher",
