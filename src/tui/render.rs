@@ -139,14 +139,10 @@ pub(crate) fn draw_settings_screen(
     draw_top_bar(top_bar_area, app, buf, capture.as_ref());
 
     refresh_key_preview_cache(app, Some(layer));
-    let composer_height = composer_height(app, screen.w);
     let key_preview_height = key_preview_height(app, screen.w);
     let key_preview_area = screen.take_bottom(key_preview_height as i32);
     let status_area = screen.take_bottom(1);
-    let composer_area = screen.take_bottom(composer_height as i32);
 
-    draw_composer(composer_area, app, ChatPanelFocus::Compose, buf);
-    buf.hide_cursor();
     let session = settings_mode.session_mut();
     ui::settings::draw_settings(
         screen,
