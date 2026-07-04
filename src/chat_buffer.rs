@@ -171,10 +171,10 @@ impl VirtualChatBuffer {
         }
     }
 
-    pub fn push_chat(&mut self, message: ChatMessage, local: bool) {
+    fn build_entry(&self, message: ChatMessage, local: bool) -> ChatEntry {
         let inline = crate::markdown::inline_ranges(&message.body);
         let refs = self.build_ref_spans(&message.body, inline.refs);
-        self.messages.push(ChatEntry {
+        ChatEntry {
             id: message.message_id.0,
             sender: message.sender_name,
             body: message.body,
@@ -185,8 +185,80 @@ impl VirtualChatBuffer {
             refs,
             expanded: false,
             layout: MessageLayout::new(),
-        });
+        }
+    }
+
+    pub fn push_chat(&mut self, message: ChatMessage, local: bool) {
+        let entry = self.build_entry(message, local);
+        self.messages.push(entry);
         self.trim_front();
+    }
+
+    /// Inserts a batch of older messages before the first entry. `messages`
+    /// must be sorted by `(timestamp_ms, message_id)` and older than every
+    /// resident message. The bottom-relative scroll is untouched, so the view
+    /// does not jump; selection coordinates shift with the entries they name.
+    pub fn prepend_chat(&mut self, messages: Vec<(ChatMessage, bool)>) {
+        if messages.is_empty() {
+            return;
+        }
+        let count = messages.len();
+        let entries: Vec<ChatEntry> = messages
+            .into_iter()
+            .map(|(message, local)| self.build_entry(message, local))
+            .collect();
+        self.messages.splice(0..0, entries);
+        if let Some(selection) = &mut self.selection {
+            selection.anchor.0 += count;
+            selection.head.0 += count;
+        }
+        if let Some(selected) = &mut self.selected_message {
+            *selected += count;
+        }
+        self.trim_front();
+    }
+
+    /// Inserts one message at its sorted position among real messages,
+    /// leaving notices pinned where they were pushed. For the rare history
+    /// straggler that lands between resident messages.
+    pub fn insert_chat(&mut self, message: ChatMessage, local: bool) {
+        let key = (message.timestamp_ms, message.message_id.0);
+        let index = self
+            .messages
+            .iter()
+            .rposition(|entry| entry.timestamp_ms != 0 && (entry.timestamp_ms, entry.id) < key)
+            .map_or(0, |newest_older| newest_older + 1);
+        let entry = self.build_entry(message, local);
+        self.messages.insert(index, entry);
+        if let Some(selection) = &mut self.selection {
+            if selection.anchor.0 >= index {
+                selection.anchor.0 += 1;
+            }
+            if selection.head.0 >= index {
+                selection.head.0 += 1;
+            }
+        }
+        if let Some(selected) = &mut self.selected_message
+            && *selected >= index
+        {
+            *selected += 1;
+        }
+        self.trim_front();
+    }
+
+    /// Re-marks which messages are locally sent, keyed by
+    /// `(timestamp_ms, message_id)`. Heading grouping reads `local` per frame
+    /// and cached layouts do not depend on it, so nothing is invalidated.
+    /// Notices and keys the callback does not know keep their flag.
+    pub fn set_local_flags(&mut self, local_for: impl Fn(u64, u64) -> Option<bool>) {
+        for entry in &mut self.messages {
+            if entry.timestamp_ms == 0 {
+                continue;
+            }
+            if let Some(local) = local_for(entry.timestamp_ms, entry.id) {
+                entry.local = local;
+            }
+        }
     }
 
     pub fn push_notice(&mut self, sender: impl Into<String>, body: impl Into<String>) {
@@ -363,10 +435,6 @@ impl VirtualChatBuffer {
         self.scroll_offset = 0;
     }
 
-    pub fn restore_scroll_offset(&mut self, scroll_offset: usize) {
-        self.scroll_offset = scroll_offset;
-    }
-
     pub fn is_at_top(&mut self, width: u16, height: u16) -> bool {
         self.scroll_offset == self.max_scroll(width, height)
     }
@@ -411,6 +479,7 @@ impl VirtualChatBuffer {
         self.selection = None;
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn selected_message(&self) -> Option<usize> {
         self.selected_message
     }
@@ -2079,6 +2148,87 @@ mod tests {
             });
             self.trim_front();
         }
+    }
+
+    fn chat_message(id: u64, timestamp_ms: u64, body: &str) -> ChatMessage {
+        ChatMessage {
+            message_id: rpc::ids::MessageId(id),
+            room_id: rpc::ids::RoomId(1),
+            sender: rpc::ids::UserId(2),
+            sender_name: "alice".to_string(),
+            timestamp_ms,
+            body: body.to_string(),
+            file_transfer_id: None,
+        }
+    }
+
+    #[test]
+    fn prepend_keeps_selection_and_bottom_relative_scroll() {
+        let mut buf = VirtualChatBuffer::new(1000, SyntaxTheme::default());
+        for id in 10..15 {
+            buf.push_chat(chat_message(id, id * 1_000, "resident"), false);
+        }
+        buf.scroll_up(3, 40, 2);
+        let offset = buf.scroll_offset();
+        buf.select_message(2);
+
+        let older = (1..4)
+            .map(|id| (chat_message(id, id * 1_000, "older"), false))
+            .collect();
+        buf.prepend_chat(older);
+
+        assert_eq!(buf.len(), 8);
+        assert_eq!(buf.message(0).id, 1);
+        assert_eq!(buf.scroll_offset(), offset);
+        assert_eq!(buf.selected_message(), Some(5));
+        assert_eq!(buf.message(5).id, 12);
+    }
+
+    #[test]
+    fn prepend_respects_message_cap() {
+        let mut buf = VirtualChatBuffer::new(4, SyntaxTheme::default());
+        for id in 10..13 {
+            buf.push_chat(chat_message(id, id * 1_000, "resident"), false);
+        }
+
+        let older = (1..=3)
+            .map(|id| (chat_message(id, id * 1_000, "older"), false))
+            .collect();
+        buf.prepend_chat(older);
+
+        assert_eq!(buf.len(), 4);
+        assert_eq!(buf.message(0).id, 3);
+        assert_eq!(buf.message(3).id, 12);
+    }
+
+    #[test]
+    fn insert_chat_orders_between_messages_and_skips_notices() {
+        let mut buf = VirtualChatBuffer::new(1000, SyntaxTheme::default());
+        buf.push_chat(chat_message(1, 1_000, "first"), false);
+        buf.push_notice("net", "notice");
+        buf.push_chat(chat_message(4, 4_000, "fourth"), false);
+
+        buf.insert_chat(chat_message(2, 2_000, "second"), false);
+        buf.insert_chat(chat_message(0, 500, "oldest"), false);
+
+        let ids: Vec<u64> = (0..buf.len()).map(|index| buf.message(index).id).collect();
+        assert_eq!(ids, vec![0, 1, 2, 0, 4]);
+        assert_eq!(buf.message(3).timestamp_ms, 0, "notice stays pinned");
+        assert_eq!(buf.message(0).body, "oldest");
+    }
+
+    #[test]
+    fn set_local_flags_updates_entries_by_key() {
+        let mut buf = VirtualChatBuffer::new(1000, SyntaxTheme::default());
+        buf.push_chat(chat_message(1, 1_000, "mine"), false);
+        buf.push_notice("net", "notice");
+        buf.push_chat(chat_message(2, 2_000, "theirs"), false);
+
+        buf.set_local_flags(|timestamp_ms, id| (timestamp_ms == 1_000 && id == 1).then_some(true));
+
+        assert!(buf.message(0).local);
+        assert!(!buf.message(1).local);
+        assert!(!buf.message(2).local);
     }
 
     fn heading_ids(buf: &mut VirtualChatBuffer, width: u16) -> Vec<u64> {

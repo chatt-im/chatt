@@ -1183,13 +1183,15 @@ impl App {
                 }
             };
         let history_id = crate::room_history::derive_server_id(&server.token);
-        self.room.connect_to_server(
+        let continuity = self.room.connect_to_server(
             server.label.clone(),
             history_id.clone(),
             server.effective_display_name(),
         );
-        let catalog = crate::room_catalog::load(&history_id);
-        self.room.load_offline_catalog(&catalog, self.user_id);
+        if continuity == room::ServerContinuity::NewServer {
+            let catalog = crate::room_catalog::load(&history_id);
+            self.room.load_offline_catalog(&catalog, self.user_id);
+        }
         if let Some(feed) = &self.web_feed {
             let view = self.room.viewed_history();
             feed.set_room(web_room_messages(&view, &self.room));
@@ -1803,8 +1805,8 @@ impl App {
             } => {
                 self.room
                     .complete_history_fetch(room_id, &messages, at_start);
-                self.room.merge_history(room_id, messages, self.user_id);
-                if self.room.viewed_room == Some(room_id) {
+                let changed = self.room.merge_history(room_id, messages, self.user_id);
+                if changed && self.room.viewed_room == Some(room_id) && self.web_feed.is_some() {
                     self.sync_viewed_room_to_feeds();
                 }
             }

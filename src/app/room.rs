@@ -71,6 +71,12 @@ impl crate::ui::select::SelectableItem for RoomSelectItem {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ServerContinuity {
+    SameServer,
+    NewServer,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum ClientRoomKind {
     Public,
@@ -145,6 +151,65 @@ impl ClientRoom {
                     .insert((message.timestamp_ms, message.message_id.0), attachment);
             }
         }
+        true
+    }
+
+    /// Merges one server history page: dedups against the resident log,
+    /// captures fresh messages to disk, and threads them into the buffer at
+    /// their key order without rebuilding it, so notices, transfer overlays,
+    /// and the scroll position survive. Returns whether anything changed.
+    fn merge_history_page(
+        &mut self,
+        page: Vec<ChatMessage>,
+        local_user: Option<UserId>,
+        max_messages: usize,
+    ) -> bool {
+        let mut fresh = page;
+        fresh.sort_by_key(MessageLog::key);
+        fresh.dedup_by_key(|message| MessageLog::key(message));
+        fresh.retain(|message| !self.messages.contains(MessageLog::key(message)));
+        if fresh.is_empty() {
+            return false;
+        }
+        if let Some(store) = &mut self.history {
+            for message in &fresh {
+                store.append_message(message);
+            }
+        }
+        collect_web_attachments(
+            &fresh,
+            &self.files,
+            &mut self.web_attachments,
+            &mut self.web_file_attachments,
+        );
+        let oldest_resident = self.messages.first().map(MessageLog::key);
+        let split = oldest_resident.map_or(fresh.len(), |oldest| {
+            fresh.partition_point(|message| MessageLog::key(message) < oldest)
+        });
+        let rest = fresh.split_off(split);
+        let older = fresh;
+        // Budget the prepend to the cap's remaining room so trim never has to
+        // undo it; the overflow is the oldest data and stays on disk only.
+        let budget = max_messages.saturating_sub(self.messages.len());
+        let skip = older.len().saturating_sub(budget);
+        let older: Vec<ChatMessage> = older.into_iter().skip(skip).collect();
+        if !older.is_empty() {
+            let flagged = older
+                .iter()
+                .map(|message| (message.clone(), Some(message.sender) == local_user))
+                .collect();
+            self.chat.prepend_chat(flagged);
+            self.messages.prepend(older);
+        }
+        for message in rest {
+            let local = Some(message.sender) == local_user;
+            match self.messages.insert(message.clone()) {
+                LogInsert::Appended => self.chat.push_chat(message, local),
+                LogInsert::Inserted => self.chat.insert_chat(message, local),
+                LogInsert::Duplicate => {}
+            }
+        }
+        self.messages.trim_front(max_messages);
         true
     }
 }
@@ -257,6 +322,29 @@ impl MessageLog {
             .partition_point(|resident| Self::key(resident) < key);
         self.messages.insert(index, message);
         LogInsert::Inserted
+    }
+
+    fn contains(&self, key: (u64, u64)) -> bool {
+        self.keys.contains(&key)
+    }
+
+    fn first(&self) -> Option<&ChatMessage> {
+        self.messages.first()
+    }
+
+    /// Splices a sorted batch strictly older than the resident front.
+    fn prepend(&mut self, messages: Vec<ChatMessage>) {
+        debug_assert!(messages.is_sorted_by_key(Self::key));
+        debug_assert!(
+            messages
+                .last()
+                .zip(self.messages.first())
+                .is_none_or(|(newest, front)| Self::key(newest) < Self::key(front))
+        );
+        for message in &messages {
+            self.keys.insert(Self::key(message));
+        }
+        self.messages.splice(0..0, messages);
     }
 
     /// Drops the oldest messages over `max`, removing their keys with them.
@@ -550,29 +638,41 @@ impl RoomSession {
         server_alias: String,
         history_id: String,
         local_user_name: String,
-    ) {
-        let same_server = !history_id.is_empty() && self.history_id == history_id;
-        self.clear_active_room_state();
+    ) -> ServerContinuity {
+        let continuity = if !history_id.is_empty() && self.history_id == history_id {
+            ServerContinuity::SameServer
+        } else {
+            ServerContinuity::NewServer
+        };
         self.server_alias = server_alias;
         self.history_id = history_id;
         self.local_user_name = local_user_name;
-        self.room_name = "lobby".to_string();
-        self.metas.clear();
-        self.parked.clear();
-        if !same_server {
-            self.participant_presence.clear();
+
+        match continuity {
+            ServerContinuity::SameServer => {
+                self.stream_users.clear();
+                self.volume_preview = None;
+            }
+            ServerContinuity::NewServer => {
+                self.clear_active_room_state();
+                self.room_name = "lobby".to_string();
+                self.metas.clear();
+                self.parked.clear();
+                self.participant_presence.clear();
+                self.archived_metas.clear();
+                self.archived_rooms.clear();
+                self.users.clear();
+                self.viewed_room = None;
+                self.default_room = None;
+                self.local_user = None;
+                self.muted_users.clear();
+                self.stream_users.clear();
+                self.volume_preview = None;
+                self.composer.clear();
+                self.composer.enter_insert_mode();
+            }
         }
-        self.archived_metas.clear();
-        self.archived_rooms.clear();
-        self.users.clear();
-        self.viewed_room = None;
-        self.default_room = None;
-        self.local_user = None;
-        self.muted_users.clear();
-        self.stream_users.clear();
-        self.volume_preview = None;
-        self.composer.clear();
-        self.composer.enter_insert_mode();
+        continuity
     }
 
     pub(crate) fn reset_for_server_list(&mut self) {
@@ -853,6 +953,10 @@ impl RoomSession {
         }
     }
 
+    /// Re-derives the viewed room's presentation after authentication: the
+    /// room name and which messages count as locally sent now that
+    /// `local_user` is known. The buffer itself is untouched, so notices and
+    /// the scroll position survive re-auth.
     fn refresh_viewed_room(&mut self, local_user: Option<UserId>) {
         let Some(room_id) = self.viewed_room else {
             return;
@@ -862,13 +966,14 @@ impl RoomSession {
             .get(&room_id)
             .map(|meta| meta.name.clone())
             .unwrap_or_default();
-        self.active.chat.clear();
         self.active.chat.set_room_id(room_id);
+        let mut locals = HashMap::new();
         for message in self.active.messages.as_slice() {
-            let local = Some(message.sender) == local_user;
-            self.active.chat.push_chat(message.clone(), local);
+            locals.insert(MessageLog::key(message), Some(message.sender) == local_user);
         }
-        self.active.chat.bottom();
+        self.active
+            .chat
+            .set_local_flags(|timestamp_ms, id| locals.get(&(timestamp_ms, id)).copied());
         self.mark_viewed_read();
         self.rebuild_roster();
     }
@@ -1042,74 +1147,24 @@ impl RoomSession {
         Some((room_id, Some(before), limit))
     }
 
+    /// Merges a server history page into whichever room holds `room_id`,
+    /// returning whether the room gained any messages.
     pub(crate) fn merge_history(
         &mut self,
         room_id: RoomId,
         messages: Vec<ChatMessage>,
         local_user: Option<UserId>,
-    ) {
-        if self.viewed_room == Some(room_id) {
-            let scroll_offset = self.active.chat.scroll_offset();
-            let selected = self.active.chat.selected_message().map(|index| {
-                let message = self.active.chat.message(index);
-                (message.timestamp_ms, message.id)
-            });
-            let mut fresh = false;
-            for message in messages {
-                if let LogInsert::Duplicate = self.active.messages.insert(message.clone()) {
-                    continue;
-                }
-                if let Some(store) = &mut self.active.history {
-                    store.append_message(&message);
-                }
-                fresh = true;
-            }
-            if !fresh {
-                return;
-            }
-            self.active.messages.trim_front(self.max_messages);
-            let all = std::mem::take(&mut self.active.messages);
-            self.populate_history(room_id, all.as_slice(), local_user);
-            self.active.messages = all;
-            self.active.chat.restore_scroll_offset(scroll_offset);
-            if let Some(selected) = selected
-                && let Some(index) =
-                    self.active.messages.as_slice().iter().position(|message| {
-                        (message.timestamp_ms, message.message_id.0) == selected
-                    })
-            {
-                self.active.chat.select_message(index);
-            }
-            let files = std::mem::take(&mut self.active.files);
-            self.populate_web_attachments_list(&files);
-            self.active.files = files;
-            self.mark_viewed_read();
-            return;
-        }
-        let Some(room) = self.parked.get_mut(&room_id) else {
-            return;
+    ) -> bool {
+        let viewed = self.viewed_room == Some(room_id);
+        let max_messages = self.max_messages;
+        let Some(room) = self.room_mut(room_id) else {
+            return false;
         };
-        let mut fresh = false;
-        for message in messages {
-            if let LogInsert::Duplicate = room.messages.insert(message.clone()) {
-                continue;
-            }
-            if let Some(store) = &mut room.history {
-                store.append_message(&message);
-            }
-            fresh = true;
+        let changed = room.merge_history_page(messages, local_user, max_messages);
+        if changed && viewed {
+            self.mark_viewed_read();
         }
-        if !fresh {
-            return;
-        }
-        room.messages.trim_front(self.max_messages);
-        room.chat.clear();
-        room.chat.set_room_id(room_id);
-        for message in room.messages.as_slice() {
-            let local = Some(message.sender) == local_user;
-            room.chat.push_chat(message.clone(), local);
-        }
-        room.chat.bottom();
+        changed
     }
 
     /// The viewed room's messages and file details, for mirroring into the web
@@ -1304,44 +1359,6 @@ impl RoomSession {
             }
         }
         self.participants.replace_room(seeds);
-    }
-
-    /// Replaces the chat buffer and dedup set with `messages`, marking those
-    /// from `local_user` as locally sent. Shared by [`joined`](Self::joined) and
-    /// [`load_offline_history`](Self::load_offline_history).
-    ///
-    /// `room_id` is set before any push so message references resolve while the
-    /// history populates.
-    fn populate_history(
-        &mut self,
-        room_id: RoomId,
-        messages: &[ChatMessage],
-        local_user: Option<UserId>,
-    ) {
-        self.active.chat.clear();
-        self.active.chat.set_room_id(room_id);
-        self.active.transfers.clear();
-        self.active.web_attachments.clear();
-        self.active.web_file_attachments.clear();
-        for message in messages {
-            let local = Some(message.sender) == local_user;
-            self.active.chat.push_chat(message.clone(), local);
-        }
-        self.active.chat.bottom();
-    }
-
-    fn populate_web_attachments_list(
-        &mut self,
-        files: &std::collections::HashMap<FileHistoryKey, room_history::FileDetail>,
-    ) {
-        self.active.web_attachments.clear();
-        self.active.web_file_attachments.clear();
-        collect_web_attachments(
-            self.active.messages.as_slice(),
-            files,
-            &mut self.active.web_attachments,
-            &mut self.active.web_file_attachments,
-        );
     }
 
     pub(crate) fn web_ref_for(
@@ -1673,8 +1690,14 @@ impl RoomSession {
         Some(submission)
     }
 
+    /// Clears the visible scrollback. The buffer keeps its room binding so
+    /// references keep resolving and later history pages merge in place.
     pub(crate) fn clear_chat(&mut self) {
+        let room_id = self.active.chat.room_id();
         self.active.chat.clear();
+        if let Some(room_id) = room_id {
+            self.active.chat.set_room_id(room_id);
+        }
     }
 
     pub(super) fn apply_theme(&mut self, theme: &Theme) {
@@ -1964,6 +1987,17 @@ mod tests {
     fn message_in(room_id: RoomId, id: u64, sender: UserId, body: &str) -> ChatMessage {
         let mut message = message(id, sender, body);
         message.room_id = room_id;
+        message
+    }
+
+    fn file_message(
+        id: u64,
+        sender: UserId,
+        body: &str,
+        transfer_id: FileTransferId,
+    ) -> ChatMessage {
+        let mut message = message(id, sender, body);
+        message.file_transfer_id = Some(transfer_id);
         message
     }
 
@@ -2403,6 +2437,104 @@ mod tests {
     }
 
     #[test]
+    fn history_merge_prepends_older_page_and_keeps_notices() {
+        let mut room = test_room();
+        let newest = (10..=12)
+            .map(|id| message(id, UserId(2), "newest"))
+            .collect::<Vec<_>>();
+        enter(&mut room, Vec::new(), newest, Some(UserId(1)));
+        room.push_notice("system", "help text");
+
+        let older = (1..=3)
+            .map(|id| message(id, UserId(2), "older"))
+            .collect::<Vec<_>>();
+        assert!(room.merge_history(RoomId(1), older, Some(UserId(1))));
+
+        let real_ids = (0..room.active.chat.len())
+            .filter_map(|index| {
+                let entry = room.active.chat.message(index);
+                (entry.timestamp_ms != 0).then_some(entry.id)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(real_ids, vec![1, 2, 3, 10, 11, 12]);
+        assert!(
+            (0..room.active.chat.len())
+                .any(|index| room.active.chat.message(index).body == "help text"),
+            "notice survived incremental merge"
+        );
+    }
+
+    #[test]
+    fn history_merge_keeps_transfer_overlays() {
+        let mut room = test_room();
+        enter(
+            &mut room,
+            Vec::new(),
+            vec![file_message(10, UserId(2), "file", FileTransferId(7))],
+            Some(UserId(1)),
+        );
+        room.transfer_progress(
+            RoomId(1),
+            FileTransferId(7),
+            25,
+            100,
+            TransferDirection::Incoming,
+        );
+
+        let older = (1..=3)
+            .map(|id| message(id, UserId(2), "older"))
+            .collect::<Vec<_>>();
+        assert!(room.merge_history(RoomId(1), older, Some(UserId(1))));
+
+        assert_eq!(room.transfer(FileTransferId(7)).unwrap().transferred, 25);
+    }
+
+    #[test]
+    fn history_merge_inserts_interleaved_messages_in_order() {
+        let mut room = test_room();
+        enter(
+            &mut room,
+            Vec::new(),
+            vec![
+                message(1, UserId(2), "first"),
+                message(3, UserId(2), "third"),
+            ],
+            Some(UserId(1)),
+        );
+
+        assert!(room.merge_history(
+            RoomId(1),
+            vec![
+                message(2, UserId(2), "second"),
+                message(4, UserId(2), "fourth"),
+            ],
+            Some(UserId(1)),
+        ));
+
+        let ids = (0..room.active.chat.len())
+            .map(|index| room.active.chat.message(index).id)
+            .collect::<Vec<_>>();
+        assert_eq!(ids, vec![1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn history_merge_reports_duplicate_pages_unchanged() {
+        let mut room = test_room();
+        let page = vec![
+            message(1, UserId(2), "first"),
+            message(2, UserId(2), "second"),
+        ];
+        enter(&mut room, Vec::new(), page.clone(), Some(UserId(1)));
+
+        assert!(!room.merge_history(RoomId(1), page, Some(UserId(1))));
+        assert!(room.merge_history(
+            RoomId(1),
+            vec![message(3, UserId(2), "third")],
+            Some(UserId(1)),
+        ));
+    }
+
+    #[test]
     fn message_log_keys_match_resident_messages() {
         let mut log = MessageLog::default();
         assert!(matches!(
@@ -2602,6 +2734,107 @@ mod tests {
         assert_eq!(room.participants.entries.len(), 1);
         assert_eq!(room.participants.entries[0].display_name(), "alice");
         assert!(room.active.chat.message(0).local);
+    }
+
+    #[test]
+    fn reauth_keeps_notices_and_fixes_local_marks() {
+        let catalog = RoomCatalog {
+            last_viewed_room: Some(RoomId(1)),
+            last_voice_room: None,
+            rooms: vec![CatalogRoom {
+                room_id: RoomId(1),
+                name: "old-name".to_string(),
+                kind: CatalogRoomKind::Public,
+                last_read: None,
+            }],
+        };
+        let mut room = test_room();
+        room.connect_to_server("alias".to_string(), String::new(), "me".to_string());
+        room.load_offline_catalog(&catalog, None);
+        room.chat_received(message(1, UserId(1), "mine"), None);
+        room.push_notice("system", "worker stopped");
+        assert!(!room.active.chat.message(0).local);
+
+        let mut live = room_info(1);
+        live.name = "renamed".to_string();
+        room.authenticated(
+            &[live],
+            vec![user(UserId(1), "alice")],
+            RoomId(1),
+            catalog.last_viewed_room,
+            Some(UserId(1)),
+        );
+
+        assert_eq!(room.room_name, "renamed");
+        assert!(room.active.chat.message(0).local);
+        assert!(
+            (0..room.active.chat.len())
+                .any(|index| room.active.chat.message(index).body == "worker stopped"),
+            "notice survived re-auth refresh"
+        );
+    }
+
+    #[test]
+    fn same_server_reconnect_keeps_drafts_unreads_and_buffers() {
+        let mut room = test_room();
+        assert_eq!(
+            room.connect_to_server(
+                "alias".to_string(),
+                "same-history".to_string(),
+                "alice".to_string(),
+            ),
+            ServerContinuity::NewServer
+        );
+        enter(
+            &mut room,
+            vec![user(UserId(1), "alice"), user(UserId(2), "bob")],
+            vec![message(1, UserId(1), "before reconnect")],
+            Some(UserId(1)),
+        );
+        room.push_notice("network", "worker stopped");
+        room.composer.set_lines("draft survives");
+        room.chat_received(
+            message_in(RoomId(2), 1, UserId(2), "hidden unread"),
+            Some(UserId(1)),
+        );
+        room.toggle_user_mute(UserId(2));
+        room.begin_volume_preview(UserId(2), 3.0);
+        room.voice_started(
+            RoomId(1),
+            SessionId(2),
+            UserId(2),
+            StreamId(9),
+            None,
+            Some(RoomId(1)),
+        );
+
+        assert_eq!(
+            room.connect_to_server(
+                "renamed".to_string(),
+                "same-history".to_string(),
+                "alice-new".to_string(),
+            ),
+            ServerContinuity::SameServer
+        );
+
+        assert_eq!(room.server_alias, "renamed");
+        assert_eq!(room.local_user_name, "alice-new");
+        assert_eq!(room.viewed_room, Some(RoomId(1)));
+        assert_eq!(room.room_name, "room-1");
+        assert_eq!(room.local_user, Some(UserId(1)));
+        assert_eq!(room.default_room, Some(RoomId(1)));
+        assert_eq!(room.room_meta(RoomId(2)).unwrap().unread, 1);
+        assert!(room.muted_user(UserId(2)));
+        assert!(room.preview_volume_for_test().is_none());
+        assert!(room.users_with_streams().next().is_none());
+        assert_eq!(room.composer.text().trim(), "draft survives");
+        assert_eq!(room.active.chat.message(0).body, "before reconnect");
+        assert!(
+            (0..room.active.chat.len())
+                .any(|index| room.active.chat.message(index).body == "worker stopped"),
+            "same-server reconnect kept active notices"
+        );
+        assert!(room.parked.contains_key(&RoomId(2)));
     }
 
     #[test]
