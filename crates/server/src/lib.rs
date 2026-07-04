@@ -2012,7 +2012,7 @@ impl Server {
                 let session = self
                     .sessions
                     .values()
-                    .find(|session| session.user_id == user.id);
+                    .find(|session| session.user_id == user.id && session.announced);
                 UserSummary {
                     user_id: user.id,
                     display_name: user.display_name.clone(),
@@ -2024,7 +2024,7 @@ impl Server {
             })
             .collect();
         for session in self.sessions.values() {
-            if is_dynamic_user_id(session.user_id) {
+            if session.announced && is_dynamic_user_id(session.user_id) {
                 users.push(Self::session_user_summary(session, true));
             }
         }
@@ -2093,7 +2093,12 @@ impl Server {
             session_id = session_id.0,
             room_id = room_id.0
         );
-        if !self.check_room_access(session_id, room_id) {
+        let allowed = match (self.sessions.get(&session_id), self.rooms.get(&room_id)) {
+            (Some(session), Some(room)) => room.access.allows(session.user_id),
+            _ => false,
+        };
+        if !allowed {
+            self.send_voice_join_failed(session_id, room_id, "room not found");
             return;
         }
         let previous = self.sessions.get(&session_id).and_then(|s| s.voice_room);
@@ -2110,8 +2115,8 @@ impl Server {
         if let Some(session) = self.sessions.get_mut(&session_id) {
             session.voice_room = Some(room_id);
         }
-        let voice_started = match self.ensure_voice_stream(session_id, room_id) {
-            Ok(voice) => Some(voice),
+        let (user_id, stream_id) = match self.ensure_voice_stream(session_id, room_id) {
+            Ok(voice) => voice,
             Err(error) => {
                 kvlog::warn!(
                     "voice stream failed",
@@ -2119,16 +2124,52 @@ impl Server {
                     room_id = room_id.0,
                     error = error.as_str()
                 );
-                None
+                if let Some(session) = self.sessions.get_mut(&session_id) {
+                    session.voice_room = None;
+                }
+                self.send_voice_join_failed(session_id, room_id, &error);
+                return;
             }
         };
-        if !already_active && let Some((user_id, stream_id)) = voice_started {
+        if !already_active {
             self.broadcast_voice_started(room_id, session_id, user_id, stream_id);
         }
         if let Some(token) = self.live_token_for_session(session_id) {
             self.send_existing_voice_streams_to_token(room_id, session_id, token);
         }
         self.replay_voice_room_shares(room_id, session_id);
+        if !already_active {
+            // Peers cache the last VoiceStatus broadcast per user, and status
+            // changes made while out of a call are stored without broadcast,
+            // so an effective join must republish the joiner's current status
+            // unconditionally to overwrite any stale belief.
+            let status = self
+                .sessions
+                .get(&session_id)
+                .map(|session| session.voice_status)
+                .unwrap_or_default();
+            self.broadcast_control(
+                room_id,
+                &ServerControl::VoiceStatus {
+                    room_id,
+                    user_id,
+                    status,
+                },
+            );
+        }
+    }
+
+    fn send_voice_join_failed(&mut self, session_id: SessionId, room_id: RoomId, message: &str) {
+        let Some(token) = self.live_token_for_session(session_id) else {
+            return;
+        };
+        let _ = self.send_control_to_token(
+            token,
+            &ServerControl::VoiceJoinFailed {
+                room_id,
+                message: message.to_string(),
+            },
+        );
     }
 
     /// Leaves the session's current voice call: stops its stream, tears down
@@ -4363,6 +4404,7 @@ fn server_control_kind(control: &ServerControl) -> &'static str {
         ServerControl::VoiceStarted { .. } => "voice_started",
         ServerControl::VoiceStopped { .. } => "voice_stopped",
         ServerControl::VoiceStatus { .. } => "voice_status",
+        ServerControl::VoiceJoinFailed { .. } => "voice_join_failed",
         ServerControl::RoomRttSnapshot { .. } => "room_rtt_snapshot",
         ServerControl::UdpBound => "udp_bound",
         ServerControl::UdpReflexive { .. } => "udp_reflexive",
@@ -4602,6 +4644,40 @@ mod tests {
                 .iter()
                 .all(|user| user.user_id != user_id || !user.online),
             "the ghost user must not linger online in the directory"
+        );
+    }
+
+    #[test]
+    fn user_summaries_hides_unannounced_sessions() {
+        let mut server = test_server();
+        server.config.users.push(UserConfig {
+            id: UserId(9),
+            name: "bob".to_string(),
+            display_name: "Bob".to_string(),
+            token_hash: String::new(),
+        });
+        let mut configured = test_session(UserId(9), Token(11), None);
+        configured.announced = false;
+        server.sessions.insert(SessionId(1), configured);
+        let dynamic_id = UserId(config::FIRST_DYNAMIC_USER_ID);
+        let mut dynamic = test_session(dynamic_id, Token(22), None);
+        dynamic.announced = false;
+        server.sessions.insert(SessionId(2), dynamic);
+
+        let users = server.user_summaries();
+
+        let configured = users
+            .iter()
+            .find(|user| user.user_id == UserId(9))
+            .expect("configured users stay listed");
+        assert!(
+            !configured.online,
+            "an unannounced session must not count as online"
+        );
+        assert_eq!(configured.connected_at_ms, 0);
+        assert!(
+            users.iter().all(|user| user.user_id != dynamic_id),
+            "an unannounced dynamic session must stay out of the directory"
         );
     }
 
@@ -5008,6 +5084,56 @@ mod tests {
     }
 
     #[test]
+    fn join_voice_broadcasts_joiner_stored_status() {
+        fn read_voice_status(
+            peer: &mut std::net::TcpStream,
+        ) -> (UserId, control::ParticipantVoiceStatus) {
+            let control = read_until(peer, |control| {
+                matches!(control, ServerControl::VoiceStatus { .. })
+            });
+            let ServerControl::VoiceStatus {
+                user_id, status, ..
+            } = control
+            else {
+                unreachable!();
+            };
+            (user_id, status)
+        }
+
+        let mut server = test_server();
+        let room_id = RoomId(1);
+        let joiner = SessionId(1);
+        let observer = SessionId(2);
+        let _joiner_peer = live_user(&mut server, Token(11), joiner, UserId(1));
+        let mut observer_peer = live_user(&mut server, Token(22), observer, UserId(2));
+        let muted = control::ParticipantVoiceStatus {
+            muted: true,
+            deafened: false,
+        };
+
+        server.join_voice(joiner, room_id);
+        server.leave_voice(joiner, None);
+        server.set_voice_status(joiner, muted);
+        server.join_voice(joiner, room_id);
+        server.leave_voice(joiner, None);
+        server.set_voice_status(joiner, control::ParticipantVoiceStatus::default());
+        server.join_voice(joiner, room_id);
+
+        let mut statuses = Vec::new();
+        for _ in 0..3 {
+            statuses.push(read_voice_status(&mut observer_peer));
+        }
+        assert_eq!(
+            statuses,
+            vec![
+                (UserId(1), control::ParticipantVoiceStatus::default()),
+                (UserId(1), muted),
+                (UserId(1), control::ParticipantVoiceStatus::default()),
+            ]
+        );
+    }
+
+    #[test]
     fn screen_share_is_announced_only_to_voice_members() {
         let mut server = test_server();
         let room_id = RoomId(1);
@@ -5218,7 +5344,7 @@ mod tests {
     }
 
     #[test]
-    fn join_voice_answers_404_for_inaccessible_room() {
+    fn join_voice_answers_failure_for_inaccessible_room() {
         let mut server = test_server();
         let secret = RoomId(3);
         server
@@ -5230,12 +5356,12 @@ mod tests {
         server.join_voice(outsider, secret);
 
         let control = read_until(&mut outsider_peer, |control| {
-            matches!(control, ServerControl::Error { .. })
+            matches!(control, ServerControl::VoiceJoinFailed { .. })
         });
-        let ServerControl::Error { code, .. } = control else {
+        let ServerControl::VoiceJoinFailed { room_id, .. } = control else {
             unreachable!();
         };
-        assert_eq!(code, control::ERROR_ROOM_NOT_FOUND);
+        assert_eq!(room_id, secret);
         let session = server.sessions.get(&outsider).expect("session exists");
         assert_eq!(session.voice_room, None);
     }

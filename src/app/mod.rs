@@ -1998,6 +1998,12 @@ impl App {
                 self.room.voice_status_changed(user_id, status);
                 self.apply_remote_sender_mute(user_id, status.muted);
             }
+            NetworkEvent::VoiceJoinFailed { room_id, message } => {
+                if self.requested_voice_room == Some(room_id) {
+                    self.requested_voice_room = None;
+                }
+                self.set_error(format!("voice join failed: {message}"));
+            }
             NetworkEvent::EncoderProfileChanged(profile) => {
                 self.encoder_profile = profile;
                 if let Some(capture) = &self.capture {
@@ -4817,6 +4823,7 @@ fn network_event_kind(event: &NetworkEvent) -> &'static str {
         NetworkEvent::ServerRtt { .. } => "server_rtt",
         NetworkEvent::PeerRtt { .. } => "peer_rtt",
         NetworkEvent::VoiceStatus { .. } => "voice_status",
+        NetworkEvent::VoiceJoinFailed { .. } => "voice_join_failed",
         NetworkEvent::EncoderProfileChanged(_) => "encoder_profile_changed",
         NetworkEvent::Status(_) => "status",
         NetworkEvent::Error(_) => "error",
@@ -5339,6 +5346,42 @@ mod tests {
                 .iter()
                 .any(|command| matches!(command, NetworkCommand::JoinVoice(rpc::ids::RoomId(1)))),
             "expected JoinVoice, got {commands:?}"
+        );
+    }
+
+    #[test]
+    fn voice_join_failure_clears_requested_room() {
+        let mut app = test_app();
+        let (tx, rx) = mpsc::channel();
+        app.network = Some(NetworkClient::from_parts_for_test(tx));
+        app.user_id = Some(UserId(1));
+        enter_test_room(&mut app);
+        app.deafened.store(true, Ordering::Relaxed);
+
+        app.room.composer.set_lines("/voice");
+        app.submit_input();
+        assert_eq!(app.requested_voice_room, Some(rpc::ids::RoomId(1)));
+
+        app.handle_network_event(NetworkEvent::VoiceJoinFailed {
+            room_id: rpc::ids::RoomId(1),
+            message: "room not found".to_string(),
+        });
+
+        assert_eq!(app.requested_voice_room, None);
+        assert_eq!(app.status.kind(), StatusKind::Error);
+
+        app.room.composer.set_lines("/voice");
+        app.submit_input();
+        assert_eq!(app.requested_voice_room, Some(rpc::ids::RoomId(1)));
+        let mut join_count = 0;
+        while let Ok(command) = rx.try_recv() {
+            if matches!(command, NetworkCommand::JoinVoice(rpc::ids::RoomId(1))) {
+                join_count += 1;
+            }
+        }
+        assert_eq!(
+            join_count, 2,
+            "retrying after a failed join must send JoinVoice again"
         );
     }
 

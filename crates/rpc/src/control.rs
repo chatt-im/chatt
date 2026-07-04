@@ -226,6 +226,12 @@ pub enum ServerControl {
         user_id: UserId,
         status: ParticipantVoiceStatus,
     },
+    /// Reply to a [`ClientControl::JoinVoice`] the server could not satisfy,
+    /// attributable to the room so the client can roll back its pending join.
+    VoiceJoinFailed {
+        room_id: RoomId,
+        message: String,
+    },
     /// Periodic authoritative snapshot of each room member's measured
     /// client-to-server RTT. Clients combine their local RTT with a remote
     /// member's value to estimate the full relayed path.
@@ -1005,6 +1011,16 @@ mod tests {
             room_id: RoomId(1),
             user_id: UserId(2),
             status,
+        };
+        let encoded = encode_server_control(&server);
+        assert_eq!(decode_server_control(&encoded).unwrap(), server);
+    }
+
+    #[test]
+    fn voice_join_failed_round_trips() {
+        let server = ServerControl::VoiceJoinFailed {
+            room_id: RoomId(7),
+            message: "room not found".to_string(),
         };
         let encoded = encode_server_control(&server);
         assert_eq!(decode_server_control(&encoded).unwrap(), server);

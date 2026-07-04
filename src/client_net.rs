@@ -329,6 +329,12 @@ pub enum NetworkEvent {
         user_id: UserId,
         status: ParticipantVoiceStatus,
     },
+    /// The server refused or failed a `JoinVoice` for `room_id`, so the
+    /// pending join must be rolled back before the room can be retried.
+    VoiceJoinFailed {
+        room_id: RoomId,
+        message: String,
+    },
     EncoderProfileChanged(LiveEncoderProfile),
     ShareStarted {
         room_id: RoomId,
@@ -3582,6 +3588,16 @@ impl WorkerState {
                     .events
                     .send(NetworkEvent::VoiceStatus { user_id, status });
             }
+            ServerControl::VoiceJoinFailed { room_id, message } => {
+                kvlog::warn!(
+                    "client voice join failed",
+                    room_id = room_id.0,
+                    error = message.as_str()
+                );
+                let _ = self
+                    .events
+                    .send(NetworkEvent::VoiceJoinFailed { room_id, message });
+            }
             ServerControl::RoomRttSnapshot { room_id, members } => {
                 if self.voice_room == Some(room_id) {
                     self.room_server_rtts = members
@@ -5070,6 +5086,7 @@ fn server_control_kind(control: &ServerControl) -> &'static str {
         ServerControl::VoiceStarted { .. } => "voice_started",
         ServerControl::VoiceStopped { .. } => "voice_stopped",
         ServerControl::VoiceStatus { .. } => "voice_status",
+        ServerControl::VoiceJoinFailed { .. } => "voice_join_failed",
         ServerControl::RoomRttSnapshot { .. } => "room_rtt_snapshot",
         ServerControl::UdpBound => "udp_bound",
         ServerControl::UdpReflexive { .. } => "udp_reflexive",
