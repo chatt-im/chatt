@@ -1980,7 +1980,7 @@ fn connection_state_label(app: &App) -> &'static str {
     }
 }
 
-fn age_label(instant: Instant) -> String {
+pub(crate) fn age_label(instant: Instant) -> String {
     let secs = instant.elapsed().as_secs();
     if secs < 60 {
         format!("{secs}s")

@@ -148,6 +148,7 @@ viewer-in-seperate-browser-tab = false
 "C-k" = "RoomSwitcher"
 "M-DOWN" = "NextRoom"
 "M-UP" = "PrevRoom"
+"F3" = "OpenUserList"
 "." = "ToggleKeyPreview"
 
 [bindings.picker]
@@ -164,6 +165,22 @@ viewer-in-seperate-browser-tab = false
 "d" = "DeleteServer"
 "/" = "SearchServers"
 "F2" = "OpenSettings"
+"." = "ToggleKeyPreview"
+
+[bindings.users]
+"C-c" = "Quit"
+"ESC" = "Cancel"
+"q" = "Cancel"
+"F3" = "Cancel"
+"j" = "SelectNext"
+"k" = "SelectPrev"
+"DOWN" = "SelectNext"
+"UP" = "SelectPrev"
+"C-d" = "HalfPageDown"
+"C-u" = "HalfPageUp"
+"ENTER" = "Activate"
+"d" = "StartDm"
+"/" = "SearchServers"
 "." = "ToggleKeyPreview"
 
 [bindings.form]

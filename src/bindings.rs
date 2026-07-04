@@ -15,6 +15,7 @@ pub const DIALOG_LAYER: LayerId = LayerId::new(6);
 pub const COMPOSE_NORMAL_LAYER: LayerId = LayerId::new(7);
 pub const PASSWORD_LAYER: LayerId = LayerId::new(8);
 pub const PASTE_LAYER: LayerId = LayerId::new(9);
+pub const USER_LIST_LAYER: LayerId = LayerId::new(10);
 
 #[derive(Clone, Debug, Toml)]
 pub enum BindCommand {
@@ -71,6 +72,8 @@ pub enum BindCommand {
     RoomSwitcher,
     NextRoom,
     PrevRoom,
+    OpenUserList,
+    StartDm,
 }
 
 impl std::fmt::Display for BindCommand {
@@ -130,6 +133,8 @@ impl std::fmt::Display for BindCommand {
             RoomSwitcher => "RoomSwitcher",
             NextRoom => "NextRoom",
             PrevRoom => "PrevRoom",
+            OpenUserList => "OpenUserList",
+            StartDm => "StartDm",
         })
     }
 }
@@ -201,6 +206,8 @@ impl BindCommand {
             RoomSwitcher => spec("Rooms", NAV),
             NextRoom => spec("Next Room", NAV),
             PrevRoom => spec("Prev Room", NAV),
+            OpenUserList => spec("Users", NAV),
+            StartDm => spec("DM", ACTION),
         }
     }
 }
@@ -389,6 +396,7 @@ impl<'de> FromToml<'de> for BindingRuntime {
             ("dialog", DIALOG_LAYER),
             ("password", PASSWORD_LAYER),
             ("paste", PASTE_LAYER),
+            ("users", USER_LIST_LAYER),
         ] {
             if let Some(bindings) = default_table.get(name) {
                 extend_layer(ctx, bindings, &mut actions, &mut builder, layer)?;

@@ -1473,6 +1473,10 @@ impl App {
         self.push_mode(Box::new(RoomSwitchMode::new()));
     }
 
+    pub(crate) fn open_user_list(&mut self) {
+        self.push_mode(Box::new(crate::tui::user_list::UserListMode::new()));
+    }
+
     /// Switches the view to the neighboring room in catalog order, wrapping.
     pub(crate) fn cycle_room(&mut self, delta: isize) {
         let rooms: Vec<RoomId> = self.room.room_metas().map(|(room_id, _)| room_id).collect();
@@ -4108,8 +4112,6 @@ impl App {
         self.set_viewed_room(room_id);
     }
 
-    /// Asks the server for the DM room with the named user; the view switches
-    /// when `DmOpened` arrives.
     fn open_dm_command(&mut self, command: &str) {
         let name = command.trim_start_matches("/dm ").trim();
         if name.is_empty() {
@@ -4120,6 +4122,12 @@ impl App {
             self.set_error(format!("no user named {name}"));
             return;
         };
+        self.open_dm_with(user_id);
+    }
+
+    /// Asks the server for the DM room with `user_id`; the view switches when
+    /// `DmOpened` arrives.
+    pub(crate) fn open_dm_with(&mut self, user_id: UserId) {
         if self.network.is_none() {
             self.set_error("select a server before opening dms");
             return;
@@ -4150,6 +4158,12 @@ impl App {
                 }
             },
         };
+        self.join_voice_room(target);
+    }
+
+    /// Moves the voice call to `target`; which room is viewed is the caller's
+    /// concern.
+    pub(crate) fn join_voice_room(&mut self, target: RoomId) {
         if self.network.is_none() {
             self.set_error("select a server before joining voice");
             return;
