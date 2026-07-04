@@ -243,7 +243,10 @@ pub(crate) struct LiveEncoderPipeline {
     /// Media timestamp (48 kHz sample index) of the first sample currently in
     /// `pending_opus_samples`. Valid while `pending_opus_samples` is non-empty;
     /// re-anchored whenever queued frames transition pending from empty to
-    /// non-empty.
+    /// non-empty. A partial frame must never straddle a suppressed span, so
+    /// entering suppression drops it via
+    /// [`Self::discard_pending_before_suppression`] to keep pending contiguous
+    /// with `next_capture_sample`.
     pending_start_sample: u32,
     next_opus_packet_flags: u8,
     silence_resume_hint_packets: u8,
@@ -450,7 +453,7 @@ impl LiveEncoderPipeline {
         let vad = vad_to_u8(vad_probability);
         let silence = is_capture_skip_safe_silence(self.tuning, vad, frame);
         stats.store_voice_active(!muted && !silence);
-        self.log_mute_state_change_if_needed(muted, frame);
+        self.handle_mute_state_change(muted, frame);
 
         // Account this 10 ms slot on the media sample clock before any emit, so
         // packets stamp a timestamp that tracks real elapsed time even when the
@@ -483,6 +486,7 @@ impl LiveEncoderPipeline {
                 self.queue_processed_capture_frame(frame, slot_start, stats, on_packet)?;
             }
             CaptureGateDecision::SuppressCurrent => {
+                self.discard_pending_before_suppression();
                 self.suppressed_frames = self.suppressed_frames.saturating_add(1);
                 self.maybe_emit_silence_marker(0, on_packet);
             }
@@ -501,12 +505,23 @@ impl LiveEncoderPipeline {
         Ok(())
     }
 
-    fn log_mute_state_change_if_needed(&mut self, muted: bool, frame: &[f32]) {
+    fn handle_mute_state_change(&mut self, muted: bool, frame: &[f32]) {
         if muted == self.last_muted {
             return;
         }
         self.mute_transition_id = self.mute_transition_id.wrapping_add(1);
         self.last_muted = muted;
+        if muted {
+            // Discard the long-silence gate's state the moment the user mutes.
+            // The mute fade owns silence from here and bypasses the gate, so its
+            // `suppressed` flag and pre-mute preroll would otherwise survive the
+            // mute and, on the next talkspurt, replay pre-mute audio as a
+            // back-dated resume. The full-suppression unmute path also resets the
+            // gate, but a mute/unmute shorter than the fade never reaches it.
+            if let Some(gate) = self.long_silence.as_mut() {
+                gate.reset();
+            }
+        }
         if !audio_pop_logging_enabled() {
             return;
         }
@@ -566,6 +581,7 @@ impl LiveEncoderPipeline {
         if muted && self.mute_gain <= 0.0 {
             // Fully faded out: stop encoding, emit only silence keepalives.
             self.mute_suppressed = true;
+            self.discard_pending_before_suppression();
             self.suppressed_frames = self.suppressed_frames.saturating_add(1);
             self.maybe_emit_silence_marker(LIVE_PACKET_FLAG_MUTE, on_packet);
             return Ok(());
@@ -573,13 +589,11 @@ impl LiveEncoderPipeline {
 
         if self.mute_suppressed {
             // Resuming after a suppressed pause: re-anchor the Opus stream so the
-            // first packet carries OPUS_RESET | SILENCE_RESUME, and drop the
-            // silence-gate state (its preroll holds stale pre-mute audio).
+            // first packet carries OPUS_RESET | SILENCE_RESUME. The silence gate
+            // was already reset when the mute began and stays bypassed until the
+            // fade fully reopens, so it needs no reset here.
             self.mute_suppressed = false;
             self.reset_opus_stream()?;
-            if let Some(gate) = self.long_silence.as_mut() {
-                gate.reset();
-            }
             if log_enabled {
                 kvlog::info!(
                     "audio pop capture mute resume",
@@ -715,6 +729,22 @@ impl LiveEncoderPipeline {
         }
 
         Ok(())
+    }
+
+    /// Drops any partial Opus frame left in `pending_opus_samples` at the start
+    /// of a suppressed span (long-silence gate suppression or a fully faded
+    /// mute).
+    ///
+    /// `next_capture_sample` advances for every 10 ms slot, including the
+    /// suppressed ones that append nothing, so a partial frame kept across the
+    /// gap would strand `pending_start_sample` behind the clock. The next queued
+    /// frame — a gate `Resume`, or a mute fade-out that bypasses the gate — then
+    /// fails the contiguity check in [`Self::queue_processed_capture_frame`].
+    /// That partial is pre-silence tail which both resume paths discard through
+    /// [`Self::reset_opus_stream`] anyway, so clearing it here transmits no less
+    /// audio and keeps every queued frame contiguous with the clock.
+    fn discard_pending_before_suppression(&mut self) {
+        self.pending_opus_samples.clear();
     }
 
     fn maybe_emit_silence_marker<F>(&mut self, extra_flags: u8, on_packet: &mut F)
@@ -1334,6 +1364,187 @@ mod tests {
         let (packets, resume_slot_starts, preroll_frames) = drive_silence_gate_cycles(preroll, 3);
 
         assert_resume_timestamps(&packets, &resume_slot_starts, preroll_frames);
+    }
+
+    #[test]
+    fn muting_during_gate_silence_suppression_stays_contiguous() {
+        // Reproduces the capture-pipeline panic seen when a user clicks mute
+        // while the long-silence gate is already suppressing: the gate leaves a
+        // partial Opus frame in `pending_opus_samples`, the media clock keeps
+        // advancing across the suppressed slots, and the mute fade-out bypasses
+        // the gate (so it never resumes/resets) and queues a frame that used to
+        // fail the contiguity assertion.
+        let mut tuning = test_tuning();
+        tuning.capture_silence_gate = true;
+        tuning.capture_long_silence_stop = Duration::from_millis(20);
+        tuning.capture_silence_preroll = Duration::from_millis(20);
+        tuning.capture_silence_ramp = Duration::ZERO;
+        tuning.silence_vad_max = u8::MAX;
+
+        let mut pipeline = build_live_encoder_pipeline(
+            tuning,
+            false,
+            DEFAULT_LIVE_MAX_AMPLIFICATION,
+            true,
+            EncoderNetworkProfile::EXCELLENT,
+            None,
+        )
+        .unwrap();
+        let stats = AudioStats::new();
+        let speech = high_energy_speech_chunk();
+        let silence = vec![0.0f32; FRAME_SAMPLES];
+        let mut packets = Vec::new();
+
+        let mut push = |pipeline: &mut LiveEncoderPipeline, frame: &[f32], muted: bool| {
+            pipeline
+                .push_chunk(
+                    frame,
+                    DEFAULT_LIVE_MAX_AMPLIFICATION,
+                    muted,
+                    &stats,
+                    &mut |packet| packets.push(packet),
+                )
+                .unwrap();
+        };
+
+        // Four speech frames make the transmitted-frame count going into
+        // suppression even, so a 480-sample partial is still pending when the
+        // gate suppresses — the stale buffer that used to desynchronise the mute
+        // fade-out from the clock.
+        for _ in 0..4 {
+            push(&mut pipeline, &speech, false);
+        }
+        // Feed silence until the gate suppresses, recording the pending fill the
+        // suppressing frame inherited. That partial is the historical hazard, so
+        // the test asserts it is genuinely non-empty and still reproduces the bug.
+        let mut suppress_pending = None;
+        for _ in 0..12 {
+            let was_suppressing = pipeline.suppressed_frames > 0;
+            let pending_before = pipeline.pending_opus_samples.len();
+            push(&mut pipeline, &silence, false);
+            if !was_suppressing && pipeline.suppressed_frames > 0 {
+                suppress_pending = Some(pending_before);
+            }
+        }
+        assert_eq!(
+            suppress_pending,
+            Some(FRAME_SAMPLES),
+            "scenario must leave a partial frame pending when suppression begins"
+        );
+
+        // The user clicks mute mid-suppression. The fade-out and full-mute
+        // frames must queue without panicking on a stale, non-contiguous pending
+        // buffer.
+        for _ in 0..40 {
+            push(&mut pipeline, &silence, true);
+        }
+
+        // Unmuting resumes cleanly, and every Opus packet keeps a unique
+        // timestamp anchored to the advancing media clock.
+        for _ in 0..6 {
+            push(&mut pipeline, &speech, false);
+        }
+
+        let timestamps = opus_packets(&packets)
+            .iter()
+            .map(|packet| packet.timestamp)
+            .collect::<Vec<_>>();
+        for (index, timestamp) in timestamps.iter().enumerate() {
+            assert!(
+                !timestamps[..index].contains(timestamp),
+                "duplicate Opus timestamp {timestamp} in {timestamps:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn brief_mute_toggle_during_gate_suppression_resets_the_gate() {
+        // A mute/unmute cycle shorter than the 60 ms fade never reaches full
+        // mute suppression, so `mute_suppressed` never latches and the unmute
+        // path that resets the long-silence gate is skipped. If the gate was
+        // suppressing silence when the user muted, its stale `suppressed` state
+        // and pre-mute preroll survive the toggle, and the first post-unmute
+        // talkspurt makes the gate emit a back-dated `Resume` (OPUS_RESET) that
+        // replays pre-mute audio. The mute transition must reset the gate.
+        let mut tuning = test_tuning();
+        tuning.capture_silence_gate = true;
+        tuning.capture_long_silence_stop = Duration::from_millis(20);
+        tuning.capture_silence_preroll = Duration::from_millis(30);
+        tuning.capture_silence_ramp = Duration::ZERO;
+        tuning.silence_vad_max = u8::MAX;
+
+        let mut pipeline = build_live_encoder_pipeline(
+            tuning,
+            false,
+            DEFAULT_LIVE_MAX_AMPLIFICATION,
+            true,
+            EncoderNetworkProfile::EXCELLENT,
+            None,
+        )
+        .unwrap();
+        let stats = AudioStats::new();
+        let speech = high_energy_speech_chunk();
+        let silence = vec![0.0f32; FRAME_SAMPLES];
+        let mut packets = Vec::new();
+
+        let push = |pipeline: &mut LiveEncoderPipeline,
+                    frame: &[f32],
+                    muted: bool,
+                    packets: &mut Vec<LocalVoiceFrame>| {
+            pipeline
+                .push_chunk(
+                    frame,
+                    DEFAULT_LIVE_MAX_AMPLIFICATION,
+                    muted,
+                    &stats,
+                    &mut |packet| packets.push(packet),
+                )
+                .unwrap();
+        };
+
+        // Talk, then go silent long enough for the gate to suppress and buffer
+        // pre-mute preroll frames.
+        for _ in 0..4 {
+            push(&mut pipeline, &speech, false, &mut packets);
+        }
+        for _ in 0..12 {
+            push(&mut pipeline, &silence, false, &mut packets);
+        }
+        assert!(
+            pipeline.suppressed_frames > 0,
+            "gate must be suppressing before the mute click"
+        );
+
+        let before_mute = packets.len();
+
+        // Briefly mute (three frames, well under the six-frame fade) then let
+        // the fade back in complete. The fade never reaches zero, so
+        // `mute_suppressed` stays false and the full-suppression unmute reset is
+        // never taken.
+        for _ in 0..3 {
+            push(&mut pipeline, &silence, true, &mut packets);
+        }
+        assert!(
+            !pipeline.mute_suppressed,
+            "fade must not complete, or the scenario reduces to the reset path"
+        );
+        while pipeline.mute_gain < 1.0 {
+            push(&mut pipeline, &silence, false, &mut packets);
+        }
+
+        // The first talkspurt after the fade fully reopens reaches the gate. A
+        // reset gate transmits it directly; a stale, still-suppressed gate
+        // resumes and replays a back-dated OPUS_RESET.
+        push(&mut pipeline, &speech, false, &mut packets);
+
+        let replayed_reset = packets[before_mute..].iter().any(|packet| {
+            matches!(packet.payload, VoicePayload::Opus(_))
+                && packet.flags & LIVE_PACKET_FLAG_OPUS_RESET != 0
+        });
+        assert!(
+            !replayed_reset,
+            "a brief mute toggle left the gate suppressed and replayed pre-mute audio"
+        );
     }
 
     #[test]
