@@ -98,7 +98,12 @@ impl HistoryReader {
 fn execute(request: &HistoryReadRequest) -> HistoryReadReply {
     let selected = select_records(request);
     let at_start = selected.first_message_id() == Some(request.oldest_durable_id);
-    let payloads = match selected.chunk_payloads(request.room_id, at_start, request.target_bytes) {
+    let payloads = match selected.chunk_payloads(
+        request.room_id,
+        request.before,
+        at_start,
+        request.target_bytes,
+    ) {
         Ok(payloads) => payloads,
         Err(error) => {
             kvlog::error!(
@@ -106,7 +111,7 @@ fn execute(request: &HistoryReadRequest) -> HistoryReadReply {
                 room_id = request.room_id.0,
                 error = error.as_str()
             );
-            vec![empty_chunk(request.room_id)]
+            vec![empty_chunk(request.room_id, request.before)]
         }
     };
     HistoryReadReply {
@@ -193,9 +198,9 @@ fn scan_records_before(bytes: &[u8], before: MessageId) -> Option<ResidentHistor
 /// A terminal empty chunk: `complete` so the client's fetch state cannot
 /// wedge, and not `at_start` because the start was not reached, the fetch
 /// merely failed.
-pub(crate) fn empty_chunk(room_id: RoomId) -> Vec<u8> {
+pub(crate) fn empty_chunk(room_id: RoomId, before: Option<MessageId>) -> Vec<u8> {
     let mut payload = Vec::with_capacity(history::CHUNK_HEADER_BYTES);
-    history::write_chunk_header(room_id, false, true, 0, &mut payload)
+    history::write_chunk_header(room_id, before, false, true, 0, &mut payload)
         .expect("empty history chunk header should encode");
     payload
 }
@@ -313,6 +318,12 @@ mod tests {
         let (ids, at_start) = page_of(&reply);
         assert_eq!(ids, vec![9, 10, 11, 12]);
         assert!(!at_start);
+        let chunk = history::decode_chunk(&reply.payloads[0]).unwrap().unwrap();
+        assert_eq!(
+            chunk.before,
+            Some(MessageId(13)),
+            "disk pages echo the request cursor"
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 

@@ -2290,13 +2290,14 @@ impl Server {
         let Some(session) = self.sessions.get(&session_id) else {
             return;
         };
+        let before = request.before;
         if session.pending_disk_history_fetches >= MAX_PENDING_DISK_HISTORY_FETCHES {
             kvlog::warn!(
                 "disk history fetch limit exceeded",
                 session_id = session_id.0,
                 room_id = room_id.0
             );
-            self.send_empty_history_chunk(token, room_id);
+            self.send_empty_history_chunk(token, room_id, before);
             return;
         }
         if !self.history_reader.enqueue(request) {
@@ -2305,7 +2306,7 @@ impl Server {
                 session_id = session_id.0,
                 room_id = room_id.0
             );
-            self.send_empty_history_chunk(token, room_id);
+            self.send_empty_history_chunk(token, room_id, before);
             return;
         }
         if let Some(session) = self.sessions.get_mut(&session_id) {
@@ -2321,8 +2322,13 @@ impl Server {
     /// Terminates a history fetch that cannot be served with an empty
     /// `complete` chunk; the client has no fetch timeout, so a request
     /// without a terminal chunk would wedge its paging for the room.
-    fn send_empty_history_chunk(&mut self, token: Token, room_id: RoomId) {
-        let payload = history_reader::empty_chunk(room_id);
+    fn send_empty_history_chunk(
+        &mut self,
+        token: Token,
+        room_id: RoomId,
+        before: Option<MessageId>,
+    ) {
+        let payload = history_reader::empty_chunk(room_id, before);
         let _ = self.queue_control_payload_to_token(token, "history_chunk", &payload);
     }
 
@@ -5123,6 +5129,7 @@ mod tests {
 
         let chunk = read_until_history_chunk(&mut peer);
         assert_eq!(chunk.room_id, RoomId(1));
+        assert_eq!(chunk.before, Some(MessageId(6)));
         assert!(chunk.complete);
         let ids: Vec<u64> = chunk
             .messages
@@ -5134,6 +5141,7 @@ mod tests {
 
         server.fetch_history(session, RoomId(1), Some(MessageId(2)), 4);
         let chunk = read_until_history_chunk(&mut peer);
+        assert_eq!(chunk.before, Some(MessageId(2)));
         assert!(chunk.complete);
         assert_eq!(chunk.messages.len(), 1);
         assert!(chunk.at_start);

@@ -256,6 +256,8 @@ pub enum NetworkEvent {
     /// One chunk of server-retained history for a room.
     HistoryChunk {
         room_id: RoomId,
+        /// Echo of the originating request's paging cursor.
+        before: Option<MessageId>,
         messages: Vec<ChatMessage>,
         at_start: bool,
         /// True on the final chunk for one fetch request.
@@ -772,7 +774,6 @@ fn run_worker_inner(
         user_id: None,
         active_room: None,
         voice_room: None,
-        requested_voice_room: None,
         active_stream: None,
         local_sequence: 0,
         voice_timestamp: VoiceTimestampRebaser::default(),
@@ -791,7 +792,6 @@ fn run_worker_inner(
         mdns_pending: HashMap::new(),
         p2p_peers: HashMap::new(),
         p2p_stream_owners: HashMap::new(),
-        online_others: HashSet::new(),
         voice_others: HashSet::new(),
         room_server_rtts: HashMap::new(),
         next_relay_keepalive: Instant::now() + RELAY_KEEPALIVE_INTERVAL,
@@ -1313,7 +1313,6 @@ struct WorkerState {
     /// The room whose voice call this client is in, target for screen shares
     /// and P2P publication.
     voice_room: Option<RoomId>,
-    requested_voice_room: Option<RoomId>,
     active_stream: Option<StreamId>,
     local_sequence: u32,
     voice_timestamp: VoiceTimestampRebaser,
@@ -1332,7 +1331,6 @@ struct WorkerState {
     mdns_pending: HashMap<String, MdnsPending>,
     p2p_peers: HashMap<SessionId, PeerConnection>,
     p2p_stream_owners: HashMap<StreamId, SessionId>,
-    online_others: HashSet<UserId>,
     voice_others: HashSet<UserId>,
     room_server_rtts: HashMap<UserId, u16>,
     next_relay_keepalive: Instant,
@@ -1581,10 +1579,10 @@ fn direct_path_healthy(
 fn relay_suppressed(
     now: Instant,
     confirm_window: Duration,
-    online_others: &HashSet<UserId>,
+    voice_others: &HashSet<UserId>,
     peers: impl Iterator<Item = (UserId, Option<Instant>)>,
 ) -> bool {
-    if online_others.is_empty() {
+    if voice_others.is_empty() {
         return false;
     }
     let mut covered = HashSet::new();
@@ -1595,9 +1593,7 @@ fn relay_suppressed(
             }
         }
     }
-    online_others
-        .iter()
-        .all(|user_id| covered.contains(user_id))
+    voice_others.iter().all(|user_id| covered.contains(user_id))
 }
 
 fn voice_sequence_distance_forward(from: u32, to: u32) -> Option<u32> {
@@ -2508,11 +2504,9 @@ impl WorkerState {
                 self.active_room = Some(room_id);
             }
             NetworkCommand::JoinVoice(room_id) => {
-                self.requested_voice_room = Some(room_id);
                 self.queue_control(ClientControl::JoinVoice { room_id })?;
             }
             NetworkCommand::LeaveVoice => {
-                self.requested_voice_room = None;
                 self.queue_control(ClientControl::LeaveVoice)?;
             }
             NetworkCommand::FetchHistory {
@@ -3445,6 +3439,7 @@ impl WorkerState {
         );
         let _ = self.events.send(NetworkEvent::HistoryChunk {
             room_id: chunk.room_id,
+            before: chunk.before,
             messages: chunk.messages,
             at_start: chunk.at_start,
             complete: chunk.complete,
@@ -3469,11 +3464,6 @@ impl WorkerState {
                 self.session_id = Some(session_id);
                 self.user_id = Some(user_id);
                 self.active_room = Some(default_room);
-                self.online_others = users
-                    .iter()
-                    .filter(|user| user.online && Some(user.user_id) != Some(user_id))
-                    .map(|user| user.user_id)
-                    .collect();
                 self.room_server_rtts.clear();
                 kvlog::info!(
                     "client authenticated",
@@ -3518,7 +3508,6 @@ impl WorkerState {
                 if Some(session_id) == self.session_id {
                     self.reset_voice_peer_state();
                     self.voice_room = Some(room_id);
-                    self.requested_voice_room = None;
                     self.active_stream = Some(stream_id);
                     self.voice_others.clear();
                     self.local_sequence = 0;
@@ -3793,13 +3782,8 @@ impl WorkerState {
                     display_name = user.display_name.as_str(),
                     online
                 );
-                if Some(user.user_id) != self.user_id {
-                    if online {
-                        self.online_others.insert(user.user_id);
-                    } else {
-                        self.online_others.remove(&user.user_id);
-                        self.room_server_rtts.remove(&user.user_id);
-                    }
+                if !online {
+                    self.room_server_rtts.remove(&user.user_id);
                 }
                 let _ = self.events.send(NetworkEvent::Presence { user, online });
             }
@@ -4093,7 +4077,12 @@ impl WorkerState {
 
     fn install_p2p_peer(&mut self, peer: P2pPeerInfo) -> Result<(), String> {
         if self.voice_room != Some(peer.room_id) {
-            return Err("P2P peer belongs to a different voice room".to_string());
+            kvlog::info!(
+                "p2p peer ignored for inactive voice room",
+                peer_room_id = peer.room_id.0,
+                voice_room_id = self.voice_room.map(|room| room.0).unwrap_or(0)
+            );
+            return Ok(());
         }
         let send_key = key_from_control(&peer.send_key)?;
         let recv_key = key_from_control(&peer.recv_key)?;

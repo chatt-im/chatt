@@ -154,8 +154,10 @@ pub(crate) fn save(history_id: &str, catalog: &RoomCatalog) {
     }
     let tmp = path.with_extension("toml.tmp");
     let result = fs::File::create(&tmp)
-        .and_then(|mut file| file.write_all(out.as_bytes()).map(|()| file))
-        .and_then(|file| file.sync_all())
+        .and_then(|mut file| {
+            file.write_all(out.as_bytes())?;
+            file.flush()
+        })
         .and_then(|()| fs::rename(&tmp, &path));
     if let Err(error) = result {
         let _ = fs::remove_file(&tmp);

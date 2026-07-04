@@ -5,10 +5,11 @@ use crate::{
 
 const RECORD_VERSION: u8 = 1;
 const RECORD_BASE_BYTES: usize = 1 + 8 + 4 + 8 + 8 + 1 + 8 + 4 + 4;
-pub const CHUNK_HEADER_BYTES: usize = 4 + 4 + 1 + 2;
+pub const CHUNK_HEADER_BYTES: usize = 4 + 4 + 1 + 2 + 8;
 const CHUNK_MAGIC: &[u8; 4] = b"CHH1";
 const CHUNK_FLAG_AT_START: u8 = 0x01;
 const CHUNK_FLAG_COMPLETE: u8 = 0x02;
+const CHUNK_FLAG_HAS_BEFORE: u8 = 0x04;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct HistoryMessageRef<'a> {
@@ -39,6 +40,9 @@ impl HistoryMessageRef<'_> {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HistoryChunk {
     pub room_id: RoomId,
+    /// Echo of the fetch request's exclusive paging cursor, so the client can
+    /// match a chunk to the request that produced it.
+    pub before: Option<MessageId>,
     pub messages: Vec<ChatMessage>,
     pub at_start: bool,
     pub complete: bool,
@@ -47,6 +51,8 @@ pub struct HistoryChunk {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HistoryChunkRef<'a> {
     pub room_id: RoomId,
+    /// Echo of the fetch request's exclusive paging cursor.
+    pub before: Option<MessageId>,
     pub messages: Vec<HistoryMessageRef<'a>>,
     pub at_start: bool,
     pub complete: bool,
@@ -99,6 +105,7 @@ pub fn message_id(bytes: &[u8]) -> Result<MessageId, String> {
 
 pub fn write_chunk_header(
     room_id: RoomId,
+    before: Option<MessageId>,
     at_start: bool,
     complete: bool,
     message_count: usize,
@@ -115,8 +122,12 @@ pub fn write_chunk_header(
     if complete {
         flags |= CHUNK_FLAG_COMPLETE;
     }
+    if before.is_some() {
+        flags |= CHUNK_FLAG_HAS_BEFORE;
+    }
     out.push(flags);
     out.extend_from_slice(&count.to_le_bytes());
+    out.extend_from_slice(&before.unwrap_or(MessageId(0)).0.to_le_bytes());
     Ok(())
 }
 
@@ -126,6 +137,7 @@ pub fn decode_chunk(bytes: &[u8]) -> Result<Option<HistoryChunk>, String> {
     };
     Ok(Some(HistoryChunk {
         room_id: chunk.room_id,
+        before: chunk.before,
         messages: chunk
             .messages
             .into_iter()
@@ -147,10 +159,12 @@ pub fn decode_chunk_ref(bytes: &[u8]) -> Result<Option<HistoryChunkRef<'_>>, Str
     }
     let room_id = RoomId(cursor.read_u32()?);
     let flags = cursor.read_u8()?;
-    if flags & !(CHUNK_FLAG_AT_START | CHUNK_FLAG_COMPLETE) != 0 {
+    if flags & !(CHUNK_FLAG_AT_START | CHUNK_FLAG_COMPLETE | CHUNK_FLAG_HAS_BEFORE) != 0 {
         return Err("history chunk flags are invalid".to_string());
     }
     let count = cursor.read_u16()? as usize;
+    let before = cursor.read_u64()?;
+    let before = (flags & CHUNK_FLAG_HAS_BEFORE != 0).then_some(MessageId(before));
     let mut messages = Vec::with_capacity(count);
     for _ in 0..count {
         messages.push(read_message(&mut cursor)?);
@@ -158,6 +172,7 @@ pub fn decode_chunk_ref(bytes: &[u8]) -> Result<Option<HistoryChunkRef<'_>>, Str
     cursor.finish()?;
     Ok(Some(HistoryChunkRef {
         room_id,
+        before,
         messages,
         at_start: flags & CHUNK_FLAG_AT_START != 0,
         complete: flags & CHUNK_FLAG_COMPLETE != 0,
@@ -323,12 +338,13 @@ mod tests {
         let second = encode_message(&second_message);
 
         let mut chunk = Vec::new();
-        write_chunk_header(RoomId(7), true, true, 2, &mut chunk).unwrap();
+        write_chunk_header(RoomId(7), Some(MessageId(44)), true, true, 2, &mut chunk).unwrap();
         chunk.extend_from_slice(&first);
         chunk.extend_from_slice(&second);
 
         let decoded = decode_chunk(&chunk).unwrap().unwrap();
         assert_eq!(decoded.room_id, RoomId(7));
+        assert_eq!(decoded.before, Some(MessageId(44)));
         assert!(decoded.at_start);
         assert!(decoded.complete);
         assert_eq!(decoded.messages.len(), 2);
