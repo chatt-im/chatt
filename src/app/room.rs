@@ -12,7 +12,7 @@ use rpc::{
 use chatt::audio::{LivePlaybackFeedback, PlaybackStreamControl};
 
 use crate::{
-    chat_buffer::VirtualChatBuffer,
+    chat_buffer::{NoticeId, VirtualChatBuffer},
     client_net::TransferDirection,
     config::Config,
     room_catalog::{CatalogRoom, CatalogRoomKind, RoomCatalog},
@@ -45,7 +45,37 @@ pub(crate) struct RoomMeta {
     /// Oldest message in the most recent server history page.
     history_before: Option<MessageId>,
     history_at_start: bool,
-    history_in_flight: bool,
+    history_fetch: HistoryFetchState,
+    gap: Option<GapBounds>,
+}
+
+type MessageKey = (u64, u64);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct GapBounds {
+    /// Newest locally resident message before the disconnected run.
+    lower: MessageKey,
+    /// Oldest message in the newer server page that exposed the gap.
+    upper: MessageKey,
+    marker: Option<NoticeId>,
+}
+
+/// The room's outstanding server history request. The requested cursor is
+/// kept so a reply can be matched against it: a chunk whose echoed cursor
+/// differs answers an older request (superseded by an upsert reset) and must
+/// not move the paging cursor.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HistoryFetchState {
+    Idle,
+    InFlight {
+        before: Option<MessageId>,
+        resident_newest_before: Option<MessageKey>,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct HistoryFetchCompletion {
+    resident_newest_before: Option<MessageKey>,
 }
 
 /// One row of the room switcher and rooms strip, in catalog order (public and
@@ -140,6 +170,7 @@ impl ClientRoom {
             store.append_message(message);
         }
         self.messages.trim_front(max_messages);
+        self.trim_orphaned_attachments();
         self.chat.push_chat(message.clone(), local);
         if let Some(transfer_id) = message.file_transfer_id {
             let key = FileHistoryKey {
@@ -210,7 +241,24 @@ impl ClientRoom {
             }
         }
         self.messages.trim_front(max_messages);
+        self.trim_orphaned_attachments();
         true
+    }
+
+    fn trim_orphaned_attachments(&mut self) {
+        let Some(oldest) = self.messages.first() else {
+            self.files.clear();
+            self.web_attachments.clear();
+            self.web_file_attachments.clear();
+            return;
+        };
+        let oldest_key = MessageLog::key(oldest);
+        let oldest_timestamp = oldest.timestamp_ms;
+        self.web_attachments.retain(|key, _| *key >= oldest_key);
+        self.files
+            .retain(|key, _| key.timestamp_ms >= oldest_timestamp);
+        self.web_file_attachments
+            .retain(|key, _| key.timestamp_ms >= oldest_timestamp);
     }
 }
 
@@ -237,7 +285,7 @@ pub(crate) struct RoomSession {
     pending_clipboard: Option<String>,
     pending_url_open: Option<String>,
     muted_users: HashSet<UserId>,
-    stream_users: HashMap<u32, UserId>,
+    stream_users: HashMap<StreamId, UserId>,
     volume_preview: Option<(UserId, f32)>,
     /// Catalog facts for every known room, viewed or not.
     metas: BTreeMap<RoomId, RoomMeta>,
@@ -332,6 +380,10 @@ impl MessageLog {
         self.messages.first()
     }
 
+    fn last(&self) -> Option<&ChatMessage> {
+        self.messages.last()
+    }
+
     /// Splices a sorted batch strictly older than the resident front.
     fn prepend(&mut self, messages: Vec<ChatMessage>) {
         debug_assert!(messages.is_sorted_by_key(Self::key));
@@ -395,12 +447,20 @@ pub(crate) struct RoomChatUpdate {
     /// dropped by dedup. Notifications and feed pushes key off this.
     pub(crate) fresh: bool,
     pub(crate) should_scroll_bottom: bool,
+    pub(crate) read_advanced: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ParticipantNotice {
     pub(crate) display_name: String,
     pub(crate) local: bool,
+    pub(crate) relevant: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct HistoryChunkUpdate {
+    pub(crate) changed: bool,
+    pub(crate) next_backfill: Option<(RoomId, Option<MessageId>, u16)>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -720,6 +780,7 @@ impl RoomSession {
         }
         for meta in self.metas.values_mut() {
             meta.voice_users.clear();
+            meta.history_fetch = HistoryFetchState::Idle;
         }
         self.rebuild_roster();
     }
@@ -759,6 +820,7 @@ impl RoomSession {
     /// buffer is materialized lazily when viewed or when background activity
     /// needs somewhere to land.
     pub(crate) fn upsert_room(&mut self, info: &RoomInfo, _local_user: Option<UserId>) {
+        self.clear_gap_marker(info.room_id);
         let kind = ClientRoomKind::from_wire(&info.kind);
         let name = self.display_room_name(&info.name, &kind);
         match self.metas.get_mut(&info.room_id) {
@@ -769,7 +831,8 @@ impl RoomSession {
                 meta.head = info.head;
                 meta.history_before = None;
                 meta.history_at_start = false;
-                meta.history_in_flight = false;
+                meta.history_fetch = HistoryFetchState::Idle;
+                meta.gap = None;
             }
             None => {
                 self.metas.insert(
@@ -783,7 +846,8 @@ impl RoomSession {
                         unread: 0,
                         history_before: None,
                         history_at_start: false,
-                        history_in_flight: false,
+                        history_fetch: HistoryFetchState::Idle,
+                        gap: None,
                     },
                 );
             }
@@ -803,6 +867,7 @@ impl RoomSession {
         room.messages = MessageLog::from_sorted(opened.loaded.messages);
         room.messages.trim_front(self.max_messages);
         room.files = opened.loaded.files;
+        room.trim_orphaned_attachments();
         room.history = opened.store;
         room.chat.set_room_id(room_id);
         for message in room.messages.as_slice() {
@@ -844,6 +909,29 @@ impl RoomSession {
             return self.archived_rooms.get_mut(&room_id);
         }
         self.parked.get_mut(&room_id)
+    }
+
+    fn room_ref(&self, room_id: RoomId) -> Option<&ClientRoom> {
+        if self.viewed_room == Some(room_id) {
+            return Some(&self.active);
+        }
+        if self.archived_rooms.contains_key(&room_id) {
+            return self.archived_rooms.get(&room_id);
+        }
+        self.parked.get(&room_id)
+    }
+
+    fn clear_gap_marker(&mut self, room_id: RoomId) {
+        let marker = self
+            .metas
+            .get_mut(&room_id)
+            .and_then(|meta| meta.gap.take())
+            .and_then(|gap| gap.marker);
+        if let Some(marker) = marker
+            && let Some(room) = self.room_mut(room_id)
+        {
+            room.chat.remove_notice(marker);
+        }
     }
 
     /// Like [`room_mut`](Self::room_mut), but materializes a known but
@@ -980,19 +1068,22 @@ impl RoomSession {
 
     /// Marks the viewed room read up to its newest buffered message and clears
     /// its unread count.
-    pub(crate) fn mark_viewed_read(&mut self) {
+    pub(crate) fn mark_viewed_read(&mut self) -> bool {
         let Some(room_id) = self.viewed_room else {
-            return;
+            return false;
         };
         let newest = (0..self.active.chat.len())
             .rev()
-            .map(|index| self.active.chat.message(index).id)
-            .find(|id| *id != 0)
-            .map(MessageId);
+            .map(|index| self.active.chat.message(index))
+            .find(|entry| entry.timestamp_ms != 0)
+            .map(|entry| MessageId(entry.id));
         if let Some(meta) = self.metas.get_mut(&room_id) {
+            let previous = meta.last_read;
             meta.unread = 0;
             meta.last_read = newest.max(meta.last_read);
+            return meta.last_read != previous;
         }
+        false
     }
 
     /// Loads the room catalog persisted for this server and shows the last
@@ -1041,7 +1132,8 @@ impl RoomSession {
                     unread: 0,
                     history_before: None,
                     history_at_start: false,
-                    history_in_flight: false,
+                    history_fetch: HistoryFetchState::Idle,
+                    gap: None,
                 },
             );
         }
@@ -1090,41 +1182,70 @@ impl RoomSession {
         }
     }
 
-    /// Merges a server history page into the room, deduped against what the
-    /// room already holds, appending unseen messages to the local capture and
-    /// rebuilding the buffer in `(timestamp_ms, message_id)` order.
-    pub(crate) fn begin_history_fetch(
-        &mut self,
-        room_id: RoomId,
-        before: Option<MessageId>,
-    ) -> bool {
+    /// Marks the room's initial backfill request as outstanding. Refuses when
+    /// a fetch is already in flight or the newest page was already fetched.
+    pub(crate) fn begin_history_fetch(&mut self, room_id: RoomId) -> bool {
+        let resident_newest_before = self
+            .room_ref(room_id)
+            .and_then(|room| room.messages.last())
+            .map(MessageLog::key);
         let Some(meta) = self.metas.get_mut(&room_id) else {
             return false;
         };
-        if meta.history_in_flight {
+        if meta.history_fetch != HistoryFetchState::Idle {
             return false;
         }
-        if before.is_none() && (meta.history_before.is_some() || meta.history_at_start) {
+        if meta.history_before.is_some() || meta.history_at_start {
             return false;
         }
-        meta.history_in_flight = true;
+        meta.history_fetch = HistoryFetchState::InFlight {
+            before: None,
+            resident_newest_before,
+        };
         true
     }
 
-    pub(crate) fn complete_history_fetch(
-        &mut self,
-        room_id: RoomId,
-        messages: &[ChatMessage],
-        at_start: bool,
-    ) {
+    pub(crate) fn abort_history_fetch(&mut self, room_id: RoomId, before: Option<MessageId>) {
         let Some(meta) = self.metas.get_mut(&room_id) else {
             return;
         };
-        meta.history_in_flight = false;
+        if matches!(meta.history_fetch, HistoryFetchState::InFlight { before: fetch_before, .. } if fetch_before == before)
+        {
+            meta.history_fetch = HistoryFetchState::Idle;
+        }
+    }
+
+    /// Applies a complete history reply's paging cursor. A reply whose echoed
+    /// cursor does not match the outstanding request answers a superseded
+    /// fetch and leaves the cursor alone.
+    pub(crate) fn complete_history_fetch(
+        &mut self,
+        room_id: RoomId,
+        before: Option<MessageId>,
+        messages: &[ChatMessage],
+        at_start: bool,
+    ) -> Option<HistoryFetchCompletion> {
+        let Some(meta) = self.metas.get_mut(&room_id) else {
+            return None;
+        };
+        let HistoryFetchState::InFlight {
+            before: fetch_before,
+            resident_newest_before,
+        } = meta.history_fetch
+        else {
+            return None;
+        };
+        if fetch_before != before {
+            return None;
+        }
+        meta.history_fetch = HistoryFetchState::Idle;
         if let Some(first) = messages.first() {
             meta.history_before = Some(first.message_id);
         }
         meta.history_at_start = at_start || messages.is_empty();
+        Some(HistoryFetchCompletion {
+            resident_newest_before,
+        })
     }
 
     /// Starts one older-page request for the viewed room, coalescing repeated
@@ -1133,7 +1254,7 @@ impl RoomSession {
         let room_id = self.viewed_room?;
         let meta = self.metas.get_mut(&room_id)?;
         if meta.history_at_start
-            || meta.history_in_flight
+            || meta.history_fetch != HistoryFetchState::Idle
             || self.active.messages.len() >= self.max_messages
         {
             return None;
@@ -1143,8 +1264,116 @@ impl RoomSession {
         let limit = remaining
             .min(usize::from(rpc::control::MAX_HISTORY_FETCH_MESSAGES))
             .max(1) as u16;
-        meta.history_in_flight = true;
+        meta.history_fetch = HistoryFetchState::InFlight {
+            before: Some(before),
+            resident_newest_before: None,
+        };
         Some((room_id, Some(before), limit))
+    }
+
+    pub(crate) fn gap_backfill_request_for_viewed_room(
+        &mut self,
+    ) -> Option<(RoomId, Option<MessageId>, u16)> {
+        let room_id = self.viewed_room?;
+        let meta = self.metas.get_mut(&room_id)?;
+        if meta.gap.is_none()
+            || meta.history_at_start
+            || meta.history_fetch != HistoryFetchState::Idle
+            || self.active.messages.len() >= self.max_messages
+        {
+            return None;
+        }
+        let before = meta.history_before?;
+        let remaining = self.max_messages.saturating_sub(self.active.messages.len());
+        let limit = remaining
+            .min(usize::from(rpc::control::MAX_HISTORY_FETCH_MESSAGES))
+            .max(1) as u16;
+        meta.history_fetch = HistoryFetchState::InFlight {
+            before: Some(before),
+            resident_newest_before: None,
+        };
+        Some((room_id, Some(before), limit))
+    }
+
+    fn detect_initial_history_gap(
+        &mut self,
+        room_id: RoomId,
+        before: Option<MessageId>,
+        resident_newest_before: Option<MessageKey>,
+        page_oldest: Option<MessageKey>,
+        at_start: bool,
+    ) {
+        if before.is_some() || at_start {
+            return;
+        }
+        let Some(upper) = page_oldest else {
+            return;
+        };
+        let Some(lower) = resident_newest_before else {
+            return;
+        };
+        if upper <= lower {
+            return;
+        }
+        let marker = self
+            .room_mut(room_id)
+            .map(|room| room.chat.push_notice("history", "older messages missing"));
+        if let Some(meta) = self.metas.get_mut(&room_id) {
+            meta.gap = Some(GapBounds {
+                lower,
+                upper,
+                marker,
+            });
+        }
+    }
+
+    fn clear_history_gap_if_bridged(&mut self, room_id: RoomId, page_oldest: Option<MessageKey>) {
+        let Some(page_oldest) = page_oldest else {
+            return;
+        };
+        let bridged = self
+            .metas
+            .get(&room_id)
+            .and_then(|meta| meta.gap.as_ref())
+            .is_some_and(|gap| page_oldest <= gap.lower);
+        if bridged {
+            self.clear_gap_marker(room_id);
+        }
+    }
+
+    pub(crate) fn history_chunk_received(
+        &mut self,
+        room_id: RoomId,
+        before: Option<MessageId>,
+        messages: Vec<ChatMessage>,
+        at_start: bool,
+        complete: bool,
+        local_user: Option<UserId>,
+    ) -> HistoryChunkUpdate {
+        let page_oldest = messages.iter().map(MessageLog::key).min();
+        let completion = complete
+            .then(|| self.complete_history_fetch(room_id, before, &messages, at_start))
+            .flatten();
+        if let Some(completion) = completion {
+            self.detect_initial_history_gap(
+                room_id,
+                before,
+                completion.resident_newest_before,
+                page_oldest,
+                at_start,
+            );
+        }
+        let changed = self.merge_history(room_id, messages, local_user);
+        self.clear_history_gap_if_bridged(room_id, page_oldest);
+        let next_backfill = if completion.is_some() {
+            self.gap_backfill_request_for_viewed_room()
+        } else {
+            None
+        };
+        HistoryChunkUpdate {
+            changed,
+            next_backfill,
+        }
     }
 
     /// Merges a server history page into whichever room holds `room_id`,
@@ -1277,14 +1506,6 @@ impl RoomSession {
             .away_since = None;
     }
 
-    fn mark_participant_online_in_seen_rooms(&mut self, user_id: UserId) {
-        for room in self.participant_presence.values_mut() {
-            if let Some(presence) = room.get_mut(&user_id) {
-                presence.away_since = None;
-            }
-        }
-    }
-
     fn mark_participant_away_in_seen_rooms(&mut self, user_id: UserId, away_since: Instant) {
         for room in self.participant_presence.values_mut() {
             if let Some(presence) = room.get_mut(&user_id) {
@@ -1397,11 +1618,12 @@ impl RoomSession {
         if fresh && (!viewed || should_scroll_bottom) {
             room.chat.bottom();
         }
+        let mut read_advanced = false;
         if fresh {
             self.mark_participant_online_in_room(room_id, sender);
             if viewed {
                 self.participants.note_message(&message);
-                self.mark_viewed_read();
+                read_advanced = self.mark_viewed_read();
             } else if !local && let Some(meta) = self.metas.get_mut(&room_id) {
                 meta.unread = meta.unread.saturating_add(1);
             }
@@ -1410,6 +1632,7 @@ impl RoomSession {
             local,
             fresh,
             should_scroll_bottom,
+            read_advanced,
         })
     }
 
@@ -1450,8 +1673,7 @@ impl RoomSession {
         total: u64,
         direction: TransferDirection,
     ) {
-        let local_user = self.local_user;
-        let Some(room) = self.room_mut_materializing(room_id, local_user) else {
+        let Some(room) = self.room_mut(room_id) else {
             return;
         };
         update_transfer_progress(
@@ -1496,12 +1718,46 @@ impl RoomSession {
         let display_name = user.display_name.clone();
         let local = Some(user.user_id) == local_user;
         let user_id = user.user_id;
+        let relevant_rooms = self
+            .metas
+            .iter()
+            .filter_map(|(room_id, meta)| {
+                Self::user_belongs_to_room_kind(user_id, &meta.kind).then_some(*room_id)
+            })
+            .collect::<Vec<_>>();
+        let relevant = !relevant_rooms.is_empty();
         if online {
-            self.mark_participant_online_in_seen_rooms(user_id);
+            for room_id in &relevant_rooms {
+                self.mark_participant_online_in_room(*room_id, user_id);
+            }
         } else {
             self.mark_participant_away_in_seen_rooms(user_id, Instant::now());
         }
         self.users.insert(user_id, user.clone());
+        let dm_name_updates = self
+            .metas
+            .iter()
+            .filter_map(|(room_id, meta)| {
+                let ClientRoomKind::Dm { user_a, user_b } = &meta.kind else {
+                    return None;
+                };
+                let (user_a, user_b) = (*user_a, *user_b);
+                if user_id != user_a && user_id != user_b {
+                    return None;
+                }
+                let peer = self.dm_peer(user_a, user_b);
+                let name = self.display_name_of(peer);
+                (!name.is_empty()).then_some((*room_id, format!("@{name}")))
+            })
+            .collect::<Vec<_>>();
+        for (room_id, name) in dm_name_updates {
+            if let Some(meta) = self.metas.get_mut(&room_id) {
+                meta.name = name.clone();
+            }
+            if self.viewed_room == Some(room_id) {
+                self.room_name = name;
+            }
+        }
         if let Some(room_id) = self.viewed_room
             && self
                 .metas
@@ -1526,6 +1782,7 @@ impl RoomSession {
         ParticipantNotice {
             display_name,
             local,
+            relevant,
         }
     }
 
@@ -1546,7 +1803,7 @@ impl RoomSession {
         }
         self.mark_participant_online_in_room(room_id, user_id);
         if voice_room == Some(room_id) {
-            self.stream_users.insert(stream_id.0, user_id);
+            self.stream_users.insert(stream_id, user_id);
         }
         if self.viewed_room == Some(room_id) {
             if let Some(mut user) = self.users.get(&user_id).cloned() {
@@ -1579,7 +1836,7 @@ impl RoomSession {
         if self.viewed_room == Some(room_id) {
             self.participants.voice_stopped(user_id, stream_id);
         }
-        self.stream_users.remove(&stream_id.0);
+        self.stream_users.remove(&stream_id);
         VoiceNotice {
             display_name: self.display_name_of(user_id),
             local: Some(session_id) == local_session,
@@ -1721,6 +1978,7 @@ impl RoomSession {
         for room in rooms {
             room.chat.set_max_messages(max_messages as usize);
             room.messages.trim_front(max_messages as usize);
+            room.trim_orphaned_attachments();
         }
     }
 
@@ -1906,7 +2164,7 @@ impl RoomSession {
         self.stream_users
             .iter()
             .filter_map(move |(stream_id, stream_user)| {
-                (*stream_user == user_id).then_some(*stream_id)
+                (*stream_user == user_id).then_some(stream_id.0)
             })
     }
 
@@ -1949,6 +2207,26 @@ mod tests {
             room_id: RoomId(id),
             name: format!("room-{id}"),
             kind: RoomKind::Public,
+            head: None,
+            voice_users: Vec::new(),
+        }
+    }
+
+    fn private_room_info(id: u32, members: Vec<UserId>) -> RoomInfo {
+        RoomInfo {
+            room_id: RoomId(id),
+            name: format!("room-{id}"),
+            kind: RoomKind::Private { members },
+            head: None,
+            voice_users: Vec::new(),
+        }
+    }
+
+    fn dm_room_info(id: u32, user_a: UserId, user_b: UserId) -> RoomInfo {
+        RoomInfo {
+            room_id: RoomId(id),
+            name: format!("dm:{}:{}", user_a.0, user_b.0),
+            kind: RoomKind::Dm { user_a, user_b },
             head: None,
             voice_users: Vec::new(),
         }
@@ -2076,7 +2354,7 @@ mod tests {
     }
 
     #[test]
-    fn background_transfer_progress_stays_with_its_room() {
+    fn transfer_progress_skips_unmaterialized_rooms() {
         let mut room = test_room();
         enter(&mut room, Vec::new(), Vec::new(), Some(UserId(1)));
         let id = FileTransferId(12);
@@ -2084,8 +2362,9 @@ mod tests {
         room.transfer_progress(RoomId(2), id, 25, 100, TransferDirection::Incoming);
 
         assert!(room.transfer(id).is_none());
+        assert_eq!(room.parked.len(), 0);
         assert!(room.set_viewed_room(RoomId(2), Some(UserId(1))));
-        assert_eq!(room.transfer(id).unwrap().transferred, 25);
+        assert!(room.transfer(id).is_none());
     }
 
     #[test]
@@ -2309,6 +2588,49 @@ mod tests {
     }
 
     #[test]
+    fn presence_online_user_appears_in_rosters_of_rooms_they_belong_to() {
+        let mut room = test_room();
+        room.authenticated(
+            &[
+                room_info(1),
+                private_room_info(2, vec![UserId(1), UserId(2)]),
+            ],
+            vec![user(UserId(1), "alice")],
+            RoomId(1),
+            None,
+            Some(UserId(1)),
+        );
+
+        let notice = room.presence_changed(user(UserId(2), "bob"), true, Some(UserId(1)));
+
+        assert!(notice.relevant);
+        assert_eq!(room.participants.entries.len(), 1);
+        assert_eq!(room.participants.entries[0].display_name(), "bob");
+        assert!(room.set_viewed_room(RoomId(2), Some(UserId(1))));
+        assert_eq!(room.participants.entries.len(), 1);
+        assert_eq!(room.participants.entries[0].display_name(), "bob");
+    }
+
+    #[test]
+    fn dm_label_refreshes_when_presence_reveals_peer_name() {
+        let mut room = test_room();
+        let dm = dm_room_info(0x8000_0001, UserId(1), UserId(2));
+        room.authenticated(
+            &[dm],
+            vec![user(UserId(1), "alice")],
+            RoomId(0x8000_0001),
+            None,
+            Some(UserId(1)),
+        );
+        assert_eq!(room.room_name, "dm:1:2");
+
+        room.presence_changed(user(UserId(2), "bob"), true, Some(UserId(1)));
+
+        assert_eq!(room.room_name, "@bob");
+        assert_eq!(room.room_meta(RoomId(0x8000_0001)).unwrap().name, "@bob");
+    }
+
+    #[test]
     fn away_rows_require_an_observed_transition_in_that_room() {
         let mut room = test_room();
         enter(
@@ -2393,11 +2715,11 @@ mod tests {
             Vec::new(),
             Some(UserId(1)),
         );
-        assert!(room.begin_history_fetch(RoomId(1), None));
+        assert!(room.begin_history_fetch(RoomId(1)));
         let newest = (6..=9)
             .map(|id| message(id, UserId(2), "newest"))
             .collect::<Vec<_>>();
-        room.complete_history_fetch(RoomId(1), &newest, false);
+        room.complete_history_fetch(RoomId(1), None, &newest, false);
         room.merge_history(RoomId(1), newest, Some(UserId(1)));
 
         assert_eq!(
@@ -2413,9 +2735,209 @@ mod tests {
         let oldest = (1..=5)
             .map(|id| message(id, UserId(2), "oldest"))
             .collect::<Vec<_>>();
-        room.complete_history_fetch(RoomId(1), &oldest, true);
+        room.complete_history_fetch(RoomId(1), Some(MessageId(6)), &oldest, true);
         room.merge_history(RoomId(1), oldest, Some(UserId(1)));
         assert_eq!(room.older_history_request(), None);
+    }
+
+    #[test]
+    fn stale_history_reply_does_not_move_the_paging_cursor() {
+        let mut room = test_room();
+        enter(
+            &mut room,
+            vec![user(UserId(1), "alice")],
+            Vec::new(),
+            Some(UserId(1)),
+        );
+        assert!(room.begin_history_fetch(RoomId(1)));
+        let stale = (1..=3)
+            .map(|id| message(id, UserId(2), "stale"))
+            .collect::<Vec<_>>();
+        room.complete_history_fetch(RoomId(1), Some(MessageId(4)), &stale, true);
+
+        assert_eq!(room.older_history_request(), None, "fetch still in flight");
+        let newest = (6..=9)
+            .map(|id| message(id, UserId(2), "newest"))
+            .collect::<Vec<_>>();
+        room.complete_history_fetch(RoomId(1), None, &newest, false);
+        assert_eq!(
+            room.older_history_request(),
+            Some((
+                RoomId(1),
+                Some(MessageId(6)),
+                rpc::control::MAX_HISTORY_FETCH_MESSAGES
+            )),
+            "the matching reply sets the cursor from its own page"
+        );
+    }
+
+    #[test]
+    fn history_gap_detection_marks_non_overlapping_initial_page() {
+        let mut room = test_room();
+        let resident = (1..=5)
+            .map(|id| message(id, UserId(2), "resident"))
+            .collect::<Vec<_>>();
+        enter(&mut room, Vec::new(), resident, Some(UserId(1)));
+        assert!(room.begin_history_fetch(RoomId(1)));
+        let page = (10..=12)
+            .map(|id| message(id, UserId(2), "newer"))
+            .collect::<Vec<_>>();
+
+        let update =
+            room.history_chunk_received(RoomId(1), None, page, false, true, Some(UserId(1)));
+
+        assert!(update.changed);
+        assert_eq!(
+            update.next_backfill.map(|(_, before, _)| before),
+            Some(Some(MessageId(10)))
+        );
+        assert!(room.room_meta(RoomId(1)).unwrap().gap.is_some());
+        let bodies = (0..room.active.chat.len())
+            .map(|index| room.active.chat.message(index).body.as_str())
+            .collect::<Vec<_>>();
+        assert!(bodies.contains(&"older messages missing"));
+    }
+
+    #[test]
+    fn history_gap_detection_ignores_overlapping_initial_page() {
+        let mut room = test_room();
+        let resident = (1..=10)
+            .map(|id| message(id, UserId(2), "resident"))
+            .collect::<Vec<_>>();
+        enter(&mut room, Vec::new(), resident, Some(UserId(1)));
+        assert!(room.begin_history_fetch(RoomId(1)));
+        let page = (8..=12)
+            .map(|id| message(id, UserId(2), "overlap"))
+            .collect::<Vec<_>>();
+
+        let update =
+            room.history_chunk_received(RoomId(1), None, page, false, true, Some(UserId(1)));
+
+        assert!(update.changed);
+        assert!(update.next_backfill.is_none());
+        assert!(room.room_meta(RoomId(1)).unwrap().gap.is_none());
+        assert!(
+            !(0..room.active.chat.len())
+                .any(|index| room.active.chat.message(index).body == "older messages missing")
+        );
+    }
+
+    #[test]
+    fn history_gap_detection_uses_pre_fetch_resident_tail_across_chunks() {
+        let mut room = test_room();
+        let resident = (1..=5)
+            .map(|id| message(id, UserId(2), "resident"))
+            .collect::<Vec<_>>();
+        enter(&mut room, Vec::new(), resident, Some(UserId(1)));
+        assert!(room.begin_history_fetch(RoomId(1)));
+
+        let newest_chunk = (12..=13)
+            .map(|id| message(id, UserId(2), "newest"))
+            .collect::<Vec<_>>();
+        let update = room.history_chunk_received(
+            RoomId(1),
+            None,
+            newest_chunk,
+            false,
+            false,
+            Some(UserId(1)),
+        );
+        assert!(update.next_backfill.is_none());
+        assert!(room.room_meta(RoomId(1)).unwrap().gap.is_none());
+
+        let oldest_chunk = (10..=11)
+            .map(|id| message(id, UserId(2), "oldest"))
+            .collect::<Vec<_>>();
+        let update = room.history_chunk_received(
+            RoomId(1),
+            None,
+            oldest_chunk,
+            false,
+            true,
+            Some(UserId(1)),
+        );
+
+        assert!(update.next_backfill.is_some());
+        assert!(room.room_meta(RoomId(1)).unwrap().gap.is_some());
+    }
+
+    #[test]
+    fn history_gap_marker_removed_when_page_bridges_gap() {
+        let mut room = test_room();
+        let resident = (1..=5)
+            .map(|id| message(id, UserId(2), "resident"))
+            .collect::<Vec<_>>();
+        enter(&mut room, Vec::new(), resident, Some(UserId(1)));
+        assert!(room.begin_history_fetch(RoomId(1)));
+        let page = (10..=12)
+            .map(|id| message(id, UserId(2), "newer"))
+            .collect::<Vec<_>>();
+        let update =
+            room.history_chunk_received(RoomId(1), None, page, false, true, Some(UserId(1)));
+        assert!(update.next_backfill.is_some());
+
+        let bridge = (4..=9)
+            .map(|id| message(id, UserId(2), "bridge"))
+            .collect::<Vec<_>>();
+        let update = room.history_chunk_received(
+            RoomId(1),
+            Some(MessageId(10)),
+            bridge,
+            false,
+            true,
+            Some(UserId(1)),
+        );
+
+        assert!(update.next_backfill.is_none());
+        assert!(room.room_meta(RoomId(1)).unwrap().gap.is_none());
+        assert!(
+            !(0..room.active.chat.len())
+                .any(|index| room.active.chat.message(index).body == "older messages missing")
+        );
+    }
+
+    #[test]
+    fn history_gap_auto_fetch_stops_at_cap_and_at_start() {
+        let mut capped = test_room();
+        capped.set_max_messages(8);
+        let resident = (1..=5)
+            .map(|id| message(id, UserId(2), "resident"))
+            .collect::<Vec<_>>();
+        enter(&mut capped, Vec::new(), resident, Some(UserId(1)));
+        assert!(capped.begin_history_fetch(RoomId(1)));
+        let page = (10..=12)
+            .map(|id| message(id, UserId(2), "newer"))
+            .collect::<Vec<_>>();
+        let update =
+            capped.history_chunk_received(RoomId(1), None, page, false, true, Some(UserId(1)));
+        assert!(update.next_backfill.is_none());
+        assert!(capped.room_meta(RoomId(1)).unwrap().gap.is_some());
+
+        let mut at_start = test_room();
+        let resident = (1..=5)
+            .map(|id| message(id, UserId(2), "resident"))
+            .collect::<Vec<_>>();
+        enter(&mut at_start, Vec::new(), resident, Some(UserId(1)));
+        assert!(at_start.begin_history_fetch(RoomId(1)));
+        let page = (10..=12)
+            .map(|id| message(id, UserId(2), "newer"))
+            .collect::<Vec<_>>();
+        let update =
+            at_start.history_chunk_received(RoomId(1), None, page, false, true, Some(UserId(1)));
+        assert!(update.next_backfill.is_some());
+        let terminal = (6..=9)
+            .map(|id| message(id, UserId(2), "terminal"))
+            .collect::<Vec<_>>();
+        let update = at_start.history_chunk_received(
+            RoomId(1),
+            Some(MessageId(10)),
+            terminal,
+            true,
+            true,
+            Some(UserId(1)),
+        );
+        assert!(update.next_backfill.is_none());
+        assert!(at_start.room_meta(RoomId(1)).unwrap().gap.is_some());
     }
 
     #[test]
@@ -2487,6 +3009,63 @@ mod tests {
         assert!(room.merge_history(RoomId(1), older, Some(UserId(1))));
 
         assert_eq!(room.transfer(FileTransferId(7)).unwrap().transferred, 25);
+    }
+
+    #[test]
+    fn trim_prunes_attachment_maps_for_evicted_messages() {
+        let mut room = test_room();
+        let transfer_old = FileTransferId(1);
+        let transfer_kept = FileTransferId(2);
+        enter(
+            &mut room,
+            Vec::new(),
+            vec![
+                file_message(1, UserId(2), "old", transfer_old),
+                file_message(2, UserId(2), "kept", transfer_kept),
+                message(3, UserId(2), "tail"),
+            ],
+            Some(UserId(1)),
+        );
+        let old_key = FileHistoryKey {
+            timestamp_ms: 1_000,
+            transfer_id: transfer_old,
+        };
+        let kept_key = FileHistoryKey {
+            timestamp_ms: 2_000,
+            transfer_id: transfer_kept,
+        };
+        let detail = room_history::FileDetail {
+            file_name: "file.bin".to_string(),
+            length: 1,
+            packed_dims: 0,
+        };
+        let attachment = WebAttachment {
+            name: "file.bin".to_string(),
+            kind: "file".to_string(),
+            width: None,
+            height: None,
+        };
+        room.active.files.insert(old_key, detail.clone());
+        room.active.files.insert(kept_key, detail);
+        room.active
+            .web_file_attachments
+            .insert(old_key, attachment.clone());
+        room.active
+            .web_file_attachments
+            .insert(kept_key, attachment.clone());
+        room.active
+            .web_attachments
+            .insert((1_000, 1), attachment.clone());
+        room.active.web_attachments.insert((2_000, 2), attachment);
+
+        room.set_max_messages(2);
+
+        assert!(!room.active.files.contains_key(&old_key));
+        assert!(room.active.files.contains_key(&kept_key));
+        assert!(!room.active.web_file_attachments.contains_key(&old_key));
+        assert!(room.active.web_file_attachments.contains_key(&kept_key));
+        assert!(!room.active.web_attachments.contains_key(&(1_000, 1)));
+        assert!(room.active.web_attachments.contains_key(&(2_000, 2)));
     }
 
     #[test]

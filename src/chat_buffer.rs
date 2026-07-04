@@ -18,6 +18,9 @@ const COLLAPSE_SHOW: usize = 10;
 /// Maximum gap between adjacent same-sender messages that still groups them.
 const GROUP_GAP_MS: u64 = 90_000;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct NoticeId(u64);
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Segment {
     pub col: u16,
@@ -86,6 +89,7 @@ pub struct ChatEntry {
     pub refs: Vec<MsgRefSpan>,
     /// Whether a collapsible (over [`COLLAPSE_LIMIT`] lines) message is expanded.
     expanded: bool,
+    notice_id: Option<NoticeId>,
     layout: MessageLayout,
 }
 
@@ -128,6 +132,7 @@ pub struct VirtualChatBuffer {
     selected_message: Option<usize>,
     syntax: SyntaxTheme,
     room_id: Option<rpc::ids::RoomId>,
+    next_notice_id: u64,
 }
 
 impl VirtualChatBuffer {
@@ -140,6 +145,7 @@ impl VirtualChatBuffer {
             selected_message: None,
             syntax,
             room_id: None,
+            next_notice_id: 1,
         }
     }
 
@@ -184,6 +190,7 @@ impl VirtualChatBuffer {
             links: inline.urls,
             refs,
             expanded: false,
+            notice_id: None,
             layout: MessageLayout::new(),
         }
     }
@@ -261,10 +268,12 @@ impl VirtualChatBuffer {
         }
     }
 
-    pub fn push_notice(&mut self, sender: impl Into<String>, body: impl Into<String>) {
+    pub fn push_notice(&mut self, sender: impl Into<String>, body: impl Into<String>) -> NoticeId {
         let body = body.into();
         let inline = crate::markdown::inline_ranges(&body);
         let refs = self.build_ref_spans(&body, inline.refs);
+        let notice_id = NoticeId(self.next_notice_id);
+        self.next_notice_id = self.next_notice_id.wrapping_add(1).max(1);
         self.messages.push(ChatEntry {
             id: 0,
             sender: sender.into(),
@@ -275,9 +284,44 @@ impl VirtualChatBuffer {
             links: inline.urls,
             refs,
             expanded: false,
+            notice_id: Some(notice_id),
             layout: MessageLayout::new(),
         });
         self.trim_front();
+        notice_id
+    }
+
+    pub fn remove_notice(&mut self, notice_id: NoticeId) -> bool {
+        let Some(index) = self
+            .messages
+            .iter()
+            .position(|entry| entry.notice_id == Some(notice_id))
+        else {
+            return false;
+        };
+        self.messages.remove(index);
+        if let Some(selection) = &mut self.selection {
+            if selection.anchor.0 == index || selection.head.0 == index {
+                self.selection = None;
+            } else {
+                if selection.anchor.0 > index {
+                    selection.anchor.0 -= 1;
+                }
+                if selection.head.0 > index {
+                    selection.head.0 -= 1;
+                }
+            }
+        }
+        self.selected_message = self.selected_message.and_then(|message| {
+            if message == index {
+                None
+            } else if message > index {
+                Some(message - 1)
+            } else {
+                Some(message)
+            }
+        });
+        true
     }
 
     fn build_ref_spans(&self, body: &str, ranges: Vec<Range<u32>>) -> Vec<MsgRefSpan> {
@@ -344,6 +388,7 @@ impl VirtualChatBuffer {
         self.selection = None;
         self.selected_message = None;
         self.room_id = None;
+        self.next_notice_id = 1;
     }
 
     pub fn len(&self) -> usize {
@@ -2144,6 +2189,7 @@ mod tests {
                 links: inline.urls,
                 refs,
                 expanded: false,
+                notice_id: None,
                 layout: MessageLayout::new(),
             });
             self.trim_front();

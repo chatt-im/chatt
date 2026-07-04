@@ -262,6 +262,9 @@ pub(crate) struct App {
     /// their mute fade-out tail before transport closes.
     pending_voice_teardown_at: Option<Instant>,
     pending_network_commands: VecDeque<NetworkCommand>,
+    network_disconnected: bool,
+    pending_dm_open: Option<(RoomId, UserId)>,
+    pending_room_catalog_save: Option<PendingRoomCatalogSave>,
     supervisor: SupervisorState,
     /// Recent audio device events (losses, recoveries, default changes) shown
     /// by `/audio`.
@@ -300,6 +303,10 @@ struct AvailableShare {
 pub(crate) struct PendingAudioApply {
     capture: bool,
     playback: bool,
+    deadline: Instant,
+}
+
+pub(crate) struct PendingRoomCatalogSave {
     deadline: Instant,
 }
 
@@ -384,6 +391,7 @@ const LOBBY_TALKING_RMS_THRESHOLD: f32 = 0.001; // -60 dBFS
 /// Debounce window before a scheduled audio restart fires. Coalesces rapid
 /// settings edits (cycling a choice, typing a buffer size) into one restart.
 const AUDIO_APPLY_DEBOUNCE: Duration = Duration::from_millis(400);
+const ROOM_CATALOG_SAVE_DEBOUNCE: Duration = Duration::from_millis(400);
 
 /// Grace period outbound voice keeps running after a deafen, so active senders
 /// transmit their mute fade-out tail (`LIVE_CAPTURE_MUTE_FADE`) plus an entry
@@ -832,6 +840,9 @@ impl App {
             server_rtt_ms: None,
             pending_voice_teardown_at: None,
             pending_network_commands: VecDeque::new(),
+            network_disconnected: false,
+            pending_dm_open: None,
+            pending_room_catalog_save: None,
             supervisor: SupervisorState::default(),
             audio_events: AudioEventLog::default(),
             web_feed,
@@ -1203,6 +1214,7 @@ impl App {
         );
         self.active_server_label = Some(server.label.clone());
         self.network = Some(network);
+        self.network_disconnected = false;
         self.supervisor.network.reset();
         self.join_notice = None;
         self.set_status("connecting");
@@ -1227,6 +1239,8 @@ impl App {
         self.voice_tx_enabled.store(false, Ordering::Relaxed);
         self.pending_voice_teardown_at = None;
         self.pending_network_commands.clear();
+        self.network_disconnected = true;
+        self.pending_dm_open = None;
         self.supervisor.network.reset();
         self.supervisor.control_socket.reset();
         self.supervisor.capture.reset();
@@ -1242,6 +1256,7 @@ impl App {
         self.save_room_catalog();
         self.voice_room = None;
         self.requested_voice_room = None;
+        self.pending_dm_open = None;
         self.room.reset_for_disconnect();
     }
 
@@ -1274,14 +1289,16 @@ impl App {
         let Some((room_id, before, limit)) = self.room.older_history_request() else {
             return;
         };
-        self.send_network_command(
+        if !self.send_network_command(
             NetworkCommand::FetchHistory {
                 room_id,
                 before,
                 limit,
             },
             false,
-        );
+        ) {
+            self.room.abort_history_fetch(room_id, before);
+        }
     }
 
     /// The switcher and rooms-strip rows for the current catalog, voice, and
@@ -1304,8 +1321,12 @@ impl App {
         let current = self
             .room
             .viewed_room
-            .and_then(|viewed| rooms.iter().position(|room_id| *room_id == viewed))
-            .unwrap_or(0);
+            .and_then(|viewed| rooms.iter().position(|room_id| *room_id == viewed));
+        let Some(current) = current else {
+            let next = if delta < 0 { rooms.len() - 1 } else { 0 };
+            self.set_viewed_room(rooms[next]);
+            return;
+        };
         let next = (current as isize + delta).rem_euclid(rooms.len() as isize) as usize;
         self.set_viewed_room(rooms[next]);
     }
@@ -1313,7 +1334,8 @@ impl App {
     fn after_view_switch(&mut self) {
         self.sync_viewed_room_to_feeds();
         self.request_initial_history_for_viewed_room();
-        self.save_room_catalog();
+        self.request_gap_backfill_for_viewed_room();
+        self.mark_room_catalog_dirty();
         self.set_status(format!("viewing {}", self.room.room_name));
     }
 
@@ -1321,15 +1343,34 @@ impl App {
         let Some(room_id) = self.room.viewed_room else {
             return;
         };
-        if self.room.begin_history_fetch(room_id, None) {
-            self.send_network_command(
+        if self.room.begin_history_fetch(room_id) {
+            if !self.send_network_command(
                 NetworkCommand::FetchHistory {
                     room_id,
                     before: None,
                     limit: rpc::control::MAX_HISTORY_FETCH_MESSAGES,
                 },
                 false,
-            );
+            ) {
+                self.room.abort_history_fetch(room_id, None);
+            }
+        }
+    }
+
+    fn request_gap_backfill_for_viewed_room(&mut self) {
+        let Some((room_id, before, limit)) = self.room.gap_backfill_request_for_viewed_room()
+        else {
+            return;
+        };
+        if !self.send_network_command(
+            NetworkCommand::FetchHistory {
+                room_id,
+                before,
+                limit,
+            },
+            false,
+        ) {
+            self.room.abort_history_fetch(room_id, before);
         }
     }
 
@@ -1342,9 +1383,23 @@ impl App {
         self.send_network_command(NetworkCommand::SendChat { room_id, body }, true);
     }
 
+    fn mark_room_catalog_dirty(&mut self) {
+        if self.room.history_id().is_empty() {
+            return;
+        }
+        self.pending_room_catalog_save = Some(PendingRoomCatalogSave {
+            deadline: Instant::now() + ROOM_CATALOG_SAVE_DEBOUNCE,
+        });
+    }
+
     /// Persists the room catalog (names, kinds, read state, last viewed/voice
     /// rooms) so rooms stay navigable offline.
-    fn save_room_catalog(&self) {
+    fn save_room_catalog(&mut self) {
+        self.pending_room_catalog_save = None;
+        self.write_room_catalog();
+    }
+
+    fn write_room_catalog(&self) {
         let history_id = self.room.history_id();
         if history_id.is_empty() {
             return;
@@ -1750,6 +1805,7 @@ impl App {
             } => {
                 self.session_id = Some(session_id);
                 self.user_id = Some(user_id);
+                self.network_disconnected = false;
                 self.last_network_notice = None;
                 let catalog = crate::room_catalog::load(self.room.history_id());
                 let known = self.room.authenticated(
@@ -1761,15 +1817,17 @@ impl App {
                 );
                 self.sync_viewed_room_to_feeds();
                 for room_id in known {
-                    if self.room.begin_history_fetch(room_id, None) {
-                        self.send_network_command(
+                    if self.room.begin_history_fetch(room_id) {
+                        if !self.send_network_command(
                             NetworkCommand::FetchHistory {
                                 room_id,
                                 before: None,
                                 limit: rpc::control::MAX_HISTORY_FETCH_MESSAGES,
                             },
                             false,
-                        );
+                        ) {
+                            self.room.abort_history_fetch(room_id, None);
+                        }
                     }
                 }
                 if !self.voice_left {
@@ -1781,36 +1839,64 @@ impl App {
                     self.send_network_command(NetworkCommand::JoinVoice(voice_target), true);
                     self.publish_voice_status();
                 }
-                self.save_room_catalog();
+                self.mark_room_catalog_dirty();
                 self.set_status(format!("authenticated as {}", self.room.local_user_name));
                 self.flush_pending_network_commands();
             }
             NetworkEvent::RoomUpserted(info) => {
+                let room_id = info.room_id;
                 self.room.upsert_room(&info, self.user_id);
-                if self.room.viewed_room == Some(info.room_id) {
+                if self.room.viewed_room == Some(room_id) {
                     self.request_initial_history_for_viewed_room();
                 }
-                self.save_room_catalog();
+                if let Some((pending_room, peer)) = self.pending_dm_open
+                    && pending_room == room_id
+                    && self.room.set_viewed_room(room_id, self.user_id)
+                {
+                    self.pending_dm_open = None;
+                    self.after_view_switch();
+                    self.set_status(format!("dm with {}", self.room.display_name_of(peer)));
+                }
+                self.mark_room_catalog_dirty();
             }
             NetworkEvent::DmOpened { room_id, peer } => {
                 if self.room.set_viewed_room(room_id, self.user_id) {
                     self.after_view_switch();
                     self.set_status(format!("dm with {}", self.room.display_name_of(peer)));
+                } else {
+                    self.pending_dm_open = Some((room_id, peer));
                 }
             }
             NetworkEvent::HistoryChunk {
                 room_id,
+                before,
                 messages,
                 at_start,
                 complete,
             } => {
-                if complete {
-                    self.room
-                        .complete_history_fetch(room_id, &messages, at_start);
-                }
-                let changed = self.room.merge_history(room_id, messages, self.user_id);
+                let update = self.room.history_chunk_received(
+                    room_id,
+                    before,
+                    messages,
+                    at_start,
+                    complete,
+                    self.user_id,
+                );
+                let changed = update.changed;
                 if changed && self.room.viewed_room == Some(room_id) && self.web_feed.is_some() {
                     self.sync_viewed_room_to_feeds();
+                }
+                if let Some((room_id, before, limit)) = update.next_backfill
+                    && !self.send_network_command(
+                        NetworkCommand::FetchHistory {
+                            room_id,
+                            before,
+                            limit,
+                        },
+                        false,
+                    )
+                {
+                    self.room.abort_history_fetch(room_id, before);
                 }
             }
             NetworkEvent::Chat(message) => {
@@ -1822,6 +1908,9 @@ impl App {
                 };
                 if !update.fresh {
                     return;
+                }
+                if update.read_advanced {
+                    self.mark_room_catalog_dirty();
                 }
                 if let Some(message) = feed_message
                     && let Some(feed) = &self.web_feed
@@ -1893,18 +1982,18 @@ impl App {
             }
             NetworkEvent::Presence { user, online } => {
                 let notice = self.room.presence_changed(user, online, self.user_id);
-                if !notice.local {
+                if !notice.local && notice.relevant {
                     self.play_notification(if online {
                         NotificationSound::PeerJoin
                     } else {
                         NotificationSound::PeerLeave
                     });
+                    self.set_status(format!(
+                        "{} {}",
+                        notice.display_name,
+                        if online { "joined" } else { "left" }
+                    ));
                 }
-                self.set_status(format!(
-                    "{} {}",
-                    notice.display_name,
-                    if online { "joined" } else { "left" }
-                ));
             }
             NetworkEvent::VoiceStarted {
                 room_id,
@@ -1935,7 +2024,7 @@ impl App {
                     } else {
                         self.set_status("voice stream ready");
                     }
-                    self.save_room_catalog();
+                    self.mark_room_catalog_dirty();
                 } else if self.voice_room == Some(room_id) {
                     self.set_status(format!("{} voice ready", notice.display_name));
                 }
@@ -2155,6 +2244,7 @@ impl App {
                 self.set_error(error);
             }
             NetworkEvent::ReconnectScheduled { retry_in, reason } => {
+                self.network_disconnected = true;
                 self.stop_audio();
                 // The reconnect issues a fresh session id, so every share and
                 // viewer tied to the old one is dead; subscribers would retry
@@ -2198,7 +2288,18 @@ impl App {
     }
 
     fn send_network_command(&mut self, command: NetworkCommand, queue_on_failure: bool) -> bool {
+        if self.network_disconnected {
+            let kind = app_network_command_kind(&command);
+            kvlog::info!("network command queued while disconnected", kind);
+            if queue_on_failure {
+                self.pending_network_commands.push_back(command);
+            }
+            return false;
+        }
         let Some(network) = &self.network else {
+            if queue_on_failure {
+                self.pending_network_commands.push_back(command);
+            }
             return false;
         };
         match network.try_send(command) {
@@ -2221,7 +2322,10 @@ impl App {
     }
 
     fn flush_pending_network_commands(&mut self) {
-        if self.pending_network_commands.is_empty() || self.network.is_none() {
+        if self.pending_network_commands.is_empty()
+            || self.network.is_none()
+            || self.network_disconnected
+        {
             return;
         }
         let mut sent = 0usize;
@@ -2696,7 +2800,18 @@ impl App {
         self.supervise(now);
         self.update_lobby_talking(now);
         self.apply_pending_audio_restart();
+        self.apply_pending_room_catalog_save(now);
         self.supervise_voice_teardown(now);
+    }
+
+    fn apply_pending_room_catalog_save(&mut self, now: Instant) {
+        let Some(pending) = &self.pending_room_catalog_save else {
+            return;
+        };
+        if now < pending.deadline {
+            return;
+        }
+        self.save_room_catalog();
     }
 
     /// Completes a deferred outbound-voice teardown once the deafen grace period
@@ -5047,6 +5162,16 @@ mod tests {
         }
     }
 
+    fn dm_room_info(id: u32, user_a: UserId, user_b: UserId) -> rpc::control::RoomInfo {
+        rpc::control::RoomInfo {
+            room_id: rpc::ids::RoomId(id),
+            name: format!("dm:{}:{}", user_a.0, user_b.0),
+            kind: rpc::control::RoomKind::Dm { user_a, user_b },
+            head: None,
+            voice_users: Vec::new(),
+        }
+    }
+
     /// Registers room 1 as the viewed room with `users` in the directory.
     fn enter_room_with_users(app: &mut App, users: Vec<rpc::control::UserSummary>) {
         app.room.authenticated(
@@ -5259,6 +5384,61 @@ mod tests {
     }
 
     #[test]
+    fn command_during_reconnect_backoff_queues_and_flushes_after_auth() {
+        let mut app = test_app();
+        let (tx, rx) = mpsc::channel();
+        app.network = Some(NetworkClient::from_parts_for_test(tx));
+        app.voice_left = true;
+
+        app.handle_network_event(NetworkEvent::ReconnectScheduled {
+            retry_in: Duration::from_secs(1),
+            reason: "reset".to_string(),
+        });
+        assert!(!app.send_network_command(
+            NetworkCommand::SendChat {
+                room_id: RoomId(1),
+                body: "queued".to_string(),
+            },
+            true,
+        ));
+        assert!(rx.try_recv().is_err());
+        assert_eq!(app.pending_network_commands.len(), 1);
+
+        app.handle_network_event(NetworkEvent::Authenticated {
+            session_id: SessionId(1),
+            user_id: UserId(1),
+            rooms: vec![test_room_info(1)],
+            users: vec![user_summary(UserId(1), "alice")],
+            default_room: RoomId(1),
+        });
+
+        let mut flushed = false;
+        while let Ok(command) = rx.try_recv() {
+            if matches!(command, NetworkCommand::SendChat { body, .. } if body == "queued") {
+                flushed = true;
+            }
+        }
+        assert!(flushed);
+        assert!(app.pending_network_commands.is_empty());
+        assert!(!app.network_disconnected);
+    }
+
+    #[test]
+    fn failed_initial_history_send_clears_in_flight_state() {
+        let mut app = test_app();
+        let (tx, _rx) = mpsc::channel();
+        app.network = Some(NetworkClient::from_parts_for_test(tx));
+        app.network_disconnected = true;
+        app.user_id = Some(UserId(1));
+        enter_test_room(&mut app);
+
+        app.request_initial_history_for_viewed_room();
+
+        assert!(app.room.begin_history_fetch(RoomId(1)));
+        app.room.abort_history_fetch(RoomId(1), None);
+    }
+
+    #[test]
     fn leading_space_escapes_slash_command_as_chat() {
         let mut app = test_app();
         let (tx, rx) = mpsc::channel();
@@ -5319,6 +5499,79 @@ mod tests {
             NetworkCommand::OpenDm(user_id) => assert_eq!(user_id, UserId(2)),
             other => panic!("unexpected command: {other:?}"),
         }
+    }
+
+    #[test]
+    fn own_user_presence_produces_no_status_notice() {
+        let mut app = test_app();
+        app.user_id = Some(UserId(1));
+        enter_room_with_users(&mut app, vec![user_summary(UserId(1), "alice")]);
+        app.set_status("steady");
+
+        app.handle_network_event(NetworkEvent::Presence {
+            user: user_summary(UserId(1), "alice"),
+            online: true,
+        });
+
+        assert_eq!(app.status.text(), "steady");
+    }
+
+    #[test]
+    fn dm_irrelevant_presence_produces_no_notice() {
+        let mut app = test_app();
+        app.user_id = Some(UserId(1));
+        app.room.authenticated(
+            &[dm_room_info(0x8000_0001, UserId(1), UserId(2))],
+            vec![
+                user_summary(UserId(1), "alice"),
+                user_summary(UserId(2), "bob"),
+            ],
+            RoomId(0x8000_0001),
+            None,
+            app.user_id,
+        );
+        app.set_status("steady");
+
+        app.handle_network_event(NetworkEvent::Presence {
+            user: user_summary(UserId(3), "carol"),
+            online: true,
+        });
+
+        assert_eq!(app.status.text(), "steady");
+    }
+
+    #[test]
+    fn dm_opened_waits_for_room_upsert_when_room_is_unknown() {
+        let mut app = test_app();
+        app.user_id = Some(UserId(1));
+        app.room.authenticated(
+            &[test_room_info(1)],
+            vec![
+                user_summary(UserId(1), "alice"),
+                user_summary(UserId(2), "bob"),
+            ],
+            RoomId(1),
+            None,
+            app.user_id,
+        );
+        let dm_id = RoomId(0x8000_0001);
+
+        app.handle_network_event(NetworkEvent::DmOpened {
+            room_id: dm_id,
+            peer: UserId(2),
+        });
+        assert_eq!(app.room.viewed_room, Some(RoomId(1)));
+        assert_eq!(app.pending_dm_open, Some((dm_id, UserId(2))));
+
+        app.handle_network_event(NetworkEvent::RoomUpserted(dm_room_info(
+            dm_id.0,
+            UserId(1),
+            UserId(2),
+        )));
+
+        assert_eq!(app.pending_dm_open, None);
+        assert_eq!(app.room.viewed_room, Some(dm_id));
+        assert_eq!(app.status.text(), "dm with bob");
     }
 
     #[test]
@@ -5591,6 +5844,26 @@ mod tests {
     }
 
     #[test]
+    fn cycle_room_without_current_room_uses_directional_edge() {
+        let mut app = test_app();
+        app.room.authenticated(
+            &[test_room_info(1), test_room_info(2)],
+            Vec::new(),
+            RoomId(1),
+            None,
+            None,
+        );
+        app.room.viewed_room = None;
+
+        app.cycle_room(1);
+        assert_eq!(app.room.viewed_room, Some(RoomId(1)));
+
+        app.room.viewed_room = None;
+        app.cycle_room(-1);
+        assert_eq!(app.room.viewed_room, Some(RoomId(2)));
+    }
+
+    #[test]
     fn background_room_file_completion_updates_its_own_history() {
         let mut app = test_app();
         app.user_id = Some(UserId(1));
@@ -5632,7 +5905,7 @@ mod tests {
         app.network = Some(NetworkClient::from_parts_for_test(tx));
         app.user_id = Some(UserId(1));
         enter_test_room(&mut app);
-        assert!(app.room.begin_history_fetch(RoomId(1), None));
+        assert!(app.room.begin_history_fetch(RoomId(1)));
         let messages = (6..=20)
             .map(|id| rpc::control::ChatMessage {
                 message_id: rpc::ids::MessageId(id),
@@ -5644,7 +5917,8 @@ mod tests {
                 file_transfer_id: None,
             })
             .collect::<Vec<_>>();
-        app.room.complete_history_fetch(RoomId(1), &messages, false);
+        app.room
+            .complete_history_fetch(RoomId(1), None, &messages, false);
         app.room.merge_history(RoomId(1), messages, app.user_id);
 
         app.request_older_history_if_at_top(40, 5);
@@ -6238,6 +6512,7 @@ mod tests {
 
 impl Drop for App {
     fn drop(&mut self) {
+        self.save_room_catalog();
         self.stop_audio();
     }
 }

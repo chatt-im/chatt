@@ -138,6 +138,7 @@ impl Retention {
 
 pub struct HistoryFetchPlan {
     room_id: RoomId,
+    before: Option<MessageId>,
     chunks: Vec<HistoryChunkSpec>,
     pub message_count: usize,
     pub at_start: bool,
@@ -282,6 +283,7 @@ impl ResidentHistory {
         }
         HistoryFetchPlan {
             room_id,
+            before,
             chunks,
             message_count: selected.len(),
             at_start,
@@ -351,7 +353,12 @@ impl ResidentHistory {
         chunks
     }
 
-    fn encode_chunk(&self, room_id: RoomId, spec: &HistoryChunkSpec) -> Result<Vec<u8>, String> {
+    fn encode_chunk(
+        &self,
+        room_id: RoomId,
+        before: Option<MessageId>,
+        spec: &HistoryChunkSpec,
+    ) -> Result<Vec<u8>, String> {
         let entries = self.entries();
         let Some(chunk_entries) = entries.get(spec.start..spec.end) else {
             return Err("history fetch plan no longer matches retained history".to_string());
@@ -359,6 +366,7 @@ impl ResidentHistory {
         let mut payload = Vec::with_capacity(history::CHUNK_HEADER_BYTES + spec.records_bytes);
         history::write_chunk_header(
             room_id,
+            before,
             spec.at_start,
             spec.complete,
             chunk_entries.len(),
@@ -376,13 +384,14 @@ impl ResidentHistory {
     pub(crate) fn chunk_payloads(
         &self,
         room_id: RoomId,
+        before: Option<MessageId>,
         at_start: bool,
         target_bytes: usize,
     ) -> Result<Vec<Vec<u8>>, String> {
         let specs = self.chunk_specs(self.entries(), at_start, target_bytes);
         let mut payloads = Vec::with_capacity(specs.len());
         for spec in &specs {
-            payloads.push(self.encode_chunk(room_id, spec)?);
+            payloads.push(self.encode_chunk(room_id, before, spec)?);
         }
         Ok(payloads)
     }
@@ -730,6 +739,7 @@ impl RoomStore {
             }
             None => HistoryFetchPlan {
                 room_id,
+                before,
                 chunks: vec![HistoryChunkSpec {
                     start: 0,
                     end: 0,
@@ -827,6 +837,7 @@ impl RoomStore {
             let mut payload = Vec::with_capacity(history::CHUNK_HEADER_BYTES);
             history::write_chunk_header(
                 plan.room_id,
+                plan.before,
                 spec.at_start,
                 spec.complete,
                 0,
@@ -836,7 +847,7 @@ impl RoomStore {
         }
         self.resident(plan.room_id)
             .ok_or_else(|| "history fetch plan no longer has retained messages".to_string())?
-            .encode_chunk(plan.room_id, spec)
+            .encode_chunk(plan.room_id, plan.before, spec)
     }
 
     fn resident(&self, room_id: RoomId) -> Option<&ResidentHistory> {

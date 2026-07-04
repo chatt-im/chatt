@@ -73,6 +73,11 @@ fi
 '''
 info = "Run the Carol prerecorded-audio soundboard client; trailing args run a chatt subcommand against it"
 
+[test.cargo]
+cmd = ["cargo", "nextest", "run", "--workspace", {var = "args"}]
+cli.forward_arguments = true
+env.CARGO_TERM_COLOR = "never"
+
 [action.json-snapshot-client-logs]
 sh = '''
 kvlog /tmp/chatt-server.kvlog --json > /tmp/chatt-server.json
