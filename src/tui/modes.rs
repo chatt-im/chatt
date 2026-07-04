@@ -1,7 +1,7 @@
-use extui::event::{KeyEvent, KeyEventKind, MouseEvent};
+use extui::event::{KeyCode, KeyEvent, KeyEventKind, MouseEvent};
 use extui::{Buffer, Rect};
 use extui_bindings::{InputKey, LayerId};
-use extui_editor::Mode as EditorMode;
+use extui_editor::{Editor, Mode as EditorMode, Span as EditorSpan};
 
 use crate::{
     app::{App, ChatPanelFocus, ServerEditDraft, ServerEditEvent, ToggleExpandResult},
@@ -56,6 +56,35 @@ fn resolve_binding(app: &mut App, layer: LayerId, key: KeyEvent) -> BindingResol
         Resolved::Consumed => BindingResolution::Consumed,
         Resolved::Unmatched => BindingResolution::Unmatched,
     }
+}
+
+fn maybe_auto_close_markdown_code_fence(editor: &mut Editor, key: KeyEvent) {
+    if key.code != KeyCode::Char('`') || !key.modifiers.is_empty() {
+        return;
+    }
+
+    let cursor = editor.cursor_offset();
+    let text = editor.text();
+    let cursor = cursor as usize;
+    let Some(before_cursor) = text.get(..cursor) else {
+        return;
+    };
+    let line_start = before_cursor.rfind('\n').map_or(0, |index| index + 1);
+    if &before_cursor[line_start..] != "```" {
+        return;
+    }
+    let Some(after_cursor) = text.get(cursor..) else {
+        return;
+    };
+    if !(after_cursor.is_empty() || after_cursor.starts_with('\n')) {
+        return;
+    }
+    if after_cursor.starts_with("\n```") {
+        return;
+    }
+
+    editor.replace_range(EditorSpan::empty_at(cursor as u32), "\n```");
+    editor.set_cursor_offset(cursor as u32);
 }
 
 pub(crate) struct ServerListMode {
@@ -826,7 +855,9 @@ impl RoomMode {
                     BindingResolution::Unmatched => {}
                 }
             }
-            let _ = app.room.composer.send_key(&key);
+            if app.room.composer.send_key(&key) {
+                maybe_auto_close_markdown_code_fence(&mut app.room.composer, key);
+            }
             return Action::Continue;
         }
 
@@ -1372,6 +1403,63 @@ mod tests {
                 "focus {focus:?} did not receive paste"
             );
         }
+    }
+
+    #[test]
+    fn typed_markdown_code_fence_auto_closes() {
+        let mut app = test_app();
+        let mut room = RoomMode::default();
+
+        type_text(&mut room, &mut app, "```");
+
+        assert_eq!(app.room.composer.text(), "```\n```");
+        assert_eq!(app.room.composer.cursor_offset(), 3);
+    }
+
+    #[test]
+    fn typed_markdown_code_fence_language_inserts_before_closer() {
+        let mut app = test_app();
+        let mut room = RoomMode::default();
+
+        type_text(&mut room, &mut app, "```rust");
+
+        assert_eq!(app.room.composer.text(), "```rust\n```");
+        assert_eq!(app.room.composer.cursor_offset(), "```rust".len() as u32);
+    }
+
+    #[test]
+    fn typed_markdown_code_fence_inside_line_does_not_auto_close() {
+        let mut app = test_app();
+        let mut room = RoomMode::default();
+        app.room.composer.set_lines("``x");
+        app.room.composer.set_cursor_offset(2);
+        app.room.composer.enter_insert_mode();
+
+        room.process_input(&mut app, key('`'));
+
+        assert_eq!(app.room.composer.text(), "```x");
+        assert_eq!(app.room.composer.cursor_offset(), 3);
+    }
+
+    #[test]
+    fn pasted_markdown_code_fence_does_not_auto_close() {
+        let mut app = test_app();
+        let mut room = RoomMode::default();
+
+        room.process_paste(&mut app, "```".to_string());
+
+        assert_eq!(app.room.composer.text(), "```");
+        assert_eq!(app.room.composer.cursor_offset(), 3);
+    }
+
+    #[test]
+    fn direct_insert_paste_markdown_code_fence_does_not_auto_close() {
+        let mut app = test_app();
+
+        app.room.insert_paste("```".to_string());
+
+        assert_eq!(app.room.composer.text(), "```");
+        assert_eq!(app.room.composer.cursor_offset(), 3);
     }
 
     #[test]
