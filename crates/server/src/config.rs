@@ -795,14 +795,23 @@ fn parse_config_content(
 
 /// Writes `content` to a sibling temp file, fsyncs it, then atomically renames
 /// it over `path`. The rename is atomic, so a reader never sees a partial or
-/// missing config even if the process dies mid-write.
+/// missing config even if the process dies mid-write. The temp file is created
+/// owner-only (0600) because the content carries the identity seed and token
+/// hashes, and the rename makes its mode the config's mode.
 pub(crate) fn atomic_write_toml(path: &Path, content: &str) -> Result<(), String> {
     let tmp = temp_config_path(path);
+    // A stale temp file from a crashed run would keep its old mode through
+    // truncation; recreate so 0600 always applies.
+    let _ = fs::remove_file(&tmp);
 
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
+    let mut options = OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options
         .open(&tmp)
         .map_err(|err| format!("failed to create {}: {err}", tmp.display()))?;
     file.write_all(content.as_bytes())
@@ -1661,5 +1670,27 @@ mod tests {
 
         assert!(config.security.public);
         assert!(config.users.is_empty());
+    }
+
+    #[test]
+    fn atomic_write_toml_keeps_secrets_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let path = std::env::temp_dir().join(format!(
+            "chatt-atomic-mode-{}-{:?}.toml",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = fs::remove_file(&path);
+
+        atomic_write_toml(&path, "key = 1\n").unwrap();
+
+        let mode = fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(
+            mode & 0o077,
+            0,
+            "config rewrite must stay owner-only, got {mode:o}"
+        );
+        let _ = fs::remove_file(&path);
     }
 }

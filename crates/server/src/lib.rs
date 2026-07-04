@@ -61,6 +61,8 @@ const UDP_PROBE: Token = Token(2);
 /// Wake-only token the history reader thread signals after queueing a reply.
 const WAKER: Token = Token(3);
 const FIRST_CLIENT: usize = 4;
+/// The default config's lobby room id, used by tests asserting lobby state.
+#[cfg(test)]
 const DEFAULT_ROOM: RoomId = RoomId(1);
 const POLL_TIMEOUT: Duration = Duration::from_millis(100);
 const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(20);
@@ -293,17 +295,6 @@ impl Server {
                     id: room.room_id(),
                     name: room.name.clone(),
                     access,
-                    active_streams: HashMap::new(),
-                },
-            );
-        }
-        if rooms.is_empty() {
-            rooms.insert(
-                DEFAULT_ROOM,
-                RoomState {
-                    id: DEFAULT_ROOM,
-                    name: "lobby".to_string(),
-                    access: RoomAccess::Public,
                     active_streams: HashMap::new(),
                 },
             );
@@ -996,12 +987,12 @@ impl Server {
             tokens.push(publisher);
         }
         let control = ServerControl::ShareEnded { room_id, stream_id };
-        let recipients = self.voice_member_sessions(room_id);
-        for session_id in recipients {
-            if let Some(token) = self.live_token_for_session(session_id) {
-                let _ = self.send_control_to_token(token, &control);
-            }
-        }
+        let recipients: Vec<Token> = self
+            .voice_member_sessions(room_id)
+            .into_iter()
+            .filter_map(|session_id| self.live_token_for_session(session_id))
+            .collect();
+        self.send_control_to_tokens(&recipients, &control);
         for token in tokens {
             self.disconnect(token);
         }
@@ -1364,14 +1355,15 @@ impl Server {
                 },
             ) => {
                 let session_id = self.session_for_token(token)?;
-                self.publish_p2p(
+                let result = self.publish_p2p(
                     session_id,
                     room_id,
                     generation,
                     nat,
                     tie_breaker,
                     candidates,
-                )
+                );
+                self.report_request_outcome(token, result)
             }
             (
                 ConnState::Ready,
@@ -1424,7 +1416,7 @@ impl Server {
                 },
             ) => {
                 let session_id = self.session_for_token(token)?;
-                self.start_share(
+                let result = self.start_share(
                     session_id,
                     room_id,
                     codec,
@@ -1432,11 +1424,13 @@ impl Server {
                     coded_height,
                     annexb,
                     extradata,
-                )
+                );
+                self.report_request_outcome(token, result)
             }
             (ConnState::Ready, ClientControl::StopShare { stream_id }) => {
                 let session_id = self.session_for_token(token)?;
-                self.stop_share(session_id, stream_id)
+                let result = self.stop_share(session_id, stream_id);
+                self.report_request_outcome(token, result)
             }
             (ConnState::Ready, ClientControl::Ping { nonce }) => {
                 self.send_control_to_token(token, &ServerControl::Pong { nonce })
@@ -2081,9 +2075,7 @@ impl Server {
             .map(|candidate| candidate.tcp_token)
             .filter(|token| *token != own_token && self.clients.contains_key(token))
             .collect();
-        for token in tokens {
-            let _ = self.send_control_to_token(token, &control);
-        }
+        self.send_control_to_tokens(&tokens, &control);
     }
 
     /// Whether the session's user may access the room; sends the deliberate
@@ -2151,12 +2143,10 @@ impl Server {
         };
         if !already_active {
             self.broadcast_voice_started(room_id, session_id, user_id, stream_id);
-        }
-        if let Some(token) = self.live_token_for_session(session_id) {
-            self.send_existing_voice_streams_to_token(room_id, session_id, token);
-        }
-        self.replay_voice_room_shares(room_id, session_id);
-        if !already_active {
+            if let Some(token) = self.live_token_for_session(session_id) {
+                self.send_existing_voice_streams_to_token(room_id, session_id, token);
+            }
+            self.replay_voice_room_shares(room_id, session_id);
             // Peers cache the last VoiceStatus broadcast per user, and status
             // changes made while out of a call are stored without broadcast,
             // so an effective join must republish the joiner's current status
@@ -2274,7 +2264,8 @@ impl Server {
                     break;
                 }
             };
-            if let Err(error) = self.queue_control_payload_to_token(token, "history_chunk", payload)
+            if let Err(error) =
+                self.queue_control_payload_to_token(token, "history_chunk", &payload)
             {
                 kvlog::warn!(
                     "history chunk send failed",
@@ -2332,7 +2323,7 @@ impl Server {
     /// without a terminal chunk would wedge its paging for the room.
     fn send_empty_history_chunk(&mut self, token: Token, room_id: RoomId) {
         let payload = history_reader::empty_chunk(room_id);
-        let _ = self.queue_control_payload_to_token(token, "history_chunk", payload);
+        let _ = self.queue_control_payload_to_token(token, "history_chunk", &payload);
     }
 
     /// Queues finished disk history pages to their sessions. Called every
@@ -2349,7 +2340,7 @@ impl Server {
             let chunk_count = reply.payloads.len();
             for (chunk_index, payload) in reply.payloads.into_iter().enumerate() {
                 if let Err(error) =
-                    self.queue_control_payload_to_token(token, "history_chunk", payload)
+                    self.queue_control_payload_to_token(token, "history_chunk", &payload)
                 {
                     kvlog::warn!(
                         "disk history chunk send failed",
@@ -2375,21 +2366,31 @@ impl Server {
         else {
             return;
         };
+        let Some(token) = self.live_token_for_session(session_id) else {
+            return;
+        };
+        if requester == peer {
+            let _ = self.send_control_to_token(
+                token,
+                &ServerControl::Error {
+                    code: control::ERROR_REQUEST_REJECTED,
+                    message: "cannot open a direct message with yourself".to_string(),
+                },
+            );
+            return;
+        }
         let peer_known = self.config.users.iter().any(|user| user.id == peer)
             || self
                 .sessions
                 .values()
                 .any(|session| session.user_id == peer)
             || self.store.dm_room_for(requester, peer).is_some();
-        let Some(token) = self.live_token_for_session(session_id) else {
-            return;
-        };
         if !peer_known {
             let _ = self.send_control_to_token(
                 token,
                 &ServerControl::Error {
                     code: control::ERROR_ROOM_NOT_FOUND,
-                    message: "user not found".to_string(),
+                    message: "room not found".to_string(),
                 },
             );
             return;
@@ -2401,7 +2402,7 @@ impl Server {
                 let _ = self.send_control_to_token(
                     token,
                     &ServerControl::Error {
-                        code: 500,
+                        code: control::ERROR_INTERNAL,
                         message: error,
                     },
                 );
@@ -2437,9 +2438,7 @@ impl Server {
                 .map(|session| session.tcp_token)
                 .filter(|token| self.clients.contains_key(token))
                 .collect();
-            for endpoint in endpoint_tokens {
-                let _ = self.send_control_to_token(endpoint, &control);
-            }
+            self.send_control_to_tokens(&endpoint_tokens, &control);
         }
         if self.live_token_for_session(session_id).is_some() {
             let _ = self.send_control_to_token(token, &ServerControl::DmOpened { room_id, peer });
@@ -2463,15 +2462,13 @@ impl Server {
             .filter(|member| *member != session_id)
             .filter_map(|member| self.live_token_for_session(member))
             .collect();
-        for token in tokens {
-            let _ = self.send_control_to_token(
-                token,
-                &ServerControl::P2pPeerGone {
-                    session_id,
-                    user_id,
-                },
-            );
-        }
+        self.send_control_to_tokens(
+            &tokens,
+            &ServerControl::P2pPeerGone {
+                session_id,
+                user_id,
+            },
+        );
     }
 
     /// Sessions currently in the room's voice call.
@@ -2709,20 +2706,20 @@ impl Server {
             chunk_size = data.len(),
             recipient_count = recipients.len()
         );
+        let control = ServerControl::FileChunk {
+            transfer_id: server_transfer_id,
+            offset,
+            data,
+        };
+        let kind = server_control_kind(&control);
+        let payload = encode_server_control(&control);
         let mut disconnected_recipients = Vec::new();
         for recipient in recipients {
             let Some(token) = self.live_token_for_session(recipient) else {
                 disconnected_recipients.push(recipient);
                 continue;
             };
-            let _ = self.send_control_to_token(
-                token,
-                &ServerControl::FileChunk {
-                    transfer_id: server_transfer_id,
-                    offset,
-                    data: data.clone(),
-                },
-            );
+            let _ = self.queue_control_payload_to_token(token, kind, &payload);
             if self.live_token_for_session(recipient).is_none() {
                 disconnected_recipients.push(recipient);
             }
@@ -2763,17 +2760,17 @@ impl Server {
             wire_bytes = upload.wire_received,
             savings_percent = wire_savings_percent(upload.original_size, upload.wire_received)
         );
-        for recipient in &upload.recipients {
-            let Some(token) = self.live_token_for_session(*recipient) else {
-                continue;
-            };
-            let _ = self.send_control_to_token(
-                token,
-                &ServerControl::FileComplete {
-                    transfer_id: upload.server_transfer_id,
-                },
-            );
-        }
+        let recipients: Vec<Token> = upload
+            .recipients
+            .iter()
+            .filter_map(|recipient| self.live_token_for_session(*recipient))
+            .collect();
+        self.send_control_to_tokens(
+            &recipients,
+            &ServerControl::FileComplete {
+                transfer_id: upload.server_transfer_id,
+            },
+        );
         Ok(())
     }
 
@@ -3510,14 +3507,31 @@ impl Server {
         control: &ServerControl,
     ) -> Result<(), String> {
         let payload = encode_server_control(control);
-        self.queue_control_payload_to_token(token, server_control_kind(control), payload)
+        self.queue_control_payload_to_token(token, server_control_kind(control), &payload)
+    }
+
+    /// Encodes the control once and queues it to every token; per-recipient
+    /// failures are logged and skipped.
+    fn send_control_to_tokens(&mut self, tokens: &[Token], control: &ServerControl) {
+        let kind = server_control_kind(control);
+        let payload = encode_server_control(control);
+        for token in tokens {
+            if let Err(error) = self.queue_control_payload_to_token(*token, kind, &payload) {
+                kvlog::warn!(
+                    "server control send failed",
+                    token = token.0,
+                    kind,
+                    error = %error
+                );
+            }
+        }
     }
 
     fn queue_control_payload_to_token(
         &mut self,
         token: Token,
         kind: &'static str,
-        payload: Vec<u8>,
+        payload: &[u8],
     ) -> Result<(), String> {
         if payload.len() > MAX_CONTROL_PAYLOAD_BYTES {
             return Err(format!("{kind} exceeds control payload limit"));
@@ -3530,7 +3544,7 @@ impl Server {
             .control
             .as_mut()
             .ok_or_else(|| "missing control cipher".to_string())?
-            .seal_next(CHANNEL_CONTROL, &payload)
+            .seal_next(CHANNEL_CONTROL, payload)
             .map_err(|error| error.to_string())?;
         frame::encode_frame(&encrypted, &mut client.write_buf)
             .map_err(|error| error.to_string())?;
@@ -3570,8 +3584,9 @@ impl Server {
             kind,
             recipient_count = tokens.len()
         );
+        let payload = encode_server_control(control);
         for token in tokens {
-            if let Err(error) = self.send_control_to_token(token, control) {
+            if let Err(error) = self.queue_control_payload_to_token(token, kind, &payload) {
                 kvlog::warn!(
                     "server control broadcast failed",
                     token = token.0,
@@ -3757,9 +3772,7 @@ impl Server {
                 .into_iter()
                 .filter_map(|session_id| self.live_token_for_session(session_id))
                 .collect();
-            for token in tokens {
-                let _ = self.send_control_to_token(token, &control);
-            }
+            self.send_control_to_tokens(&tokens, &control);
         }
     }
 
@@ -3801,6 +3814,34 @@ impl Server {
 
     fn allocate_file_name(&mut self, requested: &str) -> String {
         reserve_unique_file_name(&mut self.reserved_file_names, requested)
+    }
+
+    /// Converts a room-verb rejection into a recoverable control `Error`.
+    /// These verbs fail on state races (voice eviction, a share ending) that a
+    /// connected client cannot avoid, so they must never read as protocol
+    /// errors that tear down the connection.
+    fn report_request_outcome(
+        &mut self,
+        token: Token,
+        result: Result<(), String>,
+    ) -> Result<(), String> {
+        match result {
+            Ok(()) => Ok(()),
+            Err(message) => {
+                kvlog::warn!(
+                    "client request rejected",
+                    token = token.0,
+                    error = message.as_str()
+                );
+                self.send_control_to_token(
+                    token,
+                    &ServerControl::Error {
+                        code: control::ERROR_REQUEST_REJECTED,
+                        message,
+                    },
+                )
+            }
+        }
     }
 
     /// Reports a bug-report handler failure to the client as a non-fatal
@@ -5003,6 +5044,31 @@ mod tests {
     }
 
     #[test]
+    fn dm_open_with_self_is_rejected() {
+        let mut server = test_server();
+        let requester = SessionId(1);
+        let mut requester_peer = live_user(&mut server, Token(11), requester, UserId(1));
+
+        server.open_dm(requester, UserId(1));
+
+        let control = read_until(&mut requester_peer, |control| {
+            matches!(control, ServerControl::Error { .. })
+        });
+        let ServerControl::Error { code, .. } = control else {
+            unreachable!();
+        };
+        assert_eq!(code, control::ERROR_REQUEST_REJECTED);
+        assert!(server.store.dm_rooms().is_empty());
+        assert!(
+            server
+                .rooms
+                .values()
+                .all(|room| !matches!(room.access, RoomAccess::Dm(..))),
+            "a self dm room must not be created"
+        );
+    }
+
+    #[test]
     fn dm_room_survives_restart() {
         let dir = std::env::temp_dir().join(format!("chatt-dm-restart-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -5388,6 +5454,77 @@ mod tests {
             }
         ));
         assert_no_control(&mut idler_peer);
+    }
+
+    #[test]
+    fn share_rejection_answers_error_without_disconnect() {
+        let mut server = test_server();
+        let session = SessionId(1);
+        let token = Token(11);
+        let mut peer = live_user(&mut server, token, session, UserId(1));
+        server.clients.get_mut(&token).unwrap().session_id = Some(session);
+
+        let result = server.handle_control(
+            token,
+            ClientControl::StartShare {
+                room_id: RoomId(1),
+                codec: "avc1.42c01f".to_string(),
+                coded_width: 1280,
+                coded_height: 720,
+                annexb: true,
+                extradata: Vec::new(),
+            },
+        );
+
+        assert_eq!(
+            result,
+            Ok(()),
+            "rejection must not read as a protocol error"
+        );
+        assert!(
+            server.clients.contains_key(&token),
+            "the connection must survive the rejection"
+        );
+        let control = read_until(&mut peer, |control| {
+            matches!(control, ServerControl::Error { .. })
+        });
+        let ServerControl::Error { code, .. } = control else {
+            unreachable!();
+        };
+        assert_eq!(code, control::ERROR_REQUEST_REJECTED);
+        assert!(server.streams.is_empty());
+    }
+
+    #[test]
+    fn rejoining_the_active_voice_room_replays_nothing() {
+        let mut server = test_server();
+        let room_id = RoomId(1);
+        let joiner = SessionId(1);
+        let owner = SessionId(2);
+        let mut joiner_peer = live_user(&mut server, Token(11), joiner, UserId(1));
+        let _owner_peer = live_user(&mut server, Token(22), owner, UserId(2));
+        server.sessions.get_mut(&owner).unwrap().voice_room = Some(room_id);
+        server.ensure_voice_stream(owner, room_id).unwrap();
+        server
+            .start_share(
+                owner,
+                room_id,
+                "avc1.42c01f".to_string(),
+                1280,
+                720,
+                true,
+                Vec::new(),
+            )
+            .unwrap();
+
+        server.join_voice(joiner, room_id);
+        read_until(&mut joiner_peer, |control| {
+            matches!(control, ServerControl::VoiceStatus { .. })
+        });
+
+        server.join_voice(joiner, room_id);
+
+        assert_no_control(&mut joiner_peer);
     }
 
     #[test]
