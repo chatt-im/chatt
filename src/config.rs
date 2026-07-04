@@ -1504,7 +1504,7 @@ path = "assets/sample-001.opus"
             "[audio]\n",
             "input-buffer = \"default\" # keep me\n",
             "\n",
-            "[bindings.compose]\n",
+            "[bindings.insert]\n",
             "\"C-x\" = \"Quit\"\n",
         );
         let arena = Arena::new();
@@ -1512,7 +1512,7 @@ path = "assets/sample-001.opus"
         let content = config.runtime_toml(existing).unwrap();
 
         assert!(content.contains("# keep me"));
-        assert!(content.contains("[bindings.compose]"));
+        assert!(content.contains("[bindings.insert]"));
         assert!(content.contains("\"C-x\" = \"Quit\""));
     }
 
