@@ -103,6 +103,7 @@ fn client_config(
         max_receive_bytes: LIMIT_BYTES,
         upload_rate_bytes: 0,
         candidate_privacy: CandidatePrivacy::Disabled,
+        p2p_enabled: false,
         prefer_ipv6: false,
     }
 }

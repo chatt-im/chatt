@@ -16,6 +16,7 @@ mod highlight;
 mod link;
 mod local_control;
 mod markdown;
+mod paths;
 mod room_catalog;
 mod room_history;
 mod runtime;

@@ -23,7 +23,7 @@ use crate::{
     chat_buffer::{self, LineKind},
     client_net::{TransferDirection, format_bytes},
     theme::{self, Theme},
-    tui::modes::{LobbyListFocus, RoomLayout, SettingsMode},
+    tui::modes::{LobbyListFocus, RoomLayout, SettingsMode, WelcomeMode},
     ui,
     ui::select::FuzzySelect,
 };
@@ -135,8 +135,6 @@ pub(crate) fn draw_settings_screen(
 ) {
     let capture = prepare_screen(app, buf);
     let mut screen = buf.rect();
-    let top_bar_area = screen.take_top(1);
-    draw_top_bar(top_bar_area, app, buf, capture.as_ref());
 
     refresh_key_preview_cache(app, Some(layer));
     let key_preview_height = key_preview_height(app, screen.w);
@@ -148,6 +146,7 @@ pub(crate) fn draw_settings_screen(
         screen,
         buf,
         &app.theme,
+        &app.config.bindings,
         &mut session.draft,
         &mut session.form,
         session.dirty,
@@ -157,6 +156,27 @@ pub(crate) fn draw_settings_screen(
         &session.output_items,
         &mut session.output_picker,
     );
+    draw_status(status_area, app, buf, mode, status_label, capture.as_ref());
+    draw_key_preview(key_preview_area, app, buf);
+}
+
+pub(crate) fn draw_welcome_screen(
+    app: &mut App,
+    welcome_mode: &mut WelcomeMode,
+    mode: theme::UiMode,
+    status_label: &'static str,
+    layer: LayerId,
+    buf: &mut Buffer,
+) {
+    let capture = prepare_screen(app, buf);
+    let mut screen = buf.rect();
+
+    refresh_key_preview_cache(app, Some(layer));
+    let key_preview_height = key_preview_height(app, screen.w);
+    let key_preview_area = screen.take_bottom(key_preview_height as i32);
+    let status_area = screen.take_bottom(1);
+
+    welcome_mode.draw_body(screen, app, buf);
     draw_status(status_area, app, buf, mode, status_label, capture.as_ref());
     draw_key_preview(key_preview_area, app, buf);
 }

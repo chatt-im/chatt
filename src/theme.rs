@@ -136,7 +136,7 @@ impl Theme {
             selected_focused: d
                 .with_bg_rgb(0x35, 0x3b, 0x46)
                 .with_fg_rgb(0xf0, 0xf2, 0xe8),
-            detail_panel: d.with_bg_rgb(0x18, 0x1b, 0x20),
+            detail_panel: d.with_bg_rgb(0x20, 0x24, 0x2b),
             dialog_panel: d
                 .with_bg_rgb(0x18, 0x1b, 0x20)
                 .with_fg_rgb(0xd8, 0xdb, 0xd6),
@@ -232,7 +232,7 @@ impl Theme {
             selected_focused: d
                 .with_bg_ansi(AnsiColor::Grey[7])
                 .with_fg_ansi(bright_white),
-            detail_panel: d.with_bg_ansi(AnsiColor::Grey[2]),
+            detail_panel: d.with_bg_ansi(AnsiColor::Grey[3]),
             dialog_panel: d.with_bg_ansi(AnsiColor::Grey[2]).with_fg_ansi(white),
             dialog_header: d
                 .with_bg_ansi(AnsiColor::Grey[7])
@@ -302,7 +302,7 @@ impl Theme {
             join_input_boundary_active: d.with_bg_ansi(AnsiColor::Grey[22]).with_fg_ansi(black),
             row_focused: d.with_bg_ansi(AnsiColor::Grey[27]).with_fg_ansi(black),
             selected_focused: d.with_bg_ansi(AnsiColor::Grey[23]).with_fg_ansi(black),
-            detail_panel: d.with_bg_ansi(AnsiColor::Grey[28]),
+            detail_panel: d.with_bg_ansi(AnsiColor::Grey[27]),
             dialog_panel: d.with_bg_ansi(AnsiColor::Grey[28]).with_fg_ansi(black),
             dialog_header: d.with_bg_ansi(AnsiColor::Grey[23]).with_fg_ansi(black),
             mode_server_select: d.with_bg_ansi(grey).with_fg_ansi(white),

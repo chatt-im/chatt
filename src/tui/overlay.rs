@@ -5,7 +5,7 @@ use extui::{
     },
     vt::Modifier,
 };
-use extui_bindings::{InputKey, LayerId};
+use extui_bindings::InputKey;
 use extui_editor::{Editor, Mode as EditorMode, Span as EditorSpan};
 use unicode_width::UnicodeWidthStr;
 
@@ -20,7 +20,7 @@ use crate::{
         Action,
         form::rect_contains,
         mode::{AppMode, ChromeSpec, Coverage, ModePresentation, ModeTransition, is_quit_key},
-        widgets::draw_labeled_editor_frame,
+        widgets::{RowPalette, button_label, draw_button, draw_labeled_editor_frame},
     },
 };
 
@@ -465,7 +465,7 @@ impl PasswordPromptMode {
 
         let cancel = button_label(
             "Cancel",
-            command_key_hint(
+            bindings::command_key_hint(
                 &app.config.bindings,
                 bindings::PASSWORD_LAYER,
                 BindCommand::Cancel,
@@ -473,7 +473,7 @@ impl PasswordPromptMode {
         );
         let submit = button_label(
             "Submit",
-            command_key_hint(
+            bindings::command_key_hint(
                 &app.config.bindings,
                 bindings::PASSWORD_LAYER,
                 BindCommand::SubmitPassword,
@@ -620,7 +620,7 @@ impl PasteImageUploadMode {
 
         let cancel = button_label(
             "Cancel",
-            command_key_hint(
+            bindings::command_key_hint(
                 &app.config.bindings,
                 bindings::PASTE_LAYER,
                 BindCommand::Cancel,
@@ -628,7 +628,7 @@ impl PasteImageUploadMode {
         );
         let upload = button_label(
             "Upload",
-            command_key_hint(
+            bindings::command_key_hint(
                 &app.config.bindings,
                 bindings::PASTE_LAYER,
                 BindCommand::Activate,
@@ -679,6 +679,7 @@ impl AppMode for PasteImageUploadMode {
             body.take_top(1),
             buf,
             theme,
+            RowPalette::dialog(theme),
             6,
             "Name",
             true,
@@ -794,30 +795,6 @@ fn format_size(bytes: u64) -> String {
         format!("{:.1} KB", bytes as f64 / KIB as f64)
     } else {
         format!("{bytes} B")
-    }
-}
-
-fn command_key_hint(
-    bindings: &bindings::BindingRuntime,
-    layer: LayerId,
-    target: BindCommand,
-) -> Option<String> {
-    let pending = None;
-    for reachable in bindings::reachable(bindings, layer, &pending) {
-        let bindings::ReachableKind::Action(command) = reachable.kind else {
-            continue;
-        };
-        if std::mem::discriminant(&command) == std::mem::discriminant(&target) {
-            return Some(reachable.key.to_string());
-        }
-    }
-    None
-}
-
-fn button_label(label: &str, key: Option<String>) -> String {
-    match key {
-        Some(key) => format!("{label} [{key}]"),
-        None => label.to_string(),
     }
 }
 
@@ -953,7 +930,7 @@ mod tests {
         let chrome = mode.presentation(&app).chrome.expect("dialog chrome");
         assert!(chrome.layer == bindings::PASTE_LAYER);
         assert_eq!(
-            command_key_hint(
+            bindings::command_key_hint(
                 &app.config.bindings,
                 bindings::PASTE_LAYER,
                 BindCommand::Cancel
@@ -961,7 +938,7 @@ mod tests {
             Some("Esc".to_string())
         );
         assert_eq!(
-            command_key_hint(
+            bindings::command_key_hint(
                 &app.config.bindings,
                 bindings::PASTE_LAYER,
                 BindCommand::Activate
@@ -1023,7 +1000,7 @@ mod tests {
         assert_eq!(
             button_label(
                 "Cancel",
-                command_key_hint(
+                bindings::command_key_hint(
                     &app.config.bindings,
                     bindings::PASSWORD_LAYER,
                     BindCommand::Cancel
@@ -1034,7 +1011,7 @@ mod tests {
         assert_eq!(
             button_label(
                 "Submit",
-                command_key_hint(
+                bindings::command_key_hint(
                     &app.config.bindings,
                     bindings::PASSWORD_LAYER,
                     BindCommand::SubmitPassword
@@ -1100,12 +1077,4 @@ mod tests {
         );
         assert!(app.pending_transition.is_empty());
     }
-}
-
-fn draw_button(area: Rect, buf: &mut Buffer, style: extui::Style, label: &str) {
-    area.with(style).fill(buf);
-    area.with(style)
-        .with(HAlign::Center)
-        .with(Ellipsis(true))
-        .text(buf, label);
 }

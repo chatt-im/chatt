@@ -1,5 +1,6 @@
-# Default chatt configuration. User configuration is loaded from
-# ~/.config/chatt.toml unless --config or CHATT_CONFIG is provided.
+# Default chatt configuration. User configuration is loaded from the platform
+# config directory, e.g. ~/.config/chatt/client.toml on Linux, unless --config
+# or CHATT_CONFIG is provided.
 
 # Program (and fixed arguments) used to open a clicked chat URL. The URL is
 # appended as the final argument. Defaults to the platform launcher: "open" on
@@ -51,16 +52,17 @@ max-composer-height = 6
 placeholder = "Message #lobby"
 max-messages = 50000
 overscan = 24
-form-bindings = "vim"
+default-bindings = "standard"
 # Color theme: "tomorrow-night", "base16-dark", or "base16-light".
 theme = "tomorrow-night"
 
 [files]
 max-upload-bytes = 52428800
 max-receive-bytes = 52428800
-receive-dir = "/tmp/tchat2"
+receive-dir = ""
 
 [p2p]
+enabled = false
 # How local host candidates are exposed to peers.
 #   mdns     publish host candidates as random `.local` names resolved via mDNS (default)
 #   disabled publish host candidates as literal IP addresses
@@ -69,6 +71,9 @@ candidate-privacy = "mdns"
 # Prefer native IPv6 over IPv4 at equal candidate type (RFC 8421). Set false to
 # revert to IPv4-first for diagnostics.
 prefer-ipv6 = true
+
+[history]
+enabled = false
 
 [web]
 # Automatically play newly received videos. `true` autoplays muted; use
@@ -207,7 +212,6 @@ inherit = ["list"]
 "RIGHT" = "AdjustRight"
 "ENTER" = "Activate"
 "r" = "RefreshDevices"
-"w" = "SaveSettings"
 "C-s" = "SaveSettings"
 "." = "ToggleKeyPreview"
 

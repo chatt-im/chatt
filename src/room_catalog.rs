@@ -1,6 +1,6 @@
 //! Per-server local room catalog.
 //!
-//! One TOML file per server (`<data_dir>/chatt/<history_id>/rooms.toml`)
+//! One TOML file per server (`<data-dir>/<history-id>/rooms.toml`)
 //! remembers every room the client has seen — id, name, kind, read watermark —
 //! plus the last viewed and last voice rooms. It is what makes room names and
 //! navigation available offline, alongside the per-room `room-<id>.kvlog`

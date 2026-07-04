@@ -14,6 +14,7 @@ use crate::{
     bindings::BindingRuntime,
     client_net::ClientConfig,
     config_diagnostics::{self, Diag},
+    paths,
 };
 use rpc::control::DEFAULT_FILE_SIZE_LIMIT_BYTES;
 
@@ -76,6 +77,7 @@ impl ServerEntry {
             max_upload_bytes: files.max_upload_bytes,
             max_receive_bytes: files.max_receive_bytes,
             upload_rate_bytes: files.upload_rate_bytes,
+            p2p_enabled: p2p.enabled,
             candidate_privacy: p2p.candidate_privacy,
             prefer_ipv6: p2p.prefer_ipv6,
         }
@@ -296,7 +298,7 @@ pub struct UiConfig {
     #[toml(default = 24)]
     pub overscan: u32,
     #[toml(default)]
-    pub form_bindings: FormBindings,
+    pub default_bindings: DefaultBindings,
     #[toml(default)]
     pub theme: ThemeChoice,
 }
@@ -335,7 +337,7 @@ impl Default for UiConfig {
             placeholder: default_placeholder(),
             max_messages: 50_000,
             overscan: 24,
-            form_bindings: FormBindings::Vim,
+            default_bindings: DefaultBindings::Standard,
             theme: ThemeChoice::default(),
         }
     }
@@ -343,11 +345,13 @@ impl Default for UiConfig {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Toml)]
 #[toml(FromToml, ToToml, rename_all = "kebab-case")]
-pub enum FormBindings {
-    Standard,
+pub enum DefaultBindings {
     #[default]
+    Standard,
     Vim,
 }
+
+pub use DefaultBindings as FormBindings;
 
 /// Default upload pacing ceiling. `0` disables throttling: uploads stream at
 /// full socket speed.
@@ -404,6 +408,8 @@ pub enum CandidatePrivacy {
 #[toml(FromToml, ToToml, rename_all = "kebab-case")]
 pub struct P2pConfig {
     #[toml(default)]
+    pub enabled: bool,
+    #[toml(default)]
     pub candidate_privacy: CandidatePrivacy,
     /// Prefer native IPv6 over IPv4 at equal candidate type (RFC 8421). Set
     /// `false` to revert to IPv4-first for diagnostics.
@@ -414,15 +420,10 @@ pub struct P2pConfig {
 impl Default for P2pConfig {
     fn default() -> Self {
         Self {
+            enabled: false,
             candidate_privacy: CandidatePrivacy::default(),
             prefer_ipv6: true,
         }
-    }
-}
-
-impl P2pConfig {
-    pub fn is_default(&self) -> bool {
-        *self == P2pConfig::default()
     }
 }
 
@@ -517,6 +518,13 @@ pub struct NotificationConfig {
     pub peer_join_volume_db: f32,
     #[toml(default)]
     pub peer_leave_volume_db: f32,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Toml)]
+#[toml(FromToml, ToToml, rename_all = "kebab-case")]
+pub struct HistoryConfig {
+    #[toml(default)]
+    pub enabled: bool,
 }
 
 impl Default for NotificationConfig {
@@ -657,8 +665,10 @@ pub struct Config {
     pub ui: UiConfig,
     #[toml(default, style = Header)]
     pub files: FileConfig,
-    #[toml(default, style = Header, ToToml skip_if = P2pConfig::is_default)]
+    #[toml(default, style = Header)]
     pub p2p: P2pConfig,
+    #[toml(default, style = Header)]
+    pub history: HistoryConfig,
     #[toml(default, style = Header, ToToml skip_if = WebConfig::is_default)]
     pub web: WebConfig,
     #[toml(default, style = Header, ToToml skip_if = NotificationConfig::is_default)]
@@ -698,6 +708,11 @@ struct LoadOutcome {
     diagnostics: Vec<Diag>,
 }
 
+pub(crate) enum AppConfigLoad {
+    Existing(Config),
+    Missing(Config),
+}
+
 impl Config {
     /// Loads and validates the config file, rendering diagnostics to stderr.
     ///
@@ -723,16 +738,45 @@ impl Config {
         }
     }
 
+    /// Loads config for interactive app startup. A missing file is not an
+    /// error here: it means the first-run welcome flow must collect the
+    /// user's privacy and storage choices before the app continues.
+    pub fn load_for_app(path: Option<&str>) -> Result<AppConfigLoad, String> {
+        let config_path = resolve_config_path(path)
+            .ok_or_else(|| "HOME is not set; cannot determine config path".to_string())?;
+        match fs::read_to_string(&config_path) {
+            Ok(content) => {
+                let outcome = Self::collect_content(
+                    content,
+                    config_path.display().to_string(),
+                    Some(config_path),
+                )?;
+                config_diagnostics::render(&outcome.source, &outcome.content, &outcome.diagnostics);
+                let errors = outcome.diagnostics.iter().filter(|diag| diag.error).count();
+                match outcome.config {
+                    Some(config) if errors == 0 => Ok(AppConfigLoad::Existing(config)),
+                    _ => Err(format!(
+                        "invalid configuration: {errors} error(s) in {}",
+                        outcome.source
+                    )),
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let mut config = Config::default();
+                config.config_path = Some(config_path);
+                Ok(AppConfigLoad::Missing(config))
+            }
+            Err(error) => Err(format!("failed to read {}: {error}", config_path.display())),
+        }
+    }
+
     /// Reads, parses, and validates the config, accumulating diagnostics.
     ///
     /// This is the pure half of [`Config::load`]: it performs no rendering so
     /// tests can inspect the diagnostics directly. `Err` is reserved for a file
     /// that cannot be read, where there is no source to annotate.
     fn collect(path: Option<&str>) -> Result<LoadOutcome, String> {
-        let config_path = path
-            .map(PathBuf::from)
-            .or_else(|| std::env::var_os("CHATT_CONFIG").map(PathBuf::from))
-            .or_else(default_config_path);
+        let config_path = resolve_config_path(path);
 
         let (content, source) = if let Some(path) = &config_path {
             let content = fs::read_to_string(path)
@@ -742,6 +786,14 @@ impl Config {
             (DEFAULT_CONFIG.to_string(), "<embedded default>".to_string())
         };
 
+        Self::collect_content(content, source, config_path)
+    }
+
+    fn collect_content(
+        content: String,
+        source: String,
+        config_path: Option<PathBuf>,
+    ) -> Result<LoadOutcome, String> {
         let arena = Arena::new();
         let mut doc = toml_spanner::parse_recoverable(&content, &arena);
         let udp_addr_configured = server_udp_addr_configured(&doc);
@@ -1002,7 +1054,7 @@ impl Config {
         let path = self
             .config_path
             .clone()
-            .or_else(user_config_path)
+            .or_else(paths::client_config_path)
             .ok_or_else(|| "HOME is not set; cannot determine config path".to_string())?;
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)
@@ -1071,13 +1123,8 @@ pub fn value_arg(args: &[String], key: &str) -> Option<String> {
         .find_map(|window| (window[0] == key).then(|| window[1].clone()))
 }
 
-fn default_config_path() -> Option<PathBuf> {
-    let explicit = std::env::var_os("CHATT_CONFIG").map(PathBuf::from);
-    if explicit.is_some() {
-        return explicit;
-    }
-    let user = user_config_path()?;
-    user.exists().then_some(user)
+fn resolve_config_path(path: Option<&str>) -> Option<PathBuf> {
+    path.map(PathBuf::from).or_else(paths::client_config_path)
 }
 
 fn default_server_alias() -> String {
@@ -1111,10 +1158,6 @@ fn server_udp_addr_configured(doc: &toml_spanner::Document<'_>) -> Vec<bool> {
                 .collect()
         })
         .unwrap_or_default()
-}
-
-fn user_config_path() -> Option<PathBuf> {
-    std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config/chatt.toml"))
 }
 
 fn non_empty_string(value: &str) -> Option<String> {
@@ -1344,6 +1387,27 @@ path = "assets/sample-001.opus"
     }
 
     #[test]
+    fn load_for_app_missing_returns_first_run_config() {
+        let path = std::env::temp_dir().join(format!(
+            "chatt-missing-client-config-{}.toml",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+
+        let loaded = Config::load_for_app(Some(path.to_str().unwrap())).unwrap();
+        let AppConfigLoad::Missing(config) = loaded else {
+            panic!("missing config should request first-run setup");
+        };
+
+        assert_eq!(config.config_path.as_deref(), Some(path.as_path()));
+        assert_eq!(config.ui.default_bindings, DefaultBindings::Standard);
+        assert_eq!(config.ui.theme, ThemeChoice::TomorrowNight);
+        assert!(!config.p2p.enabled);
+        assert!(!config.history.enabled);
+        assert!(config.files.receive_dir.is_empty());
+    }
+
+    #[test]
     fn unknown_key_warns_but_loads() {
         let outcome = collect_from("unknown-key", "totally-unknown-key = 7\n");
         assert!(outcome.config.is_some());
@@ -1380,6 +1444,17 @@ path = "assets/sample-001.opus"
         assert!(content.contains("[[servers]]"));
         assert!(!content.contains("active-server"));
         assert!(!content.contains("pairing-code"));
+    }
+
+    #[test]
+    fn runtime_config_writes_first_run_defaults() {
+        let content = render_runtime(&Config::default());
+
+        assert!(content.contains("default-bindings = \"standard\""));
+        assert!(content.contains("[p2p]\nenabled = false"));
+        assert!(content.contains("[history]\nenabled = false"));
+        assert!(content.contains("receive-dir = \"\""));
+        assert!(!content.contains("form-bindings"));
     }
 
     #[test]

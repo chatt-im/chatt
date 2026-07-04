@@ -2,13 +2,14 @@ use crate::audio::{DenoiseConfig, DredConfig};
 use crate::config::{FormBindings, ThemeChoice};
 use crate::{
     audio::StatsSnapshot,
+    bindings::{self, BindCommand, BindingRuntime},
     settings::{
         AudioDeviceItem, AudioDevicePickerState, AudioInputItem, AudioInputPickerState,
         AudioOutputItem, AudioOutputPickerState, BITRATES, DENOISE_RELEASE_LABELS,
         DENOISE_RELEASES, DENOISE_SUPPRESSION_LABELS, DENOISE_SUPPRESSIONS,
         DENOISE_TYPING_VAD_LABELS, DENOISE_TYPING_VAD_THRESHOLDS, MAX_AMPLIFICATIONS,
-        NOTIFICATION_VOLUMES_DB, SettingsDraft, buffer_field_error, form_bindings_label,
-        raw_device_error, raw_device_selection, selected_audio_input_label,
+        NOTIFICATION_VOLUMES_DB, SettingsDraft, buffer_field_error, download_path_error,
+        form_bindings_label, raw_device_error, raw_device_selection, selected_audio_input_label,
         selected_audio_output_label, volume_db_label, web_bind_error,
     },
     theme::Theme,
@@ -76,6 +77,7 @@ pub(crate) enum SettingsButton {
     Refresh,
     Save,
     Close,
+    Exit,
 }
 
 /// What the focused field did this logic pass, applied by the app layer.
@@ -99,9 +101,42 @@ enum FocusDetail {
 
 struct SettingsForm<'a> {
     form: CoreForm<'a>,
-    dirty: bool,
+    action_labels: &'a SettingsActionLabels,
     detail: Option<FocusDetail>,
     output: SettingsOutput,
+}
+
+struct SettingsActionLabels {
+    refresh: String,
+    save: String,
+    close: String,
+    exit: String,
+}
+
+impl SettingsActionLabels {
+    fn new(bindings: &BindingRuntime, dirty: bool) -> Self {
+        Self {
+            refresh: action_label(bindings, "Refresh devices", BindCommand::RefreshDevices),
+            save: action_label(
+                bindings,
+                if dirty {
+                    "Save config *"
+                } else {
+                    "Save config"
+                },
+                BindCommand::SaveSettings,
+            ),
+            close: action_label(bindings, "Back to chat", BindCommand::CloseSettings),
+            exit: action_label(bindings, "Exit", BindCommand::Quit),
+        }
+    }
+}
+
+fn action_label(bindings: &BindingRuntime, label: &str, command: BindCommand) -> String {
+    widgets::button_label(
+        label,
+        bindings::command_key_hint(bindings, bindings::SETTINGS_LAYER, command),
+    )
 }
 
 impl<'a> SettingsForm<'a> {
@@ -109,6 +144,7 @@ impl<'a> SettingsForm<'a> {
         state: &'a mut FormState<FieldId>,
         buf: Option<&'a mut Buffer>,
         theme: &'a Theme,
+        action_labels: &'a SettingsActionLabels,
         dirty: bool,
         intent: FieldIntent,
         commit: Option<(FieldId, String)>,
@@ -117,7 +153,7 @@ impl<'a> SettingsForm<'a> {
         Self {
             form: CoreForm::new(state, buf, theme, dirty, intent, commit, focus_column)
                 .with_label_width(LABEL_WIDTH),
-            dirty,
+            action_labels,
             detail: None,
             output: SettingsOutput::default(),
         }
@@ -282,31 +318,37 @@ impl<'a> SettingsForm<'a> {
         self.form.respond(focused, false)
     }
 
-    /// The trailing action-button row (Refresh / Save / Close). Buttons share a
+    /// The trailing action-button row. Buttons share a
     /// virtual row so left/right moves between them.
     fn actions(&mut self) {
         let specs = [
             ActionButton {
-                key: "Refresh",
-                label: "Refresh devices",
-                value: SettingsButton::Refresh,
-                help: "Re-scan audio devices using the current buffer requests.",
+                key: "Exit",
+                label: &self.action_labels.exit,
+                value: SettingsButton::Exit,
+                help: "Close chatt.",
+                primary: false,
             },
             ActionButton {
-                key: "Save",
-                label: if self.dirty {
-                    "Save config *"
-                } else {
-                    "Save config"
-                },
-                value: SettingsButton::Save,
-                help: "Persist the draft to chatt.toml.",
+                key: "Refresh",
+                label: &self.action_labels.refresh,
+                value: SettingsButton::Refresh,
+                help: "Re-scan audio devices using the current buffer requests.",
+                primary: false,
             },
             ActionButton {
                 key: "Close",
-                label: "Back to chat",
+                label: &self.action_labels.close,
                 value: SettingsButton::Close,
                 help: "Return to chat without saving further changes.",
+                primary: false,
+            },
+            ActionButton {
+                key: "Save",
+                label: &self.action_labels.save,
+                value: SettingsButton::Save,
+                help: "Persist the draft to chatt.toml.",
+                primary: true,
             },
         ];
         let response = self.form.actions(&specs);
@@ -592,14 +634,14 @@ fn settings_ui(
     form.section("Interface Settings");
     if form
         .choice_value(
-            "Form Bindings",
+            "Default Bindings",
             &mut draft.form_bindings,
             &[FormBindings::Standard, FormBindings::Vim],
             |bindings| form_bindings_label(bindings).to_string(),
         )
         .is_focus()
     {
-        form.set_help("Keyboard model used by forms such as settings and server editing.");
+        form.set_help("Keyboard model used by editable controls throughout the interface.");
     }
     if form
         .choice_value("Theme", &mut draft.theme, &ThemeChoice::ALL, |theme| {
@@ -610,7 +652,40 @@ fn settings_ui(
         form.set_help("Color theme for the interface. Applies immediately; Save persists it.");
     }
 
-    form.section("Actions");
+    form.section("Privacy And Storage");
+    if form.checkbox("P2P", &mut draft.p2p_enabled).is_focus() {
+        form.set_help(
+            "Direct peer media can reduce latency, but may expose your IP address to other users in a voice room.",
+        );
+    }
+    if form
+        .checkbox("Accept Downloads", &mut draft.accept_downloads)
+        .is_focus()
+    {
+        form.set_help(
+            "Allows incoming files up to the default 50 MB receive limit. The limit can be changed in the config file.",
+        );
+    }
+    let accept_downloads = draft.accept_downloads;
+    if accept_downloads
+        && form
+            .text("Download Path", &mut draft.download_path, |value| {
+                download_path_error(accept_downloads, value)
+            })
+            .is_focus()
+    {
+        form.set_help("Directory where accepted files are saved.");
+    }
+    if form
+        .checkbox("Chat Persistence", &mut draft.history_enabled)
+        .is_focus()
+    {
+        form.set_help(
+            "Stores local room catalogs and chat logs under the chatt data directory for offline browsing.",
+        );
+    }
+
+    form.form.spacer(1);
     form.actions();
 }
 
@@ -634,6 +709,7 @@ pub(crate) fn settings_logic(
     state: &mut FormState<FieldId>,
     draft: &mut SettingsDraft,
     theme: &Theme,
+    bindings: &BindingRuntime,
     dirty: bool,
     intent: FieldIntent,
     commit: Option<(FieldId, String)>,
@@ -645,7 +721,17 @@ pub(crate) fn settings_logic(
 ) -> SettingsOutput {
     let viewport = state.viewport();
     state.begin_frame(viewport);
-    let mut form = SettingsForm::new(state, None, theme, dirty, intent, commit, focus_column);
+    let action_labels = SettingsActionLabels::new(bindings, dirty);
+    let mut form = SettingsForm::new(
+        state,
+        None,
+        theme,
+        &action_labels,
+        dirty,
+        intent,
+        commit,
+        focus_column,
+    );
     settings_ui(
         &mut form,
         draft,
@@ -664,6 +750,7 @@ pub fn draw_settings(
     area: Rect,
     buf: &mut Buffer,
     theme: &Theme,
+    bindings: &BindingRuntime,
     settings: &mut SettingsDraft,
     form: &mut FormState<FieldId>,
     dirty: bool,
@@ -696,8 +783,17 @@ pub fn draw_settings(
     }
     form.begin_frame(body);
     let focus_detail = {
-        let mut context =
-            SettingsForm::new(form, Some(buf), theme, dirty, FieldIntent::None, None, None);
+        let action_labels = SettingsActionLabels::new(bindings, dirty);
+        let mut context = SettingsForm::new(
+            form,
+            Some(buf),
+            theme,
+            &action_labels,
+            dirty,
+            FieldIntent::None,
+            None,
+            None,
+        );
         settings_ui(
             &mut context,
             settings,

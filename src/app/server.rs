@@ -14,7 +14,6 @@ use crate::{
 
 const LABEL_WIDTH: u16 = 12;
 const SERVER_SECTION: &str = "Server";
-const ACTIONS_SECTION: &str = "Actions";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ServerEditButton {
@@ -25,7 +24,7 @@ enum ServerEditButton {
 
 const ACTIONS: [ActionButton<'static, ServerEditButton>; 3] = [
     ActionButton::new("Save", ServerEditButton::Save),
-    ActionButton::new("Save and join", ServerEditButton::SaveJoin),
+    ActionButton::primary("Save and join", ServerEditButton::SaveJoin),
     ActionButton::new("Cancel", ServerEditButton::Cancel),
 ];
 
@@ -310,7 +309,7 @@ fn server_edit_ui(form: &mut Form, values: ServerEditValues<'_>) -> Option<Serve
     form.text("TCP", values.tcp_addr, |_| None);
     form.text("UDP", values.udp_addr, |_| None);
     form.text("Probe", values.udp_probe_addr, |_| None);
-    form.section(ACTIONS_SECTION);
+    form.spacer(1);
     form.actions(&ACTIONS).activated
 }
 

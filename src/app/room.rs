@@ -691,6 +691,17 @@ impl RoomSession {
         &self.history_id
     }
 
+    pub(crate) fn disable_history(&mut self) {
+        self.history_id.clear();
+        self.active.history = None;
+        for room in self.parked.values_mut() {
+            room.history = None;
+        }
+        for room in self.archived_rooms.values_mut() {
+            room.history = None;
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn preview_volume_for_test(&self) -> Option<(UserId, f32)> {
         self.volume_preview

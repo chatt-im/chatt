@@ -4,9 +4,10 @@ use crate::{
         AudioConfig, AudioLatencyConfig, BufferSize, DEFAULT_DENOISE_RELEASE,
         DEFAULT_DENOISE_SUPPRESSION, DEFAULT_DENOISE_TYPING_VAD_ENTER,
         DEFAULT_DENOISE_TYPING_VAD_RELEASE, DEFAULT_INPUT_BUFFER_SAMPLES,
-        DEFAULT_MAX_AMPLIFICATION, DEFAULT_OUTPUT_BUFFER_SAMPLES, FormBindings, NotificationConfig,
-        ThemeChoice, WebAutoplay, WebConfig,
+        DEFAULT_MAX_AMPLIFICATION, DEFAULT_OUTPUT_BUFFER_SAMPLES, FileConfig, FormBindings,
+        HistoryConfig, NotificationConfig, P2pConfig, ThemeChoice, WebAutoplay, WebConfig,
     },
+    paths,
     ui::select::{FuzzySelect, SelectableItem},
 };
 
@@ -71,6 +72,10 @@ pub struct SettingsDraft {
     pub(crate) peer_leave_notification_volume_index: usize,
     pub(crate) form_bindings: FormBindings,
     pub(crate) theme: ThemeChoice,
+    pub(crate) p2p_enabled: bool,
+    pub(crate) accept_downloads: bool,
+    pub(crate) download_path: String,
+    pub(crate) history_enabled: bool,
     pub(crate) denoise: DenoiseConfig,
     pub(crate) dred: DredConfig,
     pub(crate) echo_cancellation: bool,
@@ -128,6 +133,10 @@ impl SettingsDraft {
             peer_leave_notification_volume_index: notification_volume_index(0.0),
             form_bindings: FormBindings::Standard,
             theme: ThemeChoice::default(),
+            p2p_enabled: P2pConfig::default().enabled,
+            accept_downloads: false,
+            download_path: default_download_path_text(),
+            history_enabled: HistoryConfig::default().enabled,
             denoise: config.denoise,
             dred: config.dred,
             echo_cancellation: config.echo_cancellation,
@@ -158,6 +167,23 @@ impl SettingsDraft {
 
     pub fn set_theme_from_config(&mut self, theme: ThemeChoice) {
         self.theme = theme;
+    }
+
+    pub fn set_files_from_config(&mut self, files: &FileConfig) {
+        self.accept_downloads = files.receive_dir_path().is_some();
+        self.download_path = if files.receive_dir.trim().is_empty() {
+            default_download_path_text()
+        } else {
+            files.receive_dir.clone()
+        };
+    }
+
+    pub fn set_p2p_from_config(&mut self, p2p: &P2pConfig) {
+        self.p2p_enabled = p2p.enabled;
+    }
+
+    pub fn set_history_from_config(&mut self, history: &HistoryConfig) {
+        self.history_enabled = history.enabled;
     }
 
     pub fn theme(&self) -> ThemeChoice {
@@ -204,6 +230,28 @@ impl SettingsDraft {
 
     pub fn form_bindings(&self) -> FormBindings {
         self.form_bindings
+    }
+
+    pub fn to_files(&self, previous: &FileConfig) -> FileConfig {
+        let mut files = previous.clone();
+        files.receive_dir = if self.accept_downloads {
+            self.download_path.trim().to_string()
+        } else {
+            String::new()
+        };
+        files
+    }
+
+    pub fn to_p2p(&self, previous: &P2pConfig) -> P2pConfig {
+        let mut p2p = previous.clone();
+        p2p.enabled = self.p2p_enabled;
+        p2p
+    }
+
+    pub fn to_history(&self) -> HistoryConfig {
+        HistoryConfig {
+            enabled: self.history_enabled,
+        }
     }
 
     pub fn input_selection(&self) -> Option<&str> {
@@ -255,6 +303,7 @@ impl SettingsDraft {
     pub fn settings_text_invalid(&self) -> Option<String> {
         self.device_string_invalid()
             .or_else(|| web_bind_error(&self.web_bind))
+            .or_else(|| download_path_error(self.accept_downloads, &self.download_path))
     }
 
     /// Reason the rnnoise-tuning rows are inert, or `None` when they apply. The
@@ -324,6 +373,20 @@ pub fn form_bindings_label(value: FormBindings) -> &'static str {
     match value {
         FormBindings::Standard => "Standard",
         FormBindings::Vim => "Vim",
+    }
+}
+
+pub fn default_download_path_text() -> String {
+    paths::default_download_dir()
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|| "files".to_string())
+}
+
+pub fn download_path_error(enabled: bool, value: &str) -> Option<String> {
+    if enabled && value.trim().is_empty() {
+        Some("download path cannot be empty while downloads are accepted".to_string())
+    } else {
+        None
     }
 }
 

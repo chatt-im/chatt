@@ -8,7 +8,7 @@ use std::{
 use crate::{
     app::{App, PendingJoin},
     config::Config,
-    tui::{Action, mode_stack::ModeStack},
+    tui::{Action, mode_stack::ModeStack, modes::WelcomeMode},
 };
 use extui::{
     Buffer, Terminal, TerminalFlags,
@@ -23,8 +23,28 @@ pub(crate) fn run_app(
     config: Config,
     pending_join: Option<PendingJoin>,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    run_app_inner(config, pending_join, false)
+}
+
+pub(crate) fn run_app_with_welcome(
+    config: Config,
+    pending_join: Option<PendingJoin>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    run_app_inner(config, pending_join, true)
+}
+
+fn run_app_inner(
+    config: Config,
+    mut pending_join: Option<PendingJoin>,
+    show_welcome: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
     install_panic_hook();
-    let mut app = App::new(config, pending_join)?;
+    let startup_pending = if show_welcome {
+        None
+    } else {
+        pending_join.take()
+    };
+    let mut app = App::new(config, startup_pending)?;
     event::polling::initialize_global_waker(GlobalWakerConfig {
         resize: true,
         termination: true,
@@ -53,7 +73,12 @@ pub(crate) fn run_app(
     let mut url_opener = crate::url_open::UrlOpener::new(app.config.url_open.clone());
     let stdin = std::io::stdin();
 
-    let mut mode_stack = ModeStack::new(app.base_mode(), &mut app);
+    let root_mode: Box<dyn crate::tui::mode::AppMode> = if show_welcome {
+        Box::new(WelcomeMode::new(&app, pending_join))
+    } else {
+        app.base_mode()
+    };
+    let mut mode_stack = ModeStack::new(root_mode, &mut app);
 
     loop {
         while let Some(event) = app.next_event() {
@@ -98,6 +123,9 @@ pub(crate) fn run_app(
                 _ => {}
             }
             mode_stack.apply_pending(&mut app);
+            if app.take_quit_requested() {
+                return Ok(());
+            }
         }
 
         if let Some(text) = app.room.take_pending_clipboard() {

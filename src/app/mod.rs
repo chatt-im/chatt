@@ -50,6 +50,7 @@ use crate::{
         DeviceAction, DeviceSide, FieldId, FieldIntent, SettingsButton, SettingsOutput,
         capture_device_id, playback_device_id,
     },
+    ui::welcome::WelcomeDraft,
 };
 
 use chatt::audio::{
@@ -349,6 +350,8 @@ pub(crate) struct App {
     /// configured server matched. Cleared once the client connects, disconnects,
     /// or cancels the pairing.
     pub join_notice: Option<String>,
+    pending_after_welcome: Option<PendingJoin>,
+    quit_requested: bool,
     pub pending_audio_apply: Option<PendingAudioApply>,
     /// When `true`, the lobby shows the detailed developer voice stats instead of
     /// the collapsed per-participant latency estimate. Toggled by `/stats`,
@@ -948,6 +951,8 @@ impl App {
             encoder_profile: LiveEncoderProfile::DRED_20,
             last_network_notice: None,
             join_notice: None,
+            pending_after_welcome: None,
+            quit_requested: false,
             pending_audio_apply: None,
             lobby_details: false,
             server_rtt_ms: None,
@@ -969,16 +974,67 @@ impl App {
             config,
         };
         app.rebuild_server_items();
-        match pending_join {
-            Some(PendingJoin::Invite(ticket)) => app.start_join_pairing(ticket),
-            Some(PendingJoin::Open { addr }) => app.start_open_pairing(addr),
-            Some(PendingJoin::Named { specifier }) => app.start_named_join(specifier),
-            None if app.config.servers.is_empty() => {
-                app.set_status("no servers configured; run chatt pair <server>");
-            }
-            None => {}
+        if let Some(pending) = pending_join {
+            app.start_pending_join(pending);
+        } else if app.config.servers.is_empty() {
+            app.set_status("no servers configured; run chatt pair <server>");
         }
         Ok(app)
+    }
+
+    fn start_pending_join(&mut self, pending: PendingJoin) {
+        match pending {
+            PendingJoin::Invite(ticket) => self.start_join_pairing(ticket),
+            PendingJoin::Open { addr } => self.start_open_pairing(addr),
+            PendingJoin::Named { specifier } => self.start_named_join(specifier),
+        }
+    }
+
+    pub(crate) fn finish_welcome(&mut self, pending_join: Option<PendingJoin>) {
+        self.pending_after_welcome = pending_join;
+        self.request_mode_transition(ModeTransition::Set(self.base_mode()));
+    }
+
+    pub(crate) fn request_quit(&mut self) {
+        self.quit_requested = true;
+    }
+
+    pub(crate) fn take_quit_requested(&mut self) -> bool {
+        let requested = self.quit_requested;
+        self.quit_requested = false;
+        requested
+    }
+
+    pub(crate) fn save_welcome(&mut self, draft: &WelcomeDraft) -> bool {
+        if let Some(reason) = draft.invalid() {
+            self.set_error(format!("not saved: {reason}"));
+            return false;
+        }
+        draft.apply_to_config(&mut self.config);
+        self.theme = Theme::from_choice(self.config.ui.theme);
+        self.room.apply_theme(&self.theme);
+        match self.config.save_runtime() {
+            Ok(path) => {
+                self.config.config_path = Some(path.clone());
+                self.room.set_max_messages(self.config.ui.max_messages);
+                self.set_status(format!("setup saved to {}", path.display()));
+                true
+            }
+            Err(error) => {
+                self.set_error(error);
+                false
+            }
+        }
+    }
+
+    fn start_pending_after_welcome(&mut self) {
+        let Some(pending) = self.pending_after_welcome.take() else {
+            return;
+        };
+        self.start_pending_join(pending);
+        if self.network.is_some() && self.pending_transition.is_empty() {
+            self.request_mode_transition(ModeTransition::Set(Box::new(RoomMode::default())));
+        }
     }
 
     pub(crate) fn next_event(&mut self) -> Option<AppEvent> {
@@ -1316,7 +1372,7 @@ impl App {
             self.set_error(format!("server {label} is not configured"));
             return None;
         };
-        let draft = ServerEditDraft::from_server(&server, self.config.ui.form_bindings);
+        let draft = ServerEditDraft::from_server(&server, self.config.ui.default_bindings);
         Some((server.label, draft))
     }
 
@@ -1355,13 +1411,17 @@ impl App {
                     None
                 }
             };
-        let history_id = crate::room_history::derive_server_id(&server.token);
+        let history_id = if self.config.history.enabled {
+            crate::room_history::derive_server_id(&server.token)
+        } else {
+            String::new()
+        };
         let continuity = self.room.connect_to_server(
             server.label.clone(),
             history_id.clone(),
             server.effective_display_name(),
         );
-        if continuity == room::ServerContinuity::NewServer {
+        if self.config.history.enabled && continuity == room::ServerContinuity::NewServer {
             let catalog = crate::room_catalog::load(&history_id);
             self.room.load_offline_catalog(&catalog, self.user_id);
         }
@@ -1550,7 +1610,7 @@ impl App {
     }
 
     fn mark_room_catalog_dirty(&mut self) {
-        if self.room.history_id().is_empty() {
+        if !self.config.history.enabled || self.room.history_id().is_empty() {
             return;
         }
         self.pending_room_catalog_save = Some(PendingRoomCatalogSave {
@@ -1566,6 +1626,9 @@ impl App {
     }
 
     fn write_room_catalog(&self) {
+        if !self.config.history.enabled {
+            return;
+        }
         let history_id = self.room.history_id();
         if history_id.is_empty() {
             return;
@@ -2840,6 +2903,7 @@ impl App {
             &mut session.form,
             &mut session.draft,
             &self.theme,
+            &self.config.bindings,
             session.dirty,
             intent,
             commit,
@@ -2862,6 +2926,10 @@ impl App {
                 }
                 SettingsButton::Close => {
                     self.close_settings(session);
+                    return;
+                }
+                SettingsButton::Exit => {
+                    self.request_quit();
                     return;
                 }
             }
@@ -2892,7 +2960,7 @@ impl App {
     /// Slow fields (device, bitrate, denoise, buffer, latency) schedule a
     /// debounced stream restart. The on-disk file is only written by `Save`.
     fn sync_settings_change(&mut self, session: &mut SettingsSession) {
-        self.config.ui.form_bindings = session.draft.form_bindings();
+        self.config.ui.default_bindings = session.draft.form_bindings();
         self.apply_theme(session.draft.theme());
         // Never place malformed free-form settings into the live config. Hold
         // the last valid state until the text is fixed, then the diff below
@@ -2904,10 +2972,17 @@ impl App {
         }
         let old = self.config.audio.clone();
         let old_web = self.config.web.clone();
+        let old_p2p_enabled = self.config.p2p.enabled;
+        let old_history_enabled = self.config.history.enabled;
         self.config.audio = session.draft.to_audio();
         self.config.web = session.draft.to_web();
         self.config.notifications = session.draft.to_notifications();
+        self.config.files = session.draft.to_files(&self.config.files);
+        self.config.p2p = session.draft.to_p2p(&self.config.p2p);
+        self.config.history = session.draft.to_history();
         self.apply_web_setting(&old_web);
+        self.apply_p2p_setting(old_p2p_enabled);
+        self.apply_history_setting(old_history_enabled);
         self.apply_echo_cancellation_setting();
         self.apply_active_capture_amplification(self.config.audio.max_amplification);
         let (capture, playback) = audio_restart_flags(&old, &self.config.audio);
@@ -2921,7 +2996,7 @@ impl App {
     /// buffer restyles its syntax highlighting and the composer editor adopts
     /// the new selection colors. Every other surface reads `self.theme` per
     /// frame, so a field swap is enough for them.
-    fn apply_theme(&mut self, choice: ThemeChoice) {
+    pub(crate) fn apply_theme(&mut self, choice: ThemeChoice) {
         if self.config.ui.theme == choice {
             return;
         }
@@ -2967,6 +3042,35 @@ impl App {
         }
     }
 
+    fn apply_p2p_setting(&mut self, old_enabled: bool) {
+        if old_enabled == self.config.p2p.enabled {
+            return;
+        }
+        if let Some(network) = &self.network {
+            let _ = network
+                .sender()
+                .send(NetworkCommand::SetP2pEnabled(self.config.p2p.enabled));
+        }
+        if self.config.p2p.enabled {
+            self.set_status("P2P enabled for this session");
+        } else {
+            self.set_status("P2P disabled; using relay");
+        }
+    }
+
+    fn apply_history_setting(&mut self, old_enabled: bool) {
+        if old_enabled == self.config.history.enabled {
+            return;
+        }
+        if self.config.history.enabled {
+            self.set_status("chat persistence enabled for future connections");
+        } else {
+            self.room.disable_history();
+            self.pending_room_catalog_save = None;
+            self.set_status("chat persistence disabled");
+        }
+    }
+
     fn schedule_audio_apply(&mut self, capture: bool, playback: bool) {
         let deadline = Instant::now() + AUDIO_APPLY_DEBOUNCE;
         match &mut self.pending_audio_apply {
@@ -2989,6 +3093,7 @@ impl App {
     /// run-loop iteration from [`crate::runtime`].
     pub(crate) fn tick(&mut self) {
         let now = Instant::now();
+        self.start_pending_after_welcome();
         self.expire_status(now);
         self.supervise(now);
         self.update_lobby_talking(now);
@@ -3717,7 +3822,7 @@ impl App {
     }
 
     fn apply_settings_form_bindings(&mut self, session: &mut SettingsSession) {
-        // Only the form-bindings choice triggers this, so no text edit is in
+        // Only the default-bindings choice triggers this, so no text edit is in
         // flight and the returned commit is always empty.
         let _ = session.form.set_bindings(session.draft.form_bindings());
     }
@@ -5311,6 +5416,7 @@ fn app_network_command_kind(command: &NetworkCommand) -> &'static str {
         NetworkCommand::StopShare { .. } => "stop_share",
         NetworkCommand::ReportBug { .. } => "report_bug",
         NetworkCommand::SetUploadRate(_) => "set_upload_rate",
+        NetworkCommand::SetP2pEnabled(_) => "set_p2p_enabled",
         NetworkCommand::Shutdown => "shutdown",
     }
 }
@@ -6387,7 +6493,7 @@ mod tests {
         let mut app = test_app();
         let form = FormState::new(
             crate::ui::settings::capture_device_id(),
-            app.config.ui.form_bindings,
+            app.config.ui.default_bindings,
         );
         let mut mode = SettingsMode::with_form_for_test(form, &app);
         mode.session_mut().input_items = ["System default", "USB Mic", "Line In"]
@@ -6447,7 +6553,7 @@ mod tests {
         let mut app = test_app();
         let form = FormState::new(
             crate::ui::settings::field_id_for("Capture Settings", "Bitrate"),
-            app.config.ui.form_bindings,
+            app.config.ui.default_bindings,
         );
         let mut mode = SettingsMode::with_form_for_test(form, &app);
         let before = app.config.audio.bitrate_bps;

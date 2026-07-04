@@ -1,10 +1,10 @@
-use extui::event::{KeyCode, KeyEvent, KeyEventKind, MouseEvent};
+use extui::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent};
 use extui::{Buffer, Rect};
 use extui_bindings::{InputKey, LayerId};
 use extui_editor::{Editor, Mode as EditorMode, Span as EditorSpan};
 
 use crate::{
-    app::{App, ChatPanelFocus, ServerEditDraft, ServerEditEvent, ToggleExpandResult},
+    app::{App, ChatPanelFocus, PendingJoin, ServerEditDraft, ServerEditEvent, ToggleExpandResult},
     bindings::{self, BindCommand, Resolved},
     chat_buffer::{LineKind, VisibleLine},
     settings::{self, AudioInputPickerState, AudioOutputPickerState, SettingsDraft},
@@ -17,6 +17,7 @@ use crate::{
     ui::{
         select::FuzzySelect,
         settings::{FieldId, FieldIntent},
+        welcome::{self, WelcomeButton, WelcomeDraft, WelcomeOutput},
     },
 };
 
@@ -24,6 +25,188 @@ use crate::{
 pub(crate) enum Action {
     Continue,
     Quit,
+}
+
+pub(crate) struct WelcomeMode {
+    form: FormState<FieldId>,
+    draft: WelcomeDraft,
+    pending_join: Option<PendingJoin>,
+    config_path_text: String,
+    data_dir_text: String,
+}
+
+impl WelcomeMode {
+    pub(crate) fn new(app: &App, pending_join: Option<PendingJoin>) -> Self {
+        let draft = WelcomeDraft::privacy_first();
+        Self {
+            form: FormState::new(welcome::initial_focus(), draft.default_bindings),
+            draft,
+            pending_join,
+            config_path_text: app
+                .config
+                .config_path
+                .as_ref()
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|| "<unknown>".to_string()),
+            data_dir_text: crate::paths::client_data_dir()
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|| "<unknown>".to_string()),
+        }
+    }
+
+    fn drive(
+        &mut self,
+        app: &mut App,
+        intent: FieldIntent,
+        commit: Option<(FieldId, String)>,
+        focus_column: Option<u16>,
+    ) {
+        let output = welcome::welcome_logic(
+            &mut self.form,
+            &mut self.draft,
+            &app.theme,
+            &app.config.bindings,
+            intent,
+            commit,
+            focus_column,
+        );
+        self.handle_output(app, output);
+    }
+
+    fn handle_output(&mut self, app: &mut App, output: WelcomeOutput) {
+        if output.changed {
+            let _ = self.form.set_bindings(self.draft.default_bindings);
+            app.apply_theme(self.draft.theme);
+        }
+        match output.button {
+            Some(WelcomeButton::Save) if app.save_welcome(&self.draft) => {
+                app.finish_welcome(self.pending_join.take());
+            }
+            Some(WelcomeButton::Exit) => app.request_quit(),
+            Some(WelcomeButton::Save) | None => {}
+        }
+    }
+
+    fn save_and_continue(&mut self, app: &mut App) {
+        let commit = self.form.clear_text();
+        self.drive(app, FieldIntent::None, commit, None);
+        if app.save_welcome(&self.draft) {
+            app.finish_welcome(self.pending_join.take());
+        }
+    }
+
+    fn process_action(&mut self, app: &mut App, command: BindCommand) -> Action {
+        match command {
+            BindCommand::SaveSettings => self.save_and_continue(app),
+            BindCommand::Cancel | BindCommand::CloseSettings => {
+                app.set_status("save setup to continue");
+            }
+            BindCommand::Quit => return Action::Quit,
+            _ => return app.process_global_command(command),
+        }
+        Action::Continue
+    }
+
+    fn resolve_binding(&mut self, app: &mut App, key: KeyEvent) -> Action {
+        match resolve_binding(app, bindings::SETTINGS_LAYER, key) {
+            BindingResolution::Action(command) => self.process_action(app, command),
+            BindingResolution::Consumed | BindingResolution::Unmatched => Action::Continue,
+        }
+    }
+
+    pub(crate) fn draw_body(&mut self, area: Rect, app: &App, buf: &mut Buffer) {
+        welcome::draw_welcome(
+            area,
+            buf,
+            &app.theme,
+            &app.config.bindings,
+            &mut self.draft,
+            &mut self.form,
+            &self.config_path_text,
+            &self.data_dir_text,
+        );
+    }
+}
+
+impl AppMode for WelcomeMode {
+    fn render(&mut self, app: &mut App, buf: &mut Buffer, _now_ms: u64) {
+        let chrome = self.presentation(app).chrome.expect("base mode has chrome");
+        crate::tui::render::draw_welcome_screen(
+            app,
+            self,
+            chrome.theme_mode,
+            chrome.status_label,
+            chrome.layer,
+            buf,
+        );
+    }
+
+    fn process_input(&mut self, app: &mut App, key: KeyEvent) -> Action {
+        if is_quit_key(&key) {
+            return Action::Quit;
+        }
+        if matches!(key.kind, KeyEventKind::Release) {
+            return Action::Continue;
+        }
+        if is_control_save_chord(app, &key) {
+            self.save_and_continue(app);
+            return Action::Continue;
+        }
+
+        let kind = self.form.focused_kind();
+        let text_focused = kind == FormFieldKind::Text;
+        let event = self.form.handle_key(key, kind);
+        match event.action {
+            FormAction::None if !text_focused => return self.resolve_binding(app, key),
+            FormAction::None => self.drive(app, FieldIntent::None, event.commit, None),
+            FormAction::Cancel => {
+                app.set_status("save setup to continue");
+            }
+            FormAction::Activate if text_focused => {
+                self.drive(app, FieldIntent::None, event.commit, None);
+                let commit = self.form.move_focus(1);
+                self.drive(app, FieldIntent::None, commit, None);
+            }
+            FormAction::Activate => {
+                self.drive(app, FieldIntent::Activate, event.commit, None);
+            }
+            FormAction::Adjust(delta) => {
+                self.drive(app, FieldIntent::Adjust(delta), event.commit, None);
+            }
+            FormAction::FocusMoved | FormAction::Scrolled => {
+                self.drive(app, FieldIntent::None, event.commit, None);
+            }
+            FormAction::TextChanged => {}
+        }
+        Action::Continue
+    }
+
+    fn process_mouse(&mut self, app: &mut App, mouse: MouseEvent) -> Action {
+        let event = self.form.handle_mouse(mouse);
+        match event.intent {
+            FormMouseIntent::None | FormMouseIntent::PickerItem(_, _) => {
+                self.drive(app, FieldIntent::None, event.commit, None);
+            }
+            FormMouseIntent::Activate(_) => {
+                self.drive(app, FieldIntent::Activate, event.commit, None);
+            }
+            FormMouseIntent::Adjust(_, delta) => {
+                self.drive(app, FieldIntent::Adjust(delta), event.commit, None);
+            }
+            FormMouseIntent::Text(_, _, column) => {
+                self.drive(app, FieldIntent::None, event.commit, Some(column));
+            }
+        }
+        Action::Continue
+    }
+
+    fn presentation(&self, _app: &App) -> ModePresentation {
+        ModePresentation::full_screen(ChromeSpec {
+            theme_mode: theme::UiMode::Settings,
+            status_label: "Setup",
+            layer: bindings::SETTINGS_LAYER,
+        })
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -85,6 +268,25 @@ fn maybe_auto_close_markdown_code_fence(editor: &mut Editor, key: KeyEvent) {
 
     editor.replace_range(EditorSpan::empty_at(cursor as u32), "\n```");
     editor.set_cursor_offset(cursor as u32);
+}
+
+fn is_control_save_chord(app: &App, key: &KeyEvent) -> bool {
+    if !key.modifiers.contains(KeyModifiers::CONTROL) {
+        return false;
+    }
+    let Some(input) = InputKey::from_event(key) else {
+        return false;
+    };
+    let pending = None;
+    bindings::reachable(&app.config.bindings, bindings::SETTINGS_LAYER, &pending)
+        .into_iter()
+        .any(|reachable| {
+            reachable.key == input
+                && matches!(
+                    reachable.kind,
+                    bindings::ReachableKind::Action(BindCommand::SaveSettings)
+                )
+        })
 }
 
 pub(crate) struct ServerListMode {
@@ -403,10 +605,13 @@ pub(crate) struct SettingsSession {
 impl SettingsSession {
     fn new(app: &App) -> Self {
         let mut draft = SettingsDraft::from_audio(&app.config.audio);
-        draft.set_form_bindings_from_config(app.config.ui.form_bindings);
+        draft.set_form_bindings_from_config(app.config.ui.default_bindings);
         draft.set_theme_from_config(app.config.ui.theme);
         draft.set_web_from_config(&app.config.web);
         draft.set_notifications_from_config(&app.config.notifications);
+        draft.set_files_from_config(&app.config.files);
+        draft.set_p2p_from_config(&app.config.p2p);
+        draft.set_history_from_config(&app.config.history);
         let input_items = settings::audio_input_items(app.audio_devices.input_devices());
         let output_items = settings::audio_output_items(app.audio_devices.output_devices());
         let mut input_picker = AudioInputPickerState::default();
@@ -416,7 +621,7 @@ impl SettingsSession {
         Self {
             form: FormState::new(
                 crate::ui::settings::initial_focus(),
-                app.config.ui.form_bindings,
+                app.config.ui.default_bindings,
             ),
             draft,
             input_items,
@@ -531,6 +736,10 @@ impl AppMode for SettingsMode {
         }
         self.session.sync_catalog(app);
         if app.handle_open_settings_picker_key(&mut self.session, key) {
+            return Action::Continue;
+        }
+        if is_control_save_chord(app, &key) {
+            app.save_settings(&mut self.session);
             return Action::Continue;
         }
 
