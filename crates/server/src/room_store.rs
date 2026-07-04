@@ -579,15 +579,26 @@ impl RoomStore {
             history.extend(active.history);
         }
         history.trim_to_limit(self.tuning.max_resident_messages);
-        let file = open_active_log(&path)
-            .map_err(|error| {
-                kvlog::error!(
-                    "durable room log open failed; retention degraded to memory",
-                    room_id = room_id.0,
-                    error = error.to_string().as_str()
-                );
-            })
-            .ok();
+        // Appending to a log whose corrupt tail could not be truncated would
+        // place records after the corruption, unreadable by every future
+        // startup while ids keep advancing.
+        let file = if active.tail_repair_failed {
+            kvlog::error!(
+                "durable room log tail unrepaired; retention degraded to memory",
+                room_id = room_id.0
+            );
+            None
+        } else {
+            open_active_log(&path)
+                .map_err(|error| {
+                    kvlog::error!(
+                        "durable room log open failed; retention degraded to memory",
+                        room_id = room_id.0,
+                        error = error.to_string().as_str()
+                    );
+                })
+                .ok()
+        };
         Retention::Durable {
             history,
             file,
@@ -857,6 +868,9 @@ impl RoomStore {
         second: UserId,
         now_ms: u64,
     ) -> Result<RoomId, String> {
+        if first == second {
+            return Err("cannot open a direct message with yourself".to_string());
+        }
         if let Some(existing) = self.dm_room_for(first, second) {
             return Ok(existing);
         }
@@ -1022,6 +1036,7 @@ enum LogRepair {
 struct LoadedLog {
     history: ResidentHistory,
     valid_bytes: u64,
+    tail_repair_failed: bool,
 }
 
 fn load_log_repairing(path: &Path) -> LoadedLog {
@@ -1073,6 +1088,7 @@ fn load_log(path: &Path, repair: LogRepair) -> LoadedLog {
         return LoadedLog {
             history: ResidentHistory::default(),
             valid_bytes: 0,
+            tail_repair_failed: false,
         };
     };
     let mut history = ResidentHistory::default();
@@ -1084,6 +1100,7 @@ fn load_log(path: &Path, repair: LogRepair) -> LoadedLog {
         }
         offset = records.offset();
     }
+    let mut tail_repair_failed = false;
     if offset < bytes.len() {
         match repair {
             LogRepair::Truncate => {
@@ -1093,9 +1110,13 @@ fn load_log(path: &Path, repair: LogRepair) -> LoadedLog {
                     valid_bytes = offset,
                     total_bytes = bytes.len()
                 );
-                if let Ok(file) = OpenOptions::new().write(true).open(path) {
-                    let _ = file.set_len(offset as u64);
-                    let _ = file.sync_all();
+                if let Err(error) = truncate_log(path, offset as u64) {
+                    kvlog::error!(
+                        "durable room log tail truncation failed",
+                        path = path.display().to_string().as_str(),
+                        error = error.to_string().as_str()
+                    );
+                    tail_repair_failed = true;
                 }
             }
             LogRepair::ReadOnly => {
@@ -1111,7 +1132,14 @@ fn load_log(path: &Path, repair: LogRepair) -> LoadedLog {
     LoadedLog {
         history,
         valid_bytes: offset as u64,
+        tail_repair_failed,
     }
+}
+
+fn truncate_log(path: &Path, valid_bytes: u64) -> std::io::Result<()> {
+    let file = OpenOptions::new().write(true).open(path)?;
+    file.set_len(valid_bytes)?;
+    file.sync_all()
 }
 
 fn rotate_log(
@@ -1430,6 +1458,15 @@ mod tests {
     }
 
     #[test]
+    fn open_dm_rejects_the_same_user_on_both_ends() {
+        let mut store = RoomStore::open(None, &[]);
+
+        assert!(store.open_dm(UserId(1), UserId(1), 1_000).is_err());
+        assert!(store.dm_rooms().is_empty());
+        assert_eq!(store.dm_room_for(UserId(1), UserId(1)), None);
+    }
+
+    #[test]
     fn open_dm_rolls_back_when_state_persist_fails() {
         use std::os::unix::fs::PermissionsExt;
 
@@ -1474,6 +1511,48 @@ mod tests {
 
         let store = RoomStore::open(Some(dir.clone()), &rooms);
         assert_eq!(store.recent(room, 10).len(), 3);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn unrepairable_corrupt_tail_degrades_to_memory() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = temp_dir("corrupt-unrepairable");
+        let rooms = [durable_room(1)];
+        let room = RoomId(1);
+
+        let mut store = RoomStore::open(Some(dir.clone()), &rooms);
+        for _ in 0..3 {
+            let id = store.allocate_message_id(room);
+            store.append(room, &test_message(room, id.0));
+        }
+        drop(store);
+
+        let log = dir.join("rooms").join("1.log");
+        let mut bytes = fs::read(&log).unwrap();
+        bytes.truncate(bytes.len() - 3);
+        bytes.extend_from_slice(&[0xFF, 0xFF]);
+        fs::write(&log, &bytes).unwrap();
+        fs::set_permissions(&log, fs::Permissions::from_mode(0o444)).unwrap();
+
+        let mut store = RoomStore::open(Some(dir.clone()), &rooms);
+        assert_eq!(store.recent(room, 10).len(), 2);
+        let id = store.allocate_message_id(room);
+        store.append(room, &test_message(room, id.0));
+        assert_eq!(
+            store.recent(room, 10).len(),
+            3,
+            "appends must continue in memory"
+        );
+        drop(store);
+
+        assert_eq!(
+            fs::read(&log).unwrap(),
+            bytes,
+            "nothing may be written after the unrepaired corruption"
+        );
+        fs::set_permissions(&log, fs::Permissions::from_mode(0o644)).unwrap();
         let _ = fs::remove_dir_all(&dir);
     }
 

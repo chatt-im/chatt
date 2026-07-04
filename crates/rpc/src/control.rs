@@ -39,6 +39,11 @@ pub const ERROR_BUG_REPORT_REJECTED: u16 = 400;
 /// answer for rooms the user cannot access, so private rooms are
 /// indistinguishable from missing ones.
 pub const ERROR_ROOM_NOT_FOUND: u16 = 404;
+/// A room verb was rejected by current server state (not in the voice call,
+/// share already active, peer gone); the connection stays usable.
+pub const ERROR_REQUEST_REJECTED: u16 = 412;
+/// The server failed internally while handling an otherwise valid request.
+pub const ERROR_INTERNAL: u16 = 500;
 /// Most messages one `FetchHistory` may request.
 pub const MAX_HISTORY_FETCH_MESSAGES: u16 = 500;
 pub const JOIN_STRING_PREFIX: &str = "tcj1_";
