@@ -857,11 +857,7 @@ fn data_dir() -> Option<PathBuf> {
     }
     #[cfg(not(test))]
     {
-        if let Some(xdg) = std::env::var_os("XDG_DATA_HOME").filter(|value| !value.is_empty()) {
-            Some(PathBuf::from(xdg).join("chatt"))
-        } else {
-            std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/share/chatt"))
-        }
+        crate::paths::client_data_dir()
     }
 }
 

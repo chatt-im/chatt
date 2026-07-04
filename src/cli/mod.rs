@@ -16,7 +16,7 @@ use chatt::audio::{
     LiveAudioFilePlaybackTestReport, LiveAudioPacketLossProfile,
 };
 
-use crate::{config, config::Config, local_control, runtime, settings};
+use crate::{config, config::AppConfigLoad, config::Config, local_control, runtime, settings};
 use command::{Arg, Command, Example, Flag, Matches, Parsed};
 
 const AUDIO_PLAYBACK_TEST_DEFAULT_SEED: u64 = 0x746f_6d63_6861_7404;
@@ -357,8 +357,7 @@ fn dispatch(matches: &Matches) -> Result<(), Box<dyn std::error::Error>> {
                     addr: parse_pair_address(target)?,
                 }
             };
-            let config = Config::load(config_path)?;
-            runtime::run_app(config, Some(pending))
+            run_interactive_app(config_path, Some(pending))
         }
         Some(("join", sub)) => {
             let target = sub.value_of("specifier").unwrap_or_default().trim();
@@ -368,9 +367,8 @@ fn dispatch(matches: &Matches) -> Result<(), Box<dyn std::error::Error>> {
             if target.starts_with(rpc::control::JOIN_STRING_PREFIX) {
                 return Err(join_ticket_redirect_message(target).into());
             }
-            let config = Config::load(config_path)?;
-            runtime::run_app(
-                config,
+            run_interactive_app(
+                config_path,
                 Some(crate::app::PendingJoin::Named {
                     specifier: target.to_string(),
                 }),
@@ -464,10 +462,17 @@ fn dispatch(matches: &Matches) -> Result<(), Box<dyn std::error::Error>> {
             println!("{response}");
             Ok(())
         }
-        _ => {
-            let config = Config::load(config_path)?;
-            runtime::run_app(config, None)
-        }
+        _ => run_interactive_app(config_path, None),
+    }
+}
+
+fn run_interactive_app(
+    config_path: Option<&str>,
+    pending_join: Option<crate::app::PendingJoin>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    match Config::load_for_app(config_path)? {
+        AppConfigLoad::Existing(config) => runtime::run_app(config, pending_join),
+        AppConfigLoad::Missing(config) => runtime::run_app_with_welcome(config, pending_join),
     }
 }
 

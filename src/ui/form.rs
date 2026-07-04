@@ -68,6 +68,7 @@ pub(crate) struct ActionButton<'a, T> {
     pub(crate) label: &'a str,
     pub(crate) value: T,
     pub(crate) help: &'static str,
+    pub(crate) primary: bool,
 }
 
 impl<'a, T> ActionButton<'a, T> {
@@ -77,6 +78,17 @@ impl<'a, T> ActionButton<'a, T> {
             label,
             value,
             help: "",
+            primary: false,
+        }
+    }
+
+    pub(crate) const fn primary(label: &'a str, value: T) -> Self {
+        Self {
+            key: label,
+            label,
+            value,
+            help: "",
+            primary: true,
         }
     }
 }
@@ -85,6 +97,12 @@ pub(crate) struct ActionResponse<T> {
     pub(crate) focused: Option<T>,
     pub(crate) activated: Option<T>,
     pub(crate) help: Option<&'static str>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FormSurface {
+    Page,
+    Dialog,
 }
 
 pub(crate) type State = FormState<FieldId>;
@@ -111,6 +129,7 @@ pub(crate) struct Form<'a> {
     focus_column: Option<u16>,
     enabled: bool,
     changed: bool,
+    surface: FormSurface,
 }
 
 impl<'a> Form<'a> {
@@ -136,11 +155,17 @@ impl<'a> Form<'a> {
             focus_column,
             enabled: true,
             changed: false,
+            surface: FormSurface::Page,
         }
     }
 
     pub(crate) fn with_label_width(mut self, label_width: u16) -> Self {
         self.label_width = label_width;
+        self
+    }
+
+    pub(crate) fn with_surface(mut self, surface: FormSurface) -> Self {
+        self.surface = surface;
         self
     }
 
@@ -221,13 +246,14 @@ impl<'a> Form<'a> {
         let row = self.state.next_row(1);
         let area = self.state.register_field(row, id, FormFieldKind::Static);
         if let (Some(area), Some(buf)) = (area, self.buf.as_deref_mut()) {
-            widgets::draw_labeled_value(
+            widgets::draw_labeled_value_with(
                 area,
                 buf,
-                self.theme,
+                row_palette(self.theme, self.surface),
                 self.label_width,
                 label,
                 value,
+                false,
                 false,
                 false,
             );
@@ -252,7 +278,7 @@ impl<'a> Form<'a> {
             widgets::draw_labeled_value_with(
                 area,
                 buf,
-                RowPalette::from_theme(self.theme),
+                row_palette(self.theme, self.surface),
                 self.label_width,
                 label,
                 &text,
@@ -298,7 +324,7 @@ impl<'a> Form<'a> {
             widgets::draw_labeled_value_with(
                 area,
                 buf,
-                RowPalette::from_theme(self.theme),
+                row_palette(self.theme, self.surface),
                 self.label_width,
                 label,
                 &text,
@@ -385,13 +411,22 @@ impl<'a> Form<'a> {
             }
             return response;
         };
-        let width = (area.w / specs.len() as u16).max(1);
+        let gap = u16::from(specs.len() > 1 && area.w > specs.len() as u16);
+        let total_gap = gap.saturating_mul(specs.len().saturating_sub(1) as u16);
+        let width = (area.w.saturating_sub(total_gap) / specs.len() as u16).max(1);
         let mut remaining = area;
         for (slot, spec) in specs.iter().enumerate() {
             let rect = if slot + 1 == specs.len() {
                 remaining
             } else {
-                remaining.take_left(width as i32)
+                let rect = remaining.take_left(width as i32);
+                let gap_rect = remaining.take_left(gap as i32);
+                if matches!(self.surface, FormSurface::Dialog)
+                    && let Some(buf) = self.buf.as_deref_mut()
+                {
+                    gap_rect.with(self.theme.dialog_panel).fill(buf);
+                }
+                rect
             };
             let id = self.id(spec.key);
             self.state
@@ -405,7 +440,15 @@ impl<'a> Form<'a> {
                 }
             }
             if let Some(buf) = self.buf.as_deref_mut() {
-                widgets::draw_action(rect, buf, self.theme, spec.label, focused);
+                widgets::draw_action(
+                    rect,
+                    buf,
+                    self.theme,
+                    spec.label,
+                    focused,
+                    spec.primary,
+                    matches!(self.surface, FormSurface::Dialog),
+                );
             }
         }
         response
@@ -460,6 +503,7 @@ impl<'a> Form<'a> {
                     area,
                     buf,
                     self.theme,
+                    self.surface,
                     self.label_width,
                     label,
                     shown,
@@ -477,6 +521,7 @@ impl<'a> Form<'a> {
                 area,
                 buf,
                 self.theme,
+                row_palette(self.theme, self.surface),
                 self.label_width,
                 label,
                 true,
@@ -494,15 +539,16 @@ impl<'a> Form<'a> {
         focused: bool,
     ) {
         if let Some(buf) = self.buf.as_deref_mut() {
-            widgets::draw_labeled_value(
+            widgets::draw_labeled_value_with(
                 area,
                 buf,
-                self.theme,
+                row_palette(self.theme, self.surface),
                 self.label_width,
                 label,
                 value,
                 focused,
                 self.dirty,
+                false,
             );
         }
     }
@@ -512,7 +558,15 @@ impl<'a> Form<'a> {
         let row = self.state.next_row(1);
         let area = self.state.register_field(row, id, FormFieldKind::Disabled);
         if let (Some(area), Some(buf)) = (area, self.buf.as_deref_mut()) {
-            draw_disabled_row(area, buf, self.theme, self.label_width, label, &value);
+            draw_disabled_row(
+                area,
+                buf,
+                self.theme,
+                self.surface,
+                self.label_width,
+                label,
+                &value,
+            );
         }
         Response {
             focused: false,
@@ -563,6 +617,7 @@ fn draw_value_row(
     area: Rect,
     buf: &mut Buffer,
     theme: &Theme,
+    surface: FormSurface,
     label_width: u16,
     label: &str,
     value: &str,
@@ -573,7 +628,7 @@ fn draw_value_row(
     widgets::draw_labeled_value_with(
         area,
         buf,
-        RowPalette::from_theme(theme),
+        row_palette(theme, surface),
         label_width,
         label,
         value,
@@ -587,11 +642,12 @@ fn draw_disabled_row(
     area: Rect,
     buf: &mut Buffer,
     theme: &Theme,
+    surface: FormSurface,
     label_width: u16,
     label: &str,
     value: &str,
 ) {
-    let mut palette = RowPalette::from_theme(theme);
+    let mut palette = row_palette(theme, surface);
     palette.label = theme.subtle;
     palette.value = theme.subtle;
     widgets::draw_labeled_value_with(
@@ -605,6 +661,13 @@ fn draw_disabled_row(
         false,
         false,
     );
+}
+
+fn row_palette(theme: &Theme, surface: FormSurface) -> RowPalette {
+    match surface {
+        FormSurface::Page => RowPalette::from_theme(theme),
+        FormSurface::Dialog => RowPalette::dialog(theme),
+    }
 }
 
 fn on_off(value: bool) -> String {

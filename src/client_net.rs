@@ -148,6 +148,7 @@ pub struct ClientConfig {
     /// [`UploadThrottle`] and is adjustable at runtime via
     /// [`NetworkCommand::SetUploadRate`].
     pub upload_rate_bytes: u64,
+    pub p2p_enabled: bool,
     pub candidate_privacy: crate::config::CandidatePrivacy,
     pub prefer_ipv6: bool,
 }
@@ -224,6 +225,7 @@ pub enum NetworkCommand {
     },
     /// Sets the upload pacing ceiling in bytes per second, `0` for unlimited.
     SetUploadRate(u64),
+    SetP2pEnabled(bool),
     Shutdown,
 }
 
@@ -790,6 +792,7 @@ fn run_worker_inner(
         p2p_reflexive_addr: None,
         p2p_candidates: Vec::new(),
         p2p_local_candidates: Vec::new(),
+        p2p_enabled: config.p2p_enabled,
         candidate_privacy: config.candidate_privacy,
         prefer_ipv6: config.prefer_ipv6,
         mdns: MdnsSystem::bind(),
@@ -1331,6 +1334,7 @@ struct WorkerState {
     p2p_reflexive_addr: Option<SocketAddr>,
     p2p_candidates: Vec<P2pCandidate>,
     p2p_local_candidates: Vec<Candidate>,
+    p2p_enabled: bool,
     candidate_privacy: CandidatePrivacy,
     prefer_ipv6: bool,
     mdns: MdnsSystem,
@@ -2550,6 +2554,25 @@ impl WorkerState {
                 let _ = self
                     .events
                     .send(NetworkEvent::Status(format!("upload rate set to {label}")));
+            }
+            NetworkCommand::SetP2pEnabled(enabled) => {
+                if self.p2p_enabled == enabled {
+                    return Ok(());
+                }
+                self.p2p_enabled = enabled;
+                self.request_p2p_restart();
+                if enabled {
+                    self.publish_p2p_candidates();
+                    let _ = self
+                        .events
+                        .send(NetworkEvent::Status("P2P enabled".to_string()));
+                } else {
+                    self.publish_p2p_disabled();
+                    self.reset_voice_peer_state();
+                    let _ = self.events.send(NetworkEvent::Status(
+                        "P2P disabled; using relay".to_string(),
+                    ));
+                }
             }
             NetworkCommand::LocalVoicePacket(frame) => {
                 if let Some(stream_id) = self.active_stream {
@@ -4003,6 +4026,9 @@ impl WorkerState {
     }
 
     fn publish_p2p_candidates(&mut self) {
+        if !self.p2p_enabled {
+            return;
+        }
         let Some(room_id) = self.voice_room else {
             return;
         };
@@ -4024,6 +4050,25 @@ impl WorkerState {
             nat: self.p2p_nat,
             tie_breaker: self.p2p_tie_breaker,
             candidates: gathered.published,
+        });
+    }
+
+    fn publish_p2p_disabled(&mut self) {
+        let Some(room_id) = self.voice_room else {
+            return;
+        };
+        if self.session_id.is_none() {
+            return;
+        }
+        self.p2p_local_candidates.clear();
+        self.p2p_candidates.clear();
+        self.mdns.publish_names(std::iter::empty());
+        let _ = self.queue_control(ClientControl::PublishP2p {
+            room_id,
+            generation: self.p2p_generation,
+            nat: self.p2p_nat,
+            tie_breaker: self.p2p_tie_breaker,
+            candidates: Vec::new(),
         });
     }
 
@@ -4112,6 +4157,9 @@ impl WorkerState {
     }
 
     fn install_p2p_peer(&mut self, peer: P2pPeerInfo) -> Result<(), String> {
+        if !self.p2p_enabled {
+            return Ok(());
+        }
         if self.voice_room != Some(peer.room_id) {
             kvlog::info!(
                 "p2p peer ignored for inactive voice room",
@@ -5010,6 +5058,7 @@ fn network_command_kind(command: &NetworkCommand) -> &'static str {
         NetworkCommand::StopShare { .. } => "stop_share",
         NetworkCommand::ReportBug { .. } => "report_bug",
         NetworkCommand::SetUploadRate(_) => "set_upload_rate",
+        NetworkCommand::SetP2pEnabled(_) => "set_p2p_enabled",
         NetworkCommand::Shutdown => "shutdown",
     }
 }

@@ -336,6 +336,23 @@ pub fn reachable(
     out
 }
 
+pub fn command_key_hint(
+    bindings: &BindingRuntime,
+    layer: LayerId,
+    target: BindCommand,
+) -> Option<String> {
+    let pending = None;
+    for reachable in reachable(bindings, layer, &pending) {
+        let ReachableKind::Action(command) = reachable.kind else {
+            continue;
+        };
+        if std::mem::discriminant(&command) == std::mem::discriminant(&target) {
+            return Some(reachable.key.to_string());
+        }
+    }
+    None
+}
+
 impl Default for BindingRuntime {
     fn default() -> Self {
         let arena = toml_spanner::Arena::new();

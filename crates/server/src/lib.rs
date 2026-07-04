@@ -3041,6 +3041,20 @@ impl Server {
             self.remove_peer_links(session_id);
             return Ok(());
         }
+        if candidates.is_empty() {
+            kvlog::info!(
+                "p2p candidates cleared",
+                session_id = session_id.0,
+                room_id = room_id.0,
+                generation
+            );
+            if let Some(session) = self.sessions.get_mut(&session_id) {
+                session.p2p = None;
+            }
+            self.broadcast_p2p_gone(session_id, room_id);
+            self.remove_peer_links(session_id);
+            return Ok(());
+        }
         let in_voice = self
             .sessions
             .get(&session_id)

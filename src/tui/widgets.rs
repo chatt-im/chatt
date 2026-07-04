@@ -25,6 +25,12 @@ impl RowPalette {
             error: theme.error,
         }
     }
+
+    pub(crate) fn dialog(theme: &Theme) -> Self {
+        let mut palette = Self::from_theme(theme);
+        palette.base = theme.dialog_panel;
+        palette
+    }
 }
 
 pub(crate) fn draw_section_header(area: Rect, buf: &mut Buffer, theme: &Theme, label: &str) {
@@ -34,29 +40,6 @@ pub(crate) fn draw_section_header(area: Rect, buf: &mut Buffer, theme: &Theme, l
     area.with(theme.status_section | Modifier::BOLD)
         .with(Ellipsis(true))
         .text(buf, label);
-}
-
-pub(crate) fn draw_labeled_value(
-    area: Rect,
-    buf: &mut Buffer,
-    theme: &Theme,
-    label_width: u16,
-    label: &str,
-    value: &str,
-    focused: bool,
-    dirty: bool,
-) {
-    draw_labeled_value_with(
-        area,
-        buf,
-        RowPalette::from_theme(theme),
-        label_width,
-        label,
-        value,
-        focused,
-        dirty,
-        false,
-    );
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -105,12 +88,12 @@ pub(crate) fn draw_labeled_editor_frame(
     area: Rect,
     buf: &mut Buffer,
     theme: &Theme,
+    palette: RowPalette,
     label_width: u16,
     label: &str,
     focused: bool,
     error: bool,
 ) -> Rect {
-    let palette = RowPalette::from_theme(theme);
     let base = if focused {
         palette.focused
     } else {
@@ -140,15 +123,48 @@ pub(crate) fn draw_labeled_editor_frame(
     row
 }
 
-pub(crate) fn draw_action(area: Rect, buf: &mut Buffer, theme: &Theme, label: &str, focused: bool) {
+pub(crate) fn draw_action(
+    area: Rect,
+    buf: &mut Buffer,
+    theme: &Theme,
+    label: &str,
+    focused: bool,
+    primary: bool,
+    dialog: bool,
+) {
     if area.is_empty() {
         return;
     }
-    let style = if focused {
-        RowPalette::from_theme(theme).focused.patch(theme.good)
+    let style = if dialog {
+        let style = if focused || primary {
+            theme.selected_focused
+        } else {
+            theme.dialog_panel.patch(theme.muted)
+        };
+        if focused {
+            style | Modifier::BOLD
+        } else {
+            style
+        }
+    } else if focused {
+        theme.background.patch(theme.good | Modifier::BOLD)
+    } else if primary {
+        theme.background.patch(theme.text | Modifier::BOLD)
     } else {
-        theme.background.patch(theme.text)
+        theme.background.patch(theme.muted)
     };
+    draw_button(area, buf, style, label);
+}
+
+pub(crate) fn button_label(label: &str, key: Option<String>) -> String {
+    match key {
+        Some(key) => format!("{label} [{key}]"),
+        None => label.to_string(),
+    }
+}
+
+pub(crate) fn draw_button(area: Rect, buf: &mut Buffer, style: Style, label: &str) {
+    area.with(style).fill(buf);
     area.with(style)
         .with(HAlign::Center)
         .with(Ellipsis(true))
