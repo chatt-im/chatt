@@ -11,11 +11,12 @@ use std::{
 };
 
 pub mod config;
+mod history_reader;
 pub mod local_admin;
 pub mod room_store;
 
 use mio::{
-    Events, Interest, Poll, Token,
+    Events, Interest, Poll, Token, Waker,
     net::{TcpListener, TcpStream, UdpSocket},
 };
 use ring::rand::SecureRandom;
@@ -47,6 +48,7 @@ use config::{
     Config as ServerConfig, UserConfig, constant_time_eq, hash_secret, value_arg,
     verify_secret_hash,
 };
+use history_reader::{HistoryReadReply, HistoryReader};
 use local_admin::{AdminCommand, AdminSocket};
 use room_store::RoomStore;
 
@@ -56,7 +58,9 @@ use rpc::history;
 const LISTENER: Token = Token(0);
 const UDP: Token = Token(1);
 const UDP_PROBE: Token = Token(2);
-const FIRST_CLIENT: usize = 3;
+/// Wake-only token the history reader thread signals after queueing a reply.
+const WAKER: Token = Token(3);
+const FIRST_CLIENT: usize = 4;
 const DEFAULT_ROOM: RoomId = RoomId(1);
 const POLL_TIMEOUT: Duration = Duration::from_millis(100);
 const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(20);
@@ -75,6 +79,9 @@ const OPEN_PAIR_GLOBAL_LIMIT: usize = 30;
 /// The protocol hard cap is higher; this leaves room for framing, encryption,
 /// and future metadata while allowing one fetch to stream over several chunks.
 const HISTORY_CHUNK_TARGET_BYTES: usize = 192 * 1024;
+/// Most disk-paged history fetches one session may have queued on the reader
+/// thread; a well-behaved client keeps at most one in flight per room.
+const MAX_PENDING_DISK_HISTORY_FETCHES: u8 = 8;
 /// Cap on a stream's fast-start ring. Keyframes reset the ring, so this only
 /// bounds a pathologically long GOP rather than normal operation.
 const VIDEO_RING_MAX_BYTES: usize = 8 * 1024 * 1024;
@@ -221,6 +228,8 @@ pub struct Server {
     server_key_pair: ring::signature::Ed25519KeyPair,
     next_media_sweep_at: Option<Instant>,
     next_rtt_snapshot_at: Instant,
+    history_reader: HistoryReader,
+    history_replies: mpsc::Receiver<HistoryReadReply>,
     /// Persistent scratch the per-client TCP read loop reads into, allocated
     /// once and reused so relaying bulk transfers does not allocate or zero a
     /// fresh buffer per read.
@@ -313,6 +322,9 @@ impl Server {
             );
         }
 
+        let waker = Arc::new(Waker::new(poll.registry(), WAKER)?);
+        let (history_reader, history_replies) = HistoryReader::spawn(waker);
+
         let server_key_pair = config
             .server_key_pair()
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
@@ -353,6 +365,8 @@ impl Server {
             server_key_pair,
             next_media_sweep_at: None,
             next_rtt_snapshot_at: Instant::now() + RTT_SNAPSHOT_INTERVAL,
+            history_reader,
+            history_replies,
             read_scratch: vec![0u8; TCP_READ_BUFFER_BYTES],
         })
     }
@@ -375,6 +389,8 @@ impl Server {
                     LISTENER => self.accept_clients()?,
                     UDP => self.receive_udp(0),
                     UDP_PROBE => self.receive_udp(1),
+                    // Wake-only; replies drain unconditionally below.
+                    WAKER => {}
                     token => {
                         if event.is_readable() {
                             self.read_client(token);
@@ -385,6 +401,7 @@ impl Server {
                     }
                 }
             }
+            self.drain_history_replies();
             self.handle_admin_commands(admin_rx);
             self.flush_disconnects();
             let now = Instant::now();
@@ -1929,6 +1946,7 @@ impl Server {
                 file_receive_limit_bytes,
                 announced: announce,
                 connected_at_ms: now_ms(),
+                pending_disk_history_fetches: 0,
             },
         );
 
@@ -2198,7 +2216,9 @@ impl Server {
         self.remove_peer_links(session_id);
     }
 
-    /// Answers a history page from the room's retained messages.
+    /// Answers a history page: synchronously from the resident window when it
+    /// holds any of the requested range, otherwise via the disk reader thread
+    /// paging the room's rotated segments.
     fn fetch_history(
         &mut self,
         session_id: SessionId,
@@ -2218,6 +2238,18 @@ impl Server {
             usize::from(limit),
             HISTORY_CHUNK_TARGET_BYTES,
         );
+        if plan.message_count == 0
+            && let Some(request) = self.store.disk_fetch_request(
+                session_id,
+                room_id,
+                before,
+                usize::from(limit),
+                HISTORY_CHUNK_TARGET_BYTES,
+            )
+        {
+            self.enqueue_disk_history_fetch(session_id, token, room_id, request);
+            return;
+        }
         let chunk_count = plan.chunk_count();
         kvlog::info!(
             "history chunks queued",
@@ -2253,6 +2285,82 @@ impl Server {
                     error = error.as_str()
                 );
                 break;
+            }
+        }
+    }
+
+    fn enqueue_disk_history_fetch(
+        &mut self,
+        session_id: SessionId,
+        token: Token,
+        room_id: RoomId,
+        request: history_reader::HistoryReadRequest,
+    ) {
+        let Some(session) = self.sessions.get(&session_id) else {
+            return;
+        };
+        if session.pending_disk_history_fetches >= MAX_PENDING_DISK_HISTORY_FETCHES {
+            kvlog::warn!(
+                "disk history fetch limit exceeded",
+                session_id = session_id.0,
+                room_id = room_id.0
+            );
+            self.send_empty_history_chunk(token, room_id);
+            return;
+        }
+        if !self.history_reader.enqueue(request) {
+            kvlog::error!(
+                "history reader unavailable",
+                session_id = session_id.0,
+                room_id = room_id.0
+            );
+            self.send_empty_history_chunk(token, room_id);
+            return;
+        }
+        if let Some(session) = self.sessions.get_mut(&session_id) {
+            session.pending_disk_history_fetches += 1;
+        }
+        kvlog::info!(
+            "disk history fetch queued",
+            session_id = session_id.0,
+            room_id = room_id.0
+        );
+    }
+
+    /// Terminates a history fetch that cannot be served with an empty
+    /// `complete` chunk; the client has no fetch timeout, so a request
+    /// without a terminal chunk would wedge its paging for the room.
+    fn send_empty_history_chunk(&mut self, token: Token, room_id: RoomId) {
+        let payload = history_reader::empty_chunk(room_id);
+        let _ = self.queue_control_payload_to_token(token, "history_chunk", payload);
+    }
+
+    /// Queues finished disk history pages to their sessions. Called every
+    /// event-loop pass; the reader's waker only shortens the wait.
+    fn drain_history_replies(&mut self) {
+        while let Ok(reply) = self.history_replies.try_recv() {
+            if let Some(session) = self.sessions.get_mut(&reply.session_id) {
+                session.pending_disk_history_fetches =
+                    session.pending_disk_history_fetches.saturating_sub(1);
+            }
+            let Some(token) = self.live_token_for_session(reply.session_id) else {
+                continue;
+            };
+            let chunk_count = reply.payloads.len();
+            for (chunk_index, payload) in reply.payloads.into_iter().enumerate() {
+                if let Err(error) =
+                    self.queue_control_payload_to_token(token, "history_chunk", payload)
+                {
+                    kvlog::warn!(
+                        "disk history chunk send failed",
+                        session_id = reply.session_id.0,
+                        room_id = reply.room_id.0,
+                        chunk_index,
+                        chunk_count,
+                        error = error.as_str()
+                    );
+                    break;
+                }
             }
         }
     }
@@ -3949,6 +4057,9 @@ struct Session {
     announced: bool,
     /// Server wall-clock (UNIX ms) the session connected.
     connected_at_ms: u64,
+    /// History fetches queued on the disk reader thread, bounded by
+    /// [`MAX_PENDING_DISK_HISTORY_FETCHES`].
+    pending_disk_history_fetches: u8,
 }
 
 impl Session {
@@ -4501,6 +4612,7 @@ mod tests {
             file_receive_limit_bytes: 0,
             announced: true,
             connected_at_ms: 0,
+            pending_disk_history_fetches: 0,
         }
     }
 
@@ -5007,6 +5119,111 @@ mod tests {
         assert!(chunk_count > 1, "large history response should be chunked");
         assert_eq!(message_count, 80);
         assert!(final_at_start);
+    }
+
+    /// Reads frames until a history chunk arrives, draining the disk reader's
+    /// replies between attempts since no event loop is running.
+    fn pump_history_chunk(
+        server: &mut Server,
+        peer: &mut std::net::TcpStream,
+    ) -> history::HistoryChunk {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            server.drain_history_replies();
+            peer.set_read_timeout(Some(Duration::from_millis(20)))
+                .expect("set read timeout");
+            let mut len = [0u8; 4];
+            match peer.peek(&mut len) {
+                Ok(4) => {
+                    let payload = read_plaintext_server_payload(peer);
+                    if let Some(chunk) =
+                        history::decode_chunk(&payload).expect("decode history chunk")
+                    {
+                        return chunk;
+                    }
+                    let _ = rpc::control::decode_server_control(&payload)
+                        .expect("decode server control");
+                }
+                Ok(_) => {}
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                    ) => {}
+                Err(error) => panic!("peek frame length: {error}"),
+            }
+            assert!(
+                Instant::now() < deadline,
+                "history chunk was not received in time"
+            );
+        }
+    }
+
+    #[test]
+    fn history_fetch_pages_from_disk_below_resident_window() {
+        let dir = std::env::temp_dir().join(format!(
+            "chatt-server-disk-paging-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut config = ServerConfig::default();
+        config.network.tcp_addr = "127.0.0.1:0".parse().unwrap();
+        config.network.udp_addr = "127.0.0.1:0".parse().unwrap();
+        config.network.p2p_enabled = false;
+        config.rooms[0].persistence = config::RoomPersistenceConfig::Durable;
+        config.storage.data_dir = Some(dir.display().to_string());
+        let mut server = Server::bind(config).expect("test server");
+        server.store.set_tuning(room_store::StoreTuning {
+            max_active_log_bytes: 512,
+            max_resident_messages: 6,
+        });
+        let session = SessionId(1);
+        let mut peer = live_user(&mut server, Token(11), session, UserId(1));
+        for index in 0..30 {
+            server
+                .send_chat(session, RoomId(1), format!("message {index}"))
+                .unwrap();
+        }
+
+        let mut collected: Vec<u64> = Vec::new();
+        let mut before: Option<MessageId> = None;
+        let mut at_start = false;
+        for _ in 0..30 {
+            server.fetch_history(session, RoomId(1), before, 4);
+            let mut page: Vec<u64> = Vec::new();
+            loop {
+                let chunk = pump_history_chunk(&mut server, &mut peer);
+                assert_eq!(chunk.room_id, RoomId(1));
+                let ids: Vec<u64> = chunk
+                    .messages
+                    .iter()
+                    .map(|message| message.message_id.0)
+                    .collect();
+                page.splice(0..0, ids);
+                if chunk.complete {
+                    at_start = chunk.at_start;
+                    break;
+                }
+            }
+            assert!(
+                !page.is_empty() || at_start,
+                "an empty page must only terminate paging at the start"
+            );
+            before = page.first().copied().map(MessageId).or(before);
+            page.append(&mut collected);
+            collected = page;
+            if at_start {
+                break;
+            }
+        }
+        assert!(at_start, "paging must reach the durable start");
+        let expected: Vec<u64> = (1..=30).collect();
+        assert_eq!(
+            collected, expected,
+            "pages must cover every durable message exactly once"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
