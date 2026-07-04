@@ -435,6 +435,14 @@ impl TraversalAgent {
         match message.class {
             MessageClass::Request => {
                 self.peer_reflexive_seen = true;
+                // A Binding Request from the already-selected address is an
+                // RFC 7675 keepalive, which arrives ~1/s from each peer. It must
+                // be answered but must not re-announce the path: `DirectReady`
+                // marks the transition into a direct path, not steady state, so
+                // re-firing it on every keepalive spams the caller.
+                let already_selected = self
+                    .selected
+                    .is_some_and(|selected| selected.remote_addr == src);
                 let selected = self.select_peer_reflexive(src);
                 let response = StunMessage::binding_success(message.transaction_id, src)
                     .encode(Some(&self.config.auth.key));
@@ -443,7 +451,9 @@ impl TraversalAgent {
                     bytes: response,
                     transaction_id: message.transaction_id,
                 }];
-                actions.push(Action::DirectReady { selected });
+                if !already_selected {
+                    actions.push(Action::DirectReady { selected });
+                }
                 Ok(actions)
             }
             MessageClass::SuccessResponse => {
@@ -1255,6 +1265,45 @@ mod tests {
                     ..
                 }
             }) if remote_addr == "198.51.100.9:62000".parse().unwrap()
+        ));
+    }
+
+    #[test]
+    fn keepalive_request_from_selected_address_does_not_re_announce() {
+        let now = at(0);
+        let mut agent = TraversalAgent::new(
+            now,
+            test_config(),
+            IceRole::Controlling,
+            10,
+            NatKind::Cone,
+            NatKind::Cone,
+            vec![candidate(1, CandidateKind::Host, "10.0.0.2:5000")],
+            vec![candidate(2, CandidateKind::Host, "10.0.0.3:5001")],
+        );
+        let peer: SocketAddr = "10.0.0.3:5001".parse().unwrap();
+        assert!(matches!(
+            agent.observe_authenticated_packet(now, peer),
+            Some(Action::DirectReady { .. })
+        ));
+
+        // An RFC 7675 keepalive is a Binding Request from the already-selected
+        // address. It must be answered but must not re-announce the direct path,
+        // or every ~1/s keepalive would spam a fresh `DirectReady`.
+        let keepalive = StunMessage::binding_request(
+            TransactionId::from_counter(7),
+            None,
+            0,
+            RoleAttribute::Controlled(1),
+            false,
+        )
+        .encode(Some(&[0u8; 32]));
+        let actions = agent
+            .handle_inbound(now + Duration::from_secs(1), peer, &keepalive)
+            .unwrap();
+        assert!(matches!(
+            actions.as_slice(),
+            [Action::SendStunResponse { .. }]
         ));
     }
 
