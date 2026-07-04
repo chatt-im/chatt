@@ -810,6 +810,7 @@ fn run_worker_inner(
         encoder_feedback: EncoderFeedbackController::new(),
         restart_port_policy: RestartPortPolicy::default(),
         udp_rebind_requested: false,
+        awaiting_udp_bound: false,
         interface_snapshot: InterfaceSnapshot::capture().ok(),
         next_interface_poll: Instant::now() + INTERFACE_POLL_INTERVAL,
         next_file_transfer: 1,
@@ -1350,6 +1351,11 @@ struct WorkerState {
     encoder_feedback: EncoderFeedbackController,
     restart_port_policy: RestartPortPolicy,
     udp_rebind_requested: bool,
+    /// Whether a `UdpBound` confirmation is still owed for the latest
+    /// [`bind_udp`](WorkerState::bind_udp). The relay keepalive reuses the
+    /// `Bind` payload and the server confirms every one, so only the first
+    /// confirmation after a bind is announced.
+    awaiting_udp_bound: bool,
     interface_snapshot: Option<InterfaceSnapshot>,
     next_interface_poll: Instant,
     next_file_transfer: u64,
@@ -2032,6 +2038,12 @@ struct PeerConnection {
     send_counter: u64,
     recv_replay: AntiReplay,
     connection_id: u64,
+    /// The peer's candidate generation this agent was built from.
+    remote_generation: u64,
+    /// Our own candidate generation when this agent was built. A local restart
+    /// bumps it, so a matching `P2pPeer` must still rebuild the agent to pick
+    /// up the fresh local candidates.
+    local_generation: u64,
     /// When the current healthy direct path was first observed, the clock for
     /// the [`DIRECT_CONFIRM_WINDOW`] confirmation. `None` while no healthy direct
     /// path exists.
@@ -3605,16 +3617,24 @@ impl WorkerState {
                 }
             }
             ServerControl::UdpBound => {
-                kvlog::info!("client udp bound");
-                let _ = self
-                    .events
-                    .send(NetworkEvent::Status("udp media bound".to_string()));
+                if self.awaiting_udp_bound {
+                    self.awaiting_udp_bound = false;
+                    kvlog::info!("client udp bound");
+                    let _ = self
+                        .events
+                        .send(NetworkEvent::Status("udp media bound".to_string()));
+                }
             }
             ServerControl::UdpReflexive { addr } => match addr.parse::<SocketAddr>() {
                 Ok(addr) => {
                     kvlog::info!("client udp reflexive address received", addr = %addr);
-                    self.p2p_reflexive_addr = Some(addr);
-                    self.publish_p2p_candidates();
+                    // The server answers every relay keepalive `Bind` with a
+                    // fresh `UdpReflexive`, so an unchanged address must not
+                    // republish or the peers re-pair once per keepalive.
+                    if self.p2p_reflexive_addr != Some(addr) {
+                        self.p2p_reflexive_addr = Some(addr);
+                        self.publish_p2p_candidates();
+                    }
                 }
                 Err(error) => {
                     kvlog::warn!("invalid udp reflexive address", addr = addr.as_str(), error = %error);
@@ -3634,10 +3654,13 @@ impl WorkerState {
                         server_addr,
                         mapped_addr: addr,
                     });
+                    let previous = (self.p2p_nat, self.p2p_reflexive_addr);
                     let classified = self.p2p_nat_classifier.classify();
                     self.p2p_nat = control_nat_kind(classified);
                     self.p2p_reflexive_addr = self.p2p_nat_classifier.primary_reflexive_addr();
-                    self.publish_p2p_candidates();
+                    if (self.p2p_nat, self.p2p_reflexive_addr) != previous {
+                        self.publish_p2p_candidates();
+                    }
                 }
                 Err(error) => {
                     kvlog::warn!(
@@ -3805,6 +3828,7 @@ impl WorkerState {
     fn bind_udp(&mut self) {
         if let Some(session_id) = self.session_id {
             kvlog::info!("udp bind sending", session_id = session_id.0);
+            self.awaiting_udp_bound = true;
             self.send_media(&MediaPayload::Bind { session_id });
             self.send_nat_probe(session_id, 0, self.server_udp_addr);
             if let Some(udp_probe_addr) = self.server_udp_probe_addr {
@@ -4096,6 +4120,18 @@ impl WorkerState {
             );
             return Ok(());
         }
+        if let Some(existing) = self.p2p_peers.get(&peer.session_id)
+            && p2p_peer_is_republish(existing, &peer, self.p2p_generation)
+        {
+            kvlog::info!(
+                "p2p peer republish ignored",
+                session_id = peer.session_id.0,
+                user_id = peer.user_id.0,
+                generation = peer.generation,
+                connection_id = peer.connection_id
+            );
+            return Ok(());
+        }
         let send_key = key_from_control(&peer.send_key)?;
         let recv_key = key_from_control(&peer.recv_key)?;
         let stun_key = key_from_control(&peer.stun_key)?.bytes;
@@ -4158,6 +4194,8 @@ impl WorkerState {
                 send_counter: 0,
                 recv_replay: AntiReplay::new(),
                 connection_id: peer.connection_id,
+                remote_generation: peer.generation,
+                local_generation: self.p2p_generation,
                 direct_stable_since: None,
                 last_direct_inbound: None,
                 rtt_in_flight: VecDeque::new(),
@@ -5502,6 +5540,20 @@ fn key_from_control(key: &P2pKey) -> Result<KeyMaterial, String> {
     Ok(KeyMaterial { id: key.id, bytes })
 }
 
+/// Whether an incoming `P2pPeer` merely republishes the connection already
+/// installed for the session: the server link and both sides' candidate
+/// generations are unchanged, so the live agent — and its selected direct
+/// path — must be kept rather than rebuilt.
+fn p2p_peer_is_republish(
+    installed: &PeerConnection,
+    peer: &P2pPeerInfo,
+    local_generation: u64,
+) -> bool {
+    installed.connection_id == peer.connection_id
+        && installed.remote_generation == peer.generation
+        && installed.local_generation == local_generation
+}
+
 fn p2p_username(connection_id: u64) -> String {
     format!("chatt-p2p:{connection_id}")
 }
@@ -5615,6 +5667,90 @@ mod tests {
             IpAddr::V4(v4) => v4.is_private(),
             IpAddr::V6(v6) => (v6.octets()[0] & 0xfe) == 0xfc,
         }
+    }
+
+    fn test_peer_connection(
+        connection_id: u64,
+        remote_generation: u64,
+        local_generation: u64,
+    ) -> PeerConnection {
+        let agent = TraversalAgent::new(
+            Instant::now(),
+            P2pAgentConfig::with_auth(StunAuth::new([0u8; 32], [0u8; 32])),
+            IceRole::Controlling,
+            1,
+            NatKind::Cone,
+            NatKind::Cone,
+            vec![cand(1, CandidateKind::Host, "10.0.0.2:5000")],
+            vec![cand(2, CandidateKind::Host, "10.0.0.3:5001")],
+        );
+        PeerConnection {
+            user_id: user(2),
+            agent,
+            send_key: KeyMaterial {
+                id: 1,
+                bytes: [0u8; KEY_LEN],
+            },
+            recv_key: KeyMaterial {
+                id: 2,
+                bytes: [0u8; KEY_LEN],
+            },
+            send_counter: 0,
+            recv_replay: AntiReplay::new(),
+            connection_id,
+            remote_generation,
+            local_generation,
+            direct_stable_since: None,
+            last_direct_inbound: None,
+            rtt_in_flight: VecDeque::new(),
+            rtt_ms: None,
+        }
+    }
+
+    fn test_peer_info(connection_id: u64, generation: u64) -> P2pPeerInfo {
+        let key = P2pKey {
+            id: 1,
+            bytes: vec![0u8; KEY_LEN],
+        };
+        P2pPeerInfo {
+            room_id: RoomId(1),
+            session_id: SessionId(9),
+            user_id: user(2),
+            generation,
+            role: P2pRole::Controlled,
+            nat: P2pNatKind::Cone,
+            tie_breaker: 7,
+            candidates: vec![ctrl("10.0.0.3:5001", P2pCandidateKind::Host)],
+            send_key: key.clone(),
+            recv_key: key.clone(),
+            stun_key: key,
+            connection_id,
+        }
+    }
+
+    #[test]
+    fn republished_p2p_peer_keeps_installed_agent() {
+        let installed = test_peer_connection(14, 1, 1);
+        assert!(p2p_peer_is_republish(&installed, &test_peer_info(14, 1), 1));
+        // A peer restart bumps its generation and must rebuild the agent.
+        assert!(!p2p_peer_is_republish(
+            &installed,
+            &test_peer_info(14, 2),
+            1
+        ));
+        // A local restart bumps our own generation: the fresh local candidates
+        // only reach the agent through a rebuild.
+        assert!(!p2p_peer_is_republish(
+            &installed,
+            &test_peer_info(14, 1),
+            2
+        ));
+        // A new server link means new keys, never a republish.
+        assert!(!p2p_peer_is_republish(
+            &installed,
+            &test_peer_info(15, 1),
+            1
+        ));
     }
 
     #[test]
