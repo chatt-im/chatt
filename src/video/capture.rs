@@ -1,13 +1,19 @@
-//! Screen capture: spawns a capture subprocess, reads its H.264 Annex-B stdout,
-//! and splits it into access units the publisher streams. The subprocess is
+//! Screen capture: spawns a capture subprocess, reads its H.264/HEVC stdout,
+//! and turns it into access units the publisher streams. The subprocess is
 //! ffmpeg by default, but `screencast start <COMMAND...>` runs any program that
-//! writes Annex-B to stdout.
+//! writes NUT or raw Annex-B to stdout; the format is detected from the first
+//! bytes.
 //!
-//! The default command captures the X11 desktop. `repeat-headers=1` makes x264
-//! emit SPS/PPS in band at every keyframe so a mid-stream viewer bootstraps, and
-//! `sliced-threads=0` keeps one slice per frame so an access unit is one NAL.
-//! The splitter promotes the Phase-0 spike's `split_access_units` into the
-//! client. Codec metadata is derived from the parameter sets by
+//! NUT is preferred: its frame headers carry an explicit payload size, so each
+//! frame emits the moment its bytes arrive. Raw Annex-B has no framing, so an
+//! access unit only completes when the next start code arrives — with
+//! damage-driven capture that next frame may be arbitrarily far away, leaving
+//! the latest frame buffered until the screen changes again.
+//!
+//! The default command captures the X11 desktop into NUT. `repeat-headers=1`
+//! makes x264 emit SPS/PPS in band at every keyframe so a mid-stream viewer
+//! bootstraps, and `sliced-threads=0` keeps one slice per frame so an access
+//! unit is one NAL. Codec metadata is derived from the parameter sets by
 //! [`rpc::bitstream`] in the publisher.
 
 use std::collections::VecDeque;
@@ -20,6 +26,8 @@ use std::thread::{self, JoinHandle};
 use std::time::Instant;
 
 use rpc::bitstream::Codec;
+
+use super::nut::{NUT_MAGIC, NutDemuxer, NutError};
 
 /// How many trailing stderr lines to retain so a capture failure can report why.
 const STDERR_TAIL_LINES: usize = 8;
@@ -146,7 +154,7 @@ pub fn default_ffmpeg_argv() -> Vec<String> {
         "-pix_fmt",
         "yuv420p",
         "-f",
-        "h264",
+        "nut",
         "pipe:1",
     ]
     .iter()
@@ -181,7 +189,7 @@ pub fn hevc_ffmpeg_argv() -> Vec<String> {
         "-x265-params",
         "repeat-headers=1:keyint=60:min-keyint=60:log-level=none",
         "-f",
-        "hevc",
+        "nut",
         "pipe:1",
     ]
     .iter()
@@ -277,7 +285,7 @@ fn read_loop(
     stop: &AtomicBool,
     failure_reason: &Mutex<Option<String>>,
 ) {
-    let mut splitter = Splitter::new(codec);
+    let mut ingest = Ingest::new(codec);
     let mut buf = [0u8; 64 * 1024];
     loop {
         if stop.load(Ordering::Relaxed) {
@@ -285,9 +293,9 @@ fn read_loop(
         }
         match stdout.read(&mut buf) {
             Ok(0) => break,
-            Ok(n) => match splitter.push(&buf[..n], frame_tx) {
+            Ok(n) => match ingest.push(&buf[..n], frame_tx) {
                 Ok(()) => {}
-                Err(SplitterError::SenderClosed) => return,
+                Err(IngestError::SenderClosed) => return,
                 Err(error) => {
                     if let Ok(mut reason) = failure_reason.lock() {
                         *reason = Some(error.to_string());
@@ -302,12 +310,90 @@ fn read_loop(
             }
         }
     }
-    splitter.flush(frame_tx);
+    ingest.flush(frame_tx);
+}
+
+/// Stream-format dispatcher: buffers the first bytes until they either match
+/// the NUT ID string or diverge from it (raw Annex-B diverges on its first
+/// zero byte), then routes everything to the NUT demuxer or the Annex-B
+/// splitter.
+enum Ingest {
+    Probing { codec: Codec, buffered: Vec<u8> },
+    Nut { demuxer: NutDemuxer, frames: Vec<CapturedFrame> },
+    AnnexB(Splitter),
+}
+
+impl Ingest {
+    fn new(codec: Codec) -> Self {
+        Ingest::Probing {
+            codec,
+            buffered: Vec::new(),
+        }
+    }
+
+    fn push(
+        &mut self,
+        bytes: &[u8],
+        frame_tx: &Sender<CapturedFrame>,
+    ) -> Result<(), IngestError> {
+        if let Ingest::Probing { codec, buffered } = self {
+            buffered.extend_from_slice(bytes);
+            if buffered.len() < NUT_MAGIC.len() && NUT_MAGIC.starts_with(buffered) {
+                return Ok(());
+            }
+            let codec = *codec;
+            let buffered = std::mem::take(buffered);
+            *self = if buffered.starts_with(NUT_MAGIC) {
+                Ingest::Nut {
+                    demuxer: NutDemuxer::new(codec),
+                    frames: Vec::new(),
+                }
+            } else {
+                Ingest::AnnexB(Splitter::new(codec))
+            };
+            return self.feed(&buffered, frame_tx);
+        }
+        self.feed(bytes, frame_tx)
+    }
+
+    fn feed(
+        &mut self,
+        bytes: &[u8],
+        frame_tx: &Sender<CapturedFrame>,
+    ) -> Result<(), IngestError> {
+        match self {
+            Ingest::Probing { .. } => unreachable!("push resolves probing before feeding"),
+            Ingest::AnnexB(splitter) => splitter.push(bytes, frame_tx),
+            Ingest::Nut { demuxer, frames } => {
+                demuxer.push(bytes, frames).map_err(|error| match error {
+                    NutError::CodecMismatch => IngestError::CodecMismatch,
+                    NutError::Malformed(what) => IngestError::MalformedNut(what),
+                })?;
+                for frame in frames.drain(..) {
+                    frame_tx
+                        .send(frame)
+                        .map_err(|_| IngestError::SenderClosed)?;
+                }
+                Ok(())
+            }
+        }
+    }
+
+    /// Emits whatever a closed stdout leaves complete. Only the Annex-B path
+    /// holds a finished unit back (it waits for the next start code); a NUT
+    /// frame is emitted as soon as its payload ends, so a partial one is just
+    /// truncated output.
+    fn flush(&mut self, frame_tx: &Sender<CapturedFrame>) {
+        if let Ingest::AnnexB(splitter) = self {
+            splitter.flush(frame_tx);
+        }
+    }
 }
 
 /// Incremental Annex-B access-unit splitter. A NAL is complete once the next
-/// start code arrives, so units emit with one frame of latency, which is
-/// negligible for live view.
+/// start code arrives, so units emit with one frame of latency; with
+/// damage-driven capture that can hold the latest frame back indefinitely,
+/// which is why NUT output is preferred.
 struct Splitter {
     codec: Codec,
     buf: Vec<u8>,
@@ -318,21 +404,25 @@ struct Splitter {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum SplitterError {
+enum IngestError {
     SenderClosed,
     MissingAnnexBStartCode,
     CodecMismatch,
+    MalformedNut(&'static str),
 }
 
-impl std::fmt::Display for SplitterError {
+impl std::fmt::Display for IngestError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            SplitterError::SenderClosed => f.write_str("screen capture reader stopped"),
-            SplitterError::MissingAnnexBStartCode => {
+            IngestError::SenderClosed => f.write_str("screen capture reader stopped"),
+            IngestError::MissingAnnexBStartCode => {
                 f.write_str("screen capture output is not Annex-B video")
             }
-            SplitterError::CodecMismatch => {
+            IngestError::CodecMismatch => {
                 f.write_str("screen capture output does not match the selected video codec")
+            }
+            IngestError::MalformedNut(what) => {
+                write!(f, "screen capture NUT output is malformed ({what})")
             }
         }
     }
@@ -386,12 +476,12 @@ impl Splitter {
         &mut self,
         bytes: &[u8],
         frame_tx: &Sender<CapturedFrame>,
-    ) -> Result<(), SplitterError> {
+    ) -> Result<(), IngestError> {
         self.buf.extend_from_slice(bytes);
         let codes = start_code_offsets(&self.buf);
         if codes.len() < 2 {
             if codes.is_empty() && self.buf.len() >= FORMAT_PROBE_BYTES {
-                return Err(SplitterError::MissingAnnexBStartCode);
+                return Err(IngestError::MissingAnnexBStartCode);
             }
             return Ok(());
         }
@@ -407,7 +497,7 @@ impl Splitter {
                 if let Some(frame) = self.push_nal(&nal)? {
                     frame_tx
                         .send(frame)
-                        .map_err(|_| SplitterError::SenderClosed)?;
+                        .map_err(|_| IngestError::SenderClosed)?;
                 }
             }
         }
@@ -443,9 +533,9 @@ impl Splitter {
 
     /// Appends one NAL to the current unit, emitting the previous unit when this
     /// NAL begins a new one.
-    fn push_nal(&mut self, nal: &[u8]) -> Result<Option<CapturedFrame>, SplitterError> {
+    fn push_nal(&mut self, nal: &[u8]) -> Result<Option<CapturedFrame>, IngestError> {
         if !nal_compatible_with_codec(self.codec, nal) {
-            return Err(SplitterError::CodecMismatch);
+            return Err(IngestError::CodecMismatch);
         }
         let class = classify_nal(self.codec, nal);
         let starts_new_unit = self.unit_has_vcl && (class.is_vcl || class.is_param_or_meta);
@@ -481,7 +571,7 @@ impl Splitter {
 }
 
 /// Offsets of each `00 00 01` start code in an Annex-B stream.
-fn start_code_offsets(stream: &[u8]) -> Vec<usize> {
+pub(super) fn start_code_offsets(stream: &[u8]) -> Vec<usize> {
     let mut offsets = Vec::new();
     let mut index = 0;
     while index + 3 <= stream.len() {
@@ -624,7 +714,7 @@ mod tests {
         let bytes = vec![b'x'; FORMAT_PROBE_BYTES];
         assert_eq!(
             splitter.push(&bytes, &tx),
-            Err(SplitterError::MissingAnnexBStartCode)
+            Err(IngestError::MissingAnnexBStartCode)
         );
     }
 
@@ -633,6 +723,32 @@ mod tests {
         let (tx, _rx) = mpsc::channel();
         let mut splitter = Splitter::new(Codec::Hevc);
         let h264 = annexb(&[&[0x67, 0x42, 0xc0, 0x1f], &[0x68, 0x00]]);
-        assert_eq!(splitter.push(&h264, &tx), Err(SplitterError::CodecMismatch));
+        assert_eq!(splitter.push(&h264, &tx), Err(IngestError::CodecMismatch));
+    }
+
+    #[test]
+    fn ingest_routes_annex_b_output_to_the_splitter() {
+        let stream = annexb(&[&[0x67, 0x42, 0xc0, 0x1f], &[0x65, 0x88], &[0x41, 0x9a]]);
+        let (tx, rx) = mpsc::channel();
+        let mut ingest = Ingest::new(Codec::H264);
+        ingest.push(&stream, &tx).unwrap();
+        ingest.flush(&tx);
+        let frames: Vec<_> = rx.try_iter().collect();
+        assert_eq!(frames.len(), 2);
+        assert!(frames[0].is_key);
+    }
+
+    #[test]
+    fn ingest_detects_nut_magic_across_chunk_boundaries() {
+        let (tx, _rx) = mpsc::channel();
+        let mut ingest = Ingest::new(Codec::H264);
+        for byte in NUT_MAGIC {
+            ingest.push(&[*byte], &tx).unwrap();
+        }
+        // A frame byte before any NUT header proves the NUT path took over.
+        assert_eq!(
+            ingest.push(&[0xff], &tx),
+            Err(IngestError::MalformedNut("frame before main header"))
+        );
     }
 }

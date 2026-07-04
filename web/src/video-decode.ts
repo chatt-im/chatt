@@ -60,6 +60,13 @@ export class ScreenShareDecoder {
   private pending: VideoFrame[] = [];
   private skippedBeforeKey = 0;
   private warnedWaitingForKey = false;
+  // Timestamp of the last frame accepted for decode, to flag duplicated or
+  // reordered frames (a delta decoded twice, or on the wrong reference,
+  // corrupts the picture until the next keyframe).
+  private lastAcceptedTsMs = Number.NEGATIVE_INFINITY;
+  // Highest chunk timestamp (microseconds) handed to the decoder, so the
+  // output callback can tell an intermediate catch-up frame from the newest.
+  private newestSubmittedUs = Number.NEGATIVE_INFINITY;
 
   constructor(private canvas: HTMLCanvasElement) {}
 
@@ -94,7 +101,15 @@ export class ScreenShareDecoder {
         }
         this.decoded = true;
         this.replay.length = 0;
-        if (ctx) {
+        // While catching up (fast-start burst, or decode falling behind), more
+        // frames are already queued behind this one. Drawing each of them would
+        // flash the whole backlog across the canvas and canvas draws are slow,
+        // so skip intermediate frames and draw only the newest one. The newest
+        // submitted frame itself always draws, so the canvas never sticks on a
+        // stale frame when the stream then goes quiet.
+        const catchingUp =
+          this.pending.length > 0 || decoded.timestamp < this.newestSubmittedUs;
+        if (ctx && !catchingUp) {
           if (this.canvas.width !== decoded.displayWidth) this.canvas.width = decoded.displayWidth;
           if (this.canvas.height !== decoded.displayHeight)
             this.canvas.height = decoded.displayHeight;
@@ -123,6 +138,8 @@ export class ScreenShareDecoder {
     this.pending.length = 0;
     this.skippedBeforeKey = 0;
     this.warnedWaitingForKey = false;
+    this.lastAcceptedTsMs = Number.NEGATIVE_INFINITY;
+    this.newestSubmittedUs = Number.NEGATIVE_INFINITY;
   }
 
   // Retries in software when a hardware decoder fails before drawing a frame,
@@ -134,6 +151,7 @@ export class ScreenShareDecoder {
       alreadySoftware: this.preferSoftware,
       state: this.decoder?.state,
       buffered: this.replay.length,
+      pending: this.pending.length,
       message: error.message,
     });
     if (this.decoded || this.preferSoftware) {
@@ -143,17 +161,29 @@ export class ScreenShareDecoder {
     console.warn("[screenshare] hardware decode failed, falling back to software");
     this.preferSoftware = true;
     const chunks = this.replay;
+    // The frames still queued behind the failed decoder are part of the same
+    // GOP; dropping them would leave a gap after the replayed chunks and the
+    // stream would decode corrupt until the next keyframe. Capture them before
+    // start() clears the queue and requeue them after the replay.
+    const pending = this.pending;
     this.replay = [];
+    this.pending = [];
     this.start();
-    console.info("[screenshare] replaying", chunks.length, "buffered chunks in software");
+    console.info(
+      "[screenshare] replaying in software",
+      { chunks: chunks.length, pending: pending.length },
+    );
     for (const chunk of chunks) {
       if (chunk.type === "key") this.sawKey = true;
+      this.newestSubmittedUs = Math.max(this.newestSubmittedUs, chunk.timestamp);
       try {
         this.decoder?.decode(chunk);
       } catch (replayError) {
         console.error("[screenshare] replay decode threw", replayError);
       }
     }
+    this.pending = pending;
+    this.pump();
   }
 
   decode(frame: VideoFrame) {
@@ -184,6 +214,14 @@ export class ScreenShareDecoder {
         bytes: frame.data.byteLength,
       });
     }
+    if (!frame.isKey && frame.tsMs <= this.lastAcceptedTsMs) {
+      console.warn("[screenshare] non-monotonic delta frame", {
+        streamId: frame.streamId,
+        tsMs: frame.tsMs,
+        lastTsMs: this.lastAcceptedTsMs,
+      });
+    }
+    this.lastAcceptedTsMs = frame.tsMs;
     if (frame.isKey && this.shouldRestartAtKeyframe()) {
       console.warn("[screenshare] restarting decoder at fresh keyframe", {
         streamId: frame.streamId,
@@ -247,6 +285,7 @@ export class ScreenShareDecoder {
       if (frame.isKey) this.replay.length = 0;
       this.replay.push(chunk);
     }
+    this.newestSubmittedUs = Math.max(this.newestSubmittedUs, chunk.timestamp);
     try {
       this.decoder.decode(chunk);
     } catch (error) {
