@@ -289,7 +289,12 @@ Useful in-app slash commands:
 - `/settings` or `/config`: open settings.
 - `/clear`: clear the local chat view.
 
-The default key bindings are in `chatt.toml` under `[bindings.*]`.
+The default key bindings are in `chatt.toml` under `[bindings.*]`. A bindings
+table can set `inherit = ["name", ...]` to pull in another table's bindings
+before its own keys, so its own keys always win. A table whose name is not a
+layer (like the default `list`) is a reusable template: it only takes effect
+where it is inherited, and a table that is neither a layer nor inherited
+anywhere is reported as an unknown-key warning.
 
 ### Pasting from the clipboard
 

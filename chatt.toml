@@ -151,23 +151,7 @@ viewer-in-seperate-browser-tab = false
 "F3" = "OpenUserList"
 "." = "ToggleKeyPreview"
 
-[bindings.picker]
-"C-c" = "Quit"
-"ESC" = "Cancel"
-"q" = "Cancel"
-"C-k" = "RoomSwitcher"
-"j" = "SelectNext"
-"k" = "SelectPrev"
-"DOWN" = "SelectNext"
-"UP" = "SelectPrev"
-"ENTER" = "Activate"
-"e" = "EditServer"
-"d" = "DeleteServer"
-"/" = "SearchServers"
-"F2" = "OpenSettings"
-"." = "ToggleKeyPreview"
-
-[bindings.users]
+[bindings.list]
 "C-c" = "Quit"
 "ESC" = "Cancel"
 "q" = "Cancel"
@@ -179,9 +163,20 @@ viewer-in-seperate-browser-tab = false
 "C-d" = "HalfPageDown"
 "C-u" = "HalfPageUp"
 "ENTER" = "Activate"
+"." = "ToggleKeyPreview"
+
+[bindings.picker]
+inherit = ["list"]
+"C-k" = "RoomSwitcher"
+"e" = "EditServer"
+"d" = "DeleteServer"
+"/" = "SearchServers"
+"F2" = "OpenSettings"
+
+[bindings.users]
+inherit = ["list"]
 "d" = "StartDm"
 "/" = "SearchServers"
-"." = "ToggleKeyPreview"
 
 [bindings.form]
 "C-c" = "Quit"
