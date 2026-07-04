@@ -13,8 +13,8 @@ use chatt::audio::StatsSnapshot;
 
 use crate::{
     app::{
-        App, ChatPanelFocus, ParticipantState, ParticipantVoiceFeedback, ScreencastPhase,
-        ServerEditDraft, ServerSelectItem, StatusKind,
+        App, ChatPanelFocus, LocalVoiceMode, ParticipantState, ParticipantVoiceFeedback,
+        ScreencastPhase, ServerEditDraft, ServerSelectItem, StatusKind,
         audio_supervisor::AudioHealthState,
         room::{RoomSelectItem, TransferProgress},
         volume_db_label,
@@ -35,6 +35,7 @@ fn prepare_screen(app: &mut App, buf: &mut Buffer) -> Option<StatsSnapshot> {
         .capture
         .as_ref()
         .map(|capture| capture.stats().snapshot());
+    app.chrome.top_bar.live = Rect::EMPTY;
     app.chrome.top_bar.mute = Rect::EMPTY;
     app.chrome.top_bar.deafen = Rect::EMPTY;
     app.chrome.top_bar.video = Rect::EMPTY;
@@ -938,28 +939,7 @@ fn draw_top_bar(area: Rect, app: &mut App, buf: &mut Buffer, capture: Option<&St
 
     let mut right = area;
     app.chrome.top_bar.video = draw_video_status_block(&mut right, app, buf);
-    let deafened = app.deafened.load(Ordering::Relaxed);
-    let muted = deafened || app.mic_muted.load(Ordering::Relaxed);
-    app.chrome.top_bar.deafen = draw_status_segment_right(
-        &mut right,
-        buf,
-        if deafened {
-            theme.status_section.patch(theme.warn) | Modifier::BOLD
-        } else {
-            theme.status_fill.patch(theme.good)
-        },
-        if deafened { " DEAF " } else { " HEAR " },
-    );
-    app.chrome.top_bar.mute = draw_status_segment_right(
-        &mut right,
-        buf,
-        if muted {
-            theme.status_section.patch(theme.warn) | Modifier::BOLD
-        } else {
-            theme.status_fill.patch(theme.good)
-        },
-        if muted { " MUTED " } else { " MIC " },
-    );
+    draw_top_bar_voice_buttons(&mut right, app, buf);
     draw_status_segment_right(&mut right, buf, theme.status_fill, " ");
 
     let meter_width = right.w.min(14);
@@ -967,34 +947,23 @@ fn draw_top_bar(area: Rect, app: &mut App, buf: &mut Buffer, capture: Option<&St
         let meter = right.take_right(meter_width as i32);
         ui::vu::draw_status_vu(meter, buf, capture, &theme);
     }
-    draw_status_segment_right(&mut right, buf, theme.status_fill, " ");
-    draw_status_segment_right(
-        &mut right,
-        buf,
-        theme.status_fill.patch(voice_style(app)),
-        &format!(
-            " {} {} ",
-            voice_state_label(app),
-            mic_status_compact(app, capture)
-        ),
-    );
 }
 
 fn draw_video_status_block(row: &mut Rect, app: &App, buf: &mut Buffer) -> Rect {
     let (style, label) = match app.screencast_status.phase {
         ScreencastPhase::Starting => (
-            video_badge_style(app.theme, app.theme.good),
+            top_bar_active_button_style(app.theme, app.theme.good),
             " VIDEO starting ".to_string(),
         ),
         ScreencastPhase::Live => (
-            video_badge_style(app.theme, app.theme.good),
+            top_bar_active_button_style(app.theme, app.theme.good),
             format!(
                 " VIDEO {}/s ",
                 format_bytes(app.screencast_status.rolling_bytes_per_sec)
             ),
         ),
         ScreencastPhase::Failed => (
-            video_badge_style(app.theme, app.theme.error),
+            top_bar_active_button_style(app.theme, app.theme.error),
             " VIDEO FAILED ".to_string(),
         ),
         ScreencastPhase::Idle => return Rect::EMPTY,
@@ -1002,7 +971,51 @@ fn draw_video_status_block(row: &mut Rect, app: &App, buf: &mut Buffer) -> Rect 
     draw_status_segment_right(row, buf, style | Modifier::BOLD, &label)
 }
 
-fn video_badge_style(theme: Theme, accent: Style) -> Style {
+fn draw_top_bar_voice_buttons(row: &mut Rect, app: &mut App, buf: &mut Buffer) {
+    app.chrome.top_bar.deafen = draw_status_segment_right(
+        row,
+        buf,
+        top_bar_voice_button_style(app, LocalVoiceMode::Deafened),
+        " DEAF ",
+    );
+    app.chrome.top_bar.mute = draw_status_segment_right(
+        row,
+        buf,
+        top_bar_voice_button_style(app, LocalVoiceMode::Muted),
+        " MUTE ",
+    );
+    app.chrome.top_bar.live = draw_status_segment_right(
+        row,
+        buf,
+        top_bar_voice_button_style(app, LocalVoiceMode::Live),
+        " LIVE ",
+    );
+}
+
+fn top_bar_voice_button_style(app: &App, button: LocalVoiceMode) -> Style {
+    let theme = app.theme;
+    if app.local_voice_mode() != button {
+        return top_bar_inactive_button_style(theme, button);
+    }
+
+    match button {
+        LocalVoiceMode::Live => top_bar_active_button_style(theme, theme.good) | Modifier::BOLD,
+        LocalVoiceMode::Muted => top_bar_active_button_style(theme, theme.warn) | Modifier::BOLD,
+        LocalVoiceMode::Deafened => {
+            top_bar_active_button_style(theme, theme.error) | Modifier::BOLD
+        }
+    }
+}
+
+fn top_bar_inactive_button_style(theme: Theme, button: LocalVoiceMode) -> Style {
+    match button {
+        LocalVoiceMode::Live => theme.status_section.patch(theme.muted),
+        LocalVoiceMode::Muted => theme.status_fill.patch(theme.muted),
+        LocalVoiceMode::Deafened => theme.selected_line.patch(theme.muted),
+    }
+}
+
+fn top_bar_active_button_style(theme: Theme, accent: Style) -> Style {
     match accent.fg().or_else(|| accent.bg()) {
         Some(color) => theme.mode_server_edit.with_bg(color),
         None => theme.status_fill.patch(accent),
@@ -1520,6 +1533,30 @@ mod tests {
     }
 
     #[test]
+    fn top_bar_active_voice_buttons_use_state_fill_and_badge_foreground() {
+        let theme = Theme::tomorrow_night();
+        for accent in [theme.good, theme.warn, theme.error] {
+            let style = top_bar_active_button_style(theme, accent);
+            assert_eq!(style.bg(), accent.fg());
+            assert_eq!(style.fg(), theme.mode_server_edit.fg());
+        }
+    }
+
+    #[test]
+    fn top_bar_inactive_voice_buttons_use_visible_grey_backgrounds() {
+        let theme = Theme::base16_dark();
+        let live = top_bar_inactive_button_style(theme, LocalVoiceMode::Live);
+        let mute = top_bar_inactive_button_style(theme, LocalVoiceMode::Muted);
+        let deaf = top_bar_inactive_button_style(theme, LocalVoiceMode::Deafened);
+
+        assert!(live.bg().is_some());
+        assert!(mute.bg().is_some());
+        assert!(deaf.bg().is_some());
+        assert_ne!(live.bg(), mute.bg());
+        assert_ne!(mute.bg(), deaf.bg());
+    }
+
+    #[test]
     fn key_preview_entries_are_deterministic_and_reuse_buffer() {
         let runtime = bindings::BindingRuntime::default();
         let layer = bindings::WORKSPACE_LAYER;
@@ -1944,84 +1981,6 @@ fn connection_state_label(app: &App) -> &'static str {
         "Connected"
     } else {
         "Connecting"
-    }
-}
-
-fn voice_style(app: &App) -> Style {
-    if audio_failed(app) {
-        app.theme.error
-    } else if app.deafened.load(Ordering::Relaxed) {
-        app.theme.warn
-    } else if app.voice_tx_enabled.load(Ordering::Relaxed) {
-        app.theme.good
-    } else if app.user_id.is_some() {
-        app.theme.warn
-    } else {
-        app.theme.status_fill
-    }
-}
-
-/// True when capture or playback failed to start while the client is in a call.
-/// Drives the persistent status-bar indicator so a dead audio path is visible
-/// rather than only flashing a transient status line.
-fn audio_failed(app: &App) -> bool {
-    app.user_id.is_some()
-        && (!app.capture_audio_health().is_healthy()
-            || !app.playback_audio_health().is_healthy()
-            || app.mic_error.is_some()
-            || app.playback_error.is_some())
-}
-
-fn mic_status_compact(app: &App, capture: Option<&StatsSnapshot>) -> String {
-    if !app.capture_audio_health().is_healthy() {
-        return "mic reconnecting".to_string();
-    }
-    if !app.playback_audio_health().is_healthy() {
-        return "speaker reconnecting".to_string();
-    }
-    if app.mic_error.is_some() {
-        return "mic unavailable".to_string();
-    }
-    if app.playback_error.is_some() {
-        return "speaker unavailable".to_string();
-    }
-    if app.config.soundboard.enabled {
-        return if app.soundboard_busy.load(Ordering::Relaxed) {
-            "soundboard playing".to_string()
-        } else {
-            format!("soundboard {} clips", app.config.soundboard.clips.len())
-        };
-    }
-    let mute = if app.deafened.load(Ordering::Relaxed) {
-        "deaf"
-    } else if app.settings_preview_capture && !app.voice_tx_enabled.load(Ordering::Relaxed) {
-        "preview"
-    } else if app.mic_muted.load(Ordering::Relaxed) {
-        "muted"
-    } else {
-        "open"
-    };
-    match capture {
-        Some(capture) => format!(
-            "{mute} {}kbps vad{:02}%",
-            app.config.audio.bitrate_bps / 1000,
-            (capture.vad_probability.clamp(0.0, 1.0) * 100.0).round() as u32
-        ),
-        None => format!("{mute} inactive"),
-    }
-}
-
-fn voice_state_label(app: &App) -> &'static str {
-    if audio_failed(app) {
-        "audio error"
-    } else if app.deafened.load(Ordering::Relaxed) {
-        "deafened"
-    } else if app.voice_tx_enabled.load(Ordering::Relaxed) {
-        "voice"
-    } else if app.user_id.is_some() {
-        "voice"
-    } else {
-        "offline"
     }
 }
 

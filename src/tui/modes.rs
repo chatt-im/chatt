@@ -1426,6 +1426,15 @@ mod tests {
         }
     }
 
+    fn row_text(buffer: &mut Buffer, row: u16) -> String {
+        let width = buffer.current().width();
+        let mut text = String::new();
+        for column in 0..width {
+            text.push_str(&cell_text(buffer, column, row));
+        }
+        text
+    }
+
     fn enter_room_one(app: &mut App) {
         if app.room.viewed_room.is_some() {
             return;
@@ -2101,6 +2110,37 @@ mod tests {
 
         room.process_input(&mut app, ctrl('h'));
         assert!(app.deafened.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn top_bar_uses_fixed_voice_buttons_without_compact_status() {
+        let mut app = test_app();
+        app.voice_tx_enabled.store(true, Ordering::Relaxed);
+        let mut room = RoomMode::default();
+        let mut buffer = Buffer::new(100, 24);
+
+        render_room(&mut app, &mut room, &mut buffer);
+        let live_row = row_text(&mut buffer, 0);
+        assert!(live_row.contains(" LIVE  MUTE  DEAF "));
+        assert!(!live_row.contains("voice"));
+        assert!(!live_row.contains("open"));
+        assert!(!live_row.contains("kbps"));
+        assert!(!live_row.contains("vad"));
+        assert!(!live_row.contains(" MIC "));
+        assert!(!live_row.contains(" HEAR "));
+
+        app.voice_tx_enabled.store(false, Ordering::Relaxed);
+        app.mic_muted.store(true, Ordering::Relaxed);
+        render_room(&mut app, &mut room, &mut buffer);
+        let muted_row = row_text(&mut buffer, 0);
+        assert!(muted_row.contains(" LIVE  MUTE  DEAF "));
+        assert!(!muted_row.contains(" MUTED "));
+
+        app.deafened.store(true, Ordering::Relaxed);
+        render_room(&mut app, &mut room, &mut buffer);
+        let deaf_row = row_text(&mut buffer, 0);
+        assert!(deaf_row.contains(" LIVE  MUTE  DEAF "));
+        assert!(!deaf_row.contains(" HEAR "));
     }
 
     #[test]

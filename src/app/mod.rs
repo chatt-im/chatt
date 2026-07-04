@@ -387,6 +387,13 @@ pub(crate) struct App {
     active_server_label: Option<String>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum LocalVoiceMode {
+    Live,
+    Muted,
+    Deafened,
+}
+
 /// A share this client can view: the secret to bring up a viewer connection and
 /// the codec metadata to configure the browser decoder.
 struct AvailableShare {
@@ -434,12 +441,6 @@ struct DeviceProbeState {
 pub(crate) struct AudioSideHealth {
     pub(crate) state: AudioHealthState,
     pub(crate) device_name: Option<String>,
-}
-
-impl AudioSideHealth {
-    pub(crate) fn is_healthy(&self) -> bool {
-        self.state == AudioHealthState::Healthy
-    }
 }
 
 /// Edge detectors over the capture stats snapshot, so each failure episode
@@ -2579,12 +2580,16 @@ impl App {
         if !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
             return false;
         }
+        if rect_contains(self.chrome.top_bar.live, mouse.column, mouse.row) {
+            self.activate_top_bar_voice_mode(LocalVoiceMode::Live);
+            return true;
+        }
         if rect_contains(self.chrome.top_bar.mute, mouse.column, mouse.row) {
-            self.toggle_mute();
+            self.activate_top_bar_voice_mode(LocalVoiceMode::Muted);
             return true;
         }
         if rect_contains(self.chrome.top_bar.deafen, mouse.column, mouse.row) {
-            self.set_deafen(!self.deafened.load(Ordering::Relaxed));
+            self.activate_top_bar_voice_mode(LocalVoiceMode::Deafened);
             return true;
         }
         if rect_contains(self.chrome.top_bar.video, mouse.column, mouse.row) {
@@ -4296,6 +4301,54 @@ impl App {
             self.set_status("undeafened");
             self.start_room_voice();
         }
+    }
+
+    pub(crate) fn local_voice_mode(&self) -> LocalVoiceMode {
+        if self.deafened.load(Ordering::Relaxed) {
+            LocalVoiceMode::Deafened
+        } else if self.mic_muted.load(Ordering::Relaxed) {
+            LocalVoiceMode::Muted
+        } else {
+            LocalVoiceMode::Live
+        }
+    }
+
+    fn activate_top_bar_voice_mode(&mut self, requested: LocalVoiceMode) {
+        let mode = if self.local_voice_mode() == requested {
+            LocalVoiceMode::Live
+        } else {
+            requested
+        };
+        self.set_local_voice_mode(mode);
+    }
+
+    fn set_local_voice_mode(&mut self, mode: LocalVoiceMode) {
+        match mode {
+            LocalVoiceMode::Live => {
+                self.deafened.store(false, Ordering::Relaxed);
+                self.mic_muted.store(false, Ordering::Relaxed);
+                self.pending_voice_teardown_at = None;
+                self.publish_voice_status();
+                self.set_status("live");
+                self.ensure_room_voice_running();
+            }
+            LocalVoiceMode::Muted => {
+                self.deafened.store(false, Ordering::Relaxed);
+                self.mic_muted.store(true, Ordering::Relaxed);
+                self.pending_voice_teardown_at = None;
+                self.publish_voice_status();
+                self.set_status("microphone muted");
+                self.ensure_room_voice_running();
+            }
+            LocalVoiceMode::Deafened => self.set_deafen(true),
+        }
+    }
+
+    fn ensure_room_voice_running(&mut self) {
+        if self.voice_tx_enabled.load(Ordering::Relaxed) && self.playback.is_some() {
+            return;
+        }
+        self.start_room_voice();
     }
 
     fn local_voice_status(&self) -> ParticipantVoiceStatus {
@@ -6702,39 +6755,65 @@ mod tests {
         assert_eq!(room.layout().chat_rect.bottom(), expected_chat_bottom);
     }
 
+    fn click_top_bar_rect(app: &mut App, room: &mut RoomMode, rect: extui::Rect) {
+        assert!(!rect.is_empty());
+        room.process_mouse(
+            app,
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: rect.x,
+                row: rect.y,
+                modifiers: KeyModifiers::empty(),
+            },
+        );
+    }
+
     #[test]
-    fn top_bar_audio_indicators_toggle_on_click() {
+    fn top_bar_voice_buttons_select_exclusive_modes() {
         let mut app = test_app();
         let mut room = RoomMode::default();
 
         let mut buffer = Buffer::new(80, 24);
         render_room(&mut app, &mut room, &mut buffer);
-
+        let live_rect = app.chrome.top_bar.live;
         let mute_rect = app.chrome.top_bar.mute;
-        assert!(!mute_rect.is_empty());
-        room.process_mouse(
-            &mut app,
-            MouseEvent {
-                kind: MouseEventKind::Down(MouseButton::Left),
-                column: mute_rect.x,
-                row: mute_rect.y,
-                modifiers: KeyModifiers::empty(),
-            },
-        );
-        assert!(app.mic_muted.load(Ordering::Relaxed));
-
         let deafen_rect = app.chrome.top_bar.deafen;
+        assert!(!live_rect.is_empty());
+        assert!(!mute_rect.is_empty());
         assert!(!deafen_rect.is_empty());
-        room.process_mouse(
-            &mut app,
-            MouseEvent {
-                kind: MouseEventKind::Down(MouseButton::Left),
-                column: deafen_rect.x,
-                row: deafen_rect.y,
-                modifiers: KeyModifiers::empty(),
-            },
-        );
+
+        click_top_bar_rect(&mut app, &mut room, mute_rect);
+        assert_eq!(app.local_voice_mode(), LocalVoiceMode::Muted);
+        assert!(app.mic_muted.load(Ordering::Relaxed));
+        assert!(!app.deafened.load(Ordering::Relaxed));
+
+        click_top_bar_rect(&mut app, &mut room, mute_rect);
+        assert_eq!(app.local_voice_mode(), LocalVoiceMode::Live);
+        assert!(!app.mic_muted.load(Ordering::Relaxed));
+        assert!(!app.deafened.load(Ordering::Relaxed));
+
+        click_top_bar_rect(&mut app, &mut room, deafen_rect);
+        assert_eq!(app.local_voice_mode(), LocalVoiceMode::Deafened);
+        assert!(app.mic_muted.load(Ordering::Relaxed));
         assert!(app.deafened.load(Ordering::Relaxed));
+
+        click_top_bar_rect(&mut app, &mut room, mute_rect);
+        assert_eq!(app.local_voice_mode(), LocalVoiceMode::Muted);
+        assert!(app.mic_muted.load(Ordering::Relaxed));
+        assert!(!app.deafened.load(Ordering::Relaxed));
+
+        click_top_bar_rect(&mut app, &mut room, live_rect);
+        assert_eq!(app.local_voice_mode(), LocalVoiceMode::Live);
+        assert!(!app.mic_muted.load(Ordering::Relaxed));
+        assert!(!app.deafened.load(Ordering::Relaxed));
+
+        click_top_bar_rect(&mut app, &mut room, deafen_rect);
+        assert_eq!(app.local_voice_mode(), LocalVoiceMode::Deafened);
+
+        click_top_bar_rect(&mut app, &mut room, deafen_rect);
+        assert_eq!(app.local_voice_mode(), LocalVoiceMode::Live);
+        assert!(!app.mic_muted.load(Ordering::Relaxed));
+        assert!(!app.deafened.load(Ordering::Relaxed));
     }
 
     #[test]
