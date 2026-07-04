@@ -67,18 +67,44 @@ static NEXT_UPLOAD_TEMP_ID: AtomicU64 = AtomicU64::new(1);
 struct VideoFastStart {
     frames: VecDeque<Vec<u8>>,
     bytes: usize,
+    /// Delta frames dropped since the cache last held a keyframe, for
+    /// diagnostics: a nonzero count means a play click in that window replayed
+    /// nothing and the browser had to wait for the next keyframe.
+    dropped_without_key: u64,
 }
 
 impl VideoFastStart {
-    fn push(&mut self, frame: Vec<u8>, is_key: bool) {
+    fn push(&mut self, stream_id: u32, frame: Vec<u8>, is_key: bool) {
         if is_key {
+            if self.dropped_without_key > 0 {
+                kvlog::info!(
+                    "video fast start resumed at keyframe",
+                    stream_id,
+                    dropped_frames = self.dropped_without_key
+                );
+            }
+            self.dropped_without_key = 0;
             self.frames.clear();
             self.bytes = 0;
         } else if self.frames.is_empty() {
+            self.dropped_without_key += 1;
+            if self.dropped_without_key == 1 {
+                kvlog::warn!(
+                    "video fast start has no keyframe, dropping deltas until the next one",
+                    stream_id
+                );
+            }
             return;
         }
 
         if self.bytes.saturating_add(frame.len()) > VIDEO_FAST_START_MAX_BYTES {
+            kvlog::warn!(
+                "video fast start cache overflowed, pausing until the next keyframe",
+                stream_id,
+                cached_frames = self.frames.len(),
+                cached_bytes = self.bytes,
+                frame_bytes = frame.len()
+            );
             self.frames.clear();
             self.bytes = 0;
             return;
@@ -979,6 +1005,19 @@ fn run(
                     }
                 }
                 Ok(WebFeed::ShareConfig { stream_id, payload }) => {
+                    let cached = video_fast_start.get(&stream_id);
+                    let leads_with_key = cached
+                        .and_then(|cache| cache.frames.front())
+                        .and_then(|frame| video_frame_meta(frame))
+                        .is_some_and(|(_, is_key)| is_key);
+                    kvlog::info!(
+                        "video fast start replay",
+                        stream_id,
+                        frames = cached.map(|cache| cache.frames.len()).unwrap_or(0),
+                        bytes = cached.map(|cache| cache.bytes).unwrap_or(0),
+                        leads_with_key,
+                        clients = clients.len()
+                    );
                     for id in &clients {
                         let _ = server.send_websocket_text(*id, &payload);
                         if let Some(cached) = video_fast_start.get(&stream_id) {
@@ -1014,7 +1053,7 @@ fn run(
                     video_fast_start
                         .entry(stream_id)
                         .or_default()
-                        .push(frame, is_key);
+                        .push(stream_id, frame, is_key);
                 }
                 Ok(WebFeed::Stop) => return,
                 Err(TryRecvError::Empty) => break,
@@ -1234,12 +1273,12 @@ mod tests {
         let new_delta = video::encode_video_frame(5, false, 7, &[5]);
         let mut cache = VideoFastStart::default();
 
-        cache.push(delta_before_key, false);
+        cache.push(7, delta_before_key, false);
         assert!(cache.frames.is_empty());
-        cache.push(old_key, true);
-        cache.push(old_delta, false);
-        cache.push(new_key.clone(), true);
-        cache.push(new_delta.clone(), false);
+        cache.push(7, old_key, true);
+        cache.push(7, old_delta, false);
+        cache.push(7, new_key.clone(), true);
+        cache.push(7, new_delta.clone(), false);
 
         assert_eq!(
             cache.frames.iter().collect::<Vec<_>>(),

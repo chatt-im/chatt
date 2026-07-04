@@ -189,16 +189,20 @@ cargo run -p chatt -- screencast start --hevc
 
 Override the capture with your own command, passing the verbatim argv after
 `start`. Everything after `start` is the command, run directly with no shell, and
-it must write Annex-B to stdout. Add `--hevc` (before the command) when it emits
+it must write NUT (preferred) or raw Annex-B to stdout; the format is detected
+automatically. Prefer NUT: its framing lets each frame stream out the moment it
+is encoded, while raw Annex-B holds every frame back until the next one starts —
+with damage-driven capture (kmsgrab, wl-screenrec) that delays the latest frame
+until the screen changes again. Add `--hevc` (before the command) when it emits
 H.265:
 
 ```sh
-cargo run -p chatt -- screencast start ffmpeg -f x11grab -i :0 -f h264 pipe:1
-cargo run -p chatt -- screencast start wl-screenrec -o HDMI-A-1 --ffmpeg-muxer h264 -f -
+cargo run -p chatt -- screencast start ffmpeg -f x11grab -i :0 -f nut pipe:1
+cargo run -p chatt -- screencast start wl-screenrec -o HDMI-A-1 --ffmpeg-muxer nut -f -
 ```
 
 The command need not be ffmpeg. `wl-screenrec` (Wayland) or any capture tool that
-emits an Annex-B H.264 stream on stdout works. When the capture command fails to
+emits a NUT-muxed or Annex-B H.264 stream on stdout works. When the capture command fails to
 start a stream or exits early, the client shows the reason (the tail of the
 command's stderr). The full stderr is in the client logfile (`--logfile`).
 

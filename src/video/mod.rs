@@ -8,6 +8,7 @@
 //! voice and restarts are cheap.
 
 pub mod capture;
+mod nut;
 mod publisher;
 mod subscriber;
 
