@@ -2,6 +2,7 @@ pub mod bitstream;
 pub mod control;
 pub mod crypto;
 pub mod frame;
+pub mod history;
 pub mod ids;
 pub mod media;
 pub mod msgref;

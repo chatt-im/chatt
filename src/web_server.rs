@@ -383,9 +383,16 @@ enum ClientRequest {
 pub struct WebFeedSender {
     tx: Sender<WebFeed>,
     wake: WakeHandle,
+    #[cfg(test)]
+    local_addr: SocketAddr,
 }
 
 impl WebFeedSender {
+    #[cfg(test)]
+    pub fn local_addr(&self) -> SocketAddr {
+        self.local_addr
+    }
+
     /// Pushes a message to every connected browser and records it in history.
     pub fn send(&self, message: WebMessage) {
         let _ = self.tx.send(WebFeed::Message(message));
@@ -554,7 +561,12 @@ pub fn spawn(
         })?;
 
     kvlog::info!("web server listening", addr = %local);
-    Ok(WebFeedSender { tx, wake })
+    Ok(WebFeedSender {
+        tx,
+        wake,
+        #[cfg(test)]
+        local_addr: local,
+    })
 }
 
 /// The web thread's event loop. Blocks until a socket event or a feed wake.
@@ -1420,13 +1432,13 @@ mod tests {
         let cfg = WebConfig {
             enabled: true,
             readonly: true,
-            bind: "127.0.0.1:39521".to_string(),
+            bind: "127.0.0.1:0".to_string(),
             ..WebConfig::default()
         };
         let (web_tx, _web_rx) = mpsc::channel();
-        let _sender = spawn(&cfg, Some(dir.clone()), 100, web_tx, true).unwrap();
+        let sender = spawn(&cfg, Some(dir.clone()), 100, web_tx, true).unwrap();
 
-        let mut stream = TcpStream::connect("127.0.0.1:39521").unwrap();
+        let mut stream = TcpStream::connect(sender.local_addr()).unwrap();
         stream
             .set_read_timeout(Some(Duration::from_secs(2)))
             .unwrap();
@@ -1458,13 +1470,13 @@ mod tests {
         let cfg = WebConfig {
             enabled: true,
             readonly: true,
-            bind: "127.0.0.1:39523".to_string(),
+            bind: "127.0.0.1:0".to_string(),
             ..WebConfig::default()
         };
         let (web_tx, _web_rx) = mpsc::channel();
-        let _sender = spawn(&cfg, Some(dir.clone()), 100, web_tx, true).unwrap();
+        let sender = spawn(&cfg, Some(dir.clone()), 100, web_tx, true).unwrap();
 
-        let mut stream = TcpStream::connect("127.0.0.1:39523").unwrap();
+        let mut stream = TcpStream::connect(sender.local_addr()).unwrap();
         stream
             .set_read_timeout(Some(Duration::from_secs(2)))
             .unwrap();
@@ -1487,13 +1499,13 @@ mod tests {
         let cfg = WebConfig {
             enabled: true,
             readonly: true,
-            bind: "127.0.0.1:39522".to_string(),
+            bind: "127.0.0.1:0".to_string(),
             ..WebConfig::default()
         };
         let (web_tx, _web_rx) = mpsc::channel();
-        let _sender = spawn(&cfg, Some(dir.clone()), 100, web_tx, true).unwrap();
+        let sender = spawn(&cfg, Some(dir.clone()), 100, web_tx, true).unwrap();
 
-        let mut stream = TcpStream::connect("127.0.0.1:39522").unwrap();
+        let mut stream = TcpStream::connect(sender.local_addr()).unwrap();
         stream
             .set_read_timeout(Some(Duration::from_secs(2)))
             .unwrap();
@@ -1540,13 +1552,13 @@ mod tests {
         let cfg = WebConfig {
             enabled: true,
             readonly: true,
-            bind: "127.0.0.1:39517".to_string(),
+            bind: "127.0.0.1:0".to_string(),
             ..WebConfig::default()
         };
         let (web_tx, _web_rx) = mpsc::channel();
         let sender = spawn(&cfg, None, 100, web_tx, true).unwrap();
 
-        let mut stream = TcpStream::connect("127.0.0.1:39517").unwrap();
+        let mut stream = TcpStream::connect(sender.local_addr()).unwrap();
         stream
             .set_read_timeout(Some(Duration::from_secs(2)))
             .unwrap();
@@ -1623,7 +1635,7 @@ Sec-WebSocket-Version: 13\r\n\
 
     /// Opens a browser feed, draining the sync frame and the config envelope that
     /// always follow a connect, and returns the socket ready for live frames.
-    fn open_ready_ws(addr: &str) -> TcpStream {
+    fn open_ready_ws(addr: impl std::net::ToSocketAddrs) -> TcpStream {
         let mut stream = open_ws(addr);
         let (_, sync) = read_ws_frame(&mut stream);
         assert_eq!(web_wire::decode_window(&sync).kind, web_wire::KIND_SYNC);
@@ -1631,7 +1643,7 @@ Sec-WebSocket-Version: 13\r\n\
         stream
     }
 
-    fn open_ws(addr: &str) -> TcpStream {
+    fn open_ws(addr: impl std::net::ToSocketAddrs) -> TcpStream {
         let mut stream = TcpStream::connect(addr).unwrap();
         stream
             .set_read_timeout(Some(Duration::from_secs(2)))
@@ -1660,13 +1672,13 @@ Sec-WebSocket-Version: 13\r\n\
         let cfg = WebConfig {
             enabled: true,
             readonly: true,
-            bind: "127.0.0.1:39520".to_string(),
+            bind: "127.0.0.1:0".to_string(),
             ..WebConfig::default()
         };
         let (web_tx, _web_rx) = mpsc::channel();
         let sender = spawn(&cfg, None, 100, web_tx, true).unwrap();
 
-        let mut stream = open_ws("127.0.0.1:39520");
+        let mut stream = open_ws(sender.local_addr());
         let (_, sync) = read_ws_frame(&mut stream);
         assert!(web_wire::decode_window(&sync).messages.is_empty());
         drain_config(&mut stream);
@@ -1695,13 +1707,13 @@ Sec-WebSocket-Version: 13\r\n\
         let cfg = WebConfig {
             enabled: true,
             readonly: true,
-            bind: "127.0.0.1:39518".to_string(),
+            bind: "127.0.0.1:0".to_string(),
             ..WebConfig::default()
         };
         let (web_tx, _web_rx) = mpsc::channel();
         let sender = spawn(&cfg, None, 100, web_tx, true).unwrap();
 
-        let mut stream = open_ws("127.0.0.1:39518");
+        let mut stream = open_ws(sender.local_addr());
         // Drain the initial empty sync frame and the config envelope.
         let (_, payload) = read_ws_frame(&mut stream);
         assert_eq!(web_wire::decode_window(&payload).kind, web_wire::KIND_SYNC);
@@ -1740,7 +1752,7 @@ Sec-WebSocket-Version: 13\r\n\
         let cfg = WebConfig {
             enabled: true,
             readonly: true,
-            bind: "127.0.0.1:39519".to_string(),
+            bind: "127.0.0.1:0".to_string(),
             ..WebConfig::default()
         };
         let (web_tx, _web_rx) = mpsc::channel();
@@ -1754,7 +1766,7 @@ Sec-WebSocket-Version: 13\r\n\
 
         // A browser that connects after the share still learns it is available:
         // the retained announcement follows the initial sync frame.
-        let mut late = open_ws("127.0.0.1:39519");
+        let mut late = open_ws(sender.local_addr());
         let (_, sync) = read_ws_frame(&mut late);
         assert_eq!(web_wire::decode_window(&sync).kind, web_wire::KIND_SYNC);
         drain_config(&mut late);
@@ -1776,7 +1788,7 @@ Sec-WebSocket-Version: 13\r\n\
 
         // A browser that connects now sees no share. After sync, the next frame
         // is a live chat message, with no stale share_available before it.
-        let mut fresh = open_ws("127.0.0.1:39519");
+        let mut fresh = open_ws(sender.local_addr());
         let (_, sync2) = read_ws_frame(&mut fresh);
         assert_eq!(web_wire::decode_window(&sync2).kind, web_wire::KIND_SYNC);
         drain_config(&mut fresh);
@@ -1793,14 +1805,14 @@ Sec-WebSocket-Version: 13\r\n\
         let cfg = WebConfig {
             enabled: true,
             readonly: true,
-            bind: "127.0.0.1:39524".to_string(),
+            bind: "127.0.0.1:0".to_string(),
             autoplay: WebAutoplay::WithAudio,
             viewer_in_seperate_browser_tab: true,
         };
         let (web_tx, _web_rx) = mpsc::channel();
-        let _sender = spawn(&cfg, None, 100, web_tx, true).unwrap();
+        let sender = spawn(&cfg, None, 100, web_tx, true).unwrap();
 
-        let mut stream = open_ws("127.0.0.1:39524");
+        let mut stream = open_ws(sender.local_addr());
         // The sync frame comes first, then the config envelope as a text frame.
         let (opcode, sync) = read_ws_frame(&mut stream);
         assert_eq!(opcode, 0x2);
@@ -1822,13 +1834,13 @@ Sec-WebSocket-Version: 13\r\n\
         let cfg = WebConfig {
             enabled: true,
             readonly: false,
-            bind: "127.0.0.1:39525".to_string(),
+            bind: "127.0.0.1:0".to_string(),
             ..WebConfig::default()
         };
         let (web_tx, web_rx) = mpsc::channel();
-        let _sender = spawn(&cfg, None, 100, web_tx, false).unwrap();
+        let sender = spawn(&cfg, None, 100, web_tx, false).unwrap();
 
-        let mut stream = open_ready_ws("127.0.0.1:39525");
+        let mut stream = open_ready_ws(sender.local_addr());
         write_ws_text(&mut stream, r#"{"type":"send_message","body":"hi there"}"#);
 
         let request = web_rx.recv_timeout(Duration::from_secs(2)).unwrap();
@@ -1845,13 +1857,13 @@ Sec-WebSocket-Version: 13\r\n\
         let cfg = WebConfig {
             enabled: true,
             readonly: true,
-            bind: "127.0.0.1:39526".to_string(),
+            bind: "127.0.0.1:0".to_string(),
             ..WebConfig::default()
         };
         let (web_tx, web_rx) = mpsc::channel();
-        let _sender = spawn(&cfg, None, 100, web_tx, true).unwrap();
+        let sender = spawn(&cfg, None, 100, web_tx, true).unwrap();
 
-        let mut stream = open_ready_ws("127.0.0.1:39526");
+        let mut stream = open_ready_ws(sender.local_addr());
         write_ws_text(&mut stream, r#"{"type":"send_message","body":"hi there"}"#);
 
         // A read-only feed drops the write, so nothing reaches the app.
@@ -1863,13 +1875,13 @@ Sec-WebSocket-Version: 13\r\n\
         let cfg = WebConfig {
             enabled: true,
             readonly: false,
-            bind: "127.0.0.1:39527".to_string(),
+            bind: "127.0.0.1:0".to_string(),
             ..WebConfig::default()
         };
         let (web_tx, web_rx) = mpsc::channel();
-        let _sender = spawn(&cfg, None, 100, web_tx, false).unwrap();
+        let sender = spawn(&cfg, None, 100, web_tx, false).unwrap();
 
-        let mut stream = open_ready_ws("127.0.0.1:39527");
+        let mut stream = open_ready_ws(sender.local_addr());
         write_ws_text(
             &mut stream,
             r#"{"type":"upload_start","upload_id":42,"name":"note.txt","size":11}"#,
@@ -1901,13 +1913,13 @@ Sec-WebSocket-Version: 13\r\n\
         let cfg = WebConfig {
             enabled: true,
             readonly: false,
-            bind: "127.0.0.1:39528".to_string(),
+            bind: "127.0.0.1:0".to_string(),
             ..WebConfig::default()
         };
         let (web_tx, web_rx) = mpsc::channel();
-        let _sender = spawn(&cfg, None, 100, web_tx, false).unwrap();
+        let sender = spawn(&cfg, None, 100, web_tx, false).unwrap();
 
-        let mut stream = open_ready_ws("127.0.0.1:39528");
+        let mut stream = open_ready_ws(sender.local_addr());
         write_ws_text(
             &mut stream,
             r#"{"type":"upload_start","upload_id":42,"name":"note.txt","size":11}"#,

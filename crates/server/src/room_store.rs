@@ -22,6 +22,7 @@ use std::{
 
 use rpc::{
     control::ChatMessage,
+    history,
     ids::{MessageId, RoomId, UserId},
 };
 use toml_spanner::Toml;
@@ -57,11 +58,11 @@ impl DmRoom {
 enum Retention {
     None,
     Memory {
-        messages: Vec<ChatMessage>,
+        history: ResidentHistory,
         limit: usize,
     },
     Durable {
-        messages: Vec<ChatMessage>,
+        history: ResidentHistory,
         file: Option<File>,
         active_bytes: u64,
         path: Option<PathBuf>,
@@ -69,12 +70,275 @@ enum Retention {
 }
 
 impl Retention {
-    fn messages(&self) -> &[ChatMessage] {
+    fn history(&self) -> Option<&ResidentHistory> {
         match self {
-            Retention::None => &[],
-            Retention::Memory { messages, .. } => messages,
-            Retention::Durable { messages, .. } => messages,
+            Retention::None => None,
+            Retention::Memory { history, .. } | Retention::Durable { history, .. } => Some(history),
         }
+    }
+}
+
+pub struct HistoryFetchPlan {
+    room_id: RoomId,
+    chunks: Vec<HistoryChunkSpec>,
+    pub message_count: usize,
+    pub at_start: bool,
+}
+
+impl HistoryFetchPlan {
+    pub fn chunk_count(&self) -> usize {
+        self.chunks.len()
+    }
+}
+
+struct HistoryChunkSpec {
+    start: usize,
+    end: usize,
+    records_bytes: usize,
+    at_start: bool,
+    complete: bool,
+}
+
+#[derive(Default)]
+struct ResidentHistory {
+    bytes: Vec<u8>,
+    entries: Vec<HistoryEntry>,
+    first_entry: usize,
+    first_byte: usize,
+}
+
+#[derive(Clone, Copy)]
+struct HistoryEntry {
+    message_id: MessageId,
+    start: usize,
+    len: usize,
+}
+
+impl ResidentHistory {
+    fn len(&self) -> usize {
+        self.entries.len().saturating_sub(self.first_entry)
+    }
+
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    fn entries(&self) -> &[HistoryEntry] {
+        &self.entries[self.first_entry..]
+    }
+
+    fn last(&self) -> Option<HistoryEntry> {
+        self.entries().last().copied()
+    }
+
+    fn record(&self, entry: HistoryEntry) -> &[u8] {
+        &self.bytes[entry.start..entry.start + entry.len]
+    }
+
+    fn record_range(&self, start: usize, len: usize) -> &[u8] {
+        &self.bytes[start..start + len]
+    }
+
+    fn append_message(&mut self, message: &ChatMessage) -> (usize, usize) {
+        let start = self.bytes.len();
+        history::write_message(message, &mut self.bytes);
+        let len = self.bytes.len() - start;
+        self.entries.push(HistoryEntry {
+            message_id: message.message_id,
+            start,
+            len,
+        });
+        (start, len)
+    }
+
+    fn append_record(&mut self, record: &[u8]) -> Result<(), String> {
+        let parsed = history::parse_message(record)?;
+        self.append_known_record(parsed.message_id, record);
+        Ok(())
+    }
+
+    fn append_known_record(&mut self, message_id: MessageId, record: &[u8]) {
+        let start = self.bytes.len();
+        self.bytes.extend_from_slice(record);
+        self.entries.push(HistoryEntry {
+            message_id,
+            start,
+            len: record.len(),
+        });
+    }
+
+    fn extend(&mut self, other: ResidentHistory) {
+        for entry in other.entries() {
+            self.append_known_record(entry.message_id, other.record(*entry));
+        }
+    }
+
+    fn recent(&self, max: usize) -> Vec<ChatMessage> {
+        let entries = self.entries();
+        let skip = entries.len().saturating_sub(max);
+        self.decode_entries(&entries[skip..])
+    }
+
+    fn messages_before(&self, before: Option<MessageId>, limit: usize) -> (Vec<ChatMessage>, bool) {
+        let entries = self.entries();
+        let end = match before {
+            Some(before) => entries.partition_point(|entry| entry.message_id < before),
+            None => entries.len(),
+        };
+        let start = end.saturating_sub(limit);
+        (self.decode_entries(&entries[start..end]), start == 0)
+    }
+
+    fn history_chunks_before(
+        &self,
+        room_id: RoomId,
+        before: Option<MessageId>,
+        limit: usize,
+        target_bytes: usize,
+    ) -> HistoryFetchPlan {
+        let entries = self.entries();
+        let end = match before {
+            Some(before) => entries.partition_point(|entry| entry.message_id < before),
+            None => entries.len(),
+        };
+        let start = end.saturating_sub(limit);
+        let selected = &entries[start..end];
+        let at_start = start == 0;
+        let mut chunks = self.chunk_specs(selected, at_start, target_bytes);
+        for chunk in &mut chunks {
+            chunk.start += start;
+            chunk.end += start;
+        }
+        HistoryFetchPlan {
+            room_id,
+            chunks,
+            message_count: selected.len(),
+            at_start,
+        }
+    }
+
+    fn decode_entries(&self, entries: &[HistoryEntry]) -> Vec<ChatMessage> {
+        entries
+            .iter()
+            .map(|entry| {
+                history::decode_message(self.record(*entry))
+                    .expect("resident history record should remain valid")
+            })
+            .collect()
+    }
+
+    fn chunk_specs(
+        &self,
+        entries: &[HistoryEntry],
+        at_start: bool,
+        target_bytes: usize,
+    ) -> Vec<HistoryChunkSpec> {
+        if entries.is_empty() {
+            return vec![HistoryChunkSpec {
+                start: 0,
+                end: 0,
+                records_bytes: 0,
+                at_start,
+                complete: true,
+            }];
+        }
+
+        let target_bytes = target_bytes.max(history::CHUNK_HEADER_BYTES);
+        let mut ranges = Vec::new();
+        let mut start = 0usize;
+        let mut bytes = history::CHUNK_HEADER_BYTES;
+        let mut records_bytes = 0usize;
+        let mut count = 0usize;
+        for (index, entry) in entries.iter().enumerate() {
+            let would_exceed_bytes = count > 0 && bytes.saturating_add(entry.len) > target_bytes;
+            let would_exceed_count = count == u16::MAX as usize;
+            if would_exceed_bytes || would_exceed_count {
+                ranges.push((start, index, records_bytes));
+                start = index;
+                bytes = history::CHUNK_HEADER_BYTES;
+                records_bytes = 0;
+                count = 0;
+            }
+            bytes = bytes.saturating_add(entry.len);
+            records_bytes = records_bytes.saturating_add(entry.len);
+            count += 1;
+        }
+        ranges.push((start, entries.len(), records_bytes));
+
+        let chunk_count = ranges.len();
+        let mut chunks = Vec::with_capacity(chunk_count);
+        for (send_index, (start, end, records_bytes)) in ranges.into_iter().rev().enumerate() {
+            let complete = send_index + 1 == chunk_count;
+            chunks.push(HistoryChunkSpec {
+                start,
+                end,
+                records_bytes,
+                at_start: complete && at_start,
+                complete,
+            });
+        }
+        chunks
+    }
+
+    fn encode_chunk(&self, room_id: RoomId, spec: &HistoryChunkSpec) -> Result<Vec<u8>, String> {
+        let entries = self.entries();
+        let Some(chunk_entries) = entries.get(spec.start..spec.end) else {
+            return Err("history fetch plan no longer matches retained history".to_string());
+        };
+        let mut payload = Vec::with_capacity(history::CHUNK_HEADER_BYTES + spec.records_bytes);
+        history::write_chunk_header(
+            room_id,
+            spec.at_start,
+            spec.complete,
+            chunk_entries.len(),
+            &mut payload,
+        )?;
+        for entry in chunk_entries {
+            payload.extend_from_slice(self.record(*entry));
+        }
+        Ok(payload)
+    }
+
+    fn trim_to_limit(&mut self, limit: usize) {
+        while self.len() > limit {
+            let entry = self.entries[self.first_entry];
+            self.first_byte = entry.start + entry.len;
+            self.first_entry += 1;
+        }
+        self.compact_if_worthwhile();
+    }
+
+    fn compact_if_worthwhile(&mut self) {
+        if self.first_entry == 0 {
+            return;
+        }
+        if self.first_entry == self.entries.len() {
+            self.bytes.clear();
+            self.entries.clear();
+            self.first_entry = 0;
+            self.first_byte = 0;
+            return;
+        }
+
+        const COMPACT_DEAD_BYTES: usize = 64 * 1024;
+        const COMPACT_DEAD_ENTRIES: usize = 1024;
+        let dead_bytes = self.first_byte;
+        let dead_entries = self.first_entry;
+        let worthwhile_bytes =
+            dead_bytes >= COMPACT_DEAD_BYTES && dead_bytes * 2 >= self.bytes.len();
+        let worthwhile_entries =
+            dead_entries >= COMPACT_DEAD_ENTRIES && dead_entries * 2 >= self.entries.len();
+        if !worthwhile_bytes && !worthwhile_entries {
+            return;
+        }
+
+        self.bytes.drain(..dead_bytes);
+        for entry in &mut self.entries[self.first_entry..] {
+            entry.start -= dead_bytes;
+        }
+        self.entries.drain(..self.first_entry);
+        self.first_entry = 0;
+        self.first_byte = 0;
     }
 }
 
@@ -157,13 +421,13 @@ impl RoomStore {
         let retention = match persistence {
             RoomPersistenceConfig::None => Retention::None,
             RoomPersistenceConfig::Memory => Retention::Memory {
-                messages: Vec::new(),
+                history: ResidentHistory::default(),
                 limit: memory_limit,
             },
             RoomPersistenceConfig::Durable => self.open_durable(room_id),
         };
-        if let Retention::Durable { messages, .. } = &retention
-            && let Some(last) = messages.last()
+        if let Retention::Durable { history, .. } = &retention
+            && let Some(last) = history.last()
         {
             let next = self.next_ids.entry(room_id).or_insert(1);
             *next = (*next).max(last.message_id.0 + 1);
@@ -175,17 +439,18 @@ impl RoomStore {
     fn open_durable(&self, room_id: RoomId) -> Retention {
         let Some(dir) = &self.data_dir else {
             return Retention::Durable {
-                messages: Vec::new(),
+                history: ResidentHistory::default(),
                 file: None,
                 active_bytes: 0,
                 path: None,
             };
         };
         let path = dir.join("rooms").join(format!("{}.log", room_id.0));
-        let mut messages = load_log(&backup_path(&path), LogRepair::ReadOnly);
+        let mut history = load_log(&backup_path(&path), LogRepair::ReadOnly).history;
         let active = load_log_repairing(&path);
-        messages.extend(active.messages);
-        trim_resident(&mut messages);
+        let active_bytes = active.valid_bytes;
+        history.extend(active.history);
+        trim_resident(&mut history);
         let file = OpenOptions::new()
             .create(true)
             .append(true)
@@ -199,9 +464,9 @@ impl RoomStore {
             })
             .ok();
         Retention::Durable {
-            messages,
+            history,
             file,
-            active_bytes: active.valid_bytes,
+            active_bytes,
             path: Some(path),
         }
     }
@@ -229,24 +494,22 @@ impl RoomStore {
         self.heads.insert(room_id, message.message_id);
         match retention {
             Retention::None => 0,
-            Retention::Memory { messages, limit } => {
-                messages.push(message.clone());
-                if messages.len() > *limit {
-                    let excess = messages.len() - *limit;
-                    messages.drain(..excess);
-                }
-                messages.len()
+            Retention::Memory { history, limit } => {
+                history.append_message(message);
+                history.trim_to_limit(*limit);
+                history.len()
             }
             Retention::Durable {
-                messages,
+                history,
                 file,
                 active_bytes,
                 path,
             } => {
+                let (start, len) = history.append_message(message);
                 if let Some(open) = file {
-                    let record = encode_record(message);
-                    match open.write_all(&record) {
-                        Ok(()) => *active_bytes += record.len() as u64,
+                    let record = history.record_range(start, len);
+                    match write_log_record(open, record) {
+                        Ok(written) => *active_bytes += written as u64,
                         Err(error) => {
                             kvlog::error!(
                                 "durable room log append failed; retention degraded to memory",
@@ -262,18 +525,17 @@ impl RoomStore {
                 {
                     rotate_log(path, file, active_bytes);
                 }
-                messages.push(message.clone());
-                trim_resident(messages);
-                messages.len()
+                trim_resident(history);
+                history.len()
             }
         }
     }
 
     /// The most recent `max` retained messages, oldest first.
     pub fn recent(&self, room_id: RoomId, max: usize) -> Vec<ChatMessage> {
-        let retained = self.retained(room_id);
-        let skip = retained.len().saturating_sub(max);
-        retained[skip..].to_vec()
+        self.resident(room_id)
+            .map(|history| history.recent(max))
+            .unwrap_or_default()
     }
 
     /// Latest message id assigned in the room, `None` before the first message.
@@ -290,20 +552,63 @@ impl RoomStore {
         before: Option<MessageId>,
         limit: usize,
     ) -> (Vec<ChatMessage>, bool) {
-        let retained = self.retained(room_id);
-        let end = match before {
-            Some(before) => retained.partition_point(|message| message.message_id < before),
-            None => retained.len(),
-        };
-        let start = end.saturating_sub(limit);
-        (retained[start..end].to_vec(), start == 0)
+        self.resident(room_id)
+            .map(|history| history.messages_before(before, limit))
+            .unwrap_or_else(|| (Vec::new(), true))
     }
 
-    fn retained(&self, room_id: RoomId) -> &[ChatMessage] {
+    pub fn history_fetch_plan_before(
+        &self,
+        room_id: RoomId,
+        before: Option<MessageId>,
+        limit: usize,
+        target_bytes: usize,
+    ) -> HistoryFetchPlan {
+        self.resident(room_id)
+            .map(|history| history.history_chunks_before(room_id, before, limit, target_bytes))
+            .unwrap_or_else(|| HistoryFetchPlan {
+                room_id,
+                chunks: vec![HistoryChunkSpec {
+                    start: 0,
+                    end: 0,
+                    records_bytes: 0,
+                    at_start: true,
+                    complete: true,
+                }],
+                message_count: 0,
+                at_start: true,
+            })
+    }
+
+    pub fn encode_history_chunk(
+        &self,
+        plan: &HistoryFetchPlan,
+        chunk_index: usize,
+    ) -> Result<Vec<u8>, String> {
+        let Some(spec) = plan.chunks.get(chunk_index) else {
+            return Err("history chunk index is out of range".to_string());
+        };
+        if spec.start == spec.end {
+            let mut payload = Vec::with_capacity(history::CHUNK_HEADER_BYTES);
+            history::write_chunk_header(
+                plan.room_id,
+                spec.at_start,
+                spec.complete,
+                0,
+                &mut payload,
+            )?;
+            return Ok(payload);
+        }
+        self.resident(plan.room_id)
+            .ok_or_else(|| "history fetch plan no longer has retained messages".to_string())?
+            .encode_chunk(plan.room_id, spec)
+    }
+
+    fn resident(&self, room_id: RoomId) -> Option<&ResidentHistory> {
         self.rooms
             .get(&room_id)
-            .map(Retention::messages)
-            .unwrap_or(&[])
+            .and_then(Retention::history)
+            .filter(|history| !history.is_empty())
     }
 
     pub fn dm_rooms(&self) -> &[DmRoom] {
@@ -471,12 +776,16 @@ fn load_state(dir: &Path) -> StoreState {
     }
 }
 
-fn encode_record(message: &ChatMessage) -> Vec<u8> {
-    let payload = jsony::to_binary(message);
-    let mut record = Vec::with_capacity(4 + payload.len());
-    record.extend_from_slice(&(payload.len() as u32).to_le_bytes());
-    record.extend_from_slice(&payload);
-    record
+fn write_log_record(file: &mut File, payload: &[u8]) -> std::io::Result<usize> {
+    let len = u32::try_from(payload.len()).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "history record exceeds log length field",
+        )
+    })?;
+    file.write_all(&len.to_le_bytes())?;
+    file.write_all(payload)?;
+    Ok(4 + payload.len())
 }
 
 enum LogRepair {
@@ -487,24 +796,22 @@ enum LogRepair {
 }
 
 struct LoadedLog {
-    messages: Vec<ChatMessage>,
+    history: ResidentHistory,
     valid_bytes: u64,
 }
 
 fn load_log_repairing(path: &Path) -> LoadedLog {
-    let messages = load_log(path, LogRepair::Truncate);
-    let valid_bytes = fs::metadata(path).map(|meta| meta.len()).unwrap_or(0);
-    LoadedLog {
-        messages,
-        valid_bytes,
-    }
+    load_log(path, LogRepair::Truncate)
 }
 
-fn load_log(path: &Path, repair: LogRepair) -> Vec<ChatMessage> {
+fn load_log(path: &Path, repair: LogRepair) -> LoadedLog {
     let Ok(bytes) = fs::read(path) else {
-        return Vec::new();
+        return LoadedLog {
+            history: ResidentHistory::default(),
+            valid_bytes: 0,
+        };
     };
-    let mut messages = Vec::new();
+    let mut history = ResidentHistory::default();
     let mut offset = 0usize;
     while bytes.len() - offset >= 4 {
         let len = u32::from_le_bytes(bytes[offset..offset + 4].try_into().expect("4 bytes"));
@@ -515,10 +822,9 @@ fn load_log(path: &Path, repair: LogRepair) -> Vec<ChatMessage> {
         let Some(payload) = bytes.get(offset + 4..offset + 4 + len) else {
             break;
         };
-        let Ok(message) = jsony::from_binary::<ChatMessage>(payload) else {
+        if history.append_record(payload).is_err() {
             break;
-        };
-        messages.push(message);
+        }
         offset += 4 + len;
     }
     if offset < bytes.len() {
@@ -545,7 +851,10 @@ fn load_log(path: &Path, repair: LogRepair) -> Vec<ChatMessage> {
             }
         }
     }
-    messages
+    LoadedLog {
+        history,
+        valid_bytes: offset as u64,
+    }
 }
 
 fn rotate_log(path: &Path, file: &mut Option<File>, active_bytes: &mut u64) {
@@ -574,11 +883,8 @@ fn rotate_log(path: &Path, file: &mut Option<File>, active_bytes: &mut u64) {
     }
 }
 
-fn trim_resident(messages: &mut Vec<ChatMessage>) {
-    if messages.len() > MAX_DURABLE_RESIDENT_MESSAGES {
-        let excess = messages.len() - MAX_DURABLE_RESIDENT_MESSAGES;
-        messages.drain(..excess);
-    }
+fn trim_resident(history: &mut ResidentHistory) {
+    history.trim_to_limit(MAX_DURABLE_RESIDENT_MESSAGES);
 }
 
 fn backup_path(path: &Path) -> PathBuf {

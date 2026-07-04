@@ -1802,9 +1802,12 @@ impl App {
                 room_id,
                 messages,
                 at_start,
+                complete,
             } => {
-                self.room
-                    .complete_history_fetch(room_id, &messages, at_start);
+                if complete {
+                    self.room
+                        .complete_history_fetch(room_id, &messages, at_start);
+                }
                 let changed = self.room.merge_history(room_id, messages, self.user_id);
                 if changed && self.room.viewed_room == Some(room_id) && self.web_feed.is_some() {
                     self.sync_viewed_room_to_feeds();
