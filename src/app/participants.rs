@@ -1,7 +1,7 @@
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use rpc::{
-    control::{ChatMessage, ParticipantVoiceStatus, UserSummary},
+    control::{ParticipantVoiceStatus, UserSummary},
     ids::{StreamId, UserId},
 };
 
@@ -178,11 +178,6 @@ impl Participants {
         }
         self.sort();
         self.ensure_selection();
-    }
-
-    pub(crate) fn note_message(&mut self, message: &ChatMessage) {
-        let entry = self.ensure_user(message.sender);
-        entry.name = Some(message.sender_name.clone());
     }
 
     pub(crate) fn voice_started(&mut self, user_id: UserId, stream_id: StreamId) {

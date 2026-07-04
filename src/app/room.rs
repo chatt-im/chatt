@@ -262,11 +262,6 @@ impl ClientRoom {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default)]
-struct RoomParticipantPresence {
-    away_since: Option<Instant>,
-}
-
 pub(crate) struct RoomSession {
     pub server_alias: String,
     /// Stable per-server storage id for history, independent of the mutable
@@ -291,11 +286,12 @@ pub(crate) struct RoomSession {
     metas: BTreeMap<RoomId, RoomMeta>,
     /// Buffered state of rooms other than the viewed one.
     parked: HashMap<RoomId, ClientRoom>,
-    /// Users this client process has actually shown or observed in each room.
-    /// Offline entries render only when they carry a real observed-away
-    /// timestamp, so the lobby cannot invent "away for 0s" rows from the server
-    /// directory.
-    participant_presence: HashMap<RoomId, HashMap<UserId, RoomParticipantPresence>>,
+    /// Users this client process has seen in each room's voice call. The value
+    /// is when they left the call: `None` while they are in it, `Some(instant)`
+    /// once they leave (drives the `away` age column). A user stays in this map
+    /// for the rest of the process, so the lobby lists everyone who was ever in
+    /// the room's voice — and only them.
+    voice_seen: HashMap<RoomId, HashMap<UserId, Option<Instant>>>,
     /// Rooms omitted by the latest authenticated snapshot. They remain
     /// available as local history whenever the client is offline.
     archived_metas: BTreeMap<RoomId, RoomMeta>,
@@ -624,7 +620,7 @@ impl RoomSession {
             volume_preview: None,
             metas: BTreeMap::new(),
             parked: HashMap::new(),
-            participant_presence: HashMap::new(),
+            voice_seen: HashMap::new(),
             archived_metas: BTreeMap::new(),
             archived_rooms: HashMap::new(),
             viewed_room: None,
@@ -718,7 +714,7 @@ impl RoomSession {
                 self.room_name = "lobby".to_string();
                 self.metas.clear();
                 self.parked.clear();
-                self.participant_presence.clear();
+                self.voice_seen.clear();
                 self.archived_metas.clear();
                 self.archived_rooms.clear();
                 self.users.clear();
@@ -743,7 +739,7 @@ impl RoomSession {
         self.room_name = "servers".to_string();
         self.metas.clear();
         self.parked.clear();
-        self.participant_presence.clear();
+        self.voice_seen.clear();
         self.archived_metas.clear();
         self.archived_rooms.clear();
         self.users.clear();
@@ -766,12 +762,9 @@ impl RoomSession {
         self.restore_archived_rooms();
         self.stream_users.clear();
         let disconnected_at = Instant::now();
-        let users = &self.users;
-        for room in self.participant_presence.values_mut() {
-            for (user_id, presence) in room {
-                if users.get(user_id).is_some_and(|user| user.online) {
-                    presence.away_since.get_or_insert(disconnected_at);
-                }
+        for room in self.voice_seen.values_mut() {
+            for left_at in room.values_mut() {
+                left_at.get_or_insert(disconnected_at);
             }
         }
         for user in self.users.values_mut() {
@@ -852,8 +845,20 @@ impl RoomSession {
                 );
             }
         }
+        // The snapshot is authoritative for current occupancy: mark its voice
+        // users as in-call, and stamp anyone previously in this room's call who
+        // is no longer listed as having left, so a reconnect can't leave a
+        // stale in-call row.
+        let now = Instant::now();
+        if let Some(seen) = self.voice_seen.get_mut(&info.room_id) {
+            for (user_id, left_at) in seen.iter_mut() {
+                if !info.voice_users.contains(user_id) {
+                    left_at.get_or_insert(now);
+                }
+            }
+        }
         for user_id in &info.voice_users {
-            self.mark_participant_online_in_room(info.room_id, *user_id);
+            self.note_voice_join(info.room_id, *user_id);
         }
     }
 
@@ -1497,34 +1502,41 @@ impl RoomSession {
         matches.next().is_none().then_some(first.user_id)
     }
 
-    fn mark_participant_online_in_room(&mut self, room_id: RoomId, user_id: UserId) {
-        self.participant_presence
+    /// Records that `user_id` is in `room_id`'s voice call now, adding them to
+    /// the room's voice-seen set and clearing any prior leave timestamp.
+    fn note_voice_join(&mut self, room_id: RoomId, user_id: UserId) {
+        *self
+            .voice_seen
             .entry(room_id)
             .or_default()
             .entry(user_id)
-            .or_default()
-            .away_since = None;
+            .or_default() = None;
     }
 
-    fn mark_participant_away_in_seen_rooms(&mut self, user_id: UserId, away_since: Instant) {
-        for room in self.participant_presence.values_mut() {
-            if let Some(presence) = room.get_mut(&user_id) {
-                presence.away_since.get_or_insert(away_since);
-            }
+    /// Stamps when `user_id` left `room_id`'s voice call, keeping them in the
+    /// voice-seen set so the lobby still lists them as `away`.
+    fn note_voice_leave(&mut self, room_id: RoomId, user_id: UserId) {
+        if let Some(left_at) = self
+            .voice_seen
+            .get_mut(&room_id)
+            .and_then(|room| room.get_mut(&user_id))
+        {
+            left_at.get_or_insert(Instant::now());
         }
     }
 
-    fn participant_seen_in_room(&self, room_id: RoomId, user_id: UserId) -> bool {
-        self.participant_presence
+    fn seen_in_voice(&self, room_id: RoomId, user_id: UserId) -> bool {
+        self.voice_seen
             .get(&room_id)
             .is_some_and(|room| room.contains_key(&user_id))
     }
 
-    fn participant_away_since(&self, room_id: RoomId, user_id: UserId) -> Option<Instant> {
-        self.participant_presence
+    fn voice_left_at(&self, room_id: RoomId, user_id: UserId) -> Option<Instant> {
+        self.voice_seen
             .get(&room_id)
             .and_then(|room| room.get(&user_id))
-            .and_then(|presence| presence.away_since)
+            .copied()
+            .flatten()
     }
 
     fn user_belongs_to_room_kind(user_id: UserId, kind: &ClientRoomKind) -> bool {
@@ -1535,9 +1547,10 @@ impl RoomSession {
         }
     }
 
-    /// Rebuilds the viewed room's roster from the user directory and the
-    /// room's kind. Offline users are shown only after this client process has
-    /// actually observed them in this room and recorded a real away timestamp.
+    /// Rebuilds the viewed room's roster from the room's voice-seen set: every
+    /// user who is, or was during this process, in the room's voice call. A
+    /// row's `online` flag mirrors call membership, so users who have left
+    /// render as `away`.
     pub(crate) fn rebuild_roster(&mut self) {
         let Some(room_id) = self.viewed_room else {
             self.participants.replace_room(Vec::new());
@@ -1546,27 +1559,21 @@ impl RoomSession {
         let Some(meta) = self.metas.get(&room_id) else {
             return;
         };
-        let kind = meta.kind.clone();
         let voice_users = meta.voice_users.clone();
         let seeds: Vec<RosterSeed> = self
             .users
             .values()
             .filter_map(|user| {
-                if !Self::user_belongs_to_room_kind(user.user_id, &kind) {
-                    return None;
-                }
-                if !self.participant_seen_in_room(room_id, user.user_id) {
+                if !self.seen_in_voice(room_id, user.user_id) {
                     return None;
                 }
                 let in_call = voice_users.contains(&user.user_id);
-                let away_since = self.participant_away_since(room_id, user.user_id);
-                if !user.online && !in_call && away_since.is_none() {
-                    return None;
-                }
+                let away_since = (!in_call).then(|| {
+                    self.voice_left_at(room_id, user.user_id)
+                        .unwrap_or_else(Instant::now)
+                });
                 let mut user = user.clone();
-                if in_call {
-                    user.online = true;
-                }
+                user.online = in_call;
                 Some(RosterSeed {
                     user,
                     in_call,
@@ -1574,11 +1581,6 @@ impl RoomSession {
                 })
             })
             .collect();
-        for seed in &seeds {
-            if seed.user.online {
-                self.mark_participant_online_in_room(room_id, seed.user.user_id);
-            }
-        }
         self.participants.replace_room(seeds);
     }
 
@@ -1606,7 +1608,6 @@ impl RoomSession {
     ) -> Option<RoomChatUpdate> {
         let local = Some(message.sender) == local_user;
         let room_id = message.room_id;
-        let sender = message.sender;
         if let Some(meta) = self.metas.get_mut(&room_id) {
             meta.head = Some(message.message_id).max(meta.head);
         }
@@ -1620,9 +1621,7 @@ impl RoomSession {
         }
         let mut read_advanced = false;
         if fresh {
-            self.mark_participant_online_in_room(room_id, sender);
             if viewed {
-                self.participants.note_message(&message);
                 read_advanced = self.mark_viewed_read();
             } else if !local && let Some(meta) = self.metas.get_mut(&room_id) {
                 meta.unread = meta.unread.saturating_add(1);
@@ -1705,8 +1704,10 @@ impl RoomSession {
         self.active.chat.bottom();
     }
 
-    /// Applies a server-wide presence update to the user directory and to rooms
-    /// where this client process has already observed the user.
+    /// Applies a server-wide presence update to the user directory and DM
+    /// labels. Presence no longer touches the lobby roster — that tracks voice
+    /// participation only — so this just keeps directory-derived state fresh
+    /// and reports whether the change is worth a status notice.
     pub(super) fn presence_changed(
         &mut self,
         user: rpc::control::UserSummary,
@@ -1718,22 +1719,11 @@ impl RoomSession {
         let display_name = user.display_name.clone();
         let local = Some(user.user_id) == local_user;
         let user_id = user.user_id;
-        let relevant_rooms = self
+        let relevant = self
             .metas
-            .iter()
-            .filter_map(|(room_id, meta)| {
-                Self::user_belongs_to_room_kind(user_id, &meta.kind).then_some(*room_id)
-            })
-            .collect::<Vec<_>>();
-        let relevant = !relevant_rooms.is_empty();
-        if online {
-            for room_id in &relevant_rooms {
-                self.mark_participant_online_in_room(*room_id, user_id);
-            }
-        } else {
-            self.mark_participant_away_in_seen_rooms(user_id, Instant::now());
-        }
-        self.users.insert(user_id, user.clone());
+            .values()
+            .any(|meta| Self::user_belongs_to_room_kind(user_id, &meta.kind));
+        self.users.insert(user_id, user);
         let dm_name_updates = self
             .metas
             .iter()
@@ -1758,27 +1748,6 @@ impl RoomSession {
                 self.room_name = name;
             }
         }
-        if let Some(room_id) = self.viewed_room
-            && self
-                .metas
-                .get(&room_id)
-                .is_some_and(|meta| Self::user_belongs_to_room_kind(user_id, &meta.kind))
-            && self.participant_seen_in_room(room_id, user_id)
-        {
-            let in_call = self
-                .metas
-                .get(&room_id)
-                .is_some_and(|meta| meta.voice_users.contains(&user_id));
-            self.participants.upsert(RosterSeed {
-                user,
-                in_call,
-                away_since: if online {
-                    None
-                } else {
-                    self.participant_away_since(room_id, user_id)
-                },
-            });
-        }
         ParticipantNotice {
             display_name,
             local,
@@ -1801,7 +1770,7 @@ impl RoomSession {
         if let Some(meta) = self.metas.get_mut(&room_id) {
             meta.voice_users.insert(user_id);
         }
-        self.mark_participant_online_in_room(room_id, user_id);
+        self.note_voice_join(room_id, user_id);
         if voice_room == Some(room_id) {
             self.stream_users.insert(stream_id, user_id);
         }
@@ -1833,8 +1802,22 @@ impl RoomSession {
         if let Some(meta) = self.metas.get_mut(&room_id) {
             meta.voice_users.remove(&user_id);
         }
+        self.note_voice_leave(room_id, user_id);
         if self.viewed_room == Some(room_id) {
             self.participants.voice_stopped(user_id, stream_id);
+            // Keep the row but demote it to `away`: the user was in this call,
+            // just not anymore.
+            if let Some(mut user) = self.users.get(&user_id).cloned() {
+                user.online = false;
+                self.participants.upsert(RosterSeed {
+                    user,
+                    in_call: false,
+                    away_since: Some(
+                        self.voice_left_at(room_id, user_id)
+                            .unwrap_or_else(Instant::now),
+                    ),
+                });
+            }
         }
         self.stream_users.remove(&stream_id);
         VoiceNotice {
@@ -1850,7 +1833,7 @@ impl RoomSession {
     pub(super) fn peer_transport_changed(&mut self, user_id: UserId, direct: bool) {
         if self
             .viewed_room
-            .is_some_and(|room_id| self.participant_seen_in_room(room_id, user_id))
+            .is_some_and(|room_id| self.seen_in_voice(room_id, user_id))
         {
             self.participants.set_peer_transport(user_id, direct);
         }
@@ -1867,7 +1850,7 @@ impl RoomSession {
         }
         if self
             .viewed_room
-            .is_some_and(|room_id| self.participant_seen_in_room(room_id, user_id))
+            .is_some_and(|room_id| self.seen_in_voice(room_id, user_id))
         {
             self.participants.set_voice_status(user_id, status);
         }
@@ -2588,7 +2571,7 @@ mod tests {
     }
 
     #[test]
-    fn presence_online_user_appears_in_rosters_of_rooms_they_belong_to() {
+    fn presence_online_does_not_add_a_lobby_row() {
         let mut room = test_room();
         room.authenticated(
             &[
@@ -2601,14 +2584,14 @@ mod tests {
             Some(UserId(1)),
         );
 
+        // Coming online is still notice-worthy, but the lobby tracks voice
+        // participation only, so a bare presence event adds no roster row.
         let notice = room.presence_changed(user(UserId(2), "bob"), true, Some(UserId(1)));
 
         assert!(notice.relevant);
-        assert_eq!(room.participants.entries.len(), 1);
-        assert_eq!(room.participants.entries[0].display_name(), "bob");
+        assert!(room.participants.entries.is_empty());
         assert!(room.set_viewed_room(RoomId(2), Some(UserId(1))));
-        assert_eq!(room.participants.entries.len(), 1);
-        assert_eq!(room.participants.entries[0].display_name(), "bob");
+        assert!(room.participants.entries.is_empty());
     }
 
     #[test]
@@ -2631,7 +2614,7 @@ mod tests {
     }
 
     #[test]
-    fn away_rows_require_an_observed_transition_in_that_room() {
+    fn left_voice_users_remain_as_away_rows_in_that_room_only() {
         let mut room = test_room();
         enter(
             &mut room,
@@ -2644,16 +2627,47 @@ mod tests {
             Some(UserId(1)),
         );
 
-        room.chat_received(message(1, UserId(2), "seen here"), Some(UserId(1)));
-        room.presence_changed(offline_user(UserId(2), "bob"), false, Some(UserId(1)));
+        // Bob joins then leaves this room's voice call. He stays listed as an
+        // away row for the rest of the process, since he was in the call.
+        room.voice_started(
+            RoomId(1),
+            SessionId(2),
+            UserId(2),
+            StreamId(10),
+            Some(SessionId(1)),
+            Some(RoomId(1)),
+        );
+        room.voice_stopped(
+            RoomId(1),
+            SessionId(2),
+            UserId(2),
+            StreamId(10),
+            Some(SessionId(1)),
+        );
 
         assert_eq!(room.participants.entries.len(), 1);
         assert_eq!(room.participants.entries[0].display_name(), "bob");
         assert!(!room.participants.entries[0].online);
+        assert!(!room.participants.entries[0].voice_active);
         assert!(room.participants.entries[0].presence_since.is_some());
 
+        // A room he never voiced in shows nothing.
         assert!(room.set_viewed_room(RoomId(2), Some(UserId(1))));
         assert!(room.participants.entries.is_empty());
+
+        // Back in the original room, rejoining voice flips the away row live.
+        assert!(room.set_viewed_room(RoomId(1), Some(UserId(1))));
+        room.voice_started(
+            RoomId(1),
+            SessionId(2),
+            UserId(2),
+            StreamId(11),
+            Some(SessionId(1)),
+            Some(RoomId(1)),
+        );
+        assert_eq!(room.participants.entries.len(), 1);
+        assert!(room.participants.entries[0].online);
+        assert!(room.participants.entries[0].voice_active);
     }
 
     #[test]
@@ -3310,8 +3324,8 @@ mod tests {
         );
 
         assert_eq!(room.room_name, "renamed");
-        assert_eq!(room.participants.entries.len(), 1);
-        assert_eq!(room.participants.entries[0].display_name(), "alice");
+        // The lobby is voice-scoped: nobody has joined voice, so it stays empty.
+        assert!(room.participants.entries.is_empty());
         assert!(room.active.chat.message(0).local);
     }
 
@@ -3462,7 +3476,7 @@ mod tests {
     }
 
     #[test]
-    fn incoming_chat_notes_activity_and_preserves_bottom_scroll_behavior() {
+    fn incoming_chat_preserves_bottom_scroll_behavior() {
         let mut room = test_room();
         enter(&mut room, Vec::new(), Vec::new(), Some(UserId(1)));
         let update = room
@@ -3471,7 +3485,8 @@ mod tests {
         assert!(!update.local);
         assert!(update.should_scroll_bottom);
         assert_eq!(room.active.chat.scroll_offset(), 0);
-        assert_eq!(room.participants.entries[0].name.as_deref(), Some("user-2"));
+        // A chat message does not populate the voice-scoped lobby roster.
+        assert!(room.participants.entries.is_empty());
 
         for id in 2..20 {
             room.chat_received(message(id, UserId(2), "line"), Some(UserId(1)));
