@@ -210,11 +210,7 @@ impl NutDemuxer {
     ///
     /// Returns [`NutError`] when the stream is malformed or its video stream
     /// does not match the selected codec. The demuxer is unusable afterwards.
-    pub fn push(
-        &mut self,
-        bytes: &[u8],
-        frames: &mut Vec<CapturedFrame>,
-    ) -> Result<(), NutError> {
+    pub fn push(&mut self, bytes: &[u8], frames: &mut Vec<CapturedFrame>) -> Result<(), NutError> {
         self.buf.extend_from_slice(bytes);
         let mut consumed = 0;
         loop {
@@ -718,7 +714,10 @@ mod tests {
     /// and the payload length rides in `data_size_msb`.
     fn test_frame(flags: u64, coded_pts: u64, payload: &[u8]) -> Vec<u8> {
         let mut out = vec![0u8];
-        put_v(&mut out, FLAG_CODED ^ (flags | FLAG_CODED_PTS | FLAG_SIZE_MSB));
+        put_v(
+            &mut out,
+            FLAG_CODED ^ (flags | FLAG_CODED_PTS | FLAG_SIZE_MSB),
+        );
         put_v(&mut out, coded_pts);
         put_v(&mut out, payload.len() as u64);
         out.extend_from_slice(payload);
@@ -922,7 +921,11 @@ mod tests {
     }
 
     fn assert_live_stream(codec: Codec, frames: &[CapturedFrame], width: u32, height: u32) {
-        assert!(frames.len() >= 25, "expected ~30 frames, got {}", frames.len());
+        assert!(
+            frames.len() >= 25,
+            "expected ~30 frames, got {}",
+            frames.len()
+        );
         assert!(frames[0].is_key);
         let params = rpc::bitstream::parse_keyframe(codec, &frames[0].data)
             .expect("first keyframe carries parameter sets");

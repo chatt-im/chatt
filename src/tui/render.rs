@@ -23,7 +23,7 @@ use crate::{
     chat_buffer::{self, LineKind},
     client_net::{TransferDirection, format_bytes},
     theme::{self, Theme},
-    tui::modes::{RoomLayout, SettingsMode},
+    tui::modes::{LobbyListFocus, RoomLayout, SettingsMode},
     ui,
     ui::select::FuzzySelect,
 };
@@ -167,6 +167,7 @@ pub(crate) fn draw_settings_screen(
 pub(crate) fn draw_room_screen(
     app: &mut App,
     focus: ChatPanelFocus,
+    lobby_list_focus: LobbyListFocus,
     layout: &mut RoomLayout,
     mode: theme::UiMode,
     status_label: &'static str,
@@ -190,7 +191,7 @@ pub(crate) fn draw_room_screen(
     layout.compose_bar_rect = status_area;
     let chat_log_bar_area = screen.take_bottom(1);
     layout.chat_log_bar_rect = chat_log_bar_area;
-    draw_workspace(screen, app, focus, layout, buf, now_ms);
+    draw_workspace(screen, app, focus, lobby_list_focus, layout, buf, now_ms);
     draw_chat_log_bar(chat_log_bar_area, app, focus, buf);
 
     draw_compose_bar(status_area, app, focus, buf, mode, status_label);
@@ -207,7 +208,13 @@ fn composer_height(app: &mut App, width: u16) -> u16 {
         .max(1)
 }
 
-fn draw_room(area: Rect, app: &App, focus: ChatPanelFocus, buf: &mut Buffer) {
+fn draw_user_list(
+    area: Rect,
+    app: &App,
+    focus: ChatPanelFocus,
+    lobby_list_focus: LobbyListFocus,
+    buf: &mut Buffer,
+) {
     area.with(app.theme.panel_alt).fill(buf);
     let mut rows = area;
     let visible = rows.h as usize;
@@ -226,8 +233,9 @@ fn draw_room(area: Rect, app: &App, focus: ChatPanelFocus, buf: &mut Buffer) {
         .take(visible)
     {
         let row = rows.take_top(1);
-        let selected =
-            lobby_focused && Some(participant.user_id) == app.room.participants.selected_user;
+        let selected = lobby_focused
+            && lobby_list_focus == LobbyListFocus::Users
+            && Some(participant.user_id) == app.room.participants.selected_user;
         let state =
             if Some(participant.user_id) == app.user_id && app.deafened.load(Ordering::Relaxed) {
                 "deaf"
@@ -282,6 +290,7 @@ fn draw_workspace(
     area: Rect,
     app: &mut App,
     focus: ChatPanelFocus,
+    lobby_list_focus: LobbyListFocus,
     layout: &mut RoomLayout,
     buf: &mut Buffer,
     now_ms: u64,
@@ -289,20 +298,29 @@ fn draw_workspace(
     let mut rows = area;
     let room_height = app.config.ui.room_height.min(rows.h.saturating_sub(1));
     if room_height > 0 {
-        let mut room_area = rows.take_top(room_height as i32);
-        if room_height >= 2 {
-            let rooms_row = room_area.take_top(1);
-            layout.rooms_row_rect = rooms_row;
-            draw_rooms_row(rooms_row, app, layout, buf);
-        }
-        layout.room_rect = room_area;
-        draw_room(room_area, app, focus, buf);
+        let lobby_area = rows.take_top(room_height as i32);
+        let (rooms_area, divider_area, users_area) = split_lobby_lists(lobby_area);
+        layout.room_list_rect = rooms_area;
+        layout.lobby_divider_rect = divider_area;
+        layout.user_list_rect = users_area;
+        draw_room_list(rooms_area, app, focus, lobby_list_focus, layout, buf);
+        divider_area.with(app.theme.status_fill).fill(buf);
+        draw_user_list(users_area, app, focus, lobby_list_focus, buf);
     }
 
     if rows.h > 0 {
         let lobby_bar = rows.take_top(1);
         layout.lobby_bar_rect = lobby_bar;
-        draw_lobby_bar(lobby_bar, app, focus, buf);
+        draw_lobby_bar(
+            lobby_bar,
+            app,
+            focus,
+            lobby_list_focus,
+            layout.room_list_rect,
+            layout.lobby_divider_rect,
+            layout.user_list_rect,
+            buf,
+        );
     }
 
     if rows.h > 0 {
@@ -312,39 +330,111 @@ fn draw_workspace(
     }
 }
 
-/// The one-line rooms strip at the top of the lobby panel: one flat segment
-/// per room with unread and voice markers, hit boxes recorded for clicks.
-fn draw_rooms_row(area: Rect, app: &App, layout: &mut RoomLayout, buf: &mut Buffer) {
+fn split_lobby_lists(area: Rect) -> (Rect, Rect, Rect) {
+    if area.is_empty() {
+        return (Rect::EMPTY, Rect::EMPTY, Rect::EMPTY);
+    }
+
+    let mut columns = area;
+    if area.w < 3 {
+        let rooms_width = area.w / 2;
+        let rooms = columns.take_left(rooms_width as i32);
+        return (rooms, Rect::EMPTY, columns);
+    }
+
+    let rooms_width = (area.w / 3).clamp(1, 50);
+    let rooms = columns.take_left(rooms_width as i32);
+    let divider = columns.take_left(1);
+    (rooms, divider, columns)
+}
+
+/// Full-height room list for the lobby panel, with one full-row click target
+/// per visible room.
+fn draw_room_list(
+    area: Rect,
+    app: &App,
+    focus: ChatPanelFocus,
+    lobby_list_focus: LobbyListFocus,
+    layout: &mut RoomLayout,
+    buf: &mut Buffer,
+) {
     if area.is_empty() {
         return;
     }
     let theme = app.theme;
     area.with(theme.panel_alt).fill(buf);
-    let mut row = area;
-    for item in app.room_select_items() {
-        let mut label = format!(" {}", item.name);
-        if item.unread > 0 {
-            label.push_str(&format!(" {}", item.unread));
-        } else if item.behind_head {
-            label.push_str(" •");
-        }
-        if item.voice {
-            label.push_str(" V");
-        }
-        label.push(' ');
-        let style = if item.viewed {
-            theme.room_selected.patch(theme.text) | Modifier::BOLD
-        } else if item.unread > 0 || item.behind_head {
-            theme.panel_alt.patch(theme.warn)
-        } else {
-            theme.panel_alt.patch(theme.muted)
-        };
-        let rect = draw_status_segment(&mut row, buf, style, &label);
-        if rect.is_empty() {
-            break;
-        }
-        layout.room_hits.push((rect, item.room_id));
+
+    let items = app.room_select_items();
+    if items.is_empty() {
+        area.with(theme.panel_alt.patch(theme.muted))
+            .with(Ellipsis(true))
+            .text(buf, " No rooms known yet.");
+        return;
     }
+
+    let visible = area.h as usize;
+    let viewed = items.iter().position(|item| item.viewed).unwrap_or(0);
+    let start = viewed.saturating_sub(visible.saturating_sub(1));
+    let active = focus == ChatPanelFocus::Lobby && lobby_list_focus == LobbyListFocus::Rooms;
+    let mut rows = area;
+    for item in items.iter().skip(start).take(visible) {
+        let full_row = rows.take_top(1);
+        layout.room_hits.push((full_row, item.room_id));
+        draw_room_list_item(full_row, buf, item, active, &theme);
+    }
+}
+
+fn draw_room_list_item(
+    area: Rect,
+    buf: &mut Buffer,
+    item: &RoomSelectItem,
+    active: bool,
+    theme: &Theme,
+) {
+    let selected = active && item.viewed;
+    let base = if selected {
+        theme.room_selected
+    } else {
+        theme.panel_alt
+    };
+    area.with(base).fill(buf);
+
+    let mut row = area;
+    if item.voice {
+        draw_status_segment_right(&mut row, buf, base.patch(theme.good), " V ");
+    }
+    if item.unread > 0 {
+        draw_status_segment_right(
+            &mut row,
+            buf,
+            base.patch(theme.warn) | Modifier::BOLD,
+            &format!(" {} ", item.unread),
+        );
+    } else if item.behind_head {
+        draw_status_segment_right(&mut row, buf, base.patch(theme.warn), " • ");
+    }
+
+    let marker_width = row.w.min(2);
+    if marker_width > 0 {
+        row.take_left(marker_width as i32)
+            .with(base.patch(if item.viewed {
+                theme.good
+            } else {
+                theme.subtle
+            }))
+            .text(buf, if selected { ">" } else { " " });
+    }
+
+    let name_style = if item.viewed {
+        base.patch(theme.text | Modifier::BOLD)
+    } else if item.unread > 0 || item.behind_head {
+        base.patch(theme.warn)
+    } else {
+        base.patch(theme.muted)
+    };
+    row.with(name_style)
+        .with(Ellipsis(true))
+        .text(buf, &item.name);
 }
 
 pub(crate) fn draw_room_select_screen(
@@ -919,13 +1009,49 @@ fn video_badge_style(theme: Theme, accent: Style) -> Style {
     }
 }
 
-fn draw_lobby_bar(area: Rect, app: &mut App, focus: ChatPanelFocus, buf: &mut Buffer) {
+fn draw_lobby_bar(
+    area: Rect,
+    app: &mut App,
+    focus: ChatPanelFocus,
+    lobby_list_focus: LobbyListFocus,
+    room_list_rect: Rect,
+    divider_rect: Rect,
+    user_list_rect: Rect,
+    buf: &mut Buffer,
+) {
     if area.is_empty() {
         return;
     }
-    let focused = focus == ChatPanelFocus::Lobby;
-    let (fill, label, detail) = section_bar_styles(app.theme, ChatPanelFocus::Lobby, focused);
+    let lobby_focused = focus == ChatPanelFocus::Lobby;
+    let fill = app.theme.status_fill;
     area.with(fill).fill(buf);
+
+    let rooms_bar = bar_rect_for(area, room_list_rect);
+    if !rooms_bar.is_empty() {
+        let (_, label, detail) = section_bar_styles(
+            app.theme,
+            ChatPanelFocus::Lobby,
+            lobby_focused && lobby_list_focus == LobbyListFocus::Rooms,
+        );
+        let room_count = app.room_select_items().len();
+        let mut row = rooms_bar;
+        draw_status_segment(&mut row, buf, label, " Rooms ");
+        draw_status_segment(&mut row, buf, detail, &format!(" {} ", room_count));
+    }
+
+    bar_rect_for(area, divider_rect).with(fill).fill(buf);
+
+    let lobby_bar = bar_rect_for(area, user_list_rect);
+    if lobby_bar.is_empty() {
+        draw_lobby_audio_widget(Rect::EMPTY, app, fill, buf);
+        return;
+    }
+
+    let (_, label, detail) = section_bar_styles(
+        app.theme,
+        ChatPanelFocus::Lobby,
+        lobby_focused && lobby_list_focus == LobbyListFocus::Users,
+    );
     let voice_label = match app
         .voice_room
         .and_then(|room_id| app.room.room_meta(room_id))
@@ -933,7 +1059,7 @@ fn draw_lobby_bar(area: Rect, app: &mut App, focus: ChatPanelFocus, buf: &mut Bu
         Some(meta) => format!("voice: {} {}", meta.name, meta.voice_users.len()),
         None => "voice: off".to_string(),
     };
-    let mut row = area;
+    let mut row = lobby_bar;
     draw_status_segment(&mut row, buf, label, " Lobby ");
     draw_status_segment(
         &mut row,
@@ -948,6 +1074,19 @@ fn draw_lobby_bar(area: Rect, app: &mut App, focus: ChatPanelFocus, buf: &mut Bu
         ),
     );
     draw_lobby_audio_widget(row, app, fill, buf);
+}
+
+fn bar_rect_for(bar: Rect, source: Rect) -> Rect {
+    if bar.is_empty() || source.is_empty() {
+        return Rect::EMPTY;
+    }
+    Rect {
+        x: source.x,
+        y: bar.y,
+        w: source.w,
+        h: bar.h,
+    }
+    .intersect(bar)
 }
 
 /// The audio health widget on the right of the lobby bar: compact device
