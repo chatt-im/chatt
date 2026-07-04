@@ -1,7 +1,4 @@
-use std::{
-    collections::{BTreeMap, VecDeque},
-    time::Instant,
-};
+use std::{collections::BTreeMap, time::Instant};
 
 use hashbrown::{HashMap, HashSet};
 
@@ -102,11 +99,10 @@ impl ClientRoomKind {
 pub(crate) struct ClientRoom {
     pub(crate) chat: VirtualChatBuffer,
     /// Canonical ordered message list backing the buffer, bounded to the same
-    /// cap. Kept so history merges can re-sort and rebuild, and so the web
+    /// cap. Kept so history merges can dedup and order pages, and so the web
     /// feed can mirror a room without re-reading disk.
-    messages: Vec<ChatMessage>,
+    messages: MessageLog,
     files: std::collections::HashMap<FileHistoryKey, room_history::FileDetail>,
-    seen: BoundedKeySet,
     history: Option<RoomHistoryStore>,
     draft: String,
     web_attachments: HashMap<(u64, u64), WebAttachment>,
@@ -118,9 +114,8 @@ impl ClientRoom {
     fn empty(max_messages: usize, syntax: crate::theme::SyntaxTheme) -> Self {
         Self {
             chat: VirtualChatBuffer::new(max_messages, syntax),
-            messages: Vec::new(),
+            messages: MessageLog::default(),
             files: std::collections::HashMap::new(),
-            seen: BoundedKeySet::with_capacity(max_messages),
             history: None,
             draft: String::new(),
             web_attachments: HashMap::new(),
@@ -132,17 +127,13 @@ impl ClientRoom {
     /// Applies one live message: dedup, disk capture, canonical list, buffer,
     /// and web-attachment correlation. Returns whether it was fresh.
     fn receive_chat(&mut self, message: &ChatMessage, local: bool, max_messages: usize) -> bool {
-        if !self
-            .seen
-            .insert((message.timestamp_ms, message.message_id.0))
-        {
+        if let LogInsert::Duplicate = self.messages.insert(message.clone()) {
             return false;
         }
         if let Some(store) = &mut self.history {
             store.append_message(message);
         }
-        self.messages.push(message.clone());
-        trim_messages(&mut self.messages, max_messages);
+        self.messages.trim_front(max_messages);
         self.chat.push_chat(message.clone(), local);
         if let Some(transfer_id) = message.file_transfer_id {
             let key = FileHistoryKey {
@@ -218,52 +209,73 @@ pub(crate) struct TransferProgress {
     pub(crate) direction: TransferDirection,
 }
 
-/// Bounded membership set of `(timestamp_ms, message_id)` keys that evicts the
-/// oldest inserted key once full. It mirrors the chat buffer's message cap so
-/// live-message dedup state cannot outgrow the visible scrollback, even when a
-/// peer keeps sending or a long join history is loaded.
-struct BoundedKeySet {
+/// The canonical ordered message list and its dedup keys. The key set always
+/// holds exactly the keys of resident messages: inserts add them and trims
+/// remove them with the messages they belong to, so live dedup can never
+/// drift from the buffered scrollback.
+#[derive(Default)]
+struct MessageLog {
+    messages: Vec<ChatMessage>,
     keys: HashSet<(u64, u64)>,
-    order: VecDeque<(u64, u64)>,
-    capacity: usize,
 }
 
-impl BoundedKeySet {
-    fn with_capacity(capacity: usize) -> Self {
-        Self {
-            keys: HashSet::new(),
-            order: VecDeque::new(),
-            capacity: capacity.max(1),
-        }
+enum LogInsert {
+    Duplicate,
+    Appended,
+    Inserted,
+}
+
+impl MessageLog {
+    fn key(message: &ChatMessage) -> (u64, u64) {
+        (message.timestamp_ms, message.message_id.0)
     }
 
-    /// Inserts `key`, evicting the oldest key when over capacity. Returns whether
-    /// the key was newly inserted.
-    fn insert(&mut self, key: (u64, u64)) -> bool {
+    /// Adopts a load that is already sorted and deduped by key, as
+    /// [`room_history::LoadedHistory`] guarantees.
+    fn from_sorted(messages: Vec<ChatMessage>) -> Self {
+        let keys = messages.iter().map(Self::key).collect();
+        Self { messages, keys }
+    }
+
+    /// Inserts at the key's sorted position, appending on the common
+    /// newest-message path. Returns where it landed, or `Duplicate`.
+    fn insert(&mut self, message: ChatMessage) -> LogInsert {
+        let key = Self::key(&message);
         if !self.keys.insert(key) {
-            return false;
+            return LogInsert::Duplicate;
         }
-        self.order.push_back(key);
-        while self.order.len() > self.capacity {
-            if let Some(evicted) = self.order.pop_front() {
-                self.keys.remove(&evicted);
-            }
+        if self
+            .messages
+            .last()
+            .is_none_or(|last| Self::key(last) < key)
+        {
+            self.messages.push(message);
+            return LogInsert::Appended;
         }
-        true
+        let index = self
+            .messages
+            .partition_point(|resident| Self::key(resident) < key);
+        self.messages.insert(index, message);
+        LogInsert::Inserted
     }
 
-    fn set_capacity(&mut self, capacity: usize) {
-        self.capacity = capacity.max(1);
-        while self.order.len() > self.capacity {
-            if let Some(evicted) = self.order.pop_front() {
-                self.keys.remove(&evicted);
-            }
+    /// Drops the oldest messages over `max`, removing their keys with them.
+    fn trim_front(&mut self, max: usize) {
+        if self.messages.len() <= max {
+            return;
+        }
+        let excess = self.messages.len() - max;
+        for message in self.messages.drain(..excess) {
+            self.keys.remove(&Self::key(&message));
         }
     }
 
-    fn clear(&mut self) {
-        self.keys.clear();
-        self.order.clear();
+    fn len(&self) -> usize {
+        self.messages.len()
+    }
+
+    fn as_slice(&self) -> &[ChatMessage] {
+        &self.messages
     }
 }
 
@@ -328,14 +340,6 @@ pub(crate) enum RefJump {
 pub(crate) enum ComposerSubmission {
     Command(String),
     Message(String),
-}
-
-/// Keeps the newest `max` messages, dropping from the front like the buffer.
-fn trim_messages(messages: &mut Vec<ChatMessage>, max: usize) {
-    if messages.len() > max {
-        let excess = messages.len() - max;
-        messages.drain(..excess);
-    }
 }
 
 /// Derives web attachments for file-announcement messages from their stored
@@ -690,23 +694,24 @@ impl RoomSession {
     }
 
     /// Builds a room's buffered state from its on-disk capture, opening an
-    /// append handle so live messages keep being captured.
+    /// append handle so live messages keep being captured. An oversized
+    /// capture is trimmed to the message cap so it cannot lock out server
+    /// history paging.
     fn materialize_room(&self, room_id: RoomId, local_user: Option<UserId>) -> ClientRoom {
         let opened = room_history::open(&self.history_id, room_id);
         let mut room = ClientRoom::empty(self.max_messages, self.syntax);
-        room.messages = opened.loaded.messages;
+        room.messages = MessageLog::from_sorted(opened.loaded.messages);
+        room.messages.trim_front(self.max_messages);
         room.files = opened.loaded.files;
         room.history = opened.store;
         room.chat.set_room_id(room_id);
-        for message in &room.messages {
+        for message in room.messages.as_slice() {
             let local = Some(message.sender) == local_user;
-            room.seen
-                .insert((message.timestamp_ms, message.message_id.0));
             room.chat.push_chat(message.clone(), local);
         }
         room.chat.bottom();
         collect_web_attachments(
-            &room.messages,
+            room.messages.as_slice(),
             &room.files,
             &mut room.web_attachments,
             &mut room.web_file_attachments,
@@ -859,12 +864,8 @@ impl RoomSession {
             .unwrap_or_default();
         self.active.chat.clear();
         self.active.chat.set_room_id(room_id);
-        self.active.seen.clear();
-        for message in &self.active.messages {
+        for message in self.active.messages.as_slice() {
             let local = Some(message.sender) == local_user;
-            self.active
-                .seen
-                .insert((message.timestamp_ms, message.message_id.0));
             self.active.chat.push_chat(message.clone(), local);
         }
         self.active.chat.bottom();
@@ -1055,32 +1056,25 @@ impl RoomSession {
             });
             let mut fresh = false;
             for message in messages {
-                if self
-                    .active
-                    .seen
-                    .insert((message.timestamp_ms, message.message_id.0))
-                {
-                    if let Some(store) = &mut self.active.history {
-                        store.append_message(&message);
-                    }
-                    self.active.messages.push(message);
-                    fresh = true;
+                if let LogInsert::Duplicate = self.active.messages.insert(message.clone()) {
+                    continue;
                 }
+                if let Some(store) = &mut self.active.history {
+                    store.append_message(&message);
+                }
+                fresh = true;
             }
             if !fresh {
                 return;
             }
-            self.active
-                .messages
-                .sort_by_key(|message| (message.timestamp_ms, message.message_id.0));
-            trim_messages(&mut self.active.messages, self.max_messages);
+            self.active.messages.trim_front(self.max_messages);
             let all = std::mem::take(&mut self.active.messages);
-            self.populate_history(room_id, &all, local_user);
+            self.populate_history(room_id, all.as_slice(), local_user);
             self.active.messages = all;
             self.active.chat.restore_scroll_offset(scroll_offset);
             if let Some(selected) = selected
                 && let Some(index) =
-                    self.active.messages.iter().position(|message| {
+                    self.active.messages.as_slice().iter().position(|message| {
                         (message.timestamp_ms, message.message_id.0) == selected
                     })
             {
@@ -1097,26 +1091,21 @@ impl RoomSession {
         };
         let mut fresh = false;
         for message in messages {
-            if room
-                .seen
-                .insert((message.timestamp_ms, message.message_id.0))
-            {
-                if let Some(store) = &mut room.history {
-                    store.append_message(&message);
-                }
-                room.messages.push(message);
-                fresh = true;
+            if let LogInsert::Duplicate = room.messages.insert(message.clone()) {
+                continue;
             }
+            if let Some(store) = &mut room.history {
+                store.append_message(&message);
+            }
+            fresh = true;
         }
         if !fresh {
             return;
         }
-        room.messages
-            .sort_by_key(|message| (message.timestamp_ms, message.message_id.0));
-        trim_messages(&mut room.messages, self.max_messages);
+        room.messages.trim_front(self.max_messages);
         room.chat.clear();
         room.chat.set_room_id(room_id);
-        for message in &room.messages {
+        for message in room.messages.as_slice() {
             let local = Some(message.sender) == local_user;
             room.chat.push_chat(message.clone(), local);
         }
@@ -1127,7 +1116,7 @@ impl RoomSession {
     /// feed.
     pub(crate) fn viewed_history(&self) -> room_history::LoadedHistory {
         room_history::LoadedHistory {
-            messages: self.active.messages.clone(),
+            messages: self.active.messages.as_slice().to_vec(),
             files: self.active.files.clone(),
         }
     }
@@ -1331,15 +1320,11 @@ impl RoomSession {
     ) {
         self.active.chat.clear();
         self.active.chat.set_room_id(room_id);
-        self.active.seen.clear();
         self.active.transfers.clear();
         self.active.web_attachments.clear();
         self.active.web_file_attachments.clear();
         for message in messages {
             let local = Some(message.sender) == local_user;
-            self.active
-                .seen
-                .insert((message.timestamp_ms, message.message_id.0));
             self.active.chat.push_chat(message.clone(), local);
         }
         self.active.chat.bottom();
@@ -1352,7 +1337,7 @@ impl RoomSession {
         self.active.web_attachments.clear();
         self.active.web_file_attachments.clear();
         collect_web_attachments(
-            &self.active.messages,
+            self.active.messages.as_slice(),
             files,
             &mut self.active.web_attachments,
             &mut self.active.web_file_attachments,
@@ -1712,7 +1697,7 @@ impl RoomSession {
             .chain(self.archived_rooms.values_mut());
         for room in rooms {
             room.chat.set_max_messages(max_messages as usize);
-            room.seen.set_capacity(max_messages as usize);
+            room.messages.trim_front(max_messages as usize);
         }
     }
 
@@ -2415,6 +2400,76 @@ mod tests {
         room.merge_history(RoomId(1), older, Some(UserId(1)));
 
         assert_eq!(room.active.chat.scroll_offset(), before);
+    }
+
+    #[test]
+    fn message_log_keys_match_resident_messages() {
+        let mut log = MessageLog::default();
+        assert!(matches!(
+            log.insert(message(2, UserId(1), "middle")),
+            LogInsert::Appended
+        ));
+        assert!(matches!(
+            log.insert(message(2, UserId(1), "dupe")),
+            LogInsert::Duplicate
+        ));
+        assert!(matches!(
+            log.insert(message(1, UserId(1), "older")),
+            LogInsert::Inserted
+        ));
+        assert!(matches!(
+            log.insert(message(3, UserId(1), "newest")),
+            LogInsert::Appended
+        ));
+        let ids: Vec<u64> = log.as_slice().iter().map(|m| m.message_id.0).collect();
+        assert_eq!(ids, vec![1, 2, 3]);
+        assert_eq!(log.keys.len(), log.len());
+
+        log.trim_front(2);
+        let ids: Vec<u64> = log.as_slice().iter().map(|m| m.message_id.0).collect();
+        assert_eq!(ids, vec![2, 3]);
+        assert_eq!(log.keys.len(), log.len());
+        assert!(matches!(
+            log.insert(message(1, UserId(1), "trimmed key gone")),
+            LogInsert::Inserted
+        ));
+    }
+
+    #[test]
+    fn materialize_room_trims_oversized_capture() {
+        let history_id = "trim-oversized-capture";
+        let room_id = RoomId(1);
+        let mut store = room_history::open(history_id, room_id)
+            .store
+            .expect("history store opens");
+        for id in 1..=10 {
+            store.append_message(&message(id, UserId(2), "captured"));
+        }
+        drop(store);
+        let catalog = RoomCatalog {
+            last_viewed_room: Some(room_id),
+            last_voice_room: None,
+            rooms: vec![CatalogRoom {
+                room_id,
+                name: "lobby".to_string(),
+                kind: CatalogRoomKind::Public,
+                last_read: None,
+            }],
+        };
+
+        let mut room = test_room();
+        room.set_max_messages(4);
+        room.connect_to_server(
+            "alias".to_string(),
+            history_id.to_string(),
+            "me".to_string(),
+        );
+        room.load_offline_catalog(&catalog, None);
+
+        assert_eq!(room.active.chat.len(), 4);
+        let history = room.viewed_history();
+        assert_eq!(history.messages.len(), 4);
+        assert_eq!(history.messages[0].message_id, MessageId(7));
     }
 
     #[test]
