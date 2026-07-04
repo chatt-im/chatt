@@ -696,7 +696,10 @@ impl RoomMode {
         match focus {
             ChatPanelFocus::Lobby => self.keep_selected_room_user_visible(app),
             ChatPanelFocus::ChatLog => {
-                app.room.chat.ensure_selected_header(self.layout.chat_width);
+                app.room
+                    .active
+                    .chat
+                    .ensure_selected_header(self.layout.chat_width);
             }
             ChatPanelFocus::Compose => {}
         }
@@ -889,7 +892,7 @@ impl RoomMode {
             }
             extui::event::MouseEventKind::ScrollDown if in_chat => {
                 self.set_focus(app, ChatPanelFocus::ChatLog);
-                app.room.chat.scroll_down(5);
+                app.room.active.chat.scroll_down(5);
             }
             extui::event::MouseEventKind::Down(extui::event::MouseButton::Left) if in_chat => {
                 self.set_focus(app, ChatPanelFocus::ChatLog);
@@ -897,23 +900,28 @@ impl RoomMode {
                     Some(line) => match line.kind {
                         LineKind::Heading | LineKind::Ellipsis => {
                             app.room
+                                .active
                                 .chat
                                 .select_header_containing(line.message, self.layout.chat_width);
                             app.room
+                                .active
                                 .chat
                                 .toggle_expand(line.message, self.layout.chat_width);
                             self.keep_selected_chat_header_visible(app);
-                            app.room.chat.clear_selection();
+                            app.room.active.chat.clear_selection();
                         }
                         LineKind::Body => {
-                            app.room.chat.begin_selection((line.message, line.line));
+                            app.room
+                                .active
+                                .chat
+                                .begin_selection((line.message, line.line));
                         }
                     },
-                    _ => app.room.chat.clear_selection(),
+                    _ => app.room.active.chat.clear_selection(),
                 }
             }
             extui::event::MouseEventKind::Drag(extui::event::MouseButton::Left)
-                if app.room.chat.is_selecting() =>
+                if app.room.active.chat.is_selecting() =>
             {
                 self.set_focus(app, ChatPanelFocus::ChatLog);
                 self.drag_chat_selection(app, mouse.row);
@@ -922,17 +930,17 @@ impl RoomMode {
                 // A collapsed selection (press and release without a drag) over a
                 // message reference jumps to it and over a URL opens it; a drag
                 // remains a text selection.
-                if app.room.chat.selection_is_click() {
+                if app.room.active.chat.selection_is_click() {
                     if let Some(target) = self.chat_ref_at(app, mouse.column, mouse.row) {
                         self.jump_to_ref(app, target);
                     } else if let Some(url) = self.chat_link_at(app, mouse.column, mouse.row) {
                         app.room.request_open_url(url);
                     }
                 }
-                app.room.chat.end_selection();
+                app.room.active.chat.end_selection();
             }
             extui::event::MouseEventKind::Up(extui::event::MouseButton::Left) => {
-                app.room.chat.end_selection();
+                app.room.active.chat.end_selection();
             }
             _ => {}
         }
@@ -953,6 +961,7 @@ impl RoomMode {
         }
         let col_in_line = column - content_x;
         app.room
+            .active
             .chat
             .link_at(line.message, line.line, col_in_line)
             .map(str::to_owned)
@@ -969,7 +978,10 @@ impl RoomMode {
             return None;
         }
         let col_in_line = column - content_x;
-        app.room.chat.ref_at(line.message, line.line, col_in_line)
+        app.room
+            .active
+            .chat
+            .ref_at(line.message, line.line, col_in_line)
     }
 
     /// Jumps to a reference's target: selects and scrolls to the message when
@@ -1034,7 +1046,7 @@ impl RoomMode {
         if self.focus != ChatPanelFocus::ChatLog {
             return;
         }
-        let Some(target) = app.room.chat.selected_ref(self.layout.chat_width) else {
+        let Some(target) = app.room.active.chat.selected_ref(self.layout.chat_width) else {
             app.set_status("selected message contains no reference");
             return;
         };
@@ -1046,13 +1058,16 @@ impl RoomMode {
         if row < rect.y {
             self.scroll_chat_up(app, 1);
         } else if row >= rect.y.saturating_add(rect.h) {
-            app.room.chat.scroll_down(1);
+            app.room.active.chat.scroll_down(1);
         }
         let clamped = row.clamp(rect.y, rect.y.saturating_add(rect.h).saturating_sub(1));
         if let Some(line) = self.layout.chat_line_at(clamped)
             && line.kind == LineKind::Body
         {
-            app.room.chat.extend_selection((line.message, line.line));
+            app.room
+                .active
+                .chat
+                .extend_selection((line.message, line.line));
         }
     }
 
@@ -1073,6 +1088,7 @@ impl RoomMode {
 
     fn scroll_chat_up(&mut self, app: &mut App, rows: usize) {
         app.room
+            .active
             .chat
             .scroll_up(rows, self.layout.chat_width, self.layout.chat_height);
         app.request_older_history_if_at_top(self.layout.chat_width, self.layout.chat_height);
@@ -1091,10 +1107,11 @@ impl RoomMode {
     fn select_chat_top(&mut self, app: &mut App) {
         if self.focus == ChatPanelFocus::ChatLog {
             app.room
+                .active
                 .chat
                 .top(self.layout.chat_width, self.layout.chat_height);
-            app.room.chat.select_first_header();
-            app.room.chat.clear_selection();
+            app.room.active.chat.select_first_header();
+            app.room.active.chat.clear_selection();
             self.keep_selected_chat_header_visible(app);
             app.request_older_history_if_at_top(self.layout.chat_width, self.layout.chat_height);
         }
@@ -1102,9 +1119,12 @@ impl RoomMode {
 
     fn select_chat_bottom(&mut self, app: &mut App) {
         if self.focus == ChatPanelFocus::ChatLog {
-            app.room.chat.bottom();
-            app.room.chat.select_last_header(self.layout.chat_width);
-            app.room.chat.clear_selection();
+            app.room.active.chat.bottom();
+            app.room
+                .active
+                .chat
+                .select_last_header(self.layout.chat_width);
+            app.room.active.chat.clear_selection();
             self.keep_selected_chat_header_visible(app);
         }
     }
@@ -1136,7 +1156,7 @@ impl RoomMode {
         if rows < 0 {
             self.scroll_chat_up(app, rows.unsigned_abs());
         } else {
-            app.room.chat.scroll_down(rows as usize);
+            app.room.active.chat.scroll_down(rows as usize);
         }
     }
 
@@ -1158,6 +1178,7 @@ impl RoomMode {
 
     fn keep_selected_chat_header_visible(&mut self, app: &mut App) {
         app.room
+            .active
             .chat
             .keep_selected_header_visible(self.layout.chat_width, self.layout.chat_height);
     }
@@ -1604,13 +1625,13 @@ mod tests {
         }
 
         room.set_focus(&mut app, ChatPanelFocus::ChatLog);
-        assert_eq!(app.room.chat.selected_message(), Some(2));
+        assert_eq!(app.room.active.chat.selected_message(), Some(2));
 
         room.process_input(&mut app, key('k'));
-        assert_eq!(app.room.chat.selected_message(), Some(1));
+        assert_eq!(app.room.active.chat.selected_message(), Some(1));
 
         room.process_input(&mut app, key('j'));
-        assert_eq!(app.room.chat.selected_message(), Some(2));
+        assert_eq!(app.room.active.chat.selected_message(), Some(2));
     }
 
     #[test]
@@ -1633,12 +1654,12 @@ mod tests {
 
         room.process_input(&mut app, key('g'));
         room.process_input(&mut app, key('g'));
-        assert_eq!(app.room.chat.selected_message(), Some(0));
-        assert!(app.room.chat.scroll_offset() > 0);
+        assert_eq!(app.room.active.chat.selected_message(), Some(0));
+        assert!(app.room.active.chat.scroll_offset() > 0);
 
         room.process_input(&mut app, key('G'));
-        assert_eq!(app.room.chat.selected_message(), Some(19));
-        assert_eq!(app.room.chat.scroll_offset(), 0);
+        assert_eq!(app.room.active.chat.selected_message(), Some(19));
+        assert_eq!(app.room.active.chat.scroll_offset(), 0);
     }
 
     #[test]
@@ -1661,7 +1682,12 @@ mod tests {
         room.process_input(&mut app, key('k'));
         render_room(&mut app, &mut room, &mut buffer);
 
-        let selected = app.room.chat.selected_message().expect("selected header");
+        let selected = app
+            .room
+            .active
+            .chat
+            .selected_message()
+            .expect("selected header");
         assert_eq!(selected, 12);
         assert!(
             room.layout()
@@ -1687,10 +1713,10 @@ mod tests {
         let mut buffer = Buffer::new(80, 24);
         render_room(&mut app, &mut room, &mut buffer);
         room.set_focus(&mut app, ChatPanelFocus::ChatLog);
-        assert!(app.room.chat.is_collapsed(0));
+        assert!(app.room.active.chat.is_collapsed(0));
 
         room.process_input(&mut app, KeyEvent::new(KeyCode::Tab, KeyModifiers::empty()));
-        assert!(app.room.chat.is_expanded(0));
+        assert!(app.room.active.chat.is_expanded(0));
     }
 
     #[test]
@@ -1730,7 +1756,7 @@ mod tests {
         let width = room.layout().chat_width;
         let height = room.layout().chat_height;
         assert!(
-            app.room.chat.is_collapsed(0),
+            app.room.active.chat.is_collapsed(0),
             "long message starts collapsed"
         );
 
@@ -1738,9 +1764,9 @@ mod tests {
         // at the top of the viewport. Collapsing now removes fewer rows than the
         // viewport height, which lands the scroll offset in the window where
         // `visible_lines` does not self-correct.
-        app.room.chat.toggle_expand(0, width);
-        assert!(app.room.chat.is_expanded(0));
-        app.room.chat.top(width, height);
+        app.room.active.chat.toggle_expand(0, width);
+        assert!(app.room.active.chat.is_expanded(0));
+        app.room.active.chat.top(width, height);
         render_room(&mut app, &mut room, &mut buffer);
 
         let heading_row = room
@@ -1762,7 +1788,7 @@ mod tests {
             },
         );
         assert!(
-            app.room.chat.is_collapsed(0),
+            app.room.active.chat.is_collapsed(0),
             "clicking the heading collapses it"
         );
 
@@ -1791,7 +1817,7 @@ mod tests {
         let mut buffer = Buffer::new(80, 24);
         render_room(&mut app, &mut room, &mut buffer);
         room.set_focus(&mut app, ChatPanelFocus::ChatLog);
-        app.room.chat.select_first_header();
+        app.room.active.chat.select_first_header();
         room.process_input(&mut app, key('y'));
 
         assert_eq!(
@@ -1832,8 +1858,8 @@ mod tests {
         );
 
         assert_eq!(room.focus(), ChatPanelFocus::ChatLog);
-        assert_eq!(app.room.chat.selected_message(), Some(line.message));
-        assert!(app.room.chat.is_selecting());
+        assert_eq!(app.room.active.chat.selected_message(), Some(line.message));
+        assert!(app.room.active.chat.is_selecting());
     }
 
     #[test]

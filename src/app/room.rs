@@ -96,11 +96,11 @@ impl ClientRoomKind {
     }
 }
 
-/// A room's buffered state while it is not the viewed room. The viewed room's
-/// copy of these fields lives inline in [`RoomSession`]; switching rooms parks
-/// the active state here and checks out the target's.
-struct ClientRoom {
-    chat: VirtualChatBuffer,
+/// A room's buffered state. The viewed room lives in [`RoomSession::active`];
+/// switching rooms parks the active state into the parked map and checks out
+/// the target's.
+pub(crate) struct ClientRoom {
+    pub(crate) chat: VirtualChatBuffer,
     /// Canonical ordered message list backing the buffer, bounded to the same
     /// cap. Kept so history merges can re-sort and rebuild, and so the web
     /// feed can mirror a room without re-reading disk.
@@ -112,6 +112,22 @@ struct ClientRoom {
     web_attachments: HashMap<(u64, u64), WebAttachment>,
     web_file_attachments: HashMap<FileHistoryKey, WebAttachment>,
     transfers: HashMap<FileTransferId, TransferProgress>,
+}
+
+impl ClientRoom {
+    fn empty(max_messages: usize, syntax: crate::theme::SyntaxTheme) -> Self {
+        Self {
+            chat: VirtualChatBuffer::new(max_messages, syntax),
+            messages: Vec::new(),
+            files: std::collections::HashMap::new(),
+            seen: BoundedKeySet::with_capacity(max_messages),
+            history: None,
+            draft: String::new(),
+            web_attachments: HashMap::new(),
+            web_file_attachments: HashMap::new(),
+            transfers: HashMap::new(),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -130,25 +146,15 @@ pub(crate) struct RoomSession {
     pub composer_hl: EditorHighlighter,
     command_completion: CommandCompletionState,
     ref_completion: RefCompletionState,
-    pub chat: VirtualChatBuffer,
-    messages: Vec<ChatMessage>,
-    files: std::collections::HashMap<FileHistoryKey, room_history::FileDetail>,
+    /// The viewed room's buffered state. Present even before any room is
+    /// known, so pre-connect notices have a buffer to land in.
+    pub(crate) active: ClientRoom,
     pub participants: Participants,
     pending_clipboard: Option<String>,
     pending_url_open: Option<String>,
     muted_users: HashSet<UserId>,
     stream_users: HashMap<u32, UserId>,
     volume_preview: Option<(UserId, f32)>,
-    history: Option<RoomHistoryStore>,
-    seen: BoundedKeySet,
-    web_attachments: HashMap<(u64, u64), WebAttachment>,
-    web_file_attachments: HashMap<FileHistoryKey, WebAttachment>,
-    /// Live progress for in-flight file transfers, keyed by the server transfer
-    /// id. An entry exists only while a transfer is running: it is inserted on
-    /// the first tick and removed when it completes, cancels, or errors, so the
-    /// file's chat line reverts to its normal completed rendering. Cleared on
-    /// room switch.
-    transfers: HashMap<FileTransferId, TransferProgress>,
     /// Catalog facts for every known room, viewed or not.
     metas: BTreeMap<RoomId, RoomMeta>,
     /// Buffered state of rooms other than the viewed one.
@@ -426,20 +432,13 @@ impl RoomSession {
             composer_hl,
             command_completion: CommandCompletionState::default(),
             ref_completion: RefCompletionState::default(),
-            chat: VirtualChatBuffer::new(config.ui.max_messages as usize, theme.syntax),
+            active: ClientRoom::empty(config.ui.max_messages as usize, theme.syntax),
             participants: Participants::default(),
             pending_clipboard: None,
             pending_url_open: None,
             muted_users: HashSet::new(),
             stream_users: HashMap::new(),
             volume_preview: None,
-            history: None,
-            seen: BoundedKeySet::with_capacity(config.ui.max_messages as usize),
-            web_attachments: HashMap::new(),
-            web_file_attachments: HashMap::new(),
-            transfers: HashMap::new(),
-            messages: Vec::new(),
-            files: std::collections::HashMap::new(),
             metas: BTreeMap::new(),
             parked: HashMap::new(),
             participant_presence: HashMap::new(),
@@ -497,7 +496,7 @@ impl RoomSession {
             .inline_completion(&self.composer, style)
             .or_else(|| {
                 self.ref_completion
-                    .inline_completion(&self.composer, &self.chat, style)
+                    .inline_completion(&self.composer, &self.active.chat, style)
             });
         self.composer.set_inline_completion(completion);
     }
@@ -507,7 +506,8 @@ impl RoomSession {
         if self.command_completion.complete(&mut self.composer) {
             return true;
         }
-        self.ref_completion.complete(&mut self.composer, &self.chat)
+        self.ref_completion
+            .complete(&mut self.composer, &self.active.chat)
     }
 
     pub(crate) fn connect_to_server(
@@ -561,14 +561,7 @@ impl RoomSession {
     }
 
     fn clear_active_room_state(&mut self) {
-        self.chat.clear();
-        self.messages.clear();
-        self.files.clear();
-        self.history = None;
-        self.seen.clear();
-        self.web_attachments.clear();
-        self.web_file_attachments.clear();
-        self.transfers.clear();
+        self.active = ClientRoom::empty(self.max_messages, self.syntax);
         self.participants.replace_room(Vec::new());
     }
 
@@ -669,17 +662,10 @@ impl RoomSession {
     /// append handle so live messages keep being captured.
     fn materialize_room(&self, room_id: RoomId, local_user: Option<UserId>) -> ClientRoom {
         let opened = room_history::open(&self.history_id, room_id);
-        let mut room = ClientRoom {
-            chat: VirtualChatBuffer::new(self.max_messages, self.syntax),
-            messages: opened.loaded.messages,
-            files: opened.loaded.files,
-            seen: BoundedKeySet::with_capacity(self.max_messages),
-            history: opened.store,
-            draft: String::new(),
-            web_attachments: HashMap::new(),
-            web_file_attachments: HashMap::new(),
-            transfers: HashMap::new(),
-        };
+        let mut room = ClientRoom::empty(self.max_messages, self.syntax);
+        room.messages = opened.loaded.messages;
+        room.files = opened.loaded.files;
+        room.history = opened.store;
         room.chat.set_room_id(room_id);
         for message in &room.messages {
             let local = Some(message.sender) == local_user;
@@ -724,21 +710,14 @@ impl RoomSession {
             return true;
         }
         self.park_viewed_room();
-        let room = match self.parked.remove(&room_id) {
+        self.active = match self.parked.remove(&room_id) {
             Some(room) => room,
             None => self.materialize_room(room_id, local_user),
         };
-        self.chat = room.chat;
-        self.messages = room.messages;
-        self.files = room.files;
-        self.seen = room.seen;
-        self.history = room.history;
-        self.web_attachments = room.web_attachments;
-        self.web_file_attachments = room.web_file_attachments;
-        self.transfers = room.transfers;
         self.composer.clear();
-        if !room.draft.is_empty() {
-            self.composer.set_lines(&room.draft);
+        let draft = std::mem::take(&mut self.active.draft);
+        if !draft.is_empty() {
+            self.composer.set_lines(&draft);
         }
         self.composer.enter_insert_mode();
         self.viewed_room = Some(room_id);
@@ -756,21 +735,11 @@ impl RoomSession {
         let Some(previous) = self.viewed_room.take() else {
             return;
         };
-        let empty = VirtualChatBuffer::new(self.max_messages, self.syntax);
-        let parked = ClientRoom {
-            chat: std::mem::replace(&mut self.chat, empty),
-            messages: std::mem::take(&mut self.messages),
-            files: std::mem::take(&mut self.files),
-            seen: std::mem::replace(
-                &mut self.seen,
-                BoundedKeySet::with_capacity(self.max_messages),
-            ),
-            history: self.history.take(),
-            draft: self.composer.text(),
-            web_attachments: std::mem::take(&mut self.web_attachments),
-            web_file_attachments: std::mem::take(&mut self.web_file_attachments),
-            transfers: std::mem::take(&mut self.transfers),
-        };
+        let mut parked = std::mem::replace(
+            &mut self.active,
+            ClientRoom::empty(self.max_messages, self.syntax),
+        );
+        parked.draft = self.composer.text();
         self.parked.insert(previous, parked);
     }
 
@@ -829,16 +798,17 @@ impl RoomSession {
             .get(&room_id)
             .map(|meta| meta.name.clone())
             .unwrap_or_default();
-        self.chat.clear();
-        self.chat.set_room_id(room_id);
-        self.seen.clear();
-        for message in &self.messages {
+        self.active.chat.clear();
+        self.active.chat.set_room_id(room_id);
+        self.active.seen.clear();
+        for message in &self.active.messages {
             let local = Some(message.sender) == local_user;
-            self.seen
+            self.active
+                .seen
                 .insert((message.timestamp_ms, message.message_id.0));
-            self.chat.push_chat(message.clone(), local);
+            self.active.chat.push_chat(message.clone(), local);
         }
-        self.chat.bottom();
+        self.active.chat.bottom();
         self.mark_viewed_read();
         self.rebuild_roster();
     }
@@ -849,9 +819,9 @@ impl RoomSession {
         let Some(room_id) = self.viewed_room else {
             return;
         };
-        let newest = (0..self.chat.len())
+        let newest = (0..self.active.chat.len())
             .rev()
-            .map(|index| self.chat.message(index).id)
+            .map(|index| self.active.chat.message(index).id)
             .find(|id| *id != 0)
             .map(MessageId);
         if let Some(meta) = self.metas.get_mut(&room_id) {
@@ -999,12 +969,12 @@ impl RoomSession {
         let meta = self.metas.get_mut(&room_id)?;
         if meta.history_at_start
             || meta.history_in_flight
-            || self.messages.len() >= self.max_messages
+            || self.active.messages.len() >= self.max_messages
         {
             return None;
         }
         let before = meta.history_before?;
-        let remaining = self.max_messages.saturating_sub(self.messages.len());
+        let remaining = self.max_messages.saturating_sub(self.active.messages.len());
         let limit = remaining
             .min(usize::from(rpc::control::MAX_HISTORY_FETCH_MESSAGES))
             .max(1) as u16;
@@ -1019,45 +989,47 @@ impl RoomSession {
         local_user: Option<UserId>,
     ) {
         if self.viewed_room == Some(room_id) {
-            let scroll_offset = self.chat.scroll_offset();
-            let selected = self.chat.selected_message().map(|index| {
-                let message = self.chat.message(index);
+            let scroll_offset = self.active.chat.scroll_offset();
+            let selected = self.active.chat.selected_message().map(|index| {
+                let message = self.active.chat.message(index);
                 (message.timestamp_ms, message.id)
             });
             let mut fresh = false;
             for message in messages {
                 if self
+                    .active
                     .seen
                     .insert((message.timestamp_ms, message.message_id.0))
                 {
-                    if let Some(store) = &mut self.history {
+                    if let Some(store) = &mut self.active.history {
                         store.append_message(&message);
                     }
-                    self.messages.push(message);
+                    self.active.messages.push(message);
                     fresh = true;
                 }
             }
             if !fresh {
                 return;
             }
-            self.messages
+            self.active
+                .messages
                 .sort_by_key(|message| (message.timestamp_ms, message.message_id.0));
-            trim_messages(&mut self.messages, self.max_messages);
-            let all = std::mem::take(&mut self.messages);
+            trim_messages(&mut self.active.messages, self.max_messages);
+            let all = std::mem::take(&mut self.active.messages);
             self.populate_history(room_id, &all, local_user);
-            self.messages = all;
-            self.chat.restore_scroll_offset(scroll_offset);
+            self.active.messages = all;
+            self.active.chat.restore_scroll_offset(scroll_offset);
             if let Some(selected) = selected
-                && let Some(index) = self
-                    .messages
-                    .iter()
-                    .position(|message| (message.timestamp_ms, message.message_id.0) == selected)
+                && let Some(index) =
+                    self.active.messages.iter().position(|message| {
+                        (message.timestamp_ms, message.message_id.0) == selected
+                    })
             {
-                self.chat.select_message(index);
+                self.active.chat.select_message(index);
             }
-            let files = std::mem::take(&mut self.files);
+            let files = std::mem::take(&mut self.active.files);
             self.populate_web_attachments_list(&files);
-            self.files = files;
+            self.active.files = files;
             self.mark_viewed_read();
             return;
         }
@@ -1096,8 +1068,8 @@ impl RoomSession {
     /// feed.
     pub(crate) fn viewed_history(&self) -> room_history::LoadedHistory {
         room_history::LoadedHistory {
-            messages: self.messages.clone(),
-            files: self.files.clone(),
+            messages: self.active.messages.clone(),
+            files: self.active.files.clone(),
         }
     }
 
@@ -1298,32 +1270,33 @@ impl RoomSession {
         messages: &[ChatMessage],
         local_user: Option<UserId>,
     ) {
-        self.chat.clear();
-        self.chat.set_room_id(room_id);
-        self.seen.clear();
-        self.transfers.clear();
-        self.web_attachments.clear();
-        self.web_file_attachments.clear();
+        self.active.chat.clear();
+        self.active.chat.set_room_id(room_id);
+        self.active.seen.clear();
+        self.active.transfers.clear();
+        self.active.web_attachments.clear();
+        self.active.web_file_attachments.clear();
         for message in messages {
             let local = Some(message.sender) == local_user;
-            self.seen
+            self.active
+                .seen
                 .insert((message.timestamp_ms, message.message_id.0));
-            self.chat.push_chat(message.clone(), local);
+            self.active.chat.push_chat(message.clone(), local);
         }
-        self.chat.bottom();
+        self.active.chat.bottom();
     }
 
     fn populate_web_attachments_list(
         &mut self,
         files: &std::collections::HashMap<FileHistoryKey, room_history::FileDetail>,
     ) {
-        self.web_attachments.clear();
-        self.web_file_attachments.clear();
+        self.active.web_attachments.clear();
+        self.active.web_file_attachments.clear();
         collect_web_attachments(
-            &self.messages,
+            &self.active.messages,
             files,
-            &mut self.web_attachments,
-            &mut self.web_file_attachments,
+            &mut self.active.web_attachments,
+            &mut self.active.web_file_attachments,
         );
     }
 
@@ -1331,8 +1304,9 @@ impl RoomSession {
         &self,
         target: rpc::msgref::MessageRef,
     ) -> Option<crate::web_wire::ResolvedRef> {
-        let label = self.chat.ref_label_for(target)?;
+        let label = self.active.chat.ref_label_for(target)?;
         let attachment = self
+            .active
             .web_attachments
             .get(&(target.timestamp_ms, target.message_id.0))
             .cloned();
@@ -1355,11 +1329,12 @@ impl RoomSession {
             meta.head = Some(message.message_id).max(meta.head);
         }
         if self.viewed_room == Some(room_id) {
-            let should_scroll_bottom = self.chat.scroll_offset() == 0;
+            let should_scroll_bottom = self.active.chat.scroll_offset() == 0;
             let web_attachment = message
                 .file_transfer_id
                 .and_then(|transfer_id| {
-                    self.web_file_attachments
+                    self.active
+                        .web_file_attachments
                         .get(&FileHistoryKey {
                             timestamp_ms: message.timestamp_ms,
                             transfer_id,
@@ -1368,23 +1343,25 @@ impl RoomSession {
                 })
                 .map(|attachment| (message.timestamp_ms, message.message_id.0, attachment));
             if self
+                .active
                 .seen
                 .insert((message.timestamp_ms, message.message_id.0))
             {
-                if let Some(store) = &mut self.history {
+                if let Some(store) = &mut self.active.history {
                     store.append_message(&message);
                 }
                 self.mark_participant_online_in_room(room_id, sender);
                 self.participants.note_message(&message);
-                self.messages.push(message.clone());
-                trim_messages(&mut self.messages, self.max_messages);
-                self.chat.push_chat(message, local);
+                self.active.messages.push(message.clone());
+                trim_messages(&mut self.active.messages, self.max_messages);
+                self.active.chat.push_chat(message, local);
                 if let Some((timestamp_ms, message_id, attachment)) = web_attachment {
-                    self.web_attachments
+                    self.active
+                        .web_attachments
                         .insert((timestamp_ms, message_id), attachment);
                 }
                 if should_scroll_bottom {
-                    self.chat.bottom();
+                    self.active.chat.bottom();
                 }
                 self.mark_viewed_read();
             }
@@ -1464,7 +1441,7 @@ impl RoomSession {
         }
         let packed_dims =
             dimensions.map_or(0, |(width, height)| ((height as u64) << 32) | width as u64);
-        if let Some(store) = &mut self.history {
+        if let Some(store) = &mut self.active.history {
             store.append_file_detail(
                 FileHistoryKey {
                     timestamp_ms,
@@ -1475,7 +1452,7 @@ impl RoomSession {
                 packed_dims,
             );
         }
-        self.files.insert(
+        self.active.files.insert(
             FileHistoryKey {
                 timestamp_ms,
                 transfer_id,
@@ -1487,15 +1464,16 @@ impl RoomSession {
             },
         );
         let attachment = WebAttachment::from_served_file(file_name, dimensions);
-        self.web_file_attachments.insert(
+        self.active.web_file_attachments.insert(
             FileHistoryKey {
                 timestamp_ms,
                 transfer_id,
             },
             attachment.clone(),
         );
-        if let Some(message_id) = file_message_id(&self.chat, timestamp_ms, transfer_id) {
-            self.web_attachments
+        if let Some(message_id) = file_message_id(&self.active.chat, timestamp_ms, transfer_id) {
+            self.active
+                .web_attachments
                 .insert((timestamp_ms, message_id), attachment);
         }
     }
@@ -1535,7 +1513,7 @@ impl RoomSession {
             return;
         }
         update_transfer_progress(
-            &mut self.transfers,
+            &mut self.active.transfers,
             transfer_id,
             transferred,
             total,
@@ -1546,7 +1524,7 @@ impl RoomSession {
     /// Removes any progress overlay for `transfer_id`, on completion or cancel.
     pub(crate) fn clear_transfer(&mut self, room_id: RoomId, transfer_id: FileTransferId) {
         if self.viewed_room == Some(room_id) {
-            self.transfers.remove(&transfer_id);
+            self.active.transfers.remove(&transfer_id);
         } else if let Some(room) = self.archived_rooms.get_mut(&room_id) {
             room.transfers.remove(&transfer_id);
         } else if let Some(room) = self.ensure_parked_room(room_id, self.local_user) {
@@ -1556,12 +1534,12 @@ impl RoomSession {
 
     /// The live progress for `transfer_id`, if a transfer is in flight.
     pub(crate) fn transfer(&self, transfer_id: FileTransferId) -> Option<TransferProgress> {
-        self.transfers.get(&transfer_id).copied()
+        self.active.transfers.get(&transfer_id).copied()
     }
 
     pub(super) fn push_notice(&mut self, sender: impl Into<String>, body: impl Into<String>) {
-        self.chat.push_notice(sender, body);
-        self.chat.bottom();
+        self.active.chat.push_notice(sender, body);
+        self.active.chat.bottom();
     }
 
     /// Applies a server-wide presence update to the user directory and to rooms
@@ -1772,13 +1750,17 @@ impl RoomSession {
     }
 
     pub(crate) fn clear_chat(&mut self) {
-        self.chat.clear();
+        self.active.chat.clear();
     }
 
     pub(super) fn apply_theme(&mut self, theme: &Theme) {
         self.syntax = theme.syntax;
-        self.chat.set_syntax(theme.syntax);
-        for room in self.parked.values_mut() {
+        self.active.chat.set_syntax(theme.syntax);
+        for room in self
+            .parked
+            .values_mut()
+            .chain(self.archived_rooms.values_mut())
+        {
             room.chat.set_syntax(theme.syntax);
         }
         self.composer.set_theme(theme.editor_theme());
@@ -1786,9 +1768,10 @@ impl RoomSession {
 
     pub(super) fn set_max_messages(&mut self, max_messages: u32) {
         self.max_messages = max_messages as usize;
-        self.chat.set_max_messages(max_messages as usize);
-        self.seen.set_capacity(max_messages as usize);
-        for room in self.parked.values_mut() {
+        let rooms = std::iter::once(&mut self.active)
+            .chain(self.parked.values_mut())
+            .chain(self.archived_rooms.values_mut());
+        for room in rooms {
             room.chat.set_max_messages(max_messages as usize);
             room.seen.set_capacity(max_messages as usize);
         }
@@ -1822,9 +1805,10 @@ impl RoomSession {
 
     pub(crate) fn copy_chat_selection(&mut self, width: u16) -> Option<String> {
         let text = self
+            .active
             .chat
             .selected_text()
-            .or_else(|| self.chat.selected_header_text(width))?;
+            .or_else(|| self.active.chat.selected_header_text(width))?;
         self.pending_clipboard = Some(text.clone());
         Some(text)
     }
@@ -1832,9 +1816,9 @@ impl RoomSession {
     /// The reference identifying the keyboard-selected message, when one is
     /// selected and referenceable (notices have no durable key).
     fn selected_message_ref(&mut self, width: u16) -> Option<rpc::msgref::MessageRef> {
-        let room_id = self.chat.room_id()?;
-        let selected = self.chat.ensure_selected_header(width)?;
-        let entry = self.chat.message(selected);
+        let room_id = self.active.chat.room_id()?;
+        let selected = self.active.chat.ensure_selected_header(width)?;
+        let entry = self.active.chat.message(selected);
         if entry.timestamp_ms == 0 {
             return None;
         }
@@ -1887,27 +1871,30 @@ impl RoomSession {
         width: u16,
         height: u16,
     ) -> RefJump {
-        if self.chat.room_id() != Some(target.room_id) {
+        if self.active.chat.room_id() != Some(target.room_id) {
             return RefJump::OtherRoom;
         }
         let Some(index) = self
+            .active
             .chat
             .find_message(target.timestamp_ms, target.message_id.0)
         else {
             return RefJump::NotFound;
         };
-        self.chat.clear_selection();
-        self.chat.select_header_containing(index, width);
-        self.chat.scroll_message_into_view(index, width, height);
+        self.active.chat.clear_selection();
+        self.active.chat.select_header_containing(index, width);
+        self.active
+            .chat
+            .scroll_message_into_view(index, width, height);
         RefJump::Jumped
     }
 
     pub(crate) fn toggle_selected_message_expand(&mut self, width: u16) -> ToggleExpandResult {
-        if self.chat.ensure_selected_header(width).is_none() {
+        if self.active.chat.ensure_selected_header(width).is_none() {
             return ToggleExpandResult::NoMessages;
         }
-        self.chat.clear_selection();
-        if self.chat.toggle_selected_expand(width) {
+        self.active.chat.clear_selection();
+        if self.active.chat.toggle_selected_expand(width) {
             ToggleExpandResult::Toggled
         } else {
             ToggleExpandResult::NotCollapsible
@@ -1915,8 +1902,11 @@ impl RoomSession {
     }
 
     pub(crate) fn move_selected_message(&mut self, delta: isize, width: u16) -> bool {
-        self.chat.clear_selection();
-        self.chat.move_selected_header(delta, width).is_some()
+        self.active.chat.clear_selection();
+        self.active
+            .chat
+            .move_selected_header(delta, width)
+            .is_some()
     }
 
     pub(super) fn begin_volume_preview(&mut self, user_id: UserId, value_db: f32) {
@@ -2154,17 +2144,17 @@ mod tests {
 
         assert!(room.set_viewed_room(RoomId(2), Some(UserId(1))));
         assert_eq!(room.viewed_room, Some(RoomId(2)));
-        assert_eq!(room.chat.len(), 0);
+        assert_eq!(room.active.chat.len(), 0);
         assert!(room.composer.text().trim().is_empty());
         room.chat_received(
             message_in(RoomId(2), 1, UserId(1), "in two"),
             Some(UserId(1)),
         );
-        assert_eq!(room.chat.len(), 1);
+        assert_eq!(room.active.chat.len(), 1);
 
         assert!(room.set_viewed_room(RoomId(1), Some(UserId(1))));
-        assert_eq!(room.chat.len(), 1);
-        assert_eq!(room.chat.message(0).body, "in one");
+        assert_eq!(room.active.chat.len(), 1);
+        assert_eq!(room.active.chat.message(0).body, "in one");
         assert_eq!(room.composer.text().trim(), "draft for one");
     }
 
@@ -2281,7 +2271,7 @@ mod tests {
 
         room.set_viewed_room(RoomId(2), Some(UserId(1)));
         assert_eq!(room.room_meta(RoomId(2)).unwrap().unread, 0);
-        assert_eq!(room.chat.len(), 2);
+        assert_eq!(room.active.chat.len(), 2);
     }
 
     #[test]
@@ -2384,10 +2374,10 @@ mod tests {
         );
 
         // The duplicate (timestamp_ms, message_id) is dropped by seen dedup.
-        assert_eq!(room.chat.len(), 3);
-        assert_eq!(room.chat.message(0).body, "first");
-        assert_eq!(room.chat.message(1).body, "second");
-        assert_eq!(room.chat.message(2).body, "third");
+        assert_eq!(room.active.chat.len(), 3);
+        assert_eq!(room.active.chat.message(0).body, "first");
+        assert_eq!(room.active.chat.message(1).body, "second");
+        assert_eq!(room.active.chat.message(2).body, "third");
     }
 
     #[test]
@@ -2431,15 +2421,15 @@ mod tests {
             .map(|id| message(id, UserId(2), "newest"))
             .collect::<Vec<_>>();
         enter(&mut room, Vec::new(), newest, Some(UserId(1)));
-        room.chat.scroll_up(8, 40, 5);
-        let before = room.chat.scroll_offset();
+        room.active.chat.scroll_up(8, 40, 5);
+        let before = room.active.chat.scroll_offset();
 
         let older = (1..10)
             .map(|id| message(id, UserId(2), "older"))
             .collect::<Vec<_>>();
         room.merge_history(RoomId(1), older, Some(UserId(1)));
 
-        assert_eq!(room.chat.scroll_offset(), before);
+        assert_eq!(room.active.chat.scroll_offset(), before);
     }
 
     #[test]
@@ -2481,11 +2471,11 @@ mod tests {
 
         assert_eq!(room.viewed_room, Some(room_id));
         assert_eq!(room.room_metas().count(), 2);
-        assert_eq!(room.chat.len(), 2);
-        assert_eq!(room.chat.message(0).body, "first");
-        assert_eq!(room.chat.message(1).body, "second");
+        assert_eq!(room.active.chat.len(), 2);
+        assert_eq!(room.active.chat.message(0).body, "first");
+        assert_eq!(room.active.chat.message(1).body, "second");
         assert!(room.set_viewed_room(RoomId(2), None));
-        assert_eq!(room.chat.len(), 0);
+        assert_eq!(room.active.chat.len(), 0);
     }
 
     #[test]
@@ -2556,7 +2546,7 @@ mod tests {
         room.connect_to_server("alias".to_string(), String::new(), "me".to_string());
         room.load_offline_catalog(&catalog, None);
         room.chat_received(message(1, UserId(1), "mine"), None);
-        assert!(!room.chat.message(0).local);
+        assert!(!room.active.chat.message(0).local);
 
         let mut live = room_info(1);
         live.name = "renamed".to_string();
@@ -2571,7 +2561,7 @@ mod tests {
         assert_eq!(room.room_name, "renamed");
         assert_eq!(room.participants.entries.len(), 1);
         assert_eq!(room.participants.entries[0].display_name(), "alice");
-        assert!(room.chat.message(0).local);
+        assert!(room.active.chat.message(0).local);
     }
 
     #[test]
@@ -2606,17 +2596,17 @@ mod tests {
             vec![message(5, UserId(2), "seeded")],
             Some(UserId(1)),
         );
-        assert_eq!(room.chat.len(), 1);
+        assert_eq!(room.active.chat.len(), 1);
 
         // Same (timestamp_ms, message_id) is skipped.
         room.chat_received(message(5, UserId(2), "echo"), Some(UserId(1)));
-        assert_eq!(room.chat.len(), 1);
+        assert_eq!(room.active.chat.len(), 1);
 
         // Same id with a different timestamp (post-restart) is a new message.
         let mut restarted = message(5, UserId(2), "post-restart");
         restarted.timestamp_ms += 1;
         room.chat_received(restarted, Some(UserId(1)));
-        assert_eq!(room.chat.len(), 2);
+        assert_eq!(room.active.chat.len(), 2);
     }
 
     #[test]
@@ -2628,21 +2618,21 @@ mod tests {
             .expect("known room");
         assert!(!update.local);
         assert!(update.should_scroll_bottom);
-        assert_eq!(room.chat.scroll_offset(), 0);
+        assert_eq!(room.active.chat.scroll_offset(), 0);
         assert_eq!(room.participants.entries[0].name.as_deref(), Some("user-2"));
 
         for id in 2..20 {
             room.chat_received(message(id, UserId(2), "line"), Some(UserId(1)));
         }
-        room.chat.scroll_up(3, 80, 1);
-        let offset = room.chat.scroll_offset();
+        room.active.chat.scroll_up(3, 80, 1);
+        let offset = room.active.chat.scroll_offset();
         assert!(offset > 0);
 
         let update = room
             .chat_received(message(20, UserId(2), "while reading"), Some(UserId(1)))
             .expect("known room");
         assert!(!update.should_scroll_bottom);
-        assert_eq!(room.chat.scroll_offset(), offset);
+        assert_eq!(room.active.chat.scroll_offset(), offset);
     }
 
     #[test]
@@ -2662,13 +2652,13 @@ mod tests {
             message_id: MessageId(7),
         };
         assert_eq!(room.jump_to_ref(target, 40, 5), RefJump::Jumped);
-        assert_eq!(room.chat.scroll_offset(), 1);
+        assert_eq!(room.active.chat.scroll_offset(), 1);
 
         let update = room
             .chat_received(message(9, UserId(2), "new tail"), Some(UserId(1)))
             .expect("known room");
         assert!(!update.should_scroll_bottom);
-        assert!(room.chat.scroll_offset() > 0);
+        assert!(room.active.chat.scroll_offset() > 0);
     }
 
     #[test]
