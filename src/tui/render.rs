@@ -1079,7 +1079,7 @@ fn draw_lobby_bar(
         buf,
         detail,
         &format!(
-            " {} | online {}/{} | {} ",
+            " {} | in call {}/{} | {} ",
             app.room.room_name,
             app.room.participants.online_count(),
             app.room.participants.entries.len(),
