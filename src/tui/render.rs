@@ -1006,8 +1006,8 @@ fn draw_chat_log_bar(area: Rect, app: &App, focus: ChatPanelFocus, buf: &mut Buf
         detail,
         &format!(
             " {} msg/{} rows ",
-            app.room.chat.len(),
-            app.room.chat.total_lines_estimate()
+            app.room.active.chat.len(),
+            app.room.active.chat.total_lines_estimate()
         ),
     );
 }
@@ -1090,22 +1090,23 @@ fn draw_chat(
     let content_width = area.w.saturating_sub(1).max(1);
     if content_width != layout.chat_width {
         // Reflow invalidates the (message, line) coordinates a selection holds.
-        app.room.chat.clear_selection();
+        app.room.active.chat.clear_selection();
     }
     layout.chat_width = content_width;
     layout.chat_height = area.h;
     layout.chat_rect = area;
-    if app.room.chat.is_empty() {
+    if app.room.active.chat.is_empty() {
         layout.visible_chat_lines.clear();
         area.with(app.theme.subtle)
             .with(HAlign::Center)
             .text(buf, "No messages");
         return;
     }
-    let lines = app
-        .room
-        .chat
-        .visible_lines(content_width, area.h, app.config.ui.overscan as usize);
+    let lines =
+        app.room
+            .active
+            .chat
+            .visible_lines(content_width, area.h, app.config.ui.overscan as usize);
     layout.visible_chat_lines = lines.clone();
     let chat_focused = focus == ChatPanelFocus::ChatLog;
     // Content is top-anchored: lines are drawn from the top of `area` and the
@@ -1121,16 +1122,17 @@ fn draw_chat(
                 app,
                 line.message,
                 now_ms,
-                chat_focused && app.room.chat.is_header_selected(line),
+                chat_focused && app.room.active.chat.is_header_selected(line),
                 buf,
             ),
             LineKind::Body => {
-                let msg = app.room.chat.message(line.message);
+                let msg = app.room.active.chat.message(line.message);
                 // A file message in flight overlays a progress bar on its single
                 // body line, keyed by the server transfer id. `transfer` returns a
                 // `Copy` snapshot, so no borrow of `app.room` outlives this read.
                 let progress = msg.file_transfer_id.and_then(|id| app.room.transfer(id));
-                let selected = chat_focused && app.room.chat.is_selected(line.message, line.line);
+                let selected =
+                    chat_focused && app.room.active.chat.is_selected(line.message, line.line);
                 let base = if selected {
                     app.theme.selected_line
                 } else if msg.local {
@@ -1152,8 +1154,8 @@ fn draw_chat(
                     let name = msg.body.split('`').nth(1).unwrap_or(msg.body.as_str());
                     draw_transfer_progress(row, base, progress, name, app, buf);
                 } else {
-                    for seg in app.room.chat.line(line.message, line.line) {
-                        let text = app.room.chat.segment_text(line.message, seg);
+                    for seg in app.room.active.chat.line(line.message, line.line) {
+                        let text = app.room.active.chat.segment_text(line.message, seg);
                         let mut style = base.patch(app.theme.text).patch(seg.style);
                         if !seg.synth
                             && msg
@@ -1246,7 +1248,7 @@ fn draw_chat_heading(
     selected: bool,
     buf: &mut Buffer,
 ) {
-    let msg = app.room.chat.message(message);
+    let msg = app.room.active.chat.message(message);
     let normal_base = if msg.local {
         app.theme.local_line
     } else {
@@ -1272,9 +1274,9 @@ fn draw_chat_heading(
     marker.with(normal_base.patch(accent)).text(buf, "▟");
     row.with(header_base).fill(buf);
     let content = row.inset(1, 0);
-    let name = if app.room.chat.is_collapsed(message) {
+    let name = if app.room.active.chat.is_collapsed(message) {
         format!("{} (Collapsed)", msg.sender)
-    } else if app.room.chat.is_expanded(message) {
+    } else if app.room.active.chat.is_expanded(message) {
         format!("{} (Expanded)", msg.sender)
     } else {
         msg.sender.clone()

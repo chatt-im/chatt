@@ -1266,7 +1266,7 @@ impl App {
     }
 
     pub(crate) fn request_older_history_if_at_top(&mut self, width: u16, height: u16) {
-        if !self.room.chat.is_at_top(width, height) {
+        if !self.room.active.chat.is_at_top(width, height) {
             return;
         }
         let Some((room_id, before, limit)) = self.room.older_history_request() else {
@@ -5595,7 +5595,7 @@ mod tests {
         app.request_older_history_if_at_top(40, 5);
         assert!(rx.try_recv().is_err());
 
-        app.room.chat.top(40, 5);
+        app.room.active.chat.top(40, 5);
         app.request_older_history_if_at_top(40, 5);
         match rx.try_recv().unwrap() {
             NetworkCommand::FetchHistory {
@@ -5835,8 +5835,8 @@ mod tests {
 
         app.submit_input();
 
-        assert_eq!(app.room.chat.len(), 1);
-        let notice = app.room.chat.message(0);
+        assert_eq!(app.room.active.chat.len(), 1);
+        let notice = app.room.active.chat.message(0);
         assert_eq!(notice.sender, "help");
         assert!(notice.body.contains("/report-bug what went wrong"));
         assert!(notice.body.contains("Press Tab again to cycle matches"));
