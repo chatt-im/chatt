@@ -1920,11 +1920,14 @@ export default function App() {
         // client supplies, then mark the share as playing. The canvas was
         // mounted with the share's row, so it is already registered. The client
         // broadcasts share_config on every play request so a tab that joined
-        // after the share started can bootstrap its decoder; a tab already
-        // playing this stream keeps its live decoder rather than resetting it.
+        // after the share started can bootstrap its decoder. Treat the config as
+        // a fresh bootstrap point even if a decoder already exists: the server is
+        // about to fast-start from a keyframe, and any stale decode queue would
+        // otherwise keep the canvas pinned on old frames.
         const canvas = canvases.get(env.stream_id);
-        if (canvas && !decoders.has(env.stream_id)) {
+        if (canvas) {
           clearShareError(env.stream_id);
+          decoders.get(env.stream_id)?.close();
           const decoder = new ScreenShareDecoder(canvas);
           decoders.set(env.stream_id, decoder);
           decoder.configure(env.codec, new Uint8Array(env.extradata));

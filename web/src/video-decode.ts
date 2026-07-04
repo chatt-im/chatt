@@ -12,6 +12,8 @@
 // straight through, with no in-browser NAL parsing.
 
 const VIDEO_FRAME_HEADER_LEN = 17;
+const MAX_DECODE_QUEUE = 2;
+const MAX_PENDING_FRAMES = 90;
 
 export interface VideoFrame {
   tsMs: number;
@@ -55,6 +57,9 @@ export class ScreenShareDecoder {
   // last keyframe are retained so a hardware failure can replay them in software.
   private decoded = false;
   private replay: EncodedVideoChunk[] = [];
+  private pending: VideoFrame[] = [];
+  private skippedBeforeKey = 0;
+  private warnedWaitingForKey = false;
 
   constructor(private canvas: HTMLCanvasElement) {}
 
@@ -96,6 +101,7 @@ export class ScreenShareDecoder {
           ctx.drawImage(decoded, 0, 0);
         }
         decoded.close();
+        this.pump();
       },
       error: (error) => this.onError(error),
     });
@@ -114,6 +120,9 @@ export class ScreenShareDecoder {
     }
     this.sawKey = false;
     this.decoded = false;
+    this.pending.length = 0;
+    this.skippedBeforeKey = 0;
+    this.warnedWaitingForKey = false;
   }
 
   // Retries in software when a hardware decoder fails before drawing a frame,
@@ -156,9 +165,77 @@ export class ScreenShareDecoder {
       return;
     }
     if (!this.sawKey) {
-      if (!frame.isKey) return;
+      if (!frame.isKey) {
+        this.skippedBeforeKey += 1;
+        if (this.skippedBeforeKey === 1 || this.skippedBeforeKey % 120 === 0) {
+          console.warn("[screenshare] waiting for keyframe", {
+            skipped: this.skippedBeforeKey,
+            streamId: frame.streamId,
+            tsMs: frame.tsMs,
+          });
+        }
+        return;
+      }
       this.sawKey = true;
+      this.skippedBeforeKey = 0;
+      console.info("[screenshare] first keyframe received", {
+        streamId: frame.streamId,
+        tsMs: frame.tsMs,
+        bytes: frame.data.byteLength,
+      });
     }
+    if (frame.isKey && this.shouldRestartAtKeyframe()) {
+      console.warn("[screenshare] restarting decoder at fresh keyframe", {
+        streamId: frame.streamId,
+        tsMs: frame.tsMs,
+        pending: this.pending.length,
+        decodeQueue: this.decoder?.decodeQueueSize ?? 0,
+      });
+      this.restartAtKeyframe(frame);
+      return;
+    }
+    this.pending.push(frame);
+    this.warnIfWaitingForCatchup();
+    this.pump();
+  }
+
+  private shouldRestartAtKeyframe(): boolean {
+    if (!this.decoded || !this.decoder || this.decoder.state === "closed") return false;
+    return (
+      this.pending.length > MAX_PENDING_FRAMES ||
+      this.decoder.decodeQueueSize > MAX_DECODE_QUEUE
+    );
+  }
+
+  private restartAtKeyframe(frame: VideoFrame) {
+    this.closeDecoderOnly();
+    this.start();
+    this.sawKey = true;
+    this.pending.push(frame);
+    this.pump();
+  }
+
+  private warnIfWaitingForCatchup() {
+    if (this.warnedWaitingForKey || this.pending.length <= MAX_PENDING_FRAMES) return;
+    this.warnedWaitingForKey = true;
+    console.warn("[screenshare] decoder is behind; waiting for a keyframe to catch up", {
+      pending: this.pending.length,
+      decodeQueue: this.decoder?.decodeQueueSize ?? 0,
+    });
+  }
+
+  private pump() {
+    if (!this.decoder || this.decoder.state === "closed") return;
+    while (this.pending.length > 0 && this.decoder.decodeQueueSize < MAX_DECODE_QUEUE) {
+      const frame = this.pending.shift();
+      if (!frame) return;
+      this.decodeNow(frame);
+      if (!this.decoder) return;
+    }
+  }
+
+  private decodeNow(frame: VideoFrame) {
+    if (!this.decoder || this.decoder.state === "closed") return;
     const chunk = new EncodedVideoChunk({
       type: frame.isKey ? "key" : "delta",
       timestamp: frame.tsMs * 1000,
@@ -178,6 +255,16 @@ export class ScreenShareDecoder {
   }
 
   close() {
+    this.closeDecoderOnly();
+    this.sawKey = false;
+    this.decoded = false;
+    this.replay.length = 0;
+    this.pending.length = 0;
+    this.skippedBeforeKey = 0;
+    this.warnedWaitingForKey = false;
+  }
+
+  private closeDecoderOnly() {
     if (this.decoder && this.decoder.state !== "closed") {
       try {
         this.decoder.close();
@@ -186,8 +273,5 @@ export class ScreenShareDecoder {
       }
     }
     this.decoder = null;
-    this.sawKey = false;
-    this.decoded = false;
-    this.replay.length = 0;
   }
 }

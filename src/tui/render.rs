@@ -13,8 +13,8 @@ use chatt::audio::StatsSnapshot;
 
 use crate::{
     app::{
-        App, ChatPanelFocus, ParticipantState, ParticipantVoiceFeedback, ServerEditDraft,
-        ServerSelectItem, StatusKind,
+        App, ChatPanelFocus, ParticipantState, ParticipantVoiceFeedback, ScreencastPhase,
+        ServerEditDraft, ServerSelectItem, StatusKind,
         audio_supervisor::AudioHealthState,
         room::{RoomSelectItem, TransferProgress},
         volume_db_label,
@@ -37,6 +37,7 @@ fn prepare_screen(app: &mut App, buf: &mut Buffer) -> Option<StatsSnapshot> {
         .map(|capture| capture.stats().snapshot());
     app.chrome.top_bar.mute = Rect::EMPTY;
     app.chrome.top_bar.deafen = Rect::EMPTY;
+    app.chrome.top_bar.video = Rect::EMPTY;
     capture
 }
 
@@ -846,6 +847,7 @@ fn draw_top_bar(area: Rect, app: &mut App, buf: &mut Buffer, capture: Option<&St
     }
 
     let mut right = area;
+    app.chrome.top_bar.video = draw_video_status_block(&mut right, app, buf);
     let deafened = app.deafened.load(Ordering::Relaxed);
     let muted = deafened || app.mic_muted.load(Ordering::Relaxed);
     app.chrome.top_bar.deafen = draw_status_segment_right(
@@ -886,6 +888,35 @@ fn draw_top_bar(area: Rect, app: &mut App, buf: &mut Buffer, capture: Option<&St
             mic_status_compact(app, capture)
         ),
     );
+}
+
+fn draw_video_status_block(row: &mut Rect, app: &App, buf: &mut Buffer) -> Rect {
+    let (style, label) = match app.screencast_status.phase {
+        ScreencastPhase::Starting => (
+            video_badge_style(app.theme, app.theme.good),
+            " VIDEO starting ".to_string(),
+        ),
+        ScreencastPhase::Live => (
+            video_badge_style(app.theme, app.theme.good),
+            format!(
+                " VIDEO {}/s ",
+                format_bytes(app.screencast_status.rolling_bytes_per_sec)
+            ),
+        ),
+        ScreencastPhase::Failed => (
+            video_badge_style(app.theme, app.theme.error),
+            " VIDEO FAILED ".to_string(),
+        ),
+        ScreencastPhase::Idle => return Rect::EMPTY,
+    };
+    draw_status_segment_right(row, buf, style | Modifier::BOLD, &label)
+}
+
+fn video_badge_style(theme: Theme, accent: Style) -> Style {
+    match accent.fg().or_else(|| accent.bg()) {
+        Some(color) => theme.mode_server_edit.with_bg(color),
+        None => theme.status_fill.patch(accent),
+    }
 }
 
 fn draw_lobby_bar(area: Rect, app: &mut App, focus: ChatPanelFocus, buf: &mut Buffer) {

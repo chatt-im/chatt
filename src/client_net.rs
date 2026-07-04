@@ -363,6 +363,9 @@ pub enum NetworkEvent {
         room_id: RoomId,
         stream_id: StreamId,
     },
+    ShareStartRejected {
+        message: String,
+    },
     Status(String),
     Error(String),
     AuthFailed {
@@ -775,6 +778,7 @@ fn run_worker_inner(
         active_room: None,
         voice_room: None,
         active_stream: None,
+        pending_share_start: false,
         local_sequence: 0,
         voice_timestamp: VoiceTimestampRebaser::default(),
         media_send_counter: 0,
@@ -1314,6 +1318,7 @@ struct WorkerState {
     /// and P2P publication.
     voice_room: Option<RoomId>,
     active_stream: Option<StreamId>,
+    pending_share_start: bool,
     local_sequence: u32,
     voice_timestamp: VoiceTimestampRebaser,
     media_send_counter: u64,
@@ -2603,9 +2608,9 @@ impl WorkerState {
                 extradata,
             } => {
                 let Some(room_id) = self.voice_room else {
-                    let _ = self.events.send(NetworkEvent::Error(
-                        "join a voice call before sharing".to_string(),
-                    ));
+                    let _ = self.events.send(NetworkEvent::ShareStartRejected {
+                        message: "join a voice call before sharing".to_string(),
+                    });
                     return Ok(());
                 };
                 self.queue_control(ClientControl::StartShare {
@@ -2616,6 +2621,7 @@ impl WorkerState {
                     annexb,
                     extradata,
                 })?;
+                self.pending_share_start = true;
             }
             NetworkCommand::StopShare { stream_id } => {
                 self.queue_control(ClientControl::StopShare { stream_id })?;
@@ -3698,6 +3704,7 @@ impl WorkerState {
                 coded_height,
                 extradata,
             } => {
+                self.pending_share_start = false;
                 kvlog::info!("client share started", stream_id = stream_id.0);
                 let _ = self.events.send(NetworkEvent::ShareStarted {
                     room_id,
@@ -3760,6 +3767,11 @@ impl WorkerState {
                 if self.session_id.is_none() && is_auth_failure_code(code) {
                     self.auth_failure = Some((code, message));
                     self.shutdown = true;
+                } else if self.pending_share_start {
+                    self.pending_share_start = false;
+                    let _ = self
+                        .events
+                        .send(NetworkEvent::ShareStartRejected { message });
                 } else {
                     let _ = self.events.send(NetworkEvent::Error(message));
                 }

@@ -132,6 +132,11 @@ pub(crate) const SLASH_COMMANDS: &[SlashCommand] = &[
         description: "show known room users",
     },
     SlashCommand {
+        name: "/video",
+        usage: "/video",
+        description: "show screen-share diagnostics",
+    },
+    SlashCommand {
         name: "/voice",
         usage: "/voice [room]",
         description: "join a room's voice call (default: the viewed room)",
