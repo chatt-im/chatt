@@ -292,6 +292,12 @@ pub(crate) struct RoomSession {
     /// for the rest of the process, so the lobby lists everyone who was ever in
     /// the room's voice — and only them.
     voice_seen: HashMap<RoomId, HashMap<UserId, Option<Instant>>>,
+    /// Users this process has observed online on the server. The value is
+    /// `None` while they are online and the instant the offline transition
+    /// was observed once they disconnect, which drives the user list's away
+    /// age column. Users never observed online are absent and render without
+    /// a timer.
+    presence_seen: HashMap<UserId, Option<Instant>>,
     /// Rooms omitted by the latest authenticated snapshot. They remain
     /// available as local history whenever the client is offline.
     archived_metas: BTreeMap<RoomId, RoomMeta>,
@@ -307,6 +313,50 @@ pub(crate) struct RoomSession {
     /// Message cap applied to each room buffer.
     max_messages: usize,
     syntax: crate::theme::SyntaxTheme,
+}
+
+/// One row of the server-wide user list popup: directory identity plus the
+/// derived presence bucket, pre-sorted by [`RoomSession::user_list_rows`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct UserListRow {
+    pub(crate) user_id: UserId,
+    pub(crate) name: String,
+    pub(crate) presence: UserPresence,
+    pub(crate) is_local: bool,
+}
+
+/// Presence bucket of a [`UserListRow`], in display order: connected users
+/// first, then away users whose disconnect this process observed (they carry
+/// an age timer), then users only known from the directory.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum UserPresence {
+    Online { room: Option<(RoomId, String)> },
+    AwaySeen { since: Instant },
+    AwayUnseen,
+}
+
+impl UserListRow {
+    /// Sort key implementing the list order: presence group, voice room name
+    /// (room-less online users after all room groups), user name, id
+    /// tiebreak. Room and user names compare case-insensitively.
+    fn sort_key(&self) -> (u8, u8, String, u32, String, u64) {
+        let (group, no_room, room_name, room_id) = match &self.presence {
+            UserPresence::Online {
+                room: Some((room_id, name)),
+            } => (0, 0, name.to_lowercase(), room_id.0),
+            UserPresence::Online { room: None } => (0, 1, String::new(), 0),
+            UserPresence::AwaySeen { .. } => (1, 0, String::new(), 0),
+            UserPresence::AwayUnseen => (2, 0, String::new(), 0),
+        };
+        (
+            group,
+            no_room,
+            room_name,
+            room_id,
+            self.name.to_lowercase(),
+            self.user_id.0,
+        )
+    }
 }
 
 /// A render-time snapshot of an in-flight transfer, overlaid on the file's chat
@@ -621,6 +671,7 @@ impl RoomSession {
             metas: BTreeMap::new(),
             parked: HashMap::new(),
             voice_seen: HashMap::new(),
+            presence_seen: HashMap::new(),
             archived_metas: BTreeMap::new(),
             archived_rooms: HashMap::new(),
             viewed_room: None,
@@ -715,6 +766,7 @@ impl RoomSession {
                 self.metas.clear();
                 self.parked.clear();
                 self.voice_seen.clear();
+                self.presence_seen.clear();
                 self.archived_metas.clear();
                 self.archived_rooms.clear();
                 self.users.clear();
@@ -740,6 +792,7 @@ impl RoomSession {
         self.metas.clear();
         self.parked.clear();
         self.voice_seen.clear();
+        self.presence_seen.clear();
         self.archived_metas.clear();
         self.archived_rooms.clear();
         self.users.clear();
@@ -767,6 +820,9 @@ impl RoomSession {
                 left_at.get_or_insert(disconnected_at);
             }
         }
+        for left_at in self.presence_seen.values_mut() {
+            left_at.get_or_insert(disconnected_at);
+        }
         for user in self.users.values_mut() {
             user.online = false;
             user.connected_at_ms = 0;
@@ -793,6 +849,17 @@ impl RoomSession {
     ) -> Vec<RoomId> {
         self.local_user = local_user;
         self.users = users.into_iter().map(|user| (user.user_id, user)).collect();
+        // The snapshot is authoritative for presence: online users (re)open
+        // their seen entry, and anyone we still thought online gets their
+        // away timer stamped so a reconnect can't leave it running.
+        let now = Instant::now();
+        for user in self.users.values() {
+            if user.online {
+                self.presence_seen.insert(user.user_id, None);
+            } else if let Some(left_at) = self.presence_seen.get_mut(&user.user_id) {
+                left_at.get_or_insert(now);
+            }
+        }
         self.default_room = Some(default_room);
         let accessible: HashSet<RoomId> = rooms.iter().map(|room| room.room_id).collect();
         self.archive_inaccessible_rooms(&accessible, local_user);
@@ -1584,6 +1651,40 @@ impl RoomSession {
         self.participants.replace_room(seeds);
     }
 
+    /// Builds the server-wide user list in its final display order: online
+    /// users grouped by voice room (room-less last), then away users seen
+    /// online this process session, then the rest of the directory, each
+    /// group alphabetical by name.
+    pub(crate) fn user_list_rows(&self) -> Vec<UserListRow> {
+        let mut rows: Vec<UserListRow> = self
+            .users
+            .values()
+            .map(|user| {
+                let presence = if user.online {
+                    let room = self
+                        .metas
+                        .iter()
+                        .find(|(_, meta)| meta.voice_users.contains(&user.user_id))
+                        .map(|(room_id, meta)| (*room_id, meta.name.clone()));
+                    UserPresence::Online { room }
+                } else {
+                    match self.presence_seen.get(&user.user_id).copied().flatten() {
+                        Some(since) => UserPresence::AwaySeen { since },
+                        None => UserPresence::AwayUnseen,
+                    }
+                };
+                UserListRow {
+                    user_id: user.user_id,
+                    name: user.display_name.clone(),
+                    presence,
+                    is_local: Some(user.user_id) == self.local_user,
+                }
+            })
+            .collect();
+        rows.sort_by(|a, b| a.sort_key().cmp(&b.sort_key()));
+        rows
+    }
+
     pub(crate) fn web_ref_for(
         &self,
         target: rpc::msgref::MessageRef,
@@ -1724,6 +1825,11 @@ impl RoomSession {
             .values()
             .any(|meta| Self::user_belongs_to_room_kind(user_id, &meta.kind));
         self.users.insert(user_id, user);
+        if online {
+            self.presence_seen.insert(user_id, None);
+        } else if let Some(left_at) = self.presence_seen.get_mut(&user_id) {
+            left_at.get_or_insert(Instant::now());
+        }
         let dm_name_updates = self
             .metas
             .iter()
@@ -2260,6 +2366,107 @@ mod tests {
         let mut message = message(id, sender, body);
         message.file_transfer_id = Some(transfer_id);
         message
+    }
+
+    fn presence_of(room: &RoomSession, user_id: UserId) -> UserPresence {
+        room.user_list_rows()
+            .into_iter()
+            .find(|row| row.user_id == user_id)
+            .expect("user in list")
+            .presence
+    }
+
+    #[test]
+    fn observed_offline_transition_stamps_away_timer_once() {
+        let mut room = test_room();
+        enter(&mut room, vec![user(UserId(1), "ann")], Vec::new(), None);
+        assert!(matches!(
+            presence_of(&room, UserId(1)),
+            UserPresence::Online { .. }
+        ));
+
+        room.presence_changed(user(UserId(1), "ann"), false, None);
+        let UserPresence::AwaySeen { since } = presence_of(&room, UserId(1)) else {
+            panic!("observed disconnect must carry a timer");
+        };
+
+        room.presence_changed(user(UserId(1), "ann"), false, None);
+        assert_eq!(
+            presence_of(&room, UserId(1)),
+            UserPresence::AwaySeen { since },
+            "a repeated offline presence must keep the first stamp"
+        );
+    }
+
+    #[test]
+    fn directory_only_users_are_away_without_timer() {
+        let mut room = test_room();
+        enter(
+            &mut room,
+            vec![offline_user(UserId(1), "ann")],
+            Vec::new(),
+            None,
+        );
+        assert_eq!(presence_of(&room, UserId(1)), UserPresence::AwayUnseen);
+    }
+
+    #[test]
+    fn own_disconnect_stamps_presence_timers() {
+        let mut room = test_room();
+        enter(&mut room, vec![user(UserId(1), "ann")], Vec::new(), None);
+
+        room.reset_for_disconnect();
+
+        assert!(matches!(
+            presence_of(&room, UserId(1)),
+            UserPresence::AwaySeen { .. }
+        ));
+    }
+
+    #[test]
+    fn reconnect_snapshot_reopens_presence_for_online_users() {
+        let mut room = test_room();
+        enter(&mut room, vec![user(UserId(1), "ann")], Vec::new(), None);
+        room.reset_for_disconnect();
+
+        enter(&mut room, vec![user(UserId(1), "ann")], Vec::new(), None);
+
+        assert!(matches!(
+            presence_of(&room, UserId(1)),
+            UserPresence::Online { .. }
+        ));
+    }
+
+    #[test]
+    fn user_list_sorts_presence_group_then_room_then_name() {
+        let mut room = test_room();
+        let mut in_room_1 = room_info(1);
+        in_room_1.voice_users = vec![UserId(1), UserId(2)];
+        let mut in_room_2 = room_info(2);
+        in_room_2.voice_users = vec![UserId(3)];
+        room.authenticated(
+            &[in_room_1, in_room_2],
+            vec![
+                user(UserId(1), "zoe"),
+                user(UserId(2), "Bob"),
+                user(UserId(3), "adam"),
+                user(UserId(4), "carl"),
+                user(UserId(5), "dave"),
+                offline_user(UserId(6), "abe"),
+            ],
+            RoomId(1),
+            None,
+            None,
+        );
+        room.presence_changed(user(UserId(5), "dave"), false, None);
+
+        let names: Vec<String> = room
+            .user_list_rows()
+            .into_iter()
+            .map(|row| row.name)
+            .collect();
+
+        assert_eq!(names, ["Bob", "zoe", "adam", "carl", "dave", "abe"]);
     }
 
     #[test]

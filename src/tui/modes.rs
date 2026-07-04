@@ -34,13 +34,13 @@ pub(crate) enum LobbyListFocus {
 }
 
 #[derive(Debug)]
-enum BindingResolution {
+pub(crate) enum BindingResolution {
     Action(BindCommand),
     Consumed,
     Unmatched,
 }
 
-fn resolve_binding(app: &mut App, layer: LayerId, key: KeyEvent) -> BindingResolution {
+pub(crate) fn resolve_binding(app: &mut App, layer: LayerId, key: KeyEvent) -> BindingResolution {
     let Some(input) = InputKey::from_event(&key) else {
         return BindingResolution::Unmatched;
     };
@@ -831,6 +831,7 @@ impl RoomMode {
                 self.paste_from_clipboard(app, &crate::clipboard_paste::HelperClipboard)
             }
             RoomSwitcher => app.open_room_switcher(),
+            OpenUserList => app.open_user_list(),
             NextRoom => app.cycle_room(1),
             PrevRoom => app.cycle_room(-1),
             _ => return app.process_global_command(command),
