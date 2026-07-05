@@ -1,19 +1,21 @@
 use std::sync::Arc;
 
-use crate::audio::{playback::SampleRing, shared::PlaybackStreamControl};
+use crate::audio::{
+    playback::{SampleRing, SharedNetEqHandle},
+    shared::PlaybackStreamControl,
+};
 
 /// Control-plane events the decode worker sends to the cpal consumer.
 ///
-/// Sample data no longer travels through this channel: the worker writes
-/// time-scaled audio straight into each stream's [`SampleRing`], and the
-/// consumer reads it. Only stream lifecycle and mute/gain cross here.
+/// Audio no longer crosses this channel at all: the consumer pulls each voice
+/// stream's NetEQ directly through its [`SharedNetEqHandle`]. Only stream
+/// lifecycle and mute/gain cross here.
 pub(crate) enum LivePlaybackMixerEvent {
     Empty,
-    /// Registers a new stream and hands the consumer the read side of its ring.
+    /// Registers a new stream and hands the consumer its audio source.
     EnsureStream {
         stream_id: u32,
-        ring: Arc<SampleRing>,
-        intentional_drain: bool,
+        source: MixerStreamSource,
     },
     StopStream {
         stream_id: u32,
@@ -22,10 +24,26 @@ pub(crate) enum LivePlaybackMixerEvent {
         stream_id: u32,
         control: PlaybackStreamControl,
     },
-    SetStreamIntentionalDrain {
-        stream_id: u32,
-        intentional: bool,
-    },
+}
+
+/// What the consumer renders a registered stream from.
+pub(crate) enum MixerStreamSource {
+    /// A remote voice stream, pulled synchronously from its shared NetEQ.
+    NetEq(SharedNetEqHandle),
+    /// A pre-rendered notification clip, read from its ring.
+    Ring(Arc<SampleRing>),
+}
+
+impl From<Arc<SampleRing>> for MixerStreamSource {
+    fn from(ring: Arc<SampleRing>) -> Self {
+        Self::Ring(ring)
+    }
+}
+
+impl From<SharedNetEqHandle> for MixerStreamSource {
+    fn from(handle: SharedNetEqHandle) -> Self {
+        Self::NetEq(handle)
+    }
 }
 
 impl Default for LivePlaybackMixerEvent {
@@ -41,7 +59,6 @@ impl LivePlaybackMixerEvent {
             Self::EnsureStream { .. } => "ensure_stream",
             Self::StopStream { .. } => "stop_stream",
             Self::SetStreamControl { .. } => "set_stream_control",
-            Self::SetStreamIntentionalDrain { .. } => "set_stream_intentional_drain",
         }
     }
 }

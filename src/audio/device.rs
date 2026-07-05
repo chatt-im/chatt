@@ -1505,25 +1505,14 @@ fn drain_live_playback_mixer_events(
     while mixer_events.remove(pending_event) {
         match mem::take(pending_event) {
             LivePlaybackMixerEvent::Empty => {}
-            LivePlaybackMixerEvent::EnsureStream {
-                stream_id,
-                ring,
-                intentional_drain,
-            } => {
-                mixer.ensure_stream(stream_id, ring);
-                mixer.set_stream_intentional_drain(stream_id, intentional_drain);
+            LivePlaybackMixerEvent::EnsureStream { stream_id, source } => {
+                mixer.ensure_stream(stream_id, source);
             }
             LivePlaybackMixerEvent::StopStream { stream_id } => {
                 mixer.remove_stream(stream_id);
             }
             LivePlaybackMixerEvent::SetStreamControl { stream_id, control } => {
                 mixer.set_stream_control(stream_id, control);
-            }
-            LivePlaybackMixerEvent::SetStreamIntentionalDrain {
-                stream_id,
-                intentional,
-            } => {
-                mixer.set_stream_intentional_drain(stream_id, intentional);
             }
         }
     }
@@ -1544,11 +1533,11 @@ impl LivePlaybackMixAdapter {
         }
     }
 
-    fn fill(&mut self, mixer: &mut LivePlaybackMixer, out: &mut [f32]) {
+    fn fill(&mut self, mixer: &mut LivePlaybackMixer, now: Instant, out: &mut [f32]) {
         let mut written = 0;
         while written < out.len() {
             if self.carry_cursor >= self.carry_len {
-                mixer.mix_10ms(&mut self.carry);
+                mixer.mix_10ms(now, &mut self.carry);
                 self.carry_cursor = 0;
                 self.carry_len = MIX_FRAME_SAMPLES;
             }
@@ -1562,15 +1551,19 @@ impl LivePlaybackMixAdapter {
         }
     }
 
-    fn next_sample(&mut self, mixer: &mut LivePlaybackMixer) -> f32 {
+    fn next_sample(&mut self, mixer: &mut LivePlaybackMixer, now: Instant) -> f32 {
         if self.carry_cursor >= self.carry_len {
-            mixer.mix_10ms(&mut self.carry);
+            mixer.mix_10ms(now, &mut self.carry);
             self.carry_cursor = 0;
             self.carry_len = MIX_FRAME_SAMPLES;
         }
         let sample = self.carry[self.carry_cursor];
         self.carry_cursor += 1;
         sample
+    }
+
+    fn staged_samples(&self) -> usize {
+        self.carry_len.saturating_sub(self.carry_cursor)
     }
 }
 
@@ -1650,7 +1643,7 @@ fn live_playback_callback<T>(
     playback_record_block: &mut Vec<f32>,
     mix_adapter: &mut LivePlaybackMixAdapter,
     mut resampler: Option<&mut PlaybackResampler>,
-    _now: Instant,
+    now: Instant,
 ) where
     T: Sample + FromSample<f32>,
 {
@@ -1668,7 +1661,7 @@ fn live_playback_callback<T>(
             mixer.note_device_callback_frames(source_block);
             for frame in output.chunks_mut(channels.get()) {
                 let sample = resampler.next_sample(|block| {
-                    mix_adapter.fill(mixer, block);
+                    mix_adapter.fill(mixer, now, block);
                     for &mixed in block.iter() {
                         if let Some(writer) = echo_writer.as_mut() {
                             writer.push(mixed);
@@ -1690,7 +1683,7 @@ fn live_playback_callback<T>(
                 playback_record_block.resize(output_frames, 0.0);
             }
             for (index, frame) in output.chunks_mut(channels.get()).enumerate() {
-                let sample = mix_adapter.next_sample(mixer);
+                let sample = mix_adapter.next_sample(mixer, now);
                 if let Some(writer) = echo_writer.as_mut() {
                     writer.push(sample);
                 }
@@ -1710,6 +1703,7 @@ fn live_playback_callback<T>(
     if let Some(writer) = echo_writer {
         writer.commit();
     }
+    mixer.note_staged_samples(mix_adapter.staged_samples());
 }
 
 fn capture_callback<T>(
@@ -1767,6 +1761,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::audio::playback::MixerStreamSource;
     #[allow(unused_imports)]
     use crate::audio::test_support::*;
     use cpal::{SupportedBufferSize, SupportedStreamConfigRange};
@@ -2000,7 +1995,7 @@ mod tests {
         let mut reference = Vec::new();
         while reference.len() < total {
             let mut frame = [0.0; MIX_FRAME_SAMPLES];
-            reference_mixer.mix_10ms(&mut frame);
+            reference_mixer.mix_10ms(Instant::now(), &mut frame);
             reference.extend_from_slice(&frame);
         }
 
@@ -2011,7 +2006,11 @@ mod tests {
         for callback_frames in callback_sizes {
             let start = served.len();
             served.resize(start + callback_frames, 0.0);
-            adapter.fill(&mut mixer, &mut served[start..start + callback_frames]);
+            adapter.fill(
+                &mut mixer,
+                Instant::now(),
+                &mut served[start..start + callback_frames],
+            );
         }
 
         assert_eq!(served.len(), total);
@@ -2033,8 +2032,7 @@ mod tests {
         ring.write_samples(&vec![0.25; crate::audio::shared::FRAME_SAMPLES]);
         let mut event = LivePlaybackMixerEvent::EnsureStream {
             stream_id: 7,
-            ring: Arc::clone(&ring),
-            intentional_drain: false,
+            source: MixerStreamSource::Ring(Arc::clone(&ring)),
         };
         assert!(mixer_events.insert(&mut event));
 
@@ -2044,39 +2042,10 @@ mod tests {
 
         assert_eq!(mixer.active_streams(), 1);
         let mut out = vec![0.0; crate::audio::shared::FRAME_SAMPLES];
-        mixer.fill_block(&mut out);
+        mixer.fill_block(Instant::now(), &mut out);
         // Read past the declick ramp so the per-stream envelope is at unity.
         let steady = out[crate::audio::shared::FRAME_SAMPLES - 1];
         assert!((steady - 0.25).abs() < 1e-6, "mixed sample {steady}");
         assert_eq!(ring.depth(), 0, "consumer drained the ring");
-    }
-
-    #[test]
-    fn live_mixer_ensure_applies_initial_intentional_drain() {
-        use std::sync::Arc;
-        let mixer_events = SpscSwapQueue::<LivePlaybackMixerEvent>::with_capacity(4);
-        let ring = Arc::new(crate::audio::playback::SampleRing::with_capacity(
-            crate::audio::shared::FRAME_SAMPLES * 4,
-        ));
-        let mut event = LivePlaybackMixerEvent::EnsureStream {
-            stream_id: 7,
-            ring: Arc::clone(&ring),
-            intentional_drain: true,
-        };
-        assert!(mixer_events.insert(&mut event));
-
-        let mut mixer = LivePlaybackMixer::with_tuning(test_tuning());
-        let mut pending_event = LivePlaybackMixerEvent::default();
-        drain_live_playback_mixer_events(&mut mixer, &mixer_events, &mut pending_event);
-
-        let mut out = vec![0.0; crate::audio::shared::FRAME_SAMPLES];
-        mixer.fill_block(&mut out);
-
-        assert!(out.iter().all(|&sample| sample == 0.0));
-        assert_eq!(
-            ring.underruns(),
-            0,
-            "initial intentional drain should suppress underrun accounting"
-        );
     }
 }

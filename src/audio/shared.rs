@@ -200,12 +200,6 @@ pub(crate) const LIVE_PLAYBACK_COMMAND_CAPACITY: usize = 256;
 pub(crate) const LIVE_NETEQ_START_DELAY: Duration = Duration::from_millis(60);
 pub(crate) const LIVE_NETEQ_MIN_DELAY: Duration = Duration::from_millis(20);
 pub(crate) const LIVE_NETEQ_MAX_DELAY: Duration = Duration::from_millis(1_000);
-// A lone playout underrun is usually a talkspurt draining to empty, not network
-// starvation. The target only re-widens when underruns recur: at least this
-// many within the window below. Each starvation episode produces one underrun
-// notification, so an isolated end-of-speech drain never pins the target.
-pub(crate) const LIVE_PLAYBACK_DYNAMIC_UNDERRUN_WINDOW: Duration = Duration::from_millis(500);
-pub(crate) const LIVE_PLAYBACK_DYNAMIC_UNDERRUN_MIN: usize = 2;
 // Ignore recommended-target changes smaller than this to avoid chatter.
 pub(crate) const LIVE_PLAYBACK_DYNAMIC_DEADBAND: Duration = Duration::from_millis(3);
 pub(crate) const LIVE_PLAYBACK_HARD_QUEUE_BOUND: Duration = Duration::from_millis(1_500);
@@ -337,6 +331,8 @@ pub struct LivePlaybackFeedback {
     pub duplicate_packets: u16,
     pub reordered_packets: u16,
     pub window_ms: u16,
+    /// Receiver-side staged playout depth in milliseconds. For current live
+    /// playback this is only the mix-adapter carry, not a voice staging ring.
     pub max_output_ring_ms: u16,
     pub max_neteq_target_ms: u16,
     pub max_neteq_playout_delay_ms: u16,
@@ -645,7 +641,11 @@ pub struct LivePlaybackStreamActivity {
 pub struct LivePlaybackSnapshot {
     pub active_streams: usize,
     pub stream_activity: Vec<LivePlaybackStreamActivity>,
+    /// Mixed-but-unplayed samples staged after NetEQ. In live playback this is
+    /// the device mix-adapter carry only.
     pub output_ring_samples: usize,
+    /// Max staged output depth in milliseconds. This is diagnostics-only and is
+    /// normally less than one 10 ms mixer frame.
     pub max_output_ring_ms: u64,
     pub neteq_playout_delay_ms: u64,
     pub neteq_sync_buffer_ms: u64,
@@ -667,7 +667,6 @@ pub struct LivePlaybackSnapshot {
     pub dred_missed_horizon_count: u64,
     pub dred_missed_horizon_ms: u64,
     pub hard_trim_count: u64,
-    pub underrun_count: u64,
     pub dred_recoveries: u64,
     pub fec_recoveries: u64,
     pub plc_fallbacks: u64,

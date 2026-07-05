@@ -22,7 +22,7 @@
 //! `i16`<->`f32` conversions are at decode (Opus i16 out) and the final output
 //! block (i16 -> f32 for the mixer/ring).
 
-use std::rc::Rc;
+use std::sync::Arc;
 use std::time::Instant;
 
 use opus_codec::{
@@ -178,6 +178,13 @@ pub(crate) struct NetEqCore {
     dred_missed_horizon_count: u64,
     dred_missed_horizon_samples: u64,
 }
+
+/// The audio callback pulls a `NetEqCore` owned behind an `Arc<Mutex<_>>` shared
+/// with the decode worker, so the core must stay `Send`.
+const _: () = {
+    const fn assert_send<T: Send>() {}
+    assert_send::<NetEqCore>()
+};
 
 impl NetEqCore {
     pub(crate) fn new(tuning: LiveAudioTuning) -> Result<Self, String> {
@@ -389,7 +396,7 @@ impl NetEqCore {
             // gap); reset the decoder before the next decode to match.
             self.reset_decoder = true;
         }
-        let datagram = Rc::new(opus.to_vec());
+        let datagram = Arc::new(opus.to_vec());
 
         // Compute the recovery gap behind this packet, exactly as the DRED fork's
         // InsertPacketInternal does: the hole between the most recent buffered (or
@@ -408,7 +415,7 @@ impl NetEqCore {
         let packets = parse_payload_redundancy(
             timestamp,
             sequence,
-            Rc::clone(&datagram),
+            Arc::clone(&datagram),
             current_gap,
             DEFAULT_FRAME_SAMPLES as u32,
             fec,
@@ -530,7 +537,7 @@ impl NetEqCore {
     fn parse_dred(
         &mut self,
         sequence: u32,
-        datagram: &Rc<Vec<u8>>,
+        datagram: &Arc<Vec<u8>>,
         current_gap: u32,
     ) -> (Option<DredInfo>, u32) {
         if current_gap == 0 {
@@ -1025,7 +1032,7 @@ impl NetEqCore {
     fn decode_dred(
         &mut self,
         sequence: u32,
-        source: &Rc<Vec<u8>>,
+        source: &Arc<Vec<u8>>,
         offset: i32,
         out_start: usize,
     ) -> Result<usize, ()> {
@@ -1765,7 +1772,7 @@ mod tests {
         let units = parse_payload_redundancy(
             timestamp,
             2,
-            Rc::new(packets[2].clone()),
+            Arc::new(packets[2].clone()),
             0,
             LIVE_OPUS_FRAME_SAMPLES as u32,
             Some(fec),
@@ -1818,7 +1825,7 @@ mod tests {
             .iter()
             .enumerate()
             .find_map(|(sequence, payload)| {
-                let datagram = Rc::new(payload.clone());
+                let datagram = Arc::new(payload.clone());
                 let (dred, available_horizon) =
                     probe.parse_dred(sequence as u32, &datagram, gap_samples);
                 let usable_reach = dred
@@ -1843,7 +1850,7 @@ mod tests {
                 0,
                 super::super::packet::Priority::PRIMARY,
                 LIVE_OPUS_FRAME_SAMPLES,
-                PacketPayload::Opus(Rc::new(vec![0xF8])),
+                PacketPayload::Opus(Arc::new(vec![0xF8])),
             ),
             &core.tick_timer,
         );

@@ -601,7 +601,13 @@ mod tests {
         };
         let mixer = Arc::new(Mutex::new(LivePlaybackMixer::with_tuning(config.tuning)));
         let mut decode_streams = LiveDecodeStreams::new(config.tuning);
-        decode_streams.set_block_samples(LIVE_OPUS_FRAME_SAMPLES);
+        decode_streams
+            .playout_hints()
+            .note_block_samples(LIVE_OPUS_FRAME_SAMPLES);
+        mixer
+            .lock()
+            .map_err(|_| "headless soundboard mixer lock poisoned")?
+            .set_playout_hints(decode_streams.playout_hints());
         let mut trace = None;
         let start = Instant::now();
         let frame_duration = Duration::from_secs_f64(FRAME_SAMPLES as f64 / SAMPLE_RATE as f64);
@@ -726,10 +732,10 @@ mod tests {
         let snapshot = &report.final_snapshot;
         format!(
             "playback\n\
-             output: ring max {}ms, queued {} samples\n\
+             output: staged max {}ms, queued {} samples\n\
              neteq: playout {}ms, target {}ms (start {}ms), packets wait {}ms span {}ms / {} pkts\n\
              timing: accelerate {}ms / {}, expand {}ms / {}\n\
-             recovery: dred {}, fec {}, horizon {}ms, missed {}ms / {}, plc {}, trims {}, underruns {}\n\
+             recovery: dred {}, fec {}, horizon {}ms, missed {}ms / {}, plc {}, trims {}, concealment expands {}\n\
              active streams: {}\n\
              network\n\
              voice rx: {} packets / {}B\n\
@@ -753,7 +759,7 @@ mod tests {
             snapshot.dred_missed_horizon_count,
             snapshot.plc_fallbacks,
             snapshot.hard_trim_count,
-            snapshot.underrun_count,
+            snapshot.concealment_expands,
             snapshot.active_streams,
             report.voice_packets_received,
             report.voice_bytes_received,

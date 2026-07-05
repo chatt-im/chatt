@@ -2,7 +2,6 @@ use std::{
     collections::VecDeque,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicUsize, Ordering},
         mpsc::{Receiver, RecvTimeoutError, Sender},
     },
     time::{Duration, Instant},
@@ -15,9 +14,9 @@ use crate::{
         lifecycle::LivePlaybackCommand,
         playback::{
             LivePlaybackFeedbackState, LivePlaybackMixer, LivePlaybackMixerEvent,
-            LivePlaybackMixerStats, LivePlaybackSharedSnapshot, ProducedBlock,
-            RingPlaybackProducer, SampleRing, SpscSwapQueue,
-            neteq::{NetEqCore, NetEqDiagnostics},
+            LivePlaybackMixerStats, LivePlaybackPlayoutHints, LivePlaybackSharedSnapshot,
+            MixerStreamSource, SampleRing, SharedNetEqHandle, SharedNetEqStream, SpscSwapQueue,
+            lock_shared_stream, neteq::NetEqDiagnostics,
         },
         shared::{
             FRAME_SAMPLES, LIVE_CAPTURE_MUTE_FADE, LIVE_PACKET_FLAG_MUTE,
@@ -54,9 +53,9 @@ pub(crate) fn run_live_decoder_worker(
     tuning: LiveAudioTuning,
     feedback_sender: Option<Sender<LivePlaybackFeedback>>,
     shared_snapshot: Arc<LivePlaybackSharedSnapshot>,
-    block_hint: Arc<AtomicUsize>,
+    hints: Arc<LivePlaybackPlayoutHints>,
 ) {
-    let mut streams = LiveDecodeStreams::new(tuning);
+    let mut streams = LiveDecodeStreams::with_hints(tuning, hints);
     let mut last_diagnostic_log: Option<Instant> = None;
 
     loop {
@@ -76,7 +75,6 @@ pub(crate) fn run_live_decoder_worker(
         }
 
         let now = Instant::now();
-        streams.set_block_samples(block_hint.load(Ordering::Relaxed));
         streams.drain_into_mixer_events(&mixer_events, now, feedback_sender.as_ref());
         let snapshot = streams.snapshot_at(now);
         let due = last_diagnostic_log
@@ -113,7 +111,6 @@ fn log_neteq_diagnostics(snapshot: &LivePlaybackSnapshot) {
         reason = snapshot.neteq_decision_reason.as_str(),
         accelerate_count = snapshot.accelerate_count,
         expand_count = snapshot.expand_count,
-        underrun_count = snapshot.underrun_count,
         hard_trim_count = snapshot.hard_trim_count
     );
 }
@@ -164,71 +161,34 @@ fn push_mixer_event(
     false
 }
 
-fn push_intentional_drain_event(
-    stream_id: u32,
-    intentional: bool,
-    mixer_intentional_drains: &mut HashMap<u32, bool>,
-    mixer_events: &SpscSwapQueue<LivePlaybackMixerEvent>,
-    dropped_mixer_events: &mut u64,
-) {
-    if mixer_intentional_drains
-        .get(&stream_id)
-        .is_some_and(|&previous| previous == intentional)
-    {
-        return;
-    }
-
-    let event = LivePlaybackMixerEvent::SetStreamIntentionalDrain {
-        stream_id,
-        intentional,
-    };
-    if push_mixer_event(mixer_events, dropped_mixer_events, event) {
-        mixer_intentional_drains.insert(stream_id, intentional);
-    }
-}
-
-/// Pumps one stream's NetEQ output into its ring and closes the feedback window.
-/// Takes the stream and producer as disjoint borrows so the `get_audio` closure
-/// (which borrows the stream's core) and the producer can be mutated together.
-#[allow(clippy::too_many_arguments)]
-fn drain_pump_stream(
+/// One stream's control-plane step: applies pending mute state, folds the stat
+/// deltas the callback recorded since the last drain, refreshes the cached
+/// diagnostics, and closes the feedback window. The audio itself is pulled by
+/// the callback through the stream's [`SharedNetEqHandle`], not here.
+fn drain_stream(
     stream: &mut LiveDecodeStream,
-    producer: &mut RingPlaybackProducer,
     stats: &mut LivePlaybackMixerStats,
     stream_id: u32,
     now: Instant,
-    block: usize,
+    output_ring_ms: u64,
     feedback_sender: Option<&Sender<LivePlaybackFeedback>>,
 ) {
     stream.apply_control_mute_pending(now, stream_id);
     stream.activate_control_mute_fallback_if_due(now, stream_id);
 
     let sender_silence = stream.take_sender_silence_pending();
-    {
-        let core = &mut stream.core;
-        // NetEQ is pulled at the constant output rate regardless of packet arrival,
-        // exactly as `NetEqImpl::GetAudio` is driven by the audio device. During a
-        // sender pause it expands (and `generated_noise_samples` accumulates on the
-        // tick timer); on resume the future-packet timestamp catches up to that noise
-        // so the talkspurt merges back in seamlessly. Never short-circuit this, or the
-        // catch-up cannot happen and the resume clicks. A muted sender's audio is
-        // faded to silence on the way in, so the expansion it conceals is silence too.
-        producer.pump(
-            block,
-            |out| {
-                let result = core.get_audio(now, out);
-                if result.muted {
-                    ProducedBlock::Muted(result)
-                } else {
-                    ProducedBlock::Audio(result)
-                }
-            },
-            stats,
-        );
-    }
-
-    let output_ring_ms = samples_to_ms(producer.buffered_samples());
-    let neteq = stream.playback_diagnostics();
+    let (delta, diagnostics, activity) = {
+        let mut shared = lock_shared_stream(&stream.shared);
+        (
+            shared.take_stats(),
+            shared.diagnostics(),
+            shared.voice_activity(),
+        )
+    };
+    stats.absorb(delta);
+    let neteq = stream.adjust_diagnostics(diagnostics);
+    stream.last_diagnostics = neteq.clone();
+    stream.last_activity = activity;
     if sender_silence {
         stream.flush_sender_silence_feedback(
             stream_id,
@@ -278,9 +238,7 @@ impl LivePlaybackTrend {
 pub(crate) struct LiveDecodeStreams {
     tuning: LiveAudioTuning,
     streams: HashMap<u32, LiveDecodeStream>,
-    producers: HashMap<u32, RingPlaybackProducer>,
     mixer_streams: HashSet<u32>,
-    mixer_intentional_drains: HashMap<u32, bool>,
     /// Sender-mute fallback state received before the stream's first packet
     /// created its entry, consumed by [`Self::ensure_entry`]. The app pushes it
     /// at `VoiceStarted`, which always precedes the first media packet.
@@ -293,10 +251,12 @@ pub(crate) struct LiveDecodeStreams {
     /// re-pushed each drain cycle until delivered. While an id is pending here
     /// its `EnsureStream` is withheld: the mixer's `ensure_stream` no-ops on an
     /// occupied id, so a straggler-recreated stream registered before the stop
-    /// lands would leave the mixer reading the dead ring forever.
+    /// lands would leave the mixer pulling the dead source forever.
     pending_mixer_stops: HashSet<u32>,
     stats: LivePlaybackMixerStats,
-    block_samples: usize,
+    /// Playout telemetry published by the mixer consumer, shared with it through
+    /// [`crate::audio::playback::LivePlaybackMixer::set_playout_hints`].
+    hints: Arc<LivePlaybackPlayoutHints>,
     dropped_mixer_events: u64,
     notification: Option<NotificationVoice>,
     trend: LivePlaybackTrend,
@@ -304,21 +264,31 @@ pub(crate) struct LiveDecodeStreams {
 
 impl LiveDecodeStreams {
     pub(crate) fn new(tuning: LiveAudioTuning) -> Self {
+        Self::with_hints(tuning, Arc::default())
+    }
+
+    pub(crate) fn with_hints(
+        tuning: LiveAudioTuning,
+        hints: Arc<LivePlaybackPlayoutHints>,
+    ) -> Self {
         Self {
             tuning,
             streams: HashMap::new(),
-            producers: HashMap::new(),
             mixer_streams: HashSet::new(),
-            mixer_intentional_drains: HashMap::new(),
             pending_sender_muted: HashMap::new(),
             pending_mixer_controls: HashMap::new(),
             pending_mixer_stops: HashSet::new(),
             stats: LivePlaybackMixerStats::default(),
-            block_samples: FRAME_SAMPLES,
+            hints,
             dropped_mixer_events: 0,
             notification: None,
             trend: LivePlaybackTrend::default(),
         }
+    }
+
+    /// The telemetry instance the mixer consumer must publish into.
+    pub(crate) fn playout_hints(&self) -> Arc<LivePlaybackPlayoutHints> {
+        Arc::clone(&self.hints)
     }
 
     fn play_notification(
@@ -335,8 +305,7 @@ impl LiveDecodeStreams {
         if !notification.registered {
             let event = LivePlaybackMixerEvent::EnsureStream {
                 stream_id: NOTIFICATION_STREAM_ID,
-                ring: Arc::clone(&notification.ring),
-                intentional_drain: false,
+                source: MixerStreamSource::Ring(Arc::clone(&notification.ring)),
             };
             if push_mixer_event(mixer_events, dropped, event) {
                 notification.registered = true;
@@ -363,14 +332,6 @@ impl LiveDecodeStreams {
         }
     }
 
-    pub(crate) fn set_block_samples(&mut self, block_samples: usize) {
-        self.block_samples = if block_samples == 0 {
-            FRAME_SAMPLES
-        } else {
-            block_samples
-        };
-    }
-
     pub(crate) fn stats(&self) -> &LivePlaybackMixerStats {
         &self.stats
     }
@@ -389,15 +350,7 @@ impl LiveDecodeStreams {
         if let Some(muted) = self.pending_sender_muted.remove(&stream_id) {
             stream.set_control_muted(muted);
         }
-        let producer = match RingPlaybackProducer::new(self.tuning) {
-            Ok(producer) => producer,
-            Err(error) => {
-                eprintln!("failed to create live playback producer: {error}");
-                return false;
-            }
-        };
         self.streams.insert(stream_id, stream);
-        self.producers.insert(stream_id, producer);
         true
     }
 
@@ -427,10 +380,13 @@ impl LiveDecodeStreams {
     }
 
     pub(crate) fn remove_stream(&mut self, stream_id: u32) {
-        self.streams.remove(&stream_id);
-        self.producers.remove(&stream_id);
+        if let Some(stream) = self.streams.remove(&stream_id) {
+            // Fold the counters the callback recorded since the last drain, so
+            // teardown loses at most nothing rather than up to one tick.
+            let delta = lock_shared_stream(&stream.shared).take_stats();
+            self.stats.absorb(delta);
+        }
         self.mixer_streams.remove(&stream_id);
-        self.mixer_intentional_drains.remove(&stream_id);
         self.pending_sender_muted.remove(&stream_id);
         self.pending_mixer_controls.remove(&stream_id);
     }
@@ -496,8 +452,8 @@ impl LiveDecodeStreams {
         }
     }
 
-    /// Producer step on the real worker: pump every stream into its ring and emit
-    /// `EnsureStream` for any new stream.
+    /// Control-plane step on the real worker: fold every stream's callback
+    /// deltas, flush feedback, and emit `EnsureStream` for any new stream.
     pub(crate) fn drain_into_mixer_events(
         &mut self,
         mixer_events: &SpscSwapQueue<LivePlaybackMixerEvent>,
@@ -506,56 +462,41 @@ impl LiveDecodeStreams {
     ) {
         self.flush_pending_mixer_stops(mixer_events);
         self.flush_pending_mixer_controls(mixer_events);
-        let block = self.block_samples;
-        let producers = &mut self.producers;
+        let output_ring_ms = samples_to_ms(self.hints.staged_samples());
         let dropped = &mut self.dropped_mixer_events;
         let stats = &mut self.stats;
+        let mixer_streams = &mut self.mixer_streams;
+        let pending_mixer_stops = &self.pending_mixer_stops;
         for (stream_id, stream) in &mut self.streams {
-            let Some(producer) = producers.get_mut(stream_id) else {
-                continue;
-            };
-            drain_pump_stream(
+            drain_stream(
                 stream,
-                producer,
                 stats,
                 *stream_id,
                 now,
-                block,
+                output_ring_ms,
                 feedback_sender,
             );
-            let intentional = producer.intentional_drain();
-            if !self.mixer_streams.contains(stream_id) {
+            if !mixer_streams.contains(stream_id) {
                 // The consumer may drain the queue between the failed stop flush
                 // above and this push, so without this guard the EnsureStream
                 // could land ahead of the retried StopStream and be destroyed by
                 // it (or no-op against the occupied entry the stop targets).
-                if self.pending_mixer_stops.contains(stream_id) {
+                if pending_mixer_stops.contains(stream_id) {
                     continue;
                 }
                 let event = LivePlaybackMixerEvent::EnsureStream {
                     stream_id: *stream_id,
-                    ring: producer.ring(),
-                    intentional_drain: intentional,
+                    source: MixerStreamSource::NetEq(Arc::clone(&stream.shared)),
                 };
                 if push_mixer_event(mixer_events, dropped, event) {
-                    self.mixer_streams.insert(*stream_id);
-                    self.mixer_intentional_drains
-                        .insert(*stream_id, intentional);
+                    mixer_streams.insert(*stream_id);
                 }
-            } else {
-                push_intentional_drain_event(
-                    *stream_id,
-                    intentional,
-                    &mut self.mixer_intentional_drains,
-                    mixer_events,
-                    dropped,
-                );
             }
         }
         self.retire_drained_notification(mixer_events);
     }
 
-    /// Producer step used by the single-threaded simulation harness.
+    /// Control-plane step used by the single-threaded simulation harness.
     pub(crate) fn drain_into_mixer(
         &mut self,
         mixer: &Arc<Mutex<LivePlaybackMixer>>,
@@ -574,44 +515,26 @@ impl LiveDecodeStreams {
         _trace: &mut Option<LiveAudioTraceWriter>,
         feedback_sender: Option<&Sender<LivePlaybackFeedback>>,
     ) {
-        let block = self.block_samples;
-        let producers = &mut self.producers;
+        let output_ring_ms = samples_to_ms(self.hints.staged_samples());
         let stats = &mut self.stats;
+        let mixer_streams = &mut self.mixer_streams;
         for (stream_id, stream) in &mut self.streams {
-            let Some(producer) = producers.get_mut(stream_id) else {
-                continue;
-            };
-            drain_pump_stream(
+            drain_stream(
                 stream,
-                producer,
                 stats,
                 *stream_id,
                 now,
-                block,
+                output_ring_ms,
                 feedback_sender,
             );
-            let intentional = producer.intentional_drain();
-            if !self.mixer_streams.contains(stream_id) {
-                if let Ok(mut mixer) = mixer.lock() {
-                    mixer.ensure_stream(*stream_id, producer.ring());
-                    mixer.set_stream_intentional_drain(*stream_id, intentional);
-                    self.mixer_streams.insert(*stream_id);
-                    self.mixer_intentional_drains
-                        .insert(*stream_id, intentional);
-                }
-                continue;
-            }
-            let previous = self
-                .mixer_intentional_drains
-                .get(stream_id)
-                .copied()
-                .unwrap_or(false);
-            if previous != intentional
+            if !mixer_streams.contains(stream_id)
                 && let Ok(mut mixer) = mixer.lock()
             {
-                mixer.set_stream_intentional_drain(*stream_id, intentional);
-                self.mixer_intentional_drains
-                    .insert(*stream_id, intentional);
+                mixer.ensure_stream(
+                    *stream_id,
+                    MixerStreamSource::NetEq(Arc::clone(&stream.shared)),
+                );
+                mixer_streams.insert(*stream_id);
             }
         }
         let snapshot = self.snapshot_at(now);
@@ -621,14 +544,8 @@ impl LiveDecodeStreams {
     }
 
     pub(crate) fn snapshot_at(&mut self, now: Instant) -> LivePlaybackSnapshot {
-        let output_ring_samples: usize =
-            self.producers.values().map(|p| p.buffered_samples()).sum();
-        let max_output_ring_samples = self
-            .producers
-            .values()
-            .map(|p| p.buffered_samples())
-            .max()
-            .unwrap_or_default();
+        let output_ring_samples = self.hints.staged_samples();
+        let max_output_ring_samples = output_ring_samples;
         let diagnostics: Vec<NetEqDiagnostics> = self
             .streams
             .values()
@@ -654,12 +571,12 @@ impl LiveDecodeStreams {
         LivePlaybackSnapshot {
             active_streams: self.streams.len(),
             stream_activity: self
-                .producers
+                .streams
                 .iter()
-                .map(|(stream_id, producer)| LivePlaybackStreamActivity {
+                .map(|(stream_id, stream)| LivePlaybackStreamActivity {
                     stream_id: *stream_id,
-                    voice_active: producer.voice_active(),
-                    rms: producer.voice_rms(),
+                    voice_active: stream.last_activity.0,
+                    rms: stream.last_activity.1,
                 })
                 .collect(),
             output_ring_samples,
@@ -696,8 +613,8 @@ impl LiveDecodeStreams {
                 .iter()
                 .filter_map(|diagnostics| diagnostics.next_packet_gap_ms)
                 .max_by_key(|gap| gap.abs()),
-            backend_block_ms: samples_to_ms(self.block_samples),
-            playout_quantum_ms: samples_to_ms(self.block_samples.min(FRAME_SAMPLES)),
+            backend_block_ms: samples_to_ms(self.hints.block_samples()),
+            playout_quantum_ms: samples_to_ms(self.hints.block_samples().min(FRAME_SAMPLES)),
             neteq_start_delay_ms: duration_to_ms(self.tuning.neteq_start_delay),
             neteq_target_ms,
             neteq_target_delta_5s_ms,
@@ -722,7 +639,6 @@ impl LiveDecodeStreams {
                 .map(|diagnostics| diagnostics.dred_missed_horizon_ms)
                 .sum(),
             hard_trim_count: self.stats.hard_trim_count,
-            underrun_count: self.stats.underrun_count,
             dred_recoveries: self.stats.dred_recoveries,
             fec_recoveries: self.stats.fec_recoveries,
             plc_fallbacks: self.stats.plc_fallbacks,
@@ -763,9 +679,11 @@ fn neteq_operation_priority(operation: &str) -> u8 {
 /// One remote voice stream: a NetEQ core plus the receiver-side feedback report
 /// and the mute/control-mute tracking that governs concealment during silence.
 pub(crate) struct LiveDecodeStream {
-    core: NetEqCore,
+    shared: SharedNetEqHandle,
     feedback: LivePlaybackFeedbackState,
     tuning: LiveAudioTuning,
+    last_diagnostics: NetEqDiagnostics,
+    last_activity: (bool, f32),
     sender_silence_pending: bool,
     sender_silence_active: bool,
     /// True while the sender is muted (in-band media flags or the control-stream
@@ -783,10 +701,14 @@ pub(crate) struct LiveDecodeStream {
 
 impl LiveDecodeStream {
     pub(crate) fn new(tuning: LiveAudioTuning) -> Result<Self, String> {
+        let shared = SharedNetEqStream::new(tuning)?;
+        let last_diagnostics = lock_shared_stream(&shared).diagnostics();
         Ok(Self {
-            core: NetEqCore::new(tuning)?,
+            shared,
             feedback: LivePlaybackFeedbackState::default(),
             tuning,
+            last_diagnostics,
+            last_activity: (false, 0.0),
             sender_silence_pending: false,
             sender_silence_active: false,
             sender_muted: false,
@@ -827,8 +749,9 @@ impl LiveDecodeStream {
         } else {
             flags
         };
-        self.core
-            .insert_packet(now, timestamp, sequence, effective_flags, opus)
+        let mut shared = lock_shared_stream(&self.shared);
+        shared.set_idle_expand_stats_suppressed(false);
+        shared.insert_packet(now, timestamp, sequence, effective_flags, opus)
     }
 
     pub(crate) fn observe_sender_silence(
@@ -843,6 +766,7 @@ impl LiveDecodeStream {
         self.sender_silence_active = true;
         self.sender_muted = muted;
         self.media_muted = muted;
+        lock_shared_stream(&self.shared).set_idle_expand_stats_suppressed(true);
         if muted {
             self.control_mute_fallback_at = None;
             self.control_fallback_active = false;
@@ -868,7 +792,10 @@ impl LiveDecodeStream {
     }
 
     fn playback_diagnostics(&self) -> NetEqDiagnostics {
-        let mut diagnostics = self.core.diagnostics();
+        self.adjust_diagnostics(self.last_diagnostics.clone())
+    }
+
+    fn adjust_diagnostics(&self, mut diagnostics: NetEqDiagnostics) -> NetEqDiagnostics {
         if self.sender_silence_active && diagnostics.packets_buffered == 0 {
             diagnostics.playout_delay_ms = 0;
             diagnostics.packet_buffer_ms = 0;
@@ -926,6 +853,7 @@ impl LiveDecodeStream {
             self.sender_muted = true;
             self.sender_silence_pending = true;
         }
+        lock_shared_stream(&self.shared).set_idle_expand_stats_suppressed(true);
         if audio_pop_logging_enabled() {
             kvlog::info!(
                 "audio pop decode control mute fallback activated",
@@ -988,6 +916,7 @@ mod tests {
     use crate::audio::test_support::*;
     use crate::audio::{
         capture::OpusVoiceEncoder,
+        playback::MIX_FRAME_SAMPLES,
         shared::{LIVE_OPUS_FRAME_SAMPLES, LIVE_PACKET_FLAG_SILENCE_HINT, SAMPLE_RATE},
     };
 
@@ -1036,10 +965,15 @@ mod tests {
             let opus = tone_packet(&mut encoder, seq as usize * LIVE_OPUS_FRAME_SAMPLES);
             streams.insert_packet(voice_packet(7, seq, 0, opus, now), now);
             streams.drain_into_mixer(&mixer, now, None);
+            let mut mixer = mixer.lock().unwrap();
+            for _ in 0..LIVE_OPUS_FRAME_SAMPLES {
+                let _ = mixer.pop_mixed_output_sample(now, LIVE_OPUS_FRAME_SAMPLES);
+            }
         }
+        streams.drain_into_mixer(&mixer, now, None);
         assert!(
             streams.stats().direct_samples > 0,
-            "no decoded audio reached the ring"
+            "no decoded audio reached the callback"
         );
     }
 
@@ -1113,28 +1047,30 @@ mod tests {
         let tuning = test_tuning();
         let mut stream = LiveDecodeStream::new(tuning).unwrap();
         let mut encoder = OpusVoiceEncoder::new(32_000).unwrap();
-        let mut output = vec![0.0; stream.core.output_size_samples()];
+        let mut output = [0.0; MIX_FRAME_SAMPLES];
 
         for seq in 0..4u32 {
             let opus = tone_packet(&mut encoder, seq as usize * LIVE_OPUS_FRAME_SAMPLES);
             stream.insert_audio(seq * LIVE_OPUS_FRAME_SAMPLES as u32, seq, 0, &opus, now);
-            stream.core.get_audio(now, &mut output);
+            lock_shared_stream(&stream.shared).get_audio_10ms(now, &mut output);
         }
         for _ in 0..700 {
-            stream.core.get_audio(now, &mut output);
+            lock_shared_stream(&stream.shared).get_audio_10ms(now, &mut output);
         }
         // Sustained idle Expand freezes the sync-buffer end timestamp, but
         // `playout_delay_ms` now folds in `generated_noise_samples` so the playout
         // position tracks wall-clock instead of ageing. The delay stays bounded
         // even without any explicit sender-silence signal, so it never wraps and
         // never spuriously drives Accelerate.
+        let diagnostics = lock_shared_stream(&stream.shared).diagnostics();
         assert!(
-            stream.core.diagnostics().playout_delay_ms < 500,
+            diagnostics.playout_delay_ms < 500,
             "playout delay aged during sustained expand: {}ms",
-            stream.core.diagnostics().playout_delay_ms,
+            diagnostics.playout_delay_ms,
         );
 
         stream.observe_sender_silence(7, 99, true, now + Duration::from_secs(7));
+        stream.last_diagnostics = lock_shared_stream(&stream.shared).diagnostics();
         let diagnostics = stream.playback_diagnostics();
         assert_eq!(diagnostics.playout_delay_ms, 0);
         assert_eq!(diagnostics.packet_buffer_ms, 0);
@@ -1176,31 +1112,18 @@ mod tests {
     }
 
     #[test]
-    fn failed_registration_retries_with_current_intentional_drain() {
+    fn failed_registration_retries_with_current_source() {
         let now = Instant::now();
         let tuning = test_tuning();
         let mut streams = LiveDecodeStreams::new(tuning);
         let mut encoder = OpusVoiceEncoder::new(32_000).unwrap();
         assert!(streams.ensure_entry(7));
-
-        {
-            let stream = streams.streams.get_mut(&7).unwrap();
-            let mut output = vec![0.0; stream.core.output_size_samples()];
-            for seq in 0..6u32 {
-                let opus = tone_packet(&mut encoder, seq as usize * LIVE_OPUS_FRAME_SAMPLES);
-                stream.insert_audio(seq * LIVE_OPUS_FRAME_SAMPLES as u32, seq, 0, &opus, now);
-                stream.core.get_audio(now, &mut output);
-            }
-            for _ in 0..400 {
-                if stream.core.get_audio(now, &mut output).muted {
-                    break;
-                }
-            }
-            assert!(
-                stream.core.get_audio(now, &mut output).muted,
-                "stream should be in muted expand before the registration retry test"
-            );
-        }
+        let opus = tone_packet(&mut encoder, 0);
+        streams
+            .streams
+            .get_mut(&7)
+            .unwrap()
+            .insert_audio(0, 0, 0, &opus, now);
 
         let queue = SpscSwapQueue::<LivePlaybackMixerEvent>::with_capacity(1);
         let mut filler = LivePlaybackMixerEvent::StopStream { stream_id: 99 };
@@ -1211,10 +1134,6 @@ mod tests {
         assert!(
             !streams.mixer_streams.contains(&7),
             "failed EnsureStream must not cache registration"
-        );
-        assert!(
-            !streams.mixer_intentional_drains.contains_key(&7),
-            "failed EnsureStream must not cache drain state"
         );
 
         let mut drained = LivePlaybackMixerEvent::Empty;
@@ -1229,21 +1148,13 @@ mod tests {
         let mut event = LivePlaybackMixerEvent::Empty;
         assert!(queue.remove(&mut event));
         match event {
-            LivePlaybackMixerEvent::EnsureStream {
-                stream_id,
-                intentional_drain,
-                ..
-            } => {
+            LivePlaybackMixerEvent::EnsureStream { stream_id, source } => {
                 assert_eq!(stream_id, 7);
-                assert!(
-                    intentional_drain,
-                    "retried registration should carry current intentional drain"
-                );
+                assert!(matches!(source, MixerStreamSource::NetEq(_)));
             }
             other => panic!("expected retried EnsureStream, got {}", other.kind()),
         }
         assert!(streams.mixer_streams.contains(&7));
-        assert_eq!(streams.mixer_intentional_drains.get(&7), Some(&true));
     }
 
     fn stream_control(muted: bool) -> PlaybackStreamControl {
@@ -1407,10 +1318,9 @@ mod tests {
     ) -> Option<Arc<SampleRing>> {
         let mut event = LivePlaybackMixerEvent::Empty;
         while queue.remove(&mut event) {
-            if let LivePlaybackMixerEvent::EnsureStream {
-                stream_id, ring, ..
-            } = &event
+            if let LivePlaybackMixerEvent::EnsureStream { stream_id, source } = &event
                 && *stream_id == NOTIFICATION_STREAM_ID
+                && let MixerStreamSource::Ring(ring) = source
             {
                 return Some(Arc::clone(ring));
             }

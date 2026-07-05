@@ -98,6 +98,9 @@ pub struct VoiceFeedback {
     pub duplicate_packets: u16,
     pub reordered_packets: u16,
     pub window_ms: u16,
+    /// Receiver-side staged playout depth in milliseconds. This reports the
+    /// local mix-adapter carry, not a protocol buffer or sender-controlled
+    /// queue.
     pub max_output_ring_ms: u16,
     pub max_neteq_target_ms: u16,
     pub max_neteq_playout_delay_ms: u16,

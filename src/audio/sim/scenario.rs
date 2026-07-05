@@ -194,9 +194,9 @@ pub struct LiveAudioSimulationReport {
     /// Minimum NetEQ target observed over the steady-state tail window, in
     /// milliseconds. Captures how far the delay manager relaxed.
     pub steady_state_min_neteq_target_ms: u64,
-    /// Underrun episodes observed over the steady-state tail window, excluding
-    /// startup priming.
-    pub steady_state_underruns: u64,
+    /// NetEQ expand-concealment blocks observed over the steady-state tail
+    /// window, excluding startup priming.
+    pub steady_state_concealment_expands: u64,
     pub final_snapshot: LivePlaybackSnapshot,
 }
 
