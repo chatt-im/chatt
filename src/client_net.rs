@@ -821,6 +821,9 @@ fn run_worker_inner(
         server_udp_addr,
         server_udp_probe_addr,
         read_buf: RecvBuffer::new(),
+        // Starts true so the first loop iteration reads anything that arrived
+        // before the socket was registered with the poll.
+        tcp_readable: true,
         write_buf: Vec::new(),
         media_packet: Vec::new(),
         media_scratch: Vec::new(),
@@ -926,10 +929,13 @@ fn run_worker_inner(
         for event in poll_events.iter() {
             match event.token() {
                 TCP => {
+                    // Reading happens below through `tcp_readable` so a read
+                    // capped by `MAX_BUFFERED_SERVER_BYTES` is retried once
+                    // control processing frees buffer space. Consuming the
+                    // edge-triggered event without draining the socket would
+                    // otherwise strand the remaining bytes forever.
                     if event.is_readable() {
-                        if let Err(error) = worker.read_tcp() {
-                            return SessionEnd::Disconnected(error);
-                        }
+                        worker.tcp_readable = true;
                     }
                     if event.is_writable() {
                         if let Err(error) = worker.write_tcp() {
@@ -942,6 +948,11 @@ fn run_worker_inner(
                 MDNS_V6 => worker.handle_mdns_readable(MDNS_V6, Instant::now()),
                 WAKE => {}
                 _ => {}
+            }
+        }
+        if worker.tcp_readable {
+            if let Err(error) = worker.read_tcp() {
+                return SessionEnd::Disconnected(error);
             }
         }
         if let Err(error) = worker.process_server_controls() {
@@ -1010,7 +1021,12 @@ fn run_worker_inner(
         } else {
             None
         };
-        let incoming_ready = !worker.read_buf.is_empty()
+        // A whole buffered frame or possibly-unread socket bytes mean another
+        // tick can make progress now. A lone partial frame does not: its rest
+        // arrives with the next readable edge, so parking on the poll is safe
+        // and avoids a busy loop while the tail is in flight.
+        let incoming_ready = worker.tcp_readable
+            || matches!(frame::parse_frame(worker.read_buf.pending()), Ok(Some(_)))
             || worker.incoming_files.values().any(|incoming| {
                 incoming.pending_wire_offset < incoming.pending_wire.len()
                     || incoming.complete_received
@@ -1350,6 +1366,14 @@ struct WorkerState {
     udp: UdpSocket,
     udp_local_addr: SocketAddr,
     read_buf: RecvBuffer,
+    /// Whether the TCP socket may hold unread bytes. Set on every readable
+    /// poll event and cleared only when a read drains to `WouldBlock` or
+    /// end-of-stream. [`read_tcp`](WorkerState::read_tcp) stops early once
+    /// `read_buf` reaches [`MAX_BUFFERED_SERVER_BYTES`], and the poll is
+    /// edge-triggered, so without this flag a capped read would strand the
+    /// remaining kernel bytes: no new readable edge fires while the sender is
+    /// blocked on our zero receive window.
+    tcp_readable: bool,
     write_buf: Vec<u8>,
     /// Reusable buffers for the outbound media seal path, cleared on each use so
     /// the per-frame voice send does not allocate. `media_packet` holds the UDP
@@ -2242,6 +2266,11 @@ impl WorkerState {
         self.write_tcp()
     }
 
+    /// Reads from the TCP socket until `read_buf` reaches
+    /// [`MAX_BUFFERED_SERVER_BYTES`] or the socket drains. Only a drain
+    /// (`WouldBlock` or end-of-stream) clears `tcp_readable`; stopping at the
+    /// buffer cap leaves it set so the main loop retries after
+    /// `process_server_controls` frees buffer space.
     fn read_tcp(&mut self) -> Result<(), String> {
         while self.read_buf.len() < MAX_BUFFERED_SERVER_BYTES {
             match self.read_buf.fill(&self.tcp, TCP_READ_CHUNK_BYTES) {
@@ -2249,6 +2278,7 @@ impl WorkerState {
                     kvlog::info!("tcp server closed connection");
                     self.shutdown = true;
                     self.disconnect_reason = Some("server closed connection".to_string());
+                    self.tcp_readable = false;
                     break;
                 }
                 Ok(_read) => {
@@ -2258,7 +2288,10 @@ impl WorkerState {
                         buffered = self.read_buf.len()
                     );
                 }
-                Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    self.tcp_readable = false;
+                    break;
+                }
                 Err(error) => {
                     kvlog::warn!("tcp read failed", error = %error);
                     return Err(format!("TCP read failed: {error}"));
