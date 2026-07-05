@@ -41,7 +41,10 @@ use rpc::{
         SessionSecrets, complete_client_transport_handshake, dev_server_public_key,
         ed25519_public_key_from_hex, encode_hex, generate_client_hello,
     },
-    evented::{MioReady, ReadLimit, Readiness, WriteQueue, recv_datagram_with, write_queue_to},
+    evented::{
+        MioReady, ReadLimit, Readiness, WriteQueue, is_interrupted_io_error, recv_datagram_with,
+        write_queue_to,
+    },
     frame, history,
     ids::{BugReportId, FileTransferId, MessageId, RoomId, SessionId, StreamId, UserId},
     media::{self, MediaPayload, VoicePayload as MediaVoicePayload},
@@ -110,10 +113,8 @@ const MAX_COMPRESSED_UPLOAD_SOURCE_AHEAD_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_FILE_WIRE_BYTES_PER_TICK: usize = 1024 * 1024;
 const MAX_FILE_DECODED_BYTES_PER_TICK: usize = 1024 * 1024;
 const MAX_SERVER_CONTROLS_PER_FILE_PUMP: usize = 8;
+const MAX_SERVER_CONTROLS_PER_ITERATION: usize = 64;
 const MAX_BUFFERED_SERVER_BYTES: usize = 2 * 1024 * 1024;
-/// Minimum spare capacity ensured before each direct read into the TCP receive
-/// buffer; the buffer grows past this on demand during bulk transfers.
-const TCP_READ_CHUNK_BYTES: usize = 64 * 1024;
 const TCP_WRITE_ATTEMPTS: usize = 32;
 const UDP_DRAIN_BUDGET: usize = 64;
 const MDNS_DRAIN_BUDGET: usize = 32;
@@ -1080,6 +1081,10 @@ fn run_worker_inner(
     let mut poll_timeout = worker.next_poll_timeout(CommandDrainOutcome::Empty, Instant::now());
     while !worker.shutdown {
         if let Err(error) = poll.poll(&mut poll_events, Some(poll_timeout)) {
+            if is_interrupted_io_error(&error) {
+                kvlog::warn!("network poll interrupted", error = %error);
+                continue;
+            }
             return SessionEnd::Disconnected(format!("network poll failed: {error}"));
         }
         for event in poll_events.iter() {
@@ -2430,7 +2435,7 @@ impl WorkerState {
 
     #[inline]
     fn receive_wake(&self) -> WakeIntent {
-        let ready = matches!(frame::parse_frame(self.read_buf.pending()), Ok(Some(_)))
+        let ready = !matches!(frame::parse_frame(self.read_buf.pending()), Ok(None))
             || self.incoming_files.values().any(|incoming| {
                 incoming.pending_wire_offset < incoming.pending_wire.len()
                     || incoming.complete_received
@@ -2509,7 +2514,7 @@ impl WorkerState {
             &self.tcp,
             &mut self.read_buf,
             &mut self.tcp_readiness,
-            TCP_READ_CHUNK_BYTES,
+            MAX_BUFFERED_SERVER_BYTES,
             ReadLimit::MaxBuffered(MAX_BUFFERED_SERVER_BYTES),
         )
         .map_err(|error| {
@@ -2535,7 +2540,11 @@ impl WorkerState {
         let mut wire_budget = MAX_FILE_WIRE_BYTES_PER_TICK;
         let mut decoded_budget = MAX_FILE_DECODED_BYTES_PER_TICK;
         let mut controls_since_file_pump = 0;
+        let mut controls_processed = 0usize;
         loop {
+            if controls_processed >= MAX_SERVER_CONTROLS_PER_ITERATION {
+                break;
+            }
             if controls_since_file_pump >= MAX_SERVER_CONTROLS_PER_FILE_PUMP {
                 self.pump_incoming_files(&mut wire_budget, &mut decoded_budget);
                 controls_since_file_pump = 0;
@@ -2566,11 +2575,13 @@ impl WorkerState {
             kvlog::debug!("server control decrypted", payload_size = plaintext.len());
             if self.handle_history_chunk_payload(&plaintext)? {
                 controls_since_file_pump += 1;
+                controls_processed += 1;
                 continue;
             }
             let control = decode_server_control(&plaintext)?;
             self.handle_server_control(control);
             controls_since_file_pump += 1;
+            controls_processed += 1;
         }
         Ok(())
     }
@@ -2588,6 +2599,9 @@ impl WorkerState {
                 attempts = outcome.attempts,
                 remaining = self.write_buf.len()
             );
+        }
+        if outcome.wrote_zero {
+            return Err("TCP write returned zero bytes".to_string());
         }
         if outcome.hit_limit {
             self.loop_work.queue_tcp_write();
