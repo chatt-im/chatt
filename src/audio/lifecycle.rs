@@ -187,6 +187,7 @@ pub struct LivePlaybackSink {
 }
 
 pub(crate) enum LivePlaybackCommand {
+    StartStream(u32),
     Packet(RemoteVoicePacket),
     StopStream(u32),
     SetStreamControl(u32, PlaybackStreamControl),
@@ -295,6 +296,12 @@ impl LivePlayback {
         }
     }
 
+    pub fn start_stream(&self, stream_id: u32) {
+        if let Some(sender) = &self.sender {
+            let _ = sender.send(LivePlaybackCommand::StartStream(stream_id));
+        }
+    }
+
     /// Mixes a one-shot notification clip into the live output. Drops the clip
     /// if the command channel is full, which is acceptable for a notification.
     pub fn play_notification(&self, samples: Arc<[f32]>) {
@@ -354,6 +361,12 @@ impl LivePlayback {
 }
 
 impl LivePlaybackSink {
+    pub fn start_stream(&self, stream_id: u32) {
+        let _ = self
+            .sender
+            .send(LivePlaybackCommand::StartStream(stream_id));
+    }
+
     pub fn push(&self, packet: RemoteVoicePacket) {
         let _ = self.sender.try_send(LivePlaybackCommand::Packet(packet));
     }

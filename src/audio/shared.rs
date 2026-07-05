@@ -684,6 +684,13 @@ pub struct LivePlaybackSnapshot {
     /// Backend stream errors whose [`AudioErrorKind`] warrants a stream
     /// rebuild. Excludes xruns, refused realtime priority, and reroutes.
     pub backend_fatal_stream_errors: u64,
+    pub playback_callbacks: u64,
+    pub playback_callback_overruns: u64,
+    pub playback_callback_max_duration_us: u64,
+    pub playback_mixer_events_drained: u64,
+    pub neteq_lock_wait_count: u64,
+    pub neteq_lock_wait_total_us: u64,
+    pub neteq_lock_wait_max_us: u64,
     pub last_backend_error_kind: Option<AudioErrorKind>,
     pub last_backend_error: Option<String>,
 }
@@ -932,6 +939,11 @@ pub(crate) fn frames_for_duration(duration: Duration) -> usize {
 
 pub(crate) fn samples_to_ms(samples: usize) -> u64 {
     ((samples as f64 / SAMPLE_RATE as f64) * 1_000.0).round() as u64
+}
+
+pub(crate) fn samples_to_duration(samples: usize) -> Duration {
+    let nanos = samples as u128 * 1_000_000_000u128 / u128::from(SAMPLE_RATE);
+    Duration::from_nanos(nanos.min(u128::from(u64::MAX)) as u64)
 }
 
 pub(crate) fn duration_to_ms(duration: Duration) -> u64 {

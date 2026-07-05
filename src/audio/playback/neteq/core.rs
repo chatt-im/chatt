@@ -40,7 +40,7 @@ use super::neteq_status::{
     ControllerConfig, NetEqStatus, PacketArrivedInfo, PacketBufferInfo, PacketInfo,
 };
 use super::operation::{Mode, Operation};
-use super::packet::{Packet, PacketPayload, is_newer_timestamp};
+use super::packet::{Packet, PacketPayload, Priority, is_newer_timestamp};
 use super::packet_buffer::PacketBuffer;
 use super::redundancy::{DredInfo, FecInfo, parse_payload_redundancy};
 use super::sync_buffer::SyncBuffer;
@@ -107,12 +107,83 @@ pub(crate) struct NetEqDiagnostics {
     pub dred_missed_horizon_ms: u64,
 }
 
+/// Cheap state the worker snapshots before preparing a packet outside the
+/// callback-shared NetEQ mutex.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct NetEqInsertPlan {
+    current_gap: u32,
+    dred_enabled: bool,
+}
+
 /// One cached DRED parse, reused across the 10 ms chunks recovered from the same
 /// packet (mirrors the previous live path's `DredGapState`).
 struct DredParse {
     sequence: u32,
     state: DredState,
     processed: bool,
+}
+
+/// Packet bytes and redundancy expansion prepared before the final NetEQ insert
+/// lock hold.
+pub(crate) struct NetEqPreparedPacket {
+    plan: NetEqInsertPlan,
+    timestamp: u32,
+    sequence: u32,
+    flags: u8,
+    packets: Vec<Packet>,
+    dred_parse: Option<DredParse>,
+    available_horizon_samples: u32,
+}
+
+impl NetEqPreparedPacket {
+    pub(crate) fn prepare(
+        plan: NetEqInsertPlan,
+        timestamp: u32,
+        sequence: u32,
+        flags: u8,
+        opus: &[u8],
+        dred_decoder: Option<&mut DredDecoder>,
+    ) -> Option<Self> {
+        if opus.is_empty() {
+            return None;
+        }
+        let datagram = Arc::new(opus.to_vec());
+        let fec = NetEqCore::parse_fec(opus);
+        let (dred, dred_parse, available_horizon_samples) = if plan.dred_enabled {
+            NetEqCore::parse_dred_for_insert(dred_decoder, sequence, &datagram, plan.current_gap)
+        } else {
+            (None, None, 0)
+        };
+        let mut packets = parse_payload_redundancy(
+            timestamp,
+            sequence,
+            Arc::clone(&datagram),
+            plan.current_gap,
+            DEFAULT_FRAME_SAMPLES as u32,
+            fec,
+            dred,
+        );
+        if flags & LIVE_PACKET_FLAG_MUTE != 0
+            && let Some(primary) = packets
+                .iter_mut()
+                .find(|packet| packet.priority == Priority::PRIMARY)
+        {
+            primary.muted = true;
+        }
+        Some(Self {
+            plan,
+            timestamp,
+            sequence,
+            flags,
+            packets,
+            dred_parse,
+            available_horizon_samples,
+        })
+    }
+
+    pub(crate) fn plan(&self) -> NetEqInsertPlan {
+        self.plan
+    }
 }
 
 /// The faithful NetEQ control + decode loop for the live playback path.
@@ -270,6 +341,12 @@ impl NetEqCore {
         self.packet_buffer.num_packets()
     }
 
+    fn playout_timestamp(&self) -> u32 {
+        self.sync_buffer
+            .end_timestamp()
+            .wrapping_sub(self.sync_buffer.future_length() as u32)
+    }
+
     pub(crate) fn diagnostics(&self) -> NetEqDiagnostics {
         let status = self.status();
         // Match `DecisionLogic::playout_delay_ms`: the end timestamp freezes during
@@ -344,19 +421,62 @@ impl NetEqCore {
         flags: u8,
         opus: &[u8],
     ) -> bool {
-        if opus.is_empty() {
+        let Some(prepared) = NetEqPreparedPacket::prepare(
+            self.insert_plan(timestamp, sequence),
+            timestamp,
+            sequence,
+            flags,
+            opus,
+            self.dred_decoder.as_mut(),
+        ) else {
             return false;
+        };
+        self.insert_prepared_packet(now, prepared)
+    }
+
+    pub(crate) fn insert_plan(&self, timestamp: u32, sequence: u32) -> NetEqInsertPlan {
+        let playout_timestamp = self.playout_timestamp();
+        let sequence_advanced = self
+            .last_sequence
+            .is_none_or(|last| is_newer_timestamp(sequence, last));
+        let rebases_timeline = !self.first_packet
+            && sequence_advanced
+            && is_newer_timestamp(playout_timestamp, timestamp)
+            && playout_timestamp.wrapping_sub(timestamp) > TIMELINE_REBASE_TOLERANCE_SAMPLES;
+        NetEqInsertPlan {
+            current_gap: if self.first_packet || rebases_timeline {
+                0
+            } else {
+                self.recovery_gap(timestamp)
+            },
+            dred_enabled: self.dred_decoder.is_some(),
         }
+    }
+
+    pub(crate) fn insert_plan_matches(
+        &self,
+        timestamp: u32,
+        sequence: u32,
+        plan: NetEqInsertPlan,
+    ) -> bool {
+        self.insert_plan(timestamp, sequence) == plan
+    }
+
+    pub(crate) fn insert_prepared_packet(
+        &mut self,
+        now: Instant,
+        mut prepared: NetEqPreparedPacket,
+    ) -> bool {
         let arrival_samples = self.observe_wall_clock(now);
+        let timestamp = prepared.timestamp;
+        let sequence = prepared.sequence;
+        let flags = prepared.flags;
         if let Some(floor) = self.rebase_floor_sequence
             && is_newer_timestamp(floor, sequence)
         {
             return true;
         }
-        let playout_timestamp = self
-            .sync_buffer
-            .end_timestamp()
-            .wrapping_sub(self.sync_buffer.future_length() as u32);
+        let playout_timestamp = self.playout_timestamp();
         // A sender capture restart (e.g. a mic device switch mid-call) rebases
         // its media clock to zero while the stream and its wire sequence persist.
         // Relative to the old timeline the new timestamps read as a huge
@@ -375,12 +495,15 @@ impl NetEqCore {
         {
             self.flush();
             self.rebase_floor_sequence = Some(sequence);
+            prepared
+                .packets
+                .retain(|packet| packet.priority.codec_level != 2);
+            prepared.dred_parse = None;
         }
         if sequence_advanced {
             self.last_sequence = Some(sequence);
         }
         let late = !self.first_packet && is_newer_timestamp(playout_timestamp, timestamp);
-        let muted = flags & LIVE_PACKET_FLAG_MUTE != 0;
         // The sender drains its buffered preroll tail as a burst of back-dated
         // packets when resuming from a silence-gated pause. Those carry RTP
         // timestamps trailing wall-clock by the preroll length, so feeding them
@@ -396,43 +519,26 @@ impl NetEqCore {
             // gap); reset the decoder before the next decode to match.
             self.reset_decoder = true;
         }
-        let datagram = Arc::new(opus.to_vec());
 
         // Compute the recovery gap behind this packet, exactly as the DRED fork's
         // InsertPacketInternal does: the hole between the most recent buffered (or
         // played) audio and this packet's timestamp.
         let current_gap = self.recovery_gap(timestamp);
-        let fec = Self::parse_fec(opus);
-        let (dred, available_horizon_samples) = self.parse_dred(sequence, &datagram, current_gap);
-        self.dred_last_horizon_samples = available_horizon_samples as usize;
-        if current_gap > available_horizon_samples {
+        self.dred_last_horizon_samples = prepared.available_horizon_samples as usize;
+        if current_gap > prepared.available_horizon_samples {
             self.dred_missed_horizon_count = self.dred_missed_horizon_count.saturating_add(1);
             self.dred_missed_horizon_samples = self
                 .dred_missed_horizon_samples
-                .saturating_add(u64::from(current_gap - available_horizon_samples));
+                .saturating_add(u64::from(current_gap - prepared.available_horizon_samples));
+        }
+        if let Some(dred_parse) = prepared.dred_parse.take() {
+            self.dred_parse = Some(dred_parse);
         }
 
-        let packets = parse_payload_redundancy(
-            timestamp,
-            sequence,
-            Arc::clone(&datagram),
-            current_gap,
-            DEFAULT_FRAME_SAMPLES as u32,
-            fec,
-            dred,
-        );
-        let main_timestamp = packets.first().map_or(timestamp, |packet| packet.timestamp);
-        let mut packets = packets;
-        if muted {
-            // Tag the primary (codec_level 0) so the decode loop fades it.
-            if let Some(primary) = packets
-                .iter_mut()
-                .find(|packet| packet.priority.codec_level == 0)
-            {
-                primary.muted = true;
-            }
-        }
-
+        let main_timestamp = prepared
+            .packets
+            .first()
+            .map_or(timestamp, |packet| packet.timestamp);
         let was_first_packet = self.first_packet;
         if self.first_packet {
             self.packet_buffer.flush();
@@ -451,7 +557,7 @@ impl NetEqCore {
         // colliding in `PacketArrivalHistory` with a DRED chunk that pre-recovered
         // its timestamp: the chunk's 10 ms span does not contain the 20 ms primary,
         // so the reorder still reaches the reorder optimizer.
-        for packet in packets {
+        for packet in prepared.packets {
             let packet_timestamp = packet.timestamp;
             let packet_length_samples = packet.duration_samples;
             let buffer_flush = matches!(
@@ -540,11 +646,29 @@ impl NetEqCore {
         datagram: &Arc<Vec<u8>>,
         current_gap: u32,
     ) -> (Option<DredInfo>, u32) {
-        if current_gap == 0 {
-            return (None, 0);
+        let (dred, dred_parse, available_horizon_samples) = Self::parse_dred_for_insert(
+            self.dred_decoder.as_mut(),
+            sequence,
+            datagram,
+            current_gap,
+        );
+        if let Some(dred_parse) = dred_parse {
+            self.dred_parse = Some(dred_parse);
         }
-        let Some(decoder) = self.dred_decoder.as_mut() else {
-            return (None, 0);
+        (dred, available_horizon_samples)
+    }
+
+    fn parse_dred_for_insert(
+        dred_decoder: Option<&mut DredDecoder>,
+        sequence: u32,
+        datagram: &Arc<Vec<u8>>,
+        current_gap: u32,
+    ) -> (Option<DredInfo>, Option<DredParse>, u32) {
+        if current_gap == 0 {
+            return (None, None, 0);
+        }
+        let Some(decoder) = dred_decoder else {
+            return (None, None, 0);
         };
         let available_horizon_samples =
             Self::parse_dred_state(decoder, datagram, LIVE_PLAYBACK_DRED_MAX_SAMPLES)
@@ -556,21 +680,22 @@ impl NetEqCore {
         let Some((state, reach, dred_end)) =
             Self::parse_dred_state(decoder, datagram, max_dred_samples)
         else {
-            return (None, available_horizon_samples);
+            return (None, None, available_horizon_samples);
         };
         if reach == 0 {
-            return (None, available_horizon_samples);
+            return (None, None, available_horizon_samples);
         }
-        self.dred_parse = Some(DredParse {
+        let dred_parse = DredParse {
             sequence,
             state,
             processed: false,
-        });
+        };
         (
             Some(DredInfo {
                 samples: reach as i32,
                 dred_end,
             }),
+            Some(dred_parse),
             available_horizon_samples,
         )
     }

@@ -698,6 +698,7 @@ mod tests {
                 let mut mixer = mixer
                     .lock()
                     .map_err(|_| "headless soundboard mixer lock poisoned")?;
+                mixer.begin_output_callback();
                 for _ in 0..LIVE_OPUS_FRAME_SAMPLES {
                     let _ = mixer.pop_mixed_output_sample(now, LIVE_OPUS_FRAME_SAMPLES);
                 }
