@@ -196,6 +196,95 @@ impl PollSchedule {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WorkerTask {
+    TcpRead,
+    UdpDrain,
+    MdnsDrain(Token),
+}
+
+const WORK_TCP_READ: u8 = 1 << 0;
+const WORK_UDP_DRAIN: u8 = 1 << 1;
+const WORK_MDNS_V4_DRAIN: u8 = 1 << 2;
+const WORK_MDNS_V6_DRAIN: u8 = 1 << 3;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct WorkerWork {
+    bits: u8,
+}
+
+impl WorkerWork {
+    #[inline]
+    fn has_immediate_work(&self) -> bool {
+        self.bits != 0
+    }
+
+    #[inline]
+    fn wake(&self) -> WakeIntent {
+        if self.has_immediate_work() {
+            WakeIntent::Now
+        } else {
+            WakeIntent::Idle
+        }
+    }
+
+    #[inline]
+    fn queue_tcp_read(&mut self) {
+        self.bits |= WORK_TCP_READ;
+    }
+
+    #[inline]
+    fn queue_udp_drain(&mut self) {
+        self.bits |= WORK_UDP_DRAIN;
+    }
+
+    #[inline]
+    fn queue_mdns_drain(&mut self, token: Token) {
+        match token {
+            MDNS_V4 => self.bits |= WORK_MDNS_V4_DRAIN,
+            MDNS_V6 => self.bits |= WORK_MDNS_V6_DRAIN,
+            _ => {}
+        }
+    }
+
+    #[inline]
+    fn take_tasks(&mut self) -> WorkerTasks {
+        let bits = self.bits;
+        self.bits = 0;
+        WorkerTasks { bits }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct WorkerTasks {
+    bits: u8,
+}
+
+impl Iterator for WorkerTasks {
+    type Item = WorkerTask;
+
+    #[inline]
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.bits & WORK_TCP_READ != 0 {
+            self.bits &= !WORK_TCP_READ;
+            return Some(WorkerTask::TcpRead);
+        }
+        if self.bits & WORK_UDP_DRAIN != 0 {
+            self.bits &= !WORK_UDP_DRAIN;
+            return Some(WorkerTask::UdpDrain);
+        }
+        if self.bits & WORK_MDNS_V4_DRAIN != 0 {
+            self.bits &= !WORK_MDNS_V4_DRAIN;
+            return Some(WorkerTask::MdnsDrain(MDNS_V4));
+        }
+        if self.bits & WORK_MDNS_V6_DRAIN != 0 {
+            self.bits &= !WORK_MDNS_V6_DRAIN;
+            return Some(WorkerTask::MdnsDrain(MDNS_V6));
+        }
+        None
+    }
+}
+
 #[inline]
 fn read_tcp_into_buffer(
     socket: &impl std::os::fd::AsRawFd,
@@ -228,6 +317,7 @@ fn read_tcp_into_buffer(
     Ok(outcome)
 }
 
+#[cfg(test)]
 #[inline]
 fn tcp_receive_work_ready(readiness: Readiness, read_buf: &RecvBuffer) -> bool {
     readiness.is_ready() || matches!(frame::parse_frame(read_buf.pending()), Ok(Some(_)))
@@ -236,6 +326,29 @@ fn tcp_receive_work_ready(readiness: Readiness, read_buf: &RecvBuffer) -> bool {
 #[inline]
 fn is_interrupted_io_error(error: &io::Error) -> bool {
     error.kind() == io::ErrorKind::Interrupted || error.raw_os_error() == Some(libc::EINTR)
+}
+
+#[inline]
+fn recv_udp_datagram_with(
+    buf: &mut [u8],
+    mut recv_from: impl FnMut(&mut [u8]) -> io::Result<(usize, SocketAddr)>,
+) -> io::Result<Option<(usize, SocketAddr)>> {
+    loop {
+        match recv_from(buf) {
+            Ok(value) => return Ok(Some(value)),
+            Err(error) if is_interrupted_io_error(&error) => continue,
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(None),
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+#[inline]
+fn recv_udp_datagram(
+    socket: &UdpSocket,
+    buf: &mut [u8],
+) -> io::Result<Option<(usize, SocketAddr)>> {
+    recv_udp_datagram_with(buf, |buf| socket.recv_from(buf))
 }
 
 #[cfg(test)]
@@ -931,6 +1044,7 @@ fn run_worker_inner(
         tcp: TcpStream::from_std(std_tcp),
         udp: UdpSocket::from_std(std_udp),
         udp_local_addr,
+        loop_work: WorkerWork::default(),
         server_udp_addr,
         server_udp_probe_addr,
         read_buf: RecvBuffer::new(),
@@ -995,6 +1109,7 @@ fn run_worker_inner(
         disconnect_reason: None,
         auth_failure: None,
     };
+    worker.loop_work.queue_tcp_read();
 
     // The poll outlives each session so its waker survives reconnects. A prior
     // session's sockets were dropped on return, closing their fds and clearing
@@ -1049,6 +1164,7 @@ fn run_worker_inner(
                     // otherwise strand the remaining bytes forever.
                     if event.is_readable() {
                         worker.tcp_readiness.mark_ready();
+                        worker.loop_work.queue_tcp_read();
                     }
                     if event.is_writable() {
                         if let Err(error) = worker.write_tcp() {
@@ -1056,17 +1172,15 @@ fn run_worker_inner(
                         }
                     }
                 }
-                UDP => worker.read_udp(),
-                MDNS_V4 => worker.handle_mdns_readable(MDNS_V4, Instant::now()),
-                MDNS_V6 => worker.handle_mdns_readable(MDNS_V6, Instant::now()),
+                UDP => worker.loop_work.queue_udp_drain(),
+                MDNS_V4 => worker.loop_work.queue_mdns_drain(MDNS_V4),
+                MDNS_V6 => worker.loop_work.queue_mdns_drain(MDNS_V6),
                 WAKE => {}
                 _ => {}
             }
         }
-        if worker.tcp_readiness.is_ready() {
-            if let Err(error) = worker.read_tcp() {
-                return SessionEnd::Disconnected(error);
-            }
+        if let Err(error) = worker.run_loop_tasks() {
+            return SessionEnd::Disconnected(error);
         }
         if let Err(error) = worker.process_server_controls() {
             return SessionEnd::Disconnected(error);
@@ -1103,7 +1217,6 @@ fn run_worker_inner(
         worker.poll_relay_keepalive(now);
         worker.poll_rtt_probe(now);
         worker.poll_mdns(now);
-        worker.read_udp();
         poll_timeout = worker.next_poll_timeout(command_drain, now);
         #[cfg(debug_assertions)]
         if poll_timeout != Duration::ZERO {
@@ -1431,6 +1544,7 @@ struct WorkerState {
     tcp: TcpStream,
     udp: UdpSocket,
     udp_local_addr: SocketAddr,
+    loop_work: WorkerWork,
     read_buf: RecvBuffer,
     /// Whether the TCP socket may hold unread bytes. Set on every readable
     /// poll event and cleared only when a read drains to `WouldBlock` or
@@ -2316,14 +2430,39 @@ impl EncoderFeedbackController {
 
 impl WorkerState {
     #[inline]
-    fn next_poll_timeout(&self, command_drain: CommandDrainOutcome, now: Instant) -> Duration {
+    fn next_poll_timeout(&mut self, command_drain: CommandDrainOutcome, now: Instant) -> Duration {
+        self.queue_runnable_io();
         let mut schedule = PollSchedule::after(POLL_TIMEOUT);
+        schedule.include(self.loop_work.wake());
         schedule.include(self.command_wake(command_drain));
         schedule.include(self.bug_report_wake());
         schedule.include(self.receive_wake());
         schedule.include(self.upload_wake());
         schedule.include(self.mdns_wake(now));
         schedule.timeout()
+    }
+
+    #[inline]
+    fn queue_runnable_io(&mut self) {
+        if self.tcp_readiness.is_ready() && self.read_buf.len() < MAX_BUFFERED_SERVER_BYTES {
+            self.loop_work.queue_tcp_read();
+        }
+    }
+
+    fn run_loop_tasks(&mut self) -> Result<(), String> {
+        let tasks = self.loop_work.take_tasks();
+        for task in tasks {
+            match task {
+                WorkerTask::TcpRead => {
+                    if self.tcp_readiness.is_ready() {
+                        self.read_tcp()?;
+                    }
+                }
+                WorkerTask::UdpDrain => self.read_udp(),
+                WorkerTask::MdnsDrain(token) => self.handle_mdns_readable(token, Instant::now()),
+            }
+        }
+        Ok(())
     }
 
     #[inline]
@@ -2351,7 +2490,7 @@ impl WorkerState {
 
     #[inline]
     fn receive_wake(&self) -> WakeIntent {
-        let ready = tcp_receive_work_ready(self.tcp_readiness, &self.read_buf)
+        let ready = matches!(frame::parse_frame(self.read_buf.pending()), Ok(Some(_)))
             || self.incoming_files.values().any(|incoming| {
                 incoming.pending_wire_offset < incoming.pending_wire.len()
                     || incoming.complete_received
@@ -2392,6 +2531,10 @@ impl WorkerState {
 
     #[cfg(debug_assertions)]
     fn debug_assert_no_immediate_work(&self, command_drain: CommandDrainOutcome) {
+        debug_assert!(!self.loop_work.has_immediate_work());
+        debug_assert!(
+            !(self.tcp_readiness.is_ready() && self.read_buf.len() < MAX_BUFFERED_SERVER_BYTES)
+        );
         debug_assert_ne!(self.command_wake(command_drain), WakeIntent::Now);
         debug_assert_ne!(self.bug_report_wake(), WakeIntent::Now);
         debug_assert_ne!(self.receive_wake(), WakeIntent::Now);
@@ -2517,10 +2660,9 @@ impl WorkerState {
         let mut buf = [0u8; 2048];
         let mut datagrams_this_wake: u32 = 0;
         loop {
-            let (len, src) = match self.udp.recv_from(&mut buf) {
-                Ok(value) => value,
-                Err(error) if is_interrupted_io_error(&error) => continue,
-                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+            let (len, src) = match recv_udp_datagram(&self.udp, &mut buf) {
+                Ok(Some(value)) => value,
+                Ok(None) => {
                     // More than one datagram per poll wake means inbound packets
                     // queued in the socket while this single-threaded worker was
                     // busy (sending voice, polling p2p) between wakes. That read
@@ -6356,6 +6498,67 @@ mod tests {
         assert!(!is_interrupted_io_error(&io::Error::from(
             io::ErrorKind::WouldBlock
         )));
+    }
+
+    #[test]
+    fn worker_work_queues_socket_drains_and_forces_zero_timeout() {
+        let mut work = WorkerWork::default();
+        assert_eq!(work.wake(), WakeIntent::Idle);
+
+        work.queue_tcp_read();
+        work.queue_tcp_read();
+        work.queue_udp_drain();
+        work.queue_udp_drain();
+        work.queue_mdns_drain(MDNS_V4);
+        work.queue_mdns_drain(MDNS_V4);
+        work.queue_mdns_drain(MDNS_V6);
+
+        assert_eq!(work.wake(), WakeIntent::Now);
+        let tasks = work.take_tasks().collect::<Vec<_>>();
+        assert_eq!(
+            tasks,
+            vec![
+                WorkerTask::TcpRead,
+                WorkerTask::UdpDrain,
+                WorkerTask::MdnsDrain(MDNS_V4),
+                WorkerTask::MdnsDrain(MDNS_V6),
+            ]
+        );
+        assert_eq!(work.wake(), WakeIntent::Idle);
+    }
+
+    #[test]
+    fn udp_recv_retries_interrupted_before_datagram_or_drain() {
+        let src = "127.0.0.1:12345".parse::<SocketAddr>().unwrap();
+        let mut calls = 0;
+        let mut buf = [0u8; 8];
+
+        let received = recv_udp_datagram_with(&mut buf, |_| {
+            calls += 1;
+            match calls {
+                1 => Err(io::Error::from_raw_os_error(libc::EINTR)),
+                2 => Ok((3, src)),
+                _ => unreachable!("receive loop should return after one datagram"),
+            }
+        })
+        .unwrap();
+
+        assert_eq!(received, Some((3, src)));
+        assert_eq!(calls, 2);
+
+        let mut calls = 0;
+        let drained = recv_udp_datagram_with(&mut buf, |_| {
+            calls += 1;
+            match calls {
+                1 => Err(io::Error::from(io::ErrorKind::Interrupted)),
+                2 => Err(io::Error::from(io::ErrorKind::WouldBlock)),
+                _ => unreachable!("receive loop should stop at WouldBlock"),
+            }
+        })
+        .unwrap();
+
+        assert_eq!(drained, None);
+        assert_eq!(calls, 2);
     }
 
     #[test]
