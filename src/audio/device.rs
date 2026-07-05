@@ -962,6 +962,13 @@ pub(crate) fn select_buffer_size(
     match request {
         BufferRequest::Default => (BufferSize::Default, "host default".to_string()),
         BufferRequest::Fixed(requested) => match supported {
+            // The PipeWire host advertises 0..=0 until the server's clock
+            // metadata arrives. Clamping into that range would request a
+            // zero-sized buffer, so keep the requested size as a preference.
+            SupportedBufferSize::Range { min: 0, max: 0 } => (
+                BufferSize::Fixed(requested),
+                format!("requested {requested}; quantum range unknown"),
+            ),
             SupportedBufferSize::Range { min, max } if requested >= min && requested <= max => (
                 BufferSize::Fixed(requested),
                 format!("requested {requested} frames"),
@@ -1790,6 +1797,24 @@ mod tests {
         assert!(rate_rank(44_100) > rate_rank(SAMPLE_RATE));
         // A range covering no usable rate is rejected.
         assert_eq!(range_stream_rate(&range(22_050, 22_050)), None);
+    }
+
+    #[test]
+    fn zero_quantum_range_keeps_requested_buffer() {
+        // The PipeWire host reports Range { 0, 0 } before clock metadata
+        // arrives; the request must pass through instead of clamping to zero.
+        let (size, note) = select_buffer_size(
+            BufferRequest::Fixed(480),
+            SupportedBufferSize::Range { min: 0, max: 0 },
+        );
+        assert_eq!(size, cpal::BufferSize::Fixed(480));
+        assert!(note.contains("quantum range unknown"));
+
+        let (size, _) = select_buffer_size(
+            BufferRequest::Fixed(480),
+            SupportedBufferSize::Range { min: 32, max: 8192 },
+        );
+        assert_eq!(size, cpal::BufferSize::Fixed(480));
     }
 
     #[test]

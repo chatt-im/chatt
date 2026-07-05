@@ -5,10 +5,13 @@ use std::env;
 use std::path::PathBuf;
 
 fn main() {
-    let libs = system_deps::Config::new()
-        .probe()
-        .expect("Cannot find libpipewire");
-    let libpipewire = libs.get_by_name("libpipewire").unwrap();
+    // Headers are only needed at build time. The library itself is loaded at
+    // runtime via dlopen (see src/lib.rs), so no link flags are emitted and
+    // the resulting binary runs on systems without libpipewire installed.
+    let libpipewire = pkg_config::Config::new()
+        .cargo_metadata(false)
+        .probe("libpipewire-0.3")
+        .expect("Cannot find libpipewire headers (libpipewire-0.3 pkg-config)");
 
     // Tell cargo to invalidate the built crate whenever the wrapper changes
     println!("cargo:rerun-if-changed=wrapper.h");
