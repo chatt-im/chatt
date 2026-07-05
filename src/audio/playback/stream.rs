@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 use crate::audio::{
     playback::{
         LivePlaybackMixerStats, MIX_FRAME_SAMPLES,
-        neteq::{AudioResult, NetEqCore, NetEqDiagnostics, NetEqInsertPlan, NetEqPreparedPacket},
+        neteq::{AudioResult, NetEqCore, NetEqDiagnostics},
     },
     shared::{
         DecodedFrameSource, LiveAudioTuning, TIME_SCALE_NOISE_FLOOR_MS, TIME_SCALE_VAD_RATIO,
@@ -22,7 +22,7 @@ use crate::audio::{
 /// `get_audio_10ms` per 10 ms output block. Both holds are short and never
 /// nest another lock.
 pub(crate) struct SharedNetEqStream {
-    core: NetEqCore,
+    pub(super) core: NetEqCore,
     /// Per-block stat deltas folded by the callback, drained by the worker
     /// through [`Self::take_stats`].
     stats: LivePlaybackMixerStats,
@@ -51,43 +51,6 @@ impl SharedNetEqStream {
             last_voice_rms: 0.0,
             last_voice_active: false,
         })))
-    }
-
-    /// Worker side. See [`NetEqCore::insert_packet`].
-    pub(crate) fn insert_packet(
-        &mut self,
-        now: Instant,
-        timestamp: u32,
-        sequence: u32,
-        flags: u8,
-        opus: &[u8],
-    ) -> bool {
-        self.core
-            .insert_packet(now, timestamp, sequence, flags, opus)
-    }
-
-    /// Worker side: snapshots cheap insertion state so payload preparation can
-    /// run outside the callback-shared mutex.
-    pub(crate) fn insert_plan(&self, timestamp: u32, sequence: u32) -> NetEqInsertPlan {
-        self.core.insert_plan(timestamp, sequence)
-    }
-
-    pub(crate) fn insert_plan_matches(
-        &self,
-        timestamp: u32,
-        sequence: u32,
-        plan: NetEqInsertPlan,
-    ) -> bool {
-        self.core.insert_plan_matches(timestamp, sequence, plan)
-    }
-
-    /// Worker side: commits an already prepared packet into NetEQ.
-    pub(crate) fn insert_prepared_packet(
-        &mut self,
-        now: Instant,
-        prepared: NetEqPreparedPacket,
-    ) -> bool {
-        self.core.insert_prepared_packet(now, prepared)
     }
 
     /// Worker side. See [`NetEqCore::diagnostics`].

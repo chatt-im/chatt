@@ -110,7 +110,7 @@ pub(crate) struct NetEqDiagnostics {
 /// Cheap state the worker snapshots before preparing a packet outside the
 /// callback-shared NetEQ mutex.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct NetEqInsertPlan {
+pub(crate) struct NetEqInsertContext {
     current_gap: u32,
     dred_enabled: bool,
 }
@@ -126,7 +126,7 @@ struct DredParse {
 /// Packet bytes and redundancy expansion prepared before the final NetEQ insert
 /// lock hold.
 pub(crate) struct NetEqPreparedPacket {
-    plan: NetEqInsertPlan,
+    context: NetEqInsertContext,
     timestamp: u32,
     sequence: u32,
     flags: u8,
@@ -137,20 +137,19 @@ pub(crate) struct NetEqPreparedPacket {
 
 impl NetEqPreparedPacket {
     pub(crate) fn prepare(
-        plan: NetEqInsertPlan,
+        context: NetEqInsertContext,
         timestamp: u32,
         sequence: u32,
         flags: u8,
-        opus: &[u8],
+        datagram: Arc<Vec<u8>>,
         dred_decoder: Option<&mut DredDecoder>,
     ) -> Option<Self> {
-        if opus.is_empty() {
+        if datagram.is_empty() {
             return None;
         }
-        let datagram = Arc::new(opus.to_vec());
-        let fec = NetEqCore::parse_fec(opus);
-        let (dred, dred_parse, available_horizon_samples) = if plan.dred_enabled {
-            NetEqCore::parse_dred_for_insert(dred_decoder, sequence, &datagram, plan.current_gap)
+        let fec = NetEqCore::parse_fec(datagram.as_slice());
+        let (dred, dred_parse, available_horizon_samples) = if context.dred_enabled {
+            NetEqCore::parse_dred_for_insert(dred_decoder, sequence, &datagram, context.current_gap)
         } else {
             (None, None, 0)
         };
@@ -158,7 +157,7 @@ impl NetEqPreparedPacket {
             timestamp,
             sequence,
             Arc::clone(&datagram),
-            plan.current_gap,
+            context.current_gap,
             DEFAULT_FRAME_SAMPLES as u32,
             fec,
             dred,
@@ -171,7 +170,7 @@ impl NetEqPreparedPacket {
             primary.muted = true;
         }
         Some(Self {
-            plan,
+            context,
             timestamp,
             sequence,
             flags,
@@ -181,8 +180,8 @@ impl NetEqPreparedPacket {
         })
     }
 
-    pub(crate) fn plan(&self) -> NetEqInsertPlan {
-        self.plan
+    pub(crate) fn context(&self) -> NetEqInsertContext {
+        self.context
     }
 }
 
@@ -421,12 +420,23 @@ impl NetEqCore {
         flags: u8,
         opus: &[u8],
     ) -> bool {
+        self.insert_datagram(now, timestamp, sequence, flags, Arc::new(opus.to_vec()))
+    }
+
+    pub(crate) fn insert_datagram(
+        &mut self,
+        now: Instant,
+        timestamp: u32,
+        sequence: u32,
+        flags: u8,
+        datagram: Arc<Vec<u8>>,
+    ) -> bool {
         let Some(prepared) = NetEqPreparedPacket::prepare(
-            self.insert_plan(timestamp, sequence),
+            self.capture_insert_context(timestamp, sequence),
             timestamp,
             sequence,
             flags,
-            opus,
+            datagram,
             self.dred_decoder.as_mut(),
         ) else {
             return false;
@@ -434,7 +444,11 @@ impl NetEqCore {
         self.insert_prepared_packet(now, prepared)
     }
 
-    pub(crate) fn insert_plan(&self, timestamp: u32, sequence: u32) -> NetEqInsertPlan {
+    pub(crate) fn capture_insert_context(
+        &self,
+        timestamp: u32,
+        sequence: u32,
+    ) -> NetEqInsertContext {
         let playout_timestamp = self.playout_timestamp();
         let sequence_advanced = self
             .last_sequence
@@ -443,7 +457,7 @@ impl NetEqCore {
             && sequence_advanced
             && is_newer_timestamp(playout_timestamp, timestamp)
             && playout_timestamp.wrapping_sub(timestamp) > TIMELINE_REBASE_TOLERANCE_SAMPLES;
-        NetEqInsertPlan {
+        NetEqInsertContext {
             current_gap: if self.first_packet || rebases_timeline {
                 0
             } else {
@@ -451,15 +465,6 @@ impl NetEqCore {
             },
             dred_enabled: self.dred_decoder.is_some(),
         }
-    }
-
-    pub(crate) fn insert_plan_matches(
-        &self,
-        timestamp: u32,
-        sequence: u32,
-        plan: NetEqInsertPlan,
-    ) -> bool {
-        self.insert_plan(timestamp, sequence) == plan
     }
 
     pub(crate) fn insert_prepared_packet(
@@ -1215,7 +1220,7 @@ impl NetEqCore {
         if decoded_len == 0 {
             return;
         }
-        let decoded = self.decoded_buffer[..decoded_len].to_vec();
+        let decoded = &self.decoded_buffer[..decoded_len];
         if matches!(self.last_mode, Mode::Expand | Mode::CodecPlc) {
             // Resuming after concealment: unmute and cross-fade the seam.
             // `process_after_expand` reads/writes the sync buffer and resets
@@ -1238,7 +1243,7 @@ impl NetEqCore {
 
     /// Port of `NetEqImpl::DoMerge`: merge decoded audio onto the expand tail.
     fn do_merge(&mut self, decoded_len: usize) {
-        let decoded = self.decoded_buffer[..decoded_len].to_vec();
+        let decoded = &self.decoded_buffer[..decoded_len];
         let next_index = self.sync_buffer.next_index();
         let result = merge::process(
             &decoded,
@@ -1909,6 +1914,49 @@ mod tests {
                 matches!(packet.payload, PacketPayload::OpusFec(_)) && packet.timestamp == recovered
             }),
             "FEC unit missing from parsed redundancy: {units:?}",
+        );
+    }
+
+    #[test]
+    fn stale_prepared_insert_falls_back_to_serialized_insert() {
+        let mut core = NetEqCore::new(LiveAudioTuning::default()).unwrap();
+        let mut encoder = OpusVoiceEncoder::new(32_000).unwrap();
+        let payload = Arc::new(encode_tone(&mut encoder, 0));
+        let timestamp = 3 * LIVE_OPUS_FRAME_SAMPLES as u32;
+        let sequence = 7;
+
+        core.first_packet = false;
+        let context_before = core.capture_insert_context(timestamp, sequence);
+        assert!(context_before.current_gap > 0);
+        let prepared = NetEqPreparedPacket::prepare(
+            context_before,
+            timestamp,
+            sequence,
+            0,
+            Arc::clone(&payload),
+            core.dred_decoder.as_mut(),
+        )
+        .expect("valid payload prepares");
+
+        core.sync_buffer
+            .increase_end_timestamp(LIVE_OPUS_FRAME_SAMPLES as u32);
+        let context_after = core.capture_insert_context(timestamp, sequence);
+        assert_ne!(context_after, prepared.context());
+
+        let late = if context_after == prepared.context() {
+            core.insert_prepared_packet(Instant::now(), prepared)
+        } else {
+            core.insert_datagram(Instant::now(), timestamp, sequence, 0, payload)
+        };
+
+        assert!(!late);
+        assert_eq!(core.packet_buffer.num_packets(), 1);
+        assert_eq!(
+            core.packet_buffer
+                .peek_next_packet()
+                .expect("inserted packet")
+                .timestamp,
+            timestamp,
         );
     }
 

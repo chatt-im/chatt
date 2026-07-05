@@ -373,24 +373,33 @@ impl LiveDecodeStreams {
         packet: RemoteVoicePacket,
         now: Instant,
     ) -> Option<InsertOutcome> {
-        if !self.ensure_entry(packet.stream_id) {
+        let RemoteVoicePacket {
+            stream_id,
+            sequence,
+            timestamp,
+            flags,
+            payload,
+            received_at: _,
+        } = packet;
+        if !self.ensure_entry(stream_id) {
             return None;
         }
-        let stream = self.streams.get_mut(&packet.stream_id)?;
-        if packet.payload.is_silence() {
-            let muted = packet.flags & LIVE_PACKET_FLAG_MUTE != 0;
-            stream.observe_sender_silence(packet.stream_id, packet.sequence, muted, now);
-            return Some(InsertOutcome::Accepted);
+        let stream = self.streams.get_mut(&stream_id)?;
+        match payload {
+            VoicePayload::Silence => {
+                let muted = flags & LIVE_PACKET_FLAG_MUTE != 0;
+                stream.observe_sender_silence(stream_id, sequence, muted, now);
+                Some(InsertOutcome::Accepted)
+            }
+            VoicePayload::Opus(opus) => {
+                let late = stream.insert_audio(timestamp, sequence, flags, opus, now);
+                Some(if late {
+                    InsertOutcome::Late
+                } else {
+                    InsertOutcome::Accepted
+                })
+            }
         }
-        let VoicePayload::Opus(opus) = &packet.payload else {
-            return Some(InsertOutcome::Accepted);
-        };
-        let late = stream.insert_audio(packet.timestamp, packet.sequence, packet.flags, opus, now);
-        Some(if late {
-            InsertOutcome::Late
-        } else {
-            InsertOutcome::Accepted
-        })
     }
 
     pub(crate) fn remove_stream(&mut self, stream_id: u32) {
@@ -752,7 +761,7 @@ impl LiveDecodeStream {
         timestamp: u32,
         sequence: u32,
         flags: u8,
-        opus: &[u8],
+        opus: Vec<u8>,
         now: Instant,
     ) -> bool {
         self.feedback.observe_insert(sequence, flags, now);
@@ -774,39 +783,29 @@ impl LiveDecodeStream {
         } else {
             flags
         };
-        let mut plan = lock_shared_stream(&self.shared).insert_plan(timestamp, sequence);
-        for _ in 0..3 {
-            let Some(prepared) = NetEqPreparedPacket::prepare(
-                plan,
-                timestamp,
-                sequence,
-                effective_flags,
-                opus,
-                self.dred_parser.as_mut(),
-            ) else {
-                return false;
-            };
-            let mut shared = lock_shared_stream(&self.shared);
-            if shared.insert_plan_matches(timestamp, sequence, prepared.plan()) {
-                shared.set_idle_expand_stats_suppressed(false);
-                return shared.insert_prepared_packet(now, prepared);
-            }
-            plan = shared.insert_plan(timestamp, sequence);
-        }
-
+        let datagram = Arc::new(opus);
+        let context = lock_shared_stream(&self.shared)
+            .core
+            .capture_insert_context(timestamp, sequence);
         let Some(prepared) = NetEqPreparedPacket::prepare(
-            plan,
+            context,
             timestamp,
             sequence,
             effective_flags,
-            opus,
+            Arc::clone(&datagram),
             self.dred_parser.as_mut(),
         ) else {
             return false;
         };
         let mut shared = lock_shared_stream(&self.shared);
         shared.set_idle_expand_stats_suppressed(false);
-        shared.insert_prepared_packet(now, prepared)
+        if shared.core.capture_insert_context(timestamp, sequence) == prepared.context() {
+            return shared.core.insert_prepared_packet(now, prepared);
+        }
+
+        shared
+            .core
+            .insert_datagram(now, timestamp, sequence, effective_flags, datagram)
     }
 
     pub(crate) fn observe_sender_silence(
@@ -1107,7 +1106,7 @@ mod tests {
 
         for seq in 0..4u32 {
             let opus = tone_packet(&mut encoder, seq as usize * LIVE_OPUS_FRAME_SAMPLES);
-            stream.insert_audio(seq * LIVE_OPUS_FRAME_SAMPLES as u32, seq, 0, &opus, now);
+            stream.insert_audio(seq * LIVE_OPUS_FRAME_SAMPLES as u32, seq, 0, opus, now);
             lock_shared_stream(&stream.shared).get_audio_10ms(now, &mut output);
         }
         for _ in 0..700 {
@@ -1179,7 +1178,7 @@ mod tests {
             .streams
             .get_mut(&7)
             .unwrap()
-            .insert_audio(0, 0, 0, &opus, now);
+            .insert_audio(0, 0, 0, opus, now);
 
         let queue = SpscSwapQueue::<LivePlaybackMixerEvent>::with_capacity(1);
         let mut filler = LivePlaybackMixerEvent::StopStream { stream_id: 99 };
