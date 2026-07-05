@@ -177,13 +177,15 @@ struct ReadPumpOutcome {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum LoopTask {
-    ClientRead(Token),
+struct UdpDrainTasks {
+    mask: u8,
 }
 
 #[derive(Debug, Default)]
 struct LoopWork {
-    tasks: Vec<LoopTask>,
+    accept_clients: bool,
+    udp_drains: u8,
+    client_reads: VecDeque<Token>,
 }
 
 impl LoopWork {
@@ -198,36 +200,102 @@ impl LoopWork {
 
     #[inline]
     fn has_immediate_work(&self) -> bool {
-        !self.tasks.is_empty()
+        self.accept_clients || self.udp_drains != 0 || !self.client_reads.is_empty()
     }
 
     #[inline]
     fn queue_client_read(&mut self, token: Token) {
-        let task = LoopTask::ClientRead(token);
-        if !self.tasks.contains(&task) {
-            self.tasks.push(task);
+        if !self.client_reads.contains(&token) {
+            self.client_reads.push_back(token);
+        }
+    }
+
+    #[inline]
+    fn queue_accept_clients(&mut self) {
+        self.accept_clients = true;
+    }
+
+    #[inline]
+    fn queue_udp_drain(&mut self, probe_id: u8) {
+        match probe_id {
+            0 | 1 => self.udp_drains |= 1 << probe_id,
+            _ => debug_assert!(probe_id <= 1),
         }
     }
 
     #[inline]
     fn has_client_read(&self, token: Token) -> bool {
-        self.tasks.contains(&LoopTask::ClientRead(token))
+        self.client_reads.contains(&token)
     }
 
     #[inline]
-    fn take_tasks(&mut self) -> Vec<LoopTask> {
-        std::mem::take(&mut self.tasks)
+    fn take_accept_clients(&mut self) -> bool {
+        let accept_clients = self.accept_clients;
+        self.accept_clients = false;
+        accept_clients
+    }
+
+    #[inline]
+    fn take_udp_drains(&mut self) -> UdpDrainTasks {
+        let mask = self.udp_drains;
+        self.udp_drains = 0;
+        UdpDrainTasks { mask }
+    }
+
+    #[inline]
+    fn client_read_count(&self) -> usize {
+        self.client_reads.len()
+    }
+
+    #[inline]
+    fn pop_client_read(&mut self) -> Option<Token> {
+        self.client_reads.pop_front()
     }
 
     #[cfg(test)]
     fn queued_client_reads(&self) -> Vec<Token> {
-        self.tasks
-            .iter()
-            .map(|task| match *task {
-                LoopTask::ClientRead(token) => token,
-            })
-            .collect()
+        self.client_reads.iter().copied().collect()
     }
+}
+
+impl Iterator for UdpDrainTasks {
+    type Item = u8;
+
+    #[inline]
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.mask & 1 != 0 {
+            self.mask &= !1;
+            return Some(0);
+        }
+        if self.mask & 2 != 0 {
+            self.mask &= !2;
+            return Some(1);
+        }
+        None
+    }
+}
+
+#[inline]
+fn recv_udp_datagram_with(
+    buf: &mut [u8],
+    mut recv_from: impl FnMut(&mut [u8]) -> io::Result<(usize, SocketAddr)>,
+) -> io::Result<Option<(usize, SocketAddr)>> {
+    loop {
+        match recv_from(buf) {
+            Ok(value) => return Ok(Some(value)),
+            Err(error) if is_interrupted_io_error(&error) => continue,
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(None),
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+#[inline]
+fn recv_udp_datagram(
+    socket: &UdpSocket,
+    buf: &mut [u8],
+) -> io::Result<Option<(usize, SocketAddr)>> {
+    recv_udp_datagram_with(buf, |buf| socket.recv_from(buf))
 }
 
 #[inline]
@@ -578,9 +646,9 @@ impl Server {
             }
             for event in events.iter() {
                 match event.token() {
-                    LISTENER => self.accept_clients()?,
-                    UDP => self.receive_udp(0),
-                    UDP_PROBE => self.receive_udp(1),
+                    LISTENER => self.loop_work.queue_accept_clients(),
+                    UDP => self.loop_work.queue_udp_drain(0),
+                    UDP_PROBE => self.loop_work.queue_udp_drain(1),
                     // Wake-only; replies drain unconditionally below.
                     WAKER => {}
                     token => {
@@ -596,10 +664,16 @@ impl Server {
                     }
                 }
             }
-            let loop_tasks = self.loop_work.take_tasks();
-            for task in loop_tasks {
-                match task {
-                    LoopTask::ClientRead(token) => self.read_client(token),
+            if self.loop_work.take_accept_clients() {
+                self.accept_clients()?;
+            }
+            for probe_id in self.loop_work.take_udp_drains() {
+                self.receive_udp(probe_id);
+            }
+            let client_read_count = self.loop_work.client_read_count();
+            for _ in 0..client_read_count {
+                if let Some(token) = self.loop_work.pop_client_read() {
+                    self.read_client(token);
                 }
             }
             self.requeue_unclogged_uploaders();
@@ -676,6 +750,7 @@ impl Server {
                     // the same error and starve existing clients harder.
                     kvlog::warn!("transient tcp accept failure", error = %error);
                     thread::sleep(ACCEPT_ERROR_BACKOFF);
+                    self.loop_work.queue_accept_clients();
                     return Ok(());
                 }
                 Err(error) => return Err(error),
@@ -3480,17 +3555,16 @@ impl Server {
         let mut buf = [0u8; 2048];
         loop {
             let received = if probe_id == 0 {
-                self.udp.recv_from(&mut buf)
+                recv_udp_datagram(&self.udp, &mut buf)
             } else {
                 let Some(udp_probe) = self.udp_probe.as_mut() else {
                     return;
                 };
-                udp_probe.recv_from(&mut buf)
+                recv_udp_datagram(udp_probe, &mut buf)
             };
             let (len, src) = match received {
-                Ok(value) => value,
-                Err(error) if is_interrupted_io_error(&error) => continue,
-                Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
+                Ok(Some(value)) => value,
+                Ok(None) => break,
                 Err(error) => {
                     kvlog::warn!("udp receive failed", error = %error);
                     break;
@@ -6969,13 +7043,58 @@ mod tests {
         let mut work = LoopWork::default();
         assert_eq!(work.poll_timeout(POLL_TIMEOUT), POLL_TIMEOUT);
 
+        work.queue_accept_clients();
+        work.queue_accept_clients();
+        work.queue_udp_drain(0);
+        work.queue_udp_drain(0);
+        work.queue_udp_drain(1);
         work.queue_client_read(Token(7));
         work.queue_client_read(Token(7));
 
         assert_eq!(work.poll_timeout(POLL_TIMEOUT), Duration::ZERO);
+        assert!(work.take_accept_clients());
+        assert!(!work.take_accept_clients());
+        assert_eq!(work.take_udp_drains().collect::<Vec<_>>(), vec![0, 1]);
+        assert!(work.take_udp_drains().next().is_none());
         assert_eq!(work.queued_client_reads(), vec![Token(7)]);
-        assert_eq!(work.take_tasks(), vec![LoopTask::ClientRead(Token(7))]);
+        assert_eq!(work.client_read_count(), 1);
+        assert_eq!(work.pop_client_read(), Some(Token(7)));
+        assert_eq!(work.pop_client_read(), None);
         assert_eq!(work.poll_timeout(POLL_TIMEOUT), POLL_TIMEOUT);
+    }
+
+    #[test]
+    fn udp_recv_retries_interrupted_before_datagram_or_drain() {
+        let src = "127.0.0.1:12345".parse::<SocketAddr>().unwrap();
+        let mut calls = 0;
+        let mut buf = [0u8; 8];
+
+        let received = recv_udp_datagram_with(&mut buf, |_| {
+            calls += 1;
+            match calls {
+                1 => Err(io::Error::from_raw_os_error(libc::EINTR)),
+                2 => Ok((3, src)),
+                _ => unreachable!("receive loop should return after one datagram"),
+            }
+        })
+        .unwrap();
+
+        assert_eq!(received, Some((3, src)));
+        assert_eq!(calls, 2);
+
+        let mut calls = 0;
+        let drained = recv_udp_datagram_with(&mut buf, |_| {
+            calls += 1;
+            match calls {
+                1 => Err(io::Error::from(io::ErrorKind::Interrupted)),
+                2 => Err(io::Error::from(io::ErrorKind::WouldBlock)),
+                _ => unreachable!("receive loop should stop at WouldBlock"),
+            }
+        })
+        .unwrap();
+
+        assert_eq!(drained, None);
+        assert_eq!(calls, 2);
     }
 
     #[test]
