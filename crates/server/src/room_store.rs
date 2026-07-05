@@ -10,18 +10,30 @@
 //! that must survive restarts: per-room message-id watermarks (so ids are
 //! never reused) and the registry of runtime-created DM rooms.
 //!
+//! # Durability scope
+//!
+//! Log appends and state writes reach the OS through ordinary writes with no
+//! fsync on the append path, so durable rooms survive a process crash (the
+//! page cache persists) but not power loss or a kernel crash. After such an
+//! unclean shutdown the loader truncates the torn log tail while message ids
+//! keep advancing, so a client that saw the lost messages observes a gap.
+//! Fsync-on-a-timer is the upgrade path if that trade stops being acceptable.
+//!
 //! Message ids are per-room, monotonic from 1, and durable. Allocation uses a
-//! block reservation: the persisted watermark is rounded up to the next
-//! [`MESSAGE_ID_RESERVE`] boundary whenever an allocation crosses it, so rooms
-//! without durable logs cost one state write per block instead of one per
-//! message. A restart resumes from the watermark, skipping at most
-//! `MESSAGE_ID_RESERVE - 1` ids.
+//! block reservation: whenever the remaining reservation drops below half a
+//! block, the watermark advances past the next [`MESSAGE_ID_RESERVE`]
+//! boundary and the new value is queued to the background state writer, so
+//! the write lands while ids from the still-reserved region are handed out.
+//! A restart resumes from the watermark, skipping at most
+//! `2 * MESSAGE_ID_RESERVE - 1` ids.
 
 use hashbrown::HashMap;
 use std::{
     fs::{self, File, OpenOptions},
     io::Write,
     path::{Path, PathBuf},
+    sync::mpsc,
+    thread,
 };
 
 use rpc::{
@@ -34,12 +46,9 @@ use toml_spanner::Toml;
 use crate::config::{FIRST_DYNAMIC_ROOM_ID, RoomConfig, RoomPersistenceConfig, atomic_write_toml};
 use crate::history_reader::{HistoryReadRequest, Source};
 
-/// Message-id block reserved per state write; a restart skips at most this
-/// many ids per room.
+/// Message-id block reserved per state write; a restart skips at most twice
+/// this many ids per room.
 pub const MESSAGE_ID_RESERVE: u64 = 1024;
-/// Upper bound on one serialized log record; larger frames mark the log tail
-/// corrupt.
-const MAX_LOG_RECORD_BYTES: u32 = 128 * 1024;
 /// Active durable log size that triggers rotation into an immutable
 /// id-named segment.
 const MAX_ACTIVE_LOG_BYTES: u64 = 4 * 1024 * 1024;
@@ -87,12 +96,33 @@ enum Retention {
     },
     Durable {
         history: ResidentHistory,
-        file: Option<File>,
+        file: ActiveLog,
         active_bytes: u64,
         path: Option<PathBuf>,
         active_first_id: Option<MessageId>,
         segments: Vec<Segment>,
     },
+}
+
+/// Write state of a durable room's active log file.
+enum ActiveLog {
+    Open(File),
+    /// Rotation renamed the old log away but the fresh open failed; the path
+    /// is free, so a later append retries the open.
+    Reopen,
+    /// Appending would place records after unrepaired corruption or a torn
+    /// write; the room keeps only resident history for the rest of the
+    /// process.
+    Disabled,
+}
+
+impl ActiveLog {
+    fn open(&self) -> Option<&File> {
+        match self {
+            ActiveLog::Open(file) => Some(file),
+            ActiveLog::Reopen | ActiveLog::Disabled => None,
+        }
+    }
 }
 
 /// An immutable rotated log file, named `<log>.<first-message-id>` so the
@@ -150,9 +180,13 @@ impl HistoryFetchPlan {
     }
 }
 
+/// One planned wire chunk, anchored to the id of its oldest message so an
+/// intervening resident trim is detected at encode time instead of silently
+/// shifting the range onto newer entries.
 struct HistoryChunkSpec {
-    start: usize,
-    end: usize,
+    /// Id of the chunk's oldest message; `None` for the empty terminal chunk.
+    first_id: Option<MessageId>,
+    count: usize,
     records_bytes: usize,
     at_start: bool,
     complete: bool,
@@ -238,28 +272,6 @@ impl ResidentHistory {
         }
     }
 
-    fn recent(&self, max: usize) -> Vec<ChatMessage> {
-        let entries = self.entries();
-        let skip = entries.len().saturating_sub(max);
-        self.decode_entries(&entries[skip..])
-    }
-
-    fn messages_before(
-        &self,
-        before: Option<MessageId>,
-        limit: usize,
-        has_older_on_disk: bool,
-    ) -> (Vec<ChatMessage>, bool) {
-        let entries = self.entries();
-        let end = match before {
-            Some(before) => entries.partition_point(|entry| entry.message_id < before),
-            None => entries.len(),
-        };
-        let start = end.saturating_sub(limit);
-        let at_start = start == 0 && !has_older_on_disk;
-        (self.decode_entries(&entries[start..end]), at_start)
-    }
-
     fn history_chunks_before(
         &self,
         room_id: RoomId,
@@ -276,28 +288,13 @@ impl ResidentHistory {
         let start = end.saturating_sub(limit);
         let selected = &entries[start..end];
         let at_start = start == 0 && !has_older_on_disk;
-        let mut chunks = self.chunk_specs(selected, at_start, target_bytes);
-        for chunk in &mut chunks {
-            chunk.start += start;
-            chunk.end += start;
-        }
         HistoryFetchPlan {
             room_id,
             before,
-            chunks,
+            chunks: self.chunk_specs(selected, at_start, target_bytes),
             message_count: selected.len(),
             at_start,
         }
-    }
-
-    fn decode_entries(&self, entries: &[HistoryEntry]) -> Vec<ChatMessage> {
-        entries
-            .iter()
-            .map(|entry| {
-                history::decode_message(self.record(*entry))
-                    .expect("resident history record should remain valid")
-            })
-            .collect()
     }
 
     fn chunk_specs(
@@ -308,8 +305,8 @@ impl ResidentHistory {
     ) -> Vec<HistoryChunkSpec> {
         if entries.is_empty() {
             return vec![HistoryChunkSpec {
-                start: 0,
-                end: 0,
+                first_id: None,
+                count: 0,
                 records_bytes: 0,
                 at_start,
                 complete: true,
@@ -324,7 +321,7 @@ impl ResidentHistory {
         let mut count = 0usize;
         for (index, entry) in entries.iter().enumerate() {
             let would_exceed_bytes = count > 0 && bytes.saturating_add(entry.len) > target_bytes;
-            let would_exceed_count = count == u16::MAX as usize;
+            let would_exceed_count = count == history::MAX_CHUNK_MESSAGES;
             if would_exceed_bytes || would_exceed_count {
                 ranges.push((start, index, records_bytes));
                 start = index;
@@ -343,8 +340,8 @@ impl ResidentHistory {
         for (send_index, (start, end, records_bytes)) in ranges.into_iter().rev().enumerate() {
             let complete = send_index + 1 == chunk_count;
             chunks.push(HistoryChunkSpec {
-                start,
-                end,
+                first_id: Some(entries[start].message_id),
+                count: end - start,
                 records_bytes,
                 at_start: complete && at_start,
                 complete,
@@ -359,9 +356,23 @@ impl ResidentHistory {
         before: Option<MessageId>,
         spec: &HistoryChunkSpec,
     ) -> Result<Vec<u8>, String> {
+        let stale = || "history fetch plan no longer matches retained history".to_string();
         let entries = self.entries();
-        let Some(chunk_entries) = entries.get(spec.start..spec.end) else {
-            return Err("history fetch plan no longer matches retained history".to_string());
+        let chunk_entries = match spec.first_id {
+            None => &[] as &[HistoryEntry],
+            Some(first_id) => {
+                let start = entries.partition_point(|entry| entry.message_id < first_id);
+                let Some(chunk_entries) = start
+                    .checked_add(spec.count)
+                    .and_then(|end| entries.get(start..end))
+                else {
+                    return Err(stale());
+                };
+                if chunk_entries.first().map(|entry| entry.message_id) != Some(first_id) {
+                    return Err(stale());
+                }
+                chunk_entries
+            }
         };
         let mut payload = Vec::with_capacity(history::CHUNK_HEADER_BYTES + spec.records_bytes);
         history::write_chunk_header(
@@ -441,6 +452,7 @@ impl ResidentHistory {
 
 pub struct RoomStore {
     data_dir: Option<PathBuf>,
+    state_writer: Option<StateWriter>,
     tuning: StoreTuning,
     next_room_id: u32,
     next_ids: HashMap<RoomId, u64>,
@@ -486,8 +498,12 @@ impl RoomStore {
         if let Some(dir) = &data_dir {
             next_room_id = next_room_id.max(next_room_id_above_existing_logs(dir));
         }
+        let state_writer = data_dir
+            .as_deref()
+            .map(|dir| StateWriter::spawn(dir.join(STATE_FILE)));
         let mut store = Self {
             data_dir,
+            state_writer,
             tuning,
             next_room_id,
             next_ids: HashMap::new(),
@@ -555,7 +571,7 @@ impl RoomStore {
         let Some(dir) = &self.data_dir else {
             return Retention::Durable {
                 history: ResidentHistory::default(),
-                file: None,
+                file: ActiveLog::Disabled,
                 active_bytes: 0,
                 path: None,
                 active_first_id: None,
@@ -596,17 +612,19 @@ impl RoomStore {
                 "durable room log tail unrepaired; retention degraded to memory",
                 room_id = room_id.0
             );
-            None
+            ActiveLog::Disabled
         } else {
-            open_active_log(&path)
-                .map_err(|error| {
+            match open_active_log(&path) {
+                Ok(open) => ActiveLog::Open(open),
+                Err(error) => {
                     kvlog::error!(
                         "durable room log open failed; retention degraded to memory",
                         room_id = room_id.0,
                         error = error.to_string().as_str()
                     );
-                })
-                .ok()
+                    ActiveLog::Disabled
+                }
+            }
         };
         Retention::Durable {
             history,
@@ -618,16 +636,22 @@ impl RoomStore {
         }
     }
 
-    /// Hands out the next message id for the room, persisting a new watermark
-    /// block when the reservation is exhausted.
+    /// Hands out the next message id for the room, queueing a new watermark
+    /// block to the background state writer when the remaining reservation
+    /// drops below half a block.
+    ///
+    /// The half-block headroom lets the write land off the event loop while
+    /// ids from the still-reserved region keep flowing; the persisted
+    /// watermark only ever advances, and durable rooms additionally recover
+    /// their next id from the log itself.
     pub fn allocate_message_id(&mut self, room_id: RoomId) -> MessageId {
         let next = self.next_ids.entry(room_id).or_insert(1);
         let id = *next;
         *next += 1;
         let watermark = self.watermarks.entry(room_id).or_insert(0);
-        if id >= *watermark {
-            *watermark = (id + 1).next_multiple_of(MESSAGE_ID_RESERVE);
-            self.persist_state();
+        if id + MESSAGE_ID_RESERVE / 2 >= *watermark {
+            *watermark = (id + 1 + MESSAGE_ID_RESERVE).next_multiple_of(MESSAGE_ID_RESERVE);
+            self.queue_persist_state();
         }
         MessageId(id)
     }
@@ -659,7 +683,17 @@ impl RoomStore {
                 segments,
             } => {
                 let (start, len) = history.append_message(message);
-                if let Some(open) = file {
+                if matches!(file, ActiveLog::Reopen)
+                    && let Some(path) = path.as_deref()
+                    && let Ok(fresh) = open_active_log(path)
+                {
+                    kvlog::info!(
+                        "durable room log reopened after failed rotation",
+                        room_id = room_id.0
+                    );
+                    *file = ActiveLog::Open(fresh);
+                }
+                if let ActiveLog::Open(open) = file {
                     let record = history.record_range(start, len);
                     match write_log_record(open, record) {
                         Ok(written) => {
@@ -668,13 +702,23 @@ impl RoomStore {
                             }
                             *active_bytes += written as u64;
                         }
+                        // An InvalidInput record was rejected before any byte
+                        // reached the file, so the log framing stays intact;
+                        // only this record is dropped from the durable copy.
+                        Err(error) if error.kind() == std::io::ErrorKind::InvalidInput => {
+                            kvlog::error!(
+                                "history record exceeds the log record cap; message not persisted",
+                                room_id = room_id.0,
+                                message_id = message.message_id.0
+                            );
+                        }
                         Err(error) => {
                             kvlog::error!(
                                 "durable room log append failed; retention degraded to memory",
                                 room_id = room_id.0,
                                 error = error.to_string().as_str()
                             );
-                            *file = None;
+                            *file = ActiveLog::Disabled;
                         }
                     }
                 }
@@ -689,11 +733,11 @@ impl RoomStore {
         }
     }
 
-    /// The most recent `max` retained messages, oldest first.
-    pub fn recent(&self, room_id: RoomId, max: usize) -> Vec<ChatMessage> {
-        self.resident(room_id)
-            .map(|history| history.recent(max))
-            .unwrap_or_default()
+    /// Test-only: the most recent `max` retained messages, oldest first,
+    /// served through the live fetch-plan path.
+    #[cfg(test)]
+    pub(crate) fn recent(&self, room_id: RoomId, max: usize) -> Vec<ChatMessage> {
+        self.messages_before(room_id, None, max).0
     }
 
     /// Latest message id assigned in the room, `None` before the first message.
@@ -701,24 +745,28 @@ impl RoomStore {
         self.heads.get(&room_id).copied()
     }
 
-    /// Resident messages strictly before `before` (or the newest when
-    /// `None`), oldest first, at most `limit`. The bool is true when the
-    /// returned slice reaches the oldest message retained anywhere, including
-    /// on disk.
-    pub fn messages_before(
+    /// Test-only view of one resident history page, decoded from the same
+    /// plan-and-encode path production uses so pagination has a single
+    /// implementation. The bool is the page's `at_start`.
+    #[cfg(test)]
+    pub(crate) fn messages_before(
         &self,
         room_id: RoomId,
         before: Option<MessageId>,
         limit: usize,
     ) -> (Vec<ChatMessage>, bool) {
-        let Some(retention) = self.rooms.get(&room_id) else {
-            return (Vec::new(), true);
-        };
-        let has_older = retention.has_unresident_history();
-        match retention.history().filter(|history| !history.is_empty()) {
-            Some(history) => history.messages_before(before, limit, has_older),
-            None => (Vec::new(), !has_older),
+        let plan = self.history_fetch_plan_before(room_id, before, limit, usize::MAX);
+        let mut messages = Vec::new();
+        for chunk_index in 0..plan.chunk_count() {
+            let payload = self
+                .encode_history_chunk(&plan, chunk_index)
+                .expect("plan encodes before any retention change");
+            let chunk = history::decode_chunk(&payload)
+                .expect("planned chunk decodes")
+                .expect("planned chunk carries the magic");
+            messages.splice(0..0, chunk.messages);
         }
+        (messages, plan.at_start)
     }
 
     pub fn history_fetch_plan_before(
@@ -733,7 +781,7 @@ impl RoomStore {
         let resident = retention
             .and_then(Retention::history)
             .filter(|history| !history.is_empty());
-        match resident {
+        let mut plan = match resident {
             Some(history) => {
                 history.history_chunks_before(room_id, before, limit, target_bytes, has_older)
             }
@@ -741,16 +789,32 @@ impl RoomStore {
                 room_id,
                 before,
                 chunks: vec![HistoryChunkSpec {
-                    start: 0,
-                    end: 0,
+                    first_id: None,
+                    count: 0,
                     records_bytes: 0,
-                    at_start: !has_older,
+                    at_start: false,
                     complete: true,
                 }],
                 message_count: 0,
-                at_start: !has_older,
+                at_start: false,
             },
+        };
+        if plan.message_count == 0 {
+            // An empty page is the true start only when nothing older than
+            // `before` survives anywhere. Residency alone would claim older
+            // history that `disk_fetch_request` then refuses to serve,
+            // sending clients into a re-request loop.
+            let before_bound = before.unwrap_or(MessageId(u64::MAX));
+            let at_start = match retention.and_then(Retention::oldest_durable_id) {
+                Some(oldest_durable) => oldest_durable >= before_bound,
+                None => true,
+            };
+            plan.at_start = at_start;
+            for chunk in &mut plan.chunks {
+                chunk.at_start = at_start;
+            }
         }
+        plan
     }
 
     /// Builds the background read request serving history strictly before
@@ -783,7 +847,7 @@ impl RoomStore {
         let sources = 'sources: {
             let mut sources = Vec::new();
             if active_first_id.is_some_and(|first| first < before_bound) {
-                let clone = file.as_ref().and_then(|open| {
+                let clone = file.open().and_then(|open| {
                     open.try_clone()
                         .map_err(|error| {
                             kvlog::warn!(
@@ -833,7 +897,7 @@ impl RoomStore {
         let Some(spec) = plan.chunks.get(chunk_index) else {
             return Err("history chunk index is out of range".to_string());
         };
-        if spec.start == spec.end {
+        if spec.first_id.is_none() {
             let mut payload = Vec::with_capacity(history::CHUNK_HEADER_BYTES);
             history::write_chunk_header(
                 plan.room_id,
@@ -910,19 +974,28 @@ impl RoomStore {
         Ok(room_id)
     }
 
-    fn persist_state(&self) {
-        if let Err(error) = self.try_persist_state() {
-            kvlog::error!(
-                "room state write failed; ids may repeat after restart",
-                error = error.as_str()
-            );
-        }
+    /// Queues a state snapshot to the background writer without waiting for
+    /// the write; used on the message hot path where an fsync stall must not
+    /// block the event loop.
+    fn queue_persist_state(&self) {
+        let Some(writer) = &self.state_writer else {
+            return;
+        };
+        writer.enqueue(self.state_snapshot());
     }
 
+    /// Writes a state snapshot through the background writer and waits for
+    /// the result, so rare callers like DM creation can roll back on failure.
+    /// Routing through the writer keeps a single ordered stream of `state.toml`
+    /// writes; a queued older snapshot can never clobber a newer one.
     fn try_persist_state(&self) -> Result<(), String> {
-        let Some(dir) = &self.data_dir else {
+        let Some(writer) = &self.state_writer else {
             return Ok(());
         };
+        writer.write_sync(self.state_snapshot())
+    }
+
+    fn state_snapshot(&self) -> String {
         let mut watermarks: Vec<(u32, u64)> = self
             .watermarks
             .iter()
@@ -943,7 +1016,96 @@ impl RoomStore {
                 dm.room_id.0, dm.user_a.0, dm.user_b.0, dm.created_at_ms
             ));
         }
-        atomic_write_toml(&dir.join(STATE_FILE), &out)
+        out
+    }
+}
+
+/// One queued rewrite of `state.toml`; `reply` is present when the caller
+/// waits for the write result.
+struct StateWrite {
+    snapshot: String,
+    reply: Option<mpsc::SyncSender<Result<(), String>>>,
+}
+
+/// Background `state.toml` writer thread. Snapshots are complete state, so
+/// queued writes coalesce to the newest one, and every drained waiter gets
+/// the result of the write that covered its snapshot. Dropping the writer
+/// flushes the queue before returning, so a clean shutdown persists the
+/// final watermarks.
+struct StateWriter {
+    sender: Option<mpsc::Sender<StateWrite>>,
+    thread: Option<thread::JoinHandle<()>>,
+}
+
+impl StateWriter {
+    fn spawn(path: PathBuf) -> Self {
+        let (sender, receiver) = mpsc::channel::<StateWrite>();
+        let thread = thread::spawn(move || {
+            while let Ok(first) = receiver.recv() {
+                let mut batch = vec![first];
+                while let Ok(more) = receiver.try_recv() {
+                    batch.push(more);
+                }
+                let newest = &batch[batch.len() - 1].snapshot;
+                let result = atomic_write_toml(&path, newest);
+                if let Err(error) = &result {
+                    kvlog::error!(
+                        "room state write failed; ids may repeat after restart",
+                        error = error.as_str()
+                    );
+                }
+                for write in batch {
+                    let Some(reply) = write.reply else {
+                        continue;
+                    };
+                    let _ = reply.send(result.clone());
+                }
+            }
+        });
+        Self {
+            sender: Some(sender),
+            thread: Some(thread),
+        }
+    }
+
+    fn enqueue(&self, snapshot: String) {
+        let Some(sender) = &self.sender else {
+            return;
+        };
+        if sender
+            .send(StateWrite {
+                snapshot,
+                reply: None,
+            })
+            .is_err()
+        {
+            kvlog::error!("room state writer gone; ids may repeat after restart");
+        }
+    }
+
+    fn write_sync(&self, snapshot: String) -> Result<(), String> {
+        let gone = || "room state writer thread is gone".to_string();
+        let Some(sender) = &self.sender else {
+            return Err(gone());
+        };
+        let (reply, done) = mpsc::sync_channel(1);
+        sender
+            .send(StateWrite {
+                snapshot,
+                reply: Some(reply),
+            })
+            .map_err(|_| gone())?;
+        done.recv().map_err(|_| gone())?
+    }
+}
+
+impl Drop for StateWriter {
+    fn drop(&mut self) {
+        drop(self.sender.take());
+        let Some(thread) = self.thread.take() else {
+            return;
+        };
+        let _ = thread.join();
     }
 }
 
@@ -1025,13 +1187,18 @@ fn load_state(dir: &Path) -> StoreState {
     }
 }
 
+/// Appends one `len:u32 | record` frame, rejecting records the loader would
+/// treat as a corrupt tail. Without the write-time check an oversized record
+/// would append fine and the next startup's tail repair would silently drop
+/// it and every later message.
 fn write_log_record(file: &mut File, payload: &[u8]) -> std::io::Result<usize> {
-    let len = u32::try_from(payload.len()).map_err(|_| {
-        std::io::Error::new(
+    if payload.len() > history::MAX_LOG_RECORD_BYTES as usize {
+        return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
-            "history record exceeds log length field",
-        )
-    })?;
+            "history record exceeds the log record cap",
+        ));
+    }
+    let len = payload.len() as u32;
     file.write_all(&len.to_le_bytes())?;
     file.write_all(payload)?;
     Ok(4 + payload.len())
@@ -1084,7 +1251,7 @@ impl<'a> LogRecords<'a> {
                 .try_into()
                 .expect("4 bytes"),
         );
-        if len > MAX_LOG_RECORD_BYTES {
+        if len > history::MAX_LOG_RECORD_BYTES {
             return None;
         }
         let len = len as usize;
@@ -1155,7 +1322,7 @@ fn truncate_log(path: &Path, valid_bytes: u64) -> std::io::Result<()> {
 
 fn rotate_log(
     path: &Path,
-    file: &mut Option<File>,
+    file: &mut ActiveLog,
     active_bytes: &mut u64,
     active_first_id: &mut Option<MessageId>,
     segments: &mut Vec<Segment>,
@@ -1177,18 +1344,22 @@ fn rotate_log(
         first_id,
     });
     *active_first_id = None;
+    // The rename already freed the path, so the fresh log starts empty either
+    // way; resetting `active_bytes` on failure keeps later appends from
+    // re-entering rotation, and `Reopen` retries the open on a later append
+    // once a transient error (EMFILE, ENOSPC) clears.
+    *active_bytes = 0;
     match open_active_log(path) {
         Ok(fresh) => {
-            *file = Some(fresh);
-            *active_bytes = 0;
+            *file = ActiveLog::Open(fresh);
         }
         Err(error) => {
             kvlog::error!(
-                "durable room log reopen after rotate failed; retention degraded to memory",
+                "durable room log reopen after rotate failed; retrying on a later append",
                 path = path.display().to_string().as_str(),
                 error = error.to_string().as_str()
             );
-            *file = None;
+            *file = ActiveLog::Reopen;
         }
     }
 }
@@ -1361,7 +1532,8 @@ mod tests {
         let mut store = RoomStore::open(Some(dir.clone()), &rooms);
         assert_eq!(
             store.allocate_message_id(room),
-            MessageId(MESSAGE_ID_RESERVE)
+            MessageId(2 * MESSAGE_ID_RESERVE),
+            "restart resumes at the persisted watermark, one headroom block past the used ids"
         );
         let _ = fs::remove_dir_all(&dir);
     }
@@ -1737,6 +1909,193 @@ mod tests {
             memory
                 .disk_fetch_request(SessionId(1), memory_room_id, None, 4, 4096)
                 .is_none()
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn oversized_record_is_rejected_at_write_and_later_messages_survive() {
+        let dir = temp_dir("oversized-record");
+        let rooms = [durable_room(1)];
+        let room = RoomId(1);
+
+        let mut store = RoomStore::open(Some(dir.clone()), &rooms);
+        let id = store.allocate_message_id(room);
+        store.append(room, &test_message(room, id.0));
+        let id = store.allocate_message_id(room);
+        let mut oversized = test_message(room, id.0);
+        oversized.body = "x".repeat(history::MAX_LOG_RECORD_BYTES as usize + 1);
+        store.append(room, &oversized);
+        let id = store.allocate_message_id(room);
+        store.append(room, &test_message(room, id.0));
+        drop(store);
+
+        let store = RoomStore::open(Some(dir.clone()), &rooms);
+        let ids: Vec<u64> = store
+            .recent(room, 10)
+            .iter()
+            .map(|message| message.message_id.0)
+            .collect();
+        assert_eq!(
+            ids,
+            vec![1, 3],
+            "an oversized record must not take later messages with it"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn smaller_records_still_round_trip_under_the_cap() {
+        let dir = temp_dir("cap-round-trip");
+        let rooms = [durable_room(1)];
+        let room = RoomId(1);
+
+        let mut store = RoomStore::open(Some(dir.clone()), &rooms);
+        let id = store.allocate_message_id(room);
+        let mut large = test_message(room, id.0);
+        large.body = "x".repeat(64 * 1024);
+        store.append(room, &large);
+        drop(store);
+
+        let store = RoomStore::open(Some(dir.clone()), &rooms);
+        assert_eq!(store.recent(room, 10).len(), 1);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn stale_fetch_plan_errors_instead_of_serving_shifted_messages() {
+        let mut store = RoomStore::open(None, &[memory_room(1, 4)]);
+        let room = RoomId(1);
+        for _ in 0..4 {
+            let id = store.allocate_message_id(room);
+            store.append(room, &test_message(room, id.0));
+        }
+
+        let plan = store.history_fetch_plan_before(room, None, 4, usize::MAX);
+        assert_eq!(plan.message_count, 4);
+        for _ in 0..2 {
+            let id = store.allocate_message_id(room);
+            store.append(room, &test_message(room, id.0));
+        }
+
+        assert!(
+            store.encode_history_chunk(&plan, 0).is_err(),
+            "a plan trimmed out of residency must error, not serve newer ids"
+        );
+    }
+
+    #[test]
+    fn fetch_plan_is_stable_across_new_appends() {
+        let mut store = RoomStore::open(None, &[memory_room(1, 100)]);
+        let room = RoomId(1);
+        for _ in 0..4 {
+            let id = store.allocate_message_id(room);
+            store.append(room, &test_message(room, id.0));
+        }
+
+        let plan = store.history_fetch_plan_before(room, None, 4, usize::MAX);
+        for _ in 0..2 {
+            let id = store.allocate_message_id(room);
+            store.append(room, &test_message(room, id.0));
+        }
+
+        let payload = store.encode_history_chunk(&plan, 0).unwrap();
+        let chunk = history::decode_chunk(&payload).unwrap().unwrap();
+        let ids: Vec<u64> = chunk
+            .messages
+            .iter()
+            .map(|message| message.message_id.0)
+            .collect();
+        assert_eq!(
+            ids,
+            vec![1, 2, 3, 4],
+            "appends must not shift a planned page"
+        );
+    }
+
+    #[test]
+    fn reopen_retry_after_failed_rotation_restores_durability() {
+        let dir = temp_dir("reopen-retry");
+        let rooms = [durable_room(1)];
+        let room = RoomId(1);
+
+        let mut store = RoomStore::open(Some(dir.clone()), &rooms);
+        for _ in 0..2 {
+            let id = store.allocate_message_id(room);
+            store.append(room, &test_message(room, id.0));
+        }
+        // Simulate the state rotate_log leaves after the rename succeeded but
+        // the fresh open failed: the log became a segment and the path is
+        // free.
+        let log = dir.join("rooms").join("1.log");
+        let segment = segment_path(&log, MessageId(1));
+        fs::rename(&log, &segment).unwrap();
+        let Some(Retention::Durable {
+            file,
+            active_bytes,
+            active_first_id,
+            segments,
+            ..
+        }) = store.rooms.get_mut(&room)
+        else {
+            panic!("room 1 must be durable");
+        };
+        *file = ActiveLog::Reopen;
+        *active_bytes = 0;
+        *active_first_id = None;
+        segments.push(Segment {
+            path: segment,
+            first_id: MessageId(1),
+        });
+
+        let id = store.allocate_message_id(room);
+        store.append(room, &test_message(room, id.0));
+        drop(store);
+
+        let store = RoomStore::open(Some(dir.clone()), &rooms);
+        let ids: Vec<u64> = store
+            .recent(room, 10)
+            .iter()
+            .map(|message| message.message_id.0)
+            .collect();
+        assert_eq!(
+            ids,
+            vec![1, 2, 3],
+            "the append after a failed reopen must recover durability"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn empty_fetch_at_durable_floor_reports_at_start() {
+        let dir = temp_dir("empty-at-floor");
+        let rooms = [durable_room(1)];
+        let room = RoomId(1);
+        let tuning = StoreTuning {
+            max_active_log_bytes: 1 << 20,
+            max_resident_messages: 4,
+        };
+
+        let mut store = RoomStore::open_with_tuning(Some(dir.clone()), &rooms, tuning);
+        for _ in 0..10 {
+            let id = store.allocate_message_id(room);
+            store.append(room, &test_message(room, id.0));
+        }
+
+        let plan = store.history_fetch_plan_before(room, Some(MessageId(1)), 4, 4096);
+        assert_eq!(plan.message_count, 0);
+        assert!(
+            plan.at_start,
+            "nothing older than the durable floor exists to fetch"
+        );
+        let payload = store.encode_history_chunk(&plan, 0).unwrap();
+        let chunk = history::decode_chunk(&payload).unwrap().unwrap();
+        assert!(chunk.at_start);
+        assert!(
+            store
+                .disk_fetch_request(SessionId(1), room, Some(MessageId(1)), 4, 4096)
+                .is_none(),
+            "the plan and the disk fetch must agree there is nothing older"
         );
         let _ = fs::remove_dir_all(&dir);
     }

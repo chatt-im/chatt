@@ -5,6 +5,13 @@ use crate::{
 
 const RECORD_VERSION: u8 = 1;
 const RECORD_BASE_BYTES: usize = 1 + 8 + 4 + 8 + 8 + 1 + 8 + 4 + 4;
+/// Upper bound on one serialized history record. The durable log writer
+/// rejects larger appends and the log loader treats a larger length prefix as
+/// a corrupt tail, so both sides of the on-disk format share this constant.
+pub const MAX_LOG_RECORD_BYTES: u32 = 128 * 1024;
+/// Most messages one history chunk can carry, pinned by the `u16` count field
+/// written by [`write_chunk_header`].
+pub const MAX_CHUNK_MESSAGES: usize = u16::MAX as usize;
 pub const CHUNK_HEADER_BYTES: usize = 4 + 4 + 1 + 2 + 8;
 const CHUNK_MAGIC: &[u8; 4] = b"CHH1";
 const CHUNK_FLAG_AT_START: u8 = 0x01;
@@ -149,11 +156,10 @@ pub fn decode_chunk(bytes: &[u8]) -> Result<Option<HistoryChunk>, String> {
 }
 
 pub fn decode_chunk_ref(bytes: &[u8]) -> Result<Option<HistoryChunkRef<'_>>, String> {
-    if bytes.get(..CHUNK_MAGIC.len()) != Some(CHUNK_MAGIC) {
-        return Ok(None);
-    }
     let mut cursor = HistoryCursor::new(bytes);
-    let magic = cursor.take(CHUNK_MAGIC.len())?;
+    let Ok(magic) = cursor.take(CHUNK_MAGIC.len()) else {
+        return Ok(None);
+    };
     if magic != CHUNK_MAGIC {
         return Ok(None);
     }
@@ -165,7 +171,9 @@ pub fn decode_chunk_ref(bytes: &[u8]) -> Result<Option<HistoryChunkRef<'_>>, Str
     let count = cursor.read_u16()? as usize;
     let before = cursor.read_u64()?;
     let before = (flags & CHUNK_FLAG_HAS_BEFORE != 0).then_some(MessageId(before));
-    let mut messages = Vec::with_capacity(count);
+    // The count is untrusted input; growth by push keeps a lying header from
+    // reserving megabytes before the first record fails to parse.
+    let mut messages = Vec::new();
     for _ in 0..count {
         messages.push(read_message(&mut cursor)?);
     }
@@ -351,5 +359,13 @@ mod tests {
         assert_eq!(decoded.messages[0].message_id, MessageId(42));
         assert_eq!(decoded.messages[1].message_id, MessageId(43));
         assert!(decode_chunk(&[1, 2, 3]).unwrap().is_none());
+    }
+
+    #[test]
+    fn chunk_decode_rejects_count_beyond_payload() {
+        let mut chunk = Vec::new();
+        write_chunk_header(RoomId(7), None, false, true, MAX_CHUNK_MESSAGES, &mut chunk).unwrap();
+
+        assert!(decode_chunk(&chunk).is_err());
     }
 }
