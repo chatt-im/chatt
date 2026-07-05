@@ -60,17 +60,23 @@ pub fn read_into_buffer(
     socket: &impl AsRawFd,
     read_buf: &mut RecvBuffer,
     readiness: &mut Readiness,
-    read_chunk_bytes: usize,
+    max_read_bytes_per_syscall: usize,
     limit: ReadLimit,
 ) -> io::Result<ReadPumpOutcome> {
-    debug_assert!(read_chunk_bytes > 0);
+    debug_assert!(max_read_bytes_per_syscall > 0);
     debug_assert!(match limit {
         ReadLimit::ByteBudget(bytes) | ReadLimit::MaxBuffered(bytes) => bytes > 0,
     });
 
     let mut outcome = ReadPumpOutcome::default();
     while readiness.is_ready() && read_limit_allows_read(limit, read_buf, outcome.bytes_read) {
-        match read_buf.fill(socket, read_chunk_bytes) {
+        let read_bytes = max_read_bytes_per_syscall.min(read_limit_remaining(
+            limit,
+            read_buf,
+            outcome.bytes_read,
+        ));
+        debug_assert!(read_bytes > 0);
+        match read_buf.fill(socket, read_bytes) {
             Ok(0) => {
                 readiness.mark_drained();
                 outcome.disconnected = true;
@@ -101,6 +107,14 @@ fn read_limit_allows_read(limit: ReadLimit, read_buf: &RecvBuffer, bytes_read: u
     match limit {
         ReadLimit::ByteBudget(bytes) => bytes_read < bytes,
         ReadLimit::MaxBuffered(bytes) => read_buf.len() < bytes,
+    }
+}
+
+#[inline]
+fn read_limit_remaining(limit: ReadLimit, read_buf: &RecvBuffer, bytes_read: usize) -> usize {
+    match limit {
+        ReadLimit::ByteBudget(bytes) => bytes.saturating_sub(bytes_read),
+        ReadLimit::MaxBuffered(bytes) => bytes.saturating_sub(read_buf.len()),
     }
 }
 
@@ -205,10 +219,14 @@ pub fn write_queue_to(
                 outcome.blocked = true;
                 break;
             }
+            Err(error) if is_interrupted_io_error(&error) => continue,
             Err(error) => return Err(error),
         }
     }
-    outcome.hit_limit = !queue.is_empty() && outcome.attempts == max_attempts && !outcome.blocked;
+    outcome.hit_limit = !queue.is_empty()
+        && outcome.attempts == max_attempts
+        && !outcome.blocked
+        && !outcome.wrote_zero;
     Ok(outcome)
 }
 
@@ -284,6 +302,36 @@ mod tests {
         }
     }
 
+    struct InterruptedOnceWriter {
+        interrupted: bool,
+    }
+
+    impl Write for InterruptedOnceWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            if !self.interrupted {
+                self.interrupted = true;
+                return Err(io::Error::from(io::ErrorKind::Interrupted));
+            }
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    struct ZeroWriter;
+
+    impl Write for ZeroWriter {
+        fn write(&mut self, _buf: &[u8]) -> io::Result<usize> {
+            Ok(0)
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
     #[test]
     fn read_byte_budget_stop_keeps_readiness_for_retry() {
         let (mut writer, reader) = UnixStream::pair().expect("socket pair");
@@ -306,6 +354,29 @@ mod tests {
         assert!(outcome.bytes_read >= 1);
         assert!(readiness.is_ready());
         assert!(!read_buf.is_empty());
+    }
+
+    #[test]
+    fn read_byte_budget_caps_single_large_syscall() {
+        let (mut writer, reader) = UnixStream::pair().expect("socket pair");
+        reader.set_nonblocking(true).expect("set nonblocking");
+        writer.write_all(b"abcdef").expect("write payload");
+        let mut read_buf = RecvBuffer::new();
+        let mut readiness = Readiness::primed();
+
+        let outcome = read_into_buffer(
+            &reader,
+            &mut read_buf,
+            &mut readiness,
+            64,
+            ReadLimit::ByteBudget(3),
+        )
+        .unwrap();
+
+        assert_eq!(outcome.bytes_read, 3);
+        assert!(outcome.hit_limit);
+        assert!(readiness.is_ready());
+        assert_eq!(read_buf.pending(), b"abc");
     }
 
     #[test]
@@ -394,6 +465,34 @@ mod tests {
         assert_eq!(outcome.bytes_written, 2);
         assert!(outcome.hit_limit);
         assert_eq!(queue.pending(), b"cdef");
+    }
+
+    #[test]
+    fn write_pump_retries_interrupted_write() {
+        let mut writer = InterruptedOnceWriter { interrupted: false };
+        let mut queue = WriteQueue::new();
+        queue.tail_mut().extend_from_slice(b"abcdef");
+
+        let outcome = write_queue_to(&mut writer, &mut queue, 2).unwrap();
+
+        assert_eq!(outcome.attempts, 2);
+        assert_eq!(outcome.bytes_written, 6);
+        assert!(!outcome.hit_limit);
+        assert!(queue.is_empty());
+    }
+
+    #[test]
+    fn write_pump_reports_zero_write_without_consuming() {
+        let mut writer = ZeroWriter;
+        let mut queue = WriteQueue::new();
+        queue.tail_mut().extend_from_slice(b"abcdef");
+
+        let outcome = write_queue_to(&mut writer, &mut queue, 1).unwrap();
+
+        assert_eq!(outcome.attempts, 1);
+        assert!(outcome.wrote_zero);
+        assert!(!outcome.hit_limit);
+        assert_eq!(queue.pending(), b"abcdef");
     }
 
     #[test]

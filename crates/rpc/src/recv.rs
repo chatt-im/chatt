@@ -3,7 +3,9 @@
 //!
 //! [`RecvBuffer::fill`] reads with `libc::read` straight into the `Vec`'s
 //! spare capacity, so there is no zero-initialized scratch buffer and no copy
-//! from scratch into the buffer. Frames are parsed from [`RecvBuffer::pending`]
+//! from scratch into the buffer. The caller supplies the maximum bytes for one
+//! syscall; retained capacity is reuse only, not an implicit larger read.
+//! Frames are parsed from [`RecvBuffer::pending`]
 //! and consumed by advancing a cursor, so popping a frame never memmoves the
 //! bytes behind it, and sealed frames decrypt in place through
 //! [`RecvBuffer::pending_mut`]. A read usually delivers exactly one whole
@@ -58,30 +60,30 @@ impl RecvBuffer {
     }
 
     /// Reads once from `socket` directly into the buffer's spare capacity,
-    /// growing it to hold at least `min_spare` more bytes first. Returns the
+    /// growing it to hold up to `max_read` more bytes first. Returns the
     /// number of bytes read; `Ok(0)` is end-of-stream, and a would-block on a
     /// nonblocking socket (or a receive timeout) surfaces as the usual
     /// [`io::ErrorKind::WouldBlock`].
     ///
     /// Any partial frame left from the previous read is moved to the front of
     /// the buffer first — the only copy this buffer ever makes.
-    pub fn fill(&mut self, socket: &impl AsRawFd, min_spare: usize) -> io::Result<usize> {
+    pub fn fill(&mut self, socket: &impl AsRawFd, max_read: usize) -> io::Result<usize> {
+        debug_assert!(max_read > 0);
         if self.start > 0 {
             self.buf.copy_within(self.start.., 0);
             self.buf.truncate(self.buf.len() - self.start);
             self.start = 0;
         }
         let len = self.buf.len();
-        if self.buf.capacity() - len < min_spare {
-            self.buf.reserve(min_spare);
+        if self.buf.capacity() - len < max_read {
+            self.buf.reserve(max_read);
         }
-        let spare = self.buf.capacity() - len;
         loop {
             let read = unsafe {
                 libc::read(
                     socket.as_raw_fd(),
                     self.buf.as_mut_ptr().add(len).cast(),
-                    spare,
+                    max_read,
                 )
             };
             if read >= 0 {
@@ -150,6 +152,18 @@ mod tests {
         writer.write_all(b"three").unwrap();
         recv.fill(&reader, 16).unwrap();
         assert_eq!(recv.pending(), b"twothree");
+    }
+
+    #[test]
+    fn fill_reads_at_most_requested_bytes() {
+        let (mut writer, reader) = UnixStream::pair().unwrap();
+        writer.write_all(b"abcdef").unwrap();
+        let mut recv = RecvBuffer::new();
+
+        assert_eq!(recv.fill(&reader, 3).unwrap(), 3);
+        assert_eq!(recv.pending(), b"abc");
+        assert_eq!(recv.fill(&reader, 3).unwrap(), 3);
+        assert_eq!(recv.pending(), b"abcdef");
     }
 
     #[test]

@@ -76,17 +76,21 @@ const MAX_CLIENTS: usize = 1024;
 const ACCEPT_BUDGET: usize = 64;
 const TCP_WRITE_ATTEMPTS: usize = 32;
 const UDP_DRAIN_BUDGET: usize = 64;
-/// Minimum spare capacity ensured before each direct read into a connection's
-/// receive buffer. The buffer grows past this on demand (a full file-chunk
-/// frame arrives in a couple of reads once its capacity has ramped), while
-/// connections that only exchange small control frames stay small.
-const TCP_READ_CHUNK_BYTES: usize = 64 * 1024;
-/// Cap on bytes read from one TCP connection per readiness pass, so one fast
-/// sender cannot monopolize the single-threaded loop or grow its `read_buf`
-/// without bound inside a single poll iteration. mio events are edge-triggered,
-/// so a connection cut off by the budget is queued for a re-read on the next
-/// loop pass rather than waiting for a new readiness event.
-const READ_BUDGET_BYTES: usize = 256 * 1024;
+/// Scheduling budget for bytes read from one TCP connection per readiness pass:
+/// enough for one maximum framed control record, while still preventing one
+/// fast sender from monopolizing the single-threaded loop. mio events are
+/// edge-triggered, so a connection cut off by the budget is queued for a
+/// re-read on the next loop pass rather than waiting for a new readiness event.
+/// This is also the maximum bytes requested by one TCP read syscall.
+const READ_BUDGET_BYTES: usize = frame::LENGTH_PREFIX_LEN + frame::MAX_FRAME_LEN;
+/// Maximum complete control frames processed for one connection in one loop
+/// pass after its socket read. Bulk file chunks are already byte-budgeted by
+/// `READ_BUDGET_BYTES`; this bounds tiny pipelined controls.
+const CONTROL_STEPS_PER_READ: usize = 64;
+/// Maximum complete video records processed for one connection in one loop
+/// pass after its socket read. One record can still be large; this only bounds
+/// already-buffered batches of records.
+const VIDEO_RECORDS_PER_READ: usize = 8;
 /// A connection that has not finished classification, handshake, and auth
 /// within this bound is dropped; without it a socket that connects and sends
 /// nothing occupies one of the [`MAX_CLIENTS`] slots forever.
@@ -717,7 +721,14 @@ impl Server {
             let (mut socket, addr) = match self.listener.accept() {
                 Ok(value) => value,
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(()),
-                Err(error) if is_transient_accept_error(&error) => {
+                Err(error) if is_interrupted_io_error(&error) => {
+                    self.loop_work.queue_accept_clients();
+                    return Ok(());
+                }
+                Err(error) if error.kind() == io::ErrorKind::ConnectionAborted => {
+                    continue;
+                }
+                Err(error) if is_fd_pressure_accept_error(&error) => {
                     // fd pressure (EMFILE/ENFILE) cannot drain by accepting, so
                     // back off briefly before returning. This stalls the whole
                     // single-threaded loop, but a tight retry would just spin on
@@ -799,7 +810,7 @@ impl Server {
                     &client.socket,
                     &mut client.read_buf,
                     &mut client.readiness,
-                    TCP_READ_CHUNK_BYTES,
+                    READ_BUDGET_BYTES,
                     ReadLimit::ByteBudget(READ_BUDGET_BYTES),
                 ) {
                     Ok(outcome) => {
@@ -856,7 +867,12 @@ impl Server {
             return;
         }
 
+        let mut steps = 0usize;
         loop {
+            if steps >= CONTROL_STEPS_PER_READ {
+                self.queue_client_read_if_work_ready(token);
+                return;
+            }
             // Relayed chunks queue to recipients inside `handle_control`, so
             // re-check between frames and park with the remaining frames
             // still buffered once a recipient's queue is over the cap.
@@ -875,6 +891,7 @@ impl Server {
             match control_conn_step(token, client) {
                 Ok(None) => return,
                 Ok(Some(ControlStep::Hello(hello))) => {
+                    steps += 1;
                     if let Err(error) = self.handle_client_hello(token, hello) {
                         kvlog::warn!(
                             "tcp client protocol error",
@@ -886,6 +903,7 @@ impl Server {
                     }
                 }
                 Ok(Some(ControlStep::Control(control))) => {
+                    steps += 1;
                     if let Err(error) = self.handle_control(token, control) {
                         kvlog::warn!(
                             "tcp client protocol error",
@@ -906,7 +924,12 @@ impl Server {
     }
 
     fn read_video_conn(&mut self, token: Token) {
+        let mut records = 0usize;
         loop {
+            if records >= VIDEO_RECORDS_PER_READ {
+                self.queue_client_read_if_work_ready(token);
+                return;
+            }
             let Some(client) = self.clients.get_mut(&token) else {
                 return;
             };
@@ -916,6 +939,7 @@ impl Server {
             match video_conn_step(client) {
                 Ok(None) => return,
                 Ok(Some(VideoStep::Handshake(record))) => {
+                    records += 1;
                     if let Err(error) = self.process_video_record(token, record) {
                         kvlog::warn!(
                             "video connection protocol error",
@@ -930,8 +954,13 @@ impl Server {
                     stream_id,
                     frame,
                     is_key,
-                })) => self.publish_video_frame(stream_id, frame, is_key),
-                Ok(Some(VideoStep::SubscriberChatter)) => {}
+                })) => {
+                    records += 1;
+                    self.publish_video_frame(stream_id, frame, is_key);
+                }
+                Ok(Some(VideoStep::SubscriberChatter)) => {
+                    records += 1;
+                }
                 Err(error) => {
                     kvlog::warn!(
                         "video connection protocol error",
@@ -4049,6 +4078,10 @@ impl Server {
                             attempts = outcome.attempts
                         );
                     }
+                    if outcome.wrote_zero {
+                        kvlog::warn!("tcp client write returned zero bytes", token = token.0);
+                        disconnected = true;
+                    }
                     requeue = outcome.hit_limit;
                 }
                 Err(error) => {
@@ -4355,14 +4388,35 @@ impl Server {
         }
     }
 
+    fn queue_client_read_if_work_ready(&mut self, token: Token) {
+        if self.client_read_work_ready(token) {
+            self.loop_work.queue_client_read(token);
+        }
+    }
+
+    fn client_read_work_ready(&self, token: Token) -> bool {
+        let Some(client) = self.clients.get(&token) else {
+            return false;
+        };
+        if client.is_closing() || self.relay_clogged_for_reader(token) {
+            return false;
+        }
+        if client.readiness.is_ready() {
+            return true;
+        }
+        match &client.kind {
+            ConnKind::Video(_) => {
+                !matches!(video::parse_record(client.read_buf.pending()), Ok(None))
+            }
+            ConnKind::Unidentified => client.read_buf.len() >= video::VIDEO_MAGIC.len(),
+            ConnKind::Control => !matches!(frame::parse_frame(client.read_buf.pending()), Ok(None)),
+        }
+    }
+
     #[cfg(debug_assertions)]
     fn debug_assert_no_immediate_read_work(&self) {
-        for (token, client) in &self.clients {
-            let whole_frame_buffered =
-                matches!(frame::parse_frame(client.read_buf.pending()), Ok(Some(_)));
-            let can_process_now = !client.is_closing()
-                && !self.relay_clogged_for_reader(*token)
-                && (client.readiness.is_ready() || whole_frame_buffered);
+        for token in self.clients.keys() {
+            let can_process_now = self.client_read_work_ready(*token);
             debug_assert!(
                 !can_process_now,
                 "server poll would sleep with immediate client read work for token {}",
@@ -5094,10 +5148,8 @@ fn positional_args(args: &[String]) -> Vec<&str> {
     out
 }
 
-fn is_transient_accept_error(error: &io::Error) -> bool {
-    is_interrupted_io_error(error)
-        || matches!(error.kind(), io::ErrorKind::ConnectionAborted)
-        || matches!(error.raw_os_error(), Some(libc::EMFILE | libc::ENFILE))
+fn is_fd_pressure_accept_error(error: &io::Error) -> bool {
+    matches!(error.raw_os_error(), Some(libc::EMFILE | libc::ENFILE))
 }
 
 fn random_secret_hex(rng: &ring::rand::SystemRandom) -> Result<String, String> {
@@ -8204,17 +8256,17 @@ mod tests {
     }
 
     #[test]
-    fn accept_error_classification_is_transient_for_fd_pressure() {
-        assert!(is_transient_accept_error(&io::Error::from_raw_os_error(
+    fn accept_error_classification_matches_fd_pressure_only() {
+        assert!(is_fd_pressure_accept_error(&io::Error::from_raw_os_error(
             libc::EMFILE
         )));
-        assert!(is_transient_accept_error(&io::Error::from_raw_os_error(
+        assert!(is_fd_pressure_accept_error(&io::Error::from_raw_os_error(
             libc::ENFILE
         )));
-        assert!(is_transient_accept_error(&io::Error::from(
+        assert!(!is_fd_pressure_accept_error(&io::Error::from(
             io::ErrorKind::Interrupted
         )));
-        assert!(!is_transient_accept_error(&io::Error::from(
+        assert!(!is_fd_pressure_accept_error(&io::Error::from(
             io::ErrorKind::PermissionDenied
         )));
     }
