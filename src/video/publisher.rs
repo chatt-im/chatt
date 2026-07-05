@@ -18,9 +18,9 @@ use std::time::{Duration, Instant};
 
 use rpc::{
     bitstream::{self, Codec},
-    crypto::{CHANNEL_VIDEO, TransportCipher},
+    crypto::{CHANNEL_VIDEO, TAG_LEN, TRANSPORT_HEADER_LEN, TransportCipher},
     ids::{SessionId, StreamId},
-    video::{self, VideoRole},
+    video::{self, SharedVideoFrame, VideoRole},
 };
 
 use crate::app::{AppEvent, EventSender, ScreencastProgress};
@@ -120,6 +120,51 @@ struct PublisherConn {
     cipher: TransportCipher,
     stream_id: u32,
     codec: Codec,
+    copy_stats: CopyStats,
+    /// Reusable plaintext frame body, rebuilt in place each [`Self::send_frame`].
+    inner: Vec<u8>,
+    /// Reusable length-prefixed sealed record, rebuilt in place each
+    /// [`Self::send_frame`], so steady-state publishing allocates nothing.
+    record: Vec<u8>,
+}
+
+/// Rolling per-second counters for publish-path copy cost, logged at most once
+/// per [`COPY_STATS_INTERVAL`] so an active share reports copied bytes/sec
+/// without per-frame log noise.
+struct CopyStats {
+    plaintext_bytes: u64,
+    self_view_bytes: u64,
+    sealed_bytes: u64,
+    frames: u64,
+    last_log: Instant,
+}
+
+const COPY_STATS_INTERVAL: Duration = Duration::from_secs(1);
+
+impl CopyStats {
+    fn new() -> Self {
+        Self {
+            plaintext_bytes: 0,
+            self_view_bytes: 0,
+            sealed_bytes: 0,
+            frames: 0,
+            last_log: Instant::now(),
+        }
+    }
+
+    fn maybe_log(&mut self) {
+        if self.last_log.elapsed() < COPY_STATS_INTERVAL {
+            return;
+        }
+        kvlog::debug!(
+            "video publish copy stats",
+            plaintext_bytes = self.plaintext_bytes,
+            self_view_bytes = self.self_view_bytes,
+            sealed_bytes = self.sealed_bytes,
+            frames = self.frames
+        );
+        *self = Self::new();
+    }
 }
 
 impl PublisherConn {
@@ -133,19 +178,29 @@ impl PublisherConn {
         frame: &CapturedFrame,
         web_feed: Option<&WebFeedSender>,
     ) -> Result<u64, String> {
-        let inner = encode_publish_frame(frame, self.stream_id, self.codec);
+        self.inner.clear();
+        encode_publish_frame_into(frame, self.stream_id, self.codec, &mut self.inner);
+        self.copy_stats.plaintext_bytes += self.inner.len() as u64;
         if let Some(feed) = web_feed {
-            feed.send_video_frame(inner.clone());
+            self.copy_stats.self_view_bytes += self.inner.len() as u64;
+            feed.send_video_frame(SharedVideoFrame::copy_from_slice(&self.inner));
         }
-        let sealed = self
-            .cipher
-            .seal_next(CHANNEL_VIDEO, &inner)
+        let sealed_len = TRANSPORT_HEADER_LEN + self.inner.len() + TAG_LEN;
+        if sealed_len > video::MAX_VIDEO_FRAME_LEN {
+            return Err("sealed video record exceeds maximum length".to_string());
+        }
+        self.record.clear();
+        self.record
+            .extend_from_slice(&(sealed_len as u32).to_le_bytes());
+        self.cipher
+            .seal_next_into(CHANNEL_VIDEO, &self.inner, &mut self.record)
             .map_err(|error| error.to_string())?;
-        let mut record = Vec::with_capacity(sealed.len() + 4);
-        video::write_record(&mut record, &sealed).map_err(|error| error.to_string())?;
-        let bytes = record.len() as u64;
+        let bytes = self.record.len() as u64;
+        self.copy_stats.sealed_bytes += bytes;
+        self.copy_stats.frames += 1;
+        self.copy_stats.maybe_log();
         self.stream
-            .write_all(&record)
+            .write_all(&self.record)
             .map_err(|error| format!("video frame write failed: {error}"))?;
         Ok(bytes)
     }
@@ -367,9 +422,29 @@ fn codec_label(codec: Codec) -> &'static str {
 /// it: the access unit becomes a length-prefixed bitstream with parameter sets
 /// stripped, tagged with `stream_id`. This is the exact body sealed to the server
 /// and teed to the local web feed, so a sharer's self-view decodes identically.
+///
+/// Appends to `out` without allocating: the frame header goes down first with a
+/// placeholder size, the bitstream converts straight into `out`, then the size
+/// field is patched, so the converted bitstream is never staged in a separate
+/// buffer.
+fn encode_publish_frame_into(
+    frame: &CapturedFrame,
+    stream_id: u32,
+    codec: Codec,
+    out: &mut Vec<u8>,
+) {
+    let start = out.len();
+    video::write_video_frame(out, frame.ts_ms, frame.is_key, stream_id, &[]);
+    bitstream::annex_b_to_length_prefixed_into(codec, &frame.data, out);
+    let size = ((out.len() - start) as u32).to_le_bytes();
+    out[start..start + size.len()].copy_from_slice(&size);
+}
+
+#[cfg(test)]
 fn encode_publish_frame(frame: &CapturedFrame, stream_id: u32, codec: Codec) -> Vec<u8> {
-    let body = bitstream::annex_b_to_length_prefixed(codec, &frame.data);
-    video::encode_video_frame(frame.ts_ms, frame.is_key, stream_id, &body)
+    let mut inner = Vec::new();
+    encode_publish_frame_into(frame, stream_id, codec, &mut inner);
+    inner
 }
 
 fn connect(
@@ -394,6 +469,9 @@ fn connect(
         cipher,
         stream_id: stream_id.0,
         codec,
+        copy_stats: CopyStats::new(),
+        inner: Vec::new(),
+        record: Vec::new(),
     })
 }
 
@@ -431,6 +509,33 @@ mod tests {
         assert_eq!(parsed.ts_ms, 5);
         // Only the IDR slice survives, length-prefixed; SPS/PPS are stripped.
         assert_eq!(parsed.data, vec![0, 0, 0, 3, 0x65, 0xaa, 0xbb]);
+    }
+
+    #[test]
+    fn encode_into_reused_buffer_matches_allocating_path() {
+        let frames = [
+            CapturedFrame {
+                ts_ms: 1,
+                is_key: true,
+                data: vec![
+                    0, 0, 0, 1, 0x67, 0x42, 0, 0, 0, 1, 0x68, 0xce, 0, 0, 0, 1, 0x65, 0xaa, 0xbb,
+                    0xcc, 0xdd,
+                ],
+            },
+            CapturedFrame {
+                ts_ms: 2,
+                is_key: false,
+                data: vec![0, 0, 0, 1, 0x41, 0x11],
+            },
+        ];
+        let mut inner = Vec::new();
+        for frame in &frames {
+            inner.clear();
+            encode_publish_frame_into(frame, 9, Codec::H264, &mut inner);
+            let body = bitstream::annex_b_to_length_prefixed(Codec::H264, &frame.data);
+            let expected = video::encode_video_frame(frame.ts_ms, frame.is_key, 9, &body);
+            assert_eq!(inner, expected);
+        }
     }
 
     #[test]

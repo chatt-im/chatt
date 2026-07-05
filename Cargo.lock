@@ -277,7 +277,6 @@ version = "0.1.0"
 dependencies = [
  "annotate-snippets 0.12.16",
  "bwrap",
- "bytes",
  "chatt-p2p",
  "cpal",
  "darkhttp",
@@ -1610,7 +1609,6 @@ dependencies = [
 name = "server"
 version = "0.1.0"
 dependencies = [
- "bytes",
  "foldhash",
  "hashbrown 0.17.1",
  "jsony",

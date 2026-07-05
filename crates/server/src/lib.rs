@@ -47,7 +47,7 @@ use rpc::{
     ids::{BugReportId, FileTransferId, MessageId, RoomId, SessionId, StreamId, UserId},
     media::{self, MediaPayload},
     recv::RecvBuffer,
-    video::{self, VideoAck, VideoHello, VideoRole},
+    video::{self, SharedVideoFrame, VideoAck, VideoHello, VideoRecordReader, VideoRole},
 };
 
 use config::{Config as ServerConfig, UserConfig, hash_secret, value_arg, verify_secret_hash};
@@ -433,6 +433,43 @@ pub struct Server {
     udp_send_scratch: Vec<u8>,
     /// Reusable recipient list for [`Self::relay_voice`].
     relay_recipients: Vec<SessionId>,
+    video_copy_stats: VideoCopyStats,
+}
+
+/// Rolling per-second counters for video ingest copy cost and ring retention,
+/// logged at most once per [`VIDEO_COPY_STATS_INTERVAL`] while frames flow so
+/// copied bytes/sec and retained ring bytes are measurable without per-frame
+/// log noise.
+struct VideoCopyStats {
+    ingest_copy_bytes: u64,
+    frames: u64,
+    last_log: Instant,
+}
+
+const VIDEO_COPY_STATS_INTERVAL: Duration = Duration::from_secs(1);
+
+impl VideoCopyStats {
+    fn new() -> Self {
+        Self {
+            ingest_copy_bytes: 0,
+            frames: 0,
+            last_log: Instant::now(),
+        }
+    }
+
+    fn maybe_log(&mut self, _ring_visible_bytes: usize, _ring_retained_bytes: usize) {
+        if self.last_log.elapsed() < VIDEO_COPY_STATS_INTERVAL {
+            return;
+        }
+        kvlog::debug!(
+            "video ingest copy stats",
+            ingest_copy_bytes = self.ingest_copy_bytes,
+            frames = self.frames,
+            ring_visible_bytes = _ring_visible_bytes,
+            ring_retained_bytes = _ring_retained_bytes
+        );
+        *self = Self::new();
+    }
 }
 
 impl Server {
@@ -572,6 +609,7 @@ impl Server {
             udp_send_packet: Vec::new(),
             udp_send_scratch: Vec::new(),
             relay_recipients: Vec::new(),
+            video_copy_stats: VideoCopyStats::new(),
         })
     }
 
@@ -805,7 +843,10 @@ impl Server {
         let mut disconnected = false;
         let mut hit_limit = false;
         if let Some(client) = self.clients.get_mut(&token) {
-            if !clogged {
+            // A connection with an exact video record reader pumps its own
+            // socket inside `read_video_conn`; a generic fill here would put
+            // frame bytes back in the shared receive buffer and force a copy.
+            if !clogged && !client.video_reader_attached() {
                 match read_into_buffer(
                     &client.socket,
                     &mut client.read_buf,
@@ -925,10 +966,35 @@ impl Server {
 
     fn read_video_conn(&mut self, token: Token) {
         let mut records = 0usize;
+        let mut byte_budget = READ_BUDGET_BYTES;
         loop {
             if records >= VIDEO_RECORDS_PER_READ {
                 self.queue_client_read_if_work_ready(token);
                 return;
+            }
+            let (pump, spent) = self.pump_video_reader(token, byte_budget);
+            byte_budget = byte_budget.saturating_sub(spent);
+            match pump {
+                VideoPump::Step => {}
+                VideoPump::Idle => return,
+                VideoPump::Budget => {
+                    self.loop_work.queue_client_read(token);
+                    return;
+                }
+                VideoPump::Closed => {
+                    kvlog::info!("tcp client closed", token = token.0);
+                    self.disconnect(token);
+                    return;
+                }
+                VideoPump::Failed(error) => {
+                    kvlog::warn!(
+                        "video connection protocol error",
+                        token = token.0,
+                        error = error.as_str()
+                    );
+                    self.disconnect(token);
+                    return;
+                }
             }
             let Some(client) = self.clients.get_mut(&token) else {
                 return;
@@ -971,6 +1037,56 @@ impl Server {
                     return;
                 }
             }
+        }
+    }
+
+    /// Feeds a reader-driven video connection: drains any residual bytes the
+    /// generic receive buffer read before the reader attached, then pumps the
+    /// socket until a whole record is buffered, the socket drains, or
+    /// `byte_budget` is spent. Returns the outcome and the bytes read.
+    /// Connections without a reader step straight from the receive buffer.
+    fn pump_video_reader(&mut self, token: Token, byte_budget: usize) -> (VideoPump, usize) {
+        let Some(client) = self.clients.get_mut(&token) else {
+            return (VideoPump::Idle, 0);
+        };
+        if client.is_closing() {
+            return (VideoPump::Idle, 0);
+        }
+        let ConnKind::Video(video) = &mut client.kind else {
+            return (VideoPump::Step, 0);
+        };
+        let Some(reader) = video.reader.as_mut() else {
+            return (VideoPump::Step, 0);
+        };
+        while !client.read_buf.is_empty() && !reader.record_ready() {
+            match reader.accept(client.read_buf.pending()) {
+                Ok(taken) => {
+                    self.video_copy_stats.ingest_copy_bytes += taken as u64;
+                    client.read_buf.consume(taken);
+                }
+                Err(error) => return (VideoPump::Failed(format!("invalid record: {error}")), 0),
+            }
+        }
+        if reader.record_ready() {
+            return (VideoPump::Step, 0);
+        }
+        match video::read_video_record(&client.socket, reader, &mut client.readiness, byte_budget) {
+            Ok(outcome) => {
+                if outcome.bytes_read > 0 {
+                    client.last_activity = Instant::now();
+                }
+                let pump = if outcome.disconnected {
+                    VideoPump::Closed
+                } else if reader.record_ready() {
+                    VideoPump::Step
+                } else if outcome.hit_limit {
+                    VideoPump::Budget
+                } else {
+                    VideoPump::Idle
+                };
+                (pump, outcome.bytes_read)
+            }
+            Err(error) => (VideoPump::Failed(format!("video read failed: {error}")), 0),
         }
     }
 
@@ -1070,7 +1186,17 @@ impl Server {
             .map_err(|error| error.to_string())?;
         self.write_client(token);
         match role {
-            VideoRole::Publisher => self.attach_publisher(token, stream_id),
+            VideoRole::Publisher => {
+                self.attach_publisher(token, stream_id)?;
+                // From here on, published records land in exact per-record
+                // allocations so their plaintext can be retained zero-copy.
+                if let Some(client) = self.clients.get_mut(&token)
+                    && let ConnKind::Video(video) = &mut client.kind
+                {
+                    video.reader = Some(VideoRecordReader::new());
+                }
+                Ok(())
+            }
             VideoRole::Subscriber => self.attach_subscriber(token, stream_id),
         }
     }
@@ -1098,7 +1224,7 @@ impl Server {
     /// keyframe and every frame after it, so the viewer's decoder bootstraps
     /// without waiting for the next GOP.
     fn attach_subscriber(&mut self, token: Token, stream_id: StreamId) -> Result<(), String> {
-        let burst: Vec<Arc<[u8]>> = {
+        let burst: Vec<SharedVideoFrame> = {
             let stream = self
                 .streams
                 .get_mut(&stream_id)
@@ -1118,7 +1244,7 @@ impl Server {
         };
         let burst_len = burst.len();
         for data in &burst {
-            self.seal_video_to_subscriber(token, data)?;
+            self.seal_video_to_subscriber(token, data.as_slice())?;
         }
         kvlog::info!(
             "video subscriber attached",
@@ -1169,7 +1295,8 @@ impl Server {
     /// keyframe the ring resets so a new viewer starts from a self-contained
     /// point. A subscriber whose queue overflows is dropped, it reconnects and
     /// fast-starts cheaply.
-    fn publish_video_frame(&mut self, stream_id: StreamId, data: Arc<[u8]>, is_key: bool) {
+    fn publish_video_frame(&mut self, stream_id: StreamId, data: SharedVideoFrame, is_key: bool) {
+        self.video_copy_stats.frames += 1;
         let subscribers = {
             let Some(stream) = self.streams.get_mut(&stream_id) else {
                 return;
@@ -1178,21 +1305,24 @@ impl Server {
                 stream.ring.clear();
                 stream.ring_bytes = 0;
             }
-            stream.ring_bytes += data.len();
+            stream.ring_bytes += data.retained_bytes();
             stream.ring.push_back(VideoRingFrame {
                 data: data.clone(),
                 is_key,
             });
             while stream.ring_bytes > VIDEO_RING_MAX_BYTES && stream.ring.len() > 1 {
                 if let Some(front) = stream.ring.pop_front() {
-                    stream.ring_bytes -= front.data.len();
+                    stream.ring_bytes -= front.data.retained_bytes();
                 }
             }
+            let visible_bytes = stream.ring.iter().map(|frame| frame.data.len()).sum();
+            self.video_copy_stats
+                .maybe_log(visible_bytes, stream.ring_bytes);
             stream.subscribers.clone()
         };
         let mut overflowed = Vec::new();
         for token in subscribers {
-            match self.seal_video_to_subscriber(token, &data) {
+            match self.seal_video_to_subscriber(token, data.as_slice()) {
                 Ok(true) => {}
                 Ok(false) | Err(_) => overflowed.push(token),
             }
@@ -4405,9 +4535,12 @@ impl Server {
             return true;
         }
         match &client.kind {
-            ConnKind::Video(_) => {
-                !matches!(video::parse_record(client.read_buf.pending()), Ok(None))
-            }
+            ConnKind::Video(video) => match &video.reader {
+                // Residual receive-buffer bytes drain into the reader without
+                // a new socket edge, so they count as work too.
+                Some(reader) => reader.record_ready() || !client.read_buf.is_empty(),
+                None => !matches!(video::parse_record(client.read_buf.pending()), Ok(None)),
+            },
             ConnKind::Unidentified => client.read_buf.len() >= video::VIDEO_MAGIC.len(),
             ConnKind::Control => !matches!(frame::parse_frame(client.read_buf.pending()), Ok(None)),
         }
@@ -4673,6 +4806,12 @@ impl ClientConn {
         !matches!(self.close, Close::Open)
     }
 
+    /// Whether socket reads route through an attached exact video record
+    /// reader instead of the generic receive buffer.
+    fn video_reader_attached(&self) -> bool {
+        matches!(&self.kind, ConnKind::Video(video) if video.reader.is_some())
+    }
+
     /// Whether classification, handshake, and auth have all completed.
     /// Connections still setting up are bounded by [`HANDSHAKE_TIMEOUT`],
     /// established ones by [`IDLE_TIMEOUT`].
@@ -4755,23 +4894,70 @@ fn control_conn_step(
     }
 }
 
+/// Outcome of feeding a video connection's reader in
+/// [`Server::pump_video_reader`], deciding how [`Server::read_video_conn`]
+/// proceeds.
+enum VideoPump {
+    /// A record may be steppable: either the reader holds a whole record or
+    /// the connection reads through the generic receive buffer.
+    Step,
+    /// No whole record and the socket is drained; wait for the next edge.
+    Idle,
+    /// The byte budget ran out mid-record; requeue the read.
+    Budget,
+    /// The peer closed the socket.
+    Closed,
+    /// A read or protocol failure that tears the connection down.
+    Failed(String),
+}
+
 /// One inbound video-connection record, extracted from the receive buffer by
 /// [`video_conn_step`].
 enum VideoStep {
     Handshake(Vec<u8>),
     Publish {
         stream_id: StreamId,
-        frame: Arc<[u8]>,
+        frame: SharedVideoFrame,
         is_key: bool,
     },
     SubscriberChatter,
 }
 
 /// Extracts the next video record buffered on `client`. Handshake records are
-/// small and copied out; streaming records decrypt in place in the receive
-/// buffer, so a published frame's only copy is into the shared ring [`Arc`].
-/// Returns `None` when no whole record is buffered yet.
+/// small and copied out. A streaming publisher's records arrive through the
+/// exact per-record reader: the sealed body decrypts in place in its own
+/// allocation, which then backs the shared [`SharedVideoFrame`] without a
+/// copy. Returns `None` when no whole record is buffered yet.
 fn video_conn_step(client: &mut ClientConn) -> Result<Option<VideoStep>, String> {
+    if let ConnKind::Video(video) = &mut client.kind
+        && video.phase == VideoPhase::Streaming
+        && let Some(reader) = video.reader.as_mut()
+    {
+        let Some(mut record) = reader.take_record() else {
+            return Ok(None);
+        };
+        let stream_id = video
+            .stream_id
+            .ok_or_else(|| "stream before hello".to_string())?;
+        let cipher = video
+            .cipher
+            .as_mut()
+            .ok_or_else(|| "stream before auth".to_string())?;
+        let plaintext_len = cipher
+            .open_next_in_place(CHANNEL_VIDEO, &mut record)
+            .map_err(|error| error.to_string())?
+            .len();
+        if plaintext_len < video::VIDEO_FRAME_HEADER_LEN {
+            return Err("video frame is shorter than its header".to_string());
+        }
+        let frame = SharedVideoFrame::from_record(record, TRANSPORT_HEADER_LEN, plaintext_len);
+        let is_key = frame.as_slice()[12] == 1;
+        return Ok(Some(VideoStep::Publish {
+            stream_id,
+            frame,
+            is_key,
+        }));
+    }
     let total = match video::parse_record(client.read_buf.pending()) {
         Ok(Some((_, total))) => total,
         Ok(None) => return Ok(None),
@@ -4808,7 +4994,7 @@ fn video_conn_step(client: &mut ClientConn) -> Result<Option<VideoStep>, String>
                     }
                     VideoStep::Publish {
                         stream_id,
-                        frame: Arc::from(plaintext),
+                        frame: SharedVideoFrame::copy_from_slice(plaintext),
                         is_key: plaintext[12] == 1,
                     }
                 }
@@ -4849,6 +5035,11 @@ struct VideoConn {
     stream_id: Option<StreamId>,
     role: Option<VideoRole>,
     cipher: Option<TransportCipher>,
+    /// Exact per-record reader, attached when a publisher enters
+    /// [`VideoPhase::Streaming`] so retained frames never share an allocation
+    /// with the generic receive buffer. Subscriber connections send only
+    /// small chatter and stay on the receive buffer.
+    reader: Option<VideoRecordReader>,
 }
 
 impl VideoConn {
@@ -4859,6 +5050,7 @@ impl VideoConn {
             stream_id: None,
             role: None,
             cipher: None,
+            reader: None,
         }
     }
 }
@@ -5052,10 +5244,11 @@ struct VideoStream {
 }
 
 /// One cached frame in a stream's fast-start ring. `data` is the inner
-/// [`video::write_video_frame`] plaintext (13-byte header plus H.264), shared so
-/// fan-out to many subscribers does not copy it.
+/// [`video::write_video_frame`] plaintext (17-byte header plus bitstream),
+/// shared so fan-out to many subscribers does not copy it. Ring budgets charge
+/// [`SharedVideoFrame::retained_bytes`], the allocation actually held.
 struct VideoRingFrame {
-    data: Arc<[u8]>,
+    data: SharedVideoFrame,
     is_key: bool,
 }
 
@@ -6777,7 +6970,7 @@ mod tests {
         let mut bytes = Vec::new();
         video::write_video_frame(&mut bytes, 0, is_key, 0, &[0u8; 8]);
         VideoRingFrame {
-            data: Arc::from(bytes),
+            data: SharedVideoFrame::copy_from_slice(&bytes),
             is_key,
         }
     }
@@ -7261,7 +7454,127 @@ mod tests {
         let stream = server.streams.get(&stream_id).unwrap();
         assert_eq!(stream.ring.len(), 1);
         assert!(stream.ring[0].is_key);
-        assert_eq!(stream.ring_bytes, key.len());
+        assert_eq!(stream.ring_bytes, key.retained_bytes());
+    }
+
+    #[test]
+    fn streaming_publisher_reader_retains_frames_zero_copy() {
+        let mut server = test_server();
+        let stream_id = StreamId(1);
+        server
+            .streams
+            .insert(stream_id, test_stream(RoomId(1), SessionId(1)));
+
+        let secret = [9u8; KEY_LEN];
+        let (client_send, client_recv) = derive_video_keys(&secret, VideoKeyRole::Client);
+        let mut client_cipher = TransportCipher::new(client_send, client_recv);
+        let (server_send, server_recv) = derive_video_keys(&secret, VideoKeyRole::Server);
+        let server_cipher = TransportCipher::new(server_send, server_recv);
+
+        let token = Token(5);
+        let (mut conn, mut peer) = test_live_client();
+        let mut video = VideoConn::new();
+        video.phase = VideoPhase::Streaming;
+        video.session_id = Some(SessionId(1));
+        video.stream_id = Some(stream_id);
+        video.role = Some(VideoRole::Publisher);
+        video.cipher = Some(server_cipher);
+        conn.kind = ConnKind::Video(video);
+
+        let seal_record = |cipher: &mut TransportCipher, is_key: bool, body: &[u8]| {
+            let mut inner = Vec::new();
+            video::write_video_frame(&mut inner, 0, is_key, stream_id.0, body);
+            let sealed = cipher.seal_next(CHANNEL_VIDEO, &inner).expect("seal");
+            let mut record = Vec::new();
+            video::write_record(&mut record, &sealed).expect("record");
+            (inner, record)
+        };
+
+        // The first record lands in the generic receive buffer before the
+        // reader attaches, becoming the residual the reader must drain.
+        let (key_inner, key_record) = seal_record(&mut client_cipher, true, &[1u8; 8]);
+        peer.write_all(&key_record).expect("write key record");
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while conn.read_buf.len() < key_record.len() {
+            assert!(Instant::now() < deadline, "residual never arrived");
+            conn.readiness.mark_ready();
+            read_into_buffer(
+                &conn.socket,
+                &mut conn.read_buf,
+                &mut conn.readiness,
+                READ_BUDGET_BYTES,
+                ReadLimit::ByteBudget(READ_BUDGET_BYTES),
+            )
+            .expect("fill residual");
+        }
+        let ConnKind::Video(video) = &mut conn.kind else {
+            unreachable!()
+        };
+        video.reader = Some(VideoRecordReader::new());
+        server.clients.insert(token, conn);
+
+        // The second record flows through the exact per-record reader.
+        let (delta_inner, delta_record) = seal_record(&mut client_cipher, false, &[2u8; 16]);
+        peer.write_all(&delta_record).expect("write delta record");
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while server.streams.get(&stream_id).expect("stream").ring.len() < 2 {
+            assert!(Instant::now() < deadline, "frames never published");
+            server
+                .clients
+                .get_mut(&token)
+                .expect("publisher connected")
+                .readiness
+                .mark_ready();
+            server.read_video_conn(token);
+        }
+
+        let stream = server.streams.get(&stream_id).expect("stream");
+        assert!(stream.ring[0].is_key);
+        assert!(!stream.ring[1].is_key);
+        assert_eq!(stream.ring[0].data.as_slice(), key_inner);
+        assert_eq!(stream.ring[1].data.as_slice(), delta_inner);
+        // Both frames retain exactly their sealed record allocation: the
+        // plaintext plus transport header and tag, nothing more.
+        for (frame, inner) in [
+            (&stream.ring[0], &key_inner),
+            (&stream.ring[1], &delta_inner),
+        ] {
+            assert_eq!(
+                frame.data.retained_bytes(),
+                inner.len() + TRANSPORT_HEADER_LEN + TAG_LEN
+            );
+        }
+        assert_eq!(
+            stream.ring_bytes,
+            stream.ring[0].data.retained_bytes() + stream.ring[1].data.retained_bytes()
+        );
+    }
+
+    #[test]
+    fn ring_accounting_charges_retained_bytes_not_visible_bytes() {
+        let mut server = test_server();
+        let stream_id = StreamId(1);
+        server
+            .streams
+            .insert(stream_id, test_stream(RoomId(1), SessionId(1)));
+
+        let mut record = Vec::with_capacity(TRANSPORT_HEADER_LEN + 24 + TAG_LEN);
+        record.extend_from_slice(&[0u8; TRANSPORT_HEADER_LEN]);
+        video::write_video_frame(&mut record, 0, true, 0, &[0u8; 7]);
+        record.extend_from_slice(&[0u8; TAG_LEN]);
+        let key = SharedVideoFrame::from_record(record, TRANSPORT_HEADER_LEN, 24);
+        assert_eq!(key.len(), 24);
+        assert!(key.retained_bytes() > key.len());
+
+        server.publish_video_frame(stream_id, key.clone(), true);
+        let delta = ring_frame(false).data;
+        server.publish_video_frame(stream_id, delta.clone(), false);
+
+        let stream = server.streams.get(&stream_id).unwrap();
+        assert_eq!(
+            stream.ring_bytes,
+            key.retained_bytes() + delta.retained_bytes()
+        );
     }
 
     #[test]

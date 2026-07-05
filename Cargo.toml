@@ -40,7 +40,6 @@ imagesize = "0.14"
 tempfile = "3.27.0"
 mimalloc = { version = "0.1.52", features = ["override"], optional = true }
 dhat = { version = "0.3", optional = true }
-bytes = "1.12.0"
 
 [features]
 default = ["audio-realtime", "mimalloc-allocator", "embed-web"]

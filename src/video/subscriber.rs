@@ -1,10 +1,12 @@
 //! Inbound screen share: a viewer's dedicated connection.
 //!
-//! The subscriber thread authenticates, reads sealed frames, decrypts each, and
-//! forwards the plaintext frame body to the browser over the web feed. The body
-//! is byte-identical to what the WebCodecs decoder expects, so it is forwarded
-//! without re-framing. The thread auto-reconnects on disconnect or overflow,
-//! getting a fresh keyframe from the server's fast-start cache each time.
+//! The subscriber thread authenticates, then reads each sealed frame record
+//! into its own exact allocation through [`VideoRecordReader`], decrypts it in
+//! place, and forwards the plaintext window to the browser as a
+//! [`SharedVideoFrame`]. The body is byte-identical to what the WebCodecs
+//! decoder expects, so it is forwarded without re-framing or copying. The
+//! thread auto-reconnects on disconnect or overflow, getting a fresh keyframe
+//! from the server's fast-start cache each time.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -14,14 +16,49 @@ use std::time::Duration;
 use rpc::{
     crypto::{CHANNEL_VIDEO, TRANSPORT_HEADER_LEN, TransportCipher},
     ids::{SessionId, StreamId},
-    recv::RecvBuffer,
-    video::{self, VideoRole},
+    video::{SharedVideoFrame, VideoRecordReader, VideoRole},
 };
 
 use crate::web_server::WebFeedSender;
 
 const READ_TIMEOUT: Duration = Duration::from_millis(200);
 const RECONNECT_BACKOFF: Duration = Duration::from_millis(500);
+const COPY_STATS_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Rolling per-second counters for receive-path copy behaviour: frame bytes
+/// forwarded zero-copy from exact record allocations versus handshake-residual
+/// bytes copied into the reader once at connect. Logged at most once per
+/// [`COPY_STATS_INTERVAL`].
+struct CopyStats {
+    shipped_bytes: u64,
+    copied_bytes: u64,
+    frames: u64,
+    last_log: std::time::Instant,
+}
+
+impl CopyStats {
+    fn new() -> Self {
+        Self {
+            shipped_bytes: 0,
+            copied_bytes: 0,
+            frames: 0,
+            last_log: std::time::Instant::now(),
+        }
+    }
+
+    fn maybe_log(&mut self) {
+        if self.last_log.elapsed() < COPY_STATS_INTERVAL {
+            return;
+        }
+        kvlog::debug!(
+            "video subscribe copy stats",
+            shipped_bytes = self.shipped_bytes,
+            copied_bytes = self.copied_bytes,
+            frames = self.frames
+        );
+        *self = Self::new();
+    }
+}
 
 /// Handle to an active viewer connection. Dropping it tears the connection down.
 pub struct SubscriberHandle {
@@ -114,12 +151,25 @@ fn run_once(
         .map_err(|error| error.to_string())?;
     kvlog::info!("video subscriber connected", stream_id = stream_id.0);
 
+    let mut copy_stats = CopyStats::new();
+    let mut reader = VideoRecordReader::new();
+    // Bytes the handshake read past the ack drain into exact per-record
+    // storage, the one copy this connection ever makes.
+    while !recv.is_empty() {
+        let taken = reader
+            .accept(recv.pending())
+            .map_err(|error| error.to_string())?;
+        copy_stats.copied_bytes += taken as u64;
+        recv.consume(taken);
+        forward_ready_record(&mut reader, &mut cipher, feed, &mut copy_stats)?;
+    }
+
     loop {
         if stop.load(Ordering::SeqCst) {
             return Ok(());
         }
-        forward_buffered_frames(&mut recv, &mut cipher, feed)?;
-        match recv.fill(&stream, super::VIDEO_READ_CHUNK_BYTES) {
+        forward_ready_record(&mut reader, &mut cipher, feed, &mut copy_stats)?;
+        match reader.fill(&stream, super::VIDEO_READ_CHUNK_BYTES) {
             Ok(0) => return Err("video connection closed".to_string()),
             Ok(_) => {}
             Err(error)
@@ -132,35 +182,86 @@ fn run_once(
     }
 }
 
-/// Decrypts every whole record buffered in `recv` in place and forwards the
-/// plaintext to the browser. A read usually delivers exactly one whole record,
-/// and that record's buffer is shipped to the feed as-is rather than copied;
-/// only records sharing the buffer with following bytes are copied out.
-fn forward_buffered_frames(
-    recv: &mut RecvBuffer,
+/// Forwards the reader's completed record, when one is buffered: decrypts it
+/// in place in its own exact allocation and hands the plaintext window to the
+/// browser as a [`SharedVideoFrame`] without copying.
+fn forward_ready_record(
+    reader: &mut VideoRecordReader,
     cipher: &mut TransportCipher,
     feed: &WebFeedSender,
+    copy_stats: &mut CopyStats,
 ) -> Result<(), String> {
-    const PLAINTEXT_START: usize = video::VIDEO_LENGTH_PREFIX_LEN + TRANSPORT_HEADER_LEN;
-    loop {
-        let total = match video::parse_record(recv.pending()) {
-            Ok(Some((_, total))) => total,
-            Ok(None) => return Ok(()),
-            Err(error) => return Err(error.to_string()),
-        };
-        let plaintext_len = {
-            let record = &mut recv.pending_mut()[video::VIDEO_LENGTH_PREFIX_LEN..total];
-            cipher
-                .open_next_in_place(CHANNEL_VIDEO, record)
-                .map_err(|error| error.to_string())?
-                .len()
-        };
-        if recv.len() == total {
-            feed.send_video_frame(recv.ship(PLAINTEXT_START, plaintext_len));
-        } else {
-            let plaintext = &recv.pending()[PLAINTEXT_START..PLAINTEXT_START + plaintext_len];
-            feed.send_video_frame(plaintext.to_vec());
-            recv.consume(total);
+    let Some(record) = reader.take_record() else {
+        return Ok(());
+    };
+    let frame = open_record_frame(record, cipher)?;
+    copy_stats.shipped_bytes += frame.len() as u64;
+    copy_stats.frames += 1;
+    copy_stats.maybe_log();
+    feed.send_video_frame(frame);
+    Ok(())
+}
+
+/// Decrypts one whole sealed record body in place and wraps its plaintext
+/// window, keeping the record's exact allocation as the frame's backing.
+fn open_record_frame(
+    mut record: Vec<u8>,
+    cipher: &mut TransportCipher,
+) -> Result<SharedVideoFrame, String> {
+    let plaintext_len = cipher
+        .open_next_in_place(CHANNEL_VIDEO, &mut record)
+        .map_err(|error| error.to_string())?
+        .len();
+    Ok(SharedVideoFrame::from_record(
+        record,
+        TRANSPORT_HEADER_LEN,
+        plaintext_len,
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rpc::crypto::{KEY_LEN, TAG_LEN, VideoKeyRole, derive_video_keys};
+    use rpc::video;
+
+    #[test]
+    fn multi_record_residual_forwards_exact_backed_frames() {
+        let secret = [3u8; KEY_LEN];
+        let (server_send, server_recv) = derive_video_keys(&secret, VideoKeyRole::Server);
+        let mut server_cipher = TransportCipher::new(server_send, server_recv);
+        let (client_send, client_recv) = derive_video_keys(&secret, VideoKeyRole::Client);
+        let mut client_cipher = TransportCipher::new(client_send, client_recv);
+
+        let mut inners = Vec::new();
+        let mut residual = Vec::new();
+        for (ts_ms, body) in [(1i64, vec![1u8; 8]), (2, vec![2u8; 24]), (3, vec![3u8; 4])] {
+            let mut inner = Vec::new();
+            video::write_video_frame(&mut inner, ts_ms, ts_ms == 1, 7, &body);
+            let sealed = server_cipher.seal_next(CHANNEL_VIDEO, &inner).unwrap();
+            video::write_record(&mut residual, &sealed).unwrap();
+            inners.push(inner);
+        }
+
+        let mut reader = VideoRecordReader::new();
+        let mut offset = 0;
+        let mut frames = Vec::new();
+        while offset < residual.len() || reader.record_ready() {
+            let taken = reader.accept(&residual[offset..]).unwrap();
+            offset += taken;
+            if let Some(record) = reader.take_record() {
+                frames.push(open_record_frame(record, &mut client_cipher).unwrap());
+            }
+        }
+
+        assert_eq!(frames.len(), inners.len());
+        for (frame, inner) in frames.iter().zip(&inners) {
+            assert_eq!(frame.as_slice(), inner);
+            // Each frame keeps exactly its own sealed record allocation.
+            assert_eq!(
+                frame.retained_bytes(),
+                inner.len() + TRANSPORT_HEADER_LEN + TAG_LEN
+            );
         }
     }
 }

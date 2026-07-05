@@ -18,4 +18,3 @@ libc = "0.2"
 foldhash = "0.2.0"
 hashbrown = "0.17.1"
 mimalloc = { version = "0.1.52", features = ["override"] }
-bytes = "1.12.0"
