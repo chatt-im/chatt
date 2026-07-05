@@ -39,6 +39,10 @@ use rpc::{
         TransportCipher, VideoKeyRole, derive_video_keys, encode_hex, issue_dynamic_token,
         respond_to_client_hello, respond_to_client_hello_plaintext, verify_dynamic_token,
     },
+    evented::{
+        MioReady, ReadLimit, Readiness, WriteQueue, is_interrupted_io_error, read_into_buffer,
+        recv_datagram_with, write_queue_to,
+    },
     frame,
     ids::{BugReportId, FileTransferId, MessageId, RoomId, SessionId, StreamId, UserId},
     media::{self, MediaPayload},
@@ -52,6 +56,8 @@ use local_admin::{AdminCommand, AdminSocket};
 use room_store::RoomStore;
 use user_store::UserStore;
 
+#[cfg(test)]
+use rpc::evented::ReadPumpOutcome;
 #[cfg(test)]
 use rpc::history;
 
@@ -67,6 +73,9 @@ const DEFAULT_ROOM: RoomId = RoomId(1);
 const POLL_TIMEOUT: Duration = Duration::from_millis(100);
 const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(20);
 const MAX_CLIENTS: usize = 1024;
+const ACCEPT_BUDGET: usize = 64;
+const TCP_WRITE_ATTEMPTS: usize = 32;
+const UDP_DRAIN_BUDGET: usize = 64;
 /// Minimum spare capacity ensured before each direct read into a connection's
 /// receive buffer. The buffer grows past this on demand (a full file-chunk
 /// frame arrives in a couple of reads once its capacity has ramped), while
@@ -137,45 +146,6 @@ const AUDIO_POP_PACKET_FLAG_SILENCE_HINT: u8 = 0x02;
 const AUDIO_POP_PACKET_FLAG_SILENCE_RESUME: u8 = 0x04;
 const AUDIO_POP_PACKET_FLAG_MUTE: u8 = 0x08;
 
-#[repr(transparent)]
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-struct Readiness(bool);
-
-impl Readiness {
-    #[inline]
-    fn new() -> Self {
-        Self(false)
-    }
-
-    #[cfg(test)]
-    #[inline]
-    fn primed() -> Self {
-        Self(true)
-    }
-
-    #[inline]
-    fn mark_ready(&mut self) {
-        self.0 = true;
-    }
-
-    #[inline]
-    fn mark_drained(&mut self) {
-        self.0 = false;
-    }
-
-    #[inline]
-    fn is_ready(self) -> bool {
-        self.0
-    }
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-struct ReadPumpOutcome {
-    bytes_read: usize,
-    hit_budget: bool,
-    disconnected: bool,
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct UdpDrainTasks {
     mask: u8,
@@ -186,6 +156,7 @@ struct LoopWork {
     accept_clients: bool,
     udp_drains: u8,
     client_reads: VecDeque<Token>,
+    client_writes: VecDeque<Token>,
 }
 
 impl LoopWork {
@@ -200,13 +171,23 @@ impl LoopWork {
 
     #[inline]
     fn has_immediate_work(&self) -> bool {
-        self.accept_clients || self.udp_drains != 0 || !self.client_reads.is_empty()
+        self.accept_clients
+            || self.udp_drains != 0
+            || !self.client_reads.is_empty()
+            || !self.client_writes.is_empty()
     }
 
     #[inline]
     fn queue_client_read(&mut self, token: Token) {
         if !self.client_reads.contains(&token) {
             self.client_reads.push_back(token);
+        }
+    }
+
+    #[inline]
+    fn queue_client_write(&mut self, token: Token) {
+        if !self.client_writes.contains(&token) {
+            self.client_writes.push_back(token);
         }
     }
 
@@ -252,9 +233,24 @@ impl LoopWork {
         self.client_reads.pop_front()
     }
 
+    #[inline]
+    fn client_write_count(&self) -> usize {
+        self.client_writes.len()
+    }
+
+    #[inline]
+    fn pop_client_write(&mut self) -> Option<Token> {
+        self.client_writes.pop_front()
+    }
+
     #[cfg(test)]
     fn queued_client_reads(&self) -> Vec<Token> {
         self.client_reads.iter().copied().collect()
+    }
+
+    #[cfg(test)]
+    fn queued_client_writes(&self) -> Vec<Token> {
+        self.client_writes.iter().copied().collect()
     }
 }
 
@@ -276,62 +272,11 @@ impl Iterator for UdpDrainTasks {
 }
 
 #[inline]
-fn recv_udp_datagram_with(
-    buf: &mut [u8],
-    mut recv_from: impl FnMut(&mut [u8]) -> io::Result<(usize, SocketAddr)>,
-) -> io::Result<Option<(usize, SocketAddr)>> {
-    loop {
-        match recv_from(buf) {
-            Ok(value) => return Ok(Some(value)),
-            Err(error) if is_interrupted_io_error(&error) => continue,
-            Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(None),
-            Err(error) => return Err(error),
-        }
-    }
-}
-
-#[inline]
 fn recv_udp_datagram(
     socket: &UdpSocket,
     buf: &mut [u8],
 ) -> io::Result<Option<(usize, SocketAddr)>> {
-    recv_udp_datagram_with(buf, |buf| socket.recv_from(buf))
-}
-
-#[inline]
-fn read_socket_into_buffer(
-    socket: &impl std::os::fd::AsRawFd,
-    read_buf: &mut RecvBuffer,
-    readiness: &mut Readiness,
-    read_chunk_bytes: usize,
-    read_budget_bytes: usize,
-) -> io::Result<ReadPumpOutcome> {
-    debug_assert!(read_chunk_bytes > 0);
-    debug_assert!(read_budget_bytes > 0);
-
-    let mut outcome = ReadPumpOutcome::default();
-    while readiness.is_ready() {
-        match read_buf.fill(socket, read_chunk_bytes) {
-            Ok(0) => {
-                readiness.mark_drained();
-                outcome.disconnected = true;
-                break;
-            }
-            Ok(read) => {
-                outcome.bytes_read += read;
-                if outcome.bytes_read >= read_budget_bytes {
-                    outcome.hit_budget = true;
-                    break;
-                }
-            }
-            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                readiness.mark_drained();
-                break;
-            }
-            Err(error) => return Err(error),
-        }
-    }
-    Ok(outcome)
+    recv_datagram_with(buf, |buf| socket.recv_from(buf))
 }
 
 /// Runs the server command-line entry point: parses `std::env::args`, handles
@@ -645,21 +590,39 @@ impl Server {
                 return Err(error.into());
             }
             for event in events.iter() {
+                let ready = MioReady::from_event(event);
                 match event.token() {
-                    LISTENER => self.loop_work.queue_accept_clients(),
-                    UDP => self.loop_work.queue_udp_drain(0),
-                    UDP_PROBE => self.loop_work.queue_udp_drain(1),
+                    LISTENER => {
+                        if ready.readable_like() {
+                            self.loop_work.queue_accept_clients();
+                        }
+                    }
+                    UDP => {
+                        if ready.readable_like() {
+                            self.loop_work.queue_udp_drain(0);
+                        }
+                    }
+                    UDP_PROBE => {
+                        if ready.readable_like() {
+                            self.loop_work.queue_udp_drain(1);
+                        }
+                    }
                     // Wake-only; replies drain unconditionally below.
                     WAKER => {}
                     token => {
-                        if event.is_readable() {
+                        if ready.readable_like() {
                             if let Some(client) = self.clients.get_mut(&token) {
                                 client.readiness.mark_ready();
                             }
                             self.loop_work.queue_client_read(token);
                         }
-                        if event.is_writable() {
-                            self.write_client(token);
+                        if ready.writable_like()
+                            && self
+                                .clients
+                                .get(&token)
+                                .is_some_and(|client| !client.write_buf.is_empty())
+                        {
+                            self.loop_work.queue_client_write(token);
                         }
                     }
                 }
@@ -674,6 +637,12 @@ impl Server {
             for _ in 0..client_read_count {
                 if let Some(token) = self.loop_work.pop_client_read() {
                     self.read_client(token);
+                }
+            }
+            let client_write_count = self.loop_work.client_write_count();
+            for _ in 0..client_write_count {
+                if let Some(token) = self.loop_work.pop_client_write() {
+                    self.write_client(token);
                 }
             }
             self.requeue_unclogged_uploaders();
@@ -739,7 +708,12 @@ impl Server {
     }
 
     fn accept_clients(&mut self) -> io::Result<()> {
+        let mut accepted = 0usize;
         loop {
+            if accepted >= ACCEPT_BUDGET {
+                self.loop_work.queue_accept_clients();
+                return Ok(());
+            }
             let (mut socket, addr) = match self.listener.accept() {
                 Ok(value) => value,
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(()),
@@ -755,6 +729,7 @@ impl Server {
                 }
                 Err(error) => return Err(error),
             };
+            accepted += 1;
             // Accept then close over-cap connections so the backlog keeps
             // draining. Returning early would leave the listener readable with
             // an edge-triggered poll, so it would not wake again until the next
@@ -817,15 +792,15 @@ impl Server {
         // `requeue_unclogged_uploaders` sweep resumes the connection.
         let clogged = self.relay_clogged_for_reader(token);
         let mut disconnected = false;
-        let mut hit_budget = false;
+        let mut hit_limit = false;
         if let Some(client) = self.clients.get_mut(&token) {
             if !clogged {
-                match read_socket_into_buffer(
+                match read_into_buffer(
                     &client.socket,
                     &mut client.read_buf,
                     &mut client.readiness,
                     TCP_READ_CHUNK_BYTES,
-                    READ_BUDGET_BYTES,
+                    ReadLimit::ByteBudget(READ_BUDGET_BYTES),
                 ) {
                     Ok(outcome) => {
                         if outcome.bytes_read > 0 {
@@ -834,7 +809,7 @@ impl Server {
                         if outcome.disconnected {
                             kvlog::info!("tcp client closed", token = token.0);
                         }
-                        hit_budget = outcome.hit_budget;
+                        hit_limit = outcome.hit_limit;
                         disconnected = outcome.disconnected;
                     }
                     Err(error) => {
@@ -849,7 +824,7 @@ impl Server {
             self.disconnect(token);
             return;
         }
-        if hit_budget {
+        if hit_limit {
             self.loop_work.queue_client_read(token);
         }
 
@@ -3553,7 +3528,12 @@ impl Server {
 
     fn receive_udp(&mut self, probe_id: u8) {
         let mut buf = [0u8; 2048];
+        let mut datagrams = 0usize;
         loop {
+            if datagrams >= UDP_DRAIN_BUDGET {
+                self.loop_work.queue_udp_drain(probe_id);
+                break;
+            }
             let received = if probe_id == 0 {
                 recv_udp_datagram(&self.udp, &mut buf)
             } else {
@@ -3570,6 +3550,7 @@ impl Server {
                     break;
                 }
             };
+            datagrams += 1;
             let packet = &buf[..len];
             if let Err(error) = self.handle_udp_packet(probe_id, src, packet) {
                 kvlog::warn!(
@@ -4050,31 +4031,30 @@ impl Server {
 
     fn write_client(&mut self, token: Token) {
         let mut disconnected = false;
+        let mut requeue = false;
         if let Some(client) = self.clients.get_mut(&token) {
-            let mut wrote = false;
-            while !client.write_buf.is_empty() {
-                match client.socket.write(client.write_buf.pending()) {
-                    Ok(0) => break,
-                    Ok(n) => {
-                        client.write_buf.consume(n);
-                        wrote = true;
+            match write_queue_to(
+                &mut client.socket,
+                &mut client.write_buf,
+                TCP_WRITE_ATTEMPTS,
+            ) {
+                Ok(outcome) => {
+                    if outcome.bytes_written > 0 {
+                        client.last_activity = Instant::now();
                         kvlog::debug!(
                             "tcp client bytes written",
                             token = token.0,
-                            size = n,
-                            remaining = client.write_buf.len()
+                            size = outcome.bytes_written,
+                            remaining = client.write_buf.len(),
+                            attempts = outcome.attempts
                         );
                     }
-                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
-                    Err(error) => {
-                        kvlog::warn!("tcp client write failed", token = token.0, error = %error);
-                        disconnected = true;
-                        break;
-                    }
+                    requeue = outcome.hit_limit;
                 }
-            }
-            if wrote {
-                client.last_activity = Instant::now();
+                Err(error) => {
+                    kvlog::warn!("tcp client write failed", token = token.0, error = %error);
+                    disconnected = true;
+                }
             }
             if client.is_closing() && client.write_buf.is_empty() {
                 disconnected = true;
@@ -4082,6 +4062,8 @@ impl Server {
         }
         if disconnected {
             self.disconnect(token);
+        } else if requeue {
+            self.loop_work.queue_client_write(token);
         }
     }
 
@@ -4659,61 +4641,6 @@ enum Close {
     Draining { deadline: Instant },
 }
 
-/// Threshold above which [`WriteQueue::consume`] compacts the consumed prefix
-/// away. Compaction additionally requires the prefix to be at least half the
-/// buffer, keeping the memmove amortized against the bytes already written.
-const WRITE_QUEUE_COMPACT_BYTES: usize = 64 * 1024;
-
-/// Outbound byte queue drained from the front through a cursor rather than
-/// `Vec::drain`, so a partial socket write against a deep backlog (an 8 MiB
-/// video queue) does not memmove the remaining megabytes on every write.
-struct WriteQueue {
-    buf: Vec<u8>,
-    start: usize,
-}
-
-impl WriteQueue {
-    fn new() -> Self {
-        Self {
-            buf: Vec::new(),
-            start: 0,
-        }
-    }
-
-    /// Bytes queued but not yet written.
-    fn pending(&self) -> &[u8] {
-        &self.buf[self.start..]
-    }
-
-    fn len(&self) -> usize {
-        self.buf.len() - self.start
-    }
-
-    fn is_empty(&self) -> bool {
-        self.start == self.buf.len()
-    }
-
-    /// The backing vector, for encoders that append to a `Vec`. Only appends
-    /// are valid; bytes before the cursor are dead.
-    fn tail_mut(&mut self) -> &mut Vec<u8> {
-        &mut self.buf
-    }
-
-    /// Marks the next `n` pending bytes written, compacting the dead prefix
-    /// once it is both large and the majority of the buffer.
-    fn consume(&mut self, n: usize) {
-        self.start += n;
-        debug_assert!(self.start <= self.buf.len());
-        if self.start == self.buf.len() {
-            self.buf.clear();
-            self.start = 0;
-        } else if self.start >= WRITE_QUEUE_COMPACT_BYTES && self.start >= self.len() {
-            self.buf.drain(..self.start);
-            self.start = 0;
-        }
-    }
-}
-
 /// One inbound control-channel frame, parsed and decrypted in place in the
 /// connection's receive buffer by [`control_conn_step`].
 enum ControlStep {
@@ -5165,10 +5092,6 @@ fn positional_args(args: &[String]) -> Vec<&str> {
         }
     }
     out
-}
-
-fn is_interrupted_io_error(error: &io::Error) -> bool {
-    error.kind() == io::ErrorKind::Interrupted || error.raw_os_error() == Some(libc::EINTR)
 }
 
 fn is_transient_accept_error(error: &io::Error) -> bool {
@@ -6857,26 +6780,6 @@ mod tests {
     }
 
     #[test]
-    fn write_queue_consumes_through_cursor_and_compacts() {
-        let mut queue = WriteQueue::new();
-        queue.tail_mut().extend_from_slice(b"abcdef");
-        queue.consume(2);
-        assert_eq!(queue.pending(), b"cdef");
-        queue.tail_mut().extend_from_slice(b"gh");
-        assert_eq!(queue.pending(), b"cdefgh");
-        queue.consume(6);
-        assert!(queue.is_empty());
-
-        let mut queue = WriteQueue::new();
-        queue
-            .tail_mut()
-            .extend_from_slice(&vec![7u8; WRITE_QUEUE_COMPACT_BYTES + 16]);
-        queue.consume(WRITE_QUEUE_COMPACT_BYTES);
-        assert_eq!(queue.pending(), &[7u8; 16]);
-        assert_eq!(queue.start, 0);
-    }
-
-    #[test]
     fn sweep_drops_stale_handshake_but_keeps_active_connection() {
         let mut server = test_server();
         let now = Instant::now();
@@ -7007,10 +6910,16 @@ mod tests {
         let mut read_buf = RecvBuffer::new();
         let mut readiness = Readiness::primed();
 
-        let outcome =
-            read_socket_into_buffer(&reader, &mut read_buf, &mut readiness, 1, 1).unwrap();
+        let outcome = read_into_buffer(
+            &reader,
+            &mut read_buf,
+            &mut readiness,
+            1,
+            ReadLimit::ByteBudget(1),
+        )
+        .unwrap();
 
-        assert!(outcome.hit_budget);
+        assert!(outcome.hit_limit);
         assert!(!outcome.disconnected);
         assert!(outcome.bytes_read >= 1);
         assert!(readiness.is_ready());
@@ -7025,14 +6934,26 @@ mod tests {
         let mut read_buf = RecvBuffer::new();
         let mut readiness = Readiness::primed();
 
-        let outcome =
-            read_socket_into_buffer(&reader, &mut read_buf, &mut readiness, 1, 1).unwrap();
-        assert!(outcome.hit_budget);
+        let outcome = read_into_buffer(
+            &reader,
+            &mut read_buf,
+            &mut readiness,
+            1,
+            ReadLimit::ByteBudget(1),
+        )
+        .unwrap();
+        assert!(outcome.hit_limit);
         assert!(readiness.is_ready());
 
         read_buf.consume(read_buf.len());
-        let outcome =
-            read_socket_into_buffer(&reader, &mut read_buf, &mut readiness, 1, 1).unwrap();
+        let outcome = read_into_buffer(
+            &reader,
+            &mut read_buf,
+            &mut readiness,
+            1,
+            ReadLimit::ByteBudget(1),
+        )
+        .unwrap();
 
         assert_eq!(outcome, ReadPumpOutcome::default());
         assert!(!readiness.is_ready());
@@ -7050,6 +6971,8 @@ mod tests {
         work.queue_udp_drain(1);
         work.queue_client_read(Token(7));
         work.queue_client_read(Token(7));
+        work.queue_client_write(Token(9));
+        work.queue_client_write(Token(9));
 
         assert_eq!(work.poll_timeout(POLL_TIMEOUT), Duration::ZERO);
         assert!(work.take_accept_clients());
@@ -7060,6 +6983,10 @@ mod tests {
         assert_eq!(work.client_read_count(), 1);
         assert_eq!(work.pop_client_read(), Some(Token(7)));
         assert_eq!(work.pop_client_read(), None);
+        assert_eq!(work.queued_client_writes(), vec![Token(9)]);
+        assert_eq!(work.client_write_count(), 1);
+        assert_eq!(work.pop_client_write(), Some(Token(9)));
+        assert_eq!(work.pop_client_write(), None);
         assert_eq!(work.poll_timeout(POLL_TIMEOUT), POLL_TIMEOUT);
     }
 
@@ -7069,7 +6996,7 @@ mod tests {
         let mut calls = 0;
         let mut buf = [0u8; 8];
 
-        let received = recv_udp_datagram_with(&mut buf, |_| {
+        let received = recv_datagram_with(&mut buf, |_| {
             calls += 1;
             match calls {
                 1 => Err(io::Error::from_raw_os_error(libc::EINTR)),
@@ -7083,7 +7010,7 @@ mod tests {
         assert_eq!(calls, 2);
 
         let mut calls = 0;
-        let drained = recv_udp_datagram_with(&mut buf, |_| {
+        let drained: Option<(usize, SocketAddr)> = recv_datagram_with(&mut buf, |_| {
             calls += 1;
             match calls {
                 1 => Err(io::Error::from(io::ErrorKind::Interrupted)),

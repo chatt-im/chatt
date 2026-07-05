@@ -41,11 +41,15 @@ use rpc::{
         SessionSecrets, complete_client_transport_handshake, dev_server_public_key,
         ed25519_public_key_from_hex, encode_hex, generate_client_hello,
     },
+    evented::{MioReady, ReadLimit, Readiness, WriteQueue, recv_datagram_with, write_queue_to},
     frame, history,
     ids::{BugReportId, FileTransferId, MessageId, RoomId, SessionId, StreamId, UserId},
     media::{self, MediaPayload, VoicePayload as MediaVoicePayload},
     recv::RecvBuffer,
 };
+
+#[cfg(test)]
+use rpc::evented::ReadPumpOutcome;
 
 use crate::app::EventSender;
 use crate::audio::{
@@ -110,6 +114,9 @@ const MAX_BUFFERED_SERVER_BYTES: usize = 2 * 1024 * 1024;
 /// Minimum spare capacity ensured before each direct read into the TCP receive
 /// buffer; the buffer grows past this on demand during bulk transfers.
 const TCP_READ_CHUNK_BYTES: usize = 64 * 1024;
+const TCP_WRITE_ATTEMPTS: usize = 32;
+const UDP_DRAIN_BUDGET: usize = 64;
+const MDNS_DRAIN_BUDGET: usize = 32;
 /// Byte step between [`NetworkEvent::TransferProgress`] ticks. Small enough for a
 /// smooth progress bar, coarse enough to keep the event channel and web feed from
 /// flooding on a fast transfer. First and final ticks are always emitted.
@@ -124,44 +131,6 @@ const RECENT_VOICE_SEQUENCE_WORD_BITS: usize = u64::BITS as usize;
 const RECENT_VOICE_SEQUENCE_WORDS: usize =
     MAX_RECENT_VOICE_SEQUENCES / RECENT_VOICE_SEQUENCE_WORD_BITS;
 const _: () = assert!(MAX_RECENT_VOICE_SEQUENCES % RECENT_VOICE_SEQUENCE_WORD_BITS == 0);
-
-#[repr(transparent)]
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-struct Readiness(bool);
-
-impl Readiness {
-    #[cfg(test)]
-    #[inline]
-    fn new() -> Self {
-        Self(false)
-    }
-
-    #[inline]
-    fn primed() -> Self {
-        Self(true)
-    }
-
-    #[inline]
-    fn mark_ready(&mut self) {
-        self.0 = true;
-    }
-
-    #[inline]
-    fn mark_drained(&mut self) {
-        self.0 = false;
-    }
-
-    #[inline]
-    fn is_ready(self) -> bool {
-        self.0
-    }
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-struct TcpReadOutcome {
-    bytes_read: usize,
-    disconnected: bool,
-}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum WakeIntent {
@@ -199,14 +168,16 @@ impl PollSchedule {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum WorkerTask {
     TcpRead,
+    TcpWrite,
     UdpDrain,
     MdnsDrain(Token),
 }
 
 const WORK_TCP_READ: u8 = 1 << 0;
-const WORK_UDP_DRAIN: u8 = 1 << 1;
-const WORK_MDNS_V4_DRAIN: u8 = 1 << 2;
-const WORK_MDNS_V6_DRAIN: u8 = 1 << 3;
+const WORK_TCP_WRITE: u8 = 1 << 1;
+const WORK_UDP_DRAIN: u8 = 1 << 2;
+const WORK_MDNS_V4_DRAIN: u8 = 1 << 3;
+const WORK_MDNS_V6_DRAIN: u8 = 1 << 4;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct WorkerWork {
@@ -231,6 +202,11 @@ impl WorkerWork {
     #[inline]
     fn queue_tcp_read(&mut self) {
         self.bits |= WORK_TCP_READ;
+    }
+
+    #[inline]
+    fn queue_tcp_write(&mut self) {
+        self.bits |= WORK_TCP_WRITE;
     }
 
     #[inline]
@@ -269,6 +245,10 @@ impl Iterator for WorkerTasks {
             self.bits &= !WORK_TCP_READ;
             return Some(WorkerTask::TcpRead);
         }
+        if self.bits & WORK_TCP_WRITE != 0 {
+            self.bits &= !WORK_TCP_WRITE;
+            return Some(WorkerTask::TcpWrite);
+        }
         if self.bits & WORK_UDP_DRAIN != 0 {
             self.bits &= !WORK_UDP_DRAIN;
             return Some(WorkerTask::UdpDrain);
@@ -285,38 +265,6 @@ impl Iterator for WorkerTasks {
     }
 }
 
-#[inline]
-fn read_tcp_into_buffer(
-    socket: &impl std::os::fd::AsRawFd,
-    read_buf: &mut RecvBuffer,
-    readiness: &mut Readiness,
-    read_chunk_bytes: usize,
-    max_buffered_bytes: usize,
-) -> io::Result<TcpReadOutcome> {
-    debug_assert!(read_chunk_bytes > 0);
-    debug_assert!(max_buffered_bytes > 0);
-
-    let mut outcome = TcpReadOutcome::default();
-    while readiness.is_ready() && read_buf.len() < max_buffered_bytes {
-        match read_buf.fill(socket, read_chunk_bytes) {
-            Ok(0) => {
-                readiness.mark_drained();
-                outcome.disconnected = true;
-                break;
-            }
-            Ok(read) => {
-                outcome.bytes_read += read;
-            }
-            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                readiness.mark_drained();
-                break;
-            }
-            Err(error) => return Err(error),
-        }
-    }
-    Ok(outcome)
-}
-
 #[cfg(test)]
 #[inline]
 fn tcp_receive_work_ready(readiness: Readiness, read_buf: &RecvBuffer) -> bool {
@@ -324,31 +272,11 @@ fn tcp_receive_work_ready(readiness: Readiness, read_buf: &RecvBuffer) -> bool {
 }
 
 #[inline]
-fn is_interrupted_io_error(error: &io::Error) -> bool {
-    error.kind() == io::ErrorKind::Interrupted || error.raw_os_error() == Some(libc::EINTR)
-}
-
-#[inline]
-fn recv_udp_datagram_with(
-    buf: &mut [u8],
-    mut recv_from: impl FnMut(&mut [u8]) -> io::Result<(usize, SocketAddr)>,
-) -> io::Result<Option<(usize, SocketAddr)>> {
-    loop {
-        match recv_from(buf) {
-            Ok(value) => return Ok(Some(value)),
-            Err(error) if is_interrupted_io_error(&error) => continue,
-            Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(None),
-            Err(error) => return Err(error),
-        }
-    }
-}
-
-#[inline]
 fn recv_udp_datagram(
     socket: &UdpSocket,
     buf: &mut [u8],
 ) -> io::Result<Option<(usize, SocketAddr)>> {
-    recv_udp_datagram_with(buf, |buf| socket.recv_from(buf))
+    recv_datagram_with(buf, |buf| socket.recv_from(buf))
 }
 
 #[cfg(test)]
@@ -1051,7 +979,7 @@ fn run_worker_inner(
         // Starts true so the first loop iteration reads anything that arrived
         // before the socket was registered with the poll.
         tcp_readiness: Readiness::primed(),
-        write_buf: Vec::new(),
+        write_buf: WriteQueue::new(),
         media_packet: Vec::new(),
         media_scratch: Vec::new(),
         p2p_routes: Vec::new(),
@@ -1162,19 +1090,30 @@ fn run_worker_inner(
                     // control processing frees buffer space. Consuming the
                     // edge-triggered event without draining the socket would
                     // otherwise strand the remaining bytes forever.
-                    if event.is_readable() {
+                    let ready = MioReady::from_event(event);
+                    if ready.readable_like() {
                         worker.tcp_readiness.mark_ready();
                         worker.loop_work.queue_tcp_read();
                     }
-                    if event.is_writable() {
-                        if let Err(error) = worker.write_tcp() {
-                            return SessionEnd::Disconnected(error);
-                        }
+                    if ready.writable_like() && !worker.write_buf.is_empty() {
+                        worker.loop_work.queue_tcp_write();
                     }
                 }
-                UDP => worker.loop_work.queue_udp_drain(),
-                MDNS_V4 => worker.loop_work.queue_mdns_drain(MDNS_V4),
-                MDNS_V6 => worker.loop_work.queue_mdns_drain(MDNS_V6),
+                UDP => {
+                    if MioReady::from_event(event).readable_like() {
+                        worker.loop_work.queue_udp_drain();
+                    }
+                }
+                MDNS_V4 => {
+                    if MioReady::from_event(event).readable_like() {
+                        worker.loop_work.queue_mdns_drain(MDNS_V4);
+                    }
+                }
+                MDNS_V6 => {
+                    if MioReady::from_event(event).readable_like() {
+                        worker.loop_work.queue_mdns_drain(MDNS_V6);
+                    }
+                }
                 WAKE => {}
                 _ => {}
             }
@@ -1554,7 +1493,7 @@ struct WorkerState {
     /// remaining kernel bytes: no new readable edge fires while the sender is
     /// blocked on our zero receive window.
     tcp_readiness: Readiness,
-    write_buf: Vec<u8>,
+    write_buf: WriteQueue,
     /// Reusable buffers for the outbound media seal path, cleared on each use so
     /// the per-frame voice send does not allocate. `media_packet` holds the UDP
     /// datagram, `media_scratch` the encoded plaintext, and `p2p_routes` the
@@ -2458,6 +2397,7 @@ impl WorkerState {
                         self.read_tcp()?;
                     }
                 }
+                WorkerTask::TcpWrite => self.write_tcp()?,
                 WorkerTask::UdpDrain => self.read_udp(),
                 WorkerTask::MdnsDrain(token) => self.handle_mdns_readable(token, Instant::now()),
             }
@@ -2547,7 +2487,8 @@ impl WorkerState {
             .control
             .seal_next(CHANNEL_CONTROL, &payload)
             .map_err(|error| error.to_string())?;
-        frame::encode_frame(&encrypted, &mut self.write_buf).map_err(|error| error.to_string())?;
+        frame::encode_frame(&encrypted, self.write_buf.tail_mut())
+            .map_err(|error| error.to_string())?;
         kvlog::debug!(
             "client control queued",
             kind = client_control_kind(&control),
@@ -2564,12 +2505,12 @@ impl WorkerState {
     /// buffer cap leaves it set so the main loop retries after
     /// `process_server_controls` frees buffer space.
     fn read_tcp(&mut self) -> Result<(), String> {
-        let outcome = read_tcp_into_buffer(
+        let outcome = rpc::evented::read_into_buffer(
             &self.tcp,
             &mut self.read_buf,
             &mut self.tcp_readiness,
             TCP_READ_CHUNK_BYTES,
-            MAX_BUFFERED_SERVER_BYTES,
+            ReadLimit::MaxBuffered(MAX_BUFFERED_SERVER_BYTES),
         )
         .map_err(|error| {
             kvlog::warn!("tcp read failed", error = %error);
@@ -2635,30 +2576,28 @@ impl WorkerState {
     }
 
     fn write_tcp(&mut self) -> Result<(), String> {
-        while !self.write_buf.is_empty() {
-            match self.tcp.write(&self.write_buf) {
-                Ok(0) => break,
-                Ok(n) => {
-                    self.write_buf.drain(..n);
-                    kvlog::debug!(
-                        "tcp bytes written",
-                        size = n,
-                        remaining = self.write_buf.len()
-                    );
-                }
-                Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
-                Err(error) => {
-                    kvlog::warn!("tcp write failed", error = %error);
-                    return Err(format!("TCP write failed: {error}"));
-                }
-            }
+        let outcome = write_queue_to(&mut self.tcp, &mut self.write_buf, TCP_WRITE_ATTEMPTS)
+            .map_err(|error| {
+                kvlog::warn!("tcp write failed", error = %error);
+                format!("TCP write failed: {error}")
+            })?;
+        if outcome.bytes_written > 0 {
+            kvlog::debug!(
+                "tcp bytes written",
+                size = outcome.bytes_written,
+                attempts = outcome.attempts,
+                remaining = self.write_buf.len()
+            );
+        }
+        if outcome.hit_limit {
+            self.loop_work.queue_tcp_write();
         }
         Ok(())
     }
 
     fn read_udp(&mut self) {
         let mut buf = [0u8; 2048];
-        let mut datagrams_this_wake: u32 = 0;
+        let mut datagrams_this_wake = 0usize;
         loop {
             let (len, src) = match recv_udp_datagram(&self.udp, &mut buf) {
                 Ok(Some(value)) => value,
@@ -2686,101 +2625,101 @@ impl WorkerState {
             let now = Instant::now();
             if is_stun_message(packet) {
                 self.handle_p2p_stun(now, src, packet);
-                continue;
-            }
-            if self.handle_p2p_media(now, src, packet) {
-                continue;
-            }
-            if src != self.server_udp_addr {
+            } else if self.handle_p2p_media(now, src, packet) {
+            } else if src != self.server_udp_addr {
                 kvlog::warn!(
                     "udp packet ignored",
                     addr = %src,
                     expected_addr = %self.server_udp_addr,
                     packet_size = len
                 );
-                continue;
-            }
-            match self.open_server_media(packet) {
-                Ok((
-                    _,
-                    MediaPayload::Voice {
-                        stream_id,
-                        sequence,
-                        timestamp,
-                        flags,
-                        payload,
-                    },
-                )) => {
-                    let payload_size = payload.len();
-                    let payload_kind = media_voice_payload_kind(&payload);
-                    kvlog::info!(
-                        "voice packet received",
-                        route = "server",
-                        stream_id = stream_id.0,
-                        sequence,
-                        flags,
-                        payload_size,
-                        payload_kind
-                    );
-                    log_audio_pop_media_packet(
-                        "rx",
-                        "server",
-                        stream_id.0,
-                        sequence,
-                        flags,
-                        payload_size,
-                        payload_kind,
-                    );
-                    self.dispatch_voice_packet(
-                        RemoteVoicePacket {
-                            stream_id: stream_id.0,
+            } else {
+                match self.open_server_media(packet) {
+                    Ok((
+                        _,
+                        MediaPayload::Voice {
+                            stream_id,
                             sequence,
                             timestamp,
                             flags,
-                            payload: audio_payload_from_media(payload),
-                            received_at: now,
+                            payload,
                         },
-                        "server",
-                    );
-                }
-                Ok((_, MediaPayload::Pong { nonce })) => {
-                    if let Some(sample) =
-                        take_rtt_sample(&mut self.server_rtt_in_flight, nonce, now)
-                    {
-                        let rtt = fold_rtt_ewma(self.server_rtt_ms, sample);
-                        self.server_rtt_ms = Some(rtt);
-                        self.server_rtt_last_sample_at = Some(now);
-                        let _ = self.events.send(NetworkEvent::ServerRtt {
-                            rtt_ms: Some(clamp_rtt_ms(rtt)),
-                        });
-                        self.publish_all_relay_rtts();
+                    )) => {
+                        let payload_size = payload.len();
+                        let payload_kind = media_voice_payload_kind(&payload);
+                        kvlog::info!(
+                            "voice packet received",
+                            route = "server",
+                            stream_id = stream_id.0,
+                            sequence,
+                            flags,
+                            payload_size,
+                            payload_kind
+                        );
+                        log_audio_pop_media_packet(
+                            "rx",
+                            "server",
+                            stream_id.0,
+                            sequence,
+                            flags,
+                            payload_size,
+                            payload_kind,
+                        );
+                        self.dispatch_voice_packet(
+                            RemoteVoicePacket {
+                                stream_id: stream_id.0,
+                                sequence,
+                                timestamp,
+                                flags,
+                                payload: audio_payload_from_media(payload),
+                                received_at: now,
+                            },
+                            "server",
+                        );
+                    }
+                    Ok((_, MediaPayload::Pong { nonce })) => {
+                        if let Some(sample) =
+                            take_rtt_sample(&mut self.server_rtt_in_flight, nonce, now)
+                        {
+                            let rtt = fold_rtt_ewma(self.server_rtt_ms, sample);
+                            self.server_rtt_ms = Some(rtt);
+                            self.server_rtt_last_sample_at = Some(now);
+                            let _ = self.events.send(NetworkEvent::ServerRtt {
+                                rtt_ms: Some(clamp_rtt_ms(rtt)),
+                            });
+                            self.publish_all_relay_rtts();
+                        }
+                    }
+                    Ok((
+                        _,
+                        MediaPayload::VoiceFeedback {
+                            stream_id,
+                            feedback,
+                        },
+                    )) => {
+                        let feedback = live_feedback_from_media(stream_id, feedback);
+                        self.handle_encoder_feedback(feedback, now);
+                    }
+                    Ok((_, MediaPayload::Ping { nonce, .. })) => {
+                        self.send_media(&MediaPayload::Pong { nonce });
+                    }
+                    Ok((_, MediaPayload::Bind { .. })) => {}
+                    Ok((_, MediaPayload::NatProbe { .. })) => {}
+                    Ok((
+                        _,
+                        MediaPayload::PeerVoice { .. } | MediaPayload::PeerVoiceFeedback { .. },
+                    )) => {}
+                    Err(error) => {
+                        kvlog::warn!("udp packet rejected", packet_size = len, error = %error);
+                        let _ = self
+                            .events
+                            .send(NetworkEvent::Error(format!("UDP packet rejected: {error}")));
                     }
                 }
-                Ok((
-                    _,
-                    MediaPayload::VoiceFeedback {
-                        stream_id,
-                        feedback,
-                    },
-                )) => {
-                    let feedback = live_feedback_from_media(stream_id, feedback);
-                    self.handle_encoder_feedback(feedback, now);
-                }
-                Ok((_, MediaPayload::Ping { nonce, .. })) => {
-                    self.send_media(&MediaPayload::Pong { nonce });
-                }
-                Ok((_, MediaPayload::Bind { .. })) => {}
-                Ok((_, MediaPayload::NatProbe { .. })) => {}
-                Ok((
-                    _,
-                    MediaPayload::PeerVoice { .. } | MediaPayload::PeerVoiceFeedback { .. },
-                )) => {}
-                Err(error) => {
-                    kvlog::warn!("udp packet rejected", packet_size = len, error = %error);
-                    let _ = self
-                        .events
-                        .send(NetworkEvent::Error(format!("UDP packet rejected: {error}")));
-                }
+            }
+            if datagrams_this_wake >= UDP_DRAIN_BUDGET {
+                self.loop_work.queue_udp_drain();
+                break;
             }
         }
     }
@@ -4655,8 +4594,8 @@ impl WorkerState {
     /// Drains resolved mDNS answers on the given socket, feeding each one into
     /// the matching peer's agent. Also answers inbound queries for local names.
     fn handle_mdns_readable(&mut self, token: Token, now: Instant) {
-        let resolved = self.mdns.handle_readable(token, now);
-        for (name, ip) in resolved {
+        let outcome = self.mdns.handle_readable(token, now, MDNS_DRAIN_BUDGET);
+        for (name, ip) in outcome.resolved {
             let Some(pending) = self.mdns_pending.remove(&name) else {
                 continue;
             };
@@ -4667,6 +4606,9 @@ impl WorkerState {
             };
             kvlog::info!("p2p mdns candidate resolved", name = name.as_str(), addr = %addr);
             peer.agent.add_remote_candidate(now, candidate);
+        }
+        if outcome.hit_limit {
+            self.loop_work.queue_mdns_drain(token);
         }
     }
 
@@ -6489,13 +6431,13 @@ mod tests {
 
     #[test]
     fn interrupted_io_errors_are_retryable() {
-        assert!(is_interrupted_io_error(&io::Error::from(
+        assert!(rpc::evented::is_interrupted_io_error(&io::Error::from(
             io::ErrorKind::Interrupted
         )));
-        assert!(is_interrupted_io_error(&io::Error::from_raw_os_error(
-            libc::EINTR
-        )));
-        assert!(!is_interrupted_io_error(&io::Error::from(
+        assert!(rpc::evented::is_interrupted_io_error(
+            &io::Error::from_raw_os_error(libc::EINTR)
+        ));
+        assert!(!rpc::evented::is_interrupted_io_error(&io::Error::from(
             io::ErrorKind::WouldBlock
         )));
     }
@@ -6507,6 +6449,8 @@ mod tests {
 
         work.queue_tcp_read();
         work.queue_tcp_read();
+        work.queue_tcp_write();
+        work.queue_tcp_write();
         work.queue_udp_drain();
         work.queue_udp_drain();
         work.queue_mdns_drain(MDNS_V4);
@@ -6519,6 +6463,7 @@ mod tests {
             tasks,
             vec![
                 WorkerTask::TcpRead,
+                WorkerTask::TcpWrite,
                 WorkerTask::UdpDrain,
                 WorkerTask::MdnsDrain(MDNS_V4),
                 WorkerTask::MdnsDrain(MDNS_V6),
@@ -6533,7 +6478,7 @@ mod tests {
         let mut calls = 0;
         let mut buf = [0u8; 8];
 
-        let received = recv_udp_datagram_with(&mut buf, |_| {
+        let received = recv_datagram_with(&mut buf, |_| {
             calls += 1;
             match calls {
                 1 => Err(io::Error::from_raw_os_error(libc::EINTR)),
@@ -6547,7 +6492,7 @@ mod tests {
         assert_eq!(calls, 2);
 
         let mut calls = 0;
-        let drained = recv_udp_datagram_with(&mut buf, |_| {
+        let drained: Option<(usize, SocketAddr)> = recv_datagram_with(&mut buf, |_| {
             calls += 1;
             match calls {
                 1 => Err(io::Error::from(io::ErrorKind::Interrupted)),
@@ -6569,8 +6514,16 @@ mod tests {
         let mut read_buf = RecvBuffer::new();
         let mut readiness = Readiness::primed();
 
-        let outcome = read_tcp_into_buffer(&reader, &mut read_buf, &mut readiness, 1, 1).unwrap();
+        let outcome = rpc::evented::read_into_buffer(
+            &reader,
+            &mut read_buf,
+            &mut readiness,
+            1,
+            ReadLimit::MaxBuffered(1),
+        )
+        .unwrap();
 
+        assert!(outcome.hit_limit);
         assert!(!outcome.disconnected);
         assert!(outcome.bytes_read >= 1);
         assert!(readiness.is_ready());
@@ -6586,14 +6539,28 @@ mod tests {
         let mut read_buf = RecvBuffer::new();
         let mut readiness = Readiness::primed();
 
-        let outcome = read_tcp_into_buffer(&reader, &mut read_buf, &mut readiness, 1, 1).unwrap();
+        let outcome = rpc::evented::read_into_buffer(
+            &reader,
+            &mut read_buf,
+            &mut readiness,
+            1,
+            ReadLimit::MaxBuffered(1),
+        )
+        .unwrap();
         assert!(outcome.bytes_read >= 1);
         assert!(readiness.is_ready());
 
         read_buf.consume(read_buf.len());
-        let outcome = read_tcp_into_buffer(&reader, &mut read_buf, &mut readiness, 1, 1).unwrap();
+        let outcome = rpc::evented::read_into_buffer(
+            &reader,
+            &mut read_buf,
+            &mut readiness,
+            1,
+            ReadLimit::MaxBuffered(1),
+        )
+        .unwrap();
 
-        assert_eq!(outcome, TcpReadOutcome::default());
+        assert_eq!(outcome, ReadPumpOutcome::default());
         assert!(!readiness.is_ready());
         assert!(!tcp_receive_work_ready(readiness, &read_buf));
     }
@@ -6608,12 +6575,12 @@ mod tests {
         let mut read_buf = RecvBuffer::new();
         let mut readiness = Readiness::primed();
 
-        let outcome = read_tcp_into_buffer(
+        let outcome = rpc::evented::read_into_buffer(
             &reader,
             &mut read_buf,
             &mut readiness,
             encoded.len(),
-            encoded.len() + 1,
+            ReadLimit::MaxBuffered(encoded.len() + 1),
         )
         .unwrap();
         assert_eq!(outcome.bytes_read, encoded.len());

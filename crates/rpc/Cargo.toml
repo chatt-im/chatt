@@ -6,5 +6,6 @@ edition = "2024"
 [dependencies]
 jsony = "0.1.10"
 libc = "0.2"
+mio = { version = "1.2.1", features = ["os-poll"] }
 ring = "0.17.14"
 toml-spanner = { version = "1.0.3", features = ["to-toml", "from-toml", "derive"] }
