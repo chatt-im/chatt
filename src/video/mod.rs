@@ -12,13 +12,14 @@ mod nut;
 mod publisher;
 mod subscriber;
 
-use std::io::{Read, Write};
+use std::io::Write;
 use std::net::TcpStream;
 use std::time::Duration;
 
 use rpc::{
     crypto::{CHANNEL_VIDEO, KEY_LEN, TransportCipher, VideoKeyRole, derive_video_keys},
     ids::{SessionId, StreamId},
+    recv::RecvBuffer,
     video::{self, VideoAck, VideoHello, VideoRole},
 };
 
@@ -40,7 +41,7 @@ fn open_video_connection(
     stream_id: StreamId,
     role: VideoRole,
     secret: &[u8],
-) -> Result<(TcpStream, TransportCipher, Vec<u8>), String> {
+) -> Result<(TcpStream, TransportCipher, RecvBuffer), String> {
     let secret: &[u8; KEY_LEN] = secret
         .try_into()
         .map_err(|_| "video secret must be 32 bytes".to_string())?;
@@ -73,32 +74,46 @@ fn open_video_connection(
         .map_err(|error| format!("video handshake write failed: {error}"))?;
     stream.flush().map_err(|error| error.to_string())?;
 
-    let mut buf = Vec::new();
-    let ack_record = read_one_record(&mut stream, &mut buf)?;
-    let ack_plain = cipher
-        .open_next(CHANNEL_VIDEO, &ack_record)
-        .map_err(|error| format!("video ack open failed: {error}"))?;
+    let mut recv = RecvBuffer::new();
+    let ack_plain = read_one_plain_record(&mut stream, &mut recv, &mut cipher)?;
     match video::decode_video_ack(&ack_plain)? {
         VideoAck::Ok => {}
         VideoAck::Rejected => return Err("video stream rejected by server".to_string()),
     }
-    Ok((stream, cipher, buf))
+    Ok((stream, cipher, recv))
 }
 
-/// Reads from `stream` into `buf` until one whole record is buffered, returning
-/// it. Leftover bytes stay in `buf` for the caller.
-fn read_one_record(stream: &mut TcpStream, buf: &mut Vec<u8>) -> Result<Vec<u8>, String> {
+/// Minimum spare receive capacity ensured before each video socket read.
+const VIDEO_READ_CHUNK_BYTES: usize = 64 * 1024;
+
+/// Reads from `stream` into `recv` until one whole record is buffered, opening
+/// it in place and returning the plaintext. Bytes past the record stay
+/// buffered for the caller.
+fn read_one_plain_record(
+    stream: &mut TcpStream,
+    recv: &mut RecvBuffer,
+    cipher: &mut TransportCipher,
+) -> Result<Vec<u8>, String> {
     loop {
-        if let Some(record) = video::pop_record(buf).map_err(|error| error.to_string())? {
-            return Ok(record);
-        }
-        let mut tmp = [0u8; 64 * 1024];
-        let read = stream
-            .read(&mut tmp)
-            .map_err(|error| format!("video read failed: {error}"))?;
-        if read == 0 {
-            return Err("video connection closed".to_string());
-        }
-        buf.extend_from_slice(&tmp[..read]);
+        let total = match video::parse_record(recv.pending()) {
+            Ok(Some((_, total))) => total,
+            Ok(None) => {
+                let read = recv
+                    .fill(stream, VIDEO_READ_CHUNK_BYTES)
+                    .map_err(|error| format!("video read failed: {error}"))?;
+                if read == 0 {
+                    return Err("video connection closed".to_string());
+                }
+                continue;
+            }
+            Err(error) => return Err(error.to_string()),
+        };
+        let record = &mut recv.pending_mut()[video::VIDEO_LENGTH_PREFIX_LEN..total];
+        let plaintext = cipher
+            .open_next_in_place(CHANNEL_VIDEO, record)
+            .map_err(|error| format!("video record open failed: {error}"))?
+            .to_vec();
+        recv.consume(total);
+        return Ok(plaintext);
     }
 }

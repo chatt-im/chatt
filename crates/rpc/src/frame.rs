@@ -30,21 +30,24 @@ pub fn encode_frame(payload: &[u8], out: &mut Vec<u8>) -> Result<(), FrameError>
     Ok(())
 }
 
-pub fn pop_frame(buffer: &mut Vec<u8>) -> Result<Option<Vec<u8>>, FrameError> {
-    if buffer.len() < LENGTH_PREFIX_LEN {
+/// Parses the frame at the front of `buffer` without consuming or copying it,
+/// returning the payload as a borrowed slice and the total number of bytes the
+/// frame occupies. Callers holding many pipelined frames advance a cursor by
+/// the returned length instead of draining per frame, so the buffer tail is
+/// not memmoved once per frame.
+pub fn parse_frame(buffer: &[u8]) -> Result<Option<(&[u8], usize)>, FrameError> {
+    let Some(prefix) = buffer.get(..LENGTH_PREFIX_LEN) else {
         return Ok(None);
-    }
-    let len = u32::from_le_bytes(buffer[..LENGTH_PREFIX_LEN].try_into().unwrap()) as usize;
+    };
+    let len = u32::from_le_bytes(prefix.try_into().unwrap()) as usize;
     if len > MAX_FRAME_LEN {
         return Err(FrameError::TooLarge);
     }
     let total = LENGTH_PREFIX_LEN + len;
-    if buffer.len() < total {
+    let Some(payload) = buffer.get(LENGTH_PREFIX_LEN..total) else {
         return Ok(None);
-    }
-    let payload = buffer[LENGTH_PREFIX_LEN..total].to_vec();
-    buffer.drain(..total);
-    Ok(Some(payload))
+    };
+    Ok(Some((payload, total)))
 }
 
 #[cfg(test)]
@@ -55,7 +58,34 @@ mod tests {
     fn length_prefixed_frame_round_trips() {
         let mut buffer = Vec::new();
         encode_frame(b"abc", &mut buffer).unwrap();
-        assert_eq!(pop_frame(&mut buffer).unwrap(), Some(b"abc".to_vec()));
-        assert!(buffer.is_empty());
+        let (payload, consumed) = parse_frame(&buffer).unwrap().expect("whole frame");
+        assert_eq!(payload, b"abc".as_slice());
+        assert_eq!(consumed, buffer.len());
+    }
+
+    #[test]
+    fn parse_frame_returns_consumed_length_without_draining() {
+        let mut buffer = Vec::new();
+        encode_frame(b"first", &mut buffer).unwrap();
+        encode_frame(b"second", &mut buffer).unwrap();
+
+        let (payload, consumed) = parse_frame(&buffer).unwrap().expect("first frame");
+        assert_eq!(payload, b"first".as_slice());
+        assert_eq!(consumed, LENGTH_PREFIX_LEN + 5);
+        assert_eq!(buffer.len(), 2 * LENGTH_PREFIX_LEN + 5 + 6);
+
+        let (payload, consumed) = parse_frame(&buffer[consumed..])
+            .unwrap()
+            .expect("second frame");
+        assert_eq!(payload, b"second".as_slice());
+        assert_eq!(consumed, LENGTH_PREFIX_LEN + 6);
+    }
+
+    #[test]
+    fn parse_frame_reports_incomplete_and_oversized_input() {
+        assert_eq!(parse_frame(&[1, 0, 0]).unwrap(), None);
+        assert_eq!(parse_frame(&[2, 0, 0, 0, 9]).unwrap(), None);
+        let oversized = (MAX_FRAME_LEN as u32 + 1).to_le_bytes();
+        assert_eq!(parse_frame(&oversized), Err(FrameError::TooLarge));
     }
 }
