@@ -265,6 +265,12 @@ pub struct Server {
     pending_reads: Vec<Token>,
     history_reader: HistoryReader,
     history_replies: mpsc::Receiver<HistoryReadReply>,
+    /// Reusable sealing buffers for [`Self::send_udp_payload`], so per-packet
+    /// voice fan-out allocates nothing in steady state.
+    udp_send_packet: Vec<u8>,
+    udp_send_scratch: Vec<u8>,
+    /// Reusable recipient list for [`Self::relay_voice`].
+    relay_recipients: Vec<SessionId>,
 }
 
 impl Server {
@@ -352,6 +358,11 @@ impl Server {
             "server identity loaded",
             public_key = encode_hex(server_key_pair.public_key().as_ref()).as_str()
         );
+        if !config.security.encryption {
+            kvlog::warn!(
+                "encryption disabled: plaintext UDP trusts spoofable Bind packets and allows session hijack, development only, never expose publicly"
+            );
+        }
         let file_size_limit_bytes = config.security.max_file_size_bytes;
 
         Ok(Self {
@@ -389,6 +400,9 @@ impl Server {
             pending_reads: Vec::new(),
             history_reader,
             history_replies,
+            udp_send_packet: Vec::new(),
+            udp_send_scratch: Vec::new(),
+            relay_recipients: Vec::new(),
         })
     }
 
@@ -1150,6 +1164,8 @@ impl Server {
         }
     }
 
+    /// Announces every active share in the room to a member that just joined, so
+    /// a viewer who arrives mid-share still sees a play button with the codec.
     fn replay_voice_room_shares(&mut self, room_id: RoomId, session_id: SessionId) {
         let streams = self
             .streams
@@ -1929,8 +1945,7 @@ impl Server {
             .get(&token)
             .and_then(|client| client.secrets.clone());
         if let Some(secrets) = &secrets {
-            self.media_key_to_session
-                .insert(secrets.media_recv.id, session_id);
+            self.register_media_key(secrets.media_recv.id, session_id)?;
         }
         self.sessions.insert(
             session_id,
@@ -1997,6 +2012,31 @@ impl Server {
         if announce && self.live_token_for_session(session_id).is_some() {
             self.broadcast_presence(session_id, true);
         }
+        Ok(())
+    }
+
+    /// Registers a session's inbound media key id for UDP demultiplexing.
+    ///
+    /// A 32-bit key id colliding with another live session's is astronomically
+    /// unlikely, but silently overwriting would strand both sessions' UDP once
+    /// either tears down (`teardown_session` removes the shared entry). The new
+    /// session is rejected instead, forcing a reconnect whose fresh handshake
+    /// draws a new random key id. Stale entries whose session is already gone
+    /// are reclaimed.
+    fn register_media_key(&mut self, key_id: u32, session_id: SessionId) -> Result<(), String> {
+        if let Some(existing) = self.media_key_to_session.get(&key_id).copied()
+            && existing != session_id
+            && self.sessions.contains_key(&existing)
+        {
+            kvlog::error!(
+                "media key id collision with a live session",
+                key_id,
+                existing_session_id = existing.0,
+                rejected_session_id = session_id.0
+            );
+            return Err("media key id collision".to_string());
+        }
+        self.media_key_to_session.insert(key_id, session_id);
         Ok(())
     }
 
@@ -2091,13 +2131,21 @@ impl Server {
         self.send_control_to_tokens(&tokens, &control);
     }
 
-    /// Whether the session's user may access the room; sends the deliberate
-    /// `404 room not found` (indistinguishable from a missing room) otherwise.
-    fn check_room_access(&mut self, session_id: SessionId, room_id: RoomId) -> bool {
-        let allowed = match (self.sessions.get(&session_id), self.rooms.get(&room_id)) {
+    /// Whether the session's user may access the room. Denials never reveal
+    /// whether the room exists: a private room a user cannot see and a missing
+    /// room answer identically, so callers must pick failure replies that
+    /// preserve that indistinguishability.
+    fn room_allows(&self, session_id: SessionId, room_id: RoomId) -> bool {
+        match (self.sessions.get(&session_id), self.rooms.get(&room_id)) {
             (Some(session), Some(room)) => room.access.allows(session.user_id),
             _ => false,
-        };
+        }
+    }
+
+    /// [`Self::room_allows`], sending the deliberate `404 room not found`
+    /// control error on denial.
+    fn check_room_access(&mut self, session_id: SessionId, room_id: RoomId) -> bool {
+        let allowed = self.room_allows(session_id, room_id);
         if !allowed && let Some(token) = self.live_token_for_session(session_id) {
             let _ = self.send_control_to_token(
                 token,
@@ -2116,11 +2164,7 @@ impl Server {
             session_id = session_id.0,
             room_id = room_id.0
         );
-        let allowed = match (self.sessions.get(&session_id), self.rooms.get(&room_id)) {
-            (Some(session), Some(room)) => room.access.allows(session.user_id),
-            _ => false,
-        };
-        if !allowed {
+        if !self.room_allows(session_id, room_id) {
             self.send_voice_join_failed(session_id, room_id, "room not found");
             return;
         }
@@ -2944,8 +2988,9 @@ impl Server {
         }
     }
 
-    /// Announces every active share in the room to a member that just joined, so
-    /// a viewer who arrives mid-share still sees a play button with the codec.
+    /// Ends the session's active voice stream (if it matches `requested`),
+    /// removes it from the room's call membership, and broadcasts
+    /// `VoiceStopped` to the remaining members.
     fn stop_voice(
         &mut self,
         session_id: SessionId,
@@ -3233,7 +3278,7 @@ impl Server {
     ) -> Result<(), String> {
         let (header, _) = media::parse_header(packet).map_err(|error| error.to_string())?;
         let (session_id, payload, udp_addr_changed) = if header.key_id == media::PLAINTEXT_KEY_ID {
-            self.open_plaintext_udp_packet(src, packet)?
+            self.open_plaintext_udp_packet(server_probe_id, src, packet)?
         } else {
             let session_id = *self
                 .media_key_to_session
@@ -3251,8 +3296,18 @@ impl Server {
                 let (_, payload) =
                     media::open_media(&secrets.media_recv, &mut session.media_recv_replay, packet)
                         .map_err(|error| error.to_string())?;
-                let old_addr = session.observe_udp_addr(src);
-                (payload, old_addr.is_some_and(|old| old != src))
+                // Behind a symmetric NAT the mapping toward the probe port
+                // differs from the mapping toward the main port, so a probe
+                // packet's source is only reachable by the probe flow. Recording
+                // it would point voice and pongs sent from the main socket at a
+                // dead address until the next main-socket packet flips it back.
+                let udp_addr_changed = if server_probe_id == 0 {
+                    let old_addr = session.observe_udp_addr(src);
+                    old_addr.is_some_and(|old| old != src)
+                } else {
+                    false
+                };
+                (payload, udp_addr_changed)
             };
             (session_id, payload, udp_addr_changed)
         };
@@ -3348,8 +3403,14 @@ impl Server {
         }
     }
 
+    /// Development-only UDP path for `encryption = false`. The plaintext `Bind`
+    /// and `NatProbe` carry a bare session id with no proof of possession, so
+    /// any host able to spoof UDP toward the server can hijack a session's
+    /// media address. This mode must never be exposed publicly; [`Server::bind`]
+    /// logs a startup warning whenever it is active.
     fn open_plaintext_udp_packet(
         &mut self,
+        server_probe_id: u8,
         src: SocketAddr,
         packet: &[u8],
     ) -> Result<(SessionId, MediaPayload, bool), String> {
@@ -3381,6 +3442,11 @@ impl Server {
             if !session.media_recv_replay.update(header.counter) {
                 return Err(media::MediaError::Replay.to_string());
             }
+            // Same probe-flow hazard as the encrypted path: a probe-socket
+            // packet's source must not rebind the media address.
+            if server_probe_id != 0 {
+                return Ok((session_id, payload, false));
+            }
             session.observe_udp_addr(src)
         };
         if let Some(old_addr) = old_addr
@@ -3410,12 +3476,16 @@ impl Server {
             }
             _ => return Ok(()),
         };
-        let recipients: Vec<SessionId> = self
-            .voice_member_sessions(room_id)
-            .into_iter()
-            .filter(|session_id| *session_id != sender_session_id)
-            .collect();
-        kvlog::info!(
+        let mut recipients = std::mem::take(&mut self.relay_recipients);
+        recipients.clear();
+        if let Some(room) = self.rooms.get(&room_id) {
+            for session_id in room.active_streams.values() {
+                if *session_id != sender_session_id {
+                    recipients.push(*session_id);
+                }
+            }
+        }
+        kvlog::debug!(
             "voice packet relaying",
             session_id = sender_session_id.0,
             room_id = room_id.0,
@@ -3441,9 +3511,10 @@ impl Server {
             flags,
             payload: voice_payload,
         };
-        for session_id in recipients {
-            self.send_udp_payload(session_id, &payload);
+        for session_id in &recipients {
+            self.send_udp_payload(*session_id, &payload);
         }
+        self.relay_recipients = recipients;
         Ok(())
     }
 
@@ -3470,7 +3541,7 @@ impl Server {
         if owner_session_id == receiver_session_id {
             return Ok(());
         }
-        kvlog::info!(
+        kvlog::debug!(
             "voice feedback relaying",
             receiver_session_id = receiver_session_id.0,
             owner_session_id = owner_session_id.0,
@@ -3522,25 +3593,26 @@ impl Server {
         }
         let counter = session.media_send_counter;
         session.media_send_counter = session.media_send_counter.wrapping_add(1);
-        let packet = match &session.secrets {
-            Some(secrets) => media::seal_media(&secrets.media_send, counter, payload),
-            None => media::seal_plaintext_media(counter, payload),
+        let packet = &mut self.udp_send_packet;
+        let scratch = &mut self.udp_send_scratch;
+        let sealed = match &session.secrets {
+            Some(secrets) => {
+                media::seal_media_into(&secrets.media_send, counter, payload, packet, scratch)
+            }
+            None => media::seal_plaintext_media_into(counter, payload, packet, scratch),
         };
-        match packet {
-            Ok(packet) => {
-                if let Err(error) = self.udp.send_to(&packet, addr) {
-                    kvlog::warn!(
-                        "udp send failed",
-                        session_id = session_id.0,
-                        addr = %addr,
-                        packet_size = packet.len(),
-                        error = %error
-                    );
-                }
-            }
-            Err(error) => {
-                kvlog::warn!("udp seal failed", session_id = session_id.0, error = %error);
-            }
+        if let Err(error) = sealed {
+            kvlog::warn!("udp seal failed", session_id = session_id.0, error = %error);
+            return;
+        }
+        if let Err(error) = self.udp.send_to(packet, addr) {
+            kvlog::warn!(
+                "udp send failed",
+                session_id = session_id.0,
+                addr = %addr,
+                packet_size = packet.len(),
+                error = %error
+            );
         }
     }
 
@@ -4243,15 +4315,20 @@ enum ControlStep {
 /// Parses, decrypts (in place), and decodes the next control frame buffered on
 /// `client`, consuming it from the receive buffer. Returns `None` when no
 /// whole frame is buffered yet.
-fn control_conn_step(token: Token, client: &mut ClientConn) -> Result<Option<ControlStep>, String> {
+// `_token` is referenced only by `kvlog::debug!`, which compiles to nothing
+// without the `debug` feature.
+fn control_conn_step(
+    _token: Token,
+    client: &mut ClientConn,
+) -> Result<Option<ControlStep>, String> {
     let total = match frame::parse_frame(client.read_buf.pending()) {
         Ok(Some((_, total))) => total,
         Ok(None) => return Ok(None),
         Err(error) => return Err(format!("invalid frame: {error}")),
     };
-    kvlog::info!(
+    kvlog::debug!(
         "tcp frame processing",
-        token = token.0,
+        token = _token.0,
         state = conn_state_name(client.state),
         size = total
     );
@@ -4271,15 +4348,15 @@ fn control_conn_step(token: Token, client: &mut ClientConn) -> Result<Option<Con
             let plaintext = transport
                 .open_next_in_place(CHANNEL_CONTROL, frame)
                 .map_err(|error| error.to_string())?;
-            kvlog::info!(
+            kvlog::debug!(
                 "client control decrypted",
-                token = token.0,
+                token = _token.0,
                 payload_size = plaintext.len()
             );
             let control = decode_client_control(plaintext)?;
-            kvlog::info!(
+            kvlog::debug!(
                 "client control decoded",
-                token = token.0,
+                token = _token.0,
                 kind = client_control_kind(&control)
             );
             client.read_buf.consume(total);
@@ -5056,6 +5133,232 @@ mod tests {
         session.observe_udp_addr(second);
         assert_eq!(session.fresh_server_rtt(now), None);
         assert_eq!(session.server_rtt_reported_at, None);
+    }
+
+    fn test_key(id: u32, byte: u8) -> KeyMaterial {
+        KeyMaterial {
+            id,
+            bytes: [byte; KEY_LEN],
+        }
+    }
+
+    fn test_secrets(media_recv_id: u32) -> SessionSecrets {
+        SessionSecrets {
+            control_send: test_key(1, 1),
+            control_recv: test_key(2, 2),
+            media_send: test_key(3, 3),
+            media_recv: test_key(media_recv_id, 4),
+        }
+    }
+
+    #[test]
+    fn probe_socket_packet_does_not_clobber_media_addr() {
+        // A NAT probe is deliberately sent from the client's single media
+        // socket toward the probe port. Behind a symmetric NAT that flow gets
+        // its own mapping, so the probe packet's source address is unreachable
+        // from the server's main socket and must not become the session's
+        // media address (nor wipe the RTT estimate).
+        let mut server = test_server();
+        let session_id = SessionId(1);
+        let secrets = test_secrets(77);
+        let client_media_key = secrets.media_recv.clone();
+        let mut session = test_session(UserId(9), Token(11), None);
+        session.secrets = Some(secrets);
+        let media_addr: SocketAddr = "203.0.113.5:4000".parse().unwrap();
+        let now = Instant::now();
+        session.observe_udp_addr(media_addr);
+        session.report_server_rtt(Some(40), now);
+        server.sessions.insert(session_id, session);
+        server.media_key_to_session.insert(77, session_id);
+
+        let probe_src: SocketAddr = "203.0.113.5:5000".parse().unwrap();
+        let packet = media::seal_media(
+            &client_media_key,
+            1,
+            &MediaPayload::NatProbe {
+                session_id,
+                probe_id: 1,
+            },
+        )
+        .unwrap();
+        server.handle_udp_packet(1, probe_src, &packet).unwrap();
+
+        let session = server.sessions.get(&session_id).unwrap();
+        assert_eq!(
+            session.udp_addr,
+            Some(media_addr),
+            "a probe-socket packet must not rebind the media address"
+        );
+        assert_eq!(
+            session.fresh_server_rtt(now),
+            Some(40),
+            "a probe-socket packet must not reset the RTT estimate"
+        );
+
+        // The same packet arriving on the main media socket is the client
+        // genuinely moving, and must still rebind.
+        let packet = media::seal_media(
+            &client_media_key,
+            2,
+            &MediaPayload::NatProbe {
+                session_id,
+                probe_id: 1,
+            },
+        )
+        .unwrap();
+        server.handle_udp_packet(0, probe_src, &packet).unwrap();
+        let session = server.sessions.get(&session_id).unwrap();
+        assert_eq!(session.udp_addr, Some(probe_src));
+    }
+
+    #[test]
+    fn media_key_collision_rejects_new_session_and_keeps_survivor() {
+        // A 32-bit media key id collision must not silently overwrite the live
+        // session's mapping: `teardown_session` removes the shared key when
+        // either session ends, permanently stranding the survivor's UDP.
+        let mut server = test_server();
+        let alice = UserConfig {
+            id: UserId(1),
+            name: "alice".to_string(),
+            display_name: "Alice".to_string(),
+            token_hash: String::new(),
+        };
+        let bob = UserConfig {
+            id: UserId(2),
+            name: "bob".to_string(),
+            display_name: "Bob".to_string(),
+            token_hash: String::new(),
+        };
+        let (conn, _alice_peer) = test_live_client();
+        server.clients.insert(Token(11), conn);
+        server.clients.get_mut(&Token(11)).unwrap().secrets = Some(test_secrets(77));
+        let (conn, _bob_peer) = test_live_client();
+        server.clients.insert(Token(22), conn);
+        server.clients.get_mut(&Token(22)).unwrap().secrets = Some(test_secrets(77));
+
+        server
+            .establish_session(Token(11), &alice, false, 0, false, None)
+            .unwrap();
+        let alice_session = server.clients.get(&Token(11)).unwrap().session_id.unwrap();
+        assert_eq!(server.media_key_to_session.get(&77), Some(&alice_session));
+
+        let result = server.establish_session(Token(22), &bob, false, 0, false, None);
+        assert!(
+            result.is_err(),
+            "a colliding media key must reject the new session"
+        );
+        assert_eq!(
+            server.media_key_to_session.get(&77),
+            Some(&alice_session),
+            "the live session's mapping must survive the collision"
+        );
+    }
+
+    #[test]
+    fn media_key_of_dead_session_is_reclaimed() {
+        // A mapping left behind by a torn-down session (the sweep backstop has
+        // not run yet) must not block a new session from taking the key id.
+        let mut server = test_server();
+        server.media_key_to_session.insert(77, SessionId(999));
+        let carol = UserConfig {
+            id: UserId(3),
+            name: "carol".to_string(),
+            display_name: "Carol".to_string(),
+            token_hash: String::new(),
+        };
+        let (conn, _carol_peer) = test_live_client();
+        server.clients.insert(Token(33), conn);
+        server.clients.get_mut(&Token(33)).unwrap().secrets = Some(test_secrets(77));
+
+        server
+            .establish_session(Token(33), &carol, false, 0, false, None)
+            .unwrap();
+        let carol_session = server.clients.get(&Token(33)).unwrap().session_id.unwrap();
+        assert_eq!(server.media_key_to_session.get(&77), Some(&carol_session));
+    }
+
+    #[test]
+    fn send_udp_payload_seals_decodable_packets_with_incrementing_counters() {
+        // Pins the relay's wire bytes: whatever sealing path the server uses
+        // internally, the client must keep opening consecutive packets with the
+        // shared media key and a fresh anti-replay window.
+        let mut server = test_server();
+        let receiver = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        receiver
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        let session_id = SessionId(1);
+        let secrets = test_secrets(77);
+        let server_send_key = secrets.media_send.clone();
+        let mut session = test_session(UserId(9), Token(11), None);
+        session.secrets = Some(secrets);
+        session.udp_addr = Some(receiver.local_addr().unwrap());
+        server.sessions.insert(session_id, session);
+
+        let mut replay = AntiReplay::new();
+        let mut buf = [0u8; 2048];
+        for nonce in [7u64, 8, 9] {
+            server.send_udp_payload(session_id, &MediaPayload::Pong { nonce });
+            let (len, _) = receiver.recv_from(&mut buf).unwrap();
+            let (_, payload) =
+                media::open_media(&server_send_key, &mut replay, &buf[..len]).unwrap();
+            assert_eq!(payload, MediaPayload::Pong { nonce });
+        }
+    }
+
+    #[test]
+    fn room_allows_denies_non_member_and_missing_room() {
+        let mut server = test_server();
+        let secret = RoomId(3);
+        server
+            .rooms
+            .insert(secret, private_room(secret, &[UserId(1)]));
+        let member = SessionId(1);
+        let outsider = SessionId(2);
+        server
+            .sessions
+            .insert(member, test_session(UserId(1), Token(11), None));
+        server
+            .sessions
+            .insert(outsider, test_session(UserId(2), Token(22), None));
+
+        assert!(server.room_allows(member, secret));
+        assert!(!server.room_allows(outsider, secret));
+        assert!(!server.room_allows(member, RoomId(99)));
+        assert!(!server.room_allows(SessionId(99), secret));
+    }
+
+    #[test]
+    fn join_voice_answers_voice_join_failed_for_denied_and_missing_rooms() {
+        // The private-room invisibility policy: a denied voice join and a voice
+        // join to a nonexistent room must answer identically.
+        let mut server = test_server();
+        let secret = RoomId(3);
+        server
+            .rooms
+            .insert(secret, private_room(secret, &[UserId(1)]));
+        let outsider = SessionId(2);
+        let mut peer = live_user(&mut server, Token(22), outsider, UserId(2));
+
+        server.join_voice(outsider, secret);
+        let denied = read_until(&mut peer, |control| {
+            matches!(control, ServerControl::VoiceJoinFailed { .. })
+        });
+        server.join_voice(outsider, RoomId(99));
+        let missing = read_until(&mut peer, |control| {
+            matches!(control, ServerControl::VoiceJoinFailed { .. })
+        });
+
+        let ServerControl::VoiceJoinFailed { room_id, message } = denied else {
+            unreachable!();
+        };
+        assert_eq!(room_id, secret);
+        assert_eq!(message, "room not found");
+        let ServerControl::VoiceJoinFailed { room_id, message } = missing else {
+            unreachable!();
+        };
+        assert_eq!(room_id, RoomId(99));
+        assert_eq!(message, "room not found");
     }
 
     #[test]

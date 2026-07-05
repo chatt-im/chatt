@@ -751,4 +751,66 @@ mod tests {
         let mut replay = AntiReplay::new();
         assert_eq!(open_media(&key, &mut replay, &packet).unwrap().1, payload);
     }
+
+    #[test]
+    fn seal_media_into_matches_seal_media_across_fan_out() {
+        // The server relay reuses one packet/scratch pair while sealing the
+        // same payload for many recipients under different keys and counters;
+        // every sealed datagram must match the allocating path byte for byte.
+        let keys = [
+            KeyMaterial {
+                id: 7,
+                bytes: [1; crypto::KEY_LEN],
+            },
+            KeyMaterial {
+                id: 8,
+                bytes: [2; crypto::KEY_LEN],
+            },
+        ];
+        let payloads = [
+            MediaPayload::Voice {
+                stream_id: StreamId(5),
+                sequence: 9,
+                timestamp: 8_640,
+                flags: 0,
+                payload: VoicePayload::Opus(vec![1, 2, 3, 4, 5, 6, 7, 8]),
+            },
+            MediaPayload::Voice {
+                stream_id: StreamId(5),
+                sequence: 10,
+                timestamp: 9_600,
+                flags: 1,
+                payload: VoicePayload::Silence,
+            },
+            MediaPayload::Pong { nonce: 44 },
+        ];
+
+        let mut packet = Vec::new();
+        let mut scratch = Vec::new();
+        let mut counter = 0u64;
+        for payload in &payloads {
+            for key in &keys {
+                let expected = seal_media(key, counter, payload).unwrap();
+                seal_media_into(key, counter, payload, &mut packet, &mut scratch).unwrap();
+                assert_eq!(packet, expected);
+                counter += 1;
+            }
+        }
+    }
+
+    #[test]
+    fn seal_plaintext_media_into_matches_seal_plaintext_media() {
+        let payload = MediaPayload::Voice {
+            stream_id: StreamId(5),
+            sequence: 9,
+            timestamp: 8_640,
+            flags: 0,
+            payload: VoicePayload::Opus(vec![1, 2, 3]),
+        };
+        let expected = seal_plaintext_media(6, &payload).unwrap();
+        let mut packet = vec![0xAA; 64];
+        let mut scratch = vec![0xBB; 64];
+        seal_plaintext_media_into(6, &payload, &mut packet, &mut scratch).unwrap();
+        assert_eq!(packet, expected);
+    }
 }
