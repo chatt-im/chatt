@@ -2,8 +2,9 @@
 //!
 //! A reference addresses a message by the durable key the rest of the system
 //! already uses for dedup and merge: `(timestamp_ms, message_id)` scoped by
-//! `room_id` (message ids restart with the server process, so the timestamp is
-//! required for uniqueness). References travel inside message bodies as
+//! `room_id`. Message ids are durable and watermarked, but a room without a
+//! durable log can reuse ids when the server's `state.toml` is lost, so the
+//! timestamp stays part of the key. References travel inside message bodies as
 //! `@@<code>` where the code is Crockford base32 of the LEB128-packed fields
 //! plus a one-character checksum. Encoding is canonical: a code decodes only
 //! if re-encoding the result reproduces it.
