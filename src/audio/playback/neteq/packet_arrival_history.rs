@@ -280,6 +280,27 @@ mod tests {
     }
 
     #[test]
+    fn reordered_packets_keep_their_older_rtp_timestamp() {
+        let mut history = PacketArrivalHistory::new(2000);
+        history.set_sample_rate(48000);
+        let first = 10_000;
+        let reordered = first - 8 * TICK as u32;
+
+        assert!(history.insert(first, 960, 0));
+        assert!(history.is_newest_rtp_timestamp(first));
+
+        assert!(history.insert(reordered, 960, 0));
+        assert!(!history.is_newest_rtp_timestamp(reordered));
+        assert_eq!(history.delay_ms(reordered, 0), 80);
+
+        let next = first + 960;
+        assert!(history.insert(next, 960, 8 * TICK));
+        assert!(history.is_newest_rtp_timestamp(next));
+        assert_eq!(history.delay_ms(next, 8 * TICK), 60);
+        assert_eq!(history.max_delay_ms(), 60);
+    }
+
+    #[test]
     fn duplicate_timestamp_is_rejected() {
         let mut history = PacketArrivalHistory::new(2000);
         history.set_sample_rate(48000);
