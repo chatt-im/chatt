@@ -9,11 +9,9 @@ server-identity-seed = "546f6d636861742064657620736572766572206b6579207631000000
 encryption = true
 max-file-size-bytes = 52428800
 public = true
-password = "123"
+password-hash = "sha256:a665a45920422f9d417e4867efdc4fb8a04a1f3fff1fa07e998e86f7f7a27ae3"
 password-epoch = 0
-next-dynamic-user-id = 4294967298
 
 [[rooms]]
 id = 1
 name = "lobby"
-
