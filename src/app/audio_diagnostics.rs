@@ -89,7 +89,7 @@ impl AudioDiagnostics {
         };
 
         format!(
-            "devices\n  input: {}\n  output: {}\nplayback\n  output: ring max {}ms, queued {} samples, callback {}ms\n  neteq: playout {}ms ({} / 5s), target {}ms{} ({} / 5s)\n  buffers: decoded {}ms, packets wait {}ms span {}ms / {} pkts, next gap {}\n  decision: {} ({})\n  timing: accelerate {}ms / {}, expand {}ms / {}\n  recovery: dred {}, fec {}, horizon {}ms, missed {}ms / {}, plc {}, trims {}, underruns {}\n  active streams: {}\nnetwork\n  voice rx: {} packets / {}\nencoder\n  profile: {}\n{}",
+            "devices\n  input: {}\n  output: {}\nplayback\n  output: staged max {}ms, queued {} samples, callback {}ms\n  neteq: playout {}ms ({} / 5s), target {}ms{} ({} / 5s)\n  buffers: decoded {}ms, packets wait {}ms span {}ms / {} pkts, next gap {}\n  decision: {} ({})\n  timing: accelerate {}ms / {}, expand {}ms / {}\n  recovery: dred {}, fec {}, horizon {}ms, missed {}ms / {}, plc {}, trims {}, concealment expands {}\n  active streams: {}\nnetwork\n  voice rx: {} packets / {}\nencoder\n  profile: {}\n{}",
             input_device,
             output_device,
             self.snapshot.max_output_ring_ms,
@@ -118,7 +118,7 @@ impl AudioDiagnostics {
             self.snapshot.dred_missed_horizon_count,
             self.snapshot.plc_fallbacks,
             self.snapshot.hard_trim_count,
-            self.snapshot.underrun_count,
+            self.snapshot.concealment_expands,
             self.snapshot.active_streams,
             self.voice_packets_received,
             format_bytes_compact(self.voice_bytes_received),

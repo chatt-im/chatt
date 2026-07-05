@@ -14,7 +14,7 @@
 //! `GetAudio` loop. The DRED span is supplied as [`DredInfo`] (the result of
 //! `WebRtcOpus_DredParse`) so placement is unit-testable without the codec.
 
-use std::rc::Rc;
+use std::sync::Arc;
 
 use super::packet::{Packet, PacketPayload, Priority};
 
@@ -51,7 +51,7 @@ pub(crate) struct FecInfo {
 pub(crate) fn parse_payload_redundancy(
     timestamp: u32,
     sequence_number: u32,
-    datagram: Rc<Vec<u8>>,
+    datagram: Arc<Vec<u8>>,
     current_gap: u32,
     primary_duration: u32,
     fec: Option<FecInfo>,
@@ -66,7 +66,7 @@ pub(crate) fn parse_payload_redundancy(
             sequence_number,
             Priority::new(1, 0),
             fec.duration as usize,
-            PacketPayload::OpusFec(Rc::clone(&datagram)),
+            PacketPayload::OpusFec(Arc::clone(&datagram)),
         ));
         begin_timestamp = begin_timestamp.wrapping_sub(fec.duration);
     }
@@ -106,7 +106,7 @@ pub(crate) fn parse_payload_redundancy(
                         Priority::new(2, 0),
                         DRED_CHUNK_SAMPLES as usize,
                         PacketPayload::Dred {
-                            source: Rc::clone(&datagram),
+                            source: Arc::clone(&datagram),
                             offset,
                         },
                     ));
@@ -130,8 +130,8 @@ pub(crate) fn parse_payload_redundancy(
 mod tests {
     use super::*;
 
-    fn datagram() -> Rc<Vec<u8>> {
-        Rc::new(vec![9u8; 16])
+    fn datagram() -> Arc<Vec<u8>> {
+        Arc::new(vec![9u8; 16])
     }
 
     fn descriptors(packets: &[Packet]) -> Vec<(u32, i32)> {

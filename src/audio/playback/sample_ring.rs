@@ -2,7 +2,7 @@ use std::{
     cell::UnsafeCell,
     slice,
     sync::Arc,
-    sync::atomic::{AtomicU64, AtomicUsize, Ordering},
+    sync::atomic::{AtomicUsize, Ordering},
 };
 
 /// Flat single-producer single-consumer ring of `f32` samples.
@@ -37,7 +37,6 @@ pub(crate) struct SampleRing {
     buf: Box<[UnsafeCell<f32>]>,
     read: AtomicUsize,
     write: AtomicUsize,
-    underruns: AtomicU64,
 }
 
 // SAFETY: see the type-level safety argument. Exactly one producer calls the
@@ -68,7 +67,6 @@ impl SampleRing {
             buf: buf.into_boxed_slice(),
             read: AtomicUsize::new(0),
             write: AtomicUsize::new(0),
-            underruns: AtomicU64::new(0),
         }
     }
 
@@ -82,11 +80,6 @@ impl SampleRing {
         let write = self.write.load(Ordering::Acquire);
         let read = self.read.load(Ordering::Acquire);
         write.wrapping_sub(read)
-    }
-
-    /// Total underruns the consumer has recorded since construction.
-    pub(crate) fn underruns(&self) -> u64 {
-        self.underruns.load(Ordering::Acquire)
     }
 
     // --- Producer side -----------------------------------------------------
@@ -178,12 +171,6 @@ impl SampleRing {
         let read = self.read.load(Ordering::Relaxed);
         self.read.store(read.wrapping_add(count), Ordering::Release);
     }
-
-    /// Records that the consumer read a dry ring mid-block. The producer reads
-    /// this to drive expansion.
-    pub(crate) fn note_underrun(&self) {
-        self.underruns.fetch_add(1, Ordering::Release);
-    }
 }
 
 /// The sole consumer handle to a [`SampleRing`], the only path to the read side.
@@ -228,11 +215,6 @@ impl RingReader {
     /// once the span returned by [`Self::readable_span`] is dropped.
     pub(crate) fn advance(&mut self, count: usize) {
         self.ring.advance_read(count);
-    }
-
-    /// Records a dry-ring underrun for the producer's expansion estimator.
-    pub(crate) fn note_underrun(&self) {
-        self.ring.note_underrun();
     }
 }
 
@@ -323,15 +305,6 @@ mod tests {
         assert_eq!(span.len(), 2);
         assert!(span.get(2).is_none());
         assert!(span.is_empty() == false);
-    }
-
-    #[test]
-    fn underruns_accumulate() {
-        let ring = SampleRing::with_capacity(4);
-        assert_eq!(ring.underruns(), 0);
-        ring.note_underrun();
-        ring.note_underrun();
-        assert_eq!(ring.underruns(), 2);
     }
 
     #[test]

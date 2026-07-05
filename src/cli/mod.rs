@@ -581,7 +581,7 @@ fn print_audio_playback_test_report(
         report.feedback_max_interarrival_jitter_ms
     );
     println!(
-        "playback_max_output_ring_ms={},neteq_playout_delay_ms={},neteq_target_ms={},neteq_packet_buffer_ms={},accelerate_count={},expand_count={},accelerate_ms={},expand_ms={},hard_trim_count={},underruns={},dred={},fec={},plc={},suppressed_frames={}",
+        "playback_max_output_ring_ms={},neteq_playout_delay_ms={},neteq_target_ms={},neteq_packet_buffer_ms={},accelerate_count={},expand_count={},accelerate_ms={},expand_ms={},hard_trim_count={},concealment_expands={},dred={},fec={},plc={},suppressed_frames={}",
         report.final_snapshot.max_output_ring_ms,
         report.final_snapshot.neteq_playout_delay_ms,
         report.final_snapshot.neteq_target_ms,
@@ -591,7 +591,7 @@ fn print_audio_playback_test_report(
         live_samples_to_ms(report.final_snapshot.accelerate_samples as usize),
         live_samples_to_ms(report.final_snapshot.expand_samples as usize),
         report.final_snapshot.hard_trim_count,
-        report.final_snapshot.underrun_count,
+        report.final_snapshot.concealment_expands,
         report.final_snapshot.dred_recoveries,
         report.final_snapshot.fec_recoveries,
         report.final_snapshot.plc_fallbacks,

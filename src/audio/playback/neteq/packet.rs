@@ -8,10 +8,10 @@
 //!
 //! Chatt differs from WebRTC in two deliberate ways: the sequence number is a
 //! `u32` (Chatt's wire sequence) rather than a 16-bit RTP value, and the
-//! payloads share the originating datagram bytes through an [`Rc`] so derived
+//! payloads share the originating datagram bytes through an [`Arc`] so derived
 //! FEC/DRED entries do not copy the encoded data.
 
-use std::rc::Rc;
+use std::sync::Arc;
 
 use super::tick_timer::Stopwatch;
 
@@ -61,13 +61,13 @@ impl Ord for Priority {
 #[derive(Clone, Debug)]
 pub(crate) enum PacketPayload {
     /// Primary Opus payload.
-    Opus(Rc<Vec<u8>>),
+    Opus(Arc<Vec<u8>>),
     /// In-band FEC (LBRR): decode these bytes in FEC mode to recover the frame
     /// one step before the carrying packet.
-    OpusFec(Rc<Vec<u8>>),
+    OpusFec(Arc<Vec<u8>>),
     /// A DRED recovered chunk: the bounding datagram bytes plus the DRED offset
     /// (in samples before the bounding packet's primary audio) to decode at.
-    Dred { source: Rc<Vec<u8>>, offset: i32 },
+    Dred { source: Arc<Vec<u8>>, offset: i32 },
 }
 
 /// One decodable unit before the decoder. Comparison establishes ordering by
@@ -157,7 +157,7 @@ mod tests {
             sequence,
             priority,
             960,
-            PacketPayload::Opus(Rc::new(vec![0u8; 4])),
+            PacketPayload::Opus(Arc::new(vec![0u8; 4])),
         )
     }
 

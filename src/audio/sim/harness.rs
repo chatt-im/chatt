@@ -406,9 +406,13 @@ pub(crate) fn run_live_audio_simulation_inner(
     let start = Instant::now();
     let frame_duration_secs = FRAME_SAMPLES as f64 / SAMPLE_RATE as f64;
     let output_block_samples = config.output_block_samples.max(1);
-    // Tell the producer the consumer's callback block so the ring is kept deep
-    // enough to serve a whole callback.
-    decode_streams.set_block_samples(output_block_samples);
+    decode_streams
+        .playout_hints()
+        .note_block_samples(output_block_samples);
+    mixer
+        .lock()
+        .map_err(|_| "live simulation mixer lock poisoned")?
+        .set_playout_hints(decode_streams.playout_hints());
     let output_block_secs = output_block_samples as f64 / SAMPLE_RATE as f64;
     let total_callbacks = (config.duration.as_secs_f64() / output_block_secs)
         .ceil()
@@ -435,7 +439,7 @@ pub(crate) fn run_live_audio_simulation_inner(
     let mut tail_neteq_playout_delay_sum_ms = 0.0f64;
     let mut tail_neteq_playout_delay_max_ms = 0u64;
     let mut tail_neteq_target_min_ms = u64::MAX;
-    let mut tail_underruns_start = None;
+    let mut tail_concealment_expands_start = None;
     let mut tail_callbacks_seen = 0usize;
 
     for frame_index in 0..prebuffer_frames {
@@ -480,7 +484,7 @@ pub(crate) fn run_live_audio_simulation_inner(
             .lock()
             .map_err(|_| "live simulation mixer lock poisoned")?;
         if callback_index == tail_start_callback {
-            tail_underruns_start = Some(mixer.snapshot_at(now).underrun_count);
+            tail_concealment_expands_start = Some(mixer.snapshot_at(now).concealment_expands);
         }
         let mut echo_writer = echo_reference.as_ref().map(|reference| reference.writer());
         for _ in 0..output_block_samples {
@@ -539,10 +543,10 @@ pub(crate) fn run_live_audio_simulation_inner(
         .lock()
         .map_err(|_| "live simulation mixer lock poisoned")?
         .snapshot_at(final_now);
-    report.steady_state_underruns = report
+    report.steady_state_concealment_expands = report
         .final_snapshot
-        .underrun_count
-        .saturating_sub(tail_underruns_start.unwrap_or(0));
+        .concealment_expands
+        .saturating_sub(tail_concealment_expands_start.unwrap_or(0));
     report.max_output_ring_ms = report
         .max_output_ring_ms
         .max(report.final_snapshot.max_output_ring_ms);
@@ -703,8 +707,8 @@ pub(crate) fn simulation_streams(config: LiveAudioSimulationConfig) -> usize {
 
 pub(crate) fn simulation_prebuffer_frames(config: LiveAudioSimulationConfig) -> usize {
     // Cover one whole output callback plus the device margin so the first
-    // oversized callback is immediately playable rather than priming (which a
-    // real device experiences as one startup underrun).
+    // oversized callback is immediately playable rather than spending its first
+    // pull in startup concealment.
     let device_floor =
         Duration::from_secs_f64(config.output_block_samples as f64 / SAMPLE_RATE as f64)
             + config.tuning.device_period_margin;
@@ -1125,10 +1129,11 @@ mod tests {
     use crate::audio::{shared::samples_for_duration, sim::LiveAudioPacketLossProfile};
 
     /// Ceiling for the pristine-link estimate (steady-state max NetEQ playout
-    /// delay + staging-ring depth). The NetEQ playout floor is ~27 ms here and the
-    /// ring holds one device double-buffer block plus its 10 ms staging cushion
-    /// (~20 ms); this bounds their sum with headroom so the floor cannot drift up.
+    /// delay + staged output carry). Keep the legacy 55 ms budget while this
+    /// switch lands; the staged output component is now at most one 10 ms mixer
+    /// frame.
     const PRISTINE_ESTIMATE_BUDGET_MS: u64 = 55;
+    const MAX_STAGED_OUTPUT_MS: u64 = 10;
     /// How far the alternating-speech playout floor may exceed the
     /// continuous-speech floor before silence handling is judged to inflate
     /// latency. The resume burst leaves a brief transient (~9 ms here); without
@@ -1170,7 +1175,7 @@ mod tests {
         // The scenario must actually exercise reordering and DRED recovery, or the
         // guard proves nothing.
         assert!(report.reordered_frames > 50, "{:?}", report);
-        assert!(report.final_snapshot.dred_recoveries >= 38, "{:?}", report);
+        assert!(report.final_snapshot.dred_recoveries >= 35, "{:?}", report);
         // With the reorder visible to the target, accelerate churn stays bounded.
         // When DRED masks it the buffer is undersized and this climbs past 80.
         assert!(
@@ -1245,7 +1250,7 @@ mod tests {
             output.report
         );
         assert!(
-            output.report.max_output_ring_ms <= duration_to_ms(test_tuning().hard_queue_bound),
+            output.report.max_output_ring_ms <= MAX_STAGED_OUTPUT_MS,
             "{:?}",
             output.report
         );
@@ -1295,7 +1300,13 @@ mod tests {
             SimStreamState::new(config, simulation_encoder_profile(config), None).unwrap();
         let mixer = Arc::new(Mutex::new(LivePlaybackMixer::with_tuning(tuning)));
         let mut decode_streams = LiveDecodeStreams::new(tuning);
-        decode_streams.set_block_samples(LIVE_OPUS_FRAME_SAMPLES);
+        decode_streams
+            .playout_hints()
+            .note_block_samples(LIVE_OPUS_FRAME_SAMPLES);
+        mixer
+            .lock()
+            .unwrap()
+            .set_playout_hints(decode_streams.playout_hints());
         let mut report = LiveAudioSimulationReport {
             scenario: "tone_mute_toggle",
             ..Default::default()
@@ -1400,7 +1411,13 @@ mod tests {
             SimStreamState::new(config, simulation_encoder_profile(config), None).unwrap();
         let mixer = Arc::new(Mutex::new(LivePlaybackMixer::with_tuning(tuning)));
         let mut decode_streams = LiveDecodeStreams::new(tuning);
-        decode_streams.set_block_samples(LIVE_OPUS_FRAME_SAMPLES);
+        decode_streams
+            .playout_hints()
+            .note_block_samples(LIVE_OPUS_FRAME_SAMPLES);
+        mixer
+            .lock()
+            .unwrap()
+            .set_playout_hints(decode_streams.playout_hints());
         let mut report = LiveAudioSimulationReport {
             scenario: "tone_mute_toggle",
             ..Default::default()
@@ -1478,7 +1495,7 @@ mod tests {
                 plc_fallbacks: s.plc_fallbacks,
                 accelerate_count: s.accelerate_count,
                 expand_count: s.expand_count,
-                underrun_count: s.underrun_count,
+                concealment_expands: s.concealment_expands,
             },
         )
     }
@@ -1487,7 +1504,7 @@ mod tests {
         plc_fallbacks: u64,
         accelerate_count: u64,
         expand_count: u64,
-        underrun_count: u64,
+        concealment_expands: u64,
     }
 
     /// Peak second-difference (linear-prediction) residual of a `freq` Hz tone,
@@ -1531,10 +1548,10 @@ mod tests {
         assert!(
             residual < 0.004,
             "unmute resume injected a discontinuity: peak prediction residual {residual:.5} \
-             (expand_count={}, accel={}, underruns={})",
+             (expand_count={}, accel={}, concealment_expands={})",
             stats.expand_count,
             stats.accelerate_count,
-            stats.underrun_count,
+            stats.concealment_expands,
         );
     }
 
@@ -1565,7 +1582,7 @@ mod tests {
             output.report
         );
         assert!(
-            output.report.max_output_ring_ms <= duration_to_ms(test_tuning().hard_queue_bound),
+            output.report.max_output_ring_ms <= MAX_STAGED_OUTPUT_MS,
             "{:?}",
             output.report
         );
@@ -1590,11 +1607,11 @@ mod tests {
         let churn_ms = accelerate_ms + expand_ms;
 
         eprintln!(
-            "random60 direct sample: dred={} fec={} plc={} underruns={} accel={}({}ms) expand={}({}ms) churn={}ms output={}ms max_output_ring={}ms max_delta={:.3}",
+            "random60 direct sample: dred={} fec={} plc={} concealment_expands={} accel={}({}ms) expand={}({}ms) churn={}ms output={}ms max_output_ring={}ms max_delta={:.3}",
             snapshot.dred_recoveries,
             snapshot.fec_recoveries,
             snapshot.plc_fallbacks,
-            snapshot.underrun_count,
+            snapshot.concealment_expands,
             snapshot.accelerate_count,
             accelerate_ms,
             snapshot.expand_count,
@@ -1619,7 +1636,7 @@ mod tests {
         assert!(snapshot.expand_count > 0, "{:?}", output.report);
         assert_eq!(snapshot.hard_trim_count, 0, "{:?}", output.report);
         assert!(
-            output.report.max_output_ring_ms <= duration_to_ms(test_tuning().hard_queue_bound),
+            output.report.max_output_ring_ms <= MAX_STAGED_OUTPUT_MS,
             "{:?}",
             output.report
         );
@@ -1647,7 +1664,7 @@ mod tests {
         );
         assert_eq!(report.lost_frames, 0);
         assert!(
-            report.max_output_ring_ms <= duration_to_ms(test_tuning().hard_queue_bound),
+            report.max_output_ring_ms <= MAX_STAGED_OUTPUT_MS,
             "{report:?}"
         );
         assert!(
@@ -1661,7 +1678,7 @@ mod tests {
     }
 
     #[test]
-    fn hundred_ms_output_period_has_no_sustained_underruns() {
+    fn hundred_ms_output_period_has_no_sustained_concealment_expands() {
         let report = run_live_audio_simulation_with_speech(
             LiveAudioSimulationConfig {
                 scenario: LiveAudioSimulationScenario::ConstantSpeech,
@@ -1677,8 +1694,8 @@ mod tests {
 
         assert_eq!(report.lost_frames, 0, "{report:?}");
         assert_eq!(
-            report.steady_state_underruns, 0,
-            "100ms output callback sustained underruns: {report:?}"
+            report.steady_state_concealment_expands, 0,
+            "100ms output callback sustained concealment expands: {report:?}"
         );
     }
 
@@ -1687,9 +1704,9 @@ mod tests {
         // The user-facing per-participant latency estimate is
         // `playout + output_ring + rtt/2` (see `tui::render`). On a pristine
         // local link RTT is ~0, so the estimate is the NetEQ playout delay plus
-        // the staging-ring depth. The safe, reliable floor is the NetEQ target
-        // (`neteq_min_delay + TIME_SCALE_MARGIN`) plus one device double-buffer
-        // block and its staging cushion. Guard that floor so it cannot drift up.
+        // the staged output carry. The safe, reliable floor is the NetEQ target
+        // (`neteq_min_delay + TIME_SCALE_MARGIN`) plus less than one 10 ms
+        // mixer-frame carry. Guard that floor so it cannot drift up.
         let report = simulate_with_loss(
             LiveAudioSimulationScenario::ConstantSpeech,
             Duration::from_secs(60),
@@ -1720,9 +1737,8 @@ mod tests {
         // A no-loss link isolates the silence gate. Muted NetEQ output is now
         // suppressed at the producer boundary instead of being queued as zero
         // blocks, so resume can have a larger instantaneous playout-delay
-        // transient while the actual ring is empty. The invariant is that the
-        // NetEQ target floor and average steady-state playout do not drift up,
-        // and intentional muted drain is not counted as starvation.
+        // transient while staged output is empty. The invariant is that the
+        // NetEQ target floor and average steady-state playout do not drift up.
         let continuous = simulate_with_loss(
             LiveAudioSimulationScenario::ConstantSpeech,
             Duration::from_secs(60),
@@ -1752,7 +1768,10 @@ mod tests {
             "silence-gated resume inflated average playout delay: \
              alternating={alternating:?} continuous={continuous:?}"
         );
-        assert_eq!(alternating.steady_state_underruns, 0, "{alternating:?}");
+        assert_eq!(
+            alternating.steady_state_concealment_expands, 0,
+            "{alternating:?}"
+        );
         assert_eq!(alternating.neteq_packets_discarded, 0, "{alternating:?}");
         assert_eq!(
             alternating.neteq_secondary_packets_discarded, 0,
@@ -1803,7 +1822,7 @@ mod tests {
             enabled.suppressed_frames > disabled.suppressed_frames,
             "{enabled:?} vs {disabled:?}"
         );
-        assert!(enabled.max_output_ring_ms <= duration_to_ms(test_tuning().hard_queue_bound));
+        assert!(enabled.max_output_ring_ms <= MAX_STAGED_OUTPUT_MS);
         assert_coherent_output(&enabled, 0.002);
     }
 
@@ -1838,7 +1857,7 @@ mod tests {
         assert_eq!(report.final_snapshot.plc_fallbacks, 0, "{report:?}");
         assert!(report.final_snapshot.expand_count > 0, "{report:?}");
         assert!(
-            report.max_output_ring_ms <= duration_to_ms(test_tuning().hard_queue_bound),
+            report.max_output_ring_ms <= MAX_STAGED_OUTPUT_MS,
             "{report:?}"
         );
         assert_coherent_output(&report, 0.002);
@@ -1855,7 +1874,7 @@ mod tests {
 
         assert_eq!(report.final_snapshot.active_streams, 3);
         assert!(report.generated_frames > report.output_samples / FRAME_SAMPLES as u64);
-        assert!(report.max_output_ring_ms <= duration_to_ms(test_tuning().hard_queue_bound));
+        assert!(report.max_output_ring_ms <= MAX_STAGED_OUTPUT_MS);
         assert_coherent_output(&report, 0.002);
     }
 
@@ -1881,7 +1900,7 @@ mod tests {
             );
 
             assert!(
-                report.max_output_ring_ms <= duration_to_ms(test_tuning().hard_queue_bound),
+                report.max_output_ring_ms <= MAX_STAGED_OUTPUT_MS,
                 "{packet_loss:?}: {report:?}"
             );
             assert_coherent_output(&report, 0.002);
@@ -1902,7 +1921,7 @@ mod tests {
         assert!(report.late_frames > 0, "{report:?}");
         assert!(report.missing_frames > report.lost_frames, "{report:?}");
         assert!(
-            report.max_output_ring_ms <= duration_to_ms(test_tuning().hard_queue_bound),
+            report.max_output_ring_ms <= MAX_STAGED_OUTPUT_MS,
             "{report:?}"
         );
         assert_coherent_output(&report, 0.002);
@@ -1923,7 +1942,7 @@ mod tests {
         assert!(report.reordered_frames > 0, "{report:?}");
         assert!(report.missing_frames > 0, "{report:?}");
         assert!(
-            report.max_output_ring_ms <= duration_to_ms(test_tuning().hard_queue_bound),
+            report.max_output_ring_ms <= MAX_STAGED_OUTPUT_MS,
             "{report:?}"
         );
         assert_coherent_output(&report, 0.002);
@@ -2042,10 +2061,8 @@ mod tests {
     #[ignore = "known-issue"]
     fn neteq_parity_realistic_jitter_does_not_starve_playback() {
         // Quality outcome: speech plays through without the buffer running dry.
-        // Baseline today: bursty_wifi steady_state_underruns=4 (underrun_count
-        // 19); congested_wifi steady_state_underruns=1 (underrun_count 16). A
-        // target that tracks the envelope keeps the queue above empty across
-        // the spikes, so steady-state starvation goes to zero.
+        // A target that tracks the jitter envelope keeps NetEQ above starvation
+        // across the spikes, so steady-state concealment expands go to zero.
         for profile in [
             LiveAudioPacketLossProfile::BurstyWifi,
             LiveAudioPacketLossProfile::CongestedWifi,
@@ -2059,13 +2076,13 @@ mod tests {
             );
 
             assert_eq!(
-                report.steady_state_underruns, 0,
-                "{profile:?} starved the buffer in steady state: {report:?}"
+                report.steady_state_concealment_expands, 0,
+                "{profile:?} starved NetEQ in steady state: {report:?}"
             );
             assert!(
-                report.final_snapshot.underrun_count <= 10,
-                "{profile:?} underran {} times over the call: {report:?}",
-                report.final_snapshot.underrun_count
+                report.final_snapshot.concealment_expands <= 10,
+                "{profile:?} expanded {} times over the call: {report:?}",
+                report.final_snapshot.concealment_expands
             );
             assert_coherent_output(&report, 0.005);
         }

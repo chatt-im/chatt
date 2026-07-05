@@ -232,7 +232,7 @@ fn log_discard(packet: &Packet, primary: &mut u64, secondary: &mut u64) {
 
 #[cfg(test)]
 mod tests {
-    use std::rc::Rc;
+    use std::sync::Arc;
 
     use super::*;
     use crate::audio::playback::neteq::packet::{Packet, PacketPayload, Priority};
@@ -243,7 +243,7 @@ mod tests {
             sequence,
             priority,
             960,
-            PacketPayload::Opus(Rc::new(vec![1, 2, 3, 4])),
+            PacketPayload::Opus(Arc::new(vec![1, 2, 3, 4])),
         )
     }
 
