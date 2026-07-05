@@ -108,6 +108,10 @@ const HISTORY_CHUNK_TARGET_BYTES: usize = 192 * 1024;
 /// Most disk-paged history fetches one session may have queued on the reader
 /// thread; a well-behaved client keeps at most one in flight per room.
 const MAX_PENDING_DISK_HISTORY_FETCHES: u8 = 8;
+/// Most concurrent file uploads one session may hold open. A well-behaved
+/// client streams uploads one at a time, so this only bounds a client that
+/// opens transfers and never finishes them.
+const MAX_ACTIVE_UPLOADS_PER_SESSION: usize = 8;
 /// Cap on a stream's fast-start ring. Keyframes reset the ring, so this only
 /// bounds a pathologically long GOP rather than normal operation.
 const VIDEO_RING_MAX_BYTES: usize = 8 * 1024 * 1024;
@@ -2622,6 +2626,14 @@ impl Server {
         if self.active_uploads.contains_key(&key) {
             return Err("file transfer id is already active".into());
         }
+        let session_uploads = self
+            .active_uploads
+            .keys()
+            .filter(|(owner, _)| *owner == session_id)
+            .count();
+        if session_uploads >= MAX_ACTIVE_UPLOADS_PER_SESSION {
+            return Err("too many concurrent file uploads".into());
+        }
         let (sender, sender_name) = match self.sessions.get(&session_id) {
             Some(session) => (session.user_id, session.display_name.clone()),
             None => return Err("unknown session".into()),
@@ -2629,6 +2641,9 @@ impl Server {
         if !self.check_room_access(session_id, room_id) {
             return Ok(());
         }
+        let Some(uploader_token) = self.live_token_for_session(session_id) else {
+            return Err("uploading session disconnected".into());
+        };
 
         let member_ids: Vec<SessionId> = self
             .rooms
@@ -2686,19 +2701,42 @@ impl Server {
             ),
             file_transfer_id: Some(server_transfer_id),
         };
-        let uploader_token = self
-            .live_token_for_session(session_id)
-            .ok_or_else(|| "uploading session disconnected".to_string())?;
-        self.send_control_to_token(
+        // The upload is registered before anything durable or visible
+        // happens, so an uploader torn down by any of the sends below is
+        // swept by `cancel_uploads_for_session`, which emits the terminal
+        // `FileCanceled` and releases the reserved name.
+        self.active_uploads.insert(
+            key,
+            ServerUpload {
+                server_transfer_id,
+                room_id,
+                encoding,
+                original_size,
+                wire_received: 0,
+                file_name,
+                recipients: recipients.clone(),
+            },
+        );
+        let accepted = self.send_control_to_token(
             uploader_token,
             &ServerControl::UploadFileAccepted {
                 client_transfer_id,
                 file: metadata.clone(),
             },
-        )?;
+        );
+        if accepted.is_err() || self.live_token_for_session(session_id).is_none() {
+            self.cancel_file_upload(
+                session_id,
+                client_transfer_id,
+                "uploading session disconnected".to_string(),
+            );
+            return accepted;
+        }
         self.store.append(room_id, &message);
         self.broadcast_control(room_id, &ServerControl::Chat { message });
         if self.live_token_for_session(session_id).is_none() {
+            // The uploader's teardown during the broadcast already canceled
+            // the upload, giving the persisted message its terminal event.
             return Ok(());
         }
         recipients.retain(|recipient| self.live_token_for_session(*recipient).is_some());
@@ -2720,17 +2758,11 @@ impl Server {
             }
         }
 
-        self.active_uploads.insert(
-            key,
-            ServerUpload {
-                server_transfer_id,
-                room_id,
-                encoding,
-                original_size,
-                wire_received: 0,
-                recipients,
-            },
-        );
+        // A recipient teardown during the fan-out can cascade into canceling
+        // this upload, so the entry may already be gone.
+        if let Some(upload) = self.active_uploads.get_mut(&key) {
+            upload.recipients = recipients;
+        }
         Ok(())
     }
 
@@ -2807,6 +2839,7 @@ impl Server {
             .active_uploads
             .remove(&key)
             .ok_or_else(|| "unknown file transfer".to_string())?;
+        self.reserved_file_names.remove(&upload.file_name);
         if !upload_completion_is_valid(upload.encoding, upload.original_size, upload.wire_received)
         {
             self.send_file_canceled(&upload, "upload ended before all bytes arrived");
@@ -2845,6 +2878,7 @@ impl Server {
     ) {
         let key = (session_id, client_transfer_id);
         if let Some(upload) = self.active_uploads.remove(&key) {
+            self.reserved_file_names.remove(&upload.file_name);
             kvlog::warn!(
                 "file upload canceled",
                 session_id = session_id.0,
@@ -4531,6 +4565,9 @@ struct ServerUpload {
     encoding: FileContentEncoding,
     original_size: u64,
     wire_received: u64,
+    /// Name held in `reserved_file_names` for the transfer's lifetime,
+    /// released when the upload completes or cancels.
+    file_name: String,
     recipients: HashSet<SessionId>,
 }
 
@@ -5077,13 +5114,17 @@ mod tests {
         assert_eq!(positional_args(&args), vec!["serve", "server.toml"]);
     }
 
-    fn test_server() -> Server {
+    fn test_server_config() -> ServerConfig {
         let mut config = ServerConfig::default();
         config.network.tcp_addr = "127.0.0.1:0".parse().expect("valid tcp addr");
         config.network.udp_addr = "127.0.0.1:0".parse().expect("valid udp addr");
         config.network.udp_probe_addr = None;
         config.network.p2p_enabled = false;
-        Server::bind(config).expect("test server")
+        config
+    }
+
+    fn test_server() -> Server {
+        Server::bind(test_server_config()).expect("test server")
     }
 
     #[test]
@@ -6758,6 +6799,162 @@ mod tests {
         assert!(!session_accepts_file(&session, 1025));
         session.receive_files = false;
         assert!(!session_accepts_file(&session, 1));
+    }
+
+    #[test]
+    fn upload_start_of_uploader_torn_down_mid_accept_persists_no_file_message() {
+        // The `UploadFileAccepted` send can tear the uploader down
+        // synchronously (a draining connection whose queue flushed, or
+        // backpressure overflow). The durable chat message carrying the
+        // transfer id must not be appended after that teardown: with the
+        // upload never registered, no `FileCanceled` ever follows and every
+        // client renders a broken file message forever.
+        let mut config = test_server_config();
+        config.rooms[0].persistence = config::RoomPersistenceConfig::Memory;
+        let mut server = Server::bind(config).expect("test server");
+        let room_id = server.default_room;
+        let session_id = SessionId(1);
+        let token = Token(11);
+        let (mut conn, _peer) = test_live_client();
+        conn.close = Close::Draining {
+            deadline: Instant::now() + Duration::from_secs(60),
+        };
+        server.clients.insert(token, conn);
+        server
+            .sessions
+            .insert(session_id, test_session(UserId(9), token, None));
+
+        let result = server.start_file_upload(
+            session_id,
+            room_id,
+            FileTransferId(1),
+            "report.pdf".to_string(),
+            128,
+            FileContentEncoding::Identity,
+        );
+
+        assert!(result.is_ok());
+        assert!(
+            server.clients.is_empty(),
+            "the draining uploader flushes and disconnects during the accept send"
+        );
+        assert!(server.active_uploads.is_empty());
+        assert!(server.reserved_file_names.is_empty());
+        let dangling = server
+            .store
+            .recent(room_id, 16)
+            .into_iter()
+            .filter(|message| message.file_transfer_id.is_some())
+            .count();
+        assert_eq!(dangling, 0, "no chat message may reference the transfer");
+    }
+
+    #[test]
+    fn completed_upload_releases_its_reserved_file_name() {
+        let mut server = test_server();
+        let room_id = server.default_room;
+        let session_id = SessionId(1);
+        let _peer = live_user(&mut server, Token(11), session_id, UserId(9));
+
+        server
+            .start_file_upload(
+                session_id,
+                room_id,
+                FileTransferId(1),
+                "report.pdf".to_string(),
+                4,
+                FileContentEncoding::Identity,
+            )
+            .unwrap();
+        assert!(server.reserved_file_names.contains("report.pdf"));
+        server
+            .receive_file_chunk(session_id, FileTransferId(1), 0, vec![0u8; 4])
+            .unwrap();
+        assert!(
+            server.reserved_file_names.contains("report.pdf"),
+            "the name stays reserved while chunks stream"
+        );
+        server
+            .complete_file_upload(session_id, FileTransferId(1))
+            .unwrap();
+        assert!(server.reserved_file_names.is_empty());
+
+        server
+            .start_file_upload(
+                session_id,
+                room_id,
+                FileTransferId(2),
+                "report.pdf".to_string(),
+                4,
+                FileContentEncoding::Identity,
+            )
+            .unwrap();
+        let upload = server
+            .active_uploads
+            .get(&(session_id, FileTransferId(2)))
+            .unwrap();
+        assert_eq!(
+            upload.file_name, "report.pdf",
+            "a released name is reused without a numeric suffix"
+        );
+    }
+
+    #[test]
+    fn canceled_upload_releases_its_reserved_file_name() {
+        let mut server = test_server();
+        let room_id = server.default_room;
+        let session_id = SessionId(1);
+        let _peer = live_user(&mut server, Token(11), session_id, UserId(9));
+
+        server
+            .start_file_upload(
+                session_id,
+                room_id,
+                FileTransferId(1),
+                "report.pdf".to_string(),
+                4,
+                FileContentEncoding::Identity,
+            )
+            .unwrap();
+        assert!(server.reserved_file_names.contains("report.pdf"));
+
+        server.cancel_file_upload(session_id, FileTransferId(1), "client canceled".to_string());
+
+        assert!(server.active_uploads.is_empty());
+        assert!(server.reserved_file_names.is_empty());
+    }
+
+    #[test]
+    fn upload_start_beyond_per_session_cap_is_rejected() {
+        let mut server = test_server();
+        let room_id = server.default_room;
+        let session_id = SessionId(1);
+        let _peer = live_user(&mut server, Token(11), session_id, UserId(9));
+
+        for index in 0..MAX_ACTIVE_UPLOADS_PER_SESSION {
+            server
+                .start_file_upload(
+                    session_id,
+                    room_id,
+                    FileTransferId(index as u64 + 1),
+                    format!("file-{index}.bin"),
+                    4,
+                    FileContentEncoding::Identity,
+                )
+                .unwrap();
+        }
+
+        let result = server.start_file_upload(
+            session_id,
+            room_id,
+            FileTransferId(99),
+            "file-extra.bin".to_string(),
+            4,
+            FileContentEncoding::Identity,
+        );
+
+        assert!(result.is_err());
+        assert_eq!(server.active_uploads.len(), MAX_ACTIVE_UPLOADS_PER_SESSION);
     }
 
     #[test]
