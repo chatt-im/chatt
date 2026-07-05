@@ -15,6 +15,7 @@ use crate::audio::{
     shared::{
         AUDIO_POP_DELTA_THRESHOLD, LivePlaybackSnapshot, PlaybackStreamControl,
         audio_pop_logging_enabled, db_to_gain, max_adjacent_delta, peak_normalized, rms_normalized,
+        samples_to_duration,
     },
 };
 
@@ -65,6 +66,7 @@ pub(crate) struct LivePlaybackMixer {
     /// Fixed 10 ms cache backing the legacy per-sample `pop_mixed_*` interface.
     fill: [f32; MIX_FRAME_SAMPLES],
     fill_cursor: usize,
+    callback_source_cursor: usize,
     /// Diagnostics snapshot the worker stashes here, so the UI and the
     /// single-threaded simulation can read depth through this consumer.
     last_snapshot: LivePlaybackSnapshot,
@@ -123,6 +125,7 @@ impl LivePlaybackMixer {
             combiner: FrameCombiner::default(),
             fill: [0.0; MIX_FRAME_SAMPLES],
             fill_cursor: MIX_FRAME_SAMPLES,
+            callback_source_cursor: 0,
             last_snapshot: LivePlaybackSnapshot::default(),
             hints: None,
             last_output_sample: 0.0,
@@ -163,19 +166,28 @@ impl LivePlaybackMixer {
     /// device and simulation call sites stay unchanged.
     pub(crate) fn log_playback_diagnostics_if_due(&self, _now: Instant) {}
 
+    pub(crate) fn begin_output_callback(&mut self) {
+        self.callback_source_cursor = 0;
+    }
+
+    fn callback_block_time(&self, callback_start: Instant) -> Instant {
+        callback_start + samples_to_duration(self.callback_source_cursor)
+    }
+
     /// Mixes one mono sample, refilling the block cache once per `block`.
-    pub(crate) fn pop_mixed_output_sample(&mut self, now: Instant, block: usize) -> f32 {
+    pub(crate) fn pop_mixed_output_sample(&mut self, callback_start: Instant, block: usize) -> f32 {
         if self.fill_cursor >= MIX_FRAME_SAMPLES {
             if let Some(hints) = &self.hints {
                 hints.note_block_samples(block);
             }
             let mut fill = [0.0; MIX_FRAME_SAMPLES];
-            self.mix_10ms(now, &mut fill);
+            self.mix_10ms(self.callback_block_time(callback_start), &mut fill);
             self.fill = fill;
             self.fill_cursor = 0;
         }
         let sample = self.fill[self.fill_cursor];
         self.fill_cursor += 1;
+        self.callback_source_cursor = self.callback_source_cursor.saturating_add(1);
         sample
     }
 
@@ -248,17 +260,36 @@ impl LivePlaybackMixer {
         }
     }
 
+    pub(crate) fn note_callback_metrics(
+        &self,
+        duration: Duration,
+        period: Duration,
+        mixer_events_drained: u64,
+    ) {
+        if let Some(hints) = &self.hints {
+            hints.note_callback(duration, period, mixer_events_drained);
+        }
+    }
+
+    fn note_neteq_lock_waits(&self, count: u64, total: Duration, max: Duration) {
+        if let Some(hints) = &self.hints {
+            hints.note_neteq_lock_waits(count, total, max);
+        }
+    }
+
     /// Mixes an arbitrary mono block by serving fixed 10 ms mixer frames.
-    pub(crate) fn fill_block(&mut self, now: Instant, out: &mut [f32]) {
+    pub(crate) fn fill_block(&mut self, callback_start: Instant, out: &mut [f32]) {
+        self.begin_output_callback();
         for sample in out {
             if self.fill_cursor >= MIX_FRAME_SAMPLES {
                 let mut fill = [0.0; MIX_FRAME_SAMPLES];
-                self.mix_10ms(now, &mut fill);
+                self.mix_10ms(self.callback_block_time(callback_start), &mut fill);
                 self.fill = fill;
                 self.fill_cursor = 0;
             }
             *sample = self.fill[self.fill_cursor];
             self.fill_cursor += 1;
+            self.callback_source_cursor = self.callback_source_cursor.saturating_add(1);
         }
     }
 
@@ -273,12 +304,26 @@ impl LivePlaybackMixer {
         // `number_of_streams` remains the registered source count passed to the
         // combiner.
         let mut normal_frames = 0;
+        let mut neteq_lock_wait_count = 0u64;
+        let mut neteq_lock_wait_total = Duration::ZERO;
+        let mut neteq_lock_wait_max = Duration::ZERO;
         for stream in self.streams.values_mut() {
             let frame = &mut self.source_frames[normal_frames];
-            if render_stream_10ms(stream, now, frame) {
+            let (active, wait) = render_stream_10ms(stream, now, frame);
+            if wait.as_micros() > 0 {
+                neteq_lock_wait_count = neteq_lock_wait_count.saturating_add(1);
+                neteq_lock_wait_total += wait;
+                neteq_lock_wait_max = neteq_lock_wait_max.max(wait);
+            }
+            if active {
                 normal_frames += 1;
             }
         }
+        self.note_neteq_lock_waits(
+            neteq_lock_wait_count,
+            neteq_lock_wait_total,
+            neteq_lock_wait_max,
+        );
 
         self.combiner.combine_contiguous(
             &self.source_frames[..normal_frames],
@@ -293,7 +338,7 @@ fn render_stream_10ms(
     stream: &mut ConsumerStream,
     now: Instant,
     out: &mut [f32; MIX_FRAME_SAMPLES],
-) -> bool {
+) -> (bool, Duration) {
     let gain = db_to_gain(stream.control.volume_db);
     let muted = stream.control.muted;
     match &mut stream.source {
@@ -301,16 +346,25 @@ fn render_stream_10ms(
             // NetEQ is pulled even while locally muted or in muted expand so its
             // timeline keeps advancing at the playout rate; the envelope then
             // decides whether the block reaches the combiner.
-            let result = lock_shared_stream(handle).get_audio_10ms(now, out);
-            apply_declick(&mut stream.declick_gain, gain, !muted && !result.muted, out)
+            let lock_start = Instant::now();
+            let mut shared = lock_shared_stream(handle);
+            let wait = lock_start.elapsed();
+            let result = shared.get_audio_10ms(now, out);
+            (
+                apply_declick(&mut stream.declick_gain, gain, !muted && !result.muted, out),
+                wait,
+            )
         }
-        ConsumerSource::Ring(reader) => render_ring_stream_10ms(
-            reader,
-            &mut stream.declick_gain,
-            &mut stream.last_sample,
-            gain,
-            muted,
-            out,
+        ConsumerSource::Ring(reader) => (
+            render_ring_stream_10ms(
+                reader,
+                &mut stream.declick_gain,
+                &mut stream.last_sample,
+                gain,
+                muted,
+                out,
+            ),
+            Duration::ZERO,
         ),
     }
 }

@@ -7,7 +7,7 @@ use std::{
         atomic::{AtomicUsize, Ordering},
         mpsc::{Receiver, SyncSender},
     },
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use cpal::{
@@ -29,6 +29,7 @@ use crate::audio::{
     resample::PlaybackResampler,
     shared::{
         AudioStats, BufferRequest, PlaybackStats, SAMPLE_RATE, peak_i16_scale, rms_i16_scale,
+        samples_to_duration,
     },
 };
 
@@ -1459,7 +1460,8 @@ where
                     observer.observe(output.len(), channels);
                 }
                 let now = Instant::now();
-                drain_live_playback_mixer_events(&mut mixer, &mixer_events, &mut pending_event);
+                let drained_events =
+                    drain_live_playback_mixer_events(&mut mixer, &mixer_events, &mut pending_event);
                 live_playback_callback(
                     output,
                     channels,
@@ -1469,7 +1471,13 @@ where
                     &mut playback_record_block,
                     &mut mix_adapter,
                     resampler.as_mut(),
+                    device_rate,
                     now,
+                );
+                mixer.note_callback_metrics(
+                    now.elapsed(),
+                    callback_period(channels.frames_for_interleaved(output.len()), device_rate),
+                    drained_events,
                 );
             },
             move |error| {
@@ -1501,8 +1509,10 @@ fn drain_live_playback_mixer_events(
     mixer: &mut LivePlaybackMixer,
     mixer_events: &SpscSwapQueue<LivePlaybackMixerEvent>,
     pending_event: &mut LivePlaybackMixerEvent,
-) {
+) -> u64 {
+    let mut drained = 0u64;
     while mixer_events.remove(pending_event) {
+        drained = drained.saturating_add(1);
         match mem::take(pending_event) {
             LivePlaybackMixerEvent::Empty => {}
             LivePlaybackMixerEvent::EnsureStream { stream_id, source } => {
@@ -1516,12 +1526,19 @@ fn drain_live_playback_mixer_events(
             }
         }
     }
+    drained
+}
+
+fn callback_period(frames: usize, device_rate: u32) -> Duration {
+    let nanos = frames as u128 * 1_000_000_000u128 / u128::from(device_rate.max(1));
+    Duration::from_nanos(nanos.min(u128::from(u64::MAX)) as u64)
 }
 
 struct LivePlaybackMixAdapter {
     carry: [f32; MIX_FRAME_SAMPLES],
     carry_cursor: usize,
     carry_len: usize,
+    callback_source_cursor: usize,
 }
 
 impl LivePlaybackMixAdapter {
@@ -1530,14 +1547,32 @@ impl LivePlaybackMixAdapter {
             carry: [0.0; MIX_FRAME_SAMPLES],
             carry_cursor: MIX_FRAME_SAMPLES,
             carry_len: MIX_FRAME_SAMPLES,
+            callback_source_cursor: 0,
         }
     }
 
-    fn fill(&mut self, mixer: &mut LivePlaybackMixer, now: Instant, out: &mut [f32]) {
+    fn begin_callback(&mut self) {
+        self.callback_source_cursor = 0;
+    }
+
+    fn block_time(&self, callback_start: Instant) -> Instant {
+        callback_start + samples_to_duration(self.callback_source_cursor)
+    }
+
+    fn fill(&mut self, mixer: &mut LivePlaybackMixer, callback_start: Instant, out: &mut [f32]) {
+        self.fill_from(callback_start, out, |now, carry| mixer.mix_10ms(now, carry));
+    }
+
+    fn fill_from(
+        &mut self,
+        callback_start: Instant,
+        out: &mut [f32],
+        mut render: impl FnMut(Instant, &mut [f32; MIX_FRAME_SAMPLES]),
+    ) {
         let mut written = 0;
         while written < out.len() {
             if self.carry_cursor >= self.carry_len {
-                mixer.mix_10ms(now, &mut self.carry);
+                render(self.block_time(callback_start), &mut self.carry);
                 self.carry_cursor = 0;
                 self.carry_len = MIX_FRAME_SAMPLES;
             }
@@ -1547,18 +1582,28 @@ impl LivePlaybackMixAdapter {
             out[written..written + count]
                 .copy_from_slice(&self.carry[self.carry_cursor..self.carry_cursor + count]);
             self.carry_cursor += count;
+            self.callback_source_cursor = self.callback_source_cursor.saturating_add(count);
             written += count;
         }
     }
 
-    fn next_sample(&mut self, mixer: &mut LivePlaybackMixer, now: Instant) -> f32 {
+    fn next_sample(&mut self, mixer: &mut LivePlaybackMixer, callback_start: Instant) -> f32 {
+        self.next_sample_from(callback_start, |now, carry| mixer.mix_10ms(now, carry))
+    }
+
+    fn next_sample_from(
+        &mut self,
+        callback_start: Instant,
+        mut render: impl FnMut(Instant, &mut [f32; MIX_FRAME_SAMPLES]),
+    ) -> f32 {
         if self.carry_cursor >= self.carry_len {
-            mixer.mix_10ms(now, &mut self.carry);
+            render(self.block_time(callback_start), &mut self.carry);
             self.carry_cursor = 0;
             self.carry_len = MIX_FRAME_SAMPLES;
         }
         let sample = self.carry[self.carry_cursor];
         self.carry_cursor += 1;
+        self.callback_source_cursor = self.callback_source_cursor.saturating_add(1);
         sample
     }
 
@@ -1643,11 +1688,13 @@ fn live_playback_callback<T>(
     playback_record_block: &mut Vec<f32>,
     mix_adapter: &mut LivePlaybackMixAdapter,
     mut resampler: Option<&mut PlaybackResampler>,
+    device_rate: u32,
     now: Instant,
 ) where
     T: Sample + FromSample<f32>,
 {
     let output_frames = channels.frames_for_interleaved(output.len());
+    mix_adapter.begin_callback();
     let mut echo_writer = match echo_control {
         Some(control) if control.enabled() => Some(control.reference().writer()),
         _ => None,
@@ -1659,9 +1706,14 @@ fn live_playback_callback<T>(
         Some(resampler) => {
             let source_block = resampler.source_block_samples(output_frames);
             mixer.note_device_callback_frames(source_block);
+            let mut device_frame_index = 0usize;
             for frame in output.chunks_mut(channels.get()) {
                 let sample = resampler.next_sample(|block| {
-                    mix_adapter.fill(mixer, now, block);
+                    let block_start = now + callback_period(device_frame_index, device_rate);
+                    let block: &mut [f32; MIX_FRAME_SAMPLES] = block
+                        .try_into()
+                        .expect("playback resampler source block must be one mixer frame");
+                    mixer.mix_10ms(block_start, block);
                     for &mixed in block.iter() {
                         if let Some(writer) = echo_writer.as_mut() {
                             writer.push(mixed);
@@ -1675,6 +1727,7 @@ fn live_playback_callback<T>(
                 for channel in frame {
                     *channel = output_sample;
                 }
+                device_frame_index += 1;
             }
         }
         None => {
@@ -2020,6 +2073,69 @@ mod tests {
                 "sample {index}: served {served}, expected {expected}"
             );
         }
+    }
+
+    #[test]
+    fn adapter_timestamps_each_refill_at_its_callback_source_offset() {
+        let start = Instant::now();
+        let mut adapter = LivePlaybackMixAdapter::new();
+        let mut out = vec![0.0; 1_200];
+        let mut refills = Vec::new();
+
+        adapter.begin_callback();
+        adapter.fill_from(start, &mut out, |now, block| {
+            refills.push(now);
+            block.fill(0.0);
+        });
+
+        assert_eq!(refills.len(), 3);
+        assert_eq!(refills[0], start);
+        assert_eq!(refills[1], start + Duration::from_millis(10));
+        assert_eq!(refills[2], start + Duration::from_millis(20));
+
+        let next = start + Duration::from_millis(100);
+        refills.clear();
+        let mut out = vec![0.0; 200];
+        adapter.begin_callback();
+        adapter.fill_from(next, &mut out, |now, block| {
+            refills.push(now);
+            block.fill(0.0);
+        });
+        assert!(
+            refills.is_empty(),
+            "callback should first drain carry from the previous refill"
+        );
+
+        let mut out = vec![0.0; 41];
+        adapter.fill_from(next, &mut out, |now, block| {
+            refills.push(now);
+            block.fill(0.0);
+        });
+        assert_eq!(
+            refills,
+            vec![next + samples_to_duration(240)],
+            "new block should be timestamped after the carried samples"
+        );
+    }
+
+    #[test]
+    fn adapter_next_sample_timestamps_refills_by_ten_ms() {
+        let start = Instant::now();
+        let mut adapter = LivePlaybackMixAdapter::new();
+        let mut refills = Vec::new();
+
+        adapter.begin_callback();
+        for _ in 0..(MIX_FRAME_SAMPLES * 2 + 1) {
+            let _ = adapter.next_sample_from(start, |now, block| {
+                refills.push(now);
+                block.fill(0.0);
+            });
+        }
+
+        assert_eq!(refills.len(), 3);
+        assert_eq!(refills[0], start);
+        assert_eq!(refills[1], start + Duration::from_millis(10));
+        assert_eq!(refills[2], start + Duration::from_millis(20));
     }
 
     #[test]

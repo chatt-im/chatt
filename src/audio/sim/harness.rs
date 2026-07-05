@@ -303,6 +303,7 @@ pub(crate) fn run_live_audio_direct_sample_simulation_output_inner(
         let mut mixer = mixer
             .lock()
             .map_err(|_| "direct sample simulation mixer lock poisoned")?;
+        mixer.begin_output_callback();
         let mut window = OnlineAudioMetrics::default();
         for _ in 0..FRAME_SAMPLES {
             let sample = mixer.pop_mixed_sample(now);
@@ -486,6 +487,7 @@ pub(crate) fn run_live_audio_simulation_inner(
         if callback_index == tail_start_callback {
             tail_concealment_expands_start = Some(mixer.snapshot_at(now).concealment_expands);
         }
+        mixer.begin_output_callback();
         let mut echo_writer = echo_reference.as_ref().map(|reference| reference.writer());
         for _ in 0..output_block_samples {
             let sample = mixer.pop_mixed_output_sample(now, output_block_samples);
@@ -1366,6 +1368,7 @@ mod tests {
 
             if frame_index % (LIVE_OPUS_FRAME_SAMPLES / FRAME_SAMPLES) == 0 {
                 let mut mixer = mixer.lock().unwrap();
+                mixer.begin_output_callback();
                 for _ in 0..LIVE_OPUS_FRAME_SAMPLES {
                     output.push(mixer.pop_mixed_output_sample(now, LIVE_OPUS_FRAME_SAMPLES));
                 }
@@ -1478,6 +1481,7 @@ mod tests {
 
             if frame_index % (LIVE_OPUS_FRAME_SAMPLES / FRAME_SAMPLES) == 0 {
                 let mut mixer = mixer.lock().unwrap();
+                mixer.begin_output_callback();
                 for _ in 0..LIVE_OPUS_FRAME_SAMPLES {
                     output.push(mixer.pop_mixed_output_sample(now, LIVE_OPUS_FRAME_SAMPLES));
                 }
@@ -2022,6 +2026,7 @@ mod tests {
                 &mut trace,
             );
             let mut mixer = mixer.lock().unwrap();
+            mixer.begin_output_callback();
             for _ in 0..FRAME_SAMPLES {
                 let sample = mixer.pop_mixed_output_sample(now, FRAME_SAMPLES);
                 if frame_index >= measure_from {

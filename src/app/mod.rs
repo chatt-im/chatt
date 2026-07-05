@@ -2300,6 +2300,9 @@ impl App {
                     self.voice_room,
                 );
                 if self.voice_room == Some(room_id) {
+                    if let Some(playback) = &self.playback {
+                        playback.start_stream(stream_id.0);
+                    }
                     self.apply_user_audio_control(user_id);
                     self.apply_remote_sender_mute(user_id, self.room.voice_muted(user_id));
                 }

@@ -151,6 +151,7 @@ pub(crate) fn encode_live_dred_packets(
 }
 
 pub(crate) fn pop_until_nonzero(mixer: &mut LivePlaybackMixer, now: Instant) -> f32 {
+    mixer.begin_output_callback();
     for _ in 0..(FRAME_SAMPLES * 2) {
         let sample = mixer.pop_mixed_sample(now);
         if sample.abs() > 0.01 {
@@ -161,6 +162,7 @@ pub(crate) fn pop_until_nonzero(mixer: &mut LivePlaybackMixer, now: Instant) -> 
 }
 
 pub(crate) fn pop_next_nonzero_window(mixer: &mut LivePlaybackMixer, now: Instant) -> f32 {
+    mixer.begin_output_callback();
     let mut max_sample: f32 = 0.0;
     for _ in 0..(FRAME_SAMPLES * 2) {
         max_sample = max_sample.max(mixer.pop_mixed_sample(now).abs());

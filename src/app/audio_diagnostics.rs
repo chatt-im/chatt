@@ -89,12 +89,19 @@ impl AudioDiagnostics {
         };
 
         format!(
-            "devices\n  input: {}\n  output: {}\nplayback\n  output: staged max {}ms, queued {} samples, callback {}ms\n  neteq: playout {}ms ({} / 5s), target {}ms{} ({} / 5s)\n  buffers: decoded {}ms, packets wait {}ms span {}ms / {} pkts, next gap {}\n  decision: {} ({})\n  timing: accelerate {}ms / {}, expand {}ms / {}\n  recovery: dred {}, fec {}, horizon {}ms, missed {}ms / {}, plc {}, trims {}, concealment expands {}\n  active streams: {}\nnetwork\n  voice rx: {} packets / {}\nencoder\n  profile: {}\n{}",
+            "devices\n  input: {}\n  output: {}\nplayback\n  output: staged max {}ms, queued {} samples, callback {}ms\n  callback: {} calls, {} overruns, max {}, events {}, neteq lock waits {} total / {} max / {}\n  neteq: playout {}ms ({} / 5s), target {}ms{} ({} / 5s)\n  buffers: decoded {}ms, packets wait {}ms span {}ms / {} pkts, next gap {}\n  decision: {} ({})\n  timing: accelerate {}ms / {}, expand {}ms / {}\n  recovery: dred {}, fec {}, horizon {}ms, missed {}ms / {}, plc {}, trims {}, concealment expands {}\n  active streams: {}\nnetwork\n  voice rx: {} packets / {}\nencoder\n  profile: {}\n{}",
             input_device,
             output_device,
             self.snapshot.max_output_ring_ms,
             self.snapshot.output_ring_samples,
             self.snapshot.backend_block_ms,
+            self.snapshot.playback_callbacks,
+            self.snapshot.playback_callback_overruns,
+            format_us_compact(self.snapshot.playback_callback_max_duration_us),
+            self.snapshot.playback_mixer_events_drained,
+            format_us_compact(self.snapshot.neteq_lock_wait_total_us),
+            format_us_compact(self.snapshot.neteq_lock_wait_max_us),
+            self.snapshot.neteq_lock_wait_count,
             self.snapshot.neteq_playout_delay_ms,
             format_signed_ms(self.snapshot.neteq_playout_delta_5s_ms),
             self.snapshot.neteq_target_ms,
@@ -159,6 +166,14 @@ fn live_samples_to_ms(samples: usize) -> u64 {
     ((samples as f64 / f64::from(SAMPLE_RATE)) * 1_000.0).round() as u64
 }
 
+fn format_us_compact(us: u64) -> String {
+    if us >= 1_000 {
+        format!("{:.1}ms", us as f64 / 1_000.0)
+    } else {
+        format!("{us}us")
+    }
+}
+
 fn format_bytes_compact(bytes: u64) -> String {
     const KB: u64 = 1024;
     const MB: u64 = 1024 * KB;
@@ -206,6 +221,12 @@ mod tests {
                 neteq_start_delay_ms: 40,
                 dred_recoveries: 2,
                 plc_fallbacks: 1,
+                playback_callbacks: 12,
+                playback_callback_overruns: 1,
+                playback_callback_max_duration_us: 1_250,
+                neteq_lock_wait_count: 2,
+                neteq_lock_wait_total_us: 300,
+                neteq_lock_wait_max_us: 250,
                 ..Default::default()
             },
             LiveEncoderProfile::DRED_35,
@@ -245,6 +266,8 @@ mod tests {
         assert!(body.contains("input: ALSA / Built-in Microphone (default)"));
         assert!(body.contains("output: ALSA / Built-in Speaker"));
         assert!(body.contains("playback\n"));
+        assert!(body.contains("callback: 12 calls, 1 overruns, max 1.2ms"));
+        assert!(body.contains("neteq lock waits 300us total / 250us max / 2"));
         assert!(body.contains("network\n"));
         assert!(body.contains("profile: dred35"));
         assert!(body.contains("health\n  mic: healthy\n  spk: reconnecting (attempt 2, 5s)"));

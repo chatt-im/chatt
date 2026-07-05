@@ -1,13 +1,13 @@
 use std::sync::{
     Arc, Mutex, MutexGuard, PoisonError,
-    atomic::{AtomicUsize, Ordering},
+    atomic::{AtomicU64, AtomicUsize, Ordering},
 };
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::audio::{
     playback::{
         LivePlaybackMixerStats, MIX_FRAME_SAMPLES,
-        neteq::{AudioResult, NetEqCore, NetEqDiagnostics},
+        neteq::{AudioResult, NetEqCore, NetEqDiagnostics, NetEqInsertPlan, NetEqPreparedPacket},
     },
     shared::{
         DecodedFrameSource, LiveAudioTuning, TIME_SCALE_NOISE_FLOOR_MS, TIME_SCALE_VAD_RATIO,
@@ -64,6 +64,30 @@ impl SharedNetEqStream {
     ) -> bool {
         self.core
             .insert_packet(now, timestamp, sequence, flags, opus)
+    }
+
+    /// Worker side: snapshots cheap insertion state so payload preparation can
+    /// run outside the callback-shared mutex.
+    pub(crate) fn insert_plan(&self, timestamp: u32, sequence: u32) -> NetEqInsertPlan {
+        self.core.insert_plan(timestamp, sequence)
+    }
+
+    pub(crate) fn insert_plan_matches(
+        &self,
+        timestamp: u32,
+        sequence: u32,
+        plan: NetEqInsertPlan,
+    ) -> bool {
+        self.core.insert_plan_matches(timestamp, sequence, plan)
+    }
+
+    /// Worker side: commits an already prepared packet into NetEQ.
+    pub(crate) fn insert_prepared_packet(
+        &mut self,
+        now: Instant,
+        prepared: NetEqPreparedPacket,
+    ) -> bool {
+        self.core.insert_prepared_packet(now, prepared)
     }
 
     /// Worker side. See [`NetEqCore::diagnostics`].
@@ -170,6 +194,13 @@ pub(crate) struct LivePlaybackPlayoutHints {
     /// Mixed-but-unplayed samples staged in the mix adapter carry, always less
     /// than one 10 ms block.
     staged_samples: AtomicUsize,
+    callback_count: AtomicU64,
+    callback_overruns: AtomicU64,
+    callback_max_duration_us: AtomicU64,
+    mixer_events_drained: AtomicU64,
+    neteq_lock_wait_count: AtomicU64,
+    neteq_lock_wait_total_us: AtomicU64,
+    neteq_lock_wait_max_us: AtomicU64,
 }
 
 impl LivePlaybackPlayoutHints {
@@ -187,6 +218,82 @@ impl LivePlaybackPlayoutHints {
 
     pub(crate) fn staged_samples(&self) -> usize {
         self.staged_samples.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn note_callback(
+        &self,
+        duration: Duration,
+        period: Duration,
+        mixer_events_drained: u64,
+    ) {
+        self.callback_count.fetch_add(1, Ordering::Relaxed);
+        if duration > period {
+            self.callback_overruns.fetch_add(1, Ordering::Relaxed);
+        }
+        atomic_max(&self.callback_max_duration_us, duration_to_us(duration));
+        self.mixer_events_drained
+            .fetch_add(mixer_events_drained, Ordering::Relaxed);
+    }
+
+    pub(crate) fn note_neteq_lock_wait(&self, wait: Duration) {
+        let wait_us = duration_to_us(wait);
+        if wait_us == 0 {
+            return;
+        }
+        self.note_neteq_lock_waits(1, wait, wait);
+    }
+
+    pub(crate) fn note_neteq_lock_waits(&self, count: u64, total: Duration, max: Duration) {
+        if count == 0 {
+            return;
+        }
+        let total_us = duration_to_us(total);
+        let max_us = duration_to_us(max);
+        if total_us == 0 && max_us == 0 {
+            return;
+        }
+        self.neteq_lock_wait_count
+            .fetch_add(count, Ordering::Relaxed);
+        self.neteq_lock_wait_total_us
+            .fetch_add(total_us, Ordering::Relaxed);
+        atomic_max(&self.neteq_lock_wait_max_us, max_us);
+    }
+
+    pub(crate) fn metrics(&self) -> LivePlaybackCallbackMetrics {
+        LivePlaybackCallbackMetrics {
+            callback_count: self.callback_count.load(Ordering::Relaxed),
+            callback_overruns: self.callback_overruns.load(Ordering::Relaxed),
+            callback_max_duration_us: self.callback_max_duration_us.load(Ordering::Relaxed),
+            mixer_events_drained: self.mixer_events_drained.load(Ordering::Relaxed),
+            neteq_lock_wait_count: self.neteq_lock_wait_count.load(Ordering::Relaxed),
+            neteq_lock_wait_total_us: self.neteq_lock_wait_total_us.load(Ordering::Relaxed),
+            neteq_lock_wait_max_us: self.neteq_lock_wait_max_us.load(Ordering::Relaxed),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct LivePlaybackCallbackMetrics {
+    pub(crate) callback_count: u64,
+    pub(crate) callback_overruns: u64,
+    pub(crate) callback_max_duration_us: u64,
+    pub(crate) mixer_events_drained: u64,
+    pub(crate) neteq_lock_wait_count: u64,
+    pub(crate) neteq_lock_wait_total_us: u64,
+    pub(crate) neteq_lock_wait_max_us: u64,
+}
+
+fn duration_to_us(duration: Duration) -> u64 {
+    duration.as_micros().min(u128::from(u64::MAX)) as u64
+}
+
+fn atomic_max(target: &AtomicU64, value: u64) {
+    let mut current = target.load(Ordering::Relaxed);
+    while value > current {
+        match target.compare_exchange_weak(current, value, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => break,
+            Err(next) => current = next,
+        }
     }
 }
 
