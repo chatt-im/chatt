@@ -1345,8 +1345,9 @@ name = "pipewire-sys"
 version = "0.10.0"
 dependencies = [
  "bindgen",
+ "libloading",
  "libspa-sys",
- "system-deps",
+ "pkg-config",
 ]
 
 [[package]]

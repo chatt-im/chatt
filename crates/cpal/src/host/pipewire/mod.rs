@@ -30,6 +30,13 @@ pub struct Host {
 
 impl Host {
     pub fn new() -> Result<Self, Error> {
+        // Must precede PwInitGuard: pw_init on a missing library aborts.
+        if !pipewire::sys::library_available() {
+            return Err(Error::with_message(
+                ErrorKind::HostUnavailable,
+                "libpipewire-0.3 is not loadable",
+            ));
+        }
         let _pw = PwInitGuard::new();
         let connect_automatically = Arc::new(AtomicBool::new(true));
         let device_set = init_devices(connect_automatically.clone()).ok_or_else(|| {
@@ -63,7 +70,7 @@ impl HostTrait for Host {
     type Device = Device;
 
     fn is_available() -> bool {
-        utils::find_socket_path().is_some()
+        pipewire::sys::library_available() && utils::find_socket_path().is_some()
     }
 
     fn devices(&self) -> Result<Self::Devices, Error> {

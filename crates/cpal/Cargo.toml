@@ -341,3 +341,6 @@ features = [
     "NSValue",
 ]
 default-features = false
+
+[patch.crates-io]
+pipewire-sys = { path = "../pipewire-sys" }
