@@ -14,6 +14,7 @@ pub mod config;
 mod history_reader;
 pub mod local_admin;
 pub mod room_store;
+pub mod user_store;
 
 use mio::{
     Events, Interest, Poll, Token, Waker,
@@ -45,13 +46,11 @@ use rpc::{
     video::{self, VideoAck, VideoHello, VideoRole},
 };
 
-use config::{
-    Config as ServerConfig, UserConfig, constant_time_eq, hash_secret, value_arg,
-    verify_secret_hash,
-};
+use config::{Config as ServerConfig, UserConfig, hash_secret, value_arg, verify_secret_hash};
 use history_reader::{HistoryReadReply, HistoryReader};
 use local_admin::{AdminCommand, AdminSocket};
 use room_store::RoomStore;
+use user_store::UserStore;
 
 #[cfg(test)]
 use rpc::history;
@@ -167,14 +166,14 @@ pub fn run_cli() -> Result<(), Box<dyn std::error::Error>> {
     kvlog::info!(
         "server starting",
         tcp_addr = %config.network.tcp_addr,
-        udp_addr = %config.network.udp_addr,
+        udp_addr = %config.network.udp_addr(),
         udp_probe_addr = udp_probe_label.as_str(),
         server_public_key = server_public_key.as_str(),
         encryption = config.security.encryption,
         p2p_enabled = config.network.p2p_enabled
     );
     let tcp_addr = config.network.tcp_addr;
-    let udp_addr = config.network.udp_addr;
+    let udp_addr = config.network.udp_addr();
     let public_tcp_addr = config.network.public_tcp_addr.clone();
     let public_udp_addr = config.network.public_udp_addr.clone();
     let public_udp_probe_addr = config
@@ -233,6 +232,9 @@ pub fn run_cli() -> Result<(), Box<dyn std::error::Error>> {
 
 pub struct Server {
     config: ServerConfig,
+    /// The server-managed user registry, persisted under the data dir. Public
+    /// so harnesses (`bench_upload`) can seed users directly.
+    pub users: UserStore,
     poll: Poll,
     listener: TcpListener,
     udp: UdpSocket,
@@ -291,7 +293,7 @@ impl Server {
 
     pub fn bind(config: ServerConfig) -> io::Result<Self> {
         let tcp_addr = config.network.tcp_addr;
-        let udp_addr = config.network.udp_addr;
+        let udp_addr = config.network.udp_addr();
         let udp_probe_addr = config.network.udp_probe_addr;
         let p2p_enabled = config.network.p2p_enabled;
         let poll = Poll::new()?;
@@ -311,6 +313,8 @@ impl Server {
                 .register(udp_probe, UDP_PROBE, Interest::READABLE)?;
         }
 
+        let users = UserStore::open(config.data_dir())
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
         let mut rooms = HashMap::new();
         for room in &config.rooms {
             let access = match &room.members {
@@ -319,11 +323,15 @@ impl Server {
                     members
                         .iter()
                         .filter_map(|member| {
-                            config
-                                .users
-                                .iter()
-                                .find(|user| user.name == *member)
-                                .map(|user| user.id)
+                            let user = users.users.iter().find(|user| user.name == *member);
+                            if user.is_none() {
+                                kvlog::warn!(
+                                    "private room member does not match any registered user; ignored until that user pairs",
+                                    room = room.name.as_str(),
+                                    member = member.as_str()
+                                );
+                            }
+                            user.map(|user| user.id)
                         })
                         .collect(),
                 ),
@@ -371,6 +379,7 @@ impl Server {
 
         Ok(Self {
             config,
+            users,
             poll,
             listener,
             udp,
@@ -479,6 +488,9 @@ impl Server {
         }
         if user_name.len() > 512 {
             return Err("invite user exceeds maximum length".to_string());
+        }
+        if user_name.chars().any(char::is_control) {
+            return Err("invite user contains control characters".to_string());
         }
 
         let pairing_code = random_secret_hex(&self.rng)?;
@@ -1522,7 +1534,7 @@ impl Server {
             );
         }
         let Some(user) = self
-            .config
+            .users
             .users
             .iter()
             .find(|candidate| {
@@ -1544,14 +1556,11 @@ impl Server {
         };
         let user_name = user.name.clone();
         let display_name = display_name.trim();
-        let user = if display_name.is_empty()
-            || display_name.len() > 64
-            || display_name == user.display_name
-        {
+        let user = if !valid_display_name(display_name) || display_name == user.display_name {
             user
         } else {
             match self
-                .config
+                .users
                 .set_user_display_name(&user_name, display_name.to_string())
             {
                 Ok(user) => user,
@@ -1580,10 +1589,10 @@ impl Server {
     /// identifier since there is no username.
     fn dynamic_user(user_id: UserId, display_name: &str) -> UserConfig {
         let display_name = display_name.trim();
-        let display_name = if display_name.is_empty() || display_name.len() > 64 {
-            user_id.to_string()
-        } else {
+        let display_name = if valid_display_name(display_name) {
             display_name.to_string()
+        } else {
+            user_id.to_string()
         };
         UserConfig {
             id: user_id,
@@ -1622,7 +1631,7 @@ impl Server {
             );
         };
         let display_name = display_name.trim();
-        if display_name.is_empty() || display_name.len() > 64 {
+        if !valid_display_name(display_name) {
             kvlog::warn!(
                 "pairing rejected",
                 token = token.0,
@@ -1632,13 +1641,14 @@ impl Server {
             return self.reject_auth(
                 token,
                 ERROR_PAIRING_INVALID_REQUEST,
-                "pairing failed: display name must be 1-64 bytes".to_string(),
+                "pairing failed: display name must be 1-64 bytes with no control characters"
+                    .to_string(),
             );
         }
 
         let token_hash = hash_secret(new_token);
         if self
-            .config
+            .users
             .users
             .iter()
             .any(|user| user.name != user_name && user.token_hash == token_hash)
@@ -1656,8 +1666,27 @@ impl Server {
             );
         }
         let user =
-            self.config
-                .mark_user_paired(&user_name, display_name.to_string(), token_hash)?;
+            match self
+                .users
+                .mark_user_paired(&user_name, display_name.to_string(), token_hash)
+            {
+                Ok(user) => user,
+                Err(error) => {
+                    kvlog::error!(
+                        "pairing rejected",
+                        token = token.0,
+                        user = user_name.as_str(),
+                        reason = "state_write_failed",
+                        error = error.as_str()
+                    );
+                    return self.reject_auth(
+                        token,
+                        control::ERROR_INTERNAL,
+                        "pairing failed: the server could not persist the pairing; retry pairing"
+                            .to_string(),
+                    );
+                }
+            };
         self.invites.remove(&user_name);
         kvlog::info!(
             "pairing accepted",
@@ -1777,9 +1806,9 @@ impl Server {
         if !self.check_open_pair_attempt_rate(token)? {
             return Ok(());
         }
-        let required_password = self.config.password().map(str::to_string);
+        let required_hash = self.config.password_hash().map(str::to_string);
         let mut current_password_verified = false;
-        if let Some(required) = required_password {
+        if let Some(required_hash) = required_hash {
             if password.is_empty() {
                 return self.reject_auth(
                     token,
@@ -1787,7 +1816,7 @@ impl Server {
                     "open pairing requires a password".to_string(),
                 );
             }
-            if !constant_time_eq(required.as_bytes(), password.as_bytes()) {
+            if !verify_secret_hash(&required_hash, password) {
                 kvlog::warn!(
                     "open pair rejected",
                     token = token.0,
@@ -1802,11 +1831,12 @@ impl Server {
             current_password_verified = true;
         }
         let display_name = display_name.trim();
-        if display_name.is_empty() || display_name.len() > 64 {
+        if !valid_display_name(display_name) {
             return self.reject_auth(
                 token,
                 ERROR_PAIRING_INVALID_REQUEST,
-                "open pairing failed: display name must be 1-64 bytes".to_string(),
+                "open pairing failed: display name must be 1-64 bytes with no control characters"
+                    .to_string(),
             );
         }
         let seed = self.config.security.server_identity_seed.clone();
@@ -1823,7 +1853,23 @@ impl Server {
                 if !self.check_open_pair_allocation_rate(token)? {
                     return Ok(());
                 }
-                self.config.allocate_dynamic_user_id()?
+                match self.users.allocate_dynamic_user_id() {
+                    Ok(user_id) => user_id,
+                    Err(error) => {
+                        kvlog::error!(
+                            "open pair rejected",
+                            token = token.0,
+                            reason = "state_write_failed",
+                            error = error.as_str()
+                        );
+                        return self.reject_auth(
+                            token,
+                            control::ERROR_INTERNAL,
+                            "open pairing failed: the server could not persist state; retry later"
+                                .to_string(),
+                        );
+                    }
+                }
             }
         };
         let issued = issue_dynamic_token(
@@ -2074,7 +2120,7 @@ impl Server {
     /// plus currently-online dynamic users.
     fn user_summaries(&self) -> Vec<UserSummary> {
         let mut users: Vec<UserSummary> = self
-            .config
+            .users
             .users
             .iter()
             .map(|user| {
@@ -2446,7 +2492,7 @@ impl Server {
             );
             return;
         }
-        let peer_known = self.config.users.iter().any(|user| user.id == peer)
+        let peer_known = self.users.users.iter().any(|user| user.id == peer)
             || self
                 .sessions
                 .values()
@@ -4740,6 +4786,13 @@ fn subscriber_within_limit(write_buf_len: usize) -> bool {
     write_buf_len <= VIDEO_SUBSCRIBER_HIGH_WATER
 }
 
+/// Whether a client-supplied display name is acceptable: non-empty after
+/// trimming, at most 64 bytes, and free of control characters, which must
+/// never reach the persisted user registry.
+fn valid_display_name(name: &str) -> bool {
+    !name.is_empty() && name.len() <= 64 && !name.chars().any(char::is_control)
+}
+
 fn is_dynamic_user_id(user_id: UserId) -> bool {
     user_id.0 >= config::FIRST_DYNAMIC_USER_ID
 }
@@ -5117,7 +5170,7 @@ mod tests {
     fn test_server_config() -> ServerConfig {
         let mut config = ServerConfig::default();
         config.network.tcp_addr = "127.0.0.1:0".parse().expect("valid tcp addr");
-        config.network.udp_addr = "127.0.0.1:0".parse().expect("valid udp addr");
+        config.network.udp_addr = Some("127.0.0.1:0".parse().expect("valid udp addr"));
         config.network.udp_probe_addr = None;
         config.network.p2p_enabled = false;
         config
@@ -5471,7 +5524,7 @@ mod tests {
     #[test]
     fn user_summaries_hides_unannounced_sessions() {
         let mut server = test_server();
-        server.config.users.push(UserConfig {
+        server.users.users.push(UserConfig {
             id: UserId(9),
             name: "bob".to_string(),
             display_name: "Bob".to_string(),
@@ -5753,7 +5806,7 @@ mod tests {
             .expect("dm registered");
         let mut config = server.config.clone();
         config.network.tcp_addr = "127.0.0.1:0".parse().unwrap();
-        config.network.udp_addr = "127.0.0.1:0".parse().unwrap();
+        config.network.udp_addr = Some("127.0.0.1:0".parse().unwrap());
         drop(server);
 
         let restarted = Server::bind(config).expect("restarted server");
@@ -5774,7 +5827,7 @@ mod tests {
     fn history_fetch_paginates_backwards() {
         let mut config = ServerConfig::default();
         config.network.tcp_addr = "127.0.0.1:0".parse().unwrap();
-        config.network.udp_addr = "127.0.0.1:0".parse().unwrap();
+        config.network.udp_addr = Some("127.0.0.1:0".parse().unwrap());
         config.network.p2p_enabled = false;
         config.rooms[0].persistence = config::RoomPersistenceConfig::Memory;
         config.rooms[0].memory_limit = Some(100);
@@ -5813,7 +5866,7 @@ mod tests {
     fn history_fetch_streams_page_over_bounded_chunks() {
         let mut config = ServerConfig::default();
         config.network.tcp_addr = "127.0.0.1:0".parse().unwrap();
-        config.network.udp_addr = "127.0.0.1:0".parse().unwrap();
+        config.network.udp_addr = Some("127.0.0.1:0".parse().unwrap());
         config.network.p2p_enabled = false;
         config.rooms[0].persistence = config::RoomPersistenceConfig::Memory;
         config.rooms[0].memory_limit = Some(256);
@@ -5905,7 +5958,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         let mut config = ServerConfig::default();
         config.network.tcp_addr = "127.0.0.1:0".parse().unwrap();
-        config.network.udp_addr = "127.0.0.1:0".parse().unwrap();
+        config.network.udp_addr = Some("127.0.0.1:0".parse().unwrap());
         config.network.p2p_enabled = false;
         config.rooms[0].persistence = config::RoomPersistenceConfig::Durable;
         config.storage.data_dir = Some(dir.display().to_string());
@@ -7023,7 +7076,7 @@ mod tests {
     fn authenticate_resolves_user_by_token_alone() {
         let mut server = test_server();
         let token_secret = "alice-client-generated-token-with-at-least-32-bytes";
-        server.config.users = vec![UserConfig {
+        server.users.users = vec![UserConfig {
             id: UserId(7),
             name: "alice-internal".to_string(),
             display_name: "Alice".to_string(),
@@ -7049,7 +7102,7 @@ mod tests {
     #[test]
     fn authenticate_rejects_unknown_token() {
         let mut server = test_server();
-        server.config.users = vec![UserConfig {
+        server.users.users = vec![UserConfig {
             id: UserId(7),
             name: "alice-internal".to_string(),
             display_name: "Alice".to_string(),
@@ -7061,17 +7114,10 @@ mod tests {
         assert!(server.sessions.is_empty());
     }
 
-    fn open_pair_test_server(suffix: &str) -> (Server, std::path::PathBuf) {
-        let path = std::env::temp_dir().join(format!(
-            "chatt-open-pair-{}-{}.toml",
-            std::process::id(),
-            suffix
-        ));
-        let _ = std::fs::remove_file(&path);
+    fn open_pair_test_server() -> Server {
         let mut server = test_server();
-        server.config.config_path = Some(path.clone());
         server.config.security.public = true;
-        (server, path)
+        server
     }
 
     fn session_for(server: &Server, token: Token) -> Option<&Session> {
@@ -7083,7 +7129,7 @@ mod tests {
 
     #[test]
     fn open_pair_allocates_dynamic_user_and_issues_token() {
-        let (mut server, path) = open_pair_test_server("alloc");
+        let mut server = open_pair_test_server();
 
         let _ = server.open_pair_client(Token(1), "Zoe", "", "", true, 0);
 
@@ -7094,24 +7140,22 @@ mod tests {
             session.identifier,
             config::FIRST_DYNAMIC_USER_ID.to_string()
         );
-        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
     fn open_pair_rejected_when_not_public() {
-        let (mut server, path) = open_pair_test_server("private");
+        let mut server = open_pair_test_server();
         server.config.security.public = false;
 
         let _ = server.open_pair_client(Token(1), "Zoe", "", "", true, 0);
 
         assert!(server.sessions.is_empty());
-        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
     fn open_pair_enforces_password() {
-        let (mut server, path) = open_pair_test_server("password");
-        server.config.security.password = Some("hunter2".to_string());
+        let mut server = open_pair_test_server();
+        server.config.security.password_hash = Some(hash_secret("hunter2"));
 
         let _ = server.open_pair_client(Token(1), "Zoe", "", "", true, 0);
         assert!(session_for(&server, Token(1)).is_none());
@@ -7121,13 +7165,12 @@ mod tests {
 
         let _ = server.open_pair_client(Token(3), "Zoe", "hunter2", "", true, 0);
         assert!(session_for(&server, Token(3)).is_some());
-        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
     fn open_pair_preserves_identity_on_re_pair() {
-        let (mut server, path) = open_pair_test_server("reuse");
-        server.config.security.password = Some("hunter2".to_string());
+        let mut server = open_pair_test_server();
+        server.config.security.password_hash = Some(hash_secret("hunter2"));
         server.config.security.password_epoch = 7;
         let seed = server.config.security.server_identity_seed.clone();
         let existing = issue_dynamic_token(
@@ -7143,12 +7186,11 @@ mod tests {
 
         let session = session_for(&server, Token(1)).expect("session established");
         assert_eq!(session.user_id, UserId(config::FIRST_DYNAMIC_USER_ID + 5));
-        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
     fn open_pair_without_password_does_not_preserve_stale_identity() {
-        let (mut server, path) = open_pair_test_server("reuse-stale-no-password");
+        let mut server = open_pair_test_server();
         server.config.security.password_epoch = 7;
         let seed = server.config.security.server_identity_seed.clone();
         let existing = issue_dynamic_token(
@@ -7164,13 +7206,12 @@ mod tests {
 
         let session = session_for(&server, Token(1)).expect("session established");
         assert_eq!(session.user_id, UserId(config::FIRST_DYNAMIC_USER_ID));
-        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
     fn open_pair_reissues_current_epoch_token_on_re_pair() {
-        let (mut server, path) = open_pair_test_server("reuse-token");
-        server.config.security.password = Some("hunter2".to_string());
+        let mut server = open_pair_test_server();
+        server.config.security.password_hash = Some(hash_secret("hunter2"));
         server.config.security.password_epoch = 7;
         server.config.network.public_udp_addr = "198.51.100.20:54100".to_string();
         server.config.network.public_udp_probe_addr = Some("198.51.100.20:54101".to_string());
@@ -7207,12 +7248,11 @@ mod tests {
         assert_eq!(claims.password_epoch, 7);
         assert_eq!(udp_addr, "198.51.100.20:54100");
         assert_eq!(udp_probe_addr.as_deref(), Some("198.51.100.20:54101"));
-        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
     fn open_pairing_does_not_announce_or_join_voice() {
-        let (mut server, path) = open_pair_test_server("no-lobby");
+        let mut server = open_pair_test_server();
         let token = Token(11);
         let (conn, _peer) = test_live_client();
         server.clients.insert(token, conn);
@@ -7232,12 +7272,11 @@ mod tests {
                 .active_streams
                 .is_empty()
         );
-        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
     fn authenticate_accepts_issued_dynamic_token() {
-        let (mut server, path) = open_pair_test_server("auth");
+        let mut server = open_pair_test_server();
         let seed = server.config.security.server_identity_seed.clone();
         let token = issue_dynamic_token(
             &seed,
@@ -7252,12 +7291,11 @@ mod tests {
 
         let session = session_for(&server, Token(1)).expect("session established");
         assert_eq!(session.user_id, UserId(config::FIRST_DYNAMIC_USER_ID));
-        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
     fn authenticate_rejects_dynamic_token_when_public_disabled() {
-        let (mut server, path) = open_pair_test_server("auth-private");
+        let mut server = open_pair_test_server();
         server.config.security.public = false;
         let seed = server.config.security.server_identity_seed.clone();
         let token = issue_dynamic_token(
@@ -7272,13 +7310,12 @@ mod tests {
         let _ = server.authenticate_client(Token(1), "Zoe", &token, true, 0);
 
         assert!(server.sessions.is_empty());
-        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
     fn authenticate_rejects_stale_dynamic_token_epoch() {
-        let (mut server, path) = open_pair_test_server("stale");
-        server.config.security.password = Some("hunter2".to_string());
+        let mut server = open_pair_test_server();
+        server.config.security.password_hash = Some(hash_secret("hunter2"));
         server.config.security.password_epoch = 1;
         let seed = server.config.security.server_identity_seed.clone();
         let token = issue_dynamic_token(
@@ -7293,13 +7330,12 @@ mod tests {
         let _ = server.authenticate_client(Token(1), "Zoe", &token, true, 0);
 
         assert!(server.sessions.is_empty());
-        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
     fn authenticate_rejects_stale_dynamic_token_epoch_without_password() {
-        let (mut server, path) = open_pair_test_server("stale-no-password");
-        server.config.security.password = None;
+        let mut server = open_pair_test_server();
+        server.config.security.password_hash = None;
         server.config.security.password_epoch = 1;
         let seed = server.config.security.server_identity_seed.clone();
         let token = issue_dynamic_token(
@@ -7314,12 +7350,11 @@ mod tests {
         let _ = server.authenticate_client(Token(1), "Zoe", &token, true, 0);
 
         assert!(server.sessions.is_empty());
-        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
     fn authenticate_rejects_dynamic_token_for_explicit_id_range() {
-        let (mut server, path) = open_pair_test_server("explicit-range");
+        let mut server = open_pair_test_server();
         let seed = server.config.security.server_identity_seed.clone();
         let token = issue_dynamic_token(
             &seed,
@@ -7333,12 +7368,11 @@ mod tests {
         let _ = server.authenticate_client(Token(1), "Zoe", &token, true, 0);
 
         assert!(server.sessions.is_empty());
-        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
     fn open_pair_rate_limits_new_allocations_per_ip() {
-        let (mut server, path) = open_pair_test_server("rate-ip");
+        let mut server = open_pair_test_server();
         let mut peers = Vec::new();
         for index in 0..OPEN_PAIR_PER_IP_LIMIT {
             let token = Token(100 + index);
@@ -7360,12 +7394,11 @@ mod tests {
             .unwrap();
 
         assert!(session_for(&server, blocked).is_none());
-        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
     fn open_pair_rate_limits_new_allocations_globally() {
-        let (mut server, path) = open_pair_test_server("rate-global");
+        let mut server = open_pair_test_server();
         let now = Instant::now();
         for _ in 0..OPEN_PAIR_GLOBAL_LIMIT {
             server.open_pair_global_allocations.push_back(now);
@@ -7379,13 +7412,12 @@ mod tests {
             .unwrap();
 
         assert!(session_for(&server, token).is_none());
-        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
     fn open_pair_rate_limits_password_attempts_globally() {
-        let (mut server, path) = open_pair_test_server("rate-password");
-        server.config.security.password = Some("hunter2".to_string());
+        let mut server = open_pair_test_server();
+        server.config.security.password_hash = Some(hash_secret("hunter2"));
         let now = Instant::now();
         for _ in 0..(OPEN_PAIR_GLOBAL_LIMIT - 1) {
             server.open_pair_global_allocations.push_back(now);
@@ -7415,18 +7447,12 @@ mod tests {
         };
         assert_eq!(code, ERROR_OPEN_PAIR_RATE_LIMITED);
         assert!(session_for(&server, blocked).is_none());
-        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
     fn pairing_resolves_user_from_code() {
-        let path = std::env::temp_dir().join(format!(
-            "chatt-server-pair-code-test-{}.toml",
-            std::process::id()
-        ));
         let mut server = test_server();
-        server.config.config_path = Some(path.clone());
-        server.config.users = vec![UserConfig {
+        server.users.users = vec![UserConfig {
             id: UserId(3),
             name: "dana".to_string(),
             display_name: "old".to_string(),
@@ -7445,10 +7471,8 @@ mod tests {
         // No `user` is supplied: the server matches the invite by pairing code.
         let _ = server.pair_client(Token(2), "Dana", code, new_token, true, 0);
 
-        let _ = std::fs::remove_file(&path);
-
         let user = server
-            .config
+            .users
             .users
             .iter()
             .find(|user| user.name == "dana")
@@ -7517,13 +7541,8 @@ mod tests {
         // announce presence or join voice. Otherwise it broadcasts an online
         // presence, then a matching offline when the throwaway socket drops,
         // so other clients see the user flicker before the real session joins.
-        let path = std::env::temp_dir().join(format!(
-            "chatt-server-pair-lobby-test-{}.toml",
-            std::process::id()
-        ));
         let mut server = test_server();
-        server.config.config_path = Some(path.clone());
-        server.config.users = vec![UserConfig {
+        server.users.users = vec![UserConfig {
             id: UserId(4),
             name: "gwen".to_string(),
             display_name: "old".to_string(),
@@ -7547,8 +7566,6 @@ mod tests {
         let new_token = "gwen-client-generated-token-with-at-least-32-bytes";
         let _ = server.pair_client(token, "Gwen", code, new_token, true, 0);
 
-        let _ = std::fs::remove_file(&path);
-
         let session = server
             .sessions
             .values()
@@ -7568,14 +7585,9 @@ mod tests {
 
     #[test]
     fn pairing_rejects_token_collision() {
-        let path = std::env::temp_dir().join(format!(
-            "chatt-server-pair-collision-test-{}.toml",
-            std::process::id()
-        ));
         let new_token = "shared-client-generated-token-with-at-least-32-bytes";
         let mut server = test_server();
-        server.config.config_path = Some(path.clone());
-        server.config.users = vec![
+        server.users.users = vec![
             UserConfig {
                 id: UserId(1),
                 name: "erin".to_string(),
@@ -7602,10 +7614,8 @@ mod tests {
         // server must refuse to pair rather than make the token ambiguous.
         let _ = server.pair_client(Token(5), "Frank", code, new_token, true, 0);
 
-        let _ = std::fs::remove_file(&path);
-
         let frank = server
-            .config
+            .users
             .users
             .iter()
             .find(|user| user.name == "frank")
@@ -7613,6 +7623,136 @@ mod tests {
         assert!(frank.token_hash.is_empty());
         assert!(!server.invites.is_empty());
         assert!(server.sessions.is_empty());
+    }
+
+    #[test]
+    fn pairing_rejects_control_character_display_name() {
+        let mut server = test_server();
+        let code = "pairing-code-secret-5544332211";
+        server.invites.insert(
+            "ivy".to_string(),
+            InviteState {
+                pairing_code_hash: hash_secret(code),
+                expires_at: std::time::Instant::now() + INVITE_TTL,
+            },
+        );
+        let token = Token(6);
+        let (conn, mut peer) = test_live_client();
+        server.clients.insert(token, conn);
+
+        server
+            .pair_client(
+                token,
+                "Ivy\u{1}",
+                code,
+                "ivy-client-generated-token-with-at-least-32-bytes",
+                true,
+                0,
+            )
+            .unwrap();
+
+        let ServerControl::Error { code, .. } = read_plaintext_server_control(&mut peer) else {
+            panic!("expected invalid display name error");
+        };
+        assert_eq!(code, ERROR_PAIRING_INVALID_REQUEST);
+        assert!(server.sessions.is_empty());
+        assert!(server.users.users.is_empty());
+    }
+
+    #[test]
+    fn pairing_state_write_failure_replies_with_error() {
+        let blocker = std::env::temp_dir().join(format!(
+            "chatt-pair-blocker-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::write(&blocker, "not a directory").unwrap();
+        let mut server = test_server();
+        server.users.path = Some(blocker.join("users.toml"));
+        let code = "pairing-code-secret-9988776655";
+        server.invites.insert(
+            "jo".to_string(),
+            InviteState {
+                pairing_code_hash: hash_secret(code),
+                expires_at: std::time::Instant::now() + INVITE_TTL,
+            },
+        );
+        let token = Token(8);
+        let (conn, mut peer) = test_live_client();
+        server.clients.insert(token, conn);
+
+        server
+            .pair_client(
+                token,
+                "Jo",
+                code,
+                "jo-client-generated-token-with-at-least-32-bytes",
+                true,
+                0,
+            )
+            .unwrap();
+
+        let _ = std::fs::remove_file(&blocker);
+        let ServerControl::Error { code, .. } = read_plaintext_server_control(&mut peer) else {
+            panic!("expected persist failure error reply");
+        };
+        assert_eq!(code, control::ERROR_INTERNAL);
+        assert!(server.sessions.is_empty());
+        assert!(
+            !server.invites.is_empty(),
+            "invite must survive a failed pairing so the client can retry"
+        );
+    }
+
+    #[test]
+    fn pairing_never_rewrites_the_operator_config() {
+        let dir = std::env::temp_dir().join(format!(
+            "chatt-pair-config-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let config_path = dir.join("chatt-server.toml");
+        let content = format!(
+            "# operator comment that must survive pairing\n\
+             [network]\ntcp-addr = \"127.0.0.1:0\"\np2p-enabled = false\n\n\
+             [security]\nserver-identity-seed = \"{}\"\n",
+            rpc::crypto::dev_server_seed_hex()
+        );
+        std::fs::write(&config_path, &content).unwrap();
+        let mut server = Server::bind(ServerConfig::load(&config_path).unwrap()).unwrap();
+        let code = "pairing-code-secret-1122334455";
+        server.invites.insert(
+            "hana".to_string(),
+            InviteState {
+                pairing_code_hash: hash_secret(code),
+                expires_at: std::time::Instant::now() + INVITE_TTL,
+            },
+        );
+
+        let _ = server.pair_client(
+            Token(2),
+            "Hana",
+            code,
+            "hana-client-generated-token-with-at-least-32-bytes",
+            true,
+            0,
+        );
+
+        let after = std::fs::read_to_string(&config_path).unwrap();
+        let users_content =
+            std::fs::read_to_string(dir.join("chatt-server-data").join("users.toml")).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert_eq!(after, content, "operator config must stay byte-identical");
+        assert!(users_content.contains("name = \"hana\""));
+        assert!(
+            server
+                .sessions
+                .values()
+                .any(|session| session.identifier == "hana")
+        );
     }
 
     #[test]

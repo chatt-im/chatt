@@ -8,7 +8,7 @@ use std::{
 
 use ring::{digest, rand::SecureRandom, signature::KeyPair};
 use rpc::{
-    control::{DEFAULT_FILE_SIZE_LIMIT_BYTES, MAX_AUTH_FIELD_BYTES},
+    control::DEFAULT_FILE_SIZE_LIMIT_BYTES,
     crypto::{encode_hex, server_key_pair_from_seed_hex},
     ids::{RoomId, UserId},
 };
@@ -16,8 +16,9 @@ use toml_spanner::{Item, Toml};
 
 const SECRET_HASH_PREFIX: &str = "sha256:";
 const SHA256_HEX_LEN: usize = 64;
+const DEFAULT_LISTEN_ADDR: &str = "127.0.0.1:41000";
 /// First user id handed out to a dynamic (open-paired) user. Ids below this are
-/// reserved for explicit `[[users]]` entries.
+/// reserved for explicit user-registry entries.
 pub const FIRST_DYNAMIC_USER_ID: u64 = u32::MAX as u64 + 1;
 /// First room id handed out to a runtime-created (DM) room. Ids below this are
 /// reserved for explicit `[[rooms]]` entries.
@@ -31,8 +32,10 @@ pub const DEFAULT_MEMORY_HISTORY_LIMIT: usize = 512;
 pub struct NetworkConfig {
     #[toml(FromToml with = toml_spanner::helper::parse_string)]
     pub tcp_addr: SocketAddr,
-    #[toml(default = default_shared_addr(), FromToml with = toml_spanner::helper::parse_string)]
-    pub udp_addr: SocketAddr,
+    /// UDP media bind address. `None` inherits `tcp-addr`; read through
+    /// [`NetworkConfig::udp_addr`].
+    #[toml(FromToml with = toml_spanner::helper::parse_string)]
+    pub udp_addr: Option<SocketAddr>,
     #[toml(FromToml with = toml_spanner::helper::parse_string)]
     pub udp_probe_addr: Option<SocketAddr>,
     #[toml(default)]
@@ -45,11 +48,19 @@ pub struct NetworkConfig {
     pub p2p_enabled: bool,
 }
 
+impl NetworkConfig {
+    /// The UDP media bind address: `udp-addr` when configured, otherwise
+    /// `tcp-addr`.
+    pub fn udp_addr(&self) -> SocketAddr {
+        self.udp_addr.unwrap_or(self.tcp_addr)
+    }
+}
+
 impl Default for NetworkConfig {
     fn default() -> Self {
         Self {
-            tcp_addr: "127.0.0.1:41000".parse().expect("valid default TCP addr"),
-            udp_addr: default_shared_addr(),
+            tcp_addr: DEFAULT_LISTEN_ADDR.parse().expect("valid default TCP addr"),
+            udp_addr: None,
             udp_probe_addr: None,
             public_tcp_addr: String::new(),
             public_udp_addr: String::new(),
@@ -60,7 +71,7 @@ impl Default for NetworkConfig {
 }
 
 #[derive(Clone, Debug, Toml)]
-#[toml(FromToml, ToToml, rename_all = "kebab-case")]
+#[toml(FromToml, rename_all = "kebab-case")]
 pub struct SecurityConfig {
     pub server_identity_seed: String,
     #[toml(default = true)]
@@ -74,16 +85,14 @@ pub struct SecurityConfig {
     /// Whether users may self-join via `chatt pair <addr>` without an admin invite.
     #[toml(default)]
     pub public: bool,
-    /// Shared secret required for open pairing. `None`/empty means no password.
+    /// SHA-256 hash (`sha256:<hex>`) of the shared secret required for open
+    /// pairing. `None`/empty means no password.
     #[toml(default)]
-    pub password: Option<String>,
+    pub password_hash: Option<String>,
     /// Current password epoch. Dynamic tokens embed the epoch they were issued
     /// under. Bumping this invalidates existing tokens.
     #[toml(default)]
     pub password_epoch: u32,
-    /// Next id to hand out to a dynamic user. Persisted so ids never repeat.
-    #[toml(default = FIRST_DYNAMIC_USER_ID)]
-    pub next_dynamic_user_id: u64,
 }
 
 impl Default for SecurityConfig {
@@ -95,9 +104,8 @@ impl Default for SecurityConfig {
             max_file_size_bytes: DEFAULT_FILE_SIZE_LIMIT_BYTES,
             bug_report_dir: None,
             public: false,
-            password: None,
+            password_hash: None,
             password_epoch: 0,
-            next_dynamic_user_id: FIRST_DYNAMIC_USER_ID,
         }
     }
 }
@@ -108,7 +116,7 @@ impl Default for SecurityConfig {
 /// that is lost on restart, and `Durable` appends to an on-disk log under the
 /// storage data dir.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Toml)]
-#[toml(FromToml, ToToml, rename_all = "kebab-case")]
+#[toml(FromToml, rename_all = "kebab-case")]
 pub enum RoomPersistenceConfig {
     #[default]
     None,
@@ -117,12 +125,12 @@ pub enum RoomPersistenceConfig {
 }
 
 #[derive(Clone, Debug, Toml)]
-#[toml(FromToml, ToToml, rename_all = "kebab-case")]
+#[toml(FromToml, rename_all = "kebab-case")]
 pub struct RoomConfig {
     pub id: u32,
     pub name: String,
     /// `None` means public: every user on the server can access the room.
-    /// `Some` restricts access to the listed `[[users]]` names.
+    /// `Some` restricts access to the listed user-registry names.
     #[toml(default)]
     pub members: Option<Vec<String>>,
     #[toml(default)]
@@ -162,14 +170,16 @@ impl RoomConfig {
 #[derive(Clone, Debug, Default, Toml)]
 #[toml(FromToml, rename_all = "kebab-case")]
 pub struct StorageConfig {
-    /// Directory for server-side room data (durable logs, DM registry).
-    /// Defaults to `<config stem>-data` beside the config file.
+    /// Directory for server-side room data (durable logs, DM registry, user
+    /// registry). Defaults to `<config stem>-data` beside the config file.
     #[toml(default)]
     pub data_dir: Option<String>,
 }
 
+/// One record in the server-managed user registry (see
+/// [`crate::user_store::UserStore`]).
 #[derive(Clone, Debug, Toml)]
-#[toml(FromToml, ToToml, rename_all = "kebab-case")]
+#[toml(FromToml, rename_all = "kebab-case")]
 pub struct UserConfig {
     pub id: UserId,
     pub name: String,
@@ -185,6 +195,11 @@ impl UserConfig {
     }
 }
 
+/// The operator's server configuration.
+///
+/// Parsed once at startup and never rewritten by the server. Everything the
+/// server mutates at runtime (user records, dynamic-id counters, the DM
+/// registry) lives in state files under [`Config::data_dir`].
 #[derive(Clone, Debug, Toml)]
 #[toml(FromToml, recoverable, warn_unknown_fields, rename_all = "kebab-case")]
 pub struct Config {
@@ -196,8 +211,6 @@ pub struct Config {
     pub storage: StorageConfig,
     #[toml(default = default_rooms())]
     pub rooms: Vec<RoomConfig>,
-    #[toml(default)]
-    pub users: Vec<UserConfig>,
     #[toml(skip)]
     pub config_path: Option<PathBuf>,
 }
@@ -209,10 +222,8 @@ impl Default for Config {
             security: SecurityConfig::default(),
             storage: StorageConfig::default(),
             rooms: default_rooms(),
-            users: Vec::new(),
             config_path: None,
         };
-        config.apply_inferred_addresses(false, false);
         config.normalize();
         config
     }
@@ -249,12 +260,15 @@ pub fn generated_template_config() -> Result<String, String> {
 #
 # Generated by `chatt-server init-config`. Keep this file private: it contains
 # the server identity seed that authenticates handshakes and dynamic tokens.
+#
+# The server never rewrites this file. Runtime state (the user registry, the
+# DM room registry, message logs) lives under storage.data-dir.
 
 [network]
 # Bind addresses on this host.
-tcp-addr = "127.0.0.1:41000"
+tcp-addr = "{listen_addr}"
 # udp-addr defaults to tcp-addr when omitted.
-# udp-addr = "127.0.0.1:41000"
+# udp-addr = "{listen_addr}"
 # Optional UDP socket used for P2P path probes.
 # udp-probe-addr = "127.0.0.1:41001"
 
@@ -275,24 +289,23 @@ max-file-size-bytes = {max_file_size_bytes}
 
 # Public mode lets users self-join with `chatt pair <host:port>`.
 public = false
-# Set a shared secret to gate public open pairing. Omit or leave empty for no
-# password.
-# password = "change-me"
+# SHA-256 hash of the shared secret gating public open pairing. Omit for no
+# password. Generate with: printf %s 'secret' | sha256sum
+# password-hash = "sha256:2bb80d537b1da3e38bd30361aa855686bde0eacd7162fef6a25fe97bf527a25b"
 # Bump this to invalidate existing dynamic tokens.
 password-epoch = 0
-# Dynamic users are issued ids from this counter. Explicit users must stay below
-# this range.
-next-dynamic-user-id = {first_dynamic_user_id}
 
-# Server-side room data (durable message logs, the DM room registry) lives in
-# storage.data-dir. Defaults to "<config stem>-data" beside this file.
+# Server-side runtime state (durable message logs, the DM room registry, the
+# user registry) lives in storage.data-dir. Defaults to "<config stem>-data"
+# beside this file.
 # [storage]
 # data-dir = "chatt-server-data"
 
 [[rooms]]
 id = 1
 name = "lobby"
-# Rooms are public unless they list members; members are [[users]] names.
+# Rooms are public unless they list members; members are user-registry names.
+# A member that has not paired yet is ignored until it exists.
 # members = ["alice", "bob"]
 # Server-side retention: "none" (relay only), "memory" (ring, lost on
 # restart), or "durable" (on-disk log under storage.data-dir).
@@ -305,11 +318,11 @@ default = true
 
 # Create invite users with:
 #   chatt-server invite USER
-# The server writes [[users]] entries as invites are accepted.
+# Accepted invites are recorded in the user registry under storage.data-dir.
 "#,
+        listen_addr = DEFAULT_LISTEN_ADDR,
         seed = seed,
         max_file_size_bytes = DEFAULT_FILE_SIZE_LIMIT_BYTES,
-        first_dynamic_user_id = FIRST_DYNAMIC_USER_ID,
     ))
 }
 
@@ -331,60 +344,17 @@ impl Config {
         Ok(encode_hex(key_pair.public_key().as_ref()))
     }
 
-    pub fn mark_user_paired(
-        &mut self,
-        user_name: &str,
-        display_name: String,
-        token_hash: String,
-    ) -> Result<UserConfig, String> {
-        if let Some(index) = self.users.iter().position(|user| user.name == user_name) {
-            let old_token_hash = self.users[index].token_hash.clone();
-            let old_display_name = self.users[index].display_name.clone();
-            self.users[index].display_name = display_name;
-            self.users[index].token_hash = token_hash;
-            if let Err(error) = self.save_runtime() {
-                self.users[index].token_hash = old_token_hash;
-                self.users[index].display_name = old_display_name;
-                return Err(error);
-            }
-            return Ok(self.users[index].clone());
-        }
-
-        let id = self
-            .users
-            .iter()
-            .map(|user| user.id.0)
-            .max()
-            .unwrap_or(0)
-            .checked_add(1)
-            .map(UserId)
-            .ok_or_else(|| "no user ids are available".to_string())?;
-        if id.0 >= FIRST_DYNAMIC_USER_ID {
-            return Err("no explicit user ids are available".to_string());
-        }
-        let user = UserConfig {
-            id,
-            name: user_name.to_string(),
-            display_name,
-            token_hash,
-        };
-        self.users.push(user);
-        if let Err(error) = self.save_runtime() {
-            self.users.pop();
-            return Err(error);
-        }
-        Ok(self.users.last().expect("user was just inserted").clone())
-    }
-
     pub fn is_public(&self) -> bool {
         self.security.public
     }
 
-    pub fn password(&self) -> Option<&str> {
+    /// The stored `sha256:` hash gating open pairing, `None` when open pairing
+    /// is unpassworded.
+    pub fn password_hash(&self) -> Option<&str> {
         self.security
-            .password
+            .password_hash
             .as_deref()
-            .filter(|password| !password.is_empty())
+            .filter(|hash| !hash.is_empty())
     }
 
     pub fn password_epoch(&self) -> u32 {
@@ -406,7 +376,7 @@ impl Config {
             .unwrap_or(RoomId(1))
     }
 
-    /// Directory for server-side room data: `storage.data-dir` when set,
+    /// Directory for server-side runtime state: `storage.data-dir` when set,
     /// otherwise `<config stem>-data` beside the config file. `None` only for
     /// in-memory test configs with no config path.
     pub fn data_dir(&self) -> Option<PathBuf> {
@@ -418,50 +388,6 @@ impl Config {
         Some(path.with_file_name(format!("{stem}-data")))
     }
 
-    /// Reserves the next dynamic user id, persisting the advanced counter so ids
-    /// never repeat across restarts. Rolls back the in-memory counter if the
-    /// config write fails.
-    pub fn allocate_dynamic_user_id(&mut self) -> Result<UserId, String> {
-        let id = self.security.next_dynamic_user_id;
-        if id < FIRST_DYNAMIC_USER_ID {
-            return Err(format!(
-                "next dynamic user id must be at least {FIRST_DYNAMIC_USER_ID}"
-            ));
-        }
-        let next = id
-            .checked_add(1)
-            .ok_or_else(|| "no dynamic user ids are available".to_string())?;
-        self.security.next_dynamic_user_id = next;
-        if let Err(error) = self.save_runtime() {
-            self.security.next_dynamic_user_id = id;
-            return Err(error);
-        }
-        Ok(UserId(id))
-    }
-
-    pub fn set_user_display_name(
-        &mut self,
-        user_name: &str,
-        display_name: String,
-    ) -> Result<UserConfig, String> {
-        let Some(index) = self.users.iter().position(|user| user.name == user_name) else {
-            return Err(format!("no user named '{user_name}'"));
-        };
-        let old_display_name = self.users[index].display_name.clone();
-        self.users[index].display_name = display_name;
-        if let Err(error) = self.save_runtime() {
-            self.users[index].display_name = old_display_name;
-            return Err(error);
-        }
-        Ok(self.users[index].clone())
-    }
-
-    fn apply_inferred_addresses(&mut self, udp_addr_configured: bool, udp_addr_overridden: bool) {
-        if !udp_addr_configured && !udp_addr_overridden {
-            self.network.udp_addr = self.network.tcp_addr;
-        }
-    }
-
     fn normalize(&mut self) {
         self.network.public_tcp_addr = self.network.public_tcp_addr.trim().to_string();
         if self.network.public_tcp_addr.is_empty() {
@@ -469,7 +395,7 @@ impl Config {
         }
         self.network.public_udp_addr = self.network.public_udp_addr.trim().to_string();
         if self.network.public_udp_addr.is_empty() {
-            self.network.public_udp_addr = self.network.udp_addr.to_string();
+            self.network.public_udp_addr = self.network.udp_addr().to_string();
         }
         self.network.public_udp_probe_addr = self
             .network
@@ -487,13 +413,6 @@ impl Config {
                 }
             }
         }
-        for user in &mut self.users {
-            user.name = user.name.trim().to_string();
-            user.display_name = user.display_name.trim().to_string();
-            if user.display_name.is_empty() {
-                user.display_name = user.name.clone();
-            }
-        }
     }
 
     fn validate(&self, source: &str) -> Result<(), String> {
@@ -502,12 +421,8 @@ impl Config {
         }
         server_key_pair_from_seed_hex(&self.security.server_identity_seed)
             .map_err(|error| format!("{source}: invalid security.server-identity-seed: {error}"))?;
-        if let Some(password) = &self.security.password
-            && password.len() > MAX_AUTH_FIELD_BYTES
-        {
-            return Err(format!(
-                "{source}: security.password exceeds {MAX_AUTH_FIELD_BYTES} bytes"
-            ));
+        if let Some(hash) = self.password_hash() {
+            validate_secret_hash(source, "security.password-hash", hash)?;
         }
         validate_endpoint(
             source,
@@ -521,51 +436,6 @@ impl Config {
         )?;
         if let Some(addr) = &self.network.public_udp_probe_addr {
             validate_endpoint(source, "network.public-udp-probe-addr", addr)?;
-        }
-        if self.security.next_dynamic_user_id < FIRST_DYNAMIC_USER_ID {
-            return Err(format!(
-                "{source}: security.next-dynamic-user-id must be at least {FIRST_DYNAMIC_USER_ID}"
-            ));
-        }
-
-        let mut user_ids = HashSet::new();
-        let mut user_names = HashSet::new();
-        for user in &self.users {
-            if user.id == UserId(0) {
-                return Err(format!("{source}: user id must be non-zero"));
-            }
-            if user.id.0 >= FIRST_DYNAMIC_USER_ID {
-                return Err(format!(
-                    "{source}: user {} id must be below {FIRST_DYNAMIC_USER_ID}; higher ids are reserved for dynamic users",
-                    user.name
-                ));
-            }
-            if user.name.trim().is_empty() {
-                return Err(format!("{source}: user name must not be empty"));
-            }
-            if user.display_name.trim().is_empty() {
-                return Err(format!(
-                    "{source}: user {} display-name must not be empty",
-                    user.name
-                ));
-            }
-            if user.display_name.len() > 64 {
-                return Err(format!(
-                    "{source}: user {} display-name exceeds 64 bytes",
-                    user.name
-                ));
-            }
-            if !user_ids.insert(user.id) {
-                return Err(format!("{source}: duplicate user id {}", user.id));
-            }
-            if !user_names.insert(user.name.as_str()) {
-                return Err(format!("{source}: duplicate user name {}", user.name));
-            }
-            validate_optional_secret_hash(
-                source,
-                &format!("user {} token-hash", user.name),
-                &user.token_hash,
-            )?;
         }
 
         let mut room_ids = HashSet::new();
@@ -599,14 +469,6 @@ impl Config {
                             "{source}: private room {} must list at least one member",
                             room.name
                         ));
-                    }
-                    for member in members {
-                        if !user_names.contains(member.as_str()) {
-                            return Err(format!(
-                                "{source}: room {} member {member} does not match any [[users]] name",
-                                room.name
-                            ));
-                        }
                     }
                 }
             }
@@ -643,128 +505,6 @@ impl Config {
         }
         Ok(())
     }
-
-    fn save_runtime(&self) -> Result<(), String> {
-        let path = self
-            .config_path
-            .as_ref()
-            .ok_or_else(|| "pairing requires a writable server config path".to_string())?;
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)
-                .map_err(|err| format!("failed to create {}: {err}", parent.display()))?;
-        }
-        atomic_write_toml(path, &self.to_toml_string())
-    }
-
-    fn to_toml_string(&self) -> String {
-        let mut out = String::new();
-        out.push_str("# chatt server configuration\n\n");
-        out.push_str("[network]\n");
-        out.push_str(&format!("tcp-addr = \"{}\"\n", self.network.tcp_addr));
-        if self.network.udp_addr != self.network.tcp_addr {
-            out.push_str(&format!("udp-addr = \"{}\"\n", self.network.udp_addr));
-        }
-        if let Some(udp_probe_addr) = self.network.udp_probe_addr {
-            out.push_str(&format!("udp-probe-addr = \"{}\"\n", udp_probe_addr));
-        }
-        if self.network.public_tcp_addr != self.network.tcp_addr.to_string() {
-            out.push_str(&format!(
-                "public-tcp-addr = \"{}\"\n",
-                toml_quote_value(&self.network.public_tcp_addr)
-            ));
-        }
-        if self.network.public_udp_addr != self.network.udp_addr.to_string() {
-            out.push_str(&format!(
-                "public-udp-addr = \"{}\"\n",
-                toml_quote_value(&self.network.public_udp_addr)
-            ));
-        }
-        if self.network.public_udp_probe_addr
-            != self.network.udp_probe_addr.map(|addr| addr.to_string())
-            && let Some(addr) = &self.network.public_udp_probe_addr
-        {
-            out.push_str(&format!(
-                "public-udp-probe-addr = \"{}\"\n",
-                toml_quote_value(addr)
-            ));
-        }
-        out.push_str(&format!("p2p-enabled = {}\n\n", self.network.p2p_enabled));
-        out.push_str("[security]\n");
-        out.push_str(&format!(
-            "server-identity-seed = \"{}\"\n",
-            toml_quote_value(&self.security.server_identity_seed)
-        ));
-        out.push_str(&format!("encryption = {}\n", self.security.encryption));
-        out.push_str(&format!(
-            "max-file-size-bytes = {}\n",
-            self.security.max_file_size_bytes
-        ));
-        if let Some(dir) = &self.security.bug_report_dir {
-            out.push_str(&format!("bug-report-dir = \"{}\"\n", toml_quote_value(dir)));
-        }
-        out.push_str(&format!("public = {}\n", self.security.public));
-        if let Some(password) = &self.security.password {
-            out.push_str(&format!("password = \"{}\"\n", toml_quote_value(password)));
-        }
-        out.push_str(&format!(
-            "password-epoch = {}\n",
-            self.security.password_epoch
-        ));
-        out.push_str(&format!(
-            "next-dynamic-user-id = {}\n",
-            self.security.next_dynamic_user_id
-        ));
-        out.push('\n');
-        if let Some(data_dir) = &self.storage.data_dir {
-            out.push_str("[storage]\n");
-            out.push_str(&format!(
-                "data-dir = \"{}\"\n\n",
-                toml_quote_value(data_dir)
-            ));
-        }
-        for room in &self.rooms {
-            out.push_str("[[rooms]]\n");
-            out.push_str(&format!("id = {}\n", room.id));
-            out.push_str(&format!("name = \"{}\"\n", toml_quote_value(&room.name)));
-            if let Some(members) = &room.members {
-                let members: Vec<String> = members
-                    .iter()
-                    .map(|member| format!("\"{}\"", toml_quote_value(member)))
-                    .collect();
-                out.push_str(&format!("members = [{}]\n", members.join(", ")));
-            }
-            let persistence = match room.persistence {
-                RoomPersistenceConfig::None => None,
-                RoomPersistenceConfig::Memory => Some("memory"),
-                RoomPersistenceConfig::Durable => Some("durable"),
-            };
-            if let Some(persistence) = persistence {
-                out.push_str(&format!("persistence = \"{persistence}\"\n"));
-            }
-            if let Some(memory_limit) = room.memory_limit {
-                out.push_str(&format!("memory-limit = {memory_limit}\n"));
-            }
-            if room.is_default {
-                out.push_str("default = true\n");
-            }
-            out.push('\n');
-        }
-        for user in &self.users {
-            out.push_str("[[users]]\n");
-            out.push_str(&format!("id = {}\n", user.id));
-            out.push_str(&format!("name = \"{}\"\n", toml_quote_value(&user.name)));
-            out.push_str(&format!(
-                "display-name = \"{}\"\n",
-                toml_quote_value(&user.display_name)
-            ));
-            out.push_str(&format!(
-                "token-hash = \"{}\"\n",
-                toml_quote_value(&user.token_hash)
-            ));
-            out.push('\n');
-        }
-        out
-    }
 }
 
 fn parse_config_content(
@@ -775,19 +515,16 @@ fn parse_config_content(
     let arena = toml_spanner::Arena::new();
     let mut doc = toml_spanner::parse(content, &arena)
         .map_err(|err| format!("failed to parse {source}: {err}"))?;
-    reject_deprecated_config_keys(&doc, source)?;
     if !section_contains_key(&doc, "security", "server-identity-seed") {
         return Err(format!(
             "{source}: security.server-identity-seed is required; run `chatt-server init-config PATH` to generate a private server config"
         ));
     }
-    let udp_addr_configured = network_contains_key(&doc, "udp-addr");
     let mut config: Config = doc.to().map_err(|err| {
         let errors: Vec<String> = err.errors.iter().map(ToString::to_string).collect();
         format!("failed to deserialize {source}: {}", errors.join(", "))
     })?;
     config.config_path = config_path;
-    config.apply_inferred_addresses(udp_addr_configured, false);
     config.normalize();
     config.validate(source)?;
     Ok(config)
@@ -795,25 +532,23 @@ fn parse_config_content(
 
 /// Writes `content` to a sibling temp file, fsyncs it, then atomically renames
 /// it over `path`. The rename is atomic, so a reader never sees a partial or
-/// missing config even if the process dies mid-write. The temp file is created
-/// owner-only (0600) because the content carries the identity seed and token
-/// hashes, and the rename makes its mode the config's mode.
+/// missing file even if the process dies mid-write. The temp file is created
+/// with `create_new` and owner-only mode (0600) because the content carries
+/// secrets, and the rename makes its mode the destination's mode; a stale or
+/// planted file at the predictable temp path is removed and the exclusive
+/// create retried rather than opened through.
 pub(crate) fn atomic_write_toml(path: &Path, content: &str) -> Result<(), String> {
     let tmp = temp_config_path(path);
-    // A stale temp file from a crashed run would keep its old mode through
-    // truncation; recreate so 0600 always applies.
-    let _ = fs::remove_file(&tmp);
-
-    let mut options = OpenOptions::new();
-    options.write(true).create(true).truncate(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    let mut file = options
-        .open(&tmp)
-        .map_err(|err| format!("failed to create {}: {err}", tmp.display()))?;
+    let mut file = match create_temp_file(&tmp) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            fs::remove_file(&tmp)
+                .map_err(|err| format!("failed to remove stale {}: {err}", tmp.display()))?;
+            create_temp_file(&tmp)
+                .map_err(|err| format!("failed to create {}: {err}", tmp.display()))?
+        }
+        Err(err) => return Err(format!("failed to create {}: {err}", tmp.display())),
+    };
     file.write_all(content.as_bytes())
         .map_err(|err| format!("failed to write {}: {err}", tmp.display()))?;
     file.sync_all()
@@ -832,7 +567,7 @@ pub(crate) fn atomic_write_toml(path: &Path, content: &str) -> Result<(), String
     Ok(())
 }
 
-fn open_new_config_file(path: &Path) -> Result<File, String> {
+fn create_temp_file(path: &Path) -> std::io::Result<File> {
     let mut options = OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]
@@ -840,9 +575,11 @@ fn open_new_config_file(path: &Path) -> Result<File, String> {
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o600);
     }
-    options
-        .open(path)
-        .map_err(|err| format!("failed to create {}: {err}", path.display()))
+    options.open(path)
+}
+
+fn open_new_config_file(path: &Path) -> Result<File, String> {
+    create_temp_file(path).map_err(|err| format!("failed to create {}: {err}", path.display()))
 }
 
 fn temp_config_path(path: &Path) -> PathBuf {
@@ -879,29 +616,22 @@ pub fn hash_secret(secret: &str) -> String {
     format!("{SECRET_HASH_PREFIX}{}", encode_hex(digest.as_ref()))
 }
 
+/// Whether `secret` hashes to `stored_hash`. The comparison runs over
+/// fixed-length digests in constant time, so neither the secret's content nor
+/// its length leaks through timing.
 pub fn verify_secret_hash(stored_hash: &str, secret: &str) -> bool {
     let Some(expected) = parse_secret_hash(stored_hash) else {
         return false;
     };
     let digest = digest::digest(&digest::SHA256, secret.as_bytes());
-    constant_time_eq(&expected, digest.as_ref())
-}
-
-pub fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
-    if left.len() != right.len() {
-        return false;
-    }
     let mut diff = 0u8;
-    for (&left, &right) in left.iter().zip(right.iter()) {
+    for (&left, &right) in expected.iter().zip(digest.as_ref()) {
         diff |= left ^ right;
     }
     diff == 0
 }
 
-fn validate_optional_secret_hash(source: &str, name: &str, hash: &str) -> Result<(), String> {
-    if hash.trim().is_empty() {
-        return Ok(());
-    }
+pub(crate) fn validate_secret_hash(source: &str, name: &str, hash: &str) -> Result<(), String> {
     parse_secret_hash(hash)
         .map(|_| ())
         .ok_or_else(|| format!("{source}: invalid {name}; expected sha256:<64 hex chars>"))
@@ -935,43 +665,11 @@ fn parse_secret_hash(stored_hash: &str) -> Option<[u8; 32]> {
     decoded.try_into().ok()
 }
 
-fn default_shared_addr() -> SocketAddr {
-    "127.0.0.1:41000"
-        .parse()
-        .expect("valid default network addr")
-}
-
-fn network_contains_key(doc: &toml_spanner::Document<'_>, key: &str) -> bool {
-    section_contains_key(doc, "network", key)
-}
-
 fn section_contains_key(doc: &toml_spanner::Document<'_>, section: &str, key: &str) -> bool {
     doc.table()
         .get(section)
         .and_then(Item::as_table)
         .is_some_and(|table| table.contains_key(key))
-}
-
-fn reject_deprecated_config_keys(
-    doc: &toml_spanner::Document<'_>,
-    source: &str,
-) -> Result<(), String> {
-    if doc
-        .table()
-        .get("users")
-        .and_then(Item::as_array)
-        .is_some_and(|users| {
-            users.iter().any(|user| {
-                user.as_table()
-                    .is_some_and(|user| user.contains_key("pairing-code-hash"))
-            })
-        })
-    {
-        return Err(format!(
-            "failed to deserialize {source}: users.pairing-code-hash is not supported; use `chatt-server invite USER`"
-        ));
-    }
-    Ok(())
 }
 
 fn default_rooms() -> Vec<RoomConfig> {
@@ -993,7 +691,10 @@ fn generate_identity_seed_hex() -> Result<String, String> {
     Ok(encode_hex(&bytes))
 }
 
-fn toml_quote_value(value: &str) -> String {
+/// Escapes `value` for a TOML basic string. Control characters become
+/// `\uXXXX`, matching how toml-spanner renders them, so client-supplied names
+/// can never produce a state file the parser rejects on reload.
+pub(crate) fn toml_quote_value(value: &str) -> String {
     let mut out = String::with_capacity(value.len());
     for ch in value.chars() {
         match ch {
@@ -1002,7 +703,8 @@ fn toml_quote_value(value: &str) -> String {
             '\n' => out.push_str("\\n"),
             '\r' => out.push_str("\\r"),
             '\t' => out.push_str("\\t"),
-            _ => out.push(ch),
+            ch if ch.is_control() => out.push_str(&format!("\\u{:04X}", ch as u32)),
+            ch => out.push(ch),
         }
     }
     out
@@ -1013,38 +715,25 @@ mod tests {
     use super::*;
     use rpc::crypto::dev_server_seed_hex;
 
-    fn config_with_users() -> Config {
-        let mut config = Config::default();
-        config.users = vec![
-            UserConfig {
-                id: UserId(1),
-                name: "alice".to_string(),
-                display_name: "Alice".to_string(),
-                token_hash: hash_secret("alice-client-generated-token-with-at-least-32-bytes"),
-            },
-            UserConfig {
-                id: UserId(2),
-                name: "bob".to_string(),
-                display_name: "Bob".to_string(),
-                token_hash: hash_secret("bob-client-generated-token-with-at-least-32-bytes"),
-            },
-            UserConfig {
-                id: UserId(3),
-                name: "carol".to_string(),
-                display_name: "Carol".to_string(),
-                token_hash: hash_secret("carol-client-generated-token-with-at-least-32-bytes"),
-            },
-        ];
-        config
+    fn parse(content: &str) -> Result<Config, String> {
+        parse_config_content(content, "<test>", Some(PathBuf::from("chatt-server.toml")))
+    }
+
+    /// Minimal valid config content with `extra` appended after the required
+    /// sections; rooms default to the lobby when `extra` declares none.
+    fn config_content(extra: &str) -> String {
+        format!(
+            "[network]\ntcp-addr = \"127.0.0.1:41000\"\n\n[security]\nserver-identity-seed = \"{}\"\n\n{extra}",
+            dev_server_seed_hex()
+        )
     }
 
     #[test]
     fn default_config_parses_and_validates() {
-        let mut config = Config::default();
-        config.config_path = None;
+        let config = Config::default();
         config.validate("<test>").unwrap();
         assert_eq!(config.network.tcp_addr.to_string(), "127.0.0.1:41000");
-        assert_eq!(config.network.udp_addr, config.network.tcp_addr);
+        assert_eq!(config.network.udp_addr(), config.network.tcp_addr);
         assert_eq!(config.network.udp_probe_addr, None);
         assert_eq!(config.network.public_tcp_addr, "127.0.0.1:41000");
         assert_eq!(config.network.public_udp_addr, "127.0.0.1:41000");
@@ -1062,15 +751,10 @@ mod tests {
     fn generated_template_parses_with_private_seed() {
         let content = generated_template_config().unwrap();
 
-        let config = parse_config_content(
-            &content,
-            "<generated>",
-            Some(PathBuf::from("chatt-server.toml")),
-        )
-        .unwrap();
+        let config = parse(&content).unwrap();
 
         assert_ne!(config.security.server_identity_seed, dev_server_seed_hex());
-        assert!(config.users.is_empty());
+        assert_eq!(config.network.udp_addr(), config.network.tcp_addr);
     }
 
     #[test]
@@ -1092,153 +776,66 @@ mod tests {
 
     #[test]
     fn config_rejects_missing_identity_seed() {
-        let content = Config::default()
-            .to_toml_string()
-            .lines()
-            .filter(|line| !line.starts_with("server-identity-seed = "))
-            .collect::<Vec<_>>()
-            .join("\n");
+        let content = "[network]\ntcp-addr = \"127.0.0.1:41000\"\n";
 
-        let error = parse_config_content(&content, "<test>", Some(PathBuf::from("server.toml")))
-            .unwrap_err();
+        let error = parse(content).unwrap_err();
 
         assert!(error.contains("server-identity-seed is required"));
     }
 
     #[test]
-    fn config_rejects_public_password_longer_than_wire_limit() {
-        let content = Config::default()
-            .to_toml_string()
-            .replace("public = false", "public = true")
-            .replace(
-                "password-epoch = 0",
-                &format!(
-                    "password = \"{}\"\npassword-epoch = 0",
-                    "x".repeat(MAX_AUTH_FIELD_BYTES + 1)
-                ),
-            );
+    fn config_rejects_malformed_password_hash() {
+        let content =
+            config_content("").replace("[security]", "[security]\npassword-hash = \"hunter2\"");
 
-        let error = parse_config_content(&content, "<test>", Some(PathBuf::from("server.toml")))
-            .unwrap_err();
+        let error = parse(&content).unwrap_err();
 
-        assert!(error.contains("security.password exceeds"));
+        assert!(error.contains("security.password-hash"));
     }
 
     #[test]
-    fn config_with_zero_users_validates() {
-        let mut config = Config::default();
-        config.config_path = None;
-        config.users.clear();
-        config.validate("<test>").unwrap();
-    }
+    fn config_accepts_hashed_password() {
+        let content = config_content("").replace(
+            "[security]",
+            &format!("[security]\npassword-hash = \"{}\"", hash_secret("hunter2")),
+        );
 
-    #[test]
-    fn allocate_dynamic_user_id_starts_increments_and_persists() {
-        let path = std::env::temp_dir().join(format!(
-            "chatt-open-alloc-{}-{}.toml",
-            std::process::id(),
-            FIRST_DYNAMIC_USER_ID
+        let config = parse(&content).unwrap();
+
+        assert!(verify_secret_hash(
+            config.password_hash().unwrap(),
+            "hunter2"
         ));
-        let _ = fs::remove_file(&path);
-        let mut config = Config::default();
-        config.config_path = Some(path.clone());
-
-        assert_eq!(
-            config.allocate_dynamic_user_id().unwrap(),
-            UserId(FIRST_DYNAMIC_USER_ID)
-        );
-        assert_eq!(
-            config.allocate_dynamic_user_id().unwrap(),
-            UserId(FIRST_DYNAMIC_USER_ID + 1)
-        );
-        assert_eq!(
-            config.security.next_dynamic_user_id,
-            FIRST_DYNAMIC_USER_ID + 2
-        );
-
-        let content = fs::read_to_string(&path).unwrap();
-        let reloaded = parse_config_content(&content, "<test>", Some(path.clone())).unwrap();
-        assert_eq!(
-            reloaded.security.next_dynamic_user_id,
-            FIRST_DYNAMIC_USER_ID + 2
-        );
-        let _ = fs::remove_file(&path);
-    }
-
-    #[test]
-    fn allocate_dynamic_user_id_rejects_explicit_range_counter() {
-        let mut config = Config::default();
-        config.security.next_dynamic_user_id = FIRST_DYNAMIC_USER_ID - 1;
-
-        let error = config.allocate_dynamic_user_id().unwrap_err();
-
-        assert!(error.contains("next dynamic user id"));
-    }
-
-    #[test]
-    fn config_rejects_dynamic_counter_below_reserved_range() {
-        let content = Config::default().to_toml_string().replace(
-            "next-dynamic-user-id = 4294967296",
-            "next-dynamic-user-id = 42",
-        );
-
-        let error = parse_config_content(&content, "<test>", Some(PathBuf::from("server.toml")))
-            .unwrap_err();
-
-        assert!(error.contains("next-dynamic-user-id"));
-    }
-
-    #[test]
-    fn config_rejects_explicit_user_id_in_dynamic_range() {
-        let content = config_with_users().to_toml_string().replace(
-            "id = 1\nname = \"alice\"",
-            &format!("id = {FIRST_DYNAMIC_USER_ID}\nname = \"alice\""),
-        );
-
-        let error = parse_config_content(&content, "<test>", Some(PathBuf::from("server.toml")))
-            .unwrap_err();
-
-        assert!(error.contains("reserved for dynamic users"));
     }
 
     #[test]
     fn config_parses_p2p_disabled() {
-        let arena = toml_spanner::Arena::new();
-        let content = Config::default()
-            .to_toml_string()
-            .replace("p2p-enabled = true", "p2p-enabled = false");
-        let mut doc = toml_spanner::parse(&content, &arena).unwrap();
-        let config: Config = doc.to().unwrap();
+        let content = config_content("").replace("[network]", "[network]\np2p-enabled = false");
+
+        let config = parse(&content).unwrap();
 
         assert!(!config.network.p2p_enabled);
     }
 
     #[test]
     fn udp_addr_inherits_tcp_addr_when_omitted() {
-        let arena = toml_spanner::Arena::new();
-        let content = Config::default().to_toml_string();
-        let mut doc = toml_spanner::parse(&content, &arena).unwrap();
-        let udp_addr_configured = network_contains_key(&doc, "udp-addr");
-        let mut config: Config = doc.to().unwrap();
-        config.apply_inferred_addresses(udp_addr_configured, false);
+        let config = parse(&config_content("")).unwrap();
 
-        assert_eq!(config.network.udp_addr, config.network.tcp_addr);
+        assert_eq!(config.network.udp_addr, None);
+        assert_eq!(config.network.udp_addr(), config.network.tcp_addr);
         assert_eq!(config.network.udp_probe_addr, None);
     }
 
     #[test]
     fn parses_explicit_udp_and_probe_addrs() {
-        let arena = toml_spanner::Arena::new();
-        let content = Config::default().to_toml_string().replace(
+        let content = config_content("").replace(
             "tcp-addr = \"127.0.0.1:41000\"",
             "tcp-addr = \"127.0.0.1:42000\"\nudp-addr = \"127.0.0.1:42001\"\nudp-probe-addr = \"127.0.0.1:42002\"",
         );
-        let mut doc = toml_spanner::parse(&content, &arena).unwrap();
-        let udp_addr_configured = network_contains_key(&doc, "udp-addr");
-        let mut config: Config = doc.to().unwrap();
-        config.apply_inferred_addresses(udp_addr_configured, false);
 
-        assert_eq!(config.network.udp_addr.to_string(), "127.0.0.1:42001");
+        let config = parse(&content).unwrap();
+
+        assert_eq!(config.network.udp_addr().to_string(), "127.0.0.1:42001");
         assert_eq!(
             config.network.udp_probe_addr.map(|addr| addr.to_string()),
             Some("127.0.0.1:42002".to_string())
@@ -1247,20 +844,15 @@ mod tests {
 
     #[test]
     fn public_endpoints_can_differ_from_bind_addresses() {
-        let arena = toml_spanner::Arena::new();
-        let content = Config::default().to_toml_string().replace(
+        let content = config_content("").replace(
             "tcp-addr = \"127.0.0.1:41000\"",
             "tcp-addr = \"0.0.0.0:41000\"\npublic-tcp-addr = \"chat.example.com:443\"\npublic-udp-addr = \"198.51.100.20:54100\"",
         );
-        let mut doc = toml_spanner::parse(&content, &arena).unwrap();
-        let udp_addr_configured = network_contains_key(&doc, "udp-addr");
-        let mut config: Config = doc.to().unwrap();
-        config.apply_inferred_addresses(udp_addr_configured, false);
-        config.normalize();
-        config.validate("<test>").unwrap();
+
+        let config = parse(&content).unwrap();
 
         assert_eq!(config.network.tcp_addr.to_string(), "0.0.0.0:41000");
-        assert_eq!(config.network.udp_addr.to_string(), "0.0.0.0:41000");
+        assert_eq!(config.network.udp_addr().to_string(), "0.0.0.0:41000");
         assert_eq!(config.network.public_tcp_addr, "chat.example.com:443");
         assert_eq!(config.network.public_udp_addr, "198.51.100.20:54100");
     }
@@ -1270,139 +862,11 @@ mod tests {
         let hash = hash_secret("pair-alice-please-change");
         assert!(verify_secret_hash(&hash, "pair-alice-please-change"));
         assert!(!verify_secret_hash(&hash, "pair-bob-please-change"));
-    }
-
-    #[test]
-    fn mark_user_paired_persists_token_hash_and_display_name() {
-        let path = std::env::temp_dir().join(format!(
-            "chatt-server-pairing-test-{}.toml",
-            std::process::id()
+        assert!(!verify_secret_hash(&hash, "short"));
+        assert!(!verify_secret_hash(
+            &hash,
+            "a-much-longer-candidate-secret-than-the-stored-one"
         ));
-        let mut config = Config::default();
-        config.config_path = Some(path.clone());
-
-        let token_hash = hash_secret("client-generated-token-with-at-least-32-bytes");
-        let user = config
-            .mark_user_paired("alice", "Alice Example".to_string(), token_hash.clone())
-            .unwrap();
-        let content = std::fs::read_to_string(&path).unwrap();
-        let _ = std::fs::remove_file(path);
-
-        assert_eq!(user.token_hash, token_hash);
-        assert_eq!(user.display_name, "Alice Example");
-        assert!(content.contains("p2p-enabled = true"));
-        assert!(!content.contains("udp-probe-addr"));
-        assert!(content.contains("display-name = \"Alice Example\""));
-        assert!(content.contains(&format!("token-hash = \"{token_hash}\"")));
-        assert!(!content.contains("pairing-code-hash"));
-    }
-
-    #[test]
-    fn set_user_display_name_updates_and_persists() {
-        let path = std::env::temp_dir().join(format!(
-            "chatt-server-display-name-test-{}.toml",
-            std::process::id()
-        ));
-        let mut config = config_with_users();
-        config.config_path = Some(path.clone());
-        let token_hash = config.users[0].token_hash.clone();
-
-        let user = config
-            .set_user_display_name("alice", "Alice Renamed".to_string())
-            .unwrap();
-        let content = std::fs::read_to_string(&path).unwrap();
-        let _ = std::fs::remove_file(path);
-
-        assert_eq!(user.display_name, "Alice Renamed");
-        assert_eq!(user.token_hash, token_hash);
-        assert!(content.contains("display-name = \"Alice Renamed\""));
-    }
-
-    #[test]
-    fn set_user_display_name_rejects_unknown_user() {
-        let mut config = Config::default();
-        assert!(
-            config
-                .set_user_display_name("nobody", "Ghost".to_string())
-                .is_err()
-        );
-    }
-
-    #[test]
-    fn mark_user_paired_creates_new_user() {
-        let path = std::env::temp_dir().join(format!(
-            "chatt-server-new-user-pairing-test-{}.toml",
-            std::process::id()
-        ));
-        let mut config = config_with_users();
-        config.config_path = Some(path.clone());
-
-        let token_hash = hash_secret("client-generated-token-with-at-least-32-bytes");
-        let user = config
-            .mark_user_paired("billy", "Billy".to_string(), token_hash.clone())
-            .unwrap();
-        let content = std::fs::read_to_string(&path).unwrap();
-        let _ = std::fs::remove_file(path);
-
-        assert_eq!(user.id, UserId(4));
-        assert_eq!(user.name, "billy");
-        assert_eq!(user.display_name, "Billy");
-        assert_eq!(user.token_hash, token_hash);
-        assert!(content.contains("name = \"billy\""));
-        assert!(content.contains("display-name = \"Billy\""));
-        assert!(content.contains(&format!("token-hash = \"{token_hash}\"")));
-    }
-
-    #[test]
-    fn mark_user_paired_rejects_exhausted_explicit_id_range() {
-        let mut config = Config::default();
-        config.users = vec![UserConfig {
-            id: UserId(FIRST_DYNAMIC_USER_ID - 1),
-            name: "last".to_string(),
-            display_name: "Last".to_string(),
-            token_hash: hash_secret("last-client-generated-token-with-at-least-32-bytes"),
-        }];
-
-        let error = config
-            .mark_user_paired(
-                "next",
-                "Next".to_string(),
-                hash_secret("next-client-generated-token-with-at-least-32-bytes"),
-            )
-            .unwrap_err();
-
-        assert!(error.contains("explicit user ids"));
-    }
-
-    #[test]
-    fn save_runtime_writes_atomically_without_backup_or_temp_residue() {
-        let path = std::env::temp_dir().join(format!(
-            "chatt-server-atomic-save-test-{}.toml",
-            std::process::id()
-        ));
-        let tmp = temp_config_path(&path);
-        let mut config = Config::default();
-        config.config_path = Some(path.clone());
-
-        let first_hash = hash_secret("first-client-generated-token-with-at-least-32-bytes");
-        config
-            .mark_user_paired("alice", "Alice One".to_string(), first_hash.clone())
-            .unwrap();
-        let second_hash = hash_secret("second-client-generated-token-with-at-least-32-bytes");
-        config
-            .mark_user_paired("alice", "Alice Two".to_string(), second_hash.clone())
-            .unwrap();
-
-        let current = std::fs::read_to_string(&path).unwrap();
-        let bak_exists = extension_path(&path, "bak").exists();
-        let tmp_exists = tmp.exists();
-        let _ = std::fs::remove_file(&path);
-
-        assert!(current.contains("display-name = \"Alice Two\""));
-        assert!(current.contains(&format!("token-hash = \"{second_hash}\"")));
-        // The atomic rename leaves no backup or temp file behind.
-        assert!(!bak_exists);
-        assert!(!tmp_exists);
     }
 
     #[test]
@@ -1415,7 +879,6 @@ mod tests {
 
         let error = Config::load(&path).unwrap_err();
         let content = std::fs::read_to_string(&path).unwrap();
-        // The operator's file must survive verbatim, with no `.corrupt` sibling.
         let corrupt_exists = extension_path(&path, "corrupt").exists();
         let _ = std::fs::remove_file(&path);
 
@@ -1425,45 +888,23 @@ mod tests {
     }
 
     #[test]
-    fn bug_report_dir_round_trips_through_persisted_config() {
-        let mut config = Config::default();
-        config.security.bug_report_dir = Some("/tmp/chatt-bugs".to_string());
-        let content = config.to_toml_string();
-        assert!(content.contains("bug-report-dir = \"/tmp/chatt-bugs\""));
+    fn bug_report_dir_parses() {
+        let content = config_content("").replace(
+            "[security]",
+            "[security]\nbug-report-dir = \"/tmp/chatt-bugs\"",
+        );
 
-        let restored = parse_config_content(
-            &content,
-            "<persisted>",
-            Some(PathBuf::from("chatt-server.toml")),
-        )
-        .unwrap();
+        let config = parse(&content).unwrap();
+
         assert_eq!(
-            restored.security.bug_report_dir.as_deref(),
+            config.security.bug_report_dir.as_deref(),
             Some("/tmp/chatt-bugs")
         );
     }
 
     #[test]
-    fn default_config_omits_bug_report_dir() {
-        let config = Config::default();
-        assert_eq!(config.security.bug_report_dir, None);
-        assert!(!config.to_toml_string().contains("bug-report-dir"));
-    }
-
-    fn parse(content: &str) -> Result<Config, String> {
-        parse_config_content(content, "<test>", Some(PathBuf::from("chatt-server.toml")))
-    }
-
-    fn rooms_section(rooms: &str) -> String {
-        let base = config_with_users().to_toml_string();
-        let default_room = "[[rooms]]\nid = 1\nname = \"lobby\"\ndefault = true\n";
-        assert!(base.contains(default_room), "unexpected default room block");
-        base.replace(default_room, rooms)
-    }
-
-    #[test]
     fn room_config_parses_members_persistence_and_default() {
-        let config = parse(&rooms_section(
+        let config = parse(&config_content(
             "[[rooms]]\nid = 1\nname = \"lobby\"\npersistence = \"durable\"\ndefault = true\n\n\
              [[rooms]]\nid = 2\nname = \"dev\"\npersistence = \"memory\"\nmemory-limit = 200\n\n\
              [[rooms]]\nid = 3\nname = \"secret\"\nmembers = [\"alice\", \"bob\"]\n",
@@ -1486,7 +927,7 @@ mod tests {
 
     #[test]
     fn memory_room_without_limit_uses_the_default_ring_size() {
-        let config = parse(&rooms_section(
+        let config = parse(&config_content(
             "[[rooms]]\nid = 1\nname = \"lobby\"\npersistence = \"memory\"\n",
         ))
         .unwrap();
@@ -1499,7 +940,7 @@ mod tests {
 
     #[test]
     fn config_rejects_duplicate_room_names() {
-        let error = parse(&rooms_section(
+        let error = parse(&config_content(
             "[[rooms]]\nid = 1\nname = \"lobby\"\n\n[[rooms]]\nid = 2\nname = \"lobby\"\n",
         ))
         .unwrap_err();
@@ -1508,19 +949,8 @@ mod tests {
     }
 
     #[test]
-    fn config_rejects_unknown_private_member() {
-        let error = parse(&rooms_section(
-            "[[rooms]]\nid = 1\nname = \"lobby\"\n\n\
-             [[rooms]]\nid = 2\nname = \"secret\"\nmembers = [\"mallory\"]\n",
-        ))
-        .unwrap_err();
-
-        assert!(error.contains("member mallory does not match"));
-    }
-
-    #[test]
     fn config_rejects_empty_private_members() {
-        let error = parse(&rooms_section(
+        let error = parse(&config_content(
             "[[rooms]]\nid = 1\nname = \"lobby\"\n\n\
              [[rooms]]\nid = 2\nname = \"secret\"\nmembers = []\n",
         ))
@@ -1531,7 +961,7 @@ mod tests {
 
     #[test]
     fn config_rejects_multiple_default_rooms() {
-        let error = parse(&rooms_section(
+        let error = parse(&config_content(
             "[[rooms]]\nid = 1\nname = \"lobby\"\ndefault = true\n\n\
              [[rooms]]\nid = 2\nname = \"dev\"\ndefault = true\n",
         ))
@@ -1542,7 +972,7 @@ mod tests {
 
     #[test]
     fn config_rejects_private_default_room() {
-        let error = parse(&rooms_section(
+        let error = parse(&config_content(
             "[[rooms]]\nid = 1\nname = \"lobby\"\n\n\
              [[rooms]]\nid = 2\nname = \"secret\"\nmembers = [\"alice\"]\ndefault = true\n",
         ))
@@ -1553,7 +983,7 @@ mod tests {
 
     #[test]
     fn config_requires_a_public_room() {
-        let error = parse(&rooms_section(
+        let error = parse(&config_content(
             "[[rooms]]\nid = 1\nname = \"secret\"\nmembers = [\"alice\"]\n",
         ))
         .unwrap_err();
@@ -1563,7 +993,7 @@ mod tests {
 
     #[test]
     fn config_rejects_room_id_in_dynamic_range() {
-        let error = parse(&rooms_section(&format!(
+        let error = parse(&config_content(&format!(
             "[[rooms]]\nid = {FIRST_DYNAMIC_ROOM_ID}\nname = \"lobby\"\n"
         )))
         .unwrap_err();
@@ -1573,7 +1003,7 @@ mod tests {
 
     #[test]
     fn config_rejects_memory_limit_without_memory_persistence() {
-        let error = parse(&rooms_section(
+        let error = parse(&config_content(
             "[[rooms]]\nid = 1\nname = \"lobby\"\npersistence = \"durable\"\nmemory-limit = 10\n",
         ))
         .unwrap_err();
@@ -1583,7 +1013,7 @@ mod tests {
 
     #[test]
     fn default_room_falls_back_to_lowest_public_id() {
-        let config = parse(&rooms_section(
+        let config = parse(&config_content(
             "[[rooms]]\nid = 7\nname = \"annex\"\n\n\
              [[rooms]]\nid = 2\nname = \"den\"\n\n\
              [[rooms]]\nid = 3\nname = \"secret\"\nmembers = [\"alice\"]\n",
@@ -1611,65 +1041,11 @@ mod tests {
     }
 
     #[test]
-    fn room_settings_round_trip_through_persisted_config() {
-        let mut config = config_with_users();
-        config.storage.data_dir = Some("room-data".to_string());
-        config.rooms = vec![
-            RoomConfig {
-                id: 1,
-                name: "lobby".to_string(),
-                members: None,
-                persistence: RoomPersistenceConfig::Durable,
-                memory_limit: None,
-                is_default: true,
-            },
-            RoomConfig {
-                id: 2,
-                name: "dev".to_string(),
-                members: None,
-                persistence: RoomPersistenceConfig::Memory,
-                memory_limit: Some(200),
-                is_default: false,
-            },
-            RoomConfig {
-                id: 3,
-                name: "secret".to_string(),
-                members: Some(vec!["alice".to_string(), "bob".to_string()]),
-                persistence: RoomPersistenceConfig::None,
-                memory_limit: None,
-                is_default: false,
-            },
-        ];
-
-        let restored = parse(&config.to_toml_string()).unwrap();
-
-        assert_eq!(restored.storage.data_dir.as_deref(), Some("room-data"));
-        assert_eq!(restored.rooms.len(), 3);
-        assert_eq!(
-            restored.rooms[0].persistence,
-            RoomPersistenceConfig::Durable
-        );
-        assert!(restored.rooms[0].is_default);
-        assert_eq!(restored.rooms[1].memory_limit, Some(200));
-        assert_eq!(
-            restored.rooms[2].members.as_deref(),
-            Some(["alice".to_string(), "bob".to_string()].as_slice())
-        );
-    }
-
-    #[test]
-    fn persisted_public_config_without_users_is_accepted() {
-        let content = Config::default().to_toml_string();
-        let content = content.replace("public = false", "public = true");
-        let config = parse_config_content(
-            &content,
-            "<persisted>",
-            Some(PathBuf::from("chatt-server.toml")),
-        )
-        .unwrap();
-
-        assert!(config.security.public);
-        assert!(config.users.is_empty());
+    fn toml_quote_value_escapes_control_characters() {
+        assert_eq!(toml_quote_value("x\u{1}y"), "x\\u0001y");
+        assert_eq!(toml_quote_value("bell\u{7}"), "bell\\u0007");
+        assert_eq!(toml_quote_value("del\u{7f}"), "del\\u007F");
+        assert_eq!(toml_quote_value("tab\tquote\""), "tab\\tquote\\\"");
     }
 
     #[test]
@@ -1689,8 +1065,38 @@ mod tests {
         assert_eq!(
             mode & 0o077,
             0,
-            "config rewrite must stay owner-only, got {mode:o}"
+            "state rewrite must stay owner-only, got {mode:o}"
         );
         let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn atomic_write_toml_replaces_a_planted_temp_file() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let path = std::env::temp_dir().join(format!(
+            "chatt-atomic-planted-{}-{:?}.toml",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let tmp = temp_config_path(&path);
+        let _ = fs::remove_file(&path);
+        fs::write(&tmp, "planted").unwrap();
+        fs::set_permissions(&tmp, fs::Permissions::from_mode(0o644)).unwrap();
+
+        atomic_write_toml(&path, "key = 1\n").unwrap();
+
+        let content = fs::read_to_string(&path).unwrap();
+        let mode = fs::metadata(&path).unwrap().permissions().mode();
+        let tmp_exists = tmp.exists();
+        let _ = fs::remove_file(&path);
+
+        assert_eq!(content, "key = 1\n");
+        assert_eq!(
+            mode & 0o077,
+            0,
+            "planted mode must not survive, got {mode:o}"
+        );
+        assert!(!tmp_exists);
     }
 }

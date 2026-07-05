@@ -56,8 +56,9 @@ Important fields:
   RPC protocol maximum.
 - `[[rooms]]`: configured rooms. The current client flow expects room id `1` as
   the default lobby.
-- `[[users]]`: configured users. Token hashes are stored as
-  `sha256:<64 hex chars>`. Invite secrets are never stored in TOML.
+- User records live in `users.toml` under the storage data dir, written by the
+  server as invites are accepted. Token hashes are stored as
+  `sha256:<64 hex chars>`. Invite secrets are never stored on disk.
 
 The server prints its public key at startup. Clients should copy that value into
 the active `[[servers]].server-public-key` in `chatt.toml` for
@@ -72,7 +73,7 @@ storing the token or invite secret in plaintext config.
 1. While the server is running, the admin runs `chatt-server invite USER`.
    The command connects to the server's Unix admin socket and asks the running
    process to create an in-memory invite for that internal user identifier. The
-   user does not need to exist in TOML yet. A new invite for the same user
+   user does not need to exist yet. A new invite for the same user
    replaces the previous one. Invites expire after 24 hours.
 2. The server returns a `tcj1_...` join string containing the server addresses,
    server public key, default room, and one-time invite secret. It does not
@@ -89,8 +90,8 @@ storing the token or invite secret in plaintext config.
 5. The server matches the invite by its secret, which selects the user the
    invite was issued for, removes the invite, rejects the token if its hash
    already belongs to another user, hashes the new token, creates or updates
-   the `[[users]]` entry with `token-hash` and `display-name`, and authenticates
-   the current session.
+   the user-registry record with the token hash and display name, and
+   authenticates the current session.
 6. After successful authentication, the client writes a labeled `[[servers]]`
    entry with the generated token. The invite secret is never written to client
    config. Future logins use `ClientControl::Authenticate` with the token.
