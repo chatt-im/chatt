@@ -35,6 +35,11 @@ const QTYPE_A: u16 = 1;
 const QTYPE_AAAA: u16 = 28;
 const QTYPE_ANY: u16 = 255;
 const QCLASS_IN: u16 = 1;
+
+#[inline]
+fn is_interrupted_io_error(error: &io::Error) -> bool {
+    error.kind() == io::ErrorKind::Interrupted || error.raw_os_error() == Some(libc::EINTR)
+}
 const FLAG_RESPONSE: u16 = 0x8000;
 const CLASS_CACHE_FLUSH: u16 = 0x8000;
 const QU_BIT: u16 = 0x8000;
@@ -158,9 +163,13 @@ impl MdnsSystem {
         };
         let mut buf = [0u8; READ_BUF_LEN];
         loop {
-            let received = self.recv_one(is_v4, &mut buf);
-            let Some((len, src)) = received else {
-                break;
+            let (len, src) = match self.recv_one(is_v4, &mut buf) {
+                Ok(Some(value)) => value,
+                Ok(None) => break,
+                Err(error) => {
+                    kvlog::warn!("mdns receive failed", error = %error);
+                    break;
+                }
             };
             let packet = &buf[..len];
             if let Some(queries) = parse_queries(packet) {
@@ -197,15 +206,22 @@ impl MdnsSystem {
         expired
     }
 
-    fn recv_one(&self, is_v4: bool, buf: &mut [u8]) -> Option<(usize, SocketAddr)> {
+    fn recv_one(&self, is_v4: bool, buf: &mut [u8]) -> io::Result<Option<(usize, SocketAddr)>> {
         let socket = if is_v4 {
             self.v4.as_ref()
         } else {
             self.v6.as_ref()
-        }?;
-        match socket.recv_from(buf) {
-            Ok(value) => Some(value),
-            Err(_) => None,
+        };
+        let Some(socket) = socket else {
+            return Ok(None);
+        };
+        loop {
+            match socket.recv_from(buf) {
+                Ok(value) => return Ok(Some(value)),
+                Err(error) if is_interrupted_io_error(&error) => continue,
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(None),
+                Err(error) => return Err(error),
+            }
         }
     }
 
@@ -605,6 +621,19 @@ mod tests {
         assert!(name.ends_with(".local"));
         assert!(rpc::control::is_valid_mdns_candidate_name(&name));
         assert_eq!(name.len(), TOKEN_BYTES * 2 + ".local".len());
+    }
+
+    #[test]
+    fn interrupted_io_errors_are_retryable() {
+        assert!(is_interrupted_io_error(&io::Error::from(
+            io::ErrorKind::Interrupted
+        )));
+        assert!(is_interrupted_io_error(&io::Error::from_raw_os_error(
+            libc::EINTR
+        )));
+        assert!(!is_interrupted_io_error(&io::Error::from(
+            io::ErrorKind::WouldBlock
+        )));
     }
 
     #[test]

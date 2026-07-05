@@ -125,7 +125,7 @@ const CONTROL_WRITE_HIGH_WATER: usize = 8 * 1024 * 1024;
 /// more than this queued, the uploader's connection is parked (its socket is
 /// not read and its buffered frames are not processed). TCP backpressure then
 /// propagates to the uploading client, which paces its own file reads. The
-/// uploader resumes through `pending_reads` once the recipient drains below
+/// uploader resumes through [`LoopWork`] once the recipient drains below
 /// the cap, so a fast uploader can no longer push a slower recipient into the
 /// [`CONTROL_WRITE_HIGH_WATER`] disconnect. One processed read batch can
 /// overshoot the cap by at most [`READ_BUDGET_BYTES`] plus one chunk, far
@@ -136,6 +136,135 @@ const AUDIO_POP_PACKET_FLAG_OPUS_RESET: u8 = 0x01;
 const AUDIO_POP_PACKET_FLAG_SILENCE_HINT: u8 = 0x02;
 const AUDIO_POP_PACKET_FLAG_SILENCE_RESUME: u8 = 0x04;
 const AUDIO_POP_PACKET_FLAG_MUTE: u8 = 0x08;
+
+#[repr(transparent)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Readiness(bool);
+
+impl Readiness {
+    #[inline]
+    fn new() -> Self {
+        Self(false)
+    }
+
+    #[cfg(test)]
+    #[inline]
+    fn primed() -> Self {
+        Self(true)
+    }
+
+    #[inline]
+    fn mark_ready(&mut self) {
+        self.0 = true;
+    }
+
+    #[inline]
+    fn mark_drained(&mut self) {
+        self.0 = false;
+    }
+
+    #[inline]
+    fn is_ready(self) -> bool {
+        self.0
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct ReadPumpOutcome {
+    bytes_read: usize,
+    hit_budget: bool,
+    disconnected: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LoopTask {
+    ClientRead(Token),
+}
+
+#[derive(Debug, Default)]
+struct LoopWork {
+    tasks: Vec<LoopTask>,
+}
+
+impl LoopWork {
+    #[inline]
+    fn poll_timeout(&self, idle: Duration) -> Duration {
+        if self.has_immediate_work() {
+            Duration::ZERO
+        } else {
+            idle
+        }
+    }
+
+    #[inline]
+    fn has_immediate_work(&self) -> bool {
+        !self.tasks.is_empty()
+    }
+
+    #[inline]
+    fn queue_client_read(&mut self, token: Token) {
+        let task = LoopTask::ClientRead(token);
+        if !self.tasks.contains(&task) {
+            self.tasks.push(task);
+        }
+    }
+
+    #[inline]
+    fn has_client_read(&self, token: Token) -> bool {
+        self.tasks.contains(&LoopTask::ClientRead(token))
+    }
+
+    #[inline]
+    fn take_tasks(&mut self) -> Vec<LoopTask> {
+        std::mem::take(&mut self.tasks)
+    }
+
+    #[cfg(test)]
+    fn queued_client_reads(&self) -> Vec<Token> {
+        self.tasks
+            .iter()
+            .map(|task| match *task {
+                LoopTask::ClientRead(token) => token,
+            })
+            .collect()
+    }
+}
+
+#[inline]
+fn read_socket_into_buffer(
+    socket: &impl std::os::fd::AsRawFd,
+    read_buf: &mut RecvBuffer,
+    readiness: &mut Readiness,
+    read_chunk_bytes: usize,
+    read_budget_bytes: usize,
+) -> io::Result<ReadPumpOutcome> {
+    debug_assert!(read_chunk_bytes > 0);
+    debug_assert!(read_budget_bytes > 0);
+
+    let mut outcome = ReadPumpOutcome::default();
+    while readiness.is_ready() {
+        match read_buf.fill(socket, read_chunk_bytes) {
+            Ok(0) => {
+                readiness.mark_drained();
+                outcome.disconnected = true;
+                break;
+            }
+            Ok(read) => {
+                outcome.bytes_read += read;
+                if outcome.bytes_read >= read_budget_bytes {
+                    outcome.hit_budget = true;
+                    break;
+                }
+            }
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                readiness.mark_drained();
+                break;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(outcome)
+}
 
 /// Runs the server command-line entry point: parses `std::env::args`, handles
 /// the `invite` / `init-config` / `serve` subcommands, and drives the event
@@ -275,10 +404,10 @@ pub struct Server {
     next_media_sweep_at: Option<Instant>,
     next_rtt_snapshot_at: Instant,
     next_idle_sweep_at: Instant,
-    /// Connections whose last read stopped at [`READ_BUDGET_BYTES`] with socket
-    /// data still buffered. mio readiness is edge-triggered, so these are
-    /// re-read on the next loop pass instead of waiting for a new event.
-    pending_reads: Vec<Token>,
+    /// Local work that must run before the loop parks in `poll`. Producers
+    /// register here instead of teaching the core loop each local no-sleep
+    /// condition.
+    loop_work: LoopWork,
     history_reader: HistoryReader,
     history_replies: mpsc::Receiver<HistoryReadReply>,
     /// Reusable sealing buffers for [`Self::send_udp_payload`], so per-packet
@@ -420,7 +549,7 @@ impl Server {
             next_media_sweep_at: None,
             next_rtt_snapshot_at: Instant::now() + RTT_SNAPSHOT_INTERVAL,
             next_idle_sweep_at: Instant::now() + IDLE_SWEEP_INTERVAL,
-            pending_reads: Vec::new(),
+            loop_work: LoopWork::default(),
             history_reader,
             history_replies,
             udp_send_packet: Vec::new(),
@@ -435,11 +564,11 @@ impl Server {
     ) -> Result<(), Box<dyn std::error::Error>> {
         let mut events = Events::with_capacity(256);
         loop {
-            let timeout = if self.pending_reads.is_empty() {
-                POLL_TIMEOUT
-            } else {
-                Duration::ZERO
-            };
+            let timeout = self.loop_work.poll_timeout(POLL_TIMEOUT);
+            #[cfg(debug_assertions)]
+            if !self.loop_work.has_immediate_work() {
+                self.debug_assert_no_immediate_read_work();
+            }
             if let Err(error) = self.poll.poll(&mut events, Some(timeout)) {
                 if is_interrupted_io_error(&error) {
                     kvlog::warn!("server poll interrupted", error = %error);
@@ -447,7 +576,6 @@ impl Server {
                 }
                 return Err(error.into());
             }
-            let pending_reads = std::mem::take(&mut self.pending_reads);
             for event in events.iter() {
                 match event.token() {
                     LISTENER => self.accept_clients()?,
@@ -458,9 +586,9 @@ impl Server {
                     token => {
                         if event.is_readable() {
                             if let Some(client) = self.clients.get_mut(&token) {
-                                client.readable = true;
+                                client.readiness.mark_ready();
                             }
-                            self.read_client(token);
+                            self.loop_work.queue_client_read(token);
                         }
                         if event.is_writable() {
                             self.write_client(token);
@@ -468,8 +596,11 @@ impl Server {
                     }
                 }
             }
-            for token in pending_reads {
-                self.read_client(token);
+            let loop_tasks = self.loop_work.take_tasks();
+            for task in loop_tasks {
+                match task {
+                    LoopTask::ClientRead(token) => self.read_client(token),
+                }
             }
             self.requeue_unclogged_uploaders();
             self.drain_history_replies();
@@ -588,7 +719,7 @@ impl Server {
                     socket,
                     addr,
                     read_buf: RecvBuffer::new(),
-                    readable: false,
+                    readiness: Readiness::new(),
                     write_buf: WriteQueue::new(),
                     kind: ConnKind::Unidentified,
                     state: ConnState::AwaitClientHello,
@@ -607,38 +738,35 @@ impl Server {
     fn read_client(&mut self, token: Token) {
         // A parked uploader neither fills nor processes: leaving the bytes in
         // the socket closes the uploading client's send window, which is the
-        // whole flow-control chain. `readable` keeps the lost edge; the
+        // whole flow-control chain. `readiness` keeps the lost edge; the
         // `requeue_unclogged_uploaders` sweep resumes the connection.
         let clogged = self.relay_clogged_for_reader(token);
         let mut disconnected = false;
-        let mut budget_spent = 0usize;
+        let mut hit_budget = false;
         if let Some(client) = self.clients.get_mut(&token) {
-            while !clogged && client.readable {
-                match client.read_buf.fill(&client.socket, TCP_READ_CHUNK_BYTES) {
-                    Ok(0) => {
-                        kvlog::info!("tcp client closed", token = token.0);
-                        disconnected = true;
-                        break;
-                    }
-                    Ok(n) => {
-                        budget_spent += n;
-                        if budget_spent >= READ_BUDGET_BYTES {
-                            break;
+            if !clogged {
+                match read_socket_into_buffer(
+                    &client.socket,
+                    &mut client.read_buf,
+                    &mut client.readiness,
+                    TCP_READ_CHUNK_BYTES,
+                    READ_BUDGET_BYTES,
+                ) {
+                    Ok(outcome) => {
+                        if outcome.bytes_read > 0 {
+                            client.last_activity = Instant::now();
                         }
-                    }
-                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                        client.readable = false;
-                        break;
+                        if outcome.disconnected {
+                            kvlog::info!("tcp client closed", token = token.0);
+                        }
+                        hit_budget = outcome.hit_budget;
+                        disconnected = outcome.disconnected;
                     }
                     Err(error) => {
                         kvlog::warn!("tcp client read failed", token = token.0, error = %error);
                         disconnected = true;
-                        break;
                     }
                 }
-            }
-            if budget_spent > 0 {
-                client.last_activity = Instant::now();
             }
         }
 
@@ -646,8 +774,8 @@ impl Server {
             self.disconnect(token);
             return;
         }
-        if budget_spent >= READ_BUDGET_BYTES && !self.pending_reads.contains(&token) {
-            self.pending_reads.push(token);
+        if hit_budget {
+            self.loop_work.queue_client_read(token);
         }
 
         // Classify a freshly accepted connection on its first bytes. A video
@@ -3361,6 +3489,7 @@ impl Server {
             };
             let (len, src) = match received {
                 Ok(value) => value,
+                Err(error) if is_interrupted_io_error(&error) => continue,
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
                 Err(error) => {
                     kvlog::warn!("udp receive failed", error = %error);
@@ -4136,10 +4265,10 @@ impl Server {
 
     /// Resumes uploader connections parked by relay flow control. An uploader
     /// with pending work (unread socket bytes or a whole buffered frame)
-    /// whose recipients have all drained below the soft cap re-enters
-    /// `pending_reads`, so the next loop iteration reads it at zero poll
-    /// timeout. Runs every loop iteration; recipient socket writability keeps
-    /// the loop awake while a parked transfer drains.
+    /// whose recipients have all drained below the soft cap is queued in
+    /// [`LoopWork`], so the next loop iteration reads it at zero poll timeout.
+    /// Runs every loop iteration; recipient socket writability keeps the loop
+    /// awake while a parked transfer drains.
     fn requeue_unclogged_uploaders(&mut self) {
         if self.active_uploads.is_empty() {
             return;
@@ -4149,7 +4278,7 @@ impl Server {
             let Some(token) = self.live_token_for_session(*session_id) else {
                 continue;
             };
-            if resumed.contains(&token) || self.pending_reads.contains(&token) {
+            if resumed.contains(&token) || self.loop_work.has_client_read(token) {
                 continue;
             }
             let Some(client) = self.clients.get(&token) else {
@@ -4157,7 +4286,7 @@ impl Server {
             };
             let whole_frame_buffered =
                 matches!(frame::parse_frame(client.read_buf.pending()), Ok(Some(_)));
-            if !client.readable && !whole_frame_buffered {
+            if !client.readiness.is_ready() && !whole_frame_buffered {
                 continue;
             }
             if self.upload_recipients_clogged(*session_id) {
@@ -4165,7 +4294,25 @@ impl Server {
             }
             resumed.push(token);
         }
-        self.pending_reads.extend_from_slice(&resumed);
+        for token in resumed {
+            self.loop_work.queue_client_read(token);
+        }
+    }
+
+    #[cfg(debug_assertions)]
+    fn debug_assert_no_immediate_read_work(&self) {
+        for (token, client) in &self.clients {
+            let whole_frame_buffered =
+                matches!(frame::parse_frame(client.read_buf.pending()), Ok(Some(_)));
+            let can_process_now = !client.is_closing()
+                && !self.relay_clogged_for_reader(*token)
+                && (client.readiness.is_ready() || whole_frame_buffered);
+            debug_assert!(
+                !can_process_now,
+                "server poll would sleep with immediate client read work for token {}",
+                token.0
+            );
+        }
     }
 
     fn remove_peer_links(&mut self, session_id: SessionId) {
@@ -4387,7 +4534,7 @@ struct ClientConn {
     /// edge-triggered, so a read skipped or capped by budget or relay flow
     /// control must remember the readiness here; the edge itself never
     /// re-fires while the peer is blocked on our zero receive window.
-    readable: bool,
+    readiness: Readiness,
     write_buf: WriteQueue,
     kind: ConnKind,
     state: ConnState,
@@ -5180,7 +5327,8 @@ fn server_control_kind(control: &ServerControl) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Read;
+    use std::io::{Read, Write};
+    use std::os::unix::net::UnixStream;
 
     #[test]
     fn write_bug_report_creates_paired_files() {
@@ -6756,14 +6904,15 @@ mod tests {
         peer.write_all(&pipelined).expect("write pipelined frame");
 
         // Nonblocking loopback: retry until the written bytes are readable.
-        // Each retry models a readable poll event, which sets `readable`.
+        // Each retry models a readable poll event, which sets `readiness`.
         let deadline = Instant::now() + Duration::from_secs(1);
         loop {
             server
                 .clients
                 .get_mut(&token)
                 .expect("still draining")
-                .readable = true;
+                .readiness
+                .mark_ready();
             server.read_client(token);
             let buffered = server.clients.get(&token).expect("still draining");
             if buffered.read_buf.len() >= pipelined.len() || Instant::now() > deadline {
@@ -6774,6 +6923,59 @@ mod tests {
         let client = server.clients.get(&token).expect("still draining");
         assert_eq!(client.read_buf.len(), pipelined.len());
         assert!(client.write_buf.is_empty());
+    }
+
+    #[test]
+    fn read_budget_stop_keeps_readiness_for_retry() {
+        let (mut writer, reader) = UnixStream::pair().expect("socket pair");
+        reader.set_nonblocking(true).expect("set nonblocking");
+        writer.write_all(b"x").expect("write payload");
+        let mut read_buf = RecvBuffer::new();
+        let mut readiness = Readiness::primed();
+
+        let outcome =
+            read_socket_into_buffer(&reader, &mut read_buf, &mut readiness, 1, 1).unwrap();
+
+        assert!(outcome.hit_budget);
+        assert!(!outcome.disconnected);
+        assert!(outcome.bytes_read >= 1);
+        assert!(readiness.is_ready());
+        assert!(!read_buf.is_empty());
+    }
+
+    #[test]
+    fn would_block_clears_retained_readiness_after_buffer_consumed() {
+        let (mut writer, reader) = UnixStream::pair().expect("socket pair");
+        reader.set_nonblocking(true).expect("set nonblocking");
+        writer.write_all(b"x").expect("write payload");
+        let mut read_buf = RecvBuffer::new();
+        let mut readiness = Readiness::primed();
+
+        let outcome =
+            read_socket_into_buffer(&reader, &mut read_buf, &mut readiness, 1, 1).unwrap();
+        assert!(outcome.hit_budget);
+        assert!(readiness.is_ready());
+
+        read_buf.consume(read_buf.len());
+        let outcome =
+            read_socket_into_buffer(&reader, &mut read_buf, &mut readiness, 1, 1).unwrap();
+
+        assert_eq!(outcome, ReadPumpOutcome::default());
+        assert!(!readiness.is_ready());
+    }
+
+    #[test]
+    fn loop_work_queues_reads_and_forces_zero_timeout() {
+        let mut work = LoopWork::default();
+        assert_eq!(work.poll_timeout(POLL_TIMEOUT), POLL_TIMEOUT);
+
+        work.queue_client_read(Token(7));
+        work.queue_client_read(Token(7));
+
+        assert_eq!(work.poll_timeout(POLL_TIMEOUT), Duration::ZERO);
+        assert_eq!(work.queued_client_reads(), vec![Token(7)]);
+        assert_eq!(work.take_tasks(), vec![LoopTask::ClientRead(Token(7))]);
+        assert_eq!(work.poll_timeout(POLL_TIMEOUT), POLL_TIMEOUT);
     }
 
     #[test]
@@ -6803,14 +7005,15 @@ mod tests {
         peer.write_all(&pipelined).expect("write pipelined frames");
 
         // Nonblocking loopback: retry until the written bytes are readable.
-        // Each retry models a readable poll event, which sets `readable`.
+        // Each retry models a readable poll event, which sets `readiness`.
         let deadline = Instant::now() + Duration::from_secs(1);
         loop {
             server
                 .clients
                 .get_mut(&token)
                 .expect("client still connected")
-                .readable = true;
+                .readiness
+                .mark_ready();
             server.read_client(token);
             let muted = server
                 .sessions
@@ -6881,13 +7084,14 @@ mod tests {
             .clients
             .get_mut(&uploader_token)
             .expect("uploader connected")
-            .readable = true;
+            .readiness
+            .mark_ready();
         server.read_client(uploader_token);
         let uploader = server.clients.get(&uploader_token).expect("still parked");
         assert!(uploader.read_buf.is_empty());
-        assert!(uploader.readable);
+        assert!(uploader.readiness.is_ready());
         server.requeue_unclogged_uploaders();
-        assert!(server.pending_reads.is_empty());
+        assert!(server.loop_work.queued_client_reads().is_empty());
 
         // Draining the recipient below the cap resumes the uploader.
         let queued = server
@@ -6903,7 +7107,7 @@ mod tests {
             .write_buf
             .consume(queued);
         server.requeue_unclogged_uploaders();
-        assert_eq!(server.pending_reads, vec![uploader_token]);
+        assert_eq!(server.loop_work.queued_client_reads(), vec![uploader_token]);
     }
 
     #[test]
@@ -7703,7 +7907,7 @@ mod tests {
             socket: TcpStream::from_std(client),
             addr: client_addr,
             read_buf: RecvBuffer::new(),
-            readable: false,
+            readiness: Readiness::new(),
             write_buf: WriteQueue::new(),
             kind: ConnKind::Control,
             state: ConnState::Ready,
