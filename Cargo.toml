@@ -82,6 +82,7 @@ members = [
     "crates/opus-codec",
     "crates/nnnoiseless",
     "crates/darkhttp",
+    "crates/pipewire-sys",
 ]
 exclude = ["crates/cpal", "crates/sonora", "crates/pathify_svg"]
 
@@ -107,3 +108,6 @@ debug = 1
 [profile.dhat]
 inherits = "release"
 debug = "full"
+
+[patch.crates-io]
+pipewire-sys.path = "crates/pipewire-sys"
