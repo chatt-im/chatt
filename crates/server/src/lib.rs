@@ -121,6 +121,16 @@ const VIDEO_SUBSCRIBER_HIGH_WATER: usize = 8 * 1024 * 1024;
 /// draining its socket and is dropped, so a stalled file-relay recipient or a
 /// history-pipelining client cannot pin megabytes of server memory.
 const CONTROL_WRITE_HIGH_WATER: usize = 8 * 1024 * 1024;
+/// Relay flow control: while any recipient of a session's active upload has
+/// more than this queued, the uploader's connection is parked (its socket is
+/// not read and its buffered frames are not processed). TCP backpressure then
+/// propagates to the uploading client, which paces its own file reads. The
+/// uploader resumes through `pending_reads` once the recipient drains below
+/// the cap, so a fast uploader can no longer push a slower recipient into the
+/// [`CONTROL_WRITE_HIGH_WATER`] disconnect. One processed read batch can
+/// overshoot the cap by at most [`READ_BUDGET_BYTES`] plus one chunk, far
+/// under the high water.
+const FILE_RELAY_WRITE_SOFT_CAP: usize = 1024 * 1024;
 const AUDIO_POP_LOG_ENV: &str = "CHATT_AUDIO_POP_LOG";
 const AUDIO_POP_PACKET_FLAG_OPUS_RESET: u8 = 0x01;
 const AUDIO_POP_PACKET_FLAG_SILENCE_HINT: u8 = 0x02;
@@ -447,6 +457,9 @@ impl Server {
                     WAKER => {}
                     token => {
                         if event.is_readable() {
+                            if let Some(client) = self.clients.get_mut(&token) {
+                                client.readable = true;
+                            }
                             self.read_client(token);
                         }
                         if event.is_writable() {
@@ -458,6 +471,7 @@ impl Server {
             for token in pending_reads {
                 self.read_client(token);
             }
+            self.requeue_unclogged_uploaders();
             self.drain_history_replies();
             self.handle_admin_commands(admin_rx);
             self.flush_disconnects();
@@ -574,6 +588,7 @@ impl Server {
                     socket,
                     addr,
                     read_buf: RecvBuffer::new(),
+                    readable: false,
                     write_buf: WriteQueue::new(),
                     kind: ConnKind::Unidentified,
                     state: ConnState::AwaitClientHello,
@@ -590,10 +605,15 @@ impl Server {
     }
 
     fn read_client(&mut self, token: Token) {
+        // A parked uploader neither fills nor processes: leaving the bytes in
+        // the socket closes the uploading client's send window, which is the
+        // whole flow-control chain. `readable` keeps the lost edge; the
+        // `requeue_unclogged_uploaders` sweep resumes the connection.
+        let clogged = self.relay_clogged_for_reader(token);
         let mut disconnected = false;
         let mut budget_spent = 0usize;
         if let Some(client) = self.clients.get_mut(&token) {
-            loop {
+            while !clogged && client.readable {
                 match client.read_buf.fill(&client.socket, TCP_READ_CHUNK_BYTES) {
                     Ok(0) => {
                         kvlog::info!("tcp client closed", token = token.0);
@@ -606,7 +626,10 @@ impl Server {
                             break;
                         }
                     }
-                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                        client.readable = false;
+                        break;
+                    }
                     Err(error) => {
                         kvlog::warn!("tcp client read failed", token = token.0, error = %error);
                         disconnected = true;
@@ -656,6 +679,12 @@ impl Server {
         }
 
         loop {
+            // Relayed chunks queue to recipients inside `handle_control`, so
+            // re-check between frames and park with the remaining frames
+            // still buffered once a recipient's queue is over the cap.
+            if self.relay_clogged_for_reader(token) {
+                return;
+            }
             let Some(client) = self.clients.get_mut(&token) else {
                 return;
             };
@@ -4066,6 +4095,79 @@ impl Server {
         self.clients.contains_key(&token).then_some(token)
     }
 
+    /// Whether reads from `token` are parked by relay flow control: the
+    /// connection is an authenticated control connection whose session has an
+    /// active upload with a recipient queued past
+    /// [`FILE_RELAY_WRITE_SOFT_CAP`].
+    fn relay_clogged_for_reader(&self, token: Token) -> bool {
+        let Some(client) = self.clients.get(&token) else {
+            return false;
+        };
+        if !matches!(client.kind, ConnKind::Control) {
+            return false;
+        }
+        let Some(session_id) = client.session_id else {
+            return false;
+        };
+        self.upload_recipients_clogged(session_id)
+    }
+
+    /// Whether any live recipient of `uploader`'s active uploads has more
+    /// than [`FILE_RELAY_WRITE_SOFT_CAP`] bytes queued.
+    fn upload_recipients_clogged(&self, uploader: SessionId) -> bool {
+        for ((session_id, _), upload) in &self.active_uploads {
+            if *session_id != uploader {
+                continue;
+            }
+            for recipient in &upload.recipients {
+                let Some(token) = self.live_token_for_session(*recipient) else {
+                    continue;
+                };
+                let Some(conn) = self.clients.get(&token) else {
+                    continue;
+                };
+                if conn.write_buf.len() > FILE_RELAY_WRITE_SOFT_CAP {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// Resumes uploader connections parked by relay flow control. An uploader
+    /// with pending work (unread socket bytes or a whole buffered frame)
+    /// whose recipients have all drained below the soft cap re-enters
+    /// `pending_reads`, so the next loop iteration reads it at zero poll
+    /// timeout. Runs every loop iteration; recipient socket writability keeps
+    /// the loop awake while a parked transfer drains.
+    fn requeue_unclogged_uploaders(&mut self) {
+        if self.active_uploads.is_empty() {
+            return;
+        }
+        let mut resumed = Vec::new();
+        for (session_id, _) in self.active_uploads.keys() {
+            let Some(token) = self.live_token_for_session(*session_id) else {
+                continue;
+            };
+            if resumed.contains(&token) || self.pending_reads.contains(&token) {
+                continue;
+            }
+            let Some(client) = self.clients.get(&token) else {
+                continue;
+            };
+            let whole_frame_buffered =
+                matches!(frame::parse_frame(client.read_buf.pending()), Ok(Some(_)));
+            if !client.readable && !whole_frame_buffered {
+                continue;
+            }
+            if self.upload_recipients_clogged(*session_id) {
+                continue;
+            }
+            resumed.push(token);
+        }
+        self.pending_reads.extend_from_slice(&resumed);
+    }
+
     fn remove_peer_links(&mut self, session_id: SessionId) {
         self.peer_links
             .retain(|(a, b), _| *a != session_id && *b != session_id);
@@ -4280,6 +4382,12 @@ struct ClientConn {
     socket: TcpStream,
     addr: SocketAddr,
     read_buf: RecvBuffer,
+    /// Whether the socket may hold unread bytes. Set on every readable poll
+    /// event and cleared only when a fill drains to `WouldBlock`. The poll is
+    /// edge-triggered, so a read skipped or capped by budget or relay flow
+    /// control must remember the readiness here; the edge itself never
+    /// re-fires while the peer is blocked on our zero receive window.
+    readable: bool,
     write_buf: WriteQueue,
     kind: ConnKind,
     state: ConnState,
@@ -6648,8 +6756,14 @@ mod tests {
         peer.write_all(&pipelined).expect("write pipelined frame");
 
         // Nonblocking loopback: retry until the written bytes are readable.
+        // Each retry models a readable poll event, which sets `readable`.
         let deadline = Instant::now() + Duration::from_secs(1);
         loop {
+            server
+                .clients
+                .get_mut(&token)
+                .expect("still draining")
+                .readable = true;
             server.read_client(token);
             let buffered = server.clients.get(&token).expect("still draining");
             if buffered.read_buf.len() >= pipelined.len() || Instant::now() > deadline {
@@ -6689,8 +6803,14 @@ mod tests {
         peer.write_all(&pipelined).expect("write pipelined frames");
 
         // Nonblocking loopback: retry until the written bytes are readable.
+        // Each retry models a readable poll event, which sets `readable`.
         let deadline = Instant::now() + Duration::from_secs(1);
         loop {
+            server
+                .clients
+                .get_mut(&token)
+                .expect("client still connected")
+                .readable = true;
             server.read_client(token);
             let muted = server
                 .sessions
@@ -6707,6 +6827,83 @@ mod tests {
         assert!(session.voice_status.muted);
         let client = server.clients.get(&token).expect("client still connected");
         assert!(client.read_buf.is_empty());
+    }
+
+    #[test]
+    fn relay_backpressure_parks_uploader_and_resumes_after_drain() {
+        let mut server = test_server();
+        let uploader_token = Token(21);
+        let uploader_session = SessionId(1);
+        let (mut uploader_conn, _uploader_peer) = test_live_client();
+        uploader_conn.session_id = Some(uploader_session);
+        server.clients.insert(uploader_token, uploader_conn);
+        server.sessions.insert(
+            uploader_session,
+            test_session(UserId(1), uploader_token, None),
+        );
+
+        let recipient_token = Token(22);
+        let recipient_session = SessionId(2);
+        let (mut recipient_conn, _recipient_peer) = test_live_client();
+        recipient_conn.session_id = Some(recipient_session);
+        server.clients.insert(recipient_token, recipient_conn);
+        server.sessions.insert(
+            recipient_session,
+            test_session(UserId(2), recipient_token, None),
+        );
+
+        server.active_uploads.insert(
+            (uploader_session, FileTransferId(1)),
+            ServerUpload {
+                server_transfer_id: FileTransferId(7),
+                room_id: RoomId(1),
+                encoding: FileContentEncoding::Zstd,
+                original_size: 1024,
+                wire_received: 0,
+                file_name: "clogged.bin".to_string(),
+                recipients: HashSet::from([recipient_session]),
+            },
+        );
+
+        // Below the soft cap the uploader is not parked.
+        assert!(!server.relay_clogged_for_reader(uploader_token));
+
+        // Over the cap: a readable uploader stays parked, its socket unread.
+        server
+            .clients
+            .get_mut(&recipient_token)
+            .expect("recipient connected")
+            .write_buf
+            .tail_mut()
+            .resize(FILE_RELAY_WRITE_SOFT_CAP + 1, 0);
+        assert!(server.relay_clogged_for_reader(uploader_token));
+        server
+            .clients
+            .get_mut(&uploader_token)
+            .expect("uploader connected")
+            .readable = true;
+        server.read_client(uploader_token);
+        let uploader = server.clients.get(&uploader_token).expect("still parked");
+        assert!(uploader.read_buf.is_empty());
+        assert!(uploader.readable);
+        server.requeue_unclogged_uploaders();
+        assert!(server.pending_reads.is_empty());
+
+        // Draining the recipient below the cap resumes the uploader.
+        let queued = server
+            .clients
+            .get(&recipient_token)
+            .expect("recipient connected")
+            .write_buf
+            .len();
+        server
+            .clients
+            .get_mut(&recipient_token)
+            .expect("recipient connected")
+            .write_buf
+            .consume(queued);
+        server.requeue_unclogged_uploaders();
+        assert_eq!(server.pending_reads, vec![uploader_token]);
     }
 
     #[test]
@@ -7506,6 +7703,7 @@ mod tests {
             socket: TcpStream::from_std(client),
             addr: client_addr,
             read_buf: RecvBuffer::new(),
+            readable: false,
             write_buf: WriteQueue::new(),
             kind: ConnKind::Control,
             state: ConnState::Ready,
