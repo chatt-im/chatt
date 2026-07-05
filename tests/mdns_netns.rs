@@ -15,6 +15,7 @@ use mio::{Events, Poll, Token};
 
 const V4: Token = Token(0);
 const V6: Token = Token(1);
+const MDNS_DRAIN_BUDGET: usize = 32;
 
 #[test]
 fn opt_in_netns_mdns_resolves_local_candidate() {
@@ -69,7 +70,7 @@ fn opt_in_netns_mdns_resolves_local_candidate() {
             poll.poll(&mut events, Some(Duration::from_millis(50)))
                 .unwrap();
             for event in events.iter() {
-                system.handle_readable(event.token(), Instant::now());
+                system.handle_readable(event.token(), Instant::now(), MDNS_DRAIN_BUDGET);
             }
         }
     });
@@ -88,8 +89,9 @@ fn opt_in_netns_mdns_resolves_local_candidate() {
             poll.poll(&mut events, Some(Duration::from_millis(50)))
                 .unwrap();
             for event in events.iter() {
-                let resolved = system.handle_readable(event.token(), Instant::now());
-                if let Some((_, ip)) = resolved.into_iter().next() {
+                let outcome =
+                    system.handle_readable(event.token(), Instant::now(), MDNS_DRAIN_BUDGET);
+                if let Some((_, ip)) = outcome.resolved.into_iter().next() {
                     return Some(ip);
                 }
             }

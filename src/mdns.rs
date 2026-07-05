@@ -22,6 +22,7 @@ use chatt_p2p::{
 };
 use mio::{Interest, Registry, Token, net::UdpSocket as MioUdpSocket};
 use ring::rand::SecureRandom;
+use rpc::evented::recv_datagram_with;
 
 const MDNS_PORT: u16 = 5353;
 const MDNS_GROUP_V4: Ipv4Addr = Ipv4Addr::new(224, 0, 0, 251);
@@ -36,10 +37,6 @@ const QTYPE_AAAA: u16 = 28;
 const QTYPE_ANY: u16 = 255;
 const QCLASS_IN: u16 = 1;
 
-#[inline]
-fn is_interrupted_io_error(error: &io::Error) -> bool {
-    error.kind() == io::ErrorKind::Interrupted || error.raw_os_error() == Some(libc::EINTR)
-}
 const FLAG_RESPONSE: u16 = 0x8000;
 const CLASS_CACHE_FLUSH: u16 = 0x8000;
 const QU_BIT: u16 = 0x8000;
@@ -72,6 +69,12 @@ pub struct MdnsSystem {
     v6_token: Token,
     local_names: HashMap<String, IpAddr>,
     active_queries: HashMap<String, Instant>,
+}
+
+#[derive(Debug, Default)]
+pub struct MdnsReadOutcome {
+    pub resolved: Vec<(String, IpAddr)>,
+    pub hit_limit: bool,
 }
 
 impl MdnsSystem {
@@ -152,16 +155,26 @@ impl MdnsSystem {
 
     /// Drains all pending datagrams on the given socket. Answers queries for
     /// names in the local table and returns any completed resolutions.
-    pub fn handle_readable(&mut self, token: Token, _now: Instant) -> Vec<(String, IpAddr)> {
-        let mut resolved = Vec::new();
+    pub fn handle_readable(
+        &mut self,
+        token: Token,
+        _now: Instant,
+        budget: usize,
+    ) -> MdnsReadOutcome {
+        let mut outcome = MdnsReadOutcome::default();
+        if budget == 0 {
+            outcome.hit_limit = true;
+            return outcome;
+        }
         let is_v4 = if token == self.v4_token {
             true
         } else if token == self.v6_token {
             false
         } else {
-            return resolved;
+            return outcome;
         };
         let mut buf = [0u8; READ_BUF_LEN];
+        let mut datagrams = 0usize;
         loop {
             let (len, src) = match self.recv_one(is_v4, &mut buf) {
                 Ok(Some(value)) => value,
@@ -171,6 +184,7 @@ impl MdnsSystem {
                     break;
                 }
             };
+            datagrams += 1;
             let packet = &buf[..len];
             if let Some(queries) = parse_queries(packet) {
                 for query in &queries {
@@ -180,10 +194,14 @@ impl MdnsSystem {
                 }
             }
             if let Some(answers) = parse_responses(packet) {
-                self.collect_resolutions(answers, &mut resolved);
+                self.collect_resolutions(answers, &mut outcome.resolved);
+            }
+            if datagrams >= budget {
+                outcome.hit_limit = true;
+                break;
             }
         }
-        resolved
+        outcome
     }
 
     /// Time until the oldest in-flight query times out, if any.
@@ -215,14 +233,7 @@ impl MdnsSystem {
         let Some(socket) = socket else {
             return Ok(None);
         };
-        loop {
-            match socket.recv_from(buf) {
-                Ok(value) => return Ok(Some(value)),
-                Err(error) if is_interrupted_io_error(&error) => continue,
-                Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(None),
-                Err(error) => return Err(error),
-            }
-        }
+        recv_datagram_with(buf, |buf| socket.recv_from(buf))
     }
 
     fn send_to(&self, is_v4: bool, bytes: &[u8], dest: SocketAddr) {
@@ -625,13 +636,13 @@ mod tests {
 
     #[test]
     fn interrupted_io_errors_are_retryable() {
-        assert!(is_interrupted_io_error(&io::Error::from(
+        assert!(rpc::evented::is_interrupted_io_error(&io::Error::from(
             io::ErrorKind::Interrupted
         )));
-        assert!(is_interrupted_io_error(&io::Error::from_raw_os_error(
-            libc::EINTR
-        )));
-        assert!(!is_interrupted_io_error(&io::Error::from(
+        assert!(rpc::evented::is_interrupted_io_error(
+            &io::Error::from_raw_os_error(libc::EINTR)
+        ));
+        assert!(!rpc::evented::is_interrupted_io_error(&io::Error::from(
             io::ErrorKind::WouldBlock
         )));
     }
