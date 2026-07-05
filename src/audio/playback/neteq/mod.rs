@@ -29,8 +29,6 @@ mod redundancy;
 mod sync_buffer;
 mod tick_timer;
 
-pub(crate) use core::{
-    AudioResult, NetEqCore, NetEqDiagnostics, NetEqInsertPlan, NetEqPreparedPacket,
-};
+pub(crate) use core::{AudioResult, NetEqCore, NetEqDiagnostics, NetEqPreparedPacket};
 #[cfg(test)]
 pub(crate) use operation::Mode;
