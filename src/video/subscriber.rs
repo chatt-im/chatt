@@ -6,15 +6,15 @@
 //! without re-framing. The thread auto-reconnects on disconnect or overflow,
 //! getting a fresh keyframe from the server's fast-start cache each time.
 
-use std::io::Read;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use rpc::{
-    crypto::CHANNEL_VIDEO,
+    crypto::{CHANNEL_VIDEO, TRANSPORT_HEADER_LEN, TransportCipher},
     ids::{SessionId, StreamId},
+    recv::RecvBuffer,
     video::{self, VideoRole},
 };
 
@@ -102,7 +102,7 @@ fn run_once(
     feed: &WebFeedSender,
     stop: &AtomicBool,
 ) -> Result<(), String> {
-    let (mut stream, mut cipher, mut buf) = super::open_video_connection(
+    let (stream, mut cipher, mut recv) = super::open_video_connection(
         tcp_addr,
         session_id,
         stream_id,
@@ -118,26 +118,49 @@ fn run_once(
         if stop.load(Ordering::SeqCst) {
             return Ok(());
         }
-        match video::pop_record(&mut buf).map_err(|error| error.to_string())? {
-            Some(record) => {
-                let plaintext = cipher
-                    .open_next(CHANNEL_VIDEO, &record)
-                    .map_err(|error| error.to_string())?;
-                feed.send_video_frame(plaintext);
-                continue;
-            }
-            None => {}
-        }
-        let mut tmp = [0u8; 64 * 1024];
-        match stream.read(&mut tmp) {
+        forward_buffered_frames(&mut recv, &mut cipher, feed)?;
+        match recv.fill(&stream, super::VIDEO_READ_CHUNK_BYTES) {
             Ok(0) => return Err("video connection closed".to_string()),
-            Ok(read) => buf.extend_from_slice(&tmp[..read]),
+            Ok(_) => {}
             Err(error)
                 if matches!(
                     error.kind(),
                     std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
                 ) => {}
             Err(error) => return Err(format!("video read failed: {error}")),
+        }
+    }
+}
+
+/// Decrypts every whole record buffered in `recv` in place and forwards the
+/// plaintext to the browser. A read usually delivers exactly one whole record,
+/// and that record's buffer is shipped to the feed as-is rather than copied;
+/// only records sharing the buffer with following bytes are copied out.
+fn forward_buffered_frames(
+    recv: &mut RecvBuffer,
+    cipher: &mut TransportCipher,
+    feed: &WebFeedSender,
+) -> Result<(), String> {
+    const PLAINTEXT_START: usize = video::VIDEO_LENGTH_PREFIX_LEN + TRANSPORT_HEADER_LEN;
+    loop {
+        let total = match video::parse_record(recv.pending()) {
+            Ok(Some((_, total))) => total,
+            Ok(None) => return Ok(()),
+            Err(error) => return Err(error.to_string()),
+        };
+        let plaintext_len = {
+            let record = &mut recv.pending_mut()[video::VIDEO_LENGTH_PREFIX_LEN..total];
+            cipher
+                .open_next_in_place(CHANNEL_VIDEO, record)
+                .map_err(|error| error.to_string())?
+                .len()
+        };
+        if recv.len() == total {
+            feed.send_video_frame(recv.ship(PLAINTEXT_START, plaintext_len));
+        } else {
+            let plaintext = &recv.pending()[PLAINTEXT_START..PLAINTEXT_START + plaintext_len];
+            feed.send_video_frame(plaintext.to_vec());
+            recv.consume(total);
         }
     }
 }

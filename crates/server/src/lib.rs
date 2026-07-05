@@ -1,7 +1,7 @@
 use hashbrown::{HashMap, HashSet};
 use std::{
     collections::VecDeque,
-    io::{self, Read, Write},
+    io::{self, Write},
     net::{IpAddr, SocketAddr},
     path::Path,
     sync::mpsc,
@@ -34,13 +34,14 @@ use rpc::{
     },
     crypto::{
         AntiReplay, CHANNEL_CONTROL, CHANNEL_VIDEO, ControlTransport, DYNAMIC_TOKEN_PREFIX,
-        DynamicTokenClaims, KEY_LEN, KeyMaterial, SessionSecrets, TransportCipher, VideoKeyRole,
-        derive_video_keys, encode_hex, issue_dynamic_token, respond_to_client_hello,
-        respond_to_client_hello_plaintext, verify_dynamic_token,
+        DynamicTokenClaims, KEY_LEN, KeyMaterial, SessionSecrets, TAG_LEN, TRANSPORT_HEADER_LEN,
+        TransportCipher, VideoKeyRole, derive_video_keys, encode_hex, issue_dynamic_token,
+        respond_to_client_hello, respond_to_client_hello_plaintext, verify_dynamic_token,
     },
     frame,
     ids::{BugReportId, FileTransferId, MessageId, RoomId, SessionId, StreamId, UserId},
     media::{self, MediaPayload},
+    recv::RecvBuffer,
     video::{self, VideoAck, VideoHello, VideoRole},
 };
 
@@ -67,9 +68,32 @@ const DEFAULT_ROOM: RoomId = RoomId(1);
 const POLL_TIMEOUT: Duration = Duration::from_millis(100);
 const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(20);
 const MAX_CLIENTS: usize = 1024;
-/// Capacity of the reusable per-client TCP read scratch buffer. Sized to
-/// swallow a full file chunk frame in one `read` on a fast link.
-const TCP_READ_BUFFER_BYTES: usize = 256 * 1024;
+/// Minimum spare capacity ensured before each direct read into a connection's
+/// receive buffer. The buffer grows past this on demand (a full file-chunk
+/// frame arrives in a couple of reads once its capacity has ramped), while
+/// connections that only exchange small control frames stay small.
+const TCP_READ_CHUNK_BYTES: usize = 64 * 1024;
+/// Cap on bytes read from one TCP connection per readiness pass, so one fast
+/// sender cannot monopolize the single-threaded loop or grow its `read_buf`
+/// without bound inside a single poll iteration. mio events are edge-triggered,
+/// so a connection cut off by the budget is queued for a re-read on the next
+/// loop pass rather than waiting for a new readiness event.
+const READ_BUDGET_BYTES: usize = 256 * 1024;
+/// A connection that has not finished classification, handshake, and auth
+/// within this bound is dropped; without it a socket that connects and sends
+/// nothing occupies one of the [`MAX_CLIENTS`] slots forever.
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+/// An established connection with no socket traffic for this long is dropped.
+/// The client has no TCP keepalive, but from the moment it authenticates it
+/// sends the server a UDP media ping every 5 s (`RTT_PROBE_INTERVAL` in
+/// `client_net.rs`) which refreshes its control connection's activity, so a
+/// healthy session never approaches this bound even when silent on TCP.
+const IDLE_TIMEOUT: Duration = Duration::from_secs(300);
+/// How long a gracefully closing connection may take to drain its final queued
+/// frames (an auth-rejection error) before it is force-closed; a rejected peer
+/// that stops reading must not pin its slot.
+const CLOSE_FLUSH_GRACE: Duration = Duration::from_secs(5);
+const IDLE_SWEEP_INTERVAL: Duration = Duration::from_secs(1);
 const MEDIA_SWEEP_INTERVAL: Duration = Duration::from_secs(30);
 const RTT_SNAPSHOT_INTERVAL: Duration = Duration::from_secs(5);
 const RTT_STALE_AFTER: Duration = Duration::from_secs(15);
@@ -90,6 +114,10 @@ const VIDEO_RING_MAX_BYTES: usize = 8 * 1024 * 1024;
 /// A subscriber whose queued bytes exceed this after a flush is too slow to keep
 /// up and is dropped. It reconnects and fast-starts from the latest keyframe.
 const VIDEO_SUBSCRIBER_HIGH_WATER: usize = 8 * 1024 * 1024;
+/// A control connection whose queued bytes exceed this after a flush is not
+/// draining its socket and is dropped, so a stalled file-relay recipient or a
+/// history-pipelining client cannot pin megabytes of server memory.
+const CONTROL_WRITE_HIGH_WATER: usize = 8 * 1024 * 1024;
 const AUDIO_POP_LOG_ENV: &str = "CHATT_AUDIO_POP_LOG";
 const AUDIO_POP_PACKET_FLAG_OPUS_RESET: u8 = 0x01;
 const AUDIO_POP_PACKET_FLAG_SILENCE_HINT: u8 = 0x02;
@@ -230,12 +258,13 @@ pub struct Server {
     server_key_pair: ring::signature::Ed25519KeyPair,
     next_media_sweep_at: Option<Instant>,
     next_rtt_snapshot_at: Instant,
+    next_idle_sweep_at: Instant,
+    /// Connections whose last read stopped at [`READ_BUDGET_BYTES`] with socket
+    /// data still buffered. mio readiness is edge-triggered, so these are
+    /// re-read on the next loop pass instead of waiting for a new event.
+    pending_reads: Vec<Token>,
     history_reader: HistoryReader,
     history_replies: mpsc::Receiver<HistoryReadReply>,
-    /// Persistent scratch the per-client TCP read loop reads into, allocated
-    /// once and reused so relaying bulk transfers does not allocate or zero a
-    /// fresh buffer per read.
-    read_scratch: Vec<u8>,
 }
 
 impl Server {
@@ -356,9 +385,10 @@ impl Server {
             server_key_pair,
             next_media_sweep_at: None,
             next_rtt_snapshot_at: Instant::now() + RTT_SNAPSHOT_INTERVAL,
+            next_idle_sweep_at: Instant::now() + IDLE_SWEEP_INTERVAL,
+            pending_reads: Vec::new(),
             history_reader,
             history_replies,
-            read_scratch: vec![0u8; TCP_READ_BUFFER_BYTES],
         })
     }
 
@@ -368,13 +398,19 @@ impl Server {
     ) -> Result<(), Box<dyn std::error::Error>> {
         let mut events = Events::with_capacity(256);
         loop {
-            if let Err(error) = self.poll.poll(&mut events, Some(POLL_TIMEOUT)) {
+            let timeout = if self.pending_reads.is_empty() {
+                POLL_TIMEOUT
+            } else {
+                Duration::ZERO
+            };
+            if let Err(error) = self.poll.poll(&mut events, Some(timeout)) {
                 if is_interrupted_io_error(&error) {
                     kvlog::warn!("server poll interrupted", error = %error);
                     continue;
                 }
                 return Err(error.into());
             }
+            let pending_reads = std::mem::take(&mut self.pending_reads);
             for event in events.iter() {
                 match event.token() {
                     LISTENER => self.accept_clients()?,
@@ -392,10 +428,14 @@ impl Server {
                     }
                 }
             }
+            for token in pending_reads {
+                self.read_client(token);
+            }
             self.drain_history_replies();
             self.handle_admin_commands(admin_rx);
             self.flush_disconnects();
             let now = Instant::now();
+            self.sweep_idle_connections(now);
             self.sweep_stale_media_keys(now);
             self.poll_room_rtt_snapshots(now);
         }
@@ -497,20 +537,23 @@ impl Server {
                 token,
                 Interest::READABLE | Interest::WRITABLE,
             )?;
+            let now = Instant::now();
             self.clients.insert(
                 token,
                 ClientConn {
                     socket,
                     addr,
-                    read_buf: Vec::new(),
-                    write_buf: Vec::new(),
+                    read_buf: RecvBuffer::new(),
+                    write_buf: WriteQueue::new(),
                     kind: ConnKind::Unidentified,
                     state: ConnState::AwaitClientHello,
                     control: None,
                     secrets: None,
                     session_id: None,
                     user_id: None,
-                    disconnect: false,
+                    close: Close::Open,
+                    created_at: now,
+                    last_activity: now,
                 },
             );
         }
@@ -518,17 +561,20 @@ impl Server {
 
     fn read_client(&mut self, token: Token) {
         let mut disconnected = false;
+        let mut budget_spent = 0usize;
         if let Some(client) = self.clients.get_mut(&token) {
-            let buf = &mut self.read_scratch;
             loop {
-                match client.socket.read(buf) {
+                match client.read_buf.fill(&client.socket, TCP_READ_CHUNK_BYTES) {
                     Ok(0) => {
                         kvlog::info!("tcp client closed", token = token.0);
                         disconnected = true;
                         break;
                     }
                     Ok(n) => {
-                        client.read_buf.extend_from_slice(&buf[..n]);
+                        budget_spent += n;
+                        if budget_spent >= READ_BUDGET_BYTES {
+                            break;
+                        }
                     }
                     Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
                     Err(error) => {
@@ -538,11 +584,17 @@ impl Server {
                     }
                 }
             }
+            if budget_spent > 0 {
+                client.last_activity = Instant::now();
+            }
         }
 
         if disconnected {
             self.disconnect(token);
             return;
+        }
+        if budget_spent >= READ_BUDGET_BYTES && !self.pending_reads.contains(&token) {
+            self.pending_reads.push(token);
         }
 
         // Classify a freshly accepted connection on its first bytes. A video
@@ -556,8 +608,8 @@ impl Server {
             if client.read_buf.len() < video::VIDEO_MAGIC.len() {
                 return;
             }
-            if client.read_buf.starts_with(&video::VIDEO_MAGIC) {
-                client.read_buf.drain(..video::VIDEO_MAGIC.len());
+            if client.read_buf.pending().starts_with(&video::VIDEO_MAGIC) {
+                client.read_buf.consume(video::VIDEO_MAGIC.len());
                 client.kind = ConnKind::Video(VideoConn::new());
                 kvlog::info!("video connection classified", token = token.0);
             } else {
@@ -574,54 +626,84 @@ impl Server {
         }
 
         loop {
-            let frame = match self.clients.get_mut(&token) {
-                Some(client) => match frame::pop_frame(&mut client.read_buf) {
-                    Ok(Some(frame)) => frame,
-                    Ok(None) => break,
-                    Err(error) => {
+            let Some(client) = self.clients.get_mut(&token) else {
+                return;
+            };
+            // A connection already being torn down (a rejected auth) gets no
+            // further frame processing; pipelined frames must not spend crypto
+            // or rate-limit work on its behalf.
+            if client.is_closing() {
+                return;
+            }
+            match control_conn_step(token, client) {
+                Ok(None) => return,
+                Ok(Some(ControlStep::Hello(hello))) => {
+                    if let Err(error) = self.handle_client_hello(token, hello) {
                         kvlog::warn!(
-                            "tcp client sent invalid frame",
+                            "tcp client protocol error",
                             token = token.0,
                             error = %error
                         );
                         self.disconnect(token);
-                        break;
+                        return;
                     }
-                },
-                None => break,
-            };
-
-            if let Err(error) = self.process_frame(token, frame) {
-                kvlog::warn!("tcp client protocol error", token = token.0, error = %error);
-                self.disconnect(token);
-                break;
+                }
+                Ok(Some(ControlStep::Control(control))) => {
+                    if let Err(error) = self.handle_control(token, control) {
+                        kvlog::warn!(
+                            "tcp client protocol error",
+                            token = token.0,
+                            error = %error
+                        );
+                        self.disconnect(token);
+                        return;
+                    }
+                }
+                Err(error) => {
+                    kvlog::warn!("tcp client protocol error", token = token.0, error = %error);
+                    self.disconnect(token);
+                    return;
+                }
             }
         }
     }
 
     fn read_video_conn(&mut self, token: Token) {
         loop {
-            let record = match self.clients.get_mut(&token) {
-                Some(client) => match video::pop_record(&mut client.read_buf) {
-                    Ok(Some(record)) => record,
-                    Ok(None) => break,
-                    Err(error) => {
+            let Some(client) = self.clients.get_mut(&token) else {
+                return;
+            };
+            if client.is_closing() {
+                return;
+            }
+            match video_conn_step(client) {
+                Ok(None) => return,
+                Ok(Some(VideoStep::Handshake(record))) => {
+                    if let Err(error) = self.process_video_record(token, record) {
                         kvlog::warn!(
-                            "video connection sent invalid record",
+                            "video connection protocol error",
                             token = token.0,
                             error = %error
                         );
                         self.disconnect(token);
-                        break;
+                        return;
                     }
-                },
-                None => break,
-            };
-
-            if let Err(error) = self.process_video_record(token, record) {
-                kvlog::warn!("video connection protocol error", token = token.0, error = %error);
-                self.disconnect(token);
-                break;
+                }
+                Ok(Some(VideoStep::Publish {
+                    stream_id,
+                    frame,
+                    is_key,
+                })) => self.publish_video_frame(stream_id, frame, is_key),
+                Ok(Some(VideoStep::SubscriberChatter)) => {}
+                Err(error) => {
+                    kvlog::warn!(
+                        "video connection protocol error",
+                        token = token.0,
+                        error = %error
+                    );
+                    self.disconnect(token);
+                    return;
+                }
             }
         }
     }
@@ -634,7 +716,9 @@ impl Server {
         match phase {
             VideoPhase::AwaitHello => self.handle_video_hello(token, &record),
             VideoPhase::AwaitAuth => self.handle_video_auth(token, &record),
-            VideoPhase::Streaming => self.handle_video_stream_record(token, record),
+            VideoPhase::Streaming => {
+                Err("streaming record on a handshaking connection".to_string())
+            }
         }
     }
 
@@ -716,7 +800,8 @@ impl Server {
         let stream_id = video
             .stream_id
             .ok_or_else(|| "video auth before hello".to_string())?;
-        video::write_record(&mut client.write_buf, &sealed).map_err(|error| error.to_string())?;
+        video::write_record(client.write_buf.tail_mut(), &sealed)
+            .map_err(|error| error.to_string())?;
         self.write_client(token);
         match role {
             VideoRole::Publisher => self.attach_publisher(token, stream_id),
@@ -778,8 +863,9 @@ impl Server {
         Ok(())
     }
 
-    /// Seals one inner frame for a single subscriber and queues it, then flushes.
-    /// Returns whether the subscriber's queue stayed under the high-water mark.
+    /// Seals one inner frame for a single subscriber directly into its write
+    /// queue (no intermediate frame allocation) and flushes. Returns whether
+    /// the subscriber's queue stayed under the high-water mark.
     fn seal_video_to_subscriber(&mut self, token: Token, data: &[u8]) -> Result<bool, String> {
         {
             let client = self
@@ -793,11 +879,16 @@ impl Server {
                 .cipher
                 .as_mut()
                 .ok_or_else(|| "subscriber missing cipher".to_string())?;
-            let sealed = cipher
-                .seal_next(CHANNEL_VIDEO, data)
-                .map_err(|error| error.to_string())?;
-            video::write_record(&mut client.write_buf, &sealed)
-                .map_err(|error| error.to_string())?;
+            let sealed_len = TRANSPORT_HEADER_LEN + data.len() + TAG_LEN;
+            if sealed_len > video::MAX_VIDEO_FRAME_LEN {
+                return Err("sealed video record exceeds maximum length".to_string());
+            }
+            let out = client.write_buf.tail_mut();
+            out.extend_from_slice(&(sealed_len as u32).to_le_bytes());
+            if let Err(error) = cipher.seal_next_into(CHANNEL_VIDEO, data, out) {
+                out.truncate(out.len() - video::VIDEO_LENGTH_PREFIX_LEN);
+                return Err(error.to_string());
+            }
         }
         self.write_client(token);
         let within = self
@@ -806,44 +897,6 @@ impl Server {
             .map(|client| subscriber_within_limit(client.write_buf.len()))
             .unwrap_or(false);
         Ok(within)
-    }
-
-    fn handle_video_stream_record(&mut self, token: Token, record: Vec<u8>) -> Result<(), String> {
-        let (role, stream_id, plaintext) = {
-            let client = self
-                .clients
-                .get_mut(&token)
-                .ok_or_else(|| "unknown client token".to_string())?;
-            let ConnKind::Video(video) = &mut client.kind else {
-                return Err("stream record on a non-video connection".to_string());
-            };
-            let role = video
-                .role
-                .ok_or_else(|| "stream before hello".to_string())?;
-            let stream_id = video
-                .stream_id
-                .ok_or_else(|| "stream before hello".to_string())?;
-            let cipher = video
-                .cipher
-                .as_mut()
-                .ok_or_else(|| "stream before auth".to_string())?;
-            let plaintext = cipher
-                .open_next(CHANNEL_VIDEO, &record)
-                .map_err(|error| error.to_string())?;
-            (role, stream_id, plaintext)
-        };
-        match role {
-            VideoRole::Publisher => {
-                if plaintext.len() < video::VIDEO_FRAME_HEADER_LEN {
-                    return Err("video frame is shorter than its header".to_string());
-                }
-                let is_key = plaintext[12] == 1;
-                self.publish_video_frame(stream_id, Arc::from(plaintext), is_key);
-                Ok(())
-            }
-            // A subscriber sends nothing after authenticating.
-            VideoRole::Subscriber => Ok(()),
-        }
     }
 
     /// Caches one published frame and fans it out to every subscriber. On a
@@ -1149,93 +1202,53 @@ impl Server {
         }
     }
 
-    fn process_frame(&mut self, token: Token, frame_bytes: Vec<u8>) -> Result<(), String> {
-        let state = self
-            .clients
-            .get(&token)
-            .map(|client| client.state)
-            .ok_or_else(|| "unknown client token".to_string())?;
-
+    fn handle_client_hello(
+        &mut self,
+        token: Token,
+        hello: control::ClientHello,
+    ) -> Result<(), String> {
         kvlog::info!(
-            "tcp frame processing",
+            "client hello decoded",
             token = token.0,
-            state = conn_state_name(state),
-            size = frame_bytes.len()
+            client_nonce_size = hello.client_nonce.len(),
+            client_ephemeral_size = hello.client_ephemeral.len()
         );
-        match state {
-            ConnState::AwaitClientHello => {
-                let hello = decode_client_hello(&frame_bytes)?;
-                kvlog::info!(
-                    "client hello decoded",
-                    token = token.0,
-                    client_nonce_size = hello.client_nonce.len(),
-                    client_ephemeral_size = hello.client_ephemeral.len()
-                );
-                let encryption = self.config.security.encryption;
-                let (server_hello, control, secrets) = if encryption {
-                    let response =
-                        respond_to_client_hello(&self.rng, &self.server_key_pair, &hello)
-                            .map_err(|error| error.to_string())?;
-                    (
-                        response.hello,
-                        ControlTransport::encrypted(
-                            response.secrets.control_send.clone(),
-                            response.secrets.control_recv.clone(),
-                        ),
-                        Some(response.secrets),
-                    )
-                } else {
-                    let response =
-                        respond_to_client_hello_plaintext(&self.rng, &self.server_key_pair, &hello)
-                            .map_err(|error| error.to_string())?;
-                    (response.hello, ControlTransport::plaintext(), None)
-                };
-                let encoded = encode_server_hello(&server_hello);
-                let client = self
-                    .clients
-                    .get_mut(&token)
-                    .ok_or_else(|| "unknown client token".to_string())?;
-                frame::encode_frame(&encoded, &mut client.write_buf)
+        let encryption = self.config.security.encryption;
+        let (server_hello, control, secrets) = if encryption {
+            let response = respond_to_client_hello(&self.rng, &self.server_key_pair, &hello)
+                .map_err(|error| error.to_string())?;
+            (
+                response.hello,
+                ControlTransport::encrypted(
+                    response.secrets.control_send.clone(),
+                    response.secrets.control_recv.clone(),
+                ),
+                Some(response.secrets),
+            )
+        } else {
+            let response =
+                respond_to_client_hello_plaintext(&self.rng, &self.server_key_pair, &hello)
                     .map_err(|error| error.to_string())?;
-                client.control = Some(control);
-                client.secrets = secrets;
-                client.state = ConnState::AwaitAuth;
-                kvlog::info!(
-                    "client handshake completed",
-                    token = token.0,
-                    queued_bytes = client.write_buf.len(),
-                    encryption
-                );
-                self.write_client(token);
-                Ok(())
-            }
-            ConnState::AwaitAuth | ConnState::Ready => {
-                let plaintext = {
-                    let client = self
-                        .clients
-                        .get_mut(&token)
-                        .ok_or_else(|| "unknown client token".to_string())?;
-                    client
-                        .control
-                        .as_mut()
-                        .ok_or_else(|| "missing control cipher".to_string())?
-                        .open_next(CHANNEL_CONTROL, &frame_bytes)
-                        .map_err(|error| error.to_string())?
-                };
-                kvlog::info!(
-                    "client control decrypted",
-                    token = token.0,
-                    payload_size = plaintext.len()
-                );
-                let control = decode_client_control(&plaintext)?;
-                kvlog::info!(
-                    "client control decoded",
-                    token = token.0,
-                    kind = client_control_kind(&control)
-                );
-                self.handle_control(token, control)
-            }
-        }
+            (response.hello, ControlTransport::plaintext(), None)
+        };
+        let encoded = encode_server_hello(&server_hello);
+        let client = self
+            .clients
+            .get_mut(&token)
+            .ok_or_else(|| "unknown client token".to_string())?;
+        frame::encode_frame(&encoded, client.write_buf.tail_mut())
+            .map_err(|error| error.to_string())?;
+        client.control = Some(control);
+        client.secrets = secrets;
+        client.state = ConnState::AwaitAuth;
+        kvlog::info!(
+            "client handshake completed",
+            token = token.0,
+            queued_bytes = client.write_buf.len(),
+            encryption
+        );
+        self.write_client(token);
+        Ok(())
     }
 
     fn handle_control(&mut self, token: Token, control: ClientControl) -> Result<(), String> {
@@ -1885,7 +1898,7 @@ impl Server {
     fn reject_auth(&mut self, token: Token, code: u16, message: String) -> Result<(), String> {
         self.send_control_to_token(token, &ServerControl::Error { code, message })?;
         if let Some(client) = self.clients.get_mut(&token) {
-            client.disconnect = true;
+            client.begin_graceful_close(Instant::now());
         }
         self.write_client(token);
         Ok(())
@@ -3244,6 +3257,16 @@ impl Server {
             (session_id, payload, udp_addr_changed)
         };
 
+        // Authenticated media traffic proves the session is alive: the client
+        // has no TCP keepalive but pings over UDP every few seconds, so this
+        // is what keeps a healthy-but-silent control connection from being
+        // reaped by the idle sweep.
+        if let Some(session) = self.sessions.get(&session_id)
+            && let Some(client) = self.clients.get_mut(&session.tcp_token)
+        {
+            client.last_activity = Instant::now();
+        }
+
         match payload {
             MediaPayload::Bind { session_id: bound } => {
                 if bound != session_id {
@@ -3560,23 +3583,46 @@ impl Server {
             .clients
             .get_mut(&token)
             .ok_or_else(|| "unknown client token".to_string())?;
-        let encrypted = client
+        let transport = client
             .control
             .as_mut()
-            .ok_or_else(|| "missing control cipher".to_string())?
-            .seal_next(CHANNEL_CONTROL, payload)
-            .map_err(|error| error.to_string())?;
-        frame::encode_frame(&encrypted, &mut client.write_buf)
-            .map_err(|error| error.to_string())?;
+            .ok_or_else(|| "missing control cipher".to_string())?;
+        let sealed_len = transport.sealed_len(payload.len());
+        if sealed_len > frame::MAX_FRAME_LEN {
+            return Err(format!("{kind} exceeds frame limit"));
+        }
+        let out = client.write_buf.tail_mut();
+        out.extend_from_slice(&(sealed_len as u32).to_le_bytes());
+        if let Err(error) = transport.seal_next_into(CHANNEL_CONTROL, payload, out) {
+            out.truncate(out.len() - frame::LENGTH_PREFIX_LEN);
+            return Err(error.to_string());
+        }
         kvlog::debug!(
             "server control queued",
             token = token.0,
             kind = kind,
             payload_size = payload.len(),
-            encrypted_size = encrypted.len(),
+            encrypted_size = sealed_len,
             queued_bytes = client.write_buf.len()
         );
         self.write_client(token);
+        // The flush above wrote as much as the socket accepted; what remains
+        // is bounded by the peer draining its end. A control client past the
+        // high-water mark is dropped rather than buffered further, the same
+        // treatment `publish_video_frame` gives a stalled video subscriber.
+        let over_water = self
+            .clients
+            .get(&token)
+            .is_some_and(|client| client.write_buf.len() > CONTROL_WRITE_HIGH_WATER);
+        if over_water {
+            kvlog::warn!(
+                "control client dropped for backpressure",
+                token = token.0,
+                kind
+            );
+            self.disconnect(token);
+            return Err("control write buffer overflow".to_string());
+        }
         Ok(())
     }
 
@@ -3621,11 +3667,13 @@ impl Server {
     fn write_client(&mut self, token: Token) {
         let mut disconnected = false;
         if let Some(client) = self.clients.get_mut(&token) {
+            let mut wrote = false;
             while !client.write_buf.is_empty() {
-                match client.socket.write(&client.write_buf) {
+                match client.socket.write(client.write_buf.pending()) {
                     Ok(0) => break,
                     Ok(n) => {
-                        client.write_buf.drain(..n);
+                        client.write_buf.consume(n);
+                        wrote = true;
                         kvlog::debug!(
                             "tcp client bytes written",
                             token = token.0,
@@ -3641,7 +3689,10 @@ impl Server {
                     }
                 }
             }
-            if client.disconnect && client.write_buf.is_empty() {
+            if wrote {
+                client.last_activity = Instant::now();
+            }
+            if client.is_closing() && client.write_buf.is_empty() {
                 disconnected = true;
             }
         }
@@ -3650,15 +3701,51 @@ impl Server {
         }
     }
 
+    /// Closes connections marked for a graceful teardown once their queued
+    /// frames drained, or force-closes them at their drain deadline so a peer
+    /// that stops reading cannot pin the slot.
     fn flush_disconnects(&mut self) {
-        let tokens = self
-            .clients
-            .iter()
-            .filter_map(|(token, client)| {
-                (client.disconnect && client.write_buf.is_empty()).then_some(*token)
-            })
-            .collect::<Vec<_>>();
-        for token in tokens {
+        let now = Instant::now();
+        let mut expired = Vec::new();
+        for (token, client) in &self.clients {
+            let Close::Draining { deadline } = client.close else {
+                continue;
+            };
+            if client.write_buf.is_empty() || now >= deadline {
+                expired.push(*token);
+            }
+        }
+        for token in expired {
+            self.disconnect(token);
+        }
+    }
+
+    /// Drops connections past their applicable deadline: [`HANDSHAKE_TIMEOUT`]
+    /// from creation while classification/handshake/auth is incomplete, and
+    /// [`IDLE_TIMEOUT`] without socket or session-UDP traffic once established.
+    /// Runs off the poll timeout, so idle sockets are reaped without traffic.
+    fn sweep_idle_connections(&mut self, now: Instant) {
+        if now < self.next_idle_sweep_at {
+            return;
+        }
+        self.next_idle_sweep_at = now + IDLE_SWEEP_INTERVAL;
+        let mut expired = Vec::new();
+        for (token, client) in &self.clients {
+            // Draining connections are already being torn down on their own
+            // deadline in `flush_disconnects`.
+            if client.is_closing() {
+                continue;
+            }
+            if client.setup_complete() {
+                if now.saturating_duration_since(client.last_activity) > IDLE_TIMEOUT {
+                    expired.push((*token, "idle"));
+                }
+            } else if now.saturating_duration_since(client.created_at) > HANDSHAKE_TIMEOUT {
+                expired.push((*token, "handshake"));
+            }
+        }
+        for (token, reason) in expired {
+            kvlog::warn!("tcp connection timed out", token = token.0, reason);
             self.disconnect(token);
         }
     }
@@ -4040,15 +4127,231 @@ enum ConnState {
 struct ClientConn {
     socket: TcpStream,
     addr: SocketAddr,
-    read_buf: Vec<u8>,
-    write_buf: Vec<u8>,
+    read_buf: RecvBuffer,
+    write_buf: WriteQueue,
     kind: ConnKind,
     state: ConnState,
     control: Option<ControlTransport>,
     secrets: Option<SessionSecrets>,
     session_id: Option<SessionId>,
     user_id: Option<UserId>,
-    disconnect: bool,
+    close: Close,
+    created_at: Instant,
+    last_activity: Instant,
+}
+
+impl ClientConn {
+    /// Marks the connection for a graceful close: queued frames flush before
+    /// the socket drops, force-closed at the deadline if the peer stops
+    /// reading. A connection already closing keeps its original deadline.
+    fn begin_graceful_close(&mut self, now: Instant) {
+        if matches!(self.close, Close::Open) {
+            self.close = Close::Draining {
+                deadline: now + CLOSE_FLUSH_GRACE,
+            };
+        }
+    }
+
+    fn is_closing(&self) -> bool {
+        !matches!(self.close, Close::Open)
+    }
+
+    /// Whether classification, handshake, and auth have all completed.
+    /// Connections still setting up are bounded by [`HANDSHAKE_TIMEOUT`],
+    /// established ones by [`IDLE_TIMEOUT`].
+    fn setup_complete(&self) -> bool {
+        match &self.kind {
+            ConnKind::Unidentified => false,
+            ConnKind::Control => self.state == ConnState::Ready,
+            ConnKind::Video(video) => video.phase == VideoPhase::Streaming,
+        }
+    }
+}
+
+/// Teardown intent for a connection. `Draining` flushes the queued frames (an
+/// auth-rejection error) before the socket drops, but only until `deadline`,
+/// so a peer that stops reading cannot pin its slot. Timeouts and backpressure
+/// breaches skip this and disconnect immediately.
+#[derive(Clone, Copy)]
+enum Close {
+    Open,
+    Draining { deadline: Instant },
+}
+
+/// Threshold above which [`WriteQueue::consume`] compacts the consumed prefix
+/// away. Compaction additionally requires the prefix to be at least half the
+/// buffer, keeping the memmove amortized against the bytes already written.
+const WRITE_QUEUE_COMPACT_BYTES: usize = 64 * 1024;
+
+/// Outbound byte queue drained from the front through a cursor rather than
+/// `Vec::drain`, so a partial socket write against a deep backlog (an 8 MiB
+/// video queue) does not memmove the remaining megabytes on every write.
+struct WriteQueue {
+    buf: Vec<u8>,
+    start: usize,
+}
+
+impl WriteQueue {
+    fn new() -> Self {
+        Self {
+            buf: Vec::new(),
+            start: 0,
+        }
+    }
+
+    /// Bytes queued but not yet written.
+    fn pending(&self) -> &[u8] {
+        &self.buf[self.start..]
+    }
+
+    fn len(&self) -> usize {
+        self.buf.len() - self.start
+    }
+
+    fn is_empty(&self) -> bool {
+        self.start == self.buf.len()
+    }
+
+    /// The backing vector, for encoders that append to a `Vec`. Only appends
+    /// are valid; bytes before the cursor are dead.
+    fn tail_mut(&mut self) -> &mut Vec<u8> {
+        &mut self.buf
+    }
+
+    /// Marks the next `n` pending bytes written, compacting the dead prefix
+    /// once it is both large and the majority of the buffer.
+    fn consume(&mut self, n: usize) {
+        self.start += n;
+        debug_assert!(self.start <= self.buf.len());
+        if self.start == self.buf.len() {
+            self.buf.clear();
+            self.start = 0;
+        } else if self.start >= WRITE_QUEUE_COMPACT_BYTES && self.start >= self.len() {
+            self.buf.drain(..self.start);
+            self.start = 0;
+        }
+    }
+}
+
+/// One inbound control-channel frame, parsed and decrypted in place in the
+/// connection's receive buffer by [`control_conn_step`].
+enum ControlStep {
+    Hello(control::ClientHello),
+    Control(ClientControl),
+}
+
+/// Parses, decrypts (in place), and decodes the next control frame buffered on
+/// `client`, consuming it from the receive buffer. Returns `None` when no
+/// whole frame is buffered yet.
+fn control_conn_step(token: Token, client: &mut ClientConn) -> Result<Option<ControlStep>, String> {
+    let total = match frame::parse_frame(client.read_buf.pending()) {
+        Ok(Some((_, total))) => total,
+        Ok(None) => return Ok(None),
+        Err(error) => return Err(format!("invalid frame: {error}")),
+    };
+    kvlog::info!(
+        "tcp frame processing",
+        token = token.0,
+        state = conn_state_name(client.state),
+        size = total
+    );
+    match client.state {
+        ConnState::AwaitClientHello => {
+            let frame = &client.read_buf.pending()[frame::LENGTH_PREFIX_LEN..total];
+            let hello = decode_client_hello(frame)?;
+            client.read_buf.consume(total);
+            Ok(Some(ControlStep::Hello(hello)))
+        }
+        ConnState::AwaitAuth | ConnState::Ready => {
+            let transport = client
+                .control
+                .as_mut()
+                .ok_or_else(|| "missing control cipher".to_string())?;
+            let frame = &mut client.read_buf.pending_mut()[frame::LENGTH_PREFIX_LEN..total];
+            let plaintext = transport
+                .open_next_in_place(CHANNEL_CONTROL, frame)
+                .map_err(|error| error.to_string())?;
+            kvlog::info!(
+                "client control decrypted",
+                token = token.0,
+                payload_size = plaintext.len()
+            );
+            let control = decode_client_control(plaintext)?;
+            kvlog::info!(
+                "client control decoded",
+                token = token.0,
+                kind = client_control_kind(&control)
+            );
+            client.read_buf.consume(total);
+            Ok(Some(ControlStep::Control(control)))
+        }
+    }
+}
+
+/// One inbound video-connection record, extracted from the receive buffer by
+/// [`video_conn_step`].
+enum VideoStep {
+    Handshake(Vec<u8>),
+    Publish {
+        stream_id: StreamId,
+        frame: Arc<[u8]>,
+        is_key: bool,
+    },
+    SubscriberChatter,
+}
+
+/// Extracts the next video record buffered on `client`. Handshake records are
+/// small and copied out; streaming records decrypt in place in the receive
+/// buffer, so a published frame's only copy is into the shared ring [`Arc`].
+/// Returns `None` when no whole record is buffered yet.
+fn video_conn_step(client: &mut ClientConn) -> Result<Option<VideoStep>, String> {
+    let total = match video::parse_record(client.read_buf.pending()) {
+        Ok(Some((_, total))) => total,
+        Ok(None) => return Ok(None),
+        Err(error) => return Err(format!("invalid record: {error}")),
+    };
+    let ConnKind::Video(video) = &mut client.kind else {
+        return Err("record on a non-video connection".to_string());
+    };
+    match video.phase {
+        VideoPhase::AwaitHello | VideoPhase::AwaitAuth => {
+            let record = client.read_buf.pending()[video::VIDEO_LENGTH_PREFIX_LEN..total].to_vec();
+            client.read_buf.consume(total);
+            Ok(Some(VideoStep::Handshake(record)))
+        }
+        VideoPhase::Streaming => {
+            let role = video
+                .role
+                .ok_or_else(|| "stream before hello".to_string())?;
+            let stream_id = video
+                .stream_id
+                .ok_or_else(|| "stream before hello".to_string())?;
+            let cipher = video
+                .cipher
+                .as_mut()
+                .ok_or_else(|| "stream before auth".to_string())?;
+            let record = &mut client.read_buf.pending_mut()[video::VIDEO_LENGTH_PREFIX_LEN..total];
+            let plaintext = cipher
+                .open_next_in_place(CHANNEL_VIDEO, record)
+                .map_err(|error| error.to_string())?;
+            let step = match role {
+                VideoRole::Publisher => {
+                    if plaintext.len() < video::VIDEO_FRAME_HEADER_LEN {
+                        return Err("video frame is shorter than its header".to_string());
+                    }
+                    VideoStep::Publish {
+                        stream_id,
+                        frame: Arc::from(plaintext),
+                        is_key: plaintext[12] == 1,
+                    }
+                }
+                // A subscriber sends nothing after authenticating.
+                VideoRole::Subscriber => VideoStep::SubscriberChatter,
+            };
+            client.read_buf.consume(total);
+            Ok(Some(step))
+        }
+    }
 }
 
 /// How a TCP connection has been classified on its first read.
@@ -4602,6 +4905,7 @@ fn server_control_kind(control: &ServerControl) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Read;
 
     #[test]
     fn write_bug_report_creates_paired_files() {
@@ -5826,6 +6130,223 @@ mod tests {
     }
 
     #[test]
+    fn write_queue_consumes_through_cursor_and_compacts() {
+        let mut queue = WriteQueue::new();
+        queue.tail_mut().extend_from_slice(b"abcdef");
+        queue.consume(2);
+        assert_eq!(queue.pending(), b"cdef");
+        queue.tail_mut().extend_from_slice(b"gh");
+        assert_eq!(queue.pending(), b"cdefgh");
+        queue.consume(6);
+        assert!(queue.is_empty());
+
+        let mut queue = WriteQueue::new();
+        queue
+            .tail_mut()
+            .extend_from_slice(&vec![7u8; WRITE_QUEUE_COMPACT_BYTES + 16]);
+        queue.consume(WRITE_QUEUE_COMPACT_BYTES);
+        assert_eq!(queue.pending(), &[7u8; 16]);
+        assert_eq!(queue.start, 0);
+    }
+
+    #[test]
+    fn sweep_drops_stale_handshake_but_keeps_active_connection() {
+        let mut server = test_server();
+        let now = Instant::now();
+        server.next_idle_sweep_at = now;
+
+        let (mut stale, _stale_peer) = test_live_client();
+        stale.kind = ConnKind::Unidentified;
+        stale.state = ConnState::AwaitClientHello;
+        stale.created_at = now - HANDSHAKE_TIMEOUT - Duration::from_secs(1);
+        server.clients.insert(Token(5), stale);
+
+        let (active, _active_peer) = test_live_client();
+        server.clients.insert(Token(6), active);
+
+        server.sweep_idle_connections(now);
+
+        assert!(!server.clients.contains_key(&Token(5)));
+        assert!(server.clients.contains_key(&Token(6)));
+    }
+
+    #[test]
+    fn sweep_drops_ready_connection_idle_past_timeout() {
+        let mut server = test_server();
+        let now = Instant::now();
+        server.next_idle_sweep_at = now;
+
+        let (mut idle, _peer) = test_live_client();
+        idle.last_activity = now - IDLE_TIMEOUT - Duration::from_secs(1);
+        server.clients.insert(Token(5), idle);
+
+        server.sweep_idle_connections(now);
+
+        assert!(server.clients.is_empty());
+    }
+
+    #[test]
+    fn overflowed_control_write_buffer_disconnects_client() {
+        let mut server = test_server();
+        let token = Token(5);
+        let (mut conn, _peer) = test_live_client();
+        // Twice the high-water mark: the flush inside the queue call moves at
+        // most the kernel socket buffer's worth, so the remainder stays over
+        // the limit with the peer not reading.
+        conn.write_buf
+            .tail_mut()
+            .extend_from_slice(&vec![0u8; 2 * CONTROL_WRITE_HIGH_WATER]);
+        server.clients.insert(token, conn);
+
+        let result = server.queue_control_payload_to_token(token, "test", b"x");
+
+        assert!(result.is_err());
+        assert!(server.clients.is_empty());
+    }
+
+    #[test]
+    fn graceful_close_force_drops_after_flush_deadline() {
+        let mut server = test_server();
+        let now = Instant::now();
+
+        let (mut expired, _expired_peer) = test_live_client();
+        expired
+            .write_buf
+            .tail_mut()
+            .extend_from_slice(b"undelivered");
+        expired.close = Close::Draining {
+            deadline: now - Duration::from_secs(1),
+        };
+        server.clients.insert(Token(5), expired);
+
+        let (mut draining, _draining_peer) = test_live_client();
+        draining
+            .write_buf
+            .tail_mut()
+            .extend_from_slice(b"undelivered");
+        draining.close = Close::Draining {
+            deadline: now + Duration::from_secs(60),
+        };
+        server.clients.insert(Token(6), draining);
+
+        server.flush_disconnects();
+
+        assert!(!server.clients.contains_key(&Token(5)));
+        assert!(server.clients.contains_key(&Token(6)));
+    }
+
+    #[test]
+    fn frames_behind_a_closing_connection_are_not_processed() {
+        let mut server = test_server();
+        let token = Token(5);
+        let (mut conn, mut peer) = test_live_client();
+        conn.state = ConnState::AwaitAuth;
+        conn.close = Close::Draining {
+            deadline: Instant::now() + Duration::from_secs(60),
+        };
+        server.clients.insert(token, conn);
+
+        let mut pipelined = Vec::new();
+        frame::encode_frame(b"never-processed", &mut pipelined).expect("encode frame");
+        peer.write_all(&pipelined).expect("write pipelined frame");
+
+        // Nonblocking loopback: retry until the written bytes are readable.
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            server.read_client(token);
+            let buffered = server.clients.get(&token).expect("still draining");
+            if buffered.read_buf.len() >= pipelined.len() || Instant::now() > deadline {
+                break;
+            }
+        }
+
+        let client = server.clients.get(&token).expect("still draining");
+        assert_eq!(client.read_buf.len(), pipelined.len());
+        assert!(client.write_buf.is_empty());
+    }
+
+    #[test]
+    fn pipelined_control_frames_process_from_one_read() {
+        let mut server = test_server();
+        let token = Token(11);
+        let session_id = SessionId(1);
+        let (mut conn, mut peer) = test_live_client();
+        conn.session_id = Some(session_id);
+        server.clients.insert(token, conn);
+        server
+            .sessions
+            .insert(session_id, test_session(UserId(9), token, None));
+
+        let mut pipelined = Vec::new();
+        for muted in [true, false, true] {
+            let control = ClientControl::SetVoiceStatus {
+                status: control::ParticipantVoiceStatus {
+                    muted,
+                    deafened: false,
+                },
+            };
+            let payload =
+                rpc::control::encode_client_control(&control).expect("encode client control");
+            frame::encode_frame(&payload, &mut pipelined).expect("encode frame");
+        }
+        peer.write_all(&pipelined).expect("write pipelined frames");
+
+        // Nonblocking loopback: retry until the written bytes are readable.
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            server.read_client(token);
+            let muted = server
+                .sessions
+                .get(&session_id)
+                .expect("session exists")
+                .voice_status
+                .muted;
+            if muted || Instant::now() > deadline {
+                break;
+            }
+        }
+
+        let session = server.sessions.get(&session_id).expect("session exists");
+        assert!(session.voice_status.muted);
+        let client = server.clients.get(&token).expect("client still connected");
+        assert!(client.read_buf.is_empty());
+    }
+
+    #[test]
+    fn partial_writes_reassemble_byte_for_byte() {
+        let mut server = test_server();
+        let token = Token(5);
+        let (mut conn, mut peer) = test_live_client();
+        let payload: Vec<u8> = (0..1024 * 1024u32).map(|index| index as u8).collect();
+        conn.write_buf.tail_mut().extend_from_slice(&payload);
+        server.clients.insert(token, conn);
+        peer.set_read_timeout(Some(Duration::from_millis(200)))
+            .expect("set read timeout");
+
+        let mut received = Vec::new();
+        let mut chunk = vec![0u8; 64 * 1024];
+        while received.len() < payload.len() {
+            server.write_client(token);
+            match peer.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(read) => received.extend_from_slice(&chunk[..read]),
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+                Err(error) => panic!("peer read failed: {error}"),
+            }
+        }
+
+        assert_eq!(received, payload);
+        assert!(
+            server
+                .clients
+                .get(&token)
+                .expect("client still connected")
+                .write_buf
+                .is_empty()
+        );
+    }
+
+    #[test]
     fn publish_video_frame_resets_ring_on_keyframe() {
         let mut server = test_server();
         let stream_id = StreamId(1);
@@ -6452,19 +6973,25 @@ mod tests {
         let addr = listener.local_addr().expect("local addr");
         let client = std::net::TcpStream::connect(addr).expect("connect loopback");
         let client_addr = client.local_addr().expect("client addr");
+        // The production socket is nonblocking under mio; tests exercising the
+        // read/write paths rely on the same would-block semantics.
+        client.set_nonblocking(true).expect("set nonblocking");
         let (peer, _) = listener.accept().expect("accept loopback");
+        let now = Instant::now();
         let conn = ClientConn {
             socket: TcpStream::from_std(client),
             addr: client_addr,
-            read_buf: Vec::new(),
-            write_buf: Vec::new(),
+            read_buf: RecvBuffer::new(),
+            write_buf: WriteQueue::new(),
             kind: ConnKind::Control,
             state: ConnState::Ready,
             control: Some(ControlTransport::plaintext()),
             secrets: None,
             session_id: None,
             user_id: None,
-            disconnect: false,
+            close: Close::Open,
+            created_at: now,
+            last_activity: now,
         };
         (conn, peer)
     }

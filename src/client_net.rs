@@ -44,6 +44,7 @@ use rpc::{
     frame, history,
     ids::{BugReportId, FileTransferId, MessageId, RoomId, SessionId, StreamId, UserId},
     media::{self, MediaPayload, VoicePayload as MediaVoicePayload},
+    recv::RecvBuffer,
 };
 
 use crate::app::EventSender;
@@ -106,9 +107,9 @@ const MAX_FILE_WIRE_BYTES_PER_TICK: usize = 1024 * 1024;
 const MAX_FILE_DECODED_BYTES_PER_TICK: usize = 1024 * 1024;
 const MAX_SERVER_CONTROLS_PER_FILE_PUMP: usize = 8;
 const MAX_BUFFERED_SERVER_BYTES: usize = 2 * 1024 * 1024;
-/// Capacity of the reusable TCP read scratch buffer. Sized to swallow a full
-/// file chunk frame in one `read` on a fast link.
-const TCP_READ_BUFFER_BYTES: usize = 256 * 1024;
+/// Minimum spare capacity ensured before each direct read into the TCP receive
+/// buffer; the buffer grows past this on demand during bulk transfers.
+const TCP_READ_CHUNK_BYTES: usize = 64 * 1024;
 /// Byte step between [`NetworkEvent::TransferProgress`] ticks. Small enough for a
 /// smooth progress bar, coarse enough to keep the event channel and web feed from
 /// flooding on a fast transfer. First and final ticks are always emitted.
@@ -819,9 +820,8 @@ fn run_worker_inner(
         udp_local_addr,
         server_udp_addr,
         server_udp_probe_addr,
-        read_buf: Vec::new(),
+        read_buf: RecvBuffer::new(),
         write_buf: Vec::new(),
-        read_scratch: vec![0u8; TCP_READ_BUFFER_BYTES],
         media_packet: Vec::new(),
         media_scratch: Vec::new(),
         p2p_routes: Vec::new(),
@@ -1349,11 +1349,8 @@ struct WorkerState {
     tcp: TcpStream,
     udp: UdpSocket,
     udp_local_addr: SocketAddr,
-    read_buf: Vec<u8>,
+    read_buf: RecvBuffer,
     write_buf: Vec<u8>,
-    /// Persistent scratch the TCP read loop reads into, allocated once and
-    /// reused so bulk transfers do not allocate or zero a fresh buffer per read.
-    read_scratch: Vec<u8>,
     /// Reusable buffers for the outbound media seal path, cleared on each use so
     /// the per-frame voice send does not allocate. `media_packet` holds the UDP
     /// datagram, `media_scratch` the encoded plaintext, and `p2p_routes` the
@@ -2247,18 +2244,17 @@ impl WorkerState {
 
     fn read_tcp(&mut self) -> Result<(), String> {
         while self.read_buf.len() < MAX_BUFFERED_SERVER_BYTES {
-            match self.tcp.read(&mut self.read_scratch) {
+            match self.read_buf.fill(&self.tcp, TCP_READ_CHUNK_BYTES) {
                 Ok(0) => {
                     kvlog::info!("tcp server closed connection");
                     self.shutdown = true;
                     self.disconnect_reason = Some("server closed connection".to_string());
                     break;
                 }
-                Ok(n) => {
-                    self.read_buf.extend_from_slice(&self.read_scratch[..n]);
+                Ok(_read) => {
                     kvlog::debug!(
                         "tcp bytes received",
-                        size = n,
+                        size = _read,
                         buffered = self.read_buf.len()
                     );
                 }
@@ -2284,19 +2280,26 @@ impl WorkerState {
                     break;
                 }
             }
-            let frame = match frame::pop_frame(&mut self.read_buf) {
-                Ok(Some(frame)) => frame,
+            let total = match frame::parse_frame(self.read_buf.pending()) {
+                Ok(Some((_, total))) => {
+                    kvlog::debug!(
+                        "server frame received",
+                        frame_size = total - frame::LENGTH_PREFIX_LEN
+                    );
+                    total
+                }
                 Ok(None) => {
                     self.pump_incoming_files(&mut wire_budget, &mut decoded_budget);
                     break;
                 }
                 Err(error) => return Err(format!("invalid server frame: {error}")),
             };
-            kvlog::debug!("server frame received", frame_size = frame.len());
+            let frame = &self.read_buf.pending()[frame::LENGTH_PREFIX_LEN..total];
             let plaintext = self
                 .control
-                .open_next(CHANNEL_CONTROL, &frame)
+                .open_next(CHANNEL_CONTROL, frame)
                 .map_err(|error| error.to_string())?;
+            self.read_buf.consume(total);
             kvlog::debug!("server control decrypted", payload_size = plaintext.len());
             if self.handle_history_chunk_payload(&plaintext)? {
                 controls_since_file_pump += 1;

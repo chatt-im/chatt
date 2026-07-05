@@ -586,6 +586,24 @@ impl TransportCipher {
     }
 
     pub fn seal_next(&mut self, channel: u8, plaintext: &[u8]) -> Result<Vec<u8>, CryptoError> {
+        let mut out = Vec::with_capacity(TRANSPORT_HEADER_LEN + plaintext.len() + TAG_LEN);
+        self.seal_next_into(channel, plaintext, &mut out)?;
+        Ok(out)
+    }
+
+    /// Seals `plaintext` directly onto the end of `out` — transport header,
+    /// ciphertext, tag — skipping the frame allocation [`seal_next`] makes.
+    /// The sealed frame occupies exactly [`TRANSPORT_HEADER_LEN`]` +
+    /// plaintext.len() + `[`TAG_LEN`] bytes, so callers can write a length
+    /// prefix before sealing. On error nothing is appended.
+    ///
+    /// [`seal_next`]: Self::seal_next
+    pub fn seal_next_into(
+        &mut self,
+        channel: u8,
+        plaintext: &[u8],
+        out: &mut Vec<u8>,
+    ) -> Result<(), CryptoError> {
         let counter = self.next_send_counter;
         if counter >= REJECT_AFTER_MESSAGES {
             return Err(CryptoError::CounterExhausted);
@@ -594,11 +612,32 @@ impl TransportCipher {
             .next_send_counter
             .checked_add(1)
             .ok_or(CryptoError::CounterExhausted)?;
-        seal_with_key(&self.send, channel, counter, plaintext)
+        seal_with_key_into(&self.send, channel, counter, plaintext, out)
     }
 
     pub fn open_next(&mut self, channel: u8, frame: &[u8]) -> Result<Vec<u8>, CryptoError> {
         let (counter, plaintext) = open_with_key(&self.recv, channel, frame)?;
+        self.check_recv_counter(counter)?;
+        Ok(plaintext)
+    }
+
+    /// Opens the sealed frame in place, skipping the body copy [`open_next`]
+    /// makes: afterwards the plaintext occupies the returned slice, which
+    /// starts at [`TRANSPORT_HEADER_LEN`] within `frame`. Callers that hold
+    /// the frame in a mutable receive buffer decrypt without allocating.
+    ///
+    /// [`open_next`]: Self::open_next
+    pub fn open_next_in_place<'f>(
+        &mut self,
+        channel: u8,
+        frame: &'f mut [u8],
+    ) -> Result<&'f [u8], CryptoError> {
+        let (counter, plaintext_len) = open_with_key_in_place(&self.recv, channel, frame)?;
+        self.check_recv_counter(counter)?;
+        Ok(&frame[TRANSPORT_HEADER_LEN..TRANSPORT_HEADER_LEN + plaintext_len])
+    }
+
+    fn check_recv_counter(&mut self, counter: u64) -> Result<(), CryptoError> {
         if counter != self.next_recv_counter {
             return Err(CryptoError::CounterMismatch);
         }
@@ -606,7 +645,7 @@ impl TransportCipher {
             .next_recv_counter
             .checked_add(1)
             .ok_or(CryptoError::CounterExhausted)?;
-        Ok(plaintext)
+        Ok(())
     }
 }
 
@@ -650,10 +689,49 @@ impl ControlTransport {
         }
     }
 
+    /// Number of bytes [`seal_next_into`](Self::seal_next_into) appends for a
+    /// payload of `plaintext_len` bytes, for writing a length prefix first.
+    pub fn sealed_len(&self, plaintext_len: usize) -> usize {
+        match self {
+            Self::Encrypted(_) => TRANSPORT_HEADER_LEN + plaintext_len + TAG_LEN,
+            Self::Plaintext => plaintext_len,
+        }
+    }
+
+    /// Seals `plaintext` directly onto the end of `out`, appending exactly
+    /// [`sealed_len`](Self::sealed_len) bytes; on error nothing is appended.
+    pub fn seal_next_into(
+        &mut self,
+        channel: u8,
+        plaintext: &[u8],
+        out: &mut Vec<u8>,
+    ) -> Result<(), CryptoError> {
+        match self {
+            Self::Encrypted(cipher) => cipher.seal_next_into(channel, plaintext, out),
+            Self::Plaintext => {
+                out.extend_from_slice(plaintext);
+                Ok(())
+            }
+        }
+    }
+
     pub fn open_next(&mut self, channel: u8, frame: &[u8]) -> Result<Vec<u8>, CryptoError> {
         match self {
             Self::Encrypted(cipher) => cipher.open_next(channel, frame),
             Self::Plaintext => Ok(frame.to_vec()),
+        }
+    }
+
+    /// Opens the sealed frame in place, returning the plaintext slice within
+    /// `frame` without the copy [`open_next`](Self::open_next) makes.
+    pub fn open_next_in_place<'f>(
+        &mut self,
+        channel: u8,
+        frame: &'f mut [u8],
+    ) -> Result<&'f [u8], CryptoError> {
+        match self {
+            Self::Encrypted(cipher) => cipher.open_next_in_place(channel, frame),
+            Self::Plaintext => Ok(frame),
         }
     }
 }
@@ -664,23 +742,44 @@ pub fn seal_with_key(
     counter: u64,
     plaintext: &[u8],
 ) -> Result<Vec<u8>, CryptoError> {
+    let mut out = Vec::with_capacity(TRANSPORT_HEADER_LEN + plaintext.len() + TAG_LEN);
+    seal_with_key_into(key, channel, counter, plaintext, &mut out)?;
+    Ok(out)
+}
+
+/// Seals a transport frame directly onto the end of `out`: header, ciphertext,
+/// tag. On error `out` is left exactly as it was.
+pub fn seal_with_key_into(
+    key: &KeyMaterial,
+    channel: u8,
+    counter: u64,
+    plaintext: &[u8],
+    out: &mut Vec<u8>,
+) -> Result<(), CryptoError> {
     if counter >= REJECT_AFTER_MESSAGES {
         return Err(CryptoError::CounterExhausted);
     }
-    let mut out = Vec::with_capacity(TRANSPORT_HEADER_LEN + plaintext.len() + TAG_LEN);
+    let seal_key = LessSafeKey::new(
+        UnboundKey::new(&CHACHA20_POLY1305, &key.bytes).map_err(|_| CryptoError::InvalidKey)?,
+    );
+    let base = out.len();
+    out.reserve(TRANSPORT_HEADER_LEN + plaintext.len() + TAG_LEN);
     out.extend_from_slice(&key.id.to_le_bytes());
     out.extend_from_slice(&counter.to_le_bytes());
     out.extend_from_slice(plaintext);
     let nonce = nonce_from_counter(counter);
-    let aad = transport_aad(channel, &out[..TRANSPORT_HEADER_LEN]);
-    let seal_key = LessSafeKey::new(
-        UnboundKey::new(&CHACHA20_POLY1305, &key.bytes).map_err(|_| CryptoError::InvalidKey)?,
+    let aad = transport_aad(channel, &out[base..base + TRANSPORT_HEADER_LEN]);
+    let tag = seal_key.seal_in_place_separate_tag(
+        nonce,
+        Aad::from(aad),
+        &mut out[base + TRANSPORT_HEADER_LEN..],
     );
-    let tag = seal_key
-        .seal_in_place_separate_tag(nonce, Aad::from(aad), &mut out[TRANSPORT_HEADER_LEN..])
-        .map_err(|_| CryptoError::Cipher)?;
+    let Ok(tag) = tag else {
+        out.truncate(base);
+        return Err(CryptoError::Cipher);
+    };
     out.extend_from_slice(tag.as_ref());
-    Ok(out)
+    Ok(())
 }
 
 /// Encrypts `out[cipher_start..]` in place under `key`, authenticating `aad`,
@@ -720,24 +819,53 @@ pub fn open_with_key(
     if frame.len() < TRANSPORT_HEADER_LEN + TAG_LEN {
         return Err(CryptoError::Cipher);
     }
-    let key_id = u32::from_le_bytes(frame[0..4].try_into().unwrap());
+    let (header, body) = frame.split_at(TRANSPORT_HEADER_LEN);
+    let mut body = body.to_vec();
+    let (counter, plaintext_len) = open_body_in_place(key, channel, header, &mut body)?;
+    body.truncate(plaintext_len);
+    Ok((counter, body))
+}
+
+/// Opens a sealed transport frame in place: afterwards the plaintext occupies
+/// `frame[TRANSPORT_HEADER_LEN..][..plaintext_len]`. Returns the frame counter
+/// and the plaintext length.
+pub fn open_with_key_in_place(
+    key: &KeyMaterial,
+    channel: u8,
+    frame: &mut [u8],
+) -> Result<(u64, usize), CryptoError> {
+    if frame.len() < TRANSPORT_HEADER_LEN + TAG_LEN {
+        return Err(CryptoError::Cipher);
+    }
+    let (header, body) = frame.split_at_mut(TRANSPORT_HEADER_LEN);
+    open_body_in_place(key, channel, header, body)
+}
+
+/// Decrypts `body` (ciphertext plus tag) in place against the 12-byte
+/// transport `header`, returning the counter and plaintext length.
+fn open_body_in_place(
+    key: &KeyMaterial,
+    channel: u8,
+    header: &[u8],
+    body: &mut [u8],
+) -> Result<(u64, usize), CryptoError> {
+    let key_id = u32::from_le_bytes(header[0..4].try_into().unwrap());
     if key_id != key.id {
         return Err(CryptoError::WrongKeyId);
     }
-    let counter = u64::from_le_bytes(frame[4..12].try_into().unwrap());
+    let counter = u64::from_le_bytes(header[4..12].try_into().unwrap());
     if counter >= REJECT_AFTER_MESSAGES {
         return Err(CryptoError::CounterExhausted);
     }
     let nonce = nonce_from_counter(counter);
-    let aad = transport_aad(channel, &frame[..TRANSPORT_HEADER_LEN]);
+    let aad = transport_aad(channel, header);
     let open_key = LessSafeKey::new(
         UnboundKey::new(&CHACHA20_POLY1305, &key.bytes).map_err(|_| CryptoError::InvalidKey)?,
     );
-    let mut body = frame[TRANSPORT_HEADER_LEN..].to_vec();
     let plaintext = open_key
-        .open_in_place(nonce, Aad::from(aad), &mut body)
+        .open_in_place(nonce, Aad::from(aad), body)
         .map_err(|_| CryptoError::Cipher)?;
-    Ok((counter, plaintext.to_vec()))
+    Ok((counter, plaintext.len()))
 }
 
 /// Claims carried inside a dynamic-user bearer token. The server issues one at

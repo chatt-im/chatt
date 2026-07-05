@@ -8,7 +8,7 @@
 //! [`VideoAck`], and a stream of sealed frames.
 //!
 //! Two framing layers ride the wire:
-//! - Outer: a u32 length prefix per record ([`write_record`]/[`pop_record`]),
+//! - Outer: a u32 length prefix per record ([`write_record`]/[`parse_record`]),
 //!   capped at [`MAX_VIDEO_FRAME_LEN`].
 //! - Inner (a frame record's sealed plaintext): the [`write_video_frame`] bytes,
 //!   a 17-byte header (`[u32 size_incl_header][i64 ts_ms][u8 is_key][u32
@@ -113,23 +113,24 @@ pub fn write_record(out: &mut Vec<u8>, payload: &[u8]) -> Result<(), VideoFrameE
     Ok(())
 }
 
-/// Pops one outer record from `buffer`, draining it. Returns `None` when fewer
-/// than one whole record is buffered.
-pub fn pop_record(buffer: &mut Vec<u8>) -> Result<Option<Vec<u8>>, VideoFrameError> {
-    if buffer.len() < VIDEO_LENGTH_PREFIX_LEN {
+/// Parses the outer record at the front of `buffer` without consuming or
+/// copying it, returning the payload as a borrowed slice and the total number
+/// of bytes the record occupies. Video records can be large, so consumers
+/// decrypt or relay straight from the borrowed slice and advance a cursor by
+/// the returned length instead of draining per record.
+pub fn parse_record(buffer: &[u8]) -> Result<Option<(&[u8], usize)>, VideoFrameError> {
+    let Some(prefix) = buffer.get(..VIDEO_LENGTH_PREFIX_LEN) else {
         return Ok(None);
-    }
-    let len = u32::from_le_bytes(buffer[..VIDEO_LENGTH_PREFIX_LEN].try_into().unwrap()) as usize;
+    };
+    let len = u32::from_le_bytes(prefix.try_into().unwrap()) as usize;
     if len > MAX_VIDEO_FRAME_LEN {
         return Err(VideoFrameError::TooLarge);
     }
     let total = VIDEO_LENGTH_PREFIX_LEN + len;
-    if buffer.len() < total {
+    let Some(payload) = buffer.get(VIDEO_LENGTH_PREFIX_LEN..total) else {
         return Ok(None);
-    }
-    let payload = buffer[VIDEO_LENGTH_PREFIX_LEN..total].to_vec();
-    buffer.drain(..total);
-    Ok(Some(payload))
+    };
+    Ok(Some((payload, total)))
 }
 
 /// Writes one inner frame record: the 17-byte header then the bitstream body.
@@ -229,11 +230,9 @@ mod tests {
     fn video_record_round_trips() {
         let mut buffer = Vec::new();
         write_record(&mut buffer, b"sealed-record").unwrap();
-        assert_eq!(
-            pop_record(&mut buffer).unwrap(),
-            Some(b"sealed-record".to_vec())
-        );
-        assert!(buffer.is_empty());
+        let (payload, consumed) = parse_record(&buffer).unwrap().expect("whole record");
+        assert_eq!(payload, b"sealed-record".as_slice());
+        assert_eq!(consumed, buffer.len());
     }
 
     #[test]
