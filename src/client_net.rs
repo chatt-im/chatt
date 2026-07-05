@@ -125,6 +125,119 @@ const RECENT_VOICE_SEQUENCE_WORDS: usize =
     MAX_RECENT_VOICE_SEQUENCES / RECENT_VOICE_SEQUENCE_WORD_BITS;
 const _: () = assert!(MAX_RECENT_VOICE_SEQUENCES % RECENT_VOICE_SEQUENCE_WORD_BITS == 0);
 
+#[repr(transparent)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Readiness(bool);
+
+impl Readiness {
+    #[cfg(test)]
+    #[inline]
+    fn new() -> Self {
+        Self(false)
+    }
+
+    #[inline]
+    fn primed() -> Self {
+        Self(true)
+    }
+
+    #[inline]
+    fn mark_ready(&mut self) {
+        self.0 = true;
+    }
+
+    #[inline]
+    fn mark_drained(&mut self) {
+        self.0 = false;
+    }
+
+    #[inline]
+    fn is_ready(self) -> bool {
+        self.0
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct TcpReadOutcome {
+    bytes_read: usize,
+    disconnected: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WakeIntent {
+    Idle,
+    Now,
+    After(Duration),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PollSchedule {
+    timeout: Duration,
+}
+
+impl PollSchedule {
+    #[inline]
+    fn after(timeout: Duration) -> Self {
+        Self { timeout }
+    }
+
+    #[inline]
+    fn include(&mut self, intent: WakeIntent) {
+        match intent {
+            WakeIntent::Idle => {}
+            WakeIntent::Now => self.timeout = Duration::ZERO,
+            WakeIntent::After(delay) => self.timeout = self.timeout.min(delay),
+        }
+    }
+
+    #[inline]
+    fn timeout(self) -> Duration {
+        self.timeout
+    }
+}
+
+#[inline]
+fn read_tcp_into_buffer(
+    socket: &impl std::os::fd::AsRawFd,
+    read_buf: &mut RecvBuffer,
+    readiness: &mut Readiness,
+    read_chunk_bytes: usize,
+    max_buffered_bytes: usize,
+) -> io::Result<TcpReadOutcome> {
+    debug_assert!(read_chunk_bytes > 0);
+    debug_assert!(max_buffered_bytes > 0);
+
+    let mut outcome = TcpReadOutcome::default();
+    while readiness.is_ready() && read_buf.len() < max_buffered_bytes {
+        match read_buf.fill(socket, read_chunk_bytes) {
+            Ok(0) => {
+                readiness.mark_drained();
+                outcome.disconnected = true;
+                break;
+            }
+            Ok(read) => {
+                outcome.bytes_read += read;
+            }
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                readiness.mark_drained();
+                break;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(outcome)
+}
+
+#[inline]
+fn tcp_receive_work_ready(readiness: Readiness, read_buf: &RecvBuffer) -> bool {
+    readiness.is_ready() || matches!(frame::parse_frame(read_buf.pending()), Ok(Some(_)))
+}
+
+#[inline]
+fn is_interrupted_io_error(error: &io::Error) -> bool {
+    error.kind() == io::ErrorKind::Interrupted || error.raw_os_error() == Some(libc::EINTR)
+}
+
 #[cfg(test)]
 static LAST_RECEIVED_FILE_WIRE_BYTES: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
@@ -823,7 +936,7 @@ fn run_worker_inner(
         read_buf: RecvBuffer::new(),
         // Starts true so the first loop iteration reads anything that arrived
         // before the socket was registered with the poll.
-        tcp_readable: true,
+        tcp_readiness: Readiness::primed(),
         write_buf: Vec::new(),
         media_packet: Vec::new(),
         media_scratch: Vec::new(),
@@ -921,7 +1034,7 @@ fn run_worker_inner(
     let _ = worker.events.send(NetworkEvent::Connected);
 
     let mut poll_events = Events::with_capacity(128);
-    let mut poll_timeout = POLL_TIMEOUT;
+    let mut poll_timeout = worker.next_poll_timeout(CommandDrainOutcome::Empty, Instant::now());
     while !worker.shutdown {
         if let Err(error) = poll.poll(&mut poll_events, Some(poll_timeout)) {
             return SessionEnd::Disconnected(format!("network poll failed: {error}"));
@@ -929,13 +1042,13 @@ fn run_worker_inner(
         for event in poll_events.iter() {
             match event.token() {
                 TCP => {
-                    // Reading happens below through `tcp_readable` so a read
+                    // Reading happens below through `tcp_readiness` so a read
                     // capped by `MAX_BUFFERED_SERVER_BYTES` is retried once
                     // control processing frees buffer space. Consuming the
                     // edge-triggered event without draining the socket would
                     // otherwise strand the remaining bytes forever.
                     if event.is_readable() {
-                        worker.tcp_readable = true;
+                        worker.tcp_readiness.mark_ready();
                     }
                     if event.is_writable() {
                         if let Err(error) = worker.write_tcp() {
@@ -950,7 +1063,7 @@ fn run_worker_inner(
                 _ => {}
             }
         }
-        if worker.tcp_readable {
+        if worker.tcp_readiness.is_ready() {
             if let Err(error) = worker.read_tcp() {
                 return SessionEnd::Disconnected(error);
             }
@@ -991,57 +1104,10 @@ fn run_worker_inner(
         worker.poll_rtt_probe(now);
         worker.poll_mdns(now);
         worker.read_udp();
-        // A pending file upload or bug report can keep the loop spinning at zero
-        // timeout so chunks stream at socket speed instead of one small batch per
-        // `POLL_TIMEOUT`. This only applies while `write_buf` is below the
-        // backpressure gate: once the socket refuses more (`write_buf` past the
-        // gate after a `WouldBlock`), the loop parks on the writable edge rather
-        // than busy-looping. A throttled upload whose token bucket is empty parks
-        // on the refill delay instead of spinning.
-        let write_ok = worker.write_buf.len() <= MAX_QUEUED_FILE_BYTES;
-        let bug_ready = write_ok && !worker.outgoing_bug_reports.is_empty();
-        let upload_delay = if write_ok {
-            worker.outgoing_uploads.front().map(|front| {
-                let pending = front.body.pending().len();
-                if !front.started
-                    || (!front.source_finished
-                        && pending < MAX_QUEUED_FILE_BYTES
-                        && upload_source_read_capacity(front, &worker.upload_throttle) > 0)
-                    || upload_should_flush_source_read_ahead(front, &worker.upload_throttle)
-                    || (front.source_finished && !front.encoder_finished)
-                    || (front.encoder_finished && pending == 0)
-                {
-                    Duration::ZERO
-                } else {
-                    worker
-                        .upload_throttle
-                        .delay_until(pending.min(MAX_FILE_CHUNK_BYTES) as u64)
-                }
-            })
-        } else {
-            None
-        };
-        // A whole buffered frame or possibly-unread socket bytes mean another
-        // tick can make progress now. A lone partial frame does not: its rest
-        // arrives with the next readable edge, so parking on the poll is safe
-        // and avoids a busy loop while the tail is in flight.
-        let incoming_ready = worker.tcp_readable
-            || matches!(frame::parse_frame(worker.read_buf.pending()), Ok(Some(_)))
-            || worker.incoming_files.values().any(|incoming| {
-                incoming.pending_wire_offset < incoming.pending_wire.len()
-                    || incoming.complete_received
-            });
-        poll_timeout =
-            if command_drain == CommandDrainOutcome::HitLimit || bug_ready || incoming_ready {
-                Duration::ZERO
-            } else {
-                POLL_TIMEOUT
-            };
-        if let Some(delay) = upload_delay {
-            poll_timeout = poll_timeout.min(delay);
-        }
-        if let Some(deadline) = worker.mdns.next_timeout(now) {
-            poll_timeout = poll_timeout.min(deadline);
+        poll_timeout = worker.next_poll_timeout(command_drain, now);
+        #[cfg(debug_assertions)]
+        if poll_timeout != Duration::ZERO {
+            worker.debug_assert_no_immediate_work(command_drain);
         }
     }
     if let Some((code, reason)) = worker.auth_failure.take() {
@@ -1370,10 +1436,10 @@ struct WorkerState {
     /// poll event and cleared only when a read drains to `WouldBlock` or
     /// end-of-stream. [`read_tcp`](WorkerState::read_tcp) stops early once
     /// `read_buf` reaches [`MAX_BUFFERED_SERVER_BYTES`], and the poll is
-    /// edge-triggered, so without this flag a capped read would strand the
+    /// edge-triggered, so without this state a capped read would strand the
     /// remaining kernel bytes: no new readable edge fires while the sender is
     /// blocked on our zero receive window.
-    tcp_readable: bool,
+    tcp_readiness: Readiness,
     write_buf: Vec<u8>,
     /// Reusable buffers for the outbound media seal path, cleared on each use so
     /// the per-frame voice send does not allocate. `media_packet` holds the UDP
@@ -2249,6 +2315,89 @@ impl EncoderFeedbackController {
 }
 
 impl WorkerState {
+    #[inline]
+    fn next_poll_timeout(&self, command_drain: CommandDrainOutcome, now: Instant) -> Duration {
+        let mut schedule = PollSchedule::after(POLL_TIMEOUT);
+        schedule.include(self.command_wake(command_drain));
+        schedule.include(self.bug_report_wake());
+        schedule.include(self.receive_wake());
+        schedule.include(self.upload_wake());
+        schedule.include(self.mdns_wake(now));
+        schedule.timeout()
+    }
+
+    #[inline]
+    fn command_wake(&self, command_drain: CommandDrainOutcome) -> WakeIntent {
+        if command_drain == CommandDrainOutcome::HitLimit {
+            WakeIntent::Now
+        } else {
+            WakeIntent::Idle
+        }
+    }
+
+    #[inline]
+    fn write_buffer_accepts_file_work(&self) -> bool {
+        self.write_buf.len() <= MAX_QUEUED_FILE_BYTES
+    }
+
+    #[inline]
+    fn bug_report_wake(&self) -> WakeIntent {
+        if self.write_buffer_accepts_file_work() && !self.outgoing_bug_reports.is_empty() {
+            WakeIntent::Now
+        } else {
+            WakeIntent::Idle
+        }
+    }
+
+    #[inline]
+    fn receive_wake(&self) -> WakeIntent {
+        let ready = tcp_receive_work_ready(self.tcp_readiness, &self.read_buf)
+            || self.incoming_files.values().any(|incoming| {
+                incoming.pending_wire_offset < incoming.pending_wire.len()
+                    || incoming.complete_received
+            });
+        if ready {
+            WakeIntent::Now
+        } else {
+            WakeIntent::Idle
+        }
+    }
+
+    #[inline]
+    fn upload_wake(&self) -> WakeIntent {
+        if !self.write_buffer_accepts_file_work() {
+            return WakeIntent::Idle;
+        }
+        let Some(front) = self.outgoing_uploads.front() else {
+            return WakeIntent::Idle;
+        };
+        let pending = front.body.pending().len();
+        if upload_ready_now(front, pending, &self.upload_throttle) {
+            WakeIntent::Now
+        } else {
+            WakeIntent::After(
+                self.upload_throttle
+                    .delay_until(pending.min(MAX_FILE_CHUNK_BYTES) as u64),
+            )
+        }
+    }
+
+    #[inline]
+    fn mdns_wake(&self, now: Instant) -> WakeIntent {
+        match self.mdns.next_timeout(now) {
+            Some(delay) => WakeIntent::After(delay),
+            None => WakeIntent::Idle,
+        }
+    }
+
+    #[cfg(debug_assertions)]
+    fn debug_assert_no_immediate_work(&self, command_drain: CommandDrainOutcome) {
+        debug_assert_ne!(self.command_wake(command_drain), WakeIntent::Now);
+        debug_assert_ne!(self.bug_report_wake(), WakeIntent::Now);
+        debug_assert_ne!(self.receive_wake(), WakeIntent::Now);
+        debug_assert_ne!(self.upload_wake(), WakeIntent::Now);
+    }
+
     fn queue_control(&mut self, control: ClientControl) -> Result<(), String> {
         let payload = encode_client_control(&control)?;
         let encrypted = self
@@ -2268,35 +2417,32 @@ impl WorkerState {
 
     /// Reads from the TCP socket until `read_buf` reaches
     /// [`MAX_BUFFERED_SERVER_BYTES`] or the socket drains. Only a drain
-    /// (`WouldBlock` or end-of-stream) clears `tcp_readable`; stopping at the
+    /// (`WouldBlock` or end-of-stream) clears `tcp_readiness`; stopping at the
     /// buffer cap leaves it set so the main loop retries after
     /// `process_server_controls` frees buffer space.
     fn read_tcp(&mut self) -> Result<(), String> {
-        while self.read_buf.len() < MAX_BUFFERED_SERVER_BYTES {
-            match self.read_buf.fill(&self.tcp, TCP_READ_CHUNK_BYTES) {
-                Ok(0) => {
-                    kvlog::info!("tcp server closed connection");
-                    self.shutdown = true;
-                    self.disconnect_reason = Some("server closed connection".to_string());
-                    self.tcp_readable = false;
-                    break;
-                }
-                Ok(_read) => {
-                    kvlog::debug!(
-                        "tcp bytes received",
-                        size = _read,
-                        buffered = self.read_buf.len()
-                    );
-                }
-                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                    self.tcp_readable = false;
-                    break;
-                }
-                Err(error) => {
-                    kvlog::warn!("tcp read failed", error = %error);
-                    return Err(format!("TCP read failed: {error}"));
-                }
-            }
+        let outcome = read_tcp_into_buffer(
+            &self.tcp,
+            &mut self.read_buf,
+            &mut self.tcp_readiness,
+            TCP_READ_CHUNK_BYTES,
+            MAX_BUFFERED_SERVER_BYTES,
+        )
+        .map_err(|error| {
+            kvlog::warn!("tcp read failed", error = %error);
+            format!("TCP read failed: {error}")
+        })?;
+        if outcome.bytes_read > 0 {
+            kvlog::debug!(
+                "tcp bytes received",
+                size = outcome.bytes_read,
+                buffered = self.read_buf.len()
+            );
+        }
+        if outcome.disconnected {
+            kvlog::info!("tcp server closed connection");
+            self.shutdown = true;
+            self.disconnect_reason = Some("server closed connection".to_string());
         }
         Ok(())
     }
@@ -2373,6 +2519,7 @@ impl WorkerState {
         loop {
             let (len, src) = match self.udp.recv_from(&mut buf) {
                 Ok(value) => value,
+                Err(error) if is_interrupted_io_error(&error) => continue,
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                     // More than one datagram per poll wake means inbound packets
                     // queued in the socket while this single-threaded worker was
@@ -5070,6 +5217,16 @@ fn upload_should_flush_source_read_ahead(
         && upload.body.pending().is_empty()
 }
 
+fn upload_ready_now(upload: &OutgoingUpload, pending: usize, throttle: &UploadThrottle) -> bool {
+    !upload.started
+        || (!upload.source_finished
+            && pending < MAX_QUEUED_FILE_BYTES
+            && upload_source_read_capacity(upload, throttle) > 0)
+        || upload_should_flush_source_read_ahead(upload, throttle)
+        || (upload.source_finished && !upload.encoder_finished)
+        || (upload.encoder_finished && pending == 0)
+}
+
 fn read_upload_source(upload: &mut OutgoingUpload, limit: usize) -> io::Result<Vec<u8>> {
     if upload.source_prefix_offset < upload.source_prefix.len() {
         let end = upload
@@ -5713,6 +5870,8 @@ fn connection_id_from_p2p_username(username: &str) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
+    use std::os::unix::net::UnixStream;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn user(id: u64) -> UserId {
@@ -6184,6 +6343,80 @@ mod tests {
         assert_eq!(outcome, CommandDrainOutcome::HitLimit);
         assert_eq!(handled, 2);
         assert!(matches!(rx.try_recv(), Ok(NetworkCommand::Shutdown)));
+    }
+
+    #[test]
+    fn interrupted_io_errors_are_retryable() {
+        assert!(is_interrupted_io_error(&io::Error::from(
+            io::ErrorKind::Interrupted
+        )));
+        assert!(is_interrupted_io_error(&io::Error::from_raw_os_error(
+            libc::EINTR
+        )));
+        assert!(!is_interrupted_io_error(&io::Error::from(
+            io::ErrorKind::WouldBlock
+        )));
+    }
+
+    #[test]
+    fn tcp_buffer_cap_keeps_readiness_for_retry() {
+        let (mut writer, reader) = UnixStream::pair().expect("socket pair");
+        reader.set_nonblocking(true).expect("set nonblocking");
+        writer.write_all(b"x").expect("write payload");
+        let mut read_buf = RecvBuffer::new();
+        let mut readiness = Readiness::primed();
+
+        let outcome = read_tcp_into_buffer(&reader, &mut read_buf, &mut readiness, 1, 1).unwrap();
+
+        assert!(!outcome.disconnected);
+        assert!(outcome.bytes_read >= 1);
+        assert!(readiness.is_ready());
+        assert!(!read_buf.is_empty());
+        assert!(tcp_receive_work_ready(readiness, &read_buf));
+    }
+
+    #[test]
+    fn tcp_would_block_clears_retained_readiness_after_buffer_consumed() {
+        let (mut writer, reader) = UnixStream::pair().expect("socket pair");
+        reader.set_nonblocking(true).expect("set nonblocking");
+        writer.write_all(b"x").expect("write payload");
+        let mut read_buf = RecvBuffer::new();
+        let mut readiness = Readiness::primed();
+
+        let outcome = read_tcp_into_buffer(&reader, &mut read_buf, &mut readiness, 1, 1).unwrap();
+        assert!(outcome.bytes_read >= 1);
+        assert!(readiness.is_ready());
+
+        read_buf.consume(read_buf.len());
+        let outcome = read_tcp_into_buffer(&reader, &mut read_buf, &mut readiness, 1, 1).unwrap();
+
+        assert_eq!(outcome, TcpReadOutcome::default());
+        assert!(!readiness.is_ready());
+        assert!(!tcp_receive_work_ready(readiness, &read_buf));
+    }
+
+    #[test]
+    fn complete_buffered_frame_is_immediate_tcp_work() {
+        let (mut writer, reader) = UnixStream::pair().expect("socket pair");
+        reader.set_nonblocking(true).expect("set nonblocking");
+        let mut encoded = Vec::new();
+        frame::encode_frame(b"payload", &mut encoded).expect("encode frame");
+        writer.write_all(&encoded).expect("write frame");
+        let mut read_buf = RecvBuffer::new();
+        let mut readiness = Readiness::primed();
+
+        let outcome = read_tcp_into_buffer(
+            &reader,
+            &mut read_buf,
+            &mut readiness,
+            encoded.len(),
+            encoded.len() + 1,
+        )
+        .unwrap();
+        assert_eq!(outcome.bytes_read, encoded.len());
+        assert!(!readiness.is_ready());
+
+        assert!(tcp_receive_work_ready(Readiness::new(), &read_buf));
     }
 
     #[test]
