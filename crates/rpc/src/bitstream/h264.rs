@@ -23,16 +23,22 @@ pub fn nal_type(data: &[u8]) -> u8 {
 /// carried in the `extra_data` descriptor instead of in band.
 pub fn annex_b_to_avc(annex_b: &[u8]) -> Vec<u8> {
     let mut avc = Vec::with_capacity(annex_b.len());
+    annex_b_to_avc_into(annex_b, &mut avc);
+    avc
+}
+
+/// Appends the [`annex_b_to_avc`] conversion of one access unit to `out`, for
+/// callers that reuse an encode buffer across frames.
+pub fn annex_b_to_avc_into(annex_b: &[u8], out: &mut Vec<u8>) {
     for (start, end) in find_nal_units(annex_b) {
         let nal = &annex_b[start..end];
         match nal_type(nal) {
             NAL_SPS | NAL_PPS | NAL_AUD | NAL_SEI => continue,
             _ => {}
         }
-        avc.extend_from_slice(&(nal.len() as u32).to_be_bytes());
-        avc.extend_from_slice(nal);
+        out.extend_from_slice(&(nal.len() as u32).to_be_bytes());
+        out.extend_from_slice(nal);
     }
-    avc
 }
 
 /// Extracts the first SPS and PPS NALs from an Annex-B access unit, or `None`

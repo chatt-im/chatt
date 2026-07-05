@@ -64,6 +64,15 @@ pub fn annex_b_to_length_prefixed(codec: Codec, access_unit: &[u8]) -> Vec<u8> {
     }
 }
 
+/// Appends the [`annex_b_to_length_prefixed`] conversion of one access unit to
+/// `out`, for callers that reuse an encode buffer across frames.
+pub fn annex_b_to_length_prefixed_into(codec: Codec, access_unit: &[u8], out: &mut Vec<u8>) {
+    match codec {
+        Codec::H264 => h264::annex_b_to_avc_into(access_unit, out),
+        Codec::Hevc => hevc::annex_b_to_hvc_into(access_unit, out),
+    }
+}
+
 /// Iterates the `(start, end)` byte ranges of each NAL in an Annex-B stream,
 /// handling both 3- and 4-byte start codes. The ranges exclude the start codes.
 /// The NAL header layout differs by codec, so the type is decoded per codec.

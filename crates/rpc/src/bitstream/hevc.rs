@@ -41,15 +41,21 @@ pub fn is_irap(nal_type: u8) -> bool {
 /// parameter sets carried in the `hvcC` descriptor instead of in band.
 pub fn annex_b_to_hvc(annex_b: &[u8]) -> Vec<u8> {
     let mut hvc = Vec::with_capacity(annex_b.len());
+    annex_b_to_hvc_into(annex_b, &mut hvc);
+    hvc
+}
+
+/// Appends the [`annex_b_to_hvc`] conversion of one access unit to `out`, for
+/// callers that reuse an encode buffer across frames.
+pub fn annex_b_to_hvc_into(annex_b: &[u8], out: &mut Vec<u8>) {
     for (start, end) in find_nal_units(annex_b) {
         let nal = &annex_b[start..end];
         if nal_type(nal) >= FIRST_NON_VCL {
             continue;
         }
-        hvc.extend_from_slice(&(nal.len() as u32).to_be_bytes());
-        hvc.extend_from_slice(nal);
+        out.extend_from_slice(&(nal.len() as u32).to_be_bytes());
+        out.extend_from_slice(nal);
     }
-    hvc
 }
 
 /// Extracts the first VPS, SPS, and PPS NALs from an Annex-B access unit, or

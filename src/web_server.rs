@@ -26,7 +26,7 @@ use darkhttp::{
 use jsony::Jsony;
 use rpc::{
     control::{ChatMessage, FileMetadata},
-    video,
+    video::{self, SharedVideoFrame},
 };
 
 use crate::config::{WebAutoplay, WebConfig};
@@ -63,9 +63,11 @@ const VIDEO_FAST_START_MAX_BYTES: usize = video::MAX_VIDEO_FRAME_LEN;
 static NEXT_UPLOAD_TEMP_ID: AtomicU64 = AtomicU64::new(1);
 
 /// The latest complete keyframe-led GOP forwarded to local web clients.
+/// `bytes` charges [`SharedVideoFrame::retained_bytes`], the allocation each
+/// cached frame actually keeps alive.
 #[derive(Default)]
 struct VideoFastStart {
-    frames: VecDeque<Vec<u8>>,
+    frames: VecDeque<SharedVideoFrame>,
     bytes: usize,
     /// Delta frames dropped since the cache last held a keyframe, for
     /// diagnostics: a nonzero count means a play click in that window replayed
@@ -74,7 +76,7 @@ struct VideoFastStart {
 }
 
 impl VideoFastStart {
-    fn push(&mut self, stream_id: u32, frame: Vec<u8>, is_key: bool) {
+    fn push(&mut self, stream_id: u32, frame: SharedVideoFrame, is_key: bool) {
         if is_key {
             if self.dropped_without_key > 0 {
                 kvlog::info!(
@@ -97,7 +99,7 @@ impl VideoFastStart {
             return;
         }
 
-        if self.bytes.saturating_add(frame.len()) > VIDEO_FAST_START_MAX_BYTES {
+        if self.bytes.saturating_add(frame.retained_bytes()) > VIDEO_FAST_START_MAX_BYTES {
             kvlog::warn!(
                 "video fast start cache overflowed, pausing until the next keyframe",
                 stream_id,
@@ -109,7 +111,7 @@ impl VideoFastStart {
             self.bytes = 0;
             return;
         }
-        self.bytes += frame.len();
+        self.bytes += frame.retained_bytes();
         self.frames.push_back(frame);
     }
 }
@@ -405,7 +407,8 @@ enum WebFeed {
     },
     /// One plaintext video frame body (the 17-byte header plus the bitstream),
     /// forwarded to browsers as a binary WebSocket message without re-framing.
-    VideoFrame(Vec<u8>),
+    /// Shared so the fast-start cache and the WebSocket writer never copy it.
+    VideoFrame(SharedVideoFrame),
     Stop,
 }
 
@@ -530,7 +533,7 @@ impl WebFeedSender {
     }
 
     /// Sends one plaintext video frame body as a binary WebSocket message.
-    pub fn send_video_frame(&self, frame: Vec<u8>) {
+    pub fn send_video_frame(&self, frame: SharedVideoFrame) {
         let _ = self.tx.send(WebFeed::VideoFrame(frame));
         self.wake.wake();
     }
@@ -1008,7 +1011,7 @@ fn run(
                     let cached = video_fast_start.get(&stream_id);
                     let leads_with_key = cached
                         .and_then(|cache| cache.frames.front())
-                        .and_then(|frame| video_frame_meta(frame))
+                        .and_then(|frame| video_frame_meta(frame.as_slice()))
                         .is_some_and(|(_, is_key)| is_key);
                     kvlog::info!(
                         "video fast start replay",
@@ -1022,7 +1025,7 @@ fn run(
                         let _ = server.send_websocket_text(*id, &payload);
                         if let Some(cached) = video_fast_start.get(&stream_id) {
                             for frame in &cached.frames {
-                                let _ = server.send_websocket_binary(*id, frame);
+                                let _ = server.send_websocket_binary(*id, frame.as_slice());
                             }
                         }
                     }
@@ -1040,7 +1043,7 @@ fn run(
                     }
                 }
                 Ok(WebFeed::VideoFrame(frame)) => {
-                    let Some((stream_id, is_key)) = video_frame_meta(&frame) else {
+                    let Some((stream_id, is_key)) = video_frame_meta(frame.as_slice()) else {
                         kvlog::warn!(
                             "dropping malformed browser video frame",
                             frame_bytes = frame.len()
@@ -1048,7 +1051,7 @@ fn run(
                         continue;
                     };
                     for id in &clients {
-                        let _ = server.send_websocket_binary(*id, &frame);
+                        let _ = server.send_websocket_binary(*id, frame.as_slice());
                     }
                     video_fast_start
                         .entry(stream_id)
@@ -1266,11 +1269,14 @@ mod tests {
 
     #[test]
     fn video_fast_start_keeps_only_latest_keyframe_led_gop() {
-        let delta_before_key = video::encode_video_frame(1, false, 7, &[1]);
-        let old_key = video::encode_video_frame(2, true, 7, &[2]);
-        let old_delta = video::encode_video_frame(3, false, 7, &[3]);
-        let new_key = video::encode_video_frame(4, true, 7, &[4]);
-        let new_delta = video::encode_video_frame(5, false, 7, &[5]);
+        let shared_frame = |ts_ms: i64, is_key: bool, body: &[u8]| {
+            SharedVideoFrame::copy_from_slice(&video::encode_video_frame(ts_ms, is_key, 7, body))
+        };
+        let delta_before_key = shared_frame(1, false, &[1]);
+        let old_key = shared_frame(2, true, &[2]);
+        let old_delta = shared_frame(3, false, &[3]);
+        let new_key = shared_frame(4, true, &[4]);
+        let new_delta = shared_frame(5, false, &[5]);
         let mut cache = VideoFastStart::default();
 
         cache.push(7, delta_before_key, false);
@@ -1280,9 +1286,11 @@ mod tests {
         cache.push(7, new_key.clone(), true);
         cache.push(7, new_delta.clone(), false);
 
+        let cached: Vec<&[u8]> = cache.frames.iter().map(|frame| frame.as_slice()).collect();
+        assert_eq!(cached, vec![new_key.as_slice(), new_delta.as_slice()]);
         assert_eq!(
-            cache.frames.iter().collect::<Vec<_>>(),
-            vec![&new_key, &new_delta]
+            cache.bytes,
+            new_key.retained_bytes() + new_delta.retained_bytes()
         );
     }
 
@@ -1977,7 +1985,7 @@ Sec-WebSocket-Version: 13\r\n\
         let key = video::encode_video_frame(3, true, 15, &[3]);
         let delta = video::encode_video_frame(4, false, 15, &[4]);
         for frame in [&old_key, &old_delta, &key, &delta] {
-            sender.send_video_frame(frame.clone());
+            sender.send_video_frame(SharedVideoFrame::copy_from_slice(frame));
             let (opcode, live) = read_ws_frame(&mut stream);
             assert_eq!(opcode, 0x2);
             assert_eq!(live, *frame);
