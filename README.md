@@ -409,11 +409,13 @@ public fields when clients need a DNS name, public IP, reverse proxy port, or
 NAT-forwarded port. When omitted, the public fields default to the corresponding
 bind address.
 
-The generated `server-identity-seed` must stay private. Explicit users are added
-by `chatt-server invite USER` when the invite is accepted; `name` is the
-admin-chosen internal identifier, while `display-name` is updated when a user
-successfully joins. Room id `1` is required as the default lobby by the current
-client flow.
+The generated `server-identity-seed` must stay private. The server never
+rewrites the config file; user records live in `users.toml` under
+`storage.data-dir` (default `<config stem>-data` beside the config). Explicit
+users are added by `chatt-server invite USER` when the invite is accepted;
+`name` is the admin-chosen internal identifier, while `display-name` is updated
+when a user successfully joins. Room id `1` is required as the default lobby by
+the current client flow.
 
 `encryption = true` makes the server require encrypted TCP control and
 server-relayed UDP media transport. Set it to `false` only for trusted local
@@ -423,17 +425,19 @@ confidentiality.
 
 `public = true` opens the server to self-service joining: a client runs
 `chatt pair <host:port>` with no admin invite. The server stores no row per
-open user. It hands out ids from `next-dynamic-user-id` (starting at
-`4294967296`, leaving ids below that for explicit `[[users]]`) and issues a
-sealed bearer token that carries the user id and the `password-epoch`. Set
-`password` to gate open joining behind a shared secret. New anonymous dynamic
-user allocations are rate-limited per source IP and globally to protect the
-server config write path. Bump `password-epoch` to invalidate every issued
-dynamic token. With a configured password, affected clients can re-pair with the
-current password and keep their user id; without a password, stale-token re-pair
-allocates a new dynamic id. Changing `password` without bumping the epoch leaves
-existing tokens valid. `public` defaults to `false`; when false, dynamic tokens
-are rejected and only invite-based and explicit users can authenticate.
+open user. It hands out ids from a persisted counter (starting at `4294967296`,
+leaving ids below that for explicit users) and issues a sealed bearer token
+that carries the user id and the `password-epoch`. Set `password-hash` to the
+SHA-256 of a shared secret (`sha256:<hex>`, generate with
+`printf %s 'secret' | sha256sum`) to gate open joining behind that secret. New
+anonymous dynamic user allocations are rate-limited per source IP and globally
+to protect the user-registry write path. Bump `password-epoch` to invalidate
+every issued dynamic token. With a configured password, affected clients can
+re-pair with the current password and keep their user id; without a password,
+stale-token re-pair allocates a new dynamic id. Changing `password-hash`
+without bumping the epoch leaves existing tokens valid. `public` defaults to
+`false`; when false, dynamic tokens are rejected and only invite-based and
+explicit users can authenticate.
 
 `chat-history-limit = 0` means the server relays chat without retaining message
 bodies for future room joins. Raising the value keeps that many messages in
@@ -456,7 +460,7 @@ passed to `chatt-server serve`.
 Pairing bootstraps or rotates a user's long-lived client token without putting a
 pairing code in either config file.
 
-1. Start the server with a writable config path:
+1. Start the server:
 
 ```sh
 cargo run -p server -- serve chatt-server.toml
@@ -469,7 +473,8 @@ cargo run -p server -- invite dana
 ```
 
 The `dana` value is the server's internal user identifier. It does not need to
-exist in TOML yet; successful pairing creates or updates the `[[users]]` entry.
+exist yet; successful pairing creates or updates the user's record in the
+registry under the data dir.
 
 3. On the client, pair with the printed string:
 
@@ -480,8 +485,8 @@ cargo run -p chatt -- pair tcj1_...
 The client derives a server label from the address and seeds the username
 from the operating system account name, then pairs over the normal encrypted
 control channel. On successful pairing, the client writes a labeled `[[servers]]`
-entry with the new token, and the server writes `token-hash` plus the
-`display-name`. The username is editable afterward in the server editor. Invites are
+entry with the new token, and the server records the token hash plus the
+display name in its user registry. The username is editable afterward in the server editor. Invites are
 only held in server memory and are removed when replaced, expired, or
 successfully used.
 
@@ -495,7 +500,7 @@ cargo run -p chatt -- pair 127.0.0.1:41000
 ```
 
 The client trusts the server's public key on first use and pins it. If the
-server has a `password`, the client shows a prompt (input masked), pins the key
+server has a `password-hash`, the client shows a prompt (input masked), pins the key
 from the first response, and retries only against that key. The server allocates
 a dynamic user id, issues a bearer token, returns its public UDP endpoints, and
 the client stores a labeled `[[servers]]` entry exactly like invite pairing.

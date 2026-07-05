@@ -52,7 +52,7 @@ struct Client {
 fn server_config() -> ServerConfig {
     let mut config = ServerConfig::default();
     config.network.tcp_addr = "127.0.0.1:0".parse().expect("valid loopback tcp addr");
-    config.network.udp_addr = "127.0.0.1:0".parse().expect("valid loopback udp addr");
+    config.network.udp_addr = Some("127.0.0.1:0".parse().expect("valid loopback udp addr"));
     config.network.udp_probe_addr = None;
     config.network.p2p_enabled = false;
     // Use the well-known dev identity so clients with `server_public_key = None`
@@ -68,7 +68,11 @@ fn server_config() -> ServerConfig {
         memory_limit: None,
         is_default: true,
     }];
-    config.users = vec![
+    config
+}
+
+fn server_users() -> Vec<UserConfig> {
+    vec![
         UserConfig {
             id: UserId(1),
             name: "uploader".to_string(),
@@ -81,8 +85,7 @@ fn server_config() -> ServerConfig {
             display_name: "Receiver".to_string(),
             token_hash: hash_secret(RECEIVE_TOKEN),
         },
-    ];
-    config
+    ]
 }
 
 fn client_config(
@@ -187,6 +190,7 @@ fn upload_50mb_loopback() {
     const PAYLOAD_BYTES: usize = 50 * 1024 * 1024;
 
     let mut server = Server::bind(server_config()).expect("bind server");
+    server.users.users = server_users();
     let tcp = server
         .tcp_local_addr()
         .expect("server tcp addr")
