@@ -1,0 +1,21 @@
+# chatt server user registry. Managed by the server; do not edit.
+
+next-dynamic-user-id = 4294967296
+
+[[users]]
+id = 1
+name = "alice"
+display-name = "Alice"
+token-hash = "sha256:8989ee243a8829e3364b6eb9cae74f1edfa53e327e5718fe337d23d6ab8b4625"
+
+[[users]]
+id = 2
+name = "bob"
+display-name = "Bob"
+token-hash = "sha256:fd57e39ef28a47298ae51762fd3c907253ac7d4b7507fdf28fcf6d5e4bbaeb8a"
+
+[[users]]
+id = 3
+name = "carol"
+display-name = "Carol Soundboard"
+token-hash = "sha256:f93be296b384d5f0f8760bdb53cf3ea52a5e41e6f7a532645458784ece411f62"
