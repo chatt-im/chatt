@@ -12,7 +12,7 @@ use rpc::{
 use crate::audio::{LivePlaybackFeedback, PlaybackStreamControl};
 
 use crate::{
-    chat_buffer::{NoticeId, VirtualChatBuffer},
+    chat_buffer::{NoticeId, NoticeKind, VirtualChatBuffer},
     client_net::TransferDirection,
     config::Config,
     room_catalog::{CatalogRoom, CatalogRoomKind, RoomCatalog},
@@ -1815,6 +1815,13 @@ impl RoomSession {
 
     pub(super) fn push_notice(&mut self, sender: impl Into<String>, body: impl Into<String>) {
         self.active.chat.push_notice(sender, body);
+        self.active.chat.bottom();
+    }
+
+    pub(super) fn push_error_notice(&mut self, sender: impl Into<String>, body: impl Into<String>) {
+        self.active
+            .chat
+            .push_notice_with_kind(sender, body, NoticeKind::Error);
         self.active.chat.bottom();
     }
 
