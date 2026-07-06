@@ -891,6 +891,19 @@ pub(crate) enum DecodedFrameSource {
     DecodeError,
 }
 
+impl DecodedFrameSource {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            DecodedFrameSource::Normal => "normal",
+            DecodedFrameSource::Dred => "dred",
+            DecodedFrameSource::Fec => "fec",
+            DecodedFrameSource::Expand => "expand",
+            DecodedFrameSource::Plc => "plc",
+            DecodedFrameSource::DecodeError => "decode_error",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct PlayoutDelay {
     pub(crate) current: Duration,

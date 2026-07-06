@@ -521,6 +521,7 @@ mod tests {
         max_output_ring_ms: u64,
         voice_packets_received: u64,
         voice_bytes_received: u64,
+        output: Vec<f32>,
     }
 
     fn file_source_test_config(first_sequence: u32) -> LiveAudioFileSourceConfig {
@@ -621,6 +622,7 @@ mod tests {
         )
         .saturating_add(2);
         let mut max_output_ring_ms = 0;
+        let mut output = Vec::new();
         let mut voice_packets_received = 0u64;
         let mut voice_bytes_received = 0u64;
 
@@ -667,6 +669,35 @@ mod tests {
                 );
 
                 let silence = packet.packet.payload.is_silence();
+                // Freezes the delivered packet stream (`tick seq ts flags hex`
+                // lines) for `neteq::replay_repro`, which replays it into a
+                // bare NetEqCore across commits for sender-drift-free bisects.
+                if let Ok(dump) = std::env::var("CHATT_PACKET_FIXTURE")
+                    && !dump.is_empty()
+                {
+                    use std::io::Write;
+                    let mut file = std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(&dump)
+                        .unwrap();
+                    let hex: String = match &packet.packet.payload {
+                        VoicePayload::Opus(bytes) => {
+                            bytes.iter().map(|b| format!("{b:02x}")).collect()
+                        }
+                        _ => String::new(),
+                    };
+                    writeln!(
+                        file,
+                        "{} {} {} {} {}",
+                        frame_index,
+                        packet.packet.sequence,
+                        packet.packet.timestamp,
+                        packet.packet.flags,
+                        hex
+                    )
+                    .unwrap();
+                }
                 voice_packets_received = voice_packets_received.saturating_add(1);
                 voice_bytes_received =
                     voice_bytes_received.saturating_add(packet.packet.payload.len() as u64);
@@ -700,7 +731,7 @@ mod tests {
                     .map_err(|_| "headless soundboard mixer lock poisoned")?;
                 mixer.begin_output_callback();
                 for _ in 0..LIVE_OPUS_FRAME_SAMPLES {
-                    let _ = mixer.pop_mixed_output_sample(now, LIVE_OPUS_FRAME_SAMPLES);
+                    output.push(mixer.pop_mixed_output_sample(now, LIVE_OPUS_FRAME_SAMPLES));
                 }
                 max_output_ring_ms =
                     max_output_ring_ms.max(mixer.snapshot_at(now).max_output_ring_ms);
@@ -726,6 +757,7 @@ mod tests {
             max_output_ring_ms,
             voice_packets_received,
             voice_bytes_received,
+            output,
         })
     }
 
@@ -844,6 +876,84 @@ mod tests {
                 .all(|(_, frame)| frame.flags & LIVE_PACKET_FLAG_MUTE != 0),
             "muted source markers must carry the mute flag"
         );
+    }
+
+    /// `(peak_index, |peak|)` for each pulse above `threshold` in
+    /// `samples[range]`, merging anything within 300 samples into one pulse.
+    fn pulse_peaks(
+        samples: &[f32],
+        range: std::ops::Range<usize>,
+        threshold: f32,
+    ) -> Vec<(usize, f32)> {
+        let mut pulses = Vec::new();
+        let mut index = range.start;
+        while index < range.end.min(samples.len()) {
+            if samples[index].abs() <= threshold {
+                index += 1;
+                continue;
+            }
+            let window = &samples[index..(index + 300).min(samples.len())];
+            let mut peak_offset = 0;
+            for (offset, sample) in window.iter().enumerate() {
+                if sample.abs() > window[peak_offset].abs() {
+                    peak_offset = offset;
+                }
+            }
+            let peak = index + peak_offset;
+            pulses.push((peak, samples[peak].abs()));
+            index = peak + 300;
+        }
+        pulses
+    }
+
+    /// The clip's vocal-fry segment (a natural ~120 Hz glottal pulse train at
+    /// ~3 s) plays through a DRED-recovered loss hole under the production
+    /// `random_60` seed. A gap-starved DRED feature parse renders the recovered
+    /// pulses at hallucinated amplitudes, which reads as an envelope bounce
+    /// (sharp drop then rise) instead of the fry's natural monotone decay, and
+    /// is audible as a click. The known-good envelope decays
+    /// `0.30, 0.30, 0.27, 0.20, 0.12`.
+    #[test]
+    fn soundboard_random60_keeps_fry_pulse_envelope_smooth() {
+        let input_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("assets/sample-001.opus");
+        let input = decode_audio_file_with_ffmpeg(&input_path)
+            .expect("assets/sample-001.opus should decode through ffmpeg");
+        let report =
+            run_headless_soundboard_playback(soundboard_random60_test_config(), &input).unwrap();
+        let output = &report.output;
+
+        let candidates = pulse_peaks(
+            output,
+            SAMPLE_RATE as usize * 3 / 2..SAMPLE_RATE as usize * 9 / 2,
+            0.22,
+        );
+        let mut fry = None;
+        for pair in candidates.windows(2) {
+            let spacing = pair[1].0 - pair[0].0;
+            if (330..=520).contains(&spacing) {
+                fry = Some(pair[0].0);
+                break;
+            }
+        }
+        let fry = fry.expect("the fry pulse train should survive random_60 recovery");
+
+        let envelope: Vec<f32> = pulse_peaks(
+            output,
+            fry.saturating_sub(100)..fry + SAMPLE_RATE as usize * 9 / 100,
+            0.08,
+        )
+        .into_iter()
+        .map(|(_, peak)| peak)
+        .collect();
+        for window in envelope.windows(3) {
+            let [previous, current, next] = window else {
+                unreachable!()
+            };
+            assert!(
+                !(*current < 0.6 * previous && *next > 1.2 * current),
+                "fry pulse envelope bounced (recovery hallucination): {envelope:?}"
+            );
+        }
     }
 
     #[test]

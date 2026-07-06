@@ -56,6 +56,20 @@ impl PacketBuffer {
         self.buffer.clear();
     }
 
+    #[cfg(test)]
+    pub(crate) fn debug_packets(&self) -> Vec<(u32, u32, i32)> {
+        self.buffer
+            .iter()
+            .map(|packet| {
+                (
+                    packet.timestamp,
+                    packet.sequence_number,
+                    packet.priority.codec_level,
+                )
+            })
+            .collect()
+    }
+
     pub(crate) fn is_empty(&self) -> bool {
         self.buffer.is_empty()
     }

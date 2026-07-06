@@ -1,5 +1,6 @@
 /target
 /recordings
+/analysis/__pycache__/
 /assets/sample-001.opus
 /docs/smooth-adaptive-catch-up.md
 .rgignore

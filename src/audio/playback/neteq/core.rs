@@ -121,7 +121,19 @@ struct DredParse {
     sequence: u32,
     state: DredState,
     processed: bool,
+    /// Final-pair PCM: the last two 10 ms chunks decoded as one 20 ms deep-PLC
+    /// call, keyed by `span` (the anchor offset of the pair's start). Capacity
+    /// is reserved off the audio callback so the fill does not allocate.
+    pcm: Vec<i16>,
+    span: usize,
 }
+
+/// Extra parse span beyond the recovery gap, in samples. The deep-PLC synthesis
+/// feeds feature frames past the requested reconstruction span (init frames plus
+/// `dred_ec_decode`'s pairwise latent rounding); a parse bounded exactly to the
+/// gap starves those and the first recovered chunks render with hallucinated
+/// features, which audibly corrupts pulse trains (vocal fry) at recovery onsets.
+const DRED_PARSE_MARGIN_SAMPLES: usize = 4 * DRED_CHUNK_SAMPLES;
 
 /// Packet bytes and redundancy expansion prepared before the final NetEQ insert
 /// lock hold.
@@ -379,6 +391,35 @@ impl NetEqCore {
             dred_missed_horizon_count: self.dred_missed_horizon_count,
             dred_missed_horizon_ms: samples_to_ms(self.dred_missed_horizon_samples as usize),
         }
+    }
+
+    /// Compact one-line dump of the playout position, sync buffer depth, and
+    /// the first buffered packets as `ts+<gap>(<seq>s<codec_level>)`, for
+    /// attributing sim artifacts to buffer/timeline state.
+    #[cfg(test)]
+    pub(crate) fn debug_timeline(&self) -> String {
+        let status = self.status();
+        let playout = status
+            .target_timestamp
+            .wrapping_add(status.generated_noise_samples as u32)
+            .wrapping_sub(status.sync_buffer_samples as u32);
+        let packets: Vec<String> = self
+            .packet_buffer
+            .debug_packets()
+            .into_iter()
+            .take(6)
+            .map(|(ts, seq, level)| {
+                format!("ts+{}({}s{})", ts.wrapping_sub(playout) as i32, seq, level)
+            })
+            .collect();
+        format!(
+            "playout={playout} end_ts={} gen_noise={} sync={} last={} pkts={}",
+            status.target_timestamp,
+            status.generated_noise_samples,
+            status.sync_buffer_samples,
+            self.last_operation.label(),
+            packets.join(",")
+        )
     }
 
     /// Flushes all state for a hard stream restart (decoder reset boundary).
@@ -681,6 +722,7 @@ impl NetEqCore {
                 .unwrap_or_default();
         let max_dred_samples = usize::try_from(current_gap)
             .unwrap_or(usize::MAX)
+            .saturating_add(DRED_PARSE_MARGIN_SAMPLES)
             .min(LIVE_PLAYBACK_DRED_MAX_SAMPLES);
         let Some((state, reach, dred_end)) =
             Self::parse_dred_state(decoder, datagram, max_dred_samples)
@@ -694,6 +736,8 @@ impl NetEqCore {
             sequence,
             state,
             processed: false,
+            pcm: Vec::with_capacity(2 * DRED_CHUNK_SAMPLES),
+            span: 0,
         };
         (
             Some(DredInfo {
@@ -1179,6 +1223,7 @@ impl NetEqCore {
             let mut dred_end = 0;
             let max_dred_samples = usize::try_from(offset.max(DRED_CHUNK_SAMPLES as i32))
                 .unwrap_or(usize::MAX)
+                .saturating_add(DRED_PARSE_MARGIN_SAMPLES)
                 .min(LIVE_PLAYBACK_DRED_MAX_SAMPLES);
             let _ = dred_decoder.parse(
                 &mut state,
@@ -1192,24 +1237,51 @@ impl NetEqCore {
                 sequence,
                 state,
                 processed: false,
+                pcm: Vec::with_capacity(2 * DRED_CHUNK_SAMPLES),
+                span: 0,
             });
         }
-        {
-            let parse = self.dred_parse.as_mut().expect("dred parse present");
-            if !parse.processed {
-                dred_decoder
-                    .process_in_place(&mut parse.state)
-                    .map_err(|_| ())?;
-                parse.processed = true;
-            }
+        let parse = self.dred_parse.as_mut().expect("dred parse present");
+        if !parse.processed {
+            dred_decoder
+                .process_in_place(&mut parse.state)
+                .map_err(|_| ())?;
+            parse.processed = true;
         }
-        let parse = self.dred_parse.as_ref().expect("dred parse present");
+        let decoder = &mut self.decoder;
         let end = (out_start + DRED_CHUNK_SAMPLES).min(self.decoded_buffer.len());
         let output = &mut self.decoded_buffer[out_start..end];
-        let decoder = &mut self.decoder;
-        let dred_decoder = self.dred_decoder.as_mut().expect("dred decoder present");
+        let Ok(offset) = usize::try_from(offset) else {
+            return Err(());
+        };
+        // Serve the tail chunk from the pair cache when the previous pull
+        // decoded it (see below).
+        if parse.span == offset + DRED_CHUNK_SAMPLES && parse.pcm.len() == 2 * DRED_CHUNK_SAMPLES {
+            let served = output.len().min(DRED_CHUNK_SAMPLES);
+            output[..served].copy_from_slice(&parse.pcm[DRED_CHUNK_SAMPLES..][..served]);
+            return Ok(served);
+        }
+        // The size of the deep-PLC call that ends at the anchor decides how
+        // cleanly the decoder blends into the following real decode: a final
+        // 10 ms call triples the transition click vs a final 20 ms call, while
+        // the sizes of earlier calls are irrelevant. So the last two chunks are
+        // decoded as one 20 ms pass and the tail chunk is served from `pcm`
+        // above. Chunks are otherwise decoded one 10 ms pull at a time, so a
+        // late real packet replacing a buffered chunk never leaves the decoder
+        // state advanced past audio that actually played.
+        if offset == 2 * DRED_CHUNK_SAMPLES {
+            parse.pcm.clear();
+            parse.pcm.resize(2 * DRED_CHUNK_SAMPLES, 0);
+            parse.span = offset;
+            dred_decoder
+                .decode_into_i16(decoder, &parse.state, offset as i32, &mut parse.pcm)
+                .map_err(|_| ())?;
+            let served = output.len().min(DRED_CHUNK_SAMPLES);
+            output[..served].copy_from_slice(&parse.pcm[..served]);
+            return Ok(served);
+        }
         dred_decoder
-            .decode_into_i16(decoder, &parse.state, offset, output)
+            .decode_into_i16(decoder, &parse.state, offset as i32, output)
             .map_err(|_| ())
     }
 
@@ -1422,7 +1494,7 @@ mod tests {
 
     use super::*;
     use crate::audio::capture::OpusVoiceEncoder;
-    use crate::network::EncoderNetworkProfile;
+    use crate::network::{EncoderNetworkProfile, EncoderNetworkTuning};
 
     /// Wall clock advancing like a real device: 10 ms per `get_audio` pull.
     struct WallClock(Instant);
@@ -1456,6 +1528,197 @@ mod tests {
         let len = encoder.encode(&frame, &mut output).expect("encode");
         output.truncate(len);
         output
+    }
+
+    /// One output block's observable state from [`run_tone_stream`].
+    struct ToneBlock {
+        mode: Mode,
+        source: DecodedFrameSource,
+        reason: &'static str,
+        target_ms: u64,
+        packet_buffer_ms: u64,
+    }
+
+    impl ToneBlock {
+        #[allow(dead_code)]
+        fn describe(&self) -> String {
+            format!(
+                "{}/{:?}/{} t={} b={}",
+                self.mode.label(),
+                self.source,
+                self.reason,
+                self.target_ms,
+                self.packet_buffer_ms
+            )
+        }
+    }
+
+    /// Runs a continuous-phase tone stream through NetEQ under an arbitrary
+    /// delivery schedule. `schedule` maps a packet's sequence to its arrival
+    /// tick (one tick per 10 ms output block, nominal send tick is `seq * 2`)
+    /// or `None` to drop it. The encoder still sees every frame so phase stays
+    /// continuous. `fec` applies the live encoder loss profile so packets carry
+    /// LBRR. `dred` controls the receiver's DRED decoder. Returns all output
+    /// samples plus per-block state.
+    fn run_tone_stream(
+        total: u32,
+        fec: bool,
+        dred: bool,
+        schedule: impl Fn(u32) -> Option<u32>,
+    ) -> (Vec<f32>, Vec<ToneBlock>) {
+        let mut core = NetEqCore::new(LiveAudioTuning::default()).unwrap();
+        if !dred {
+            core.dred_decoder = None;
+        }
+        let mut encoder = OpusVoiceEncoder::new(32_000).unwrap();
+        if fec {
+            encoder
+                .apply_network_profile(EncoderNetworkProfile::CRITICAL)
+                .unwrap();
+        }
+        let mut arrivals: Vec<Vec<(u32, Vec<u8>)>> = vec![Vec::new(); total as usize * 2 + 1];
+        for seq in 0..total {
+            let payload = encode_tone(&mut encoder, seq as usize * LIVE_OPUS_FRAME_SAMPLES);
+            let Some(tick) = schedule(seq) else { continue };
+            let tick = (tick as usize).min(arrivals.len() - 1);
+            arrivals[tick].push((seq, payload));
+        }
+
+        let mut output = vec![0.0; OUTPUT_SIZE_SAMPLES];
+        let mut clock = WallClock::new();
+        let mut samples = Vec::new();
+        let mut blocks = Vec::new();
+        for tick_arrivals in &arrivals {
+            for (seq, payload) in tick_arrivals {
+                core.insert_packet(
+                    clock.now(),
+                    seq * LIVE_OPUS_FRAME_SAMPLES as u32,
+                    *seq,
+                    0,
+                    payload,
+                );
+            }
+            let result = core.get_audio(clock.now(), &mut output);
+            clock.advance_block();
+            samples.extend_from_slice(&output);
+            let diagnostics = core.diagnostics();
+            blocks.push(ToneBlock {
+                mode: result.mode,
+                source: result.source,
+                reason: diagnostics.reason,
+                target_ms: diagnostics.target_ms,
+                packet_buffer_ms: diagnostics.packet_buffer_ms,
+            });
+        }
+        (samples, blocks)
+    }
+
+    /// Peak 3-tap linear-prediction residual of a `freq` Hz tone over
+    /// `samples[skip..]`. A pure sinusoid is predicted exactly, so the residual
+    /// sits at the codec noise floor and any phase or level splice spikes above
+    /// it. See the identical helper in the sim harness tests.
+    fn peak_tone_prediction_residual(samples: &[f32], freq: f64, skip: usize) -> (f32, usize) {
+        let w = 2.0 * std::f64::consts::PI * freq / SAMPLE_RATE as f64;
+        let two_cos_w = 2.0 * w.cos() as f32;
+        let mut peak = 0.0f32;
+        let mut peak_index = 0;
+        for (index, window) in samples.windows(3).enumerate().skip(skip) {
+            let residual = (window[2] - two_cos_w * window[1] + window[0]).abs();
+            if residual > peak {
+                peak = residual;
+                peak_index = index;
+            }
+        }
+        (peak, peak_index)
+    }
+
+    /// A short timeline hole reaches the playout point while later packets sit
+    /// buffered, so NetEQ expands into the gap and then merges back into
+    /// decoded audio. The expand entry and merge return splices must not click.
+    #[test]
+    fn short_gap_expand_merge_splice_stays_smooth() {
+        let freq = 220.0;
+        let skip = (SAMPLE_RATE as usize * 3) / 20;
+
+        let (control, control_blocks) = run_tone_stream(200, false, false, |seq| Some(seq * 2));
+        let (control_residual, _) = peak_tone_prediction_residual(&control, freq, skip);
+        assert!(
+            !control_blocks[20..]
+                .iter()
+                .any(|block| block.mode.is_expand()),
+            "control run concealed unexpectedly"
+        );
+
+        let (output, blocks) = run_tone_stream(200, false, false, |seq| {
+            if seq == 100 || seq == 101 {
+                None
+            } else {
+                Some(seq * 2)
+            }
+        });
+        let (residual, _) = peak_tone_prediction_residual(&output, freq, skip);
+        let gap_modes: Vec<&str> = blocks[190..215]
+            .iter()
+            .map(|block| block.mode.label())
+            .collect();
+        assert!(
+            blocks[190..215].iter().any(|block| block.mode.is_expand()),
+            "the hole never reached concealment: {gap_modes:?}"
+        );
+        assert!(
+            residual < 3.0 * control_residual.max(0.002),
+            "expand/merge splice injected a discontinuity: residual {residual:.5} \
+             vs control {control_residual:.5}, modes {gap_modes:?}"
+        );
+    }
+
+    /// The same hole under E2E-like conditions: FEC/DRED-bearing packets and
+    /// jittery bursty arrivals that inflate the delay target so the buffer runs
+    /// deep with time-stretch churn before the hole reaches playout. Catches
+    /// both the 10 ms-final-DRED-call blend regression and DRED interruption
+    /// over-advance.
+    #[test]
+    fn short_gap_splice_stays_smooth_under_jitter_and_fec() {
+        let freq = 220.0;
+        let skip = (SAMPLE_RATE as usize * 3) / 20;
+        let jitter = |seq: u32| {
+            let hold = (seq % 4) * 2 + u32::from(seq % 7 == 0) * 3;
+            Some(seq * 2 + hold)
+        };
+
+        let (control, _) = run_tone_stream(500, true, true, jitter);
+        let (control_residual, _) = peak_tone_prediction_residual(&control, freq, skip);
+
+        let (output, blocks) = run_tone_stream(500, true, true, |seq| {
+            if seq == 400 || seq == 401 {
+                None
+            } else {
+                jitter(seq)
+            }
+        });
+        let (residual, residual_index) = peak_tone_prediction_residual(&output, freq, skip);
+        let peak_block = residual_index / OUTPUT_SIZE_SAMPLES;
+        assert!(
+            blocks
+                .iter()
+                .any(|block| matches!(block.source, DecodedFrameSource::Dred)),
+            "the hole never exercised DRED recovery"
+        );
+        // The DRED-to-real-decode boundary carries an inherent deep-PLC blend
+        // residual of ~0.0066 even under libopus's own `opus_demo` consumption
+        // pattern; the regressions this guards against (a 10 ms final DRED
+        // call, or a gap-starved feature parse) measure 0.019+. 0.009 separates
+        // the two with margin on both sides.
+        assert!(
+            residual < 0.009,
+            "recovery splice injected a discontinuity: residual {residual:.5} \
+             vs control {control_residual:.5} at block {peak_block} ({})",
+            blocks[peak_block.saturating_sub(2)..(peak_block + 3).min(blocks.len())]
+                .iter()
+                .map(|block| block.describe())
+                .collect::<Vec<_>>()
+                .join(" | ")
+        );
     }
 
     #[test]
