@@ -235,14 +235,16 @@ fn upload_50mb_loopback() {
     });
     uploader
         .handle
-        .send(NetworkCommand::SetActiveRoom(RoomId(ROOM)));
+        .try_send(NetworkCommand::SetActiveRoom(RoomId(ROOM)))
+        .expect("set active room");
 
     let start = Instant::now();
     uploader
         .handle
-        .send(NetworkCommand::UploadFile(UploadFileRequest::new(
+        .try_send(NetworkCommand::UploadFile(UploadFileRequest::new(
             source.clone(),
-        )));
+        )))
+        .expect("upload compressible file");
 
     let received = wait_for(
         "receiver",
@@ -290,9 +292,10 @@ fn upload_50mb_loopback() {
     let identity_start = Instant::now();
     uploader
         .handle
-        .send(NetworkCommand::UploadFile(UploadFileRequest::new(
+        .try_send(NetworkCommand::UploadFile(UploadFileRequest::new(
             incompressible_source,
-        )));
+        )))
+        .expect("upload incompressible file");
     let received = wait_for(
         "receiver identity",
         &receiver.events,
@@ -319,9 +322,10 @@ fn upload_50mb_loopback() {
     std::fs::write(&excluded_source, &excluded).expect("write excluded payload");
     uploader
         .handle
-        .send(NetworkCommand::UploadFile(UploadFileRequest::new(
+        .try_send(NetworkCommand::UploadFile(UploadFileRequest::new(
             excluded_source,
-        )));
+        )))
+        .expect("upload excluded file");
     let received = wait_for(
         "receiver excluded",
         &receiver.events,

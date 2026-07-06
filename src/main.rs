@@ -4,7 +4,6 @@ mod bench_upload;
 mod bindings;
 mod chat_buffer;
 mod cli;
-#[allow(dead_code)]
 mod client_net;
 mod clipboard;
 mod clipboard_paste;
