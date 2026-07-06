@@ -22,6 +22,12 @@ const GROUP_GAP_MS: u64 = 90_000;
 pub struct NoticeId(u64);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NoticeKind {
+    Info,
+    Error,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Segment {
     pub col: u16,
     pub start: u32,
@@ -90,6 +96,7 @@ pub struct ChatEntry {
     /// Whether a collapsible (over [`COLLAPSE_LIMIT`] lines) message is expanded.
     expanded: bool,
     notice_id: Option<NoticeId>,
+    pub notice_kind: Option<NoticeKind>,
     layout: MessageLayout,
 }
 
@@ -191,6 +198,7 @@ impl VirtualChatBuffer {
             refs,
             expanded: false,
             notice_id: None,
+            notice_kind: None,
             layout: MessageLayout::new(),
         }
     }
@@ -269,6 +277,15 @@ impl VirtualChatBuffer {
     }
 
     pub fn push_notice(&mut self, sender: impl Into<String>, body: impl Into<String>) -> NoticeId {
+        self.push_notice_with_kind(sender, body, NoticeKind::Info)
+    }
+
+    pub fn push_notice_with_kind(
+        &mut self,
+        sender: impl Into<String>,
+        body: impl Into<String>,
+        kind: NoticeKind,
+    ) -> NoticeId {
         let body = body.into();
         let inline = crate::markdown::inline_ranges(&body);
         let refs = self.build_ref_spans(&body, inline.refs);
@@ -285,6 +302,7 @@ impl VirtualChatBuffer {
             refs,
             expanded: false,
             notice_id: Some(notice_id),
+            notice_kind: Some(kind),
             layout: MessageLayout::new(),
         });
         self.trim_front();
@@ -2190,6 +2208,7 @@ mod tests {
                 refs,
                 expanded: false,
                 notice_id: None,
+                notice_kind: None,
                 layout: MessageLayout::new(),
             });
             self.trim_front();

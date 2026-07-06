@@ -90,6 +90,7 @@ const TRANSIENT_STATUS_LIFETIME: Duration = Duration::from_secs(3);
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ScreencastPhase {
     Idle,
+    Off,
     Starting,
     Live,
     Failed,
@@ -175,6 +176,19 @@ impl ScreencastStatus {
 
     fn clear_active(&mut self) {
         self.phase = ScreencastPhase::Idle;
+        self.stream_id = None;
+        self.codec = None;
+        self.coded_width = None;
+        self.coded_height = None;
+        self.started_at = None;
+        self.ended_at = Some(Instant::now());
+        self.total_bytes = 0;
+        self.total_frames = 0;
+        self.rolling_bytes_per_sec = 0;
+    }
+
+    fn turn_off(&mut self) {
+        self.phase = ScreencastPhase::Off;
         self.stream_id = None;
         self.codec = None;
         self.coded_width = None;
@@ -378,6 +392,10 @@ pub(crate) struct App {
     web_feed: Option<crate::web_server::WebFeedSender>,
     /// The active outbound screen share, if this client is sharing.
     screencast: Option<crate::video::ScreencastHandle>,
+    /// The resolved capture command that last successfully launched an outbound
+    /// screen share. Used by the top-bar `VIDEO OFF` badge to restart exactly
+    /// what the user had running.
+    cached_screencast_start: Option<CachedScreencastStart>,
     /// The stream id of our active outbound share, set on `ShareStarted`.
     screencast_stream_id: Option<StreamId>,
     pub(crate) screencast_status: ScreencastStatus,
@@ -408,6 +426,21 @@ struct AvailableShare {
     /// The decoder `extra_data` descriptor (`avcC`/`hvcC`), built by the
     /// publisher from the stream's parameter sets.
     extradata: Vec<u8>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CachedScreencastStart {
+    argv: Vec<String>,
+    hevc: bool,
+}
+
+impl CachedScreencastStart {
+    fn into_command(self) -> local_control::ScreencastCommand {
+        local_control::ScreencastCommand::Start {
+            argv: self.argv,
+            hevc: self.hevc,
+        }
+    }
 }
 
 /// A debounced request to restart audio streams so a slow settings-page change
@@ -960,6 +993,7 @@ impl App {
             audio_events: AudioEventLog::default(),
             web_feed,
             screencast: None,
+            cached_screencast_start: None,
             screencast_stream_id: None,
             screencast_status: ScreencastStatus::default(),
             available_shares: HashMap::new(),
@@ -1104,6 +1138,10 @@ impl App {
                 } else {
                     crate::video::capture::default_ffmpeg_argv()
                 };
+                let cached_start = CachedScreencastStart {
+                    argv: argv.clone(),
+                    hevc,
+                };
                 let web_feed = self.web_feed.clone();
                 let events = self.events.sender();
                 match crate::video::start_screencast(
@@ -1117,6 +1155,7 @@ impl App {
                     Ok(handle) => {
                         self.screencast_status.start();
                         self.screencast = Some(handle);
+                        self.cached_screencast_start = Some(cached_start);
                         self.set_status("starting screen share");
                     }
                     Err(error) => {
@@ -1125,10 +1164,25 @@ impl App {
                 }
             }
             local_control::ScreencastCommand::Stop => {
-                self.teardown_own_share(true);
-                self.screencast_status.clear_active();
-                self.set_status("screen share stopped");
+                self.stop_screencast_to_off();
             }
+        }
+    }
+
+    fn stop_screencast_to_off(&mut self) {
+        let had_restartable_video = self.screencast.is_some()
+            || matches!(
+                self.screencast_status.phase,
+                ScreencastPhase::Starting | ScreencastPhase::Live | ScreencastPhase::Off
+            )
+            || self.cached_screencast_start.is_some();
+        self.teardown_own_share(true);
+        if had_restartable_video {
+            self.screencast_status.turn_off();
+            self.set_status("video off");
+        } else {
+            self.screencast_status.clear_active();
+            self.set_status("screen share stopped");
         }
     }
 
@@ -2655,7 +2709,7 @@ impl App {
             return;
         }
         self.last_network_notice = Some(body.to_string());
-        self.room.push_notice(sender, body);
+        self.room.push_error_notice(sender, body);
     }
 
     /// Builds the fallback base mode used if the stack is ever popped empty.
@@ -2706,7 +2760,7 @@ impl App {
             return true;
         }
         if rect_contains(self.chrome.top_bar.video, mouse.column, mouse.row) {
-            self.show_video_status();
+            self.activate_top_bar_video();
             return true;
         }
         false
@@ -4566,6 +4620,23 @@ impl App {
         self.send_network_command(NetworkCommand::SetVoiceStatus(status), false);
     }
 
+    fn activate_top_bar_video(&mut self) {
+        match self.screencast_status.phase {
+            ScreencastPhase::Failed => self.show_video_status(),
+            ScreencastPhase::Off => self.restart_cached_screencast(),
+            ScreencastPhase::Starting | ScreencastPhase::Live => self.stop_screencast_to_off(),
+            ScreencastPhase::Idle => self.show_video_status(),
+        }
+    }
+
+    fn restart_cached_screencast(&mut self) {
+        let Some(command) = self.cached_screencast_start.clone() else {
+            self.set_error("no cached video command");
+            return;
+        };
+        self.handle_screencast_command(command.into_command());
+    }
+
     fn show_mute_status(&mut self) {
         self.set_status(if self.deafened.load(Ordering::Relaxed) {
             "deafened; microphone muted"
@@ -4585,8 +4656,12 @@ impl App {
     }
 
     fn show_video_status(&mut self) {
-        self.room
-            .push_notice("video", self.video_diagnostics_notice());
+        let notice = self.video_diagnostics_notice();
+        if self.screencast_status.phase == ScreencastPhase::Failed {
+            self.room.push_error_notice("video", notice);
+        } else {
+            self.room.push_notice("video", notice);
+        }
         self.set_status(self.video_status_summary());
     }
 
@@ -4596,6 +4671,7 @@ impl App {
                 Some(issue) => format!("video idle; last issue: {}", issue.reason),
                 None => "video idle".to_string(),
             },
+            ScreencastPhase::Off => "video off".to_string(),
             ScreencastPhase::Starting => "video starting".to_string(),
             ScreencastPhase::Live => format!(
                 "video live: {}",
@@ -5428,6 +5504,7 @@ fn lobby_voice_level_active(rms: f32) -> bool {
 fn screencast_phase_label(phase: ScreencastPhase) -> &'static str {
     match phase {
         ScreencastPhase::Idle => "idle",
+        ScreencastPhase::Off => "off",
         ScreencastPhase::Starting => "starting",
         ScreencastPhase::Live => "live",
         ScreencastPhase::Failed => "failed",
@@ -5514,7 +5591,7 @@ fn auth_failure_status(detail: &str) -> &'static str {
 mod tests {
     use super::*;
     use crate::{settings::SettingsDraft, tui::form::FormState};
-    use extui::{Buffer, event::KeyModifiers};
+    use extui::{Buffer, Rect, Style, event::KeyModifiers};
     use extui_editor::Mode as EditorMode;
 
     fn test_app() -> App {
@@ -5554,6 +5631,27 @@ mod tests {
 
     fn render_room(app: &mut App, room: &mut RoomMode, buffer: &mut Buffer) {
         room.render(app, buffer, 0);
+    }
+
+    fn cell_style(buffer: &mut Buffer, column: u16, row: u16) -> Style {
+        let grid = buffer.current();
+        grid.cells()[(row as usize * grid.width() as usize) + column as usize].style()
+    }
+
+    fn cell_text(buffer: &mut Buffer, column: u16, row: u16) -> String {
+        let grid = buffer.current();
+        let cell = grid.cells()[(row as usize * grid.width() as usize) + column as usize];
+        if cell.is_handle() {
+            String::from_utf8_lossy(grid.handle_text(cell).unwrap_or_default()).to_string()
+        } else {
+            cell.text_inline().unwrap_or_default().to_string()
+        }
+    }
+
+    fn rect_text(buffer: &mut Buffer, rect: Rect) -> String {
+        (0..rect.w)
+            .map(|column| cell_text(buffer, rect.x + column, rect.y))
+            .collect::<String>()
     }
 
     fn base_mode_label(app: &App) -> &'static str {
@@ -6689,6 +6787,10 @@ mod tests {
         assert_eq!(notice.sender, "help");
         assert!(notice.body.contains("/report-bug what went wrong"));
         assert!(notice.body.contains("Press Tab again to cycle matches"));
+        assert_eq!(
+            notice.notice_kind,
+            Some(crate::chat_buffer::NoticeKind::Info)
+        );
         assert_eq!(app.status.text(), "slash commands listed");
     }
 
@@ -6706,6 +6808,10 @@ mod tests {
         assert_eq!(notice.sender, "video");
         assert!(notice.body.contains("state: failed"));
         assert!(notice.body.contains("last issue:"));
+        assert_eq!(
+            notice.notice_kind,
+            Some(crate::chat_buffer::NoticeKind::Error)
+        );
         assert!(app.status.text().contains("video failed:"));
     }
 
@@ -6952,6 +7058,33 @@ mod tests {
         assert_eq!(room.layout().chat_rect.bottom(), expected_chat_bottom);
     }
 
+    #[test]
+    fn chat_notice_markers_use_notice_kind_accent() {
+        let mut app = test_app();
+        let mut room = RoomMode::default();
+        app.room.push_notice("system", "joined");
+        let mut buffer = Buffer::new(80, 24);
+        render_room(&mut app, &mut room, &mut buffer);
+        let info_marker = cell_style(
+            &mut buffer,
+            room.layout().chat_rect.x,
+            room.layout().chat_rect.y,
+        );
+        assert_eq!(info_marker.fg(), app.theme.muted.fg());
+
+        let mut app = test_app();
+        let mut room = RoomMode::default();
+        app.room.push_error_notice("video", "failed");
+        let mut buffer = Buffer::new(80, 24);
+        render_room(&mut app, &mut room, &mut buffer);
+        let error_marker = cell_style(
+            &mut buffer,
+            room.layout().chat_rect.x,
+            room.layout().chat_rect.y,
+        );
+        assert_eq!(error_marker.fg(), app.theme.error.fg());
+    }
+
     fn click_top_bar_rect(app: &mut App, room: &mut RoomMode, rect: extui::Rect) {
         assert!(!rect.is_empty());
         room.process_mouse(
@@ -7011,6 +7144,81 @@ mod tests {
         assert_eq!(app.local_voice_mode(), LocalVoiceMode::Live);
         assert!(!app.mic_muted.load(Ordering::Relaxed));
         assert!(!app.deafened.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn live_video_badge_stops_to_warn_backed_off_state() {
+        let mut app = test_app();
+        let mut room = RoomMode::default();
+        let (tx, rx) = mpsc::channel();
+        app.network = Some(NetworkClient::from_parts_for_test(tx));
+        app.screencast = Some(crate::video::ScreencastHandle::for_test());
+        app.cached_screencast_start = Some(CachedScreencastStart {
+            argv: vec!["capture".to_string()],
+            hevc: false,
+        });
+        let stream_id = StreamId(7);
+        app.screencast_stream_id = Some(stream_id);
+        app.screencast_status
+            .live(stream_id, "h264".to_string(), 1280, 720);
+
+        let mut buffer = Buffer::new(100, 24);
+        render_room(&mut app, &mut room, &mut buffer);
+        let video_rect = app.chrome.top_bar.video;
+
+        click_top_bar_rect(&mut app, &mut room, video_rect);
+
+        assert!(app.screencast.is_none());
+        assert_eq!(app.screencast_status.phase, ScreencastPhase::Off);
+        assert_eq!(app.status.text(), "video off");
+        match rx.try_recv().expect("stop share command") {
+            NetworkCommand::StopShare { stream_id: stopped } => assert_eq!(stopped, stream_id),
+            other => panic!("unexpected command: {other:?}"),
+        }
+
+        let mut buffer = Buffer::new(100, 24);
+        render_room(&mut app, &mut room, &mut buffer);
+        let off_rect = app.chrome.top_bar.video;
+        assert!(!off_rect.is_empty());
+        assert_eq!(rect_text(&mut buffer, off_rect), " VIDEO OFF ");
+        let style = cell_style(&mut buffer, off_rect.x, off_rect.y);
+        assert_eq!(style.bg(), app.theme.warn.fg());
+        assert_eq!(style.fg(), app.theme.mode_server_edit.fg());
+    }
+
+    #[test]
+    fn off_video_badge_restarts_cached_command() {
+        let mut app = test_app();
+        let mut room = RoomMode::default();
+        let (tx, _rx) = mpsc::channel();
+        app.network = Some(NetworkClient::from_parts_for_test(tx));
+        app.active_tcp_addr = Some("127.0.0.1:1".to_string());
+        app.voice_room = Some(RoomId(1));
+        let missing = format!(
+            "/tmp/chatt-missing-cached-video-command-{}",
+            std::process::id()
+        );
+        app.cached_screencast_start = Some(CachedScreencastStart {
+            argv: vec![missing.clone()],
+            hevc: false,
+        });
+        app.screencast_status.turn_off();
+
+        let mut buffer = Buffer::new(100, 24);
+        render_room(&mut app, &mut room, &mut buffer);
+        let off_rect = app.chrome.top_bar.video;
+
+        click_top_bar_rect(&mut app, &mut room, off_rect);
+
+        assert_eq!(app.screencast_status.phase, ScreencastPhase::Failed);
+        assert!(
+            app.screencast_status
+                .last_issue
+                .as_ref()
+                .is_some_and(|issue| issue.reason.contains(&missing)),
+            "restart should use the cached command"
+        );
+        assert_eq!(app.status.kind(), StatusKind::Error);
     }
 
     #[test]

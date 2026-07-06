@@ -20,7 +20,7 @@ use crate::{
         volume_db_label,
     },
     bindings::{self, Reachable, ReachableKind},
-    chat_buffer::{self, LineKind},
+    chat_buffer::{self, LineKind, NoticeKind},
     client_net::{TransferDirection, format_bytes},
     theme::{self, Theme},
     tui::modes::{LobbyListFocus, RoomLayout, SettingsMode, WelcomeMode},
@@ -1002,6 +1002,10 @@ fn draw_video_status_block(row: &mut Rect, app: &App, buf: &mut Buffer) -> Rect 
                 format_bytes(app.screencast_status.rolling_bytes_per_sec)
             ),
         ),
+        ScreencastPhase::Off => (
+            top_bar_active_button_style(app.theme, app.theme.warn),
+            " VIDEO OFF ".to_string(),
+        ),
         ScreencastPhase::Failed => (
             top_bar_active_button_style(app.theme, app.theme.error),
             " VIDEO FAILED ".to_string(),
@@ -1363,11 +1367,7 @@ fn draw_chat(
                 } else {
                     app.theme.background
                 };
-                let accent = if msg.local {
-                    app.theme.good
-                } else {
-                    app.theme.accent
-                };
+                let accent = chat_entry_accent(app.theme, msg.local, msg.notice_kind);
                 marker.with(base).fill(buf);
                 marker.with(base.patch(accent)).text(buf, "▌");
                 row.with(base).fill(buf);
@@ -1482,11 +1482,7 @@ fn draw_chat_heading(
     } else {
         normal_base
     };
-    let accent = if msg.local {
-        app.theme.good
-    } else {
-        app.theme.accent
-    };
+    let accent = chat_entry_accent(app.theme, msg.local, msg.notice_kind);
     let selected_base = selected_chat_heading_style(app.theme, accent);
     let header_base = if selected {
         selected_base.unwrap_or(base)
@@ -1521,6 +1517,15 @@ fn draw_chat_heading(
             base.patch(app.theme.subtle)
         };
         content.with(age_style).with(HAlign::Right).text(buf, &age);
+    }
+}
+
+fn chat_entry_accent(theme: Theme, local: bool, notice_kind: Option<NoticeKind>) -> Style {
+    match notice_kind {
+        Some(NoticeKind::Info) => theme.muted,
+        Some(NoticeKind::Error) => theme.error,
+        None if local => theme.good,
+        None => theme.accent,
     }
 }
 
