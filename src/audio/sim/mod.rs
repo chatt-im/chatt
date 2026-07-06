@@ -9,13 +9,16 @@ pub use file_source::{
     run_live_audio_file_source,
 };
 pub use harness::{
-    load_live_audio_simulation_sample_pcm, load_live_audio_simulation_speech_frames,
-    render_live_audio_simulation_input, run_live_audio_direct_sample_simulation_output,
+    LiveAudioContentionBenchmark, load_live_audio_simulation_sample_pcm,
+    load_live_audio_simulation_speech_frames, render_live_audio_simulation_input,
+    run_live_audio_direct_sample_simulation_output,
     run_live_audio_direct_sample_simulation_output_with_trace, run_live_audio_simulation,
     run_live_audio_simulation_with_speech, run_live_audio_simulation_with_speech_output,
     split_pcm_to_simulation_frames,
 };
 pub use scenario::{
+    LiveAudioContentionBenchCondition, LiveAudioContentionBenchConfig,
+    LiveAudioContentionBenchReport, LiveAudioContentionBenchTarget,
     LiveAudioDirectSampleSimulationConfig, LiveAudioPacketLossProfile, LiveAudioSimulationConfig,
     LiveAudioSimulationOutput, LiveAudioSimulationReport, LiveAudioSimulationScenario,
 };

@@ -1536,6 +1536,56 @@ pub(crate) fn drain_live_playback_mixer_events(
     drained
 }
 
+pub(crate) struct LivePlaybackCallbackBench {
+    channels: CallbackChannelCount,
+    output: Vec<f32>,
+    playback_record_block: Vec<f32>,
+    mix_adapter: LivePlaybackMixAdapter,
+    device_rate: u32,
+}
+
+impl LivePlaybackCallbackBench {
+    pub(crate) fn new_48khz_f32_stereo(frames: usize) -> Self {
+        let channels = CallbackChannelCount::new(2, "live playback benchmark")
+            .expect("stereo benchmark channel count should be non-zero");
+        Self {
+            channels,
+            output: vec![0.0; frames.saturating_mul(channels.get())],
+            playback_record_block: Vec::new(),
+            mix_adapter: LivePlaybackMixAdapter::new(),
+            device_rate: SAMPLE_RATE,
+        }
+    }
+
+    pub(crate) fn run(&mut self, mixer: &mut LivePlaybackMixer, now: Instant) -> f64 {
+        live_playback_callback::<f32>(
+            &mut self.output,
+            self.channels,
+            mixer,
+            None,
+            None,
+            &mut self.playback_record_block,
+            &mut self.mix_adapter,
+            None,
+            self.device_rate,
+            now,
+        );
+        self.output
+            .iter()
+            .enumerate()
+            .map(|(index, sample)| f64::from(*sample) * ((index % 251 + 1) as f64))
+            .sum()
+    }
+
+    pub(crate) fn output_frames(&self) -> usize {
+        self.channels.frames_for_interleaved(self.output.len())
+    }
+
+    pub(crate) fn output(&self) -> &[f32] {
+        &self.output
+    }
+}
+
 fn callback_period(frames: usize, device_rate: u32) -> Duration {
     let nanos = frames as u128 * 1_000_000_000u128 / u128::from(device_rate.max(1));
     Duration::from_nanos(nanos.min(u128::from(u64::MAX)) as u64)

@@ -33,6 +33,8 @@ pub use shared::{
     RemoteVoicePacket, SAMPLE_RATE, StatsSnapshot, VoicePayload, VoicePayloadRef,
 };
 pub use sim::{
+    LiveAudioContentionBenchCondition, LiveAudioContentionBenchConfig,
+    LiveAudioContentionBenchReport, LiveAudioContentionBenchTarget, LiveAudioContentionBenchmark,
     LiveAudioDirectSampleSimulationConfig, LiveAudioFilePlaybackTestConfig,
     LiveAudioFilePlaybackTestReport, LiveAudioFileSourceConfig, LiveAudioFileSourceReport,
     LiveAudioMuteState, LiveAudioPacketLossProfile, LiveAudioSimulationConfig,

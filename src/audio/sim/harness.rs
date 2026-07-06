@@ -1,7 +1,8 @@
 use std::{
     path::Path,
     process::Command,
-    sync::{Arc, Mutex},
+    sync::{Arc, Barrier, Mutex},
+    thread,
     time::{Duration, Instant},
 };
 
@@ -10,12 +11,16 @@ use crate::{
         capture::{
             EchoReference, LiveEncoderPipeline, build_live_encoder_pipeline_with_initial_mute,
         },
-        playback::{LiveDecodeStreams, LivePlaybackMixer},
+        device::{LivePlaybackCallbackBench, drain_live_playback_mixer_events},
+        playback::{
+            LiveDecodeStreams, LivePlaybackMixer, LivePlaybackMixerEvent, MIX_FRAME_SAMPLES,
+            SpscSwapQueue,
+        },
         shared::{
-            AudioStats, FRAME_SAMPLES, LIVE_OPUS_FRAME_SAMPLES, LiveAudioTraceWriter,
-            LocalVoiceFrame, RemoteVoicePacket, SAMPLE_RATE, duration_to_ms, frames_for_duration,
-            max_adjacent_delta, normalized_to_i16_scale, peak_i16_scale, rms_i16_scale,
-            rms_normalized, samples_to_ms, soft_limit, trace_time_ms,
+            AudioStats, FRAME_SAMPLES, LIVE_OPUS_FRAME_SAMPLES, LIVE_PLAYBACK_COMMAND_CAPACITY,
+            LiveAudioTraceWriter, LocalVoiceFrame, RemoteVoicePacket, SAMPLE_RATE, duration_to_ms,
+            frames_for_duration, max_adjacent_delta, normalized_to_i16_scale, peak_i16_scale,
+            rms_i16_scale, rms_normalized, samples_to_ms, soft_limit, trace_time_ms,
         },
         sim::{
             network::{
@@ -24,8 +29,11 @@ use crate::{
                 trace_output_window,
             },
             scenario::{
-                LiveAudioDirectSampleSimulationConfig, LiveAudioSimulationConfig,
-                LiveAudioSimulationOutput, LiveAudioSimulationReport, LiveAudioSimulationScenario,
+                LiveAudioContentionBenchCondition, LiveAudioContentionBenchConfig,
+                LiveAudioContentionBenchReport, LiveAudioContentionBenchTarget,
+                LiveAudioDirectSampleSimulationConfig, LiveAudioPacketLossProfile,
+                LiveAudioSimulationConfig, LiveAudioSimulationOutput, LiveAudioSimulationReport,
+                LiveAudioSimulationScenario,
             },
         },
     },
@@ -182,6 +190,489 @@ pub fn run_live_audio_simulation_with_speech_output(
     speech_frames: &[Vec<f32>],
 ) -> Result<LiveAudioSimulationOutput, String> {
     run_live_audio_simulation_inner(config, speech_frames, true)
+}
+
+pub struct LiveAudioContentionBenchmark {
+    config: LiveAudioContentionBenchConfig,
+    primer_packets: Arc<[ContentionScheduledPacket]>,
+    replay_packets: Arc<[ContentionScheduledPacket]>,
+    callbacks: usize,
+    prepared: ContentionPreparedStats,
+}
+
+#[derive(Clone)]
+struct ContentionScheduledPacket {
+    offset: Duration,
+    packet: RemoteVoicePacket,
+}
+
+impl ContentionScheduledPacket {
+    fn replay_at(&self, start: Instant) -> RemoteVoicePacket {
+        let mut packet = self.packet.clone();
+        packet.received_at = start + self.offset;
+        packet
+    }
+}
+
+#[derive(Clone, Copy, Default)]
+struct ContentionPreparedStats {
+    generated_frames: u64,
+    queued_frames: u64,
+    lost_frames: u64,
+    suppressed_frames: u64,
+}
+
+#[derive(Default)]
+struct ContentionIngestStats {
+    inserted_packets: u64,
+    late_packets: u64,
+}
+
+#[derive(Default)]
+struct ContentionOutputStats {
+    callbacks: u64,
+    mixer_events_drained: u64,
+    checksum: f64,
+    metrics: OnlineAudioMetrics,
+}
+
+struct ContentionRuntime {
+    mixer: LivePlaybackMixer,
+    decode_streams: LiveDecodeStreams,
+    mixer_events: Arc<SpscSwapQueue<LivePlaybackMixerEvent>>,
+    start: Instant,
+}
+
+impl LiveAudioContentionBenchmark {
+    pub fn prepare(
+        config: LiveAudioContentionBenchConfig,
+        speech_frames: &[Vec<f32>],
+    ) -> Result<Self, String> {
+        config.tuning.validate()?;
+        if config.streams == 0 {
+            return Err("live audio contention benchmark needs at least one stream".to_string());
+        }
+        validate_live_audio_simulation_speech_frames(speech_frames)?;
+
+        let callbacks = frames_for_duration(config.duration).max(1);
+        let (primer_packets, replay_packets, prepared) =
+            prepare_contention_packets(config, speech_frames)?;
+
+        Ok(Self {
+            config,
+            primer_packets: Arc::from(primer_packets.into_boxed_slice()),
+            replay_packets: Arc::from(replay_packets.into_boxed_slice()),
+            callbacks,
+            prepared,
+        })
+    }
+
+    pub fn run(&self) -> Result<LiveAudioContentionBenchReport, String> {
+        let runtime = self.build_runtime()?;
+        let runtime_start = runtime.start;
+        let runtime_finish = runtime_end(self.config, runtime_start);
+        let gate = Arc::new(Barrier::new(2));
+
+        let (decode_streams, ingest, output) = match self.config.target {
+            LiveAudioContentionBenchTarget::OutputCallback
+            | LiveAudioContentionBenchTarget::FullOutputCallback => {
+                let ingest_gate = Arc::clone(&gate);
+                let ingest_packets = Arc::clone(&self.replay_packets);
+                let ingest_events = Arc::clone(&runtime.mixer_events);
+                let ingest_start = runtime.start;
+                let decode_streams = runtime.decode_streams;
+                let ingest = thread::spawn(move || {
+                    run_contention_ingest(
+                        decode_streams,
+                        ingest_events,
+                        ingest_packets,
+                        ingest_start,
+                        runtime_finish,
+                        ingest_gate,
+                    )
+                });
+
+                let (mixer, output) = match self.config.target {
+                    LiveAudioContentionBenchTarget::OutputCallback => run_contention_output(
+                        runtime.mixer,
+                        runtime.mixer_events,
+                        self.callbacks,
+                        runtime.start,
+                        gate,
+                    ),
+                    LiveAudioContentionBenchTarget::FullOutputCallback => {
+                        run_contention_full_output_callback(
+                            runtime.mixer,
+                            runtime.mixer_events,
+                            self.callbacks,
+                            runtime.start,
+                            gate,
+                        )
+                    }
+                    LiveAudioContentionBenchTarget::Ingest => unreachable!(),
+                };
+                let (decode_streams, ingest) = ingest
+                    .join()
+                    .map_err(|_| "live audio contention ingest thread panicked".to_string())?;
+                drop(mixer);
+                (decode_streams, ingest, output)
+            }
+            LiveAudioContentionBenchTarget::Ingest => {
+                let output_gate = Arc::clone(&gate);
+                let output_events = Arc::clone(&runtime.mixer_events);
+                let output_start = runtime.start;
+                let callbacks = self.callbacks;
+                let mixer = runtime.mixer;
+                let output = thread::spawn(move || {
+                    run_contention_output(
+                        mixer,
+                        output_events,
+                        callbacks,
+                        output_start,
+                        output_gate,
+                    )
+                });
+
+                let (decode_streams, ingest) = run_contention_ingest(
+                    runtime.decode_streams,
+                    runtime.mixer_events,
+                    Arc::clone(&self.replay_packets),
+                    runtime.start,
+                    runtime_finish,
+                    gate,
+                );
+                let (mixer, output) = output
+                    .join()
+                    .map_err(|_| "live audio contention output thread panicked".to_string())?;
+                drop(mixer);
+                (decode_streams, ingest, output)
+            }
+        };
+
+        let mut decode_streams = decode_streams;
+        let final_snapshot = decode_streams.snapshot_at(runtime_finish);
+
+        Ok(LiveAudioContentionBenchReport {
+            target: self.config.target.as_name(),
+            condition: self.config.condition.as_name(),
+            streams: self.config.streams,
+            generated_frames: self.prepared.generated_frames,
+            queued_frames: self.prepared.queued_frames,
+            lost_frames: self.prepared.lost_frames,
+            suppressed_frames: self.prepared.suppressed_frames,
+            inserted_packets: ingest.inserted_packets,
+            late_packets: ingest.late_packets,
+            callbacks: output.callbacks,
+            mixer_events_drained: output.mixer_events_drained,
+            output_samples: output.metrics.samples,
+            output_checksum: output.checksum,
+            rms: output.metrics.rms(),
+            peak: output.metrics.peak,
+            non_finite_samples: output.metrics.non_finite_samples,
+            final_snapshot,
+        })
+    }
+
+    fn build_runtime(&self) -> Result<ContentionRuntime, String> {
+        let start = Instant::now();
+        let mixer_events = Arc::new(SpscSwapQueue::with_capacity(LIVE_PLAYBACK_COMMAND_CAPACITY));
+        let mut decode_streams = LiveDecodeStreams::new(self.config.tuning);
+        decode_streams
+            .playout_hints()
+            .note_block_samples(MIX_FRAME_SAMPLES);
+        let mut mixer = LivePlaybackMixer::with_live_capacity(self.config.tuning);
+        mixer.set_playout_hints(decode_streams.playout_hints());
+
+        for packet in self.primer_packets.iter() {
+            let packet = packet.replay_at(start);
+            let now = packet.received_at;
+            let _ = decode_streams.insert_packet(packet, now);
+        }
+        decode_streams.drain_into_mixer_events(&mixer_events, start, None);
+
+        let mut pending_event = LivePlaybackMixerEvent::default();
+        let drained =
+            drain_live_playback_mixer_events(&mut mixer, &mixer_events, &mut pending_event);
+        if drained < self.config.streams as u64 {
+            return Err(format!(
+                "live audio contention benchmark registered {drained} streams, expected {}",
+                self.config.streams
+            ));
+        }
+
+        Ok(ContentionRuntime {
+            mixer,
+            decode_streams,
+            mixer_events,
+            start,
+        })
+    }
+}
+
+fn prepare_contention_packets(
+    config: LiveAudioContentionBenchConfig,
+    speech_frames: &[Vec<f32>],
+) -> Result<
+    (
+        Vec<ContentionScheduledPacket>,
+        Vec<ContentionScheduledPacket>,
+        ContentionPreparedStats,
+    ),
+    String,
+> {
+    let start = Instant::now();
+    let total_frames = frames_for_duration(config.duration).max(1);
+    let mut packets = Vec::new();
+    let mut prepared = ContentionPreparedStats::default();
+
+    for stream_index in 0..config.streams {
+        let stream_id = (stream_index + 1) as u32;
+        let packet_loss = contention_stream_loss(config.condition, stream_index);
+        let stream_config = LiveAudioSimulationConfig {
+            scenario: LiveAudioSimulationScenario::ConstantSpeech,
+            tuning: config.tuning,
+            duration: config.duration,
+            producer_clock_ratio: 1.0,
+            output_block_samples: MIX_FRAME_SAMPLES,
+            streams: config.streams,
+            seed: contention_stream_seed(config.seed, stream_index),
+            packet_loss,
+            max_amplification: crate::audio::shared::DEFAULT_LIVE_MAX_AMPLIFICATION,
+            denoise: true,
+            auto_gain: true,
+            echo_cancellation: false,
+            capture_dc_offset: 0.0,
+            capture_noise_rms: 0.0,
+        };
+        let mut state = SimStreamState::new(
+            stream_config,
+            simulation_encoder_profile(stream_config),
+            None,
+        )?;
+        let mut rng = SimRng::new(stream_config.seed);
+        let mut report = LiveAudioSimulationReport::default();
+        let mut trace = None;
+
+        for frame_index in 0..total_frames {
+            prepared.generated_frames = prepared.generated_frames.saturating_add(1);
+            let frame =
+                sample_speech_simulation_frame(speech_frames, stream_index, frame_index, 0.72);
+            let now = start + frame_offset(frame_index);
+            state.encode_and_queue_frame(
+                stream_config,
+                stream_id,
+                frame_index,
+                &frame.samples,
+                now,
+                start,
+                &mut rng,
+                &mut report,
+                &mut trace,
+            )?;
+        }
+
+        let drain_at = runtime_end(config, start);
+        for pending in state.network.drain_ready(drain_at) {
+            let offset = pending
+                .packet
+                .received_at
+                .checked_duration_since(start)
+                .unwrap_or_default();
+            packets.push(ContentionScheduledPacket {
+                offset,
+                packet: pending.packet,
+            });
+        }
+        prepared.queued_frames = prepared.queued_frames.saturating_add(report.queued_frames);
+        prepared.lost_frames = prepared.lost_frames.saturating_add(report.lost_frames);
+        prepared.suppressed_frames = prepared
+            .suppressed_frames
+            .saturating_add(state.suppressed_frames());
+    }
+
+    packets.sort_by(|left, right| {
+        left.offset
+            .cmp(&right.offset)
+            .then_with(|| left.packet.stream_id.cmp(&right.packet.stream_id))
+            .then_with(|| left.packet.sequence.cmp(&right.packet.sequence))
+    });
+
+    let mut primed = vec![false; config.streams];
+    let mut primer_packets = Vec::with_capacity(config.streams);
+    let mut replay_packets = Vec::with_capacity(packets.len().saturating_sub(config.streams));
+    for packet in packets {
+        let stream_index = packet.packet.stream_id.saturating_sub(1) as usize;
+        if stream_index < primed.len() && !primed[stream_index] {
+            primed[stream_index] = true;
+            primer_packets.push(packet);
+        } else {
+            replay_packets.push(packet);
+        }
+    }
+
+    if primer_packets.len() != config.streams {
+        return Err(format!(
+            "live audio contention benchmark only found {} priming streams, expected {}",
+            primer_packets.len(),
+            config.streams
+        ));
+    }
+    if replay_packets.is_empty() {
+        return Err("live audio contention benchmark produced no replay packets".to_string());
+    }
+
+    Ok((primer_packets, replay_packets, prepared))
+}
+
+fn run_contention_ingest(
+    mut decode_streams: LiveDecodeStreams,
+    mixer_events: Arc<SpscSwapQueue<LivePlaybackMixerEvent>>,
+    packets: Arc<[ContentionScheduledPacket]>,
+    start: Instant,
+    end: Instant,
+    gate: Arc<Barrier>,
+) -> (LiveDecodeStreams, ContentionIngestStats) {
+    const DRAIN_INTERVAL_PACKETS: usize = 8;
+
+    gate.wait();
+    let mut stats = ContentionIngestStats::default();
+    for (index, packet) in packets.iter().enumerate() {
+        let packet = packet.replay_at(start);
+        let now = packet.received_at;
+        match decode_streams.insert_packet(packet, now) {
+            Some(InsertOutcome::Accepted) => {
+                stats.inserted_packets = stats.inserted_packets.saturating_add(1);
+            }
+            Some(InsertOutcome::Late) => {
+                stats.inserted_packets = stats.inserted_packets.saturating_add(1);
+                stats.late_packets = stats.late_packets.saturating_add(1);
+            }
+            None => {}
+        }
+        if index % DRAIN_INTERVAL_PACKETS == DRAIN_INTERVAL_PACKETS - 1 {
+            decode_streams.drain_into_mixer_events(&mixer_events, now, None);
+        }
+    }
+    decode_streams.drain_into_mixer_events(&mixer_events, end, None);
+    (decode_streams, stats)
+}
+
+fn run_contention_output(
+    mut mixer: LivePlaybackMixer,
+    mixer_events: Arc<SpscSwapQueue<LivePlaybackMixerEvent>>,
+    callbacks: usize,
+    start: Instant,
+    gate: Arc<Barrier>,
+) -> (LivePlaybackMixer, ContentionOutputStats) {
+    let mut pending_event = LivePlaybackMixerEvent::default();
+    let mut out = [0.0f32; MIX_FRAME_SAMPLES];
+    let mut stats = ContentionOutputStats::default();
+    let callback_period = frame_offset(1);
+
+    gate.wait();
+    for callback_index in 0..callbacks {
+        let callback_start = Instant::now();
+        let now = start + frame_offset(callback_index);
+        let drained =
+            drain_live_playback_mixer_events(&mut mixer, &mixer_events, &mut pending_event);
+        mixer.note_device_callback_frames(MIX_FRAME_SAMPLES);
+        mixer.mix_10ms(now, &mut out);
+        mixer.note_staged_samples(0);
+        mixer.note_callback_metrics(callback_start.elapsed(), callback_period, drained);
+
+        stats.callbacks = stats.callbacks.saturating_add(1);
+        stats.mixer_events_drained = stats.mixer_events_drained.saturating_add(drained);
+        for sample in out {
+            let weight = (stats.metrics.samples % 251 + 1) as f64;
+            stats.checksum += f64::from(sample) * weight;
+            stats.metrics.observe(sample);
+        }
+    }
+
+    let drained = drain_live_playback_mixer_events(&mut mixer, &mixer_events, &mut pending_event);
+    stats.mixer_events_drained = stats.mixer_events_drained.saturating_add(drained);
+    (mixer, stats)
+}
+
+fn run_contention_full_output_callback(
+    mut mixer: LivePlaybackMixer,
+    mixer_events: Arc<SpscSwapQueue<LivePlaybackMixerEvent>>,
+    callbacks: usize,
+    start: Instant,
+    gate: Arc<Barrier>,
+) -> (LivePlaybackMixer, ContentionOutputStats) {
+    let mut callback = LivePlaybackCallbackBench::new_48khz_f32_stereo(MIX_FRAME_SAMPLES);
+    let mut pending_event = LivePlaybackMixerEvent::default();
+    let mut stats = ContentionOutputStats::default();
+    let callback_period = frame_offset(1);
+
+    gate.wait();
+    for callback_index in 0..callbacks {
+        let callback_start = Instant::now();
+        let now = start + frame_offset(callback_index);
+        let drained =
+            drain_live_playback_mixer_events(&mut mixer, &mixer_events, &mut pending_event);
+        stats.checksum += callback.run(&mut mixer, now);
+        mixer.note_callback_metrics(callback_start.elapsed(), callback_period, drained);
+
+        stats.callbacks = stats.callbacks.saturating_add(1);
+        stats.mixer_events_drained = stats.mixer_events_drained.saturating_add(drained);
+        debug_assert_eq!(callback.output_frames(), MIX_FRAME_SAMPLES);
+        for &sample in callback.output() {
+            stats.metrics.observe(sample);
+        }
+    }
+
+    let drained = drain_live_playback_mixer_events(&mut mixer, &mixer_events, &mut pending_event);
+    stats.mixer_events_drained = stats.mixer_events_drained.saturating_add(drained);
+    (mixer, stats)
+}
+
+fn runtime_end(config: LiveAudioContentionBenchConfig, start: Instant) -> Instant {
+    start + config.duration + Duration::from_secs(2)
+}
+
+fn frame_offset(frame_index: usize) -> Duration {
+    Duration::from_secs_f64(frame_index as f64 * MIX_FRAME_SAMPLES as f64 / SAMPLE_RATE as f64)
+}
+
+fn contention_stream_loss(
+    condition: LiveAudioContentionBenchCondition,
+    stream_index: usize,
+) -> LiveAudioPacketLossProfile {
+    match condition {
+        LiveAudioContentionBenchCondition::Normal => {
+            const LOSSES: [LiveAudioPacketLossProfile; 6] = [
+                LiveAudioPacketLossProfile::None,
+                LiveAudioPacketLossProfile::Lan,
+                LiveAudioPacketLossProfile::CleanJitter,
+                LiveAudioPacketLossProfile::RegionalEthernet,
+                LiveAudioPacketLossProfile::CleanJitter,
+                LiveAudioPacketLossProfile::MildRandom,
+            ];
+            LOSSES[stream_index % LOSSES.len()]
+        }
+        LiveAudioContentionBenchCondition::Extreme => {
+            const LOSSES: [LiveAudioPacketLossProfile; 6] = [
+                LiveAudioPacketLossProfile::Random30,
+                LiveAudioPacketLossProfile::Random45,
+                LiveAudioPacketLossProfile::Random60,
+                LiveAudioPacketLossProfile::BurstyWifi,
+                LiveAudioPacketLossProfile::CongestedWifi,
+                LiveAudioPacketLossProfile::MobileHandoff,
+            ];
+            LOSSES[stream_index % LOSSES.len()]
+        }
+    }
+}
+
+fn contention_stream_seed(seed: u64, stream_index: usize) -> u64 {
+    let stream = stream_index as u64 + 1;
+    let mixed = seed
+        ^ 0x9e37_79b9_7f4a_7c15u64
+            .wrapping_mul(stream)
+            .rotate_left((stream_index as u32 % 31) + 1);
+    mixed.max(1)
 }
 
 pub fn run_live_audio_direct_sample_simulation_output(
