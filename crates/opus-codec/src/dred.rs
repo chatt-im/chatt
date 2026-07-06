@@ -335,6 +335,7 @@ fn validate_pcm_frame_len<T>(
 /// Managed handle for libopus `OpusDRED` state.
 pub struct DredState {
     raw: NonNull<OpusDRED>,
+    size: usize,
 }
 
 unsafe impl Send for DredState {}
@@ -357,7 +358,14 @@ impl DredState {
         let ptr = NonNull::new(ptr).ok_or(Error::AllocFail)?;
         // opus_dred_alloc() is malloc-like and does not initialize OpusDRED.
         unsafe { std::ptr::write_bytes(ptr.as_ptr().cast::<u8>(), 0, size) };
-        Ok(Self { raw: ptr })
+        Ok(Self { raw: ptr, size })
+    }
+
+    /// Reset the state in place, equivalent to a fresh [`DredState::new`]
+    /// without the allocation: `new` only zeroes the malloc'd block, so
+    /// re-zeroing restores the exact initial state.
+    pub fn reset(&mut self) {
+        unsafe { std::ptr::write_bytes(self.raw.as_ptr().cast::<u8>(), 0, self.size) };
     }
 
     /// Size of a DRED state in bytes.
