@@ -15,8 +15,8 @@ use crate::audio::{
     },
     shared::{
         AUDIO_POP_DELTA_THRESHOLD, LivePlaybackSnapshot, PlaybackStreamControl,
-        audio_pop_logging_enabled, db_to_gain, max_adjacent_delta, peak_normalized, rms_normalized,
-        samples_to_duration,
+        audio_callback_logging_enabled, audio_pop_logging_enabled, db_to_gain, max_adjacent_delta,
+        peak_normalized, rms_normalized, samples_to_duration,
     },
 };
 
@@ -316,6 +316,9 @@ impl LivePlaybackMixer {
             return;
         }
         self.callback_overruns = self.callback_overruns.saturating_add(1);
+        if !audio_callback_logging_enabled() {
+            return;
+        }
         let now = Instant::now();
         if self.last_overrun_log_at.is_some_and(|at| {
             now.saturating_duration_since(at) < LIVE_PLAYBACK_BACKEND_ERROR_LOG_INTERVAL
@@ -797,6 +800,9 @@ impl LivePlaybackSharedSnapshot {
     ) {
         let is_xrun = kind == AudioErrorKind::Xrun;
         let Ok(mut inner) = self.inner.lock() else {
+            if !audio_callback_logging_enabled() {
+                return;
+            }
             if is_xrun {
                 kvlog::warn!("live playback backend xrun", error = error.as_str());
             } else {
@@ -817,6 +823,9 @@ impl LivePlaybackSharedSnapshot {
         }
         inner.snapshot.last_backend_error = Some(error.clone());
 
+        if !audio_callback_logging_enabled() {
+            return;
+        }
         if inner.last_backend_error_log_at.is_some_and(|at| {
             now.saturating_duration_since(at) < LIVE_PLAYBACK_BACKEND_ERROR_LOG_INTERVAL
         }) {
