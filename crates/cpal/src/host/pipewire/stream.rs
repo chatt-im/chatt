@@ -286,6 +286,27 @@ fn pw_stream_time(stream: &pw::stream::Stream) -> Option<Time> {
     Some(t)
 }
 
+fn output_frame_count(
+    requested: u64,
+    capacity: usize,
+    last_quantum: u64,
+    sample_rate: u32,
+) -> usize {
+    // PipeWire documents `pw_buffer.requested == 0` as "no suggestion
+    // provided", not as a request for an empty buffer. Reuse the last graph
+    // quantum in that case. Before the first nonzero suggestion, use one 10 ms
+    // audio block, matching the fixed block supplied by clients such as Mumble.
+    let fallback = usize::try_from(last_quantum)
+        .ok()
+        .filter(|&frames| frames > 0)
+        .unwrap_or_else(|| (sample_rate as usize / 100).max(1));
+    let frames = usize::try_from(requested)
+        .ok()
+        .filter(|&frames| frames > 0)
+        .unwrap_or(fallback);
+    frames.min(capacity)
+}
+
 impl<D> UserData<D>
 where
     D: FnMut(&Data, &InputCallbackInfo) + Send + 'static,
@@ -691,7 +712,7 @@ where
 
             if let Some(mut buffer) = stream.dequeue_buffer() {
                 // Read the requested frame count before mutably borrowing datas_mut().
-                let requested = buffer.requested() as usize;
+                let requested = buffer.requested();
                 let datas = buffer.datas_mut();
                 if datas.is_empty() {
                     return;
@@ -699,10 +720,13 @@ where
                 let buf_data = &mut datas[0];
 
                 let stride = user_data.sample_format.sample_size() * n_channels as usize;
-                // frames = samples / channels or frames = data_len / stride
-                // Honor the frame count PipeWire requests this cycle, capped by the
-                // mapped buffer capacity to guard against any mismatch.
-                let frames = requested.min(buf_data.as_raw().maxsize as usize / stride);
+                let capacity = buf_data.as_raw().maxsize as usize / stride;
+                let frames = output_frame_count(
+                    requested,
+                    capacity,
+                    user_data.last_quantum.load(Ordering::Relaxed),
+                    user_data.format.rate(),
+                );
                 let Some(samples) = buf_data.data() else {
                     return;
                 };
@@ -767,6 +791,32 @@ where
         invalidated,
         is_default_device,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::output_frame_count;
+
+    #[test]
+    fn output_frame_count_honors_pipewire_suggestion() {
+        assert_eq!(output_frame_count(256, 1_024, 480, 48_000), 256);
+    }
+
+    #[test]
+    fn output_frame_count_reuses_last_quantum_without_suggestion() {
+        assert_eq!(output_frame_count(0, 1_024, 256, 48_000), 256);
+    }
+
+    #[test]
+    fn output_frame_count_starts_with_ten_ms_without_quantum() {
+        assert_eq!(output_frame_count(0, 1_024, 0, 48_000), 480);
+    }
+
+    #[test]
+    fn output_frame_count_is_capped_by_mapped_buffer() {
+        assert_eq!(output_frame_count(960, 256, 480, 48_000), 256);
+        assert_eq!(output_frame_count(0, 256, 480, 48_000), 256);
+    }
 }
 
 pub fn connect_input<D, E>(
