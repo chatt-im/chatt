@@ -170,6 +170,13 @@ pub(crate) struct LivePlaybackPlayoutHints {
     neteq_lock_wait_count: AtomicU64,
     neteq_lock_wait_total_us: AtomicU64,
     neteq_lock_wait_max_us: AtomicU64,
+    /// Count of `StopStream` events the mixer consumer has applied, in queue
+    /// order. The worker retires a stopped stream's [`SharedNetEqHandle`] only
+    /// once this passes the stop's push ordinal, so the mixer's clone is
+    /// provably dropped and the worker's drop cannot land on the callback.
+    stop_events_processed: AtomicU64,
+    /// `EnsureStream` events the mixer rejected at its preallocated stream cap.
+    streams_rejected: AtomicU64,
 }
 
 impl LivePlaybackPlayoutHints {
@@ -228,6 +235,22 @@ impl LivePlaybackPlayoutHints {
         atomic_max(&self.neteq_lock_wait_max_us, max_us);
     }
 
+    /// Consumer side: one drained `StopStream` was applied and its stream entry
+    /// dropped. Release pairs with the worker's Acquire read so the entry's
+    /// destruction happens-before the worker retires its own handle.
+    pub(crate) fn note_stop_event_processed(&self) {
+        self.stop_events_processed.fetch_add(1, Ordering::Release);
+    }
+
+    /// Worker side: how many pushed `StopStream` events the consumer has applied.
+    pub(crate) fn stop_events_processed(&self) -> u64 {
+        self.stop_events_processed.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn note_stream_rejected(&self) {
+        self.streams_rejected.fetch_add(1, Ordering::Relaxed);
+    }
+
     pub(crate) fn metrics(&self) -> LivePlaybackCallbackMetrics {
         LivePlaybackCallbackMetrics {
             callback_count: self.callback_count.load(Ordering::Relaxed),
@@ -237,6 +260,7 @@ impl LivePlaybackPlayoutHints {
             neteq_lock_wait_count: self.neteq_lock_wait_count.load(Ordering::Relaxed),
             neteq_lock_wait_total_us: self.neteq_lock_wait_total_us.load(Ordering::Relaxed),
             neteq_lock_wait_max_us: self.neteq_lock_wait_max_us.load(Ordering::Relaxed),
+            streams_rejected: self.streams_rejected.load(Ordering::Relaxed),
         }
     }
 }
@@ -250,6 +274,7 @@ pub(crate) struct LivePlaybackCallbackMetrics {
     pub(crate) neteq_lock_wait_count: u64,
     pub(crate) neteq_lock_wait_total_us: u64,
     pub(crate) neteq_lock_wait_max_us: u64,
+    pub(crate) streams_rejected: u64,
 }
 
 fn duration_to_us(duration: Duration) -> u64 {

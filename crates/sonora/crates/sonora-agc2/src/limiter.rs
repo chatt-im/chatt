@@ -97,7 +97,25 @@ impl Limiter {
         // Build immutable view of signal for level estimation.
         let signal_refs: Vec<&[f32]> = signal.iter().map(|ch| &**ch).collect();
         let level_estimate = self.level_estimator.compute_level(&signal_refs);
+        self.apply_level_estimate(level_estimate, samples_per_channel, signal);
+    }
 
+    /// Applies limiter and hard-clipping to one mono channel without any
+    /// per-call heap allocation, for realtime callers.
+    pub fn process_mono(&mut self, channel: &mut [f32]) {
+        let samples_per_channel = channel.len();
+        debug_assert!(samples_per_channel <= MAXIMAL_NUMBER_OF_SAMPLES_PER_CHANNEL);
+
+        let level_estimate = self.level_estimator.compute_level(&[&*channel]);
+        self.apply_level_estimate(level_estimate, samples_per_channel, &mut [channel]);
+    }
+
+    fn apply_level_estimate(
+        &mut self,
+        level_estimate: [f32; SUB_FRAMES_IN_FRAME as usize],
+        samples_per_channel: usize,
+        signal: &mut [&mut [f32]],
+    ) {
         debug_assert_eq!(level_estimate.len() + 1, self.scaling_factors.len());
         self.scaling_factors[0] = self.last_scaling_factor;
         for (i, &level) in level_estimate.iter().enumerate() {
@@ -147,6 +165,29 @@ mod tests {
         let mut buffer = vec![MAX_ABS_FLOAT_S16_VALUE; samples_per_channel];
         let mut channels: Vec<&mut [f32]> = vec![buffer.as_mut_slice()];
         limiter.process(&mut channels);
+    }
+
+    #[test]
+    fn process_mono_matches_process() {
+        let samples_per_channel = 480;
+        let mut limiter = Limiter::new(samples_per_channel);
+        let mut limiter_mono = Limiter::new(samples_per_channel);
+
+        for round in 0..8 {
+            let buffer: Vec<f32> = (0..samples_per_channel)
+                .map(|i| {
+                    let t = (round * samples_per_channel + i) as f32;
+                    (t * 0.013).sin() * MAX_ABS_FLOAT_S16_VALUE * 0.8
+                })
+                .collect();
+            let mut via_process = buffer.clone();
+            let mut channels: Vec<&mut [f32]> = vec![via_process.as_mut_slice()];
+            limiter.process(&mut channels);
+
+            let mut via_mono = buffer;
+            limiter_mono.process_mono(&mut via_mono);
+            assert_eq!(via_process, via_mono, "round {round}");
+        }
     }
 
     #[test]

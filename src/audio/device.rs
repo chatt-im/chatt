@@ -1512,7 +1512,7 @@ fn record_live_playback_stream_error(
     shared_snapshot.record_backend_stream_error(error, kind, Instant::now());
 }
 
-fn drain_live_playback_mixer_events(
+pub(crate) fn drain_live_playback_mixer_events(
     mixer: &mut LivePlaybackMixer,
     mixer_events: &SpscSwapQueue<LivePlaybackMixerEvent>,
     pending_event: &mut LivePlaybackMixerEvent,
@@ -1526,7 +1526,7 @@ fn drain_live_playback_mixer_events(
                 mixer.ensure_stream(stream_id, source);
             }
             LivePlaybackMixerEvent::StopStream { stream_id } => {
-                mixer.remove_stream(stream_id);
+                mixer.apply_stop_stream_event(stream_id);
             }
             LivePlaybackMixerEvent::SetStreamControl { stream_id, control } => {
                 mixer.set_stream_control(stream_id, control);
