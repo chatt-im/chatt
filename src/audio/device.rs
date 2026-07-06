@@ -28,8 +28,8 @@ use crate::audio::{
     },
     resample::PlaybackResampler,
     shared::{
-        AudioStats, BufferRequest, PlaybackStats, SAMPLE_RATE, peak_i16_scale, rms_i16_scale,
-        samples_to_duration,
+        AudioStats, BufferRequest, PlaybackStats, SAMPLE_RATE, audio_callback_logging_enabled,
+        audio_pop_logging_enabled, peak_i16_scale, rms_i16_scale, samples_to_duration,
     },
 };
 
@@ -1034,6 +1034,9 @@ impl AudioCallbackBufferObserver {
         if previous == frames {
             return;
         }
+        if !audio_callback_logging_enabled() {
+            return;
+        }
 
         kvlog::info!(
             "live audio callback buffer observed",
@@ -1186,6 +1189,8 @@ where
 {
     let data_stats = stats.clone();
     let error_stats = stats.clone();
+    let _ = audio_pop_logging_enabled();
+    let _ = audio_callback_logging_enabled();
     device
         .build_input_stream(
             stream_config,
@@ -1197,7 +1202,7 @@ where
                 capture_callback(input, channels, mono, &sender, &data_stats);
             },
             move |error| {
-                if error.kind() == ErrorKind::RealtimeDenied {
+                if error.kind() == ErrorKind::RealtimeDenied && audio_callback_logging_enabled() {
                     let error_message = error.to_string();
                     kvlog::warn!(
                         "audio realtime priority denied",
@@ -1448,6 +1453,8 @@ where
     // The worker now publishes the stream snapshot, so the callback never
     // touches `shared_snapshot` except on a backend error.
     let _ = shared_snapshot;
+    let _ = audio_pop_logging_enabled();
+    let _ = audio_callback_logging_enabled();
     let mut resampler = PlaybackResampler::new(device_rate);
     let mut pending_event = LivePlaybackMixerEvent::default();
     let mut mix_adapter = LivePlaybackMixAdapter::new();
@@ -1494,7 +1501,7 @@ fn record_live_playback_stream_error(
 ) {
     let kind = AudioErrorKind::from_cpal(error.kind());
     let error = error.to_string();
-    if kind == AudioErrorKind::RealtimeDenied {
+    if kind == AudioErrorKind::RealtimeDenied && audio_callback_logging_enabled() {
         kvlog::warn!(
             "audio realtime priority denied",
             direction = "live playback",
@@ -1625,6 +1632,7 @@ where
     let data_stats = stats.clone();
     let error_stats = stats.clone();
     let mut cursor = 0usize;
+    let _ = audio_callback_logging_enabled();
     device
         .build_output_stream(
             stream_config,
@@ -1632,7 +1640,7 @@ where
                 playback_callback(output, channels, &samples, &mut cursor, &data_stats);
             },
             move |error| {
-                if error.kind() == ErrorKind::RealtimeDenied {
+                if error.kind() == ErrorKind::RealtimeDenied && audio_callback_logging_enabled() {
                     let error_message = error.to_string();
                     kvlog::warn!(
                         "audio realtime priority denied",
@@ -1782,7 +1790,7 @@ fn capture_callback<T>(
         // dropped duration so the worker leaves a concealable timestamp gap
         // rather than splicing the media clock across the hole.
         let dropped = stats.record_dropped_chunk(samples);
-        if dropped.is_power_of_two() {
+        if dropped.is_power_of_two() && audio_callback_logging_enabled() {
             kvlog::warn!(
                 "capture worker backpressure dropped chunk",
                 dropped_chunks = dropped

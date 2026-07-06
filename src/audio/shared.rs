@@ -275,6 +275,7 @@ pub(crate) const MAX_OPUS_DECODE_SAMPLES: usize = 5_760;
 pub(crate) const MAX_OPUS_PACKET_BYTES: usize = 1_500;
 pub(crate) const AUDIO_POP_LOG_ENV: &str = "CHATT_AUDIO_POP_LOG";
 pub(crate) const AUDIO_POP_DELTA_THRESHOLD: f32 = 0.025;
+pub(crate) const AUDIO_CALLBACK_LOG_ENV: &str = "CHATT_AUDIO_CALLBACK_LOG";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BufferRequest {
@@ -856,6 +857,14 @@ pub(crate) fn peak_normalized(samples: &[f32]) -> f32 {
 pub(crate) fn audio_pop_logging_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| env_flag_enabled(AUDIO_POP_LOG_ENV))
+}
+
+/// True when kvlog diagnostics on CPAL callback threads are enabled. Logging
+/// from a callback locks the global logger and can allocate, so it is opt-in.
+/// Initialize eagerly at stream build so the env read never runs on a callback.
+pub(crate) fn audio_callback_logging_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| env_flag_enabled(AUDIO_CALLBACK_LOG_ENV))
 }
 
 fn env_flag_enabled(name: &str) -> bool {
