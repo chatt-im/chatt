@@ -695,6 +695,16 @@ impl LiveDecodeStreams {
     pub(crate) fn get(&self, stream_id: u32) -> Option<&LiveDecodeStream> {
         self.streams.get(&stream_id)
     }
+
+    /// One [`NetEqCore::debug_timeline`] line per stream, for pinpointing
+    /// buffer/timeline state around a misbehaving output block in sims.
+    #[cfg(test)]
+    pub(crate) fn debug_timelines(&self) -> Vec<String> {
+        self.streams
+            .values()
+            .map(|stream| lock_shared_stream(&stream.shared).core().debug_timeline())
+            .collect()
+    }
 }
 
 fn neteq_operation_priority(operation: &str) -> u8 {

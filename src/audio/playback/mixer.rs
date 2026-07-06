@@ -6,6 +6,7 @@ use std::{
 use hashbrown::HashMap;
 
 use super::frame_combiner::{FrameCombiner, MIX_FRAME_SAMPLES};
+use super::neteq::AudioResult;
 use crate::audio::{
     errors::AudioErrorKind,
     playback::{
@@ -75,6 +76,30 @@ pub(crate) struct LivePlaybackMixer {
     last_output_sample: f32,
     has_last_output_sample: bool,
     output_block_index: u64,
+    /// Per-stream render attribution for the current block, captured inside each
+    /// stream's NetEQ lock hold so a detected pop can be traced to the operation
+    /// that produced it. Reused across callbacks.
+    render_records: Vec<StreamRenderRecord>,
+}
+
+/// One stream's contribution to the block being mixed.
+struct StreamRenderRecord {
+    stream_id: u32,
+    /// Index into `source_frames` when the stream reached the combiner.
+    frame_index: Option<usize>,
+    /// The NetEQ operation that rendered the block, `None` for ring sources.
+    neteq: Option<AudioResult>,
+    declick_start: f32,
+    declick_end: f32,
+    /// The stream's final contributed sample of the previous block, for the
+    /// cross-block first-sample delta.
+    previous_last_sample: f32,
+}
+
+struct RenderedStream {
+    active: bool,
+    neteq_lock_wait: Duration,
+    neteq: Option<AudioResult>,
 }
 
 struct ConsumerStream {
@@ -85,6 +110,9 @@ struct ConsumerStream {
     /// fades in instead of stepping from silence; ramps back to 0.0 on mute or
     /// muted NetEQ output.
     declick_gain: f32,
+    /// The last post-envelope sample this stream contributed, 0.0 while
+    /// inactive. Diagnostics only, feeds [`StreamRenderRecord`].
+    last_rendered_sample: f32,
 }
 
 enum ConsumerSource {
@@ -131,6 +159,7 @@ impl LivePlaybackMixer {
             last_output_sample: 0.0,
             has_last_output_sample: false,
             output_block_index: 0,
+            render_records: Vec::with_capacity(LIVE_PLAYBACK_PREALLOCATED_STREAMS),
         }
     }
 
@@ -223,9 +252,14 @@ impl LivePlaybackMixer {
                 control,
                 last_sample: 0.0,
                 declick_gain: 0.0,
+                last_rendered_sample: 0.0,
             });
         while self.source_frames.len() < self.streams.len() {
             self.source_frames.push([0.0; MIX_FRAME_SAMPLES]);
+        }
+        if self.render_records.capacity() < self.streams.len() {
+            self.render_records
+                .reserve(self.streams.len() - self.render_records.capacity());
         }
     }
 
@@ -307,15 +341,31 @@ impl LivePlaybackMixer {
         let mut neteq_lock_wait_count = 0u64;
         let mut neteq_lock_wait_total = Duration::ZERO;
         let mut neteq_lock_wait_max = Duration::ZERO;
-        for stream in self.streams.values_mut() {
+        self.render_records.clear();
+        for (&stream_id, stream) in self.streams.iter_mut() {
             let frame = &mut self.source_frames[normal_frames];
-            let (active, wait) = render_stream_10ms(stream, now, frame);
-            if wait.as_micros() > 0 {
+            let declick_start = stream.declick_gain;
+            let previous_last_sample = stream.last_rendered_sample;
+            let rendered = render_stream_10ms(stream, now, frame);
+            if rendered.neteq_lock_wait.as_micros() > 0 {
                 neteq_lock_wait_count = neteq_lock_wait_count.saturating_add(1);
-                neteq_lock_wait_total += wait;
-                neteq_lock_wait_max = neteq_lock_wait_max.max(wait);
+                neteq_lock_wait_total += rendered.neteq_lock_wait;
+                neteq_lock_wait_max = neteq_lock_wait_max.max(rendered.neteq_lock_wait);
             }
-            if active {
+            stream.last_rendered_sample = if rendered.active {
+                frame[MIX_FRAME_SAMPLES - 1]
+            } else {
+                0.0
+            };
+            self.render_records.push(StreamRenderRecord {
+                stream_id,
+                frame_index: rendered.active.then_some(normal_frames),
+                neteq: rendered.neteq,
+                declick_start,
+                declick_end: stream.declick_gain,
+                previous_last_sample,
+            });
+            if rendered.active {
                 normal_frames += 1;
             }
         }
@@ -338,7 +388,7 @@ fn render_stream_10ms(
     stream: &mut ConsumerStream,
     now: Instant,
     out: &mut [f32; MIX_FRAME_SAMPLES],
-) -> (bool, Duration) {
+) -> RenderedStream {
     let gain = db_to_gain(stream.control.volume_db);
     let muted = stream.control.muted;
     match &mut stream.source {
@@ -350,13 +400,14 @@ fn render_stream_10ms(
             let mut shared = lock_shared_stream(handle);
             let wait = lock_start.elapsed();
             let result = shared.get_audio_10ms(now, out);
-            (
-                apply_declick(&mut stream.declick_gain, gain, !muted && !result.muted, out),
-                wait,
-            )
+            RenderedStream {
+                active: apply_declick(&mut stream.declick_gain, gain, !muted && !result.muted, out),
+                neteq_lock_wait: wait,
+                neteq: Some(result),
+            }
         }
-        ConsumerSource::Ring(reader) => (
-            render_ring_stream_10ms(
+        ConsumerSource::Ring(reader) => RenderedStream {
+            active: render_ring_stream_10ms(
                 reader,
                 &mut stream.declick_gain,
                 &mut stream.last_sample,
@@ -364,8 +415,9 @@ fn render_stream_10ms(
                 muted,
                 out,
             ),
-            Duration::ZERO,
-        ),
+            neteq_lock_wait: Duration::ZERO,
+            neteq: None,
+        },
     }
 }
 
@@ -456,9 +508,7 @@ impl LivePlaybackMixer {
         };
         let max_delta = max_adjacent_delta(out);
         if audio_pop_logging_enabled()
-            && (first_delta >= AUDIO_POP_DELTA_THRESHOLD
-                || max_delta >= AUDIO_POP_DELTA_THRESHOLD
-                || self.last_snapshot.backend_xruns > 0)
+            && (first_delta >= AUDIO_POP_DELTA_THRESHOLD || max_delta >= AUDIO_POP_DELTA_THRESHOLD)
         {
             kvlog::info!(
                 "audio pop mixer output block",
@@ -472,19 +522,87 @@ impl LivePlaybackMixer {
                 first_sample,
                 last_sample = out.last().copied().unwrap_or_default(),
                 active_streams = self.streams.len(),
-                output_ring_samples = self.last_snapshot.output_ring_samples,
-                max_output_ring_ms = self.last_snapshot.max_output_ring_ms,
-                neteq_start_delay_ms = self.last_snapshot.neteq_start_delay_ms,
-                neteq_target_ms = self.last_snapshot.neteq_target_ms,
-                neteq_playout_delay_ms = self.last_snapshot.neteq_playout_delay_ms,
-                neteq_packet_buffer_ms = self.last_snapshot.neteq_packet_buffer_ms,
-                neteq_decision = self.last_snapshot.neteq_decision.as_str(),
-                backend_xruns = self.last_snapshot.backend_xruns
+                backend_xruns = self.backend_xruns
             );
+            self.log_stream_pop_records();
         }
         self.last_output_sample = out.last().copied().unwrap_or_default();
         self.has_last_output_sample = true;
         self.output_block_index = self.output_block_index.wrapping_add(1);
+    }
+
+    /// Emits one attribution record per stream for the block that tripped the
+    /// pop logger: the NetEQ operation captured while the block was rendered,
+    /// the stream's post-envelope frame statistics, and a fresh diagnostics read
+    /// from the stream's NetEQ. Runs only after a pop is detected, so the extra
+    /// lock holds stay off the steady path.
+    fn log_stream_pop_records(&self) {
+        for record in &self.render_records {
+            let Some(stream) = self.streams.get(&record.stream_id) else {
+                continue;
+            };
+            let (first_delta, max_delta, rms, peak) = match record.frame_index {
+                Some(index) => {
+                    let frame = &self.source_frames[index];
+                    (
+                        (frame[0] - record.previous_last_sample).abs(),
+                        max_adjacent_delta(frame),
+                        rms_normalized(frame),
+                        peak_normalized(frame),
+                    )
+                }
+                None => (record.previous_last_sample.abs(), 0.0, 0.0, 0.0),
+            };
+            match (&stream.source, record.neteq) {
+                (ConsumerSource::NetEq(handle), Some(result)) => {
+                    let diagnostics = lock_shared_stream(handle).diagnostics();
+                    kvlog::info!(
+                        "audio pop stream block",
+                        block_index = self.output_block_index,
+                        stream_id = record.stream_id,
+                        active = record.frame_index.is_some(),
+                        neteq_op = result.mode.label(),
+                        frame_source = result.source.label(),
+                        result_muted = result.muted,
+                        time_stretched = i64::from(result.time_stretched),
+                        declick_start = record.declick_start,
+                        declick_end = record.declick_end,
+                        control_muted = stream.control.muted,
+                        volume_db = stream.control.volume_db,
+                        first_delta,
+                        max_delta,
+                        rms,
+                        peak,
+                        decision = diagnostics.operation,
+                        reason = diagnostics.reason,
+                        target_ms = diagnostics.target_ms,
+                        playout_delay_ms = diagnostics.playout_delay_ms,
+                        sync_buffer_ms = diagnostics.sync_buffer_ms,
+                        packet_buffer_ms = diagnostics.packet_buffer_ms,
+                        packet_buffer_wait_ms = diagnostics.packet_buffer_wait_ms,
+                        packets_buffered = diagnostics.packets_buffered as u64,
+                        next_packet_gap_ms = diagnostics.next_packet_gap_ms
+                    );
+                }
+                _ => {
+                    kvlog::info!(
+                        "audio pop stream block",
+                        block_index = self.output_block_index,
+                        stream_id = record.stream_id,
+                        active = record.frame_index.is_some(),
+                        source_kind = "ring",
+                        declick_start = record.declick_start,
+                        declick_end = record.declick_end,
+                        control_muted = stream.control.muted,
+                        volume_db = stream.control.volume_db,
+                        first_delta,
+                        max_delta,
+                        rms,
+                        peak
+                    );
+                }
+            }
+        }
     }
 
     pub(crate) fn record_backend_stream_error(
@@ -698,8 +816,9 @@ impl LivePlaybackSharedSnapshot {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::audio::playback::SampleRing;
+    use crate::audio::playback::{SampleRing, SharedNetEqStream};
     use crate::audio::shared::FRAME_SAMPLES;
+    use crate::audio::test_support::test_tuning;
 
     fn ring_with(samples: &[f32]) -> Arc<SampleRing> {
         let ring = Arc::new(SampleRing::with_capacity(samples.len().max(1) * 2));
@@ -998,6 +1117,54 @@ mod tests {
         assert!(
             out.iter().all(|&s| s == 0.5),
             "steady-state envelope must be a no-op"
+        );
+    }
+
+    #[test]
+    fn render_records_attribute_each_stream_per_block() {
+        let mut mixer = LivePlaybackMixer::new();
+        mixer.ensure_stream(1, ring_with(&[0.5; FRAME_SAMPLES * 2]));
+        mixer.ensure_stream(2, SharedNetEqStream::new(test_tuning()).unwrap());
+
+        let mut out = vec![0.0; FRAME_SAMPLES];
+        mixer.fill_block(Instant::now(), &mut out);
+
+        assert_eq!(mixer.render_records.len(), 2);
+        let ring = mixer
+            .render_records
+            .iter()
+            .find(|record| record.stream_id == 1)
+            .unwrap();
+        assert!(ring.neteq.is_none(), "ring source carries no NetEQ result");
+        assert!(
+            ring.frame_index.is_some(),
+            "ring stream reached the combiner"
+        );
+        let neteq = mixer
+            .render_records
+            .iter()
+            .find(|record| record.stream_id == 2)
+            .unwrap();
+        assert!(
+            neteq.neteq.is_some(),
+            "NetEQ stream records its rendered operation"
+        );
+    }
+
+    #[test]
+    fn render_records_carry_previous_block_last_sample() {
+        let mut mixer = LivePlaybackMixer::new();
+        mixer.ensure_stream(1, ring_with(&[0.5; FRAME_SAMPLES * 2]));
+
+        let mut out = vec![0.0; FRAME_SAMPLES];
+        mixer.fill_block(Instant::now(), &mut out);
+        assert_eq!(mixer.render_records[0].previous_last_sample, 0.0);
+
+        let mut out = vec![0.0; FRAME_SAMPLES];
+        mixer.fill_block(Instant::now(), &mut out);
+        assert_eq!(
+            mixer.render_records[0].previous_last_sample, 0.5,
+            "cross-block delta baseline is the prior block's contribution"
         );
     }
 
