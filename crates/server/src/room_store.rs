@@ -1449,14 +1449,44 @@ mod tests {
         }
     }
 
-    fn temp_dir(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "chatt-room-store-{tag}-{}-{:?}",
-            std::process::id(),
-            std::thread::current().id()
-        ));
-        let _ = fs::remove_dir_all(&dir);
-        dir
+    struct Scratch {
+        dir: PathBuf,
+    }
+
+    impl Scratch {
+        fn new(tag: &str) -> Scratch {
+            let dir = std::env::temp_dir().join(format!(
+                "chatt-room-store-{tag}-{}-{:?}",
+                std::process::id(),
+                std::thread::current().id()
+            ));
+            let _ = fs::remove_dir_all(dir.as_path());
+            Scratch { dir }
+        }
+    }
+
+    impl std::ops::Deref for Scratch {
+        type Target = Path;
+
+        fn deref(&self) -> &Path {
+            &self.dir
+        }
+    }
+
+    impl AsRef<Path> for Scratch {
+        fn as_ref(&self) -> &Path {
+            &self.dir
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    fn temp_dir(tag: &str) -> Scratch {
+        Scratch::new(tag)
     }
 
     #[test]
@@ -1465,19 +1495,18 @@ mod tests {
         let rooms = [durable_room(1)];
         let room = RoomId(1);
 
-        let mut store = RoomStore::open(Some(dir.clone()), &rooms);
+        let mut store = RoomStore::open(Some(dir.to_path_buf()), &rooms);
         for _ in 0..3 {
             let id = store.allocate_message_id(room);
             store.append(room, &test_message(room, id.0));
         }
         drop(store);
 
-        let mut store = RoomStore::open(Some(dir.clone()), &rooms);
+        let mut store = RoomStore::open(Some(dir.to_path_buf()), &rooms);
         let next = store.allocate_message_id(room);
         assert!(next.0 > 3, "id {} must not reuse 1..=3", next.0);
         assert_eq!(store.recent(room, 10).len(), 3);
         assert_eq!(store.head(room), Some(MessageId(3)));
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -1496,26 +1525,23 @@ mod tests {
     fn restart_head_tracks_retained_messages_not_reserved_ids() {
         let durable_dir = temp_dir("durable-head");
         let room = RoomId(1);
-        let mut store = RoomStore::open(Some(durable_dir.clone()), &[durable_room(1)]);
+        let mut store = RoomStore::open(Some(durable_dir.to_path_buf()), &[durable_room(1)]);
         let id = store.allocate_message_id(room);
         store.append(room, &test_message(room, id.0));
         drop(store);
 
-        let store = RoomStore::open(Some(durable_dir.clone()), &[durable_room(1)]);
+        let store = RoomStore::open(Some(durable_dir.to_path_buf()), &[durable_room(1)]);
         assert_eq!(store.head(room), Some(MessageId(1)));
         drop(store);
 
         let memory_dir = temp_dir("memory-head");
-        let mut store = RoomStore::open(Some(memory_dir.clone()), &[memory_room(1, 16)]);
+        let mut store = RoomStore::open(Some(memory_dir.to_path_buf()), &[memory_room(1, 16)]);
         let id = store.allocate_message_id(room);
         store.append(room, &test_message(room, id.0));
         drop(store);
 
-        let store = RoomStore::open(Some(memory_dir.clone()), &[memory_room(1, 16)]);
+        let store = RoomStore::open(Some(memory_dir.to_path_buf()), &[memory_room(1, 16)]);
         assert_eq!(store.head(room), None);
-
-        let _ = fs::remove_dir_all(durable_dir);
-        let _ = fs::remove_dir_all(memory_dir);
     }
 
     #[test]
@@ -1524,18 +1550,17 @@ mod tests {
         let rooms = [memory_room(1, 16)];
         let room = RoomId(1);
 
-        let mut store = RoomStore::open(Some(dir.clone()), &rooms);
+        let mut store = RoomStore::open(Some(dir.to_path_buf()), &rooms);
         assert_eq!(store.allocate_message_id(room), MessageId(1));
         assert_eq!(store.allocate_message_id(room), MessageId(2));
         drop(store);
 
-        let mut store = RoomStore::open(Some(dir.clone()), &rooms);
+        let mut store = RoomStore::open(Some(dir.to_path_buf()), &rooms);
         assert_eq!(
             store.allocate_message_id(room),
             MessageId(2 * MESSAGE_ID_RESERVE),
             "restart resumes at the persisted watermark, one headroom block past the used ids"
         );
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -1579,7 +1604,7 @@ mod tests {
         let dir = temp_dir("dm");
         let rooms = [durable_room(1)];
 
-        let mut store = RoomStore::open(Some(dir.clone()), &rooms);
+        let mut store = RoomStore::open(Some(dir.to_path_buf()), &rooms);
         let dm = store.open_dm(UserId(3), UserId(7), 1_234).unwrap();
         assert!(dm.0 >= FIRST_DYNAMIC_ROOM_ID);
         assert_eq!(store.open_dm(UserId(7), UserId(3), 9_999).unwrap(), dm);
@@ -1587,45 +1612,42 @@ mod tests {
         store.append(dm, &test_message(dm, id.0));
         drop(store);
 
-        let store = RoomStore::open(Some(dir.clone()), &rooms);
+        let store = RoomStore::open(Some(dir.to_path_buf()), &rooms);
         assert_eq!(store.dm_room_for(UserId(3), UserId(7)), Some(dm));
         assert_eq!(store.dm_rooms().len(), 1);
         assert_eq!(store.recent(dm, 10).len(), 1);
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn dm_rooms_allocate_distinct_ids() {
         let dir = temp_dir("dm-distinct");
-        let mut store = RoomStore::open(Some(dir.clone()), &[durable_room(1)]);
+        let mut store = RoomStore::open(Some(dir.to_path_buf()), &[durable_room(1)]);
 
         let first = store.open_dm(UserId(1), UserId(2), 0).unwrap();
         let second = store.open_dm(UserId(1), UserId(3), 0).unwrap();
         assert_ne!(first, second);
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn dm_room_id_never_reused_after_state_loss() {
         let dir = temp_dir("dm-state-loss");
-        let mut store = RoomStore::open(Some(dir.clone()), &[]);
+        let mut store = RoomStore::open(Some(dir.to_path_buf()), &[]);
         let dm = store.open_dm(UserId(1), UserId(2), 1_000).unwrap();
         let id = store.allocate_message_id(dm);
         store.append(dm, &test_message(dm, id.0));
         drop(store);
 
         fs::remove_file(dir.join(STATE_FILE)).unwrap();
-        let mut store = RoomStore::open(Some(dir.clone()), &[]);
+        let mut store = RoomStore::open(Some(dir.to_path_buf()), &[]);
         let fresh = store.open_dm(UserId(3), UserId(4), 2_000).unwrap();
         assert_ne!(fresh, dm, "id with a surviving log was handed out again");
         assert!(store.recent(fresh, 10).is_empty());
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn dm_room_id_floors_over_backup_logs() {
         let dir = temp_dir("dm-backup-floor");
-        let mut store = RoomStore::open(Some(dir.clone()), &[]);
+        let mut store = RoomStore::open(Some(dir.to_path_buf()), &[]);
         let dm = store.open_dm(UserId(1), UserId(2), 1_000).unwrap();
         let id = store.allocate_message_id(dm);
         store.append(dm, &test_message(dm, id.0));
@@ -1634,10 +1656,9 @@ mod tests {
         fs::remove_file(dir.join(STATE_FILE)).unwrap();
         let log = dir.join("rooms").join(format!("{}.log", dm.0));
         fs::rename(&log, segment_path(&log, MessageId(1))).unwrap();
-        let mut store = RoomStore::open(Some(dir.clone()), &[]);
+        let mut store = RoomStore::open(Some(dir.to_path_buf()), &[]);
         let fresh = store.open_dm(UserId(3), UserId(4), 2_000).unwrap();
         assert!(fresh.0 > dm.0, "backup log {} vs fresh {}", dm.0, fresh.0);
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -1654,7 +1675,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
 
         let dir = temp_dir("dm-rollback");
-        let mut store = RoomStore::open(Some(dir.clone()), &[]);
+        let mut store = RoomStore::open(Some(dir.to_path_buf()), &[]);
         fs::set_permissions(&dir, fs::Permissions::from_mode(0o555)).unwrap();
         let result = store.open_dm(UserId(1), UserId(2), 1_000);
         fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
@@ -1663,7 +1684,6 @@ mod tests {
 
         let retry = store.open_dm(UserId(1), UserId(2), 1_000).unwrap();
         assert_eq!(store.dm_room_for(UserId(1), UserId(2)), Some(retry));
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -1672,7 +1692,7 @@ mod tests {
         let rooms = [durable_room(1)];
         let room = RoomId(1);
 
-        let mut store = RoomStore::open(Some(dir.clone()), &rooms);
+        let mut store = RoomStore::open(Some(dir.to_path_buf()), &rooms);
         for _ in 0..3 {
             let id = store.allocate_message_id(room);
             store.append(room, &test_message(room, id.0));
@@ -1685,16 +1705,15 @@ mod tests {
         bytes.extend_from_slice(&[0xFF, 0xFF]);
         fs::write(&log, &bytes).unwrap();
 
-        let mut store = RoomStore::open(Some(dir.clone()), &rooms);
+        let mut store = RoomStore::open(Some(dir.to_path_buf()), &rooms);
         let recent = store.recent(room, 10);
         assert_eq!(recent.len(), 2);
         let id = store.allocate_message_id(room);
         store.append(room, &test_message(room, id.0));
         drop(store);
 
-        let store = RoomStore::open(Some(dir.clone()), &rooms);
+        let store = RoomStore::open(Some(dir.to_path_buf()), &rooms);
         assert_eq!(store.recent(room, 10).len(), 3);
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -1705,7 +1724,7 @@ mod tests {
         let rooms = [durable_room(1)];
         let room = RoomId(1);
 
-        let mut store = RoomStore::open(Some(dir.clone()), &rooms);
+        let mut store = RoomStore::open(Some(dir.to_path_buf()), &rooms);
         for _ in 0..3 {
             let id = store.allocate_message_id(room);
             store.append(room, &test_message(room, id.0));
@@ -1719,7 +1738,7 @@ mod tests {
         fs::write(&log, &bytes).unwrap();
         fs::set_permissions(&log, fs::Permissions::from_mode(0o444)).unwrap();
 
-        let mut store = RoomStore::open(Some(dir.clone()), &rooms);
+        let mut store = RoomStore::open(Some(dir.to_path_buf()), &rooms);
         assert_eq!(store.recent(room, 10).len(), 2);
         let id = store.allocate_message_id(room);
         store.append(room, &test_message(room, id.0));
@@ -1736,7 +1755,6 @@ mod tests {
             "nothing may be written after the unrepaired corruption"
         );
         fs::set_permissions(&log, fs::Permissions::from_mode(0o644)).unwrap();
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -1774,7 +1792,7 @@ mod tests {
             max_resident_messages: 4,
         };
 
-        let mut store = RoomStore::open_with_tuning(Some(dir.clone()), &rooms, tuning);
+        let mut store = RoomStore::open_with_tuning(Some(dir.to_path_buf()), &rooms, tuning);
         for _ in 0..20 {
             let id = store.allocate_message_id(room);
             store.append(room, &test_message(room, id.0));
@@ -1798,7 +1816,7 @@ mod tests {
         drop(store);
 
         let store = RoomStore::open_with_tuning(
-            Some(dir.clone()),
+            Some(dir.to_path_buf()),
             &rooms,
             StoreTuning {
                 max_active_log_bytes: 256,
@@ -1811,7 +1829,6 @@ mod tests {
             .map(|message| message.message_id.0)
             .collect();
         assert_eq!(ids, (1..=20).collect::<Vec<u64>>());
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -1824,14 +1841,14 @@ mod tests {
             max_resident_messages: 8,
         };
 
-        let mut store = RoomStore::open_with_tuning(Some(dir.clone()), &rooms, tuning);
+        let mut store = RoomStore::open_with_tuning(Some(dir.to_path_buf()), &rooms, tuning);
         for _ in 0..30 {
             let id = store.allocate_message_id(room);
             store.append(room, &test_message(room, id.0));
         }
         drop(store);
 
-        let store = RoomStore::open_with_tuning(Some(dir.clone()), &rooms, tuning);
+        let store = RoomStore::open_with_tuning(Some(dir.to_path_buf()), &rooms, tuning);
         let ids: Vec<u64> = store
             .recent(room, 100)
             .iter()
@@ -1844,7 +1861,6 @@ mod tests {
         );
         let (_, at_start) = store.messages_before(room, None, 100);
         assert!(!at_start, "older messages remain on disk");
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -1857,7 +1873,7 @@ mod tests {
             max_resident_messages: 4,
         };
 
-        let mut store = RoomStore::open_with_tuning(Some(dir.clone()), &rooms, tuning);
+        let mut store = RoomStore::open_with_tuning(Some(dir.to_path_buf()), &rooms, tuning);
         for _ in 0..10 {
             let id = store.allocate_message_id(room);
             store.append(room, &test_message(room, id.0));
@@ -1880,7 +1896,6 @@ mod tests {
             .expect("disk records exist below the resident window");
         assert_eq!(request.oldest_durable_id, MessageId(1));
         assert_eq!(request.sources.len(), 1, "active tail is the only source");
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -1889,7 +1904,7 @@ mod tests {
         let rooms = [durable_room(1)];
         let room = RoomId(1);
 
-        let mut store = RoomStore::open(Some(dir.clone()), &rooms);
+        let mut store = RoomStore::open(Some(dir.to_path_buf()), &rooms);
         for _ in 0..3 {
             let id = store.allocate_message_id(room);
             store.append(room, &test_message(room, id.0));
@@ -1910,7 +1925,6 @@ mod tests {
                 .disk_fetch_request(SessionId(1), memory_room_id, None, 4, 4096)
                 .is_none()
         );
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -1919,7 +1933,7 @@ mod tests {
         let rooms = [durable_room(1)];
         let room = RoomId(1);
 
-        let mut store = RoomStore::open(Some(dir.clone()), &rooms);
+        let mut store = RoomStore::open(Some(dir.to_path_buf()), &rooms);
         let id = store.allocate_message_id(room);
         store.append(room, &test_message(room, id.0));
         let id = store.allocate_message_id(room);
@@ -1930,7 +1944,7 @@ mod tests {
         store.append(room, &test_message(room, id.0));
         drop(store);
 
-        let store = RoomStore::open(Some(dir.clone()), &rooms);
+        let store = RoomStore::open(Some(dir.to_path_buf()), &rooms);
         let ids: Vec<u64> = store
             .recent(room, 10)
             .iter()
@@ -1941,7 +1955,6 @@ mod tests {
             vec![1, 3],
             "an oversized record must not take later messages with it"
         );
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -1950,16 +1963,15 @@ mod tests {
         let rooms = [durable_room(1)];
         let room = RoomId(1);
 
-        let mut store = RoomStore::open(Some(dir.clone()), &rooms);
+        let mut store = RoomStore::open(Some(dir.to_path_buf()), &rooms);
         let id = store.allocate_message_id(room);
         let mut large = test_message(room, id.0);
         large.body = "x".repeat(64 * 1024);
         store.append(room, &large);
         drop(store);
 
-        let store = RoomStore::open(Some(dir.clone()), &rooms);
+        let store = RoomStore::open(Some(dir.to_path_buf()), &rooms);
         assert_eq!(store.recent(room, 10).len(), 1);
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -2019,7 +2031,7 @@ mod tests {
         let rooms = [durable_room(1)];
         let room = RoomId(1);
 
-        let mut store = RoomStore::open(Some(dir.clone()), &rooms);
+        let mut store = RoomStore::open(Some(dir.to_path_buf()), &rooms);
         for _ in 0..2 {
             let id = store.allocate_message_id(room);
             store.append(room, &test_message(room, id.0));
@@ -2052,7 +2064,7 @@ mod tests {
         store.append(room, &test_message(room, id.0));
         drop(store);
 
-        let store = RoomStore::open(Some(dir.clone()), &rooms);
+        let store = RoomStore::open(Some(dir.to_path_buf()), &rooms);
         let ids: Vec<u64> = store
             .recent(room, 10)
             .iter()
@@ -2063,7 +2075,6 @@ mod tests {
             vec![1, 2, 3],
             "the append after a failed reopen must recover durability"
         );
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -2076,7 +2087,7 @@ mod tests {
             max_resident_messages: 4,
         };
 
-        let mut store = RoomStore::open_with_tuning(Some(dir.clone()), &rooms, tuning);
+        let mut store = RoomStore::open_with_tuning(Some(dir.to_path_buf()), &rooms, tuning);
         for _ in 0..10 {
             let id = store.allocate_message_id(room);
             store.append(room, &test_message(room, id.0));
@@ -2097,7 +2108,6 @@ mod tests {
                 .is_none(),
             "the plan and the disk fetch must agree there is nothing older"
         );
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -2106,7 +2116,7 @@ mod tests {
         let rooms = [durable_room(1)];
         let room = RoomId(1);
 
-        let mut store = RoomStore::open(Some(dir.clone()), &rooms);
+        let mut store = RoomStore::open(Some(dir.to_path_buf()), &rooms);
         for _ in 0..3 {
             let id = store.allocate_message_id(room);
             store.append(room, &test_message(room, id.0));
@@ -2116,10 +2126,9 @@ mod tests {
         let log = dir.join("rooms").join("1.log");
         fs::rename(&log, segment_path(&log, MessageId(1))).unwrap();
 
-        let mut store = RoomStore::open(Some(dir.clone()), &rooms);
+        let mut store = RoomStore::open(Some(dir.to_path_buf()), &rooms);
         assert_eq!(store.recent(room, 10).len(), 3);
         let id = store.allocate_message_id(room);
         assert!(id.0 > 3, "ids must resume above segment records");
-        let _ = fs::remove_dir_all(&dir);
     }
 }
