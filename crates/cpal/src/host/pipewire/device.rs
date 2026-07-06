@@ -152,6 +152,19 @@ impl Device {
         }
     }
 
+    /// Identifies this device's clock domain for `node.group`. Real device nodes
+    /// key on their PipeWire object serial, which is unique per node and always
+    /// present (unlike `node.name`, which falls back to `"unknown"` and would
+    /// collapse distinct devices into one group). The default pseudo-devices carry
+    /// serial 0, so they key on their node name instead, which already differs per
+    /// direction (`input_default` / `output_default` / `sink_default`).
+    fn clock_group_key(&self) -> String {
+        match self.class {
+            Class::Node => self.object_serial.to_string(),
+            Class::DefaultSink | Class::DefaultInput | Class::DefaultOutput => self.node_name.clone(),
+        }
+    }
+
     pub(crate) fn pw_properties(
         &self,
         direction: DeviceDirection,
@@ -175,9 +188,19 @@ impl Device {
             properties.insert(*pw::keys::TARGET_OBJECT, self.object_serial.to_string());
         }
 
-        // Group input and output nodes so PipeWire schedules them in the same quantum,
-        // preventing phase drift between simultaneous input/output streams.
-        properties.insert("node.group", format!("cpal-{}", std::process::id()));
+        // Group the input and output streams of a *single* device so PipeWire
+        // schedules them in one quantum, keeping simultaneous input/output on that
+        // device in phase. The group key includes the device clock domain so two
+        // *different* physical devices — e.g. a USB microphone and a separate USB
+        // output interface — never share a group: one group spans one clock domain.
+        // Grouping across independent clocks demotes one device to a resampled
+        // follower of the other's driver, and the drift correction between the two
+        // hardware crystals pops the followed stream (audible on output, invisible
+        // to xrun counters).
+        properties.insert(
+            "node.group",
+            format!("cpal-{}-{}", std::process::id(), self.clock_group_key()),
+        );
 
         if let BufferSize::Fixed(buffer_size) = config.buffer_size {
             properties.insert(
