@@ -69,6 +69,8 @@ const SAMPLES_30_MS: usize = 3 * SAMPLES_10_MS;
 /// The default packet duration before any packet has been decoded: Chatt's 20 ms
 /// Opus frame.
 const DEFAULT_FRAME_SAMPLES: usize = LIVE_OPUS_FRAME_SAMPLES;
+/// Packet-buffer overflow threshold, also sizing the extraction scratch list.
+const MAX_PACKETS_IN_BUFFER: usize = 200;
 /// One DRED chunk, 10 ms at 48 kHz.
 const DRED_CHUNK_SAMPLES: usize = SAMPLE_RATE as usize / 100;
 /// How far a sequence-advancing packet's timestamp may trail the playout point
@@ -99,6 +101,7 @@ pub(crate) struct NetEqDiagnostics {
     pub packets_buffered: usize,
     pub packets_discarded: u64,
     pub secondary_packets_discarded: u64,
+    pub trash_overflow: u64,
     pub next_packet_gap_ms: Option<i64>,
     pub operation: &'static str,
     pub reason: &'static str,
@@ -223,6 +226,10 @@ pub(crate) struct NetEqCore {
     random_vector: RandomVector,
     /// `decoded_buffer_`: scratch for freshly decoded PCM.
     decoded_buffer: Vec<i16>,
+    /// Reusable extraction list so `GetAudio` never allocates one. Taken by
+    /// `get_decision`, threaded to `decode`, and restored there emptied, with
+    /// consumed packets parked in the packet-buffer trash.
+    packet_scratch: Vec<Packet>,
     last_mode: Mode,
     /// `decoder_frame_length_`: samples per channel of the last decoded frame.
     decoder_frame_length: usize,
@@ -278,7 +285,7 @@ impl NetEqCore {
         let max_delay_ms = duration_to_i32_ms(tuning.neteq_max_delay);
         let config = ControllerConfig {
             allow_time_stretching: true,
-            max_packets_in_buffer: 200,
+            max_packets_in_buffer: MAX_PACKETS_IN_BUFFER as i32,
             start_delay_ms,
             min_delay_ms,
             base_min_delay_ms,
@@ -296,7 +303,7 @@ impl NetEqCore {
             tick_timer,
             wall_origin: None,
             wall_now_samples: 0,
-            packet_buffer: PacketBuffer::new(200),
+            packet_buffer: PacketBuffer::new(MAX_PACKETS_IN_BUFFER),
             sync_buffer: SyncBuffer::with_default_length(),
             decision_logic,
             decoder: Decoder::new(SampleRate::Hz48000, Channels::Mono)
@@ -307,6 +314,7 @@ impl NetEqCore {
             background_noise: BackgroundNoise::new(),
             random_vector: RandomVector::new(),
             decoded_buffer: vec![0; MAX_OPUS_DECODE_SAMPLES],
+            packet_scratch: Vec::with_capacity(MAX_PACKETS_IN_BUFFER),
             last_mode: Mode::Normal,
             decoder_frame_length: DEFAULT_FRAME_SAMPLES,
             timestamp: 0,
@@ -352,6 +360,11 @@ impl NetEqCore {
         self.packet_buffer.num_packets()
     }
 
+    /// Worker side. See [`PacketBuffer::swap_trash`].
+    pub(crate) fn swap_packet_trash(&mut self, into: &mut Vec<Packet>) {
+        self.packet_buffer.swap_trash(into);
+    }
+
     fn playout_timestamp(&self) -> u32 {
         self.sync_buffer
             .end_timestamp()
@@ -384,6 +397,7 @@ impl NetEqCore {
             packets_buffered: status.packet_buffer_info.num_packets,
             packets_discarded: self.packet_buffer.packets_discarded(),
             secondary_packets_discarded: self.packet_buffer.secondary_packets_discarded(),
+            trash_overflow: self.packet_buffer.trash_overflow(),
             next_packet_gap_ms,
             operation: self.last_operation.label(),
             reason: self.last_decision_reason,
@@ -873,6 +887,8 @@ impl NetEqCore {
     /// Port of `NetEqImpl::GetDecision`: build the status snapshot, ask the
     /// controller, post-process the decision, and extract the packets to decode.
     fn get_decision(&mut self) -> (Operation, Vec<Packet>) {
+        let packet_list = std::mem::take(&mut self.packet_scratch);
+        debug_assert!(packet_list.is_empty());
         let end_timestamp = self.sync_buffer.end_timestamp();
         if !self.new_codec {
             let five_seconds = 5 * FS_HZ as u32;
@@ -909,7 +925,7 @@ impl NetEqCore {
         {
             self.last_operation = Operation::Normal;
             self.last_decision_reason = "decoded_buffer_ready";
-            return (Operation::Normal, Vec::new());
+            return (Operation::Normal, packet_list);
         }
 
         if self.new_codec || operation == Operation::Undefined {
@@ -927,13 +943,13 @@ impl NetEqCore {
                 .increase_end_timestamp(self.timestamp.wrapping_sub(end_timestamp));
             self.new_codec = false;
             self.decision_logic.soft_reset(&self.tick_timer);
-            let result = self.finish_decision(operation, self.timestamp);
+            let result = self.finish_decision(operation, self.timestamp, packet_list);
             self.last_operation = result.0;
             self.last_decision_reason = self.decision_reason(result.0, &status);
             return result;
         }
 
-        let result = self.finish_decision(operation, end_timestamp);
+        let result = self.finish_decision(operation, end_timestamp, packet_list);
         self.last_operation = result.0;
         self.last_decision_reason = self.decision_reason(result.0, &status);
         result
@@ -1010,6 +1026,7 @@ impl NetEqCore {
         &mut self,
         mut operation: Operation,
         end_timestamp: u32,
+        mut packet_list: Vec<Packet>,
     ) -> (Operation, Vec<Packet>) {
         let samples_left = self
             .sync_buffer
@@ -1020,20 +1037,20 @@ impl NetEqCore {
         match operation {
             Operation::Expand => {
                 self.timestamp = end_timestamp;
-                return (operation, Vec::new());
+                return (operation, packet_list);
             }
             Operation::Rfc3389CngNoPacket | Operation::CodecInternalCng => {
-                return (operation, Vec::new());
+                return (operation, packet_list);
             }
             Operation::Accelerate | Operation::FastAccelerate => {
                 if samples_left >= SAMPLES_30_MS as i32 {
                     self.decision_logic.set_sample_memory(samples_left);
                     self.decision_logic.set_prev_time_scale(true);
-                    return (operation, Vec::new());
+                    return (operation, packet_list);
                 } else if samples_left >= SAMPLES_10_MS as i32
                     && self.decoder_frame_length >= SAMPLES_30_MS
                 {
-                    return (Operation::Normal, Vec::new());
+                    return (Operation::Normal, packet_list);
                 } else if samples_left < SAMPLES_20_MS as i32
                     && self.decoder_frame_length < SAMPLES_30_MS
                 {
@@ -1048,7 +1065,7 @@ impl NetEqCore {
                 {
                     self.decision_logic.set_sample_memory(samples_left);
                     self.decision_logic.set_prev_time_scale(true);
-                    return (operation, Vec::new());
+                    return (operation, packet_list);
                 }
                 if samples_left < SAMPLES_20_MS as i32 && self.decoder_frame_length < SAMPLES_30_MS
                 {
@@ -1066,7 +1083,6 @@ impl NetEqCore {
             _ => {}
         }
 
-        let mut packet_list = Vec::new();
         let mut extracted_samples = 0i32;
         if let Some(first_timestamp) = self.packet_buffer.next_timestamp() {
             self.sync_buffer
@@ -1132,13 +1148,14 @@ impl NetEqCore {
     fn decode(
         &mut self,
         operation: &mut Operation,
-        packet_list: Vec<Packet>,
+        mut packet_list: Vec<Packet>,
     ) -> (usize, DecodedFrameSource) {
         if self.reset_decoder {
             let _ = self.decoder.reset();
             self.reset_decoder = false;
         }
         if packet_list.is_empty() {
+            self.packet_scratch = packet_list;
             return (0, DecodedFrameSource::Normal);
         }
 
@@ -1170,6 +1187,11 @@ impl NetEqCore {
                 }
             }
         }
+
+        for packet in packet_list.drain(..) {
+            self.packet_buffer.retire(packet);
+        }
+        self.packet_scratch = packet_list;
 
         if had_error {
             // Reference: a decode error rewinds to expand and advances the clock.

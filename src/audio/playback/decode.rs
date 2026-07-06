@@ -18,7 +18,7 @@ use crate::{
             LivePlaybackMixerStats, LivePlaybackPlayoutHints, LivePlaybackSharedSnapshot,
             MixerStreamSource, SampleRing, SharedNetEqHandle, SharedNetEqStream, SpscSwapQueue,
             lock_shared_stream,
-            neteq::{NetEqDiagnostics, NetEqPreparedPacket},
+            neteq::{NetEqDiagnostics, NetEqPreparedPacket, PACKET_TRASH_CAPACITY, Packet},
         },
         shared::{
             FRAME_SAMPLES, LIVE_CAPTURE_MUTE_FADE, LIVE_PACKET_FLAG_MUTE,
@@ -182,6 +182,7 @@ fn drain_stream(
     now: Instant,
     output_ring_ms: u64,
     feedback_sender: Option<&Sender<LivePlaybackFeedback>>,
+    trash_swap: &mut Vec<Packet>,
 ) {
     stream.apply_control_mute_pending(now, stream_id);
     stream.activate_control_mute_fallback_if_due(now, stream_id);
@@ -189,12 +190,14 @@ fn drain_stream(
     let sender_silence = stream.take_sender_silence_pending();
     let (delta, diagnostics, activity) = {
         let mut shared = lock_shared_stream(&stream.shared);
+        shared.swap_packet_trash(trash_swap);
         (
             shared.take_stats(),
             shared.diagnostics(),
             shared.voice_activity(),
         )
     };
+    trash_swap.clear();
     stats.absorb(delta);
     let neteq = stream.adjust_diagnostics(diagnostics);
     stream.last_diagnostics = neteq.clone();
@@ -271,6 +274,10 @@ pub(crate) struct LiveDecodeStreams {
     dropped_mixer_events: u64,
     notification: Option<NotificationVoice>,
     trend: LivePlaybackTrend,
+    /// Empty swap target for each stream's packet trash, sized to match so the
+    /// swap never leaves a smaller vec behind. The retired payloads drop here,
+    /// on the worker thread, when it is cleared after the lock is released.
+    trash_swap: Vec<Packet>,
 }
 
 impl LiveDecodeStreams {
@@ -295,6 +302,7 @@ impl LiveDecodeStreams {
             dropped_mixer_events: 0,
             notification: None,
             trend: LivePlaybackTrend::default(),
+            trash_swap: Vec::with_capacity(PACKET_TRASH_CAPACITY),
         }
     }
 
@@ -411,7 +419,12 @@ impl LiveDecodeStreams {
         if let Some(stream) = self.streams.remove(&stream_id) {
             // Fold the counters the callback recorded since the last drain, so
             // teardown loses at most nothing rather than up to one tick.
-            let delta = lock_shared_stream(&stream.shared).take_stats();
+            let delta = {
+                let mut shared = lock_shared_stream(&stream.shared);
+                shared.swap_packet_trash(&mut self.trash_swap);
+                shared.take_stats()
+            };
+            self.trash_swap.clear();
             self.stats.absorb(delta);
         }
         self.mixer_streams.remove(&stream_id);
@@ -496,6 +509,7 @@ impl LiveDecodeStreams {
         let stats = &mut self.stats;
         let mixer_streams = &mut self.mixer_streams;
         let pending_mixer_stops = &self.pending_mixer_stops;
+        let trash_swap = &mut self.trash_swap;
         for (stream_id, stream) in &mut self.streams {
             drain_stream(
                 stream,
@@ -504,6 +518,7 @@ impl LiveDecodeStreams {
                 now,
                 output_ring_ms,
                 feedback_sender,
+                trash_swap,
             );
             if !mixer_streams.contains(stream_id) {
                 // The consumer may drain the queue between the failed stop flush
@@ -547,6 +562,7 @@ impl LiveDecodeStreams {
         let output_ring_ms = samples_to_ms(self.hints.staged_samples());
         let stats = &mut self.stats;
         let mixer_streams = &mut self.mixer_streams;
+        let trash_swap = &mut self.trash_swap;
         for (stream_id, stream) in &mut self.streams {
             drain_stream(
                 stream,
@@ -555,6 +571,7 @@ impl LiveDecodeStreams {
                 now,
                 output_ring_ms,
                 feedback_sender,
+                trash_swap,
             );
             if !mixer_streams.contains(stream_id)
                 && let Ok(mut mixer) = mixer.lock()

@@ -25,6 +25,40 @@ pub(crate) enum InsertOutcome {
     Flushed,
 }
 
+/// Retired packets awaiting destruction off the audio callback.
+///
+/// Dropping a [`Packet`] can free its payload `Arc<Vec<u8>>`, which must not
+/// happen on the realtime thread. The buffer parks retired packets here and the
+/// decode worker swaps them out under the stream mutex it already holds, so the
+/// frees run on the worker. When full, the push drops inline and counts the
+/// overflow instead of blocking or growing.
+#[derive(Debug)]
+pub(crate) struct PacketTrash {
+    packets: Vec<Packet>,
+    overflow: u64,
+}
+
+/// Retired-packet capacity: the 200-packet production buffer plus a margin for
+/// packets extracted between worker drains.
+pub(crate) const PACKET_TRASH_CAPACITY: usize = 256;
+
+impl PacketTrash {
+    fn new() -> Self {
+        Self {
+            packets: Vec::with_capacity(PACKET_TRASH_CAPACITY),
+            overflow: 0,
+        }
+    }
+
+    fn push(&mut self, packet: Packet) {
+        if self.packets.len() == self.packets.capacity() {
+            self.overflow = self.overflow.saturating_add(1);
+            return;
+        }
+        self.packets.push(packet);
+    }
+}
+
 /// Holds packets before decoding, ordered by (timestamp, sequence, priority).
 #[derive(Debug)]
 pub(crate) struct PacketBuffer {
@@ -32,28 +66,47 @@ pub(crate) struct PacketBuffer {
     max_number_of_packets: usize,
     packets_discarded: u64,
     secondary_packets_discarded: u64,
+    trash: PacketTrash,
 }
 
 impl PacketBuffer {
     pub(crate) fn new(max_number_of_packets: usize) -> Self {
         Self {
-            buffer: VecDeque::new(),
+            buffer: VecDeque::with_capacity(max_number_of_packets),
             max_number_of_packets,
             packets_discarded: 0,
             secondary_packets_discarded: 0,
+            trash: PacketTrash::new(),
         }
+    }
+
+    /// Parks a consumed packet for the worker to destroy off the callback.
+    pub(crate) fn retire(&mut self, packet: Packet) {
+        self.trash.push(packet);
+    }
+
+    /// Swaps the retired packets into `into` (an empty, equally sized vec) so
+    /// the worker can drop them on its own thread.
+    pub(crate) fn swap_trash(&mut self, into: &mut Vec<Packet>) {
+        debug_assert!(into.is_empty());
+        std::mem::swap(&mut self.trash.packets, into);
+    }
+
+    /// Retired packets dropped inline because the trash was full.
+    pub(crate) fn trash_overflow(&self) -> u64 {
+        self.trash.overflow
     }
 
     /// Deletes all packets in the buffer.
     pub(crate) fn flush(&mut self) {
-        for packet in &self.buffer {
+        while let Some(packet) = self.buffer.pop_front() {
             log_discard(
-                packet,
+                &packet,
                 &mut self.packets_discarded,
                 &mut self.secondary_packets_discarded,
             );
+            self.trash.push(packet);
         }
-        self.buffer.clear();
     }
 
     #[cfg(test)]
@@ -114,6 +167,7 @@ impl PacketBuffer {
                         &mut self.packets_discarded,
                         &mut self.secondary_packets_discarded,
                     );
+                    self.trash.push(packet);
                     return outcome;
                 }
                 r + 1
@@ -130,6 +184,7 @@ impl PacketBuffer {
                 &mut self.packets_discarded,
                 &mut self.secondary_packets_discarded,
             );
+            self.trash.push(replaced);
         }
 
         self.buffer.insert(insert_idx, packet);
@@ -167,34 +222,25 @@ impl PacketBuffer {
         self.buffer.pop_front()
     }
 
-    pub(crate) fn discard_next_packet(&mut self) {
-        if let Some(packet) = self.buffer.pop_front() {
+    /// Discards front packets strictly older than `timestamp_limit` but within
+    /// `horizon_samples`. Port of `DiscardOldPackets`, which stops at the first
+    /// non-obsolete packet: the buffer is sorted, so obsolete packets form a
+    /// front prefix except for entries older than the horizon window.
+    pub(crate) fn discard_old_packets(&mut self, timestamp_limit: u32, horizon_samples: u32) {
+        while let Some(front) = self.buffer.front() {
+            if front.timestamp == timestamp_limit
+                || !is_obsolete_timestamp(front.timestamp, timestamp_limit, horizon_samples)
+            {
+                break;
+            }
+            let packet = self.buffer.pop_front().expect("front exists");
             log_discard(
                 &packet,
                 &mut self.packets_discarded,
                 &mut self.secondary_packets_discarded,
             );
+            self.trash.push(packet);
         }
-    }
-
-    /// Discards packets strictly older than `timestamp_limit` but within
-    /// `horizon_samples`. Port of `DiscardOldPackets`.
-    pub(crate) fn discard_old_packets(&mut self, timestamp_limit: u32, horizon_samples: u32) {
-        let mut kept = VecDeque::with_capacity(self.buffer.len());
-        while let Some(packet) = self.buffer.pop_front() {
-            if packet.timestamp == timestamp_limit
-                || !is_obsolete_timestamp(packet.timestamp, timestamp_limit, horizon_samples)
-            {
-                kept.push_back(packet);
-            } else {
-                log_discard(
-                    &packet,
-                    &mut self.packets_discarded,
-                    &mut self.secondary_packets_discarded,
-                );
-            }
-        }
-        self.buffer = kept;
     }
 
     /// Total duration in samples the buffered packets span across. Port of
@@ -333,6 +379,36 @@ mod tests {
         buffer.discard_old_packets(1920, 0);
         assert_eq!(buffer.timestamps(), vec![1920]);
         assert_eq!(buffer.packets_discarded(), 2);
+    }
+
+    #[test]
+    fn discarded_packets_park_in_trash_until_swapped() {
+        let timer = TickTimer::new();
+        let mut buffer = PacketBuffer::new(50);
+        buffer.insert_packet(opus(0, 0, Priority::PRIMARY), &timer);
+        buffer.insert_packet(opus(960, 1, Priority::PRIMARY), &timer);
+        buffer.discard_old_packets(1920, 0);
+        buffer.flush();
+
+        let mut swapped = Vec::with_capacity(PACKET_TRASH_CAPACITY);
+        buffer.swap_trash(&mut swapped);
+        assert_eq!(swapped.len(), 2);
+        assert_eq!(buffer.trash_overflow(), 0);
+
+        let mut empty = Vec::with_capacity(PACKET_TRASH_CAPACITY);
+        buffer.swap_trash(&mut empty);
+        assert!(empty.is_empty(), "trash drained by the previous swap");
+    }
+
+    #[test]
+    fn full_trash_drops_inline_and_counts_overflow() {
+        let timer = TickTimer::new();
+        let mut buffer = PacketBuffer::new(PACKET_TRASH_CAPACITY + 8);
+        for index in 0..PACKET_TRASH_CAPACITY as u32 + 2 {
+            buffer.insert_packet(opus(index * 960, index, Priority::PRIMARY), &timer);
+        }
+        buffer.flush();
+        assert_eq!(buffer.trash_overflow(), 2);
     }
 
     #[test]
