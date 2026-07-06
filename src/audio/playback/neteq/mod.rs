@@ -34,3 +34,5 @@ mod tick_timer;
 pub(crate) use core::{AudioResult, NetEqCore, NetEqDiagnostics, NetEqPreparedPacket};
 #[cfg(test)]
 pub(crate) use operation::Mode;
+pub(crate) use packet::Packet;
+pub(crate) use packet_buffer::PACKET_TRASH_CAPACITY;

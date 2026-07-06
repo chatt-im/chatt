@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 use crate::audio::{
     playback::{
         LivePlaybackMixerStats, MIX_FRAME_SAMPLES,
-        neteq::{AudioResult, NetEqCore, NetEqDiagnostics},
+        neteq::{AudioResult, NetEqCore, NetEqDiagnostics, Packet},
     },
     shared::{
         DecodedFrameSource, LiveAudioTuning, TIME_SCALE_NOISE_FLOOR_MS, TIME_SCALE_VAD_RATIO,
@@ -68,6 +68,12 @@ impl SharedNetEqStream {
     /// call.
     pub(crate) fn take_stats(&mut self) -> LivePlaybackMixerStats {
         std::mem::take(&mut self.stats)
+    }
+
+    /// Worker side: swaps out the retired packets so their payloads are freed
+    /// on the worker thread instead of the audio callback.
+    pub(crate) fn swap_packet_trash(&mut self, into: &mut Vec<Packet>) {
+        self.core.swap_packet_trash(into);
     }
 
     /// Worker side: `(voice_active, rms)` of the last rendered block.
