@@ -11,6 +11,7 @@ use super::background_noise::BackgroundNoise;
 use super::dsp_helper;
 use super::expand::Expand;
 use super::random_vector::RandomVector;
+use super::scratch::DspScratch;
 use super::spl;
 
 const FS_MULT: usize = 6;
@@ -22,16 +23,10 @@ const INPUT_DOWNSAMP_LENGTH: usize = 40;
 const REQUIRED_LENGTH: usize = (120 + 80 + 2) * FS_MULT; // 1212
 const DOWNSAMPLE_48KHZ_TBL: [i16; 7] = [1019, 390, 427, 440, 427, 390, 1019];
 
-/// Result of a merge: `added` samples produced beyond what was borrowed from the
-/// sync buffer, plus the merged `output` (after the borrowed prefix is returned
-/// to the sync buffer).
-pub(crate) struct MergeResult {
-    pub(crate) added: usize,
-    pub(crate) output: Vec<i16>,
-}
-
 /// `Merge::Process` (mono). Modifies `sync_buffer` in place (the borrowed prefix
-/// is written back at `next_index`).
+/// is written back at `next_index`) and writes the merged result past that
+/// prefix into `scratch.op_out`. Returns `added`, the samples produced beyond
+/// what was borrowed from the sync buffer.
 pub(crate) fn process(
     input: &[i16],
     sync_buffer: &mut [i16],
@@ -39,44 +34,56 @@ pub(crate) fn process(
     expand: &mut Expand,
     background_noise: &mut BackgroundNoise,
     random_vector: &mut RandomVector,
-) -> MergeResult {
+    scratch: &mut DspScratch,
+) -> usize {
+    let DspScratch {
+        expand: expand_scratch,
+        expand_out: expanded_temp,
+        merge: scratch,
+        op_out: output,
+        ..
+    } = scratch;
+    output.clear();
     let input_length = input.len();
     if input_length == 0 {
-        return MergeResult {
-            added: 0,
-            output: Vec::new(),
-        };
+        return 0;
     }
 
     // --- GetExpandedSignal ---
     let old_length = sync_buffer.len() - next_index;
     expand.set_parameters_for_merge_after_expand();
-    let mut expanded_temp = Vec::new();
     expand.process(
         sync_buffer,
         background_noise,
         random_vector,
-        &mut expanded_temp,
+        expand_scratch,
+        expanded_temp,
     );
 
-    let mut expanded: Vec<i16> = sync_buffer[next_index..].to_vec();
+    // Only the first `REQUIRED_LENGTH` samples are ever read, so a longer
+    // sync-buffer future is truncated up front to keep the scratch bounded.
+    let future = &sync_buffer[next_index..];
+    let take = future.len().min(REQUIRED_LENGTH);
+    scratch.expanded.clear();
+    scratch.expanded.extend_from_slice(&future[..take]);
+    let expanded = &mut scratch.expanded;
     if expanded.len() < REQUIRED_LENGTH {
         while expanded.len() < REQUIRED_LENGTH {
-            expanded.extend_from_slice(&expanded_temp);
+            expanded.extend_from_slice(expanded_temp);
         }
         expanded.truncate(REQUIRED_LENGTH);
     }
     let expanded_length = REQUIRED_LENGTH;
 
     // --- per channel (mono) ---
-    let new_mute_factor = signal_scaling(input, input_length, &expanded).min(16384);
+    let new_mute_factor = signal_scaling(input, input_length, expanded).min(16384);
 
     let mut expanded_downsampled = [0i16; EXPAND_DOWNSAMP_LENGTH];
     let mut input_downsampled = [0i16; INPUT_DOWNSAMP_LENGTH];
     downsample(
         input,
         input_length,
-        &expanded,
+        expanded,
         expanded_length,
         &mut expanded_downsampled,
         &mut input_downsampled,
@@ -87,9 +94,14 @@ pub(crate) fn process(
         expand,
         &input_downsampled,
         &expanded_downsampled,
+        &mut scratch.correlation16,
     );
 
-    let mut temp_data = vec![0i16; input_length + best_correlation_index];
+    scratch.temp_data.clear();
+    scratch
+        .temp_data
+        .resize(input_length + best_correlation_index, 0);
+    let temp_data = &mut scratch.temp_data;
 
     let mut interpolation_length =
         (MAX_CORRELATION_LENGTH * FS_MULT).min(expanded_length - best_correlation_index);
@@ -98,12 +110,14 @@ pub(crate) fn process(
     let mute_factor = expand.mute_factor().max(new_mute_factor);
 
     // Ramp/unmute the new decoded frame (operates on a working copy of input).
-    let mut input_channel = input.to_vec();
+    scratch.input_channel.clear();
+    scratch.input_channel.extend_from_slice(input);
+    let input_channel = &mut scratch.input_channel;
     if mute_factor < 16384 {
         let back_to_fullscale_inc = ((16384 - mute_factor as i32) << 6) / input_length as i32;
         let increment = (4194 / FS_MULT as i32).max(back_to_fullscale_inc);
         let mut mf = dsp_helper::ramp_signal_in_place(
-            &mut input_channel,
+            input_channel,
             interpolation_length,
             mute_factor as i32,
             increment,
@@ -125,27 +139,25 @@ pub(crate) fn process(
     let increment = (16384 / (interpolation_length + 1)) as i16;
     let local_mute_factor = 16384 - increment;
     temp_data[..best_correlation_index].copy_from_slice(&expanded[..best_correlation_index]);
-    let mut faded = vec![0i16; interpolation_length];
+    scratch.faded.clear();
+    scratch.faded.resize(interpolation_length, 0);
     dsp_helper::cross_fade(
         &expanded[best_correlation_index..],
-        &input_channel,
+        input_channel,
         interpolation_length,
         local_mute_factor,
         increment,
-        &mut faded,
+        &mut scratch.faded,
     );
     temp_data[best_correlation_index..best_correlation_index + interpolation_length]
-        .copy_from_slice(&faded);
+        .copy_from_slice(&scratch.faded);
 
     let output_length = best_correlation_index + input_length;
 
     // Write the borrowed prefix back to the sync buffer, return the rest.
     sync_buffer[next_index..next_index + old_length].copy_from_slice(&temp_data[..old_length]);
-    let output = temp_data[old_length..output_length].to_vec();
-    MergeResult {
-        added: output_length - old_length,
-        output,
-    }
+    output.extend_from_slice(&temp_data[old_length..output_length]);
+    output_length - old_length
 }
 
 /// `Merge::SignalScaling`.
@@ -259,6 +271,7 @@ fn correlate_and_peak_search(
     expand: &Expand,
     input_downsampled: &[i16],
     expanded_downsampled: &[i16],
+    correlation16: &mut Vec<i16>,
 ) -> usize {
     let stop_position_downsamp = MAX_CORRELATION_LENGTH.min(expand.max_lag() / (FS_MULT * 2) + 1);
 
@@ -275,7 +288,8 @@ fn correlate_and_peak_search(
 
     let pad_length = OVERLAP_LENGTH - 1; // 29
     let correlation_buffer_size = 2 * pad_length + MAX_CORRELATION_LENGTH + 1;
-    let mut correlation16 = vec![0i16; correlation_buffer_size];
+    correlation16.clear();
+    correlation16.resize(correlation_buffer_size, 0);
     let max_correlation = spl::max_abs_value_w32(&correlation[..stop_position_downsamp]);
     let norm_shift = (17 - spl::norm_w32(max_correlation) as i32).max(0);
     spl::vector_bit_shift_w32_to_w16(
@@ -326,14 +340,24 @@ mod tests {
         let mut bg = BackgroundNoise::new();
         let mut rv = RandomVector::new();
         let mut expand = Expand::new();
+        let mut scratch = DspScratch::new();
         {
             let mut o = Vec::new();
-            expand.process(&mut sync, &mut bg, &mut rv, &mut o);
+            expand.process(&mut sync, &mut bg, &mut rv, &mut scratch.expand, &mut o);
         }
 
-        let result = process(&input, &mut sync, next_index, &mut expand, &mut bg, &mut rv);
-        let mut got = vec![result.added as i64, result.output.len() as i64];
-        got.extend(result.output.iter().map(|&x| x as i64));
+        let added = process(
+            &input,
+            &mut sync,
+            next_index,
+            &mut expand,
+            &mut bg,
+            &mut rv,
+            &mut scratch,
+        );
+        let output = &scratch.op_out;
+        let mut got = vec![added as i64, output.len() as i64];
+        got.extend(output.iter().map(|&x| x as i64));
         assert_eq!(got, load("merge_out"));
 
         let after: Vec<i64> = sync.iter().map(|&x| x as i64).collect();

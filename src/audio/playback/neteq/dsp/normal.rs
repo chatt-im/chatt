@@ -8,6 +8,7 @@
 use super::background_noise::BackgroundNoise;
 use super::expand::Expand;
 use super::random_vector::RandomVector;
+use super::scratch::ExpandScratch;
 use super::spl;
 
 const FS_HZ: i32 = 48000;
@@ -16,13 +17,16 @@ const SAMPLES_PER_MS: usize = (FS_HZ / 1000) as usize; // 48
 
 /// `Normal::Process` for `last_mode == kExpand`. `input` is the freshly decoded
 /// frame; `output` receives the unmuted, cross-faded result. `expand` must hold
-/// the state from the concealment run that just ended.
+/// the state from the concealment run that just ended. `expanded` is caller
+/// scratch for the interpolation tail.
 pub(crate) fn process_after_expand(
     input: &[i16],
     sync_buffer: &mut [i16],
     expand: &mut Expand,
     background_noise: &mut BackgroundNoise,
     random_vector: &mut RandomVector,
+    expand_scratch: &mut ExpandScratch,
+    expanded: &mut Vec<i16>,
     output: &mut Vec<i16>,
 ) {
     output.clear();
@@ -35,8 +39,13 @@ pub(crate) fn process_after_expand(
 
     // Generate the interpolation tail from Expand.
     expand.set_parameters_for_normal_after_expand();
-    let mut expanded = Vec::new();
-    expand.process(sync_buffer, background_noise, random_vector, &mut expanded);
+    expand.process(
+        sync_buffer,
+        background_noise,
+        random_vector,
+        expand_scratch,
+        expanded,
+    );
     let mut mute_factor = expand.mute_factor();
     expand.reset();
 
@@ -75,7 +84,7 @@ pub(crate) fn process_after_expand(
     }
 
     // Cross-fade the expanded tail into the unmuted output.
-    crossfade(&expanded, output, SAMPLES_PER_MS);
+    crossfade(expanded, output, SAMPLES_PER_MS);
 }
 
 /// `Normal`'s file-local `Crossfade`: fade `from` out and `to` in over
@@ -112,11 +121,13 @@ mod tests {
         let mut bg = BackgroundNoise::new();
         let mut rv = RandomVector::new();
         let mut expand = Expand::new();
+        let mut scratch = crate::audio::playback::neteq::dsp::scratch::DspScratch::new();
         for _ in 0..3 {
             let mut o = Vec::new();
-            expand.process(&mut sync, &mut bg, &mut rv, &mut o);
+            expand.process(&mut sync, &mut bg, &mut rv, &mut scratch.expand, &mut o);
         }
 
+        let mut expanded = Vec::new();
         let mut output = Vec::new();
         process_after_expand(
             &input,
@@ -124,6 +135,8 @@ mod tests {
             &mut expand,
             &mut bg,
             &mut rv,
+            &mut scratch.expand,
+            &mut expanded,
             &mut output,
         );
         let mut got = vec![output.len() as i64];

@@ -21,6 +21,7 @@ use super::super::sync_buffer::SyncBuffer;
 use super::background_noise::BackgroundNoise;
 use super::expand::Expand;
 use super::random_vector::RandomVector;
+use super::scratch::DspScratch;
 use super::test_vectors::load;
 use super::time_stretch::{self, ReturnCode};
 use super::{merge, normal};
@@ -115,6 +116,7 @@ fn pipeline_matches_oracle() {
     let mut expand = Expand::new();
     let mut bg = BackgroundNoise::new();
     let mut rv = RandomVector::new();
+    let mut scratch = DspScratch::new();
 
     let mut cursor = SYNC;
     let mut last_mode = LastMode::Normal;
@@ -139,6 +141,8 @@ fn pipeline_matches_oracle() {
                         &mut expand,
                         &mut bg,
                         &mut rv,
+                        &mut scratch.expand,
+                        &mut scratch.expand_out,
                         &mut out,
                     );
                     sync.push_back(&out);
@@ -150,15 +154,16 @@ fn pipeline_matches_oracle() {
             Op::Merge => {
                 let decoded = next_frame(&mut cursor, OUT);
                 let next_index = sync.next_index();
-                let result = merge::process(
+                merge::process(
                     &decoded,
                     sync.data_mut(),
                     next_index,
                     &mut expand,
                     &mut bg,
                     &mut rv,
+                    &mut scratch,
                 );
-                sync.push_back(&result.output);
+                sync.push_back(&scratch.op_out);
                 expand.reset();
                 last_mode = LastMode::Merge;
             }
@@ -173,7 +178,13 @@ fn pipeline_matches_oracle() {
                     let mut out = Vec::new();
                     let mut guard = 0;
                     while sync.future_length().saturating_sub(OVERLAP) < OUT {
-                        expand.process(sync.data_mut(), &mut bg, &mut rv, &mut out);
+                        expand.process(
+                            sync.data_mut(),
+                            &mut bg,
+                            &mut rv,
+                            &mut scratch.expand,
+                            &mut out,
+                        );
                         if out.is_empty() {
                             sync.push_back_zeros(OUT);
                         } else {
@@ -190,11 +201,12 @@ fn pipeline_matches_oracle() {
             Op::Accelerate | Op::FastAccelerate => {
                 let decoded = next_frame(&mut cursor, REQ);
                 let fast = op == Op::FastAccelerate;
-                let result = time_stretch::accelerate_process(&decoded, fast, &bg);
+                let mut output = Vec::new();
+                let result = time_stretch::accelerate_process(&decoded, fast, &bg, &mut output);
                 if result.length_change_samples > 0 {
                     stretches += 1;
                 }
-                sync.push_back(&result.output);
+                sync.push_back(&output);
                 last_mode = match result.return_code {
                     ReturnCode::Success => LastMode::AccelerateSuccess,
                     ReturnCode::SuccessLowEnergy => LastMode::AccelerateLowEnergy,
@@ -204,11 +216,13 @@ fn pipeline_matches_oracle() {
             }
             Op::PreemptiveExpand => {
                 let decoded = next_frame(&mut cursor, REQ);
-                let result = time_stretch::preemptive_expand_process(&decoded, 0, OVERLAP, &bg);
+                let mut output = Vec::new();
+                let result =
+                    time_stretch::preemptive_expand_process(&decoded, 0, OVERLAP, &bg, &mut output);
                 if result.length_change_samples > 0 {
                     stretches += 1;
                 }
-                sync.push_back(&result.output);
+                sync.push_back(&output);
                 last_mode = match result.return_code {
                     ReturnCode::Success => LastMode::PreemptiveExpandSuccess,
                     ReturnCode::SuccessLowEnergy => LastMode::PreemptiveExpandLowEnergy,

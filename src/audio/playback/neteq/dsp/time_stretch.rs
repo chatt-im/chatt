@@ -28,11 +28,10 @@ pub(crate) enum ReturnCode {
     Error = -1,
 }
 
-/// Outcome of a stretch: the produced samples, the return code, and the number
-/// of samples the length changed by.
+/// Outcome of a stretch: the return code and the number of samples the length
+/// changed by. The produced samples land in the caller's output scratch.
 #[derive(Debug)]
 pub(crate) struct StretchResult {
-    pub(crate) output: Vec<i16>,
     pub(crate) return_code: ReturnCode,
     pub(crate) length_change_samples: usize,
 }
@@ -178,12 +177,15 @@ fn cross_fade(out: &mut Vec<i16>, append: &[i16], fade_length: usize) {
     out.extend_from_slice(&append[fade_length..]);
 }
 
-/// `Accelerate::Process`. `input` is the mono 30 ms analysis window.
+/// `Accelerate::Process`. `input` is the mono 30 ms analysis window; the
+/// stretched samples are written into `output`.
 pub(crate) fn accelerate_process(
     input: &[i16],
     fast_mode: bool,
     background_noise: &BackgroundNoise,
+    output: &mut Vec<i16>,
 ) -> StretchResult {
+    output.clear();
     let analysis = analyze(input, background_noise);
     // Accelerate::SetParametersForPassiveSpeech sets correlation to zero.
     let best_correlation = if analysis.active_speech {
@@ -207,10 +209,9 @@ pub(crate) fn accelerate_process(
         } else {
             peak_index
         };
-        let mut output = Vec::with_capacity(input.len());
         output.extend_from_slice(&input[..FS_MULT_120]);
         let temp = &input[FS_MULT_120..FS_MULT_120 + stretch_peak];
-        cross_fade(&mut output, temp, stretch_peak);
+        cross_fade(output, temp, stretch_peak);
         output.extend_from_slice(&input[FS_MULT_120 + stretch_peak..]);
         let return_code = if active_speech {
             ReturnCode::Success
@@ -218,13 +219,12 @@ pub(crate) fn accelerate_process(
             ReturnCode::SuccessLowEnergy
         };
         StretchResult {
-            output,
             return_code,
             length_change_samples: peak_index,
         }
     } else {
+        output.extend_from_slice(input);
         StretchResult {
-            output: input.to_vec(),
             return_code: ReturnCode::NoStretch,
             length_change_samples: 0,
         }
@@ -238,12 +238,14 @@ pub(crate) fn preemptive_expand_process(
     old_data_length: usize,
     overlap_samples: usize,
     background_noise: &BackgroundNoise,
+    output: &mut Vec<i16>,
 ) -> StretchResult {
+    output.clear();
     // Length guard from PreemptiveExpand::Process (mono).
     let input_length = input.len();
     if input_length < (2 * 120 - 1) * FS_MULT || old_data_length >= input_length - overlap_samples {
+        output.extend_from_slice(input);
         return StretchResult {
-            output: input.to_vec(),
             return_code: ReturnCode::Error,
             length_change_samples: 0,
         };
@@ -262,10 +264,9 @@ pub(crate) fn preemptive_expand_process(
         || !active_speech
     {
         let unmodified_length = old_data_length.max(FS_MULT_120);
-        let mut output = Vec::with_capacity(input.len() + peak_index);
         output.extend_from_slice(&input[..unmodified_length + peak_index]);
         let temp = &input[unmodified_length - peak_index..unmodified_length];
-        cross_fade(&mut output, temp, peak_index);
+        cross_fade(output, temp, peak_index);
         output.extend_from_slice(&input[unmodified_length..]);
         let return_code = if active_speech {
             ReturnCode::Success
@@ -273,13 +274,12 @@ pub(crate) fn preemptive_expand_process(
             ReturnCode::SuccessLowEnergy
         };
         StretchResult {
-            output,
             return_code,
             length_change_samples: peak_index,
         }
     } else {
+        output.extend_from_slice(input);
         StretchResult {
-            output: input.to_vec(),
             return_code: ReturnCode::NoStretch,
             length_change_samples: 0,
         }
@@ -295,13 +295,13 @@ mod tests {
         v.into_iter().map(|x| x as i16).collect()
     }
 
-    fn check(result: &StretchResult, name: &str) {
+    fn check(result: &StretchResult, output: &[i16], name: &str) {
         let mut got = vec![
             result.return_code as i64,
             result.length_change_samples as i64,
-            result.output.len() as i64,
+            output.len() as i64,
         ];
-        got.extend(result.output.iter().map(|&x| x as i64));
+        got.extend(output.iter().map(|&x| x as i64));
         assert_eq!(got, load(name));
     }
 
@@ -309,17 +309,19 @@ mod tests {
     fn accelerate_matches_oracle() {
         let input = as_i16(load("accelerate_in"));
         let bg = BackgroundNoise::new();
-        check(&accelerate_process(&input, false, &bg), "accelerate_normal");
-        check(&accelerate_process(&input, true, &bg), "accelerate_fast");
+        let mut output = Vec::new();
+        let result = accelerate_process(&input, false, &bg, &mut output);
+        check(&result, &output, "accelerate_normal");
+        let result = accelerate_process(&input, true, &bg, &mut output);
+        check(&result, &output, "accelerate_fast");
     }
 
     #[test]
     fn preemptive_expand_matches_oracle() {
         let input = as_i16(load("preemptive_expand_in"));
         let bg = BackgroundNoise::new();
-        check(
-            &preemptive_expand_process(&input, 480, 240, &bg),
-            "preemptive_expand_normal",
-        );
+        let mut output = Vec::new();
+        let result = preemptive_expand_process(&input, 480, 240, &bg, &mut output);
+        check(&result, &output, "preemptive_expand_normal");
     }
 }
