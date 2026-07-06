@@ -76,6 +76,9 @@ pub(crate) struct LivePlaybackMixer {
     last_output_sample: f32,
     has_last_output_sample: bool,
     output_block_index: u64,
+    /// Callback deadline misses observed by [`Self::note_callback_metrics`].
+    callback_overruns: u64,
+    last_overrun_log_at: Option<Instant>,
     /// Per-stream render attribution for the current block, captured inside each
     /// stream's NetEQ lock hold so a detected pop can be traced to the operation
     /// that produced it. Reused across callbacks.
@@ -159,6 +162,8 @@ impl LivePlaybackMixer {
             last_output_sample: 0.0,
             has_last_output_sample: false,
             output_block_index: 0,
+            callback_overruns: 0,
+            last_overrun_log_at: None,
             render_records: Vec::with_capacity(LIVE_PLAYBACK_PREALLOCATED_STREAMS),
         }
     }
@@ -294,8 +299,12 @@ impl LivePlaybackMixer {
         }
     }
 
+    /// Publishes one callback's timing and warns when it overran its period.
+    /// An overrunning callback starves the device: the underrun is audible on
+    /// the output yet absent from the recorded (pre-device) mix, so this warn
+    /// is the only capture-side evidence of that pop class.
     pub(crate) fn note_callback_metrics(
-        &self,
+        &mut self,
         duration: Duration,
         period: Duration,
         mixer_events_drained: u64,
@@ -303,6 +312,25 @@ impl LivePlaybackMixer {
         if let Some(hints) = &self.hints {
             hints.note_callback(duration, period, mixer_events_drained);
         }
+        if duration <= period {
+            return;
+        }
+        self.callback_overruns = self.callback_overruns.saturating_add(1);
+        let now = Instant::now();
+        if self.last_overrun_log_at.is_some_and(|at| {
+            now.saturating_duration_since(at) < LIVE_PLAYBACK_BACKEND_ERROR_LOG_INTERVAL
+        }) {
+            return;
+        }
+        self.last_overrun_log_at = Some(now);
+        kvlog::warn!(
+            "live playback callback overrun",
+            duration_us = duration.as_micros().min(u64::MAX as u128) as u64,
+            period_us = period.as_micros().min(u64::MAX as u128) as u64,
+            callback_overruns = self.callback_overruns,
+            mixer_events_drained,
+            active_streams = self.streams.len()
+        );
     }
 
     fn note_neteq_lock_waits(&self, count: u64, total: Duration, max: Duration) {

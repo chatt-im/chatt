@@ -113,7 +113,12 @@ fn log_neteq_diagnostics(snapshot: &LivePlaybackSnapshot) {
         reason = snapshot.neteq_decision_reason.as_str(),
         accelerate_count = snapshot.accelerate_count,
         expand_count = snapshot.expand_count,
-        hard_trim_count = snapshot.hard_trim_count
+        hard_trim_count = snapshot.hard_trim_count,
+        callbacks = snapshot.playback_callbacks,
+        callback_overruns = snapshot.playback_callback_overruns,
+        callback_max_duration_us = snapshot.playback_callback_max_duration_us,
+        neteq_lock_wait_max_us = snapshot.neteq_lock_wait_max_us,
+        backend_xruns = snapshot.backend_xruns
     );
 }
 
