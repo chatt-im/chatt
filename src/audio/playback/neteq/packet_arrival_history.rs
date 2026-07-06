@@ -13,7 +13,7 @@
 //! arrival times wobble around wall time and read as phantom jitter. The
 //! caller passes real wall-clock sample counts instead.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::VecDeque;
 
 /// A forward packet after a long receive-side idle period can belong to a new
 /// talkspurt or source instance even if the sender failed to advance RTP time
@@ -69,13 +69,22 @@ impl PacketArrival {
     }
 }
 
+/// Entry bound for the history and the monotonic deques: the 2 s window at
+/// one 10 ms redundancy unit per entry, with slack for reordered stragglers.
+/// `PacketArrival` is `Copy`, so preallocated deques make every operation —
+/// including the callback-side `reset` — allocation- and free-free.
+const HISTORY_CAPACITY: usize = 512;
+
 /// Fixed-window record of packet arrivals for delay estimation.
 #[derive(Debug)]
 pub(crate) struct PacketArrivalHistory {
     window_size_ms: i64,
     sample_rate_khz: i64,
     unwrapper: TimestampUnwrapper,
-    history: BTreeMap<i64, PacketArrival>,
+    /// Arrivals sorted by unwrapped RTP timestamp (unique), oldest at the
+    /// front. Replaces WebRTC's map with a bounded deque so the callback can
+    /// reset it without touching the allocator.
+    history: VecDeque<PacketArrival>,
     min_arrivals: VecDeque<PacketArrival>,
     max_arrivals: VecDeque<PacketArrival>,
 }
@@ -86,9 +95,9 @@ impl PacketArrivalHistory {
             window_size_ms: window_size_ms as i64,
             sample_rate_khz: 0,
             unwrapper: TimestampUnwrapper::default(),
-            history: BTreeMap::new(),
-            min_arrivals: VecDeque::new(),
-            max_arrivals: VecDeque::new(),
+            history: VecDeque::with_capacity(HISTORY_CAPACITY),
+            min_arrivals: VecDeque::with_capacity(HISTORY_CAPACITY),
+            max_arrivals: VecDeque::with_capacity(HISTORY_CAPACITY),
         }
     }
 
@@ -115,7 +124,7 @@ impl PacketArrivalHistory {
         if self.sample_rate_khz <= 0 {
             return false;
         }
-        let Some(newest) = self.history.values().next_back().copied() else {
+        let Some(newest) = self.history.back().copied() else {
             return false;
         };
         let unwrapped = self.unwrapper.peek_unwrap(rtp_timestamp);
@@ -150,13 +159,43 @@ impl PacketArrivalHistory {
         if self.is_obsolete(&packet) || self.contains(&packet) {
             return false;
         }
-        self.history.insert(packet.rtp_timestamp, packet);
-        let newest = *self.history.values().next_back().expect("just inserted");
+        // Sorted insert, scanning from the back (arrivals are mostly in
+        // order). A same-timestamp entry was already rejected by `contains`
+        // only when the earlier packet spans this one, so replace on equality.
+        let position = self
+            .history
+            .iter()
+            .rposition(|entry| entry.rtp_timestamp <= packet.rtp_timestamp);
+        match position {
+            Some(index) if self.history[index].rtp_timestamp == packet.rtp_timestamp => {
+                self.history[index] = packet;
+            }
+            Some(index) => {
+                if self.history.len() == HISTORY_CAPACITY {
+                    let evicted = self.history.pop_front().expect("history full");
+                    if self.min_arrivals.front() == Some(&evicted) {
+                        self.min_arrivals.pop_front();
+                    }
+                    if self.max_arrivals.front() == Some(&evicted) {
+                        self.max_arrivals.pop_front();
+                    }
+                    self.history.insert(index, packet);
+                } else {
+                    self.history.insert(index + 1, packet);
+                }
+            }
+            None => {
+                if self.history.len() < HISTORY_CAPACITY {
+                    self.history.push_front(packet);
+                }
+            }
+        }
+        let newest = *self.history.back().expect("just inserted");
         if packet != newest {
             // Reordered packet: kept in history but excluded from min/max.
             return true;
         }
-        while let Some((&oldest_key, &oldest)) = self.history.iter().next() {
+        while let Some(&oldest) = self.history.front() {
             if !self.is_obsolete(&oldest) {
                 break;
             }
@@ -166,7 +205,7 @@ impl PacketArrivalHistory {
             if self.max_arrivals.front() == Some(&oldest) {
                 self.max_arrivals.pop_front();
             }
-            self.history.remove(&oldest_key);
+            self.history.pop_front();
         }
         while self
             .min_arrivals
@@ -215,7 +254,7 @@ impl PacketArrivalHistory {
     }
 
     pub(crate) fn is_newest_rtp_timestamp(&self, rtp_timestamp: u32) -> bool {
-        match self.history.values().next_back() {
+        match self.history.back() {
             None => true,
             Some(newest) => self.unwrapper.peek_unwrap(rtp_timestamp) == newest.rtp_timestamp,
         }
@@ -233,7 +272,7 @@ impl PacketArrivalHistory {
     }
 
     fn is_obsolete(&self, packet: &PacketArrival) -> bool {
-        match self.history.values().next_back() {
+        match self.history.back() {
             None => false,
             Some(newest) => {
                 packet.rtp_timestamp + self.window_size_ms * self.sample_rate_khz
@@ -243,9 +282,14 @@ impl PacketArrivalHistory {
     }
 
     fn contains(&self, packet: &PacketArrival) -> bool {
-        match self.history.range(..=packet.rtp_timestamp).next_back() {
+        let previous = self
+            .history
+            .iter()
+            .rev()
+            .find(|entry| entry.rtp_timestamp <= packet.rtp_timestamp);
+        match previous {
             None => false,
-            Some((_, prev)) => prev.contains(packet),
+            Some(prev) => prev.contains(packet),
         }
     }
 }
