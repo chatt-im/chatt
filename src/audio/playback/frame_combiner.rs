@@ -89,8 +89,7 @@ impl FrameCombiner {
         }
 
         if self.use_limiter {
-            let mut channels = [self.mixing_buffer.as_mut_slice()];
-            self.limiter.process(&mut channels);
+            self.limiter.process_mono(&mut self.mixing_buffer);
         }
 
         for (dst, &sample) in out.iter_mut().zip(self.mixing_buffer.iter()) {

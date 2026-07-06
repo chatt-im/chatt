@@ -145,7 +145,7 @@ impl LivePlaybackMixer {
     fn with_streams(streams: HashMap<u32, ConsumerStream>) -> Self {
         Self {
             streams,
-            pending_controls: HashMap::new(),
+            pending_controls: HashMap::with_capacity(LIVE_PLAYBACK_PREALLOCATED_STREAMS),
             backend_xruns: 0,
             backend_stream_errors: 0,
             backend_fatal_stream_errors: 0,
@@ -237,6 +237,17 @@ impl LivePlaybackMixer {
     /// stream, so each ring gets exactly one reader.
     pub(crate) fn ensure_stream(&mut self, stream_id: u32, source: impl Into<MixerStreamSource>) {
         let source = source.into();
+        // Beyond the preallocated capacity a new entry would grow the stream
+        // table on the callback thread, so the registration is refused instead
+        // and surfaced through the rejection counter.
+        if !self.streams.contains_key(&stream_id)
+            && self.streams.len() >= LIVE_PLAYBACK_PREALLOCATED_STREAMS
+        {
+            if let Some(hints) = &self.hints {
+                hints.note_stream_rejected();
+            }
+            return;
+        }
         // A pending control never coexists with a registered stream:
         // `set_stream_control` applies directly once registered, so consuming it
         // here (even on the occupied path) discards nothing.
@@ -273,10 +284,26 @@ impl LivePlaybackMixer {
         self.pending_controls.remove(&stream_id);
     }
 
+    /// Applies one drained `StopStream` event: removes the entry (dropping the
+    /// mixer's source handle) and then publishes the ack ordinal the worker
+    /// waits on before retiring its own handle. The order matters: the drop
+    /// must happen-before the ack is visible.
+    pub(crate) fn apply_stop_stream_event(&mut self, stream_id: u32) {
+        self.remove_stream(stream_id);
+        if let Some(hints) = &self.hints {
+            hints.note_stop_event_processed();
+        }
+    }
+
     pub(crate) fn set_stream_control(&mut self, stream_id: u32, control: PlaybackStreamControl) {
         match self.streams.get_mut(&stream_id) {
             Some(stream) => stream.control = control,
             None => {
+                if self.pending_controls.len() >= LIVE_PLAYBACK_PREALLOCATED_STREAMS
+                    && !self.pending_controls.contains_key(&stream_id)
+                {
+                    return;
+                }
                 self.pending_controls.insert(stream_id, control);
             }
         }
@@ -360,9 +387,10 @@ impl LivePlaybackMixer {
 
     pub(crate) fn mix_10ms(&mut self, now: Instant, out: &mut [f32; MIX_FRAME_SAMPLES]) {
         let number_of_streams = self.streams.len();
-        while self.source_frames.len() < number_of_streams {
-            self.source_frames.push([0.0; MIX_FRAME_SAMPLES]);
-        }
+        debug_assert!(
+            self.source_frames.len() >= number_of_streams,
+            "ensure_stream sizes source_frames ahead of registration"
+        );
 
         // Match `/tmp/webrtc/modules/audio_mixer/audio_mixer_impl.cc`: muted
         // sources are excluded from the normal mix list, while
@@ -374,7 +402,9 @@ impl LivePlaybackMixer {
         let mut neteq_lock_wait_max = Duration::ZERO;
         self.render_records.clear();
         for (&stream_id, stream) in self.streams.iter_mut() {
-            let frame = &mut self.source_frames[normal_frames];
+            let Some(frame) = self.source_frames.get_mut(normal_frames) else {
+                break;
+            };
             let declick_start = stream.declick_gain;
             let previous_last_sample = stream.last_rendered_sample;
             let rendered = render_stream_10ms(stream, now, frame);

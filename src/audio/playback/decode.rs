@@ -278,6 +278,22 @@ pub(crate) struct LiveDecodeStreams {
     /// swap never leaves a smaller vec behind. The retired payloads drop here,
     /// on the worker thread, when it is cleared after the lock is released.
     trash_swap: Vec<Packet>,
+    /// `StopStream` events successfully pushed, i.e. the queue-order ordinal of
+    /// the most recent one. The queue is FIFO with one consumer, so the nth
+    /// pushed stop is the nth counted by
+    /// [`LivePlaybackPlayoutHints::note_stop_event_processed`].
+    stops_pushed: u64,
+    /// Stopped streams whose NetEQ the worker keeps alive until the mixer acks
+    /// the matching `StopStream`, so the mixer-side drop is never the last Arc.
+    retiring: Vec<RetiringStream>,
+}
+
+struct RetiringStream {
+    stream_id: u32,
+    shared: SharedNetEqHandle,
+    /// Push ordinal of this stream's `StopStream`, `None` while the push is
+    /// still pending on a full event queue.
+    stop_ordinal: Option<u64>,
 }
 
 impl LiveDecodeStreams {
@@ -303,6 +319,8 @@ impl LiveDecodeStreams {
             notification: None,
             trend: LivePlaybackTrend::default(),
             trash_swap: Vec::with_capacity(PACKET_TRASH_CAPACITY),
+            stops_pushed: 0,
+            retiring: Vec::new(),
         }
     }
 
@@ -337,17 +355,20 @@ impl LiveDecodeStreams {
         &mut self,
         mixer_events: &SpscSwapQueue<LivePlaybackMixerEvent>,
     ) {
-        let dropped = &mut self.dropped_mixer_events;
-        let Some(notification) = self.notification.as_mut() else {
+        let Some(notification) = self.notification.as_ref() else {
             return;
         };
         if !notification.registered || notification.ring.depth() != 0 {
             return;
         }
-        let event = LivePlaybackMixerEvent::StopStream {
-            stream_id: NOTIFICATION_STREAM_ID,
-        };
-        if push_mixer_event(mixer_events, dropped, event) {
+        // The worker keeps the ring Arc, so no retiring entry is needed, but
+        // the push must still go through the ordinal counter: the mixer acks
+        // every drained StopStream, this one included.
+        if self
+            .push_stop_event(mixer_events, NOTIFICATION_STREAM_ID)
+            .is_some()
+            && let Some(notification) = self.notification.as_mut()
+        {
             notification.registered = false;
         }
     }
@@ -415,8 +436,10 @@ impl LiveDecodeStreams {
         }
     }
 
-    pub(crate) fn remove_stream(&mut self, stream_id: u32) {
-        if let Some(stream) = self.streams.remove(&stream_id) {
+    /// Removes the worker's stream entry, returning the shared NetEQ handle so
+    /// the caller decides where it is destroyed.
+    pub(crate) fn remove_stream(&mut self, stream_id: u32) -> Option<SharedNetEqHandle> {
+        let handle = self.streams.remove(&stream_id).map(|stream| {
             // Fold the counters the callback recorded since the last drain, so
             // teardown loses at most nothing rather than up to one tick.
             let delta = {
@@ -426,10 +449,44 @@ impl LiveDecodeStreams {
             };
             self.trash_swap.clear();
             self.stats.absorb(delta);
-        }
+            stream.shared
+        });
         self.mixer_streams.remove(&stream_id);
         self.pending_sender_muted.remove(&stream_id);
         self.pending_mixer_controls.remove(&stream_id);
+        handle
+    }
+
+    /// Pushes one `StopStream`, returning its queue ordinal on success.
+    fn push_stop_event(
+        &mut self,
+        mixer_events: &SpscSwapQueue<LivePlaybackMixerEvent>,
+        stream_id: u32,
+    ) -> Option<u64> {
+        let event = LivePlaybackMixerEvent::StopStream { stream_id };
+        if !push_mixer_event(mixer_events, &mut self.dropped_mixer_events, event) {
+            return None;
+        }
+        self.stops_pushed += 1;
+        Some(self.stops_pushed)
+    }
+
+    fn assign_stop_ordinal(&mut self, stream_id: u32, ordinal: u64) {
+        for entry in &mut self.retiring {
+            if entry.stream_id == stream_id && entry.stop_ordinal.is_none() {
+                entry.stop_ordinal = Some(ordinal);
+                return;
+            }
+        }
+    }
+
+    /// Drops retired handles whose `StopStream` the mixer has acked: the mixer
+    /// clone is gone, so the worker's drop here is the last one and the NetEQ
+    /// is destroyed on this thread, never on the audio callback.
+    fn release_acked_retiring(&mut self) {
+        let acked = self.hints.stop_events_processed();
+        self.retiring
+            .retain(|entry| entry.stop_ordinal.is_none_or(|ordinal| ordinal > acked));
     }
 
     pub(crate) fn stop_stream(
@@ -438,21 +495,39 @@ impl LiveDecodeStreams {
         mixer_events: &SpscSwapQueue<LivePlaybackMixerEvent>,
     ) {
         self.stopped_streams.insert(stream_id);
-        self.remove_stream(stream_id);
-        let event = LivePlaybackMixerEvent::StopStream { stream_id };
-        if !push_mixer_event(mixer_events, &mut self.dropped_mixer_events, event) {
+        let mixer_holds = self.mixer_streams.contains(&stream_id);
+        let shared = self.remove_stream(stream_id);
+        let stop_ordinal = self.push_stop_event(mixer_events, stream_id);
+        if stop_ordinal.is_none() {
             self.pending_mixer_stops.insert(stream_id);
         }
+        let Some(shared) = shared else {
+            return;
+        };
+        if !mixer_holds {
+            // The mixer never received this handle, so the worker owns the last
+            // Arc and the drop right here is off the callback.
+            return;
+        }
+        self.retiring.push(RetiringStream {
+            stream_id,
+            shared,
+            stop_ordinal,
+        });
     }
 
     fn flush_pending_mixer_stops(&mut self, mixer_events: &SpscSwapQueue<LivePlaybackMixerEvent>) {
-        let dropped = &mut self.dropped_mixer_events;
-        self.pending_mixer_stops.retain(|stream_id| {
-            let event = LivePlaybackMixerEvent::StopStream {
-                stream_id: *stream_id,
+        if self.pending_mixer_stops.is_empty() {
+            return;
+        }
+        let pending: Vec<u32> = self.pending_mixer_stops.iter().copied().collect();
+        for stream_id in pending {
+            let Some(ordinal) = self.push_stop_event(mixer_events, stream_id) else {
+                continue;
             };
-            !push_mixer_event(mixer_events, dropped, event)
-        });
+            self.pending_mixer_stops.remove(&stream_id);
+            self.assign_stop_ordinal(stream_id, ordinal);
+        }
     }
 
     pub(crate) fn set_stream_control(
@@ -504,6 +579,7 @@ impl LiveDecodeStreams {
     ) {
         self.flush_pending_mixer_stops(mixer_events);
         self.flush_pending_mixer_controls(mixer_events);
+        self.release_acked_retiring();
         let output_ring_ms = samples_to_ms(self.hints.staged_samples());
         let dropped = &mut self.dropped_mixer_events;
         let stats = &mut self.stats;
@@ -1510,5 +1586,90 @@ mod tests {
             event = LivePlaybackMixerEvent::Empty;
         }
         false
+    }
+
+    #[test]
+    fn stopped_stream_retires_only_after_mixer_ack() {
+        let now = Instant::now();
+        let tuning = test_tuning();
+        let mut streams = LiveDecodeStreams::new(tuning);
+        let mut mixer = LivePlaybackMixer::with_live_capacity(tuning);
+        mixer.set_playout_hints(streams.playout_hints());
+        let queue = SpscSwapQueue::with_capacity(16);
+        let mut pending_event = LivePlaybackMixerEvent::default();
+        let mut encoder = OpusVoiceEncoder::new(32_000).unwrap();
+
+        let opus = tone_packet(&mut encoder, 0);
+        streams.insert_packet(voice_packet(7, 0, 0, opus, now), now);
+        streams.drain_into_mixer_events(&queue, now, None);
+        crate::audio::device::drain_live_playback_mixer_events(
+            &mut mixer,
+            &queue,
+            &mut pending_event,
+        );
+        let weak = Arc::downgrade(&streams.streams.get(&7).unwrap().shared);
+
+        streams.stop_stream(7, &queue);
+        streams.drain_into_mixer_events(&queue, now, None);
+        assert!(
+            weak.upgrade().is_some(),
+            "worker retired the stream before the mixer acked its StopStream"
+        );
+
+        crate::audio::device::drain_live_playback_mixer_events(
+            &mut mixer,
+            &queue,
+            &mut pending_event,
+        );
+        streams.drain_into_mixer_events(&queue, now, None);
+        assert!(
+            weak.upgrade().is_none(),
+            "acked stream was never released by the worker"
+        );
+    }
+
+    #[test]
+    fn notification_stop_keeps_stream_ack_ordinals_aligned() {
+        let now = Instant::now();
+        let tuning = test_tuning();
+        let mut streams = LiveDecodeStreams::new(tuning);
+        let mut mixer = LivePlaybackMixer::with_live_capacity(tuning);
+        mixer.set_playout_hints(streams.playout_hints());
+        let queue = SpscSwapQueue::with_capacity(16);
+        let mut pending_event = LivePlaybackMixerEvent::default();
+        let mut encoder = OpusVoiceEncoder::new(32_000).unwrap();
+
+        // An empty notification registers and immediately retires on the next
+        // drain, interleaving a notification StopStream ahead of the stream's.
+        streams.play_notification(&[0.0; 4], &queue);
+        let opus = tone_packet(&mut encoder, 0);
+        streams.insert_packet(voice_packet(7, 0, 0, opus, now), now);
+        streams.drain_into_mixer_events(&queue, now, None);
+        crate::audio::device::drain_live_playback_mixer_events(
+            &mut mixer,
+            &queue,
+            &mut pending_event,
+        );
+        let weak = Arc::downgrade(&streams.streams.get(&7).unwrap().shared);
+
+        // One mixed block drains the 4-sample notification ring, so the next
+        // worker drain retires it, pushing its StopStream ahead of the stream's.
+        mixer.begin_output_callback();
+        for _ in 0..MIX_FRAME_SAMPLES {
+            let _ = mixer.pop_mixed_output_sample(now, MIX_FRAME_SAMPLES);
+        }
+        streams.drain_into_mixer_events(&queue, now, None);
+        assert_eq!(streams.stops_pushed, 1, "notification stop was not pushed");
+        streams.stop_stream(7, &queue);
+        crate::audio::device::drain_live_playback_mixer_events(
+            &mut mixer,
+            &queue,
+            &mut pending_event,
+        );
+        streams.drain_into_mixer_events(&queue, now, None);
+        assert!(
+            weak.upgrade().is_none(),
+            "stream ack ordinal desynced by the notification stop"
+        );
     }
 }
