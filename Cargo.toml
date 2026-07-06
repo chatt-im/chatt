@@ -86,6 +86,9 @@ members = [
 ]
 exclude = ["crates/cpal", "crates/sonora", "crates/pathify_svg"]
 
+[profile.release]
+debug = 1
+
 [profile.dev]
 debug = 0
 opt-level = 1

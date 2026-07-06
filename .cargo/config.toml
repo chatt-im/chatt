@@ -11,7 +11,9 @@
 #
 # The rustflags are scoped to x86-64 targets so host build scripts are
 # unaffected when cross-compiling. Note env `RUSTFLAGS`, if set, overrides these.
-
+#
+[build]
+rustflags = ["-C", "force-frame-pointers=yes"]
 
 [alias]
 v3 = [
