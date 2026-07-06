@@ -618,15 +618,22 @@ pub(crate) fn filter_ar_fast_q12(
     data_length: usize,
 ) {
     let order = coefficients.len() - 1;
+    let c0 = coefficients[0] as i32;
+    // Feedback taps, applied newest-history-first. The contiguous history window
+    // `state_and_out[i..i + order]` has `window[k] == state_and_out[order + i - j]`
+    // for `j == order - k`, so pairing it with the reversed taps reproduces the C
+    // inner sum term for term. i32 products match the C `int16 * int16 -> int`
+    // width; the running sum (`order` terms, each below 2^31) stays within i64.
+    let taps = &coefficients[1..=order];
     for i in 0..data_length {
+        let window = &state_and_out[i..i + order];
         let mut sum: i64 = 0;
-        for j in (1..=order).rev() {
-            sum += (coefficients[j] as i64) * (state_and_out[order + i - j] as i64);
+        for (&c, &w) in taps.iter().rev().zip(window) {
+            sum += (c as i32 * w as i32) as i64;
         }
-        let mut output: i64 = (coefficients[0] as i64) * (data_in[i] as i64);
-        output -= sum;
+        let output = (c0 * data_in[i] as i32) as i64 - sum;
         // WEBRTC_SPL_SAT(134215679, output, -134217728).
-        output = output.clamp(-134_217_728, 134_215_679);
+        let output = output.clamp(-134_217_728, 134_215_679);
         state_and_out[order + i] = ((output + 2048) >> 12) as i16;
     }
 }
