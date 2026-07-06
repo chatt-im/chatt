@@ -120,9 +120,12 @@ pub(crate) struct NetEqInsertContext {
 }
 
 /// One cached DRED parse, reused across the 10 ms chunks recovered from the same
-/// packet (mirrors the previous live path's `DredGapState`).
+/// packet (mirrors the previous live path's `DredGapState`). The core keeps one
+/// slot alive for the stream's lifetime so a callback-side re-parse reuses the
+/// existing `DredState` allocation via [`DredState::reset`]. `sequence` is
+/// `None` while the slot holds no valid parse.
 struct DredParse {
-    sequence: u32,
+    sequence: Option<u32>,
     state: DredState,
     processed: bool,
     /// Final-pair PCM: the last two 10 ms chunks decoded as one 20 ms deep-PLC
@@ -302,6 +305,27 @@ impl NetEqCore {
         {
             return Err("invalid NetEQ delay constraints".to_string());
         }
+        // The parse slot is created eagerly so the callback-side DRED fallback
+        // reuses its allocation via reset() instead of opus_dred_alloc. DRED is
+        // disabled outright if the state cannot be allocated, keeping the
+        // "decoder present implies slot present" invariant.
+        let mut dred_decoder = DredDecoder::new().ok();
+        let dred_parse = match &dred_decoder {
+            Some(_) => match DredState::new() {
+                Ok(state) => Some(DredParse {
+                    sequence: None,
+                    state,
+                    processed: false,
+                    pcm: Vec::with_capacity(2 * DRED_CHUNK_SAMPLES),
+                    span: 0,
+                }),
+                Err(_) => {
+                    dred_decoder = None;
+                    None
+                }
+            },
+            None => None,
+        };
         Ok(Self {
             tick_timer,
             wall_origin: None,
@@ -311,8 +335,8 @@ impl NetEqCore {
             decision_logic,
             decoder: Decoder::new(SampleRate::Hz48000, Channels::Mono)
                 .map_err(|error| error.to_string())?,
-            dred_decoder: DredDecoder::new().ok(),
-            dred_parse: None,
+            dred_decoder,
+            dred_parse,
             expand: Expand::new(),
             background_noise: BackgroundNoise::new(),
             random_vector: RandomVector::new(),
@@ -453,7 +477,11 @@ impl NetEqCore {
         self.new_codec = false;
         self.reset_decoder = false;
         self.generated_noise_stopwatch = None;
-        self.dred_parse = None;
+        if let Some(parse) = &mut self.dred_parse {
+            // Invalidate rather than drop: the state allocation is reused and
+            // flush must stay allocation/free-free for callers under the lock.
+            parse.sequence = None;
+        }
         self.mute_gain = 1.0;
         self.mute_target = 1.0;
         self.last_operation = Operation::Normal;
@@ -751,7 +779,7 @@ impl NetEqCore {
             return (None, None, available_horizon_samples);
         }
         let dred_parse = DredParse {
-            sequence,
+            sequence: Some(sequence),
             state,
             processed: false,
             pcm: Vec::with_capacity(2 * DRED_CHUNK_SAMPLES),
@@ -1239,35 +1267,30 @@ impl NetEqCore {
         let Some(dred_decoder) = self.dred_decoder.as_mut() else {
             return Ok(0);
         };
+        let parse = self.dred_parse.as_mut().ok_or(())?;
         // Reuse the cached parse from insertion when it is for this packet.
-        let cached = self
-            .dred_parse
-            .as_ref()
-            .is_some_and(|parse| parse.sequence == sequence);
-        if !cached {
-            let mut state = DredState::new().map_err(|_| ())?;
+        // Otherwise re-parse into the same slot: reset() re-zeroes the existing
+        // DredState in place, so this fallback never touches the allocator.
+        if parse.sequence != Some(sequence) {
+            parse.state.reset();
             let mut dred_end = 0;
             let max_dred_samples = usize::try_from(offset.max(DRED_CHUNK_SAMPLES as i32))
                 .unwrap_or(usize::MAX)
                 .saturating_add(DRED_PARSE_MARGIN_SAMPLES)
                 .min(LIVE_PLAYBACK_DRED_MAX_SAMPLES);
             let _ = dred_decoder.parse(
-                &mut state,
+                &mut parse.state,
                 source,
                 max_dred_samples,
                 SampleRate::Hz48000,
                 &mut dred_end,
                 true,
             );
-            self.dred_parse = Some(DredParse {
-                sequence,
-                state,
-                processed: false,
-                pcm: Vec::with_capacity(2 * DRED_CHUNK_SAMPLES),
-                span: 0,
-            });
+            parse.sequence = Some(sequence);
+            parse.processed = false;
+            parse.pcm.clear();
+            parse.span = 0;
         }
-        let parse = self.dred_parse.as_mut().expect("dred parse present");
         if !parse.processed {
             dred_decoder
                 .process_in_place(&mut parse.state)
@@ -2279,7 +2302,9 @@ mod tests {
             clock.advance_block();
             clock.advance_block();
             assert!(
-                core.dred_parse.is_none(),
+                core.dred_parse
+                    .as_ref()
+                    .is_none_or(|parse| parse.sequence.is_none()),
                 "zero-gap insert parsed DRED at seq {seq}",
             );
         }
