@@ -37,12 +37,9 @@ impl TickTimer {
         self.ticks += ticks;
     }
 
+    #[cfg(test)]
     pub(crate) fn ticks(&self) -> u64 {
         self.ticks
-    }
-
-    pub(crate) fn ms_per_tick(&self) -> u64 {
-        self.ms_per_tick
     }
 
     pub(crate) fn new_stopwatch(&self) -> Stopwatch {

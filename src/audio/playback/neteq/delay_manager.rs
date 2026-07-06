@@ -93,9 +93,7 @@ mod tests {
         PacketArrivedInfo {
             packet_length_samples: 960,
             main_timestamp: 0,
-            main_sequence_number: 0,
             is_cng_or_dtmf: false,
-            is_dtx: false,
             buffer_flush: false,
         }
     }

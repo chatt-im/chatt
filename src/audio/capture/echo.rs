@@ -116,7 +116,8 @@ impl EchoReference {
 
     /// Appends a block of render samples, publishing them with a single atomic
     /// store. Producer side, never blocks. Drops the samples that do not fit.
-    pub fn push_frame(&self, samples: &[f32]) {
+    #[cfg(test)]
+    pub(crate) fn push_frame(&self, samples: &[f32]) {
         let mut writer = self.writer();
         for &sample in samples {
             writer.push(sample);

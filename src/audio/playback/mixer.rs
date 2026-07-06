@@ -59,7 +59,6 @@ pub(crate) struct LivePlaybackMixer {
     backend_fatal_stream_errors: u64,
     last_backend_error_kind: Option<AudioErrorKind>,
     last_backend_error: Option<String>,
-    last_backend_error_log_at: Option<Instant>,
     /// Per-stream rendered 10 ms source frames, reused across callbacks to avoid
     /// allocation on the audio thread.
     source_frames: Vec<[f32; MIX_FRAME_SAMPLES]>,
@@ -151,7 +150,6 @@ impl LivePlaybackMixer {
             backend_fatal_stream_errors: 0,
             last_backend_error_kind: None,
             last_backend_error: None,
-            last_backend_error_log_at: None,
             source_frames: Vec::with_capacity(LIVE_PLAYBACK_PREALLOCATED_STREAMS),
             combiner: FrameCombiner::default(),
             fill: [0.0; MIX_FRAME_SAMPLES],
@@ -191,14 +189,6 @@ impl LivePlaybackMixer {
     pub(crate) fn snapshot(&self) -> LivePlaybackSnapshot {
         self.last_snapshot.clone()
     }
-
-    pub(crate) fn output_ring_samples(&self) -> usize {
-        self.last_snapshot.output_ring_samples
-    }
-
-    /// Diagnostics logging now lives on the producer; kept as a no-op so the
-    /// device and simulation call sites stay unchanged.
-    pub(crate) fn log_playback_diagnostics_if_due(&self, _now: Instant) {}
 
     pub(crate) fn begin_output_callback(&mut self) {
         self.callback_source_cursor = 0;
@@ -243,6 +233,7 @@ impl LivePlaybackMixer {
         if !self.streams.contains_key(&stream_id)
             && self.streams.len() >= LIVE_PLAYBACK_PREALLOCATED_STREAMS
         {
+            #[cfg(test)]
             if let Some(hints) = &self.hints {
                 hints.note_stream_rejected();
             }
@@ -309,6 +300,7 @@ impl LivePlaybackMixer {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn active_streams(&self) -> usize {
         self.streams.len()
     }
@@ -370,6 +362,7 @@ impl LivePlaybackMixer {
     }
 
     /// Mixes an arbitrary mono block by serving fixed 10 ms mixer frames.
+    #[cfg(test)]
     pub(crate) fn fill_block(&mut self, callback_start: Instant, out: &mut [f32]) {
         self.begin_output_callback();
         for sample in out {
@@ -663,46 +656,6 @@ impl LivePlaybackMixer {
                     );
                 }
             }
-        }
-    }
-
-    pub(crate) fn record_backend_stream_error(
-        &mut self,
-        error: String,
-        kind: AudioErrorKind,
-        now: Instant,
-    ) {
-        let is_xrun = kind == AudioErrorKind::Xrun;
-        self.backend_stream_errors = self.backend_stream_errors.saturating_add(1);
-        if is_xrun {
-            self.backend_xruns = self.backend_xruns.saturating_add(1);
-        }
-        if kind.triggers_recovery() {
-            self.backend_fatal_stream_errors = self.backend_fatal_stream_errors.saturating_add(1);
-            self.last_backend_error_kind = Some(kind);
-        }
-        self.last_backend_error = Some(error.clone());
-
-        if self.last_backend_error_log_at.is_some_and(|at| {
-            now.saturating_duration_since(at) < LIVE_PLAYBACK_BACKEND_ERROR_LOG_INTERVAL
-        }) {
-            return;
-        }
-        self.last_backend_error_log_at = Some(now);
-        if is_xrun {
-            kvlog::warn!(
-                "live playback backend xrun",
-                error = error.as_str(),
-                backend_xruns = self.backend_xruns,
-                backend_stream_errors = self.backend_stream_errors
-            );
-        } else {
-            kvlog::warn!(
-                "live playback backend stream error",
-                error = error.as_str(),
-                backend_xruns = self.backend_xruns,
-                backend_stream_errors = self.backend_stream_errors
-            );
         }
     }
 }

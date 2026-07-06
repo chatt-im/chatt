@@ -13,7 +13,6 @@ use super::operation::Mode;
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct PacketInfo {
     pub timestamp: u32,
-    pub is_dtx: bool,
     pub is_cng: bool,
 }
 
@@ -21,7 +20,6 @@ pub(crate) struct PacketInfo {
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct PacketBufferInfo {
     pub dtx_or_cng: bool,
-    pub num_samples: usize,
     pub span_samples: usize,
     pub span_samples_wait_time: usize,
     pub num_packets: usize,
@@ -34,7 +32,6 @@ pub(crate) struct NetEqStatus {
     pub target_timestamp: u32,
     /// Expand mute factor in Q14 (16384 == 1.0).
     pub expand_mutefactor: i16,
-    pub last_packet_samples: usize,
     pub next_packet: Option<PacketInfo>,
     pub last_mode: Mode,
     pub play_dtmf: bool,
@@ -49,9 +46,7 @@ pub(crate) struct NetEqStatus {
 pub(crate) struct PacketArrivedInfo {
     pub packet_length_samples: usize,
     pub main_timestamp: u32,
-    pub main_sequence_number: u16,
     pub is_cng_or_dtmf: bool,
-    pub is_dtx: bool,
     pub buffer_flush: bool,
 }
 

@@ -131,10 +131,6 @@ impl Expand {
         self.max_lag
     }
 
-    fn too_many_expands(&self) -> bool {
-        self.consecutive_expands >= MAX_CONSECUTIVE_EXPANDS
-    }
-
     fn update_lag_index(&mut self) {
         self.current_lag_index += self.lag_index_direction;
         if self.current_lag_index <= 0 {

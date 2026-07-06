@@ -11,7 +11,7 @@ mod term;
 
 use std::path::{Path, PathBuf};
 
-use chatt::audio::{
+use crate::audio::{
     self, BufferRequest, DeviceInfo, LiveAudioFilePlaybackTestConfig,
     LiveAudioFilePlaybackTestReport, LiveAudioPacketLossProfile,
 };
@@ -313,7 +313,7 @@ static VOICE_SET: Command = Command {
     examples: &[],
 };
 
-pub(crate) fn run() -> Result<(), Box<dyn std::error::Error>> {
+pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     let args = std::env::args().collect::<Vec<_>>();
     let logfile =
         config::value_arg(&args, "--logfile").or_else(|| std::env::var("CHATT_LOGFILE").ok());

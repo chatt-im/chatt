@@ -42,6 +42,7 @@ impl RandomVector {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn reset(&mut self) {
         self.seed = 777;
         self.seed_increment = 1;

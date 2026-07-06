@@ -77,10 +77,6 @@ impl DelayConstraints {
         true
     }
 
-    pub(crate) fn base_minimum_delay(&self) -> i32 {
-        self.base_minimum_delay_ms
-    }
-
     fn is_valid_minimum_delay(&self, delay_ms: i32) -> bool {
         (0..=self.minimum_delay_upper_bound()).contains(&delay_ms)
     }

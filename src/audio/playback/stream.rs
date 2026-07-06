@@ -108,11 +108,6 @@ impl SharedNetEqStream {
     pub(crate) fn core_mut(&mut self) -> &mut NetEqCore {
         &mut self.core
     }
-
-    #[cfg(test)]
-    pub(crate) fn core(&self) -> &NetEqCore {
-        &self.core
-    }
 }
 
 /// Records one output block's NetEQ operation. The operation `Mode`/source from
@@ -176,6 +171,7 @@ pub(crate) struct LivePlaybackPlayoutHints {
     /// provably dropped and the worker's drop cannot land on the callback.
     stop_events_processed: AtomicU64,
     /// `EnsureStream` events the mixer rejected at its preallocated stream cap.
+    #[cfg(test)]
     streams_rejected: AtomicU64,
 }
 
@@ -211,6 +207,7 @@ impl LivePlaybackPlayoutHints {
             .fetch_add(mixer_events_drained, Ordering::Relaxed);
     }
 
+    #[cfg(test)]
     pub(crate) fn note_neteq_lock_wait(&self, wait: Duration) {
         let wait_us = duration_to_us(wait);
         if wait_us == 0 {
@@ -247,6 +244,7 @@ impl LivePlaybackPlayoutHints {
         self.stop_events_processed.load(Ordering::Acquire)
     }
 
+    #[cfg(test)]
     pub(crate) fn note_stream_rejected(&self) {
         self.streams_rejected.fetch_add(1, Ordering::Relaxed);
     }
@@ -260,6 +258,7 @@ impl LivePlaybackPlayoutHints {
             neteq_lock_wait_count: self.neteq_lock_wait_count.load(Ordering::Relaxed),
             neteq_lock_wait_total_us: self.neteq_lock_wait_total_us.load(Ordering::Relaxed),
             neteq_lock_wait_max_us: self.neteq_lock_wait_max_us.load(Ordering::Relaxed),
+            #[cfg(test)]
             streams_rejected: self.streams_rejected.load(Ordering::Relaxed),
         }
     }
@@ -274,6 +273,7 @@ pub(crate) struct LivePlaybackCallbackMetrics {
     pub(crate) neteq_lock_wait_count: u64,
     pub(crate) neteq_lock_wait_total_us: u64,
     pub(crate) neteq_lock_wait_max_us: u64,
+    #[cfg(test)]
     pub(crate) streams_rejected: u64,
 }
 

@@ -258,26 +258,6 @@ pub(crate) fn peak_detection(
     }
 }
 
-/// `DspHelper::RampSignal`: scale `input` by `factor` (Q14), stepping the gain by
-/// `increment` (Q20) per sample. Returns the final Q14 factor.
-pub(crate) fn ramp_signal(
-    input: &[i16],
-    length: usize,
-    factor: i32,
-    increment: i32,
-    output: &mut [i16],
-) -> i32 {
-    let mut factor = factor;
-    let mut factor_q20 = (factor << 6) + 32;
-    for i in 0..length {
-        output[i] = ((factor * input[i] as i32 + 8192) >> 14) as i16;
-        factor_q20 += increment;
-        factor_q20 = factor_q20.max(0);
-        factor = (factor_q20 >> 6).min(16384);
-    }
-    factor
-}
-
 /// In-place `DspHelper::RampSignal(int16_t* signal, ...)`.
 pub(crate) fn ramp_signal_in_place(
     signal: &mut [i16],

@@ -15,10 +15,12 @@ const FLOAT_S16_SCALE: f32 = 32768.0;
 const MIN_FLOAT_S16: f32 = -32768.0;
 const MAX_FLOAT_S16: f32 = 32767.0;
 
+#[cfg(test)]
 pub(crate) struct MixerFrameRef<'a> {
     samples: &'a [f32; MIX_FRAME_SAMPLES],
 }
 
+#[cfg(test)]
 impl<'a> MixerFrameRef<'a> {
     pub(crate) fn new(samples: &'a [f32; MIX_FRAME_SAMPLES]) -> Self {
         Self { samples }
@@ -46,6 +48,7 @@ impl FrameCombiner {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn combine(
         &mut self,
         normal_frames: &[MixerFrameRef<'_>],

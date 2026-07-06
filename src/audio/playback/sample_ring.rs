@@ -70,10 +70,6 @@ impl SampleRing {
         }
     }
 
-    pub(crate) fn capacity(&self) -> usize {
-        self.buf.len()
-    }
-
     /// Current fill level, `write - read`. Callable from either side. The
     /// producer uses it to steer time-scaling toward the adaptive target.
     pub(crate) fn depth(&self) -> usize {
@@ -86,6 +82,7 @@ impl SampleRing {
 
     /// Free space available to the producer, computed from one `Acquire` load
     /// of `read`.
+    #[cfg(test)]
     pub(crate) fn free(&self) -> usize {
         let write = self.write.load(Ordering::Relaxed);
         let read = self.read.load(Ordering::Acquire);
@@ -224,6 +221,7 @@ impl ReadSpan<'_> {
         self.first.len() + self.second.len()
     }
 
+    #[cfg(test)]
     pub(crate) fn is_empty(&self) -> bool {
         self.len() == 0
     }

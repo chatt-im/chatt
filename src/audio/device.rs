@@ -1566,10 +1566,12 @@ impl LivePlaybackMixAdapter {
         callback_start + samples_to_duration(self.callback_source_cursor)
     }
 
+    #[cfg(test)]
     fn fill(&mut self, mixer: &mut LivePlaybackMixer, callback_start: Instant, out: &mut [f32]) {
         self.fill_from(callback_start, out, |now, carry| mixer.mix_10ms(now, carry));
     }
 
+    #[cfg(test)]
     fn fill_from(
         &mut self,
         callback_start: Instant,

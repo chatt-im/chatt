@@ -21,25 +21,6 @@ pub(crate) fn norm_w32(a: i32) -> i16 {
     (count_leading_zeros32(masked) - 1) as i16
 }
 
-/// `WebRtcSpl_NormU32`: leading-zero count of an unsigned value (0 for zero).
-pub(crate) fn norm_u32(a: u32) -> i16 {
-    if a == 0 {
-        0
-    } else {
-        count_leading_zeros32(a) as i16
-    }
-}
-
-/// `WebRtcSpl_NormW16`: left shifts available before `a` overflows int16.
-pub(crate) fn norm_w16(a: i16) -> i16 {
-    if a == 0 {
-        return 0;
-    }
-    let a32 = a as i32;
-    let masked = if a < 0 { !a32 } else { a32 } as u32;
-    (count_leading_zeros32(masked) - 17) as i16
-}
-
 /// `WebRtcSpl_GetSizeInBits`: index of the most significant set bit plus one.
 pub(crate) fn get_size_in_bits(n: u32) -> i16 {
     (32 - count_leading_zeros32(n)) as i16
@@ -212,6 +193,7 @@ pub(crate) fn cross_correlation_at(
 }
 
 /// `WebRtcSpl_CrossCorrelation` for the contiguous, forward-stepping case.
+#[cfg(test)]
 pub(crate) fn cross_correlation(
     cross_correlation: &mut [i32],
     seq1: &[i16],
@@ -280,6 +262,7 @@ pub(crate) fn cross_correlation_with_auto_shift(
 
 /// `WebRtcSpl_AutoCorrelation`: scaled autocorrelation for lags `0..=order`.
 /// Returns the per-sample right shift via `scale`.
+#[cfg(test)]
 pub(crate) fn auto_correlation(
     in_vector: &[i16],
     order: usize,

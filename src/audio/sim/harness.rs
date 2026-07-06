@@ -149,9 +149,7 @@ pub(crate) fn trace_packet_delivery(
     };
     let outcome = match outcome {
         Some(InsertOutcome::Accepted) => "accepted",
-        Some(InsertOutcome::Duplicate) => "duplicate",
         Some(InsertOutcome::Late) => "late",
-        Some(InsertOutcome::BufferFull) => "buffer_full",
         None => "decoder_unavailable",
     };
     trace.write_event(jsony::object! {
@@ -1017,7 +1015,6 @@ impl SimStreamState {
 
 pub(crate) struct SimulationFrame {
     samples: Vec<f32>,
-    silence: bool,
 }
 
 pub(crate) fn simulation_frame(
@@ -1112,14 +1109,12 @@ pub(crate) fn sample_speech_simulation_frame(
             .iter()
             .map(|sample| (sample * gain).clamp(-0.95, 0.95))
             .collect(),
-        silence: false,
     }
 }
 
 pub(crate) fn silence_simulation_frame() -> SimulationFrame {
     SimulationFrame {
         samples: vec![0.0; FRAME_SAMPLES],
-        silence: true,
     }
 }
 

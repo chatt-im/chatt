@@ -1,16 +1,12 @@
 #![cfg(test)]
 //! Shared test fixtures for the audio module tree.
-use std::{
-    collections::VecDeque,
-    time::{Duration, Instant},
-};
+use std::{collections::VecDeque, time::Duration};
 
 use opus_codec::{Channels, Decoder, DredDecoder, DredState, SampleRate};
 
 use crate::{
     audio::{
         capture::OpusVoiceEncoder,
-        playback::LivePlaybackMixer,
         shared::{
             DEFAULT_LIVE_MAX_AMPLIFICATION, FRAME_SAMPLES, LIVE_OPUS_FRAME_SAMPLES,
             LIVE_PLAYBACK_DRED_MAX_SAMPLES, LiveAudioTuning, MAX_OPUS_PACKET_BYTES,
@@ -22,7 +18,7 @@ use crate::{
             load_live_audio_simulation_speech_frames, run_live_audio_simulation_with_speech,
         },
     },
-    network::{AudioPacketRef, EncoderNetworkProfile, EncoderNetworkTuning},
+    network::{EncoderNetworkProfile, EncoderNetworkTuning},
 };
 
 pub(crate) fn count_direct_encoder_recoverable_dred(frame_samples: usize) -> usize {
@@ -148,42 +144,6 @@ pub(crate) fn encode_live_dred_packets(
         packets.push(packet[..encoded].to_vec());
     }
     packets
-}
-
-pub(crate) fn pop_until_nonzero(mixer: &mut LivePlaybackMixer, now: Instant) -> f32 {
-    mixer.begin_output_callback();
-    for _ in 0..(FRAME_SAMPLES * 2) {
-        let sample = mixer.pop_mixed_sample(now);
-        if sample.abs() > 0.01 {
-            return sample;
-        }
-    }
-    0.0
-}
-
-pub(crate) fn pop_next_nonzero_window(mixer: &mut LivePlaybackMixer, now: Instant) -> f32 {
-    mixer.begin_output_callback();
-    let mut max_sample: f32 = 0.0;
-    for _ in 0..(FRAME_SAMPLES * 2) {
-        max_sample = max_sample.max(mixer.pop_mixed_sample(now).abs());
-    }
-    max_sample
-}
-
-pub(crate) fn test_audio_packet(sequence: u32, payload: &[u8]) -> AudioPacketRef<'_> {
-    AudioPacketRef {
-        sequence,
-        flags: 0,
-        payload: crate::audio::shared::VoicePayloadRef::Opus(payload),
-    }
-}
-
-pub(crate) fn encode_test_frame(encoder: &mut OpusVoiceEncoder, amplitude: i16) -> Vec<u8> {
-    let input = vec![amplitude; LIVE_OPUS_FRAME_SAMPLES];
-    let mut output = vec![0u8; MAX_OPUS_PACKET_BYTES];
-    let len = encoder.encode(&input, &mut output).unwrap();
-    output.truncate(len);
-    output
 }
 
 pub(crate) fn test_tuning() -> LiveAudioTuning {

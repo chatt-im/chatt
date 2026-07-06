@@ -234,6 +234,7 @@ impl CaptureProcessor {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn echo_enabled(&self) -> bool {
         self.echo_enabled
     }

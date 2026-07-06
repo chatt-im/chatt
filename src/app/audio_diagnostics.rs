@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use chatt::audio::{AudioDeviceInfo, LiveEncoderProfile, LivePlaybackSnapshot, SAMPLE_RATE};
+use crate::audio::{AudioDeviceInfo, LiveEncoderProfile, LivePlaybackSnapshot, SAMPLE_RATE};
 
 pub(crate) struct AudioDiagnostics {
     snapshot: LivePlaybackSnapshot,

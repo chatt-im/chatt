@@ -9,7 +9,7 @@ use extui_bindings::LayerId;
 use extui_editor::Mode as EditorMode;
 use unicode_width::UnicodeWidthStr;
 
-use chatt::audio::StatsSnapshot;
+use crate::audio::StatsSnapshot;
 
 use crate::{
     app::{

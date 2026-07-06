@@ -35,6 +35,7 @@ pub(crate) enum InsertOutcome {
 #[derive(Debug)]
 pub(crate) struct PacketTrash {
     packets: Vec<Packet>,
+    #[cfg(test)]
     overflow: u64,
 }
 
@@ -46,13 +47,17 @@ impl PacketTrash {
     fn new() -> Self {
         Self {
             packets: Vec::with_capacity(PACKET_TRASH_CAPACITY),
+            #[cfg(test)]
             overflow: 0,
         }
     }
 
     fn push(&mut self, packet: Packet) {
         if self.packets.len() == self.packets.capacity() {
-            self.overflow = self.overflow.saturating_add(1);
+            #[cfg(test)]
+            {
+                self.overflow = self.overflow.saturating_add(1);
+            }
             return;
         }
         self.packets.push(packet);
@@ -93,6 +98,7 @@ impl PacketBuffer {
     }
 
     /// Retired packets dropped inline because the trash was full.
+    #[cfg(test)]
     pub(crate) fn trash_overflow(&self) -> u64 {
         self.trash.overflow
     }
@@ -107,24 +113,6 @@ impl PacketBuffer {
             );
             self.trash.push(packet);
         }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn debug_packets(&self) -> Vec<(u32, u32, i32)> {
-        self.buffer
-            .iter()
-            .map(|packet| {
-                (
-                    packet.timestamp,
-                    packet.sequence_number,
-                    packet.priority.codec_level,
-                )
-            })
-            .collect()
-    }
-
-    pub(crate) fn is_empty(&self) -> bool {
-        self.buffer.is_empty()
     }
 
     pub(crate) fn num_packets(&self) -> usize {
@@ -196,14 +184,6 @@ impl PacketBuffer {
         self.buffer.front().map(|p| p.timestamp)
     }
 
-    /// First timestamp at or above `timestamp`. Port of `NextHigherTimestamp`.
-    pub(crate) fn next_higher_timestamp(&self, timestamp: u32) -> Option<u32> {
-        self.buffer
-            .iter()
-            .find(|p| p.timestamp >= timestamp)
-            .map(|p| p.timestamp)
-    }
-
     /// Highest timestamp strictly below `timestamp`, used to size the DRED gap on
     /// insertion (the end of the most recent buffered audio before `timestamp`).
     pub(crate) fn next_lower_timestamp(&self, timestamp: u32) -> Option<u32> {
@@ -260,12 +240,6 @@ impl PacketBuffer {
             span += back.duration_samples;
         }
         span
-    }
-
-    /// Number of samples carried by all packets, counting only primaries' worth
-    /// of duration (mirrors `NumSamplesInBuffer` for a single codec).
-    pub(crate) fn num_samples(&self) -> usize {
-        self.buffer.iter().map(|p| p.duration_samples).sum()
     }
 
     pub(crate) fn packets_discarded(&self) -> u64 {
