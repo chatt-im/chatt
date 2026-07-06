@@ -2356,13 +2356,6 @@ impl App {
             } => {
                 self.observe_voice_packet(stream_id, payload_size);
             }
-            NetworkEvent::VoicePacket(packet) => {
-                if !self.deafened.load(Ordering::Relaxed)
-                    && let Some(playback) = &self.playback
-                {
-                    playback.push(packet);
-                }
-            }
             NetworkEvent::PlaybackFeedback(feedback) => {
                 self.room.playback_feedback(feedback);
             }
@@ -2448,7 +2441,6 @@ impl App {
                 coded_height,
                 extradata,
                 view_secret,
-                ..
             } => {
                 if self.voice_room != Some(room_id) {
                     return;
@@ -2477,7 +2469,7 @@ impl App {
                 }
                 self.set_status(format!("{sender_name} is sharing their screen"));
             }
-            NetworkEvent::ShareEnded { stream_id, .. } => {
+            NetworkEvent::ShareEnded { stream_id } => {
                 if self.screencast_stream_id == Some(stream_id) {
                     self.screencast_status
                         .fail("screen share ended by server".to_string());
@@ -2572,12 +2564,6 @@ impl App {
                     &format!("Network worker stopped: {reason}; reconnecting"),
                 );
                 self.schedule_network_recovery(Instant::now(), reason);
-            }
-            NetworkEvent::Disconnected => {
-                self.fail_screencast_if_running("screen share stopped: disconnected", false);
-                self.disconnect_network();
-                self.push_network_notice("network", "disconnected; viewing offline logs");
-                self.set_error("disconnected");
             }
         }
     }
@@ -5468,7 +5454,6 @@ fn network_event_kind(event: &NetworkEvent) -> &'static str {
         NetworkEvent::VoiceStopped { .. } => "voice_stopped",
         NetworkEvent::PeerTransport { .. } => "peer_transport",
         NetworkEvent::VoicePacketObserved { .. } => "voice_packet_observed",
-        NetworkEvent::VoicePacket(_) => "voice_packet",
         NetworkEvent::PlaybackFeedback(_) => "playback_feedback",
         NetworkEvent::ServerRtt { .. } => "server_rtt",
         NetworkEvent::PeerRtt { .. } => "peer_rtt",
@@ -5484,7 +5469,6 @@ fn network_event_kind(event: &NetworkEvent) -> &'static str {
         NetworkEvent::OpenPairingNeedsPassword { .. } => "open_pairing_needs_password",
         NetworkEvent::ReconnectScheduled { .. } => "reconnect_scheduled",
         NetworkEvent::WorkerStopped { .. } => "worker_stopped",
-        NetworkEvent::Disconnected => "disconnected",
         NetworkEvent::ShareStarted { .. } => "share_started",
         NetworkEvent::ShareAvailable { .. } => "share_available",
         NetworkEvent::ShareEnded { .. } => "share_ended",
@@ -6300,12 +6284,10 @@ mod tests {
         let available = |room_id, stream_id| NetworkEvent::ShareAvailable {
             room_id,
             stream_id,
-            user_id: UserId(2),
             sender_name: "bob".to_string(),
             codec: "avc1.42c01f".to_string(),
             coded_width: 1280,
             coded_height: 720,
-            annexb: false,
             extradata: Vec::new(),
             view_secret: vec![7; 32],
         };
@@ -6344,12 +6326,10 @@ mod tests {
         app.handle_network_event(NetworkEvent::ShareAvailable {
             room_id: RoomId(1),
             stream_id: StreamId(10),
-            user_id: UserId(2),
             sender_name: "bob".to_string(),
             codec: "avc1.42c01f".to_string(),
             coded_width: 1280,
             coded_height: 720,
-            annexb: false,
             extradata: Vec::new(),
             view_secret: vec![7; 32],
         });

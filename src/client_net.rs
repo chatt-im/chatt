@@ -525,7 +525,6 @@ pub enum NetworkEvent {
         stream_id: u32,
         payload_size: usize,
     },
-    VoicePacket(RemoteVoicePacket),
     PlaybackFeedback(LivePlaybackFeedback),
     /// Smoothed round-trip time to the server relay media socket, milliseconds.
     ServerRtt {
@@ -560,17 +559,14 @@ pub enum NetworkEvent {
     ShareAvailable {
         room_id: RoomId,
         stream_id: StreamId,
-        user_id: UserId,
         sender_name: String,
         codec: String,
         coded_width: u32,
         coded_height: u32,
-        annexb: bool,
         extradata: Vec<u8>,
         view_secret: Vec<u8>,
     },
     ShareEnded {
-        room_id: RoomId,
         stream_id: StreamId,
     },
     ShareStartRejected {
@@ -606,7 +602,6 @@ pub enum NetworkEvent {
     WorkerStopped {
         reason: String,
     },
-    Disconnected,
 }
 
 /// Sends a [`NetworkCommand`] to the worker and wakes its event loop.
@@ -695,19 +690,11 @@ impl NetworkClient {
         self.tx.send(command)
     }
 
-    pub fn send(&self, command: NetworkCommand) {
-        let _ = self.try_send(command);
-    }
-
     pub fn is_worker_finished(&self) -> bool {
         self.worker.as_ref().is_some_and(JoinHandle::is_finished)
     }
 
     pub fn stop(mut self) {
-        self.stop_inner();
-    }
-
-    pub fn shutdown(&mut self) {
         self.stop_inner();
     }
 
@@ -2453,7 +2440,6 @@ impl WorkerState {
             .map_err(|error| error.to_string())?;
         kvlog::debug!(
             "client control queued",
-            kind = client_control_kind(&control),
             payload_size = payload.len(),
             encrypted_size = encrypted.len(),
             queued_bytes = self.write_buf.len()
@@ -3115,8 +3101,7 @@ impl WorkerState {
             original_size = size,
             decision = _decision,
             probe_raw_bytes = source_prefix.len(),
-            probe_encoded_bytes = _probe_encoded_len.unwrap_or(0),
-            encoding = file_content_encoding_name(body.encoding())
+            probe_encoded_bytes = _probe_encoded_len.unwrap_or(0)
         );
         let transfer_id = FileTransferId(self.next_file_transfer);
         self.next_file_transfer = self.next_file_transfer.wrapping_add(1).max(1);
@@ -3391,10 +3376,8 @@ impl WorkerState {
         kvlog::debug!(
             "file upload encoding completed",
             file_name = upload.name.as_str(),
-            encoding = file_content_encoding_name(upload.body.encoding()),
             original_bytes = upload.size,
-            wire_bytes = upload.wire_offset,
-            savings_percent = wire_savings_percent(upload.size, upload.wire_offset)
+            wire_bytes = upload.wire_offset
         );
         let _ = self.events.send(NetworkEvent::Status(format!(
             "upload complete: {} ({})",
@@ -3716,10 +3699,8 @@ impl WorkerState {
                     kvlog::debug!(
                         "file receive decoding completed",
                         file_name = metadata.file_name.as_str(),
-                        encoding = file_content_encoding_name(metadata.encoding),
                         original_bytes = metadata.size,
-                        wire_bytes = _wire_bytes,
-                        savings_percent = wire_savings_percent(metadata.size, _wire_bytes)
+                        wire_bytes = _wire_bytes
                     );
                     let _ = self.events.send(NetworkEvent::Status(format!(
                         "saved {} to {}",
@@ -4059,12 +4040,12 @@ impl WorkerState {
             ServerControl::ShareAvailable {
                 room_id,
                 stream_id,
-                user_id,
+                user_id: _,
                 sender_name,
                 codec,
                 coded_width,
                 coded_height,
-                annexb,
+                annexb: _,
                 extradata,
                 view_secret,
             } => {
@@ -4072,18 +4053,15 @@ impl WorkerState {
                     "client share available",
                     room_id = room_id.0,
                     stream_id = stream_id.0,
-                    user_id = user_id.0,
                     codec = codec.as_str()
                 );
                 let _ = self.events.send(NetworkEvent::ShareAvailable {
                     room_id,
                     stream_id,
-                    user_id,
                     sender_name,
                     codec,
                     coded_width,
                     coded_height,
-                    annexb,
                     extradata,
                     view_secret,
                 });
@@ -4094,9 +4072,7 @@ impl WorkerState {
                     room_id = room_id.0,
                     stream_id = stream_id.0
                 );
-                let _ = self
-                    .events
-                    .send(NetworkEvent::ShareEnded { room_id, stream_id });
+                let _ = self.events.send(NetworkEvent::ShareEnded { stream_id });
             }
             ServerControl::Pong { .. } => {}
             ServerControl::BugReportSaved { report_id } => {
@@ -5331,22 +5307,6 @@ fn capture_upload_image_prefix(upload: &mut OutgoingUpload, data: &[u8]) {
     upload.dimensions = crate::web_server::image_dimensions(&upload.image_prefix);
 }
 
-fn wire_savings_percent(original_size: u64, wire_size: u64) -> i64 {
-    if original_size == 0 {
-        return 0;
-    }
-    let percent =
-        (i128::from(original_size) - i128::from(wire_size)) * 100 / i128::from(original_size);
-    percent.clamp(i128::from(i64::MIN), i128::from(i64::MAX)) as i64
-}
-
-fn file_content_encoding_name(encoding: FileContentEncoding) -> &'static str {
-    match encoding {
-        FileContentEncoding::Identity => "identity",
-        FileContentEncoding::Zstd => "zstd",
-    }
-}
-
 fn network_command_kind(command: &NetworkCommand) -> &'static str {
     match command {
         NetworkCommand::SendChat { .. } => "send_chat",
@@ -5445,31 +5405,6 @@ fn live_feedback_from_media(
         max_neteq_playout_delay_ms: feedback.max_neteq_playout_delay_ms,
         max_neteq_packet_buffer_ms: feedback.max_neteq_packet_buffer_ms,
         max_interarrival_jitter_ms: feedback.max_interarrival_jitter_ms,
-    }
-}
-
-fn client_control_kind(control: &ClientControl) -> &'static str {
-    match control {
-        ClientControl::Authenticate { .. } => "authenticate",
-        ClientControl::Pair { .. } => "pair",
-        ClientControl::OpenPair { .. } => "open_pair",
-        ClientControl::SendChat { .. } => "send_chat",
-        ClientControl::SetVoiceStatus { .. } => "set_voice_status",
-        ClientControl::PublishP2p { .. } => "publish_p2p",
-        ClientControl::UploadFileStart { .. } => "upload_file_start",
-        ClientControl::UploadFileChunk { .. } => "upload_file_chunk",
-        ClientControl::UploadFileComplete { .. } => "upload_file_complete",
-        ClientControl::UploadFileCancel { .. } => "upload_file_cancel",
-        ClientControl::StartShare { .. } => "start_share",
-        ClientControl::StopShare { .. } => "stop_share",
-        ClientControl::Ping { .. } => "ping",
-        ClientControl::BugReportStart { .. } => "bug_report_start",
-        ClientControl::BugReportChunk { .. } => "bug_report_chunk",
-        ClientControl::BugReportComplete { .. } => "bug_report_complete",
-        ClientControl::FetchHistory { .. } => "fetch_history",
-        ClientControl::JoinVoice { .. } => "join_voice",
-        ClientControl::LeaveVoice => "leave_voice",
-        ClientControl::OpenDm { .. } => "open_dm",
     }
 }
 
