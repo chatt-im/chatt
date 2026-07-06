@@ -4,6 +4,8 @@ mod feedback;
 mod frame_combiner;
 mod mixer;
 mod neteq;
+#[cfg(test)]
+mod realtime_alloc_tests;
 mod sample_ring;
 mod stream;
 mod swap_queue;

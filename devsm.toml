@@ -22,6 +22,7 @@ cli.forward_arguments = true
 env.CHATT_RUN_DIR = "/tmp/chatt-dev/alice"
 env.CARGO_FLAGS = { if.profile = "pop", then = "--release", or_else = "" }
 env.CHATT_AUDIO_POP_LOG = { if.profile = "pop", then = "1", or_else = "0" }
+env.CHATT_AUDIO_CALLBACK_LOG = { if.profile = "pop", then = "1", or_else = "0" }
 env.CHATT_AUDIO_PLAYBACK_WAV = { if.profile = "pop", then = "/tmp/chatt-alice-playback.wav", or_else = "" }
 sh = '''
 if [ "$#" -gt 0 ]; then
