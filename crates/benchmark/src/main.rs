@@ -3,7 +3,7 @@ use std::{
     path::{Path, PathBuf},
     process::Command,
     ptr::NonNull,
-    sync::Arc,
+    sync::{Arc, OnceLock},
 };
 
 use chatt::audio::{
@@ -12,7 +12,7 @@ use chatt::audio::{
     LiveAudioPacketLossProfile, LiveAudioSimulationConfig, LiveAudioSimulationScenario,
     LiveAudioTuning, run_live_audio_simulation_with_speech, split_pcm_to_simulation_frames,
 };
-use jsony_bench::{Bench, BenchParameters, Router};
+use jsony_bench::{Bench, BenchParameters, DEFAULT_BURN_IN_SAMPLES, Router};
 use nnnoiseless::DenoiseState;
 use opus_codec::{Channels, Decoder, DredDecoder, DredState, SampleRate};
 use sonora::config::EchoCanceller as Aec3Config;
@@ -33,6 +33,7 @@ const BENCH_PARAMS: BenchParameters = BenchParameters {
     max_samples: 64,
     min_samples: 20,
     target_duration_ns: 150_000_000,
+    burn_in_samples: DEFAULT_BURN_IN_SAMPLES,
 };
 const LIVE_BENCH_PARAMS: BenchParameters = BenchParameters {
     sample_target_duration_ns: 2_000_000,
@@ -41,6 +42,7 @@ const LIVE_BENCH_PARAMS: BenchParameters = BenchParameters {
     max_samples: 20,
     min_samples: 4,
     target_duration_ns: 75_000_000,
+    burn_in_samples: DEFAULT_BURN_IN_SAMPLES,
 };
 const PROFILE_CODEC_PROFILE: &str = "dred_32k_1000ms_loss20";
 const PROFILE_FEATURE_ALL_ON: &str = "all_on";
@@ -50,7 +52,7 @@ const PROFILE_CALL_LOSS: &str = "congested_wifi";
 const PROFILE_GROUP_LOSS: &str = "bursty_wifi";
 const PROFILE_AEC: &str = "on";
 const PROFILE_GROUP_STREAMS: &str = "3";
-const LIVE_CONTENTION_DURATION: std::time::Duration = std::time::Duration::from_secs(30);
+const LIVE_CONTENTION_DURATION: std::time::Duration = std::time::Duration::from_secs(15);
 const OPUS_ENCODE_PROFILE_ITERATIONS: u64 = 30_000;
 const OPUS_DECODE_PROFILE_ITERATIONS: u64 = 300_000;
 const DRED_PARSE_PROFILE_ITERATIONS: u64 = 800_000;
@@ -71,9 +73,17 @@ const LIVE_CONTENTION_PARAMS: BenchParameters = BenchParameters {
     sample_target_duration_ns: 4_000_000,
     max_sample_iterations: 128,
     min_sample_iterations: 1,
-    max_samples: 16,
-    min_samples: 5,
-    target_duration_ns: 100_000_000,
+    // Each op runs a full LIVE_CONTENTION_DURATION call simulation (~70-90ms
+    // wall), enough to clear target_duration_ns in one or two samples;
+    // min_samples is the knob that buys a robust median/MAD over the noisy
+    // extreme condition.
+    max_samples: 96,
+    min_samples: 64,
+    target_duration_ns: 2_000_000_000,
+    // The op self-warms in one or two runs, so the default 16 burn-in samples
+    // would just add several seconds of unmeasured wall time for no stability
+    // gain.
+    burn_in_samples: 3,
 };
 
 const PROFILES: [CodecProfile; 10] = [
@@ -183,11 +193,52 @@ struct CodecProfile {
     packet_loss_percent: i32,
 }
 
+/// Decoded sample plus every derived form of it a route might need. Only the
+/// sample decode is eager; each derived corpus (Opus frames, RNNoise frames,
+/// live simulation frames, and the per-profile encoded packets) is built on
+/// first use so a run that selects one route does not pay to build inputs the
+/// other routes need. Notably, `live/*` runs skip the whole opus/dred/rnnoise
+/// encode corpus, and `opus`/`dred`/`rnnoise` runs skip the simulation frames.
 struct Corpus {
-    opus_frames: Arc<Vec<Vec<f32>>>,
-    rnnoise_frames: Arc<Vec<Vec<f32>>>,
-    live_simulation_frames: Arc<Vec<Vec<f32>>>,
-    encoded_profiles: Vec<EncodedProfile>,
+    pcm: Vec<f32>,
+    opus_frames: OnceLock<Arc<Vec<Vec<f32>>>>,
+    rnnoise_frames: OnceLock<Arc<Vec<Vec<f32>>>>,
+    live_simulation_frames: OnceLock<Arc<Vec<Vec<f32>>>>,
+    encoded_profiles: OnceLock<Vec<EncodedProfile>>,
+}
+
+impl Corpus {
+    fn opus_frames(&self) -> &Arc<Vec<Vec<f32>>> {
+        self.opus_frames.get_or_init(|| {
+            Arc::new(select_active_contiguous_frames(
+                &self.pcm,
+                OPUS_FRAME_SAMPLES,
+                OPUS_FRAME_LIMIT,
+                1.0,
+            ))
+        })
+    }
+
+    fn rnnoise_frames(&self) -> &Arc<Vec<Vec<f32>>> {
+        self.rnnoise_frames.get_or_init(|| {
+            Arc::new(select_active_contiguous_frames(
+                &self.pcm,
+                RNNOISE_FRAME_SAMPLES,
+                RNNOISE_FRAME_LIMIT,
+                i16::MAX as f32,
+            ))
+        })
+    }
+
+    fn live_simulation_frames(&self) -> &Arc<Vec<Vec<f32>>> {
+        self.live_simulation_frames
+            .get_or_init(|| Arc::new(split_pcm_to_simulation_frames(&self.pcm, SAMPLE_RATE * 20)))
+    }
+
+    fn encoded_profiles(&self) -> &[EncodedProfile] {
+        self.encoded_profiles
+            .get_or_init(|| build_encoded_profiles(self.opus_frames()))
+    }
 }
 
 struct EncodedProfile {
@@ -230,7 +281,7 @@ fn bench_opus(bench: &mut Bench<'_>, corpus: Arc<Corpus>) {
             [PROFILE_CODEC_PROFILE],
             |bench, profile_name| {
                 let profile = profile_by_name(&profile_name);
-                let frames = Arc::clone(&corpus.opus_frames);
+                let frames = Arc::clone(corpus.opus_frames());
                 let cycle_len = frames.len();
                 let mut encoder = OpusRawEncoder::new(profile).unwrap();
                 let mut output = vec![0u8; MAX_OPUS_PACKET_BYTES];
@@ -272,13 +323,13 @@ fn bench_opus(bench: &mut Bench<'_>, corpus: Arc<Corpus>) {
 fn bench_dred(bench: &mut Bench<'_>, corpus: Arc<Corpus>) {
     let mut bench = bench.with_parameters(BENCH_PARAMS);
     let dred_profile_names = corpus
-        .encoded_profiles
+        .encoded_profiles()
         .iter()
         .filter(|encoded| encoded.profile.dred_duration_10ms > 0)
         .map(|encoded| encoded.profile.name.to_owned())
         .collect::<Vec<_>>();
     let dred_recover_profile_names = corpus
-        .encoded_profiles
+        .encoded_profiles()
         .iter()
         .filter(|encoded| {
             encoded.profile.dred_duration_10ms > 0 && !encoded.dred_recover_packets.is_empty()
@@ -374,7 +425,7 @@ fn bench_dred(bench: &mut Bench<'_>, corpus: Arc<Corpus>) {
 
 fn bench_rnnoise(bench: &mut Bench<'_>, corpus: Arc<Corpus>) {
     let mut bench = bench.with_parameters(BENCH_PARAMS);
-    let frames = Arc::clone(&corpus.rnnoise_frames);
+    let frames = Arc::clone(corpus.rnnoise_frames());
     let cycle_len = frames.len();
     let mut denoise = DenoiseState::new();
     let mut output = vec![0.0f32; RNNOISE_FRAME_SAMPLES];
@@ -403,7 +454,7 @@ fn bench_pipeline(bench: &mut Bench<'_>, corpus: Arc<Corpus>) {
             [PROFILE_CODEC_PROFILE],
             |bench, profile_name| {
                 let profile = profile_by_name(&profile_name);
-                let rnnoise_frames = Arc::clone(&corpus.rnnoise_frames);
+                let rnnoise_frames = Arc::clone(corpus.rnnoise_frames());
                 let cycle_len = rnnoise_frames.len() / 2;
                 let mut denoise = DenoiseState::new();
                 let mut encoder = OpusRawEncoder::new(profile).unwrap();
@@ -437,7 +488,7 @@ fn bench_pipeline(bench: &mut Bench<'_>, corpus: Arc<Corpus>) {
             [PROFILE_CODEC_PROFILE],
             |bench, profile_name| {
                 let profile = profile_by_name(&profile_name);
-                let rnnoise_frames = Arc::clone(&corpus.rnnoise_frames);
+                let rnnoise_frames = Arc::clone(corpus.rnnoise_frames());
                 let cycle_len = rnnoise_frames.len() / 2;
                 let mut aec = new_aec();
                 let mut encoder = OpusRawEncoder::new(profile).unwrap();
@@ -518,7 +569,7 @@ fn bench_live(bench: &mut Bench<'_>, corpus: Arc<Corpus>) {
             ["all_on", "gate_off"],
             [PROFILE_FEATURE_ALL_ON],
             |bench, feature| {
-                let frames = Arc::clone(&corpus.live_simulation_frames);
+                let frames = Arc::clone(corpus.live_simulation_frames());
                 let tuning = live_tuning_for_feature_set(&feature);
                 bench.indexed_cyclic(1, move |_| {
                     let report = run_live_audio_simulation_with_speech(
@@ -555,7 +606,7 @@ fn bench_live(bench: &mut Bench<'_>, corpus: Arc<Corpus>) {
             &feature_sets,
             [PROFILE_PLAYBACK_MIXER_FEATURE],
             |bench, feature| {
-                let frames = Arc::clone(&corpus.live_simulation_frames);
+                let frames = Arc::clone(corpus.live_simulation_frames());
                 let tuning = live_tuning_for_feature_set(&feature);
                 bench.indexed_cyclic(1, move |_| {
                     let report = run_live_audio_simulation_with_speech(
@@ -595,7 +646,7 @@ fn bench_live(bench: &mut Bench<'_>, corpus: Arc<Corpus>) {
             &scenario_names,
             [PROFILE_CALL_SCENARIO],
             |bench, scenario_name| {
-                let frames = Arc::clone(&corpus.live_simulation_frames);
+                let frames = Arc::clone(corpus.live_simulation_frames());
                 let scenario = LiveAudioSimulationScenario::from_name(&scenario_name)
                     .unwrap_or(LiveAudioSimulationScenario::ConstantSpeech);
                 bench.param_str_profile_defaults(
@@ -662,7 +713,7 @@ fn bench_live(bench: &mut Bench<'_>, corpus: Arc<Corpus>) {
             ["3", "6"],
             [PROFILE_GROUP_STREAMS],
             |bench, streams| {
-                let frames = Arc::clone(&corpus.live_simulation_frames);
+                let frames = Arc::clone(corpus.live_simulation_frames());
                 let streams = streams.parse::<usize>().unwrap();
                 bench.param_str_profile_defaults(
                     "loss",
@@ -714,7 +765,7 @@ fn bench_live_contention(bench: &mut Bench<'_>, corpus: Arc<Corpus>) {
             conditions,
             [LiveAudioContentionBenchCondition::Extreme.as_name()],
             |bench, condition| {
-                let frames = Arc::clone(&corpus.live_simulation_frames);
+                let frames = Arc::clone(corpus.live_simulation_frames());
                 let benchmark = prepare_contention_benchmark(
                     LiveAudioContentionBenchTarget::OutputCallback,
                     &condition,
@@ -737,7 +788,7 @@ fn bench_live_contention(bench: &mut Bench<'_>, corpus: Arc<Corpus>) {
             conditions,
             [LiveAudioContentionBenchCondition::Extreme.as_name()],
             |bench, condition| {
-                let frames = Arc::clone(&corpus.live_simulation_frames);
+                let frames = Arc::clone(corpus.live_simulation_frames());
                 let benchmark = prepare_contention_benchmark(
                     LiveAudioContentionBenchTarget::FullOutputCallback,
                     &condition,
@@ -760,7 +811,7 @@ fn bench_live_contention(bench: &mut Bench<'_>, corpus: Arc<Corpus>) {
             conditions,
             [LiveAudioContentionBenchCondition::Extreme.as_name()],
             |bench, condition| {
-                let frames = Arc::clone(&corpus.live_simulation_frames);
+                let frames = Arc::clone(corpus.live_simulation_frames());
                 let benchmark = prepare_contention_benchmark(
                     LiveAudioContentionBenchTarget::Ingest,
                     &condition,
@@ -825,27 +876,22 @@ fn live_tuning_for_feature_set(feature: &str) -> LiveAudioTuning {
 
 fn load_corpus() -> Corpus {
     let sample = sample_path();
-    let pcm = decode_sample_with_ffmpeg(&sample);
-    let opus_frames = Arc::new(select_active_contiguous_frames(
-        &pcm,
-        OPUS_FRAME_SAMPLES,
-        OPUS_FRAME_LIMIT,
-        1.0,
-    ));
-    let rnnoise_frames = Arc::new(select_active_contiguous_frames(
-        &pcm,
-        RNNOISE_FRAME_SAMPLES,
-        RNNOISE_FRAME_LIMIT,
-        i16::MAX as f32,
-    ));
-    let live_simulation_frames = Arc::new(split_pcm_to_simulation_frames(&pcm, SAMPLE_RATE * 20));
-    let generated_voice_frames = generated_voiced_frames(OPUS_FRAME_SAMPLES, OPUS_FRAME_LIMIT);
+    Corpus {
+        pcm: decode_sample_with_ffmpeg(&sample),
+        opus_frames: OnceLock::new(),
+        rnnoise_frames: OnceLock::new(),
+        live_simulation_frames: OnceLock::new(),
+        encoded_profiles: OnceLock::new(),
+    }
+}
 
-    let encoded_profiles = PROFILES
+fn build_encoded_profiles(opus_frames: &[Vec<f32>]) -> Vec<EncodedProfile> {
+    let generated_voice_frames = generated_voiced_frames(OPUS_FRAME_SAMPLES, OPUS_FRAME_LIMIT);
+    PROFILES
         .iter()
         .copied()
         .map(|profile| {
-            let packets = encode_packets(profile, &opus_frames);
+            let packets = encode_packets(profile, opus_frames);
             let mut dred_recover_packets = filter_dred_recover_packets(&packets);
             let mut dred_recover_source =
                 (!dred_recover_packets.is_empty()).then_some(DredRecoverSource::Sample);
@@ -862,14 +908,7 @@ fn load_corpus() -> Corpus {
                 dred_recover_source,
             }
         })
-        .collect();
-
-    Corpus {
-        opus_frames,
-        rnnoise_frames,
-        live_simulation_frames,
-        encoded_profiles,
-    }
+        .collect()
 }
 
 fn sample_path() -> PathBuf {
@@ -1070,7 +1109,7 @@ fn profile_by_name(name: &str) -> CodecProfile {
 
 fn encoded_profile<'a>(corpus: &'a Corpus, name: &str) -> &'a EncodedProfile {
     corpus
-        .encoded_profiles
+        .encoded_profiles()
         .iter()
         .find(|encoded| encoded.profile.name == name)
         .unwrap_or_else(|| panic!("unknown encoded profile {name}"))
@@ -1174,10 +1213,10 @@ mod tests {
     #[test]
     fn corpus_loads_from_sample() {
         let corpus = load_corpus();
-        assert_eq!(corpus.opus_frames.len(), OPUS_FRAME_LIMIT);
-        assert_eq!(corpus.rnnoise_frames.len(), RNNOISE_FRAME_LIMIT);
-        assert!(!corpus.live_simulation_frames.is_empty());
-        assert_eq!(corpus.encoded_profiles.len(), PROFILES.len());
+        assert_eq!(corpus.opus_frames().len(), OPUS_FRAME_LIMIT);
+        assert_eq!(corpus.rnnoise_frames().len(), RNNOISE_FRAME_LIMIT);
+        assert!(!corpus.live_simulation_frames().is_empty());
+        assert_eq!(corpus.encoded_profiles().len(), PROFILES.len());
     }
 
     #[test]
@@ -1189,7 +1228,7 @@ mod tests {
                 duration: std::time::Duration::from_secs(1),
                 ..Default::default()
             },
-            &corpus.live_simulation_frames,
+            corpus.live_simulation_frames(),
         )
         .unwrap();
 
@@ -1210,7 +1249,7 @@ mod tests {
                 seed: 0xabc0_2001,
                 ..Default::default()
             },
-            &corpus.live_simulation_frames,
+            corpus.live_simulation_frames(),
         )
         .unwrap();
 
@@ -1235,7 +1274,7 @@ mod tests {
                 seed: 0xabc0_2002,
                 ..Default::default()
             },
-            &corpus.live_simulation_frames,
+            corpus.live_simulation_frames(),
         )
         .unwrap();
 
@@ -1252,7 +1291,7 @@ mod tests {
     fn profiles_encode_packets() {
         let corpus = load_corpus();
 
-        for encoded in &corpus.encoded_profiles {
+        for encoded in corpus.encoded_profiles() {
             assert_eq!(encoded.packets.len(), OPUS_FRAME_LIMIT);
             assert!(encoded.packets.iter().all(|packet| !packet.is_empty()));
 

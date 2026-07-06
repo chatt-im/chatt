@@ -272,6 +272,11 @@ impl LiveAudioContentionBenchmark {
         let runtime_start = runtime.start;
         let runtime_finish = runtime_end(self.config, runtime_start);
         let gate = Arc::new(Barrier::new(2));
+        // jsony_bench pins the measurement thread to a single core. Pin the
+        // spawned partner thread to a sibling core so the two contend on the
+        // NetEQ locks in true parallel instead of timesharing one core, which
+        // otherwise makes the `extreme` timings bimodal.
+        let sibling_cpu = contention_sibling_cpu();
 
         let (decode_streams, ingest, output) = match self.config.target {
             LiveAudioContentionBenchTarget::OutputCallback
@@ -282,6 +287,9 @@ impl LiveAudioContentionBenchmark {
                 let ingest_start = runtime.start;
                 let decode_streams = runtime.decode_streams;
                 let ingest = thread::spawn(move || {
+                    if let Some(cpu) = sibling_cpu {
+                        pin_thread_to_cpu(cpu);
+                    }
                     run_contention_ingest(
                         decode_streams,
                         ingest_events,
@@ -324,6 +332,9 @@ impl LiveAudioContentionBenchmark {
                 let callbacks = self.callbacks;
                 let mixer = runtime.mixer;
                 let output = thread::spawn(move || {
+                    if let Some(cpu) = sibling_cpu {
+                        pin_thread_to_cpu(cpu);
+                    }
                     run_contention_output(
                         mixer,
                         output_events,
@@ -665,6 +676,42 @@ fn contention_stream_loss(
         }
     }
 }
+
+/// Pick a CPU for the spawned partner thread that differs from the measurement
+/// thread's current CPU. Returns `None` when a distinct sibling cannot be
+/// determined (non-Linux, single core, or a failed query), in which case the
+/// partner thread stays unpinned.
+#[cfg(target_os = "linux")]
+fn contention_sibling_cpu() -> Option<usize> {
+    // SAFETY: sched_getcpu and sysconf have no preconditions.
+    let current = unsafe { libc::sched_getcpu() };
+    let online = unsafe { libc::sysconf(libc::_SC_NPROCESSORS_ONLN) };
+    if current < 0 || online < 2 {
+        return None;
+    }
+    Some((current as usize + 1) % online as usize)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn contention_sibling_cpu() -> Option<usize> {
+    None
+}
+
+/// Pin the calling thread to `cpu`. Affinity is a benchmark-stability hint, not
+/// a correctness requirement, so failures are silently ignored.
+#[cfg(target_os = "linux")]
+fn pin_thread_to_cpu(cpu: usize) {
+    // SAFETY: zero-initialize cpu_set_t, set the chosen CPU bit, then pin the
+    // calling thread (pid 0) to it.
+    unsafe {
+        let mut set: libc::cpu_set_t = std::mem::zeroed();
+        libc::CPU_SET(cpu, &mut set);
+        libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &set);
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn pin_thread_to_cpu(_cpu: usize) {}
 
 fn contention_stream_seed(seed: u64, stream_index: usize) -> u64 {
     let stream = stream_index as u64 + 1;
