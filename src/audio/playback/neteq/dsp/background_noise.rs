@@ -187,10 +187,15 @@ impl BackgroundNoise {
         noise_copy: &mut Vec<i16>,
     ) {
         const ORDER: usize = MAX_LPC_ORDER;
-        if !self.initialized {
-            for sample in &mut buffer[ORDER..ORDER + num_noise_samples] {
-                *sample = 0;
-            }
+        // The synthesized noise is scaled by `mute_factor` (a `< 16384` affine)
+        // before it leaves this function, so a zero mute factor makes every
+        // output sample zero regardless of the AR synthesis. Chatt never raises
+        // the BGN mute factor above the `0` that `Expand` seeds each expand
+        // period, so this fast path is always taken today; skipping the affine
+        // scale and `filter_ar_fast_q12` here is bit-exact. If the unmute ramp is
+        // ever wired up, a non-zero `mute_factor` re-engages the full synthesis.
+        if !self.initialized || self.params.mute_factor == 0 {
+            buffer[ORDER..ORDER + num_noise_samples].fill(0);
             return;
         }
 
