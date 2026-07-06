@@ -7,9 +7,10 @@ use std::{
 };
 
 use chatt::audio::{
-    DEFAULT_LIVE_MAX_AMPLIFICATION, LiveAudioPacketLossProfile, LiveAudioSimulationConfig,
-    LiveAudioSimulationScenario, LiveAudioTuning, run_live_audio_simulation_with_speech,
-    split_pcm_to_simulation_frames,
+    DEFAULT_LIVE_MAX_AMPLIFICATION, LiveAudioContentionBenchCondition,
+    LiveAudioContentionBenchConfig, LiveAudioContentionBenchTarget, LiveAudioContentionBenchmark,
+    LiveAudioPacketLossProfile, LiveAudioSimulationConfig, LiveAudioSimulationScenario,
+    LiveAudioTuning, run_live_audio_simulation_with_speech, split_pcm_to_simulation_frames,
 };
 use jsony_bench::{Bench, BenchParameters, Router};
 use nnnoiseless::DenoiseState;
@@ -49,6 +50,7 @@ const PROFILE_CALL_LOSS: &str = "congested_wifi";
 const PROFILE_GROUP_LOSS: &str = "bursty_wifi";
 const PROFILE_AEC: &str = "on";
 const PROFILE_GROUP_STREAMS: &str = "3";
+const LIVE_CONTENTION_DURATION: std::time::Duration = std::time::Duration::from_secs(30);
 const OPUS_ENCODE_PROFILE_ITERATIONS: u64 = 30_000;
 const OPUS_DECODE_PROFILE_ITERATIONS: u64 = 300_000;
 const DRED_PARSE_PROFILE_ITERATIONS: u64 = 800_000;
@@ -57,6 +59,7 @@ const RNNOISE_PROFILE_ITERATIONS: u64 = 100_000;
 const PIPELINE_PROFILE_ITERATIONS: u64 = 15_000;
 const LIVE_CAPTURE_GATE_PROFILE_ITERATIONS: u64 = 160;
 const LIVE_PLAYBACK_MIXER_PROFILE_ITERATIONS: u64 = 150;
+const LIVE_CONTENTION_PROFILE_ITERATIONS: u64 = 80;
 // Profile-mode iteration counts for the live call simulations. Each iteration
 // runs a full LIVE_SIM_DURATION call through the real capture+playback pipeline,
 // so these are kept low enough that `profile live/call_sim` finishes in a few
@@ -64,6 +67,14 @@ const LIVE_PLAYBACK_MIXER_PROFILE_ITERATIONS: u64 = 150;
 // sweeps the full parameter matrix and intentionally takes minutes.)
 const LIVE_CALL_SIM_PROFILE_ITERATIONS: u64 = 25;
 const LIVE_GROUP_CALL_SIM_PROFILE_ITERATIONS: u64 = 12;
+const LIVE_CONTENTION_PARAMS: BenchParameters = BenchParameters {
+    sample_target_duration_ns: 4_000_000,
+    max_sample_iterations: 128,
+    min_sample_iterations: 1,
+    max_samples: 16,
+    min_samples: 5,
+    target_duration_ns: 100_000_000,
+};
 
 const PROFILES: [CodecProfile; 10] = [
     CodecProfile {
@@ -574,6 +585,8 @@ fn bench_live(bench: &mut Bench<'_>, corpus: Arc<Corpus>) {
             },
         );
 
+    bench_live_contention(&mut bench, Arc::clone(&corpus));
+
     bench
         .named("call_sim")
         .with_profile_iterations(LIVE_CALL_SIM_PROFILE_ITERATIONS)
@@ -687,6 +700,117 @@ fn bench_live(bench: &mut Bench<'_>, corpus: Arc<Corpus>) {
                 );
             },
         );
+}
+
+fn bench_live_contention(bench: &mut Bench<'_>, corpus: Arc<Corpus>) {
+    let mut bench = bench.with_parameters(LIVE_CONTENTION_PARAMS);
+    let conditions = LiveAudioContentionBenchCondition::NAMES;
+
+    bench
+        .named("output_contention")
+        .with_profile_iterations(LIVE_CONTENTION_PROFILE_ITERATIONS)
+        .param_str_profile_defaults(
+            "condition",
+            conditions,
+            [LiveAudioContentionBenchCondition::Extreme.as_name()],
+            |bench, condition| {
+                let frames = Arc::clone(&corpus.live_simulation_frames);
+                let benchmark = prepare_contention_benchmark(
+                    LiveAudioContentionBenchTarget::OutputCallback,
+                    &condition,
+                    &frames,
+                );
+                bench.indexed_cyclic(1, move |_| {
+                    let report = benchmark.run().unwrap();
+                    black_box(report.output_checksum);
+                    black_box(report.final_snapshot.neteq_lock_wait_max_us);
+                    black_box(report.inserted_packets);
+                });
+            },
+        );
+
+    bench
+        .named("output_callback")
+        .with_profile_iterations(LIVE_CONTENTION_PROFILE_ITERATIONS)
+        .param_str_profile_defaults(
+            "condition",
+            conditions,
+            [LiveAudioContentionBenchCondition::Extreme.as_name()],
+            |bench, condition| {
+                let frames = Arc::clone(&corpus.live_simulation_frames);
+                let benchmark = prepare_contention_benchmark(
+                    LiveAudioContentionBenchTarget::FullOutputCallback,
+                    &condition,
+                    &frames,
+                );
+                bench.indexed_cyclic(1, move |_| {
+                    let report = benchmark.run().unwrap();
+                    black_box(report.output_checksum);
+                    black_box(report.final_snapshot.neteq_lock_wait_max_us);
+                    black_box(report.inserted_packets);
+                });
+            },
+        );
+
+    bench
+        .named("ingest_contention")
+        .with_profile_iterations(LIVE_CONTENTION_PROFILE_ITERATIONS)
+        .param_str_profile_defaults(
+            "condition",
+            conditions,
+            [LiveAudioContentionBenchCondition::Extreme.as_name()],
+            |bench, condition| {
+                let frames = Arc::clone(&corpus.live_simulation_frames);
+                let benchmark = prepare_contention_benchmark(
+                    LiveAudioContentionBenchTarget::Ingest,
+                    &condition,
+                    &frames,
+                );
+                bench.indexed_cyclic(1, move |_| {
+                    let report = benchmark.run().unwrap();
+                    black_box(report.inserted_packets);
+                    black_box(report.late_packets);
+                    black_box(report.final_snapshot.neteq_packets_buffered);
+                });
+            },
+        );
+}
+
+fn prepare_contention_benchmark(
+    target: LiveAudioContentionBenchTarget,
+    condition: &str,
+    frames: &[Vec<f32>],
+) -> LiveAudioContentionBenchmark {
+    let condition = LiveAudioContentionBenchCondition::from_name(condition)
+        .unwrap_or(LiveAudioContentionBenchCondition::Extreme);
+    LiveAudioContentionBenchmark::prepare(
+        LiveAudioContentionBenchConfig {
+            target,
+            condition,
+            duration: LIVE_CONTENTION_DURATION,
+            streams: 6,
+            seed: 0xabc0_1000 ^ contention_seed_offset(target, condition),
+            ..Default::default()
+        },
+        frames,
+    )
+    .unwrap()
+}
+
+fn contention_seed_offset(
+    target: LiveAudioContentionBenchTarget,
+    condition: LiveAudioContentionBenchCondition,
+) -> u64 {
+    let target = match target {
+        LiveAudioContentionBenchTarget::OutputCallback => 0x0100,
+        LiveAudioContentionBenchTarget::FullOutputCallback => 0x0180,
+        LiveAudioContentionBenchTarget::Ingest => 0x0200,
+    };
+    let condition = match condition {
+        LiveAudioContentionBenchCondition::Normal => 0x0001,
+        LiveAudioContentionBenchCondition::Extreme => 0x0002,
+    };
+    target | condition
 }
 
 fn live_tuning_for_feature_set(feature: &str) -> LiveAudioTuning {
@@ -1072,6 +1196,56 @@ mod tests {
         assert_eq!(report.non_finite_samples, 0);
         assert!(report.rms > 0.0);
         assert!(report.max_output_ring_ms <= 120);
+    }
+
+    #[test]
+    fn contention_benchmark_replays_sample_speakers() {
+        let corpus = load_corpus();
+        let benchmark = LiveAudioContentionBenchmark::prepare(
+            LiveAudioContentionBenchConfig {
+                target: LiveAudioContentionBenchTarget::Ingest,
+                condition: LiveAudioContentionBenchCondition::Normal,
+                duration: std::time::Duration::from_millis(200),
+                streams: 6,
+                seed: 0xabc0_2001,
+                ..Default::default()
+            },
+            &corpus.live_simulation_frames,
+        )
+        .unwrap();
+
+        let report = benchmark.run().unwrap();
+        assert_eq!(report.target, "ingest");
+        assert_eq!(report.condition, "normal");
+        assert_eq!(report.streams, 6);
+        assert!(report.inserted_packets > 0);
+        assert!(report.callbacks > 0);
+        assert_eq!(report.non_finite_samples, 0);
+    }
+
+    #[test]
+    fn full_output_callback_benchmark_replays_sample_speakers() {
+        let corpus = load_corpus();
+        let benchmark = LiveAudioContentionBenchmark::prepare(
+            LiveAudioContentionBenchConfig {
+                target: LiveAudioContentionBenchTarget::FullOutputCallback,
+                condition: LiveAudioContentionBenchCondition::Normal,
+                duration: std::time::Duration::from_millis(200),
+                streams: 6,
+                seed: 0xabc0_2002,
+                ..Default::default()
+            },
+            &corpus.live_simulation_frames,
+        )
+        .unwrap();
+
+        let report = benchmark.run().unwrap();
+        assert_eq!(report.target, "full_output_callback");
+        assert_eq!(report.condition, "normal");
+        assert_eq!(report.streams, 6);
+        assert!(report.inserted_packets > 0);
+        assert!(report.callbacks > 0);
+        assert_eq!(report.non_finite_samples, 0);
     }
 
     #[test]

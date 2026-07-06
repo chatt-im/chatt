@@ -118,6 +118,103 @@ impl LiveAudioPacketLossProfile {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LiveAudioContentionBenchCondition {
+    Normal,
+    Extreme,
+}
+
+impl LiveAudioContentionBenchCondition {
+    pub const NAMES: [&'static str; 2] = ["normal", "extreme"];
+
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "normal" => Some(Self::Normal),
+            "extreme" => Some(Self::Extreme),
+            _ => None,
+        }
+    }
+
+    pub fn as_name(self) -> &'static str {
+        match self {
+            Self::Normal => "normal",
+            Self::Extreme => "extreme",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LiveAudioContentionBenchTarget {
+    OutputCallback,
+    FullOutputCallback,
+    Ingest,
+}
+
+impl LiveAudioContentionBenchTarget {
+    pub const NAMES: [&'static str; 3] = ["output_callback", "full_output_callback", "ingest"];
+
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "output_callback" => Some(Self::OutputCallback),
+            "full_output_callback" => Some(Self::FullOutputCallback),
+            "ingest" => Some(Self::Ingest),
+            _ => None,
+        }
+    }
+
+    pub fn as_name(self) -> &'static str {
+        match self {
+            Self::OutputCallback => "output_callback",
+            Self::FullOutputCallback => "full_output_callback",
+            Self::Ingest => "ingest",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct LiveAudioContentionBenchConfig {
+    pub target: LiveAudioContentionBenchTarget,
+    pub condition: LiveAudioContentionBenchCondition,
+    pub tuning: LiveAudioTuning,
+    pub duration: Duration,
+    pub streams: usize,
+    pub seed: u64,
+}
+
+impl Default for LiveAudioContentionBenchConfig {
+    fn default() -> Self {
+        Self {
+            target: LiveAudioContentionBenchTarget::OutputCallback,
+            condition: LiveAudioContentionBenchCondition::Extreme,
+            tuning: LiveAudioTuning::default(),
+            duration: Duration::from_secs(30),
+            streams: 6,
+            seed: 0x746f_6d63_6861_7404,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct LiveAudioContentionBenchReport {
+    pub target: &'static str,
+    pub condition: &'static str,
+    pub streams: usize,
+    pub generated_frames: u64,
+    pub queued_frames: u64,
+    pub lost_frames: u64,
+    pub suppressed_frames: u64,
+    pub inserted_packets: u64,
+    pub late_packets: u64,
+    pub callbacks: u64,
+    pub mixer_events_drained: u64,
+    pub output_samples: u64,
+    pub output_checksum: f64,
+    pub rms: f32,
+    pub peak: f32,
+    pub non_finite_samples: u64,
+    pub final_snapshot: LivePlaybackSnapshot,
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct LiveAudioSimulationConfig {
     pub scenario: LiveAudioSimulationScenario,

@@ -15,6 +15,9 @@ cargo run --release -p benchmark -- bench pipeline/rnnoise_then_encode --progres
 cargo run --release -p benchmark -- bench pipeline/aec_then_encode --progress
 cargo run --release -p benchmark -- bench live/call_sim --progress
 cargo run --release -p benchmark -- bench live/group_call_sim --progress
+cargo run --release -p benchmark -- bench live/output_contention --progress
+cargo run --release -p benchmark -- bench live/output_callback --progress
+cargo run --release -p benchmark -- bench live/ingest_contention --progress
 ```
 
 `pipeline/aec_then_encode` mirrors `pipeline/rnnoise_then_encode` but runs the
@@ -29,6 +32,8 @@ Filter benchmark parameters:
 cargo run --release -p benchmark -- bench opus/encode --param profile=dred_32k_1000ms_loss20 --progress
 cargo run --release -p benchmark -- bench live/call_sim --param scenario=lossy_speech --param feature=all_on --param loss=congested_wifi --param aec=on --progress
 cargo run --release -p benchmark -- bench live/playback_mixer --param feature=skip_off --progress
+cargo run --release -p benchmark -- bench live/output_callback --param condition=normal --progress
+cargo run --release -p benchmark -- bench live/ingest_contention --param condition=extreme --progress
 ```
 
 Profile a route with calibrated default iterations:
@@ -37,6 +42,9 @@ Profile a route with calibrated default iterations:
 cargo run --release -p benchmark -- profile opus/encode
 samply record cargo run --release -p benchmark -- profile live/call_sim
 samply record cargo run --release -p benchmark -- profile live/group_call_sim
+samply record cargo run --release -p benchmark -- profile live/output_contention
+samply record cargo run --release -p benchmark -- profile live/output_callback
+samply record cargo run --release -p benchmark -- profile live/ingest_contention
 ```
 
 The `profile` subcommand is quiet by default so profiler output stays compact;
@@ -64,6 +72,24 @@ cargo run --release -p benchmark -- bench opus/encode --save /tmp/chatt-opus-bas
 cargo run --release -p benchmark -- bench opus/encode --compare /tmp/chatt-opus-base.json --progress
 ```
 
+For latency-critical contention work, capture five baseline runs, then compare
+five current runs per route and condition. Each saved run includes raw samples
+and summary statistics for wall time, CPU cycles, instructions, and branches;
+the compare report classifies changes from the cycle posterior and uses
+instructions as a grounding signal.
+
+```sh
+for i in 1 2 3 4 5; do
+  cargo run --release -p benchmark -- bench live/output_callback --param condition=extreme --save /tmp/chatt-output-callback-base-$i.json
+  cargo run --release -p benchmark -- bench live/ingest_contention --param condition=extreme --save /tmp/chatt-ingest-contention-base-$i.json
+done
+
+for i in 1 2 3 4 5; do
+  cargo run --release -p benchmark -- bench live/output_callback --param condition=extreme --compare /tmp/chatt-output-callback-base-$i.json --save /tmp/chatt-output-callback-current-$i.json
+  cargo run --release -p benchmark -- bench live/ingest_contention --param condition=extreme --compare /tmp/chatt-ingest-contention-base-$i.json --save /tmp/chatt-ingest-contention-current-$i.json
+done
+```
+
 Notes:
 
 - `ffmpeg` and `ffprobe` must be available in `PATH`; they decode and inspect
@@ -85,6 +111,20 @@ Notes:
   `random_45`, `random_60`, `bursty_wifi`, `congested_wifi`,
   `mobile_handoff`, or `scenario_default`. Non-`none` named profiles combine
   packet drops with delivery jitter so they exercise out-of-order playback too.
+- `live/output_callback`, `live/output_contention`, and
+  `live/ingest_contention` prebuild six sample-derived speakers, prime their
+  playback streams outside measurement, then run a playback-output thread
+  against an off-thread packet-ingestion loop for a fixed 30 s simulated call.
+  `condition=normal` uses clean/light-loss links; `condition=extreme` gives the
+  six speakers different seeded high-loss profiles (`random_30`, `random_45`,
+  `random_60`, `bursty_wifi`, `congested_wifi`, `mobile_handoff`).
+  `live/output_callback` runs the production callback body for 48 kHz stereo
+  f32 output, including event drain, mix adapter, per-sample pull, sample
+  conversion/fanout, staged-sample accounting, and callback metrics. It leaves
+  optional debug/non-default paths off: no callback observer, no playback WAV
+  recorder, no echo-reference writer, and no non-48 kHz resampler.
+  `live/output_contention` keeps the narrower direct `mix_10ms` callback-side
+  mutex/core path for comparison.
 
 For packet-size context, run:
 
