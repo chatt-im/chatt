@@ -15,6 +15,7 @@ pub(crate) mod expand;
 pub(crate) mod merge;
 pub(crate) mod normal;
 pub(crate) mod random_vector;
+pub(crate) mod scratch;
 pub(crate) mod spl;
 pub(crate) mod time_stretch;
 

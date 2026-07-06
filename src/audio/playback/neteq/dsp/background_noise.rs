@@ -170,11 +170,16 @@ impl BackgroundNoise {
     /// `BackgroundNoise::GenerateBackgroundNoise`: synthesize `num_noise_samples`
     /// into `buffer[kMaxLpcOrder..]`. `buffer[..kMaxLpcOrder]` is used as the AR
     /// filter state. `random_vector` must be at least `num_noise_samples` long.
+    /// `scaled_random` and `noise_copy` are caller scratch (see
+    /// [`ExpandScratch`](super::scratch::ExpandScratch)); their contents are
+    /// overwritten.
     pub(crate) fn generate_background_noise(
         &mut self,
         random_vector: &[i16],
         num_noise_samples: usize,
         buffer: &mut [i16],
+        scaled_random: &mut Vec<i16>,
+        noise_copy: &mut Vec<i16>,
     ) {
         const ORDER: usize = MAX_LPC_ORDER;
         if !self.initialized {
@@ -184,7 +189,8 @@ impl BackgroundNoise {
             return;
         }
 
-        let mut scaled_random = vec![0i16; num_noise_samples];
+        scaled_random.clear();
+        scaled_random.resize(num_noise_samples, 0);
         buffer[..ORDER].copy_from_slice(&self.params.filter_state);
 
         let dc_offset = if self.params.scale_shift > 1 {
@@ -193,7 +199,7 @@ impl BackgroundNoise {
             0
         };
         spl::affine_transform_vector(
-            &mut scaled_random,
+            scaled_random,
             random_vector,
             self.params.scale,
             dc_offset,
@@ -202,7 +208,7 @@ impl BackgroundNoise {
         );
 
         let filter = self.params.filter;
-        spl::filter_ar_fast_q12(&scaled_random, buffer, &filter, num_noise_samples);
+        spl::filter_ar_fast_q12(scaled_random, buffer, &filter, num_noise_samples);
 
         let new_state: [i16; ORDER] = buffer[num_noise_samples..num_noise_samples + ORDER]
             .try_into()
@@ -213,10 +219,11 @@ impl BackgroundNoise {
         if bgn_mute_factor < 16384 {
             // In place: noise_samples = buffer[ORDER..].
             let noise = &mut buffer[ORDER..ORDER + num_noise_samples];
-            let copy: Vec<i16> = noise.to_vec();
+            noise_copy.clear();
+            noise_copy.extend_from_slice(noise);
             spl::affine_transform_vector(
                 noise,
-                &copy,
+                noise_copy,
                 bgn_mute_factor,
                 8192,
                 14,
@@ -326,7 +333,15 @@ mod tests {
         let mut random_vector = vec![0i16; num_noise];
         rv.generate(&mut random_vector);
         let mut buffer = vec![0i16; MAX_LPC_ORDER + num_noise];
-        bg.generate_background_noise(&random_vector, num_noise, &mut buffer);
+        let mut scaled_random = Vec::new();
+        let mut noise_copy = Vec::new();
+        bg.generate_background_noise(
+            &random_vector,
+            num_noise,
+            &mut buffer,
+            &mut scaled_random,
+            &mut noise_copy,
+        );
         let noise: Vec<i64> = buffer[MAX_LPC_ORDER..].iter().map(|&x| x as i64).collect();
         assert_eq!(noise, load("background_noise_generate"));
     }

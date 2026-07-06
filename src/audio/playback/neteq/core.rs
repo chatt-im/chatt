@@ -34,6 +34,7 @@ use super::decision_logic::DecisionLogic;
 use super::dsp::background_noise::BackgroundNoise;
 use super::dsp::expand::Expand;
 use super::dsp::random_vector::RandomVector;
+use super::dsp::scratch::{DspScratch, TimescaleScratch};
 use super::dsp::time_stretch::{self, ReturnCode};
 use super::dsp::{merge, normal};
 use super::neteq_status::{
@@ -224,6 +225,8 @@ pub(crate) struct NetEqCore {
     background_noise: BackgroundNoise,
     /// Concealment RNG; its seed-increment ordering is part of bit-exactness.
     random_vector: RandomVector,
+    /// Preallocated DSP temporaries so no operation allocates on the callback.
+    scratch: DspScratch,
     /// `decoded_buffer_`: scratch for freshly decoded PCM.
     decoded_buffer: Vec<i16>,
     /// Reusable extraction list so `GetAudio` never allocates one. Taken by
@@ -313,6 +316,7 @@ impl NetEqCore {
             expand: Expand::new(),
             background_noise: BackgroundNoise::new(),
             random_vector: RandomVector::new(),
+            scratch: DspScratch::new(),
             decoded_buffer: vec![0; MAX_OPUS_DECODE_SAMPLES],
             packet_scratch: Vec::with_capacity(MAX_PACKETS_IN_BUFFER),
             last_mode: Mode::Normal,
@@ -1319,18 +1323,19 @@ impl NetEqCore {
             // Resuming after concealment: unmute and cross-fade the seam.
             // `process_after_expand` reads/writes the sync buffer and resets
             // Expand internally (matching `Normal::Process`).
-            let mut out = Vec::new();
             normal::process_after_expand(
-                &decoded,
+                decoded,
                 self.sync_buffer.data_mut(),
                 &mut self.expand,
                 &mut self.background_noise,
                 &mut self.random_vector,
-                &mut out,
+                &mut self.scratch.expand,
+                &mut self.scratch.expand_out,
+                &mut self.scratch.op_out,
             );
-            self.sync_buffer.push_back(&out);
+            self.sync_buffer.push_back(&self.scratch.op_out);
         } else {
-            self.sync_buffer.push_back(&decoded);
+            self.sync_buffer.push_back(decoded);
         }
         self.last_mode = Mode::Normal;
     }
@@ -1339,15 +1344,16 @@ impl NetEqCore {
     fn do_merge(&mut self, decoded_len: usize) {
         let decoded = &self.decoded_buffer[..decoded_len];
         let next_index = self.sync_buffer.next_index();
-        let result = merge::process(
-            &decoded,
+        merge::process(
+            decoded,
             self.sync_buffer.data_mut(),
             next_index,
             &mut self.expand,
             &mut self.background_noise,
             &mut self.random_vector,
+            &mut self.scratch,
         );
-        self.sync_buffer.push_back(&result.output);
+        self.sync_buffer.push_back(&self.scratch.op_out);
         self.expand.reset();
         self.last_mode = Mode::Merge;
     }
@@ -1374,7 +1380,6 @@ impl NetEqCore {
             self.last_mode = Mode::Expand;
             return;
         }
-        let mut out = Vec::new();
         let mut guard = 0;
         while self
             .sync_buffer
@@ -1385,11 +1390,13 @@ impl NetEqCore {
             // `process` analyzes the history on the first chunk of a run and
             // overlap-adds into the sync-buffer tail, then fills `out` with the
             // new concealment samples to append.
+            let out = &mut self.scratch.expand_out;
             self.expand.process(
                 self.sync_buffer.data_mut(),
                 &mut self.background_noise,
                 &mut self.random_vector,
-                &mut out,
+                &mut self.scratch.expand,
+                out,
             );
             if out.is_empty() {
                 // No history to extrapolate from: emit silence to make progress.
@@ -1409,15 +1416,16 @@ impl NetEqCore {
     /// Port of `NetEqImpl::DoAccelerate`: borrow 30 ms across the decoded buffer
     /// and the sync tail, time-compress one pitch period, and write back.
     fn do_accelerate(&mut self, decoded_len: usize, fast: bool) -> i32 {
-        let (input, borrowed) = self.build_timescale_input(decoded_len);
-        let result = time_stretch::accelerate_process(&input, fast, &self.background_noise);
+        let borrowed = self.build_timescale_input(decoded_len);
+        let TimescaleScratch { input, output, .. } = &mut self.scratch.timescale;
+        let result = time_stretch::accelerate_process(input, fast, &self.background_noise, output);
         self.last_mode = match result.return_code {
             ReturnCode::Success => Mode::AccelerateSuccess,
             ReturnCode::SuccessLowEnergy => Mode::AccelerateLowEnergy,
             ReturnCode::NoStretch | ReturnCode::Error => Mode::AccelerateFail,
         };
         let removed = result.length_change_samples;
-        self.apply_timescale_result(result.output, borrowed);
+        self.apply_timescale_result(borrowed);
         self.expand.reset();
         removed as i32
     }
@@ -1431,12 +1439,14 @@ impl NetEqCore {
         let borrowed = TIMESCALE_REQUIRED_SAMPLES.saturating_sub(decoded_len);
         let old_data_length = borrowed.saturating_sub(future);
         let overlap_samples = self.expand.overlap_length();
-        let (input, borrowed) = self.build_timescale_input(decoded_len);
+        let borrowed = self.build_timescale_input(decoded_len);
+        let TimescaleScratch { input, output, .. } = &mut self.scratch.timescale;
         let result = time_stretch::preemptive_expand_process(
-            &input,
+            input,
             old_data_length,
             overlap_samples,
             &self.background_noise,
+            output,
         );
         self.last_mode = match result.return_code {
             ReturnCode::Success => Mode::PreemptiveExpandSuccess,
@@ -1444,56 +1454,60 @@ impl NetEqCore {
             ReturnCode::NoStretch | ReturnCode::Error => Mode::PreemptiveExpandFail,
         };
         let added = result.length_change_samples;
-        self.apply_timescale_result(result.output, borrowed);
+        self.apply_timescale_result(borrowed);
         self.expand.reset();
         added as i32
     }
 
-    /// Builds the 30 ms time-scale input: the decoded buffer prefixed with
-    /// samples borrowed from the end of the sync buffer when the decoder gave
-    /// fewer than 30 ms. Mirrors the `ReadInterleavedFromEnd` borrow in
-    /// `DoAccelerate`/`DoPreemptiveExpand`.
-    fn build_timescale_input(&mut self, decoded_len: usize) -> (Vec<i16>, usize) {
+    /// Builds the 30 ms time-scale input into `scratch.timescale.input`: the
+    /// decoded buffer prefixed with samples borrowed from the end of the sync
+    /// buffer when the decoder gave fewer than 30 ms. Mirrors the
+    /// `ReadInterleavedFromEnd` borrow in `DoAccelerate`/`DoPreemptiveExpand`.
+    /// Returns the borrowed sample count.
+    fn build_timescale_input(&mut self, decoded_len: usize) -> usize {
+        let TimescaleScratch { input, tail, .. } = &mut self.scratch.timescale;
+        input.clear();
         if decoded_len >= TIMESCALE_REQUIRED_SAMPLES {
-            return (self.decoded_buffer[..decoded_len].to_vec(), 0);
+            input.extend_from_slice(&self.decoded_buffer[..decoded_len]);
+            return 0;
         }
         let borrowed = TIMESCALE_REQUIRED_SAMPLES - decoded_len;
-        let mut input = Vec::with_capacity(TIMESCALE_REQUIRED_SAMPLES);
-        let mut tail = Vec::new();
-        self.sync_buffer.read_from_end(borrowed, &mut tail);
+        self.sync_buffer.read_from_end(borrowed, tail);
         // The borrow may be shorter than requested if the buffer is small; pad to
         // keep the analysis window full.
         if tail.len() < borrowed {
             input.resize(borrowed - tail.len(), 0);
         }
-        input.extend_from_slice(&tail);
+        input.extend_from_slice(tail);
         input.extend_from_slice(&self.decoded_buffer[..decoded_len]);
-        (input, borrowed)
+        borrowed
     }
 
-    /// Writes a time-scaled algorithm buffer back, restoring the borrowed sync
-    /// tail in place and pushing the remainder. Port of the borrow-restore tail
-    /// of `DoAccelerate`/`DoPreemptiveExpand`.
-    fn apply_timescale_result(&mut self, mut algorithm: Vec<i16>, borrowed: usize) {
+    /// Writes the time-scaled `scratch.timescale.output` back, restoring the
+    /// borrowed sync tail in place and pushing the remainder. Port of the
+    /// borrow-restore tail of `DoAccelerate`/`DoPreemptiveExpand`.
+    fn apply_timescale_result(&mut self, borrowed: usize) {
+        let algorithm = &mut self.scratch.timescale.output;
+        let mut start = 0;
         if borrowed > 0 {
             let size = self.sync_buffer.size();
             if algorithm.len() < borrowed {
                 let len = algorithm.len();
                 self.sync_buffer
-                    .replace_at_index(&algorithm, len, size - borrowed);
+                    .replace_at_index(algorithm, len, size - borrowed);
                 self.sync_buffer.push_front_zeros(borrowed - len);
-                algorithm.clear();
+                start = algorithm.len();
             } else {
                 self.sync_buffer.replace_at_index(
                     &algorithm[..borrowed],
                     borrowed,
                     size - borrowed,
                 );
-                algorithm.drain(..borrowed);
+                start = borrowed;
             }
         }
-        if !algorithm.is_empty() {
-            self.sync_buffer.push_back(&algorithm);
+        if start < algorithm.len() {
+            self.sync_buffer.push_back(&algorithm[start..]);
         }
     }
 

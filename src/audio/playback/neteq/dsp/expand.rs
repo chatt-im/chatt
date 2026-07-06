@@ -10,6 +10,7 @@
 use super::background_noise::BackgroundNoise;
 use super::dsp_helper;
 use super::random_vector::{RANDOM_TABLE, RandomVector};
+use super::scratch::ExpandScratch;
 use super::spl;
 
 const FS_HZ: i32 = 48000;
@@ -42,9 +43,11 @@ struct ChannelParameters {
 
 impl ChannelParameters {
     fn new() -> Self {
+        // One expansion vector is at most `max_lag + OVERLAP_LENGTH` (750), so
+        // reserving that here keeps `analyze_signal` allocation-free.
         Self {
-            expand_vector0: Vec::new(),
-            expand_vector1: Vec::new(),
+            expand_vector0: Vec::with_capacity(120 * FS_MULT + OVERLAP_LENGTH),
+            expand_vector1: Vec::with_capacity(120 * FS_MULT + OVERLAP_LENGTH),
             ar_filter: [0; UNVOICED_LPC_ORDER + 1],
             ar_filter_state: [0; UNVOICED_LPC_ORDER],
             mute_factor: 16384,
@@ -181,6 +184,7 @@ impl Expand {
         sync_buffer: &mut [i16],
         background_noise: &mut BackgroundNoise,
         random_vector: &mut RandomVector,
+        scratch: &mut ExpandScratch,
         output: &mut Vec<i16>,
     ) {
         let mut rng_buffer = [0i16; 48000 / 8000 * 120 + 30]; // 750
@@ -193,6 +197,7 @@ impl Expand {
                 sync_buffer,
                 background_noise,
                 random_vector,
+                scratch,
                 &mut rng_buffer,
             );
             self.first_expand = false;
@@ -210,7 +215,9 @@ impl Expand {
         let expansion_temp_length = current_lag + OVERLAP_LENGTH;
 
         // Voiced part: weighted combination of the two expansion vectors.
-        let mut voiced_vector_storage = vec![0i16; expansion_temp_length];
+        scratch.voiced.clear();
+        scratch.voiced.resize(expansion_temp_length, 0);
+        let voiced_vector_storage = &mut scratch.voiced;
         match self.current_lag_index {
             0 => {
                 voiced_vector_storage.copy_from_slice(
@@ -229,7 +236,7 @@ impl Expand {
                     temp_1,
                     1,
                     2,
-                    &mut voiced_vector_storage,
+                    voiced_vector_storage,
                     expansion_temp_length,
                 );
             }
@@ -244,7 +251,7 @@ impl Expand {
                     temp_1,
                     1,
                     1,
-                    &mut voiced_vector_storage,
+                    voiced_vector_storage,
                     expansion_temp_length,
                 );
             }
@@ -336,17 +343,18 @@ impl Expand {
             let temp_scale = 16384 - self.params.current_voice_mix_factor;
             let voiced = &voiced_vector_storage[OVERLAP_LENGTH..];
             let unvoiced = &unvoiced_array_memory[uv_out..];
-            let mut tail = vec![0i16; current_lag - temp_length];
+            scratch.tail.clear();
+            scratch.tail.resize(current_lag - temp_length, 0);
             spl::scale_and_add_vectors_with_round(
                 &voiced[temp_length..],
                 self.params.current_voice_mix_factor,
                 &unvoiced[temp_length..],
                 temp_scale,
                 14,
-                &mut tail,
+                &mut scratch.tail,
                 current_lag - temp_length,
             );
-            temp_data[temp_length..current_lag].copy_from_slice(&tail);
+            temp_data[temp_length..current_lag].copy_from_slice(&scratch.tail);
         }
 
         // Progressive muting.
@@ -384,6 +392,8 @@ impl Expand {
             &rng_buffer,
             current_lag,
             &mut unvoiced_array_memory,
+            &mut scratch.noise_scaled,
+            &mut scratch.noise_copy,
         );
         let noise = &unvoiced_array_memory[NOISE_LPC_ORDER..];
         for i in 0..current_lag {
@@ -453,6 +463,7 @@ impl Expand {
         sync_buffer: &mut [i16],
         background_noise: &mut BackgroundNoise,
         random_vector: &mut RandomVector,
+        scratch: &mut ExpandScratch,
         rng_buffer: &mut [i16],
     ) {
         let fs_mult = FS_MULT;
@@ -463,8 +474,11 @@ impl Expand {
         let fs_mult_lpc_analysis_len = fs_mult * LPC_ANALYSIS_LENGTH; // 960
 
         let audio_history_position = sync_buffer.len() - SIGNAL_LENGTH;
-        let audio_history: Vec<i16> =
-            sync_buffer[audio_history_position..audio_history_position + SIGNAL_LENGTH].to_vec();
+        scratch.audio_history.clear();
+        scratch.audio_history.extend_from_slice(
+            &sync_buffer[audio_history_position..audio_history_position + SIGNAL_LENGTH],
+        );
+        let audio_history = &scratch.audio_history;
 
         self.initialize_for_an_expand_period(background_noise, random_vector);
 
@@ -552,9 +566,11 @@ impl Expand {
             - 31)
             .max(0);
 
-        let mut correlation_vector2 = vec![0i32; correlation_lags];
+        scratch.correlation2.clear();
+        scratch.correlation2.resize(correlation_lags, 0);
+        let correlation_vector2 = &mut scratch.correlation2;
         spl::cross_correlation_at(
-            &mut correlation_vector2,
+            correlation_vector2,
             &audio_history[SIGNAL_LENGTH - correlation_length..],
             &audio_history,
             (SIGNAL_LENGTH - correlation_length - start_index) as isize,
@@ -564,7 +580,7 @@ impl Expand {
             -1,
         );
 
-        let mut best_index = spl::max_index_w32(&correlation_vector2);
+        let mut best_index = spl::max_index_w32(correlation_vector2);
         let mut max_correlation = correlation_vector2[best_index];
         best_index += start_index;
 
@@ -622,20 +638,21 @@ impl Expand {
             parameters.expand_vector0.extend_from_slice(vector1);
             parameters.expand_vector1.clear();
             parameters.expand_vector1.resize(expansion_length, 0);
-            let mut temp_1 = vec![0i16; expansion_length];
             spl::affine_transform_vector(
-                &mut temp_1,
+                &mut parameters.expand_vector1,
                 vector2,
                 amplitude_ratio,
                 4096,
                 13,
                 expansion_length,
             );
-            parameters.expand_vector1.copy_from_slice(&temp_1);
         } else {
             parameters.expand_vector0.clear();
             parameters.expand_vector0.extend_from_slice(vector1);
-            parameters.expand_vector1 = parameters.expand_vector0.clone();
+            parameters.expand_vector1.clear();
+            parameters
+                .expand_vector1
+                .extend_from_slice(&parameters.expand_vector0);
             amplitude_ratio = if energy1 / 4 < energy2 || energy2 == 0 {
                 4096
             } else {
@@ -658,7 +675,11 @@ impl Expand {
 
         // LPC analysis on a zero-padded copy of the signal tail.
         let temp_index = SIGNAL_LENGTH - fs_mult_lpc_analysis_len - UNVOICED_LPC_ORDER;
-        let mut temp_signal = vec![0i16; fs_mult_lpc_analysis_len + UNVOICED_LPC_ORDER];
+        scratch.temp_signal.clear();
+        scratch
+            .temp_signal
+            .resize(fs_mult_lpc_analysis_len + UNVOICED_LPC_ORDER, 0);
+        let temp_signal = &mut scratch.temp_signal;
         temp_signal[UNVOICED_LPC_ORDER..].copy_from_slice(
             &audio_history[temp_index + UNVOICED_LPC_ORDER
                 ..temp_index + UNVOICED_LPC_ORDER + fs_mult_lpc_analysis_len],
@@ -666,7 +687,7 @@ impl Expand {
         let mut auto_correlation = [0i32; UNVOICED_LPC_ORDER + 1];
         spl::cross_correlation_with_auto_shift(
             &temp_signal[UNVOICED_LPC_ORDER..],
-            &temp_signal,
+            temp_signal,
             UNVOICED_LPC_ORDER as isize,
             fs_mult_lpc_analysis_len,
             UNVOICED_LPC_ORDER + 1,
@@ -708,12 +729,14 @@ impl Expand {
         parameters
             .ar_filter_state
             .copy_from_slice(&audio_history[SIGNAL_LENGTH - UNVOICED_LPC_ORDER..]);
-        let mut unvoiced_buf = vec![0i16; UNVOICED_LPC_ORDER + 128];
+        scratch.unvoiced.clear();
+        scratch.unvoiced.resize(UNVOICED_LPC_ORDER + 128, 0);
+        let unvoiced_buf = &mut scratch.unvoiced;
         unvoiced_buf[..UNVOICED_LPC_ORDER].copy_from_slice(
             &audio_history[SIGNAL_LENGTH - 128 - UNVOICED_LPC_ORDER..SIGNAL_LENGTH - 128],
         );
         spl::filter_ma_fast_q12(
-            &audio_history,
+            audio_history,
             (SIGNAL_LENGTH - 128) as isize,
             &mut unvoiced_buf[UNVOICED_LPC_ORDER..],
             &parameters.ar_filter,
@@ -792,10 +815,17 @@ mod tests {
         let mut bg = BackgroundNoise::new();
         let mut rv = RandomVector::new();
         let mut expand = Expand::new();
+        let mut scratch = crate::audio::playback::neteq::dsp::scratch::DspScratch::new();
 
         for call in 0..4 {
             let mut output = Vec::new();
-            expand.process(&mut sync, &mut bg, &mut rv, &mut output);
+            expand.process(
+                &mut sync,
+                &mut bg,
+                &mut rv,
+                &mut scratch.expand,
+                &mut output,
+            );
             let mut got = vec![output.len() as i64];
             got.extend(output.iter().map(|&x| x as i64));
             assert_eq!(got, load(&format!("expand_out_{call}")), "call {call}");
