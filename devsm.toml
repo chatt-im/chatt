@@ -106,7 +106,7 @@ BENCH=$(cargo --config "target.'cfg(unix)'.runner = 'echo'" run -q --release)
 ROUTE=${1:-profile}
 PROFILE_ROUTE=$(printf '%s' "$ROUTE" | sed 's#[^A-Za-z0-9_.-]#-#g')
 PROFILE_OUTPUT="/tmp/profile-${PROFILE_ROUTE}.json"
-samply record -r 5000 --save-only --output "$PROFILE_OUTPUT" $BENCH profile  "$@" || exit 1
+samply record -r 5000 --presymbolicate --save-only --output "$PROFILE_OUTPUT" $BENCH profile  "$@" || exit 1
 echo "Profile output to $PROFILE_OUTPUT for: benchmark profile $*"
 '''
 env.DEBUGINFOD_URLS = "https://debuginfod.archlinux.org"
