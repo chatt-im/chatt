@@ -9,7 +9,7 @@ use rpc::{
     ids::{FileTransferId, MessageId, RoomId, SessionId, StreamId, UserId},
 };
 
-use chatt::audio::{LivePlaybackFeedback, PlaybackStreamControl};
+use crate::audio::{LivePlaybackFeedback, PlaybackStreamControl};
 
 use crate::{
     chat_buffer::{NoticeId, VirtualChatBuffer},

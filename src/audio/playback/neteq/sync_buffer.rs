@@ -57,6 +57,7 @@ impl SyncBuffer {
         self.end_timestamp
     }
 
+    #[cfg(test)]
     pub(crate) fn set_end_timestamp(&mut self, value: u32) {
         self.end_timestamp = value;
     }
@@ -146,6 +147,7 @@ impl SyncBuffer {
         self.data[position..position + length].copy_from_slice(&insert_this[..length]);
     }
 
+    #[cfg(test)]
     pub(crate) fn replace_at_index_all(&mut self, insert_this: &[i16], position: usize) {
         self.replace_at_index(insert_this, insert_this.len(), position);
     }

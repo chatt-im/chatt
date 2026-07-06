@@ -290,7 +290,7 @@ pub(crate) struct LiveDecodeStreams {
 
 struct RetiringStream {
     stream_id: u32,
-    shared: SharedNetEqHandle,
+    _shared: SharedNetEqHandle,
     /// Push ordinal of this stream's `StopStream`, `None` while the push is
     /// still pending on a full event queue.
     stop_ordinal: Option<u64>,
@@ -511,7 +511,7 @@ impl LiveDecodeStreams {
         }
         self.retiring.push(RetiringStream {
             stream_id,
-            shared,
+            _shared: shared,
             stop_ordinal,
         });
     }
@@ -617,6 +617,7 @@ impl LiveDecodeStreams {
     }
 
     /// Control-plane step used by the single-threaded simulation harness.
+    #[cfg(test)]
     pub(crate) fn drain_into_mixer(
         &mut self,
         mixer: &Arc<Mutex<LivePlaybackMixer>>,
@@ -792,16 +793,6 @@ impl LiveDecodeStreams {
     #[cfg(test)]
     pub(crate) fn get(&self, stream_id: u32) -> Option<&LiveDecodeStream> {
         self.streams.get(&stream_id)
-    }
-
-    /// One [`NetEqCore::debug_timeline`] line per stream, for pinpointing
-    /// buffer/timeline state around a misbehaving output block in sims.
-    #[cfg(test)]
-    pub(crate) fn debug_timelines(&self) -> Vec<String> {
-        self.streams
-            .values()
-            .map(|stream| lock_shared_stream(&stream.shared).core().debug_timeline())
-            .collect()
     }
 }
 

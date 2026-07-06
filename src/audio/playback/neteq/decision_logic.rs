@@ -28,7 +28,6 @@ const TARGET_LEVEL_WINDOW_MS: i32 = 100;
 // 15 ms granularity rounded up to the 10 ms clock.
 const DELAY_ADJUSTMENT_GRANULARITY_MS: i64 = 20;
 const PACKET_HISTORY_SIZE_MS: i32 = 2000;
-const CNG_TIMEOUT_MS: usize = 1000;
 const EXPAND_MUTE_FACTOR_HALF: i16 = 16384 / 2;
 
 /// The NetEQ decision tree.
@@ -149,10 +148,6 @@ impl DecisionLogic {
             .clamp(self.delay_manager.target_delay_ms())
     }
 
-    pub(crate) fn filtered_buffer_level(&self) -> i32 {
-        self.buffer_level_filter.filtered_current_level()
-    }
-
     pub(crate) fn set_minimum_delay(&mut self, delay_ms: i32) -> bool {
         self.delay_constraints.set_minimum_delay(delay_ms)
     }
@@ -268,13 +263,6 @@ impl DecisionLogic {
     fn no_packet(&self, status: &NetEqStatus) -> Operation {
         match status.last_mode {
             Mode::Rfc3389Cng => Operation::Rfc3389CngNoPacket,
-            Mode::CodecInternalCng => {
-                if status.generated_noise_samples > CNG_TIMEOUT_MS * self.sample_rate_khz as usize {
-                    Operation::Expand
-                } else {
-                    Operation::CodecInternalCng
-                }
-            }
             _ => {
                 if status.play_dtmf {
                     Operation::Dtmf
@@ -332,7 +320,7 @@ impl DecisionLogic {
         }
         match status.last_mode {
             Mode::Expand => Operation::Merge,
-            Mode::CodecPlc | Mode::Rfc3389Cng | Mode::CodecInternalCng => Operation::Normal,
+            Mode::Rfc3389Cng => Operation::Normal,
             _ => {
                 if status.play_dtmf {
                     Operation::Dtmf
@@ -421,7 +409,6 @@ mod tests {
         NetEqStatus {
             target_timestamp: 9600,
             expand_mutefactor: 16384,
-            last_packet_samples: 960,
             next_packet: next,
             last_mode,
             play_dtmf: false,
@@ -431,13 +418,11 @@ mod tests {
         }
     }
 
-    fn info(main_timestamp: u32, seq: u16) -> PacketArrivedInfo {
+    fn info(main_timestamp: u32, _seq: u16) -> PacketArrivedInfo {
         PacketArrivedInfo {
             packet_length_samples: 960,
             main_timestamp,
-            main_sequence_number: seq,
             is_cng_or_dtmf: false,
-            is_dtx: false,
             buffer_flush: false,
         }
     }
@@ -543,7 +528,6 @@ mod tests {
         let mut logic = logic(&timer);
         let next = Some(PacketInfo {
             timestamp: 9600,
-            is_dtx: false,
             is_cng: false,
         });
         let mut st = status(next, Mode::Normal);
@@ -560,7 +544,6 @@ mod tests {
         // Next packet is ahead of the playout point and we were concealing.
         let next = Some(PacketInfo {
             timestamp: 9600 + 960,
-            is_dtx: false,
             is_cng: false,
         });
         let mut st = status(next, Mode::Expand);
@@ -576,7 +559,6 @@ mod tests {
         let mut logic = logic(&timer);
         let next = Some(PacketInfo {
             timestamp: 9600,
-            is_dtx: false,
             is_cng: false,
         });
         // Just finished a deep expand (mute factor below half) with an almost
@@ -598,9 +580,7 @@ mod tests {
             let info = PacketArrivedInfo {
                 packet_length_samples: 960,
                 main_timestamp: seq * 960,
-                main_sequence_number: seq as u16,
                 is_cng_or_dtmf: false,
-                is_dtx: false,
                 buffer_flush: false,
             };
             logic.packet_arrived(48000, true, &info, &timer, now_samples(&timer));
@@ -610,7 +590,6 @@ mod tests {
         // audio has arrived — a deeply overfull buffer, so speed up.
         let next = Some(PacketInfo {
             timestamp: 0,
-            is_dtx: false,
             is_cng: false,
         });
         let mut st = status(next, Mode::Normal);

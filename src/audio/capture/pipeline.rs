@@ -343,6 +343,7 @@ impl LiveEncoderPipeline {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn aec_enabled(&self) -> bool {
         self.processor.echo_enabled()
     }
@@ -820,6 +821,7 @@ impl LiveEncoderPipeline {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn build_live_encoder_pipeline(
     tuning: LiveAudioTuning,
     denoise_enabled: bool,

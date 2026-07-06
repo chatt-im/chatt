@@ -88,6 +88,7 @@ impl BackgroundNoise {
         self.params.energy
     }
 
+    #[cfg(test)]
     pub(crate) fn mute_factor(&self) -> i16 {
         self.params.mute_factor
     }
@@ -96,18 +97,22 @@ impl BackgroundNoise {
         self.params.mute_factor = value;
     }
 
+    #[cfg(test)]
     pub(crate) fn filter(&self) -> &[i16] {
         &self.params.filter
     }
 
+    #[cfg(test)]
     pub(crate) fn filter_state(&self) -> &[i16] {
         &self.params.filter_state
     }
 
+    #[cfg(test)]
     pub(crate) fn scale(&self) -> i16 {
         self.params.scale
     }
 
+    #[cfg(test)]
     pub(crate) fn scale_shift(&self) -> i16 {
         self.params.scale_shift
     }

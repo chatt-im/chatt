@@ -59,6 +59,7 @@ impl BufferLevelFilter {
 
     /// Filtered current level in samples, rounded to nearest. Port of
     /// `filtered_current_level`.
+    #[cfg(test)]
     pub(crate) fn filtered_current_level(&self) -> i32 {
         ((self.filtered_current_level + (1 << 7)) >> 8) as i32
     }

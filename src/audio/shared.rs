@@ -200,24 +200,7 @@ pub(crate) const LIVE_PLAYBACK_COMMAND_CAPACITY: usize = 256;
 pub(crate) const LIVE_NETEQ_START_DELAY: Duration = Duration::from_millis(60);
 pub(crate) const LIVE_NETEQ_MIN_DELAY: Duration = Duration::from_millis(20);
 pub(crate) const LIVE_NETEQ_MAX_DELAY: Duration = Duration::from_millis(1_000);
-// Ignore recommended-target changes smaller than this to avoid chatter.
-pub(crate) const LIVE_PLAYBACK_DYNAMIC_DEADBAND: Duration = Duration::from_millis(3);
 pub(crate) const LIVE_PLAYBACK_HARD_QUEUE_BOUND: Duration = Duration::from_millis(1_500);
-// Overlap-add expansion conceals jitter and sender-slow drift on a *live*
-// stream: it duplicates buffered audio to bridge an underrun until the next
-// real frame arrives. A stream that has ended (sender stopped, or a
-// silence-gated pause) delivers no further frames, so unbounded expansion would
-// loop the residual buffer forever and play a static drone. This caps how much
-// audio expansion may synthesize before a real decoded frame resets it, so a
-// stalled stream drains to silence instead. Any genuine live stream keeps
-// queuing real Normal/DRED frames within this bound.
-pub(crate) const LIVE_PLAYBACK_MAX_IDLE_EXPANSION: Duration = Duration::from_millis(100);
-// NetEQ keeps time-scale decisions behind mode/countdown state: the first
-// packet after concealment is not accelerated/preemptively expanded, and
-// successful time-scale operations arm `timescale_countdown_`. A sender-silence
-// resume is Chatt's CNG/DTX-style concealment boundary; protect the capture
-// fade-in from pitch-period time scaling until it has stabilized.
-pub(crate) const LIVE_PLAYBACK_RESUME_TIME_SCALE_HOLD: Duration = Duration::from_millis(80);
 // Priming cushion added on top of one output device callback when sizing the
 // playout target. A device whose host period exceeds the one-packet floor needs
 // its whole callback buffered, plus this slack, or it re-primes whenever
@@ -229,40 +212,13 @@ pub(crate) const LIVE_PLAYBACK_INITIAL_BUFFER: Duration = Duration::from_millis(
 pub(crate) const LIVE_PLAYBACK_DRAIN_INTERVAL: Duration = Duration::from_millis(10);
 pub(crate) const LIVE_PLAYBACK_FEEDBACK_INTERVAL: Duration = Duration::from_millis(500);
 pub(crate) const LIVE_PLAYBACK_FEEDBACK_PACKETS: u32 = 25;
-// Cadence of the "live playback snapshot" diagnostic. Decoupled from the 500 ms
-// feedback window so queue/target/correction dynamics are sampled finely enough
-// to see the queue oscillate between arrivals (one packet is 20 ms).
-pub(crate) const LIVE_PLAYBACK_SNAPSHOT_INTERVAL: Duration = Duration::from_millis(100);
 pub(crate) const LIVE_PLAYBACK_MAX_REORDER_DELAY: Duration = Duration::from_millis(60);
 pub(crate) const LIVE_PLAYBACK_DRED_MAX_SAMPLES: usize = SAMPLE_RATE as usize;
 pub(crate) const LIVE_PLAYBACK_SILENCE_VAD_MAX: u8 = 64;
-pub(crate) const LIVE_PLAYBACK_RECOVERY_DECLICK: Duration = Duration::from_millis(5);
-pub(crate) const LIVE_PLAYBACK_RECOVERY_DECLICK_MIN_DELTA: f32 = 0.01;
-pub(crate) const TIME_SCALE_DECIMATION: usize = 12;
-pub(crate) const TIME_SCALE_DOWNSAMPLED_LEN: usize = 110;
-pub(crate) const TIME_SCALE_CORRELATION_LEN: usize = 50;
-pub(crate) const TIME_SCALE_MIN_LAG_4K: usize = 10;
-pub(crate) const TIME_SCALE_MAX_LAG_4K: usize = 60;
-pub(crate) const TIME_SCALE_WINDOW: usize = 1_440;
-pub(crate) const TIME_SCALE_REF_OFFSET: usize = 720;
-pub(crate) const TIME_SCALE_MIN_LAG_48K: usize = 120;
-pub(crate) const TIME_SCALE_MAX_LAG_48K: usize = 720;
-pub(crate) const TIME_SCALE_CORRELATION_THRESHOLD: f32 = 0.90;
-pub(crate) const TIME_SCALE_FAST_CORRELATION_THRESHOLD: f32 = 0.50;
-pub(crate) const TIME_SCALE_OVERLAP: Duration = Duration::from_millis(10);
 pub(crate) const TIME_SCALE_VAD_RATIO: f32 = 8.0;
 pub(crate) const TIME_SCALE_NOISE_FLOOR_MS: f32 = 7.0e-5;
-pub(crate) const TIME_SCALE_DECISION_INTERVAL: Duration = Duration::from_millis(10);
-pub(crate) const TIME_SCALE_OPERATION_HOLD: Duration = Duration::from_millis(50);
+#[cfg(test)]
 pub(crate) const TIME_SCALE_MARGIN: Duration = Duration::from_millis(20);
-pub(crate) const DELAY_BUCKETS: usize = 100;
-pub(crate) const DELAY_BUCKET_MS: u64 = 20;
-pub(crate) const DELAY_FORGET_FACTOR: f32 = 0.983;
-pub(crate) const REORDER_FORGET_FACTOR: f32 = 0.9993;
-pub(crate) const START_FORGET_WEIGHT: f32 = 2.0;
-pub(crate) const MS_PER_LOSS_PERCENT: f32 = 20.0;
-pub(crate) const DELAY_QUANTILE: f32 = 0.95;
-pub(crate) const DELAY_RESAMPLE_INTERVAL: Duration = Duration::from_millis(500);
 pub(crate) const LIVE_CAPTURE_LONG_SILENCE_STOP: Duration = Duration::from_secs(2);
 pub(crate) const LIVE_CAPTURE_SILENCE_PREROLL: Duration = Duration::from_millis(30);
 pub(crate) const LIVE_CAPTURE_SILENCE_RAMP: Duration = Duration::from_millis(10);
@@ -896,7 +852,6 @@ pub(crate) enum DecodedFrameSource {
     Dred,
     Fec,
     Expand,
-    Plc,
     DecodeError,
 }
 
@@ -907,20 +862,9 @@ impl DecodedFrameSource {
             DecodedFrameSource::Dred => "dred",
             DecodedFrameSource::Fec => "fec",
             DecodedFrameSource::Expand => "expand",
-            DecodedFrameSource::Plc => "plc",
             DecodedFrameSource::DecodeError => "decode_error",
         }
     }
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(crate) struct PlayoutDelay {
-    pub(crate) current: Duration,
-    pub(crate) peak: Duration,
-}
-
-pub(crate) fn neteq_start_delay_samples(tuning: LiveAudioTuning) -> usize {
-    samples_for_duration(tuning.neteq_start_delay)
 }
 
 pub(crate) fn samples_for_duration(duration: Duration) -> usize {
@@ -1084,17 +1028,6 @@ pub(crate) fn trace_time_ms(start: Instant, now: Instant) -> u64 {
     duration_to_ms(now.saturating_duration_since(start))
 }
 
-pub(crate) fn trace_source_name(source: DecodedFrameSource) -> &'static str {
-    match source {
-        DecodedFrameSource::Normal => "normal",
-        DecodedFrameSource::Dred => "dred",
-        DecodedFrameSource::Fec => "fec",
-        DecodedFrameSource::Expand => "expand",
-        DecodedFrameSource::Plc => "plc",
-        DecodedFrameSource::DecodeError => "decode_error",
-    }
-}
-
 pub(crate) fn max_adjacent_delta(samples: &[f32]) -> f32 {
     let mut max_delta: f32 = 0.0;
     let mut last: Option<f32> = None;
@@ -1105,182 +1038,6 @@ pub(crate) fn max_adjacent_delta(samples: &[f32]) -> f32 {
         last = Some(*sample);
     }
     max_delta
-}
-
-pub(crate) fn trace_jitter_item(
-    trace: &mut Option<LiveAudioTraceWriter>,
-    start: Instant,
-    now: Instant,
-    stream_id: u32,
-    sequence: u32,
-    item: &'static str,
-    flags: u8,
-) {
-    let Some(trace) = trace else {
-        return;
-    };
-    trace.write_event(jsony::object! {
-        event: "jitter_item",
-        time_ms: trace_time_ms(start, now),
-        stream_id,
-        sequence,
-        item,
-        flags,
-    });
-}
-
-pub(crate) fn trace_fast_forward(
-    trace: &mut Option<LiveAudioTraceWriter>,
-    start: Instant,
-    now: Instant,
-    stream_id: u32,
-    from_sequence: u32,
-    to_sequence: u32,
-    skipped_packets: u32,
-) {
-    let Some(trace) = trace else {
-        return;
-    };
-    trace.write_event(jsony::object! {
-        event: "jitter_item",
-        time_ms: trace_time_ms(start, now),
-        stream_id,
-        item: "fast_forward",
-        from_sequence,
-        to_sequence,
-        skipped_packets,
-    });
-}
-
-pub(crate) fn trace_decoder_reset(
-    trace: &mut Option<LiveAudioTraceWriter>,
-    start: Instant,
-    now: Instant,
-    stream_id: u32,
-    sequence: u32,
-) {
-    let Some(trace) = trace else {
-        return;
-    };
-    trace.write_event(jsony::object! {
-        event: "decoder_reset",
-        time_ms: trace_time_ms(start, now),
-        stream_id,
-        sequence,
-    });
-}
-
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn trace_dred_parse(
-    trace: &mut Option<LiveAudioTraceWriter>,
-    start: Instant,
-    now: Instant,
-    stream_id: u32,
-    missing_sequence: u32,
-    future_sequence: u32,
-    requested_offset_samples: u32,
-    parsed_offset_samples: u32,
-    dred_end: i32,
-    status: &'static str,
-) {
-    let Some(trace) = trace else {
-        return;
-    };
-    trace.write_event(jsony::object! {
-        event: "dred_parse",
-        time_ms: trace_time_ms(start, now),
-        stream_id,
-        missing_sequence,
-        future_sequence,
-        requested_offset_samples,
-        parsed_offset_samples,
-        dred_end,
-        status,
-    });
-}
-
-pub(crate) fn trace_dred_skip(
-    trace: &mut Option<LiveAudioTraceWriter>,
-    start: Instant,
-    now: Instant,
-    stream_id: u32,
-    missing_sequence: u32,
-    future_sequence: Option<u32>,
-    reason: &'static str,
-) {
-    let Some(trace) = trace else {
-        return;
-    };
-    trace.write_event(jsony::object! {
-        event: "dred_skip",
-        time_ms: trace_time_ms(start, now),
-        stream_id,
-        missing_sequence,
-        future_sequence,
-        reason,
-    });
-}
-
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn trace_decode_output(
-    trace: &mut Option<LiveAudioTraceWriter>,
-    start: Instant,
-    now: Instant,
-    stream_id: u32,
-    sequence: u32,
-    source: DecodedFrameSource,
-    decoded_samples: usize,
-    error: Option<String>,
-    samples: &[f32],
-) {
-    let Some(trace) = trace else {
-        return;
-    };
-    trace.write_event(jsony::object! {
-        event: match source {
-            DecodedFrameSource::Dred => "dred_decode",
-            DecodedFrameSource::Fec => "fec_decode",
-            DecodedFrameSource::Normal => "normal_decode",
-            DecodedFrameSource::Expand => "expand_decode",
-            DecodedFrameSource::Plc => "plc_decode",
-            DecodedFrameSource::DecodeError => "decode_error",
-        },
-        time_ms: trace_time_ms(start, now),
-        stream_id,
-        sequence,
-        source: trace_source_name(source),
-        decoded_samples,
-        rms: rms_normalized(samples),
-        peak: peak_normalized(samples),
-        max_delta: max_adjacent_delta(samples),
-        error: error.as_deref(),
-    });
-}
-
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn trace_mixer_output_ring(
-    trace: &mut Option<LiveAudioTraceWriter>,
-    start: Instant,
-    now: Instant,
-    stream_id: u32,
-    source: DecodedFrameSource,
-    samples: &[f32],
-    max_output_ring_ms: u64,
-) {
-    let Some(trace) = trace else {
-        return;
-    };
-    trace.write_event(jsony::object! {
-        event: "mixer_output_ring",
-        time_ms: trace_time_ms(start, now),
-        stream_id,
-        source: trace_source_name(source),
-        samples: samples.len(),
-        rms: rms_normalized(samples),
-        peak: peak_normalized(samples),
-        max_delta: max_adjacent_delta(samples),
-        max_output_ring_ms,
-    });
 }
 
 pub(crate) fn normalized_to_i16_scale(samples: &[f32]) -> Vec<f32> {

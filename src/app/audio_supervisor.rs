@@ -11,7 +11,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use chatt::audio::AudioErrorKind;
+use crate::audio::AudioErrorKind;
 
 /// Delay before the n-th consecutive failed rebuild is retried. Attempts past
 /// the end of the schedule use [`AUDIO_BACKOFF_CAP`]; recovery never gives up.

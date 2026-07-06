@@ -18,7 +18,6 @@ pub(crate) enum Operation {
     PreemptiveExpand,
     Rfc3389Cng,
     Rfc3389CngNoPacket,
-    CodecInternalCng,
     Dtmf,
     Undefined,
 }
@@ -34,7 +33,6 @@ impl Operation {
             Operation::PreemptiveExpand => "preemptive_expand",
             Operation::Rfc3389Cng => "rfc3389_cng",
             Operation::Rfc3389CngNoPacket => "rfc3389_cng_no_packet",
-            Operation::CodecInternalCng => "codec_internal_cng",
             Operation::Dtmf => "dtmf",
             Operation::Undefined => "undefined",
         }
@@ -54,11 +52,7 @@ pub(crate) enum Mode {
     PreemptiveExpandLowEnergy,
     PreemptiveExpandFail,
     Rfc3389Cng,
-    CodecInternalCng,
-    CodecPlc,
-    Dtmf,
     Error,
-    Undefined,
 }
 
 impl Mode {
@@ -74,11 +68,7 @@ impl Mode {
             Mode::PreemptiveExpandLowEnergy => "preemptive_expand_low_energy",
             Mode::PreemptiveExpandFail => "preemptive_expand_fail",
             Mode::Rfc3389Cng => "rfc3389_cng",
-            Mode::CodecInternalCng => "codec_internal_cng",
-            Mode::CodecPlc => "codec_plc",
-            Mode::Dtmf => "dtmf",
             Mode::Error => "error",
-            Mode::Undefined => "undefined",
         }
     }
 
@@ -97,12 +87,12 @@ impl Mode {
     /// Whether the mode is comfort noise (RFC 3389 or codec-internal). Port of
     /// `IsCng`.
     pub(crate) fn is_cng(self) -> bool {
-        matches!(self, Mode::Rfc3389Cng | Mode::CodecInternalCng)
+        matches!(self, Mode::Rfc3389Cng)
     }
 
     /// Whether the mode is concealment (expand or codec PLC). Port of `IsExpand`.
     pub(crate) fn is_expand(self) -> bool {
-        matches!(self, Mode::Expand | Mode::CodecPlc)
+        matches!(self, Mode::Expand)
     }
 
     /// Whether the mode is an accelerate outcome (success or low-energy).

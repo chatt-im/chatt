@@ -54,7 +54,7 @@ use crate::{
     ui::welcome::WelcomeDraft,
 };
 
-use chatt::audio::{
+use crate::audio::{
     self, AudioStartError, BufferRequest, DeviceInfo, EchoCancellationControl,
     LiveAudioFileSourceConfig, LiveAudioFileSourceReport, LiveAudioMuteState,
     LiveAudioPacketLossProfile, LiveCapture, LiveCaptureConfig, LiveEncoderProfile, LivePlayback,
@@ -62,11 +62,11 @@ use chatt::audio::{
     LocalVoiceFrame, NotificationSound, PlaybackStreamControl,
 };
 
+use crate::audio::{AudioErrorKind, DeviceIdentityProbe};
 use audio_diagnostics::AudioDiagnostics;
 use audio_supervisor::{
     AudioDeviceEventKind, AudioEventLog, AudioHealthState, AudioStreamSupervisor, RebuildCause,
 };
-use chatt::audio::{AudioErrorKind, DeviceIdentityProbe};
 use commands::slash_command_help;
 
 pub(crate) use dialogs::{UserVolumeDialog, UserVolumeEvent};

@@ -119,13 +119,6 @@ impl Packet {
         }
         rhs.timestamp.wrapping_sub(self.timestamp) < 0xFFFF_FFFF / 2
     }
-
-    /// True if `self` and `rhs` denote the same (timestamp, sequence, priority).
-    pub(crate) fn same_slot(&self, rhs: &Packet) -> bool {
-        self.timestamp == rhs.timestamp
-            && self.sequence_number == rhs.sequence_number
-            && self.priority == rhs.priority
-    }
 }
 
 /// True if `timestamp` is older than `timestamp_limit` but less than

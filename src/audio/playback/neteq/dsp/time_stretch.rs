@@ -11,7 +11,6 @@ use super::dsp_helper;
 use super::spl;
 
 const FS_MULT: usize = 6;
-const SAMPLE_RATE_HZ: i32 = 48000;
 const CORRELATION_LEN: usize = 50;
 const MIN_LAG: usize = 10;
 const MAX_LAG: usize = 60;

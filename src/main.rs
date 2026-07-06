@@ -1,37 +1,3 @@
-mod app;
-#[cfg(test)]
-mod bench_upload;
-mod bindings;
-mod chat_buffer;
-mod cli;
-mod client_net;
-mod clipboard;
-mod clipboard_paste;
-mod config;
-mod config_diagnostics;
-mod file_compression;
-mod fuzzy;
-mod highlight;
-mod link;
-mod local_control;
-mod markdown;
-mod paths;
-mod room_catalog;
-mod room_history;
-mod runtime;
-mod self_log;
-mod settings;
-mod theme;
-mod tui;
-mod ui;
-mod url_open;
-mod video;
-mod web_server;
-mod web_wire;
-
-pub(crate) use chatt::audio;
-pub(crate) use chatt::mdns;
-
 #[cfg(all(feature = "mimalloc-allocator", not(feature = "dhat-heap")))]
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
@@ -52,7 +18,7 @@ fn main() {
         }
         builder.build()
     };
-    if let Err(error) = cli::run() {
+    if let Err(error) = chatt::cli::run() {
         // Print via Display, not the Debug formatting Rust applies to a
         // `main` that returns `Result`, so messages read cleanly.
         eprintln!("error: {error}");

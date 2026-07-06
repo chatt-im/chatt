@@ -5,7 +5,7 @@ use rpc::{
     ids::{StreamId, UserId},
 };
 
-use chatt::audio::LivePlaybackFeedback;
+use crate::audio::LivePlaybackFeedback;
 
 const UNKNOWN_NAME: &str = "…";
 

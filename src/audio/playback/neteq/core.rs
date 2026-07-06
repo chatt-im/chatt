@@ -102,6 +102,7 @@ pub(crate) struct NetEqDiagnostics {
     pub packets_buffered: usize,
     pub packets_discarded: u64,
     pub secondary_packets_discarded: u64,
+    #[cfg(test)]
     pub trash_overflow: u64,
     pub next_packet_gap_ms: Option<i64>,
     pub operation: &'static str,
@@ -363,10 +364,6 @@ impl NetEqCore {
         })
     }
 
-    pub(crate) fn output_size_samples(&self) -> usize {
-        OUTPUT_SIZE_SAMPLES
-    }
-
     /// Advances the wall-clock arrival timeline to `now`, returning it in
     /// 48 kHz sample units since the first observation.
     fn observe_wall_clock(&mut self, now: Instant) -> i64 {
@@ -376,14 +373,7 @@ impl NetEqCore {
         self.wall_now_samples
     }
 
-    pub(crate) fn target_level_ms(&self) -> i32 {
-        self.decision_logic.target_level_ms()
-    }
-
-    pub(crate) fn future_length(&self) -> usize {
-        self.sync_buffer.future_length()
-    }
-
+    #[cfg(test)]
     pub(crate) fn packets_buffered(&self) -> usize {
         self.packet_buffer.num_packets()
     }
@@ -425,6 +415,7 @@ impl NetEqCore {
             packets_buffered: status.packet_buffer_info.num_packets,
             packets_discarded: self.packet_buffer.packets_discarded(),
             secondary_packets_discarded: self.packet_buffer.secondary_packets_discarded(),
+            #[cfg(test)]
             trash_overflow: self.packet_buffer.trash_overflow(),
             next_packet_gap_ms,
             operation: self.last_operation.label(),
@@ -433,35 +424,6 @@ impl NetEqCore {
             dred_missed_horizon_count: self.dred_missed_horizon_count,
             dred_missed_horizon_ms: samples_to_ms(self.dred_missed_horizon_samples as usize),
         }
-    }
-
-    /// Compact one-line dump of the playout position, sync buffer depth, and
-    /// the first buffered packets as `ts+<gap>(<seq>s<codec_level>)`, for
-    /// attributing sim artifacts to buffer/timeline state.
-    #[cfg(test)]
-    pub(crate) fn debug_timeline(&self) -> String {
-        let status = self.status();
-        let playout = status
-            .target_timestamp
-            .wrapping_add(status.generated_noise_samples as u32)
-            .wrapping_sub(status.sync_buffer_samples as u32);
-        let packets: Vec<String> = self
-            .packet_buffer
-            .debug_packets()
-            .into_iter()
-            .take(6)
-            .map(|(ts, seq, level)| {
-                format!("ts+{}({}s{})", ts.wrapping_sub(playout) as i32, seq, level)
-            })
-            .collect();
-        format!(
-            "playout={playout} end_ts={} gen_noise={} sync={} last={} pkts={}",
-            status.target_timestamp,
-            status.generated_noise_samples,
-            status.sync_buffer_samples,
-            self.last_operation.label(),
-            packets.join(",")
-        )
     }
 
     /// Flushes all state for a hard stream restart (decoder reset boundary).
@@ -499,6 +461,7 @@ impl NetEqCore {
     /// Returns `true` if the packet arrived after its playout slot had already
     /// passed (older than the current playout point), i.e. too late to be played.
     /// `now` is the packet's wall-clock arrival time.
+    #[cfg(test)]
     pub(crate) fn insert_packet(
         &mut self,
         now: Instant,
@@ -662,9 +625,7 @@ impl NetEqCore {
             let info = PacketArrivedInfo {
                 packet_length_samples,
                 main_timestamp: packet_timestamp,
-                main_sequence_number: sequence as u16,
                 is_cng_or_dtmf: false,
-                is_dtx: false,
                 buffer_flush,
             };
             let should_update_stats = !self.new_codec && !silence_resume;
@@ -732,6 +693,7 @@ impl NetEqCore {
     /// Parses the DRED region of `datagram`, caching a gap-bounded state for the
     /// decode loop. Returns the gap-bounded DRED span for recovery placement plus
     /// the packet's full available DRED horizon for diagnostics.
+    #[cfg(test)]
     fn parse_dred(
         &mut self,
         sequence: u32,
@@ -833,7 +795,7 @@ impl NetEqCore {
 
         let mut time_stretched = 0;
         match operation {
-            Operation::Normal | Operation::CodecInternalCng => self.do_normal(decoded_len),
+            Operation::Normal => self.do_normal(decoded_len),
             Operation::Merge => {
                 self.do_merge(decoded_len);
                 source = DecodedFrameSource::Expand;
@@ -893,10 +855,7 @@ impl NetEqCore {
         // Background noise tracks audio written straight from the decoder.
         if matches!(
             self.last_mode,
-            Mode::Normal
-                | Mode::AccelerateFail
-                | Mode::PreemptiveExpandFail
-                | Mode::CodecInternalCng
+            Mode::Normal | Mode::AccelerateFail | Mode::PreemptiveExpandFail
         ) {
             self.background_noise.update(self.sync_buffer.data());
         }
@@ -993,20 +952,17 @@ impl NetEqCore {
             .peek_next_packet()
             .map(|packet| PacketInfo {
                 timestamp: packet.timestamp,
-                is_dtx: false,
                 is_cng: false,
             });
         NetEqStatus {
             target_timestamp: self.sync_buffer.end_timestamp(),
             expand_mutefactor: self.expand.mute_factor(),
-            last_packet_samples: self.decoder_frame_length,
             next_packet,
             last_mode: self.last_mode,
             play_dtmf: false,
             generated_noise_samples: self.generated_noise_samples() as usize,
             packet_buffer_info: PacketBufferInfo {
                 dtx_or_cng: false,
-                num_samples: self.packet_buffer.num_samples(),
                 span_samples: self.packet_buffer.span_samples(false, &self.tick_timer),
                 span_samples_wait_time: self.packet_buffer.span_samples(true, &self.tick_timer),
                 num_packets: self.packet_buffer.num_packets(),
@@ -1038,7 +994,6 @@ impl NetEqCore {
             Operation::PreemptiveExpand => "below_target",
             Operation::Rfc3389CngNoPacket => "cng_no_packet",
             Operation::Rfc3389Cng => "cng",
-            Operation::CodecInternalCng => "codec_internal_cng",
             Operation::Dtmf => "dtmf",
             Operation::Undefined => "undefined",
         }
@@ -1071,7 +1026,7 @@ impl NetEqCore {
                 self.timestamp = end_timestamp;
                 return (operation, packet_list);
             }
-            Operation::Rfc3389CngNoPacket | Operation::CodecInternalCng => {
+            Operation::Rfc3389CngNoPacket => {
                 return (operation, packet_list);
             }
             Operation::Accelerate | Operation::FastAccelerate => {
@@ -1342,7 +1297,7 @@ impl NetEqCore {
             return;
         }
         let decoded = &self.decoded_buffer[..decoded_len];
-        if matches!(self.last_mode, Mode::Expand | Mode::CodecPlc) {
+        if matches!(self.last_mode, Mode::Expand) {
             // Resuming after concealment: unmute and cross-fade the seam.
             // `process_after_expand` reads/writes the sync buffer and resets
             // Expand internally (matching `Normal::Process`).
