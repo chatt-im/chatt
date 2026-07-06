@@ -958,12 +958,14 @@ fn data_dir() -> Option<PathBuf> {
 
 #[cfg(test)]
 fn test_data_dir() -> PathBuf {
-    use std::sync::OnceLock;
-    static DIR: OnceLock<PathBuf> = OnceLock::new();
-    DIR.get_or_init(|| {
-        std::env::temp_dir().join(format!("chatt-history-tests-{}", std::process::id()))
-    })
-    .clone()
+    thread_local! {
+        static DIR: tempfile::TempDir = tempfile::Builder::new()
+            .prefix("chatt-history-tests-")
+            .tempdir()
+            .expect("history test data dir");
+    }
+
+    DIR.with(|dir| dir.path().to_path_buf())
 }
 
 fn sanitize_alias(alias: &str) -> String {
