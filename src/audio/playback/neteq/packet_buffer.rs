@@ -187,11 +187,16 @@ impl PacketBuffer {
     /// Highest timestamp strictly below `timestamp`, used to size the DRED gap on
     /// insertion (the end of the most recent buffered audio before `timestamp`).
     pub(crate) fn next_lower_timestamp(&self, timestamp: u32) -> Option<u32> {
+        // `insert_packet` keeps the buffer in ascending timestamp order, so the
+        // timestamps strictly below `timestamp` form a prefix and the highest is
+        // the last of them. Scanning from the back and returning the first
+        // strictly-lower timestamp yields that maximum in O(1) for the common
+        // in-order insert, versus scanning the whole buffer.
         self.buffer
             .iter()
+            .rev()
             .map(|p| p.timestamp)
-            .filter(|&ts| ts < timestamp)
-            .max()
+            .find(|&ts| ts < timestamp)
     }
 
     pub(crate) fn peek_next_packet(&self) -> Option<&Packet> {
