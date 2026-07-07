@@ -286,24 +286,35 @@ impl DeviceTrait for Device {
             ));
         }
 
-        if let BufferSize::Fixed(n) = config.buffer_size {
-            if let SupportedBufferSize::Range { min, max } =
-                supported_render_quantum_range(config.sample_rate)
-            {
-                if !(min..=max).contains(&n) {
-                    return Err(Error::with_message(
-                        ErrorKind::UnsupportedConfig,
-                        format!(
-                            "Buffer size {n} is not in the supported render quantum range {min}..={max}"
-                        ),
-                    ));
+        let render_size_hint = match config.buffer_size {
+            BufferSize::Fixed(n) => {
+                if let SupportedBufferSize::Range { min, max } =
+                    supported_render_quantum_range(config.sample_rate)
+                {
+                    if !(min..=max).contains(&n) {
+                        return Err(Error::with_message(
+                            ErrorKind::UnsupportedConfig,
+                            format!(
+                                "Buffer size {n} is not in the supported render quantum range {min}..={max}"
+                            ),
+                        ));
+                    }
                 }
+                Some(n)
             }
-        }
+            BufferSize::TargetLatency(target) => {
+                let frames = BufferSize::frames_for_latency(target, config.sample_rate);
+                Some(match supported_render_quantum_range(config.sample_rate) {
+                    SupportedBufferSize::Range { min, max } => frames.clamp(min, max),
+                    SupportedBufferSize::Unknown => frames,
+                })
+            }
+            BufferSize::Default => None,
+        };
 
         let stream_opts = web_sys::AudioContextOptions::new();
         stream_opts.set_sample_rate(config.sample_rate as f32);
-        if let BufferSize::Fixed(n) = config.buffer_size {
+        if let Some(n) = render_size_hint {
             let _ = js_sys::Reflect::set(
                 stream_opts.as_ref(),
                 &JsValue::from_str("renderSizeHint"),
@@ -340,9 +351,8 @@ impl DeviceTrait for Device {
         }
         destination.set_channel_count(config.channels as u32);
 
-        let initial_quantum = actual_render_quantum.unwrap_or(match config.buffer_size {
-            BufferSize::Fixed(n) => n as u64,
-            BufferSize::Default => DEFAULT_RENDER_SIZE,
+        let initial_quantum = actual_render_quantum.unwrap_or_else(|| {
+            render_size_hint.unwrap_or(DEFAULT_RENDER_SIZE as FrameCount) as u64
         });
         let buffer_size_frames = Arc::new(AtomicU64::new(initial_quantum));
         let buffer_size_frames_cb = buffer_size_frames.clone();

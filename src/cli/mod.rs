@@ -428,7 +428,7 @@ fn dispatch(matches: &Matches) -> Result<(), Box<dyn std::error::Error>> {
                 config
                     .audio
                     .input_buffer
-                    .to_request(config::DEFAULT_INPUT_BUFFER_SAMPLES),
+                    .to_request(config::DEFAULT_INPUT_TARGET_LATENCY),
             )?;
             Ok(())
         }
@@ -438,7 +438,7 @@ fn dispatch(matches: &Matches) -> Result<(), Box<dyn std::error::Error>> {
                 config
                     .audio
                     .output_buffer
-                    .to_request(config::DEFAULT_OUTPUT_BUFFER_SAMPLES),
+                    .to_request(config::DEFAULT_OUTPUT_TARGET_LATENCY),
             )?;
             Ok(())
         }
@@ -540,7 +540,7 @@ fn run_audio_playback_test(
         buffer_request: config
             .audio
             .output_buffer
-            .to_request(config::DEFAULT_OUTPUT_BUFFER_SAMPLES),
+            .to_request(config::DEFAULT_OUTPUT_TARGET_LATENCY),
         tuning: config.audio.latency.to_tuning(),
         packet_loss,
         seed,

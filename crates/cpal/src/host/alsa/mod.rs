@@ -401,7 +401,7 @@ impl Device {
 
         let handle = open_pcm(&self.pcm_id, stream_type)?;
 
-        let hw_params = set_hw_params_from_format(&handle, conf, sample_format)?;
+        let hw_params = set_hw_params_from_format(&handle, conf, sample_format, stream_type)?;
         let (buffer_size, period_size) = set_sw_params_from_format(&handle, stream_type)?;
         if buffer_size == 0 || period_size == 0 {
             return Err(ErrorKind::DeviceNotAvailable.into());
@@ -1607,14 +1607,33 @@ fn set_hw_params_from_format(
     pcm_handle: &alsa::pcm::PCM,
     config: StreamConfig,
     sample_format: SampleFormat,
+    stream_type: alsa::Direction,
 ) -> Result<alsa::pcm::HwParams<'_>, Error> {
     let hw_params = init_hw_params(pcm_handle, config, sample_format)?;
 
-    // When BufferSize::Fixed(x) is specified, we configure double-buffering with
-    // buffer_size = 2x and period_size = x. This provides consistent low-latency
+    // Resolve the requested period in frames. A latency target is converted at
+    // the stream rate; on a playback stream it is snapped to a power of two so
+    // the period aligns to the sink/graph clock (reproducing the rounding an
+    // ADJUST_LATENCY-style server would apply — pipewire-alsa otherwise grants
+    // our exact request and forces the shared graph quantum). Capture keeps the
+    // raw frame, matching WebRTC's fixed capture frame.
+    let requested_period = match config.buffer_size {
+        BufferSize::Fixed(period_size) => Some(period_size as alsa::pcm::Frames),
+        BufferSize::TargetLatency(target) => {
+            let mut frames = BufferSize::frames_for_latency(target, config.sample_rate);
+            if stream_type == alsa::Direction::Playback {
+                frames = crate::nearest_power_of_two(frames);
+            }
+            Some(frames as alsa::pcm::Frames)
+        }
+        BufferSize::Default => None,
+    };
+
+    // When an explicit period is requested, configure double-buffering with
+    // buffer_size = 2 * period_size. This provides consistent low-latency
     // behavior across different ALSA implementations and hardware.
-    if let BufferSize::Fixed(period_size) = config.buffer_size {
-        let mut period_size = period_size as alsa::pcm::Frames;
+    if let Some(period_size) = requested_period {
+        let mut period_size = period_size;
 
         // Clamp the request into the device's supported period range rather than failing.
         // ALSA hardware advertises a discrete period range (often power-of-two bound), so an

@@ -1455,6 +1455,8 @@ fn shared_mode_period_frames(
 fn buffer_size_to_duration(buffer_size: &BufferSize, sample_rate: SampleRate) -> i64 {
     match buffer_size {
         BufferSize::Fixed(frames) => *frames as i64 * (1_000_000_000 / 100) / sample_rate as i64,
+        // REFERENCE_TIME is expressed in 100 ns units.
+        BufferSize::TargetLatency(target) => (target.as_nanos() / 100) as i64,
         BufferSize::Default => 0,
     }
 }

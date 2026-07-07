@@ -3,8 +3,8 @@ use crate::{
     config::{
         AudioConfig, AudioLatencyConfig, BufferSize, DEFAULT_DENOISE_RELEASE,
         DEFAULT_DENOISE_SUPPRESSION, DEFAULT_DENOISE_TYPING_VAD_ENTER,
-        DEFAULT_DENOISE_TYPING_VAD_RELEASE, DEFAULT_INPUT_BUFFER_SAMPLES,
-        DEFAULT_MAX_AMPLIFICATION, DEFAULT_OUTPUT_BUFFER_SAMPLES, FileConfig, FormBindings,
+        DEFAULT_DENOISE_TYPING_VAD_RELEASE, DEFAULT_INPUT_TARGET_LATENCY,
+        DEFAULT_MAX_AMPLIFICATION, DEFAULT_OUTPUT_TARGET_LATENCY, FileConfig, FormBindings,
         HistoryConfig, NotificationConfig, P2pConfig, ThemeChoice, WebAutoplay, WebConfig,
     },
     paths,
@@ -327,11 +327,11 @@ impl SettingsDraft {
     }
 
     pub fn input_buffer_request(&self) -> BufferRequest {
-        parse_buffer_size(&self.input_buffer).to_request(DEFAULT_INPUT_BUFFER_SAMPLES)
+        parse_buffer_size(&self.input_buffer).to_request(DEFAULT_INPUT_TARGET_LATENCY)
     }
 
     pub fn output_buffer_request(&self) -> BufferRequest {
-        parse_buffer_size(&self.output_buffer).to_request(DEFAULT_OUTPUT_BUFFER_SAMPLES)
+        parse_buffer_size(&self.output_buffer).to_request(DEFAULT_OUTPUT_TARGET_LATENCY)
     }
 
     pub fn max_amplification(&self) -> f32 {

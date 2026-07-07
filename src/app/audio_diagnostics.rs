@@ -241,6 +241,7 @@ mod tests {
                 device_rate: 48_000,
                 buffer_size: "256 frames".to_string(),
                 buffer_note: String::new(),
+                acquired_buffer_frames: Some(256),
                 buffer_fallback: false,
             }),
             Some(AudioDeviceInfo {
@@ -252,6 +253,7 @@ mod tests {
                 device_rate: 48_000,
                 buffer_size: "host default".to_string(),
                 buffer_note: String::new(),
+                acquired_buffer_frames: None,
                 buffer_fallback: true,
             }),
             vec![
@@ -264,7 +266,11 @@ mod tests {
         let body = report.notice_body();
         assert!(body.contains("devices\n"));
         assert!(body.contains("input: ALSA / Built-in Microphone (default)"));
+        // Requested and acquired periods render side by side; the acquired
+        // fragment is omitted when the backend reports none.
+        assert!(body.contains("buffer 256 frames, acquired 256 fr / 5.3 ms"));
         assert!(body.contains("output: ALSA / Built-in Speaker"));
+        assert!(body.contains("buffer host default (fallback)"));
         assert!(body.contains("playback\n"));
         assert!(body.contains("callback: 12 calls, 1 overruns, max 1.2ms"));
         assert!(body.contains("neteq lock waits 300us total / 250us max / 2"));

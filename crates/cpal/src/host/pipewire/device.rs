@@ -91,6 +91,33 @@ pub struct Device {
 }
 
 impl Device {
+    fn target_latency_frames(
+        direction: DeviceDirection,
+        target: Duration,
+        sample_rate: SampleRate,
+    ) -> FrameCount {
+        let frames = BufferSize::frames_for_latency(target, sample_rate);
+        if direction == DeviceDirection::Output {
+            crate::nearest_power_of_two(frames)
+        } else {
+            frames
+        }
+    }
+
+    fn requested_quantum(
+        direction: DeviceDirection,
+        buffer_size: BufferSize,
+        sample_rate: SampleRate,
+    ) -> Option<FrameCount> {
+        match buffer_size {
+            BufferSize::Fixed(frames) => Some(frames),
+            BufferSize::TargetLatency(target) => {
+                Some(Self::target_latency_frames(direction, target, sample_rate))
+            }
+            BufferSize::Default => None,
+        }
+    }
+
     pub(crate) fn class(&self) -> Class {
         self.class
     }
@@ -204,10 +231,18 @@ impl Device {
             format!("cpal-{}-{}", std::process::id(), self.clock_group_key()),
         );
 
-        if let BufferSize::Fixed(buffer_size) = config.buffer_size {
+        // `node.latency = frames/rate` sets this node's quantum. PipeWire honors
+        // it *exactly* (it does not round to a power of two), so a playback
+        // TargetLatency is snapped here to align the sink/graph quantum to a
+        // power of two — matching what a hardware period runs on. Capture keeps
+        // the raw frame (WebRTC's fixed capture frame); Fixed is honored
+        // verbatim. The negotiated quantum is reported back via `last_quantum`.
+        let node_latency_frames =
+            Self::requested_quantum(direction, config.buffer_size, config.sample_rate);
+        if let Some(frames) = node_latency_frames {
             properties.insert(
                 *pw::keys::NODE_LATENCY,
-                format!("{buffer_size}/{rate}", rate = config.sample_rate),
+                format!("{frames}/{rate}", rate = config.sample_rate),
             );
         }
         properties
@@ -400,10 +435,12 @@ impl DeviceTrait for Device {
         let waiter = latch.waiter();
         let device = self.clone();
         let wait_timeout = timeout.unwrap_or(Duration::from_secs(2));
-        let initial_quantum = match config.buffer_size {
-            BufferSize::Fixed(n) => n as u64,
-            BufferSize::Default => self.quantum as u64,
-        };
+        let initial_quantum = Self::requested_quantum(
+            DeviceDirection::Input,
+            config.buffer_size,
+            config.sample_rate,
+        )
+        .unwrap_or(self.quantum) as u64;
         let last_quantum = Arc::new(AtomicU64::new(initial_quantum));
         let last_quantum_clone = last_quantum.clone();
         let start = std::time::Instant::now();
@@ -573,10 +610,12 @@ impl DeviceTrait for Device {
         let waiter = latch.waiter();
         let device = self.clone();
         let wait_timeout = timeout.unwrap_or(Duration::from_secs(2));
-        let initial_quantum = match config.buffer_size {
-            BufferSize::Fixed(n) => n as u64,
-            BufferSize::Default => self.quantum as u64,
-        };
+        let initial_quantum = Self::requested_quantum(
+            DeviceDirection::Output,
+            config.buffer_size,
+            config.sample_rate,
+        )
+        .unwrap_or(self.quantum) as u64;
         let last_quantum = Arc::new(AtomicU64::new(initial_quantum));
         let last_quantum_clone = last_quantum.clone();
         let start = std::time::Instant::now();
@@ -1249,6 +1288,39 @@ mod test {
         let rate_str = r#"  { 44100, 48000, 88200, 96000 ,176400 ,192000 } "#;
         let rates = parse_allow_rates(rate_str);
         assert_eq!(rates, None);
+    }
+
+    #[test]
+    fn target_latency_snaps_playback_node_latency_to_power_of_two() {
+        use crate::{BufferSize, DeviceDirection, StreamConfig};
+        let config = |buffer_size| StreamConfig {
+            channels: 2,
+            sample_rate: 48_000,
+            buffer_size,
+        };
+        let ten_ms = BufferSize::TargetLatency(std::time::Duration::from_millis(10));
+
+        // Playback: 10 ms (480 frames) snaps up to a 512 power-of-two quantum so
+        // the sink/graph quantum aligns to a hardware period.
+        let out = Device::output_default().pw_properties(DeviceDirection::Output, &config(ten_ms));
+        assert_eq!(out.get(*super::pw::keys::NODE_LATENCY), Some("512/48000"));
+        assert_eq!(
+            Device::requested_quantum(DeviceDirection::Output, ten_ms, 48_000),
+            Some(512)
+        );
+
+        // Capture keeps the raw 10 ms frame (WebRTC's fixed capture frame).
+        let inp = Device::input_default().pw_properties(DeviceDirection::Input, &config(ten_ms));
+        assert_eq!(inp.get(*super::pw::keys::NODE_LATENCY), Some("480/48000"));
+        assert_eq!(
+            Device::requested_quantum(DeviceDirection::Input, ten_ms, 48_000),
+            Some(480)
+        );
+
+        // An explicit Fixed request is honored verbatim, never snapped.
+        let fixed = Device::output_default()
+            .pw_properties(DeviceDirection::Output, &config(BufferSize::Fixed(480)));
+        assert_eq!(fixed.get(*super::pw::keys::NODE_LATENCY), Some("480/48000"));
     }
 
     #[test]
