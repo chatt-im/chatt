@@ -1116,6 +1116,11 @@ impl Server {
         if self.live_token_for_session(hello.session_id).is_none() {
             return Err("video session is not active".to_string());
         }
+        let session_mode = self
+            .sessions
+            .get(&hello.session_id)
+            .map(|session| session.transport.mode)
+            .ok_or_else(|| "video session is not active".to_string())?;
         let in_voice_room = self
             .sessions
             .get(&hello.session_id)
@@ -1132,10 +1137,11 @@ impl Server {
             _ => return Err("video session is not authorized for this stream".to_string()),
         };
         let (send, recv) = derive_video_keys(&secret, VideoKeyRole::Server);
-        // The server runs one transport mode: native seals video records with the
-        // per-stream keys; external-link leaves them clear (the outer link
-        // secures the wire) and authenticates setup with a proof instead.
-        let record = match self.config.transport_mode() {
+        // The connection inherits its owning session's negotiated mode: native
+        // seals video records with the per-stream keys; external-link leaves them
+        // clear (the outer link secures the wire) and authenticates setup with a
+        // proof instead.
+        let record = match session_mode {
             TransportMode::NativeEncrypted => RecordProtection::aead(send, recv),
             TransportMode::ExternalSecureLink => RecordProtection::clear(),
         };
@@ -1161,7 +1167,6 @@ impl Server {
     }
 
     fn handle_video_auth(&mut self, token: Token, record: &[u8]) -> Result<(), String> {
-        let mode = self.config.transport_mode();
         // Phase 1: read the connection identity and prove possession. Native
         // proves it by opening the AEAD auth record; external-link verifies a
         // compact HMAC proof under the session's video auth key.
@@ -1193,22 +1198,22 @@ impl Server {
             }
             (session_id, stream_id, role)
         };
-        if mode == TransportMode::ExternalSecureLink {
-            let video_auth_key = self
-                .sessions
-                .get(&session_id)
-                .map(|session| session.transport.video_auth_key)
-                .ok_or_else(|| "video auth session missing".to_string())?;
-            if !video::video_auth_proof_verify(
+        let (mode, video_auth_key) = self
+            .sessions
+            .get(&session_id)
+            .map(|session| (session.transport.mode, session.transport.video_auth_key))
+            .ok_or_else(|| "video auth session missing".to_string())?;
+        if mode == TransportMode::ExternalSecureLink
+            && !video::video_auth_proof_verify(
                 &video_auth_key,
                 session_id,
                 stream_id,
                 role,
                 mode,
                 record,
-            ) {
-                return Err("video auth proof failed".to_string());
-            }
+            )
+        {
+            return Err("video auth proof failed".to_string());
         }
         // Phase 2: ack and attach.
         let client = self
@@ -5768,11 +5773,7 @@ mod tests {
     }
 
     fn clear_client(route_id: u32, bind_key: [u8; KEY_LEN]) -> media::MediaProtection {
-        media::MediaProtection::Clear {
-            route_id,
-            bind_key,
-            mode: TransportMode::ExternalSecureLink,
-        }
+        media::MediaProtection::Clear { route_id, bind_key }
     }
 
     #[test]
