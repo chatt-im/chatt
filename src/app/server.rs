@@ -61,6 +61,7 @@ pub(crate) struct ServerSelectItem {
     pub(crate) label: String,
     pub(crate) username: String,
     pub(crate) tcp_addr: String,
+    pub(crate) require_native_encryption: bool,
     pub(crate) search_text: String,
 }
 
