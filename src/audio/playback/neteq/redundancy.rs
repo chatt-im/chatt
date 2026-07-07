@@ -10,13 +10,14 @@
 //! everything by timestamp, so the decision logic and Expand/Merge stay blind to
 //! whether a unit is primary, FEC, or DRED.
 //!
-//! This module is pure: the CPU-bound Opus/DRED decode runs later in the
-//! `GetAudio` loop. The DRED span is supplied as [`DredInfo`] (the result of
-//! `WebRtcOpus_DredParse`) so placement is unit-testable without the codec.
+//! This module is pure: the CPU-bound Opus/DRED preparation is supplied as
+//! [`DredInfo`] plus a processed [`DredState`], so placement remains
+//! unit-testable without the codec.
 
 use std::sync::Arc;
 
 use super::packet::{Packet, PacketPayload, Priority};
+use opus_codec::DredState;
 
 /// One 10 ms DRED chunk at 48 kHz.
 const DRED_CHUNK_SAMPLES: u32 = 480;
@@ -56,6 +57,7 @@ pub(crate) fn parse_payload_redundancy(
     primary_duration: u32,
     fec: Option<FecInfo>,
     dred: Option<DredInfo>,
+    dred_state: Option<Arc<DredState>>,
 ) -> Vec<Packet> {
     let mut results = Vec::new();
     let mut begin_timestamp = timestamp;
@@ -72,7 +74,7 @@ pub(crate) fn parse_payload_redundancy(
     }
 
     if current_gap > 0 {
-        if let Some(dred) = dred {
+        if let (Some(dred), Some(dred_state)) = (dred, dred_state) {
             // Only latent-backed chunks are worth emitting: a span that is all
             // trailing silence (`dred_end >= samples`, i.e. zero latents) has
             // nothing to decode. Placement stays adjacent to the packet — decode
@@ -106,7 +108,7 @@ pub(crate) fn parse_payload_redundancy(
                         Priority::new(2, 0),
                         DRED_CHUNK_SAMPLES as usize,
                         PacketPayload::Dred {
-                            source: Arc::clone(&datagram),
+                            state: Arc::clone(&dred_state),
                             offset,
                         },
                     ));
@@ -134,6 +136,10 @@ mod tests {
         Arc::new(vec![9u8; 16])
     }
 
+    fn dred_state_for(dred: Option<DredInfo>) -> Option<Arc<DredState>> {
+        dred.map(|_| Arc::new(DredState::new().expect("DRED state")))
+    }
+
     fn descriptors(packets: &[Packet]) -> Vec<(u32, i32)> {
         // (timestamp, codec_level) for each emitted packet.
         packets
@@ -144,7 +150,7 @@ mod tests {
 
     #[test]
     fn no_gap_emits_only_primary() {
-        let packets = parse_payload_redundancy(9600, 10, datagram(), 0, 960, None, None);
+        let packets = parse_payload_redundancy(9600, 10, datagram(), 0, 960, None, None, None);
         assert_eq!(descriptors(&packets), vec![(9600, 0)]);
     }
 
@@ -156,7 +162,16 @@ mod tests {
             samples: 2880,
             dred_end: 0,
         });
-        let packets = parse_payload_redundancy(9600, 10, datagram(), 1920, 960, None, dred);
+        let packets = parse_payload_redundancy(
+            9600,
+            10,
+            datagram(),
+            1920,
+            960,
+            None,
+            dred,
+            dred_state_for(dred),
+        );
         assert_eq!(
             descriptors(&packets),
             vec![
@@ -182,11 +197,30 @@ mod tests {
             samples: 4800,
             dred_end: 0,
         });
-        let packets = parse_payload_redundancy(9600, 10, datagram(), 960, 960, None, dred);
+        let packets = parse_payload_redundancy(
+            9600,
+            10,
+            datagram(),
+            960,
+            960,
+            None,
+            dred,
+            dred_state_for(dred),
+        );
         assert_eq!(
             descriptors(&packets),
             vec![(9600 - 2 * 480, 2), (9600 - 480, 2), (9600, 0)]
         );
+    }
+
+    #[test]
+    fn dred_info_without_prepared_state_emits_only_primary() {
+        let dred = Some(DredInfo {
+            samples: 2880,
+            dred_end: 0,
+        });
+        let packets = parse_payload_redundancy(9600, 10, datagram(), 1920, 960, None, dred, None);
+        assert_eq!(descriptors(&packets), vec![(9600, 0)]);
     }
 
     #[test]
@@ -198,14 +232,32 @@ mod tests {
             samples: 2880,
             dred_end: 2880,
         });
-        let packets = parse_payload_redundancy(9600, 10, datagram(), 1920, 960, None, dred);
+        let packets = parse_payload_redundancy(
+            9600,
+            10,
+            datagram(),
+            1920,
+            960,
+            None,
+            dred,
+            dred_state_for(dred),
+        );
         assert_eq!(descriptors(&packets), vec![(9600, 0)]);
 
         let dred = Some(DredInfo {
             samples: 960,
             dred_end: 2880,
         });
-        let packets = parse_payload_redundancy(9600, 10, datagram(), 1920, 960, None, dred);
+        let packets = parse_payload_redundancy(
+            9600,
+            10,
+            datagram(),
+            1920,
+            960,
+            None,
+            dred,
+            dred_state_for(dred),
+        );
         assert_eq!(descriptors(&packets), vec![(9600, 0)]);
     }
 
@@ -220,7 +272,16 @@ mod tests {
             samples: 2880,
             dred_end: 960,
         });
-        let packets = parse_payload_redundancy(9600, 10, datagram(), 2880, 960, None, dred);
+        let packets = parse_payload_redundancy(
+            9600,
+            10,
+            datagram(),
+            2880,
+            960,
+            None,
+            dred,
+            dred_state_for(dred),
+        );
         assert_eq!(
             descriptors(&packets),
             vec![
@@ -248,6 +309,7 @@ mod tests {
             960,
             Some(FecInfo { duration: 960 }),
             None,
+            None,
         );
         assert_eq!(descriptors(&packets), vec![(8640, 1), (9600, 0)]);
     }
@@ -268,6 +330,7 @@ mod tests {
             960,
             Some(FecInfo { duration: 960 }),
             dred,
+            dred_state_for(dred),
         );
         let dred_ts: Vec<u32> = packets
             .iter()

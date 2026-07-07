@@ -74,6 +74,10 @@ const DEFAULT_FRAME_SAMPLES: usize = LIVE_OPUS_FRAME_SAMPLES;
 const MAX_PACKETS_IN_BUFFER: usize = 200;
 /// One DRED chunk, 10 ms at 48 kHz.
 const DRED_CHUNK_SAMPLES: usize = SAMPLE_RATE as usize / 100;
+/// Look far enough ahead to cover the current device callback plus one worker
+/// drain. This catches an imminent DRED pull without keeping assist active for a
+/// deeply buffered future recovery.
+const DRED_ASSIST_LOOKAHEAD_SAMPLES: usize = 6 * OUTPUT_SIZE_SAMPLES;
 /// How far a sequence-advancing packet's timestamp may trail the playout point
 /// before it is treated as a sender media-clock rebase (capture restart) rather
 /// than late data. Must stay well above the silence-gate preroll back-dating
@@ -110,6 +114,7 @@ pub(crate) struct NetEqDiagnostics {
     pub dred_last_horizon_ms: u64,
     pub dred_missed_horizon_count: u64,
     pub dred_missed_horizon_ms: u64,
+    pub dred_near_playout: bool,
 }
 
 /// Cheap state the worker snapshots before preparing a packet outside the
@@ -120,20 +125,32 @@ pub(crate) struct NetEqInsertContext {
     pub dred_enabled: bool,
 }
 
-/// One cached DRED parse, reused across the 10 ms chunks recovered from the same
-/// packet (mirrors the previous live path's `DredGapState`). The core keeps one
-/// slot alive for the stream's lifetime so a callback-side re-parse reuses the
-/// existing `DredState` allocation via [`DredState::reset`]. `sequence` is
-/// `None` while the slot holds no valid parse.
-struct DredParse {
+/// Small callback-side PCM cache for the final two DRED chunks recovered from
+/// the same packet. The CPU-heavy DRED state processing is done at insertion;
+/// this cache only preserves the 20 ms final decode used for clean splices.
+struct DredDecodeCache {
     sequence: Option<u32>,
-    state: DredState,
-    processed: bool,
     /// Final-pair PCM: the last two 10 ms chunks decoded as one 20 ms deep-PLC
     /// call, keyed by `span` (the anchor offset of the pair's start). Capacity
     /// is reserved off the audio callback so the fill does not allocate.
     pcm: Vec<i16>,
     span: usize,
+}
+
+impl DredDecodeCache {
+    fn new() -> Self {
+        Self {
+            sequence: None,
+            pcm: Vec::with_capacity(2 * DRED_CHUNK_SAMPLES),
+            span: 0,
+        }
+    }
+
+    fn reset(&mut self) {
+        self.sequence = None;
+        self.pcm.clear();
+        self.span = 0;
+    }
 }
 
 /// Extra parse span beyond the recovery gap, in samples. The deep-PLC synthesis
@@ -151,7 +168,6 @@ pub(crate) struct NetEqPreparedPacket {
     sequence: u32,
     flags: u8,
     packets: Vec<Packet>,
-    dred_parse: Option<DredParse>,
     available_horizon_samples: u32,
 }
 
@@ -168,7 +184,7 @@ impl NetEqPreparedPacket {
             return None;
         }
         let fec = NetEqCore::parse_fec(datagram.as_slice());
-        let (dred, dred_parse, available_horizon_samples) = if context.dred_enabled {
+        let (dred, dred_state, available_horizon_samples) = if context.dred_enabled {
             NetEqCore::parse_dred_for_insert(dred_decoder, sequence, &datagram, context.current_gap)
         } else {
             (None, None, 0)
@@ -181,6 +197,7 @@ impl NetEqPreparedPacket {
             DEFAULT_FRAME_SAMPLES as u32,
             fec,
             dred,
+            dred_state,
         );
         if flags & LIVE_PACKET_FLAG_MUTE != 0
             && let Some(primary) = packets
@@ -195,7 +212,6 @@ impl NetEqPreparedPacket {
             sequence,
             flags,
             packets,
-            dred_parse,
             available_horizon_samples,
         })
     }
@@ -220,7 +236,7 @@ pub(crate) struct NetEqCore {
     decision_logic: DecisionLogic,
     decoder: Decoder,
     dred_decoder: Option<DredDecoder>,
-    dred_parse: Option<DredParse>,
+    dred_decode_cache: DredDecodeCache,
     /// The packet-loss concealment generator. Shares `background_noise` and
     /// `random_vector` with the time-stretch ops, exactly as WebRTC does.
     expand: Expand,
@@ -306,27 +322,7 @@ impl NetEqCore {
         {
             return Err("invalid NetEQ delay constraints".to_string());
         }
-        // The parse slot is created eagerly so the callback-side DRED fallback
-        // reuses its allocation via reset() instead of opus_dred_alloc. DRED is
-        // disabled outright if the state cannot be allocated, keeping the
-        // "decoder present implies slot present" invariant.
-        let mut dred_decoder = DredDecoder::new().ok();
-        let dred_parse = match &dred_decoder {
-            Some(_) => match DredState::new() {
-                Ok(state) => Some(DredParse {
-                    sequence: None,
-                    state,
-                    processed: false,
-                    pcm: Vec::with_capacity(2 * DRED_CHUNK_SAMPLES),
-                    span: 0,
-                }),
-                Err(_) => {
-                    dred_decoder = None;
-                    None
-                }
-            },
-            None => None,
-        };
+        let dred_decoder = DredDecoder::new().ok();
         Ok(Self {
             tick_timer,
             wall_origin: None,
@@ -337,7 +333,7 @@ impl NetEqCore {
             decoder: Decoder::new(SampleRate::Hz48000, Channels::Mono)
                 .map_err(|error| error.to_string())?,
             dred_decoder,
-            dred_parse,
+            dred_decode_cache: DredDecodeCache::new(),
             expand: Expand::new(),
             background_noise: BackgroundNoise::new(),
             random_vector: RandomVector::new(),
@@ -423,7 +419,22 @@ impl NetEqCore {
             dred_last_horizon_ms: samples_to_ms(self.dred_last_horizon_samples),
             dred_missed_horizon_count: self.dred_missed_horizon_count,
             dred_missed_horizon_ms: samples_to_ms(self.dred_missed_horizon_samples as usize),
+            dred_near_playout: self.dred_recovery_near_playout(),
         }
+    }
+
+    /// Worker-side predictor for callback DRED cost. The expensive path is
+    /// reached only once buffered DRED is close to both the packet-buffer front
+    /// and the sync-buffer playout edge.
+    pub(crate) fn dred_recovery_near_playout(&self) -> bool {
+        let playable_future = self
+            .sync_buffer
+            .future_length()
+            .saturating_sub(EXPAND_OVERLAP_LENGTH);
+        playable_future <= DRED_ASSIST_LOOKAHEAD_SAMPLES
+            && self
+                .packet_buffer
+                .dred_within_front_span(DRED_ASSIST_LOOKAHEAD_SAMPLES)
     }
 
     /// Flushes all state for a hard stream restart (decoder reset boundary).
@@ -439,11 +450,7 @@ impl NetEqCore {
         self.new_codec = false;
         self.reset_decoder = false;
         self.generated_noise_stopwatch = None;
-        if let Some(parse) = &mut self.dred_parse {
-            // Invalidate rather than drop: the state allocation is reused and
-            // flush must stay allocation/free-free for callers under the lock.
-            parse.sequence = None;
-        }
+        self.dred_decode_cache.reset();
         self.mute_gain = 1.0;
         self.mute_target = 1.0;
         self.last_operation = Operation::Normal;
@@ -554,7 +561,6 @@ impl NetEqCore {
             prepared
                 .packets
                 .retain(|packet| packet.priority.codec_level != 2);
-            prepared.dred_parse = None;
         }
         if sequence_advanced {
             self.last_sequence = Some(sequence);
@@ -587,10 +593,6 @@ impl NetEqCore {
                 .dred_missed_horizon_samples
                 .saturating_add(u64::from(current_gap - prepared.available_horizon_samples));
         }
-        if let Some(dred_parse) = prepared.dred_parse.take() {
-            self.dred_parse = Some(dred_parse);
-        }
-
         let main_timestamp = prepared
             .packets
             .first()
@@ -691,9 +693,9 @@ impl NetEqCore {
         })
     }
 
-    /// Parses the DRED region of `datagram`, caching a gap-bounded state for the
-    /// decode loop. Returns the gap-bounded DRED span for recovery placement plus
-    /// the packet's full available DRED horizon for diagnostics.
+    /// Parses the DRED region of `datagram`. Returns the gap-bounded DRED span
+    /// for recovery placement plus the packet's full available DRED horizon for
+    /// diagnostics.
     #[cfg(test)]
     fn parse_dred(
         &mut self,
@@ -701,24 +703,21 @@ impl NetEqCore {
         datagram: &Arc<Vec<u8>>,
         current_gap: u32,
     ) -> (Option<DredInfo>, u32) {
-        let (dred, dred_parse, available_horizon_samples) = Self::parse_dred_for_insert(
+        let (dred, _dred_state, available_horizon_samples) = Self::parse_dred_for_insert(
             self.dred_decoder.as_mut(),
             sequence,
             datagram,
             current_gap,
         );
-        if let Some(dred_parse) = dred_parse {
-            self.dred_parse = Some(dred_parse);
-        }
         (dred, available_horizon_samples)
     }
 
     fn parse_dred_for_insert(
         dred_decoder: Option<&mut DredDecoder>,
-        sequence: u32,
+        _sequence: u32,
         datagram: &Arc<Vec<u8>>,
         current_gap: u32,
-    ) -> (Option<DredInfo>, Option<DredParse>, u32) {
+    ) -> (Option<DredInfo>, Option<Arc<DredState>>, u32) {
         if current_gap == 0 {
             return (None, None, 0);
         }
@@ -726,7 +725,7 @@ impl NetEqCore {
             return (None, None, 0);
         };
         let available_horizon_samples =
-            Self::parse_dred_state(decoder, datagram, LIVE_PLAYBACK_DRED_MAX_SAMPLES)
+            Self::parse_dred_state(decoder, datagram, LIVE_PLAYBACK_DRED_MAX_SAMPLES, true)
                 .map(|(_, reach, _)| reach as u32)
                 .unwrap_or_default();
         let max_dred_samples = usize::try_from(current_gap)
@@ -734,26 +733,19 @@ impl NetEqCore {
             .saturating_add(DRED_PARSE_MARGIN_SAMPLES)
             .min(LIVE_PLAYBACK_DRED_MAX_SAMPLES);
         let Some((state, reach, dred_end)) =
-            Self::parse_dred_state(decoder, datagram, max_dred_samples)
+            Self::parse_dred_state(decoder, datagram, max_dred_samples, false)
         else {
             return (None, None, available_horizon_samples);
         };
         if reach == 0 {
             return (None, None, available_horizon_samples);
         }
-        let dred_parse = DredParse {
-            sequence: Some(sequence),
-            state,
-            processed: false,
-            pcm: Vec::with_capacity(2 * DRED_CHUNK_SAMPLES),
-            span: 0,
-        };
         (
             Some(DredInfo {
                 samples: reach as i32,
                 dred_end,
             }),
-            Some(dred_parse),
+            Some(Arc::new(state)),
             available_horizon_samples,
         )
     }
@@ -762,6 +754,7 @@ impl NetEqCore {
         decoder: &mut DredDecoder,
         datagram: &[u8],
         max_dred_samples: usize,
+        defer_processing: bool,
     ) -> Option<(DredState, usize, i32)> {
         let mut state = DredState::new().ok()?;
         let mut dred_end = 0;
@@ -772,7 +765,7 @@ impl NetEqCore {
                 max_dred_samples,
                 SampleRate::Hz48000,
                 &mut dred_end,
-                true,
+                defer_processing,
             )
             .unwrap_or(0);
         Some((state, reach, dred_end))
@@ -1207,8 +1200,8 @@ impl NetEqCore {
                 let output = &mut self.decoded_buffer[out_start..end];
                 self.decoder.decode(bytes, output, true).map_err(|_| ())
             }
-            PacketPayload::Dred { source, offset } => {
-                self.decode_dred(packet.sequence_number, source, *offset, out_start)
+            PacketPayload::Dred { state, offset } => {
+                self.decode_dred(packet.sequence_number, state, *offset, out_start)
             }
         }
     }
@@ -1216,44 +1209,20 @@ impl NetEqCore {
     fn decode_dred(
         &mut self,
         sequence: u32,
-        source: &Arc<Vec<u8>>,
+        state: &DredState,
         offset: i32,
         out_start: usize,
     ) -> Result<usize, ()> {
         let Some(dred_decoder) = self.dred_decoder.as_mut() else {
             return Ok(0);
         };
-        let parse = self.dred_parse.as_mut().ok_or(())?;
-        // Reuse the cached parse from insertion when it is for this packet.
-        // Otherwise re-parse into the same slot: reset() re-zeroes the existing
-        // DredState in place, so this fallback never touches the allocator.
-        if parse.sequence != Some(sequence) {
-            parse.state.reset();
-            let mut dred_end = 0;
-            let max_dred_samples = usize::try_from(offset.max(DRED_CHUNK_SAMPLES as i32))
-                .unwrap_or(usize::MAX)
-                .saturating_add(DRED_PARSE_MARGIN_SAMPLES)
-                .min(LIVE_PLAYBACK_DRED_MAX_SAMPLES);
-            let _ = dred_decoder.parse(
-                &mut parse.state,
-                source,
-                max_dred_samples,
-                SampleRate::Hz48000,
-                &mut dred_end,
-                true,
-            );
-            parse.sequence = Some(sequence);
-            parse.processed = false;
-            parse.pcm.clear();
-            parse.span = 0;
-        }
-        if !parse.processed {
-            dred_decoder
-                .process_in_place(&mut parse.state)
-                .map_err(|_| ())?;
-            parse.processed = true;
-        }
         let decoder = &mut self.decoder;
+        let cache = &mut self.dred_decode_cache;
+        if cache.sequence != Some(sequence) {
+            cache.sequence = Some(sequence);
+            cache.pcm.clear();
+            cache.span = 0;
+        }
         let end = (out_start + DRED_CHUNK_SAMPLES).min(self.decoded_buffer.len());
         let output = &mut self.decoded_buffer[out_start..end];
         let Ok(offset) = usize::try_from(offset) else {
@@ -1261,9 +1230,9 @@ impl NetEqCore {
         };
         // Serve the tail chunk from the pair cache when the previous pull
         // decoded it (see below).
-        if parse.span == offset + DRED_CHUNK_SAMPLES && parse.pcm.len() == 2 * DRED_CHUNK_SAMPLES {
+        if cache.span == offset + DRED_CHUNK_SAMPLES && cache.pcm.len() == 2 * DRED_CHUNK_SAMPLES {
             let served = output.len().min(DRED_CHUNK_SAMPLES);
-            output[..served].copy_from_slice(&parse.pcm[DRED_CHUNK_SAMPLES..][..served]);
+            output[..served].copy_from_slice(&cache.pcm[DRED_CHUNK_SAMPLES..][..served]);
             return Ok(served);
         }
         // The size of the deep-PLC call that ends at the anchor decides how
@@ -1275,18 +1244,18 @@ impl NetEqCore {
         // late real packet replacing a buffered chunk never leaves the decoder
         // state advanced past audio that actually played.
         if offset == 2 * DRED_CHUNK_SAMPLES {
-            parse.pcm.clear();
-            parse.pcm.resize(2 * DRED_CHUNK_SAMPLES, 0);
-            parse.span = offset;
+            cache.pcm.clear();
+            cache.pcm.resize(2 * DRED_CHUNK_SAMPLES, 0);
+            cache.span = offset;
             dred_decoder
-                .decode_into_i16(decoder, &parse.state, offset as i32, &mut parse.pcm)
+                .decode_into_i16(decoder, state, offset as i32, &mut cache.pcm)
                 .map_err(|_| ())?;
             let served = output.len().min(DRED_CHUNK_SAMPLES);
-            output[..served].copy_from_slice(&parse.pcm[..served]);
+            output[..served].copy_from_slice(&cache.pcm[..served]);
             return Ok(served);
         }
         dred_decoder
-            .decode_into_i16(decoder, &parse.state, offset as i32, output)
+            .decode_into_i16(decoder, state, offset as i32, output)
             .map_err(|_| ())
     }
 
@@ -2185,6 +2154,7 @@ mod tests {
             LIVE_OPUS_FRAME_SAMPLES as u32,
             Some(fec),
             None,
+            None,
         );
         let recovered = timestamp - LIVE_OPUS_FRAME_SAMPLES as u32;
         assert!(
@@ -2258,9 +2228,7 @@ mod tests {
             clock.advance_block();
             clock.advance_block();
             assert!(
-                core.dred_parse
-                    .as_ref()
-                    .is_none_or(|parse| parse.sequence.is_none()),
+                core.diagnostics().dred_last_horizon_ms == 0,
                 "zero-gap insert parsed DRED at seq {seq}",
             );
         }
@@ -2321,8 +2289,9 @@ mod tests {
 
         let mut dred_units = 0;
         while let Some(packet) = core.packet_buffer.get_next_packet() {
-            if matches!(packet.payload, PacketPayload::Dred { .. }) {
+            if let PacketPayload::Dred { state, .. } = packet.payload {
                 dred_units += 1;
+                assert_eq!(Arc::strong_count(&state), 1);
                 assert_eq!(packet.timestamp, timestamp - gap_samples);
                 assert_eq!(packet.duration_samples, DRED_CHUNK_SAMPLES);
             }
