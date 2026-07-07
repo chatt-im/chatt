@@ -883,10 +883,11 @@ impl LiveDecodeStream {
             flags
         };
         let datagram = Arc::new(opus);
-        let context = lock_shared_stream(&self.shared)
-            .core
-            .capture_insert_context(timestamp, sequence);
-        let Some(prepared) = NetEqPreparedPacket::prepare(
+        let context = {
+            let shared = lock_shared_stream(&self.shared);
+            shared.core.capture_insert_context(timestamp, sequence)
+        };
+        let Some(mut prepared) = NetEqPreparedPacket::prepare(
             context,
             timestamp,
             sequence,
@@ -898,13 +899,25 @@ impl LiveDecodeStream {
         };
         let mut shared = lock_shared_stream(&self.shared);
         shared.set_idle_expand_stats_suppressed(false);
-        if shared.core.capture_insert_context(timestamp, sequence) == prepared.context() {
-            return shared.core.insert_prepared_packet(now, prepared);
+        'insert: {
+            let new_context = shared.core.capture_insert_context(timestamp, sequence);
+            if new_context == prepared.context() {
+                break 'insert;
+            }
+            if let Some(new_prepared) = NetEqPreparedPacket::prepare(
+                new_context,
+                timestamp,
+                sequence,
+                effective_flags,
+                datagram,
+                self.dred_parser.as_mut(),
+            ) {
+                prepared = new_prepared;
+            } else {
+                return false;
+            }
         }
-
-        shared
-            .core
-            .insert_datagram(now, timestamp, sequence, effective_flags, datagram)
+        return shared.core.insert_prepared_packet(now, prepared);
     }
 
     pub(crate) fn observe_sender_silence(
