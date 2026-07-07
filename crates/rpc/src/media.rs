@@ -163,7 +163,6 @@ pub enum MediaProtection {
     Clear {
         route_id: u32,
         bind_key: [u8; crypto::KEY_LEN],
-        mode: TransportMode,
     },
 }
 
@@ -179,7 +178,6 @@ impl MediaProtection {
             TransportMode::ExternalSecureLink => MediaProtection::Clear {
                 route_id: transport.route_id,
                 bind_key: transport.bind_key,
-                mode: transport.mode,
             },
         }
     }
@@ -216,13 +214,16 @@ pub struct OpenedMedia {
 /// Domain-separated message covered by the external-link `Bind` proof. Binds the
 /// route id, UDP kind, counter, and selected mode so a proof cannot be replayed
 /// under a different session, kind, counter, or transport mode.
-fn bind_proof_message(route_id: u32, kind: u8, counter: u64, mode: TransportMode) -> [u8; 39] {
+fn bind_proof_message(route_id: u32, kind: u8, counter: u64) -> [u8; 39] {
     let mut msg = [0u8; 39];
     msg[0..25].copy_from_slice(b"chatt media bind proof v1");
     msg[25..29].copy_from_slice(&route_id.to_le_bytes());
     msg[29] = kind;
     msg[30..38].copy_from_slice(&counter.to_le_bytes());
-    msg[38] = mode.wire_id();
+    // Clear-mode media exists only under external-secure-link, so the mode id is
+    // a constant here; bind it into the proof for domain separation without
+    // threading a value that can only ever be one thing.
+    msg[38] = TransportMode::ExternalSecureLink.wire_id();
     msg
 }
 
@@ -276,9 +277,9 @@ pub fn seal_media_into(
             aad[1..].copy_from_slice(&packet[2..UDP_HEADER_LEN]);
             crypto::seal_in_place_append_tag(send, counter, &aad, cipher_start, packet)?;
         }
-        MediaProtection::Clear { bind_key, mode, .. } => {
+        MediaProtection::Clear { bind_key, .. } => {
             if kind == KIND_BIND {
-                let message = bind_proof_message(protection.route_id(), kind, counter, *mode);
+                let message = bind_proof_message(protection.route_id(), kind, counter);
                 packet.extend_from_slice(&crypto::auth_proof(bind_key, &message));
             }
         }
@@ -310,33 +311,38 @@ pub fn open_media(
             let plaintext_len =
                 crypto::open_in_place_with_aad(recv, header.counter, &aad, &mut buf)?;
             buf.truncate(plaintext_len);
+            // Decode before advancing replay state: authenticate fully, then
+            // commit, so a malformed payload never consumes a counter slot.
+            let payload = decode_payload(header.kind, &buf)?;
             if !replay.update(header.counter) {
                 return Err(MediaError::Replay);
             }
             Ok(OpenedMedia {
                 header,
-                payload: decode_payload(header.kind, &buf)?,
+                payload,
                 address_proof: AddressProof::AuthenticatedDatagram,
             })
         }
-        MediaProtection::Clear { bind_key, mode, .. } => {
+        MediaProtection::Clear { bind_key, .. } => {
             if header.kind == KIND_BIND {
                 if body.len() < crypto::AUTH_PROOF_LEN {
                     return Err(MediaError::InvalidPayload);
                 }
                 let split = body.len() - crypto::AUTH_PROOF_LEN;
                 let (payload_bytes, proof) = body.split_at(split);
-                let message =
-                    bind_proof_message(header.route_id, header.kind, header.counter, *mode);
+                let message = bind_proof_message(header.route_id, header.kind, header.counter);
                 if !crypto::auth_proof_verify(bind_key, &message, proof) {
                     return Err(MediaError::Crypto("bind proof mismatch".to_string()));
                 }
+                // Fully validate the datagram before advancing replay state, so a
+                // malformed payload never consumes a counter slot.
+                let payload = decode_payload(header.kind, payload_bytes)?;
                 if !replay.update(header.counter) {
                     return Err(MediaError::Replay);
                 }
                 Ok(OpenedMedia {
                     header,
-                    payload: decode_payload(header.kind, payload_bytes)?,
+                    payload,
                     address_proof: AddressProof::AuthenticatedAddressClaim,
                 })
             } else {
@@ -406,15 +412,20 @@ pub fn open_peer_media(
         return Err(CryptoError::WrongKeyId.into());
     }
 
-    let mut transport = Vec::with_capacity(crypto::TRANSPORT_HEADER_LEN + body.len());
-    transport.extend_from_slice(&header.route_id.to_le_bytes());
-    transport.extend_from_slice(&header.counter.to_le_bytes());
-    transport.extend_from_slice(body);
-    let (_, plaintext) = crypto::open_with_key(key, crypto::CHANNEL_MEDIA, &transport)?;
+    // Mirror `open_media`'s relay path: the header's route id and counter are
+    // authenticated as AAD rather than rebuilt into a synthetic transport frame,
+    // so a peer voice datagram opens with a single allocation on the hot path.
+    let mut buf = body.to_vec();
+    let mut aad = [0u8; 1 + crypto::TRANSPORT_HEADER_LEN];
+    aad[0] = crypto::CHANNEL_MEDIA;
+    aad[1..].copy_from_slice(&bytes[2..UDP_HEADER_LEN]);
+    let plaintext_len = crypto::open_in_place_with_aad(key, header.counter, &aad, &mut buf)?;
+    buf.truncate(plaintext_len);
+    let payload = decode_payload(header.kind, &buf)?;
     if !replay.update(header.counter) {
         return Err(MediaError::Replay);
     }
-    Ok((header, decode_payload(header.kind, &plaintext)?))
+    Ok((header, payload))
 }
 
 pub fn parse_header(bytes: &[u8]) -> Result<(UdpHeader, &[u8]), MediaError> {
@@ -844,7 +855,6 @@ mod tests {
         MediaProtection::Clear {
             route_id,
             bind_key: [3; crypto::KEY_LEN],
-            mode: TransportMode::ExternalSecureLink,
         }
     }
 
@@ -960,12 +970,10 @@ mod tests {
         let sender = MediaProtection::Clear {
             route_id: 9,
             bind_key: [1; crypto::KEY_LEN],
-            mode: TransportMode::ExternalSecureLink,
         };
         let receiver = MediaProtection::Clear {
             route_id: 9,
             bind_key: [2; crypto::KEY_LEN],
-            mode: TransportMode::ExternalSecureLink,
         };
         let packet = seal_media(&sender, 0, &MediaPayload::Bind).unwrap();
         let mut replay = AntiReplay::new();
