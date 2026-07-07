@@ -1,5 +1,3 @@
-use std::sync::OnceLock;
-
 use extui::{Buffer, Ellipsis, Rect, Style, vt::Modifier};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
@@ -20,9 +18,20 @@ const MIN_DETAIL_WIDTH: u16 = 96;
 const WELCOME_WIDTH: u16 = 104;
 const INTRO_HEIGHT: u16 = 8;
 const INTRO_DIALOG_GAP: u16 = 1;
+const LOGO_WIDTH: u16 = 22;
 const LOGO_TEXT_GAP: u16 = 2;
 const DIALOG_CHROME_HEIGHT: u16 = 3;
 const SETTINGS_SECTION: &str = "First Run Settings";
+const LOGO: [&str; 8] = [
+    "████▀████████████▀████",
+    "████  ▀▀██████▀▀  ████",
+    "████     ▀██▀     ████",
+    "████     ▄██▄     ████",
+    "████  ▄▄██████▄▄  ████",
+    "████▄████████████▄████",
+    "   █████▀▀",
+    "   █▀▀",
+];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum WelcomeButton {
@@ -342,9 +351,9 @@ fn draw_intro(area: Rect, buf: &mut Buffer, theme: &Theme, config_path: &str, da
         return;
     }
     let mut body = area;
-    let logo_width = logo_width().min(body.w);
+    let logo_width = LOGO_WIDTH.min(body.w);
     let logo = body.take_left(logo_width as i32);
-    for (row, line) in logo_text().lines().enumerate() {
+    for (row, line) in LOGO.iter().copied().enumerate() {
         if row as u16 >= logo.h {
             break;
         }
@@ -617,20 +626,6 @@ fn split_cells(text: &str, width: usize) -> (&str, &str) {
             .unwrap_or(text.len());
     }
     text.split_at(split)
-}
-
-fn logo_text() -> &'static str {
-    static LOGO: OnceLock<String> = OnceLock::new();
-    LOGO.get_or_init(|| std::fs::read_to_string("/tmp/box-drawing-logo.txt").unwrap_or_default())
-}
-
-fn logo_width() -> u16 {
-    logo_text()
-        .lines()
-        .map(UnicodeWidthStr::width)
-        .max()
-        .unwrap_or(0)
-        .min(u16::MAX as usize) as u16
 }
 
 #[cfg(test)]
