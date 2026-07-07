@@ -48,6 +48,8 @@ pub struct ServerEntry {
     pub token: String,
     #[toml(default)]
     pub server_public_key: String,
+    #[toml(default = true, ToToml skip_if = |value: &bool| *value)]
+    pub require_native_encryption: bool,
     #[toml(default, style = Header, ToToml skip_if = FileOverrides::is_empty)]
     pub files: FileOverrides,
     #[toml(default, style = Header, ToToml skip_if = HistoryOverrides::is_empty)]
@@ -66,6 +68,7 @@ impl Default for ServerEntry {
             username: "Alice".to_string(),
             token: "alice-dev-token".to_string(),
             server_public_key: String::new(),
+            require_native_encryption: true,
             files: FileOverrides::default(),
             history: HistoryOverrides::default(),
             rooms: Vec::new(),
@@ -82,6 +85,7 @@ impl ServerEntry {
             display_name: self.effective_display_name(),
             token: self.token.clone(),
             server_public_key: non_empty_string(&self.server_public_key),
+            require_native_encryption: self.require_native_encryption,
             file_policy: config.file_policy(self),
             max_upload_bytes: config.files.max_upload_bytes,
             upload_rate_bytes: config.files.upload_rate_bytes,
@@ -299,7 +303,7 @@ pub struct UiConfig {
     pub room_height: u16,
     #[toml(default = 6)]
     pub max_composer_height: u16,
-    #[toml(default = default_placeholder())]
+    #[toml(default = "Message #lobby".to_string())]
     pub placeholder: String,
     #[toml(default = 50_000)]
     pub max_messages: u32,
@@ -309,10 +313,6 @@ pub struct UiConfig {
     pub default_bindings: DefaultBindings,
     #[toml(default)]
     pub theme: ThemeChoice,
-}
-
-fn default_placeholder() -> String {
-    "Message #lobby".to_string()
 }
 
 /// The platform default URL opener: `open` on macOS, `xdg-open` on Linux, and
@@ -342,7 +342,7 @@ impl Default for UiConfig {
         Self {
             room_height: 4,
             max_composer_height: 6,
-            placeholder: default_placeholder(),
+            placeholder: "Message #lobby".to_string(),
             max_messages: 50_000,
             overscan: 24,
             default_bindings: DefaultBindings::Standard,
@@ -498,11 +498,11 @@ pub struct WebConfig {
     #[toml(default)]
     pub enabled: bool,
     /// The loopback address the web server binds.
-    #[toml(default = default_web_bind())]
+    #[toml(default = "127.0.0.1:8080".to_string())]
     pub bind: String,
     /// Whether the browser view is view-only. When `true` (the default) the page
     /// cannot send chat messages or files. Set `false` to enable the compose box.
-    #[toml(default = default_true())]
+    #[toml(default = true)]
     pub readonly: bool,
     /// Automatically play newly received videos. `true` uses muted playback so
     /// browsers can start it without interaction; `"with-audio"` also requests
@@ -519,7 +519,7 @@ impl Default for WebConfig {
     fn default() -> Self {
         Self {
             enabled: false,
-            bind: default_web_bind(),
+            bind: "127.0.0.1:8080".to_string(),
             readonly: true,
             autoplay: WebAutoplay::Disabled,
             viewer_in_seperate_browser_tab: false,
@@ -645,9 +645,9 @@ pub struct SoundboardClip {
 pub struct SoundboardConfig {
     #[toml(default)]
     pub enabled: bool,
-    #[toml(default = default_soundboard_loss())]
+    #[toml(default = "congested_wifi".to_string())]
     pub loss: String,
-    #[toml(default = default_soundboard_seed())]
+    #[toml(default = 0x746f_6d63_6861_7405)]
     pub seed: u64,
     #[toml(default, style = Header)]
     pub clips: Vec<SoundboardClip>,
@@ -657,8 +657,8 @@ impl Default for SoundboardConfig {
     fn default() -> Self {
         Self {
             enabled: false,
-            loss: default_soundboard_loss(),
-            seed: default_soundboard_seed(),
+            loss: "congested_wifi".to_string(),
+            seed: 0x746f_6d63_6861_7405,
             clips: Vec::new(),
         }
     }
@@ -674,14 +674,6 @@ impl SoundboardConfig {
     pub fn is_default(&self) -> bool {
         *self == SoundboardConfig::default()
     }
-}
-
-fn default_soundboard_loss() -> String {
-    "congested_wifi".to_string()
-}
-
-fn default_soundboard_seed() -> u64 {
-    0x746f_6d63_6861_7405
 }
 
 /// Selects which builtin color theme the UI renders with. A future custom mode
@@ -731,7 +723,7 @@ pub struct Config {
     /// appended as the final argument. Defaults to the platform launcher.
     #[toml(default = default_url_open(), ToToml skip_if = is_default_url_open)]
     pub url_open: Vec<String>,
-    #[toml(default = default_servers(), style = Header)]
+    #[toml(default = Vec::new(), style = Header)]
     pub servers: Vec<ServerEntry>,
     #[toml(default, style = Header)]
     pub audio: AudioConfig,
@@ -1281,18 +1273,6 @@ fn resolve_config_path(path: Option<&str>) -> Option<PathBuf> {
 
 fn default_server_alias() -> String {
     "local".to_string()
-}
-
-fn default_web_bind() -> String {
-    "127.0.0.1:8080".to_string()
-}
-
-fn default_true() -> bool {
-    true
-}
-
-fn default_servers() -> Vec<ServerEntry> {
-    Vec::new()
 }
 
 fn server_udp_addr_configured(doc: &toml_spanner::Document<'_>) -> Vec<bool> {

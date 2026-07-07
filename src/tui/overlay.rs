@@ -187,6 +187,213 @@ impl AppMode for ConfirmMode {
     }
 }
 
+/// Safety gate for connecting to a server that selected plaintext
+/// ExternalSecureLink transport.
+pub(crate) struct NativeEncryptionWarningMode {
+    label: String,
+    cancel_button: Rect,
+    connect_button: Rect,
+}
+
+impl NativeEncryptionWarningMode {
+    pub(crate) fn new(label: String) -> Self {
+        Self {
+            label,
+            cancel_button: Rect::EMPTY,
+            connect_button: Rect::EMPTY,
+        }
+    }
+
+    fn accept(&mut self, app: &mut App) {
+        app.accept_native_encryption_warning(&self.label);
+    }
+
+    fn cancel(&mut self, app: &mut App) {
+        app.cancel_native_encryption_warning();
+    }
+
+    fn process_command(&mut self, app: &mut App, command: BindCommand) -> Action {
+        use BindCommand::*;
+        match command {
+            Cancel => self.cancel(app),
+            Activate => self.accept(app),
+            command => return app.process_global_command(command),
+        }
+        Action::Continue
+    }
+
+    fn render_buttons(&mut self, area: Rect, app: &App, buf: &mut Buffer, theme: &Theme) {
+        if area.is_empty() {
+            self.cancel_button = Rect::EMPTY;
+            self.connect_button = Rect::EMPTY;
+            return;
+        }
+
+        let mut row = area;
+        let gap = u16::from(row.w > 20);
+        let button_width = row.w.saturating_sub(gap) / 2;
+        self.cancel_button = row.take_left(button_width as i32);
+        if gap > 0 {
+            row.take_left(gap as i32).with(theme.dialog_panel).fill(buf);
+        }
+        self.connect_button = row;
+
+        let cancel = button_label(
+            "Cancel",
+            bindings::command_key_hint(
+                &app.config.bindings,
+                bindings::DIALOG_LAYER,
+                BindCommand::Cancel,
+            ),
+        );
+        let connect = button_label(
+            "Connect",
+            bindings::command_key_hint(
+                &app.config.bindings,
+                bindings::DIALOG_LAYER,
+                BindCommand::Activate,
+            ),
+        );
+        draw_button(
+            self.cancel_button,
+            buf,
+            theme.dialog_panel.patch(theme.muted),
+            &cancel,
+        );
+        draw_button(self.connect_button, buf, theme.selected_focused, &connect);
+    }
+}
+
+impl AppMode for NativeEncryptionWarningMode {
+    fn render(&mut self, app: &mut App, buf: &mut Buffer, _now_ms: u64) {
+        let theme = &app.theme;
+        let area = buf.rect();
+        if area.w < 34 || area.h < 11 {
+            return;
+        }
+        let width = area.w.min(68).max(34);
+        let height = area.h.min(12);
+        let panel = Rect {
+            x: area.x + area.w.saturating_sub(width) / 2,
+            y: area.y + area.h.saturating_sub(height) / 2,
+            w: width,
+            h: height,
+        };
+        buf.clear_rect(panel, theme.dialog_panel);
+
+        let mut rows = panel;
+        rows.take_top(1)
+            .with(native_encryption_header_style(theme) | Modifier::BOLD)
+            .fill(buf)
+            .with(HAlign::Center)
+            .with(Ellipsis(true))
+            .text(buf, "No Native Encryption to Server");
+
+        let mut body = rows.inset(2, 1);
+        body.take_top(1)
+            .with(theme.dialog_panel.patch(theme.error | Modifier::BOLD))
+            .with(HAlign::Center)
+            .with(Ellipsis(true))
+            .text(buf, "Chatt will not encrypt this connection");
+        body.take_top(1);
+        body.take_top(1)
+            .with(theme.dialog_panel.patch(theme.text))
+            .with(Ellipsis(true))
+            .text(
+                buf,
+                "The server selected plaintext ExternalSecureLink transport.",
+            );
+        body.take_top(1)
+            .with(theme.dialog_panel.patch(theme.text))
+            .with(Ellipsis(true))
+            .text(
+                buf,
+                "Connect only when another secure link already protects it.",
+            );
+        body.take_top(1)
+            .with(theme.dialog_panel.patch(theme.muted))
+            .with(Ellipsis(true))
+            .text(
+                buf,
+                "Examples: WireGuard, SSH tunnel, or a private trusted network.",
+            );
+        body.take_top(1);
+        body.take_top(1)
+            .with(theme.dialog_panel.patch(theme.subtle))
+            .with(Ellipsis(true))
+            .text(
+                buf,
+                &format!(
+                    "Accepting saves require-native-encryption = false for {}.",
+                    self.label
+                ),
+            );
+        if body.h > 0 {
+            body.take_top(1);
+        }
+        if body.h > 0 {
+            self.render_buttons(body.take_top(1), app, buf, theme);
+        }
+        crate::tui::render::draw_overlay_key_preview(app, bindings::DIALOG_LAYER, buf);
+    }
+
+    fn process_input(&mut self, app: &mut App, key: KeyEvent) -> Action {
+        if is_quit_key(&key) {
+            return Action::Quit;
+        }
+        if matches!(key.kind, KeyEventKind::Release) {
+            return Action::Continue;
+        }
+        if let Some(input) = InputKey::from_event(&key) {
+            match bindings::resolve(
+                &app.config.bindings.router,
+                bindings::DIALOG_LAYER,
+                &mut app.chrome.binding.pending_chord,
+                input,
+            ) {
+                Resolved::Action(id) => {
+                    let command = app.config.bindings.actions.get(id).clone();
+                    return self.process_command(app, command);
+                }
+                Resolved::Consumed => return Action::Continue,
+                Resolved::Unmatched => {}
+            }
+        }
+        Action::Continue
+    }
+
+    fn process_mouse(&mut self, app: &mut App, mouse: MouseEvent) -> Action {
+        if !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+            return Action::Continue;
+        }
+        if rect_contains(self.cancel_button, mouse.column, mouse.row) {
+            self.cancel(app);
+        } else if rect_contains(self.connect_button, mouse.column, mouse.row) {
+            self.accept(app);
+        }
+        Action::Continue
+    }
+
+    fn presentation(&self, _app: &App) -> ModePresentation {
+        ModePresentation {
+            coverage: Coverage::Overlay,
+            chrome: Some(ChromeSpec {
+                theme_mode: theme::UiMode::ServerSelect,
+                status_label: "Security",
+                layer: bindings::DIALOG_LAYER,
+            }),
+        }
+    }
+}
+
+fn native_encryption_header_style(theme: &Theme) -> extui::Style {
+    if let Some(error) = theme.error.fg() {
+        theme.dialog_header.with_bg(error).with_fg_rgb(0, 0, 0)
+    } else {
+        theme.dialog_header.patch(theme.error).with_fg_rgb(0, 0, 0)
+    }
+}
+
 /// Transient overlay prompting for the open-pairing password.
 ///
 /// The entered password is held verbatim but rendered as `*` characters. Enter
@@ -961,6 +1168,20 @@ mod tests {
             },
             open: Some(String::new()),
             completion: PairCompletion::OpenEditor,
+        }
+    }
+
+    #[test]
+    fn native_encryption_warning_header_uses_black_on_error_fill() {
+        let black = extui::Style::DEFAULT.with_fg_rgb(0, 0, 0).fg();
+        for theme in [
+            Theme::tomorrow_night(),
+            Theme::base16_dark(),
+            Theme::base16_light(),
+        ] {
+            let style = native_encryption_header_style(&theme);
+            assert_eq!(style.bg(), theme.error.fg());
+            assert_eq!(style.fg(), black);
         }
     }
 

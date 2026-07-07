@@ -103,6 +103,7 @@ fn client_config(
         display_name: name.to_string(),
         token: token.to_string(),
         server_public_key: None,
+        require_native_encryption: true,
         file_policy: FilePolicy {
             default: EffectiveFiles {
                 receive_dir,

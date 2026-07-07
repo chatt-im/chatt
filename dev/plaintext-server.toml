@@ -1,0 +1,15 @@
+# chatt dev server using external-secure-link/plaintext transport.
+# Not for production: the identity seed and tokens are public dev fixtures.
+
+[network]
+tcp-addr = "127.0.0.1:41000"
+p2p-enabled = false
+
+[security]
+server-identity-seed = "546f6d636861742064657620736572766572206b657920763100000000000001"
+transport-mode = "external-secure-link"
+max-file-size-bytes = 52428800
+
+[[rooms]]
+id = 1
+name = "lobby"
