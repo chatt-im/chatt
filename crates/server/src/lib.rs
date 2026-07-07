@@ -34,10 +34,10 @@ use rpc::{
         encode_server_hello, max_file_wire_bytes,
     },
     crypto::{
-        AntiReplay, CHANNEL_CONTROL, CHANNEL_VIDEO, ControlTransport, DYNAMIC_TOKEN_PREFIX,
-        DynamicTokenClaims, KEY_LEN, KeyMaterial, SessionSecrets, TAG_LEN, TRANSPORT_HEADER_LEN,
-        TransportCipher, VideoKeyRole, derive_video_keys, encode_hex, issue_dynamic_token,
-        respond_to_client_hello, respond_to_client_hello_plaintext, verify_dynamic_token,
+        AntiReplay, CHANNEL_CONTROL, CHANNEL_VIDEO, DYNAMIC_TOKEN_PREFIX, DynamicTokenClaims,
+        KEY_LEN, KeyMaterial, RecordProtection, SessionTransport, TransportMode, VideoKeyRole,
+        derive_video_keys, encode_hex, issue_dynamic_token, respond_to_client_hello,
+        verify_dynamic_token,
     },
     evented::{
         MioReady, ReadLimit, Readiness, WriteQueue, is_interrupted_io_error, read_into_buffer,
@@ -325,7 +325,7 @@ pub fn run_cli() -> Result<(), Box<dyn std::error::Error>> {
         udp_addr = %config.network.udp_addr(),
         udp_probe_addr = udp_probe_label.as_str(),
         server_public_key = server_public_key.as_str(),
-        encryption = config.security.encryption,
+        transport_mode = config.transport_mode().as_str(),
         p2p_enabled = config.network.p2p_enabled
     );
     let tcp_addr = config.network.tcp_addr;
@@ -355,13 +355,12 @@ pub fn run_cli() -> Result<(), Box<dyn std::error::Error>> {
     );
     println!("chatt server public key: {server_public_key}");
     println!(
-        "chatt transport encryption: {}",
-        if server.config.security.encryption {
-            "enabled"
-        } else {
-            "disabled"
-        }
+        "chatt transport mode: {}",
+        server.config.transport_mode().as_str()
     );
+    if server.config.transport_mode() == rpc::crypto::TransportMode::ExternalSecureLink {
+        println!("chatt is relying on the outer secure link for wire security; P2P disabled");
+    }
     println!(
         "chatt P2P support: {}",
         if server.config.network.p2p_enabled {
@@ -379,7 +378,7 @@ pub fn run_cli() -> Result<(), Box<dyn std::error::Error>> {
         tcp_addr = %tcp_addr,
         udp_addr = %udp_addr,
         udp_probe_addr = udp_probe_label.as_str(),
-        encryption = server.config.security.encryption,
+        transport_mode = server.config.transport_mode().as_str(),
         p2p_enabled = server.config.network.p2p_enabled
     );
     let _admin_socket = admin_socket;
@@ -397,8 +396,9 @@ pub struct Server {
     udp_probe: Option<UdpSocket>,
     clients: HashMap<Token, ClientConn>,
     sessions: HashMap<SessionId, Session>,
-    media_key_to_session: HashMap<u32, SessionId>,
-    plaintext_addr_to_session: HashMap<SocketAddr, SessionId>,
+    /// The single UDP demux map: a session's derived media route id to its id.
+    /// Populated for every live session regardless of transport mode.
+    media_route_to_session: HashMap<u32, SessionId>,
     peer_links: HashMap<(SessionId, SessionId), PeerLink>,
     rooms: HashMap<RoomId, RoomState>,
     streams: HashMap<StreamId, VideoStream>,
@@ -484,7 +484,8 @@ impl Server {
         self.udp.local_addr()
     }
 
-    pub fn bind(config: ServerConfig) -> io::Result<Self> {
+    pub fn bind(mut config: ServerConfig) -> io::Result<Self> {
+        config.normalize();
         let tcp_addr = config.network.tcp_addr;
         let udp_addr = config.network.udp_addr();
         let udp_probe_addr = config.network.udp_probe_addr;
@@ -563,9 +564,9 @@ impl Server {
             "server identity loaded",
             public_key = encode_hex(server_key_pair.public_key().as_ref()).as_str()
         );
-        if !config.security.encryption {
+        if config.transport_mode() == rpc::crypto::TransportMode::ExternalSecureLink {
             kvlog::warn!(
-                "encryption disabled: plaintext UDP trusts spoofable Bind packets and allows session hijack, development only, never expose publicly"
+                "external-secure-link transport: chatt relies on the outer link for wire security; control, media, video, and file payloads travel clear and P2P is disabled"
             );
         }
         let file_size_limit_bytes = config.security.max_file_size_bytes;
@@ -579,8 +580,7 @@ impl Server {
             udp_probe,
             clients: HashMap::new(),
             sessions: HashMap::new(),
-            media_key_to_session: HashMap::new(),
-            plaintext_addr_to_session: HashMap::new(),
+            media_route_to_session: HashMap::new(),
             peer_links: HashMap::new(),
             rooms,
             streams: HashMap::new(),
@@ -693,7 +693,7 @@ impl Server {
             self.flush_disconnects();
             let now = Instant::now();
             self.sweep_idle_connections(now);
-            self.sweep_stale_media_keys(now);
+            self.sweep_stale_media_routes(now);
             self.poll_room_rtt_snapshots(now);
         }
     }
@@ -823,7 +823,7 @@ impl Server {
                     kind: ConnKind::Unidentified,
                     state: ConnState::AwaitClientHello,
                     control: None,
-                    secrets: None,
+                    transport: None,
                     session_id: None,
                     user_id: None,
                     close: Close::Open,
@@ -1132,6 +1132,13 @@ impl Server {
             _ => return Err("video session is not authorized for this stream".to_string()),
         };
         let (send, recv) = derive_video_keys(&secret, VideoKeyRole::Server);
+        // The server runs one transport mode: native seals video records with the
+        // per-stream keys; external-link leaves them clear (the outer link
+        // secures the wire) and authenticates setup with a proof instead.
+        let record = match self.config.transport_mode() {
+            TransportMode::NativeEncrypted => RecordProtection::aead(send, recv),
+            TransportMode::ExternalSecureLink => RecordProtection::clear(),
+        };
         let client = self
             .clients
             .get_mut(&token)
@@ -1142,7 +1149,7 @@ impl Server {
         video.session_id = Some(hello.session_id);
         video.stream_id = Some(hello.stream_id);
         video.role = Some(hello.role);
-        video.cipher = Some(TransportCipher::new(send, recv));
+        video.record = Some(record);
         video.phase = VideoPhase::AwaitAuth;
         kvlog::info!(
             "video hello accepted",
@@ -1154,6 +1161,56 @@ impl Server {
     }
 
     fn handle_video_auth(&mut self, token: Token, record: &[u8]) -> Result<(), String> {
+        let mode = self.config.transport_mode();
+        // Phase 1: read the connection identity and prove possession. Native
+        // proves it by opening the AEAD auth record; external-link verifies a
+        // compact HMAC proof under the session's video auth key.
+        let (session_id, stream_id, role) = {
+            let client = self
+                .clients
+                .get_mut(&token)
+                .ok_or_else(|| "unknown client token".to_string())?;
+            let ConnKind::Video(video) = &mut client.kind else {
+                return Err("auth on a non-video connection".to_string());
+            };
+            let session_id = video
+                .session_id
+                .ok_or_else(|| "video auth before hello".to_string())?;
+            let stream_id = video
+                .stream_id
+                .ok_or_else(|| "video auth before hello".to_string())?;
+            let role = video
+                .role
+                .ok_or_else(|| "video auth before hello".to_string())?;
+            let record_protection = video
+                .record
+                .as_mut()
+                .ok_or_else(|| "video auth before hello".to_string())?;
+            if let RecordProtection::Aead(cipher) = record_protection {
+                cipher
+                    .open_next(CHANNEL_VIDEO, record)
+                    .map_err(|error| format!("video auth failed: {error}"))?;
+            }
+            (session_id, stream_id, role)
+        };
+        if mode == TransportMode::ExternalSecureLink {
+            let video_auth_key = self
+                .sessions
+                .get(&session_id)
+                .map(|session| session.transport.video_auth_key)
+                .ok_or_else(|| "video auth session missing".to_string())?;
+            if !video::video_auth_proof_verify(
+                &video_auth_key,
+                session_id,
+                stream_id,
+                role,
+                mode,
+                record,
+            ) {
+                return Err("video auth proof failed".to_string());
+            }
+        }
+        // Phase 2: ack and attach.
         let client = self
             .clients
             .get_mut(&token)
@@ -1161,27 +1218,15 @@ impl Server {
         let ConnKind::Video(video) = &mut client.kind else {
             return Err("auth on a non-video connection".to_string());
         };
-        let cipher = video
-            .cipher
+        let record_protection = video
+            .record
             .as_mut()
             .ok_or_else(|| "video auth before hello".to_string())?;
-        // The auth payload's contents are irrelevant: opening it proves the peer
-        // holds the per-stream secret. A peer that cannot seal a record the
-        // server opens is dropped, so guessing a stream id yields nothing.
-        cipher
-            .open_next(CHANNEL_VIDEO, record)
-            .map_err(|error| format!("video auth failed: {error}"))?;
         let ack = video::encode_video_ack(&VideoAck::Ok);
-        let sealed = cipher
+        let sealed = record_protection
             .seal_next(CHANNEL_VIDEO, &ack)
             .map_err(|error| error.to_string())?;
         video.phase = VideoPhase::Streaming;
-        let role = video
-            .role
-            .ok_or_else(|| "video auth before hello".to_string())?;
-        let stream_id = video
-            .stream_id
-            .ok_or_else(|| "video auth before hello".to_string())?;
         video::write_record(client.write_buf.tail_mut(), &sealed)
             .map_err(|error| error.to_string())?;
         self.write_client(token);
@@ -1267,17 +1312,17 @@ impl Server {
             let ConnKind::Video(video) = &mut client.kind else {
                 return Err("subscriber is not a video connection".to_string());
             };
-            let cipher = video
-                .cipher
+            let record = video
+                .record
                 .as_mut()
-                .ok_or_else(|| "subscriber missing cipher".to_string())?;
-            let sealed_len = TRANSPORT_HEADER_LEN + data.len() + TAG_LEN;
+                .ok_or_else(|| "subscriber missing record protection".to_string())?;
+            let sealed_len = record.sealed_len(data.len());
             if sealed_len > video::MAX_VIDEO_FRAME_LEN {
                 return Err("sealed video record exceeds maximum length".to_string());
             }
             let out = client.write_buf.tail_mut();
             out.extend_from_slice(&(sealed_len as u32).to_le_bytes());
-            if let Err(error) = cipher.seal_next_into(CHANNEL_VIDEO, data, out) {
+            if let Err(error) = record.seal_next_into(CHANNEL_VIDEO, data, out) {
                 out.truncate(out.len() - video::VIDEO_LENGTH_PREFIX_LEN);
                 return Err(error.to_string());
             }
@@ -1611,25 +1656,13 @@ impl Server {
             client_nonce_size = hello.client_nonce.len(),
             client_ephemeral_size = hello.client_ephemeral.len()
         );
-        let encryption = self.config.security.encryption;
-        let (server_hello, control, secrets) = if encryption {
-            let response = respond_to_client_hello(&self.rng, &self.server_key_pair, &hello)
-                .map_err(|error| error.to_string())?;
-            (
-                response.hello,
-                ControlTransport::encrypted(
-                    response.secrets.control_send.clone(),
-                    response.secrets.control_recv.clone(),
-                ),
-                Some(response.secrets),
-            )
-        } else {
-            let response =
-                respond_to_client_hello_plaintext(&self.rng, &self.server_key_pair, &hello)
-                    .map_err(|error| error.to_string())?;
-            (response.hello, ControlTransport::plaintext(), None)
-        };
-        let encoded = encode_server_hello(&server_hello);
+        let mode = self.config.transport_mode();
+        // Rejects the client (connection dropped) if it did not advertise the
+        // server's configured mode; there is one server mode, no per-client mix.
+        let response = respond_to_client_hello(&self.rng, &self.server_key_pair, &hello, mode)
+            .map_err(|error| error.to_string())?;
+        let control = response.transport.control_record();
+        let encoded = encode_server_hello(&response.hello);
         let client = self
             .clients
             .get_mut(&token)
@@ -1637,13 +1670,13 @@ impl Server {
         frame::encode_frame(&encoded, client.write_buf.tail_mut())
             .map_err(|error| error.to_string())?;
         client.control = Some(control);
-        client.secrets = secrets;
+        client.transport = Some(response.transport);
         client.state = ConnState::AwaitAuth;
         kvlog::info!(
             "client handshake completed",
             token = token.0,
             queued_bytes = client.write_buf.len(),
-            encryption
+            transport_mode = mode.as_str()
         );
         self.write_client(token);
         Ok(())
@@ -2356,13 +2389,12 @@ impl Server {
         let display_name = user.display_name.clone();
         let identifier = user.name.clone();
 
-        let secrets = self
+        let transport = self
             .clients
-            .get(&token)
-            .and_then(|client| client.secrets.clone());
-        if let Some(secrets) = &secrets {
-            self.register_media_key(secrets.media_recv.id, session_id)?;
-        }
+            .get_mut(&token)
+            .and_then(|client| client.transport.take())
+            .ok_or_else(|| "session transport missing after handshake".to_string())?;
+        self.register_media_route(transport.route_id, session_id)?;
         self.sessions.insert(
             session_id,
             Session {
@@ -2372,7 +2404,7 @@ impl Server {
                 tcp_token: token,
                 voice_room: None,
                 udp_addr: None,
-                secrets,
+                transport,
                 media_send_counter: 0,
                 media_recv_replay: AntiReplay::new(),
                 active_stream: None,
@@ -2431,28 +2463,28 @@ impl Server {
         Ok(())
     }
 
-    /// Registers a session's inbound media key id for UDP demultiplexing.
+    /// Registers a session's derived media route id for UDP demultiplexing.
     ///
-    /// A 32-bit key id colliding with another live session's is astronomically
+    /// A 32-bit route id colliding with another live session's is astronomically
     /// unlikely, but silently overwriting would strand both sessions' UDP once
     /// either tears down (`teardown_session` removes the shared entry). The new
     /// session is rejected instead, forcing a reconnect whose fresh handshake
-    /// draws a new random key id. Stale entries whose session is already gone
-    /// are reclaimed.
-    fn register_media_key(&mut self, key_id: u32, session_id: SessionId) -> Result<(), String> {
-        if let Some(existing) = self.media_key_to_session.get(&key_id).copied()
+    /// draws a new route id. Stale entries whose session is already gone are
+    /// reclaimed.
+    fn register_media_route(&mut self, route_id: u32, session_id: SessionId) -> Result<(), String> {
+        if let Some(existing) = self.media_route_to_session.get(&route_id).copied()
             && existing != session_id
             && self.sessions.contains_key(&existing)
         {
             kvlog::error!(
-                "media key id collision with a live session",
-                key_id,
+                "media route id collision with a live session",
+                route_id,
                 existing_session_id = existing.0,
                 rejected_session_id = session_id.0
             );
-            return Err("media key id collision".to_string());
+            return Err("media route id collision".to_string());
         }
-        self.media_key_to_session.insert(key_id, session_id);
+        self.media_route_to_session.insert(route_id, session_id);
         Ok(())
     }
 
@@ -3729,39 +3761,46 @@ impl Server {
         packet: &[u8],
     ) -> Result<(), String> {
         let (header, _) = media::parse_header(packet).map_err(|error| error.to_string())?;
-        let (session_id, payload, udp_addr_changed) = if header.key_id == media::PLAINTEXT_KEY_ID {
-            self.open_plaintext_udp_packet(server_probe_id, src, packet)?
-        } else {
-            let session_id = *self
-                .media_key_to_session
-                .get(&header.key_id)
-                .ok_or_else(|| "unknown UDP key id".to_string())?;
-            let (payload, udp_addr_changed) = {
-                let session = self
-                    .sessions
-                    .get_mut(&session_id)
-                    .ok_or_else(|| "unknown UDP session".to_string())?;
-                let secrets = session
-                    .secrets
-                    .as_ref()
-                    .ok_or_else(|| "encrypted UDP for plaintext session".to_string())?;
-                let (_, payload) =
-                    media::open_media(&secrets.media_recv, &mut session.media_recv_replay, packet)
-                        .map_err(|error| error.to_string())?;
-                // Behind a symmetric NAT the mapping toward the probe port
-                // differs from the mapping toward the main port, so a probe
-                // packet's source is only reachable by the probe flow. Recording
-                // it would point voice and pongs sent from the main socket at a
-                // dead address until the next main-socket packet flips it back.
-                let udp_addr_changed = if server_probe_id == 0 {
-                    let old_addr = session.observe_udp_addr(src);
-                    old_addr.is_some_and(|old| old != src)
-                } else {
+        let session_id = *self
+            .media_route_to_session
+            .get(&header.route_id)
+            .ok_or_else(|| "unknown UDP route id".to_string())?;
+        let (payload, udp_addr_changed) = {
+            let session = self
+                .sessions
+                .get_mut(&session_id)
+                .ok_or_else(|| "unknown UDP session".to_string())?;
+            let protection = session.media_protection();
+            let opened = media::open_media(&protection, &mut session.media_recv_replay, packet)
+                .map_err(|error| error.to_string())?;
+            let is_main_socket = server_probe_id == 0;
+            let udp_addr_changed = match opened.address_proof {
+                // Native: every opened datagram is authenticated. External-link
+                // `Bind`: the address claim carries a valid proof. Either may
+                // refresh the media address, but only on the main socket —
+                // behind a symmetric NAT the probe-port mapping differs from the
+                // main-port mapping, so recording a probe packet's source would
+                // point voice and pongs (sent from the main socket) at a dead
+                // address until the next main-socket packet flips it back.
+                media::AddressProof::AuthenticatedDatagram
+                | media::AddressProof::AuthenticatedAddressClaim => {
+                    if is_main_socket {
+                        session.observe_udp_addr(src).is_some_and(|old| old != src)
+                    } else {
+                        false
+                    }
+                }
+                // External-link data (voice, feedback, ping, pong) is
+                // unauthenticated by chatt, so it is accepted only from the
+                // already-bound address and never rebinds the session.
+                media::AddressProof::None => {
+                    if session.udp_addr != Some(src) {
+                        return Err("external-link media from an unbound source".to_string());
+                    }
                     false
-                };
-                (payload, udp_addr_changed)
+                }
             };
-            (session_id, payload, udp_addr_changed)
+            (opened.payload, udp_addr_changed)
         };
 
         // Authenticated media traffic proves the session is alive: the client
@@ -3775,15 +3814,7 @@ impl Server {
         }
 
         match payload {
-            MediaPayload::Bind { session_id: bound } => {
-                if bound != session_id {
-                    kvlog::warn!(
-                        "udp bind rejected",
-                        session_id = session_id.0,
-                        bound_session_id = bound.0
-                    );
-                    return Err("UDP bind session mismatch".into());
-                }
+            MediaPayload::Bind => {
                 kvlog::info!("udp session bound", session_id = session_id.0, addr = %src);
                 let token = self.live_token_for_session(session_id);
                 if let Some(token) = token {
@@ -3801,12 +3832,15 @@ impl Server {
                 }
                 Ok(())
             }
-            MediaPayload::NatProbe {
-                session_id: bound,
-                probe_id,
-            } => {
-                if bound != session_id {
-                    return Err("NAT probe session mismatch".into());
+            MediaPayload::NatProbe { probe_id } => {
+                // NAT probes are a native/P2P-only mechanism. External-link mode
+                // disables P2P, so a probe there is rejected rather than relayed.
+                if self
+                    .sessions
+                    .get(&session_id)
+                    .is_some_and(Session::is_external_link)
+                {
+                    return Err("NAT probe not available in external-secure-link".into());
                 }
                 if !self.config.network.p2p_enabled {
                     return Ok(());
@@ -3853,62 +3887,6 @@ impl Server {
             }
             MediaPayload::Pong { .. } => Ok(()),
         }
-    }
-
-    /// Development-only UDP path for `encryption = false`. The plaintext `Bind`
-    /// and `NatProbe` carry a bare session id with no proof of possession, so
-    /// any host able to spoof UDP toward the server can hijack a session's
-    /// media address. This mode must never be exposed publicly; [`Server::bind`]
-    /// logs a startup warning whenever it is active.
-    fn open_plaintext_udp_packet(
-        &mut self,
-        server_probe_id: u8,
-        src: SocketAddr,
-        packet: &[u8],
-    ) -> Result<(SessionId, MediaPayload, bool), String> {
-        let (header, payload) =
-            media::open_plaintext_media(packet).map_err(|error| error.to_string())?;
-        let session_id = match &payload {
-            MediaPayload::Bind { session_id } | MediaPayload::NatProbe { session_id, .. } => {
-                *session_id
-            }
-            MediaPayload::Voice { .. }
-            | MediaPayload::PeerVoice { .. }
-            | MediaPayload::VoiceFeedback { .. }
-            | MediaPayload::PeerVoiceFeedback { .. }
-            | MediaPayload::Ping { .. }
-            | MediaPayload::Pong { .. } => *self
-                .plaintext_addr_to_session
-                .get(&src)
-                .ok_or_else(|| "unknown plaintext UDP source".to_string())?,
-        };
-
-        let old_addr = {
-            let session = self
-                .sessions
-                .get_mut(&session_id)
-                .ok_or_else(|| "unknown UDP session".to_string())?;
-            if session.secrets.is_some() {
-                return Err("plaintext UDP for encrypted session".to_string());
-            }
-            if !session.media_recv_replay.update(header.counter) {
-                return Err(media::MediaError::Replay.to_string());
-            }
-            // Same probe-flow hazard as the encrypted path: a probe-socket
-            // packet's source must not rebind the media address.
-            if server_probe_id != 0 {
-                return Ok((session_id, payload, false));
-            }
-            session.observe_udp_addr(src)
-        };
-        if let Some(old_addr) = old_addr
-            && old_addr != src
-            && self.plaintext_addr_to_session.get(&old_addr) == Some(&session_id)
-        {
-            self.plaintext_addr_to_session.remove(&old_addr);
-        }
-        self.plaintext_addr_to_session.insert(src, session_id);
-        Ok((session_id, payload, old_addr.is_some_and(|old| old != src)))
     }
 
     fn relay_voice(
@@ -4045,14 +4023,10 @@ impl Server {
         }
         let counter = session.media_send_counter;
         session.media_send_counter = session.media_send_counter.wrapping_add(1);
+        let protection = session.media_protection();
         let packet = &mut self.udp_send_packet;
         let scratch = &mut self.udp_send_scratch;
-        let sealed = match &session.secrets {
-            Some(secrets) => {
-                media::seal_media_into(&secrets.media_send, counter, payload, packet, scratch)
-            }
-            None => media::seal_plaintext_media_into(counter, payload, packet, scratch),
-        };
+        let sealed = media::seal_media_into(&protection, counter, payload, packet, scratch);
         if let Err(error) = sealed {
             kvlog::warn!("udp seal failed", session_id = session_id.0, error = %error);
             return;
@@ -4324,14 +4298,8 @@ impl Server {
             self.broadcast_presence(session_id, false);
         }
         if let Some(session) = self.sessions.remove(&session_id) {
-            if let Some(secrets) = &session.secrets {
-                self.media_key_to_session.remove(&secrets.media_recv.id);
-            }
-            if let Some(addr) = session.udp_addr
-                && self.plaintext_addr_to_session.get(&addr) == Some(&session_id)
-            {
-                self.plaintext_addr_to_session.remove(&addr);
-            }
+            self.media_route_to_session
+                .remove(&session.transport.route_id);
         }
         self.remove_peer_links(session_id);
     }
@@ -4368,10 +4336,10 @@ impl Server {
         }
     }
 
-    /// Backstop that drops media-key mappings whose session has gone away.
-    /// `disconnect` already removes a session's key on the normal path, so this
+    /// Backstop that drops media-route mappings whose session has gone away.
+    /// `disconnect` already removes a session's route on the normal path, so this
     /// only catches leaks and runs at most once per [`MEDIA_SWEEP_INTERVAL`].
-    fn sweep_stale_media_keys(&mut self, now: Instant) {
+    fn sweep_stale_media_routes(&mut self, now: Instant) {
         if self
             .next_media_sweep_at
             .is_some_and(|deadline| now < deadline)
@@ -4380,12 +4348,12 @@ impl Server {
         }
         self.next_media_sweep_at = Some(now + MEDIA_SWEEP_INTERVAL);
         let sessions = &self.sessions;
-        let before = self.media_key_to_session.len();
-        self.media_key_to_session
+        let before = self.media_route_to_session.len();
+        self.media_route_to_session
             .retain(|_, session_id| sessions.contains_key(session_id));
-        let removed = before.saturating_sub(self.media_key_to_session.len());
+        let removed = before.saturating_sub(self.media_route_to_session.len());
         if removed > 0 {
-            kvlog::warn!("stale media key mappings removed", removed);
+            kvlog::warn!("stale media route mappings removed", removed);
         }
     }
 
@@ -4781,8 +4749,10 @@ struct ClientConn {
     write_buf: WriteQueue,
     kind: ConnKind,
     state: ConnState,
-    control: Option<ControlTransport>,
-    secrets: Option<SessionSecrets>,
+    control: Option<RecordProtection>,
+    /// The full session material derived at handshake; moved into the `Session`
+    /// at authentication. Present for both transport modes.
+    transport: Option<SessionTransport>,
     session_id: Option<SessionId>,
     user_id: Option<UserId>,
     close: Close,
@@ -4939,18 +4909,21 @@ fn video_conn_step(client: &mut ClientConn) -> Result<Option<VideoStep>, String>
         let stream_id = video
             .stream_id
             .ok_or_else(|| "stream before hello".to_string())?;
-        let cipher = video
-            .cipher
+        let record_protection = video
+            .record
             .as_mut()
             .ok_or_else(|| "stream before auth".to_string())?;
-        let plaintext_len = cipher
-            .open_next_in_place(CHANNEL_VIDEO, &mut record)
-            .map_err(|error| error.to_string())?
-            .len();
+        let base = record.as_ptr() as usize;
+        let (plaintext_offset, plaintext_len) = {
+            let plaintext = record_protection
+                .open_next_in_place(CHANNEL_VIDEO, &mut record)
+                .map_err(|error| error.to_string())?;
+            (plaintext.as_ptr() as usize - base, plaintext.len())
+        };
         if plaintext_len < video::VIDEO_FRAME_HEADER_LEN {
             return Err("video frame is shorter than its header".to_string());
         }
-        let frame = SharedVideoFrame::from_record(record, TRANSPORT_HEADER_LEN, plaintext_len);
+        let frame = SharedVideoFrame::from_record(record, plaintext_offset, plaintext_len);
         let is_key = frame.as_slice()[12] == 1;
         return Ok(Some(VideoStep::Publish {
             stream_id,
@@ -4979,12 +4952,12 @@ fn video_conn_step(client: &mut ClientConn) -> Result<Option<VideoStep>, String>
             let stream_id = video
                 .stream_id
                 .ok_or_else(|| "stream before hello".to_string())?;
-            let cipher = video
-                .cipher
+            let record_protection = video
+                .record
                 .as_mut()
                 .ok_or_else(|| "stream before auth".to_string())?;
             let record = &mut client.read_buf.pending_mut()[video::VIDEO_LENGTH_PREFIX_LEN..total];
-            let plaintext = cipher
+            let plaintext = record_protection
                 .open_next_in_place(CHANNEL_VIDEO, record)
                 .map_err(|error| error.to_string())?;
             let step = match role {
@@ -5027,14 +5000,15 @@ enum VideoPhase {
 }
 
 /// Per-connection state for a dedicated video connection. `stream_id`, `role`,
-/// and `cipher` are filled once the clear [`VideoHello`] arrives, before the
-/// sealed auth record is opened.
+/// and `record` are filled once the clear [`VideoHello`] arrives, before the
+/// auth record is opened. `record` is AEAD in native mode and clear in
+/// external-link mode.
 struct VideoConn {
     phase: VideoPhase,
     session_id: Option<SessionId>,
     stream_id: Option<StreamId>,
     role: Option<VideoRole>,
-    cipher: Option<TransportCipher>,
+    record: Option<RecordProtection>,
     /// Exact per-record reader, attached when a publisher enters
     /// [`VideoPhase::Streaming`] so retained frames never share an allocation
     /// with the generic receive buffer. Subscriber connections send only
@@ -5049,7 +5023,7 @@ impl VideoConn {
             session_id: None,
             stream_id: None,
             role: None,
-            cipher: None,
+            record: None,
             reader: None,
         }
     }
@@ -5064,7 +5038,9 @@ struct Session {
     /// room's chat the client is reading.
     voice_room: Option<RoomId>,
     udp_addr: Option<SocketAddr>,
-    secrets: Option<SessionSecrets>,
+    /// Full session material derived at handshake. Its mode selects how media
+    /// datagrams are protected; the route id is this session's UDP demux tag.
+    transport: SessionTransport,
     media_send_counter: u64,
     media_recv_replay: AntiReplay,
     active_stream: Option<StreamId>,
@@ -5086,6 +5062,17 @@ struct Session {
 }
 
 impl Session {
+    /// The media codec for this session's UDP datagrams, selected by its mode.
+    fn media_protection(&self) -> media::MediaProtection {
+        media::MediaProtection::from_transport(&self.transport)
+    }
+
+    /// Whether chatt secures the wire for this session, versus deferring to an
+    /// outer link (external-secure-link).
+    fn is_external_link(&self) -> bool {
+        self.transport.mode == TransportMode::ExternalSecureLink
+    }
+
     fn observe_udp_addr(&mut self, addr: SocketAddr) -> Option<SocketAddr> {
         let old_addr = self.udp_addr.replace(addr);
         if old_addr.is_some_and(|old| old != addr) {
@@ -5569,6 +5556,7 @@ fn server_control_kind(control: &ServerControl) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rpc::crypto::{SessionSecrets, TAG_LEN, TRANSPORT_HEADER_LEN, TransportCipher};
     use std::io::{Read, Write};
     use std::os::unix::net::UnixStream;
 
@@ -5630,7 +5618,7 @@ mod tests {
             tcp_token: token,
             voice_room,
             udp_addr: None,
-            secrets: None,
+            transport: test_transport(1),
             media_send_counter: 0,
             media_recv_replay: AntiReplay::new(),
             active_stream: None,
@@ -5734,13 +5722,103 @@ mod tests {
         }
     }
 
-    fn test_secrets(media_recv_id: u32) -> SessionSecrets {
-        SessionSecrets {
-            control_send: test_key(1, 1),
-            control_recv: test_key(2, 2),
-            media_send: test_key(3, 3),
-            media_recv: test_key(media_recv_id, 4),
+    /// A native-mode session transport with the given media route id. The media
+    /// send/recv keys are identical so one [`media::MediaProtection`] both seals
+    /// (as the peer) and opens (as this session) a datagram in tests.
+    fn test_transport(route_id: u32) -> SessionTransport {
+        SessionTransport {
+            mode: TransportMode::NativeEncrypted,
+            secrets: SessionSecrets {
+                control_send: test_key(1, 1),
+                control_recv: test_key(2, 2),
+                media_send: test_key(4, 4),
+                media_recv: test_key(4, 4),
+            },
+            route_id,
+            bind_key: [5; KEY_LEN],
+            video_auth_key: [6; KEY_LEN],
         }
+    }
+
+    /// The peer-side media codec matching [`test_transport`]: seals datagrams the
+    /// session (`route_id`) will open.
+    fn test_client_media_protection(route_id: u32) -> media::MediaProtection {
+        media::MediaProtection::Aead {
+            route_id,
+            send: test_key(4, 4),
+            recv: test_key(4, 4),
+        }
+    }
+
+    /// An external-secure-link session transport with the given route id and bind
+    /// key, so external-link UDP handling can be exercised end to end.
+    fn test_external_transport(route_id: u32, bind_key: [u8; KEY_LEN]) -> SessionTransport {
+        SessionTransport {
+            mode: TransportMode::ExternalSecureLink,
+            secrets: SessionSecrets {
+                control_send: test_key(1, 1),
+                control_recv: test_key(2, 2),
+                media_send: test_key(3, 3),
+                media_recv: test_key(4, 4),
+            },
+            route_id,
+            bind_key,
+            video_auth_key: [6; KEY_LEN],
+        }
+    }
+
+    fn clear_client(route_id: u32, bind_key: [u8; KEY_LEN]) -> media::MediaProtection {
+        media::MediaProtection::Clear {
+            route_id,
+            bind_key,
+            mode: TransportMode::ExternalSecureLink,
+        }
+    }
+
+    #[test]
+    fn external_link_bind_binds_and_rejects_spoof_and_unbound() {
+        let mut server = test_server();
+        let session_id = SessionId(1);
+        let bind_key = [9u8; KEY_LEN];
+        let mut session = test_session(UserId(9), Token(11), None);
+        session.transport = test_external_transport(88, bind_key);
+        server.sessions.insert(session_id, session);
+        server.media_route_to_session.insert(88, session_id);
+
+        // A valid external Bind (correct bind key) binds the media address.
+        let client = clear_client(88, bind_key);
+        let src: SocketAddr = "203.0.113.9:6000".parse().unwrap();
+        let bind = media::seal_media(&client, 1, &MediaPayload::Bind).unwrap();
+        server.handle_udp_packet(0, src, &bind).unwrap();
+        assert_eq!(
+            server.sessions.get(&session_id).unwrap().udp_addr,
+            Some(src)
+        );
+
+        // A spoofed Bind from a wrong bind key cannot rebind the session.
+        let spoofer = clear_client(88, [1u8; KEY_LEN]);
+        let evil: SocketAddr = "198.51.100.9:6000".parse().unwrap();
+        let spoof = media::seal_media(&spoofer, 2, &MediaPayload::Bind).unwrap();
+        assert!(server.handle_udp_packet(0, evil, &spoof).is_err());
+        assert_eq!(
+            server.sessions.get(&session_id).unwrap().udp_addr,
+            Some(src)
+        );
+
+        // External data from the bound source is accepted, but from any other
+        // source it is rejected (chatt does not authenticate clear data packets).
+        let ping = MediaPayload::Ping {
+            nonce: 1,
+            observed_rtt_ms: None,
+        };
+        let from_bound = media::seal_media(&client, 3, &ping).unwrap();
+        server.handle_udp_packet(0, src, &from_bound).unwrap();
+        let from_evil = media::seal_media(&client, 4, &ping).unwrap();
+        assert!(server.handle_udp_packet(0, evil, &from_evil).is_err());
+
+        // NAT probes are native/P2P-only and rejected in external-link mode.
+        let probe = media::seal_media(&client, 5, &MediaPayload::NatProbe { probe_id: 0 }).unwrap();
+        assert!(server.handle_udp_packet(0, src, &probe).is_err());
     }
 
     #[test]
@@ -5752,27 +5830,19 @@ mod tests {
         // media address (nor wipe the RTT estimate).
         let mut server = test_server();
         let session_id = SessionId(1);
-        let secrets = test_secrets(77);
-        let client_media_key = secrets.media_recv.clone();
+        let client = test_client_media_protection(77);
         let mut session = test_session(UserId(9), Token(11), None);
-        session.secrets = Some(secrets);
+        session.transport = test_transport(77);
         let media_addr: SocketAddr = "203.0.113.5:4000".parse().unwrap();
         let now = Instant::now();
         session.observe_udp_addr(media_addr);
         session.report_server_rtt(Some(40), now);
         server.sessions.insert(session_id, session);
-        server.media_key_to_session.insert(77, session_id);
+        server.media_route_to_session.insert(77, session_id);
 
         let probe_src: SocketAddr = "203.0.113.5:5000".parse().unwrap();
-        let packet = media::seal_media(
-            &client_media_key,
-            1,
-            &MediaPayload::NatProbe {
-                session_id,
-                probe_id: 1,
-            },
-        )
-        .unwrap();
+        let packet =
+            media::seal_media(&client, 1, &MediaPayload::NatProbe { probe_id: 1 }).unwrap();
         server.handle_udp_packet(1, probe_src, &packet).unwrap();
 
         let session = server.sessions.get(&session_id).unwrap();
@@ -5789,24 +5859,17 @@ mod tests {
 
         // The same packet arriving on the main media socket is the client
         // genuinely moving, and must still rebind.
-        let packet = media::seal_media(
-            &client_media_key,
-            2,
-            &MediaPayload::NatProbe {
-                session_id,
-                probe_id: 1,
-            },
-        )
-        .unwrap();
+        let packet =
+            media::seal_media(&client, 2, &MediaPayload::NatProbe { probe_id: 1 }).unwrap();
         server.handle_udp_packet(0, probe_src, &packet).unwrap();
         let session = server.sessions.get(&session_id).unwrap();
         assert_eq!(session.udp_addr, Some(probe_src));
     }
 
     #[test]
-    fn media_key_collision_rejects_new_session_and_keeps_survivor() {
-        // A 32-bit media key id collision must not silently overwrite the live
-        // session's mapping: `teardown_session` removes the shared key when
+    fn media_route_collision_rejects_new_session_and_keeps_survivor() {
+        // A 32-bit media route id collision must not silently overwrite the live
+        // session's mapping: `teardown_session` removes the shared route when
         // either session ends, permanently stranding the survivor's UDP.
         let mut server = test_server();
         let alice = UserConfig {
@@ -5823,35 +5886,35 @@ mod tests {
         };
         let (conn, _alice_peer) = test_live_client();
         server.clients.insert(Token(11), conn);
-        server.clients.get_mut(&Token(11)).unwrap().secrets = Some(test_secrets(77));
+        server.clients.get_mut(&Token(11)).unwrap().transport = Some(test_transport(77));
         let (conn, _bob_peer) = test_live_client();
         server.clients.insert(Token(22), conn);
-        server.clients.get_mut(&Token(22)).unwrap().secrets = Some(test_secrets(77));
+        server.clients.get_mut(&Token(22)).unwrap().transport = Some(test_transport(77));
 
         server
             .establish_session(Token(11), &alice, false, 0, false, None)
             .unwrap();
         let alice_session = server.clients.get(&Token(11)).unwrap().session_id.unwrap();
-        assert_eq!(server.media_key_to_session.get(&77), Some(&alice_session));
+        assert_eq!(server.media_route_to_session.get(&77), Some(&alice_session));
 
         let result = server.establish_session(Token(22), &bob, false, 0, false, None);
         assert!(
             result.is_err(),
-            "a colliding media key must reject the new session"
+            "a colliding media route must reject the new session"
         );
         assert_eq!(
-            server.media_key_to_session.get(&77),
+            server.media_route_to_session.get(&77),
             Some(&alice_session),
             "the live session's mapping must survive the collision"
         );
     }
 
     #[test]
-    fn media_key_of_dead_session_is_reclaimed() {
+    fn media_route_of_dead_session_is_reclaimed() {
         // A mapping left behind by a torn-down session (the sweep backstop has
-        // not run yet) must not block a new session from taking the key id.
+        // not run yet) must not block a new session from taking the route id.
         let mut server = test_server();
-        server.media_key_to_session.insert(77, SessionId(999));
+        server.media_route_to_session.insert(77, SessionId(999));
         let carol = UserConfig {
             id: UserId(3),
             name: "carol".to_string(),
@@ -5860,13 +5923,13 @@ mod tests {
         };
         let (conn, _carol_peer) = test_live_client();
         server.clients.insert(Token(33), conn);
-        server.clients.get_mut(&Token(33)).unwrap().secrets = Some(test_secrets(77));
+        server.clients.get_mut(&Token(33)).unwrap().transport = Some(test_transport(77));
 
         server
             .establish_session(Token(33), &carol, false, 0, false, None)
             .unwrap();
         let carol_session = server.clients.get(&Token(33)).unwrap().session_id.unwrap();
-        assert_eq!(server.media_key_to_session.get(&77), Some(&carol_session));
+        assert_eq!(server.media_route_to_session.get(&77), Some(&carol_session));
     }
 
     #[test]
@@ -5880,10 +5943,10 @@ mod tests {
             .set_read_timeout(Some(Duration::from_secs(1)))
             .unwrap();
         let session_id = SessionId(1);
-        let secrets = test_secrets(77);
-        let server_send_key = secrets.media_send.clone();
+        // The client opens with the same keys the session seals with.
+        let client = test_client_media_protection(77);
         let mut session = test_session(UserId(9), Token(11), None);
-        session.secrets = Some(secrets);
+        session.transport = test_transport(77);
         session.udp_addr = Some(receiver.local_addr().unwrap());
         server.sessions.insert(session_id, session);
 
@@ -5892,9 +5955,8 @@ mod tests {
         for nonce in [7u64, 8, 9] {
             server.send_udp_payload(session_id, &MediaPayload::Pong { nonce });
             let (len, _) = receiver.recv_from(&mut buf).unwrap();
-            let (_, payload) =
-                media::open_media(&server_send_key, &mut replay, &buf[..len]).unwrap();
-            assert_eq!(payload, MediaPayload::Pong { nonce });
+            let opened = media::open_media(&client, &mut replay, &buf[..len]).unwrap();
+            assert_eq!(opened.payload, MediaPayload::Pong { nonce });
         }
     }
 
@@ -7478,7 +7540,7 @@ mod tests {
         video.session_id = Some(SessionId(1));
         video.stream_id = Some(stream_id);
         video.role = Some(VideoRole::Publisher);
-        video.cipher = Some(server_cipher);
+        video.record = Some(RecordProtection::Aead(server_cipher));
         conn.kind = ConnKind::Video(video);
 
         let seal_record = |cipher: &mut TransportCipher, is_key: bool, body: &[u8]| {
@@ -7548,6 +7610,58 @@ mod tests {
             stream.ring_bytes,
             stream.ring[0].data.retained_bytes() + stream.ring[1].data.retained_bytes()
         );
+    }
+
+    #[test]
+    fn external_streaming_publisher_reader_uses_clear_record_offset() {
+        let stream_id = StreamId(1);
+        let (mut conn, _peer) = test_live_client();
+        let mut video = VideoConn::new();
+        video.phase = VideoPhase::Streaming;
+        video.session_id = Some(SessionId(1));
+        video.stream_id = Some(stream_id);
+        video.role = Some(VideoRole::Publisher);
+        video.record = Some(RecordProtection::clear());
+        video.reader = Some(VideoRecordReader::new());
+        conn.kind = ConnKind::Video(video);
+
+        let mut inner = Vec::new();
+        video::write_video_frame(&mut inner, 0, true, stream_id.0, &[1u8; 8]);
+        let mut wire = Vec::new();
+        video::write_record(&mut wire, &inner).expect("record");
+        let ConnKind::Video(video) = &mut conn.kind else {
+            unreachable!()
+        };
+        let reader = video.reader.as_mut().expect("reader");
+        let mut offset = 0;
+        while offset < wire.len() {
+            let taken = reader.accept(&wire[offset..]).expect("accept");
+            assert!(taken > 0 || reader.record_ready());
+            offset += taken;
+        }
+
+        let step = video_conn_step(&mut conn)
+            .expect("step")
+            .expect("published frame");
+        let VideoStep::Publish { frame, is_key, .. } = step else {
+            panic!("expected published frame");
+        };
+        assert!(is_key);
+        assert_eq!(frame.as_slice(), inner);
+        assert_eq!(frame.retained_bytes(), inner.len());
+    }
+
+    #[test]
+    fn server_bind_normalizes_external_link_p2p_off() {
+        let mut config = test_server_config();
+        config.security.transport_mode = crate::config::TransportModeConfig::ExternalSecureLink;
+        config.network.p2p_enabled = true;
+        config.network.udp_probe_addr = Some("127.0.0.1:0".parse().unwrap());
+
+        let server = Server::bind(config).expect("test server");
+
+        assert!(!server.config.network.p2p_enabled);
+        assert!(server.udp_probe.is_none());
     }
 
     #[test]
@@ -7895,10 +8009,9 @@ mod tests {
             token_hash: hash_secret(token_secret),
         }];
 
-        // The trailing Authenticated send fails because no client socket is
-        // registered, but the session is established before that send, so the
-        // durable side effect proves the token-only lookup succeeded. The
+        // The session is established from the client's handshake transport; the
         // display name matches the stored one, so no config save is attempted.
+        let _peer = seed_session_client(&mut server, Token(1));
         let _ = server.authenticate_client(Token(1), "Alice", token_secret, true, 0);
 
         let session = server
@@ -7943,6 +8056,7 @@ mod tests {
     fn open_pair_allocates_dynamic_user_and_issues_token() {
         let mut server = open_pair_test_server();
 
+        let _peer = seed_session_client(&mut server, Token(1));
         let _ = server.open_pair_client(Token(1), "Zoe", "", "", true, 0);
 
         let session = session_for(&server, Token(1)).expect("session established");
@@ -7975,6 +8089,7 @@ mod tests {
         let _ = server.open_pair_client(Token(2), "Zoe", "wrong", "", true, 0);
         assert!(session_for(&server, Token(2)).is_none());
 
+        let _peer = seed_session_client(&mut server, Token(3));
         let _ = server.open_pair_client(Token(3), "Zoe", "hunter2", "", true, 0);
         assert!(session_for(&server, Token(3)).is_some());
     }
@@ -7994,6 +8109,7 @@ mod tests {
         )
         .unwrap();
 
+        let _peer = seed_session_client(&mut server, Token(1));
         let _ = server.open_pair_client(Token(1), "Zoe", "hunter2", &existing, true, 0);
 
         let session = session_for(&server, Token(1)).expect("session established");
@@ -8014,6 +8130,7 @@ mod tests {
         )
         .unwrap();
 
+        let _peer = seed_session_client(&mut server, Token(1));
         let _ = server.open_pair_client(Token(1), "Zoe", "", &existing, true, 0);
 
         let session = session_for(&server, Token(1)).expect("session established");
@@ -8099,6 +8216,7 @@ mod tests {
         )
         .unwrap();
 
+        let _peer = seed_session_client(&mut server, Token(1));
         let _ = server.authenticate_client(Token(1), "Zoe", &token, true, 0);
 
         let session = session_for(&server, Token(1)).expect("session established");
@@ -8281,6 +8399,7 @@ mod tests {
         let new_token = "dana-client-generated-token-with-at-least-32-bytes";
 
         // No `user` is supplied: the server matches the invite by pairing code.
+        let _peer = seed_session_client(&mut server, Token(2));
         let _ = server.pair_client(Token(2), "Dana", code, new_token, true, 0);
 
         let user = server
@@ -8300,11 +8419,17 @@ mod tests {
         );
     }
 
-    /// Builds a live `ClientConn` over a connected loopback socket with a
-    /// plaintext control transport, so server send paths run without a full
-    /// crypto handshake. The returned peer socket must be kept alive for the
-    /// test so the connection stays open.
+    /// A monotonic route-id source for [`test_live_client`], so distinct test
+    /// connections that each establish a session get non-colliding media routes.
+    static NEXT_TEST_ROUTE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1000);
+
+    /// Builds a live `ClientConn` over a connected loopback socket with a clear
+    /// control record and a native session transport, so server send and
+    /// session-establishment paths run without a full crypto handshake. The
+    /// returned peer socket must be kept alive for the test so the connection
+    /// stays open.
     fn test_live_client() -> (ClientConn, std::net::TcpStream) {
+        let route_id = NEXT_TEST_ROUTE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
         let addr = listener.local_addr().expect("local addr");
         let client = std::net::TcpStream::connect(addr).expect("connect loopback");
@@ -8322,8 +8447,8 @@ mod tests {
             write_buf: WriteQueue::new(),
             kind: ConnKind::Control,
             state: ConnState::Ready,
-            control: Some(ControlTransport::plaintext()),
-            secrets: None,
+            control: Some(RecordProtection::clear()),
+            transport: Some(test_transport(route_id)),
             session_id: None,
             user_id: None,
             close: Close::Open,
@@ -8331,6 +8456,15 @@ mod tests {
             last_activity: now,
         };
         (conn, peer)
+    }
+
+    /// Registers a live client at `token` carrying a session transport, so
+    /// `establish_session` can take it exactly as it would after a real
+    /// handshake. Returns the peer socket, which the caller keeps alive.
+    fn seed_session_client(server: &mut Server, token: Token) -> std::net::TcpStream {
+        let (conn, peer) = test_live_client();
+        server.clients.insert(token, conn);
+        peer
     }
 
     fn read_plaintext_server_payload(peer: &mut std::net::TcpStream) -> Vec<u8> {
@@ -8544,6 +8678,7 @@ mod tests {
             },
         );
 
+        let _peer = seed_session_client(&mut server, Token(2));
         let _ = server.pair_client(
             Token(2),
             "Hana",

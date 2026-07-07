@@ -54,6 +54,9 @@ const BASE64URL: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvw
 #[jsony(Binary, version)]
 pub struct ClientHello {
     pub version: u16,
+    /// Transport-mode wire ids the client supports; the server selects one it is
+    /// configured for or rejects the connection. See [`crate::crypto::TransportMode`].
+    pub modes: Vec<u8>,
     pub client_nonce: Vec<u8>,
     pub client_ephemeral: Vec<u8>,
 }
@@ -62,7 +65,8 @@ pub struct ClientHello {
 #[jsony(Binary, version)]
 pub struct ServerHello {
     pub version: u16,
-    pub encrypted: bool,
+    /// The transport-mode wire id the server selected. Covered by `signature`.
+    pub mode: u8,
     pub server_nonce: Vec<u8>,
     pub server_ephemeral: Vec<u8>,
     pub server_public_key: Vec<u8>,

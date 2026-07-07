@@ -27,7 +27,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use jsony::Jsony;
 
-use crate::crypto::{TAG_LEN, TRANSPORT_HEADER_LEN};
+use crate::crypto::{self, AUTH_PROOF_LEN, TAG_LEN, TRANSPORT_HEADER_LEN, TransportMode};
 use crate::evented::{ReadPumpOutcome, Readiness};
 use crate::ids::{SessionId, StreamId};
 
@@ -57,6 +57,66 @@ pub const MAX_VIDEO_HELLO_BYTES: usize = 4 * 1024;
 pub enum VideoRole {
     Publisher,
     Subscriber,
+}
+
+impl VideoRole {
+    fn proof_byte(self) -> u8 {
+        match self {
+            VideoRole::Publisher => 0,
+            VideoRole::Subscriber => 1,
+        }
+    }
+}
+
+/// Domain-separated message the external-link video auth proof covers, binding
+/// the connection's identity, role, and transport mode so a proof issued for one
+/// stream/role/session cannot be reused for another.
+fn video_auth_message(
+    session_id: SessionId,
+    stream_id: StreamId,
+    role: VideoRole,
+    mode: TransportMode,
+) -> [u8; 39] {
+    let mut msg = [0u8; 39];
+    msg[0..25].copy_from_slice(b"chatt video auth proof v1");
+    msg[25..33].copy_from_slice(&session_id.0.to_le_bytes());
+    msg[33..37].copy_from_slice(&stream_id.0.to_le_bytes());
+    msg[37] = role.proof_byte();
+    msg[38] = mode.wire_id();
+    msg
+}
+
+/// Computes the external-link video auth proof: a truncated HMAC under the
+/// session's video auth key proving the connecting peer completed the session
+/// handshake. In native-encrypted mode possession is proven by opening the AEAD
+/// auth record instead, so this is unused there.
+pub fn video_auth_proof(
+    video_auth_key: &[u8],
+    session_id: SessionId,
+    stream_id: StreamId,
+    role: VideoRole,
+    mode: TransportMode,
+) -> [u8; AUTH_PROOF_LEN] {
+    crypto::auth_proof(
+        video_auth_key,
+        &video_auth_message(session_id, stream_id, role, mode),
+    )
+}
+
+/// Verifies a [`video_auth_proof`] in constant time.
+pub fn video_auth_proof_verify(
+    video_auth_key: &[u8],
+    session_id: SessionId,
+    stream_id: StreamId,
+    role: VideoRole,
+    mode: TransportMode,
+    tag: &[u8],
+) -> bool {
+    crypto::auth_proof_verify(
+        video_auth_key,
+        &video_auth_message(session_id, stream_id, role, mode),
+        tag,
+    )
 }
 
 /// The first record on a video connection, sent in the clear. The server needs
@@ -464,6 +524,63 @@ pub fn decode_video_ack(bytes: &[u8]) -> Result<VideoAck, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn video_auth_proof_binds_identity_and_role() {
+        let key = [4u8; crate::crypto::KEY_LEN];
+        let mode = TransportMode::ExternalSecureLink;
+        let proof = video_auth_proof(&key, SessionId(7), StreamId(3), VideoRole::Publisher, mode);
+        assert!(video_auth_proof_verify(
+            &key,
+            SessionId(7),
+            StreamId(3),
+            VideoRole::Publisher,
+            mode,
+            &proof
+        ));
+        // A proof for one connection must not verify for a different role,
+        // stream, session, key, or transport mode.
+        assert!(!video_auth_proof_verify(
+            &key,
+            SessionId(7),
+            StreamId(3),
+            VideoRole::Subscriber,
+            mode,
+            &proof
+        ));
+        assert!(!video_auth_proof_verify(
+            &key,
+            SessionId(8),
+            StreamId(3),
+            VideoRole::Publisher,
+            mode,
+            &proof
+        ));
+        assert!(!video_auth_proof_verify(
+            &key,
+            SessionId(7),
+            StreamId(4),
+            VideoRole::Publisher,
+            mode,
+            &proof
+        ));
+        assert!(!video_auth_proof_verify(
+            &[5u8; crate::crypto::KEY_LEN],
+            SessionId(7),
+            StreamId(3),
+            VideoRole::Publisher,
+            mode,
+            &proof
+        ));
+        assert!(!video_auth_proof_verify(
+            &key,
+            SessionId(7),
+            StreamId(3),
+            VideoRole::Publisher,
+            TransportMode::NativeEncrypted,
+            &proof
+        ));
+    }
 
     #[test]
     fn video_frame_round_trips() {

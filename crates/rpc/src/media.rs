@@ -1,11 +1,10 @@
-use crate::crypto::{self, AntiReplay, CryptoError, KeyMaterial};
-use crate::ids::{SessionId, StreamId};
+use crate::crypto::{self, AntiReplay, CryptoError, KeyMaterial, SessionTransport, TransportMode};
+use crate::ids::StreamId;
 
 pub const UDP_VERSION: u8 = 4;
 pub const UDP_HEADER_LEN: usize = 14;
 pub const SAFE_UDP_PAYLOAD_BYTES: usize = 1_200;
 pub const MAX_VOICE_PAYLOAD_BYTES: usize = 1_024;
-pub const PLAINTEXT_KEY_ID: u32 = 0;
 
 pub const KIND_BIND: u8 = 1;
 pub const KIND_VOICE: u8 = 2;
@@ -22,17 +21,21 @@ const VOICE_PAYLOAD_SILENCE: u8 = 1;
 pub struct UdpHeader {
     pub version: u8,
     pub kind: u8,
-    pub key_id: u32,
+    /// Per-session UDP demux tag. For server-session datagrams this is the
+    /// session's derived media route id; for direct P2P peer datagrams it is the
+    /// peer key id. Authenticated as AAD (native) or covered by the bind proof
+    /// (external-link `Bind`).
+    pub route_id: u32,
     pub counter: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum MediaPayload {
-    Bind {
-        session_id: SessionId,
-    },
+    /// Claims (or refreshes) the session's UDP address. The session is
+    /// identified by the datagram's route id; the media codec adds the address
+    /// proof on the wire in external-link mode.
+    Bind,
     NatProbe {
-        session_id: SessionId,
         probe_id: u8,
     },
     Voice {
@@ -143,22 +146,214 @@ impl From<CryptoError> for MediaError {
     }
 }
 
+/// How a session's UDP media datagrams are protected, selected once from the
+/// session [`TransportMode`].
+///
+/// `Aead` seals every datagram with the directional session keys and demuxes by
+/// `route_id`. `Clear` sends payloads in the clear (the outer secure link
+/// protects them) but authenticates `Bind` address claims with a truncated HMAC
+/// under `bind_key`, so a spoofed datagram cannot rebind the session.
+#[derive(Clone)]
+pub enum MediaProtection {
+    Aead {
+        route_id: u32,
+        send: KeyMaterial,
+        recv: KeyMaterial,
+    },
+    Clear {
+        route_id: u32,
+        bind_key: [u8; crypto::KEY_LEN],
+        mode: TransportMode,
+    },
+}
+
+impl MediaProtection {
+    /// Builds the media codec selected by the session's negotiated mode.
+    pub fn from_transport(transport: &SessionTransport) -> Self {
+        match transport.mode {
+            TransportMode::NativeEncrypted => MediaProtection::Aead {
+                route_id: transport.route_id,
+                send: transport.secrets.media_send.clone(),
+                recv: transport.secrets.media_recv.clone(),
+            },
+            TransportMode::ExternalSecureLink => MediaProtection::Clear {
+                route_id: transport.route_id,
+                bind_key: transport.bind_key,
+                mode: transport.mode,
+            },
+        }
+    }
+
+    pub fn route_id(&self) -> u32 {
+        match self {
+            MediaProtection::Aead { route_id, .. } | MediaProtection::Clear { route_id, .. } => {
+                *route_id
+            }
+        }
+    }
+}
+
+/// Proof that an opened datagram may act on the session's UDP address.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AddressProof {
+    /// Native-encrypted: the whole datagram is AEAD-authenticated.
+    AuthenticatedDatagram,
+    /// External-link `Bind`: the address claim carries a valid bind proof.
+    AuthenticatedAddressClaim,
+    /// External-link data: unauthenticated by chatt, accepted only from the
+    /// already-bound address.
+    None,
+}
+
+/// A successfully opened media datagram together with its address-proof status.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OpenedMedia {
+    pub header: UdpHeader,
+    pub payload: MediaPayload,
+    pub address_proof: AddressProof,
+}
+
+/// Domain-separated message covered by the external-link `Bind` proof. Binds the
+/// route id, UDP kind, counter, and selected mode so a proof cannot be replayed
+/// under a different session, kind, counter, or transport mode.
+fn bind_proof_message(route_id: u32, kind: u8, counter: u64, mode: TransportMode) -> [u8; 39] {
+    let mut msg = [0u8; 39];
+    msg[0..25].copy_from_slice(b"chatt media bind proof v1");
+    msg[25..29].copy_from_slice(&route_id.to_le_bytes());
+    msg[29] = kind;
+    msg[30..38].copy_from_slice(&counter.to_le_bytes());
+    msg[38] = mode.wire_id();
+    msg
+}
+
 pub fn seal_media(
-    key: &KeyMaterial,
+    protection: &MediaProtection,
     counter: u64,
     payload: &MediaPayload,
 ) -> Result<Vec<u8>, MediaError> {
     let mut packet = Vec::new();
     let mut scratch = Vec::new();
-    seal_media_into(key, counter, payload, &mut packet, &mut scratch)?;
+    seal_media_into(protection, counter, payload, &mut packet, &mut scratch)?;
     Ok(packet)
 }
 
-/// Seals `payload` into `packet` as a UDP media datagram, reusing `scratch` for
-/// the encoded plaintext. Both buffers are cleared first, so callers reuse them
-/// across frames to avoid per-frame allocation. Produces the same bytes as
-/// [`seal_media`].
+/// Seals `payload` into `packet` as a UDP media datagram under `protection`,
+/// reusing `scratch` for the encoded plaintext. Both buffers are cleared first,
+/// so callers reuse them across frames to avoid per-frame allocation.
+///
+/// In `Aead` mode the body is AEAD-sealed. In `Clear` mode the body is written
+/// in the clear; a `Bind` additionally carries a 16-byte proof, so voice and the
+/// other data kinds add no per-packet overhead beyond the shared UDP header.
 pub fn seal_media_into(
+    protection: &MediaProtection,
+    counter: u64,
+    payload: &MediaPayload,
+    packet: &mut Vec<u8>,
+    scratch: &mut Vec<u8>,
+) -> Result<(), MediaError> {
+    let kind = payload.kind();
+    scratch.clear();
+    encode_payload_into(payload, scratch)?;
+    if scratch.len() > SAFE_UDP_PAYLOAD_BYTES {
+        return Err(MediaError::PayloadTooLarge);
+    }
+
+    packet.clear();
+    packet.push(UDP_VERSION);
+    packet.push(kind);
+    packet.extend_from_slice(&protection.route_id().to_le_bytes());
+    packet.extend_from_slice(&counter.to_le_bytes());
+    let cipher_start = packet.len();
+    debug_assert_eq!(cipher_start, UDP_HEADER_LEN);
+    packet.extend_from_slice(scratch);
+
+    match protection {
+        MediaProtection::Aead { send, .. } => {
+            // `packet[2..UDP_HEADER_LEN]` (route id + counter) is authenticated as
+            // AAD instead of carrying a second copy in the body.
+            let mut aad = [0u8; 1 + crypto::TRANSPORT_HEADER_LEN];
+            aad[0] = crypto::CHANNEL_MEDIA;
+            aad[1..].copy_from_slice(&packet[2..UDP_HEADER_LEN]);
+            crypto::seal_in_place_append_tag(send, counter, &aad, cipher_start, packet)?;
+        }
+        MediaProtection::Clear { bind_key, mode, .. } => {
+            if kind == KIND_BIND {
+                let message = bind_proof_message(protection.route_id(), kind, counter, *mode);
+                packet.extend_from_slice(&crypto::auth_proof(bind_key, &message));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Opens a session UDP media datagram under `protection`, returning the header,
+/// decoded payload, and how far the datagram is authenticated. Anti-replay is
+/// enforced for authenticated datagrams only: every `Aead` datagram, and every
+/// `Clear` `Bind` after its proof verifies. Clear data kinds are unauthenticated
+/// by chatt (the outer link protects them) and carry no replay state.
+pub fn open_media(
+    protection: &MediaProtection,
+    replay: &mut AntiReplay,
+    bytes: &[u8],
+) -> Result<OpenedMedia, MediaError> {
+    let (header, body) = parse_header(bytes)?;
+    if header.route_id != protection.route_id() {
+        return Err(CryptoError::WrongKeyId.into());
+    }
+
+    match protection {
+        MediaProtection::Aead { recv, .. } => {
+            let mut buf = body.to_vec();
+            let mut aad = [0u8; 1 + crypto::TRANSPORT_HEADER_LEN];
+            aad[0] = crypto::CHANNEL_MEDIA;
+            aad[1..].copy_from_slice(&bytes[2..UDP_HEADER_LEN]);
+            let plaintext_len =
+                crypto::open_in_place_with_aad(recv, header.counter, &aad, &mut buf)?;
+            buf.truncate(plaintext_len);
+            if !replay.update(header.counter) {
+                return Err(MediaError::Replay);
+            }
+            Ok(OpenedMedia {
+                header,
+                payload: decode_payload(header.kind, &buf)?,
+                address_proof: AddressProof::AuthenticatedDatagram,
+            })
+        }
+        MediaProtection::Clear { bind_key, mode, .. } => {
+            if header.kind == KIND_BIND {
+                if body.len() < crypto::AUTH_PROOF_LEN {
+                    return Err(MediaError::InvalidPayload);
+                }
+                let split = body.len() - crypto::AUTH_PROOF_LEN;
+                let (payload_bytes, proof) = body.split_at(split);
+                let message =
+                    bind_proof_message(header.route_id, header.kind, header.counter, *mode);
+                if !crypto::auth_proof_verify(bind_key, &message, proof) {
+                    return Err(MediaError::Crypto("bind proof mismatch".to_string()));
+                }
+                if !replay.update(header.counter) {
+                    return Err(MediaError::Replay);
+                }
+                Ok(OpenedMedia {
+                    header,
+                    payload: decode_payload(header.kind, payload_bytes)?,
+                    address_proof: AddressProof::AuthenticatedAddressClaim,
+                })
+            } else {
+                Ok(OpenedMedia {
+                    header,
+                    payload: decode_payload(header.kind, body)?,
+                    address_proof: AddressProof::None,
+                })
+            }
+        }
+    }
+}
+
+/// Seals a direct P2P peer datagram under a raw AEAD `key`, using the key id as
+/// the header route tag. P2P runs only in native-encrypted mode, so peer media
+/// is always AEAD; this is the raw-key counterpart to [`seal_media_into`].
+pub fn seal_peer_media_into(
     key: &KeyMaterial,
     counter: u64,
     payload: &MediaPayload,
@@ -177,8 +372,6 @@ pub fn seal_media_into(
     packet.push(kind);
     packet.extend_from_slice(&key.id.to_le_bytes());
     packet.extend_from_slice(&counter.to_le_bytes());
-    // `packet[2..UDP_HEADER_LEN]` is the transport header (key id + counter); it
-    // is authenticated as AAD instead of carrying a second copy in the body.
     let cipher_start = packet.len();
     debug_assert_eq!(cipher_start, UDP_HEADER_LEN);
     packet.extend_from_slice(scratch);
@@ -190,49 +383,31 @@ pub fn seal_media_into(
     Ok(())
 }
 
-pub fn seal_plaintext_media(counter: u64, payload: &MediaPayload) -> Result<Vec<u8>, MediaError> {
+pub fn seal_peer_media(
+    key: &KeyMaterial,
+    counter: u64,
+    payload: &MediaPayload,
+) -> Result<Vec<u8>, MediaError> {
     let mut packet = Vec::new();
     let mut scratch = Vec::new();
-    seal_plaintext_media_into(counter, payload, &mut packet, &mut scratch)?;
+    seal_peer_media_into(key, counter, payload, &mut packet, &mut scratch)?;
     Ok(packet)
 }
 
-/// Buffer-reusing counterpart to [`seal_plaintext_media`]. Clears `packet` and
-/// `scratch` before use.
-pub fn seal_plaintext_media_into(
-    counter: u64,
-    payload: &MediaPayload,
-    packet: &mut Vec<u8>,
-    scratch: &mut Vec<u8>,
-) -> Result<(), MediaError> {
-    let kind = payload.kind();
-    scratch.clear();
-    encode_payload_into(payload, scratch)?;
-    if scratch.len() > SAFE_UDP_PAYLOAD_BYTES {
-        return Err(MediaError::PayloadTooLarge);
-    }
-
-    packet.clear();
-    packet.push(UDP_VERSION);
-    packet.push(kind);
-    packet.extend_from_slice(&PLAINTEXT_KEY_ID.to_le_bytes());
-    packet.extend_from_slice(&counter.to_le_bytes());
-    packet.extend_from_slice(scratch);
-    Ok(())
-}
-
-pub fn open_media(
+/// Opens a direct P2P peer datagram sealed by [`seal_peer_media_into`], checking
+/// the header route tag against `key.id` and enforcing anti-replay.
+pub fn open_peer_media(
     key: &KeyMaterial,
     replay: &mut AntiReplay,
     bytes: &[u8],
 ) -> Result<(UdpHeader, MediaPayload), MediaError> {
     let (header, body) = parse_header(bytes)?;
-    if header.key_id != key.id {
+    if header.route_id != key.id {
         return Err(CryptoError::WrongKeyId.into());
     }
 
     let mut transport = Vec::with_capacity(crypto::TRANSPORT_HEADER_LEN + body.len());
-    transport.extend_from_slice(&header.key_id.to_le_bytes());
+    transport.extend_from_slice(&header.route_id.to_le_bytes());
     transport.extend_from_slice(&header.counter.to_le_bytes());
     transport.extend_from_slice(body);
     let (_, plaintext) = crypto::open_with_key(key, crypto::CHANNEL_MEDIA, &transport)?;
@@ -240,14 +415,6 @@ pub fn open_media(
         return Err(MediaError::Replay);
     }
     Ok((header, decode_payload(header.kind, &plaintext)?))
-}
-
-pub fn open_plaintext_media(bytes: &[u8]) -> Result<(UdpHeader, MediaPayload), MediaError> {
-    let (header, body) = parse_header(bytes)?;
-    if header.key_id != PLAINTEXT_KEY_ID {
-        return Err(CryptoError::WrongKeyId.into());
-    }
-    Ok((header, decode_payload(header.kind, body)?))
 }
 
 pub fn parse_header(bytes: &[u8]) -> Result<(UdpHeader, &[u8]), MediaError> {
@@ -274,7 +441,7 @@ pub fn parse_header(bytes: &[u8]) -> Result<(UdpHeader, &[u8]), MediaError> {
         UdpHeader {
             version,
             kind,
-            key_id: u32::from_le_bytes(bytes[2..6].try_into().unwrap()),
+            route_id: u32::from_le_bytes(bytes[2..6].try_into().unwrap()),
             counter: u64::from_le_bytes(bytes[6..14].try_into().unwrap()),
         },
         &bytes[UDP_HEADER_LEN..],
@@ -284,7 +451,7 @@ pub fn parse_header(bytes: &[u8]) -> Result<(UdpHeader, &[u8]), MediaError> {
 impl MediaPayload {
     pub fn kind(&self) -> u8 {
         match self {
-            MediaPayload::Bind { .. } => KIND_BIND,
+            MediaPayload::Bind => KIND_BIND,
             MediaPayload::NatProbe { .. } => KIND_NAT_PROBE,
             MediaPayload::Voice { .. } => KIND_VOICE,
             MediaPayload::PeerVoice { .. } => KIND_PEER_VOICE,
@@ -307,14 +474,8 @@ pub fn encode_payload(payload: &MediaPayload) -> Result<Vec<u8>, MediaError> {
 pub fn encode_payload_into(payload: &MediaPayload, out: &mut Vec<u8>) -> Result<(), MediaError> {
     out.push(payload.kind());
     match payload {
-        MediaPayload::Bind { session_id } => {
-            out.extend_from_slice(&session_id.0.to_le_bytes());
-        }
-        MediaPayload::NatProbe {
-            session_id,
-            probe_id,
-        } => {
-            out.extend_from_slice(&session_id.0.to_le_bytes());
+        MediaPayload::Bind => {}
+        MediaPayload::NatProbe { probe_id } => {
             out.push(*probe_id);
         }
         MediaPayload::Voice {
@@ -390,21 +551,16 @@ pub fn decode_payload(kind: u8, bytes: &[u8]) -> Result<MediaPayload, MediaError
     }
     match kind {
         KIND_BIND => {
-            if bytes.len() != 8 {
+            if !bytes.is_empty() {
                 return Err(MediaError::InvalidPayload);
             }
-            Ok(MediaPayload::Bind {
-                session_id: SessionId(u64::from_le_bytes(bytes.try_into().unwrap())),
-            })
+            Ok(MediaPayload::Bind)
         }
         KIND_NAT_PROBE => {
-            if bytes.len() != 9 {
+            if bytes.len() != 1 {
                 return Err(MediaError::InvalidPayload);
             }
-            Ok(MediaPayload::NatProbe {
-                session_id: SessionId(u64::from_le_bytes(bytes[0..8].try_into().unwrap())),
-                probe_id: bytes[8],
-            })
+            Ok(MediaPayload::NatProbe { probe_id: bytes[0] })
         }
         KIND_VOICE => {
             if bytes.len() < 16 {
@@ -664,12 +820,32 @@ mod tests {
 
     #[test]
     fn nat_probe_payload_round_trips() {
-        let payload = MediaPayload::NatProbe {
-            session_id: SessionId(42),
-            probe_id: 2,
-        };
+        let payload = MediaPayload::NatProbe { probe_id: 2 };
         let encoded = encode_payload(&payload).unwrap();
         assert_eq!(decode_payload(KIND_NAT_PROBE, &encoded).unwrap(), payload);
+    }
+
+    fn aead_protection(route_id: u32) -> MediaProtection {
+        // A self-test protection whose send and recv keys match, so one instance
+        // both seals and opens a datagram (as a client's send key matches the
+        // server's recv key for that session).
+        let key = KeyMaterial {
+            id: 42,
+            bytes: [7; crypto::KEY_LEN],
+        };
+        MediaProtection::Aead {
+            route_id,
+            send: key.clone(),
+            recv: key,
+        }
+    }
+
+    fn clear_protection(route_id: u32) -> MediaProtection {
+        MediaProtection::Clear {
+            route_id,
+            bind_key: [3; crypto::KEY_LEN],
+            mode: TransportMode::ExternalSecureLink,
+        }
     }
 
     #[test]
@@ -693,47 +869,125 @@ mod tests {
     }
 
     #[test]
-    fn encrypted_media_round_trips_and_rejects_replay() {
-        let key = KeyMaterial {
-            id: 77,
-            bytes: [8; crypto::KEY_LEN],
-        };
+    fn native_media_round_trips_and_rejects_replay() {
+        let protection = aead_protection(9);
         let payload = MediaPayload::Ping {
             nonce: 123,
             observed_rtt_ms: Some(25),
         };
-        let packet = seal_media(&key, 0, &payload).unwrap();
+        let packet = seal_media(&protection, 0, &payload).unwrap();
         let mut replay = AntiReplay::new();
-        assert_eq!(open_media(&key, &mut replay, &packet).unwrap().1, payload);
+        let opened = open_media(&protection, &mut replay, &packet).unwrap();
+        assert_eq!(opened.payload, payload);
+        assert_eq!(opened.address_proof, AddressProof::AuthenticatedDatagram);
         assert_eq!(
-            open_media(&key, &mut replay, &packet).unwrap_err(),
+            open_media(&protection, &mut replay, &packet).unwrap_err(),
             MediaError::Replay
         );
     }
 
     #[test]
-    fn plaintext_media_round_trips_and_rejects_replay() {
-        let payload = MediaPayload::Ping {
-            nonce: 123,
-            observed_rtt_ms: None,
-        };
-        let packet = seal_plaintext_media(0, &payload).unwrap();
-        let (header, decoded) = open_plaintext_media(&packet).unwrap();
-        assert_eq!(header.key_id, PLAINTEXT_KEY_ID);
-        assert_eq!(decoded, payload);
-
+    fn native_media_rejects_tamper() {
+        let protection = aead_protection(9);
+        let payload = MediaPayload::Pong { nonce: 7 };
+        let mut packet = seal_media(&protection, 0, &payload).unwrap();
+        let last = packet.len() - 1;
+        packet[last] ^= 0x55;
         let mut replay = AntiReplay::new();
-        assert!(replay.update(header.counter));
-        assert_eq!(open_plaintext_media(&packet).unwrap().1, payload);
-        assert!(!replay.update(header.counter));
+        assert!(open_media(&protection, &mut replay, &packet).is_err());
+    }
+
+    #[test]
+    fn media_open_rejects_wrong_route_id() {
+        let payload = MediaPayload::Pong { nonce: 7 };
+        let packet = seal_media(&aead_protection(9), 0, &payload).unwrap();
+        let mut replay = AntiReplay::new();
+        assert_eq!(
+            open_media(&aead_protection(10), &mut replay, &packet).unwrap_err(),
+            MediaError::Crypto(CryptoError::WrongKeyId.to_string())
+        );
+    }
+
+    #[test]
+    fn external_voice_has_no_aead_overhead() {
+        let protection = clear_protection(9);
+        let payload = MediaPayload::Voice {
+            stream_id: StreamId(5),
+            sequence: 9,
+            timestamp: 8_640,
+            flags: 0,
+            payload: VoicePayload::Opus(vec![1, 2, 3, 4, 5, 6, 7, 8]),
+        };
+        let packet = seal_media(&protection, 0, &payload).unwrap();
+        // Clear voice carries exactly the UDP header plus the encoded payload —
+        // no transport header, tag, or bind proof.
+        assert_eq!(
+            packet.len(),
+            UDP_HEADER_LEN + encode_payload(&payload).unwrap().len()
+        );
+        let mut replay = AntiReplay::new();
+        let opened = open_media(&protection, &mut replay, &packet).unwrap();
+        assert_eq!(opened.payload, payload);
+        assert_eq!(opened.address_proof, AddressProof::None);
+    }
+
+    #[test]
+    fn external_bind_with_valid_proof_binds() {
+        let protection = clear_protection(9);
+        let packet = seal_media(&protection, 0, &MediaPayload::Bind).unwrap();
+        let mut replay = AntiReplay::new();
+        let opened = open_media(&protection, &mut replay, &packet).unwrap();
+        assert_eq!(opened.payload, MediaPayload::Bind);
+        assert_eq!(
+            opened.address_proof,
+            AddressProof::AuthenticatedAddressClaim
+        );
+    }
+
+    #[test]
+    fn external_bind_with_wrong_proof_is_rejected() {
+        let protection = clear_protection(9);
+        let mut packet = seal_media(&protection, 0, &MediaPayload::Bind).unwrap();
+        let last = packet.len() - 1;
+        packet[last] ^= 0x01;
+        let mut replay = AntiReplay::new();
+        assert!(open_media(&protection, &mut replay, &packet).is_err());
+    }
+
+    #[test]
+    fn external_bind_from_wrong_key_is_rejected() {
+        // A blind spoofer without the bind key cannot forge an accepted Bind.
+        let sender = MediaProtection::Clear {
+            route_id: 9,
+            bind_key: [1; crypto::KEY_LEN],
+            mode: TransportMode::ExternalSecureLink,
+        };
+        let receiver = MediaProtection::Clear {
+            route_id: 9,
+            bind_key: [2; crypto::KEY_LEN],
+            mode: TransportMode::ExternalSecureLink,
+        };
+        let packet = seal_media(&sender, 0, &MediaPayload::Bind).unwrap();
+        let mut replay = AntiReplay::new();
+        assert!(open_media(&receiver, &mut replay, &packet).is_err());
+    }
+
+    #[test]
+    fn external_bind_replay_is_rejected() {
+        let protection = clear_protection(9);
+        let packet = seal_media(&protection, 5, &MediaPayload::Bind).unwrap();
+        let mut replay = AntiReplay::new();
+        assert!(open_media(&protection, &mut replay, &packet).is_ok());
+        // A previously accepted Bind (same counter) cannot roll the session back.
+        assert_eq!(
+            open_media(&protection, &mut replay, &packet).unwrap_err(),
+            MediaError::Replay
+        );
     }
 
     #[test]
     fn seal_media_into_matches_seal_media_byte_for_byte() {
-        let key = KeyMaterial {
-            id: 77,
-            bytes: [8; crypto::KEY_LEN],
-        };
+        let protection = aead_protection(9);
         let payload = MediaPayload::Voice {
             stream_id: StreamId(5),
             sequence: 9,
@@ -742,78 +996,47 @@ mod tests {
             payload: VoicePayload::Opus(vec![1, 2, 3, 4, 5, 6, 7, 8]),
         };
 
-        let expected = seal_media(&key, 3, &payload).unwrap();
+        let expected = seal_media(&protection, 3, &payload).unwrap();
 
         // Pre-populate the reusable buffers with stale data to prove they are
         // cleared, mirroring the steady-state reuse in the client worker.
         let mut packet = vec![0xAA; 64];
         let mut scratch = vec![0xBB; 64];
-        seal_media_into(&key, 3, &payload, &mut packet, &mut scratch).unwrap();
+        seal_media_into(&protection, 3, &payload, &mut packet, &mut scratch).unwrap();
         assert_eq!(packet, expected);
 
         let mut replay = AntiReplay::new();
-        assert_eq!(open_media(&key, &mut replay, &packet).unwrap().1, payload);
+        assert_eq!(
+            open_media(&protection, &mut replay, &packet)
+                .unwrap()
+                .payload,
+            payload
+        );
     }
 
     #[test]
-    fn seal_media_into_matches_seal_media_across_fan_out() {
-        // The server relay reuses one packet/scratch pair while sealing the
-        // same payload for many recipients under different keys and counters;
-        // every sealed datagram must match the allocating path byte for byte.
-        let keys = [
-            KeyMaterial {
-                id: 7,
-                bytes: [1; crypto::KEY_LEN],
-            },
-            KeyMaterial {
-                id: 8,
-                bytes: [2; crypto::KEY_LEN],
-            },
-        ];
-        let payloads = [
-            MediaPayload::Voice {
-                stream_id: StreamId(5),
-                sequence: 9,
-                timestamp: 8_640,
-                flags: 0,
-                payload: VoicePayload::Opus(vec![1, 2, 3, 4, 5, 6, 7, 8]),
-            },
-            MediaPayload::Voice {
-                stream_id: StreamId(5),
-                sequence: 10,
-                timestamp: 9_600,
-                flags: 1,
-                payload: VoicePayload::Silence,
-            },
-            MediaPayload::Pong { nonce: 44 },
-        ];
-
-        let mut packet = Vec::new();
-        let mut scratch = Vec::new();
-        let mut counter = 0u64;
-        for payload in &payloads {
-            for key in &keys {
-                let expected = seal_media(key, counter, payload).unwrap();
-                seal_media_into(key, counter, payload, &mut packet, &mut scratch).unwrap();
-                assert_eq!(packet, expected);
-                counter += 1;
-            }
-        }
-    }
-
-    #[test]
-    fn seal_plaintext_media_into_matches_seal_plaintext_media() {
-        let payload = MediaPayload::Voice {
-            stream_id: StreamId(5),
-            sequence: 9,
-            timestamp: 8_640,
-            flags: 0,
+    fn peer_media_round_trips_and_rejects_replay() {
+        let key = KeyMaterial {
+            id: 77,
+            bytes: [8; crypto::KEY_LEN],
+        };
+        let payload = MediaPayload::PeerVoice {
+            connection_id: 99,
+            stream_id: StreamId(9),
+            sequence: 42,
+            timestamp: 40_320,
+            flags: 3,
             payload: VoicePayload::Opus(vec![1, 2, 3]),
         };
-        let expected = seal_plaintext_media(6, &payload).unwrap();
-        let mut packet = vec![0xAA; 64];
-        let mut scratch = vec![0xBB; 64];
-        seal_plaintext_media_into(6, &payload, &mut packet, &mut scratch).unwrap();
-        assert_eq!(packet, expected);
+        let packet = seal_peer_media(&key, 0, &payload).unwrap();
+        let mut replay = AntiReplay::new();
+        assert_eq!(
+            open_peer_media(&key, &mut replay, &packet).unwrap().1,
+            payload
+        );
+        assert_eq!(
+            open_peer_media(&key, &mut replay, &packet).unwrap_err(),
+            MediaError::Replay
+        );
     }
 }

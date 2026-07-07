@@ -91,10 +91,79 @@ pub struct SessionSecrets {
     pub media_recv: KeyMaterial,
 }
 
+/// The trust boundary a session runs under, negotiated by the signed handshake.
+///
+/// Both modes derive full session material; the mode only decides whether chatt
+/// itself protects record and datagram payloads or defers to an outer secure
+/// link.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TransportMode {
+    /// Chatt secures the wire: control, media, video, and file payloads are AEAD
+    /// protected by session keys.
+    NativeEncrypted,
+    /// An outer tunnel secures the wire: payloads travel clear after the signed
+    /// handshake, but UDP address claims still carry proof of possession. P2P is
+    /// unavailable because it would bypass the outer link.
+    ExternalSecureLink,
+}
+
+impl TransportMode {
+    pub const fn wire_id(self) -> u8 {
+        match self {
+            TransportMode::NativeEncrypted => 1,
+            TransportMode::ExternalSecureLink => 2,
+        }
+    }
+
+    pub fn from_wire_id(id: u8) -> Option<Self> {
+        match id {
+            1 => Some(TransportMode::NativeEncrypted),
+            2 => Some(TransportMode::ExternalSecureLink),
+            _ => None,
+        }
+    }
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            TransportMode::NativeEncrypted => "native-encrypted",
+            TransportMode::ExternalSecureLink => "external-secure-link",
+        }
+    }
+
+    /// The transport-mode ids this build supports, advertised in `ClientHello`.
+    pub fn supported_wire_ids() -> Vec<u8> {
+        vec![
+            TransportMode::NativeEncrypted.wire_id(),
+            TransportMode::ExternalSecureLink.wire_id(),
+        ]
+    }
+}
+
+/// Everything a session derives from the handshake: the negotiated mode, the
+/// directional AEAD material, the UDP demux route id, and the auth keys for
+/// external-link UDP address claims and video connection setup. This is the
+/// object callers ask to build the concrete lane codecs; they do not choose
+/// per-lane security states.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum HandshakeMode {
-    Encrypted(SessionSecrets),
-    Plaintext,
+pub struct SessionTransport {
+    pub mode: TransportMode,
+    pub secrets: SessionSecrets,
+    pub route_id: u32,
+    pub bind_key: [u8; KEY_LEN],
+    pub video_auth_key: [u8; KEY_LEN],
+}
+
+impl SessionTransport {
+    /// Builds the control-lane record codec selected by the session mode.
+    pub fn control_record(&self) -> RecordProtection {
+        match self.mode {
+            TransportMode::NativeEncrypted => RecordProtection::aead(
+                self.secrets.control_send.clone(),
+                self.secrets.control_recv.clone(),
+            ),
+            TransportMode::ExternalSecureLink => RecordProtection::clear(),
+        }
+    }
 }
 
 pub struct ClientHandshake {
@@ -104,11 +173,7 @@ pub struct ClientHandshake {
 
 pub struct ServerHandshake {
     pub hello: ServerHello,
-    pub secrets: SessionSecrets,
-}
-
-pub struct PlaintextServerHandshake {
-    pub hello: ServerHello,
+    pub transport: SessionTransport,
 }
 
 pub fn dev_server_public_key() -> [u8; ED25519_PUBLIC_KEY_LEN] {
@@ -191,18 +256,29 @@ pub fn generate_client_hello(rng: &dyn rand::SecureRandom) -> Result<ClientHands
         private,
         hello: ClientHello {
             version: PROTOCOL_VERSION,
+            modes: TransportMode::supported_wire_ids(),
             client_nonce: nonce.to_vec(),
             client_ephemeral: public.as_ref().to_vec(),
         },
     })
 }
 
+/// Runs the server side of the signed handshake for the server-selected
+/// transport `mode`, deriving full session material regardless of mode.
+///
+/// The client must have advertised `mode` in its `ClientHello`; otherwise the
+/// connection is rejected. The signature covers the selected mode and both
+/// ephemeral keys, so a downgrade cannot be forged.
 pub fn respond_to_client_hello(
     rng: &dyn rand::SecureRandom,
     server_key_pair: &signature::Ed25519KeyPair,
     client_hello: &ClientHello,
+    mode: TransportMode,
 ) -> Result<ServerHandshake, CryptoError> {
     validate_client_hello(client_hello)?;
+    if !client_hello.modes.contains(&mode.wire_id()) {
+        return Err(CryptoError::InvalidHandshake);
+    }
     let private = agreement::EphemeralPrivateKey::generate(&agreement::X25519, rng)
         .map_err(|_| CryptoError::Random)?;
     let public = private
@@ -221,7 +297,7 @@ pub fn respond_to_client_hello(
     let unsigned = server_transcript(
         client_hello,
         PROTOCOL_VERSION,
-        true,
+        mode.wire_id(),
         &nonce,
         public.as_ref(),
         server_key_pair.public_key().as_ref(),
@@ -229,86 +305,47 @@ pub fn respond_to_client_hello(
     let signature = server_key_pair.sign(&unsigned);
     let hello = ServerHello {
         version: PROTOCOL_VERSION,
-        encrypted: true,
+        mode: mode.wire_id(),
         server_nonce: nonce.to_vec(),
         server_ephemeral: public.as_ref().to_vec(),
         server_public_key: server_key_pair.public_key().as_ref().to_vec(),
         signature: signature.as_ref().to_vec(),
     };
     let transcript = full_transcript(client_hello, &hello, server_key_pair.public_key().as_ref())?;
-    let secrets = derive_session_secrets(Role::Server, &shared, &transcript);
-    Ok(ServerHandshake { hello, secrets })
+    let transport = derive_session_transport(Role::Server, mode, &shared, &transcript);
+    Ok(ServerHandshake { hello, transport })
 }
 
-pub fn respond_to_client_hello_plaintext(
-    rng: &dyn rand::SecureRandom,
-    server_key_pair: &signature::Ed25519KeyPair,
-    client_hello: &ClientHello,
-) -> Result<PlaintextServerHandshake, CryptoError> {
-    validate_client_hello(client_hello)?;
-    let mut nonce = [0u8; NONCE_LEN];
-    rng.fill(&mut nonce).map_err(|_| CryptoError::Random)?;
-    let unsigned = server_transcript(
-        client_hello,
-        PROTOCOL_VERSION,
-        false,
-        &nonce,
-        &[],
-        server_key_pair.public_key().as_ref(),
-    );
-    let signature = server_key_pair.sign(&unsigned);
-    Ok(PlaintextServerHandshake {
-        hello: ServerHello {
-            version: PROTOCOL_VERSION,
-            encrypted: false,
-            server_nonce: nonce.to_vec(),
-            server_ephemeral: Vec::new(),
-            server_public_key: server_key_pair.public_key().as_ref().to_vec(),
-            signature: signature.as_ref().to_vec(),
-        },
-    })
-}
-
-/// Completes the client handshake, returning the negotiated transport mode and
-/// the Ed25519 key that was trusted. When `pinned_server_public_key` is `None`
-/// the server's presented key is trusted on first use and returned so the caller
-/// can pin it for later connections.
+/// Completes the client handshake, returning the derived [`SessionTransport`]
+/// and the Ed25519 key that was trusted. When `pinned_server_public_key` is
+/// `None` the server's presented key is trusted on first use and returned so the
+/// caller can pin it for later connections.
+///
+/// The server-selected mode must be one the client advertised, and the
+/// signature over the transcript (which binds that mode and both ephemerals) is
+/// always verified.
 pub fn complete_client_transport_handshake(
     handshake: ClientHandshake,
     server_hello: &ServerHello,
     pinned_server_public_key: Option<&[u8; ED25519_PUBLIC_KEY_LEN]>,
-) -> Result<(HandshakeMode, [u8; ED25519_PUBLIC_KEY_LEN]), CryptoError> {
-    if server_hello.encrypted {
-        validate_server_hello(server_hello)?;
-    } else {
-        validate_plaintext_server_hello(server_hello)?;
+) -> Result<(SessionTransport, [u8; ED25519_PUBLIC_KEY_LEN]), CryptoError> {
+    validate_server_hello(server_hello)?;
+    let mode =
+        TransportMode::from_wire_id(server_hello.mode).ok_or(CryptoError::InvalidHandshake)?;
+    if !handshake.hello.modes.contains(&server_hello.mode) {
+        return Err(CryptoError::InvalidHandshake);
     }
     let trusted = resolve_server_public_key(server_hello, pinned_server_public_key)?;
-    if server_hello.encrypted {
-        let secrets = complete_client_handshake(handshake, server_hello, &trusted)?;
-        Ok((HandshakeMode::Encrypted(secrets), trusted))
-    } else {
-        verify_plaintext_server_hello(&handshake.hello, server_hello, &trusted)?;
-        Ok((HandshakeMode::Plaintext, trusted))
-    }
-}
-
-pub fn complete_client_handshake(
-    handshake: ClientHandshake,
-    server_hello: &ServerHello,
-    pinned_server_public_key: &[u8; ED25519_PUBLIC_KEY_LEN],
-) -> Result<SessionSecrets, CryptoError> {
-    validate_server_hello(server_hello)?;
-    let transcript = full_transcript(&handshake.hello, server_hello, pinned_server_public_key)?;
-    signature::UnparsedPublicKey::new(&signature::ED25519, pinned_server_public_key)
+    let transcript = full_transcript(&handshake.hello, server_hello, &trusted)?;
+    signature::UnparsedPublicKey::new(&signature::ED25519, &trusted)
         .verify(
             &server_transcript(
                 &handshake.hello,
                 server_hello.version,
-                true,
+                server_hello.mode,
                 &server_hello.server_nonce,
                 &server_hello.server_ephemeral,
-                pinned_server_public_key,
+                &trusted,
             ),
             &server_hello.signature,
         )
@@ -321,29 +358,8 @@ pub fn complete_client_handshake(
     )
     .map_err(|_| CryptoError::InvalidHandshake)?;
 
-    Ok(derive_session_secrets(Role::Client, &shared, &transcript))
-}
-
-fn verify_plaintext_server_hello(
-    client_hello: &ClientHello,
-    server_hello: &ServerHello,
-    pinned_server_public_key: &[u8; ED25519_PUBLIC_KEY_LEN],
-) -> Result<(), CryptoError> {
-    validate_client_hello(client_hello)?;
-    validate_plaintext_server_hello(server_hello)?;
-    signature::UnparsedPublicKey::new(&signature::ED25519, pinned_server_public_key)
-        .verify(
-            &server_transcript(
-                client_hello,
-                server_hello.version,
-                false,
-                &server_hello.server_nonce,
-                &server_hello.server_ephemeral,
-                pinned_server_public_key,
-            ),
-            &server_hello.signature,
-        )
-        .map_err(|_| CryptoError::InvalidSignature)
+    let transport = derive_session_transport(Role::Client, mode, &shared, &transcript);
+    Ok((transport, trusted))
 }
 
 fn validate_client_hello(hello: &ClientHello) -> Result<(), CryptoError> {
@@ -352,6 +368,7 @@ fn validate_client_hello(hello: &ClientHello) -> Result<(), CryptoError> {
     }
     if hello.client_nonce.len() != NONCE_LEN
         || hello.client_ephemeral.len() != X25519_PUBLIC_KEY_LEN
+        || hello.modes.is_empty()
     {
         return Err(CryptoError::InvalidHandshake);
     }
@@ -362,24 +379,9 @@ fn validate_server_hello(hello: &ServerHello) -> Result<(), CryptoError> {
     if hello.version != PROTOCOL_VERSION {
         return Err(CryptoError::UnsupportedVersion(hello.version));
     }
-    if !hello.encrypted
+    if TransportMode::from_wire_id(hello.mode).is_none()
         || hello.server_nonce.len() != NONCE_LEN
         || hello.server_ephemeral.len() != X25519_PUBLIC_KEY_LEN
-        || hello.server_public_key.len() != ED25519_PUBLIC_KEY_LEN
-        || hello.signature.is_empty()
-    {
-        return Err(CryptoError::InvalidHandshake);
-    }
-    Ok(())
-}
-
-fn validate_plaintext_server_hello(hello: &ServerHello) -> Result<(), CryptoError> {
-    if hello.version != PROTOCOL_VERSION {
-        return Err(CryptoError::UnsupportedVersion(hello.version));
-    }
-    if hello.encrypted
-        || hello.server_nonce.len() != NONCE_LEN
-        || !hello.server_ephemeral.is_empty()
         || hello.server_public_key.len() != ED25519_PUBLIC_KEY_LEN
         || hello.signature.is_empty()
     {
@@ -411,16 +413,16 @@ fn resolve_server_public_key(
 fn server_transcript(
     client_hello: &ClientHello,
     server_version: u16,
-    encrypted: bool,
+    mode: u8,
     server_nonce: &[u8],
     server_ephemeral: &[u8],
     server_public_key: &[u8],
 ) -> Vec<u8> {
     let mut out = Vec::with_capacity(160);
-    out.extend_from_slice(b"chatt server hello v2");
+    out.extend_from_slice(b"chatt server hello v3");
     out.extend_from_slice(&client_hello.version.to_le_bytes());
     out.extend_from_slice(&server_version.to_le_bytes());
-    out.push(u8::from(encrypted));
+    out.push(mode);
     out.extend_from_slice(&client_hello.client_nonce);
     out.extend_from_slice(&client_hello.client_ephemeral);
     out.extend_from_slice(server_nonce);
@@ -439,7 +441,7 @@ fn full_transcript(
     let mut out = server_transcript(
         client_hello,
         server_hello.version,
-        server_hello.encrypted,
+        server_hello.mode,
         &server_hello.server_nonce,
         &server_hello.server_ephemeral,
         server_public_key,
@@ -454,7 +456,19 @@ enum Role {
     Server,
 }
 
-fn derive_session_secrets(role: Role, shared: &[u8], transcript_hash: &[u8]) -> SessionSecrets {
+/// Derives every session output from the handshake: the directional AEAD keys,
+/// the shared UDP demux route id, and the auth keys used for external-link UDP
+/// address claims and video connection setup.
+///
+/// The route id and auth keys are direction-agnostic — both ends derive the same
+/// values — while the AEAD keys are mirrored per role like the control/media
+/// send/recv pairs.
+fn derive_session_transport(
+    role: Role,
+    mode: TransportMode,
+    shared: &[u8],
+    transcript_hash: &[u8],
+) -> SessionTransport {
     let salt = hkdf::Salt::new(hkdf::HKDF_SHA256, transcript_hash);
     let prk = salt.extract(shared);
 
@@ -486,7 +500,7 @@ fn derive_session_secrets(role: Role, shared: &[u8], transcript_hash: &[u8]) -> 
         bytes: server_media,
     };
 
-    match role {
+    let secrets = match role {
         Role::Client => SessionSecrets {
             control_send: client_control,
             control_recv: server_control,
@@ -499,6 +513,19 @@ fn derive_session_secrets(role: Role, shared: &[u8], transcript_hash: &[u8]) -> 
             media_send: server_media,
             media_recv: client_media,
         },
+    };
+
+    let route_material = expand_key(&prk, b"chatt media route id v1");
+    let route_id = u32::from_le_bytes(route_material[0..4].try_into().unwrap()).max(1);
+    let bind_key = expand_key(&prk, b"chatt media bind key v1");
+    let video_auth_key = expand_key(&prk, b"chatt video auth key v1");
+
+    SessionTransport {
+        mode,
+        secrets,
+        route_id,
+        bind_key,
+        video_auth_key,
     }
 }
 
@@ -649,43 +676,48 @@ impl TransportCipher {
     }
 }
 
+/// Record-framing codec for the control and video lanes. In
+/// [`Aead`](Self::Aead) mode records are ChaCha20-Poly1305 sealed by a
+/// [`TransportCipher`]; in [`Clear`](Self::Clear) mode the outer secure link
+/// protects the wire and record bytes pass through unchanged. The session's
+/// [`TransportMode`] selects the variant; this is not a per-lane policy.
 #[derive(Debug)]
-pub enum ControlTransport {
-    Encrypted(TransportCipher),
-    Plaintext,
+pub enum RecordProtection {
+    Aead(TransportCipher),
+    Clear,
 }
 
-impl ControlTransport {
-    pub fn encrypted(send: KeyMaterial, recv: KeyMaterial) -> Self {
-        Self::Encrypted(TransportCipher::new(send, recv))
+impl RecordProtection {
+    pub fn aead(send: KeyMaterial, recv: KeyMaterial) -> Self {
+        Self::Aead(TransportCipher::new(send, recv))
     }
 
-    pub fn plaintext() -> Self {
-        Self::Plaintext
+    pub fn clear() -> Self {
+        Self::Clear
     }
 
     pub fn is_encrypted(&self) -> bool {
-        matches!(self, Self::Encrypted(_))
+        matches!(self, Self::Aead(_))
     }
 
     pub fn send_key_id(&self) -> Option<u32> {
         match self {
-            Self::Encrypted(cipher) => Some(cipher.send_key_id()),
-            Self::Plaintext => None,
+            Self::Aead(cipher) => Some(cipher.send_key_id()),
+            Self::Clear => None,
         }
     }
 
     pub fn recv_key_id(&self) -> Option<u32> {
         match self {
-            Self::Encrypted(cipher) => Some(cipher.recv_key_id()),
-            Self::Plaintext => None,
+            Self::Aead(cipher) => Some(cipher.recv_key_id()),
+            Self::Clear => None,
         }
     }
 
     pub fn seal_next(&mut self, channel: u8, plaintext: &[u8]) -> Result<Vec<u8>, CryptoError> {
         match self {
-            Self::Encrypted(cipher) => cipher.seal_next(channel, plaintext),
-            Self::Plaintext => Ok(plaintext.to_vec()),
+            Self::Aead(cipher) => cipher.seal_next(channel, plaintext),
+            Self::Clear => Ok(plaintext.to_vec()),
         }
     }
 
@@ -693,8 +725,8 @@ impl ControlTransport {
     /// payload of `plaintext_len` bytes, for writing a length prefix first.
     pub fn sealed_len(&self, plaintext_len: usize) -> usize {
         match self {
-            Self::Encrypted(_) => TRANSPORT_HEADER_LEN + plaintext_len + TAG_LEN,
-            Self::Plaintext => plaintext_len,
+            Self::Aead(_) => TRANSPORT_HEADER_LEN + plaintext_len + TAG_LEN,
+            Self::Clear => plaintext_len,
         }
     }
 
@@ -707,8 +739,8 @@ impl ControlTransport {
         out: &mut Vec<u8>,
     ) -> Result<(), CryptoError> {
         match self {
-            Self::Encrypted(cipher) => cipher.seal_next_into(channel, plaintext, out),
-            Self::Plaintext => {
+            Self::Aead(cipher) => cipher.seal_next_into(channel, plaintext, out),
+            Self::Clear => {
                 out.extend_from_slice(plaintext);
                 Ok(())
             }
@@ -717,8 +749,8 @@ impl ControlTransport {
 
     pub fn open_next(&mut self, channel: u8, frame: &[u8]) -> Result<Vec<u8>, CryptoError> {
         match self {
-            Self::Encrypted(cipher) => cipher.open_next(channel, frame),
-            Self::Plaintext => Ok(frame.to_vec()),
+            Self::Aead(cipher) => cipher.open_next(channel, frame),
+            Self::Clear => Ok(frame.to_vec()),
         }
     }
 
@@ -730,8 +762,8 @@ impl ControlTransport {
         frame: &'f mut [u8],
     ) -> Result<&'f [u8], CryptoError> {
         match self {
-            Self::Encrypted(cipher) => cipher.open_next_in_place(channel, frame),
-            Self::Plaintext => Ok(frame),
+            Self::Aead(cipher) => cipher.open_next_in_place(channel, frame),
+            Self::Clear => Ok(frame),
         }
     }
 }
@@ -809,6 +841,30 @@ pub fn seal_in_place_append_tag(
         .map_err(|_| CryptoError::Cipher)?;
     out.extend_from_slice(tag.as_ref());
     Ok(())
+}
+
+/// Opens `body` (ciphertext followed by the 16-byte tag) in place under
+/// `key.bytes`, with the nonce derived from `counter` and `aad` authenticated,
+/// returning the plaintext length. Unlike [`open_with_key`] this does not embed
+/// or check a key id — the caller owns the framing and AAD, so it suits the UDP
+/// media path where demux is by route id rather than key id.
+pub fn open_in_place_with_aad(
+    key: &KeyMaterial,
+    counter: u64,
+    aad: &[u8],
+    body: &mut [u8],
+) -> Result<usize, CryptoError> {
+    if counter >= REJECT_AFTER_MESSAGES {
+        return Err(CryptoError::CounterExhausted);
+    }
+    let nonce = nonce_from_counter(counter);
+    let open_key = LessSafeKey::new(
+        UnboundKey::new(&CHACHA20_POLY1305, &key.bytes).map_err(|_| CryptoError::InvalidKey)?,
+    );
+    let plaintext = open_key
+        .open_in_place(nonce, Aad::from(aad), body)
+        .map_err(|_| CryptoError::Cipher)?;
+    Ok(plaintext.len())
 }
 
 pub fn open_with_key(
@@ -945,6 +1001,32 @@ pub fn stun_verify(key: &[u8], message_prefix: &[u8], tag: &[u8]) -> bool {
     hmac::verify(&verify_key, message_prefix, tag).is_ok()
 }
 
+/// Length of a truncated HMAC-SHA256 authentication proof.
+pub const AUTH_PROOF_LEN: usize = 16;
+
+/// Computes a 16-byte HMAC-SHA256 proof over `message` under `key`, used to
+/// authenticate external-link UDP address claims and video connection setup
+/// without putting AEAD on payload bytes.
+pub fn auth_proof(key: &[u8], message: &[u8]) -> [u8; AUTH_PROOF_LEN] {
+    let full = stun_integrity(key, message);
+    let mut out = [0u8; AUTH_PROOF_LEN];
+    out.copy_from_slice(&full[..AUTH_PROOF_LEN]);
+    out
+}
+
+/// Verifies a 16-byte [`auth_proof`] in constant time.
+pub fn auth_proof_verify(key: &[u8], message: &[u8], tag: &[u8]) -> bool {
+    if tag.len() != AUTH_PROOF_LEN {
+        return false;
+    }
+    let expected = auth_proof(key, message);
+    let mut diff = 0u8;
+    for (a, b) in expected.iter().zip(tag.iter()) {
+        diff |= a ^ b;
+    }
+    diff == 0
+}
+
 /// Builds the additional-authenticated-data block for a transport frame: the
 /// channel byte followed by the 12-byte transport header. Returned by value on
 /// the stack so the per-frame seal/open paths do not allocate.
@@ -1079,17 +1161,83 @@ mod tests {
 
     #[test]
     fn client_and_server_derive_opposite_keys() {
+        for mode in [
+            TransportMode::NativeEncrypted,
+            TransportMode::ExternalSecureLink,
+        ] {
+            let rng = rand::SystemRandom::new();
+            let client = generate_client_hello(&rng).unwrap();
+            let client_hello = client.hello.clone();
+            let server =
+                respond_to_client_hello(&rng, &dev_server_key_pair(), &client_hello, mode).unwrap();
+            let (client_transport, trusted) = complete_client_transport_handshake(
+                client,
+                &server.hello,
+                Some(&dev_server_public_key()),
+            )
+            .unwrap();
+
+            assert_eq!(trusted, dev_server_public_key());
+            assert_eq!(client_transport.mode, mode);
+            assert_eq!(server.transport.mode, mode);
+            let client_keys = &client_transport.secrets;
+            assert_eq!(
+                client_keys.control_send,
+                server.transport.secrets.control_recv
+            );
+            assert_eq!(
+                client_keys.control_recv,
+                server.transport.secrets.control_send
+            );
+            assert_eq!(client_keys.media_send, server.transport.secrets.media_recv);
+            assert_eq!(client_keys.media_recv, server.transport.secrets.media_send);
+            // Route id and auth keys are direction-agnostic: identical on both ends.
+            assert_eq!(client_transport.route_id, server.transport.route_id);
+            assert_ne!(client_transport.route_id, 0);
+            assert_eq!(client_transport.bind_key, server.transport.bind_key);
+            assert_eq!(
+                client_transport.video_auth_key,
+                server.transport.video_auth_key
+            );
+        }
+    }
+
+    #[test]
+    fn server_signature_covers_selected_mode() {
+        // A ServerHello signed for one mode must not verify when its mode byte is
+        // swapped to the other.
         let rng = rand::SystemRandom::new();
         let client = generate_client_hello(&rng).unwrap();
         let client_hello = client.hello.clone();
-        let server = respond_to_client_hello(&rng, &dev_server_key_pair(), &client_hello).unwrap();
-        let client_keys =
-            complete_client_handshake(client, &server.hello, &dev_server_public_key()).unwrap();
+        let server = respond_to_client_hello(
+            &rng,
+            &dev_server_key_pair(),
+            &client_hello,
+            TransportMode::NativeEncrypted,
+        )
+        .unwrap();
+        let mut tampered = server.hello.clone();
+        tampered.mode = TransportMode::ExternalSecureLink.wire_id();
+        assert!(
+            complete_client_transport_handshake(client, &tampered, Some(&dev_server_public_key()))
+                .is_err()
+        );
+    }
 
-        assert_eq!(client_keys.control_send, server.secrets.control_recv);
-        assert_eq!(client_keys.control_recv, server.secrets.control_send);
-        assert_eq!(client_keys.media_send, server.secrets.media_recv);
-        assert_eq!(client_keys.media_recv, server.secrets.media_send);
+    #[test]
+    fn server_rejects_unadvertised_mode() {
+        let rng = rand::SystemRandom::new();
+        let mut client = generate_client_hello(&rng).unwrap();
+        client.hello.modes = vec![TransportMode::NativeEncrypted.wire_id()];
+        assert!(
+            respond_to_client_hello(
+                &rng,
+                &dev_server_key_pair(),
+                &client.hello,
+                TransportMode::ExternalSecureLink,
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -1108,21 +1256,31 @@ mod tests {
     }
 
     #[test]
-    fn server_can_select_signed_plaintext_transport() {
+    fn external_link_handshake_is_signed_and_derives_material() {
         let rng = rand::SystemRandom::new();
         let client = generate_client_hello(&rng).unwrap();
         let client_hello = client.hello.clone();
-        let server =
-            respond_to_client_hello_plaintext(&rng, &dev_server_key_pair(), &client_hello).unwrap();
+        let server = respond_to_client_hello(
+            &rng,
+            &dev_server_key_pair(),
+            &client_hello,
+            TransportMode::ExternalSecureLink,
+        )
+        .unwrap();
 
-        assert!(!server.hello.encrypted);
-        let (mode, trusted) = complete_client_transport_handshake(
+        assert_eq!(
+            server.hello.mode,
+            TransportMode::ExternalSecureLink.wire_id()
+        );
+        // The external-link server still runs the signed ephemeral handshake.
+        assert_eq!(server.hello.server_ephemeral.len(), X25519_PUBLIC_KEY_LEN);
+        let (transport, trusted) = complete_client_transport_handshake(
             client,
             &server.hello,
             Some(&dev_server_public_key()),
         )
         .unwrap();
-        assert_eq!(mode, HandshakeMode::Plaintext);
+        assert_eq!(transport.mode, TransportMode::ExternalSecureLink);
         assert_eq!(trusted, dev_server_public_key());
     }
 
@@ -1148,14 +1306,22 @@ mod tests {
     }
 
     #[test]
-    fn plaintext_control_transport_passes_payloads_without_framing() {
-        let mut transport = ControlTransport::plaintext();
-        let frame = transport.seal_next(CHANNEL_CONTROL, b"hello").unwrap();
+    fn clear_record_protection_passes_payloads_without_framing() {
+        let mut record = RecordProtection::clear();
+        let frame = record.seal_next(CHANNEL_CONTROL, b"hello").unwrap();
         assert_eq!(frame, b"hello");
-        assert_eq!(
-            transport.open_next(CHANNEL_CONTROL, &frame).unwrap(),
-            b"hello"
-        );
+        assert_eq!(record.open_next(CHANNEL_CONTROL, &frame).unwrap(), b"hello");
+    }
+
+    #[test]
+    fn auth_proof_round_trips_and_rejects_tamper() {
+        let key = [9u8; KEY_LEN];
+        let proof = auth_proof(&key, b"claim");
+        assert!(auth_proof_verify(&key, b"claim", &proof));
+        assert!(!auth_proof_verify(&key, b"other", &proof));
+        let mut tampered = proof;
+        tampered[0] ^= 0x01;
+        assert!(!auth_proof_verify(&key, b"claim", &tampered));
     }
 
     #[test]

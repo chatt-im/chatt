@@ -30,7 +30,9 @@ use crate::client_net::{
 use crate::config::{CandidatePrivacy, EffectiveFiles};
 
 use server::Server;
-use server::config::{Config as ServerConfig, RoomConfig, UserConfig, hash_secret};
+use server::config::{
+    Config as ServerConfig, RoomConfig, TransportModeConfig, UserConfig, hash_secret,
+};
 
 const ROOM: u32 = 1;
 const UPLOAD_TOKEN: &str = "bench-uploader-token";
@@ -58,7 +60,7 @@ fn server_config() -> ServerConfig {
     // Use the well-known dev identity so clients with `server_public_key = None`
     // pin the matching key (see `pinned_server_public_key`).
     config.security.server_identity_seed = dev_server_seed_hex();
-    config.security.encryption = true;
+    config.security.transport_mode = TransportModeConfig::NativeEncrypted;
     config.security.max_file_size_bytes = LIMIT_BYTES;
     config.rooms = vec![RoomConfig {
         id: ROOM,

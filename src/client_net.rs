@@ -37,8 +37,8 @@ use rpc::{
         encode_client_control, encode_client_hello, max_file_wire_bytes,
     },
     crypto::{
-        AntiReplay, CHANNEL_CONTROL, ControlTransport, HandshakeMode, KEY_LEN, KeyMaterial,
-        SessionSecrets, complete_client_transport_handshake, dev_server_public_key,
+        AntiReplay, CHANNEL_CONTROL, KEY_LEN, KeyMaterial, RecordProtection, SessionTransport,
+        TransportMode, complete_client_transport_handshake, dev_server_public_key,
         ed25519_public_key_from_hex, encode_hex, generate_client_hello,
     },
     evented::{
@@ -85,6 +85,10 @@ const RELAY_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(5);
 /// Cadence of media `Ping` probes used to estimate round-trip latency to the
 /// server relay and to each direct peer.
 const RTT_PROBE_INTERVAL: Duration = Duration::from_secs(5);
+/// Retry cadence for the UDP address claim while no `UdpBound` confirmation has
+/// arrived. External-link mode cannot use ordinary clear pings to establish the
+/// address, so losing the first `Bind` must be recoverable.
+const UDP_BIND_RETRY_INTERVAL: Duration = Duration::from_secs(1);
 /// A server RTT without a successful probe for this long no longer describes
 /// the current relay path and is reported as unavailable.
 const RTT_STALE_AFTER: Duration = Duration::from_secs(15);
@@ -455,6 +459,8 @@ pub enum NetworkEvent {
         rooms: Vec<RoomInfo>,
         users: Vec<UserSummary>,
         default_room: RoomId,
+        video_transport_mode: TransportMode,
+        video_auth_key: [u8; KEY_LEN],
     },
     /// A room appeared or changed shape (today: DM creation).
     RoomUpserted(RoomInfo),
@@ -761,10 +767,11 @@ fn open_pair_once(
     password: String,
     existing_token: String,
 ) -> OpenPairOutcome {
-    let (mut stream, mut control, _secrets, trusted) = match connect_and_handshake(config, true) {
+    let (mut stream, transport, trusted) = match connect_and_handshake(config, true) {
         Ok(value) => value,
         Err(error) => return OpenPairOutcome::Failed(error),
     };
+    let mut control = transport.control_record();
     let request = ClientControl::OpenPair {
         display_name: config.display_name.clone(),
         password,
@@ -908,10 +915,17 @@ fn run_worker_inner(
     commands: &Receiver<NetworkCommand>,
     poll: &mut Poll,
 ) -> SessionEnd {
-    let (std_tcp, control, secrets, _trusted) = match connect_and_handshake(config, false) {
+    let (std_tcp, transport, _trusted) = match connect_and_handshake(config, false) {
         Ok(value) => value,
         Err(error) => return SessionEnd::ConnectFailed(error),
     };
+    let transport_mode = transport.mode;
+    let video_auth_key = transport.video_auth_key;
+    let control = transport.control_record();
+    let media = media::MediaProtection::from_transport(&transport);
+    // P2P would bypass an outer secure link, so it is only available when chatt
+    // secures the wire itself, regardless of the client's p2p config.
+    let p2p_enabled = config.p2p_enabled && transport_mode == TransportMode::NativeEncrypted;
     let server_udp_addr = match resolve_endpoint(&config.udp_addr) {
         Ok(addr) => addr,
         Err(error) => return SessionEnd::ConnectFailed(format!("invalid UDP endpoint: {error}")),
@@ -972,7 +986,9 @@ fn run_worker_inner(
         media_scratch: Vec::new(),
         p2p_routes: Vec::new(),
         control,
-        secrets,
+        media,
+        transport_mode,
+        video_auth_key,
         session_id: None,
         user_id: None,
         active_room: None,
@@ -989,7 +1005,7 @@ fn run_worker_inner(
         p2p_reflexive_addr: None,
         p2p_candidates: Vec::new(),
         p2p_local_candidates: Vec::new(),
-        p2p_enabled: config.p2p_enabled,
+        p2p_enabled,
         candidate_privacy: config.candidate_privacy,
         prefer_ipv6: config.prefer_ipv6,
         mdns: MdnsSystem::bind(),
@@ -1000,6 +1016,7 @@ fn run_worker_inner(
         room_server_rtts: HashMap::new(),
         next_relay_keepalive: Instant::now() + RELAY_KEEPALIVE_INTERVAL,
         next_rtt_probe: Instant::now() + RTT_PROBE_INTERVAL,
+        next_udp_bind_retry: Instant::now() + UDP_BIND_RETRY_INTERVAL,
         rtt_probe_seq: 0,
         server_rtt_in_flight: VecDeque::new(),
         server_rtt_ms: None,
@@ -1144,6 +1161,7 @@ fn run_worker_inner(
             }
         }
         worker.poll_p2p(now);
+        worker.poll_udp_bind_retry(now);
         worker.poll_relay_keepalive(now);
         worker.poll_rtt_probe(now);
         worker.poll_mdns(now);
@@ -1287,15 +1305,7 @@ fn wait_for_reconnect(commands: &Receiver<NetworkCommand>, delay: Duration) -> R
 fn connect_and_handshake(
     config: &ClientConfig,
     allow_tofu: bool,
-) -> Result<
-    (
-        StdTcpStream,
-        ControlTransport,
-        Option<SessionSecrets>,
-        [u8; 32],
-    ),
-    String,
-> {
+) -> Result<(StdTcpStream, SessionTransport, [u8; 32]), String> {
     kvlog::info!(
         "tcp connecting",
         tcp_addr = %config.tcp_addr,
@@ -1323,38 +1333,23 @@ fn connect_and_handshake(
         .map_err(|error| format!("failed to read server hello: {error}"))?;
     let server_hello = decode_server_hello(&response)?;
     let pinned_server_public_key = pinned_server_public_key(config, allow_tofu)?;
-    let (mode, trusted_key) = complete_client_transport_handshake(
+    let (transport, trusted_key) = complete_client_transport_handshake(
         client,
         &server_hello,
         pinned_server_public_key.as_ref(),
     )
     .map_err(|error| error.to_string())?;
-    let (control, secrets) = match mode {
-        HandshakeMode::Encrypted(secrets) => {
-            let control = ControlTransport::encrypted(
-                secrets.control_send.clone(),
-                secrets.control_recv.clone(),
-            );
-            kvlog::info!(
-                "tcp handshake completed",
-                encryption = true,
-                control_send_key_id = secrets.control_send.id,
-                control_recv_key_id = secrets.control_recv.id,
-                media_send_key_id = secrets.media_send.id,
-                media_recv_key_id = secrets.media_recv.id
-            );
-            (control, Some(secrets))
-        }
-        HandshakeMode::Plaintext => {
-            kvlog::info!("tcp handshake completed", encryption = false);
-            (ControlTransport::plaintext(), None)
-        }
-    };
-    Ok((stream, control, secrets, trusted_key))
+    kvlog::info!(
+        "tcp handshake completed",
+        transport_mode = transport.mode.as_str(),
+        media_route_id = transport.route_id
+    );
+    Ok((stream, transport, trusted_key))
 }
 
 fn pair_once(config: &ClientConfig, pairing_code: String) -> Result<(), String> {
-    let (mut stream, mut control, _secrets, _trusted) = connect_and_handshake(config, false)?;
+    let (mut stream, transport, _trusted) = connect_and_handshake(config, false)?;
+    let mut control = transport.control_record();
     write_blocking_control(
         &mut stream,
         &mut control,
@@ -1383,7 +1378,7 @@ fn pair_once(config: &ClientConfig, pairing_code: String) -> Result<(), String> 
 
 fn write_blocking_control(
     stream: &mut StdTcpStream,
-    control: &mut ControlTransport,
+    control: &mut RecordProtection,
     message: ClientControl,
 ) -> Result<(), String> {
     let payload = encode_client_control(&message)?;
@@ -1492,8 +1487,14 @@ struct WorkerState {
     media_packet: Vec<u8>,
     media_scratch: Vec<u8>,
     p2p_routes: Vec<P2pVoiceRoute>,
-    control: ControlTransport,
-    secrets: Option<SessionSecrets>,
+    control: RecordProtection,
+    /// The server-link media codec selected by the negotiated mode. Holds the
+    /// route id, AEAD keys (native), or bind key (external-link).
+    media: media::MediaProtection,
+    /// The negotiated transport mode, gating P2P and steering `bind_udp`.
+    transport_mode: TransportMode,
+    /// Session-authentication key for external-link video connection setup.
+    video_auth_key: [u8; KEY_LEN],
     server_udp_addr: SocketAddr,
     server_udp_probe_addr: Option<SocketAddr>,
     session_id: Option<SessionId>,
@@ -1527,6 +1528,7 @@ struct WorkerState {
     room_server_rtts: HashMap<UserId, u16>,
     next_relay_keepalive: Instant,
     next_rtt_probe: Instant,
+    next_udp_bind_retry: Instant,
     rtt_probe_seq: u64,
     server_rtt_in_flight: VecDeque<(u64, Instant)>,
     server_rtt_ms: Option<f32>,
@@ -2685,18 +2687,8 @@ impl WorkerState {
         &mut self,
         packet: &[u8],
     ) -> Result<(media::UdpHeader, MediaPayload), media::MediaError> {
-        match &self.secrets {
-            Some(secrets) => {
-                media::open_media(&secrets.media_recv, &mut self.media_recv_replay, packet)
-            }
-            None => {
-                let (header, payload) = media::open_plaintext_media(packet)?;
-                if !self.media_recv_replay.update(header.counter) {
-                    return Err(media::MediaError::Replay);
-                }
-                Ok((header, payload))
-            }
-        }
+        let opened = media::open_media(&self.media, &mut self.media_recv_replay, packet)?;
+        Ok((opened.header, opened.payload))
     }
 
     fn dispatch_voice_packet(&mut self, packet: RemoteVoicePacket, route: &'static str) {
@@ -2832,6 +2824,14 @@ impl WorkerState {
                 self.config.file_policy = policy;
             }
             NetworkCommand::SetP2pEnabled(enabled) => {
+                // P2P would bypass an outer secure link, so it stays off in
+                // external-secure-link mode regardless of a runtime toggle.
+                if enabled && self.transport_mode != TransportMode::NativeEncrypted {
+                    let _ = self.events.send(NetworkEvent::Status(
+                        "P2P unavailable in external-secure-link mode".to_string(),
+                    ));
+                    return Ok(());
+                }
                 if self.p2p_enabled == enabled {
                     return Ok(());
                 }
@@ -3795,6 +3795,8 @@ impl WorkerState {
                     rooms,
                     users,
                     default_room,
+                    video_transport_mode: self.transport_mode,
+                    video_auth_key: self.video_auth_key,
                 });
                 self.bind_udp();
             }
@@ -4122,19 +4124,33 @@ impl WorkerState {
         if let Some(session_id) = self.session_id {
             kvlog::info!("udp bind sending", session_id = session_id.0);
             self.awaiting_udp_bound = true;
-            self.send_media(&MediaPayload::Bind { session_id });
-            self.send_nat_probe(session_id, 0, self.server_udp_addr);
-            if let Some(udp_probe_addr) = self.server_udp_probe_addr {
-                self.send_nat_probe(session_id, 1, udp_probe_addr);
+            self.next_udp_bind_retry = Instant::now() + UDP_BIND_RETRY_INTERVAL;
+            self.send_media(&MediaPayload::Bind);
+            // NAT probes discover reflexive addresses for P2P only, which runs
+            // solely in native-encrypted mode. External-link mode disables P2P
+            // and the server rejects probes there.
+            if self.p2p_enabled {
+                self.send_nat_probe(0, self.server_udp_addr);
+                if let Some(udp_probe_addr) = self.server_udp_probe_addr {
+                    self.send_nat_probe(1, udp_probe_addr);
+                }
             }
         }
     }
 
-    fn send_nat_probe(&mut self, session_id: SessionId, probe_id: u8, addr: SocketAddr) {
-        let payload = MediaPayload::NatProbe {
-            session_id,
-            probe_id,
-        };
+    fn poll_udp_bind_retry(&mut self, now: Instant) {
+        if !self.awaiting_udp_bound || now < self.next_udp_bind_retry {
+            return;
+        }
+        self.next_udp_bind_retry = now + UDP_BIND_RETRY_INTERVAL;
+        if self.session_id.is_some() {
+            kvlog::info!("udp bind retry sending");
+            self.send_media(&MediaPayload::Bind);
+        }
+    }
+
+    fn send_nat_probe(&mut self, probe_id: u8, addr: SocketAddr) {
+        let payload = MediaPayload::NatProbe { probe_id };
         let counter = self.media_send_counter;
         self.media_send_counter = self.media_send_counter.wrapping_add(1);
         match self.seal_server_media(counter, &payload) {
@@ -4237,21 +4253,13 @@ impl WorkerState {
         let kind = media_payload_kind(payload);
         let counter = self.media_send_counter;
         self.media_send_counter = self.media_send_counter.wrapping_add(1);
-        let result = match &self.secrets {
-            Some(secrets) => media::seal_media_into(
-                &secrets.media_send,
-                counter,
-                payload,
-                &mut self.media_packet,
-                &mut self.media_scratch,
-            ),
-            None => media::seal_plaintext_media_into(
-                counter,
-                payload,
-                &mut self.media_packet,
-                &mut self.media_scratch,
-            ),
-        };
+        let result = media::seal_media_into(
+            &self.media,
+            counter,
+            payload,
+            &mut self.media_packet,
+            &mut self.media_scratch,
+        );
         match result {
             Ok(()) => {
                 // Detach the packet buffer so `send_udp` style logging can borrow
@@ -4289,10 +4297,7 @@ impl WorkerState {
         counter: u64,
         payload: &MediaPayload,
     ) -> Result<Vec<u8>, media::MediaError> {
-        match &self.secrets {
-            Some(secrets) => media::seal_media(&secrets.media_send, counter, payload),
-            None => media::seal_plaintext_media(counter, payload),
-        }
+        media::seal_media(&self.media, counter, payload)
     }
 
     fn publish_p2p_candidates(&mut self) {
@@ -4623,8 +4628,8 @@ impl WorkerState {
             return;
         }
         self.next_relay_keepalive = now + RELAY_KEEPALIVE_INTERVAL;
-        if let Some(session_id) = self.session_id {
-            self.send_media(&MediaPayload::Bind { session_id });
+        if self.session_id.is_some() {
+            self.send_media(&MediaPayload::Bind);
         }
     }
 
@@ -4704,7 +4709,7 @@ impl WorkerState {
             push_rtt_in_flight(&mut peer.rtt_in_flight, nonce, now);
             Some((
                 addr,
-                media::seal_media(
+                media::seal_peer_media(
                     &peer.send_key,
                     counter,
                     &MediaPayload::Ping {
@@ -4733,7 +4738,7 @@ impl WorkerState {
             peer.send_counter = peer.send_counter.wrapping_add(1);
             Some((
                 addr,
-                media::seal_media(&peer.send_key, counter, &MediaPayload::Pong { nonce }),
+                media::seal_peer_media(&peer.send_key, counter, &MediaPayload::Pong { nonce }),
             ))
         }) else {
             return;
@@ -4801,7 +4806,7 @@ impl WorkerState {
             return false;
         };
         let Some(session_id) = self.p2p_peers.iter().find_map(|(session_id, peer)| {
-            (peer.recv_key.id == header.key_id).then_some(*session_id)
+            (peer.recv_key.id == header.route_id).then_some(*session_id)
         }) else {
             return false;
         };
@@ -4811,7 +4816,7 @@ impl WorkerState {
                 .p2p_peers
                 .get_mut(&session_id)
                 .expect("p2p peer exists");
-            match media::open_media(&peer.recv_key, &mut peer.recv_replay, packet) {
+            match media::open_peer_media(&peer.recv_key, &mut peer.recv_replay, packet) {
                 Ok((
                     _,
                     MediaPayload::PeerVoice {
@@ -4997,7 +5002,7 @@ impl WorkerState {
                 flags,
                 payload: media_payload_from_audio(audio_payload),
             };
-            match media::seal_media_into(
+            match media::seal_peer_media_into(
                 &route.key,
                 route.counter,
                 &payload,
@@ -5036,7 +5041,10 @@ impl WorkerState {
             };
             let counter = peer.send_counter;
             peer.send_counter = peer.send_counter.wrapping_add(1);
-            Some((addr, media::seal_media(&peer.send_key, counter, &payload)))
+            Some((
+                addr,
+                media::seal_peer_media(&peer.send_key, counter, &payload),
+            ))
         }) else {
             return;
         };

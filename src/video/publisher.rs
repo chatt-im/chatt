@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 
 use rpc::{
     bitstream::{self, Codec},
-    crypto::{CHANNEL_VIDEO, TAG_LEN, TRANSPORT_HEADER_LEN, TransportCipher},
+    crypto::{CHANNEL_VIDEO, RecordProtection},
     ids::{SessionId, StreamId},
     video::{self, SharedVideoFrame, VideoRole},
 };
@@ -27,6 +27,7 @@ use crate::app::{AppEvent, EventSender, ScreencastProgress};
 use crate::client_net::{CommandSender, NetworkCommand};
 use crate::web_server::WebFeedSender;
 
+use super::VideoTransport;
 use super::capture::{self, Capture, CapturedFrame};
 
 /// Cap on frames buffered while waiting for the publish secret, so a secret that
@@ -84,6 +85,7 @@ pub fn start(
     codec: Codec,
     commands: CommandSender,
     tcp_addr: String,
+    video_transport: VideoTransport,
     web_feed: Option<WebFeedSender>,
     events: EventSender,
 ) -> Result<ScreencastHandle, String> {
@@ -102,6 +104,7 @@ pub fn start(
                 secret_rx,
                 commands,
                 tcp_addr,
+                video_transport,
                 web_feed,
                 events,
                 manager_stop,
@@ -117,7 +120,7 @@ pub fn start(
 
 struct PublisherConn {
     stream: TcpStream,
-    cipher: TransportCipher,
+    record_protection: RecordProtection,
     stream_id: u32,
     codec: Codec,
     copy_stats: CopyStats,
@@ -185,14 +188,14 @@ impl PublisherConn {
             self.copy_stats.self_view_bytes += self.inner.len() as u64;
             feed.send_video_frame(SharedVideoFrame::copy_from_slice(&self.inner));
         }
-        let sealed_len = TRANSPORT_HEADER_LEN + self.inner.len() + TAG_LEN;
+        let sealed_len = self.record_protection.sealed_len(self.inner.len());
         if sealed_len > video::MAX_VIDEO_FRAME_LEN {
             return Err("sealed video record exceeds maximum length".to_string());
         }
         self.record.clear();
         self.record
             .extend_from_slice(&(sealed_len as u32).to_le_bytes());
-        self.cipher
+        self.record_protection
             .seal_next_into(CHANNEL_VIDEO, &self.inner, &mut self.record)
             .map_err(|error| error.to_string())?;
         let bytes = self.record.len() as u64;
@@ -268,6 +271,7 @@ fn run_manager(
     secret_rx: Receiver<(SessionId, StreamId, Vec<u8>)>,
     commands: CommandSender,
     tcp_addr: String,
+    video_transport: VideoTransport,
     web_feed: Option<WebFeedSender>,
     events: EventSender,
     stop: Arc<AtomicBool>,
@@ -291,7 +295,14 @@ fn run_manager(
         if conn.is_none()
             && let Ok((session_id, stream_id, secret)) = secret_rx.try_recv()
         {
-            match connect(&tcp_addr, session_id, stream_id, &secret, codec) {
+            match connect(
+                &tcp_addr,
+                session_id,
+                stream_id,
+                &secret,
+                codec,
+                video_transport,
+            ) {
                 Ok(mut publisher) => {
                     let mut failed = false;
                     for frame in buffered.drain(..) {
@@ -453,20 +464,22 @@ fn connect(
     stream_id: StreamId,
     secret: &[u8],
     codec: Codec,
+    video_transport: VideoTransport,
 ) -> Result<PublisherConn, String> {
-    let (stream, cipher, _residual) = super::open_video_connection(
+    let (stream, record_protection, _residual) = super::open_video_connection(
         tcp_addr,
         session_id,
         stream_id,
         VideoRole::Publisher,
         secret,
+        video_transport,
     )?;
     stream
         .set_write_timeout(Some(VIDEO_WRITE_TIMEOUT))
         .map_err(|error| format!("video write timeout setup failed: {error}"))?;
     Ok(PublisherConn {
         stream,
-        cipher,
+        record_protection,
         stream_id: stream_id.0,
         codec,
         copy_stats: CopyStats::new(),

@@ -392,7 +392,7 @@ p2p-enabled = true
 
 [security]
 server-identity-seed = "<generated 64 hex chars>"
-encryption = true
+transport-mode = "native-encrypted"
 chat-history-limit = 0
 # max upload size the server relays, any u64 (e.g. 68719476736 for 64 GiB); defaults to 50 MiB
 max-file-size-bytes = 52428800
@@ -417,11 +417,17 @@ users are added by `chatt-server invite USER` when the invite is accepted;
 when a user successfully joins. Room id `1` is required as the default lobby by
 the current client flow.
 
-`encryption = true` makes the server require encrypted TCP control and
-server-relayed UDP media transport. Set it to `false` only for trusted local
-networks or debugging; the server still signs that plaintext decision, but user
-tokens, pairing codes, chat, files, and server-relayed media are sent without
-confidentiality.
+`transport-mode` selects the trust boundary for every client. `"native-encrypted"`
+(the default) has chatt secure the wire: TCP control, server-relayed UDP media,
+video, and file chunks are protected by session keys. `"external-secure-link"`
+defers wire security to an outer tunnel (e.g. WireGuard or an SSH tunnel): after
+the signed handshake, control, media, video, and file payloads travel in the
+clear, but UDP address claims still carry a proof of possession so a spoofed
+datagram cannot hijack a session's media address. P2P is disabled in
+`external-secure-link` mode because it would bypass the outer link. The signed
+X25519 handshake and session key derivation run in both modes; the mode only
+decides whether chatt encrypts payloads. Use `"external-secure-link"` only on a
+network that is already confidential end to end.
 
 `public = true` opens the server to self-service joining: a client runs
 `chatt pair <host:port>` with no admin invite. The server stores no row per
