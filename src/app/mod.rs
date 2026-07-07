@@ -286,6 +286,7 @@ impl ServerCatalog {
                 label: server.label.clone(),
                 username: server.username.clone(),
                 tcp_addr: server.tcp_addr.clone(),
+                require_native_encryption: server.require_native_encryption,
                 search_text: format!("{} {} {}", server.label, server.username, server.tcp_addr),
             })
             .collect();

@@ -856,10 +856,16 @@ fn draw_server_select_item(
             .text(buf, &format!("  {}", item.username));
     }
     if rows.h > 0 {
-        rows.take_top(1)
+        let addr = rows
+            .take_top(1)
             .with(base.patch(theme.subtle))
             .with(Ellipsis(true))
             .text(buf, &format!("  {}", item.tcp_addr));
+        if !item.require_native_encryption {
+            addr.with(base.patch(theme.warn))
+                .with(Ellipsis(true))
+                .text(buf, "  (encryption not enforced)");
+        }
     }
 }
 
