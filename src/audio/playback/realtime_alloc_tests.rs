@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 use super::neteq::{Mode, NetEqCore};
 use super::{
     LivePlaybackMixer, LivePlaybackMixerEvent, MIX_FRAME_SAMPLES, MixerStreamSource,
-    SharedNetEqStream, SpscSwapQueue, lock_shared_stream,
+    NetEqMixerSource, SharedNetEqStream, SpscSwapQueue, lock_shared_stream,
 };
 use crate::audio::capture::OpusVoiceEncoder;
 use crate::audio::device::drain_live_playback_mixer_events;
@@ -227,20 +227,29 @@ fn shared_tone_stream(
     handle
 }
 
+fn shared_tone_source(
+    tuning: LiveAudioTuning,
+    encoder: &mut OpusVoiceEncoder,
+    packets: u32,
+    now: Instant,
+) -> NetEqMixerSource {
+    NetEqMixerSource::new(shared_tone_stream(tuning, encoder, packets, now))
+}
+
 #[test]
 fn two_stream_mix_with_limiter_never_allocates() {
     init_flags();
     let tuning = test_tuning();
     let now = Instant::now();
     let mut encoder = OpusVoiceEncoder::new(32_000).unwrap();
-    let first = shared_tone_stream(tuning, &mut encoder, 20, now);
-    let second = shared_tone_stream(tuning, &mut encoder, 20, now);
+    let first = shared_tone_source(tuning, &mut encoder, 20, now);
+    let second = shared_tone_source(tuning, &mut encoder, 20, now);
 
     let mut mixer = LivePlaybackMixer::with_live_capacity(tuning);
     mixer.set_playout_hints(Arc::new(LivePlaybackPlayoutHints::default()));
     assert_no_alloc("ensure two streams", || {
-        mixer.ensure_stream(1, MixerStreamSource::NetEq(Arc::clone(&first)));
-        mixer.ensure_stream(2, MixerStreamSource::NetEq(Arc::clone(&second)));
+        mixer.ensure_stream(1, MixerStreamSource::NetEq(first.clone()));
+        mixer.ensure_stream(2, MixerStreamSource::NetEq(second.clone()));
     });
     assert_eq!(mixer.active_streams(), 2);
 
@@ -260,7 +269,7 @@ fn stream_lifecycle_events_never_allocate() {
     let tuning = test_tuning();
     let now = Instant::now();
     let mut encoder = OpusVoiceEncoder::new(32_000).unwrap();
-    let handle = shared_tone_stream(tuning, &mut encoder, 4, now);
+    let source = shared_tone_source(tuning, &mut encoder, 4, now);
 
     let mut mixer = LivePlaybackMixer::with_live_capacity(tuning);
     let hints = Arc::new(LivePlaybackPlayoutHints::default());
@@ -268,14 +277,15 @@ fn stream_lifecycle_events_never_allocate() {
     let queue: SpscSwapQueue<LivePlaybackMixerEvent> = SpscSwapQueue::with_capacity(16);
     let mut event = LivePlaybackMixerEvent::EnsureStream {
         stream_id: 7,
-        source: MixerStreamSource::NetEq(Arc::clone(&handle)),
+        source: MixerStreamSource::NetEq(source.clone()),
     };
     assert!(queue.insert(&mut event));
     let mut event = LivePlaybackMixerEvent::StopStream { stream_id: 7 };
     assert!(queue.insert(&mut event));
 
-    // The test retains `handle`, standing in for the worker's retiring list,
-    // so the StopStream removal below is never the last Arc.
+    // The test retains `source`, standing in for the worker's retiring list, so
+    // the StopStream removal below is never the last Arc for the NetEQ or its
+    // assisted render ring.
     let mut pending = LivePlaybackMixerEvent::default();
     let drained = assert_no_alloc("event drain incl. stream removal", || {
         drain_live_playback_mixer_events(&mut mixer, &queue, &mut pending)
@@ -300,10 +310,10 @@ fn stream_cap_rejection_never_allocates() {
     let hints = Arc::new(LivePlaybackPlayoutHints::default());
     mixer.set_playout_hints(Arc::clone(&hints));
 
-    let mut handles = Vec::new();
+    let mut sources = Vec::new();
     for stream_id in 0..33u32 {
-        handles.push(shared_tone_stream(tuning, &mut encoder, 1, now));
-        let source = MixerStreamSource::NetEq(Arc::clone(handles.last().unwrap()));
+        sources.push(shared_tone_source(tuning, &mut encoder, 1, now));
+        let source = MixerStreamSource::NetEq(sources.last().unwrap().clone());
         assert_no_alloc("ensure within and beyond cap", || {
             mixer.ensure_stream(stream_id, source);
         });

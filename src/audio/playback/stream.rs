@@ -1,5 +1,5 @@
 use std::sync::{
-    Arc, Mutex, MutexGuard, PoisonError,
+    Arc, Mutex, MutexGuard, PoisonError, TryLockError,
     atomic::{AtomicU64, AtomicUsize, Ordering},
 };
 use std::time::{Duration, Instant};
@@ -18,9 +18,9 @@ use crate::audio::{
 /// One remote stream's NetEQ, shared between the decode worker and the audio
 /// callback with the locking discipline of WebRTC's
 /// `ChannelReceive::neteq_mutex_`: the worker holds the lock around
-/// `insert_packet` and its diagnostics reads, the callback holds it around one
-/// `get_audio_10ms` per 10 ms output block. Both holds are short and never
-/// nest another lock.
+/// `insert_packet`, diagnostics reads, and assisted pre-render pulls; the
+/// callback holds it around one direct `get_audio_10ms` per 10 ms output block.
+/// Both holds are short and never nest another lock.
 pub(crate) struct SharedNetEqStream {
     pub(super) core: NetEqCore,
     /// Per-block stat deltas folded by the callback, drained by the worker
@@ -33,6 +33,138 @@ pub(crate) struct SharedNetEqStream {
 
 pub(crate) type SharedNetEqHandle = Arc<Mutex<SharedNetEqStream>>;
 
+/// Number of fixed 10 ms blocks reserved for one stream's assisted render ring.
+pub(crate) const NETEQ_RENDER_ASSIST_RING_BLOCKS: usize = 4;
+const NETEQ_RENDER_ASSIST_TARGET_BLOCKS: usize = 1;
+const NETEQ_RENDER_ASSIST_BURST_BLOCKS: usize = 16;
+const NETEQ_RENDER_ASSIST_TRIGGER_US: u64 = 750;
+
+/// Shared control plane for one stream's callback render assist.
+///
+/// Direct callback pulls remain the normal path. When one direct NetEQ render
+/// exceeds the callback-side budget, the callback arms a short worker pre-render
+/// burst into the stream's SPSC ring. The callback drains that ring while it has
+/// complete 10 ms blocks and falls back to direct pull on underrun.
+#[derive(Default)]
+pub(crate) struct NetEqRenderAssist {
+    target_samples: AtomicUsize,
+    blocks_remaining: AtomicUsize,
+    requests: AtomicU64,
+    activations: AtomicU64,
+    prefilled_blocks: AtomicU64,
+    mixed_blocks: AtomicU64,
+    underrun_blocks: AtomicU64,
+    lock_miss_silence_blocks: AtomicU64,
+}
+
+impl NetEqRenderAssist {
+    pub(crate) fn note_direct_render(&self, duration: Duration) {
+        if duration_to_us(duration) >= NETEQ_RENDER_ASSIST_TRIGGER_US {
+            self.requests.fetch_add(1, Ordering::Relaxed);
+            self.request_prefill();
+        }
+    }
+
+    fn request_prefill(&self) {
+        let was_idle = self.target_samples.load(Ordering::Acquire) == 0
+            && self.blocks_remaining.load(Ordering::Acquire) == 0;
+        if was_idle {
+            self.activations.fetch_add(1, Ordering::Relaxed);
+        }
+        self.blocks_remaining
+            .store(NETEQ_RENDER_ASSIST_BURST_BLOCKS, Ordering::Release);
+        self.target_samples.store(
+            NETEQ_RENDER_ASSIST_TARGET_BLOCKS * MIX_FRAME_SAMPLES,
+            Ordering::Release,
+        );
+    }
+
+    pub(crate) fn prefill_target_samples(&self) -> usize {
+        if self.blocks_remaining.load(Ordering::Acquire) == 0 {
+            return 0;
+        }
+        self.target_samples.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn active(&self) -> bool {
+        self.target_samples.load(Ordering::Acquire) != 0
+            || self.blocks_remaining.load(Ordering::Acquire) != 0
+    }
+
+    pub(crate) fn try_claim_prefill_block(&self) -> bool {
+        let mut remaining = self.blocks_remaining.load(Ordering::Acquire);
+        while remaining > 0 {
+            match self.blocks_remaining.compare_exchange_weak(
+                remaining,
+                remaining - 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return true,
+                Err(next) => remaining = next,
+            }
+        }
+        false
+    }
+
+    pub(crate) fn finish_if_idle(&self, ring_depth: usize) {
+        if ring_depth == 0 && self.blocks_remaining.load(Ordering::Acquire) == 0 {
+            self.target_samples.store(0, Ordering::Release);
+        }
+    }
+
+    pub(crate) fn note_prefilled_block(&self) {
+        self.prefilled_blocks.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn note_mixed_block(&self) {
+        self.mixed_blocks.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn note_underrun_block(&self) {
+        self.underrun_blocks.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn note_lock_miss_silence_block(&self) {
+        self.lock_miss_silence_blocks
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn metrics(&self) -> NetEqRenderAssistMetrics {
+        NetEqRenderAssistMetrics {
+            requests: self.requests.load(Ordering::Relaxed),
+            activations: self.activations.load(Ordering::Relaxed),
+            prefilled_blocks: self.prefilled_blocks.load(Ordering::Relaxed),
+            mixed_blocks: self.mixed_blocks.load(Ordering::Relaxed),
+            underrun_blocks: self.underrun_blocks.load(Ordering::Relaxed),
+            lock_miss_silence_blocks: self.lock_miss_silence_blocks.load(Ordering::Relaxed),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct NetEqRenderAssistMetrics {
+    pub requests: u64,
+    pub activations: u64,
+    pub prefilled_blocks: u64,
+    pub mixed_blocks: u64,
+    pub underrun_blocks: u64,
+    pub lock_miss_silence_blocks: u64,
+}
+
+impl NetEqRenderAssistMetrics {
+    pub(crate) fn absorb(&mut self, other: Self) {
+        self.requests = self.requests.saturating_add(other.requests);
+        self.activations = self.activations.saturating_add(other.activations);
+        self.prefilled_blocks = self.prefilled_blocks.saturating_add(other.prefilled_blocks);
+        self.mixed_blocks = self.mixed_blocks.saturating_add(other.mixed_blocks);
+        self.underrun_blocks = self.underrun_blocks.saturating_add(other.underrun_blocks);
+        self.lock_miss_silence_blocks = self
+            .lock_miss_silence_blocks
+            .saturating_add(other.lock_miss_silence_blocks);
+    }
+}
+
 /// Locks a shared stream, recovering from poison: a panicked callback must not
 /// permanently silence the stream, and one interrupted `get_audio` leaves no
 /// invariant a later pull cannot recover from.
@@ -40,6 +172,18 @@ pub(crate) fn lock_shared_stream(
     handle: &Mutex<SharedNetEqStream>,
 ) -> MutexGuard<'_, SharedNetEqStream> {
     handle.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Callback side: tries to lock a stream without waiting behind worker-side
+/// assisted pre-render. Poison is recovered the same way as [`lock_shared_stream`].
+pub(crate) fn try_lock_shared_stream(
+    handle: &Mutex<SharedNetEqStream>,
+) -> Option<MutexGuard<'_, SharedNetEqStream>> {
+    match handle.try_lock() {
+        Ok(guard) => Some(guard),
+        Err(TryLockError::Poisoned(error)) => Some(error.into_inner()),
+        Err(TryLockError::WouldBlock) => None,
+    }
 }
 
 impl SharedNetEqStream {
@@ -166,9 +310,9 @@ pub(crate) struct LivePlaybackPlayoutHints {
     neteq_lock_wait_total_us: AtomicU64,
     neteq_lock_wait_max_us: AtomicU64,
     /// Count of `StopStream` events the mixer consumer has applied, in queue
-    /// order. The worker retires a stopped stream's [`SharedNetEqHandle`] only
-    /// once this passes the stop's push ordinal, so the mixer's clone is
-    /// provably dropped and the worker's drop cannot land on the callback.
+    /// order. The worker retires a stopped stream's callback-facing handles
+    /// only once this passes the stop's push ordinal, so the mixer's clones are
+    /// provably dropped and the worker's drops cannot land on the callback.
     stop_events_processed: AtomicU64,
     /// `EnsureStream` events the mixer rejected at its preallocated stream cap.
     #[cfg(test)]

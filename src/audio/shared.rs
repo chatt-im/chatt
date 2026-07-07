@@ -295,8 +295,8 @@ pub struct LivePlaybackFeedback {
     pub duplicate_packets: u16,
     pub reordered_packets: u16,
     pub window_ms: u16,
-    /// Receiver-side staged playout depth in milliseconds. For current live
-    /// playback this is only the mix-adapter carry, not a voice staging ring.
+    /// Receiver-side staged playout depth in milliseconds: the mix-adapter
+    /// carry plus any active callback-assist voice ring.
     pub max_output_ring_ms: u16,
     pub max_neteq_target_ms: u16,
     pub max_neteq_playout_delay_ms: u16,
@@ -605,11 +605,11 @@ pub struct LivePlaybackStreamActivity {
 pub struct LivePlaybackSnapshot {
     pub active_streams: usize,
     pub stream_activity: Vec<LivePlaybackStreamActivity>,
-    /// Mixed-but-unplayed samples staged after NetEQ. In live playback this is
-    /// the device mix-adapter carry only.
+    /// Mixed-but-unplayed samples staged after NetEQ: the device mix-adapter
+    /// carry plus any active callback-assist voice ring.
     pub output_ring_samples: usize,
     /// Max staged output depth in milliseconds. This is diagnostics-only and is
-    /// normally less than one 10 ms mixer frame.
+    /// normally less than one 10 ms mixer frame unless callback assist is active.
     pub max_output_ring_ms: u64,
     pub neteq_playout_delay_ms: u64,
     pub neteq_sync_buffer_ms: u64,
@@ -652,6 +652,12 @@ pub struct LivePlaybackSnapshot {
     pub playback_callback_overruns: u64,
     pub playback_callback_max_duration_us: u64,
     pub playback_mixer_events_drained: u64,
+    pub playback_assist_requests: u64,
+    pub playback_assist_activations: u64,
+    pub playback_assist_prefill_blocks: u64,
+    pub playback_assist_mixed_blocks: u64,
+    pub playback_assist_underrun_blocks: u64,
+    pub playback_assist_lock_miss_silence_blocks: u64,
     pub neteq_lock_wait_count: u64,
     pub neteq_lock_wait_total_us: u64,
     pub neteq_lock_wait_max_us: u64,

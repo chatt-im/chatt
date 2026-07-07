@@ -10,8 +10,8 @@ use super::neteq::AudioResult;
 use crate::audio::{
     errors::AudioErrorKind,
     playback::{
-        LivePlaybackPlayoutHints, MixerStreamSource, RingReader, SharedNetEqHandle,
-        lock_shared_stream,
+        LivePlaybackPlayoutHints, MixerStreamSource, NetEqMixerSource, RingReader,
+        lock_shared_stream, try_lock_shared_stream,
     },
     shared::{
         AUDIO_POP_DELTA_THRESHOLD, LivePlaybackSnapshot, PlaybackStreamControl,
@@ -43,10 +43,10 @@ fn smoothstep(gain: f32) -> f32 {
 ///
 /// Per 10 ms block it pulls each voice stream's NetEQ directly (one short
 /// per-stream lock hold covering Opus decode and the concealment/time-scale
-/// DSP, exactly the work WebRTC runs on its playout thread), applies the
-/// per-stream mute/gain declick envelope, and combines. Notification clips are
-/// the one ring-fed source left. It allocates nothing and frees nothing on the
-/// steady path.
+/// DSP, exactly the work WebRTC runs on its playout thread) unless a slow-pull
+/// assist ring already holds a worker-rendered block. It then applies the
+/// per-stream mute/gain declick envelope and combines. It allocates nothing and
+/// frees nothing on the steady path.
 pub(crate) struct LivePlaybackMixer {
     streams: HashMap<u32, ConsumerStream>,
     /// Controls received before the stream registered. The app applies local
@@ -89,7 +89,8 @@ struct StreamRenderRecord {
     stream_id: u32,
     /// Index into `source_frames` when the stream reached the combiner.
     frame_index: Option<usize>,
-    /// The NetEQ operation that rendered the block, `None` for ring sources.
+    /// The NetEQ operation that rendered the block, `None` for assisted/ring
+    /// sources.
     neteq: Option<AudioResult>,
     declick_start: f32,
     declick_end: f32,
@@ -118,8 +119,13 @@ struct ConsumerStream {
 }
 
 enum ConsumerSource {
-    NetEq(SharedNetEqHandle),
+    NetEq(NetEqConsumerSource),
     Ring(RingReader),
+}
+
+struct NetEqConsumerSource {
+    source: NetEqMixerSource,
+    render_reader: RingReader,
 }
 
 impl Default for LivePlaybackMixer {
@@ -247,7 +253,18 @@ impl LivePlaybackMixer {
             .entry(stream_id)
             .or_insert_with(|| ConsumerStream {
                 source: match source {
-                    MixerStreamSource::NetEq(handle) => ConsumerSource::NetEq(handle),
+                    MixerStreamSource::NetEq(source) => {
+                        // SAFETY: the sole assisted-ring `RingReader` for this
+                        // stream. The worker owns the producer side only, and
+                        // `ensure_stream` runs this closure once per registered
+                        // `stream_id`.
+                        let render_reader =
+                            unsafe { RingReader::new(Arc::clone(&source.render_ring)) };
+                        ConsumerSource::NetEq(NetEqConsumerSource {
+                            source,
+                            render_reader,
+                        })
+                    }
                     // SAFETY: the sole `RingReader` for `ring`. This vacant-entry
                     // closure runs once per `stream_id`, and the worker routes each
                     // ring to a single stream, so no other reader is ever built for
@@ -447,18 +464,7 @@ fn render_stream_10ms(
     let muted = stream.control.muted;
     match &mut stream.source {
         ConsumerSource::NetEq(handle) => {
-            // NetEQ is pulled even while locally muted or in muted expand so its
-            // timeline keeps advancing at the playout rate; the envelope then
-            // decides whether the block reaches the combiner.
-            let lock_start = Instant::now();
-            let mut shared = lock_shared_stream(handle);
-            let wait = lock_start.elapsed();
-            let result = shared.get_audio_10ms(now, out);
-            RenderedStream {
-                active: apply_declick(&mut stream.declick_gain, gain, !muted && !result.muted, out),
-                neteq_lock_wait: wait,
-                neteq: Some(result),
-            }
+            render_neteq_stream_10ms(handle, now, &mut stream.declick_gain, gain, muted, out)
         }
         ConsumerSource::Ring(reader) => RenderedStream {
             active: render_ring_stream_10ms(
@@ -473,6 +479,87 @@ fn render_stream_10ms(
             neteq: None,
         },
     }
+}
+
+fn render_neteq_stream_10ms(
+    source: &mut NetEqConsumerSource,
+    now: Instant,
+    declick_gain: &mut f32,
+    gain: f32,
+    muted: bool,
+    out: &mut [f32; MIX_FRAME_SAMPLES],
+) -> RenderedStream {
+    if let Some(active) = render_assisted_neteq_10ms(source, declick_gain, gain, muted, out) {
+        return RenderedStream {
+            active,
+            neteq_lock_wait: Duration::ZERO,
+            neteq: None,
+        };
+    }
+
+    // NetEQ is pulled even while locally muted or in muted expand so its
+    // timeline keeps advancing at the playout rate; the envelope then decides
+    // whether the block reaches the combiner. Once worker assist is active, do
+    // not wait behind that worker's pre-render lock if the ring underruns.
+    let lock_start = Instant::now();
+    let assist_active = source.source.assist.active();
+    if assist_active {
+        source.source.assist.note_underrun_block();
+    }
+    let maybe_shared = if assist_active {
+        try_lock_shared_stream(&source.source.shared)
+    } else {
+        Some(lock_shared_stream(&source.source.shared))
+    };
+    let Some(mut shared) = maybe_shared else {
+        source.source.assist.note_lock_miss_silence_block();
+        out.fill(0.0);
+        return RenderedStream {
+            active: apply_declick(declick_gain, gain, false, out),
+            neteq_lock_wait: Duration::ZERO,
+            neteq: None,
+        };
+    };
+    let wait = lock_start.elapsed();
+    let result = shared.get_audio_10ms(now, out);
+    drop(shared);
+    source
+        .source
+        .assist
+        .note_direct_render(lock_start.elapsed());
+    RenderedStream {
+        active: apply_declick(declick_gain, gain, !muted && !result.muted, out),
+        neteq_lock_wait: wait,
+        neteq: Some(result),
+    }
+}
+
+fn render_assisted_neteq_10ms(
+    source: &mut NetEqConsumerSource,
+    declick_gain: &mut f32,
+    gain: f32,
+    muted: bool,
+    out: &mut [f32; MIX_FRAME_SAMPLES],
+) -> Option<bool> {
+    let span = source.render_reader.readable_span();
+    if span.len() < MIX_FRAME_SAMPLES {
+        drop(span);
+        return None;
+    }
+
+    let (first, second) = span.slices();
+    let first_len = first.len().min(MIX_FRAME_SAMPLES);
+    out[..first_len].copy_from_slice(&first[..first_len]);
+    if first_len < MIX_FRAME_SAMPLES {
+        let remaining = MIX_FRAME_SAMPLES - first_len;
+        out[first_len..].copy_from_slice(&second[..remaining]);
+    }
+    drop(span);
+    source.render_reader.advance(MIX_FRAME_SAMPLES);
+    source.source.assist.note_mixed_block();
+
+    let has_signal = out.iter().any(|sample| *sample != 0.0);
+    Some(apply_declick(declick_gain, gain, !muted && has_signal, out))
 }
 
 /// Applies the mute/gain declick envelope in place over one complete 10 ms
@@ -608,8 +695,8 @@ impl LivePlaybackMixer {
                 None => (record.previous_last_sample.abs(), 0.0, 0.0, 0.0),
             };
             match (&stream.source, record.neteq) {
-                (ConsumerSource::NetEq(handle), Some(result)) => {
-                    let diagnostics = lock_shared_stream(handle).diagnostics();
+                (ConsumerSource::NetEq(source), Some(result)) => {
+                    let diagnostics = lock_shared_stream(&source.source.shared).diagnostics();
                     kvlog::info!(
                         "audio pop stream block",
                         block_index = self.output_block_index,
@@ -638,7 +725,34 @@ impl LivePlaybackMixer {
                         next_packet_gap_ms = diagnostics.next_packet_gap_ms
                     );
                 }
-                _ => {
+                (ConsumerSource::NetEq(source), None) => {
+                    let diagnostics = lock_shared_stream(&source.source.shared).diagnostics();
+                    kvlog::info!(
+                        "audio pop stream block",
+                        block_index = self.output_block_index,
+                        stream_id = record.stream_id,
+                        active = record.frame_index.is_some(),
+                        source_kind = "neteq_assist",
+                        declick_start = record.declick_start,
+                        declick_end = record.declick_end,
+                        control_muted = stream.control.muted,
+                        volume_db = stream.control.volume_db,
+                        first_delta,
+                        max_delta,
+                        rms,
+                        peak,
+                        decision = diagnostics.operation,
+                        reason = diagnostics.reason,
+                        target_ms = diagnostics.target_ms,
+                        playout_delay_ms = diagnostics.playout_delay_ms,
+                        sync_buffer_ms = diagnostics.sync_buffer_ms,
+                        packet_buffer_ms = diagnostics.packet_buffer_ms,
+                        packet_buffer_wait_ms = diagnostics.packet_buffer_wait_ms,
+                        packets_buffered = diagnostics.packets_buffered as u64,
+                        next_packet_gap_ms = diagnostics.next_packet_gap_ms
+                    );
+                }
+                (ConsumerSource::Ring(_), _) => {
                     kvlog::info!(
                         "audio pop stream block",
                         block_index = self.output_block_index,
@@ -836,7 +950,9 @@ impl LivePlaybackSharedSnapshot {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::audio::playback::{SampleRing, SharedNetEqStream};
+    use crate::audio::playback::{
+        NetEqMixerSource, SampleRing, SharedNetEqStream, lock_shared_stream,
+    };
     use crate::audio::shared::FRAME_SAMPLES;
     use crate::audio::test_support::test_tuning;
 
@@ -909,6 +1025,47 @@ mod tests {
             (steady - 0.3).abs() < 1e-4,
             "notification ducked speech instead of summing: {steady}"
         );
+    }
+
+    #[test]
+    fn neteq_assist_ring_is_mixed_before_direct_pull() {
+        let source = NetEqMixerSource::new(SharedNetEqStream::new(test_tuning()).unwrap());
+        source.render_ring.write_samples(&vec![0.25; FRAME_SAMPLES]);
+
+        let mut mixer = LivePlaybackMixer::new();
+        mixer.ensure_stream(1, MixerStreamSource::NetEq(source.clone()));
+
+        let mut out = vec![0.0; FRAME_SAMPLES];
+        mixer.fill_block(Instant::now(), &mut out);
+
+        let steady = out[FRAME_SAMPLES - 1];
+        assert!((steady - 0.25).abs() < 1e-6, "mixed sample {steady}");
+        assert_eq!(source.render_ring.depth(), 0, "assist ring was not drained");
+        assert_eq!(source.assist.metrics().mixed_blocks, 1);
+        assert_eq!(source.assist.metrics().underrun_blocks, 0);
+    }
+
+    #[test]
+    fn neteq_assist_underrun_does_not_wait_for_worker_lock() {
+        let source = NetEqMixerSource::new(SharedNetEqStream::new(test_tuning()).unwrap());
+        source
+            .assist
+            .note_direct_render(Duration::from_micros(1_000));
+
+        let mut mixer = LivePlaybackMixer::new();
+        mixer.ensure_stream(1, MixerStreamSource::NetEq(source.clone()));
+
+        let guard = lock_shared_stream(&source.shared);
+        let mut out = vec![1.0; FRAME_SAMPLES];
+        mixer.fill_block(Instant::now(), &mut out);
+        drop(guard);
+
+        assert!(out.iter().all(|sample| *sample == 0.0));
+        let metrics = source.assist.metrics();
+        assert_eq!(metrics.requests, 1);
+        assert_eq!(metrics.activations, 1);
+        assert_eq!(metrics.underrun_blocks, 1);
+        assert_eq!(metrics.lock_miss_silence_blocks, 1);
     }
 
     #[test]
@@ -1144,7 +1301,8 @@ mod tests {
     fn render_records_attribute_each_stream_per_block() {
         let mut mixer = LivePlaybackMixer::new();
         mixer.ensure_stream(1, ring_with(&[0.5; FRAME_SAMPLES * 2]));
-        mixer.ensure_stream(2, SharedNetEqStream::new(test_tuning()).unwrap());
+        let source = NetEqMixerSource::new(SharedNetEqStream::new(test_tuning()).unwrap());
+        mixer.ensure_stream(2, MixerStreamSource::NetEq(source));
 
         let mut out = vec![0.0; FRAME_SAMPLES];
         mixer.fill_block(Instant::now(), &mut out);
