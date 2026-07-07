@@ -1668,6 +1668,9 @@ mod tests {
     /// switch lands; the staged output component is now at most one 10 ms mixer
     /// frame.
     const PRISTINE_ESTIMATE_BUDGET_MS: u64 = 55;
+    // Normal direct-pull playback only stages the mix-adapter carry (<10 ms).
+    // Callback assist is capped at one worker-rendered 10 ms NetEQ block so it
+    // cannot weaken the latency guard under pristine conditions.
     const MAX_STAGED_OUTPUT_MS: u64 = 10;
     /// How far the alternating-speech playout floor may exceed the
     /// continuous-speech floor before silence handling is judged to inflate

@@ -1,14 +1,15 @@
 use std::sync::Arc;
 
+use super::frame_combiner::MIX_FRAME_SAMPLES;
 use crate::audio::{
-    playback::{SampleRing, SharedNetEqHandle},
+    playback::{NETEQ_RENDER_ASSIST_RING_BLOCKS, NetEqRenderAssist, SampleRing, SharedNetEqHandle},
     shared::PlaybackStreamControl,
 };
 
 /// Control-plane events the decode worker sends to the cpal consumer.
 ///
 /// Audio no longer crosses this channel at all: the consumer pulls each voice
-/// stream's NetEQ directly through its [`SharedNetEqHandle`]. Only stream
+/// stream's NetEQ directly or drains its assisted render ring. Only stream
 /// lifecycle and mute/gain cross here.
 pub(crate) enum LivePlaybackMixerEvent {
     Empty,
@@ -26,10 +27,30 @@ pub(crate) enum LivePlaybackMixerEvent {
     },
 }
 
+/// The callback-side handles for a live NetEQ voice stream.
+#[derive(Clone)]
+pub(crate) struct NetEqMixerSource {
+    pub shared: SharedNetEqHandle,
+    pub render_ring: Arc<SampleRing>,
+    pub assist: Arc<NetEqRenderAssist>,
+}
+
+impl NetEqMixerSource {
+    pub(crate) fn new(shared: SharedNetEqHandle) -> Self {
+        Self {
+            shared,
+            render_ring: Arc::new(SampleRing::with_capacity(
+                MIX_FRAME_SAMPLES * NETEQ_RENDER_ASSIST_RING_BLOCKS,
+            )),
+            assist: Arc::new(NetEqRenderAssist::default()),
+        }
+    }
+}
+
 /// What the consumer renders a registered stream from.
 pub(crate) enum MixerStreamSource {
-    /// A remote voice stream, pulled synchronously from its shared NetEQ.
-    NetEq(SharedNetEqHandle),
+    /// A remote voice stream, pulled from shared NetEQ or its assisted ring.
+    NetEq(NetEqMixerSource),
     /// A pre-rendered notification clip, read from its ring.
     Ring(Arc<SampleRing>),
 }
@@ -37,12 +58,6 @@ pub(crate) enum MixerStreamSource {
 impl From<Arc<SampleRing>> for MixerStreamSource {
     fn from(ring: Arc<SampleRing>) -> Self {
         Self::Ring(ring)
-    }
-}
-
-impl From<SharedNetEqHandle> for MixerStreamSource {
-    fn from(handle: SharedNetEqHandle) -> Self {
-        Self::NetEq(handle)
     }
 }
 

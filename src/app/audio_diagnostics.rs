@@ -89,7 +89,7 @@ impl AudioDiagnostics {
         };
 
         format!(
-            "devices\n  input: {}\n  output: {}\nplayback\n  output: staged max {}ms, queued {} samples, callback {}ms\n  callback: {} calls, {} overruns, max {}, events {}, neteq lock waits {} total / {} max / {}\n  neteq: playout {}ms ({} / 5s), target {}ms{} ({} / 5s)\n  buffers: decoded {}ms, packets wait {}ms span {}ms / {} pkts, next gap {}\n  decision: {} ({})\n  timing: accelerate {}ms / {}, expand {}ms / {}\n  recovery: dred {}, fec {}, horizon {}ms, missed {}ms / {}, plc {}, trims {}, concealment expands {}\n  active streams: {}\nnetwork\n  voice rx: {} packets / {}\nencoder\n  profile: {}\n{}",
+            "devices\n  input: {}\n  output: {}\nplayback\n  output: staged max {}ms, queued {} samples, callback {}ms\n  callback: {} calls, {} overruns, max {}, events {}, neteq lock waits {} total / {} max / {}\n  assist: {} requests, {} bursts, {} prefilled, {} mixed, {} underruns, {} lock-miss silence\n  neteq: playout {}ms ({} / 5s), target {}ms{} ({} / 5s)\n  buffers: decoded {}ms, packets wait {}ms span {}ms / {} pkts, next gap {}\n  decision: {} ({})\n  timing: accelerate {}ms / {}, expand {}ms / {}\n  recovery: dred {}, fec {}, horizon {}ms, missed {}ms / {}, plc {}, trims {}, concealment expands {}\n  active streams: {}\nnetwork\n  voice rx: {} packets / {}\nencoder\n  profile: {}\n{}",
             input_device,
             output_device,
             self.snapshot.max_output_ring_ms,
@@ -102,6 +102,12 @@ impl AudioDiagnostics {
             format_us_compact(self.snapshot.neteq_lock_wait_total_us),
             format_us_compact(self.snapshot.neteq_lock_wait_max_us),
             self.snapshot.neteq_lock_wait_count,
+            self.snapshot.playback_assist_requests,
+            self.snapshot.playback_assist_activations,
+            self.snapshot.playback_assist_prefill_blocks,
+            self.snapshot.playback_assist_mixed_blocks,
+            self.snapshot.playback_assist_underrun_blocks,
+            self.snapshot.playback_assist_lock_miss_silence_blocks,
             self.snapshot.neteq_playout_delay_ms,
             format_signed_ms(self.snapshot.neteq_playout_delta_5s_ms),
             self.snapshot.neteq_target_ms,
@@ -224,6 +230,12 @@ mod tests {
                 playback_callbacks: 12,
                 playback_callback_overruns: 1,
                 playback_callback_max_duration_us: 1_250,
+                playback_assist_requests: 3,
+                playback_assist_activations: 2,
+                playback_assist_prefill_blocks: 5,
+                playback_assist_mixed_blocks: 4,
+                playback_assist_underrun_blocks: 1,
+                playback_assist_lock_miss_silence_blocks: 1,
                 neteq_lock_wait_count: 2,
                 neteq_lock_wait_total_us: 300,
                 neteq_lock_wait_max_us: 250,
@@ -274,6 +286,9 @@ mod tests {
         assert!(body.contains("playback\n"));
         assert!(body.contains("callback: 12 calls, 1 overruns, max 1.2ms"));
         assert!(body.contains("neteq lock waits 300us total / 250us max / 2"));
+        assert!(body.contains(
+            "assist: 3 requests, 2 bursts, 5 prefilled, 4 mixed, 1 underruns, 1 lock-miss silence"
+        ));
         assert!(body.contains("network\n"));
         assert!(body.contains("profile: dred35"));
         assert!(body.contains("health\n  mic: healthy\n  spk: reconnecting (attempt 2, 5s)"));
