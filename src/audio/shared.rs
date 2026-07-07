@@ -630,6 +630,7 @@ pub struct LivePlaybackSnapshot {
     pub dred_last_horizon_ms: u64,
     pub dred_missed_horizon_count: u64,
     pub dred_missed_horizon_ms: u64,
+    pub neteq_dred_near_playout: bool,
     pub hard_trim_count: u64,
     pub dred_recoveries: u64,
     pub fec_recoveries: u64,

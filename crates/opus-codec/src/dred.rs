@@ -341,6 +341,14 @@ pub struct DredState {
 unsafe impl Send for DredState {}
 unsafe impl Sync for DredState {}
 
+impl std::fmt::Debug for DredState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DredState")
+            .field("size", &self.size)
+            .finish_non_exhaustive()
+    }
+}
+
 impl DredState {
     /// Allocate a new DRED state.
     ///

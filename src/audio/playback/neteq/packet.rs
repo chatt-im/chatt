@@ -14,6 +14,7 @@
 use std::sync::Arc;
 
 use super::tick_timer::Stopwatch;
+use opus_codec::DredState;
 
 /// Redundancy ranking. Sorted low-to-high: a lower value is a *higher* priority
 /// payload that should be preferred for the same timestamp. `{0, 0}` is the
@@ -55,9 +56,10 @@ impl Ord for Priority {
     }
 }
 
-/// The decodable content of a [`Packet`]. FEC and DRED reference the bounding
-/// datagram's raw bytes so the actual Opus/DRED decode can run later in the
-/// `GetAudio` loop without re-buffering the encoded data.
+/// The decodable content of a [`Packet`]. FEC references the bounding datagram's
+/// raw bytes so it can decode later without copying. DRED carries the
+/// worker-prepared state so the callback only materializes the needed PCM
+/// slice.
 #[derive(Clone, Debug)]
 pub(crate) enum PacketPayload {
     /// Primary Opus payload.
@@ -65,9 +67,9 @@ pub(crate) enum PacketPayload {
     /// In-band FEC (LBRR): decode these bytes in FEC mode to recover the frame
     /// one step before the carrying packet.
     OpusFec(Arc<Vec<u8>>),
-    /// A DRED recovered chunk: the bounding datagram bytes plus the DRED offset
+    /// A DRED recovered chunk: the processed DRED state plus the DRED offset
     /// (in samples before the bounding packet's primary audio) to decode at.
-    Dred { source: Arc<Vec<u8>>, offset: i32 },
+    Dred { state: Arc<DredState>, offset: i32 },
 }
 
 /// One decodable unit before the decoder. Comparison establishes ordering by

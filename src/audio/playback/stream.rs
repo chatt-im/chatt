@@ -65,6 +65,17 @@ impl NetEqRenderAssist {
         }
     }
 
+    pub(crate) fn request_predictive_prefill(&self, ring_depth: usize) {
+        self.finish_if_idle(ring_depth);
+        let is_idle = self.target_samples.load(Ordering::Acquire) == 0
+            && self.blocks_remaining.load(Ordering::Acquire) == 0;
+        if !is_idle {
+            return;
+        }
+        self.requests.fetch_add(1, Ordering::Relaxed);
+        self.request_prefill();
+    }
+
     fn request_prefill(&self) {
         let was_idle = self.target_samples.load(Ordering::Acquire) == 0
             && self.blocks_remaining.load(Ordering::Acquire) == 0;

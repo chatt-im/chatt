@@ -114,6 +114,7 @@ fn log_neteq_diagnostics(snapshot: &LivePlaybackSnapshot) {
         accelerate_count = snapshot.accelerate_count,
         expand_count = snapshot.expand_count,
         hard_trim_count = snapshot.hard_trim_count,
+        dred_near_playout = snapshot.neteq_dred_near_playout,
         callbacks = snapshot.playback_callbacks,
         callback_overruns = snapshot.playback_callback_overruns,
         callback_max_duration_us = snapshot.playback_callback_max_duration_us,
@@ -191,6 +192,7 @@ fn drain_stream(
 ) {
     stream.apply_control_mute_pending(now, stream_id);
     stream.activate_control_mute_fallback_if_due(now, stream_id);
+    stream.request_dred_render_assist();
     stream.prefill_render_assist(now);
 
     let sender_silence = stream.take_sender_silence_pending();
@@ -778,6 +780,9 @@ impl LiveDecodeStreams {
                 .iter()
                 .map(|diagnostics| diagnostics.dred_missed_horizon_ms)
                 .sum(),
+            neteq_dred_near_playout: diagnostics
+                .iter()
+                .any(|diagnostics| diagnostics.dred_near_playout),
             hard_trim_count: self.stats.hard_trim_count,
             dred_recoveries: self.stats.dred_recoveries,
             fec_recoveries: self.stats.fec_recoveries,
@@ -1086,6 +1091,18 @@ impl LiveDecodeStream {
         self.source
             .assist
             .finish_if_idle(self.source.render_ring.depth());
+    }
+
+    fn request_dred_render_assist(&mut self) {
+        let dred_near_playout = {
+            let shared = lock_shared_stream(&self.source.shared);
+            shared.core.dred_recovery_near_playout()
+        };
+        if dred_near_playout {
+            self.source
+                .assist
+                .request_predictive_prefill(self.source.render_ring.depth());
+        }
     }
 
     fn flush_feedback(
@@ -1527,6 +1544,43 @@ mod tests {
         assert!(
             snapshot.playback_assist_prefill_blocks >= 1,
             "snapshot hid worker assist prefill"
+        );
+    }
+
+    #[test]
+    fn dred_near_playout_predictively_prefills_assist_ring() {
+        let now = Instant::now();
+        let tuning = test_tuning();
+        let mut streams = LiveDecodeStreams::new(tuning);
+        let queue = SpscSwapQueue::<LivePlaybackMixerEvent>::with_capacity(8);
+        let packets = encode_live_dred_packets(crate::network::EncoderNetworkProfile::CRITICAL, 20);
+
+        streams.insert_packet(voice_packet(7, 10, 0, packets[10].clone(), now), now);
+        streams.insert_packet(voice_packet(7, 14, 0, packets[14].clone(), now), now);
+
+        {
+            let stream = streams.streams.get(&7).unwrap();
+            let shared = lock_shared_stream(&stream.source.shared);
+            assert!(
+                shared.core.dred_recovery_near_playout(),
+                "test setup did not put DRED near the playout edge"
+            );
+        }
+
+        streams.drain_into_mixer_events(&queue, now, None);
+
+        let stream = streams.streams.get(&7).unwrap();
+        let ring_depth = stream.source.render_ring.depth();
+        let metrics = stream.source.assist.metrics();
+        assert!(
+            ring_depth >= MIX_FRAME_SAMPLES,
+            "predictive assist did not pre-render a complete block"
+        );
+        assert_eq!(metrics.requests, 1);
+        assert_eq!(metrics.activations, 1);
+        assert!(
+            metrics.prefilled_blocks >= 1,
+            "predictive assist request did not produce a worker-rendered block"
         );
     }
 

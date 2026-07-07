@@ -203,6 +203,22 @@ impl PacketBuffer {
         self.buffer.front()
     }
 
+    /// True when a DRED packet is close enough to the front that the next few
+    /// `GetAudio` pulls may have to materialize it.
+    pub(crate) fn dred_within_front_span(&self, span_samples: usize) -> bool {
+        let mut preceding_samples = 0usize;
+        for packet in &self.buffer {
+            if packet.priority.codec_level == 2 {
+                return preceding_samples <= span_samples;
+            }
+            preceding_samples = preceding_samples.saturating_add(packet.duration_samples);
+            if preceding_samples > span_samples {
+                return false;
+            }
+        }
+        false
+    }
+
     pub(crate) fn get_next_packet(&mut self) -> Option<Packet> {
         self.buffer.pop_front()
     }
@@ -398,5 +414,15 @@ mod tests {
         buffer.insert_packet(opus(960, 1, Priority::PRIMARY), &timer);
         assert_eq!(buffer.next_lower_timestamp(2880), Some(960));
         assert_eq!(buffer.next_lower_timestamp(0), None);
+    }
+
+    #[test]
+    fn dred_within_front_span_finds_near_recovery_packet() {
+        let timer = TickTimer::new();
+        let mut buffer = PacketBuffer::new(50);
+        buffer.insert_packet(opus(0, 0, Priority::PRIMARY), &timer);
+        buffer.insert_packet(opus(960, 1, Priority::new(2, 0)), &timer);
+        assert!(buffer.dred_within_front_span(960));
+        assert!(!buffer.dred_within_front_span(480));
     }
 }
