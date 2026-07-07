@@ -45,7 +45,9 @@ use crate::{
         modes::{
             RoomMode, RoomSwitchMode, ServerEditMode, ServerListMode, SettingsMode, SettingsSession,
         },
-        overlay::{DialogMode, PasswordPromptMode, PasteImageUploadMode},
+        overlay::{
+            DialogMode, NativeEncryptionWarningMode, PasswordPromptMode, PasteImageUploadMode,
+        },
     },
     ui::settings::{
         DeviceAction, DeviceSide, FieldId, FieldIntent, SettingsButton, SettingsOutput,
@@ -2591,6 +2593,17 @@ impl App {
                 self.push_network_notice("auth", &message);
                 self.set_error(auth_failure_status(&message));
             }
+            NetworkEvent::NativeEncryptionRequired => {
+                let Some(label) = self.active_server_label.clone() else {
+                    self.disconnect_network();
+                    self.open_server_select();
+                    self.set_error("server is not using native encryption");
+                    return;
+                };
+                self.disconnect_network();
+                self.push_mode(Box::new(NativeEncryptionWarningMode::new(label)));
+                self.set_error("server is not using native encryption");
+            }
             NetworkEvent::PairingSucceeded => {
                 let Some(pair) = self.pending_pair.take() else {
                     self.set_status("pairing succeeded");
@@ -2817,6 +2830,51 @@ impl App {
             }
             Err(error) => self.set_error(error),
         }
+    }
+
+    pub(crate) fn accept_native_encryption_warning(&mut self, label: &str) {
+        let Some(server) = self
+            .config
+            .servers
+            .iter_mut()
+            .find(|server| server.label == label)
+        else {
+            self.set_error(format!("server {label} is not configured"));
+            self.room.reset_for_server_list();
+            self.request_mode_transition(ModeTransition::Set(Box::new(ServerListMode::new())));
+            return;
+        };
+        server.require_native_encryption = false;
+
+        match self.config.save_runtime() {
+            Ok(path) => {
+                self.config.config_path = Some(path.clone());
+                self.rebuild_server_items();
+                if self.start_network(label) {
+                    self.request_mode_transition(ModeTransition::Set(
+                        Box::new(RoomMode::default()),
+                    ));
+                    self.set_status(format!(
+                        "native encryption disabled for {label}; config saved to {}",
+                        path.display()
+                    ));
+                } else {
+                    self.room.reset_for_server_list();
+                    self.request_mode_transition(ModeTransition::Set(Box::new(
+                        ServerListMode::new(),
+                    )));
+                }
+            }
+            Err(error) => self.set_error(error),
+        }
+    }
+
+    pub(crate) fn cancel_native_encryption_warning(&mut self) {
+        self.disconnect_network();
+        self.room.reset_for_server_list();
+        self.rebuild_server_items();
+        self.request_mode_transition(ModeTransition::Set(Box::new(ServerListMode::new())));
+        self.set_status("connection canceled");
     }
 
     pub(crate) fn save_server_edit_with(&mut self, draft: &ServerEditDraft, join_after_save: bool) {
@@ -5575,6 +5633,7 @@ fn network_event_kind(event: &NetworkEvent) -> &'static str {
         NetworkEvent::PairingFailed(_) => "pairing_failed",
         NetworkEvent::OpenPairingSucceeded { .. } => "open_pairing_succeeded",
         NetworkEvent::OpenPairingNeedsPassword { .. } => "open_pairing_needs_password",
+        NetworkEvent::NativeEncryptionRequired => "native_encryption_required",
         NetworkEvent::ReconnectScheduled { .. } => "reconnect_scheduled",
         NetworkEvent::WorkerStopped { .. } => "worker_stopped",
         NetworkEvent::ShareStarted { .. } => "share_started",

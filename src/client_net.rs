@@ -301,6 +301,7 @@ pub struct ClientConfig {
     pub display_name: String,
     pub token: String,
     pub server_public_key: Option<String>,
+    pub require_native_encryption: bool,
     pub file_policy: FilePolicy,
     pub max_upload_bytes: u64,
     /// Upload pacing ceiling in bytes per second, `0` for unlimited. Seeds
@@ -601,6 +602,9 @@ pub enum NetworkEvent {
         retry: bool,
         server_public_key: String,
     },
+    /// The server selected plaintext ExternalSecureLink transport, while this
+    /// saved server still requires chatt-native encryption.
+    NativeEncryptionRequired,
     ReconnectScheduled {
         retry_in: Duration,
         reason: String,
@@ -920,6 +924,10 @@ fn run_worker_inner(
         Err(error) => return SessionEnd::ConnectFailed(error),
     };
     let transport_mode = transport.mode;
+    if transport_mode == TransportMode::ExternalSecureLink && config.require_native_encryption {
+        let _ = events.send(NetworkEvent::NativeEncryptionRequired);
+        return SessionEnd::Shutdown;
+    }
     let video_auth_key = transport.video_auth_key;
     let control = transport.control_record();
     let media = media::MediaProtection::from_transport(&transport);

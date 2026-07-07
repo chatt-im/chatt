@@ -23,6 +23,7 @@ use crate::{
 
 const LABEL_WIDTH: u16 = 12;
 const SERVER_SECTION: &str = "Server";
+const NATIVE_ENCRYPTION_CHOICES: [bool; 2] = [true, false];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ServerEditButton {
@@ -85,6 +86,7 @@ pub(crate) struct ServerEditDraft {
     tcp_addr: String,
     udp_addr: String,
     udp_probe_addr: String,
+    require_native_encryption: bool,
     files_choice: OverrideToggle,
     download_path: String,
     receive_limit: String,
@@ -134,6 +136,7 @@ impl ServerEditDraft {
             tcp_addr: server.tcp_addr.clone(),
             udp_addr: server.udp_addr.clone(),
             udp_probe_addr: server.udp_probe_addr.clone().unwrap_or_default(),
+            require_native_encryption: server.require_native_encryption,
             files_choice,
             download_path,
             receive_limit: byte_limit_text(server.files.max_receive_bytes),
@@ -153,7 +156,7 @@ impl ServerEditDraft {
 
     /// The number of form rows the dialog body currently lays out.
     pub(crate) fn form_height(&self) -> u16 {
-        20 + u16::from(self.files_choice == OverrideToggle::On)
+        22 + u16::from(self.files_choice == OverrideToggle::On)
     }
 
     pub(crate) fn handle_key(&mut self, key: KeyEvent, theme: &Theme) -> ServerEditEvent {
@@ -234,6 +237,7 @@ impl ServerEditDraft {
                 tcp_addr: &mut self.tcp_addr,
                 udp_addr: &mut self.udp_addr,
                 udp_probe_addr: &mut self.udp_probe_addr,
+                require_native_encryption: &mut self.require_native_encryption,
                 files_choice: &mut self.files_choice,
                 download_path: &mut self.download_path,
                 receive_limit: &mut self.receive_limit,
@@ -295,6 +299,7 @@ impl ServerEditDraft {
             username: draft.username.trim().to_string(),
             token: self.token.clone(),
             server_public_key: self.server_public_key.clone(),
+            require_native_encryption: draft.require_native_encryption,
             files,
             history,
             rooms: self.rooms.clone(),
@@ -336,6 +341,7 @@ impl ServerEditDraft {
                 tcp_addr: &mut self.tcp_addr,
                 udp_addr: &mut self.udp_addr,
                 udp_probe_addr: &mut self.udp_probe_addr,
+                require_native_encryption: &mut self.require_native_encryption,
                 files_choice: &mut self.files_choice,
                 download_path: &mut self.download_path,
                 receive_limit: &mut self.receive_limit,
@@ -387,6 +393,7 @@ impl ServerEditDraft {
             tcp_addr: self.tcp_addr.clone(),
             udp_addr: self.udp_addr.clone(),
             udp_probe_addr: self.udp_probe_addr.clone(),
+            require_native_encryption: self.require_native_encryption,
             files_choice: self.files_choice,
             download_path: self.download_path.clone(),
             receive_limit: self.receive_limit.clone(),
@@ -409,6 +416,7 @@ struct ServerEditValues<'a> {
     tcp_addr: &'a mut String,
     udp_addr: &'a mut String,
     udp_probe_addr: &'a mut String,
+    require_native_encryption: &'a mut bool,
     files_choice: &'a mut OverrideToggle,
     download_path: &'a mut String,
     receive_limit: &'a mut String,
@@ -446,6 +454,18 @@ fn server_edit_ui(
         .is_focus()
     {
         form.set_help("Optional UDP NAT-probe address for direct peer media checks. Empty disables the separate probe endpoint.");
+    }
+    form.section("Security");
+    if form
+        .choice_value(
+            "Native enc",
+            values.require_native_encryption,
+            &NATIVE_ENCRYPTION_CHOICES,
+            native_encryption_choice_label,
+        )
+        .is_focus()
+    {
+        form.set_help("Requires chatt-native encryption. Disable only when another secure link protects this server connection.");
     }
     form.section("Downloads");
     let inherited_downloads_on = values.inherited_downloads_on;
@@ -513,6 +533,14 @@ fn server_edit_button_event(button: ServerEditButton) -> ServerEditEvent {
             join_after_save: true,
         },
         ServerEditButton::Cancel => ServerEditEvent::Cancel,
+    }
+}
+
+fn native_encryption_choice_label(required: bool) -> String {
+    if required {
+        "required".to_string()
+    } else {
+        "external link allowed".to_string()
     }
 }
 
