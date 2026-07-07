@@ -617,23 +617,45 @@ pub(crate) fn filter_ar_fast_q12(
     coefficients: &[i16],
     data_length: usize,
 ) {
+    if data_length == 0 {
+        return;
+    }
+
     let order = coefficients.len() - 1;
+    assert!(
+        order <= 8,
+        "At the time there two places which use this max out at 8"
+    );
+    assert!(data_in.len() >= data_length);
+    assert!(state_and_out.len() >= order + data_length);
+
     let c0 = coefficients[0] as i32;
-    // Feedback taps, applied newest-history-first. The contiguous history window
-    // `state_and_out[i..i + order]` has `window[k] == state_and_out[order + i - j]`
-    // for `j == order - k`, so pairing it with the reversed taps reproduces the C
-    // inner sum term for term. i32 products match the C `int16 * int16 -> int`
-    // width; the running sum (`order` terms, each below 2^31) stays within i64.
-    let taps = &coefficients[1..=order];
+
+    let mut rev_taps_buf = [0i16; 8];
+    if order > 0 {
+        rev_taps_buf[..order].copy_from_slice(&coefficients[1..=order]);
+        rev_taps_buf[..order].reverse();
+    }
+
+    let data_in = &data_in[..data_length];
+    let state_and_out = &mut state_and_out[..order + data_length];
+    let rev_taps = &rev_taps_buf[..order];
+
     for i in 0..data_length {
+        // Because we sliced state_and_out to `order + data_length`,
+        // the compiler can prove `i..i + order` is safe and elide the bounds check.
         let window = &state_and_out[i..i + order];
+
         let mut sum: i64 = 0;
-        for (&c, &w) in taps.iter().rev().zip(window) {
+        // Since `rev_taps` and `window` both have length `order`,
+        // the zip operation requires no length checks or dynamic resizing.
+        for (&c, &w) in rev_taps.iter().zip(window) {
             sum += (c as i32 * w as i32) as i64;
         }
+
         let output = (c0 * data_in[i] as i32) as i64 - sum;
-        // WEBRTC_SPL_SAT(134215679, output, -134217728).
         let output = output.clamp(-134_217_728, 134_215_679);
+
         state_and_out[order + i] = ((output + 2048) >> 12) as i16;
     }
 }
