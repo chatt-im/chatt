@@ -117,7 +117,7 @@ pub(crate) struct NetEqDiagnostics {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct NetEqInsertContext {
     current_gap: u32,
-    dred_enabled: bool,
+    pub dred_enabled: bool,
 }
 
 /// One cached DRED parse, reused across the 10 ms chunks recovered from the same
@@ -473,6 +473,7 @@ impl NetEqCore {
         self.insert_datagram(now, timestamp, sequence, flags, Arc::new(opus.to_vec()))
     }
 
+    #[cfg(test)]
     pub(crate) fn insert_datagram(
         &mut self,
         now: Instant,
