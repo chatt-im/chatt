@@ -6,15 +6,20 @@ useful as the code moves.
 
 ## Security Status
 
-- By default, application control, chat, file relay, and server-relayed media
-  traffic is encrypted after the TCP handshake completes. The server can select
-  authenticated plaintext transport with `security.encryption = false`.
-- The handshake itself carries only public key agreement material, nonces, and a
-  server signature. No user token, pairing code, chat body, file content, or
-  media payload is sent before the server-selected transport mode is active.
-- In plaintext mode, the server's no-encryption decision is signed, but user
-  tokens, pairing codes, chat, files, and server-relayed media do not have
-  transport confidentiality.
+- By default (`transport-mode = "native-encrypted"`), application control, chat,
+  file relay, video, and server-relayed media traffic is encrypted after the TCP
+  handshake completes. The server can instead select
+  `transport-mode = "external-secure-link"`, which defers wire security to an
+  outer tunnel and sends those payloads in the clear after the handshake.
+- The signed X25519 handshake runs and derives full session material in **both**
+  modes; only the selected mode differs, and the server's signature covers it. No
+  user token, pairing code, chat body, file content, or media payload is sent
+  before the transport is active.
+- In `external-secure-link` mode, control, media, video, and file payloads have
+  no chatt-provided confidentiality (the outer link supplies it), but UDP address
+  claims still carry a proof of possession under a session-derived bind key, so a
+  spoofed datagram cannot hijack a session's media address. P2P is disabled in
+  this mode because it would bypass the outer link.
 - The server is trusted in this version. It decrypts messages and media in order
   to route them, so this is not end-to-end encryption.
 - The default server config sets `security.chat-history-limit = 0`, so the
@@ -48,8 +53,10 @@ Important fields:
   embedded in invites.
 - `security.server-identity-seed`: 32-byte Ed25519 seed encoded as hex. Replace
   the development value before non-local use.
-- `security.encryption`: whether TCP control and server-relayed UDP media use
-  negotiated transport encryption. Defaults to `true`.
+- `security.transport-mode`: `"native-encrypted"` (default) has chatt secure the
+  wire with session keys; `"external-secure-link"` defers wire security to an
+  outer tunnel, sending payloads clear after the signed handshake and disabling
+  P2P.
 - `security.chat-history-limit`: number of messages to keep in memory for new
   joins. Use `0` for no retained message bodies.
 - `security.max-file-size-bytes`: server-side file relay limit, capped by the
@@ -142,17 +149,16 @@ Shared protocol:
   validation in `validate_client_control`; `InviteTicket` join-string
   encoding/decoding.
 - `crates/rpc/src/crypto.rs`: handshake generation and verification in
-  `generate_client_hello`, `respond_to_client_hello`,
-  `respond_to_client_hello_plaintext`, and
-  `complete_client_transport_handshake`; key derivation in
-  `derive_session_secrets`; control transport selection in `ControlTransport`;
-  AEAD framing in `TransportCipher`, `seal_with_key`, and `open_with_key`;
-  replay tracking in `AntiReplay`; configured-key helpers in
-  `server_key_pair_from_seed_hex`, `ed25519_public_key_from_hex`, and
-  `encode_hex`.
-- `crates/rpc/src/media.rs`: UDP encryption/plaintext and anti-replay entry
-  points in `seal_media`, `open_media`, `seal_plaintext_media`,
-  `open_plaintext_media`, and `parse_header`.
+  `generate_client_hello`, `respond_to_client_hello`, and
+  `complete_client_transport_handshake`; the negotiated `TransportMode` and the
+  per-session `SessionTransport` (route id, bind key, video auth key); key
+  derivation in `derive_session_transport`; record-lane selection in
+  `RecordProtection`; AEAD framing in `TransportCipher`, `seal_with_key`, and
+  `open_with_key`; truncated-HMAC setup proofs in `auth_proof`; replay tracking
+  in `AntiReplay`.
+- `crates/rpc/src/media.rs`: the per-session `MediaProtection` codec and its
+  `seal_media`/`open_media` (returning `OpenedMedia` with an `AddressProof`),
+  the raw-key peer codec `seal_peer_media`/`open_peer_media`, and `parse_header`.
 
 Server:
 

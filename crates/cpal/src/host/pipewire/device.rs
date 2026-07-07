@@ -161,7 +161,9 @@ impl Device {
     fn clock_group_key(&self) -> String {
         match self.class {
             Class::Node => self.object_serial.to_string(),
-            Class::DefaultSink | Class::DefaultInput | Class::DefaultOutput => self.node_name.clone(),
+            Class::DefaultSink | Class::DefaultInput | Class::DefaultOutput => {
+                self.node_name.clone()
+            }
         }
     }
 

@@ -404,6 +404,9 @@ pub(crate) struct App {
     available_shares: HashMap<StreamId, AvailableShare>,
     /// Active inbound viewer connections, keyed by stream id.
     subscribers: HashMap<StreamId, crate::video::SubscriberHandle>,
+    /// Video connection authentication/protection selected by the current
+    /// session handshake.
+    video_transport: Option<crate::video::VideoTransport>,
     /// TCP address of the connected server, reused by dedicated video
     /// connections. Set on connect, cleared on disconnect.
     active_tcp_addr: Option<String>,
@@ -998,6 +1001,7 @@ impl App {
             screencast_status: ScreencastStatus::default(),
             available_shares: HashMap::new(),
             subscribers: HashMap::new(),
+            video_transport: None,
             active_tcp_addr: None,
             active_server_label: None,
             config,
@@ -1144,11 +1148,18 @@ impl App {
                 };
                 let web_feed = self.web_feed.clone();
                 let events = self.events.sender();
+                let Some(video_transport) = self.video_transport else {
+                    self.fail_screencast_start(
+                        "screen share failed: video transport is not ready".to_string(),
+                    );
+                    return;
+                };
                 match crate::video::start_screencast(
                     argv,
                     codec,
                     network.sender(),
                     tcp_addr,
+                    video_transport,
                     web_feed,
                     events,
                 ) {
@@ -1370,8 +1381,21 @@ impl App {
             ));
             return;
         };
-        let handle =
-            crate::video::start_subscriber(session_id, stream_id, view_secret, tcp_addr, feed);
+        let Some(video_transport) = self.video_transport else {
+            feed.send_share_error(share_error_envelope(
+                stream_id,
+                "video transport is not ready",
+            ));
+            return;
+        };
+        let handle = crate::video::start_subscriber(
+            session_id,
+            stream_id,
+            view_secret,
+            tcp_addr,
+            video_transport,
+            feed,
+        );
         self.subscribers.insert(stream_id, handle);
         self.set_status("viewing screen share");
     }
@@ -1490,6 +1514,7 @@ impl App {
         self.stop_all_shares();
         self.active_tcp_addr = None;
         self.active_server_label = None;
+        self.video_transport = None;
         self.control_socket.take();
         if let Some(network) = self.network.take() {
             network.stop();
@@ -2142,9 +2167,15 @@ impl App {
                 rooms,
                 users,
                 default_room,
+                video_transport_mode,
+                video_auth_key,
             } => {
                 self.session_id = Some(session_id);
                 self.user_id = Some(user_id);
+                self.video_transport = Some(crate::video::VideoTransport::new(
+                    video_transport_mode,
+                    video_auth_key,
+                ));
                 self.network_disconnected = false;
                 self.last_network_notice = None;
                 let catalog = crate::room_catalog::load(self.room.history_storage().catalog_dir());
@@ -6032,6 +6063,8 @@ mod tests {
             rooms: vec![test_room_info(1)],
             users: vec![user_summary(UserId(1), "alice")],
             default_room: RoomId(1),
+            video_transport_mode: rpc::crypto::TransportMode::NativeEncrypted,
+            video_auth_key: [0; rpc::crypto::KEY_LEN],
         });
 
         let mut flushed = false;
@@ -6296,6 +6329,8 @@ mod tests {
             rooms: vec![test_room_info(1)],
             users: vec![user_summary(UserId(1), "alice")],
             default_room: RoomId(1),
+            video_transport_mode: rpc::crypto::TransportMode::NativeEncrypted,
+            video_auth_key: [0; rpc::crypto::KEY_LEN],
         };
         app.handle_network_event(authenticated());
         let mut commands = Vec::new();
@@ -7194,6 +7229,10 @@ mod tests {
         app.network = Some(NetworkClient::from_parts_for_test(tx));
         app.active_tcp_addr = Some("127.0.0.1:1".to_string());
         app.voice_room = Some(RoomId(1));
+        app.video_transport = Some(crate::video::VideoTransport::new(
+            rpc::crypto::TransportMode::NativeEncrypted,
+            [0u8; rpc::crypto::KEY_LEN],
+        ));
         let missing = format!(
             "/tmp/chatt-missing-cached-video-command-{}",
             std::process::id()

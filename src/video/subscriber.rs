@@ -14,12 +14,14 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use rpc::{
-    crypto::{CHANNEL_VIDEO, TRANSPORT_HEADER_LEN, TransportCipher},
+    crypto::{CHANNEL_VIDEO, RecordProtection},
     ids::{SessionId, StreamId},
     video::{SharedVideoFrame, VideoRecordReader, VideoRole},
 };
 
 use crate::web_server::WebFeedSender;
+
+use super::VideoTransport;
 
 const READ_TIMEOUT: Duration = Duration::from_millis(200);
 const RECONNECT_BACKOFF: Duration = Duration::from_millis(500);
@@ -87,6 +89,7 @@ pub fn start(
     stream_id: StreamId,
     view_secret: Vec<u8>,
     tcp_addr: String,
+    video_transport: VideoTransport,
     feed: WebFeedSender,
 ) -> SubscriberHandle {
     let stop = Arc::new(AtomicBool::new(false));
@@ -99,6 +102,7 @@ pub fn start(
                 stream_id,
                 &view_secret,
                 &tcp_addr,
+                video_transport,
                 &feed,
                 &thread_stop,
             )
@@ -112,11 +116,20 @@ fn run(
     stream_id: StreamId,
     secret: &[u8],
     tcp_addr: &str,
+    video_transport: VideoTransport,
     feed: &WebFeedSender,
     stop: &AtomicBool,
 ) {
     while !stop.load(Ordering::SeqCst) {
-        match run_once(session_id, stream_id, secret, tcp_addr, feed, stop) {
+        match run_once(
+            session_id,
+            stream_id,
+            secret,
+            tcp_addr,
+            video_transport,
+            feed,
+            stop,
+        ) {
             Ok(()) => break,
             Err(error) => {
                 kvlog::warn!(
@@ -136,15 +149,17 @@ fn run_once(
     stream_id: StreamId,
     secret: &[u8],
     tcp_addr: &str,
+    video_transport: VideoTransport,
     feed: &WebFeedSender,
     stop: &AtomicBool,
 ) -> Result<(), String> {
-    let (stream, mut cipher, mut recv) = super::open_video_connection(
+    let (stream, mut record_protection, mut recv) = super::open_video_connection(
         tcp_addr,
         session_id,
         stream_id,
         VideoRole::Subscriber,
         secret,
+        video_transport,
     )?;
     stream
         .set_read_timeout(Some(READ_TIMEOUT))
@@ -161,14 +176,14 @@ fn run_once(
             .map_err(|error| error.to_string())?;
         copy_stats.copied_bytes += taken as u64;
         recv.consume(taken);
-        forward_ready_record(&mut reader, &mut cipher, feed, &mut copy_stats)?;
+        forward_ready_record(&mut reader, &mut record_protection, feed, &mut copy_stats)?;
     }
 
     loop {
         if stop.load(Ordering::SeqCst) {
             return Ok(());
         }
-        forward_ready_record(&mut reader, &mut cipher, feed, &mut copy_stats)?;
+        forward_ready_record(&mut reader, &mut record_protection, feed, &mut copy_stats)?;
         match reader.fill(&stream, super::VIDEO_READ_CHUNK_BYTES) {
             Ok(0) => return Err("video connection closed".to_string()),
             Ok(_) => {}
@@ -187,14 +202,14 @@ fn run_once(
 /// browser as a [`SharedVideoFrame`] without copying.
 fn forward_ready_record(
     reader: &mut VideoRecordReader,
-    cipher: &mut TransportCipher,
+    record_protection: &mut RecordProtection,
     feed: &WebFeedSender,
     copy_stats: &mut CopyStats,
 ) -> Result<(), String> {
     let Some(record) = reader.take_record() else {
         return Ok(());
     };
-    let frame = open_record_frame(record, cipher)?;
+    let frame = open_record_frame(record, record_protection)?;
     copy_stats.shipped_bytes += frame.len() as u64;
     copy_stats.frames += 1;
     copy_stats.maybe_log();
@@ -206,15 +221,18 @@ fn forward_ready_record(
 /// window, keeping the record's exact allocation as the frame's backing.
 fn open_record_frame(
     mut record: Vec<u8>,
-    cipher: &mut TransportCipher,
+    record_protection: &mut RecordProtection,
 ) -> Result<SharedVideoFrame, String> {
-    let plaintext_len = cipher
-        .open_next_in_place(CHANNEL_VIDEO, &mut record)
-        .map_err(|error| error.to_string())?
-        .len();
+    let base = record.as_ptr() as usize;
+    let (plaintext_offset, plaintext_len) = {
+        let plaintext = record_protection
+            .open_next_in_place(CHANNEL_VIDEO, &mut record)
+            .map_err(|error| error.to_string())?;
+        (plaintext.as_ptr() as usize - base, plaintext.len())
+    };
     Ok(SharedVideoFrame::from_record(
         record,
-        TRANSPORT_HEADER_LEN,
+        plaintext_offset,
         plaintext_len,
     ))
 }
@@ -222,7 +240,9 @@ fn open_record_frame(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rpc::crypto::{KEY_LEN, TAG_LEN, VideoKeyRole, derive_video_keys};
+    use rpc::crypto::{
+        KEY_LEN, TAG_LEN, TRANSPORT_HEADER_LEN, TransportCipher, VideoKeyRole, derive_video_keys,
+    };
     use rpc::video;
 
     #[test]
@@ -231,7 +251,7 @@ mod tests {
         let (server_send, server_recv) = derive_video_keys(&secret, VideoKeyRole::Server);
         let mut server_cipher = TransportCipher::new(server_send, server_recv);
         let (client_send, client_recv) = derive_video_keys(&secret, VideoKeyRole::Client);
-        let mut client_cipher = TransportCipher::new(client_send, client_recv);
+        let mut client_record = RecordProtection::aead(client_send, client_recv);
 
         let mut inners = Vec::new();
         let mut residual = Vec::new();
@@ -250,7 +270,7 @@ mod tests {
             let taken = reader.accept(&residual[offset..]).unwrap();
             offset += taken;
             if let Some(record) = reader.take_record() {
-                frames.push(open_record_frame(record, &mut client_cipher).unwrap());
+                frames.push(open_record_frame(record, &mut client_record).unwrap());
             }
         }
 
@@ -263,5 +283,15 @@ mod tests {
                 inner.len() + TRANSPORT_HEADER_LEN + TAG_LEN
             );
         }
+    }
+
+    #[test]
+    fn clear_record_frame_uses_zero_plaintext_offset() {
+        let mut inner = Vec::new();
+        video::write_video_frame(&mut inner, 1, true, 7, &[1, 2, 3]);
+        let mut record = RecordProtection::clear();
+        let frame = open_record_frame(inner.clone(), &mut record).unwrap();
+        assert_eq!(frame.as_slice(), inner);
+        assert_eq!(frame.retained_bytes(), inner.len());
     }
 }
