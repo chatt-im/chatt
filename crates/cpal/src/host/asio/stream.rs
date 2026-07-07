@@ -857,6 +857,9 @@ impl Device {
 
         let buffer_size = match config.buffer_size {
             BufferSize::Fixed(v) => Some(v as i32),
+            BufferSize::TargetLatency(target) => {
+                Some(BufferSize::frames_for_latency(target, config.sample_rate) as i32)
+            }
             BufferSize::Default => None,
         };
 
@@ -899,6 +902,9 @@ impl Device {
 
         let buffer_size = match config.buffer_size {
             BufferSize::Fixed(v) => Some(v as i32),
+            BufferSize::TargetLatency(target) => {
+                Some(BufferSize::frames_for_latency(target, config.sample_rate) as i32)
+            }
             BufferSize::Default => None,
         };
 

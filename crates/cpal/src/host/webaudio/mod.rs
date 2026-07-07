@@ -270,6 +270,9 @@ impl DeviceTrait for Device {
 
         let buffer_size_frames = match config.buffer_size {
             BufferSize::Fixed(v) => v as usize,
+            BufferSize::TargetLatency(target) => {
+                BufferSize::frames_for_latency(target, config.sample_rate) as usize
+            }
             BufferSize::Default => DEFAULT_BUFFER_SIZE,
         };
         let buffer_size_samples = buffer_size_frames.checked_mul(n_channels).ok_or_else(|| {

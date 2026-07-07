@@ -235,8 +235,14 @@ pub(crate) const AUDIO_CALLBACK_LOG_ENV: &str = "CHATT_AUDIO_CALLBACK_LOG";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BufferRequest {
+    /// Host default period (used as the fallback when a request fails to build).
     Default,
+    /// Exactly `n` frames, honoured verbatim (clamped to the device range).
     Fixed(u32),
+    /// Auto mode: negotiate a device period for this target latency, letting the
+    /// cpal backend round to a natively-supported quantum (power of two on
+    /// playback). Maps to [`cpal::BufferSize::TargetLatency`].
+    Auto { target: Duration },
 }
 
 impl BufferRequest {
@@ -244,6 +250,7 @@ impl BufferRequest {
         match self {
             BufferRequest::Default => "default".to_string(),
             BufferRequest::Fixed(frames) => format!("{frames} frames"),
+            BufferRequest::Auto { target } => format!("auto ~{} ms", target.as_millis()),
         }
     }
 }

@@ -24,6 +24,7 @@ use crate::{
 };
 
 const INIT_TIMEOUT: Duration = Duration::from_secs(2);
+const TARGET_CAPTURE_BUFFER_EXTRA: Duration = Duration::from_millis(750);
 
 const MIN_SAMPLE_RATE: SampleRate = 1; // per `pa_sample_spec_valid()`
 
@@ -356,7 +357,10 @@ impl DeviceTrait for Device {
         let sample_spec = make_sample_spec(config, format);
         let channel_map = make_channel_map(config);
         let buffer_attr = make_record_buffer_attr(config, format);
-        let adjust_latency = matches!(config.buffer_size, BufferSize::Fixed(_));
+        let adjust_latency = matches!(
+            config.buffer_size,
+            BufferSize::Fixed(_) | BufferSize::TargetLatency(_)
+        );
 
         let params = protocol::RecordStreamParams {
             sample_spec,
@@ -448,7 +452,10 @@ impl DeviceTrait for Device {
         let sample_spec = make_sample_spec(config, format);
         let channel_map = make_channel_map(config);
         let buffer_attr = make_playback_buffer_attr(config, format);
-        let adjust_latency = matches!(config.buffer_size, BufferSize::Fixed(_));
+        let adjust_latency = matches!(
+            config.buffer_size,
+            BufferSize::Fixed(_) | BufferSize::TargetLatency(_)
+        );
 
         let params = protocol::PlaybackStreamParams {
             sink_index: Some(info.index),
@@ -608,24 +615,25 @@ fn make_playback_buffer_attr(
     config: StreamConfig,
     format: protocol::SampleFormat,
 ) -> protocol::stream::BufferAttr {
-    match config.buffer_size {
-        BufferSize::Default => Default::default(),
-        BufferSize::Fixed(frame_count) => {
-            let len =
-                (frame_count as u64 * config.channels as u64 * format.bytes_per_sample() as u64)
-                    .min(u32::MAX as u64) as u32;
-            let double_len = (len as u64 * 2).min(u32::MAX as u64) as u32;
-            protocol::stream::BufferAttr {
-                // Double-buffer: total buffer = 2 callback periods. With
-                // adjust_latency this becomes the end-to-end latency target,
-                // Minimum request = one callback period, ensuring the server
-                // always asks for exactly frame_count frames per call.
-                max_length: double_len,
-                target_length: double_len,
-                minimum_request_length: len,
-                ..Default::default()
-            }
+    let frame_count = match config.buffer_size {
+        BufferSize::Default => return Default::default(),
+        BufferSize::Fixed(frame_count) => frame_count,
+        BufferSize::TargetLatency(target) => {
+            BufferSize::frames_for_latency(target, config.sample_rate)
         }
+    };
+    let len = (frame_count as u64 * config.channels as u64 * format.bytes_per_sample() as u64)
+        .min(u32::MAX as u64) as u32;
+    let double_len = (len as u64 * 2).min(u32::MAX as u64) as u32;
+    protocol::stream::BufferAttr {
+        // Double-buffer: total buffer = 2 callback periods. With
+        // adjust_latency this becomes the end-to-end latency target,
+        // Minimum request = one callback period, ensuring the server
+        // always asks for exactly frame_count frames per call.
+        max_length: double_len,
+        target_length: double_len,
+        minimum_request_length: len,
+        ..Default::default()
     }
 }
 
@@ -633,20 +641,29 @@ fn make_record_buffer_attr(
     config: StreamConfig,
     format: protocol::SampleFormat,
 ) -> protocol::stream::BufferAttr {
-    match config.buffer_size {
-        BufferSize::Default => Default::default(),
-        BufferSize::Fixed(frame_count) => {
-            let len =
-                (frame_count as u64 * config.channels as u64 * format.bytes_per_sample() as u64)
-                    .min(u32::MAX as u64) as u32;
-            protocol::stream::BufferAttr {
-                // fragment_size controls the delivery chunk size for record
-                // streams; target_length is playback-only and is ignored here.
-                max_length: len,
-                fragment_size: len,
-                ..Default::default()
-            }
+    let (fragment_frames, max_frames) = match config.buffer_size {
+        BufferSize::Default => return Default::default(),
+        BufferSize::Fixed(frame_count) => (frame_count, frame_count),
+        BufferSize::TargetLatency(target) => {
+            let latency_frames = BufferSize::frames_for_latency(target, config.sample_rate);
+            let extra_frames =
+                BufferSize::frames_for_latency(TARGET_CAPTURE_BUFFER_EXTRA, config.sample_rate);
+            (latency_frames, latency_frames.saturating_add(extra_frames))
         }
+    };
+    let fragment_len =
+        (fragment_frames as u64 * config.channels as u64 * format.bytes_per_sample() as u64)
+            .min(u32::MAX as u64) as u32;
+    let max_len = (max_frames as u64 * config.channels as u64 * format.bytes_per_sample() as u64)
+        .min(u32::MAX as u64) as u32;
+    protocol::stream::BufferAttr {
+        // fragment_size controls the delivery chunk size for record
+        // streams; TargetLatency keeps WebRTC-style extra headroom in the
+        // server-side capture buffer so scheduler stalls do not immediately
+        // overflow the stream.
+        max_length: max_len,
+        fragment_size: fragment_len,
+        ..Default::default()
     }
 }
 
@@ -676,5 +693,40 @@ impl Hash for Device {
             Device::Sink { info, .. } => info.name.hash(state),
             Device::Source { info, .. } => info.name.hash(state),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn stream_config(buffer_size: BufferSize) -> StreamConfig {
+        StreamConfig {
+            channels: 2,
+            sample_rate: 48_000,
+            buffer_size,
+        }
+    }
+
+    #[test]
+    fn record_target_latency_keeps_extra_capture_headroom() {
+        let attr = make_record_buffer_attr(
+            stream_config(BufferSize::TargetLatency(Duration::from_millis(10))),
+            protocol::SampleFormat::S16Le,
+        );
+
+        assert_eq!(attr.fragment_size, 480 * 2 * 2);
+        assert_eq!(attr.max_length, (480 + 36_000) * 2 * 2);
+    }
+
+    #[test]
+    fn record_fixed_buffer_remains_exact() {
+        let attr = make_record_buffer_attr(
+            stream_config(BufferSize::Fixed(480)),
+            protocol::SampleFormat::S16Le,
+        );
+
+        assert_eq!(attr.fragment_size, 480 * 2 * 2);
+        assert_eq!(attr.max_length, 480 * 2 * 2);
     }
 }

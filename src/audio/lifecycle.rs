@@ -96,10 +96,17 @@ pub struct AudioDeviceInfo {
     pub channels: u16,
     /// Rate the device stream runs at, before resampling to 48 kHz.
     pub device_rate: u32,
-    /// Human-readable buffer size label, e.g. `256 frames` or `host default`.
+    /// Human-readable label for the buffer size that was *requested*, e.g.
+    /// `256 frames`, `~10 ms target`, or `host default`.
     pub buffer_size: String,
     /// Note describing why the buffer size was chosen.
     pub buffer_note: String,
+    /// Device period the backend actually granted, in frames at
+    /// [`Self::device_rate`], read back from the live stream via
+    /// [`cpal::traits::StreamTrait::buffer_size`]. `None` when the backend does
+    /// not report one. This is the *acquired* counterpart to the requested
+    /// [`Self::buffer_size`]; a divergence flags a re-negotiated quantum.
+    pub acquired_buffer_frames: Option<u32>,
     /// True when the configured fixed buffer was unsupported and the host
     /// default was used instead.
     pub buffer_fallback: bool,
@@ -115,23 +122,44 @@ impl AudioDeviceInfo {
         } else {
             ""
         };
+        let acquired = match self.acquired_buffer_frames {
+            Some(frames) => {
+                let ms = f64::from(frames) * 1_000.0 / f64::from(self.device_rate.max(1));
+                format!(", acquired {frames} fr / {ms:.1} ms")
+            }
+            None => String::new(),
+        };
         let note = if self.buffer_note.is_empty() {
             String::new()
         } else {
             format!(" [{}]", self.buffer_note)
         };
         format!(
-            "{} / {}{}, {}ch @ {}Hz, buffer {}{}{}",
+            "{} / {}{}, {}ch @ {}Hz, buffer {}{}{}{}",
             self.backend,
             self.device_name,
             default,
             self.channels,
             self.device_rate,
             self.buffer_size,
+            acquired,
             fallback,
             note
         )
     }
+}
+
+/// Clones `info`, overwriting its acquired period with a fresh read from the
+/// live `stream`. The backend reports the current negotiated period (an atomic
+/// on PipeWire, the stored `period_size` on ALSA), so a running stream reflects
+/// a quantum the graph re-negotiated after start. Falls back to `info`'s
+/// start-time value when there is no stream or the backend reports none.
+fn refresh_acquired_buffer(info: &AudioDeviceInfo, stream: Option<&Stream>) -> AudioDeviceInfo {
+    let mut info = info.clone();
+    if let Some(frames) = stream.and_then(|stream| stream.buffer_size().ok()) {
+        info.acquired_buffer_frames = Some(frames);
+    }
+    info
 }
 
 #[derive(Clone, Debug)]
@@ -234,6 +262,13 @@ impl LiveCapture {
         &self.device_info
     }
 
+    /// [`Self::device_info`] with the acquired period re-read from the live
+    /// stream, so PipeWire's settled graph quantum (updated once cycles run,
+    /// not at start) shows in `/audio` rather than the start-time estimate.
+    pub fn device_info_live(&self) -> AudioDeviceInfo {
+        refresh_acquired_buffer(&self.device_info, self.stream.as_ref())
+    }
+
     pub fn worker_finished(&self) -> bool {
         self.worker.as_ref().is_some_and(JoinHandle::is_finished)
     }
@@ -288,6 +323,13 @@ impl LivePlayback {
     /// Resolved backend, device, and buffer the playback stream opened.
     pub fn device_info(&self) -> &AudioDeviceInfo {
         &self.device_info
+    }
+
+    /// [`Self::device_info`] with the acquired period re-read from the live
+    /// stream, so PipeWire's settled graph quantum (updated once cycles run,
+    /// not at start) shows in `/audio` rather than the start-time estimate.
+    pub fn device_info_live(&self) -> AudioDeviceInfo {
+        refresh_acquired_buffer(&self.device_info, self.stream.as_ref())
     }
 
     pub fn push(&self, packet: RemoteVoicePacket) {
@@ -655,6 +697,7 @@ where
         device_rate: selection.device_rate,
         buffer_size: audio_buffer_size_label(selection.preview.buffer_size),
         buffer_note: selection.preview.buffer_note.clone(),
+        acquired_buffer_frames: stream.buffer_size().ok(),
         buffer_fallback,
     };
     Ok(LiveCapture {
@@ -804,6 +847,7 @@ pub fn start_live_playback(config: LivePlaybackConfig) -> Result<LivePlayback, A
         device_rate: selection.device_rate,
         buffer_size: audio_buffer_size_label(selection.preview.buffer_size),
         buffer_note: selection.preview.buffer_note.clone(),
+        acquired_buffer_frames: stream.buffer_size().ok(),
         buffer_fallback,
     };
     let (sender, receiver) = sync_channel(LIVE_PLAYBACK_COMMAND_CAPACITY);
@@ -904,6 +948,45 @@ mod tests {
     use super::*;
     #[allow(unused_imports)]
     use crate::audio::test_support::*;
+
+    fn device_info(device_rate: u32, acquired_buffer_frames: Option<u32>) -> AudioDeviceInfo {
+        AudioDeviceInfo {
+            backend: "PipeWire",
+            device_name: "AirPods".to_string(),
+            stable_id: "airpods".to_string(),
+            is_default: true,
+            channels: 2,
+            device_rate,
+            buffer_size: "~10 ms target".to_string(),
+            buffer_note: "target ~10 ms; backend-negotiated period".to_string(),
+            acquired_buffer_frames,
+            buffer_fallback: false,
+        }
+    }
+
+    #[test]
+    fn summary_renders_acquired_period_after_request() {
+        // 512 frames at 48 kHz is ~10.7 ms; the acquired fragment sits between
+        // the requested label and the note.
+        let summary = device_info(48_000, Some(512)).summary();
+        assert!(
+            summary.contains("buffer ~10 ms target, acquired 512 fr / 10.7 ms [target ~10 ms"),
+            "{summary}"
+        );
+    }
+
+    #[test]
+    fn summary_scales_acquired_ms_by_device_rate() {
+        // A 44.1 kHz device converts frames to ms at its own rate, not 48 kHz.
+        let summary = device_info(44_100, Some(441)).summary();
+        assert!(summary.contains("acquired 441 fr / 10.0 ms"), "{summary}");
+    }
+
+    #[test]
+    fn summary_omits_acquired_when_backend_reports_none() {
+        let summary = device_info(48_000, None).summary();
+        assert!(!summary.contains("acquired"), "{summary}");
+    }
 
     #[test]
     fn live_decoder_worker_stops_with_sink_clone_alive() {

@@ -389,6 +389,58 @@ pub enum BufferSize {
     #[default]
     Default,
     Fixed(FrameCount),
+    /// Request a target period *latency* rather than an exact frame count.
+    ///
+    /// The backend negotiates the nearest natively-supported period/quantum for
+    /// this latency and reports the granted value back through the stream's
+    /// callback frame count. This mirrors WebRTC's device negotiation
+    /// (`snd_pcm_set_params(latency)` / `PA_STREAM_ADJUST_LATENCY`): the caller
+    /// expresses intent as a latency and lets the driver/server round.
+    ///
+    /// Per-backend behaviour:
+    /// - **PipeWire**: sets `node.latency`, accepting the server's quantum.
+    /// - **ALSA / CoreAudio**: snaps to the nearest supported period, rounding
+    ///   playback periods to a power of two (capture keeps the raw frame).
+    /// - Other backends resolve it to a frame count at the stream sample rate.
+    TargetLatency(std::time::Duration),
+}
+
+impl BufferSize {
+    /// Frame count corresponding to `target` at `sample_rate`, rounded to the
+    /// nearest frame and clamped to at least one frame.
+    pub(crate) fn frames_for_latency(
+        target: std::time::Duration,
+        sample_rate: SampleRate,
+    ) -> FrameCount {
+        let frames = (target.as_secs_f64() * sample_rate as f64).round();
+        frames.clamp(1.0, FrameCount::MAX as f64) as FrameCount
+    }
+}
+
+/// Nearest power of two to `n`, rounding halves up, with a floor of one.
+///
+/// Real audio hardware runs its DMA period on a power of two, so aligning a
+/// requested period to one lets the driver/server drive the device directly
+/// instead of inserting an adaptive re-blocker.
+pub(crate) fn nearest_power_of_two(n: FrameCount) -> FrameCount {
+    if n <= 1 {
+        return 1;
+    }
+    if n.is_power_of_two() {
+        return n;
+    }
+    // Guard against `next_power_of_two` overflow on absurd inputs; no real
+    // buffer approaches this, but keep the helper total.
+    if n >= (1 << 31) {
+        return 1 << 31;
+    }
+    let upper = n.next_power_of_two();
+    let lower = upper >> 1;
+    if n - lower < upper - n {
+        lower
+    } else {
+        upper
+    }
 }
 
 #[cfg(all(
@@ -414,6 +466,9 @@ impl wasm_bindgen::convert::IntoWasmAbi for BufferSize {
         match self {
             Self::Default => None,
             Self::Fixed(fc) => Some(fc),
+            // The wasm ABI has no representation for a latency target; treat it
+            // as the host default. This path is only reachable on wasm builds.
+            Self::TargetLatency(_) => None,
         }
         .into_abi()
     }
@@ -891,6 +946,14 @@ pub(crate) fn validate_stream_config(config: &StreamConfig) -> Result<(), Error>
             "buffer size must be greater than 0",
         ));
     }
+    if let BufferSize::TargetLatency(target) = config.buffer_size {
+        if target.is_zero() {
+            return Err(Error::with_message(
+                ErrorKind::InvalidInput,
+                "target latency must be greater than zero",
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -1092,5 +1155,46 @@ mod tests {
             buffer_size: BufferSize::Fixed(1),
         })
         .is_ok());
+        assert!(validate_stream_config(&StreamConfig {
+            channels: 1,
+            sample_rate: 48000,
+            buffer_size: BufferSize::TargetLatency(std::time::Duration::from_millis(10)),
+        })
+        .is_ok());
+    }
+
+    #[test]
+    fn validate_stream_config_rejects_zero_target_latency() {
+        assert!(validate_stream_config(&StreamConfig {
+            channels: 1,
+            sample_rate: 48000,
+            buffer_size: BufferSize::TargetLatency(std::time::Duration::ZERO),
+        })
+        .is_err());
+    }
+
+    #[test]
+    fn frames_for_latency_rounds_at_rate() {
+        let ms = std::time::Duration::from_millis(10);
+        assert_eq!(BufferSize::frames_for_latency(ms, 48_000), 480);
+        assert_eq!(BufferSize::frames_for_latency(ms, 44_100), 441);
+        assert_eq!(BufferSize::frames_for_latency(ms, 96_000), 960);
+        // Never resolves below one frame.
+        assert_eq!(
+            BufferSize::frames_for_latency(std::time::Duration::from_nanos(1), 48_000),
+            1
+        );
+    }
+
+    #[test]
+    fn nearest_power_of_two_rounds_to_hardware_grid() {
+        // 10 ms at 48 kHz (480) snaps up to 512, matching WebRTC's playout node.
+        assert_eq!(nearest_power_of_two(480), 512);
+        assert_eq!(nearest_power_of_two(441), 512);
+        assert_eq!(nearest_power_of_two(512), 512);
+        assert_eq!(nearest_power_of_two(500), 512);
+        assert_eq!(nearest_power_of_two(300), 256);
+        assert_eq!(nearest_power_of_two(1), 1);
+        assert_eq!(nearest_power_of_two(0), 1);
     }
 }

@@ -962,6 +962,13 @@ pub(crate) fn select_buffer_size(
 ) -> (BufferSize, String) {
     match request {
         BufferRequest::Default => (BufferSize::Default, "host default".to_string()),
+        BufferRequest::Auto { target } => (
+            BufferSize::TargetLatency(target),
+            format!(
+                "target ~{} ms; backend-negotiated period",
+                target.as_millis()
+            ),
+        ),
         BufferRequest::Fixed(requested) => match supported {
             // The PipeWire host advertises 0..=0 until the server's clock
             // metadata arrives. Clamping into that range would request a
@@ -993,6 +1000,7 @@ pub(crate) fn audio_buffer_size_label(buffer_size: BufferSize) -> String {
     match buffer_size {
         BufferSize::Default => "default".to_string(),
         BufferSize::Fixed(frames) => format!("{frames} frames"),
+        BufferSize::TargetLatency(target) => format!("~{} ms target", target.as_millis()),
     }
 }
 
@@ -1923,6 +1931,19 @@ mod tests {
             SupportedBufferSize::Range { min: 32, max: 8192 },
         );
         assert_eq!(size, cpal::BufferSize::Fixed(480));
+    }
+
+    #[test]
+    fn auto_request_maps_to_backend_target_latency() {
+        // Auto mode defers the period choice to the cpal backend, which rounds
+        // the target latency to a native (power-of-two on playback) quantum.
+        let target = std::time::Duration::from_millis(10);
+        let (size, note) = select_buffer_size(
+            BufferRequest::Auto { target },
+            SupportedBufferSize::Range { min: 32, max: 8192 },
+        );
+        assert_eq!(size, cpal::BufferSize::TargetLatency(target));
+        assert!(note.contains("target"));
     }
 
     #[test]

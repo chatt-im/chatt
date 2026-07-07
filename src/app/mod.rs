@@ -4857,10 +4857,10 @@ impl App {
             self.voice_bytes_received,
             self.capture
                 .as_ref()
-                .map(|capture| capture.device_info().clone()),
+                .map(|capture| capture.device_info_live()),
             self.playback
                 .as_ref()
-                .map(|playback| playback.device_info().clone()),
+                .map(|playback| playback.device_info_live()),
             health_lines,
             recent_events,
         );
@@ -4914,10 +4914,10 @@ impl App {
             self.voice_bytes_received,
             self.capture
                 .as_ref()
-                .map(|capture| capture.device_info().clone()),
+                .map(|capture| capture.device_info_live()),
             self.playback
                 .as_ref()
-                .map(|playback| playback.device_info().clone()),
+                .map(|playback| playback.device_info_live()),
             health_lines,
             recent_events,
         )
@@ -5491,14 +5491,14 @@ impl App {
         self.config
             .audio
             .input_buffer
-            .to_request(config::DEFAULT_INPUT_BUFFER_SAMPLES)
+            .to_request(config::DEFAULT_INPUT_TARGET_LATENCY)
     }
 
     fn output_buffer_request(&self) -> BufferRequest {
         self.config
             .audio
             .output_buffer
-            .to_request(config::DEFAULT_OUTPUT_BUFFER_SAMPLES)
+            .to_request(config::DEFAULT_OUTPUT_TARGET_LATENCY)
     }
 
     pub(crate) fn set_status(&mut self, status: impl Into<String>) {

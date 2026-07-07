@@ -977,8 +977,19 @@ fn configure_stream_format_and_buffer(
     let asbd = asbd_from_config(config, sample_format);
     audio_unit.set_property(kAudioUnitProperty_StreamFormat, scope, element, Some(&asbd))?;
 
+    // Resolve the requested buffer frame size. A latency target is converted at
+    // the stream rate and snapped to a power of two: the buffer frame size is a
+    // device-level (shared input/output) property that macOS runs on
+    // power-of-two IO periods, so the snap is direction-independent.
+    let requested_buffer_size = match config.buffer_size {
+        BufferSize::Fixed(buffer_size) => Some(buffer_size),
+        BufferSize::TargetLatency(target) => Some(crate::nearest_power_of_two(
+            BufferSize::frames_for_latency(target, config.sample_rate),
+        )),
+        BufferSize::Default => None,
+    };
     // Configure device buffer size if requested
-    if let BufferSize::Fixed(buffer_size) = config.buffer_size {
+    if let Some(buffer_size) = requested_buffer_size {
         // Pre-validate against the hardware range so callers get a human-readable error.
         if let Ok(SupportedBufferSize::Range { min, max }) =
             get_io_buffer_frame_size_range(device_id)

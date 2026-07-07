@@ -111,9 +111,10 @@ impl ServerEntry {
 
 /// The cpal device period to request for one audio stream, in samples.
 ///
-/// `Default` resolves to a usage-appropriate fixed size (see
-/// [`DEFAULT_INPUT_BUFFER_SAMPLES`]/[`DEFAULT_OUTPUT_BUFFER_SAMPLES`]) rather
-/// than the host default; `Samples(n)` requests exactly `n` frames.
+/// `Default` resolves to auto mode: a target latency (see
+/// [`DEFAULT_INPUT_TARGET_LATENCY`]/[`DEFAULT_OUTPUT_TARGET_LATENCY`]) that the
+/// cpal backend negotiates into a natively-supported device period, rather than
+/// a forced fixed size. `Samples(n)` requests exactly `n` frames.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Toml)]
 #[toml(FromToml, ToToml, rename_all = "kebab-case")]
 pub enum BufferSize {
@@ -122,20 +123,23 @@ pub enum BufferSize {
     Samples(u32),
 }
 
-/// Sample count `input-buffer.samples = "default"` resolves to: one 20 ms Opus
-/// frame at 48 kHz, which keeps capture wakeups aligned to the encoder frame.
-pub const DEFAULT_INPUT_BUFFER_SAMPLES: u32 = 960;
-/// Sample count `output-buffer.samples = "default"` resolves to: one 10 ms
-/// playback quantum at 48 kHz, lowering latency on hosts that honor fixed
-/// output periods.
-pub const DEFAULT_OUTPUT_BUFFER_SAMPLES: u32 = 480;
+/// Target capture period `input-buffer.samples = "default"` resolves to: a 10 ms
+/// frame, matching WebRTC's fixed capture frame. The device keeps its own native
+/// period; the 20 ms Opus packet is assembled by the capture repacketizer.
+pub const DEFAULT_INPUT_TARGET_LATENCY: Duration = Duration::from_millis(10);
+/// Target playback period `output-buffer.samples = "default"` resolves to: a
+/// ~10 ms period. cpal snaps playback to the nearest power of two (512 at
+/// 48 kHz) so the period aligns to the sink/graph clock.
+pub const DEFAULT_OUTPUT_TARGET_LATENCY: Duration = Duration::from_millis(10);
 
 impl BufferSize {
     /// Resolves the configured size into a [`BufferRequest`], substituting
-    /// `default_samples` for [`BufferSize::Default`].
-    pub fn to_request(self, default_samples: u32) -> BufferRequest {
+    /// `default_target` (as an auto-negotiated latency) for [`BufferSize::Default`].
+    pub fn to_request(self, default_target: Duration) -> BufferRequest {
         match self {
-            BufferSize::Default => BufferRequest::Fixed(default_samples),
+            BufferSize::Default => BufferRequest::Auto {
+                target: default_target,
+            },
             BufferSize::Samples(samples) => BufferRequest::Fixed(samples),
         }
     }
