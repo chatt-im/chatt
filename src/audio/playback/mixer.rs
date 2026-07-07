@@ -6,7 +6,7 @@ use std::{
 use hashbrown::HashMap;
 
 use super::frame_combiner::{FrameCombiner, MIX_FRAME_SAMPLES};
-use super::neteq::AudioResult;
+use super::neteq::{AudioResult, NetEqDiagnostics};
 use crate::audio::{
     errors::AudioErrorKind,
     playback::{
@@ -22,6 +22,8 @@ use crate::audio::{
 
 const LIVE_PLAYBACK_BACKEND_ERROR_LOG_INTERVAL: Duration = Duration::from_secs(1);
 const LIVE_PLAYBACK_PREALLOCATED_STREAMS: usize = 32;
+const LIVE_PLAYBACK_CALLBACK_RENDER_RECORDS: usize = LIVE_PLAYBACK_PREALLOCATED_STREAMS * 4;
+const LIVE_PLAYBACK_SLOW_CALLBACK_LOG_THRESHOLD: Duration = Duration::from_micros(500);
 /// Linear declick ramp length applied to each stream's output envelope. 5 ms at
 /// the mixer's fixed 48 kHz domain (the device resampler runs after the mixer) =
 /// 240 samples: long enough to kill boundary clicks at speech onset/offset, short
@@ -82,6 +84,11 @@ pub(crate) struct LivePlaybackMixer {
     /// stream's NetEQ lock hold so a detected pop can be traced to the operation
     /// that produced it. Reused across callbacks.
     render_records: Vec<StreamRenderRecord>,
+    /// Per-stream timing/state attribution for the current device callback,
+    /// filled only when callback logging is enabled. Reused across callbacks.
+    callback_render_records: Vec<CallbackRenderRecord>,
+    callback_render_records_dropped: u64,
+    callback_render_blocks: u64,
 }
 
 /// One stream's contribution to the block being mixed.
@@ -99,10 +106,34 @@ struct StreamRenderRecord {
     previous_last_sample: f32,
 }
 
+struct CallbackRenderRecord {
+    block_index: u64,
+    stream_id: u32,
+    active: bool,
+    source_kind: &'static str,
+    neteq_op: &'static str,
+    frame_source: &'static str,
+    result_muted: bool,
+    time_stretched: i32,
+    neteq_lock_wait: Duration,
+    neteq_render_duration: Duration,
+    neteq_total_duration: Duration,
+    assist_active: bool,
+    ring_depth_before: usize,
+    ring_depth_after: usize,
+    diagnostics_before: Option<NetEqDiagnostics>,
+    diagnostics_after: Option<NetEqDiagnostics>,
+    first_delta: f32,
+    max_delta: f32,
+    rms: f32,
+    peak: f32,
+}
+
 struct RenderedStream {
     active: bool,
     neteq_lock_wait: Duration,
     neteq: Option<AudioResult>,
+    callback_record: Option<CallbackRenderRecord>,
 }
 
 struct ConsumerStream {
@@ -169,6 +200,9 @@ impl LivePlaybackMixer {
             callback_overruns: 0,
             last_overrun_log_at: None,
             render_records: Vec::with_capacity(LIVE_PLAYBACK_PREALLOCATED_STREAMS),
+            callback_render_records: Vec::with_capacity(LIVE_PLAYBACK_CALLBACK_RENDER_RECORDS),
+            callback_render_records_dropped: 0,
+            callback_render_blocks: 0,
         }
     }
 
@@ -198,6 +232,9 @@ impl LivePlaybackMixer {
 
     pub(crate) fn begin_output_callback(&mut self) {
         self.callback_source_cursor = 0;
+        self.callback_render_records.clear();
+        self.callback_render_records_dropped = 0;
+        self.callback_render_blocks = 0;
     }
 
     fn callback_block_time(&self, callback_start: Instant) -> Instant {
@@ -344,9 +381,41 @@ impl LivePlaybackMixer {
         duration: Duration,
         period: Duration,
         mixer_events_drained: u64,
+        event_drain_duration: Duration,
+        render_duration: Duration,
+        output_frames: usize,
+        staged_samples: usize,
     ) {
         if let Some(hints) = &self.hints {
             hints.note_callback(duration, period, mixer_events_drained);
+        }
+        if audio_callback_logging_enabled() {
+            kvlog::info!(
+                "callback",
+                us = duration_us(duration),
+                total_us = duration_us(duration),
+                render_us = duration_us(render_duration),
+                event_drain_us = duration_us(event_drain_duration),
+                period_us = duration_us(period),
+                output_frames = output_frames as u64,
+                staged_samples = staged_samples as u64,
+                mixer_events_drained,
+                active_streams = self.streams.len() as u64,
+                render_blocks = self.callback_render_blocks,
+                render_records = self.callback_render_records.len() as u64,
+                render_records_dropped = self.callback_render_records_dropped
+            );
+            if duration >= LIVE_PLAYBACK_SLOW_CALLBACK_LOG_THRESHOLD {
+                self.log_slow_callback_records(
+                    duration,
+                    period,
+                    event_drain_duration,
+                    render_duration,
+                    mixer_events_drained,
+                    output_frames,
+                    staged_samples,
+                );
+            }
         }
         if duration <= period {
             return;
@@ -369,6 +438,131 @@ impl LivePlaybackMixer {
             callback_overruns = self.callback_overruns,
             mixer_events_drained,
             active_streams = self.streams.len()
+        );
+    }
+
+    fn log_slow_callback_records(
+        &self,
+        duration: Duration,
+        period: Duration,
+        event_drain_duration: Duration,
+        render_duration: Duration,
+        mixer_events_drained: u64,
+        output_frames: usize,
+        staged_samples: usize,
+    ) {
+        let mut lock_wait_total = Duration::ZERO;
+        let mut lock_wait_max = Duration::ZERO;
+        let mut neteq_render_total = Duration::ZERO;
+        let mut neteq_render_max = Duration::ZERO;
+        let mut neteq_total_max = Duration::ZERO;
+        let mut direct_blocks = 0u64;
+        let mut assist_blocks = 0u64;
+        let mut lock_miss_blocks = 0u64;
+        let mut ring_blocks = 0u64;
+        for record in &self.callback_render_records {
+            lock_wait_total += record.neteq_lock_wait;
+            lock_wait_max = lock_wait_max.max(record.neteq_lock_wait);
+            neteq_render_total += record.neteq_render_duration;
+            neteq_render_max = neteq_render_max.max(record.neteq_render_duration);
+            neteq_total_max = neteq_total_max.max(record.neteq_total_duration);
+            match record.source_kind {
+                "neteq_direct" => direct_blocks = direct_blocks.saturating_add(1),
+                "neteq_assist" => assist_blocks = assist_blocks.saturating_add(1),
+                "neteq_lock_miss" => lock_miss_blocks = lock_miss_blocks.saturating_add(1),
+                "ring" => ring_blocks = ring_blocks.saturating_add(1),
+                _ => {}
+            }
+        }
+        kvlog::info!(
+            "live playback slow callback",
+            total_us = duration_us(duration),
+            render_us = duration_us(render_duration),
+            event_drain_us = duration_us(event_drain_duration),
+            period_us = duration_us(period),
+            output_frames = output_frames as u64,
+            staged_samples = staged_samples as u64,
+            mixer_events_drained,
+            active_streams = self.streams.len() as u64,
+            render_blocks = self.callback_render_blocks,
+            render_records = self.callback_render_records.len() as u64,
+            render_records_dropped = self.callback_render_records_dropped,
+            neteq_direct_blocks = direct_blocks,
+            neteq_assist_blocks = assist_blocks,
+            neteq_lock_miss_blocks = lock_miss_blocks,
+            ring_blocks,
+            neteq_lock_wait_total_us = duration_us(lock_wait_total),
+            neteq_lock_wait_max_us = duration_us(lock_wait_max),
+            neteq_render_total_us = duration_us(neteq_render_total),
+            neteq_render_max_us = duration_us(neteq_render_max),
+            neteq_total_max_us = duration_us(neteq_total_max)
+        );
+        for record in &self.callback_render_records {
+            self.log_slow_callback_record(record);
+        }
+    }
+
+    fn log_slow_callback_record(&self, record: &CallbackRenderRecord) {
+        let (
+            before_decision,
+            before_reason,
+            before_target_ms,
+            before_playout_ms,
+            before_sync_ms,
+            before_packet_ms,
+            before_packet_wait_ms,
+            before_packets,
+            before_next_gap_ms,
+        ) = diagnostics_fields(record.diagnostics_before.as_ref());
+        let (
+            after_decision,
+            after_reason,
+            after_target_ms,
+            after_playout_ms,
+            after_sync_ms,
+            after_packet_ms,
+            after_packet_wait_ms,
+            after_packets,
+            after_next_gap_ms,
+        ) = diagnostics_fields(record.diagnostics_after.as_ref());
+        kvlog::info!(
+            "live playback slow callback stream",
+            block_index = record.block_index,
+            stream_id = record.stream_id,
+            source_kind = record.source_kind,
+            active = record.active,
+            neteq_op = record.neteq_op,
+            frame_source = record.frame_source,
+            result_muted = record.result_muted,
+            time_stretched = i64::from(record.time_stretched),
+            neteq_lock_wait_us = duration_us(record.neteq_lock_wait),
+            neteq_render_us = duration_us(record.neteq_render_duration),
+            neteq_total_us = duration_us(record.neteq_total_duration),
+            assist_active = record.assist_active,
+            ring_depth_before = record.ring_depth_before as u64,
+            ring_depth_after = record.ring_depth_after as u64,
+            before_decision,
+            before_reason,
+            before_target_ms,
+            before_playout_ms,
+            before_sync_ms,
+            before_packet_ms,
+            before_packet_wait_ms,
+            before_packets,
+            before_next_gap_ms,
+            after_decision,
+            after_reason,
+            after_target_ms,
+            after_playout_ms,
+            after_sync_ms,
+            after_packet_ms,
+            after_packet_wait_ms,
+            after_packets,
+            after_next_gap_ms,
+            first_delta = record.first_delta,
+            max_delta = record.max_delta,
+            rms = record.rms,
+            peak = record.peak
         );
     }
 
@@ -397,6 +591,8 @@ impl LivePlaybackMixer {
 
     pub(crate) fn mix_10ms(&mut self, now: Instant, out: &mut [f32; MIX_FRAME_SAMPLES]) {
         let number_of_streams = self.streams.len();
+        let block_index = self.output_block_index;
+        self.callback_render_blocks = self.callback_render_blocks.saturating_add(1);
         debug_assert!(
             self.source_frames.len() >= number_of_streams,
             "ensure_stream sizes source_frames ahead of registration"
@@ -410,34 +606,63 @@ impl LivePlaybackMixer {
         let mut neteq_lock_wait_count = 0u64;
         let mut neteq_lock_wait_total = Duration::ZERO;
         let mut neteq_lock_wait_max = Duration::ZERO;
-        self.render_records.clear();
-        for (&stream_id, stream) in self.streams.iter_mut() {
-            let Some(frame) = self.source_frames.get_mut(normal_frames) else {
-                break;
-            };
-            let declick_start = stream.declick_gain;
-            let previous_last_sample = stream.last_rendered_sample;
-            let rendered = render_stream_10ms(stream, now, frame);
-            if rendered.neteq_lock_wait.as_micros() > 0 {
-                neteq_lock_wait_count = neteq_lock_wait_count.saturating_add(1);
-                neteq_lock_wait_total += rendered.neteq_lock_wait;
-                neteq_lock_wait_max = neteq_lock_wait_max.max(rendered.neteq_lock_wait);
-            }
-            stream.last_rendered_sample = if rendered.active {
-                frame[MIX_FRAME_SAMPLES - 1]
-            } else {
-                0.0
-            };
-            self.render_records.push(StreamRenderRecord {
-                stream_id,
-                frame_index: rendered.active.then_some(normal_frames),
-                neteq: rendered.neteq,
-                declick_start,
-                declick_end: stream.declick_gain,
-                previous_last_sample,
-            });
-            if rendered.active {
-                normal_frames += 1;
+        {
+            let streams = &mut self.streams;
+            let source_frames = &mut self.source_frames;
+            let render_records = &mut self.render_records;
+            let callback_render_records = &mut self.callback_render_records;
+            let callback_render_records_dropped = &mut self.callback_render_records_dropped;
+
+            render_records.clear();
+            for (&stream_id, stream) in streams.iter_mut() {
+                let Some(frame) = source_frames.get_mut(normal_frames) else {
+                    break;
+                };
+                let declick_start = stream.declick_gain;
+                let previous_last_sample = stream.last_rendered_sample;
+                let rendered = render_stream_10ms(stream, now, frame);
+                if rendered.neteq_lock_wait.as_micros() > 0 {
+                    neteq_lock_wait_count = neteq_lock_wait_count.saturating_add(1);
+                    neteq_lock_wait_total += rendered.neteq_lock_wait;
+                    neteq_lock_wait_max = neteq_lock_wait_max.max(rendered.neteq_lock_wait);
+                }
+                stream.last_rendered_sample = if rendered.active {
+                    frame[MIX_FRAME_SAMPLES - 1]
+                } else {
+                    0.0
+                };
+                render_records.push(StreamRenderRecord {
+                    stream_id,
+                    frame_index: rendered.active.then_some(normal_frames),
+                    neteq: rendered.neteq,
+                    declick_start,
+                    declick_end: stream.declick_gain,
+                    previous_last_sample,
+                });
+                if rendered.active {
+                    normal_frames += 1;
+                }
+                if let Some(mut record) = rendered.callback_record {
+                    record.block_index = block_index;
+                    record.stream_id = stream_id;
+                    if let Some(index) = record.active.then_some(normal_frames.saturating_sub(1)) {
+                        let frame = &source_frames[index];
+                        record.first_delta = (frame[0] - previous_last_sample).abs();
+                        record.max_delta = max_adjacent_delta(frame);
+                        record.rms = rms_normalized(frame);
+                        record.peak = peak_normalized(frame);
+                    } else {
+                        record.first_delta = previous_last_sample.abs();
+                        record.max_delta = 0.0;
+                        record.rms = 0.0;
+                        record.peak = 0.0;
+                    }
+                    push_callback_render_record(
+                        callback_render_records,
+                        callback_render_records_dropped,
+                        record,
+                    );
+                }
             }
         }
         self.note_neteq_lock_waits(
@@ -466,18 +691,43 @@ fn render_stream_10ms(
         ConsumerSource::NetEq(handle) => {
             render_neteq_stream_10ms(handle, now, &mut stream.declick_gain, gain, muted, out)
         }
-        ConsumerSource::Ring(reader) => RenderedStream {
-            active: render_ring_stream_10ms(
+        ConsumerSource::Ring(reader) => {
+            let active = render_ring_stream_10ms(
                 reader,
                 &mut stream.declick_gain,
                 &mut stream.last_sample,
                 gain,
                 muted,
                 out,
-            ),
-            neteq_lock_wait: Duration::ZERO,
-            neteq: None,
-        },
+            );
+            RenderedStream {
+                active,
+                neteq_lock_wait: Duration::ZERO,
+                neteq: None,
+                callback_record: callback_record_enabled().then(|| CallbackRenderRecord {
+                    block_index: 0,
+                    stream_id: 0,
+                    active,
+                    source_kind: "ring",
+                    neteq_op: "none",
+                    frame_source: "ring",
+                    result_muted: muted || !active,
+                    time_stretched: 0,
+                    neteq_lock_wait: Duration::ZERO,
+                    neteq_render_duration: Duration::ZERO,
+                    neteq_total_duration: Duration::ZERO,
+                    assist_active: false,
+                    ring_depth_before: 0,
+                    ring_depth_after: 0,
+                    diagnostics_before: None,
+                    diagnostics_after: None,
+                    first_delta: 0.0,
+                    max_delta: 0.0,
+                    rms: 0.0,
+                    peak: 0.0,
+                }),
+            }
+        }
     }
 }
 
@@ -489,11 +739,35 @@ fn render_neteq_stream_10ms(
     muted: bool,
     out: &mut [f32; MIX_FRAME_SAMPLES],
 ) -> RenderedStream {
-    if let Some(active) = render_assisted_neteq_10ms(source, declick_gain, gain, muted, out) {
+    if let Some((active, ring_depth_before, ring_depth_after)) =
+        render_assisted_neteq_10ms(source, declick_gain, gain, muted, out)
+    {
         return RenderedStream {
             active,
             neteq_lock_wait: Duration::ZERO,
             neteq: None,
+            callback_record: callback_record_enabled().then(|| CallbackRenderRecord {
+                block_index: 0,
+                stream_id: 0,
+                active,
+                source_kind: "neteq_assist",
+                neteq_op: "none",
+                frame_source: "assist",
+                result_muted: !active,
+                time_stretched: 0,
+                neteq_lock_wait: Duration::ZERO,
+                neteq_render_duration: Duration::ZERO,
+                neteq_total_duration: Duration::ZERO,
+                assist_active: true,
+                ring_depth_before,
+                ring_depth_after,
+                diagnostics_before: None,
+                diagnostics_after: None,
+                first_delta: 0.0,
+                max_delta: 0.0,
+                rms: 0.0,
+                peak: 0.0,
+            }),
         };
     }
 
@@ -503,6 +777,7 @@ fn render_neteq_stream_10ms(
     // not wait behind that worker's pre-render lock if the ring underruns.
     let lock_start = Instant::now();
     let assist_active = source.source.assist.active();
+    let ring_depth_before = source.source.render_ring.depth();
     if assist_active {
         source.source.assist.note_underrun_block();
     }
@@ -514,23 +789,71 @@ fn render_neteq_stream_10ms(
     let Some(mut shared) = maybe_shared else {
         source.source.assist.note_lock_miss_silence_block();
         out.fill(0.0);
+        let active = apply_declick(declick_gain, gain, false, out);
         return RenderedStream {
-            active: apply_declick(declick_gain, gain, false, out),
+            active,
             neteq_lock_wait: Duration::ZERO,
             neteq: None,
+            callback_record: callback_record_enabled().then(|| CallbackRenderRecord {
+                block_index: 0,
+                stream_id: 0,
+                active,
+                source_kind: "neteq_lock_miss",
+                neteq_op: "none",
+                frame_source: "silence",
+                result_muted: true,
+                time_stretched: 0,
+                neteq_lock_wait: Duration::ZERO,
+                neteq_render_duration: Duration::ZERO,
+                neteq_total_duration: lock_start.elapsed(),
+                assist_active,
+                ring_depth_before,
+                ring_depth_after: source.source.render_ring.depth(),
+                diagnostics_before: None,
+                diagnostics_after: None,
+                first_delta: 0.0,
+                max_delta: 0.0,
+                rms: 0.0,
+                peak: 0.0,
+            }),
         };
     };
     let wait = lock_start.elapsed();
+    let diagnostics_before = callback_record_enabled().then(|| shared.diagnostics());
+    let render_start = Instant::now();
     let result = shared.get_audio_10ms(now, out);
+    let render_duration = render_start.elapsed();
+    let diagnostics_after = callback_record_enabled().then(|| shared.diagnostics());
     drop(shared);
-    source
-        .source
-        .assist
-        .note_direct_render(lock_start.elapsed());
+    let total_duration = lock_start.elapsed();
+    source.source.assist.note_direct_render(total_duration);
+    let active = apply_declick(declick_gain, gain, !muted && !result.muted, out);
     RenderedStream {
-        active: apply_declick(declick_gain, gain, !muted && !result.muted, out),
+        active,
         neteq_lock_wait: wait,
         neteq: Some(result),
+        callback_record: callback_record_enabled().then(|| CallbackRenderRecord {
+            block_index: 0,
+            stream_id: 0,
+            active,
+            source_kind: "neteq_direct",
+            neteq_op: result.mode.label(),
+            frame_source: result.source.label(),
+            result_muted: result.muted,
+            time_stretched: result.time_stretched,
+            neteq_lock_wait: wait,
+            neteq_render_duration: render_duration,
+            neteq_total_duration: total_duration,
+            assist_active,
+            ring_depth_before,
+            ring_depth_after: source.source.render_ring.depth(),
+            diagnostics_before,
+            diagnostics_after,
+            first_delta: 0.0,
+            max_delta: 0.0,
+            rms: 0.0,
+            peak: 0.0,
+        }),
     }
 }
 
@@ -540,9 +863,10 @@ fn render_assisted_neteq_10ms(
     gain: f32,
     muted: bool,
     out: &mut [f32; MIX_FRAME_SAMPLES],
-) -> Option<bool> {
+) -> Option<(bool, usize, usize)> {
     let span = source.render_reader.readable_span();
-    if span.len() < MIX_FRAME_SAMPLES {
+    let ring_depth_before = span.len();
+    if ring_depth_before < MIX_FRAME_SAMPLES {
         drop(span);
         return None;
     }
@@ -557,9 +881,14 @@ fn render_assisted_neteq_10ms(
     drop(span);
     source.render_reader.advance(MIX_FRAME_SAMPLES);
     source.source.assist.note_mixed_block();
+    let ring_depth_after = source.source.render_ring.depth();
 
     let has_signal = out.iter().any(|sample| *sample != 0.0);
-    Some(apply_declick(declick_gain, gain, !muted && has_signal, out))
+    Some((
+        apply_declick(declick_gain, gain, !muted && has_signal, out),
+        ring_depth_before,
+        ring_depth_after,
+    ))
 }
 
 /// Applies the mute/gain declick envelope in place over one complete 10 ms
@@ -591,6 +920,57 @@ fn apply_declick(
         }
     }
     normal
+}
+
+fn callback_record_enabled() -> bool {
+    audio_callback_logging_enabled()
+}
+
+fn push_callback_render_record(
+    records: &mut Vec<CallbackRenderRecord>,
+    dropped: &mut u64,
+    record: CallbackRenderRecord,
+) {
+    if !callback_record_enabled() {
+        return;
+    }
+    if records.len() < records.capacity() {
+        records.push(record);
+    } else {
+        *dropped = dropped.saturating_add(1);
+    }
+}
+
+fn duration_us(duration: Duration) -> u64 {
+    duration.as_micros().min(u128::from(u64::MAX)) as u64
+}
+
+fn diagnostics_fields(
+    diagnostics: Option<&NetEqDiagnostics>,
+) -> (
+    &'static str,
+    &'static str,
+    u64,
+    u64,
+    u64,
+    u64,
+    u64,
+    u64,
+    Option<i64>,
+) {
+    diagnostics.map_or(("none", "none", 0, 0, 0, 0, 0, 0, None), |diagnostics| {
+        (
+            diagnostics.operation,
+            diagnostics.reason,
+            diagnostics.target_ms,
+            diagnostics.playout_delay_ms,
+            diagnostics.sync_buffer_ms,
+            diagnostics.packet_buffer_ms,
+            diagnostics.packet_buffer_wait_ms,
+            diagnostics.packets_buffered as u64,
+            diagnostics.next_packet_gap_ms,
+        )
+    })
 }
 
 /// Renders one 10 ms block from a notification clip's ring. Past the covered

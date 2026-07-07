@@ -1475,8 +1475,11 @@ where
                     observer.observe(output.len(), channels);
                 }
                 let now = Instant::now();
+                let event_drain_start = Instant::now();
                 let drained_events =
                     drain_live_playback_mixer_events(&mut mixer, &mixer_events, &mut pending_event);
+                let event_drain_duration = event_drain_start.elapsed();
+                let render_start = Instant::now();
                 live_playback_callback(
                     output,
                     channels,
@@ -1489,10 +1492,18 @@ where
                     device_rate,
                     now,
                 );
+                let render_duration = render_start.elapsed();
+                let total_duration = now.elapsed();
+                let output_frames = channels.frames_for_interleaved(output.len());
+                let staged_samples = mix_adapter.staged_samples();
                 mixer.note_callback_metrics(
-                    now.elapsed(),
-                    callback_period(channels.frames_for_interleaved(output.len()), device_rate),
+                    total_duration,
+                    callback_period(output_frames, device_rate),
                     drained_events,
+                    event_drain_duration,
+                    render_duration,
+                    output_frames,
+                    staged_samples,
                 );
             },
             move |error| {
@@ -1761,6 +1772,7 @@ fn live_playback_callback<T>(
 ) where
     T: Sample + FromSample<f32>,
 {
+    mixer.begin_output_callback();
     let output_frames = channels.frames_for_interleaved(output.len());
     mix_adapter.begin_callback();
     let mut echo_writer = match echo_control {
