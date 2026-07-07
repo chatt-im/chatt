@@ -35,7 +35,7 @@ pub(crate) type SharedNetEqHandle = Arc<Mutex<SharedNetEqStream>>;
 
 /// Number of fixed 10 ms blocks reserved for one stream's assisted render ring.
 pub(crate) const NETEQ_RENDER_ASSIST_RING_BLOCKS: usize = 4;
-const NETEQ_RENDER_ASSIST_TARGET_BLOCKS: usize = 1;
+const NETEQ_RENDER_ASSIST_TARGET_BLOCKS: usize = 2;
 const NETEQ_RENDER_ASSIST_BURST_BLOCKS: usize = 16;
 const NETEQ_RENDER_ASSIST_TRIGGER_US: u64 = 750;
 
@@ -61,11 +61,11 @@ impl NetEqRenderAssist {
     pub(crate) fn note_direct_render(&self, duration: Duration) {
         if duration_to_us(duration) >= NETEQ_RENDER_ASSIST_TRIGGER_US {
             self.requests.fetch_add(1, Ordering::Relaxed);
-            self.request_prefill();
+            self.request_prefill(NETEQ_RENDER_ASSIST_TARGET_BLOCKS);
         }
     }
 
-    pub(crate) fn request_predictive_prefill(&self, ring_depth: usize) {
+    pub(crate) fn request_predictive_prefill(&self, ring_depth: usize, target_blocks: usize) {
         self.finish_if_idle(ring_depth);
         let is_idle = self.target_samples.load(Ordering::Acquire) == 0
             && self.blocks_remaining.load(Ordering::Acquire) == 0;
@@ -73,10 +73,10 @@ impl NetEqRenderAssist {
             return;
         }
         self.requests.fetch_add(1, Ordering::Relaxed);
-        self.request_prefill();
+        self.request_prefill(target_blocks);
     }
 
-    fn request_prefill(&self) {
+    fn request_prefill(&self, target_blocks: usize) {
         let was_idle = self.target_samples.load(Ordering::Acquire) == 0
             && self.blocks_remaining.load(Ordering::Acquire) == 0;
         if was_idle {
@@ -85,7 +85,7 @@ impl NetEqRenderAssist {
         self.blocks_remaining
             .store(NETEQ_RENDER_ASSIST_BURST_BLOCKS, Ordering::Release);
         self.target_samples.store(
-            NETEQ_RENDER_ASSIST_TARGET_BLOCKS * MIX_FRAME_SAMPLES,
+            render_assist_target_samples(target_blocks),
             Ordering::Release,
         );
     }
@@ -151,6 +151,10 @@ impl NetEqRenderAssist {
             lock_miss_silence_blocks: self.lock_miss_silence_blocks.load(Ordering::Relaxed),
         }
     }
+}
+
+fn render_assist_target_samples(target_blocks: usize) -> usize {
+    target_blocks.clamp(1, NETEQ_RENDER_ASSIST_RING_BLOCKS) * MIX_FRAME_SAMPLES
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
