@@ -584,12 +584,25 @@ fn run_contention_output(
     for callback_index in 0..callbacks {
         let callback_start = Instant::now();
         let now = start + frame_offset(callback_index);
+        let event_drain_start = Instant::now();
         let drained =
             drain_live_playback_mixer_events(&mut mixer, &mixer_events, &mut pending_event);
+        let event_drain_duration = event_drain_start.elapsed();
+        let render_start = Instant::now();
+        mixer.begin_output_callback();
         mixer.note_device_callback_frames(MIX_FRAME_SAMPLES);
         mixer.mix_10ms(now, &mut out);
         mixer.note_staged_samples(0);
-        mixer.note_callback_metrics(callback_start.elapsed(), callback_period, drained);
+        let render_duration = render_start.elapsed();
+        mixer.note_callback_metrics(
+            callback_start.elapsed(),
+            callback_period,
+            drained,
+            event_drain_duration,
+            render_duration,
+            MIX_FRAME_SAMPLES,
+            0,
+        );
 
         stats.callbacks = stats.callbacks.saturating_add(1);
         stats.mixer_events_drained = stats.mixer_events_drained.saturating_add(drained);
@@ -621,10 +634,22 @@ fn run_contention_full_output_callback(
     for callback_index in 0..callbacks {
         let callback_start = Instant::now();
         let now = start + frame_offset(callback_index);
+        let event_drain_start = Instant::now();
         let drained =
             drain_live_playback_mixer_events(&mut mixer, &mixer_events, &mut pending_event);
+        let event_drain_duration = event_drain_start.elapsed();
+        let render_start = Instant::now();
         stats.checksum += callback.run(&mut mixer, now);
-        mixer.note_callback_metrics(callback_start.elapsed(), callback_period, drained);
+        let render_duration = render_start.elapsed();
+        mixer.note_callback_metrics(
+            callback_start.elapsed(),
+            callback_period,
+            drained,
+            event_drain_duration,
+            render_duration,
+            callback.output_frames(),
+            0,
+        );
 
         stats.callbacks = stats.callbacks.saturating_add(1);
         stats.mixer_events_drained = stats.mixer_events_drained.saturating_add(drained);
