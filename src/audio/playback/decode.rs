@@ -16,8 +16,9 @@ use crate::{
         playback::{
             LivePlaybackFeedbackState, LivePlaybackMixer, LivePlaybackMixerEvent,
             LivePlaybackMixerStats, LivePlaybackPlayoutHints, LivePlaybackSharedSnapshot,
-            MIX_FRAME_SAMPLES, MixerStreamSource, NetEqMixerSource, NetEqRenderAssistMetrics,
-            SampleRing, SharedNetEqStream, SpscSwapQueue, lock_shared_stream,
+            MIX_FRAME_SAMPLES, MixerStreamSource, NETEQ_RENDER_ASSIST_RING_BLOCKS,
+            NetEqMixerSource, NetEqRenderAssistMetrics, SampleRing, SharedNetEqStream,
+            SpscSwapQueue, lock_shared_stream,
             neteq::{NetEqDiagnostics, NetEqPreparedPacket, PACKET_TRASH_CAPACITY, Packet},
         },
         shared::{
@@ -187,12 +188,13 @@ fn drain_stream(
     stream_id: u32,
     now: Instant,
     staged_output_samples: usize,
+    render_assist_target_blocks: usize,
     feedback_sender: Option<&Sender<LivePlaybackFeedback>>,
     trash_swap: &mut Vec<Packet>,
 ) {
     stream.apply_control_mute_pending(now, stream_id);
     stream.activate_control_mute_fallback_if_due(now, stream_id);
-    stream.request_dred_render_assist();
+    stream.request_dred_render_assist(render_assist_target_blocks);
     stream.prefill_render_assist(now);
 
     let sender_silence = stream.take_sender_silence_pending();
@@ -223,6 +225,13 @@ fn drain_stream(
     } else {
         stream.flush_feedback(stream_id, now, output_ring_ms, &neteq, feedback_sender);
     }
+}
+
+fn render_assist_target_blocks(block_samples: usize) -> usize {
+    block_samples
+        .div_ceil(MIX_FRAME_SAMPLES)
+        .saturating_add(1)
+        .clamp(1, NETEQ_RENDER_ASSIST_RING_BLOCKS)
 }
 
 #[derive(Default)]
@@ -591,6 +600,7 @@ impl LiveDecodeStreams {
         self.flush_pending_mixer_controls(mixer_events);
         self.release_acked_retiring();
         let staged_output_samples = self.hints.staged_samples();
+        let render_assist_target_blocks = render_assist_target_blocks(self.hints.block_samples());
         let dropped = &mut self.dropped_mixer_events;
         let stats = &mut self.stats;
         let mixer_streams = &mut self.mixer_streams;
@@ -603,6 +613,7 @@ impl LiveDecodeStreams {
                 *stream_id,
                 now,
                 staged_output_samples,
+                render_assist_target_blocks,
                 feedback_sender,
                 trash_swap,
             );
@@ -647,6 +658,7 @@ impl LiveDecodeStreams {
         feedback_sender: Option<&Sender<LivePlaybackFeedback>>,
     ) {
         let staged_output_samples = self.hints.staged_samples();
+        let render_assist_target_blocks = render_assist_target_blocks(self.hints.block_samples());
         let stats = &mut self.stats;
         let mixer_streams = &mut self.mixer_streams;
         let trash_swap = &mut self.trash_swap;
@@ -657,6 +669,7 @@ impl LiveDecodeStreams {
                 *stream_id,
                 now,
                 staged_output_samples,
+                render_assist_target_blocks,
                 feedback_sender,
                 trash_swap,
             );
@@ -1093,7 +1106,7 @@ impl LiveDecodeStream {
             .finish_if_idle(self.source.render_ring.depth());
     }
 
-    fn request_dred_render_assist(&mut self) {
+    fn request_dred_render_assist(&mut self, target_blocks: usize) {
         let dred_near_playout = {
             let shared = lock_shared_stream(&self.source.shared);
             shared.core.dred_recovery_near_playout()
@@ -1101,7 +1114,7 @@ impl LiveDecodeStream {
         if dred_near_playout {
             self.source
                 .assist
-                .request_predictive_prefill(self.source.render_ring.depth());
+                .request_predictive_prefill(self.source.render_ring.depth(), target_blocks);
         }
     }
 
@@ -1508,6 +1521,17 @@ mod tests {
     }
 
     #[test]
+    fn render_assist_target_covers_callback_quantum_plus_speculation() {
+        assert_eq!(render_assist_target_blocks(0), 1);
+        assert_eq!(render_assist_target_blocks(MIX_FRAME_SAMPLES), 2);
+        assert_eq!(render_assist_target_blocks(512), 3);
+        assert_eq!(
+            render_assist_target_blocks(MIX_FRAME_SAMPLES * 8),
+            NETEQ_RENDER_ASSIST_RING_BLOCKS
+        );
+    }
+
+    #[test]
     fn slow_callback_request_prefills_assist_ring() {
         let now = Instant::now();
         let tuning = test_tuning();
@@ -1531,8 +1555,8 @@ mod tests {
 
         let ring_depth = streams.streams.get(&7).unwrap().source.render_ring.depth();
         assert!(
-            ring_depth >= MIX_FRAME_SAMPLES,
-            "assist did not pre-render a complete block"
+            ring_depth >= 2 * MIX_FRAME_SAMPLES,
+            "assist did not pre-render two complete blocks"
         );
         let snapshot = streams.snapshot_at(now);
         assert!(
@@ -1552,6 +1576,7 @@ mod tests {
         let now = Instant::now();
         let tuning = test_tuning();
         let mut streams = LiveDecodeStreams::new(tuning);
+        streams.playout_hints().note_block_samples(512);
         let queue = SpscSwapQueue::<LivePlaybackMixerEvent>::with_capacity(8);
         let packets = encode_live_dred_packets(crate::network::EncoderNetworkProfile::CRITICAL, 20);
 
@@ -1573,14 +1598,14 @@ mod tests {
         let ring_depth = stream.source.render_ring.depth();
         let metrics = stream.source.assist.metrics();
         assert!(
-            ring_depth >= MIX_FRAME_SAMPLES,
-            "predictive assist did not pre-render a complete block"
+            ring_depth >= render_assist_target_blocks(512) * MIX_FRAME_SAMPLES,
+            "predictive assist did not cover a 512-frame callback plus speculation"
         );
         assert_eq!(metrics.requests, 1);
         assert_eq!(metrics.activations, 1);
         assert!(
-            metrics.prefilled_blocks >= 1,
-            "predictive assist request did not produce a worker-rendered block"
+            metrics.prefilled_blocks >= render_assist_target_blocks(512) as u64,
+            "predictive assist request did not produce the targeted worker-rendered blocks"
         );
     }
 
