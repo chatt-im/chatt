@@ -74,6 +74,9 @@ pub struct Theme {
     pub editor_selection_linewise: Style,
     // VU meter.
     pub vu_track: Style,
+    /// Fill color while the mic level is shown but not being transmitted
+    /// (silence-gated or muted): a dim grey close to the track, per theme.
+    pub vu_idle_fg: Style,
     pub vu_low_fill: Style,
     pub vu_low_fg: Style,
     pub vu_good_fill: Style,
@@ -164,6 +167,7 @@ impl Theme {
             editor_selection_charwise: d.with_bg_rgb(0x4b, 0x3f, 0x61),
             editor_selection_linewise: d.with_bg_rgb(0x33, 0x38, 0x44),
             vu_track: d.with_bg_rgb(0x1d, 0x22, 0x29),
+            vu_idle_fg: d.with_fg_ansi(AnsiColor::Grey[7]),
             vu_low_fill: d.with_bg_rgb(0x3f, 0x5f, 0x75),
             vu_low_fg: d.with_fg_rgb(0x5d, 0x86, 0xa1),
             vu_good_fill: d.with_bg_rgb(0x45, 0x78, 0x4e),
@@ -245,6 +249,7 @@ impl Theme {
             editor_selection_charwise: d.with_bg_ansi(AnsiColor::Grey[6]),
             editor_selection_linewise: d.with_bg_ansi(AnsiColor::Grey[4]),
             vu_track: d.with_bg_ansi(AnsiColor::Grey[2]),
+            vu_idle_fg: d.with_fg_ansi(AnsiColor::Grey[7]),
             vu_low_fill: d.with_bg_ansi(AnsiColor(4)),
             vu_low_fg: d.with_fg_ansi(blue),
             vu_good_fill: d.with_bg_ansi(AnsiColor(2)),
@@ -313,6 +318,7 @@ impl Theme {
             editor_selection_charwise: d.with_bg_ansi(AnsiColor::Grey[24]),
             editor_selection_linewise: d.with_bg_ansi(AnsiColor::Grey[27]),
             vu_track: d.with_bg_ansi(AnsiColor::Grey[28]),
+            vu_idle_fg: d.with_fg_ansi(AnsiColor::Grey[23]),
             vu_low_fill: d.with_bg_ansi(blue),
             vu_low_fg: d.with_fg_ansi(blue),
             vu_good_fill: d.with_bg_ansi(green),
