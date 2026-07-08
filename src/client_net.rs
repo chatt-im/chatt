@@ -89,6 +89,9 @@ const RTT_PROBE_INTERVAL: Duration = Duration::from_secs(5);
 /// arrived. External-link mode cannot use ordinary clear pings to establish the
 /// address, so losing the first `Bind` must be recoverable.
 const UDP_BIND_RETRY_INTERVAL: Duration = Duration::from_secs(1);
+/// Number of unconfirmed `Bind` retries (at [`UDP_BIND_RETRY_INTERVAL`]) after
+/// which the UDP media path is reported unreachable to the UI.
+const UDP_BIND_FAILURE_ATTEMPTS: u32 = 5;
 /// A server RTT without a successful probe for this long no longer describes
 /// the current relay path and is reported as unavailable.
 const RTT_STALE_AFTER: Duration = Duration::from_secs(15);
@@ -609,6 +612,12 @@ pub enum NetworkEvent {
         retry_in: Duration,
         reason: String,
     },
+    /// UDP media reachability to the server changed. `udp_ok: false` after
+    /// repeated `Bind` retries go unconfirmed; `true` once a `UdpBound` finally
+    /// lands after such a failure.
+    MediaConnectivity {
+        udp_ok: bool,
+    },
     WorkerStopped {
         reason: String,
     },
@@ -1036,6 +1045,8 @@ fn run_worker_inner(
         restart_port_policy: RestartPortPolicy::default(),
         udp_rebind_requested: false,
         awaiting_udp_bound: false,
+        udp_bind_attempts: 0,
+        udp_reported_unreachable: false,
         interface_snapshot: InterfaceSnapshot::capture().ok(),
         next_interface_poll: Instant::now() + INTERFACE_POLL_INTERVAL,
         next_file_transfer: 1,
@@ -1552,6 +1563,14 @@ struct WorkerState {
     /// `Bind` payload and the server confirms every one, so only the first
     /// confirmation after a bind is announced.
     awaiting_udp_bound: bool,
+    /// Consecutive unconfirmed `Bind` retries since the last [`bind_udp`], used
+    /// to detect a UDP media path that never binds.
+    ///
+    /// [`bind_udp`]: WorkerState::bind_udp
+    udp_bind_attempts: u32,
+    /// Whether a [`NetworkEvent::MediaConnectivity`] failure has already been
+    /// announced for the current outage, so the failure edge fires once.
+    udp_reported_unreachable: bool,
     interface_snapshot: Option<InterfaceSnapshot>,
     next_interface_poll: Instant,
     next_file_transfer: u64,
@@ -3936,6 +3955,13 @@ impl WorkerState {
                 if self.awaiting_udp_bound {
                     self.awaiting_udp_bound = false;
                     kvlog::info!("client udp bound");
+                    if self.udp_reported_unreachable {
+                        let _ = self
+                            .events
+                            .send(NetworkEvent::MediaConnectivity { udp_ok: true });
+                    }
+                    self.udp_reported_unreachable = false;
+                    self.udp_bind_attempts = 0;
                     let _ = self
                         .events
                         .send(NetworkEvent::Status("udp media bound".to_string()));
@@ -4140,6 +4166,7 @@ impl WorkerState {
         if let Some(session_id) = self.session_id {
             kvlog::info!("udp bind sending", session_id = session_id.0);
             self.awaiting_udp_bound = true;
+            self.udp_bind_attempts = 0;
             self.next_udp_bind_retry = Instant::now() + UDP_BIND_RETRY_INTERVAL;
             self.send_media(&MediaPayload::Bind);
             // NAT probes discover reflexive addresses for P2P only, which runs
@@ -4162,6 +4189,14 @@ impl WorkerState {
         if self.session_id.is_some() {
             kvlog::info!("udp bind retry sending");
             self.send_media(&MediaPayload::Bind);
+        }
+        self.udp_bind_attempts = self.udp_bind_attempts.saturating_add(1);
+        if self.udp_bind_attempts >= UDP_BIND_FAILURE_ATTEMPTS && !self.udp_reported_unreachable {
+            self.udp_reported_unreachable = true;
+            kvlog::warn!("client udp unreachable", attempts = self.udp_bind_attempts);
+            let _ = self
+                .events
+                .send(NetworkEvent::MediaConnectivity { udp_ok: false });
         }
     }
 
