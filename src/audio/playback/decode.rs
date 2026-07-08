@@ -196,6 +196,10 @@ fn drain_stream(
 ) {
     stream.apply_control_mute_pending(now, stream_id);
     stream.activate_control_mute_fallback_if_due(now, stream_id);
+    stream
+        .source
+        .assist
+        .set_reactive_target_blocks(render_assist_target_blocks);
     stream.request_dred_render_assist(render_assist_target_blocks);
     stream.prefill_render_assist(now);
 
