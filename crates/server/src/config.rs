@@ -434,7 +434,10 @@ impl Config {
         }
         self.network.public_udp_addr = self.network.public_udp_addr.trim().to_string();
         if self.network.public_udp_addr.is_empty() {
-            self.network.public_udp_addr = self.network.udp_addr().to_string();
+            self.network.public_udp_addr = public_endpoint_for_bind_addr(
+                self.network.udp_addr(),
+                &self.network.public_tcp_addr,
+            );
         }
         self.network.public_udp_probe_addr = self
             .network
@@ -443,7 +446,11 @@ impl Config {
             .map(str::trim)
             .filter(|addr| !addr.is_empty())
             .map(str::to_string)
-            .or_else(|| self.network.udp_probe_addr.map(|addr| addr.to_string()));
+            .or_else(|| {
+                self.network
+                    .udp_probe_addr
+                    .map(|addr| public_endpoint_for_bind_addr(addr, &self.network.public_tcp_addr))
+            });
         for room in &mut self.rooms {
             room.name = room.name.trim().to_string();
             if let Some(members) = &mut room.members {
@@ -463,18 +470,18 @@ impl Config {
         if let Some(hash) = self.password_hash() {
             validate_secret_hash(source, "security.password-hash", hash)?;
         }
-        validate_endpoint(
+        validate_public_endpoint(
             source,
             "network.public-tcp-addr",
             &self.network.public_tcp_addr,
         )?;
-        validate_endpoint(
+        validate_public_endpoint(
             source,
             "network.public-udp-addr",
             &self.network.public_udp_addr,
         )?;
         if let Some(addr) = &self.network.public_udp_probe_addr {
-            validate_endpoint(source, "network.public-udp-probe-addr", addr)?;
+            validate_public_endpoint(source, "network.public-udp-probe-addr", addr)?;
         }
 
         let mut room_ids = HashSet::new();
@@ -693,6 +700,39 @@ fn validate_endpoint(source: &str, name: &str, value: &str) -> Result<(), String
     port.parse::<u16>()
         .map(|_| ())
         .map_err(|_| format!("{source}: {name} port is invalid"))
+}
+
+fn validate_public_endpoint(source: &str, name: &str, value: &str) -> Result<(), String> {
+    validate_endpoint(source, name, value)?;
+    if let Ok(addr) = value.trim().parse::<SocketAddr>()
+        && addr.ip().is_unspecified()
+    {
+        return Err(format!(
+            "{source}: {name} must not use an unspecified address"
+        ));
+    }
+    Ok(())
+}
+
+fn public_endpoint_for_bind_addr(bind_addr: SocketAddr, public_tcp_addr: &str) -> String {
+    if bind_addr.ip().is_unspecified() {
+        return endpoint_with_port(public_tcp_addr, bind_addr.port())
+            .unwrap_or_else(|| bind_addr.to_string());
+    }
+    bind_addr.to_string()
+}
+
+fn endpoint_with_port(endpoint: &str, port: u16) -> Option<String> {
+    let endpoint = endpoint.trim();
+    if let Ok(addr) = endpoint.parse::<SocketAddr>() {
+        return Some(SocketAddr::new(addr.ip(), port).to_string());
+    }
+    let (host, _) = endpoint.rsplit_once(':')?;
+    let host = host.trim();
+    if host.is_empty() {
+        return None;
+    }
+    Some(format!("{host}:{port}"))
 }
 
 fn parse_secret_hash(stored_hash: &str) -> Option<[u8; 32]> {
@@ -916,6 +956,47 @@ mod tests {
         assert_eq!(config.network.udp_addr().to_string(), "0.0.0.0:41000");
         assert_eq!(config.network.public_tcp_addr, "chat.example.com:443");
         assert_eq!(config.network.public_udp_addr, "198.51.100.20:54100");
+    }
+
+    #[test]
+    fn public_udp_addr_inherits_public_tcp_host_when_bind_is_unspecified() {
+        let content = config_content("").replace(
+            "tcp-addr = \"127.0.0.1:41000\"",
+            "tcp-addr = \"0.0.0.0:41000\"\npublic-tcp-addr = \"104.247.224.7:41000\"",
+        );
+
+        let config = parse(&content).unwrap();
+
+        assert_eq!(config.network.tcp_addr.to_string(), "0.0.0.0:41000");
+        assert_eq!(config.network.udp_addr().to_string(), "0.0.0.0:41000");
+        assert_eq!(config.network.public_tcp_addr, "104.247.224.7:41000");
+        assert_eq!(config.network.public_udp_addr, "104.247.224.7:41000");
+    }
+
+    #[test]
+    fn public_endpoints_reject_unspecified_addresses() {
+        let content = config_content("").replace(
+            "tcp-addr = \"127.0.0.1:41000\"",
+            "tcp-addr = \"0.0.0.0:41000\"",
+        );
+
+        let error = parse(&content).unwrap_err();
+
+        assert!(error.contains("network.public-tcp-addr"));
+        assert!(error.contains("unspecified address"));
+    }
+
+    #[test]
+    fn explicit_public_udp_addr_rejects_unspecified_address() {
+        let content = config_content("").replace(
+            "tcp-addr = \"127.0.0.1:41000\"",
+            "tcp-addr = \"0.0.0.0:41000\"\npublic-tcp-addr = \"104.247.224.7:41000\"\npublic-udp-addr = \"0.0.0.0:41000\"",
+        );
+
+        let error = parse(&content).unwrap_err();
+
+        assert!(error.contains("network.public-udp-addr"));
+        assert!(error.contains("unspecified address"));
     }
 
     #[test]

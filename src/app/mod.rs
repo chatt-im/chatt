@@ -7516,6 +7516,17 @@ mod tests {
     }
 
     #[test]
+    fn join_no_match_unspecified_address_does_not_pair() {
+        let mut app = app_with_servers(&[("lab", "10.0.0.1:4000")]);
+        assert_eq!(app.resolve_join("0.0.0.0:41000"), JoinResolution::NoMatch);
+
+        app.start_named_join("0.0.0.0:41000".to_string());
+
+        assert!(app.pending_pair.is_none());
+        assert_eq!(app.status.kind(), StatusKind::Error);
+    }
+
+    #[test]
     fn join_no_match_bad_label_opens_picker_without_pairing() {
         let mut app = app_with_servers(&[("lab", "10.0.0.1:4000")]);
         assert_eq!(app.resolve_join("does-not-exist"), JoinResolution::NoMatch);

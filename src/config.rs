@@ -1431,7 +1431,10 @@ fn validate_endpoint(value: &str, name: &str) -> Result<(), String> {
     if value.is_empty() {
         return Err(format!("{name} is empty"));
     }
-    if value.parse::<std::net::SocketAddr>().is_ok() {
+    if let Ok(addr) = value.parse::<std::net::SocketAddr>() {
+        if addr.ip().is_unspecified() {
+            return Err(format!("{name} must not use an unspecified address"));
+        }
         return Ok(());
     }
     let Some((host, port)) = value.rsplit_once(':') else {
@@ -1559,6 +1562,34 @@ server-public-key = ""
     }
 
     #[test]
+    fn server_endpoints_reject_unspecified_addresses() {
+        let arena = Arena::new();
+        let mut doc = toml_spanner::parse(
+            r#"
+active-server = "lab"
+
+[[servers]]
+label = "lab"
+username = "Alice"
+token = "alice-dev-token"
+tcp-addr = "0.0.0.0:41000"
+server-public-key = ""
+"#,
+            &arena,
+        )
+        .unwrap();
+        let udp_addr_configured = server_udp_addr_configured(&doc);
+        let mut config: Config = doc.to().unwrap();
+        config.apply_inferred_addresses_from_doc(&udp_addr_configured);
+        config.normalize();
+
+        let error = validation_errors(&config);
+
+        assert!(error.contains("tcp-addr must not use an unspecified address"));
+        assert!(error.contains("udp-addr must not use an unspecified address"));
+    }
+
+    #[test]
     fn soundboard_config_parses_clip_and_loss_profile() {
         let arena = Arena::new();
         let mut doc = toml_spanner::parse(
@@ -1652,6 +1683,61 @@ path = "assets/sample-001.opus"
                 .iter()
                 .any(|diag| diag.error && diag.message.contains("bitrate-bps"))
         );
+    }
+
+    #[test]
+    fn unspecified_server_endpoint_is_load_error() {
+        let outcome = collect_from(
+            "unspecified-server-endpoint",
+            r#"
+active-server = "lab"
+
+[[servers]]
+label = "lab"
+username = "Alice"
+token = "alice-dev-token"
+tcp-addr = "0.0.0.0:41000"
+server-public-key = ""
+"#,
+        );
+
+        assert!(outcome.diagnostics.iter().any(|diag| {
+            diag.error
+                && diag
+                    .message
+                    .contains("tcp-addr must not use an unspecified address")
+        }));
+        assert!(outcome.diagnostics.iter().any(|diag| {
+            diag.error
+                && diag
+                    .message
+                    .contains("udp-addr must not use an unspecified address")
+        }));
+    }
+
+    #[test]
+    fn unspecified_udp_endpoint_is_load_error() {
+        let outcome = collect_from(
+            "unspecified-udp-endpoint",
+            r#"
+active-server = "lab"
+
+[[servers]]
+label = "lab"
+username = "Alice"
+token = "alice-dev-token"
+tcp-addr = "104.247.224.7:41000"
+udp-addr = "0.0.0.0:41000"
+server-public-key = ""
+"#,
+        );
+
+        assert!(outcome.diagnostics.iter().any(|diag| {
+            diag.error
+                && diag
+                    .message
+                    .contains("udp-addr must not use an unspecified address")
+        }));
     }
 
     fn render_runtime(config: &Config) -> String {

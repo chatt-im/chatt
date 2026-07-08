@@ -683,7 +683,12 @@ pub(crate) fn parse_pair_address(target: &str) -> Result<String, String> {
     if target.is_empty() {
         return Err("usage: chatt pair <host:port | invite-ticket>".to_string());
     }
-    if target.parse::<std::net::SocketAddr>().is_ok() {
+    if let Ok(addr) = target.parse::<std::net::SocketAddr>() {
+        if addr.ip().is_unspecified() {
+            return Err(format!(
+                "invalid server address '{target}'; host must not be an unspecified address"
+            ));
+        }
         return Ok(target.to_string());
     }
     match target.rsplit_once(':') {
@@ -859,6 +864,13 @@ mod tests {
         let (name, sub) = matches.subcommand().unwrap();
         assert_eq!(name, "pair");
         assert_eq!(sub.value_of("join_string"), Some("tcj1_abc"));
+    }
+
+    #[test]
+    fn pair_address_rejects_unspecified_socket_address() {
+        let error = parse_pair_address("0.0.0.0:41000").unwrap_err();
+
+        assert!(error.contains("unspecified address"));
     }
 
     #[test]
