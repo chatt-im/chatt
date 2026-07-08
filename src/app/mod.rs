@@ -3431,9 +3431,12 @@ impl App {
         } else if self.config.soundboard.enabled {
             self.soundboard_busy.load(Ordering::Relaxed)
         } else {
+            // Drive the self indicator from the capture transmit gate, not a raw
+            // level threshold: residual denoiser noise clears the threshold but is
+            // silence-gated out of the outbound stream, so the dot must stay dark.
             self.capture
                 .as_ref()
-                .is_some_and(|capture| lobby_voice_level_active(capture.stats().snapshot().rms))
+                .is_some_and(|capture| capture.stats().snapshot().voice_active)
         };
         let playback = self.playback.as_ref().map(|playback| playback.stats());
         let updates = self

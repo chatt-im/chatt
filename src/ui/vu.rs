@@ -101,7 +101,8 @@ pub fn draw_status_vu(
     let (rms, peak) = capture
         .map(|stats| (stats.rms, stats.peak))
         .unwrap_or_default();
-    draw_vu_meter(area, buf, rms, peak, theme.status_fill, theme);
+    let transmitting = capture.is_some_and(|stats| stats.voice_active);
+    draw_vu_meter(area, buf, rms, peak, transmitting, theme.status_fill, theme);
 }
 
 pub fn draw_settings_vu_row(
@@ -137,16 +138,19 @@ pub fn draw_settings_vu_row(
     let (rms, peak) = capture
         .map(|stats| (stats.rms, stats.peak))
         .unwrap_or_default();
-    draw_vu_meter(row, buf, rms, peak, base, theme);
+    let transmitting = capture.is_some_and(|stats| stats.voice_active);
+    draw_vu_meter(row, buf, rms, peak, transmitting, base, theme);
 
     if let Some(value_area) = value_area {
         let (label, style) = match capture {
             Some(_) => {
                 let db = dbfs(rms);
-                (
-                    format!("{db:>5.1} dB"),
-                    level_style(base, db, dbfs(peak), theme),
-                )
+                let style = if transmitting {
+                    level_style(base, db, dbfs(peak), theme)
+                } else {
+                    base.patch(theme.vu_idle_fg)
+                };
+                (format!("{db:>5.1} dB"), style)
             }
             None => ("inactive".to_string(), base.patch(theme.muted)),
         };
@@ -154,7 +158,15 @@ pub fn draw_settings_vu_row(
     }
 }
 
-fn draw_vu_meter(area: Rect, buf: &mut Buffer, rms: f32, peak: f32, base: Style, theme: &Theme) {
+fn draw_vu_meter(
+    area: Rect,
+    buf: &mut Buffer,
+    rms: f32,
+    peak: f32,
+    transmitting: bool,
+    base: Style,
+    theme: &Theme,
+) {
     if area.is_empty() {
         return;
     }
@@ -168,7 +180,7 @@ fn draw_vu_meter(area: Rect, buf: &mut Buffer, rms: f32, peak: f32, base: Style,
     for index in 0..width {
         let zone_db = cell_zone_db(index, width);
         let covered = filled.saturating_sub(index * 4).min(4);
-        let (text, style) = meter_cell(covered, base, zone_db, theme);
+        let (text, style) = meter_cell(covered, base, zone_db, transmitting, theme);
         buf.set_stringn(area.x + index as u16, area.y, text, 1, style);
     }
 
@@ -178,15 +190,16 @@ fn draw_vu_meter(area: Rect, buf: &mut Buffer, rms: f32, peak: f32, base: Style,
             let index = ((peak_quarters - 1) / 4).min(width - 1);
             let zone_db = cell_zone_db(index, width);
             let covered = filled.saturating_sub(index * 4).min(4);
-            let bg = if covered == 4 {
-                fill_bg(zone_db, theme)
+            // A suppressed level keeps the marker on the faint idle track so it
+            // reads as level history, not a live peak.
+            let (bg, fg) = if !transmitting {
+                (theme.vu_track, theme.vu_idle_fg)
+            } else if covered == 4 {
+                (fill_bg(zone_db, theme), theme.vu_peak_fg)
             } else {
-                theme.vu_track
+                (theme.vu_track, theme.vu_peak_fg)
             };
-            let style = base
-                .patch(bg)
-                .patch(theme.vu_peak_fg)
-                .with_modifier(Modifier::BOLD);
+            let style = base.patch(bg).patch(fg).with_modifier(Modifier::BOLD);
             buf.set_stringn(area.x + index as u16, area.y, "▏", 1, style);
         }
     }
@@ -196,9 +209,24 @@ fn meter_cell(
     covered_quarters: usize,
     base: Style,
     zone_db: f32,
+    transmitting: bool,
     theme: &Theme,
 ) -> (&'static str, Style) {
     let track = theme.vu_track;
+    if !transmitting {
+        // While nothing is being sent (silence-gated or muted), the level is
+        // still shown but demoted to a faint grey close to the track, so the
+        // residual denoiser noise does not read as live speech. Full cells use
+        // a block glyph rather than a solid fill for the same reason.
+        let idle = base.patch(track).patch(theme.vu_idle_fg);
+        return match covered_quarters {
+            0 => (" ", base.patch(track)),
+            1 => ("▎", idle),
+            2 => ("▌", idle),
+            3 => ("▊", idle),
+            _ => ("█", idle),
+        };
+    }
     match covered_quarters {
         0 => (" ", base.patch(track)),
         1 => ("▎", base.patch(track).patch(fill_fg(zone_db, theme))),
@@ -325,9 +353,20 @@ mod tests {
     #[test]
     fn meter_cells_use_quarter_block_precision() {
         let theme = Theme::tomorrow_night();
-        assert_eq!(meter_cell(1, Style::DEFAULT, -30.0, &theme).0, "▎");
-        assert_eq!(meter_cell(2, Style::DEFAULT, -30.0, &theme).0, "▌");
-        assert_eq!(meter_cell(3, Style::DEFAULT, -30.0, &theme).0, "▊");
-        assert_eq!(meter_cell(4, Style::DEFAULT, -30.0, &theme).0, " ");
+        assert_eq!(meter_cell(1, Style::DEFAULT, -30.0, true, &theme).0, "▎");
+        assert_eq!(meter_cell(2, Style::DEFAULT, -30.0, true, &theme).0, "▌");
+        assert_eq!(meter_cell(3, Style::DEFAULT, -30.0, true, &theme).0, "▊");
+        assert_eq!(meter_cell(4, Style::DEFAULT, -30.0, true, &theme).0, " ");
+    }
+
+    #[test]
+    fn meter_cells_idle_stay_grey_and_solid() {
+        let theme = Theme::tomorrow_night();
+        // Not transmitting: full cells stay a grey block, never a bright fill.
+        assert_eq!(meter_cell(4, Style::DEFAULT, -30.0, false, &theme).0, "█");
+        assert_eq!(
+            meter_cell(4, Style::DEFAULT, -30.0, false, &theme).1,
+            Style::DEFAULT.patch(theme.vu_track).patch(theme.vu_idle_fg)
+        );
     }
 }
