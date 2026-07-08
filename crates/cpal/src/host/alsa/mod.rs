@@ -90,7 +90,18 @@ mod enumerate;
 // buffers.
 
 const DEFAULT_DEVICE: &str = "default";
-const DEFAULT_PERIODS: alsa::pcm::Frames = 2;
+const PLAYBACK_PERIODS: alsa::pcm::Frames = 2;
+// Match the common low-latency ALSA capture shape used by Mumble: keep the
+// callback period small, but give the capture side enough ring headroom to
+// survive scheduling hiccups without overrunning in the ALSA layer.
+const CAPTURE_PERIODS: alsa::pcm::Frames = 8;
+
+fn periods_for_direction(direction: alsa::Direction) -> alsa::pcm::Frames {
+    match direction {
+        alsa::Direction::Playback => PLAYBACK_PERIODS,
+        alsa::Direction::Capture => CAPTURE_PERIODS,
+    }
+}
 
 // Some ALSA plugins (e.g. alsaequal, certain USB drivers) are not reentrant.
 static ALSA_OPEN_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -588,7 +599,7 @@ impl Device {
                     *buffer_size_cache
                         .entry((channels, width))
                         .or_insert_with(|| {
-                            supported_period_size_range(&hw_params, alsa_format, channels)
+                            supported_period_size_range(&hw_params, stream_t, alsa_format, channels)
                         });
 
                 for &(min_rate, max_rate) in sample_rates.iter() {
@@ -1463,6 +1474,7 @@ impl StreamTrait for Stream {
 
 fn supported_period_size_range(
     hw_params: &alsa::pcm::HwParams<'_>,
+    direction: alsa::Direction,
     alsa_format: alsa::pcm::Format,
     channels: ChannelCount,
 ) -> SupportedBufferSize {
@@ -1477,10 +1489,12 @@ fn supported_period_size_range(
         return SupportedBufferSize::Unknown;
     };
     let min_frames = min.max(1);
-    // cpal double-buffers (ring = DEFAULT_PERIODS × period), so the achievable
-    // period maximum is also bounded by max_buffer / DEFAULT_PERIODS.
+    let periods = periods_for_direction(direction);
+    // cpal exposes the ALSA period size as BufferSize::Fixed, while the actual
+    // ring is period_count * period. Bound the advertised period by the ring
+    // size we will request for this direction.
     let effective_max = match p.get_buffer_size_max() {
-        Ok(max_buf) if max_buf > 0 => max.min(max_buf / DEFAULT_PERIODS),
+        Ok(max_buf) if max_buf > 0 => max.min(max_buf / periods),
         _ => max,
     };
     if effective_max >= min_frames {
@@ -1629,11 +1643,12 @@ fn set_hw_params_from_format(
         BufferSize::Default => None,
     };
 
-    // When an explicit period is requested, configure double-buffering with
-    // buffer_size = 2 * period_size. This provides consistent low-latency
-    // behavior across different ALSA implementations and hardware.
+    // When an explicit period is requested, configure the ALSA ring as
+    // period_count * period_size. The period remains the callback size; the
+    // larger capture period count only adds overrun headroom in the backend.
     if let Some(period_size) = requested_period {
         let mut period_size = period_size;
+        let periods = periods_for_direction(stream_type);
 
         // Clamp the request into the device's supported period range rather than failing.
         // ALSA hardware advertises a discrete period range (often power-of-two bound), so an
@@ -1647,33 +1662,35 @@ fn set_hw_params_from_format(
             period_size = period_size.clamp(min_period, max_period);
         }
 
-        // Keep the double-buffered ring within the device maximum by shrinking the period so
-        // that buffer = DEFAULT_PERIODS * period still fits.
+        // Keep the ring within the device maximum by shrinking the period so
+        // that buffer = periods * period still fits.
         if let Ok(max_buffer) = hw_params.get_buffer_size_max() {
-            if max_buffer > 0 && DEFAULT_PERIODS * period_size > max_buffer {
-                period_size = (max_buffer / DEFAULT_PERIODS).max(1);
+            if max_buffer > 0 && periods * period_size > max_buffer {
+                period_size = (max_buffer / periods).max(1);
             }
         }
 
-        let buffer_size = DEFAULT_PERIODS * period_size;
-        hw_params.set_buffer_size_near(buffer_size)?;
         hw_params.set_period_size_near(period_size, alsa::ValueOr::Nearest)?;
+        hw_params.set_buffer_size_near(periods * period_size)?;
     }
 
     // Apply hardware parameters
     pcm_handle.hw_params(&hw_params)?;
 
-    // For BufferSize::Default, constrain to device's configured period with 2-period buffering.
+    // For BufferSize::Default, constrain to the device's configured period with
+    // the same direction-specific period count used for explicit requests.
     // PipeWire-ALSA picks a good period size but pairs it with many periods (huge buffer).
     // We need to re-initialize hw_params and set BOTH period and buffer to constrain properly.
     if config.buffer_size == BufferSize::Default {
         if let Ok(period_size) = hw_params.get_period_size() {
             // Re-initialize hw_params to clear previous constraints
             let hw_params = init_hw_params(pcm_handle, config, sample_format)?;
+            let periods = periods_for_direction(stream_type);
 
-            // Set both period (to device's chosen value) and buffer (to 2 periods)
+            // Set both period (to device's chosen value) and buffer (to the
+            // direction-specific period count).
             hw_params.set_period_size_near(period_size, alsa::ValueOr::Nearest)?;
-            hw_params.set_buffer_size_near(DEFAULT_PERIODS * period_size)?;
+            hw_params.set_buffer_size_near(periods * period_size)?;
 
             // Re-apply with new constraints
             pcm_handle.hw_params(&hw_params)?;
@@ -1696,7 +1713,7 @@ fn set_sw_params_from_format(
         alsa::Direction::Playback => {
             // Start playback when 2 periods are filled. This ensures consistent low-latency
             // startup regardless of total buffer size (whether 2 or more periods).
-            DEFAULT_PERIODS * period_size
+            PLAYBACK_PERIODS * period_size
         }
         alsa::Direction::Capture => 1,
     };
