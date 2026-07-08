@@ -191,6 +191,36 @@ configured.",
             examples: &[],
         },
         Command {
+            name: "output-volume",
+            aliases: &[],
+            about: "Show or adjust the running client's output volume.",
+            long_about: "With no value, prints the running client's global output volume. \
+Pass an unsigned percent to set it, or a signed percent to adjust it.",
+            args: &[Arg {
+                name: "value",
+                value_name: "VALUE",
+                help: "Percent value such as 50%, +10%, or -0.5%",
+                required: false,
+                possible: &[],
+            }],
+            flags: &[],
+            subs: &[],
+            examples: &[
+                Example {
+                    cmd: "output-volume",
+                    help: "Print the current output volume.",
+                },
+                Example {
+                    cmd: "output-volume 50%",
+                    help: "Set the output volume to 50%.",
+                },
+                Example {
+                    cmd: "output-volume -0.5%",
+                    help: "Reduce the output volume by half a percentage point.",
+                },
+            ],
+        },
+        Command {
             name: "mute",
             aliases: &[],
             about: "Mute or unmute the active call.",
@@ -442,6 +472,12 @@ fn dispatch(matches: &Matches) -> Result<(), Box<dyn std::error::Error>> {
             )?;
             Ok(())
         }
+        Some(("output-volume", sub)) => {
+            let command = parse_output_volume_command(sub.value_of("value"))?;
+            let response = local_control::send_output_volume(command)?;
+            println!("{response}");
+            Ok(())
+        }
         Some(("mute", sub)) => {
             let command = match sub.subcommand() {
                 Some(("set", set)) => local_control::VoiceCommand::SetMute(parse_voice_state(set)),
@@ -522,6 +558,21 @@ fn parse_voice_state(set: &Matches) -> bool {
     set.value_of("state") == Some("true")
 }
 
+fn parse_output_volume_command(
+    value: Option<&str>,
+) -> Result<local_control::OutputVolumeCommand, String> {
+    let Some(value) = value else {
+        return Ok(local_control::OutputVolumeCommand::Query);
+    };
+    let trimmed = value.trim();
+    let parsed = config::parse_output_volume_percent_number(trimmed)?;
+    if trimmed.starts_with(['+', '-']) {
+        Ok(local_control::OutputVolumeCommand::Adjust(parsed))
+    } else {
+        Ok(local_control::OutputVolumeCommand::Set(parsed))
+    }
+}
+
 fn run_audio_playback_test(
     config: Config,
     path: PathBuf,
@@ -545,6 +596,7 @@ fn run_audio_playback_test(
         packet_loss,
         seed,
         max_amplification: config.audio.max_amplification,
+        output_volume: config.audio.output_volume,
         denoise: config.audio.denoise.is_enabled(),
         auto_gain: true,
     })?;
@@ -827,6 +879,52 @@ mod tests {
         assert_eq!(sub.value_of("path"), Some("assets/sample-001.opus"));
         assert_eq!(sub.value_of("loss"), Some("random_60"));
         assert_eq!(sub.value_of("seed"), Some("0x1234"));
+    }
+
+    #[test]
+    fn parses_output_volume_query_set_and_adjust() {
+        let matches = run_matches(&["chatt", "output-volume"]);
+        let (name, sub) = matches.subcommand().unwrap();
+        assert_eq!(name, "output-volume");
+        assert_eq!(sub.value_of("value"), None);
+
+        let matches = run_matches(&["chatt", "output-volume", "50%"]);
+        assert_eq!(
+            matches.subcommand().unwrap().1.value_of("value"),
+            Some("50%")
+        );
+
+        let matches = run_matches(&["chatt", "output-volume", "+10%"]);
+        assert_eq!(
+            matches.subcommand().unwrap().1.value_of("value"),
+            Some("+10%")
+        );
+
+        let matches = run_matches(&["chatt", "output-volume", "-0.5%"]);
+        assert_eq!(
+            matches.subcommand().unwrap().1.value_of("value"),
+            Some("-0.5%")
+        );
+    }
+
+    #[test]
+    fn output_volume_cli_value_selects_set_or_adjust() {
+        assert_eq!(
+            parse_output_volume_command(None).unwrap(),
+            local_control::OutputVolumeCommand::Query
+        );
+        assert_eq!(
+            parse_output_volume_command(Some("50%")).unwrap(),
+            local_control::OutputVolumeCommand::Set(50.0)
+        );
+        assert_eq!(
+            parse_output_volume_command(Some("+10%")).unwrap(),
+            local_control::OutputVolumeCommand::Adjust(10.0)
+        );
+        assert_eq!(
+            parse_output_volume_command(Some("-0.5%")).unwrap(),
+            local_control::OutputVolumeCommand::Adjust(-0.5)
+        );
     }
 
     #[test]

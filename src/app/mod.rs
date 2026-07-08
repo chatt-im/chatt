@@ -13,7 +13,7 @@ use std::{
     path::PathBuf,
     sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU32, Ordering},
         mpsc::{self, Receiver, Sender},
     },
     thread,
@@ -358,6 +358,7 @@ pub(crate) struct App {
     pub settings_preview_refresh_id: Option<u64>,
     pub allow_settings_preview_capture: bool,
     pub playback: Option<LivePlayback>,
+    output_volume_percent_bits: Arc<AtomicU32>,
     pub soundboard_busy: Arc<AtomicBool>,
     pub soundboard_next_sequence: u32,
     pub echo_control: Arc<EchoCancellationControl>,
@@ -673,6 +674,10 @@ pub(crate) enum AppEvent {
     Soundboard(SoundboardEvent),
     Voice(local_control::VoiceCommand),
     Screencast(local_control::ScreencastCommand),
+    OutputVolume {
+        command: local_control::OutputVolumeCommand,
+        reply: Sender<Result<f32, String>>,
+    },
     Web(crate::web_server::WebRequest),
     /// A bug report request from `chatt report-bug`, carrying the description.
     ReportBug(String),
@@ -937,6 +942,8 @@ impl App {
         let theme = Theme::from_choice(config.ui.theme);
         let room = RoomSession::new(&config, &theme);
         let echo_control = Arc::new(EchoCancellationControl::new(config.audio.echo_cancellation));
+        let output_volume_percent_bits =
+            Arc::new(AtomicU32::new(config.audio.output_volume.to_bits()));
         let web_feed = if config.web.enabled {
             // The web feed is app-wide and spawns before any server
             // connection, so it uses the global receive dir, not a per-room
@@ -977,6 +984,7 @@ impl App {
             settings_preview_refresh_id: None,
             allow_settings_preview_capture: !soundboard_enabled,
             playback: None,
+            output_volume_percent_bits,
             soundboard_busy: Arc::new(AtomicBool::new(false)),
             soundboard_next_sequence: 0,
             echo_control,
@@ -1092,6 +1100,9 @@ impl App {
             AppEvent::Soundboard(event) => self.handle_soundboard_event(event),
             AppEvent::Voice(command) => self.apply_voice_command(command),
             AppEvent::Screencast(command) => self.handle_screencast_command(command),
+            AppEvent::OutputVolume { command, reply } => {
+                self.handle_output_volume_command(command, reply)
+            }
             AppEvent::Web(request) => self.handle_web_request(request),
             AppEvent::ReportBug(description) => self.start_bug_report(description),
             AppEvent::ScreencastFailed(reason) => self.handle_screencast_failed(reason),
@@ -1110,6 +1121,32 @@ impl App {
             }
             local_control::VoiceCommand::SetDeafen(state) => self.set_deafen(state),
         }
+    }
+
+    fn handle_output_volume_command(
+        &mut self,
+        command: local_control::OutputVolumeCommand,
+        reply: Sender<Result<f32, String>>,
+    ) {
+        let value = match command {
+            local_control::OutputVolumeCommand::Query => self.config.audio.output_volume,
+            local_control::OutputVolumeCommand::Set(value) => self.set_output_volume(value),
+            local_control::OutputVolumeCommand::Adjust(delta) => {
+                self.set_output_volume(self.config.audio.output_volume + delta)
+            }
+        };
+        let _ = reply.send(Ok(value));
+    }
+
+    fn set_output_volume(&mut self, value: f32) -> f32 {
+        let value = config::snap_output_volume_percent(value);
+        self.config.audio.output_volume = value;
+        self.apply_output_volume_setting();
+        self.set_status(format!(
+            "output volume {}",
+            config::output_volume_percent_label(value)
+        ));
+        value
     }
 
     /// Applies a CLI-driven screencast command: spawns capture and the publisher
@@ -3190,6 +3227,7 @@ impl App {
         self.apply_p2p_setting(old_p2p_enabled);
         self.apply_history_setting(old_history_enabled);
         self.apply_echo_cancellation_setting();
+        self.apply_output_volume_setting();
         self.apply_active_capture_amplification(self.config.audio.max_amplification);
         let (capture, playback) = audio_restart_flags(&old, &self.config.audio);
         if capture || playback {
@@ -4264,6 +4302,13 @@ impl App {
     fn apply_echo_cancellation_setting(&self) {
         self.echo_control
             .set_enabled(self.config.audio.echo_cancellation);
+    }
+
+    fn apply_output_volume_setting(&self) {
+        self.output_volume_percent_bits.store(
+            config::snap_output_volume_percent(self.config.audio.output_volume).to_bits(),
+            Ordering::Relaxed,
+        );
     }
 
     pub(crate) fn save_settings(&mut self, session: &mut SettingsSession) {
@@ -5440,6 +5485,7 @@ impl App {
             tuning: self.config.audio.latency.to_tuning(),
             feedback_sender,
             echo_control: Some(Arc::clone(&self.echo_control)),
+            output_volume_percent: Arc::clone(&self.output_volume_percent_bits),
         }
     }
 
@@ -5701,6 +5747,38 @@ mod tests {
         assert!(parse_upload_rate("").is_err());
         assert!(parse_upload_rate("fast").is_err());
         assert!(parse_upload_rate("12x").is_err());
+    }
+
+    #[test]
+    fn output_volume_command_updates_live_config_and_atomic() {
+        let mut app = test_app();
+
+        let (reply, rx) = mpsc::channel();
+        app.handle_output_volume_command(local_control::OutputVolumeCommand::Set(50.0), reply);
+        assert_eq!(rx.recv().unwrap().unwrap(), 50.0);
+        assert_eq!(app.config.audio.output_volume, 50.0);
+        assert_eq!(
+            f32::from_bits(app.output_volume_percent_bits.load(Ordering::Relaxed)),
+            50.0
+        );
+
+        let (reply, rx) = mpsc::channel();
+        app.handle_output_volume_command(local_control::OutputVolumeCommand::Adjust(200.0), reply);
+        assert_eq!(
+            rx.recv().unwrap().unwrap(),
+            config::MAX_OUTPUT_VOLUME_PERCENT
+        );
+        assert_eq!(
+            app.config.audio.output_volume,
+            config::MAX_OUTPUT_VOLUME_PERCENT
+        );
+
+        let (reply, rx) = mpsc::channel();
+        app.handle_output_volume_command(local_control::OutputVolumeCommand::Query, reply);
+        assert_eq!(
+            rx.recv().unwrap().unwrap(),
+            config::MAX_OUTPUT_VOLUME_PERCENT
+        );
     }
 
     fn pending_open_pair(label: &str) -> PendingPair {

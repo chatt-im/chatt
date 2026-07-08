@@ -205,7 +205,11 @@ fn parse_command(
             index = parse_long(cmd, root, tokens, index, path, &mut matches, globals)?;
             continue;
         }
-        if !only_positional && token.starts_with('-') && token.len() > 1 {
+        if !only_positional
+            && token.starts_with('-')
+            && token.len() > 1
+            && !(positional_index < cmd.args.len() && is_negative_numeric_positional(token))
+        {
             index = parse_short(cmd, root, tokens, index, path, &mut matches, globals)?;
             continue;
         }
@@ -239,6 +243,14 @@ fn parse_command(
 
     finish(cmd, path, &matches, positional_index)?;
     Ok(Step::Matches(matches))
+}
+
+fn is_negative_numeric_positional(token: &str) -> bool {
+    let Some(body) = token.strip_prefix('-') else {
+        return false;
+    };
+    let body = body.strip_suffix('%').unwrap_or(body);
+    !body.is_empty() && body.parse::<f32>().is_ok()
 }
 
 /// Parses a `--long` or `--long=value` token at `index`, returning the next

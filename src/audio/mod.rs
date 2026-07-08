@@ -27,10 +27,12 @@ pub use shared::{
     AudioStats, BufferRequest, CHANNELS, DEFAULT_DENOISE_RELEASE, DEFAULT_DENOISE_SUPPRESSION,
     DEFAULT_DENOISE_TYPING_RELEASE_MS, DEFAULT_DENOISE_TYPING_SUPPRESSION,
     DEFAULT_DENOISE_TYPING_VAD_ENTER, DEFAULT_DENOISE_TYPING_VAD_RELEASE,
-    DEFAULT_LIVE_MAX_AMPLIFICATION, DenoiseConfig, DenoiseSuppression, DenoiseTypingSuppression,
-    DredConfig, FRAME_SAMPLES, LiveAudioTuning, LiveEncoderProfile, LivePlaybackFeedback,
-    LivePlaybackSnapshot, LocalVoiceFrame, PlaybackSnapshot, PlaybackStats, PlaybackStreamControl,
+    DEFAULT_LIVE_MAX_AMPLIFICATION, DEFAULT_OUTPUT_VOLUME_PERCENT, DenoiseConfig,
+    DenoiseSuppression, DenoiseTypingSuppression, DredConfig, FRAME_SAMPLES, LiveAudioTuning,
+    LiveEncoderProfile, LivePlaybackFeedback, LivePlaybackSnapshot, LocalVoiceFrame,
+    MAX_OUTPUT_VOLUME_PERCENT, PlaybackSnapshot, PlaybackStats, PlaybackStreamControl,
     RemoteVoicePacket, SAMPLE_RATE, StatsSnapshot, VoicePayload, VoicePayloadRef,
+    normalize_output_volume_percent, output_volume_percent_to_gain,
 };
 pub use sim::{
     LiveAudioContentionBenchCondition, LiveAudioContentionBenchConfig,

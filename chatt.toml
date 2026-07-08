@@ -31,6 +31,8 @@ denoise-typing-vad-enter = 0.80
 denoise-typing-vad-release = 0.82
 input-buffer = "default"
 output-buffer = "default"
+# Global output volume, mpv-style percent: 100 is unchanged, max is 130.
+output-volume = 100
 
 [audio.latency]
 capture-silence-gate = true

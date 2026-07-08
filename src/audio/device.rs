@@ -4,7 +4,7 @@ use std::{
     str::FromStr,
     sync::{
         Arc,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicU32, AtomicUsize, Ordering},
         mpsc::{Receiver, SyncSender},
     },
     time::{Duration, Instant},
@@ -30,7 +30,8 @@ use crate::audio::{
     shared::{
         AudioStats, BufferRequest, CaptureCallbackTiming, CapturedAudioChunk, PlaybackStats,
         SAMPLE_RATE, audio_callback_logging_enabled, audio_pop_logging_enabled, duration_to_us,
-        optional_duration_to_us, peak_i16_scale, rms_i16_scale, samples_to_duration,
+        optional_duration_to_us, output_volume_percent_to_gain, peak_i16_scale, rms_i16_scale,
+        samples_to_duration,
     },
 };
 
@@ -1388,6 +1389,7 @@ pub(crate) fn build_live_output_stream(
     callback_buffer_observer: Option<Arc<AudioCallbackBufferObserver>>,
     device_rate: u32,
     playback_recorder: Option<LivePlaybackWavRecorderHandle>,
+    output_volume_percent: Arc<AtomicU32>,
 ) -> Result<Stream, String> {
     log_audio_stream_config("live playback", device, sample_format, &stream_config);
     let channels = CallbackChannelCount::new(channels, "live output")?;
@@ -1403,6 +1405,7 @@ pub(crate) fn build_live_output_stream(
             callback_buffer_observer,
             device_rate,
             playback_recorder,
+            output_volume_percent,
         ),
         SampleFormat::I16 => build_typed_live_output_stream::<i16>(
             device,
@@ -1415,6 +1418,7 @@ pub(crate) fn build_live_output_stream(
             callback_buffer_observer,
             device_rate,
             playback_recorder,
+            output_volume_percent,
         ),
         SampleFormat::I24 => build_typed_live_output_stream::<cpal::I24>(
             device,
@@ -1427,6 +1431,7 @@ pub(crate) fn build_live_output_stream(
             callback_buffer_observer,
             device_rate,
             playback_recorder,
+            output_volume_percent,
         ),
         SampleFormat::I32 => build_typed_live_output_stream::<i32>(
             device,
@@ -1439,6 +1444,7 @@ pub(crate) fn build_live_output_stream(
             callback_buffer_observer,
             device_rate,
             playback_recorder,
+            output_volume_percent,
         ),
         SampleFormat::I64 => build_typed_live_output_stream::<i64>(
             device,
@@ -1451,6 +1457,7 @@ pub(crate) fn build_live_output_stream(
             callback_buffer_observer,
             device_rate,
             playback_recorder,
+            output_volume_percent,
         ),
         SampleFormat::U8 => build_typed_live_output_stream::<u8>(
             device,
@@ -1463,6 +1470,7 @@ pub(crate) fn build_live_output_stream(
             callback_buffer_observer,
             device_rate,
             playback_recorder,
+            output_volume_percent,
         ),
         SampleFormat::U16 => build_typed_live_output_stream::<u16>(
             device,
@@ -1475,6 +1483,7 @@ pub(crate) fn build_live_output_stream(
             callback_buffer_observer,
             device_rate,
             playback_recorder,
+            output_volume_percent,
         ),
         SampleFormat::U24 => build_typed_live_output_stream::<cpal::U24>(
             device,
@@ -1487,6 +1496,7 @@ pub(crate) fn build_live_output_stream(
             callback_buffer_observer,
             device_rate,
             playback_recorder,
+            output_volume_percent,
         ),
         SampleFormat::U32 => build_typed_live_output_stream::<u32>(
             device,
@@ -1499,6 +1509,7 @@ pub(crate) fn build_live_output_stream(
             callback_buffer_observer,
             device_rate,
             playback_recorder,
+            output_volume_percent,
         ),
         SampleFormat::U64 => build_typed_live_output_stream::<u64>(
             device,
@@ -1511,6 +1522,7 @@ pub(crate) fn build_live_output_stream(
             callback_buffer_observer,
             device_rate,
             playback_recorder,
+            output_volume_percent,
         ),
         SampleFormat::F32 => build_typed_live_output_stream::<f32>(
             device,
@@ -1523,6 +1535,7 @@ pub(crate) fn build_live_output_stream(
             callback_buffer_observer,
             device_rate,
             playback_recorder,
+            output_volume_percent,
         ),
         SampleFormat::F64 => build_typed_live_output_stream::<f64>(
             device,
@@ -1535,6 +1548,7 @@ pub(crate) fn build_live_output_stream(
             callback_buffer_observer,
             device_rate,
             playback_recorder,
+            output_volume_percent,
         ),
         _ => Err(format!("unsupported output sample format: {sample_format}")),
     }
@@ -1551,6 +1565,7 @@ fn build_typed_live_output_stream<T>(
     callback_buffer_observer: Option<Arc<AudioCallbackBufferObserver>>,
     device_rate: u32,
     playback_recorder: Option<LivePlaybackWavRecorderHandle>,
+    output_volume_percent: Arc<AtomicU32>,
 ) -> Result<Stream, String>
 where
     T: Sample + cpal::SizedSample + FromSample<f32> + Send + 'static,
@@ -1607,6 +1622,9 @@ where
                     drain_live_playback_mixer_events(&mut mixer, &mixer_events, &mut pending_event);
                 let event_drain_duration = event_drain_start.elapsed();
                 let render_start = Instant::now();
+                let output_gain = output_volume_percent_to_gain(f32::from_bits(
+                    output_volume_percent.load(Ordering::Relaxed),
+                ));
                 live_playback_callback(
                     output,
                     channels,
@@ -1619,6 +1637,7 @@ where
                     device_rate,
                     now,
                     callback_timing,
+                    output_gain,
                 );
                 let render_duration = render_start.elapsed();
                 let total_duration = now.elapsed();
@@ -1716,6 +1735,7 @@ impl LivePlaybackCallbackBench {
             self.device_rate,
             now,
             LivePlaybackOutputCallbackTiming::default(),
+            1.0,
         );
         self.output
             .iter()
@@ -1898,6 +1918,7 @@ fn live_playback_callback<T>(
     device_rate: u32,
     now: Instant,
     callback_timing: LivePlaybackOutputCallbackTiming,
+    output_gain: f32,
 ) where
     T: Sample + FromSample<f32>,
 {
@@ -1909,9 +1930,10 @@ fn live_playback_callback<T>(
         _ => None,
     };
     match resampler.as_mut() {
-        // Non-48 kHz device: pull 48 kHz blocks from the mixer, resample each to
-        // the device rate. The echo reference still receives the pre-resample
-        // 48 kHz samples, so AEC keeps working against a 48 kHz render signal.
+        // Non-48 kHz device: pull 48 kHz blocks from the mixer, apply global
+        // output gain, then resample each to the device rate. The echo reference
+        // still receives 48 kHz samples, so AEC keeps working against a 48 kHz
+        // render signal.
         Some(resampler) => {
             let source_block = resampler.source_block_samples(output_frames);
             mixer.note_device_callback_frames(source_block);
@@ -1923,6 +1945,7 @@ fn live_playback_callback<T>(
                         .try_into()
                         .expect("playback resampler source block must be one mixer frame");
                     mixer.mix_10ms(block_start, block);
+                    apply_output_gain(block, output_gain);
                     for &mixed in block.iter() {
                         if let Some(writer) = echo_writer.as_mut() {
                             writer.push(mixed);
@@ -1945,7 +1968,7 @@ fn live_playback_callback<T>(
                 playback_record_block.resize(output_frames, 0.0);
             }
             for (index, frame) in output.chunks_mut(channels.get()).enumerate() {
-                let sample = mix_adapter.next_sample(mixer, now);
+                let sample = mix_adapter.next_sample(mixer, now) * output_gain;
                 if let Some(writer) = echo_writer.as_mut() {
                     writer.push(sample);
                 }
@@ -1966,6 +1989,15 @@ fn live_playback_callback<T>(
         writer.commit();
     }
     mixer.note_staged_samples(mix_adapter.staged_samples());
+}
+
+fn apply_output_gain(samples: &mut [f32], gain: f32) {
+    if (gain - 1.0).abs() < f32::EPSILON {
+        return;
+    }
+    for sample in samples {
+        *sample *= gain;
+    }
 }
 
 fn capture_callback<T>(
