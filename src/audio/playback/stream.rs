@@ -35,7 +35,6 @@ pub(crate) type SharedNetEqHandle = Arc<Mutex<SharedNetEqStream>>;
 
 /// Number of fixed 10 ms blocks reserved for one stream's assisted render ring.
 pub(crate) const NETEQ_RENDER_ASSIST_RING_BLOCKS: usize = 4;
-const NETEQ_RENDER_ASSIST_TARGET_BLOCKS: usize = 2;
 const NETEQ_RENDER_ASSIST_BURST_BLOCKS: usize = 16;
 const NETEQ_RENDER_ASSIST_TRIGGER_US: u64 = 750;
 
@@ -52,6 +51,12 @@ pub(crate) struct NetEqRenderAssist {
     /// the render ring stays empty and the staged output depth is never inflated.
     /// Gated by [`LiveAudioTuning::render_assist`].
     enabled: bool,
+    /// Quantum-aware reactive prefill target in 10 ms blocks, refreshed on the
+    /// worker drain cadence from the device callback size so a reactive arm
+    /// covers a full callback plus a speculation block rather than a fixed short
+    /// burst. Matches the predictive DRED path's target so both paths keep the
+    /// ring from underrunning mid-callback. See [`render_assist_target_samples`].
+    reactive_target_blocks: AtomicUsize,
     target_samples: AtomicUsize,
     blocks_remaining: AtomicUsize,
     requests: AtomicU64,
@@ -64,10 +69,28 @@ pub(crate) struct NetEqRenderAssist {
 
 impl NetEqRenderAssist {
     pub(crate) fn new(enabled: bool) -> Self {
-        Self {
+        let assist = Self {
             enabled,
             ..Self::default()
-        }
+        };
+        // Cover a full ring until the first worker drain reports the device
+        // callback size; the drain then refines this to the exact quantum.
+        assist
+            .reactive_target_blocks
+            .store(NETEQ_RENDER_ASSIST_RING_BLOCKS, Ordering::Relaxed);
+        assist
+    }
+
+    /// Refreshes the reactive prefill target from the worker's quantum-aware
+    /// block count so a slow-callback arm stages a full device callback plus a
+    /// speculation block. The predictive DRED path already uses this same target;
+    /// keeping the reactive path in step prevents the ring from underrunning
+    /// whenever the callback quantum exceeds the old fixed two-block burst.
+    pub(crate) fn set_reactive_target_blocks(&self, blocks: usize) {
+        self.reactive_target_blocks.store(
+            blocks.clamp(1, NETEQ_RENDER_ASSIST_RING_BLOCKS),
+            Ordering::Relaxed,
+        );
     }
 
     pub(crate) fn note_direct_render(&self, duration: Duration) {
@@ -76,7 +99,7 @@ impl NetEqRenderAssist {
         }
         if duration_to_us(duration) >= NETEQ_RENDER_ASSIST_TRIGGER_US {
             self.requests.fetch_add(1, Ordering::Relaxed);
-            self.request_prefill(NETEQ_RENDER_ASSIST_TARGET_BLOCKS);
+            self.request_prefill(self.reactive_target_blocks.load(Ordering::Relaxed));
         }
     }
 
@@ -513,6 +536,42 @@ mod tests {
         assert_eq!(stats.direct_samples, 2 * MIX_FRAME_SAMPLES as u64);
         let stats = stream.take_stats();
         assert_eq!(stats.direct_samples, 0, "take_stats drains the deltas");
+    }
+
+    #[test]
+    fn reactive_arm_targets_quantum_not_fixed_burst() {
+        let assist = NetEqRenderAssist::new(true);
+        // The worker reports a device callback that spans more than one 10 ms
+        // block; a reactive arm must stage the whole callback quantum plus a
+        // speculation block so the ring survives a full callback without an
+        // inline decode, matching the predictive DRED target.
+        assist.set_reactive_target_blocks(NETEQ_RENDER_ASSIST_RING_BLOCKS);
+        assist.note_direct_render(Duration::from_micros(NETEQ_RENDER_ASSIST_TRIGGER_US));
+        assert_eq!(
+            assist.prefill_target_samples(),
+            NETEQ_RENDER_ASSIST_RING_BLOCKS * MIX_FRAME_SAMPLES,
+            "reactive arm should target the quantum-aware block count"
+        );
+    }
+
+    #[test]
+    fn reactive_target_clamps_into_ring_capacity() {
+        let assist = NetEqRenderAssist::new(true);
+        assist.set_reactive_target_blocks(0);
+        assist.note_direct_render(Duration::from_micros(NETEQ_RENDER_ASSIST_TRIGGER_US));
+        assert_eq!(
+            assist.prefill_target_samples(),
+            MIX_FRAME_SAMPLES,
+            "a zero target floors at one block"
+        );
+        let assist = NetEqRenderAssist::new(true);
+        assist.set_reactive_target_blocks(NETEQ_RENDER_ASSIST_RING_BLOCKS + 5);
+        assist.note_direct_render(Duration::from_micros(NETEQ_RENDER_ASSIST_TRIGGER_US));
+        assert_eq!(
+            assist.prefill_target_samples(),
+            NETEQ_RENDER_ASSIST_RING_BLOCKS * MIX_FRAME_SAMPLES,
+            "an oversized target caps at the ring capacity"
+        );
     }
 
     #[test]
