@@ -348,6 +348,11 @@ pub struct LivePlaybackFeedback {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct LiveAudioTuning {
     pub capture_silence_gate: bool,
+    /// Opt-in NetEQ callback render assist (reactive slow-callback pre-render and
+    /// predictive DRED prefill). It trades a deeper staged output ring for compute
+    /// headroom, so it is only worthwhile on devices too slow to reliably render a
+    /// NetEQ block within the audio callback quantum. Off on capable hardware.
+    pub render_assist: bool,
     pub neteq_start_delay: Duration,
     pub neteq_min_delay: Duration,
     pub neteq_base_minimum_delay: Duration,
@@ -366,6 +371,7 @@ impl Default for LiveAudioTuning {
     fn default() -> Self {
         Self {
             capture_silence_gate: true,
+            render_assist: false,
             neteq_start_delay: LIVE_NETEQ_START_DELAY,
             neteq_min_delay: LIVE_NETEQ_MIN_DELAY,
             neteq_base_minimum_delay: Duration::ZERO,

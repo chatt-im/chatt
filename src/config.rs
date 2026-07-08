@@ -225,6 +225,8 @@ impl Default for AudioConfig {
 pub struct AudioLatencyConfig {
     #[toml(default = true)]
     pub capture_silence_gate: bool,
+    #[toml(default = false)]
+    pub render_assist: bool,
     #[toml(default = 60)]
     pub neteq_start_delay_ms: u64,
     #[toml(default = 20)]
@@ -256,6 +258,7 @@ impl Default for AudioLatencyConfig {
         let tuning = LiveAudioTuning::default();
         Self {
             capture_silence_gate: tuning.capture_silence_gate,
+            render_assist: tuning.render_assist,
             neteq_start_delay_ms: duration_ms(tuning.neteq_start_delay),
             neteq_min_delay_ms: duration_ms(tuning.neteq_min_delay),
             neteq_base_minimum_delay_ms: duration_ms(tuning.neteq_base_minimum_delay),
@@ -276,6 +279,7 @@ impl AudioLatencyConfig {
     pub fn to_tuning(&self) -> LiveAudioTuning {
         LiveAudioTuning {
             capture_silence_gate: self.capture_silence_gate,
+            render_assist: self.render_assist,
             neteq_start_delay: Duration::from_millis(self.neteq_start_delay_ms),
             neteq_min_delay: Duration::from_millis(self.neteq_min_delay_ms),
             neteq_base_minimum_delay: Duration::from_millis(self.neteq_base_minimum_delay_ms),

@@ -36,13 +36,13 @@ pub(crate) struct NetEqMixerSource {
 }
 
 impl NetEqMixerSource {
-    pub(crate) fn new(shared: SharedNetEqHandle) -> Self {
+    pub(crate) fn new(shared: SharedNetEqHandle, render_assist_enabled: bool) -> Self {
         Self {
             shared,
             render_ring: Arc::new(SampleRing::with_capacity(
                 MIX_FRAME_SAMPLES * NETEQ_RENDER_ASSIST_RING_BLOCKS,
             )),
-            assist: Arc::new(NetEqRenderAssist::default()),
+            assist: Arc::new(NetEqRenderAssist::new(render_assist_enabled)),
         }
     }
 }

@@ -47,6 +47,11 @@ const NETEQ_RENDER_ASSIST_TRIGGER_US: u64 = 750;
 /// complete 10 ms blocks and falls back to direct pull on underrun.
 #[derive(Default)]
 pub(crate) struct NetEqRenderAssist {
+    /// Whether callback render assist is armed at all. When false both the
+    /// reactive slow-callback path and the predictive DRED prefill are inert, so
+    /// the render ring stays empty and the staged output depth is never inflated.
+    /// Gated by [`LiveAudioTuning::render_assist`].
+    enabled: bool,
     target_samples: AtomicUsize,
     blocks_remaining: AtomicUsize,
     requests: AtomicU64,
@@ -58,7 +63,17 @@ pub(crate) struct NetEqRenderAssist {
 }
 
 impl NetEqRenderAssist {
+    pub(crate) fn new(enabled: bool) -> Self {
+        Self {
+            enabled,
+            ..Self::default()
+        }
+    }
+
     pub(crate) fn note_direct_render(&self, duration: Duration) {
+        if !self.enabled {
+            return;
+        }
         if duration_to_us(duration) >= NETEQ_RENDER_ASSIST_TRIGGER_US {
             self.requests.fetch_add(1, Ordering::Relaxed);
             self.request_prefill(NETEQ_RENDER_ASSIST_TARGET_BLOCKS);
@@ -66,6 +81,9 @@ impl NetEqRenderAssist {
     }
 
     pub(crate) fn request_predictive_prefill(&self, ring_depth: usize, target_blocks: usize) {
+        if !self.enabled {
+            return;
+        }
         self.finish_if_idle(ring_depth);
         let is_idle = self.target_samples.load(Ordering::Acquire) == 0
             && self.blocks_remaining.load(Ordering::Acquire) == 0;

@@ -905,7 +905,7 @@ pub(crate) struct LiveDecodeStream {
 impl LiveDecodeStream {
     pub(crate) fn new(tuning: LiveAudioTuning) -> Result<Self, String> {
         let shared = SharedNetEqStream::new(tuning)?;
-        let source = NetEqMixerSource::new(shared);
+        let source = NetEqMixerSource::new(shared, tuning.render_assist);
         let last_diagnostics = lock_shared_stream(&source.shared).diagnostics();
         Ok(Self {
             source,
@@ -1565,7 +1565,8 @@ mod tests {
     #[test]
     fn slow_callback_request_prefills_assist_ring() {
         let now = Instant::now();
-        let tuning = test_tuning();
+        let mut tuning = test_tuning();
+        tuning.render_assist = true;
         let mut streams = LiveDecodeStreams::new(tuning);
         let queue = SpscSwapQueue::<LivePlaybackMixerEvent>::with_capacity(8);
         let mut encoder = OpusVoiceEncoder::new(32_000).unwrap();
@@ -1605,7 +1606,8 @@ mod tests {
     #[test]
     fn dred_near_playout_predictively_prefills_assist_ring() {
         let now = Instant::now();
-        let tuning = test_tuning();
+        let mut tuning = test_tuning();
+        tuning.render_assist = true;
         let mut streams = LiveDecodeStreams::new(tuning);
         streams.playout_hints().note_block_samples(512);
         let queue = SpscSwapQueue::<LivePlaybackMixerEvent>::with_capacity(8);
