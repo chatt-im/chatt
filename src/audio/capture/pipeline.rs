@@ -1,7 +1,10 @@
-use std::sync::{
-    Arc,
-    atomic::{AtomicBool, AtomicU32, Ordering},
-    mpsc::{Receiver, SyncSender},
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicU32, Ordering},
+        mpsc::{Receiver, SyncSender},
+    },
+    time::Instant,
 };
 
 use nnnoiseless::DenoiseState;
@@ -19,14 +22,14 @@ use crate::{
         },
         resample::CaptureResampler,
         shared::{
-            AUDIO_POP_DELTA_THRESHOLD, AudioStats, DenoiseConfig, DenoiseSuppression,
-            DenoiseTypingSuppression, FRAME_SAMPLES, LIVE_CAPTURE_MUTE_FADE,
+            AUDIO_POP_DELTA_THRESHOLD, AudioStats, CapturedAudioChunk, DenoiseConfig,
+            DenoiseSuppression, DenoiseTypingSuppression, FRAME_SAMPLES, LIVE_CAPTURE_MUTE_FADE,
             LIVE_OPUS_FRAME_SAMPLES, LIVE_PACKET_FLAG_MUTE, LIVE_PACKET_FLAG_OPUS_RESET,
             LIVE_PACKET_FLAG_SILENCE_HINT, LIVE_PACKET_FLAG_SILENCE_RESUME, LiveAudioTuning,
             LiveEncoderProfile, LocalVoiceFrame, MAX_OPUS_PACKET_BYTES, VoicePayload,
             apply_gain_ramp, audio_pop_logging_enabled, convert_i16_scale_to_pcm_i16,
-            max_adjacent_delta, mute_gain_step, peak_normalized, rms_normalized,
-            samples_for_duration, vad_to_u8,
+            duration_to_us, max_adjacent_delta, mute_gain_step, optional_duration_to_us,
+            peak_normalized, rms_normalized, samples_for_duration, vad_to_u8,
         },
     },
     network::{EncoderNetworkProfile, EncoderNetworkTuning},
@@ -36,8 +39,13 @@ use crate::{
 const SILENCE_RESUME_HINT_PACKETS: u8 = 10;
 const SILENCE_KEEPALIVE_CAPTURE_FRAMES: usize = 100;
 
+fn device_samples_to_duration(samples: usize, device_rate: u32) -> std::time::Duration {
+    let nanos = samples as u128 * 1_000_000_000u128 / u128::from(device_rate.max(1));
+    std::time::Duration::from_nanos(nanos.min(u128::from(u64::MAX)) as u64)
+}
+
 pub(crate) fn run_encoder_worker(
-    receiver: Receiver<Vec<f32>>,
+    receiver: Receiver<CapturedAudioChunk>,
     recycle: SyncSender<Vec<f32>>,
     mut writer: PacketLogWriter<std::io::BufWriter<std::fs::File>>,
     mut encoder: OpusVoiceEncoder,
@@ -65,7 +73,7 @@ pub(crate) fn run_encoder_worker(
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn run_live_encoder_worker<F>(
-    receiver: Receiver<Vec<f32>>,
+    receiver: Receiver<CapturedAudioChunk>,
     recycle: SyncSender<Vec<f32>>,
     encoder: OpusVoiceEncoder,
     denoise: DenoiseConfig,
@@ -107,7 +115,7 @@ pub(crate) fn run_live_encoder_worker<F>(
 }
 
 pub(crate) fn run_encoder_worker_inner(
-    receiver: Receiver<Vec<f32>>,
+    receiver: Receiver<CapturedAudioChunk>,
     recycle: SyncSender<Vec<f32>>,
     writer: &mut PacketLogWriter<std::io::BufWriter<std::fs::File>>,
     encoder: &mut OpusVoiceEncoder,
@@ -127,6 +135,8 @@ pub(crate) fn run_encoder_worker_inner(
     let mut encoded = vec![0u8; MAX_OPUS_PACKET_BYTES];
 
     for chunk in receiver {
+        let CapturedAudioChunk { samples: chunk, .. } = chunk;
+        let _ = stats.note_capture_chunk_dequeued();
         let result = accumulator.push_chunk(&chunk, |frame| {
             high_pass.process(frame);
             if let Some(gain) = gain.as_mut() {
@@ -159,7 +169,7 @@ pub(crate) fn run_encoder_worker_inner(
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn run_live_encoder_worker_inner<F>(
-    receiver: Receiver<Vec<f32>>,
+    receiver: Receiver<CapturedAudioChunk>,
     recycle: SyncSender<Vec<f32>>,
     encoder: OpusVoiceEncoder,
     denoise: DenoiseConfig,
@@ -193,11 +203,29 @@ where
     let mut applied_loss_percent = LiveEncoderProfile::DRED_20.packet_loss_percent;
 
     for chunk in receiver {
+        let CapturedAudioChunk {
+            samples: chunk,
+            enqueued_at,
+            timing,
+            queue_depth_after_enqueue,
+        } = chunk;
+        let dequeued_at = Instant::now();
+        let queue_depth_after_dequeue = stats.note_capture_chunk_dequeued();
+        let queue_age = dequeued_at.saturating_duration_since(enqueued_at);
         let dropped_samples = stats.take_dropped_capture_samples();
         if dropped_samples > 0 {
             let gap = dropped_samples * u64::from(crate::audio::shared::SAMPLE_RATE)
                 / u64::from(device_rate.max(1));
             pipeline.note_capture_gap(gap as u32)?;
+            if audio_pop_logging_enabled() {
+                kvlog::info!(
+                    "audio pop capture dropped gap applied",
+                    callback_sequence = timing.callback_sequence,
+                    dropped_device_samples = dropped_samples,
+                    dropped_48k_samples = gap,
+                    device_rate
+                );
+            }
         }
         let requested_loss_percent = encoder_loss_percent.load(Ordering::Relaxed).min(100) as i32;
         if requested_loss_percent != applied_loss_percent {
@@ -207,13 +235,41 @@ where
             applied_loss_percent = requested_loss_percent;
         }
         let muted = mic_muted.load(Ordering::Relaxed) || deafened.load(Ordering::Relaxed);
+        let process_start = Instant::now();
+        let mut emitted_packets = 0u32;
         pipeline.push_chunk(
             &chunk,
             f32::from_bits(max_amplification_bits.load(Ordering::Relaxed)),
             muted,
             stats,
-            on_packet,
+            &mut |packet| {
+                emitted_packets = emitted_packets.wrapping_add(1);
+                on_packet(packet);
+            },
         )?;
+        let process_time = process_start.elapsed();
+        if audio_pop_logging_enabled() {
+            let expected_callback_delta_us =
+                duration_to_us(device_samples_to_duration(chunk.len(), device_rate));
+            kvlog::info!(
+                "audio pop capture chunk processed",
+                callback_sequence = timing.callback_sequence,
+                samples = chunk.len(),
+                device_rate,
+                expected_callback_delta_us,
+                callback_delta_us = optional_duration_to_us(timing.callback_delta),
+                cpal_callback_ns = timing.cpal_callback_ns,
+                cpal_capture_ns = timing.cpal_capture_ns,
+                cpal_callback_delta_us = optional_duration_to_us(timing.cpal_callback_delta),
+                cpal_capture_to_callback_us = duration_to_us(timing.cpal_capture_to_callback),
+                queue_age_us = duration_to_us(queue_age),
+                queue_depth_after_enqueue,
+                queue_depth_after_dequeue,
+                process_us = duration_to_us(process_time),
+                emitted_packets,
+                muted,
+            );
+        }
         let _ = recycle.try_send(chunk);
     }
 
@@ -477,6 +533,30 @@ impl LiveEncoderPipeline {
             .unwrap_or(CaptureGateDecision::TransmitCurrent {
                 silence_hint: false,
             });
+        if audio_pop_logging_enabled() {
+            let slot_start = self.next_capture_sample.wrapping_sub(FRAME_SAMPLES as u32);
+            let (decision_label, silence_hint, resume_frames) = match &decision {
+                CaptureGateDecision::TransmitCurrent { silence_hint } => {
+                    ("transmit", *silence_hint, 0usize)
+                }
+                CaptureGateDecision::SuppressCurrent => ("suppress", false, 0),
+                CaptureGateDecision::Resume(frames) => ("resume", false, frames.len()),
+            };
+            kvlog::info!(
+                "audio pop capture frame decision",
+                slot_start_sample = slot_start,
+                next_capture_sample = self.next_capture_sample,
+                decision = decision_label,
+                silence_hint,
+                resume_frames,
+                vad,
+                silence,
+                muted,
+                pending_opus_samples = self.pending_opus_samples.len(),
+                suppressed_frames = self.suppressed_frames,
+                sender_silence_active = self.sender_silence_active
+            );
+        }
         match decision {
             CaptureGateDecision::TransmitCurrent { silence_hint } => {
                 if silence_hint {
@@ -676,12 +756,25 @@ impl LiveEncoderPipeline {
             if self.silence_resume_hint_packets > 0 {
                 flags |= LIVE_PACKET_FLAG_SILENCE_RESUME;
             }
+            let encode_start = Instant::now();
             let payload = encode_live_frame(
                 &self.pending_opus_samples[..LIVE_OPUS_FRAME_SAMPLES],
                 &mut self.encoder,
                 &mut self.opus_frame,
                 &mut self.encoded,
             )?;
+            let encode_us = encode_start.elapsed().as_micros() as u64;
+            let timestamp = self.pending_start_sample;
+            if audio_pop_logging_enabled() {
+                kvlog::info!(
+                    "audio pop capture encoded packet timing",
+                    media_timestamp = timestamp,
+                    flags,
+                    payload_size = payload.len(),
+                    pending_opus_samples = self.pending_opus_samples.len(),
+                    encode_us
+                );
+            }
             if audio_pop_logging_enabled()
                 && (flags != 0
                     || self.mute_gain < 1.0
@@ -693,11 +786,13 @@ impl LiveEncoderPipeline {
                 kvlog::info!(
                     "audio pop capture encoded packet",
                     transition_id = self.mute_transition_id,
+                    media_timestamp = timestamp,
                     flags,
                     flag_opus_reset = flags & LIVE_PACKET_FLAG_OPUS_RESET != 0,
                     flag_silence_hint = flags & LIVE_PACKET_FLAG_SILENCE_HINT != 0,
                     flag_silence_resume = flags & LIVE_PACKET_FLAG_SILENCE_RESUME != 0,
                     flag_mute = flags & LIVE_PACKET_FLAG_MUTE != 0,
+                    encode_us,
                     mute_gain = self.mute_gain,
                     mute_suppressed = self.mute_suppressed,
                     packet_samples = LIVE_OPUS_FRAME_SAMPLES,
@@ -716,7 +811,6 @@ impl LiveEncoderPipeline {
             let packet_len = payload.len();
             self.sender_silence_active = false;
             self.silence_keepalive_frames = 0;
-            let timestamp = self.pending_start_sample;
             on_packet(LocalVoiceFrame {
                 flags,
                 payload,
@@ -764,9 +858,11 @@ impl LiveEncoderPipeline {
         }
         if entering_sender_silence && audio_pop_logging_enabled() {
             let flags = LIVE_PACKET_FLAG_SILENCE_HINT | extra_flags;
+            let timestamp = self.next_capture_sample.wrapping_sub(FRAME_SAMPLES as u32);
             kvlog::info!(
                 "audio pop capture silence marker",
                 transition_id = self.mute_transition_id,
+                media_timestamp = timestamp,
                 flags,
                 flag_silence_hint = flags & LIVE_PACKET_FLAG_SILENCE_HINT != 0,
                 flag_mute = flags & LIVE_PACKET_FLAG_MUTE != 0,
@@ -801,6 +897,7 @@ impl LiveEncoderPipeline {
             kvlog::info!(
                 "audio pop capture opus reset",
                 transition_id = self.mute_transition_id,
+                next_capture_sample = self.next_capture_sample,
                 mute_gain = self.mute_gain,
                 mute_suppressed = self.mute_suppressed
             );
@@ -1625,13 +1722,23 @@ mod tests {
         let device_rate = 24_000u32;
         stats.record_dropped_chunk(u64::from(device_rate));
 
-        let (sender, receiver) = sync_channel::<Vec<f32>>(64);
+        let (sender, receiver) = sync_channel::<CapturedAudioChunk>(64);
         let (recycle_sender, _recycle_receiver) = sync_channel::<Vec<f32>>(64);
         let tone: Vec<f32> = (0..device_rate as usize / 100)
             .map(|n| (n as f32 * 0.07).sin() * 8_000.0)
             .collect();
-        for _ in 0..24 {
-            sender.send(tone.clone()).unwrap();
+        for sequence in 0..24 {
+            sender
+                .send(CapturedAudioChunk::new(
+                    tone.clone(),
+                    Instant::now(),
+                    crate::audio::shared::CaptureCallbackTiming {
+                        callback_sequence: sequence,
+                        ..crate::audio::shared::CaptureCallbackTiming::default()
+                    },
+                    0,
+                ))
+                .unwrap();
         }
         drop(sender);
 

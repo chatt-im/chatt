@@ -35,8 +35,8 @@ use crate::{
             LivePlaybackSharedSnapshot, SpscSwapQueue, run_live_decoder_worker,
         },
         shared::{
-            AudioStats, BufferRequest, CALLBACK_QUEUE_CAPACITY, CHANNELS, DenoiseConfig,
-            DenoiseSuppression, DenoiseTypingSuppression, DredConfig, FRAME_SAMPLES,
+            AudioStats, BufferRequest, CALLBACK_QUEUE_CAPACITY, CHANNELS, CapturedAudioChunk,
+            DenoiseConfig, DenoiseSuppression, DenoiseTypingSuppression, DredConfig, FRAME_SAMPLES,
             LIVE_PLAYBACK_COMMAND_CAPACITY, LiveAudioTuning, LiveEncoderProfile,
             LivePlaybackFeedback, LivePlaybackSnapshot, LocalVoiceFrame, PlaybackSnapshot,
             PlaybackStats, PlaybackStreamControl, RemoteVoicePacket, SAMPLE_RATE, StatsSnapshot,
@@ -585,7 +585,10 @@ where
     // after a stream builds so a fallback attempt uses a fresh channel. Audio must never
     // die because a buffer preference was rejected.
     let observer = Arc::new(AudioCallbackBufferObserver::new("live_capture"));
-    let build = |selection: &ConfigSelection| -> Result<(Stream, Receiver<Vec<f32>>, SyncSender<Vec<f32>>), String> {
+    let build = |selection: &ConfigSelection| -> Result<
+        (Stream, Receiver<CapturedAudioChunk>, SyncSender<Vec<f32>>),
+        String,
+    > {
         let (sender, receiver) = sync_channel(CALLBACK_QUEUE_CAPACITY);
         let (recycle_tx, recycle_rx) = sync_channel(CALLBACK_QUEUE_CAPACITY);
         let stream = with_audio_backend_stderr_suppressed(|| {

@@ -2619,6 +2619,7 @@ impl WorkerState {
                             route = "server",
                             stream_id = stream_id.0,
                             sequence,
+                            media_timestamp = timestamp,
                             flags,
                             payload_size,
                             payload_kind
@@ -2628,6 +2629,7 @@ impl WorkerState {
                             "server",
                             stream_id.0,
                             sequence,
+                            timestamp,
                             flags,
                             payload_size,
                             payload_kind,
@@ -2702,6 +2704,7 @@ impl WorkerState {
     fn dispatch_voice_packet(&mut self, packet: RemoteVoicePacket, route: &'static str) {
         let stream_id = packet.stream_id;
         let sequence = packet.sequence;
+        let timestamp = packet.timestamp;
         let flags = packet.flags;
         let payload_size = packet.payload.len();
         let payload_kind = voice_payload_kind(&packet.payload);
@@ -2712,6 +2715,7 @@ impl WorkerState {
                     route,
                     stream_id,
                     sequence,
+                    media_timestamp = timestamp,
                     flags,
                     payload_size,
                     payload_kind
@@ -2723,6 +2727,7 @@ impl WorkerState {
                     route,
                     stream_id,
                     sequence,
+                    media_timestamp = timestamp,
                     flags,
                     payload_size,
                     payload_kind
@@ -2735,6 +2740,7 @@ impl WorkerState {
                     route,
                     stream_id,
                     sequence,
+                    media_timestamp = timestamp,
                     flags,
                     payload_size,
                     payload_kind
@@ -2980,6 +2986,7 @@ impl WorkerState {
             "voice packet sent",
             stream_id = stream_id.0,
             sequence,
+            media_timestamp = timestamp,
             flags = frame.flags,
             payload_size = frame.payload.len(),
             payload_kind = voice_payload_kind(&frame.payload)
@@ -2989,6 +2996,7 @@ impl WorkerState {
             "local",
             stream_id.0,
             sequence,
+            timestamp,
             frame.flags,
             frame.payload.len(),
             voice_payload_kind(&frame.payload),
@@ -4903,6 +4911,7 @@ impl WorkerState {
                     route = "p2p",
                     stream_id = stream_id.0,
                     sequence,
+                    media_timestamp = timestamp,
                     flags,
                     payload_size,
                     payload_kind
@@ -4912,6 +4921,7 @@ impl WorkerState {
                     "p2p",
                     stream_id.0,
                     sequence,
+                    timestamp,
                     flags,
                     payload_size,
                     payload_kind,
@@ -5637,6 +5647,7 @@ fn log_audio_pop_media_packet(
     route: &'static str,
     stream_id: u32,
     sequence: u32,
+    timestamp: u32,
     flags: u8,
     payload_size: usize,
     payload_kind: &'static str,
@@ -5650,6 +5661,7 @@ fn log_audio_pop_media_packet(
         route,
         stream_id,
         sequence,
+        media_timestamp = timestamp,
         flags,
         flag_opus_reset = flags & AUDIO_POP_PACKET_FLAG_OPUS_RESET != 0,
         flag_silence_hint = flags & AUDIO_POP_PACKET_FLAG_SILENCE_HINT != 0,

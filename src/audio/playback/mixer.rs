@@ -24,6 +24,7 @@ const LIVE_PLAYBACK_BACKEND_ERROR_LOG_INTERVAL: Duration = Duration::from_secs(1
 const LIVE_PLAYBACK_PREALLOCATED_STREAMS: usize = 32;
 const LIVE_PLAYBACK_CALLBACK_RENDER_RECORDS: usize = LIVE_PLAYBACK_PREALLOCATED_STREAMS * 4;
 const LIVE_PLAYBACK_SLOW_CALLBACK_LOG_THRESHOLD: Duration = Duration::from_micros(500);
+const LIVE_PLAYBACK_PLAYOUT_LOG_INTERVAL_BLOCKS: u64 = 100;
 /// Linear declick ramp length applied to each stream's output envelope. 5 ms at
 /// the mixer's fixed 48 kHz domain (the device resampler runs after the mixer) =
 /// 240 samples: long enough to kill boundary clicks at speech onset/offset, short
@@ -89,6 +90,20 @@ pub(crate) struct LivePlaybackMixer {
     callback_render_records: Vec<CallbackRenderRecord>,
     callback_render_records_dropped: u64,
     callback_render_blocks: u64,
+    current_callback_timing: LivePlaybackOutputCallbackTiming,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct LivePlaybackOutputCallbackTiming {
+    pub callback_sequence: u64,
+    pub callback_delta: Option<Duration>,
+    pub cpal_callback_ns: u64,
+    pub cpal_playback_ns: u64,
+    pub cpal_callback_delta: Option<Duration>,
+    pub cpal_callback_to_playback: Duration,
+    pub output_frames: usize,
+    pub device_rate: u32,
+    pub expected_callback_delta: Duration,
 }
 
 /// One stream's contribution to the block being mixed.
@@ -203,6 +218,7 @@ impl LivePlaybackMixer {
             callback_render_records: Vec::with_capacity(LIVE_PLAYBACK_CALLBACK_RENDER_RECORDS),
             callback_render_records_dropped: 0,
             callback_render_blocks: 0,
+            current_callback_timing: LivePlaybackOutputCallbackTiming::default(),
         }
     }
 
@@ -231,10 +247,18 @@ impl LivePlaybackMixer {
     }
 
     pub(crate) fn begin_output_callback(&mut self) {
+        self.begin_output_callback_with_timing(LivePlaybackOutputCallbackTiming::default());
+    }
+
+    pub(crate) fn begin_output_callback_with_timing(
+        &mut self,
+        timing: LivePlaybackOutputCallbackTiming,
+    ) {
         self.callback_source_cursor = 0;
         self.callback_render_records.clear();
         self.callback_render_records_dropped = 0;
         self.callback_render_blocks = 0;
+        self.current_callback_timing = timing;
     }
 
     fn callback_block_time(&self, callback_start: Instant) -> Instant {
@@ -390,14 +414,24 @@ impl LivePlaybackMixer {
             hints.note_callback(duration, period, mixer_events_drained);
         }
         if audio_callback_logging_enabled() {
+            let timing = self.current_callback_timing;
             kvlog::info!(
                 "callback",
+                callback_sequence = timing.callback_sequence,
                 us = duration_us(duration),
                 total_us = duration_us(duration),
                 render_us = duration_us(render_duration),
                 event_drain_us = duration_us(event_drain_duration),
                 period_us = duration_us(period),
+                expected_callback_delta_us = duration_us(timing.expected_callback_delta),
+                callback_delta_us = timing.callback_delta.map(duration_us),
+                cpal_callback_ns = timing.cpal_callback_ns,
+                cpal_playback_ns = timing.cpal_playback_ns,
+                cpal_callback_delta_us = timing.cpal_callback_delta.map(duration_us),
+                cpal_callback_to_playback_us = duration_us(timing.cpal_callback_to_playback),
                 output_frames = output_frames as u64,
+                timing_output_frames = timing.output_frames as u64,
+                device_rate = timing.device_rate,
                 staged_samples = staged_samples as u64,
                 mixer_events_drained,
                 active_streams = self.streams.len() as u64,
@@ -1021,6 +1055,7 @@ impl LivePlaybackMixer {
         if out.is_empty() {
             return;
         }
+        self.log_playout_block_if_due(block, out);
         let first_sample = out[0];
         let first_delta = if self.has_last_output_sample {
             (first_sample - self.last_output_sample).abs()
@@ -1031,9 +1066,19 @@ impl LivePlaybackMixer {
         if audio_pop_logging_enabled()
             && (first_delta >= AUDIO_POP_DELTA_THRESHOLD || max_delta >= AUDIO_POP_DELTA_THRESHOLD)
         {
+            let timing = self.current_callback_timing;
             kvlog::info!(
                 "audio pop mixer output block",
                 block_index = self.output_block_index,
+                callback_sequence = timing.callback_sequence,
+                callback_delta_us = timing.callback_delta.map(duration_us),
+                expected_callback_delta_us = duration_us(timing.expected_callback_delta),
+                cpal_callback_ns = timing.cpal_callback_ns,
+                cpal_playback_ns = timing.cpal_playback_ns,
+                cpal_callback_delta_us = timing.cpal_callback_delta.map(duration_us),
+                cpal_callback_to_playback_us = duration_us(timing.cpal_callback_to_playback),
+                output_frames = timing.output_frames as u64,
+                device_rate = timing.device_rate,
                 block_samples = block,
                 frames = out.len(),
                 first_delta,
@@ -1050,6 +1095,89 @@ impl LivePlaybackMixer {
         self.last_output_sample = out.last().copied().unwrap_or_default();
         self.has_last_output_sample = true;
         self.output_block_index = self.output_block_index.wrapping_add(1);
+    }
+
+    fn log_playout_block_if_due(&self, block: usize, out: &[f32]) {
+        if !audio_pop_logging_enabled()
+            || self.streams.is_empty()
+            || self.output_block_index % LIVE_PLAYBACK_PLAYOUT_LOG_INTERVAL_BLOCKS != 0
+        {
+            return;
+        }
+        let timing = self.current_callback_timing;
+        kvlog::info!(
+            "audio pop playback playout block",
+            block_index = self.output_block_index,
+            callback_sequence = timing.callback_sequence,
+            callback_delta_us = timing.callback_delta.map(duration_us),
+            expected_callback_delta_us = duration_us(timing.expected_callback_delta),
+            cpal_callback_ns = timing.cpal_callback_ns,
+            cpal_playback_ns = timing.cpal_playback_ns,
+            cpal_callback_delta_us = timing.cpal_callback_delta.map(duration_us),
+            cpal_callback_to_playback_us = duration_us(timing.cpal_callback_to_playback),
+            output_frames = timing.output_frames as u64,
+            device_rate = timing.device_rate,
+            block_samples = block,
+            frames = out.len(),
+            rms = rms_normalized(out),
+            peak = peak_normalized(out),
+            active_streams = self.streams.len() as u64,
+            backend_xruns = self.backend_xruns
+        );
+        self.log_playout_stream_records();
+    }
+
+    fn log_playout_stream_records(&self) {
+        for record in &self.render_records {
+            let Some(stream) = self.streams.get(&record.stream_id) else {
+                continue;
+            };
+            match &stream.source {
+                ConsumerSource::NetEq(source) => {
+                    let diagnostics = lock_shared_stream(&source.source.shared).diagnostics();
+                    let rendered_media_timestamp = diagnostics
+                        .playout_media_timestamp
+                        .wrapping_sub(MIX_FRAME_SAMPLES as u32);
+                    kvlog::info!(
+                        "audio pop playback playout stream",
+                        block_index = self.output_block_index,
+                        callback_sequence = self.current_callback_timing.callback_sequence,
+                        stream_id = record.stream_id,
+                        active = record.frame_index.is_some(),
+                        rendered_media_timestamp,
+                        playout_media_timestamp = diagnostics.playout_media_timestamp,
+                        next_packet_media_timestamp = diagnostics.next_packet_media_timestamp,
+                        next_packet_gap_ms = diagnostics.next_packet_gap_ms,
+                        target_ms = diagnostics.target_ms,
+                        playout_delay_ms = diagnostics.playout_delay_ms,
+                        sync_buffer_ms = diagnostics.sync_buffer_ms,
+                        packet_buffer_ms = diagnostics.packet_buffer_ms,
+                        packet_buffer_wait_ms = diagnostics.packet_buffer_wait_ms,
+                        packets_buffered = diagnostics.packets_buffered as u64,
+                        decision = diagnostics.operation,
+                        reason = diagnostics.reason,
+                        declick_start = record.declick_start,
+                        declick_end = record.declick_end,
+                        control_muted = stream.control.muted,
+                        volume_db = stream.control.volume_db
+                    );
+                }
+                ConsumerSource::Ring(_) => {
+                    kvlog::info!(
+                        "audio pop playback playout stream",
+                        block_index = self.output_block_index,
+                        callback_sequence = self.current_callback_timing.callback_sequence,
+                        stream_id = record.stream_id,
+                        active = record.frame_index.is_some(),
+                        source_kind = "ring",
+                        declick_start = record.declick_start,
+                        declick_end = record.declick_end,
+                        control_muted = stream.control.muted,
+                        volume_db = stream.control.volume_db
+                    );
+                }
+            }
+        }
     }
 
     /// Emits one attribution record per stream for the block that tripped the
@@ -1077,6 +1205,9 @@ impl LivePlaybackMixer {
             match (&stream.source, record.neteq) {
                 (ConsumerSource::NetEq(source), Some(result)) => {
                     let diagnostics = lock_shared_stream(&source.source.shared).diagnostics();
+                    let rendered_media_timestamp = diagnostics
+                        .playout_media_timestamp
+                        .wrapping_sub(MIX_FRAME_SAMPLES as u32);
                     kvlog::info!(
                         "audio pop stream block",
                         block_index = self.output_block_index,
@@ -1097,7 +1228,10 @@ impl LivePlaybackMixer {
                         decision = diagnostics.operation,
                         reason = diagnostics.reason,
                         target_ms = diagnostics.target_ms,
+                        rendered_media_timestamp,
+                        playout_media_timestamp = diagnostics.playout_media_timestamp,
                         playout_delay_ms = diagnostics.playout_delay_ms,
+                        next_packet_media_timestamp = diagnostics.next_packet_media_timestamp,
                         sync_buffer_ms = diagnostics.sync_buffer_ms,
                         packet_buffer_ms = diagnostics.packet_buffer_ms,
                         packet_buffer_wait_ms = diagnostics.packet_buffer_wait_ms,
@@ -1107,6 +1241,9 @@ impl LivePlaybackMixer {
                 }
                 (ConsumerSource::NetEq(source), None) => {
                     let diagnostics = lock_shared_stream(&source.source.shared).diagnostics();
+                    let rendered_media_timestamp = diagnostics
+                        .playout_media_timestamp
+                        .wrapping_sub(MIX_FRAME_SAMPLES as u32);
                     kvlog::info!(
                         "audio pop stream block",
                         block_index = self.output_block_index,
@@ -1124,7 +1261,10 @@ impl LivePlaybackMixer {
                         decision = diagnostics.operation,
                         reason = diagnostics.reason,
                         target_ms = diagnostics.target_ms,
+                        rendered_media_timestamp,
+                        playout_media_timestamp = diagnostics.playout_media_timestamp,
                         playout_delay_ms = diagnostics.playout_delay_ms,
+                        next_packet_media_timestamp = diagnostics.next_packet_media_timestamp,
                         sync_buffer_ms = diagnostics.sync_buffer_ms,
                         packet_buffer_ms = diagnostics.packet_buffer_ms,
                         packet_buffer_wait_ms = diagnostics.packet_buffer_wait_ms,

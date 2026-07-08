@@ -23,13 +23,14 @@ use crate::audio::{
     diagnostics::LivePlaybackWavRecorderHandle,
     errors::{AudioErrorKind, AudioStartError},
     playback::{
-        LivePlaybackMixer, LivePlaybackMixerEvent, LivePlaybackSharedSnapshot, MIX_FRAME_SAMPLES,
-        SpscSwapQueue,
+        LivePlaybackMixer, LivePlaybackMixerEvent, LivePlaybackOutputCallbackTiming,
+        LivePlaybackSharedSnapshot, MIX_FRAME_SAMPLES, SpscSwapQueue,
     },
     resample::PlaybackResampler,
     shared::{
-        AudioStats, BufferRequest, PlaybackStats, SAMPLE_RATE, audio_callback_logging_enabled,
-        audio_pop_logging_enabled, peak_i16_scale, rms_i16_scale, samples_to_duration,
+        AudioStats, BufferRequest, CaptureCallbackTiming, CapturedAudioChunk, PlaybackStats,
+        SAMPLE_RATE, audio_callback_logging_enabled, audio_pop_logging_enabled, duration_to_us,
+        optional_duration_to_us, peak_i16_scale, rms_i16_scale, samples_to_duration,
     },
 };
 
@@ -1004,6 +1005,60 @@ pub(crate) fn audio_buffer_size_label(buffer_size: BufferSize) -> String {
     }
 }
 
+fn audio_timing_logging_enabled() -> bool {
+    audio_pop_logging_enabled() || audio_callback_logging_enabled()
+}
+
+fn buffer_size_fixed_frames(buffer_size: BufferSize) -> Option<u32> {
+    match buffer_size {
+        BufferSize::Fixed(frames) => Some(frames),
+        BufferSize::Default | BufferSize::TargetLatency(_) => None,
+    }
+}
+
+fn buffer_size_target_latency_ms(buffer_size: BufferSize) -> Option<u64> {
+    match buffer_size {
+        BufferSize::TargetLatency(target) => {
+            Some(target.as_millis().min(u128::from(u64::MAX)) as u64)
+        }
+        BufferSize::Default | BufferSize::Fixed(_) => None,
+    }
+}
+
+fn stream_instant_ns(instant: cpal::StreamInstant) -> u64 {
+    instant.as_nanos().min(u128::from(u64::MAX)) as u64
+}
+
+fn device_callback_period_us(frames: usize, device_rate: u32) -> u64 {
+    duration_to_us(callback_period(frames, device_rate))
+}
+
+fn log_audio_stream_config(
+    direction: &'static str,
+    device: &cpal::Device,
+    sample_format: SampleFormat,
+    stream_config: &StreamConfig,
+) {
+    if !audio_timing_logging_enabled() {
+        return;
+    }
+    let device_name = device.to_string();
+    let sample_format = sample_format.to_string();
+    let buffer_size = audio_buffer_size_label(stream_config.buffer_size);
+    kvlog::info!(
+        "audio stream config",
+        direction,
+        host = cpal::default_host().id().name(),
+        device_name = device_name.as_str(),
+        sample_format = sample_format.as_str(),
+        channels = stream_config.channels,
+        sample_rate = stream_config.sample_rate,
+        buffer_size = buffer_size.as_str(),
+        buffer_size_fixed_frames = buffer_size_fixed_frames(stream_config.buffer_size),
+        buffer_size_target_latency_ms = buffer_size_target_latency_ms(stream_config.buffer_size)
+    );
+}
+
 #[derive(Clone, Copy, Debug)]
 struct CallbackChannelCount(NonZeroUsize);
 
@@ -1036,7 +1091,12 @@ impl AudioCallbackBufferObserver {
         }
     }
 
-    fn observe(&self, interleaved_samples: usize, channels: CallbackChannelCount) {
+    fn observe(
+        &self,
+        interleaved_samples: usize,
+        channels: CallbackChannelCount,
+        device_rate: u32,
+    ) {
         let frames = channels.frames_for_interleaved(interleaved_samples);
         let previous = self.last_frames.swap(frames, Ordering::Relaxed);
         if previous == frames {
@@ -1050,7 +1110,8 @@ impl AudioCallbackBufferObserver {
             "live audio callback buffer observed",
             direction = self.direction,
             observed_buffer_frames = frames,
-            observed_buffer_ms = frames as f64 * 1000.0 / SAMPLE_RATE as f64,
+            observed_buffer_ms = frames as f64 * 1000.0 / f64::from(device_rate.max(1)),
+            device_rate,
             channels = channels.get(),
             interleaved_samples = interleaved_samples,
             changed = previous != usize::MAX
@@ -1063,11 +1124,12 @@ pub(crate) fn build_input_stream(
     sample_format: SampleFormat,
     stream_config: StreamConfig,
     channels: usize,
-    sender: SyncSender<Vec<f32>>,
+    sender: SyncSender<CapturedAudioChunk>,
     recycle: Receiver<Vec<f32>>,
     stats: AudioStats,
     callback_buffer_observer: Option<Arc<AudioCallbackBufferObserver>>,
 ) -> Result<Stream, String> {
+    log_audio_stream_config("capture", device, sample_format, &stream_config);
     let channels = CallbackChannelCount::new(channels, "input")?;
     match sample_format {
         SampleFormat::I8 => build_typed_input_stream::<i8>(
@@ -1186,7 +1248,7 @@ fn build_typed_input_stream<T>(
     device: &cpal::Device,
     stream_config: StreamConfig,
     channels: CallbackChannelCount,
-    sender: SyncSender<Vec<f32>>,
+    sender: SyncSender<CapturedAudioChunk>,
     recycle: Receiver<Vec<f32>>,
     stats: AudioStats,
     callback_buffer_observer: Option<Arc<AudioCallbackBufferObserver>>,
@@ -1199,15 +1261,49 @@ where
     let error_stats = stats.clone();
     let _ = audio_pop_logging_enabled();
     let _ = audio_callback_logging_enabled();
+    let device_rate = stream_config.sample_rate;
+    let mut callback_sequence = 0u64;
+    let mut last_callback_at: Option<Instant> = None;
+    let mut last_cpal_callback_at: Option<cpal::StreamInstant> = None;
     device
         .build_input_stream(
             stream_config,
-            move |input: &[T], _| {
+            move |input: &[T], info| {
+                let callback_at = Instant::now();
+                let callback_delta =
+                    last_callback_at.map(|last| callback_at.saturating_duration_since(last));
+                last_callback_at = Some(callback_at);
+                let cpal_timestamp = info.timestamp();
+                let cpal_callback_delta = last_cpal_callback_at
+                    .map(|last| cpal_timestamp.callback.saturating_duration_since(last));
+                last_cpal_callback_at = Some(cpal_timestamp.callback);
+                let cpal_capture_to_callback = cpal_timestamp
+                    .callback
+                    .saturating_duration_since(cpal_timestamp.capture);
+                let sequence = callback_sequence;
+                callback_sequence = callback_sequence.wrapping_add(1);
                 if let Some(observer) = callback_buffer_observer.as_ref() {
-                    observer.observe(input.len(), channels);
+                    observer.observe(input.len(), channels, device_rate);
                 }
+                let timing = CaptureCallbackTiming {
+                    callback_sequence: sequence,
+                    callback_delta,
+                    cpal_callback_ns: stream_instant_ns(cpal_timestamp.callback),
+                    cpal_capture_ns: stream_instant_ns(cpal_timestamp.capture),
+                    cpal_callback_delta,
+                    cpal_capture_to_callback,
+                };
                 let mono = recycle.try_recv().unwrap_or_default();
-                capture_callback(input, channels, mono, &sender, &data_stats);
+                capture_callback(
+                    input,
+                    channels,
+                    mono,
+                    &sender,
+                    &data_stats,
+                    callback_at,
+                    timing,
+                    device_rate,
+                );
             },
             move |error| {
                 if error.kind() == ErrorKind::RealtimeDenied && audio_callback_logging_enabled() {
@@ -1237,6 +1333,7 @@ pub(crate) fn build_output_stream(
     samples: Arc<Vec<i16>>,
     stats: PlaybackStats,
 ) -> Result<Stream, String> {
+    log_audio_stream_config("playback", device, sample_format, &stream_config);
     let channels = CallbackChannelCount::new(channels, "output")?;
     match sample_format {
         SampleFormat::I8 => {
@@ -1292,6 +1389,7 @@ pub(crate) fn build_live_output_stream(
     device_rate: u32,
     playback_recorder: Option<LivePlaybackWavRecorderHandle>,
 ) -> Result<Stream, String> {
+    log_audio_stream_config("live playback", device, sample_format, &stream_config);
     let channels = CallbackChannelCount::new(channels, "live output")?;
     match sample_format {
         SampleFormat::I8 => build_typed_live_output_stream::<i8>(
@@ -1467,14 +1565,43 @@ where
     let mut pending_event = LivePlaybackMixerEvent::default();
     let mut mix_adapter = LivePlaybackMixAdapter::new();
     let mut playback_record_block = Vec::with_capacity(SAMPLE_RATE as usize);
+    let mut callback_sequence = 0u64;
+    let mut last_callback_at: Option<Instant> = None;
+    let mut last_cpal_callback_at: Option<cpal::StreamInstant> = None;
     device
         .build_output_stream(
             stream_config,
-            move |output: &mut [T], _| {
+            move |output: &mut [T], info| {
+                let callback_at = Instant::now();
+                let callback_delta =
+                    last_callback_at.map(|last| callback_at.saturating_duration_since(last));
+                last_callback_at = Some(callback_at);
+                let cpal_timestamp = info.timestamp();
+                let cpal_callback_delta = last_cpal_callback_at
+                    .map(|last| cpal_timestamp.callback.saturating_duration_since(last));
+                last_cpal_callback_at = Some(cpal_timestamp.callback);
+                let cpal_callback_to_playback = cpal_timestamp
+                    .playback
+                    .saturating_duration_since(cpal_timestamp.callback);
+                let sequence = callback_sequence;
+                callback_sequence = callback_sequence.wrapping_add(1);
                 if let Some(observer) = callback_buffer_observer.as_ref() {
-                    observer.observe(output.len(), channels);
+                    observer.observe(output.len(), channels, device_rate);
                 }
-                let now = Instant::now();
+                let now = callback_at;
+                let output_frames = channels.frames_for_interleaved(output.len());
+                let expected_callback_delta = callback_period(output_frames, device_rate);
+                let callback_timing = LivePlaybackOutputCallbackTiming {
+                    callback_sequence: sequence,
+                    callback_delta,
+                    cpal_callback_ns: stream_instant_ns(cpal_timestamp.callback),
+                    cpal_playback_ns: stream_instant_ns(cpal_timestamp.playback),
+                    cpal_callback_delta,
+                    cpal_callback_to_playback,
+                    output_frames,
+                    device_rate,
+                    expected_callback_delta,
+                };
                 let event_drain_start = Instant::now();
                 let drained_events =
                     drain_live_playback_mixer_events(&mut mixer, &mixer_events, &mut pending_event);
@@ -1491,14 +1618,14 @@ where
                     resampler.as_mut(),
                     device_rate,
                     now,
+                    callback_timing,
                 );
                 let render_duration = render_start.elapsed();
                 let total_duration = now.elapsed();
-                let output_frames = channels.frames_for_interleaved(output.len());
                 let staged_samples = mix_adapter.staged_samples();
                 mixer.note_callback_metrics(
                     total_duration,
-                    callback_period(output_frames, device_rate),
+                    expected_callback_delta,
                     drained_events,
                     event_drain_duration,
                     render_duration,
@@ -1588,6 +1715,7 @@ impl LivePlaybackCallbackBench {
             None,
             self.device_rate,
             now,
+            LivePlaybackOutputCallbackTiming::default(),
         );
         self.output
             .iter()
@@ -1769,10 +1897,11 @@ fn live_playback_callback<T>(
     mut resampler: Option<&mut PlaybackResampler>,
     device_rate: u32,
     now: Instant,
+    callback_timing: LivePlaybackOutputCallbackTiming,
 ) where
     T: Sample + FromSample<f32>,
 {
-    mixer.begin_output_callback();
+    mixer.begin_output_callback_with_timing(callback_timing);
     let output_frames = channels.frames_for_interleaved(output.len());
     mix_adapter.begin_callback();
     let mut echo_writer = match echo_control {
@@ -1843,8 +1972,11 @@ fn capture_callback<T>(
     input: &[T],
     channels: CallbackChannelCount,
     mut mono: Vec<f32>,
-    sender: &SyncSender<Vec<f32>>,
+    sender: &SyncSender<CapturedAudioChunk>,
     stats: &AudioStats,
+    callback_at: Instant,
+    timing: CaptureCallbackTiming,
+    device_rate: u32,
 ) where
     T: Sample,
     f32: FromSample<T>,
@@ -1855,13 +1987,53 @@ fn capture_callback<T>(
     let peak = peak_i16_scale(&mono);
     stats.record_capture_callback(samples, rms, peak);
 
-    if sender.try_send(mono).is_err() {
+    let queue_depth_after_enqueue = stats.note_capture_chunk_enqueued();
+    let expected_callback_delta_us = device_callback_period_us(samples as usize, device_rate);
+    let chunk = CapturedAudioChunk::new(mono, callback_at, timing, queue_depth_after_enqueue);
+    if sender.try_send(chunk).is_ok() {
+        if audio_callback_logging_enabled() {
+            kvlog::info!(
+                "capture callback chunk queued",
+                callback_sequence = timing.callback_sequence,
+                samples,
+                device_rate,
+                expected_callback_delta_us,
+                callback_delta_us = optional_duration_to_us(timing.callback_delta),
+                cpal_callback_ns = timing.cpal_callback_ns,
+                cpal_capture_ns = timing.cpal_capture_ns,
+                cpal_callback_delta_us = optional_duration_to_us(timing.cpal_callback_delta),
+                cpal_capture_to_callback_us = duration_to_us(timing.cpal_capture_to_callback),
+                queue_depth_after_enqueue,
+                rms,
+                peak
+            );
+        }
+    } else {
+        let _ = stats.note_capture_chunk_dequeued();
         // The encoder worker is behind, so this chunk is lost. Surface the
         // backpressure (throttled to powers of two so a sustained overload does
         // not flood the log) instead of dropping it silently, and account the
         // dropped duration so the worker leaves a concealable timestamp gap
         // rather than splicing the media clock across the hole.
         let dropped = stats.record_dropped_chunk(samples);
+        if audio_callback_logging_enabled() {
+            kvlog::warn!(
+                "capture callback chunk dropped",
+                callback_sequence = timing.callback_sequence,
+                samples,
+                device_rate,
+                expected_callback_delta_us,
+                callback_delta_us = optional_duration_to_us(timing.callback_delta),
+                cpal_callback_ns = timing.cpal_callback_ns,
+                cpal_capture_ns = timing.cpal_capture_ns,
+                cpal_callback_delta_us = optional_duration_to_us(timing.cpal_callback_delta),
+                cpal_capture_to_callback_us = duration_to_us(timing.cpal_capture_to_callback),
+                queue_depth_after_enqueue = queue_depth_after_enqueue.saturating_sub(1),
+                dropped_chunks = dropped,
+                rms,
+                peak
+            );
+        }
         if dropped.is_power_of_two() && audio_callback_logging_enabled() {
             kvlog::warn!(
                 "capture worker backpressure dropped chunk",
@@ -2078,14 +2250,37 @@ mod tests {
 
     #[test]
     fn dropped_capture_chunk_records_dropped_samples() {
-        let (sender, _receiver) = std::sync::mpsc::sync_channel::<Vec<f32>>(1);
-        sender.try_send(vec![0.0]).unwrap();
+        let (sender, _receiver) = std::sync::mpsc::sync_channel::<CapturedAudioChunk>(1);
         let stats = AudioStats::new();
+        let queue_depth = stats.note_capture_chunk_enqueued();
+        sender
+            .try_send(CapturedAudioChunk::new(
+                vec![0.0],
+                Instant::now(),
+                CaptureCallbackTiming {
+                    callback_sequence: 0,
+                    ..CaptureCallbackTiming::default()
+                },
+                queue_depth,
+            ))
+            .unwrap();
         let channels = CallbackChannelCount::new(2, "input").unwrap();
 
         // The channel is full, so this stereo chunk (48 mono frames) is dropped
         // and its sample count must be surfaced for the media clock.
-        capture_callback(&[0.1f32; 96], channels, Vec::new(), &sender, &stats);
+        capture_callback(
+            &[0.1f32; 96],
+            channels,
+            Vec::new(),
+            &sender,
+            &stats,
+            Instant::now(),
+            CaptureCallbackTiming {
+                callback_sequence: 1,
+                ..CaptureCallbackTiming::default()
+            },
+            SAMPLE_RATE,
+        );
 
         assert_eq!(stats.take_dropped_capture_samples(), 48);
         assert_eq!(

@@ -14,7 +14,10 @@ pub(crate) use decode::{LiveDecodeStreams, run_live_decoder_worker};
 pub(crate) use events::{LivePlaybackMixerEvent, MixerStreamSource, NetEqMixerSource};
 pub(crate) use feedback::LivePlaybackFeedbackState;
 pub(crate) use frame_combiner::MIX_FRAME_SAMPLES;
-pub(crate) use mixer::{LivePlaybackMixer, LivePlaybackMixerStats, LivePlaybackSharedSnapshot};
+pub(crate) use mixer::{
+    LivePlaybackMixer, LivePlaybackMixerStats, LivePlaybackOutputCallbackTiming,
+    LivePlaybackSharedSnapshot,
+};
 pub(crate) use sample_ring::{RingReader, SampleRing};
 pub(crate) use stream::{
     LivePlaybackPlayoutHints, NETEQ_RENDER_ASSIST_RING_BLOCKS, NetEqRenderAssist,

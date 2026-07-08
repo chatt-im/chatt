@@ -103,11 +103,13 @@ fn log_neteq_diagnostics(snapshot: &LivePlaybackSnapshot) {
         target_delta_5s_ms = snapshot.neteq_target_delta_5s_ms,
         start_delay_ms = snapshot.neteq_start_delay_ms,
         playout_ms = snapshot.neteq_playout_delay_ms,
+        playout_media_timestamp = snapshot.neteq_playout_media_timestamp,
         playout_delta_5s_ms = snapshot.neteq_playout_delta_5s_ms,
         packet_buffer_ms = snapshot.neteq_packet_buffer_ms,
         packet_buffer_wait_ms = snapshot.neteq_packet_buffer_wait_ms,
         sync_buffer_ms = snapshot.neteq_sync_buffer_ms,
         packets_buffered = snapshot.neteq_packets_buffered as u64,
+        next_packet_media_timestamp = snapshot.neteq_next_packet_media_timestamp,
         next_packet_gap_ms = snapshot.neteq_next_packet_gap_ms,
         output_ring_ms = snapshot.max_output_ring_ms,
         decision = snapshot.neteq_decision.as_str(),
@@ -432,10 +434,25 @@ impl LiveDecodeStreams {
             timestamp,
             flags,
             payload,
-            received_at: _,
+            received_at,
         } = packet;
         if !self.ensure_entry(stream_id) {
             return None;
+        }
+        if audio_pop_logging_enabled() {
+            kvlog::info!(
+                "audio pop playback packet dequeued",
+                stream_id,
+                sequence,
+                media_timestamp = timestamp,
+                flags,
+                payload_kind = match &payload {
+                    VoicePayload::Opus(_) => "opus",
+                    VoicePayload::Silence => "silence",
+                },
+                receive_to_worker_us =
+                    now.saturating_duration_since(received_at).as_micros() as u64
+            );
         }
         let stream = self.streams.get_mut(&stream_id)?;
         match payload {
@@ -446,6 +463,16 @@ impl LiveDecodeStreams {
             }
             VoicePayload::Opus(opus) => {
                 let late = stream.insert_audio(timestamp, sequence, flags, opus, now);
+                if audio_pop_logging_enabled() {
+                    kvlog::info!(
+                        "audio pop playback packet inserted",
+                        stream_id,
+                        sequence,
+                        media_timestamp = timestamp,
+                        flags,
+                        late
+                    );
+                }
                 Some(if late {
                     InsertOutcome::Late
                 } else {
@@ -737,6 +764,8 @@ impl LiveDecodeStreams {
             output_ring_samples,
             max_output_ring_ms: samples_to_ms(max_output_ring_samples),
             neteq_playout_delay_ms,
+            neteq_playout_media_timestamp: representative
+                .map(|diagnostics| diagnostics.playout_media_timestamp),
             neteq_sync_buffer_ms: diagnostics
                 .iter()
                 .map(|diagnostics| diagnostics.sync_buffer_ms)
@@ -764,6 +793,8 @@ impl LiveDecodeStreams {
                 .iter()
                 .map(|diagnostics| diagnostics.secondary_packets_discarded)
                 .sum(),
+            neteq_next_packet_media_timestamp: representative
+                .and_then(|diagnostics| diagnostics.next_packet_media_timestamp),
             neteq_next_packet_gap_ms: diagnostics
                 .iter()
                 .filter_map(|diagnostics| diagnostics.next_packet_gap_ms)
