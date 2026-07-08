@@ -107,66 +107,66 @@ impl Theme {
             panel: d,
             panel_alt: d,
             text: d.with_fg_rgb(0xd8, 0xdb, 0xd6),
-            muted: d.with_fg_rgb(0x8a, 0x8f, 0x98),
-            subtle: d.with_fg_rgb(0x66, 0x6d, 0x78),
+            muted: d.with_fg_rgb(0x90, 0x90, 0x90),
+            subtle: d.with_fg_rgb(0x6e, 0x6e, 0x6e),
             accent: d.with_fg_rgb(0x8a, 0xa6, 0xbd),
             good: d.with_fg_rgb(0x9e, 0xd0, 0x8f),
             warn: d.with_fg_rgb(0xe6, 0xc3, 0x84),
             error: d.with_fg_rgb(0xff, 0x66, 0x6f),
             local_line: d,
-            selected_line: d.with_bg_rgb(0x33, 0x38, 0x44),
+            selected_line: d.with_bg_rgb(0x3a, 0x3a, 0x3a),
             room_selected: d
-                .with_bg_rgb(0x24, 0x28, 0x30)
+                .with_bg_rgb(0x29, 0x29, 0x29)
                 .with_fg_rgb(0xf0, 0xf2, 0xe8),
             status_fill: d
-                .with_bg_rgb(0x2a, 0x2f, 0x38)
+                .with_bg_rgb(0x30, 0x30, 0x30)
                 .with_fg_rgb(0xc8, 0xcd, 0xc3),
             status_section: d
-                .with_bg_rgb(0x3d, 0x45, 0x52)
+                .with_bg_rgb(0x46, 0x46, 0x46)
                 .with_fg_rgb(0xf0, 0xf2, 0xe8),
             join_input_active: d
-                .with_bg_rgb(0x24, 0x28, 0x30)
+                .with_bg_rgb(0x29, 0x29, 0x29)
                 .with_fg_rgb(0xf0, 0xf2, 0xe8),
             join_input_inactive: d
-                .with_bg_rgb(0x18, 0x1b, 0x21)
+                .with_bg_rgb(0x1c, 0x1c, 0x1c)
                 .with_fg_rgb(0xd8, 0xdb, 0xd6),
             join_input_boundary_active: d
-                .with_bg_rgb(0x45, 0x4b, 0x57)
+                .with_bg_rgb(0x4d, 0x4d, 0x4d)
                 .with_fg_rgb(0xf0, 0xf2, 0xe8),
             row_focused: d
-                .with_bg_rgb(0x24, 0x28, 0x30)
+                .with_bg_rgb(0x29, 0x29, 0x29)
                 .with_fg_rgb(0xd8, 0xdb, 0xd6),
             selected_focused: d
-                .with_bg_rgb(0x35, 0x3b, 0x46)
+                .with_bg_rgb(0x3c, 0x3c, 0x3c)
                 .with_fg_rgb(0xf0, 0xf2, 0xe8),
-            detail_panel: d.with_bg_rgb(0x20, 0x24, 0x2b),
+            detail_panel: d.with_bg_rgb(0x25, 0x25, 0x25),
             dialog_panel: d
-                .with_bg_rgb(0x18, 0x1b, 0x20)
+                .with_bg_rgb(0x1b, 0x1b, 0x1b)
                 .with_fg_rgb(0xd8, 0xdb, 0xd6),
             dialog_header: d
-                .with_bg_rgb(0x35, 0x3b, 0x46)
+                .with_bg_rgb(0x3c, 0x3c, 0x3c)
                 .with_fg_rgb(0xf0, 0xf2, 0xe8),
             // Mode-tab badges reuse the palette's pastel accents as soft
             // backgrounds with a near-black foreground, instead of the saturated
             // 256-color named colors the original reached for.
             mode_server_select: d
                 .with_bg_rgb(0x6b, 0x72, 0x80)
-                .with_fg_rgb(0x1d, 0x22, 0x29),
+                .with_fg_rgb(0x22, 0x22, 0x22),
             mode_server_edit: d
                 .with_bg_rgb(0xe6, 0xc3, 0x84)
-                .with_fg_rgb(0x1d, 0x22, 0x29),
+                .with_fg_rgb(0x22, 0x22, 0x22),
             mode_compose: d
                 .with_bg_rgb(0x9e, 0xd0, 0x8f)
-                .with_fg_rgb(0x1d, 0x22, 0x29),
+                .with_fg_rgb(0x22, 0x22, 0x22),
             mode_log: d
                 .with_bg_rgb(0x8a, 0xa6, 0xbd)
-                .with_fg_rgb(0x1d, 0x22, 0x29),
+                .with_fg_rgb(0x22, 0x22, 0x22),
             mode_settings: d
                 .with_bg_rgb(0xb4, 0x9b, 0xbb)
-                .with_fg_rgb(0x1d, 0x22, 0x29),
+                .with_fg_rgb(0x22, 0x22, 0x22),
             editor_selection_charwise: d.with_bg_rgb(0x4b, 0x3f, 0x61),
-            editor_selection_linewise: d.with_bg_rgb(0x33, 0x38, 0x44),
-            vu_track: d.with_bg_rgb(0x1d, 0x22, 0x29),
+            editor_selection_linewise: d.with_bg_rgb(0x3a, 0x3a, 0x3a),
+            vu_track: d.with_bg_rgb(0x22, 0x22, 0x22),
             vu_idle_fg: d.with_fg_ansi(AnsiColor::Grey[7]),
             vu_low_fill: d.with_bg_rgb(0x3f, 0x5f, 0x75),
             vu_low_fg: d.with_fg_rgb(0x5d, 0x86, 0xa1),
