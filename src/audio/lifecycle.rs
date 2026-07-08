@@ -169,6 +169,7 @@ pub struct LivePlaybackConfig {
     pub tuning: LiveAudioTuning,
     pub feedback_sender: Option<Sender<LivePlaybackFeedback>>,
     pub echo_control: Option<Arc<EchoCancellationControl>>,
+    pub output_volume_percent: Arc<AtomicU32>,
 }
 
 pub struct Recording {
@@ -802,6 +803,7 @@ pub fn start_live_playback(config: LivePlaybackConfig) -> Result<LivePlayback, A
                 Some(Arc::clone(&observer)),
                 selection.device_rate,
                 playback_recording_handle.clone(),
+                Arc::clone(&config.output_volume_percent),
             )
         })
     };

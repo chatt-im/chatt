@@ -1063,6 +1063,22 @@ pub(crate) fn db_to_gain(db: f32) -> f32 {
     }
 }
 
+pub const DEFAULT_OUTPUT_VOLUME_PERCENT: f32 = 100.0;
+pub const MAX_OUTPUT_VOLUME_PERCENT: f32 = 130.0;
+
+pub fn normalize_output_volume_percent(value: f32) -> f32 {
+    if value.is_finite() {
+        value.clamp(0.0, MAX_OUTPUT_VOLUME_PERCENT)
+    } else {
+        DEFAULT_OUTPUT_VOLUME_PERCENT
+    }
+}
+
+pub fn output_volume_percent_to_gain(value: f32) -> f32 {
+    let scalar = normalize_output_volume_percent(value) / 100.0;
+    scalar * scalar * scalar
+}
+
 pub(crate) fn soft_limit(sample: f32) -> f32 {
     const THRESHOLD: f32 = 0.95;
     let magnitude = sample.abs();
@@ -1151,6 +1167,14 @@ mod tests {
         );
 
         assert_eq!(output, [i16::MIN, i16::MIN, 16_384, 16_385, i16::MAX]);
+    }
+
+    #[test]
+    fn output_volume_uses_mpv_cubic_gain() {
+        assert_eq!(output_volume_percent_to_gain(100.0), 1.0);
+        assert!((output_volume_percent_to_gain(50.0) - 0.125).abs() < f32::EPSILON);
+        assert!((output_volume_percent_to_gain(130.0) - 2.197).abs() < 0.001);
+        assert_eq!(output_volume_percent_to_gain(-10.0), 0.0);
     }
 
     #[test]

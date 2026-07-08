@@ -28,6 +28,8 @@ pub const DEFAULT_DENOISE_TYPING_VAD_ENTER: f32 = crate::audio::DEFAULT_DENOISE_
 pub const DEFAULT_DENOISE_TYPING_VAD_RELEASE: f32 =
     crate::audio::DEFAULT_DENOISE_TYPING_VAD_RELEASE;
 pub const DEFAULT_DENOISE_TYPING_RELEASE_MS: u64 = crate::audio::DEFAULT_DENOISE_TYPING_RELEASE_MS;
+pub const DEFAULT_OUTPUT_VOLUME_PERCENT: f32 = crate::audio::DEFAULT_OUTPUT_VOLUME_PERCENT;
+pub const MAX_OUTPUT_VOLUME_PERCENT: f32 = crate::audio::MAX_OUTPUT_VOLUME_PERCENT;
 pub const MIN_USER_VOLUME_DB: f32 = -24.0;
 pub const MAX_USER_VOLUME_DB: f32 = 12.0;
 pub const USER_VOLUME_DB_STEP: f32 = 0.5;
@@ -174,6 +176,11 @@ pub struct AudioConfig {
     pub input_buffer: BufferSize,
     #[toml(default, style = Dotted)]
     pub output_buffer: BufferSize,
+    #[toml(
+        default = DEFAULT_OUTPUT_VOLUME_PERCENT,
+        ToToml skip_if = is_default_output_volume_percent
+    )]
+    pub output_volume: f32,
     #[toml(default, style = Header)]
     pub latency: AudioLatencyConfig,
 }
@@ -215,6 +222,7 @@ impl Default for AudioConfig {
             denoise_typing_vad_release: DEFAULT_DENOISE_TYPING_VAD_RELEASE,
             input_buffer: BufferSize::Default,
             output_buffer: BufferSize::Default,
+            output_volume: DEFAULT_OUTPUT_VOLUME_PERCENT,
             latency: AudioLatencyConfig::default(),
         }
     }
@@ -945,6 +953,7 @@ impl Config {
             snap_notification_volume_db(self.notifications.peer_join_volume_db);
         self.notifications.peer_leave_volume_db =
             snap_notification_volume_db(self.notifications.peer_leave_volume_db);
+        self.audio.output_volume = snap_output_volume_percent(self.audio.output_volume);
         self.soundboard.loss = self.soundboard.loss.trim().to_string();
         for clip in &mut self.soundboard.clips {
             clip.name = clip.name.trim().to_string();
@@ -1268,6 +1277,61 @@ pub fn snap_notification_volume_db(volume_db: f32) -> f32 {
     } else {
         clamped
     }
+}
+
+pub fn snap_output_volume_percent(volume_percent: f32) -> f32 {
+    let normalized = crate::audio::normalize_output_volume_percent(volume_percent);
+    if normalized.abs() < f32::EPSILON {
+        0.0
+    } else {
+        normalized
+    }
+}
+
+pub fn parse_output_volume_percent_number(text: &str) -> Result<f32, String> {
+    let text = text.trim();
+    if text.is_empty() {
+        return Err("output volume cannot be empty".to_string());
+    }
+    let number = text.strip_suffix('%').unwrap_or(text).trim();
+    if number.is_empty() {
+        return Err("output volume cannot be empty".to_string());
+    }
+    let value = number
+        .parse::<f32>()
+        .map_err(|_| "output volume must be a number, optionally followed by %".to_string())?;
+    if value.is_finite() {
+        Ok(value)
+    } else {
+        Err("output volume must be finite".to_string())
+    }
+}
+
+pub fn parse_output_volume_percent(text: &str) -> Result<f32, String> {
+    let value = parse_output_volume_percent_number(text)?;
+    if (0.0..=MAX_OUTPUT_VOLUME_PERCENT).contains(&value) {
+        Ok(snap_output_volume_percent(value))
+    } else {
+        Err(format!(
+            "output volume must be between {} and {}",
+            output_volume_percent_label(0.0),
+            output_volume_percent_label(MAX_OUTPUT_VOLUME_PERCENT)
+        ))
+    }
+}
+
+pub fn output_volume_percent_label(value: f32) -> String {
+    let value = snap_output_volume_percent(value);
+    let mut label = format!("{value:.1}");
+    if label.ends_with(".0") {
+        label.truncate(label.len() - 2);
+    }
+    label.push('%');
+    label
+}
+
+fn is_default_output_volume_percent(value: &f32) -> bool {
+    (snap_output_volume_percent(*value) - DEFAULT_OUTPUT_VOLUME_PERCENT).abs() < f32::EPSILON
 }
 
 pub fn value_arg(args: &[String], key: &str) -> Option<String> {
@@ -1906,6 +1970,30 @@ path = "assets/sample-001.opus"
         let content = render_runtime(&config);
 
         assert!(content.contains("echo-cancellation = true"));
+    }
+
+    #[test]
+    fn output_volume_percent_parses_and_formats_at_most_one_decimal() {
+        assert_eq!(parse_output_volume_percent("50%").unwrap(), 50.0);
+        assert_eq!(parse_output_volume_percent("99.5").unwrap(), 99.5);
+        assert_eq!(output_volume_percent_label(50.0), "50%");
+        assert_eq!(output_volume_percent_label(99.56), "99.6%");
+        assert_eq!(output_volume_percent_label(200.0), "130%");
+        assert!(parse_output_volume_percent("130.1%").is_err());
+        assert!(parse_output_volume_percent("loud").is_err());
+    }
+
+    #[test]
+    fn output_volume_clamps_on_load() {
+        let outcome = Config::collect_content(
+            "[audio]\noutput-volume = 999.0\n".to_string(),
+            "test".to_string(),
+            None,
+        )
+        .unwrap();
+        let config = outcome.config.unwrap();
+
+        assert_eq!(config.audio.output_volume, MAX_OUTPUT_VOLUME_PERCENT);
     }
 
     #[test]

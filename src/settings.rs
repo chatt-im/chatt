@@ -6,6 +6,7 @@ use crate::{
         DEFAULT_DENOISE_TYPING_VAD_RELEASE, DEFAULT_INPUT_TARGET_LATENCY,
         DEFAULT_MAX_AMPLIFICATION, DEFAULT_OUTPUT_TARGET_LATENCY, FileConfig, FormBindings,
         HistoryConfig, NotificationConfig, P2pConfig, ThemeChoice, WebAutoplay, WebConfig,
+        output_volume_percent_label, parse_output_volume_percent,
     },
     paths,
     ui::select::{FuzzySelect, SelectableItem},
@@ -54,6 +55,7 @@ pub struct SettingsDraft {
     /// [`parse_buffer_size`]). The shared form editor commits into these.
     pub(crate) input_buffer: String,
     pub(crate) output_buffer: String,
+    pub(crate) output_volume: String,
     /// When set, the device row is a free-form text field for a raw ALSA pcm
     /// string instead of the enumerated-device picker.
     pub(crate) input_raw: bool,
@@ -117,6 +119,7 @@ impl SettingsDraft {
             ),
             input_buffer: buffer_size_text(config.input_buffer),
             output_buffer: buffer_size_text(config.output_buffer),
+            output_volume: output_volume_percent_label(config.output_volume),
             input_raw: config
                 .input_device_id
                 .as_deref()
@@ -210,6 +213,8 @@ impl SettingsDraft {
             denoise_typing_vad_release: self.typing_vad_release(),
             input_buffer: parse_buffer_size(&self.input_buffer),
             output_buffer: parse_buffer_size(&self.output_buffer),
+            output_volume: parse_output_volume_percent(&self.output_volume)
+                .unwrap_or(crate::config::DEFAULT_OUTPUT_VOLUME_PERCENT),
             latency: self.latency.clone(),
         }
     }
@@ -308,6 +313,7 @@ impl SettingsDraft {
 
     pub fn settings_text_invalid(&self) -> Option<String> {
         self.device_string_invalid()
+            .or_else(|| output_volume_field_error(&self.output_volume))
             .or_else(|| web_bind_error(&self.web_bind))
             .or_else(|| download_path_error(self.accept_downloads, &self.download_path))
     }
@@ -530,6 +536,10 @@ pub(crate) fn buffer_field_error(text: &str) -> Option<String> {
         Ok(samples) if (MIN_BUFFER_SAMPLES..=MAX_BUFFER_SAMPLES).contains(&samples) => None,
         _ => invalid(),
     }
+}
+
+pub(crate) fn output_volume_field_error(text: &str) -> Option<String> {
+    parse_output_volume_percent(text).err()
 }
 
 /// Validates a raw ALSA device string. Empty means system default. Otherwise it
@@ -1294,6 +1304,22 @@ mod tests {
         assert_eq!(audio.output_device_id.as_deref(), Some("usb speakers"));
         assert!(audio.echo_cancellation);
         assert_eq!(audio.max_amplification, 30.0);
+    }
+
+    #[test]
+    fn settings_draft_round_trips_output_volume() {
+        let config = AudioConfig {
+            output_volume: 99.5,
+            ..AudioConfig::default()
+        };
+
+        let mut draft = SettingsDraft::from_audio(&config);
+        assert_eq!(draft.output_volume, "99.5%");
+        assert_eq!(draft.to_audio().output_volume, 99.5);
+
+        draft.output_volume = "50%".to_string();
+        assert_eq!(draft.to_audio().output_volume, 50.0);
+        assert!(output_volume_field_error("130.1%").is_some());
     }
 
     #[test]

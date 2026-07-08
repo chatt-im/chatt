@@ -28,6 +28,7 @@ mod imp {
     const OP_SCREENCAST: u8 = 3;
     const OP_CLIENT_LOGS: u8 = 4;
     const OP_REPORT_BUG: u8 = 5;
+    const OP_OUTPUT_VOLUME: u8 = 6;
     const SCREENCAST_START: u8 = 0;
     const SCREENCAST_STOP: u8 = 1;
     const STATUS_OK: u8 = 0;
@@ -44,6 +45,9 @@ mod imp {
     const VOICE_ACTION_TOGGLE: u8 = 0;
     const VOICE_ACTION_SET_FALSE: u8 = 1;
     const VOICE_ACTION_SET_TRUE: u8 = 2;
+    const OUTPUT_VOLUME_QUERY: u8 = 0;
+    const OUTPUT_VOLUME_SET: u8 = 1;
+    const OUTPUT_VOLUME_ADJUST: u8 = 2;
 
     /// A voice-control intent forwarded from the CLI to the running client. The
     /// client applies it through the same App methods the UI keybindings use.
@@ -92,6 +96,46 @@ mod imp {
                 VoiceCommand::SetMute(state) => format!("mute set {state} requested"),
                 VoiceCommand::ToggleDeafen => "deafen toggle requested".to_string(),
                 VoiceCommand::SetDeafen(state) => format!("deafen set {state} requested"),
+            }
+        }
+    }
+
+    /// A global output-volume request forwarded from the CLI to the running
+    /// client. The value uses mpv-style percent units, not dB.
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    pub enum OutputVolumeCommand {
+        Query,
+        Set(f32),
+        Adjust(f32),
+    }
+
+    impl OutputVolumeCommand {
+        fn encode(self) -> Vec<u8> {
+            let mut body = Vec::with_capacity(5);
+            match self {
+                OutputVolumeCommand::Query => body.push(OUTPUT_VOLUME_QUERY),
+                OutputVolumeCommand::Set(value) => {
+                    body.push(OUTPUT_VOLUME_SET);
+                    body.extend_from_slice(&value.to_be_bytes());
+                }
+                OutputVolumeCommand::Adjust(delta) => {
+                    body.push(OUTPUT_VOLUME_ADJUST);
+                    body.extend_from_slice(&delta.to_be_bytes());
+                }
+            }
+            body
+        }
+
+        fn decode(payload: &[u8]) -> Result<Self, String> {
+            let (&action, rest) = payload
+                .split_first()
+                .ok_or_else(|| "empty output-volume payload".to_string())?;
+            match action {
+                OUTPUT_VOLUME_QUERY if rest.is_empty() => Ok(OutputVolumeCommand::Query),
+                OUTPUT_VOLUME_SET => Ok(OutputVolumeCommand::Set(read_f32(rest)?)),
+                OUTPUT_VOLUME_ADJUST => Ok(OutputVolumeCommand::Adjust(read_f32(rest)?)),
+                OUTPUT_VOLUME_QUERY => Err("output-volume query payload must be empty".to_string()),
+                other => Err(format!("unknown output-volume action {other}")),
             }
         }
     }
@@ -173,6 +217,17 @@ mod imp {
         let (head, tail) = cursor.split_at(4);
         *cursor = tail;
         Ok(u32::from_be_bytes(head.try_into().unwrap()))
+    }
+
+    fn read_f32(bytes: &[u8]) -> Result<f32, String> {
+        let bytes: [u8; 4] = bytes
+            .try_into()
+            .map_err(|_| "output-volume value must be 4 bytes".to_string())?;
+        let value = f32::from_be_bytes(bytes);
+        value
+            .is_finite()
+            .then_some(value)
+            .ok_or_else(|| "output-volume value must be finite".to_string())
     }
 
     pub struct ControlSocket {
@@ -331,6 +386,37 @@ mod imp {
         }
     }
 
+    pub fn send_output_volume(command: OutputVolumeCommand) -> Result<String, String> {
+        let socket_path = socket_path()?;
+        send_output_volume_to_path(&socket_path, command)
+    }
+
+    fn send_output_volume_to_path(
+        socket_path: &Path,
+        command: OutputVolumeCommand,
+    ) -> Result<String, String> {
+        let mut stream = UnixStream::connect(socket_path).map_err(|error| {
+            format!(
+                "no active chatt control socket at {}; start chatt or set {SOCKET_ENV}: {error}",
+                socket_path.display()
+            )
+        })?;
+        stream
+            .set_read_timeout(Some(STREAM_TIMEOUT))
+            .map_err(|error| format!("failed to set control socket read timeout: {error}"))?;
+        stream
+            .set_write_timeout(Some(STREAM_TIMEOUT))
+            .map_err(|error| format!("failed to set control socket write timeout: {error}"))?;
+
+        write_output_volume_request(&mut stream, command)?;
+        let response = read_response(&mut stream)?;
+        match response.status {
+            STATUS_OK => Ok(response.message),
+            STATUS_ERROR => Err(response.message),
+            status => Err(format!("control socket returned unknown status {status}")),
+        }
+    }
+
     pub fn socket_path() -> Result<PathBuf, String> {
         Ok(socket_config()?.path)
     }
@@ -345,6 +431,7 @@ mod imp {
         Upload(PathBuf),
         Voice(VoiceCommand),
         Screencast(ScreencastCommand),
+        OutputVolume(OutputVolumeCommand),
         ClientLogs { follow: bool },
         ReportBug(String),
     }
@@ -515,6 +602,38 @@ mod imp {
                     message: "chatt client is not running".to_string(),
                 },
             },
+            Ok(Request::OutputVolume(command)) => {
+                let (reply_tx, reply_rx) = mpsc::channel();
+                match voice.send(crate::app::AppEvent::OutputVolume {
+                    command,
+                    reply: reply_tx,
+                }) {
+                    Ok(()) => match reply_rx.recv_timeout(STREAM_TIMEOUT) {
+                        Ok(Ok(value)) => Response {
+                            status: STATUS_OK,
+                            message: crate::config::output_volume_percent_label(value),
+                        },
+                        Ok(Err(error)) => Response {
+                            status: STATUS_ERROR,
+                            message: error,
+                        },
+                        Err(mpsc::RecvTimeoutError::Timeout) => Response {
+                            status: STATUS_ERROR,
+                            message: "chatt client did not answer output-volume request"
+                                .to_string(),
+                        },
+                        Err(mpsc::RecvTimeoutError::Disconnected) => Response {
+                            status: STATUS_ERROR,
+                            message: "chatt client stopped before answering output-volume request"
+                                .to_string(),
+                        },
+                    },
+                    Err(_) => Response {
+                        status: STATUS_ERROR,
+                        message: "chatt client is not running".to_string(),
+                    },
+                }
+            }
             Ok(Request::Screencast(command)) => {
                 let ack = command.ack_message();
                 match voice.send(command) {
@@ -679,6 +798,7 @@ mod imp {
             ))),
             OP_VOICE => Ok(Request::Voice(VoiceCommand::decode(&body)?)),
             OP_SCREENCAST => Ok(Request::Screencast(ScreencastCommand::decode(&body)?)),
+            OP_OUTPUT_VOLUME => Ok(Request::OutputVolume(OutputVolumeCommand::decode(&body)?)),
             OP_CLIENT_LOGS => Ok(Request::ClientLogs {
                 follow: body.first().is_some_and(|byte| *byte != 0),
             }),
@@ -712,6 +832,22 @@ mod imp {
         let mut frame = Vec::with_capacity(MAGIC.len() + 1 + 4 + payload.len());
         frame.extend_from_slice(MAGIC);
         frame.push(OP_VOICE);
+        frame.extend_from_slice(&len.to_be_bytes());
+        frame.extend_from_slice(&payload);
+        stream
+            .write_all(&frame)
+            .map_err(|error| format!("failed to write control request: {error}"))
+    }
+
+    fn write_output_volume_request(
+        stream: &mut UnixStream,
+        command: OutputVolumeCommand,
+    ) -> Result<(), String> {
+        let payload = command.encode();
+        let len = payload.len() as u32;
+        let mut frame = Vec::with_capacity(MAGIC.len() + 1 + 4 + payload.len());
+        frame.extend_from_slice(MAGIC);
+        frame.push(OP_OUTPUT_VOLUME);
         frame.extend_from_slice(&len.to_be_bytes());
         frame.extend_from_slice(&payload);
         stream
@@ -866,6 +1002,23 @@ mod imp {
         }
 
         #[test]
+        fn output_volume_request_round_trips_each_command() {
+            let commands = [
+                OutputVolumeCommand::Query,
+                OutputVolumeCommand::Set(50.0),
+                OutputVolumeCommand::Adjust(-0.5),
+            ];
+            for command in commands {
+                let (mut writer, mut reader) = UnixStream::pair().unwrap();
+                write_output_volume_request(&mut writer, command).unwrap();
+                match read_request(&mut reader).unwrap() {
+                    Request::OutputVolume(actual) => assert_eq!(actual, command),
+                    other => panic!("unexpected request: {other:?}"),
+                }
+            }
+        }
+
+        #[test]
         fn screencast_request_round_trips() {
             let commands = [
                 ScreencastCommand::Start {
@@ -961,6 +1114,40 @@ mod imp {
         }
 
         #[test]
+        fn control_socket_output_volume_waits_for_reply() {
+            let dir = temp_test_dir("output-volume-replies");
+            fs::create_dir_all(&dir).unwrap();
+            let socket_path = dir.join("control.sock");
+            let (tx, _rx) = mpsc::channel();
+            let (voice_tx, voice_rx) = mpsc::channel();
+            let socket = ControlSocket::spawn_at_path(
+                socket_path.clone(),
+                CommandSender::for_test(tx),
+                EventSender(voice_tx),
+            )
+            .unwrap();
+
+            let send_path = socket_path.clone();
+            let handle = thread::spawn(move || {
+                send_output_volume_to_path(&send_path, OutputVolumeCommand::Adjust(-0.5)).unwrap()
+            });
+            let event = voice_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            match event {
+                crate::app::AppEvent::OutputVolume { command, reply } => {
+                    assert_eq!(command, OutputVolumeCommand::Adjust(-0.5));
+                    reply.send(Ok(99.5)).unwrap();
+                }
+                _ => panic!("unexpected event"),
+            }
+
+            assert_eq!(handle.join().unwrap(), "99.5%");
+
+            drop(socket);
+            assert!(!socket_path.exists());
+            let _ = fs::remove_dir_all(dir);
+        }
+
+        #[test]
         fn bind_listener_rejects_live_socket() {
             let dir = temp_test_dir("rejects-live-socket");
             fs::create_dir_all(&dir).unwrap();
@@ -1009,6 +1196,13 @@ mod imp {
         Stop,
     }
 
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    pub enum OutputVolumeCommand {
+        Query,
+        Set(f32),
+        Adjust(f32),
+    }
+
     pub struct ControlSocket;
 
     impl ControlSocket {
@@ -1037,6 +1231,10 @@ mod imp {
         Err("chatt screencast is only supported on Unix".to_string())
     }
 
+    pub fn send_output_volume(_command: OutputVolumeCommand) -> Result<String, String> {
+        Err("chatt output-volume is only supported on Unix".to_string())
+    }
+
     pub fn send_client_logs(_follow: bool) -> Result<(), String> {
         Err("chatt client-logs is only supported on Unix".to_string())
     }
@@ -1047,6 +1245,6 @@ mod imp {
 }
 
 pub use imp::{
-    ControlSocket, ScreencastCommand, VoiceCommand, send_client_logs, send_report_bug,
-    send_screencast, send_upload, send_voice,
+    ControlSocket, OutputVolumeCommand, ScreencastCommand, VoiceCommand, send_client_logs,
+    send_output_volume, send_report_bug, send_screencast, send_upload, send_voice,
 };

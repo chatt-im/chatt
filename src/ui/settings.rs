@@ -9,8 +9,8 @@ use crate::{
         DENOISE_RELEASES, DENOISE_SUPPRESSION_LABELS, DENOISE_SUPPRESSIONS,
         DENOISE_TYPING_VAD_LABELS, DENOISE_TYPING_VAD_THRESHOLDS, MAX_AMPLIFICATIONS,
         NOTIFICATION_VOLUMES_DB, SettingsDraft, buffer_field_error, download_path_error,
-        form_bindings_label, raw_device_error, raw_device_selection, selected_audio_input_label,
-        selected_audio_output_label, volume_db_label, web_bind_error,
+        form_bindings_label, output_volume_field_error, raw_device_error, raw_device_selection,
+        selected_audio_input_label, selected_audio_output_label, volume_db_label, web_bind_error,
     },
     theme::Theme,
     tui::{
@@ -581,6 +581,16 @@ fn settings_ui(
         .is_focus()
     {
         form.set_help("Requested playback buffer in samples, or default for the host backend.");
+    }
+    if form
+        .text(
+            "Output Volume",
+            &mut draft.output_volume,
+            output_volume_field_error,
+        )
+        .is_focus()
+    {
+        form.set_help("Global playback volume. 100% is unchanged; the maximum is 130%.");
     }
     if form
         .checkbox("Render Assist", &mut draft.latency.render_assist)

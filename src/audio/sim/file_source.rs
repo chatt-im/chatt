@@ -2,7 +2,7 @@ use std::{
     path::PathBuf,
     sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU32, Ordering},
         mpsc::Receiver,
     },
     thread,
@@ -69,6 +69,7 @@ pub struct LiveAudioFilePlaybackTestConfig {
     pub packet_loss: LiveAudioPacketLossProfile,
     pub seed: u64,
     pub max_amplification: f32,
+    pub output_volume: f32,
     pub denoise: bool,
     pub auto_gain: bool,
 }
@@ -317,6 +318,7 @@ pub fn run_live_audio_file_playback_test(
         tuning: config.tuning,
         feedback_sender: Some(feedback_sender),
         echo_control: None,
+        output_volume_percent: Arc::new(AtomicU32::new(config.output_volume.to_bits())),
     })?;
 
     let mut report = LiveAudioFilePlaybackTestReport {
