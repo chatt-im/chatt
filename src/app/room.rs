@@ -1956,6 +1956,10 @@ impl RoomSession {
         self.participants.voice_feedback(feedback);
     }
 
+    pub(super) fn outbound_feedback(&mut self, reporter: UserId, feedback: LivePlaybackFeedback) {
+        self.participants.outbound_feedback(reporter, feedback);
+    }
+
     pub(super) fn peer_transport_changed(&mut self, user_id: UserId, direct: bool) {
         if self
             .viewed_room

@@ -3875,6 +3875,8 @@ impl Server {
             } => self.relay_voice_feedback(session_id, stream_id, feedback),
             MediaPayload::PeerVoice { .. } => Ok(()),
             MediaPayload::PeerVoiceFeedback { .. } => Ok(()),
+            // Server-authored, owner-facing only; a client never sends it.
+            MediaPayload::VoiceFeedbackFrom { .. } => Ok(()),
             MediaPayload::Ping {
                 nonce,
                 observed_rtt_ms,
@@ -3976,10 +3978,20 @@ impl Server {
         if owner_session_id == receiver_session_id {
             return Ok(());
         }
+        // The trusted server authors the reporter identity so the owner can
+        // attribute the report to the specific listener; clients never send it.
+        let Some(reporter) = self
+            .sessions
+            .get(&receiver_session_id)
+            .map(|session| session.user_id)
+        else {
+            return Ok(());
+        };
         kvlog::debug!(
             "voice feedback relaying",
             receiver_session_id = receiver_session_id.0,
             owner_session_id = owner_session_id.0,
+            reporter = reporter.0,
             room_id = room_id.0,
             stream_id = stream_id.0,
             expected = feedback.expected_packets,
@@ -3992,7 +4004,8 @@ impl Server {
         );
         self.send_udp_payload(
             owner_session_id,
-            &MediaPayload::VoiceFeedback {
+            &MediaPayload::VoiceFeedbackFrom {
+                reporter,
                 stream_id,
                 feedback,
             },
@@ -5972,6 +5985,100 @@ mod tests {
             let opened = media::open_media(&client, &mut replay, &buf[..len]).unwrap();
             assert_eq!(opened.payload, MediaPayload::Pong { nonce });
         }
+    }
+
+    #[test]
+    fn relay_voice_feedback_stamps_reporter_identity() {
+        // A listener's reception report about the owner's outbound stream reaches
+        // the owner as a `VoiceFeedbackFrom` carrying the listener's user id, so
+        // the owner can attribute it to that specific listener.
+        let mut server = test_server();
+        let receiver = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        receiver
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        let owner_client = test_client_media_protection(77);
+
+        let room_id = RoomId(1);
+        let owner_session = SessionId(1);
+        let listener_session = SessionId(2);
+        let owner_stream = StreamId(100);
+        server.rooms.insert(
+            room_id,
+            RoomState {
+                id: room_id,
+                name: "test".to_string(),
+                access: RoomAccess::Public,
+                active_streams: [(owner_stream, owner_session)].into_iter().collect(),
+            },
+        );
+
+        let mut owner = test_session(UserId(9), Token(11), Some(room_id));
+        owner.transport = test_transport(77);
+        owner.udp_addr = Some(receiver.local_addr().unwrap());
+        server.sessions.insert(owner_session, owner);
+        server.sessions.insert(
+            listener_session,
+            test_session(UserId(5), Token(22), Some(room_id)),
+        );
+
+        let feedback = media::VoiceFeedback {
+            lost_packets: 3,
+            max_neteq_playout_delay_ms: 120,
+            ..Default::default()
+        };
+        server
+            .relay_voice_feedback(listener_session, owner_stream, feedback)
+            .unwrap();
+
+        let mut replay = AntiReplay::new();
+        let mut buf = [0u8; 2048];
+        let (len, _) = receiver.recv_from(&mut buf).unwrap();
+        let opened = media::open_media(&owner_client, &mut replay, &buf[..len]).unwrap();
+        assert_eq!(
+            opened.payload,
+            MediaPayload::VoiceFeedbackFrom {
+                reporter: UserId(5),
+                stream_id: owner_stream,
+                feedback,
+            }
+        );
+    }
+
+    #[test]
+    fn relay_voice_feedback_suppresses_self_report() {
+        // A session reporting on its own stream produces no relayed datagram.
+        let mut server = test_server();
+        let room_id = RoomId(1);
+        let owner_session = SessionId(1);
+        let owner_stream = StreamId(100);
+        server.rooms.insert(
+            room_id,
+            RoomState {
+                id: room_id,
+                name: "test".to_string(),
+                access: RoomAccess::Public,
+                active_streams: [(owner_stream, owner_session)].into_iter().collect(),
+            },
+        );
+        let mut owner = test_session(UserId(9), Token(11), Some(room_id));
+        owner.transport = test_transport(77);
+        // No udp_addr: if the self-skip failed and we tried to send, the missing
+        // address would silently drop it, so we instead assert the early return by
+        // leaving the owner's outbound counter untouched.
+        server.sessions.insert(owner_session, owner);
+
+        server
+            .relay_voice_feedback(owner_session, owner_stream, media::VoiceFeedback::default())
+            .unwrap();
+        assert_eq!(
+            server
+                .sessions
+                .get(&owner_session)
+                .unwrap()
+                .media_send_counter,
+            0
+        );
     }
 
     #[test]

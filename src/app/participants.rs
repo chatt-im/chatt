@@ -36,7 +36,13 @@ pub(crate) struct ParticipantState {
     /// transition is observed. Backs the lobby age column.
     pub(crate) presence_since: Option<Instant>,
     pub(crate) active_stream: Option<StreamId>,
+    /// Inbound (this user -> me) reception estimate, measured locally from my
+    /// NetEQ decode of their stream.
     pub(crate) voice_feedback: Option<ParticipantVoiceFeedback>,
+    /// Outbound (me -> this user) reception estimate: this user's own inbound
+    /// report about *my* stream, relayed back and attributed to them. Keyed by
+    /// this row's `user_id` (the reporter), not by a stream id.
+    pub(crate) outbound_feedback: Option<ParticipantVoiceFeedback>,
     /// Smoothed round-trip time to this peer over its current audio transport
     /// (direct p2p, or end-to-end through the server relay), milliseconds. The
     /// network leg of the latency estimate.
@@ -45,11 +51,38 @@ pub(crate) struct ParticipantState {
     /// active feedback windows. Backs the stabilized `ParticipantVoiceFeedback::
     /// jitter_buffer_ms`; `None` until the first sample seeds it.
     jitter_buffer_ms: Option<f32>,
+    /// Outbound counterpart of [`Self::jitter_buffer_ms`], smoothing this user's
+    /// reports about my stream.
+    outbound_jitter_buffer_ms: Option<f32>,
 }
 
 impl ParticipantState {
     pub(crate) fn display_name(&self) -> &str {
         self.name.as_deref().unwrap_or(UNKNOWN_NAME)
+    }
+
+    /// A bare online, in-voice roster row with no feedback, for rendering tests in
+    /// sibling modules that cannot name this struct's private fields.
+    #[cfg(test)]
+    pub(crate) fn for_test(user_id: UserId) -> Self {
+        ParticipantState {
+            user_id,
+            name: None,
+            identifier: None,
+            online: true,
+            voice_active: true,
+            voice_status: ParticipantVoiceStatus::default(),
+            talking_display: false,
+            last_talking_at: None,
+            p2p_direct: false,
+            presence_since: None,
+            active_stream: None,
+            voice_feedback: None,
+            outbound_feedback: None,
+            peer_rtt_ms: None,
+            jitter_buffer_ms: None,
+            outbound_jitter_buffer_ms: None,
+        }
     }
 }
 
@@ -77,6 +110,48 @@ pub(crate) struct ParticipantVoiceFeedback {
     /// shows the raw `max_neteq_*` values.
     pub(crate) jitter_buffer_ms: u16,
     pub(crate) updated_at: Instant,
+}
+
+/// Folds one reception-report window into a directional latency slot: updates the
+/// stabilized jitter-buffer EWMA (`jitter_buffer_ms`) on active windows and writes
+/// the freshly built [`ParticipantVoiceFeedback`] into `slot`. Shared by the
+/// inbound and outbound paths, which differ only in which fields they target.
+fn fold_participant_feedback(
+    jitter_buffer_ms: &mut Option<f32>,
+    slot: &mut Option<ParticipantVoiceFeedback>,
+    feedback: LivePlaybackFeedback,
+) {
+    let loss_packets = feedback.lost_packets.saturating_add(feedback.late_packets);
+    let loss_percent = if feedback.expected_packets == 0 {
+        0
+    } else {
+        ((u32::from(loss_packets) * 100) / u32::from(feedback.expected_packets)).min(100) as u8
+    };
+    // Stabilize the jitter-buffer term off the realized NetEQ playout delay (what
+    // the listener actually experiences) rather than the target setpoint, which
+    // the buffer often fails to reach on bad networks. An EWMA over windows that
+    // actually carried speech tames its noise; silence-boundary and talk-gap
+    // windows hold the previous value so the estimate stays put through mutes and
+    // silences.
+    if feedback.expected_packets >= JITTER_ACTIVE_MIN_PACKETS {
+        let sample = f32::from(feedback.max_neteq_playout_delay_ms);
+        *jitter_buffer_ms = Some(match *jitter_buffer_ms {
+            Some(prev) => prev + JITTER_BUFFER_EWMA_WEIGHT * (sample - prev),
+            None => sample,
+        });
+    }
+    let stabilized = jitter_buffer_ms
+        .map(|value| value.round().clamp(0.0, f32::from(u16::MAX)) as u16)
+        .unwrap_or(feedback.max_neteq_playout_delay_ms);
+    *slot = Some(ParticipantVoiceFeedback {
+        loss_percent,
+        max_output_ring_ms: feedback.max_output_ring_ms,
+        max_neteq_target_ms: feedback.max_neteq_target_ms,
+        max_neteq_playout_delay_ms: feedback.max_neteq_playout_delay_ms,
+        max_interarrival_jitter_ms: feedback.max_interarrival_jitter_ms,
+        jitter_buffer_ms: stabilized,
+        updated_at: Instant::now(),
+    });
 }
 
 #[derive(Default)]
@@ -144,8 +219,10 @@ impl Participants {
             if !online || !in_call || existing.voice_status.muted {
                 existing.p2p_direct = false;
                 existing.voice_feedback = None;
+                existing.outbound_feedback = None;
                 existing.peer_rtt_ms = None;
                 existing.jitter_buffer_ms = None;
+                existing.outbound_jitter_buffer_ms = None;
                 existing.talking_display = false;
                 existing.last_talking_at = None;
             }
@@ -172,8 +249,10 @@ impl Participants {
                 presence_since: Some(presence_since),
                 active_stream: None,
                 voice_feedback: None,
+                outbound_feedback: None,
                 peer_rtt_ms: None,
                 jitter_buffer_ms: None,
+                outbound_jitter_buffer_ms: None,
             });
         }
         self.sort();
@@ -195,8 +274,10 @@ impl Participants {
             entry.voice_active = false;
             entry.p2p_direct = false;
             entry.voice_feedback = None;
+            entry.outbound_feedback = None;
             entry.peer_rtt_ms = None;
             entry.jitter_buffer_ms = None;
+            entry.outbound_jitter_buffer_ms = None;
             entry.talking_display = false;
             entry.last_talking_at = None;
             if entry.active_stream == Some(stream_id) {
@@ -257,8 +338,13 @@ impl Participants {
         let entry = self.ensure_user(user_id);
         if entry.p2p_direct != direct {
             // The prior RTT was measured over the previous transport and no
-            // longer describes how this participant's audio reaches us.
+            // longer describes how this participant's audio reaches us. The
+            // outbound estimate likewise arrived over the old path (relay
+            // `VoiceFeedbackFrom` vs. p2p `PeerVoiceFeedback`), so drop its EWMA
+            // rather than blend two paths.
             entry.peer_rtt_ms = None;
+            entry.outbound_feedback = None;
+            entry.outbound_jitter_buffer_ms = None;
         }
         entry.p2p_direct = direct;
         self.sort();
@@ -274,45 +360,36 @@ impl Participants {
         }
     }
 
+    /// Records an inbound reception report (this user -> me), matched to the row
+    /// owning the reported stream.
     pub(crate) fn voice_feedback(&mut self, feedback: LivePlaybackFeedback) {
         if let Some(entry) = self
             .entries
             .iter_mut()
             .find(|entry| entry.active_stream == Some(StreamId(feedback.stream_id)))
         {
-            let loss_packets = feedback.lost_packets.saturating_add(feedback.late_packets);
-            let loss_percent = if feedback.expected_packets == 0 {
-                0
-            } else {
-                ((u32::from(loss_packets) * 100) / u32::from(feedback.expected_packets)).min(100)
-                    as u8
-            };
-            // Stabilize the jitter-buffer term off the realized NetEQ playout
-            // delay (what the listener actually experiences) rather than the
-            // target setpoint, which the buffer often fails to reach on bad
-            // networks. An EWMA over windows that actually carried speech tames
-            // its noise; silence-boundary and talk-gap windows hold the previous
-            // value so the estimate stays put through mutes and silences.
-            if feedback.expected_packets >= JITTER_ACTIVE_MIN_PACKETS {
-                let sample = f32::from(feedback.max_neteq_playout_delay_ms);
-                entry.jitter_buffer_ms = Some(match entry.jitter_buffer_ms {
-                    Some(prev) => prev + JITTER_BUFFER_EWMA_WEIGHT * (sample - prev),
-                    None => sample,
-                });
-            }
-            let jitter_buffer_ms = entry
-                .jitter_buffer_ms
-                .map(|value| value.round().clamp(0.0, f32::from(u16::MAX)) as u16)
-                .unwrap_or(feedback.max_neteq_playout_delay_ms);
-            entry.voice_feedback = Some(ParticipantVoiceFeedback {
-                loss_percent,
-                max_output_ring_ms: feedback.max_output_ring_ms,
-                max_neteq_target_ms: feedback.max_neteq_target_ms,
-                max_neteq_playout_delay_ms: feedback.max_neteq_playout_delay_ms,
-                max_interarrival_jitter_ms: feedback.max_interarrival_jitter_ms,
-                jitter_buffer_ms,
-                updated_at: Instant::now(),
-            });
+            fold_participant_feedback(
+                &mut entry.jitter_buffer_ms,
+                &mut entry.voice_feedback,
+                feedback,
+            );
+        }
+    }
+
+    /// Records an outbound reception report (me -> `reporter`): the reporting
+    /// user's own inbound estimate for my stream, matched to their row so the
+    /// figure is attributed per listener rather than smeared across the self row.
+    pub(crate) fn outbound_feedback(&mut self, reporter: UserId, feedback: LivePlaybackFeedback) {
+        if let Some(entry) = self
+            .entries
+            .iter_mut()
+            .find(|entry| entry.user_id == reporter)
+        {
+            fold_participant_feedback(
+                &mut entry.outbound_jitter_buffer_ms,
+                &mut entry.outbound_feedback,
+                feedback,
+            );
         }
     }
 
@@ -348,8 +425,10 @@ impl Participants {
             presence_since: None,
             active_stream: None,
             voice_feedback: None,
+            outbound_feedback: None,
             peer_rtt_ms: None,
             jitter_buffer_ms: None,
+            outbound_jitter_buffer_ms: None,
         });
         if self.selected_user.is_none() {
             self.selected_user = Some(user_id);
@@ -511,6 +590,80 @@ mod tests {
                 .jitter_buffer_ms,
             90
         );
+    }
+
+    #[test]
+    fn outbound_feedback_estimate_holds_through_silence() {
+        let mut participants = Participants::default();
+        participants.replace_room(vec![participant(UserId(1))]);
+        participants.voice_started(UserId(1), StreamId(7));
+
+        // An active report seeds the outbound stabilized jitter buffer.
+        participants.outbound_feedback(UserId(1), live_feedback(99, 25, 80));
+        assert_eq!(
+            participants.entries[0]
+                .outbound_feedback
+                .unwrap()
+                .jitter_buffer_ms,
+            80
+        );
+
+        // A silence-boundary window must not move it.
+        participants.outbound_feedback(UserId(1), live_feedback(99, 0, 400));
+        assert_eq!(
+            participants.entries[0]
+                .outbound_feedback
+                .unwrap()
+                .jitter_buffer_ms,
+            80
+        );
+
+        // A fresh active window nudges it via the EWMA: 80 + 0.25 * (120 - 80) = 90.
+        participants.outbound_feedback(UserId(1), live_feedback(99, 25, 120));
+        assert_eq!(
+            participants.entries[0]
+                .outbound_feedback
+                .unwrap()
+                .jitter_buffer_ms,
+            90
+        );
+    }
+
+    #[test]
+    fn outbound_feedback_lands_on_each_reporter_row() {
+        // The smear-bug regression: in a >2 call, two listeners reporting on my
+        // stream must each update their own row, not collapse together.
+        let mut participants = Participants::default();
+        participants.replace_room(vec![participant(UserId(1)), participant(UserId(2))]);
+
+        participants.outbound_feedback(UserId(1), live_feedback(50, 25, 60));
+        participants.outbound_feedback(UserId(2), live_feedback(50, 25, 180));
+
+        let row = |participants: &Participants, user_id: UserId| {
+            participants
+                .entries
+                .iter()
+                .find(|entry| entry.user_id == user_id)
+                .unwrap()
+                .outbound_feedback
+                .unwrap()
+                .jitter_buffer_ms
+        };
+        assert_eq!(row(&participants, UserId(1)), 60);
+        assert_eq!(row(&participants, UserId(2)), 180);
+    }
+
+    #[test]
+    fn outbound_feedback_cleared_on_voice_stopped() {
+        let mut participants = Participants::default();
+        participants.replace_room(vec![participant(UserId(1))]);
+        participants.voice_started(UserId(1), StreamId(7));
+        participants.outbound_feedback(UserId(1), live_feedback(99, 25, 80));
+        assert!(participants.entries[0].outbound_feedback.is_some());
+
+        participants.voice_stopped(UserId(1), StreamId(7));
+        assert!(participants.entries[0].outbound_feedback.is_none());
+        assert!(participants.entries[0].outbound_jitter_buffer_ms.is_none());
     }
 
     #[test]
