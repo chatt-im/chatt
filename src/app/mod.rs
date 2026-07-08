@@ -386,6 +386,9 @@ pub(crate) struct App {
     pending_voice_teardown_at: Option<Instant>,
     pending_network_commands: VecDeque<NetworkCommand>,
     network_disconnected: bool,
+    /// UDP media path to the server never bound after repeated retries while the
+    /// TCP session is otherwise up. Surfaced as "UDP Connection Failure".
+    udp_unreachable: bool,
     pending_dm_open: Option<(RoomId, UserId)>,
     pending_room_catalog_save: Option<PendingRoomCatalogSave>,
     supervisor: SupervisorState,
@@ -1001,6 +1004,7 @@ impl App {
             pending_voice_teardown_at: None,
             pending_network_commands: VecDeque::new(),
             network_disconnected: false,
+            udp_unreachable: false,
             pending_dm_open: None,
             pending_room_catalog_save: None,
             supervisor: SupervisorState::default(),
@@ -1549,6 +1553,17 @@ impl App {
         true
     }
 
+    /// Whether the client has no live session: either the worker is gone or a
+    /// reconnect is in flight. Drives the "Offline" top-bar label.
+    pub(crate) fn is_offline(&self) -> bool {
+        self.network.is_none() || self.network_disconnected
+    }
+
+    /// Whether the TCP session is up but the UDP media path never bound.
+    pub(crate) fn is_udp_unreachable(&self) -> bool {
+        self.udp_unreachable
+    }
+
     fn disconnect_network(&mut self) {
         self.stop_audio();
         self.stop_all_shares();
@@ -1569,6 +1584,7 @@ impl App {
         self.pending_voice_teardown_at = None;
         self.pending_network_commands.clear();
         self.network_disconnected = true;
+        self.udp_unreachable = false;
         self.pending_dm_open = None;
         self.supervisor.network.reset();
         self.supervisor.control_socket.reset();
@@ -2217,6 +2233,7 @@ impl App {
                     video_auth_key,
                 ));
                 self.network_disconnected = false;
+                self.udp_unreachable = false;
                 self.last_network_notice = None;
                 let catalog = crate::room_catalog::load(self.room.history_storage().catalog_dir());
                 let known = self.room.authenticated(
@@ -2612,6 +2629,7 @@ impl App {
             NetworkEvent::ShareStartRejected { message } => {
                 self.handle_screencast_failed(message);
             }
+            NetworkEvent::MediaConnectivity { udp_ok } => self.udp_unreachable = !udp_ok,
             NetworkEvent::Status(status) => self.set_status(status),
             NetworkEvent::Error(error) => {
                 kvlog::warn!("app network error", error = error.as_str());
@@ -2671,6 +2689,7 @@ impl App {
             }
             NetworkEvent::ReconnectScheduled { retry_in, reason } => {
                 self.network_disconnected = true;
+                self.udp_unreachable = false;
                 self.stop_audio();
                 self.fail_screencast_if_running(
                     format!("screen share stopped: connection failed: {reason}"),
@@ -5681,6 +5700,7 @@ fn network_event_kind(event: &NetworkEvent) -> &'static str {
         NetworkEvent::OpenPairingSucceeded { .. } => "open_pairing_succeeded",
         NetworkEvent::OpenPairingNeedsPassword { .. } => "open_pairing_needs_password",
         NetworkEvent::NativeEncryptionRequired => "native_encryption_required",
+        NetworkEvent::MediaConnectivity { .. } => "media_connectivity",
         NetworkEvent::ReconnectScheduled { .. } => "reconnect_scheduled",
         NetworkEvent::WorkerStopped { .. } => "worker_stopped",
         NetworkEvent::ShareStarted { .. } => "share_started",

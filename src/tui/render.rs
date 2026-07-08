@@ -972,8 +972,16 @@ fn draw_top_bar(area: Rect, app: &mut App, buf: &mut Buffer, capture: Option<&St
         &mut left,
         buf,
         theme.status_section | Modifier::BOLD,
-        &format!(" {server} - {} ", connection_state_label(app)),
+        &format!(" {server} "),
     );
+    if let Some((label, style)) = connection_status_label(app) {
+        draw_status_segment(
+            &mut left,
+            buf,
+            style | Modifier::BOLD,
+            &format!(" {label} "),
+        );
+    }
     if !app.room.local_user_name.trim().is_empty() {
         draw_status_segment(
             &mut left,
@@ -2025,13 +2033,22 @@ fn draw_composer(area: Rect, app: &mut App, focus: ChatPanelFocus, buf: &mut Buf
     }
 }
 
-fn connection_state_label(app: &App) -> &'static str {
-    if app.network.is_none() {
-        "Disconnected"
-    } else if app.user_id.is_some() {
-        "Connected"
+/// The top-bar status suffix and its style, or `None` in the healthy connected
+/// state (where only the server name shows). Failures take priority over the
+/// transient "Connecting" phase.
+fn connection_status_label(app: &App) -> Option<(&'static str, Style)> {
+    let theme = app.theme;
+    if app.is_offline() {
+        Some(("Offline", theme.status_fill.patch(theme.error)))
+    } else if app.user_id.is_none() {
+        Some(("Connecting", theme.status_fill.patch(theme.muted)))
+    } else if app.is_udp_unreachable() {
+        Some((
+            "UDP Connection Failure",
+            theme.status_fill.patch(theme.error),
+        ))
     } else {
-        "Connecting"
+        None
     }
 }
 
