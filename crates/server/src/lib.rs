@@ -5672,6 +5672,19 @@ mod tests {
     }
 
     #[test]
+    fn invite_ticket_uses_advertised_public_udp_endpoint() {
+        let mut server = test_server();
+        server.config.network.public_tcp_addr = "104.247.224.7:41000".to_string();
+        server.config.network.public_udp_addr = "104.247.224.7:41000".to_string();
+
+        let join_string = server.create_invite("alice").unwrap();
+        let ticket = control::decode_invite_ticket(&join_string).unwrap();
+
+        assert_eq!(ticket.tcp_addr, "104.247.224.7:41000");
+        assert_eq!(ticket.udp_addr, "104.247.224.7:41000");
+    }
+
+    #[test]
     fn room_rtt_snapshot_is_sorted_and_expires_stale_reports() {
         let mut server = test_server();
         let now = Instant::now();
