@@ -49,8 +49,8 @@ use super::tick_timer::{Stopwatch, TickTimer};
 use crate::audio::shared::{
     DecodedFrameSource, LIVE_CAPTURE_MUTE_FADE, LIVE_OPUS_FRAME_SAMPLES, LIVE_PACKET_FLAG_MUTE,
     LIVE_PACKET_FLAG_OPUS_RESET, LIVE_PACKET_FLAG_SILENCE_RESUME, LIVE_PLAYBACK_DRED_MAX_SAMPLES,
-    LiveAudioTuning, MAX_OPUS_DECODE_SAMPLES, SAMPLE_RATE, apply_gain_ramp, duration_to_ms,
-    mute_gain_step, samples_for_duration, samples_to_ms,
+    LiveAudioTuning, MAX_OPUS_DECODE_SAMPLES, SAMPLE_RATE, apply_gain_ramp,
+    audio_pop_logging_enabled, duration_to_ms, mute_gain_step, samples_for_duration, samples_to_ms,
 };
 
 /// Expand's overlap lookahead the sync buffer always retains (`5 * fs_mult` at
@@ -100,6 +100,7 @@ pub(crate) struct AudioResult {
 pub(crate) struct NetEqDiagnostics {
     pub target_ms: u64,
     pub playout_delay_ms: u64,
+    pub playout_media_timestamp: u32,
     pub sync_buffer_ms: u64,
     pub packet_buffer_ms: u64,
     pub packet_buffer_wait_ms: u64,
@@ -108,6 +109,7 @@ pub(crate) struct NetEqDiagnostics {
     pub secondary_packets_discarded: u64,
     #[cfg(test)]
     pub trash_overflow: u64,
+    pub next_packet_media_timestamp: Option<u32>,
     pub next_packet_gap_ms: Option<i64>,
     pub operation: &'static str,
     pub reason: &'static str,
@@ -398,6 +400,7 @@ impl NetEqCore {
             let gap_samples = packet.timestamp.wrapping_sub(playout_timestamp) as i32;
             i64::from(gap_samples) / i64::from(FS_HZ / 1000)
         });
+        let next_packet_media_timestamp = status.next_packet.map(|packet| packet.timestamp);
 
         NetEqDiagnostics {
             target_ms: self.decision_logic.target_level_ms().max(0) as u64,
@@ -405,6 +408,7 @@ impl NetEqCore {
                 .decision_logic
                 .playout_delay_ms(&status, self.wall_now_samples)
                 .max(0) as u64,
+            playout_media_timestamp: playout_timestamp,
             sync_buffer_ms: samples_to_ms(status.sync_buffer_samples),
             packet_buffer_ms: samples_to_ms(status.packet_buffer_info.span_samples),
             packet_buffer_wait_ms: samples_to_ms(status.packet_buffer_info.span_samples_wait_time),
@@ -413,6 +417,7 @@ impl NetEqCore {
             secondary_packets_discarded: self.packet_buffer.secondary_packets_discarded(),
             #[cfg(test)]
             trash_overflow: self.packet_buffer.trash_overflow(),
+            next_packet_media_timestamp,
             next_packet_gap_ms,
             operation: self.last_operation.label(),
             reason: self.last_decision_reason,
@@ -618,6 +623,9 @@ impl NetEqCore {
         for packet in prepared.packets {
             let packet_timestamp = packet.timestamp;
             let packet_length_samples = packet.duration_samples;
+            let priority_codec_level = packet.priority.codec_level;
+            let priority_red_level = packet.priority.red_level;
+            let muted = packet.muted;
             let buffer_flush = matches!(
                 self.packet_buffer.insert_packet(packet, &self.tick_timer),
                 super::packet_buffer::InsertOutcome::Flushed
@@ -632,13 +640,31 @@ impl NetEqCore {
                 buffer_flush,
             };
             let should_update_stats = !self.new_codec && !silence_resume;
-            self.decision_logic.packet_arrived(
+            let arrival_delay_ms = self.decision_logic.packet_arrived(
                 FS_HZ,
                 should_update_stats,
                 &info,
                 &self.tick_timer,
                 arrival_samples,
             );
+            if audio_pop_logging_enabled() {
+                kvlog::info!(
+                    "audio pop neteq packet arrived",
+                    sequence,
+                    datagram_timestamp = timestamp,
+                    packet_timestamp,
+                    packet_length_samples,
+                    priority_codec_level,
+                    priority_red_level,
+                    muted,
+                    flags,
+                    silence_resume,
+                    buffer_flush,
+                    should_update_stats,
+                    arrival_samples,
+                    arrival_delay_ms
+                );
+            }
         }
 
         // Reference sets `new_codec_` only after the arrival loop, inside the

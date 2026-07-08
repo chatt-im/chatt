@@ -233,6 +233,47 @@ pub(crate) const AUDIO_POP_LOG_ENV: &str = "CHATT_AUDIO_POP_LOG";
 pub(crate) const AUDIO_POP_DELTA_THRESHOLD: f32 = 0.025;
 pub(crate) const AUDIO_CALLBACK_LOG_ENV: &str = "CHATT_AUDIO_CALLBACK_LOG";
 
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct CaptureCallbackTiming {
+    pub callback_sequence: u64,
+    pub callback_delta: Option<Duration>,
+    pub cpal_callback_ns: u64,
+    pub cpal_capture_ns: u64,
+    pub cpal_callback_delta: Option<Duration>,
+    pub cpal_capture_to_callback: Duration,
+}
+
+pub(crate) struct CapturedAudioChunk {
+    pub samples: Vec<f32>,
+    pub enqueued_at: Instant,
+    pub timing: CaptureCallbackTiming,
+    pub queue_depth_after_enqueue: usize,
+}
+
+impl CapturedAudioChunk {
+    pub(crate) fn new(
+        samples: Vec<f32>,
+        enqueued_at: Instant,
+        timing: CaptureCallbackTiming,
+        queue_depth_after_enqueue: usize,
+    ) -> Self {
+        Self {
+            samples,
+            enqueued_at,
+            timing,
+            queue_depth_after_enqueue,
+        }
+    }
+}
+
+pub(crate) fn duration_to_us(duration: Duration) -> u64 {
+    duration.as_micros().min(u128::from(u64::MAX)) as u64
+}
+
+pub(crate) fn optional_duration_to_us(duration: Option<Duration>) -> Option<u64> {
+    duration.map(duration_to_us)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BufferRequest {
     /// Host default period (used as the fallback when a request fails to build).
@@ -523,6 +564,31 @@ impl AudioStats {
         self.inner.dropped_chunks.fetch_add(1, Ordering::Relaxed) + 1
     }
 
+    pub(crate) fn note_capture_chunk_enqueued(&self) -> usize {
+        self.inner
+            .capture_queue_depth
+            .fetch_add(1, Ordering::Relaxed)
+            + 1
+    }
+
+    pub(crate) fn note_capture_chunk_dequeued(&self) -> usize {
+        let mut depth = self.inner.capture_queue_depth.load(Ordering::Relaxed);
+        loop {
+            if depth == 0 {
+                return 0;
+            }
+            match self.inner.capture_queue_depth.compare_exchange_weak(
+                depth,
+                depth - 1,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return depth - 1,
+                Err(current) => depth = current,
+            }
+        }
+    }
+
     /// Drains the mono device-rate sample count dropped since the last call.
     pub(crate) fn take_dropped_capture_samples(&self) -> u64 {
         self.inner
@@ -612,12 +678,14 @@ pub struct LivePlaybackSnapshot {
     /// normally less than one 10 ms mixer frame unless callback assist is active.
     pub max_output_ring_ms: u64,
     pub neteq_playout_delay_ms: u64,
+    pub neteq_playout_media_timestamp: Option<u32>,
     pub neteq_sync_buffer_ms: u64,
     pub neteq_packet_buffer_ms: u64,
     pub neteq_packet_buffer_wait_ms: u64,
     pub neteq_packets_buffered: usize,
     pub neteq_packets_discarded: u64,
     pub neteq_secondary_packets_discarded: u64,
+    pub neteq_next_packet_media_timestamp: Option<u32>,
     pub neteq_next_packet_gap_ms: Option<i64>,
     pub backend_block_ms: u64,
     pub playout_quantum_ms: u64,
@@ -746,6 +814,7 @@ struct SharedStats {
     encoded_bytes: AtomicU64,
     dropped_chunks: AtomicU64,
     dropped_capture_samples: AtomicU64,
+    capture_queue_depth: AtomicUsize,
     stream_errors: AtomicU64,
     fatal_stream_errors: AtomicU64,
     last_error_kind: AtomicU8,
