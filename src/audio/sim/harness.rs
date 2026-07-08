@@ -2108,8 +2108,9 @@ mod tests {
             stats.plc_fallbacks, 0,
             "loopback mute toggle should never invoke PLC"
         );
-        // Fixed pipeline sits at ~0.0019 (codec floor); the pre-fix onset splice
-        // measured ~0.0087. 0.004 separates the two with margin on both sides.
+        // Fixed pipeline sits at ~0.0010 (codec floor, once the capture APM stopped
+        // band-splitting for the full-band HPF); the pre-fix onset splice measured
+        // ~0.0087. 0.004 separates the two with margin on both sides.
         assert!(
             residual < 0.004,
             "unmute resume injected a discontinuity: peak prediction residual {residual:.5} \

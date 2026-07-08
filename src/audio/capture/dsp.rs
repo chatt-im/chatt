@@ -3,7 +3,7 @@ use std::collections::VecDeque;
 use earshot::Detector as EarshotDetector;
 use nnnoiseless::DenoiseState;
 use sonora::config::{
-    AdaptiveDigital, EchoCanceller as Aec3Config, GainController2, HighPassFilter, NoiseSuppression,
+    AdaptiveDigital, EchoCanceller as Aec3Config, GainController2, NoiseSuppression,
 };
 use sonora::{AudioProcessing, Config as ApmConfig, StreamConfig as ApmStreamConfig};
 
@@ -118,12 +118,20 @@ impl CaptureGain {
     }
 }
 
-/// Builds the live capture APM config bundling the always-on high-pass filter
-/// with the optionally-enabled AEC3, spectral noise suppression, and AGC2
-/// passes. A pass left out of the config is not run, so a well-levelled rig with
-/// echo off and a non-spectral denoise engine pays only for the high-pass
-/// filter and any enabled gain. RNNoise denoising runs outside the APM (see
-/// [`CaptureProcessor::process`]).
+/// Builds the live capture APM config for the optionally-enabled AEC3, spectral
+/// noise suppression, and AGC2 passes. A pass left out of the config is not run,
+/// so a well-levelled rig with echo off and a non-spectral denoise engine pays
+/// only for any enabled gain. The high-pass filter is deliberately *not* an APM
+/// submodule here: it runs as a standalone full-band pre-stage
+/// ([`CaptureProcessor::high_pass`]) instead. WebRTC counts an enabled HPF as a
+/// multi-band submodule, which forces the APM to band-split and — under sonora's
+/// 32 kHz internal-rate cap — resample every 48 kHz frame down to 32 kHz and
+/// back, a no-op QMF round-trip plus a 16 kHz low-pass whenever AEC and NS are
+/// both off (the default config). Filtering full-band outside the APM leaves the
+/// APM with no multi-band submodule in that case, so it processes natively at
+/// 48 kHz with no split and no resampler. When AEC or spectral NS *is* on the
+/// APM band-splits at its native 32 kHz for those passes, exactly as upstream.
+/// RNNoise denoising runs outside the APM too (see [`CaptureProcessor::process`]).
 fn capture_apm_config(denoise: DenoiseConfig, echo: bool, max_gain_db: f32) -> ApmConfig {
     let gain_controller2 = (max_gain_db.is_finite() && max_gain_db > 0.0).then(|| {
         let max_gain_db = max_gain_db.min(MAX_CAPTURE_GAIN_DB);
@@ -138,7 +146,6 @@ fn capture_apm_config(denoise: DenoiseConfig, echo: bool, max_gain_db: f32) -> A
         }
     });
     ApmConfig {
-        high_pass_filter: Some(HighPassFilter::default()),
         echo_canceller: echo.then(Aec3Config::default),
         noise_suppression: matches!(denoise, DenoiseConfig::Spectral)
             .then(NoiseSuppression::default),
@@ -156,15 +163,21 @@ const ECHO_BACKLOG_TARGET_FRAMES: usize = 4;
 /// above the setpoint, keeping per-tick API-call jitter bounded.
 const ECHO_MAX_FEED_FRAMES: usize = 2;
 
-/// Consolidated live capture front-end: one sonora WebRTC `AudioProcessing`
-/// instance running the high-pass filter, AEC3, optional spectral noise
-/// suppression, and AGC2 in the canonical WebRTC order in a single pass. With
-/// the [`DenoiseConfig::RnnNoise`] engine, the higher-quality RNNoise denoiser
-/// runs after that pass instead of the APM's spectral suppressor, matching the
-/// historical "denoise last" ordering and supplying the VAD. Processes one 10 ms
-/// mono frame at 48 kHz per call inside the capture worker, never a realtime
-/// callback. AEC and gain toggle at runtime through `apply_config`.
+/// Consolidated live capture front-end: a standalone full-band high-pass filter
+/// followed by one sonora WebRTC `AudioProcessing` instance running AEC3,
+/// optional spectral noise suppression, and AGC2 in the canonical WebRTC order.
+/// The high-pass runs ahead of the APM (still first, still full-band, matching
+/// WebRTC's `apply_in_full_band` ordering) rather than as an APM submodule, so
+/// that with AEC and spectral NS off the APM has no multi-band pass and stays on
+/// the native 48 kHz path with no band-split or resampler round-trip (see
+/// [`capture_apm_config`]). With the [`DenoiseConfig::RnnNoise`] engine, the
+/// higher-quality RNNoise denoiser runs after the APM instead of the APM's
+/// spectral suppressor, matching the historical "denoise last" ordering and
+/// supplying the VAD. Processes one 10 ms mono frame at 48 kHz per call inside
+/// the capture worker, never a realtime callback. AEC and gain toggle at runtime
+/// through `apply_config`.
 pub(crate) struct CaptureProcessor {
+    high_pass: CaptureHighPass,
     apm: AudioProcessing,
     denoise: DenoiseConfig,
     echo_enabled: bool,
@@ -196,6 +209,7 @@ impl CaptureProcessor {
             state
         });
         Self {
+            high_pass: CaptureHighPass::new(),
             apm,
             denoise,
             echo_enabled,
@@ -253,6 +267,10 @@ impl CaptureProcessor {
         if frame.len() != FRAME_SAMPLES {
             return None;
         }
+        // Full-band high-pass first, ahead of the APM, so AEC3 and AGC2 see a
+        // DC-blocked signal while the APM itself carries no multi-band submodule
+        // (and thus no band-split/resample) when echo and spectral NS are off.
+        self.high_pass.process(frame);
         if self.echo_enabled {
             if let Some(reference) = reference {
                 self.feed_render(reference);

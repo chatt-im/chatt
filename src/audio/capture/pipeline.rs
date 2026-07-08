@@ -1570,11 +1570,12 @@ mod tests {
                 .unwrap();
         };
 
-        // Four speech frames make the transmitted-frame count going into
-        // suppression even, so a 480-sample partial is still pending when the
-        // gate suppresses — the stale buffer that used to desynchronise the mute
-        // fade-out from the clock.
-        for _ in 0..4 {
+        // Prime enough speech frames that the running transmitted-frame count is
+        // odd when the gate suppresses, so a 480-sample partial is still pending
+        // at that point — the stale buffer that used to desynchronise the mute
+        // fade-out from the clock. The count is one 10 ms Opus half-frame, so the
+        // exact priming depends on how many silence frames precede suppression.
+        for _ in 0..5 {
             push(&mut pipeline, &speech, false);
         }
         // Feed silence until the gate suppresses, recording the pending fill the
