@@ -536,6 +536,12 @@ pub enum NetworkEvent {
         payload_size: usize,
     },
     PlaybackFeedback(LivePlaybackFeedback),
+    /// A listener's reception report about *my* outbound stream, attributed to
+    /// the reporting user. Drives that user's roster-row outbound latency.
+    OutboundFeedback {
+        reporter: UserId,
+        feedback: LivePlaybackFeedback,
+    },
     /// Smoothed round-trip time to the server relay media socket, milliseconds.
     ServerRtt {
         rtt_ms: Option<u16>,
@@ -2680,22 +2686,28 @@ impl WorkerState {
                     }
                     Ok((
                         _,
-                        MediaPayload::VoiceFeedback {
+                        MediaPayload::VoiceFeedbackFrom {
+                            reporter,
                             stream_id,
                             feedback,
                         },
                     )) => {
                         let feedback = live_feedback_from_media(stream_id, feedback);
-                        self.handle_encoder_feedback(feedback, now);
+                        self.handle_encoder_feedback(reporter, feedback, now);
                     }
                     Ok((_, MediaPayload::Ping { nonce, .. })) => {
                         self.send_media(&MediaPayload::Pong { nonce });
                     }
                     Ok((_, MediaPayload::Bind { .. })) => {}
                     Ok((_, MediaPayload::NatProbe { .. })) => {}
+                    // Variants a client never receives from the server: peer media
+                    // arrives on the p2p socket, and the server upgrades every
+                    // relayed reception report to `VoiceFeedbackFrom`.
                     Ok((
                         _,
-                        MediaPayload::PeerVoice { .. } | MediaPayload::PeerVoiceFeedback { .. },
+                        MediaPayload::PeerVoice { .. }
+                        | MediaPayload::PeerVoiceFeedback { .. }
+                        | MediaPayload::VoiceFeedback { .. },
                     )) => {}
                     Err(error) => {
                         kvlog::warn!("udp packet rejected", packet_size = len, error = %error);
@@ -4982,8 +4994,12 @@ impl WorkerState {
                 if let Some(action) = action {
                     self.apply_p2p_actions(session_id, vec![action]);
                 }
-                let feedback = live_feedback_from_media(stream_id, feedback);
-                self.handle_encoder_feedback(feedback, now);
+                // The packet was matched to this p2p peer by route id, so the peer
+                // (and its user) is present; it is the reporting listener.
+                if let Some(reporter) = self.p2p_peers.get(&session_id).map(|peer| peer.user_id) {
+                    let feedback = live_feedback_from_media(stream_id, feedback);
+                    self.handle_encoder_feedback(reporter, feedback, now);
+                }
             }
             Ok(P2pMediaPacket::Ping { nonce, action }) => {
                 if let Some(action) = action {
@@ -5113,8 +5129,19 @@ impl WorkerState {
         }
     }
 
-    fn handle_encoder_feedback(&mut self, feedback: LivePlaybackFeedback, now: Instant) {
-        let _ = self.events.send(NetworkEvent::PlaybackFeedback(feedback));
+    /// Handles a reception report about *my own* outbound stream. `reporter` is
+    /// the listening user (stamped by the trusted server, or the known p2p peer);
+    /// the UI routes it to that user's roster row so outbound latency is
+    /// per-listener. Encoder adaptation stays aggregate across all reporters.
+    fn handle_encoder_feedback(
+        &mut self,
+        reporter: UserId,
+        feedback: LivePlaybackFeedback,
+        now: Instant,
+    ) {
+        let _ = self
+            .events
+            .send(NetworkEvent::OutboundFeedback { reporter, feedback });
         kvlog::info!(
             "playback feedback received",
             stream_id = feedback.stream_id,
@@ -5617,6 +5644,7 @@ fn media_payload_kind(payload: &MediaPayload) -> &'static str {
         MediaPayload::PeerVoice { .. } => "peer_voice",
         MediaPayload::VoiceFeedback { .. } => "voice_feedback",
         MediaPayload::PeerVoiceFeedback { .. } => "peer_voice_feedback",
+        MediaPayload::VoiceFeedbackFrom { .. } => "voice_feedback_from",
         MediaPayload::Ping { .. } => "ping",
         MediaPayload::Pong { .. } => "pong",
     }

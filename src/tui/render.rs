@@ -314,7 +314,7 @@ fn draw_user_list(
         let marker = if selected { ">" } else { " " };
         let (status_marker, status_style) = room_user_status_indicator(app, participant);
         let control = room_user_control_label(app, participant);
-        let voice = room_user_voice_feedback_label(app, participant);
+        let voice = room_user_voice_feedback_label(app.lobby_details, participant);
         row.with(base).fill(buf);
         row.with(style).with(Ellipsis(true)).text(
             buf,
@@ -869,37 +869,62 @@ fn draw_server_select_item(
     }
 }
 
-fn room_user_voice_feedback_label(app: &App, participant: &ParticipantState) -> String {
-    let Some(feedback) = participant.voice_feedback else {
-        return String::new();
+fn room_user_voice_feedback_label(lobby_details: bool, participant: &ParticipantState) -> String {
+    // Each directional link is owned by the receiver of that audio. Inbound
+    // (this user -> me) is my local NetEQ estimate of their stream; outbound
+    // (me -> this user) is this user's own inbound estimate for my stream, reported
+    // back and attributed to their row. Both reuse the peer's end-to-end RTT
+    // (round-trip already covers me -> them), halved to one way. The self row has
+    // no peer link and carries neither side, so it renders blank.
+    let rtt_ms = participant.peer_rtt_ms;
+    let fresh = |feedback: &ParticipantVoiceFeedback| {
+        feedback.updated_at.elapsed() <= Duration::from_secs(10)
     };
-    if !participant.voice_active || feedback.updated_at.elapsed() > Duration::from_secs(10) {
-        return String::new();
-    }
-    // Every remote participant carries its own end-to-end RTT (direct p2p, or
-    // relayed peer pings covering both network legs). The self row has no peer
-    // to probe, so its network leg is the link to the relay. Halved to one-way.
-    let rtt_ms = if Some(participant.user_id) == app.user_id {
-        app.server_rtt_ms
+    let inbound = participant
+        .voice_feedback
+        .filter(|feedback| participant.voice_active && fresh(feedback));
+    let outbound = participant.outbound_feedback.filter(fresh);
+
+    let (inbound, outbound) = if lobby_details {
+        (
+            inbound.map(|feedback| voice_feedback_stats(&feedback, rtt_ms)),
+            outbound.map(|feedback| voice_feedback_stats(&feedback, rtt_ms)),
+        )
     } else {
-        participant.peer_rtt_ms
+        // Collapsed default: mouth-to-ear-ish estimate per direction.
+        (
+            inbound.map(|feedback| {
+                format!("{}ms", participant_latency_estimate_ms(&feedback, rtt_ms))
+            }),
+            outbound.map(|feedback| {
+                format!("{}ms", participant_latency_estimate_ms(&feedback, rtt_ms))
+            }),
+        )
     };
-    if app.lobby_details {
-        let net = match rtt_ms {
-            Some(rtt) => format!("net{}", rtt / 2),
-            None => "net?".to_string(),
-        };
-        return format!(
-            "loss{} jb{}/{} r{} j{} {net}",
-            feedback.loss_percent,
-            feedback.max_neteq_playout_delay_ms,
-            feedback.max_neteq_target_ms,
-            feedback.max_output_ring_ms,
-            feedback.max_interarrival_jitter_ms,
-        );
+    // `inbound -> outbound`, with the arrow kept when one side is absent so the
+    // remaining figure's direction stays unambiguous.
+    match (inbound, outbound) {
+        (Some(inbound), Some(outbound)) => format!("{inbound} -> {outbound}"),
+        (Some(inbound), None) => format!("{inbound} ->"),
+        (None, Some(outbound)) => format!("-> {outbound}"),
+        (None, None) => String::new(),
     }
-    // Collapsed default: a single mouth-to-ear-ish latency estimate.
-    format!("~{}ms", participant_latency_estimate_ms(&feedback, rtt_ms))
+}
+
+/// Renders one direction's detailed reception stats for the `/stats` lobby view.
+fn voice_feedback_stats(feedback: &ParticipantVoiceFeedback, rtt_ms: Option<u16>) -> String {
+    let net = match rtt_ms {
+        Some(rtt) => format!("net{}", rtt / 2),
+        None => "net?".to_string(),
+    };
+    format!(
+        "loss{} jb{}/{} r{} j{} {net}",
+        feedback.loss_percent,
+        feedback.max_neteq_playout_delay_ms,
+        feedback.max_neteq_target_ms,
+        feedback.max_output_ring_ms,
+        feedback.max_interarrival_jitter_ms,
+    )
 }
 
 /// Combines the stabilized jitter-buffer depth (an EWMA of the NetEQ target that
@@ -1551,6 +1576,7 @@ fn selected_chat_heading_style(theme: Theme, accent: Style) -> Option<Style> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rpc::ids::{StreamId, UserId};
 
     fn feedback(jitter_buffer_ms: u16, ring_ms: u16) -> ParticipantVoiceFeedback {
         ParticipantVoiceFeedback {
@@ -1577,6 +1603,56 @@ mod tests {
     fn latency_estimate_tolerates_missing_rtt() {
         // Without an RTT sample the network leg contributes nothing.
         assert_eq!(participant_latency_estimate_ms(&feedback(60, 10), None), 70);
+    }
+
+    #[test]
+    fn voice_label_shows_both_directions_with_arrow() {
+        let mut participant = ParticipantState::for_test(UserId(1));
+        participant.peer_rtt_ms = Some(40);
+        participant.active_stream = Some(StreamId(7));
+        participant.voice_feedback = Some(feedback(60, 10)); // inbound: 60 + 10 + 20 = 90
+        participant.outbound_feedback = Some(feedback(30, 10)); // outbound: 30 + 10 + 20 = 60
+
+        assert_eq!(
+            room_user_voice_feedback_label(false, &participant),
+            "90ms -> 60ms"
+        );
+    }
+
+    #[test]
+    fn voice_label_keeps_arrow_for_single_present_direction() {
+        let mut participant = ParticipantState::for_test(UserId(1));
+        participant.peer_rtt_ms = Some(40);
+        participant.outbound_feedback = Some(feedback(30, 10));
+
+        // Only outbound present (no inbound stream/report yet).
+        assert_eq!(
+            room_user_voice_feedback_label(false, &participant),
+            "-> 60ms"
+        );
+
+        // Only inbound present.
+        participant.outbound_feedback = None;
+        participant.voice_feedback = Some(feedback(60, 10));
+        assert_eq!(
+            room_user_voice_feedback_label(false, &participant),
+            "90ms ->"
+        );
+    }
+
+    #[test]
+    fn voice_label_stats_view_joins_both_directions() {
+        let mut participant = ParticipantState::for_test(UserId(1));
+        participant.peer_rtt_ms = Some(40);
+        participant.voice_feedback = Some(feedback(60, 10));
+        participant.outbound_feedback = Some(feedback(30, 10));
+
+        let label = room_user_voice_feedback_label(true, &participant);
+        assert!(
+            label.contains(" -> "),
+            "stats view joins directions: {label}"
+        );
+        assert_eq!(label.matches("net20").count(), 2);
     }
 
     #[test]

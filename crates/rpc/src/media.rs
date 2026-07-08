@@ -1,5 +1,5 @@
 use crate::crypto::{self, AntiReplay, CryptoError, KeyMaterial, SessionTransport, TransportMode};
-use crate::ids::StreamId;
+use crate::ids::{StreamId, UserId};
 
 pub const UDP_VERSION: u8 = 4;
 pub const UDP_HEADER_LEN: usize = 14;
@@ -14,6 +14,7 @@ pub const KIND_PEER_VOICE: u8 = 5;
 pub const KIND_NAT_PROBE: u8 = 6;
 pub const KIND_VOICE_FEEDBACK: u8 = 7;
 pub const KIND_PEER_VOICE_FEEDBACK: u8 = 8;
+pub const KIND_VOICE_FEEDBACK_FROM: u8 = 9;
 const VOICE_PAYLOAD_OPUS: u8 = 0;
 const VOICE_PAYLOAD_SILENCE: u8 = 1;
 
@@ -63,6 +64,15 @@ pub enum MediaPayload {
     },
     PeerVoiceFeedback {
         connection_id: u64,
+        stream_id: StreamId,
+        feedback: VoiceFeedback,
+    },
+    /// Server-stamped relay of a listener's reception report about the recipient's
+    /// own outbound stream. `reporter` is the listening user, filled in by the
+    /// trusted server (clients never author it); `stream_id` is the recipient's
+    /// stream. Only ever travels server -> stream owner.
+    VoiceFeedbackFrom {
+        reporter: UserId,
         stream_id: StreamId,
         feedback: VoiceFeedback,
     },
@@ -445,7 +455,8 @@ pub fn parse_header(bytes: &[u8]) -> Result<(UdpHeader, &[u8]), MediaError> {
         | KIND_PEER_VOICE
         | KIND_NAT_PROBE
         | KIND_VOICE_FEEDBACK
-        | KIND_PEER_VOICE_FEEDBACK => {}
+        | KIND_PEER_VOICE_FEEDBACK
+        | KIND_VOICE_FEEDBACK_FROM => {}
         _ => return Err(MediaError::UnknownKind(kind)),
     }
     Ok((
@@ -468,6 +479,7 @@ impl MediaPayload {
             MediaPayload::PeerVoice { .. } => KIND_PEER_VOICE,
             MediaPayload::VoiceFeedback { .. } => KIND_VOICE_FEEDBACK,
             MediaPayload::PeerVoiceFeedback { .. } => KIND_PEER_VOICE_FEEDBACK,
+            MediaPayload::VoiceFeedbackFrom { .. } => KIND_VOICE_FEEDBACK_FROM,
             MediaPayload::Ping { .. } => KIND_PING,
             MediaPayload::Pong { .. } => KIND_PONG,
         }
@@ -530,6 +542,15 @@ pub fn encode_payload_into(payload: &MediaPayload, out: &mut Vec<u8>) -> Result<
             feedback,
         } => {
             out.extend_from_slice(&connection_id.to_le_bytes());
+            out.extend_from_slice(&stream_id.0.to_le_bytes());
+            encode_voice_feedback(*feedback, out);
+        }
+        MediaPayload::VoiceFeedbackFrom {
+            reporter,
+            stream_id,
+            feedback,
+        } => {
+            out.extend_from_slice(&reporter.0.to_le_bytes());
             out.extend_from_slice(&stream_id.0.to_le_bytes());
             encode_voice_feedback(*feedback, out);
         }
@@ -624,6 +645,16 @@ pub fn decode_payload(kind: u8, bytes: &[u8]) -> Result<MediaPayload, MediaError
             }
             Ok(MediaPayload::PeerVoiceFeedback {
                 connection_id: u64::from_le_bytes(bytes[0..8].try_into().unwrap()),
+                stream_id: StreamId(u32::from_le_bytes(bytes[8..12].try_into().unwrap())),
+                feedback: decode_voice_feedback(&bytes[12..])?,
+            })
+        }
+        KIND_VOICE_FEEDBACK_FROM => {
+            if bytes.len() != 38 {
+                return Err(MediaError::InvalidPayload);
+            }
+            Ok(MediaPayload::VoiceFeedbackFrom {
+                reporter: UserId(u64::from_le_bytes(bytes[0..8].try_into().unwrap())),
                 stream_id: StreamId(u32::from_le_bytes(bytes[8..12].try_into().unwrap())),
                 feedback: decode_voice_feedback(&bytes[12..])?,
             })
@@ -826,6 +857,49 @@ mod tests {
         assert_eq!(
             decode_payload(KIND_PEER_VOICE_FEEDBACK, &encoded).unwrap(),
             payload
+        );
+    }
+
+    #[test]
+    fn voice_feedback_from_payload_round_trips() {
+        let feedback = VoiceFeedback {
+            highest_contiguous_sequence: 82,
+            expected_packets: 27,
+            lost_packets: 6,
+            late_packets: 4,
+            duplicate_packets: 3,
+            reordered_packets: 5,
+            window_ms: 502,
+            max_output_ring_ms: 242,
+            max_neteq_target_ms: 122,
+            max_neteq_playout_delay_ms: 162,
+            max_neteq_packet_buffer_ms: 82,
+            max_interarrival_jitter_ms: 89,
+        };
+        let payload = MediaPayload::VoiceFeedbackFrom {
+            reporter: UserId(7),
+            stream_id: StreamId(9),
+            feedback,
+        };
+        let encoded = encode_payload(&payload).unwrap();
+        assert_eq!(
+            decode_payload(KIND_VOICE_FEEDBACK_FROM, &encoded).unwrap(),
+            payload
+        );
+    }
+
+    #[test]
+    fn voice_feedback_from_rejects_wrong_length() {
+        let payload = MediaPayload::VoiceFeedbackFrom {
+            reporter: UserId(7),
+            stream_id: StreamId(9),
+            feedback: VoiceFeedback::default(),
+        };
+        let mut encoded = encode_payload(&payload).unwrap();
+        encoded.push(0);
+        assert_eq!(
+            decode_payload(KIND_VOICE_FEEDBACK_FROM, &encoded).unwrap_err(),
+            MediaError::InvalidPayload
         );
     }
 

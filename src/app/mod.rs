@@ -2501,6 +2501,9 @@ impl App {
             NetworkEvent::PlaybackFeedback(feedback) => {
                 self.room.playback_feedback(feedback);
             }
+            NetworkEvent::OutboundFeedback { reporter, feedback } => {
+                self.room.outbound_feedback(reporter, feedback);
+            }
             NetworkEvent::ServerRtt { rtt_ms } => {
                 self.server_rtt_ms = rtt_ms;
             }
@@ -5687,6 +5690,7 @@ fn network_event_kind(event: &NetworkEvent) -> &'static str {
         NetworkEvent::PeerTransport { .. } => "peer_transport",
         NetworkEvent::VoicePacketObserved { .. } => "voice_packet_observed",
         NetworkEvent::PlaybackFeedback(_) => "playback_feedback",
+        NetworkEvent::OutboundFeedback { .. } => "outbound_feedback",
         NetworkEvent::ServerRtt { .. } => "server_rtt",
         NetworkEvent::PeerRtt { .. } => "peer_rtt",
         NetworkEvent::VoiceStatus { .. } => "voice_status",
