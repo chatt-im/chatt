@@ -1549,7 +1549,7 @@ mod tests {
 
     #[test]
     fn neteq_assist_ring_is_mixed_before_direct_pull() {
-        let source = NetEqMixerSource::new(SharedNetEqStream::new(test_tuning()).unwrap());
+        let source = NetEqMixerSource::new(SharedNetEqStream::new(test_tuning()).unwrap(), true);
         source.render_ring.write_samples(&vec![0.25; FRAME_SAMPLES]);
 
         let mut mixer = LivePlaybackMixer::new();
@@ -1567,7 +1567,7 @@ mod tests {
 
     #[test]
     fn neteq_assist_underrun_does_not_wait_for_worker_lock() {
-        let source = NetEqMixerSource::new(SharedNetEqStream::new(test_tuning()).unwrap());
+        let source = NetEqMixerSource::new(SharedNetEqStream::new(test_tuning()).unwrap(), true);
         source
             .assist
             .note_direct_render(Duration::from_micros(1_000));
@@ -1821,7 +1821,7 @@ mod tests {
     fn render_records_attribute_each_stream_per_block() {
         let mut mixer = LivePlaybackMixer::new();
         mixer.ensure_stream(1, ring_with(&[0.5; FRAME_SAMPLES * 2]));
-        let source = NetEqMixerSource::new(SharedNetEqStream::new(test_tuning()).unwrap());
+        let source = NetEqMixerSource::new(SharedNetEqStream::new(test_tuning()).unwrap(), false);
         mixer.ensure_stream(2, MixerStreamSource::NetEq(source));
 
         let mut out = vec![0.0; FRAME_SAMPLES];

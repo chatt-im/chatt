@@ -582,6 +582,14 @@ fn settings_ui(
     {
         form.set_help("Requested playback buffer in samples, or default for the host backend.");
     }
+    if form
+        .checkbox("Render Assist", &mut draft.latency.render_assist)
+        .is_focus()
+    {
+        form.set_help(
+            "Pre-renders playout blocks off the audio callback thread. Enable only on devices too slow to decode within the callback; it adds output latency, so leave it off on capable hardware.",
+        );
+    }
 
     form.section("Web Log Server");
     if form.checkbox("Web Log", &mut draft.web_enabled).is_focus() {

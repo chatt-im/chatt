@@ -233,7 +233,10 @@ fn shared_tone_source(
     packets: u32,
     now: Instant,
 ) -> NetEqMixerSource {
-    NetEqMixerSource::new(shared_tone_stream(tuning, encoder, packets, now))
+    NetEqMixerSource::new(
+        shared_tone_stream(tuning, encoder, packets, now),
+        tuning.render_assist,
+    )
 }
 
 #[test]

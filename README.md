@@ -361,7 +361,10 @@ Latency controls live under `[audio.latency]` in `chatt.toml`. The defaults
 enable capture silence gating and a 60 ms NetEQ start delay. Set
 `capture-silence-gate = false` to isolate sender-side silence suppression during
 testing, and tune `neteq-min-delay-ms`, `neteq-base-minimum-delay-ms`, or
-`neteq-max-delay-ms` when profiling receive latency.
+`neteq-max-delay-ms` when profiling receive latency. Set `render-assist = true`
+(default `false`) only on devices too slow to render a NetEQ block within the
+audio callback: it pre-renders playout blocks off the callback thread at the cost
+of a deeper staged output ring, so capable hardware should leave it off.
 
 Set `echo-cancellation = true` under `[audio]` to remove far-end speaker audio
 from the microphone before encoding. It uses the speaker mix as the echo
