@@ -519,6 +519,66 @@ impl VoicePayloadRef<'_> {
     }
 }
 
+/// Reserved playback stream id for the settings-only microphone loopback
+/// monitor. Server-assigned voice ids start at 1 and climb, and notifications
+/// take `u32::MAX`, so this sentinel never collides with a real stream.
+pub const LOOPBACK_STREAM_ID: u32 = u32::MAX - 1;
+
+/// Shared handle that lets the capture encoder thread route local frames into
+/// the live playback pipeline, for the settings loopback monitor. Installed with
+/// a [`LivePlaybackSink`] while loopback is on and cleared when it is off; the
+/// capture closure holds a clone and reads it once per frame.
+///
+/// The `Mutex` is taken on the encoder worker thread (~once per 20 ms), off the
+/// realtime audio callback, so it is not on a hot path.
+#[derive(Clone, Default)]
+pub struct LoopbackTap {
+    sink: Arc<Mutex<Option<crate::audio::lifecycle::LivePlaybackSink>>>,
+    sequence: Arc<AtomicU32>,
+}
+
+impl LoopbackTap {
+    /// Installs the destination sink and starts the loopback stream so pushed
+    /// frames are decoded. Resets the sequence counter for the fresh stream.
+    pub fn install(&self, sink: crate::audio::lifecycle::LivePlaybackSink) {
+        sink.start_stream(LOOPBACK_STREAM_ID);
+        self.sequence.store(0, Ordering::Relaxed);
+        *self.sink.lock().expect("loopback tap poisoned") = Some(sink);
+    }
+
+    /// Removes the destination sink. Pushed frames become no-ops until the next
+    /// [`Self::install`].
+    pub fn clear(&self) {
+        *self.sink.lock().expect("loopback tap poisoned") = None;
+    }
+
+    /// True while a sink is installed, i.e. loopback is on. The single source of
+    /// truth for the enabled state, so the app carries no separate flag.
+    pub fn is_active(&self) -> bool {
+        self.sink.lock().expect("loopback tap poisoned").is_some()
+    }
+
+    /// Routes one captured frame into the loopback stream when a sink is
+    /// installed. A no-op otherwise.
+    pub fn push_frame(&self, frame: &LocalVoiceFrame) {
+        let mut guard = self.sink.lock().expect("loopback tap poisoned");
+        let Some(sink) = guard.as_ref() else {
+            return;
+        };
+        let still_connected = sink.try_push(RemoteVoicePacket {
+            stream_id: LOOPBACK_STREAM_ID,
+            sequence: self.sequence.fetch_add(1, Ordering::Relaxed),
+            timestamp: frame.timestamp,
+            flags: frame.flags,
+            payload: frame.payload.clone(),
+            received_at: Instant::now(),
+        });
+        if !still_connected {
+            *guard = None;
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct PlaybackStreamControl {
     pub muted: bool,

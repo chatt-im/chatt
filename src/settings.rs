@@ -84,6 +84,11 @@ pub struct SettingsDraft {
     pub(crate) dred: DredConfig,
     pub(crate) echo_cancellation: bool,
     pub(crate) latency: AudioLatencyConfig,
+    /// Transient settings-only microphone loopback monitor. Never persisted:
+    /// [`SettingsDraft::from_audio`] always seeds it off and
+    /// [`SettingsDraft::to_audio`] ignores it, matching the auto-disable-on-close
+    /// contract enforced in the app.
+    pub(crate) loopback: bool,
 }
 
 impl SettingsDraft {
@@ -147,6 +152,7 @@ impl SettingsDraft {
             dred: config.dred,
             echo_cancellation: config.echo_cancellation,
             latency: config.latency.clone(),
+            loopback: false,
         }
     }
 
@@ -1194,6 +1200,19 @@ mod tests {
             preview: None,
             issue: (!supported).then(|| "unsupported".to_string()),
         }
+    }
+
+    #[test]
+    fn settings_draft_never_persists_loopback() {
+        // Loopback is a transient settings-only toggle: it must default off and
+        // never leak into the saved audio config.
+        let mut draft = SettingsDraft::from_audio(&AudioConfig::default());
+        assert!(!draft.loopback);
+
+        draft.loopback = true;
+        let audio = draft.to_audio();
+        // Re-deriving a draft from the produced config keeps loopback off.
+        assert!(!SettingsDraft::from_audio(&audio).loopback);
     }
 
     #[test]
