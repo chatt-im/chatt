@@ -3,6 +3,7 @@ use std::{
     sync::{
         Arc,
         atomic::{AtomicBool, AtomicU32, Ordering},
+        mpsc::TrySendError,
         mpsc::{Receiver, Sender, SyncSender, sync_channel},
     },
     thread::{self, JoinHandle},
@@ -411,7 +412,14 @@ impl LivePlaybackSink {
     }
 
     pub fn push(&self, packet: RemoteVoicePacket) {
-        let _ = self.sender.try_send(LivePlaybackCommand::Packet(packet));
+        let _ = self.try_push(packet);
+    }
+
+    pub(crate) fn try_push(&self, packet: RemoteVoicePacket) -> bool {
+        match self.sender.try_send(LivePlaybackCommand::Packet(packet)) {
+            Ok(()) | Err(TrySendError::Full(_)) => true,
+            Err(TrySendError::Disconnected(_)) => false,
+        }
     }
 
     /// Constructs a sink whose receiver is immediately dropped, for tests in
@@ -1020,5 +1028,67 @@ mod tests {
         sender.send(LivePlaybackCommand::Shutdown).unwrap();
 
         worker.join().unwrap();
+    }
+
+    #[test]
+    fn loopback_tap_emits_incrementing_sequence_on_loopback_stream() {
+        use crate::audio::shared::{LOOPBACK_STREAM_ID, LoopbackTap, VoicePayload};
+
+        let (sender, receiver) = sync_channel(LIVE_PLAYBACK_COMMAND_CAPACITY);
+        let sink = LivePlaybackSink { sender };
+        let tap = LoopbackTap::default();
+
+        let frame = |timestamp| LocalVoiceFrame {
+            flags: 7,
+            payload: VoicePayload::Opus(vec![1, 2, 3]),
+            timestamp,
+        };
+
+        // No sink installed: pushing a frame is a silent no-op.
+        tap.push_frame(&frame(0));
+        assert!(receiver.try_recv().is_err());
+
+        // Installing starts the loopback stream before any packet.
+        tap.install(sink);
+        match receiver.try_recv().unwrap() {
+            LivePlaybackCommand::StartStream(id) => assert_eq!(id, LOOPBACK_STREAM_ID),
+            _ => panic!("expected StartStream on install"),
+        }
+
+        for expected_sequence in 0..3 {
+            tap.push_frame(&frame(expected_sequence * 960));
+            match receiver.try_recv().unwrap() {
+                LivePlaybackCommand::Packet(packet) => {
+                    assert_eq!(packet.stream_id, LOOPBACK_STREAM_ID);
+                    assert_eq!(packet.sequence, expected_sequence);
+                    assert_eq!(packet.timestamp, expected_sequence * 960);
+                    assert_eq!(packet.flags, 7);
+                    assert_eq!(packet.payload, VoicePayload::Opus(vec![1, 2, 3]));
+                }
+                _ => panic!("expected Packet after push"),
+            }
+        }
+
+        // Clearing detaches the sink: further frames are dropped.
+        tap.clear();
+        tap.push_frame(&frame(0));
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn loopback_tap_clears_disconnected_sink() {
+        use crate::audio::shared::{LoopbackTap, VoicePayload};
+
+        let tap = LoopbackTap::default();
+        tap.install(LivePlaybackSink::for_test());
+        assert!(tap.is_active());
+
+        tap.push_frame(&LocalVoiceFrame {
+            flags: 0,
+            payload: VoicePayload::Opus(vec![1]),
+            timestamp: 0,
+        });
+
+        assert!(!tap.is_active());
     }
 }

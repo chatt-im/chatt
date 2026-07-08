@@ -35,6 +35,20 @@ fn prepare_screen(app: &mut App, buf: &mut Buffer) -> Option<StatsSnapshot> {
         .capture
         .as_ref()
         .map(|capture| capture.stats().snapshot());
+    let capture = match capture {
+        Some(mut snapshot) => {
+            let (rms, peak) =
+                app.mic_level_ballistics
+                    .smooth(snapshot.rms, snapshot.peak, Instant::now());
+            snapshot.rms = rms;
+            snapshot.peak = peak;
+            Some(snapshot)
+        }
+        None => {
+            app.mic_level_ballistics.reset();
+            None
+        }
+    };
     app.chrome.top_bar.live = Rect::EMPTY;
     app.chrome.top_bar.mute = Rect::EMPTY;
     app.chrome.top_bar.deafen = Rect::EMPTY;

@@ -53,15 +53,16 @@ use crate::{
         DeviceAction, DeviceSide, FieldId, FieldIntent, SettingsButton, SettingsOutput,
         capture_device_id, playback_device_id,
     },
+    ui::vu::MicLevelBallistics,
     ui::welcome::WelcomeDraft,
 };
 
 use crate::audio::{
-    self, AudioStartError, BufferRequest, DeviceInfo, EchoCancellationControl,
+    self, AudioStartError, BufferRequest, DeviceInfo, EchoCancellationControl, LOOPBACK_STREAM_ID,
     LiveAudioFileSourceConfig, LiveAudioFileSourceReport, LiveAudioMuteState,
     LiveAudioPacketLossProfile, LiveCapture, LiveCaptureConfig, LiveEncoderProfile, LivePlayback,
     LivePlaybackConfig, LivePlaybackFeedback, LivePlaybackSink, LivePlaybackSnapshot,
-    LocalVoiceFrame, NotificationSound, PlaybackStreamControl,
+    LocalVoiceFrame, LoopbackTap, NotificationSound, PlaybackStreamControl,
 };
 
 use crate::audio::{AudioErrorKind, DeviceIdentityProbe};
@@ -354,10 +355,23 @@ pub(crate) struct App {
     pub mic_error: Option<String>,
     pub playback_error: Option<String>,
     pub capture: Option<LiveCapture>,
+    /// Fast-attack/slow-release smoothing for the mic VU meter and dB readout,
+    /// so noise-reduction gating faint background noise reads as a steady level
+    /// instead of flicker. Applied in `prepare_screen`; display-only.
+    pub mic_level_ballistics: MicLevelBallistics,
     pub settings_preview_capture: bool,
     pub settings_preview_refresh_id: Option<u64>,
     pub allow_settings_preview_capture: bool,
     pub playback: Option<LivePlayback>,
+    /// Dedicated playback stream backing the settings loopback monitor when no
+    /// call playback exists. `None` when loopback is off or reuses the live call
+    /// playback. See [`App::set_loopback_enabled`].
+    pub loopback_playback: Option<LivePlayback>,
+    /// Shared route the capture encoder thread reads to feed local frames into
+    /// the loopback stream. Cloned into the capture packet handler; whether a
+    /// sink is installed ([`LoopbackTap::is_active`]) is the enabled state, so no
+    /// separate flag is kept. Loopback is transient, settings-only, never saved.
+    loopback_tap: LoopbackTap,
     output_volume_percent_bits: Arc<AtomicU32>,
     pub soundboard_busy: Arc<AtomicBool>,
     pub soundboard_next_sequence: u32,
@@ -983,10 +997,13 @@ impl App {
             mic_error: None,
             playback_error: None,
             capture: None,
+            mic_level_ballistics: MicLevelBallistics::default(),
             settings_preview_capture: false,
             settings_preview_refresh_id: None,
             allow_settings_preview_capture: !soundboard_enabled,
             playback: None,
+            loopback_playback: None,
+            loopback_tap: LoopbackTap::default(),
             output_volume_percent_bits,
             soundboard_busy: Arc::new(AtomicBool::new(false)),
             soundboard_next_sequence: 0,
@@ -3132,6 +3149,10 @@ impl App {
 
     pub(crate) fn finish_settings_session(&mut self, session: &mut SettingsSession) {
         self.apply_active_capture_amplification(self.config.audio.max_amplification);
+        // Loopback is settings-only; guarantee it is off before the preview
+        // capture stops, regardless of how the session ends (close/cancel/save/quit).
+        self.set_loopback_enabled(false);
+        session.draft.loopback = false;
         self.settings_preview_refresh_id = None;
         self.stop_settings_preview_capture();
         session
@@ -3251,6 +3272,13 @@ impl App {
         self.apply_echo_cancellation_setting();
         self.apply_output_volume_setting();
         self.apply_active_capture_amplification(self.config.audio.max_amplification);
+        // Loopback is transient runtime state, not part of `AudioConfig`; reconcile
+        // it straight from the draft. A failed enable resets the draft toggle so the
+        // checkbox reflects the true state.
+        self.set_loopback_enabled(session.draft.loopback);
+        if session.draft.loopback && !self.loopback_tap.is_active() {
+            session.draft.loopback = false;
+        }
         let (capture, playback) = audio_restart_flags(&old, &self.config.audio);
         if capture || playback {
             self.schedule_audio_apply(capture, playback);
@@ -3458,7 +3486,11 @@ impl App {
         }
         if playback {
             self.supervisor.playback.reset();
-            self.restart_playback_stream();
+            if self.loopback_uses_dedicated_playback() {
+                self.restart_loopback_output();
+            } else {
+                self.restart_playback_stream();
+            }
             applied.push("playback");
         }
         if !applied.is_empty() {
@@ -4070,12 +4102,26 @@ impl App {
     }
 
     fn restart_playback_stream(&mut self) {
+        let restore_loopback = self.loopback_tap.is_active() && self.loopback_playback.is_none();
+        if restore_loopback {
+            self.loopback_tap.clear();
+        }
         if self.network.is_none() {
+            if restore_loopback {
+                self.restart_loopback_output();
+            }
             return;
         }
         self.set_network_playback_sink(None);
         self.playback.take();
         self.start_playback_stream(true);
+        if restore_loopback {
+            if self.playback.is_some() {
+                self.restart_loopback_output();
+            } else {
+                self.fail_loopback(AudioStartError::transient("voice playback is unavailable"));
+            }
+        }
     }
 
     /// Flushes the shared editor into the focused text field by replaying one
@@ -5215,11 +5261,15 @@ impl App {
         let event_tx = self.events.sender();
         let send_failed = Arc::new(AtomicBool::new(false));
         let voice_tx_enabled = Arc::clone(&self.voice_tx_enabled);
+        let loopback_tap = self.loopback_tap.clone();
         // Mute and deafen are handled inside the capture pipeline (fade-out tail
         // plus silence markers), so this handler only gates the hard transport
         // on/off. Dropping muted frames here would look like packet loss to the
         // receiver's jitter buffer.
         move |payload| {
+            // Loopback runs off the same captured frame, independent of the
+            // transport gate, so it works outside a call while settings is open.
+            loopback_tap.push_frame(&payload);
             if !voice_tx_enabled.load(Ordering::Relaxed) {
                 return;
             }
@@ -5383,6 +5433,8 @@ impl App {
     /// per-user audio controls. `capture_ok` gates the "voice active" status so a
     /// failed capture start does not look successful.
     fn start_playback_stream(&mut self, capture_ok: bool) {
+        let migrate_loopback_to_call =
+            self.loopback_tap.is_active() && self.loopback_playback.is_some();
         let (feedback_tx, feedback_rx) = mpsc::channel::<LivePlaybackFeedback>();
         let Some(network) = &self.network else {
             self.set_error("select a server before starting playback");
@@ -5477,6 +5529,9 @@ impl App {
                         self.set_status("voice active");
                     }
                 }
+                if migrate_loopback_to_call {
+                    self.restart_loopback_output();
+                }
             }
             Err(error) => {
                 self.set_network_playback_sink(None);
@@ -5492,6 +5547,122 @@ impl App {
                 self.supervisor
                     .playback
                     .on_rebuild_failed(now, error.kind, error.message);
+            }
+        }
+    }
+
+    /// Enables or disables the settings-only microphone loopback monitor.
+    /// Loopback re-injects captured frames into the live playback pipeline on a
+    /// reserved stream id, reusing the full decode/mixer/output path so the
+    /// monitor sounds exactly like what peers hear. Idempotent; only meaningful
+    /// while settings is open, and torn down by `finish_settings_session`.
+    pub(crate) fn set_loopback_enabled(&mut self, enabled: bool) {
+        if enabled && self.loopback_tap.is_active() {
+            return;
+        }
+        if !enabled && !self.loopback_tap.is_active() && self.loopback_playback.is_none() {
+            return;
+        }
+        if enabled {
+            if let Err(error) = self.enable_loopback() {
+                self.fail_loopback(error);
+                return;
+            }
+            self.set_status("loopback active");
+        } else {
+            self.disable_loopback();
+        }
+    }
+
+    fn enable_loopback(&mut self) -> Result<(), AudioStartError> {
+        self.ensure_loopback_capture()?;
+        // Reuse the in-call playback stream when present; otherwise stand up a
+        // dedicated monitor stream so loopback works with no server or call.
+        let sink = if self.playback.is_some() {
+            self.loopback_playback = None;
+            self.playback.as_ref().and_then(LivePlayback::sink)
+        } else {
+            self.loopback_playback = None;
+            let playback = self.start_loopback_playback()?;
+            let sink = playback.sink();
+            self.loopback_playback = Some(playback);
+            sink
+        };
+        let Some(sink) = sink else {
+            return Err(AudioStartError::transient(
+                "playback stream has no sink".to_string(),
+            ));
+        };
+        self.loopback_tap.install(sink);
+        Ok(())
+    }
+
+    fn ensure_loopback_capture(&mut self) -> Result<(), AudioStartError> {
+        if self.deafened.load(Ordering::Relaxed) {
+            return Err(AudioStartError::new(
+                AudioErrorKind::ConfigInvalid,
+                "undeafen before using loopback",
+            ));
+        }
+        if self.capture.is_none() {
+            self.start_settings_preview_capture_inner()?;
+        }
+        if self.capture.is_some() {
+            Ok(())
+        } else {
+            Err(AudioStartError::new(
+                AudioErrorKind::ConfigInvalid,
+                "microphone capture is unavailable for loopback",
+            ))
+        }
+    }
+
+    fn loopback_uses_dedicated_playback(&self) -> bool {
+        self.loopback_tap.is_active() && self.loopback_playback.is_some() && self.playback.is_none()
+    }
+
+    fn restart_loopback_output(&mut self) {
+        self.loopback_tap.clear();
+        self.loopback_playback = None;
+        if let Err(error) = self.enable_loopback() {
+            self.fail_loopback(error);
+        }
+    }
+
+    fn fail_loopback(&mut self, error: AudioStartError) {
+        self.loopback_tap.clear();
+        self.loopback_playback = None;
+        self.set_error(format!("loopback unavailable: {error}"));
+    }
+
+    /// Starts a dedicated playback stream for the loopback monitor, mirroring the
+    /// configured-then-default output fallback used by `start_playback_stream`.
+    fn start_loopback_playback(&self) -> Result<LivePlayback, AudioStartError> {
+        let configured_output = self.config.audio.output_device_id.clone();
+        let resolved_output = configured_output
+            .as_deref()
+            .filter(|id| !audio::configured_output_is_default(id))
+            .map(|id| id.to_string());
+        match audio::start_live_playback(self.live_playback_config(resolved_output.clone(), None)) {
+            Ok(playback) => Ok(playback),
+            Err(error) if resolved_output.is_some() => {
+                kvlog::warn!(
+                    "loopback output failed, trying default",
+                    error = error.message.as_str()
+                );
+                audio::start_live_playback(self.live_playback_config(None, None))
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn disable_loopback(&mut self) {
+        self.loopback_tap.clear();
+        if self.loopback_playback.take().is_none() {
+            // Loopback rode the live call playback; tear down just its stream,
+            // leaving the call audio intact.
+            if let Some(playback) = &self.playback {
+                playback.stop_stream(LOOPBACK_STREAM_ID);
             }
         }
     }
@@ -6135,6 +6306,34 @@ mod tests {
         let mut echo = base.clone();
         echo.echo_cancellation = !echo.echo_cancellation;
         assert_eq!(audio_restart_flags(&base, &echo), (false, false));
+    }
+
+    #[test]
+    fn loopback_enable_requires_capture_source() {
+        let mut app = test_app();
+        app.allow_settings_preview_capture = false;
+
+        app.set_loopback_enabled(true);
+
+        assert!(!app.loopback_tap.is_active());
+        assert!(app.loopback_playback.is_none());
+        assert_eq!(app.status.kind(), StatusKind::Error);
+        assert!(app.status.text().contains("loopback unavailable"));
+    }
+
+    #[test]
+    fn loopback_enable_rejects_deafened_state() {
+        let mut app = test_app();
+        app.deafened.store(true, Ordering::Relaxed);
+
+        app.set_loopback_enabled(true);
+
+        assert!(!app.loopback_tap.is_active());
+        assert!(app.loopback_playback.is_none());
+        assert_eq!(
+            app.status.text(),
+            "loopback unavailable: undeafen before using loopback"
+        );
     }
 
     #[test]

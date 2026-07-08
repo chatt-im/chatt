@@ -600,6 +600,11 @@ fn settings_ui(
             "Pre-renders playout blocks off the audio callback thread. Enable only on devices too slow to decode within the callback; it adds output latency, so leave it off on capable hardware.",
         );
     }
+    if form.checkbox("Loopback", &mut draft.loopback).is_focus() {
+        form.set_help(
+            "Plays your microphone back through the output device to test your setup. Turns off automatically when settings closes; use headphones to avoid feedback.",
+        );
+    }
 
     form.section("Web Log Server");
     if form.checkbox("Web Log", &mut draft.web_enabled).is_focus() {

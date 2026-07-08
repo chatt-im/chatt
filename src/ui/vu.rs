@@ -1,3 +1,5 @@
+use std::time::Instant;
+
 use extui::{Buffer, HAlign, Rect, Style, vt::Modifier};
 
 use crate::{audio::StatsSnapshot, theme::Theme};
@@ -7,6 +9,80 @@ const LOW_DB: f32 = -36.0;
 const GOOD_MIN_DB: f32 = -24.0;
 const GOOD_MAX_DB: f32 = -9.0;
 const PEAK_DB: f32 = -3.0;
+
+/// Rise time constant for the RMS bar and dB number: short so real speech
+/// onsets light the meter almost immediately.
+const RMS_ATTACK_TAU_S: f32 = 0.02;
+/// Fall time constant for the RMS bar and dB number: long enough to bridge the
+/// brief silences RNNoise punches into faint background noise, so the meter
+/// decays smoothly instead of flickering to the floor between dropouts.
+const RMS_RELEASE_TAU_S: f32 = 0.110;
+/// Decay time constant for the peak marker once the incoming peak drops below
+/// the held value; the peak still jumps up instantly.
+const PEAK_DECAY_TAU_S: f32 = 0.375;
+/// Gap beyond which the filter is treated as freshly started and adopts the raw
+/// values directly, rather than integrating one enormous `dt`.
+const RESYNC_GAP_S: f32 = 1.0;
+
+/// Fast-attack, slow-release ballistics for the mic level display. Holds the
+/// smoothed `rms`/`peak` between frames so faint noise gated on and off by
+/// noise reduction reads as a steady level instead of sporadic flicker. Purely
+/// a display filter: the stored capture levels are untouched.
+#[derive(Default)]
+pub(crate) struct MicLevelBallistics {
+    rms: f32,
+    peak: f32,
+    last: Option<Instant>,
+}
+
+impl MicLevelBallistics {
+    /// Advances the filter with the raw `rms`/`peak` from the latest capture
+    /// snapshot and returns the smoothed pair to display. The first call, or
+    /// one after a [`RESYNC_GAP_S`] gap, adopts the raw values so the meter does
+    /// not crawl up from zero on stream start.
+    pub(crate) fn smooth(&mut self, rms: f32, peak: f32, now: Instant) -> (f32, f32) {
+        let dt = match self.last {
+            Some(last) => now.saturating_duration_since(last).as_secs_f32(),
+            None => f32::INFINITY,
+        };
+        self.last = Some(now);
+
+        if !(dt < RESYNC_GAP_S) {
+            self.rms = rms;
+            self.peak = peak;
+            return (rms, peak);
+        }
+
+        let rms_tau = if rms > self.rms {
+            RMS_ATTACK_TAU_S
+        } else {
+            RMS_RELEASE_TAU_S
+        };
+        self.rms += (rms - self.rms) * coefficient(dt, rms_tau);
+
+        if peak >= self.peak {
+            self.peak = peak;
+        } else {
+            self.peak += (peak - self.peak) * coefficient(dt, PEAK_DECAY_TAU_S);
+        }
+
+        (self.rms, self.peak)
+    }
+
+    /// Clears the held state so the next [`Self::smooth`] starts fresh. Called
+    /// when capture stops, so a later resume does not decay a stale level.
+    pub(crate) fn reset(&mut self) {
+        self.rms = 0.0;
+        self.peak = 0.0;
+        self.last = None;
+    }
+}
+
+/// Frame-rate-independent smoothing weight for a step of `dt` seconds toward a
+/// target with time constant `tau`.
+fn coefficient(dt: f32, tau: f32) -> f32 {
+    1.0 - (-dt / tau).exp()
+}
 
 pub fn dbfs(level: f32) -> f32 {
     if level <= f32::EPSILON {
@@ -180,6 +256,8 @@ fn level_style(base: Style, rms_db: f32, peak_db: f32, theme: &Theme) -> Style {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::*;
 
     #[test]
@@ -193,6 +271,55 @@ mod tests {
         assert_eq!(filled_quarters(0.0, 10), 0);
         assert_eq!(filled_quarters(1.0, 10), 40);
         assert_eq!(filled_quarters(10.0_f32.powf(-30.0 / 20.0), 10), 20);
+    }
+
+    #[test]
+    fn first_sample_adopts_raw() {
+        let mut ballistics = MicLevelBallistics::default();
+        let now = Instant::now();
+        assert_eq!(ballistics.smooth(0.4, 0.6, now), (0.4, 0.6));
+    }
+
+    #[test]
+    fn attack_rises_quickly() {
+        let mut ballistics = MicLevelBallistics::default();
+        let start = Instant::now();
+        ballistics.smooth(0.0, 0.0, start);
+        // One 10 ms frame with a loud target reaches most of the way there.
+        let (rms, _) = ballistics.smooth(1.0, 1.0, start + Duration::from_millis(10));
+        assert!(rms > 0.15, "attack too slow: {rms}");
+    }
+
+    #[test]
+    fn release_bridges_dropouts() {
+        let mut ballistics = MicLevelBallistics::default();
+        let start = Instant::now();
+        // Settle at a steady level, then a single frame of NR-induced silence.
+        let mut now = start;
+        ballistics.smooth(0.5, 0.5, now);
+        for _ in 0..50 {
+            now += Duration::from_millis(10);
+            ballistics.smooth(0.5, 0.5, now);
+        }
+        now += Duration::from_millis(10);
+        let (rms, _) = ballistics.smooth(0.0, 0.0, now);
+        assert!(rms > 0.4, "release collapsed on a single dropout: {rms}");
+    }
+
+    #[test]
+    fn peak_holds_then_decays() {
+        let mut ballistics = MicLevelBallistics::default();
+        let start = Instant::now();
+        ballistics.smooth(0.0, 0.0, start);
+        // A spike is adopted instantly.
+        let (_, peak) = ballistics.smooth(0.0, 0.9, start + Duration::from_millis(10));
+        assert_eq!(peak, 0.9);
+        // A following lower reading decays rather than snapping down.
+        let (_, peak) = ballistics.smooth(0.0, 0.1, start + Duration::from_millis(20));
+        assert!(
+            peak > 0.1 && peak < 0.9,
+            "peak did not decay smoothly: {peak}"
+        );
     }
 
     #[test]
