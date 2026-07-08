@@ -212,20 +212,21 @@ where
         let dequeued_at = Instant::now();
         let queue_depth_after_dequeue = stats.note_capture_chunk_dequeued();
         let queue_age = dequeued_at.saturating_duration_since(enqueued_at);
+        // Slave the media clock to cpal's capture timestamp before processing the
+        // chunk. This subsumes both capture xruns and software drops: a dropped
+        // callback simply leaves the counted clock behind the authoritative
+        // capture instant, which surfaces here as a concealable gap.
+        pipeline.note_capture_timestamp(timing.cpal_capture_ns)?;
+        // The software-drop counter no longer drives the clock (the timestamp path
+        // covers it); drain and log it purely as a backpressure signal.
         let dropped_samples = stats.take_dropped_capture_samples();
-        if dropped_samples > 0 {
-            let gap = dropped_samples * u64::from(crate::audio::shared::SAMPLE_RATE)
-                / u64::from(device_rate.max(1));
-            pipeline.note_capture_gap(gap as u32)?;
-            if audio_pop_logging_enabled() {
-                kvlog::info!(
-                    "audio pop capture dropped gap applied",
-                    callback_sequence = timing.callback_sequence,
-                    dropped_device_samples = dropped_samples,
-                    dropped_48k_samples = gap,
-                    device_rate
-                );
-            }
+        if dropped_samples > 0 && audio_pop_logging_enabled() {
+            kvlog::info!(
+                "audio pop capture software drop observed",
+                callback_sequence = timing.callback_sequence,
+                dropped_device_samples = dropped_samples,
+                device_rate
+            );
         }
         let requested_loss_percent = encoder_loss_percent.load(Ordering::Relaxed).min(100) as i32;
         if requested_loss_percent != applied_loss_percent {
@@ -274,6 +275,18 @@ where
     }
 
     Ok(())
+}
+
+/// Anchor tying the counted media clock to cpal's authoritative capture
+/// timestamp. `last_effective_sample` is the media index (48 kHz) of the first
+/// sample of the callback captured at `last_capture_ns` nanoseconds since stream
+/// creation. Comparing the next callback's timestamp delta against how far the
+/// counted clock actually advanced reveals any span the hardware captured but the
+/// pipeline never saw.
+#[derive(Clone, Copy)]
+struct CaptureClock {
+    last_capture_ns: u64,
+    last_effective_sample: u32,
 }
 
 pub(crate) struct LiveEncoderPipeline {
@@ -331,6 +344,9 @@ pub(crate) struct LiveEncoderPipeline {
     /// slot, including suppressed-silence slots, so an emitted packet's
     /// timestamp reflects true elapsed media time across pauses.
     next_capture_sample: u32,
+    /// Slaving anchor for [`Self::note_capture_timestamp`]. `None` until the
+    /// first callback establishes it.
+    capture_clock: Option<CaptureClock>,
 }
 
 #[derive(Clone, Copy)]
@@ -396,6 +412,7 @@ impl LiveEncoderPipeline {
             echo_source,
             echo_reference_active: false,
             next_capture_sample: 0,
+            capture_clock: None,
         }
     }
 
@@ -465,6 +482,53 @@ impl LiveEncoderPipeline {
             .wrapping_add(gap_samples)
             .wrapping_add(pending);
         self.reset_opus_stream()
+    }
+
+    /// Slaves the media clock to cpal's authoritative capture timestamp
+    /// (`capture_ns`, nanoseconds since stream creation). The counted clock
+    /// advances one 10 ms slot per accumulated frame, so any span the hardware
+    /// captured but the pipeline never processed — a capture xrun, or a callback
+    /// dropped under load before it reached the encoder — surfaces here as the
+    /// capture instant running ahead of what we counted. The shortfall is emitted
+    /// through [`Self::note_capture_gap`] so the drop reaches the receiver as a
+    /// concealable timestamp gap instead of a slow clock. Sub-frame jitter and a
+    /// leading counted clock are ignored: the clock only ever jumps forward, in
+    /// whole gaps, exactly as an under-load drop already does.
+    pub(crate) fn note_capture_timestamp(&mut self, capture_ns: u64) -> Result<(), String> {
+        // `effective` is the media index of the first sample of the incoming
+        // chunk: accumulator `pending` holds the previous chunk's leftover, which
+        // the new samples are appended after.
+        let effective = self
+            .next_capture_sample
+            .wrapping_add(self.accumulator.pending.len() as u32);
+        let Some(prev) = self.capture_clock else {
+            self.capture_clock = Some(CaptureClock {
+                last_capture_ns: capture_ns,
+                last_effective_sample: effective,
+            });
+            return Ok(());
+        };
+        let dt_ns = capture_ns.saturating_sub(prev.last_capture_ns);
+        let expected = ((dt_ns * u64::from(crate::audio::shared::SAMPLE_RATE) + 500_000_000)
+            / 1_000_000_000) as u32;
+        let actual = effective.wrapping_sub(prev.last_effective_sample);
+        let shortfall = expected.saturating_sub(actual);
+        if shortfall >= FRAME_SAMPLES as u32 {
+            self.note_capture_gap(shortfall)?;
+        }
+        // Re-lock the anchor to the authoritative timestamp. After a gap the
+        // recomputed `effective` has advanced by exactly `shortfall`, so the
+        // stored clock tracks `expected` and rounding never accumulates. Clamp the
+        // timestamp monotone so a transient backward blip cannot manufacture a
+        // later gap.
+        let last_effective_sample = self
+            .next_capture_sample
+            .wrapping_add(self.accumulator.pending.len() as u32);
+        self.capture_clock = Some(CaptureClock {
+            last_capture_ns: capture_ns.max(prev.last_capture_ns),
+            last_effective_sample,
+        });
+        Ok(())
     }
 
     fn process_accumulated_frame<F>(
@@ -1709,18 +1773,26 @@ mod tests {
         );
     }
 
-    #[test]
-    fn live_worker_applies_dropped_capture_samples_to_the_media_clock() {
+    /// Nanoseconds cpal advances the capture instant per 10 ms callback.
+    const CALLBACK_PERIOD_NS: u64 = 10_000_000;
+
+    /// Drives 24 tone callbacks through the worker at a 48 kHz device rate, with
+    /// each callback's `cpal_capture_ns` supplied by `capture_ns(sequence)`, and
+    /// returns the emitted packets. `dropped_before` seeds the software-drop
+    /// counter to prove it no longer drives the clock.
+    fn run_worker_with_capture_timestamps(
+        capture_ns: impl Fn(u64) -> u64,
+        dropped_before: u64,
+    ) -> Vec<LocalVoiceFrame> {
         use std::sync::mpsc::sync_channel;
 
         let mut tuning = test_tuning();
         tuning.capture_silence_gate = false;
         let stats = AudioStats::new();
-        // A whole second at a 24 kHz device rate was dropped before any chunk
-        // reached the worker; the media clock must advance by the 48 kHz
-        // equivalent before the first packet is stamped.
-        let device_rate = 24_000u32;
-        stats.record_dropped_chunk(u64::from(device_rate));
+        let device_rate = 48_000u32;
+        if dropped_before > 0 {
+            stats.record_dropped_chunk(dropped_before);
+        }
 
         let (sender, receiver) = sync_channel::<CapturedAudioChunk>(64);
         let (recycle_sender, _recycle_receiver) = sync_channel::<Vec<f32>>(64);
@@ -1734,6 +1806,7 @@ mod tests {
                     Instant::now(),
                     crate::audio::shared::CaptureCallbackTiming {
                         callback_sequence: sequence,
+                        cpal_capture_ns: capture_ns(sequence),
                         ..crate::audio::shared::CaptureCallbackTiming::default()
                     },
                     0,
@@ -1766,14 +1839,142 @@ mod tests {
             &mut |packet| packets.push(packet),
         )
         .unwrap();
+        packets
+    }
 
-        let first = opus_packets(&packets)
-            .first()
-            .expect("worker should emit Opus packets")
-            .timestamp;
+    /// The first Opus packet whose timestamp jumps by at least `SAMPLE_RATE` from
+    /// the previous Opus packet, i.e. the packet that resumes after a gap.
+    fn resumed_after_gap(packets: &[LocalVoiceFrame]) -> &LocalVoiceFrame {
+        let opus = opus_packets(packets);
+        opus.windows(2)
+            .find(|pair| pair[1].timestamp.wrapping_sub(pair[0].timestamp) >= SAMPLE_RATE)
+            .map(|pair| pair[1])
+            .expect("a post-gap resume packet should be emitted")
+    }
+
+    #[test]
+    fn capture_timestamp_slaves_media_clock() {
+        let mut tuning = test_tuning();
+        tuning.capture_silence_gate = false;
+        let mut pipeline = build_live_encoder_pipeline(
+            tuning,
+            false,
+            DEFAULT_LIVE_MAX_AMPLIFICATION,
+            true,
+            EncoderNetworkProfile::EXCELLENT,
+            None,
+        )
+        .unwrap();
+        let stats = AudioStats::new();
+        // One 10 ms frame at 48 kHz, so each callback advances the clock by exactly
+        // FRAME_SAMPLES and stays locked to a 10 ms capture-timestamp cadence.
+        let frame: Vec<f32> = (0..FRAME_SAMPLES)
+            .map(|n| (n as f32 * 0.07).sin() * 8_000.0)
+            .collect();
+        let push = |pipeline: &mut LiveEncoderPipeline| {
+            pipeline
+                .push_chunk(
+                    &frame,
+                    DEFAULT_LIVE_MAX_AMPLIFICATION,
+                    false,
+                    &stats,
+                    &mut |_| {},
+                )
+                .unwrap();
+        };
+
+        // Steady cadence: the capture instant advances exactly one period per
+        // processed frame, so no gap is ever emitted.
+        pipeline.note_capture_timestamp(0).unwrap();
+        push(&mut pipeline);
+        for slot in 1..8u64 {
+            pipeline
+                .note_capture_timestamp(slot * CALLBACK_PERIOD_NS)
+                .unwrap();
+            push(&mut pipeline);
+        }
+        assert_eq!(
+            pipeline.next_capture_sample,
+            8 * FRAME_SAMPLES as u32,
+            "steady capture timestamps must not perturb the media clock"
+        );
+
+        // Sub-frame jitter: one callback's capture instant lands 3 ms late but the
+        // next returns to the true grid, so no audio was actually lost and no gap
+        // is emitted.
+        pipeline
+            .note_capture_timestamp(8 * CALLBACK_PERIOD_NS + 3_000_000)
+            .unwrap();
+        push(&mut pipeline);
+        pipeline
+            .note_capture_timestamp(9 * CALLBACK_PERIOD_NS)
+            .unwrap();
+        push(&mut pipeline);
+        assert_eq!(
+            pipeline.next_capture_sample,
+            10 * FRAME_SAMPLES as u32,
+            "sub-frame jitter that returns to grid must not emit a gap"
+        );
+
+        // A full extra period the pipeline never saw: the capture instant runs one
+        // frame ahead of the counted clock, so the missing frame is inserted and
+        // the clock advances by the pushed frame plus the one-frame gap.
+        let before = pipeline.next_capture_sample;
+        pipeline
+            .note_capture_timestamp(11 * CALLBACK_PERIOD_NS)
+            .unwrap();
+        push(&mut pipeline);
+        let advanced = pipeline.next_capture_sample.wrapping_sub(before);
+        assert_eq!(
+            advanced,
+            2 * FRAME_SAMPLES as u32,
+            "a dropped period must advance the clock by the pushed frame plus the gap"
+        );
+    }
+
+    #[test]
+    fn live_worker_applies_capture_timestamp_gap_to_media_clock() {
+        // A full second of capture is lost between callbacks 11 and 12: the
+        // capture instant jumps a second beyond the steady cadence.
+        let packets = run_worker_with_capture_timestamps(
+            |sequence| {
+                let extra = if sequence >= 12 { 1_000_000_000 } else { 0 };
+                sequence * CALLBACK_PERIOD_NS + extra
+            },
+            0,
+        );
+
+        let resumed = resumed_after_gap(&packets);
+        assert_ne!(
+            resumed.flags & LIVE_PACKET_FLAG_OPUS_RESET,
+            0,
+            "the stream must re-anchor across the capture-timestamp gap"
+        );
+    }
+
+    #[test]
+    fn capture_timestamp_gap_subsumes_software_drop() {
+        // Same one-second capture gap, but with the software-drop counter seeded to
+        // a huge value. The clock must advance by the timestamp-implied second
+        // only: the counter no longer drives the clock, so there is no double
+        // count.
+        let packets = run_worker_with_capture_timestamps(
+            |sequence| {
+                let extra = if sequence >= 12 { 1_000_000_000 } else { 0 };
+                sequence * CALLBACK_PERIOD_NS + extra
+            },
+            10 * u64::from(SAMPLE_RATE),
+        );
+
+        let opus = opus_packets(&packets);
+        let jump = opus
+            .windows(2)
+            .map(|pair| pair[1].timestamp.wrapping_sub(pair[0].timestamp))
+            .find(|jump| *jump >= SAMPLE_RATE)
+            .expect("a post-gap resume packet should be emitted");
         assert!(
-            first >= SAMPLE_RATE,
-            "dropped device samples were not applied to the 48 kHz media clock: first timestamp {first}"
+            jump < 2 * SAMPLE_RATE,
+            "the software-drop counter double-counted the gap: jump {jump}"
         );
     }
 
