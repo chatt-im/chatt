@@ -1396,6 +1396,31 @@ impl Config {
         }
     }
 
+    /// Reloads and validates the config for a running client, returning any
+    /// diagnostics as the error string instead of rendering them to stderr.
+    ///
+    /// Startup loaders ([`Config::load`], [`Config::load_for_app`]) render
+    /// diagnostics to stderr before the TUI takes the screen; that is wrong for a
+    /// mid-session reload, so this renders them into the returned `Err` where the
+    /// caller can forward them (e.g. over the control socket).
+    ///
+    /// # Errors
+    /// Returns the rendered diagnostics when the file cannot be read or when any
+    /// error-level diagnostic was emitted.
+    pub(crate) fn reload(path: Option<&str>, styled_diagnostics: bool) -> Result<Config, String> {
+        let outcome = Self::collect(path)?;
+        let errors = outcome.diagnostics.iter().filter(|diag| diag.error).count();
+        match outcome.config {
+            Some(config) if errors == 0 => Ok(config),
+            _ => Err(config_diagnostics::render_to_string(
+                &outcome.source,
+                &outcome.content,
+                &outcome.diagnostics,
+                styled_diagnostics,
+            )),
+        }
+    }
+
     /// Reads, parses, and validates the config, accumulating diagnostics.
     ///
     /// This is the pure half of [`Config::load`]: it performs no rendering so
@@ -1961,7 +1986,7 @@ pub fn value_arg(args: &[String], key: &str) -> Option<String> {
         .find_map(|window| (window[0] == key).then(|| window[1].clone()))
 }
 
-fn resolve_config_path(path: Option<&str>) -> Option<PathBuf> {
+pub(crate) fn resolve_config_path(path: Option<&str>) -> Option<PathBuf> {
     path.map(PathBuf::from).or_else(paths::client_config_path)
 }
 
@@ -3227,5 +3252,55 @@ server-public-key = ""
         assert!(content.contains("server-alias = \"local\""));
         assert!(content.contains("user-id = 2"));
         assert!(content.contains("volume-db = -5.5"));
+    }
+
+    #[test]
+    fn reload_parses_valid_config_and_reports_errors() {
+        let dir = std::env::temp_dir().join(format!(
+            "chatt-reload-config-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("chatt.toml");
+
+        fs::write(&path, DEFAULT_CONFIG).unwrap();
+        let config = Config::reload(Some(path.to_str().unwrap()), false).unwrap();
+        assert_eq!(config.config_path.as_deref(), Some(path.as_path()));
+
+        fs::write(&path, "this is not = = valid toml [[[").unwrap();
+        let error = match Config::reload(Some(path.to_str().unwrap()), false) {
+            Ok(_) => panic!("expected the invalid config to fail"),
+            Err(error) => error,
+        };
+        assert!(!error.is_empty(), "expected rendered diagnostics");
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn reload_can_render_styled_diagnostics() {
+        let dir = std::env::temp_dir().join(format!(
+            "chatt-reload-styled-config-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("chatt.toml");
+        fs::write(&path, "this is not = = valid toml [[[").unwrap();
+
+        let error = match Config::reload(Some(path.to_str().unwrap()), true) {
+            Ok(_) => panic!("expected the invalid config to fail"),
+            Err(error) => error,
+        };
+        assert!(error.contains("\x1b["), "expected ANSI-styled diagnostics");
+
+        let _ = fs::remove_dir_all(dir);
     }
 }

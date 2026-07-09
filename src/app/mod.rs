@@ -699,6 +699,18 @@ pub(crate) enum AppEvent {
         reply: Sender<Result<f32, String>>,
     },
     Web(crate::web_server::WebRequest),
+    /// A theme-reload request from `chatt reload-theme`. Re-reads the config file
+    /// and re-resolves the theme; the reply carries a status message on success or
+    /// the config diagnostics on failure.
+    ReloadTheme {
+        styled_diagnostics: bool,
+        reply: Sender<Result<String, String>>,
+    },
+    /// A config-path query from `chatt reload-theme --watch`, so the watcher
+    /// tracks the same file the running client will reload.
+    ConfigPath {
+        reply: Sender<Result<String, String>>,
+    },
     /// A bug report request from `chatt report-bug`, carrying the description.
     ReportBug(String),
     /// The outbound screen share's capture or publisher thread ended abnormally,
@@ -1191,6 +1203,11 @@ impl App {
             AppEvent::OutputVolume { command, reply } => {
                 self.handle_output_volume_command(command, reply)
             }
+            AppEvent::ReloadTheme {
+                styled_diagnostics,
+                reply,
+            } => self.handle_reload_theme(styled_diagnostics, reply),
+            AppEvent::ConfigPath { reply } => self.handle_config_path(reply),
             AppEvent::Web(request) => self.handle_web_request(request),
             AppEvent::ReportBug(description) => self.start_bug_report(description),
             AppEvent::ScreencastFailed(reason) => self.handle_screencast_failed(reason),
@@ -1224,6 +1241,42 @@ impl App {
             }
         };
         let _ = reply.send(Ok(value));
+    }
+
+    /// Re-reads the config file and re-resolves the theme, replying with a status
+    /// message or the config diagnostics. Only the theme-relevant `[ui]` fields
+    /// are swapped; every other live config section is left untouched, and the
+    /// current theme is kept if the file no longer parses.
+    fn handle_reload_theme(
+        &mut self,
+        styled_diagnostics: bool,
+        reply: Sender<Result<String, String>>,
+    ) {
+        let path = self
+            .config
+            .config_path
+            .as_ref()
+            .map(|path| path.to_string_lossy().into_owned());
+        let reloaded = match Config::reload(path.as_deref(), styled_diagnostics) {
+            Ok(config) => config,
+            Err(error) => {
+                let _ = reply.send(Err(error));
+                return;
+            }
+        };
+        self.config.ui.theme = reloaded.ui.theme;
+        self.config.ui.themes = reloaded.ui.themes;
+        self.theme = self.config.ui.resolve_theme();
+        self.room.apply_theme(&self.theme);
+        let _ = reply.send(Ok("theme reloaded".to_string()));
+    }
+
+    fn handle_config_path(&mut self, reply: Sender<Result<String, String>>) {
+        let Some(path) = &self.config.config_path else {
+            let _ = reply.send(Err("running client has no config path".to_string()));
+            return;
+        };
+        let _ = reply.send(Ok(path.to_string_lossy().into_owned()));
     }
 
     fn set_output_volume(&mut self, value: f32) -> f32 {
@@ -6089,6 +6142,18 @@ mod tests {
             rx.recv().unwrap().unwrap(),
             config::MAX_OUTPUT_VOLUME_PERCENT
         );
+    }
+
+    #[test]
+    fn config_path_command_reports_running_config_path() {
+        let mut app = test_app();
+        let path = std::env::temp_dir().join("chatt-config-path-command.toml");
+        app.config.config_path = Some(path.clone());
+
+        let (reply, rx) = mpsc::channel();
+        app.handle_config_path(reply);
+
+        assert_eq!(rx.recv().unwrap().unwrap(), path.display().to_string());
     }
 
     fn pending_open_pair(label: &str) -> PendingPair {

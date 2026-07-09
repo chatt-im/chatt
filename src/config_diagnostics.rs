@@ -79,6 +79,39 @@ pub fn render(path: &str, source: &str, diags: &[Diag]) {
     if diags.is_empty() {
         return;
     }
+    let groups = build_groups(path, source, diags);
+    let renderer = if std::io::stderr().is_terminal() {
+        Renderer::styled()
+    } else {
+        Renderer::plain()
+    };
+    let mut stderr = std::io::stderr().lock();
+    let _ = writeln!(stderr, "{}", renderer.render(&groups));
+    let _ = stderr.flush();
+}
+
+/// Renders every diagnostic to a string.
+///
+/// Used where the diagnostics must travel somewhere other than stderr — for
+/// example a runtime config reload that forwards the failure over the control
+/// socket while the TUI owns the terminal. Output can still be styled when the
+/// receiving command is connected to a terminal. Returns an empty string when
+/// there are no diagnostics.
+pub fn render_to_string(path: &str, source: &str, diags: &[Diag], styled: bool) -> String {
+    if diags.is_empty() {
+        return String::new();
+    }
+    let groups = build_groups(path, source, diags);
+    let renderer = if styled {
+        Renderer::styled()
+    } else {
+        Renderer::plain()
+    };
+    renderer.render(&groups).to_string()
+}
+
+/// Builds the annotated snippet groups for a set of diagnostics.
+fn build_groups<'a>(path: &'a str, source: &'a str, diags: &'a [Diag]) -> Vec<Group<'a>> {
     let mut groups: Vec<Group> = Vec::with_capacity(diags.len());
     for diag in diags {
         let level = if diag.error {
@@ -102,13 +135,5 @@ pub fn render(path: &str, source: &str, diags: &[Diag]) {
         }
         groups.push(title.element(snippet));
     }
-
-    let renderer = if std::io::stderr().is_terminal() {
-        Renderer::styled()
-    } else {
-        Renderer::plain()
-    };
-    let mut stderr = std::io::stderr().lock();
-    let _ = writeln!(stderr, "{}", renderer.render(&groups));
-    let _ = stderr.flush();
+    groups
 }

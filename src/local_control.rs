@@ -1,8 +1,9 @@
 #[cfg(unix)]
 mod imp {
     use std::{
+        borrow::Cow,
         env, fs,
-        io::{self, BufReader, Read, Write},
+        io::{self, BufReader, IsTerminal, Read, Write},
         path::{Path, PathBuf},
         sync::mpsc::{self, Sender, TryRecvError},
         thread::{self, JoinHandle},
@@ -29,12 +30,14 @@ mod imp {
     const OP_CLIENT_LOGS: u8 = 4;
     const OP_REPORT_BUG: u8 = 5;
     const OP_OUTPUT_VOLUME: u8 = 6;
+    const OP_RELOAD_THEME: u8 = 7;
+    const OP_CONFIG_PATH: u8 = 8;
     const SCREENCAST_START: u8 = 0;
     const SCREENCAST_STOP: u8 = 1;
     const STATUS_OK: u8 = 0;
     const STATUS_ERROR: u8 = 1;
     const MAX_PATH_BYTES: u32 = 64 * 1024;
-    const MAX_RESPONSE_BYTES: u32 = 8 * 1024;
+    const MAX_RESPONSE_BYTES: u32 = 256 * 1024;
     const ACCEPT_SLEEP: Duration = Duration::from_millis(20);
     const STREAM_TIMEOUT: Duration = Duration::from_secs(2);
     /// Poll interval for `client-logs --follow` streaming.
@@ -417,6 +420,70 @@ mod imp {
         }
     }
 
+    pub fn send_reload_theme() -> Result<String, String> {
+        let socket_path = socket_path()?;
+        send_reload_theme_to_path(&socket_path, io::stdout().is_terminal())
+    }
+
+    fn send_reload_theme_to_path(
+        socket_path: &Path,
+        styled_diagnostics: bool,
+    ) -> Result<String, String> {
+        let mut stream = UnixStream::connect(socket_path).map_err(|error| {
+            format!(
+                "no active chatt control socket at {}; start chatt or set {SOCKET_ENV}: {error}",
+                socket_path.display()
+            )
+        })?;
+        stream
+            .set_read_timeout(Some(STREAM_TIMEOUT))
+            .map_err(|error| format!("failed to set control socket read timeout: {error}"))?;
+        stream
+            .set_write_timeout(Some(STREAM_TIMEOUT))
+            .map_err(|error| format!("failed to set control socket write timeout: {error}"))?;
+
+        write_simple_request(
+            &mut stream,
+            OP_RELOAD_THEME,
+            &[u8::from(styled_diagnostics)],
+        )?;
+        let response = read_response(&mut stream)?;
+        match response.status {
+            STATUS_OK => Ok(response.message),
+            STATUS_ERROR => Err(response.message),
+            status => Err(format!("control socket returned unknown status {status}")),
+        }
+    }
+
+    pub fn send_config_path() -> Result<PathBuf, String> {
+        let socket_path = socket_path()?;
+        let message = send_config_path_to_path(&socket_path)?;
+        Ok(PathBuf::from(message))
+    }
+
+    fn send_config_path_to_path(socket_path: &Path) -> Result<String, String> {
+        let mut stream = UnixStream::connect(socket_path).map_err(|error| {
+            format!(
+                "no active chatt control socket at {}; start chatt or set {SOCKET_ENV}: {error}",
+                socket_path.display()
+            )
+        })?;
+        stream
+            .set_read_timeout(Some(STREAM_TIMEOUT))
+            .map_err(|error| format!("failed to set control socket read timeout: {error}"))?;
+        stream
+            .set_write_timeout(Some(STREAM_TIMEOUT))
+            .map_err(|error| format!("failed to set control socket write timeout: {error}"))?;
+
+        write_simple_request(&mut stream, OP_CONFIG_PATH, &[])?;
+        let response = read_response(&mut stream)?;
+        match response.status {
+            STATUS_OK => Ok(response.message),
+            STATUS_ERROR => Err(response.message),
+            status => Err(format!("control socket returned unknown status {status}")),
+        }
+    }
+
     pub fn socket_path() -> Result<PathBuf, String> {
         Ok(socket_config()?.path)
     }
@@ -432,6 +499,8 @@ mod imp {
         Voice(VoiceCommand),
         Screencast(ScreencastCommand),
         OutputVolume(OutputVolumeCommand),
+        ReloadTheme { styled_diagnostics: bool },
+        ConfigPath,
         ClientLogs { follow: bool },
         ReportBug(String),
     }
@@ -634,6 +703,65 @@ mod imp {
                     },
                 }
             }
+            Ok(Request::ReloadTheme { styled_diagnostics }) => {
+                let (reply_tx, reply_rx) = mpsc::channel();
+                match voice.send(crate::app::AppEvent::ReloadTheme {
+                    styled_diagnostics,
+                    reply: reply_tx,
+                }) {
+                    Ok(()) => match reply_rx.recv_timeout(STREAM_TIMEOUT) {
+                        Ok(Ok(message)) => Response {
+                            status: STATUS_OK,
+                            message,
+                        },
+                        Ok(Err(error)) => Response {
+                            status: STATUS_ERROR,
+                            message: error,
+                        },
+                        Err(mpsc::RecvTimeoutError::Timeout) => Response {
+                            status: STATUS_ERROR,
+                            message: "chatt client did not answer reload-theme request".to_string(),
+                        },
+                        Err(mpsc::RecvTimeoutError::Disconnected) => Response {
+                            status: STATUS_ERROR,
+                            message: "chatt client stopped before answering reload-theme request"
+                                .to_string(),
+                        },
+                    },
+                    Err(_) => Response {
+                        status: STATUS_ERROR,
+                        message: "chatt client is not running".to_string(),
+                    },
+                }
+            }
+            Ok(Request::ConfigPath) => {
+                let (reply_tx, reply_rx) = mpsc::channel();
+                match voice.send(crate::app::AppEvent::ConfigPath { reply: reply_tx }) {
+                    Ok(()) => match reply_rx.recv_timeout(STREAM_TIMEOUT) {
+                        Ok(Ok(message)) => Response {
+                            status: STATUS_OK,
+                            message,
+                        },
+                        Ok(Err(error)) => Response {
+                            status: STATUS_ERROR,
+                            message: error,
+                        },
+                        Err(mpsc::RecvTimeoutError::Timeout) => Response {
+                            status: STATUS_ERROR,
+                            message: "chatt client did not answer config-path request".to_string(),
+                        },
+                        Err(mpsc::RecvTimeoutError::Disconnected) => Response {
+                            status: STATUS_ERROR,
+                            message: "chatt client stopped before answering config-path request"
+                                .to_string(),
+                        },
+                    },
+                    Err(_) => Response {
+                        status: STATUS_ERROR,
+                        message: "chatt client is not running".to_string(),
+                    },
+                }
+            }
             Ok(Request::Screencast(command)) => {
                 let ack = command.ack_message();
                 match voice.send(command) {
@@ -799,6 +927,10 @@ mod imp {
             OP_VOICE => Ok(Request::Voice(VoiceCommand::decode(&body)?)),
             OP_SCREENCAST => Ok(Request::Screencast(ScreencastCommand::decode(&body)?)),
             OP_OUTPUT_VOLUME => Ok(Request::OutputVolume(OutputVolumeCommand::decode(&body)?)),
+            OP_RELOAD_THEME => Ok(Request::ReloadTheme {
+                styled_diagnostics: body.first().is_some_and(|byte| *byte != 0),
+            }),
+            OP_CONFIG_PATH => Ok(Request::ConfigPath),
             OP_CLIENT_LOGS => Ok(Request::ClientLogs {
                 follow: body.first().is_some_and(|byte| *byte != 0),
             }),
@@ -940,14 +1072,10 @@ mod imp {
     }
 
     fn write_response(stream: &mut UnixStream, status: u8, message: &str) -> Result<(), String> {
+        let message = response_message_within_limit(message);
         let bytes = message.as_bytes();
         let len =
             u32::try_from(bytes.len()).map_err(|_| "control response is too long".to_string())?;
-        if len > MAX_RESPONSE_BYTES {
-            return Err(format!(
-                "control response exceeds {MAX_RESPONSE_BYTES} bytes"
-            ));
-        }
         let mut frame = Vec::with_capacity(MAGIC.len() + 1 + 4 + bytes.len());
         frame.extend_from_slice(MAGIC);
         frame.push(status);
@@ -956,6 +1084,24 @@ mod imp {
         stream
             .write_all(&frame)
             .map_err(|error| format!("failed to write control response: {error}"))
+    }
+
+    fn response_message_within_limit(message: &str) -> Cow<'_, str> {
+        let max = MAX_RESPONSE_BYTES as usize;
+        if message.len() <= max {
+            return Cow::Borrowed(message);
+        }
+
+        let suffix = format!("\n... response truncated to {MAX_RESPONSE_BYTES} bytes");
+        let limit = max.saturating_sub(suffix.len());
+        let mut end = limit.min(message.len());
+        while !message.is_char_boundary(end) {
+            end -= 1;
+        }
+        let mut truncated = String::with_capacity(end + suffix.len());
+        truncated.push_str(&message[..end]);
+        truncated.push_str(&suffix);
+        Cow::Owned(truncated)
     }
 
     fn current_uid() -> u32 {
@@ -1046,6 +1192,26 @@ mod imp {
         }
 
         #[test]
+        fn reload_theme_request_round_trips() {
+            let (mut writer, mut reader) = UnixStream::pair().unwrap();
+            write_simple_request(&mut writer, OP_RELOAD_THEME, &[1]).unwrap();
+            match read_request(&mut reader).unwrap() {
+                Request::ReloadTheme { styled_diagnostics } => assert!(styled_diagnostics),
+                other => panic!("unexpected request: {other:?}"),
+            }
+        }
+
+        #[test]
+        fn config_path_request_round_trips() {
+            let (mut writer, mut reader) = UnixStream::pair().unwrap();
+            write_simple_request(&mut writer, OP_CONFIG_PATH, &[]).unwrap();
+            match read_request(&mut reader).unwrap() {
+                Request::ConfigPath => {}
+                other => panic!("unexpected request: {other:?}"),
+            }
+        }
+
+        #[test]
         fn response_round_trips_message() {
             let (mut writer, mut reader) = UnixStream::pair().unwrap();
 
@@ -1054,6 +1220,17 @@ mod imp {
 
             assert_eq!(response.status, STATUS_OK);
             assert_eq!(response.message, "queued upload /tmp/foo.md");
+        }
+
+        #[test]
+        fn response_truncates_to_protocol_limit() {
+            let message = "x".repeat(MAX_RESPONSE_BYTES as usize + 128);
+
+            let truncated = response_message_within_limit(&message);
+
+            assert!(truncated.len() <= MAX_RESPONSE_BYTES as usize);
+            assert!(truncated.ends_with("bytes"));
+            assert!(truncated.contains("response truncated"));
         }
 
         #[test]
@@ -1148,6 +1325,107 @@ mod imp {
         }
 
         #[test]
+        fn control_socket_reload_theme_waits_for_reply() {
+            let dir = temp_test_dir("reload-theme-replies");
+            fs::create_dir_all(&dir).unwrap();
+            let socket_path = dir.join("control.sock");
+            let (tx, _rx) = mpsc::channel();
+            let (voice_tx, voice_rx) = mpsc::channel();
+            let socket = ControlSocket::spawn_at_path(
+                socket_path.clone(),
+                CommandSender::for_test(tx),
+                EventSender(voice_tx),
+            )
+            .unwrap();
+
+            let send_path = socket_path.clone();
+            let handle = thread::spawn(move || send_reload_theme_to_path(&send_path, false));
+            let event = voice_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            match event {
+                crate::app::AppEvent::ReloadTheme {
+                    styled_diagnostics,
+                    reply,
+                } => {
+                    assert!(!styled_diagnostics);
+                    reply.send(Ok("theme reloaded".to_string())).unwrap();
+                }
+                _ => panic!("unexpected event"),
+            }
+
+            assert_eq!(handle.join().unwrap().unwrap(), "theme reloaded");
+
+            drop(socket);
+            assert!(!socket_path.exists());
+            let _ = fs::remove_dir_all(dir);
+        }
+
+        #[test]
+        fn control_socket_reload_theme_forwards_error() {
+            let dir = temp_test_dir("reload-theme-error");
+            fs::create_dir_all(&dir).unwrap();
+            let socket_path = dir.join("control.sock");
+            let (tx, _rx) = mpsc::channel();
+            let (voice_tx, voice_rx) = mpsc::channel();
+            let socket = ControlSocket::spawn_at_path(
+                socket_path.clone(),
+                CommandSender::for_test(tx),
+                EventSender(voice_tx),
+            )
+            .unwrap();
+
+            let send_path = socket_path.clone();
+            let handle = thread::spawn(move || send_reload_theme_to_path(&send_path, true));
+            match voice_rx.recv_timeout(Duration::from_secs(2)).unwrap() {
+                crate::app::AppEvent::ReloadTheme {
+                    styled_diagnostics,
+                    reply,
+                } => {
+                    assert!(styled_diagnostics);
+                    reply.send(Err("bad theme".to_string())).unwrap();
+                }
+                _ => panic!("unexpected event"),
+            }
+
+            assert_eq!(handle.join().unwrap().unwrap_err(), "bad theme");
+
+            drop(socket);
+            let _ = fs::remove_dir_all(dir);
+        }
+
+        #[test]
+        fn control_socket_config_path_waits_for_reply() {
+            let dir = temp_test_dir("config-path-replies");
+            fs::create_dir_all(&dir).unwrap();
+            let socket_path = dir.join("control.sock");
+            let config_path = dir.join("client.toml");
+            let (tx, _rx) = mpsc::channel();
+            let (voice_tx, voice_rx) = mpsc::channel();
+            let socket = ControlSocket::spawn_at_path(
+                socket_path.clone(),
+                CommandSender::for_test(tx),
+                EventSender(voice_tx),
+            )
+            .unwrap();
+
+            let send_path = socket_path.clone();
+            let handle = thread::spawn(move || send_config_path_to_path(&send_path));
+            match voice_rx.recv_timeout(Duration::from_secs(2)).unwrap() {
+                crate::app::AppEvent::ConfigPath { reply } => {
+                    reply.send(Ok(config_path.display().to_string())).unwrap();
+                }
+                _ => panic!("unexpected event"),
+            }
+
+            assert_eq!(
+                handle.join().unwrap().unwrap(),
+                dir.join("client.toml").display().to_string()
+            );
+
+            drop(socket);
+            let _ = fs::remove_dir_all(dir);
+        }
+
+        #[test]
         fn bind_listener_rejects_live_socket() {
             let dir = temp_test_dir("rejects-live-socket");
             fs::create_dir_all(&dir).unwrap();
@@ -1235,6 +1513,14 @@ mod imp {
         Err("chatt output-volume is only supported on Unix".to_string())
     }
 
+    pub fn send_reload_theme() -> Result<String, String> {
+        Err("chatt reload-theme is only supported on Unix".to_string())
+    }
+
+    pub fn send_config_path() -> Result<std::path::PathBuf, String> {
+        Err("chatt config-path is only supported on Unix".to_string())
+    }
+
     pub fn send_client_logs(_follow: bool) -> Result<(), String> {
         Err("chatt client-logs is only supported on Unix".to_string())
     }
@@ -1246,5 +1532,6 @@ mod imp {
 
 pub use imp::{
     ControlSocket, OutputVolumeCommand, ScreencastCommand, VoiceCommand, send_client_logs,
-    send_output_volume, send_report_bug, send_screencast, send_upload, send_voice,
+    send_config_path, send_output_volume, send_reload_theme, send_report_bug, send_screencast,
+    send_upload, send_voice,
 };

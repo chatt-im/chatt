@@ -221,6 +221,35 @@ Pass an unsigned percent to set it, or a signed percent to adjust it.",
             ],
         },
         Command {
+            name: "reload-theme",
+            aliases: &[],
+            about: "Reload the running client's theme from its config file.",
+            long_about: "Tells a running client to re-read its config file over the \
+local control socket and re-resolve the UI theme. Config parse or validation \
+errors are printed here instead of applied. With `--watch` the config file is \
+polled and reloaded on every change until interrupted.",
+            args: &[],
+            flags: &[Flag {
+                long: "watch",
+                short: "w",
+                value_name: "",
+                help: "Reload on every config file change until interrupted",
+                global: false,
+                possible: &[],
+            }],
+            subs: &[],
+            examples: &[
+                Example {
+                    cmd: "reload-theme",
+                    help: "Reload the theme once from the config file.",
+                },
+                Example {
+                    cmd: "reload-theme --watch",
+                    help: "Reload the theme live on every config file change.",
+                },
+            ],
+        },
+        Command {
             name: "mute",
             aliases: &[],
             about: "Mute or unmute the active call.",
@@ -478,6 +507,15 @@ fn dispatch(matches: &Matches) -> Result<(), Box<dyn std::error::Error>> {
             println!("{response}");
             Ok(())
         }
+        Some(("reload-theme", sub)) => {
+            if sub.is_present("watch") {
+                watch_reload_theme()
+            } else {
+                let response = local_control::send_reload_theme()?;
+                println!("{response}");
+                Ok(())
+            }
+        }
         Some(("mute", sub)) => {
             let command = match sub.subcommand() {
                 Some(("set", set)) => local_control::VoiceCommand::SetMute(parse_voice_state(set)),
@@ -510,6 +548,49 @@ fn run_interactive_app(
         AppConfigLoad::Existing(config) => runtime::run_app(config, pending_join),
         AppConfigLoad::Missing(config) => runtime::run_app_with_welcome(config, pending_join),
     }
+}
+
+/// Polls the running client's config file and asks it to reload its theme on
+/// every change, until interrupted.
+///
+/// The file path is queried from the running client, so the watcher tracks the
+/// same file the client will reload. An initial reload runs immediately;
+/// thereafter the file's modified time and length are `stat`-polled every 30 ms
+/// and a reload is sent on any change. Reload failures (an invalid file mid-edit,
+/// or a client that exits after watch startup) are printed but do not stop the
+/// watch, so it recovers on the next valid save.
+fn watch_reload_theme() -> Result<(), Box<dyn std::error::Error>> {
+    const POLL: std::time::Duration = std::time::Duration::from_millis(30);
+
+    let path = local_control::send_config_path()?;
+
+    let mut last = file_signature(&path);
+    report_reload_theme();
+    loop {
+        std::thread::sleep(POLL);
+        let signature = file_signature(&path);
+        if signature != last {
+            last = signature;
+            report_reload_theme();
+        }
+    }
+}
+
+/// Sends a single theme-reload request and prints the outcome, mapping a failure
+/// to a printed line rather than an error so the watch loop keeps running.
+fn report_reload_theme() {
+    match local_control::send_reload_theme() {
+        Ok(response) => println!("{response}"),
+        Err(error) => eprintln!("reload-theme: {error}"),
+    }
+}
+
+/// A cheap change signature for the config file: its length and modified time.
+/// `None` when the file cannot be stat'd (e.g. deleted mid-edit), which itself
+/// registers as a change once it reappears.
+fn file_signature(path: &Path) -> Option<(u64, std::time::SystemTime)> {
+    let metadata = std::fs::metadata(path).ok()?;
+    Some((metadata.len(), metadata.modified().ok()?))
 }
 
 /// Intercepts `screencast start <COMMAND...>` before the structured parser.
