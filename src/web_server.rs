@@ -241,13 +241,11 @@ impl WebMessage {
         served_name: &str,
         dimensions: Option<(u32, u32)>,
     ) -> Self {
-        // Mirror the server's announcement body so the size metadata survives
+        // Name the body after the served file, not the sender's original name, so
+        // the recipient sees where the file actually landed after any save-time
+        // rename. Mirrors the announcement format so the size metadata survives
         // whichever of the two messages wins the upsert merge.
-        let body = format!(
-            "sent file `{}` ({})",
-            metadata.original_name,
-            format_size(metadata.size)
-        );
+        let body = file_announcement_body(served_name, metadata.size);
         WebMessage {
             id: metadata.transfer_id.0,
             sender: metadata.sender_name.clone(),
@@ -269,13 +267,18 @@ impl WebMessage {
     pub fn from_history_file(
         message: &ChatMessage,
         served_name: &str,
+        size: u64,
         dimensions: Option<(u32, u32)>,
     ) -> Self {
         let file_id = message.file_transfer_id.map(|transfer_id| transfer_id.0);
+        // Rebuild the body from the served name rather than reusing the stored
+        // announcement, which carries the sender's original name; the live view
+        // does the same in `from_file` so a reload reads identically.
+        let body = file_announcement_body(served_name, size);
         WebMessage {
             id: file_id.unwrap_or(message.message_id.0),
             sender: message.sender_name.clone(),
-            fragments: split_fragments(&message.body, &|_| None),
+            fragments: split_fragments(&body, &|_| None),
             timestamp_ms: message.timestamp_ms,
             attachment: Some(WebAttachment::from_served_file(served_name, dimensions)),
             file_id,
@@ -337,6 +340,12 @@ fn same_file(left: &WebMessage, right: &WebMessage) -> bool {
 
 /// Formats a byte count the way the server's file announcement does, so an
 /// enriched file message reads identically to its placeholder.
+/// The `sent file `name` (size)` body shown for a file message, matching the
+/// server's announcement format so live and history views render the same.
+fn file_announcement_body(name: &str, size: u64) -> String {
+    format!("sent file `{}` ({})", name, format_size(size))
+}
+
 fn format_size(bytes: u64) -> String {
     const KIB: u64 = 1024;
     const MIB: u64 = 1024 * KIB;
@@ -1467,13 +1476,14 @@ mod tests {
         );
         assert!(!frame.is_empty());
 
-        // The file id carries the transfer id and the body keeps the size, so the
-        // inline message correlates with and reads like its announcement.
+        // The file id carries the transfer id and the body names the served file
+        // (the renamed on-disk name), keeping the size, so the recipient sees
+        // where it actually landed.
         assert_eq!(message.file_id, Some(3));
         let Fragment::Text { html: body, .. } = &message.fragments[0] else {
             panic!("expected a text fragment");
         };
-        assert_eq!(body, "<p>sent file <code>wide.png</code> (10 B)</p>");
+        assert_eq!(body, "<p>sent file <code>wide-1.png</code> (10 B)</p>");
     }
 
     fn file_metadata(transfer_id: u64) -> FileMetadata {

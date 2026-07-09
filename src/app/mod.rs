@@ -873,6 +873,7 @@ fn web_room_messages(
                 Some(detail) => crate::web_server::WebMessage::from_history_file(
                     message,
                     &detail.file_name,
+                    detail.length,
                     detail.dimensions(),
                 ),
                 None => crate::web_server::WebMessage::from_chat(message, &resolver),
