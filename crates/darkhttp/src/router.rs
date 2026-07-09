@@ -49,7 +49,7 @@ pub enum GeneratedResponse {
     Bytes {
         status: u16,
         content_type: String,
-        body: Arc<[u8]>,
+        body: Arc<Vec<u8>>,
     },
     /// Serve this file from disk, with full `Range`/`If-Modified-Since` support.
     /// Used to serve a specific file the handler located itself (e.g. a download
@@ -65,11 +65,20 @@ pub enum GeneratedResponse {
 
 impl GeneratedResponse {
     /// A `200 OK` response with the given body and content type.
-    pub fn ok(content_type: impl Into<String>, body: impl Into<Arc<[u8]>>) -> Self {
+    pub fn ok(content_type: impl Into<String>, body: impl Into<Vec<u8>>) -> Self {
         Self::Bytes {
             status: 200,
             content_type: content_type.into(),
-            body: body.into(),
+            body: Arc::new(body.into()),
+        }
+    }
+
+    /// A `200 OK` response backed by an already shared vector.
+    pub fn ok_shared(content_type: impl Into<String>, body: Arc<Vec<u8>>) -> Self {
+        Self::Bytes {
+            status: 200,
+            content_type: content_type.into(),
+            body,
         }
     }
 

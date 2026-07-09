@@ -1020,12 +1020,12 @@ fn reason_phrase(status: u16) -> &'static str {
     }
 }
 
-/// Serves an in-memory `Arc<[u8]>` body, applying the request's `Range` to a
+/// Serves an in-memory `Arc<Vec<u8>>` body, applying the request's `Range` to a
 /// `200` response without copying the buffer (`206`/`416` as appropriate).
 fn memory_response(
     status: u16,
     content_type: &str,
-    body: Arc<[u8]>,
+    body: Arc<Vec<u8>>,
     range: Option<ByteRange>,
     keep_alive: bool,
     timeout: Duration,

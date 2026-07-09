@@ -16,9 +16,9 @@ pub(crate) struct PreparedResponse {
 pub(crate) enum Body {
     Empty,
     Bytes(Arc<[u8]>),
-    /// A sub-range of a shared in-memory buffer, served without copying.
+    /// A sub-range of a shared in-memory vector, served without copying.
     BytesRange {
-        bytes: Arc<[u8]>,
+        bytes: Arc<Vec<u8>>,
         offset: usize,
         len: usize,
     },
@@ -137,13 +137,13 @@ pub(crate) fn bytes(
     }
 }
 
-/// An in-memory response served from a shared `Arc<[u8]>`, honouring `Range`.
+/// An in-memory response served from a shared `Arc<Vec<u8>>`, honouring `Range`.
 /// Mirrors [`file`] for a buffer that is already resident, so a `/files` hit on
 /// an in-memory download costs an `Arc` clone rather than a copy of the body.
 pub(crate) struct MemoryResponse {
     pub(crate) status: u16,
     pub(crate) reason: &'static str,
-    pub(crate) body: Arc<[u8]>,
+    pub(crate) body: Arc<Vec<u8>>,
     pub(crate) offset: usize,
     pub(crate) len: usize,
     pub(crate) content_type: String,
