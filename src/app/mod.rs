@@ -888,28 +888,52 @@ fn web_room_messages(
     messages
 }
 
+/// Registers persistent downloads already on disk so the web view can serve them
+/// after a restart. Each configured persistent directory is scanned and its
+/// files registered under their on-disk names (first-wins on collision),
+/// matching the served names history carries. Live transfers register
+/// themselves as they complete.
+fn register_existing_downloads(
+    config: &config::Config,
+    store: &crate::receive_store::DownloadStore,
+) {
+    for dir in config.persistent_download_dirs() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            if !entry
+                .file_type()
+                .map(|kind| kind.is_file())
+                .unwrap_or(false)
+            {
+                continue;
+            }
+            let Some(name) = entry.file_name().to_str().map(str::to_string) else {
+                continue;
+            };
+            if store.name_available(&name) {
+                store.register_disk(name, entry.path());
+            }
+        }
+    }
+}
+
 fn spawn_web_feed(
     web: &config::WebConfig,
     download_store: crate::receive_store::DownloadStore,
-    persistent_dir: Option<PathBuf>,
     max_messages: usize,
     events: &EventSender,
 ) -> Option<crate::web_server::WebFeedSender> {
     let (web_tx, web_rx) = mpsc::channel();
-    let feed = match crate::web_server::spawn(
-        web,
-        download_store,
-        persistent_dir,
-        max_messages,
-        web_tx,
-        web.readonly,
-    ) {
-        Ok(feed) => feed,
-        Err(error) => {
-            kvlog::error!("web server failed to start", error = %error);
-            return None;
-        }
-    };
+    let feed =
+        match crate::web_server::spawn(web, download_store, max_messages, web_tx, web.readonly) {
+            Ok(feed) => feed,
+            Err(error) => {
+                kvlog::error!("web server failed to start", error = %error);
+                return None;
+            }
+        };
     let relay = events.clone();
     if let Err(error) = thread::Builder::new()
         .name("chatt-web-relay".to_string())
@@ -1003,14 +1027,13 @@ impl App {
             Arc::new(AtomicU32::new(config.audio.output_volume.to_bits()));
         let download_store =
             crate::receive_store::DownloadStore::new(config.files.download_memory_bytes);
+        // Register persistent downloads already on disk so they remain servable
+        // after a restart; live transfers register themselves as they complete.
+        register_existing_downloads(&config, &download_store);
         let web_feed = if config.web.enabled {
-            // The web feed is app-wide and spawns before any server
-            // connection, so it uses the global persistent dir, not a per-room
-            // effective one; in-memory downloads are served from the store.
             spawn_web_feed(
                 &config.web,
                 download_store.clone(),
-                config.web_persistent_dir(),
                 config.ui.max_messages as usize,
                 &events.tx,
             )
@@ -3347,8 +3370,10 @@ impl App {
         self.apply_web_setting(&old_web);
         self.apply_p2p_setting(old_p2p_enabled);
         self.apply_history_setting(old_history_enabled);
-        self.download_store
-            .set_cap(self.config.files.download_memory_bytes);
+        // The memory cap and the network file policy are runtime effects that
+        // commit together on Save (see `save_settings`), so the live config, the
+        // ring, and the network worker never disagree about the download mode
+        // mid-edit.
         self.apply_echo_cancellation_setting();
         self.apply_output_volume_setting();
         self.apply_active_capture_amplification(self.config.audio.max_amplification);
@@ -3398,7 +3423,6 @@ impl App {
             let feed = spawn_web_feed(
                 &self.config.web,
                 self.download_store.clone(),
-                self.config.web_persistent_dir(),
                 self.config.ui.max_messages as usize,
                 &self.events.tx,
             );
@@ -4477,6 +4501,11 @@ impl App {
                 self.config.config_path = Some(path.clone());
                 session.dirty = false;
                 self.room.set_max_messages(self.config.ui.max_messages);
+                // Commit the download runtime effects together: the memory ring
+                // cap and the network worker's file policy flip on Save, so the
+                // UI, the ring, and the worker stay consistent.
+                self.download_store
+                    .set_cap(self.config.files.download_memory_bytes);
                 self.push_file_policy();
                 self.set_status(format!("settings saved to {}", path.display()));
             }

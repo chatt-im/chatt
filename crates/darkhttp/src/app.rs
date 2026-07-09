@@ -8,13 +8,14 @@ use std::time::{Duration, Instant};
 
 use crate::config::ServerConfig;
 use crate::connection::{AfterResponse, ConnState, Connection, WebSocketFragment};
-use crate::files::FileTask;
-use crate::http::request::{Method, Request};
-use crate::http::response::{self, Body, PreparedResponse};
+use crate::files::{FileTask, apply_range};
+use crate::http::request::{ByteRange, Method, Request};
+use crate::http::response::{self, Body, ContentRange, MemoryResponse, PreparedResponse};
 use crate::net::io_pool::IoPool;
 use crate::net::socket;
 use crate::net::waker::Waker;
 use crate::router::Router;
+use crate::router::{GeneratedResponse, MountKind};
 use crate::server::{ServerEvent, WebSocketCloseReason, WebSocketId, WebSocketMessage};
 use crate::websocket::{frame, handshake};
 
@@ -356,31 +357,29 @@ impl App {
                         self.config.timeout,
                         request.is_head(),
                     )
-                } else if let Some((handler, relative)) =
+                } else if let Some((handler, relative, prefix)) =
                     self.router.resolve_generated(&request.path)
                 {
                     let handler = handler.clone();
                     let path = request.path.as_str().to_owned();
                     let relative = relative.to_owned();
-                    let is_head = request.is_head();
-                    let keep_alive = request.keep_alive;
-                    // Resolve a directory mount on the same prefix so a handler
-                    // that returns `GeneratedResponse::pass()` can defer to disk
-                    // (keeping Range/If-Modified-Since serving) rather than
-                    // short-circuiting the request.
-                    let fallback = self.router.resolve_mount(&request.path).map(|resolved| {
-                        (
-                            resolved.mount.root().to_path_buf(),
-                            resolved.mount.kind,
-                            resolved.relative_path.to_owned(),
-                        )
-                    });
-                    let fallback = fallback.map(|(root, kind, relative_path)| {
-                        FileTask::new(root, kind, relative_path, request, self.config.clone())
-                    });
-                    self.dispatch_generated_task(
-                        idx, handler, path, relative, is_head, keep_alive, fallback,
-                    );
+                    // Resolve a directory mount on the handler's *own* prefix so
+                    // a handler that returns `GeneratedResponse::pass()` can defer
+                    // to disk (keeping Range/If-Modified-Since serving). Only a
+                    // mount with the exact same prefix qualifies, so a `/files`
+                    // miss can never fall through to a catch-all `/` mount.
+                    let fallback = self
+                        .router
+                        .resolve_mount(&request.path)
+                        .filter(|resolved| &resolved.mount.prefix == prefix)
+                        .map(|resolved| {
+                            (
+                                resolved.mount.root().to_path_buf(),
+                                resolved.mount.kind,
+                                resolved.relative_path.to_owned(),
+                            )
+                        });
+                    self.dispatch_generated_task(idx, handler, path, relative, request, fallback);
                     return;
                 } else if let Some(resolved) = self.router.resolve_mount(&request.path) {
                     let root = resolved.mount.root().to_path_buf();
@@ -425,29 +424,57 @@ impl App {
         handler: crate::router::GeneratedHandler,
         path: String,
         relative: String,
-        is_head: bool,
-        keep_alive: bool,
-        fallback: Option<FileTask>,
+        request: Request,
+        fallback: Option<(std::path::PathBuf, crate::router::MountKind, String)>,
     ) {
         let conn_id = self.conns[idx].id;
         let file_tx = self.file_tx.clone();
         let notifier = self.waker.notifier();
+        let config = self.config.clone();
         let timeout = self.config.timeout;
         self.conns[idx].request.clear();
         self.conns[idx].state = ConnState::AwaitFile;
         self.pending_files += 1;
         self.io_pool.execute(move || {
-            let request = crate::router::GeneratedRequest {
+            let is_head = request.is_head();
+            let keep_alive = request.keep_alive;
+            let range = request.range();
+            let gen_request = crate::router::GeneratedRequest {
                 path: &path,
                 relative: &relative,
                 is_head,
             };
-            let result = handler(&request);
-            let response = if result.is_pass() {
-                // The handler declined; serve the disk fallback if the prefix
-                // also has a directory mount, otherwise a plain 404.
-                match fallback {
-                    Some(task) => task.serve(),
+            let response = match handler(&gen_request) {
+                GeneratedResponse::Bytes {
+                    status,
+                    content_type,
+                    body,
+                } => memory_response(
+                    status,
+                    &content_type,
+                    body,
+                    range,
+                    keep_alive,
+                    timeout,
+                    is_head,
+                ),
+                GeneratedResponse::File(file_path) => {
+                    direct_file_task(file_path, request, config).serve()
+                }
+                GeneratedResponse::Error(status) => response::error(
+                    status,
+                    reason_phrase(status),
+                    "",
+                    keep_alive,
+                    timeout,
+                    is_head,
+                ),
+                GeneratedResponse::Pass => match fallback {
+                    // The handler declined; serve the same-prefix disk mount if
+                    // one exists, otherwise a plain 404.
+                    Some((root, kind, relative_path)) => {
+                        FileTask::new(root, kind, relative_path, request, config).serve()
+                    }
                     None => response::error(
                         404,
                         "Not Found",
@@ -456,17 +483,7 @@ impl App {
                         timeout,
                         is_head,
                     ),
-                }
-            } else {
-                response::owned(
-                    result.status,
-                    reason_phrase(result.status),
-                    Arc::from(result.body),
-                    &result.content_type,
-                    keep_alive,
-                    timeout,
-                    is_head,
-                )
+                },
             };
             let _ = file_tx.send(FileResult { conn_id, response });
             notifier.wake();
@@ -550,6 +567,42 @@ impl App {
                     loop {
                         let header_left = &header[conn.header_sent..];
                         let body_left = &bytes[conn.body_sent as usize..];
+                        if header_left.is_empty() && body_left.is_empty() {
+                            break true;
+                        }
+                        let iov = [io::IoSlice::new(header_left), io::IoSlice::new(body_left)];
+                        match conn.stream.write_vectored(&iov) {
+                            Ok(0) => {
+                                conn.state = ConnState::Done;
+                                return;
+                            }
+                            Ok(sent) => {
+                                conn.last_active = Instant::now();
+                                let header_left_len = header_left.len();
+                                if sent <= header_left_len {
+                                    conn.header_sent += sent;
+                                } else {
+                                    conn.header_sent = header.len();
+                                    conn.body_sent += (sent - header_left_len) as u64;
+                                }
+                            }
+                            Err(error) if error.kind() == io::ErrorKind::WouldBlock => return,
+                            Err(_) => {
+                                conn.state = ConnState::Done;
+                                return;
+                            }
+                        }
+                    }
+                }
+                Body::BytesRange { bytes, offset, len } => {
+                    // A windowed in-memory body (a `Range` hit on a resident
+                    // download): the same coalesced header+body `writev` as
+                    // `Body::Bytes`, restricted to the requested sub-slice.
+                    let header = response.header.as_slice();
+                    let window = &bytes[*offset..*offset + *len];
+                    loop {
+                        let header_left = &header[conn.header_sent..];
+                        let body_left = &window[conn.body_sent as usize..];
                         if header_left.is_empty() && body_left.is_empty() {
                             break true;
                         }
@@ -964,5 +1017,86 @@ fn reason_phrase(status: u16) -> &'static str {
         415 => "Unsupported Media Type",
         500 => "Internal Server Error",
         _ => "OK",
+    }
+}
+
+/// Serves an in-memory `Arc<[u8]>` body, applying the request's `Range` to a
+/// `200` response without copying the buffer (`206`/`416` as appropriate).
+fn memory_response(
+    status: u16,
+    content_type: &str,
+    body: Arc<[u8]>,
+    range: Option<ByteRange>,
+    keep_alive: bool,
+    timeout: Duration,
+    is_head: bool,
+) -> PreparedResponse {
+    let size = body.len() as u64;
+    match range {
+        Some(range) if status == 200 => match apply_range(range, size) {
+            Some((from, to)) => response::memory(MemoryResponse {
+                status: 206,
+                reason: "Partial Content",
+                body,
+                offset: from as usize,
+                len: (to - from + 1) as usize,
+                content_type: content_type.to_string(),
+                content_range: Some(ContentRange::Satisfied { from, to, size }),
+                keep_alive,
+                timeout,
+                header_only: is_head,
+            }),
+            None => response::memory(MemoryResponse {
+                status: 416,
+                reason: "Range Not Satisfiable",
+                body,
+                offset: 0,
+                len: 0,
+                content_type: content_type.to_string(),
+                content_range: Some(ContentRange::Unsatisfied { size }),
+                keep_alive,
+                timeout,
+                header_only: true,
+            }),
+        },
+        _ => {
+            let len = body.len();
+            response::memory(MemoryResponse {
+                status,
+                reason: reason_phrase(status),
+                body,
+                offset: 0,
+                len,
+                content_type: content_type.to_string(),
+                content_range: None,
+                keep_alive,
+                timeout,
+                header_only: is_head,
+            })
+        }
+    }
+}
+
+/// Builds a [`FileTask`] that serves one specific file with full `Range`
+/// support, rooting the mount at the file's parent so the canonical-path
+/// containment check still applies.
+fn direct_file_task(path: std::path::PathBuf, request: Request, config: ServerConfig) -> FileTask {
+    match (path.parent(), path.file_name()) {
+        (Some(parent), Some(name)) => FileTask::new(
+            parent.to_path_buf(),
+            MountKind::FileDir,
+            name.to_string_lossy().into_owned(),
+            request,
+            config,
+        ),
+        // A path with no parent/file name can never resolve to a real file; an
+        // empty relative path under a nonexistent root yields a clean 404.
+        _ => FileTask::new(
+            std::path::PathBuf::new(),
+            MountKind::FileDir,
+            String::new(),
+            request,
+            config,
+        ),
     }
 }

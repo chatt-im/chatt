@@ -16,6 +16,12 @@ pub(crate) struct PreparedResponse {
 pub(crate) enum Body {
     Empty,
     Bytes(Arc<[u8]>),
+    /// A sub-range of a shared in-memory buffer, served without copying.
+    BytesRange {
+        bytes: Arc<[u8]>,
+        offset: usize,
+        len: usize,
+    },
     File(FileBody),
 }
 
@@ -102,31 +108,6 @@ pub(crate) fn error(
     }
 }
 
-/// An in-memory response with an arbitrary status, for a handler that computes
-/// its body. Unlike [`bytes`], the status and reason are the caller's.
-pub(crate) fn owned(
-    status: u16,
-    reason: &'static str,
-    body: Arc<[u8]>,
-    content_type: &str,
-    keep_alive: bool,
-    timeout: Duration,
-    header_only: bool,
-) -> PreparedResponse {
-    let mut header = common_header(status, reason, keep_alive, timeout);
-    content_type_header(&mut header, content_type);
-    finish_header(&mut header, body.len() as u64);
-    PreparedResponse {
-        header,
-        body: if header_only {
-            Body::Empty
-        } else {
-            Body::Bytes(body)
-        },
-        keep_alive,
-    }
-}
-
 pub(crate) fn bytes(
     body: Arc<[u8]>,
     content_type: &str,
@@ -153,6 +134,53 @@ pub(crate) fn bytes(
             Body::Bytes(body)
         },
         keep_alive,
+    }
+}
+
+/// An in-memory response served from a shared `Arc<[u8]>`, honouring `Range`.
+/// Mirrors [`file`] for a buffer that is already resident, so a `/files` hit on
+/// an in-memory download costs an `Arc` clone rather than a copy of the body.
+pub(crate) struct MemoryResponse {
+    pub(crate) status: u16,
+    pub(crate) reason: &'static str,
+    pub(crate) body: Arc<[u8]>,
+    pub(crate) offset: usize,
+    pub(crate) len: usize,
+    pub(crate) content_type: String,
+    pub(crate) content_range: Option<ContentRange>,
+    pub(crate) keep_alive: bool,
+    pub(crate) timeout: Duration,
+    pub(crate) header_only: bool,
+}
+
+pub(crate) fn memory(options: MemoryResponse) -> PreparedResponse {
+    let mut header = common_header(
+        options.status,
+        options.reason,
+        options.keep_alive,
+        options.timeout,
+    );
+    header.line(b"Accept-Ranges: bytes");
+    if let Some(range) = options.content_range {
+        content_range_header(&mut header, range);
+    }
+    if options.status != 416 {
+        content_type_header(&mut header, &options.content_type);
+    }
+    finish_header(&mut header, options.len as u64);
+    let body = if options.header_only || options.status == 416 {
+        Body::Empty
+    } else {
+        Body::BytesRange {
+            bytes: options.body,
+            offset: options.offset,
+            len: options.len,
+        }
+    };
+    PreparedResponse {
+        header,
+        body,
+        keep_alive: options.keep_alive,
     }
 }
 

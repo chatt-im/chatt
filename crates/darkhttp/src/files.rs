@@ -171,7 +171,7 @@ fn serve_path(path: PathBuf, request: &Request, config: &ServerConfig) -> Prepar
     }
 }
 
-fn apply_range(range: ByteRange, size: u64) -> Option<(u64, u64)> {
+pub(crate) fn apply_range(range: ByteRange, size: u64) -> Option<(u64, u64)> {
     if size == 0 {
         return None;
     }

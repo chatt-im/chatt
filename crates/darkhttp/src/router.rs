@@ -38,53 +38,56 @@ pub struct GeneratedRequest<'a> {
 }
 
 /// A computed response from a generated-route handler.
-pub struct GeneratedResponse {
-    pub status: u16,
-    pub content_type: String,
-    pub body: Vec<u8>,
+///
+/// Each variant is a distinct outcome, so there is no in-band status sentinel: a
+/// [`pass`](GeneratedResponse::pass) can only be produced by that constructor,
+/// never by a handler that happens to compute a particular status code.
+pub enum GeneratedResponse {
+    /// An in-memory body served with the given status and content type. The
+    /// router applies the request's `Range` and `HEAD` to the shared `Arc`
+    /// without copying the body.
+    Bytes {
+        status: u16,
+        content_type: String,
+        body: Arc<[u8]>,
+    },
+    /// Serve this file from disk, with full `Range`/`If-Modified-Since` support.
+    /// Used to serve a specific file the handler located itself (e.g. a download
+    /// held in a per-room directory the router does not mount).
+    File(PathBuf),
+    /// An error response with an empty body.
+    Error(u16),
+    /// Defer to a [directory mount](Router::mount_file_dir) on the handler's own
+    /// prefix, or a `404` when none matches. Lets a generated handler fall
+    /// through to disk when it has nothing to serve itself.
+    Pass,
 }
 
 impl GeneratedResponse {
     /// A `200 OK` response with the given body and content type.
-    pub fn ok(content_type: impl Into<String>, body: Vec<u8>) -> Self {
-        Self {
+    pub fn ok(content_type: impl Into<String>, body: impl Into<Arc<[u8]>>) -> Self {
+        Self::Bytes {
             status: 200,
             content_type: content_type.into(),
-            body,
+            body: body.into(),
         }
     }
 
     /// An error response with an empty body.
     pub fn error(status: u16) -> Self {
-        Self {
-            status,
-            content_type: "text/plain; charset=UTF-8".to_string(),
-            body: Vec::new(),
-        }
+        Self::Error(status)
     }
 
-    /// A sentinel asking the router to defer to the next matching mount instead
-    /// of sending this response. Lets a generated handler that shares a prefix
-    /// with a [directory mount](Router::mount_file_dir) fall through to disk
-    /// (preserving Range serving) when it has nothing to serve itself. When no
-    /// directory mount matches, a `404` is sent.
+    /// Serve `path` from disk with `Range`/`If-Modified-Since` support.
+    pub fn file(path: impl Into<PathBuf>) -> Self {
+        Self::File(path.into())
+    }
+
+    /// Defer to a directory mount on the handler's prefix, or a `404`.
     pub fn pass() -> Self {
-        Self {
-            status: PASS_STATUS,
-            content_type: String::new(),
-            body: Vec::new(),
-        }
-    }
-
-    /// Whether this is the [`pass`](GeneratedResponse::pass) sentinel.
-    pub(crate) fn is_pass(&self) -> bool {
-        self.status == PASS_STATUS
+        Self::Pass
     }
 }
-
-/// Sentinel status for [`GeneratedResponse::pass`]. Zero is not a valid HTTP
-/// status, so it can never collide with a real response.
-pub(crate) const PASS_STATUS: u16 = 0;
 
 /// A handler that computes a response for any path under its mount prefix. It
 /// runs on the server's I/O thread pool, so it may block on disk or CPU without
@@ -228,12 +231,12 @@ impl Router {
     pub(crate) fn resolve_generated<'m, 'p>(
         &'m self,
         path: &'p RoutePath,
-    ) -> Option<(&'m GeneratedHandler, &'p str)> {
+    ) -> Option<(&'m GeneratedHandler, &'p str, &'m RoutePath)> {
         self.generated
             .iter()
             .filter_map(|mount| Some((mount, relative_to_prefix(&mount.prefix, path)?)))
             .max_by_key(|(mount, _)| mount.prefix.as_str().len())
-            .map(|(mount, relative)| (&mount.handler, relative))
+            .map(|(mount, relative)| (&mount.handler, relative, &mount.prefix))
     }
 
     pub fn websocket(mut self, path: impl AsRef<str>) -> Self {
