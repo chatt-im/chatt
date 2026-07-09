@@ -399,6 +399,10 @@ enum WebFeed {
     /// merge it into the matching placeholder message and it is not retained, so a
     /// browser that connects mid-transfer simply sees the file once it lands.
     FileProgress(String),
+    /// A `file_terminal` envelope for a transfer that ended without landing.
+    /// Transient like [`FileProgress`](WebFeed::FileProgress); browsers merge it
+    /// into the placeholder, swapping the progress bar for the terminal label.
+    FileTerminal(String),
     /// A `share_ended` envelope. Drops the retained `share_available` for its
     /// `stream_id`.
     ShareEnded {
@@ -432,6 +436,11 @@ pub enum WebRequest {
         path: PathBuf,
         name: String,
     },
+    /// Aborts the in-flight transfer with the given server transfer id: the app
+    /// cancels it if it is an outgoing upload, or skips it if incoming.
+    CancelTransfer {
+        transfer_id: u64,
+    },
 }
 
 /// A request a browser sends over the WebSocket as a JSON text frame.
@@ -463,6 +472,11 @@ enum ClientRequest {
     /// reassembled file for sending.
     #[jsony(rename = "upload_finish")]
     UploadFinish { upload_id: u32 },
+    /// Cancels an in-flight upload or skips an in-flight download, by the server
+    /// transfer id the placeholder message carries as its `file_id`. Ignored
+    /// when read-only.
+    #[jsony(rename = "abort_transfer")]
+    AbortTransfer { transfer_id: u64 },
 }
 
 /// A cloneable handle the app uses to push messages to the web view.
@@ -523,6 +537,14 @@ impl WebFeedSender {
     /// it into the matching placeholder message.
     pub fn send_file_progress(&self, payload: String) {
         let _ = self.tx.send(WebFeed::FileProgress(payload));
+        self.wake.wake();
+    }
+
+    /// Broadcasts a file-transfer terminal envelope (skipped/cancelled/failed).
+    /// Not retained: browsers merge it into the matching placeholder message,
+    /// replacing its progress bar with the terminal label.
+    pub fn send_file_terminal(&self, payload: String) {
+        let _ = self.tx.send(WebFeed::FileTerminal(payload));
         self.wake.wake();
     }
 
@@ -877,6 +899,15 @@ fn run(
                             );
                         }
                     }
+                    Ok(ClientRequest::AbortTransfer { transfer_id }) if !readonly => {
+                        kvlog::info!(
+                            "websocket request",
+                            ws_id = id.get(),
+                            kind = "abort_transfer",
+                            transfer_id
+                        );
+                        let _ = web_requests.send(WebRequest::CancelTransfer { transfer_id });
+                    }
                     Ok(request) => {
                         let kind = client_request_kind(&request);
                         kvlog::info!(
@@ -1030,7 +1061,9 @@ fn run(
                         }
                     }
                 }
-                Ok(WebFeed::ShareError(payload)) | Ok(WebFeed::FileProgress(payload)) => {
+                Ok(WebFeed::ShareError(payload))
+                | Ok(WebFeed::FileProgress(payload))
+                | Ok(WebFeed::FileTerminal(payload)) => {
                     for id in &clients {
                         let _ = server.send_websocket_text(*id, &payload);
                     }
@@ -1117,6 +1150,7 @@ fn client_request_kind(request: &ClientRequest) -> &'static str {
         ClientRequest::SendMessage { .. } => "send_message",
         ClientRequest::UploadStart { .. } => "upload_start",
         ClientRequest::UploadFinish { .. } => "upload_finish",
+        ClientRequest::AbortTransfer { .. } => "abort_transfer",
     }
 }
 
@@ -2055,6 +2089,42 @@ Sec-WebSocket-Version: 13\r\n\
                 body: "hi there".to_string()
             }
         );
+    }
+
+    #[test]
+    fn abort_transfer_forwards_cancel_request() {
+        let cfg = WebConfig {
+            enabled: true,
+            readonly: false,
+            bind: "127.0.0.1:0".to_string(),
+            ..WebConfig::default()
+        };
+        let (web_tx, web_rx) = mpsc::channel();
+        let sender = spawn(&cfg, None, 100, web_tx, false).unwrap();
+
+        let mut stream = open_ready_ws(sender.local_addr());
+        write_ws_text(&mut stream, r#"{"type":"abort_transfer","transfer_id":7}"#);
+
+        let request = web_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert_eq!(request, WebRequest::CancelTransfer { transfer_id: 7 });
+    }
+
+    #[test]
+    fn abort_transfer_ignored_when_readonly() {
+        let cfg = WebConfig {
+            enabled: true,
+            readonly: true,
+            bind: "127.0.0.1:0".to_string(),
+            ..WebConfig::default()
+        };
+        let (web_tx, web_rx) = mpsc::channel();
+        let sender = spawn(&cfg, None, 100, web_tx, true).unwrap();
+
+        let mut stream = open_ready_ws(sender.local_addr());
+        write_ws_text(&mut stream, r#"{"type":"abort_transfer","transfer_id":7}"#);
+
+        // A read-only viewer cannot abort the host's transfers.
+        assert!(web_rx.recv_timeout(Duration::from_millis(300)).is_err());
     }
 
     #[test]

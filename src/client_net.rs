@@ -398,6 +398,13 @@ pub enum NetworkCommand {
         body: String,
     },
     UploadFile(UploadFileRequest),
+    /// Aborts an in-flight file transfer identified by its server transfer id.
+    /// The worker resolves the direction: an outgoing upload is canceled
+    /// ([`ClientControl::UploadFileCancel`]); an incoming download is skipped
+    /// ([`ClientControl::SkipFile`]).
+    CancelTransfer {
+        transfer_id: FileTransferId,
+    },
     /// Tells the worker which room the client is viewing, the target for
     /// uploads injected outside the app thread (`chatt upload`, web sends
     /// without a room).
@@ -454,6 +461,42 @@ pub enum TransferDirection {
     Outgoing,
 }
 
+/// How a file transfer ended without landing, chosen so the file line's terminal
+/// label reads naturally: a declined download is `skipped`, an aborted upload is
+/// `cancelled`, and an upstream/local error is `failed`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TerminalVerb {
+    Skipped,
+    Cancelled,
+    Failed,
+}
+
+impl TerminalVerb {
+    /// The lowercase word shown on the terminal file line and in the web
+    /// envelope.
+    pub fn label(self) -> &'static str {
+        match self {
+            TerminalVerb::Skipped => "skipped",
+            TerminalVerb::Cancelled => "cancelled",
+            TerminalVerb::Failed => "failed",
+        }
+    }
+}
+
+/// Why [`NetworkClient::cancel_outgoing_upload`] is tearing an upload down, which
+/// decides the terminal label and whether an error notice is raised. An
+/// intentional cancel (user or server-declined) must not surface as an error.
+enum UploadAbort {
+    /// The user canceled their own upload: bare `cancelled`, no error notice.
+    UserCancel,
+    /// The server reported the upload lost its last recipient:
+    /// `cancelled: recipient declined`, no error notice.
+    Declined,
+    /// The upload failed locally (read/compression): `failed: <error>`, and the
+    /// error is also raised as a notice.
+    Failure(String),
+}
+
 #[derive(Clone, Debug)]
 pub enum NetworkEvent {
     Connected,
@@ -504,9 +547,23 @@ pub enum NetworkEvent {
         total: u64,
         direction: TransferDirection,
     },
-    /// A file transfer failed or was canceled before completion. Clears any
-    /// progress overlay for `transfer_id`.
-    TransferCanceled {
+    /// A file transfer ended without landing (skipped, canceled, or failed).
+    /// Replaces any progress overlay for `transfer_id` with a persistent terminal
+    /// label. `reason` fills the `verb: reason` form; `None` renders the bare verb
+    /// (an explicit user skip/cancel). `timestamp_ms` addresses the web
+    /// placeholder alongside `transfer_id`.
+    TransferEnded {
+        room_id: RoomId,
+        transfer_id: FileTransferId,
+        timestamp_ms: u64,
+        verb: TerminalVerb,
+        reason: Option<String>,
+    },
+    /// A file transfer finished successfully with nothing to save locally (an
+    /// upload with no receive directory). Clears the progress overlay; the file
+    /// line reverts to its plain announcement. Downloads and saved uploads clear
+    /// via [`NetworkEvent::FileReceived`] instead.
+    TransferComplete {
         room_id: RoomId,
         transfer_id: FileTransferId,
     },
@@ -2831,6 +2888,9 @@ impl WorkerState {
             NetworkCommand::UploadFile(request) => {
                 self.queue_file_upload(request);
             }
+            NetworkCommand::CancelTransfer { transfer_id } => {
+                self.cancel_transfer(transfer_id)?;
+            }
             NetworkCommand::SetActiveRoom(room_id) => {
                 self.active_room = Some(room_id);
             }
@@ -3316,7 +3376,7 @@ impl WorkerState {
                 return self.cancel_outgoing_upload(
                     upload,
                     "compression failed",
-                    &format!("failed to flush compressed upload: {error}"),
+                    UploadAbort::Failure(format!("failed to flush compressed upload: {error}")),
                 );
             }
             if upload.body.pending().is_empty() {
@@ -3342,14 +3402,16 @@ impl WorkerState {
                     return self.cancel_outgoing_upload(
                         upload,
                         "local file ended early",
-                        "file ended early while uploading",
+                        UploadAbort::Failure("file ended early while uploading".to_string()),
                     );
                 }
                 Err(error) => {
                     return self.cancel_outgoing_upload(
                         upload,
                         "failed to read local file",
-                        &format!("failed to read file while uploading: {error}"),
+                        UploadAbort::Failure(format!(
+                            "failed to read file while uploading: {error}"
+                        )),
                     );
                 }
             };
@@ -3359,7 +3421,7 @@ impl WorkerState {
                 return self.cancel_outgoing_upload(
                     upload,
                     "compression failed",
-                    &format!("failed to compress upload: {error}"),
+                    UploadAbort::Failure(format!("failed to compress upload: {error}")),
                 );
             }
             if compressed_upload_source_read_ahead_is_limited(&upload, &self.upload_throttle) {
@@ -3399,7 +3461,7 @@ impl WorkerState {
                 return self.cancel_outgoing_upload(
                     upload,
                     "compression failed",
-                    &format!("failed to finish compressed upload: {error}"),
+                    UploadAbort::Failure(format!("failed to finish compressed upload: {error}")),
                 );
             }
             upload.encoder_finished = true;
@@ -3431,15 +3493,93 @@ impl WorkerState {
             upload.name,
             format_bytes(upload.size)
         )));
+        // Terminal clear for the progress overlay. An uploader with a receive
+        // directory also clears via the `FileReceived` in `finish_local_copy`
+        // (a redundant but harmless second clear); one without a directory never
+        // emits `FileReceived`, so this is its only clear path.
+        if let Some(meta) = upload.server_metadata.as_ref() {
+            let _ = self.events.send(NetworkEvent::TransferComplete {
+                room_id: meta.room_id,
+                transfer_id: meta.transfer_id,
+            });
+        }
         self.finish_local_copy(&mut upload);
         Ok(true)
+    }
+
+    /// Aborts the transfer with server id `transfer_id`, resolving the direction
+    /// from which map holds it: an outgoing upload is canceled, an incoming
+    /// download is skipped. Unknown ids (already finished or canceled) are a
+    /// no-op.
+    fn cancel_transfer(&mut self, transfer_id: FileTransferId) -> Result<(), String> {
+        if let Some(index) = self.outgoing_uploads.iter().position(|upload| {
+            upload
+                .server_metadata
+                .as_ref()
+                .is_some_and(|metadata| metadata.transfer_id == transfer_id)
+        }) {
+            let upload = self
+                .outgoing_uploads
+                .remove(index)
+                .expect("index in bounds");
+            self.cancel_outgoing_upload(upload, "canceled by sender", UploadAbort::UserCancel)?;
+        } else if self.incoming_files.contains_key(&transfer_id) {
+            self.skip_incoming_file(transfer_id)?;
+        }
+        Ok(())
+    }
+
+    /// Declines an in-flight download: tells the server to stop relaying
+    /// ([`ClientControl::SkipFile`]), drops the partial file, and clears the
+    /// local view. Mirrors [`Self::handle_file_canceled`] for a locally
+    /// initiated skip.
+    fn skip_incoming_file(&mut self, transfer_id: FileTransferId) -> Result<(), String> {
+        self.queue_control(ClientControl::SkipFile { transfer_id })?;
+        if let Some(incoming) = self.incoming_files.remove(&transfer_id) {
+            let room_id = incoming.metadata.room_id;
+            let _ = fs::remove_file(&incoming.path);
+            let _ = self.events.send(NetworkEvent::TransferEnded {
+                room_id,
+                transfer_id,
+                timestamp_ms: incoming.metadata.timestamp_ms,
+                verb: TerminalVerb::Skipped,
+                reason: None,
+            });
+        }
+        Ok(())
+    }
+
+    /// Tells the server to stop relaying an offered file this client is declining
+    /// at offer time (its per-room policy rejects it). Best-effort: a full control
+    /// queue means the connection is already failing.
+    fn skip_offered_download(&mut self, file: &FileMetadata) {
+        if let Err(error) = self.queue_control(ClientControl::SkipFile {
+            transfer_id: file.transfer_id,
+        }) {
+            kvlog::warn!(
+                "failed to queue skip for offered file",
+                error = error.as_str()
+            );
+        }
+    }
+
+    /// Emits the persistent `skipped: <reason>` terminal label for an offered file
+    /// this client did not accept.
+    fn end_transfer_skipped(&self, file: &FileMetadata, reason: String) {
+        let _ = self.events.send(NetworkEvent::TransferEnded {
+            room_id: file.room_id,
+            transfer_id: file.transfer_id,
+            timestamp_ms: file.timestamp_ms,
+            verb: TerminalVerb::Skipped,
+            reason: Some(reason),
+        });
     }
 
     fn cancel_outgoing_upload(
         &mut self,
         mut upload: OutgoingUpload,
         wire_reason: &str,
-        error: &str,
+        abort: UploadAbort,
     ) -> Result<bool, String> {
         self.queue_control(ClientControl::UploadFileCancel {
             transfer_id: upload.transfer_id,
@@ -3448,15 +3588,28 @@ impl WorkerState {
         if let Some((path, _)) = upload.local_copy.take() {
             let _ = fs::remove_file(path);
         }
+        let (verb, reason) = match &abort {
+            UploadAbort::UserCancel => (TerminalVerb::Cancelled, None),
+            UploadAbort::Declined => (
+                TerminalVerb::Cancelled,
+                Some("recipient declined".to_string()),
+            ),
+            UploadAbort::Failure(error) => (TerminalVerb::Failed, Some(error.clone())),
+        };
         if let Some(metadata) = upload.server_metadata {
-            let _ = self.events.send(NetworkEvent::TransferCanceled {
+            let _ = self.events.send(NetworkEvent::TransferEnded {
                 room_id: metadata.room_id,
                 transfer_id: metadata.transfer_id,
+                timestamp_ms: metadata.timestamp_ms,
+                verb,
+                reason,
             });
         }
-        let _ = self
-            .events
-            .send(NetworkEvent::Error(format!("{error} {}", upload.name)));
+        if let UploadAbort::Failure(error) = abort {
+            let _ = self
+                .events
+                .send(NetworkEvent::Error(format!("{error} {}", upload.name)));
+        }
         Ok(true)
     }
 
@@ -3539,37 +3692,59 @@ impl WorkerState {
             file_size = file.size,
             contents
         );
-        let policy = self.config.file_policy.for_room(file.room_id);
+        // Take owned copies of the per-room policy so the borrow of `self.config`
+        // ends before the `&mut self` skip/label calls below.
+        let (receive_dir, max_receive_bytes) = {
+            let policy = self.config.file_policy.for_room(file.room_id);
+            (policy.receive_dir.clone(), policy.max_receive_bytes)
+        };
+        let size_label = || {
+            format!(
+                "File exceeds maximum configured size ({})",
+                format_bytes(max_receive_bytes)
+            )
+        };
         if !contents {
-            let reason = if policy.receive_dir.is_some() {
-                "receive limit"
+            // The server already declined to stream (the file exceeds our
+            // advertised limit or receiving is off), so no `SkipFile` is needed;
+            // just label the line with why.
+            let reason = if receive_dir.is_some() {
+                size_label()
             } else {
-                "receive-dir disabled"
+                "Automatic file receive disabled".to_string()
             };
-            let _ = self.events.send(NetworkEvent::Status(format!(
-                "{} sent {} ({}, metadata only: {reason})",
-                file.sender_name,
-                file.file_name,
-                format_bytes(file.size)
-            )));
-            return;
-        }
-        if file.size > policy.max_receive_bytes {
-            let _ = self.events.send(NetworkEvent::Error(format!(
-                "not receiving {}; size {} exceeds local limit {}",
-                file.file_name,
-                format_bytes(file.size),
-                format_bytes(policy.max_receive_bytes)
-            )));
-            return;
-        }
-        let Some(receive_dir) = policy.receive_dir.clone() else {
             let _ = self.events.send(NetworkEvent::Status(format!(
                 "{} sent {} ({}, metadata only)",
                 file.sender_name,
                 file.file_name,
                 format_bytes(file.size)
             )));
+            self.end_transfer_skipped(&file, reason);
+            return;
+        }
+        if file.size > max_receive_bytes {
+            // The server would stream this, but our per-room limit rejects it, so
+            // tell it to stop relaying to us rather than letting it waste the
+            // whole transfer.
+            self.skip_offered_download(&file);
+            let _ = self.events.send(NetworkEvent::Error(format!(
+                "not receiving {}; size {} exceeds local limit {}",
+                file.file_name,
+                format_bytes(file.size),
+                format_bytes(max_receive_bytes)
+            )));
+            self.end_transfer_skipped(&file, size_label());
+            return;
+        }
+        let Some(receive_dir) = receive_dir else {
+            self.skip_offered_download(&file);
+            let _ = self.events.send(NetworkEvent::Status(format!(
+                "{} sent {} ({}, metadata only)",
+                file.sender_name,
+                file.file_name,
+                format_bytes(file.size)
+            )));
+            self.end_transfer_skipped(&file, "Automatic file receive disabled".to_string());
             return;
         };
         match create_receive_file(&receive_dir, &file.file_name) {
@@ -3680,9 +3855,14 @@ impl WorkerState {
                 "file transfer canceled for {}: {reason}",
                 incoming.metadata.file_name
             )));
-            let _ = self.events.send(NetworkEvent::TransferCanceled {
+            // The recipient can't tell an uploader's abort from an upstream
+            // failure; both read as the sender pulling the file.
+            let _ = self.events.send(NetworkEvent::TransferEnded {
                 room_id,
                 transfer_id,
+                timestamp_ms: incoming.metadata.timestamp_ms,
+                verb: TerminalVerb::Skipped,
+                reason: Some("Sender aborted transfer".to_string()),
             });
         }
     }
@@ -3738,6 +3918,7 @@ impl WorkerState {
                 .remove(&transfer_id)
                 .expect("incoming file exists");
             let room_id = incoming.metadata.room_id;
+            let timestamp_ms = incoming.metadata.timestamp_ms;
             match incoming.finalize() {
                 Ok((metadata, path, dimensions, _wire_bytes)) => {
                     #[cfg(test)]
@@ -3762,12 +3943,14 @@ impl WorkerState {
                 }
                 Err((path, name, error)) => {
                     let _ = fs::remove_file(path);
-                    let _ = self.events.send(NetworkEvent::Error(format!(
-                        "failed to finish receiving {name}: {error}"
-                    )));
-                    let _ = self.events.send(NetworkEvent::TransferCanceled {
+                    let message = format!("failed to finish receiving {name}: {error}");
+                    let _ = self.events.send(NetworkEvent::Error(message.clone()));
+                    let _ = self.events.send(NetworkEvent::TransferEnded {
                         room_id,
                         transfer_id,
+                        timestamp_ms,
+                        verb: TerminalVerb::Failed,
+                        reason: Some(message),
                     });
                 }
             }
@@ -3779,14 +3962,16 @@ impl WorkerState {
             return;
         };
         let room_id = incoming.metadata.room_id;
+        let timestamp_ms = incoming.metadata.timestamp_ms;
         let _ = fs::remove_file(&incoming.path);
-        let _ = self.events.send(NetworkEvent::Error(format!(
-            "{reason} for {}",
-            incoming.metadata.file_name
-        )));
-        let _ = self.events.send(NetworkEvent::TransferCanceled {
+        let message = format!("{reason} for {}", incoming.metadata.file_name);
+        let _ = self.events.send(NetworkEvent::Error(message.clone()));
+        let _ = self.events.send(NetworkEvent::TransferEnded {
             room_id,
             transfer_id,
+            timestamp_ms,
+            verb: TerminalVerb::Failed,
+            reason: Some(message),
         });
     }
 
@@ -4171,7 +4356,35 @@ impl WorkerState {
                 }
                 let _ = self.events.send(NetworkEvent::Presence { user, online });
             }
+            ServerControl::UploadDeclined {
+                client_transfer_id,
+                reason,
+            } => self.handle_upload_declined(client_transfer_id, &reason),
         }
+    }
+
+    /// Handles the server telling us our upload lost its last recipient: cancel
+    /// the now-pointless transfer locally, which also stops streaming and shows
+    /// the `cancelled: <reason>` terminal label. Unknown ids (already gone) are a
+    /// no-op.
+    fn handle_upload_declined(&mut self, client_transfer_id: FileTransferId, reason: &str) {
+        kvlog::info!(
+            "upload declined by server",
+            client_transfer_id = client_transfer_id.0,
+            reason
+        );
+        let Some(index) = self
+            .outgoing_uploads
+            .iter()
+            .position(|upload| upload.transfer_id == client_transfer_id)
+        else {
+            return;
+        };
+        let upload = self
+            .outgoing_uploads
+            .remove(index)
+            .expect("index in bounds");
+        let _ = self.cancel_outgoing_upload(upload, reason, UploadAbort::Declined);
     }
 
     fn bind_udp(&mut self) {
@@ -5399,6 +5612,7 @@ fn network_command_kind(command: &NetworkCommand) -> &'static str {
     match command {
         NetworkCommand::SendChat { .. } => "send_chat",
         NetworkCommand::UploadFile(_) => "upload_file",
+        NetworkCommand::CancelTransfer { .. } => "cancel_transfer",
         NetworkCommand::SetActiveRoom(_) => "set_active_room",
         NetworkCommand::JoinVoice(_) => "join_voice",
         NetworkCommand::LeaveVoice => "leave_voice",
@@ -5525,6 +5739,7 @@ fn server_control_kind(control: &ServerControl) -> &'static str {
         ServerControl::BugReportSaved { .. } => "bug_report_saved",
         ServerControl::RoomUpserted { .. } => "room_upserted",
         ServerControl::DmOpened { .. } => "dm_opened",
+        ServerControl::UploadDeclined { .. } => "upload_declined",
     }
 }
 

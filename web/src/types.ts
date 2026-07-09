@@ -3,6 +3,9 @@
 
 export type MediaKind = "image" | "video" | "audio" | "file";
 export type AutoplayMode = "disabled" | "muted" | "with-audio";
+// Which side of a transfer this view is on: "incoming" is a download this
+// client is receiving, "outgoing" is an upload it is sending.
+export type TransferDirection = "incoming" | "outgoing";
 
 export interface WebAttachment {
   // Served file name. The URL is `/files/${name}`.
@@ -46,10 +49,15 @@ export interface WebMessage {
   // Precomputed `@@` reference code (without the prefix) for copying/quoting a
   // reference to this message. Empty when the message is not referenceable.
   ref_code: string;
-  // Live receive progress for an in-flight file, set from `file_progress`
-  // envelopes while the host client pulls the file off the relay. Cleared when
+  // Live progress for an in-flight file, set from `file_progress` envelopes.
+  // `direction` picks the verb and the abort button label: an "incoming"
+  // download offers [skip], an "outgoing" upload offers [cancel]. Cleared when
   // the enriched attachment replaces the placeholder.
-  progress?: { transferred: number; total: number };
+  progress?: { transferred: number; total: number; direction: TransferDirection };
+  // Persistent terminal state for a file that ended without landing, set from a
+  // `file_terminal` envelope. Replaces `progress`; `verb` is skipped/cancelled/
+  // failed and `reason` fills the `verb: reason` label (null for a bare verb).
+  terminal?: { verb: string; reason: string | null };
   // Client-only playback intent attached to a newly received video. History
   // sync messages omit it so reconnecting does not autoplay old media.
   autoplay?: AutoplayMode;
@@ -79,7 +87,23 @@ export type ServerEnvelope =
   | { type: "share_error"; stream_id: number; message: string }
   // Live receive progress for an in-flight file, merged into the placeholder
   // message matched by `file_id` and `timestamp_ms`.
-  | { type: "file_progress"; file_id: number; timestamp_ms: number; transferred: number; total: number }
+  | {
+      type: "file_progress";
+      file_id: number;
+      timestamp_ms: number;
+      transferred: number;
+      total: number;
+      direction: TransferDirection;
+    }
+  // A file transfer ended without landing; merged into the placeholder matched by
+  // `file_id` and `timestamp_ms`, swapping its progress bar for a terminal label.
+  | {
+      type: "file_terminal";
+      file_id: number;
+      timestamp_ms: number;
+      verb: string;
+      reason: string | null;
+    }
   // Sent once on connect with browser-only behavior settings.
   | {
       type: "config";
@@ -107,4 +131,5 @@ export type ClientRequest =
   | { type: "stop_share"; stream_id: number }
   | { type: "send_message"; body: string }
   | { type: "upload_start"; upload_id: number; name: string; size: number }
-  | { type: "upload_finish"; upload_id: number };
+  | { type: "upload_finish"; upload_id: number }
+  | { type: "abort_transfer"; transfer_id: number };

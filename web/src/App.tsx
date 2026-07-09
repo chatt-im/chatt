@@ -19,6 +19,7 @@ import type {
   ClientRequest,
   ShareInfo,
   Fragment,
+  TransferDirection,
 } from "./types";
 import ScreenShare from "./ScreenShare";
 import { ScreenShareDecoder, parseFrame } from "./video-decode";
@@ -376,31 +377,50 @@ function withPastedImageName(file: File, pastedAt: Date, index: number): File {
   );
 }
 
-// Progress bar shown on a file's placeholder message while the host client
-// pulls the file off the relay. Replaced by the attachment on completion.
+// Progress bar shown on a file's placeholder message while a transfer is in
+// flight, replaced by the attachment on completion. `direction` picks the verb
+// and, when `onAbort` is provided (writable view), the button: an incoming
+// download offers [skip], an outgoing upload offers [cancel].
 function TransferProgressBar(props: {
-  progress: { transferred: number; total: number };
+  progress: { transferred: number; total: number; direction: TransferDirection };
+  onAbort?: () => void;
 }) {
   const ratio = () => {
     const { transferred, total } = props.progress;
     return total > 0 ? Math.min(1, transferred / total) : 0;
   };
   const pct = () => Math.round(ratio() * 100);
+  const incoming = () => props.progress.direction === "incoming";
+  const verb = () => (incoming() ? "receiving" : "sending");
+  const abortLabel = () => (incoming() ? "skip" : "cancel");
   return (
-    <div
-      class="message-progress"
-      role="progressbar"
-      aria-valuenow={pct()}
-      aria-valuemin={0}
-      aria-valuemax={100}
-    >
-      <div class="message-progress-track">
-        <div class="message-progress-fill" style={{ width: `${pct()}%` }} />
+    <div class="message-progress-row">
+      <div
+        class="message-progress"
+        role="progressbar"
+        aria-valuenow={pct()}
+        aria-valuemin={0}
+        aria-valuemax={100}
+      >
+        <div class="message-progress-track">
+          <div class="message-progress-fill" style={{ width: `${pct()}%` }} />
+        </div>
+        <span class="message-progress-label">
+          {verb()} {formatBytes(props.progress.transferred)} /{" "}
+          {formatBytes(props.progress.total)} ({pct()}%)
+        </span>
       </div>
-      <span class="message-progress-label">
-        receiving {formatBytes(props.progress.transferred)} /{" "}
-        {formatBytes(props.progress.total)} ({pct()}%)
-      </span>
+      <Show when={props.onAbort}>
+        <button
+          class="message-progress-abort"
+          type="button"
+          aria-label={incoming() ? "Skip download" : "Cancel upload"}
+          title={incoming() ? "Skip download" : "Cancel upload"}
+          onClick={() => props.onAbort!()}
+        >
+          {abortLabel()}
+        </button>
+      </Show>
     </div>
   );
 }
@@ -698,6 +718,7 @@ function MessageRow(props: {
   onToggleGroup: (key: string) => void;
   onOpenPreview: (item: PreviewItem, opener: HTMLElement) => void;
   onQuoteRef?: (refCode: string) => void;
+  onAbortTransfer?: (transferId: number) => void;
   autoplay: AutoplayMode;
 }) {
   // A continuation hides the header and shows its time only on hover, in the
@@ -789,7 +810,21 @@ function MessageRow(props: {
           />
         </Show>
         <Show when={!props.message.attachment && props.message.progress}>
-          <TransferProgressBar progress={props.message.progress!} />
+          <TransferProgressBar
+            progress={props.message.progress!}
+            onAbort={
+              props.onAbortTransfer && props.message.file_id != null
+                ? () => props.onAbortTransfer!(props.message.file_id!)
+                : undefined
+            }
+          />
+        </Show>
+        <Show when={!props.message.attachment && props.message.terminal}>
+          <div class="message-transfer-terminal">
+            {props.message.terminal!.reason
+              ? `${props.message.terminal!.verb}: ${props.message.terminal!.reason}`
+              : props.message.terminal!.verb}
+          </div>
         </Show>
         <Show when={props.message.ref_code}>
           <div class="message-actions">
@@ -1400,6 +1435,12 @@ export default function App() {
     }
   }
 
+  // Cancel an outgoing upload or skip an incoming download, by the transfer id
+  // the placeholder message carries as its `file_id`.
+  function abortTransfer(transferId: number) {
+    sendJson({ type: "abort_transfer", transfer_id: transferId });
+  }
+
   function openSocketOrThrow(): WebSocket {
     if (!socket || socket.readyState !== WebSocket.OPEN) {
       throw new Error("websocket is not open");
@@ -1950,7 +1991,30 @@ export default function App() {
           const next = prev.slice();
           next[i] = {
             ...next[i],
-            progress: { transferred: env.transferred, total: env.total },
+            progress: {
+              transferred: env.transferred,
+              total: env.total,
+              direction: env.direction,
+            },
+          };
+          return next;
+        });
+      } else if (env.type === "file_terminal") {
+        // The transfer ended without landing: replace any progress bar with a
+        // persistent terminal label on the still-placeholder message.
+        setMessages((prev) => {
+          const i = prev.findIndex(
+            (m) =>
+              m.file_id === env.file_id &&
+              m.timestamp_ms === env.timestamp_ms &&
+              !m.attachment
+          );
+          if (i < 0) return prev;
+          const next = prev.slice();
+          next[i] = {
+            ...next[i],
+            progress: undefined,
+            terminal: { verb: env.verb, reason: env.reason },
           };
           return next;
         });
@@ -2157,6 +2221,7 @@ export default function App() {
                     onToggleGroup={toggleMessageGroup}
                     onOpenPreview={openPreview}
                     onQuoteRef={readonly() ? undefined : quoteRef}
+                    onAbortTransfer={readonly() ? undefined : abortTransfer}
                     autoplay={message.autoplay ?? "disabled"}
                   />
                 )}

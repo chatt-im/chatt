@@ -185,6 +185,14 @@ pub enum ClientControl {
     OpenDm {
         user_id: UserId,
     },
+    /// A recipient declines an in-flight file it is receiving. `transfer_id` is
+    /// the server transfer id the recipient learned from
+    /// [`FileMetadata::transfer_id`]. The server drops this session from the
+    /// transfer's recipient set, stopping further chunk relay to it; the upload
+    /// continues for everyone else.
+    SkipFile {
+        transfer_id: FileTransferId,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Jsony)]
@@ -336,6 +344,14 @@ pub enum ServerControl {
     Presence {
         user: UserSummary,
         online: bool,
+    },
+    /// An in-flight upload lost its last recipient (all recipients skipped,
+    /// disconnected, or none accepted it at offer time), so the server is
+    /// relaying its chunks to nobody. The uploader responds with
+    /// [`ClientControl::UploadFileCancel`] to tear the transfer down cleanly.
+    UploadDeclined {
+        client_transfer_id: FileTransferId,
+        reason: String,
     },
 }
 

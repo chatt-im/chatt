@@ -25,14 +25,14 @@ use extui::event::{
 };
 use rpc::{
     control::{ERROR_TOKEN_STALE_EPOCH, InviteTicket, ParticipantVoiceStatus},
-    ids::{RoomId, SessionId, StreamId, UserId},
+    ids::{FileTransferId, RoomId, SessionId, StreamId, UserId},
 };
 
 use crate::{
     bindings::BindCommand,
     client_net::{
-        NetworkClient, NetworkCommand, NetworkEvent, UploadFileRequest, spawn_open_pair_once,
-        spawn_pair_once,
+        NetworkClient, NetworkCommand, NetworkEvent, TerminalVerb, TransferDirection,
+        UploadFileRequest, spawn_open_pair_once, spawn_pair_once,
     },
     config::{self, Config, ServerEntry, SoundboardClip, ThemeSelection, validate_server_entry},
     local_control, settings,
@@ -804,13 +804,42 @@ fn parse_upload_rate(arg: &str) -> Result<u64, String> {
 /// The `file_progress` envelope updating a placeholder file message's progress
 /// bar. Keyed by `file_id` (the server transfer id) plus `timestamp_ms`, matching
 /// the browser's placeholder upsert. Dropped once the enriched attachment arrives.
-fn file_progress_envelope(file_id: u64, timestamp_ms: u64, transferred: u64, total: u64) -> String {
+fn file_progress_envelope(
+    file_id: u64,
+    timestamp_ms: u64,
+    transferred: u64,
+    total: u64,
+    direction: TransferDirection,
+) -> String {
+    let direction = match direction {
+        TransferDirection::Incoming => "incoming",
+        TransferDirection::Outgoing => "outgoing",
+    };
     jsony::object! {
         type: "file_progress",
         file_id: file_id,
         timestamp_ms: timestamp_ms,
         transferred: transferred,
         total: total,
+        direction: direction,
+    }
+}
+
+/// The `file_terminal` envelope replacing a placeholder file message's progress
+/// bar with a persistent `verb: reason` label (skipped/cancelled/failed). Keyed
+/// like [`file_progress_envelope`]. `reason` is null for a bare verb.
+fn file_terminal_envelope(
+    file_id: u64,
+    timestamp_ms: u64,
+    verb: TerminalVerb,
+    reason: Option<&str>,
+) -> String {
+    jsony::object! {
+        type: "file_terminal",
+        file_id: file_id,
+        timestamp_ms: timestamp_ms,
+        verb: verb.label(),
+        reason: reason,
     }
 }
 
@@ -1382,7 +1411,17 @@ impl App {
                     true,
                 );
             }
+            crate::web_server::WebRequest::CancelTransfer { transfer_id } => {
+                self.cancel_transfer(FileTransferId(transfer_id));
+            }
         }
+    }
+
+    /// Aborts the in-flight transfer with server id `transfer_id`: the worker
+    /// cancels it if it is an outgoing upload, or skips it if it is an incoming
+    /// download. Shared by the TUI cancel/skip button and the web view.
+    pub(crate) fn cancel_transfer(&mut self, transfer_id: FileTransferId) {
+        self.send_network_command(NetworkCommand::CancelTransfer { transfer_id }, true);
     }
 
     /// Tells the browser to configure its decoder for `stream_id` and ensures a
@@ -2416,10 +2455,30 @@ impl App {
                         timestamp_ms,
                         transferred,
                         total,
+                        direction,
                     ));
                 }
             }
-            NetworkEvent::TransferCanceled {
+            NetworkEvent::TransferEnded {
+                room_id,
+                transfer_id,
+                timestamp_ms,
+                verb,
+                reason,
+            } => {
+                if self.room.viewed_room == Some(room_id)
+                    && let Some(feed) = &self.web_feed
+                {
+                    feed.send_file_terminal(file_terminal_envelope(
+                        transfer_id.0,
+                        timestamp_ms,
+                        verb,
+                        reason.as_deref(),
+                    ));
+                }
+                self.room.end_transfer(room_id, transfer_id, verb, reason);
+            }
+            NetworkEvent::TransferComplete {
                 room_id,
                 transfer_id,
             } => {
@@ -5857,7 +5916,8 @@ fn network_event_kind(event: &NetworkEvent) -> &'static str {
         NetworkEvent::Chat(_) => "chat",
         NetworkEvent::FileReceived { .. } => "file_received",
         NetworkEvent::TransferProgress { .. } => "transfer_progress",
-        NetworkEvent::TransferCanceled { .. } => "transfer_canceled",
+        NetworkEvent::TransferEnded { .. } => "transfer_ended",
+        NetworkEvent::TransferComplete { .. } => "transfer_complete",
         NetworkEvent::Presence { .. } => "presence",
         NetworkEvent::VoiceStarted { .. } => "voice_started",
         NetworkEvent::VoiceStopped { .. } => "voice_stopped",
@@ -5892,6 +5952,7 @@ fn app_network_command_kind(command: &NetworkCommand) -> &'static str {
     match command {
         NetworkCommand::SendChat { .. } => "send_chat",
         NetworkCommand::UploadFile(_) => "upload_file",
+        NetworkCommand::CancelTransfer { .. } => "cancel_transfer",
         NetworkCommand::SetActiveRoom(_) => "set_active_room",
         NetworkCommand::JoinVoice(_) => "join_voice",
         NetworkCommand::LeaveVoice => "leave_voice",
