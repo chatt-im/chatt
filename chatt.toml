@@ -76,10 +76,15 @@ theme = "tomorrow-night"
 # [ui.themes.midnight.syntax]
 # keyword = "#c792ea"
 
+# download: how received files are handled — "off" rejects them, "memory" keeps
+# them in a RAM ring buffer (lost on restart, viewable in the web log), and
+# "persistent" saves them under download-dir (empty = platform default dir).
 [files]
+download = "off"
+download-dir = ""
+download-memory-bytes = 268435456
+max-download-bytes = 52428800
 max-upload-bytes = 52428800
-max-receive-bytes = 52428800
-receive-dir = ""
 
 [p2p]
 enabled = false

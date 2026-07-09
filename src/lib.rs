@@ -20,6 +20,7 @@ pub mod mdns;
 pub mod network;
 pub mod packet_log;
 mod paths;
+mod receive_store;
 mod room_catalog;
 mod room_history;
 mod runtime;

@@ -16,9 +16,10 @@ form-bindings = "vim"
 theme = "tomorrow-night"
 
 [files]
-receive-dir = "/tmp/chatt-soundboard"
+download = "persistent"
+download-dir = "/tmp/chatt-soundboard"
 max-upload-bytes = 52428800
-max-receive-bytes = 52428800
+max-download-bytes = 52428800
 
 [audio]
 bitrate-bps = 48000

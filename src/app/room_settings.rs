@@ -2,9 +2,10 @@ use extui::{Buffer, Rect, event::KeyEvent, event::MouseEvent};
 use rpc::ids::RoomId;
 
 use crate::{
-    config::{Config, FileOverrides, HistoryOverrides, RoomOverrides, ServerEntry},
+    config::{Config, DownloadMode, FileOverrides, HistoryOverrides, RoomOverrides, ServerEntry},
     settings::{
-        OverrideToggle, byte_limit_error, byte_limit_text, download_path_error, parse_byte_limit,
+        DownloadChoice, OverrideToggle, byte_limit_error, byte_limit_text, download_path_error,
+        parse_byte_limit,
     },
     theme::Theme,
     tui::form::{FormAction, FormFieldKind, FormMouseIntent},
@@ -54,13 +55,13 @@ pub(crate) struct RoomSettingsDraft {
     server_label: String,
     room_id: RoomId,
     room_name: String,
-    files_choice: OverrideToggle,
+    download_choice: DownloadChoice,
     download_path: String,
     receive_limit: String,
     history_choice: OverrideToggle,
     history_location: String,
     /// Server-level effective values, shown as what `inherit` resolves to.
-    inherited_downloads_on: bool,
+    inherited_download_mode: DownloadMode,
     inherited_receive_limit: String,
     inherited_history_on: bool,
     form: UiFormState,
@@ -82,23 +83,20 @@ impl RoomSettingsDraft {
                 room_id,
                 ..Default::default()
             });
-        let (files_choice, download_path) = match &overrides.files.receive_dir {
-            None => (OverrideToggle::Inherit, String::new()),
-            Some(dir) if dir.trim().is_empty() => (OverrideToggle::Off, String::new()),
-            Some(dir) => (OverrideToggle::On, dir.clone()),
-        };
+        let download_choice = DownloadChoice::from_override(overrides.files.download);
+        let download_path = overrides.files.download_dir.clone().unwrap_or_default();
         let inherited_files = config.effective_files(server, None);
         Self {
             server_label: server.label.clone(),
             room_id,
             room_name,
-            files_choice,
+            download_choice,
             download_path,
-            receive_limit: byte_limit_text(overrides.files.max_receive_bytes),
+            receive_limit: byte_limit_text(overrides.files.max_download_bytes),
             history_choice: OverrideToggle::from_option(overrides.history.enabled),
             history_location: overrides.history.location.clone().unwrap_or_default(),
-            inherited_downloads_on: inherited_files.receive_dir.is_some(),
-            inherited_receive_limit: byte_limit_text(Some(inherited_files.max_receive_bytes)),
+            inherited_download_mode: inherited_files.target.mode(),
+            inherited_receive_limit: byte_limit_text(Some(inherited_files.max_download_bytes)),
             inherited_history_on: config.effective_history(server, None).enabled,
             form: form::state_with_focus(
                 config.ui.default_bindings,
@@ -118,7 +116,7 @@ impl RoomSettingsDraft {
 
     /// The number of form rows the dialog body currently lays out.
     pub(crate) fn form_height(&self) -> u16 {
-        9 + u16::from(self.files_choice == OverrideToggle::On)
+        9 + u16::from(self.download_choice.shows_path())
     }
 
     pub(crate) fn to_overrides(&self) -> Result<RoomOverrides, String> {
@@ -131,22 +129,23 @@ impl RoomSettingsDraft {
                 None,
             );
         }
-        let receive_dir = match draft.files_choice {
-            OverrideToggle::Inherit => None,
-            OverrideToggle::On => {
-                let path = draft.download_path.trim();
-                if path.is_empty() {
-                    return Err("download path cannot be empty while downloads are on".to_string());
-                }
-                Some(path.to_string())
+        let download_dir = if draft.download_choice == DownloadChoice::Persistent {
+            let path = draft.download_path.trim();
+            if path.is_empty() {
+                return Err(
+                    "download path cannot be empty while downloads are saved to disk".to_string(),
+                );
             }
-            OverrideToggle::Off => Some(String::new()),
+            Some(path.to_string())
+        } else {
+            None
         };
         Ok(RoomOverrides {
             room_id: self.room_id,
             files: FileOverrides {
-                receive_dir,
-                max_receive_bytes: parse_byte_limit(&draft.receive_limit)?,
+                download: draft.download_choice.to_override(),
+                download_dir,
+                max_download_bytes: parse_byte_limit(&draft.receive_limit)?,
             },
             history: HistoryOverrides {
                 enabled: draft.history_choice.to_option(),
@@ -229,12 +228,12 @@ impl RoomSettingsDraft {
             .with_surface(FormSurface::Dialog);
             let mut form = DetailForm::new(core);
             let values = RoomSettingsValues {
-                files_choice: &mut self.files_choice,
+                download_choice: &mut self.download_choice,
                 download_path: &mut self.download_path,
                 receive_limit: &mut self.receive_limit,
                 history_choice: &mut self.history_choice,
                 history_location: &mut self.history_location,
-                inherited_downloads_on: self.inherited_downloads_on,
+                inherited_download_mode: self.inherited_download_mode,
                 inherited_receive_limit: &self.inherited_receive_limit,
                 inherited_history_on: self.inherited_history_on,
             };
@@ -275,12 +274,12 @@ impl RoomSettingsDraft {
             .with_surface(FormSurface::Dialog);
             let mut form = DetailForm::new(core);
             let values = RoomSettingsValues {
-                files_choice: &mut self.files_choice,
+                download_choice: &mut self.download_choice,
                 download_path: &mut self.download_path,
                 receive_limit: &mut self.receive_limit,
                 history_choice: &mut self.history_choice,
                 history_location: &mut self.history_location,
-                inherited_downloads_on: self.inherited_downloads_on,
+                inherited_download_mode: self.inherited_download_mode,
                 inherited_receive_limit: &self.inherited_receive_limit,
                 inherited_history_on: self.inherited_history_on,
             };
@@ -295,12 +294,12 @@ impl RoomSettingsDraft {
             server_label: self.server_label.clone(),
             room_id: self.room_id,
             room_name: self.room_name.clone(),
-            files_choice: self.files_choice,
+            download_choice: self.download_choice,
             download_path: self.download_path.clone(),
             receive_limit: self.receive_limit.clone(),
             history_choice: self.history_choice,
             history_location: self.history_location.clone(),
-            inherited_downloads_on: self.inherited_downloads_on,
+            inherited_download_mode: self.inherited_download_mode,
             inherited_receive_limit: self.inherited_receive_limit.clone(),
             inherited_history_on: self.inherited_history_on,
             form: form::state_with_focus(
@@ -313,12 +312,12 @@ impl RoomSettingsDraft {
 }
 
 struct RoomSettingsValues<'a> {
-    files_choice: &'a mut OverrideToggle,
+    download_choice: &'a mut DownloadChoice,
     download_path: &'a mut String,
     receive_limit: &'a mut String,
     history_choice: &'a mut OverrideToggle,
     history_location: &'a mut String,
-    inherited_downloads_on: bool,
+    inherited_download_mode: DownloadMode,
     inherited_receive_limit: &'a str,
     inherited_history_on: bool,
 }
@@ -328,27 +327,26 @@ fn room_settings_ui(
     values: RoomSettingsValues<'_>,
 ) -> Option<RoomSettingsButton> {
     form.section(DOWNLOADS_SECTION);
-    let inherited_downloads_on = values.inherited_downloads_on;
+    let inherited_download_mode = values.inherited_download_mode;
     if form
         .choice_value(
             "Downloads",
-            values.files_choice,
-            &OverrideToggle::ALL,
-            |choice| choice.label(inherited_downloads_on),
+            values.download_choice,
+            &DownloadChoice::ALL,
+            |choice| choice.label(inherited_download_mode),
         )
         .is_focus()
     {
-        form.set_help("Controls whether files in this room are accepted, inherited from server settings, or disabled here.");
+        form.set_help("How files in this room are handled: inherited from server settings, off, kept in memory, or saved to disk.");
     }
-    if *values.files_choice == OverrideToggle::On {
-        if form
+    if values.download_choice.shows_path()
+        && form
             .text("Path", values.download_path, |value| {
                 download_path_error(true, value)
             })
             .is_focus()
-        {
-            form.set_help("Directory where files received in this room are saved.");
-        }
+    {
+        form.set_help("Directory where files received in this room are saved.");
     }
     if form
         .text_with_placeholder(
@@ -400,8 +398,9 @@ mod tests {
         server.rooms = vec![RoomOverrides {
             room_id: RoomId(3),
             files: FileOverrides {
-                receive_dir: Some("/room/dl".to_string()),
-                max_receive_bytes: Some(300 * 1024 * 1024),
+                download: Some(DownloadMode::Persistent),
+                download_dir: Some("/room/dl".to_string()),
+                max_download_bytes: Some(300 * 1024 * 1024),
             },
             history: HistoryOverrides {
                 enabled: Some(true),
@@ -431,7 +430,7 @@ mod tests {
     fn empty_limit_uses_server_effective_limit_placeholder() {
         let config = Config::default();
         let mut server = ServerEntry::default();
-        server.files.max_receive_bytes = Some(75 * 1024 * 1024);
+        server.files.max_download_bytes = Some(75 * 1024 * 1024);
 
         let draft =
             RoomSettingsDraft::from_config(&config, &server, RoomId(9), "other".to_string());

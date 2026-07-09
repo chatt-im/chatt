@@ -59,7 +59,7 @@ use crate::audio::{
     LiveEncoderProfile, LivePlaybackFeedback, LivePlaybackSink, LocalVoiceFrame, RemoteVoicePacket,
     VoicePayload as AudioVoicePayload,
 };
-use crate::config::{CandidatePrivacy, EffectiveFiles};
+use crate::config::{CandidatePrivacy, DownloadTarget, EffectiveFiles};
 use crate::file_compression::{
     self, COMPRESSION_PROBE_BYTES, FastCompressionDecision, ZSTD_WINDOW_LOG,
 };
@@ -306,6 +306,11 @@ pub struct ClientConfig {
     pub server_public_key: Option<String>,
     pub require_native_encryption: bool,
     pub file_policy: FilePolicy,
+    /// The in-memory download ring buffer shared with the web server, filled
+    /// when a room's download target resolves to [`DownloadTarget::Memory`].
+    ///
+    /// [`DownloadTarget::Memory`]: crate::config::DownloadTarget::Memory
+    pub download_store: crate::receive_store::DownloadStore,
     pub max_upload_bytes: u64,
     /// Upload pacing ceiling in bytes per second, `0` for unlimited. Seeds
     /// [`UploadThrottle`] and is adjustable at runtime via
@@ -342,24 +347,23 @@ impl FilePolicy {
     /// Whether any room accepts downloads: the `receive_files` flag advertised
     /// to the server at join time.
     pub fn receives_any(&self) -> bool {
-        if self.default.receive_dir.is_some() {
+        if self.default.target.is_active() {
             return true;
         }
-        self.rooms
-            .iter()
-            .any(|(_, files)| files.receive_dir.is_some())
+        self.rooms.iter().any(|(_, files)| files.target.is_active())
     }
 
     /// The receive limit advertised to the server: the largest limit among the
     /// receiving levels. Tighter per-room limits are enforced locally.
     pub fn advertised_limit(&self) -> u64 {
-        let mut limit = match self.default.receive_dir {
-            Some(_) => self.default.max_receive_bytes,
-            None => 0,
+        let mut limit = if self.default.target.is_active() {
+            self.default.max_download_bytes
+        } else {
+            0
         };
         for (_, files) in &self.rooms {
-            if files.receive_dir.is_some() {
-                limit = limit.max(files.max_receive_bytes);
+            if files.target.is_active() {
+                limit = limit.max(files.max_download_bytes);
             }
         }
         limit
@@ -529,7 +533,10 @@ pub enum NetworkEvent {
     Chat(ChatMessage),
     FileReceived {
         metadata: FileMetadata,
-        path: PathBuf,
+        /// The name the file is served under (`/files/<served_name>` in the web
+        /// view), mode-agnostic: an on-disk file name for persistent downloads
+        /// or the ring-buffer key for in-memory ones.
+        served_name: String,
         /// Intrinsic pixel size, parsed from the file's header as it streamed.
         /// `Some` only for images whose header fit the captured prefix.
         dimensions: Option<(u32, u32)>,
@@ -2075,7 +2082,7 @@ struct OutgoingBugReport {
 
 struct IncomingFile {
     metadata: FileMetadata,
-    path: PathBuf,
+    dest: ReceiveDest,
     body: IncomingBody,
     pending_wire: Vec<u8>,
     pending_wire_offset: usize,
@@ -2085,8 +2092,53 @@ struct IncomingFile {
     next_status_at: u64,
 }
 
+/// Where an in-flight download is being written. Distinguishes the on-disk path
+/// (which needs unlinking on failure/cancel) from an in-memory transfer (which
+/// leaves nothing behind).
+#[derive(Debug)]
+enum ReceiveDest {
+    Disk(PathBuf),
+    Memory,
+}
+
+/// The final resting place of a completed download, produced by
+/// [`IncomingFile::finalize`].
+#[derive(Debug)]
+enum FinalizedLocation {
+    Disk(PathBuf),
+    Memory(Vec<u8>),
+}
+
+/// The byte sink a [`ReceiveSink`] writes decoded output into: either the
+/// on-disk file or an in-memory buffer for [`DownloadMode::Memory`].
+///
+/// [`DownloadMode::Memory`]: crate::config::DownloadMode::Memory
+enum SinkTarget {
+    Disk(File),
+    Memory(Vec<u8>),
+}
+
+impl Write for SinkTarget {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        match self {
+            SinkTarget::Disk(file) => file.write(buf),
+            SinkTarget::Memory(bytes) => {
+                bytes.extend_from_slice(buf);
+                Ok(buf.len())
+            }
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        match self {
+            SinkTarget::Disk(file) => file.flush(),
+            SinkTarget::Memory(_) => Ok(()),
+        }
+    }
+}
+
 struct ReceiveSink {
-    file: File,
+    target: SinkTarget,
     expected: u64,
     decoded: u64,
     work_budget: usize,
@@ -2095,9 +2147,9 @@ struct ReceiveSink {
 }
 
 impl ReceiveSink {
-    fn new(file: File, expected: u64, capture_image_prefix: bool) -> Self {
+    fn new(target: SinkTarget, expected: u64, capture_image_prefix: bool) -> Self {
         Self {
-            file,
+            target,
             expected,
             decoded: 0,
             work_budget: 0,
@@ -2126,7 +2178,7 @@ impl Write for ReceiveSink {
             ));
         }
         let write_len = buf.len().min(self.work_budget);
-        let written = self.file.write(&buf[..write_len])?;
+        let written = self.target.write(&buf[..write_len])?;
         if self.capture_image_prefix && self.image_prefix.len() < MAX_FILE_CHUNK_BYTES {
             let capture = written.min(MAX_FILE_CHUNK_BYTES - self.image_prefix.len());
             self.image_prefix.extend_from_slice(&buf[..capture]);
@@ -2137,7 +2189,7 @@ impl Write for ReceiveSink {
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        self.file.flush()
+        self.target.flush()
     }
 }
 
@@ -2243,11 +2295,13 @@ impl IncomingFile {
 
     fn finalize(
         self,
-    ) -> Result<(FileMetadata, PathBuf, Option<(u32, u32)>, u64), (PathBuf, String, io::Error)>
-    {
+    ) -> Result<
+        (FileMetadata, FinalizedLocation, Option<(u32, u32)>, u64),
+        (ReceiveDest, String, io::Error),
+    > {
         let Self {
             metadata,
-            path,
+            dest,
             body,
             wire_received,
             ..
@@ -2257,13 +2311,20 @@ impl IncomingFile {
             IncomingBody::Zstd(decoder) => decoder.into_inner().0,
         };
         if let Err(error) = sink.flush() {
-            return Err((path, metadata.file_name, error));
+            return Err((dest, metadata.file_name, error));
         }
         let dimensions = sink
             .capture_image_prefix
             .then(|| crate::web_server::image_dimensions(&sink.image_prefix))
             .flatten();
-        Ok((metadata, path, dimensions, wire_received))
+        let location = match (dest, sink.target) {
+            (ReceiveDest::Disk(path), _) => FinalizedLocation::Disk(path),
+            (ReceiveDest::Memory, SinkTarget::Memory(bytes)) => FinalizedLocation::Memory(bytes),
+            // The dest and sink target are constructed together, so a memory
+            // dest always pairs with a memory sink.
+            (ReceiveDest::Memory, SinkTarget::Disk(_)) => FinalizedLocation::Memory(Vec::new()),
+        };
+        Ok((metadata, location, dimensions, wire_received))
     }
 }
 
@@ -3321,11 +3382,15 @@ impl WorkerState {
                 encoding: upload.body.encoding(),
             })?;
             upload.started = true;
-            if let Some(receive_dir) = self
+            // Keep a local copy of the sender's own upload only when the room
+            // persists downloads to disk. Off and memory modes keep none: the
+            // sender already holds the original, and the memory ring is reserved
+            // for genuinely received files.
+            if let DownloadTarget::Persistent(receive_dir) = self
                 .config
                 .file_policy
                 .for_room(upload.room_id)
-                .receive_dir
+                .target
                 .clone()
             {
                 match create_receive_file(&receive_dir, &upload.name) {
@@ -3537,7 +3602,7 @@ impl WorkerState {
         self.queue_control(ClientControl::SkipFile { transfer_id })?;
         if let Some(incoming) = self.incoming_files.remove(&transfer_id) {
             let room_id = incoming.metadata.room_id;
-            let _ = fs::remove_file(&incoming.path);
+            cleanup_partial(&incoming.dest);
             let _ = self.events.send(NetworkEvent::TransferEnded {
                 room_id,
                 transfer_id,
@@ -3677,9 +3742,10 @@ impl WorkerState {
         path: PathBuf,
         dimensions: Option<(u32, u32)>,
     ) {
+        let served_name = served_file_name(&path, &metadata.file_name);
         let _ = self.events.send(NetworkEvent::FileReceived {
             metadata,
-            path,
+            served_name,
             dimensions,
         });
     }
@@ -3694,21 +3760,21 @@ impl WorkerState {
         );
         // Take owned copies of the per-room policy so the borrow of `self.config`
         // ends before the `&mut self` skip/label calls below.
-        let (receive_dir, max_receive_bytes) = {
+        let (target, max_download_bytes) = {
             let policy = self.config.file_policy.for_room(file.room_id);
-            (policy.receive_dir.clone(), policy.max_receive_bytes)
+            (policy.target.clone(), policy.max_download_bytes)
         };
         let size_label = || {
             format!(
                 "File exceeds maximum configured size ({})",
-                format_bytes(max_receive_bytes)
+                format_bytes(max_download_bytes)
             )
         };
         if !contents {
             // The server already declined to stream (the file exceeds our
             // advertised limit or receiving is off), so no `SkipFile` is needed;
             // just label the line with why.
-            let reason = if receive_dir.is_some() {
+            let reason = if target.is_active() {
                 size_label()
             } else {
                 "Automatic file receive disabled".to_string()
@@ -3722,7 +3788,7 @@ impl WorkerState {
             self.end_transfer_skipped(&file, reason);
             return;
         }
-        if file.size > max_receive_bytes {
+        if file.size > max_download_bytes {
             // The server would stream this, but our per-room limit rejects it, so
             // tell it to stop relaying to us rather than letting it waste the
             // whole transfer.
@@ -3731,87 +3797,124 @@ impl WorkerState {
                 "not receiving {}; size {} exceeds local limit {}",
                 file.file_name,
                 format_bytes(file.size),
-                format_bytes(max_receive_bytes)
+                format_bytes(max_download_bytes)
             )));
             self.end_transfer_skipped(&file, size_label());
             return;
         }
-        let Some(receive_dir) = receive_dir else {
-            self.skip_offered_download(&file);
-            let _ = self.events.send(NetworkEvent::Status(format!(
-                "{} sent {} ({}, metadata only)",
-                file.sender_name,
-                file.file_name,
-                format_bytes(file.size)
-            )));
-            self.end_transfer_skipped(&file, "Automatic file receive disabled".to_string());
-            return;
-        };
-        match create_receive_file(&receive_dir, &file.file_name) {
-            Ok((path, handle)) => {
-                let sink = ReceiveSink::new(handle, file.size, is_image_name(&file.file_name));
-                let body = match file.encoding {
-                    FileContentEncoding::Identity => IncomingBody::Identity(sink),
-                    FileContentEncoding::Zstd => {
-                        let mut decoder = match zstd::stream::raw::Decoder::new() {
-                            Ok(decoder) => decoder,
-                            Err(error) => {
-                                let _ = fs::remove_file(&path);
-                                let _ = self.events.send(NetworkEvent::Error(format!(
-                                    "failed to initialize decompression for {}: {error}",
-                                    file.file_name
-                                )));
-                                return;
-                            }
-                        };
-                        if let Err(error) = decoder.set_parameter(
-                            zstd::stream::raw::DParameter::WindowLogMax(ZSTD_WINDOW_LOG),
-                        ) {
-                            let _ = fs::remove_file(&path);
-                            let _ = self.events.send(NetworkEvent::Error(format!(
-                                "failed to limit decompression for {}: {error}",
-                                file.file_name
-                            )));
-                            return;
-                        }
-                        IncomingBody::Zstd(zstd::stream::zio::Writer::new(sink, decoder))
-                    }
-                };
+        match target {
+            DownloadTarget::Off => {
+                self.skip_offered_download(&file);
                 let _ = self.events.send(NetworkEvent::Status(format!(
-                    "receiving {} from {}",
-                    file.file_name, file.sender_name
+                    "{} sent {} ({}, metadata only)",
+                    file.sender_name,
+                    file.file_name,
+                    format_bytes(file.size)
                 )));
-                let transfer_id = file.transfer_id;
-                let room_id = file.room_id;
-                let timestamp_ms = file.timestamp_ms;
-                let total = file.size;
-                self.incoming_files.insert(
-                    transfer_id,
-                    IncomingFile {
-                        metadata: file,
-                        path,
-                        body,
-                        pending_wire: Vec::new(),
-                        pending_wire_offset: 0,
-                        wire_received: 0,
-                        complete_received: false,
-                        decoder_finished: false,
-                        next_status_at: FILE_PROGRESS_STEP_BYTES,
-                    },
-                );
-                let _ = self.events.send(NetworkEvent::TransferProgress {
-                    room_id,
-                    transfer_id,
-                    timestamp_ms,
-                    transferred: 0,
-                    total,
-                    direction: TransferDirection::Incoming,
-                });
+                self.end_transfer_skipped(&file, "Automatic file receive disabled".to_string());
             }
-            Err(error) => {
-                let _ = self.events.send(NetworkEvent::Error(error));
+            DownloadTarget::Memory => {
+                // A file that cannot fit the whole ring is rejected up front
+                // rather than buffered and dropped when it fails to be stored.
+                let cap = self.config.download_store.capacity();
+                if file.size > cap {
+                    self.skip_offered_download(&file);
+                    let reason = format!(
+                        "File exceeds the in-memory download buffer ({})",
+                        format_bytes(cap)
+                    );
+                    let _ = self.events.send(NetworkEvent::Error(format!(
+                        "not receiving {}; size {} exceeds the in-memory download buffer {}",
+                        file.file_name,
+                        format_bytes(file.size),
+                        format_bytes(cap)
+                    )));
+                    self.end_transfer_skipped(&file, reason);
+                    return;
+                }
+                let target = SinkTarget::Memory(Vec::with_capacity(file.size.min(cap) as usize));
+                self.begin_incoming(file, target, ReceiveDest::Memory);
+            }
+            DownloadTarget::Persistent(receive_dir) => {
+                match create_receive_file(&receive_dir, &file.file_name) {
+                    Ok((path, handle)) => {
+                        self.begin_incoming(
+                            file,
+                            SinkTarget::Disk(handle),
+                            ReceiveDest::Disk(path),
+                        );
+                    }
+                    Err(error) => {
+                        let _ = self.events.send(NetworkEvent::Error(error));
+                    }
+                }
             }
         }
+    }
+
+    /// Wraps `target` in an [`IncomingBody`] (applying the zstd decoder for
+    /// compressed transfers), registers the [`IncomingFile`], and emits the
+    /// initial progress tick. On decoder-init failure the partial destination is
+    /// cleaned up and the transfer is abandoned.
+    fn begin_incoming(&mut self, file: FileMetadata, target: SinkTarget, dest: ReceiveDest) {
+        let sink = ReceiveSink::new(target, file.size, is_image_name(&file.file_name));
+        let body = match file.encoding {
+            FileContentEncoding::Identity => IncomingBody::Identity(sink),
+            FileContentEncoding::Zstd => {
+                let mut decoder = match zstd::stream::raw::Decoder::new() {
+                    Ok(decoder) => decoder,
+                    Err(error) => {
+                        cleanup_partial(&dest);
+                        let _ = self.events.send(NetworkEvent::Error(format!(
+                            "failed to initialize decompression for {}: {error}",
+                            file.file_name
+                        )));
+                        return;
+                    }
+                };
+                if let Err(error) = decoder
+                    .set_parameter(zstd::stream::raw::DParameter::WindowLogMax(ZSTD_WINDOW_LOG))
+                {
+                    cleanup_partial(&dest);
+                    let _ = self.events.send(NetworkEvent::Error(format!(
+                        "failed to limit decompression for {}: {error}",
+                        file.file_name
+                    )));
+                    return;
+                }
+                IncomingBody::Zstd(zstd::stream::zio::Writer::new(sink, decoder))
+            }
+        };
+        let _ = self.events.send(NetworkEvent::Status(format!(
+            "receiving {} from {}",
+            file.file_name, file.sender_name
+        )));
+        let transfer_id = file.transfer_id;
+        let room_id = file.room_id;
+        let timestamp_ms = file.timestamp_ms;
+        let total = file.size;
+        self.incoming_files.insert(
+            transfer_id,
+            IncomingFile {
+                metadata: file,
+                dest,
+                body,
+                pending_wire: Vec::new(),
+                pending_wire_offset: 0,
+                wire_received: 0,
+                complete_received: false,
+                decoder_finished: false,
+                next_status_at: FILE_PROGRESS_STEP_BYTES,
+            },
+        );
+        let _ = self.events.send(NetworkEvent::TransferProgress {
+            room_id,
+            transfer_id,
+            timestamp_ms,
+            transferred: 0,
+            total,
+            direction: TransferDirection::Incoming,
+        });
     }
 
     fn handle_file_chunk(&mut self, transfer_id: FileTransferId, offset: u64, data: Vec<u8>) {
@@ -3850,7 +3953,7 @@ impl WorkerState {
     fn handle_file_canceled(&mut self, transfer_id: FileTransferId, reason: &str) {
         if let Some(incoming) = self.incoming_files.remove(&transfer_id) {
             let room_id = incoming.metadata.room_id;
-            let _ = fs::remove_file(&incoming.path);
+            cleanup_partial(&incoming.dest);
             let _ = self.events.send(NetworkEvent::Status(format!(
                 "file transfer canceled for {}: {reason}",
                 incoming.metadata.file_name
@@ -3920,7 +4023,7 @@ impl WorkerState {
             let room_id = incoming.metadata.room_id;
             let timestamp_ms = incoming.metadata.timestamp_ms;
             match incoming.finalize() {
-                Ok((metadata, path, dimensions, _wire_bytes)) => {
+                Ok((metadata, location, dimensions, _wire_bytes)) => {
                     #[cfg(test)]
                     LAST_RECEIVED_FILE_WIRE_BYTES
                         .store(_wire_bytes, std::sync::atomic::Ordering::Relaxed);
@@ -3930,19 +4033,58 @@ impl WorkerState {
                         original_bytes = metadata.size,
                         wire_bytes = _wire_bytes
                     );
-                    let _ = self.events.send(NetworkEvent::Status(format!(
-                        "saved {} to {}",
-                        metadata.file_name,
-                        path.display()
-                    )));
+                    let served_name = match location {
+                        FinalizedLocation::Disk(path) => {
+                            let _ = self.events.send(NetworkEvent::Status(format!(
+                                "saved {} to {}",
+                                metadata.file_name,
+                                path.display()
+                            )));
+                            served_file_name(&path, &metadata.file_name)
+                        }
+                        FinalizedLocation::Memory(bytes) => {
+                            let size = bytes.len();
+                            match self
+                                .config
+                                .download_store
+                                .insert(&metadata.file_name, bytes)
+                            {
+                                Some(name) => {
+                                    let _ = self.events.send(NetworkEvent::Status(format!(
+                                        "received {} ({}, held in memory)",
+                                        metadata.file_name,
+                                        format_bytes(size as u64)
+                                    )));
+                                    name
+                                }
+                                None => {
+                                    // The ring capacity shrank below this file
+                                    // after it was accepted; drop it.
+                                    let message = format!(
+                                        "in-memory download buffer too small to hold {}",
+                                        metadata.file_name
+                                    );
+                                    let _ = self.events.send(NetworkEvent::Error(message.clone()));
+                                    let _ = self.events.send(NetworkEvent::TransferEnded {
+                                        room_id,
+                                        transfer_id,
+                                        timestamp_ms,
+                                        verb: TerminalVerb::Failed,
+                                        reason: Some(message),
+                                    });
+                                    continue;
+                                }
+                            }
+                        }
+                    };
                     let _ = self.events.send(NetworkEvent::FileReceived {
                         metadata,
-                        path,
+                        served_name,
                         dimensions,
                     });
                 }
-                Err((path, name, error)) => {
-                    let _ = fs::remove_file(path);
+                Err((dest, name, error)) => {
+                    cleanup_partial(&dest);
                     let message = format!("failed to finish receiving {name}: {error}");
                     let _ = self.events.send(NetworkEvent::Error(message.clone()));
                     let _ = self.events.send(NetworkEvent::TransferEnded {
@@ -3963,7 +4105,7 @@ impl WorkerState {
         };
         let room_id = incoming.metadata.room_id;
         let timestamp_ms = incoming.metadata.timestamp_ms;
-        let _ = fs::remove_file(&incoming.path);
+        cleanup_partial(&incoming.dest);
         let message = format!("{reason} for {}", incoming.metadata.file_name);
         let _ = self.events.send(NetworkEvent::Error(message.clone()));
         let _ = self.events.send(NetworkEvent::TransferEnded {
@@ -5763,25 +5905,37 @@ fn is_image_name(name: &str) -> bool {
 fn create_receive_file(dir: &Path, requested_name: &str) -> Result<(PathBuf, File), String> {
     fs::create_dir_all(dir)
         .map_err(|error| format!("failed to create {}: {error}", dir.display()))?;
-    let name = sanitize_file_name(requested_name);
-    let (stem, extension) = split_extension(&name);
-    for index in 0u64..10_000 {
-        let candidate = if index == 0 {
-            name.clone()
-        } else {
-            format!("{stem}-{index}{extension}")
-        };
+    crate::receive_store::allocate_name(requested_name, |candidate| {
         let path = dir.join(candidate);
         match OpenOptions::new().write(true).create_new(true).open(&path) {
-            Ok(file) => return Ok((path, file)),
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
-            Err(error) => return Err(format!("failed to create {}: {error}", path.display())),
+            Ok(file) => Some(Ok((path, file))),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => None,
+            Err(error) => Some(Err(format!("failed to create {}: {error}", path.display()))),
         }
+    })
+    .unwrap_or_else(|| {
+        Err(format!(
+            "could not allocate a unique receive path for {}",
+            sanitize_file_name(requested_name)
+        ))
+    })
+}
+
+/// Removes the on-disk partial of an aborted download. In-memory transfers hold
+/// nothing on disk, so there is nothing to clean up.
+fn cleanup_partial(dest: &ReceiveDest) {
+    if let ReceiveDest::Disk(path) = dest {
+        let _ = fs::remove_file(path);
     }
-    Err(format!(
-        "could not allocate a unique receive path for {}",
-        name
-    ))
+}
+
+/// The name a received file is served under: its on-disk file name (which may
+/// carry a `-N` collision suffix), falling back to the sender's declared name.
+fn served_file_name(path: &Path, fallback: &str) -> String {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(fallback)
+        .to_string()
 }
 
 /// Resolves the sanitized upload name from an optional override, falling back
@@ -5829,13 +5983,6 @@ pub(crate) fn sanitize_file_name(name: &str) -> String {
         "file".to_string()
     } else {
         out.to_string()
-    }
-}
-
-fn split_extension(name: &str) -> (&str, &str) {
-    match name.rfind('.') {
-        Some(index) if index > 0 && index + 1 < name.len() => (&name[..index], &name[index..]),
-        _ => (name, ""),
     }
 }
 
@@ -6173,8 +6320,15 @@ mod tests {
 
     fn receiving(dir: &str, limit: u64) -> EffectiveFiles {
         EffectiveFiles {
-            receive_dir: Some(PathBuf::from(dir)),
-            max_receive_bytes: limit,
+            target: DownloadTarget::Persistent(PathBuf::from(dir)),
+            max_download_bytes: limit,
+        }
+    }
+
+    fn not_receiving(limit: u64) -> EffectiveFiles {
+        EffectiveFiles {
+            target: DownloadTarget::Off,
+            max_download_bytes: limit,
         }
     }
 
@@ -6195,13 +6349,7 @@ mod tests {
             default: receiving("/dl", 100),
             rooms: vec![
                 (RoomId(3), receiving("/room", 300)),
-                (
-                    RoomId(4),
-                    EffectiveFiles {
-                        receive_dir: None,
-                        max_receive_bytes: 900,
-                    },
-                ),
+                (RoomId(4), not_receiving(900)),
             ],
         };
         assert!(policy.receives_any());
@@ -6209,10 +6357,7 @@ mod tests {
         assert_eq!(policy.advertised_limit(), 300);
 
         let disabled = FilePolicy {
-            default: EffectiveFiles {
-                receive_dir: None,
-                max_receive_bytes: 100,
-            },
+            default: not_receiving(100),
             rooms: Vec::new(),
         };
         assert!(!disabled.receives_any());
@@ -6222,10 +6367,7 @@ mod tests {
     #[test]
     fn file_policy_receives_any_when_only_a_room_accepts() {
         let policy = FilePolicy {
-            default: EffectiveFiles {
-                receive_dir: None,
-                max_receive_bytes: 100,
-            },
+            default: not_receiving(100),
             rooms: vec![(RoomId(3), receiving("/room", 300))],
         };
         assert!(policy.receives_any());
@@ -6961,7 +7103,11 @@ mod tests {
         encoding: FileContentEncoding,
         image: bool,
     ) -> IncomingFile {
-        let sink = ReceiveSink::new(File::create(path).unwrap(), original_size, image);
+        let sink = ReceiveSink::new(
+            SinkTarget::Disk(File::create(path).unwrap()),
+            original_size,
+            image,
+        );
         let body = match encoding {
             FileContentEncoding::Identity => IncomingBody::Identity(sink),
             FileContentEncoding::Zstd => {
@@ -6988,7 +7134,7 @@ mod tests {
                 encoding,
                 timestamp_ms: 1,
             },
-            path: path.to_path_buf(),
+            dest: ReceiveDest::Disk(path.to_path_buf()),
             body,
             pending_wire: Vec::new(),
             pending_wire_offset: 0,
@@ -7050,7 +7196,10 @@ mod tests {
                 let mut incoming =
                     incoming_test_file(&path, data.len() as u64, FileContentEncoding::Zstd, false);
                 pump_test_input(&mut incoming, &encoded, 313, 64 * 1024).unwrap();
-                let (_, path, _, _) = incoming.finalize().unwrap();
+                let (_, location, _, _) = incoming.finalize().unwrap();
+                let FinalizedLocation::Disk(path) = location else {
+                    panic!("disk transfer should finalize to a disk path");
+                };
                 assert_eq!(fs::read(path).unwrap(), data);
             }
         }

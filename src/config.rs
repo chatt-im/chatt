@@ -83,7 +83,11 @@ impl Default for ServerEntry {
 }
 
 impl ServerEntry {
-    pub fn client_config(&self, config: &Config) -> ClientConfig {
+    pub fn client_config(
+        &self,
+        config: &Config,
+        download_store: crate::receive_store::DownloadStore,
+    ) -> ClientConfig {
         ClientConfig {
             tcp_addr: self.tcp_addr.clone(),
             udp_addr: self.effective_udp_addr(),
@@ -93,6 +97,7 @@ impl ServerEntry {
             server_public_key: non_empty_string(&self.server_public_key),
             require_native_encryption: self.require_native_encryption,
             file_policy: config.file_policy(self),
+            download_store,
             max_upload_bytes: config.files.max_upload_bytes,
             upload_rate_bytes: config.files.upload_rate_bytes,
             p2p_enabled: config.p2p.enabled,
@@ -388,46 +393,112 @@ pub use DefaultBindings as FormBindings;
 /// full socket speed.
 pub const DEFAULT_UPLOAD_RATE_BYTES: u64 = 0;
 
+/// Default capacity of the in-memory download ring buffer: 256 MiB.
+pub const DEFAULT_DOWNLOAD_MEMORY_BYTES: u64 = 256 * 1024 * 1024;
+
+/// How received files are handled. The single downloads switch, unified across
+/// the settings UI and the `download` config key.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Toml)]
+#[toml(FromToml, ToToml, rename_all = "kebab-case")]
+pub enum DownloadMode {
+    /// Reject incoming files.
+    #[default]
+    Off,
+    /// Hold received files in an in-memory ring buffer, never touching disk.
+    Memory,
+    /// Write received files to a directory on disk.
+    Persistent,
+}
+
+impl DownloadMode {
+    pub const ALL: [DownloadMode; 3] = [
+        DownloadMode::Off,
+        DownloadMode::Memory,
+        DownloadMode::Persistent,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            DownloadMode::Off => "off",
+            DownloadMode::Memory => "memory",
+            DownloadMode::Persistent => "persistent",
+        }
+    }
+}
+
 #[derive(Clone, Debug, Toml)]
 #[toml(FromToml, ToToml, rename_all = "kebab-case")]
 pub struct FileConfig {
+    /// How received files are handled: dropped, kept in an in-memory ring
+    /// buffer, or written to disk.
+    #[toml(default)]
+    pub download: DownloadMode,
+    /// Directory received files are written to in [`DownloadMode::Persistent`].
+    /// Empty falls back to the platform default download directory.
+    #[toml(default)]
+    pub download_dir: String,
+    /// Capacity of the in-memory download ring buffer used by
+    /// [`DownloadMode::Memory`]. One shared store, so this is a single global
+    /// ceiling rather than a per-server or per-room setting.
+    #[toml(default = DEFAULT_DOWNLOAD_MEMORY_BYTES)]
+    pub download_memory_bytes: u64,
+    #[toml(default = DEFAULT_FILE_SIZE_LIMIT_BYTES)]
+    pub max_download_bytes: u64,
     #[toml(default = DEFAULT_FILE_SIZE_LIMIT_BYTES)]
     pub max_upload_bytes: u64,
-    #[toml(default = DEFAULT_FILE_SIZE_LIMIT_BYTES)]
-    pub max_receive_bytes: u64,
     /// Upload pacing ceiling in bytes per second. `0` streams at full socket
     /// speed. Primarily a test lever to stretch a transfer so its progress is
     /// observable, and a mild bandwidth cap.
     #[toml(default = DEFAULT_UPLOAD_RATE_BYTES)]
     pub upload_rate_bytes: u64,
-    #[toml(default)]
-    pub receive_dir: String,
 }
 
 impl Default for FileConfig {
     fn default() -> Self {
         Self {
+            download: DownloadMode::Off,
+            download_dir: String::new(),
+            download_memory_bytes: DEFAULT_DOWNLOAD_MEMORY_BYTES,
+            max_download_bytes: DEFAULT_FILE_SIZE_LIMIT_BYTES,
             max_upload_bytes: DEFAULT_FILE_SIZE_LIMIT_BYTES,
-            max_receive_bytes: DEFAULT_FILE_SIZE_LIMIT_BYTES,
             upload_rate_bytes: DEFAULT_UPLOAD_RATE_BYTES,
-            receive_dir: String::new(),
         }
     }
 }
 
-impl FileConfig {
-    pub fn receive_dir_path(&self) -> Option<PathBuf> {
-        let trimmed = self.receive_dir.trim();
-        (!trimmed.is_empty()).then(|| PathBuf::from(trimmed))
+/// The resolved download destination after room > server > global resolution.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum DownloadTarget {
+    /// Downloads are disabled.
+    #[default]
+    Off,
+    /// Received files are held in the shared in-memory ring buffer.
+    Memory,
+    /// Received files are written under this directory.
+    Persistent(PathBuf),
+}
+
+impl DownloadTarget {
+    /// Whether this level accepts downloads at all.
+    pub fn is_active(&self) -> bool {
+        !matches!(self, DownloadTarget::Off)
+    }
+
+    /// The download mode this target corresponds to, for display.
+    pub fn mode(&self) -> DownloadMode {
+        match self {
+            DownloadTarget::Off => DownloadMode::Off,
+            DownloadTarget::Memory => DownloadMode::Memory,
+            DownloadTarget::Persistent(_) => DownloadMode::Persistent,
+        }
     }
 }
 
 /// Download settings after room > server > global resolution.
-/// `receive_dir: None` means downloads are disabled.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct EffectiveFiles {
-    pub receive_dir: Option<PathBuf>,
-    pub max_receive_bytes: u64,
+    pub target: DownloadTarget,
+    pub max_download_bytes: u64,
 }
 
 /// Persistence settings after room > server > global resolution.
@@ -577,12 +648,14 @@ pub struct HistoryConfig {
 }
 
 /// Per-server or per-room download overrides. `None` inherits the next level
-/// up; an explicitly empty `receive-dir` disables downloads at this level.
+/// up. The `download` mode carries off/memory/persistent; the in-memory ring
+/// size stays a global-only setting.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Toml)]
 #[toml(FromToml, ToToml, rename_all = "kebab-case")]
 pub struct FileOverrides {
-    pub receive_dir: Option<String>,
-    pub max_receive_bytes: Option<u64>,
+    pub download: Option<DownloadMode>,
+    pub download_dir: Option<String>,
+    pub max_download_bytes: Option<u64>,
 }
 
 impl FileOverrides {
@@ -1586,18 +1659,44 @@ impl Config {
     /// `room_id` (or a room without overrides) yields the server-level value.
     pub fn effective_files(&self, server: &ServerEntry, room_id: Option<RoomId>) -> EffectiveFiles {
         let room = room_overrides(server, room_id).map(|room| &room.files);
-        let receive_dir = room
-            .and_then(|files| files.receive_dir.clone())
-            .or_else(|| server.files.receive_dir.clone())
-            .unwrap_or_else(|| self.files.receive_dir.clone());
-        let receive_dir = receive_dir.trim();
-        let max_receive_bytes = room
-            .and_then(|files| files.max_receive_bytes)
-            .or(server.files.max_receive_bytes)
-            .unwrap_or(self.files.max_receive_bytes);
+        let mode = room
+            .and_then(|files| files.download)
+            .or(server.files.download)
+            .unwrap_or(self.files.download);
+        let download_dir = room
+            .and_then(|files| files.download_dir.clone())
+            .or_else(|| server.files.download_dir.clone())
+            .unwrap_or_else(|| self.files.download_dir.clone());
+        let download_dir = download_dir.trim();
+        let target = match mode {
+            DownloadMode::Off => DownloadTarget::Off,
+            DownloadMode::Memory => DownloadTarget::Memory,
+            DownloadMode::Persistent => {
+                let dir = if download_dir.is_empty() {
+                    paths::default_download_dir().unwrap_or_else(|| PathBuf::from("files"))
+                } else {
+                    PathBuf::from(download_dir)
+                };
+                DownloadTarget::Persistent(dir)
+            }
+        };
+        let max_download_bytes = room
+            .and_then(|files| files.max_download_bytes)
+            .or(server.files.max_download_bytes)
+            .unwrap_or(self.files.max_download_bytes);
         EffectiveFiles {
-            receive_dir: (!receive_dir.is_empty()).then(|| PathBuf::from(receive_dir)),
-            max_receive_bytes,
+            target,
+            max_download_bytes,
+        }
+    }
+
+    /// The directory the web view serves persistent downloads from: the
+    /// resolved global persistent target, or `None` when the global download
+    /// mode is not persistent.
+    pub fn web_persistent_dir(&self) -> Option<PathBuf> {
+        match self.effective_files(&ServerEntry::default(), None).target {
+            DownloadTarget::Persistent(dir) => Some(dir),
+            DownloadTarget::Off | DownloadTarget::Memory => None,
         }
     }
 
@@ -1862,10 +1961,12 @@ fn room_overrides(server: &ServerEntry, room_id: Option<RoomId>) -> Option<&Room
 }
 
 fn normalize_file_overrides(files: &mut FileOverrides) {
-    // `Some("")` stays: it means downloads are explicitly disabled here.
-    if let Some(dir) = &mut files.receive_dir {
-        *dir = dir.trim().to_string();
-    }
+    // An empty path override is meaningless now that `download = "off"`
+    // expresses disabling; collapse it back to inherit.
+    files.download_dir = files
+        .download_dir
+        .take()
+        .and_then(|dir| non_empty_string(&dir));
 }
 
 fn normalize_history_overrides(history: &mut HistoryOverrides) {
@@ -2162,7 +2263,8 @@ path = "assets/sample-001.opus"
         );
         assert!(!config.p2p.enabled);
         assert!(!config.history.enabled);
-        assert!(config.files.receive_dir.is_empty());
+        assert_eq!(config.files.download, DownloadMode::Off);
+        assert!(config.files.download_dir.is_empty());
     }
 
     #[test]
@@ -2266,7 +2368,8 @@ server-public-key = ""
         assert!(content.contains("default-bindings = \"standard\""));
         assert!(content.contains("[p2p]\nenabled = false"));
         assert!(content.contains("[history]\nenabled = false"));
-        assert!(content.contains("receive-dir = \"\""));
+        assert!(content.contains("download = \"off\""));
+        assert!(content.contains("download-dir = \"\""));
         assert!(!content.contains("form-bindings"));
     }
 
@@ -2275,8 +2378,9 @@ server-public-key = ""
         let mut config = Config::default();
         let mut server = ServerEntry::default();
         server.files = FileOverrides {
-            receive_dir: Some("/srv/dl".to_string()),
-            max_receive_bytes: None,
+            download: Some(DownloadMode::Persistent),
+            download_dir: Some("/srv/dl".to_string()),
+            max_download_bytes: None,
         };
         server.history = HistoryOverrides {
             enabled: Some(true),
@@ -2286,16 +2390,18 @@ server-public-key = ""
             RoomOverrides {
                 room_id: RoomId(3),
                 files: FileOverrides {
-                    receive_dir: None,
-                    max_receive_bytes: Some(104_857_600),
+                    download: None,
+                    download_dir: None,
+                    max_download_bytes: Some(104_857_600),
                 },
                 history: HistoryOverrides::default(),
             },
             RoomOverrides {
                 room_id: RoomId(7),
                 files: FileOverrides {
-                    receive_dir: Some(String::new()),
-                    max_receive_bytes: None,
+                    download: Some(DownloadMode::Off),
+                    download_dir: None,
+                    max_download_bytes: None,
                 },
                 history: HistoryOverrides {
                     enabled: Some(false),
@@ -2310,7 +2416,7 @@ server-public-key = ""
         assert!(content.contains("[servers.history]"), "{content}");
         assert!(content.contains("[[servers.rooms]]"), "{content}");
         assert!(
-            content.contains("max-receive-bytes = 104857600"),
+            content.contains("max-download-bytes = 104857600"),
             "{content}"
         );
 
@@ -2336,14 +2442,16 @@ server-public-key = ""
 
     fn overridden_server() -> (Config, ServerEntry) {
         let mut config = Config::default();
-        config.files.receive_dir = "/global/dl".to_string();
-        config.files.max_receive_bytes = 100;
+        config.files.download = DownloadMode::Persistent;
+        config.files.download_dir = "/global/dl".to_string();
+        config.files.max_download_bytes = 100;
         config.history.enabled = false;
         config.history.location = None;
         let mut server = ServerEntry::default();
         server.files = FileOverrides {
-            receive_dir: Some("/server/dl".to_string()),
-            max_receive_bytes: None,
+            download: Some(DownloadMode::Persistent),
+            download_dir: Some("/server/dl".to_string()),
+            max_download_bytes: None,
         };
         server.history = HistoryOverrides {
             enabled: None,
@@ -2352,8 +2460,9 @@ server-public-key = ""
         server.rooms = vec![RoomOverrides {
             room_id: RoomId(3),
             files: FileOverrides {
-                receive_dir: None,
-                max_receive_bytes: Some(300),
+                download: None,
+                download_dir: None,
+                max_download_bytes: Some(300),
             },
             history: HistoryOverrides {
                 enabled: Some(true),
@@ -2368,29 +2477,74 @@ server-public-key = ""
         let (config, server) = overridden_server();
 
         let global_only = config.effective_files(&ServerEntry::default(), None);
-        assert_eq!(global_only.receive_dir, Some(PathBuf::from("/global/dl")));
-        assert_eq!(global_only.max_receive_bytes, 100);
+        assert_eq!(
+            global_only.target,
+            DownloadTarget::Persistent(PathBuf::from("/global/dl"))
+        );
+        assert_eq!(global_only.max_download_bytes, 100);
 
         let server_level = config.effective_files(&server, None);
-        assert_eq!(server_level.receive_dir, Some(PathBuf::from("/server/dl")));
-        assert_eq!(server_level.max_receive_bytes, 100);
+        assert_eq!(
+            server_level.target,
+            DownloadTarget::Persistent(PathBuf::from("/server/dl"))
+        );
+        assert_eq!(server_level.max_download_bytes, 100);
 
         let room_level = config.effective_files(&server, Some(RoomId(3)));
-        assert_eq!(room_level.receive_dir, Some(PathBuf::from("/server/dl")));
-        assert_eq!(room_level.max_receive_bytes, 300);
+        assert_eq!(
+            room_level.target,
+            DownloadTarget::Persistent(PathBuf::from("/server/dl"))
+        );
+        assert_eq!(room_level.max_download_bytes, 300);
 
         let unknown_room = config.effective_files(&server, Some(RoomId(9)));
         assert_eq!(unknown_room, server_level);
     }
 
     #[test]
-    fn explicit_empty_receive_dir_disables_downloads_at_room_level() {
+    fn room_download_off_disables_downloads_at_room_level() {
         let (config, mut server) = overridden_server();
-        server.rooms[0].files.receive_dir = Some(String::new());
+        server.rooms[0].files.download = Some(DownloadMode::Off);
 
         let room_level = config.effective_files(&server, Some(RoomId(3)));
-        assert_eq!(room_level.receive_dir, None);
-        assert!(config.effective_files(&server, None).receive_dir.is_some());
+        assert_eq!(room_level.target, DownloadTarget::Off);
+        assert!(config.effective_files(&server, None).target.is_active());
+    }
+
+    #[test]
+    fn room_download_memory_resolves_to_memory_target() {
+        let (config, mut server) = overridden_server();
+        server.rooms[0].files.download = Some(DownloadMode::Memory);
+
+        let room_level = config.effective_files(&server, Some(RoomId(3)));
+        assert_eq!(room_level.target, DownloadTarget::Memory);
+    }
+
+    #[test]
+    fn persistent_empty_dir_falls_back_to_default_download_dir() {
+        let mut config = Config::default();
+        config.files.download = DownloadMode::Persistent;
+        config.files.download_dir = String::new();
+
+        let expected = paths::default_download_dir().unwrap_or_else(|| PathBuf::from("files"));
+        assert_eq!(
+            config.effective_files(&ServerEntry::default(), None).target,
+            DownloadTarget::Persistent(expected)
+        );
+    }
+
+    #[test]
+    fn download_mode_round_trips_toml() {
+        for (value, expected) in [
+            ("\"off\"", DownloadMode::Off),
+            ("\"memory\"", DownloadMode::Memory),
+            ("\"persistent\"", DownloadMode::Persistent),
+        ] {
+            let source = format!("[files]\ndownload = {value}\n");
+            let arena = Arena::new();
+            let config: Config = toml_spanner::parse(&source, &arena).unwrap().to().unwrap();
+            assert_eq!(config.files.download, expected);
+        }
     }
 
     #[test]
@@ -2438,16 +2592,18 @@ server-public-key = ""
             RoomOverrides {
                 room_id: RoomId(3),
                 files: FileOverrides {
-                    receive_dir: Some("/a".to_string()),
-                    max_receive_bytes: None,
+                    download: Some(DownloadMode::Persistent),
+                    download_dir: Some("/a".to_string()),
+                    max_download_bytes: None,
                 },
                 history: HistoryOverrides::default(),
             },
             RoomOverrides {
                 room_id: RoomId(3),
                 files: FileOverrides {
-                    receive_dir: Some("/b".to_string()),
-                    max_receive_bytes: None,
+                    download: Some(DownloadMode::Persistent),
+                    download_dir: Some("/b".to_string()),
+                    max_download_bytes: None,
                 },
                 history: HistoryOverrides::default(),
             },

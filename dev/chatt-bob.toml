@@ -9,4 +9,5 @@ tcp-addr = "127.0.0.1:41000"
 placeholder = "Bob #lobby"
 
 [files]
-receive-dir = "/tmp/chatt-bob"
+download = "persistent"
+download-dir = "/tmp/chatt-bob"
