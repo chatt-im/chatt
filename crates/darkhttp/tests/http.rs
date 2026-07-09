@@ -224,6 +224,79 @@ fn generated_route_serves_computed_body() {
     assert_eq!(res.status().as_u16(), 404);
 }
 
+#[test]
+fn generated_pass_never_falls_through_to_a_different_prefix() {
+    // The root static mount holds a file at the path a `/files/*` request would
+    // map to. Without the same-prefix restriction, a `/files` miss returning
+    // `pass()` would fall through to `/` and leak it.
+    let root = TestRoot::new("pass-root");
+    root.write("files/leak.txt", b"must not leak");
+
+    let router = Router::new()
+        .mount_generated(
+            "/files",
+            Arc::new(|_req: &darkhttp::GeneratedRequest| darkhttp::GeneratedResponse::pass()),
+        )
+        .mount_static_dir("/", root.path());
+    let server = EmbeddedServer::start(router);
+    let agent = agent();
+
+    let res = agent.get(server.url("/files/leak.txt")).call().unwrap();
+    assert_eq!(res.status().as_u16(), 404);
+}
+
+#[test]
+fn generated_pass_defers_to_same_prefix_mount() {
+    let files = TestRoot::new("pass-files");
+    files.write("hit.txt", b"served from the files mount");
+
+    let router = Router::new()
+        .mount_generated(
+            "/files",
+            Arc::new(|_req: &darkhttp::GeneratedRequest| darkhttp::GeneratedResponse::pass()),
+        )
+        .mount_file_dir("/files", files.path());
+    let server = EmbeddedServer::start(router);
+    let agent = agent();
+
+    let mut res = agent.get(server.url("/files/hit.txt")).call().unwrap();
+    assert_eq!(res.status().as_u16(), 200);
+    assert_eq!(
+        res.body_mut().read_to_string().unwrap(),
+        "served from the files mount"
+    );
+}
+
+#[test]
+fn generated_file_response_serves_from_disk_with_range() {
+    let dir = TestRoot::new("gen-file");
+    dir.write("report.txt", b"0123456789");
+    let path = dir.path().join("report.txt");
+
+    let router = Router::new().mount_generated(
+        "/files",
+        Arc::new(move |_req: &darkhttp::GeneratedRequest| {
+            darkhttp::GeneratedResponse::file(path.clone())
+        }),
+    );
+    let server = EmbeddedServer::start(router);
+    let agent = agent();
+
+    let mut res = agent.get(server.url("/files/anything")).call().unwrap();
+    assert_eq!(res.status().as_u16(), 200);
+    assert_eq!(header(&res, "Accept-Ranges"), "bytes");
+    assert_eq!(res.body_mut().read_to_string().unwrap(), "0123456789");
+
+    let mut res = agent
+        .get(server.url("/files/anything"))
+        .header("Range", "bytes=2-5")
+        .call()
+        .unwrap();
+    assert_eq!(res.status().as_u16(), 206);
+    assert_eq!(header(&res, "Content-Range"), "bytes 2-5/10");
+    assert_eq!(res.body_mut().read_to_string().unwrap(), "2345");
+}
+
 fn embedded(path: &str) -> Option<(&'static str, &'static str, &'static [u8])> {
     match path {
         "/" | "/index.html" => Some(("text/html; charset=UTF-8", "gzip", b"GZIPPEDHTML")),

@@ -1506,6 +1506,14 @@ impl Config {
                 "audio bitrate-bps must be between 8000 and 96000",
             ));
         }
+        if self.files.download_memory_bytes == 0 {
+            // Memory mode advertises that downloads are active but would reject
+            // every non-empty file with a zero-sized ring, so reject it at load
+            // the same way the settings UI does.
+            out.push(Diag::error(
+                "files download-memory-bytes must be a positive byte count",
+            ));
+        }
         if let Err(error) = self.web.bind.parse::<std::net::SocketAddr>() {
             out.push(Diag::error(format!(
                 "web bind must be a socket address: {error}"
@@ -1690,14 +1698,28 @@ impl Config {
         }
     }
 
-    /// The directory the web view serves persistent downloads from: the
-    /// resolved global persistent target, or `None` when the global download
-    /// mode is not persistent.
-    pub fn web_persistent_dir(&self) -> Option<PathBuf> {
-        match self.effective_files(&ServerEntry::default(), None).target {
-            DownloadTarget::Persistent(dir) => Some(dir),
-            DownloadTarget::Off | DownloadTarget::Memory => None,
+    /// Every distinct directory a persistent download could be saved to: the
+    /// global target plus each server- and room-level override. The web view
+    /// registers the files already in these directories at startup so downloads
+    /// from a previous session remain servable regardless of which directory
+    /// they live in.
+    pub fn persistent_download_dirs(&self) -> Vec<PathBuf> {
+        let mut dirs = Vec::new();
+        let mut push = |target: DownloadTarget| {
+            if let DownloadTarget::Persistent(dir) = target
+                && !dirs.contains(&dir)
+            {
+                dirs.push(dir);
+            }
+        };
+        push(self.effective_files(&ServerEntry::default(), None).target);
+        for server in &self.servers {
+            push(self.effective_files(server, None).target);
+            for room in &server.rooms {
+                push(self.effective_files(server, Some(room.room_id)).target);
+            }
         }
+        dirs
     }
 
     /// Resolves persistence settings room > server > global, per field.
@@ -2470,6 +2492,25 @@ server-public-key = ""
             },
         }];
         (config, server)
+    }
+
+    #[test]
+    fn zero_download_memory_bytes_is_rejected() {
+        let mut config = Config::default();
+        config.files.download_memory_bytes = 0;
+        let mut diagnostics = Vec::new();
+        config.validate(&mut diagnostics);
+        let messages = diagnostics
+            .iter()
+            .filter(|diag| diag.error)
+            .map(|diag| diag.message.as_str())
+            .collect::<Vec<_>>();
+        assert!(
+            messages
+                .iter()
+                .any(|message| message.contains("download-memory-bytes")),
+            "expected a download-memory-bytes error, got {messages:?}"
+        );
     }
 
     #[test]

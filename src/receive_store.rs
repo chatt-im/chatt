@@ -1,15 +1,22 @@
-//! An in-memory ring buffer for received files.
+//! The served-file index: the single source of truth for what `/files/<name>`
+//! resolves to.
 //!
-//! When downloads resolve to [`DownloadTarget::Memory`], completed transfers
-//! are held here instead of on disk and served to the web view from memory. The
-//! store is a single size-bounded FIFO shared (via [`DownloadStore::clone`])
-//! between the network worker that fills it and the web server that reads it;
-//! oldest entries are evicted once the total exceeds the configured capacity.
+//! Every completed download registers a served name here. In-memory downloads
+//! ([`DownloadTarget::Memory`]) keep their bytes in a size-bounded FIFO ring;
+//! persistent downloads register the absolute path they were saved to, so files
+//! written to a per-room or per-server directory the web server does not mount
+//! are still reachable. Served names are allocated through one place and never
+//! reused for the process lifetime, so an evicted memory file cannot be shadowed
+//! by a later file of the same name and memory and disk names never collide.
+//!
+//! The store is shared (via [`DownloadStore::clone`]) between the single network
+//! worker that fills it and the web server that reads it. Name allocation
+//! assumes that single writer; reads (`resolve`, `get`) may run concurrently.
 //!
 //! [`DownloadTarget::Memory`]: crate::config::DownloadTarget::Memory
 
-use std::collections::{HashMap, VecDeque};
-use std::path::Path;
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use crate::client_net::sanitize_file_name;
@@ -22,15 +29,35 @@ struct Entry {
 
 struct Inner {
     cap_bytes: u64,
+    /// Bytes of resident memory entries.
     total_bytes: u64,
-    /// Served names in insertion order, oldest first — the eviction queue.
+    /// Bytes promised to in-flight memory transfers that have reserved space but
+    /// not yet inserted, so `total_bytes + reserved_bytes` is the true peak.
+    reserved_bytes: u64,
+    /// Served names of memory entries in insertion order, oldest first — the
+    /// eviction queue.
     order: VecDeque<String>,
     entries: HashMap<String, Entry>,
+    /// Served names of persistent downloads mapped to their absolute path.
+    disk: HashMap<String, PathBuf>,
+    /// Every served name ever handed out (memory or disk), so a name is never
+    /// reused even after the memory entry is evicted.
+    used_names: HashSet<String>,
 }
 
-/// A shared, size-bounded FIFO store of recently received files. Cloning shares
-/// the same backing store, so the network worker and the web server observe the
-/// same entries.
+/// The source a served name resolves to.
+pub enum Source {
+    /// An in-memory download, served without copying the buffer.
+    Memory {
+        bytes: Arc<[u8]>,
+        content_type: &'static str,
+    },
+    /// A persistent download at this absolute path.
+    Disk(PathBuf),
+}
+
+/// A shared served-file index. Cloning shares the same backing store, so the
+/// network worker and the web server observe the same entries.
 #[derive(Clone)]
 pub struct DownloadStore(Arc<Mutex<Inner>>);
 
@@ -39,9 +66,40 @@ impl std::fmt::Debug for DownloadStore {
         let inner = self.0.lock().unwrap();
         f.debug_struct("DownloadStore")
             .field("entries", &inner.entries.len())
+            .field("disk", &inner.disk.len())
             .field("total_bytes", &inner.total_bytes)
+            .field("reserved_bytes", &inner.reserved_bytes)
             .field("cap_bytes", &inner.cap_bytes)
             .finish()
+    }
+}
+
+/// A claim on `size` bytes of the memory ring for an in-flight transfer. Held
+/// from accept until [`DownloadStore::insert_reserved`] converts it to a
+/// resident entry; dropping it (a skipped or failed transfer) releases the
+/// bytes, so the ring is a true peak-memory cap.
+#[must_use]
+pub struct Reservation {
+    store: DownloadStore,
+    size: u64,
+    active: bool,
+}
+
+impl Reservation {
+    /// Consumes the reservation without releasing it, returning its size. The
+    /// caller must account for `size` bytes under the store lock.
+    fn disarm(mut self) -> u64 {
+        self.active = false;
+        self.size
+    }
+}
+
+impl Drop for Reservation {
+    fn drop(&mut self) {
+        if self.active {
+            let mut inner = self.store.0.lock().unwrap();
+            inner.reserved_bytes -= self.size;
+        }
     }
 }
 
@@ -50,34 +108,70 @@ impl DownloadStore {
         DownloadStore(Arc::new(Mutex::new(Inner {
             cap_bytes,
             total_bytes: 0,
+            reserved_bytes: 0,
             order: VecDeque::new(),
             entries: HashMap::new(),
+            disk: HashMap::new(),
+            used_names: HashSet::new(),
         })))
     }
 
-    /// Updates the capacity, evicting oldest entries until the store fits.
+    /// Updates the capacity, evicting oldest memory entries until the resident
+    /// plus reserved total fits.
     pub fn set_cap(&self, cap_bytes: u64) {
         let mut inner = self.0.lock().unwrap();
         inner.cap_bytes = cap_bytes;
         inner.evict_to_fit(0);
     }
 
-    /// Stores `bytes` under a unique name derived from `requested_name`,
-    /// returning the served name. Returns `None` when the file alone exceeds
-    /// the whole ring capacity — the caller should skip the transfer.
-    pub fn insert(&self, requested_name: &str, bytes: Vec<u8>) -> Option<String> {
-        let len = bytes.len() as u64;
+    /// The current capacity in bytes.
+    pub fn capacity(&self) -> u64 {
+        self.0.lock().unwrap().cap_bytes
+    }
+
+    /// Reserves `size` bytes of the memory ring for an incoming transfer,
+    /// evicting oldest entries to make room. Returns `None` when the file cannot
+    /// fit alongside outstanding reservations even after evicting every resident
+    /// entry — the caller should skip the transfer. No entries are evicted when
+    /// the reservation fails.
+    pub fn reserve(&self, size: u64) -> Option<Reservation> {
         let mut inner = self.0.lock().unwrap();
-        if len > inner.cap_bytes {
+        // Feasible only if it fits alongside other reservations once every
+        // evictable resident entry is gone.
+        if inner.reserved_bytes + size > inner.cap_bytes {
             return None;
         }
+        inner.evict_to_fit(size);
+        inner.reserved_bytes += size;
+        Some(Reservation {
+            store: self.clone(),
+            size,
+            active: true,
+        })
+    }
+
+    /// Stores `bytes` under a unique name derived from `requested_name`,
+    /// consuming the `reservation` taken at accept time. Returns the served name,
+    /// or `None` if no unique name could be allocated.
+    pub fn insert_reserved(
+        &self,
+        reservation: Reservation,
+        requested_name: &str,
+        bytes: Vec<u8>,
+    ) -> Option<String> {
+        let reserved = reservation.disarm();
+        let len = bytes.len() as u64;
+        let mut inner = self.0.lock().unwrap();
+        inner.reserved_bytes -= reserved;
         let name = allocate_name(requested_name, |candidate| {
-            (!inner.entries.contains_key(candidate)).then(|| candidate.to_string())
+            (!inner.used_names.contains(candidate) && !inner.entries.contains_key(candidate))
+                .then(|| candidate.to_string())
         })?;
         inner.evict_to_fit(len);
         let content_type = darkhttp::content_type(Path::new(&name));
         inner.total_bytes += len;
         inner.order.push_back(name.clone());
+        inner.used_names.insert(name.clone());
         inner.entries.insert(
             name.clone(),
             Entry {
@@ -88,13 +182,50 @@ impl DownloadStore {
         Some(name)
     }
 
-    /// The current capacity in bytes. A single file larger than this can never
-    /// be stored, so callers reject such transfers up front.
-    pub fn capacity(&self) -> u64 {
-        self.0.lock().unwrap().cap_bytes
+    /// Reserves space and stores `bytes` in one step. Returns `None` when the
+    /// file exceeds the ring or no unique name is available. A test convenience;
+    /// the live path reserves at accept time and inserts on finalize.
+    #[cfg(test)]
+    pub fn insert(&self, requested_name: &str, bytes: Vec<u8>) -> Option<String> {
+        let reservation = self.reserve(bytes.len() as u64)?;
+        self.insert_reserved(reservation, requested_name, bytes)
     }
 
-    /// Returns the bytes and content type for `served_name`, if present.
+    /// Whether `candidate` is free to hand out as a served name. Consulted by the
+    /// disk allocator so memory and disk names never collide. Single-writer, so
+    /// no reservation happens until [`register_disk`](Self::register_disk).
+    pub fn name_available(&self, candidate: &str) -> bool {
+        let inner = self.0.lock().unwrap();
+        !inner.used_names.contains(candidate) && !inner.entries.contains_key(candidate)
+    }
+
+    /// Registers a persistent download's served `name` and the absolute `path`
+    /// it was saved to, so `/files/<name>` can serve it from any directory.
+    pub fn register_disk(&self, name: String, path: PathBuf) {
+        let mut inner = self.0.lock().unwrap();
+        inner.used_names.insert(name.clone());
+        inner.disk.insert(name, path);
+    }
+
+    /// Resolves a served name to its source: in-memory bytes or a disk path.
+    pub fn resolve(&self, served_name: &str) -> Option<Source> {
+        let inner = self.0.lock().unwrap();
+        if let Some(entry) = inner.entries.get(served_name) {
+            return Some(Source::Memory {
+                bytes: entry.bytes.clone(),
+                content_type: entry.content_type,
+            });
+        }
+        inner
+            .disk
+            .get(served_name)
+            .map(|path| Source::Disk(path.clone()))
+    }
+
+    /// Returns the in-memory bytes and content type for `served_name`, if it is a
+    /// resident memory entry. A test convenience; serving goes through
+    /// [`resolve`](Self::resolve).
+    #[cfg(test)]
     pub fn get(&self, served_name: &str) -> Option<(Arc<[u8]>, &'static str)> {
         let inner = self.0.lock().unwrap();
         inner
@@ -105,9 +236,10 @@ impl DownloadStore {
 }
 
 impl Inner {
-    /// Evicts oldest entries until `incoming` more bytes fit under the cap.
+    /// Evicts oldest memory entries until `incoming` more bytes fit under the cap
+    /// alongside the resident and reserved totals.
     fn evict_to_fit(&mut self, incoming: u64) {
-        while self.total_bytes + incoming > self.cap_bytes {
+        while self.total_bytes + self.reserved_bytes + incoming > self.cap_bytes {
             let Some(name) = self.order.pop_front() else {
                 break;
             };
@@ -197,5 +329,66 @@ mod tests {
         store.set_cap(50);
         assert!(store.get("a.bin").is_none());
         assert!(store.get("b.bin").is_some());
+    }
+
+    #[test]
+    fn evicted_name_is_never_reused() {
+        let store = DownloadStore::new(10);
+        let first = store.insert("photo.png", vec![0; 6]).unwrap();
+        assert_eq!(first, "photo.png");
+        // Overflows the ring, evicting the first photo.png.
+        let second = store.insert("photo.png", vec![0; 6]).unwrap();
+        assert!(store.get("photo.png").is_none());
+        // The evicted name is not handed out again, so the old message's URL
+        // 404s instead of serving the new file.
+        assert_eq!(second, "photo-1.png");
+        assert!(store.get("photo-1.png").is_some());
+    }
+
+    #[test]
+    fn memory_and_disk_names_do_not_collide() {
+        let store = DownloadStore::new(1024);
+        let mem = store.insert("foo.png", vec![1, 2, 3]).unwrap();
+        assert_eq!(mem, "foo.png");
+        // A later persistent file of the same name must get a fresh name so it
+        // cannot be shadowed by the memory entry.
+        assert!(!store.name_available("foo.png"));
+        let disk = allocate_name("foo.png", |candidate| {
+            store
+                .name_available(candidate)
+                .then(|| candidate.to_string())
+        })
+        .unwrap();
+        assert_eq!(disk, "foo-1.png");
+        store.register_disk(disk.clone(), PathBuf::from("/tmp/foo-1.png"));
+        assert!(matches!(store.resolve(&disk), Some(Source::Disk(_))));
+        assert!(matches!(store.resolve(&mem), Some(Source::Memory { .. })));
+    }
+
+    #[test]
+    fn reservation_bounds_peak_over_a_full_store() {
+        let store = DownloadStore::new(10);
+        store.insert("a.bin", vec![0; 8]).unwrap();
+        // An 8-byte reservation over a full ring evicts the resident entry so
+        // resident + reserved never exceeds the cap.
+        let reservation = store.reserve(8).unwrap();
+        assert!(store.get("a.bin").is_none());
+        // A second concurrent reservation cannot exceed the cap.
+        assert!(store.reserve(8).is_none());
+        let name = store
+            .insert_reserved(reservation, "b.bin", vec![0; 8])
+            .unwrap();
+        assert!(store.get(&name).is_some());
+    }
+
+    #[test]
+    fn dropped_reservation_releases_bytes() {
+        let store = DownloadStore::new(10);
+        {
+            let _reservation = store.reserve(8).unwrap();
+            assert!(store.reserve(8).is_none());
+        }
+        // After the failed transfer's reservation drops, the space is free again.
+        assert!(store.reserve(8).is_some());
     }
 }

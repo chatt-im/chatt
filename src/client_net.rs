@@ -64,6 +64,7 @@ use crate::file_compression::{
     self, COMPRESSION_PROBE_BYTES, FastCompressionDecision, ZSTD_WINDOW_LOG,
 };
 use crate::mdns::{MdnsSystem, generate_mdns_name};
+use crate::receive_store::Reservation;
 
 const TCP: Token = Token(0);
 const UDP: Token = Token(1);
@@ -1954,10 +1955,11 @@ struct OutgoingUpload {
     encoder_finished: bool,
     started: bool,
     next_status_at: u64,
-    /// A copy of the upload written into the local receive directory so the
-    /// uploader's own views (such as the web log) can serve the file. Written
-    /// from the same chunks sent to the server, never round-tripped through it.
-    local_copy: Option<(PathBuf, File)>,
+    /// A copy of the sender's own upload kept so the uploader's own views (such
+    /// as the web log) can serve the file. Written from the same chunks sent to
+    /// the server, never round-tripped through it. Present in persistent and
+    /// memory download modes, absent when receiving is off.
+    local_copy: Option<UploadLocalCopy>,
     /// Intrinsic image size, parsed from the first chunk as it streams.
     dimensions: Option<(u32, u32)>,
     image_prefix: Vec<u8>,
@@ -2064,8 +2066,29 @@ impl UploadBody {
     }
 }
 
+/// The sender's own copy of an in-flight upload, mirroring the room's download
+/// mode: written to disk as it streams, or buffered into the in-memory ring.
+enum UploadLocalCopy {
+    Disk {
+        path: PathBuf,
+        file: File,
+    },
+    Memory {
+        reservation: Reservation,
+        bytes: Vec<u8>,
+    },
+}
+
+/// Where a completed local upload copy lives, so it can be surfaced as a
+/// received file once the server assigns its metadata.
+enum LocalFileLocation {
+    Disk(PathBuf),
+    /// Already inserted into the ring under this served name.
+    Memory(String),
+}
+
 struct PendingLocalFile {
-    path: PathBuf,
+    location: LocalFileLocation,
     dimensions: Option<(u32, u32)>,
 }
 
@@ -2090,6 +2113,10 @@ struct IncomingFile {
     complete_received: bool,
     decoder_finished: bool,
     next_status_at: u64,
+    /// The memory-ring claim for a [`DownloadTarget::Memory`] transfer, consumed
+    /// by [`DownloadStore::insert_reserved`] on finalize and released if the
+    /// transfer is dropped, failed, or skipped. `None` for on-disk transfers.
+    reservation: Option<Reservation>,
 }
 
 /// Where an in-flight download is being written. Distinguishes the on-disk path
@@ -2296,7 +2323,13 @@ impl IncomingFile {
     fn finalize(
         self,
     ) -> Result<
-        (FileMetadata, FinalizedLocation, Option<(u32, u32)>, u64),
+        (
+            FileMetadata,
+            FinalizedLocation,
+            Option<Reservation>,
+            Option<(u32, u32)>,
+            u64,
+        ),
         (ReceiveDest, String, io::Error),
     > {
         let Self {
@@ -2304,6 +2337,7 @@ impl IncomingFile {
             dest,
             body,
             wire_received,
+            reservation,
             ..
         } = self;
         let mut sink = match body {
@@ -2324,7 +2358,7 @@ impl IncomingFile {
             // dest always pairs with a memory sink.
             (ReceiveDest::Memory, SinkTarget::Disk(_)) => FinalizedLocation::Memory(Vec::new()),
         };
-        Ok((metadata, location, dimensions, wire_received))
+        Ok((metadata, location, reservation, dimensions, wire_received))
     }
 }
 
@@ -3382,26 +3416,47 @@ impl WorkerState {
                 encoding: upload.body.encoding(),
             })?;
             upload.started = true;
-            // Keep a local copy of the sender's own upload only when the room
-            // persists downloads to disk. Off and memory modes keep none: the
-            // sender already holds the original, and the memory ring is reserved
-            // for genuinely received files.
-            if let DownloadTarget::Persistent(receive_dir) = self
+            // Keep a local copy of the sender's own upload so the uploader's own
+            // views can serve it, mirroring the room's download mode. The server
+            // excludes the sender from the file fanout, so this local copy is the
+            // only way the uploader's web log renders and serves its own upload.
+            // Off mode keeps none: the sender already holds the original.
+            match self
                 .config
                 .file_policy
                 .for_room(upload.room_id)
                 .target
                 .clone()
             {
-                match create_receive_file(&receive_dir, &upload.name) {
-                    Ok((path, file)) => upload.local_copy = Some((path, file)),
-                    Err(error) => {
-                        let _ = self.events.send(NetworkEvent::Error(format!(
-                            "failed to keep a local copy of {}: {error}",
-                            upload.name
-                        )));
+                DownloadTarget::Persistent(receive_dir) => {
+                    match create_receive_file(
+                        &self.config.download_store,
+                        &receive_dir,
+                        &upload.name,
+                    ) {
+                        Ok((path, file)) => {
+                            upload.local_copy = Some(UploadLocalCopy::Disk { path, file })
+                        }
+                        Err(error) => {
+                            let _ = self.events.send(NetworkEvent::Error(format!(
+                                "failed to keep a local copy of {}: {error}",
+                                upload.name
+                            )));
+                        }
                     }
                 }
+                DownloadTarget::Memory => {
+                    // Buffer into the ring like a received file. If it does not
+                    // fit, the upload still proceeds; only the local copy is
+                    // skipped.
+                    if let Some(reservation) = self.config.download_store.reserve(upload.size) {
+                        upload.local_copy = Some(UploadLocalCopy::Memory {
+                            reservation,
+                            bytes: Vec::with_capacity(upload.size as usize),
+                        });
+                    }
+                }
+                DownloadTarget::Off => {}
             }
             let _ = self.events.send(NetworkEvent::Status(format!(
                 "uploading {} ({})",
@@ -3650,8 +3705,13 @@ impl WorkerState {
             transfer_id: upload.transfer_id,
             reason: wire_reason.to_string(),
         })?;
-        if let Some((path, _)) = upload.local_copy.take() {
-            let _ = fs::remove_file(path);
+        match upload.local_copy.take() {
+            // Drop the on-disk partial; the memory copy's reservation releases as
+            // it drops, freeing its ring bytes.
+            Some(UploadLocalCopy::Disk { path, .. }) => {
+                let _ = fs::remove_file(path);
+            }
+            Some(UploadLocalCopy::Memory { .. }) | None => {}
         }
         let (verb, reason) = match &abort {
             UploadAbort::UserCancel => (TerminalVerb::Cancelled, None),
@@ -3681,24 +3741,45 @@ impl WorkerState {
     /// Flushes the uploader's local copy and emits [`NetworkEvent::FileReceived`]
     /// so local views render the file the same way they render a received one.
     fn finish_local_copy(&mut self, upload: &mut OutgoingUpload) {
-        let Some((path, mut file)) = upload.local_copy.take() else {
+        let Some(copy) = upload.local_copy.take() else {
             return;
         };
-        if let Err(error) = file.flush() {
-            let _ = fs::remove_file(&path);
-            let _ = self.events.send(NetworkEvent::Error(format!(
-                "failed to flush local copy {}: {error}",
-                path.display()
-            )));
-            return;
-        }
+        let location = match copy {
+            UploadLocalCopy::Disk { path, mut file } => {
+                if let Err(error) = file.flush() {
+                    let _ = fs::remove_file(&path);
+                    let _ = self.events.send(NetworkEvent::Error(format!(
+                        "failed to flush local copy {}: {error}",
+                        path.display()
+                    )));
+                    return;
+                }
+                LocalFileLocation::Disk(path)
+            }
+            UploadLocalCopy::Memory { reservation, bytes } => {
+                match self
+                    .config
+                    .download_store
+                    .insert_reserved(reservation, &upload.name, bytes)
+                {
+                    Some(name) => LocalFileLocation::Memory(name),
+                    None => {
+                        let _ = self.events.send(NetworkEvent::Error(format!(
+                            "could not keep {} in the in-memory download buffer",
+                            upload.name
+                        )));
+                        return;
+                    }
+                }
+            }
+        };
         if let Some(metadata) = upload.server_metadata.take() {
-            self.emit_local_file(metadata, path, upload.dimensions);
+            self.emit_local_file(metadata, location, upload.dimensions);
         } else {
             self.pending_local_files.insert(
                 upload.transfer_id,
                 PendingLocalFile {
-                    path,
+                    location,
                     dimensions: upload.dimensions,
                 },
             );
@@ -3716,7 +3797,7 @@ impl WorkerState {
             client_transfer_id,
             metadata,
         ) {
-            self.emit_local_file(metadata, local.path, local.dimensions);
+            self.emit_local_file(metadata, local.location, local.dimensions);
         } else if let Some(upload) = self
             .outgoing_uploads
             .iter()
@@ -3739,10 +3820,13 @@ impl WorkerState {
     fn emit_local_file(
         &self,
         metadata: FileMetadata,
-        path: PathBuf,
+        location: LocalFileLocation,
         dimensions: Option<(u32, u32)>,
     ) {
-        let served_name = served_file_name(&path, &metadata.file_name);
+        let served_name = match location {
+            LocalFileLocation::Disk(path) => served_file_name(&path, &metadata.file_name),
+            LocalFileLocation::Memory(name) => name,
+        };
         let _ = self.events.send(NetworkEvent::FileReceived {
             metadata,
             served_name,
@@ -3814,10 +3898,12 @@ impl WorkerState {
                 self.end_transfer_skipped(&file, "Automatic file receive disabled".to_string());
             }
             DownloadTarget::Memory => {
-                // A file that cannot fit the whole ring is rejected up front
-                // rather than buffered and dropped when it fails to be stored.
+                // Reserve the file's bytes in the ring up front so peak memory
+                // stays bounded across concurrent transfers. A file that cannot
+                // fit the whole ring is rejected here rather than buffered and
+                // dropped when it fails to be stored.
                 let cap = self.config.download_store.capacity();
-                if file.size > cap {
+                let Some(reservation) = self.config.download_store.reserve(file.size) else {
                     self.skip_offered_download(&file);
                     let reason = format!(
                         "File exceeds the in-memory download buffer ({})",
@@ -3831,21 +3917,31 @@ impl WorkerState {
                     )));
                     self.end_transfer_skipped(&file, reason);
                     return;
-                }
-                let target = SinkTarget::Memory(Vec::with_capacity(file.size.min(cap) as usize));
-                self.begin_incoming(file, target, ReceiveDest::Memory);
+                };
+                let target = SinkTarget::Memory(Vec::with_capacity(file.size as usize));
+                self.begin_incoming(file, target, ReceiveDest::Memory, Some(reservation));
             }
             DownloadTarget::Persistent(receive_dir) => {
-                match create_receive_file(&receive_dir, &file.file_name) {
+                match create_receive_file(
+                    &self.config.download_store,
+                    &receive_dir,
+                    &file.file_name,
+                ) {
                     Ok((path, handle)) => {
                         self.begin_incoming(
                             file,
                             SinkTarget::Disk(handle),
                             ReceiveDest::Disk(path),
+                            None,
                         );
                     }
                     Err(error) => {
+                        // Setup failed after the server began relaying; tell it to
+                        // stop and label the line rather than silently dropping
+                        // the chunks it keeps sending.
+                        self.skip_offered_download(&file);
                         let _ = self.events.send(NetworkEvent::Error(error));
+                        self.end_transfer_skipped(&file, "Could not save the file".to_string());
                     }
                 }
             }
@@ -3856,7 +3952,13 @@ impl WorkerState {
     /// compressed transfers), registers the [`IncomingFile`], and emits the
     /// initial progress tick. On decoder-init failure the partial destination is
     /// cleaned up and the transfer is abandoned.
-    fn begin_incoming(&mut self, file: FileMetadata, target: SinkTarget, dest: ReceiveDest) {
+    fn begin_incoming(
+        &mut self,
+        file: FileMetadata,
+        target: SinkTarget,
+        dest: ReceiveDest,
+        reservation: Option<Reservation>,
+    ) {
         let sink = ReceiveSink::new(target, file.size, is_image_name(&file.file_name));
         let body = match file.encoding {
             FileContentEncoding::Identity => IncomingBody::Identity(sink),
@@ -3865,10 +3967,17 @@ impl WorkerState {
                     Ok(decoder) => decoder,
                     Err(error) => {
                         cleanup_partial(&dest);
+                        // Tell the server to stop relaying and label the line;
+                        // the reservation is released as it drops here.
+                        self.skip_offered_download(&file);
                         let _ = self.events.send(NetworkEvent::Error(format!(
                             "failed to initialize decompression for {}: {error}",
                             file.file_name
                         )));
+                        self.end_transfer_skipped(
+                            &file,
+                            "Could not start decompression".to_string(),
+                        );
                         return;
                     }
                 };
@@ -3876,10 +3985,12 @@ impl WorkerState {
                     .set_parameter(zstd::stream::raw::DParameter::WindowLogMax(ZSTD_WINDOW_LOG))
                 {
                     cleanup_partial(&dest);
+                    self.skip_offered_download(&file);
                     let _ = self.events.send(NetworkEvent::Error(format!(
                         "failed to limit decompression for {}: {error}",
                         file.file_name
                     )));
+                    self.end_transfer_skipped(&file, "Could not start decompression".to_string());
                     return;
                 }
                 IncomingBody::Zstd(zstd::stream::zio::Writer::new(sink, decoder))
@@ -3905,6 +4016,7 @@ impl WorkerState {
                 complete_received: false,
                 decoder_finished: false,
                 next_status_at: FILE_PROGRESS_STEP_BYTES,
+                reservation,
             },
         );
         let _ = self.events.send(NetworkEvent::TransferProgress {
@@ -4023,7 +4135,7 @@ impl WorkerState {
             let room_id = incoming.metadata.room_id;
             let timestamp_ms = incoming.metadata.timestamp_ms;
             match incoming.finalize() {
-                Ok((metadata, location, dimensions, _wire_bytes)) => {
+                Ok((metadata, location, reservation, dimensions, _wire_bytes)) => {
                     #[cfg(test)]
                     LAST_RECEIVED_FILE_WIRE_BYTES
                         .store(_wire_bytes, std::sync::atomic::Ordering::Relaxed);
@@ -4044,11 +4156,17 @@ impl WorkerState {
                         }
                         FinalizedLocation::Memory(bytes) => {
                             let size = bytes.len();
-                            match self
-                                .config
-                                .download_store
-                                .insert(&metadata.file_name, bytes)
-                            {
+                            // The reservation taken at accept time guarantees the
+                            // space; consume it to convert reserved bytes into a
+                            // resident entry without exceeding the peak cap.
+                            let stored = reservation.and_then(|reservation| {
+                                self.config.download_store.insert_reserved(
+                                    reservation,
+                                    &metadata.file_name,
+                                    bytes,
+                                )
+                            });
+                            match stored {
                                 Some(name) => {
                                     let _ = self.events.send(NetworkEvent::Status(format!(
                                         "received {} ({}, held in memory)",
@@ -4058,10 +4176,10 @@ impl WorkerState {
                                     name
                                 }
                                 None => {
-                                    // The ring capacity shrank below this file
-                                    // after it was accepted; drop it.
+                                    // No unique name could be allocated for the
+                                    // file; drop it.
                                     let message = format!(
-                                        "in-memory download buffer too small to hold {}",
+                                        "could not store {} in the in-memory download buffer",
                                         metadata.file_name
                                     );
                                     let _ = self.events.send(NetworkEvent::Error(message.clone()));
@@ -5720,20 +5838,20 @@ fn read_upload_source(upload: &mut OutgoingUpload, limit: usize) -> io::Result<V
 }
 
 fn write_upload_local_copy(events: &EventSender, upload: &mut OutgoingUpload, data: &[u8]) {
-    let failure = upload.local_copy.as_mut().and_then(|(path, file)| {
-        file.write_all(data)
-            .err()
-            .map(|error| (path.clone(), error))
-    });
-    let Some((path, error)) = failure else {
-        return;
-    };
-    let _ = events.send(NetworkEvent::Error(format!(
-        "failed to write local copy {}: {error}",
-        path.display()
-    )));
-    let _ = fs::remove_file(&path);
-    upload.local_copy = None;
+    match upload.local_copy.as_mut() {
+        Some(UploadLocalCopy::Disk { path, file }) => {
+            if let Err(error) = file.write_all(data) {
+                let _ = events.send(NetworkEvent::Error(format!(
+                    "failed to write local copy {}: {error}",
+                    path.display()
+                )));
+                let _ = fs::remove_file(path);
+                upload.local_copy = None;
+            }
+        }
+        Some(UploadLocalCopy::Memory { bytes, .. }) => bytes.extend_from_slice(data),
+        None => {}
+    }
 }
 
 fn capture_upload_image_prefix(upload: &mut OutgoingUpload, data: &[u8]) {
@@ -5902,13 +6020,27 @@ fn is_image_name(name: &str) -> bool {
     crate::web_server::classify(name) == "image"
 }
 
-fn create_receive_file(dir: &Path, requested_name: &str) -> Result<(PathBuf, File), String> {
+/// Creates a uniquely named file under `dir` for a persistent download and
+/// registers its served name and absolute path in `store`, so the web server can
+/// serve it from any directory and the name is never reused. The candidate name
+/// must be free in both the store (memory and disk) and the filesystem.
+fn create_receive_file(
+    store: &crate::receive_store::DownloadStore,
+    dir: &Path,
+    requested_name: &str,
+) -> Result<(PathBuf, File), String> {
     fs::create_dir_all(dir)
         .map_err(|error| format!("failed to create {}: {error}", dir.display()))?;
     crate::receive_store::allocate_name(requested_name, |candidate| {
+        if !store.name_available(candidate) {
+            return None;
+        }
         let path = dir.join(candidate);
         match OpenOptions::new().write(true).create_new(true).open(&path) {
-            Ok(file) => Some(Ok((path, file))),
+            Ok(file) => {
+                store.register_disk(candidate.to_string(), path.clone());
+                Some(Ok((path, file)))
+            }
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => None,
             Err(error) => Some(Err(format!("failed to create {}: {error}", path.display()))),
         }
@@ -7142,6 +7274,7 @@ mod tests {
             complete_received: false,
             decoder_finished: false,
             next_status_at: FILE_PROGRESS_STEP_BYTES,
+            reservation: None,
         }
     }
 
@@ -7196,7 +7329,7 @@ mod tests {
                 let mut incoming =
                     incoming_test_file(&path, data.len() as u64, FileContentEncoding::Zstd, false);
                 pump_test_input(&mut incoming, &encoded, 313, 64 * 1024).unwrap();
-                let (_, location, _, _) = incoming.finalize().unwrap();
+                let (_, location, _, _, _) = incoming.finalize().unwrap();
                 let FinalizedLocation::Disk(path) = location else {
                     panic!("disk transfer should finalize to a disk path");
                 };
@@ -7274,7 +7407,7 @@ mod tests {
             let path = dir.path().join("image.png");
             let mut incoming = incoming_test_file(&path, png.len() as u64, encoding, true);
             pump_test_input(&mut incoming, &wire, 191, 4096).unwrap();
-            let (_, _, dimensions, _) = incoming.finalize().unwrap();
+            let (_, _, _, dimensions, _) = incoming.finalize().unwrap();
             assert_eq!(dimensions, Some((320, 180)));
         }
     }
@@ -7384,7 +7517,10 @@ mod tests {
             encoder_finished: false,
             started: true,
             next_status_at: FILE_PROGRESS_STEP_BYTES,
-            local_copy: Some((local_path.clone(), File::create(&local_path).unwrap())),
+            local_copy: Some(UploadLocalCopy::Disk {
+                path: local_path.clone(),
+                file: File::create(&local_path).unwrap(),
+            }),
             dimensions: None,
             image_prefix: Vec::new(),
         };
@@ -7394,7 +7530,10 @@ mod tests {
         write_upload_local_copy(&events, &mut upload, &raw);
         upload.body.feed(&raw).unwrap();
         upload.body.finish().unwrap();
-        upload.local_copy.as_mut().unwrap().1.flush().unwrap();
+        let Some(UploadLocalCopy::Disk { file, .. }) = upload.local_copy.as_mut() else {
+            panic!("expected an on-disk local copy");
+        };
+        file.flush().unwrap();
 
         assert_eq!(fs::read(local_path).unwrap(), raw);
         assert!(upload.body.pending().len() < raw.len());
@@ -7459,7 +7598,8 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
         fs::write(dir.join("report.pdf"), b"existing").unwrap();
 
-        let (path, _file) = create_receive_file(&dir, "report.pdf").unwrap();
+        let store = crate::receive_store::DownloadStore::new(64 * 1024 * 1024);
+        let (path, _file) = create_receive_file(&store, &dir, "report.pdf").unwrap();
 
         assert_eq!(
             path.file_name().and_then(|name| name.to_str()),
@@ -7532,7 +7672,7 @@ mod tests {
         pending.insert(
             client_id,
             PendingLocalFile {
-                path: path.clone(),
+                location: LocalFileLocation::Disk(path.clone()),
                 dimensions: Some((4, 3)),
             },
         );

@@ -30,7 +30,7 @@ use rpc::{
 };
 
 use crate::config::{WebAutoplay, WebConfig};
-use crate::receive_store::DownloadStore;
+use crate::receive_store::{DownloadStore, Source};
 use crate::web_wire::{self, Fragment, split_fragments};
 
 /// The path a browser opens a WebSocket on for the live feed.
@@ -576,18 +576,21 @@ impl WebFeedSender {
     }
 }
 
-/// Builds the `/files/<name>` handler serving in-memory downloads. A hit
-/// returns the stored bytes with their inferred content type; a miss returns
-/// [`GeneratedResponse::pass`](darkhttp::GeneratedResponse::pass) so the request
-/// falls through to the on-disk `/files` mount (preserving Range serving) when
-/// one exists.
+/// Builds the `/files/<name>` handler that resolves a served name through the
+/// download index. An in-memory download is served straight from its shared
+/// `Arc<[u8]>` (honouring `Range`/`HEAD` without copying the body); a persistent
+/// download is served from its absolute path with full `Range` support, wherever
+/// on disk it was saved; a miss is a plain `404`. The handler never returns
+/// `pass()`, so a miss can never fall through to another mount.
 fn files_route(store: DownloadStore) -> darkhttp::GeneratedHandler {
     Arc::new(
-        move |request: &darkhttp::GeneratedRequest| match store.get(request.relative) {
-            Some((bytes, content_type)) => {
-                darkhttp::GeneratedResponse::ok(content_type, bytes.to_vec())
-            }
-            None => darkhttp::GeneratedResponse::pass(),
+        move |request: &darkhttp::GeneratedRequest| match store.resolve(request.relative) {
+            Some(Source::Memory {
+                bytes,
+                content_type,
+            }) => darkhttp::GeneratedResponse::ok(content_type, bytes),
+            Some(Source::Disk(path)) => darkhttp::GeneratedResponse::file(path),
+            None => darkhttp::GeneratedResponse::error(404),
         },
     )
 }
@@ -595,13 +598,13 @@ fn files_route(store: DownloadStore) -> darkhttp::GeneratedHandler {
 /// Builds the `/highlight/<name>` handler serving a file's line-indexed
 /// highlight buffer (see [`crate::highlight::encode_file`]).
 ///
-/// The name resolves against the in-memory download `store` first, then the
-/// persistent directory `dir` when set — the same flat namespace `/files`
-/// serves. A missing file is `404`, a file over [`MAX_HIGHLIGHT_FILE_BYTES`] is
-/// `413`, a non-UTF-8 file is `415`, and any text file returns the binary
-/// buffer regardless of whether its extension maps to a highlighter (an unknown
-/// extension renders as plain text).
-fn highlight_route(store: DownloadStore, dir: Option<PathBuf>) -> darkhttp::GeneratedHandler {
+/// The name resolves through the download index — the same flat namespace
+/// `/files` serves, covering both in-memory and persistent downloads. A missing
+/// file is `404`, a file over [`MAX_HIGHLIGHT_FILE_BYTES`] is `413`, a non-UTF-8
+/// file is `415`, and any text file returns the binary buffer regardless of
+/// whether its extension maps to a highlighter (an unknown extension renders as
+/// plain text).
+fn highlight_route(store: DownloadStore) -> darkhttp::GeneratedHandler {
     Arc::new(move |request: &darkhttp::GeneratedRequest| {
         let name = request.relative;
         // The receive namespace is flat, so a name with a separator or parent
@@ -609,31 +612,32 @@ fn highlight_route(store: DownloadStore, dir: Option<PathBuf>) -> darkhttp::Gene
         if !valid_highlight_name(name) {
             return darkhttp::GeneratedResponse::error(404);
         }
-        let bytes = if let Some((bytes, _)) = store.get(name) {
-            if bytes.len() as u64 > MAX_HIGHLIGHT_FILE_BYTES {
-                return darkhttp::GeneratedResponse::error(413);
+        let bytes = match store.resolve(name) {
+            Some(Source::Memory { bytes, .. }) => {
+                if bytes.len() as u64 > MAX_HIGHLIGHT_FILE_BYTES {
+                    return darkhttp::GeneratedResponse::error(413);
+                }
+                bytes.to_vec()
             }
-            bytes.to_vec()
-        } else if let Some(dir) = &dir {
-            let path = dir.join(name);
-            let Ok(metadata) = fs::metadata(&path) else {
-                return darkhttp::GeneratedResponse::error(404);
-            };
-            if !metadata.is_file() {
-                return darkhttp::GeneratedResponse::error(404);
+            Some(Source::Disk(path)) => {
+                let Ok(metadata) = fs::metadata(&path) else {
+                    return darkhttp::GeneratedResponse::error(404);
+                };
+                if !metadata.is_file() {
+                    return darkhttp::GeneratedResponse::error(404);
+                }
+                if metadata.len() > MAX_HIGHLIGHT_FILE_BYTES {
+                    return darkhttp::GeneratedResponse::error(413);
+                }
+                let Ok(bytes) = fs::read(&path) else {
+                    return darkhttp::GeneratedResponse::error(404);
+                };
+                if bytes.len() as u64 > MAX_HIGHLIGHT_FILE_BYTES {
+                    return darkhttp::GeneratedResponse::error(413);
+                }
+                bytes
             }
-            if metadata.len() > MAX_HIGHLIGHT_FILE_BYTES {
-                return darkhttp::GeneratedResponse::error(413);
-            }
-            let Ok(bytes) = fs::read(&path) else {
-                return darkhttp::GeneratedResponse::error(404);
-            };
-            if bytes.len() as u64 > MAX_HIGHLIGHT_FILE_BYTES {
-                return darkhttp::GeneratedResponse::error(413);
-            }
-            bytes
-        } else {
-            return darkhttp::GeneratedResponse::error(404);
+            None => return darkhttp::GeneratedResponse::error(404),
         };
         let Ok(text) = String::from_utf8(bytes) else {
             return darkhttp::GeneratedResponse::error(415);
@@ -650,10 +654,11 @@ fn valid_highlight_name(name: &str) -> bool {
 
 /// Starts the web server on its own thread and returns a feed handle.
 ///
-/// `/files` serves in-memory downloads from `download_store` first, falling
-/// through to `persistent_dir` (when set) on disk so inline media resolves in
-/// either download mode. `max_messages` bounds the in-memory history replayed to
-/// new clients.
+/// `/files` and `/highlight` resolve every served name through `download_store`,
+/// which maps each name to its source — in-memory bytes or an absolute disk
+/// path — so downloads resolve in any mode and from any directory without a
+/// captured mount. `max_messages` bounds the in-memory history replayed to new
+/// clients.
 ///
 /// # Errors
 ///
@@ -662,7 +667,6 @@ fn valid_highlight_name(name: &str) -> bool {
 pub fn spawn(
     cfg: &WebConfig,
     download_store: DownloadStore,
-    persistent_dir: Option<PathBuf>,
     max_messages: usize,
     web_requests: Sender<WebRequest>,
     readonly: bool,
@@ -674,21 +678,14 @@ pub fn spawn(
         )
     })?;
 
-    // `/files` and `/highlight` first consult the in-memory download store. A
-    // store miss on `/files` returns `pass()` so the request falls through to
-    // the on-disk mount below (which keeps HTTP Range/If-Modified-Since serving
-    // for persistent downloads); `/highlight` has no disk mount, so it reads
-    // the persistent directory itself.
+    // `/files` and `/highlight` resolve names through the download index, which
+    // returns explicit responses (bytes, a disk file, or a 404) — never a
+    // fall-through — so no on-disk `/files` mount is needed.
+    #[cfg_attr(feature = "embed-web", allow(unused_mut))]
     let mut router = Router::new()
         .websocket(WS_PATH)
         .mount_generated("/files", files_route(download_store.clone()))
-        .mount_generated(
-            "/highlight",
-            highlight_route(download_store, persistent_dir.clone()),
-        );
-    if let Some(dir) = persistent_dir {
-        router = router.mount_file_dir("/files", dir);
-    }
+        .mount_generated("/highlight", highlight_route(download_store));
     #[cfg(not(feature = "embed-web"))]
     {
         router = router.mount_static_dir("/", PathBuf::from(WEB_ASSETS_DIR));
@@ -1688,15 +1685,9 @@ mod tests {
             ..WebConfig::default()
         };
         let (web_tx, _web_rx) = mpsc::channel();
-        let sender = spawn(
-            &cfg,
-            DownloadStore::new(64 * 1024 * 1024),
-            Some(dir.clone()),
-            100,
-            web_tx,
-            true,
-        )
-        .unwrap();
+        let store = DownloadStore::new(64 * 1024 * 1024);
+        store.register_disk("trace..old.rs".to_string(), dir.join("trace..old.rs"));
+        let sender = spawn(&cfg, store, 100, web_tx, true).unwrap();
 
         let mut stream = TcpStream::connect(sender.local_addr()).unwrap();
         stream
@@ -1732,8 +1723,7 @@ mod tests {
             ..WebConfig::default()
         };
         let (web_tx, _web_rx) = mpsc::channel();
-        // No persistent dir: only the in-memory store backs `/files`.
-        let sender = spawn(&cfg, store, None, 100, web_tx, true).unwrap();
+        let sender = spawn(&cfg, store, 100, web_tx, true).unwrap();
 
         let mut stream = TcpStream::connect(sender.local_addr()).unwrap();
         stream
@@ -1755,7 +1745,81 @@ mod tests {
     }
 
     #[test]
-    fn files_endpoint_falls_through_to_disk_on_store_miss() {
+    fn files_endpoint_serves_memory_range() {
+        let store = DownloadStore::new(64 * 1024 * 1024);
+        let served = store.insert("photo.png", vec![1, 2, 3, 4, 5]).unwrap();
+
+        let cfg = WebConfig {
+            enabled: true,
+            readonly: true,
+            bind: "127.0.0.1:0".to_string(),
+            ..WebConfig::default()
+        };
+        let (web_tx, _web_rx) = mpsc::channel();
+        let sender = spawn(&cfg, store, 100, web_tx, true).unwrap();
+
+        let mut stream = TcpStream::connect(sender.local_addr()).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        stream
+            .write_all(
+                format!(
+                    "GET /files/{served} HTTP/1.1\r\nHost: x\r\nRange: bytes=1-3\r\nConnection: close\r\n\r\n"
+                )
+                .as_bytes(),
+            )
+            .unwrap();
+        let headers = read_http_headers(&mut stream);
+        assert!(
+            headers.starts_with("HTTP/1.1 206 Partial Content"),
+            "{headers}"
+        );
+        assert!(headers.contains("Content-Range: bytes 1-3/5"), "{headers}");
+
+        // The body is the requested sub-slice, served straight from the shared
+        // buffer without copying the whole file.
+        let mut body = Vec::new();
+        stream.read_to_end(&mut body).unwrap();
+        assert_eq!(body, vec![2, 3, 4]);
+    }
+
+    #[test]
+    fn files_endpoint_head_omits_memory_body() {
+        let store = DownloadStore::new(64 * 1024 * 1024);
+        let served = store.insert("photo.png", vec![1, 2, 3, 4, 5]).unwrap();
+
+        let cfg = WebConfig {
+            enabled: true,
+            readonly: true,
+            bind: "127.0.0.1:0".to_string(),
+            ..WebConfig::default()
+        };
+        let (web_tx, _web_rx) = mpsc::channel();
+        let sender = spawn(&cfg, store, 100, web_tx, true).unwrap();
+
+        let mut stream = TcpStream::connect(sender.local_addr()).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        stream
+            .write_all(
+                format!("HEAD /files/{served} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+                    .as_bytes(),
+            )
+            .unwrap();
+        let headers = read_http_headers(&mut stream);
+        assert!(headers.starts_with("HTTP/1.1 200 OK"), "{headers}");
+        assert!(headers.contains("Content-Length: 5"), "{headers}");
+
+        // A HEAD response carries the length header but no body.
+        let mut body = Vec::new();
+        stream.read_to_end(&mut body).unwrap();
+        assert!(body.is_empty(), "HEAD body should be empty, got {body:?}");
+    }
+
+    #[test]
+    fn files_endpoint_serves_registered_disk_file() {
         let dir = std::env::temp_dir().join(format!("chatt-files-disk-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("doc.txt"), b"hello disk").unwrap();
@@ -1767,12 +1831,44 @@ mod tests {
             ..WebConfig::default()
         };
         let (web_tx, _web_rx) = mpsc::channel();
-        // Empty store plus a persistent dir: a store miss must fall through to
-        // the on-disk mount rather than 404.
+        // A persistent download registered by absolute path is served from disk
+        // wherever it lives, with Range support.
+        let store = DownloadStore::new(64 * 1024 * 1024);
+        store.register_disk("doc.txt".to_string(), dir.join("doc.txt"));
+        let sender = spawn(&cfg, store, 100, web_tx, true).unwrap();
+
+        let mut stream = TcpStream::connect(sender.local_addr()).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        stream
+            .write_all(b"GET /files/doc.txt HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+            .unwrap();
+        let headers = read_http_headers(&mut stream);
+        assert!(headers.starts_with("HTTP/1.1 200 OK"), "{headers}");
+        assert!(headers.contains("Accept-Ranges: bytes"), "{headers}");
+
+        let mut body = Vec::new();
+        stream.read_to_end(&mut body).unwrap();
+        assert_eq!(body, b"hello disk");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn files_endpoint_404s_on_miss() {
+        let cfg = WebConfig {
+            enabled: true,
+            readonly: true,
+            bind: "127.0.0.1:0".to_string(),
+            ..WebConfig::default()
+        };
+        let (web_tx, _web_rx) = mpsc::channel();
+        // An empty store must 404 rather than fall through to the static asset
+        // mount.
         let sender = spawn(
             &cfg,
             DownloadStore::new(64 * 1024 * 1024),
-            Some(dir.clone()),
             100,
             web_tx,
             true,
@@ -1784,16 +1880,10 @@ mod tests {
             .set_read_timeout(Some(Duration::from_secs(2)))
             .unwrap();
         stream
-            .write_all(b"GET /files/doc.txt HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+            .write_all(b"GET /files/missing.txt HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
             .unwrap();
         let headers = read_http_headers(&mut stream);
-        assert!(headers.starts_with("HTTP/1.1 200 OK"), "{headers}");
-
-        let mut body = Vec::new();
-        stream.read_to_end(&mut body).unwrap();
-        assert_eq!(body, b"hello disk");
-
-        let _ = std::fs::remove_dir_all(&dir);
+        assert!(headers.starts_with("HTTP/1.1 404"), "{headers}");
     }
 
     #[test]
@@ -1810,15 +1900,9 @@ mod tests {
             ..WebConfig::default()
         };
         let (web_tx, _web_rx) = mpsc::channel();
-        let sender = spawn(
-            &cfg,
-            DownloadStore::new(64 * 1024 * 1024),
-            Some(dir.clone()),
-            100,
-            web_tx,
-            true,
-        )
-        .unwrap();
+        let store = DownloadStore::new(64 * 1024 * 1024);
+        store.register_disk("large.txt".to_string(), dir.join("large.txt"));
+        let sender = spawn(&cfg, store, 100, web_tx, true).unwrap();
 
         let mut stream = TcpStream::connect(sender.local_addr()).unwrap();
         stream
@@ -1850,7 +1934,6 @@ mod tests {
         let sender = spawn(
             &cfg,
             DownloadStore::new(64 * 1024 * 1024),
-            Some(dir.clone()),
             100,
             web_tx,
             true,
@@ -1911,7 +1994,6 @@ mod tests {
         let sender = spawn(
             &cfg,
             DownloadStore::new(64 * 1024 * 1024),
-            None,
             100,
             web_tx,
             true,
@@ -2039,7 +2121,6 @@ Sec-WebSocket-Version: 13\r\n\
         let sender = spawn(
             &cfg,
             DownloadStore::new(64 * 1024 * 1024),
-            None,
             100,
             web_tx,
             true,
@@ -2082,7 +2163,6 @@ Sec-WebSocket-Version: 13\r\n\
         let sender = spawn(
             &cfg,
             DownloadStore::new(64 * 1024 * 1024),
-            None,
             100,
             web_tx,
             true,
@@ -2135,7 +2215,6 @@ Sec-WebSocket-Version: 13\r\n\
         let sender = spawn(
             &cfg,
             DownloadStore::new(64 * 1024 * 1024),
-            None,
             100,
             web_tx,
             true,
@@ -2196,7 +2275,6 @@ Sec-WebSocket-Version: 13\r\n\
         let sender = spawn(
             &cfg,
             DownloadStore::new(64 * 1024 * 1024),
-            None,
             100,
             web_tx,
             true,
@@ -2242,7 +2320,6 @@ Sec-WebSocket-Version: 13\r\n\
         let sender = spawn(
             &cfg,
             DownloadStore::new(64 * 1024 * 1024),
-            None,
             100,
             web_tx,
             true,
@@ -2278,7 +2355,6 @@ Sec-WebSocket-Version: 13\r\n\
         let sender = spawn(
             &cfg,
             DownloadStore::new(64 * 1024 * 1024),
-            None,
             100,
             web_tx,
             false,
@@ -2309,7 +2385,6 @@ Sec-WebSocket-Version: 13\r\n\
         let sender = spawn(
             &cfg,
             DownloadStore::new(64 * 1024 * 1024),
-            None,
             100,
             web_tx,
             false,
@@ -2335,7 +2410,6 @@ Sec-WebSocket-Version: 13\r\n\
         let sender = spawn(
             &cfg,
             DownloadStore::new(64 * 1024 * 1024),
-            None,
             100,
             web_tx,
             true,
@@ -2361,7 +2435,6 @@ Sec-WebSocket-Version: 13\r\n\
         let sender = spawn(
             &cfg,
             DownloadStore::new(64 * 1024 * 1024),
-            None,
             100,
             web_tx,
             true,
@@ -2387,7 +2460,6 @@ Sec-WebSocket-Version: 13\r\n\
         let sender = spawn(
             &cfg,
             DownloadStore::new(64 * 1024 * 1024),
-            None,
             100,
             web_tx,
             false,
@@ -2433,7 +2505,6 @@ Sec-WebSocket-Version: 13\r\n\
         let sender = spawn(
             &cfg,
             DownloadStore::new(64 * 1024 * 1024),
-            None,
             100,
             web_tx,
             false,
