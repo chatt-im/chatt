@@ -424,6 +424,14 @@ body {
   display: contents;
 }
 
+.media-image, .media-video {
+  border: 6px solid var(--border);
+  border-radius: 2px;
+}
+.media-image:hover {
+  border: 6px solid var(--accent);
+}
+
 .media-image {
   display: block;
   width: auto;
@@ -432,13 +440,11 @@ body {
   max-height: 50vh;
   background: var(--bg);
   cursor: pointer;
-  /* opacity: 0;
-  transition: opacity 0.05s ease; */
 }
 
 /* Revealed on decode (or error) so the image fades in rather than snapping. */
 .media-image.is-loaded {
-  /* opacity: 1; */
+  opacity:1;
 }
 
 /* Video metadata loads async and its intrinsic size is unknown up front, so a
