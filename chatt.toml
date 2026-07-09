@@ -80,11 +80,12 @@ theme = "tomorrow-night"
 # them in a RAM ring buffer (lost on restart, viewable in the web log), and
 # "persistent" saves them under download-dir (empty = platform default dir).
 [files]
-download = "off"
+download = "memory"
 download-dir = ""
-download-memory-bytes = 268435456
-max-download-bytes = 52428800
-max-upload-bytes = 52428800
+# Size fields below are MiB (1024*1024 bytes).
+download-memory-mb = 512
+max-download-mb = 50
+max-upload-mb = 4096
 
 [p2p]
 enabled = false

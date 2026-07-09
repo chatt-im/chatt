@@ -22,6 +22,10 @@ use crate::{
 };
 use rpc::control::DEFAULT_FILE_SIZE_LIMIT_BYTES;
 
+pub const MIB: u64 = 1024 * 1024;
+pub const DEFAULT_FILE_SIZE_LIMIT_MB: u64 = DEFAULT_FILE_SIZE_LIMIT_BYTES / MIB;
+pub const DEFAULT_MAX_UPLOAD_MB: u64 = 4096;
+
 pub const DEFAULT_CONFIG: &str = include_str!("../chatt.toml");
 pub const DEFAULT_MAX_AMPLIFICATION: f32 = crate::audio::DEFAULT_LIVE_MAX_AMPLIFICATION;
 pub const DEFAULT_DENOISE_SUPPRESSION: f32 = crate::audio::DEFAULT_DENOISE_SUPPRESSION;
@@ -98,7 +102,7 @@ impl ServerEntry {
             require_native_encryption: self.require_native_encryption,
             file_policy: config.file_policy(self),
             download_store,
-            max_upload_bytes: config.files.max_upload_bytes,
+            max_upload_bytes: config.files.max_upload_bytes(),
             upload_rate_bytes: config.files.upload_rate_bytes,
             p2p_enabled: config.p2p.enabled,
             candidate_privacy: config.p2p.candidate_privacy,
@@ -393,8 +397,8 @@ pub use DefaultBindings as FormBindings;
 /// full socket speed.
 pub const DEFAULT_UPLOAD_RATE_BYTES: u64 = 0;
 
-/// Default capacity of the in-memory download ring buffer: 256 MiB.
-pub const DEFAULT_DOWNLOAD_MEMORY_BYTES: u64 = 256 * 1024 * 1024;
+/// Default capacity of the in-memory download ring buffer, in MiB.
+pub const DEFAULT_DOWNLOAD_MEMORY_MB: u64 = 512;
 
 /// How received files are handled. The single downloads switch, unified across
 /// the settings UI and the `download` config key.
@@ -402,9 +406,9 @@ pub const DEFAULT_DOWNLOAD_MEMORY_BYTES: u64 = 256 * 1024 * 1024;
 #[toml(FromToml, ToToml, rename_all = "kebab-case")]
 pub enum DownloadMode {
     /// Reject incoming files.
-    #[default]
     Off,
     /// Hold received files in an in-memory ring buffer, never touching disk.
+    #[default]
     Memory,
     /// Write received files to a directory on disk.
     Persistent,
@@ -438,14 +442,14 @@ pub struct FileConfig {
     #[toml(default)]
     pub download_dir: String,
     /// Capacity of the in-memory download ring buffer used by
-    /// [`DownloadMode::Memory`]. One shared store, so this is a single global
-    /// ceiling rather than a per-server or per-room setting.
-    #[toml(default = DEFAULT_DOWNLOAD_MEMORY_BYTES)]
-    pub download_memory_bytes: u64,
-    #[toml(default = DEFAULT_FILE_SIZE_LIMIT_BYTES)]
-    pub max_download_bytes: u64,
-    #[toml(default = DEFAULT_FILE_SIZE_LIMIT_BYTES)]
-    pub max_upload_bytes: u64,
+    /// [`DownloadMode::Memory`], in MiB. One shared store, so this is a single
+    /// global ceiling rather than a per-server or per-room setting.
+    #[toml(default = DEFAULT_DOWNLOAD_MEMORY_MB)]
+    pub download_memory_mb: u64,
+    #[toml(default = DEFAULT_FILE_SIZE_LIMIT_MB)]
+    pub max_download_mb: u64,
+    #[toml(default = DEFAULT_MAX_UPLOAD_MB)]
+    pub max_upload_mb: u64,
     /// Upload pacing ceiling in bytes per second. `0` streams at full socket
     /// speed. Primarily a test lever to stretch a transfer so its progress is
     /// observable, and a mild bandwidth cap.
@@ -456,13 +460,23 @@ pub struct FileConfig {
 impl Default for FileConfig {
     fn default() -> Self {
         Self {
-            download: DownloadMode::Off,
+            download: DownloadMode::Memory,
             download_dir: String::new(),
-            download_memory_bytes: DEFAULT_DOWNLOAD_MEMORY_BYTES,
-            max_download_bytes: DEFAULT_FILE_SIZE_LIMIT_BYTES,
-            max_upload_bytes: DEFAULT_FILE_SIZE_LIMIT_BYTES,
+            download_memory_mb: DEFAULT_DOWNLOAD_MEMORY_MB,
+            max_download_mb: DEFAULT_FILE_SIZE_LIMIT_MB,
+            max_upload_mb: DEFAULT_MAX_UPLOAD_MB,
             upload_rate_bytes: DEFAULT_UPLOAD_RATE_BYTES,
         }
+    }
+}
+
+impl FileConfig {
+    pub fn download_memory_bytes(&self) -> u64 {
+        self.download_memory_mb.checked_mul(MIB).unwrap_or(u64::MAX)
+    }
+
+    pub fn max_upload_bytes(&self) -> u64 {
+        self.max_upload_mb.checked_mul(MIB).unwrap_or(u64::MAX)
     }
 }
 
@@ -655,7 +669,7 @@ pub struct HistoryConfig {
 pub struct FileOverrides {
     pub download: Option<DownloadMode>,
     pub download_dir: Option<String>,
-    pub max_download_bytes: Option<u64>,
+    pub max_download_mb: Option<u64>,
 }
 
 impl FileOverrides {
@@ -1506,12 +1520,12 @@ impl Config {
                 "audio bitrate-bps must be between 8000 and 96000",
             ));
         }
-        if self.files.download_memory_bytes == 0 {
+        if self.files.download_memory_mb == 0 {
             // Memory mode advertises that downloads are active but would reject
             // every non-empty file with a zero-sized ring, so reject it at load
             // the same way the settings UI does.
             out.push(Diag::error(
-                "files download-memory-bytes must be a positive byte count",
+                "files download-memory-mb must be a positive MiB count",
             ));
         }
         if let Err(error) = self.web.bind.parse::<std::net::SocketAddr>() {
@@ -1688,13 +1702,13 @@ impl Config {
                 DownloadTarget::Persistent(dir)
             }
         };
-        let max_download_bytes = room
-            .and_then(|files| files.max_download_bytes)
-            .or(server.files.max_download_bytes)
-            .unwrap_or(self.files.max_download_bytes);
+        let max_download_mb = room
+            .and_then(|files| files.max_download_mb)
+            .or(server.files.max_download_mb)
+            .unwrap_or(self.files.max_download_mb);
         EffectiveFiles {
             target,
-            max_download_bytes,
+            max_download_bytes: max_download_mb.checked_mul(MIB).unwrap_or(u64::MAX),
         }
     }
 
@@ -2285,7 +2299,9 @@ path = "assets/sample-001.opus"
         );
         assert!(!config.p2p.enabled);
         assert!(!config.history.enabled);
-        assert_eq!(config.files.download, DownloadMode::Off);
+        assert_eq!(config.files.download, DownloadMode::Memory);
+        assert_eq!(config.files.download_memory_mb, 512);
+        assert_eq!(config.files.download_memory_bytes(), 512 * MIB);
         assert!(config.files.download_dir.is_empty());
     }
 
@@ -2390,8 +2406,11 @@ server-public-key = ""
         assert!(content.contains("default-bindings = \"standard\""));
         assert!(content.contains("[p2p]\nenabled = false"));
         assert!(content.contains("[history]\nenabled = false"));
-        assert!(content.contains("download = \"off\""));
+        assert!(content.contains("download = \"memory\""));
         assert!(content.contains("download-dir = \"\""));
+        assert!(content.contains("download-memory-mb = 512"));
+        assert!(content.contains("max-download-mb = 50"));
+        assert!(content.contains("max-upload-mb = 4096"));
         assert!(!content.contains("form-bindings"));
     }
 
@@ -2402,7 +2421,7 @@ server-public-key = ""
         server.files = FileOverrides {
             download: Some(DownloadMode::Persistent),
             download_dir: Some("/srv/dl".to_string()),
-            max_download_bytes: None,
+            max_download_mb: None,
         };
         server.history = HistoryOverrides {
             enabled: Some(true),
@@ -2414,7 +2433,7 @@ server-public-key = ""
                 files: FileOverrides {
                     download: None,
                     download_dir: None,
-                    max_download_bytes: Some(104_857_600),
+                    max_download_mb: Some(100),
                 },
                 history: HistoryOverrides::default(),
             },
@@ -2423,7 +2442,7 @@ server-public-key = ""
                 files: FileOverrides {
                     download: Some(DownloadMode::Off),
                     download_dir: None,
-                    max_download_bytes: None,
+                    max_download_mb: None,
                 },
                 history: HistoryOverrides {
                     enabled: Some(false),
@@ -2437,10 +2456,7 @@ server-public-key = ""
         assert!(content.contains("[servers.files]"), "{content}");
         assert!(content.contains("[servers.history]"), "{content}");
         assert!(content.contains("[[servers.rooms]]"), "{content}");
-        assert!(
-            content.contains("max-download-bytes = 104857600"),
-            "{content}"
-        );
+        assert!(content.contains("max-download-mb = 100"), "{content}");
 
         let arena = Arena::new();
         let parsed: Config = toml_spanner::parse(&content, &arena).unwrap().to().unwrap();
@@ -2466,14 +2482,14 @@ server-public-key = ""
         let mut config = Config::default();
         config.files.download = DownloadMode::Persistent;
         config.files.download_dir = "/global/dl".to_string();
-        config.files.max_download_bytes = 100;
+        config.files.max_download_mb = 100;
         config.history.enabled = false;
         config.history.location = None;
         let mut server = ServerEntry::default();
         server.files = FileOverrides {
             download: Some(DownloadMode::Persistent),
             download_dir: Some("/server/dl".to_string()),
-            max_download_bytes: None,
+            max_download_mb: None,
         };
         server.history = HistoryOverrides {
             enabled: None,
@@ -2484,7 +2500,7 @@ server-public-key = ""
             files: FileOverrides {
                 download: None,
                 download_dir: None,
-                max_download_bytes: Some(300),
+                max_download_mb: Some(300),
             },
             history: HistoryOverrides {
                 enabled: Some(true),
@@ -2495,9 +2511,9 @@ server-public-key = ""
     }
 
     #[test]
-    fn zero_download_memory_bytes_is_rejected() {
+    fn zero_download_memory_mb_is_rejected() {
         let mut config = Config::default();
-        config.files.download_memory_bytes = 0;
+        config.files.download_memory_mb = 0;
         let mut diagnostics = Vec::new();
         config.validate(&mut diagnostics);
         let messages = diagnostics
@@ -2508,8 +2524,8 @@ server-public-key = ""
         assert!(
             messages
                 .iter()
-                .any(|message| message.contains("download-memory-bytes")),
-            "expected a download-memory-bytes error, got {messages:?}"
+                .any(|message| message.contains("download-memory-mb")),
+            "expected a download-memory-mb error, got {messages:?}"
         );
     }
 
@@ -2522,21 +2538,21 @@ server-public-key = ""
             global_only.target,
             DownloadTarget::Persistent(PathBuf::from("/global/dl"))
         );
-        assert_eq!(global_only.max_download_bytes, 100);
+        assert_eq!(global_only.max_download_bytes, 100 * MIB);
 
         let server_level = config.effective_files(&server, None);
         assert_eq!(
             server_level.target,
             DownloadTarget::Persistent(PathBuf::from("/server/dl"))
         );
-        assert_eq!(server_level.max_download_bytes, 100);
+        assert_eq!(server_level.max_download_bytes, 100 * MIB);
 
         let room_level = config.effective_files(&server, Some(RoomId(3)));
         assert_eq!(
             room_level.target,
             DownloadTarget::Persistent(PathBuf::from("/server/dl"))
         );
-        assert_eq!(room_level.max_download_bytes, 300);
+        assert_eq!(room_level.max_download_bytes, 300 * MIB);
 
         let unknown_room = config.effective_files(&server, Some(RoomId(9)));
         assert_eq!(unknown_room, server_level);
@@ -2635,7 +2651,7 @@ server-public-key = ""
                 files: FileOverrides {
                     download: Some(DownloadMode::Persistent),
                     download_dir: Some("/a".to_string()),
-                    max_download_bytes: None,
+                    max_download_mb: None,
                 },
                 history: HistoryOverrides::default(),
             },
@@ -2644,7 +2660,7 @@ server-public-key = ""
                 files: FileOverrides {
                     download: Some(DownloadMode::Persistent),
                     download_dir: Some("/b".to_string()),
-                    max_download_bytes: None,
+                    max_download_mb: None,
                 },
                 history: HistoryOverrides::default(),
             },

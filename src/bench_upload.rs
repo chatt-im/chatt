@@ -61,7 +61,7 @@ fn server_config() -> ServerConfig {
     // pin the matching key (see `pinned_server_public_key`).
     config.security.server_identity_seed = dev_server_seed_hex();
     config.security.transport_mode = TransportModeConfig::NativeEncrypted;
-    config.security.max_file_size_bytes = LIMIT_BYTES;
+    config.security.max_file_size_mb = LIMIT_BYTES / crate::config::MIB;
     config.rooms = vec![RoomConfig {
         id: ROOM,
         name: "lobby".to_string(),
