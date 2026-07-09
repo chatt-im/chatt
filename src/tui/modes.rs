@@ -79,7 +79,7 @@ impl WelcomeMode {
     fn handle_output(&mut self, app: &mut App, output: WelcomeOutput) {
         if output.changed {
             let _ = self.form.set_bindings(self.draft.default_bindings);
-            app.apply_theme(self.draft.theme);
+            app.apply_theme(self.draft.theme.clone());
         }
         match output.button {
             Some(WelcomeButton::Save) if app.save_welcome(&self.draft) => {
@@ -604,7 +604,10 @@ impl SettingsSession {
     fn new(app: &App) -> Self {
         let mut draft = SettingsDraft::from_audio(&app.config.audio);
         draft.set_form_bindings_from_config(app.config.ui.default_bindings);
-        draft.set_theme_from_config(app.config.ui.theme);
+        draft.set_theme_from_config(
+            app.config.ui.theme.clone(),
+            app.config.ui.themes.resolved.keys().cloned().collect(),
+        );
         draft.set_web_from_config(&app.config.web);
         draft.set_notifications_from_config(&app.config.notifications);
         draft.set_files_from_config(&app.config.files);

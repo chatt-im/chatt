@@ -55,8 +55,26 @@ placeholder = "Message #lobby"
 max-messages = 50000
 overscan = 24
 default-bindings = "standard"
-# Color theme: "tomorrow-night", "base16-dark", or "base16-light".
+# Color theme: a builtin ("tomorrow-night", "base16-dark", "base16-light") or
+# the name of a custom [ui.themes.<name>] table defined below.
 theme = "tomorrow-night"
+
+# Custom themes start from a builtin `base`, may define palette colors, and
+# override individual style slots. Colors are "#rrggbb" / "#rgb" true-color,
+# "ansi:N" (a 0-255 palette index), or a palette name in slot/syntax values.
+# Each slot takes { fg = "...", bg = "..." } or dotted keys like text.fg; a
+# bare string or integer is shorthand for the foreground. Defining a slot
+# replaces it completely; omitted fg/bg components reset to terminal default.
+# Select one with `theme = "midnight"`.
+# [ui.themes.midnight]
+# base = "tomorrow-night"
+# palette.surface = "#101018"
+# palette.sky = "#88ccff"
+# background.bg = "surface"
+# accent.fg = "sky"
+# status-fill = { fg = "#cccccc", bg = "#202030" }
+# [ui.themes.midnight.syntax]
+# keyword = "#c792ea"
 
 [files]
 max-upload-bytes = 52428800

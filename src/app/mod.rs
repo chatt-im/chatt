@@ -34,7 +34,7 @@ use crate::{
         NetworkClient, NetworkCommand, NetworkEvent, UploadFileRequest, spawn_open_pair_once,
         spawn_pair_once,
     },
-    config::{self, Config, ServerEntry, SoundboardClip, ThemeChoice, validate_server_entry},
+    config::{self, Config, ServerEntry, SoundboardClip, ThemeSelection, validate_server_entry},
     local_control, settings,
     theme::Theme,
     tui::{
@@ -956,7 +956,7 @@ impl App {
     pub(crate) fn new(config: Config, pending_join: Option<PendingJoin>) -> Result<Self, String> {
         let events = AppEvents::new();
         let soundboard_enabled = config.soundboard.enabled;
-        let theme = Theme::from_choice(config.ui.theme);
+        let theme = config.ui.resolve_theme();
         let room = RoomSession::new(&config, &theme);
         let echo_control = Arc::new(EchoCancellationControl::new(config.audio.echo_cancellation));
         let output_volume_percent_bits =
@@ -1076,7 +1076,7 @@ impl App {
             return false;
         }
         draft.apply_to_config(&mut self.config);
-        self.theme = Theme::from_choice(self.config.ui.theme);
+        self.theme = self.config.ui.resolve_theme();
         self.room.apply_theme(&self.theme);
         match self.config.save_runtime() {
             Ok(path) => {
@@ -3290,12 +3290,12 @@ impl App {
     /// buffer restyles its syntax highlighting and the composer editor adopts
     /// the new selection colors. Every other surface reads `self.theme` per
     /// frame, so a field swap is enough for them.
-    pub(crate) fn apply_theme(&mut self, choice: ThemeChoice) {
-        if self.config.ui.theme == choice {
+    pub(crate) fn apply_theme(&mut self, selection: ThemeSelection) {
+        if self.config.ui.theme == selection {
             return;
         }
-        self.config.ui.theme = choice;
-        self.theme = Theme::from_choice(choice);
+        self.config.ui.theme = selection;
+        self.theme = self.config.ui.resolve_theme();
         self.room.apply_theme(&self.theme);
     }
 

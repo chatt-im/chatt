@@ -3,7 +3,7 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::{
     bindings::{self, BindCommand, BindingRuntime},
-    config::{Config, DEFAULT_MAX_AMPLIFICATION, FormBindings, ThemeChoice},
+    config::{Config, DEFAULT_MAX_AMPLIFICATION, FormBindings, ThemeSelection},
     settings::{default_download_path_text, download_path_error, form_bindings_label},
     theme::Theme,
     tui::form::FormState,
@@ -48,7 +48,7 @@ pub(crate) struct WelcomeOutput {
 #[derive(Clone, Debug)]
 pub(crate) struct WelcomeDraft {
     pub(crate) default_bindings: FormBindings,
-    pub(crate) theme: ThemeChoice,
+    pub(crate) theme: ThemeSelection,
     pub(crate) p2p_enabled: bool,
     pub(crate) accept_downloads: bool,
     pub(crate) download_path: String,
@@ -59,7 +59,7 @@ impl WelcomeDraft {
     pub(crate) fn privacy_first() -> Self {
         Self {
             default_bindings: FormBindings::Standard,
-            theme: ThemeChoice::default(),
+            theme: ThemeSelection::default(),
             p2p_enabled: false,
             accept_downloads: false,
             download_path: default_download_path_text(),
@@ -69,7 +69,7 @@ impl WelcomeDraft {
 
     pub(crate) fn apply_to_config(&self, config: &mut Config) {
         config.ui.default_bindings = self.default_bindings;
-        config.ui.theme = self.theme;
+        config.ui.theme = self.theme.clone();
         config.p2p.enabled = self.p2p_enabled;
         config.files.receive_dir = if self.accept_downloads {
             self.download_path.trim().to_string()
@@ -168,6 +168,23 @@ impl<'a> WelcomeForm<'a> {
         response
     }
 
+    fn choice(
+        &mut self,
+        label: &str,
+        index: &mut usize,
+        len: usize,
+        fmt: impl Fn(usize) -> String,
+    ) -> crate::ui::form::Response {
+        let response = self.form.choice(label, index, len, &fmt);
+        if response.changed() {
+            self.output.changed = true;
+        }
+        if response.is_focus() {
+            self.set_option_detail(fmt(*index), None);
+        }
+        response
+    }
+
     fn checkbox(&mut self, label: &str, value: &mut bool) -> crate::ui::form::Response {
         let response = self.form.checkbox(label, value);
         if response.changed() {
@@ -252,12 +269,17 @@ fn welcome_ui(form: &mut WelcomeForm, draft: &mut WelcomeDraft) {
     {
         form.set_help("Keyboard model used by editable controls throughout the interface.");
     }
-    if form
-        .choice_value("Theme", &mut draft.theme, &ThemeChoice::ALL, |theme| {
-            theme.label().to_string()
-        })
-        .is_focus()
-    {
+    // First run has no custom themes yet, so the cycle list is the builtins.
+    let themes = ThemeSelection::cycle_list(&[]);
+    let mut theme_index = themes
+        .iter()
+        .position(|selection| *selection == draft.theme)
+        .unwrap_or(0);
+    let theme_response = form.choice("Theme", &mut theme_index, themes.len(), |index| {
+        themes[index].label()
+    });
+    draft.theme = themes[theme_index].clone();
+    if theme_response.is_focus() {
         form.set_help("Color theme for the terminal interface.");
     }
     if form.checkbox("P2P", &mut draft.p2p_enabled).is_focus() {

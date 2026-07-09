@@ -340,14 +340,67 @@ falls back to the compiled development server key.
 UDP media shares `tcp-addr` by default. Set `udp-addr` only when the server uses
 a separate UDP media address.
 
-The `theme` key under `[ui]` selects the color theme. Valid values are
-`"tomorrow-night"` (the default true-color dark palette), `"base16-dark"`, and
-`"base16-light"`. The base16 themes draw foreground roles from the 16 terminal
-ANSI colors and keep the terminal's own background, so they follow the
-terminal's color scheme. Use `base16-light` on a light terminal and
-`base16-dark` on a dark one. The Theme row in the settings page (`F2`) cycles
-through the themes and applies the change immediately; Save writes it to
-`chatt.toml`.
+The `theme` key under `[ui]` selects the color theme. It may name a builtin —
+`"tomorrow-night"` (the default true-color dark palette), `"base16-dark"`, or
+`"base16-light"` — or a custom theme defined under `[ui.themes.<name>]`. The
+base16 themes draw foreground roles from the 16 terminal ANSI colors and keep
+the terminal's own background, so they follow the terminal's color scheme. Use
+`base16-light` on a light terminal and `base16-dark` on a dark one. The Theme row
+in the settings page (`F2`) cycles through the builtins plus every custom theme
+and applies the change immediately; Save writes the selection to `chatt.toml`.
+
+### Custom themes
+
+Define a custom theme under `[ui.themes.<name>]`. Each starts from a builtin
+`base`, may define a theme-local `palette`, and overrides individual style
+slots; unset slots inherit the base:
+
+```toml
+[ui.themes.midnight]
+base = "tomorrow-night"
+palette.surface = "#101018"
+palette.sky = "#88ccff"
+palette.violet = "#c792ea"
+background.bg = "surface"
+accent.fg = "sky"
+status-fill = { fg = "#cccccc", bg = "#202030" }
+
+[ui.themes.midnight.syntax]
+keyword = "violet"
+
+[ui]
+theme = "midnight"
+```
+
+Colors are `"#rrggbb"` / `"#rgb"` for true color, or `"ansi:N"` (equivalently a
+bare integer `0`–`255`) for a 256-color palette index. Slot and syntax values
+may also name a color from `[ui.themes.<name>.palette]`; palette values
+themselves must be direct colors, not aliases. Each slot takes an inline
+`{ fg = "…", bg = "…" }` table, or the equivalent dotted keys like
+`text.fg = "sky"`; a bare string or integer is shorthand for the foreground.
+Defining a slot replaces the whole base slot, so an omitted `fg` or `bg` resets
+that component to the terminal default (transparent background). Surfaces such
+as `background` normally set `background.bg = "…"`, `{ bg = "…" }`, or `{}` for
+transparent.
+Palette names are theme-local and use the same identifier rules as custom theme
+names, except names that look like color literals (`12`, `ansi:12`, `#fff`) are
+reserved. The overridable slot names match the theme's roles — surfaces
+(`background`, `panel`, `panel-alt`, `detail-panel`, `dialog-panel`, `dialog-header`),
+foreground roles (`text`, `muted`, `subtle`, `accent`, `good`, `warn`, `error`),
+chat lines (`local-line`, `selected-line`, `room-selected`), the status bar
+(`status-fill`, `status-section`), inputs (`join-input-active`,
+`join-input-inactive`, `join-input-boundary-active`), form rows (`row-focused`,
+`selected-focused`), mode badges (`mode-server-select`, `mode-server-edit`,
+`mode-compose`, `mode-log`, `mode-settings`), editor selection
+(`editor-selection-charwise`, `editor-selection-linewise`), and the VU meter
+(`vu-track`, `vu-idle`, and the level zones `vu-low`, `vu-good`, `vu-warn`,
+`vu-peak` — each taking `{ fg, bg }` where `fg` is the glyph/readout color and
+`bg` is the fill). A nested
+`[ui.themes.<name>.syntax]` table overrides syntax colors (`fg`, `type`,
+`function`, `binding`, `namespace`, `keyword`, `string`, `number`, `comment`).
+Custom theme tables are written back verbatim on Save, so their color spellings,
+comments, and key order are preserved. A custom name may not collide with a
+builtin theme name.
 
 Voice receive uses the NetEQ delay manager as the jitter buffer controller. It
 starts at `neteq-start-delay-ms`, clamps the delay target between

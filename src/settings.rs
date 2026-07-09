@@ -5,7 +5,7 @@ use crate::{
         DEFAULT_DENOISE_SUPPRESSION, DEFAULT_DENOISE_TYPING_VAD_ENTER,
         DEFAULT_DENOISE_TYPING_VAD_RELEASE, DEFAULT_INPUT_TARGET_LATENCY,
         DEFAULT_MAX_AMPLIFICATION, DEFAULT_OUTPUT_TARGET_LATENCY, FileConfig, FormBindings,
-        HistoryConfig, NotificationConfig, P2pConfig, ThemeChoice, WebAutoplay, WebConfig,
+        HistoryConfig, NotificationConfig, P2pConfig, ThemeSelection, WebAutoplay, WebConfig,
         output_volume_percent_label, parse_output_volume_percent,
     },
     paths,
@@ -73,7 +73,10 @@ pub struct SettingsDraft {
     pub(crate) peer_join_notification_volume_index: usize,
     pub(crate) peer_leave_notification_volume_index: usize,
     pub(crate) form_bindings: FormBindings,
-    pub(crate) theme: ThemeChoice,
+    pub(crate) theme: ThemeSelection,
+    /// Custom theme names from the config registry, in sorted order. Seeded at
+    /// session start so the Theme row can cycle builtins plus custom themes.
+    pub(crate) theme_names: Vec<String>,
     pub(crate) p2p_enabled: bool,
     pub(crate) accept_downloads: bool,
     pub(crate) download_path: String,
@@ -142,7 +145,8 @@ impl SettingsDraft {
             peer_join_notification_volume_index: notification_volume_index(0.0),
             peer_leave_notification_volume_index: notification_volume_index(0.0),
             form_bindings: FormBindings::Standard,
-            theme: ThemeChoice::default(),
+            theme: ThemeSelection::default(),
+            theme_names: Vec::new(),
             p2p_enabled: P2pConfig::default().enabled,
             accept_downloads: false,
             download_path: default_download_path_text(),
@@ -177,8 +181,9 @@ impl SettingsDraft {
         self.form_bindings = form_bindings;
     }
 
-    pub fn set_theme_from_config(&mut self, theme: ThemeChoice) {
+    pub fn set_theme_from_config(&mut self, theme: ThemeSelection, custom_names: Vec<String>) {
         self.theme = theme;
+        self.theme_names = custom_names;
     }
 
     pub fn set_files_from_config(&mut self, files: &FileConfig) {
@@ -199,8 +204,8 @@ impl SettingsDraft {
         self.history_location = history.location.clone().unwrap_or_default();
     }
 
-    pub fn theme(&self) -> ThemeChoice {
-        self.theme
+    pub fn theme(&self) -> ThemeSelection {
+        self.theme.clone()
     }
 
     pub fn to_audio(&self) -> AudioConfig {
