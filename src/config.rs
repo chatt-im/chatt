@@ -1,10 +1,14 @@
+use extui::{AnsiColor, Color, Rgb};
 use hashbrown::HashSet;
 use rpc::ids::{RoomId, UserId};
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::{fs, time::Duration};
 
 use toml_spanner::Toml;
-use toml_spanner::{Arena, Context, Failed, FromToml, Item, ToToml, ToTomlError};
+use toml_spanner::{
+    Arena, Context, Failed, FromToml, Item, OwnedTable, Table, ToToml, ToTomlError,
+};
 
 use crate::{
     audio::{
@@ -328,7 +332,9 @@ pub struct UiConfig {
     #[toml(default)]
     pub default_bindings: DefaultBindings,
     #[toml(default)]
-    pub theme: ThemeChoice,
+    pub theme: ThemeSelection,
+    #[toml(default, style = Header, ToToml skip_if = ThemesConfig::is_empty)]
+    pub themes: ThemesConfig,
 }
 
 /// The platform default URL opener: `open` on macOS, `xdg-open` on Linux, and
@@ -362,7 +368,8 @@ impl Default for UiConfig {
             max_messages: 50_000,
             overscan: 24,
             default_bindings: DefaultBindings::Standard,
-            theme: ThemeChoice::default(),
+            theme: ThemeSelection::default(),
+            themes: ThemesConfig::default(),
         }
     }
 }
@@ -692,8 +699,9 @@ impl SoundboardConfig {
     }
 }
 
-/// Selects which builtin color theme the UI renders with. A future custom mode
-/// can add a variant (or a sibling `[theme]` table) without breaking configs.
+/// Selects which builtin color theme the UI renders with. Custom user themes
+/// live in the sibling `[ui.themes.<name>]` registry ([`ThemesConfig`]) and are
+/// referenced by name through [`ThemeSelection`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Toml)]
 #[toml(FromToml, ToToml, rename_all = "kebab-case")]
 pub enum ThemeChoice {
@@ -720,6 +728,455 @@ impl ThemeChoice {
             ThemeChoice::Base16Dark => "Base16 Dark",
             ThemeChoice::Base16Light => "Base16 Light",
         }
+    }
+
+    /// The kebab-case config name for this builtin, matching the `rename_all`
+    /// mapping used when serializing `ui.theme` as a plain string.
+    pub fn kebab(self) -> &'static str {
+        match self {
+            ThemeChoice::TomorrowNight => "tomorrow-night",
+            ThemeChoice::Base16Dark => "base16-dark",
+            ThemeChoice::Base16Light => "base16-light",
+        }
+    }
+
+    /// Resolves a builtin from its kebab-case config name, or `None` when the
+    /// name is not a builtin (so it may reference a custom theme).
+    pub fn from_kebab(name: &str) -> Option<Self> {
+        ThemeChoice::ALL
+            .into_iter()
+            .find(|choice| choice.kebab() == name)
+    }
+}
+
+/// A literal color parsed from a custom theme table: `"#rgb"`/`"#rrggbb"` for
+/// true color, or `"ansi:N"` / a bare integer `0..=255` for a 256-color palette
+/// index. Wraps an [`extui::Color`]; only parses (the registry re-serializes
+/// verbatim, see [`ThemesConfig`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ThemeColor(pub Color);
+
+impl<'de> FromToml<'de> for ThemeColor {
+    fn from_toml(ctx: &mut Context<'de>, item: &Item<'de>) -> Result<Self, Failed> {
+        if let Some(text) = item.as_str() {
+            return parse_theme_color(text)
+                .map(ThemeColor)
+                .ok_or_else(|| ctx.report_custom_error(THEME_COLOR_EXPECTED, item));
+        }
+        if let Some(index) = item.as_i64() {
+            return u8::try_from(index)
+                .map(|index| ThemeColor(Color::Ansi(AnsiColor(index))))
+                .map_err(|_| ctx.report_custom_error(THEME_COLOR_EXPECTED, item));
+        }
+        Err(ctx.report_custom_error(THEME_COLOR_EXPECTED, item))
+    }
+}
+
+const THEME_COLOR_EXPECTED: &str =
+    "expected a color: \"#rrggbb\", \"#rgb\", \"ansi:N\", or an integer 0-255";
+
+/// Parses one color string. Returns `None` on any malformed input so the caller
+/// can attach a spanned diagnostic.
+fn parse_theme_color(text: &str) -> Option<Color> {
+    let text = text.trim();
+    if let Some(hex) = text.strip_prefix('#') {
+        return parse_hex_color(hex);
+    }
+    if let Some(index) = text.strip_prefix("ansi:") {
+        return index
+            .trim()
+            .parse::<u8>()
+            .ok()
+            .map(|n| Color::Ansi(AnsiColor(n)));
+    }
+    // A bare integer string is also accepted as a palette index.
+    text.parse::<u8>().ok().map(|n| Color::Ansi(AnsiColor(n)))
+}
+
+/// Parses the hex body after `#`: three nibbles (`rgb`) or six (`rrggbb`).
+fn parse_hex_color(hex: &str) -> Option<Color> {
+    let bytes = hex.as_bytes();
+    match bytes.len() {
+        3 => {
+            let r = hex_nibble(bytes[0])?;
+            let g = hex_nibble(bytes[1])?;
+            let b = hex_nibble(bytes[2])?;
+            Some(Color::Rgb(Rgb(r * 0x11, g * 0x11, b * 0x11)))
+        }
+        6 => {
+            let r = hex_pair(bytes[0], bytes[1])?;
+            let g = hex_pair(bytes[2], bytes[3])?;
+            let b = hex_pair(bytes[4], bytes[5])?;
+            Some(Color::Rgb(Rgb(r, g, b)))
+        }
+        _ => None,
+    }
+}
+
+fn hex_nibble(byte: u8) -> Option<u8> {
+    (byte as char).to_digit(16).map(|value| value as u8)
+}
+
+fn hex_pair(hi: u8, lo: u8) -> Option<u8> {
+    Some(hex_nibble(hi)? << 4 | hex_nibble(lo)?)
+}
+
+/// One full-slot override: an optional foreground and/or background color.
+/// Authored as a bare string (foreground shorthand) or an inline `{ fg, bg }`
+/// table. Omitted components reset to terminal default when applied.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ThemeColorPair {
+    pub fg: Option<ThemeColor>,
+    pub bg: Option<ThemeColor>,
+}
+
+impl ThemeColorPair {
+    fn from_toml_with_palette<'de>(
+        ctx: &mut Context<'de>,
+        item: &Item<'de>,
+        palette: &BTreeMap<String, ThemeColor>,
+    ) -> Result<Self, Failed> {
+        if item.as_str().is_some() || item.as_i64().is_some() {
+            return Ok(ThemeColorPair {
+                fg: Some(theme_color_from_toml(ctx, item, palette)?),
+                bg: None,
+            });
+        }
+        let table = item.require_table(ctx)?;
+        let mut pair = ThemeColorPair::default();
+        for (key, value) in table {
+            match key.name {
+                "fg" => pair.fg = Some(theme_color_from_toml(ctx, value, palette)?),
+                "bg" => pair.bg = Some(theme_color_from_toml(ctx, value, palette)?),
+                _ => {
+                    ctx.report_unexpected_key(0, value, key.span);
+                }
+            }
+        }
+        Ok(pair)
+    }
+}
+
+fn theme_color_from_toml<'de>(
+    ctx: &mut Context<'de>,
+    item: &Item<'de>,
+    palette: &BTreeMap<String, ThemeColor>,
+) -> Result<ThemeColor, Failed> {
+    let Some(text) = item.as_str() else {
+        return ThemeColor::from_toml(ctx, item);
+    };
+    let name = text.trim();
+    if name.is_empty() || is_reserved_theme_palette_name(name) {
+        return ThemeColor::from_toml(ctx, item);
+    }
+    palette
+        .get(name)
+        .copied()
+        .ok_or_else(|| ctx.report_custom_error(format!("unknown palette color {name:?}"), item))
+}
+
+/// One overridable slot in [`crate::theme::Theme`], keyed by its kebab-case
+/// config name. Resolution match-dispatches each parsed entry onto the base
+/// theme in a single pass (see `Theme::resolve`), so lookup stays O(1) per
+/// override rather than scanning the full slot set.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ThemeSlot {
+    Background,
+    Panel,
+    PanelAlt,
+    Text,
+    Muted,
+    Subtle,
+    Accent,
+    Good,
+    Warn,
+    Error,
+    LocalLine,
+    SelectedLine,
+    RoomSelected,
+    StatusFill,
+    StatusSection,
+    JoinInputActive,
+    JoinInputInactive,
+    JoinInputBoundaryActive,
+    RowFocused,
+    SelectedFocused,
+    DetailPanel,
+    DialogPanel,
+    DialogHeader,
+    ModeServerSelect,
+    ModeServerEdit,
+    ModeCompose,
+    ModeLog,
+    ModeSettings,
+    EditorSelectionCharwise,
+    EditorSelectionLinewise,
+    VuTrack,
+    VuIdle,
+    /// A VU meter level zone carrying both its fill background and its
+    /// glyph/readout foreground; the renderer extracts whichever side it needs.
+    VuLow,
+    VuGood,
+    VuWarn,
+    VuPeak,
+}
+
+impl ThemeSlot {
+    /// Maps a kebab-case override key to its slot, or `None` for keys that are
+    /// not style slots (reported as unexpected by the caller).
+    pub fn from_key(key: &str) -> Option<Self> {
+        let slot = match key {
+            "background" => Self::Background,
+            "panel" => Self::Panel,
+            "panel-alt" => Self::PanelAlt,
+            "text" => Self::Text,
+            "muted" => Self::Muted,
+            "subtle" => Self::Subtle,
+            "accent" => Self::Accent,
+            "good" => Self::Good,
+            "warn" => Self::Warn,
+            "error" => Self::Error,
+            "local-line" => Self::LocalLine,
+            "selected-line" => Self::SelectedLine,
+            "room-selected" => Self::RoomSelected,
+            "status-fill" => Self::StatusFill,
+            "status-section" => Self::StatusSection,
+            "join-input-active" => Self::JoinInputActive,
+            "join-input-inactive" => Self::JoinInputInactive,
+            "join-input-boundary-active" => Self::JoinInputBoundaryActive,
+            "row-focused" => Self::RowFocused,
+            "selected-focused" => Self::SelectedFocused,
+            "detail-panel" => Self::DetailPanel,
+            "dialog-panel" => Self::DialogPanel,
+            "dialog-header" => Self::DialogHeader,
+            "mode-server-select" => Self::ModeServerSelect,
+            "mode-server-edit" => Self::ModeServerEdit,
+            "mode-compose" => Self::ModeCompose,
+            "mode-log" => Self::ModeLog,
+            "mode-settings" => Self::ModeSettings,
+            "editor-selection-charwise" => Self::EditorSelectionCharwise,
+            "editor-selection-linewise" => Self::EditorSelectionLinewise,
+            "vu-track" => Self::VuTrack,
+            "vu-idle" => Self::VuIdle,
+            "vu-low" => Self::VuLow,
+            "vu-good" => Self::VuGood,
+            "vu-warn" => Self::VuWarn,
+            "vu-peak" => Self::VuPeak,
+            _ => return None,
+        };
+        Some(slot)
+    }
+}
+
+/// One overridable slot in [`crate::theme::SyntaxTheme`]. Syntax slots are
+/// foreground-only, so each carries a single [`ThemeColor`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SyntaxSlot {
+    Fg,
+    Type,
+    Function,
+    Binding,
+    Namespace,
+    Keyword,
+    String,
+    Number,
+    Comment,
+}
+
+impl SyntaxSlot {
+    pub fn from_key(key: &str) -> Option<Self> {
+        let slot = match key {
+            "fg" => Self::Fg,
+            "type" => Self::Type,
+            "function" => Self::Function,
+            "binding" => Self::Binding,
+            "namespace" => Self::Namespace,
+            "keyword" => Self::Keyword,
+            "string" => Self::String,
+            "number" => Self::Number,
+            "comment" => Self::Comment,
+            _ => return None,
+        };
+        Some(slot)
+    }
+}
+
+/// A user-authored theme: a builtin `base` plus a list of per-slot color
+/// overrides. Parsed into entry lists (not a wide struct or string-keyed map)
+/// so resolution is a single match-dispatch pass, linear in the number of
+/// authored overrides. Parses only; the registry re-serializes verbatim.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct CustomTheme {
+    pub(crate) base: ThemeChoice,
+    pub(crate) palette: BTreeMap<String, ThemeColor>,
+    pub(crate) overrides: Vec<(ThemeSlot, ThemeColorPair)>,
+    pub(crate) syntax: Vec<(SyntaxSlot, ThemeColor)>,
+}
+
+impl<'de> FromToml<'de> for CustomTheme {
+    fn from_toml(ctx: &mut Context<'de>, item: &Item<'de>) -> Result<Self, Failed> {
+        let table = item.require_table(ctx)?;
+        let mut theme = CustomTheme::default();
+        if let Some(palette) = table.get("palette") {
+            theme.parse_palette(ctx, palette);
+        }
+        for (key, value) in table {
+            match key.name {
+                "base" => {
+                    if let Ok(base) = ThemeChoice::from_toml(ctx, value) {
+                        theme.base = base;
+                    }
+                }
+                "palette" => {}
+                "syntax" => theme.parse_syntax(ctx, value),
+                other => {
+                    if let Some(slot) = ThemeSlot::from_key(other) {
+                        if let Ok(pair) =
+                            ThemeColorPair::from_toml_with_palette(ctx, value, &theme.palette)
+                        {
+                            theme.overrides.push((slot, pair));
+                        }
+                    } else {
+                        ctx.report_unexpected_key(0, value, key.span);
+                    }
+                }
+            }
+        }
+        Ok(theme)
+    }
+}
+
+impl CustomTheme {
+    /// Parses the nested `[ui.themes.<name>.palette]` table into direct colors.
+    fn parse_palette<'de>(&mut self, ctx: &mut Context<'de>, item: &Item<'de>) {
+        let Ok(table) = item.require_table(ctx) else {
+            return;
+        };
+        for (key, value) in table {
+            if let Ok(color) = ThemeColor::from_toml(ctx, value) {
+                self.palette.insert(key.name.to_string(), color);
+            }
+        }
+    }
+
+    /// Parses the nested `[ui.themes.<name>.syntax]` table into syntax slots.
+    fn parse_syntax<'de>(&mut self, ctx: &mut Context<'de>, item: &Item<'de>) {
+        let Ok(table) = item.require_table(ctx) else {
+            return;
+        };
+        for (key, value) in table {
+            if let Some(slot) = SyntaxSlot::from_key(key.name) {
+                if let Ok(color) = theme_color_from_toml(ctx, value, &self.palette) {
+                    self.syntax.push((slot, color));
+                }
+            } else {
+                ctx.report_unexpected_key(0, value, key.span);
+            }
+        }
+    }
+}
+
+/// The `[ui.themes.<name>]` registry of user-authored themes.
+///
+/// The typed `resolved` map drives theme resolution; the verbatim `raw` table
+/// is what serializes back out. Storing the raw parse and re-emitting it keeps
+/// a config re-save byte-faithful — the user's exact color spellings, comments,
+/// and key order survive — because `toml-spanner`'s format preservation would
+/// otherwise canonicalize values through the typed round-trip. This mirrors how
+/// [`BindingRuntime`] preserves the `[bindings]` table.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ThemesConfig {
+    pub resolved: BTreeMap<String, CustomTheme>,
+    raw: Option<OwnedTable>,
+}
+
+impl ThemesConfig {
+    pub fn is_empty(&self) -> bool {
+        self.resolved.is_empty()
+    }
+}
+
+impl<'de> FromToml<'de> for ThemesConfig {
+    fn from_toml(ctx: &mut Context<'de>, item: &Item<'de>) -> Result<Self, Failed> {
+        let table = item.require_table(ctx)?;
+        let mut resolved = BTreeMap::new();
+        for (key, value) in table {
+            // Errors are recorded in `ctx`; skip the failing theme and continue
+            // so every malformed theme reports at once.
+            if let Ok(theme) = CustomTheme::from_toml(ctx, value) {
+                resolved.insert(key.name.to_string(), theme);
+            }
+        }
+        Ok(ThemesConfig {
+            resolved,
+            raw: Some(OwnedTable::from(table)),
+        })
+    }
+}
+
+impl ToToml for ThemesConfig {
+    fn to_toml<'a>(&'a self, arena: &'a Arena) -> Result<Item<'a>, ToTomlError> {
+        match &self.raw {
+            Some(raw) => raw.to_toml(arena),
+            // Unreachable in practice: an empty registry is skipped on output
+            // via `skip_if = ThemesConfig::is_empty`.
+            None => Ok(Table::new().into_item()),
+        }
+    }
+}
+
+/// Which theme `ui.theme` selects: a builtin, or a custom theme by name.
+///
+/// Serializes as a plain string (the builtin's kebab name or the custom name),
+/// so it stays a simple scalar that format preservation restyles cleanly.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ThemeSelection {
+    Builtin(ThemeChoice),
+    Custom(String),
+}
+
+impl Default for ThemeSelection {
+    fn default() -> Self {
+        ThemeSelection::Builtin(ThemeChoice::default())
+    }
+}
+
+impl ThemeSelection {
+    /// The display label shown in the settings/welcome Theme row.
+    pub fn label(&self) -> String {
+        match self {
+            ThemeSelection::Builtin(choice) => choice.label().to_string(),
+            ThemeSelection::Custom(name) => name.clone(),
+        }
+    }
+
+    /// The full cycle list: the three builtins followed by `custom_names` in
+    /// order (the registry is a `BTreeMap`, so names arrive sorted).
+    pub fn cycle_list(custom_names: &[String]) -> Vec<ThemeSelection> {
+        ThemeChoice::ALL
+            .into_iter()
+            .map(ThemeSelection::Builtin)
+            .chain(custom_names.iter().cloned().map(ThemeSelection::Custom))
+            .collect()
+    }
+}
+
+impl<'de> FromToml<'de> for ThemeSelection {
+    fn from_toml(ctx: &mut Context<'de>, item: &Item<'de>) -> Result<Self, Failed> {
+        let name = item.require_string(ctx)?;
+        Ok(match ThemeChoice::from_kebab(name) {
+            Some(choice) => ThemeSelection::Builtin(choice),
+            None => ThemeSelection::Custom(name.to_string()),
+        })
+    }
+}
+
+impl ToToml for ThemeSelection {
+    fn to_toml<'a>(&'a self, arena: &'a Arena) -> Result<Item<'a>, ToTomlError> {
+        Ok(match self {
+            ThemeSelection::Builtin(choice) => Item::string(choice.kebab()),
+            ThemeSelection::Custom(name) => Item::string(arena.alloc_str(name)),
+        })
     }
 }
 
@@ -1093,6 +1550,36 @@ impl Config {
         {
             out.push(Diag::error("url-open program must not be empty"));
         }
+        self.validate_themes(out);
+    }
+
+    /// Checks the custom theme registry: names are well-formed and distinct from
+    /// builtins, and palette keys are usable.
+    fn validate_themes(&self, out: &mut Vec<Diag>) {
+        for (name, theme) in &self.ui.themes.resolved {
+            if let Err(error) = validate_server_label(name) {
+                out.push(Diag::error(format!("theme {name}: {error}")));
+            }
+            if ThemeChoice::from_kebab(name).is_some() {
+                out.push(Diag::error(format!(
+                    "theme {name}: name collides with a builtin theme"
+                )));
+            }
+            for palette_name in theme.palette.keys() {
+                if let Err(error) = validate_theme_palette_name(palette_name) {
+                    out.push(Diag::error(format!(
+                        "theme {name} palette {palette_name}: {error}"
+                    )));
+                }
+            }
+        }
+        if let ThemeSelection::Custom(name) = &self.ui.theme
+            && !self.ui.themes.resolved.contains_key(name)
+        {
+            out.push(Diag::error(format!(
+                "ui theme {name:?} is not a builtin or a configured [ui.themes.{name}]"
+            )));
+        }
     }
 
     /// Resolves download settings room > server > global, per field. A `None`
@@ -1456,6 +1943,20 @@ fn validate_non_empty(value: &str, name: &str) -> Result<(), String> {
     }
 }
 
+fn validate_theme_palette_name(name: &str) -> Result<(), String> {
+    if is_reserved_theme_palette_name(name) {
+        return Err("name conflicts with color literal syntax".to_string());
+    }
+    validate_server_label(name)
+}
+
+fn is_reserved_theme_palette_name(name: &str) -> bool {
+    !name.is_empty()
+        && (name.starts_with('#')
+            || name.starts_with("ansi:")
+            || name.bytes().all(|byte| byte.is_ascii_digit()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1655,7 +2156,10 @@ path = "assets/sample-001.opus"
 
         assert_eq!(config.config_path.as_deref(), Some(path.as_path()));
         assert_eq!(config.ui.default_bindings, DefaultBindings::Standard);
-        assert_eq!(config.ui.theme, ThemeChoice::TomorrowNight);
+        assert_eq!(
+            config.ui.theme,
+            ThemeSelection::Builtin(ThemeChoice::TomorrowNight)
+        );
         assert!(!config.p2p.enabled);
         assert!(!config.history.enabled);
         assert!(config.files.receive_dir.is_empty());
@@ -2000,7 +2504,7 @@ server-public-key = ""
             ("[ui]\ntheme = \"base16-light\"\n", ThemeChoice::Base16Light),
         ] {
             let config: Config = toml_spanner::parse(text, &arena).unwrap().to().unwrap();
-            assert_eq!(config.ui.theme, expected);
+            assert_eq!(config.ui.theme, ThemeSelection::Builtin(expected));
         }
     }
 
@@ -2008,19 +2512,303 @@ server-public-key = ""
     fn theme_choice_defaults_to_tomorrow_night() {
         let arena = Arena::new();
         let config: Config = toml_spanner::parse("", &arena).unwrap().to().unwrap();
-        assert_eq!(config.ui.theme, ThemeChoice::TomorrowNight);
+        assert_eq!(
+            config.ui.theme,
+            ThemeSelection::Builtin(ThemeChoice::TomorrowNight)
+        );
     }
 
     #[test]
     fn runtime_config_round_trips_theme() {
         let mut config = Config::default();
-        config.ui.theme = ThemeChoice::Base16Dark;
+        config.ui.theme = ThemeSelection::Builtin(ThemeChoice::Base16Dark);
         let content = render_runtime(&config);
         assert!(content.contains("theme = \"base16-dark\""));
 
         let arena = Arena::new();
         let parsed: Config = toml_spanner::parse(&content, &arena).unwrap().to().unwrap();
-        assert_eq!(parsed.ui.theme, ThemeChoice::Base16Dark);
+        assert_eq!(
+            parsed.ui.theme,
+            ThemeSelection::Builtin(ThemeChoice::Base16Dark)
+        );
+    }
+
+    #[test]
+    fn theme_color_parses_hex_and_ansi_forms() {
+        assert_eq!(
+            parse_theme_color("#8aa6bd"),
+            Some(Color::Rgb(Rgb(0x8a, 0xa6, 0xbd)))
+        );
+        assert_eq!(
+            parse_theme_color("#fff"),
+            Some(Color::Rgb(Rgb(0xff, 0xff, 0xff)))
+        );
+        assert_eq!(
+            parse_theme_color("#ABC"),
+            Some(Color::Rgb(Rgb(0xaa, 0xbb, 0xcc)))
+        );
+        assert_eq!(
+            parse_theme_color("ansi:236"),
+            Some(Color::Ansi(AnsiColor(236)))
+        );
+        assert_eq!(parse_theme_color("12"), Some(Color::Ansi(AnsiColor(12))));
+        assert_eq!(parse_theme_color("#gggggg"), None);
+        assert_eq!(parse_theme_color("#12345"), None);
+        assert_eq!(parse_theme_color("ansi:300"), None);
+        assert_eq!(parse_theme_color("blue"), None);
+    }
+
+    fn direct_color(color: Color) -> ThemeColor {
+        ThemeColor(color)
+    }
+
+    /// Parses a config and returns the resolved [`CustomTheme`] for `name`.
+    fn parse_custom_theme(text: &str, name: &str) -> CustomTheme {
+        let arena = Arena::new();
+        let config: Config = toml_spanner::parse(text, &arena).unwrap().to().unwrap();
+        config.ui.themes.resolved.get(name).cloned().unwrap()
+    }
+
+    #[test]
+    fn custom_theme_parses_base_overrides_and_syntax() {
+        let theme = parse_custom_theme(
+            concat!(
+                "[ui.themes.mine]\n",
+                "base = \"base16-dark\"\n",
+                "text = \"#ffffff\"\n",
+                "status-fill = { fg = \"#cccccc\", bg = \"#202030\" }\n",
+                "[ui.themes.mine.syntax]\n",
+                "keyword = \"#c792ea\"\n",
+            ),
+            "mine",
+        );
+        assert_eq!(theme.base, ThemeChoice::Base16Dark);
+        // A bare string is a foreground-only override.
+        let (slot, pair) = theme
+            .overrides
+            .iter()
+            .find(|(slot, _)| *slot == ThemeSlot::Text)
+            .unwrap();
+        assert_eq!(*slot, ThemeSlot::Text);
+        assert_eq!(
+            pair.fg,
+            Some(direct_color(Color::Rgb(Rgb(0xff, 0xff, 0xff))))
+        );
+        assert_eq!(pair.bg, None);
+        // The table form carries both components.
+        let (_, status) = theme
+            .overrides
+            .iter()
+            .find(|(slot, _)| *slot == ThemeSlot::StatusFill)
+            .unwrap();
+        assert!(status.fg.is_some() && status.bg.is_some());
+        assert_eq!(
+            theme.syntax,
+            vec![(
+                SyntaxSlot::Keyword,
+                direct_color(Color::Rgb(Rgb(0xc7, 0x92, 0xea)))
+            )]
+        );
+    }
+
+    #[test]
+    fn custom_theme_resolves_overrides_over_base() {
+        let theme = parse_custom_theme(
+            concat!(
+                "[ui.themes.mine]\n",
+                "base = \"tomorrow-night\"\n",
+                "accent = \"#010203\"\n",
+            ),
+            "mine",
+        );
+        let resolved = theme.apply_to();
+        let base = crate::theme::Theme::from_choice(ThemeChoice::TomorrowNight);
+        // Overridden slot changed to the requested color.
+        assert_eq!(resolved.accent.fg(), Some(Color::Rgb(Rgb(1, 2, 3))));
+        // Unset slots still match the base builtin.
+        assert_eq!(resolved.text.fg(), base.text.fg());
+        assert_eq!(resolved.background, base.background);
+    }
+
+    #[test]
+    fn custom_theme_slot_override_replaces_entire_style() {
+        let theme = parse_custom_theme(
+            concat!(
+                "[ui.themes.mine]\n",
+                "base = \"tomorrow-night\"\n",
+                "status-fill.fg = \"#010203\"\n",
+            ),
+            "mine",
+        );
+        let resolved = theme.apply_to();
+        let base = crate::theme::Theme::from_choice(ThemeChoice::TomorrowNight);
+
+        assert_eq!(
+            base.status_fill.bg(),
+            Some(Color::Rgb(Rgb(0x30, 0x30, 0x30)))
+        );
+        assert_eq!(resolved.status_fill.fg(), Some(Color::Rgb(Rgb(1, 2, 3))));
+        assert_eq!(resolved.status_fill.bg(), None);
+    }
+
+    #[test]
+    fn custom_theme_resolves_palette_refs_from_dotted_keys() {
+        let theme = parse_custom_theme(
+            concat!(
+                "[ui.themes.mine]\n",
+                "base = \"tomorrow-night\"\n",
+                "text.fg = \"red\"\n",
+                "status-fill.bg = \"red\"\n",
+                "palette.red = \"#ff0000\"\n",
+                "[ui.themes.mine.syntax]\n",
+                "keyword = \"red\"\n",
+            ),
+            "mine",
+        );
+
+        assert_eq!(
+            theme.palette.get("red"),
+            Some(&ThemeColor(Color::Rgb(Rgb(0xff, 0, 0))))
+        );
+        let resolved = theme.apply_to();
+        assert_eq!(resolved.text.fg(), Some(Color::Rgb(Rgb(0xff, 0, 0))));
+        assert_eq!(resolved.status_fill.bg(), Some(Color::Rgb(Rgb(0xff, 0, 0))));
+        assert_eq!(
+            resolved.syntax.keyword.fg(),
+            Some(Color::Rgb(Rgb(0xff, 0, 0)))
+        );
+    }
+
+    #[test]
+    fn custom_theme_accepts_integer_foreground_shorthand() {
+        let theme = parse_custom_theme(concat!("[ui.themes.mine]\n", "accent = 12\n"), "mine");
+        let resolved = theme.apply_to();
+        assert_eq!(resolved.accent.fg(), Some(Color::Ansi(AnsiColor(12))));
+    }
+
+    /// Parses a config allowing errors and returns the accumulated messages.
+    fn parse_diagnostics(text: &str) -> Vec<String> {
+        let arena = Arena::new();
+        let mut doc = toml_spanner::parse_recoverable(text, &arena);
+        let errors = match doc.to_allowing_errors::<Config>() {
+            Ok((_, errors)) => errors,
+            Err(errors) => errors,
+        };
+        errors.errors.iter().map(|err| err.to_string()).collect()
+    }
+
+    #[test]
+    fn custom_theme_rejects_malformed_color() {
+        for value in ["\"#gggggg\"", "\"ansi:300\"", "\"300\"", "300"] {
+            let messages = parse_diagnostics(&format!("[ui.themes.mine]\naccent = {value}\n"));
+            assert!(
+                messages
+                    .iter()
+                    .any(|message| message.contains("expected a color")),
+                "expected a color diagnostic for {value}, got {messages:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn custom_theme_rejects_palette_alias_values() {
+        let messages = parse_diagnostics(concat!(
+            "[ui.themes.mine]\n",
+            "palette.red = \"#ff0000\"\n",
+            "palette.alias = \"red\"\n",
+        ));
+        assert!(
+            messages
+                .iter()
+                .any(|message| message.contains("expected a color")),
+            "expected a color diagnostic, got {messages:?}"
+        );
+    }
+
+    #[test]
+    fn custom_theme_rejects_unknown_palette_references() {
+        let messages = parse_diagnostics(concat!(
+            "[ui.themes.mine]\n",
+            "text.fg = \"missing\"\n",
+            "[ui.themes.mine.syntax]\n",
+            "keyword = \"missing\"\n",
+        ));
+        assert!(
+            messages
+                .iter()
+                .any(|message| message.contains("unknown palette color \"missing\"")),
+            "expected unknown palette diagnostic, got {messages:?}"
+        );
+    }
+
+    #[test]
+    fn theme_validation_rejects_bad_palette_names() {
+        let arena = Arena::new();
+        let config: Config = toml_spanner::parse(
+            concat!(
+                "[ui.themes.mine.palette]\n",
+                "\"12\" = \"#ffffff\"\n",
+                "\"bad name\" = \"#000000\"\n",
+            ),
+            &arena,
+        )
+        .unwrap()
+        .to()
+        .unwrap();
+        let errors = validation_errors(&config);
+        assert!(errors.contains("palette 12"), "{errors}");
+        assert!(errors.contains("color literal syntax"), "{errors}");
+        assert!(errors.contains("palette bad name"), "{errors}");
+    }
+
+    #[test]
+    fn theme_validation_rejects_unknown_reference_and_bad_names() {
+        let arena = Arena::new();
+        let config: Config = toml_spanner::parse(
+            concat!(
+                "[ui]\n",
+                "theme = \"missing\"\n",
+                "[ui.themes.tomorrow-night]\n",
+                "base = \"base16-dark\"\n",
+                "[ui.themes.\"bad name\"]\n",
+                "base = \"base16-dark\"\n",
+            ),
+            &arena,
+        )
+        .unwrap()
+        .to()
+        .unwrap();
+        let errors = validation_errors(&config);
+        assert!(errors.contains("not a builtin or a configured"), "{errors}");
+        assert!(errors.contains("collides with a builtin theme"), "{errors}");
+        assert!(errors.contains("bad name"), "{errors}");
+    }
+
+    #[test]
+    fn runtime_config_preserves_custom_theme_verbatim() {
+        // Non-canonical spellings, an inline comment, and a deliberate key order.
+        let source = concat!(
+            "[ui]\n",
+            "theme = \"mine\"\n",
+            "\n",
+            "[ui.themes.mine]\n",
+            "base = \"tomorrow-night\"\n",
+            "accent = { fg = \"#FFF\" } # my accent\n",
+            "status-fill = { bg = \"#AABBCC\", fg = \"12\" }\n",
+        );
+        let arena = Arena::new();
+        let mut config: Config = toml_spanner::parse(source, &arena).unwrap().to().unwrap();
+        // Change an unrelated setting; the themes table must be untouched.
+        config.ui.room_height = 7;
+        let rendered = config.runtime_toml(source).unwrap();
+        assert!(
+            rendered.contains("accent = { fg = \"#FFF\" } # my accent"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("status-fill = { bg = \"#AABBCC\", fg = \"12\" }"),
+            "{rendered}"
+        );
     }
 
     #[test]

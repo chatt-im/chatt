@@ -148,7 +148,7 @@ pub fn draw_settings_vu_row(
                 let style = if transmitting {
                     level_style(base, db, dbfs(peak), theme)
                 } else {
-                    base.patch(theme.vu_idle_fg)
+                    base.patch(theme.vu_idle)
                 };
                 (format!("{db:>5.1} dB"), style)
             }
@@ -192,12 +192,13 @@ fn draw_vu_meter(
             let covered = filled.saturating_sub(index * 4).min(4);
             // A suppressed level keeps the marker on the faint idle track so it
             // reads as level history, not a live peak.
+            let peak_fg = theme.vu_peak.without_bg();
             let (bg, fg) = if !transmitting {
-                (theme.vu_track, theme.vu_idle_fg)
+                (theme.vu_track, theme.vu_idle)
             } else if covered == 4 {
-                (fill_bg(zone_db, theme), theme.vu_peak_fg)
+                (fill_bg(zone_db, theme), peak_fg)
             } else {
-                (theme.vu_track, theme.vu_peak_fg)
+                (theme.vu_track, peak_fg)
             };
             let style = base.patch(bg).patch(fg).with_modifier(Modifier::BOLD);
             buf.set_stringn(area.x + index as u16, area.y, "▏", 1, style);
@@ -218,7 +219,7 @@ fn meter_cell(
         // still shown but demoted to a faint grey close to the track, so the
         // residual denoiser noise does not read as live speech. Full cells use
         // a block glyph rather than a solid fill for the same reason.
-        let idle = base.patch(track).patch(theme.vu_idle_fg);
+        let idle = base.patch(track).patch(theme.vu_idle);
         return match covered_quarters {
             0 => (" ", base.patch(track)),
             1 => ("▎", idle),
@@ -246,35 +247,37 @@ fn cell_zone_db(index: usize, width: usize) -> f32 {
     FLOOR_DB + (-FLOOR_DB * right_edge)
 }
 
-fn fill_bg(db: f32, theme: &Theme) -> Style {
+/// The combined zone style for a level, carrying both fill background and glyph
+/// foreground. Callers take one side via [`fill_bg`]/[`fill_fg`].
+fn zone_style(db: f32, theme: &Theme) -> Style {
     if db >= PEAK_DB {
-        theme.vu_peak_fill
+        theme.vu_peak
     } else if db >= GOOD_MAX_DB {
-        theme.vu_warn_fill
+        theme.vu_warn
     } else if db >= GOOD_MIN_DB {
-        theme.vu_good_fill
+        theme.vu_good
     } else {
-        theme.vu_low_fill
+        theme.vu_low
     }
 }
 
+/// The fill background for a level: the zone color with its glyph foreground
+/// dropped, so a solid cell paints only the fill.
+fn fill_bg(db: f32, theme: &Theme) -> Style {
+    zone_style(db, theme).without_fg()
+}
+
+/// The glyph foreground for a level: the zone color with its fill background
+/// dropped, so a partial block draws over the track rather than repainting it.
 fn fill_fg(db: f32, theme: &Theme) -> Style {
-    if db >= PEAK_DB {
-        theme.vu_peak_fg
-    } else if db >= GOOD_MAX_DB {
-        theme.vu_warn_fg
-    } else if db >= GOOD_MIN_DB {
-        theme.vu_good_fg
-    } else {
-        theme.vu_low_fg
-    }
+    zone_style(db, theme).without_bg()
 }
 
 fn level_style(base: Style, rms_db: f32, peak_db: f32, theme: &Theme) -> Style {
     if peak_db >= PEAK_DB {
         base.patch(theme.error).with_modifier(Modifier::BOLD)
     } else if rms_db < LOW_DB {
-        base.patch(theme.vu_low_fg)
+        base.patch(theme.vu_low.without_bg())
     } else if (GOOD_MIN_DB..=GOOD_MAX_DB).contains(&rms_db) {
         base.patch(theme.good)
     } else {
@@ -366,7 +369,7 @@ mod tests {
         assert_eq!(meter_cell(4, Style::DEFAULT, -30.0, false, &theme).0, "█");
         assert_eq!(
             meter_cell(4, Style::DEFAULT, -30.0, false, &theme).1,
-            Style::DEFAULT.patch(theme.vu_track).patch(theme.vu_idle_fg)
+            Style::DEFAULT.patch(theme.vu_track).patch(theme.vu_idle)
         );
     }
 }

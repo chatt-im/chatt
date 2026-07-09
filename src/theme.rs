@@ -2,7 +2,10 @@ use extui::{AnsiColor, Style};
 use extui_editor::{EditorTheme, SelectionTheme};
 use tinyhl::RenderSpan;
 
-use crate::config::ThemeChoice;
+use crate::config::{
+    CustomTheme, SyntaxSlot, ThemeChoice, ThemeColorPair, ThemeSelection, ThemeSlot, ThemesConfig,
+    UiConfig,
+};
 use crate::highlight::{HlClass, classify_span};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -76,15 +79,14 @@ pub struct Theme {
     pub vu_track: Style,
     /// Fill color while the mic level is shown but not being transmitted
     /// (silence-gated or muted): a dim grey close to the track, per theme.
-    pub vu_idle_fg: Style,
-    pub vu_low_fill: Style,
-    pub vu_low_fg: Style,
-    pub vu_good_fill: Style,
-    pub vu_good_fg: Style,
-    pub vu_warn_fill: Style,
-    pub vu_warn_fg: Style,
-    pub vu_peak_fill: Style,
-    pub vu_peak_fg: Style,
+    pub vu_idle: Style,
+    /// Per-level VU zone colors. Each carries both the fill background and the
+    /// glyph/readout foreground for that zone; the renderer extracts whichever
+    /// side it needs (`without_fg` for the fill, `without_bg` for the glyph).
+    pub vu_low: Style,
+    pub vu_good: Style,
+    pub vu_warn: Style,
+    pub vu_peak: Style,
     // Syntax highlighting.
     pub syntax: SyntaxTheme,
 }
@@ -96,6 +98,21 @@ impl Theme {
             ThemeChoice::TomorrowNight => Self::tomorrow_night(),
             ThemeChoice::Base16Dark => Self::base16_dark(),
             ThemeChoice::Base16Light => Self::base16_light(),
+        }
+    }
+
+    /// Resolves the live theme from a selection and the custom-theme registry.
+    ///
+    /// A builtin resolves directly; a custom name resolves its registry entry
+    /// (falling back to the default builtin if the name is missing, which
+    /// validation already rejects at load).
+    pub fn resolve(selection: &ThemeSelection, themes: &ThemesConfig) -> Self {
+        match selection {
+            ThemeSelection::Builtin(choice) => Self::from_choice(*choice),
+            ThemeSelection::Custom(name) => match themes.resolved.get(name) {
+                Some(custom) => custom.apply_to(),
+                None => Self::from_choice(ThemeChoice::default()),
+            },
         }
     }
 
@@ -167,15 +184,19 @@ impl Theme {
             editor_selection_charwise: d.with_bg_rgb(0x4b, 0x3f, 0x61),
             editor_selection_linewise: d.with_bg_rgb(0x3a, 0x3a, 0x3a),
             vu_track: d.with_bg_rgb(0x22, 0x22, 0x22),
-            vu_idle_fg: d.with_fg_ansi(AnsiColor::Grey[7]),
-            vu_low_fill: d.with_bg_rgb(0x3f, 0x5f, 0x75),
-            vu_low_fg: d.with_fg_rgb(0x5d, 0x86, 0xa1),
-            vu_good_fill: d.with_bg_rgb(0x45, 0x78, 0x4e),
-            vu_good_fg: d.with_fg_rgb(0x8f, 0xd0, 0x88),
-            vu_warn_fill: d.with_bg_rgb(0x8a, 0x6a, 0x35),
-            vu_warn_fg: d.with_fg_rgb(0xe6, 0xc3, 0x84),
-            vu_peak_fill: d.with_bg_rgb(0x8a, 0x35, 0x3d),
-            vu_peak_fg: d.with_fg_rgb(0xff, 0x66, 0x6f),
+            vu_idle: d.with_fg_ansi(AnsiColor::Grey[7]),
+            vu_low: d
+                .with_bg_rgb(0x3f, 0x5f, 0x75)
+                .with_fg_rgb(0x5d, 0x86, 0xa1),
+            vu_good: d
+                .with_bg_rgb(0x45, 0x78, 0x4e)
+                .with_fg_rgb(0x8f, 0xd0, 0x88),
+            vu_warn: d
+                .with_bg_rgb(0x8a, 0x6a, 0x35)
+                .with_fg_rgb(0xe6, 0xc3, 0x84),
+            vu_peak: d
+                .with_bg_rgb(0x8a, 0x35, 0x3d)
+                .with_fg_rgb(0xff, 0x66, 0x6f),
             syntax: SyntaxTheme {
                 fg: d.with_fg_rgb(0xbd, 0xc0, 0xbe),
                 type_: d.with_fg_rgb(0xeb, 0xc7, 0x82),
@@ -249,15 +270,11 @@ impl Theme {
             editor_selection_charwise: d.with_bg_ansi(AnsiColor::Grey[6]),
             editor_selection_linewise: d.with_bg_ansi(AnsiColor::Grey[4]),
             vu_track: d.with_bg_ansi(AnsiColor::Grey[2]),
-            vu_idle_fg: d.with_fg_ansi(AnsiColor::Grey[7]),
-            vu_low_fill: d.with_bg_ansi(AnsiColor(4)),
-            vu_low_fg: d.with_fg_ansi(blue),
-            vu_good_fill: d.with_bg_ansi(AnsiColor(2)),
-            vu_good_fg: d.with_fg_ansi(green),
-            vu_warn_fill: d.with_bg_ansi(AnsiColor(3)),
-            vu_warn_fg: d.with_fg_ansi(yellow),
-            vu_peak_fill: d.with_bg_ansi(AnsiColor(1)),
-            vu_peak_fg: d.with_fg_ansi(red),
+            vu_idle: d.with_fg_ansi(AnsiColor::Grey[7]),
+            vu_low: d.with_bg_ansi(AnsiColor(4)).with_fg_ansi(blue),
+            vu_good: d.with_bg_ansi(AnsiColor(2)).with_fg_ansi(green),
+            vu_warn: d.with_bg_ansi(AnsiColor(3)).with_fg_ansi(yellow),
+            vu_peak: d.with_bg_ansi(AnsiColor(1)).with_fg_ansi(red),
             syntax: SyntaxTheme {
                 fg: d.with_fg_ansi(white),
                 type_: d.with_fg_ansi(yellow),
@@ -318,15 +335,11 @@ impl Theme {
             editor_selection_charwise: d.with_bg_ansi(AnsiColor::Grey[24]),
             editor_selection_linewise: d.with_bg_ansi(AnsiColor::Grey[27]),
             vu_track: d.with_bg_ansi(AnsiColor::Grey[28]),
-            vu_idle_fg: d.with_fg_ansi(AnsiColor::Grey[23]),
-            vu_low_fill: d.with_bg_ansi(blue),
-            vu_low_fg: d.with_fg_ansi(blue),
-            vu_good_fill: d.with_bg_ansi(green),
-            vu_good_fg: d.with_fg_ansi(green),
-            vu_warn_fill: d.with_bg_ansi(yellow),
-            vu_warn_fg: d.with_fg_ansi(yellow),
-            vu_peak_fill: d.with_bg_ansi(red),
-            vu_peak_fg: d.with_fg_ansi(red),
+            vu_idle: d.with_fg_ansi(AnsiColor::Grey[23]),
+            vu_low: d.with_bg_ansi(blue).with_fg_ansi(blue),
+            vu_good: d.with_bg_ansi(green).with_fg_ansi(green),
+            vu_warn: d.with_bg_ansi(yellow).with_fg_ansi(yellow),
+            vu_peak: d.with_bg_ansi(red).with_fg_ansi(red),
             syntax: SyntaxTheme {
                 fg: d.with_fg_ansi(black),
                 type_: d.with_fg_ansi(yellow),
@@ -338,6 +351,48 @@ impl Theme {
                 number: d.with_fg_ansi(yellow),
                 comment: d.with_fg_ansi(grey),
             },
+        }
+    }
+
+    /// The mutable style slot for one [`ThemeSlot`], used to apply overrides.
+    fn slot_mut(&mut self, slot: ThemeSlot) -> &mut Style {
+        match slot {
+            ThemeSlot::Background => &mut self.background,
+            ThemeSlot::Panel => &mut self.panel,
+            ThemeSlot::PanelAlt => &mut self.panel_alt,
+            ThemeSlot::Text => &mut self.text,
+            ThemeSlot::Muted => &mut self.muted,
+            ThemeSlot::Subtle => &mut self.subtle,
+            ThemeSlot::Accent => &mut self.accent,
+            ThemeSlot::Good => &mut self.good,
+            ThemeSlot::Warn => &mut self.warn,
+            ThemeSlot::Error => &mut self.error,
+            ThemeSlot::LocalLine => &mut self.local_line,
+            ThemeSlot::SelectedLine => &mut self.selected_line,
+            ThemeSlot::RoomSelected => &mut self.room_selected,
+            ThemeSlot::StatusFill => &mut self.status_fill,
+            ThemeSlot::StatusSection => &mut self.status_section,
+            ThemeSlot::JoinInputActive => &mut self.join_input_active,
+            ThemeSlot::JoinInputInactive => &mut self.join_input_inactive,
+            ThemeSlot::JoinInputBoundaryActive => &mut self.join_input_boundary_active,
+            ThemeSlot::RowFocused => &mut self.row_focused,
+            ThemeSlot::SelectedFocused => &mut self.selected_focused,
+            ThemeSlot::DetailPanel => &mut self.detail_panel,
+            ThemeSlot::DialogPanel => &mut self.dialog_panel,
+            ThemeSlot::DialogHeader => &mut self.dialog_header,
+            ThemeSlot::ModeServerSelect => &mut self.mode_server_select,
+            ThemeSlot::ModeServerEdit => &mut self.mode_server_edit,
+            ThemeSlot::ModeCompose => &mut self.mode_compose,
+            ThemeSlot::ModeLog => &mut self.mode_log,
+            ThemeSlot::ModeSettings => &mut self.mode_settings,
+            ThemeSlot::EditorSelectionCharwise => &mut self.editor_selection_charwise,
+            ThemeSlot::EditorSelectionLinewise => &mut self.editor_selection_linewise,
+            ThemeSlot::VuTrack => &mut self.vu_track,
+            ThemeSlot::VuIdle => &mut self.vu_idle,
+            ThemeSlot::VuLow => &mut self.vu_low,
+            ThemeSlot::VuGood => &mut self.vu_good,
+            ThemeSlot::VuWarn => &mut self.vu_warn,
+            ThemeSlot::VuPeak => &mut self.vu_peak,
         }
     }
 
@@ -422,5 +477,167 @@ impl SyntaxTheme {
             HlClass::Comment | HlClass::DocComment => self.comment,
             HlClass::Blockquote | HlClass::ListMarker | HlClass::Emphasis => self.fg,
         }
+    }
+
+    /// The mutable foreground slot for one [`SyntaxSlot`].
+    fn slot_mut(&mut self, slot: SyntaxSlot) -> &mut Style {
+        match slot {
+            SyntaxSlot::Fg => &mut self.fg,
+            SyntaxSlot::Type => &mut self.type_,
+            SyntaxSlot::Function => &mut self.function,
+            SyntaxSlot::Binding => &mut self.binding,
+            SyntaxSlot::Namespace => &mut self.namespace,
+            SyntaxSlot::Keyword => &mut self.keyword,
+            SyntaxSlot::String => &mut self.string,
+            SyntaxSlot::Number => &mut self.number,
+            SyntaxSlot::Comment => &mut self.comment,
+        }
+    }
+}
+
+impl CustomTheme {
+    /// Resolves this custom theme to a live [`Theme`]: start from the builtin
+    /// `base`, then apply each parsed override in a single pass. Linear in the
+    /// number of authored overrides — each slot is an O(1) match dispatch.
+    pub fn apply_to(&self) -> Theme {
+        let mut theme = Theme::from_choice(self.base);
+        for (slot, pair) in &self.overrides {
+            let cell = theme.slot_mut(*slot);
+            *cell = apply_pair(pair);
+        }
+        for (slot, color) in &self.syntax {
+            let cell = theme.syntax.slot_mut(*slot);
+            *cell = cell.with_fg(color.0);
+        }
+        theme
+    }
+}
+
+impl UiConfig {
+    /// The live [`Theme`] for the configured selection and custom registry.
+    pub fn resolve_theme(&self) -> Theme {
+        Theme::resolve(&self.theme, &self.themes)
+    }
+}
+
+/// Converts a slot override into a full replacement style. Omitted foreground
+/// and background components reset to the terminal default instead of inheriting
+/// from the base theme.
+fn apply_pair(pair: &ThemeColorPair) -> Style {
+    let mut style = Style::default();
+    if let Some(fg) = pair.fg {
+        style = style.with_fg(fg.0);
+    }
+    if let Some(bg) = pair.bg {
+        style = style.with_bg(bg.0);
+    }
+    style
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+
+    use extui::{Color, Rgb};
+
+    use super::*;
+    use crate::config::ThemeColor;
+
+    fn pair(index: u8) -> ThemeColorPair {
+        ThemeColorPair {
+            fg: Some(ThemeColor(Color::Rgb(Rgb(index, 0, 0)))),
+            bg: Some(ThemeColor(Color::Rgb(Rgb(0, index, 0)))),
+        }
+    }
+
+    fn style(index: u8) -> Style {
+        Style::default()
+            .with_fg_rgb(index, 0, 0)
+            .with_bg_rgb(0, index, 0)
+    }
+
+    #[test]
+    fn every_theme_field_has_a_configurable_slot() {
+        let custom = CustomTheme {
+            base: ThemeChoice::TomorrowNight,
+            palette: BTreeMap::new(),
+            overrides: vec![
+                (ThemeSlot::Background, pair(1)),
+                (ThemeSlot::Panel, pair(2)),
+                (ThemeSlot::PanelAlt, pair(3)),
+                (ThemeSlot::Text, pair(4)),
+                (ThemeSlot::Muted, pair(5)),
+                (ThemeSlot::Subtle, pair(6)),
+                (ThemeSlot::Accent, pair(7)),
+                (ThemeSlot::Good, pair(8)),
+                (ThemeSlot::Warn, pair(9)),
+                (ThemeSlot::Error, pair(10)),
+                (ThemeSlot::LocalLine, pair(11)),
+                (ThemeSlot::SelectedLine, pair(12)),
+                (ThemeSlot::RoomSelected, pair(13)),
+                (ThemeSlot::StatusFill, pair(14)),
+                (ThemeSlot::StatusSection, pair(15)),
+                (ThemeSlot::JoinInputActive, pair(16)),
+                (ThemeSlot::JoinInputInactive, pair(17)),
+                (ThemeSlot::JoinInputBoundaryActive, pair(18)),
+                (ThemeSlot::RowFocused, pair(19)),
+                (ThemeSlot::SelectedFocused, pair(20)),
+                (ThemeSlot::DetailPanel, pair(21)),
+                (ThemeSlot::DialogPanel, pair(22)),
+                (ThemeSlot::DialogHeader, pair(23)),
+                (ThemeSlot::ModeServerSelect, pair(24)),
+                (ThemeSlot::ModeServerEdit, pair(25)),
+                (ThemeSlot::ModeCompose, pair(26)),
+                (ThemeSlot::ModeLog, pair(27)),
+                (ThemeSlot::ModeSettings, pair(28)),
+                (ThemeSlot::EditorSelectionCharwise, pair(29)),
+                (ThemeSlot::EditorSelectionLinewise, pair(30)),
+                (ThemeSlot::VuTrack, pair(31)),
+                (ThemeSlot::VuIdle, pair(32)),
+                (ThemeSlot::VuLow, pair(33)),
+                (ThemeSlot::VuGood, pair(34)),
+                (ThemeSlot::VuWarn, pair(35)),
+                (ThemeSlot::VuPeak, pair(36)),
+            ],
+            syntax: Vec::new(),
+        };
+
+        let theme = custom.apply_to();
+        assert_eq!(theme.background, style(1));
+        assert_eq!(theme.panel, style(2));
+        assert_eq!(theme.panel_alt, style(3));
+        assert_eq!(theme.text, style(4));
+        assert_eq!(theme.muted, style(5));
+        assert_eq!(theme.subtle, style(6));
+        assert_eq!(theme.accent, style(7));
+        assert_eq!(theme.good, style(8));
+        assert_eq!(theme.warn, style(9));
+        assert_eq!(theme.error, style(10));
+        assert_eq!(theme.local_line, style(11));
+        assert_eq!(theme.selected_line, style(12));
+        assert_eq!(theme.room_selected, style(13));
+        assert_eq!(theme.status_fill, style(14));
+        assert_eq!(theme.status_section, style(15));
+        assert_eq!(theme.join_input_active, style(16));
+        assert_eq!(theme.join_input_inactive, style(17));
+        assert_eq!(theme.join_input_boundary_active, style(18));
+        assert_eq!(theme.row_focused, style(19));
+        assert_eq!(theme.selected_focused, style(20));
+        assert_eq!(theme.detail_panel, style(21));
+        assert_eq!(theme.dialog_panel, style(22));
+        assert_eq!(theme.dialog_header, style(23));
+        assert_eq!(theme.mode_server_select, style(24));
+        assert_eq!(theme.mode_server_edit, style(25));
+        assert_eq!(theme.mode_compose, style(26));
+        assert_eq!(theme.mode_log, style(27));
+        assert_eq!(theme.mode_settings, style(28));
+        assert_eq!(theme.editor_selection_charwise, style(29));
+        assert_eq!(theme.editor_selection_linewise, style(30));
+        assert_eq!(theme.vu_track, style(31));
+        assert_eq!(theme.vu_idle, style(32));
+        assert_eq!(theme.vu_low, style(33));
+        assert_eq!(theme.vu_good, style(34));
+        assert_eq!(theme.vu_warn, style(35));
+        assert_eq!(theme.vu_peak, style(36));
     }
 }

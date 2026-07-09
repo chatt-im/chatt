@@ -1,5 +1,5 @@
 use crate::audio::{DenoiseConfig, DredConfig};
-use crate::config::{FormBindings, ThemeChoice};
+use crate::config::{FormBindings, ThemeSelection};
 use crate::{
     audio::StatsSnapshot,
     bindings::{self, BindCommand, BindingRuntime},
@@ -666,12 +666,16 @@ fn settings_ui(
     {
         form.set_help("Keyboard model used by editable controls throughout the interface.");
     }
-    if form
-        .choice_value("Theme", &mut draft.theme, &ThemeChoice::ALL, |theme| {
-            theme.label().to_string()
-        })
-        .is_focus()
-    {
+    let themes = ThemeSelection::cycle_list(&draft.theme_names);
+    let mut theme_index = themes
+        .iter()
+        .position(|selection| *selection == draft.theme)
+        .unwrap_or(0);
+    let theme_response = form.choice("Theme", &mut theme_index, themes.len(), |index| {
+        themes[index].label()
+    });
+    draft.theme = themes[theme_index].clone();
+    if theme_response.is_focus() {
         form.set_help("Color theme for the interface. Applies immediately; Save persists it.");
     }
 

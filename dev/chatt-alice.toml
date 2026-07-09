@@ -13,7 +13,85 @@ max-composer-height = 6
 max-messages = 50000
 overscan = 24
 default-bindings = "standard"
-theme = "tomorrow-night"
+theme = "catppuccin-frappe"
+
+[ui.themes.catppuccin-frappe]
+base = "tomorrow-night"
+palette.rosewater = "#f2d5cf"
+palette.flamingo = "#eebebe"
+palette.pink = "#f4b8e4"
+palette.mauve = "#ca9ee6"
+palette.red = "#e78284"
+palette.maroon = "#ea999c"
+palette.peach = "#ef9f76"
+palette.yellow = "#e5c890"
+palette.green = "#a6d189"
+palette.teal = "#81c8be"
+palette.sky = "#99d1db"
+palette.sapphire = "#85c1dc"
+palette.blue = "#8caaee"
+palette.lavender = "#babbf1"
+palette.text = "#c6d0f5"
+palette.subtext1 = "#b5bfe2"
+palette.subtext0 = "#a5adce"
+palette.overlay2 = "#949cbb"
+palette.overlay1 = "#838ba7"
+palette.overlay0 = "#737994"
+palette.selection = "#44495d"
+palette.surface2 = "#626880"
+palette.surface1 = "#51576d"
+palette.surface0 = "#414559"
+palette.base = "#303446"
+palette.mantle = "#292c3c"
+palette.crust = "#232634"
+
+background = {}
+panel.bg = "crust"
+panel-alt = {}
+text.fg = "text"
+muted.fg = "subtext1"
+subtle.fg = "overlay1"
+accent.fg = "blue"
+good.fg = "green"
+warn.fg = "yellow"
+error.fg = "red"
+local-line = {}
+selected-line.bg = "selection"
+room-selected = { fg = "text", bg = "selection" }
+status-fill = { fg = "subtext1", bg = "mantle" }
+status-section = { fg = "subtext0", bg = "mantle" }
+join-input-active = { fg = "text", bg = "surface0" }
+join-input-inactive = { fg = "subtext0", bg = "mantle" }
+join-input-boundary-active = { fg = "base", bg = "rosewater" }
+row-focused = { fg = "text", bg = "surface0" }
+selected-focused = { fg = "text", bg = "selection" }
+detail-panel.bg = "mantle"
+dialog-panel = { fg = "text", bg = "crust" }
+dialog-header = { fg = "base", bg = "mauve" }
+mode-server-select = { fg = "base", bg = "lavender" }
+mode-server-edit = { fg = "base", bg = "peach" }
+mode-compose = { fg = "base", bg = "green" }
+mode-log = { fg = "base", bg = "blue" }
+mode-settings = { fg = "base", bg = "mauve" }
+editor-selection-charwise = { fg = "text", bg = "selection" }
+editor-selection-linewise.bg = "selection"
+vu-track.bg = "surface0"
+vu-idle.fg = "overlay0"
+vu-low = { fg = "teal", bg = "teal" }
+vu-good = { fg = "green", bg = "green" }
+vu-warn = { fg = "yellow", bg = "yellow" }
+vu-peak = { fg = "red", bg = "red" }
+
+[ui.themes.catppuccin-frappe.syntax]
+fg = "text"
+type = "yellow"
+function = "blue"
+binding = "maroon"
+namespace = "teal"
+keyword = "mauve"
+string = "green"
+number = "peach"
+comment = "overlay2"
 
 [files]
 receive-dir = "/tmp/chatt-alice"
