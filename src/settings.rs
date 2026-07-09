@@ -4,9 +4,9 @@ use crate::{
         AudioConfig, AudioLatencyConfig, BufferSize, DEFAULT_DENOISE_RELEASE,
         DEFAULT_DENOISE_SUPPRESSION, DEFAULT_DENOISE_TYPING_VAD_ENTER,
         DEFAULT_DENOISE_TYPING_VAD_RELEASE, DEFAULT_INPUT_TARGET_LATENCY,
-        DEFAULT_MAX_AMPLIFICATION, DEFAULT_OUTPUT_TARGET_LATENCY, FileConfig, FormBindings,
-        HistoryConfig, NotificationConfig, P2pConfig, ThemeSelection, WebAutoplay, WebConfig,
-        output_volume_percent_label, parse_output_volume_percent,
+        DEFAULT_MAX_AMPLIFICATION, DEFAULT_OUTPUT_TARGET_LATENCY, DownloadMode, FileConfig,
+        FormBindings, HistoryConfig, NotificationConfig, P2pConfig, ThemeSelection, WebAutoplay,
+        WebConfig, output_volume_percent_label, parse_output_volume_percent,
     },
     paths,
     ui::select::{FuzzySelect, SelectableItem},
@@ -78,8 +78,11 @@ pub struct SettingsDraft {
     /// session start so the Theme row can cycle builtins plus custom themes.
     pub(crate) theme_names: Vec<String>,
     pub(crate) p2p_enabled: bool,
-    pub(crate) accept_downloads: bool,
+    pub(crate) download_mode: DownloadMode,
     pub(crate) download_path: String,
+    /// The in-memory download ring-buffer size, editable as a `K`/`M`/`G` byte
+    /// count. Shown only in [`DownloadMode::Memory`].
+    pub(crate) download_memory_bytes: String,
     pub(crate) history_enabled: bool,
     /// Base directory for persisted history; empty means the platform default.
     pub(crate) history_location: String,
@@ -148,8 +151,11 @@ impl SettingsDraft {
             theme: ThemeSelection::default(),
             theme_names: Vec::new(),
             p2p_enabled: P2pConfig::default().enabled,
-            accept_downloads: false,
+            download_mode: DownloadMode::default(),
             download_path: default_download_path_text(),
+            download_memory_bytes: byte_limit_text(Some(
+                FileConfig::default().download_memory_bytes,
+            )),
             history_enabled: HistoryConfig::default().enabled,
             history_location: String::new(),
             denoise: config.denoise,
@@ -187,12 +193,13 @@ impl SettingsDraft {
     }
 
     pub fn set_files_from_config(&mut self, files: &FileConfig) {
-        self.accept_downloads = files.receive_dir_path().is_some();
-        self.download_path = if files.receive_dir.trim().is_empty() {
+        self.download_mode = files.download;
+        self.download_path = if files.download_dir.trim().is_empty() {
             default_download_path_text()
         } else {
-            files.receive_dir.clone()
+            files.download_dir.clone()
         };
+        self.download_memory_bytes = byte_limit_text(Some(files.download_memory_bytes));
     }
 
     pub fn set_p2p_from_config(&mut self, p2p: &P2pConfig) {
@@ -254,11 +261,13 @@ impl SettingsDraft {
 
     pub fn to_files(&self, previous: &FileConfig) -> FileConfig {
         let mut files = previous.clone();
-        files.receive_dir = if self.accept_downloads {
-            self.download_path.trim().to_string()
-        } else {
-            String::new()
-        };
+        files.download = self.download_mode;
+        if self.download_mode == DownloadMode::Persistent {
+            files.download_dir = self.download_path.trim().to_string();
+        }
+        if let Some(bytes) = parse_byte_size(self.download_memory_bytes.trim()) {
+            files.download_memory_bytes = bytes;
+        }
         files
     }
 
@@ -326,7 +335,17 @@ impl SettingsDraft {
         self.device_string_invalid()
             .or_else(|| output_volume_field_error(&self.output_volume))
             .or_else(|| web_bind_error(&self.web_bind))
-            .or_else(|| download_path_error(self.accept_downloads, &self.download_path))
+            .or_else(|| {
+                download_path_error(
+                    self.download_mode == DownloadMode::Persistent,
+                    &self.download_path,
+                )
+            })
+            .or_else(|| {
+                (self.download_mode == DownloadMode::Memory)
+                    .then(|| download_memory_error(&self.download_memory_bytes))
+                    .flatten()
+            })
     }
 
     /// Reason the rnnoise-tuning rows are inert, or `None` when they apply. The
@@ -444,6 +463,59 @@ impl OverrideToggle {
     }
 }
 
+/// Four-state control for a per-server or per-room download override:
+/// inherit the next level up, or explicitly off / in-memory / persistent.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DownloadChoice {
+    Inherit,
+    Off,
+    Memory,
+    Persistent,
+}
+
+impl DownloadChoice {
+    pub const ALL: [DownloadChoice; 4] = [
+        DownloadChoice::Inherit,
+        DownloadChoice::Off,
+        DownloadChoice::Memory,
+        DownloadChoice::Persistent,
+    ];
+
+    pub fn from_override(value: Option<DownloadMode>) -> Self {
+        match value {
+            None => DownloadChoice::Inherit,
+            Some(DownloadMode::Off) => DownloadChoice::Off,
+            Some(DownloadMode::Memory) => DownloadChoice::Memory,
+            Some(DownloadMode::Persistent) => DownloadChoice::Persistent,
+        }
+    }
+
+    pub fn to_override(self) -> Option<DownloadMode> {
+        match self {
+            DownloadChoice::Inherit => None,
+            DownloadChoice::Off => Some(DownloadMode::Off),
+            DownloadChoice::Memory => Some(DownloadMode::Memory),
+            DownloadChoice::Persistent => Some(DownloadMode::Persistent),
+        }
+    }
+
+    /// Whether this choice needs the download-path field shown.
+    pub fn shows_path(self) -> bool {
+        matches!(self, DownloadChoice::Persistent)
+    }
+
+    /// The visible option label. `inherited` is the effective mode one level up,
+    /// so `Inherit` reads as what it resolves to.
+    pub fn label(self, inherited: DownloadMode) -> String {
+        match self {
+            DownloadChoice::Inherit => format!("inherit ({})", inherited.label()),
+            DownloadChoice::Off => "off".to_string(),
+            DownloadChoice::Memory => "memory".to_string(),
+            DownloadChoice::Persistent => "persistent".to_string(),
+        }
+    }
+}
+
 /// Parses a byte count with an optional `K`/`M`/`G` suffix (powers of 1024).
 pub fn parse_byte_size(text: &str) -> Option<u64> {
     let text = text.trim();
@@ -500,11 +572,20 @@ pub fn default_download_path_text() -> String {
         .unwrap_or_else(|| "files".to_string())
 }
 
-pub fn download_path_error(enabled: bool, value: &str) -> Option<String> {
-    if enabled && value.trim().is_empty() {
-        Some("download path cannot be empty while downloads are accepted".to_string())
+pub fn download_path_error(persistent: bool, value: &str) -> Option<String> {
+    if persistent && value.trim().is_empty() {
+        Some("download path cannot be empty while downloads are saved to disk".to_string())
     } else {
         None
+    }
+}
+
+/// Validates the in-memory download buffer size field: a non-empty positive
+/// byte count with an optional `K`/`M`/`G` suffix.
+pub fn download_memory_error(value: &str) -> Option<String> {
+    match parse_byte_size(value.trim()) {
+        Some(bytes) if bytes > 0 => None,
+        _ => Some("memory buffer size must be a positive byte count".to_string()),
     }
 }
 

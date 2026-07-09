@@ -4,11 +4,12 @@ use rpc::{control::InviteTicket, crypto::encode_hex};
 
 use crate::{
     config::{
-        Config, FileOverrides, FormBindings, HistoryOverrides, RoomOverrides, ServerEntry,
-        validate_server_entry,
+        Config, DownloadMode, FileOverrides, FormBindings, HistoryOverrides, RoomOverrides,
+        ServerEntry, validate_server_entry,
     },
     settings::{
-        OverrideToggle, byte_limit_error, byte_limit_text, download_path_error, parse_byte_limit,
+        DownloadChoice, OverrideToggle, byte_limit_error, byte_limit_text, download_path_error,
+        parse_byte_limit,
     },
     theme::Theme,
     tui::form::{FormAction, FormFieldKind, FormMouseIntent},
@@ -88,13 +89,13 @@ pub(crate) struct ServerEditDraft {
     udp_addr: String,
     udp_probe_addr: String,
     require_native_encryption: bool,
-    files_choice: OverrideToggle,
+    download_choice: DownloadChoice,
     download_path: String,
     receive_limit: String,
     history_choice: OverrideToggle,
     history_location: String,
     /// Global effective values, shown as what `inherit` resolves to.
-    inherited_downloads_on: bool,
+    inherited_download_mode: DownloadMode,
     inherited_receive_limit: String,
     inherited_history_on: bool,
     /// Room overrides pass through an edit untouched; the room settings popup
@@ -123,11 +124,8 @@ pub(crate) enum PairCompletion {
 
 impl ServerEditDraft {
     pub(crate) fn from_server(server: &ServerEntry, config: &Config) -> Self {
-        let (files_choice, download_path) = match &server.files.receive_dir {
-            None => (OverrideToggle::Inherit, String::new()),
-            Some(dir) if dir.trim().is_empty() => (OverrideToggle::Off, String::new()),
-            Some(dir) => (OverrideToggle::On, dir.clone()),
-        };
+        let download_choice = DownloadChoice::from_override(server.files.download);
+        let download_path = server.files.download_dir.clone().unwrap_or_default();
         Self {
             original_label: server.label.clone(),
             token: server.token.clone(),
@@ -138,13 +136,13 @@ impl ServerEditDraft {
             udp_addr: server.udp_addr.clone(),
             udp_probe_addr: server.udp_probe_addr.clone().unwrap_or_default(),
             require_native_encryption: server.require_native_encryption,
-            files_choice,
+            download_choice,
             download_path,
-            receive_limit: byte_limit_text(server.files.max_receive_bytes),
+            receive_limit: byte_limit_text(server.files.max_download_bytes),
             history_choice: OverrideToggle::from_option(server.history.enabled),
             history_location: server.history.location.clone().unwrap_or_default(),
-            inherited_downloads_on: config.files.receive_dir_path().is_some(),
-            inherited_receive_limit: byte_limit_text(Some(config.files.max_receive_bytes)),
+            inherited_download_mode: config.files.download,
+            inherited_receive_limit: byte_limit_text(Some(config.files.max_download_bytes)),
             inherited_history_on: config.history.enabled,
             rooms: server.rooms.clone(),
             form: form::state_with_focus(config.ui.default_bindings, SERVER_SECTION, "Label"),
@@ -157,7 +155,7 @@ impl ServerEditDraft {
 
     /// The number of form rows the dialog body currently lays out.
     pub(crate) fn form_height(&self) -> u16 {
-        22 + u16::from(self.files_choice == OverrideToggle::On)
+        22 + u16::from(self.download_choice.shows_path())
     }
 
     pub(crate) fn handle_key(&mut self, key: KeyEvent, theme: &Theme) -> ServerEditEvent {
@@ -239,12 +237,12 @@ impl ServerEditDraft {
                 udp_addr: &mut self.udp_addr,
                 udp_probe_addr: &mut self.udp_probe_addr,
                 require_native_encryption: &mut self.require_native_encryption,
-                files_choice: &mut self.files_choice,
+                download_choice: &mut self.download_choice,
                 download_path: &mut self.download_path,
                 receive_limit: &mut self.receive_limit,
                 history_choice: &mut self.history_choice,
                 history_location: &mut self.history_location,
-                inherited_downloads_on: self.inherited_downloads_on,
+                inherited_download_mode: self.inherited_download_mode,
                 inherited_receive_limit: &self.inherited_receive_limit,
                 inherited_history_on: self.inherited_history_on,
             };
@@ -273,20 +271,21 @@ impl ServerEditDraft {
             );
         }
         let udp_probe_addr = non_empty_text(&draft.udp_probe_addr);
-        let receive_dir = match draft.files_choice {
-            OverrideToggle::Inherit => None,
-            OverrideToggle::On => {
-                let path = draft.download_path.trim();
-                if path.is_empty() {
-                    return Err("download path cannot be empty while downloads are on".to_string());
-                }
-                Some(path.to_string())
+        let download_dir = if draft.download_choice == DownloadChoice::Persistent {
+            let path = draft.download_path.trim();
+            if path.is_empty() {
+                return Err(
+                    "download path cannot be empty while downloads are saved to disk".to_string(),
+                );
             }
-            OverrideToggle::Off => Some(String::new()),
+            Some(path.to_string())
+        } else {
+            None
         };
         let files = FileOverrides {
-            receive_dir,
-            max_receive_bytes: parse_byte_limit(&draft.receive_limit)?,
+            download: draft.download_choice.to_override(),
+            download_dir,
+            max_download_bytes: parse_byte_limit(&draft.receive_limit)?,
         };
         let history = HistoryOverrides {
             enabled: draft.history_choice.to_option(),
@@ -343,12 +342,12 @@ impl ServerEditDraft {
                 udp_addr: &mut self.udp_addr,
                 udp_probe_addr: &mut self.udp_probe_addr,
                 require_native_encryption: &mut self.require_native_encryption,
-                files_choice: &mut self.files_choice,
+                download_choice: &mut self.download_choice,
                 download_path: &mut self.download_path,
                 receive_limit: &mut self.receive_limit,
                 history_choice: &mut self.history_choice,
                 history_location: &mut self.history_location,
-                inherited_downloads_on: self.inherited_downloads_on,
+                inherited_download_mode: self.inherited_download_mode,
                 inherited_receive_limit: &self.inherited_receive_limit,
                 inherited_history_on: self.inherited_history_on,
             };
@@ -395,12 +394,12 @@ impl ServerEditDraft {
             udp_addr: self.udp_addr.clone(),
             udp_probe_addr: self.udp_probe_addr.clone(),
             require_native_encryption: self.require_native_encryption,
-            files_choice: self.files_choice,
+            download_choice: self.download_choice,
             download_path: self.download_path.clone(),
             receive_limit: self.receive_limit.clone(),
             history_choice: self.history_choice,
             history_location: self.history_location.clone(),
-            inherited_downloads_on: self.inherited_downloads_on,
+            inherited_download_mode: self.inherited_download_mode,
             inherited_receive_limit: self.inherited_receive_limit.clone(),
             inherited_history_on: self.inherited_history_on,
             rooms: self.rooms.clone(),
@@ -418,12 +417,12 @@ struct ServerEditValues<'a> {
     udp_addr: &'a mut String,
     udp_probe_addr: &'a mut String,
     require_native_encryption: &'a mut bool,
-    files_choice: &'a mut OverrideToggle,
+    download_choice: &'a mut DownloadChoice,
     download_path: &'a mut String,
     receive_limit: &'a mut String,
     history_choice: &'a mut OverrideToggle,
     history_location: &'a mut String,
-    inherited_downloads_on: bool,
+    inherited_download_mode: DownloadMode,
     inherited_receive_limit: &'a str,
     inherited_history_on: bool,
 }
@@ -469,27 +468,26 @@ fn server_edit_ui(
         form.set_help("Requires chatt-native encryption. Disable only when another secure link protects this server connection.");
     }
     form.section("Downloads");
-    let inherited_downloads_on = values.inherited_downloads_on;
+    let inherited_download_mode = values.inherited_download_mode;
     if form
         .choice_value(
             "Downloads",
-            values.files_choice,
-            &OverrideToggle::ALL,
-            |choice| choice.label(inherited_downloads_on),
+            values.download_choice,
+            &DownloadChoice::ALL,
+            |choice| choice.label(inherited_download_mode),
         )
         .is_focus()
     {
-        form.set_help("Controls whether files from this server are accepted, inherited from global settings, or disabled here.");
+        form.set_help("How files from this server are handled: inherited from global settings, off, kept in memory, or saved to disk.");
     }
-    if *values.files_choice == OverrideToggle::On {
-        if form
+    if values.download_choice.shows_path()
+        && form
             .text("Path", values.download_path, |value| {
                 download_path_error(true, value)
             })
             .is_focus()
-        {
-            form.set_help("Directory where files received from this server are saved.");
-        }
+    {
+        form.set_help("Directory where files received from this server are saved.");
     }
     if form
         .text_with_placeholder(
@@ -714,8 +712,9 @@ mod tests {
     fn overridden_entry() -> ServerEntry {
         let mut server = ServerEntry::default();
         server.files = FileOverrides {
-            receive_dir: Some("/srv/dl".to_string()),
-            max_receive_bytes: Some(100 * 1024 * 1024),
+            download: Some(DownloadMode::Persistent),
+            download_dir: Some("/srv/dl".to_string()),
+            max_download_bytes: Some(100 * 1024 * 1024),
         };
         server.history = HistoryOverrides {
             enabled: Some(true),
@@ -724,8 +723,9 @@ mod tests {
         server.rooms = vec![RoomOverrides {
             room_id: RoomId(3),
             files: FileOverrides {
-                receive_dir: Some(String::new()),
-                max_receive_bytes: None,
+                download: Some(DownloadMode::Off),
+                download_dir: None,
+                max_download_bytes: None,
             },
             history: HistoryOverrides::default(),
         }];
@@ -752,13 +752,13 @@ mod tests {
     #[test]
     fn empty_limit_uses_global_limit_placeholder() {
         let mut config = Config::default();
-        config.files.max_receive_bytes = 125 * 1024 * 1024;
+        config.files.max_download_bytes = 125 * 1024 * 1024;
         let draft = ServerEditDraft::from_server(&ServerEntry::default(), &config);
 
         assert!(draft.receive_limit.is_empty());
         assert_eq!(draft.inherited_receive_limit, "125M");
         assert_eq!(
-            draft.to_update().unwrap().server.files.max_receive_bytes,
+            draft.to_update().unwrap().server.files.max_download_bytes,
             None
         );
     }
@@ -778,7 +778,8 @@ mod tests {
     fn downloads_on_requires_a_path() {
         let config = Config::default();
         let mut server = ServerEntry::default();
-        server.files.receive_dir = Some("/srv/dl".to_string());
+        server.files.download = Some(DownloadMode::Persistent);
+        server.files.download_dir = Some("/srv/dl".to_string());
 
         let mut draft = ServerEditDraft::from_server(&server, &config);
         draft.download_path.clear();

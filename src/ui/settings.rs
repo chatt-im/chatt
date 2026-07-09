@@ -686,22 +686,40 @@ fn settings_ui(
         );
     }
     if form
-        .checkbox("Accept Downloads", &mut draft.accept_downloads)
+        .choice_value(
+            "Downloads",
+            &mut draft.download_mode,
+            &crate::config::DownloadMode::ALL,
+            |mode| mode.label().to_string(),
+        )
         .is_focus()
     {
         form.set_help(
-            "Allows incoming files up to the default 50 MB receive limit. The limit can be changed in the config file.",
+            "How received files are handled: off rejects them, memory keeps them in a RAM buffer (lost on restart, viewable in the web log), persistent saves them to disk.",
         );
     }
-    let accept_downloads = draft.accept_downloads;
-    if accept_downloads
+    let download_mode = draft.download_mode;
+    if download_mode == crate::config::DownloadMode::Persistent
         && form
             .text("Download Path", &mut draft.download_path, |value| {
-                download_path_error(accept_downloads, value)
+                download_path_error(true, value)
             })
             .is_focus()
     {
-        form.set_help("Directory where accepted files are saved.");
+        form.set_help("Directory where received files are saved.");
+    }
+    if download_mode == crate::config::DownloadMode::Memory
+        && form
+            .text(
+                "Memory Buffer Size",
+                &mut draft.download_memory_bytes,
+                |value| crate::settings::download_memory_error(value),
+            )
+            .is_focus()
+    {
+        form.set_help(
+            "How much RAM the in-memory download buffer may use (e.g. 256M). The oldest files are dropped once this fills.",
+        );
     }
     if form
         .checkbox("Chat Persistence", &mut draft.history_enabled)

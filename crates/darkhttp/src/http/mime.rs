@@ -1,6 +1,6 @@
 use std::path::Path;
 
-pub(crate) fn content_type(path: &Path) -> &'static str {
+pub fn content_type(path: &Path) -> &'static str {
     let Some(ext) = path.extension().and_then(|ext| ext.to_str()) else {
         return "application/octet-stream";
     };

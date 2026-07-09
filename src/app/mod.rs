@@ -411,6 +411,9 @@ pub(crate) struct App {
     audio_events: AudioEventLog,
     /// The browser chat-log feed, present only when `[web] enabled = true`.
     web_feed: Option<crate::web_server::WebFeedSender>,
+    /// The in-memory download ring buffer, shared with the network worker and
+    /// the web server. Held app-wide so it survives web-server respawns.
+    download_store: crate::receive_store::DownloadStore,
     /// The active outbound screen share, if this client is sharing.
     screencast: Option<crate::video::ScreencastHandle>,
     /// The resolved capture command that last successfully launched an outbound
@@ -887,13 +890,20 @@ fn web_room_messages(
 
 fn spawn_web_feed(
     web: &config::WebConfig,
-    receive_dir: Option<PathBuf>,
+    download_store: crate::receive_store::DownloadStore,
+    persistent_dir: Option<PathBuf>,
     max_messages: usize,
     events: &EventSender,
 ) -> Option<crate::web_server::WebFeedSender> {
     let (web_tx, web_rx) = mpsc::channel();
-    let feed = match crate::web_server::spawn(web, receive_dir, max_messages, web_tx, web.readonly)
-    {
+    let feed = match crate::web_server::spawn(
+        web,
+        download_store,
+        persistent_dir,
+        max_messages,
+        web_tx,
+        web.readonly,
+    ) {
         Ok(feed) => feed,
         Err(error) => {
             kvlog::error!("web server failed to start", error = %error);
@@ -991,13 +1001,16 @@ impl App {
         let echo_control = Arc::new(EchoCancellationControl::new(config.audio.echo_cancellation));
         let output_volume_percent_bits =
             Arc::new(AtomicU32::new(config.audio.output_volume.to_bits()));
+        let download_store =
+            crate::receive_store::DownloadStore::new(config.files.download_memory_bytes);
         let web_feed = if config.web.enabled {
             // The web feed is app-wide and spawns before any server
-            // connection, so it uses the global receive dir, not a per-room
-            // effective one.
+            // connection, so it uses the global persistent dir, not a per-room
+            // effective one; in-memory downloads are served from the store.
             spawn_web_feed(
                 &config.web,
-                config.files.receive_dir_path(),
+                download_store.clone(),
+                config.web_persistent_dir(),
                 config.ui.max_messages as usize,
                 &events.tx,
             )
@@ -1057,6 +1070,7 @@ impl App {
             supervisor: SupervisorState::default(),
             audio_events: AudioEventLog::default(),
             web_feed,
+            download_store,
             screencast: None,
             cached_screencast_start: None,
             screencast_stream_id: None,
@@ -1559,14 +1573,16 @@ impl App {
             }
         };
         self.disconnect_network();
-        let network =
-            match NetworkClient::spawn(server.client_config(&self.config), self.events.sender()) {
-                Ok(network) => network,
-                Err(error) => {
-                    self.set_error(format!("failed to start network: {error}"));
-                    return false;
-                }
-            };
+        let network = match NetworkClient::spawn(
+            server.client_config(&self.config, self.download_store.clone()),
+            self.events.sender(),
+        ) {
+            Ok(network) => network,
+            Err(error) => {
+                self.set_error(format!("failed to start network: {error}"));
+                return false;
+            }
+        };
         self.control_socket =
             match local_control::ControlSocket::spawn(network.sender(), self.events.sender()) {
                 Ok(socket) => {
@@ -1600,7 +1616,11 @@ impl App {
             let view = self.room.viewed_history();
             feed.set_room(web_room_messages(&view, &self.room));
         }
-        self.active_tcp_addr = Some(server.client_config(&self.config).tcp_addr);
+        self.active_tcp_addr = Some(
+            server
+                .client_config(&self.config, self.download_store.clone())
+                .tcp_addr,
+        );
         self.active_server_label = Some(server.label.clone());
         self.network = Some(network);
         self.network_disconnected = false;
@@ -1908,7 +1928,7 @@ impl App {
             return;
         }
         spawn_pair_once(
-            server.client_config(&self.config),
+            server.client_config(&self.config, self.download_store.clone()),
             ticket.pairing_code,
             self.events.sender(),
         );
@@ -1936,7 +1956,7 @@ impl App {
             ..ServerEntry::default()
         };
         spawn_open_pair_once(
-            server.client_config(&self.config),
+            server.client_config(&self.config, self.download_store.clone()),
             String::new(),
             String::new(),
             self.events.sender(),
@@ -2024,7 +2044,9 @@ impl App {
             return;
         };
         let alias = pending.server.label.clone();
-        let client_config = pending.server.client_config(&self.config);
+        let client_config = pending
+            .server
+            .client_config(&self.config, self.download_store.clone());
         spawn_open_pair_once(
             client_config,
             password,
@@ -2133,7 +2155,7 @@ impl App {
         if existing_token.trim().is_empty() {
             return false;
         }
-        let client_config = server.client_config(&self.config);
+        let client_config = server.client_config(&self.config, self.download_store.clone());
         self.disconnect_network();
         self.push_network_notice("auth", reason);
         spawn_open_pair_once(
@@ -2411,19 +2433,15 @@ impl App {
             }
             NetworkEvent::FileReceived {
                 metadata,
-                path,
+                served_name,
                 dimensions,
             } => {
-                let served_name = path
-                    .file_name()
-                    .and_then(|name| name.to_str())
-                    .unwrap_or(&metadata.file_name);
                 if self.room.viewed_room == Some(metadata.room_id)
                     && let Some(feed) = &self.web_feed
                 {
                     feed.send(crate::web_server::WebMessage::from_file(
                         &metadata,
-                        served_name,
+                        &served_name,
                         dimensions,
                     ));
                 }
@@ -2433,7 +2451,7 @@ impl App {
                     metadata.room_id,
                     metadata.transfer_id,
                     metadata.timestamp_ms,
-                    served_name,
+                    &served_name,
                     metadata.size,
                     dimensions,
                 );
@@ -3329,6 +3347,8 @@ impl App {
         self.apply_web_setting(&old_web);
         self.apply_p2p_setting(old_p2p_enabled);
         self.apply_history_setting(old_history_enabled);
+        self.download_store
+            .set_cap(self.config.files.download_memory_bytes);
         self.apply_echo_cancellation_setting();
         self.apply_output_volume_setting();
         self.apply_active_capture_amplification(self.config.audio.max_amplification);
@@ -3377,7 +3397,8 @@ impl App {
         if self.config.web.enabled && self.web_feed.is_none() {
             let feed = spawn_web_feed(
                 &self.config.web,
-                self.config.files.receive_dir_path(),
+                self.download_store.clone(),
+                self.config.web_persistent_dir(),
                 self.config.ui.max_messages as usize,
                 &self.events.tx,
             );
@@ -6968,7 +6989,7 @@ mod tests {
 
         app.handle_network_event(NetworkEvent::FileReceived {
             metadata,
-            path: PathBuf::from("/tmp/room-two.bin"),
+            served_name: "room-two.bin".to_string(),
             dimensions: None,
         });
 

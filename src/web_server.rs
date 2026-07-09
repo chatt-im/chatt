@@ -30,6 +30,7 @@ use rpc::{
 };
 
 use crate::config::{WebAutoplay, WebConfig};
+use crate::receive_store::DownloadStore;
 use crate::web_wire::{self, Fragment, split_fragments};
 
 /// The path a browser opens a WebSocket on for the live feed.
@@ -575,38 +576,65 @@ impl WebFeedSender {
     }
 }
 
+/// Builds the `/files/<name>` handler serving in-memory downloads. A hit
+/// returns the stored bytes with their inferred content type; a miss returns
+/// [`GeneratedResponse::pass`](darkhttp::GeneratedResponse::pass) so the request
+/// falls through to the on-disk `/files` mount (preserving Range serving) when
+/// one exists.
+fn files_route(store: DownloadStore) -> darkhttp::GeneratedHandler {
+    Arc::new(
+        move |request: &darkhttp::GeneratedRequest| match store.get(request.relative) {
+            Some((bytes, content_type)) => {
+                darkhttp::GeneratedResponse::ok(content_type, bytes.to_vec())
+            }
+            None => darkhttp::GeneratedResponse::pass(),
+        },
+    )
+}
+
 /// Builds the `/highlight/<name>` handler serving a file's line-indexed
 /// highlight buffer (see [`crate::highlight::encode_file`]).
 ///
-/// The name resolves against `dir`, the same flat receive directory `/files`
+/// The name resolves against the in-memory download `store` first, then the
+/// persistent directory `dir` when set — the same flat namespace `/files`
 /// serves. A missing file is `404`, a file over [`MAX_HIGHLIGHT_FILE_BYTES`] is
 /// `413`, a non-UTF-8 file is `415`, and any text file returns the binary
 /// buffer regardless of whether its extension maps to a highlighter (an unknown
 /// extension renders as plain text).
-fn highlight_route(dir: PathBuf) -> darkhttp::GeneratedHandler {
+fn highlight_route(store: DownloadStore, dir: Option<PathBuf>) -> darkhttp::GeneratedHandler {
     Arc::new(move |request: &darkhttp::GeneratedRequest| {
         let name = request.relative;
-        // The receive directory is flat, so a name with a separator or parent
+        // The receive namespace is flat, so a name with a separator or parent
         // reference is never valid and is refused rather than resolved.
         if !valid_highlight_name(name) {
             return darkhttp::GeneratedResponse::error(404);
         }
-        let path = dir.join(name);
-        let Ok(metadata) = fs::metadata(&path) else {
+        let bytes = if let Some((bytes, _)) = store.get(name) {
+            if bytes.len() as u64 > MAX_HIGHLIGHT_FILE_BYTES {
+                return darkhttp::GeneratedResponse::error(413);
+            }
+            bytes.to_vec()
+        } else if let Some(dir) = &dir {
+            let path = dir.join(name);
+            let Ok(metadata) = fs::metadata(&path) else {
+                return darkhttp::GeneratedResponse::error(404);
+            };
+            if !metadata.is_file() {
+                return darkhttp::GeneratedResponse::error(404);
+            }
+            if metadata.len() > MAX_HIGHLIGHT_FILE_BYTES {
+                return darkhttp::GeneratedResponse::error(413);
+            }
+            let Ok(bytes) = fs::read(&path) else {
+                return darkhttp::GeneratedResponse::error(404);
+            };
+            if bytes.len() as u64 > MAX_HIGHLIGHT_FILE_BYTES {
+                return darkhttp::GeneratedResponse::error(413);
+            }
+            bytes
+        } else {
             return darkhttp::GeneratedResponse::error(404);
         };
-        if !metadata.is_file() {
-            return darkhttp::GeneratedResponse::error(404);
-        }
-        if metadata.len() > MAX_HIGHLIGHT_FILE_BYTES {
-            return darkhttp::GeneratedResponse::error(413);
-        }
-        let Ok(bytes) = fs::read(&path) else {
-            return darkhttp::GeneratedResponse::error(404);
-        };
-        if bytes.len() as u64 > MAX_HIGHLIGHT_FILE_BYTES {
-            return darkhttp::GeneratedResponse::error(413);
-        }
         let Ok(text) = String::from_utf8(bytes) else {
             return darkhttp::GeneratedResponse::error(415);
         };
@@ -622,8 +650,10 @@ fn valid_highlight_name(name: &str) -> bool {
 
 /// Starts the web server on its own thread and returns a feed handle.
 ///
-/// `receive_dir`, when set, is mounted at `/files` so inline media resolves.
-/// `max_messages` bounds the in-memory history replayed to new clients.
+/// `/files` serves in-memory downloads from `download_store` first, falling
+/// through to `persistent_dir` (when set) on disk so inline media resolves in
+/// either download mode. `max_messages` bounds the in-memory history replayed to
+/// new clients.
 ///
 /// # Errors
 ///
@@ -631,7 +661,8 @@ fn valid_highlight_name(name: &str) -> bool {
 /// cannot bind.
 pub fn spawn(
     cfg: &WebConfig,
-    receive_dir: Option<PathBuf>,
+    download_store: DownloadStore,
+    persistent_dir: Option<PathBuf>,
     max_messages: usize,
     web_requests: Sender<WebRequest>,
     readonly: bool,
@@ -643,11 +674,20 @@ pub fn spawn(
         )
     })?;
 
-    let mut router = Router::new().websocket(WS_PATH);
-    if let Some(dir) = receive_dir {
-        router = router
-            .mount_file_dir("/files", dir.clone())
-            .mount_generated("/highlight", highlight_route(dir));
+    // `/files` and `/highlight` first consult the in-memory download store. A
+    // store miss on `/files` returns `pass()` so the request falls through to
+    // the on-disk mount below (which keeps HTTP Range/If-Modified-Since serving
+    // for persistent downloads); `/highlight` has no disk mount, so it reads
+    // the persistent directory itself.
+    let mut router = Router::new()
+        .websocket(WS_PATH)
+        .mount_generated("/files", files_route(download_store.clone()))
+        .mount_generated(
+            "/highlight",
+            highlight_route(download_store, persistent_dir.clone()),
+        );
+    if let Some(dir) = persistent_dir {
+        router = router.mount_file_dir("/files", dir);
     }
     #[cfg(not(feature = "embed-web"))]
     {
@@ -1648,7 +1688,15 @@ mod tests {
             ..WebConfig::default()
         };
         let (web_tx, _web_rx) = mpsc::channel();
-        let sender = spawn(&cfg, Some(dir.clone()), 100, web_tx, true).unwrap();
+        let sender = spawn(
+            &cfg,
+            DownloadStore::new(64 * 1024 * 1024),
+            Some(dir.clone()),
+            100,
+            web_tx,
+            true,
+        )
+        .unwrap();
 
         let mut stream = TcpStream::connect(sender.local_addr()).unwrap();
         stream
@@ -1673,6 +1721,82 @@ mod tests {
     }
 
     #[test]
+    fn files_endpoint_serves_from_memory_store() {
+        let store = DownloadStore::new(64 * 1024 * 1024);
+        let served = store.insert("photo.png", vec![1, 2, 3, 4, 5]).unwrap();
+
+        let cfg = WebConfig {
+            enabled: true,
+            readonly: true,
+            bind: "127.0.0.1:0".to_string(),
+            ..WebConfig::default()
+        };
+        let (web_tx, _web_rx) = mpsc::channel();
+        // No persistent dir: only the in-memory store backs `/files`.
+        let sender = spawn(&cfg, store, None, 100, web_tx, true).unwrap();
+
+        let mut stream = TcpStream::connect(sender.local_addr()).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        stream
+            .write_all(
+                format!("GET /files/{served} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+                    .as_bytes(),
+            )
+            .unwrap();
+        let headers = read_http_headers(&mut stream);
+        assert!(headers.starts_with("HTTP/1.1 200 OK"), "{headers}");
+        assert!(headers.contains("image/png"), "{headers}");
+
+        let mut body = Vec::new();
+        stream.read_to_end(&mut body).unwrap();
+        assert_eq!(body, vec![1, 2, 3, 4, 5]);
+    }
+
+    #[test]
+    fn files_endpoint_falls_through_to_disk_on_store_miss() {
+        let dir = std::env::temp_dir().join(format!("chatt-files-disk-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("doc.txt"), b"hello disk").unwrap();
+
+        let cfg = WebConfig {
+            enabled: true,
+            readonly: true,
+            bind: "127.0.0.1:0".to_string(),
+            ..WebConfig::default()
+        };
+        let (web_tx, _web_rx) = mpsc::channel();
+        // Empty store plus a persistent dir: a store miss must fall through to
+        // the on-disk mount rather than 404.
+        let sender = spawn(
+            &cfg,
+            DownloadStore::new(64 * 1024 * 1024),
+            Some(dir.clone()),
+            100,
+            web_tx,
+            true,
+        )
+        .unwrap();
+
+        let mut stream = TcpStream::connect(sender.local_addr()).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        stream
+            .write_all(b"GET /files/doc.txt HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+            .unwrap();
+        let headers = read_http_headers(&mut stream);
+        assert!(headers.starts_with("HTTP/1.1 200 OK"), "{headers}");
+
+        let mut body = Vec::new();
+        stream.read_to_end(&mut body).unwrap();
+        assert_eq!(body, b"hello disk");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn highlight_endpoint_rejects_large_file() {
         let dir = std::env::temp_dir().join(format!("chatt-hl-large-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -1686,7 +1810,15 @@ mod tests {
             ..WebConfig::default()
         };
         let (web_tx, _web_rx) = mpsc::channel();
-        let sender = spawn(&cfg, Some(dir.clone()), 100, web_tx, true).unwrap();
+        let sender = spawn(
+            &cfg,
+            DownloadStore::new(64 * 1024 * 1024),
+            Some(dir.clone()),
+            100,
+            web_tx,
+            true,
+        )
+        .unwrap();
 
         let mut stream = TcpStream::connect(sender.local_addr()).unwrap();
         stream
@@ -1715,7 +1847,15 @@ mod tests {
             ..WebConfig::default()
         };
         let (web_tx, _web_rx) = mpsc::channel();
-        let sender = spawn(&cfg, Some(dir.clone()), 100, web_tx, true).unwrap();
+        let sender = spawn(
+            &cfg,
+            DownloadStore::new(64 * 1024 * 1024),
+            Some(dir.clone()),
+            100,
+            web_tx,
+            true,
+        )
+        .unwrap();
 
         let mut stream = TcpStream::connect(sender.local_addr()).unwrap();
         stream
@@ -1768,7 +1908,15 @@ mod tests {
             ..WebConfig::default()
         };
         let (web_tx, _web_rx) = mpsc::channel();
-        let sender = spawn(&cfg, None, 100, web_tx, true).unwrap();
+        let sender = spawn(
+            &cfg,
+            DownloadStore::new(64 * 1024 * 1024),
+            None,
+            100,
+            web_tx,
+            true,
+        )
+        .unwrap();
 
         let mut stream = TcpStream::connect(sender.local_addr()).unwrap();
         stream
@@ -1888,7 +2036,15 @@ Sec-WebSocket-Version: 13\r\n\
             ..WebConfig::default()
         };
         let (web_tx, _web_rx) = mpsc::channel();
-        let sender = spawn(&cfg, None, 100, web_tx, true).unwrap();
+        let sender = spawn(
+            &cfg,
+            DownloadStore::new(64 * 1024 * 1024),
+            None,
+            100,
+            web_tx,
+            true,
+        )
+        .unwrap();
 
         let mut stream = open_ws(sender.local_addr());
         let (_, sync) = read_ws_frame(&mut stream);
@@ -1923,7 +2079,15 @@ Sec-WebSocket-Version: 13\r\n\
             ..WebConfig::default()
         };
         let (web_tx, _web_rx) = mpsc::channel();
-        let sender = spawn(&cfg, None, 100, web_tx, true).unwrap();
+        let sender = spawn(
+            &cfg,
+            DownloadStore::new(64 * 1024 * 1024),
+            None,
+            100,
+            web_tx,
+            true,
+        )
+        .unwrap();
 
         let mut stream = open_ws(sender.local_addr());
         // Drain the initial empty sync frame and the config envelope.
@@ -1968,7 +2132,15 @@ Sec-WebSocket-Version: 13\r\n\
             ..WebConfig::default()
         };
         let (web_tx, _web_rx) = mpsc::channel();
-        let sender = spawn(&cfg, None, 100, web_tx, true).unwrap();
+        let sender = spawn(
+            &cfg,
+            DownloadStore::new(64 * 1024 * 1024),
+            None,
+            100,
+            web_tx,
+            true,
+        )
+        .unwrap();
 
         // A share starts before any browser connects.
         sender.send_share_available(
@@ -2021,7 +2193,15 @@ Sec-WebSocket-Version: 13\r\n\
             ..WebConfig::default()
         };
         let (web_tx, _web_rx) = mpsc::channel();
-        let sender = spawn(&cfg, None, 100, web_tx, true).unwrap();
+        let sender = spawn(
+            &cfg,
+            DownloadStore::new(64 * 1024 * 1024),
+            None,
+            100,
+            web_tx,
+            true,
+        )
+        .unwrap();
         let mut stream = open_ready_ws(sender.local_addr());
 
         let old_key = video::encode_video_frame(1, true, 15, &[1]);
@@ -2059,7 +2239,15 @@ Sec-WebSocket-Version: 13\r\n\
             viewer_in_seperate_browser_tab: true,
         };
         let (web_tx, _web_rx) = mpsc::channel();
-        let sender = spawn(&cfg, None, 100, web_tx, true).unwrap();
+        let sender = spawn(
+            &cfg,
+            DownloadStore::new(64 * 1024 * 1024),
+            None,
+            100,
+            web_tx,
+            true,
+        )
+        .unwrap();
 
         let mut stream = open_ws(sender.local_addr());
         // The sync frame comes first, then the config envelope as a text frame.
@@ -2087,7 +2275,15 @@ Sec-WebSocket-Version: 13\r\n\
             ..WebConfig::default()
         };
         let (web_tx, web_rx) = mpsc::channel();
-        let sender = spawn(&cfg, None, 100, web_tx, false).unwrap();
+        let sender = spawn(
+            &cfg,
+            DownloadStore::new(64 * 1024 * 1024),
+            None,
+            100,
+            web_tx,
+            false,
+        )
+        .unwrap();
 
         let mut stream = open_ready_ws(sender.local_addr());
         write_ws_text(&mut stream, r#"{"type":"send_message","body":"hi there"}"#);
@@ -2110,7 +2306,15 @@ Sec-WebSocket-Version: 13\r\n\
             ..WebConfig::default()
         };
         let (web_tx, web_rx) = mpsc::channel();
-        let sender = spawn(&cfg, None, 100, web_tx, false).unwrap();
+        let sender = spawn(
+            &cfg,
+            DownloadStore::new(64 * 1024 * 1024),
+            None,
+            100,
+            web_tx,
+            false,
+        )
+        .unwrap();
 
         let mut stream = open_ready_ws(sender.local_addr());
         write_ws_text(&mut stream, r#"{"type":"abort_transfer","transfer_id":7}"#);
@@ -2128,7 +2332,15 @@ Sec-WebSocket-Version: 13\r\n\
             ..WebConfig::default()
         };
         let (web_tx, web_rx) = mpsc::channel();
-        let sender = spawn(&cfg, None, 100, web_tx, true).unwrap();
+        let sender = spawn(
+            &cfg,
+            DownloadStore::new(64 * 1024 * 1024),
+            None,
+            100,
+            web_tx,
+            true,
+        )
+        .unwrap();
 
         let mut stream = open_ready_ws(sender.local_addr());
         write_ws_text(&mut stream, r#"{"type":"abort_transfer","transfer_id":7}"#);
@@ -2146,7 +2358,15 @@ Sec-WebSocket-Version: 13\r\n\
             ..WebConfig::default()
         };
         let (web_tx, web_rx) = mpsc::channel();
-        let sender = spawn(&cfg, None, 100, web_tx, true).unwrap();
+        let sender = spawn(
+            &cfg,
+            DownloadStore::new(64 * 1024 * 1024),
+            None,
+            100,
+            web_tx,
+            true,
+        )
+        .unwrap();
 
         let mut stream = open_ready_ws(sender.local_addr());
         write_ws_text(&mut stream, r#"{"type":"send_message","body":"hi there"}"#);
@@ -2164,7 +2384,15 @@ Sec-WebSocket-Version: 13\r\n\
             ..WebConfig::default()
         };
         let (web_tx, web_rx) = mpsc::channel();
-        let sender = spawn(&cfg, None, 100, web_tx, false).unwrap();
+        let sender = spawn(
+            &cfg,
+            DownloadStore::new(64 * 1024 * 1024),
+            None,
+            100,
+            web_tx,
+            false,
+        )
+        .unwrap();
 
         let mut stream = open_ready_ws(sender.local_addr());
         write_ws_text(
@@ -2202,7 +2430,15 @@ Sec-WebSocket-Version: 13\r\n\
             ..WebConfig::default()
         };
         let (web_tx, web_rx) = mpsc::channel();
-        let sender = spawn(&cfg, None, 100, web_tx, false).unwrap();
+        let sender = spawn(
+            &cfg,
+            DownloadStore::new(64 * 1024 * 1024),
+            None,
+            100,
+            web_tx,
+            false,
+        )
+        .unwrap();
 
         let mut stream = open_ready_ws(sender.local_addr());
         write_ws_text(

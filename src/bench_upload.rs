@@ -106,11 +106,15 @@ fn client_config(
         require_native_encryption: true,
         file_policy: FilePolicy {
             default: EffectiveFiles {
-                receive_dir,
-                max_receive_bytes: LIMIT_BYTES,
+                target: match receive_dir {
+                    Some(dir) => crate::config::DownloadTarget::Persistent(dir),
+                    None => crate::config::DownloadTarget::Off,
+                },
+                max_download_bytes: LIMIT_BYTES,
             },
             rooms: Vec::new(),
         },
+        download_store: crate::receive_store::DownloadStore::new(LIMIT_BYTES),
         max_upload_bytes: LIMIT_BYTES,
         upload_rate_bytes: 0,
         candidate_privacy: CandidatePrivacy::Disabled,
@@ -257,11 +261,16 @@ fn upload_50mb_loopback() {
     );
     let elapsed = start.elapsed();
 
-    let NetworkEvent::FileReceived { metadata, path, .. } = received else {
+    let NetworkEvent::FileReceived {
+        metadata,
+        served_name,
+        ..
+    } = received
+    else {
         unreachable!("predicate guarantees FileReceived")
     };
 
-    let got = std::fs::read(&path).expect("read received file");
+    let got = std::fs::read(receive_dir.join(&served_name)).expect("read received file");
     assert_eq!(got.len(), PAYLOAD_BYTES, "received size mismatch");
     assert_eq!(sha256(&got), expected_digest, "received content mismatch");
     assert_eq!(metadata.size, PAYLOAD_BYTES as u64);
@@ -306,10 +315,15 @@ fn upload_50mb_loopback() {
         |event| matches!(event, NetworkEvent::FileReceived { .. }),
     );
     let identity_elapsed = identity_start.elapsed();
-    let NetworkEvent::FileReceived { metadata, path, .. } = received else {
+    let NetworkEvent::FileReceived {
+        metadata,
+        served_name,
+        ..
+    } = received
+    else {
         unreachable!("predicate guarantees FileReceived")
     };
-    let got = std::fs::read(path).expect("read identity file");
+    let got = std::fs::read(receive_dir.join(&served_name)).expect("read identity file");
     assert_eq!(sha256(&got), expected_digest);
     assert_eq!(metadata.encoding, FileContentEncoding::Identity);
     let identity_wire_bytes = crate::client_net::last_received_file_wire_bytes();
@@ -335,10 +349,18 @@ fn upload_50mb_loopback() {
         Duration::from_secs(30),
         |event| matches!(event, NetworkEvent::FileReceived { .. }),
     );
-    let NetworkEvent::FileReceived { metadata, path, .. } = received else {
+    let NetworkEvent::FileReceived {
+        metadata,
+        served_name,
+        ..
+    } = received
+    else {
         unreachable!("predicate guarantees FileReceived")
     };
-    assert_eq!(std::fs::read(path).unwrap(), excluded);
+    assert_eq!(
+        std::fs::read(receive_dir.join(&served_name)).unwrap(),
+        excluded
+    );
     assert_eq!(metadata.encoding, FileContentEncoding::Identity);
     assert_eq!(
         crate::client_net::last_received_file_wire_bytes(),

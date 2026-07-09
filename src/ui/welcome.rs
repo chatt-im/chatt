@@ -3,7 +3,7 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::{
     bindings::{self, BindCommand, BindingRuntime},
-    config::{Config, DEFAULT_MAX_AMPLIFICATION, FormBindings, ThemeSelection},
+    config::{Config, DEFAULT_MAX_AMPLIFICATION, DownloadMode, FormBindings, ThemeSelection},
     settings::{default_download_path_text, download_path_error, form_bindings_label},
     theme::Theme,
     tui::form::FormState,
@@ -50,7 +50,7 @@ pub(crate) struct WelcomeDraft {
     pub(crate) default_bindings: FormBindings,
     pub(crate) theme: ThemeSelection,
     pub(crate) p2p_enabled: bool,
-    pub(crate) accept_downloads: bool,
+    pub(crate) download_mode: DownloadMode,
     pub(crate) download_path: String,
     pub(crate) history_enabled: bool,
 }
@@ -61,7 +61,7 @@ impl WelcomeDraft {
             default_bindings: FormBindings::Standard,
             theme: ThemeSelection::default(),
             p2p_enabled: false,
-            accept_downloads: false,
+            download_mode: DownloadMode::Off,
             download_path: default_download_path_text(),
             history_enabled: false,
         }
@@ -71,19 +71,21 @@ impl WelcomeDraft {
         config.ui.default_bindings = self.default_bindings;
         config.ui.theme = self.theme.clone();
         config.p2p.enabled = self.p2p_enabled;
-        config.files.receive_dir = if self.accept_downloads {
-            self.download_path.trim().to_string()
-        } else {
-            String::new()
-        };
+        config.files.download = self.download_mode;
+        if self.download_mode == DownloadMode::Persistent {
+            config.files.download_dir = self.download_path.trim().to_string();
+        }
         config.files.max_upload_bytes = rpc::control::DEFAULT_FILE_SIZE_LIMIT_BYTES;
-        config.files.max_receive_bytes = rpc::control::DEFAULT_FILE_SIZE_LIMIT_BYTES;
+        config.files.max_download_bytes = rpc::control::DEFAULT_FILE_SIZE_LIMIT_BYTES;
         config.audio.max_amplification = DEFAULT_MAX_AMPLIFICATION;
         config.history.enabled = self.history_enabled;
     }
 
     pub(crate) fn invalid(&self) -> Option<String> {
-        download_path_error(self.accept_downloads, &self.download_path)
+        download_path_error(
+            self.download_mode == DownloadMode::Persistent,
+            &self.download_path,
+        )
     }
 }
 
@@ -288,22 +290,27 @@ fn welcome_ui(form: &mut WelcomeForm, draft: &mut WelcomeDraft) {
         );
     }
     if form
-        .checkbox("Accept Downloads", &mut draft.accept_downloads)
+        .choice_value(
+            "Downloads",
+            &mut draft.download_mode,
+            &DownloadMode::ALL,
+            |mode| mode.label().to_string(),
+        )
         .is_focus()
     {
         form.set_help(
-            "Allows incoming files up to the default 50 MB receive limit. The limit can be changed in the config file.",
+            "How received files are handled: off rejects them, memory keeps them in a RAM buffer (lost on restart), persistent saves them to disk.",
         );
     }
-    let accept_downloads = draft.accept_downloads;
-    if accept_downloads
+    let download_mode = draft.download_mode;
+    if download_mode == DownloadMode::Persistent
         && form
             .text("Download Path", &mut draft.download_path, |value| {
-                download_path_error(accept_downloads, value)
+                download_path_error(true, value)
             })
             .is_focus()
     {
-        form.set_help("Directory where accepted files are saved.");
+        form.set_help("Directory where received files are saved.");
     }
     if form
         .checkbox("Chat Persistence", &mut draft.history_enabled)
@@ -459,7 +466,7 @@ fn welcome_dialog_height(draft: &WelcomeDraft, available_height: u16) -> u16 {
 }
 
 fn welcome_form_height(draft: &WelcomeDraft) -> u16 {
-    let download_path_height = u16::from(draft.accept_downloads);
+    let download_path_height = u16::from(draft.download_mode == DownloadMode::Persistent);
     8 + download_path_height
 }
 
@@ -675,7 +682,7 @@ mod tests {
         let mut draft = WelcomeDraft::privacy_first();
         assert_eq!(welcome_dialog_height(&draft, 40), 11);
 
-        draft.accept_downloads = true;
+        draft.download_mode = DownloadMode::Persistent;
         assert_eq!(welcome_dialog_height(&draft, 40), 12);
     }
 

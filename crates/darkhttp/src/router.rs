@@ -62,7 +62,29 @@ impl GeneratedResponse {
             body: Vec::new(),
         }
     }
+
+    /// A sentinel asking the router to defer to the next matching mount instead
+    /// of sending this response. Lets a generated handler that shares a prefix
+    /// with a [directory mount](Router::mount_file_dir) fall through to disk
+    /// (preserving Range serving) when it has nothing to serve itself. When no
+    /// directory mount matches, a `404` is sent.
+    pub fn pass() -> Self {
+        Self {
+            status: PASS_STATUS,
+            content_type: String::new(),
+            body: Vec::new(),
+        }
+    }
+
+    /// Whether this is the [`pass`](GeneratedResponse::pass) sentinel.
+    pub(crate) fn is_pass(&self) -> bool {
+        self.status == PASS_STATUS
+    }
 }
+
+/// Sentinel status for [`GeneratedResponse::pass`]. Zero is not a valid HTTP
+/// status, so it can never collide with a real response.
+pub(crate) const PASS_STATUS: u16 = 0;
 
 /// A handler that computes a response for any path under its mount prefix. It
 /// runs on the server's I/O thread pool, so it may block on disk or CPU without

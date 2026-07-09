@@ -363,13 +363,23 @@ impl App {
                     let path = request.path.as_str().to_owned();
                     let relative = relative.to_owned();
                     let is_head = request.is_head();
+                    let keep_alive = request.keep_alive;
+                    // Resolve a directory mount on the same prefix so a handler
+                    // that returns `GeneratedResponse::pass()` can defer to disk
+                    // (keeping Range/If-Modified-Since serving) rather than
+                    // short-circuiting the request.
+                    let fallback = self.router.resolve_mount(&request.path).map(|resolved| {
+                        (
+                            resolved.mount.root().to_path_buf(),
+                            resolved.mount.kind,
+                            resolved.relative_path.to_owned(),
+                        )
+                    });
+                    let fallback = fallback.map(|(root, kind, relative_path)| {
+                        FileTask::new(root, kind, relative_path, request, self.config.clone())
+                    });
                     self.dispatch_generated_task(
-                        idx,
-                        handler,
-                        path,
-                        relative,
-                        is_head,
-                        request.keep_alive,
+                        idx, handler, path, relative, is_head, keep_alive, fallback,
                     );
                     return;
                 } else if let Some(resolved) = self.router.resolve_mount(&request.path) {
@@ -417,6 +427,7 @@ impl App {
         relative: String,
         is_head: bool,
         keep_alive: bool,
+        fallback: Option<FileTask>,
     ) {
         let conn_id = self.conns[idx].id;
         let file_tx = self.file_tx.clone();
@@ -432,15 +443,31 @@ impl App {
                 is_head,
             };
             let result = handler(&request);
-            let response = response::owned(
-                result.status,
-                reason_phrase(result.status),
-                Arc::from(result.body),
-                &result.content_type,
-                keep_alive,
-                timeout,
-                is_head,
-            );
+            let response = if result.is_pass() {
+                // The handler declined; serve the disk fallback if the prefix
+                // also has a directory mount, otherwise a plain 404.
+                match fallback {
+                    Some(task) => task.serve(),
+                    None => response::error(
+                        404,
+                        "Not Found",
+                        "The URL you requested was not found.",
+                        keep_alive,
+                        timeout,
+                        is_head,
+                    ),
+                }
+            } else {
+                response::owned(
+                    result.status,
+                    reason_phrase(result.status),
+                    Arc::from(result.body),
+                    &result.content_type,
+                    keep_alive,
+                    timeout,
+                    is_head,
+                )
+            };
             let _ = file_tx.send(FileResult { conn_id, response });
             notifier.wake();
         });
