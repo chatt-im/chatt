@@ -64,7 +64,7 @@ use crate::file_compression::{
     self, COMPRESSION_PROBE_BYTES, FastCompressionDecision, ZSTD_WINDOW_LOG,
 };
 use crate::mdns::{MdnsSystem, generate_mdns_name};
-use crate::receive_store::Reservation;
+use crate::receive_store::{DiskReservation, Reservation};
 
 const TCP: Token = Token(0);
 const UDP: Token = Token(1);
@@ -2072,6 +2072,7 @@ enum UploadLocalCopy {
     Disk {
         path: PathBuf,
         file: File,
+        reservation: DiskReservation,
     },
     Memory {
         reservation: Reservation,
@@ -2082,7 +2083,7 @@ enum UploadLocalCopy {
 /// Where a completed local upload copy lives, so it can be surfaced as a
 /// received file once the server assigns its metadata.
 enum LocalFileLocation {
-    Disk(PathBuf),
+    Disk(String),
     /// Already inserted into the ring under this served name.
     Memory(String),
 }
@@ -2124,7 +2125,10 @@ struct IncomingFile {
 /// leaves nothing behind).
 #[derive(Debug)]
 enum ReceiveDest {
-    Disk(PathBuf),
+    Disk {
+        path: PathBuf,
+        reservation: DiskReservation,
+    },
     Memory,
 }
 
@@ -2132,8 +2136,14 @@ enum ReceiveDest {
 /// [`IncomingFile::finalize`].
 #[derive(Debug)]
 enum FinalizedLocation {
-    Disk(PathBuf),
+    Disk { path: PathBuf, served_name: String },
     Memory(Vec<u8>),
+}
+
+struct ReceiveFile {
+    path: PathBuf,
+    file: File,
+    reservation: DiskReservation,
 }
 
 /// The byte sink a [`ReceiveSink`] writes decoded output into: either the
@@ -2352,7 +2362,10 @@ impl IncomingFile {
             .then(|| crate::web_server::image_dimensions(&sink.image_prefix))
             .flatten();
         let location = match (dest, sink.target) {
-            (ReceiveDest::Disk(path), _) => FinalizedLocation::Disk(path),
+            (ReceiveDest::Disk { path, reservation }, _) => {
+                let served_name = reservation.commit(path.clone());
+                FinalizedLocation::Disk { path, served_name }
+            }
             (ReceiveDest::Memory, SinkTarget::Memory(bytes)) => FinalizedLocation::Memory(bytes),
             // The dest and sink target are constructed together, so a memory
             // dest always pairs with a memory sink.
@@ -3434,8 +3447,12 @@ impl WorkerState {
                         &receive_dir,
                         &upload.name,
                     ) {
-                        Ok((path, file)) => {
-                            upload.local_copy = Some(UploadLocalCopy::Disk { path, file })
+                        Ok(receive) => {
+                            upload.local_copy = Some(UploadLocalCopy::Disk {
+                                path: receive.path,
+                                file: receive.file,
+                                reservation: receive.reservation,
+                            })
                         }
                         Err(error) => {
                             let _ = self.events.send(NetworkEvent::Error(format!(
@@ -3745,7 +3762,11 @@ impl WorkerState {
             return;
         };
         let location = match copy {
-            UploadLocalCopy::Disk { path, mut file } => {
+            UploadLocalCopy::Disk {
+                path,
+                mut file,
+                reservation,
+            } => {
                 if let Err(error) = file.flush() {
                     let _ = fs::remove_file(&path);
                     let _ = self.events.send(NetworkEvent::Error(format!(
@@ -3754,7 +3775,7 @@ impl WorkerState {
                     )));
                     return;
                 }
-                LocalFileLocation::Disk(path)
+                LocalFileLocation::Disk(reservation.commit(path))
             }
             UploadLocalCopy::Memory { reservation, bytes } => {
                 match self
@@ -3824,7 +3845,7 @@ impl WorkerState {
         dimensions: Option<(u32, u32)>,
     ) {
         let served_name = match location {
-            LocalFileLocation::Disk(path) => served_file_name(&path, &metadata.file_name),
+            LocalFileLocation::Disk(name) => name,
             LocalFileLocation::Memory(name) => name,
         };
         let _ = self.events.send(NetworkEvent::FileReceived {
@@ -3927,11 +3948,14 @@ impl WorkerState {
                     &receive_dir,
                     &file.file_name,
                 ) {
-                    Ok((path, handle)) => {
+                    Ok(receive) => {
                         self.begin_incoming(
                             file,
-                            SinkTarget::Disk(handle),
-                            ReceiveDest::Disk(path),
+                            SinkTarget::Disk(receive.file),
+                            ReceiveDest::Disk {
+                                path: receive.path,
+                                reservation: receive.reservation,
+                            },
                             None,
                         );
                     }
@@ -4146,13 +4170,13 @@ impl WorkerState {
                         wire_bytes = _wire_bytes
                     );
                     let served_name = match location {
-                        FinalizedLocation::Disk(path) => {
+                        FinalizedLocation::Disk { path, served_name } => {
                             let _ = self.events.send(NetworkEvent::Status(format!(
                                 "saved {} to {}",
                                 metadata.file_name,
                                 path.display()
                             )));
-                            served_file_name(&path, &metadata.file_name)
+                            served_name
                         }
                         FinalizedLocation::Memory(bytes) => {
                             let size = bytes.len();
@@ -5839,7 +5863,7 @@ fn read_upload_source(upload: &mut OutgoingUpload, limit: usize) -> io::Result<V
 
 fn write_upload_local_copy(events: &EventSender, upload: &mut OutgoingUpload, data: &[u8]) {
     match upload.local_copy.as_mut() {
-        Some(UploadLocalCopy::Disk { path, file }) => {
+        Some(UploadLocalCopy::Disk { path, file, .. }) => {
             if let Err(error) = file.write_all(data) {
                 let _ = events.send(NetworkEvent::Error(format!(
                     "failed to write local copy {}: {error}",
@@ -6028,7 +6052,7 @@ fn create_receive_file(
     store: &crate::receive_store::DownloadStore,
     dir: &Path,
     requested_name: &str,
-) -> Result<(PathBuf, File), String> {
+) -> Result<ReceiveFile, String> {
     fs::create_dir_all(dir)
         .map_err(|error| format!("failed to create {}: {error}", dir.display()))?;
     crate::receive_store::allocate_name(requested_name, |candidate| {
@@ -6038,8 +6062,15 @@ fn create_receive_file(
         let path = dir.join(candidate);
         match OpenOptions::new().write(true).create_new(true).open(&path) {
             Ok(file) => {
-                store.register_disk(candidate.to_string(), path.clone());
-                Some(Ok((path, file)))
+                let Some(reservation) = store.reserve_disk_name(candidate.to_string()) else {
+                    let _ = fs::remove_file(&path);
+                    return None;
+                };
+                Some(Ok(ReceiveFile {
+                    path,
+                    file,
+                    reservation,
+                }))
             }
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => None,
             Err(error) => Some(Err(format!("failed to create {}: {error}", path.display()))),
@@ -6056,18 +6087,9 @@ fn create_receive_file(
 /// Removes the on-disk partial of an aborted download. In-memory transfers hold
 /// nothing on disk, so there is nothing to clean up.
 fn cleanup_partial(dest: &ReceiveDest) {
-    if let ReceiveDest::Disk(path) = dest {
+    if let ReceiveDest::Disk { path, .. } = dest {
         let _ = fs::remove_file(path);
     }
-}
-
-/// The name a received file is served under: its on-disk file name (which may
-/// carry a `-N` collision suffix), falling back to the sender's declared name.
-fn served_file_name(path: &Path, fallback: &str) -> String {
-    path.file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or(fallback)
-        .to_string()
 }
 
 /// Resolves the sanitized upload name from an optional override, falling back
@@ -7235,6 +7257,9 @@ mod tests {
         encoding: FileContentEncoding,
         image: bool,
     ) -> IncomingFile {
+        let file_name = if image { "image.png" } else { "data.bin" };
+        let store = crate::receive_store::DownloadStore::new(64 * 1024 * 1024);
+        let reservation = store.reserve_disk_name(file_name.to_string()).unwrap();
         let sink = ReceiveSink::new(
             SinkTarget::Disk(File::create(path).unwrap()),
             original_size,
@@ -7256,17 +7281,16 @@ mod tests {
                 room_id: RoomId(1),
                 sender: UserId(1),
                 sender_name: "sender".to_string(),
-                file_name: if image {
-                    "image.png".to_string()
-                } else {
-                    "data.bin".to_string()
-                },
+                file_name: file_name.to_string(),
                 original_name: "data.bin".to_string(),
                 size: original_size,
                 encoding,
                 timestamp_ms: 1,
             },
-            dest: ReceiveDest::Disk(path.to_path_buf()),
+            dest: ReceiveDest::Disk {
+                path: path.to_path_buf(),
+                reservation,
+            },
             body,
             pending_wire: Vec::new(),
             pending_wire_offset: 0,
@@ -7330,9 +7354,10 @@ mod tests {
                     incoming_test_file(&path, data.len() as u64, FileContentEncoding::Zstd, false);
                 pump_test_input(&mut incoming, &encoded, 313, 64 * 1024).unwrap();
                 let (_, location, _, _, _) = incoming.finalize().unwrap();
-                let FinalizedLocation::Disk(path) = location else {
+                let FinalizedLocation::Disk { path, served_name } = location else {
                     panic!("disk transfer should finalize to a disk path");
                 };
+                assert_eq!(served_name, "data.bin");
                 assert_eq!(fs::read(path).unwrap(), data);
             }
         }
@@ -7520,6 +7545,9 @@ mod tests {
             local_copy: Some(UploadLocalCopy::Disk {
                 path: local_path.clone(),
                 file: File::create(&local_path).unwrap(),
+                reservation: crate::receive_store::DownloadStore::new(64 * 1024 * 1024)
+                    .reserve_disk_name("local.bin".to_string())
+                    .unwrap(),
             }),
             dimensions: None,
             image_prefix: Vec::new(),
@@ -7599,12 +7627,15 @@ mod tests {
         fs::write(dir.join("report.pdf"), b"existing").unwrap();
 
         let store = crate::receive_store::DownloadStore::new(64 * 1024 * 1024);
-        let (path, _file) = create_receive_file(&store, &dir, "report.pdf").unwrap();
+        let receive = create_receive_file(&store, &dir, "report.pdf").unwrap();
 
         assert_eq!(
-            path.file_name().and_then(|name| name.to_str()),
+            receive.path.file_name().and_then(|name| name.to_str()),
             Some("report-1.pdf")
         );
+        assert!(store.resolve("report-1.pdf").is_none());
+        drop(receive);
+        assert!(store.name_available("report-1.pdf"));
         let _ = fs::remove_dir_all(dir);
     }
 
@@ -7672,7 +7703,7 @@ mod tests {
         pending.insert(
             client_id,
             PendingLocalFile {
-                location: LocalFileLocation::Disk(path.clone()),
+                location: LocalFileLocation::Disk("report.pdf".to_string()),
                 dimensions: Some((4, 3)),
             },
         );

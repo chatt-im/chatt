@@ -3,11 +3,18 @@
 //!
 //! Every completed download registers a served name here. In-memory downloads
 //! ([`DownloadTarget::Memory`]) keep their bytes in a size-bounded FIFO ring;
-//! persistent downloads register the absolute path they were saved to, so files
-//! written to a per-room or per-server directory the web server does not mount
-//! are still reachable. Served names are allocated through one place and never
-//! reused for the process lifetime, so an evicted memory file cannot be shadowed
-//! by a later file of the same name and memory and disk names never collide.
+//! persistent downloads register the absolute path they were saved to after the
+//! file is complete, so files written to a per-room or per-server directory the
+//! web server does not mount are still reachable. Served names are allocated
+//! through one place and never reused for the process lifetime after completion,
+//! so an evicted memory file cannot be shadowed by a later file of the same name
+//! and memory and disk names never collide.
+//!
+//! The in-memory cap applies to resident entries plus reservations accepted under
+//! the current cap. If the cap shrinks while transfers are in flight, those
+//! accepted reservations may still land, so the process can temporarily retain
+//! up to the largest cap observed during runtime until later inserts evict back
+//! to the current cap.
 //!
 //! The store is shared (via [`DownloadStore::clone`]) between the single network
 //! worker that fills it and the web server that reads it. Name allocation
@@ -23,7 +30,7 @@ use crate::client_net::sanitize_file_name;
 
 /// A completed received file retained in memory.
 struct Entry {
-    bytes: Arc<[u8]>,
+    bytes: Arc<Vec<u8>>,
     content_type: &'static str,
 }
 
@@ -40,8 +47,11 @@ struct Inner {
     entries: HashMap<String, Entry>,
     /// Served names of persistent downloads mapped to their absolute path.
     disk: HashMap<String, PathBuf>,
+    /// Served names reserved by in-flight persistent downloads. These block
+    /// collisions while the partial exists but are not servable until committed.
+    pending_disk: HashSet<String>,
     /// Every served name ever handed out (memory or disk), so a name is never
-    /// reused even after the memory entry is evicted.
+    /// reused after a successful completion, even after a memory entry is evicted.
     used_names: HashSet<String>,
 }
 
@@ -49,7 +59,7 @@ struct Inner {
 pub enum Source {
     /// An in-memory download, served without copying the buffer.
     Memory {
-        bytes: Arc<[u8]>,
+        bytes: Arc<Vec<u8>>,
         content_type: &'static str,
     },
     /// A persistent download at this absolute path.
@@ -85,6 +95,47 @@ pub struct Reservation {
     active: bool,
 }
 
+/// A claim on a served name for an in-flight persistent download. Dropping it
+/// before commit releases the name; committing makes the disk file servable and
+/// burns the name for the process lifetime.
+#[must_use]
+pub struct DiskReservation {
+    store: DownloadStore,
+    name: String,
+    active: bool,
+}
+
+impl std::fmt::Debug for DiskReservation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DiskReservation")
+            .field("name", &self.name)
+            .field("active", &self.active)
+            .finish_non_exhaustive()
+    }
+}
+
+impl DiskReservation {
+    /// Makes this pending served name resolve to `path`, returning the committed
+    /// name. After this point the name is never reused for this process lifetime.
+    pub fn commit(mut self, path: PathBuf) -> String {
+        let mut inner = self.store.0.lock().unwrap();
+        inner.pending_disk.remove(&self.name);
+        inner.used_names.insert(self.name.clone());
+        inner.disk.insert(self.name.clone(), path);
+        self.active = false;
+        self.name.clone()
+    }
+}
+
+impl Drop for DiskReservation {
+    fn drop(&mut self) {
+        if self.active {
+            let mut inner = self.store.0.lock().unwrap();
+            inner.pending_disk.remove(&self.name);
+        }
+    }
+}
+
 impl Reservation {
     /// Consumes the reservation without releasing it, returning its size. The
     /// caller must account for `size` bytes under the store lock.
@@ -112,12 +163,16 @@ impl DownloadStore {
             order: VecDeque::new(),
             entries: HashMap::new(),
             disk: HashMap::new(),
+            pending_disk: HashSet::new(),
             used_names: HashSet::new(),
         })))
     }
 
     /// Updates the capacity, evicting oldest memory entries until the resident
-    /// plus reserved total fits.
+    /// plus reserved total fits when possible. In-flight reservations accepted
+    /// under the previous cap are honored; they may land even after a shrink, so
+    /// resident memory can remain above the current cap until a later insert or
+    /// reservation has a chance to evict entries.
     pub fn set_cap(&self, cap_bytes: u64) {
         let mut inner = self.0.lock().unwrap();
         inner.cap_bytes = cap_bytes;
@@ -164,7 +219,8 @@ impl DownloadStore {
         let mut inner = self.0.lock().unwrap();
         inner.reserved_bytes -= reserved;
         let name = allocate_name(requested_name, |candidate| {
-            (!inner.used_names.contains(candidate) && !inner.entries.contains_key(candidate))
+            inner
+                .name_available(candidate)
                 .then(|| candidate.to_string())
         })?;
         inner.evict_to_fit(len);
@@ -175,7 +231,7 @@ impl DownloadStore {
         inner.entries.insert(
             name.clone(),
             Entry {
-                bytes: Arc::from(bytes),
+                bytes: Arc::new(bytes),
                 content_type,
             },
         );
@@ -196,13 +252,30 @@ impl DownloadStore {
     /// no reservation happens until [`register_disk`](Self::register_disk).
     pub fn name_available(&self, candidate: &str) -> bool {
         let inner = self.0.lock().unwrap();
-        !inner.used_names.contains(candidate) && !inner.entries.contains_key(candidate)
+        inner.name_available(candidate)
+    }
+
+    /// Reserves a served name for an in-flight persistent download without making
+    /// it resolve through `/files` yet. The name is released automatically if the
+    /// transfer fails before commit.
+    pub fn reserve_disk_name(&self, name: String) -> Option<DiskReservation> {
+        let mut inner = self.0.lock().unwrap();
+        if !inner.name_available(&name) {
+            return None;
+        }
+        inner.pending_disk.insert(name.clone());
+        Some(DiskReservation {
+            store: self.clone(),
+            name,
+            active: true,
+        })
     }
 
     /// Registers a persistent download's served `name` and the absolute `path`
     /// it was saved to, so `/files/<name>` can serve it from any directory.
     pub fn register_disk(&self, name: String, path: PathBuf) {
         let mut inner = self.0.lock().unwrap();
+        inner.pending_disk.remove(&name);
         inner.used_names.insert(name.clone());
         inner.disk.insert(name, path);
     }
@@ -226,7 +299,7 @@ impl DownloadStore {
     /// resident memory entry. A test convenience; serving goes through
     /// [`resolve`](Self::resolve).
     #[cfg(test)]
-    pub fn get(&self, served_name: &str) -> Option<(Arc<[u8]>, &'static str)> {
+    pub fn get(&self, served_name: &str) -> Option<(Arc<Vec<u8>>, &'static str)> {
         let inner = self.0.lock().unwrap();
         inner
             .entries
@@ -236,6 +309,12 @@ impl DownloadStore {
 }
 
 impl Inner {
+    fn name_available(&self, candidate: &str) -> bool {
+        !self.used_names.contains(candidate)
+            && !self.entries.contains_key(candidate)
+            && !self.pending_disk.contains(candidate)
+    }
+
     /// Evicts oldest memory entries until `incoming` more bytes fit under the cap
     /// alongside the resident and reserved totals.
     fn evict_to_fit(&mut self, incoming: u64) {
@@ -289,8 +368,25 @@ mod tests {
         let name = store.insert("photo.png", vec![1, 2, 3, 4]).unwrap();
         assert_eq!(name, "photo.png");
         let (bytes, content_type) = store.get(&name).unwrap();
-        assert_eq!(bytes.as_ref(), &[1, 2, 3, 4]);
+        assert_eq!(bytes.as_slice(), &[1, 2, 3, 4]);
         assert_eq!(content_type, "image/png");
+    }
+
+    #[test]
+    fn insert_reserved_keeps_vec_allocation() {
+        let store = DownloadStore::new(1024);
+        let mut bytes = Vec::with_capacity(8);
+        bytes.extend_from_slice(&[1, 2, 3, 4]);
+        let ptr = bytes.as_ptr();
+        let reservation = store.reserve(bytes.len() as u64).unwrap();
+
+        let name = store
+            .insert_reserved(reservation, "photo.png", bytes)
+            .unwrap();
+        let (stored, _) = store.get(&name).unwrap();
+
+        assert_eq!(stored.as_ptr(), ptr);
+        assert_eq!(stored.as_slice(), &[1, 2, 3, 4]);
     }
 
     #[test]
@@ -390,5 +486,52 @@ mod tests {
         }
         // After the failed transfer's reservation drops, the space is free again.
         assert!(store.reserve(8).is_some());
+    }
+
+    #[test]
+    fn reservation_accepted_before_cap_shrink_can_still_land() {
+        let store = DownloadStore::new(10);
+        let reservation = store.reserve(8).unwrap();
+        store.set_cap(4);
+
+        let name = store
+            .insert_reserved(reservation, "large.bin", vec![0; 8])
+            .unwrap();
+
+        assert!(store.get(&name).is_some());
+        let small = store.reserve(1).unwrap();
+        let small_name = store.insert_reserved(small, "small.bin", vec![0]).unwrap();
+        assert!(store.get(&name).is_none());
+        assert!(store.get(&small_name).is_some());
+    }
+
+    #[test]
+    fn pending_disk_name_blocks_collisions_but_is_not_served() {
+        let store = DownloadStore::new(1024);
+        let pending = store.reserve_disk_name("report.pdf".to_string()).unwrap();
+
+        assert!(!store.name_available("report.pdf"));
+        assert!(store.resolve("report.pdf").is_none());
+        assert_eq!(
+            store.insert("report.pdf", vec![1, 2, 3]).unwrap(),
+            "report-1.pdf"
+        );
+
+        drop(pending);
+        assert!(store.name_available("report.pdf"));
+    }
+
+    #[test]
+    fn committed_disk_name_resolves_and_is_never_reused() {
+        let store = DownloadStore::new(1024);
+        let pending = store.reserve_disk_name("report.pdf".to_string()).unwrap();
+        let committed = pending.commit(PathBuf::from("/tmp/report.pdf"));
+
+        assert_eq!(committed, "report.pdf");
+        assert!(matches!(store.resolve("report.pdf"), Some(Source::Disk(_))));
+        assert_eq!(
+            store.insert("report.pdf", vec![1, 2, 3]).unwrap(),
+            "report-1.pdf"
+        );
     }
 }

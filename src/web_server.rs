@@ -578,7 +578,7 @@ impl WebFeedSender {
 
 /// Builds the `/files/<name>` handler that resolves a served name through the
 /// download index. An in-memory download is served straight from its shared
-/// `Arc<[u8]>` (honouring `Range`/`HEAD` without copying the body); a persistent
+/// `Arc<Vec<u8>>` (honouring `Range`/`HEAD` without copying the body); a persistent
 /// download is served from its absolute path with full `Range` support, wherever
 /// on disk it was saved; a miss is a plain `404`. The handler never returns
 /// `pass()`, so a miss can never fall through to another mount.
@@ -588,7 +588,7 @@ fn files_route(store: DownloadStore) -> darkhttp::GeneratedHandler {
             Some(Source::Memory {
                 bytes,
                 content_type,
-            }) => darkhttp::GeneratedResponse::ok(content_type, bytes),
+            }) => darkhttp::GeneratedResponse::ok_shared(content_type, bytes),
             Some(Source::Disk(path)) => darkhttp::GeneratedResponse::file(path),
             None => darkhttp::GeneratedResponse::error(404),
         },
