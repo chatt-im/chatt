@@ -902,11 +902,27 @@ impl RoomLayout {
     }
 }
 
+/// An in-progress divider drag started on one of the inner status bars. The
+/// anchor is the row the drag began on and the starting size lets each `Drag`
+/// apply `start + delta` from that anchor, robust against the layout rects
+/// shifting between frames as the split moves.
+#[derive(Debug, Clone, Copy)]
+enum DividerDrag {
+    /// Dragging the Lobby/Rooms bar resizes the rooms/users list block above it.
+    LobbyBar {
+        anchor_row: u16,
+        start_room_height: u16,
+    },
+    /// Dragging the Chat Log bar resizes the compose window below it.
+    ChatLogBar { anchor_row: u16, start_rows: u16 },
+}
+
 #[derive(Debug)]
 pub(crate) struct RoomMode {
     focus: ChatPanelFocus,
     lobby_list_focus: LobbyListFocus,
     layout: RoomLayout,
+    divider_drag: Option<DividerDrag>,
 }
 
 impl Default for RoomMode {
@@ -921,6 +937,7 @@ impl RoomMode {
             focus: ChatPanelFocus::Compose,
             lobby_list_focus: LobbyListFocus::Users,
             layout: RoomLayout::default(),
+            divider_drag: None,
         }
     }
 
@@ -930,6 +947,7 @@ impl RoomMode {
             focus,
             lobby_list_focus: LobbyListFocus::Users,
             layout: RoomLayout::default(),
+            divider_drag: None,
         }
     }
 
@@ -1150,6 +1168,10 @@ impl RoomMode {
             }
             extui::event::MouseEventKind::Down(extui::event::MouseButton::Left) if in_lobby_bar => {
                 self.set_focus(app, ChatPanelFocus::Lobby);
+                self.divider_drag = Some(DividerDrag::LobbyBar {
+                    anchor_row: mouse.row,
+                    start_room_height: self.layout.room_list_rect.h.max(1),
+                });
             }
             extui::event::MouseEventKind::Down(extui::event::MouseButton::Left) if in_room_list => {
                 self.set_lobby_list_focus(app, LobbyListFocus::Rooms);
@@ -1180,6 +1202,10 @@ impl RoomMode {
             }
             extui::event::MouseEventKind::Down(extui::event::MouseButton::Left) if in_chat_bar => {
                 self.set_focus(app, ChatPanelFocus::ChatLog);
+                self.divider_drag = Some(DividerDrag::ChatLogBar {
+                    anchor_row: mouse.row,
+                    start_rows: self.layout.composer_rect.h,
+                });
             }
             extui::event::MouseEventKind::ScrollUp if in_chat => {
                 self.set_focus(app, ChatPanelFocus::ChatLog);
@@ -1214,6 +1240,16 @@ impl RoomMode {
                     },
                     _ => app.room.active.chat.clear_selection(),
                 }
+            }
+            extui::event::MouseEventKind::Drag(extui::event::MouseButton::Left)
+                if self.divider_drag.is_some() =>
+            {
+                self.drag_divider(app, mouse.row);
+            }
+            extui::event::MouseEventKind::Up(extui::event::MouseButton::Left)
+                if self.divider_drag.is_some() =>
+            {
+                self.divider_drag = None;
             }
             extui::event::MouseEventKind::Drag(extui::event::MouseButton::Left)
                 if app.room.active.chat.is_selecting() =>
@@ -1363,6 +1399,39 @@ impl RoomMode {
                 .active
                 .chat
                 .extend_selection((line.message, line.line));
+        }
+    }
+
+    /// Applies an in-progress divider drag, trading rows between the chat log
+    /// and the neighboring region. Both dividers keep the chat log at a
+    /// minimum of one row.
+    fn drag_divider(&mut self, app: &mut App, row: u16) {
+        match self.divider_drag {
+            Some(DividerDrag::LobbyBar {
+                anchor_row,
+                start_room_height,
+            }) => {
+                // Dragging down grows the rooms/users block; the block and the
+                // chat log share their rows (the 1-row bar between is fixed).
+                let delta = i32::from(row) - i32::from(anchor_row);
+                let budget = i32::from(start_room_height) + i32::from(self.layout.chat_rect.h);
+                // Keep at least one lobby row and one chat row.
+                let height = (i32::from(start_room_height) + delta).clamp(1, (budget - 1).max(1));
+                app.config.ui.room_height = height as u16;
+            }
+            Some(DividerDrag::ChatLogBar {
+                anchor_row,
+                start_rows,
+            }) => {
+                // Dragging up grows the compose window; it and the chat log
+                // share their rows. The dragged height becomes the composer's
+                // new floor and is allowed past `max_composer_height`.
+                let delta = i32::from(anchor_row) - i32::from(row);
+                let budget = i32::from(start_rows) + i32::from(self.layout.chat_rect.h);
+                let rows = (i32::from(start_rows) + delta).clamp(1, (budget - 1).max(1)) as u16;
+                app.room.composer_min_rows = Some(rows);
+            }
+            None => {}
         }
     }
 
@@ -1611,6 +1680,15 @@ mod tests {
 
     fn ctrl(ch: char) -> KeyEvent {
         KeyEvent::new(KeyCode::Char(ch), KeyModifiers::CONTROL)
+    }
+
+    fn mouse(kind: MouseEventKind, column: u16, row: u16) -> MouseEvent {
+        MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::empty(),
+        }
     }
 
     #[test]
@@ -2334,6 +2412,235 @@ mod tests {
         assert_eq!(room.focus(), ChatPanelFocus::Lobby);
         assert_eq!(room.lobby_list_focus(), LobbyListFocus::Users);
         assert_eq!(app.room.participants.selected_user, Some(UserId(1)));
+    }
+
+    #[test]
+    fn drag_lobby_bar_trades_rows_with_chat_log() {
+        let mut app = test_app();
+        let mut room = RoomMode::default();
+        let mut buffer = Buffer::new(80, 24);
+        render_room(&mut app, &mut room, &mut buffer);
+
+        let bar_row = room.layout().lobby_bar_rect.y;
+        let column = room.layout().lobby_bar_rect.x;
+        let start_height = app.config.ui.room_height;
+        let budget = start_height + room.layout().chat_rect.h;
+
+        room.process_mouse(
+            &mut app,
+            mouse(MouseEventKind::Down(MouseButton::Left), column, bar_row),
+        );
+        // Dragging one row down grows the rooms/users block by one row.
+        room.process_mouse(
+            &mut app,
+            mouse(MouseEventKind::Drag(MouseButton::Left), column, bar_row + 1),
+        );
+        assert_eq!(app.config.ui.room_height, start_height + 1);
+
+        // Dragging far down keeps the chat log at one row and never past it.
+        room.process_mouse(
+            &mut app,
+            mouse(MouseEventKind::Drag(MouseButton::Left), column, 1000),
+        );
+        assert_eq!(app.config.ui.room_height, budget - 1);
+        render_room(&mut app, &mut room, &mut buffer);
+        assert!(room.layout().chat_rect.h >= 1);
+
+        // Dragging back above the anchor shrinks it again.
+        room.process_mouse(
+            &mut app,
+            mouse(
+                MouseEventKind::Drag(MouseButton::Left),
+                column,
+                bar_row.saturating_sub(2),
+            ),
+        );
+        assert_eq!(app.config.ui.room_height, start_height.saturating_sub(2));
+
+        // Dragging all the way up never shrinks the lobby below a single row.
+        room.process_mouse(
+            &mut app,
+            mouse(MouseEventKind::Drag(MouseButton::Left), column, 0),
+        );
+        assert_eq!(app.config.ui.room_height, 1);
+
+        room.process_mouse(
+            &mut app,
+            mouse(MouseEventKind::Up(MouseButton::Left), column, bar_row),
+        );
+    }
+
+    #[test]
+    fn drag_lobby_bar_uses_rendered_height_when_config_is_too_large() {
+        let mut app = test_app();
+        app.config.ui.room_height = 100;
+        let mut room = RoomMode::default();
+        let mut buffer = Buffer::new(80, 12);
+        render_room(&mut app, &mut room, &mut buffer);
+
+        let bar_row = room.layout().lobby_bar_rect.y;
+        let column = room.layout().lobby_bar_rect.x;
+        let rendered_lobby_height = room.layout().room_list_rect.h;
+        let budget = rendered_lobby_height + room.layout().chat_rect.h;
+        assert!(rendered_lobby_height < app.config.ui.room_height);
+        assert!(room.layout().chat_rect.h >= 1);
+
+        room.process_mouse(
+            &mut app,
+            mouse(MouseEventKind::Down(MouseButton::Left), column, bar_row),
+        );
+        room.process_mouse(
+            &mut app,
+            mouse(MouseEventKind::Drag(MouseButton::Left), column, 1000),
+        );
+
+        assert_eq!(app.config.ui.room_height, budget - 1);
+        render_room(&mut app, &mut room, &mut buffer);
+        assert!(room.layout().chat_rect.h >= 1);
+    }
+
+    #[test]
+    fn drag_chat_log_bar_sets_composer_floor_that_survives_send() {
+        let mut app = test_app();
+        let mut room = RoomMode::default();
+        let mut buffer = Buffer::new(80, 24);
+        render_room(&mut app, &mut room, &mut buffer);
+
+        let bar_row = room.layout().chat_log_bar_rect.y;
+        let column = room.layout().chat_log_bar_rect.x;
+        // Drag up past `max_composer_height` (default 6) to prove the override
+        // may exceed the content cap.
+        let target = 9u16;
+        assert!(target > app.config.ui.max_composer_height);
+
+        room.process_mouse(
+            &mut app,
+            mouse(MouseEventKind::Down(MouseButton::Left), column, bar_row),
+        );
+        room.process_mouse(
+            &mut app,
+            mouse(
+                MouseEventKind::Drag(MouseButton::Left),
+                column,
+                bar_row - (target - 1),
+            ),
+        );
+        room.process_mouse(
+            &mut app,
+            mouse(
+                MouseEventKind::Up(MouseButton::Left),
+                column,
+                bar_row - (target - 1),
+            ),
+        );
+
+        assert_eq!(app.room.composer_min_rows, Some(target));
+        render_room(&mut app, &mut room, &mut buffer);
+        assert_eq!(room.layout().composer_rect.h, target);
+
+        // The floor persists once the message clears on send.
+        type_text(&mut room, &mut app, "hello");
+        app.room.submit_composer();
+        assert!(app.room.composer.text().is_empty());
+        assert_eq!(app.room.composer_min_rows, Some(target));
+        render_room(&mut app, &mut room, &mut buffer);
+        assert_eq!(room.layout().composer_rect.h, target);
+    }
+
+    #[test]
+    fn composer_floor_is_clamped_by_current_terminal_height() {
+        let mut app = test_app();
+        let mut room = RoomMode::default();
+        let mut tall = Buffer::new(80, 30);
+        render_room(&mut app, &mut room, &mut tall);
+
+        let bar_row = room.layout().chat_log_bar_rect.y;
+        let column = room.layout().chat_log_bar_rect.x;
+        let target = 12u16;
+        room.process_mouse(
+            &mut app,
+            mouse(MouseEventKind::Down(MouseButton::Left), column, bar_row),
+        );
+        room.process_mouse(
+            &mut app,
+            mouse(
+                MouseEventKind::Drag(MouseButton::Left),
+                column,
+                bar_row - (target - 1),
+            ),
+        );
+        room.process_mouse(
+            &mut app,
+            mouse(
+                MouseEventKind::Up(MouseButton::Left),
+                column,
+                bar_row - (target - 1),
+            ),
+        );
+        assert_eq!(app.room.composer_min_rows, Some(target));
+
+        let mut short = Buffer::new(80, 12);
+        render_room(&mut app, &mut room, &mut short);
+
+        assert!(room.layout().composer_rect.h < target);
+        assert_eq!(room.layout().chat_log_bar_rect.h, 1);
+        assert!(room.layout().room_list_rect.h >= 1);
+        assert_eq!(room.layout().lobby_bar_rect.h, 1);
+        assert!(room.layout().chat_rect.h >= 1);
+    }
+
+    #[test]
+    fn overlarge_resize_preserves_lobby_row_bar_and_chat_row() {
+        let mut app = test_app();
+        app.config.ui.room_height = 100;
+        app.room.composer_min_rows = Some(100);
+        let mut room = RoomMode::default();
+        let mut buffer = Buffer::new(80, 12);
+
+        render_room(&mut app, &mut room, &mut buffer);
+
+        assert_eq!(room.layout().room_list_rect.h, 1);
+        assert_eq!(room.layout().lobby_bar_rect.h, 1);
+        assert_eq!(room.layout().chat_rect.h, 1);
+        assert_eq!(room.layout().chat_log_bar_rect.h, 1);
+    }
+
+    #[test]
+    fn manual_composer_floor_does_not_cap_taller_content() {
+        let mut app = test_app();
+        app.config.ui.max_composer_height = 2;
+        app.room.composer_min_rows = Some(3);
+        app.room.composer.set_lines("a\nb\nc\nd\ne");
+        let mut room = RoomMode::default();
+        let mut buffer = Buffer::new(80, 24);
+
+        render_room(&mut app, &mut room, &mut buffer);
+
+        assert_eq!(room.layout().composer_rect.h, 5);
+    }
+
+    #[test]
+    fn click_on_lobby_bar_without_drag_keeps_sizes() {
+        let mut app = test_app();
+        let mut room = RoomMode::default();
+        let mut buffer = Buffer::new(80, 24);
+        render_room(&mut app, &mut room, &mut buffer);
+
+        let bar_row = room.layout().lobby_bar_rect.y;
+        let column = room.layout().lobby_bar_rect.x;
+        let start_height = app.config.ui.room_height;
+
+        room.process_mouse(
+            &mut app,
+            mouse(MouseEventKind::Down(MouseButton::Left), column, bar_row),
+        );
+        room.process_mouse(
+            &mut app,
+            mouse(MouseEventKind::Up(MouseButton::Left), column, bar_row),
+        );
+
+        assert_eq!(app.config.ui.room_height, start_height);
+        assert_eq!(room.focus(), ChatPanelFocus::Lobby);
     }
 
     #[test]
