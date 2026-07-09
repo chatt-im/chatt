@@ -61,7 +61,7 @@ impl WelcomeDraft {
             default_bindings: FormBindings::Standard,
             theme: ThemeSelection::default(),
             p2p_enabled: false,
-            download_mode: DownloadMode::Off,
+            download_mode: DownloadMode::Memory,
             download_path: default_download_path_text(),
             history_enabled: false,
         }
@@ -75,8 +75,8 @@ impl WelcomeDraft {
         if self.download_mode == DownloadMode::Persistent {
             config.files.download_dir = self.download_path.trim().to_string();
         }
-        config.files.max_upload_bytes = rpc::control::DEFAULT_FILE_SIZE_LIMIT_BYTES;
-        config.files.max_download_bytes = rpc::control::DEFAULT_FILE_SIZE_LIMIT_BYTES;
+        config.files.max_upload_mb = crate::config::DEFAULT_MAX_UPLOAD_MB;
+        config.files.max_download_mb = crate::config::DEFAULT_FILE_SIZE_LIMIT_MB;
         config.audio.max_amplification = DEFAULT_MAX_AMPLIFICATION;
         config.history.enabled = self.history_enabled;
     }
@@ -284,11 +284,6 @@ fn welcome_ui(form: &mut WelcomeForm, draft: &mut WelcomeDraft) {
     if theme_response.is_focus() {
         form.set_help("Color theme for the terminal interface.");
     }
-    if form.checkbox("P2P", &mut draft.p2p_enabled).is_focus() {
-        form.set_help(
-            "Direct peer media can reduce latency, but may expose your IP address to other users in a voice room.",
-        );
-    }
     if form
         .choice_value(
             "Downloads",
@@ -318,6 +313,11 @@ fn welcome_ui(form: &mut WelcomeForm, draft: &mut WelcomeDraft) {
     {
         form.set_help(
             "Stores local room catalogs and chat logs under the chatt data directory for offline browsing.",
+        );
+    }
+    if form.checkbox("P2P", &mut draft.p2p_enabled).is_focus() {
+        form.set_help(
+            "Direct peer media can reduce latency, but may expose your IP address to other users in a voice room.",
         );
     }
 
@@ -681,6 +681,7 @@ mod tests {
     fn welcome_dialog_height_leaves_one_trailing_blank_row() {
         let mut draft = WelcomeDraft::privacy_first();
         assert_eq!(welcome_dialog_height(&draft, 40), 11);
+        assert_eq!(draft.download_mode, DownloadMode::Memory);
 
         draft.download_mode = DownloadMode::Persistent;
         assert_eq!(welcome_dialog_height(&draft, 40), 12);

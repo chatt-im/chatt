@@ -80,9 +80,9 @@ pub struct SettingsDraft {
     pub(crate) p2p_enabled: bool,
     pub(crate) download_mode: DownloadMode,
     pub(crate) download_path: String,
-    /// The in-memory download ring-buffer size, editable as a `K`/`M`/`G` byte
-    /// count. Shown only in [`DownloadMode::Memory`].
-    pub(crate) download_memory_bytes: String,
+    /// The in-memory download ring-buffer size, editable as a MiB count. Shown
+    /// only in [`DownloadMode::Memory`].
+    pub(crate) download_memory_mb: String,
     pub(crate) history_enabled: bool,
     /// Base directory for persisted history; empty means the platform default.
     pub(crate) history_location: String,
@@ -153,9 +153,7 @@ impl SettingsDraft {
             p2p_enabled: P2pConfig::default().enabled,
             download_mode: DownloadMode::default(),
             download_path: default_download_path_text(),
-            download_memory_bytes: byte_limit_text(Some(
-                FileConfig::default().download_memory_bytes,
-            )),
+            download_memory_mb: FileConfig::default().download_memory_mb.to_string(),
             history_enabled: HistoryConfig::default().enabled,
             history_location: String::new(),
             denoise: config.denoise,
@@ -199,7 +197,7 @@ impl SettingsDraft {
         } else {
             files.download_dir.clone()
         };
-        self.download_memory_bytes = byte_limit_text(Some(files.download_memory_bytes));
+        self.download_memory_mb = files.download_memory_mb.to_string();
     }
 
     pub fn set_p2p_from_config(&mut self, p2p: &P2pConfig) {
@@ -265,8 +263,8 @@ impl SettingsDraft {
         if self.download_mode == DownloadMode::Persistent {
             files.download_dir = self.download_path.trim().to_string();
         }
-        if let Some(bytes) = parse_byte_size(self.download_memory_bytes.trim()) {
-            files.download_memory_bytes = bytes;
+        if let Some(mb) = parse_mib_count(self.download_memory_mb.trim()) {
+            files.download_memory_mb = mb;
         }
         files
     }
@@ -343,7 +341,7 @@ impl SettingsDraft {
             })
             .or_else(|| {
                 (self.download_mode == DownloadMode::Memory)
-                    .then(|| download_memory_error(&self.download_memory_bytes))
+                    .then(|| download_memory_error(&self.download_memory_mb))
                     .flatten()
             })
     }
@@ -529,41 +527,26 @@ pub fn parse_byte_size(text: &str) -> Option<u64> {
     Some(value.saturating_mul(multiplier))
 }
 
-/// Parses a byte-limit override field. Empty inherits (`None`); otherwise a
-/// byte count with an optional `K`/`M`/`G` suffix.
-pub fn parse_byte_limit(text: &str) -> Result<Option<u64>, String> {
+/// Parses a MiB-limit override field. Empty inherits (`None`); otherwise the
+/// value is a positive count of 1024*1024-byte units.
+pub fn parse_mb_limit(text: &str) -> Result<Option<u64>, String> {
     let text = text.trim();
     if text.is_empty() {
         return Ok(None);
     }
-    match parse_byte_size(text) {
-        Some(bytes) => Ok(Some(bytes)),
-        None => Err(format!("invalid size limit: {text}")),
+    match parse_mib_count(text) {
+        Some(mb) => Ok(Some(mb)),
+        None => Err(format!("invalid MiB limit: {text}")),
     }
 }
 
-pub fn byte_limit_error(text: &str) -> Option<String> {
-    parse_byte_limit(text).err()
+pub fn mb_limit_error(text: &str) -> Option<String> {
+    parse_mb_limit(text).err()
 }
 
-/// Renders a byte-limit override as editable text: empty for inherit, a
-/// `K`/`M`/`G` suffix form when exact, else the raw byte count.
-pub fn byte_limit_text(value: Option<u64>) -> String {
-    const KIB: u64 = 1024;
-    const MIB: u64 = 1024 * 1024;
-    const GIB: u64 = 1024 * 1024 * 1024;
-    let Some(bytes) = value else {
-        return String::new();
-    };
-    if bytes >= GIB && bytes % GIB == 0 {
-        format!("{}G", bytes / GIB)
-    } else if bytes >= MIB && bytes % MIB == 0 {
-        format!("{}M", bytes / MIB)
-    } else if bytes >= KIB && bytes % KIB == 0 {
-        format!("{}K", bytes / KIB)
-    } else {
-        bytes.to_string()
-    }
+/// Renders a MiB-limit override as editable text; empty means inherit.
+pub fn mb_limit_text(value: Option<u64>) -> String {
+    value.map(|mb| mb.to_string()).unwrap_or_default()
 }
 
 pub fn default_download_path_text() -> String {
@@ -580,13 +563,18 @@ pub fn download_path_error(persistent: bool, value: &str) -> Option<String> {
     }
 }
 
-/// Validates the in-memory download buffer size field: a non-empty positive
-/// byte count with an optional `K`/`M`/`G` suffix.
+/// Validates the in-memory download buffer size field: a non-empty positive MiB
+/// count.
 pub fn download_memory_error(value: &str) -> Option<String> {
-    match parse_byte_size(value.trim()) {
-        Some(bytes) if bytes > 0 => None,
-        _ => Some("memory buffer size must be a positive byte count".to_string()),
+    match parse_mib_count(value.trim()) {
+        Some(mb) if mb > 0 => None,
+        _ => Some("memory buffer size must be a positive MiB count".to_string()),
     }
+}
+
+fn parse_mib_count(text: &str) -> Option<u64> {
+    let mb = text.trim().parse::<u64>().ok()?;
+    (mb > 0).then_some(mb)
 }
 
 /// Renders a [`BufferSize`] as the editable settings text: `"default"` or the

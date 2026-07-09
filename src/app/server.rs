@@ -8,8 +8,8 @@ use crate::{
         ServerEntry, validate_server_entry,
     },
     settings::{
-        DownloadChoice, OverrideToggle, byte_limit_error, byte_limit_text, download_path_error,
-        parse_byte_limit,
+        DownloadChoice, OverrideToggle, download_path_error, mb_limit_error, mb_limit_text,
+        parse_mb_limit,
     },
     theme::Theme,
     tui::form::{FormAction, FormFieldKind, FormMouseIntent},
@@ -138,11 +138,11 @@ impl ServerEditDraft {
             require_native_encryption: server.require_native_encryption,
             download_choice,
             download_path,
-            receive_limit: byte_limit_text(server.files.max_download_bytes),
+            receive_limit: mb_limit_text(server.files.max_download_mb),
             history_choice: OverrideToggle::from_option(server.history.enabled),
             history_location: server.history.location.clone().unwrap_or_default(),
             inherited_download_mode: config.files.download,
-            inherited_receive_limit: byte_limit_text(Some(config.files.max_download_bytes)),
+            inherited_receive_limit: mb_limit_text(Some(config.files.max_download_mb)),
             inherited_history_on: config.history.enabled,
             rooms: server.rooms.clone(),
             form: form::state_with_focus(config.ui.default_bindings, SERVER_SECTION, "Label"),
@@ -285,7 +285,7 @@ impl ServerEditDraft {
         let files = FileOverrides {
             download: draft.download_choice.to_override(),
             download_dir,
-            max_download_bytes: parse_byte_limit(&draft.receive_limit)?,
+            max_download_mb: parse_mb_limit(&draft.receive_limit)?,
         };
         let history = HistoryOverrides {
             enabled: draft.history_choice.to_option(),
@@ -494,11 +494,11 @@ fn server_edit_ui(
             "Limit",
             values.receive_limit,
             Some(values.inherited_receive_limit),
-            |value| byte_limit_error(value),
+            |value| mb_limit_error(value),
         )
         .is_focus()
     {
-        form.set_help("Maximum file size accepted from this server. Empty inherits the global limit shown in the field.");
+        form.set_help("Maximum file size accepted from this server, in MiB. Empty inherits the global limit shown in the field.");
     }
     form.section("Persistence");
     let inherited_history_on = values.inherited_history_on;
@@ -714,7 +714,7 @@ mod tests {
         server.files = FileOverrides {
             download: Some(DownloadMode::Persistent),
             download_dir: Some("/srv/dl".to_string()),
-            max_download_bytes: Some(100 * 1024 * 1024),
+            max_download_mb: Some(100),
         };
         server.history = HistoryOverrides {
             enabled: Some(true),
@@ -725,7 +725,7 @@ mod tests {
             files: FileOverrides {
                 download: Some(DownloadMode::Off),
                 download_dir: None,
-                max_download_bytes: None,
+                max_download_mb: None,
             },
             history: HistoryOverrides::default(),
         }];
@@ -752,13 +752,13 @@ mod tests {
     #[test]
     fn empty_limit_uses_global_limit_placeholder() {
         let mut config = Config::default();
-        config.files.max_download_bytes = 125 * 1024 * 1024;
+        config.files.max_download_mb = 125;
         let draft = ServerEditDraft::from_server(&ServerEntry::default(), &config);
 
         assert!(draft.receive_limit.is_empty());
-        assert_eq!(draft.inherited_receive_limit, "125M");
+        assert_eq!(draft.inherited_receive_limit, "125");
         assert_eq!(
-            draft.to_update().unwrap().server.files.max_download_bytes,
+            draft.to_update().unwrap().server.files.max_download_mb,
             None
         );
     }

@@ -712,13 +712,13 @@ fn settings_ui(
         && form
             .text(
                 "Memory Buffer Size",
-                &mut draft.download_memory_bytes,
+                &mut draft.download_memory_mb,
                 |value| crate::settings::download_memory_error(value),
             )
             .is_focus()
     {
         form.set_help(
-            "How much RAM the in-memory download buffer may use (e.g. 256M). The oldest files are dropped once this fills.",
+            "How much RAM the in-memory download buffer may use, in MiB (e.g. 512). The oldest files are dropped once this fills.",
         );
     }
     if form

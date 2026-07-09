@@ -4,8 +4,8 @@ use rpc::ids::RoomId;
 use crate::{
     config::{Config, DownloadMode, FileOverrides, HistoryOverrides, RoomOverrides, ServerEntry},
     settings::{
-        DownloadChoice, OverrideToggle, byte_limit_error, byte_limit_text, download_path_error,
-        parse_byte_limit,
+        DownloadChoice, OverrideToggle, download_path_error, mb_limit_error, mb_limit_text,
+        parse_mb_limit,
     },
     theme::Theme,
     tui::form::{FormAction, FormFieldKind, FormMouseIntent},
@@ -92,11 +92,13 @@ impl RoomSettingsDraft {
             room_name,
             download_choice,
             download_path,
-            receive_limit: byte_limit_text(overrides.files.max_download_bytes),
+            receive_limit: mb_limit_text(overrides.files.max_download_mb),
             history_choice: OverrideToggle::from_option(overrides.history.enabled),
             history_location: overrides.history.location.clone().unwrap_or_default(),
             inherited_download_mode: inherited_files.target.mode(),
-            inherited_receive_limit: byte_limit_text(Some(inherited_files.max_download_bytes)),
+            inherited_receive_limit: mb_limit_text(Some(
+                inherited_files.max_download_bytes / crate::config::MIB,
+            )),
             inherited_history_on: config.effective_history(server, None).enabled,
             form: form::state_with_focus(
                 config.ui.default_bindings,
@@ -145,7 +147,7 @@ impl RoomSettingsDraft {
             files: FileOverrides {
                 download: draft.download_choice.to_override(),
                 download_dir,
-                max_download_bytes: parse_byte_limit(&draft.receive_limit)?,
+                max_download_mb: parse_mb_limit(&draft.receive_limit)?,
             },
             history: HistoryOverrides {
                 enabled: draft.history_choice.to_option(),
@@ -353,11 +355,11 @@ fn room_settings_ui(
             "Limit",
             values.receive_limit,
             Some(values.inherited_receive_limit),
-            |value| byte_limit_error(value),
+            |value| mb_limit_error(value),
         )
         .is_focus()
     {
-        form.set_help("Maximum file size accepted in this room. Empty inherits the server-effective limit shown in the field.");
+        form.set_help("Maximum file size accepted in this room, in MiB. Empty inherits the server-effective limit shown in the field.");
     }
     form.section("Persistence");
     let inherited_history_on = values.inherited_history_on;
@@ -400,7 +402,7 @@ mod tests {
             files: FileOverrides {
                 download: Some(DownloadMode::Persistent),
                 download_dir: Some("/room/dl".to_string()),
-                max_download_bytes: Some(300 * 1024 * 1024),
+                max_download_mb: Some(300),
             },
             history: HistoryOverrides {
                 enabled: Some(true),
@@ -430,13 +432,13 @@ mod tests {
     fn empty_limit_uses_server_effective_limit_placeholder() {
         let config = Config::default();
         let mut server = ServerEntry::default();
-        server.files.max_download_bytes = Some(75 * 1024 * 1024);
+        server.files.max_download_mb = Some(75);
 
         let draft =
             RoomSettingsDraft::from_config(&config, &server, RoomId(9), "other".to_string());
 
         assert!(draft.receive_limit.is_empty());
-        assert_eq!(draft.inherited_receive_limit, "75M");
+        assert_eq!(draft.inherited_receive_limit, "75");
         assert!(draft.to_overrides().unwrap().is_empty());
     }
 

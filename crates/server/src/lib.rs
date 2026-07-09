@@ -569,7 +569,7 @@ impl Server {
                 "external-secure-link transport: chatt relies on the outer link for wire security; control, media, video, and file payloads travel clear and P2P is disabled"
             );
         }
-        let file_size_limit_bytes = config.security.max_file_size_bytes;
+        let file_size_limit_bytes = config.security.max_file_size_bytes();
 
         Ok(Self {
             config,

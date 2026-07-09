@@ -1026,7 +1026,7 @@ impl App {
         let output_volume_percent_bits =
             Arc::new(AtomicU32::new(config.audio.output_volume.to_bits()));
         let download_store =
-            crate::receive_store::DownloadStore::new(config.files.download_memory_bytes);
+            crate::receive_store::DownloadStore::new(config.files.download_memory_bytes());
         // Register persistent downloads already on disk so they remain servable
         // after a restart; live transfers register themselves as they complete.
         register_existing_downloads(&config, &download_store);
@@ -4505,7 +4505,7 @@ impl App {
                 // cap and the network worker's file policy flip on Save, so the
                 // UI, the ring, and the worker stay consistent.
                 self.download_store
-                    .set_cap(self.config.files.download_memory_bytes);
+                    .set_cap(self.config.files.download_memory_bytes());
                 self.push_file_policy();
                 self.set_status(format!("settings saved to {}", path.display()));
             }

@@ -17,6 +17,8 @@ use toml_spanner::{Item, Toml};
 const SECRET_HASH_PREFIX: &str = "sha256:";
 const SHA256_HEX_LEN: usize = 64;
 const DEFAULT_LISTEN_ADDR: &str = "127.0.0.1:41000";
+const MIB: u64 = 1024 * 1024;
+const DEFAULT_FILE_SIZE_LIMIT_MB: u64 = DEFAULT_FILE_SIZE_LIMIT_BYTES / MIB;
 /// First user id handed out to a dynamic (open-paired) user. Ids below this are
 /// reserved for explicit user-registry entries.
 pub const FIRST_DYNAMIC_USER_ID: u64 = u32::MAX as u64 + 1;
@@ -101,8 +103,8 @@ pub struct SecurityConfig {
     /// The transport trust boundary applied to every client.
     #[toml(default)]
     pub transport_mode: TransportModeConfig,
-    #[toml(default = DEFAULT_FILE_SIZE_LIMIT_BYTES)]
-    pub max_file_size_bytes: u64,
+    #[toml(default = DEFAULT_FILE_SIZE_LIMIT_MB)]
+    pub max_file_size_mb: u64,
     /// Directory where `/report-bug` bundles are saved. Bug reports are rejected
     /// when unset.
     #[toml(default)]
@@ -126,7 +128,7 @@ impl Default for SecurityConfig {
             server_identity_seed: generate_identity_seed_hex()
                 .expect("system random is available for default test config"),
             transport_mode: TransportModeConfig::NativeEncrypted,
-            max_file_size_bytes: DEFAULT_FILE_SIZE_LIMIT_BYTES,
+            max_file_size_mb: DEFAULT_FILE_SIZE_LIMIT_MB,
             bug_report_dir: None,
             public: false,
             password_hash: None,
@@ -311,7 +313,8 @@ server-identity-seed = "{seed}"
 # tunnel: control, media, video, and file payloads travel clear after the signed
 # handshake, and P2P is disabled.
 transport-mode = "native-encrypted"
-max-file-size-bytes = {max_file_size_bytes}
+# Maximum relayed file size, in MiB.
+max-file-size-mb = {max_file_size_mb}
 # Directory where `/report-bug` bundles are saved. Bug reports are rejected when
 # unset.
 # bug-report-dir = "/tmp/chatt-bugs"
@@ -351,8 +354,14 @@ default = true
 "#,
         listen_addr = DEFAULT_LISTEN_ADDR,
         seed = seed,
-        max_file_size_bytes = DEFAULT_FILE_SIZE_LIMIT_BYTES,
+        max_file_size_mb = DEFAULT_FILE_SIZE_LIMIT_MB,
     ))
+}
+
+impl SecurityConfig {
+    pub fn max_file_size_bytes(&self) -> u64 {
+        self.max_file_size_mb.checked_mul(MIB).unwrap_or(u64::MAX)
+    }
 }
 
 impl Config {
