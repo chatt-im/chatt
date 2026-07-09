@@ -8,7 +8,7 @@ p2p-enabled = true
 [security]
 server-identity-seed = "546f6d636861742064657620736572766572206b657920763100000000000001"
 transport-mode = "native-encrypted"
-max-file-size-bytes = 52428800
+max-file-size-mb = 52428800
 
 [[rooms]]
 id = 1

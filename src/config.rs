@@ -1283,7 +1283,7 @@ pub struct Config {
     /// appended as the final argument. Defaults to the platform launcher.
     #[toml(default = default_url_open(), ToToml skip_if = is_default_url_open)]
     pub url_open: Vec<String>,
-    #[toml(default = Vec::new(), style = Header)]
+    #[toml(default, style = Header, ToToml skip_if = Vec::is_empty)]
     pub servers: Vec<ServerEntry>,
     #[toml(default, style = Header)]
     pub audio: AudioConfig,
