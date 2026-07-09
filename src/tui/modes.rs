@@ -1121,8 +1121,21 @@ impl RoomMode {
                     mouse.column,
                     mouse.row,
                 );
+        let transfer_hit = app
+            .chrome
+            .transfer_buttons
+            .iter()
+            .find(|(rect, _)| crate::tui::form::rect_contains(*rect, mouse.column, mouse.row))
+            .map(|(_, id)| *id);
 
         match mouse.kind {
+            extui::event::MouseEventKind::Down(extui::event::MouseButton::Left)
+                if transfer_hit.is_some() =>
+            {
+                if let Some(transfer_id) = transfer_hit {
+                    app.cancel_transfer(transfer_id);
+                }
+            }
             extui::event::MouseEventKind::Down(extui::event::MouseButton::Left) if in_composer => {
                 self.enter_compose_insert_mode(app);
             }
@@ -1572,12 +1585,12 @@ mod tests {
     use extui_editor::Mode as EditorMode;
     use rpc::{
         control::{ChatMessage, ParticipantVoiceStatus},
-        ids::{MessageId, RoomId, UserId},
+        ids::{FileTransferId, MessageId, RoomId, UserId},
     };
     use toml_spanner::Arena;
 
     use super::*;
-    use crate::{chat_buffer::LineKind, config::Config};
+    use crate::{chat_buffer::LineKind, client_net::TerminalVerb, config::Config};
 
     fn test_app() -> App {
         App::new(Config::default(), None).expect("test app")
@@ -1807,6 +1820,49 @@ mod tests {
                 file_transfer_id: None,
             },
             None,
+        );
+    }
+
+    fn push_file_message(app: &mut App, message_id: u64, transfer_id: FileTransferId) {
+        enter_room_one(app);
+        app.room.chat_received(
+            ChatMessage {
+                message_id: MessageId(message_id),
+                room_id: RoomId(1),
+                sender: UserId(2),
+                sender_name: "user2".to_string(),
+                timestamp_ms: 1_000,
+                body: "sent file `photo.png` (1.0 KiB)".to_string(),
+                file_transfer_id: Some(transfer_id),
+            },
+            None,
+        );
+    }
+
+    #[test]
+    fn terminal_transfer_shows_label_and_no_button() {
+        let mut app = test_app();
+        let transfer_id = FileTransferId(1);
+        push_file_message(&mut app, 1, transfer_id);
+        app.room.end_transfer(
+            RoomId(1),
+            transfer_id,
+            TerminalVerb::Skipped,
+            Some("Automatic file receive disabled".to_string()),
+        );
+
+        let mut room = RoomMode::default();
+        let mut buffer = Buffer::new(80, 12);
+        render_room(&mut app, &mut room, &mut buffer);
+
+        let screen: String = (0..12).map(|row| row_text(&mut buffer, row)).collect();
+        assert!(
+            screen.contains("skipped: Automatic file receive disabled"),
+            "terminal label missing: {screen}"
+        );
+        assert!(
+            app.chrome.transfer_buttons.is_empty(),
+            "a terminal transfer must not offer a cancel/skip button"
         );
     }
 

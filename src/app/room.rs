@@ -13,7 +13,7 @@ use crate::audio::{LivePlaybackFeedback, PlaybackStreamControl};
 
 use crate::{
     chat_buffer::{NoticeId, NoticeKind, VirtualChatBuffer},
-    client_net::TransferDirection,
+    client_net::{TerminalVerb, TransferDirection},
     config::Config,
     room_catalog::{CatalogRoom, CatalogRoomKind, RoomCatalog},
     room_history::{self, FileHistoryKey, HistoryStorage, RoomHistoryStore},
@@ -143,7 +143,7 @@ pub(crate) struct ClientRoom {
     draft: String,
     web_attachments: HashMap<(u64, u64), WebAttachment>,
     web_file_attachments: HashMap<FileHistoryKey, WebAttachment>,
-    transfers: HashMap<FileTransferId, TransferProgress>,
+    transfers: HashMap<FileTransferId, TransferStatus>,
 }
 
 impl ClientRoom {
@@ -366,6 +366,20 @@ pub(crate) struct TransferProgress {
     pub(crate) transferred: u64,
     pub(crate) total: u64,
     pub(crate) direction: TransferDirection,
+}
+
+/// The render state overlaid on a file's chat line: either a live progress bar,
+/// or a persistent terminal label once the transfer ended without landing. Held
+/// per-room in `transfers` and cleared only on a disconnect or a successful
+/// completion (`FileReceived`/`TransferComplete`), never merely by progress
+/// reaching the total.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum TransferStatus {
+    Active(TransferProgress),
+    Terminal {
+        verb: TerminalVerb,
+        reason: Option<String>,
+    },
 }
 
 /// The canonical ordered message list and its dedup keys. The key set always
@@ -607,23 +621,24 @@ fn record_room_file(
 }
 
 fn update_transfer_progress(
-    transfers: &mut HashMap<FileTransferId, TransferProgress>,
+    transfers: &mut HashMap<FileTransferId, TransferStatus>,
     transfer_id: FileTransferId,
     transferred: u64,
     total: u64,
     direction: TransferDirection,
 ) {
-    if transferred >= total {
-        transfers.remove(&transfer_id);
-        return;
-    }
+    // A tick reaching `total` is no longer terminal: outgoing `transferred`
+    // counts source bytes (reached before the wire tail is sent) and incoming
+    // counts decoded bytes (reached before finalize), so clearing here would drop
+    // the bar/button while the transfer is still live. Clearing is driven only by
+    // the explicit terminal events.
     transfers.insert(
         transfer_id,
-        TransferProgress {
+        TransferStatus::Active(TransferProgress {
             transferred,
             total,
             direction,
-        },
+        }),
     );
 }
 
@@ -826,6 +841,17 @@ impl RoomSession {
     /// room buffers, so captured logs stay browsable offline.
     pub(crate) fn reset_for_disconnect(&mut self) {
         self.restore_archived_rooms();
+        // Drop every live/terminal transfer overlay: the worker's
+        // incoming_files/outgoing_uploads are gone, and server transfer ids are
+        // reused after a restart, so a stale entry could paint over or act on an
+        // unrelated transfer once we reconnect.
+        self.active.transfers.clear();
+        for room in self.parked.values_mut() {
+            room.transfers.clear();
+        }
+        for room in self.archived_rooms.values_mut() {
+            room.transfers.clear();
+        }
         self.stream_users.clear();
         let disconnected_at = Instant::now();
         for room in self.voice_seen.values_mut() {
@@ -1774,10 +1800,9 @@ impl RoomSession {
         );
     }
 
-    /// Records a progress tick for an in-flight transfer. A tick that reaches or
-    /// passes `total` is terminal: the entry is removed so the file line renders
-    /// as completed. This is the only clear path for an uploader without a
-    /// receive directory, which never emits a terminal `FileReceived`.
+    /// Records a progress tick for an in-flight transfer. Reaching `total` is not
+    /// terminal (see [`update_transfer_progress`]); the overlay clears on an
+    /// explicit terminal event ([`Self::clear_transfer`] or [`Self::end_transfer`]).
     pub(crate) fn transfer_progress(
         &mut self,
         room_id: RoomId,
@@ -1798,9 +1823,9 @@ impl RoomSession {
         );
     }
 
-    /// Removes any progress overlay for `transfer_id`, on completion or
-    /// cancel. A room with no in-memory state has no overlay to clear, so
-    /// this never materializes one from disk.
+    /// Removes any overlay for `transfer_id`, on successful completion
+    /// (`FileReceived`/`TransferComplete`). A room with no in-memory state has no
+    /// overlay to clear, so this never materializes one from disk.
     pub(crate) fn clear_transfer(&mut self, room_id: RoomId, transfer_id: FileTransferId) {
         let Some(room) = self.room_mut(room_id) else {
             return;
@@ -1808,9 +1833,28 @@ impl RoomSession {
         room.transfers.remove(&transfer_id);
     }
 
-    /// The live progress for `transfer_id`, if a transfer is in flight.
-    pub(crate) fn transfer(&self, transfer_id: FileTransferId) -> Option<TransferProgress> {
-        self.active.transfers.get(&transfer_id).copied()
+    /// Replaces any overlay for `transfer_id` with a persistent terminal label,
+    /// on a skip/cancel/failure. Unlike [`Self::clear_transfer`], this leaves a
+    /// visible `verb: reason` marker on the file line.
+    pub(crate) fn end_transfer(
+        &mut self,
+        room_id: RoomId,
+        transfer_id: FileTransferId,
+        verb: TerminalVerb,
+        reason: Option<String>,
+    ) {
+        let Some(room) = self.room_mut(room_id) else {
+            return;
+        };
+        room.transfers
+            .insert(transfer_id, TransferStatus::Terminal { verb, reason });
+    }
+
+    /// The overlay state for `transfer_id`: a live progress bar or a terminal
+    /// label. Cloned out so the renderer can drop the `&self` borrow before it
+    /// needs `&mut app` to record the cancel/skip button.
+    pub(crate) fn transfer(&self, transfer_id: FileTransferId) -> Option<TransferStatus> {
+        self.active.transfers.get(&transfer_id).cloned()
     }
 
     pub(super) fn push_notice(&mut self, sender: impl Into<String>, body: impl Into<String>) {
@@ -2491,21 +2535,64 @@ mod tests {
         assert_eq!(names, ["Bob", "zoe", "adam", "carl", "dave", "abe"]);
     }
 
+    fn active_progress(room: &RoomSession, id: FileTransferId) -> TransferProgress {
+        match room.transfer(id).expect("overlay recorded") {
+            TransferStatus::Active(progress) => progress,
+            other => panic!("expected active progress, got {other:?}"),
+        }
+    }
+
     #[test]
-    fn transfer_progress_tracks_then_clears_on_completion() {
+    fn transfer_progress_survives_reaching_total() {
         let mut room = test_room();
         let id = FileTransferId(7);
         room.viewed_room = Some(RoomId(1));
         room.transfer_progress(RoomId(1), id, 0, 100, TransferDirection::Incoming);
-        let progress = room.transfer(id).expect("progress recorded");
-        assert_eq!(progress.transferred, 0);
-        assert_eq!(progress.total, 100);
+        assert_eq!(active_progress(&room, id).transferred, 0);
+        assert_eq!(active_progress(&room, id).total, 100);
         room.transfer_progress(RoomId(1), id, 40, 100, TransferDirection::Incoming);
-        assert_eq!(room.transfer(id).unwrap().transferred, 40);
-        // Reaching total is terminal: the entry is dropped so the line reverts to
-        // its completed rendering.
+        assert_eq!(active_progress(&room, id).transferred, 40);
+        // Reaching total is no longer terminal: the overlay (and its cancel/skip
+        // button) stays until an explicit completion or terminal event.
         room.transfer_progress(RoomId(1), id, 100, 100, TransferDirection::Incoming);
+        assert_eq!(active_progress(&room, id).transferred, 100);
+        room.clear_transfer(RoomId(1), id);
         assert!(room.transfer(id).is_none());
+    }
+
+    #[test]
+    fn end_transfer_leaves_a_terminal_label() {
+        let mut room = test_room();
+        let id = FileTransferId(9);
+        room.viewed_room = Some(RoomId(1));
+        room.transfer_progress(RoomId(1), id, 10, 100, TransferDirection::Incoming);
+        room.end_transfer(
+            RoomId(1),
+            id,
+            TerminalVerb::Skipped,
+            Some("Sender aborted transfer".to_string()),
+        );
+        assert_eq!(
+            room.transfer(id),
+            Some(TransferStatus::Terminal {
+                verb: TerminalVerb::Skipped,
+                reason: Some("Sender aborted transfer".to_string()),
+            })
+        );
+    }
+
+    #[test]
+    fn reset_for_disconnect_clears_transfers() {
+        let mut room = test_room();
+        let id = FileTransferId(4);
+        room.viewed_room = Some(RoomId(1));
+        room.transfer_progress(RoomId(1), id, 10, 100, TransferDirection::Outgoing);
+        assert!(room.transfer(id).is_some());
+        room.reset_for_disconnect();
+        assert!(
+            room.transfer(id).is_none(),
+            "stale transfer overlays must not survive a reconnect"
+        );
     }
 
     #[test]
@@ -3251,7 +3338,7 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(room.merge_history(RoomId(1), older, Some(UserId(1))));
 
-        assert_eq!(room.transfer(FileTransferId(7)).unwrap().transferred, 25);
+        assert_eq!(active_progress(&room, FileTransferId(7)).transferred, 25);
     }
 
     #[test]

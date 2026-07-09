@@ -1,6 +1,7 @@
 use extui::Rect;
 
 use crate::{bindings::PendingChord, tui::render::KeyPreviewCache};
+use rpc::ids::FileTransferId;
 
 #[derive(Default)]
 pub(crate) struct BindingState {
@@ -53,4 +54,7 @@ pub(crate) struct ChromeState {
     pub(crate) key_preview: KeyPreviewState,
     pub(crate) top_bar: TopBarLayout,
     pub(crate) lobby_bar: LobbyBarLayout,
+    /// Cancel/skip button hit-boxes for the transfers rendered this frame, keyed
+    /// by server transfer id. Rebuilt every frame by `draw_transfer_progress`.
+    pub(crate) transfer_buttons: Vec<(Rect, FileTransferId)>,
 }

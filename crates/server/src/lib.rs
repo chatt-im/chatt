@@ -1853,6 +1853,11 @@ impl Server {
                 self.cancel_file_upload(session_id, transfer_id, reason);
                 Ok(())
             }
+            (ConnState::Ready, ClientControl::SkipFile { transfer_id }) => {
+                let session_id = self.session_for_token(token)?;
+                self.skip_file_download(session_id, transfer_id);
+                Ok(())
+            }
             (
                 ConnState::Ready,
                 ClientControl::StartShare {
@@ -3164,6 +3169,7 @@ impl Server {
                 wire_received: 0,
                 file_name,
                 recipients: recipients.clone(),
+                declined_notified: false,
             },
         );
         let accepted = self.send_control_to_token(
@@ -3212,7 +3218,43 @@ impl Server {
         if let Some(upload) = self.active_uploads.get_mut(&key) {
             upload.recipients = recipients;
         }
+        // The room has other members, but none accepted the file (all have
+        // downloads disabled or a smaller limit): the upload would stream to
+        // nobody, so tell the uploader to cancel it. An upload into a room with
+        // no other members completes normally and gets no false decline.
+        if !transfer_members.is_empty() {
+            self.notify_upload_declined(key, "recipient declined");
+        }
         Ok(())
+    }
+
+    /// Tells the uploader, once, that transfer `key` has lost every recipient so
+    /// it can cancel the now-pointless upload. The upload stays registered: the
+    /// uploader replies with [`ClientControl::UploadFileCancel`], which tears it
+    /// down through [`Self::cancel_file_upload`] without the `Err` that removing
+    /// it here would turn into an uploader disconnect. A no-op when the transfer
+    /// is gone, still has recipients, or was already notified.
+    fn notify_upload_declined(&mut self, key: (SessionId, FileTransferId), reason: &str) {
+        let Some(upload) = self.active_uploads.get(&key) else {
+            return;
+        };
+        if !upload.recipients.is_empty() || upload.declined_notified {
+            return;
+        }
+        let (uploader, client_transfer_id) = key;
+        let Some(token) = self.live_token_for_session(uploader) else {
+            return;
+        };
+        let _ = self.send_control_to_token(
+            token,
+            &ServerControl::UploadDeclined {
+                client_transfer_id,
+                reason: reason.to_string(),
+            },
+        );
+        if let Some(upload) = self.active_uploads.get_mut(&key) {
+            upload.declined_notified = true;
+        }
     }
 
     fn receive_file_chunk(
@@ -3250,6 +3292,14 @@ impl Server {
             chunk_size = data.len(),
             recipient_count = recipients.len()
         );
+        // The recipient set can already be empty (all skipped/left): the offset
+        // check above still runs so a resuming uploader stays consistent, but
+        // there is nobody to relay to. The uploader has been (or is about to be)
+        // told to cancel via `notify_upload_declined`.
+        if recipients.is_empty() {
+            self.notify_upload_declined(key, "recipient declined");
+            return Ok(());
+        }
         let control = ServerControl::FileChunk {
             transfer_id: server_transfer_id,
             offset,
@@ -3275,6 +3325,9 @@ impl Server {
                 upload.recipients.remove(&recipient);
             }
         }
+        // If that prune took the last recipient, stop the uploader now rather
+        // than waiting for the next chunk's empty check.
+        self.notify_upload_declined(key, "recipient declined");
         Ok(())
     }
 
@@ -3348,6 +3401,35 @@ impl Server {
             .collect::<Vec<_>>();
         for transfer_id in keys {
             self.cancel_file_upload(session_id, transfer_id, reason.to_string());
+        }
+    }
+
+    /// Drops `session_id` from an in-flight transfer's recipient set when that
+    /// recipient skips the download. `active_uploads` is keyed by the uploader's
+    /// `(SessionId, client FileTransferId)`, so the transfer is located by a
+    /// value scan on `server_transfer_id` (at most
+    /// `MAX_ACTIVE_UPLOADS_PER_SESSION` per uploader). Removal stops
+    /// [`Self::receive_file_chunk`] and [`Self::complete_file_upload`] from
+    /// relaying anything further to this recipient; the upload continues for the
+    /// remaining recipients, or — when this was the last one — the uploader is
+    /// told to cancel via [`Self::notify_upload_declined`].
+    fn skip_file_download(&mut self, session_id: SessionId, server_transfer_id: FileTransferId) {
+        let Some((key, upload)) = self
+            .active_uploads
+            .iter_mut()
+            .find(|(_, upload)| upload.server_transfer_id == server_transfer_id)
+        else {
+            return;
+        };
+        let key = *key;
+        if upload.recipients.remove(&session_id) {
+            kvlog::info!(
+                "file download skipped",
+                session_id = session_id.0,
+                room_id = upload.room_id.0,
+                server_transfer_id = server_transfer_id.0
+            );
+            self.notify_upload_declined(key, "recipient declined");
         }
     }
 
@@ -5122,6 +5204,10 @@ struct ServerUpload {
     /// released when the upload completes or cancels.
     file_name: String,
     recipients: HashSet<SessionId>,
+    /// Set once the uploader has been told (via [`ServerControl::UploadDeclined`])
+    /// that its recipient set emptied, so later chunks arriving before the
+    /// uploader's cancel don't re-notify.
+    declined_notified: bool,
 }
 
 fn session_accepts_file(session: &Session, original_size: u64) -> bool {
@@ -5529,6 +5615,7 @@ fn client_control_kind(control: &ClientControl) -> &'static str {
         ClientControl::JoinVoice { .. } => "join_voice",
         ClientControl::LeaveVoice => "leave_voice",
         ClientControl::OpenDm { .. } => "open_dm",
+        ClientControl::SkipFile { .. } => "skip_file",
     }
 }
 
@@ -5568,6 +5655,7 @@ fn server_control_kind(control: &ServerControl) -> &'static str {
         ServerControl::BugReportSaved { .. } => "bug_report_saved",
         ServerControl::RoomUpserted { .. } => "room_upserted",
         ServerControl::DmOpened { .. } => "dm_opened",
+        ServerControl::UploadDeclined { .. } => "upload_declined",
     }
 }
 
@@ -6267,6 +6355,23 @@ mod tests {
         server
             .sessions
             .insert(session_id, test_session(user_id, token, None));
+        peer
+    }
+
+    /// Like [`live_user`], but the session accepts relayed files, so it lands in
+    /// a transfer's recipient set.
+    fn live_receiver(
+        server: &mut Server,
+        token: Token,
+        session_id: SessionId,
+        user_id: UserId,
+    ) -> std::net::TcpStream {
+        let (conn, peer) = test_live_client();
+        server.clients.insert(token, conn);
+        let mut session = test_session(user_id, token, None);
+        session.receive_files = true;
+        session.file_receive_limit_bytes = u64::MAX;
+        server.sessions.insert(session_id, session);
         peer
     }
 
@@ -7539,6 +7644,7 @@ mod tests {
                 wire_received: 0,
                 file_name: "clogged.bin".to_string(),
                 recipients: HashSet::from([recipient_session]),
+                declined_notified: false,
             },
         );
 
@@ -8022,6 +8128,189 @@ mod tests {
 
         assert!(server.active_uploads.is_empty());
         assert!(server.reserved_file_names.is_empty());
+    }
+
+    #[test]
+    fn skip_file_download_drops_only_the_skipping_recipient() {
+        let mut server = test_server();
+        let room_id = server.default_room;
+        let uploader = SessionId(1);
+        let recipient_a = SessionId(2);
+        let recipient_b = SessionId(3);
+        let _uploader_peer = live_user(&mut server, Token(11), uploader, UserId(9));
+        let _peer_a = live_receiver(&mut server, Token(12), recipient_a, UserId(10));
+        let _peer_b = live_receiver(&mut server, Token(13), recipient_b, UserId(11));
+
+        server
+            .start_file_upload(
+                uploader,
+                room_id,
+                FileTransferId(1),
+                "report.pdf".to_string(),
+                8,
+                FileContentEncoding::Identity,
+            )
+            .unwrap();
+        let key = (uploader, FileTransferId(1));
+        let server_transfer_id = server.active_uploads[&key].server_transfer_id;
+        assert!(
+            server.active_uploads[&key]
+                .recipients
+                .contains(&recipient_a)
+        );
+        assert!(
+            server.active_uploads[&key]
+                .recipients
+                .contains(&recipient_b)
+        );
+
+        server.skip_file_download(recipient_a, server_transfer_id);
+
+        let upload = server
+            .active_uploads
+            .get(&key)
+            .expect("upload continues for the remaining recipients");
+        assert!(
+            !upload.recipients.contains(&recipient_a),
+            "the skipping recipient is dropped from the relay set"
+        );
+        assert!(
+            upload.recipients.contains(&recipient_b),
+            "other recipients keep receiving"
+        );
+        // The upload itself is unaffected and keeps accepting chunks.
+        server
+            .receive_file_chunk(uploader, FileTransferId(1), 0, vec![0u8; 8])
+            .unwrap();
+    }
+
+    #[test]
+    fn skip_file_download_for_unknown_transfer_is_a_noop() {
+        let mut server = test_server();
+        let session_id = SessionId(1);
+        let _peer = live_user(&mut server, Token(11), session_id, UserId(9));
+        // No panic, nothing to drop.
+        server.skip_file_download(session_id, FileTransferId(999));
+    }
+
+    #[test]
+    fn last_recipient_skip_notifies_uploader_and_keeps_upload() {
+        let mut server = test_server();
+        let room_id = server.default_room;
+        let uploader = SessionId(1);
+        let recipient = SessionId(2);
+        let mut uploader_peer = live_user(&mut server, Token(11), uploader, UserId(9));
+        let _recipient_peer = live_receiver(&mut server, Token(12), recipient, UserId(10));
+
+        server
+            .start_file_upload(
+                uploader,
+                room_id,
+                FileTransferId(1),
+                "report.pdf".to_string(),
+                8,
+                FileContentEncoding::Identity,
+            )
+            .unwrap();
+        let key = (uploader, FileTransferId(1));
+        let server_transfer_id = server.active_uploads[&key].server_transfer_id;
+
+        server.skip_file_download(recipient, server_transfer_id);
+
+        // The upload stays registered with an empty recipient set: removing it
+        // here would turn the uploader's next chunk into an error and disconnect
+        // it. The name stays reserved until the uploader's own cancel arrives.
+        let upload = server
+            .active_uploads
+            .get(&key)
+            .expect("upload stays registered so the uploader can cancel it");
+        assert!(upload.recipients.is_empty());
+        assert!(upload.declined_notified);
+        assert!(server.reserved_file_names.contains("report.pdf"));
+
+        let declined = read_until(&mut uploader_peer, |control| {
+            matches!(control, ServerControl::UploadDeclined { .. })
+        });
+        let ServerControl::UploadDeclined {
+            client_transfer_id,
+            reason,
+        } = declined
+        else {
+            unreachable!()
+        };
+        assert_eq!(client_transfer_id, FileTransferId(1));
+        assert_eq!(reason, "recipient declined");
+
+        // A chunk arriving before the uploader's cancel is accepted (offset
+        // validation still advances) but relayed to nobody.
+        server
+            .receive_file_chunk(uploader, FileTransferId(1), 0, vec![0u8; 8])
+            .unwrap();
+        assert_eq!(server.active_uploads[&key].wire_received, 8);
+    }
+
+    #[test]
+    fn upload_with_no_accepting_recipients_notifies_uploader() {
+        let mut server = test_server();
+        let room_id = server.default_room;
+        let uploader = SessionId(1);
+        let bystander = SessionId(2);
+        let mut uploader_peer = live_user(&mut server, Token(11), uploader, UserId(9));
+        // A room member who does not accept relayed files, so the transfer opens
+        // with a non-empty membership but an empty recipient set.
+        let _bystander_peer = live_user(&mut server, Token(12), bystander, UserId(10));
+
+        server
+            .start_file_upload(
+                uploader,
+                room_id,
+                FileTransferId(1),
+                "report.pdf".to_string(),
+                8,
+                FileContentEncoding::Identity,
+            )
+            .unwrap();
+        let key = (uploader, FileTransferId(1));
+        assert!(server.active_uploads[&key].recipients.is_empty());
+        assert!(server.active_uploads[&key].declined_notified);
+
+        let declined = read_until(&mut uploader_peer, |control| {
+            matches!(control, ServerControl::UploadDeclined { .. })
+        });
+        assert!(matches!(
+            declined,
+            ServerControl::UploadDeclined { reason, .. } if reason == "recipient declined"
+        ));
+    }
+
+    #[test]
+    fn upload_into_room_without_other_members_is_not_declined() {
+        let mut server = test_server();
+        let room_id = server.default_room;
+        let uploader = SessionId(1);
+        let _uploader_peer = live_user(&mut server, Token(11), uploader, UserId(9));
+
+        server
+            .start_file_upload(
+                uploader,
+                room_id,
+                FileTransferId(1),
+                "report.pdf".to_string(),
+                8,
+                FileContentEncoding::Identity,
+            )
+            .unwrap();
+        let key = (uploader, FileTransferId(1));
+        // No other members means nobody to decline; the upload completes as a
+        // sender-only save rather than showing a false "recipient declined".
+        assert!(!server.active_uploads[&key].declined_notified);
+        server
+            .receive_file_chunk(uploader, FileTransferId(1), 0, vec![0u8; 8])
+            .unwrap();
+        server
+            .complete_file_upload(uploader, FileTransferId(1))
+            .unwrap();
+        assert!(server.active_uploads.is_empty());
     }
 
     #[test]

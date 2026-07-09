@@ -7,6 +7,7 @@ use std::{
 use extui::{AnsiColor, Buffer, Ellipsis, HAlign, Rect, Style, vt::Modifier};
 use extui_bindings::LayerId;
 use extui_editor::Mode as EditorMode;
+use rpc::ids::FileTransferId;
 use unicode_width::UnicodeWidthStr;
 
 use crate::audio::StatsSnapshot;
@@ -16,12 +17,12 @@ use crate::{
         App, ChatPanelFocus, LocalVoiceMode, ParticipantState, ParticipantVoiceFeedback,
         ScreencastPhase, ServerEditDraft, ServerSelectItem, StatusKind,
         audio_supervisor::AudioHealthState,
-        room::{RoomSelectItem, TransferProgress},
+        room::{RoomSelectItem, TransferProgress, TransferStatus},
         volume_db_label,
     },
     bindings::{self, Reachable, ReachableKind},
     chat_buffer::{self, LineKind, NoticeKind},
-    client_net::{TransferDirection, format_bytes},
+    client_net::{TerminalVerb, TransferDirection, format_bytes},
     theme::{self, Theme},
     tui::modes::{LobbyListFocus, RoomLayout, SettingsMode, WelcomeMode},
     ui,
@@ -53,6 +54,7 @@ fn prepare_screen(app: &mut App, buf: &mut Buffer) -> Option<StatsSnapshot> {
     app.chrome.top_bar.mute = Rect::EMPTY;
     app.chrome.top_bar.deafen = Rect::EMPTY;
     app.chrome.top_bar.video = Rect::EMPTY;
+    app.chrome.transfer_buttons.clear();
     capture
 }
 
@@ -1407,10 +1409,11 @@ fn draw_chat(
             ),
             LineKind::Body => {
                 let msg = app.room.active.chat.message(line.message);
-                // A file message in flight overlays a progress bar on its single
-                // body line, keyed by the server transfer id. `transfer` returns a
-                // `Copy` snapshot, so no borrow of `app.room` outlives this read.
-                let progress = msg.file_transfer_id.and_then(|id| app.room.transfer(id));
+                // A file message overlays its single body line, keyed by the
+                // server transfer id: an in-flight transfer draws a progress bar,
+                // one that ended without landing draws a terminal label. `transfer`
+                // clones the status, so no borrow of `app.room` outlives this read.
+                let status = msg.file_transfer_id.and_then(|id| app.room.transfer(id));
                 let selected =
                     chat_focused && app.room.active.chat.is_selected(line.message, line.line);
                 let base = if selected {
@@ -1425,10 +1428,13 @@ fn draw_chat(
                 marker.with(base.patch(accent)).text(buf, "▌");
                 row.with(base).fill(buf);
                 if line.line == 0
-                    && let Some(progress) = progress
+                    && let Some(TransferStatus::Active(progress)) = status
+                    && let Some(transfer_id) = msg.file_transfer_id
                 {
-                    let name = msg.body.split('`').nth(1).unwrap_or(msg.body.as_str());
-                    draw_transfer_progress(row, base, progress, name, app, buf);
+                    // Copy out the name before the `msg` borrow of `app.room`
+                    // ends: recording the button hit-box needs `&mut app`.
+                    let name = msg.body.split('`').nth(1).unwrap_or(&msg.body).to_string();
+                    draw_transfer_progress(row, base, progress, &name, transfer_id, app, buf);
                 } else {
                     for seg in app.room.active.chat.line(line.message, line.line) {
                         let text = app.room.active.chat.segment_text(line.message, seg);
@@ -1447,6 +1453,20 @@ fn draw_chat(
                             buf.set_stringn(row.x + seg.col, row.y, text, max_width, style);
                         }
                     }
+                    // A terminal transfer keeps its plain body and gains a dim
+                    // `verb: reason` label where the cancel/skip button used to be.
+                    if line.line == 0
+                        && let Some(TransferStatus::Terminal { verb, reason }) = &status
+                    {
+                        draw_transfer_terminal(
+                            row,
+                            base,
+                            *verb,
+                            reason.as_deref(),
+                            &app.theme,
+                            buf,
+                        );
+                    }
                 }
             }
             LineKind::Ellipsis => {
@@ -1464,29 +1484,37 @@ fn draw_chat(
 /// Overlays an in-flight file transfer's progress on its chat-line `row`: the
 /// filled portion is drawn reversed over a `verb name done/total (pct%)` label,
 /// so the bar reads left to right and reverts to the plain body text once the
-/// overlay is cleared on completion.
+/// overlay is cleared on completion. A `[cancel]` (outgoing) or `[skip]`
+/// (incoming) button is reserved on the right and its hit-box recorded in
+/// `chrome.transfer_buttons` for [`App::process_chat_mouse`] to resolve clicks.
 fn draw_transfer_progress(
-    row: Rect,
+    mut row: Rect,
     base: Style,
     progress: TransferProgress,
     file_name: &str,
-    app: &App,
+    transfer_id: FileTransferId,
+    app: &mut App,
     buf: &mut Buffer,
 ) {
-    let width = row.w as usize;
-    if width == 0 {
+    if row.w == 0 {
         return;
     }
+    let (verb, button_text) = match progress.direction {
+        TransferDirection::Incoming => ("receiving", "[skip]"),
+        TransferDirection::Outgoing => ("sending", "[cancel]"),
+    };
+    // Carve a padded right-hand segment for the button, leaving the rest for the
+    // bar. On a row too narrow for both, the bar keeps the whole width.
+    let button_w = button_text.chars().count() as u16 + 2;
+    let button_rect = (row.w > button_w).then(|| row.take_right(button_w as i32));
+
+    let width = row.w as usize;
     let ratio = if progress.total == 0 {
         0.0
     } else {
         (progress.transferred as f64 / progress.total as f64).clamp(0.0, 1.0)
     };
     let pct = (ratio * 100.0).round() as u64;
-    let verb = match progress.direction {
-        TransferDirection::Incoming => "receiving",
-        TransferDirection::Outgoing => "sending",
-    };
     let label = format!(
         " {verb} {file_name}  {}/{} ({pct}%)",
         format_bytes(progress.transferred),
@@ -1499,7 +1527,7 @@ fn draw_transfer_progress(
     for col in 0..width {
         let ch = chars.get(col).copied().unwrap_or(' ');
         let style = if col < filled {
-            text_style.with_modifier(extui::vt::Modifier::REVERSED)
+            text_style.with_modifier(Modifier::REVERSED)
         } else {
             text_style
         };
@@ -1511,6 +1539,37 @@ fn draw_transfer_progress(
             style,
         );
     }
+    if let Some(button_rect) = button_rect {
+        let button_style = base.patch(app.theme.text).with_modifier(Modifier::REVERSED);
+        button_rect
+            .with(button_style)
+            .with(HAlign::Center)
+            .text(buf, button_text);
+        app.chrome.transfer_buttons.push((button_rect, transfer_id));
+    }
+}
+
+/// Draws the dim `verb: reason` (or bare `verb`) label for a transfer that ended
+/// without landing, right-aligned in the band the cancel/skip button occupied.
+/// Records no button hit-box, so the terminal line is inert.
+fn draw_transfer_terminal(
+    row: Rect,
+    base: Style,
+    verb: TerminalVerb,
+    reason: Option<&str>,
+    theme: &Theme,
+    buf: &mut Buffer,
+) {
+    if row.w == 0 {
+        return;
+    }
+    let label = match reason {
+        Some(reason) => format!("{}: {reason}", verb.label()),
+        None => verb.label().to_string(),
+    };
+    let width = (label.chars().count() as u16).min(row.w);
+    let x = row.x + row.w - width;
+    buf.set_stringn(x, row.y, &label, width as usize, base.patch(theme.subtle));
 }
 
 /// Draws a block heading: the `▟` marker, then the sender name on the left and
