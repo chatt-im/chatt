@@ -17,6 +17,7 @@ type ImageLoadState = "loading" | "loaded" | "error";
 
 const MANUAL_ZOOM_MIN = 0.1;
 const MANUAL_ZOOM_MAX = 8;
+const DEFAULT_AUTO_FIT_MAX = 3;
 const ZOOM_STEP = 0.25;
 const KEY_PAN_STEP = 32;
 
@@ -99,6 +100,7 @@ export default function ImageViewer(props: {
   const [viewportSize, setViewportSize] = createSignal<Size>({ width: 0, height: 0 });
   const [mode, setMode] = createSignal<"fit" | "manual">("fit");
   const [manualScale, setManualScale] = createSignal(1);
+  const [autoFitMaxScale, setAutoFitMaxScale] = createSignal(DEFAULT_AUTO_FIT_MAX);
   const [pan, setPan] = createSignal<Point>({ x: 0, y: 0 });
   const [loadState, setLoadState] = createSignal<ImageLoadState>(
     initialImageState.loadState,
@@ -110,7 +112,7 @@ export default function ImageViewer(props: {
   const pointers = new Map<number, Point>();
   const renderedPointers = new Map<number, Point>();
 
-  const fitScale = createMemo(() => {
+  const rawFitScale = createMemo(() => {
     const image = naturalSize();
     const viewport = viewportSize();
     if (
@@ -124,9 +126,10 @@ export default function ImageViewer(props: {
     return Math.min(viewport.width / image.width, viewport.height / image.height);
   });
 
+  const fitScale = createMemo(() => Math.min(rawFitScale(), autoFitMaxScale()));
   const scale = createMemo(() => (mode() === "fit" ? fitScale() : manualScale()));
-  const minScale = () => Math.min(MANUAL_ZOOM_MIN, fitScale());
-  const maxScale = () => Math.max(MANUAL_ZOOM_MAX, fitScale());
+  const minScale = () => Math.min(MANUAL_ZOOM_MIN, rawFitScale());
+  const maxScale = () => Math.max(MANUAL_ZOOM_MAX, rawFitScale());
   const zoomPercent = () => Math.round(scale() * 100);
 
   function clampPan(next: Point, atScale = scale()): Point {
@@ -172,6 +175,7 @@ export default function ImageViewer(props: {
           setLoadState(next.loadState);
           setMode("fit");
           setManualScale(1);
+          setAutoFitMaxScale(DEFAULT_AUTO_FIT_MAX);
           setPan({ x: 0, y: 0 });
         });
       },
@@ -199,6 +203,7 @@ export default function ImageViewer(props: {
   });
 
   function resetFit() {
+    setAutoFitMaxScale((current) => Math.max(current, rawFitScale()));
     batch(() => {
       setMode("fit");
       setPan({ x: 0, y: 0 });
