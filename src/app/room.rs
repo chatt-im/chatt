@@ -271,6 +271,11 @@ pub(crate) struct RoomSession {
     pub room_name: String,
     pub composer: Editor,
     pub composer_hl: EditorHighlighter,
+    /// A minimum composer height, in rows, set by dragging the Chat Log bar.
+    /// In-memory only (never persisted to config); `None` restores the
+    /// content-driven default. Survives sending so a dragged-taller composer
+    /// does not collapse back to one line once its message clears.
+    pub composer_min_rows: Option<u16>,
     command_completion: CommandCompletionState,
     ref_completion: RefCompletionState,
     /// The viewed room's buffered state. Present even before any room is
@@ -662,7 +667,7 @@ impl RoomSession {
         let mut composer =
             Editor::with_bindings(editor_bindings::vim(editor_bindings::VimOptions::default()));
         composer.set_wrap(true);
-        composer.set_height_bounds(1, config.ui.max_composer_height.max(1));
+        composer.set_height_bounds(1, u16::MAX);
         composer.set_theme(theme.editor_theme());
         composer.enter_insert_mode();
         let composer_hl = EditorHighlighter::new(&mut composer);
@@ -674,6 +679,7 @@ impl RoomSession {
             room_name: "servers".to_string(),
             composer,
             composer_hl,
+            composer_min_rows: None,
             command_completion: CommandCompletionState::default(),
             ref_completion: RefCompletionState::default(),
             active: ClientRoom::empty(config.ui.max_messages as usize, theme.syntax),

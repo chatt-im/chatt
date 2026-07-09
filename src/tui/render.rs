@@ -245,10 +245,10 @@ pub(crate) fn draw_room_screen(
     draw_top_bar(top_bar_area, app, buf, capture.as_ref());
 
     refresh_key_preview_cache(app, Some(layer));
-    let composer_height = composer_height(app, screen.w);
     let key_preview_height = key_preview_height(app, screen.w);
     let key_preview_area = screen.take_bottom(key_preview_height as i32);
     let status_area = screen.take_bottom(1);
+    let composer_height = composer_height(app, screen.w, screen.h.saturating_sub(4));
     let composer_area = screen.take_bottom(composer_height as i32);
     layout.composer_rect = composer_area;
     layout.compose_bar_rect = status_area;
@@ -262,13 +262,20 @@ pub(crate) fn draw_room_screen(
     draw_key_preview(key_preview_area, app, buf);
 }
 
-fn composer_height(app: &mut App, width: u16) -> u16 {
+fn composer_height(app: &mut App, width: u16, max_rows: u16) -> u16 {
+    if max_rows == 0 {
+        return 0;
+    }
     app.room.composer.resize(width.max(1));
-    app.room
-        .composer
-        .desired_height()
-        .min(app.config.ui.max_composer_height.max(1))
-        .max(1)
+    let floor = app.room.composer_min_rows.unwrap_or(1).max(1);
+    let config_cap = app.config.ui.max_composer_height.max(1);
+    let desired = app.room.composer.desired_height();
+    let height = if app.room.composer_min_rows.is_some() {
+        desired.max(floor)
+    } else {
+        desired.min(config_cap)
+    };
+    height.clamp(1, max_rows)
 }
 
 fn draw_user_list(
@@ -359,7 +366,7 @@ fn draw_workspace(
     now_ms: u64,
 ) {
     let mut rows = area;
-    let room_height = app.config.ui.room_height.min(rows.h.saturating_sub(1));
+    let room_height = app.config.ui.room_height.min(rows.h.saturating_sub(2));
     if room_height > 0 {
         let lobby_area = rows.take_top(room_height as i32);
         let (rooms_area, divider_area, users_area) = split_lobby_lists(lobby_area);
