@@ -18,8 +18,6 @@ theme = "tomorrow-night"
 [files]
 download = "persistent"
 download-dir = "/tmp/chatt-soundboard"
-max-upload-bytes = 52428800
-max-download-bytes = 52428800
 
 [audio]
 bitrate-bps = 48000

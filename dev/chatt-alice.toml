@@ -96,10 +96,6 @@ comment = "overlay2"
 [files]
 download = "memory"
 download-dir = "/tmp/chatt-alice"
-download-memory-bytes = 268435456
-max-upload-bytes = 52428800
-max-download-bytes = 52428800
-upload-rate-bytes = 0
 
 [p2p]
 enabled = false
