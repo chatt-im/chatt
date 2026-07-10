@@ -155,7 +155,7 @@ impl ModeStack {
         };
 
         // Chords never cross a navigation boundary, including overlays.
-        app.chrome.binding.pending_chord = None;
+        app.view.chrome.binding.pending_chord = None;
 
         match transition {
             ModeTransition::Set(mut mode) => {
@@ -308,7 +308,7 @@ mod tests {
         stack.apply_pending(&mut app);
 
         assert_eq!(stack.depth(), 1);
-        assert!(app.pending_transition.is_empty());
+        assert!(app.view.pending_transition.is_empty());
     }
 
     #[test]
@@ -323,15 +323,15 @@ mod tests {
         let _ = crate::bindings::resolve(
             &app.config.bindings.router,
             crate::bindings::WORKSPACE_LAYER,
-            &mut app.chrome.binding.pending_chord,
+            &mut app.view.chrome.binding.pending_chord,
             input,
         );
-        assert!(app.chrome.binding.pending_chord.is_some());
+        assert!(app.view.chrome.binding.pending_chord.is_some());
 
         app.push_mode(Box::new(OverlayMode));
         stack.apply_pending(&mut app);
 
-        assert!(app.chrome.binding.pending_chord.is_none());
+        assert!(app.view.chrome.binding.pending_chord.is_none());
         assert_eq!(stack.depth(), 2);
     }
 
@@ -363,7 +363,7 @@ mod tests {
         }
 
         let mut app = app();
-        let status_before = app.status.text().to_string();
+        let status_before = app.view.status.text().to_string();
         let consumed = Rc::new(Cell::new(false));
         let mut stack = ModeStack::new(
             Box::new(EventConsumer {
@@ -375,7 +375,7 @@ mod tests {
         stack.process_app_event(&mut app, AppEvent::ReportBug("details".to_string()));
 
         assert!(consumed.get());
-        assert_eq!(app.status.text(), status_before);
+        assert_eq!(app.view.status.text(), status_before);
     }
 
     #[test]

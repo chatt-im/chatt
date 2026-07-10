@@ -9,6 +9,7 @@ use rpc::ids::{MessageId, RoomId};
 
 use crate::{
     app::{
+        StatusState,
         commands::{CommandCompletionState, RefCompletionState},
         room::{
             ComposerSubmission, DeleteDenied, DeleteSelection, EditDenied, PendingEdit, RefJump,
@@ -18,11 +19,25 @@ use crate::{
     chat_buffer::NoticeKind,
     config::{Config, DefaultBindings},
     theme::Theme,
-    tui::editor::EditorHighlighter,
+    tui::{chrome::ChromeState, editor::EditorHighlighter, mode::PendingTransition},
+    ui::vu::MicLevelBallistics,
 };
 
 /// One terminal's exclusive UI state over the shared session.
 pub(crate) struct ClientView {
+    pub theme: Theme,
+    pub status: StatusState,
+    pub pending_transition: PendingTransition,
+    pub chrome: ChromeState,
+    /// Fast-attack/slow-release smoothing for the mic VU meter and dB readout,
+    /// so noise-reduction gating faint background noise reads as a steady level
+    /// instead of flicker. Applied in `prepare_screen`; display-only.
+    pub mic_level_ballistics: MicLevelBallistics,
+    pub quit_requested: bool,
+    /// When `true`, the lobby shows the detailed developer voice stats instead
+    /// of the collapsed per-participant latency estimate. Toggled by `/stats`,
+    /// session-only (defaults off each launch).
+    pub lobby_details: bool,
     pub composer: Editor,
     pub composer_hl: EditorHighlighter,
     /// A minimum composer height, in rows, set by dragging the Chat Log bar.
@@ -51,7 +66,7 @@ pub(crate) struct ClientView {
 }
 
 impl ClientView {
-    pub(crate) fn new(config: &Config, theme: &Theme) -> Self {
+    pub(crate) fn new(config: &Config, theme: Theme) -> Self {
         let bindings = config.ui.default_bindings;
         let editor_bindings = match bindings {
             DefaultBindings::Standard => editor_bindings::nano(),
@@ -64,8 +79,16 @@ impl ClientView {
         composer.enter_insert_mode();
         let composer_hl = EditorHighlighter::new(&mut composer);
         let max_messages = config.ui.max_messages as usize;
+        let syntax = theme.syntax;
 
         Self {
+            theme,
+            status: StatusState::new("select a server"),
+            pending_transition: PendingTransition::default(),
+            chrome: ChromeState::default(),
+            mic_level_ballistics: MicLevelBallistics::default(),
+            quit_requested: false,
+            lobby_details: false,
             composer,
             composer_hl,
             composer_min_rows: None,
@@ -74,12 +97,12 @@ impl ClientView {
             bindings,
             pending_edit: None,
             viewed_room: None,
-            active: RoomView::detached(max_messages, theme.syntax),
+            active: RoomView::detached(max_messages, syntax),
             parked: HashMap::new(),
             pending_clipboard: None,
             pending_url_open: None,
             max_messages,
-            syntax: theme.syntax,
+            syntax,
         }
     }
 
@@ -521,13 +544,16 @@ impl ClientView {
         self.active.chat.move_cursor_line(delta, width).is_some()
     }
 
-    pub(crate) fn apply_theme(&mut self, theme: &Theme) {
+    /// Adopts `theme` for this view: the buffers' syntax palette and the
+    /// composer's editor theme.
+    pub(crate) fn apply_theme(&mut self, theme: Theme) {
         self.syntax = theme.syntax;
         self.active.chat.set_syntax(theme.syntax);
         for room in self.parked.values_mut() {
             room.chat.set_syntax(theme.syntax);
         }
         self.composer.set_theme(theme.editor_theme());
+        self.theme = theme;
     }
 
     pub(crate) fn set_max_messages(&mut self, max_messages: u32) {

@@ -2761,7 +2761,7 @@ mod tests {
     fn test_room() -> TestClient {
         TestClient {
             session: RoomSession::new(&Config::default()),
-            view: ClientView::new(&Config::default(), &Theme::tomorrow_night()),
+            view: ClientView::new(&Config::default(), Theme::tomorrow_night()),
         }
     }
 
@@ -4515,7 +4515,7 @@ mod tests {
         config.ui.default_bindings = DefaultBindings::Vim;
         TestClient {
             session: RoomSession::new(&config),
-            view: ClientView::new(&config, &Theme::tomorrow_night()),
+            view: ClientView::new(&config, Theme::tomorrow_night()),
         }
     }
 

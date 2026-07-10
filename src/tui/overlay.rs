@@ -40,7 +40,7 @@ impl DialogMode {
 
 impl AppMode for DialogMode {
     fn render(&mut self, app: &mut App, buf: &mut Buffer, _now_ms: u64) {
-        self.dialog.render(buf.rect(), buf, &app.theme);
+        self.dialog.render(buf.rect(), buf, &app.view.theme);
     }
 
     fn process_input(&mut self, app: &mut App, key: KeyEvent) -> Action {
@@ -129,7 +129,7 @@ impl ConfirmMode {
 
 impl AppMode for ConfirmMode {
     fn render(&mut self, app: &mut App, buf: &mut Buffer, _now_ms: u64) {
-        let theme = &app.theme;
+        let theme = &app.view.theme;
         let area = buf.rect();
         if area.w < 24 || area.h < 5 {
             self.cancel_button = Rect::EMPTY;
@@ -280,7 +280,7 @@ impl NativeEncryptionWarningMode {
 
 impl AppMode for NativeEncryptionWarningMode {
     fn render(&mut self, app: &mut App, buf: &mut Buffer, _now_ms: u64) {
-        let theme = &app.theme;
+        let theme = &app.view.theme;
         let area = buf.rect();
         if area.w < 34 || area.h < 11 {
             return;
@@ -362,7 +362,7 @@ impl AppMode for NativeEncryptionWarningMode {
             match bindings::resolve(
                 &app.config.bindings.router,
                 bindings::DIALOG_LAYER,
-                &mut app.chrome.binding.pending_chord,
+                &mut app.view.chrome.binding.pending_chord,
                 input,
             ) {
                 Resolved::Action(id) => {
@@ -506,7 +506,7 @@ impl PasswordPromptMode {
 
 impl AppMode for PasswordPromptMode {
     fn render(&mut self, app: &mut App, buf: &mut Buffer, _now_ms: u64) {
-        let theme = &app.theme;
+        let theme = &app.view.theme;
         let area = buf.rect();
         if area.w < 28 || area.h < 9 {
             return;
@@ -604,7 +604,7 @@ impl AppMode for PasswordPromptMode {
             match bindings::resolve(
                 &app.config.bindings.router,
                 bindings::PASSWORD_LAYER,
-                &mut app.chrome.binding.pending_chord,
+                &mut app.view.chrome.binding.pending_chord,
                 input,
             ) {
                 Resolved::Action(id) => {
@@ -867,7 +867,7 @@ impl PasteImageUploadMode {
 
 impl AppMode for PasteImageUploadMode {
     fn render(&mut self, app: &mut App, buf: &mut Buffer, _now_ms: u64) {
-        let theme = &app.theme;
+        let theme = &app.view.theme;
         let area = buf.rect();
         if area.w < 28 || area.h < 7 {
             return;
@@ -950,7 +950,7 @@ impl AppMode for PasteImageUploadMode {
             match bindings::resolve(
                 &app.config.bindings.router,
                 bindings::PASTE_LAYER,
-                &mut app.chrome.binding.pending_chord,
+                &mut app.view.chrome.binding.pending_chord,
                 input,
             ) {
                 Resolved::Action(id) => {
@@ -1057,7 +1057,7 @@ mod tests {
         );
 
         assert!(confirmed.get());
-        assert!(!app.pending_transition.is_empty());
+        assert!(!app.view.pending_transition.is_empty());
     }
 
     #[test]
@@ -1083,7 +1083,7 @@ mod tests {
         );
 
         assert!(!confirmed.get());
-        assert!(!app.pending_transition.is_empty());
+        assert!(!app.view.pending_transition.is_empty());
     }
 
     fn image_paste(source: ImagePasteSource, default_name: &str) -> ImagePaste {
@@ -1103,7 +1103,7 @@ mod tests {
                 ImagePasteSource::ExistingPath("/tmp/pic.png".into()),
                 "pic.png",
             ),
-            &app.theme,
+            &app.view.theme,
         );
         mode.editor.set_lines("");
         assert_eq!(mode.finalize_name(), "pic.png");
@@ -1117,7 +1117,7 @@ mod tests {
                 ImagePasteSource::StagedFile("/tmp/staged.png".into()),
                 "clipboard-image.png",
             ),
-            &app.theme,
+            &app.view.theme,
         );
         mode.editor.set_lines("holiday");
         assert_eq!(mode.finalize_name(), "holiday.png");
@@ -1133,7 +1133,7 @@ mod tests {
                 ImagePasteSource::StagedFile("/tmp/staged.png".into()),
                 "clipboard.png",
             ),
-            &app.theme,
+            &app.view.theme,
         );
         assert_eq!(mode.ghost_text(""), "clipboard.png");
         assert_eq!(mode.ghost_text("cat"), ".png");
@@ -1148,11 +1148,11 @@ mod tests {
                 ImagePasteSource::ExistingPath("/tmp/pic.png".into()),
                 "pic.png",
             ),
-            &app.theme,
+            &app.view.theme,
         );
         mode.submit(&mut app);
         assert!(mode.error.is_some());
-        assert!(app.pending_transition.is_empty());
+        assert!(app.view.pending_transition.is_empty());
     }
 
     #[test]
@@ -1163,18 +1163,18 @@ mod tests {
                 ImagePasteSource::ExistingPath("/tmp/pic.png".into()),
                 "pic.png",
             ),
-            &app.theme,
+            &app.view.theme,
         );
         let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::empty());
 
         // First Esc: editor leaves insert mode, dialog stays open.
         mode.process_input(&mut app, esc);
         assert_eq!(mode.editor.mode(), EditorMode::Normal);
-        assert!(app.pending_transition.is_empty());
+        assert!(app.view.pending_transition.is_empty());
 
         // Second Esc: from normal mode this cancels the dialog.
         mode.process_input(&mut app, esc);
-        assert!(!app.pending_transition.is_empty());
+        assert!(!app.view.pending_transition.is_empty());
     }
 
     #[test]
@@ -1185,11 +1185,11 @@ mod tests {
         std::fs::write(&path, b"bytes").unwrap();
         let mut mode = PasteImageUploadMode::new(
             image_paste(ImagePasteSource::StagedFile(path.clone()), "staged.png"),
-            &app.theme,
+            &app.view.theme,
         );
         mode.cancel(&mut app);
         assert!(!path.exists());
-        assert!(!app.pending_transition.is_empty());
+        assert!(!app.view.pending_transition.is_empty());
     }
 
     #[test]
@@ -1200,7 +1200,7 @@ mod tests {
                 ImagePasteSource::ExistingPath("/tmp/pic.png".into()),
                 "pic.png",
             ),
-            &app.theme,
+            &app.view.theme,
         );
         let chrome = mode.presentation(&app).chrome.expect("dialog chrome");
         assert!(chrome.layer == bindings::PASTE_LAYER);
@@ -1334,7 +1334,7 @@ mod tests {
         );
 
         assert!(app.pending_pair.is_none());
-        assert!(!app.pending_transition.is_empty());
+        assert!(!app.view.pending_transition.is_empty());
     }
 
     #[test]
@@ -1365,6 +1365,6 @@ mod tests {
             app.pending_pair.as_ref().unwrap().server.server_public_key,
             key
         );
-        assert!(app.pending_transition.is_empty());
+        assert!(app.view.pending_transition.is_empty());
     }
 }
