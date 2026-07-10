@@ -76,6 +76,8 @@ const EDIT_ACTION_WINDOW = 200;
 const DELETE_ACTION_WINDOW = 256;
 
 type MessageGroupInfo = {
+  // Hidden messages inherit their root section's key so reference jumps can
+  // expand exactly that section.
   key: string;
   continuation: boolean;
   messageCount: number;
@@ -87,6 +89,11 @@ type MessageList = {
   visible: WebMessage[];
   groups: Map<WebMessage, MessageGroupInfo>;
 };
+
+// Each value is the first message after a collapsed section, or null when the
+// section extends to the end of its sender group. Explicit ends keep sibling
+// sections independent when either one is expanded.
+type CollapsedSections = ReadonlyMap<string, string | null>;
 
 type PendingWebEdit = {
   target: number;
@@ -108,7 +115,7 @@ function isMessageContinuation(
   );
 }
 
-function messageGroupKey(message: WebMessage): string {
+function messageCollapseKey(message: WebMessage): string {
   return `${message.timestamp_ms}:${message.message_id}:${message.id}`;
 }
 
@@ -117,11 +124,12 @@ function debugMessageKey(message: WebMessage | undefined): string | undefined {
   return `${message.timestamp_ms}:${message.message_id}:${message.id}`;
 }
 
-// Projects the flat feed into header-led sender groups. A collapsed group keeps
-// one compact header row in the virtualizer and omits every message body.
+// Projects the flat feed into sender groups. Collapsed ranges are root-level
+// siblings: an existing section bounds the section before it instead of being
+// nested inside that section.
 function buildMessageList(
   messages: readonly WebMessage[],
-  collapsedGroups: ReadonlySet<string>
+  collapsedSections: CollapsedSections
 ): MessageList {
   const visible: WebMessage[] = [];
   const groups = new Map<WebMessage, MessageGroupInfo>();
@@ -135,29 +143,57 @@ function buildMessageList(
       end++;
     }
 
-    const header = messages[start]!;
-    const key = messageGroupKey(header);
-    const messageCount = end - start;
-    const collapsed = collapsedGroups.has(key);
-    visible.push(header);
-    groups.set(header, {
-      key,
-      continuation: false,
-      messageCount,
-      collapsed,
-      newestOffset: messages.length - start,
-    });
+    const sections: { start: number; end: number; key: string }[] = [];
+    for (let index = start; index < end; index++) {
+      const key = messageCollapseKey(messages[index]!);
+      if (!collapsedSections.has(key)) continue;
 
-    for (let index = start + 1; index < end; index++) {
-      const child = messages[index]!;
-      groups.set(child, {
-        key,
-        continuation: true,
-        messageCount,
+      const endKey = collapsedSections.get(key);
+      let sectionEnd = end;
+      if (endKey) {
+        for (let candidate = index + 1; candidate < end; candidate++) {
+          if (messageCollapseKey(messages[candidate]!) === endKey) {
+            sectionEnd = candidate;
+            break;
+          }
+        }
+      }
+      sections.push({ start: index, end: sectionEnd, key });
+    }
+
+    // Group edits or prepended history can bring formerly separate sections
+    // together. Clamp them at the next root boundary to preserve no-nesting.
+    for (let index = 0; index < sections.length; index++) {
+      const nextStart = sections[index + 1]?.start ?? end;
+      sections[index]!.end = Math.min(sections[index]!.end, nextStart);
+    }
+
+    let sectionIndex = 0;
+    for (let index = start; index < end; index++) {
+      const message = messages[index]!;
+      while (
+        sectionIndex < sections.length &&
+        index >= sections[sectionIndex]!.end
+      ) {
+        sectionIndex++;
+      }
+      const section = sections[sectionIndex];
+      const collapsed =
+        !!section && index >= section.start && index < section.end;
+      const collapseStart = collapsed && index === section!.start;
+      const nextBoundary = section?.start ?? end;
+      groups.set(message, {
+        key: collapsed ? section!.key : messageCollapseKey(message),
+        // A collapsed continuation becomes a compact header of its own until
+        // expanded, while preceding rows retain their original grouping.
+        continuation: index > start && !collapseStart,
+        messageCount: collapsed
+          ? section!.end - section!.start
+          : nextBoundary - index,
         collapsed,
         newestOffset: messages.length - index,
       });
-      if (!collapsed) visible.push(child);
+      if (!collapsed || collapseStart) visible.push(message);
     }
     start = end;
   }
@@ -615,7 +651,7 @@ function estimateMessageRowSize(
   group: MessageGroupInfo,
   layout: MessageEstimateLayout = DEFAULT_MESSAGE_ESTIMATE_LAYOUT
 ): number {
-  if (group.collapsed) return 34;
+  if (group.collapsed) return 38;
 
   let height = group.continuation ? 2 : 31;
   height += estimateFragmentsHeight(message.fragments, layout);
@@ -809,12 +845,17 @@ function Attachment(props: {
   const cachedImage = () =>
     att().kind === "image" ? cachedImageState(url()) : undefined;
   const imageUnavailable = () => cachedImage()?.status === "error";
+  const hasIntrinsicImageSize = () =>
+    (att().width ?? 0) > 0 && (att().height ?? 0) > 0;
   const missingImageStyle = () => {
     const width = att().width ?? 0;
     const height = att().height ?? 0;
     if (width > 0 && height > 0) {
       return {
-        width: `${width}px`,
+        // Unlike a replaced <img>, the placeholder div does not transfer its
+        // max-height constraint back to its width. Apply the equivalent width
+        // cap explicitly so the intrinsic ratio survives the 50vh limit.
+        width: `min(${width}px, 100%, ${(50 * width) / height}vh)`,
         "aspect-ratio": `${width} / ${height}`,
       };
     }
@@ -886,6 +927,7 @@ function Attachment(props: {
           >
             <div
               class="media-image media-image-missing"
+              classList={{ "has-intrinsic-size": hasIntrinsicImageSize() }}
               style={missingImageStyle()}
               role="img"
               aria-label={`${att().name} failed to load`}
@@ -1073,8 +1115,17 @@ function MessageRow(props: {
       }}
       data-ts={props.message.timestamp_ms}
       data-mid={props.message.message_id}
-      onClick={() => {
-        if (props.group.collapsed) props.onToggleGroup(props.group.key);
+      onClick={(event) => {
+        if (!props.group.collapsed) return;
+        const active = document.activeElement;
+        if (
+          event.detail > 0 &&
+          active instanceof HTMLElement &&
+          event.currentTarget.contains(active)
+        ) {
+          active.blur();
+        }
+        props.onToggleGroup(props.group.key);
       }}
     >
       {/* The time always lives in the left gutter so it sits in one consistent
@@ -1095,30 +1146,31 @@ function MessageRow(props: {
             </span>
           </Show>
         </div>
-        <button
-          class="message-group-toggle"
-          type="button"
-          aria-expanded={!props.group.collapsed}
-          aria-label={groupLabel()}
-          title={
-            props.group.collapsed
-              ? "Expand message group"
-              : "Collapse message group"
-          }
-          onClick={(event) => {
-            event.stopPropagation();
-            props.onToggleGroup(props.group.key);
-          }}
-        >
-          <Icon
-            name={
-              props.group.collapsed
-                ? "list-chevrons-up-down"
-                : "list-chevrons-down-up"
-            }
-          />
-        </button>
       </Show>
+      <button
+        class="message-group-toggle"
+        type="button"
+        aria-expanded={!props.group.collapsed}
+        aria-label={groupLabel()}
+        title={
+          props.group.collapsed
+            ? "Expand collapsed messages"
+            : "Collapse this message and those below"
+        }
+        onClick={(event) => {
+          event.stopPropagation();
+          if (event.detail > 0) event.currentTarget.blur();
+          props.onToggleGroup(props.group.key);
+        }}
+      >
+        <Icon
+          name={
+            props.group.collapsed
+              ? "list-chevrons-up-down"
+              : "list-chevrons-down-up"
+          }
+        />
+      </button>
       <Show when={!props.group.collapsed}>
         <MessageBody fragments={props.message.fragments} />
         <Show when={props.message.attachment}>
@@ -1301,11 +1353,10 @@ export default function App() {
   }
 
   const [messages, setMessages] = createSignal<WebMessage[]>([]);
-  const [collapsedGroups, setCollapsedGroups] = createSignal<
-    ReadonlySet<string>
-  >(new Set());
+  const [collapsedSections, setCollapsedSections] =
+    createSignal<CollapsedSections>(new Map());
   const messageList = createMemo(() =>
-    buildMessageList(messages(), collapsedGroups())
+    buildMessageList(messages(), collapsedSections())
   );
   const [refToast, setRefToast] = createSignal<string | null>(null);
   const [deleteError, setDeleteError] = createSignal<string | null>(null);
@@ -1827,10 +1878,36 @@ export default function App() {
   }
 
   function toggleMessageGroup(key: string) {
-    setCollapsedGroups((current) => {
-      const next = new Set(current);
-      if (next.has(key)) next.delete(key);
-      else next.add(key);
+    setCollapsedSections((current) => {
+      const next = new Map(current);
+      if (next.has(key)) {
+        next.delete(key);
+        return next;
+      }
+
+      const feed = messages();
+      const selected = feed.findIndex(
+        (message) => messageCollapseKey(message) === key
+      );
+      if (selected < 0) return current;
+
+      let groupEnd = selected + 1;
+      while (
+        groupEnd < feed.length &&
+        isMessageContinuation(feed[groupEnd]!, feed[groupEnd - 1])
+      ) {
+        groupEnd++;
+      }
+
+      let nextSection: string | null = null;
+      for (let index = selected + 1; index < groupEnd; index++) {
+        const candidate = messageCollapseKey(feed[index]!);
+        if (current.has(candidate)) {
+          nextSection = candidate;
+          break;
+        }
+      }
+      next.set(key, nextSection);
       return next;
     });
   }
@@ -1853,11 +1930,11 @@ export default function App() {
     if (!target) return;
 
     const group = messageList().groups.get(target);
-    const groupKeyToExpand = group?.collapsed ? group.key : null;
-    if (groupKeyToExpand) {
-      setCollapsedGroups((current) => {
-        const next = new Set(current);
-        next.delete(groupKeyToExpand);
+    const collapseKeyToExpand = group?.collapsed ? group.key : null;
+    if (collapseKeyToExpand) {
+      setCollapsedSections((current) => {
+        const next = new Map(current);
+        next.delete(collapseKeyToExpand);
         return next;
       });
     }
@@ -1871,7 +1948,7 @@ export default function App() {
     };
 
     // Let the virtualizer register restored child rows before addressing one.
-    if (groupKeyToExpand) requestAnimationFrame(scroll);
+    if (collapseKeyToExpand) requestAnimationFrame(scroll);
     else scroll();
   }
 
