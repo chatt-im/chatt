@@ -18,9 +18,13 @@ pub const COMPOSE_NORMAL_LAYER: LayerId = LayerId::new(7);
 pub const PASSWORD_LAYER: LayerId = LayerId::new(8);
 pub const PASTE_LAYER: LayerId = LayerId::new(9);
 pub const USER_LIST_LAYER: LayerId = LayerId::new(10);
+/// The chat log's visual-line mode: active while a visual anchor is set, so
+/// `y` yanks the selection instead of opening the yank chord.
+pub const CHAT_VISUAL_LAYER: LayerId = LayerId::new(11);
 
-const LAYER_TABLES: [(&str, LayerId); 10] = [
+const LAYER_TABLES: [(&str, LayerId); 11] = [
     ("workspace", WORKSPACE_LAYER),
+    ("chat-visual", CHAT_VISUAL_LAYER),
     ("compose-normal", COMPOSE_NORMAL_LAYER),
     ("insert", INSERT_LAYER),
     ("picker", PICKER_LAYER),
@@ -51,7 +55,13 @@ pub enum BindCommand {
     HalfPageDown,
     Top,
     Bottom,
+    ParagraphBack,
+    ParagraphForward,
+    ToggleVisual,
+    ClearSelection,
     CopySelection,
+    CopyLine,
+    CopyMessage,
     CopyMessageRef,
     InsertMessageRef,
     OpenMessageRef,
@@ -113,7 +123,13 @@ impl std::fmt::Display for BindCommand {
             HalfPageDown => "HalfPageDown",
             Top => "Top",
             Bottom => "Bottom",
+            ParagraphBack => "ParagraphBack",
+            ParagraphForward => "ParagraphForward",
+            ToggleVisual => "ToggleVisual",
+            ClearSelection => "ClearSelection",
             CopySelection => "CopySelection",
+            CopyLine => "CopyLine",
+            CopyMessage => "CopyMessage",
             CopyMessageRef => "CopyMessageRef",
             InsertMessageRef => "InsertMessageRef",
             OpenMessageRef => "OpenMessageRef",
@@ -187,7 +203,13 @@ impl BindCommand {
             HalfPageDown => spec("Page Down", NAV),
             Top => spec("Top", NAV),
             Bottom => spec("Bottom", NAV),
+            ParagraphBack => spec("Prev Block", NAV),
+            ParagraphForward => spec("Next Block", NAV),
+            ToggleVisual => spec("Visual", NAV),
+            ClearSelection => spec("Clear Sel", NAV),
             CopySelection => spec("Copy", ACTION),
+            CopyLine => spec("Yank Line", ACTION),
+            CopyMessage => spec("Yank Msg", ACTION),
             CopyMessageRef => spec("Copy Ref", ACTION),
             InsertMessageRef => spec("Quote", ACTION),
             OpenMessageRef => spec("Open Ref", ACTION),

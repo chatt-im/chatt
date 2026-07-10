@@ -1378,8 +1378,9 @@ fn draw_chat(
     // column less than the full chat width.
     let content_width = area.w.saturating_sub(1).max(1);
     if content_width != layout.chat_width {
-        // Reflow invalidates the (message, line) coordinates a selection holds.
-        app.room.active.chat.clear_selection();
+        // Reflow invalidates wrapped-line coordinates: the visual anchor is
+        // dropped and the cursor's line is clamped.
+        app.room.active.chat.on_reflow(content_width);
     }
     layout.chat_width = content_width;
     layout.chat_height = area.h;
@@ -1391,6 +1392,8 @@ fn draw_chat(
             .text(buf, "No messages");
         return;
     }
+    // Clamp a stale cursor (eviction, collapse) before styling against it.
+    app.room.active.chat.ensure_cursor(content_width);
     let lines =
         app.room
             .active
@@ -1405,15 +1408,7 @@ fn draw_chat(
         let mut row = row_area.take_top(1);
         let marker = row.take_left(1);
         match line.kind {
-            LineKind::Heading => draw_chat_heading(
-                marker,
-                row,
-                app,
-                line.message,
-                now_ms,
-                chat_focused && app.room.active.chat.is_header_selected(line),
-                buf,
-            ),
+            LineKind::Heading => draw_chat_heading(marker, row, app, line.message, now_ms, buf),
             LineKind::Body => {
                 let msg = app.room.active.chat.message(line.message);
                 // A file message overlays its single body line, keyed by the
@@ -1421,10 +1416,14 @@ fn draw_chat(
                 // one that ended without landing draws a terminal label. `transfer`
                 // clones the status, so no borrow of `app.room` outlives this read.
                 let status = msg.file_transfer_id.and_then(|id| app.room.transfer(id));
-                let selected =
-                    chat_focused && app.room.active.chat.is_selected(line.message, line.line);
-                let base = if selected {
-                    app.theme.selected_line
+                let visual_here =
+                    chat_focused && app.room.active.chat.is_visual(line.message, line.line);
+                let cursor_here =
+                    chat_focused && app.room.active.chat.is_cursor_line(line.message, line.line);
+                let base = if visual_here {
+                    app.theme.chat_visual_line
+                } else if cursor_here {
+                    app.theme.chat_cursor_line
                 } else if msg.local {
                     app.theme.local_line
                 } else {
@@ -1432,7 +1431,14 @@ fn draw_chat(
                 };
                 let accent = chat_entry_accent(app.theme, msg.local, msg.notice_kind);
                 marker.with(base).fill(buf);
-                marker.with(base.patch(accent)).text(buf, "▌");
+                // The cursor row's gutter stays identifiable even inside a
+                // visual range, where the background alone cannot mark it.
+                let marker_style = if cursor_here {
+                    base.patch(app.theme.text) | extui::vt::Modifier::BOLD
+                } else {
+                    base.patch(accent)
+                };
+                marker.with(marker_style).text(buf, "▌");
                 row.with(base).fill(buf);
                 if line.line == 0
                     && let Some(TransferStatus::Active(progress)) = status
@@ -1587,30 +1593,18 @@ fn draw_chat_heading(
     app: &App,
     message: usize,
     now_ms: u64,
-    selected: bool,
     buf: &mut Buffer,
 ) {
     let msg = app.room.active.chat.message(message);
-    let normal_base = if msg.local {
+    let base = if msg.local {
         app.theme.local_line
     } else {
         app.theme.background
     };
-    let base = if selected {
-        app.theme.mode_log
-    } else {
-        normal_base
-    };
     let accent = chat_entry_accent(app.theme, msg.local, msg.notice_kind);
-    let selected_base = selected_chat_heading_style(app.theme, accent);
-    let header_base = if selected {
-        selected_base.unwrap_or(base)
-    } else {
-        base
-    };
-    marker.with(normal_base).fill(buf);
-    marker.with(normal_base.patch(accent)).text(buf, "▟");
-    row.with(header_base).fill(buf);
+    marker.with(base).fill(buf);
+    marker.with(base.patch(accent)).text(buf, "▟");
+    row.with(base).fill(buf);
     let content = row.inset(1, 0);
     let name = if app.room.active.chat.is_collapsed(message) {
         format!("{} (Collapsed)", msg.sender)
@@ -1619,23 +1613,16 @@ fn draw_chat_heading(
     } else {
         msg.sender.clone()
     };
-    let name_style = if selected {
-        header_base
-    } else {
-        base.patch(accent)
-    };
     content
-        .with(name_style)
+        .with(base.patch(accent))
         .with(Ellipsis(true))
         .text(buf, &name);
     let age = chat_age(msg.timestamp_ms, now_ms);
     if !age.is_empty() {
-        let age_style = if selected {
-            header_base
-        } else {
-            base.patch(app.theme.subtle)
-        };
-        content.with(age_style).with(HAlign::Right).text(buf, &age);
+        content
+            .with(base.patch(app.theme.subtle))
+            .with(HAlign::Right)
+            .text(buf, &age);
     }
 }
 
@@ -1646,11 +1633,6 @@ fn chat_entry_accent(theme: Theme, local: bool, notice_kind: Option<NoticeKind>)
         None if local => theme.good,
         None => theme.accent,
     }
-}
-
-fn selected_chat_heading_style(theme: Theme, accent: Style) -> Option<Style> {
-    let color = accent.fg().or_else(|| accent.bg())?;
-    Some(theme.mode_log.with_bg(color))
 }
 
 #[cfg(test)]
@@ -1733,18 +1715,6 @@ mod tests {
             "stats view joins directions: {label}"
         );
         assert_eq!(label.matches("net20").count(), 2);
-    }
-
-    #[test]
-    fn selected_chat_heading_uses_message_accent_as_fill() {
-        let theme = Theme::tomorrow_night();
-        let local = selected_chat_heading_style(theme, theme.good).expect("local accent");
-        let remote = selected_chat_heading_style(theme, theme.accent).expect("remote accent");
-
-        assert_eq!(local.bg(), theme.good.fg());
-        assert_eq!(remote.bg(), theme.accent.fg());
-        assert_eq!(local.fg(), theme.mode_log.fg());
-        assert_eq!(remote.fg(), theme.mode_log.fg());
     }
 
     #[test]

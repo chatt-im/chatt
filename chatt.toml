@@ -167,7 +167,12 @@ viewer-in-seperate-browser-tab = false
 "LEFT" = "AdjustLeft"
 "RIGHT" = "AdjustRight"
 "c" = "ClearChat"
-"y" = "CopySelection"
+"v" = "ToggleVisual"
+"{" = "ParagraphBack"
+"}" = "ParagraphForward"
+"y" = { Label = "Yank" }
+"y y" = "CopyLine"
+"y m" = "CopyMessage"
 "Y" = "CopyMessageRef"
 "r" = "InsertMessageRef"
 "o" = "OpenMessageRef"
@@ -182,6 +187,13 @@ viewer-in-seperate-browser-tab = false
 "F3" = "OpenUserList"
 "F4" = "OpenRoomSettings"
 "." = "ToggleKeyPreview"
+
+# Active while the chat log has a visual-line selection (mouse drag or `v`).
+# `y` yanks the selection directly instead of opening the yank chord.
+[bindings.chat-visual]
+inherit = ["workspace"]
+"y" = "CopySelection"
+"ESC" = "ClearSelection"
 
 [bindings.list]
 "C-c" = "Quit"
