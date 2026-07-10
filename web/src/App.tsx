@@ -25,7 +25,12 @@ import ScreenShare from "./ScreenShare";
 import { ScreenShareDecoder, parseFrame } from "./video-decode";
 import { renderInline } from "./highlight";
 import { decodeFeed } from "./feed";
-import { markImageError, markImageLoaded } from "./image-cache";
+import {
+  cachedImageState,
+  markImageError,
+  markImageLoaded,
+} from "./image-cache";
+import { appendDebugLog, debugFlagEnabled } from "./debug-log";
 import Icon, { IconSprite } from "./Icon";
 import PreviewPanel, { previewKey, type PreviewItem } from "./PreviewPanel";
 import VideoPlayer from "./VideoPlayer";
@@ -35,8 +40,12 @@ import VideoPlayer from "./VideoPlayer";
 // not-at-bottom right after a programmatic scroll.
 const BOTTOM_EPSILON = 4;
 
-// Distance from the top, in pixels, at which scrolling up requests older history.
-const TOP_THRESHOLD = 200;
+// Request older history before the user reaches the hard top. A viewport-based
+// threshold hides normal paging latency without turning every small correction
+// near the top into another request.
+const TOP_PREFETCH_VIEWPORTS = 2;
+const TOP_PREFETCH_MIN = 800;
+const TOP_PREFETCH_MAX = 2400;
 
 // How many older messages one paging request asks for.
 const PAGE = 100;
@@ -83,6 +92,11 @@ function isMessageContinuation(
 }
 
 function messageGroupKey(message: WebMessage): string {
+  return `${message.timestamp_ms}:${message.message_id}:${message.id}`;
+}
+
+function debugMessageKey(message: WebMessage | undefined): string | undefined {
+  if (!message) return undefined;
   return `${message.timestamp_ms}:${message.message_id}:${message.id}`;
 }
 
@@ -139,6 +153,8 @@ const CONNECTION_ERROR_DELAY_MS = 3_000;
 type ImagePreload = {
   image: HTMLImageElement;
 };
+
+type OlderRequestSource = "scroll" | "ref";
 
 const DEFAULT_SHARE_PANE_HEIGHT = 360;
 const MIN_SHARE_PANE_HEIGHT = 160;
@@ -243,16 +259,6 @@ function imageDebugEnabled(): boolean {
   }
 }
 
-function debugFlagEnabled(queryParam: string, storageKey: string): boolean {
-  if (typeof location === "undefined") return false;
-  if (new URLSearchParams(location.search).has(queryParam)) return true;
-  try {
-    return localStorage.getItem(storageKey) === "1";
-  } catch {
-    return false;
-  }
-}
-
 function uploadDebugEnabled(): boolean {
   return debugFlagEnabled("debugUpload", "chatt.debugUpload");
 }
@@ -261,6 +267,10 @@ function socketDebugEnabled(): boolean {
   return (
     debugFlagEnabled("debugSocket", "chatt.debugSocket") || uploadDebugEnabled()
   );
+}
+
+function scrollDebugEnabled(): boolean {
+  return debugFlagEnabled("debugScroll", "chatt.debugScroll");
 }
 
 function debugImageTiming(stage: string, name: string, url: string) {
@@ -303,6 +313,11 @@ function debugSocket(stage: string, fields: Record<string, unknown> = {}) {
         : Math.round(performance.now() * 10) / 10,
     ...fields,
   });
+}
+
+function debugScroll(stage: string, fields: Record<string, unknown> = {}) {
+  if (!scrollDebugEnabled()) return;
+  appendDebugLog("scroll", stage, fields);
 }
 
 function delay(ms: number): Promise<void> {
@@ -436,6 +451,166 @@ type ContentFragment = TextFragment | CodeFragment;
 
 const fragmentHtmlCache = new WeakMap<ContentFragment, string>();
 const codeTextDecoder = new TextDecoder();
+
+const ESTIMATE_TEXT_LINE_HEIGHT = 22;
+const ESTIMATE_CODE_LINE_HEIGHT = 19;
+const ESTIMATE_CHAT_CONTENT_WIDTH = 720;
+const ESTIMATE_TEXT_CHARS_PER_LINE = 86;
+const ESTIMATE_TEXT_AVG_CHAR_WIDTH =
+  ESTIMATE_CHAT_CONTENT_WIDTH / ESTIMATE_TEXT_CHARS_PER_LINE;
+const ESTIMATE_IMAGE_MAX_HEIGHT = 460;
+const ESTIMATE_IMAGE_VIEWPORT_RATIO = 0.5;
+const ESTIMATE_MESSAGE_HORIZONTAL_PADDING = 72;
+const ESTIMATE_MIN_CONTENT_WIDTH = 240;
+const ESTIMATE_MEDIA_MARGIN_Y = 10;
+const ESTIMATE_VIDEO_HEIGHT = 240;
+
+type MessageEstimateLayout = {
+  contentWidth: number;
+  imageMaxHeight: number;
+};
+
+const DEFAULT_MESSAGE_ESTIMATE_LAYOUT: MessageEstimateLayout = {
+  contentWidth: ESTIMATE_CHAT_CONTENT_WIDTH,
+  imageMaxHeight: ESTIMATE_IMAGE_MAX_HEIGHT,
+};
+
+function countMatches(text: string, pattern: RegExp): number {
+  return text.match(pattern)?.length ?? 0;
+}
+
+function htmlTextForEstimate(html: string): string {
+  return html
+    .replace(/<br\s*\/?>/gi, "\n")
+    .replace(/<\/(?:p|li|h3|div|blockquote)>/gi, "\n")
+    .replace(/<[^>]*>/g, "")
+    .replace(/&(?:#\d+|#x[\da-f]+|[a-z][a-z\d]+);/gi, "x")
+    .replace(/[ \t\r\f\v]+/g, " ")
+    .trim();
+}
+
+function estimateWrappedLines(text: string, charsPerLine: number): number {
+  if (!text) return 0;
+  return text
+    .split("\n")
+    .reduce(
+      (lines, segment) =>
+        lines + Math.max(1, Math.ceil(segment.trim().length / charsPerLine)),
+      0
+    );
+}
+
+function estimateTextCharsPerLine(layout: MessageEstimateLayout): number {
+  return Math.max(
+    24,
+    Math.floor(layout.contentWidth / ESTIMATE_TEXT_AVG_CHAR_WIDTH)
+  );
+}
+
+function estimateTextFragmentHeight(
+  fragment: TextFragment,
+  layout: MessageEstimateLayout
+): number {
+  const html = fragment.html;
+  const text = htmlTextForEstimate(html);
+  if (!text) return 0;
+
+  const blockCount = Math.max(
+    1,
+    countMatches(html, /<(?:p|li|h3)\b/gi) +
+      countMatches(html, /<br\s*\/?>/gi)
+  );
+  const lines = Math.max(
+    blockCount,
+    estimateWrappedLines(text, estimateTextCharsPerLine(layout))
+  );
+  return lines * ESTIMATE_TEXT_LINE_HEIGHT + Math.max(0, blockCount - 1) * 6;
+}
+
+function estimateCodeFragmentHeight(fragment: CodeFragment): number {
+  let lines = 1;
+  for (const byte of fragment.text) {
+    if (byte === 10) {
+      lines += 1;
+    }
+  }
+  // Code blocks use `white-space: pre` with horizontal scrolling, so long
+  // lines affect width, not row height.
+  // Frame margins, border, and vertical padding from `.code-block-frame` and
+  // `.code-block`.
+  return lines * ESTIMATE_CODE_LINE_HEIGHT + 42;
+}
+
+function estimateFragmentsHeight(
+  fragments: readonly Fragment[],
+  layout: MessageEstimateLayout
+): number {
+  let height = 0;
+  for (const fragment of fragments) {
+    switch (fragment.kind) {
+      case "text":
+        height += estimateTextFragmentHeight(fragment, layout);
+        break;
+      case "code":
+        height += estimateCodeFragmentHeight(fragment);
+        break;
+      case "quote_start":
+        height += 6;
+        break;
+      case "quote_end":
+        break;
+    }
+  }
+  return height;
+}
+
+function estimateAttachmentHeight(
+  attachment: NonNullable<WebMessage["attachment"]>,
+  layout: MessageEstimateLayout
+): number {
+  switch (attachment.kind) {
+    case "image": {
+      const width = attachment.width ?? 0;
+      const height = attachment.height ?? 0;
+      if (width > 0 && height > 0) {
+        const scaledHeight =
+          height * Math.min(1, layout.contentWidth / width) + 12;
+        const imageHeight = Math.min(scaledHeight, layout.imageMaxHeight);
+        return (
+          ESTIMATE_MEDIA_MARGIN_Y + Math.max(72, Math.ceil(imageHeight))
+        );
+      }
+      return ESTIMATE_MEDIA_MARGIN_Y + 160;
+    }
+    case "video":
+      return ESTIMATE_MEDIA_MARGIN_Y + ESTIMATE_VIDEO_HEIGHT;
+    case "audio":
+      return ESTIMATE_MEDIA_MARGIN_Y + 40;
+    case "file":
+      return ESTIMATE_MEDIA_MARGIN_Y + 34;
+  }
+}
+
+function estimateMessageRowSize(
+  message: WebMessage,
+  group: MessageGroupInfo,
+  layout: MessageEstimateLayout = DEFAULT_MESSAGE_ESTIMATE_LAYOUT
+): number {
+  if (group.collapsed) return 34;
+
+  let height = group.continuation ? 2 : 31;
+  height += estimateFragmentsHeight(message.fragments, layout);
+
+  if (message.attachment) {
+    height += estimateAttachmentHeight(message.attachment, layout);
+  } else if (message.progress) {
+    height += 24;
+  } else if (message.terminal) {
+    height += 21;
+  }
+
+  return Math.max(24, Math.ceil(height));
+}
 
 function fragmentHtml(fragment: ContentFragment): string {
   let html = fragmentHtmlCache.get(fragment);
@@ -612,9 +787,26 @@ function Attachment(props: {
 }) {
   const att = () => props.message.attachment!;
   const url = () => fileUrl(att().name);
+  const cachedImage = () =>
+    att().kind === "image" ? cachedImageState(url()) : undefined;
+  const imageUnavailable = () => cachedImage()?.status === "error";
+  const missingImageStyle = () => {
+    const width = att().width ?? 0;
+    const height = att().height ?? 0;
+    if (width > 0 && height > 0) {
+      return {
+        width: `${width}px`,
+        "aspect-ratio": `${width} / ${height}`,
+      };
+    }
+    if (width > 0) return { width: `${width}px` };
+    return undefined;
+  };
   // Fades the image in on decode instead of snapping. The box is already
   // reserved by width/height, so this only affects the pixels, never layout.
-  const [loaded, setLoaded] = createSignal(false);
+  const [loaded, setLoaded] = createSignal(
+    cachedImage()?.status === "loaded"
+  );
   onMount(() => {
     if (att().kind === "image")
       debugImageTiming("img:mount", att().name, url());
@@ -647,27 +839,42 @@ function Attachment(props: {
             );
           }}
         >
-          <img
-            class="media-image"
-            classList={{ "is-loaded": loaded() }}
-            src={url()}
-            alt={att().name}
-            width={att().width ?? undefined}
-            height={att().height ?? undefined}
-            loading="eager"
-            decoding="async"
-            fetchpriority="high"
-            onLoad={(event) => {
-              markImageLoaded(url(), event.currentTarget);
-              debugImageTiming("img:load", att().name, url());
-              setLoaded(true);
-            }}
-            onError={() => {
-              markImageError(url());
-              debugImageTiming("img:error", att().name, url());
-              setLoaded(true);
-            }}
-          />
+          <Show
+            when={imageUnavailable()}
+            fallback={
+              <img
+                class="media-image"
+                classList={{ "is-loaded": loaded() }}
+                src={url()}
+                alt={att().name}
+                width={att().width ?? undefined}
+                height={att().height ?? undefined}
+                loading="eager"
+                decoding="async"
+                fetchpriority="high"
+                onLoad={(event) => {
+                  markImageLoaded(url(), event.currentTarget);
+                  debugImageTiming("img:load", att().name, url());
+                  setLoaded(true);
+                }}
+                onError={() => {
+                  markImageError(url());
+                  debugImageTiming("img:error", att().name, url());
+                  setLoaded(true);
+                }}
+              />
+            }
+          >
+            <div
+              class="media-image media-image-missing"
+              style={missingImageStyle()}
+              role="img"
+              aria-label={`${att().name} failed to load`}
+              title={`${att().name} failed to load`}
+            >
+              image unavailable
+            </div>
+          </Show>
         </a>
       </Show>
       <Show when={att().kind === "video"}>
@@ -857,6 +1064,7 @@ function MessageRow(props: {
 
 export default function App() {
   const standalone = standalonePreviewFromLocation();
+  const scrollDebugActive = scrollDebugEnabled();
   if (standalone) {
     const key = previewKey(standalone.item);
     document.title = `${standalone.item.name} — chatt`;
@@ -1048,6 +1256,9 @@ export default function App() {
   let oldestSeq = 0;
   let hasMore = false;
   let loadingOlder = false;
+  let topPagingArmed = true;
+  let prependSettling = false;
+  let prependSettleFrame: number | undefined;
 
   // HARD REQUIREMENT (see docs/web.md): while following, the view MUST stay glued
   // to the newest message and MUST NOT break when media grows the layout after a
@@ -1068,6 +1279,8 @@ export default function App() {
   let refJumping = false;
   let refJumpTimer: number | undefined;
   let pendingJumpFrame: number | undefined;
+  let lastScrollDebugAt = 0;
+  let lastTopBlockedDebugAt = 0;
 
   // Use virtua's measured geometry, not DOM scrollHeight: when tail items are
   // still unmeasured, totalSize is an estimate and scrollHeight can disagree.
@@ -1079,9 +1292,92 @@ export default function App() {
     );
   }
 
+  function chatViewportSize(): number {
+    return handle?.viewportSize || logEl?.clientHeight || 0;
+  }
+
+  function messageEstimateLayout(): MessageEstimateLayout {
+    const contentWidth = logEl?.clientWidth
+      ? Math.max(
+          ESTIMATE_MIN_CONTENT_WIDTH,
+          logEl.clientWidth - ESTIMATE_MESSAGE_HORIZONTAL_PADDING
+        )
+      : ESTIMATE_CHAT_CONTENT_WIDTH;
+    const imageMaxHeight =
+      typeof window === "undefined" || window.innerHeight <= 0
+        ? ESTIMATE_IMAGE_MAX_HEIGHT
+        : Math.max(72, window.innerHeight * ESTIMATE_IMAGE_VIEWPORT_RATIO);
+    return { contentWidth, imageMaxHeight };
+  }
+
+  function topRequestThreshold(): number {
+    const viewport = chatViewportSize();
+    if (viewport <= 0) return TOP_PREFETCH_MIN;
+    return clamp(
+      viewport * TOP_PREFETCH_VIEWPORTS,
+      TOP_PREFETCH_MIN,
+      TOP_PREFETCH_MAX
+    );
+  }
+
+  function topRearmThreshold(): number {
+    return topRequestThreshold() + Math.max(chatViewportSize(), 400);
+  }
+
+  function debugScrollState(
+    stage: string,
+    fields: Record<string, unknown> = {}
+  ) {
+    if (!scrollDebugActive) return;
+
+    const h = handle;
+    const el = logEl;
+    const estimateLayout = messageEstimateLayout();
+    const list = messageList().visible;
+    const topIndex =
+      h && h.scrollOffset >= 0 ? h.findItemIndex(h.scrollOffset) : undefined;
+    const topMessage =
+      topIndex !== undefined && topIndex >= 0 ? list[topIndex] : undefined;
+
+    debugScroll(stage, {
+      domTop: el?.scrollTop,
+      domScrollHeight: el?.scrollHeight,
+      domClientHeight: el?.clientHeight,
+      vOffset: h?.scrollOffset,
+      vScrollSize: h?.scrollSize,
+      vViewportSize: h?.viewportSize,
+      topIndex,
+      topMessage: debugMessageKey(topMessage),
+      messages: messages().length,
+      visible: list.length,
+      firstMessage: debugMessageKey(messages()[0]),
+      oldestSeq,
+      hasMore,
+      loadingOlder,
+      topPagingArmed,
+      prependSettling,
+      topRequestThreshold: topRequestThreshold(),
+      topRearmThreshold: topRearmThreshold(),
+      estimateContentWidth: estimateLayout.contentWidth,
+      estimateImageMaxHeight: estimateLayout.imageMaxHeight,
+      prepend: prepend(),
+      userDriving,
+      suppress,
+      following,
+      refJumping,
+      ...fields,
+    });
+  }
+
+  function debugNow(): number {
+    return typeof performance === "undefined" ? Date.now() : performance.now();
+  }
+
   // The ONLY thing allowed to flip `following`. Bound to genuine input events.
   function markUser() {
+    const wasDriving = userDriving;
     userDriving = true;
+    if (!wasDriving) debugScrollState("user-start");
     if (idleTimer) {
       clearTimeout(idleTimer);
       idleTimer = undefined;
@@ -1116,6 +1412,36 @@ export default function App() {
       cancelAnimationFrame(pendingJumpFrame);
       pendingJumpFrame = undefined;
     }
+  }
+
+  function clearPrependSettleFrame() {
+    if (prependSettleFrame !== undefined) {
+      cancelAnimationFrame(prependSettleFrame);
+      prependSettleFrame = undefined;
+    }
+  }
+
+  function finishPrependSettling() {
+    prependSettling = false;
+    prependSettleFrame = undefined;
+    const rearmThreshold = topRearmThreshold();
+    if (handle && handle.scrollOffset > rearmThreshold) {
+      topPagingArmed = true;
+    }
+    debugScrollState("prepend-settle-end", { rearmThreshold });
+  }
+
+  function holdPrependSettling() {
+    prependSettling = true;
+    clearPrependSettleFrame();
+    debugScrollState("prepend-settle-start");
+    prependSettleFrame = requestAnimationFrame(() => {
+      debugScrollState("prepend-settle-raf1");
+      prependSettleFrame = requestAnimationFrame(() => {
+        debugScrollState("prepend-settle-raf2");
+        finishPrependSettling();
+      });
+    });
   }
 
   function holdRefJump(ms: number) {
@@ -1156,13 +1482,25 @@ export default function App() {
     // Changing the split width can resize every mounted chat row. Let the
     // virtualizer process those measurements without repeatedly restarting
     // scrollToIndex's measurement loop; the drag end performs one final pin.
-    if (previewPanelResize || !handle || refJumping || !following) return;
+    if (previewPanelResize || !handle || refJumping || !following) {
+      debugScrollState("pin-skip", {
+        reason: {
+          previewPanelResize: !!previewPanelResize,
+          noHandle: !handle,
+          refJumping,
+          detached: !following,
+        },
+      });
+      return;
+    }
     const last = messages().length - 1;
     if (last < 0) return;
     suppressProgrammaticScroll(250);
+    const target = Math.max(0, handle.scrollSize - handle.viewportSize);
+    debugScrollState("pin", { target, last });
     // Scroll to the virtual bottom so the configured end margin remains visible
     // after the newest message.
-    handle.scrollTo(Math.max(0, handle.scrollSize - handle.viewportSize));
+    handle.scrollTo(target);
     // Programmatic scrolls may emit zero scroll events when already at the
     // destination, so clearing `suppress` from onScrollEnd would deadlock it.
     // Always clear on a timer that outlives the measurement window.
@@ -1221,16 +1559,32 @@ export default function App() {
     }
   }
 
-  function requestOlder() {
-    if (!hasMore || loadingOlder) return;
-    if (!socket || socket.readyState !== WebSocket.OPEN) return;
+  function requestOlder(source: OlderRequestSource): boolean {
+    if (!hasMore) {
+      debugScrollState("request-older-skip", { source, reason: "no-more" });
+      return false;
+    }
+    if (loadingOlder) {
+      debugScrollState("request-older-skip", { source, reason: "loading" });
+      return false;
+    }
+    if (!socket || socket.readyState !== WebSocket.OPEN) {
+      debugScrollState("request-older-skip", { source, reason: "socket" });
+      return false;
+    }
     loadingOlder = true;
     const req: ClientRequest = {
       type: "load_older",
       before_seq: oldestSeq,
       limit: PAGE,
     };
+    debugScrollState("request-older-send", {
+      source,
+      beforeSeq: req.before_seq,
+      limit: req.limit,
+    });
     socket.send(JSON.stringify(req));
+    return true;
   }
 
   // A click on a `@@` reference jumps to its target, paging older history in
@@ -1316,7 +1670,7 @@ export default function App() {
       if (!pendingJump || pendingJump.ts !== ts || pendingJump.mid !== mid) {
         pendingJump = { ts, mid, tries: 0 };
       }
-      requestOlder();
+      requestOlder("ref");
       return;
     }
     pendingJump = undefined;
@@ -1351,7 +1705,7 @@ export default function App() {
       showRefToast("Referenced message isn't in the loaded history");
       return;
     }
-    requestOlder();
+    requestOlder("ref");
   }
 
   // Splices a `@@code ` reference into the composer draft, from a message row's
@@ -1843,10 +2197,61 @@ export default function App() {
   }
 
   function onScroll(offset: number) {
-    // Page in older history when the user nears the top. Guarded so it never
-    // duplicates an in-flight request; after a prepend the offset moves down
-    // (content added above), so it does not immediately re-trigger.
-    if (offset < TOP_THRESHOLD) requestOlder();
+    const now = debugNow();
+    const requestThreshold = topRequestThreshold();
+    const rearmThreshold = topRearmThreshold();
+    const nearTop = offset < rearmThreshold;
+    const scrollLogInterval = nearTop ? 100 : 500;
+    if (scrollDebugActive && now - lastScrollDebugAt >= scrollLogInterval) {
+      lastScrollDebugAt = now;
+      debugScrollState("scroll", {
+        offset,
+        nearTop,
+        atTopThreshold: offset < requestThreshold,
+        requestThreshold,
+        rearmThreshold,
+      });
+    }
+
+    if (!prependSettling && offset > rearmThreshold && !topPagingArmed) {
+      topPagingArmed = true;
+      debugScrollState("top-rearmed", { offset, rearmThreshold });
+    }
+
+    // Page older history only on a genuine user-driven crossing into the top
+    // zone. Virtua's prepend shift and resize compensation also emit scroll
+    // events near the top, and treating those as demand can replay a page loop.
+    const canRequestOlderFromScroll =
+      hasMore &&
+      !loadingOlder &&
+      topPagingArmed &&
+      userDriving &&
+      !suppress &&
+      !refJumping &&
+      !prependSettling &&
+      offset < requestThreshold;
+    if (canRequestOlderFromScroll) {
+      if (requestOlder("scroll")) topPagingArmed = false;
+    } else if (
+      scrollDebugActive &&
+      hasMore &&
+      offset < requestThreshold &&
+      now - lastTopBlockedDebugAt >= 250
+    ) {
+      lastTopBlockedDebugAt = now;
+      debugScrollState("top-request-blocked", {
+        offset,
+        requestThreshold,
+        rearmThreshold,
+        blockedBy: {
+          disarmed: !topPagingArmed,
+          noUser: !userDriving,
+          suppress,
+          refJumping,
+          prependSettling,
+        },
+      });
+    }
 
     // Rule 1: ignore our own pin() scroll and any scroll not under user control
     // (virtua resize-jump compensation). Only a real user scroll flips follow.
@@ -1859,9 +2264,11 @@ export default function App() {
   // control shortly after so a later spontaneous compensation scroll is not
   // mis-attributed to the user.
   function onScrollEnd() {
+    debugScrollState("scroll-end");
     if (idleTimer) clearTimeout(idleTimer);
     idleTimer = window.setTimeout(() => {
       userDriving = false;
+      debugScrollState("user-idle");
     }, 120);
   }
 
@@ -1896,21 +2303,48 @@ export default function App() {
           return;
         }
         if (feed.kind === "sync") {
+          debugScrollState("sync-received", {
+            count: feed.messages.length,
+            frameOldestSeq: feed.oldest_seq,
+            frameHasMore: feed.has_more,
+          });
           preloadRecentImages(feed.messages);
           setMessages(feed.messages);
           oldestSeq = feed.oldest_seq;
           hasMore = feed.has_more;
+          prependSettling = false;
+          clearPrependSettleFrame();
+          topPagingArmed = true;
           following = true;
           pin();
         } else if (feed.kind === "older") {
+          debugScrollState("older-received", {
+            count: feed.messages.length,
+            frameOldestSeq: feed.oldest_seq,
+            frameHasMore: feed.has_more,
+            loadingOlderBefore: loadingOlder,
+            firstOlder: debugMessageKey(feed.messages[0]),
+            lastOlder: debugMessageKey(feed.messages[feed.messages.length - 1]),
+          });
           loadingOlder = false;
           if (feed.messages.length > 0) {
             preloadRecentImages(feed.messages);
+            holdPrependSettling();
             setPrepend(true);
             setMessages((prev) => [...feed.messages, ...prev]);
+            debugScrollState("older-applied", {
+              count: feed.messages.length,
+              frameOldestSeq: feed.oldest_seq,
+              frameHasMore: feed.has_more,
+            });
           }
           oldestSeq = feed.oldest_seq;
           hasMore = feed.has_more;
+          debugScrollState("older-cursor-updated", {
+            count: feed.messages.length,
+            frameOldestSeq: feed.oldest_seq,
+            frameHasMore: feed.has_more,
+          });
           scheduleResumePendingJump();
         } else {
           // A live message. Upsert by the announcement timestamp and file id;
@@ -2128,6 +2562,7 @@ export default function App() {
     if (idleTimer) clearTimeout(idleTimer);
     if (refJumpTimer) clearTimeout(refJumpTimer);
     if (pendingJumpFrame) cancelAnimationFrame(pendingJumpFrame);
+    clearPrependSettleFrame();
     if (refToastTimer) clearTimeout(refToastTimer);
     for (const decoder of decoders.values()) decoder.close();
     decoders.clear();
@@ -2209,6 +2644,14 @@ export default function App() {
                 ref={(h) => (handle = h)}
                 scrollRef={logEl}
                 data={messageList().visible}
+                itemSize={(message) => {
+                  const group = messageList().groups.get(message)!;
+                  return estimateMessageRowSize(
+                    message,
+                    group,
+                    messageEstimateLayout()
+                  );
+                }}
                 endMargin={CHAT_END_MARGIN_PX}
                 shift={prepend()}
                 onScroll={onScroll}

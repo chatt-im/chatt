@@ -18,6 +18,7 @@ import type {
   ItemsRange,
 } from "./types.js";
 import { abs, max, min, NULL } from "./utils.js";
+import { appendDebugLog, debugFlagEnabled } from "../../../debug-log";
 
 const MAX_INT_32 = 0x7fffffff;
 
@@ -36,6 +37,45 @@ type ScrollMode =
   | typeof SCROLL_BY_NATIVE
   | typeof SCROLL_BY_MANUAL_SCROLL
   | typeof SCROLL_BY_SHIFT;
+
+const VIRTUA_DEBUG_TOP_THRESHOLD = 600;
+
+const scrollDirectionName = (direction: ScrollDirection): string => {
+  switch (direction) {
+    case SCROLL_DOWN:
+      return "down";
+    case SCROLL_UP:
+      return "up";
+    default:
+      return "idle";
+  }
+};
+
+const scrollModeName = (mode: ScrollMode): string => {
+  switch (mode) {
+    case SCROLL_BY_MANUAL_SCROLL:
+      return "manual";
+    case SCROLL_BY_SHIFT:
+      return "shift";
+    default:
+      return "native";
+  }
+};
+
+const virtuaDebugEnabled = (): boolean => {
+  return (
+    debugFlagEnabled("debugScroll", "chatt.debugScroll") ||
+    debugFlagEnabled("debugVirtua", "chatt.debugVirtua")
+  );
+};
+
+const debugVirtua = (
+  stage: string,
+  fields: Record<string, unknown> = {},
+): void => {
+  if (!virtuaDebugEnabled()) return;
+  appendDebugLog("virtua", stage, fields);
+};
 
 /** @internal */
 export const ACTION_SCROLL = 1;
@@ -63,7 +103,11 @@ type Actions =
   | [type: typeof ACTION_VIEWPORT_RESIZE, size: number]
   | [
       type: typeof ACTION_ITEMS_LENGTH_CHANGE,
-      arg: [length: number, isShift?: boolean | undefined],
+      arg: [
+        length: number,
+        isShift?: boolean | undefined,
+        itemSizes?: readonly number[] | undefined,
+      ],
     ]
   | [type: typeof ACTION_START_OFFSET_CHANGE, offset: number]
   | [type: typeof ACTION_END_OFFSET_CHANGE, offset: number]
@@ -125,6 +169,7 @@ export const createVirtualStore = (
   ssrCount: number = 0,
   cacheSnapshot?: CacheSnapshot | undefined,
   shouldAutoEstimateItemSize: boolean = false,
+  itemSizes?: readonly number[] | undefined,
 ): VirtualStore => {
   let isSSR = !!ssrCount;
   let stateVersion: StateVersion = 1;
@@ -137,6 +182,7 @@ export const createVirtualStore = (
   let _flushedJump = 0;
   let _scrollDirection: ScrollDirection = SCROLL_IDLE;
   let _scrollMode: ScrollMode = SCROLL_BY_NATIVE;
+  let resetShiftOnScroll = false;
   let _frozenRange: ItemsRange | null = NULL;
   let _prevRange: ItemsRange = [0, isSSR ? max(ssrCount - 1, 0) : -1];
   let _totalMeasuredSize = 0;
@@ -147,7 +193,9 @@ export const createVirtualStore = (
     cacheSnapshot
       ? (cacheSnapshot as unknown as InternalCacheSnapshot)[1]
       : itemSize,
-    cacheSnapshot && (cacheSnapshot as unknown as InternalCacheSnapshot)[0],
+    cacheSnapshot
+      ? (cacheSnapshot as unknown as InternalCacheSnapshot)[0]
+      : itemSizes,
   );
   const subscribers = new Set<[number, Subscriber]>();
   const getRelativeScrollOffset = () => scrollOffset - startSpacerSize;
@@ -173,17 +221,25 @@ export const createVirtualStore = (
 
   const applyJump = (j: number) => {
     if (j) {
-      if (
-        // In iOS WebKit browsers, updating scroll position will stop scrolling so it have to be deferred during scrolling.
+      const deferred =
         (isIOSWebKit() && _scrollDirection !== SCROLL_IDLE) ||
-        // Before imperative smooth scrolling, we measure all items which may be visible during scrolling.
-        // However, especially in Firefox, there are rare cases where items resize while scrolling, which can stop smooth scrolling.
-        (_frozenRange && _scrollMode === SCROLL_BY_MANUAL_SCROLL)
-      ) {
+        (_frozenRange && _scrollMode === SCROLL_BY_MANUAL_SCROLL);
+      if (deferred) {
         pendingJump += j;
       } else {
         jump += j;
       }
+      debugVirtua("apply-jump", {
+        amount: j,
+        deferred,
+        pendingJump,
+        jump,
+        scrollOffset,
+        viewportSize,
+        totalSize: getTotalSize(),
+        direction: scrollDirectionName(_scrollDirection),
+        mode: scrollModeName(_scrollMode),
+      });
     }
   };
 
@@ -273,6 +329,8 @@ export const createVirtualStore = (
 
           const flushedJump = _flushedJump;
           _flushedJump = 0;
+          const shouldResetShift =
+            resetShiftOnScroll && _scrollMode === SCROLL_BY_SHIFT;
 
           const delta = payload - scrollOffset;
           const distance = abs(delta);
@@ -322,6 +380,44 @@ export const createVirtualStore = (
             // Update synchronously if scrolled a lot
             shouldSync = distance > viewportSize;
           }
+          if (
+            virtuaDebugEnabled() &&
+            (payload < VIRTUA_DEBUG_TOP_THRESHOLD ||
+              distance > viewportSize / 2 ||
+              !!flushedJump)
+          ) {
+            debugVirtua("scroll", {
+              payload,
+              previous: payload - delta,
+              delta,
+              distance,
+              flushedJump,
+              isJustJumped: !!isJustJumped,
+              relativeOffset,
+              viewportSize,
+              totalSize: getTotalSize(),
+              direction: scrollDirectionName(_scrollDirection),
+              mode: scrollModeName(_scrollMode),
+              resetShiftOnScroll: shouldResetShift,
+              pendingJump,
+              jump,
+              shouldSync: !!shouldSync,
+            });
+          }
+          if (shouldResetShift) {
+            // Local fix for reverse infinite chat history: shift mode is needed
+            // for the prepend jump itself, but keeping it for the whole smooth
+            // wheel gesture makes each newly measured row fight the user's
+            // scroll with another distance-from-end correction.
+            resetShiftOnScroll = false;
+            _scrollMode = SCROLL_BY_NATIVE;
+            debugVirtua("shift-scroll-applied", {
+              payload,
+              scrollOffset,
+              viewportSize,
+              totalSize: getTotalSize(),
+            });
+          }
           break;
         }
         case ACTION_SCROLL_END: {
@@ -330,8 +426,19 @@ export const createVirtualStore = (
             shouldFlushPendingJump = true;
             mutated += UPDATE_VIRTUAL_STATE;
           }
+          debugVirtua("scroll-end", {
+            direction: scrollDirectionName(_scrollDirection),
+            mode: scrollModeName(_scrollMode),
+            pendingJump,
+            jump,
+            shouldFlushPendingJump: !!shouldFlushPendingJump,
+            scrollOffset,
+            viewportSize,
+            totalSize: getTotalSize(),
+          });
           _scrollDirection = SCROLL_IDLE;
           _scrollMode = SCROLL_BY_NATIVE;
+          resetShiftOnScroll = false;
           _frozenRange = NULL;
           break;
         }
@@ -345,44 +452,58 @@ export const createVirtualStore = (
             break;
           }
 
-          // Calculate jump by resize to minimize junks in appearance
-          applyJump(
-            updated.reduce((acc, [index, size]) => {
-              let shouldKeep: boolean;
-              if (
-                // Keep distance from end during shifting
-                _scrollMode === SCROLL_BY_SHIFT
-              ) {
-                shouldKeep = true;
-              } else if (
-                _frozenRange &&
-                _scrollMode === SCROLL_BY_MANUAL_SCROLL
-              ) {
-                // https://github.com/inokawa/virtua/issues/380
-                // https://github.com/inokawa/virtua/issues/758
-                shouldKeep = index < _frozenRange[0];
-              } else {
-                // Otherwise we should maintain visible position
-                const start = getRelativeScrollOffset();
-                const itemOffset = getItemOffset(index);
-                const itemSize = getItemSize(index);
-                shouldKeep =
-                  _scrollDirection !== SCROLL_DOWN &&
-                  _scrollMode === SCROLL_BY_NATIVE
-                    ? // https://github.com/inokawa/virtua/issues/385
-                      // https://github.com/inokawa/virtua/discussions/865
-                      itemOffset + itemSize < start
-                    : // https://github.com/inokawa/virtua/pull/868
-                      itemOffset < start &&
-                      itemOffset + itemSize < start + viewportSize;
-              }
+          let minIndex = updated[0]![0];
+          let maxIndex = minIndex;
+          const resizeJump = updated.reduce((acc, [index, size]) => {
+            minIndex = min(minIndex, index);
+            maxIndex = max(maxIndex, index);
+            let shouldKeep: boolean;
+            if (
+              // Keep distance from end during shifting
+              _scrollMode === SCROLL_BY_SHIFT
+            ) {
+              shouldKeep = true;
+            } else if (
+              _frozenRange &&
+              _scrollMode === SCROLL_BY_MANUAL_SCROLL
+            ) {
+              // https://github.com/inokawa/virtua/issues/380
+              // https://github.com/inokawa/virtua/issues/758
+              shouldKeep = index < _frozenRange[0];
+            } else {
+              // Otherwise we should maintain visible position
+              const start = getRelativeScrollOffset();
+              const itemOffset = getItemOffset(index);
+              const itemSize = getItemSize(index);
+              shouldKeep =
+                _scrollDirection !== SCROLL_DOWN &&
+                _scrollMode === SCROLL_BY_NATIVE
+                  ? // https://github.com/inokawa/virtua/issues/385
+                    // https://github.com/inokawa/virtua/discussions/865
+                    itemOffset + itemSize < start
+                  : // https://github.com/inokawa/virtua/pull/868
+                    itemOffset < start &&
+                    itemOffset + itemSize < start + viewportSize;
+            }
 
-              if (shouldKeep) {
-                acc += size - getItemSize(index);
-              }
-              return acc;
-            }, 0),
-          );
+            if (shouldKeep) {
+              acc += size - getItemSize(index);
+            }
+            return acc;
+          }, 0);
+          debugVirtua("item-resize", {
+            count: updated.length,
+            minIndex,
+            maxIndex,
+            resizeJump,
+            scrollOffset,
+            viewportSize,
+            totalSize: getTotalSize(),
+            direction: scrollDirectionName(_scrollDirection),
+            mode: scrollModeName(_scrollMode),
+          });
+          // Calculate jump by resize to minimize junks in appearance
+          applyJump(resizeJump);
 
           // Update item sizes
           for (const [index, size] of updated) {
@@ -403,12 +524,18 @@ export const createVirtualStore = (
             // If the total size is lower than the viewport, the item may be a empty state
             _totalMeasuredSize > viewportSize
           ) {
-            applyJump(
-              estimateDefaultItemSize(
-                cache,
-                findIndex(cache, getVisibleOffset()),
-              ),
+            const estimateJump = estimateDefaultItemSize(
+              cache,
+              findIndex(cache, getVisibleOffset()),
             );
+            debugVirtua("estimate-item-size", {
+              estimateJump,
+              defaultItemSize: cache._defaultItemSize,
+              scrollOffset,
+              viewportSize,
+              totalSize: getTotalSize(),
+            });
+            applyJump(estimateJump);
             shouldAutoEstimateItemSize = false;
           }
 
@@ -434,12 +561,41 @@ export const createVirtualStore = (
           break;
         }
         case ACTION_ITEMS_LENGTH_CHANGE: {
+          const previousLength = cache._length;
           if (payload[1]) {
-            applyJump(updateCacheLength(cache, payload[0], true));
-            _scrollMode = SCROLL_BY_SHIFT;
+            const lengthJump = updateCacheLength(
+              cache,
+              payload[0],
+              true,
+              payload[2],
+            );
+            debugVirtua("items-length-change", {
+              previousLength,
+              nextLength: payload[0],
+              shift: true,
+              lengthJump,
+              hasItemSizes: !!payload[2],
+              scrollOffset,
+              viewportSize,
+              totalSize: getTotalSize(),
+              defaultItemSize: cache._defaultItemSize,
+            });
+            applyJump(lengthJump);
+            _scrollMode = lengthJump ? SCROLL_BY_SHIFT : SCROLL_BY_NATIVE;
+            resetShiftOnScroll = !!lengthJump;
             mutated = UPDATE_VIRTUAL_STATE;
           } else {
-            updateCacheLength(cache, payload[0]);
+            updateCacheLength(cache, payload[0], false, payload[2]);
+            debugVirtua("items-length-change", {
+              previousLength,
+              nextLength: payload[0],
+              shift: false,
+              hasItemSizes: !!payload[2],
+              scrollOffset,
+              viewportSize,
+              totalSize: getTotalSize(),
+              defaultItemSize: cache._defaultItemSize,
+            });
             // https://github.com/inokawa/virtua/issues/552
             // https://github.com/inokawa/virtua/issues/557
             mutated = UPDATE_VIRTUAL_STATE;

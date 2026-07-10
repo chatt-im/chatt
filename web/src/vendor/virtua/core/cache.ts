@@ -206,8 +206,10 @@ export const updateCacheLength = (
   cache: Writeable<Cache>,
   length: number,
   isShift?: boolean,
+  itemSizes?: readonly number[],
 ): number => {
   const diff = length - cache._length;
+  const previousLength = cache._length;
 
   cache._computedOffsetIndex = isShift
     ? // Discard cache for now
@@ -218,8 +220,20 @@ export const updateCacheLength = (
   if (diff > 0) {
     // Added
     fill(cache._offsets, diff);
-    fill(cache._sizes, diff, isShift);
-    return cache._defaultItemSize * diff;
+    const start = isShift ? 0 : previousLength;
+    const inserted = Array.from({ length: diff }, (_, i) => {
+      const size = itemSizes?.[start + i];
+      return size !== undefined && Number.isFinite(size) && size > 0
+        ? size
+        : UNCACHED;
+    });
+    if (isShift) cache._sizes.unshift(...inserted);
+    else cache._sizes.push(...inserted);
+    return inserted.reduce(
+      (acc, size) =>
+        acc + (size === UNCACHED ? cache._defaultItemSize : size),
+      0,
+    );
   } else {
     // Removed
     cache._offsets.splice(diff);

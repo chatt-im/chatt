@@ -125,9 +125,10 @@ export interface VirtualizerProps<T> {
    * Item size hint for unmeasured items in pixels. It will help to reduce scroll jump when items are measured if used properly.
    *
    * - If not set, initial item sizes will be automatically estimated from measured sizes. This is recommended for most cases.
-   * - If set, you can opt out estimation and use the value as initial item size.
+   * - If set to a number, you can opt out estimation and use the value as initial item size.
+   * - If set to a function, each item can provide its own initial size estimate.
    */
-  itemSize?: number;
+  itemSize?: number | ((data: T, index: number) => number);
   /**
    * While true is set, scroll position will be maintained from the end not usual start when items are added to/removed from start. It's recommended to set false if you add to/remove from mid/end of the list because it can cause unexpected behavior. This prop is useful for reverse infinite scrolling.
    */
@@ -170,18 +171,29 @@ export interface VirtualizerProps<T> {
  */
 export const Virtualizer = <T,>(props: VirtualizerProps<T>): JSX.Element => {
   let containerRef: HTMLDivElement | undefined;
-  const { itemSize, horizontal = false, cache } = props;
+  const { horizontal = false, cache } = props;
   props = mergeProps<[Partial<VirtualizerProps<T>>, VirtualizerProps<T>]>(
     { as: "div" },
     props,
   );
+  const itemSize =
+    typeof props.itemSize === "number" ? props.itemSize : undefined;
+  const itemSizeHints = () => {
+    const estimate = props.itemSize;
+    if (typeof estimate !== "function") return undefined;
+    return props.data.map((item, index) => {
+      const size = estimate(item, index);
+      return Number.isFinite(size) && size > 0 ? size : 40;
+    });
+  };
 
   const store = createVirtualStore(
     props.data.length,
     itemSize,
     undefined,
     cache,
-    !itemSize,
+    !props.itemSize,
+    itemSizeHints(),
   );
   const resizer = createResizer(store, horizontal);
   const scroller = createScroller(store, horizontal);
@@ -282,7 +294,11 @@ export const Virtualizer = <T,>(props: VirtualizerProps<T>): JSX.Element => {
     const count = props.data.length;
     untrack(() => {
       if (count !== store.$getItemsLength()) {
-        store.$update(ACTION_ITEMS_LENGTH_CHANGE, [count, props.shift]);
+        store.$update(ACTION_ITEMS_LENGTH_CHANGE, [
+          count,
+          props.shift,
+          itemSizeHints(),
+        ]);
       }
     });
     const items: T[] = [];
