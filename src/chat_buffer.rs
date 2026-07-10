@@ -472,6 +472,7 @@ impl VirtualChatBuffer {
         }
     }
 
+    #[cfg(test)]
     pub fn push_notice(&mut self, sender: impl Into<String>, body: impl Into<String>) -> NoticeId {
         self.push_notice_with_kind(sender, body, NoticeKind::Info)
     }

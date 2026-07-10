@@ -266,11 +266,11 @@ fn composer_height(app: &mut App, width: u16, max_rows: u16) -> u16 {
     if max_rows == 0 {
         return 0;
     }
-    app.room.composer.resize(width.max(1));
-    let floor = app.room.composer_min_rows.unwrap_or(1).max(1);
+    app.view.composer.resize(width.max(1));
+    let floor = app.view.composer_min_rows.unwrap_or(1).max(1);
     let config_cap = app.config.ui.max_composer_height.max(1);
-    let desired = app.room.composer.desired_height();
-    let height = if app.room.composer_min_rows.is_some() {
+    let desired = app.view.composer.desired_height();
+    let height = if app.view.composer_min_rows.is_some() {
         desired.max(floor)
     } else {
         desired.min(config_cap)
@@ -1295,8 +1295,8 @@ fn draw_chat_log_bar(area: Rect, app: &App, focus: ChatPanelFocus, buf: &mut Buf
         detail,
         &format!(
             " {} msg/{} rows ",
-            app.room.active.chat.len(),
-            app.room.active.chat.total_lines_estimate()
+            app.view.active.chat.len(),
+            app.view.active.chat.total_lines_estimate()
         ),
     );
 }
@@ -1330,8 +1330,8 @@ fn draw_compose_bar(
 }
 
 fn composer_mode_label(app: &App) -> &'static str {
-    if app.room.has_pending_edit() {
-        return match app.room.composer.mode() {
+    if app.view.has_pending_edit() {
+        return match app.view.composer.mode() {
             EditorMode::Normal => "edit normal",
             EditorMode::Insert => "edit insert",
             EditorMode::Visual => "edit visual",
@@ -1339,7 +1339,7 @@ fn composer_mode_label(app: &App) -> &'static str {
             EditorMode::VisualBlock => "edit visual block",
         };
     }
-    match app.room.composer.mode() {
+    match app.view.composer.mode() {
         EditorMode::Normal => "normal",
         EditorMode::Insert => "insert",
         EditorMode::Visual => "visual",
@@ -1389,12 +1389,12 @@ fn draw_chat(
     if content_width != layout.chat_width {
         // Reflow invalidates wrapped-line coordinates: the visual anchor is
         // dropped and the cursor's line is clamped.
-        app.room.active.chat.on_reflow(content_width);
+        app.view.active.chat.on_reflow(content_width);
     }
     layout.chat_width = content_width;
     layout.chat_height = area.h;
     layout.chat_rect = area;
-    if app.room.active.chat.is_empty() {
+    if app.view.active.chat.is_empty() {
         layout.visible_chat_lines.clear();
         area.with(app.theme.subtle)
             .with(HAlign::Center)
@@ -1402,8 +1402,8 @@ fn draw_chat(
         return;
     }
     // Clamp a stale cursor (eviction, collapse) before styling against it.
-    app.room.active.chat.ensure_cursor(content_width);
-    app.room.active.chat.visible_lines_into(
+    app.view.active.chat.ensure_cursor(content_width);
+    app.view.active.chat.visible_lines_into(
         content_width,
         area.h,
         app.config.ui.overscan as usize,
@@ -1419,16 +1419,16 @@ fn draw_chat(
         match line.kind {
             LineKind::Heading => draw_chat_heading(marker, row, app, line.message, now_ms, buf),
             LineKind::Body => {
-                let msg = app.room.active.chat.message(line.message);
+                let msg = app.view.active.chat.message(line.message);
                 // A file message overlays its single body line, keyed by the
                 // server transfer id: an in-flight transfer draws a progress bar,
                 // one that ended without landing draws a terminal label. `transfer`
                 // clones the status, so no borrow of `app.room` outlives this read.
                 let status = msg.file_transfer_id.and_then(|id| app.room.transfer(id));
                 let visual_here =
-                    chat_focused && app.room.active.chat.is_visual(line.message, line.line);
+                    chat_focused && app.view.active.chat.is_visual(line.message, line.line);
                 let cursor_here =
-                    chat_focused && app.room.active.chat.is_cursor_line(line.message, line.line);
+                    chat_focused && app.view.active.chat.is_cursor_line(line.message, line.line);
                 let base = if visual_here {
                     app.theme.chat_visual_line
                 } else if cursor_here {
@@ -1458,8 +1458,8 @@ fn draw_chat(
                     let name = msg.body.split('`').nth(1).unwrap_or(&msg.body).to_string();
                     draw_transfer_progress(row, base, progress, &name, transfer_id, app, buf);
                 } else {
-                    for seg in app.room.active.chat.line(line.message, line.line) {
-                        let text = app.room.active.chat.segment_text(line.message, seg);
+                    for seg in app.view.active.chat.line(line.message, line.line) {
+                        let text = app.view.active.chat.segment_text(line.message, seg);
                         let mut style = base.patch(app.theme.text).patch(seg.style);
                         if !seg.synth
                             && msg
@@ -1604,7 +1604,7 @@ fn draw_chat_heading(
     now_ms: u64,
     buf: &mut Buffer,
 ) {
-    let msg = app.room.active.chat.message(message);
+    let msg = app.view.active.chat.message(message);
     let base = if msg.local {
         app.theme.local_line
     } else {
@@ -1620,9 +1620,9 @@ fn draw_chat_heading(
     } else {
         msg.sender.clone()
     };
-    if app.room.active.chat.is_collapsed(message) {
+    if app.view.active.chat.is_collapsed(message) {
         name.push_str(" (Collapsed)");
-    } else if app.room.active.chat.is_expanded(message) {
+    } else if app.view.active.chat.is_expanded(message) {
         name.push_str(" (Expanded)");
     }
     content
@@ -2155,16 +2155,16 @@ fn draw_composer(area: Rect, app: &mut App, focus: ChatPanelFocus, buf: &mut Buf
         return;
     }
     area.with(app.theme.panel).fill(buf);
-    app.room.composer.resize(area.w.max(1));
-    app.room
+    app.view.composer.resize(area.w.max(1));
+    app.view
         .refresh_command_completion(focus == ChatPanelFocus::Compose, app.theme.subtle);
-    app.room
+    app.view
         .composer_hl
-        .render(&mut app.room.composer, area, buf, &app.theme);
+        .render(&mut app.view.composer, area, buf, &app.theme);
     if focus != ChatPanelFocus::Compose {
         buf.hide_cursor();
     }
-    if app.room.composer.text_len() == 0 {
+    if app.view.composer.text_len() == 0 {
         area.with(app.theme.muted)
             .with(Ellipsis(true))
             .text(buf, &format!(" {}", app.config.ui.placeholder));
