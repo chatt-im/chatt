@@ -1,10 +1,12 @@
 mod app;
+mod attach;
 pub mod audio;
 #[cfg(test)]
 mod bench_upload;
 mod bindings;
 mod chat_buffer;
 pub mod cli;
+mod client_channel;
 mod client_net;
 mod clipboard;
 mod clipboard_paste;
