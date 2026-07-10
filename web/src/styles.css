@@ -442,6 +442,18 @@ body {
   cursor: pointer;
 }
 
+.media-image-missing {
+  display: flex;
+  width: min(320px, 100%);
+  min-height: 72px;
+  align-items: center;
+  justify-content: center;
+  padding: var(--space);
+  color: var(--text-dim);
+  font-size: 12px;
+  background: var(--bg-code);
+}
+
 /* Revealed on decode (or error) so the image fades in rather than snapping. */
 .media-image.is-loaded {
   opacity:1;
