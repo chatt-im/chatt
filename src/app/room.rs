@@ -2173,8 +2173,8 @@ impl RoomSession {
 
     /// Copies the visual selection's text, clearing the selection on success
     /// so a yank exits visual mode.
-    pub(crate) fn copy_chat_selection(&mut self) -> Option<String> {
-        let text = self.active.chat.visual_text()?;
+    pub(crate) fn copy_chat_selection(&mut self, width: u16) -> Option<String> {
+        let text = self.active.chat.visual_text(width)?;
         self.active.chat.clear_visual_anchor();
         self.pending_clipboard = Some(text.clone());
         Some(text)

@@ -102,6 +102,7 @@ pub struct ChatEntry {
 }
 
 /// A run of one or more consecutive messages rendered under a single heading.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Block {
     /// Oldest message index (heading anchor and age source).
     first: usize,
@@ -113,6 +114,141 @@ struct Block {
     /// True only for a lone message over [`COLLAPSE_LIMIT`] lines that is not
     /// expanded.
     collapsed: bool,
+}
+
+#[derive(Default)]
+struct LayoutIndex {
+    width: u16,
+    valid: bool,
+    line_counts: Vec<usize>,
+    blocks: Vec<Block>,
+    rows: FenwickRows,
+    #[cfg(test)]
+    full_rebuilds: usize,
+}
+
+impl LayoutIndex {
+    fn invalidate(&mut self) {
+        self.valid = false;
+        self.rows.clear();
+    }
+
+    fn clear(&mut self) {
+        self.valid = false;
+        self.line_counts.clear();
+        self.blocks.clear();
+        self.rows.clear();
+    }
+
+    fn total_rows(&self) -> usize {
+        self.rows.total().max(1)
+    }
+
+    fn block_containing_message(&self, message: usize) -> Option<usize> {
+        let index = self.blocks.partition_point(|block| block.last < message);
+        self.blocks
+            .get(index)
+            .is_some_and(|block| block.first <= message)
+            .then_some(index)
+    }
+}
+
+#[derive(Default)]
+struct FenwickRows {
+    tree: Vec<usize>,
+    total: usize,
+}
+
+impl FenwickRows {
+    fn clear(&mut self) {
+        self.tree.clear();
+        self.total = 0;
+    }
+
+    fn len(&self) -> usize {
+        self.tree.len()
+    }
+
+    fn total(&self) -> usize {
+        self.total
+    }
+
+    fn push(&mut self, value: usize) {
+        let index = self.tree.len();
+        let one_based = index + 1;
+        let lowbit = one_based & one_based.wrapping_neg();
+        let start = one_based - lowbit;
+        let previous = self
+            .prefix_sum(index)
+            .saturating_sub(self.prefix_sum(start));
+        self.tree.push(previous.saturating_add(value));
+        self.total = self.total.saturating_add(value);
+    }
+
+    fn truncate(&mut self, len: usize) {
+        self.tree.truncate(len);
+        self.total = self.prefix_sum(len);
+    }
+
+    fn set(&mut self, index: usize, value: usize) {
+        let current = self.range_sum(index, index + 1);
+        if value >= current {
+            self.add(index, value - current);
+            self.total = self.total.saturating_add(value - current);
+        } else {
+            self.sub(index, current - value);
+            self.total = self.total.saturating_sub(current - value);
+        }
+    }
+
+    fn prefix_sum(&self, count: usize) -> usize {
+        let mut index = count.min(self.tree.len());
+        let mut sum = 0usize;
+        while index > 0 {
+            sum = sum.saturating_add(self.tree[index - 1]);
+            index &= index - 1;
+        }
+        sum
+    }
+
+    fn range_sum(&self, start: usize, end: usize) -> usize {
+        self.prefix_sum(end).saturating_sub(self.prefix_sum(start))
+    }
+
+    fn row_to_block(&self, row: usize) -> Option<usize> {
+        if self.tree.is_empty() {
+            return None;
+        }
+        let row = row.min(self.total.saturating_sub(1));
+        let mut index = 0usize;
+        let mut sum = 0usize;
+        let mut bit = self.tree.len().next_power_of_two();
+        while bit > 0 {
+            let next = index + bit;
+            if next <= self.tree.len() && sum.saturating_add(self.tree[next - 1]) <= row {
+                sum = sum.saturating_add(self.tree[next - 1]);
+                index = next;
+            }
+            bit >>= 1;
+        }
+        Some(index.min(self.tree.len() - 1))
+    }
+
+    fn add(&mut self, index: usize, delta: usize) {
+        let mut one_based = index + 1;
+        while one_based <= self.tree.len() {
+            self.tree[one_based - 1] = self.tree[one_based - 1].saturating_add(delta);
+            one_based += one_based & one_based.wrapping_neg();
+        }
+    }
+
+    fn sub(&mut self, index: usize, delta: usize) {
+        let mut one_based = index + 1;
+        while one_based <= self.tree.len() {
+            self.tree[one_based - 1] = self.tree[one_based - 1].saturating_sub(delta);
+            one_based += one_based & one_based.wrapping_neg();
+        }
+    }
 }
 
 /// A body-line position: wrapped visible `line` within `message`. `Ord` is
@@ -140,6 +276,7 @@ pub struct VirtualChatBuffer {
     syntax: SyntaxTheme,
     room_id: Option<rpc::ids::RoomId>,
     next_notice_id: u64,
+    layout_index: LayoutIndex,
 }
 
 impl VirtualChatBuffer {
@@ -154,6 +291,7 @@ impl VirtualChatBuffer {
             syntax,
             room_id: None,
             next_notice_id: 1,
+            layout_index: LayoutIndex::default(),
         }
     }
 
@@ -183,6 +321,7 @@ impl VirtualChatBuffer {
         for entry in &mut self.messages {
             entry.layout.invalidate();
         }
+        self.layout_index.invalidate();
     }
 
     fn build_entry(&self, message: ChatMessage, local: bool) -> ChatEntry {
@@ -208,6 +347,7 @@ impl VirtualChatBuffer {
         let old_len = self.messages.len();
         let entry = self.build_entry(message, local);
         self.messages.push(entry);
+        self.repair_layout_index_after_append(old_len);
         self.follow_bottom_after_push(old_len);
         self.trim_front();
     }
@@ -252,6 +392,7 @@ impl VirtualChatBuffer {
         if let Some(anchor) = &mut self.anchor {
             anchor.message += count;
         }
+        self.layout_index.invalidate();
         self.trim_front();
     }
 
@@ -277,21 +418,27 @@ impl VirtualChatBuffer {
         {
             anchor.message += 1;
         }
+        self.layout_index.invalidate();
         self.trim_front();
     }
 
     /// Re-marks which messages are locally sent, keyed by
-    /// `(timestamp_ms, message_id)`. Heading grouping reads `local` per frame
-    /// and cached layouts do not depend on it, so nothing is invalidated.
+    /// `(timestamp_ms, message_id)`. Heading grouping reads `local`, so the row
+    /// index is invalidated only when an entry actually changes.
     /// Notices and keys the callback does not know keep their flag.
     pub fn set_local_flags(&mut self, local_for: impl Fn(u64, u64) -> Option<bool>) {
+        let mut changed = false;
         for entry in &mut self.messages {
             if entry.timestamp_ms == 0 {
                 continue;
             }
             if let Some(local) = local_for(entry.timestamp_ms, entry.id) {
+                changed |= entry.local != local;
                 entry.local = local;
             }
+        }
+        if changed {
+            self.layout_index.invalidate();
         }
     }
 
@@ -310,6 +457,7 @@ impl VirtualChatBuffer {
         let refs = self.build_ref_spans(&body, inline.refs);
         let notice_id = NoticeId(self.next_notice_id);
         self.next_notice_id = self.next_notice_id.wrapping_add(1).max(1);
+        let old_len = self.messages.len();
         self.messages.push(ChatEntry {
             id: 0,
             sender: sender.into(),
@@ -324,6 +472,8 @@ impl VirtualChatBuffer {
             notice_kind: Some(kind),
             layout: MessageLayout::new(),
         });
+        self.repair_layout_index_after_append(old_len);
+        self.follow_bottom_after_push(old_len);
         self.trim_front();
         notice_id
     }
@@ -337,27 +487,31 @@ impl VirtualChatBuffer {
             return false;
         };
         self.messages.remove(index);
-        match &mut self.anchor {
-            Some(anchor) if anchor.message == index => self.anchor = None,
-            Some(anchor) if anchor.message > index => anchor.message -= 1,
-            _ => {}
+        let anchor_removed = self.anchor.is_some_and(|anchor| anchor.message == index);
+        let cursor_removed = self.cursor.is_some_and(|cursor| cursor.message == index);
+        if anchor_removed || cursor_removed {
+            self.anchor = None;
+        } else if let Some(anchor) = &mut self.anchor
+            && anchor.message > index
+        {
+            anchor.message -= 1;
         }
-        match &mut self.cursor {
-            Some(cursor) if cursor.message == index => {
-                // Land on the nearest surviving message's first line.
-                if self.messages.is_empty() {
-                    self.cursor = None;
-                    self.anchor = None;
-                } else {
-                    *cursor = Cursor {
-                        message: index.min(self.messages.len() - 1),
-                        line: 0,
-                    };
-                }
+        if cursor_removed {
+            // Land on the nearest surviving message's first line.
+            if self.messages.is_empty() {
+                self.cursor = None;
+            } else {
+                self.cursor = Some(Cursor {
+                    message: index.min(self.messages.len() - 1),
+                    line: 0,
+                });
             }
-            Some(cursor) if cursor.message > index => cursor.message -= 1,
-            _ => {}
+        } else if let Some(cursor) = &mut self.cursor
+            && cursor.message > index
+        {
+            cursor.message -= 1;
         }
+        self.layout_index.invalidate();
         true
     }
 
@@ -427,6 +581,7 @@ impl VirtualChatBuffer {
         self.dragging = false;
         self.room_id = None;
         self.next_notice_id = 1;
+        self.layout_index.clear();
     }
 
     pub fn len(&self) -> usize {
@@ -616,13 +771,12 @@ impl VirtualChatBuffer {
     /// away (a sender-group heading boundary), clamping at the ends.
     pub fn move_cursor_paragraph(&mut self, delta: isize, width: u16) -> Option<Cursor> {
         let cursor = self.ensure_cursor(width)?;
-        let blocks = self.blocks(width);
-        let current = blocks
-            .iter()
-            .position(|(first, last)| *first <= cursor.message && cursor.message <= *last)?;
-        let next = (current as isize + delta).clamp(0, blocks.len() as isize - 1) as usize;
+        self.ensure_layout_index(width);
+        let current = self.layout_index.block_containing_message(cursor.message)?;
+        let block_count = self.layout_index.blocks.len();
+        let next = (current as isize + delta).clamp(0, block_count as isize - 1) as usize;
         self.cursor = Some(Cursor {
-            message: blocks[next].0,
+            message: self.layout_index.blocks[next].first,
             line: 0,
         });
         self.cursor
@@ -699,13 +853,13 @@ impl VirtualChatBuffer {
     /// rows, content only (no sender column). Wrapped rows from the same
     /// message are sliced as one source range so clipboard text keeps the
     /// message's whitespace instead of the display wrapper's trimmed fragments.
-    pub fn visual_text(&self) -> Option<String> {
+    pub fn visual_text(&mut self, width: u16) -> Option<String> {
+        let width = width.max(1);
         let (lo, hi) = self.visual_bounds()?;
         let mut out = String::new();
         let mut first = true;
         for message in lo.message..=hi.message.min(self.messages.len().saturating_sub(1)) {
-            let entry = &self.messages[message];
-            let lines = entry.layout.lines().max(1);
+            let lines = self.visible_body_lines(message, width);
             let start = if message == lo.message { lo.line } else { 0 };
             if start >= lines {
                 continue;
@@ -720,8 +874,14 @@ impl VirtualChatBuffer {
                 out.push('\n');
             }
             first = false;
+            let entry = &self.messages[message];
             if start == 0 && end == lines - 1 {
-                out.push_str(&entry.body);
+                if lines == entry.layout.lines().max(1) {
+                    out.push_str(&entry.body);
+                } else {
+                    let range = entry.layout.source_range(start, end, entry.body.len());
+                    out.push_str(&entry.body[range]);
+                }
             } else {
                 let range = entry.layout.source_range(start, end, entry.body.len());
                 out.push_str(&entry.body[range]);
@@ -793,6 +953,7 @@ impl VirtualChatBuffer {
     pub fn on_reflow(&mut self, width: u16) {
         self.anchor = None;
         self.dragging = false;
+        self.layout_index.invalidate();
         self.clamp_positions(width);
     }
 
@@ -857,6 +1018,28 @@ impl VirtualChatBuffer {
             return false;
         }
         self.messages[message].expanded = !self.messages[message].expanded;
+        if self.layout_index.valid
+            && self.layout_index.width == width.max(1)
+            && self.layout_index.line_counts.len() == self.messages.len()
+        {
+            if let Some(block_index) = self.layout_index.block_containing_message(message) {
+                let rows = {
+                    let block = &mut self.layout_index.blocks[block_index];
+                    block.body_lines = if self.messages[message].expanded {
+                        self.layout_index.line_counts[message]
+                    } else {
+                        COLLAPSE_SHOW
+                    };
+                    block.collapsed = !self.messages[message].expanded;
+                    Self::block_rows(block)
+                };
+                self.layout_index.rows.set(block_index, rows);
+            } else {
+                self.layout_index.invalidate();
+            }
+        } else {
+            self.layout_index.invalidate();
+        }
         // Collapsing under the cursor or anchor pulls them into the preview.
         self.clamp_positions(width);
         true
@@ -883,66 +1066,192 @@ impl VirtualChatBuffer {
         entry.layout.lines() > COLLAPSE_LIMIT && entry.expanded
     }
 
-    pub fn visible_lines(&mut self, width: u16, height: u16, overscan: usize) -> Vec<VisibleLine> {
+    pub fn visible_lines_into(
+        &mut self,
+        width: u16,
+        height: u16,
+        _overscan: usize,
+        out: &mut Vec<VisibleLine>,
+    ) {
         let width = width.max(1);
         let target = height as usize;
-        let mut need = target.saturating_add(overscan);
-        let mut skip = self.scroll_offset;
-        let mut reversed = Vec::with_capacity(target);
-
-        let mut cursor = self.messages.len();
-        'runs: while cursor > 0 && need > 0 {
-            let last = cursor - 1;
-            let run_start = self.run_start(last, width);
-            let blocks = self.pack_run(run_start, last, width);
-            cursor = run_start;
-            for block in blocks.iter().rev() {
-                let rows = self.block_row_lines(block);
-                let n = rows.len();
-                if skip >= n {
-                    skip -= n;
-                    continue;
-                }
-                let end = n - skip;
-                let take = end.min(need);
-                let start = end - take;
-                for i in (start..end).rev() {
-                    reversed.push(rows[i]);
-                }
-                need = need.saturating_sub(take);
-                skip = 0;
-                if need == 0 {
-                    break 'runs;
-                }
+        out.clear();
+        if self.messages.is_empty() || target == 0 {
+            return;
+        }
+        self.ensure_layout_index(width);
+        let total = self.layout_index.total_rows();
+        let max_scroll = total.saturating_sub(target);
+        self.scroll_offset = self.scroll_offset.min(max_scroll);
+        let top = total.saturating_sub(self.scroll_offset.saturating_add(target));
+        let bottom = top.saturating_add(target).min(total);
+        out.reserve(bottom.saturating_sub(top));
+        for row in top..bottom {
+            if let Some(line) = self.cached_visible_line(row) {
+                out.push(line);
             }
         }
+    }
 
-        if skip > 0 {
-            self.scroll_offset = self.scroll_offset.saturating_sub(skip);
-        }
-
-        reversed.reverse();
-        if reversed.len() > target {
-            reversed.split_off(reversed.len() - target)
-        } else {
-            reversed
-        }
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn visible_lines(&mut self, width: u16, height: u16, overscan: usize) -> Vec<VisibleLine> {
+        let mut lines = Vec::new();
+        self.visible_lines_into(width, height, overscan, &mut lines);
+        lines
     }
 
     /// Lays out `idx` at `width` and returns its wrapped line count (at least 1).
     fn ensure_lines(&mut self, idx: usize, width: u16) -> usize {
         let width = width.max(1);
+        if self.layout_index.valid && self.layout_index.width != width {
+            self.layout_index.invalidate();
+        }
         let syntax = self.syntax;
         let msg = &mut self.messages[idx];
         msg.layout.ensure(width, &msg.body, &msg.refs, syntax);
         msg.layout.lines().max(1)
     }
 
-    /// Whether a block boundary is forced between adjacent messages `prev` and
-    /// `cur` (`cur == prev + 1`): a sender or locality change, a notice
-    /// (`timestamp_ms == 0`), a gap over [`GROUP_GAP_MS`], or either side being a
-    /// lone collapsible message over [`COLLAPSE_LIMIT`] lines.
-    fn boundary_before(&mut self, prev: usize, cur: usize, width: u16) -> bool {
+    fn ensure_layout_index(&mut self, width: u16) {
+        let width = width.max(1);
+        if self.layout_index.valid
+            && self.layout_index.width == width
+            && self.layout_index.line_counts.len() == self.messages.len()
+        {
+            return;
+        }
+        self.rebuild_layout_index(width);
+    }
+
+    fn rebuild_layout_index(&mut self, width: u16) {
+        let width = width.max(1);
+        self.layout_index.valid = false;
+        self.layout_index.width = width;
+
+        let mut line_counts = std::mem::take(&mut self.layout_index.line_counts);
+        line_counts.clear();
+        line_counts.reserve(self.messages.len());
+        for idx in 0..self.messages.len() {
+            line_counts.push(self.ensure_lines(idx, width));
+        }
+
+        let mut blocks = std::mem::take(&mut self.layout_index.blocks);
+        blocks.clear();
+        let mut cursor = 0usize;
+        while cursor < self.messages.len() {
+            let run_end = self.run_end_cached(cursor, &line_counts);
+            self.pack_run_cached(cursor, run_end, &line_counts, &mut blocks);
+            cursor = run_end + 1;
+        }
+
+        self.layout_index.rows.clear();
+        for block in &blocks {
+            self.layout_index.rows.push(Self::block_rows(block));
+        }
+        self.layout_index.line_counts = line_counts;
+        self.layout_index.blocks = blocks;
+        self.layout_index.valid = true;
+        #[cfg(test)]
+        {
+            self.layout_index.full_rebuilds += 1;
+        }
+    }
+
+    fn repair_layout_index_after_append(&mut self, old_len: usize) {
+        if !self.layout_index.valid {
+            return;
+        }
+        if old_len + 1 != self.messages.len()
+            || self.layout_index.line_counts.len() != old_len
+            || self.layout_index.rows.len() != self.layout_index.blocks.len()
+        {
+            self.layout_index.invalidate();
+            return;
+        }
+        let width = self.layout_index.width;
+        let lines = self.ensure_lines(old_len, width);
+        self.layout_index.line_counts.push(lines);
+        let repair_start = if old_len == 0 {
+            0
+        } else if self.boundary_before_cached(old_len - 1, old_len, &self.layout_index.line_counts)
+        {
+            old_len
+        } else if let Some(block_index) = self.layout_index.block_containing_message(old_len - 1) {
+            self.layout_index.blocks[block_index].first
+        } else {
+            self.layout_index.invalidate();
+            return;
+        };
+        self.rebuild_layout_index_tail_from(repair_start);
+    }
+
+    fn rebuild_layout_index_tail_from(&mut self, repair_start: usize) {
+        if !self.layout_index.valid
+            || self.layout_index.line_counts.len() != self.messages.len()
+            || repair_start > self.messages.len()
+        {
+            self.layout_index.invalidate();
+            return;
+        }
+        let keep_blocks = self
+            .layout_index
+            .blocks
+            .partition_point(|block| block.last < repair_start);
+        self.layout_index.blocks.truncate(keep_blocks);
+        self.layout_index.rows.truncate(keep_blocks);
+
+        let mut tail_blocks = Vec::new();
+        let mut cursor = repair_start;
+        while cursor < self.messages.len() {
+            let run_end = self.run_end_cached(cursor, &self.layout_index.line_counts);
+            self.pack_run_cached(
+                cursor,
+                run_end,
+                &self.layout_index.line_counts,
+                &mut tail_blocks,
+            );
+            cursor = run_end + 1;
+        }
+        for block in tail_blocks {
+            self.layout_index.rows.push(Self::block_rows(&block));
+            self.layout_index.blocks.push(block);
+        }
+    }
+
+    fn rebuild_layout_index_blocks_from_counts(&mut self) {
+        if !self.layout_index.valid || self.layout_index.line_counts.len() != self.messages.len() {
+            self.layout_index.invalidate();
+            return;
+        }
+        let mut blocks = std::mem::take(&mut self.layout_index.blocks);
+        blocks.clear();
+        let mut cursor = 0usize;
+        while cursor < self.messages.len() {
+            let run_end = self.run_end_cached(cursor, &self.layout_index.line_counts);
+            self.pack_run_cached(cursor, run_end, &self.layout_index.line_counts, &mut blocks);
+            cursor = run_end + 1;
+        }
+        self.layout_index.rows.clear();
+        for block in &blocks {
+            self.layout_index.rows.push(Self::block_rows(block));
+        }
+        self.layout_index.blocks = blocks;
+    }
+
+    fn run_end_cached(&self, start: usize, line_counts: &[usize]) -> usize {
+        if line_counts[start] > COLLAPSE_LIMIT {
+            return start;
+        }
+        let mut end = start;
+        while end + 1 < self.messages.len()
+            && !self.boundary_before_cached(end, end + 1, line_counts)
+        {
+            end += 1;
+        }
+        end
+    }
+
+    fn boundary_before_cached(&self, prev: usize, cur: usize, line_counts: &[usize]) -> bool {
         if self.messages[prev].timestamp_ms == 0 || self.messages[cur].timestamp_ms == 0 {
             return true;
         }
@@ -957,56 +1266,31 @@ impl VirtualChatBuffer {
         if gap > GROUP_GAP_MS {
             return true;
         }
-        self.ensure_lines(prev, width) > COLLAPSE_LIMIT
-            || self.ensure_lines(cur, width) > COLLAPSE_LIMIT
+        line_counts[prev] > COLLAPSE_LIMIT || line_counts[cur] > COLLAPSE_LIMIT
     }
 
-    /// Oldest message in the same groupable run as `last`, walking back until a
-    /// forced boundary. Headings anchor to a run's blocks from this end, so they
-    /// stay fixed as newer messages arrive.
-    fn run_start(&mut self, last: usize, width: u16) -> usize {
-        if self.ensure_lines(last, width) > COLLAPSE_LIMIT {
-            return last;
-        }
-        let mut start = last;
-        while start > 0 && !self.boundary_before(start - 1, start, width) {
-            start -= 1;
-        }
-        start
-    }
-
-    /// Newest message in the same groupable run as `start`, walking forward until
-    /// a forced boundary.
-    fn run_end(&mut self, start: usize, width: u16) -> usize {
-        if self.ensure_lines(start, width) > COLLAPSE_LIMIT {
-            return start;
-        }
-        let mut end = start;
-        while end + 1 < self.messages.len() && !self.boundary_before(end, end + 1, width) {
-            end += 1;
-        }
-        end
-    }
-
-    /// Packs the run `[run_start, run_end]` into blocks oldest-first, greedily
-    /// filling each to [`COLLAPSE_LIMIT`] lines. A lone message over the limit
-    /// becomes a single collapsible block.
-    fn pack_run(&mut self, run_start: usize, run_end: usize, width: u16) -> Vec<Block> {
-        let first_lines = self.ensure_lines(run_start, width);
+    fn pack_run_cached(
+        &self,
+        run_start: usize,
+        run_end: usize,
+        line_counts: &[usize],
+        blocks: &mut Vec<Block>,
+    ) {
+        let first_lines = line_counts[run_start];
         if run_start == run_end && first_lines > COLLAPSE_LIMIT {
             let expanded = self.messages[run_start].expanded;
-            return vec![Block {
+            blocks.push(Block {
                 first: run_start,
                 last: run_start,
                 body_lines: if expanded { first_lines } else { COLLAPSE_SHOW },
                 collapsed: !expanded,
-            }];
+            });
+            return;
         }
-        let mut blocks = Vec::new();
         let mut start = run_start;
         let mut total = 0usize;
         for message in run_start..=run_end {
-            let lines = self.ensure_lines(message, width);
+            let lines = line_counts[message];
             if total > 0 && total + lines > COLLAPSE_LIMIT {
                 blocks.push(Block {
                     first: start,
@@ -1025,52 +1309,56 @@ impl VirtualChatBuffer {
             body_lines: total,
             collapsed: false,
         });
-        blocks
     }
 
-    /// Rendered rows of `block`, top to bottom: heading, body lines, then an
-    /// ellipsis row when collapsed. Layouts must already be ensured.
-    fn block_row_lines(&self, block: &Block) -> Vec<VisibleLine> {
-        let mut rows = Vec::with_capacity(Self::block_rows(block));
-        rows.push(VisibleLine {
-            message: block.first,
-            block_first: block.first,
-            block_last: block.last,
-            line: 0,
-            kind: LineKind::Heading,
-        });
+    fn cached_visible_line(&self, row: usize) -> Option<VisibleLine> {
+        let block_index = self.layout_index.rows.row_to_block(row)?;
+        let block = self.layout_index.blocks.get(block_index)?;
+        let row_in_block = row.saturating_sub(self.layout_index.rows.prefix_sum(block_index));
+        if row_in_block == 0 {
+            return Some(VisibleLine {
+                message: block.first,
+                block_first: block.first,
+                block_last: block.last,
+                line: 0,
+                kind: LineKind::Heading,
+            });
+        }
         if block.collapsed {
-            for line in 0..block.body_lines {
-                rows.push(VisibleLine {
+            let body_row = row_in_block - 1;
+            if body_row < block.body_lines {
+                return Some(VisibleLine {
                     message: block.last,
                     block_first: block.first,
                     block_last: block.last,
-                    line,
+                    line: body_row,
                     kind: LineKind::Body,
                 });
             }
-            rows.push(VisibleLine {
+            return Some(VisibleLine {
                 message: block.last,
                 block_first: block.first,
                 block_last: block.last,
                 line: 0,
                 kind: LineKind::Ellipsis,
             });
-        } else {
-            for message in block.first..=block.last {
-                let lines = self.messages[message].layout.lines().max(1);
-                for line in 0..lines {
-                    rows.push(VisibleLine {
-                        message,
-                        block_first: block.first,
-                        block_last: block.last,
-                        line,
-                        kind: LineKind::Body,
-                    });
-                }
-            }
         }
-        rows
+
+        let mut body_row = row_in_block - 1;
+        for message in block.first..=block.last {
+            let lines = self.layout_index.line_counts[message];
+            if body_row < lines {
+                return Some(VisibleLine {
+                    message,
+                    block_first: block.first,
+                    block_last: block.last,
+                    line: body_row,
+                    kind: LineKind::Body,
+                });
+            }
+            body_row -= lines;
+        }
+        None
     }
 
     /// Total rendered rows for a block: heading + body + optional ellipsis.
@@ -1087,40 +1375,27 @@ impl VirtualChatBuffer {
     }
 
     fn total_lines_exact(&mut self, width: u16) -> usize {
-        let width = width.max(1);
-        let mut total = 0usize;
-        let mut cursor = 0usize;
-        while cursor < self.messages.len() {
-            let run_end = self.run_end(cursor, width);
-            for block in self.pack_run(cursor, run_end, width) {
-                total = total.saturating_add(Self::block_rows(&block));
-            }
-            cursor = run_end + 1;
-        }
-        total.max(1)
-    }
-
-    /// All blocks oldest-first as `(first, last)` message index pairs, the
-    /// stops paragraph motion jumps between.
-    fn blocks(&mut self, width: u16) -> Vec<(usize, usize)> {
-        let width = width.max(1);
-        let mut blocks = Vec::new();
-        let mut cursor = 0usize;
-        while cursor < self.messages.len() {
-            let run_end = self.run_end(cursor, width);
-            for block in self.pack_run(cursor, run_end, width) {
-                blocks.push((block.first, block.last));
-            }
-            cursor = run_end + 1;
-        }
-        blocks
+        self.ensure_layout_index(width);
+        self.layout_index.total_rows()
     }
 
     /// Visible body lines of `message` at `width`: the full wrapped count, or
     /// [`COLLAPSE_SHOW`] when the message is collapsed.
     fn visible_body_lines(&mut self, message: usize, width: u16) -> usize {
-        let lines = self.ensure_lines(message, width);
-        if lines > COLLAPSE_LIMIT && !self.messages[message].expanded {
+        let width = width.max(1);
+        let lines = if self.layout_index.valid
+            && self.layout_index.width == width
+            && self.layout_index.line_counts.len() == self.messages.len()
+        {
+            self.layout_index.line_counts[message]
+        } else {
+            self.ensure_lines(message, width)
+        };
+        Self::visible_body_lines_for(&self.messages[message], lines)
+    }
+
+    fn visible_body_lines_for(entry: &ChatEntry, lines: usize) -> usize {
+        if lines > COLLAPSE_LIMIT && !entry.expanded {
             COLLAPSE_SHOW
         } else {
             lines
@@ -1163,70 +1438,71 @@ impl VirtualChatBuffer {
         if pos.message >= self.messages.len() {
             return None;
         }
-        let width = width.max(1);
-        let mut pos_row = None;
-        let mut row = 0usize;
-        let mut cursor = 0usize;
-        while cursor < self.messages.len() {
-            let run_end = self.run_end(cursor, width);
-            for block in self.pack_run(cursor, run_end, width) {
-                if block.first <= pos.message && pos.message <= block.last {
-                    let body_offset = if block.collapsed {
-                        1
-                    } else {
-                        1 + (block.first..pos.message)
-                            .map(|idx| self.messages[idx].layout.lines().max(1))
-                            .sum::<usize>()
-                    };
-                    pos_row = Some(row.saturating_add(body_offset).saturating_add(pos.line));
-                }
-                row = row.saturating_add(Self::block_rows(&block));
-            }
-            cursor = run_end + 1;
+        self.ensure_layout_index(width);
+        let block_index = self.layout_index.block_containing_message(pos.message)?;
+        let block = self.layout_index.blocks[block_index];
+        let mut row = self
+            .layout_index
+            .rows
+            .prefix_sum(block_index)
+            .saturating_add(1);
+        if !block.collapsed {
+            row = row.saturating_add(
+                self.layout_index.line_counts[block.first..pos.message]
+                    .iter()
+                    .copied()
+                    .sum::<usize>(),
+            );
         }
-        pos_row.map(|target| (target, row.max(1)))
+        let visible_lines = Self::visible_body_lines_for(
+            &self.messages[pos.message],
+            self.layout_index.line_counts[pos.message],
+        );
+        row = row.saturating_add(pos.line.min(visible_lines.saturating_sub(1)));
+        Some((row, self.layout_index.total_rows()))
     }
 
     fn message_row_and_total(&mut self, message: usize, width: u16) -> Option<(usize, usize)> {
         if message >= self.messages.len() {
             return None;
         }
-        let width = width.max(1);
-        let mut message_row = None;
-        let mut row = 0usize;
-        let mut cursor = 0usize;
-        while cursor < self.messages.len() {
-            let run_end = self.run_end(cursor, width);
-            for block in self.pack_run(cursor, run_end, width) {
-                if block.first <= message && message <= block.last {
-                    let body_offset = if block.collapsed {
-                        1
-                    } else {
-                        1 + (block.first..message)
-                            .map(|idx| self.messages[idx].layout.lines().max(1))
-                            .sum::<usize>()
-                    };
-                    message_row = Some(row.saturating_add(body_offset));
-                }
-                row = row.saturating_add(Self::block_rows(&block));
-            }
-            cursor = run_end + 1;
+        self.ensure_layout_index(width);
+        let block_index = self.layout_index.block_containing_message(message)?;
+        let block = self.layout_index.blocks[block_index];
+        let mut row = self
+            .layout_index
+            .rows
+            .prefix_sum(block_index)
+            .saturating_add(1);
+        if !block.collapsed {
+            row = row.saturating_add(
+                self.layout_index.line_counts[block.first..message]
+                    .iter()
+                    .copied()
+                    .sum::<usize>(),
+            );
         }
-        message_row.map(|target| (target, row.max(1)))
+        Some((row, self.layout_index.total_rows()))
     }
 
     fn trim_front(&mut self) {
         let excess = self.messages.len().saturating_sub(self.max_messages);
         if excess > 0 {
+            let index_repairable = self.layout_index.valid
+                && self.layout_index.line_counts.len() == self.messages.len()
+                && self.layout_index.rows.len() == self.layout_index.blocks.len();
             self.messages.drain(0..excess);
             self.scroll_offset = self.scroll_offset.saturating_sub(excess);
-            self.anchor = match self.anchor {
-                Some(anchor) => anchor.message.checked_sub(excess).map(|message| Cursor {
-                    message,
+            let anchor_evicted = self.anchor.is_some_and(|anchor| anchor.message < excess);
+            let cursor_evicted = self.cursor.is_some_and(|cursor| cursor.message < excess);
+            if anchor_evicted || cursor_evicted {
+                self.anchor = None;
+            } else {
+                self.anchor = self.anchor.map(|anchor| Cursor {
+                    message: anchor.message - excess,
                     line: anchor.line,
-                }),
-                None => None,
-            };
+                });
+            }
             self.cursor = self.cursor.map(|cursor| {
                 // Clamp an evicted cursor onto the oldest survivor.
                 match cursor.message.checked_sub(excess) {
@@ -1240,6 +1516,12 @@ impl VirtualChatBuffer {
                     },
                 }
             });
+            if index_repairable {
+                self.layout_index.line_counts.drain(0..excess);
+                self.rebuild_layout_index_blocks_from_counts();
+            } else {
+                self.layout_index.invalidate();
+            }
         }
     }
 }
@@ -2352,6 +2634,7 @@ mod tests {
             let id = self.messages.len() as u64;
             let inline = crate::markdown::inline_ranges(body);
             let refs = self.build_ref_spans(body, inline.refs);
+            let old_len = self.messages.len();
             self.messages.push(ChatEntry {
                 id,
                 sender: sender.to_string(),
@@ -2366,6 +2649,7 @@ mod tests {
                 notice_kind: None,
                 layout: MessageLayout::new(),
             });
+            self.repair_layout_index_after_append(old_len);
             self.trim_front();
         }
     }
@@ -2645,6 +2929,20 @@ mod tests {
     }
 
     #[test]
+    fn reflow_first_render_clamps_stale_scroll_offset() {
+        let mut buf = buffer_with_notices(20);
+        let height = 5;
+        buf.top(3, height);
+        assert!(buf.scroll_offset() > 0);
+
+        buf.on_reflow(80);
+        let rows = buf.visible_lines(80, height, 0);
+
+        assert!(!rows.is_empty(), "the first post-reflow render draws rows");
+        assert_eq!(buf.scroll_offset(), buf.max_scroll(80, height));
+    }
+
+    #[test]
     fn cursor_message_body_returns_the_full_body() {
         let mut buf = VirtualChatBuffer::new(1000, SyntaxTheme::default());
         buf.push_test("alice", "first", 1_000_000, false);
@@ -2744,9 +3042,33 @@ mod tests {
             line: 0,
         });
         assert_eq!(
-            buf.visual_text().as_deref(),
+            buf.visual_text(40).as_deref(),
             Some("message 0\nmessage 1\nmessage 2")
         );
+    }
+
+    #[test]
+    fn visual_text_does_not_copy_hidden_collapsed_rows() {
+        let mut buf = VirtualChatBuffer::new(1000, SyntaxTheme::default());
+        buf.push_test("alice", "before", 1_000_000, false);
+        buf.push_test("bob", &fenced(13), 1_200_000, false);
+        buf.push_test("carol", "after", 1_400_000, false);
+        let _ = buf.total_lines_exact(40);
+
+        buf.begin_drag(Cursor {
+            message: 0,
+            line: 0,
+        });
+        buf.drag_to(Cursor {
+            message: 2,
+            line: 0,
+        });
+
+        let copied = buf.visual_text(40).expect("selection copies");
+        assert!(copied.contains("before\n0\n1"));
+        assert!(copied.contains("\n9\nafter"));
+        assert!(!copied.contains("\n10"));
+        assert!(!copied.contains("\n12"));
     }
 
     #[test]
@@ -2778,7 +3100,7 @@ mod tests {
             line: 1,
         });
 
-        assert_eq!(buf.visual_text().as_deref(), Some("alpha beta"));
+        assert_eq!(buf.visual_text(5).as_deref(), Some("alpha beta"));
     }
 
     fn ref_code(timestamp_ms: u64, message_id: u64) -> String {
@@ -2898,7 +3220,7 @@ mod tests {
             line: 1,
         });
         assert_eq!(
-            buf.visual_text().as_deref(),
+            buf.visual_text(95).as_deref(),
             Some(format!("see @@{code} tail").as_str())
         );
     }
@@ -2918,7 +3240,7 @@ mod tests {
             line: buf.messages[0].layout.lines() - 1,
         });
 
-        assert_eq!(buf.visual_text().as_deref(), Some("alpha\nbeta"));
+        assert_eq!(buf.visual_text(40).as_deref(), Some("alpha\nbeta"));
     }
 
     /// A theme whose `comment` slot is a distinct grey, so quote dimming is
@@ -3087,7 +3409,7 @@ mod tests {
             message: 0,
             line: 0,
         });
-        assert_eq!(buf.visual_text().as_deref(), Some("a"));
+        assert_eq!(buf.visual_text(40).as_deref(), Some("a"));
     }
 
     #[test]
@@ -3111,7 +3433,7 @@ mod tests {
             line: 1,
         });
         assert_eq!(
-            buf.visual_text().as_deref(),
+            buf.visual_text(40).as_deref(),
             Some("> literal marker"),
             "the container prefix is absent while the deeper literal marker remains"
         );
@@ -3132,7 +3454,7 @@ mod tests {
             message: 0,
             line: 1,
         });
-        assert_eq!(buf.visual_text().as_deref(), Some(""));
+        assert_eq!(buf.visual_text(40).as_deref(), Some(""));
     }
 
     #[test]
@@ -3284,7 +3606,7 @@ mod tests {
         assert!(buf.is_visual(0, 0));
         assert!(buf.is_visual(2, 0));
         assert_eq!(
-            buf.visual_text().as_deref(),
+            buf.visual_text(40).as_deref(),
             Some("message 0\nmessage 1\nmessage 2")
         );
     }
@@ -3335,6 +3657,56 @@ mod tests {
 
         assert!(buf.has_visual());
         assert!(buf.is_visual(0, 0) && buf.is_visual(1, 0));
+    }
+
+    #[test]
+    fn trim_clears_visual_when_either_endpoint_is_evicted() {
+        let mut buf = VirtualChatBuffer::new(3, SyntaxTheme::default());
+        for id in 0..3 {
+            buf.push_chat(chat_message(id, 1_000 + id, "m"), false);
+        }
+        buf.begin_drag(Cursor {
+            message: 0,
+            line: 0,
+        });
+        buf.drag_to(Cursor {
+            message: 2,
+            line: 0,
+        });
+
+        buf.push_chat(chat_message(3, 2_000, "new"), false);
+
+        assert!(!buf.has_visual());
+        assert_eq!(
+            buf.cursor().map(|cursor| buf.message(cursor.message).id),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn remove_notice_clears_visual_when_cursor_endpoint_is_removed() {
+        let mut buf = VirtualChatBuffer::new(1000, SyntaxTheme::default());
+        buf.push_notice("system", "one");
+        let notice = buf.push_notice("system", "two");
+        buf.begin_drag(Cursor {
+            message: 0,
+            line: 0,
+        });
+        buf.drag_to(Cursor {
+            message: 1,
+            line: 0,
+        });
+
+        assert!(buf.remove_notice(notice));
+
+        assert!(!buf.has_visual());
+        assert_eq!(
+            buf.cursor(),
+            Some(Cursor {
+                message: 0,
+                line: 0
+            })
+        );
     }
 
     #[test]
@@ -3393,6 +3765,25 @@ mod tests {
             }),
             "cursor follows to the new newest message's last line"
         );
+    }
+
+    #[test]
+    fn notice_append_follows_bottom_cursor() {
+        let mut buf = VirtualChatBuffer::new(1000, SyntaxTheme::default());
+        buf.push_chat(chat_message(1, 1_000, "old"), false);
+        buf.ensure_cursor(40);
+
+        let notice = buf.push_notice("system", "connected");
+
+        assert_eq!(
+            buf.ensure_cursor(40),
+            Some(Cursor {
+                message: 1,
+                line: 0
+            }),
+            "cursor follows the newest notice while at bottom"
+        );
+        assert_eq!(buf.message(1).notice_id, Some(notice));
     }
 
     #[test]
@@ -3495,7 +3886,7 @@ mod tests {
         let mut buf = buffer_with_notices(2);
         let _ = buf.total_lines_exact(40);
         buf.ensure_cursor(40);
-        assert_eq!(buf.visual_text(), None);
+        assert_eq!(buf.visual_text(40), None);
     }
 
     #[test]
@@ -3516,5 +3907,75 @@ mod tests {
         buf.cursor_to_last(width);
         buf.keep_cursor_visible(width, height);
         assert_eq!(buf.scroll_offset(), 0, "newest line sits at the bottom");
+    }
+
+    #[test]
+    fn cached_navigation_reuses_full_layout_index() {
+        let mut buf = buffer_with_notices(30);
+        let (width, height) = (40, 6);
+        let _ = buf.total_lines_exact(width);
+        let rebuilds = buf.layout_index.full_rebuilds;
+
+        buf.cursor_to_first();
+        for _ in 0..20 {
+            buf.move_cursor_line(1, width);
+            buf.keep_cursor_visible(width, height);
+        }
+
+        assert_eq!(buf.layout_index.full_rebuilds, rebuilds);
+    }
+
+    #[test]
+    fn rendering_builds_layout_index_on_cache_miss() {
+        let mut buf = buffer_with_notices(30);
+        let (width, height) = (40, 6);
+        assert!(!buf.layout_index.valid);
+
+        let rows = buf.visible_lines(width, height, 0);
+
+        assert_eq!(rows.len(), height as usize);
+        assert!(buf.layout_index.valid);
+        assert_eq!(buf.layout_index.width, width);
+        let rebuilds = buf.layout_index.full_rebuilds;
+
+        let rows = buf.visible_lines(width, height, 0);
+
+        assert_eq!(rows.len(), height as usize);
+        assert_eq!(buf.layout_index.full_rebuilds, rebuilds);
+    }
+
+    #[test]
+    fn tail_append_repairs_cache_without_full_rebuild() {
+        let mut buf = VirtualChatBuffer::new(1000, SyntaxTheme::default());
+        for i in 0..5 {
+            buf.push_chat(chat_message(i, 1_000 + i, "m"), false);
+        }
+        let _ = buf.total_lines_exact(40);
+        let rebuilds = buf.layout_index.full_rebuilds;
+
+        buf.push_chat(chat_message(5, 2_000, "new"), false);
+        let total = buf.total_lines_exact(40);
+
+        assert_eq!(buf.layout_index.full_rebuilds, rebuilds);
+        assert_eq!(total, buf.visible_lines(40, 10_000, 0).len());
+    }
+
+    #[test]
+    fn capped_tail_append_repairs_cache_without_full_rebuild() {
+        let mut buf = VirtualChatBuffer::new(5, SyntaxTheme::default());
+        for i in 0..5 {
+            buf.push_chat(chat_message(i, 1_000 + i, "m"), false);
+        }
+        let _ = buf.total_lines_exact(40);
+        let rebuilds = buf.layout_index.full_rebuilds;
+
+        buf.push_chat(chat_message(5, 2_000, "new"), false);
+        let total = buf.total_lines_exact(40);
+
+        assert_eq!(buf.len(), 5);
+        assert_eq!(buf.message(0).id, 1);
+        assert!(buf.layout_index.valid);
+        assert_eq!(buf.layout_index.full_rebuilds, rebuilds);
+        assert_eq!(total, buf.visible_lines(40, 10_000, 0).len());
     }
 }
