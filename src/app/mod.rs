@@ -336,7 +336,6 @@ pub(crate) struct App {
     /// buffers, pending edit, clipboard queue. Splits off `room` so attached
     /// clients can each own one.
     pub view: ClientView,
-    pub audio_devices: AudioDeviceCatalog,
     pub network: Option<NetworkClient>,
     pub control_socket: Option<local_control::ControlSocket>,
     pub session_id: Option<SessionId>,
@@ -345,7 +344,7 @@ pub(crate) struct App {
     /// The user explicitly left voice this session; suppresses the voice
     /// auto-join on (re-)authentication until the next explicit join.
     voice_left: bool,
-    pub server_catalog: ServerCatalog,
+
     pub pending_pair: Option<PendingPair>,
     pub mic_muted: Arc<AtomicBool>,
     pub deafened: Arc<AtomicBool>,
@@ -480,6 +479,7 @@ struct DeviceProbeState {
 }
 
 /// One audio direction's health plus its opened device, for the TUI.
+#[derive(Clone, Debug, Default)]
 pub(crate) struct AudioSideHealth {
     pub(crate) state: AudioHealthState,
     pub(crate) device_name: Option<String>,
@@ -1079,14 +1079,12 @@ impl App {
             events,
             room,
             view,
-            audio_devices: AudioDeviceCatalog::default(),
             network: None,
             control_socket: None,
             session_id: None,
             user_id: None,
             requested_voice_room: None,
             voice_left: false,
-            server_catalog: ServerCatalog::default(),
             pending_pair: None,
             mic_muted: Arc::new(AtomicBool::new(false)),
             deafened: Arc::new(AtomicBool::new(false)),
@@ -1127,6 +1125,9 @@ impl App {
             active_tcp_addr: None,
             config,
         };
+        // The view reads the shared mute switches; hand it the real handles.
+        app.view.mic_muted = app.mic_muted.clone();
+        app.view.deafened = app.deafened.clone();
         app.rebuild_server_items();
         if let Some(pending) = pending_join {
             app.start_pending_join(pending);
@@ -1808,11 +1809,11 @@ impl App {
     }
 
     fn rebuild_server_items(&mut self) {
-        self.server_catalog.rebuild(&self.config);
+        self.view.server_catalog.rebuild(&self.config);
     }
 
     pub(crate) fn server_items(&self) -> &[ServerSelectItem] {
-        self.server_catalog.items()
+        self.view.server_catalog.items()
     }
 
     pub(crate) fn open_server_select(&mut self) {
@@ -2529,10 +2530,10 @@ impl App {
     }
 
     fn handle_audio_device_refresh(&mut self, refresh: AudioDeviceRefresh) {
-        if refresh.id + 1 != self.audio_devices.next_refresh_id {
+        if refresh.id + 1 != self.room.audio_devices.next_refresh_id {
             return;
         }
-        self.audio_devices.refresh_in_flight = false;
+        self.room.audio_devices.refresh_in_flight = false;
 
         let mut input_count = None;
         let mut output_count = None;
@@ -2541,7 +2542,7 @@ impl App {
         match refresh.input {
             Ok(devices) => {
                 input_count = Some(devices.len());
-                self.audio_devices.input_devices = devices;
+                self.room.audio_devices.input_devices = devices;
             }
             Err(error) => {
                 self.mic_error = Some(error.clone());
@@ -2552,21 +2553,21 @@ impl App {
         match refresh.output {
             Ok(devices) => {
                 output_count = Some(devices.len());
-                self.audio_devices.output_devices = devices;
+                self.room.audio_devices.output_devices = devices;
             }
             Err(error) => {
                 errors.push(format!("output devices: {error}"));
             }
         }
 
-        self.audio_devices.generation = self.audio_devices.generation.saturating_add(1);
+        self.room.audio_devices.generation = self.room.audio_devices.generation.saturating_add(1);
         kvlog::info!(
             "audio device refresh completed",
             id = refresh.id,
             input_buffer_request = refresh.input_buffer_request.label(),
             output_buffer_request = refresh.output_buffer_request.label(),
-            input_count = input_count.unwrap_or(self.audio_devices.input_devices.len()),
-            output_count = output_count.unwrap_or(self.audio_devices.output_devices.len()),
+            input_count = input_count.unwrap_or(self.room.audio_devices.input_devices.len()),
+            output_count = output_count.unwrap_or(self.room.audio_devices.output_devices.len()),
             input_ok = input_count.is_some(),
             output_ok = output_count.is_some(),
         );
@@ -3641,8 +3642,8 @@ impl App {
 
     pub(crate) fn open_settings(&mut self) {
         if self.allow_settings_preview_capture
-            && (self.audio_devices.input_devices.is_empty()
-                || self.audio_devices.output_devices.is_empty())
+            && (self.room.audio_devices.input_devices.is_empty()
+                || self.room.audio_devices.output_devices.is_empty())
         {
             self.refresh_audio_devices();
         }
@@ -3907,10 +3908,19 @@ impl App {
         self.start_pending_after_welcome();
         self.expire_status(now);
         self.supervise(now);
+        self.refresh_session_projection();
         self.update_lobby_talking(now);
         self.apply_pending_audio_restart();
         self.apply_pending_room_catalog_save(now);
         self.supervise_voice_teardown(now);
+    }
+
+    /// Projects audio display facts into the shared session so every view
+    /// renders them without reaching into core state. Runs once per tick.
+    fn refresh_session_projection(&mut self) {
+        self.room.capture_health = self.capture_audio_health();
+        self.room.playback_health = self.playback_audio_health();
+        self.room.capture_stats = self.capture.as_ref().map(|capture| capture.stats());
     }
 
     fn apply_pending_room_catalog_save(&mut self, now: Instant) {
@@ -4680,7 +4690,7 @@ impl App {
         if session.input_picker.open {
             self.confirm_audio_input_picker(session);
         } else {
-            if self.audio_devices.input_devices.is_empty() {
+            if self.room.audio_devices.input_devices.is_empty() {
                 self.refresh_audio_devices();
             }
             session
@@ -4693,7 +4703,7 @@ impl App {
         if session.output_picker.open {
             self.confirm_audio_output_picker(session);
         } else {
-            if self.audio_devices.output_devices.is_empty() {
+            if self.room.audio_devices.output_devices.is_empty() {
                 self.refresh_audio_devices();
             }
             session
@@ -4958,7 +4968,7 @@ impl App {
         input_buffer_request: BufferRequest,
         output_buffer_request: BufferRequest,
     ) {
-        if self.audio_devices.refresh_in_flight {
+        if self.room.audio_devices.refresh_in_flight {
             self.set_status("refreshing audio devices");
             return;
         }
@@ -4969,9 +4979,10 @@ impl App {
             self.stop_mic_capture();
         }
 
-        let id = self.audio_devices.next_refresh_id;
-        self.audio_devices.next_refresh_id = self.audio_devices.next_refresh_id.saturating_add(1);
-        self.audio_devices.refresh_in_flight = true;
+        let id = self.room.audio_devices.next_refresh_id;
+        self.room.audio_devices.next_refresh_id =
+            self.room.audio_devices.next_refresh_id.saturating_add(1);
+        self.room.audio_devices.refresh_in_flight = true;
         if restart_preview {
             self.settings_preview_refresh_id = Some(id);
         }
@@ -5836,8 +5847,9 @@ impl App {
             return Ok(());
         }
         if let Some(id) = self.config.audio.input_device_id.as_deref() {
-            if !self.audio_devices.input_devices.is_empty() {
-                let input_items = settings::audio_input_items(&self.audio_devices.input_devices);
+            if !self.room.audio_devices.input_devices.is_empty() {
+                let input_items =
+                    settings::audio_input_items(&self.room.audio_devices.input_devices);
                 if let Some(item) = input_items
                     .iter()
                     .find(|item| item.matches_selection(Some(id)))
@@ -6558,6 +6570,9 @@ mod tests {
     }
 
     fn render_room(app: &mut App, room: &mut RoomMode, buffer: &mut Buffer) {
+        // The runtime ticks before every paint; reproduce the projection so
+        // renders see fresh session display facts.
+        app.refresh_session_projection();
         room.render(app, buffer, 0);
     }
 
@@ -8104,7 +8119,7 @@ mod tests {
     #[test]
     fn server_catalog_rebuild_tracks_generation() {
         let mut app = test_app();
-        let initial_generation = app.server_catalog.generation();
+        let initial_generation = app.view.server_catalog.generation();
         app.config.servers.push(crate::config::ServerEntry {
             label: "s1".to_string(),
             ..Default::default()
@@ -8114,7 +8129,7 @@ mod tests {
 
         assert_eq!(app.server_items().len(), 1);
         assert_eq!(
-            app.server_catalog.generation(),
+            app.view.server_catalog.generation(),
             initial_generation.saturating_add(1)
         );
     }

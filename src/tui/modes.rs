@@ -616,8 +616,8 @@ impl SettingsSession {
         draft.set_files_from_config(&app.config.files);
         draft.set_p2p_from_config(&app.config.p2p);
         draft.set_history_from_config(&app.config.history);
-        let input_items = settings::audio_input_items(app.audio_devices.input_devices());
-        let output_items = settings::audio_output_items(app.audio_devices.output_devices());
+        let input_items = settings::audio_input_items(app.room.audio_devices.input_devices());
+        let output_items = settings::audio_output_items(app.room.audio_devices.output_devices());
         let mut input_picker = AudioInputPickerState::default();
         input_picker.reset(&input_items, draft.input_selection());
         let mut output_picker = AudioOutputPickerState::default();
@@ -633,16 +633,16 @@ impl SettingsSession {
             input_picker,
             output_picker,
             dirty: false,
-            catalog_generation: app.audio_devices.generation(),
+            catalog_generation: app.room.audio_devices.generation(),
         }
     }
 
     pub(crate) fn sync_catalog(&mut self, app: &App) {
-        if self.catalog_generation == app.audio_devices.generation() {
+        if self.catalog_generation == app.room.audio_devices.generation() {
             return;
         }
-        self.catalog_generation = app.audio_devices.generation();
-        self.input_items = settings::audio_input_items(app.audio_devices.input_devices());
+        self.catalog_generation = app.room.audio_devices.generation();
+        self.input_items = settings::audio_input_items(app.room.audio_devices.input_devices());
         if self.input_picker.open {
             self.input_picker
                 .refresh_items(&self.input_items, self.draft.input_selection());
@@ -650,7 +650,7 @@ impl SettingsSession {
             self.input_picker
                 .reset(&self.input_items, self.draft.input_selection());
         }
-        self.output_items = settings::audio_output_items(app.audio_devices.output_devices());
+        self.output_items = settings::audio_output_items(app.room.audio_devices.output_devices());
         if self.output_picker.open {
             self.output_picker
                 .refresh_items(&self.output_items, self.draft.output_selection());
