@@ -1394,17 +1394,17 @@ fn draw_chat(
     }
     // Clamp a stale cursor (eviction, collapse) before styling against it.
     app.room.active.chat.ensure_cursor(content_width);
-    let lines =
-        app.room
-            .active
-            .chat
-            .visible_lines(content_width, area.h, app.config.ui.overscan as usize);
-    layout.visible_chat_lines = lines.clone();
+    app.room.active.chat.visible_lines_into(
+        content_width,
+        area.h,
+        app.config.ui.overscan as usize,
+        &mut layout.visible_chat_lines,
+    );
     let chat_focused = focus == ChatPanelFocus::ChatLog;
     // Content is top-anchored: lines are drawn from the top of `area` and the
     // already-background-filled rows below them stay empty.
     let mut row_area = area;
-    for line in lines {
+    for line in layout.visible_chat_lines.iter().copied() {
         let mut row = row_area.take_top(1);
         let marker = row.take_left(1);
         match line.kind {

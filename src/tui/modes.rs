@@ -1481,7 +1481,11 @@ impl RoomMode {
     }
 
     fn copy_chat_selection(&mut self, app: &mut App) {
-        if app.room.copy_chat_selection().is_some() {
+        if app
+            .room
+            .copy_chat_selection(self.layout.chat_width)
+            .is_some()
+        {
             app.set_transient_status("copied to clipboard");
         }
     }
