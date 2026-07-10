@@ -1800,10 +1800,12 @@ impl RoomSession {
         })
     }
 
-    /// Starts one older-page request for the viewed room, coalescing repeated
+    /// Starts one older-page request for `room_id`, coalescing repeated
     /// top-of-scroll attempts until the outstanding response arrives.
-    pub(crate) fn older_history_request(&mut self) -> Option<(RoomId, Option<MessageId>, u16)> {
-        let room_id = self.viewed_room?;
+    pub(crate) fn older_history_request(
+        &mut self,
+        room_id: RoomId,
+    ) -> Option<(RoomId, Option<MessageId>, u16)> {
         let meta = self.metas.get_mut(&room_id)?;
         let resident = self
             .rooms
@@ -3525,21 +3527,21 @@ mod tests {
         room.merge_history(RoomId(1), newest);
 
         assert_eq!(
-            room.older_history_request(),
+            room.older_history_request(RoomId(1)),
             Some((
                 RoomId(1),
                 Some(MessageId(6)),
                 rpc::control::MAX_HISTORY_FETCH_MESSAGES
             ))
         );
-        assert_eq!(room.older_history_request(), None);
+        assert_eq!(room.older_history_request(RoomId(1)), None);
 
         let oldest = (1..=5)
             .map(|id| message(id, UserId(2), "oldest"))
             .collect::<Vec<_>>();
         room.complete_history_fetch(RoomId(1), Some(MessageId(6)), &oldest, true);
         room.merge_history(RoomId(1), oldest);
-        assert_eq!(room.older_history_request(), None);
+        assert_eq!(room.older_history_request(RoomId(1)), None);
     }
 
     #[test]
@@ -3557,13 +3559,17 @@ mod tests {
             .collect::<Vec<_>>();
         room.complete_history_fetch(RoomId(1), Some(MessageId(4)), &stale, true);
 
-        assert_eq!(room.older_history_request(), None, "fetch still in flight");
+        assert_eq!(
+            room.older_history_request(RoomId(1)),
+            None,
+            "fetch still in flight"
+        );
         let newest = (6..=9)
             .map(|id| message(id, UserId(2), "newest"))
             .collect::<Vec<_>>();
         room.complete_history_fetch(RoomId(1), None, &newest, false);
         assert_eq!(
-            room.older_history_request(),
+            room.older_history_request(RoomId(1)),
             Some((
                 RoomId(1),
                 Some(MessageId(6)),

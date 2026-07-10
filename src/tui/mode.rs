@@ -5,10 +5,30 @@ use extui::{
 use extui_bindings::LayerId;
 
 use crate::{
-    app::{App, AppEvent},
+    app::{App, AppEvent, RoomSession, command::CoreCommand},
+    config::Config,
     theme,
-    tui::Action,
+    tui::{Action, view::ClientView},
 };
+
+/// The state and command sink available to render-thread mode code.
+///
+/// The session is deliberately read-only. Once clients render on their own
+/// threads this reference will be backed by a scoped `RwLock` read guard.
+#[allow(dead_code)]
+pub(crate) struct ViewCx<'a> {
+    pub(crate) view: &'a mut ClientView,
+    pub(crate) session: &'a RoomSession,
+    pub(crate) config: &'a Config,
+    pub(crate) commands: &'a mut Vec<CoreCommand>,
+}
+
+#[allow(dead_code)]
+impl ViewCx<'_> {
+    pub(crate) fn send(&mut self, command: CoreCommand) {
+        self.commands.push(command);
+    }
+}
 
 /// Whether `key` is the global quit chord (Ctrl-C). Overlay modes check this so
 /// quit is never trapped by a modal.
