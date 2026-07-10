@@ -20,8 +20,8 @@ use std::thread;
 use std::time::Duration;
 
 use darkhttp::{
-    Router, Server, ServerConfig, ServerEvent, WakeHandle, WebSocketCloseReason, WebSocketId,
-    WebSocketMessage,
+    HttpMethod, HttpRequestEnd, HttpRequestId, HttpRequestPhase, Router, Server, ServerConfig,
+    ServerEvent, WakeHandle, WebSocketCloseReason, WebSocketId, WebSocketMessage,
 };
 use jsony::Jsony;
 use rpc::{
@@ -36,6 +36,9 @@ use crate::web_wire::{self, Fragment, split_fragments};
 
 /// The path a browser opens a WebSocket on for the live feed.
 const WS_PATH: &str = "/ws";
+/// Loopback HTTP requests should always make prompt progress. This is an idle
+/// progress deadline, not a total request-duration limit.
+const HTTP_PROGRESS_TIMEOUT: Duration = Duration::from_secs(5);
 #[cfg(not(feature = "embed-web"))]
 const WEB_ASSETS_DIR: &str = "web/dist";
 
@@ -760,9 +763,14 @@ pub fn spawn(
         router = router.embedded_assets(embed::asset);
     }
 
-    // A zero timeout disables idle-connection reaping so a quiet WebSocket is
-    // never closed out from under a watching browser.
-    let config = ServerConfig::default().bind(addr).timeout(Duration::ZERO);
+    // A browser may watch a quiet room indefinitely, but ordinary HTTP
+    // requests retain a finite progress timeout. Keeping those policies
+    // separate prevents one stalled asset request from living forever (and
+    // keeps the HTTP Keep-Alive header truthful).
+    let config = ServerConfig::default()
+        .bind(addr)
+        .http_timeout(HTTP_PROGRESS_TIMEOUT)
+        .websocket_timeout(Duration::ZERO);
     let server = Server::bind(config, router)?;
     let wake = server.wake_handle()?;
     let local = server.local_addr()?;
@@ -832,6 +840,33 @@ fn run(
 
         for event in server.drain_events() {
             match event {
+                ServerEvent::HttpRequestStart { id, method, path } => {
+                    kvlog::info!(
+                        "web http request started",
+                        request_id = id.get(),
+                        method = method.as_str(),
+                        path = path.as_str()
+                    );
+                }
+                ServerEvent::HttpRequestEnd {
+                    id,
+                    method,
+                    path,
+                    phase,
+                    request_bytes,
+                    response_bytes,
+                    elapsed,
+                    end,
+                } => log_http_request_end(
+                    id,
+                    method,
+                    path.as_deref(),
+                    phase,
+                    request_bytes,
+                    response_bytes,
+                    elapsed,
+                    &end,
+                ),
                 ServerEvent::WebSocketOpen { id, path } => {
                     if path == WS_PATH {
                         kvlog::info!(
@@ -1328,6 +1363,103 @@ fn client_request_kind(request: &ClientRequest) -> &'static str {
         ClientRequest::UploadStart { .. } => "upload_start",
         ClientRequest::UploadFinish { .. } => "upload_finish",
         ClientRequest::AbortTransfer { .. } => "abort_transfer",
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn log_http_request_end(
+    id: HttpRequestId,
+    method: Option<HttpMethod>,
+    path: Option<&str>,
+    phase: HttpRequestPhase,
+    request_bytes: usize,
+    response_bytes: u64,
+    elapsed: Duration,
+    end: &HttpRequestEnd,
+) {
+    let method = method.map_or("UNKNOWN", HttpMethod::as_str);
+    let path = path.unwrap_or("");
+    let elapsed_us = u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX);
+    match end {
+        HttpRequestEnd::Complete { status, keep_alive } => kvlog::info!(
+            "web http request finished",
+            request_id = id.get(),
+            method,
+            path,
+            phase = phase.as_str(),
+            outcome = "complete",
+            status = *status,
+            keep_alive = *keep_alive,
+            request_bytes,
+            response_bytes,
+            elapsed_us
+        ),
+        HttpRequestEnd::ClientEof if request_bytes == 0 => {
+            kvlog::debug!(
+                "web http connection closed before request",
+                request_id = id.get(),
+                phase = phase.as_str(),
+                outcome = "client_eof",
+                elapsed_us
+            );
+        }
+        HttpRequestEnd::ClientEof => kvlog::warn!(
+            "web http request aborted",
+            request_id = id.get(),
+            method,
+            path,
+            phase = phase.as_str(),
+            outcome = "client_eof",
+            request_bytes,
+            response_bytes,
+            elapsed_us
+        ),
+        HttpRequestEnd::ReadError { error } => kvlog::warn!(
+            "web http request aborted",
+            request_id = id.get(),
+            method,
+            path,
+            phase = phase.as_str(),
+            outcome = "read_error",
+            error = error.as_str(),
+            request_bytes,
+            response_bytes,
+            elapsed_us
+        ),
+        HttpRequestEnd::WriteError { error } => kvlog::warn!(
+            "web http request aborted",
+            request_id = id.get(),
+            method,
+            path,
+            phase = phase.as_str(),
+            outcome = "write_error",
+            error = error.as_str(),
+            request_bytes,
+            response_bytes,
+            elapsed_us
+        ),
+        HttpRequestEnd::Timeout => kvlog::warn!(
+            "web http request timed out",
+            request_id = id.get(),
+            method,
+            path,
+            phase = phase.as_str(),
+            outcome = "timeout",
+            request_bytes,
+            response_bytes,
+            elapsed_us
+        ),
+        HttpRequestEnd::InternalError => kvlog::warn!(
+            "web http request aborted",
+            request_id = id.get(),
+            method,
+            path,
+            phase = phase.as_str(),
+            outcome = "internal_error",
+            request_bytes,
+            response_bytes,
+            elapsed_us
+        ),
     }
 }
 

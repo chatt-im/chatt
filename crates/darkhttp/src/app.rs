@@ -16,7 +16,10 @@ use crate::net::socket;
 use crate::net::waker::Waker;
 use crate::router::Router;
 use crate::router::{GeneratedResponse, MountKind};
-use crate::server::{ServerEvent, WebSocketCloseReason, WebSocketId, WebSocketMessage};
+use crate::server::{
+    HttpMethod, HttpRequestEnd, HttpRequestId, HttpRequestPhase, ServerEvent, WebSocketCloseReason,
+    WebSocketId, WebSocketMessage,
+};
 use crate::websocket::{frame, handshake};
 
 const READ_BUF_SIZE: usize = 32 * 1024;
@@ -32,6 +35,7 @@ pub(crate) struct App {
     file_rx: mpsc::Receiver<FileResult>,
     waker: Waker,
     next_conn_id: u64,
+    next_http_request_id: u64,
     next_ws_id: u64,
     events: VecDeque<ServerEvent>,
     /// Number of file tasks dispatched to the I/O pool whose results have not
@@ -62,6 +66,7 @@ impl App {
             file_rx,
             waker,
             next_conn_id: 1,
+            next_http_request_id: 1,
             next_ws_id: 1,
             events: VecDeque::new(),
             pending_files: 0,
@@ -219,15 +224,17 @@ impl App {
     fn poll_timeout(&self, max_wait: Option<Duration>) -> i32 {
         // Pending file responses no longer force a short timeout: the I/O-pool
         // worker wakes the loop via the waker the instant a result is ready.
-        let has_connections = self
+        let now = Instant::now();
+        let timeout = self
             .conns
             .iter()
-            .any(|conn| !matches!(conn.state, ConnState::Done));
-        let timeout = if has_connections && !self.config.timeout.is_zero() {
-            Some(self.config.timeout)
-        } else {
-            None
-        };
+            .filter(|conn| !matches!(conn.state, ConnState::Done))
+            .filter_map(|conn| {
+                let timeout = connection_timeout(&self.config, conn);
+                (!timeout.is_zero())
+                    .then(|| timeout.saturating_sub(now.duration_since(conn.last_active)))
+            })
+            .min();
         match (timeout, max_wait) {
             (Some(timeout), Some(max_wait)) => socket::duration_to_poll_ms(timeout.min(max_wait)),
             (Some(timeout), None) => socket::duration_to_poll_ms(timeout),
@@ -251,15 +258,22 @@ impl App {
             let _ = stream.set_nodelay(true);
             let id = self.next_conn_id;
             self.next_conn_id = self.next_conn_id.wrapping_add(1).max(1);
-            self.conns.push(Connection::new(id, stream));
+            let request_id = self.next_http_request_id();
+            self.conns.push(Connection::new(id, request_id, stream));
         }
+    }
+
+    fn next_http_request_id(&mut self) -> HttpRequestId {
+        let id = HttpRequestId(self.next_http_request_id);
+        self.next_http_request_id = self.next_http_request_id.wrapping_add(1).max(1);
+        id
     }
 
     fn recv_request(&mut self, idx: usize) {
         loop {
             match self.conns[idx].stream.read(self.read_buf.as_mut_slice()) {
                 Ok(0) => {
-                    self.conns[idx].state = ConnState::Done;
+                    self.conns[idx].abort_http(HttpRequestEnd::ClientEof);
                     return;
                 }
                 Ok(read) => {
@@ -273,7 +287,7 @@ impl App {
                             "Request Entity Too Large",
                             "Your request was dropped because it was too long.",
                             false,
-                            self.config.timeout,
+                            self.config.http_timeout,
                             false,
                         );
                         self.conns[idx].set_response(response, AfterResponse::Close);
@@ -285,8 +299,10 @@ impl App {
                     }
                 }
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => return,
-                Err(_) => {
-                    self.conns[idx].state = ConnState::Done;
+                Err(error) => {
+                    self.conns[idx].abort_http(HttpRequestEnd::ReadError {
+                        error: error.to_string(),
+                    });
                     return;
                 }
             }
@@ -303,13 +319,26 @@ impl App {
                     "Bad Request",
                     "You sent a request that the server could not understand.",
                     false,
-                    self.config.timeout,
+                    self.config.http_timeout,
                     false,
                 );
                 self.conns[idx].set_response(response, AfterResponse::Close);
                 return;
             }
         };
+
+        let method = match request.method {
+            Method::Get => HttpMethod::Get,
+            Method::Head => HttpMethod::Head,
+            Method::Other => HttpMethod::Other,
+        };
+        let path = request.path.as_str().to_owned();
+        self.conns[idx].http_method = Some(method);
+        self.conns[idx].http_path = Some(path.clone());
+        if let Some(id) = self.conns[idx].http_request_id {
+            self.events
+                .push_back(ServerEvent::HttpRequestStart { id, method, path });
+        }
 
         let response = match request.method {
             Method::Get | Method::Head => {
@@ -333,7 +362,7 @@ impl App {
                             "Bad Request",
                             "The WebSocket upgrade request was invalid.",
                             false,
-                            self.config.timeout,
+                            self.config.http_timeout,
                             false,
                         ),
                     }
@@ -343,7 +372,7 @@ impl App {
                         &asset.content_type,
                         None,
                         request.keep_alive,
-                        self.config.timeout,
+                        self.config.http_timeout,
                         request.is_head(),
                     )
                 } else if let Some((content_type, encoding, body)) =
@@ -354,7 +383,7 @@ impl App {
                         content_type,
                         (!encoding.is_empty()).then_some(encoding),
                         request.keep_alive,
-                        self.config.timeout,
+                        self.config.http_timeout,
                         request.is_head(),
                     )
                 } else if let Some((handler, relative, prefix)) =
@@ -396,7 +425,7 @@ impl App {
                         "Not Found",
                         "The URL you requested was not found.",
                         request.keep_alive,
-                        self.config.timeout,
+                        self.config.http_timeout,
                         request.is_head(),
                     )
                 }
@@ -406,7 +435,7 @@ impl App {
                 "Not Implemented",
                 "The method you specified is not implemented.",
                 false,
-                self.config.timeout,
+                self.config.http_timeout,
                 false,
             ),
         };
@@ -431,7 +460,8 @@ impl App {
         let file_tx = self.file_tx.clone();
         let notifier = self.waker.notifier();
         let config = self.config.clone();
-        let timeout = self.config.timeout;
+        let timeout = self.config.http_timeout;
+        self.conns[idx].http_request_bytes = self.conns[idx].request.len();
         self.conns[idx].request.clear();
         self.conns[idx].state = ConnState::AwaitFile;
         self.pending_files += 1;
@@ -494,6 +524,7 @@ impl App {
         let conn_id = self.conns[idx].id;
         let file_tx = self.file_tx.clone();
         let notifier = self.waker.notifier();
+        self.conns[idx].http_request_bytes = self.conns[idx].request.len();
         self.conns[idx].request.clear();
         self.conns[idx].state = ConnState::AwaitFile;
         self.pending_files += 1;
@@ -533,7 +564,7 @@ impl App {
         let done = {
             let conn = &mut self.conns[idx];
             let Some(response) = conn.response.as_mut() else {
-                conn.state = ConnState::Done;
+                conn.abort_http(HttpRequestEnd::InternalError);
                 return;
             };
 
@@ -543,7 +574,9 @@ impl App {
                     while conn.header_sent < header.len() {
                         match conn.stream.write(&header[conn.header_sent..]) {
                             Ok(0) => {
-                                conn.state = ConnState::Done;
+                                conn.abort_http(HttpRequestEnd::WriteError {
+                                    error: "socket write returned zero".to_string(),
+                                });
                                 return;
                             }
                             Ok(sent) => {
@@ -551,8 +584,10 @@ impl App {
                                 conn.header_sent += sent;
                             }
                             Err(error) if error.kind() == io::ErrorKind::WouldBlock => return,
-                            Err(_) => {
-                                conn.state = ConnState::Done;
+                            Err(error) => {
+                                conn.abort_http(HttpRequestEnd::WriteError {
+                                    error: error.to_string(),
+                                });
                                 return;
                             }
                         }
@@ -573,7 +608,9 @@ impl App {
                         let iov = [io::IoSlice::new(header_left), io::IoSlice::new(body_left)];
                         match conn.stream.write_vectored(&iov) {
                             Ok(0) => {
-                                conn.state = ConnState::Done;
+                                conn.abort_http(HttpRequestEnd::WriteError {
+                                    error: "socket write returned zero".to_string(),
+                                });
                                 return;
                             }
                             Ok(sent) => {
@@ -587,8 +624,10 @@ impl App {
                                 }
                             }
                             Err(error) if error.kind() == io::ErrorKind::WouldBlock => return,
-                            Err(_) => {
-                                conn.state = ConnState::Done;
+                            Err(error) => {
+                                conn.abort_http(HttpRequestEnd::WriteError {
+                                    error: error.to_string(),
+                                });
                                 return;
                             }
                         }
@@ -609,7 +648,9 @@ impl App {
                         let iov = [io::IoSlice::new(header_left), io::IoSlice::new(body_left)];
                         match conn.stream.write_vectored(&iov) {
                             Ok(0) => {
-                                conn.state = ConnState::Done;
+                                conn.abort_http(HttpRequestEnd::WriteError {
+                                    error: "socket write returned zero".to_string(),
+                                });
                                 return;
                             }
                             Ok(sent) => {
@@ -623,8 +664,10 @@ impl App {
                                 }
                             }
                             Err(error) if error.kind() == io::ErrorKind::WouldBlock => return,
-                            Err(_) => {
-                                conn.state = ConnState::Done;
+                            Err(error) => {
+                                conn.abort_http(HttpRequestEnd::WriteError {
+                                    error: error.to_string(),
+                                });
                                 return;
                             }
                         }
@@ -635,7 +678,9 @@ impl App {
                     while conn.header_sent < header.len() {
                         match conn.stream.write(&header[conn.header_sent..]) {
                             Ok(0) => {
-                                conn.state = ConnState::Done;
+                                conn.abort_http(HttpRequestEnd::WriteError {
+                                    error: "socket write returned zero".to_string(),
+                                });
                                 return;
                             }
                             Ok(sent) => {
@@ -643,8 +688,10 @@ impl App {
                                 conn.header_sent += sent;
                             }
                             Err(error) if error.kind() == io::ErrorKind::WouldBlock => return,
-                            Err(_) => {
-                                conn.state = ConnState::Done;
+                            Err(error) => {
+                                conn.abort_http(HttpRequestEnd::WriteError {
+                                    error: error.to_string(),
+                                });
                                 return;
                             }
                         }
@@ -657,17 +704,20 @@ impl App {
                             file_body.remaining,
                         ) {
                             Ok(0) => {
-                                conn.state = ConnState::Done;
+                                conn.abort_http(HttpRequestEnd::InternalError);
                                 return;
                             }
                             Ok(sent) => {
                                 conn.last_active = Instant::now();
+                                conn.body_sent += sent;
                                 file_body.offset += sent;
                                 file_body.remaining -= sent;
                             }
                             Err(error) if error.kind() == io::ErrorKind::WouldBlock => return,
-                            Err(_) => {
-                                conn.state = ConnState::Done;
+                            Err(error) => {
+                                conn.abort_http(HttpRequestEnd::WriteError {
+                                    error: error.to_string(),
+                                });
                                 return;
                             }
                         }
@@ -680,8 +730,22 @@ impl App {
         if !done {
             return;
         }
+        let status = self.conns[idx]
+            .response
+            .as_ref()
+            .map(|response| response.status)
+            .unwrap_or(500);
+        let keep_alive = matches!(self.conns[idx].after_response, AfterResponse::KeepAlive);
+        self.finish_http_request(
+            idx,
+            HttpRequestPhase::SendingResponse,
+            HttpRequestEnd::Complete { status, keep_alive },
+        );
         match self.conns[idx].after_response {
-            AfterResponse::KeepAlive => self.conns[idx].reset_for_keepalive(),
+            AfterResponse::KeepAlive => {
+                let request_id = self.next_http_request_id();
+                self.conns[idx].reset_for_keepalive(request_id);
+            }
             AfterResponse::Close => self.conns[idx].state = ConnState::Done,
             AfterResponse::WebSocket => {
                 self.conns[idx].response = None;
@@ -690,6 +754,28 @@ impl App {
                 self.conns[idx].state = ConnState::WebSocket;
             }
         }
+    }
+
+    fn finish_http_request(&mut self, idx: usize, phase: HttpRequestPhase, end: HttpRequestEnd) {
+        let conn = &mut self.conns[idx];
+        let Some(id) = conn.http_request_id.take() else {
+            return;
+        };
+        let request_bytes = conn.http_request_bytes.max(conn.request.len());
+        let response_bytes = conn.header_sent as u64 + conn.body_sent;
+        let elapsed = conn.http_started.elapsed();
+        let method = conn.http_method;
+        let path = conn.http_path.take();
+        self.events.push_back(ServerEvent::HttpRequestEnd {
+            id,
+            method,
+            path,
+            phase,
+            request_bytes,
+            response_bytes,
+            elapsed,
+            end,
+        });
     }
 
     fn recv_websocket(&mut self, idx: usize) {
@@ -920,14 +1006,20 @@ impl App {
     }
 
     fn check_timeouts(&mut self) {
-        if self.config.timeout.is_zero() {
-            return;
-        }
         let now = Instant::now();
         for idx in 0..self.conns.len() {
-            if now.duration_since(self.conns[idx].last_active) >= self.config.timeout {
+            let timeout = connection_timeout(&self.config, &self.conns[idx]);
+            if timeout.is_zero()
+                || now.duration_since(self.conns[idx].last_active) < timeout
+                || matches!(self.conns[idx].state, ConnState::Done)
+            {
+                continue;
+            }
+            if matches!(self.conns[idx].state, ConnState::WebSocket) {
                 self.emit_websocket_close(idx, WebSocketCloseReason::Timeout);
                 self.conns[idx].state = ConnState::Done;
+            } else {
+                self.conns[idx].abort_http(HttpRequestEnd::Timeout);
             }
         }
     }
@@ -936,12 +1028,27 @@ impl App {
         let mut i = 0;
         while i < self.conns.len() {
             if matches!(self.conns[i].state, ConnState::Done) {
+                if self.conns[i].http_request_id.is_some() {
+                    let (phase, end) = self.conns[i]
+                        .http_end
+                        .take()
+                        .unwrap_or((self.conns[i].http_phase(), HttpRequestEnd::InternalError));
+                    self.finish_http_request(i, phase, end);
+                }
                 self.emit_websocket_close(i, WebSocketCloseReason::ConnectionDropped);
                 self.conns.swap_remove(i);
             } else {
                 i += 1;
             }
         }
+    }
+}
+
+fn connection_timeout(config: &ServerConfig, conn: &Connection) -> Duration {
+    if matches!(conn.state, ConnState::WebSocket) {
+        config.websocket_timeout
+    } else {
+        config.http_timeout
     }
 }
 

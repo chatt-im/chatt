@@ -9,6 +9,59 @@ use crate::net::waker::WakeHandle;
 use crate::router::Router;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct HttpRequestId(pub(crate) u64);
+
+impl HttpRequestId {
+    pub fn get(self) -> u64 {
+        self.0
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HttpMethod {
+    Get,
+    Head,
+    Other,
+}
+
+impl HttpMethod {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Get => "GET",
+            Self::Head => "HEAD",
+            Self::Other => "OTHER",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HttpRequestPhase {
+    ReceivingRequest,
+    PreparingResponse,
+    SendingResponse,
+}
+
+impl HttpRequestPhase {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ReceivingRequest => "receiving_request",
+            Self::PreparingResponse => "preparing_response",
+            Self::SendingResponse => "sending_response",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum HttpRequestEnd {
+    Complete { status: u16, keep_alive: bool },
+    ClientEof,
+    ReadError { error: String },
+    WriteError { error: String },
+    Timeout,
+    InternalError,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct WebSocketId(pub(crate) u64);
 
 impl WebSocketId {
@@ -37,6 +90,21 @@ pub enum WebSocketCloseReason {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ServerEvent {
+    HttpRequestStart {
+        id: HttpRequestId,
+        method: HttpMethod,
+        path: String,
+    },
+    HttpRequestEnd {
+        id: HttpRequestId,
+        method: Option<HttpMethod>,
+        path: Option<String>,
+        phase: HttpRequestPhase,
+        request_bytes: usize,
+        response_bytes: u64,
+        elapsed: Duration,
+        end: HttpRequestEnd,
+    },
     WebSocketOpen {
         id: WebSocketId,
         path: String,
