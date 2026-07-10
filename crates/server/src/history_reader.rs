@@ -224,6 +224,8 @@ mod tests {
             timestamp_ms: 1_000 + id,
             body: format!("message {id}"),
             file_transfer_id: None,
+            flags: rpc::control::MessageFlags::default(),
+            target: None,
         }
     }
 

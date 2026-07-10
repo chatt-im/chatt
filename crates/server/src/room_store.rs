@@ -37,7 +37,7 @@ use std::{
 };
 
 use rpc::{
-    control::ChatMessage,
+    control::{ChatMessage, MUTATION_WINDOW_MESSAGES},
     history,
     ids::{MessageId, RoomId, SessionId, UserId},
 };
@@ -70,6 +70,41 @@ impl Default for StoreTuning {
         Self {
             max_active_log_bytes: MAX_ACTIVE_LOG_BYTES,
             max_resident_messages: MAX_DURABLE_RESIDENT_MESSAGES,
+        }
+    }
+}
+
+/// Which mutation [`RoomStore::validate_mutation`] is gating.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MutationKind {
+    Edit,
+    Delete,
+}
+
+/// Why [`RoomStore::validate_mutation`] rejected a mutation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MutationDenied {
+    /// The target is not among the newest window of records: unknown, frozen
+    /// by newer traffic, or the room retains no history.
+    TargetMissing,
+    /// The target was sent by someone else.
+    WrongSender,
+    /// The target announces a file transfer, which cannot be edited.
+    FileMessage,
+    /// The target is itself an edit or delete record.
+    MutationRecord,
+    /// A delete already applies to the target.
+    Deleted,
+}
+
+impl MutationDenied {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            MutationDenied::TargetMissing => "target_missing",
+            MutationDenied::WrongSender => "wrong_sender",
+            MutationDenied::FileMessage => "file_message",
+            MutationDenied::MutationRecord => "mutation_record",
+            MutationDenied::Deleted => "deleted",
         }
     }
 }
@@ -743,6 +778,56 @@ impl RoomStore {
     /// Latest message id assigned in the room, `None` before the first message.
     pub fn head(&self, room_id: RoomId) -> Option<MessageId> {
         self.heads.get(&room_id).copied()
+    }
+
+    /// Whether `sender` may edit or delete `target` in the room right now.
+    ///
+    /// Scans the newest [`MUTATION_WINDOW_MESSAGES`] resident records for the
+    /// target, so a message with more than that many records after it is
+    /// frozen and reported as [`MutationDenied::TargetMissing`]. Rooms without
+    /// resident history (`Retention::None`) reject every mutation, and a
+    /// memory room whose limit is below the window effectively shrinks it.
+    pub fn validate_mutation(
+        &self,
+        room_id: RoomId,
+        target: MessageId,
+        sender: UserId,
+        kind: MutationKind,
+    ) -> Result<(), MutationDenied> {
+        let Some(history) = self.rooms.get(&room_id).and_then(Retention::history) else {
+            return Err(MutationDenied::TargetMissing);
+        };
+        let mut deleted = false;
+        for entry in history
+            .entries()
+            .iter()
+            .rev()
+            .take(MUTATION_WINDOW_MESSAGES)
+        {
+            let Ok(record) = history::parse_message(history.record(*entry)) else {
+                return Err(MutationDenied::TargetMissing);
+            };
+            if record.target == Some(target) && record.flags.deleted() {
+                deleted = true;
+            }
+            if record.message_id != target {
+                continue;
+            }
+            if record.target.is_some() {
+                return Err(MutationDenied::MutationRecord);
+            }
+            if record.sender != sender {
+                return Err(MutationDenied::WrongSender);
+            }
+            if deleted {
+                return Err(MutationDenied::Deleted);
+            }
+            if kind == MutationKind::Edit && record.file_transfer_id.is_some() {
+                return Err(MutationDenied::FileMessage);
+            }
+            return Ok(());
+        }
+        Err(MutationDenied::TargetMissing)
     }
 
     /// Test-only view of one resident history page, decoded from the same
@@ -1424,6 +1509,8 @@ mod tests {
             timestamp_ms: 1_000 + id,
             body: format!("message {id}"),
             file_transfer_id: None,
+            flags: rpc::control::MessageFlags::default(),
+            target: None,
         }
     }
 
@@ -2130,5 +2217,146 @@ mod tests {
         assert_eq!(store.recent(room, 10).len(), 3);
         let id = store.allocate_message_id(room);
         assert!(id.0 > 3, "ids must resume above segment records");
+    }
+
+    fn append_next(store: &mut RoomStore, room: RoomId) -> MessageId {
+        let id = store.allocate_message_id(room);
+        store.append(room, &test_message(room, id.0));
+        id
+    }
+
+    fn append_mutation(
+        store: &mut RoomStore,
+        room: RoomId,
+        target: MessageId,
+        kind: MutationKind,
+    ) -> MessageId {
+        let id = store.allocate_message_id(room);
+        let mut message = test_message(room, id.0);
+        match kind {
+            MutationKind::Edit => message.flags.set_edited(),
+            MutationKind::Delete => {
+                message.flags.set_deleted();
+                message.body = String::new();
+            }
+        }
+        message.target = Some(target);
+        store.append(room, &message);
+        id
+    }
+
+    #[test]
+    fn accepts_mutation_within_window() {
+        let mut store = RoomStore::open(None, &[memory_room(1, 600)]);
+        let room = RoomId(1);
+        let target = append_next(&mut store, room);
+        for _ in 0..MUTATION_WINDOW_MESSAGES - 1 {
+            append_next(&mut store, room);
+        }
+
+        assert_eq!(
+            store.validate_mutation(room, target, UserId(1), MutationKind::Edit),
+            Ok(())
+        );
+        assert_eq!(
+            store.validate_mutation(room, target, UserId(1), MutationKind::Delete),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn rejects_target_beyond_window() {
+        let mut store = RoomStore::open(None, &[memory_room(1, 600)]);
+        let room = RoomId(1);
+        let target = append_next(&mut store, room);
+        for _ in 0..MUTATION_WINDOW_MESSAGES {
+            append_next(&mut store, room);
+        }
+
+        assert_eq!(
+            store.validate_mutation(room, target, UserId(1), MutationKind::Edit),
+            Err(MutationDenied::TargetMissing)
+        );
+    }
+
+    #[test]
+    fn rejects_missing_target_and_wrong_sender() {
+        let mut store = RoomStore::open(None, &[memory_room(1, 16)]);
+        let room = RoomId(1);
+        let target = append_next(&mut store, room);
+
+        assert_eq!(
+            store.validate_mutation(room, MessageId(999), UserId(1), MutationKind::Delete),
+            Err(MutationDenied::TargetMissing)
+        );
+        assert_eq!(
+            store.validate_mutation(room, target, UserId(2), MutationKind::Edit),
+            Err(MutationDenied::WrongSender)
+        );
+    }
+
+    #[test]
+    fn rejects_edit_of_file_message_but_allows_delete() {
+        let mut store = RoomStore::open(None, &[memory_room(1, 16)]);
+        let room = RoomId(1);
+        let id = store.allocate_message_id(room);
+        let mut message = test_message(room, id.0);
+        message.file_transfer_id = Some(rpc::ids::FileTransferId(9));
+        store.append(room, &message);
+
+        assert_eq!(
+            store.validate_mutation(room, id, UserId(1), MutationKind::Edit),
+            Err(MutationDenied::FileMessage)
+        );
+        assert_eq!(
+            store.validate_mutation(room, id, UserId(1), MutationKind::Delete),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn rejects_mutating_a_mutation_record() {
+        let mut store = RoomStore::open(None, &[memory_room(1, 16)]);
+        let room = RoomId(1);
+        let target = append_next(&mut store, room);
+        let edit = append_mutation(&mut store, room, target, MutationKind::Edit);
+
+        assert_eq!(
+            store.validate_mutation(room, edit, UserId(1), MutationKind::Edit),
+            Err(MutationDenied::MutationRecord)
+        );
+    }
+
+    #[test]
+    fn rejects_mutations_after_delete_but_allows_delete_after_edit() {
+        let mut store = RoomStore::open(None, &[memory_room(1, 16)]);
+        let room = RoomId(1);
+        let target = append_next(&mut store, room);
+        append_mutation(&mut store, room, target, MutationKind::Edit);
+        assert_eq!(
+            store.validate_mutation(room, target, UserId(1), MutationKind::Delete),
+            Ok(())
+        );
+
+        append_mutation(&mut store, room, target, MutationKind::Delete);
+        assert_eq!(
+            store.validate_mutation(room, target, UserId(1), MutationKind::Edit),
+            Err(MutationDenied::Deleted)
+        );
+        assert_eq!(
+            store.validate_mutation(room, target, UserId(1), MutationKind::Delete),
+            Err(MutationDenied::Deleted)
+        );
+    }
+
+    #[test]
+    fn mutation_append_advances_head() {
+        let mut store = RoomStore::open(None, &[memory_room(1, 16)]);
+        let room = RoomId(1);
+        let target = append_next(&mut store, room);
+        let mutation = append_mutation(&mut store, room, target, MutationKind::Edit);
+
+        assert!(mutation > target);
+        assert_eq!(store.head(room), Some(mutation));
     }
 }

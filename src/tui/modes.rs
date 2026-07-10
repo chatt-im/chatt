@@ -967,6 +967,9 @@ impl RoomMode {
     }
 
     pub(crate) fn set_focus(&mut self, app: &mut App, focus: ChatPanelFocus) {
+        if self.focus == ChatPanelFocus::Compose && focus != ChatPanelFocus::Compose {
+            app.room.cancel_pending_edit();
+        }
         self.focus = focus;
         match focus {
             ChatPanelFocus::Lobby if self.lobby_list_focus == LobbyListFocus::Users => {
@@ -1011,7 +1014,7 @@ impl RoomMode {
             EnterLog => self.set_focus(app, ChatPanelFocus::ChatLog),
             SubmitMessage => app.submit_input(),
             Cancel => {
-                if self.focus == ChatPanelFocus::Compose {
+                if self.focus == ChatPanelFocus::Compose && !app.room.cancel_pending_edit() {
                     app.room.composer.clear();
                 }
                 self.enter_compose_insert_mode(app);
@@ -1060,6 +1063,7 @@ impl RoomMode {
             CopyMessageRef => self.copy_message_ref_if_focused(app),
             InsertMessageRef => self.insert_message_ref_if_focused(app),
             OpenMessageRef => self.open_message_ref_if_focused(app),
+            EditMessage => self.edit_cursor_message_if_focused(app),
             ToggleExpand => self.toggle_chat_expand_if_focused(app),
             FocusNext => self.move_focus(app, 1),
             FocusPrev => self.move_focus(app, -1),
@@ -1571,6 +1575,22 @@ impl RoomMode {
         }
     }
 
+    /// Starts editing the cursor message: the composer takes the original
+    /// body and focus moves to it without forcing insert mode, so Vim
+    /// bindings begin in Normal mode.
+    fn edit_cursor_message_if_focused(&mut self, app: &mut App) {
+        if self.focus != ChatPanelFocus::ChatLog {
+            return;
+        }
+        match app.room.begin_edit_cursor_message(self.layout.chat_width) {
+            Ok(()) => {
+                self.set_focus(app, ChatPanelFocus::Compose);
+                app.set_status("editing message; submit to save");
+            }
+            Err(denied) => app.set_status(denied.status()),
+        }
+    }
+
     fn scroll_focused_panel(&mut self, app: &mut App, direction: isize) {
         match self.focus {
             ChatPanelFocus::ChatLog => self.move_chat_cursor(app, direction),
@@ -1727,6 +1747,14 @@ mod tests {
 
     fn test_app() -> App {
         App::new(Config::default(), None).expect("test app")
+    }
+
+    /// An app whose composer uses Vim bindings, for tests exercising the
+    /// compose Normal mode.
+    fn test_app_vim() -> App {
+        let mut config = Config::default();
+        config.ui.default_bindings = crate::config::DefaultBindings::Vim;
+        App::new(config, None).expect("test app")
     }
 
     fn app_with_bindings(bindings: &str) -> App {
@@ -1960,6 +1988,8 @@ mod tests {
                 timestamp_ms,
                 body: body.into(),
                 file_transfer_id: None,
+                flags: rpc::control::MessageFlags::default(),
+                target: None,
             },
             None,
         );
@@ -1976,6 +2006,8 @@ mod tests {
                 timestamp_ms: 1_000,
                 body: "sent file `photo.png` (1.0 KiB)".to_string(),
                 file_transfer_id: Some(transfer_id),
+                flags: rpc::control::MessageFlags::default(),
+                target: None,
             },
             None,
         );
@@ -2073,7 +2105,9 @@ mod tests {
 
     #[test]
     fn compose_normal_chord_prefix_is_not_sent_to_editor() {
-        let mut app = app_with_bindings("[bindings.compose-normal]\n\"z z\" = \"ToggleMute\"\n");
+        let mut app = app_with_bindings(
+            "[ui]\ndefault-bindings = \"vim\"\n[bindings.compose-normal]\n\"z z\" = \"ToggleMute\"\n",
+        );
         let mut room = RoomMode::default();
         room.process_input(&mut app, KeyEvent::new(KeyCode::Esc, KeyModifiers::empty()));
         assert_eq!(app.room.composer.mode(), EditorMode::Normal);
@@ -2086,7 +2120,7 @@ mod tests {
 
     #[test]
     fn escape_leaves_compose_focused_in_vim_normal_mode() {
-        let mut app = test_app();
+        let mut app = test_app_vim();
         let mut room = RoomMode::default();
 
         assert!(matches!(
@@ -2111,7 +2145,7 @@ mod tests {
 
     #[test]
     fn compose_vim_text_object_commands_receive_i_key() {
-        let mut app = test_app();
+        let mut app = test_app_vim();
         let mut room = RoomMode::default();
         app.room.composer.set_lines("alpha beta");
         app.room.composer.set_cursor_offset(2);
@@ -2133,7 +2167,7 @@ mod tests {
 
     #[test]
     fn shifted_jk_wraps_chat_panel_focus() {
-        let mut app = test_app();
+        let mut app = test_app_vim();
         let mut room = RoomMode::default();
         room.process_input(&mut app, KeyEvent::new(KeyCode::Esc, KeyModifiers::empty()));
 
@@ -2572,7 +2606,6 @@ mod tests {
 
         let expected = rpc::msgref::MessageRef {
             room_id: RoomId(1),
-            timestamp_ms: 2_000,
             message_id: MessageId(2),
         }
         .encode();
@@ -3172,7 +3205,7 @@ mod tests {
 
     #[test]
     fn shift_enter_inserts_newline_in_composer() {
-        let mut app = test_app();
+        let mut app = test_app_vim();
         let mut room = RoomMode::default();
 
         assert!(matches!(

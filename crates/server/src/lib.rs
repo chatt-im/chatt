@@ -28,8 +28,9 @@ use rpc::{
         ERROR_OPEN_PAIR_RATE_LIMITED, ERROR_PAIRING_INVALID_REQUEST, ERROR_PAIRING_NOT_ACTIVE,
         ERROR_PASSWORD_MISMATCH, ERROR_PASSWORD_REQUIRED, ERROR_PUBLIC_DISABLED,
         ERROR_TOKEN_STALE_EPOCH, FileContentEncoding, FileMetadata, InviteTicket,
-        MAX_BUG_REPORT_BYTES, MAX_CONTROL_PAYLOAD_BYTES, MAX_FILE_CHUNK_BYTES, P2pCandidate,
-        P2pKey, P2pNatKind, P2pPeerInfo, P2pRole, RoomInfo, RoomKind, ServerControl, UserSummary,
+        MAX_BUG_REPORT_BYTES, MAX_CONTROL_PAYLOAD_BYTES, MAX_FILE_CHUNK_BYTES, MessageFlags,
+        P2pCandidate, P2pKey, P2pNatKind, P2pPeerInfo, P2pRole, RoomInfo, RoomKind, ServerControl,
+        UserSummary,
         decode_client_control, decode_client_hello, encode_invite_ticket, encode_server_control,
         encode_server_hello, max_file_wire_bytes,
     },
@@ -53,7 +54,7 @@ use rpc::{
 use config::{Config as ServerConfig, UserConfig, hash_secret, value_arg, verify_secret_hash};
 use history_reader::{HistoryReadReply, HistoryReader};
 use local_admin::{AdminCommand, AdminSocket};
-use room_store::RoomStore;
+use room_store::{MutationKind, RoomStore};
 use user_store::UserStore;
 
 #[cfg(test)]
@@ -1763,6 +1764,27 @@ impl Server {
             }
             (
                 ConnState::Ready,
+                ClientControl::EditChat {
+                    room_id,
+                    target,
+                    body,
+                },
+            ) => {
+                let session_id = self.session_for_token(token)?;
+                self.mutate_chat(session_id, room_id, target, MutationKind::Edit, body)
+            }
+            (ConnState::Ready, ClientControl::DeleteChat { room_id, target }) => {
+                let session_id = self.session_for_token(token)?;
+                self.mutate_chat(
+                    session_id,
+                    room_id,
+                    target,
+                    MutationKind::Delete,
+                    String::new(),
+                )
+            }
+            (
+                ConnState::Ready,
                 ClientControl::FetchHistory {
                     room_id,
                     before,
@@ -3041,6 +3063,8 @@ impl Server {
             timestamp_ms: now_ms(),
             body,
             file_transfer_id: None,
+            flags: MessageFlags::default(),
+            target: None,
         };
         let history_len = self.store.append(room_id, &message);
         kvlog::info!(
@@ -3050,6 +3074,78 @@ impl Server {
             message_id = message.message_id.0,
             user_id = sender.0,
             body_size,
+            history_len
+        );
+        self.broadcast_control(room_id, &ServerControl::Chat { message });
+        Ok(())
+    }
+
+    /// Validates and applies an edit or delete of a recent message: appends a
+    /// mutation record targeting it and broadcasts the record as an ordinary
+    /// chat. Rejections drop the request with a log line; there is no error
+    /// channel back to the client, whose own tighter window makes them rare.
+    fn mutate_chat(
+        &mut self,
+        session_id: SessionId,
+        room_id: RoomId,
+        target: MessageId,
+        kind: MutationKind,
+        body: String,
+    ) -> Result<(), String> {
+        let (sender, sender_name) = match self.sessions.get(&session_id) {
+            Some(session) => (session.user_id, session.display_name.clone()),
+            None => {
+                kvlog::warn!(
+                    "chat mutation rejected",
+                    session_id = session_id.0,
+                    error = "unknown session"
+                );
+                return Err("unknown session".into());
+            }
+        };
+        if !self.check_room_access(session_id, room_id) {
+            kvlog::warn!(
+                "chat mutation rejected",
+                session_id = session_id.0,
+                room_id = room_id.0,
+                error = "room not accessible"
+            );
+            return Ok(());
+        }
+        if let Err(denied) = self.store.validate_mutation(room_id, target, sender, kind) {
+            kvlog::warn!(
+                "chat mutation rejected",
+                session_id = session_id.0,
+                room_id = room_id.0,
+                target = target.0,
+                error = denied.as_str()
+            );
+            return Ok(());
+        }
+        let mut flags = MessageFlags::default();
+        match kind {
+            MutationKind::Edit => flags.set_edited(),
+            MutationKind::Delete => flags.set_deleted(),
+        }
+        let message = ChatMessage {
+            message_id: self.store.allocate_message_id(room_id),
+            room_id,
+            sender,
+            sender_name,
+            timestamp_ms: now_ms(),
+            body,
+            file_transfer_id: None,
+            flags,
+            target: Some(target),
+        };
+        let history_len = self.store.append(room_id, &message);
+        kvlog::info!(
+            "chat mutation accepted",
+            session_id = session_id.0,
+            room_id = room_id.0,
+            message_id = message.message_id.0,
+            target = target.0,
+            user_id = sender.0,
             history_len
         );
         self.broadcast_control(room_id, &ServerControl::Chat { message });
@@ -3154,6 +3250,8 @@ impl Server {
                 format_bytes(original_size)
             ),
             file_transfer_id: Some(server_transfer_id),
+            flags: MessageFlags::default(),
+            target: None,
         };
         // The upload is registered before anything durable or visible
         // happens, so an uploader torn down by any of the sends below is
@@ -5616,6 +5714,8 @@ fn client_control_kind(control: &ClientControl) -> &'static str {
         ClientControl::LeaveVoice => "leave_voice",
         ClientControl::OpenDm { .. } => "open_dm",
         ClientControl::SkipFile { .. } => "skip_file",
+        ClientControl::EditChat { .. } => "edit_chat",
+        ClientControl::DeleteChat { .. } => "delete_chat",
     }
 }
 
@@ -6439,6 +6539,73 @@ mod tests {
             assert_eq!(message.room_id, RoomId(1));
             assert_eq!(message.message_id, MessageId(1));
         }
+    }
+
+    #[test]
+    fn chat_mutations_fan_out_and_foreign_mutations_are_dropped() {
+        let mut config = test_server_config();
+        config.rooms[0].persistence = config::RoomPersistenceConfig::Memory;
+        config.rooms[0].memory_limit = Some(16);
+        let mut server = Server::bind(config).expect("test server");
+        let sender = SessionId(1);
+        let reader = SessionId(2);
+        let mut sender_peer = live_user(&mut server, Token(11), sender, UserId(1));
+        let mut reader_peer = live_user(&mut server, Token(22), reader, UserId(2));
+
+        server
+            .send_chat(sender, RoomId(1), "original".to_string())
+            .unwrap();
+        let target = server.store.head(RoomId(1)).expect("stored chat message");
+        server
+            .mutate_chat(
+                sender,
+                RoomId(1),
+                target,
+                MutationKind::Edit,
+                "revised".to_string(),
+            )
+            .unwrap();
+        for peer in [&mut sender_peer, &mut reader_peer] {
+            let control = read_until(peer, |control| {
+                matches!(control, ServerControl::Chat { message } if message.target.is_some())
+            });
+            let ServerControl::Chat { message } = control else {
+                unreachable!();
+            };
+            assert!(message.flags.edited());
+            assert_eq!(message.target, Some(target));
+            assert_eq!(message.body, "revised");
+            assert!(message.message_id > target);
+        }
+
+        server
+            .mutate_chat(
+                reader,
+                RoomId(1),
+                target,
+                MutationKind::Edit,
+                "hijacked".to_string(),
+            )
+            .unwrap();
+        assert_no_control(&mut sender_peer);
+
+        server
+            .mutate_chat(
+                sender,
+                RoomId(1),
+                target,
+                MutationKind::Delete,
+                String::new(),
+            )
+            .unwrap();
+        let control = read_until(&mut reader_peer, |control| {
+            matches!(control, ServerControl::Chat { message } if message.flags.deleted())
+        });
+        let ServerControl::Chat { message } = control else {
+            unreachable!();
+        };
+        assert_eq!(message.target, Some(target));
+        assert!(message.body.is_empty());
     }
 
     #[test]

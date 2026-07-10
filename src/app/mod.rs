@@ -74,7 +74,7 @@ use commands::slash_command_help;
 
 pub(crate) use dialogs::{UserVolumeDialog, UserVolumeEvent};
 pub(crate) use participants::{ParticipantState, ParticipantVoiceFeedback, Participants};
-pub(crate) use room::{ComposerSubmission, RoomSession, ToggleExpandResult};
+pub(crate) use room::{ComposerSubmission, MutationOutcome, RoomSession, ToggleExpandResult};
 pub(crate) use room_settings::{RoomSettingsDraft, RoomSettingsEvent};
 pub(crate) use server::{
     PairCompletion, PendingPair, ServerEditDraft, ServerEditEvent, ServerSelectItem,
@@ -2484,6 +2484,31 @@ impl App {
             }
             NetworkEvent::Chat(message) => {
                 let viewed = self.room.viewed_room == Some(message.room_id);
+                if message.target.is_some() {
+                    let update = self.room.mutation_received(&message, self.user_id);
+                    let Some(update) = update else {
+                        return;
+                    };
+                    if update.read_advanced {
+                        self.mark_room_catalog_dirty();
+                    }
+                    if viewed && let Some(feed) = &self.web_feed {
+                        match update.outcome {
+                            MutationOutcome::AppliedEdit(folded) => {
+                                feed.send(crate::web_server::WebMessage::from_chat(
+                                    &folded,
+                                    &|target| self.room.web_ref_for(target),
+                                ));
+                            }
+                            MutationOutcome::AppliedDelete => {
+                                let target = message.target.expect("mutation record");
+                                feed.send_delete(target.0);
+                            }
+                            MutationOutcome::Ignored | MutationOutcome::Pending => {}
+                        }
+                    }
+                    return;
+                }
                 let feed_message = (viewed && self.web_feed.is_some()).then(|| message.clone());
                 let update = RoomSession::chat_received(&mut self.room, message, self.user_id);
                 let Some(update) = update else {
@@ -4658,6 +4683,25 @@ impl App {
                 }
                 return;
             }
+            ComposerSubmission::Edit {
+                room_id,
+                target,
+                body,
+            } => {
+                if self.network.is_some() {
+                    self.send_network_command(
+                        NetworkCommand::EditChat {
+                            room_id,
+                            target,
+                            body,
+                        },
+                        true,
+                    );
+                } else {
+                    self.set_error("select a server before editing messages");
+                }
+                return;
+            }
         };
         match input.as_str() {
             "/quit" => self.set_status("use Ctrl-C to quit"),
@@ -6055,6 +6099,8 @@ fn network_event_kind(event: &NetworkEvent) -> &'static str {
 fn app_network_command_kind(command: &NetworkCommand) -> &'static str {
     match command {
         NetworkCommand::SendChat { .. } => "send_chat",
+        NetworkCommand::EditChat { .. } => "edit_chat",
+        NetworkCommand::DeleteChat { .. } => "delete_chat",
         NetworkCommand::UploadFile(_) => "upload_file",
         NetworkCommand::CancelTransfer { .. } => "cancel_transfer",
         NetworkCommand::SetActiveRoom(_) => "set_active_room",
@@ -7109,6 +7155,8 @@ mod tests {
                 timestamp_ms: id * 1_000,
                 body: format!("message {id}"),
                 file_transfer_id: None,
+                flags: rpc::control::MessageFlags::default(),
+                target: None,
             })
             .collect::<Vec<_>>();
         app.room
@@ -7485,7 +7533,9 @@ mod tests {
 
     #[test]
     fn compose_normal_m_uses_binding_to_toggle_mute() {
-        let mut app = test_app();
+        let mut config = Config::default();
+        config.ui.default_bindings = crate::config::DefaultBindings::Vim;
+        let mut app = App::new(config, None).expect("test app");
         let mut room = RoomMode::default();
         room.process_input(&mut app, KeyEvent::new(KeyCode::Esc, KeyModifiers::empty()));
         assert_eq!(app.room.composer.mode(), EditorMode::Normal);

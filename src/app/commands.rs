@@ -459,6 +459,8 @@ mod tests {
                     timestamp_ms: 1_000_000 + i as u64,
                     body: body.to_string(),
                     file_transfer_id: None,
+                    flags: rpc::control::MessageFlags::default(),
+                    target: None,
                 },
                 false,
             );
@@ -499,7 +501,7 @@ mod tests {
             .expect("token replaced in place");
         let target = rpc::msgref::MessageRef::decode(code).expect("inserted code decodes");
         assert_eq!(target.message_id.0, 1);
-        assert_eq!(target.timestamp_ms, 1_000_000);
+        assert_eq!(target.room_id.0, 1);
     }
 
     #[test]

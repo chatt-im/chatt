@@ -1,13 +1,15 @@
 //! Compact textual references to chat messages.
 //!
 //! A reference addresses a message by the durable key the rest of the system
-//! already uses for dedup and merge: `(timestamp_ms, message_id)` scoped by
-//! `room_id`. Message ids are durable and watermarked, but a room without a
-//! durable log can reuse ids when the server's `state.toml` is lost, so the
-//! timestamp stays part of the key. References travel inside message bodies as
-//! `@@<code>` where the code is Crockford base32 of the LEB128-packed fields
-//! plus a one-character checksum. Encoding is canonical: a code decodes only
-//! if re-encoding the result reproduces it.
+//! uses for dedup and merge: `message_id` scoped by `room_id`. Message ids are
+//! per-room, monotonic, and persistently watermarked, so the id alone is the
+//! identity. (A server that loses its `state.toml` on a room without a durable
+//! log can restart ids, in which case an old code may resolve to a different
+//! message; accepted for a reference that is ultimately display text.)
+//! References travel inside message bodies as `@@<code>` where the code is
+//! Crockford base32 of the LEB128-packed fields plus a one-character checksum.
+//! Encoding is canonical: a code decodes only if re-encoding the result
+//! reproduces it.
 
 use crate::ids::{MessageId, RoomId};
 
@@ -15,10 +17,10 @@ use crate::ids::{MessageId, RoomId};
 pub const REF_PREFIX: &str = "@@";
 
 /// Shortest code [`MessageRef::decode`] can accept.
-pub const MIN_CODE_LEN: usize = 6;
+pub const MIN_CODE_LEN: usize = 5;
 
 /// Longest code [`MessageRef::decode`] can accept.
-pub const MAX_CODE_LEN: usize = 41;
+pub const MAX_CODE_LEN: usize = 25;
 
 const ALPHABET: &[u8; 32] = b"0123456789abcdefghjkmnpqrstvwxyz";
 
@@ -32,7 +34,6 @@ const ALPHABET: &[u8; 32] = b"0123456789abcdefghjkmnpqrstvwxyz";
 ///
 /// let msg_ref = MessageRef {
 ///     room_id: RoomId(1),
-///     timestamp_ms: 1_751_400_000_000,
 ///     message_id: MessageId(42),
 /// };
 /// let code = msg_ref.encode();
@@ -41,7 +42,6 @@ const ALPHABET: &[u8; 32] = b"0123456789abcdefghjkmnpqrstvwxyz";
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MessageRef {
     pub room_id: RoomId,
-    pub timestamp_ms: u64,
     pub message_id: MessageId,
 }
 
@@ -51,7 +51,6 @@ impl MessageRef {
         let mut payload = Vec::with_capacity(16);
         push_leb128(&mut payload, u64::from(self.room_id.0));
         push_leb128(&mut payload, self.message_id.0);
-        push_leb128(&mut payload, self.timestamp_ms);
         let mut out = String::with_capacity(payload.len() * 2);
         let mut acc = 0u32;
         let mut bits = 0u32;
@@ -105,13 +104,11 @@ impl MessageRef {
         let room_id = read_leb128(&payload, &mut pos)?;
         let room_id = RoomId(u32::try_from(room_id).ok()?);
         let message_id = MessageId(read_leb128(&payload, &mut pos)?);
-        let timestamp_ms = read_leb128(&payload, &mut pos)?;
         if pos != payload.len() {
             return None;
         }
         let decoded = MessageRef {
             room_id,
-            timestamp_ms,
             message_id,
         };
         let mut normalized = String::with_capacity(values.len());
@@ -188,10 +185,9 @@ fn read_leb128(bytes: &[u8], pos: &mut usize) -> Option<u64> {
 mod tests {
     use super::*;
 
-    fn reference(room: u32, timestamp_ms: u64, message: u64) -> MessageRef {
+    fn reference(room: u32, message: u64) -> MessageRef {
         MessageRef {
             room_id: RoomId(room),
-            timestamp_ms,
             message_id: MessageId(message),
         }
     }
@@ -199,11 +195,11 @@ mod tests {
     #[test]
     fn roundtrips_edge_values() {
         let cases = [
-            reference(0, 0, 0),
-            reference(0, 0, 1),
-            reference(u32::MAX, u64::MAX, u64::MAX),
-            reference(1, 1 << 42, 1),
-            reference(7, 1_751_400_000_000, 12345),
+            reference(0, 0),
+            reference(0, 1),
+            reference(u32::MAX, u64::MAX),
+            reference(1, 1 << 42),
+            reference(7, 12345),
         ];
         for case in cases {
             let code = case.encode();
@@ -218,13 +214,13 @@ mod tests {
 
     #[test]
     fn typical_code_stays_short() {
-        let code = reference(1, 1_751_400_000_000, 4821).encode();
-        assert!(code.len() <= 17, "unexpectedly long code {code}");
+        let code = reference(1, 4821).encode();
+        assert!(code.len() <= 8, "unexpectedly long code {code}");
     }
 
     #[test]
     fn decodes_uppercase_and_aliases() {
-        let case = reference(3, 1_751_400_000_000, 99);
+        let case = reference(3, 99);
         let code = case.encode();
         assert_eq!(MessageRef::decode(&code.to_ascii_uppercase()), Some(case));
         let aliased = code.replace('1', "l").replace('0', "O");
@@ -233,7 +229,7 @@ mod tests {
 
     #[test]
     fn rejects_checksum_flip() {
-        let code = reference(1, 1_751_400_000_000, 7).encode();
+        let code = reference(1, 7).encode();
         let mut flipped = code.into_bytes();
         let last = flipped.last_mut().unwrap();
         *last = if *last == b'0' { b'1' } else { b'0' };
@@ -243,11 +239,11 @@ mod tests {
 
     #[test]
     fn rejects_truncated_and_extended_codes() {
-        let code = reference(1, 1_751_400_000_000, 7).encode();
+        let code = reference(1, 700_000).encode();
         assert_eq!(MessageRef::decode(&code[..code.len() - 1]), None);
         assert_eq!(MessageRef::decode(&format!("{code}0")), None);
         assert_eq!(MessageRef::decode(""), None);
-        assert_eq!(MessageRef::decode("00000"), None);
+        assert_eq!(MessageRef::decode("0000"), None);
     }
 
     #[test]
@@ -263,7 +259,7 @@ mod tests {
 
     #[test]
     fn rejects_non_canonical_packing() {
-        let case = reference(0, 0, 0);
+        let case = reference(0, 0);
         let code = case.encode();
         assert_eq!(code.len(), MIN_CODE_LEN);
         let padded = format!("0{code}");

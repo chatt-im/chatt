@@ -1,10 +1,10 @@
 use crate::{
-    control::ChatMessage,
+    control::{ChatMessage, MessageFlags},
     ids::{FileTransferId, MessageId, RoomId, UserId},
 };
 
-const RECORD_VERSION: u8 = 1;
-const RECORD_BASE_BYTES: usize = 1 + 8 + 4 + 8 + 8 + 1 + 8 + 4 + 4;
+const RECORD_VERSION: u8 = 2;
+const RECORD_BASE_BYTES: usize = 1 + 8 + 4 + 8 + 8 + 1 + 1 + 8 + 4 + 4;
 /// Upper bound on one serialized history record. The durable log writer
 /// rejects larger appends and the log loader treats a larger length prefix as
 /// a corrupt tail, so both sides of the on-disk format share this constant.
@@ -27,6 +27,8 @@ pub struct HistoryMessageRef<'a> {
     pub timestamp_ms: u64,
     pub body: &'a str,
     pub file_transfer_id: Option<FileTransferId>,
+    pub flags: MessageFlags,
+    pub target: Option<MessageId>,
     pub raw: &'a [u8],
 }
 
@@ -40,6 +42,8 @@ impl HistoryMessageRef<'_> {
             timestamp_ms: self.timestamp_ms,
             body: self.body.to_owned(),
             file_transfer_id: self.file_transfer_id,
+            flags: self.flags,
+            target: self.target,
         }
     }
 }
@@ -66,7 +70,8 @@ pub struct HistoryChunkRef<'a> {
 }
 
 pub fn encoded_message_len(value: &ChatMessage) -> usize {
-    RECORD_BASE_BYTES + value.sender_name.len() + value.body.len()
+    let target = if value.target.is_some() { 8 } else { 0 };
+    RECORD_BASE_BYTES + target + value.sender_name.len() + value.body.len()
 }
 
 pub fn encode_message(value: &ChatMessage) -> Vec<u8> {
@@ -75,12 +80,22 @@ pub fn encode_message(value: &ChatMessage) -> Vec<u8> {
     out
 }
 
+/// Serializes one record. A record is a mutation exactly when `target` is
+/// `Some`; `flags` must then hold a valid single mutation bit and be zero
+/// otherwise, as [`MessageFlags::is_valid`] and the [`ChatMessage`] contract
+/// define.
 pub fn write_message(value: &ChatMessage, out: &mut Vec<u8>) {
+    debug_assert!(value.flags.is_valid());
+    debug_assert!(value.target.is_some() == (value.flags.0 != 0));
     out.push(RECORD_VERSION);
     out.extend_from_slice(&value.message_id.0.to_le_bytes());
     out.extend_from_slice(&value.room_id.0.to_le_bytes());
     out.extend_from_slice(&value.sender.0.to_le_bytes());
     out.extend_from_slice(&value.timestamp_ms.to_le_bytes());
+    out.push(value.flags.0);
+    if let Some(target) = value.target {
+        out.extend_from_slice(&target.0.to_le_bytes());
+    }
     match value.file_transfer_id {
         Some(file_transfer_id) => {
             out.push(1);
@@ -203,6 +218,15 @@ fn read_message<'a>(cursor: &mut HistoryCursor<'a>) -> Result<HistoryMessageRef<
     let room_id = RoomId(cursor.read_u32()?);
     let sender = UserId(cursor.read_u64()?);
     let timestamp_ms = cursor.read_u64()?;
+    let flags = MessageFlags(cursor.read_u8()?);
+    if !flags.is_valid() {
+        return Err("history message flags are invalid".to_string());
+    }
+    let target = if flags.0 != 0 {
+        Some(MessageId(cursor.read_u64()?))
+    } else {
+        None
+    };
     let file_transfer_id = match cursor.read_u8()? {
         0 => {
             cursor.read_u64()?;
@@ -211,6 +235,9 @@ fn read_message<'a>(cursor: &mut HistoryCursor<'a>) -> Result<HistoryMessageRef<
         1 => Some(FileTransferId(cursor.read_u64()?)),
         _ => return Err("history message file-transfer tag is invalid".to_string()),
     };
+    if target.is_some() && file_transfer_id.is_some() {
+        return Err("history mutation record carries a file transfer".to_string());
+    }
     let sender_name = cursor.read_str()?;
     let body = cursor.read_str()?;
     let raw = &cursor.bytes[start..cursor.offset];
@@ -222,6 +249,8 @@ fn read_message<'a>(cursor: &mut HistoryCursor<'a>) -> Result<HistoryMessageRef<
         timestamp_ms,
         body,
         file_transfer_id,
+        flags,
+        target,
         raw,
     })
 }
@@ -298,6 +327,22 @@ mod tests {
             timestamp_ms: 1_000,
             body: "hello".to_string(),
             file_transfer_id: Some(FileTransferId(55)),
+            flags: MessageFlags::default(),
+            target: None,
+        }
+    }
+
+    fn test_mutation() -> ChatMessage {
+        ChatMessage {
+            message_id: MessageId(60),
+            room_id: RoomId(7),
+            sender: UserId(9),
+            sender_name: "Alice".to_string(),
+            timestamp_ms: 2_000,
+            body: "revised".to_string(),
+            file_transfer_id: None,
+            flags: MessageFlags(MessageFlags::EDITED),
+            target: Some(MessageId(42)),
         }
     }
 
@@ -315,6 +360,59 @@ mod tests {
         assert_eq!(parsed.file_transfer_id, Some(FileTransferId(55)));
         assert_eq!(parsed.raw, encoded.as_slice());
         assert_eq!(parsed.to_chat_message(), message);
+    }
+
+    #[test]
+    fn mutation_records_round_trip_flags_and_target() {
+        let mutation = test_mutation();
+        let encoded = encode_message(&mutation);
+
+        assert_eq!(encoded.len(), encoded_message_len(&mutation));
+        let parsed = parse_message(&encoded).unwrap();
+        assert_eq!(parsed.flags, MessageFlags(MessageFlags::EDITED));
+        assert_eq!(parsed.target, Some(MessageId(42)));
+        assert_eq!(parsed.to_chat_message(), mutation);
+
+        let mut delete = test_mutation();
+        delete.flags = MessageFlags(MessageFlags::DELETED);
+        delete.body = String::new();
+        let parsed = decode_message(&encode_message(&delete)).unwrap();
+        assert_eq!(parsed, delete);
+    }
+
+    #[test]
+    fn plain_records_omit_target_bytes() {
+        let message = test_message();
+        let mutation = test_mutation();
+
+        assert_eq!(
+            encoded_message_len(&message),
+            RECORD_BASE_BYTES + message.sender_name.len() + message.body.len()
+        );
+        assert_eq!(
+            encoded_message_len(&mutation),
+            RECORD_BASE_BYTES + 8 + mutation.sender_name.len() + mutation.body.len()
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_flag_combinations() {
+        let flags_offset = 1 + 8 + 4 + 8 + 8;
+        let mut encoded = encode_message(&test_mutation());
+        encoded[flags_offset] = MessageFlags::EDITED | MessageFlags::DELETED;
+        assert!(parse_message(&encoded).is_err());
+
+        let mut encoded = encode_message(&test_mutation());
+        encoded[flags_offset] = 0x80 | MessageFlags::EDITED;
+        assert!(parse_message(&encoded).is_err());
+    }
+
+    #[test]
+    fn rejects_mutation_record_with_file_transfer() {
+        let mut encoded = encode_message(&test_mutation());
+        let tag_offset = 1 + 8 + 4 + 8 + 8 + 1 + 8;
+        encoded[tag_offset] = 1;
+        assert!(parse_message(&encoded).is_err());
     }
 
     #[test]
@@ -359,6 +457,18 @@ mod tests {
         assert_eq!(decoded.messages[0].message_id, MessageId(42));
         assert_eq!(decoded.messages[1].message_id, MessageId(43));
         assert!(decode_chunk(&[1, 2, 3]).unwrap().is_none());
+    }
+
+    #[test]
+    fn chunks_carry_mutation_records() {
+        let mut chunk = Vec::new();
+        write_chunk_header(RoomId(7), None, false, true, 2, &mut chunk).unwrap();
+        chunk.extend_from_slice(&encode_message(&test_message()));
+        chunk.extend_from_slice(&encode_message(&test_mutation()));
+
+        let decoded = decode_chunk(&chunk).unwrap().unwrap();
+        assert_eq!(decoded.messages[1].target, Some(MessageId(42)));
+        assert!(decoded.messages[1].flags.edited());
     }
 
     #[test]

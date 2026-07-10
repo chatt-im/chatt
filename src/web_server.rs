@@ -202,7 +202,6 @@ impl WebAttachment {
 fn chat_ref_code(message: &ChatMessage) -> String {
     rpc::msgref::MessageRef {
         room_id: message.room_id,
-        timestamp_ms: message.timestamp_ms,
         message_id: message.message_id,
     }
     .encode()
@@ -384,6 +383,9 @@ pub(crate) fn classify(name: &str) -> &'static str {
 /// What the app sends to the web thread.
 enum WebFeed {
     Message(WebMessage),
+    /// Drops the retained message with this chat message id and tells every
+    /// browser to remove it.
+    Delete { message_id: u64 },
     /// Replaces the backlog with the current room's messages (empty when there
     /// is no current room) and re-syncs every connected browser. The web view
     /// mirrors the room the client is in, nothing more.
@@ -560,6 +562,12 @@ impl WebFeedSender {
     /// replacing its progress bar with the terminal label.
     pub fn send_file_terminal(&self, payload: String) {
         let _ = self.tx.send(WebFeed::FileTerminal(payload));
+        self.wake.wake();
+    }
+
+    /// Tells every browser to drop a deleted chat message.
+    pub fn send_delete(&self, message_id: u64) {
+        let _ = self.tx.send(WebFeed::Delete { message_id });
         self.wake.wake();
     }
 
@@ -1055,11 +1063,14 @@ fn run(
                     // announcement placeholder, or the inline version if it
                     // arrived first), so a file is one message enriched in place,
                     // never two. The seq is preserved, so paging is untouched.
-                    let existing = message.file_id.and_then(|_| {
-                        history
-                            .iter_mut()
-                            .rev()
-                            .find(|held| same_file(held, &message))
+                    // A re-sent text message (a fold of an edit) upserts by
+                    // its chat message id the same way.
+                    let existing = history.iter_mut().rev().find(|held| {
+                        if message.file_id.is_some() {
+                            same_file(held, &message)
+                        } else {
+                            message.message_id != 0 && held.message_id == message.message_id
+                        }
                     });
                     let frame = if let Some(existing) = existing {
                         existing.merge_from(message);
@@ -1074,6 +1085,16 @@ fn run(
                         }
                         frame
                     };
+                    for id in &clients {
+                        let _ = server.send_websocket_binary(*id, &frame);
+                    }
+                }
+                Ok(WebFeed::Delete { message_id }) => {
+                    // Removing a middle entry shifts the `base_seq + index`
+                    // mapping by one for an in-flight `load_older` cursor;
+                    // bounded, and the next sync frame corrects it.
+                    history.retain(|held| held.message_id != message_id);
+                    let frame = web_wire::encode_delete(message_id);
                     for id in &clients {
                         let _ = server.send_websocket_binary(*id, &frame);
                     }
@@ -1198,12 +1219,14 @@ fn ref_preview_frame(ts: u64, mid: u64, history: &[WebMessage]) -> Vec<u8> {
     let mut found = None;
     if mid != 0 {
         for message in history.iter().rev() {
-            if message.message_id == mid && message.timestamp_ms == ts {
+            if message.message_id == mid {
                 found = Some(message);
                 break;
             }
         }
     }
+    // The `ts` echo stays in the frame so its layout is stable for the
+    // browser's fixed reader, even though the id alone is the identity.
     web_wire::encode_ref_preview(ts, mid, found)
 }
 
@@ -1436,6 +1459,23 @@ mod tests {
     }
 
     #[test]
+    fn text_edit_resend_merges_replacing_fragments() {
+        let mut held = text_message(7, "original");
+        held.attachment = Some(WebAttachment {
+            name: "pic.png".to_string(),
+            kind: "image".to_string(),
+            width: None,
+            height: None,
+        });
+
+        held.merge_from(text_message(7, "revised"));
+
+        assert_eq!(held.message_id, 7);
+        assert_eq!(held.fragments, split_fragments("revised", &|_| None));
+        assert!(held.attachment.is_some(), "attachment survives the upsert");
+    }
+
+    #[test]
     fn highlight_name_validation_allows_flat_dotted_names() {
         assert!(valid_highlight_name("trace..old.rs"));
         assert!(valid_highlight_name("main.rs"));
@@ -1604,6 +1644,8 @@ mod tests {
             timestamp_ms: 5,
             body: "sent file `wide.png` (2.0 KiB)".to_string(),
             file_transfer_id: Some(FileTransferId(7)),
+            flags: rpc::control::MessageFlags::default(),
+            target: None,
         };
         let message = WebMessage::from_chat(&announcement, &|_| None);
         // The file id keys the upsert, and the message id matches it so the

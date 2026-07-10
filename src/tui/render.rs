@@ -1330,6 +1330,15 @@ fn draw_compose_bar(
 }
 
 fn composer_mode_label(app: &App) -> &'static str {
+    if app.room.has_pending_edit() {
+        return match app.room.composer.mode() {
+            EditorMode::Normal => "edit normal",
+            EditorMode::Insert => "edit insert",
+            EditorMode::Visual => "edit visual",
+            EditorMode::VisualLine => "edit visual line",
+            EditorMode::VisualBlock => "edit visual block",
+        };
+    }
     match app.room.composer.mode() {
         EditorMode::Normal => "normal",
         EditorMode::Insert => "insert",
@@ -1606,13 +1615,16 @@ fn draw_chat_heading(
     marker.with(base.patch(accent)).text(buf, "▟");
     row.with(base).fill(buf);
     let content = row.inset(1, 0);
-    let name = if app.room.active.chat.is_collapsed(message) {
-        format!("{} (Collapsed)", msg.sender)
-    } else if app.room.active.chat.is_expanded(message) {
-        format!("{} (Expanded)", msg.sender)
+    let mut name = if msg.edited {
+        format!("{} (edited)", msg.sender)
     } else {
         msg.sender.clone()
     };
+    if app.room.active.chat.is_collapsed(message) {
+        name.push_str(" (Collapsed)");
+    } else if app.room.active.chat.is_expanded(message) {
+        name.push_str(" (Expanded)");
+    }
     content
         .with(base.patch(accent))
         .with(Ellipsis(true))

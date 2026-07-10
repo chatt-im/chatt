@@ -46,6 +46,9 @@ pub const ERROR_REQUEST_REJECTED: u16 = 412;
 pub const ERROR_INTERNAL: u16 = 500;
 /// Most messages one `FetchHistory` may request.
 pub const MAX_HISTORY_FETCH_MESSAGES: u16 = 500;
+/// A mutation is only valid while at most this many messages exist in the room
+/// after its target; the server validates by scanning back this many records.
+pub const MUTATION_WINDOW_MESSAGES: usize = 256;
 pub const JOIN_STRING_PREFIX: &str = "tcj1_";
 const MAX_JOIN_STRING_BYTES: usize = 4096;
 const BASE64URL: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
@@ -192,6 +195,20 @@ pub enum ClientControl {
     /// continues for everyone else.
     SkipFile {
         transfer_id: FileTransferId,
+    },
+    /// Replace the body of a recent text message the sender authored. Only
+    /// valid while the target is within the last
+    /// [`MUTATION_WINDOW_MESSAGES`] messages of the room.
+    EditChat {
+        room_id: RoomId,
+        target: MessageId,
+        body: String,
+    },
+    /// Delete a recent message the sender authored, of any kind. Bounded like
+    /// [`ClientControl::EditChat`].
+    DeleteChat {
+        room_id: RoomId,
+        target: MessageId,
     },
 }
 
@@ -418,6 +435,49 @@ impl ParticipantVoiceStatus {
     }
 }
 
+/// Edit/delete bits carried by [`ChatMessage::flags`].
+///
+/// On a mutation record (`target` set) exactly one bit names the operation. On
+/// a folded resident message the bits are display state: `EDITED` marks a body
+/// replaced by an edit, `DELETED` marks a hidden tombstone.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Jsony)]
+#[jsony(Binary)]
+pub struct MessageFlags(pub u8);
+
+impl MessageFlags {
+    pub const EDITED: u8 = 1;
+    pub const DELETED: u8 = 2;
+
+    pub fn edited(self) -> bool {
+        self.0 & Self::EDITED != 0
+    }
+
+    pub fn deleted(self) -> bool {
+        self.0 & Self::DELETED != 0
+    }
+
+    pub fn set_edited(&mut self) {
+        self.0 |= Self::EDITED;
+    }
+
+    pub fn set_deleted(&mut self) {
+        self.0 |= Self::DELETED;
+    }
+
+    /// Whether the bits are a coherent state: no unknown bits, and not both
+    /// `EDITED` and `DELETED` at once.
+    pub fn is_valid(self) -> bool {
+        self.0 & !(Self::EDITED | Self::DELETED) == 0 && self.0 != Self::EDITED | Self::DELETED
+    }
+}
+
+/// One chat message or mutation record.
+///
+/// `target.is_some()` marks a mutation record: `flags` then names the
+/// operation applied to the `target` message id, `body` carries the
+/// replacement text for an edit and is empty for a delete. On a plain message
+/// `target` is `None` and `flags` is folded display state (see
+/// [`MessageFlags`]).
 #[derive(Clone, Debug, PartialEq, Eq, Jsony)]
 #[jsony(Binary, version)]
 pub struct ChatMessage {
@@ -430,6 +490,9 @@ pub struct ChatMessage {
     /// `Some` when this chat announces a file transfer, carrying that transfer's
     /// id. The web view correlates the announcement with the inline file by it.
     pub file_transfer_id: Option<FileTransferId>,
+    pub flags: MessageFlags,
+    /// `Some` marks this record as a mutation of that message id.
+    pub target: Option<MessageId>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Jsony)]
@@ -669,7 +732,7 @@ fn validate_client_control(value: &ClientControl) -> Result<(), String> {
             validate_optional_auth_field("password", password)?;
             validate_optional_auth_field("existing token", existing_token)?;
         }
-        ClientControl::SendChat { body, .. } => {
+        ClientControl::SendChat { body, .. } | ClientControl::EditChat { body, .. } => {
             if body.trim().is_empty() {
                 return Err("chat message is empty".to_string());
             }
@@ -935,6 +998,41 @@ mod tests {
         };
         let encoded = encode_client_control(&message).unwrap();
         assert_eq!(decode_client_control(&encoded).unwrap(), message);
+    }
+
+    #[test]
+    fn mutation_controls_round_trip() {
+        let edit = ClientControl::EditChat {
+            room_id: RoomId(7),
+            target: MessageId(42),
+            body: "revised".to_string(),
+        };
+        let encoded = encode_client_control(&edit).unwrap();
+        assert_eq!(decode_client_control(&encoded).unwrap(), edit);
+
+        let delete = ClientControl::DeleteChat {
+            room_id: RoomId(7),
+            target: MessageId(42),
+        };
+        let encoded = encode_client_control(&delete).unwrap();
+        assert_eq!(decode_client_control(&encoded).unwrap(), delete);
+    }
+
+    #[test]
+    fn edit_chat_rejects_empty_and_oversize_body() {
+        let empty = ClientControl::EditChat {
+            room_id: RoomId(7),
+            target: MessageId(42),
+            body: "  \n".to_string(),
+        };
+        assert!(encode_client_control(&empty).is_err());
+
+        let oversize = ClientControl::EditChat {
+            room_id: RoomId(7),
+            target: MessageId(42),
+            body: "x".repeat(MAX_CHAT_BODY_BYTES + 1),
+        };
+        assert!(encode_client_control(&oversize).is_err());
     }
 
     #[test]
