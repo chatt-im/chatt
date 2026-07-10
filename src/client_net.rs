@@ -408,9 +408,7 @@ pub enum NetworkCommand {
         target: MessageId,
         body: String,
     },
-    /// Deletes a recent message the local user sent. No binding or command
-    /// triggers this yet; the transport and receive paths are complete.
-    #[expect(dead_code)]
+    /// Deletes a recent message the local user sent.
     DeleteChat {
         room_id: RoomId,
         target: MessageId,

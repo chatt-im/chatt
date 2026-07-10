@@ -25,7 +25,7 @@ use extui::event::{
 };
 use rpc::{
     control::{ERROR_TOKEN_STALE_EPOCH, InviteTicket, ParticipantVoiceStatus},
-    ids::{FileTransferId, RoomId, SessionId, StreamId, UserId},
+    ids::{FileTransferId, MessageId, RoomId, SessionId, StreamId, UserId},
 };
 
 use crate::{
@@ -74,7 +74,9 @@ use commands::slash_command_help;
 
 pub(crate) use dialogs::{UserVolumeDialog, UserVolumeEvent};
 pub(crate) use participants::{ParticipantState, ParticipantVoiceFeedback, Participants};
-pub(crate) use room::{ComposerSubmission, MutationOutcome, RoomSession, ToggleExpandResult};
+pub(crate) use room::{
+    ComposerSubmission, DeleteSelection, MutationOutcome, RoomSession, ToggleExpandResult,
+};
 pub(crate) use room_settings::{RoomSettingsDraft, RoomSettingsEvent};
 pub(crate) use server::{
     PairCompletion, PendingPair, ServerEditDraft, ServerEditEvent, ServerSelectItem,
@@ -2967,6 +2969,46 @@ impl App {
                 false
             }
         }
+    }
+
+    /// Queues one delete command per selected target. Returns whether a server
+    /// session exists, including a temporarily disconnected session whose
+    /// commands are retained for reconnect.
+    pub(crate) fn delete_chat_messages(
+        &mut self,
+        room_id: RoomId,
+        targets: Vec<MessageId>,
+    ) -> bool {
+        if self.network.is_none() {
+            kvlog::warn!(
+                "chat delete not queued",
+                room_id = room_id.0,
+                target_count = targets.len(),
+                error = "no server selected"
+            );
+            self.set_error("select a server before deleting messages");
+            return false;
+        }
+        let count = targets.len();
+        kvlog::info!("chat delete queueing", room_id = room_id.0, target_count = count);
+        let mut sent_immediately = true;
+        for target in targets {
+            sent_immediately &=
+                self.send_network_command(NetworkCommand::DeleteChat { room_id, target }, true);
+        }
+        if self.network.is_none() {
+            return false;
+        }
+        if !sent_immediately && count == 1 {
+            self.set_status("delete queued for reconnect");
+        } else if !sent_immediately {
+            self.set_status(format!("{count} deletions queued for reconnect"));
+        } else if count == 1 {
+            self.set_status("deleting message");
+        } else {
+            self.set_status(format!("deleting {count} messages"));
+        }
+        true
     }
 
     fn flush_pending_network_commands(&mut self) {
@@ -7626,6 +7668,67 @@ mod tests {
         assert!(h.app.config.servers.is_empty());
 
         let _ = std::fs::remove_file(&temp_config);
+    }
+
+    #[test]
+    fn delete_message_confirmation_gates_oldest_first_multi_delete() {
+        let mut app = test_app();
+        let (tx, rx) = mpsc::channel();
+        app.network = Some(NetworkClient::from_parts_for_test(tx));
+        app.room.server_alias = "local".to_string();
+        app.user_id = Some(UserId(1));
+        enter_test_room(&mut app);
+        for (id, sender) in [(1, UserId(1)), (2, UserId(2)), (3, UserId(1))] {
+            app.room.chat_received(
+                rpc::control::ChatMessage {
+                    message_id: MessageId(id),
+                    room_id: RoomId(1),
+                    sender,
+                    sender_name: format!("user{}", sender.0),
+                    timestamp_ms: id * 1_000,
+                    body: format!("message {id}"),
+                    file_transfer_id: None,
+                    flags: rpc::control::MessageFlags::default(),
+                    target: None,
+                },
+                app.user_id,
+            );
+        }
+
+        let mut mode = RoomMode::with_focus(ChatPanelFocus::ChatLog);
+        mode.render(&mut app, &mut Buffer::new(80, 24), 0);
+        app.room.active.chat.set_cursor_to_message(0);
+        assert!(app.room.active.chat.toggle_visual_anchor(80));
+        app.room.active.chat.move_cursor_line(2, 80);
+        let stack = crate::tui::mode_stack::ModeStack::new(Box::new(mode), &mut app);
+        let mut h = Harness { app, stack };
+
+        h.key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::empty()));
+        assert!(h.overlay_active());
+        assert!(rx.try_recv().is_err(), "opening the modal must not delete");
+        h.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::empty()));
+        assert!(h.app.room.active.chat.has_visual());
+        assert!(rx.try_recv().is_err(), "canceling must not delete");
+
+        h.key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::empty()));
+        h.key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::empty()));
+        for expected in [MessageId(1), MessageId(3)] {
+            match rx.try_recv().expect("delete command") {
+                NetworkCommand::DeleteChat { room_id, target } => {
+                    assert_eq!(room_id, RoomId(1));
+                    assert_eq!(target, expected);
+                }
+                other => panic!("unexpected command: {other:?}"),
+            }
+        }
+        assert!(rx.try_recv().is_err());
+        assert!(!h.app.room.active.chat.has_visual());
+        assert_eq!(
+            h.app.room.active.chat.len(),
+            3,
+            "deletion waits for server echo"
+        );
+        assert_eq!(h.app.status.text(), "deleting 2 messages");
     }
 
     #[test]

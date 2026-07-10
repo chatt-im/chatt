@@ -12,7 +12,7 @@ room-height = 4
 max-composer-height = 6
 max-messages = 50000
 overscan = 24
-default-bindings = "standard"
+default-bindings = "vim"
 theme = "catppuccin-frappe"
 
 [ui.themes.catppuccin-frappe]
@@ -96,6 +96,10 @@ comment = "overlay2"
 [files]
 download = "memory"
 download-dir = "/tmp/chatt-alice"
+download-memory-mb = 512
+max-download-mb = 50
+max-upload-mb = 4096
+upload-rate-bytes = 0
 
 [p2p]
 enabled = false
@@ -178,6 +182,7 @@ Y = "CopyMessageRef"
 r = "InsertMessageRef"
 o = "OpenMessageRef"
 e = "EditMessage"
+d = "DeleteMessage"
 p = "PasteClipboard"
 C-v = "PasteClipboard"
 C-M-v = "PasteClipboard"
@@ -285,6 +290,7 @@ output-buffer = "default"
 
 [audio.latency]
 capture-silence-gate = true
+render-assist = false
 neteq-start-delay-ms = 60
 neteq-min-delay-ms = 20
 neteq-base-minimum-delay-ms = 0

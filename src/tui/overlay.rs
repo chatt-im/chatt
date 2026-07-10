@@ -74,6 +74,8 @@ pub(crate) struct ConfirmMode {
     confirm_label: String,
     cancel_label: String,
     selected_confirm: bool,
+    cancel_button: Rect,
+    confirm_button: Rect,
     on_confirm: Option<Box<dyn FnOnce(&mut App) -> ConfirmDisposition>>,
 }
 
@@ -89,6 +91,8 @@ impl ConfirmMode {
             confirm_label: confirm_label.into(),
             cancel_label: cancel_label.into(),
             selected_confirm: false,
+            cancel_button: Rect::EMPTY,
+            confirm_button: Rect::EMPTY,
             on_confirm: Some(Box::new(on_confirm)),
         }
     }
@@ -107,10 +111,10 @@ impl ConfirmMode {
         }
     }
 
-    fn render_buttons(&self, area: Rect, buf: &mut Buffer, theme: &Theme) {
+    fn render_buttons(&mut self, area: Rect, buf: &mut Buffer, theme: &Theme) {
         let mut row = area;
-        let cancel = row.take_left((row.w / 2) as i32);
-        let confirm = row;
+        self.cancel_button = row.take_left((row.w / 2) as i32);
+        self.confirm_button = row;
         let selected = theme.selected_focused;
         let idle = theme.dialog_panel.patch(theme.muted);
         let (cancel_style, confirm_style) = if self.selected_confirm {
@@ -118,8 +122,18 @@ impl ConfirmMode {
         } else {
             (selected, idle)
         };
-        draw_button(cancel, buf, cancel_style, &self.cancel_label);
-        draw_button(confirm, buf, confirm_style, &self.confirm_label);
+        draw_button(
+            self.cancel_button,
+            buf,
+            cancel_style,
+            &self.cancel_label,
+        );
+        draw_button(
+            self.confirm_button,
+            buf,
+            confirm_style,
+            &self.confirm_label,
+        );
     }
 }
 
@@ -128,6 +142,8 @@ impl AppMode for ConfirmMode {
         let theme = &app.theme;
         let area = buf.rect();
         if area.w < 24 || area.h < 5 {
+            self.cancel_button = Rect::EMPTY;
+            self.confirm_button = Rect::EMPTY;
             return;
         }
         let width = area.w.min(54).max(24);
@@ -178,7 +194,15 @@ impl AppMode for ConfirmMode {
         Action::Continue
     }
 
-    fn process_mouse(&mut self, _app: &mut App, _mouse: MouseEvent) -> Action {
+    fn process_mouse(&mut self, app: &mut App, mouse: MouseEvent) -> Action {
+        if !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+            return Action::Continue;
+        }
+        if rect_contains(self.cancel_button, mouse.column, mouse.row) {
+            app.pop_mode();
+        } else if rect_contains(self.confirm_button, mouse.column, mouse.row) {
+            self.confirm(app);
+        }
         Action::Continue
     }
 
@@ -1007,6 +1031,8 @@ fn format_size(bytes: u64) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::{cell::Cell, rc::Rc};
+
     use super::*;
     use crate::{
         app::{PairCompletion, PendingPair},
@@ -1016,6 +1042,58 @@ mod tests {
 
     fn test_app() -> App {
         App::new(Config::default(), None).expect("test app")
+    }
+
+    #[test]
+    fn confirmation_buttons_are_clickable() {
+        let mut app = test_app();
+        let confirmed = Rc::new(Cell::new(false));
+        let confirmed_by_callback = Rc::clone(&confirmed);
+        let mut mode = ConfirmMode::new("Delete message?", "Delete", "Cancel", move |_| {
+            confirmed_by_callback.set(true);
+            ConfirmDisposition::Close
+        });
+        mode.render(&mut app, &mut Buffer::new(80, 24), 0);
+        let confirm = mode.confirm_button;
+
+        mode.process_mouse(
+            &mut app,
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: confirm.x,
+                row: confirm.y,
+                modifiers: KeyModifiers::empty(),
+            },
+        );
+
+        assert!(confirmed.get());
+        assert!(!app.pending_transition.is_empty());
+    }
+
+    #[test]
+    fn confirmation_cancel_button_does_not_run_callback() {
+        let mut app = test_app();
+        let confirmed = Rc::new(Cell::new(false));
+        let confirmed_by_callback = Rc::clone(&confirmed);
+        let mut mode = ConfirmMode::new("Delete message?", "Delete", "Cancel", move |_| {
+            confirmed_by_callback.set(true);
+            ConfirmDisposition::Close
+        });
+        mode.render(&mut app, &mut Buffer::new(80, 24), 0);
+        let cancel = mode.cancel_button;
+
+        mode.process_mouse(
+            &mut app,
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: cancel.x,
+                row: cancel.y,
+                modifiers: KeyModifiers::empty(),
+            },
+        );
+
+        assert!(!confirmed.get());
+        assert!(!app.pending_transition.is_empty());
     }
 
     fn image_paste(source: ImagePasteSource, default_name: &str) -> ImagePaste {
