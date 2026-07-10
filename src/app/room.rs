@@ -158,6 +158,11 @@ pub(crate) struct ClientRoom {
 /// Folded mutation state of one target message.
 #[derive(Default)]
 struct MessageMutations {
+    by_sender: HashMap<UserId, SenderMutations>,
+}
+
+#[derive(Default)]
+struct SenderMutations {
     latest_edit: Option<EditRecord>,
     deleted: bool,
 }
@@ -199,14 +204,21 @@ impl ClientRoom {
     }
 
     /// Records one mutation's state without touching disk or the buffers, the
-    /// shared step of live receipt and load-time seeding. Deletes are sticky;
-    /// among edits the highest mutation id wins.
+    /// shared step of live receipt and load-time seeding. State is separated
+    /// by sender so an unverified pending mutation cannot displace the target
+    /// author's mutation before an older history page delivers the target.
     fn note_mutation_state(&mut self, record: &ChatMessage) {
         let Some(target) = record.target else {
             return;
         };
         self.newest_mutation_seen = self.newest_mutation_seen.max(record.message_id.0);
-        let state = self.mutations.entry(target.0).or_default();
+        let state = self
+            .mutations
+            .entry(target.0)
+            .or_default()
+            .by_sender
+            .entry(record.sender)
+            .or_default();
         if record.flags.deleted() {
             state.deleted = true;
         } else if record.flags.edited()
@@ -240,11 +252,14 @@ impl ClientRoom {
     /// Re-derives the target's display state from its mutation state and
     /// pushes any change into the canonical log and the scrollback buffer.
     fn refold_target(&mut self, target: MessageKey) -> MutationOutcome {
-        let Some(state) = self.mutations.get(&target) else {
+        let Some(states) = self.mutations.get(&target) else {
             return MutationOutcome::Ignored;
         };
         let Some(message) = self.messages.get_mut(target) else {
             return MutationOutcome::Pending;
+        };
+        let Some(state) = states.by_sender.get(&message.sender) else {
+            return MutationOutcome::Ignored;
         };
         if state.deleted {
             if message.flags.deleted() {
@@ -257,6 +272,9 @@ impl ClientRoom {
             return MutationOutcome::AppliedDelete;
         }
         if let Some(edit) = &state.latest_edit {
+            if message.file_transfer_id.is_some() {
+                return MutationOutcome::Ignored;
+            }
             if message.flags.edited() && message.body == edit.body {
                 return MutationOutcome::Ignored;
             }
@@ -273,13 +291,19 @@ impl ClientRoom {
     /// resident, so a page older than its own mutations lands already edited
     /// or tombstoned.
     fn fold_pending_state(&self, message: &mut ChatMessage) {
-        let Some(state) = self.mutations.get(&message.message_id.0) else {
+        let Some(state) = self
+            .mutations
+            .get(&message.message_id.0)
+            .and_then(|states| states.by_sender.get(&message.sender))
+        else {
             return;
         };
         if state.deleted {
             message.flags = rpc::control::MessageFlags(rpc::control::MessageFlags::DELETED);
             message.body.clear();
-        } else if let Some(edit) = &state.latest_edit {
+        } else if message.file_transfer_id.is_none()
+            && let Some(edit) = &state.latest_edit
+        {
             message.body = edit.body.clone();
             message.flags.set_edited();
         }
@@ -329,8 +353,9 @@ impl ClientRoom {
         local_user: Option<UserId>,
         max_messages: usize,
     ) -> bool {
-        let (mutation_records, normals): (Vec<ChatMessage>, Vec<ChatMessage>) =
-            page.into_iter().partition(|message| message.target.is_some());
+        let (mutation_records, normals): (Vec<ChatMessage>, Vec<ChatMessage>) = page
+            .into_iter()
+            .partition(|message| message.target.is_some());
         let mut changed = false;
         let mut mutation_records = mutation_records;
         mutation_records.sort_by_key(MessageLog::key);
@@ -934,9 +959,7 @@ impl RoomSession {
         let bindings = config.ui.default_bindings;
         let editor_bindings = match bindings {
             DefaultBindings::Standard => editor_bindings::nano(),
-            DefaultBindings::Vim => {
-                editor_bindings::vim(editor_bindings::VimOptions::default())
-            }
+            DefaultBindings::Vim => editor_bindings::vim(editor_bindings::VimOptions::default()),
         };
         let mut composer = Editor::with_bindings(editor_bindings);
         composer.set_wrap(true);
@@ -4282,7 +4305,10 @@ mod tests {
         enter(
             &mut room,
             Vec::new(),
-            vec![message(1, UserId(2), "original"), message(2, UserId(2), "tail")],
+            vec![
+                message(1, UserId(2), "original"),
+                message(2, UserId(2), "tail"),
+            ],
             Some(UserId(1)),
         );
 
@@ -4304,12 +4330,102 @@ mod tests {
     }
 
     #[test]
+    fn live_foreign_mutations_do_not_change_the_target() {
+        let mut room = test_room();
+        enter(
+            &mut room,
+            Vec::new(),
+            vec![message(1, UserId(2), "original")],
+            Some(UserId(1)),
+        );
+
+        let edit = room
+            .mutation_received(&edit_record(2, 1, UserId(3), "hijacked"), Some(UserId(1)))
+            .expect("known room");
+        assert_eq!(edit.outcome, MutationOutcome::Ignored);
+        let delete = room
+            .mutation_received(&delete_record(3, 1, UserId(3)), Some(UserId(1)))
+            .expect("known room");
+        assert_eq!(delete.outcome, MutationOutcome::Ignored);
+        assert_eq!(buffer_bodies(&room), vec!["original".to_string()]);
+        assert_eq!(room.room_meta(RoomId(1)).unwrap().head, Some(MessageId(3)));
+    }
+
+    #[test]
+    fn pending_foreign_mutations_do_not_displace_the_authors_edit() {
+        let mut room = test_room();
+        enter(&mut room, Vec::new(), Vec::new(), Some(UserId(1)));
+
+        assert_eq!(
+            room.mutation_received(&edit_record(2, 1, UserId(2), "revised"), Some(UserId(1)))
+                .expect("known room")
+                .outcome,
+            MutationOutcome::Pending
+        );
+        assert_eq!(
+            room.mutation_received(
+                &edit_record(3, 1, UserId(3), "foreign edit"),
+                Some(UserId(1))
+            )
+            .expect("known room")
+            .outcome,
+            MutationOutcome::Pending
+        );
+        assert_eq!(
+            room.mutation_received(&delete_record(4, 1, UserId(3)), Some(UserId(1)))
+                .expect("known room")
+                .outcome,
+            MutationOutcome::Pending
+        );
+
+        room.merge_history(
+            RoomId(1),
+            vec![message(1, UserId(2), "original")],
+            Some(UserId(1)),
+        );
+        assert_eq!(buffer_bodies(&room), vec!["revised".to_string()]);
+        let index = room.active.chat.find_message(1).expect("resident target");
+        assert!(room.active.chat.message(index).edited);
+    }
+
+    #[test]
+    fn live_file_edit_is_ignored_but_author_delete_applies() {
+        let mut room = test_room();
+        enter(
+            &mut room,
+            Vec::new(),
+            vec![file_message(
+                1,
+                UserId(2),
+                "sent file `notes.txt` (10 B)",
+                FileTransferId(9),
+            )],
+            Some(UserId(1)),
+        );
+
+        let edit = room
+            .mutation_received(&edit_record(2, 1, UserId(2), "not a file"), Some(UserId(1)))
+            .expect("known room");
+        assert_eq!(edit.outcome, MutationOutcome::Ignored);
+        assert_eq!(buffer_bodies(&room), vec!["sent file `notes.txt` (10 B)"]);
+
+        let delete = room
+            .mutation_received(&delete_record(3, 1, UserId(2)), Some(UserId(1)))
+            .expect("known room");
+        assert_eq!(delete.outcome, MutationOutcome::AppliedDelete);
+        assert!(buffer_bodies(&room).is_empty());
+    }
+
+    #[test]
     fn live_delete_removes_from_buffer_and_history_page_cannot_resurrect() {
         let mut room = test_room();
         enter(
             &mut room,
             Vec::new(),
-            vec![message(1, UserId(2), "doomed"), message(2, UserId(2), "tail")],
+            vec![
+                message(1, UserId(2), "doomed"),
+                message(2, UserId(2), "tail"),
+            ],
             Some(UserId(1)),
         );
 
@@ -4321,7 +4437,10 @@ mod tests {
 
         room.merge_history(
             RoomId(1),
-            vec![message(1, UserId(2), "doomed"), message(2, UserId(2), "tail")],
+            vec![
+                message(1, UserId(2), "doomed"),
+                message(2, UserId(2), "tail"),
+            ],
             Some(UserId(1)),
         );
         assert_eq!(buffer_bodies(&room), vec!["tail".to_string()]);
@@ -4476,7 +4595,10 @@ mod tests {
         enter(
             &mut room,
             Vec::new(),
-            vec![message(1, UserId(1), "mine"), message(2, UserId(2), "theirs")],
+            vec![
+                message(1, UserId(1), "mine"),
+                message(2, UserId(2), "theirs"),
+            ],
             Some(UserId(1)),
         );
         room.set_viewed_room(RoomId(1), Some(UserId(1)));

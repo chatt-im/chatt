@@ -2,7 +2,9 @@
 //!
 //! One [`RoomStore`] owns, per room, the retention backend selected by the
 //! room's persistence config: nothing, a bounded in-memory ring, or an
-//! append-only on-disk log. A durable room keeps only the newest messages
+//! append-only on-disk log. Every backend also keeps a small window of record
+//! ids so mutation recency does not require retaining message contents. A
+//! durable room keeps only the newest messages
 //! resident; when the active log grows past its size cap it rotates into an
 //! immutable segment named `<log>.<first-message-id>`, and segments are never
 //! deleted, so older pages stay servable from disk (see
@@ -29,6 +31,7 @@
 
 use hashbrown::HashMap;
 use std::{
+    collections::VecDeque,
     fs::{self, File, OpenOptions},
     io::Write,
     path::{Path, PathBuf},
@@ -84,8 +87,8 @@ pub enum MutationKind {
 /// Why [`RoomStore::validate_mutation`] rejected a mutation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MutationDenied {
-    /// The target is not among the newest window of records: unknown, frozen
-    /// by newer traffic, or the room retains no history.
+    /// The target is not among the newest window of record ids: unknown or
+    /// frozen by newer traffic.
     TargetMissing,
     /// The target was sent by someone else.
     WrongSender,
@@ -493,6 +496,7 @@ pub struct RoomStore {
     next_ids: HashMap<RoomId, u64>,
     watermarks: HashMap<RoomId, u64>,
     heads: HashMap<RoomId, MessageId>,
+    recent_ids: HashMap<RoomId, VecDeque<MessageId>>,
     dm_rooms: Vec<DmRoom>,
     rooms: HashMap<RoomId, Retention>,
 }
@@ -544,6 +548,7 @@ impl RoomStore {
             next_ids: HashMap::new(),
             watermarks: HashMap::new(),
             heads: HashMap::new(),
+            recent_ids: HashMap::new(),
             dm_rooms: Vec::new(),
             rooms: HashMap::new(),
         };
@@ -592,6 +597,19 @@ impl RoomStore {
             },
             RoomPersistenceConfig::Durable => self.open_durable(room_id),
         };
+        let recent_ids = retention
+            .history()
+            .map(|history| {
+                history
+                    .entries()
+                    .iter()
+                    .rev()
+                    .take(MUTATION_WINDOW_MESSAGES)
+                    .rev()
+                    .map(|entry| entry.message_id)
+                    .collect()
+            })
+            .unwrap_or_default();
         if let Retention::Durable { history, .. } = &retention
             && let Some(last) = history.last()
         {
@@ -599,6 +617,7 @@ impl RoomStore {
             *next = (*next).max(last.message_id.0 + 1);
             self.heads.insert(room_id, last.message_id);
         }
+        self.recent_ids.insert(room_id, recent_ids);
         self.rooms.insert(room_id, retention);
     }
 
@@ -702,6 +721,11 @@ impl RoomStore {
             return 0;
         };
         self.heads.insert(room_id, message.message_id);
+        let recent_ids = self.recent_ids.entry(room_id).or_default();
+        if recent_ids.len() == MUTATION_WINDOW_MESSAGES {
+            recent_ids.pop_front();
+        }
+        recent_ids.push_back(message.message_id);
         match retention {
             Retention::None => 0,
             Retention::Memory { history, limit } => {
@@ -782,11 +806,10 @@ impl RoomStore {
 
     /// Whether `sender` may edit or delete `target` in the room right now.
     ///
-    /// Scans the newest [`MUTATION_WINDOW_MESSAGES`] resident records for the
-    /// target, so a message with more than that many records after it is
-    /// frozen and reported as [`MutationDenied::TargetMissing`]. Rooms without
-    /// resident history (`Retention::None`) reject every mutation, and a
-    /// memory room whose limit is below the window effectively shrinks it.
+    /// The target must be one of the newest [`MUTATION_WINDOW_MESSAGES`] record
+    /// ids. When its full record is resident, ownership and target semantics
+    /// are checked too. Otherwise only recency is knowable and clients validate
+    /// the broadcast mutation against their copy of the target.
     pub fn validate_mutation(
         &self,
         room_id: RoomId,
@@ -794,8 +817,15 @@ impl RoomStore {
         sender: UserId,
         kind: MutationKind,
     ) -> Result<(), MutationDenied> {
-        let Some(history) = self.rooms.get(&room_id).and_then(Retention::history) else {
+        if !self
+            .recent_ids
+            .get(&room_id)
+            .is_some_and(|ids| ids.contains(&target))
+        {
             return Err(MutationDenied::TargetMissing);
+        }
+        let Some(history) = self.rooms.get(&room_id).and_then(Retention::history) else {
+            return Ok(());
         };
         let mut deleted = false;
         for entry in history
@@ -827,7 +857,7 @@ impl RoomStore {
             }
             return Ok(());
         }
-        Err(MutationDenied::TargetMissing)
+        Ok(())
     }
 
     /// Test-only view of one resident history page, decoded from the same
@@ -1053,6 +1083,7 @@ impl RoomStore {
             self.next_ids.remove(&room_id);
             self.watermarks.remove(&room_id);
             self.heads.remove(&room_id);
+            self.recent_ids.remove(&room_id);
             self.next_room_id = room_id.0;
             return Err(format!("dm room registry write failed: {error}"));
         }
@@ -1532,6 +1563,17 @@ mod tests {
             members: None,
             persistence: RoomPersistenceConfig::Memory,
             memory_limit: Some(limit),
+            is_default: false,
+        }
+    }
+
+    fn none_room(id: u32) -> RoomConfig {
+        RoomConfig {
+            id,
+            name: format!("room-{id}"),
+            members: None,
+            persistence: RoomPersistenceConfig::None,
+            memory_limit: None,
             is_default: false,
         }
     }
@@ -2260,6 +2302,36 @@ mod tests {
         );
         assert_eq!(
             store.validate_mutation(room, target, UserId(1), MutationKind::Delete),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn stateless_room_accepts_recent_mutation_without_sender_metadata() {
+        let mut store = RoomStore::open(None, &[none_room(1)]);
+        let room = RoomId(1);
+        let target = append_next(&mut store, room);
+
+        assert_eq!(
+            store.validate_mutation(room, target, UserId(2), MutationKind::Edit),
+            Ok(())
+        );
+        assert_eq!(
+            store.validate_mutation(room, target, UserId(2), MutationKind::Delete),
+            Ok(())
+        );
+        assert!(store.recent(room, 1).is_empty());
+    }
+
+    #[test]
+    fn recency_fallback_survives_a_short_memory_history() {
+        let mut store = RoomStore::open(None, &[memory_room(1, 1)]);
+        let room = RoomId(1);
+        let target = append_next(&mut store, room);
+        append_next(&mut store, room);
+
+        assert_eq!(
+            store.validate_mutation(room, target, UserId(2), MutationKind::Edit),
             Ok(())
         );
     }

@@ -3805,7 +3805,10 @@ mod tests {
         buf.set_cursor_to_message(1);
         let lines_before = buf.total_lines_exact(40);
 
-        assert!(buf.edit_message(2, edited_message(2, 2_000, "a much longer body\nwith a second line")));
+        assert!(buf.edit_message(
+            2,
+            edited_message(2, 2_000, "a much longer body\nwith a second line")
+        ));
 
         assert_eq!(
             buf.cursor().map(|cursor| buf.message(cursor.message).id),

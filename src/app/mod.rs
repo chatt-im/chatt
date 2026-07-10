@@ -2990,7 +2990,11 @@ impl App {
             return false;
         }
         let count = targets.len();
-        kvlog::info!("chat delete queueing", room_id = room_id.0, target_count = count);
+        kvlog::info!(
+            "chat delete queueing",
+            room_id = room_id.0,
+            target_count = count
+        );
         let mut sent_immediately = true;
         for target in targets {
             sent_immediately &=

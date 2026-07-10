@@ -385,7 +385,9 @@ enum WebFeed {
     Message(WebMessage),
     /// Drops the retained message with this chat message id and tells every
     /// browser to remove it.
-    Delete { message_id: u64 },
+    Delete {
+        message_id: u64,
+    },
     /// Replaces the backlog with the current room's messages (empty when there
     /// is no current room) and re-syncs every connected browser. The web view
     /// mirrors the room the client is in, nothing more.
