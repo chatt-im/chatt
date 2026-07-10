@@ -25,6 +25,7 @@ pub const KIND_SYNC: u8 = 1;
 pub const KIND_MESSAGE: u8 = 2;
 pub const KIND_OLDER: u8 = 3;
 pub const KIND_REF_PREVIEW: u8 = 4;
+pub const KIND_DELETE: u8 = 5;
 
 /// Fragment kind bytes.
 const FRAG_TEXT: u8 = 0;
@@ -233,8 +234,8 @@ fn render_ref(code: &str, resolver: RefResolver, html: &mut String) {
     };
     let _ = write!(
         html,
-        "<a href=\"#\" class=\"{class}\" data-ts=\"{}\" data-mid=\"{}\" data-room=\"{}\"",
-        target.timestamp_ms, target.message_id.0, target.room_id.0,
+        "<a href=\"#\" class=\"{class}\" data-mid=\"{}\" data-room=\"{}\"",
+        target.message_id.0, target.room_id.0,
     );
     if let Some(attachment) = resolved
         .as_ref()
@@ -318,6 +319,15 @@ pub fn encode_ref_preview(
             encode_message(&mut buf, message);
         }
     }
+    buf
+}
+
+/// Encodes a `delete` frame: the chat message id the browser should drop.
+pub fn encode_delete(message_id: u64) -> Vec<u8> {
+    let mut buf = Vec::new();
+    buf.extend_from_slice(&SENTINEL);
+    buf.push(KIND_DELETE);
+    put_u64(&mut buf, message_id);
     buf
 }
 
@@ -541,6 +551,15 @@ mod tests {
     use super::*;
 
     #[test]
+    fn delete_frame_carries_sentinel_kind_and_id() {
+        let frame = encode_delete(0xABCD);
+        assert_eq!(&frame[0..4], &SENTINEL);
+        assert_eq!(frame[4], KIND_DELETE);
+        assert_eq!(u64::from_le_bytes(frame[5..13].try_into().unwrap()), 0xABCD);
+        assert_eq!(frame.len(), 13);
+    }
+
+    #[test]
     fn plain_body_is_one_text_fragment() {
         let fragments = split_fragments("hello **world**", &|_| None);
         assert_eq!(
@@ -589,7 +608,6 @@ mod tests {
     fn message_ref_renders_by_resolution_state() {
         let target = rpc::msgref::MessageRef {
             room_id: rpc::ids::RoomId(1),
-            timestamp_ms: 1_000_000,
             message_id: rpc::ids::MessageId(7),
         };
         let code = target.encode();
@@ -605,7 +623,6 @@ mod tests {
             panic!("expected text fragment");
         };
         assert!(html.contains("class=\"msg-ref\""), "html: {html}");
-        assert!(html.contains("data-ts=\"1000000\""), "html: {html}");
         assert!(html.contains("data-mid=\"7\""), "html: {html}");
         assert!(html.contains("↩ alice: &lt;hi&gt;"), "html: {html}");
 
@@ -628,7 +645,6 @@ mod tests {
     fn resolved_media_ref_carries_attachment_metadata() {
         let target = rpc::msgref::MessageRef {
             room_id: rpc::ids::RoomId(1),
-            timestamp_ms: 1_000_000,
             message_id: rpc::ids::MessageId(7),
         };
         let code = target.encode();

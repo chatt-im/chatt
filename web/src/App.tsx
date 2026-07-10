@@ -1675,10 +1675,9 @@ export default function App() {
     refToastTimer = window.setTimeout(() => setRefToast(null), 2500);
   }
 
-  function findMessageIndex(ts: number, mid: number): number {
-    return messages().findIndex(
-      (m) => m.message_id === mid && m.timestamp_ms === ts
-    );
+  // Message ids are the durable identity; `ts` rides along for display only.
+  function findMessageIndex(_ts: number, mid: number): number {
+    return messages().findIndex((m) => m.message_id === mid);
   }
 
   function toggleMessageGroup(key: string) {
@@ -1690,10 +1689,8 @@ export default function App() {
     });
   }
 
-  function flashMessage(ts: number, mid: number) {
-    const row = logEl?.querySelector(
-      `.message[data-ts="${ts}"][data-mid="${mid}"]`
-    );
+  function flashMessage(_ts: number, mid: number) {
+    const row = logEl?.querySelector(`.message[data-mid="${mid}"]`);
     if (!(row instanceof HTMLElement)) return;
     row.classList.remove("msg-flash");
     // Force a reflow so a repeated jump restarts the animation.
@@ -1805,8 +1802,8 @@ export default function App() {
   let refHoverPendingKey: string | undefined;
   const refPreviewCache = new Map<string, WebMessage | null>();
 
-  function refPreviewKey(ts: number, mid: number): string {
-    return `${ts}:${mid}`;
+  function refPreviewKey(_ts: number, mid: number): string {
+    return `${mid}`;
   }
 
   function hideRefHover() {
@@ -1820,7 +1817,8 @@ export default function App() {
   }
 
   function showRefHover(anchor: HTMLElement) {
-    const ts = Number(anchor.dataset.ts);
+    // Ref pills carry only `data-mid` now; the ts is a harmless echo.
+    const ts = Number(anchor.dataset.ts ?? "0");
     const mid = Number(anchor.dataset.mid);
     if (!Number.isFinite(ts) || !Number.isFinite(mid)) return;
     const index = findMessageIndex(ts, mid);
@@ -1914,7 +1912,7 @@ export default function App() {
         return;
       }
     }
-    const ts = Number(anchor.dataset.ts);
+    const ts = Number(anchor.dataset.ts ?? "0");
     const mid = Number(anchor.dataset.mid);
     if (!Number.isFinite(ts) || !Number.isFinite(mid)) return;
     jumpToRef(ts, mid);
@@ -2546,6 +2544,15 @@ export default function App() {
                 (m) =>
                   m.file_id === msg.file_id &&
                   m.timestamp_ms === msg.timestamp_ms
+              );
+              if (i >= 0) {
+                const next = prev.slice();
+                next[i] = msg;
+                return next;
+              }
+            } else if (msg.message_id !== 0) {
+              const i = prev.findIndex(
+                (m) => m.message_id === msg.message_id
               );
               if (i >= 0) {
                 const next = prev.slice();

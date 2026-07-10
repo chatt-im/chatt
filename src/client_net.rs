@@ -402,6 +402,19 @@ pub enum NetworkCommand {
         room_id: RoomId,
         body: String,
     },
+    /// Replaces the body of a recent text message the local user sent.
+    EditChat {
+        room_id: RoomId,
+        target: MessageId,
+        body: String,
+    },
+    /// Deletes a recent message the local user sent. No binding or command
+    /// triggers this yet; the transport and receive paths are complete.
+    #[expect(dead_code)]
+    DeleteChat {
+        room_id: RoomId,
+        target: MessageId,
+    },
     UploadFile(UploadFileRequest),
     /// Aborts an in-flight file transfer identified by its server transfer id.
     /// The worker resolves the direction: an outgoing upload is canceled
@@ -2992,6 +3005,31 @@ impl WorkerState {
                     body_size = body.len()
                 );
                 self.queue_control(ClientControl::SendChat { room_id, body })?;
+            }
+            NetworkCommand::EditChat {
+                room_id,
+                target,
+                body,
+            } => {
+                kvlog::info!(
+                    "edit chat command handling",
+                    room_id = room_id.0,
+                    target = target.0,
+                    body_size = body.len()
+                );
+                self.queue_control(ClientControl::EditChat {
+                    room_id,
+                    target,
+                    body,
+                })?;
+            }
+            NetworkCommand::DeleteChat { room_id, target } => {
+                kvlog::info!(
+                    "delete chat command handling",
+                    room_id = room_id.0,
+                    target = target.0
+                );
+                self.queue_control(ClientControl::DeleteChat { room_id, target })?;
             }
             NetworkCommand::UploadFile(request) => {
                 self.queue_file_upload(request);
@@ -5895,6 +5933,8 @@ fn capture_upload_image_prefix(upload: &mut OutgoingUpload, data: &[u8]) {
 fn network_command_kind(command: &NetworkCommand) -> &'static str {
     match command {
         NetworkCommand::SendChat { .. } => "send_chat",
+        NetworkCommand::EditChat { .. } => "edit_chat",
+        NetworkCommand::DeleteChat { .. } => "delete_chat",
         NetworkCommand::UploadFile(_) => "upload_file",
         NetworkCommand::CancelTransfer { .. } => "cancel_transfer",
         NetworkCommand::SetActiveRoom(_) => "set_active_room",

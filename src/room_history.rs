@@ -19,7 +19,7 @@ use kvlog::encoding::{
 };
 use kvlog::{Encode, LogLevel};
 use ring::digest::{SHA256, digest};
-use rpc::control::{ChatMessage, MAX_CHAT_BODY_BYTES};
+use rpc::control::{ChatMessage, MAX_CHAT_BODY_BYTES, MessageFlags};
 use rpc::ids::{FileTransferId, MessageId, RoomId, UserId};
 
 const RECOVERY_MIN_RECORDS: usize = 2;
@@ -71,10 +71,14 @@ impl FileDetail {
 /// Result of reading a per-room log back from disk.
 #[derive(Debug, Default)]
 pub(crate) struct LoadedHistory {
-    /// Messages deduped by `(timestamp_ms, message_id)` and sorted by that pair.
+    /// Folded messages deduped and sorted by message id. Deleted targets stay
+    /// as tombstones (`DELETED` flag set, body cleared) so they keep occupying
+    /// their key; callers hide them from display.
     pub messages: Vec<ChatMessage>,
     /// File-detail records keyed by announcement timestamp and transfer id.
     pub files: HashMap<FileHistoryKey, FileDetail>,
+    /// Raw mutation records in id order, for seeding session mutation state.
+    pub mutations: Vec<ChatMessage>,
 }
 
 /// A validated history load and its append handle, when the active file was
@@ -128,6 +132,13 @@ impl RoomHistoryStore {
                 transfer_id
                     .0
                     .encode_log_value_into(field.static_key(StaticKey::object_id));
+            }
+            if let Some(target) = message.target {
+                u64::from(message.flags.0)
+                    .encode_log_value_into(field.static_key(StaticKey::status));
+                target
+                    .0
+                    .encode_log_value_into(field.static_key(StaticKey::target));
             }
         }
         self.write_record();
@@ -647,6 +658,8 @@ fn parse_fields(
     let mut length = None;
     let mut size = None;
     let mut correlation_timestamp = None;
+    let mut status = None;
+    let mut target = None;
 
     for field in fields {
         let (key, value) = field?;
@@ -663,6 +676,8 @@ fn parse_fields(
             Key::Static(StaticKey::timestamp) => {
                 set_once(&mut correlation_timestamp, exact_u64(value)?)?
             }
+            Key::Static(StaticKey::status) => set_once(&mut status, exact_u64(value)?)?,
+            Key::Static(StaticKey::target) => set_once(&mut target, exact_u64(value)?)?,
             _ => {}
         }
     }
@@ -686,9 +701,23 @@ fn parse_fields(
                 || length.is_some()
                 || size.is_some()
                 || correlation_timestamp.is_some()
+                || status.is_some() != target.is_some()
             {
                 return Err(MunchError::InvalidValue);
             }
+            let flags = match status {
+                None => MessageFlags::default(),
+                Some(status) => {
+                    let Ok(bits) = u8::try_from(status) else {
+                        return Err(MunchError::InvalidValue);
+                    };
+                    let flags = MessageFlags(bits);
+                    if !flags.is_valid() || flags.0 == 0 || object.is_some() {
+                        return Err(MunchError::InvalidValue);
+                    }
+                    flags
+                }
+            };
             Ok(ParsedRecord::Message(ChatMessage {
                 message_id: MessageId(id),
                 room_id: RoomId(room),
@@ -697,10 +726,18 @@ fn parse_fields(
                 timestamp_ms,
                 body,
                 file_transfer_id: object.map(FileTransferId),
+                flags,
+                target: target.map(MessageId),
             }))
         }
         (None, None) => {
-            if level != LogLevel::Debug || user.is_some() || caller.is_some() || room.is_some() {
+            if level != LogLevel::Debug
+                || user.is_some()
+                || caller.is_some()
+                || room.is_some()
+                || status.is_some()
+                || target.is_some()
+            {
                 return Err(MunchError::InvalidValue);
             }
             let transfer_id = FileTransferId(object.ok_or(MunchError::InvalidValue)?);
@@ -759,20 +796,35 @@ fn exact_string(value: Value<'_>) -> Result<String, MunchError> {
 }
 
 fn fold_records(records: &[ValidatedRecord]) -> LoadedHistory {
-    let mut messages: HashMap<(u64, u64), ChatMessage> = HashMap::new();
+    let mut messages: HashMap<u64, ChatMessage> = HashMap::new();
+    let mut mutations: Vec<ChatMessage> = Vec::new();
     let mut details = Vec::new();
     for record in records {
         match &record.parsed {
             ParsedRecord::Message(message) => {
-                messages.insert(
-                    (message.timestamp_ms, message.message_id.0),
-                    message.clone(),
-                );
+                if message.target.is_some() {
+                    mutations.push(message.clone());
+                } else {
+                    messages.insert(message.message_id.0, message.clone());
+                }
             }
             ParsedRecord::FileDetail { key, detail } => {
                 details.push((*key, detail.clone()));
             }
         }
+    }
+
+    // Mutation ids are server-assigned after their targets, so applying in id
+    // order makes the latest edit win and keeps a delete sticky over any edit
+    // sequenced before it.
+    mutations.sort_by_key(|mutation| mutation.message_id.0);
+    mutations.dedup_by_key(|mutation| mutation.message_id.0);
+    for mutation in &mutations {
+        let target = mutation.target.expect("mutation records carry a target");
+        let Some(message) = messages.get_mut(&target.0) else {
+            continue;
+        };
+        apply_mutation(message, mutation);
     }
 
     let mut message_keys: HashSet<(FileTransferId, u64)> = HashSet::new();
@@ -790,8 +842,25 @@ fn fold_records(records: &[ValidatedRecord]) -> LoadedHistory {
     }
 
     let mut messages: Vec<ChatMessage> = messages.into_values().collect();
-    messages.sort_by_key(|message| (message.timestamp_ms, message.message_id.0));
-    LoadedHistory { messages, files }
+    messages.sort_by_key(|message| message.message_id.0);
+    LoadedHistory {
+        messages,
+        files,
+        mutations,
+    }
+}
+
+/// Folds one mutation record into its target's display state: a delete leaves
+/// a body-less tombstone that no later edit revives, an edit replaces the body
+/// and marks it.
+pub(crate) fn apply_mutation(message: &mut ChatMessage, mutation: &ChatMessage) {
+    if mutation.flags.deleted() {
+        message.flags = MessageFlags(MessageFlags::DELETED);
+        message.body.clear();
+    } else if mutation.flags.edited() && !message.flags.deleted() {
+        message.body = mutation.body.clone();
+        message.flags.set_edited();
+    }
 }
 
 fn is_incomplete_tail(bytes: &[u8], offset: usize) -> bool {
@@ -1080,6 +1149,8 @@ mod tests {
             timestamp_ms,
             body: body.to_string(),
             file_transfer_id: None,
+            flags: MessageFlags::default(),
+            target: None,
         }
     }
 
@@ -1427,10 +1498,9 @@ mod tests {
     fn dedup_and_sort_on_load() {
         let path = scratch("dedup-sort");
         let mut store = fresh_store(&path);
-        store.append_message(&text_message(2, 3_000, "third"));
+        store.append_message(&text_message(2, 3_000, "second"));
         store.append_message(&text_message(1, 1_000, "first"));
-        store.append_message(&text_message(1, 1_000, "first-updated"));
-        store.append_message(&text_message(1, 2_000, "post-restart"));
+        store.append_message(&text_message(1, 2_000, "first-replayed"));
         drop(store);
 
         let loaded = open_path(&path, 7).loaded;
@@ -1439,7 +1509,116 @@ mod tests {
             .iter()
             .map(|message| message.body.as_str())
             .collect();
-        assert_eq!(bodies, vec!["first-updated", "post-restart", "third"]);
+        assert_eq!(bodies, vec!["first-replayed", "second"]);
+    }
+
+    fn edit_record(id: u64, target: u64, body: &str) -> ChatMessage {
+        let mut record = text_message(id, id * 1_000, body);
+        record.flags = MessageFlags(MessageFlags::EDITED);
+        record.target = Some(MessageId(target));
+        record
+    }
+
+    fn delete_record(id: u64, target: u64) -> ChatMessage {
+        let mut record = text_message(id, id * 1_000, "");
+        record.flags = MessageFlags(MessageFlags::DELETED);
+        record.target = Some(MessageId(target));
+        record
+    }
+
+    #[test]
+    fn mutation_record_round_trips_flags_and_target_fields() {
+        let path = scratch("mutation-roundtrip");
+        let mut store = fresh_store(&path);
+        store.append_message(&text_message(1, 1_000, "original"));
+        store.append_message(&edit_record(2, 1, "revised"));
+        drop(store);
+
+        let loaded = open_path(&path, 7).loaded;
+        assert_eq!(loaded.mutations.len(), 1);
+        let mutation = &loaded.mutations[0];
+        assert_eq!(mutation.message_id, MessageId(2));
+        assert_eq!(mutation.target, Some(MessageId(1)));
+        assert!(mutation.flags.edited());
+        assert_eq!(mutation.body, "revised");
+    }
+
+    #[test]
+    fn fold_applies_latest_edit_of_several() {
+        let path = scratch("fold-latest-edit");
+        let mut store = fresh_store(&path);
+        store.append_message(&text_message(1, 1_000, "original"));
+        store.append_message(&edit_record(3, 1, "second thought"));
+        store.append_message(&edit_record(2, 1, "first thought"));
+        drop(store);
+
+        let loaded = open_path(&path, 7).loaded;
+        assert_eq!(loaded.messages.len(), 1);
+        assert_eq!(loaded.messages[0].body, "second thought");
+        assert!(loaded.messages[0].flags.edited());
+        assert_eq!(loaded.mutations.len(), 2);
+    }
+
+    #[test]
+    fn delete_folds_to_hidden_tombstone() {
+        let path = scratch("fold-delete");
+        let mut store = fresh_store(&path);
+        store.append_message(&text_message(1, 1_000, "doomed"));
+        store.append_message(&text_message(2, 2_000, "bystander"));
+        store.append_message(&delete_record(3, 1));
+        drop(store);
+
+        let loaded = open_path(&path, 7).loaded;
+        assert_eq!(loaded.messages.len(), 2);
+        let tombstone = &loaded.messages[0];
+        assert!(tombstone.flags.deleted());
+        assert!(tombstone.body.is_empty());
+        assert_eq!(loaded.messages[1].body, "bystander");
+    }
+
+    #[test]
+    fn edit_after_delete_stays_deleted() {
+        let path = scratch("fold-edit-after-delete");
+        let mut store = fresh_store(&path);
+        store.append_message(&text_message(1, 1_000, "doomed"));
+        store.append_message(&delete_record(2, 1));
+        store.append_message(&edit_record(3, 1, "necromancy"));
+        drop(store);
+
+        let loaded = open_path(&path, 7).loaded;
+        assert!(loaded.messages[0].flags.deleted());
+        assert!(loaded.messages[0].body.is_empty());
+    }
+
+    #[test]
+    fn delete_after_edit_replaces_the_edited_flag() {
+        let path = scratch("fold-delete-after-edit");
+        let mut store = fresh_store(&path);
+        store.append_message(&text_message(1, 1_000, "original"));
+        store.append_message(&edit_record(2, 1, "revised"));
+        store.append_message(&delete_record(3, 1));
+        drop(store);
+
+        let loaded = open_path(&path, 7).loaded;
+        let tombstone = &loaded.messages[0];
+        assert_eq!(tombstone.flags, MessageFlags(MessageFlags::DELETED));
+        assert!(tombstone.flags.is_valid());
+        assert!(tombstone.body.is_empty());
+    }
+
+    #[test]
+    fn mutation_targeting_absent_message_is_kept_raw() {
+        let path = scratch("fold-absent-target");
+        let mut store = fresh_store(&path);
+        store.append_message(&text_message(5, 5_000, "resident"));
+        store.append_message(&edit_record(6, 1, "target rolled off"));
+        drop(store);
+
+        let loaded = open_path(&path, 7).loaded;
+        assert_eq!(loaded.messages.len(), 1);
+        assert_eq!(loaded.messages[0].body, "resident");
+        assert_eq!(loaded.mutations.len(), 1);
+        assert_eq!(loaded.mutations[0].target, Some(MessageId(1)));
     }
 
     #[test]

@@ -14,7 +14,7 @@ use crate::audio::{LivePlaybackFeedback, PlaybackStreamControl};
 use crate::{
     chat_buffer::{NoticeId, NoticeKind, VirtualChatBuffer},
     client_net::{TerminalVerb, TransferDirection},
-    config::Config,
+    config::{Config, DefaultBindings},
     room_catalog::{CatalogRoom, CatalogRoomKind, RoomCatalog},
     room_history::{self, FileHistoryKey, HistoryStorage, RoomHistoryStore},
     theme::Theme,
@@ -49,7 +49,7 @@ pub(crate) struct RoomMeta {
     gap: Option<GapBounds>,
 }
 
-type MessageKey = (u64, u64);
+type MessageKey = u64;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct GapBounds {
@@ -141,9 +141,44 @@ pub(crate) struct ClientRoom {
     files: std::collections::HashMap<FileHistoryKey, room_history::FileDetail>,
     history: Option<RoomHistoryStore>,
     draft: String,
-    web_attachments: HashMap<(u64, u64), WebAttachment>,
+    web_attachments: HashMap<MessageKey, WebAttachment>,
     web_file_attachments: HashMap<FileHistoryKey, WebAttachment>,
     transfers: HashMap<FileTransferId, TransferStatus>,
+    /// Per-target mutation state: the fold authority for resident messages and
+    /// the pending stash for targets older pages have yet to deliver.
+    mutations: HashMap<MessageKey, MessageMutations>,
+    /// Ids of mutation records already captured to disk, so page overlaps and
+    /// duplicate deliveries append once.
+    seen_mutations: HashSet<MessageKey>,
+    /// Newest mutation id seen in this room; keeps the read watermark from
+    /// trailing the head a mutation advanced past every visible message.
+    newest_mutation_seen: MessageKey,
+}
+
+/// Folded mutation state of one target message.
+#[derive(Default)]
+struct MessageMutations {
+    latest_edit: Option<EditRecord>,
+    deleted: bool,
+}
+
+struct EditRecord {
+    mutation_id: MessageKey,
+    body: String,
+}
+
+/// What applying one mutation record did to the room's visible state.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum MutationOutcome {
+    /// Nothing changed: not a mutation record, or the fold already matched.
+    Ignored,
+    /// The target is not resident; the state is stashed for a later page.
+    Pending,
+    /// The target's body was replaced; carries the folded message for the
+    /// web feed.
+    AppliedEdit(ChatMessage),
+    /// The target became a hidden tombstone.
+    AppliedDelete,
 }
 
 impl ClientRoom {
@@ -157,20 +192,116 @@ impl ClientRoom {
             web_attachments: HashMap::new(),
             web_file_attachments: HashMap::new(),
             transfers: HashMap::new(),
+            mutations: HashMap::new(),
+            seen_mutations: HashSet::new(),
+            newest_mutation_seen: 0,
+        }
+    }
+
+    /// Records one mutation's state without touching disk or the buffers, the
+    /// shared step of live receipt and load-time seeding. Deletes are sticky;
+    /// among edits the highest mutation id wins.
+    fn note_mutation_state(&mut self, record: &ChatMessage) {
+        let Some(target) = record.target else {
+            return;
+        };
+        self.newest_mutation_seen = self.newest_mutation_seen.max(record.message_id.0);
+        let state = self.mutations.entry(target.0).or_default();
+        if record.flags.deleted() {
+            state.deleted = true;
+        } else if record.flags.edited()
+            && state
+                .latest_edit
+                .as_ref()
+                .is_none_or(|edit| edit.mutation_id < record.message_id.0)
+        {
+            state.latest_edit = Some(EditRecord {
+                mutation_id: record.message_id.0,
+                body: record.body.clone(),
+            });
+        }
+    }
+
+    /// Applies one live or paged-in mutation record: captures it to disk once,
+    /// folds it into the target's state, and updates the visible buffer.
+    fn receive_mutation(&mut self, record: &ChatMessage) -> MutationOutcome {
+        if record.target.is_none() {
+            return MutationOutcome::Ignored;
+        }
+        if self.seen_mutations.insert(record.message_id.0)
+            && let Some(store) = &mut self.history
+        {
+            store.append_message(record);
+        }
+        self.note_mutation_state(record);
+        self.refold_target(record.target.expect("checked above").0)
+    }
+
+    /// Re-derives the target's display state from its mutation state and
+    /// pushes any change into the canonical log and the scrollback buffer.
+    fn refold_target(&mut self, target: MessageKey) -> MutationOutcome {
+        let Some(state) = self.mutations.get(&target) else {
+            return MutationOutcome::Ignored;
+        };
+        let Some(message) = self.messages.get_mut(target) else {
+            return MutationOutcome::Pending;
+        };
+        if state.deleted {
+            if message.flags.deleted() {
+                return MutationOutcome::Ignored;
+            }
+            message.flags = rpc::control::MessageFlags(rpc::control::MessageFlags::DELETED);
+            message.body.clear();
+            self.chat.remove_message(target);
+            self.web_attachments.remove(&target);
+            return MutationOutcome::AppliedDelete;
+        }
+        if let Some(edit) = &state.latest_edit {
+            if message.flags.edited() && message.body == edit.body {
+                return MutationOutcome::Ignored;
+            }
+            message.body = edit.body.clone();
+            message.flags.set_edited();
+            let folded = message.clone();
+            self.chat.edit_message(target, folded.clone());
+            return MutationOutcome::AppliedEdit(folded);
+        }
+        MutationOutcome::Ignored
+    }
+
+    /// Folds any stashed mutation state into a message about to become
+    /// resident, so a page older than its own mutations lands already edited
+    /// or tombstoned.
+    fn fold_pending_state(&self, message: &mut ChatMessage) {
+        let Some(state) = self.mutations.get(&message.message_id.0) else {
+            return;
+        };
+        if state.deleted {
+            message.flags = rpc::control::MessageFlags(rpc::control::MessageFlags::DELETED);
+            message.body.clear();
+        } else if let Some(edit) = &state.latest_edit {
+            message.body = edit.body.clone();
+            message.flags.set_edited();
         }
     }
 
     /// Applies one live message: dedup, disk capture, canonical list, buffer,
     /// and web-attachment correlation. Returns whether it was fresh.
     fn receive_chat(&mut self, message: &ChatMessage, local: bool, max_messages: usize) -> bool {
+        let mut message = message.clone();
+        self.fold_pending_state(&mut message);
+        let deleted = message.flags.deleted();
         if let LogInsert::Duplicate = self.messages.insert(message.clone()) {
             return false;
         }
         if let Some(store) = &mut self.history {
-            store.append_message(message);
+            store.append_message(&message);
         }
         self.messages.trim_front(max_messages);
         self.trim_orphaned_attachments();
+        if deleted {
+            return true;
+        }
         self.chat.push_chat(message.clone(), local);
         if let Some(transfer_id) = message.file_transfer_id {
             let key = FileHistoryKey {
@@ -179,7 +310,7 @@ impl ClientRoom {
             };
             if let Some(attachment) = self.web_file_attachments.get(&key).cloned() {
                 self.web_attachments
-                    .insert((message.timestamp_ms, message.message_id.0), attachment);
+                    .insert(message.message_id.0, attachment);
             }
         }
         true
@@ -188,19 +319,36 @@ impl ClientRoom {
     /// Merges one server history page: dedups against the resident log,
     /// captures fresh messages to disk, and threads them into the buffer at
     /// their key order without rebuilding it, so notices, transfer overlays,
-    /// and the scroll position survive. Returns whether anything changed.
+    /// and the scroll position survive. Mutation records in the page fold into
+    /// their targets (or the pending stash) instead of displaying; tombstoned
+    /// messages enter only the canonical log, which is what stops a later
+    /// page from resurrecting them. Returns whether anything changed.
     fn merge_history_page(
         &mut self,
         page: Vec<ChatMessage>,
         local_user: Option<UserId>,
         max_messages: usize,
     ) -> bool {
-        let mut fresh = page;
+        let (mutation_records, normals): (Vec<ChatMessage>, Vec<ChatMessage>) =
+            page.into_iter().partition(|message| message.target.is_some());
+        let mut changed = false;
+        let mut mutation_records = mutation_records;
+        mutation_records.sort_by_key(MessageLog::key);
+        for record in &mutation_records {
+            match self.receive_mutation(record) {
+                MutationOutcome::AppliedEdit(_) | MutationOutcome::AppliedDelete => changed = true,
+                MutationOutcome::Ignored | MutationOutcome::Pending => {}
+            }
+        }
+        let mut fresh = normals;
         fresh.sort_by_key(MessageLog::key);
         fresh.dedup_by_key(|message| MessageLog::key(message));
         fresh.retain(|message| !self.messages.contains(MessageLog::key(message)));
         if fresh.is_empty() {
-            return false;
+            return changed;
+        }
+        for message in &mut fresh {
+            self.fold_pending_state(message);
         }
         if let Some(store) = &mut self.history {
             for message in &fresh {
@@ -227,6 +375,7 @@ impl ClientRoom {
         if !older.is_empty() {
             let flagged = older
                 .iter()
+                .filter(|message| !message.flags.deleted())
                 .map(|message| (message.clone(), Some(message.sender) == local_user))
                 .collect();
             self.chat.prepend_chat(flagged);
@@ -234,10 +383,11 @@ impl ClientRoom {
         }
         for message in rest {
             let local = Some(message.sender) == local_user;
+            let deleted = message.flags.deleted();
             match self.messages.insert(message.clone()) {
-                LogInsert::Appended => self.chat.push_chat(message, local),
-                LogInsert::Inserted => self.chat.insert_chat(message, local),
-                LogInsert::Duplicate => {}
+                LogInsert::Appended if !deleted => self.chat.push_chat(message, local),
+                LogInsert::Inserted if !deleted => self.chat.insert_chat(message, local),
+                LogInsert::Appended | LogInsert::Inserted | LogInsert::Duplicate => {}
             }
         }
         self.messages.trim_front(max_messages);
@@ -254,7 +404,7 @@ impl ClientRoom {
         };
         let oldest_key = MessageLog::key(oldest);
         let oldest_timestamp = oldest.timestamp_ms;
-        self.web_attachments.retain(|key, _| *key >= oldest_key);
+        self.web_attachments.retain(|id, _| *id >= oldest_key);
         self.files
             .retain(|key, _| key.timestamp_ms >= oldest_timestamp);
         self.web_file_attachments
@@ -318,6 +468,22 @@ pub(crate) struct RoomSession {
     /// Message cap applied to each room buffer.
     max_messages: usize,
     syntax: crate::theme::SyntaxTheme,
+    /// Which binding set the composer was built with, deciding how an edit
+    /// populates it (Vim: normal mode at the start; Standard: insert at the
+    /// end).
+    bindings: DefaultBindings,
+    /// The edit in progress: submit sends it, leaving compose focus or
+    /// switching rooms cancels it and restores the parked draft.
+    pending_edit: Option<PendingEdit>,
+}
+
+struct PendingEdit {
+    room_id: RoomId,
+    target: MessageId,
+    /// The original body, so an unchanged submit is dropped.
+    original: String,
+    /// Composer text parked when the edit began, restored on cancel.
+    parked_draft: String,
 }
 
 /// One row of the server-wide user list popup: directory identity plus the
@@ -394,7 +560,7 @@ pub(crate) enum TransferStatus {
 #[derive(Default)]
 struct MessageLog {
     messages: Vec<ChatMessage>,
-    keys: HashSet<(u64, u64)>,
+    keys: HashSet<MessageKey>,
 }
 
 enum LogInsert {
@@ -404,8 +570,8 @@ enum LogInsert {
 }
 
 impl MessageLog {
-    fn key(message: &ChatMessage) -> (u64, u64) {
-        (message.timestamp_ms, message.message_id.0)
+    fn key(message: &ChatMessage) -> MessageKey {
+        message.message_id.0
     }
 
     /// Adopts a load that is already sorted and deduped by key, as
@@ -437,8 +603,31 @@ impl MessageLog {
         LogInsert::Inserted
     }
 
-    fn contains(&self, key: (u64, u64)) -> bool {
+    fn contains(&self, key: MessageKey) -> bool {
         self.keys.contains(&key)
+    }
+
+    fn position(&self, key: MessageKey) -> Option<usize> {
+        if !self.keys.contains(&key) {
+            return None;
+        }
+        let index = self
+            .messages
+            .partition_point(|resident| Self::key(resident) < key);
+        (self.messages.get(index).map(Self::key) == Some(key)).then_some(index)
+    }
+
+    fn get_mut(&mut self, key: MessageKey) -> Option<&mut ChatMessage> {
+        let index = self.position(key)?;
+        Some(&mut self.messages[index])
+    }
+
+    /// Whether the message is among the newest `window` resident messages.
+    fn is_within_newest(&self, key: MessageKey, window: usize) -> bool {
+        let Some(index) = self.position(key) else {
+            return false;
+        };
+        self.messages.len() - index <= window
     }
 
     fn first(&self) -> Option<&ChatMessage> {
@@ -515,6 +704,12 @@ pub(crate) struct RoomChatUpdate {
     pub(crate) read_advanced: bool,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct RoomMutationUpdate {
+    pub(crate) outcome: MutationOutcome,
+    pub(crate) read_advanced: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ParticipantNotice {
     pub(crate) display_name: String,
@@ -553,6 +748,40 @@ pub(crate) enum RefJump {
 pub(crate) enum ComposerSubmission {
     Command(String),
     Message(String),
+    /// An edit of a recent message, never command-parsed: an edited body may
+    /// legitimately start with `/`.
+    Edit {
+        room_id: RoomId,
+        target: MessageId,
+        body: String,
+    },
+}
+
+/// Client-side bound on how many messages back an edit may reach, tighter
+/// than the server's [`rpc::control::MUTATION_WINDOW_MESSAGES`] so a revision
+/// finished during ongoing traffic is rarely rejected.
+const EDIT_WINDOW_MESSAGES: usize = 200;
+
+/// Why the message under the cursor cannot be edited.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum EditDenied {
+    NoMessage,
+    Notice,
+    NotYours,
+    FileMessage,
+    TooOld,
+}
+
+impl EditDenied {
+    pub(crate) fn status(self) -> &'static str {
+        match self {
+            EditDenied::NoMessage => "no message selected",
+            EditDenied::Notice => "notices cannot be edited",
+            EditDenied::NotYours => "not your message",
+            EditDenied::FileMessage => "file messages cannot be edited",
+            EditDenied::TooOld => "message too old to edit",
+        }
+    }
 }
 
 /// Derives web attachments for file-announcement messages from their stored
@@ -560,7 +789,7 @@ pub(crate) enum ComposerSubmission {
 fn collect_web_attachments(
     messages: &[ChatMessage],
     files: &std::collections::HashMap<FileHistoryKey, room_history::FileDetail>,
-    web_attachments: &mut HashMap<(u64, u64), WebAttachment>,
+    web_attachments: &mut HashMap<MessageKey, WebAttachment>,
     web_file_attachments: &mut HashMap<FileHistoryKey, WebAttachment>,
 ) {
     for message in messages {
@@ -576,7 +805,7 @@ fn collect_web_attachments(
         };
         let attachment = WebAttachment::from_served_file(&detail.file_name, detail.dimensions());
         web_file_attachments.insert(key, attachment.clone());
-        web_attachments.insert((message.timestamp_ms, message.message_id.0), attachment);
+        web_attachments.insert(message.message_id.0, attachment);
     }
 }
 
@@ -620,8 +849,7 @@ fn record_room_file(
     let attachment = WebAttachment::from_served_file(file_name, dimensions);
     room.web_file_attachments.insert(key, attachment.clone());
     if let Some(message_id) = file_message_id(&room.chat, timestamp_ms, transfer_id) {
-        room.web_attachments
-            .insert((timestamp_ms, message_id), attachment);
+        room.web_attachments.insert(message_id, attachment);
     }
 }
 
@@ -664,8 +892,14 @@ fn strip_blank_edge_lines(text: &str) -> String {
 
 impl RoomSession {
     pub(super) fn new(config: &Config, theme: &Theme) -> Self {
-        let mut composer =
-            Editor::with_bindings(editor_bindings::vim(editor_bindings::VimOptions::default()));
+        let bindings = config.ui.default_bindings;
+        let editor_bindings = match bindings {
+            DefaultBindings::Standard => editor_bindings::nano(),
+            DefaultBindings::Vim => {
+                editor_bindings::vim(editor_bindings::VimOptions::default())
+            }
+        };
+        let mut composer = Editor::with_bindings(editor_bindings);
         composer.set_wrap(true);
         composer.set_height_bounds(1, u16::MAX);
         composer.set_theme(theme.editor_theme());
@@ -701,6 +935,8 @@ impl RoomSession {
             local_user: None,
             max_messages: config.ui.max_messages as usize,
             syntax: theme.syntax,
+            bindings,
+            pending_edit: None,
         }
     }
 
@@ -795,6 +1031,7 @@ impl RoomSession {
                 self.volume_preview = None;
             }
             ServerContinuity::NewServer => {
+                self.pending_edit = None;
                 self.clear_active_room_state();
                 self.room_name = "lobby".to_string();
                 self.metas.clear();
@@ -818,6 +1055,7 @@ impl RoomSession {
     }
 
     pub(crate) fn reset_for_server_list(&mut self) {
+        self.cancel_pending_edit();
         self.clear_active_room_state();
         self.server_alias.clear();
         self.history = HistoryStorage::disabled();
@@ -846,6 +1084,7 @@ impl RoomSession {
     /// Marks every user offline and clears live voice state while keeping the
     /// room buffers, so captured logs stay browsable offline.
     pub(crate) fn reset_for_disconnect(&mut self) {
+        self.cancel_pending_edit();
         self.restore_archived_rooms();
         // Drop every live/terminal transfer overlay: the worker's
         // incoming_files/outgoing_uploads are gone, and server transfer ids are
@@ -987,7 +1226,14 @@ impl RoomSession {
         room.trim_orphaned_attachments();
         room.history = opened.store;
         room.chat.set_room_id(room_id);
+        for mutation in &opened.loaded.mutations {
+            room.seen_mutations.insert(mutation.message_id.0);
+            room.note_mutation_state(mutation);
+        }
         for message in room.messages.as_slice() {
+            if message.flags.deleted() {
+                continue;
+            }
             let local = Some(message.sender) == local_user;
             room.chat.push_chat(message.clone(), local);
         }
@@ -1104,6 +1350,9 @@ impl RoomSession {
         let Some(previous) = self.viewed_room.take() else {
             return;
         };
+        // Cancel first so the draft parked below is the user's message, not
+        // the edit text.
+        self.cancel_pending_edit();
         let mut parked = std::mem::replace(
             &mut self.active,
             ClientRoom::empty(self.max_messages, self.syntax),
@@ -1178,7 +1427,7 @@ impl RoomSession {
         }
         self.active
             .chat
-            .set_local_flags(|timestamp_ms, id| locals.get(&(timestamp_ms, id)).copied());
+            .set_local_flags(|id| locals.get(&id).copied());
         self.mark_viewed_read();
         self.rebuild_roster();
     }
@@ -1192,8 +1441,15 @@ impl RoomSession {
         let newest = (0..self.active.chat.len())
             .rev()
             .map(|index| self.active.chat.message(index))
-            .find(|entry| entry.timestamp_ms != 0)
+            .find(|entry| entry.id != 0)
             .map(|entry| MessageId(entry.id));
+        // A mutation record's id advances the head past every visible
+        // message, so the watermark must count it as read or the viewed room
+        // would keep an unread dot no message can clear.
+        let newest = match self.active.newest_mutation_seen {
+            0 => newest,
+            seen => newest.max(Some(MessageId(seen))),
+        };
         if let Some(meta) = self.metas.get_mut(&room_id) {
             let previous = meta.last_read;
             meta.unread = 0;
@@ -1514,11 +1770,19 @@ impl RoomSession {
     }
 
     /// The viewed room's messages and file details, for mirroring into the web
-    /// feed.
+    /// feed. Tombstones stay internal.
     pub(crate) fn viewed_history(&self) -> room_history::LoadedHistory {
         room_history::LoadedHistory {
-            messages: self.active.messages.as_slice().to_vec(),
+            messages: self
+                .active
+                .messages
+                .as_slice()
+                .iter()
+                .filter(|message| !message.flags.deleted())
+                .cloned()
+                .collect(),
             files: self.active.files.clone(),
+            mutations: Vec::new(),
         }
     }
 
@@ -1738,7 +2002,7 @@ impl RoomSession {
         let attachment = self
             .active
             .web_attachments
-            .get(&(target.timestamp_ms, target.message_id.0))
+            .get(&target.message_id.0)
             .cloned();
         Some(crate::web_wire::ResolvedRef { label, attachment })
     }
@@ -1777,6 +2041,32 @@ impl RoomSession {
             local,
             fresh,
             should_scroll_bottom,
+            read_advanced,
+        })
+    }
+
+    /// Applies a live edit or delete record to whichever room it belongs to.
+    /// Mutations advance the head like any message but never bump unread
+    /// counts or ring the notification; viewing counts them read immediately.
+    /// Returns `None` for rooms this client does not know.
+    pub(crate) fn mutation_received(
+        &mut self,
+        record: &ChatMessage,
+        local_user: Option<UserId>,
+    ) -> Option<RoomMutationUpdate> {
+        let room_id = record.room_id;
+        if let Some(meta) = self.metas.get_mut(&room_id) {
+            meta.head = Some(record.message_id).max(meta.head);
+        }
+        let viewed = self.viewed_room == Some(room_id);
+        let room = self.room_mut_materializing(room_id, local_user)?;
+        let outcome = room.receive_mutation(record);
+        let mut read_advanced = false;
+        if viewed {
+            read_advanced = self.mark_viewed_read();
+        }
+        Some(RoomMutationUpdate {
+            outcome,
             read_advanced,
         })
     }
@@ -2094,6 +2384,17 @@ impl RoomSession {
         if input.is_empty() {
             return None;
         }
+        if let Some(edit) = self.pending_edit.take() {
+            self.reset_composer(&edit.parked_draft);
+            if input == edit.original {
+                return None;
+            }
+            return Some(ComposerSubmission::Edit {
+                room_id: edit.room_id,
+                target: edit.target,
+                body: input,
+            });
+        }
         let submission = if input.starts_with('/') {
             ComposerSubmission::Command(input.trim().to_string())
         } else {
@@ -2102,12 +2403,79 @@ impl RoomSession {
             }
             ComposerSubmission::Message(input)
         };
+        self.reset_composer("");
+        Some(submission)
+    }
+
+    /// Clears the composer back into insert mode, restoring `draft` when one
+    /// was parked.
+    fn reset_composer(&mut self, draft: &str) {
         self.command_completion.clear();
         self.ref_completion.clear();
         self.composer.clear_inline_completion();
         self.composer.clear();
+        if !draft.is_empty() {
+            self.composer.set_lines(draft);
+        }
         self.composer.enter_insert_mode();
-        Some(submission)
+    }
+
+    /// Starts editing the message under the chat cursor: parks the current
+    /// draft and populates the composer with the original body. Vim bindings
+    /// leave the editor in Normal mode at the start; Standard bindings in
+    /// insert at the end.
+    pub(crate) fn begin_edit_cursor_message(&mut self, width: u16) -> Result<(), EditDenied> {
+        let Some(room_id) = self.viewed_room else {
+            return Err(EditDenied::NoMessage);
+        };
+        let Some(cursor) = self.active.chat.ensure_cursor(width) else {
+            return Err(EditDenied::NoMessage);
+        };
+        let entry = self.active.chat.message(cursor.message);
+        if entry.id == 0 {
+            return Err(EditDenied::Notice);
+        }
+        if !entry.local {
+            return Err(EditDenied::NotYours);
+        }
+        if entry.file_transfer_id.is_some() {
+            return Err(EditDenied::FileMessage);
+        }
+        if !self
+            .active
+            .messages
+            .is_within_newest(entry.id, EDIT_WINDOW_MESSAGES)
+        {
+            return Err(EditDenied::TooOld);
+        }
+        let target = MessageId(entry.id);
+        let original = entry.body.clone();
+        let parked_draft = self.composer.text();
+        self.composer.set_lines(&original);
+        if self.bindings == DefaultBindings::Standard {
+            self.composer.set_cursor_offset(self.composer.text_len());
+        }
+        self.pending_edit = Some(PendingEdit {
+            room_id,
+            target,
+            original,
+            parked_draft,
+        });
+        Ok(())
+    }
+
+    pub(crate) fn has_pending_edit(&self) -> bool {
+        self.pending_edit.is_some()
+    }
+
+    /// Abandons an edit in progress, restoring the draft parked when it
+    /// began. Returns whether there was one.
+    pub(crate) fn cancel_pending_edit(&mut self) -> bool {
+        let Some(edit) = self.pending_edit.take() else {
+            return false;
+        };
+        self.reset_composer(&edit.parked_draft);
+        true
     }
 
     /// Clears the visible scrollback. The buffer keeps its room binding so
@@ -2202,12 +2570,11 @@ impl RoomSession {
         let room_id = self.active.chat.room_id()?;
         let cursor = self.active.chat.ensure_cursor(width)?;
         let entry = self.active.chat.message(cursor.message);
-        if entry.timestamp_ms == 0 {
+        if entry.id == 0 {
             return None;
         }
         Some(rpc::msgref::MessageRef {
             room_id,
-            timestamp_ms: entry.timestamp_ms,
             message_id: rpc::ids::MessageId(entry.id),
         })
     }
@@ -2234,9 +2601,10 @@ impl RoomSession {
     pub(crate) fn cross_room_ref_preview(&self, target: rpc::msgref::MessageRef) -> Option<String> {
         let dir = self.history.room_dir(target.room_id)?;
         let loaded = room_history::open_in(Some(dir), target.room_id).loaded;
-        let message = loaded.messages.iter().find(|message| {
-            message.timestamp_ms == target.timestamp_ms && message.message_id == target.message_id
-        })?;
+        let message = loaded
+            .messages
+            .iter()
+            .find(|message| message.message_id == target.message_id)?;
         let first_line = message.body.lines().next().unwrap_or("");
         Some(format!(
             "room {}: {}: {first_line}",
@@ -2255,11 +2623,7 @@ impl RoomSession {
         if self.active.chat.room_id() != Some(target.room_id) {
             return RefJump::OtherRoom;
         }
-        let Some(index) = self
-            .active
-            .chat
-            .find_message(target.timestamp_ms, target.message_id.0)
-        else {
+        let Some(index) = self.active.chat.find_message(target.message_id.0) else {
             return RefJump::NotFound;
         };
         self.active.chat.set_cursor_to_message(index);
@@ -2429,6 +2793,8 @@ mod tests {
             timestamp_ms: id * 1_000,
             body: body.to_string(),
             file_transfer_id: None,
+            flags: rpc::control::MessageFlags::default(),
+            target: None,
         }
     }
 
@@ -3029,8 +3395,7 @@ mod tests {
     #[test]
     fn history_merge_dedups_and_orders() {
         // Empty history id disables disk, so this exercises the in-memory
-        // merge: dedup on (timestamp_ms, message_id) and sort by it. `message`
-        // sets timestamp_ms = id * 1000, so ids order the result.
+        // merge: dedup and sort by message id.
         let mut room = test_room();
         enter(
             &mut room,
@@ -3044,7 +3409,7 @@ mod tests {
             Some(UserId(1)),
         );
 
-        // The duplicate (timestamp_ms, message_id) is dropped by seen dedup.
+        // The duplicate message id is dropped by seen dedup.
         assert_eq!(room.active.chat.len(), 3);
         assert_eq!(room.active.chat.message(0).body, "first");
         assert_eq!(room.active.chat.message(1).body, "second");
@@ -3398,10 +3763,8 @@ mod tests {
         room.active
             .web_file_attachments
             .insert(kept_key, attachment.clone());
-        room.active
-            .web_attachments
-            .insert((1_000, 1), attachment.clone());
-        room.active.web_attachments.insert((2_000, 2), attachment);
+        room.active.web_attachments.insert(1, attachment.clone());
+        room.active.web_attachments.insert(2, attachment);
 
         room.set_max_messages(2);
 
@@ -3409,8 +3772,8 @@ mod tests {
         assert!(room.active.files.contains_key(&kept_key));
         assert!(!room.active.web_file_attachments.contains_key(&old_key));
         assert!(room.active.web_file_attachments.contains_key(&kept_key));
-        assert!(!room.active.web_attachments.contains_key(&(1_000, 1)));
-        assert!(room.active.web_attachments.contains_key(&(2_000, 2)));
+        assert!(!room.active.web_attachments.contains_key(&1));
+        assert!(room.active.web_attachments.contains_key(&2));
     }
 
     #[test]
@@ -3796,6 +4159,366 @@ mod tests {
         assert_eq!(room.viewed_room, None);
     }
 
+    fn edit_record(id: u64, target: u64, sender: UserId, body: &str) -> ChatMessage {
+        let mut record = message(id, sender, body);
+        record.flags.set_edited();
+        record.target = Some(MessageId(target));
+        record
+    }
+
+    fn delete_record(id: u64, target: u64, sender: UserId) -> ChatMessage {
+        let mut record = message(id, sender, "");
+        record.flags.set_deleted();
+        record.target = Some(MessageId(target));
+        record
+    }
+
+    fn buffer_bodies(room: &RoomSession) -> Vec<String> {
+        (0..room.active.chat.len())
+            .map(|index| room.active.chat.message(index).body.clone())
+            .collect()
+    }
+
+    #[test]
+    fn live_edit_replaces_resident_body_and_marks_edited() {
+        let mut room = test_room();
+        enter(
+            &mut room,
+            Vec::new(),
+            vec![message(1, UserId(2), "original"), message(2, UserId(2), "tail")],
+            Some(UserId(1)),
+        );
+
+        let update = room
+            .mutation_received(&edit_record(3, 1, UserId(2), "revised"), Some(UserId(1)))
+            .expect("known room");
+        let MutationOutcome::AppliedEdit(folded) = update.outcome else {
+            panic!("expected an applied edit, got {:?}", update.outcome);
+        };
+        assert_eq!(folded.body, "revised");
+        assert!(folded.flags.edited());
+        assert_eq!(folded.message_id, MessageId(1));
+
+        let index = room.active.chat.find_message(1).expect("resident");
+        let entry = room.active.chat.message(index);
+        assert_eq!(entry.body, "revised");
+        assert!(entry.edited);
+        assert_eq!(room.room_meta(RoomId(1)).unwrap().head, Some(MessageId(3)));
+    }
+
+    #[test]
+    fn live_delete_removes_from_buffer_and_history_page_cannot_resurrect() {
+        let mut room = test_room();
+        enter(
+            &mut room,
+            Vec::new(),
+            vec![message(1, UserId(2), "doomed"), message(2, UserId(2), "tail")],
+            Some(UserId(1)),
+        );
+
+        let update = room
+            .mutation_received(&delete_record(3, 1, UserId(2)), Some(UserId(1)))
+            .expect("known room");
+        assert_eq!(update.outcome, MutationOutcome::AppliedDelete);
+        assert_eq!(buffer_bodies(&room), vec!["tail".to_string()]);
+
+        room.merge_history(
+            RoomId(1),
+            vec![message(1, UserId(2), "doomed"), message(2, UserId(2), "tail")],
+            Some(UserId(1)),
+        );
+        assert_eq!(buffer_bodies(&room), vec!["tail".to_string()]);
+    }
+
+    #[test]
+    fn pending_mutation_from_newer_page_applies_when_older_page_arrives() {
+        let mut room = test_room();
+        enter(&mut room, Vec::new(), Vec::new(), Some(UserId(1)));
+
+        room.merge_history(
+            RoomId(1),
+            vec![
+                message(10, UserId(2), "newer"),
+                edit_record(11, 1, UserId(2), "revised"),
+                delete_record(12, 2, UserId(2)),
+            ],
+            Some(UserId(1)),
+        );
+        assert_eq!(buffer_bodies(&room), vec!["newer".to_string()]);
+
+        room.merge_history(
+            RoomId(1),
+            vec![
+                message(1, UserId(2), "original"),
+                message(2, UserId(2), "doomed"),
+                message(3, UserId(2), "untouched"),
+            ],
+            Some(UserId(1)),
+        );
+        assert_eq!(
+            buffer_bodies(&room),
+            vec![
+                "revised".to_string(),
+                "untouched".to_string(),
+                "newer".to_string()
+            ]
+        );
+        let index = room.active.chat.find_message(1).expect("resident");
+        assert!(room.active.chat.message(index).edited);
+    }
+
+    #[test]
+    fn duplicate_mutation_delivery_is_idempotent() {
+        let mut room = test_room();
+        enter(
+            &mut room,
+            Vec::new(),
+            vec![message(1, UserId(2), "original")],
+            Some(UserId(1)),
+        );
+
+        let edit = edit_record(2, 1, UserId(2), "revised");
+        let first = room
+            .mutation_received(&edit, Some(UserId(1)))
+            .expect("known room");
+        assert!(matches!(first.outcome, MutationOutcome::AppliedEdit(_)));
+        let second = room
+            .mutation_received(&edit, Some(UserId(1)))
+            .expect("known room");
+        assert_eq!(second.outcome, MutationOutcome::Ignored);
+        assert_eq!(buffer_bodies(&room), vec!["revised".to_string()]);
+
+        let delete = delete_record(3, 1, UserId(2));
+        let first = room
+            .mutation_received(&delete, Some(UserId(1)))
+            .expect("known room");
+        assert_eq!(first.outcome, MutationOutcome::AppliedDelete);
+        let tombstone = room.active.messages.get_mut(1).expect("resident tombstone");
+        assert_eq!(
+            tombstone.flags,
+            rpc::control::MessageFlags(rpc::control::MessageFlags::DELETED)
+        );
+        assert!(tombstone.flags.is_valid());
+        let second = room
+            .mutation_received(&delete, Some(UserId(1)))
+            .expect("known room");
+        assert_eq!(second.outcome, MutationOutcome::Ignored);
+        assert!(buffer_bodies(&room).is_empty());
+    }
+
+    #[test]
+    fn latest_edit_wins_regardless_of_delivery_order() {
+        let mut room = test_room();
+        enter(
+            &mut room,
+            Vec::new(),
+            vec![message(1, UserId(2), "original")],
+            Some(UserId(1)),
+        );
+
+        room.mutation_received(&edit_record(3, 1, UserId(2), "final"), Some(UserId(1)));
+        let update = room
+            .mutation_received(&edit_record(2, 1, UserId(2), "stale"), Some(UserId(1)))
+            .expect("known room");
+        assert_eq!(update.outcome, MutationOutcome::Ignored);
+        assert_eq!(buffer_bodies(&room), vec!["final".to_string()]);
+    }
+
+    #[test]
+    fn mutation_does_not_increment_unread_and_advances_head() {
+        let mut room = test_room();
+        enter(
+            &mut room,
+            Vec::new(),
+            vec![message(1, UserId(2), "original")],
+            Some(UserId(1)),
+        );
+        room.merge_history(
+            RoomId(2),
+            vec![message_in(RoomId(2), 1, UserId(2), "parked original")],
+            Some(UserId(1)),
+        );
+
+        let mut record = edit_record(2, 1, UserId(2), "revised");
+        record.room_id = RoomId(2);
+        room.mutation_received(&record, Some(UserId(1)));
+        let meta = room.room_meta(RoomId(2)).unwrap();
+        assert_eq!(meta.unread, 0);
+        assert_eq!(meta.head, Some(MessageId(2)));
+    }
+
+    #[test]
+    fn viewed_mutation_advances_last_read() {
+        let mut room = test_room();
+        enter(
+            &mut room,
+            Vec::new(),
+            vec![message(1, UserId(2), "original")],
+            Some(UserId(1)),
+        );
+        room.set_viewed_room(RoomId(1), Some(UserId(1)));
+
+        let update = room
+            .mutation_received(&edit_record(2, 1, UserId(2), "revised"), Some(UserId(1)))
+            .expect("known room");
+        assert!(update.read_advanced);
+        let meta = room.room_meta(RoomId(1)).unwrap();
+        assert_eq!(meta.last_read, Some(MessageId(2)));
+        assert_eq!(meta.head, meta.last_read);
+    }
+
+    fn vim_test_room() -> RoomSession {
+        let mut config = Config::default();
+        config.ui.default_bindings = DefaultBindings::Vim;
+        RoomSession::new(&config, &Theme::tomorrow_night())
+    }
+
+    #[test]
+    fn begin_edit_populates_composer_and_submit_produces_edit() {
+        let mut room = test_room();
+        enter(
+            &mut room,
+            Vec::new(),
+            vec![message(1, UserId(1), "mine"), message(2, UserId(2), "theirs")],
+            Some(UserId(1)),
+        );
+        room.set_viewed_room(RoomId(1), Some(UserId(1)));
+        room.composer.set_lines("half-typed draft");
+        let index = room.active.chat.find_message(1).expect("resident");
+        room.active.chat.set_cursor_to_message(index);
+
+        room.begin_edit_cursor_message(80).expect("edit allowed");
+        assert!(room.has_pending_edit());
+        assert_eq!(room.composer.text(), "mine");
+        // Standard bindings: insert mode with the cursor at the end.
+        assert_eq!(room.composer.mode(), extui_editor::Mode::Insert);
+        assert_eq!(room.composer.cursor_offset(), room.composer.text_len());
+
+        room.composer.set_lines("mine, but better");
+        assert_eq!(
+            room.submit_composer(),
+            Some(ComposerSubmission::Edit {
+                room_id: RoomId(1),
+                target: MessageId(1),
+                body: "mine, but better".to_string(),
+            })
+        );
+        assert!(!room.has_pending_edit());
+        assert_eq!(room.composer.text(), "half-typed draft");
+    }
+
+    #[test]
+    fn vim_edit_starts_in_normal_mode() {
+        let mut room = vim_test_room();
+        enter(
+            &mut room,
+            Vec::new(),
+            vec![message(1, UserId(1), "mine")],
+            Some(UserId(1)),
+        );
+        room.set_viewed_room(RoomId(1), Some(UserId(1)));
+        room.active.chat.set_cursor_to_message(0);
+
+        room.begin_edit_cursor_message(80).expect("edit allowed");
+
+        assert_eq!(room.composer.text(), "mine");
+        assert_eq!(room.composer.mode(), extui_editor::Mode::Normal);
+    }
+
+    #[test]
+    fn unchanged_edit_submit_is_dropped() {
+        let mut room = test_room();
+        enter(
+            &mut room,
+            Vec::new(),
+            vec![message(1, UserId(1), "mine")],
+            Some(UserId(1)),
+        );
+        room.set_viewed_room(RoomId(1), Some(UserId(1)));
+        room.active.chat.set_cursor_to_message(0);
+        room.begin_edit_cursor_message(80).expect("edit allowed");
+
+        assert_eq!(room.submit_composer(), None);
+        assert!(!room.has_pending_edit());
+    }
+
+    #[test]
+    fn edit_denied_for_foreign_file_and_frozen_messages() {
+        let mut room = test_room();
+        let mut history = vec![
+            message(1, UserId(1), "frozen mine"),
+            message(2, UserId(2), "theirs"),
+            file_message(3, UserId(1), "sent file `f` (1 B)", FileTransferId(9)),
+        ];
+        for id in 4..(4 + EDIT_WINDOW_MESSAGES as u64) {
+            history.push(message(id, UserId(1), "filler"));
+        }
+        enter(&mut room, Vec::new(), history, Some(UserId(1)));
+        room.set_viewed_room(RoomId(1), Some(UserId(1)));
+
+        let index = room.active.chat.find_message(2).expect("resident");
+        room.active.chat.set_cursor_to_message(index);
+        assert_eq!(
+            room.begin_edit_cursor_message(80),
+            Err(EditDenied::NotYours)
+        );
+
+        let index = room.active.chat.find_message(3).expect("resident");
+        room.active.chat.set_cursor_to_message(index);
+        assert_eq!(
+            room.begin_edit_cursor_message(80),
+            Err(EditDenied::FileMessage)
+        );
+
+        let index = room.active.chat.find_message(1).expect("resident");
+        room.active.chat.set_cursor_to_message(index);
+        assert_eq!(room.begin_edit_cursor_message(80), Err(EditDenied::TooOld));
+
+        let index = room.active.chat.find_message(4).expect("resident");
+        room.active.chat.set_cursor_to_message(index);
+        assert_eq!(room.begin_edit_cursor_message(80), Ok(()));
+    }
+
+    #[test]
+    fn switching_rooms_cancels_pending_edit_and_restores_draft() {
+        let mut room = test_room();
+        enter(
+            &mut room,
+            Vec::new(),
+            vec![message(1, UserId(1), "mine")],
+            Some(UserId(1)),
+        );
+        room.set_viewed_room(RoomId(1), Some(UserId(1)));
+        room.composer.set_lines("draft in progress");
+        room.active.chat.set_cursor_to_message(0);
+        room.begin_edit_cursor_message(80).expect("edit allowed");
+        assert_eq!(room.composer.text(), "mine");
+
+        room.set_viewed_room(RoomId(2), Some(UserId(1)));
+        assert!(!room.has_pending_edit());
+        room.set_viewed_room(RoomId(1), Some(UserId(1)));
+        assert_eq!(room.composer.text(), "draft in progress");
+    }
+
+    #[test]
+    fn disconnect_cancels_pending_edit_and_restores_draft() {
+        let mut room = test_room();
+        enter(
+            &mut room,
+            Vec::new(),
+            vec![message(1, UserId(1), "mine")],
+            Some(UserId(1)),
+        );
+        room.composer.set_lines("draft in progress");
+        room.active.chat.set_cursor_to_message(0);
+        room.begin_edit_cursor_message(80).expect("edit allowed");
+
+        room.reset_for_disconnect();
+
+        assert!(!room.has_pending_edit());
+        assert_eq!(room.composer.text(), "draft in progress");
+    }
+
     #[test]
     fn live_chat_is_deduped_against_seen() {
         let mut room = test_room();
@@ -3807,15 +4530,14 @@ mod tests {
         );
         assert_eq!(room.active.chat.len(), 1);
 
-        // Same (timestamp_ms, message_id) is skipped.
+        // A message id is the identity, so a re-delivery is skipped even when
+        // its timestamp drifted.
         room.chat_received(message(5, UserId(2), "echo"), Some(UserId(1)));
         assert_eq!(room.active.chat.len(), 1);
-
-        // Same id with a different timestamp (post-restart) is a new message.
-        let mut restarted = message(5, UserId(2), "post-restart");
-        restarted.timestamp_ms += 1;
-        room.chat_received(restarted, Some(UserId(1)));
-        assert_eq!(room.active.chat.len(), 2);
+        let mut drifted = message(5, UserId(2), "drifted");
+        drifted.timestamp_ms += 1;
+        room.chat_received(drifted, Some(UserId(1)));
+        assert_eq!(room.active.chat.len(), 1);
     }
 
     #[test]
@@ -3858,7 +4580,6 @@ mod tests {
 
         let target = rpc::msgref::MessageRef {
             room_id: RoomId(1),
-            timestamp_ms: 7_000,
             message_id: MessageId(7),
         };
         assert_eq!(room.jump_to_ref(target, 40, 5), RefJump::Jumped);

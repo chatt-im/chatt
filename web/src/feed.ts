@@ -9,6 +9,7 @@ import type { WebMessage, Fragment, MediaKind } from "./types";
 
 const KIND_SYNC = 1;
 const KIND_MESSAGE = 2;
+const KIND_OLDER = 3;
 const KIND_REF_PREVIEW = 4;
 
 const FRAG_TEXT = 0;
@@ -44,6 +45,8 @@ export function decodeFeed(buffer: ArrayBuffer): FeedFrame | null {
     const message = reader.u8() === 1 ? reader.message() : null;
     return { kind: "ref_preview", ts, mid, message };
   }
+  // Unknown kinds (newer server) must not fall into the window parser.
+  if (kind !== KIND_SYNC && kind !== KIND_OLDER) return null;
   const oldest_seq = reader.u53();
   const has_more = reader.u8() === 1;
   const count = reader.u32();

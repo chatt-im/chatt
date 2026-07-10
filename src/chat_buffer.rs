@@ -87,6 +87,9 @@ pub struct ChatEntry {
     pub body: String,
     pub timestamp_ms: u64,
     pub local: bool,
+    /// The body was replaced by an edit; the heading renders an `(edited)`
+    /// marker.
+    pub edited: bool,
     /// The server file transfer this message announces, when it is a file. Keys
     /// the render-time progress overlay in [`crate::app::room::RoomSession`].
     pub file_transfer_id: Option<FileTransferId>,
@@ -333,6 +336,7 @@ impl VirtualChatBuffer {
             body: message.body,
             timestamp_ms: message.timestamp_ms,
             local,
+            edited: message.flags.edited(),
             file_transfer_id: message.file_transfer_id,
             links: inline.urls,
             refs,
@@ -341,6 +345,32 @@ impl VirtualChatBuffer {
             notice_kind: None,
             layout: MessageLayout::new(),
         }
+    }
+
+    /// Replaces the message with `message_id` by the folded `message`,
+    /// recomputing links, references, and layout while keeping the entry's
+    /// local flag and expansion. Returns whether the message was resident.
+    pub fn edit_message(&mut self, message_id: u64, message: ChatMessage) -> bool {
+        let Some(index) = self.find_message(message_id) else {
+            return false;
+        };
+        let expanded = self.messages[index].expanded;
+        let local = self.messages[index].local;
+        let mut entry = self.build_entry(message, local);
+        entry.expanded = expanded;
+        self.messages[index] = entry;
+        self.layout_index.invalidate();
+        true
+    }
+
+    /// Removes the message with `message_id`, fixing up the cursor and anchor
+    /// like a notice removal. Returns whether the message was resident.
+    pub fn remove_message(&mut self, message_id: u64) -> bool {
+        let Some(index) = self.find_message(message_id) else {
+            return false;
+        };
+        self.remove_at(index);
+        true
     }
 
     pub fn push_chat(&mut self, message: ChatMessage, local: bool) {
@@ -373,9 +403,9 @@ impl VirtualChatBuffer {
     }
 
     /// Inserts a batch of older messages before the first entry. `messages`
-    /// must be sorted by `(timestamp_ms, message_id)` and older than every
-    /// resident message. The bottom-relative scroll is untouched, so the view
-    /// does not jump; cursor and anchor shift with the entries they name.
+    /// must be sorted by `message_id` and older than every resident message.
+    /// The bottom-relative scroll is untouched, so the view does not jump;
+    /// cursor and anchor shift with the entries they name.
     pub fn prepend_chat(&mut self, messages: Vec<(ChatMessage, bool)>) {
         if messages.is_empty() {
             return;
@@ -400,11 +430,11 @@ impl VirtualChatBuffer {
     /// leaving notices pinned where they were pushed. For the rare history
     /// straggler that lands between resident messages.
     pub fn insert_chat(&mut self, message: ChatMessage, local: bool) {
-        let key = (message.timestamp_ms, message.message_id.0);
+        let key = message.message_id.0;
         let index = self
             .messages
             .iter()
-            .rposition(|entry| entry.timestamp_ms != 0 && (entry.timestamp_ms, entry.id) < key)
+            .rposition(|entry| entry.id != 0 && entry.id < key)
             .map_or(0, |newest_older| newest_older + 1);
         let entry = self.build_entry(message, local);
         self.messages.insert(index, entry);
@@ -422,17 +452,17 @@ impl VirtualChatBuffer {
         self.trim_front();
     }
 
-    /// Re-marks which messages are locally sent, keyed by
-    /// `(timestamp_ms, message_id)`. Heading grouping reads `local`, so the row
-    /// index is invalidated only when an entry actually changes.
+    /// Re-marks which messages are locally sent, keyed by message id. Heading
+    /// grouping reads `local`, so the row index is invalidated only when an
+    /// entry actually changes.
     /// Notices and keys the callback does not know keep their flag.
-    pub fn set_local_flags(&mut self, local_for: impl Fn(u64, u64) -> Option<bool>) {
+    pub fn set_local_flags(&mut self, local_for: impl Fn(u64) -> Option<bool>) {
         let mut changed = false;
         for entry in &mut self.messages {
-            if entry.timestamp_ms == 0 {
+            if entry.id == 0 {
                 continue;
             }
-            if let Some(local) = local_for(entry.timestamp_ms, entry.id) {
+            if let Some(local) = local_for(entry.id) {
                 changed |= entry.local != local;
                 entry.local = local;
             }
@@ -464,6 +494,7 @@ impl VirtualChatBuffer {
             body,
             timestamp_ms: 0,
             local: false,
+            edited: false,
             file_transfer_id: None,
             links: inline.urls,
             refs,
@@ -486,6 +517,11 @@ impl VirtualChatBuffer {
         else {
             return false;
         };
+        self.remove_at(index);
+        true
+    }
+
+    fn remove_at(&mut self, index: usize) {
         self.messages.remove(index);
         let anchor_removed = self.anchor.is_some_and(|anchor| anchor.message == index);
         let cursor_removed = self.cursor.is_some_and(|cursor| cursor.message == index);
@@ -512,7 +548,6 @@ impl VirtualChatBuffer {
             cursor.message -= 1;
         }
         self.layout_index.invalidate();
-        true
     }
 
     fn build_ref_spans(&self, body: &str, ranges: Vec<Range<u32>>) -> Vec<MsgRefSpan> {
@@ -542,12 +577,11 @@ impl VirtualChatBuffer {
     pub fn ref_for_index(&self, index: usize) -> Option<(rpc::msgref::MessageRef, String)> {
         let room_id = self.room_id?;
         let entry = self.messages.get(index)?;
-        if entry.timestamp_ms == 0 {
+        if entry.id == 0 {
             return None;
         }
         let target = rpc::msgref::MessageRef {
             room_id,
-            timestamp_ms: entry.timestamp_ms,
             message_id: rpc::ids::MessageId(entry.id),
         };
         Some((target, ref_label(&entry.sender, &entry.body)))
@@ -557,16 +591,16 @@ impl VirtualChatBuffer {
         if self.room_id != Some(target.room_id) {
             return None;
         }
-        let index = self.find_message(target.timestamp_ms, target.message_id.0)?;
+        let index = self.find_message(target.message_id.0)?;
         let entry = &self.messages[index];
         Some(ref_label(&entry.sender, &entry.body))
     }
 
     /// Returns the index of the message with the given durable key, preferring
     /// the newest on the (never expected) chance of a duplicate.
-    pub fn find_message(&self, timestamp_ms: u64, message_id: u64) -> Option<usize> {
+    pub fn find_message(&self, message_id: u64) -> Option<usize> {
         for (index, entry) in self.messages.iter().enumerate().rev() {
-            if entry.timestamp_ms == timestamp_ms && entry.id == message_id {
+            if entry.id == message_id && entry.notice_id.is_none() {
                 return Some(index);
             }
         }
@@ -1258,6 +1292,11 @@ impl VirtualChatBuffer {
         if self.messages[prev].local != self.messages[cur].local
             || self.messages[prev].sender != self.messages[cur].sender
         {
+            return true;
+        }
+        // An edited message anchors its own heading, where the `(edited)`
+        // marker renders; grouped mid-block it would be invisible.
+        if self.messages[prev].edited != self.messages[cur].edited {
             return true;
         }
         let gap = self.messages[cur]
@@ -2631,7 +2670,7 @@ mod tests {
 
     impl VirtualChatBuffer {
         fn push_test(&mut self, sender: &str, body: &str, timestamp_ms: u64, local: bool) {
-            let id = self.messages.len() as u64;
+            let id = self.messages.len() as u64 + 1;
             let inline = crate::markdown::inline_ranges(body);
             let refs = self.build_ref_spans(body, inline.refs);
             let old_len = self.messages.len();
@@ -2641,6 +2680,7 @@ mod tests {
                 body: body.to_string(),
                 timestamp_ms,
                 local,
+                edited: false,
                 file_transfer_id: None,
                 links: inline.urls,
                 refs,
@@ -2663,6 +2703,8 @@ mod tests {
             timestamp_ms,
             body: body.to_string(),
             file_transfer_id: None,
+            flags: rpc::control::MessageFlags::default(),
+            target: None,
         }
     }
 
@@ -2734,7 +2776,7 @@ mod tests {
         buf.push_notice("net", "notice");
         buf.push_chat(chat_message(2, 2_000, "theirs"), false);
 
-        buf.set_local_flags(|timestamp_ms, id| (timestamp_ms == 1_000 && id == 1).then_some(true));
+        buf.set_local_flags(|id| (id == 1).then_some(true));
 
         assert!(buf.message(0).local);
         assert!(!buf.message(1).local);
@@ -3103,10 +3145,9 @@ mod tests {
         assert_eq!(buf.visual_text(5).as_deref(), Some("alpha beta"));
     }
 
-    fn ref_code(timestamp_ms: u64, message_id: u64) -> String {
+    fn ref_code(message_id: u64) -> String {
         rpc::msgref::MessageRef {
             room_id: rpc::ids::RoomId(1),
-            timestamp_ms,
             message_id: rpc::ids::MessageId(message_id),
         }
         .encode()
@@ -3130,7 +3171,7 @@ mod tests {
         let mut buf = VirtualChatBuffer::new(1000, SyntaxTheme::default());
         buf.set_room_id(rpc::ids::RoomId(1));
         buf.push_test("alice", "the delay manager change is in", 1_000_000, false);
-        let code = ref_code(1_000_000, 0);
+        let code = ref_code(1);
         buf.push_test(
             "bob",
             &format!("see @@{code} for context"),
@@ -3156,22 +3197,21 @@ mod tests {
         let mut buf = VirtualChatBuffer::new(1000, SyntaxTheme::default());
         buf.set_room_id(rpc::ids::RoomId(1));
         buf.push_test("alice", "target", 1_000_000, false);
-        let code = ref_code(1_000_000, 0);
+        let code = ref_code(1);
         buf.push_test("bob", &format!("see @@{code}"), 1_060_000, false);
         let _ = buf.total_lines_exact(95);
 
         let (pill, _) = pill_segments(&buf, 1)[0];
         let target = buf.ref_at(1, 0, pill.col).expect("pill click resolves");
-        assert_eq!(target.timestamp_ms, 1_000_000);
-        assert_eq!(target.message_id.0, 0);
-        assert_eq!(buf.find_message(1_000_000, 0), Some(0));
+        assert_eq!(target.message_id.0, 1);
+        assert_eq!(buf.find_message(1), Some(0));
     }
 
     #[test]
     fn unresolved_ref_renders_the_literal_code() {
         let mut buf = VirtualChatBuffer::new(1000, SyntaxTheme::default());
         buf.set_room_id(rpc::ids::RoomId(1));
-        let code = ref_code(999, 42);
+        let code = ref_code(42);
         buf.push_test("bob", &format!("see @@{code}"), 1_060_000, false);
         let _ = buf.total_lines_exact(95);
 
@@ -3187,7 +3227,7 @@ mod tests {
     fn undecodable_ref_is_not_clickable() {
         let mut buf = VirtualChatBuffer::new(1000, SyntaxTheme::default());
         buf.set_room_id(rpc::ids::RoomId(1));
-        let mut code = ref_code(999, 42);
+        let mut code = ref_code(42);
         let flipped = if code.ends_with('0') { '1' } else { '0' };
         code.pop();
         code.push(flipped);
@@ -3205,7 +3245,7 @@ mod tests {
         let mut buf = VirtualChatBuffer::new(1000, SyntaxTheme::default());
         buf.set_room_id(rpc::ids::RoomId(1));
         buf.push_test("alice", "target message", 1_000_000, false);
-        let code = ref_code(1_000_000, 0);
+        let code = ref_code(1);
         let body = format!("intro\nsee @@{code} tail");
         buf.push_test("bob", &body, 1_060_000, false);
         let _ = buf.total_lines_exact(95);
@@ -3709,6 +3749,101 @@ mod tests {
         );
     }
 
+    fn edited_message(id: u64, timestamp_ms: u64, body: &str) -> ChatMessage {
+        let mut message = chat_message(id, timestamp_ms, body);
+        message.flags.set_edited();
+        message
+    }
+
+    #[test]
+    fn edit_message_relayouts_preserving_cursor() {
+        let mut buf = VirtualChatBuffer::new(1000, SyntaxTheme::default());
+        for id in 1..=3 {
+            buf.push_chat(chat_message(id, id * 1_000, "short"), false);
+        }
+        let _ = buf.total_lines_exact(40);
+        buf.set_cursor_to_message(1);
+        let lines_before = buf.total_lines_exact(40);
+
+        assert!(buf.edit_message(2, edited_message(2, 2_000, "a much longer body\nwith a second line")));
+
+        assert_eq!(
+            buf.cursor().map(|cursor| buf.message(cursor.message).id),
+            Some(2)
+        );
+        let entry = buf.message(1);
+        assert!(entry.edited);
+        assert_eq!(entry.body, "a much longer body\nwith a second line");
+        assert!(buf.total_lines_exact(40) > lines_before);
+        assert!(!buf.edit_message(99, edited_message(99, 9_000, "absent")));
+    }
+
+    #[test]
+    fn edit_message_preserves_expansion_and_local_flag() {
+        let mut buf = VirtualChatBuffer::new(1000, SyntaxTheme::default());
+        buf.push_chat(chat_message(1, 1_000, &fenced(20)), true);
+        let _ = buf.total_lines_exact(40);
+        assert!(buf.toggle_expand(0, 40));
+
+        assert!(buf.edit_message(1, edited_message(1, 1_000, &fenced(21))));
+        let _ = buf.total_lines_exact(40);
+
+        assert!(buf.message(0).local);
+        assert!(buf.is_expanded(0));
+    }
+
+    #[test]
+    fn remove_message_fixes_cursor_and_anchor() {
+        let mut buf = VirtualChatBuffer::new(1000, SyntaxTheme::default());
+        for id in 1..=3 {
+            buf.push_chat(chat_message(id, id * 1_000, "m"), false);
+        }
+        let _ = buf.total_lines_exact(40);
+        buf.set_cursor_to_message(2);
+
+        assert!(buf.remove_message(1));
+
+        assert_eq!(buf.len(), 2);
+        assert_eq!(
+            buf.cursor().map(|cursor| buf.message(cursor.message).id),
+            Some(3)
+        );
+        assert!(buf.find_message(1).is_none());
+        assert!(!buf.remove_message(1));
+    }
+
+    #[test]
+    fn remove_message_under_cursor_lands_on_neighbor() {
+        let mut buf = VirtualChatBuffer::new(1000, SyntaxTheme::default());
+        for id in 1..=2 {
+            buf.push_chat(chat_message(id, id * 1_000, "m"), false);
+        }
+        let _ = buf.total_lines_exact(40);
+        buf.set_cursor_to_message(1);
+        buf.toggle_visual_anchor(40);
+
+        assert!(buf.remove_message(2));
+
+        assert!(!buf.has_visual());
+        assert_eq!(
+            buf.cursor().map(|cursor| buf.message(cursor.message).id),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn edited_message_breaks_block_grouping() {
+        let mut buf = VirtualChatBuffer::new(1000, SyntaxTheme::default());
+        for id in 1..=3 {
+            buf.push_chat(chat_message(id, 1_000 + id, "grouped"), false);
+        }
+        assert_eq!(heading_ids(&mut buf, 40), vec![1]);
+
+        assert!(buf.edit_message(2, edited_message(2, 1_002, "revised")));
+
+        assert_eq!(heading_ids(&mut buf, 40), vec![1, 2, 3]);
+    }
+
     #[test]
     fn insert_before_cursor_shifts_it() {
         let mut buf = VirtualChatBuffer::new(1000, SyntaxTheme::default());
@@ -3866,7 +4001,7 @@ mod tests {
         let mut buf = VirtualChatBuffer::new(1000, SyntaxTheme::default());
         buf.set_room_id(rpc::ids::RoomId(1));
         buf.push_test("alice", "target", 1_000_000, false);
-        let code = ref_code(1_000_000, 0);
+        let code = ref_code(1);
         buf.push_test("alice", &format!("see @@{code}"), 1_001_000, false);
         buf.push_test("alice", "no reference here", 1_002_000, false);
         let _ = buf.total_lines_exact(95);
@@ -3878,7 +4013,7 @@ mod tests {
             "sibling block members are not scanned"
         );
         buf.set_cursor_to_message(1);
-        assert_eq!(buf.cursor_ref().map(|target| target.message_id.0), Some(0));
+        assert_eq!(buf.cursor_ref().map(|target| target.message_id.0), Some(1));
     }
 
     #[test]
