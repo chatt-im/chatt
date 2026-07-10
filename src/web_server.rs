@@ -460,6 +460,11 @@ enum ClientRequest {
     /// Asks for up to `limit` messages immediately older than `before_seq`.
     #[jsony(rename = "load_older")]
     LoadOlder { before_seq: u64, limit: u64 },
+    /// Asks for the message a `@@` reference targets, keyed by its timestamp and
+    /// message id, so a hover card can preview a target outside the browser's
+    /// loaded window without paging it into the view.
+    #[jsony(rename = "ref_preview")]
+    RefPreview { ts: u64, mid: u64 },
     /// Asks the app to start streaming a screen share into this browser.
     #[jsony(rename = "play_share")]
     PlayShare { stream_id: u32 },
@@ -825,6 +830,17 @@ fn run(
                         let frame = older_frame(before_seq, limit, &history, base_seq);
                         let _ = server.send_websocket_binary(id, &frame);
                     }
+                    Ok(ClientRequest::RefPreview { ts, mid }) => {
+                        kvlog::debug!(
+                            "websocket request",
+                            ws_id = id.get(),
+                            kind = "ref_preview",
+                            ts,
+                            mid
+                        );
+                        let frame = ref_preview_frame(ts, mid, &history);
+                        let _ = server.send_websocket_binary(id, &frame);
+                    }
                     Ok(ClientRequest::PlayShare { stream_id }) => {
                         kvlog::debug!(
                             "websocket request",
@@ -1174,6 +1190,23 @@ fn older_frame(before_seq: u64, limit: u64, history: &[WebMessage], base_seq: u6
     )
 }
 
+/// Builds the `ref_preview` response for one reference key: the matching
+/// message when the retained history holds it, else a not-found frame so the
+/// browser can cache the miss. `message_id` zero never matches, because it
+/// marks a message whose id is unknown, not a referenceable target.
+fn ref_preview_frame(ts: u64, mid: u64, history: &[WebMessage]) -> Vec<u8> {
+    let mut found = None;
+    if mid != 0 {
+        for message in history.iter().rev() {
+            if message.message_id == mid && message.timestamp_ms == ts {
+                found = Some(message);
+                break;
+            }
+        }
+    }
+    web_wire::encode_ref_preview(ts, mid, found)
+}
+
 /// The JSON envelope sent on connect with browser-only behavior settings.
 fn config_envelope(
     readonly: bool,
@@ -1191,6 +1224,7 @@ fn config_envelope(
 fn client_request_kind(request: &ClientRequest) -> &'static str {
     match request {
         ClientRequest::LoadOlder { .. } => "load_older",
+        ClientRequest::RefPreview { .. } => "ref_preview",
         ClientRequest::PlayShare { .. } => "play_share",
         ClientRequest::StopShare { .. } => "stop_share",
         ClientRequest::SendMessage { .. } => "send_message",
@@ -1476,6 +1510,27 @@ mod tests {
         let history = vec![text_message(0, "m")];
         assert!(older_frame_for("not json", &history, 0).is_none());
         assert!(older_frame_for(r#"{"type":"other"}"#, &history, 0).is_none());
+    }
+
+    #[test]
+    fn ref_preview_frame_finds_target_by_key() {
+        let history: Vec<WebMessage> = (1..=5).map(|i| text_message(i, "m")).collect();
+        let frame = ref_preview_frame(100, 3, &history);
+        assert_eq!(frame[4], web_wire::KIND_REF_PREVIEW);
+        assert_eq!(u64::from_le_bytes(frame[5..13].try_into().unwrap()), 100);
+        assert_eq!(u64::from_le_bytes(frame[13..21].try_into().unwrap()), 3);
+        assert_eq!(frame[21], 1);
+    }
+
+    #[test]
+    fn ref_preview_frame_reports_miss_and_never_matches_unknown_id() {
+        let history = vec![text_message(0, "m"), text_message(1, "m")];
+        let miss = ref_preview_frame(100, 9, &history);
+        assert_eq!(miss[21], 0);
+        // A stored message with id 0 has an unknown id; a mid-0 request must
+        // not claim it as the reference target.
+        let unknown = ref_preview_frame(100, 0, &history);
+        assert_eq!(unknown[21], 0);
     }
 
     use rpc::control::{FileContentEncoding, FileMetadata};

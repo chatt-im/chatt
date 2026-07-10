@@ -127,6 +127,7 @@ export interface ShareInfo {
 // each prefixed with the little-endian upload id.
 export type ClientRequest =
   | { type: "load_older"; before_seq: number; limit: number }
+  | { type: "ref_preview"; ts: number; mid: number }
   | { type: "play_share"; stream_id: number }
   | { type: "stop_share"; stream_id: number }
   | { type: "send_message"; body: string }

@@ -98,6 +98,54 @@ body {
   font-size: 14px;
 }
 
+/* Hover preview for a resolved `@@` reference pill. Fixed viewport coordinates
+ * are set inline by the hover handler; max size must stay in sync with the
+ * REF_HOVER_MAX_* constants in App.tsx. Pointer-inert so the card can never
+ * trap hover or intercept clicks. */
+.ref-hover-card {
+  position: fixed;
+  z-index: 10;
+  width: max-content;
+  max-width: 500px;
+  max-height: 360px;
+  overflow: hidden;
+  padding: var(--space);
+  background: var(--bg-elevated);
+  border: 1px solid var(--border);
+  pointer-events: none;
+}
+
+.ref-hover-meta {
+  display: flex;
+  align-items: baseline;
+  gap: var(--space);
+  margin-bottom: 4px;
+}
+
+.ref-hover-sender {
+  color: var(--text-sender);
+  font-weight: 600;
+}
+
+.ref-hover-time {
+  color: var(--text-dim);
+  font-size: 12px;
+}
+
+.ref-hover-attachment {
+  color: var(--text-dim);
+  font-size: 13px;
+}
+
+.ref-hover-image {
+  display: block;
+  max-width: 100%;
+  max-height: 300px;
+  object-fit: contain;
+  object-position: left;
+  margin-top: 4px;
+}
+
 .app-main {
   flex: 1 1 auto;
   min-height: 0;
