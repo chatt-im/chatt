@@ -694,6 +694,44 @@ Sec-WebSocket-Version: 13\r\n\
 }
 
 #[test]
+fn websocket_outgoing_queue_limit_closes_a_stalled_connection() {
+    let overflowed = Arc::new(AtomicBool::new(false));
+    let observed = Arc::clone(&overflowed);
+    let config = ServerConfig::default().max_websocket_queue_bytes(64);
+    let router = Router::new().websocket("/chat");
+    let server =
+        EmbeddedServer::start_with_config_and_events(config, router, move |event, server| {
+            if let ServerEvent::WebSocketOpen { id, .. } = event {
+                server.send_websocket_binary(id, &[1; 40]).unwrap();
+                observed.store(
+                    server.send_websocket_binary(id, &[2; 40]).is_err(),
+                    Ordering::SeqCst,
+                );
+            }
+        });
+
+    let mut stream = TcpStream::connect(server.addr).unwrap();
+    stream
+        .write_all(
+            b"GET /chat HTTP/1.1\r\n\
+Host: localhost\r\n\
+Upgrade: websocket\r\n\
+Connection: Upgrade\r\n\
+Sec-WebSocket-Key: x3JJHMbDL1EzLkh9GBhXDw==\r\n\
+Sec-WebSocket-Version: 13\r\n\
+\r\n",
+        )
+        .unwrap();
+    for _ in 0..20 {
+        if overflowed.load(Ordering::SeqCst) {
+            return;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    panic!("websocket queue limit was not enforced");
+}
+
+#[test]
 fn websocket_origin_allowlist_accepts_browser_and_native_clients() {
     let config =
         ServerConfig::default().websocket_origins(vec!["http://localhost:5173".to_string()]);

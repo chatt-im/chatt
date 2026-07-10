@@ -1,6 +1,7 @@
 import { For, Show, createEffect, createMemo, createSignal, onCleanup } from "solid-js";
 import Icon from "./Icon";
 import type { ShareInfo } from "./types";
+import { ScreenShareDecoder } from "./video-decode";
 
 const MIN_ZOOM = 1;
 const MAX_ZOOM = 8;
@@ -30,6 +31,7 @@ function initialSize(share: ShareInfo): Size {
 function ScreenShareItem(props: {
   share: ShareInfo;
   playing: boolean;
+  state: string;
   error?: string;
   fullscreen: boolean;
   onPlay: (streamId: number) => void;
@@ -232,6 +234,29 @@ function ScreenShareItem(props: {
     applyView({ zoom: 1, panX: 0, panY: 0 });
   }
 
+  function onViewportKeyDown(event: KeyboardEvent) {
+    if (!props.playing || !viewportEl) return;
+    const step = event.shiftKey ? 120 : 40;
+    if (event.key === "+" || event.key === "=") {
+      const rect = viewportEl.getBoundingClientRect();
+      zoomAt(rect.left + rect.width / 2, rect.top + rect.height / 2, 1.25);
+    } else if (event.key === "-") {
+      const rect = viewportEl.getBoundingClientRect();
+      zoomAt(rect.left + rect.width / 2, rect.top + rect.height / 2, 0.8);
+    } else if (event.key === "0" || event.key === "Home") {
+      resetView();
+    } else if (["ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown"].includes(event.key)) {
+      applyView({
+        ...viewState,
+        panX: viewState.panX + (event.key === "ArrowLeft" ? step : event.key === "ArrowRight" ? -step : 0),
+        panY: viewState.panY + (event.key === "ArrowUp" ? step : event.key === "ArrowDown" ? -step : 0),
+      });
+    } else {
+      return;
+    }
+    event.preventDefault();
+  }
+
   createEffect(() => {
     const next = initialSize(props.share);
     if (!canvasEl || canvasEl.width === 0 || canvasEl.height === 0) {
@@ -259,6 +284,9 @@ function ScreenShareItem(props: {
       <div class="screenshare-row">
         <span class="screenshare-sender">{props.share.sender} is sharing a screen</span>
         <div class="screenshare-controls">
+          <span class="screenshare-status" role="status" aria-live="polite">
+            {props.state.replace(/-/g, " ")}
+          </span>
           <Show
             when={props.playing}
             fallback={
@@ -267,6 +295,7 @@ function ScreenShareItem(props: {
                 type="button"
                 aria-label="Play screen share"
                 title="Play"
+                disabled={!ScreenShareDecoder.supported()}
                 onClick={() => props.onPlay(props.share.stream_id)}
               >
                 <Icon name="play" />
@@ -317,6 +346,10 @@ function ScreenShareItem(props: {
         onPointerUp={endDrag}
         onPointerCancel={endDrag}
         onDblClick={onDoubleClick}
+        onKeyDown={onViewportKeyDown}
+        role="region"
+        aria-label={`Screen share from ${props.share.sender}. Use arrow keys to pan, plus and minus to zoom, and Home to reset.`}
+        tabIndex={0}
       >
         <canvas class="screenshare-canvas" ref={setCanvasRef} />
       </div>
@@ -329,6 +362,7 @@ function ScreenShareItem(props: {
 export default function ScreenShare(props: {
   shares: ShareInfo[];
   playing: number[];
+  states: Record<number, string>;
   errors: Record<number, string>;
   fullscreenStream: number | null;
   onPlay: (streamId: number) => void;
@@ -349,6 +383,7 @@ export default function ScreenShare(props: {
             <ScreenShareItem
               share={share}
               playing={isPlaying(share.stream_id)}
+              state={props.states[share.stream_id] ?? "available"}
               error={props.errors[share.stream_id]}
               fullscreen={props.fullscreenStream === share.stream_id}
               onPlay={props.onPlay}

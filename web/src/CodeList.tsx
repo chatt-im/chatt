@@ -1,4 +1,5 @@
-import { onCleanup, onMount } from "solid-js";
+import { Show, createEffect, createMemo, createSignal, onCleanup, onMount } from "solid-js";
+import Icon from "./Icon";
 import type { FileHighlight } from "./highlight";
 
 // Rows kept beyond the viewport on each side when the window is refilled.
@@ -56,14 +57,62 @@ interface Row {
 // The spacer height `lineCount * rowHeight` meets the browser's max element
 // height (~17.9M px in Firefox) only far beyond the server's highlight size
 // cap.
-export default function CodeList(props: { highlight: FileHighlight }) {
+export default function CodeList(props: {
+  highlight: FileHighlight;
+  searchOpen: boolean;
+  onCloseSearch: () => void;
+}) {
   // A new file remounts this component (FileViewer re-creates it when its
   // resource changes), so the highlight can be captured once.
   const highlight = props.highlight;
   const lineCount = highlight.lineCount;
+  const [query, setQuery] = createSignal("");
+  const [resultIndex, setResultIndex] = createSignal(0);
+  const results = createMemo(() => {
+    const needle = query().toLocaleLowerCase();
+    if (!needle) return [] as number[];
+    const found: number[] = [];
+    for (let line = 0; line < highlight.lines.length; line++) {
+      const haystack = highlight.lines[line]!.toLocaleLowerCase();
+      let offset = 0;
+      while ((offset = haystack.indexOf(needle, offset)) >= 0) {
+        found.push(line);
+        offset += Math.max(1, needle.length);
+      }
+    }
+    return found;
+  });
+  const activeLine = () => results()[resultIndex()] ?? -1;
 
   let scrollEl!: HTMLDivElement;
   let spacerEl!: HTMLDivElement;
+  let searchInputEl: HTMLInputElement | undefined;
+  let scrollToLine: ((line: number) => void) | undefined;
+
+  createEffect(() => {
+    query();
+    setResultIndex(0);
+  });
+
+  createEffect(() => {
+    const line = activeLine();
+    if (line >= 0) scrollToLine?.(line);
+    else {
+      spacerEl
+        ?.querySelector(".is-search-match")
+        ?.classList.remove("is-search-match");
+    }
+  });
+
+  createEffect(() => {
+    if (props.searchOpen) queueMicrotask(() => searchInputEl?.focus());
+  });
+
+  function moveResult(delta: number) {
+    const count = results().length;
+    if (count === 0) return;
+    setResultIndex((current) => (current + delta + count) % count);
+  }
 
   onMount(() => {
     let rowHeight = 0;
@@ -135,6 +184,7 @@ export default function CodeList(props: { highlight: FileHighlight }) {
         }
       }
       row.el.style.transform = `translateY(${line * rowHeight}px)`;
+      row.el.classList.toggle("is-search-match", line === activeLine());
     };
 
     // The line shown by rows[0]; rows[i] always shows firstLine + i. -1 marks
@@ -243,6 +293,12 @@ export default function CodeList(props: { highlight: FileHighlight }) {
       }
       update();
     };
+    scrollToLine = (line: number) => {
+      if (rowHeight <= 0) return;
+      scrollEl.scrollTop = clamp(line, 0, Math.max(0, lineCount - 1)) * rowHeight;
+      firstLine = -1;
+      update();
+    };
 
     const measureRow = () => {
       const row = rows[0];
@@ -307,8 +363,66 @@ export default function CodeList(props: { highlight: FileHighlight }) {
   });
 
   return (
-    <div class="file-viewer-body" ref={scrollEl}>
-      <div class="code-list" ref={spacerEl} />
-    </div>
+    <>
+      <Show when={props.searchOpen}>
+        <div class="code-search" role="search">
+          <label>
+            <span class="visually-hidden">Search file</span>
+            <input
+              ref={searchInputEl}
+              type="search"
+              value={query()}
+              placeholder="Search file"
+              onInput={(event) => setQuery(event.currentTarget.value)}
+              onKeyDown={(event) => {
+                if (event.key === "Enter") {
+                  event.preventDefault();
+                  moveResult(event.shiftKey ? -1 : 1);
+                } else if (event.key === "Escape") {
+                  event.preventDefault();
+                  props.onCloseSearch();
+                }
+              }}
+            />
+          </label>
+          <span class="code-search-count" aria-live="polite">
+            <Show when={query()}>
+              {results().length
+                ? `${resultIndex() + 1}/${results().length}`
+                : "No matches"}
+            </Show>
+          </span>
+          <button
+            type="button"
+            aria-label="Previous result"
+            title="Previous result"
+            onClick={() => moveResult(-1)}
+            disabled={results().length === 0}
+          >
+            <Icon name="chevron-up" />
+          </button>
+          <button
+            type="button"
+            aria-label="Next result"
+            title="Next result"
+            onClick={() => moveResult(1)}
+            disabled={results().length === 0}
+          >
+            <Icon name="chevron-down" />
+          </button>
+          <button
+            type="button"
+            aria-label="Close search"
+            title="Close search"
+            onClick={props.onCloseSearch}
+          >
+            <Icon name="x" />
+          </button>
+        </div>
+      </Show>
+      <div class="file-viewer-body" ref={scrollEl}>
+        <div class="code-list" ref={spacerEl} />
+      </div>
+    </>
   );
 }

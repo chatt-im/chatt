@@ -111,15 +111,26 @@ export type ServerEnvelope =
       verb: string;
       reason: string | null;
     }
-  // Sent once on connect with browser-only behavior settings.
+  // Sent once on connect with browser behavior settings and the active room.
   | {
       type: "config";
       readonly: boolean;
       autoplay: AutoplayMode;
       viewer_in_seperate_browser_tab: boolean;
+      max_upload_bytes: number;
+      room_name: string;
     }
+  | { type: "room"; name: string }
   // A deletion request was rejected by the local client or room server.
-  | { type: "delete_error"; target: number; message: string };
+  | { type: "delete_error"; target: number; message: string }
+  | {
+      type: "request_result";
+      request_id: number;
+      operation: string;
+      accepted: boolean;
+      message: string | null;
+    }
+  | { type: "action_error"; operation: string; message: string };
 
 // A screen share this browser can watch.
 export interface ShareInfo {
@@ -139,9 +150,10 @@ export type ClientRequest =
   | { type: "ref_preview"; ts: number; mid: number }
   | { type: "play_share"; stream_id: number }
   | { type: "stop_share"; stream_id: number }
-  | { type: "send_message"; body: string }
-  | { type: "edit_message"; target: number; body: string }
-  | { type: "delete_message"; target: number }
-  | { type: "upload_start"; upload_id: number; name: string; size: number }
-  | { type: "upload_finish"; upload_id: number }
-  | { type: "abort_transfer"; transfer_id: number };
+  | { type: "send_message"; request_id: number; body: string }
+  | { type: "edit_message"; request_id: number; target: number; body: string }
+  | { type: "delete_message"; request_id: number; target: number }
+  | { type: "upload_start"; request_id: number; upload_id: number; name: string; size: number }
+  | { type: "upload_finish"; request_id: number; upload_id: number }
+  | { type: "upload_cancel"; request_id: number; upload_id: number }
+  | { type: "abort_transfer"; request_id: number; transfer_id: number };

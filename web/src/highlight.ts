@@ -42,6 +42,8 @@ export function renderInline(textBytes: Uint8Array, spans: Uint8Array): string {
 // tens of thousands of lines only builds DOM for the visible window.
 export interface FileHighlight {
   readonly lineCount: number;
+  readonly text: string;
+  readonly lines: readonly string[];
   // Walks the highlight runs of line `index` (0-based) in order. `cls` is the
   // `HlClass` byte (0 = plain). The viewer feeds each run into a recycled
   // span slot, so no HTML string, escaping, parsing, or node creation happens
@@ -73,6 +75,10 @@ export function decodeFileBuffer(buffer: ArrayBuffer): FileHighlight {
   if (recordsStart > buffer.byteLength) {
     throw new Error("corrupt highlight buffer");
   }
+  const text = decoder.decode(bytes.subarray(textStart, textStart + textLen));
+  const lines = text.split("\n");
+  if (lines.length > lineCount) lines.length = lineCount;
+  while (lines.length < lineCount) lines.push("");
 
   // Line start offsets, derived from newlines with the same rule as the
   // encoder: each line's runs carry their own lengths, so only the start of the
@@ -96,6 +102,8 @@ export function decodeFileBuffer(buffer: ArrayBuffer): FileHighlight {
 
   return {
     lineCount,
+    text,
+    lines,
     forEachLineRun(index: number, fn: (text: string, cls: number) => void): void {
       if (index < 0 || index >= lineCount) return;
       const recordOffset = view.getUint32(offsetsStart + index * 4, true);
