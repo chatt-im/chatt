@@ -14,6 +14,8 @@ use rpc::{
 };
 use toml_spanner::{Item, Toml};
 
+use crate::config_diagnostics::{self, Diag};
+
 const SECRET_HASH_PREFIX: &str = "sha256:";
 const SHA256_HEX_LEN: usize = 64;
 const DEFAULT_LISTEN_ADDR: &str = "127.0.0.1:41000";
@@ -369,7 +371,19 @@ impl Config {
         let content = fs::read_to_string(path)
             .map_err(|err| format!("failed to read {}: {err}", path.display()))?;
         let source = path.display().to_string();
-        parse_config_content(&content, &source, Some(path.to_path_buf()))
+        let outcome = collect_config_content(&content, &source, Some(path.to_path_buf()));
+        config_diagnostics::render(&source, &content, &outcome.diagnostics);
+        let errors = outcome
+            .diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.error)
+            .count();
+        match outcome.config {
+            Some(config) if errors == 0 => Ok(config),
+            _ => Err(format!(
+                "invalid configuration: {errors} error(s) in {source}"
+            )),
+        }
     }
 
     pub fn server_key_pair(&self) -> Result<ring::signature::Ed25519KeyPair, String> {
@@ -567,22 +581,63 @@ fn parse_config_content(
     source: &str,
     config_path: Option<PathBuf>,
 ) -> Result<Config, String> {
-    let arena = toml_spanner::Arena::new();
-    let mut doc = toml_spanner::parse(content, &arena)
-        .map_err(|err| format!("failed to parse {source}: {err}"))?;
-    if !section_contains_key(&doc, "security", "server-identity-seed") {
-        return Err(format!(
-            "{source}: security.server-identity-seed is required; run `chatt-server init-config PATH` to generate a private server config"
-        ));
+    let outcome = collect_config_content(content, source, config_path);
+    let errors = outcome
+        .diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.error)
+        .count();
+    match outcome.config {
+        Some(config) if errors == 0 => Ok(config),
+        _ => Err(config_diagnostics::render_to_string(
+            source,
+            content,
+            &outcome.diagnostics,
+        )),
     }
-    let mut config: Config = doc.to().map_err(|err| {
-        let errors: Vec<String> = err.errors.iter().map(ToString::to_string).collect();
-        format!("failed to deserialize {source}: {}", errors.join(", "))
-    })?;
-    config.config_path = config_path;
-    config.normalize();
-    config.validate(source)?;
-    Ok(config)
+}
+
+struct LoadOutcome {
+    config: Option<Config>,
+    diagnostics: Vec<Diag>,
+}
+
+fn collect_config_content(
+    content: &str,
+    source: &str,
+    config_path: Option<PathBuf>,
+) -> LoadOutcome {
+    let arena = toml_spanner::Arena::new();
+    let mut doc = toml_spanner::parse_recoverable(content, &arena);
+    let mut diagnostics = Vec::new();
+    let identity_seed_configured = section_contains_key(&doc, "security", "server-identity-seed");
+    let (config, from_toml) = match doc.to_allowing_errors::<Config>() {
+        Ok((config, errors)) => (Some(config), errors),
+        Err(errors) => (None, errors),
+    };
+    diagnostics.extend(
+        from_toml
+            .errors
+            .iter()
+            .map(|error| config_diagnostics::from_toml_error(error, content)),
+    );
+    if !identity_seed_configured && !diagnostics.iter().any(|diagnostic| diagnostic.error) {
+        diagnostics.push(Diag::error(format!(
+            "{source}: security.server-identity-seed is required; run `chatt-server init-config PATH` to generate a private server config"
+        )));
+    }
+    let config = config.map(|mut config| {
+        config.config_path = config_path;
+        config.normalize();
+        if let Err(error) = config.validate(source) {
+            diagnostics.push(Diag::error(error));
+        }
+        config
+    });
+    LoadOutcome {
+        config,
+        diagnostics,
+    }
 }
 
 /// Writes `content` to a sibling temp file, fsyncs it, then atomically renames
@@ -1033,9 +1088,41 @@ mod tests {
         let corrupt_exists = extension_path(&path, "corrupt").exists();
         let _ = std::fs::remove_file(&path);
 
-        assert!(error.contains("failed to parse"));
+        assert!(error.contains("invalid configuration"));
         assert_eq!(content, "this is not valid toml = [");
         assert!(!corrupt_exists);
+    }
+
+    #[test]
+    fn parse_errors_are_rendered_as_annotated_snippets() {
+        let content = "[network]\ntcp-addr = 42\n";
+        let outcome = collect_config_content(content, "server.toml", None);
+        let rendered =
+            config_diagnostics::render_to_string("server.toml", content, &outcome.diagnostics);
+
+        assert!(rendered.contains("server.toml:2"), "{rendered}");
+        assert!(rendered.contains("tcp-addr = 42"), "{rendered}");
+        assert!(rendered.contains("error:"), "{rendered}");
+    }
+
+    #[test]
+    fn unknown_keys_are_warnings_and_do_not_reject_the_config() {
+        let content = config_content("unknown-setting = true\n");
+        let outcome = collect_config_content(&content, "server.toml", None);
+
+        assert!(outcome.config.is_some());
+        assert!(
+            outcome
+                .diagnostics
+                .iter()
+                .any(|diagnostic| !diagnostic.error)
+        );
+        assert!(
+            !outcome
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.error)
+        );
     }
 
     #[test]

@@ -13,6 +13,7 @@ rpc.path = "../rpc"
 mio = { version = "1.2.1", features = ["os-poll", "net"] }
 ring = "0.17.14"
 kvlog = "0.1.5"
+annotate-snippets = "0.12.10"
 toml-spanner = { version = "1.0.3", features = ["to-toml", "from-toml", "derive"] }
 libc = "0.2"
 foldhash = "0.2.0"

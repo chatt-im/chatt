@@ -1608,6 +1608,7 @@ dependencies = [
 name = "server"
 version = "0.1.0"
 dependencies = [
+ "annotate-snippets 0.12.16",
  "foldhash",
  "hashbrown 0.17.1",
  "jsony",

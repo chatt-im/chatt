@@ -11,6 +11,7 @@ use std::{
 };
 
 pub mod config;
+mod config_diagnostics;
 mod history_reader;
 pub mod local_admin;
 pub mod room_store;
